@@ -2124,6 +2124,31 @@ MultiAudioNode::_UpdateTimeSource(multi_buffer_info& info, node_input& input)
 	if (info.played_real_time == 0 || info.played_real_time < fTimeComputer.RealTime())
 		return;
 
+	// Right after a stream (re)start the driver completes its initially
+	// queued buffers in a burst, delivering pairs only microseconds apart
+	// whose frame counts still advance by a whole buffer. Fed to the
+	// TimeComputer, those drive the drift estimate to absurd values, and the
+	// published performance clock races for about a second -- exactly when a
+	// freshly connected mixer computes its first absolute wake-up deadline
+	// from RealTimeFor(). A mixer that does so inside that window parks far in
+	// the future and plays nothing until it is restarted. Real pairs arrive
+	// one buffer period apart; refuse anything closer than half that.
+	//
+	// BufferDuration() is only set by BBufferProducer::Connect(), i.e. when
+	// something consumes this node's record output, so it is usually 0.
+	// Derive the period from the playback geometry that actually clocks us.
+	bigtime_t bufferDuration = BufferDuration();
+	if (bufferDuration <= 0) {
+		const multi_buffer_list& list = fDevice->BufferList();
+		float rate = fOutputPreferredFormat.u.raw_audio.frame_rate;
+		if (rate > 0 && list.return_playback_buffer_size > 0) {
+			bufferDuration = bigtime_t(
+				list.return_playback_buffer_size * 1000000LL / rate);
+		}
+	}
+	if (info.played_real_time - fTimeComputer.RealTime() < bufferDuration / 2)
+		return;
+
 	fTimeComputer.AddTimeStamp(info.played_real_time,
 		info.played_frames_count);
 	PublishTime(fTimeComputer.PerformanceTime(), fTimeComputer.RealTime(),
