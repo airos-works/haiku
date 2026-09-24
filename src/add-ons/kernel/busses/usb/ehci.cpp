@@ -348,7 +348,7 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
 		fCleanupSem(-1),
 		fCleanupThread(-1),
 		fStopThreads(false),
-		fNextStartingFrame(-1),
+		fIsoAnchorEvict(0),
 		fFrameBandwidth(NULL),
 		fFirstIsochronousTransfer(NULL),
 		fLastIsochronousTransfer(NULL),
@@ -370,6 +370,8 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
 		fInterruptInstalled(false)
 {
 	B_INITIALIZE_SPINLOCK(&fInterruptLock);
+
+	memset(fIsoAnchors, 0, sizeof(fIsoAnchors));
 
 	// Create a lock for the isochronous transfer list
 	mutex_init(&fIsochronousLock, "EHCI isochronous lock");
@@ -1315,8 +1317,15 @@ EHCI::SubmitIsochronous(Transfer *transfer)
 	if ((isochronousData->flags & USB_ISO_ASAP) != 0 ||
 		isochronousData->starting_frame_number == NULL) {
 
-		if (fFirstIsochronousTransfer != NULL && fNextStartingFrame != -1)
-			currentFrame = fNextStartingFrame;
+		// Chain off this pipe's previous transfer, if it is still queued.
+		int32 anchor = -1;
+		if (LockIsochronous()) {
+			anchor = GetIsoAnchor(pipe);
+			UnlockIsochronous();
+		}
+
+		if (anchor != -1)
+			currentFrame = anchor;
 		else {
 			uint32 threshold = fThreshold;
 			TRACE("threshold: %" B_PRIu32 "\n", threshold);
@@ -1439,7 +1448,10 @@ EHCI::SubmitIsochronous(Transfer *transfer)
 
 	TRACE("appended isochronous transfer by starting at frame number %d\n",
 		currentFrame);
-	fNextStartingFrame = currentFrame + 1;
+	if (LockIsochronous()) {
+		SetIsoAnchor(pipe, currentFrame + 1);
+		UnlockIsochronous();
+	}
 
 	// Wake up the isochronous finisher thread
 	release_sem_etc(fFinishIsochronousTransfersSem, 1 /*frameCount*/,
@@ -2063,6 +2075,13 @@ EHCI::NotifyPipeChange(Pipe *pipe, usb_change change)
 			// are gone, ~Pipe() waited for their references.
 			if (pipe->ControllerCookie() != NULL)
 				_FreeSplitStream(pipe);
+
+			// A later pipe at the same address must not find this one's
+			// anchor, nor should it take a slot of the table.
+			if (LockIsochronous()) {
+				ClearIsoAnchor(pipe);
+				UnlockIsochronous();
+			}
 			break;
 		}
 
@@ -3840,6 +3859,73 @@ EHCI::ReadActualLength(ehci_qtd *topDescriptor, bool *nextDataToggle)
 	TRACE("read actual length (%ld bytes)\n", actualLength);
 	*nextDataToggle = dataToggle > 0 ? true : false;
 	return actualLength;
+}
+
+
+/*!	Returns the frame after \a pipe's last isochronous transfer, at which its
+	next one should start, or -1 if the pipe has no transfer queued anymore
+	(or never had one): then the next one starts near the controller's
+	current frame. A transfer leaves the list when the finisher has passed
+	its last frame, or (when canceled) when it retires it; canceled ones are
+	still in the schedule until then, so they are chained after too.
+	The caller holds fIsochronousLock.
+*/
+int32
+EHCI::GetIsoAnchor(Pipe *pipe)
+{
+	bool queued = false;
+	for (isochronous_transfer_data *transfer = fFirstIsochronousTransfer;
+			transfer != NULL; transfer = transfer->link) {
+		if (transfer->transfer->TransferPipe() == pipe) {
+			queued = true;
+			break;
+		}
+	}
+	if (!queued)
+		return -1;
+
+	for (int i = 0; i < kIsoAnchorCount; i++) {
+		if (fIsoAnchors[i].pipe == pipe)
+			return fIsoAnchors[i].next_frame;
+	}
+	return -1;
+}
+
+
+//!	The caller holds fIsochronousLock.
+void
+EHCI::SetIsoAnchor(Pipe *pipe, int32 frame)
+{
+	int free = -1;
+	for (int i = 0; i < kIsoAnchorCount; i++) {
+		if (fIsoAnchors[i].pipe == pipe) {
+			fIsoAnchors[i].next_frame = frame;
+			return;
+		}
+		if (fIsoAnchors[i].pipe == NULL && free < 0)
+			free = i;
+	}
+
+	if (free < 0) {
+		free = fIsoAnchorEvict;
+		fIsoAnchorEvict = (fIsoAnchorEvict + 1) % kIsoAnchorCount;
+	}
+
+	fIsoAnchors[free].pipe = pipe;
+	fIsoAnchors[free].next_frame = frame;
+}
+
+
+//!	The caller holds fIsochronousLock.
+void
+EHCI::ClearIsoAnchor(Pipe *pipe)
+{
+	for (int i = 0; i < kIsoAnchorCount; i++) {
+		if (fIsoAnchors[i].pipe == pipe) {
+			fIsoAnchors[i].pipe = NULL;
+			fIsoAnchors[i].next_frame = -1;
+		}
+	}
 }
 
 
