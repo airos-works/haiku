@@ -1353,7 +1353,25 @@ EHCI::SubmitIsochronous(Transfer *transfer)
 		return B_NO_MEMORY;
 	}
 
-	memset(bufferLog, 0, dataLength);
+	if (directionIn)
+		memset(bufferLog, 0, dataLength);
+	else {
+		// The iTDs point only at this buffer: copy the caller's payload in
+		// before any of them goes live. (The vectors may be user memory,
+		// with usb_raw.)
+		result = transfer->PrepareKernelAccess();
+		if (result == B_OK) {
+			result = _CopyIsochronousData(transfer, 0, bufferLog, dataLength,
+				false);
+		}
+		if (result != B_OK) {
+			TRACE_ERROR("failed to copy isochronous out data: %s\n",
+				strerror(result));
+			FreeChunk(bufferLog, bufferPhy, dataLength);
+			delete[] isoRequest;
+			return result;
+		}
+	}
 
 	phys_addr_t currentPhy = bufferPhy;
 	uint32 frameCount = 0;
