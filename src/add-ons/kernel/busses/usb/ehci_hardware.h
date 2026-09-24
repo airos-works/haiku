@@ -140,6 +140,8 @@ typedef struct ehci_itd {
 	struct ehci_itd	*next;
 	struct ehci_itd	*prev;
 	uint32		last_token;
+	uint32		frame;
+		// the frame list entry this iTD is linked into
 } ehci_itd;
 
 #define EHCI_ITD_TOFFSET(x)		((x) & 0x0fff)

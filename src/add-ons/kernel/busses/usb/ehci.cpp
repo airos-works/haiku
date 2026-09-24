@@ -1469,6 +1469,7 @@ EHCI::SubmitIsochronous(Transfer *transfer)
 
 		if (!LockIsochronous())
 			continue;
+		itd->frame = currentFrame;
 		LinkITDescriptors(itd, &fItdEntries[currentFrame]);
 		UnlockIsochronous();
 		fFrameBandwidth[currentFrame] -= bandwidth;
@@ -3015,7 +3016,12 @@ EHCI::FinishIsochronousTransfers()
 					& EHCI_ITD_STATUS_ACTIVE) == EHCI_ITD_STATUS_ACTIVE) {
 					TRACE("FinishIsochronousTransfers unprocessed active itd\n");
 				}
+				// A retired descriptor has no prev: that is how the detach
+				// below tells it from one that is still chained.
+				ehci_itd *prev = itd->prev;
 				UnlinkITDescriptors(itd, &fItdEntries[currentFrame]);
+				itd->prev = NULL;
+				itd->next = NULL;
 
 				// Process the transfer if we found the last descriptor
 				isochronous_transfer_data *transfer
@@ -3068,7 +3074,27 @@ EHCI::FinishIsochronousTransfers()
 					completedNotify = transfer->is_active
 						|| transfer->notify_canceled;
 
-					itd = itd->prev;
+					// This pass is time-based: it starts a few frames behind
+					// the controller when woken, so it can have skipped
+					// frames that still hold earlier descriptors of this
+					// transfer. Freeing one of those while it is chained in
+					// its frame would let the next CreateItdDescriptor()
+					// reuse memory the schedule still points to. Detach them
+					// first, from the frame each was linked into.
+					for (uint32 i = 0; i <= transfer->last_to_process; i++) {
+						ehci_itd *descriptor = transfer->descriptors[i];
+						if (descriptor == NULL || descriptor->prev == NULL)
+							continue;
+						if (descriptor == prev) {
+							// in this frame, next in line for this walk
+							prev = descriptor->prev;
+						}
+						UnlinkITDescriptors(descriptor,
+							&fItdEntries[descriptor->frame
+								& (EHCI_VFRAMELIST_ENTRIES_COUNT - 1)]);
+						descriptor->prev = NULL;
+						descriptor->next = NULL;
+					}
 
 					for (uint32 i = 0; i <= transfer->last_to_process; i++)
 						FreeDescriptor(transfer->descriptors[i]);
@@ -3081,10 +3107,10 @@ EHCI::FinishIsochronousTransfers()
 						transfer->buffer_size);
 					delete transfer;
 					transferDone = true;
-				} else {
+				} else
 					TRACE("FinishIsochronousTransfers not end of transfer\n");
-					itd = itd->prev;
-				}
+
+				itd = prev;
 			}
 
 			UnlockIsochronous();
