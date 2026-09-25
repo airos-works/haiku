@@ -1308,6 +1308,33 @@ EHCI::SubmitIsochronous(Transfer *transfer)
 		return B_BAD_VALUE;
 	}
 
+	// Honour the caller's per-packet request_length values instead of
+	// flattening the transfer into packet_count equal slices. Variable-length
+	// packets are how USB audio reaches a fractional data rate -- 44.1 kHz
+	// over 1 ms service intervals is 44 frames in some packets and 45 in
+	// others -- and slicing uniformly shifts the device's frame alignment on
+	// every such transfer. The sizes are only trusted when they are
+	// consistent: each within wMaxPacketSize, and together covering exactly
+	// the data being sent. Anything else keeps the uniform behaviour.
+	// OUT only: ReadIsochronousDescriptorChain() still walks the buffer in
+	// uniform packetSize steps, so an IN transfer laid out by request_length
+	// would be read back from the wrong offsets.
+	const usb_iso_packet_descriptor *packetDescriptors
+		= isochronousData->packet_descriptors;
+	bool usePacketLengths = false;
+	if (!directionIn && packetDescriptors != NULL) {
+		size_t lengthSum = 0;
+		size_t maxLength = 0;
+		for (uint32 i = 0; i < isochronousData->packet_count; i++) {
+			size_t length = packetDescriptors[i].request_length;
+			lengthSum += length;
+			if (length > maxLength)
+				maxLength = length;
+		}
+		usePacketLengths = lengthSum == transfer->DataLength()
+			&& lengthSum > 0 && maxLength <= pipe->MaxPacketSize();
+	}
+
 	status_t result = transfer->InitKernelAccess();
 	if (result != B_OK)
 		return result;
@@ -1434,6 +1461,7 @@ EHCI::SubmitIsochronous(Transfer *transfer)
 	}
 
 	uint32 frameCount = 0;
+	uint32 packetIndex = 0;
 	while (dataLength > 0 && itdIndex < itdCount) {
 		ehci_itd* itd = CreateItdDescriptor();
 		isoRequest[itdIndex++] = itd;
@@ -1444,7 +1472,12 @@ EHCI::SubmitIsochronous(Transfer *transfer)
 			"\n", currentPhy);
 		for (int32 i = 0; i < 8 && dataLength > 0;
 				i += (int32)uframeStride) {
-			size_t length = min_c(dataLength, packetSize);
+			size_t length = usePacketLengths
+				&& packetIndex < isochronousData->packet_count
+				? min_c(dataLength,
+					(size_t)packetDescriptors[packetIndex].request_length)
+				: min_c(dataLength, packetSize);
+			packetIndex++;
 			itd->token[i] = EHCI_ITD_STATUS(EHCI_ITD_STATUS_ACTIVE)
 				| EHCI_ITD_TLENGTH(length) | EHCI_ITD_PG(pg) | EHCI_ITD_TOFFSET(offset);
 			itd->last_token = i;
