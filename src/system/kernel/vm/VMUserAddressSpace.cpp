@@ -763,7 +763,18 @@ second_chance:
 								alignment);
 
 							addr_t startRange = next->Base() + next->Size();
-							startRange -= size + kMaxRandomize;
+							// Unsigned, and kMaxRandomize is 8 MB on 32-bit:
+							// a reserved area ending below size + kMaxRandomize
+							// makes this underflow, startRange lands near the
+							// top of the address space, and _RandomizeAddress()
+							// is then called with a start above its end. The
+							// clamp below is the right answer in that case --
+							// alignedNextBase is a valid start, by the
+							// is_valid_spot() test that guards this branch.
+							if (startRange < size + kMaxRandomize)
+								startRange = alignedNextBase;
+							else
+								startRange -= size + kMaxRandomize;
 							startRange = ROUNDDOWN(startRange, alignment);
 							startRange = std::max(startRange, alignedNextBase);
 
