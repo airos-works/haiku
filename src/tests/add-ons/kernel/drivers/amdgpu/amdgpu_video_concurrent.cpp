@@ -11,9 +11,14 @@
 #include <unistd.h>
 #include <vector>
 
+static volatile uint32* sGate;
+static void ReleaseGate()
+{
+	if (sGate != NULL) { *sGate = 1; __sync_synchronize(); sGate = NULL; }
+}
 static void Require(bool value, const char* why)
 {
-	if (!value) { fprintf(stderr, "FAIL: %s: %s\n", why, strerror(errno)); exit(1); }
+	if (!value) { ReleaseGate(); fprintf(stderr, "FAIL: %s: %s\n", why, strerror(errno)); exit(1); }
 }
 template<typename T> static T Request()
 {
@@ -98,16 +103,64 @@ static amdgpu_buffer Buffer(int fd)
 		&& ioctl(fd, AMDGPU_MAP_BUFFER, &b, sizeof(b)) == 0, "create mapped RAM buffer");
 	return b;
 }
+static void QueueOrder(int fd, const amdgpu_buffer& buffer, uint64 address, bool serialized, bool dma = false)
+{
+	Decoder d = Create(1);
+	auto words = (volatile uint32*)(addr_t)buffer.address;
+	memset((void*)words, 0, buffer.bytes); sGate = words;
+	std::vector<uint32> commands = {0xc0053c00, 0x13, uint32(address), uint32(address >> 32),
+		1, 0xffffffff, 4, 0xc0033700, 0x100500, uint32(address + 4), uint32(address >> 32), 0x51005100};
+	commands.resize(256, 0x80000000);
+	auto q = Request<amdgpu_gfx_queue>(); q.address = (addr_t)commands.data();
+	q.dwords = commands.size(); q.flags = AMDGPU_GFX_VALIDATE_COMMANDS;
+	Require(ioctl(fd, AMDGPU_GFX_QUEUE_COPY, &q, sizeof(q)) == 0, "queue owned GPU gate before video");
+	auto wait = Request<amdgpu_fence_wait>(); wait.fence = q.fence;
+	if (dma) {
+		auto fill = Request<amdgpu_dma_submit>(); fill.operation = AMDGPU_DMA_FILL;
+		fill.destination = buffer.handle; fill.destination_offset = 8; fill.bytes = 4; fill.value = 0x5100da00;
+		Require(ioctl(fd, AMDGPU_SUBMIT_DMA, &fill, sizeof(fill)) == 0, "queue DMA after gated graphics");
+		wait.fence = fill.fence;
+	}
+	Require(ioctl(fd, AMDGPU_WAIT_FENCE, &wait, sizeof(wait)) == -1 && errno == B_WOULD_BLOCK,
+		"graphics gate is pending before starting decode");
+	thread_id thread = Start(d);
+	bigtime_t deadline = system_time() + 100000;
+	while (atomic_get(&d.done) == 0 && system_time() < deadline) snooze(100);
+	bool completed = atomic_get(&d.done) != 0;
+	Require(words[0] == 0 && words[1] == 0 && words[2] == 0, "GPU gate stayed closed throughout decode observation");
+	ReleaseGate(); Join(thread);
+	wait.timeout_us = 5000000;
+	Require(ioctl(fd, AMDGPU_WAIT_FENCE, &wait, sizeof(wait)) == 0 && wait.status == B_OK,
+		"gated graphics completes after release");
+	for (uint32 i = 0; i < buffer.bytes / 4; ++i)
+		Require(words[i] == (i == 0 ? 1u : i == 1 ? 0x51005100u : i == 2 && dma ? 0x5100da00u : 0u),
+			"gate/DMA output and all guards");
+	close(d.fd);
+	Require(completed != serialized, dma ? "queued DMA remains ordered before decode"
+		: serialized ? "old kernel serializes decode behind queued GFX"
+		: "decode finishes while earlier queued graphics is still blocked");
+	puts(dma ? "PASS: pending ordinary DMA still excludes video; graphics/DMA output and decoded pixels exact"
+		: serialized ? "PASS: reproduced old queued-GFX/video serialization without GPU fault"
+		: "PASS: video starts and decodes exact pixels while earlier queued graphics remains gated");
+}
 int main(int argc, char** argv)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	Require(argc == 2 || (argc == 3 && strcmp(argv[2], "--unprivileged") == 0),
-		"usage: amdgpu_video_concurrent reference.nv12 [--unprivileged]");
+	if (argc == 2 && strcmp(argv[1], "--expect-no-device") == 0) {
+		int fd = open("/dev/" AMDGPU_DEVICE_NAME, O_RDWR);
+		Require(fd < 0 && errno == B_ENTRY_NOT_FOUND, "no GPU device in emulator");
+		puts("PASS: no video/graphics device; no GPU submission"); return 0;
+	}
+	bool queue = argc == 3 && strcmp(argv[2], "--queue-order") == 0;
+	bool serialized = argc == 3 && strcmp(argv[2], "--expect-serialized") == 0;
+	bool unprivileged = argc == 3 && strcmp(argv[2], "--unprivileged") == 0;
+	Require(argc == 2 || (argc == 3 && (queue || serialized || unprivileged)),
+		"usage: amdgpu_video_concurrent reference.nv12 [--unprivileged|--queue-order|--expect-serialized]");
 	FILE* f = fopen(argv[1], "rb"); Require(f != NULL, "open independent reference");
 	sReference.resize(737280);
 	Require(fread(sReference.data(), 1, sReference.size(), f) == sReference.size()
 		&& fgetc(f) == EOF && fclose(f) == 0, "read complete padded NV12 reference");
-	if (argc == 3) Require(setgid(65534) == 0 && setuid(65534) == 0, "drop privileges");
+	if (unprivileged) Require(setgid(65534) == 0 && setuid(65534) == 0, "drop privileges");
 	int graphics = Open();
 	auto vm = Request<amdgpu_vm_info>();
 	Require(ioctl(graphics, AMDGPU_VM_INFO, &vm, sizeof(vm)) == 0, "initialize VM");
@@ -119,6 +172,12 @@ int main(int argc, char** argv)
 	auto gpu = Request<amdgpu_vm_test>(); gpu.address = map.address;
 	Require(ioctl(graphics, AMDGPU_VM_TEST, &gpu, sizeof(gpu)) == 0 && gpu.status == B_OK,
 		"initialize graphics before concurrent video");
+	if (queue || serialized) {
+		QueueOrder(graphics, buffer, map.address, serialized);
+		if (queue) QueueOrder(graphics, buffer, map.address, true, true);
+		close(graphics); Require(delete_area(buffer.area) == B_OK, "release revoked CPU clone");
+		return 0;
+	}
 	Decoder a = Create(64), b = Create(64);
 	thread_id ta = Start(a), tb = Start(b);
 	WaitBusy(a);

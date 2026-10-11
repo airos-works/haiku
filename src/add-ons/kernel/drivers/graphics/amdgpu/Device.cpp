@@ -86,7 +86,7 @@ static sem_id sJobs = -1;
 static thread_id sWorker = -1;
 static Job* sFirst;
 static Job* sLast;
-static uint32 sPending;
+static uint32 sPending, sDmaPending;
 static uint64 sNextHandle = 1;
 static uint32 sNextVideoHandle = 1;
 static uint32 sVideoSessions, sVMCount;
@@ -208,6 +208,7 @@ Executor(void*)
 		job->client->completed = job->command.fence;
 		job->client->pending--;
 		if (job->graphicsCommands != NULL) job->client->graphicsPending--;
+		else sDmaPending--;
 		sPending--;
 		PutBuffer(job->source);
 		PutBuffer(job->destination);
@@ -364,7 +365,10 @@ WaitDmaIdle(bool includeVideo = true, bool includeGraphics = true)
 {
 	bigtime_t deadline = system_time() + 5000000;
 	auto busy = [&]() {
-		return sPending != 0 || (includeVideo && sVideoExecuting)
+		// Video owns SDMA but can overlap graphics. Once graphics shares this
+		// queue, counting every queued job here would serialize decode again.
+		return (includeGraphics ? sPending : sDmaPending) != 0
+			|| (includeVideo && sVideoExecuting)
 			|| (includeGraphics && sGraphicsExecuting);
 	};
 	while (busy() && sFault == B_OK && !sStopping) {
@@ -1221,6 +1225,7 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 			sFirst = job;
 		sLast = job;
 		sPending++;
+		sDmaPending++;
 		release_sem(sJobs);
 		return B_OK;
 	}
