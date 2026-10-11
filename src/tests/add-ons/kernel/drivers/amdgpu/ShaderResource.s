@@ -13,7 +13,8 @@ shader_resource:
     s_add_u32 s8, s8, s3
     s_addc_u32 s9, s9, 0
     s_mov_b32 s10, 256
-    s_mov_b32 s11, 0
+    // X/Y/Z/W destination selects, 32-bit unsigned format (gfx8 SQ_BUF_RSRC).
+    s_mov_b32 s11, (4 | (5 << 3) | (6 << 6) | (7 << 9) | (4 << 12) | (4 << 15))
     v_lshlrev_b32 v1, 2, v0
     v_add_u32 v2, vcc, s8, v1
     v_mov_b32 v3, s9

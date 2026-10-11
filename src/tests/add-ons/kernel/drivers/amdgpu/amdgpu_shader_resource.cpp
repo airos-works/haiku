@@ -62,7 +62,8 @@ static Words Commands(uint32 seed)
 	reg(0x2e04, 0); reg(0x2e05, 0); reg(0x2e06, 0);
 	reg(0x2e07, 64); reg(0x2e08, 1); reg(0x2e09, 1);
 	reg(0x2e0c, kCode >> 8); reg(0x2e0d, kCode >> 40);
-	reg(0x2e12, 3 | 1 << 6 | 0xc0 << 12); // 16 VGPRs, 16 SGPRs; PRIV clear.
+	// s14 must not alias the trailing VCC pair while output addresses change.
+	reg(0x2e12, 3 | 2 << 6 | 0xc0 << 12); // 16 VGPRs, 24 SGPRs; PRIV clear.
 	reg(0x2e13, 5 << 1 | 1 << 7 | 1 << 15); // Five user SGPRs, group X, 512-byte LDS.
 	reg(0x2e15, 0); reg(0x2e16, 0xffffffff); reg(0x2e17, 0xffffffff);
 	reg(0x2e18, 0); reg(0x2e19, 0xffffffff); reg(0x2e1a, 0xffffffff);
@@ -103,6 +104,12 @@ static void Check(const Client& c)
 		if (p[i] != want) {
 			fprintf(stderr, "output word %u, record %u field %u: %#x expected %#x\n",
 				i, i >= 1024 ? (i - 1024) / 16 : 0, i % 16, (unsigned)p[i], want);
+			for (uint32 record = 0; record < 4; record++) {
+				fprintf(stderr, "record %u:", record);
+				for (uint32 field = 0; field < 16; field++)
+					fprintf(stderr, " %08x", (unsigned)p[1024 + record * 16 + field]);
+				fprintf(stderr, "\n");
+			}
 			Require(false, "all resource observations, positive controls and guards match");
 		}
 	}
@@ -175,13 +182,15 @@ int main(int argc, char** argv)
 		Require(fd < 0 && errno == ENOENT, "no AMD device in QEMU");
 		puts("PASS: shader resource command policy and no-device handling"); return 0;
 	}
-	Require(argc == 1 && geteuid() == 0, "shader resource qualification requires root");
+	bool snapshotOnly = argc == 2 && strcmp(argv[1], "--snapshot-only") == 0;
+	Require((argc == 1 || snapshotOnly) && geteuid() == 0, "shader resource qualification requires root");
 	int monitor = open("/dev/" AMDGPU_DEVICE_NAME, O_RDWR); Require(monitor >= 0, "open monitor");
 	auto render = Request<amdgpu_render_info>();
 	Require(ioctl(monitor, AMDGPU_RENDER_INFO, &render, sizeof(render)) == 0
 		&& (render.capabilities & AMDGPU_RENDER_CHECKED_COPY), "checked copy capability");
 	CheckABI(monitor);
 	auto translation = Snapshot(monitor, false);
+	if (snapshotOnly) { close(monitor); return 0; }
 	auto initial = IRQ(monitor);
 	auto memory = Request<amdgpu_gart_info>();
 	Require(ioctl(monitor, AMDGPU_GART_INFO, &memory, sizeof(memory)) == 0, "initial RAM accounting");
