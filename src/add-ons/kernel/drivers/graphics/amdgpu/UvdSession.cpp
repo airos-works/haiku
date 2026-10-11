@@ -43,10 +43,23 @@ UvdEngine::Session(UvdSession& s, uint32 type, const void* picture,
 	}
 	const auto& l = s.layout;
 	const uint64 guardReadback = 4096 + ((l.outputBytes + 4095ULL) & ~4095ULL);
+	auto timeout = [&](uint32 stage) {
+		s.sdmaTimeoutStage = 0;
+		amdgpu_sdma_timeout_test test = {};
+		status_t status = dma.TimeoutTest(test);
+		dprintf("amdgpu: UVD session %u SDMA timeout stage %u status 0x%x "
+			"DMA fence %u/%u ring %u/%u elapsed %llu us UVD fence %u/%u\n",
+			(unsigned)s.handle, (unsigned)stage, (unsigned)status,
+			(unsigned)test.fence, (unsigned)test.sequence, (unsigned)test.rptr,
+			(unsigned)test.wptr, (unsigned long long)test.elapsed_us,
+			(unsigned)result.fence, (unsigned)result.sequence);
+		return status;
+	};
 	bigtime_t timing[6]; timing[0] = system_time();
 	if (type == 1) {
-		status_t status = dma.Execute(AMDGPU_DMA_FILL, 0, s.gpu + l.target,
-			l.outputBytes, 0);
+		status_t status = s.sdmaTimeoutStage == AMDGPU_VIDEO_SDMA_CLEAR
+			? timeout(AMDGPU_VIDEO_SDMA_CLEAR)
+			: dma.Execute(AMDGPU_DMA_FILL, 0, s.gpu + l.target, l.outputBytes, 0);
 		if (status != B_OK) { faulted = true; Stop(); return status; }
 		// A different CPU fill each frame also makes a short/stale DMA copy
 		// visible to the independent pixel comparison. Guard pages stay fixed.
@@ -109,7 +122,8 @@ UvdEngine::Session(UvdSession& s, uint32 type, const void* picture,
 		for (uint32 guard = 0; guard < 4; guard++)
 			copies[guard + 1] = {s.gpu + l.guards[guard],
 				s.readbackGpu + guardReadback + guard * 4096, 4096};
-		status = dma.CopyRegions(copies, 5);
+		status = s.sdmaTimeoutStage == AMDGPU_VIDEO_SDMA_READBACK
+			? timeout(AMDGPU_VIDEO_SDMA_READBACK) : dma.CopyRegions(copies, 5);
 		if (status == B_OK) {
 			const uint8* ram = (const uint8*)s.readback;
 			for (uint32 i = 0; i < 4096; i++)
