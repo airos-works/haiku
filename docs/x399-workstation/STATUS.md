@@ -79,10 +79,17 @@ GPUVM under the current translation configuration. Separate store/atomic
 read-only tests produce hardware VM faults, unchanged targets/guards and
 post-close quarantine. Each reviewed fault has a planned cold recovery;
 final graphics/queues/VM/DMA/concurrent-media checks pass at 255 completions,
-510 EOPs and zero errors. GDS access containment and remaining shader resource
-paths still need qualification, and general submissions remain root-only.
-Driver `f546422d…` and private Mesa `82098de9…` are installed with same-hash
-backups; prior `ffe50ea8…`, `cb8672d6…`, `cefb183c…`/`afd206fa…`, prior `c579f1cd…`,
+510 EOPs and zero errors. A subsequent bounded GDS diagnostic qualifies reads,
+writes, atomic adds, relocated windows and zero-allocation containment. After
+correcting an oversized M0 positive-control request, 52 positive jobs and 358
+bounds-suite jobs pass; all 18 denied access cases return zero, set the shader
+memory-violation flag and preserve the full owned region. Device IRQ state stays
+healthy, and no recovery boot is needed. Graphics/queue/VM/DMA/concurrent-media
+regressions leave 698 completions, 1,396 EOPs and zero device errors. GWS,
+ordered-append and remaining shader resource paths still need qualification;
+general submissions remain root-only. Driver `2894a05c…` and private Mesa
+`82098de9…` are installed with same-hash backups; prior `f546422d…`,
+`ffe50ea8…`, `cb8672d6…`, `cefb183c…`/`afd206fa…`, prior `c579f1cd…`,
 `7d1cf6e5…`/`ee6210e5…` and older checkpoints are
 preserved. The original global media addon is restored after qualification.
 System Mesa defaults remain
