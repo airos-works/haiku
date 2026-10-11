@@ -264,6 +264,7 @@ device_control(void* cookie, uint32 op, void* buffer, size_t length)
 		|| op == AMDGPU_GFX_GDS_PROBE_COPY
 		|| op == AMDGPU_GWS_INFO || op == AMDGPU_OA_INFO
 		|| op == AMDGPU_RECOVERY_INFO || op == AMDGPU_GFX_RECOVER
+		|| op == AMDGPU_GFX_RECOVER_LIVE || op == AMDGPU_CLIENT_STATUS
 		|| op == AMDGPU_SHADER_MEMORY_INFO || op == AMDGPU_DIAGNOSTIC_RAM_PAGE
 		|| op == AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER
 		|| (op >= AMDGPU_VM_INFO && op <= AMDGPU_RENDER_INFO))
@@ -274,6 +275,7 @@ device_control(void* cookie, uint32 op, void* buffer, size_t length)
 			|| op == AMDGPU_GFX_GDS_PROBE_COPY
 			|| op == AMDGPU_GWS_INFO || op == AMDGPU_OA_INFO
 			|| op == AMDGPU_RECOVERY_INFO || op == AMDGPU_GFX_RECOVER
+			|| op == AMDGPU_GFX_RECOVER_LIVE
 			|| op == AMDGPU_GFX_QUEUE_COPY || op == AMDGPU_SHADER_MEMORY_INFO
 			|| op == AMDGPU_DIAGNOSTIC_RAM_PAGE || op == AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER)
 			&& geteuid() != 0)

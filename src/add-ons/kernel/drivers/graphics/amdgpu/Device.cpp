@@ -44,6 +44,9 @@ struct ClientVM {
 };
 
 struct AmdgpuClient {
+	AmdgpuClient* next;
+	status_t loss;
+	uint64 lossGeneration;
 	team_id team;
 	uint32 flags, references, bufferCount, pending, graphicsPending;
 	uint64 bytes, systemBytes, submitted, completed, failedFence;
@@ -97,10 +100,27 @@ static ClientVM* sQuarantinedVMs;
 static UvdSession* sQuarantinedVideos;
 static amdgpu_recovery_info sRecovery;
 static bool sRecoveryAttempted;
+static AmdgpuClient* sClients;
 static void ReleaseVM(AmdgpuClient* client);
 static void ReleaseVideo(AmdgpuClient* client);
 static void WaitGraphicsIdle();
 static status_t ExecuteQueuedGraphics(Job* job);
+
+// sMutex serializes the first fault with open, close, and recovery. Retain the
+// first loss on every old file even if its queue was empty or fully successful.
+// Recovery clears only the device fault; it cannot revive any of these files.
+static void
+SetFault(status_t status)
+{
+	if (status == B_OK) return;
+	if (sFault == B_OK) sFault = status;
+	for (AmdgpuClient* client = sClients; client != NULL; client = client->next) {
+		if (client->loss == B_OK) {
+			client->loss = sFault;
+			client->lossGeneration = sRecovery.generation;
+		}
+	}
+}
 
 // Called with sMutex held, including cleanup and the DMA worker. An async
 // fault must quarantine allocations even if the client closes immediately.
@@ -109,7 +129,7 @@ ObserveInterruptFault()
 {
 	status_t status = sGfx.interrupts.Error();
 	if (status != B_OK) {
-		if (sFault == B_OK) sFault = status;
+		if (sFault == B_OK) SetFault(status);
 		// The execution owner also observes the atomic IRQ error. Do not
 		// mutate its engine state or halt it from a concurrent cleanup call.
 		if (!sGraphicsExecuting && !sGfx.faulted) {
@@ -134,7 +154,7 @@ PutBuffer(Buffer* bo)
 	if (bo->system && !bo->poisoned && sFault == B_OK) {
 		status_t status = sGart.Unbind(bo->offset, bo->bytes);
 		if (status != B_OK)
-			sFault = status;
+			SetFault(status);
 	}
 	if (bo->poisoned || sFault != B_OK) {
 		// Retain both backing storage and its ownership record. No allocation
@@ -159,6 +179,9 @@ PutClient(AmdgpuClient* client)
 		// Closing the file may have deferred the VM until its queued jobs
 		// retire. The worker is no longer using it when dropping this reference.
 		ReleaseVM(client);
+		AmdgpuClient** link = &sClients;
+		while (*link != client) link = &(*link)->next;
+		*link = client->next;
 		free(client);
 	}
 }
@@ -213,7 +236,7 @@ Executor(void*)
 		ObserveInterruptFault();
 		if (status == B_OK && sFault != B_OK) status = B_DEV_NOT_READY;
 		if (status != B_OK) {
-			sFault = status;
+			SetFault(status);
 			if (job->client->failedFence == 0) {
 				job->client->failedFence = job->command.fence;
 				job->client->failure = status;
@@ -243,6 +266,12 @@ amdgpu_client_open(uint32 flags)
 		client->team = team_get_current_team_id();
 		client->flags = flags;
 		client->references = 1;
+		mutex_lock(&sMutex);
+		client->loss = sFault;
+		client->lossGeneration = sRecovery.generation;
+		client->next = sClients;
+		sClients = client;
+		mutex_unlock(&sMutex);
 	}
 	return client;
 }
@@ -428,7 +457,7 @@ ReleaseVideo(AmdgpuClient* client)
 			// WaitDmaIdle may have yielded to another decoder before a DMA
 			// error/timeout. Stopping UVD still requires its ownership back.
 			WaitVideoIdle();
-			sFault = status;
+			SetFault(status);
 			sUvd.faulted = true;
 			sUvd.Stop();
 		}
@@ -442,7 +471,7 @@ ReleaseVideo(AmdgpuClient* client)
 		ObserveInterruptFault();
 		if (s->readbackBound && sFault == B_OK) {
 			status_t status = sGart.Unbind(s->readbackOffset, s->readbackBytes);
-			if (status != B_OK) sFault = status;
+			if (status != B_OK) SetFault(status);
 		}
 		// Retain wired RAM and its GART extent when late writes are possible.
 		if (sFault == B_OK) {
@@ -507,7 +536,7 @@ CreateVideo(AmdgpuClient* client, void* data, size_t length)
 	if (status != B_OK) return status;
 	if (!VideoLayout(request.config, layout)) return B_BAD_VALUE;
 	if (client->video != NULL) return B_BUSY;
-	if (sFault != B_OK || client->failedFence != 0) return B_DEV_NOT_READY;
+	if (sFault != B_OK || client->loss != B_OK) return B_DEV_NOT_READY;
 	if (sNextVideoHandle == 0 || sVideoSessions >= 32) return B_NO_MEMORY;
 	UvdSession* s = (UvdSession*)calloc(1, sizeof(UvdSession));
 	if (s == NULL) return B_NO_MEMORY;
@@ -543,7 +572,7 @@ CreateVideo(AmdgpuClient* client, void* data, size_t length)
 			if (status == B_OK) {
 				memset(s->readback, 0x7d, bytes);
 				status = sGart.Bind(s->readbackOffset, bytes, s->readback);
-				if (status == B_TIMED_OUT) sFault = status;
+				if (status == B_TIMED_OUT) SetFault(status);
 				s->readbackBound = status == B_OK;
 				s->readbackGpu = Gart::kBase + s->readbackOffset;
 			}
@@ -554,7 +583,7 @@ CreateVideo(AmdgpuClient* client, void* data, size_t length)
 	for (uint64 offset = 0; status == B_OK && offset < layout.bytes;) {
 		uint64 bytes = min_c(layout.bytes - offset, 64ULL << 20);
 		status = sEngine.Execute(AMDGPU_DMA_FILL, 0, s->gpu + offset, bytes, 0);
-		if (status != B_OK) sFault = status;
+		if (status != B_OK) SetFault(status);
 		offset += bytes;
 	}
 	if (status == B_OK && !sUvd.ready) {
@@ -565,7 +594,7 @@ CreateVideo(AmdgpuClient* client, void* data, size_t length)
 				sUvdClocksQualified, firmware.view, result);
 	}
 	if (status == B_OK) status = sUvd.Session(*s, 0, NULL, NULL, 0, sEngine, result);
-	if (!sVideoExecuting && sUvd.faulted && sFault == B_OK) sFault = status;
+	if (!sVideoExecuting && sUvd.faulted && sFault == B_OK) SetFault(status);
 	if (status == B_OK) {
 		request.handle = s->handle; request.pitch = layout.pitch;
 		request.output_bytes = layout.outputBytes; request.allocated_bytes = layout.bytes;
@@ -588,7 +617,7 @@ DecodeVideo(AmdgpuClient* client, void* data, size_t length)
 		|| request.output_capacity != s->layout.outputBytes
 		|| !VideoPictureValid(*s, request.picture, request.bitstream_bytes))
 		return B_BAD_VALUE;
-	if (sFault != B_OK || client->failedFence != 0) return B_DEV_NOT_READY;
+	if (sFault != B_OK || client->loss != B_OK) return B_DEV_NOT_READY;
 	if (!AmdgpuUserRange(request.bitstream, request.bitstream_bytes)
 		|| !AmdgpuUserRange(request.output, s->layout.outputBytes))
 		return B_BAD_ADDRESS;
@@ -608,7 +637,7 @@ DecodeVideo(AmdgpuClient* client, void* data, size_t length)
 		mutex_lock(&sMutex);
 		sVideoExecuting = false;
 		ObserveInterruptFault();
-		if (sUvd.faulted && sFault == B_OK) sFault = status;
+		if (sUvd.faulted && sFault == B_OK) SetFault(status);
 		// A concurrent graphics fault quarantines the whole device, even if
 		// this decode retired successfully. Do not publish its output.
 		if (status == B_OK && sFault != B_OK) status = B_DEV_NOT_READY;
@@ -683,6 +712,10 @@ ReleaseVM(AmdgpuClient* client)
 	ClientVM* vm = client->vm;
 	if (vm == NULL)
 		return;
+	// Decide reclamation only after the last possible wait. A live-client
+	// reset may complete while this cleanup waits for another graphics owner.
+	WaitGraphicsIdle();
+	ObserveInterruptFault();
 	const bool retain = sFault != B_OK;
 	if (!retain) {
 		vm->table.Uninitialize(true);
@@ -810,7 +843,7 @@ StartGraphics()
 	status = sGfx.Initialize(sEngine.regs, sInfo, sReservation, firmware,
 		sEngine, sGart, result, &images[4].mec);
 	if (sGfx.faulted)
-		sFault = status;
+		SetFault(status);
 	return status;
 }
 
@@ -827,7 +860,7 @@ ExecuteGraphics(Execute execute)
 	mutex_lock(&sMutex);
 	sGraphicsExecuting = false;
 	ObserveInterruptFault();
-	if (sGfx.faulted && sFault == B_OK) sFault = status;
+	if (sGfx.faulted && sFault == B_OK) SetFault(status);
 	if (status == B_OK && sFault != B_OK) status = B_DEV_NOT_READY;
 	sCompleted.NotifyAll();
 	return status;
@@ -863,7 +896,7 @@ QueueGraphics(AmdgpuClient* client, void* data, size_t length)
 		|| (request.dwords & (kIbSizeAlignment / 4 - 1))
 		|| request.dwords == 0 || request.dwords > kMaxIbBytes / 4)
 		return B_BAD_VALUE;
-	if (sFault != B_OK || client->failedFence != 0 || client->vm == NULL)
+	if (sFault != B_OK || client->loss != B_OK || client->vm == NULL)
 		return B_DEV_NOT_READY;
 	if (sPending >= 256 || client->pending >= 64 || client->submitted == UINT64_MAX)
 		return B_WOULD_BLOCK;
@@ -884,6 +917,7 @@ QueueGraphics(AmdgpuClient* client, void* data, size_t length)
 	// file and other clients may have changed both quotas while we waited.
 	if (status == B_OK && (sPending >= 256 || client->pending >= 64
 		|| client->submitted == UINT64_MAX)) status = B_WOULD_BLOCK;
+	if (status == B_OK && client->loss != B_OK) status = B_DEV_NOT_READY;
 	if (status == B_OK) status = PrepareCopiedCommands(client->vm);
 	if (status == B_OK) {
 		request.fence = client->submitted + 1;
@@ -912,7 +946,7 @@ QueueGraphics(AmdgpuClient* client, void* data, size_t length)
 static status_t
 VMControl(AmdgpuClient* client, uint32 op, void* data, size_t length)
 {
-	if (sFault != B_OK || client->failedFence != 0)
+	if (sFault != B_OK || client->loss != B_OK)
 		return B_DEV_NOT_READY;
 	if (op == AMDGPU_VM_INFO) {
 		amdgpu_vm_info request;
@@ -976,6 +1010,7 @@ VMControl(AmdgpuClient* client, uint32 op, void* data, size_t length)
 		// Binding references also retain BOs whose public handles are freed.
 		status = WaitDmaIdle(probe);
 		if (status == B_OK) status = StartGraphics();
+		if (status == B_OK && client->loss != B_OK) status = B_DEV_NOT_READY;
 		amdgpu_vm_test result = {};
 		bigtime_t started = system_time();
 		if (status == B_OK) {
@@ -1011,6 +1046,7 @@ VMControl(AmdgpuClient* client, uint32 op, void* data, size_t length)
 		// Mapping references keep the BO alive even if its handle is freed.
 		status = WaitDmaIdle(false);
 		if (status == B_OK) status = StartGraphics();
+		if (status == B_OK && client->loss != B_OK) status = B_DEV_NOT_READY;
 		amdgpu_vm_test result = {};
 		result.version = AMDGPU_HAIKU_ABI_VERSION;
 		result.size = sizeof(result);
@@ -1159,12 +1195,12 @@ ReclaimGraphicsQuarantine()
 }
 
 static status_t
-RecoverGraphics()
+RecoverGraphics(bool allowLive)
 {
-	// No live GPU resource may acquire a new meaning after reset. Old queued
-	// fences must first become terminal and all owners must close/free them.
-	if (sPending != 0 || sGraphicsExecuting || sVideoExecuting || sLiveHandles != 0
-		|| sVMCount != 0 || sVideoSessions != 0)
+	// Old queues must be terminal. Live lost VMs/BOs keep their identity and
+	// allocation; only closed quarantine can be reclaimed by the reset.
+	if (sPending != 0 || sGraphicsExecuting || sVideoExecuting || sVideoSessions != 0
+		|| (!allowLive && (sLiveHandles != 0 || sVMCount != 0)))
 		return B_BUSY;
 	if (sFault == B_OK || !sGfx.faulted || !sGfx.ready || sRecoveryAttempted)
 		return B_NOT_ALLOWED;
@@ -1172,6 +1208,9 @@ RecoverGraphics()
 	// firmware video sessions need their own reset, not premature reclamation.
 	if (sEngine.faulted || sUvd.faulted || sQuarantinedVideos != NULL)
 		return B_NOT_SUPPORTED;
+	for (AmdgpuClient* client = sClients; client != NULL; client = client->next) {
+		if (client->loss == B_OK) return B_BAD_DATA;
+	}
 	InstalledFirmware images[5];
 	amdgpu::FirmwareView firmware[4];
 	for (uint32 i = 0; i < 4; i++) {
@@ -1213,12 +1252,31 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 	if (client->team != team_get_current_team_id()
 		|| (client->flags & O_ACCMODE) != O_RDWR)
 		return B_NOT_ALLOWED;
-	if (op == AMDGPU_RECOVERY_INFO || op == AMDGPU_GFX_RECOVER) {
+	if (op == AMDGPU_CLIENT_STATUS) {
+		amdgpu_client_status request;
+		status_t status = ReadRequest(request, data, length);
+		if (status != B_OK) return status;
+		if (request.flags != 0 || request.reserved != 0) return B_BAD_VALUE;
+		request.flags = client->loss != B_OK ? AMDGPU_CLIENT_LOST : 0;
+		if (client->loss != B_OK && sRecovery.generation > client->lossGeneration)
+			request.flags |= AMDGPU_CLIENT_RESET_COMPLETED;
+		request.status = client->loss;
+		request.device_status = sFault;
+		request.generation = sRecovery.generation;
+		request.loss_generation = client->lossGeneration;
+		request.submitted = client->submitted;
+		request.completed = client->completed;
+		request.failed_fence = client->failedFence;
+		return user_memcpy(data, &request, sizeof(request));
+	}
+	if (op == AMDGPU_RECOVERY_INFO || op == AMDGPU_GFX_RECOVER
+		|| op == AMDGPU_GFX_RECOVER_LIVE) {
 		amdgpu_recovery_info request;
 		status_t status = ReadRequest(request, data, length);
 		if (status != B_OK) return status;
 		if (request.flags != 0 || request.reserved != 0) return B_BAD_VALUE;
-		status = op == AMDGPU_GFX_RECOVER ? RecoverGraphics() : sFault;
+		status = op == AMDGPU_RECOVERY_INFO ? sFault
+			: RecoverGraphics(op == AMDGPU_GFX_RECOVER_LIVE);
 		request = RecoveryInfo();
 		request.status = status;
 		return user_memcpy(data, &request, sizeof(request));
@@ -1395,7 +1453,7 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 		// Recovery starts a new device epoch, but cannot turn this file's
 		// failed queue back into a successful fence timeline. Keep old waits
 		// and cleanup available; new work requires a fresh client.
-		if (sFault != B_OK || client->failedFence != 0)
+		if (sFault != B_OK || client->loss != B_OK)
 			return B_DEV_NOT_READY;
 		if ((c.operation != AMDGPU_DMA_COPY && c.operation != AMDGPU_DMA_FILL)
 			|| c.bytes == 0 || c.bytes > kMaxBufferBytes
@@ -1459,7 +1517,7 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 		return B_BAD_VALUE;
 	if (op == AMDGPU_CREATE_BUFFER || op == AMDGPU_CREATE_SYSTEM_BUFFER
 		|| op == AMDGPU_CREATE_DEVICE_BUFFER || op == AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER) {
-		if (sFault != B_OK || client->failedFence != 0)
+		if (sFault != B_OK || client->loss != B_OK)
 			return B_DEV_NOT_READY;
 		if (request.bytes == 0 || request.bytes > kMaxBufferBytes)
 			return B_BAD_VALUE;
@@ -1480,7 +1538,7 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 		// The drain releases sMutex. This file can fail while waiting, and
 		// another resource-free client can recover the device before we
 		// reacquire it. A cleared global fault cannot revive this lost file.
-		if (sFault != B_OK || client->failedFence != 0)
+		if (sFault != B_OK || client->loss != B_OK)
 			return B_DEV_NOT_READY;
 		if (client->bufferCount >= kMaxBuffers || sNextHandle == 0)
 			return B_NO_MEMORY;
@@ -1504,7 +1562,7 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 			status = sEngine.Execute(AMDGPU_DMA_FILL, 0, bo->gpu, bo->bytes, 0);
 			if (status != B_OK) {
 				// Never publish or recycle an allocation with uncertain writes.
-				sFault = status;
+				SetFault(status);
 				bo->poisoned = true;
 				PutBuffer(bo);
 				return status;
@@ -1542,7 +1600,7 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 			if (status != B_OK) {
 				// An invalidation timeout requires retaining backing RAM.
 				if (status == B_TIMED_OUT)
-					sFault = status;
+					SetFault(status);
 				PutBuffer(bo);
 				return status;
 			}
@@ -1677,7 +1735,7 @@ amdgpu_device_gfx_test(const amdgpu::FirmwareView firmware[4],
 		: sGfx.Test(sEngine.regs, sInfo, sReservation,
 			firmware, sEngine, sGart, result, mec);
 	if (!sGraphicsExecuting && sGfx.faulted && sFault == B_OK)
-		sFault = status;
+		SetFault(status);
 	mutex_unlock(&sMutex);
 	return status;
 }
@@ -1693,7 +1751,7 @@ amdgpu_device_uvd_test(const amdgpu::FirmwareView& firmware,
 		: sUvd.Test(sEngine.regs, sInfo, sReservation, sUvdClocksQualified,
 			firmware, result, output);
 	if (!sVideoExecuting && sUvd.faulted && sFault == B_OK)
-		sFault = status;
+		SetFault(status);
 	mutex_unlock(&sMutex);
 	return status;
 }
