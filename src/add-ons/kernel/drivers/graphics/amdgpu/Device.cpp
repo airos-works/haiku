@@ -3,6 +3,7 @@
 #include "Sdma.h"
 #include "Gart.h"
 #include "Gfx.h"
+#include "GfxCommandValidator.h"
 #include "GpuPageTable.h"
 #include "Uvd.h"
 #include "FirmwareLoader.h"
@@ -801,7 +802,8 @@ VMControl(AmdgpuClient* client, uint32 op, void* data, size_t length)
 		amdgpu_gfx_submit request;
 		status_t status = ReadRequest(request, data, length);
 		if (status != B_OK) return status;
-		if (request.flags != 0 || request.reserved != 0
+		if ((request.flags & ~(copy ? AMDGPU_GFX_VALIDATE_COMMANDS : 0u)) != 0
+			|| request.reserved != 0
 			|| (!copy && (request.address & (kIbAddressAlignment - 1)) != 0)
 			|| (request.dwords & (kIbSizeAlignment / 4 - 1)) != 0
 			|| request.dwords == 0 || request.dwords > kMaxIbBytes / 4)
@@ -809,6 +811,17 @@ VMControl(AmdgpuClient* client, uint32 op, void* data, size_t length)
 		if (copy) {
 			status = CopyCommands(vm, request.address, request.dwords * 4);
 			if (status != B_OK) return status;
+			if (request.flags & AMDGPU_GFX_VALIDATE_COMMANDS) {
+				amdgpu::GfxCommandValidation checked = amdgpu::ValidateGfx8Commands(
+					(const volatile uint32*)vm->copiedCommands.cpu, request.dwords);
+				if (checked.error != amdgpu::GfxCommandValidation::OK) {
+					// Never leave a rejected stream in the private executable copy.
+					memset((void*)vm->copiedCommands.cpu, 0, kMaxIbBytes);
+					__sync_synchronize();
+					(void)vm->copiedCommands.cpu[kMaxIbBytes / 8 - 1];
+					return B_NOT_ALLOWED;
+				}
+			}
 		} else {
 			VmBinding* binding = vm->bindings;
 			while (binding != NULL) {
@@ -967,7 +980,7 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 		if (status == B_OK) status = sGfx.RenderInfo(sRenderInfo, info);
 		if (status != B_OK) return status;
 		info.capabilities = AMDGPU_RENDER_ROOT_SUBMIT | AMDGPU_RENDER_SYNC_SUBMIT
-			| AMDGPU_RENDER_COPY_SUBMIT;
+			| AMDGPU_RENDER_COPY_SUBMIT | AMDGPU_RENDER_CHECKED_COPY;
 		info.total_vram = sInfo.vram_size;
 		info.visible_vram = sInfo.bar_size[0];
 		info.total_gart = Gart::kSize;

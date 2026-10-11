@@ -11,6 +11,7 @@ SimpleTest amdgpu_startup : amdgpu_startup.cpp ;
 SimpleTest amdgpu_gfx : amdgpu_gfx.cpp ;
 SimpleTest amdgpu_vm : amdgpu_vm.cpp : [ TargetLibstdc++ ] ;
 SimpleTest amdgpu_gfx_lifetime : amdgpu_gfx_lifetime.cpp ;
+SimpleTest amdgpu_checked_submit : amdgpu_checked_submit.cpp : [ TargetLibstdc++ ] ;
 SimpleTest amdgpu_copy_submit : amdgpu_copy_submit.cpp : [ TargetLibstdc++ ] ;
 SimpleTest amdgpu_irq : amdgpu_irq.cpp ;
 SimpleTest amdgpu_render : amdgpu_render.cpp ;
@@ -19,6 +20,8 @@ SimpleTest amdgpu_uvd : amdgpu_uvd.cpp ;
 local driver = [ FDirName $(HAIKU_TOP) src add-ons kernel drivers graphics amdgpu ] ;
 SubDirHdrs $(driver) ;
 SEARCH_SOURCE += $(driver) ;
+SimpleTest gfx_command_test : gfx_command_test.cpp GfxCommandValidator.cpp
+	: [ TargetLibstdc++ ] ;
 SimpleTest amdgpu_irq_fault : amdgpu_irq_fault.cpp ;
 SimpleTest amdgpu_submit : amdgpu_submit.cpp : [ TargetLibstdc++ ] ;
 SimpleTest mec_firmware_test : mec_firmware_test.cpp Firmware.cpp
