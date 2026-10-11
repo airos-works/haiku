@@ -34,6 +34,8 @@ SimpleTest amdgpu_gws : amdgpu_gws.cpp GfxCommandValidator.cpp
 	: [ TargetLibstdc++ ] ;
 SimpleTest amdgpu_oa : amdgpu_oa.cpp GfxCommandValidator.cpp
 	: [ TargetLibstdc++ ] ;
+SimpleTest amdgpu_oa_access : amdgpu_oa_access.cpp GfxCommandValidator.cpp
+	: [ TargetLibstdc++ ] ;
 SimpleTest gfx_command_test : gfx_command_test.cpp GfxCommandValidator.cpp
 	: [ TargetLibstdc++ ] ;
 SimpleTest amdgpu_irq_fault : amdgpu_irq_fault.cpp ;
