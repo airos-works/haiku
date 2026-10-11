@@ -42,8 +42,13 @@
 #include <KernelExport.h>
 #include <USB3.h>
 #include <driver_settings.h>
+#include <cpu.h>
 #include <lock.h>
+#include <smp.h>
+#include <thread.h>
+#include <thread_types.h>
 #include <util/AutoLock.h>
+#include <vm/vm_page.h>
 
 #include "aic_loader.h"
 
@@ -95,6 +100,7 @@ struct marker {
 
 static usb_module_info* sUSB;
 static bool sDebug;
+static bool sWatch;
 
 static mutex sDeviceLock = MUTEX_INITIALIZER(DRIVER_NAME " device");
 static aic_device sRom;
@@ -130,6 +136,22 @@ static int32 sTxCount;
 static bool sTxBusy;
 static bool sTxWasFull;
 static uint32 sTxErrors;
+
+// counters for the debug watch (written by one thread each, read racily)
+struct rx_counters {
+	int64				transfers;
+	int64				bytes;
+	int64				packets;
+	int32				full;		// transfers that filled the buffer
+	int32				cut;		// packets running past the transfer
+	int32				errors;
+	uint32				longest;
+	bigtime_t			last;		// when a transfer last completed
+};
+static rx_counters sRxCounters[2];
+static int64 sTxQueued;
+static int64 sTxCompleted;
+static int32 sTxRingFull;
 
 
 static inline uint16
@@ -560,6 +582,39 @@ handle_message(const uint8* body, size_t length)
 }
 
 
+/*	A packet that runs past the end of its transfer: what it claims, where,
+	the packets before it and its bytes, to tell a framing change from data
+	lost on the way. The rest of the transfer is dropped. */
+struct parsed_packet {
+	uint32				offset;
+	uint16				length;
+	uint8				type;
+};
+
+
+static void
+report_cut(rx_pipe* rx, const char* what, size_t size, const uint8* buffer,
+	size_t length, size_t offset, const parsed_packet* previous, int count)
+{
+	char line[480];
+	int used = snprintf(line, sizeof(line), "%s: %s of %zu bytes cut off at "
+		"%zu (offset %zu of %zu); %d before:", rx->name, what, size,
+		length - offset, offset, length, count);
+	for (int i = count > 4 ? count - 4 : 0; i < count; i++) {
+		used += snprintf(line + used, sizeof(line) - used, " %" B_PRIu32
+			"/%u/0x%02x", previous[i % 4].offset, previous[i % 4].length,
+			previous[i % 4].type);
+	}
+	used += snprintf(line + used, sizeof(line) - used, "; bytes:");
+	for (size_t i = offset >= 8 ? offset - 8 : 0;
+			i < length && i < offset + 24; i++) {
+		used += snprintf(line + used, sizeof(line) - used, "%s%02x",
+			i == offset ? " | " : " ", buffer[i]);
+	}
+	dprintf(DRIVER_NAME ": %s\n", line);
+}
+
+
 /*	One IN transfer holds one or more packets, each with a 4-byte header:
 	a 16-bit length, a type. Messages are padded to 4 bytes after the
 	header; a data frame is the firmware's 60-byte receive header and an
@@ -567,8 +622,11 @@ handle_message(const uint8* body, size_t length)
 static void
 parse_transfer(rx_pipe* rx, const uint8* buffer, size_t length)
 {
+	rx_counters& counters = sRxCounters[rx->index];
 	size_t offset = 0;
 	bool data = false;
+	parsed_packet previous[4];
+	int count = 0;
 
 	while (offset + 4 <= length) {
 		const uint8* packet = buffer + offset;
@@ -580,21 +638,31 @@ parse_transfer(rx_pipe* rx, const uint8* buffer, size_t length)
 		if ((type & AIC_TYPE_CONFIG) == 0) {
 			size_t size = packetLength + 60;
 			if (offset + size > length) {
-				TRACE_ALWAYS("%s: frame of %zu bytes cut off at %zu\n",
-					rx->name, size, length - offset);
+				counters.cut++;
+				report_cut(rx, "frame", size, buffer, length, offset,
+					previous, count);
 				break;
 			}
 			sCallbacks->data(sCookie, rx->index, packet, size);
 			data = true;
+			previous[count % 4].offset = offset;
+			previous[count % 4].length = packetLength;
+			previous[count++ % 4].type = type;
+			counters.packets++;
 			offset += size;
 			continue;
 		}
 
 		if (offset + 4 + packetLength > length) {
-			TRACE_ALWAYS("%s: message of %zu bytes cut off at %zu\n",
-				rx->name, packetLength, length - offset - 4);
+			counters.cut++;
+			report_cut(rx, "message", packetLength, buffer, length, offset,
+				previous, count);
 			break;
 		}
+		previous[count % 4].offset = offset;
+		previous[count % 4].length = packetLength;
+		previous[count++ % 4].type = type;
+		counters.packets++;
 
 		switch (type & 0x7f) {
 			case AIC_TYPE_MESSAGE:
@@ -668,7 +736,10 @@ rx_thread(void* data)
 		status_t status = rx->status;
 		size_t length = rx->length;
 		const uint8* buffer = rx->buffers[current];
+		rx_counters& counters = sRxCounters[rx->index];
+		counters.last = system_time();
 		if (status != B_OK) {
+			counters.errors++;
 			if (++errors % 100 == 1) {
 				TRACE_ALWAYS("%s: transfer failed: %s (%" B_PRId32 ")\n",
 					rx->name, strerror(status), errors);
@@ -679,6 +750,12 @@ rx_thread(void* data)
 			continue;
 		}
 		errors = 0;
+		counters.transfers++;
+		counters.bytes += length;
+		if (length == rx->size)
+			counters.full++;
+		if (length > counters.longest)
+			counters.longest = length;
 
 		current ^= 1;
 		queued = sUSB->queue_bulk(rx->pipe, rx->buffers[current], rx->size,
@@ -763,6 +840,7 @@ tx_start_locked()
 				sTxBuffers + sTxTail * AIC_USB_TX_MAX, sTxLengths[sTxTail],
 				tx_callback, NULL) == B_OK) {
 			sTxBusy = true;
+			sTxQueued++;
 			return;
 		}
 		if (sTxErrors++ % 100 == 0)
@@ -778,6 +856,7 @@ static void
 tx_callback(void* cookie, status_t status, void* data, size_t length)
 {
 	MutexLocker locker(sTxLock);
+	sTxCompleted++;
 	if (status != B_OK && sTxErrors++ % 100 == 0) {
 		TRACE_ALWAYS("tx: transfer failed: %s (%" B_PRIu32 ")\n",
 			strerror(status), sTxErrors);
@@ -794,6 +873,262 @@ tx_callback(void* cookie, status_t status, void* data, size_t length)
 		if (sCallbacks != NULL)
 			sCallbacks->tx_ready(sCookie);
 	}
+}
+
+
+//	#pragma mark - the debug watch
+
+
+/*	With "watch": every few seconds the processors' load, the busiest
+	threads, free memory, the transport's counters and what the driver's
+	threads wait for, on the serial port. For stalls and overloads that
+	leave no other trace. */
+
+#define WATCH_INTERVAL		5000000
+#define WATCH_THREADS		4096
+
+struct watch_sample {
+	thread_id			id;
+	bigtime_t			time;
+};
+
+struct watch_lock {
+	const char*			name;
+	const void*			object;
+	const volatile thread_id* owner;
+};
+
+static thread_id sWatchThread = -1;
+static sem_id sWatchSem = -1;
+static thread_id sWatchWork = -1;
+static watch_lock sWatchLocks[8];
+static int32 sWatchLockCount;
+static watch_sample* sWatchSamples;
+
+
+void
+aic_usb_watch_thread(thread_id thread)
+{
+	sWatchWork = thread;
+}
+
+
+void
+aic_usb_watch_lock(const char* name, const void* object,
+	const volatile thread_id* owner)
+{
+	if (sWatchLockCount < (int32)B_COUNT_OF(sWatchLocks)) {
+		sWatchLocks[sWatchLockCount].name = name;
+		sWatchLocks[sWatchLockCount].object = object;
+		sWatchLocks[sWatchLockCount].owner = owner;
+		sWatchLockCount++;
+	}
+}
+
+
+static void
+watch_thread_state(thread_id id, const char* name, char* line, size_t size)
+{
+	int used = snprintf(line, size, " %s", name);
+	thread_info info;
+	if (id < 0 || get_thread_info(id, &info) != B_OK) {
+		snprintf(line + used, size - used, " -");
+		return;
+	}
+	used += snprintf(line + used, size - used, " %d", (int)info.state);
+
+	Thread* thread = Thread::Get(id);
+	if (thread == NULL)
+		return;
+	uint32 type = thread->wait.type;
+	const void* object = thread->wait.object;
+	int32 state = thread->state;
+	thread->ReleaseReference();
+	if (state != B_THREAD_WAITING)
+		return;
+
+	if (type == THREAD_BLOCK_TYPE_SEMAPHORE) {
+		sem_info semInfo;
+		if (get_sem_info((sem_id)(addr_t)object, &semInfo) == B_OK)
+			snprintf(line + used, size - used, " sem \"%s\"", semInfo.name);
+		return;
+	}
+	if (type == THREAD_BLOCK_TYPE_MUTEX) {
+		for (int32 i = 0; i < sWatchLockCount; i++) {
+			if (sWatchLocks[i].object == object) {
+				snprintf(line + used, size - used, " mutex %s (holder %"
+					B_PRId32 ")", sWatchLocks[i].name,
+					sWatchLocks[i].owner != NULL ? *sWatchLocks[i].owner : -1);
+				return;
+			}
+		}
+	}
+	snprintf(line + used, size - used, " type %" B_PRIu32 " %p", type, object);
+}
+
+
+static bigtime_t
+watch_previous_time(thread_id id, bigtime_t time)
+{
+	uint32 slot = (uint32)id % WATCH_THREADS;
+	for (int i = 0; i < 16; i++) {
+		watch_sample& sample = sWatchSamples[(slot + i) % WATCH_THREADS];
+		if (sample.id == id || sample.id <= 0) {
+			bigtime_t previous = sample.id == id ? sample.time : 0;
+			sample.id = id;
+			sample.time = time;
+			return previous;
+		}
+	}
+	return 0;
+}
+
+
+static status_t
+watch_thread(void*)
+{
+	int32 cpuCount = min_c(smp_get_num_cpus(), 16);
+	bigtime_t active[16];
+	for (int32 i = 0; i < cpuCount; i++)
+		active[i] = cpu_get_active_time(i);
+	bigtime_t last = system_time();
+	rx_counters lastRx[2];
+	memcpy(lastRx, sRxCounters, sizeof(lastRx));
+
+	while (acquire_sem_etc(sWatchSem, 1, B_RELATIVE_TIMEOUT, WATCH_INTERVAL)
+			!= B_OK || sRunning) {
+		bigtime_t now = system_time();
+		bigtime_t elapsed = max_c(now - last, 1);
+		last = now;
+
+		char line[512];
+		int used = snprintf(line, sizeof(line), "watch: cpu");
+		int32 total = 0;
+		for (int32 i = 0; i < cpuCount; i++) {
+			bigtime_t time = cpu_get_active_time(i);
+			int32 percent = (int32)((time - active[i]) * 100 / elapsed);
+			active[i] = time;
+			total += percent;
+			used += snprintf(line + used, sizeof(line) - used, " %" B_PRId32,
+				percent);
+		}
+		used += snprintf(line + used, sizeof(line) - used, " = %" B_PRId32
+			"%%; free %" B_PRIuPHYSADDR " MB",
+			total, (phys_addr_t)vm_page_num_free_pages() * B_PAGE_SIZE / 1048576);
+		dprintf(DRIVER_NAME ": %s\n", line);
+
+		// the five busiest threads of the system
+		struct { thread_id id; team_id team; bigtime_t delta; char name[24]; }
+			top[5];
+		memset(top, 0, sizeof(top));
+		int32 teamCookie = 0;
+		team_info team;
+		while (get_next_team_info(&teamCookie, &team) == B_OK) {
+			int32 threadCookie = 0;
+			thread_info info;
+			while (get_next_thread_info(team.team, &threadCookie, &info)
+					== B_OK) {
+				if (info.priority == B_IDLE_PRIORITY)
+					continue;
+				bigtime_t time = info.user_time + info.kernel_time;
+				bigtime_t previous = watch_previous_time(info.thread,
+					time);
+				bigtime_t delta = previous > 0 ? time - previous : 0;
+				for (int i = 0; i < 5; i++) {
+					if (delta <= top[i].delta)
+						continue;
+					memmove(&top[i + 1], &top[i], (4 - i) * sizeof(top[0]));
+					top[i].id = info.thread;
+					top[i].team = team.team;
+					top[i].delta = delta;
+					strlcpy(top[i].name, info.name, sizeof(top[i].name));
+					break;
+				}
+			}
+		}
+		used = snprintf(line, sizeof(line), "watch: top");
+		for (int i = 0; i < 5 && top[i].delta > 0; i++) {
+			used += snprintf(line + used, sizeof(line) - used, " %s(%" B_PRId32
+				"/%" B_PRId32 ") %" B_PRId64 "%%;", top[i].name, top[i].id,
+				top[i].team, top[i].delta * 100 / elapsed);
+		}
+		dprintf(DRIVER_NAME ": %s\n", line);
+
+		used = snprintf(line, sizeof(line), "watch: usb");
+		for (int p = 0; p < 2; p++) {
+			rx_counters now = sRxCounters[p];
+			used += snprintf(line + used, sizeof(line) - used, " %s %" B_PRId64
+				" xfers %" B_PRId64 " KB/s %" B_PRId64 " pkts (full %" B_PRId32
+				" cut %" B_PRId32 " err %" B_PRId32 " max %" B_PRIu32
+				" idle %" B_PRId64 " ms);", p == 0 ? "data" : "msg",
+				now.transfers - lastRx[p].transfers,
+				(now.bytes - lastRx[p].bytes) * 1000 / elapsed,
+				now.packets - lastRx[p].packets, now.full - lastRx[p].full,
+				now.cut - lastRx[p].cut, now.errors - lastRx[p].errors,
+				now.longest, now.last > 0 ? (system_time() - now.last) / 1000
+					: -1);
+			lastRx[p] = now;
+		}
+		used += snprintf(line + used, sizeof(line) - used, " tx %" B_PRId64
+			"/%" B_PRId64 " ring %" B_PRId32 " busy %d full %" B_PRId32
+			" err %" B_PRIu32, sTxQueued, sTxCompleted, sTxCount, sTxBusy,
+			sTxRingFull, sTxErrors);
+		dprintf(DRIVER_NAME ": %s\n", line);
+
+		used = snprintf(line, sizeof(line), "watch: threads");
+		size_t left = sizeof(line) - used;
+		watch_thread_state(sDataRx.thread, "data", line + used, left);
+		used = strlen(line);
+		watch_thread_state(sMessageRx.thread, "msg", line + used,
+			sizeof(line) - used);
+		used = strlen(line);
+		watch_thread_state(sWatchWork, "work", line + used,
+			sizeof(line) - used);
+		dprintf(DRIVER_NAME ": %s\n", line);
+	}
+	return B_OK;
+}
+
+
+static void
+watch_start()
+{
+	if (!sWatch || sWatchThread >= 0)
+		return;
+	sWatchSamples = (watch_sample*)calloc(WATCH_THREADS, sizeof(watch_sample));
+	sWatchSem = create_sem(0, DRIVER_NAME " watch");
+	if (sWatchSamples == NULL || sWatchSem < 0)
+		return;
+	static bool registered = false;
+	if (!registered) {
+		// (the registry lives as long as the driver; the driver's own locks
+		// come in once, at attachment)
+		aic_usb_watch_lock("tx", &sTxLock, NULL);
+		aic_usb_watch_lock("request", &sRequestLock, NULL);
+		aic_usb_watch_lock("confirm", &sConfirmLock, NULL);
+		aic_usb_watch_lock("device", &sDeviceLock, NULL);
+		registered = true;
+	}
+	sWatchThread = spawn_kernel_thread(watch_thread, DRIVER_NAME " watch",
+		B_REAL_TIME_DISPLAY_PRIORITY, NULL);
+	if (sWatchThread >= 0)
+		resume_thread(sWatchThread);
+}
+
+
+static void
+watch_stop()
+{
+	if (sWatchThread < 0)
+		return;
+	release_sem(sWatchSem);
+	status_t result;
+	wait_for_thread(sWatchThread, &result);
+	sWatchThread = -1;
+	delete_sem(sWatchSem);
+	sWatchSem = -1;
+	free(sWatchSamples);
+	sWatchSamples = NULL;
 }
 
 
@@ -828,6 +1163,7 @@ aic_usb_init_hardware()
 	void* settings = load_driver_settings(DRIVER_NAME);
 	if (settings != NULL) {
 		sDebug = get_driver_boolean_parameter(settings, "debug", false, true);
+		sWatch = get_driver_boolean_parameter(settings, "watch", false, true);
 		unload_driver_settings(settings);
 	}
 
@@ -948,6 +1284,8 @@ aic_usb_start(const aic_usb_callbacks* callbacks, void* cookie)
 	}
 	if (status != B_OK)
 		aic_usb_stop();
+	else
+		watch_start();
 	return status;
 }
 
@@ -956,6 +1294,7 @@ void
 aic_usb_stop()
 {
 	sRunning = false;
+	watch_stop();
 	rx_stop(&sMessageRx);
 	rx_stop(&sDataRx);
 
@@ -1075,6 +1414,7 @@ aic_usb_send(const void* frame, size_t length)
 		return B_DEV_NOT_READY;
 	if (sTxCount == TX_SLOTS) {
 		sTxWasFull = true;
+		sTxRingFull++;
 		return B_WOULD_BLOCK;
 	}
 
