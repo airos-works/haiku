@@ -16,6 +16,7 @@
 
 static_assert(sizeof(amdgpu_uvd_timeout_test) == 48, "UVD timeout ABI");
 static_assert(sizeof(amdgpu_sdma_timeout_test) == 48, "SDMA timeout ABI");
+static_assert(sizeof(amdgpu_video_sdma_timeout_test) == 24, "video SDMA timeout ABI");
 static const uint64 kVA = 0x300000000ULL;
 static const uint32 kGuard = 0x6b6b6b6b, kSeed = 0x5100dec0;
 static void Require(bool okay, const char* why)
@@ -98,9 +99,11 @@ static Decoder Create(bool hevc)
 		(unsigned long long)d.Handle(), (unsigned long long)d.Storage().vram, (unsigned long long)d.Storage().ram);
 	return d;
 }
-static bool Decode(const Decoder& d, bool lost = false, bool racing = false)
+static bool Decode(const Decoder& d, bool lost = false, bool racing = false,
+	uint32 sdmaStage = 0, status_t* failure = NULL)
 {
 	std::vector<uint8> pixels(d.Output(), 0x7b);
+	bigtime_t started = system_time();
 	int status;
 	uint32 sequence, fence, rptr, wptr, guards, vm;
 	if (d.hevc) {
@@ -121,7 +124,20 @@ static bool Decode(const Decoder& d, bool lost = false, bool racing = false)
 		sequence = r.sequence; fence = r.fence; rptr = r.rptr; wptr = r.wptr;
 		guards = r.guard_mismatches; vm = r.vm_fault_status;
 	}
-	if (lost || (racing && status < 0)) {
+	if (sdmaStage) {
+		status_t error = errno;
+		bigtime_t elapsed = system_time() - started;
+		printf("Video SDMA stage %u ioctl %d status %#x UVD fence %u/%u ring %u/%u elapsed %lld us\n",
+			sdmaStage, status, (unsigned)error, fence, sequence, rptr, wptr, (long long)elapsed);
+		Require(status == -1 && (error == B_TIMED_OUT || error == B_DEV_NOT_READY)
+			&& elapsed >= 500000 && !guards && !(vm & 0xff), "decode reaches actual SDMA timeout");
+		Require(sdmaStage == AMDGPU_VIDEO_SDMA_READBACK
+			? sequence && sequence == fence && rptr == wptr : !sequence && !fence,
+			"UVD completes before readback failure, or has not started before clear failure");
+		for (uint8 byte : pixels) Require(byte == 0x7b, "DMA failure publishes no partial video output");
+		if (failure != NULL) *failure = error;
+		return false;
+	} else if (lost || (racing && status < 0)) {
 		Require(status == -1 && errno == B_DEV_NOT_READY && (racing || (!sequence && !fence)),
 			"lost decoder rejects a new submission");
 		for (uint8 byte : pixels) Require(byte == 0x7b, "lost decoder preserves every output sentinel");
@@ -192,6 +208,8 @@ struct VideoThread {
 	int createFD;
 	bool active;
 	int32 frames, done;
+	uint32 sdmaStage;
+	status_t failure;
 };
 static int32 VideoWorker(void* data)
 {
@@ -201,6 +219,8 @@ static int32 VideoWorker(void* data)
 		Require(ioctl(t.createFD, AMDGPU_HEVC_CREATE, &r, sizeof(r)) < 0
 			&& errno == B_DEV_NOT_READY && !r.handle && !r.output_bytes && !r.allocated_bytes,
 			"waiting create cannot publish a session after its file is lost");
+	} else if (t.sdmaStage) {
+		Decode(*t.decoder, false, false, t.sdmaStage, &t.failure);
 	} else if (t.active) {
 		while (Decode(*t.decoder, false, true)) atomic_add(&t.frames, 1);
 	} else Decode(*t.decoder, true);
@@ -314,6 +334,88 @@ static void SdmaTimeout(int monitor)
 	Require(result == 0 && (r.status == B_TIMED_OUT || r.status == B_DEV_NOT_READY)
 		&& r.sequence && !r.fence && r.elapsed_us >= 500000,
 		"actual non-retiring SDMA memory poll reaches bounded timeout");
+}
+
+static void ArmVideoSdma(const Decoder& d, uint32 stage)
+{
+	auto r = Request<amdgpu_video_sdma_timeout_test>(); r.handle = d.Handle(); r.stage = stage;
+	Require(ioctl(d.fd, AMDGPU_VIDEO_SDMA_TIMEOUT_TEST, &r, sizeof(r)) == 0, "arm this decoder's next DMA boundary");
+	Require(ioctl(d.fd, AMDGPU_VIDEO_SDMA_TIMEOUT_TEST, &r, sizeof(r)) < 0 && errno == B_BUSY,
+		"cannot replace an existing decoder fault arm");
+}
+
+static void VideoSdmaABI(const Decoder& d, const Decoder& peer, uint32 stage)
+{
+	auto valid = Request<amdgpu_video_sdma_timeout_test>(); valid.handle = d.Handle(); valid.stage = stage;
+	for (uint32 variant = 0; variant < 7; variant++) {
+		auto r = valid; size_t length = sizeof(r);
+		if (variant == 0) r.version++;
+		if (variant == 1) r.size--;
+		if (variant == 2) length--;
+		if (variant == 3) r.stage = 0;
+		if (variant == 4) r.stage = 3;
+		if (variant == 5) r.reserved = 1;
+		if (variant == 6) r.handle = peer.Handle();
+		Require(ioctl(d.fd, AMDGPU_VIDEO_SDMA_TIMEOUT_TEST, &r, length) < 0 && errno == B_BAD_VALUE,
+			"bad decoder fault ABI and foreign handle rejected");
+	}
+	int empty = Open(), ro = open("/dev/" AMDGPU_DEVICE_NAME, O_RDONLY);
+	Require(ioctl(empty, AMDGPU_VIDEO_SDMA_TIMEOUT_TEST, &valid, sizeof(valid)) < 0 && errno == B_BAD_VALUE,
+		"arm requires the calling file's own decoder");
+	Require(ro >= 0 && ioctl(ro, AMDGPU_VIDEO_SDMA_TIMEOUT_TEST, &valid, sizeof(valid)) < 0
+		&& errno == B_NOT_ALLOWED, "read-only decoder arm denied");
+	close(empty); close(ro);
+	void* address = NULL;
+	area_id area = create_area("video DMA arm protection", &address, B_ANY_ADDRESS,
+		B_PAGE_SIZE, B_NO_LOCK, B_READ_AREA | B_WRITE_AREA);
+	Require(area >= 0, "allocate protected video arm request");
+	*(amdgpu_video_sdma_timeout_test*)address = valid;
+	Require(set_area_protection(area, B_READ_AREA) == B_OK, "protect video arm request");
+	Require(ioctl(d.fd, AMDGPU_VIDEO_SDMA_TIMEOUT_TEST, address, sizeof(valid)) < 0
+		&& errno == B_BAD_ADDRESS, "unwritable video arm rejected before mutation");
+	Require(delete_area(area) == B_OK, "release video arm request");
+	pid_t child = fork(); Require(child >= 0, "fork video arm privilege check");
+	if (child == 0) {
+		Require(setgid(65534) == 0 && setuid(65534) == 0, "drop video arm privilege");
+		int fd = Open();
+		Require(ioctl(fd, AMDGPU_VIDEO_SDMA_TIMEOUT_TEST, &valid, sizeof(valid)) < 0
+			&& errno == B_NOT_ALLOWED, "ordinary client cannot arm decoder DMA failure");
+		close(fd); _exit(0);
+	}
+	int result;
+	Require(waitpid(child, &result, 0) == child && WIFEXITED(result) && !WEXITSTATUS(result), "video arm child");
+	Decode(d); // Rejected arms must leave the session usable.
+	Decoder discarded = Create(d.hevc); ArmVideoSdma(discarded, stage); Destroy(discarded, false);
+	Decoder fresh = Create(d.hevc); Decode(fresh); Destroy(fresh, false);
+	puts("PASS: decoder DMA arm ABI/privilege/ownership; rejected arms and destroyed armed sessions leave decoding healthy");
+}
+
+static void VideoSdmaTimeout(Graphics& graphics, const Decoder& d, const Decoder& peer, uint32 stage)
+{
+	VideoSdmaABI(d, peer, stage);
+	ArmVideoSdma(d, stage); Decode(peer); // Arming one decoder cannot affect another.
+	VideoThread running = {&d, -1, false, 0, 0, stage, B_OK};
+	thread_id worker = Start(running); WaitBusy(d.fd, running);
+	std::vector<uint64> fences;
+	if (graphics.fd >= 0) {
+		for (uint32 i = 0; i < 16; i++) {
+			auto dma = Request<amdgpu_dma_submit>(); dma.operation = AMDGPU_DMA_FILL;
+			dma.destination = graphics.buffer.handle; dma.destination_offset = 4096 + i * 4;
+			dma.bytes = 4; dma.value = 0xbad05100;
+			Require(ioctl(graphics.fd, AMDGPU_SUBMIT_DMA, &dma, sizeof(dma)) == 0 && dma.fence,
+				"accept cancellable DMA while decoder owns SDMA"); fences.push_back(dma.fence);
+		}
+		auto pending = Info<amdgpu_recovery_info>(graphics.fd, AMDGPU_RECOVERY_INFO);
+		Require(pending.status == B_OK && pending.pending == fences.size(), "all accepted DMA waits behind decoder");
+	}
+	Join(worker);
+	for (uint64 fence : fences) {
+		auto wait = Request<amdgpu_fence_wait>(); wait.fence = fence; wait.timeout_us = 5000000;
+		Require(ioctl(graphics.fd, AMDGPU_WAIT_FENCE, &wait, sizeof(wait)) == 0
+			&& wait.status == running.failure, "each queued DMA retains the originating decoder DMA error");
+	}
+	if (graphics.fd >= 0) GraphicsCheck(graphics);
+	printf("PASS: decoder SDMA failure leaves output untouched and cancels %zu accepted DMA jobs with exact guards\n", fences.size());
 }
 
 // Standalone SDMA ownership before either graphics or video has initialized.
@@ -455,18 +557,28 @@ int main(int argc, char** argv)
 		puts("PASS: failed reset remains terminal, both manual APIs refuse retry, all quarantine retained"); return 0;
 	}
 	Require(argc == 5 && geteuid() == 0,
-		"usage: amdgpu_video_recovery --baseline|--auto-cp|--auto-waiters|--auto-decode|--auto-hevc-decode|--manual-fault|--recover-closed|--uvd-baseline|--uvd-only|--uvd-auto|--uvd-manual|--sdma-video|--sdma-auto|--sdma-manual avc.nv12 hevc.au hevc.padded");
+		"usage: amdgpu_video_recovery --baseline|--auto-cp|--auto-waiters|--auto-decode|--auto-hevc-decode|--manual-fault|--recover-closed|--uvd-baseline|--uvd-only|--uvd-auto|--uvd-manual|--sdma-video|--sdma-auto|--sdma-manual|--sdma-clear|--sdma-clear-hevc|--sdma-readback|--sdma-readback-hevc|--sdma-readback-only|--sdma-readback-manual|--sdma-readback-hevc-manual avc.nv12 hevc.au hevc.padded");
+	uint32 videoSdmaStage = 0;
+	if (strcmp(argv[1], "--sdma-clear") == 0 || strcmp(argv[1], "--sdma-clear-hevc") == 0)
+		videoSdmaStage = AMDGPU_VIDEO_SDMA_CLEAR;
+	for (const char* mode : {"--sdma-readback", "--sdma-readback-hevc", "--sdma-readback-only",
+		"--sdma-readback-manual", "--sdma-readback-hevc-manual"})
+		if (strcmp(argv[1], mode) == 0) videoSdmaStage = AMDGPU_VIDEO_SDMA_READBACK;
+	bool videoSdmaHevc = strcmp(argv[1], "--sdma-clear-hevc") == 0
+		|| strcmp(argv[1], "--sdma-readback-hevc") == 0 || strcmp(argv[1], "--sdma-readback-hevc-manual") == 0;
+	bool videoSdmaManual = strcmp(argv[1], "--sdma-readback-manual") == 0
+		|| strcmp(argv[1], "--sdma-readback-hevc-manual") == 0;
 	bool noGfx = strcmp(argv[1], "--uvd-only") == 0 || strcmp(argv[1], "--uvd-baseline") == 0
+		|| strcmp(argv[1], "--sdma-video") == 0 || strcmp(argv[1], "--sdma-readback-only") == 0;
+	bool sdma = videoSdmaStage || strcmp(argv[1], "--sdma-auto") == 0 || strcmp(argv[1], "--sdma-manual") == 0
 		|| strcmp(argv[1], "--sdma-video") == 0;
-	bool sdma = strcmp(argv[1], "--sdma-auto") == 0 || strcmp(argv[1], "--sdma-manual") == 0
-		|| strcmp(argv[1], "--sdma-video") == 0;
-	bool uvd = (noGfx && !sdma) || strcmp(argv[1], "--uvd-auto") == 0 || strcmp(argv[1], "--uvd-manual") == 0;
+	bool uvd = videoSdmaStage || (noGfx && !sdma) || strcmp(argv[1], "--uvd-auto") == 0 || strcmp(argv[1], "--uvd-manual") == 0;
 	bool baseline = strcmp(argv[1], "--baseline") == 0 || strcmp(argv[1], "--uvd-baseline") == 0;
 	bool recoverClosed = strcmp(argv[1], "--recover-closed") == 0;
 	bool waiters = strcmp(argv[1], "--auto-waiters") == 0;
 	bool activeHevc = strcmp(argv[1], "--auto-hevc-decode") == 0;
 	bool active = activeHevc || strcmp(argv[1], "--auto-decode") == 0;
-	bool automatic = waiters || active || strcmp(argv[1], "--auto-cp") == 0
+	bool automatic = (videoSdmaStage && !videoSdmaManual) || waiters || active || strcmp(argv[1], "--auto-cp") == 0
 		|| strcmp(argv[1], "--uvd-only") == 0 || strcmp(argv[1], "--uvd-auto") == 0
 		|| strcmp(argv[1], "--sdma-auto") == 0 || strcmp(argv[1], "--sdma-video") == 0;
 	Require(baseline || automatic || recoverClosed || uvd || sdma || strcmp(argv[1], "--manual-fault") == 0, "explicit recovery mode");
@@ -523,7 +635,8 @@ int main(int argc, char** argv)
 	CheckAllocation(monitor, all);
 	uint32 racingFrames = 0;
 	if (!baseline) {
-		if (sdma) SdmaTimeout(monitor);
+		if (videoSdmaStage) VideoSdmaTimeout(graphics, d[videoSdmaHevc ? 1 : 0], d[videoSdmaHevc ? 0 : 1], videoSdmaStage);
+		else if (sdma) SdmaTimeout(monitor);
 		else if (uvd) UvdTimeout(monitor);
 		else if (waiters) FaultWithWaiters(graphics, d[0]);
 		else {
@@ -608,6 +721,6 @@ int main(int argc, char** argv)
 	Require(final.status == B_OK && !final.live_handles && !final.live_vms && !final.live_videos
 		&& !final.pending && !final.buffers && !final.vms && !final.videos, "no leaked owners or quarantine");
 	printf("PASS: %s, %u exact decoded frames, 16 recreated sessions, generation %llu, healthy fences %llu\n",
-		argv[1], 20 + racingFrames, (unsigned long long)final.generation, (unsigned long long)irq.completed_fences);
+		argv[1], 20 + racingFrames + (videoSdmaStage ? 3 : 0), (unsigned long long)final.generation, (unsigned long long)irq.completed_fences);
 	close(monitor); delete sHevc; return 0;
 }

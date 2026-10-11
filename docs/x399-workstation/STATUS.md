@@ -4,16 +4,16 @@ Status values are backed by observation on the workstation. Anything not
 listed as verified is untested.
 
 **2026-10-11 WX 5100 status:** the X399 now has a Radeon Pro WX 5100.
-Current driver `c7ca36bf…` and private Mesa `42352938…` qualify SDMA0 reset
-after real memory-poll timeouts, including retained RAM/VRAM buffers and
-H.264/HEVC sessions. SDMA recovers before graphics startup; healthy UVD stays
-running. Existing UVD and GFX recovery regressions pass. Fourteen recovery
-generations and the subsequent 1,106-job regression leave 1,108 healthy
-completions, zero GPU errors and no live resources/quarantine. Automatic
-policy is enabled with ten successful attempts; verified backups remain.
-Failure during decoder DMA readback, app-level recovery, remaining shader
-isolation, native display and the full release remain open. Details are in
-[the SDMA checkpoint](WX5100.md#sdma0-recovery-with-retained-buffers-and-decoders-2026-10-11).
+Current driver `a4aebce1…` and private Mesa `42352938…` qualify combined
+SDMA/UVD/GFX recovery from real DMA timeouts at decoder clear/readback
+boundaries. H.264, HEVC Main and Main10 preserve user output and retained
+storage; accepted queued DMA is canceled and fresh decoders produce exact
+pixels. Thirteen recovery generations and the subsequent 1,106-job regression
+leave 1,108 healthy completions, zero GPU errors and no live resources or
+quarantine. Automatic policy has ten successful attempts; backups are verified.
+Application recovery, remaining shader isolation, eviction/migration, native
+display and the full release remain open. Details are in
+[the decoder DMA checkpoint](WX5100.md#decoder-dma-failure-and-combined-engine-recovery-2026-10-11).
 
 The earlier checkpoints below trace this work. The NVIDIA results describe the previous card. AMD desktop output still
 uses the firmware framebuffer. SDMA and the full 61-submission bounded GFX diagnostic pass, including

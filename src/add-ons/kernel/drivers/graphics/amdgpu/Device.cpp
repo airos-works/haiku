@@ -1343,6 +1343,24 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 	if (client->team != team_get_current_team_id()
 		|| (client->flags & O_ACCMODE) != O_RDWR)
 		return B_NOT_ALLOWED;
+	if (op == AMDGPU_VIDEO_SDMA_TIMEOUT_TEST) {
+		amdgpu_video_sdma_timeout_test request;
+		status_t status = ReadRequest(request, data, length);
+		if (status != B_OK) return status;
+		if (request.reserved || (request.stage != AMDGPU_VIDEO_SDMA_CLEAR
+			&& request.stage != AMDGPU_VIDEO_SDMA_READBACK)) return B_BAD_VALUE;
+		if (sFault != B_OK || client->loss != B_OK) return B_DEV_NOT_READY;
+		if (client->videoBusy || sPending || sGraphicsExecuting || sVideoExecuting) return B_BUSY;
+		UvdSession* session = client->video;
+		if (session == NULL || !session->created || request.handle != session->handle)
+			return B_BAD_VALUE;
+		if (session->sdmaTimeoutStage) return B_BUSY;
+		// Prove output accessibility before changing the session. sMutex and
+		// videoBusy exclude decode/destroy races; the arm never leaves its owner.
+		status = user_memcpy(data, &request, sizeof(request));
+		if (status == B_OK) session->sdmaTimeoutStage = request.stage;
+		return status;
+	}
 	if (op == AMDGPU_SDMA_TIMEOUT_TEST) {
 		amdgpu_sdma_timeout_test request;
 		status_t status = ReadRequest(request, data, length);
