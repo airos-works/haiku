@@ -185,11 +185,127 @@ static amdgpu_recovery_info Recovery(int fd, uint32 op)
 	Require(ioctl(fd, op, &r, sizeof(r)) == 0, "recovery query/control request"); return r;
 }
 
+static_assert(sizeof(amdgpu_client_status) == 64, "client status ABI");
+static amdgpu_client_status ClientStatus(int fd)
+{
+	auto r = Request<amdgpu_client_status>();
+	Require(ioctl(fd, AMDGPU_CLIENT_STATUS, &r, sizeof(r)) == 0, "read persistent owning-client status");
+	return r;
+}
+static void Lost(int fd, uint64 generation, bool recovered, uint64 submitted, uint64 failed)
+{
+	auto r = ClientStatus(fd);
+	Require(r.flags == uint32(AMDGPU_CLIENT_LOST | (recovered ? AMDGPU_CLIENT_RESET_COMPLETED : 0))
+		&& r.status == B_BAD_DATA && r.device_status == (recovered ? B_OK : B_BAD_DATA)
+		&& r.generation == generation + uint64(recovered) && r.loss_generation == generation
+		&& r.submitted == submitted && r.completed == submitted && r.failed_fence == failed,
+		"client loss, recovery completion and original fence timeline persist independently");
+	auto b = Request<amdgpu_buffer>(); b.bytes = 4096;
+	Require(ioctl(fd, AMDGPU_CREATE_SYSTEM_BUFFER, &b, sizeof(b)) < 0
+		&& errno == B_DEV_NOT_READY && !b.handle, "every lost client rejects new allocation");
+	auto vm = Request<amdgpu_vm_info>();
+	Require(ioctl(fd, AMDGPU_VM_INFO, &vm, sizeof(vm)) < 0 && errno == B_DEV_NOT_READY,
+		"every lost client rejects VM creation/mutation");
+}
+static void VramPixels(const amdgpu_buffer& b)
+{
+	for (unsigned i = 0; i < 1024; i++)
+		Require(((volatile uint32*)(addr_t)b.address)[i] == (kGuard ^ i),
+			"live VRAM allocation retains every CPU-visible word across reset and fresh work");
+}
+static void ClientStatusABI(int fd)
+{
+	for (unsigned i = 0; i < 5; i++) {
+		auto r = Request<amdgpu_client_status>(); size_t bytes = sizeof(r);
+		if (i == 0) r.version++;
+		if (i == 1) r.size--;
+		if (i == 2) bytes--;
+		if (i == 3) r.flags = 1;
+		if (i == 4) r.reserved = 1;
+		Require(ioctl(fd, AMDGPU_CLIENT_STATUS, &r, bytes) < 0 && errno == B_BAD_VALUE,
+			"client status validates ABI, flags and reserved input");
+	}
+	int ro = open("/dev/" AMDGPU_DEVICE_NAME, O_RDONLY);
+	auto r = Request<amdgpu_client_status>();
+	Require(ro >= 0 && ioctl(ro, AMDGPU_CLIENT_STATUS, &r, sizeof(r)) < 0
+		&& errno == B_NOT_ALLOWED, "read-only status file denied"); close(ro);
+}
+static void LiveRecovery(int monitor, Client& gate, Client& bad, Client& idle,
+	amdgpu_buffer& vram, int dma, amdgpu_buffer& dmaBuffer,
+	const amdgpu_memory_info& baselineMemory, const amdgpu_gart_info& baselineRam,
+	const amdgpu_memory_info& memory, const amdgpu_gart_info& ram)
+{
+	auto q = Recovery(monitor, AMDGPU_RECOVERY_INFO);
+	uint64 generation = q.generation;
+	int late = Open(); // Even a resource-free file opened during the fault stays lost.
+	Lost(gate.fd, generation, false, 8, 2); Lost(bad.fd, generation, false, 16, 1);
+	Lost(dma, generation, false, 3, 2); Lost(idle.fd, generation, false, 0, 0);
+	Lost(late, generation, false, 0, 0); Lost(monitor, generation, false, 0, 0);
+	ClientStatusABI(idle.fd);
+	Pixels(idle, 1); VramPixels(vram);
+	// Mix one closed quarantined owner with three retained resource owners.
+	Close(gate);
+	q = Recovery(monitor, AMDGPU_RECOVERY_INFO);
+	Require(q.buffers == 1 && q.vms == 1 && q.live_handles == 4 && q.live_vms == 2
+		&& !q.live_videos && !q.pending && !q.videos, "one closed VM, live faulting/idle/DMA clients");
+	Require(Recovery(monitor, AMDGPU_GFX_RECOVER).status == B_BUSY,
+		"original closed-resource recovery contract remains strict");
+	printf("Live terminal: generation %llu, live handles/VMs %u/%u, quarantine %llu/%llu; one explicit reset\n",
+		(unsigned long long)generation, q.live_handles, q.live_vms,
+		(unsigned long long)q.quarantined_vram, (unsigned long long)q.quarantined_ram);
+	auto reset = Recovery(monitor, AMDGPU_GFX_RECOVER_LIVE);
+	printf("Live recovery status %#x stage %u generation %llu reclaimed %llu/%llu\n",
+		(unsigned)reset.status, reset.stage, (unsigned long long)reset.generation,
+		(unsigned long long)reset.reclaimed_vram, (unsigned long long)reset.reclaimed_ram);
+	Require(reset.status == B_OK && reset.stage == 7 && reset.generation == generation + 1
+		&& reset.reclaimed_vram == q.quarantined_vram && reset.reclaimed_ram == q.quarantined_ram
+		&& !reset.buffers && !reset.vms && !reset.quarantined_vram && !reset.quarantined_ram
+		&& reset.live_handles == 4 && reset.live_vms == 2 && IRQ(monitor).completed_fences == 1,
+		"one live-client reset proves hardware, reclaims only closed quarantine, retains live ownership");
+	Require(Memory(monitor).allocated_bytes == memory.allocated_bytes - q.quarantined_vram
+		&& Gart(monitor).allocated_bytes == ram.allocated_bytes - q.quarantined_ram,
+		"live allocations remain charged to independent allocators");
+	for (unsigned round = 0; round < 2; round++) {
+		Lost(bad.fd, generation, true, 16, 1); Lost(dma, generation, true, 3, 2);
+		Lost(idle.fd, generation, true, 0, 0); Lost(late, generation, true, 0, 0);
+		Lost(monitor, generation, true, 0, 0);
+		for (uint64 fence = 1; fence <= 16; fence++) DmaWait(bad.fd, fence, B_BAD_DATA);
+		DmaWait(dma, 1, B_OK); DmaWait(dma, 2, B_BAD_DATA); DmaWait(dma, 3, B_BAD_DATA);
+		Enqueue(bad, Commands(bad, 0), B_DEV_NOT_READY);
+		Enqueue(idle, Commands(idle, 1), B_DEV_NOT_READY);
+		auto words = Commands(idle, 1); auto sync = Request<amdgpu_gfx_submit>();
+		sync.address = (addr_t)words.data(); sync.dwords = words.size(); sync.flags = AMDGPU_GFX_VALIDATE_COMMANDS;
+		Require(ioctl(idle.fd, AMDGPU_GFX_SUBMIT_COPY, &sync, sizeof(sync)) < 0
+			&& errno == B_DEV_NOT_READY, "successful synchronous-only client stays lost after recovery");
+		Pixels(bad, 0); Pixels(idle, 1); VramPixels(vram); DmaPixels(dmaBuffer, 0x51510001);
+		if (round == 0) {
+			Client fresh = Create(33); auto healthy = ClientStatus(fresh.fd);
+			Require(!healthy.flags && healthy.status == B_OK && healthy.device_status == B_OK
+				&& healthy.generation == generation + 1, "fresh client starts healthy in recovered generation");
+			Enqueue(fresh, Commands(fresh, 0)); Wait(fresh); Pixels(fresh, 1); Close(fresh);
+			int nextDma = Open(); auto nextBuffer = DmaBuffer(nextDma);
+			DmaFill(nextDma, nextBuffer, 1, 0x5151abcd); DmaWait(nextDma, 1, B_OK);
+			DmaPixels(nextBuffer, 0x5151abcd); DmaFree(nextDma, nextBuffer); close(nextDma);
+		}
+	}
+	Require(Recovery(monitor, AMDGPU_GFX_RECOVER_LIVE).status == B_NOT_ALLOWED,
+		"healthy live device does not reset again");
+	Close(bad); Close(idle); Require(delete_area(vram.area) == B_OK, "delete revoked VRAM clone");
+	DmaFree(dma, dmaBuffer); close(dma); close(late);
+	q = Recovery(monitor, AMDGPU_RECOVERY_INFO);
+	Require(!q.live_handles && !q.live_vms && !q.buffers && !q.vms && !q.quarantined_vram && !q.quarantined_ram
+		&& Memory(monitor).allocated_bytes == baselineMemory.allocated_bytes
+		&& Gart(monitor).allocated_bytes == baselineRam.allocated_bytes
+		&& IRQ(monitor).completed_fences == 2, "old live owner cleanup fully reclaims original allocations");
+	puts("PASS: retained live graphics/DMA/idle clients, persistent loss and recovery status, unchanged old fences,"
+		" all RAM/VRAM guards, fresh isolated work, exact closed/live reclamation");
+}
+
 // Deliberately causes a terminal GPU VM write fault. Run only on an idle
 // qualification boot with a verified recovery path, never as a smoke test.
 // --fault-recovery explicitly requests ONE reset after all expected terminal
 // fault/quarantine checks pass. It never retries a failure or observation timeout.
-static void FaultQualification(int monitor, bool recover)
+static void FaultQualification(int monitor, bool recover, bool live = false)
 {
 	auto before = IRQ(monitor);
 	auto baselineMemory = Memory(monitor); auto baselineRam = Gart(monitor);
@@ -199,6 +315,24 @@ static void FaultQualification(int monitor, bool recover)
 		dmaBuffer = DmaBuffer(dma);
 		DmaFill(dma, dmaBuffer, 1, 0x51510001); DmaWait(dma, 1, B_OK);
 		DmaPixels(dmaBuffer, 0x51510001);
+	}
+	Client idle = {}; amdgpu_buffer vram = {};
+	if (live) {
+		idle = Create(29); auto words = Commands(idle, 0);
+		auto sync = Request<amdgpu_gfx_submit>(); sync.address = (addr_t)words.data();
+		sync.dwords = words.size(); sync.flags = AMDGPU_GFX_VALIDATE_COMMANDS;
+		Require(ioctl(idle.fd, AMDGPU_GFX_SUBMIT_COPY, &sync, sizeof(sync)) == 0
+			&& sync.status == B_OK && sync.completion, "innocent synchronous-only client completed before fault");
+		Pixels(idle, 1);
+		vram = Request<amdgpu_buffer>(); vram.bytes = 4096;
+		Require(ioctl(idle.fd, AMDGPU_CREATE_BUFFER, &vram, sizeof(vram)) == 0
+			&& ioctl(idle.fd, AMDGPU_MAP_BUFFER, &vram, sizeof(vram)) == 0, "retain CPU-visible VRAM owner");
+		for (unsigned i = 0; i < 1024; i++) {
+			Require(((volatile uint32*)(addr_t)vram.address)[i] == 0, "fresh retained VRAM is zero");
+			((volatile uint32*)(addr_t)vram.address)[i] = kGuard ^ i;
+		}
+		__sync_synchronize();
+		before = IRQ(monitor);
 	}
 	Client gate = Create(30), bad = Create(31);
 	const uint64 readOnly = 0x400000000ULL;
@@ -255,6 +389,11 @@ static void FaultQualification(int monitor, bool recover)
 		&& irq.completed_fences <= before.completed_fences + 2,
 		"independent VM fault; only the gate and faulting job reached hardware");
 	Enqueue(gate, Commands(gate, 8), B_DEV_NOT_READY);
+	if (live) {
+		LiveRecovery(monitor, gate, bad, idle, vram, dma, dmaBuffer,
+			baselineMemory, baselineRam, memory, ram);
+		return;
+	}
 	Close(gate); Close(bad);
 	if (recover) DmaFree(dma, dmaBuffer);
 	Require(Memory(monitor).faulted && !Memory(monitor).pending_jobs
@@ -331,17 +470,24 @@ int main(int argc, char** argv)
 		Require(setgid(65534) == 0 && setuid(65534) == 0, "drop credentials");
 		int fd = Open(); auto r = Request<amdgpu_gfx_queue>();
 		Require(ioctl(fd, AMDGPU_GFX_QUEUE_COPY, &r, sizeof(r)) == -1 && errno == B_NOT_ALLOWED,
-			"queued general graphics retains root gate"); close(fd);
+			"queued general graphics retains root gate");
+		auto memory = Memory(fd); (void)memory; // Existing ordinary metadata initializes if needed.
+		auto state = ClientStatus(fd); Require(!state.flags && state.status == B_OK, "ordinary owning-client status");
+		ClientStatusABI(fd);
+		auto reset = Request<amdgpu_recovery_info>();
+		Require(ioctl(fd, AMDGPU_GFX_RECOVER_LIVE, &reset, sizeof(reset)) < 0 && errno == B_NOT_ALLOWED,
+			"live recovery retains root gate"); close(fd);
 		puts("PASS: asynchronous graphics retains root restriction"); return 0;
 	}
 	bool smoke = argc == 2 && strcmp(argv[1], "--smoke") == 0;
 	bool fault = argc == 2 && strcmp(argv[1], "--fault") == 0;
-	bool recover = argc == 2 && strcmp(argv[1], "--fault-recovery") == 0;
+	bool live = argc == 2 && strcmp(argv[1], "--live-recovery") == 0;
+	bool recover = live || (argc == 2 && strcmp(argv[1], "--fault-recovery") == 0);
 	Require((argc == 1 || smoke || fault || recover) && geteuid() == 0, "queue qualification requires root");
 	int monitor = Open(); auto render = Request<amdgpu_render_info>();
 	Require(ioctl(monitor, AMDGPU_RENDER_INFO, &render, sizeof(render)) == 0
 		&& (render.capabilities & AMDGPU_RENDER_QUEUE_COPY), "queued graphics capability");
-	if (fault || recover) { FaultQualification(monitor, recover); close(monitor); return 0; }
+	if (fault || recover) { FaultQualification(monitor, recover, live); close(monitor); return 0; }
 	auto before = IRQ(monitor); auto memory = Memory(monitor); auto ram = Gart(monitor);
 	Client c[5]; for (unsigned i = 0; i < 5; i++) c[i] = Create(i + 1);
 	// Malformed requests and inaccessible sources cannot submit work.

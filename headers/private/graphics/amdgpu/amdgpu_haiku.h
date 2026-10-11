@@ -54,12 +54,17 @@ enum {
 	AMDGPU_GWS_INFO,
 	AMDGPU_OA_INFO,
 	AMDGPU_RECOVERY_INFO,
-	AMDGPU_GFX_RECOVER
+	AMDGPU_GFX_RECOVER,
+	AMDGPU_GFX_RECOVER_LIVE,
+	AMDGPU_CLIENT_STATUS
 };
 
 // Root-only recovery bring-up. INFO only observes retained bookkeeping.
 // RECOVER requires a terminal graphics fault and no live GPU resources or
 // work. It never retries a failed hardware reset. flags/reserved must be zero.
+// RECOVER_LIVE additionally permits lost graphics/DMA clients to retain their
+// BOs and VMs. It never rebinds those VMs or recycles live backing allocations.
+// Live video sessions, executing work and other-engine faults still exclude it.
 struct amdgpu_recovery_info {
 	uint32 version, size, flags, reserved;
 	int32 status;
@@ -69,6 +74,22 @@ struct amdgpu_recovery_info {
 	uint32 before[4], after[4]; // GRBM, GRBM2, SRBM, combined VM fault status
 	uint64 quarantined_vram, quarantined_ram, reclaimed_vram, reclaimed_ram;
 	uint32 buffers, vms, videos, live_handles, live_vms, live_videos, pending, reserved_out;
+};
+
+// Ordinary, owning O_RDWR client query; no GPU work or memory addresses.
+// Input flags/reserved must be zero. The first device fault permanently loses
+// every open client, including clients with no failed asynchronous fence.
+// RESET_COMPLETED means a successful device recovery followed that loss;
+// it does not make the old client usable. Fresh work needs a fresh open file.
+enum {
+	AMDGPU_CLIENT_LOST = 1,
+	AMDGPU_CLIENT_RESET_COMPLETED = 2
+};
+struct amdgpu_client_status {
+	uint32 version, size, flags, reserved;
+	int32 status, device_status;
+	uint64 generation, loss_generation;
+	uint64 submitted, completed, failed_fence;
 };
 
 // One GPU virtual address space per open client. Mappings retain their BO
