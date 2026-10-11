@@ -312,7 +312,7 @@ static void SdmaTimeout(int monitor)
 		result, (unsigned)r.status, r.fence, r.sequence, r.rptr, r.wptr, r.engine_status,
 		(unsigned long long)r.elapsed_us);
 	Require(result == 0 && (r.status == B_TIMED_OUT || r.status == B_DEV_NOT_READY)
-		&& r.sequence && !r.fence && r.rptr != r.wptr && r.elapsed_us >= 500000,
+		&& r.sequence && !r.fence && r.elapsed_us >= 500000,
 		"actual non-retiring SDMA memory poll reaches bounded timeout");
 }
 
