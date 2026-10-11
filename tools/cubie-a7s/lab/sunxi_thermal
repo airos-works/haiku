@@ -1,0 +1,4 @@
+# lab images: a "watch" line (temperatures, throttle level, the clusters'
+# speed, voltage and load) on the serial port every 5 s, for the thermal
+# curves (evidence/thermal)
+log_interval 5

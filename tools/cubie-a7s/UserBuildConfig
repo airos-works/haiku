@@ -278,7 +278,8 @@ rule UserBuildConfigRulePreImage
 			SEARCH on $(labMedia) = $(CUBIE_LAB_MEDIA) ;
 			AddFilesToHaikuImage home media : $(labMedia) ;
 		}
-		local labSettings = <cubie-lab>sunxi_display <cubie-lab>aic8800wifi ;
+		local labSettings = <cubie-lab>sunxi_display <cubie-lab>aic8800wifi
+			<cubie-lab>sunxi_thermal ;
 		SEARCH on $(labSettings) = [ FDirName $(HAIKU_TOP) tools cubie-a7s lab ] ;
 		AddFilesToHaikuImage home config settings kernel drivers
 			: $(labSettings) ;
