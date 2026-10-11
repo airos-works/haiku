@@ -123,6 +123,8 @@ struct aic_softc {
 	/* when the link's rate and signal were last asked for */
 	bigtime_t			sc_link_time;
 	uint32_t			sc_link_rate;
+
+	bigtime_t			sc_stats_time;	/* the debug watch's last line */
 };
 
 

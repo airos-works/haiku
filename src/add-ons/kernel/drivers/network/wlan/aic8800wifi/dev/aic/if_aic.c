@@ -72,6 +72,7 @@
 #define ETHERTYPE_EAPOL_BYTES(p)	((p)[0] == 0x88 && (p)[1] == 0x8e)
 
 static int aic_debug;
+static int aic_watch;
 
 #define DPRINTF(x...)	do { if (aic_debug) printf(x); } while (0)
 
@@ -2071,6 +2072,18 @@ aic_tick(struct aic_softc* sc)
 		sc->sc_link_time = system_time();
 		aic_update_link(sc);
 	}
+
+	if (aic_watch && system_time() - sc->sc_stats_time >= 5000000) {
+		int held = 0, tid;
+		sc->sc_stats_time = system_time();
+		for (tid = 0; tid < 8; tid++)
+			held += sc->sc_reorder[tid].held;
+		printf("%s: watch: state %d, reorder held %d, events %d, work %d, "
+			"send queue %d, receive queue %d (%llu dropped)\n", DEVNAME(sc),
+			ic->ic_state, held, sc->sc_event_count, sc->sc_work_count,
+			ifp->if_snd.ifq_len, ifp->receive_queue.ifq_len,
+			(unsigned long long)ifp->if_iqdrops);
+	}
 }
 
 
@@ -2187,6 +2200,7 @@ aic_attach(device_t dev)
 	settings = load_driver_settings("aic8800wifi");
 	if (settings != NULL) {
 		aic_debug = get_driver_boolean_parameter(settings, "debug", 0, 1);
+		aic_watch = get_driver_boolean_parameter(settings, "watch", 0, 1);
 		sc->sc_vht = get_driver_boolean_parameter(settings, "vht", 1, 1);
 		unload_driver_settings(settings);
 	}
@@ -2265,6 +2279,12 @@ aic_attach(device_t dev)
 		goto fail;
 	}
 	resume_thread(sc->sc_thread);
+	aic_usb_watch_thread(sc->sc_thread);
+	aic_usb_watch_lock("Giant", &Giant.u.mutex_.lock, &Giant.u.mutex_.owner);
+	aic_usb_watch_lock("sc", &sc->sc_lock.mtx.u.mutex_.lock,
+		&sc->sc_lock.mtx.u.mutex_.owner);
+	aic_usb_watch_lock("sc rx", &sc->sc_rx_lock.mtx.u.mutex_.lock,
+		&sc->sc_rx_lock.mtx.u.mutex_.owner);
 
 	sc->sc_attached = 1;
 	printf("%s: address %s\n", DEVNAME(sc), ether_sprintf(ic->ic_myaddr));
