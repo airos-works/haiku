@@ -554,6 +554,29 @@ GfxEngine::ShaderMemoryInfo(amdgpu_shader_memory_info& result)
 }
 
 status_t
+GfxEngine::GwsInfo(amdgpu_gws_info& result)
+{
+	if (!ready || faulted || !mecStarted)
+		return B_DEV_NOT_READY;
+	result = {};
+	result.version = AMDGPU_HAIKU_ABI_VERSION;
+	result.size = sizeof(result);
+	result.resource_count = 64;
+	result.gws_vmid2 = regs[0x3322];
+	// Polaris gfx_8_0_d.h/sh_mask.h: fixed six-bit resource index and
+	// state register. Caller drained engines and holds the device mutex.
+	result.selector_before = regs[0xc41a];
+	for (uint32 index = 0; index < 64; index++) {
+		regs[0xc41a] = index;
+		(void)regs[0xc41a];
+		result.resources[index] = regs[0xc41b];
+	}
+	regs[0xc41a] = result.selector_before;
+	result.selector_after = regs[0xc41a];
+	return B_OK;
+}
+
+status_t
 GfxEngine::RenderInfo(const amdgpu::AtomRenderInfo& rom, amdgpu_render_info& result)
 {
 	if (!ready || faulted || !mecStarted)
@@ -1187,7 +1210,7 @@ status_t
 GfxEngine::ExecuteIB(uint64 directory, uint64 address, uint32 dwords,
 	Gart& gart, amdgpu_vm_test& result, uint32 diagnosticGds)
 {
-	if (diagnosticGds > 3)
+	if (diagnosticGds > 5)
 		return B_BAD_VALUE;
 	if (!ready || faulted || !mecStarted)
 		return B_DEV_NOT_READY;
@@ -1200,6 +1223,8 @@ GfxEngine::ExecuteIB(uint64 directory, uint64 address, uint32 dwords,
 	// VMID0's capacity is retained for firmware; this driver has no other
 	// GDS users. Probe windows are wholly within the first owned 4 KiB.
 	if (diagnosticGds != 0 && (r[0x3300] != 0 || r[0x3301] != 0x10000))
+		return B_NOT_SUPPORTED;
+	if (diagnosticGds >= 4 && r[0x3320] != (64 << 16))
 		return B_NOT_SUPPORTED;
 	// VMID2 is leased only for this synchronous job. Between jobs it points
 	// at the kernel diagnostic's empty/private directory, never a client.
@@ -1233,12 +1258,14 @@ GfxEngine::ExecuteIB(uint64 directory, uint64 address, uint32 dwords,
 		if (diagnosticGds != 0) {
 			const uint32 base = diagnosticGds == 2 ? 1024 : 0;
 			const uint32 size = diagnosticGds == 1 ? 4096 : diagnosticGds == 2 ? 256 : 0;
+			const uint32 gws = diagnosticGds == 4 ? 16 << 16
+				: diagnosticGds == 5 ? (2 << 16) | 8 : 0;
 			// Matches Linux gfx_v8_0_ring_emit_gds_switch's byte units and
 			// fixed VMID register layout. No job is in flight at this point.
-			r[0x3304] = base; r[0x3305] = size;
+			r[0x3304] = base; r[0x3305] = size; r[0x3322] = gws;
 			if (r[0x3304] != base || r[0x3305] != size
-				|| r[0x3322] != 0 || r[0x3332] != 0) {
-				r[0x3304] = 0; r[0x3305] = 0;
+				|| r[0x3322] != gws || r[0x3332] != 0) {
+				r[0x3304] = 0; r[0x3305] = 0; r[0x3322] = 0;
 				faulted = true;
 				Halt();
 				return B_BAD_DATA;
@@ -1304,8 +1331,9 @@ GfxEngine::ExecuteIB(uint64 directory, uint64 address, uint32 dwords,
 			// unmap or close; only then may page tables/backing BOs be reused.
 			status = bind(gpu - kScratchOffset + (24ULL << 20));
 			if (diagnosticGds != 0) {
-				r[0x3305] = 0; r[0x3304] = 0;
-				if (r[0x3305] != 0 || r[0x3304] != 0) status = B_BAD_DATA;
+				r[0x3305] = 0; r[0x3304] = 0; r[0x3322] = 0;
+				if (r[0x3305] != 0 || r[0x3304] != 0 || r[0x3322] != 0)
+					status = B_BAD_DATA;
 			}
 		}
 	}

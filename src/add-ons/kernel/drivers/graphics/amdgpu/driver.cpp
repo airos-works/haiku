@@ -262,6 +262,7 @@ device_control(void* cookie, uint32 op, void* buffer, size_t length)
 		|| op == AMDGPU_CREATE_DEVICE_BUFFER
 		|| op == AMDGPU_GFX_SUBMIT_COPY || op == AMDGPU_GFX_QUEUE_COPY
 		|| op == AMDGPU_GFX_GDS_PROBE_COPY
+		|| op == AMDGPU_GWS_INFO
 		|| op == AMDGPU_SHADER_MEMORY_INFO || op == AMDGPU_DIAGNOSTIC_RAM_PAGE
 		|| op == AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER
 		|| (op >= AMDGPU_VM_INFO && op <= AMDGPU_RENDER_INFO))
@@ -270,6 +271,7 @@ device_control(void* cookie, uint32 op, void* buffer, size_t length)
 		// qualification. Bounded VM_TEST continues to accept ordinary clients.
 		if ((op == AMDGPU_GFX_SUBMIT || op == AMDGPU_GFX_SUBMIT_COPY
 			|| op == AMDGPU_GFX_GDS_PROBE_COPY
+			|| op == AMDGPU_GWS_INFO
 			|| op == AMDGPU_GFX_QUEUE_COPY || op == AMDGPU_SHADER_MEMORY_INFO
 			|| op == AMDGPU_DIAGNOSTIC_RAM_PAGE || op == AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER)
 			&& geteuid() != 0)

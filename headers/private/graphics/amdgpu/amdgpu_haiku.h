@@ -50,7 +50,8 @@ enum {
 	AMDGPU_SHADER_MEMORY_INFO,
 	AMDGPU_DIAGNOSTIC_RAM_PAGE,
 	AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER,
-	AMDGPU_GFX_GDS_PROBE_COPY
+	AMDGPU_GFX_GDS_PROBE_COPY,
+	AMDGPU_GWS_INFO
 };
 
 // One GPU virtual address space per open client. Mappings retain their BO
@@ -126,13 +127,25 @@ struct amdgpu_gfx_submit {
 // ordinary submission flags. Fixed byte ranges only; no caller-selected MMIO.
 // The driver owns GDS and ordinary clients have zero allocation. The probe
 // temporarily leases a window to VMID2 for one synchronous job, then revokes
-// it on healthy retirement. GWS/OA remain disabled. These diagnostic contents
+// it on healthy retirement. GWS-only modes leave GDS/OA disabled. These contents
 // are shared across probe jobs, not a per-client storage API. Faults retain
 // the usual terminal quarantine and require recovery before another probe.
 enum {
 	AMDGPU_GDS_PROBE_FULL = 0, // base 0, size 4096; initialize/check owned guards
 	AMDGPU_GDS_PROBE_SLICE = 1, // base 1024, size 256
-	AMDGPU_GDS_PROBE_NONE = 2 // base 0, size 0; ordinary client policy
+	AMDGPU_GDS_PROBE_NONE = 2, // base 0, size 0; ordinary client policy
+	AMDGPU_GDS_PROBE_GWS_FULL = 3, // GWS base 0, count 16; GDS/OA disabled
+	AMDGPU_GDS_PROBE_GWS_SLICE = 4 // GWS base 8, count 2; GDS/OA disabled
+};
+
+// Root-only bounded observation of all 64 driver-owned GWS resources. Requires
+// an initialized, healthy idle graphics engine. No resource values are written;
+// the fixed GDS_GWS_RESOURCE_CNTL index selector is restored after readback.
+// flags/reserved must be zero. gws_vmid2 reports the current allocation.
+struct amdgpu_gws_info {
+	uint32 version, size, flags, reserved;
+	uint32 selector_before, selector_after, gws_vmid2, resource_count;
+	uint32 resources[64];
 };
 
 // Root-only asynchronous copied submission. Captures/optionally validates the
