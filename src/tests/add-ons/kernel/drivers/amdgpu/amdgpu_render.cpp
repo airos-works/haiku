@@ -81,7 +81,7 @@ int main(int argc, char** argv)
 		&& r.default_engine_khz == 300000 && r.default_memory_khz == 300000,
 		"restored selector and ROM clock defaults");
 	Require(r.capabilities == (AMDGPU_RENDER_ROOT_SUBMIT | AMDGPU_RENDER_SYNC_SUBMIT
-			| AMDGPU_RENDER_COPY_SUBMIT)
+		| AMDGPU_RENDER_COPY_SUBMIT | AMDGPU_RENDER_CHECKED_COPY)
 		&& r.total_vram == (8ULL << 30) && r.visible_vram == (256ULL << 20)
 		&& r.total_gart == (1ULL << 30) && r.address_start == 131072 && r.address_end == (1ULL << 36)
 		&& r.max_buffer_bytes == (64ULL << 20) && r.max_mapping_bytes == r.max_buffer_bytes

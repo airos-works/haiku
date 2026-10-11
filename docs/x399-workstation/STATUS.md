@@ -43,11 +43,19 @@ decode with 23 packet opcodes. A system-header BGLView application also passes
 fixed-function drawing, resize, desktop pixels and shared texture lifetime;
 the private renderer now chooses AMD automatically without a device override.
 Explicit software and unprivileged fallback also pass. The complete native
-renderer regression leaves this boot healthy at 1,399 completions. Captured
-commands are not yet a validator.
-Driver `7d1cf6e5…` and private Mesa `ee6210e5…` are installed with checked
-backups; Mesa `96975aeb…` and the previous `89b64dd6…`/Mesa `18d872ff…`
-checkpoint remain preserved.
+renderer regression passed at 1,399 completions. An initial opt-in kernel
+command policy now validates the immutable copy and rejects unsupported
+packet/control and privileged-register operations before GPU execution.
+All 337 real command captures and 233,168 policy checks pass host sanitizers
+and QEMU; native tests reject 96 streams, verify each entire private copy was
+cleared, and complete 192 recovery/control jobs. The checked renderer suite,
+concurrent media and both three-minute Summit playback trials pass, with
+5,400 frames and zero drops for each codec. Final DMA/VM checks leave this
+boot healthy at 43,457 completions with zero errors; the desktop is intact.
+Shader/resource isolation remains incomplete and both submission paths remain
+root-only. Driver `c579f1cd…` and private Mesa `afd206fa…` are installed with
+same-hash backups; prior `7d1cf6e5…`/`ee6210e5…` and older checkpoints are
+preserved. The original global media addon is restored after qualification.
 System Mesa defaults remain
 unchanged. Unprivileged general
 graphics submission, system Mesa defaults and native display remain unfinished. AMD UVD H.264 plays three minutes of 1080p30/AAC with zero drops

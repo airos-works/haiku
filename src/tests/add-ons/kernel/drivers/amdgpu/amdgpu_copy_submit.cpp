@@ -128,7 +128,7 @@ int main(int argc, char** argv)
 		volatile uint32* pixels = (volatile uint32*)(addr_t)output.address;
 		for (uint32 test = 0; test < 6; test++) {
 			auto bad = Request<amdgpu_gfx_submit>(); bad.dwords = 256;
-			if (test == 0) bad.flags = 1;
+			if (test == 0) bad.flags = 2;
 			if (test == 1) bad.reserved = 1;
 			if (test == 2) bad.dwords = 0;
 			if (test == 3) bad.dwords = 1;
