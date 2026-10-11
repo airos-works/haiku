@@ -143,6 +143,57 @@ static void Drain(int monitor)
 		Require(system_time() < end, "observe queued close retirement"); snooze(100);
 	}
 }
+
+// Deliberately causes a terminal GPU VM write fault. Run only on an idle
+// qualification boot with a verified cold-recovery path, never as a smoke test.
+static void FaultQualification(int monitor)
+{
+	auto before = IRQ(monitor);
+	Client gate = Create(30), bad = Create(31);
+	const uint64 readOnly = 0x400000000ULL;
+	auto mapping = Request<amdgpu_vm_mapping>(); mapping.handle = bad.output.handle;
+	mapping.address = readOnly; mapping.bytes = 4096; mapping.buffer_offset = 65536;
+	mapping.permissions = AMDGPU_VM_READ;
+	Require(ioctl(bad.fd, AMDGPU_VM_MAP, &mapping, sizeof(mapping)) == 0, "map owned read-only fault target");
+	sGate = (volatile uint32*)(addr_t)gate.output.address;
+	Enqueue(gate, Commands(gate, 0, true));
+	Words fault = {0xc0033700, 0x100500, uint32(readOnly), uint32(readOnly >> 32), 0xdead5100};
+	fault.resize(256, 0x80000000);
+	Enqueue(bad, fault);
+	for (unsigned n = 1; n < 16; n++) Enqueue(bad, Commands(bad, n));
+	for (unsigned n = 1; n < 8; n++) Enqueue(gate, Commands(gate, n));
+	Wait(gate, true); Wait(bad, true);
+	Require(Memory(monitor).pending_jobs == 24, "all fault and later jobs are queued behind the gate");
+	auto memory = Memory(monitor); auto ram = Gart(monitor);
+	ReleaseGate();
+	for (Client* c : {&bad, &gate}) {
+		auto wait = Request<amdgpu_fence_wait>(); wait.fence = c->fence; wait.timeout_us = 5000000;
+		Require(ioctl(c->fd, AMDGPU_WAIT_FENCE, &wait, sizeof(wait)) == 0 && wait.status != B_OK,
+			"terminal GPU fault fails every outstanding client fence");
+	}
+	Drain(monitor);
+	auto first = Request<amdgpu_fence_wait>(); first.fence = 1;
+	Require(ioctl(gate.fd, AMDGPU_WAIT_FENCE, &first, sizeof(first)) == 0 && first.status == B_OK,
+		"earlier successfully retired fence remains successful after a later fault");
+	Pixels(gate, 1, true); Pixels(bad, 0);
+	auto irq = Request<amdgpu_irq_info>();
+	Require(ioctl(monitor, AMDGPU_IRQ_INFO, &irq, sizeof(irq)) == 0
+		&& irq.status != B_OK && irq.vm_faults > before.vm_faults
+		&& !irq.privileged_faults && !irq.unknown && !irq.overflows
+		&& irq.completed_fences == before.completed_fences + 1,
+		"independent VM fault, only the pre-fault gate job completed");
+	Enqueue(gate, Commands(gate, 8), B_DEV_NOT_READY);
+	Close(gate); Close(bad);
+	Require(Memory(monitor).faulted && !Memory(monitor).pending_jobs
+		&& Memory(monitor).allocated_bytes == memory.allocated_bytes
+		&& Gart(monitor).allocated_bytes == ram.allocated_bytes,
+		"all pending jobs drained while GPU-visible storage stays quarantined after close");
+	printf("PASS: queued VM fault, 23 failed/canceled fences, prior fence preserved,"
+		" all victim/peer data unchanged and close quarantines memory; completion %llu -> %llu, VM faults %llu\n",
+		(unsigned long long)before.completed_fences, (unsigned long long)irq.completed_fences,
+		(unsigned long long)irq.vm_faults);
+}
+
 int main(int argc, char** argv)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0); disable_debugger(1);
@@ -160,10 +211,12 @@ int main(int argc, char** argv)
 		puts("PASS: asynchronous graphics retains root restriction"); return 0;
 	}
 	bool smoke = argc == 2 && strcmp(argv[1], "--smoke") == 0;
-	Require((argc == 1 || smoke) && geteuid() == 0, "queue qualification requires root");
+	bool fault = argc == 2 && strcmp(argv[1], "--fault") == 0;
+	Require((argc == 1 || smoke || fault) && geteuid() == 0, "queue qualification requires root");
 	int monitor = Open(); auto render = Request<amdgpu_render_info>();
 	Require(ioctl(monitor, AMDGPU_RENDER_INFO, &render, sizeof(render)) == 0
 		&& (render.capabilities & AMDGPU_RENDER_QUEUE_COPY), "queued graphics capability");
+	if (fault) { FaultQualification(monitor); close(monitor); return 0; }
 	auto before = IRQ(monitor); auto memory = Memory(monitor); auto ram = Gart(monitor);
 	Client c[5]; for (unsigned i = 0; i < 5; i++) c[i] = Create(i + 1);
 	// Malformed requests and inaccessible sources cannot submit work.
