@@ -444,14 +444,34 @@ WaitGraphicsIdle()
 		sCompleted.Wait(&sMutex);
 }
 
-static void
-WaitVideoIdle()
+// The caller owns idle UVD/SDMA/GFX and sMutex. A GFX reset does not destroy
+// firmware sessions: retire them explicitly before returning any address to
+// either allocator. On failure the remaining ownership record stays intact.
+static status_t
+RetireVideo(UvdSession* s, bool reclaimed)
 {
-	// Cleanup cannot unmap engine/session memory or stop UVD while the
-	// reservation owner is using it, including after a graphics fault.
-	// Session's hardware waits are bounded; this ownership wait is not.
-	while (sVideoExecuting)
-		sCompleted.Wait(&sMutex);
+	if (s->created) {
+		amdgpu_uvd_test result = {};
+		status_t status = sUvd.Session(*s, 2, NULL, NULL, 0, sEngine, result);
+		if (status != B_OK) return status;
+	}
+	if (s->readbackBytes != 0) {
+		if (s->readbackBound) {
+			status_t status = sGart.Unbind(s->readbackOffset, s->readbackBytes);
+			if (status != B_OK) return status;
+			s->readbackBound = false;
+		}
+		if (!sGartAllocator.Free(s->readbackOffset, s->readbackBytes)) return B_BAD_DATA;
+		if (s->readbackArea >= 0) delete_area(s->readbackArea);
+		s->readbackArea = -1;
+		if (reclaimed) sRecovery.reclaimed_ram += s->readbackBytes;
+		s->readbackBytes = 0;
+	}
+	if (!sAllocator.Free(s->offset, s->layout.bytes)) return B_BAD_DATA;
+	delete_area(s->area);
+	s->area = -1;
+	if (reclaimed) sRecovery.reclaimed_vram += s->layout.bytes;
+	return B_OK;
 }
 
 static void
@@ -459,43 +479,17 @@ ReleaseVideo(AmdgpuClient* client)
 {
 	UvdSession* s = client->video;
 	if (s == NULL) return;
-	WaitVideoIdle();
+	// Wait even after a fault. Recovery may finish while this wait yields;
+	// decide whether to retire or quarantine only after reacquiring all owners.
+	while (sPending != 0 || sGraphicsExecuting || sVideoExecuting)
+		sCompleted.Wait(&sMutex);
 	ObserveInterruptFault();
-	if (s->created && sFault == B_OK) {
-		amdgpu_uvd_test result = {};
-		status_t status = WaitDmaIdle();
-		if (status == B_OK) status = sUvd.Session(*s, 2, NULL, NULL, 0, sEngine, result);
-		if (status != B_OK) {
-			// WaitDmaIdle may have yielded to another decoder before a DMA
-			// error/timeout. Stopping UVD still requires its ownership back.
-			WaitVideoIdle();
-			SetFault(status);
-			sUvd.faulted = true;
-			sUvd.Stop();
-		}
-	}
-	if (sFault == B_OK) {
-		delete_area(s->area);
-		s->area = -1;
-	}
-	if (s->readbackBytes != 0) {
-		WaitGraphicsIdle();
-		ObserveInterruptFault();
-		if (s->readbackBound && sFault == B_OK) {
-			status_t status = sGart.Unbind(s->readbackOffset, s->readbackBytes);
-			if (status != B_OK) SetFault(status);
-		}
-		// Retain wired RAM and its GART extent when late writes are possible.
-		if (sFault == B_OK) {
-			if (s->readbackArea >= 0) delete_area(s->readbackArea);
-			s->readbackArea = -1;
-			sGartAllocator.Free(s->readbackOffset, s->readbackBytes);
-		}
-		client->systemBytes -= s->readbackBytes;
-	}
-	// A failed engine may still hold addresses. Keep its VRAM quarantined.
-	if (sFault == B_OK) sAllocator.Free(s->offset, s->layout.bytes);
+	client->systemBytes -= s->readbackBytes;
 	client->bytes -= s->layout.bytes;
+	if (sFault == B_OK) {
+		status_t status = RetireVideo(s, false);
+		if (status != B_OK) SetFault(status);
+	}
 	client->video = NULL;
 	sVideoSessions--;
 	if (sFault != B_OK) {
@@ -567,6 +561,7 @@ CreateVideo(AmdgpuClient* client, void* data, size_t length)
 	s->handle = sNextVideoHandle++;
 	client->video = s; client->bytes += layout.bytes; sVideoSessions++;
 	status = WaitDmaIdle();
+	if (status == B_OK && client->loss != B_OK) status = B_DEV_NOT_READY;
 	amdgpu_uvd_test result = {};
 	if (status == B_OK) {
 		uint64 bytes = ((layout.outputBytes + 4095ULL) & ~4095ULL)
@@ -638,6 +633,7 @@ DecodeVideo(AmdgpuClient* client, void* data, size_t length)
 		: AmdgpuCopyFromUser(input, request.bitstream, request.bitstream_bytes);
 	amdgpu_uvd_test result = {};
 	if (status == B_OK) status = WaitDmaIdle(true, false);
+	if (status == B_OK && client->loss != B_OK) status = B_DEV_NOT_READY;
 	if (status == B_OK) {
 		// No queued DMA remains. Keep UVD and SDMA exclusively reserved while
 		// initialized graphics runs with its own reservation. The ioctl's file
@@ -1175,6 +1171,13 @@ ReclaimGraphicsQuarantine()
 {
 	// Called only after a successful reset/private shader proof and VMID2
 	// detachment. The global fault still blocks every client allocation.
+	while (sQuarantinedVideos != NULL) {
+		UvdSession* s = sQuarantinedVideos;
+		status_t status = RetireVideo(s, true);
+		if (status != B_OK) return status;
+		sQuarantinedVideos = s->nextQuarantined;
+		free(s);
+	}
 	while (sQuarantinedBuffers != NULL) {
 		Buffer* bo = sQuarantinedBuffers;
 		if (bo->area >= 0) {
@@ -1211,14 +1214,14 @@ RecoverGraphics(bool allowLive)
 {
 	// Old queues must be terminal. Live lost VMs/BOs keep their identity and
 	// allocation; only closed quarantine can be reclaimed by the reset.
-	if (sPending != 0 || sGraphicsExecuting || sVideoExecuting || sVideoSessions != 0
-		|| (!allowLive && (sLiveHandles != 0 || sVMCount != 0)))
+	if (sPending != 0 || sGraphicsExecuting || sVideoExecuting
+		|| (!allowLive && (sLiveHandles != 0 || sVMCount != 0 || sVideoSessions != 0)))
 		return B_BUSY;
 	if (sFault == B_OK || !sGfx.faulted || !sGfx.ready || sRecoveryAttempted)
 		return B_NOT_ALLOWED;
-	// This first recovery path owns GFX only. Other engine faults and live
-	// firmware video sessions need their own reset, not premature reclamation.
-	if (sEngine.faulted || sUvd.faulted || sQuarantinedVideos != NULL)
+	// This reset owns GFX only. Healthy, idle video sessions keep every address
+	// until firmware destroy; actual UVD/SDMA failures need their own reset.
+	if (sEngine.faulted || sUvd.faulted)
 		return B_NOT_SUPPORTED;
 	for (AmdgpuClient* client = sClients; client != NULL; client = client->next) {
 		if (client->loss == B_OK) return B_BAD_DATA;
@@ -1236,7 +1239,7 @@ RecoverGraphics(bool allowLive)
 	sRecovery.stage = 0;
 	sRecovery.reclaimed_vram = sRecovery.reclaimed_ram = 0;
 	status = sGfx.Recover(sInfo, sReservation, sRenderInfo, firmware, images[4].mec,
-		sEngine, sGart, sRecovery);
+		sEngine, sGart, sRecovery, sVideoSessions != 0 || sQuarantinedVideos != NULL);
 	if (status == B_OK) status = ReclaimGraphicsQuarantine();
 	if (status == B_OK) {
 		sFault = B_OK;
@@ -1266,10 +1269,9 @@ MaybeRecoverAutomatically()
 		|| sPending != 0 || sGraphicsExecuting || sVideoExecuting)
 		return;
 	sAutomaticPending = false;
-	if (sVideoSessions != 0 || sEngine.faulted || sUvd.faulted
-		|| sQuarantinedVideos != NULL) {
+	if (sEngine.faulted || sUvd.faulted) {
 		sAutomaticStatus = B_NOT_SUPPORTED;
-		dprintf("amdgpu: automatic graphics recovery excludes video/other-engine ownership\n");
+		dprintf("amdgpu: automatic graphics recovery excludes other-engine faults\n");
 		return;
 	}
 	sAutomaticAttempts++;

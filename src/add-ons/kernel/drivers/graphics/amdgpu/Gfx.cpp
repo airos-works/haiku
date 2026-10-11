@@ -1417,7 +1417,7 @@ GfxEngine::Recover(const amdgpu_info& info,
 	const amdgpu::AtomVramReservation& reservation,
 	const amdgpu::AtomRenderInfo& topology,
 	const amdgpu::FirmwareView firmware[4], const amdgpu::MecFirmwareView& mec,
-	SdmaEngine& sdma, Gart& gart, amdgpu_recovery_info& result)
+	SdmaEngine& sdma, Gart& gart, amdgpu_recovery_info& result, bool preserveVideo)
 {
 	if (!attempted || !ready || !faulted || !mecStarted || area < 0 || vmArea < 0
 		|| topology.shaderEngines == 0 || topology.shaderEngines > 4
@@ -1438,7 +1438,11 @@ GfxEngine::Recover(const amdgpu_info& info,
 	snapshot(result.before);
 	// Reset only owned GFX/CP/RLC blocks, following Linux 6.18.52
 	// gfx_v8_0_pre/soft/post_soft_reset and matching GFX8/GMC8.1/OSS3 masks.
-	// The caller excluded live resources, all queued work and video/DMA faults.
+	// The caller excluded all queued/executing work and video/DMA faults.
+	// SEM is shared with other engines. Do not reset a busy semaphore block
+	// while firmware retains video sessions; that path needs a wider reset.
+	if (preserveVideo && (result.before[2] & 0x4000) != 0)
+		return B_NOT_SUPPORTED;
 	result.grbm_reset = 0xf0005; // CP, RLC, GFX, CPF, CPC, CPG
 	result.srbm_reset = 0x100 | ((result.before[2] & 0x4000) != 0 ? 0x8000 : 0);
 	if ((r[0x2008] & result.grbm_reset) != 0 || (r[0x398] & result.srbm_reset) != 0

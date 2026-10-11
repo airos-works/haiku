@@ -62,6 +62,8 @@ SimpleTest amdgpu_video_stream : amdgpu_video_stream.cpp H264Stream.cpp h264_par
 	: [ TargetLibstdc++ ] ;
 SimpleTest amdgpu_hevc_stream : amdgpu_hevc_stream.cpp HevcStream.cpp hevc_parse.c h264_parse.c UvdHevc.cpp
 	: [ TargetLibstdc++ ] ;
+SimpleTest amdgpu_video_recovery : amdgpu_video_recovery.cpp HevcStream.cpp hevc_parse.c h264_parse.c GfxCommandValidator.cpp
+	: [ TargetLibstdc++ ] ;
 SimpleTest amdgpu_rom : amdgpu_rom.cpp Firmware.cpp ;
 
 UsePrivateHeaders libroot ;
