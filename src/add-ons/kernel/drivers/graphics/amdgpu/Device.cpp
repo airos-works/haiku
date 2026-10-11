@@ -1477,6 +1477,11 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 			status = WaitDmaIdle(false);
 			if (status != B_OK) return status;
 		}
+		// The drain releases sMutex. This file can fail while waiting, and
+		// another resource-free client can recover the device before we
+		// reacquire it. A cleared global fault cannot revive this lost file.
+		if (sFault != B_OK || client->failedFence != 0)
+			return B_DEV_NOT_READY;
 		if (client->bufferCount >= kMaxBuffers || sNextHandle == 0)
 			return B_NO_MEMORY;
 		Buffer* bo = (Buffer*)calloc(1, sizeof(Buffer));
