@@ -20,6 +20,8 @@ SimpleTest amdgpu_uvd : amdgpu_uvd.cpp ;
 local driver = [ FDirName $(HAIKU_TOP) src add-ons kernel drivers graphics amdgpu ] ;
 SubDirHdrs $(driver) ;
 SEARCH_SOURCE += $(driver) ;
+SimpleTest amdgpu_gfx_queue : amdgpu_gfx_queue.cpp GfxCommandValidator.cpp
+	: [ TargetLibstdc++ ] ;
 SimpleTest amdgpu_shader_privilege : amdgpu_shader_privilege.cpp GfxCommandValidator.cpp
 	: [ TargetLibstdc++ ] ;
 SimpleTest gfx_command_test : gfx_command_test.cpp GfxCommandValidator.cpp

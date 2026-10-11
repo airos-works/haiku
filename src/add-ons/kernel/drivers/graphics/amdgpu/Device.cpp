@@ -44,7 +44,7 @@ struct ClientVM {
 
 struct AmdgpuClient {
 	team_id team;
-	uint32 flags, references, bufferCount, pending;
+	uint32 flags, references, bufferCount, pending, graphicsPending;
 	uint64 bytes, systemBytes, submitted, completed, failedFence;
 	status_t failure;
 	Buffer* buffers;
@@ -59,6 +59,8 @@ struct Job {
 	Buffer* source;
 	Buffer* destination;
 	amdgpu_dma_submit command;
+	uint32* graphicsCommands;
+	uint32 graphicsDwords;
 };
 
 static mutex sMutex = MUTEX_INITIALIZER("amdgpu buffers");
@@ -91,6 +93,7 @@ static uint32 sVideoSessions, sVMCount;
 static void ReleaseVM(AmdgpuClient* client);
 static void ReleaseVideo(AmdgpuClient* client);
 static void WaitGraphicsIdle();
+static status_t ExecuteQueuedGraphics(Job* job);
 
 // Called with sMutex held, including cleanup and the DMA worker. An async
 // fault must quarantine allocations even if the client closes immediately.
@@ -138,8 +141,12 @@ PutBuffer(Buffer* bo)
 static void
 PutClient(AmdgpuClient* client)
 {
-	if (--client->references == 0)
+	if (--client->references == 0) {
+		// Closing the file may have deferred the VM until its queued jobs
+		// retire. The worker is no longer using it when dropping this reference.
+		ReleaseVM(client);
 		free(client);
+	}
 }
 
 static Buffer*
@@ -159,7 +166,8 @@ Executor(void*)
 		mutex_lock(&sMutex);
 		// Decode owns SDMA for its private clear/readback. Ordinary DMA must
 		// also stay ordered against graphics accessing client-owned buffers.
-		while (sVideoExecuting || sGraphicsExecuting)
+		while (sGraphicsExecuting || (sVideoExecuting
+			&& (sFirst == NULL || sFirst->graphicsCommands == NULL)))
 			sCompleted.Wait(&sMutex);
 		ObserveInterruptFault();
 		Job* job = sFirst;
@@ -174,16 +182,22 @@ Executor(void*)
 		if (sFirst == NULL)
 			sLast = NULL;
 		status_t status = sFault;
-		mutex_unlock(&sMutex);
-		if (status == B_OK) {
+		if (status == B_OK && job->graphicsCommands != NULL) {
+			// This helper reserves graphics and drops sMutex during execution.
+			// Already running UVD may overlap this job; FIFO DMA still waits.
+			status = ExecuteQueuedGraphics(job);
+		} else if (status == B_OK) {
 			const amdgpu_dma_submit& c = job->command;
 			uint64 source = job->source != NULL
 				? job->source->gpu + c.source_offset : 0;
 			uint64 destination = job->destination->gpu
 				+ c.destination_offset;
+			mutex_unlock(&sMutex);
 			status = sEngine.Execute(c.operation, source, destination, c.bytes, c.value);
+			mutex_lock(&sMutex);
 		}
-		mutex_lock(&sMutex);
+		ObserveInterruptFault();
+		if (status == B_OK && sFault != B_OK) status = B_DEV_NOT_READY;
 		if (status != B_OK) {
 			sFault = status;
 			if (job->client->failedFence == 0) {
@@ -193,10 +207,12 @@ Executor(void*)
 		}
 		job->client->completed = job->command.fence;
 		job->client->pending--;
+		if (job->graphicsCommands != NULL) job->client->graphicsPending--;
 		sPending--;
 		PutBuffer(job->source);
 		PutBuffer(job->destination);
 		PutClient(job->client);
+		free(job->graphicsCommands);
 		free(job);
 		sCompleted.NotifyAll();
 		mutex_unlock(&sMutex);
@@ -222,7 +238,7 @@ amdgpu_client_free(AmdgpuClient* client)
 	mutex_lock(&sMutex);
 	ObserveInterruptFault();
 	ReleaseVideo(client);
-	ReleaseVM(client);
+	if (client->graphicsPending == 0) ReleaseVM(client);
 	while (client->buffers != NULL) {
 		Buffer* bo = client->buffers;
 		client->buffers = bo->next;
@@ -301,7 +317,7 @@ Start(volatile uint32* regs, const amdgpu_info& info,
 	sVideoExecuting = false;
 	sGraphicsExecuting = false;
 	sCompleted.Init(&sCompleted, "amdgpu fence");
-	sWorker = spawn_kernel_thread(Executor, "amdgpu DMA", B_NORMAL_PRIORITY, NULL);
+	sWorker = spawn_kernel_thread(Executor, "amdgpu jobs", B_NORMAL_PRIORITY, NULL);
 	if (sWorker < 0) {
 		sGart.Uninitialize(false);
 		sGartAllocator.Uninit();
@@ -693,7 +709,7 @@ CreateVM(AmdgpuClient* client)
 }
 
 static status_t
-CopyCommands(ClientVM* vm, uint64 address, uint32 bytes)
+PrepareCopiedCommands(ClientVM* vm)
 {
 	// graphicsBusy excludes another operation on this VM. No user handle or
 	// CPU clone exposes this allocation, and its GPU PTEs never allow writes.
@@ -711,8 +727,16 @@ CopyCommands(ClientVM* vm, uint64 address, uint32 bytes)
 		}
 		vm->copiedCommands = allocation;
 	}
+	return B_OK;
+}
+
+static status_t
+CopyCommands(ClientVM* vm, uint64 address, uint32 bytes)
+{
+	status_t status = PrepareCopiedCommands(vm);
+	if (status != B_OK) return status;
 	uint8* copied = (uint8*)vm->copiedCommands.cpu;
-	status_t status = AmdgpuCopyFromUser(copied, address, bytes);
+	status = AmdgpuCopyFromUser(copied, address, bytes);
 	uint32 cleared = status == B_OK ? bytes : 0;
 	memset(copied + cleared, 0, kMaxIbBytes - cleared);
 	__sync_synchronize();
@@ -773,6 +797,81 @@ ExecuteGraphics(Execute execute)
 	if (status == B_OK && sFault != B_OK) status = B_DEV_NOT_READY;
 	sCompleted.NotifyAll();
 	return status;
+}
+
+static status_t
+ExecuteQueuedGraphics(Job* job)
+{
+	// The job's client reference retains this VM after close. VM mutations
+	// are excluded by graphicsPending; only this worker replaces its private
+	// executable copy, after the previous graphics job detached VMID2.
+	ClientVM* vm = job->client->vm;
+	uint32 bytes = job->graphicsDwords * 4;
+	memcpy((void*)vm->copiedCommands.cpu, job->graphicsCommands, bytes);
+	memset((uint8*)vm->copiedCommands.cpu + bytes, 0, kMaxIbBytes - bytes);
+	__sync_synchronize();
+	(void)vm->copiedCommands.cpu[kMaxIbBytes / 8 - 1];
+	amdgpu_vm_test result = {};
+	return ExecuteGraphics([&]() {
+		return sGfx.ExecuteIB(vm->table.directory.gpu, AMDGPU_COPY_IB_ADDRESS,
+			job->graphicsDwords, sGart, result);
+	});
+}
+
+static status_t
+QueueGraphics(AmdgpuClient* client, void* data, size_t length)
+{
+	amdgpu_gfx_queue request;
+	status_t status = ReadRequest(request, data, length);
+	if (status != B_OK) return status;
+	if (request.reserved[0] || request.reserved[1]
+		|| (request.flags & ~AMDGPU_GFX_VALIDATE_COMMANDS)
+		|| (request.dwords & (kIbSizeAlignment / 4 - 1))
+		|| request.dwords == 0 || request.dwords > kMaxIbBytes / 4)
+		return B_BAD_VALUE;
+	if (sFault != B_OK || client->vm == NULL) return B_DEV_NOT_READY;
+	if (sPending >= 256 || client->pending >= 64 || client->submitted == UINT64_MAX)
+		return B_WOULD_BLOCK;
+	Job* job = (Job*)calloc(1, sizeof(Job));
+	if (job == NULL) return B_NO_MEMORY;
+	uint32 bytes = request.dwords * 4;
+	job->graphicsCommands = (uint32*)malloc(bytes);
+	if (job->graphicsCommands == NULL) status = B_NO_MEMORY;
+	else status = AmdgpuCopyFromUser(job->graphicsCommands, request.address, bytes);
+	if (status == B_OK && (request.flags & AMDGPU_GFX_VALIDATE_COMMANDS)
+		&& amdgpu::ValidateGfx8Commands(job->graphicsCommands, request.dwords).error
+			!= amdgpu::GfxCommandValidation::OK)
+		status = B_NOT_ALLOWED;
+	// Startup may drain prior DMA, but normal enqueue never waits for GPU
+	// completion. No worker may initialize graphics with itself in sPending.
+	if (status == B_OK && !sGfx.ready) status = StartGraphics();
+	// Startup can drop the lock while draining existing work. DMA on this
+	// file and other clients may have changed both quotas while we waited.
+	if (status == B_OK && (sPending >= 256 || client->pending >= 64
+		|| client->submitted == UINT64_MAX)) status = B_WOULD_BLOCK;
+	if (status == B_OK) status = PrepareCopiedCommands(client->vm);
+	if (status == B_OK) {
+		request.fence = client->submitted + 1;
+		status = user_memcpy(data, &request, sizeof(request));
+	}
+	if (status != B_OK) {
+		free(job->graphicsCommands);
+		free(job);
+		return status;
+	}
+	job->client = client;
+	job->command.fence = request.fence;
+	job->graphicsDwords = request.dwords;
+	client->submitted = request.fence;
+	client->pending++;
+	client->graphicsPending++;
+	client->references++;
+	if (sLast != NULL) sLast->next = job;
+	else sFirst = job;
+	sLast = job;
+	sPending++;
+	release_sem(sJobs);
+	return B_OK;
 }
 
 static status_t
@@ -980,7 +1079,7 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 		if (status == B_OK) status = sGfx.RenderInfo(sRenderInfo, info);
 		if (status != B_OK) return status;
 		info.capabilities = AMDGPU_RENDER_ROOT_SUBMIT | AMDGPU_RENDER_SYNC_SUBMIT
-			| AMDGPU_RENDER_COPY_SUBMIT | AMDGPU_RENDER_CHECKED_COPY;
+			| AMDGPU_RENDER_COPY_SUBMIT | AMDGPU_RENDER_CHECKED_COPY | AMDGPU_RENDER_QUEUE_COPY;
 		info.total_vram = sInfo.vram_size;
 		info.visible_vram = sInfo.bar_size[0];
 		info.total_gart = Gart::kSize;
@@ -997,9 +1096,16 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 		info.ib_size_alignment = kIbSizeAlignment;
 		return user_memcpy(data, &info, sizeof(info));
 	}
+	if (op == AMDGPU_GFX_QUEUE_COPY) {
+		if (client->graphicsBusy) return B_BUSY;
+		client->graphicsBusy = true;
+		status_t status = QueueGraphics(client, data, length);
+		client->graphicsBusy = false;
+		return status;
+	}
 	if ((op >= AMDGPU_VM_INFO && op <= AMDGPU_GFX_SUBMIT)
 		|| op == AMDGPU_GFX_SUBMIT_COPY) {
-		if (client->graphicsBusy) return B_BUSY;
+		if (client->graphicsBusy || client->graphicsPending) return B_BUSY;
 		client->graphicsBusy = true;
 		status_t status = VMControl(client, op, data, length);
 		client->graphicsBusy = false;
