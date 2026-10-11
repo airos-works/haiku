@@ -144,11 +144,62 @@ static void Drain(int monitor)
 	}
 }
 
+static void DmaWait(int fd, uint64 fence, status_t expected)
+{
+	auto r = Request<amdgpu_fence_wait>(); r.fence = fence; r.timeout_us = 5000000;
+	Require(ioctl(fd, AMDGPU_WAIT_FENCE, &r, sizeof(r)) == 0 && r.status == expected,
+		"retained DMA fence has its original terminal result");
+}
+static void DmaFill(int fd, const amdgpu_buffer& b, uint64 fence, uint32 value)
+{
+	auto r = Request<amdgpu_dma_submit>(); r.operation = AMDGPU_DMA_FILL;
+	r.destination = b.handle; r.destination_offset = 1024; r.bytes = 4; r.value = value;
+	Require(ioctl(fd, AMDGPU_SUBMIT_DMA, &r, sizeof(r)) == 0 && r.fence == fence,
+		"owned DMA fill receives the next file fence");
+}
+static amdgpu_buffer DmaBuffer(int fd)
+{
+	auto b = Request<amdgpu_buffer>(); b.bytes = 4096;
+	Require(ioctl(fd, AMDGPU_CREATE_SYSTEM_BUFFER, &b, sizeof(b)) == 0
+		&& ioctl(fd, AMDGPU_MAP_BUFFER, &b, sizeof(b)) == 0, "create CPU-visible DMA buffer");
+	auto p = (volatile uint32*)(addr_t)b.address;
+	for (unsigned i = 0; i < 1024; i++) {
+		Require(p[i] == 0, "fresh DMA allocation is zero"); p[i] = kGuard;
+	}
+	__sync_synchronize(); return b;
+}
+static void DmaPixels(const amdgpu_buffer& b, uint32 value)
+{
+	for (unsigned i = 0; i < 1024; i++)
+		Require(((volatile uint32*)(addr_t)b.address)[i] == (i == 256 ? value : kGuard),
+			"DMA target and every guard remain exact; canceled work never executes");
+}
+static void DmaFree(int fd, amdgpu_buffer& b)
+{
+	Require(ioctl(fd, AMDGPU_FREE_BUFFER, &b, sizeof(b)) == 0
+		&& delete_area(b.area) == B_OK, "free DMA handle and revoked clone, retain fence fd");
+}
+static amdgpu_recovery_info Recovery(int fd, uint32 op)
+{
+	auto r = Request<amdgpu_recovery_info>();
+	Require(ioctl(fd, op, &r, sizeof(r)) == 0, "recovery query/control request"); return r;
+}
+
 // Deliberately causes a terminal GPU VM write fault. Run only on an idle
-// qualification boot with a verified cold-recovery path, never as a smoke test.
-static void FaultQualification(int monitor)
+// qualification boot with a verified recovery path, never as a smoke test.
+// --fault-recovery explicitly requests ONE reset after all expected terminal
+// fault/quarantine checks pass. It never retries a failure or observation timeout.
+static void FaultQualification(int monitor, bool recover)
 {
 	auto before = IRQ(monitor);
+	auto baselineMemory = Memory(monitor); auto baselineRam = Gart(monitor);
+	int dma = recover ? Open() : -1;
+	amdgpu_buffer dmaBuffer = {};
+	if (recover) {
+		dmaBuffer = DmaBuffer(dma);
+		DmaFill(dma, dmaBuffer, 1, 0x51510001); DmaWait(dma, 1, B_OK);
+		DmaPixels(dmaBuffer, 0x51510001);
+	}
 	Client gate = Create(30), bad = Create(31);
 	const uint64 readOnly = 0x400000000ULL;
 	auto mapping = Request<amdgpu_vm_mapping>(); mapping.handle = bad.output.handle;
@@ -160,10 +211,15 @@ static void FaultQualification(int monitor)
 	Words fault = {0xc0033700, 0x100500, uint32(readOnly), uint32(readOnly >> 32), 0xdead5100};
 	fault.resize(256, 0x80000000);
 	Enqueue(bad, fault);
+	if (recover) {
+		DmaFill(dma, dmaBuffer, 2, 0xdead5102);
+		DmaFill(dma, dmaBuffer, 3, 0xdead5103);
+	}
 	for (unsigned n = 1; n < 16; n++) Enqueue(bad, Commands(bad, n));
 	for (unsigned n = 1; n < 8; n++) Enqueue(gate, Commands(gate, n));
 	Wait(gate, true); Wait(bad, true);
-	Require(Memory(monitor).pending_jobs == 24, "all fault and later jobs are queued behind the gate");
+	Require(Memory(monitor).pending_jobs == (recover ? 26u : 24u),
+		"all fault and later jobs are queued behind the gate");
 	auto memory = Memory(monitor); auto ram = Gart(monitor);
 	ReleaseGate();
 	for (Client* c : {&bad, &gate}) {
@@ -174,6 +230,12 @@ static void FaultQualification(int monitor)
 		}
 	}
 	Drain(monitor);
+	if (recover) {
+		DmaWait(dma, 1, B_OK); DmaWait(dma, 2, B_BAD_DATA); DmaWait(dma, 3, B_BAD_DATA);
+		DmaPixels(dmaBuffer, 0x51510001);
+		Require(Recovery(monitor, AMDGPU_GFX_RECOVER).status == B_BUSY,
+			"live faulted graphics/DMA resources exclude recovery");
+	}
 	auto first = Request<amdgpu_fence_wait>(); first.fence = 1;
 	Require(ioctl(gate.fd, AMDGPU_WAIT_FENCE, &first, sizeof(first)) == 0 && first.status == B_OK,
 		"earlier successfully retired fence remains successful after a later fault");
@@ -194,6 +256,7 @@ static void FaultQualification(int monitor)
 		"independent VM fault; only the gate and faulting job reached hardware");
 	Enqueue(gate, Commands(gate, 8), B_DEV_NOT_READY);
 	Close(gate); Close(bad);
+	if (recover) DmaFree(dma, dmaBuffer);
 	Require(Memory(monitor).faulted && !Memory(monitor).pending_jobs
 		&& Memory(monitor).allocated_bytes == memory.allocated_bytes
 		&& Gart(monitor).allocated_bytes == ram.allocated_bytes,
@@ -202,6 +265,57 @@ static void FaultQualification(int monitor)
 		" all victim/peer data unchanged and close quarantines memory; completion %llu -> %llu, VM faults %llu\n",
 		(unsigned long long)before.completed_fences, (unsigned long long)irq.completed_fences,
 		(unsigned long long)irq.vm_faults);
+	if (!recover) return;
+	auto q = Recovery(monitor, AMDGPU_RECOVERY_INFO);
+	Require(q.status == B_BAD_DATA && q.buffers == 3 && q.vms == 2 && !q.videos
+		&& !q.live_handles && !q.live_vms && !q.live_videos && !q.pending,
+		"all graphics/DMA work terminal; three BOs/two VMs retained with no live resources");
+	Require(baselineMemory.allocated_bytes + q.quarantined_vram == memory.allocated_bytes
+		&& baselineRam.allocated_bytes + q.quarantined_ram == ram.allocated_bytes,
+		"independent allocators account for complete mixed-queue quarantine");
+	printf("Mixed queue terminal: 25 failed/canceled fences, prior graphics/DMA fences preserved;"
+		" quarantine VRAM/RAM %llu/%llu; one explicit recovery requested\n",
+		(unsigned long long)q.quarantined_vram, (unsigned long long)q.quarantined_ram);
+	auto reset = Recovery(monitor, AMDGPU_GFX_RECOVER);
+	printf("Recovery status %#x stage %u generation %llu -> %llu reclaimed %llu/%llu\n",
+		(unsigned)reset.status, reset.stage, (unsigned long long)q.generation,
+		(unsigned long long)reset.generation, (unsigned long long)reset.reclaimed_vram,
+		(unsigned long long)reset.reclaimed_ram);
+	Require(reset.status == B_OK && reset.stage == 7 && reset.generation == q.generation + 1
+		&& !reset.buffers && !reset.vms && !reset.videos
+		&& !reset.quarantined_vram && !reset.quarantined_ram
+		&& reset.reclaimed_vram == q.quarantined_vram && reset.reclaimed_ram == q.quarantined_ram,
+		"one reset succeeds and reclaims exact quarantine; no retry");
+	Require(Memory(monitor).allocated_bytes == baselineMemory.allocated_bytes
+		&& Gart(monitor).allocated_bytes == baselineRam.allocated_bytes
+		&& IRQ(monitor).completed_fences == 1, "private reset proof and allocator baselines");
+	DmaWait(dma, 1, B_OK); DmaWait(dma, 2, B_BAD_DATA); DmaWait(dma, 3, B_BAD_DATA);
+	auto allocation = Request<amdgpu_buffer>(); allocation.bytes = 4096;
+	Require(ioctl(dma, AMDGPU_CREATE_SYSTEM_BUFFER, &allocation, sizeof(allocation)) < 0
+		&& errno == B_DEV_NOT_READY, "failed queue cannot allocate after recovery");
+	auto vm = Request<amdgpu_vm_info>();
+	Require(ioctl(dma, AMDGPU_VM_INFO, &vm, sizeof(vm)) < 0 && errno == B_DEV_NOT_READY,
+		"failed queue cannot create a new graphics VM after recovery");
+	auto video = Request<amdgpu_video_create>(); video.config = {864, 480, 100, 30, 2, 0};
+	Require(ioctl(dma, AMDGPU_VIDEO_CREATE, &video, sizeof(video)) < 0 && errno == B_DEV_NOT_READY,
+		"failed queue cannot create a new video session after recovery");
+	int fresh = Open(); auto freshBuffer = DmaBuffer(fresh);
+	auto refused = Request<amdgpu_dma_submit>(); refused.operation = AMDGPU_DMA_FILL;
+	refused.destination = freshBuffer.handle; refused.bytes = 4;
+	Require(ioctl(dma, AMDGPU_SUBMIT_DMA, &refused, sizeof(refused)) < 0
+		&& errno == B_DEV_NOT_READY && refused.fence == 0, "failed queue cannot publish new work/fence");
+	DmaFill(fresh, freshBuffer, 1, 0x5151abcd); DmaWait(fresh, 1, B_OK);
+	DmaPixels(freshBuffer, 0x5151abcd); DmaFree(fresh, freshBuffer); close(fresh);
+	Client next = Create(32); Enqueue(next, Commands(next, 0)); Wait(next); Pixels(next, 1); Close(next);
+	DmaWait(dma, 1, B_OK); DmaWait(dma, 2, B_BAD_DATA); DmaWait(dma, 3, B_BAD_DATA);
+	Require(Memory(dma).submitted == 3 && Memory(dma).completed == 3,
+		"old file fence timeline is unchanged by recovery and fresh clients");
+	close(dma);
+	Require(Memory(monitor).allocated_bytes == baselineMemory.allocated_bytes
+		&& Gart(monitor).allocated_bytes == baselineRam.allocated_bytes
+		&& IRQ(monitor).completed_fences == 2, "fresh graphics/DMA work and full reclamation");
+	puts("PASS: mixed queued fault recovery, retained successful/failed fences, lost file rejects new work,"
+		" fresh zeroed graphics/DMA reuse and exact reclamation");
 }
 
 int main(int argc, char** argv)
@@ -222,11 +336,12 @@ int main(int argc, char** argv)
 	}
 	bool smoke = argc == 2 && strcmp(argv[1], "--smoke") == 0;
 	bool fault = argc == 2 && strcmp(argv[1], "--fault") == 0;
-	Require((argc == 1 || smoke || fault) && geteuid() == 0, "queue qualification requires root");
+	bool recover = argc == 2 && strcmp(argv[1], "--fault-recovery") == 0;
+	Require((argc == 1 || smoke || fault || recover) && geteuid() == 0, "queue qualification requires root");
 	int monitor = Open(); auto render = Request<amdgpu_render_info>();
 	Require(ioctl(monitor, AMDGPU_RENDER_INFO, &render, sizeof(render)) == 0
 		&& (render.capabilities & AMDGPU_RENDER_QUEUE_COPY), "queued graphics capability");
-	if (fault) { FaultQualification(monitor); close(monitor); return 0; }
+	if (fault || recover) { FaultQualification(monitor, recover); close(monitor); return 0; }
 	auto before = IRQ(monitor); auto memory = Memory(monitor); auto ram = Gart(monitor);
 	Client c[5]; for (unsigned i = 0; i < 5; i++) c[i] = Create(i + 1);
 	// Malformed requests and inaccessible sources cannot submit work.

@@ -193,6 +193,8 @@ struct amdgpu_oa_info {
 // fence uses the same ordered file-local sequence and WAIT_FENCE as SUBMIT_DMA.
 // A successful enqueue is not GPU completion. Closing retains pending work;
 // terminal GPU errors fail outstanding fences and quarantine device storage.
+// A file with a failed fence remains lost after device recovery. Old waits and
+// resource cleanup stay valid; new allocations, VMs and work require reopening.
 struct amdgpu_gfx_queue {
 	uint32 version, size;
 	uint64 address;
@@ -203,7 +205,8 @@ struct amdgpu_gfx_queue {
 
 // Read-only observation after client engine startup; this does not initialize
 // graphics or alter interrupt routing. reserved must be zero. No DMA address
-// or writable ring mapping is exposed. Counts cover this device's lifetime.
+// or writable ring mapping is exposed. Counts cover the current interrupt
+// epoch; successful recovery rearms IH and advances RECOVERY_INFO.generation.
 struct amdgpu_irq_info {
 	uint32 version, size;
 	uint32 enabled, msi, vector, ring_bytes;

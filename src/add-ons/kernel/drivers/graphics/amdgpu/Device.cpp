@@ -507,7 +507,7 @@ CreateVideo(AmdgpuClient* client, void* data, size_t length)
 	if (status != B_OK) return status;
 	if (!VideoLayout(request.config, layout)) return B_BAD_VALUE;
 	if (client->video != NULL) return B_BUSY;
-	if (sFault != B_OK) return B_DEV_NOT_READY;
+	if (sFault != B_OK || client->failedFence != 0) return B_DEV_NOT_READY;
 	if (sNextVideoHandle == 0 || sVideoSessions >= 32) return B_NO_MEMORY;
 	UvdSession* s = (UvdSession*)calloc(1, sizeof(UvdSession));
 	if (s == NULL) return B_NO_MEMORY;
@@ -588,7 +588,7 @@ DecodeVideo(AmdgpuClient* client, void* data, size_t length)
 		|| request.output_capacity != s->layout.outputBytes
 		|| !VideoPictureValid(*s, request.picture, request.bitstream_bytes))
 		return B_BAD_VALUE;
-	if (sFault != B_OK) return B_DEV_NOT_READY;
+	if (sFault != B_OK || client->failedFence != 0) return B_DEV_NOT_READY;
 	if (!AmdgpuUserRange(request.bitstream, request.bitstream_bytes)
 		|| !AmdgpuUserRange(request.output, s->layout.outputBytes))
 		return B_BAD_ADDRESS;
@@ -863,7 +863,8 @@ QueueGraphics(AmdgpuClient* client, void* data, size_t length)
 		|| (request.dwords & (kIbSizeAlignment / 4 - 1))
 		|| request.dwords == 0 || request.dwords > kMaxIbBytes / 4)
 		return B_BAD_VALUE;
-	if (sFault != B_OK || client->vm == NULL) return B_DEV_NOT_READY;
+	if (sFault != B_OK || client->failedFence != 0 || client->vm == NULL)
+		return B_DEV_NOT_READY;
 	if (sPending >= 256 || client->pending >= 64 || client->submitted == UINT64_MAX)
 		return B_WOULD_BLOCK;
 	Job* job = (Job*)calloc(1, sizeof(Job));
@@ -911,7 +912,7 @@ QueueGraphics(AmdgpuClient* client, void* data, size_t length)
 static status_t
 VMControl(AmdgpuClient* client, uint32 op, void* data, size_t length)
 {
-	if (sFault != B_OK)
+	if (sFault != B_OK || client->failedFence != 0)
 		return B_DEV_NOT_READY;
 	if (op == AMDGPU_VM_INFO) {
 		amdgpu_vm_info request;
@@ -1391,7 +1392,10 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 		status_t status = ReadRequest(c, data, length);
 		if (status != B_OK)
 			return status;
-		if (sFault != B_OK)
+		// Recovery starts a new device epoch, but cannot turn this file's
+		// failed queue back into a successful fence timeline. Keep old waits
+		// and cleanup available; new work requires a fresh client.
+		if (sFault != B_OK || client->failedFence != 0)
 			return B_DEV_NOT_READY;
 		if ((c.operation != AMDGPU_DMA_COPY && c.operation != AMDGPU_DMA_FILL)
 			|| c.bytes == 0 || c.bytes > kMaxBufferBytes
@@ -1455,7 +1459,7 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 		return B_BAD_VALUE;
 	if (op == AMDGPU_CREATE_BUFFER || op == AMDGPU_CREATE_SYSTEM_BUFFER
 		|| op == AMDGPU_CREATE_DEVICE_BUFFER || op == AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER) {
-		if (sFault != B_OK)
+		if (sFault != B_OK || client->failedFence != 0)
 			return B_DEV_NOT_READY;
 		if (request.bytes == 0 || request.bytes > kMaxBufferBytes)
 			return B_BAD_VALUE;
