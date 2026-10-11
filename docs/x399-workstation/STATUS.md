@@ -4,16 +4,20 @@ Status values are backed by observation on the workstation. Anything not
 listed as verified is untested.
 
 **2026-10-11 WX 5100 status:** the X399 now has a Radeon Pro WX 5100.
-Current driver `a4aebce1…` and private Mesa `42352938…` qualify combined
-SDMA/UVD/GFX recovery from real DMA timeouts at decoder clear/readback
-boundaries. H.264, HEVC Main and Main10 preserve user output and retained
-storage; accepted queued DMA is canceled and fresh decoders produce exact
-pixels. Thirteen recovery generations and the subsequent 1,106-job regression
-leave 1,108 healthy completions, zero GPU errors and no live resources or
-quarantine. Automatic policy has ten successful attempts; backups are verified.
-Application recovery, remaining shader isolation, eviction/migration, native
-display and the full release remain open. Details are in
-[the decoder DMA checkpoint](WX5100.md#decoder-dma-failure-and-combined-engine-recovery-2026-10-11).
+Current driver `a4aebce1…` and private Mesa `42352938…` remain installed.
+Actual airTime tests now recover from real H.264/Main/Main10 GPU faults,
+replay in software, seek, recreate hardware decoding and reach the end.
+Two player bugs were fixed and integrated: stale packets after decoder
+replacement, and suppression of all final pictures during hardware catch-up.
+Four cases pass with exact paused pixels; one clear-fault case reports one
+dropped frame. Summit software decoding reaches the end after a real fault,
+but GPU composition freezes and a delayed Mesa-thread abort is recorded.
+Summit recovery is not qualified. All eight automatic resets succeeded;
+this boot is generation 21, automatic 18/18, with no retained resources.
+Fresh EGL/GLES/window and both DMA suites pass afterward, leaving 117 healthy
+GFX completions and zero GPU errors. Production media and backups are verified.
+Details and remaining full-release work are in
+[the actual application recovery checkpoint](WX5100.md#actual-application-recovery-2026-10-11).
 
 The earlier checkpoints below trace this work. The NVIDIA results describe the previous card. AMD desktop output still
 uses the firmware framebuffer. SDMA and the full 61-submission bounded GFX diagnostic pass, including
