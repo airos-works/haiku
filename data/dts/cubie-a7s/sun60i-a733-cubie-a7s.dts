@@ -339,10 +339,13 @@
 		};
 
 		/* Display engine 3.5 with its TCONs and the DisplayPort transmitter;
-		   the sunxi_display driver drives the whole chain. */
+		   the sunxi_display driver drives the whole chain. The interrupt is
+		   TCON-TV1's (vertical blank), the TCON the DisplayPort output is
+		   fed from. */
 		display-engine@5000000 {
 			compatible = "allwinner,sun60i-a733-display-engine";
 			reg = <0x05000000 0x400000>;
+			interrupts = <GIC_SPI 58 IRQ_TYPE_LEVEL_HIGH>;
 			status = "okay";
 		};
 

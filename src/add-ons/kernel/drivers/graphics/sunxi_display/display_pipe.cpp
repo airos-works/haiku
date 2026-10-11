@@ -178,6 +178,7 @@ static const uint32 kLanczos2[32] = {
 DisplayPipe::DisplayPipe()
 	:
 	fMappingCount(0),
+	fTconInterrupts(NULL),
 	fInitialized(false),
 	fEnabled(false),
 	fFlipped(false),
@@ -1218,6 +1219,9 @@ DisplayPipe::Init()
 	_InitController();
 	TRACE("DP controller %#" B_PRIx32 ", AUX PHY %#" B_PRIx32 " %#" B_PRIx32
 		"\n", _Read(kDp + DP_CORE_ID), _Read(kAuxPhy), _Read(kAuxPhy + 4));
+	// TCON-TV1 is clocked from here on, so its registers can be read when
+	// it interrupts
+	fTconInterrupts = (volatile uint32*)_Address(kTconTv1 + 0x004);
 	fInitialized = true;
 	return B_OK;
 }
@@ -1428,6 +1432,24 @@ DisplayPipe::DumpState(const char* when)
 		_Read(kPlaneScaler + 0x88), _Read(kPlaneScaler + 0x8c),
 		_Read(kBlender0), _Read(kBlender0 + 0x080), _Read(kBlender0 + 0x008),
 		_Read(kDeTop + 0x104), _Read(kTconTv1 + 0x0fc));
+}
+
+
+/*!	GINT0: interrupt enables in bits 31..16, flags in 15..0; _InitTcon()
+	enables the vertical blank one (bit 30), flagged in bit 14. Writing 0
+	clears a flag, writing 1 leaves it as it is, so the other flags are
+	written back as they were read.
+*/
+bool
+DisplayPipe::AcknowledgeBlank()
+{
+	if (fTconInterrupts == NULL)
+		return false;
+	uint32 interrupts = *fTconInterrupts;
+	if ((interrupts & (1u << 14)) == 0)
+		return false;
+	*fTconInterrupts = interrupts & ~(1u << 14);
+	return true;
 }
 
 
