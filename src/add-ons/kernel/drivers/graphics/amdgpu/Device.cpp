@@ -1072,6 +1072,31 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 		sGfx.interrupts.Snapshot(info);
 		return user_memcpy(data, &info, sizeof(info));
 	}
+	if (op == AMDGPU_DIAGNOSTIC_RAM_PAGE) {
+		amdgpu_diagnostic_ram_page request;
+		status_t status = ReadRequest(request, data, length);
+		if (status != B_OK) return status;
+		if (request.flags != 0 || request.reserved != 0 || (request.offset & 4095) != 0)
+			return B_BAD_VALUE;
+		if (sFault != B_OK) return B_DEV_NOT_READY;
+		Buffer* bo = Lookup(client, request.handle);
+		if (bo == NULL || !bo->system || bo->area < 0 || bo->cpu == NULL
+			|| bo->bytes < 4096 || request.offset > bo->bytes - 4096)
+			return B_BAD_VALUE;
+		// sMutex holds the live handle. RAM pages are wired for the BO lifetime;
+		// independently cross-check the CPU mapping against the installed GART.
+		physical_entry entry = {};
+		uint32 count = 1;
+		status = get_memory_map_etc(B_SYSTEM_TEAM, (const uint8*)bo->cpu + request.offset,
+			4096, &entry, &count);
+		if (status != B_OK) return status;
+		uint64 pte = sGart.table[(bo->offset + request.offset) / 4096];
+		if (count != 1 || entry.size != 4096 || (entry.address & 4095) != 0
+			|| (pte & 7) != 7 || entry.address != (pte & GpuPageTable::kPhysicalMask))
+			return B_BAD_DATA;
+		request.physical_address = entry.address;
+		return user_memcpy(data, &request, sizeof(request));
+	}
 	if (op == AMDGPU_SHADER_MEMORY_INFO) {
 		amdgpu_shader_memory_info info;
 		status_t status = ReadRequest(info, data, length);
