@@ -30,10 +30,10 @@ device although the host was discoverable, and the host did not find the
 Cubie.
 
 On 2026-10-11, with an antenna on J1 (the FCU760K module's shared
-Wi-Fi/BT pin; its Bluetooth-only pin is not wired), Wi-Fi hears 26-34
-networks at 2.4 GHz instead of a handful, but the Bluetooth link to the lab
-host still fails both ways: Page Timeout, empty inquiries, and the host
-neither pages nor finds the Cubie. The vendor Linux stack on the same board
+Wi-Fi/BT pin; its Bluetooth-only pin is not wired), Wi-Fi scans find
+14-34 networks at 2.4 GHz (21 on average, 8 before), but the Bluetooth
+link to the lab host still fails both ways: Page Timeout, empty
+inquiries, and the host neither pages nor finds the Cubie. The vendor Linux stack on the same board
 (Radxa Debian, aic_btusb + BlueZ) behaves the same, and every LE advertiser
 the Cubie hears is at -93 dBm or weaker, so the board and the host are out
 of Bluetooth range of each other. While the controller pages or inquires,
