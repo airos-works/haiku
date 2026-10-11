@@ -2209,12 +2209,17 @@ aic_attach(device_t dev)
 	ml_init(&sc->sc_rxq[0]);
 	ml_init(&sc->sc_rxq[1]);
 
-	sc->sc_vht = 1;
+	// HT only unless the settings say "vht true": with VHT advertised the
+	// lab's AP (5 GHz, 40 MHz) delivered downloads at a quarter of the HT
+	// rate (17 against 76 Mbit/s, 2026-10-11): the board's 64 KiB TCP
+	// window took 10-38 ms to cross instead of a few, while the link
+	// reported VHT MCS 8-9 and the receive path idled. Why is not known.
+	sc->sc_vht = 0;
 	settings = load_driver_settings("aic8800wifi");
 	if (settings != NULL) {
 		aic_debug = get_driver_boolean_parameter(settings, "debug", 0, 1);
 		aic_watch = get_driver_boolean_parameter(settings, "watch", 0, 1);
-		sc->sc_vht = get_driver_boolean_parameter(settings, "vht", 1, 1);
+		sc->sc_vht = get_driver_boolean_parameter(settings, "vht", 0, 1);
 		unload_driver_settings(settings);
 	}
 
