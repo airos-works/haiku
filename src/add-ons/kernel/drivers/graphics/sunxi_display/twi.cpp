@@ -63,7 +63,8 @@ Twi::~Twi()
 
 
 status_t
-Twi::Init(phys_addr_t base, uint32 gateRegister, uint32 gateBit)
+Twi::Init(phys_addr_t base, uint32 gateRegister, uint32 gateBit,
+	uint32 clockDivider)
 {
 	fArea = map_physical_memory("sunxi_display twi", base, B_PAGE_SIZE,
 		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
@@ -79,9 +80,10 @@ Twi::Init(phys_addr_t base, uint32 gateRegister, uint32 gateBit)
 
 	_Reset();
 
-	// SCL = clock / (10 * (M + 1) * 2^N): M = 15, N = 2 stays at or below
-	// 312 kHz for any bus clock up to 200 MHz (37.5 kHz from 24 MHz).
-	_Write(TWI_CCR, 15 << 3 | 2);
+	// SCL = clock / (10 * (M + 1) * 2^N): the default M = 15, N = 2 stays
+	// at or below 312 kHz for any bus clock up to 200 MHz (37.5 kHz from
+	// 24 MHz).
+	_Write(TWI_CCR, clockDivider);
 	return B_OK;
 }
 
