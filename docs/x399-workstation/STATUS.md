@@ -85,10 +85,15 @@ correcting an oversized M0 positive-control request, 52 positive jobs and 358
 bounds-suite jobs pass; all 18 denied access cases return zero, set the shader
 memory-violation flag and preserve the full owned region. Device IRQ state stays
 healthy, and no recovery boot is needed. Graphics/queue/VM/DMA/concurrent-media
-regressions leave 698 completions, 1,396 EOPs and zero device errors. GWS,
-ordered-append and remaining shader resource paths still need qualification;
-general submissions remain root-only. Driver `2894a05c…` and private Mesa
-`82098de9…` are installed with same-hash backups; prior `f546422d…`,
+regressions leave 698 completions, 1,396 EOPs and zero device errors. The next
+kernel qualifies all six GWS operations with independent counter/state readback,
+relocated allocations, safe semaphore/barrier preconditions and 35 denial cases.
+All 64 resources remain unchanged after each denied operation. The extended
+83-job suite and GDS/ATC/shader/queue/VM/DMA/GLES/concurrent-media regressions
+leave 797 completions, 1,594 EOPs and zero device errors without a recovery boot.
+Ordered append and remaining shader paths still need qualification; general
+submissions remain root-only. Driver `4559a441…` and private Mesa
+`82098de9…` are installed with same-hash backups; prior `2894a05c…`, `f546422d…`,
 `ffe50ea8…`, `cb8672d6…`, `cefb183c…`/`afd206fa…`, prior `c579f1cd…`,
 `7d1cf6e5…`/`ee6210e5…` and older checkpoints are
 preserved. The original global media addon is restored after qualification.
