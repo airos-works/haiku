@@ -28,6 +28,8 @@ struct Configuration {
 			fprintf(stderr, "amduvd TEST: invalid timeout boundary; disabled\n"); return;
 		}
 		after = n;
+		fprintf(stderr, "amduvd TEST: configured GPU timeout stage %u after %ld decoded pictures\n",
+			(unsigned)stage, (long)after);
 	}
 };
 int32 sPictures = 0, sAttempted = 0;

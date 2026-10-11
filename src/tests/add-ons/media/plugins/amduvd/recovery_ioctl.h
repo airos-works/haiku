@@ -3,6 +3,10 @@
 #define AMDUVD_RECOVERY_IOCTL_H
 #include <sys/ioctl.h>
 #include <SupportDefs.h>
+#include <unistd.h>
+
+// Parse Haiku's inline C++ ioctl wrapper before the interception macro.
+// Otherwise unistd.h defines an inline AmduvdRecoveryIoctl that bypasses us.
 
 extern "C" int AmduvdRecoveryIoctl(int fd, unsigned long op, void* data, size_t size);
 #endif
