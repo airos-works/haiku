@@ -61,10 +61,15 @@ A kernel graphics queue now passes immutable snapshots, pending fences,
 64/client and 256/device limits, mixed DMA ordering, and pending-close memory
 lifetime checks. A deliberate VM fault fails all 23 affected/canceled fences
 and preserves quarantined memory; cold recovery repeats 1,213 graphics jobs,
-both DMA paths and concurrent video with no errors. Mesa remains synchronous;
-its queue integration is next. Shader/resource isolation remains incomplete
-and general submissions remain root-only. Driver `cefb183c…` and private Mesa
-`afd206fa…` are installed with same-hash backups; prior `c579f1cd…`,
+both DMA paths and concurrent video with no errors. Private Mesa now has an opt-in asynchronous path with verified pending fences,
+deadlines, sync generations, teardown and deliberate-fault propagation. Its
+queued rendering suite passes. A kernel correction lets decode start while
+graphics is queued and still excludes it behind ordinary DMA; both directions
+have gated regression tests. Queued Summit HEVC 900/0 now passes after an
+initial 900/80 trial exposed the scheduling issue. Both three-minute queued
+playback trials are still in progress. Synchronous Mesa remains the default. Shader/resource isolation remains incomplete
+and general submissions remain root-only. Driver `cb8672d6…` and private Mesa
+`82098de9…` are installed for qualification; `cefb183c…`/`afd206fa…`, prior `c579f1cd…`,
 `7d1cf6e5…`/`ee6210e5…` and older checkpoints are
 preserved. The original global media addon is restored after qualification.
 System Mesa defaults remain
