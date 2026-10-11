@@ -1920,7 +1920,12 @@ BluetoothWindow::_ClassicConnectFinished(bool success, uint8 status)
 	BString text;
 	if (success) {
 		title = B_TRANSLATE("Connected to %name%");
-		if (fOperationKind == DEVICE_KIND_AUDIO) {
+		// Speakers and headsets say so in their class; a computer that
+		// plays sound (an A2DP sink) has the Rendering and Audio service
+		// bits (Assigned Numbers, Class of Device, bits 18 and 21).
+		const uint32 renderingAudio = (1 << 18) | (1 << 21);
+		if (fOperationKind == DEVICE_KIND_AUDIO
+			|| (fOperationClass & renderingAudio) == renderingAudio) {
 			// Speakers and headsets take over the sound output; the
 			// Bluetooth audio output connects its stream to them.
 			bdaddr_t address;

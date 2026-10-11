@@ -93,6 +93,7 @@ struct StatusDevice {
 		// Whether "connected" is known (the Bluetooth service may not say)
 	bool		audioOutput;
 		// sound plays through it
+	bool		playsAudio;
 	int32		battery;
 };
 
@@ -635,6 +636,7 @@ private:
 			device.connected = false;
 			device.stateKnown = true;
 			device.audioOutput = false;
+			device.playsAudio = false;
 			device.battery = -1;
 			BString key = AddressText(device.address);
 			auto name = names.find(key);
@@ -714,6 +716,10 @@ private:
 					&size) == B_OK && size == 3)
 				memcpy(deviceClass, classData, 3);
 			device.kind = KindForClass(deviceClass);
+			// Rendering and Audio service bits (Class of Device bits 18 and
+			// 21): it can play sound, whatever its major class.
+			device.playsAudio = device.kind == DEVICE_KIND_AUDIO
+				|| (deviceClass[2] & 0x24) == 0x24;
 			BString key = AddressText(device.address);
 			auto name = names.find(key);
 			const char* storedName;
@@ -808,7 +814,7 @@ private:
 			menu->AddItem(new DeviceMenuItem(device,
 				fIcons->Get(IconNameForKind(device.kind), iconSize),
 				new BMessage(kMsgOpenPreferences)));
-			if (!device.lowEnergy && (device.kind == DEVICE_KIND_AUDIO
+			if (!device.lowEnergy && (device.playsAudio
 					|| device.audioOutput)) {
 				BMessage* choice = new BMessage(kMsgAudioOutput);
 				choice->AddBool("use", !device.audioOutput);
