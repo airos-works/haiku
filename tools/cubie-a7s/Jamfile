@@ -26,6 +26,8 @@ SimpleTest pvrtest : pvrtest.cpp ;
 # (tools/rpi4/push.py serves it)
 SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) tools rpi4 ] ;
 SimpleTest cubie_fetch : fetch.cpp : network ;
+# and the other direction, for the Wi-Fi upload tests
+SimpleTest cubie_send : send.cpp : network ;
 
 # the sunxi_cedar media add-on's decoder on its own, for the video engine's
 # tests: per-picture hashes against FFmpeg's (evidence/video/proto/vectors)
