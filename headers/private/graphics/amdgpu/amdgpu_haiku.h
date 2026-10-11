@@ -141,7 +141,7 @@ enum {
 	// GDS_COMPUTE_MAX_WAVE_ID, via a trusted same-value PM4 prefix.
 	AMDGPU_GDS_PROBE_OA_RESET = 5, // reset only; GDS/GWS/OA disabled
 	AMDGPU_GDS_PROBE_OA_FULL = 6, // GDS 0/4096; OA mask 0xffff
-	AMDGPU_GDS_PROBE_OA_SLICE = 7, // GDS 0/4096; OA mask 0x30 (indices 4/5)
+	AMDGPU_GDS_PROBE_OA_SLICE = 7, // GDS 0/4096; OA resource mask 0x30
 	AMDGPU_GDS_PROBE_OA_NONE = 8, // GDS 0/4096; OA mask 0
 	AMDGPU_GDS_PROBE_OA_NOGDS = 9, // GDS disabled; OA mask 0xffff
 	AMDGPU_GDS_PROBE_LAST = AMDGPU_GDS_PROBE_OA_NOGDS

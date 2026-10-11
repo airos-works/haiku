@@ -158,13 +158,13 @@ static void CheckAll(Client& c, const uint32 expected[1024])
 }
 static void Ordered(Client& c, Client& reader, int mode, uint32 index,
 	uint32 address, bool swap, uint32 value, uint32 expected[1024], bool denied,
-	bool observePermission = false)
+	bool observePermission = false, uint32 gdsBase = 0)
 {
-	Require(address % 4 == 0 && address * 4 + index * 4 < 4096,
+	Require(address % 4 == 0 && gdsBase + address * 4 + index * 4 < 4096,
 		"every possible OA target is inside owned seeded GDS");
 	OrderedShader(c, index, swap);
 	auto before = Info<amdgpu_oa_info>(c.fd, AMDGPU_OA_INFO);
-	if (mode < 0) {
+	if (mode < 0 || mode <= AMDGPU_GDS_PROBE_NONE) {
 		// Previous ordered instructions can advance the GDS wave crawler.
 		// Synchronize to the fixture's
 		// M0 wave ID 0 before ordinary submission. This separate trusted job
@@ -184,7 +184,7 @@ static void Ordered(Client& c, Client& reader, int mode, uint32 index,
 			printf("OA %s mode %d index %u address %#x changed GDS byte %#x: %#x -> %#x\n",
 				swap ? "swap" : "add", mode, index, address, i * 4, expected[i], actual[i]);
 	}
-	uint32 word = address / 4 + index;
+	uint32 word = gdsBase / 4 + address / 4 + index;
 	uint32 old = expected[word];
 	if (observePermission) {
 		Require(trap == 0 || trap == 0x100, "observed OA exception is success or memory violation");
@@ -246,8 +246,9 @@ int main(int argc, char** argv)
 	bool extended = argc == 2 && strcmp(argv[1], "--extended") == 0;
 	bool bounds = argc == 2 && strcmp(argv[1], "--bounds") == 0;
 	bool maskObserve = argc == 2 && strcmp(argv[1], "--mask-observe") == 0;
-	Require(absent || ((controls || addressControl || extended || bounds || maskObserve) && geteuid() == 0),
-		"usage: amdgpu_oa_access --control | --address-control | --extended | --bounds | --mask-observe | --expect-no-device");
+	bool gdsWindow = argc == 2 && strcmp(argv[1], "--gds-window") == 0;
+	Require(absent || ((controls || addressControl || extended || bounds || maskObserve || gdsWindow) && geteuid() == 0),
+		"usage: amdgpu_oa_access --control | --address-control | --extended | --bounds | --mask-observe | --gds-window | --expect-no-device");
 	for (uint32 op = 0; op < 3; op++) Commands(op, 256, 4096, 0x1234, 0x5678);
 	int monitor = open("/dev/" AMDGPU_DEVICE_NAME, O_RDWR);
 	if (absent) { Require(monitor < 0 && errno == ENOENT, "no AMD device"); puts("PASS: OA access command policy and no-device handling"); return 0; }
@@ -317,6 +318,20 @@ int main(int argc, char** argv)
 					Ordered(c[index % 2], c[1 - index % 2], mode, index, 256,
 						swap, 0x700 + index, expected, false, true);
 			}
+		}
+	}
+	if (gdsWindow) {
+		for (uint32 swap = 0; swap < 2; swap++) {
+			Ordered(c[0], c[1], AMDGPU_GDS_PROBE_FULL, 63, 256, swap, 11, expected, false);
+			Ordered(c[1], c[0], AMDGPU_GDS_PROBE_SLICE, 0, 0, swap, 13, expected, false, false, 1024);
+			Ordered(c[0], c[1], AMDGPU_GDS_PROBE_SLICE, 63, 0, swap, 17, expected, false, false, 1024);
+			Ordered(c[1], c[0], AMDGPU_GDS_PROBE_SLICE, 0, 252, swap, 19, expected, false, false, 1024);
+			Ordered(c[0], c[1], AMDGPU_GDS_PROBE_SLICE, 31, 128, swap, 23, expected, false, false, 1024);
+			Ordered(c[1], c[0], AMDGPU_GDS_PROBE_SLICE, 1, 252, swap, 29, expected, true, false, 1024);
+			Ordered(c[0], c[1], AMDGPU_GDS_PROBE_SLICE, 0, 256, swap, 31, expected, true, false, 1024);
+			Ordered(c[1], c[0], AMDGPU_GDS_PROBE_SLICE, 63, 256, swap, 37, expected, true, false, 1024);
+			Ordered(c[0], c[1], AMDGPU_GDS_PROBE_NONE, 0, 0, swap, 41, expected, true);
+			Ordered(c[1], c[0], AMDGPU_GDS_PROBE_NONE, 63, 256, swap, 43, expected, true);
 		}
 	}
 	auto oaAfter = Info<amdgpu_oa_info>(monitor, AMDGPU_OA_INFO);
