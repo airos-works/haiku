@@ -1656,6 +1656,19 @@ TCPEndpoint::_SynchronizeSentReceive(tcp_segment_header &segment,
 	_PrepareReceivePath(segment);
 
 	if (segment.flags & TCP_FLAG_ACKNOWLEDGE) {
+		// The SYN's round trip: a connection that only receives (a download
+		// that sends no request) measures no other, and without one
+		// _UpdateReceiveBuffer() never grows the receive window past the
+		// socket's initial buffer size. A retransmitted SYN is only timed
+		// through the timestamp it echoes (Karn).
+		if ((fFlags & FLAG_OPTION_TIMESTAMP) != 0
+			&& segment.timestamp_reply != 0) {
+			_UpdateRoundTripTime(tcp_diff_timestamp(segment.timestamp_reply),
+				1);
+		} else if (fSendTime != 0 && fRetransmitInitialCount == 0)
+			_UpdateRoundTripTime(tcp_diff_timestamp(fSendTime), 1);
+		fSendTime = 0;
+
 		_MarkEstablished();
 	} else {
 		// simultaneous open
