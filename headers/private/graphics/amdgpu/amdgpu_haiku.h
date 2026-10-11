@@ -49,7 +49,8 @@ enum {
 	AMDGPU_GFX_QUEUE_COPY,
 	AMDGPU_SHADER_MEMORY_INFO,
 	AMDGPU_DIAGNOSTIC_RAM_PAGE,
-	AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER
+	AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER,
+	AMDGPU_GFX_GDS_PROBE_COPY
 };
 
 // One GPU virtual address space per open client. Mappings retain their BO
@@ -119,6 +120,20 @@ struct amdgpu_gfx_submit {
 // recovery. Failed validation clears the private copy and returns B_NOT_ALLOWED
 // without starting/submitting graphics. Zero flags retain the raw lab interface.
 #define AMDGPU_GFX_VALIDATE_COMMANDS 1u
+
+// Root-only GDS qualification, using amdgpu_gfx_submit with a privately copied,
+// always-validated outer IB. flags is exactly one of the modes below, not the
+// ordinary submission flags. Fixed byte ranges only; no caller-selected MMIO.
+// The driver owns GDS and ordinary clients have zero allocation. The probe
+// temporarily leases a window to VMID2 for one synchronous job, then revokes
+// it on healthy retirement. GWS/OA remain disabled. These diagnostic contents
+// are shared across probe jobs, not a per-client storage API. Faults retain
+// the usual terminal quarantine and require recovery before another probe.
+enum {
+	AMDGPU_GDS_PROBE_FULL = 0, // base 0, size 4096; initialize/check owned guards
+	AMDGPU_GDS_PROBE_SLICE = 1, // base 1024, size 256
+	AMDGPU_GDS_PROBE_NONE = 2 // base 0, size 0; ordinary client policy
+};
 
 // Root-only asynchronous copied submission. Captures/optionally validates the
 // complete outer IB before returning. Queued jobs retain the client VM and all
