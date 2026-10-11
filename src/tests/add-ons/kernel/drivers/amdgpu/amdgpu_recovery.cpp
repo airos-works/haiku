@@ -12,6 +12,7 @@
 #include <vector>
 #include "GfxCommandValidator.h"
 
+static_assert(sizeof(amdgpu_recovery_policy) == 48, "policy ABI");
 static_assert(sizeof(amdgpu_recovery_info) == 136, "recovery ABI");
 static const uint64 kOutput = 0x300000000ULL, kVram = 0x400000000ULL, kCode = 0x500000000ULL;
 static const uint32 kGuard = 0x6b6b6b6b, kMarker = 0x72535451;
@@ -117,8 +118,48 @@ static std::vector<uint32> Commands(bool shader)
 	Require(validation.error == amdgpu::GfxCommandValidation::OK,
 		"recovery fixture command policy"); return w;
 }
+static amdgpu_recovery_policy Policy(int fd, int enabled = -1)
+{
+	auto r = Request<amdgpu_recovery_policy>();
+	if (enabled >= 0) { r.flags = AMDGPU_RECOVERY_SET_POLICY; r.enabled = enabled; }
+	Require(ioctl(fd, AMDGPU_RECOVERY_POLICY, &r, sizeof(r)) == 0, "read/set healthy automatic recovery policy");
+	printf("Automatic enabled %u pending %u status %#x attempts %llu successes %llu\n", r.enabled,
+		r.pending, (unsigned)r.status, (unsigned long long)r.attempts, (unsigned long long)r.successes);
+	return r;
+}
 static void ABI(int fd)
 {
+	for (unsigned i = 0; i < 7; i++) {
+		auto r = Request<amdgpu_recovery_policy>(); size_t bytes = sizeof(r);
+		if (i == 0) r.version++;
+		if (i == 1) r.size--;
+		if (i == 2) bytes--;
+		if (i == 3) r.flags = 2;
+		if (i == 4) r.reserved = 1;
+		if (i == 5) r.reserved_out = 1;
+		if (i == 6) { r.flags = AMDGPU_RECOVERY_SET_POLICY; r.enabled = 2; }
+		Require(ioctl(fd, AMDGPU_RECOVERY_POLICY, &r, bytes) < 0 && errno == B_BAD_VALUE,
+			"malformed policy rejected without mutation");
+	}
+	auto original = Info<amdgpu_recovery_policy>(fd, AMDGPU_RECOVERY_POLICY);
+	void* address = NULL;
+	area_id area = create_area("policy read-only result", &address, B_ANY_ADDRESS, B_PAGE_SIZE,
+		B_NO_LOCK, B_READ_AREA | B_WRITE_AREA);
+	Require(area >= 0, "create protected policy result");
+	auto protectedRequest = (amdgpu_recovery_policy*)address;
+	*protectedRequest = Request<amdgpu_recovery_policy>();
+	protectedRequest->flags = AMDGPU_RECOVERY_SET_POLICY; protectedRequest->enabled = !original.enabled;
+	Require(set_area_protection(area, B_READ_AREA) == B_OK, "protect policy result");
+	// Only a healthy idle device can reach the result-copy transaction.
+	if (Info<amdgpu_recovery_info>(fd, AMDGPU_RECOVERY_INFO).status == B_OK)
+		Require(ioctl(fd, AMDGPU_RECOVERY_POLICY, protectedRequest, sizeof(*protectedRequest)) < 0
+			&& errno == B_BAD_ADDRESS && Info<amdgpu_recovery_policy>(fd, AMDGPU_RECOVERY_POLICY).enabled == original.enabled,
+			"unwritable result cannot change policy");
+	Require(delete_area(area) == B_OK, "delete protected policy result");
+	int policyRO = open("/dev/" AMDGPU_DEVICE_NAME, O_RDONLY);
+	auto policy = Request<amdgpu_recovery_policy>();
+	Require(policyRO >= 0 && ioctl(policyRO, AMDGPU_RECOVERY_POLICY, &policy, sizeof(policy)) < 0
+		&& errno == B_NOT_ALLOWED, "read-only policy denied"); close(policyRO);
 	for (uint32 op : {uint32(AMDGPU_RECOVERY_INFO), uint32(AMDGPU_GFX_RECOVER)}) {
 		auto r = Request<amdgpu_recovery_info>();
 		Require(ioctl(fd, op, NULL, sizeof(r)) < 0 && errno == B_BAD_ADDRESS, "null request denied");
@@ -137,6 +178,9 @@ static void ABI(int fd)
 		int ordinary = Open(); auto r = Request<amdgpu_recovery_info>();
 		for (uint32 op : {uint32(AMDGPU_RECOVERY_INFO), uint32(AMDGPU_GFX_RECOVER)})
 			Require(ioctl(ordinary, op, &r, sizeof(r)) < 0 && errno == B_NOT_ALLOWED, "root-only recovery gates");
+		auto policy = Request<amdgpu_recovery_policy>();
+		Require(ioctl(ordinary, AMDGPU_RECOVERY_POLICY, &policy, sizeof(policy)) < 0
+			&& errno == B_NOT_ALLOWED, "ordinary client cannot observe or change global recovery policy");
 		close(ordinary); _exit(0);
 	}
 	int status; Require(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0, "privilege child");
@@ -148,10 +192,16 @@ int main(int argc, char** argv)
 	bool baseline = argc == 2 && strcmp(argv[1], "--baseline") == 0;
 	bool snapshot = argc == 2 && strcmp(argv[1], "--snapshot-only") == 0;
 	bool recover = argc == 2 && strcmp(argv[1], "--recover") == 0;
-	bool cp = argc == 2 && strcmp(argv[1], "--cp-timeout") == 0;
-	bool shader = argc == 2 && strcmp(argv[1], "--shader-timeout") == 0;
-	Require(absent || ((baseline || snapshot || recover || cp || shader) && geteuid() == 0),
-		"usage: amdgpu_recovery --baseline | --snapshot-only | --cp-timeout | --shader-timeout | --recover | --expect-no-device");
+	bool autoCP = argc == 2 && strcmp(argv[1], "--auto-cp-timeout") == 0;
+	bool autoShader = argc == 2 && strcmp(argv[1], "--auto-shader-timeout") == 0;
+	bool automatic = autoCP || autoShader;
+	bool cp = autoCP || (argc == 2 && strcmp(argv[1], "--cp-timeout") == 0);
+	bool shader = autoShader || (argc == 2 && strcmp(argv[1], "--shader-timeout") == 0);
+	bool policy = argc == 2 && strcmp(argv[1], "--auto-policy") == 0;
+	bool enable = argc == 2 && strcmp(argv[1], "--auto-on") == 0;
+	bool disable = argc == 2 && strcmp(argv[1], "--auto-off") == 0;
+	Require(absent || ((baseline || snapshot || recover || cp || shader || policy || enable || disable) && geteuid() == 0),
+		"usage: amdgpu_recovery --baseline | --snapshot-only | --cp-timeout | --shader-timeout | --recover | --auto-policy | --auto-on | --auto-off | --auto-cp-timeout | --auto-shader-timeout | --expect-no-device");
 	Commands(false); Commands(true);
 	int monitor = open("/dev/" AMDGPU_DEVICE_NAME, O_RDWR);
 	if (absent) { Require(monitor < 0 && errno == ENOENT, "no AMD device"); puts("PASS: recovery command policy and no-device handling"); return 0; }
@@ -160,7 +210,10 @@ int main(int argc, char** argv)
 	auto ram = Info<amdgpu_gart_info>(monitor, AMDGPU_GART_INFO);
 	auto info = Info<amdgpu_recovery_info>(monitor, AMDGPU_RECOVERY_INFO); Print(info);
 	if (snapshot) return 0;
+	if (policy || enable || disable) { Policy(monitor, enable ? 1 : disable ? 0 : -1); close(monitor); return 0; }
 	ABI(monitor);
+	auto policyBefore = Policy(monitor);
+	if (cp || shader) Require(policyBefore.enabled == uint32(automatic), "fault fixture matches explicit automatic/manual policy");
 	if (recover) {
 		Require(info.status != B_OK && !info.live_handles && !info.live_vms && !info.live_videos
 			&& !info.pending && info.buffers && info.vms && !info.videos, "closed graphics-only fault quarantine");
@@ -196,6 +249,41 @@ int main(int argc, char** argv)
 		Require(request.status == B_TIMED_OUT && !request.completion && !request.vm_fault_status[0]
 			&& !request.vm_fault_status[1], "expected terminal timeout, not a VM fault");
 		Check(c[0], true); Check(c[1], false);
+		if (automatic) {
+			// Observe the same terminal fault. No reset ioctl, re-enqueue or
+			// retry is issued on this path, including after an observation limit.
+			bigtime_t deadline = system_time() + 5000000;
+			auto recovered = Info<amdgpu_recovery_info>(monitor, AMDGPU_RECOVERY_INFO);
+			while (recovered.generation == info.generation && system_time() < deadline) {
+				snooze(1000); recovered = Info<amdgpu_recovery_info>(monitor, AMDGPU_RECOVERY_INFO);
+			}
+			Print(recovered); auto policyAfter = Policy(monitor);
+			Require(recovered.status == B_OK && recovered.stage == 7 && recovered.generation == info.generation + 1
+				&& policyAfter.enabled && !policyAfter.pending && policyAfter.status == B_OK
+				&& policyAfter.attempts == policyBefore.attempts + 1 && policyAfter.successes == policyBefore.successes + 1,
+				"worker performs exactly one automatic reset after terminal timeout");
+			Require(!recovered.reclaimed_vram && !recovered.reclaimed_ram && Healthy(monitor).completed_fences == 1,
+				"automatic private proof retains every live allocation");
+			Check(c[0], true); Check(c[1], false);
+			for (auto& client : c) {
+				auto lost = Info<amdgpu_client_status>(client.fd, AMDGPU_CLIENT_STATUS);
+				Require(lost.status == B_TIMED_OUT && lost.flags == (AMDGPU_CLIENT_LOST | AMDGPU_CLIENT_RESET_COMPLETED)
+					&& !lost.failed_fence, "faulting and innocent synchronous clients retain completed loss");
+				auto denied = Request<amdgpu_buffer>(); denied.bytes = 4096;
+				Require(ioctl(client.fd, AMDGPU_CREATE_SYSTEM_BUFFER, &denied, sizeof(denied)) < 0
+					&& errno == B_DEV_NOT_READY, "lost synchronous client cannot allocate after automatic recovery");
+				Close(client);
+			}
+			Require(Info<amdgpu_memory_info>(monitor, AMDGPU_MEMORY_INFO).allocated_bytes == memory.allocated_bytes
+				&& Info<amdgpu_gart_info>(monitor, AMDGPU_GART_INFO).allocated_bytes == ram.allocated_bytes,
+				"automatic recovered live cleanup reclaims complete storage");
+			Client fresh[2] = {Create(0x5100aa03), Create(0x5100aa04)};
+			Control(fresh[0]); Control(fresh[1]); Close(fresh[0]); Close(fresh[1]);
+			Require(Healthy(monitor).completed_fences == 3, "private proof and two fresh VM controls");
+			Require(Policy(monitor).attempts == policyAfter.attempts, "no repeated automatic reset on healthy device");
+			puts("PASS: automatic terminal timeout recovery, retained innocent/faulting client loss and guards, exact cleanup and fresh VM work");
+			close(monitor); return 0;
+		}
 		auto irq = Info<amdgpu_irq_info>(monitor, AMDGPU_IRQ_INFO);
 		Require(irq.completed_fences == irqBefore.completed_fences + 2 && irq.waits == irqBefore.waits + 3
 			&& !irq.vm_faults && !irq.privileged_faults, "failed job cannot complete a fence");
