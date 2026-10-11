@@ -105,6 +105,9 @@
 /* MM_VERSION_CFM */
 #define AIC_VERSION_SIZE			28
 #define AIC_VERSION_LMAC			0
+#define AIC_VERSION_PHY_1			12	/* the PHY's features: bits 24-25 the
+										   widest channel (2: 80 MHz), 27
+										   LDPC decoding, 28 beamformee */
 #define AIC_VERSION_PHY_2			16
 #define AIC_VERSION_FEATURES		20
 #define AIC_VERSION_MAX_STA			24

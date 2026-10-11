@@ -22,8 +22,8 @@ Measured on the lab's network ("Gaspers", a WPA2-PSK/CCMP mesh; joined on
   Deskbar list the networks.
 - Join through net_server and wpa_supplicant (`ifconfig ... join`, the
   Deskbar, or `wifiautojoin` at boot with a saved network): associated, both
-  keys installed and the port open in under 2 s, then DHCP. Link VHT MCS 9
-  at 40 MHz (HT MCS 7 before VHT was advertised).
+  keys installed and the port open in under 2 s, then DHCP. Link HT MCS 7
+  at 40 MHz (VHT MCS 9 with `vht true`, but see below).
 - Ping to a LAN host over Wi-Fi: about 1.7 ms, no loss (power save is off).
 - 1 GiB from the lab host in 121 s (about 71 Mbit/s, HT40) while a BLE scan
   ran; no USB errors.
@@ -45,6 +45,62 @@ Measured on the lab's network ("Gaspers", a WPA2-PSK/CCMP mesh; joined on
   manufacturer 0x0b3b, ACL 1021 x 9); `bt_le scan` lists advertisers; the
   BluetoothStatus menu and the Bluetooth preferences show the adapter
   ("AIC8820") and find nearby devices.
+
+## The "hang" of 2026-10-11 06:38Z: the board overheated
+
+With the antenna fitted, a 512 MiB download over Wi-Fi seemed to hang the
+board: no answer on either interface, the serial log stopped. It was not the
+driver. The board lost power: the lab plug read 8, 9, 10, then 12 W during
+the download and 0 W from 06:38:16, 11 s after the last serial line, and the
+board only came back after 60 s without power (two 5 s cycles were not
+enough). The same boot had two Summit pages playing 1080p30 videos in a
+loop on the video engine (H.264 and HEVC, GPU compositing), which the same
+test session meant to close before the download but did not; the download
+came on top.
+
+air/OS has no thermal management on the Cubie: no CPU frequency scaling, no
+throttling, no critical trip (no fan is fitted: in Linux its PWM changes
+nothing; Linux holds both CPU clusters at 416 MHz once the SoC is over
+60 C). Read from the A733's THS
+(evidence/wifi-hang):
+
+- idle: 69-71 C; the two looping videos alone (Wi-Fi not joined): 71 to
+  100 C in 4.5 minutes, still rising, with 0.8 of 8 cores busy and the
+  plug at 5 to 8 W;
+- one video and the download: 77 to 95 C in under 3 minutes;
+- the download alone: 70 to 74 C over 8 minutes, 5 W, the whole Wi-Fi path
+  (EHCI finish thread, receive thread, the stack's reader) about 0.15 of a
+  core, no transfer errors.
+
+So sustained video work cooks the board to its cut-off in about 6 minutes,
+Wi-Fi or not; the fix is thermal management for the A733 (THS, throttling).
+
+With the antenna, VHT turned out to cost three quarters of the download
+rate: on the lab's AP (26:5a:4c:21:6c:a2, now on 5805 MHz, 40 MHz, -48 dBm)
+the same 1 GiB download ran at 17.2-17.8 Mbit/s with VHT advertised (five
+runs) and 75.7 Mbit/s with HT only. With VHT the board's receive path idled
+and the lab host's TCP view showed the board's 64 KiB window taking 10-38 ms
+to cross: the AP delivered slowly. The cause is open (the PHY reports
+80 MHz, LDPC and beamformee; the vendor's driver also advertises SU
+beamformee, this one does not). The driver now advertises HT unless its
+settings say `vht true`. Also only with VHT: right after the replies to a
+host are moved onto Wi-Fi, one in 11 is lost for about 2.5 minutes.
+
+Measured with the antenna on the branch cubie-wifi-hang (HT, mostly MCS 7
+at 40 MHz), evidence/wifi-hang/run9-final:
+
+- three 1 GiB downloads: 75.0, 75.5 and 75.7 Mbit/s (the plug at 5 W, the
+  receive path about 0.8 of a core); one more with a BLE scan running (it
+  listed 8 advertisers): 75.9 Mbit/s; a 512 MiB upload: 67.5 Mbit/s;
+- ping from the lab host over Wi-Fi both ways: 180 of 180 in the first
+  3 minutes after the route change, then 600 of 600 in 10 minutes, median
+  1.0 ms, p99 7.7 ms;
+- no driver or USB errors after the boot, Ethernet unaffected.
+
+`watch true` in the driver settings puts the processors' load, the busiest
+threads, free memory, the USB transport's counters and what the driver's
+threads wait for on the serial port every 5 s; a packet that runs past the
+end of its USB transfer is logged with its context.
 
 ## Pieces
 
@@ -82,7 +138,9 @@ both Cubie images. Before a public release, AICSemi should confirm that
 `LICENSE.aic` covers the Wi-Fi images too (it names the Bluetooth files).
 
 Driver settings (`~/config/settings/kernel/drivers/aic8800wifi`):
-`debug true` logs what the driver does; `attach_at_boot false` keeps it out
+`debug true` logs what the driver does; `watch true` adds the 5 s watch
+(above); `vht true` advertises VHT (slower on the lab's AP, above);
+`attach_at_boot false` keeps it out
 of the first minute after boot (touch its file to bring it in later).
 
 ## Bluetooth

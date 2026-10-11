@@ -220,6 +220,13 @@ VideoView::SetBitmap(const BBitmap* bitmap)
 			SetViewColor(B_TRANSPARENT_COLOR);
 		}
 		if (!fOverlayMode) {
+			// The consumer recycles the previous bitmap as soon as this
+			// returns, and the producer writes the next picture into it. An
+			// asynchronous draw of it still queued in a busy app_server would
+			// then read a half-written picture (a tear), so wait for the draws
+			// already sent - they had a frame's time to finish - but not for
+			// this one.
+			Sync();
 			if (fSubtitleChanged) {
 				_LayoutSubtitle();
 				Invalidate(fVideoFrame | fSubtitleFrame);

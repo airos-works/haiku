@@ -199,7 +199,7 @@ rule UserBuildConfigRulePreImage
 		imagePackages = <cubie-app-pkg>$(imagePackages:BS) ;
 		SEARCH on $(imagePackages) = $(imagePackageDir) ;
 		AddFilesToHaikuImage system packages : $(imagePackages) ;
-		local airTime = <airtime-pkg>airtime-1.0.0-16-arm64.hpkg ;
+		local airTime = <airtime-pkg>airtime-1.0.0-18-arm64.hpkg ;
 		SEARCH on $(airTime) = /mnt/HaikuWork/apps/airTime/artifacts ;
 		AddFilesToHaikuImage system packages : $(airTime) ;
 
@@ -251,8 +251,8 @@ rule UserBuildConfigRulePreImage
 		# lab tools, and the driver settings that let cubie_reg at the
 		# display registers
 		AddFilesToHaikuImage system non-packaged bin : cubie_reg cubie_fetch
-			pvrinfo pvrtest cedar_decode media_probe cpu_usage aicload
-			cubie_audio_test screencheck ;
+			cubie_send pvrinfo pvrtest cedar_decode media_probe cpu_usage aicload
+			cubie_audio_test screencheck cubie_cpubench ;
 		if $(CUBIE_AIROS_IMAGE) {
 			# a Bluetooth diagnostic the regular image leaves out
 			AddFilesToHaikuImage system non-packaged bin : bt_dev_info ;
@@ -278,7 +278,8 @@ rule UserBuildConfigRulePreImage
 			SEARCH on $(labMedia) = $(CUBIE_LAB_MEDIA) ;
 			AddFilesToHaikuImage home media : $(labMedia) ;
 		}
-		local labSettings = <cubie-lab>sunxi_display <cubie-lab>aic8800wifi ;
+		local labSettings = <cubie-lab>sunxi_display <cubie-lab>aic8800wifi
+			<cubie-lab>sunxi_thermal ;
 		SEARCH on $(labSettings) = [ FDirName $(HAIKU_TOP) tools cubie-a7s lab ] ;
 		AddFilesToHaikuImage home config settings kernel drivers
 			: $(labSettings) ;
