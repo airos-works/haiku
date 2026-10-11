@@ -385,3 +385,16 @@ amdgpu_smc_timestamp_khz(volatile uint32* regs, uint32 referenceKHz)
 		return 10000;
 	return (smc.Read(0xc05001a0) & 2) != 0 ? referenceKHz / 4 : referenceKHz;
 }
+
+status_t
+amdgpu_smc_check_uvd_clocks(volatile uint32* regs)
+{
+	SmcAccess smc(regs);
+	// vi.c changes clocks at UVD hardware initialization, not in the UVD6
+	// post-soft-reset path. Require our previously applied, ROM-qualified
+	// playback dividers, completed handshakes and unchanged source selection.
+	return smc.Read(0xc05000a4) == 0x1c && smc.Read(0xc050009c) == 0x24
+		&& (smc.Read(0xc05000a8) & 1) != 0 && (smc.Read(0xc05000a0) & 1) != 0
+		&& smc.Read(0xc0500118) == 0 && smc.Read(0xc05001c8) == 0
+		? B_OK : B_NOT_ALLOWED;
+}
