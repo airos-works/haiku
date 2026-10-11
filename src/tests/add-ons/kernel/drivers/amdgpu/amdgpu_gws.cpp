@@ -96,6 +96,14 @@ static void Run(Client& c, int mode, uint32 op, uint32 id, uint32 value,
 	uint32 peerOutput[1024];
 	memcpy(peerOutput, (void*)(addr_t)peer.output.address, sizeof(peerOutput));
 	auto before = Snapshot(c.fd);
+	// These fixed test cases always target owned GWS indices. Even if a
+	// denial unexpectedly fails, P has a token and BARRIER has no waiters.
+	uint32 target = mode == AMDGPU_GDS_PROBE_GWS_SLICE ? 8 + id : id;
+	Require(target < 64, "owned physical GWS target");
+	uint32 priorCounter = (before.resources[target] >> 1) & 0xfff;
+	Require((before.resources[target] & 0x08000000) == 0, "no preexisting waiter");
+	if (op == 2) Require(priorCounter > 0, "P has an independently observed token");
+	if (op == 5) Require(priorCounter == 0, "single-wave barrier starts at zero");
 	auto out = (uint32*)(addr_t)c.output.address;
 	for (uint32 i = 0; i < 1024; i++) out[i] = kGuard;
 	const uint32 limit = physical < 0 ? 1 : 32;
@@ -145,6 +153,8 @@ static void Run(Client& c, int mode, uint32 op, uint32 id, uint32 value,
 		else if (!observe) {
 			Require(int((after.resources[i] >> 1) & 0xfff) == counter, "exact selected GWS counter");
 			Require((after.resources[i] & 0x08000000) == 0, "no waiting GWS wave");
+			if (op == 5) Require((after.resources[i] & 0x2001)
+				== (0x2000 | ((before.resources[i] ^ 1) & 1)), "barrier type and flag toggle");
 		}
 	}
 	Require(memcmp(peerOutput, (void*)(addr_t)peer.output.address, sizeof(peerOutput)) == 0,
@@ -208,7 +218,7 @@ int main(int argc, char** argv)
 	bool bounds = argc == 2 && strcmp(argv[1], "--bounds") == 0;
 	Require(absent || ((observe || controls || bounds) && geteuid() == 0), "usage: amdgpu_gws --observe | --control | --bounds | --expect-no-device");
 	static_assert(sizeof(amdgpu_gws_info) == 288, "GWS ABI");
-	for (uint32 op = 0; op < 2; op++) Commands(op, 2, 17, 0x5678, 32);
+	for (uint32 op = 0; op < 6; op++) Commands(op, 2, 17, 0x5678, 32);
 	int monitor = open("/dev/" AMDGPU_DEVICE_NAME, O_RDWR);
 	if (absent) { Require(monitor < 0 && errno == ENOENT, "no AMD device"); puts("PASS: GWS command policy and no-device handling"); return 0; }
 	Require(monitor >= 0, "open monitor"); Info<amdgpu_render_info>(monitor, AMDGPU_RENDER_INFO);
@@ -239,8 +249,14 @@ int main(int argc, char** argv)
 		for (uint32 id = 0; id < 2; id++) {
 			Run(c[0], AMDGPU_GDS_PROBE_GWS_SLICE, 0, id, 37 + id, 8 + id, 37 + id);
 			Run(c[1], AMDGPU_GDS_PROBE_GWS_SLICE, 1, id, 0, 8 + id, 38 + id);
+			Run(c[0], AMDGPU_GDS_PROBE_GWS_SLICE, 2, id, 0, 8 + id, 37 + id);
+			Run(c[1], AMDGPU_GDS_PROBE_GWS_SLICE, 3, id, 5, 8 + id, 42 + id);
+			Run(c[0], AMDGPU_GDS_PROBE_GWS_SLICE, 4, id, 0, 8 + id, 0);
+			Run(c[1], AMDGPU_GDS_PROBE_GWS_SLICE, 0, id, 0, 8 + id, 0);
+			Run(c[0], AMDGPU_GDS_PROBE_GWS_SLICE, 5, id, 0, 8 + id, 0);
+			Run(c[1], AMDGPU_GDS_PROBE_GWS_SLICE, 0, id, 37 + id, 8 + id, 37 + id);
 		}
-		puts("PASS: 16 seeded GWS resources, relocated slice INIT/SEMA_V, all 64 resource guards");
+		puts("PASS: 16 seeded GWS resources, all six GWS operations in relocated slice, all 64 resource guards");
 		if (bounds) {
 			struct Case { int mode; uint32 id; };
 			const Case cases[] = {
@@ -248,10 +264,18 @@ int main(int argc, char** argv)
 				{AMDGPU_GDS_PROBE_GWS_FULL, 16}, {AMDGPU_GDS_PROBE_NONE, 0},
 				{-1, 0}, {-1, 8}
 			};
-			for (const auto& test : cases) for (uint32 op = 0; op < 2; op++) {
-				Run(c[1], test.mode, op, test.id, 113, -1, -1);
-				printf("PASS: mode %d op %u id %u denied, all 64 GWS resources unchanged\n",
-					test.mode, op, test.id);
+			for (uint32 op = 0; op < 6; op++) {
+				// Set each potential target to zero before BARRIER, so even an
+				// unexpected permission bypass cannot leave this wave waiting.
+				if (op == 5) for (uint32 id = 0; id < 16; id++)
+					Run(c[0], AMDGPU_GDS_PROBE_GWS_FULL, 0, id, 0, id, 0);
+				for (const auto& test : cases) {
+					// Index 16 has never been granted, so it has no token for P.
+					if (op == 2 && test.mode == AMDGPU_GDS_PROBE_GWS_FULL) continue;
+					Run(c[1], test.mode, op, test.id, op == 5 ? 0 : 113, -1, -1);
+					printf("PASS: mode %d op %u id %u denied, all 64 GWS resources unchanged\n",
+						test.mode, op, test.id);
+				}
 			}
 		}
 	}

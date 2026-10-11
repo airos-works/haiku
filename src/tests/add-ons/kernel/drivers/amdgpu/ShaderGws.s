@@ -1,6 +1,8 @@
 /* Copyright 2026, air/OS. Distributed under the terms of the MIT License.
  * LLVM gfx803, one wave. s0:1=output, s2=initial value, s3=operation
- * (0 INIT, 1 SEMA_V), s4=resource id << 16, s5=marker, s6=attempt limit.
+ * (0 INIT, 1 V, 2 P, 3 BR, 4 RELEASE_ALL, 5 BARRIER), s4=resource id << 16,
+ * s5=marker, s6=attempt limit. P requires a positive counter; the one-wave
+ * BARRIER requires counter zero. The host checks those before dispatch.
  * GFX8 needs the TRAPSTS.MEM_VIOL retry sequence used by LLVM's
  * emitGWSMemViolTestLoop, but this diagnostic bounds attempts explicitly.
  */
@@ -24,11 +26,35 @@ attempt:
     s_setreg_imm32_b32 hwreg(HW_REG_TRAPSTS, 8, 1), 0
     s_cmp_eq_u32 s3, 1
     s_cbranch_scc1 increment
+    s_cmp_eq_u32 s3, 2
+    s_cbranch_scc1 decrement
+    s_cmp_eq_u32 s3, 3
+    s_cbranch_scc1 bulk
+    s_cmp_eq_u32 s3, 4
+    s_cbranch_scc1 release
+    s_cmp_eq_u32 s3, 5
+    s_cbranch_scc1 barrier
     ds_gws_init v4 gds
     s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)
     s_branch check
 increment:
     ds_gws_sema_v gds
+    s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)
+    s_branch check
+decrement:
+    ds_gws_sema_p gds
+    s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)
+    s_branch check
+bulk:
+    ds_gws_sema_br v4 gds
+    s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)
+    s_branch check
+release:
+    ds_gws_sema_release_all gds
+    s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)
+    s_branch check
+barrier:
+    ds_gws_barrier v4 gds
     s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)
 check:
     s_getreg_b32 s10, hwreg(HW_REG_TRAPSTS, 0, 9)
