@@ -4,7 +4,17 @@ Status values are backed by observation on the workstation. Anything not
 listed as verified is untested.
 
 **2026-10-11 WX 5100 status:** the X399 now has a Radeon Pro WX 5100.
-The NVIDIA results below describe the previous card. AMD desktop output still
+Current driver `4d299065…` and private Mesa `42352938…` qualify automatic GFX
+recovery with live H.264/HEVC sessions, closed firmware-session reclamation,
+pending create/decode ownership, continuous decoding during graphics timeout,
+and permanent old-client loss. Twelve recovery generations and the subsequent
+1,106-job regression leave 1,108 healthy completions, zero GPU errors and no
+live resources/quarantine. Automatic policy is enabled with eight successful
+attempts; qualified backups remain. SDMA/UVD engine faults, application renderer
+recovery, native display and the full release remain open. Details and evidence
+are in [the retained-video checkpoint](WX5100.md#graphics-recovery-with-retained-video-sessions-2026-10-11).
+
+The earlier checkpoints below trace this work. The NVIDIA results describe the previous card. AMD desktop output still
 uses the firmware framebuffer. SDMA and the full 61-submission bounded GFX diagnostic pass, including
 indirect buffers, compute, rasterization and VM switches with zero VM faults
 and data mismatches when the matching MEC firmware is loaded. Separate
@@ -16,7 +26,7 @@ pixels. GFX client completion now requires IH3 MSI observation of its private
 fence: two 4,382-job cold-boot trials pass with ring wraps, exact data and
 media/DMA coexistence. Separate read-only-page and privileged-register
 faults fail the jobs and preserve quarantined allocations through close;
-recovery still requires a cold boot. A native Mesa metadata candidate now
+recovery at that checkpoint required a cold boot. A native Mesa metadata candidate now
 reports measured CU/RB masks, tiling, firmware, timestamp clocks and explicit
 interface limits; its graphics/DMA/media regression trial passes. Private
 RadeonSI now passes compositor and EGL-window pixels, resizing and shared
@@ -92,8 +102,8 @@ All 64 resources remain unchanged after each denied operation. The extended
 83-job suite and GDS/ATC/shader/queue/VM/DMA/GLES/concurrent-media regressions
 leave 797 completions, 1,594 EOPs and zero device errors without a recovery boot.
 Ordered append and remaining shader paths still need qualification; general
-submissions remain root-only. Driver `4559a441…` and private Mesa
-`82098de9…` are installed with same-hash backups; prior `2894a05c…`, `f546422d…`,
+submissions remain root-only. That checkpoint installed driver `4559a441…` and
+private Mesa `82098de9…` with same-hash backups; prior `2894a05c…`, `f546422d…`,
 `ffe50ea8…`, `cb8672d6…`, `cefb183c…`/`afd206fa…`, prior `c579f1cd…`,
 `7d1cf6e5…`/`ee6210e5…` and older checkpoints are
 preserved. The original global media addon is restored after qualification.
