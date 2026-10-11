@@ -1319,10 +1319,15 @@ thermal_init_driver(device_node* node, void** _cookie)
 	if (sCcuArea < 0)
 		sCcu = NULL;
 
-	// the first conversions
+	// the first conversions, of every sensor
 	for (int32 i = 0; i < 50; i++) {
-		uint32 raw;
-		if (sThs.ReadRaw(sZones[0].sensor, &raw) == B_OK)
+		int32 ready = 0;
+		for (int32 zone = 0; zone < sZoneCount; zone++) {
+			uint32 raw;
+			if (sThs.ReadRaw(sZones[zone].sensor, &raw) == B_OK)
+				ready++;
+		}
+		if (ready == sZoneCount)
 			break;
 		snooze(5000);
 	}
