@@ -327,10 +327,18 @@ rpi_get_accelerant_device_info(accelerant_device_info* info)
 }
 
 
+/*!	Released at every vertical blank of the first output shown; app_server's
+	own, which it gives to its clients.
+*/
 static sem_id
 rpi_accelerant_retrace_semaphore()
 {
-	return -1;
+	sem_id semaphore;
+	if (ioctl(gInfo->device, RPI_DISPLAY_GET_RETRACE_SEMAPHORE, &semaphore,
+			sizeof(semaphore)) != 0) {
+		return -1;
+	}
+	return semaphore;
 }
 
 
