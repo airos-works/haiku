@@ -1,0 +1,26 @@
+# The desktop's environment on air/OS for the Radxa Cubie A7S. The
+# launch_daemon's desktop target sources /boot/system/boot/SetupEnvironment,
+# which sources this file, for Tracker, Deskbar and the user bootscript, and
+# every application they start inherits it.
+
+# (as tools/rock5-itx/UserSetupEnvironment) The renamed ARM64 bootstrap ICU
+# package retains its original compiled data directory. Supply its installed
+# data path before desktop processes use ICU. Preserve an explicitly
+# configured ICU_DATA, including an empty value.
+if [ "${ICU_DATA+x}" != x ] \
+	&& [ -f /boot/system/packages/icu74-74.1_bootstrap-1-arm64.hpkg ] \
+	&& [ -f /boot/system/data/icu/74.1/icudt74l.dat ] \
+	&& [ ! -d /packages/icu74_bootstrap-74.1-1/.self/data/icu/74.1 ]; then
+	export ICU_DATA=/boot/system/data/icu/74.1
+fi
+
+# Summit's direct present also keeps app_server's own copy of the screen
+# current (the pointer is drawn from it, uncovered parts of windows are
+# restored from it). Summit leaves that off by default because on the X399
+# the GPU holds that copy's pages and a web process dying meanwhile hangs the
+# system; here zink writes the copy with the CPU after the GPU is done, and
+# killing web processes mid-frame is safe (evidence/gpu/m6). Preserve an
+# explicit setting, including an empty value.
+if [ "${SUMMIT_DIRECT_PRESENT_BACK+x}" != x ]; then
+	export SUMMIT_DIRECT_PRESENT_BACK=1
+fi

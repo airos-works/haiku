@@ -240,8 +240,10 @@ rule UserBuildConfigRulePreImage
 		local rtcSettings = <cubie-settings>RTC_time_settings ;
 		SEARCH on $(rtcSettings) = [ FDirName $(HAIKU_TOP) data boot rpi ] ;
 		AddFilesToHaikuImage home config settings : $(rtcSettings) ;
+		# The desktop's environment (ICU data, Summit's direct present into
+		# app_server's copy of the screen).
 		local environment = <cubie-settings>UserSetupEnvironment ;
-		SEARCH on $(environment) = [ FDirName $(HAIKU_TOP) tools rock5-itx ] ;
+		SEARCH on $(environment) = [ FDirName $(HAIKU_TOP) tools cubie-a7s ] ;
 		AddFilesToHaikuImage home config settings boot : $(environment) ;
 	}
 
@@ -250,7 +252,7 @@ rule UserBuildConfigRulePreImage
 		# display registers
 		AddFilesToHaikuImage system non-packaged bin : cubie_reg cubie_fetch
 			pvrinfo pvrtest cedar_decode media_probe cpu_usage aicload
-			cubie_audio_test ;
+			cubie_audio_test screencheck ;
 		if $(CUBIE_AIROS_IMAGE) {
 			# a Bluetooth diagnostic the regular image leaves out
 			AddFilesToHaikuImage system non-packaged bin : bt_dev_info ;
