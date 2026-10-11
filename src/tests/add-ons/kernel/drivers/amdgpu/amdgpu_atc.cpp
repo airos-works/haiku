@@ -39,12 +39,18 @@ static amdgpu_irq_info IRQ(int fd, bool healthy)
 		&& r.waits == r.completed_fences, "healthy independent IRQ counters");
 	return r;
 }
-static amdgpu_buffer Buffer(int fd, uint32 bytes, bool ram = true)
+static amdgpu_buffer Buffer(int fd, uint32 bytes, bool ram = true, bool diagnostic = false)
 {
 	auto b = Request<amdgpu_buffer>(); b.bytes = bytes;
-	Require(ioctl(fd, ram ? AMDGPU_CREATE_SYSTEM_BUFFER : AMDGPU_CREATE_BUFFER, &b, sizeof(b)) == 0,
+	uint32 op = diagnostic ? AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER
+		: ram ? AMDGPU_CREATE_SYSTEM_BUFFER : AMDGPU_CREATE_BUFFER;
+	Require(ioctl(fd, op, &b, sizeof(b)) == 0,
 		"allocate owned memory");
 	if (ram) Require(ioctl(fd, AMDGPU_MAP_BUFFER, &b, sizeof(b)) == 0, "map owned CPU memory");
+	if (diagnostic) {
+		for (uint32 i = 0; i < b.bytes / 4; i++)
+			Require(((uint32*)(addr_t)b.address)[i] == 0, "diagnostic RAM starts zeroed");
+	}
 	return b;
 }
 static void Map(int fd, const amdgpu_buffer& b, uint64 va, uint32 permissions)
@@ -164,16 +170,30 @@ static void ABI(int fd, const amdgpu_buffer& ram, uint64 foreign)
 	Require(ioctl(fd, AMDGPU_DIAGNOSTIC_RAM_PAGE, &r, sizeof(r)) < 0 && errno == B_BAD_VALUE,
 		"VRAM cannot be queried as RAM");
 	Require(ioctl(fd, AMDGPU_FREE_BUFFER, &vram, sizeof(vram)) == 0, "free VRAM test buffer");
+	for (uint32 bytes : {0u, 4096u, 8193u, 65536u}) {
+		auto bad = Request<amdgpu_buffer>(); bad.bytes = bytes;
+		Require(ioctl(fd, AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER, &bad, sizeof(bad)) < 0
+			&& errno == B_BAD_VALUE, "diagnostic allocation has fixed size");
+	}
+	auto bad = Request<amdgpu_buffer>(); bad.bytes = 8192; bad.reserved = 1;
+	Require(ioctl(fd, AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER, &bad, sizeof(bad)) < 0
+		&& errno == B_BAD_VALUE, "diagnostic allocation rejects reserved flags");
 	r.handle = ram.handle;
 	int ro = open("/dev/" AMDGPU_DEVICE_NAME, O_RDONLY); Require(ro >= 0, "open read-only client");
 	Require(ioctl(ro, AMDGPU_DIAGNOSTIC_RAM_PAGE, &r, sizeof(r)) < 0 && errno == B_NOT_ALLOWED,
-		"read-only page query rejected"); close(ro);
+		"read-only page query rejected");
+	bad = Request<amdgpu_buffer>(); bad.bytes = 8192;
+	Require(ioctl(ro, AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER, &bad, sizeof(bad)) < 0
+		&& errno == B_NOT_ALLOWED, "read-only diagnostic allocation rejected"); close(ro);
 	pid_t child = fork(); Require(child >= 0, "fork privilege check");
 	if (child == 0) {
 		Require(setgid(65534) == 0 && setuid(65534) == 0, "drop privilege");
 		int own = open("/dev/" AMDGPU_DEVICE_NAME, O_RDWR); Require(own >= 0, "ordinary client");
 		Require(ioctl(own, AMDGPU_DIAGNOSTIC_RAM_PAGE, &r, sizeof(r)) < 0 && errno == B_NOT_ALLOWED,
-			"physical diagnostic is root-only"); close(own); _exit(0);
+			"physical diagnostic is root-only");
+		Require(ioctl(own, AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER, &bad, sizeof(bad)) < 0
+			&& errno == B_NOT_ALLOWED, "high-RAM diagnostic allocation is root-only");
+		close(own); _exit(0);
 	}
 	int status; Require(waitpid(child, &status, 0) == child && WIFEXITED(status)
 		&& WEXITSTATUS(status) == 0, "privilege child passes");
@@ -212,11 +232,19 @@ int main(int argc, char** argv)
 	std::vector<amdgpu_buffer> physicalBuffers;
 	uint64 address = 0;
 	for (uint32 i = 0; i < 128; i++) {
-		auto b = Buffer(clients[0].fd, 8192); physicalBuffers.push_back(b);
+		auto b = Buffer(clients[0].fd, 8192, true, true); physicalBuffers.push_back(b);
 		uint64 p = Physical(clients[0].fd, b);
-		// Exclude the low PCI apertures and the driver's VMID0 GART window
-		// (0x10000000..0x50000000), as well as our code and output GPUVAs.
-		if (p >= (1ULL << 32) && p < (1ULL << 36) && p != kCode && p != kOutput) {
+		Require(p >= (1ULL << 32) && p <= (1ULL << 36) - 8192, "diagnostic physical range enforced");
+		// RAM need not be above 4 GiB. Exclude the actual device apertures and
+		// VMID0 GART window, as well as our code and output GPUVAs. The CPU
+		// mapping/GART agreement proves this is live, owned, wired system RAM.
+		bool aperture = p >= 0x10000000 && p < 0x50000000;
+		for (uint32 bar = 0; bar < 6; bar++)
+			aperture |= p >= device.bar_address[bar]
+				&& p - device.bar_address[bar] < device.bar_size[bar];
+		if (i < 4) printf("owned RAM candidate %u: %#llx excluded aperture %u\n",
+			i, (unsigned long long)p, aperture);
+		if (p >= 0x20000 && p < (1ULL << 36) && !aperture && p != kCode && p != kOutput) {
 			address = p; break;
 		}
 	}

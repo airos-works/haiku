@@ -1266,6 +1266,7 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 	}
 	if (op != AMDGPU_CREATE_BUFFER && op != AMDGPU_CREATE_SYSTEM_BUFFER
 		&& op != AMDGPU_CREATE_DEVICE_BUFFER
+		&& op != AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER
 		&& op != AMDGPU_MAP_BUFFER && op != AMDGPU_FREE_BUFFER)
 		return B_DEV_INVALID_IOCTL;
 	amdgpu_buffer request;
@@ -1275,11 +1276,13 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 	if (request.reserved != 0)
 		return B_BAD_VALUE;
 	if (op == AMDGPU_CREATE_BUFFER || op == AMDGPU_CREATE_SYSTEM_BUFFER
-		|| op == AMDGPU_CREATE_DEVICE_BUFFER) {
+		|| op == AMDGPU_CREATE_DEVICE_BUFFER || op == AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER) {
 		if (sFault != B_OK)
 			return B_DEV_NOT_READY;
 		if (request.bytes == 0 || request.bytes > kMaxBufferBytes)
 			return B_BAD_VALUE;
+		const bool diagnosticRAM = op == AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER;
+		if (diagnosticRAM && request.bytes != 8192) return B_BAD_VALUE;
 		const bool deviceOnly = op == AMDGPU_CREATE_DEVICE_BUFFER;
 		if (deviceOnly) {
 			// Initialization uses the same SDMA engine as queued client jobs.
@@ -1287,7 +1290,7 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 			status = WaitDmaIdle();
 			if (status != B_OK)
 				return status;
-		} else if (op == AMDGPU_CREATE_SYSTEM_BUFFER) {
+		} else if (op == AMDGPU_CREATE_SYSTEM_BUFFER || diagnosticRAM) {
 			// Bind/Flush must not race GFX's VMID2 invalidate request.
 			status = WaitDmaIdle(false);
 			if (status != B_OK) return status;
@@ -1298,7 +1301,7 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 		if (bo == NULL)
 			return B_NO_MEMORY;
 		bo->bytes = (request.bytes + 4095) & ~4095ULL;
-		bo->system = op == AMDGPU_CREATE_SYSTEM_BUFFER;
+		bo->system = op == AMDGPU_CREATE_SYSTEM_BUFFER || diagnosticRAM;
 		bo->area = -1;
 		VramAllocator& allocator = bo->system ? sGartAllocator : sAllocator;
 		uint64 limit = bo->system ? Gart::kSize
@@ -1322,6 +1325,11 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 		} else if (bo->system) {
 			virtual_address_restrictions va = {};
 			physical_address_restrictions pa = {};
+			if (diagnosticRAM) {
+				pa.low_address = 1ULL << 32;
+				pa.high_address = 1ULL << 36;
+				pa.alignment = 4096;
+			}
 			bo->area = create_area_etc(B_SYSTEM_TEAM, "amdgpu client RAM", bo->bytes,
 				B_FULL_LOCK, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, 0, 0, &va, &pa,
 				(void**)&bo->cpu);

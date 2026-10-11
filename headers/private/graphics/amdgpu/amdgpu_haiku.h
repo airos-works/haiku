@@ -48,7 +48,8 @@ enum {
 	AMDGPU_GFX_SUBMIT_COPY,
 	AMDGPU_GFX_QUEUE_COPY,
 	AMDGPU_SHADER_MEMORY_INFO,
-	AMDGPU_DIAGNOSTIC_RAM_PAGE
+	AMDGPU_DIAGNOSTIC_RAM_PAGE,
+	AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER
 };
 
 // One GPU virtual address space per open client. Mappings retain their BO
@@ -207,6 +208,10 @@ struct amdgpu_diagnostic_ram_page {
 	uint64 handle, offset, physical_address;
 	uint32 flags, reserved;
 };
+// CREATE_DIAGNOSTIC_RAM_BUFFER uses amdgpu_buffer, requires root and an
+// initialized device, and accepts exactly 8192 bytes with reserved=0. Its
+// wired backing is restricted to [4 GiB,64 GiB), outside VMID0's GART/PCI
+// apertures for the qualified board. Normal buffer lifetime/zeroing applies.
 
 // Read-only DCE 11.2 observation, available without starting any GPU engine.
 // Register reads are sequential, not an atomic modeset or vblank snapshot.
