@@ -167,9 +167,11 @@ static void FaultQualification(int monitor)
 	auto memory = Memory(monitor); auto ram = Gart(monitor);
 	ReleaseGate();
 	for (Client* c : {&bad, &gate}) {
-		auto wait = Request<amdgpu_fence_wait>(); wait.fence = c->fence; wait.timeout_us = 5000000;
-		Require(ioctl(c->fd, AMDGPU_WAIT_FENCE, &wait, sizeof(wait)) == 0 && wait.status != B_OK,
-			"terminal GPU fault fails every outstanding client fence");
+		for (uint64 fence = c == &bad ? 1 : 2; fence <= c->fence; fence++) {
+			auto wait = Request<amdgpu_fence_wait>(); wait.fence = fence; wait.timeout_us = 5000000;
+			Require(ioctl(c->fd, AMDGPU_WAIT_FENCE, &wait, sizeof(wait)) == 0
+				&& wait.status == B_BAD_DATA, "terminal GPU fault fails every outstanding client fence");
+		}
 	}
 	Drain(monitor);
 	auto first = Request<amdgpu_fence_wait>(); first.fence = 1;
@@ -177,11 +179,19 @@ static void FaultQualification(int monitor)
 		"earlier successfully retired fence remains successful after a later fault");
 	Pixels(gate, 1, true); Pixels(bad, 0);
 	auto irq = Request<amdgpu_irq_info>();
-	Require(ioctl(monitor, AMDGPU_IRQ_INFO, &irq, sizeof(irq)) == 0
-		&& irq.status != B_OK && irq.vm_faults > before.vm_faults
+	Require(ioctl(monitor, AMDGPU_IRQ_INFO, &irq, sizeof(irq)) == 0, "read independent fault counters");
+	printf("queued fault IRQ status %#x, completed %llu -> %llu, waits %llu -> %llu, VM %llu\n",
+		(unsigned)irq.status, (unsigned long long)before.completed_fences,
+		(unsigned long long)irq.completed_fences, (unsigned long long)before.waits,
+		(unsigned long long)irq.waits, (unsigned long long)irq.vm_faults);
+	// The trusted postlude may retire even though a VM fault invalidates the
+	// job. Completion observation is not success; WAIT_FENCE must still fail.
+	Require(irq.status == B_BAD_DATA && irq.vm_faults > before.vm_faults
 		&& !irq.privileged_faults && !irq.unknown && !irq.overflows
-		&& irq.completed_fences == before.completed_fences + 1,
-		"independent VM fault, only the pre-fault gate job completed");
+		&& irq.waits == before.waits + 2
+		&& irq.completed_fences >= before.completed_fences + 1
+		&& irq.completed_fences <= before.completed_fences + 2,
+		"independent VM fault; only the gate and faulting job reached hardware");
 	Enqueue(gate, Commands(gate, 8), B_DEV_NOT_READY);
 	Close(gate); Close(bad);
 	Require(Memory(monitor).faulted && !Memory(monitor).pending_jobs
