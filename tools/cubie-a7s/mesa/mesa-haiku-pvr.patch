@@ -198,6 +198,38 @@ it).
                                     that runs over the end of the buffer is
                                     read a component at a time instead, so
                                     the components in bounds stay exact
+  pco/pco_nir.c, pco_data.h,        uniform buffer promotion: loads of a
+  pco_trans_nir.c, pds/pvr_pds.h,   uniform buffer at constant offsets read
+  pds/pvr_pipeline_pds.c,           shared registers, which the PDS fills
+  pvr_arch_pipeline.c,              once per draw from the bound buffer
+  pvr_arch_cmd_buffer.c,            (PVR_BUFFER_TYPE_UBO_PROMOTED, a DOUTD
+  pvr_robustness.c, pvr_device.h    like push constants'). Each buffer's range
+                                    runs from its first to its last constant
+                                    load; up to 4 ranges and 128 dwords in
+                                    all (PCO_UBO_PROMOTE_MAX_DW, 0 = off).
+                                    The compiler rewrites the loads as
+                                    load_preamble from the promoted area; at
+                                    draw time the driver looks the buffer up
+                                    in the bound descriptor set (dynamic
+                                    offset included), and a range the buffer
+                                    does not hold, or a null descriptor, is
+                                    loaded from a page of zeros (with one
+                                    warning). Loads at dynamic offsets stay
+                                    lds. WebKit's TextureMapper fragment
+                                    shader through zink: 17 lds per pixel
+                                    before, 3 merged, none now
+  pvr_spm.c                         the SPM scratch buffer store keeps a
+                                    buffer at least as large as a render
+                                    needs, not only one of the same size:
+                                    renders of two sizes in turn (a WebGL
+                                    canvas and the page compositing it)
+                                    allocated and freed a GPU buffer of
+                                    about 1.7 MB each time
+  pvr_arch_job_transfer.c,          the commands of a transfer sub-command
+  winsys/powervr/pvr_drm_job_       (each region of a copy, each fill) go as
+  transfer.c                        jobs of one SUBMIT_JOBS, up to 16, the
+                                    first waiting and the last signalling;
+                                    each was an ioctl of its own
   pvr_arch_job_render.c             PVR_LOG_RENDERS=1 (stderr) or =FILE: a
                                     line per render job with the data set's
                                     size and tiling, the attachments, load
@@ -866,6 +898,46 @@ diff -ruN a/include/xf86drm.h b/include/xf86drm.h
 +#endif /* HAIKU_PVR_XF86DRM_H */
 +
 +#endif /* __HAIKU__ */
+diff -ruN a/src/imagination/pco/pco_data.h b/src/imagination/pco/pco_data.h
+--- a/src/imagination/pco/pco_data.h
++++ b/src/imagination/pco/pco_data.h
+@@ -184,6 +184,24 @@
+    unsigned used;
+ } pco_push_const_data;
+ 
++/** (air/OS) A range of a uniform buffer read from shared registers, which
++ * the PDS loads once per draw (like push constants), instead of with an ld
++ * per invocation.
++ */
++typedef struct _pco_ubo_promotion {
++   unsigned desc_set;
++   unsigned binding;
++   unsigned elem;
++   unsigned offset_dw; /** First dword of the range in the buffer. */
++   unsigned count_dw; /** Dwords in the range. */
++   unsigned base; /** Offset of the range in ubo_promoted. */
++} pco_ubo_promotion;
++
++#define PCO_MAX_UBO_PROMOTIONS 4U
++
++/** load_preamble bases from here on are relative to ubo_promoted.start. */
++#define PCO_UBO_PROMOTED_BASE 0x100000U
++
+ /** PCO common data. */
+ typedef struct _pco_common_data {
+    /** System value mappings. */
+@@ -195,6 +213,11 @@
+    /** Push constant data. */
+    pco_push_const_data push_consts;
+ 
++   /** (air/OS) Promoted uniform buffer ranges and their shared registers. */
++   pco_ubo_promotion ubo_promotions[PCO_MAX_UBO_PROMOTIONS];
++   unsigned ubo_promotion_count;
++   pco_range ubo_promoted;
++
+    pco_range point_sampler;
+    pco_range ia_sampler;
+ 
 diff -ruN a/src/imagination/pco/pco_nir.c b/src/imagination/pco/pco_nir.c
 --- a/src/imagination/pco/pco_nir.c
 +++ b/src/imagination/pco/pco_nir.c
@@ -906,7 +978,7 @@ diff -ruN a/src/imagination/pco/pco_nir.c b/src/imagination/pco/pco_nir.c
  static void pco_nir_opt(pco_ctx *ctx, nir_shader *nir, pco_data *data, bool algebraic)
  {
     bool progress;
-@@ -833,6 +863,97 @@
+@@ -833,6 +863,360 @@
     return false;
  }
  
@@ -1001,15 +1073,282 @@ diff -ruN a/src/imagination/pco/pco_nir.c b/src/imagination/pco/pco_nir.c
 +   return robustness_filter(intr, data);
 +}
 +
++/* (air/OS) Uniform buffer promotion. Loads of a uniform buffer at constant
++ * offsets read shared registers instead, which the PDS fills once per draw
++ * from the buffer (PVR_BUFFER_TYPE_UBO_PROMOTED), as it does push constants.
++ * An ld costs a memory round trip per invocation; WebKit's TextureMapper
++ * fragment shader, through zink, made 17 per pixel. Each buffer's range runs
++ * from its first to its last constant load; ranges are taken in order while
++ * they fit PCO_UBO_PROMOTE_MAX_DW dwords in all (default 128, 0 = off), at
++ * most PCO_MAX_UBO_PROMOTIONS of them. Loads at dynamic offsets stay lds.
++ * Robustness is the driver's at draw time: a range the bound buffer does not
++ * hold, or a null descriptor, is loaded from zeros.
++ */
++#define PCO_UBO_PROMOTE_MAX_DW_DEFAULT 128U
++#define PCO_UBO_PROMOTE_MAX_DW_LIMIT 1024U
++#define PCO_UBO_PROMOTE_MAX_KEYS 8U
++
++struct pco_ubo_promote_key {
++   uint32_t packed_desc;
++   unsigned elem;
++   unsigned start_dw;
++   unsigned end_dw;
++   int promotion;
++};
++
++struct pco_ubo_promote_state {
++   pco_common_data *common;
++   struct pco_ubo_promote_key keys[PCO_UBO_PROMOTE_MAX_KEYS];
++   unsigned key_count;
++};
++
++/* The buffer a load_ubo reads, as pco packs it: before pco_nir_lower_vk() a
++ * load_vulkan_descriptor of a vulkan_resource_index, after it a constant.
++ * *desc_def is the load_vulkan_descriptor, if any.
++ */
++static bool pco_ubo_index(nir_def *index,
++                          uint32_t *packed_desc,
++                          unsigned *elem,
++                          nir_def **desc_def)
++{
++   nir_scalar desc = nir_scalar_resolved(index, 0);
++   nir_scalar array_elem = nir_scalar_resolved(index, 1);
++
++   *desc_def = NULL;
++
++   if (nir_scalar_is_const(desc) && nir_scalar_is_const(array_elem)) {
++      *packed_desc = nir_scalar_as_uint(desc);
++      *elem = nir_scalar_as_uint(array_elem);
++      return true;
++   }
++
++   if (!nir_scalar_is_intrinsic(desc) ||
++       nir_scalar_intrinsic_op(desc) != nir_intrinsic_load_vulkan_descriptor ||
++       desc.def != array_elem.def || desc.comp != 0 || array_elem.comp != 1) {
++      return false;
++   }
++
++   nir_intrinsic_instr *load_desc = nir_def_as_intrinsic(desc.def);
++   nir_intrinsic_instr *res_index = nir_src_as_intrinsic(load_desc->src[0]);
++   if (!res_index ||
++       res_index->intrinsic != nir_intrinsic_vulkan_resource_index ||
++       !nir_src_is_const(res_index->src[0])) {
++      return false;
++   }
++
++   *packed_desc = pco_pack_desc(nir_intrinsic_desc_set(res_index),
++                                nir_intrinsic_binding(res_index));
++   *elem = nir_src_as_uint(res_index->src[0]);
++   *desc_def = desc.def;
++   return true;
++}
++
++/* A load_ubo offset that is a sum of constants. Before pco_nir_lower_vk() it
++ * adds the descriptor's third component, which that pass makes 0.
++ */
++static bool pco_ubo_const_offset(nir_scalar offset,
++                                 const nir_def *desc_def,
++                                 uint32_t *value)
++{
++   if (nir_scalar_is_const(offset)) {
++      *value = nir_scalar_as_uint(offset);
++      return true;
++   }
++
++   if (desc_def && offset.def == desc_def && offset.comp == 2) {
++      *value = 0;
++      return true;
++   }
++
++   if (nir_scalar_is_alu(offset) && nir_scalar_alu_op(offset) == nir_op_iadd) {
++      uint32_t a, b;
++
++      if (pco_ubo_const_offset(nir_scalar_chase_alu_src(offset, 0),
++                               desc_def,
++                               &a) &&
++          pco_ubo_const_offset(nir_scalar_chase_alu_src(offset, 1),
++                               desc_def,
++                               &b)) {
++         *value = a + b;
++         return true;
++      }
++   }
++
++   return false;
++}
++
++static bool pco_ubo_load_key(const nir_intrinsic_instr *intr,
++                             uint32_t *packed_desc,
++                             unsigned *elem,
++                             unsigned *offset_dw)
++{
++   nir_def *desc_def;
++   uint32_t offset;
++
++   if (intr->intrinsic != nir_intrinsic_load_ubo || intr->def.bit_size != 32)
++      return false;
++
++   if (!pco_ubo_index(intr->src[0].ssa, packed_desc, elem, &desc_def))
++      return false;
++
++   if (!pco_ubo_const_offset(nir_scalar_resolved(intr->src[1].ssa, 0),
++                             desc_def,
++                             &offset) ||
++       offset % sizeof(uint32_t)) {
++      return false;
++   }
++
++   *offset_dw = offset / sizeof(uint32_t);
++   return true;
++}
++
++static struct pco_ubo_promote_key *
++pco_ubo_promote_find_key(struct pco_ubo_promote_state *state,
++                         uint32_t packed_desc,
++                         unsigned elem)
++{
++   for (unsigned u = 0; u < state->key_count; ++u) {
++      if (state->keys[u].packed_desc == packed_desc &&
++          state->keys[u].elem == elem) {
++         return &state->keys[u];
++      }
++   }
++
++   return NULL;
++}
++
++static bool pco_ubo_promote_gather(nir_builder *b,
++                                   nir_intrinsic_instr *intr,
++                                   void *data)
++{
++   struct pco_ubo_promote_state *state = data;
++   uint32_t packed_desc;
++   unsigned elem, offset_dw;
++
++   if (!pco_ubo_load_key(intr, &packed_desc, &elem, &offset_dw))
++      return false;
++
++   const unsigned end_dw = offset_dw + intr->def.num_components;
++   struct pco_ubo_promote_key *key =
++      pco_ubo_promote_find_key(state, packed_desc, elem);
++
++   if (key) {
++      key->start_dw = MIN2(key->start_dw, offset_dw);
++      key->end_dw = MAX2(key->end_dw, end_dw);
++   } else if (state->key_count < ARRAY_SIZE(state->keys)) {
++      state->keys[state->key_count++] = (struct pco_ubo_promote_key){
++         .packed_desc = packed_desc,
++         .elem = elem,
++         .start_dw = offset_dw,
++         .end_dw = end_dw,
++         .promotion = -1,
++      };
++   }
++
++   return false;
++}
++
++static bool pco_ubo_promote_rewrite(nir_builder *b,
++                                    nir_intrinsic_instr *intr,
++                                    void *data)
++{
++   struct pco_ubo_promote_state *state = data;
++   uint32_t packed_desc;
++   unsigned elem, offset_dw;
++
++   if (!pco_ubo_load_key(intr, &packed_desc, &elem, &offset_dw))
++      return false;
++
++   const struct pco_ubo_promote_key *key =
++      pco_ubo_promote_find_key(state, packed_desc, elem);
++   if (!key || key->promotion < 0)
++      return false;
++
++   const pco_ubo_promotion *promotion =
++      &state->common->ubo_promotions[key->promotion];
++   assert(offset_dw >= promotion->offset_dw);
++   assert(offset_dw + intr->def.num_components <=
++          promotion->offset_dw + promotion->count_dw);
++
++   b->cursor = nir_before_instr(&intr->instr);
++   nir_def *value = nir_load_preamble(b,
++                                      intr->def.num_components,
++                                      32,
++                                      .base = PCO_UBO_PROMOTED_BASE +
++                                              promotion->base + offset_dw -
++                                              promotion->offset_dw);
++   nir_def_replace(&intr->def, value);
++   return true;
++}
++
++static bool pco_nir_promote_ubo_loads(nir_shader *nir, pco_common_data *common)
++{
++   const unsigned max_dw = MIN2(debug_get_num_option("PCO_UBO_PROMOTE_MAX_DW",
++                                                     PCO_UBO_PROMOTE_MAX_DW_DEFAULT),
++                                PCO_UBO_PROMOTE_MAX_DW_LIMIT);
++   struct pco_ubo_promote_state state = { .common = common };
++   unsigned total_dw = 0;
++
++   common->ubo_promotion_count = 0;
++   common->ubo_promoted = (pco_range){ 0 };
++
++   /* Internal shaders set up their shared registers themselves. */
++   if (!max_dw || nir->info.internal)
++      return false;
++
++   nir_shader_intrinsics_pass(nir,
++                              pco_ubo_promote_gather,
++                              nir_metadata_all,
++                              &state);
++
++   for (unsigned u = 0; u < state.key_count; ++u) {
++      struct pco_ubo_promote_key *key = &state.keys[u];
++      const unsigned count_dw = key->end_dw - key->start_dw;
++
++      if (common->ubo_promotion_count == PCO_MAX_UBO_PROMOTIONS)
++         break;
++
++      if (total_dw + count_dw > max_dw)
++         continue;
++
++      pco_ubo_promotion *promotion =
++         &common->ubo_promotions[common->ubo_promotion_count];
++      pco_unpack_desc(key->packed_desc,
++                      &promotion->desc_set,
++                      &promotion->binding);
++      promotion->elem = key->elem;
++      promotion->offset_dw = key->start_dw;
++      promotion->count_dw = count_dw;
++      promotion->base = total_dw;
++
++      key->promotion = common->ubo_promotion_count++;
++      total_dw += count_dw;
++   }
++
++   if (!total_dw)
++      return false;
++
++   common->ubo_promoted.count = total_dw;
++
++   return nir_shader_intrinsics_pass(nir,
++                                     pco_ubo_promote_rewrite,
++                                     nir_metadata_control_flow,
++                                     &state);
++}
++
  /**
   * \brief Returns if shared memory should be spilled according to the threshold.
   *
-@@ -928,8 +1049,52 @@
+@@ -928,8 +1312,54 @@
              NULL,
              NULL);
  
 -   if (data->common.robust_buffer_access)
 -      NIR_PASS(_, nir, nir_lower_robust_access, robustness_filter, NULL);
++   NIR_PASS(_, nir, nir_opt_copy_prop);
++   NIR_PASS(_, nir, nir_opt_constant_folding);
++   NIR_PASS(_, nir, pco_nir_promote_ubo_loads, &data->common);
++
 +   if (data->common.robust_buffer_access) {
 +      /* (air/OS) Vectorize buffer loads before the robustness lowering, which
 +       * makes every offset a bcsel that nothing merges afterwards. Zink
@@ -1035,8 +1374,6 @@ diff -ruN a/src/imagination/pco/pco_nir.c b/src/imagination/pco/pco_nir.c
 +      };
 +      bool merged = max_components > 1;
 +
-+      NIR_PASS(_, nir, nir_opt_copy_prop);
-+      NIR_PASS(_, nir, nir_opt_constant_folding);
 +      NIR_PASS(_, nir, nir_opt_cse);
 +      /* Each round doubles what the last one merged: 1+1, 2+2, ... 8+8. */
 +      for (unsigned i = 0; i < 4 && merged; i++) {
@@ -1059,6 +1396,84 @@ diff -ruN a/src/imagination/pco/pco_nir.c b/src/imagination/pco/pco_nir.c
  
     if (nir->info.stage == MESA_SHADER_COMPUTE &&
         (PCO_DEBUG(GLOBAL_SHMEM) ||
+diff -ruN a/src/imagination/pco/pco_trans_nir.c b/src/imagination/pco/pco_trans_nir.c
+--- a/src/imagination/pco/pco_trans_nir.c
++++ b/src/imagination/pco/pco_trans_nir.c
+@@ -2102,14 +2102,28 @@
+       instr = trans_flush_tile_buffer(tctx, intr, src[0], src[1]);
+       break;
+ 
+-   case nir_intrinsic_load_preamble:
++   case nir_intrinsic_load_preamble: {
++      unsigned base = nir_intrinsic_base(intr);
++
++      /* (air/OS) A promoted uniform buffer load (pco_nir_promote_ubo_loads):
++       * relative to the shared registers allocated for the promoted ranges.
++       */
++      if (base >= PCO_UBO_PROMOTED_BASE) {
++         const pco_range *range = &tctx->shader->data.common.ubo_promoted;
++
++         base -= PCO_UBO_PROMOTED_BASE;
++         assert(base + pco_ref_get_chans(dest) <= range->count);
++         base += range->start;
++      }
++
+       instr = pco_mov(&tctx->b,
+                       dest,
+-                      pco_ref_hwreg_vec(nir_intrinsic_base(intr),
++                      pco_ref_hwreg_vec(base,
+                                         PCO_REG_CLASS_SHARED,
+                                         pco_ref_get_chans(dest)),
+                       .rpt = pco_ref_get_chans(dest));
+       break;
++   }
+ 
+    case nir_intrinsic_store_preamble:
+       instr = pco_mov(&tctx->b,
+diff -ruN a/src/imagination/vulkan/pds/pvr_pds.h b/src/imagination/vulkan/pds/pvr_pds.h
+--- a/src/imagination/vulkan/pds/pvr_pds.h
++++ b/src/imagination/vulkan/pds/pvr_pds.h
+@@ -928,6 +928,10 @@
+ #define PVR_BUFFER_TYPE_SCRATCH_INFO (13)
+ #define PVR_BUFFER_TYPE_SAMPLE_LOCATIONS (14)
+ #define PVR_BUFFER_TYPE_GLOBAL_SHMEM (15)
++/* (air/OS) A uniform buffer range promoted to shared registers: desc_set,
++ * binding, buffer_id (the array element) and source_offset (bytes) name it.
++ */
++#define PVR_BUFFER_TYPE_UBO_PROMOTED (16)
+ #define PVR_BUFFER_TYPE_INVALID (~0)
+ 
+ struct pvr_pds_buffer {
+diff -ruN a/src/imagination/vulkan/pds/pvr_pipeline_pds.c b/src/imagination/vulkan/pds/pvr_pipeline_pds.c
+--- a/src/imagination/vulkan/pds/pvr_pipeline_pds.c
++++ b/src/imagination/vulkan/pds/pvr_pipeline_pds.c
+@@ -1638,6 +1638,26 @@
+          }
+          break;
+       }
++      case PVR_BUFFER_TYPE_UBO_PROMOTED: {
++         struct pvr_const_map_entry_special_buffer *special_buffer_entry;
++
++         assert(buffer->desc_set < 256);
++         assert(buffer->binding < 4096);
++         assert(buffer->buffer_id < 4096);
++
++         special_buffer_entry =
++            pvr_prepare_next_pds_const_map_entry(&entry_write_state,
++                                                 sizeof(*special_buffer_entry));
++         special_buffer_entry->type =
++            PVR_PDS_CONST_MAP_ENTRY_TYPE_SPECIAL_BUFFER;
++         special_buffer_entry->buffer_type = PVR_BUFFER_TYPE_UBO_PROMOTED;
++         special_buffer_entry->size_in_dwords = buffer->size_in_dwords;
++         special_buffer_entry->buffer_index = buffer->source_offset;
++         special_buffer_entry->data = buffer->desc_set |
++                                      (buffer->binding << 8) |
++                                      (buffer->buffer_id << 20);
++         break;
++      }
+       case PVR_BUFFER_TYPE_COMPILE_TIME: {
+          struct pvr_const_map_entry_special_buffer *special_buffer_entry;
+ 
 diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
 --- a/src/imagination/vulkan/pvr_arch_cmd_buffer.c
 +++ b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
@@ -1175,6 +1590,82 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
        if (result != VK_SUCCESS)
           return result;
     }
+@@ -5619,6 +5640,75 @@
+                       special_buff_entry->const_offset,
+                       pds_info->data_size_in_dwords);
+             break;
++         }
++
++         case PVR_BUFFER_TYPE_UBO_PROMOTED: {
++            /* (air/OS) A uniform buffer range the shader reads from shared
++             * registers: the PDS loads it from the bound buffer. A range the
++             * buffer does not hold all of, or a null descriptor, is loaded
++             * from zeros instead.
++             */
++            const uint32_t desc_set = special_buff_entry->data & 0xff;
++            const uint32_t binding_index =
++               (special_buff_entry->data >> 8) & 0xfff;
++            const uint32_t elem = special_buff_entry->data >> 20;
++            const uint64_t offset = special_buff_entry->buffer_index;
++            const uint64_t size =
++               special_buff_entry->size_in_dwords * sizeof(uint32_t);
++            const struct pvr_descriptor_set *descriptor_set =
++               desc_set < PVR_MAX_DESCRIPTOR_SETS ? desc_state->sets[desc_set]
++                                                  : NULL;
++            pvr_dev_addr_t addr =
++               cmd_buffer->device->ubo_promoted_zeros->vma->dev_addr;
++
++            assert(size <= PVR_UBO_PROMOTED_ZEROS_SIZE);
++
++            if (descriptor_set &&
++                binding_index < descriptor_set->layout->binding_count) {
++               const struct pvr_descriptor_set_layout_binding *binding =
++                  &descriptor_set->layout->bindings[binding_index];
++               struct pvr_buffer_descriptor desc = { 0 };
++
++               if (elem >= binding->descriptor_count) {
++                  /* Out of the binding: zeros. */
++               } else if (binding->type ==
++                          VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) {
++                  desc = descriptor_set
++                            ->dynamic_buffers[binding->dynamic_buffer_idx +
++                                              elem];
++               } else if (binding->type ==
++                          VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
++                  memcpy(&desc,
++                         (const uint8_t *)descriptor_set->mapping +
++                            binding->offset + elem * binding->stride,
++                         sizeof(desc));
++               }
++
++               if (desc.addr && offset + size <= desc.size) {
++                  addr = PVR_DEV_ADDR(desc.addr + desc.offset + offset);
++               } else if (desc.addr) {
++                  static bool warned;
++
++                  if (!warned) {
++                     warned = true;
++                     mesa_logw("pvr: a uniform buffer bound with %u bytes "
++                               "does not hold the promoted range %" PRIu64
++                               "+%" PRIu64 " (set %u binding %u): the "
++                               "shader reads zeros there",
++                               desc.size,
++                               offset,
++                               size,
++                               desc_set,
++                               binding_index);
++                  }
++               }
++            }
++
++            PVR_WRITE(qword_buffer,
++                      addr.addr,
++                      special_buff_entry->const_offset,
++                      pds_info->data_size_in_dwords);
++            break;
+          }
+ 
+          case PVR_BUFFER_TYPE_PUSH_CONSTS: {
 diff -ruN a/src/imagination/vulkan/pvr_arch_device.c b/src/imagination/vulkan/pvr_arch_device.c
 --- a/src/imagination/vulkan/pvr_arch_device.c
 +++ b/src/imagination/vulkan/pvr_arch_device.c
@@ -1460,15 +1951,79 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_job_render.c b/src/imagination/vulka
 diff -ruN a/src/imagination/vulkan/pvr_arch_job_transfer.c b/src/imagination/vulkan/pvr_arch_job_transfer.c
 --- a/src/imagination/vulkan/pvr_arch_job_transfer.c
 +++ b/src/imagination/vulkan/pvr_arch_job_transfer.c
-@@ -5952,10 +5952,21 @@
+@@ -5945,17 +5945,23 @@
+                                                 signal_sync);
+ }
+ 
++/* Prepares one transfer command, a pass at a time, into submit, submitting
++ * whenever its prepare array fills: the first submit of the sub-command waits
++ * on wait (*wait is cleared once it has), and the one with the last pass of
++ * the last command signals signal_sync.
++ */
+ static VkResult pvr_queue_transfer(struct pvr_transfer_ctx *ctx,
++                                   struct pvr_transfer_submit *submit,
+                                    struct pvr_transfer_cmd *transfer_cmd,
+-                                   struct vk_sync *wait,
+-                                   struct vk_sync *signal_sync)
++                                   struct vk_sync **wait,
++                                   struct vk_sync *signal_sync,
++                                   bool last_cmd)
  {
     struct pvr_transfer_prep_data *prep_data = NULL;
     struct pvr_transfer_prep_data *prev_prep_data;
 -   struct pvr_transfer_submit submit = { 0U };
-+   struct pvr_transfer_submit *submit;
     bool finished = false;
     uint32_t pass = 0U;
 -   VkResult result;
++   VkResult result = VK_SUCCESS;
+ 
+    /* Transfer queue might decide to do a blit in multiple passes. When the
+     * prepare doesn't set the finished flag this code will keep calling the
+@@ -5979,7 +5985,7 @@
+ 
+    while (!finished) {
+       prev_prep_data = prep_data;
+-      prep_data = &submit.prep_array[submit.prep_count++];
++      prep_data = &submit->prep_array[submit->prep_count++];
+ 
+       /* Clear down the memory before we write to this prep. */
+       memset(prep_data, 0U, sizeof(*prep_data));
+@@ -6004,18 +6010,22 @@
+       if (result != VK_SUCCESS)
+          return result;
+ 
+-      /* Submit if we have finished the blit or if we are out of prepares. */
+-      if (finished || submit.prep_count == ARRAY_SIZE(submit.prep_array)) {
++      /* (air/OS) Submit when the prepare array is full, or after the last
++       * pass of the last command: the commands of a sub-command (each region
++       * of a copy, each fill) go together, as jobs of one SUBMIT_JOBS, where
++       * each used to be submitted on its own.
++       */
++      const bool done = finished && last_cmd;
++      if (done || submit->prep_count == ARRAY_SIZE(submit->prep_array)) {
+          result = pvr_submit_transfer(ctx,
+-                                      &submit,
+-                                      wait,
+-                                      finished ? signal_sync : NULL);
++                                      submit,
++                                      *wait,
++                                      done ? signal_sync : NULL);
+          if (result != VK_SUCCESS)
+             return result;
+ 
+-         /* Check if we need to reset prep_count. */
+-         if (submit.prep_count == ARRAY_SIZE(submit.prep_array))
+-            submit.prep_count = 0U;
++         *wait = NULL;
++         submit->prep_count = 0U;
+       }
+ 
+       pass++;
+@@ -6029,37 +6039,43 @@
+                                       struct vk_sync *wait_sync,
+                                       struct vk_sync *signal_sync)
+ {
++   struct pvr_transfer_submit *submit;
 +   VkResult result = VK_SUCCESS;
 +
 +   /* (air/OS) On the heap: the prepare array makes it some 380 KiB, more
@@ -1481,65 +2036,95 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_job_transfer.c b/src/imagination/vul
 +                      VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
 +   if (!submit)
 +      return vk_error(ctx->device, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   /* The fw guarantees that any kick on the same context will be
++    * synchronized in submission order. This means only the first kick must
++    * wait, and only the last kick need signal.
++    */
+    list_for_each_entry_safe (struct pvr_transfer_cmd,
+                              transfer_cmd,
+                              sub_cmd->transfer_cmds,
+                              link) {
+-      /* The fw guarantees that any kick on the same context will be
+-       * synchronized in submission order. This means only the first kick must
+-       * wait, and only the last kick need signal.
+-       */
+-      struct vk_sync *first_cmd_wait_sync = NULL;
+-      struct vk_sync *last_cmd_signal_sync = NULL;
+-      VkResult result;
+-
+-      if (list_first_entry(sub_cmd->transfer_cmds,
+-                           struct pvr_transfer_cmd,
+-                           link) == transfer_cmd) {
+-         first_cmd_wait_sync = wait_sync;
+-      }
+-
+-      if (list_last_entry(sub_cmd->transfer_cmds,
+-                          struct pvr_transfer_cmd,
+-                          link) == transfer_cmd) {
+-         last_cmd_signal_sync = signal_sync;
+-      }
++      const bool last_cmd = list_last_entry(sub_cmd->transfer_cmds,
++                                            struct pvr_transfer_cmd,
++                                            link) == transfer_cmd;
  
-    /* Transfer queue might decide to do a blit in multiple passes. When the
-     * prepare doesn't set the finished flag this code will keep calling the
-@@ -5979,14 +5990,16 @@
- 
-    while (!finished) {
-       prev_prep_data = prep_data;
--      prep_data = &submit.prep_array[submit.prep_count++];
-+      prep_data = &submit->prep_array[submit->prep_count++];
- 
-       /* Clear down the memory before we write to this prep. */
-       memset(prep_data, 0U, sizeof(*prep_data));
- 
-       if (pass == 0U) {
--         if (!pvr_3d_validate_addr(transfer_cmd))
--            return vk_error(ctx->device, VK_ERROR_FEATURE_NOT_PRESENT);
-+         if (!pvr_3d_validate_addr(transfer_cmd)) {
-+            result = vk_error(ctx->device, VK_ERROR_FEATURE_NOT_PRESENT);
-+            goto out;
-+         }
-       } else {
-          /* Transfer queue workarounds could use more than one pass with 3D
-           * path.
-@@ -6002,26 +6015,28 @@
-             pvr_3d_copy_blit(ctx, transfer_cmd, prep_data, pass, &finished);
-       }
+       result = pvr_queue_transfer(ctx,
++                                  submit,
+                                   transfer_cmd,
+-                                  first_cmd_wait_sync,
+-                                  last_cmd_signal_sync);
++                                  &wait_sync,
++                                  signal_sync,
++                                  last_cmd);
        if (result != VK_SUCCESS)
 -         return result;
-+         goto out;
- 
-       /* Submit if we have finished the blit or if we are out of prepares. */
--      if (finished || submit.prep_count == ARRAY_SIZE(submit.prep_array)) {
-+      if (finished || submit->prep_count == ARRAY_SIZE(submit->prep_array)) {
-          result = pvr_submit_transfer(ctx,
--                                      &submit,
-+                                      submit,
-                                       wait,
-                                       finished ? signal_sync : NULL);
-          if (result != VK_SUCCESS)
--            return result;
-+            goto out;
- 
-          /* Check if we need to reset prep_count. */
--         if (submit.prep_count == ARRAY_SIZE(submit.prep_array))
--            submit.prep_count = 0U;
-+         if (submit->prep_count == ARRAY_SIZE(submit->prep_array))
-+            submit->prep_count = 0U;
-       }
- 
-       pass++;
++         break;
     }
  
 -   return VK_SUCCESS;
-+out:
 +   vk_free(&ctx->device->vk.alloc, submit);
++
 +   return result;
  }
+diff -ruN a/src/imagination/vulkan/pvr_arch_pipeline.c b/src/imagination/vulkan/pvr_arch_pipeline.c
+--- a/src/imagination/vulkan/pvr_arch_pipeline.c
++++ b/src/imagination/vulkan/pvr_arch_pipeline.c
+@@ -545,6 +545,22 @@
+       };
+    }
  
- VkResult pvr_arch_transfer_job_submit(struct pvr_transfer_ctx *ctx,
++   /* (air/OS) Each promoted uniform buffer range, from the bound buffer. */
++   for (unsigned u = 0; u < data->common.ubo_promotion_count; ++u) {
++      const pco_ubo_promotion *promotion = &data->common.ubo_promotions[u];
++
++      assert(program.buffer_count < ARRAY_SIZE(program.buffers));
++      program.buffers[program.buffer_count++] = (struct pvr_pds_buffer){
++         .type = PVR_BUFFER_TYPE_UBO_PROMOTED,
++         .size_in_dwords = promotion->count_dw,
++         .destination = data->common.ubo_promoted.start + promotion->base,
++         .buffer_id = promotion->elem,
++         .desc_set = promotion->desc_set,
++         .binding = promotion->binding,
++         .source_offset = promotion->offset_dw * sizeof(uint32_t),
++      };
++   }
++
+    if (stage == MESA_SHADER_FRAGMENT && data->fs.blend_consts.count > 0) {
+       program.buffers[program.buffer_count++] = (struct pvr_pds_buffer){
+          .type = PVR_BUFFER_TYPE_BLEND_CONSTS,
+@@ -2619,6 +2635,12 @@
+       data->common.shareds += count;
+    }
+ 
++   /* (air/OS) Promoted uniform buffer ranges (pco_nir_promote_ubo_loads). */
++   if (data->common.ubo_promoted.count > 0) {
++      data->common.ubo_promoted.start = data->common.shareds;
++      data->common.shareds += data->common.ubo_promoted.count;
++   }
++
+    if (data->common.uses.point_sampler) {
+       data->common.shareds = ALIGN_POT(data->common.shareds, 4);
+       data->common.point_sampler = (pco_range){
 diff -ruN a/src/imagination/vulkan/pvr_arch_queue.c b/src/imagination/vulkan/pvr_arch_queue.c
 --- a/src/imagination/vulkan/pvr_arch_queue.c
 +++ b/src/imagination/vulkan/pvr_arch_queue.c
@@ -2470,7 +3055,19 @@ diff -ruN a/src/imagination/vulkan/pvr_device.h b/src/imagination/vulkan/pvr_dev
  
  #include "pvr_bo.h"
  #include "pvr_common.h"
-@@ -138,6 +139,33 @@
+@@ -130,6 +131,11 @@
+       simple_mtx_t mtx;
+ 
+ #define PVR_MAX_TILE_BUFFER_COUNT 7U
++
++/* (air/OS) Bytes of zeros for promoted uniform buffer ranges; covers the
++ * compiler's limit on promoted dwords (PCO_UBO_PROMOTE_MAX_DW_LIMIT).
++ */
++#define PVR_UBO_PROMOTED_ZEROS_SIZE 4096U
+       struct pvr_bo *buffers[PVR_MAX_TILE_BUFFER_COUNT];
+       uint32_t buffer_count;
+    } tile_buffer_state;
+@@ -138,21 +144,80 @@
  
     struct pvr_bo_store *bo_store;
  
@@ -2503,8 +3100,12 @@ diff -ruN a/src/imagination/vulkan/pvr_device.h b/src/imagination/vulkan/pvr_dev
 +
     struct pvr_bo *robustness_buffer;
  
++   /* (air/OS) Zeros for promoted uniform buffer ranges without a buffer. */
++   struct pvr_bo *ubo_promoted_zeros;
++
     struct vk_sync *presignaled_sync;
-@@ -146,13 +174,42 @@
+ 
+    struct pvr_border_color_table *border_color_table;
  
     simple_mtx_t rs_mtx;
     struct list_head render_states;
@@ -2930,6 +3531,46 @@ diff -ruN a/src/imagination/vulkan/pvr_physical_device.c b/src/imagination/vulka
     pvr_physical_device_get_supported_extensions(&supported_extensions, instance);
     pvr_physical_device_get_supported_features(&pdevice->dev_info,
                                                &supported_features);
+diff -ruN a/src/imagination/vulkan/pvr_robustness.c b/src/imagination/vulkan/pvr_robustness.c
+--- a/src/imagination/vulkan/pvr_robustness.c
++++ b/src/imagination/vulkan/pvr_robustness.c
+@@ -22,6 +22,7 @@
+  */
+ 
+ #include <stdint.h>
++#include <string.h>
+ #include <vulkan/vulkan_core.h>
+ 
+ #include "pvr_bo.h"
+@@ -240,11 +241,28 @@
+ #undef ROBUSTNESS_BUFFER_ABGR
+ #undef ROBUSTNESS_BUFFER_PACKED
+ 
++   /* (air/OS) Zeros for a promoted uniform buffer range the bound buffer
++    * does not hold (PVR_BUFFER_TYPE_UBO_PROMOTED).
++    */
++   result = pvr_bo_alloc(device,
++                         device->heaps.general_heap,
++                         PVR_UBO_PROMOTED_ZEROS_SIZE,
++                         16,
++                         PVR_BO_ALLOC_FLAG_CPU_MAPPED,
++                         &device->ubo_promoted_zeros);
++   if (result != VK_SUCCESS) {
++      pvr_bo_free(device, device->robustness_buffer);
++      return result;
++   }
++
++   memset(device->ubo_promoted_zeros->bo->map, 0, PVR_UBO_PROMOTED_ZEROS_SIZE);
++
+    return VK_SUCCESS;
+ }
+ 
+ void pvr_robustness_buffer_finish(struct pvr_device *device)
+ {
++   pvr_bo_free(device, device->ubo_promoted_zeros);
+    pvr_bo_free(device, device->robustness_buffer);
+ }
+ 
 diff -ruN a/src/imagination/vulkan/pvr_rt_dataset.c b/src/imagination/vulkan/pvr_rt_dataset.c
 --- a/src/imagination/vulkan/pvr_rt_dataset.c
 +++ b/src/imagination/vulkan/pvr_rt_dataset.c
@@ -3115,6 +3756,24 @@ diff -ruN a/src/imagination/vulkan/pvr_rt_dataset.h b/src/imagination/vulkan/pvr
  
        render_target->rt_dataset[valid_idx] = NULL;
        render_target->valid_mask &= ~BITFIELD_BIT(valid_idx);
+diff -ruN a/src/imagination/vulkan/pvr_spm.c b/src/imagination/vulkan/pvr_spm.c
+--- a/src/imagination/vulkan/pvr_spm.c
++++ b/src/imagination/vulkan/pvr_spm.c
+@@ -184,7 +184,13 @@
+     * framebuffers as the scratch buffer is only used during PRs and only one PR
+     * can ever be executed at any one time.
+     */
+-   if (store->head_ref && store->head_ref->size == size) {
++   /* (air/OS) A larger buffer serves a smaller render too (the render's own
++    * EOT and background programs lay out what they store). With an exact
++    * match, renders of two sizes in turn (a WebGL canvas and the page
++    * compositing it, every frame) allocated and freed a GPU buffer of about
++    * 1.7 MB each time; now the buffer grows to the largest render and stays.
++    */
++   if (store->head_ref && store->head_ref->size >= size) {
+       buffer = store->head_ref;
+    } else {
+       VkResult result;
 diff -ruN a/src/imagination/vulkan/winsys/powervr/pvr_drm.c b/src/imagination/vulkan/winsys/powervr/pvr_drm.c
 --- a/src/imagination/vulkan/winsys/powervr/pvr_drm.c
 +++ b/src/imagination/vulkan/winsys/powervr/pvr_drm.c
@@ -3740,8 +4399,86 @@ diff -ruN a/src/imagination/vulkan/winsys/powervr/pvr_drm_job_render.c b/src/ima
 diff -ruN a/src/imagination/vulkan/winsys/powervr/pvr_drm_job_transfer.c b/src/imagination/vulkan/winsys/powervr/pvr_drm_job_transfer.c
 --- a/src/imagination/vulkan/winsys/powervr/pvr_drm_job_transfer.c
 +++ b/src/imagination/vulkan/winsys/powervr/pvr_drm_job_transfer.c
-@@ -171,10 +171,10 @@
+@@ -122,6 +122,11 @@
+    return flags;
+ }
+ 
++/* (air/OS) Every command of the submit goes as a job of one SUBMIT_JOBS:
++ * the first waits, the last signals, and the firmware keeps their order on
++ * the context. Each transfer region or fill used to be an ioctl of its own
++ * (a present's few rectangles, or a buffer cleared in rows).
++ */
+ VkResult pvr_drm_winsys_transfer_submit(
+    const struct pvr_winsys_transfer_ctx *ctx,
+    const struct pvr_winsys_transfer_submit_info *submit_info,
+@@ -131,50 +136,64 @@
+    const struct pvr_drm_winsys *drm_ws = to_pvr_drm_winsys(ctx->ws);
+    const struct pvr_drm_winsys_transfer_ctx *drm_ctx =
+       to_pvr_drm_winsys_transfer_ctx(ctx);
++   const uint32_t cmd_count = submit_info->cmd_count;
+ 
+-   struct drm_pvr_sync_op sync_ops[2];
++   struct drm_pvr_sync_op wait_op, signal_op, both_ops[2];
++   struct drm_pvr_job jobs[PVR_TRANSFER_MAX_PREPARES_PER_SUBMIT];
+ 
+-   struct drm_pvr_job job_args = {
+-      .type = DRM_PVR_JOB_TYPE_TRANSFER_FRAG,
+-      .cmd_stream = (__u64)&submit_info->cmds[0].fw_stream[0],
+-      .cmd_stream_len = submit_info->cmds[0].fw_stream_len,
+-      .flags = pvr_winsys_transfer_flags_to_drm(&submit_info->cmds[0].flags),
+-      .context_handle = drm_ctx->handle,
+-      .sync_ops = DRM_PVR_OBJ_ARRAY(0, sync_ops),
+-   };
++   assert(cmd_count > 0 && cmd_count <= ARRAY_SIZE(jobs));
+ 
+-   struct drm_pvr_ioctl_submit_jobs_args args = {
+-      .jobs = DRM_PVR_OBJ_ARRAY(1, &job_args),
+-   };
+-
+-   assert(submit_info->cmd_count == 1);
++   for (uint32_t i = 0; i < cmd_count; i++) {
++      jobs[i] = (struct drm_pvr_job){
++         .type = DRM_PVR_JOB_TYPE_TRANSFER_FRAG,
++         .cmd_stream = (__u64)&submit_info->cmds[i].fw_stream[0],
++         .cmd_stream_len = submit_info->cmds[i].fw_stream_len,
++         .flags = pvr_winsys_transfer_flags_to_drm(&submit_info->cmds[i].flags),
++         .context_handle = drm_ctx->handle,
++         .sync_ops = DRM_PVR_OBJ_ARRAY(0, both_ops),
++      };
++   }
+ 
+    if (submit_info->wait) {
+       struct vk_sync *sync = submit_info->wait;
+ 
+       assert(!(sync->flags & VK_SYNC_IS_TIMELINE));
+-      sync_ops[job_args.sync_ops.count++] = (struct drm_pvr_sync_op){
++      wait_op = (struct drm_pvr_sync_op){
+          .handle = vk_sync_as_drm_syncobj(sync)->syncobj,
+          .flags = DRM_PVR_SYNC_OP_FLAG_WAIT |
+                   DRM_PVR_SYNC_OP_FLAG_HANDLE_TYPE_SYNCOBJ,
+          .value = 0,
        };
++      jobs[0].sync_ops = (struct drm_pvr_obj_array)DRM_PVR_OBJ_ARRAY(1, &wait_op);
+    }
+ 
+    if (signal_sync) {
+       assert(!(signal_sync->flags & VK_SYNC_IS_TIMELINE));
+-      sync_ops[job_args.sync_ops.count++] = (struct drm_pvr_sync_op){
++      signal_op = (struct drm_pvr_sync_op){
+          .handle = vk_sync_as_drm_syncobj(signal_sync)->syncobj,
+          .flags = DRM_PVR_SYNC_OP_FLAG_SIGNAL |
+                   DRM_PVR_SYNC_OP_FLAG_HANDLE_TYPE_SYNCOBJ,
+          .value = 0,
+       };
++
++      if (cmd_count == 1 && submit_info->wait) {
++         /* One job: it waits and signals. */
++         both_ops[0] = wait_op;
++         both_ops[1] = signal_op;
++         jobs[0].sync_ops = (struct drm_pvr_obj_array)DRM_PVR_OBJ_ARRAY(2, both_ops);
++      } else {
++         jobs[cmd_count - 1].sync_ops = (struct drm_pvr_obj_array)DRM_PVR_OBJ_ARRAY(1, &signal_op);
++      }
     }
  
 -   /* Returns VK_ERROR_OUT_OF_DEVICE_MEMORY to match pvrsrv. */
@@ -3750,6 +4487,10 @@ diff -ruN a/src/imagination/vulkan/winsys/powervr/pvr_drm_job_transfer.c b/src/i
 -                     &args,
 -                     VK_ERROR_OUT_OF_DEVICE_MEMORY,
 -                     "Failed to submit transfer job");
++   struct drm_pvr_ioctl_submit_jobs_args args = {
++      .jobs = DRM_PVR_OBJ_ARRAY(cmd_count, jobs),
++   };
++
 +   /* VK_ERROR_OUT_OF_DEVICE_MEMORY to match pvrsrv, or
 +    * VK_ERROR_DEVICE_LOST when the kernel ended the context.
 +    */

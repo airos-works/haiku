@@ -48,6 +48,8 @@ struct pvr_haiku_device {
 	status_t				firmware_status;
 	bigtime_t				boot_time;
 	u32						trace_lines;
+	bool					verbose;	/* the settings asked for firmware
+										   tracing: log more than errors */
 };
 
 

@@ -372,10 +372,11 @@ pvr_haiku_file_ioctl(struct pvr_haiku_file* file, uint32 nr,
 			error = generic->function(file, data);
 		count_ioctl(nr, name, system_time() - start);
 		if (error == 0 && desc != NULL
+			&& to_haiku_device(file->pvr_dev)->verbose
 			&& _IOC_NR(desc->cmd)
 				== _IOC_NR(DRM_IOCTL_PVR_CREATE_HWRT_DATASET)) {
 			// the render target's size decides how many tiles each
-			// fragment job walks: worth seeing
+			// fragment job walks: worth seeing when tracing
 			const struct drm_pvr_ioctl_create_hwrt_dataset_args* args
 				= (const struct drm_pvr_ioctl_create_hwrt_dataset_args*)data;
 			TRACE("HWRT dataset %u: %ux%u, %u samples, %u layers, merge"

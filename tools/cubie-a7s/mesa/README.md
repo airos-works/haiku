@@ -71,6 +71,12 @@ On the image, the libraries go to `/boot/system/non-packaged/lib`, `10_mesa.json
     - The loads are now vectorized before the robustness lowering, in rounds of 1+1, 2+2 and 4+4, up to 8 components. TextureMapper's shader now makes 3 loads: 8 + 8 + 1.
     - A merged load is bounds-checked as a whole. A load that runs past the end of the buffer is read one component at a time instead, so the components that are in bounds stay exact, as `robustBufferAccess` requires. That branch is uniform and normally skipped.
     - `PCO_LOAD_VECTOR_MAX` sets the widest merge: 4 or 16 trade loads for temps (for TextureMapper's shader, 4 gives 5 loads and 20 temps, 8 gives 3 loads and 25 temps, 16 gives 2 loads and 39 temps), and 1 gives the old code. Shaders cached on disk keep the width they were compiled with, so set `MESA_SHADER_CACHE_DISABLE=true` when comparing.
+- Uniform buffers are promoted to shared registers (`pco_nir.c`, `pco_trans_nir.c`, `pvr_arch_pipeline.c`, `pvr_arch_cmd_buffer.c`, `pvr_pipeline_pds.c`). Loads of a uniform buffer at constant offsets read shared registers instead. The PDS fills those registers once per draw from the bound buffer, with a DOUTD, as it does push constants.
+    - Each buffer's range runs from its first to its last constant load. A shader gets at most 4 ranges and 128 dwords in all (`PCO_UBO_PROMOTE_MAX_DW`; 0 turns it off). Loads at dynamic offsets stay `ld`s.
+    - At draw time the driver finds the buffer in the bound descriptor set, dynamic offset included. A range the bound buffer does not hold, or a null descriptor, is loaded from a page of zeros, and a warning is logged once.
+    - Through zink, WebKit's TextureMapper fragment shader went from 17 loads per pixel to 3 merged loads, and now has none. The shader shrank from 346 instruction groups to 139.
+- The SPM scratch buffer is reused when it is large enough (`pvr_spm.c`). The store used to keep a buffer only for renders of exactly its size. Renders of two sizes in turn, such as a WebGL canvas and the page that composites it, allocated and freed a GPU buffer of about 1.7 MB each time. The buffer now grows to the largest render and stays.
+- A transfer sub-command is submitted as one `SUBMIT_JOBS` (`pvr_arch_job_transfer.c`, `pvr_drm_job_transfer.c`). Each region of a copy and each fill is still a job, but up to 16 of them now go in one ioctl: the first waits and the last signals. Before, each job was an ioctl of its own.
 - `PVR_LOG_RENDERS=1` (stderr) or `=FILE` (appended) prints one line per render job (`pvr_arch_job_render.c`). Each line gives the data set's size and tiling, the attachments, load ops and background object, the PBE surface (layout, stride, clip), and the ISP_CTL, pixel control and ZLS control words. Use it to match slow 3D jobs in a firmware trace with the renders that made them.
 - Small fixes cover `drm.h`, `pvr_drm.h`, `vk_image` and `pvr_physical_device.c`.
 
@@ -161,7 +167,7 @@ How to read the two:
 `--no-scanout` skips the frame buffer cases. Writing into the frame buffer shows on the screen until app_server draws there again.
 
 How the driver splits a transfer (`pvr_arch_job_transfer.c`):
-- Every region of a `vkCmdCopy*`, every fill and every clear is one transfer command, and each is submitted as its own `TRANSFER_FRAG` job, in its own `SUBMIT_JOBS`. Only the first waits and only the last signals; the firmware keeps the order within the context. So a present with N rectangles is N jobs, and 256 fills are 256 submits.
+- Every region of a `vkCmdCopy*`, every fill and every clear is one transfer command, and each becomes its own `TRANSFER_FRAG` job. The jobs of a sub-command now go together, up to 16 per `SUBMIT_JOBS`, with the first waiting and the last signalling; the firmware keeps the order within the context. So a present with N rectangles is N jobs in one submit, and 256 fills are 16 submits of 16 jobs. Before the batching they were 256 submits.
 - A fill of the 4 MB buffer is two jobs. A copy is one job, with any workaround passes in the same submit (up to 16 prepares).
 - An odd destination row length is not a separate pass: the double-stride workaround draws one surface of twice the stride and half the height, in two interleaved sets of rectangles.
 
@@ -195,23 +201,26 @@ The cases:
 
 Zink leaves the unused D24S8 out of the `summit` render, so like the board's slow pass it renders without depth (`ISP_CTL` 0x80035000). `depth` renders with depth (0x80135000).
 
-To compare the merged uniform loads with the old ones on the board:
+To compare the three ways of reading uniforms on the board:
 
 ```
-MESA_SHADER_CACHE_DISABLE=true PCO_LOAD_VECTOR_MAX=1 pvr_glcomposite
+MESA_SHADER_CACHE_DISABLE=true PCO_UBO_PROMOTE_MAX_DW=0 PCO_LOAD_VECTOR_MAX=1 pvr_glcomposite
+MESA_SHADER_CACHE_DISABLE=true PCO_UBO_PROMOTE_MAX_DW=0 pvr_glcomposite
 MESA_SHADER_CACHE_DISABLE=true pvr_glcomposite
 ```
 
+The first line is the old code (a load per component), the second the merged loads, the third the promoted ranges.
+
 Under the shim, `PCO_DEBUG_PRINT=fs,stats` prints each fragment shader with its stats. These were the counts for the cases with uniforms:
 
-| Fragment shader | Loads before | Loads now (8) | Temps before → now |
+| Fragment shader | Per component: loads, groups, temps | Merged (8) | Promoted |
 |---|---|---|---|
-| `uniform` | 4 | 1 | 13 → 13 |
-| `mat4` | 20 | 3 | 14 → 25 |
-| `webkit` | 17 | 3 | 19 → 25 |
-| `webkit-aa` | 23 | 6 | 19 → 29 |
+| `uniform` | 4, 89, 13 | 1, 115, 13 | 0, 41, 11 |
+| `mat4` | 20, 314, 14 | 3, 414, 25 | 0, 73, 13 |
+| `webkit` | 17, 346, 19 | 3, 415, 25 | 0, 139, 19 |
+| `webkit-aa` | 23, 435, 19 | 6, 580, 29 | 0, 147, 13 |
 
-"Now" counts the loads on the path a shader takes when its loads are in bounds; the skipped fallback holds the rest. None of the shaders spill.
+The merged counts are the loads on the path a shader takes when its loads are in bounds; the fallback, normally skipped, holds the rest, and adds to the groups. None of the shaders spill.
 
 ## OpenGL
 
@@ -274,6 +283,12 @@ Summit's WebProcess crashed this way. Zink's shader-cache thread wrote `util_cal
 Under the shim, `pvr_glbench` allocates its staging slab from type 1 and makes one 360000-byte invalidate per frame (300x300x4). The readback time there means nothing, because host memory is cached either way.
 
 Zink keeps its shader cache in the usual Mesa cache directory, limited to 128 MB (`MESA_SHADER_CACHE_DISABLE=true` turns it off). Its key includes the library file's timestamp.
+
+**`MESA_SHADER_CACHE_DISABLE=true` and `eglTerminate()`.** With the variable set, every GL program hit an assert in libroot when it shut down EGL (`pthread_mutex.cpp:96 __pthread_mutex_lock(): mutex->owner == -1`). The process then waited in the debugger.
+- The disabled cache still exists, but its write queue was never created.
+- Zink's screen destroy waits for that queue (`disk_cache_wait_for_idle()`), and `util_queue_finish()` locked its zeroed mutex.
+- A zeroed mutex is valid on Linux. On Haiku the owner field must start at -1, so the lock asserts.
+- `mesa-haiku-gl.patch` makes `disk_cache_wait_for_idle()` skip a cache without a queue, as `disk_cache_put()` and `disk_cache_destroy()` already do. On the host this was confirmed with a build of the shim tree that uses pthread mutexes, plus a preloaded checker that reports locks of mutexes that were never initialized: the report came before the fix and is gone after it.
 
 **Why `libvulkan.so.1` is a shim.** There is no Vulkan loader on arm64 Haiku. Zink `dlopen()`s `libvulkan.so.1` and takes `vkGetInstanceProcAddr` and `vkGetDeviceProcAddr` from it. `vulkan_shim.c` provides those two, plus the global commands, by forwarding to the driver's `vk_icdGetInstanceProcAddr`. It links the driver by name. This keeps zink unpatched and gives any program the usual way in. It is not a loader: no layers, one driver, no window system surfaces. A ported Khronos loader would replace it.
 
@@ -346,6 +361,7 @@ The shim executes nothing. So in the expected results:
 - `pvr_vkbench` (fence; then `--timeline --rerecord`) and `pvr_glbench` each run for 3 s with 1 s lines and fail their pixel or word checks. On the host their rates measure the driver and zink CPU paths only, because the shim executes nothing.
 - `pvr_copybench-scanout` (`SCANOUT=1920x1080 pvr_copybench --runs 2`) runs every case, frame buffer included, and passes. Its times measure nothing.
 - `pvr_glcomposite --frames 2 --shim --expect zink` runs every case and passes, without its pixel checks.
+- Under the tracer, the `rendered` case (a 512x512 render and a 1121x538 one each frame) creates one 2.3 MB SPM scratch buffer in 30 frames, where it used to create one at every change of size. `pvr_copybench`'s 256 row fills are 16 `SUBMIT_JOBS` of 16 jobs each, and only the last of a run signals.
 
 The tracer also logs CPU maps of buffer objects: `mmap` of the DRM device and `munmap` of such a map, as `CPU_MAP` and `CPU_UNMAP` lines. On air/OS these are `MAP_BO` and `delete_area()`. Three marked runs, `pvr_glbench --frames 60 --mark`, `pvr_glbench --frames 60 --resize 5 --mark` and `pvr_vkbench --dispatches 60 --timeline --rerecord --mark`, are cut by `trace_balance` into frames 10 to 59. For each kind of object, it reports how many are made and freed per frame, and the net count for each half of that window. A kind whose net count grows in both halves is marked `PILES UP`. The result is in `shim/balance-*.txt`. Nothing piles up. With the data set cache, a steady GL frame makes no free list and no HWRT data set: two of each are made in the first frames (zink keeps two batches in flight) and reused after that. In the resize run, each new size makes one data set the first time, and none after that. With the buffer object cache and the shared memory mappings, a steady GL frame makes no buffer object, GPU VM map or CPU map at all. Before the caches it made 7 buffer objects, 9 VM maps, 1 free list and 1 HWRT data set. What is left per frame is 13 syncobjs, created and destroyed, over 3 `SUBMIT_JOBS` with 5 jobs.
 

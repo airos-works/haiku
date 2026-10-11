@@ -848,6 +848,7 @@ pvr_haiku_firmware_boot(struct pvr_device* pvr_dev,
 	if (!device->firmware_loaded)
 		return B_NO_INIT;
 	device->trace_lines = options->trace_lines;
+	device->verbose = options->trace_mask != 0;
 
 	// the firmware's log groups, before pvr_fw_trace_init() reads them
 	if (options->trace_mask != 0) {

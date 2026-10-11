@@ -80,14 +80,15 @@ PvrDevice::~PvrDevice()
 		fw_trace_mask 0x2			firmware log groups (ROGUE_FWIF_LOG_TYPE_
 									GROUP_*), 0 for none
 		fw_trace_lines 64			firmware trace lines logged at most
-		trace_registers false		do not log the registers of the start
+		trace_registers true		log the register accesses of the start
+									(off by default)
 		vendor_secure_config true	Allwinner's SMC/GPU_GLB writes before the
 									start (see DESIGN R7)
 */
 void
 PvrDevice::_ReadSettings()
 {
-	fOptions.trace_registers = true;
+	fOptions.trace_registers = false;
 	fOptions.trace_lines = kDefaultTraceLines;
 
 	void* handle = load_driver_settings("powervr");
@@ -100,7 +101,7 @@ PvrDevice::_ReadSettings()
 	fFirmwareEnabled = get_driver_boolean_parameter(handle, "firmware", false,
 		true);
 	fOptions.trace_registers = get_driver_boolean_parameter(handle,
-		"trace_registers", true, true);
+		"trace_registers", false, true);
 	fOptions.vendor_secure_config = get_driver_boolean_parameter(handle,
 		"vendor_secure_config", false, true);
 	const char* value = get_driver_parameter(handle, "fw_trace_mask", NULL,

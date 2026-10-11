@@ -48,8 +48,32 @@ if $(CUBIE_LAB_IMAGE) = 1 {
 	DeferredSubInclude HAIKU_TOP tools cubie-a7s ;
 }
 
+# The Mesa the images ship (OpenGL through zink on the PowerVR Vulkan
+# driver, softpipe without the GPU, and the GPU's test programs): a pinned
+# release, built from the patches of one commit of tools/cubie-a7s/mesa with
+# its build.sh into /mnt/HaikuWork/cubie/mesa/release/<commit>, whose
+# MANIFEST names the patches and every file's hash. The lab's work in
+# progress goes in with -sCUBIE_MESA_DIR=/mnt/HaikuWork/cubie/mesa/out (or
+# CUBIE_MESA_DIR set before including this file).
+CUBIE_MESA_RELEASE ?= 9b809ca017 ;
+CUBIE_MESA_DIR ?= /mnt/HaikuWork/cubie/mesa/release/$(CUBIE_MESA_RELEASE) ;
+
 rule UserBuildConfigRulePreImage
 {
+	if $(HAIKU_BUILD_PROFILE) in minimum-cubie cubie-airos {
+		local mesaFiles = MANIFEST libEGL_mesa.so.0 10_mesa.json
+			libvulkan_powervr_mesa.so libvulkan.so.1 ;
+		local found = [ Glob $(CUBIE_MESA_DIR) : $(mesaFiles) ] ;
+		if ! $(found[5]) {
+			Exit "cubie-a7s: no Mesa release in" $(CUBIE_MESA_DIR)
+				"- it needs" $(mesaFiles) "- build the commit's"
+				"tools/cubie-a7s/mesa with CUBIE_MESA_ROOT=<new dir> build.sh"
+				"all and copy its out/ there, or name another with"
+				"-sCUBIE_MESA_DIR=..." ;
+		}
+		Echo "cubie-a7s: Mesa from $(CUBIE_MESA_DIR)" ;
+	}
+
 	# The PowerVR GPU's firmware and its licence (fetch-gpu-firmware.sh; not
 	# in git), for the powervr driver's firmware stage. Left out, with a
 	# note, when they have not been fetched.
@@ -117,24 +141,18 @@ rule UserBuildConfigRulePreImage
 		SEARCH on $(glViewLib) = /mnt/HaikuWork/rpi4/glvnd/stage ;
 		AddFilesToHaikuImage system non-packaged lib : $(glViewLib) ;
 
-		# OpenGL: Mesa 26.2.4 (tools/cubie-a7s/mesa) once built, zink on the
-		# PowerVR Vulkan driver and softpipe without it; otherwise the Pi's
-		# Mesa (tools/rpi4/mesa), which finds no V3D here and falls back to
-		# softpipe.
-		local mesaStage = /mnt/HaikuWork/rpi4/mesa/stage ;
-		if [ Glob /mnt/HaikuWork/cubie/mesa/out : libEGL_mesa.so.0 ] {
-			mesaStage = /mnt/HaikuWork/cubie/mesa/out ;
-		}
+		# OpenGL: Mesa 26.2.4 (CUBIE_MESA_DIR, above), zink on the PowerVR
+		# Vulkan driver and softpipe without it.
 		local mesaLib = <cubie-mesa>libEGL_mesa.so.0 ;
-		SEARCH on $(mesaLib) = $(mesaStage) ;
+		SEARCH on $(mesaLib) = $(CUBIE_MESA_DIR) ;
 		AddFilesToHaikuImage system non-packaged lib : $(mesaLib) ;
 		local vendorFile = <cubie-mesa>10_mesa.json ;
-		SEARCH on $(vendorFile) = $(mesaStage) ;
+		SEARCH on $(vendorFile) = $(CUBIE_MESA_DIR) ;
 		AddFilesToHaikuImage system non-packaged add-ons opengl egl_vendor.d
 			: $(vendorFile) ;
 		# The GPU: its firmware stage (the lab's settings log more), and
 		# Mesa's PowerVR Vulkan driver with zink's libvulkan.so.1 (the
-		# driver, without a loader) once built.
+		# driver, without a loader).
 		if $(CUBIE_LAB_IMAGE) != 1 {
 			local gpuSettings = <cubie-settings>powervr ;
 			SEARCH on $(gpuSettings)
@@ -142,13 +160,10 @@ rule UserBuildConfigRulePreImage
 			AddFilesToHaikuImage home config settings kernel drivers
 				: $(gpuSettings) ;
 		}
-		local vulkanOut = /mnt/HaikuWork/cubie/mesa/out ;
-		if [ Glob $(vulkanOut) : libvulkan_powervr_mesa.so ] {
-			local vulkanLibs = <cubie-mesa>libvulkan_powervr_mesa.so
-				<cubie-mesa>libvulkan.so.1 ;
-			SEARCH on $(vulkanLibs) = $(vulkanOut) ;
-			AddFilesToHaikuImage system non-packaged lib : $(vulkanLibs) ;
-		}
+		local vulkanLibs = <cubie-mesa>libvulkan_powervr_mesa.so
+			<cubie-mesa>libvulkan.so.1 ;
+		SEARCH on $(vulkanLibs) = $(CUBIE_MESA_DIR) ;
+		AddFilesToHaikuImage system non-packaged lib : $(vulkanLibs) ;
 
 		local glDemos = <cubie-gl>GLTeapot ;
 		SEARCH on $(glDemos) = [ FDirName $(extras) apps ] ;
@@ -225,8 +240,10 @@ rule UserBuildConfigRulePreImage
 		local rtcSettings = <cubie-settings>RTC_time_settings ;
 		SEARCH on $(rtcSettings) = [ FDirName $(HAIKU_TOP) data boot rpi ] ;
 		AddFilesToHaikuImage home config settings : $(rtcSettings) ;
+		# The desktop's environment (ICU data, Summit's direct present into
+		# app_server's copy of the screen).
 		local environment = <cubie-settings>UserSetupEnvironment ;
-		SEARCH on $(environment) = [ FDirName $(HAIKU_TOP) tools rock5-itx ] ;
+		SEARCH on $(environment) = [ FDirName $(HAIKU_TOP) tools cubie-a7s ] ;
 		AddFilesToHaikuImage home config settings boot : $(environment) ;
 	}
 
@@ -235,7 +252,7 @@ rule UserBuildConfigRulePreImage
 		# display registers
 		AddFilesToHaikuImage system non-packaged bin : cubie_reg cubie_fetch
 			pvrinfo pvrtest cedar_decode media_probe cpu_usage aicload
-			cubie_audio_test ;
+			cubie_audio_test screencheck ;
 		if $(CUBIE_AIROS_IMAGE) {
 			# a Bluetooth diagnostic the regular image leaves out
 			AddFilesToHaikuImage system non-packaged bin : bt_dev_info ;
@@ -273,28 +290,25 @@ rule UserBuildConfigRulePreImage
 		AddFilesToHaikuImage home config settings kernel drivers
 			: $(gpuSettings) ;
 
-		# The tests of Mesa's PowerVR Vulkan driver, once
-		# tools/cubie-a7s/mesa/build.sh has built them, and the driver for
-		# the minimum image (air/OS images have it anyway).
-		local mesaOut = /mnt/HaikuWork/cubie/mesa/out ;
-		if [ Glob $(mesaOut) : libvulkan_powervr_mesa.so ] {
-			if ! $(CUBIE_AIROS_IMAGE) {
-				local vulkanLibs = <cubie-mesa>libvulkan_powervr_mesa.so
-					<cubie-mesa>libvulkan.so.1 ;
-				SEARCH on $(vulkanLibs) = $(mesaOut) ;
-				AddFilesToHaikuImage system non-packaged lib : $(vulkanLibs) ;
-			}
-			local test ;
-			for test in pvr_vkprobe pvr_vkfill pvr_vkfence pvr_vktriangle
-					pvr_vkhang pvr_vkbench pvr_present pvr_copybench pvr_glprobe
-					pvr_glbench
-					pvr_glreset pvr_glpresent pvr_glcomposite
-					tls_generation_check libtls_generation_check.so {
-				if [ Glob $(mesaOut) : $(test) ] {
-					local testFile = <cubie-mesa>$(test) ;
-					SEARCH on $(testFile) = $(mesaOut) ;
-					AddFilesToHaikuImage system non-packaged bin : $(testFile) ;
-				}
+		# The tests of Mesa's PowerVR Vulkan driver from the same Mesa
+		# (CUBIE_MESA_DIR), and the driver for the minimum image (air/OS
+		# images have it anyway).
+		if ! $(CUBIE_AIROS_IMAGE) {
+			local vulkanLibs = <cubie-mesa>libvulkan_powervr_mesa.so
+				<cubie-mesa>libvulkan.so.1 ;
+			SEARCH on $(vulkanLibs) = $(CUBIE_MESA_DIR) ;
+			AddFilesToHaikuImage system non-packaged lib : $(vulkanLibs) ;
+		}
+		local test ;
+		for test in pvr_vkprobe pvr_vkfill pvr_vkfence pvr_vktriangle
+				pvr_vkhang pvr_vkbench pvr_present pvr_copybench pvr_glprobe
+				pvr_glbench pvr_glreset pvr_glpresent pvr_glcomposite
+				tls_generation_check libtls_generation_check.so {
+			# a release from before a test was written lacks it
+			if [ Glob $(CUBIE_MESA_DIR) : $(test) ] {
+				local testFile = <cubie-mesa>$(test) ;
+				SEARCH on $(testFile) = $(CUBIE_MESA_DIR) ;
+				AddFilesToHaikuImage system non-packaged bin : $(testFile) ;
 			}
 		}
 

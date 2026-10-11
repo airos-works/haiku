@@ -131,6 +131,13 @@ shared V3D bitmaps, plus the zink pieces of the air/OS x86_64 fork
       cached token address is dropped when its shader is deleted
   include/renderdoc_app.h
       calling convention on Haiku
+  src/util/disk_cache.c
+      disk_cache_wait_for_idle() leaves a cache whose queue was never made
+      alone, as disk_cache_put() and disk_cache_destroy() already do. With
+      MESA_SHADER_CACHE_DISABLE=true the cache exists but its queue does
+      not; zink's screen destroy (eglTerminate) waited on it, and
+      util_queue_finish() locked the zeroed queue mutex, which Haiku's
+      libroot asserts on (pthread_mutex.cpp: owner 0, not -1)
 
 Not ported: V3D/Mali screens, texture caches, GPU readback and shared
 bitmaps (driver-specific); the x86_64 fork's pipeline-library checks
@@ -2647,3 +2654,22 @@ diff -ruN a/src/mesa/state_tracker/st_cb_flush.c b/src/mesa/state_tracker/st_cb_
     }
  
     return gl_reset_status_from_pipe_reset_status(status);
+diff -ruN a/src/util/disk_cache.c b/src/util/disk_cache.c
+--- a/src/util/disk_cache.c
++++ b/src/util/disk_cache.c
+@@ -352,6 +352,15 @@
+ void
+ disk_cache_wait_for_idle(struct disk_cache *cache)
+ {
++   /* (air/OS) A disabled cache (MESA_SHADER_CACHE_DISABLE, or a path that
++    * could not be made) never initialized its queue, as disk_cache_put() and
++    * disk_cache_destroy() know: util_queue_finish() locked its zeroed mutex,
++    * which Haiku's libroot asserts on (owner 0, not -1) when zink destroys
++    * its screen.
++    */
++   if (!util_queue_is_initialized(&cache->cache_queue))
++      return;
++
+    util_queue_finish(&cache->cache_queue);
+ }
+ 
