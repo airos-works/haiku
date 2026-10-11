@@ -33,6 +33,7 @@ struct GfxEngine {
 		Gart& gart, amdgpu_vm_test& result);
 	void Snapshot(amdgpu_gfx_test& result);
 	status_t RenderInfo(const amdgpu::AtomRenderInfo& rom, amdgpu_render_info& result);
+	status_t ShaderMemoryInfo(amdgpu_shader_memory_info& result);
 	void DumpExecutionState(const char* point);
 	void Halt();
 	void Uninitialize();

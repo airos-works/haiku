@@ -1072,6 +1072,16 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 		sGfx.interrupts.Snapshot(info);
 		return user_memcpy(data, &info, sizeof(info));
 	}
+	if (op == AMDGPU_SHADER_MEMORY_INFO) {
+		amdgpu_shader_memory_info info;
+		status_t status = ReadRequest(info, data, length);
+		if (status != B_OK) return status;
+		if (info.flags != 0 || info.reserved != 0) return B_BAD_VALUE;
+		status = WaitDmaIdle();
+		if (status == B_OK) status = sGfx.ShaderMemoryInfo(info);
+		if (status != B_OK) return status;
+		return user_memcpy(data, &info, sizeof(info));
+	}
 	if (op == AMDGPU_RENDER_INFO) {
 		amdgpu_render_info info;
 		status_t status = ReadRequest(info, data, length);

@@ -519,6 +519,41 @@ GfxEngine::Initialize(volatile uint32* r, const amdgpu_info& info,
 }
 
 status_t
+GfxEngine::ShaderMemoryInfo(amdgpu_shader_memory_info& result)
+{
+	if (!ready || faulted || !mecStarted)
+		return B_DEV_NOT_READY;
+	result = {};
+	result.version = AMDGPU_HAIKU_ABI_VERSION;
+	result.size = sizeof(result);
+	result.vmid = 2;
+	// Caller holds the device mutex with all engines idle. Polaris register
+	// indices: AMD gfx_8_0_d.h and gmc_8_2_d.h; no indirect data or ACK reads.
+	result.selector_before = regs[0x391];
+	regs[0x391] = result.vmid << 4;
+	(void)regs[0x391];
+	result.sh_mem_config = regs[0x230d];
+	result.sh_mem_bases = regs[0x230a];
+	result.sh_mem_ape1_base = regs[0x230b];
+	result.sh_mem_ape1_limit = regs[0x230c];
+	regs[0x391] = result.selector_before;
+	result.selector_after = regs[0x391];
+	result.gds_base = regs[0x3304];
+	result.gds_size = regs[0x3305];
+	result.gws = regs[0x3322];
+	result.oa = regs[0x3332];
+	result.atc_ats_control = regs[0xcc9];
+	result.atc_ats_debug = regs[0xcca];
+	result.atc_vmid_pasid = regs[0xce9];
+	result.atc_l1_address_offset = regs[0xcdd];
+	for (uint32 aperture = 0; aperture < 2; aperture++) {
+		for (uint32 field = 0; field < 4; field++)
+			result.atc_aperture[aperture][field] = regs[0xcc0 + aperture + field * 2];
+	}
+	return B_OK;
+}
+
+status_t
 GfxEngine::RenderInfo(const amdgpu::AtomRenderInfo& rom, amdgpu_render_info& result)
 {
 	if (!ready || faulted || !mecStarted)
