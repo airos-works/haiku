@@ -46,7 +46,8 @@ enum {
 	AMDGPU_IRQ_INFO,
 	AMDGPU_RENDER_INFO,
 	AMDGPU_GFX_SUBMIT_COPY,
-	AMDGPU_GFX_QUEUE_COPY
+	AMDGPU_GFX_QUEUE_COPY,
+	AMDGPU_SHADER_MEMORY_INFO
 };
 
 // One GPU virtual address space per open client. Mappings retain their BO
@@ -180,6 +181,19 @@ struct amdgpu_render_info {
 	uint64 max_buffer_bytes, max_mapping_bytes, max_mapped_bytes;
 	uint32 max_mappings, max_vm_clients, page_size, max_ib_bytes;
 	uint32 ib_address_alignment, ib_size_alignment, max_buffers, reserved_out;
+};
+
+// Root-only, bounded diagnostic for the leased graphics VMID2. Requires an
+// already started engine and idle queues. No caller-selected register access
+// or translation changes; the SRBM bank selector is restored after reading.
+// Raw ATC configuration is evidence, not a claim that ATC accesses are safe.
+struct amdgpu_shader_memory_info {
+	uint32 version, size, flags, reserved;
+	uint32 vmid, selector_before, selector_after, reserved_out;
+	uint32 sh_mem_config, sh_mem_bases, sh_mem_ape1_base, sh_mem_ape1_limit;
+	uint32 gds_base, gds_size, gws, oa;
+	uint32 atc_ats_control, atc_ats_debug, atc_vmid_pasid, atc_l1_address_offset;
+	uint32 atc_aperture[2][4]; // low, high, access mode, VMID mask
 };
 
 // Read-only DCE 11.2 observation, available without starting any GPU engine.
