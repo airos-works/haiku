@@ -67,9 +67,10 @@ queued rendering suite passes. A kernel correction lets decode start while
 graphics is queued and still excludes it behind ordinary DMA; both directions
 have gated regression tests. Queued Summit HEVC 900/0 now passes after an
 initial 900/80 trial exposed the scheduling issue. Both three-minute queued
-playback trials are still in progress. Synchronous Mesa remains the default. Shader/resource isolation remains incomplete
+playback trials also pass 5,400 frames with zero drops. Final VM/DMA checks
+leave 44,699 healthy completions with no GPU errors. Synchronous Mesa remains the default. Shader/resource isolation remains incomplete
 and general submissions remain root-only. Driver `cb8672d6…` and private Mesa
-`82098de9…` are installed for qualification; `cefb183c…`/`afd206fa…`, prior `c579f1cd…`,
+`82098de9…` are installed with same-hash backups; `cefb183c…`/`afd206fa…`, prior `c579f1cd…`,
 `7d1cf6e5…`/`ee6210e5…` and older checkpoints are
 preserved. The original global media addon is restored after qualification.
 System Mesa defaults remain
