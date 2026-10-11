@@ -101,6 +101,10 @@ static UvdSession* sQuarantinedVideos;
 static amdgpu_recovery_info sRecovery;
 static bool sRecoveryAttempted;
 static AmdgpuClient* sClients;
+static bool sAutomaticRecovery = true, sAutomaticPending;
+static uint64 sAutomaticAttempts, sAutomaticSuccesses;
+static status_t sAutomaticStatus;
+static void MaybeRecoverAutomatically();
 static void ReleaseVM(AmdgpuClient* client);
 static void ReleaseVideo(AmdgpuClient* client);
 static void WaitGraphicsIdle();
@@ -113,7 +117,13 @@ static void
 SetFault(status_t status)
 {
 	if (status == B_OK) return;
-	if (sFault == B_OK) sFault = status;
+	if (sFault == B_OK) {
+		sFault = status;
+		sAutomaticPending = sAutomaticRecovery;
+		// One wake also handles a synchronous fault with no queued jobs. The
+		// worker waits for execution owners and drains canceled jobs first.
+		if (sAutomaticPending && sJobs >= 0) release_sem(sJobs);
+	}
 	for (AmdgpuClient* client = sClients; client != NULL; client = client->next) {
 		if (client->loss == B_OK) {
 			client->loss = sFault;
@@ -209,6 +219,7 @@ Executor(void*)
 		ObserveInterruptFault();
 		Job* job = sFirst;
 		if (job == NULL) {
+			MaybeRecoverAutomatically();
 			bool stop = sStopping;
 			mutex_unlock(&sMutex);
 			if (stop)
@@ -253,6 +264,7 @@ Executor(void*)
 		free(job->graphicsCommands);
 		free(job);
 		sCompleted.NotifyAll();
+		MaybeRecoverAutomatically();
 		mutex_unlock(&sMutex);
 	}
 	return B_OK;
@@ -1228,6 +1240,7 @@ RecoverGraphics(bool allowLive)
 	if (status == B_OK) status = ReclaimGraphicsQuarantine();
 	if (status == B_OK) {
 		sFault = B_OK;
+		sAutomaticPending = false;
 		sRecovery.generation++;
 		sRecovery.stage = 7;
 		sRecoveryAttempted = false;
@@ -1243,6 +1256,30 @@ RecoverGraphics(bool allowLive)
 	return status;
 }
 
+// Only the existing executor calls this, with sMutex held. The fault wake is
+// not a timer or an observation retry. Never consume a pending request while
+// accepted jobs or execution owners still hold the device.
+static void
+MaybeRecoverAutomatically()
+{
+	if (!sAutomaticPending || !sAutomaticRecovery || sStopping || sFault == B_OK
+		|| sPending != 0 || sGraphicsExecuting || sVideoExecuting)
+		return;
+	sAutomaticPending = false;
+	if (sVideoSessions != 0 || sEngine.faulted || sUvd.faulted
+		|| sQuarantinedVideos != NULL) {
+		sAutomaticStatus = B_NOT_SUPPORTED;
+		dprintf("amdgpu: automatic graphics recovery excludes video/other-engine ownership\n");
+		return;
+	}
+	sAutomaticAttempts++;
+	sAutomaticStatus = RecoverGraphics(true);
+	if (sAutomaticStatus == B_OK) sAutomaticSuccesses++;
+	dprintf("amdgpu: automatic recovery attempt %" B_PRIu64 " status %#" B_PRIx32
+		" successful %" B_PRIu64 "\n", sAutomaticAttempts, sAutomaticStatus,
+		sAutomaticSuccesses);
+}
+
 static status_t
 Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 {
@@ -1252,6 +1289,28 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 	if (client->team != team_get_current_team_id()
 		|| (client->flags & O_ACCMODE) != O_RDWR)
 		return B_NOT_ALLOWED;
+	if (op == AMDGPU_RECOVERY_POLICY) {
+		amdgpu_recovery_policy request;
+		status_t status = ReadRequest(request, data, length);
+		if (status != B_OK) return status;
+		if ((request.flags & ~AMDGPU_RECOVERY_SET_POLICY) || request.reserved
+			|| request.reserved_out || request.enabled > 1
+			|| (!request.flags && request.enabled)) return B_BAD_VALUE;
+		const bool update = request.flags & AMDGPU_RECOVERY_SET_POLICY;
+		if (update) {
+			if (sFault != B_OK || sRecoveryAttempted) return B_NOT_ALLOWED;
+			if (sPending || sGraphicsExecuting || sVideoExecuting) return B_BUSY;
+		}
+		request.flags = 0;
+		if (!update) request.enabled = sAutomaticRecovery;
+		request.pending = sAutomaticPending;
+		request.status = sAutomaticStatus;
+		request.attempts = sAutomaticAttempts;
+		request.successes = sAutomaticSuccesses;
+		status = user_memcpy(data, &request, sizeof(request));
+		if (status == B_OK && update) sAutomaticRecovery = request.enabled != 0;
+		return status;
+	}
 	if (op == AMDGPU_CLIENT_STATUS) {
 		amdgpu_client_status request;
 		status_t status = ReadRequest(request, data, length);

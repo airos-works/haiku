@@ -457,6 +457,72 @@ static void FaultQualification(int monitor, bool recover, bool live = false)
 		" fresh zeroed graphics/DMA reuse and exact reclamation");
 }
 
+static void AutomaticQualification(int monitor)
+{
+	auto policy = Request<amdgpu_recovery_policy>();
+	Require(ioctl(monitor, AMDGPU_RECOVERY_POLICY, &policy, sizeof(policy)) == 0
+		&& policy.enabled && !policy.pending, "default automatic recovery enabled");
+	auto prior = Recovery(monitor, AMDGPU_RECOVERY_INFO);
+	auto baselineMemory = Memory(monitor); auto baselineRam = Gart(monitor);
+	Client idle = Create(29), gate = Create(30), bad = Create(31);
+	int dma = Open(); auto dmaBuffer = DmaBuffer(dma);
+	DmaFill(dma, dmaBuffer, 1, 0x51510001); DmaWait(dma, 1, B_OK);
+	const uint64 readOnly = 0x400000000ULL;
+	auto m = Request<amdgpu_vm_mapping>(); m.handle = bad.output.handle;
+	m.address = readOnly; m.bytes = 4096; m.buffer_offset = 65536; m.permissions = AMDGPU_VM_READ;
+	Require(ioctl(bad.fd, AMDGPU_VM_MAP, &m, sizeof(m)) == 0, "owned automatic fault alias");
+	sGate = (volatile uint32*)(addr_t)gate.output.address;
+	Enqueue(gate, Commands(gate, 0, true));
+	Words fault = {0xc0033700, 0x100500, uint32(readOnly), uint32(readOnly >> 32), 0xdead5100};
+	fault.resize(256, 0x80000000); Enqueue(bad, fault);
+	DmaFill(dma, dmaBuffer, 2, 0xdead5102); DmaFill(dma, dmaBuffer, 3, 0xdead5103);
+	for (unsigned n = 1; n < 16; n++) Enqueue(bad, Commands(bad, n));
+	for (unsigned n = 1; n < 8; n++) Enqueue(gate, Commands(gate, n));
+	Require(Memory(monitor).pending_jobs == 26, "26 accepted mixed jobs behind owned gate");
+	auto set = Request<amdgpu_recovery_policy>(); set.flags = AMDGPU_RECOVERY_SET_POLICY; set.enabled = 0;
+	Require(ioctl(monitor, AMDGPU_RECOVERY_POLICY, &set, sizeof(set)) < 0 && errno == B_BUSY,
+		"automatic policy cannot change while accepted work is pending");
+	auto memory = Memory(monitor); auto ram = Gart(monitor);
+	ReleaseGate();
+	for (uint64 fence = 1; fence <= 16; fence++) DmaWait(bad.fd, fence, B_BAD_DATA);
+	DmaWait(gate.fd, 1, B_OK);
+	for (uint64 fence = 2; fence <= 8; fence++) DmaWait(gate.fd, fence, B_BAD_DATA);
+	DmaWait(dma, 1, B_OK); DmaWait(dma, 2, B_BAD_DATA); DmaWait(dma, 3, B_BAD_DATA);
+	// Observation only: this test never submits a recovery ioctl.
+	bigtime_t deadline = system_time() + 5000000;
+	auto recovered = Recovery(monitor, AMDGPU_RECOVERY_INFO);
+	while (recovered.generation == prior.generation && system_time() < deadline) {
+		snooze(1000); recovered = Recovery(monitor, AMDGPU_RECOVERY_INFO);
+	}
+	auto after = Request<amdgpu_recovery_policy>();
+	Require(ioctl(monitor, AMDGPU_RECOVERY_POLICY, &after, sizeof(after)) == 0
+		&& after.enabled && !after.pending && after.status == B_OK
+		&& after.attempts == policy.attempts + 1 && after.successes == policy.successes + 1
+		&& recovered.status == B_OK && recovered.stage == 7 && recovered.generation == prior.generation + 1,
+		"worker automatically resets once after every accepted job is terminal");
+	Require(recovered.live_handles == 4 && recovered.live_vms == 3 && !recovered.pending
+		&& !recovered.buffers && !recovered.vms && !recovered.reclaimed_ram && !recovered.reclaimed_vram
+		&& Memory(monitor).allocated_bytes == memory.allocated_bytes && Gart(monitor).allocated_bytes == ram.allocated_bytes
+		&& IRQ(monitor).completed_fences == 1, "automatic proof retains all live owners and allocations");
+	for (unsigned round = 0; round < 2; round++) {
+		Lost(gate.fd, prior.generation, true, 8, 2); Lost(bad.fd, prior.generation, true, 16, 1);
+		Lost(idle.fd, prior.generation, true, 0, 0); Lost(dma, prior.generation, true, 3, 2);
+		Pixels(gate, 1, true); Pixels(bad, 0); Pixels(idle, 0); DmaPixels(dmaBuffer, 0x51510001);
+		DmaWait(gate.fd, 1, B_OK); DmaWait(dma, 1, B_OK);
+		if (!round) {
+			Client fresh = Create(34); Enqueue(fresh, Commands(fresh, 0)); Wait(fresh); Pixels(fresh, 1); Close(fresh);
+		}
+	}
+	Close(gate); Close(bad); Close(idle); DmaFree(dma, dmaBuffer); close(dma);
+	Require(Memory(monitor).allocated_bytes == baselineMemory.allocated_bytes
+		&& Gart(monitor).allocated_bytes == baselineRam.allocated_bytes && IRQ(monitor).completed_fences == 2,
+		"automatic recovery permits fresh work and complete old owner reclamation");
+	printf("PASS: automatic mixed queue recovery generation %llu -> %llu, attempts/successes %llu/%llu;"
+		"25 canceled/failed fences, old success, innocent client loss, all guards, fresh rendering and exact cleanup\n",
+		(unsigned long long)prior.generation, (unsigned long long)recovered.generation,
+		(unsigned long long)after.attempts, (unsigned long long)after.successes);
+}
+
 int main(int argc, char** argv)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0); disable_debugger(1);
@@ -479,14 +545,18 @@ int main(int argc, char** argv)
 			"live recovery retains root gate"); close(fd);
 		puts("PASS: asynchronous graphics retains root restriction"); return 0;
 	}
+	bool automatic = argc == 2 && strcmp(argv[1], "--auto-recovery") == 0;
 	bool smoke = argc == 2 && strcmp(argv[1], "--smoke") == 0;
 	bool fault = argc == 2 && strcmp(argv[1], "--fault") == 0;
 	bool live = argc == 2 && strcmp(argv[1], "--live-recovery") == 0;
 	bool recover = live || (argc == 2 && strcmp(argv[1], "--fault-recovery") == 0);
-	Require((argc == 1 || smoke || fault || recover) && geteuid() == 0, "queue qualification requires root");
+	Require((argc == 1 || smoke || fault || recover || automatic) && geteuid() == 0, "queue qualification requires root");
 	int monitor = Open(); auto render = Request<amdgpu_render_info>();
 	Require(ioctl(monitor, AMDGPU_RENDER_INFO, &render, sizeof(render)) == 0
 		&& (render.capabilities & AMDGPU_RENDER_QUEUE_COPY), "queued graphics capability");
+	if (automatic) {
+		AutomaticQualification(monitor); AutomaticQualification(monitor); close(monitor); return 0;
+	}
 	if (fault || recover) { FaultQualification(monitor, recover, live); close(monitor); return 0; }
 	auto before = IRQ(monitor); auto memory = Memory(monitor); auto ram = Gart(monitor);
 	Client c[5]; for (unsigned i = 0; i < 5; i++) c[i] = Create(i + 1);
