@@ -198,20 +198,22 @@ int main(int argc, char** argv)
 		Run(c[0], AMDGPU_GDS_PROBE_FULL, 1, offset, 4096, seed, expected + offset / 4, false);
 	CheckAll(c[1], expected);
 	puts("PASS: seeded and independently read all 4096 GDS bytes across separate client VMs");
-	Run(c[0], AMDGPU_GDS_PROBE_SLICE, 0, 0, 4096, 0, expected + 256, false);
+	Run(c[0], AMDGPU_GDS_PROBE_SLICE, 0, 0, 256, 0, expected + 256, false);
 	for (uint32 i = 0; i < 64; i++) expected[256 + i] = Pattern(changed, i);
-	Run(c[0], AMDGPU_GDS_PROBE_SLICE, 1, 0, 4096, changed, expected + 256, false);
-	Run(c[1], AMDGPU_GDS_PROBE_SLICE, 2, 0, 4096, 0, expected + 256, false);
+	Run(c[0], AMDGPU_GDS_PROBE_SLICE, 1, 0, 256, changed, expected + 256, false);
+	Run(c[1], AMDGPU_GDS_PROBE_SLICE, 2, 0, 256, 0, expected + 256, false);
 	for (uint32 i = 0; i < 64; i++) expected[256 + i] += 0x101;
+	Run(c[1], AMDGPU_GDS_PROBE_FULL, 0, 0, (1024 << 16) | 256, 0, expected + 256, false);
 	CheckAll(c[0], expected);
 	puts("PASS: GDS slice base, write/read/atomic positive controls and full surrounding guards");
 	if (bounds) {
 		struct Case { int mode; uint32 offset, m0; };
 		const Case cases[] = {
-			{AMDGPU_GDS_PROBE_SLICE, 256, 4096},
-			{AMDGPU_GDS_PROBE_SLICE, 0, (256 << 16) | 4096},
+			{AMDGPU_GDS_PROBE_SLICE, 256, 256},
+			{AMDGPU_GDS_PROBE_SLICE, 0, 4096},
+			{AMDGPU_GDS_PROBE_SLICE, 0, (256 << 16) | 256},
 			{AMDGPU_GDS_PROBE_NONE, 0, 4096},
-			{-1, 0, 4096}, {-1, 0, (1024 << 16) | 4096}
+			{-1, 0, 4096}, {-1, 0, (1024 << 16) | 256}
 		};
 		uint32 zero[64] = {};
 		for (const auto& test : cases) {
