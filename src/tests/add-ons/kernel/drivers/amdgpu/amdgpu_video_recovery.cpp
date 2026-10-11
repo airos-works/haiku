@@ -95,7 +95,7 @@ static Decoder Create(bool hevc)
 		(unsigned long long)d.Handle(), (unsigned long long)d.Storage().vram, (unsigned long long)d.Storage().ram);
 	return d;
 }
-static void Decode(const Decoder& d, bool lost = false)
+static bool Decode(const Decoder& d, bool lost = false, bool racing = false)
 {
 	std::vector<uint8> pixels(d.Output(), 0x7b);
 	int status;
@@ -118,15 +118,17 @@ static void Decode(const Decoder& d, bool lost = false)
 		sequence = r.sequence; fence = r.fence; rptr = r.rptr; wptr = r.wptr;
 		guards = r.guard_mismatches; vm = r.vm_fault_status;
 	}
-	if (lost) {
-		Require(status == -1 && errno == B_DEV_NOT_READY && !sequence && !fence,
+	if (lost || (racing && status < 0)) {
+		Require(status == -1 && errno == B_DEV_NOT_READY && (racing || (!sequence && !fence)),
 			"lost decoder rejects a new submission");
 		for (uint8 byte : pixels) Require(byte == 0x7b, "lost decoder preserves every output sentinel");
+		return false;
 	} else {
 		Require(status == 0 && sequence && sequence == fence && rptr == wptr && !guards && !(vm & 0xff),
 			"video fence and all private guards");
 		Require(pixels == (d.hevc ? sHevcReference : sAvcReference), "every padded pixel equals independent reference");
 	}
+	return true;
 }
 static void Destroy(Decoder& d, bool lost)
 {
@@ -182,6 +184,72 @@ static std::vector<uint32> Commands(bool cp)
 	Require(amdgpu::ValidateGfx8Commands(w.data(), w.size()).error == amdgpu::GfxCommandValidation::OK,
 		"fault fixture passes command policy"); return w;
 }
+struct VideoThread {
+	const Decoder* decoder;
+	int createFD;
+	bool active;
+	int32 frames, done;
+};
+static int32 VideoWorker(void* data)
+{
+	auto& t = *(VideoThread*)data;
+	if (t.createFD >= 0) {
+		auto r = Request<amdgpu_hevc_create>(); r.config = sHevc->config;
+		Require(ioctl(t.createFD, AMDGPU_HEVC_CREATE, &r, sizeof(r)) < 0
+			&& errno == B_DEV_NOT_READY && !r.handle && !r.output_bytes && !r.allocated_bytes,
+			"waiting create cannot publish a session after its file is lost");
+	} else if (t.active) {
+		while (Decode(*t.decoder, false, true)) atomic_add(&t.frames, 1);
+	} else Decode(*t.decoder, true);
+	atomic_set(&t.done, 1); return B_OK;
+}
+static thread_id Start(VideoThread& t)
+{
+	thread_id id = spawn_thread(VideoWorker, "video reset owner", B_NORMAL_PRIORITY, &t);
+	Require(id >= 0 && resume_thread(id) == B_OK, "start video owner"); return id;
+}
+static void Join(thread_id id)
+{
+	status_t result; Require(wait_for_thread(id, &result) == B_OK && result == B_OK, "join video owner");
+}
+static void WaitBusy(int fd, VideoThread& t)
+{
+	bigtime_t deadline = system_time() + 500000;
+	for (;;) {
+		auto r = Request<amdgpu_video_destroy>(); // Invalid handle never destroys a session.
+		Require(ioctl(fd, AMDGPU_VIDEO_DESTROY, &r, sizeof(r)) < 0
+			&& (errno == B_BUSY || errno == B_BAD_VALUE), "probe video ownership");
+		if (errno == B_BUSY) return;
+		Require(!atomic_get(&t.done) && system_time() < deadline, "observe waiting/executing video owner");
+		snooze(50);
+	}
+}
+static void FaultWithWaiters(Graphics& c, Decoder& decoder)
+{
+	auto words = Commands(true); auto q = Request<amdgpu_gfx_queue>();
+	q.address = (addr_t)words.data(); q.dwords = words.size(); q.flags = AMDGPU_GFX_VALIDATE_COMMANDS;
+	Require(ioctl(c.fd, AMDGPU_GFX_QUEUE_COPY, &q, sizeof(q)) == 0, "queue graphics timeout before video waiters");
+	auto dma = Request<amdgpu_dma_submit>(); dma.operation = AMDGPU_DMA_FILL;
+	dma.destination = c.buffer.handle; dma.destination_offset = 4096; dma.bytes = 4; dma.value = 0xbad05100;
+	Require(ioctl(c.fd, AMDGPU_SUBMIT_DMA, &dma, sizeof(dma)) == 0, "queue cancellable DMA before video waiters");
+	VideoThread decode = {&decoder, -1, false, 0, 0}, create = {NULL, Open(), false, 0, 0};
+	thread_id a = Start(decode), b = Start(create);
+	WaitBusy(decoder.fd, decode); WaitBusy(create.createFD, create);
+	auto pending = Info<amdgpu_recovery_info>(c.fd, AMDGPU_RECOVERY_INFO);
+	Require(pending.status == B_OK && pending.pending == 2 && pending.live_videos == 5,
+		"both video waiters entered before the fault, including partial create ownership");
+	Join(a); Join(b);
+	for (uint64 fence : {q.fence, dma.fence}) {
+		auto wait = Request<amdgpu_fence_wait>(); wait.fence = fence; wait.timeout_us = 5000000;
+		Require(ioctl(c.fd, AMDGPU_WAIT_FENCE, &wait, sizeof(wait)) == 0
+			&& wait.status == B_TIMED_OUT, "terminal graphics and canceled DMA fences");
+	}
+	auto state = Info<amdgpu_client_status>(create.createFD, AMDGPU_CLIENT_STATUS);
+	Require(state.flags == (AMDGPU_CLIENT_LOST | AMDGPU_CLIENT_RESET_COMPLETED)
+		&& state.device_status == B_OK, "waiting create file remains lost after worker recovery");
+	Require(close(create.createFD) == 0, "close failed create file");
+	puts("PASS: decode/create waiters rejected after reset; partial session cleaned; queued DMA canceled");
+}
 int main(int argc, char** argv)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0); Commands(false); Commands(true);
@@ -191,9 +259,14 @@ int main(int argc, char** argv)
 		puts("PASS: video recovery command policy and no-device handling"); return 0;
 	}
 	Require(argc == 5 && geteuid() == 0,
-		"usage: amdgpu_video_recovery --baseline|--auto-cp|--manual-fault avc.nv12 hevc.au hevc.padded");
-	bool baseline = strcmp(argv[1], "--baseline") == 0, automatic = strcmp(argv[1], "--auto-cp") == 0;
-	Require(baseline || automatic || strcmp(argv[1], "--manual-fault") == 0, "explicit recovery mode");
+		"usage: amdgpu_video_recovery --baseline|--auto-cp|--auto-waiters|--auto-decode|--auto-hevc-decode|--manual-fault|--recover-closed avc.nv12 hevc.au hevc.padded");
+	bool baseline = strcmp(argv[1], "--baseline") == 0;
+	bool recoverClosed = strcmp(argv[1], "--recover-closed") == 0;
+	bool waiters = strcmp(argv[1], "--auto-waiters") == 0;
+	bool activeHevc = strcmp(argv[1], "--auto-hevc-decode") == 0;
+	bool active = activeHevc || strcmp(argv[1], "--auto-decode") == 0;
+	bool automatic = waiters || active || strcmp(argv[1], "--auto-cp") == 0;
+	Require(baseline || automatic || recoverClosed || strcmp(argv[1], "--manual-fault") == 0, "explicit recovery mode");
 	sAvcReference = Read(argv[2]); sHevcReference = Read(argv[4]);
 	auto au = Read(argv[3]); Require(au.size() >= 4, "HEVC access unit header");
 	uint32 bytes = au[0] | uint32(au[1]) << 8 | uint32(au[2]) << 16 | uint32(au[3]) << 24;
@@ -203,6 +276,26 @@ int main(int argc, char** argv)
 		&& sHevc->picture.nal_type >= 16 && sHevc->picture.nal_type <= 20,
 		"independently repeatable first HEVC random access picture");
 	int monitor = Open(); auto start = Info<amdgpu_recovery_info>(monitor, AMDGPU_RECOVERY_INFO);
+	if (recoverClosed) {
+		Require(start.status != B_OK && !start.live_handles && !start.live_vms && !start.live_videos
+			&& !start.pending && start.videos && start.buffers && start.vms && !Policy(monitor).enabled,
+			"explicit recovery requires only closed quarantined owners and disabled automatic policy");
+		Memory retained = Allocation(monitor);
+		auto recovered = Info<amdgpu_recovery_info>(monitor, AMDGPU_GFX_RECOVER);
+		Require(recovered.status == B_OK && recovered.stage == 7 && recovered.generation == start.generation + 1
+			&& !recovered.videos && !recovered.buffers && !recovered.vms
+			&& recovered.reclaimed_vram == start.quarantined_vram && recovered.reclaimed_ram == start.quarantined_ram,
+			"one closed-resource reset retires firmware sessions and exact quarantine");
+		Memory empty = {retained.vram - start.quarantined_vram, retained.ram - start.quarantined_ram};
+		CheckAllocation(monitor, empty);
+		Graphics fresh = GraphicsCreate(true); GraphicsControl(fresh); GraphicsClose(fresh);
+		Decoder a = Create(false), b = Create(true); Decode(a); Decode(b); Destroy(a, false); Destroy(b, false);
+		CheckAllocation(monitor, empty); Policy(monitor, 1);
+		printf("PASS: explicit closed-video recovery generation %llu reclaimed %llu/%llu, fresh exact video/graphics\n",
+			(unsigned long long)recovered.generation, (unsigned long long)recovered.reclaimed_vram,
+			(unsigned long long)recovered.reclaimed_ram);
+		close(monitor); delete sHevc; return 0;
+	}
 	Require(start.status == B_OK && !start.pending && !start.live_handles && !start.live_vms && !start.live_videos
 		&& !start.buffers && !start.vms && !start.videos, "idle clean device baseline");
 	Memory empty = Allocation(monitor); auto policy = Policy(monitor);
@@ -219,14 +312,27 @@ int main(int argc, char** argv)
 	Memory all = graphicsOnly;
 	for (auto& decoder : d) { Decode(decoder); all.vram += decoder.Storage().vram; all.ram += decoder.Storage().ram; }
 	CheckAllocation(monitor, all);
+	uint32 racingFrames = 0;
 	if (!baseline) {
-		auto commands = Commands(automatic); auto submit = Request<amdgpu_gfx_submit>();
-		submit.address = (addr_t)commands.data(); submit.dwords = commands.size(); submit.flags = AMDGPU_GFX_VALIDATE_COMMANDS;
-		Require(ioctl(graphics.fd, AMDGPU_GFX_SUBMIT_COPY, &submit, sizeof(submit)) == 0
-			&& submit.status == (automatic ? B_TIMED_OUT : B_BAD_DATA) && !submit.completion,
-			"one terminal graphics fault with four live decoder sessions");
-		printf("Fault status %#x VM %#x/%#x ring %u/%u\n", (unsigned)submit.status,
-			submit.vm_fault_status[0], submit.vm_fault_status[1], submit.rptr, submit.wptr);
+		if (waiters) FaultWithWaiters(graphics, d[0]);
+		else {
+			VideoThread running = {&d[activeHevc ? 1 : 0], -1, true, 0, 0}; thread_id worker = -1;
+			if (active) { worker = Start(running); WaitBusy(running.decoder->fd, running); }
+			auto commands = Commands(automatic); auto submit = Request<amdgpu_gfx_submit>();
+			submit.address = (addr_t)commands.data(); submit.dwords = commands.size(); submit.flags = AMDGPU_GFX_VALIDATE_COMMANDS;
+			Require(ioctl(graphics.fd, AMDGPU_GFX_SUBMIT_COPY, &submit, sizeof(submit)) == 0
+				&& submit.status == (automatic ? B_TIMED_OUT : B_BAD_DATA)
+				&& (automatic ? !submit.completion && !submit.vm_fault_status[0] && !submit.vm_fault_status[1]
+					: ((submit.vm_fault_status[0] | submit.vm_fault_status[1]) & 0xff) == 0x10),
+				"one terminal graphics fault with four live decoder sessions");
+			printf("Fault status %#x VM %#x/%#x ring %u/%u\n", (unsigned)submit.status,
+				submit.vm_fault_status[0], submit.vm_fault_status[1], submit.rptr, submit.wptr);
+			if (active) {
+				Join(worker); racingFrames = atomic_get(&running.frames);
+				Require(racingFrames > 0, "exact frames decoded concurrently with non-retiring graphics");
+				printf("PASS: %u exact concurrent frames before permanent decoder loss\n", racingFrames);
+			}
+		}
 		Memory reclaim = {};
 		if (!automatic) {
 			for (uint32 i = 2; i < 4; i++) {
@@ -281,7 +387,7 @@ int main(int argc, char** argv)
 	auto final = Info<amdgpu_recovery_info>(monitor, AMDGPU_RECOVERY_INFO);
 	Require(final.status == B_OK && !final.live_handles && !final.live_vms && !final.live_videos
 		&& !final.pending && !final.buffers && !final.vms && !final.videos, "no leaked owners or quarantine");
-	printf("PASS: %s, 20 exact decoded frames, 16 recreated sessions, generation %llu, healthy fences %llu\n",
-		argv[1], (unsigned long long)final.generation, (unsigned long long)irq.completed_fences);
+	printf("PASS: %s, %u exact decoded frames, 16 recreated sessions, generation %llu, healthy fences %llu\n",
+		argv[1], 20 + racingFrames, (unsigned long long)final.generation, (unsigned long long)irq.completed_fences);
 	close(monitor); delete sHevc; return 0;
 }
