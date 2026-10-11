@@ -10,6 +10,7 @@
 #include "ac_monitor.h"
 #include "lid_monitor.h"
 #include "power_button_monitor.h"
+#include "thermal_trip_monitor.h"
 
 #include <Server.h>
 
@@ -25,7 +26,7 @@ private:
 	static	status_t			_EventLooper(void *arg);
 
 			thread_id			fEventThread;
-			PowerMonitor*		fPowerMonitors[3];
+			PowerMonitor*		fPowerMonitors[4];
 			uint32				fMonitorCount;
 
 			bool				fQuitRequested;
@@ -65,6 +66,12 @@ PowerManagementDaemon::PowerManagementDaemon()
 		fPowerMonitors[fMonitorCount++] = acMonitor;
 	else
 		delete acMonitor;
+
+	PowerMonitor* thermalMonitor = new ThermalTripMonitor;
+	if (thermalMonitor->FDs().size() > 0)
+		fPowerMonitors[fMonitorCount++] = thermalMonitor;
+	else
+		delete thermalMonitor;
 
 	fEventThread = spawn_thread(_EventLooper, "_power_daemon_event_loop_",
 		B_NORMAL_PRIORITY, this);
