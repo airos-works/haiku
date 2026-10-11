@@ -23,3 +23,10 @@ SimpleTest hevc_packet_test : hevc_packet_test.cpp HevcPacket.cpp HevcStream.cpp
 	: [ TargetLibstdc++ ] ;
 SimpleTest hevc_output_test : hevc_output_test.cpp HevcOutput.cpp H264Output.cpp
 	: [ TargetLibstdc++ ] ;
+
+# Test-only add-on: the real decoders with an owned, root-only GPU timeout
+# inserted at a selected decode. Never install this as the default add-on.
+Addon amduvd_recovery_test : recovery_plugin.cpp recovery_hevc.cpp recovery_ioctl.cpp
+	H264Stream.cpp H264Packet.cpp H264Output.cpp h264_parse.c
+	HevcStream.cpp HevcPacket.cpp HevcOutput.cpp hevc_parse.c
+	: be media [ TargetLibsupc++ ] [ TargetLibstdc++ ] ;
