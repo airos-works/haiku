@@ -52,6 +52,7 @@
 
 // Haiku-only
 #define PVR_HAIKU_NR_MAP_BO			0xe0	// struct pvr_haiku_map_bo
+#define PVR_HAIKU_NR_IMPORT_HOST	0xe1	// struct pvr_haiku_import_host
 #define PVR_HAIKU_NR_STAGE			0xef	// struct pvr_haiku_stage
 
 #define PVR_HAIKU_ABI_VERSION		3
@@ -62,12 +63,42 @@
 	(the GPU is not cache coherent). With address 0 the clone goes anywhere,
 	otherwise exactly there (B_EXACT_ADDRESS, for placed maps). Only buffers
 	created with DRM_PVR_BO_ALLOW_CPU_USERSPACE_ACCESS can be mapped. Unmap
-	with delete_area(area). */
+	with delete_area(area).
+
+	With PVR_HAIKU_MAP_BO_CACHED the clone is cached (write-back) instead,
+	for fast CPU reads of what the GPU wrote; the caller keeps it coherent
+	itself: "dc cvac" over what the CPU wrote before the GPU reads it, "dc
+	civac" over what it will read after the GPU wrote it (both allowed in
+	userland). A caller that passes the old, shorter structure gets a
+	write-combined clone. */
+#define PVR_HAIKU_MAP_BO_CACHED		0x1u
+
 struct pvr_haiku_map_bo {
 	uint32	handle;					// in: buffer handle
 	int32	area;					// out: the clone's area
 	uint64	address;				// in: placement or 0; out: address
 	uint64	size;					// out
+	uint32	flags;					// in: PVR_HAIKU_MAP_BO_*
+	uint32	reserved;
+};
+
+
+/*	PVR_HAIKU_OP(PVR_HAIKU_NR_IMPORT_HOST) makes a buffer object of the
+	caller's own memory (VK_EXT_external_memory_host), such as another
+	team's bitmap area cloned into it: [address, address + size) must be
+	page aligned and lie within one area the caller can read and write.
+	The pages stay locked, and the memory alive, until the handle is
+	closed (GEM_CLOSE) and the GPU is done with it. The object cannot be
+	mapped with MAP_BO; the caller already has it, cached as it is, and
+	keeps it coherent as described for PVR_HAIKU_MAP_BO_CACHED. Only
+	DRM_PVR_BO_BYPASS_DEVICE_CACHE is allowed in flags. Drivers without it
+	answer B_DEV_INVALID_IOCTL. */
+struct pvr_haiku_import_host {
+	uint64	address;				// in
+	uint64	size;					// in
+	uint64	flags;					// in: DRM_PVR_BO_*
+	uint32	handle;					// out: buffer handle
+	uint32	reserved;
 };
 
 
@@ -83,8 +114,11 @@ enum {
 enum {
 	PVR_HAIKU_STAGE_QUERY = 0,		// report only
 	PVR_HAIKU_STAGE_HEALTH_CHECK,	// send a HEALTH_CHECK first (root)
-	PVR_HAIKU_STAGE_DUMP			// log registers, firmware state and
+	PVR_HAIKU_STAGE_DUMP,			// log registers, firmware state and
 									// trace to the syslog first (root)
+	PVR_HAIKU_STAGE_RESET,			// hard reset the GPU first (root)
+	PVR_HAIKU_STAGE_JOB_TIMEOUT		// set job_timeout_ms first, for the
+									// queues created from then on (root)
 };
 
 /*	PVR_HAIKU_OP(PVR_HAIKU_NR_STAGE): in: version and command; out: the
@@ -114,7 +148,13 @@ struct pvr_haiku_stage {
 	uint32	irq_spurious;			// GPU interrupts without one
 	uint32	mips_exception_status;	// ROGUE_CR_MIPS_EXCEPTION_STATUS
 	uint32	fw_faults;				// SYSDATA fw_faults
-	uint64	reserved[4];
+	uint32	resets;					// GPU resets that brought it back
+	uint32	device_lost;			// 1 once the GPU is given up
+	uint32	job_timeout_ms;			// in (JOB_TIMEOUT), out: a job queue
+									// with no job finishing that long has
+									// the GPU reset; 0 in: the default
+	uint32	reserved32;
+	uint64	reserved[2];
 };
 
 

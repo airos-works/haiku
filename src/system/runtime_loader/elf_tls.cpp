@@ -293,6 +293,13 @@ DynamicThreadVector::_ResizeVector(unsigned minimumSize)
 		fGeneration = new Generation;
 		if (fGeneration == NULL)
 			return B_NO_MEMORY;
+
+		// A new vector holds no blocks, so none of them can be stale: it is
+		// as current as the templates. Starting at 0 made the thread's next
+		// access destroy the blocks of every DSO registered after the first
+		// unload, including the one just created, and lose what was written
+		// to it in between.
+		fGeneration->SetCounter(TLSBlockTemplates::Get().GetGeneration(-1));
 	}
 
 	*(Generation**)*fVector = fGeneration;

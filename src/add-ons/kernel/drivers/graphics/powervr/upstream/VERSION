@@ -56,4 +56,4 @@ Files (67 + uapi/drm/pvr_drm.h):
     pvr_device.h pvr_drv.h pvr_fw_meta.h pvr_mmu.h pvr_power.h pvr_stream.h
     pvr_vm.h
 
-Local changes: see README (one, in pvr_fw.c).
+Local changes: see README (two: pvr_fw.c, pvr_mmu.c).

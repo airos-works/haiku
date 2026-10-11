@@ -13,9 +13,14 @@
 //      returns rows, is covered if and only if x + y <= 63.
 // It prints the EGL and GL strings first, so the renderer is known before
 // anything is drawn ("zink Vulkan 1.x(PowerVR ...)" on the GPU).
-//   pvr_glprobe [--expect TEXT] [--ppm FILE]
+//   pvr_glprobe [--expect TEXT] [--ppm FILE] [--repeat N]
 // --expect fails the run unless GL_RENDERER contains TEXT (e.g. "zink" or
-// "softpipe"); --ppm writes the triangle image (RGB, top row first).
+// "softpipe"); --ppm writes the triangle image (RGB, top row first);
+// --repeat does all of it N times in one process, eglTerminate() included.
+// Zink unloads the Vulkan driver with its screen and loads it again for the
+// next, which is what made Summit's WebProcess crash on air/OS: a library
+// with thread-local storage unloaded, then zink's new cache thread lost its
+// first TLS write (see tls_generation_check.c).
 
 
 #include <stdio.h>
@@ -139,31 +144,16 @@ write_ppm(const char* path, const uint8_t* pixels)
 }
 
 
-int
-main(int argc, char** argv)
+// One run: EGL up, the checks, EGL down. Returns whether everything passed.
+static int
+probe(const char* expect, const char* ppmPath)
 {
-	// line by line: whatever was printed survives a crash in the driver
-	setvbuf(stdout, NULL, _IOLBF, 0);
-
-	const char* expect = NULL;
-	const char* ppmPath = NULL;
-	for (int i = 1; i < argc; i++) {
-		if (strcmp(argv[i], "--expect") == 0 && i + 1 < argc)
-			expect = argv[++i];
-		else if (strcmp(argv[i], "--ppm") == 0 && i + 1 < argc)
-			ppmPath = argv[++i];
-		else {
-			printf("usage: %s [--expect TEXT] [--ppm FILE]\n", argv[0]);
-			return 2;
-		}
-	}
-
 	double start = now_ms();
 	EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
 	EGLint major = 0, minor = 0;
 	if (!check(display != EGL_NO_DISPLAY
 			&& eglInitialize(display, &major, &minor), "eglInitialize"))
-		return 1;
+		return 0;
 	printf("eglInitialize: %.1f ms\n", now_ms() - start);
 	printf("EGL %d.%d, vendor %s, version %s, client APIs %s\n", major, minor,
 		eglQueryString(display, EGL_VENDOR),
@@ -181,7 +171,7 @@ main(int argc, char** argv)
 	EGLint count = 0;
 	if (!check(eglChooseConfig(display, configAttributes, &config, 1, &count)
 			&& count == 1, "eglChooseConfig (pbuffer, ES2, RGBA8888)"))
-		return 1;
+		return 0;
 	EGLint alphaBits = 0;
 	eglGetConfigAttrib(display, config, EGL_ALPHA_SIZE, &alphaBits);
 
@@ -200,7 +190,7 @@ main(int argc, char** argv)
 	if (!check(surface != EGL_NO_SURFACE && context != EGL_NO_CONTEXT
 			&& eglMakeCurrent(display, surface, surface, context),
 			"pbuffer, ES2 context, eglMakeCurrent"))
-		return 1;
+		return 0;
 	printf("context: %.1f ms\n", now_ms() - start);
 
 	const char* renderer = (const char*)glGetString(GL_RENDERER);
@@ -247,7 +237,7 @@ main(int argc, char** argv)
 	GLint linked = 0;
 	glGetProgramiv(program, GL_LINK_STATUS, &linked);
 	if (!check(linked, "program linked"))
-		return 1;
+		return 0;
 	glUseProgram(program);
 	printf("program: %.2f ms\n", now_ms() - start);
 
@@ -282,7 +272,42 @@ main(int argc, char** argv)
 	eglDestroyContext(display, context);
 	eglDestroySurface(display, surface);
 	eglTerminate(display);
+	return ok;
+}
 
+
+int
+main(int argc, char** argv)
+{
+	// line by line: whatever was printed survives a crash in the driver
+	setvbuf(stdout, NULL, _IOLBF, 0);
+
+	const char* expect = NULL;
+	const char* ppmPath = NULL;
+	int repeat = 1;
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--expect") == 0 && i + 1 < argc)
+			expect = argv[++i];
+		else if (strcmp(argv[i], "--ppm") == 0 && i + 1 < argc)
+			ppmPath = argv[++i];
+		else if (strcmp(argv[i], "--repeat") == 0 && i + 1 < argc)
+			repeat = atoi(argv[++i]);
+		else {
+			printf("usage: %s [--expect TEXT] [--ppm FILE] [--repeat N]\n",
+				argv[0]);
+			return 2;
+		}
+	}
+	if (repeat < 1)
+		repeat = 1;
+
+	int ok = 1;
+	for (int run = 0; run < repeat; run++) {
+		if (repeat > 1)
+			printf("== run %d of %d\n", run + 1, repeat);
+		if (!probe(expect, ppmPath))
+			ok = 0;
+	}
 	printf("%s\n", ok ? "PASS" : "FAIL");
 	return ok ? 0 : 1;
 }

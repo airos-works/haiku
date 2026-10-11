@@ -3,9 +3,10 @@ Linux's drm/imagination in the powervr driver
 
 The files here are copies of Linux's drm/imagination (VERSION says which
 commit), used under the MIT licence of their "GPL-2.0-only OR MIT" dual
-licence. They are compiled as GNU C, unchanged but for the one change below,
-against compat/linux_compat.h: every <linux/...>, <drm/...> and <asm/...>
-header they include is a one-line stub in compat/ that includes it.
+licence. They are compiled as GNU C, unchanged but for the two changes
+below, against compat/linux_compat.h: every <linux/...>, <drm/...> and
+<asm/...> header they include is a one-line stub in compat/ that includes
+it.
 
 Where Linux's DRM core and the files built on it would be, glue/ has
 native code with the same interfaces:
@@ -23,14 +24,20 @@ native code with the same interfaces:
   glue/pvr_haiku_vm.c     GPU VM contexts on pvr_mmu.c's page tables
                           (replaces pvr_vm.c, which is built on drm_gpuvm)
   glue/pvr_haiku_*.c      the device (pvr_device.c, pvr_drv.c's probe),
-                          buffers (pvr_gem.c), power-off and device-lost
-                          (pvr_power.c), and stubs for what this GPU never
-                          reaches (META and RISC-V firmware processors)
+                          buffers (pvr_gem.c), power-off, soft and hard
+                          resets and device-lost (pvr_power.c), and stubs
+                          for what this GPU never reaches (META and RISC-V
+                          firmware processors)
   glue/pvr_haiku_glue.h   the C interface PvrDevice.cpp and driver.cpp use
 
 compat/linux_compat_sched.c has the DRM core pvr_job.c, pvr_queue.c and
 pvr_sync.c are built on: work queues, reservation objects, drm_exec and a
 GPU scheduler with drm_sched's rules (linux_compat_sched.h says which).
+Its timeout differs from Linux on purpose: when no job of a queue finishes
+for SCHED_TIMEOUT_PERIOD, glue/pvr_haiku_power.c hard-resets the GPU
+(pvr_power_reset()) instead of calling pvr_queue_timedout_job(), which
+leaves recovery to the firmware; the firmware ends jobs that overrun its
+own context deadline first. pvrinfo --job-timeout shortens it for tests.
 compat's spinlock_t is a Haiku mutex, so what Linux does under a spinlock
 (signaling fences, freeing) works with interrupts on.
 
@@ -57,10 +64,26 @@ puts the GPU into soft reset. Three lines, marked "Haiku":
 	 		goto err_fw_stop;
 
 
+pvr_mmu.c, pvr_mmu_op_context_create(): the number of level 0 tables to
+preallocate for a mapping was the difference of two indices within one
+level 1 table, so a mapping that crosses a 1 GiB boundary got a negative
+count, which as a u32 had the loop allocate page tables until memory ran
+out (WebKit's WebGL did it: 400000 page tables, then ENOMEM). The count
+is taken across tables; marked "Haiku":
+
+	-		const u32 l0_start_idx = pvr_page_table_l1_idx(start_addr);
+	-		const u32 l0_end_idx = pvr_page_table_l1_idx(start_addr + size);
+	-		const u32 l0_count = l0_end_idx - l0_start_idx + 1;
+	+		const u32 l0_count = (u32)(((start_addr + size) >>
+	+					    ROGUE_MMUCTRL_VADDR_PD_INDEX_SHIFT) -
+	+					   (start_addr >>
+	+					    ROGUE_MMUCTRL_VADDR_PD_INDEX_SHIFT)) + 1;
+
+
 Updating
 --------
 
 Copy the same files from a newer Linux commit, update VERSION, re-apply
-the change above, build. New Linux APIs show up as compile errors and go
+the changes above, build. New Linux APIs show up as compile errors and go
 into compat/linux_compat.h; new calls into the glue as link errors (the
 kernel refuses an add-on with undefined symbols, so check with nm -D).

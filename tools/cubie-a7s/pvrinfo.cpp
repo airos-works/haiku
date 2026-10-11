@@ -9,6 +9,11 @@
 		pvrinfo --health	send the firmware a HEALTH_CHECK first (root)
 		pvrinfo --dump		have the driver log its registers, the firmware's
 							state and trace to the syslog first (root)
+		pvrinfo --reset		hard reset the GPU first (root)
+		pvrinfo --job-timeout MS
+							reset the GPU when a job queue created from then
+							on goes MS without a job finishing; 0: the
+							default (root)
 */
 
 
@@ -44,13 +49,20 @@ int
 main(int argc, char** argv)
 {
 	uint32 command = PVR_HAIKU_STAGE_QUERY;
+	uint32 jobTimeout = 0;
 	if (argc > 1) {
 		if (strcmp(argv[1], "--health") == 0)
 			command = PVR_HAIKU_STAGE_HEALTH_CHECK;
 		else if (strcmp(argv[1], "--dump") == 0)
 			command = PVR_HAIKU_STAGE_DUMP;
-		else {
-			fprintf(stderr, "usage: %s [--health | --dump]\n", argv[0]);
+		else if (strcmp(argv[1], "--reset") == 0)
+			command = PVR_HAIKU_STAGE_RESET;
+		else if (strcmp(argv[1], "--job-timeout") == 0 && argc > 2) {
+			command = PVR_HAIKU_STAGE_JOB_TIMEOUT;
+			jobTimeout = (uint32)strtoul(argv[2], NULL, 0);
+		} else {
+			fprintf(stderr, "usage: %s [--health | --dump | --reset"
+				" | --job-timeout MS]\n", argv[0]);
 			return 2;
 		}
 	}
@@ -67,6 +79,7 @@ main(int argc, char** argv)
 	pvr_haiku_stage stage = {};
 	stage.version = PVR_HAIKU_ABI_VERSION;
 	stage.command = command;
+	stage.job_timeout_ms = jobTimeout;
 	if (ioctl(fd, PVR_HAIKU_OP(PVR_HAIKU_NR_STAGE), &stage, sizeof(stage))
 			!= 0) {
 		fprintf(stderr, "STAGE: %s\n", strerror(errno));
@@ -84,6 +97,10 @@ main(int argc, char** argv)
 	printf("core clock:         %u MHz\n",
 		(unsigned)(stage.core_clock / 1000000));
 	printf("firmware stage:     %s\n", strerror(stage.firmware_status));
+	if (stage.job_timeout_ms != 0)
+		printf("job timeout:        %u ms\n", (unsigned)stage.job_timeout_ms);
+	else
+		printf("job timeout:        the default\n");
 	if (stage.fw_version_major == 0)
 		return 0;
 	printf("firmware:           %u.%u build %u, %s\n",
@@ -100,5 +117,7 @@ main(int argc, char** argv)
 		(unsigned)stage.irq_count, (unsigned)stage.irq_spurious);
 	printf("MIPS exceptions:    %#x\n", (unsigned)stage.mips_exception_status);
 	printf("firmware faults:    %u\n", (unsigned)stage.fw_faults);
+	printf("GPU resets:         %u%s\n", (unsigned)stage.resets,
+		stage.device_lost ? ", device lost" : "");
 	return 0;
 }

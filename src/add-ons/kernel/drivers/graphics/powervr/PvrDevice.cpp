@@ -80,14 +80,15 @@ PvrDevice::~PvrDevice()
 		fw_trace_mask 0x2			firmware log groups (ROGUE_FWIF_LOG_TYPE_
 									GROUP_*), 0 for none
 		fw_trace_lines 64			firmware trace lines logged at most
-		trace_registers false		do not log the registers of the start
+		trace_registers true		log the register accesses of the start
+									(off by default)
 		vendor_secure_config true	Allwinner's SMC/GPU_GLB writes before the
 									start (see DESIGN R7)
 */
 void
 PvrDevice::_ReadSettings()
 {
-	fOptions.trace_registers = true;
+	fOptions.trace_registers = false;
 	fOptions.trace_lines = kDefaultTraceLines;
 
 	void* handle = load_driver_settings("powervr");
@@ -100,7 +101,7 @@ PvrDevice::_ReadSettings()
 	fFirmwareEnabled = get_driver_boolean_parameter(handle, "firmware", false,
 		true);
 	fOptions.trace_registers = get_driver_boolean_parameter(handle,
-		"trace_registers", true, true);
+		"trace_registers", false, true);
 	fOptions.vendor_secure_config = get_driver_boolean_parameter(handle,
 		"vendor_secure_config", false, true);
 	const char* value = get_driver_parameter(handle, "fw_trace_mask", NULL,
@@ -312,13 +313,16 @@ PvrDevice::_InterruptThread(void* data)
 //	#pragma mark - STAGE
 
 
-/*!	The device for the DRM files of the opens, while the firmware runs,
-	otherwise NULL (only STAGE then).
+/*!	The device for the DRM files of new opens, while the firmware runs and
+	the GPU is not lost, otherwise NULL (only STAGE then, and Mesa finds no
+	GPU).
 */
 struct pvr_device*
 PvrDevice::Device() const
 {
-	return fStage == PVR_HAIKU_STAGE_FIRMWARE ? fDevice : NULL;
+	if (fStage != PVR_HAIKU_STAGE_FIRMWARE || pvr_haiku_device_lost(fDevice))
+		return NULL;
+	return fDevice;
 }
 
 
@@ -336,6 +340,12 @@ PvrDevice::Stage(pvr_haiku_stage& stage)
 			pvr_haiku_health_check(fDevice);
 		else if (stage.command == PVR_HAIKU_STAGE_DUMP)
 			pvr_haiku_dump(fDevice, "asked for", fOptions.trace_lines);
+		else if (stage.command == PVR_HAIKU_STAGE_RESET) {
+			if (fStage != PVR_HAIKU_STAGE_FIRMWARE)
+				return B_NO_INIT;
+			pvr_haiku_reset(fDevice);
+		} else if (stage.command == PVR_HAIKU_STAGE_JOB_TIMEOUT)
+			pvr_haiku_set_job_timeout(stage.job_timeout_ms);
 		else
 			return B_BAD_VALUE;
 	}
@@ -349,6 +359,7 @@ PvrDevice::Stage(pvr_haiku_stage& stage)
 	stage.bvnc = fBvnc;
 	stage.core_clock = fCoreClock;
 	stage.firmware_status = B_NO_INIT;
+	stage.job_timeout_ms = pvr_haiku_job_timeout();
 	if (fDevice == NULL)
 		return B_OK;
 
@@ -368,6 +379,8 @@ PvrDevice::Stage(pvr_haiku_stage& stage)
 	stage.irq_spurious = state.irq_spurious;
 	stage.mips_exception_status = state.mips_exception_status;
 	stage.fw_faults = state.fw_faults;
+	stage.resets = state.resets;
+	stage.device_lost = state.lost ? 1 : 0;
 	return B_OK;
 }
 

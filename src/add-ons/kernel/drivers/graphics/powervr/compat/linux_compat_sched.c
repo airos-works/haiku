@@ -36,6 +36,7 @@ struct workqueue_struct {
 	char				name[B_OS_NAME_LENGTH];
 	spinlock_t			lock;
 	struct list_head	pending;
+	struct list_head	timers;		/* armed delayed work */
 	struct work_struct*	running;	/* compared only, never followed */
 	wait_queue_head_t	wake;		/* new work, or an item done */
 	thread_id			thread;
@@ -52,13 +53,29 @@ workqueue_thread(void* data)
 		int32 generation = lx_wait_queue_generation(&queue->wake);
 
 		spin_lock(&queue->lock);
+
+		// delayed work whose time has come joins the queue
+		bigtime_t now = system_time();
+		bigtime_t next = B_INFINITE_TIMEOUT;
+		struct delayed_work* timer;
+		struct delayed_work* nextTimer;
+		list_for_each_entry_safe(timer, nextTimer, &queue->timers, timer) {
+			if (timer->when <= now) {
+				list_del_init(&timer->timer);
+				if (timer->work.queue == NULL) {
+					timer->work.queue = queue;
+					list_add_tail(&timer->work.entry, &queue->pending);
+				}
+			} else if (timer->when < next)
+				next = timer->when;
+		}
+
 		if (list_empty(&queue->pending)) {
 			bool quit = queue->quit;
 			spin_unlock(&queue->lock);
 			if (quit)
 				return B_OK;
-			lx_wait_queue_sleep(&queue->wake, generation,
-				B_INFINITE_TIMEOUT);
+			lx_wait_queue_sleep(&queue->wake, generation, next);
 			continue;
 		}
 
@@ -94,6 +111,7 @@ alloc_workqueue(const char* name, unsigned int flags, int maxActive, ...)
 	strlcpy(queue->name, name, sizeof(queue->name));
 	spin_lock_init(&queue->lock);
 	INIT_LIST_HEAD(&queue->pending);
+	INIT_LIST_HEAD(&queue->timers);
 	init_waitqueue_head(&queue->wake);
 	queue->thread = spawn_kernel_thread(workqueue_thread, queue->name,
 		B_URGENT_DISPLAY_PRIORITY, queue);
@@ -193,6 +211,77 @@ flush_workqueue(struct workqueue_struct* queue)
 			return;
 		lx_wait_queue_sleep(&queue->wake, generation, B_INFINITE_TIMEOUT);
 	}
+}
+
+
+/*!	Arms \a work on \a queue, or queues it now for a delay of 0. The
+	queue's lock is held; \a work is neither armed nor pending.
+*/
+static void
+arm_delayed_work(struct workqueue_struct* queue, struct delayed_work* work,
+	unsigned long delay)
+{
+	work->timer_queue = queue;
+	if (delay == 0) {
+		work->work.queue = queue;
+		list_add_tail(&work->work.entry, &queue->pending);
+		return;
+	}
+	work->when = system_time() + (bigtime_t)jiffies_to_usecs(delay);
+	list_add_tail(&work->timer, &queue->timers);
+}
+
+
+bool
+queue_delayed_work(struct workqueue_struct* queue, struct delayed_work* work,
+	unsigned long delay)
+{
+	spin_lock(&queue->lock);
+	if (!list_empty(&work->timer) || work->work.queue != NULL) {
+		spin_unlock(&queue->lock);
+		return false;
+	}
+	arm_delayed_work(queue, work, delay);
+	spin_unlock(&queue->lock);
+	wake_up_all(&queue->wake);
+	return true;
+}
+
+
+bool
+mod_delayed_work(struct workqueue_struct* queue, struct delayed_work* work,
+	unsigned long delay)
+{
+	spin_lock(&queue->lock);
+	bool wasPending = !list_empty(&work->timer) || work->work.queue != NULL;
+	if (!list_empty(&work->timer))
+		list_del_init(&work->timer);
+	if (work->work.queue == queue) {
+		list_del_init(&work->work.entry);
+		work->work.queue = NULL;
+	}
+	if (work->work.queue == NULL)
+		arm_delayed_work(queue, work, delay);
+	spin_unlock(&queue->lock);
+	wake_up_all(&queue->wake);
+	return wasPending;
+}
+
+
+bool
+cancel_delayed_work_sync(struct delayed_work* work)
+{
+	struct workqueue_struct* queue = work->timer_queue;
+	if (queue == NULL)
+		return false;
+
+	spin_lock(&queue->lock);
+	bool wasArmed = !list_empty(&work->timer);
+	if (wasArmed)
+		list_del_init(&work->timer);
+	spin_unlock(&queue->lock);
+
+	return cancel_work_on(queue, &work->work) || wasArmed;
 }
 
 
@@ -546,11 +635,84 @@ sched_job_kill(struct drm_sched_job* job, int error)
 /* #pragma mark - running jobs */
 
 
+void (*lx_sched_job_time_hook)(struct drm_gpu_scheduler* sched,
+	bigtime_t elapsed);
+void (*lx_sched_timeout_hook)(struct drm_gpu_scheduler* sched,
+	struct drm_sched_job* job);
+unsigned int lx_sched_timeout_override_ms;
+
+
 static void
 sched_queue_run(struct drm_gpu_scheduler* sched)
 {
 	if (!sched->pause_submit)
 		queue_work(sched->submit_wq, &sched->work_run_job);
+}
+
+
+static bool
+sched_has_timeout(struct drm_gpu_scheduler* sched)
+{
+	return sched->timeout > 0 && sched->timeout != MAX_SCHEDULE_TIMEOUT;
+}
+
+
+/*!	(Re)starts the timeout: \a progress when a job finished, which
+	restarts it, otherwise only if it is not running yet.
+*/
+static void
+sched_start_timeout(struct drm_gpu_scheduler* sched, bool progress)
+{
+	if (!sched_has_timeout(sched))
+		return;
+	if (progress)
+		mod_delayed_work(sched->timeout_wq, &sched->work_tdr, sched->timeout);
+	else
+		queue_delayed_work(sched->timeout_wq, &sched->work_tdr, sched->timeout);
+}
+
+
+/*!	The oldest job handed on that has not finished, or NULL. */
+static struct drm_sched_job*
+sched_first_unfinished(struct drm_gpu_scheduler* sched)
+{
+	struct drm_sched_job* job;
+	struct drm_sched_job* found = NULL;
+	spin_lock(&sched->job_list_lock);
+	list_for_each_entry(job, &sched->pending_list, list) {
+		if (!dma_fence_is_signaled(&job->s_fence->finished)) {
+			found = job;
+			break;
+		}
+	}
+	spin_unlock(&sched->job_list_lock);
+	return found;
+}
+
+
+/*!	No job finished for the scheduler's timeout. Runs on the timeout work
+	queue, which is also the submit work queue for pvr_queue.c, so the job
+	cannot be freed meanwhile.
+*/
+static void
+sched_timeout_work(struct work_struct* work)
+{
+	struct drm_gpu_scheduler* sched = container_of(to_delayed_work(work),
+		struct drm_gpu_scheduler, work_tdr);
+
+	struct drm_sched_job* job = sched_first_unfinished(sched);
+	if (job == NULL || sched->pause_submit)
+		return;
+
+	TRACE("scheduler %s: no job finished for %lu ms\n", sched->name,
+		(unsigned long)(jiffies_to_usecs(sched->timeout) / 1000));
+	if (lx_sched_timeout_hook != NULL)
+		lx_sched_timeout_hook(sched, job);
+	else
+		sched->ops->timedout_job(job);
+
+	if (sched_first_unfinished(sched) != NULL)
+		sched_start_timeout(sched, true);
 }
 
 
@@ -561,6 +723,8 @@ sched_job_done(struct drm_sched_job* job, int result)
 	struct drm_sched_fence* s_fence = job->s_fence;
 
 	atomic_sub(job->credits, &sched->credit_count);
+	if (job->run_time != 0 && lx_sched_job_time_hook != NULL)
+		lx_sched_job_time_hook(sched, system_time() - job->run_time);
 	if (result != 0 && s_fence->finished.error == 0)
 		dma_fence_set_error(&s_fence->finished, result);
 	dma_fence_get(&s_fence->finished);
@@ -569,6 +733,7 @@ sched_job_done(struct drm_sched_job* job, int result)
 
 	queue_work(sched->submit_wq, &sched->work_free_job);
 	sched_queue_run(sched);
+	sched_start_timeout(sched, true);
 }
 
 
@@ -679,16 +844,30 @@ sched_run_job(struct drm_gpu_scheduler* sched, struct drm_sched_entity* entity,
 	spin_lock(&sched->job_list_lock);
 	list_add_tail(&job->list, &sched->pending_list);
 	spin_unlock(&sched->job_list_lock);
+	sched_start_timeout(sched, false);
 
 	if (entity->guilty != NULL && atomic_read(entity->guilty) != 0)
 		dma_fence_set_error(&s_fence->finished, -ECANCELED);
 
+	// A job of a guilty entity is not handed on: after a reset its context
+	// (client CCB, firmware context) starts over and what was queued for
+	// it before is not trusted (Linux leaves this to the driver's
+	// run_job(), which pvr_queue.c does not check).
+	if (s_fence->finished.error != 0) {
+		dma_fence_signal(&s_fence->scheduled);
+		sched_job_done(job, s_fence->finished.error);
+		return;
+	}
+
 	// drm_sched_fence_scheduled(): the hardware fence is in place before
 	// "scheduled" signals, since a job of another queue waiting for that
 	// then waits for the hardware fence in the firmware
+	job->run_time = system_time();
 	struct dma_fence* fence = sched->ops->run_job(job);
 	if (!IS_ERR_OR_NULL(fence))
 		s_fence->parent = dma_fence_get(fence);
+	else
+		job->run_time = 0;
 	dma_fence_signal(&s_fence->scheduled);
 
 	if (IS_ERR_OR_NULL(fence)) {
@@ -711,7 +890,7 @@ sched_run_work(struct work_struct* work)
 
 	for (;;) {
 		struct drm_sched_entity* entity = sched->entity;
-		if (entity == NULL || sched->pause_submit)
+		if (entity == NULL || sched->pause_submit || sched->dead)
 			return;
 
 		spin_lock(&entity->lock);
@@ -794,6 +973,12 @@ drm_sched_init(struct drm_gpu_scheduler* sched,
 	sched->submit_wq = args->submit_wq;
 	INIT_WORK(&sched->work_run_job, sched_run_work);
 	INIT_WORK(&sched->work_free_job, sched_free_work);
+	sched->timeout = args->timeout;
+	if (lx_sched_timeout_override_ms != 0)
+		sched->timeout = msecs_to_jiffies(lx_sched_timeout_override_ms);
+	sched->timeout_wq = args->timeout_wq != NULL
+		? args->timeout_wq : args->submit_wq;
+	INIT_DELAYED_WORK(&sched->work_tdr, sched_timeout_work);
 	INIT_LIST_HEAD(&sched->pending_list);
 	spin_lock_init(&sched->job_list_lock);
 	sched->ready = true;
@@ -807,6 +992,7 @@ drm_sched_fini(struct drm_gpu_scheduler* sched)
 	sched->pause_submit = true;
 	cancel_work_on(sched->submit_wq, &sched->work_run_job);
 	cancel_work_on(sched->submit_wq, &sched->work_free_job);
+	cancel_delayed_work_sync(&sched->work_tdr);
 
 	spin_lock(&sched->job_list_lock);
 	bool busy = !list_empty(&sched->pending_list);
@@ -829,15 +1015,29 @@ drm_sched_stop(struct drm_gpu_scheduler* sched, struct drm_sched_job* bad)
 	(void)bad;
 	sched->pause_submit = true;
 	cancel_work_on(sched->submit_wq, &sched->work_run_job);
+	cancel_delayed_work_sync(&sched->work_tdr);
 
+	// as Linux: jobs whose hardware fence is still pending are detached
+	// from it; the others are done (or finishing) and are freed here
 	struct drm_sched_job* job;
-	list_for_each_entry(job, &sched->pending_list, list) {
+	struct drm_sched_job* next;
+	list_for_each_entry_safe(job, next, &sched->pending_list, list) {
 		struct dma_fence* parent = job->s_fence->parent;
 		if (parent != NULL && dma_fence_remove_callback(parent, &job->cb)) {
 			dma_fence_put(parent);
 			job->s_fence->parent = NULL;
 			atomic_sub(job->credits, &sched->credit_count);
+			continue;
 		}
+		if (parent == NULL)
+			continue;
+
+		spin_lock(&sched->job_list_lock);
+		list_del_init(&job->list);
+		spin_unlock(&sched->job_list_lock);
+		// its callback may still run elsewhere
+		lx_dma_fence_wait(&job->s_fence->finished, false, B_INFINITE_TIMEOUT);
+		sched->ops->free_job(job);
 	}
 }
 
@@ -864,6 +1064,45 @@ drm_sched_start(struct drm_gpu_scheduler* sched, int error)
 
 	sched->pause_submit = false;
 	sched_queue_run(sched);
+	if (sched_first_unfinished(sched) != NULL)
+		sched_start_timeout(sched, true);
+}
+
+
+void
+lx_sched_kill_all(struct drm_gpu_scheduler* sched, int error)
+{
+	sched->dead = true;
+	drm_sched_stop(sched, NULL);
+
+	// what was handed on: drm_sched_stop() detached the jobs whose hardware
+	// fence had not signaled
+	struct drm_sched_job* job;
+	struct drm_sched_job* next;
+	spin_lock(&sched->job_list_lock);
+	list_for_each_entry_safe(job, next, &sched->pending_list, list) {
+		if (dma_fence_is_signaled(&job->s_fence->finished)
+			|| job->s_fence->parent != NULL) {
+			continue;
+		}
+		atomic_add(job->credits, &sched->credit_count);
+		sched_job_done(job, error);
+	}
+	spin_unlock(&sched->job_list_lock);
+
+	// what is still queued
+	struct drm_sched_entity* entity = sched->entity;
+	while (entity != NULL) {
+		spin_lock(&entity->lock);
+		job = list_first_entry_or_null(&entity->job_queue,
+			struct drm_sched_job, queue_link);
+		if (job != NULL)
+			list_del_init(&job->queue_link);
+		spin_unlock(&entity->lock);
+		if (job == NULL)
+			break;
+		sched_job_kill(job, error);
+	}
 }
 
 
@@ -895,14 +1134,15 @@ drm_sched_entity_push_job(struct drm_sched_job* job)
 	struct drm_sched_entity* entity = job->entity;
 
 	spin_lock(&entity->lock);
-	bool stopped = entity->stopped;
+	bool stopped = entity->stopped || entity->sched->dead;
 	if (!stopped)
 		list_add_tail(&job->queue_link, &entity->job_queue);
 	spin_unlock(&entity->lock);
 
 	if (stopped) {
-		TRACE("job pushed to a stopped entity\n");
-		sched_job_kill(job, -ENOENT);
+		if (!entity->sched->dead)
+			TRACE("job pushed to a stopped entity\n");
+		sched_job_kill(job, entity->sched->dead ? -ENODEV : -ENOENT);
 		return;
 	}
 	sched_queue_run(entity->sched);

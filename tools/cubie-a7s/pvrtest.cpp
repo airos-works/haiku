@@ -474,6 +474,143 @@ test_buffers()
 }
 
 
+static int
+import_host(const void* address, uint64 size, uint64 flags, uint32* _handle)
+{
+	pvr_haiku_import_host args = {};
+	args.address = (addr_t)address;
+	args.size = size;
+	args.flags = flags;
+	int error = pvr_ioctl(PVR_HAIKU_NR_IMPORT_HOST, &args);
+	*_handle = error == 0 ? args.handle : 0;
+	return error;
+}
+
+
+/*!	IMPORT_HOST: the team's own memory as a buffer object. Whether the GPU
+	really reads and writes it is up to the Vulkan tests.
+*/
+static void
+test_import()
+{
+	const uint64 size = 64 * 1024;
+	void* address = NULL;
+	area_id area = create_area("pvrtest host memory", &address,
+		B_ANY_ADDRESS, size, B_NO_LOCK, B_READ_AREA | B_WRITE_AREA);
+	if (area < 0) {
+		check(false, "create_area", strerror(area));
+		return;
+	}
+	uint32* words = (uint32*)address;
+	for (uint32 i = 0; i < size / 4; i++)
+		words[i] = 0xa5000000 | i;
+
+	uint32 handle;
+	int error = import_host(address, size, 0, &handle);
+	check(error == 0 && handle != 0, "IMPORT_HOST 64 KiB",
+		error != 0 ? strerror(error) : NULL);
+	if (handle == 0) {
+		delete_area(area);
+		return;
+	}
+
+	pvr_haiku_map_bo map = {};
+	map.handle = handle;
+	check_error(pvr_ioctl(PVR_HAIKU_NR_MAP_BO, &map), EACCES,
+		"MAP_BO of an imported buffer");
+
+	uint32 part;
+	error = import_host((uint8*)address + 16 * 1024, 32 * 1024,
+		DRM_PVR_BO_BYPASS_DEVICE_CACHE, &part);
+	check(error == 0, "IMPORT_HOST part of an area, bypassing the SLC",
+		error != 0 ? strerror(error) : NULL);
+
+	uint32 bad;
+	check_error(import_host((uint8*)address + 100, B_PAGE_SIZE, 0, &bad),
+		EINVAL, "IMPORT_HOST unaligned");
+	check_error(import_host(address, size + B_PAGE_SIZE, 0, &bad), EINVAL,
+		"IMPORT_HOST past the area's end");
+	check_error(import_host(address, size,
+		DRM_PVR_BO_ALLOW_CPU_USERSPACE_ACCESS, &bad), EINVAL,
+		"IMPORT_HOST with CPU access");
+	check_error(import_host((void*)(addr_t)0xffff000000000000ull,
+		B_PAGE_SIZE, 0, &bad), EINVAL, "IMPORT_HOST of a kernel address");
+
+	void* readOnlyAddress = NULL;
+	area_id readOnly = create_area("pvrtest read-only", &readOnlyAddress,
+		B_ANY_ADDRESS, B_PAGE_SIZE, B_NO_LOCK, B_READ_AREA);
+	if (readOnly >= 0) {
+		check_error(import_host(readOnlyAddress, B_PAGE_SIZE, 0, &bad),
+			EACCES, "IMPORT_HOST of a read-only area");
+		delete_area(readOnly);
+	}
+
+	// wired areas, and an untouched clone of one (as the display's frame
+	// buffer is handed out): not mapped in until touched
+	static const struct {
+		uint32		lock;
+		const char*	name;
+	} kWired[] = {
+		{ B_CONTIGUOUS, "B_CONTIGUOUS" },
+		{ B_FULL_LOCK, "B_FULL_LOCK" },
+	};
+	for (size_t i = 0; i < sizeof(kWired) / sizeof(kWired[0]); i++) {
+		void* wiredAddress = NULL;
+		area_id wired = create_area("pvrtest wired", &wiredAddress,
+			B_ANY_ADDRESS, size, kWired[i].lock, B_READ_AREA | B_WRITE_AREA);
+		if (wired < 0)
+			continue;
+		void* cloneAddress = NULL;
+		area_id clone = clone_area("pvrtest wired clone", &cloneAddress,
+			B_ANY_ADDRESS, B_READ_AREA | B_WRITE_AREA, wired);
+		char what[64];
+		uint32 wiredHandle;
+		snprintf(what, sizeof(what), "IMPORT_HOST %s", kWired[i].name);
+		error = import_host(wiredAddress, size, 0, &wiredHandle);
+		check(error == 0, what, error != 0 ? strerror(error) : NULL);
+		if (error == 0)
+			close_bo(wiredHandle);
+		if (clone >= 0) {
+			snprintf(what, sizeof(what), "IMPORT_HOST untouched clone of %s",
+				kWired[i].name);
+			error = import_host(cloneAddress, size, 0, &wiredHandle);
+			check(error == 0, what, error != 0 ? strerror(error) : NULL);
+			if (error == 0)
+				close_bo(wiredHandle);
+			delete_area(clone);
+		}
+		delete_area(wired);
+	}
+
+	// in a GPU VM like any buffer
+	drm_pvr_ioctl_create_vm_context_args vm = {};
+	error = pvr_ioctl(PVR_NR(CREATE_VM_CONTEXT), &vm);
+	if (error == 0 && sHeapCount > 0) {
+		drm_pvr_ioctl_vm_map_args vmMap = {};
+		vmMap.vm_context_handle = vm.handle;
+		vmMap.device_addr = sHeaps[DRM_PVR_HEAP_GENERAL].base;
+		vmMap.handle = handle;
+		vmMap.size = size;
+		error = pvr_ioctl(PVR_NR(VM_MAP), &vmMap);
+		check(error == 0, "VM_MAP an imported buffer",
+			error != 0 ? strerror(error) : NULL);
+		// left mapped for DESTROY_VM_CONTEXT
+	}
+	if (vm.handle != 0) {
+		drm_pvr_ioctl_destroy_vm_context_args destroy = {};
+		destroy.handle = vm.handle;
+		check(pvr_ioctl(PVR_NR(DESTROY_VM_CONTEXT), &destroy) == 0,
+			"DESTROY_VM_CONTEXT with an imported buffer");
+	}
+
+	// the object keeps the memory after the team lets go of it
+	delete_area(area);
+	if (part != 0)
+		close_bo(part);
+	close_bo(handle);
+}
+
+
 //	#pragma mark - sync objects
 
 
@@ -658,14 +795,92 @@ test_syncobjs()
 }
 
 
+//	#pragma mark - buffer costs
+
+
+/*!	--bench: the average cost of each step of a buffer's life, as Mesa
+	goes through it (CREATE_BO, VM_MAP, MAP_BO, unmap, VM_UNMAP,
+	GEM_CLOSE), for a few sizes.
+*/
+static void
+bench_buffers()
+{
+	drm_pvr_ioctl_create_vm_context_args vm = {};
+	if (pvr_ioctl(PVR_NR(CREATE_VM_CONTEXT), &vm) != 0 || sHeapCount == 0) {
+		printf("bench: no VM context\n");
+		return;
+	}
+	static const uint64 kSizes[] = { 4096, 65536, 1024 * 1024 };
+	const int kRounds = 100;
+	for (size_t s = 0; s < sizeof(kSizes) / sizeof(kSizes[0]); s++) {
+		bigtime_t times[6] = {};
+		for (int round = 0; round < kRounds; round++) {
+			bigtime_t start = system_time();
+			int error;
+			uint32 handle = create_bo(kSizes[s],
+				DRM_PVR_BO_ALLOW_CPU_USERSPACE_ACCESS, &error);
+			bigtime_t t1 = system_time();
+			if (handle == 0) {
+				printf("bench: CREATE_BO: %s\n", strerror(error));
+				return;
+			}
+			drm_pvr_ioctl_vm_map_args vmMap = {};
+			vmMap.vm_context_handle = vm.handle;
+			vmMap.device_addr = sHeaps[DRM_PVR_HEAP_GENERAL].base;
+			vmMap.handle = handle;
+			vmMap.size = kSizes[s];
+			pvr_ioctl(PVR_NR(VM_MAP), &vmMap);
+			bigtime_t t2 = system_time();
+			pvr_haiku_map_bo map = {};
+			map.handle = handle;
+			pvr_ioctl(PVR_HAIKU_NR_MAP_BO, &map);
+			bigtime_t t3 = system_time();
+			if (map.area >= 0)
+				delete_area(map.area);
+			bigtime_t t4 = system_time();
+			drm_pvr_ioctl_vm_unmap_args vmUnmap = {};
+			vmUnmap.vm_context_handle = vm.handle;
+			vmUnmap.device_addr = vmMap.device_addr;
+			vmUnmap.size = kSizes[s];
+			pvr_ioctl(PVR_NR(VM_UNMAP), &vmUnmap);
+			bigtime_t t5 = system_time();
+			drm_gem_close close = {};
+			close.handle = handle;
+			pvr_ioctl(PVR_HAIKU_NR_GEM_CLOSE, &close);
+			bigtime_t t6 = system_time();
+			times[0] += t1 - start;
+			times[1] += t2 - t1;
+			times[2] += t3 - t2;
+			times[3] += t4 - t3;
+			times[4] += t5 - t4;
+			times[5] += t6 - t5;
+		}
+		printf("bench %4llu KiB: CREATE_BO %lld us, VM_MAP %lld, MAP_BO %lld,"
+			" unmap %lld, VM_UNMAP %lld, GEM_CLOSE %lld; total %lld us\n",
+			(unsigned long long)kSizes[s] / 1024,
+			(long long)times[0] / kRounds, (long long)times[1] / kRounds,
+			(long long)times[2] / kRounds, (long long)times[3] / kRounds,
+			(long long)times[4] / kRounds, (long long)times[5] / kRounds,
+			(long long)(times[0] + times[1] + times[2] + times[3] + times[4]
+				+ times[5]) / kRounds);
+	}
+	drm_pvr_ioctl_destroy_vm_context_args destroy = {};
+	destroy.handle = vm.handle;
+	pvr_ioctl(PVR_NR(DESTROY_VM_CONTEXT), &destroy);
+}
+
+
 int
 main(int argc, char** argv)
 {
+	bool bench = false;
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-v") == 0)
 			sVerbose = true;
+		else if (strcmp(argv[i], "--bench") == 0)
+			bench = true;
 		else {
-			fprintf(stderr, "usage: %s [-v]\n", argv[0]);
+			fprintf(stderr, "usage: %s [-v] [--bench]\n", argv[0]);
 			return 2;
 		}
 	}
@@ -679,9 +894,17 @@ main(int argc, char** argv)
 		return 1;
 	}
 
+	if (bench) {
+		test_dev_query();
+		bench_buffers();
+		close(sFD);
+		return 0;
+	}
+
 	test_generic();
 	test_dev_query();
 	test_buffers();
+	test_import();
 	test_syncobjs();
 
 	close(sFD);

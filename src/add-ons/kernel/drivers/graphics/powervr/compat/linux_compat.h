@@ -581,9 +581,9 @@ kvmalloc_array(size_t count, size_t size, gfp_t flags)
 
 #define kzalloc_obj(object, ...) \
 	((__typeof__(object)*)kzalloc(sizeof(object), GFP_KERNEL))
-#define kvmalloc_objs(object, count, ...) \
-	((__typeof__(object)*)kvmalloc_array((count), sizeof(object), \
-		GFP_KERNEL))
+/* the flags count: pvr_job.c asks for __GFP_ZERO */
+#define kvmalloc_objs(object, count, flags) \
+	((__typeof__(object)*)kvmalloc_array((count), sizeof(object), (flags)))
 
 /* overflow.h; the sizes here are small, no saturation needed */
 #define struct_size(pointer, member, count) \
@@ -939,6 +939,7 @@ struct device {
 struct drm_device {
 	struct device*		dev;
 	struct list_head	managed;
+	bool				unplugged;	/* drm_dev_unplug(): the GPU is lost */
 };
 
 struct drm_file;
@@ -974,12 +975,13 @@ void lx_drm_dev_init(struct drm_device* drm, struct device* device);
 void lx_drm_dev_release(struct drm_device* drm);
 void* drmm_kzalloc(struct drm_device* drm, size_t size, gfp_t flags);
 
+/*	drm_dev_enter() fails once the device is unplugged, which on Haiku
+	means lost (pvr_device_lost()): the ioctls then answer EIO. */
 static inline bool
 drm_dev_enter(struct drm_device* drm, int* index)
 {
-	(void)drm;
 	*index = 0;
-	return true;
+	return !__atomic_load_n(&drm->unplugged, __ATOMIC_ACQUIRE);
 }
 
 static inline void
@@ -991,7 +993,7 @@ drm_dev_exit(int index)
 static inline void
 drm_dev_unplug(struct drm_device* drm)
 {
-	(void)drm;
+	__atomic_store_n(&drm->unplugged, true, __ATOMIC_RELEASE);
 }
 
 struct resource {

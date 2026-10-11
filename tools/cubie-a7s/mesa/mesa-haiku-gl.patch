@@ -45,12 +45,79 @@ shared V3D bitmaps, plus the zink pieces of the air/OS x86_64 fork
   src/gallium/drivers/zink/zink_screen.c
       disk cache key: without a build-id note, the library file's timestamp
       (else no cache), so a new zink never reads an old one's shaders
+  src/gallium/drivers/zink/zink_context.c
+      zink_wait_on_batch() on a lost device: the flush submits nothing, so
+      the batch has no id; report the loss and return instead of asserting
+      (debugoptimized builds aborted the GL program after a GPU reset)
+  src/gallium/drivers/zink/zink_haiku_present.[ch] (new),
+  zink_haiku_present_gl.c (new), zink/meson.build, egl_haiku.cpp,
+  egl/meson.build, egl.sym, egl-glvnd.sym, egl-*symbols.txt,
+  targets/dri/meson.build, dri.sym.in
+      Summit's direct present (apps/summit/tools/mesa-vm, patch 06), its
+      interface unchanged: summit_haiku_present_framebuffer, _wait_idle
+      and _release, struct summit_haiku_present version 1, the return
+      codes, a completion callback for every present (after a device loss
+      too). Ported to 26.2.4 and to this board:
+      - the front, the frame buffer, is imported through the PowerVR
+        driver's VkImportScanoutMemoryHAIKU; besides the row length, the
+        display driver's frame buffer generation (sunxi_display GET_STATE,
+        once a second) tells a new frame buffer from the old one;
+      - the back, app_server's copy of the screen, is not imported (its
+        processor writes it all the time; a cache line over a rectangle's
+        edge could be lost either way): the GPU copies the rectangles
+        into a staging buffer of zink's own in host-cached memory (one per
+        present in flight, at most 4, sized by the rectangles), each row
+        padded to 16 pixels (PowerVR's PBE strides come in pairs of pixels:
+        an odd row length sends the copy into its double-stride workaround,
+        twice the stride, half the height, two sets of rectangles),
+        and the helper thread, after the batch's timeline wait,
+        invalidates it and copies the rows into the window system's copy
+        before calling completed(); on a lost device it copies nothing;
+      - a clear still pending on the image is applied first;
+      - the GL side finds the current context through glapi, so the same
+        entry points are built into the Linux DRI driver for the host
+        smoke test (pvr_glpresent)
+      Patch 05 (frame copies, x86 readback tuning) is not taken
+  src/gallium/drivers/zink/zink_batch.c, zink_context.c
+      a lost device: batches ended after the loss were never submitted, so
+      they stayed "unflushed" forever and zink_batch_usage_unflushed_wait()
+      waited on them for good. A BGLView's present maps the frame the
+      previous batch drew, so GLTeapot's render thread hung there after a
+      GPU reset, and its quit with it (reproduced under the shim with
+      pvr_glreset: zink_image_map -> zink_resource_usage_wait ->
+      cnd_wait). Such a batch is now retired: given a batch id and marked
+      flushed, submitted and completed, and the screen's handed-back states
+      are reset as the submit thread did after each submit. Every batch
+      state is reusable on a lost device, so they are recycled instead of a
+      new one (with everything it held) per flush. flush_batch() starts a
+      new batch after a failed submit too, instead of recording into the
+      ended one, which the next flush put on the list a second time. And
+      the flush wakeup is no longer lost: the submit thread broadcasts
+      under the usage mutex and the waiter loops on the flag
+  src/gallium/drivers/zink/zink_screen.c, zink_resource.c
+      host-cached memory that is not coherent (the PowerVR driver's second
+      type on air/OS): with no coherent cached type, the staging heap
+      (ZINK_HEAP_HOST_VISIBLE_COHERENT_CACHED) takes the cached types
+      first, the coherent ones after them (Haiku only); coherent and
+      persistent resources skip types that are not coherent (Haiku only);
+      a read map of such a buffer needs no second staging copy (Haiku
+      only); and zink_image_map() invalidates a non-coherent staging buffer
+      or linear image before it is read, which it did not (any OS). Every
+      GL frame's readback (glReadPixels, the BGLView present) read from
+      write-combined memory before
   src/c11/impl/threads_posix.c
       thrd_create() gives Mesa's threads (util_queue, u_thread_create(),
       the Vulkan runtime's submit thread) 8 MiB of stack, as on Linux,
       instead of Haiku's 256 KiB: zink's flush thread overflowed it in the
       PowerVR driver's transfer submission (the pvr patch also moves that
-      frame to the heap)
+      frame to the heap); and each of them touches its thread-local storage
+      twice before it runs anything. Haiku's runtime loader starts a new
+      thread's TLS vector at generation 0, so after any library with TLS
+      was unloaded, the thread's second TLS access dropped what the first
+      wrote. Summit's zink cache thread called util_call_once_data()'s lost
+      callback, NULL. The runtime loader needs the real fix
+      (tls_generation_check tests it); this keeps Mesa's threads safe
+      without it
   src/gallium/drivers/zink/zink_state.c, zink_descriptors.c,
   src/compiler/nir/nir_opt_varyings.c
       the three largest stack frames left (zink_create_vertex_state() 109
@@ -64,6 +131,13 @@ shared V3D bitmaps, plus the zink pieces of the air/OS x86_64 fork
       cached token address is dropped when its shader is deleted
   include/renderdoc_app.h
       calling convention on Haiku
+  src/util/disk_cache.c
+      disk_cache_wait_for_idle() leaves a cache whose queue was never made
+      alone, as disk_cache_put() and disk_cache_destroy() already do. With
+      MESA_SHADER_CACHE_DISABLE=true the cache exists but its queue does
+      not; zink's screen destroy (eglTerminate) waited on it, and
+      util_queue_finish() locked the zeroed queue mutex, which Haiku's
+      libroot asserts on (pthread_mutex.cpp: owner 0, not -1)
 
 Not ported: V3D/Mali screens, texture caches, GPU readback and shared
 bitmaps (driver-specific); the x86_64 fork's pipeline-library checks
@@ -85,7 +159,43 @@ diff -ruN a/include/renderdoc_app.h b/include/renderdoc_app.h
 diff -ruN a/src/c11/impl/threads_posix.c b/src/c11/impl/threads_posix.c
 --- a/src/c11/impl/threads_posix.c
 +++ b/src/c11/impl/threads_posix.c
-@@ -252,6 +252,29 @@
+@@ -35,11 +35,35 @@
+     void *arg;
+ };
+ 
++#ifdef __HAIKU__
++/* Haiku's runtime loader starts a thread's dynamic thread vector at
++ * generation 0. Once any library with thread-local storage has been
++ * unloaded in the process, the thread's second TLS access frees and
++ * re-creates the blocks of every library loaded since, and what the first
++ * access wrote is lost. In Summit's WebProcess, zink's cache thread wrote
++ * util_call_once_data()'s context; the call_once() callback then read it
++ * back as NULL and called it. Two accesses before the thread runs anything
++ * bring its vector up to date. Each call is one __tls_get_addr(), which
++ * updates the whole vector, not just this library's block.
++ */
++static __thread volatile int impl_thrd_tls_primer;
++
++static void __attribute__((noinline, noclone))
++impl_thrd_touch_tls(void)
++{
++    impl_thrd_tls_primer++;
++}
++#endif
++
+ static void *
+ impl_thrd_routine(void *p)
+ {
+     struct impl_thrd_param pack = *((struct impl_thrd_param *)p);
+     free(p);
++#ifdef __HAIKU__
++    impl_thrd_touch_tls();
++    impl_thrd_touch_tls();
++#endif
+     return (void*)(intptr_t)pack.func(pack.arg);
+ }
+ 
+@@ -252,6 +276,29 @@
      if (!pack) return thrd_nomem;
      pack->func = func;
      pack->arg = arg;
@@ -209,7 +319,17 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
  #include "mesa/glapi/glapi/glapi.h"
  
  #include "hgl/hgl_sw_winsys.h"
-@@ -68,6 +75,9 @@
+@@ -54,6 +61,9 @@
+ extern "C" {
+ #include "target-helpers/inline_sw_helper.h"
+ }
++#ifdef GALLIUM_ZINK
++#include "zink/zink_haiku_present.h"
++#endif
+ 
+ #if MESA_DEBUG
+ #define TRACE(x...) printf("egl_haiku: " x)
+@@ -68,6 +78,9 @@
  
  struct haiku_egl_display {
     int ref_count;
@@ -219,7 +339,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
     struct hgl_display *disp;
  };
  
-@@ -84,8 +94,98 @@
+@@ -84,8 +97,98 @@
     _EGLSurface base;
     struct hgl_buffer *fb;
     struct pipe_fence_handle *throttle_fence;
@@ -318,7 +438,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
  // #pragma mark EGLSurface
  
  // Called via eglCreateWindowSurface(), drv->CreateWindowSurface().
-@@ -93,7 +193,11 @@
+@@ -93,7 +196,11 @@
  haiku_create_window_surface(_EGLDisplay *disp, _EGLConfig *conf,
                              void *native_window, const EGLint *attrib_list)
  {
@@ -331,7 +451,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
     struct haiku_egl_display *hgl_dpy = haiku_egl_display(disp);
  
     struct haiku_egl_surface *wgl_surf =
-@@ -108,7 +212,7 @@
+@@ -108,7 +215,7 @@
     }
  
     struct st_visual visual;
@@ -340,7 +460,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
  
     wgl_surf->fb =
        hgl_create_st_framebuffer(hgl_dpy->disp, &visual, native_window);
-@@ -117,6 +221,15 @@
+@@ -117,6 +224,15 @@
        return NULL;
     }
  
@@ -356,7 +476,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
     // Unset and delete previously set bitmap if any.
     delete ((BitmapHook *)native_window)->SetBitmap(NULL);
  
-@@ -127,7 +240,7 @@
+@@ -127,7 +243,7 @@
  haiku_create_pixmap_surface(_EGLDisplay *disp, _EGLConfig *conf,
                              void *native_pixmap, const EGLint *attrib_list)
  {
@@ -365,7 +485,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
     return NULL;
  }
  
-@@ -135,7 +248,7 @@
+@@ -135,7 +251,7 @@
  haiku_create_pbuffer_surface(_EGLDisplay *disp, _EGLConfig *conf,
                               const EGLint *attrib_list)
  {
@@ -374,7 +494,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
     struct haiku_egl_display *hgl_dpy = haiku_egl_display(disp);
  
     struct haiku_egl_surface *wgl_surf =
-@@ -150,7 +263,7 @@
+@@ -150,7 +266,7 @@
     }
  
     struct st_visual visual;
@@ -383,7 +503,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
  
     wgl_surf->fb = hgl_create_st_framebuffer(hgl_dpy->disp, &visual, NULL);
     if (!wgl_surf->fb) {
-@@ -168,8 +281,9 @@
+@@ -168,8 +284,9 @@
  static EGLBoolean
  haiku_destroy_surface(_EGLDisplay *disp, _EGLSurface *surf)
  {
@@ -394,7 +514,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
        struct haiku_egl_surface *hgl_surf = haiku_egl_surface(surf);
        struct pipe_screen *screen = hgl_dpy->disp->fscreen->screen;
        screen->fence_reference(screen, &hgl_surf->throttle_fence, NULL);
-@@ -177,9 +291,15 @@
+@@ -177,9 +294,15 @@
        // Unset bitmap to release ownership. Bitmap will be deleted later
        // when destroying framebuffer.
        BitmapHook *bitmapHook = (BitmapHook*)hgl_surf->fb->winsysContext;
@@ -412,7 +532,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
        hgl_destroy_st_framebuffer(hgl_surf->fb);
        free(surf);
     }
-@@ -189,9 +309,19 @@
+@@ -189,9 +312,19 @@
  static void
  update_size(struct hgl_buffer *buffer)
  {
@@ -432,7 +552,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
        buffer->newWidth = newWidth;
        buffer->newHeight = newHeight;
        p_atomic_inc(&buffer->base.stamp);
-@@ -199,8 +329,25 @@
+@@ -199,8 +332,25 @@
  }
  
  static EGLBoolean
@@ -458,7 +578,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
     struct haiku_egl_display *hgl_dpy = haiku_egl_display(disp);
     struct haiku_egl_surface *hgl_surf = haiku_egl_surface(surf);
     struct haiku_egl_context *hgl_ctx = haiku_egl_context(surf->CurrentContext);
-@@ -210,6 +357,8 @@
+@@ -210,6 +360,8 @@
     struct st_context *st = hgl_ctx->ctx->st;
     struct pipe_screen *screen = hgl_dpy->disp->fscreen->screen;
  
@@ -467,7 +587,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
     struct hgl_buffer *buffer = hgl_surf->fb;
     auto &frontBuffer = buffer->textures[ST_ATTACHMENT_FRONT_LEFT];
     auto &backBuffer = buffer->textures[ST_ATTACHMENT_BACK_LEFT];
-@@ -218,8 +367,6 @@
+@@ -218,8 +370,6 @@
     if (backBuffer != NULL)
        st->pipe->flush_resource(st->pipe, backBuffer);
  
@@ -476,7 +596,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
     struct pipe_fence_handle *new_fence = NULL;
     st_context_flush(st, ST_FLUSH_FRONT, &new_fence, NULL, NULL);
     if (hgl_surf->throttle_fence) {
-@@ -231,8 +378,13 @@
+@@ -231,8 +381,13 @@
  
     // flush back buffer and swap buffers if double buffering is used
     if (backBuffer != NULL) {
@@ -492,7 +612,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
        std::swap(frontBuffer, backBuffer);
        p_atomic_inc(&buffer->base.stamp);
     }
-@@ -273,20 +425,22 @@
+@@ -273,20 +428,22 @@
     conf->base.ConfigID = 1;
     conf->base.BindToTextureRGB = EGL_FALSE;
     conf->base.BindToTextureRGBA = EGL_FALSE;
@@ -523,12 +643,17 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
  
     TRACE("Config configuated\n");
     if (!_eglValidateConfig(&conf->base, EGL_FALSE)) {
-@@ -321,12 +475,56 @@
+@@ -321,12 +478,61 @@
     if (!p_atomic_dec_zero(&hgl_dpy->ref_count))
        return;
  
 +   _eglCleanupDisplay(disp);
     struct pipe_screen *screen = hgl_dpy->disp->fscreen->screen;
++#ifdef GALLIUM_ZINK
++   /* Summit's direct present: its frame buffer import and staging buffers
++    * belong to this screen */
++   zink_haiku_present_release(screen);
++#endif
     hgl_destroy_display(hgl_dpy->disp);
     hgl_dpy->disp = NULL;
     screen->destroy(screen); // destroy will deallocate object
@@ -580,7 +705,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
  }
  
  static EGLBoolean
-@@ -342,20 +540,49 @@
+@@ -342,20 +548,49 @@
     hgl_dpy->ref_count = 1;
     disp->DriverData = (void *)hgl_dpy;
  
@@ -637,7 +762,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
  
     /* Report back to EGL the bitmask of priorities supported */
     disp->Extensions.IMG_context_priority =
-@@ -364,17 +591,17 @@
+@@ -364,17 +599,17 @@
        disp->Extensions.IMG_context_priority &
        (1 << __EGL_CONTEXT_PRIORITY_REALTIME_BIT);
  
@@ -665,7 +790,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
  
     return EGL_TRUE;
  }
-@@ -386,7 +613,7 @@
+@@ -386,7 +621,7 @@
     struct haiku_egl_display *hgl_dpy = haiku_egl_display(disp);
  
     if (hgl_dpy) {
@@ -674,7 +799,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
        return EGL_TRUE;
     }
  
-@@ -414,6 +641,8 @@
+@@ -414,6 +649,8 @@
  static EGLBoolean
  haiku_terminate(_EGLDisplay *disp)
  {
@@ -683,7 +808,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
     haiku_display_destroy(disp);
     return EGL_TRUE;
  }
-@@ -428,8 +657,9 @@
+@@ -428,8 +665,9 @@
  
     struct haiku_egl_display *hgl_dpy = haiku_egl_display(disp);
  
@@ -695,7 +820,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
  
     struct haiku_egl_context *context =
        (struct haiku_egl_context *)calloc(1, sizeof(*context));
-@@ -441,11 +671,56 @@
+@@ -441,11 +679,56 @@
     if (!_eglInitContext(&context->base, disp, conf, share_list, attrib_list))
        goto cleanup;
  
@@ -719,7 +844,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
 +      break;
 +   default:
 +      _eglError(EGL_BAD_PARAMETER, "Haiku EGL client API");
-       goto cleanup;
++      goto cleanup;
 +   }
 +   if (context->base.Flags & EGL_CONTEXT_OPENGL_FORWARD_COMPATIBLE_BIT_KHR)
 +      attribs.flags |= ST_CONTEXT_FLAG_FORWARD_COMPATIBLE;
@@ -751,12 +876,12 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
 +   if (context->ctx == NULL) {
 +      _eglError(error == ST_CONTEXT_ERROR_NO_MEMORY ? EGL_BAD_ALLOC : EGL_BAD_MATCH,
 +                "Haiku EGL context creation failed");
-+      goto cleanup;
+       goto cleanup;
 +   }
  
     return &context->base;
  
-@@ -488,23 +763,61 @@
+@@ -488,23 +771,61 @@
        return EGL_TRUE;
     }
  
@@ -830,7 +955,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
  
     return EGL_TRUE;
  }
-@@ -519,5 +832,6 @@
+@@ -519,5 +840,6 @@
     .CreatePixmapSurface = haiku_create_pixmap_surface,
     .CreatePbufferSurface = haiku_create_pbuffer_surface,
     .DestroySurface = haiku_destroy_surface,
@@ -840,43 +965,65 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
 diff -ruN a/src/egl/egl-glvnd-symbols.txt b/src/egl/egl-glvnd-symbols.txt
 --- a/src/egl/egl-glvnd-symbols.txt
 +++ b/src/egl/egl-glvnd-symbols.txt
-@@ -2,3 +2,4 @@
+@@ -2,3 +2,7 @@
  MesaGLInteropEGLQueryDeviceInfo
  MesaGLInteropEGLExportObject
  MesaGLInteropEGLFlushObjects
 +haiku_mesa_readback_band_bytes (optional)
++summit_haiku_present_framebuffer (optional)
++summit_haiku_present_wait_idle (optional)
++summit_haiku_present_release (optional)
 diff -ruN a/src/egl/egl-glvnd.sym b/src/egl/egl-glvnd.sym
 --- a/src/egl/egl-glvnd.sym
 +++ b/src/egl/egl-glvnd.sym
-@@ -1,5 +1,6 @@
+@@ -1,5 +1,9 @@
  {
  	global:
 +		haiku_mesa_readback_band_bytes;
++		summit_haiku_present_framebuffer;
++		summit_haiku_present_wait_idle;
++		summit_haiku_present_release;
  		__egl_Main;
  		MesaGLInteropEGLQueryDeviceInfo;
  		MesaGLInteropEGLExportObject;
 diff -ruN a/src/egl/egl-symbols.txt b/src/egl/egl-symbols.txt
 --- a/src/egl/egl-symbols.txt
 +++ b/src/egl/egl-symbols.txt
-@@ -45,3 +45,4 @@
+@@ -45,3 +45,7 @@
  MesaGLInteropEGLQueryDeviceInfo
  MesaGLInteropEGLExportObject
  MesaGLInteropEGLFlushObjects
 +haiku_mesa_readback_band_bytes (optional)
++summit_haiku_present_framebuffer (optional)
++summit_haiku_present_wait_idle (optional)
++summit_haiku_present_release (optional)
 diff -ruN a/src/egl/egl.sym b/src/egl/egl.sym
 --- a/src/egl/egl.sym
 +++ b/src/egl/egl.sym
-@@ -1,5 +1,6 @@
+@@ -1,5 +1,9 @@
  {
  	global:
 +		haiku_mesa_readback_band_bytes;
++		summit_haiku_present_framebuffer;
++		summit_haiku_present_wait_idle;
++		summit_haiku_present_release;
  		egl*;
  		MesaGLInteropEGL*;
  	local:
 diff -ruN a/src/egl/meson.build b/src/egl/meson.build
 --- a/src/egl/meson.build
 +++ b/src/egl/meson.build
-@@ -148,7 +148,8 @@
+@@ -142,13 +142,18 @@
+     '-D_EGL_BUILT_IN_DRIVER_HAIKU',
+   ]
+   files_egl += files('drivers/haiku/egl_haiku.cpp')
++  if with_gallium_zink
++    # Summit's direct present (zink_haiku_present.h)
++    files_egl += files('../gallium/drivers/zink/zink_haiku_present_gl.c')
++  endif
+ 
+   incs_for_egl += [inc_gallium, inc_gallium_aux, inc_gallium_drivers, inc_gallium_winsys, inc_gallium_winsys_sw]
+   incs_for_egl += [inc_mesa]
    incs_for_egl += [include_directories('../gallium/frontends/hgl')]
  
    link_for_egl += [libmesa, libgallium, libswhgl, libsthgl, libglapi]
@@ -948,6 +1095,151 @@ diff -ruN a/src/gallium/auxiliary/target-helpers/inline_sw_helper.h b/src/galliu
  static inline struct pipe_screen *
  sw_screen_create_named(struct sw_winsys *winsys, const char *driver)
  {
+diff -ruN a/src/gallium/drivers/zink/meson.build b/src/gallium/drivers/zink/meson.build
+--- a/src/gallium/drivers/zink/meson.build
++++ b/src/gallium/drivers/zink/meson.build
+@@ -2,6 +2,7 @@
+ # SPDX-License-Identifier: MIT
+ 
+ files_libzink = files(
++  'zink_haiku_present.c',
+   'zink_lower_cubemap_to_array.c',
+   'zink_batch.c',
+   'zink_blit.c',
+diff -ruN a/src/gallium/drivers/zink/zink_batch.c b/src/gallium/drivers/zink/zink_batch.c
+--- a/src/gallium/drivers/zink/zink_batch.c
++++ b/src/gallium/drivers/zink/zink_batch.c
+@@ -439,8 +439,12 @@
+       struct zink_batch_state *j = i->next;
+       /* only a submitted state can be reused */
+       if (i->fence.submitted &&
+-          /* a submitted state must have completed before it can be reused */
+-          (zink_screen_check_last_finished(screen, i->fence.batch_id) || i->fence.completed)) {
++          /* a submitted state must have completed before it can be reused;
++           * on a lost device every one has: nothing will run, and the waits
++           * that would have found out return early without saying so
++           */
++          (zink_screen_check_last_finished(screen, i->fence.batch_id) || i->fence.completed ||
++           screen->device_lost)) {
+          pop_batch_state(ctx);
+          reset_batch_state_ctx(ctx, i);
+          if (ctx->flags & ZINK_CONTEXT_COPY_ONLY) {
+@@ -640,6 +644,24 @@
+ 
+ #define ZINK_MAX_SIGNALS 3
+ 
++/* the completed batch states contexts handed to the screen
++ * (find_completed_batch_state()): reset, and free for any context
++ */
++static void
++reset_active_batch_states(struct zink_screen *screen)
++{
++   simple_mtx_lock(&screen->active_batch_states_lock);
++   simple_mtx_lock(&screen->free_batch_states_lock);
++   for (struct zink_batch_state *i = screen->active_batch_states, *j = i ? i->next : NULL; i; i = j, j = j ? j->next : NULL) {
++      reset_batch_state_internal(screen, i);
++      zink_batch_state_append(&screen->free_batch_states, &screen->last_free_batch_state, i);
++   }
++   screen->active_batch_states = NULL;
++   screen->last_active_batch_state = NULL;
++   simple_mtx_unlock(&screen->free_batch_states_lock);
++   simple_mtx_unlock(&screen->active_batch_states_lock);
++}
++
+ static void
+ submit_queue(void *data, void *gdata, int thread_index)
+ {
+@@ -842,22 +864,49 @@
+ 
+    bs->usage.submit_count++;
+ end:
++   /* under the mutex: a waiter that saw the batch unflushed is either
++    * waiting already or will see it flushed (zink_batch_usage_unflushed_wait)
++    */
++   mtx_lock(&bs->usage.mtx);
+    cnd_broadcast(&bs->usage.flush);
++   mtx_unlock(&bs->usage.mtx);
+ 
+    post_submit(bs, screen);
+ 
+    p_atomic_set(&bs->fence.submitted, true);
+ 
+-   simple_mtx_lock(&screen->active_batch_states_lock);
+-   simple_mtx_lock(&screen->free_batch_states_lock);
+-   for (struct zink_batch_state *i = screen->active_batch_states, *j = i ? i->next : NULL; i; i = j, j = j ? j->next : NULL) {
+-      reset_batch_state_internal(screen, i);
+-      zink_batch_state_append(&screen->free_batch_states, &screen->last_free_batch_state, i);
+-   }
+-   screen->active_batch_states = NULL;
+-   screen->last_active_batch_state = NULL;
+-   simple_mtx_unlock(&screen->free_batch_states_lock);
+-   simple_mtx_unlock(&screen->active_batch_states_lock);
++   reset_active_batch_states(screen);
++}
++
++/* A lost device runs nothing: a batch ended after the loss is as done as it
++ * will ever be. It is marked flushed, submitted and completed, with a batch
++ * id like a submitted one, so that
++ * - a wait on something it used returns: zink_batch_usage_unflushed_wait()
++ *   waited on bs->usage.flush for a submit that never came, which hung the
++ *   GL thread of a BGLView after a GPU reset (its present maps the frame
++ *   the previous, ended batch drew), and with it the application's quit;
++ * - its state is recycled (find_completed_batch_state() hands it to the
++ *   screen, reset_active_batch_states() resets it) instead of a new one
++ *   being made, with all it holds, for every flush.
++ */
++static void
++retire_lost_batch(struct zink_screen *screen, struct zink_batch_state *bs)
++{
++   while (!bs->fence.batch_id)
++      bs->fence.batch_id = (uint32_t)p_atomic_inc_return(&screen->curr_batch);
++   bs->usage.usage = bs->fence.batch_id;
++
++   mtx_lock(&bs->usage.mtx);
++   bs->usage.unflushed = false;
++   bs->usage.submit_count++;
++   cnd_broadcast(&bs->usage.flush);
++   mtx_unlock(&bs->usage.mtx);
++
++   p_atomic_set(&bs->fence.completed, true);
++   p_atomic_set(&bs->fence.submitted, true);
++
++   /* what the submit thread did after each submit, which no longer comes */
++   reset_active_batch_states(screen);
+ }
+ 
+ /* called during flush */
+@@ -888,8 +937,10 @@
+       ctx->swapchain = NULL;
+    }
+ 
+-   if (screen->device_lost)
++   if (screen->device_lost) {
++      retire_lost_batch(screen, bs);
+       return;
++   }
+ 
+    if (ctx->tc) {
+       set_foreach(&bs->active_queries, entry)
+@@ -1210,9 +1261,15 @@
+          mtx_lock(&u->mtx);
+          if (trywait) {
+             struct timespec ts = {0, 10000};
+-            cnd_timedwait(&u->flush, &u->mtx, &ts);
+-         } else
+-            cnd_wait(&u->flush, &u->mtx);
++            if (u->unflushed)
++               cnd_timedwait(&u->flush, &u->mtx, &ts);
++         } else {
++            /* the flag decides, not one wakeup: a flush between the check
++             * above and the wait was missed before
++             */
++            while (u->unflushed)
++               cnd_wait(&u->flush, &u->mtx);
++         }
+          mtx_unlock(&u->mtx);
+       }
+    }
 diff -ruN a/src/gallium/drivers/zink/zink_bo.c b/src/gallium/drivers/zink/zink_bo.c
 --- a/src/gallium/drivers/zink/zink_bo.c
 +++ b/src/gallium/drivers/zink/zink_bo.c
@@ -962,6 +1254,37 @@ diff -ruN a/src/gallium/drivers/zink/zink_bo.c b/src/gallium/drivers/zink/zink_b
 +   if (screen->pb.bo_cache.buckets)
 +      pb_cache_deinit(&screen->pb.bo_cache);
  }
+diff -ruN a/src/gallium/drivers/zink/zink_context.c b/src/gallium/drivers/zink/zink_context.c
+--- a/src/gallium/drivers/zink/zink_context.c
++++ b/src/gallium/drivers/zink/zink_context.c
+@@ -4058,9 +4058,13 @@
+    if (sync)
+       sync_flush(ctx, ctx->bs);
+ 
+-   if (ctx->bs->is_device_lost) {
++   if (ctx->bs->is_device_lost)
+       check_device_lost(ctx);
+-   } else {
++   /* A new batch even on a lost device: recording goes on into batches that
++    * zink_end_batch() retires unsubmitted, not into the ended one, which the
++    * next flush would add to ctx->batch_states a second time (a cycle).
++    */
++   {
+       struct zink_screen *screen = zink_screen(ctx->base.screen);
+       zink_start_batch(ctx);
+       if (screen->info.have_EXT_transform_feedback && ctx->num_so_targets)
+@@ -4602,6 +4606,11 @@
+       bs = ctx->last_batch_state;
+       assert(bs);
+       batch_id = bs->fence.batch_id;
++      /* a lost device submits nothing, so the batch never gets an id */
++      if (!batch_id && zink_screen(ctx->base.screen)->device_lost) {
++         check_device_lost(ctx);
++         return;
++      }
+    }
+    assert(batch_id);
+    if (!zink_screen_timeline_wait(zink_screen(ctx->base.screen), batch_id, UINT64_MAX))
 diff -ruN a/src/gallium/drivers/zink/zink_descriptors.c b/src/gallium/drivers/zink/zink_descriptors.c
 --- a/src/gallium/drivers/zink/zink_descriptors.c
 +++ b/src/gallium/drivers/zink/zink_descriptors.c
@@ -1008,6 +1331,994 @@ diff -ruN a/src/gallium/drivers/zink/zink_descriptors.c b/src/gallium/drivers/zi
  void
  zink_descriptor_shader_get_binding_offsets(const struct zink_shader *shader, unsigned *offsets)
  {
+diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.c b/src/gallium/drivers/zink/zink_haiku_present.c
+--- a/src/gallium/drivers/zink/zink_haiku_present.c
++++ b/src/gallium/drivers/zink/zink_haiku_present.c
+@@ -0,0 +1,725 @@
++/*
++ * Presenting a finished frame straight into the screen on Haiku; see
++ * zink_haiku_present.h.
++ *
++ * Read back to the processor, every frame costs a wait for the GPU, a copy
++ * into a bitmap and two more in app_server (into its copy of the screen and
++ * from there into the frame buffer), one after the other. Here the GPU
++ * copies the frame into the frame buffer and into a staging buffer in cached
++ * memory in one batch, and a helper thread copies the staging buffer on into
++ * the window system's copy of the screen once the batch has run. The
++ * program's thread only waits when more presents are in flight than it
++ * allows.
++ *
++ * The window system's copy is not imported into the GPU: app_server's
++ * processor writes it all the time, and a cache line that straddles a
++ * rectangle's edge could be written back by one side over the other's
++ * pixels. Processor stores into it, from the helper thread, are coherent
++ * with app_server's.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "zink_haiku_present.h"
++
++#include <pthread.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++#include "zink_batch.h"
++#include "zink_clear.h"
++#include "zink_context.h"
++#include "zink_fence.h"
++#include "zink_resource.h"
++#include "zink_screen.h"
++#include "zink_types.h"
++
++#include "util/os_time.h"
++#include "util/u_math.h"
++#include "util/u_threaded_context.h"
++
++#include "vk_haiku_scanout.h"
++
++#ifdef __HAIKU__
++#include <fcntl.h>
++#include <unistd.h>
++#include <OS.h>
++/* sunxi_display.h is written for C++: its structures name each other
++ * without "struct" */
++typedef struct sunxi_display_timing sunxi_display_timing;
++typedef struct sunxi_display_output sunxi_display_output;
++#include <sunxi_display.h>
++#endif
++
++#define MAX_RECTS 256
++#define MAX_QUEUED 16
++/* Staging buffers for the window system's copy: one per present in flight,
++ * so frames_in_flight is at most this. */
++#define BACK_SLOTS 4
++
++/* A rectangle of the window system's copy, packed in a staging buffer: rows
++ * of row_pitch bytes from offset. */
++struct back_rect {
++   int32_t left, top;
++   uint32_t width, height;
++   uint32_t row_pitch;
++   uint64_t offset;
++};
++
++/* Staging rows are padded to this many pixels: the PowerVR transfer path
++ * writes a buffer whose row length is odd in two passes (its PBE line stride
++ * is counted in pairs of pixels), and 16 pixels keep rows on 64-byte cache
++ * lines for the processor's copy on. */
++#define BACK_ROW_ALIGN 16
++
++struct back_slot {
++   VkDeviceMemory memory;
++   VkBuffer buffer;
++   uint8_t *map;
++   uint64_t size;
++   bool coherent;
++   /* the present using it: where its rectangles go */
++   unsigned count;
++   struct back_rect rects[MAX_RECTS];
++   uint8_t *bits;
++   uint32_t bytes_per_row;
++   uint64_t used;
++};
++
++/* A present the helper thread waits for: by the number of its batch on the
++ * screen's timeline semaphore. The helper never touches zink's fences or
++ * batch states: those are recycled by the context's own thread, and a wait
++ * through them from another thread marks a reused batch idle, after which
++ * zink hands out memory the GPU is still using. */
++struct completion {
++   uint64_t batch_id;
++   void (*completed)(void *cookie);
++   void *cookie;
++   int slot;                      /* back_slot to copy on, or -1 */
++};
++
++static struct {
++   pthread_mutex_t lock;
++   pthread_cond_t changed;
++   struct zink_screen *screen;
++
++   /* The frame buffer the display scans out. */
++   VkDeviceMemory scanout_memory;
++   VkBuffer scanout_buffer;
++   uint32_t scanout_width, scanout_height, scanout_row_pitch;
++   uint64_t scanout_size;
++   int64_t scanout_refused_at;   /* os_time_get_nano() of the last refusal */
++#ifdef __HAIKU__
++   /* the display driver's frame buffer generation, checked once a second:
++    * a mode change replaces the frame buffer, and one that keeps the row
++    * length would otherwise go unnoticed */
++   int display_fd;
++   bool display_missing;
++   uint32_t scanout_generation;
++   int64_t scanout_checked_at;
++#endif
++
++   struct back_slot back[BACK_SLOTS];
++
++   /* Presents whose copies the helper thread waits for. */
++   struct completion queue[MAX_QUEUED];
++   unsigned queue_head, queue_count;
++   uint64_t submitted, finished;
++   bool thread_started;
++   pthread_t thread;
++} state = {
++   .lock = PTHREAD_MUTEX_INITIALIZER,
++   .changed = PTHREAD_COND_INITIALIZER,
++#ifdef __HAIKU__
++   .display_fd = -1,
++#endif
++};
++
++
++#ifdef __HAIKU__
++/* The sunxi_display driver's frame buffer generation (the Cubie A7S); false
++ * where there is no such driver, and then only the row length tells frame
++ * buffers apart. */
++static bool
++display_generation(uint32_t *generation)
++{
++   if (state.display_missing)
++      return false;
++   if (state.display_fd < 0) {
++      state.display_fd = open("/dev/" SUNXI_DISPLAY_DEVICE, O_RDWR | O_CLOEXEC);
++      if (state.display_fd < 0) {
++         state.display_missing = true;
++         return false;
++      }
++   }
++   struct sunxi_display_shared_info info;
++   if (ioctl(state.display_fd, SUNXI_DISPLAY_GET_STATE, &info,
++             sizeof(info)) != 0)
++      return false;
++   *generation = info.generation;
++   return true;
++}
++#endif
++
++
++static void
++copy_back(struct zink_screen *screen, struct back_slot *slot)
++{
++   if (!slot->coherent) {
++      const VkDeviceSize atom =
++         MAX2(screen->info.props.limits.nonCoherentAtomSize, 1);
++      VkDeviceSize size = align64(slot->used, atom);
++      VkMappedMemoryRange range = {
++         .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
++         .memory = slot->memory,
++         .offset = 0,
++         .size = size >= slot->size ? VK_WHOLE_SIZE : size,
++      };
++      VKSCR(InvalidateMappedMemoryRanges)(screen->dev, 1, &range);
++   }
++   for (unsigned i = 0; i < slot->count; i++) {
++      const struct back_rect *r = &slot->rects[i];
++      const size_t row = (size_t)r->width * 4;
++      const uint8_t *from = slot->map + r->offset;
++      uint8_t *to = slot->bits + (size_t)r->top * slot->bytes_per_row
++         + (size_t)r->left * 4;
++      for (uint32_t y = 0; y < r->height; y++) {
++         memcpy(to, from, row);
++         from += r->row_pitch;
++         to += slot->bytes_per_row;
++      }
++   }
++}
++
++
++static void *
++completion_thread(void *data)
++{
++   (void)data;
++   pthread_mutex_lock(&state.lock);
++   for (;;) {
++      while (state.queue_count == 0)
++         pthread_cond_wait(&state.changed, &state.lock);
++      struct completion entry = state.queue[state.queue_head];
++      struct zink_screen *screen = state.screen;
++      pthread_mutex_unlock(&state.lock);
++
++      /* On a lost device nothing ran: there is nothing to copy on, but the
++       * program still hears that the present is over. */
++      bool ran = !screen->device_lost;
++      if (ran && entry.batch_id != 0 && screen->sem != VK_NULL_HANDLE) {
++         VkSemaphoreWaitInfo wait = {
++            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
++            .semaphoreCount = 1,
++            .pSemaphores = &screen->sem,
++            .pValues = &entry.batch_id,
++         };
++         ran = VKSCR(WaitSemaphores)(screen->dev, &wait, UINT64_MAX)
++                  == VK_SUCCESS
++               && !screen->device_lost;
++      }
++      if (ran && entry.slot >= 0)
++         copy_back(screen, &state.back[entry.slot]);
++      if (entry.completed != NULL)
++         entry.completed(entry.cookie);
++
++      pthread_mutex_lock(&state.lock);
++      state.queue_head = (state.queue_head + 1) % MAX_QUEUED;
++      state.queue_count--;
++      state.finished++;
++      pthread_cond_broadcast(&state.changed);
++   }
++   return NULL;
++}
++
++
++/* With the lock held: waits until every present has finished, so that
++ * memory one of them still uses is never let go of. */
++static void
++wait_idle_locked(void)
++{
++   while (state.submitted != state.finished)
++      pthread_cond_wait(&state.changed, &state.lock);
++}
++
++
++static void
++drop_scanout(struct zink_screen *screen)
++{
++   wait_idle_locked();
++   if (state.scanout_buffer != VK_NULL_HANDLE)
++      VKSCR(DestroyBuffer)(screen->dev, state.scanout_buffer, NULL);
++   if (state.scanout_memory != VK_NULL_HANDLE)
++      VKSCR(FreeMemory)(screen->dev, state.scanout_memory, NULL);
++   state.scanout_buffer = VK_NULL_HANDLE;
++   state.scanout_memory = VK_NULL_HANDLE;
++   state.scanout_row_pitch = 0;
++}
++
++
++/* Takes hold of the frame buffer the display scans out. A mode change gives
++ * the screen a new one: its row length, or (on air/OS) the display driver's
++ * generation, tells them apart. */
++static bool
++acquire_scanout(struct zink_screen *screen, uint32_t bytes_per_row)
++{
++   const int64_t now = os_time_get_nano();
++   if (state.scanout_buffer != VK_NULL_HANDLE) {
++      bool current = state.scanout_row_pitch == bytes_per_row;
++#ifdef __HAIKU__
++      if (current && now - state.scanout_checked_at >= 1000000000LL) {
++         uint32_t generation;
++         state.scanout_checked_at = now;
++         if (display_generation(&generation)
++             && generation != state.scanout_generation)
++            current = false;
++      }
++#endif
++      if (current)
++         return true;
++      drop_scanout(screen);
++   }
++   /* Asking costs driver round trips; after a refusal, ask again later. */
++   if (state.scanout_refused_at != 0
++       && now - state.scanout_refused_at < 1000000000LL)
++      return false;
++
++#ifdef __HAIKU__
++   /* before the import: a change in between is noticed a second later */
++   uint32_t generation = 0;
++   display_generation(&generation);
++#endif
++
++   uint32_t type = UINT32_MAX;
++   for (uint32_t i = 0; i < screen->info.mem_props.memoryTypeCount; i++) {
++      if (screen->info.mem_props.memoryTypes[i].propertyFlags
++          & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
++         type = i;
++         break;
++      }
++   }
++   VkImportScanoutMemoryHAIKU scanout = {
++      .sType = VK_STRUCTURE_TYPE_IMPORT_SCANOUT_MEMORY_HAIKU,
++   };
++   VkMemoryAllocateInfo mai = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .pNext = &scanout,
++      .allocationSize = 0,
++      .memoryTypeIndex = type,
++   };
++   VkDeviceMemory memory = VK_NULL_HANDLE;
++   if (type == UINT32_MAX
++       || VKSCR(AllocateMemory)(screen->dev, &mai, NULL, &memory) != VK_SUCCESS) {
++      state.scanout_refused_at = now;
++      return false;
++   }
++   if (scanout.rowPitch != bytes_per_row) {
++      /* Not the frame buffer the window system is showing. */
++      VKSCR(FreeMemory)(screen->dev, memory, NULL);
++      state.scanout_refused_at = now;
++      return false;
++   }
++   VkBufferCreateInfo bci = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .size = scanout.size,
++      .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++   };
++   VkBuffer buffer = VK_NULL_HANDLE;
++   if (VKSCR(CreateBuffer)(screen->dev, &bci, NULL, &buffer) != VK_SUCCESS
++       || VKSCR(BindBufferMemory)(screen->dev, buffer, memory, 0) != VK_SUCCESS) {
++      if (buffer != VK_NULL_HANDLE)
++         VKSCR(DestroyBuffer)(screen->dev, buffer, NULL);
++      VKSCR(FreeMemory)(screen->dev, memory, NULL);
++      state.scanout_refused_at = now;
++      return false;
++   }
++   state.scanout_memory = memory;
++   state.scanout_buffer = buffer;
++   state.scanout_width = scanout.width;
++   state.scanout_height = scanout.height;
++   state.scanout_row_pitch = scanout.rowPitch;
++   state.scanout_size = scanout.size;
++   state.scanout_refused_at = 0;
++#ifdef __HAIKU__
++   state.scanout_generation = generation;
++   state.scanout_checked_at = now;
++#endif
++   return true;
++}
++
++
++static void
++drop_back_slot(struct zink_screen *screen, struct back_slot *slot)
++{
++   if (slot->map != NULL)
++      VKSCR(UnmapMemory)(screen->dev, slot->memory);
++   if (slot->buffer != VK_NULL_HANDLE)
++      VKSCR(DestroyBuffer)(screen->dev, slot->buffer, NULL);
++   if (slot->memory != VK_NULL_HANDLE)
++      VKSCR(FreeMemory)(screen->dev, slot->memory, NULL);
++   slot->map = NULL;
++   slot->buffer = VK_NULL_HANDLE;
++   slot->memory = VK_NULL_HANDLE;
++   slot->size = 0;
++}
++
++
++/* A staging buffer of at least `bytes` for the window system's copy, in
++ * host-cached memory if there is any (it is read by the processor), kept
++ * mapped. The slot is idle: no present in flight uses it. */
++static bool
++ensure_back_slot(struct zink_screen *screen, struct back_slot *slot,
++                 uint64_t bytes)
++{
++   if (slot->buffer != VK_NULL_HANDLE && slot->size >= bytes)
++      return true;
++   drop_back_slot(screen, slot);
++
++   /* by the rectangles, with room to grow, not by the screen */
++   const uint64_t size = align64(bytes + bytes / 4, 65536);
++   VkBufferCreateInfo bci = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .size = size,
++      .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++   };
++   if (VKSCR(CreateBuffer)(screen->dev, &bci, NULL, &slot->buffer)
++       != VK_SUCCESS) {
++      slot->buffer = VK_NULL_HANDLE;
++      return false;
++   }
++   VkMemoryRequirements reqs;
++   VKSCR(GetBufferMemoryRequirements)(screen->dev, slot->buffer, &reqs);
++
++   const VkMemoryPropertyFlags cached =
++      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
++   const VkMemoryPropertyFlags visible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
++   uint32_t type = UINT32_MAX;
++   for (unsigned pass = 0; pass < 2 && type == UINT32_MAX; pass++) {
++      const VkMemoryPropertyFlags wanted = pass == 0 ? cached : visible;
++      for (uint32_t i = 0; i < screen->info.mem_props.memoryTypeCount; i++) {
++         if ((reqs.memoryTypeBits & BITFIELD_BIT(i))
++             && (screen->info.mem_props.memoryTypes[i].propertyFlags & wanted)
++                == wanted) {
++            type = i;
++            break;
++         }
++      }
++   }
++   VkMemoryAllocateInfo mai = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = reqs.size,
++      .memoryTypeIndex = type,
++   };
++   void *map = NULL;
++   if (type == UINT32_MAX
++       || VKSCR(AllocateMemory)(screen->dev, &mai, NULL, &slot->memory)
++          != VK_SUCCESS) {
++      slot->memory = VK_NULL_HANDLE;
++      drop_back_slot(screen, slot);
++      return false;
++   }
++   if (VKSCR(BindBufferMemory)(screen->dev, slot->buffer, slot->memory, 0)
++          != VK_SUCCESS
++       || VKSCR(MapMemory)(screen->dev, slot->memory, 0, VK_WHOLE_SIZE, 0,
++                           &map) != VK_SUCCESS) {
++      drop_back_slot(screen, slot);
++      return false;
++   }
++   slot->map = map;
++   slot->size = size;
++   slot->coherent = (screen->info.mem_props.memoryTypes[type].propertyFlags
++                     & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
++   return true;
++}
++
++
++static void release_at_exit(void);
++
++
++/* Clips one of the present's rectangles to the image and to a surface of
++ * width x height pixels; false if nothing is left. */
++static bool
++clip_rect(const struct summit_haiku_present *p, uint32_t i,
++          unsigned image_width, unsigned image_height, uint32_t width,
++          uint32_t height, int32_t *left, int32_t *top, int32_t *right,
++          int32_t *bottom)
++{
++   const int32_t *r = p->rects + i * 4;
++   *left = MAX2(MAX2(r[0], p->origin_x), 0);
++   *top = MAX2(MAX2(r[1], p->origin_y), 0);
++   *right = MIN2(MIN2(r[2] + 1, p->origin_x + (int32_t)image_width),
++                 (int32_t)width);
++   *bottom = MIN2(MIN2(r[3] + 1, p->origin_y + (int32_t)image_height),
++                  (int32_t)height);
++   return *right > *left && *bottom > *top;
++}
++
++
++static VkBufferImageCopy
++image_region(const struct summit_haiku_present *p, struct zink_resource *res,
++             int32_t left, int32_t top, int32_t right, int32_t bottom,
++             uint64_t offset, uint32_t row_length)
++{
++   return (VkBufferImageCopy) {
++      .bufferOffset = offset,
++      .bufferRowLength = row_length,
++      .bufferImageHeight = bottom - top,
++      .imageSubresource = {
++         .aspectMask = res->aspect,
++         .mipLevel = 0,
++         .baseArrayLayer = 0,
++         .layerCount = 1,
++      },
++      .imageOffset = { left - p->origin_x, top - p->origin_y, 0 },
++      .imageExtent = { right - left, bottom - top, 1 },
++   };
++}
++
++
++/* The frame buffer's regions: straight into a linear surface. */
++static unsigned
++front_regions(VkBufferImageCopy *regions, const struct summit_haiku_present *p,
++              struct zink_resource *res, unsigned image_width,
++              unsigned image_height)
++{
++   unsigned count = 0;
++   for (uint32_t i = 0; i < p->rect_count && count < MAX_RECTS; i++) {
++      int32_t left, top, right, bottom;
++      if (!clip_rect(p, i, image_width, image_height, state.scanout_width,
++                     state.scanout_height, &left, &top, &right, &bottom))
++         continue;
++      regions[count++] = image_region(p, res, left, top, right, bottom,
++         (uint64_t)top * state.scanout_row_pitch + (uint64_t)left * 4,
++         state.scanout_row_pitch / 4);
++   }
++   return count;
++}
++
++
++/* The window system's copy: each rectangle packed into the slot's staging
++ * buffer, and remembered for the helper thread. */
++static unsigned
++back_regions(VkBufferImageCopy *regions, struct back_slot *slot,
++             const struct summit_haiku_present *p, struct zink_resource *res,
++             unsigned image_width, unsigned image_height, uint64_t *bytes)
++{
++   unsigned count = 0;
++   uint64_t offset = 0;
++   for (uint32_t i = 0; i < p->rect_count && count < MAX_RECTS; i++) {
++      int32_t left, top, right, bottom;
++      if (!clip_rect(p, i, image_width, image_height, p->back_width,
++                     p->back_height, &left, &top, &right, &bottom))
++         continue;
++      const uint32_t width = right - left, height = bottom - top;
++      const uint32_t row_length = align(width, BACK_ROW_ALIGN);
++      regions[count] = image_region(p, res, left, top, right, bottom, offset,
++                                    row_length);
++      slot->rects[count] = (struct back_rect) {
++         .left = left,
++         .top = top,
++         .width = width,
++         .height = height,
++         .row_pitch = row_length * 4,
++         .offset = offset,
++      };
++      count++;
++      offset += (uint64_t)row_length * 4 * height;
++   }
++   *bytes = offset;
++   return count;
++}
++
++
++int
++zink_haiku_present(struct pipe_context *pipe, struct pipe_resource *image,
++                   const struct summit_haiku_present *p)
++{
++   if (pipe == NULL || image == NULL || p == NULL
++       || p->version != SUMMIT_HAIKU_PRESENT_VERSION
++       || (p->rect_count > 0 && p->rects == NULL))
++      return -1;
++   /* The screen holds 32 bit pixels in the order B, G, R, A; copying is
++    * byte for byte, so the image must be in that order already. */
++   if (image->format != PIPE_FORMAT_B8G8R8A8_UNORM
++       && image->format != PIPE_FORMAT_B8G8R8X8_UNORM)
++      return -2;
++
++   struct zink_context *ctx = zink_context(threaded_context_unwrap_sync(pipe));
++   struct zink_screen *screen = zink_screen(image->screen);
++   struct zink_resource *res = zink_resource(image);
++   if (res->obj->is_buffer)
++      return -1;
++
++   pthread_mutex_lock(&state.lock);
++   if (state.screen != NULL && state.screen != screen) {
++      pthread_mutex_unlock(&state.lock);
++      return -1;
++   }
++   state.screen = screen;
++   if (!state.thread_started) {
++      /* Normally the display is destroyed, or the program lets go, first. */
++      atexit(release_at_exit);
++      if (pthread_create(&state.thread, NULL, completion_thread, NULL) != 0) {
++         pthread_mutex_unlock(&state.lock);
++         return -1;
++      }
++      state.thread_started = true;
++   }
++   /* Keep the GPU from falling more than a few frames behind; each present
++    * in flight may hold a staging buffer. */
++   unsigned in_flight = p->frames_in_flight ? p->frames_in_flight : 2;
++   in_flight = CLAMP(in_flight, 1, BACK_SLOTS);
++   while (state.submitted - state.finished >= in_flight
++          || state.queue_count == MAX_QUEUED)
++      pthread_cond_wait(&state.changed, &state.lock);
++
++   const unsigned image_width = image->width0;
++   const unsigned image_height = image->height0;
++   static VkBufferImageCopy front[MAX_RECTS], back[MAX_RECTS];
++   unsigned front_count = 0, back_count = 0;
++   int slot_index = -1;
++   int result = 0;
++
++   if (p->front_bytes_per_row != 0) {
++      if (acquire_scanout(screen, p->front_bytes_per_row))
++         front_count = front_regions(front, p, res, image_width, image_height);
++      else
++         result = -3;
++   }
++   if (result == 0 && p->back_bits != NULL) {
++      if (p->back_bytes_per_row < p->back_width * 4)
++         result = -4;
++      else {
++         /* free: the present that used it last has finished */
++         slot_index = state.submitted % BACK_SLOTS;
++         struct back_slot *slot = &state.back[slot_index];
++         uint64_t bytes = 0;
++         back_count = back_regions(back, slot, p, res, image_width,
++                                   image_height, &bytes);
++         if (back_count != 0 && !ensure_back_slot(screen, slot, bytes))
++            result = -4;
++         else {
++            slot->count = back_count;
++            slot->bits = p->back_bits;
++            slot->bytes_per_row = p->back_bytes_per_row;
++            slot->used = bytes;
++         }
++      }
++   }
++   if (result == 0 && front_count == 0 && back_count == 0)
++      result = p->rect_count == 0 ? 0 : -5;
++   if (result != 0 || (front_count == 0 && back_count == 0)) {
++      pthread_mutex_unlock(&state.lock);
++      if (result == 0 && p->completed != NULL)
++         p->completed(p->cookie);
++      return result;
++   }
++
++   uint64_t batch_id = 0;
++   if (!screen->device_lost) {
++      /* what was drawn last, a clear that is still pending included */
++      zink_fb_clears_apply(ctx, image, 0, 1);
++      zink_batch_no_rp(ctx);
++      screen->image_barrier(ctx, res, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                            VK_ACCESS_TRANSFER_READ_BIT,
++                            VK_PIPELINE_STAGE_TRANSFER_BIT);
++      zink_batch_reference_resource_rw(ctx, res, false);
++      VkCommandBuffer cmdbuf = ctx->bs->cmdbuf;
++
++      /* The previous present wrote the same memory: order the writes. */
++      VkMemoryBarrier before = {
++         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++         .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++      };
++      VKCTX(CmdPipelineBarrier)(cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before,
++                                0, NULL, 0, NULL);
++      if (front_count != 0)
++         VKCTX(CmdCopyImageToBuffer)(cmdbuf, res->obj->image, res->layout,
++                                     state.scanout_buffer, front_count, front);
++      if (back_count != 0)
++         VKCTX(CmdCopyImageToBuffer)(cmdbuf, res->obj->image, res->layout,
++                                     state.back[slot_index].buffer,
++                                     back_count, back);
++      /* The helper thread reads the staging buffer with the processor. */
++      VkMemoryBarrier after = {
++         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++         .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
++      };
++      VKCTX(CmdPipelineBarrier)(cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &after,
++                                0, NULL, 0, NULL);
++      ctx->bs->has_work = true;
++
++      struct pipe_fence_handle *fence = NULL;
++      ctx->base.flush(&ctx->base, &fence, 0);
++      /* The batch's number on the timeline, once it has been submitted (on
++       * the flush thread when submission is threaded); then the fence goes,
++       * here, on the context's own thread. */
++      struct zink_tc_fence *mfence = zink_tc_fence(fence);
++      if (mfence != NULL && mfence->fence != NULL) {
++         struct zink_batch_state *bs = zink_batch_state(mfence->fence);
++         if (screen->threaded_submit)
++            util_queue_fence_wait(&bs->flush_completed);
++         batch_id = mfence->fence->batch_id;
++      }
++      screen->base.fence_reference(&screen->base, &fence, NULL);
++   }
++
++   unsigned tail = (state.queue_head + state.queue_count) % MAX_QUEUED;
++   state.queue[tail] = (struct completion) {
++      .batch_id = batch_id,
++      .completed = p->completed,
++      .cookie = p->cookie,
++      .slot = back_count != 0 ? slot_index : -1,
++   };
++   state.queue_count++;
++   state.submitted++;
++   pthread_cond_broadcast(&state.changed);
++   pthread_mutex_unlock(&state.lock);
++   return 0;
++}
++
++
++void
++zink_haiku_present_release(struct pipe_screen *pscreen)
++{
++   pthread_mutex_lock(&state.lock);
++   struct zink_screen *screen = state.screen;
++   if (screen != NULL && (pscreen == NULL || &screen->base == pscreen)) {
++      /* the presents first: their copies still use what goes */
++      wait_idle_locked();
++      for (unsigned i = 0; i < BACK_SLOTS; i++)
++         drop_back_slot(screen, &state.back[i]);
++      drop_scanout(screen);
++      if (pscreen != NULL)
++         state.screen = NULL;
++   }
++   pthread_mutex_unlock(&state.lock);
++}
++
++
++static void
++release_at_exit(void)
++{
++   zink_haiku_present_release(NULL);
++#ifdef __HAIKU__
++   pthread_mutex_lock(&state.lock);
++   if (state.display_fd >= 0)
++      close(state.display_fd);
++   state.display_fd = -1;
++   pthread_mutex_unlock(&state.lock);
++#endif
++}
++
++
++void
++zink_haiku_present_wait_idle(void)
++{
++   pthread_mutex_lock(&state.lock);
++   wait_idle_locked();
++   pthread_mutex_unlock(&state.lock);
++}
+diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.h b/src/gallium/drivers/zink/zink_haiku_present.h
+--- a/src/gallium/drivers/zink/zink_haiku_present.h
++++ b/src/gallium/drivers/zink/zink_haiku_present.h
+@@ -0,0 +1,89 @@
++/*
++ * Presenting a finished frame straight into the screen on Haiku, for a
++ * program that composites with OpenGL ES through EGL (Summit's web process).
++ *
++ * The frame is copied into the rectangles of the screen the window system
++ * says are visible: by the GPU into the frame buffer the display scans out
++ * (imported through VkImportScanoutMemoryHAIKU, vk_haiku_scanout.h), and
++ * into the window system's own copy of the screen, which it draws into
++ * first and copies to the frame buffer (a direct window with
++ * B_DIRECT_DEVICE_PIXELS is handed it as drawing_bits_area). On air/OS the
++ * GPU copies the rectangles into a buffer of zink's own in cached memory and
++ * a helper thread copies them on into the window system's copy once the GPU
++ * is done: the GPU never writes memory app_server's processor writes too.
++ * Nothing waits for the GPU on the program's thread.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef ZINK_HAIKU_PRESENT_H
++#define ZINK_HAIKU_PRESENT_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct pipe_context;
++struct pipe_resource;
++struct pipe_screen;
++
++#define SUMMIT_HAIKU_PRESENT_VERSION 1
++
++struct summit_haiku_present {
++   uint32_t version;              /* SUMMIT_HAIKU_PRESENT_VERSION */
++   /* Where the image's top left texel goes, in frame buffer pixels. */
++   int32_t origin_x, origin_y;
++   /* What to copy, in frame buffer pixels, both edges included (as
++    * clipping_rect): left, top, right, bottom for each. Already clipped to
++    * what is visible; parts outside the image or the screen are dropped. */
++   uint32_t rect_count;
++   const int32_t *rects;
++   /* The frame buffer's row length, to recognise it; 0 skips it. */
++   uint32_t front_bytes_per_row;
++   /* The window system's copy of the screen as mapped in this team, or
++    * NULL. It is written by a helper thread before completed() is called,
++    * so the mapping must stay until then. */
++   void *back_bits;
++   uint32_t back_bytes_per_row;
++   uint32_t back_width, back_height;
++   /* Presents that may still be running on the GPU when another starts;
++    * the call waits for older ones. 0 means 2. */
++   uint32_t frames_in_flight;
++   /* Called on a helper thread once this present's copies are done (or at
++    * once if there was nothing to copy), also when the device was lost and
++    * nothing could be copied. May be NULL. */
++   void (*completed)(void *cookie);
++   void *cookie;
++};
++
++/* Returns 0 when the copies were submitted, a negative number when this
++ * present cannot go to the screen (the caller then presents some other way):
++ * -1 bad arguments, -2 unsupported image format, -3 no frame buffer to be had
++ * or it is not the one described, -4 the window system's copy could not be
++ * made, -5 nothing visible. */
++int zink_haiku_present(struct pipe_context *pipe, struct pipe_resource *image,
++                       const struct summit_haiku_present *present);
++
++/* Waits until every present submitted so far has finished. */
++void zink_haiku_present_wait_idle(void);
++
++/* Waits for the presents, then lets go of the frame buffer and of the
++ * staging buffers, for the given screen or any (NULL). Call before the
++ * program or the screen goes away. Presenting again takes hold of them
++ * again. */
++void zink_haiku_present_release(struct pipe_screen *screen);
++
++/* Summit's entry points, exported by the EGL library (Haiku) or the DRI
++ * driver (the Linux host build), for the current context; see
++ * zink_haiku_present_gl.c. */
++int summit_haiku_present_framebuffer(unsigned framebuffer,
++                                     const struct summit_haiku_present *present);
++void summit_haiku_present_wait_idle(void);
++void summit_haiku_present_release(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* ZINK_HAIKU_PRESENT_H */
+diff -ruN a/src/gallium/drivers/zink/zink_haiku_present_gl.c b/src/gallium/drivers/zink/zink_haiku_present_gl.c
+--- a/src/gallium/drivers/zink/zink_haiku_present_gl.c
++++ b/src/gallium/drivers/zink/zink_haiku_present_gl.c
+@@ -0,0 +1,63 @@
++/*
++ * Summit's entry points to zink_haiku_present.h, for the current OpenGL
++ * (ES) context. Summit's web process composites each page into a
++ * framebuffer object and finds these with get_image_symbol() in
++ * libEGL_mesa, so EGL's dispatch tables stay as they are. Built into the
++ * Haiku EGL driver, and into the DRI driver of the Linux host build, where
++ * build.sh's smoke test calls them.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++#include <string.h>
++
++#include "main/glthread.h"
++#include "main/mtypes.h"
++#include "glapi/glapi/glapi.h"
++#include "state_tracker/st_context.h"
++#include "util/macros.h"
++
++#include "zink/zink_haiku_present.h"
++
++/* The framebuffer object must be the one bound for drawing, as it is when a
++ * frame has just been composited into it. Returns 0 when the copies were
++ * submitted, a negative number when the caller has to present some other
++ * way (see zink_haiku_present.h; -10: no current context or not a zink one,
++ * -11: that framebuffer object is not bound or has no colour renderbuffer).
++ */
++PUBLIC int
++summit_haiku_present_framebuffer(unsigned framebuffer,
++                                 const struct summit_haiku_present *present)
++{
++   GET_CURRENT_CONTEXT(ctx);
++   if (ctx == NULL || ctx->st == NULL)
++      return -10;
++   _mesa_glthread_finish(ctx);
++
++   struct st_context *st = ctx->st;
++   struct pipe_screen *screen = st->screen;
++   if (screen == NULL || screen->get_name == NULL
++       || strncmp(screen->get_name(screen), "zink", 4) != 0)
++      return -10;
++
++   struct gl_framebuffer *fb = ctx->DrawBuffer;
++   if (fb == NULL || framebuffer == 0 || fb->Name != framebuffer)
++      return -11;
++   struct gl_renderbuffer *rb = fb->Attachment[BUFFER_COLOR0].Renderbuffer;
++   if (rb == NULL || rb->texture == NULL)
++      return -11;
++
++   return zink_haiku_present(st->pipe, rb->texture, present);
++}
++
++PUBLIC void
++summit_haiku_present_wait_idle(void)
++{
++   zink_haiku_present_wait_idle();
++}
++
++PUBLIC void
++summit_haiku_present_release(void)
++{
++   zink_haiku_present_release(NULL);
++}
+diff -ruN a/src/gallium/drivers/zink/zink_resource.c b/src/gallium/drivers/zink/zink_resource.c
+--- a/src/gallium/drivers/zink/zink_resource.c
++++ b/src/gallium/drivers/zink/zink_resource.c
+@@ -1160,6 +1160,17 @@
+       for (unsigned i = 0; !obj->bo && i < screen->heap_count[heap]; i++) {
+          if (!(reqs->memoryTypeBits & BITFIELD_BIT(screen->heap_map[heap][i])))
+             continue;
++         /* Coherent and persistent maps are never flushed or invalidated:
++          * not in host memory that is not coherent (see zink_screen.c).
++          */
++         if (screen->noncoherent_cached_staging &&
++             (templ->flags & (PIPE_RESOURCE_FLAG_MAP_COHERENT | PIPE_RESOURCE_FLAG_MAP_PERSISTENT))) {
++            const VkMemoryPropertyFlags type_flags =
++               screen->info.mem_props.memoryTypes[screen->heap_map[heap][i]].propertyFlags;
++            if ((type_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
++                !(type_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
++               continue;
++         }
+ 
+          mai.memoryTypeIndex = screen->heap_map[heap][i];
+          obj->bo = zink_bo(zink_bo_create(screen, reqs->size, alignment, heap, mai.pNext ? ZINK_ALLOC_NO_SUBALLOC : 0, mai.memoryTypeIndex, mai.pNext));
+@@ -2548,6 +2559,29 @@
+       *size += align;
+ }
+ 
++/* The first size bytes of obj, widened to nonCoherentAtomSize. Unlike
++ * zink_resource_init_mem_range(), whose limit is the object's size although
++ * offsets are relative to its (possibly larger, shared) memory, this stays
++ * inside the object: an image's readback no longer invalidates its whole
++ * staging slab.
++ */
++static VkMappedMemoryRange
++noncoherent_object_range(struct zink_screen *screen, struct zink_resource_object *obj, VkDeviceSize size)
++{
++   const VkDeviceSize atom = MAX2(screen->info.props.limits.nonCoherentAtomSize, 1);
++   const VkDeviceSize start = obj->offset - obj->offset % atom;
++   VkDeviceSize end = obj->offset + MIN2(size, obj->size);
++   end += (atom - end % atom) % atom;
++   VkMappedMemoryRange range = {
++      VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
++      NULL,
++      zink_bo_get_mem(obj->bo),
++      start,
++      end > obj->offset + obj->size ? VK_WHOLE_SIZE : end - start
++   };
++   return range;
++}
++
+ VkMappedMemoryRange
+ zink_resource_init_mem_range(struct zink_screen *screen, struct zink_resource_object *obj, VkDeviceSize offset, VkDeviceSize size)
+ {
+@@ -2722,7 +2756,13 @@
+          goto success;
+       usage |= PIPE_MAP_UNSYNCHRONIZED;
+    } else if (((usage & PIPE_MAP_READ) && !(usage & PIPE_MAP_PERSISTENT) &&
+-               ((screen->info.mem_props.memoryTypes[res->obj->bo->base.placement].propertyFlags & VK_STAGING_RAM) != VK_STAGING_RAM)) ||
++               ((screen->info.mem_props.memoryTypes[res->obj->bo->base.placement].propertyFlags & VK_STAGING_RAM) != VK_STAGING_RAM)
++               /* cached memory that is not coherent reads as fast, once
++                * invalidated (below): no second staging copy
++                */
++               && !(screen->noncoherent_cached_staging &&
++                    (screen->info.mem_props.memoryTypes[res->obj->bo->base.placement].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
++              ) ||
+               !res->obj->host_visible) {
+       /* any read, non-HV write, or unmappable that reaches this point needs staging */
+       if ((usage & PIPE_MAP_READ) || !res->obj->host_visible || res->base.b.flags & PIPE_RESOURCE_FLAG_DONT_MAP_DIRECTLY) {
+@@ -2892,6 +2932,16 @@
+       }
+ 
+       ptr = map_resource(screen, staging_res);
++      /* the copy is complete (zink_fence_wait()); a staging buffer in host
++       * memory that is not coherent must be invalidated before it is read
++       */
++      if (ptr && (usage & PIPE_MAP_READ) && !staging_res->obj->coherent) {
++         VkMappedMemoryRange range =
++            noncoherent_object_range(screen, staging_res->obj,
++                                     staging_res->base.b.width0);
++         if (VKSCR(InvalidateMappedMemoryRanges)(screen->dev, 1, &range) != VK_SUCCESS)
++            mesa_loge("ZINK: vkInvalidateMappedMemoryRanges failed");
++      }
+    } else {
+       assert(res->linear);
+       ptr = map_resource(screen, res);
+@@ -2904,6 +2954,15 @@
+          else
+             zink_resource_usage_wait(ctx, res, ZINK_RESOURCE_ACCESS_WRITE);
+       }
++      /* a linear image in host memory that is not coherent: invalidate what
++       * the GPU wrote before reading it
++       */
++      if ((usage & PIPE_MAP_READ) && !res->obj->coherent) {
++         VkMappedMemoryRange range =
++            noncoherent_object_range(screen, res->obj, res->obj->size);
++         if (VKSCR(InvalidateMappedMemoryRanges)(screen->dev, 1, &range) != VK_SUCCESS)
++            mesa_loge("ZINK: vkInvalidateMappedMemoryRanges failed");
++      }
+       VkImageSubresource isr = {
+          res->modifiers ? res->obj->modifier_aspect : res->aspect,
+          level,
 diff -ruN a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
 --- a/src/gallium/drivers/zink/zink_screen.c
 +++ b/src/gallium/drivers/zink/zink_screen.c
@@ -1024,6 +2335,35 @@ diff -ruN a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zi
  #endif
  
     /* Hash in the Vulkan pipeline cache UUID to identify the combination of
+@@ -3541,8 +3547,26 @@
+          assert(i == ZINK_HEAP_HOST_VISIBLE_COHERENT_CACHED || i == ZINK_HEAP_DEVICE_LOCAL_LAZY ||
+                 i == ZINK_HEAP_DEVICE_LOCAL_VISIBLE);
+          if (i == ZINK_HEAP_HOST_VISIBLE_COHERENT_CACHED) {
+-            memcpy(screen->heap_map[i], screen->heap_map[ZINK_HEAP_HOST_VISIBLE_COHERENT], screen->heap_count[ZINK_HEAP_HOST_VISIBLE_COHERENT]);
+-            screen->heap_count[i] = screen->heap_count[ZINK_HEAP_HOST_VISIBLE_COHERENT];
++            /* No coherent cached memory (the PowerVR driver on air/OS): the
++             * staging that reads back what the GPU wrote, every GL frame, is
++             * far faster from cached memory that is kept coherent by hand
++             * (each object knows whether it is coherent, and maps of the
++             * others are invalidated and flushed) than from write-combined
++             * memory. Coherent types follow, for resources that must be
++             * coherent (allocate_bo()). On air/OS by default;
++             * ZINK_NONCOHERENT_CACHED_STAGING=1 elsewhere, =0 to turn it off.
++             */
++            if (debug_get_bool_option("ZINK_NONCOHERENT_CACHED_STAGING", DETECT_OS_HAIKU)) {
++               const VkMemoryPropertyFlags cached =
++                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
++               for (unsigned j = 0; j < screen->info.mem_props.memoryTypeCount; j++) {
++                  if ((screen->info.mem_props.memoryTypes[j].propertyFlags & cached) == cached)
++                     screen->heap_map[i][screen->heap_count[i]++] = j;
++               }
++               screen->noncoherent_cached_staging = screen->heap_count[i] > 0;
++            }
++            for (unsigned j = 0; j < screen->heap_count[ZINK_HEAP_HOST_VISIBLE_COHERENT]; j++)
++               screen->heap_map[i][screen->heap_count[i]++] = screen->heap_map[ZINK_HEAP_HOST_VISIBLE_COHERENT][j];
+          } else {
+             memcpy(screen->heap_map[i], screen->heap_map[ZINK_HEAP_DEVICE_LOCAL], screen->heap_count[ZINK_HEAP_DEVICE_LOCAL]);
+             screen->heap_count[i] = screen->heap_count[ZINK_HEAP_DEVICE_LOCAL];
 diff -ruN a/src/gallium/drivers/zink/zink_state.c b/src/gallium/drivers/zink/zink_state.c
 --- a/src/gallium/drivers/zink/zink_state.c
 +++ b/src/gallium/drivers/zink/zink_state.c
@@ -1060,6 +2400,20 @@ diff -ruN a/src/gallium/drivers/zink/zink_state.c b/src/gallium/drivers/zink/zin
  
     return &zstate->b;
  }
+diff -ruN a/src/gallium/drivers/zink/zink_types.h b/src/gallium/drivers/zink/zink_types.h
+--- a/src/gallium/drivers/zink/zink_types.h
++++ b/src/gallium/drivers/zink/zink_types.h
+@@ -1446,6 +1446,10 @@
+    } pb;
+    uint8_t heap_map[ZINK_HEAP_MAX][VK_MAX_MEMORY_TYPES];  // mapping from zink heaps to memory type indices
+    uint8_t heap_count[ZINK_HEAP_MAX];  // number of memory types per zink heap
++   /* staging (ZINK_HEAP_HOST_VISIBLE_COHERENT_CACHED) uses host-cached memory
++    * that is not coherent, kept coherent on map/unmap (zink_screen.c)
++    */
++   bool noncoherent_cached_staging;
+    bool resizable_bar;
+ 
+    uint64_t total_video_mem;
 diff -ruN a/src/gallium/frontends/hgl/hgl.c b/src/gallium/frontends/hgl/hgl.c
 --- a/src/gallium/frontends/hgl/hgl.c
 +++ b/src/gallium/frontends/hgl/hgl.c
@@ -1233,6 +2587,39 @@ diff -ruN a/src/gallium/frontends/hgl/meson.build b/src/gallium/frontends/hgl/me
 +  dependencies : idep_mesautilformat,
    gnu_symbol_visibility : 'hidden',
  )
+diff -ruN a/src/gallium/targets/dri/dri.sym.in b/src/gallium/targets/dri/dri.sym.in
+--- a/src/gallium/targets/dri/dri.sym.in
++++ b/src/gallium/targets/dri/dri.sym.in
+@@ -9,6 +9,9 @@
+                 _mesa_glapi_tls_Context;
+                 _mesa_glapi_tls_Dispatch;
+ 
++		summit_haiku_present_framebuffer;
++		summit_haiku_present_wait_idle;
++		summit_haiku_present_release;
+ 		ddebug_screen_create;
+ 		noop_screen_create;
+ 		util_run_tests;
+diff -ruN a/src/gallium/targets/dri/meson.build b/src/gallium/targets/dri/meson.build
+--- a/src/gallium/targets/dri/meson.build
++++ b/src/gallium/targets/dri/meson.build
+@@ -39,9 +39,15 @@
+   libgallium_name = 'gallium-@0@'.format(meson.project_version())
+ endif
+ 
++files_libgallium_dri = files('dri_target.c')
++if with_gallium_zink
++  # Summit's direct present, for the air/OS host smoke test
++  files_libgallium_dri += files('../../drivers/zink/zink_haiku_present_gl.c')
++endif
++
+ libgallium_dri = shared_library(
+   libgallium_name,
+-  files('dri_target.c'),
++  files_libgallium_dri,
+   include_directories : [
+     inc_include, inc_src, inc_mesa, inc_gallium, inc_gallium_aux, inc_util, inc_gallium_drivers,
+     inc_gallium_winsys, include_directories('../../frontends/dri'),
 diff -ruN a/src/gallium/winsys/sw/hgl/meson.build b/src/gallium/winsys/sw/hgl/meson.build
 --- a/src/gallium/winsys/sw/hgl/meson.build
 +++ b/src/gallium/winsys/sw/hgl/meson.build
@@ -1267,3 +2654,22 @@ diff -ruN a/src/mesa/state_tracker/st_cb_flush.c b/src/mesa/state_tracker/st_cb_
     }
  
     return gl_reset_status_from_pipe_reset_status(status);
+diff -ruN a/src/util/disk_cache.c b/src/util/disk_cache.c
+--- a/src/util/disk_cache.c
++++ b/src/util/disk_cache.c
+@@ -352,6 +352,15 @@
+ void
+ disk_cache_wait_for_idle(struct disk_cache *cache)
+ {
++   /* (air/OS) A disabled cache (MESA_SHADER_CACHE_DISABLE, or a path that
++    * could not be made) never initialized its queue, as disk_cache_put() and
++    * disk_cache_destroy() know: util_queue_finish() locked its zeroed mutex,
++    * which Haiku's libroot asserts on (owner 0, not -1) when zink destroys
++    * its screen.
++    */
++   if (!util_queue_is_initialized(&cache->cache_queue))
++      return;
++
+    util_queue_finish(&cache->cache_queue);
+ }
+ 

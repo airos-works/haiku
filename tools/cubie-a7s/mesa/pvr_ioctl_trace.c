@@ -9,6 +9,12 @@
 // answers like the Linux kernel driver for any BVNC). It shows what the
 // air/OS powervr driver will receive: same numbers, same structures; only
 // GET_BO_MMAP_OFFSET + mmap() become PVR_HAIKU_NR_MAP_BO there.
+// PVR_TRACE_FAIL_SUBMIT=N makes the N-th SUBMIT_JOBS and every one after it
+// fail with EIO without reaching the shim, as for a context the kernel
+// ended (a GPU reset): what Mesa does then is in the log.
+// CPU maps of buffer objects (mmap() of the DRM device, munmap() of such a
+// map) are logged too, as "mmap" and "munmap" lines: on air/OS they are
+// PVR_HAIKU_NR_MAP_BO and delete_area() of the clone.
 // The shim gives every syncobj handle 1 and every VM context, context, free
 // list and HWRT data set handle 0 (it ignores them afterwards), so the tracer
 // numbers those itself, 1, 2, 3... per kind, to keep the trace readable.
@@ -25,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <time.h>
 
 #include "drm-uapi/drm.h"
@@ -34,7 +41,18 @@
 static int (*sNextIoctl)(int, unsigned long, ...);
 static pthread_mutex_t sLock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned sSequence;
+static unsigned sSubmits;
+static unsigned sFailSubmit;
 static uint32_t sNextHandle[0x100];
+
+// file descriptors DRM requests went to, and the CPU maps made through them
+#define MAX_FDS		1024
+static uint8_t sDrmFds[MAX_FDS];
+static void** sMaps;
+static size_t sMapCount, sMapCapacity;
+static void* (*sNextMmap)(void*, size_t, int, int, int, off_t);
+static void* (*sNextMmap64)(void*, size_t, int, int, int, off64_t);
+static int (*sNextMunmap)(void*, size_t);
 
 
 // the tracer's own handle for objects the shim does not number
@@ -239,9 +257,15 @@ print_in(FILE* out, unsigned nr, void* arg)
 		}
 		case 0x4b: {
 			struct drm_pvr_ioctl_create_hwrt_dataset_args* a = arg;
-			fprintf(out, " %ux%u samples=%u layers=%u free_lists=%u,%u",
+			fprintf(out, " %ux%u samples=%u layers=%u free_lists=%u,%u"
+				" merge=%u,%u/%u,%u/%u,%u rgn_header_size=%u tpc=%u/%u",
 				a->width, a->height, a->samples, a->layers,
-				a->free_list_handles[0], a->free_list_handles[1]);
+				a->free_list_handles[0], a->free_list_handles[1],
+				a->isp_merge_lower_x, a->isp_merge_lower_y,
+				a->isp_merge_upper_x, a->isp_merge_upper_y,
+				a->isp_merge_scale_x, a->isp_merge_scale_y,
+				a->region_header_size, a->geom_data_args.tpc_size,
+				a->geom_data_args.tpc_stride);
 			break;
 		}
 		case 0x4d: {
@@ -395,6 +419,8 @@ ioctl(int fd, unsigned long request, ...)
 		return sNextIoctl(fd, request, arg);
 
 	unsigned nr = _IOC_NR(request);
+	if (fd >= 0 && fd < MAX_FDS)
+		sDrmFds[fd] = 1;
 	char* line = NULL;
 	size_t length = 0;
 	FILE* out = open_memstream(&line, &length);
@@ -407,15 +433,34 @@ ioctl(int fd, unsigned long request, ...)
 	fprintf(out, "ioctl %4u %-24s", sequence, name);
 	print_in(out, nr, arg);
 
-	int result = sNextIoctl(fd, request, arg);
-	int error = errno;
+	int result;
+	int error;
+	pthread_mutex_lock(&sLock);
+	if (nr == 0x4d) {
+		const char* fail = getenv("PVR_TRACE_FAIL_SUBMIT");
+		sFailSubmit = fail != NULL ? (unsigned)strtoul(fail, NULL, 0) : 0;
+		sSubmits++;
+	}
+	int inject = nr == 0x4d && sFailSubmit != 0 && sSubmits >= sFailSubmit;
+	pthread_mutex_unlock(&sLock);
+	if (inject) {
+		fprintf(out, " [injected EIO]");
+		result = -1;
+		error = EIO;
+	} else {
+		result = sNextIoctl(fd, request, arg);
+		error = errno;
+	}
 
 	if (result == 0) {
 		renumber(nr, arg);
 		print_out(out, nr, arg);
 	}
-	else
-		fprintf(out, " = %d (%s)", result, strerror(error));
+	else {
+		/* drm-shim returns -errno itself for requests it does not know */
+		fprintf(out, " = %d (%s)", result,
+			strerror(result < -1 ? -result : error));
+	}
 	fclose(out);
 
 	pthread_mutex_lock(&sLock);
@@ -423,5 +468,92 @@ ioctl(int fd, unsigned long request, ...)
 	pthread_mutex_unlock(&sLock);
 	free(line);
 	errno = error;
+	return result;
+}
+
+
+static void
+log_map(const char* what, const char* name, void* address, size_t length,
+	int result)
+{
+	pthread_mutex_lock(&sLock);
+	unsigned sequence = ++sSequence;
+	fprintf(stderr, "%s %4u %-24saddr=%p size=0x%zx", what, sequence, name,
+		address, length);
+	if (result == 0)
+		fprintf(stderr, ", %zu mapped\n", sMapCount);
+	else
+		fprintf(stderr, " = -1\n");
+	pthread_mutex_unlock(&sLock);
+}
+
+
+static void*
+traced_map(void* result, size_t length, int fd)
+{
+	if (fd < 0 || fd >= MAX_FDS || !sDrmFds[fd])
+		return result;
+	if (result != MAP_FAILED) {
+		pthread_mutex_lock(&sLock);
+		if (sMapCount == sMapCapacity) {
+			size_t capacity = sMapCapacity != 0 ? sMapCapacity * 2 : 256;
+			void** maps = realloc(sMaps, capacity * sizeof(void*));
+			if (maps != NULL) {
+				sMaps = maps;
+				sMapCapacity = capacity;
+			}
+		}
+		if (sMapCount < sMapCapacity)
+			sMaps[sMapCount++] = result;
+		pthread_mutex_unlock(&sLock);
+	}
+	log_map("mmap", "CPU_MAP", result, length,
+		result == MAP_FAILED ? -1 : 0);
+	return result;
+}
+
+
+void*
+mmap(void* address, size_t length, int protection, int flags, int fd,
+	off_t offset)
+{
+	if (sNextMmap == NULL)
+		sNextMmap = (void* (*)(void*, size_t, int, int, int, off_t))
+			dlsym(RTLD_NEXT, "mmap");
+	return traced_map(sNextMmap(address, length, protection, flags, fd,
+		offset), length, fd);
+}
+
+
+void*
+mmap64(void* address, size_t length, int protection, int flags, int fd,
+	off64_t offset)
+{
+	if (sNextMmap64 == NULL)
+		sNextMmap64 = (void* (*)(void*, size_t, int, int, int, off64_t))
+			dlsym(RTLD_NEXT, "mmap64");
+	return traced_map(sNextMmap64(address, length, protection, flags, fd,
+		offset), length, fd);
+}
+
+
+int
+munmap(void* address, size_t length)
+{
+	if (sNextMunmap == NULL)
+		sNextMunmap = (int (*)(void*, size_t))dlsym(RTLD_NEXT, "munmap");
+	int mapped = 0;
+	pthread_mutex_lock(&sLock);
+	for (size_t i = 0; i < sMapCount; i++) {
+		if (sMaps[i] == address) {
+			sMaps[i] = sMaps[--sMapCount];
+			mapped = 1;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&sLock);
+	int result = sNextMunmap(address, length);
+	if (mapped)
+		log_map("munmap", "CPU_UNMAP", address, length, result);
 	return result;
 }

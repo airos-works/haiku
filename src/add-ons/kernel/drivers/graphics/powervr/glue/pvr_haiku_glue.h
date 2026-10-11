@@ -53,6 +53,8 @@ typedef struct pvr_haiku_firmware_state {
 	uint32			irq_spurious;		// GPU interrupts without one
 	uint32			mips_exception_status;
 	uint32			fw_faults;
+	uint32			resets;				// GPU resets that brought it back
+	bool			lost;				// the GPU is given up
 } pvr_haiku_firmware_state;
 
 
@@ -61,6 +63,7 @@ struct pvr_device*	pvr_haiku_device_create(
 void				pvr_haiku_device_delete(struct pvr_device* device);
 
 uint64				pvr_haiku_identify(struct pvr_device* device);
+bool				pvr_haiku_device_lost(struct pvr_device* device);
 
 status_t			pvr_haiku_firmware_load(struct pvr_device* device);
 void				pvr_haiku_clear_stale_interrupts(
@@ -70,6 +73,11 @@ status_t			pvr_haiku_firmware_boot(struct pvr_device* device,
 status_t			pvr_haiku_firmware_verify(struct pvr_device* device,
 						const pvr_haiku_firmware_options* options);
 status_t			pvr_haiku_health_check(struct pvr_device* device);
+status_t			pvr_haiku_reset(struct pvr_device* device);
+// how long a job queue may go without a job finishing before the GPU is
+// reset; 0 for the default (pvr_queue.c's), for queues created later
+void				pvr_haiku_set_job_timeout(uint32 milliseconds);
+uint32				pvr_haiku_job_timeout(void);
 void				pvr_haiku_firmware_shutdown(struct pvr_device* device);
 
 void				pvr_haiku_dump(struct pvr_device* device, const char* why,

@@ -10,8 +10,9 @@ firmware true
 fw_trace_mask 0x2
 fw_trace_lines 64
 
-# The register accesses of the start are logged unless this says false:
-#trace_registers false
+# Log the register accesses of the start (off unless a settings file says
+# so; air/OS images do not):
+trace_registers true
 
 # Allwinner's SMC/GPU_GLB writes before the start, if the firmware cannot
 # reach memory without them (DESIGN.md R7):

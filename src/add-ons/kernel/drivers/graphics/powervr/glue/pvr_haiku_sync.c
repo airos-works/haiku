@@ -386,9 +386,28 @@ wait_array(struct drm_syncobj** syncobjs, const u64* points,
 		= (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE) != 0
 			? SYNCOBJ_PENDING : SYNCOBJ_SIGNALED;
 	const bigtime_t deadline = deadline_for(timeoutNanoseconds);
+	const bigtime_t start = system_time();
+	bool reported = false;
 
 	for (;;) {
 		int32 generation = lx_wait_queue_generation(&lx_fence_queue);
+
+		// a wait that long is worth a line (what it waits for, once)
+		if (!reported && system_time() - start > 10000000) {
+			reported = true;
+			mutex_lock(&sSyncLock);
+			for (u32 i = 0; i < count && i < 4; i++) {
+				lx_log(LX_LOG_WARNING, "syncobj wait over 10 s (team %d, %u"
+					" handle%s, flags %#x): #%u point %llu, attached %d,"
+					" completed %llu, last %llu", (int)getpid(), count,
+					count == 1 ? "" : "s", flags, i,
+					(unsigned long long)(points != NULL ? points[i] : 0),
+					syncobjs[i]->attached,
+					(unsigned long long)syncobjs[i]->completed,
+					(unsigned long long)last_point(syncobjs[i]));
+			}
+			mutex_unlock(&sSyncLock);
+		}
 
 		u32 done = 0;
 		u32 first = count;
@@ -415,8 +434,11 @@ wait_array(struct drm_syncobj** syncobjs, const u64* points,
 		}
 		if (system_time() >= deadline)
 			return -ETIME;
+		bigtime_t until = deadline;
+		if (!reported && start + 10000001 < until)
+			until = start + 10000001;
 		if (lx_wait_queue_sleep_interruptible(&lx_fence_queue, generation,
-				deadline) == B_INTERRUPTED) {
+				until) == B_INTERRUPTED) {
 			return -EINTR;
 		}
 	}

@@ -2374,9 +2374,16 @@ pvr_mmu_op_context_create(struct pvr_mmu_context *ctx, struct sg_table *sgt,
 		const u32 l1_start_idx = pvr_page_table_l2_idx(start_addr);
 		const u32 l1_end_idx = pvr_page_table_l2_idx(start_addr + size);
 		const u32 l1_count = l1_end_idx - l1_start_idx + 1;
-		const u32 l0_start_idx = pvr_page_table_l1_idx(start_addr);
-		const u32 l0_end_idx = pvr_page_table_l1_idx(start_addr + size);
-		const u32 l0_count = l0_end_idx - l0_start_idx + 1;
+		/*
+		 * Haiku: pvr_page_table_l1_idx() is the index within one level 1
+		 * table, so a range that crosses into the next one counted
+		 * "end - start + 1" < 0 tables, and as a u32 the loop below ran
+		 * until memory was out. Count across tables instead.
+		 */
+		const u32 l0_count = (u32)(((start_addr + size) >>
+					    ROGUE_MMUCTRL_VADDR_PD_INDEX_SHIFT) -
+					   (start_addr >>
+					    ROGUE_MMUCTRL_VADDR_PD_INDEX_SHIFT)) + 1;
 
 		/*
 		 * Alloc and push page table entries until we have enough of

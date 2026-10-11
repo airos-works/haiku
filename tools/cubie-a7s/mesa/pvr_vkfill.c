@@ -9,7 +9,12 @@
 // then every word is checked. The buffer is filled with 0xdeadbeef first, so
 // words the GPU never wrote show up as such.
 //   PVR_I_WANT_A_BROKEN_VULKAN_DRIVER=1 pvr_vkfill [runs] [timeout-ms]
+//       [--cached]
 // (defaults: 1 run, 5000 ms fence timeout)
+// --cached uses HOST_VISIBLE | HOST_CACHED memory, which is not coherent on
+// air/OS: the fill is flushed (vkFlushMappedMemoryRanges) before the
+// dispatch, and the buffer invalidated (vkInvalidateMappedMemoryRanges)
+// before it is checked.
 
 
 #include <stdio.h>
@@ -141,8 +146,18 @@ main(int argc, char** argv)
 	// line by line: whatever was printed survives a crash in the driver
 	setvbuf(stdout, NULL, _IOLBF, 0);
 
-	int runs = argc > 1 ? atoi(argv[1]) : 1;
-	uint64_t timeoutMs = argc > 2 ? strtoull(argv[2], NULL, 0) : 5000;
+	int runs = 1;
+	uint64_t timeoutMs = 5000;
+	int cached = 0;
+	int positional = 0;
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--cached") == 0)
+			cached = 1;
+		else if (positional++ == 0)
+			runs = atoi(argv[i]);
+		else
+			timeoutMs = strtoull(argv[i], NULL, 0);
+	}
 	if (runs < 1)
 		runs = 1;
 
@@ -227,6 +242,8 @@ main(int argc, char** argv)
 	DEVICE_FN(vkBindBufferMemory);
 	DEVICE_FN(vkMapMemory);
 	DEVICE_FN(vkUnmapMemory);
+	DEVICE_FN(vkFlushMappedMemoryRanges);
+	DEVICE_FN(vkInvalidateMappedMemoryRanges);
 	DEVICE_FN(vkCreateDescriptorSetLayout);
 	DEVICE_FN(vkCreatePipelineLayout);
 	DEVICE_FN(vkCreateDescriptorPool);
@@ -275,7 +292,8 @@ main(int argc, char** argv)
 	VkPhysicalDeviceMemoryProperties memory;
 	vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memory);
 	const VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
-		| VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+		| (cached ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT
+			: VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 	uint32_t memoryType = UINT32_MAX;
 	for (uint32_t i = 0; i < memory.memoryTypeCount; i++) {
 		if ((requirements.memoryTypeBits & (1u << i)) != 0
@@ -285,9 +303,12 @@ main(int argc, char** argv)
 		}
 	}
 	if (memoryType == UINT32_MAX) {
-		printf("FAIL: no HOST_VISIBLE | HOST_COHERENT memory type\n");
+		printf("FAIL: no HOST_VISIBLE | %s memory type\n",
+			cached ? "HOST_CACHED" : "HOST_COHERENT");
 		return 1;
 	}
+	const int coherent = (memory.memoryTypes[memoryType].propertyFlags
+		& VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
 	VkMemoryAllocateInfo allocateInfo = {
 		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
 		.allocationSize = requirements.size,
@@ -299,8 +320,16 @@ main(int argc, char** argv)
 	uint32_t* words;
 	CHECK(vkMapMemory(sDevice, deviceMemory, 0, VK_WHOLE_SIZE, 0,
 		(void**)&words));
-	printf("buffer: %u bytes, memory type %u, mapped at %p\n", BUFFER_SIZE,
-		memoryType, (void*)words);
+	printf("buffer: %u bytes, memory type %u (flags 0x%x%s), mapped at %p\n",
+		BUFFER_SIZE, memoryType,
+		(unsigned)memory.memoryTypes[memoryType].propertyFlags,
+		coherent ? "" : ", flushed and invalidated", (void*)words);
+	VkMappedMemoryRange wholeRange = {
+		.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+		.memory = deviceMemory,
+		.offset = 0,
+		.size = VK_WHOLE_SIZE,
+	};
 
 	// the pipeline
 	VkDescriptorSetLayoutBinding binding = {
@@ -427,6 +456,8 @@ main(int argc, char** argv)
 	for (int run = 0; run < runs; run++) {
 		for (uint32_t i = 0; i < WORD_COUNT; i++)
 			words[i] = FILL_PATTERN;
+		if (!coherent)
+			CHECK(vkFlushMappedMemoryRanges(sDevice, 1, &wholeRange));
 
 		VkSubmitInfo submitInfo = {
 			.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -454,6 +485,8 @@ main(int argc, char** argv)
 		uint32_t mismatches = 0;
 		uint32_t untouched = 0;
 		start = now_ms();
+		if (!coherent)
+			CHECK(vkInvalidateMappedMemoryRanges(sDevice, 1, &wholeRange));
 		for (uint32_t i = 0; i < WORD_COUNT; i++) {
 			uint32_t expected = i * 3 + 1;
 			if (words[i] == expected)

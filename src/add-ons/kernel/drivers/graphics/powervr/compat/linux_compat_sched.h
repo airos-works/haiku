@@ -30,8 +30,13 @@ struct work_struct {
 	struct workqueue_struct*	queue;		/* where it is pending */
 };
 
+/*	A work item queued once its time comes; the queue's thread keeps the
+	timers. */
 struct delayed_work {
-	struct work_struct	work;
+	struct work_struct			work;
+	struct list_head			timer;		/* armed while linked */
+	bigtime_t					when;
+	struct workqueue_struct*	timer_queue;	/* the last one armed on */
 };
 
 #define INIT_WORK(work_, func_) \
@@ -45,6 +50,14 @@ struct delayed_work {
 #define WQ_MEM_RECLAIM	(1u << 3)
 #define WQ_HIGHPRI		(1u << 4)
 
+#define INIT_DELAYED_WORK(dwork_, func_) \
+	do { \
+		INIT_WORK(&(dwork_)->work, (func_)); \
+		INIT_LIST_HEAD(&(dwork_)->timer); \
+		(dwork_)->timer_queue = NULL; \
+	} while (0)
+#define to_delayed_work(work_)	container_of(work_, struct delayed_work, work)
+
 struct workqueue_struct* alloc_workqueue(const char* name, unsigned int flags,
 	int maxActive, ...);
 void destroy_workqueue(struct workqueue_struct* queue);
@@ -52,6 +65,13 @@ bool queue_work(struct workqueue_struct* queue, struct work_struct* work);
 /* Removes the item if it is pending and waits for it if it runs. */
 bool cancel_work_sync(struct work_struct* work);
 void flush_workqueue(struct workqueue_struct* queue);
+/* false if it is armed or pending already */
+bool queue_delayed_work(struct workqueue_struct* queue,
+	struct delayed_work* work, unsigned long delay);
+/* arms it anew (pending items stay pending) */
+bool mod_delayed_work(struct workqueue_struct* queue,
+	struct delayed_work* work, unsigned long delay);
+bool cancel_delayed_work_sync(struct delayed_work* work);
 
 
 /* #pragma mark - reservation objects */
@@ -120,7 +140,12 @@ int drm_exec_prepare_obj(struct drm_exec* exec, struct drm_gem_object* object,
 	fences) have signaled and credits are free; the hardware fence that
 	run_job() returns signals the job's finished fence; finished jobs are
 	freed in order from the pending list. Work happens on the scheduler's
-	work queue. No timeouts: a job that never finishes is not reset. */
+	work queue.
+
+	Timeouts: when no job of a scheduler finishes for its timeout while
+	one is pending, lx_sched_timeout_hook is called if the driver set it
+	(the powervr driver resets the GPU there), otherwise the backend's
+	timedout_job(). */
 
 struct drm_gpu_scheduler;
 struct drm_sched_entity;
@@ -160,6 +185,7 @@ struct drm_sched_job {
 	unsigned long				last_dependency;
 	struct dma_fence_cb			cb;				/* on the parent fence */
 	u64							drm_client_id;
+	bigtime_t					run_time;		/* handed to run_job() */
 };
 
 struct drm_sched_backend_ops {
@@ -197,7 +223,22 @@ struct drm_gpu_scheduler {
 	struct drm_sched_entity*			entity;
 	bool								pause_submit;
 	bool								ready;
+	long								timeout;	/* jiffies */
+	struct workqueue_struct*			timeout_wq;
+	struct delayed_work					work_tdr;
+	bool								dead;		/* lx_sched_kill_all() */
 };
+
+/* When set, the timeout of schedulers created from then on, in ms. */
+extern unsigned int lx_sched_timeout_override_ms;
+
+/* Called when a job that went to run_job() is done, with the time since. */
+extern void (*lx_sched_job_time_hook)(struct drm_gpu_scheduler* sched,
+	bigtime_t elapsed);
+
+/* Called on the timeout work queue for a job that stopped making progress. */
+extern void (*lx_sched_timeout_hook)(struct drm_gpu_scheduler* sched,
+	struct drm_sched_job* job);
 
 struct drm_sched_entity {
 	struct drm_gpu_scheduler*	sched;
@@ -217,6 +258,10 @@ void drm_sched_fini(struct drm_gpu_scheduler* sched);
 void drm_sched_stop(struct drm_gpu_scheduler* sched,
 	struct drm_sched_job* bad);
 void drm_sched_start(struct drm_gpu_scheduler* sched, int error);
+/*	For a lost device: stops the scheduler for good; jobs handed on finish
+	with \a error, queued and new ones are killed with it. Call it on the
+	scheduler's work queue. */
+void lx_sched_kill_all(struct drm_gpu_scheduler* sched, int error);
 
 int drm_sched_entity_init(struct drm_sched_entity* entity,
 	enum drm_sched_priority priority, struct drm_gpu_scheduler** schedList,

@@ -29,11 +29,29 @@ flags_are_valid(u64 flags)
 }
 
 
-struct pvr_gem_object*
-pvr_gem_object_create(struct pvr_device* pvr_dev, size_t size, u64 flags)
+/*!	The rest of an object around its buffer. */
+static void
+init_object(struct pvr_device* pvr_dev, struct pvr_gem_object* object,
+	u64 flags)
 {
 	static int64 sNextOffset = 1;
 
+	object->base.dev = from_pvr_device(pvr_dev);
+	object->base.size = object->buffer.size;
+	object->base.resv = &object->base._resv;
+	dma_resv_init(&object->base._resv);
+	object->base.vma_node.offset
+		= (u64)atomic_add64(&sNextOffset, 1) << PAGE_SHIFT;
+	kref_init(&object->base.refcount);
+	// The GPU is not cache coherent: never CPU cached (pvr_gem.c does the
+	// same when the device is not DMA coherent).
+	object->flags = flags & ~PVR_BO_CPU_CACHED;
+}
+
+
+struct pvr_gem_object*
+pvr_gem_object_create(struct pvr_device* pvr_dev, size_t size, u64 flags)
+{
 	if (size == 0 || !flags_are_valid(flags))
 		return ERR_PTR(-EINVAL);
 
@@ -48,16 +66,36 @@ pvr_gem_object_create(struct pvr_device* pvr_dev, size_t size, u64 flags)
 		return ERR_PTR(error);
 	}
 
-	object->base.dev = from_pvr_device(pvr_dev);
-	object->base.size = object->buffer.size;
-	object->base.resv = &object->base._resv;
-	dma_resv_init(&object->base._resv);
-	object->base.vma_node.offset
-		= (u64)atomic_add64(&sNextOffset, 1) << PAGE_SHIFT;
-	kref_init(&object->base.refcount);
-	// The GPU is not cache coherent: never CPU cached (pvr_gem.c does the
-	// same when the device is not DMA coherent).
-	object->flags = flags & ~PVR_BO_CPU_CACHED;
+	init_object(pvr_dev, object, flags);
+	return object;
+}
+
+
+/*!	An object over the calling team's memory at \a address (page aligned,
+	within one area the team can read and write), for
+	PVR_HAIKU_NR_IMPORT_HOST. The pages stay locked while the object
+	lives, even if the team deletes its area. Userland cannot map it (it
+	already has it), so only DRM_PVR_BO_BYPASS_DEVICE_CACHE is allowed.
+*/
+struct pvr_gem_object*
+pvr_haiku_gem_object_import(struct pvr_device* pvr_dev, const void* address,
+	size_t size, u64 flags)
+{
+	if ((flags & ~(u64)DRM_PVR_BO_BYPASS_DEVICE_CACHE) != 0)
+		return ERR_PTR(-EINVAL);
+
+	struct pvr_gem_object* object
+		= (struct pvr_gem_object*)kzalloc(sizeof(*object), GFP_KERNEL);
+	if (object == NULL)
+		return ERR_PTR(-ENOMEM);
+
+	int error = lx_dma_buffer_import(&object->buffer, address, size);
+	if (error != 0) {
+		kfree(object);
+		return ERR_PTR(error);
+	}
+
+	init_object(pvr_dev, object, flags);
 	return object;
 }
 

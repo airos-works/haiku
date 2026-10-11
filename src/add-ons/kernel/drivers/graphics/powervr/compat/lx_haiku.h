@@ -56,10 +56,10 @@ struct device;
 status_t	lx_status(int error);
 
 /*	Clones a kernel area into the calling team, readable and writable,
-	with the source's memory type (write-combined); at *_address exactly
-	when \a exact, anywhere otherwise. */
+	with the source's memory type (write-combined) or, when \a cached,
+	write-back; at *_address exactly when \a exact, anywhere otherwise. */
 area_id		lx_area_clone_to_user(area_id source, void** _address,
-				bool exact);
+				bool exact, bool cached);
 
 
 /* Wait queues: a generation count and a ConditionVariable in the storage. */
@@ -77,6 +77,13 @@ void	lx_wait_queue_sleep(wait_queue_head_t* queue, int32 generation,
 	otherwise (woken or past the deadline). For waits userland asked for. */
 status_t	lx_wait_queue_sleep_interruptible(wait_queue_head_t* queue,
 				int32 generation, bigtime_t deadline);
+
+/* How many GPU buffers (and their bytes), single pages, vmaps and imports
+   of team memory exist. */
+void	lx_memory_stats(uint32* buffers, uint64* bufferBytes, uint32* pages,
+			uint32* vmaps, uint32* imports);
+/* How many GPU buffers were made since boot, and their bytes. */
+void	lx_memory_totals(uint64* buffers, uint64* bytes);
 
 /* Whether all of [address, address + size) is userland memory. */
 bool	lx_access_ok(const void* address, unsigned long size);
@@ -99,11 +106,18 @@ struct lx_dma_buffer {
 	size_t				size;
 	uint32				run_count;
 	struct lx_dma_run*	runs;
+	bool				imported;	/* a locked view of a team's memory */
 };
 
 int		lx_dma_buffer_alloc(struct lx_dma_buffer* buffer, size_t size,
 			const char* name);
 void	lx_dma_buffer_free(struct lx_dma_buffer* buffer);
+/*	[address, address + size) of the calling team as a buffer: the area
+	holding it is cloned into the kernel (so the pages outlive the team's
+	mapping) and the range locked until lx_dma_buffer_free(). Page aligned;
+	the GPU must reach every page. */
+int		lx_dma_buffer_import(struct lx_dma_buffer* buffer, const void* address,
+			size_t size);
 int		lx_dma_buffer_address(const struct lx_dma_buffer* buffer,
 			size_t offset, unsigned long long* _address);
 
@@ -126,6 +140,7 @@ typedef struct {
 
 struct page*		alloc_page(unsigned int flags);
 void				__free_page(struct page* page);
+void				lx_free_pages_flush(void);
 unsigned long long	dma_map_page(struct device* device, struct page* page,
 						size_t offset, size_t size,
 						enum dma_data_direction direction);

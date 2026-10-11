@@ -103,6 +103,8 @@ static int
 map_bo_ioctl(struct pvr_haiku_file* file, void* data)
 {
 	struct pvr_haiku_map_bo* args = (struct pvr_haiku_map_bo*)data;
+	if ((args->flags & ~PVR_HAIKU_MAP_BO_CACHED) != 0 || args->reserved != 0)
+		return -EINVAL;
 	struct pvr_gem_object* pvr_obj = pvr_gem_object_from_handle(
 		to_pvr_file(&file->drm_file), args->handle);
 	if (pvr_obj == NULL)
@@ -114,7 +116,7 @@ map_bo_ioctl(struct pvr_haiku_file* file, void* data)
 	else {
 		void* address = (void*)(uintptr_t)args->address;
 		area_id area = lx_area_clone_to_user(pvr_obj->buffer.area, &address,
-			args->address != 0);
+			args->address != 0, (args->flags & PVR_HAIKU_MAP_BO_CACHED) != 0);
 		if (area < 0) {
 			TRACE("MAP_BO: handle %u (%zu KiB) not mapped: %s\n",
 				args->handle, pvr_gem_object_size(pvr_obj) / 1024,
@@ -127,6 +129,32 @@ map_bo_ioctl(struct pvr_haiku_file* file, void* data)
 		}
 	}
 	pvr_gem_object_put(pvr_obj);
+	return error;
+}
+
+
+/*!	PVR_HAIKU_NR_IMPORT_HOST: a buffer object over the caller's memory. */
+static int
+import_host_ioctl(struct pvr_haiku_file* file, void* data)
+{
+	struct pvr_haiku_import_host* args = (struct pvr_haiku_import_host*)data;
+	if (args->reserved != 0 || args->size > SIZE_MAX)
+		return -EINVAL;
+
+	struct pvr_file* pvr_file = to_pvr_file(&file->drm_file);
+	struct pvr_gem_object* pvr_obj = pvr_haiku_gem_object_import(
+		pvr_file->pvr_dev, (const void*)(uintptr_t)args->address,
+		(size_t)args->size, args->flags);
+	if (IS_ERR(pvr_obj)) {
+		TRACE("IMPORT_HOST: %#" B_PRIx64 ", %" B_PRIu64 " KiB not imported:"
+			" %d\n", args->address, args->size / 1024, (int)PTR_ERR(pvr_obj));
+		return PTR_ERR(pvr_obj);
+	}
+
+	// as pvr_ioctl_create_bo(): the handle holds the only reference
+	int error = pvr_gem_object_into_handle(pvr_obj, pvr_file, &args->handle);
+	if (error != 0)
+		pvr_gem_object_put(pvr_obj);
 	return error;
 }
 
@@ -182,7 +210,51 @@ static const struct generic_ioctl {
 		timeline_signal),
 	GENERIC_IOCTL(PVR_HAIKU_NR_MAP_BO, _IOC_READ | _IOC_WRITE,
 		struct pvr_haiku_map_bo, map_bo_ioctl),
+	GENERIC_IOCTL(PVR_HAIKU_NR_IMPORT_HOST, _IOC_READ | _IOC_WRITE,
+		struct pvr_haiku_import_host, import_host_ioctl),
 };
+
+
+/* #pragma mark - statistics */
+
+
+/*	Per ioctl number: calls, time spent in the handler (waits included),
+	the longest call. Logged with the driver's dump, to tell what a frame
+	costs in the kernel; lockless and approximate under concurrency. */
+static struct {
+	int64		count;
+	int64		time;
+	int64		max_time;
+	const char*	name;
+} sIoctlStats[256];
+
+
+static void
+count_ioctl(u32 nr, const char* name, bigtime_t elapsed)
+{
+	nr &= 0xff;
+	sIoctlStats[nr].name = name;
+	atomic_add64(&sIoctlStats[nr].count, 1);
+	atomic_add64(&sIoctlStats[nr].time, elapsed);
+	if (elapsed > atomic_get64(&sIoctlStats[nr].max_time))
+		atomic_set64(&sIoctlStats[nr].max_time, elapsed);
+}
+
+
+void
+pvr_haiku_ioctl_stats_dump(void)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(sIoctlStats); i++) {
+		int64 count = atomic_get64(&sIoctlStats[i].count);
+		if (count == 0)
+			continue;
+		int64 time = atomic_get64(&sIoctlStats[i].time);
+		TRACE("dump: ioctl %s: %" B_PRId64 " calls, %" B_PRId64 " us, %"
+			B_PRId64 " us each, longest %" B_PRId64 " us\n",
+			sIoctlStats[i].name, count, time, time / count,
+			atomic_get64(&sIoctlStats[i].max_time));
+	}
+}
 
 
 /* #pragma mark - files */
@@ -292,11 +364,29 @@ pvr_haiku_file_ioctl(struct pvr_haiku_file* file, uint32 nr,
 		error = -EFAULT;
 	else {
 		memset((u8*)data + inSize, 0, kernelSize - inSize);
+		bigtime_t start = system_time();
 		if (desc != NULL) {
 			error = desc->func(from_pvr_device(file->pvr_dev), data,
 				&file->drm_file);
 		} else
 			error = generic->function(file, data);
+		count_ioctl(nr, name, system_time() - start);
+		if (error == 0 && desc != NULL
+			&& to_haiku_device(file->pvr_dev)->verbose
+			&& _IOC_NR(desc->cmd)
+				== _IOC_NR(DRM_IOCTL_PVR_CREATE_HWRT_DATASET)) {
+			// the render target's size decides how many tiles each
+			// fragment job walks: worth seeing when tracing
+			const struct drm_pvr_ioctl_create_hwrt_dataset_args* args
+				= (const struct drm_pvr_ioctl_create_hwrt_dataset_args*)data;
+			TRACE("HWRT dataset %u: %ux%u, %u samples, %u layers, merge"
+				" %u,%u-%u,%u scale %u,%u, region headers %u\n",
+				args->handle, args->width, args->height, args->samples,
+				args->layers, args->isp_merge_lower_x,
+				args->isp_merge_lower_y, args->isp_merge_upper_x,
+				args->isp_merge_upper_y, args->isp_merge_scale_x,
+				args->isp_merge_scale_y, args->region_header_size);
+		}
 		if (copy_to_user(buffer, data, outSize) != 0)
 			error = -EFAULT;
 	}
