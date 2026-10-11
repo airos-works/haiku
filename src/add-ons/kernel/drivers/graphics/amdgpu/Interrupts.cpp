@@ -113,6 +113,12 @@ GpuInterrupts::SuspendForReset()
 	regs[0x505] &= ~kVMInterrupts;
 	regs[0xe30] &= ~0x20001u;
 	(void)regs[0xe30];
+	// tonga_ih_disable_interrupts resets both pointers after disabling IH.
+	// The hardware WPTR resets on disable; leaving an old RPTR can keep
+	// IH busy. Retain the backing memory until the idle check succeeds.
+	regs[0xe32] = regs[0xe33] = 0;
+	(void)regs[0xe33];
+	rptr = 0;
 	enabled = false;
 	pendingFence = false;
 	fence = NULL;
@@ -121,6 +127,9 @@ GpuInterrupts::SuspendForReset()
 	bigtime_t deadline = system_time() + 100000;
 	while ((regs[0x394] & 0x20000) != 0 && system_time() < deadline) snooze(10);
 	resetSuspended = (regs[0x394] & 0x20000) == 0;
+	dprintf("amdgpu: recovery IH suspended %u control %#x ptr %#x/%#x SRBM %#x\n",
+		(unsigned)resetSuspended, (unsigned)regs[0xe30], (unsigned)regs[0xe32],
+		(unsigned)regs[0xe33], (unsigned)regs[0x394]);
 	return resetSuspended ? B_OK : B_TIMED_OUT;
 }
 
