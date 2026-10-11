@@ -5,7 +5,7 @@ Audio Distribution Profile, source side, with the SBC codec. It was written
 on the Cubie A7S (AIC8800D80 controller) but nothing in it is specific to the
 board; the X399 and the ROCK 5 use the same stack.
 
-## State (2026-10-10)
+## State (2026-10-11)
 
 Built for arm64 and x86_64. What has been checked:
 
@@ -16,20 +16,33 @@ Built for arm64 and x86_64. What has been checked:
   a power-complementary prototype (within 0.1 %, 76 dB stop band).
 - On the Cubie: the HCI module takes the controller's packet sizes (ACL
   1021 bytes x 9 buffers, LE 251 x 14) from the server's start-up queries;
-  LE scanning still works; the bluetooth_server restarts cleanly.
+  LE scanning still works; the bluetooth_server restarts cleanly. With
+  the cubie-a7s merge of 2026-10-11, the Bluetooth preferences list nearby
+  LE devices and the Deskbar's Bluetooth menu opens.
 - With a device set (`bt_a2dp --use`), the media add-on publishes
   "Bluetooth: <name>", the node becomes the system audio output and the
   mixer connects to it at 44.1 kHz stereo; when MediaPlayer or airTime
   play, it tries to connect the speaker.
 
-Not yet checked over the air: the lab Cubie's 2.4 GHz radio hears almost
-nothing. Paging the lab host ends in Page Timeout after 10 s, an inquiry
-finds no device although the host is discoverable, and the host does not
-find the Cubie. The vendor Linux stack on the same board (Radxa Debian,
-aic_btusb + BlueZ) finds nothing either; Wi-Fi scans see 0-4 networks at
-2.4 GHz against 6-12 at 5 GHz. It needs an antenna (or the speaker right
-next to the board). Pairing, AVDTP and streaming have therefore not run
-against a real sink yet. Evidence: `cubie/evidence/a2dp/` on the lab disk.
+Not yet checked over the air. On 2026-10-10 the lab Cubie had no antenna:
+paging the lab host ended in Page Timeout after 10 s, an inquiry found no
+device although the host was discoverable, and the host did not find the
+Cubie.
+
+On 2026-10-11, with an antenna on J1 (the FCU760K module's shared
+Wi-Fi/BT pin; its Bluetooth-only pin is not wired), Wi-Fi hears 26-34
+networks at 2.4 GHz instead of a handful, but the Bluetooth link to the lab
+host still fails both ways: Page Timeout, empty inquiries, and the host
+neither pages nor finds the Cubie. The vendor Linux stack on the same board
+(Radxa Debian, aic_btusb + BlueZ) behaves the same, and every LE advertiser
+the Cubie hears is at -93 dBm or weaker, so the board and the host are out
+of Bluetooth range of each other. While the controller pages or inquires,
+2.4 GHz Wi-Fi scans find nothing (the antenna is Bluetooth's then). Of the
+loader's Bluetooth modes (`bt_mode` in the aic8800wifi driver settings),
+0 and 5 (the default) hear the same advertisers, 1 and 2 none. Pairing,
+AVDTP and streaming have therefore not run against a real sink yet; they
+need a sink within range of the board. Evidence: `cubie/evidence/a2dp/` on
+the lab disk (`antenna-check.txt`).
 
 ## Using it
 
