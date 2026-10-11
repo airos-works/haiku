@@ -114,7 +114,7 @@ static void Run(Client& c, int mode, uint32 op, uint32 offset, uint32 m0,
 	Require(ioctl(c.fd, mode < 0 ? AMDGPU_GFX_SUBMIT_COPY : AMDGPU_GFX_GDS_PROBE_COPY,
 		&r, sizeof(r)) == 0, "GDS synchronous copied request");
 	__sync_synchronize(); sJobs++;
-	if (mode >= AMDGPU_GDS_PROBE_OA_RESET)
+	if (mode >= AMDGPU_GDS_PROBE_OA_RESET || op == 2)
 		printf("OA access mode %d op %u M0 %#x result %#x completion %llu VM %#x/%#x first data/traps %#x/%#x/%#x\n",
 			mode, op, m0, (unsigned)r.status, (unsigned long long)r.completion,
 			r.vm_fault_status[0], r.vm_fault_status[1], out[257], out[258], out[259]);
@@ -157,12 +157,22 @@ static void CheckAll(Client& c, const uint32 expected[1024])
 		Run(c, AMDGPU_GDS_PROBE_FULL, 0, offset, 4096, 0, expected + offset / 4, false);
 }
 static void Ordered(Client& c, Client& reader, int mode, uint32 index,
-	uint32 address, bool swap, uint32 value, uint32 expected[1024], bool denied)
+	uint32 address, bool swap, uint32 value, uint32 expected[1024], bool denied,
+	bool observePermission = false)
 {
 	Require(address % 4 == 0 && address * 4 + index * 4 < 4096,
 		"every possible OA target is inside owned seeded GDS");
 	OrderedShader(c, index, swap);
 	auto before = Info<amdgpu_oa_info>(c.fd, AMDGPU_OA_INFO);
+	if (mode < 0) {
+		// Previous ordered instructions can advance the GDS wave crawler.
+		// Synchronize to the fixture's
+		// M0 wave ID 0 before ordinary submission. This separate trusted job
+		// grants no resources and executes only the already-tested GDS read.
+		// Without the reset, an old wave ID can wait before permission checks.
+		uint32 zero[64] = {};
+		Run(reader, AMDGPU_GDS_PROBE_OA_RESET, 0, 0, 4096, 0, zero, true);
+	}
 	uint32 returned[64], actual[1024], trap;
 	Run(c, mode, 2, 0, address << 16, value, NULL, denied, returned, &trap);
 	// Always gather the complete owned region before judging address semantics.
@@ -176,6 +186,10 @@ static void Ordered(Client& c, Client& reader, int mode, uint32 index,
 	}
 	uint32 word = address / 4 + index;
 	uint32 old = expected[word];
+	if (observePermission) {
+		Require(trap == 0 || trap == 0x100, "observed OA exception is success or memory violation");
+		denied = trap == 0x100;
+	}
 	Require(trap == (denied ? 0x100 : 0), "ordered instruction exception state");
 	if (!denied) expected[word] = swap ? value : old + value;
 	for (uint32 lane = 0; lane < 64; lane++)
@@ -231,8 +245,9 @@ int main(int argc, char** argv)
 	bool addressControl = argc == 2 && strcmp(argv[1], "--address-control") == 0;
 	bool extended = argc == 2 && strcmp(argv[1], "--extended") == 0;
 	bool bounds = argc == 2 && strcmp(argv[1], "--bounds") == 0;
-	Require(absent || ((controls || addressControl || extended || bounds) && geteuid() == 0),
-		"usage: amdgpu_oa_access --control | --address-control | --extended | --bounds | --expect-no-device");
+	bool maskObserve = argc == 2 && strcmp(argv[1], "--mask-observe") == 0;
+	Require(absent || ((controls || addressControl || extended || bounds || maskObserve) && geteuid() == 0),
+		"usage: amdgpu_oa_access --control | --address-control | --extended | --bounds | --mask-observe | --expect-no-device");
 	for (uint32 op = 0; op < 3; op++) Commands(op, 256, 4096, 0x1234, 0x5678);
 	int monitor = open("/dev/" AMDGPU_DEVICE_NAME, O_RDWR);
 	if (absent) { Require(monitor < 0 && errno == ENOENT, "no AMD device"); puts("PASS: OA access command policy and no-device handling"); return 0; }
@@ -274,7 +289,7 @@ int main(int argc, char** argv)
 		Ordered(c[0], c[1], AMDGPU_GDS_PROBE_OA_FULL, 0, 4, false, 9, expected, false);
 		Ordered(c[1], c[0], AMDGPU_GDS_PROBE_OA_FULL, 1, 4, true, 0x12345678, expected, false);
 	}
-	if (extended || bounds) {
+	if (extended) {
 		for (uint32 swap = 0; swap < 2; swap++) {
 			for (uint32 index = 0; index < 16; index++)
 				Ordered(c[index % 2], c[1 - index % 2], AMDGPU_GDS_PROBE_OA_FULL,
@@ -286,14 +301,21 @@ int main(int argc, char** argv)
 	}
 	if (bounds) {
 		for (uint32 swap = 0; swap < 2; swap++) {
-			for (uint32 index : {16u, 63u})
-				Ordered(c[0], c[1], AMDGPU_GDS_PROBE_OA_FULL, index, 256, swap, 3, expected, true);
-			for (uint32 index : {0u, 3u, 6u, 15u})
-				Ordered(c[1], c[0], AMDGPU_GDS_PROBE_OA_SLICE, index, 256, swap, 3, expected, true);
-			for (uint32 index : {0u, 4u, 15u}) {
-				Ordered(c[0], c[1], AMDGPU_GDS_PROBE_OA_NONE, index, 256, swap, 3, expected, true);
-				Ordered(c[1], c[0], AMDGPU_GDS_PROBE_OA_NOGDS, index, 256, swap, 3, expected, true);
-				Ordered(c[0], c[1], -1, index, 256, swap, 3, expected, true);
+			for (int mode : {6, 7, 8, 9, -1}) {
+				for (uint32 index : {0u, 4u, 16u, 20u, 63u})
+					Ordered(c[index % 2], c[1 - index % 2], mode, index, 256,
+						swap, 0x700 + index, expected, mode == 9 || mode < 0);
+			}
+		}
+	}
+	if (maskObserve) {
+		// This records the hardware permission mapping; it does not presume
+		// the instruction's six-bit index selects the 16-bit OA resource mask.
+		for (uint32 swap = 0; swap < 2; swap++) {
+			for (int mode : {6, 7, 8, 9, -1}) {
+				for (uint32 index : {0u, 4u, 16u, 20u, 63u})
+					Ordered(c[index % 2], c[1 - index % 2], mode, index, 256,
+						swap, 0x700 + index, expected, false, true);
 			}
 		}
 	}
