@@ -2,11 +2,12 @@ SubDir HAIKU_TOP src add-ons kernel drivers graphics amdgpu ;
 
 UsePrivateKernelHeaders ;
 UsePrivateHeaders [ FDirName graphics amdgpu ] ;
+UsePrivateHeaders [ FDirName graphics common ] ;
 UsePrivateHeaders libroot ;
 
 KernelAddon amdgpu : driver.cpp Firmware.cpp FirmwareLoader.cpp Rom.cpp Sdma.cpp Smu.cpp
 	Device.cpp SdmaEngine.cpp Gart.cpp Gfx.cpp Interrupts.cpp Uvd.cpp UvdClock.cpp UvdH264.cpp UvdHevc.cpp UvdSession.cpp
-	VramAllocator.cpp GpuPageTable.cpp GfxCommandValidator.cpp SHA256.cpp ;
+	VramAllocator.cpp GpuPageTable.cpp GfxCommandValidator.cpp SHA256.cpp Retrace.cpp ;
 
 SEARCH on [ FGristFiles SHA256.cpp ]
 	= [ FDirName $(HAIKU_TOP) src system libroot posix crypt ] ;

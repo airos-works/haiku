@@ -14,11 +14,13 @@
 #include <unistd.h>
 
 #include <amdgpu_haiku.h>
+#include <boot_frame_buffer_retrace.h>
 #include "Rom.h"
 #include "Sdma.h"
 #include "Smu.h"
 #include "Device.h"
 #include "FirmwareLoader.h"
+#include "Retrace.h"
 #include "UserMemory.h"
 
 // Polaris 10 register indices, from AMD's MIT-licensed register headers:
@@ -189,6 +191,8 @@ device_free(void* cookie)
 {
 	amdgpu_client_free((AmdgpuClient*)cookie);
 	mutex_lock(&sLock);
+	if (sOpenCount == 1)
+		amdgpu_retrace_stop();
 	if (--sOpenCount == 0 && !amdgpu_device_active()) {
 		delete_area(sRegisterArea);
 		sRegisterArea = -1;
@@ -286,6 +290,19 @@ device_control(void* cookie, uint32 op, void* buffer, size_t length)
 			return B_NOT_ALLOWED;
 		return amdgpu_client_control((AmdgpuClient*)cookie, op, buffer, length,
 			start_installed_device);
+	}
+	if (op == B_GET_BOOT_FRAME_BUFFER_RETRACE_SEMAPHORE) {
+		// for the framebuffer accelerant; reads display registers only
+		if (length != sizeof(sem_id))
+			return B_BAD_VALUE;
+		sem_id semaphore;
+		mutex_lock(&sLock);
+		status_t status = amdgpu_retrace_semaphore(sRegisters, sInfo,
+			&semaphore);
+		mutex_unlock(&sLock);
+		if (status != B_OK)
+			return status;
+		return user_memcpy(buffer, &semaphore, sizeof(semaphore));
 	}
 	if (op == AMDGPU_DISPLAY_SNAPSHOT) {
 		if (length != sizeof(amdgpu_display_snapshot))
@@ -677,6 +694,7 @@ init_driver()
 void
 uninit_driver()
 {
+	amdgpu_retrace_stop();
 	amdgpu_device_stop();
 	if (sRegisterArea >= 0) {
 		delete_area(sRegisterArea);
