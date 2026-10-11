@@ -57,9 +57,15 @@ neither SETREG form raises privilege, trap-register writes are ignored, and
 ordinary MODE/M0 positive controls succeed. All output/peer guards and memory
 reclamation pass. DMA plus checked GLES 3.1 leaves 43,498 healthy completions
 without requiring a reboot.
-Shader/resource isolation remains incomplete and both submission paths remain
-root-only. Driver `c579f1cd…` and private Mesa `afd206fa…` are installed with
-same-hash backups; prior `7d1cf6e5…`/`ee6210e5…` and older checkpoints are
+A kernel graphics queue now passes immutable snapshots, pending fences,
+64/client and 256/device limits, mixed DMA ordering, and pending-close memory
+lifetime checks. A deliberate VM fault fails all 23 affected/canceled fences
+and preserves quarantined memory; cold recovery repeats 1,213 graphics jobs,
+both DMA paths and concurrent video with no errors. Mesa remains synchronous;
+its queue integration is next. Shader/resource isolation remains incomplete
+and general submissions remain root-only. Driver `cefb183c…` and private Mesa
+`afd206fa…` are installed with same-hash backups; prior `c579f1cd…`,
+`7d1cf6e5…`/`ee6210e5…` and older checkpoints are
 preserved. The original global media addon is restored after qualification.
 System Mesa defaults remain
 unchanged. Unprivileged general
