@@ -34,6 +34,7 @@ struct VmBinding {
 };
 
 struct ClientVM {
+	ClientVM* nextQuarantined;
 	GpuPageTable table;
 	GpuPageTable::Allocation commands;
 	GpuPageTable::Allocation copiedCommands;
@@ -90,6 +91,12 @@ static uint32 sPending, sDmaPending;
 static uint64 sNextHandle = 1;
 static uint32 sNextVideoHandle = 1;
 static uint32 sVideoSessions, sVMCount;
+static uint32 sLiveHandles;
+static Buffer* sQuarantinedBuffers;
+static ClientVM* sQuarantinedVMs;
+static UvdSession* sQuarantinedVideos;
+static amdgpu_recovery_info sRecovery;
+static bool sRecoveryAttempted;
 static void ReleaseVM(AmdgpuClient* client);
 static void ReleaseVideo(AmdgpuClient* client);
 static void WaitGraphicsIdle();
@@ -128,6 +135,13 @@ PutBuffer(Buffer* bo)
 		status_t status = sGart.Unbind(bo->offset, bo->bytes);
 		if (status != B_OK)
 			sFault = status;
+	}
+	if (bo->poisoned || sFault != B_OK) {
+		// Retain both backing storage and its ownership record. No allocation
+		// on this fault path, and no lost wired RAM/VRAM ranges after close.
+		bo->next = sQuarantinedBuffers;
+		sQuarantinedBuffers = bo;
+		return;
 	}
 	if (bo->area >= 0 && (!bo->system || (!bo->poisoned && sFault == B_OK)))
 		delete_area(bo->area);
@@ -243,6 +257,7 @@ amdgpu_client_free(AmdgpuClient* client)
 	while (client->buffers != NULL) {
 		Buffer* bo = client->buffers;
 		client->buffers = bo->next;
+		sLiveHandles--;
 		if (bo->area >= 0 && vm_change_clones_to_null_areas(bo->area) != B_OK)
 			bo->poisoned = true;
 		PutBuffer(bo);
@@ -418,7 +433,10 @@ ReleaseVideo(AmdgpuClient* client)
 			sUvd.Stop();
 		}
 	}
-	delete_area(s->area);
+	if (sFault == B_OK) {
+		delete_area(s->area);
+		s->area = -1;
+	}
 	if (s->readbackBytes != 0) {
 		WaitGraphicsIdle();
 		ObserveInterruptFault();
@@ -429,6 +447,7 @@ ReleaseVideo(AmdgpuClient* client)
 		// Retain wired RAM and its GART extent when late writes are possible.
 		if (sFault == B_OK) {
 			if (s->readbackArea >= 0) delete_area(s->readbackArea);
+			s->readbackArea = -1;
 			sGartAllocator.Free(s->readbackOffset, s->readbackBytes);
 		}
 		client->systemBytes -= s->readbackBytes;
@@ -438,7 +457,11 @@ ReleaseVideo(AmdgpuClient* client)
 	client->bytes -= s->layout.bytes;
 	client->video = NULL;
 	sVideoSessions--;
-	free(s);
+	if (sFault != B_OK) {
+		s->nextQuarantined = sQuarantinedVideos;
+		sQuarantinedVideos = s;
+	} else
+		free(s);
 }
 
 static bool VideoLayout(const amdgpu_h264_config& c, amdgpu::UvdVideoLayout& l)
@@ -660,17 +683,24 @@ ReleaseVM(AmdgpuClient* client)
 	ClientVM* vm = client->vm;
 	if (vm == NULL)
 		return;
-	vm->table.Uninitialize(sFault == B_OK);
-	ReleasePageTable(NULL, 4096, vm->commands, sFault == B_OK);
-	if (vm->copiedCommands.cpu != NULL)
-		ReleasePageTable(NULL, kMaxIbBytes, vm->copiedCommands, sFault == B_OK);
+	const bool retain = sFault != B_OK;
+	if (!retain) {
+		vm->table.Uninitialize(true);
+		ReleasePageTable(NULL, 4096, vm->commands, true);
+		if (vm->copiedCommands.cpu != NULL)
+			ReleasePageTable(NULL, kMaxIbBytes, vm->copiedCommands, true);
+	}
 	while (vm->bindings != NULL) {
 		VmBinding* binding = vm->bindings;
 		vm->bindings = binding->next;
 		PutBuffer(binding->buffer);
 		free(binding);
 	}
-	free(vm);
+	if (retain) {
+		vm->nextQuarantined = sQuarantinedVMs;
+		sQuarantinedVMs = vm;
+	} else
+		free(vm);
 	client->vm = NULL;
 	sVMCount--;
 }
@@ -1058,6 +1088,121 @@ VMControl(AmdgpuClient* client, uint32 op, void* data, size_t length)
 	return B_OK;
 }
 
+static uint64
+VMStorageBytes(const ClientVM* vm)
+{
+	return GpuPageTable::kDirectoryBytes + (uint64)vm->table.leafCount * 4096
+		+ 4096 + (vm->copiedCommands.cpu != NULL ? kMaxIbBytes : 0);
+}
+
+static amdgpu_recovery_info
+RecoveryInfo()
+{
+	amdgpu_recovery_info info = sRecovery;
+	info.version = AMDGPU_HAIKU_ABI_VERSION; info.size = sizeof(info);
+	info.flags = info.reserved = info.reserved_out = 0;
+	info.status = sFault;
+	info.quarantined_ram = info.quarantined_vram = 0;
+	info.buffers = info.vms = info.videos = 0;
+	for (Buffer* bo = sQuarantinedBuffers; bo != NULL; bo = bo->next) {
+		info.buffers++;
+		if (bo->system) info.quarantined_ram += bo->bytes;
+		else info.quarantined_vram += bo->bytes;
+	}
+	for (ClientVM* vm = sQuarantinedVMs; vm != NULL; vm = vm->nextQuarantined) {
+		info.vms++; info.quarantined_vram += VMStorageBytes(vm);
+	}
+	for (UvdSession* v = sQuarantinedVideos; v != NULL; v = v->nextQuarantined) {
+		info.videos++; info.quarantined_vram += v->layout.bytes;
+		info.quarantined_ram += v->readbackBytes;
+	}
+	info.live_handles = sLiveHandles; info.live_vms = sVMCount;
+	info.live_videos = sVideoSessions; info.pending = sPending;
+	return info;
+}
+
+static status_t
+ReclaimGraphicsQuarantine()
+{
+	// Called only after a successful reset/private shader proof and VMID2
+	// detachment. The global fault still blocks every client allocation.
+	while (sQuarantinedBuffers != NULL) {
+		Buffer* bo = sQuarantinedBuffers;
+		if (bo->area >= 0) {
+			status_t status = vm_change_clones_to_null_areas(bo->area);
+			if (status != B_OK) return status;
+		}
+		if (bo->system) {
+			status_t status = sGart.Unbind(bo->offset, bo->bytes);
+			if (status != B_OK) return status;
+		}
+		VramAllocator& allocator = bo->system ? sGartAllocator : sAllocator;
+		if (!allocator.Free(bo->offset, bo->bytes)) return B_BAD_DATA;
+		if (bo->area >= 0) delete_area(bo->area);
+		if (bo->system) sRecovery.reclaimed_ram += bo->bytes;
+		else sRecovery.reclaimed_vram += bo->bytes;
+		sQuarantinedBuffers = bo->next;
+		free(bo);
+	}
+	while (sQuarantinedVMs != NULL) {
+		ClientVM* vm = sQuarantinedVMs;
+		sRecovery.reclaimed_vram += VMStorageBytes(vm);
+		vm->table.Uninitialize(true);
+		ReleasePageTable(NULL, 4096, vm->commands, true);
+		if (vm->copiedCommands.cpu != NULL)
+			ReleasePageTable(NULL, kMaxIbBytes, vm->copiedCommands, true);
+		sQuarantinedVMs = vm->nextQuarantined;
+		free(vm);
+	}
+	return B_OK;
+}
+
+static status_t
+RecoverGraphics()
+{
+	// No live GPU resource may acquire a new meaning after reset. Old queued
+	// fences must first become terminal and all owners must close/free them.
+	if (sPending != 0 || sGraphicsExecuting || sVideoExecuting || sLiveHandles != 0
+		|| sVMCount != 0 || sVideoSessions != 0)
+		return B_BUSY;
+	if (sFault == B_OK || !sGfx.faulted || !sGfx.ready || sRecoveryAttempted)
+		return B_NOT_ALLOWED;
+	// This first recovery path owns GFX only. Other engine faults and live
+	// firmware video sessions need their own reset, not premature reclamation.
+	if (sEngine.faulted || sUvd.faulted || sQuarantinedVideos != NULL)
+		return B_NOT_SUPPORTED;
+	InstalledFirmware images[5];
+	amdgpu::FirmwareView firmware[4];
+	for (uint32 i = 0; i < 4; i++) {
+		status_t status = images[i].LoadGfx(i);
+		if (status != B_OK) return status;
+		firmware[i] = images[i].view;
+	}
+	status_t status = images[4].LoadMec();
+	if (status != B_OK) return status;
+	sRecoveryAttempted = true;
+	sRecovery.stage = 0;
+	sRecovery.reclaimed_vram = sRecovery.reclaimed_ram = 0;
+	status = sGfx.Recover(sInfo, sReservation, sRenderInfo, firmware, images[4].mec,
+		sEngine, sGart, sRecovery);
+	if (status == B_OK) status = ReclaimGraphicsQuarantine();
+	if (status == B_OK) {
+		sFault = B_OK;
+		sRecovery.generation++;
+		sRecovery.stage = 7;
+		sRecoveryAttempted = false;
+		dprintf("amdgpu: recovered graphics generation %" B_PRIu64
+			" reclaimed VRAM %" B_PRIu64 " RAM %" B_PRIu64 "\n",
+			sRecovery.generation, sRecovery.reclaimed_vram, sRecovery.reclaimed_ram);
+	} else {
+		sGfx.faulted = true;
+		sGfx.Halt();
+	}
+	sRecovery.status = status;
+	sCompleted.NotifyAll();
+	return status;
+}
+
 static status_t
 Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 {
@@ -1067,6 +1212,16 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 	if (client->team != team_get_current_team_id()
 		|| (client->flags & O_ACCMODE) != O_RDWR)
 		return B_NOT_ALLOWED;
+	if (op == AMDGPU_RECOVERY_INFO || op == AMDGPU_GFX_RECOVER) {
+		amdgpu_recovery_info request;
+		status_t status = ReadRequest(request, data, length);
+		if (status != B_OK) return status;
+		if (request.flags != 0 || request.reserved != 0) return B_BAD_VALUE;
+		status = op == AMDGPU_GFX_RECOVER ? RecoverGraphics() : sFault;
+		request = RecoveryInfo();
+		request.status = status;
+		return user_memcpy(data, &request, sizeof(request));
+	}
 	if (op == AMDGPU_IRQ_INFO) {
 		amdgpu_irq_info info;
 		status_t status = ReadRequest(info, data, length);
@@ -1396,6 +1551,7 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 		bo->next = client->buffers;
 		client->buffers = bo;
 		client->bufferCount++;
+		sLiveHandles++;
 		if (bo->system)
 			client->systemBytes += bo->bytes;
 		else
@@ -1429,6 +1585,7 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 		link = &(*link)->next;
 	*link = bo->next;
 	client->bufferCount--;
+	sLiveHandles--;
 	if (bo->system)
 		client->systemBytes -= bo->bytes;
 	else

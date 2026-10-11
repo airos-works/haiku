@@ -1200,7 +1200,8 @@ GfxEngine::Test(volatile uint32* r, const amdgpu_info& info,
 
 status_t
 GfxEngine::ExecuteVM(uint64 directory, uint64 destination, uint32 value,
-	volatile uint32* commands, Gart& gart, amdgpu_vm_test& result)
+	volatile uint32* commands, Gart& gart, amdgpu_vm_test& result,
+	uint64 ibAddress, uint64 shaderAddress)
 {
 	volatile uint32* ib = commands;
 	uint32 count = 0;
@@ -1212,7 +1213,7 @@ GfxEngine::ExecuteVM(uint64 directory, uint64 destination, uint32 value,
 	};
 	shader(0x2e04, 0); shader(0x2e05, 0); shader(0x2e06, 0);
 	shader(0x2e07, 64); shader(0x2e08, 1); shader(0x2e09, 1);
-	shader(0x2e0c, kClientShaderVA >> 8); shader(0x2e0d, 0);
+	shader(0x2e0c, shaderAddress >> 8); shader(0x2e0d, shaderAddress >> 40);
 	shader(0x2e12, 1 | 1 << 6 | 0xc0 << 12);
 	shader(0x2e13, 3 << 1 | 1 << 7);
 	shader(0x2e14, 2);
@@ -1232,7 +1233,7 @@ GfxEngine::ExecuteVM(uint64 directory, uint64 destination, uint32 value,
 		command(Packet(0x10, padding - 2));
 		for (uint32 i = 1; i < padding; i++) command(0);
 	}
-	return ExecuteIB(directory, kClientIbVA, count, gart, result);
+	return ExecuteIB(directory, ibAddress, count, gart, result);
 }
 
 status_t
@@ -1409,6 +1410,133 @@ GfxEngine::ExecuteIB(uint64 directory, uint64 address, uint32 dwords,
 		(unsigned)vmSequence, (unsigned)status, (unsigned)result.vm_fault_status[0],
 		(unsigned)result.vm_fault_status[1], (unsigned)result.rptr, (unsigned)result.wptr);
 	return status;
+}
+
+status_t
+GfxEngine::Recover(const amdgpu_info& info,
+	const amdgpu::AtomVramReservation& reservation,
+	const amdgpu::AtomRenderInfo& topology,
+	const amdgpu::FirmwareView firmware[4], const amdgpu::MecFirmwareView& mec,
+	SdmaEngine& sdma, Gart& gart, amdgpu_recovery_info& result)
+{
+	if (!attempted || !ready || !faulted || !mecStarted || area < 0 || vmArea < 0
+		|| topology.shaderEngines == 0 || topology.shaderEngines > 4
+		|| topology.shaderArraysPerEngine == 0 || topology.shaderArraysPerEngine > 2)
+		return B_DEV_NOT_READY;
+	volatile uint32* r = regs;
+	auto snapshot = [&](uint32* out) {
+		out[0] = r[0x2004]; out[1] = r[0x2002]; out[2] = r[0x394];
+		out[3] = r[0x536] | r[0x537];
+	};
+	auto fail = [&](status_t status) {
+		faulted = true; Halt(); snapshot(result.after);
+		dprintf("amdgpu: recovery stage %u failed %#x GRBM %#x/%#x SRBM %#x VM %#x\n",
+			(unsigned)result.stage, (unsigned)status, (unsigned)result.after[0],
+			(unsigned)result.after[1], (unsigned)result.after[2], (unsigned)result.after[3]);
+		return status;
+	};
+	snapshot(result.before);
+	// Reset only owned GFX/CP/RLC blocks, following Linux 6.18.52
+	// gfx_v8_0_pre/soft/post_soft_reset and matching GFX8/GMC8.1/OSS3 masks.
+	// The caller excluded live resources, all queued work and video/DMA faults.
+	result.grbm_reset = 0xf0005; // CP, RLC, GFX, CPF, CPC, CPG
+	result.srbm_reset = 0x100 | ((result.before[2] & 0x4000) != 0 ? 0x8000 : 0);
+	if ((r[0x2008] & result.grbm_reset) != 0 || (r[0x398] & result.srbm_reset) != 0
+		|| (r[0xd5f] & 3) != 0)
+		return B_NOT_ALLOWED;
+	const uint32 heads[] = {0x1a00, 0x1c00, 0x1e00, 0x4000, 0x4200, 0x4400};
+	const uint32 displayOffsets[] = {1, 4, 6, 7, 0x19c};
+	uint32 display[6][5];
+	for (uint32 h = 0; h < 6; h++)
+		for (uint32 i = 0; i < 5; i++) display[h][i] = r[heads[h] + displayOffsets[i]];
+	uint32 select = r[0x391];
+	bool inactive = true;
+	for (uint32 me = 1; me <= 2; me++)
+		for (uint32 pipe = 0; pipe < 4; pipe++)
+			for (uint32 queue = 0; queue < 8; queue++) {
+				r[0x391] = me << 2 | pipe | queue << 8;
+				if ((r[0x3247] & 1) != 0) inactive = false;
+			}
+	r[0x391] = select;
+	if (!inactive) return B_NOT_ALLOWED;
+	result.stage = 1;
+	Halt();
+	r[0xec00] &= ~1u;
+	r[0x306a] = 0;
+	(void)r[0xec00];
+	uint32 index = r[0xc200];
+	bool serdesIdle = true;
+	for (uint32 se = 0; se < topology.shaderEngines; se++)
+		for (uint32 sh = 0; sh < topology.shaderArraysPerEngine; sh++) {
+			r[0xc200] = se << 16 | sh << 8 | 1u << 30;
+			bigtime_t end = system_time() + 100000;
+			while (r[0xec61] != 0 && system_time() < end) snooze(10);
+			if (r[0xec61] != 0) serdesIdle = false;
+		}
+	r[0xc200] = index;
+	bigtime_t end = system_time() + 100000;
+	while ((r[0xec62] & 0xdffff) != 0 && system_time() < end) snooze(10);
+	if (!serdesIdle || (r[0xec62] & 0xdffff) != 0) return fail(B_TIMED_OUT);
+	status_t status = interrupts.SuspendForReset();
+	if (status != B_OK) return fail(status);
+	result.stage = 2;
+	dprintf("amdgpu: recovery before GRBM %#x/%#x SRBM %#x VM %#x reset %#x/%#x\n",
+		(unsigned)result.before[0], (unsigned)result.before[1], (unsigned)result.before[2],
+		(unsigned)result.before[3], (unsigned)result.grbm_reset, (unsigned)result.srbm_reset);
+	uint32 gmcon = r[0xd5f], grbm = r[0x2008], srbm = r[0x398];
+	r[0xd5f] = gmcon | 3; (void)r[0xd5f]; snooze(50);
+	r[0x2008] = grbm | result.grbm_reset; (void)r[0x2008]; snooze(50);
+	r[0x2008] = grbm; (void)r[0x2008];
+	r[0x398] = srbm | result.srbm_reset; (void)r[0x398]; snooze(50);
+	r[0x398] = srbm; (void)r[0x398];
+	r[0xd5f] = gmcon; (void)r[0xd5f]; snooze(50);
+	Halt();
+	result.stage = 3;
+	end = system_time() + 100000;
+	while (((r[0x2004] & 0xf7ffc000) != 0 || (r[0x2002] & 0x73000000) != 0)
+		&& system_time() < end) snooze(10);
+	if ((r[0x2004] & 0xf7ffc000) != 0 || (r[0x2002] & 0x73000000) != 0
+		|| r[0x2008] != grbm || r[0x398] != srbm || r[0xd5f] != gmcon)
+		return fail(B_DEV_NOT_READY);
+	// Clear only retained fault latches after the fault has been recorded,
+	// then disable client VM contexts before rebuilding the private directory.
+	r[0x50c] |= 1; r[0x50d] |= 1; (void)r[0x50d];
+	r[0x505] &= ~1u; (void)r[0x505];
+	r[0x3041] = 0x80000000; r[0x3045] = 0; (void)r[0x3045]; snooze(1000);
+	r[0x3041] = 0; (void)r[0x3041];
+	if (r[0x21c0] != 0 || r[0x3045] != 0 || ((r[0x536] | r[0x537]) & 0xff) != 0)
+		return fail(B_BAD_DATA);
+	// These are CPU views of permanently reserved VRAM, not allocator frees.
+	// Client/quarantined storage remains untouched until the self-test passes.
+	delete_area(area); delete_area(vmArea); area = vmArea = -1;
+	attempted = ready = faulted = vmEnabled = false;
+	vmSequence = 0;
+	result.stage = 4;
+	amdgpu_gfx_test startup = {};
+	status = Initialize(r, info, reservation, firmware, sdma, gart, startup, &mec);
+	if (status != B_OK) return fail(status);
+	result.stage = 5;
+	volatile uint32* data = memory + 0x20000 / 4;
+	for (uint32 i = 0; i < 3072; i++) data[i] = 0xabcddcba;
+	__sync_synchronize(); (void)data[3071];
+	amdgpu_vm_test proof = {};
+	status = ExecuteVM(info.vram_gpu_base + (24ULL << 20), kMemoryVA + 0x21000,
+		0x72535452, gart.commandMemory + 65536 / 4, gart, proof,
+		kCommandVA, kMemoryVA + 0x40000);
+	if (status != B_OK) return fail(status);
+	for (uint32 i = 0; i < 3072; i++) {
+		uint32 expected = i >= 1024 && i < 2048
+			? 0x72535452 ^ ((i - 1024) * 0x10204081u) : 0xabcddcba;
+		if (data[i] != expected) return fail(B_BAD_DATA);
+	}
+	for (uint32 h = 0; h < 6; h++)
+		for (uint32 i = 0; i < 5; i++)
+			if (r[heads[h] + displayOffsets[i]] != display[h][i]) return fail(B_BAD_DATA);
+	result.stage = 6;
+	snapshot(result.after);
+	dprintf("amdgpu: recovery private VM shader and display guards pass, ring %u/%u\n",
+		(unsigned)r[0x21c0], (unsigned)r[0x3045]);
+	return B_OK;
 }
 
 void

@@ -24,10 +24,12 @@ struct GpuInterrupts {
 	sem_id signal;
 	spinlock lock;
 	int32 error;
-	bool attempted, configured, handler, enabled, programmed;
+	bool attempted, configured, handler, enabled, programmed, resetSuspended;
 	amdgpu_irq_info stats;
 
 	status_t Initialize(volatile uint32* r, const amdgpu_info& info, pci_module_info* module);
+	status_t SuspendForReset();
+	status_t RearmAfterReset();
 	void Uninitialize();
 	status_t Error() { return atomic_get(&error); }
 	void RecordError(status_t status) { atomic_test_and_set(&error, status, B_OK); }

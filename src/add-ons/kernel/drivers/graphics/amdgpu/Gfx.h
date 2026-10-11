@@ -28,7 +28,8 @@ struct GfxEngine {
 		const amdgpu::FirmwareView firmware[4], SdmaEngine& sdma, Gart& gart,
 		amdgpu_gfx_test& result, const amdgpu::MecFirmwareView* mec);
 	status_t ExecuteVM(uint64 directory, uint64 destination, uint32 value,
-		volatile uint32* commands, Gart& gart, amdgpu_vm_test& result);
+		volatile uint32* commands, Gart& gart, amdgpu_vm_test& result,
+		uint64 ibAddress = kClientIbVA, uint64 shaderAddress = kClientShaderVA);
 	status_t ExecuteIB(uint64 directory, uint64 address, uint32 dwords,
 		Gart& gart, amdgpu_vm_test& result, uint32 diagnosticGds = 0);
 	void Snapshot(amdgpu_gfx_test& result);
@@ -36,6 +37,11 @@ struct GfxEngine {
 	status_t ShaderMemoryInfo(amdgpu_shader_memory_info& result);
 	status_t GwsInfo(amdgpu_gws_info& result);
 	status_t OaInfo(amdgpu_oa_info& result);
+	status_t Recover(const amdgpu_info& info,
+		const amdgpu::AtomVramReservation& reservation,
+		const amdgpu::AtomRenderInfo& topology,
+		const amdgpu::FirmwareView firmware[4], const amdgpu::MecFirmwareView& mec,
+		SdmaEngine& sdma, Gart& gart, amdgpu_recovery_info& result);
 	void DumpExecutionState(const char* point);
 	void Halt();
 	void Uninitialize();
