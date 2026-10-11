@@ -1257,7 +1257,10 @@ GfxEngine::ExecuteIB(uint64 directory, uint64 address, uint32 dwords,
 		return B_NOT_SUPPORTED;
 	const bool ordered = diagnosticGds >= 6;
 	const uint32 maxWaveId = ordered ? r[0x3348] : 0;
-	if (ordered && ((maxWaveId & ~0xfff) != 0 || r[0x3330] != 0xffff))
+	// gfx_v8_0_set_gds_init defines 16 OA resources. OA_VMID0 is an
+	// allocation mask, not their capacity; the qualified firmware leaves
+	// it zero. Only VMID2 receives the diagnostic grant below.
+	if (ordered && ((maxWaveId & ~0xfff) != 0 || (r[0x3330] & ~0xffff) != 0))
 		return B_NOT_SUPPORTED;
 	// VMID2 is leased only for this synchronous job. Between jobs it points
 	// at the kernel diagnostic's empty/private directory, never a client.
