@@ -52,6 +52,11 @@ cleared, and complete 192 recovery/control jobs. The checked renderer suite,
 concurrent media and both three-minute Summit playback trials pass, with
 5,400 frames and zero drops for each codec. Final DMA/VM checks leave this
 boot healthy at 43,457 completions with zero errors; the desktop is intact.
+A subsequent compute-shader probe checks 16,384 lane records across four VMs:
+neither SETREG form raises privilege, trap-register writes are ignored, and
+ordinary MODE/M0 positive controls succeed. All output/peer guards and memory
+reclamation pass. DMA plus checked GLES 3.1 leaves 43,498 healthy completions
+without requiring a reboot.
 Shader/resource isolation remains incomplete and both submission paths remain
 root-only. Driver `c579f1cd…` and private Mesa `afd206fa…` are installed with
 same-hash backups; prior `7d1cf6e5…`/`ee6210e5…` and older checkpoints are
