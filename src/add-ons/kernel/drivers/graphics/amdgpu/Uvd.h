@@ -5,6 +5,7 @@
 #include "UvdH264.h"
 #include "UvdHevc.h"
 struct UvdSession {
+	UvdSession* nextQuarantined;
 	enum { kGuardReadbackBytes = 4 * 4096 };
 	union {
 		amdgpu_h264_config config;

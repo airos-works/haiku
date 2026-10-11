@@ -31,7 +31,7 @@ status_t
 GpuInterrupts::Initialize(volatile uint32* r, const amdgpu_info& info, pci_module_info* module)
 {
 	if (enabled) return Error();
-	if (attempted) return B_DEV_NOT_READY;
+	if (attempted) return RearmAfterReset();
 	// Never take over an enabled firmware/foreign interrupt ring.
 	if (module == NULL || (r[0xe30] & 0x20001) != 0) return B_NOT_ALLOWED;
 	attempted = true; area = signal = -1;
@@ -97,6 +97,72 @@ GpuInterrupts::Initialize(volatile uint32* r, const amdgpu_info& info, pci_modul
 	(void)r[0x505];
 	dprintf("amdgpu: IH3 MSI vector %u ring %#" B_PRIx64 " bytes %u control %#x\n",
 		(unsigned)vector, (uint64)physical.address, (unsigned)kRingBytes, (unsigned)r[0xe30]);
+	return B_OK;
+}
+
+status_t
+GpuInterrupts::SuspendForReset()
+{
+	if (!programmed || !configured || !handler || area < 0 || signal < 0)
+		return B_DEV_NOT_READY;
+	resetSuspended = false;
+	cpu_status previous = disable_interrupts();
+	acquire_spinlock(&lock);
+	regs[0x306a] &= ~kCPInterrupts;
+	regs[0x504] &= ~kVMInterrupts;
+	regs[0x505] &= ~kVMInterrupts;
+	regs[0xe30] &= ~0x20001u;
+	(void)regs[0xe30];
+	// tonga_ih_disable_interrupts resets both pointers after disabling IH.
+	// The hardware WPTR resets on disable; leaving an old RPTR can keep
+	// IH busy. Retain the backing memory until the idle check succeeds.
+	regs[0xe32] = regs[0xe33] = 0;
+	(void)regs[0xe33];
+	rptr = 0;
+	enabled = false;
+	pendingFence = false;
+	fence = NULL;
+	release_spinlock(&lock);
+	restore_interrupts(previous);
+	bigtime_t deadline = system_time() + 100000;
+	while ((regs[0x394] & 0x20000) != 0 && system_time() < deadline) snooze(10);
+	resetSuspended = (regs[0x394] & 0x20000) == 0;
+	dprintf("amdgpu: recovery IH suspended %u control %#x ptr %#x/%#x SRBM %#x\n",
+		(unsigned)resetSuspended, (unsigned)regs[0xe30], (unsigned)regs[0xe32],
+		(unsigned)regs[0xe33], (unsigned)regs[0x394]);
+	return resetSuspended ? B_OK : B_TIMED_OUT;
+}
+
+status_t
+GpuInterrupts::RearmAfterReset()
+{
+	// The exclusive recovery owner already halted/reset GFX and waited for
+	// IH idle. Keep MSI, its handler and wired memory; discard old vectors
+	// only after the reset proved they cannot describe new-epoch work.
+	if (!resetSuspended || !programmed || enabled || !configured || !handler || area < 0 || signal < 0
+		|| (regs[0xe30] & 0x20001) != 0 || (regs[0x394] & 0x20000) != 0)
+		return B_DEV_NOT_READY;
+	resetSuspended = false;
+	while (acquire_sem_etc(signal, 1, B_RELATIVE_TIMEOUT, 0) == B_OK) {}
+	cpu_status previous = disable_interrupts();
+	acquire_spinlock(&lock);
+	memset((void*)memory, 0, kAllocationBytes);
+	memset(&stats, 0, sizeof(stats));
+	rptr = expectedFence = 0;
+	pendingFence = false; fence = NULL;
+	atomic_set(&error, B_OK);
+	const uint32 control = (14 << 1) | (1 << 8) | (1 << 21);
+	regs[0xe30] = control | 0x80000000;
+	regs[0xe32] = regs[0xe33] = 0;
+	__sync_synchronize();
+	enabled = true;
+	regs[0xe30] = control | 0x20001;
+	regs[0x306a] |= kCPInterrupts;
+	regs[0x504] |= kVMInterrupts;
+	regs[0x505] |= kVMInterrupts;
+	(void)regs[0x505];
+	release_spinlock(&lock);
+	restore_interrupts(previous);
 	return B_OK;
 }
 
