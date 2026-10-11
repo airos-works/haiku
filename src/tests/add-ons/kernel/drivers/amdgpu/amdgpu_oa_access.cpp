@@ -1,6 +1,6 @@
 /* Copyright 2026, air/OS. Distributed under the terms of the MIT License. */
-// First ordered-append control: one wave, address/index0, trusted wave-ID
-// reset. Seed and independently check all4KiB of owned GDS around the counter.
+// Ordered-append controls: one wave, trusted wave-ID reset. Seed and
+// independently check all 4 KiB of owned GDS around every counter target.
 #include <amdgpu_haiku.h>
 #include <OS.h>
 #include <errno.h>
@@ -17,7 +17,12 @@
 
 static const uint64 kCode = 0x500000000ULL, kOutput = 0x300000000ULL;
 static const uint32 kGuard = 0x6b6b6b6b, kDone = 0x0a0dc001;
-struct Client { int fd; amdgpu_buffer code, output; uint32 marker; };
+struct Client {
+	int fd;
+	amdgpu_buffer code, output;
+	uint32 marker;
+	uint32 shader[sizeof(kShaderOaAccess) / sizeof(uint32)];
+};
 static uint64 sJobs;
 static Client* sClients;
 static void Require(bool ok, const char* why)
@@ -79,12 +84,23 @@ static std::vector<uint32> Commands(uint32 operation, uint32 offset, uint32 m0, 
 }
 static void Code(const Client& c)
 {
-	Require(memcmp((void*)(addr_t)c.code.address, kShaderOaAccess, sizeof(kShaderOaAccess)) == 0, "shader unchanged");
+	Require(memcmp((void*)(addr_t)c.code.address, c.shader, sizeof(c.shader)) == 0, "shader unchanged");
 	auto p = (volatile uint32*)(addr_t)c.code.address;
 	for (uint32 i = sizeof(kShaderOaAccess) / 4; i < 1024; i++) Require(p[i] == kGuard, "shader tail guard");
 }
+static void OrderedShader(Client& c, uint32 index, bool swap)
+{
+	Code(c);
+	// LLVM gfx803 encoding at byte 0x8c: index in offset[7:2], swap in
+	// offset[12]. Keep CS type, wave release/done and register operands fixed.
+	Require(index < 64 && kShaderOaAccess[35] == 0xd97f0300
+		&& kShaderOaAccess[36] == 0x04000004, "fixed ordered instruction encoding");
+	c.shader[35] = 0xd97f0300 | index << 2 | (swap ? 0x1000 : 0);
+	memcpy((void*)(addr_t)c.code.address, c.shader, sizeof(c.shader));
+}
 static void Run(Client& c, int mode, uint32 op, uint32 offset, uint32 m0,
-	uint32 seed, const uint32 expected[64], bool violation)
+	uint32 seed, const uint32 expected[64], bool violation, uint32* observed = NULL,
+	uint32* observedTrap = NULL)
 {
 	Client& peer = sClients[&c == &sClients[0] ? 1 : 0];
 	uint32 peerOutput[1024];
@@ -109,15 +125,19 @@ static void Run(Client& c, int mode, uint32 op, uint32 offset, uint32 m0,
 		Require(false, "GDS job completes; inspect terminal evidence before recovery");
 	}
 	uint32 trapBefore = out[258], trapAfter = out[259];
+	if (observedTrap != NULL) *observedTrap = trapAfter;
 	for (uint32 i = 0; i < 1024; i++) {
 		uint32 want = kGuard;
 		if (i >= 256 && i < 768) {
 			uint32 lane = (i - 256) / 8;
 			switch (i % 8) {
 				case 0: want = c.marker ^ lane; break;
-				case 1: want = expected[lane]; break;
+				case 1:
+					if (observed != NULL) observed[lane] = out[i];
+					want = expected != NULL ? expected[lane] : out[i];
+					break;
 				case 2: want = 0; break;
-				case 3: want = violation ? 0x100 : 0; break;
+				case 3: want = observedTrap != NULL ? trapAfter : violation ? 0x100 : 0; break;
 				case 4: want = kDone; break;
 			}
 		}
@@ -136,6 +156,42 @@ static void CheckAll(Client& c, const uint32 expected[1024])
 	for (uint32 offset = 0; offset < 4096; offset += 256)
 		Run(c, AMDGPU_GDS_PROBE_FULL, 0, offset, 4096, 0, expected + offset / 4, false);
 }
+static void Ordered(Client& c, Client& reader, int mode, uint32 index,
+	uint32 address, bool swap, uint32 value, uint32 expected[1024], bool denied)
+{
+	Require(address % 4 == 0 && address * 4 + index * 4 < 4096,
+		"every possible OA target is inside owned seeded GDS");
+	OrderedShader(c, index, swap);
+	auto before = Info<amdgpu_oa_info>(c.fd, AMDGPU_OA_INFO);
+	uint32 returned[64], actual[1024], trap;
+	Run(c, mode, 2, 0, address << 16, value, NULL, denied, returned, &trap);
+	// Always gather the complete owned region before judging address semantics.
+	for (uint32 offset = 0; offset < 4096; offset += 256)
+		Run(reader, AMDGPU_GDS_PROBE_FULL, 0, offset, 4096, 0, NULL,
+			false, actual + offset / 4);
+	for (uint32 i = 0; i < 1024; i++) {
+		if (actual[i] != expected[i])
+			printf("OA %s mode %d index %u address %#x changed GDS byte %#x: %#x -> %#x\n",
+				swap ? "swap" : "add", mode, index, address, i * 4, expected[i], actual[i]);
+	}
+	uint32 word = address / 4 + index;
+	uint32 old = expected[word];
+	Require(trap == (denied ? 0x100 : 0), "ordered instruction exception state");
+	if (!denied) expected[word] = swap ? value : old + value;
+	for (uint32 lane = 0; lane < 64; lane++)
+		Require(returned[lane] == (denied ? 0 : old), "ordered result in every lane");
+	Require(memcmp(actual, expected, sizeof(actual)) == 0, "exact counter target and all GDS guards");
+	auto after = Info<amdgpu_oa_info>(c.fd, AMDGPU_OA_INFO);
+	Require(before.selector_before == before.selector_after
+		&& after.selector_before == after.selector_after
+		&& before.max_wave_id == after.max_wave_id
+		&& memcmp(before.counters, after.counters, sizeof(before.counters)) == 0
+		&& memcmp(before.addresses, after.addresses, sizeof(before.addresses)) == 0
+		&& memcmp(before.ring_sizes, after.ring_sizes, sizeof(before.ring_sizes)) == 0,
+		"all OA resource state unchanged after completed one-wave operation");
+	printf("PASS: OA %s mode %d index %u address %#x %s, all owned GDS and lane results\n",
+		swap ? "swap" : "add", mode, index, address, denied ? "denied" : "allowed");
+}
 static void ABI(Client& c)
 {
 	auto w = Commands(0, 0, 4096, 0, c.marker);
@@ -151,7 +207,7 @@ static void ABI(Client& c)
 		}
 		Require(ioctl(c.fd, AMDGPU_GFX_GDS_PROBE_COPY, &bad, bytes) < 0 && errno == B_BAD_VALUE, "invalid diagnostic request rejected");
 	}
-	for (uint32 mode = 0; mode <= 2; mode++) {
+	for (uint32 mode = 0; mode <= AMDGPU_GDS_PROBE_LAST; mode++) {
 		r.flags = mode; w[0] = 0xc0003f00; // Nested IB is never permitted, in any mode.
 		Require(ioctl(c.fd, AMDGPU_GFX_GDS_PROBE_COPY, &r, sizeof(r)) < 0 && errno == B_NOT_ALLOWED, "diagnostic always validates copied commands");
 	}
@@ -172,7 +228,11 @@ int main(int argc, char** argv)
 	setvbuf(stdout, NULL, _IOLBF, 0); disable_debugger(1);
 	bool absent = argc == 2 && strcmp(argv[1], "--expect-no-device") == 0;
 	bool controls = argc == 2 && strcmp(argv[1], "--control") == 0;
-	Require(absent || (controls && geteuid() == 0), "usage: amdgpu_oa_access --control | --expect-no-device");
+	bool addressControl = argc == 2 && strcmp(argv[1], "--address-control") == 0;
+	bool extended = argc == 2 && strcmp(argv[1], "--extended") == 0;
+	bool bounds = argc == 2 && strcmp(argv[1], "--bounds") == 0;
+	Require(absent || ((controls || addressControl || extended || bounds) && geteuid() == 0),
+		"usage: amdgpu_oa_access --control | --address-control | --extended | --bounds | --expect-no-device");
 	for (uint32 op = 0; op < 3; op++) Commands(op, 256, 4096, 0x1234, 0x5678);
 	int monitor = open("/dev/" AMDGPU_DEVICE_NAME, O_RDWR);
 	if (absent) { Require(monitor < 0 && errno == ENOENT, "no AMD device"); puts("PASS: OA access command policy and no-device handling"); return 0; }
@@ -191,7 +251,8 @@ int main(int argc, char** argv)
 			((uint32*)(addr_t)c[i].code.address)[j] = kGuard;
 			((uint32*)(addr_t)c[i].output.address)[j] = kGuard;
 		}
-		memcpy((void*)(addr_t)c[i].code.address, kShaderOaAccess, sizeof(kShaderOaAccess));
+		memcpy(c[i].shader, kShaderOaAccess, sizeof(kShaderOaAccess));
+		memcpy((void*)(addr_t)c[i].code.address, c[i].shader, sizeof(c[i].shader));
 	}
 	sClients = c;
 	ABI(c[0]); Require(Healthy(monitor).completed_fences == initial.completed_fences, "ABI rejects before GPU execution");
@@ -200,16 +261,42 @@ int main(int argc, char** argv)
 	for (uint32 offset = 0; offset < 4096; offset += 256)
 		Run(c[0], AMDGPU_GDS_PROBE_FULL, 1, offset, 4096, seed, expected + offset / 4, false);
 	CheckAll(c[1], expected);
-	puts("PASS: seeded and read all4096 owned GDS bytes across two client VMs");
+	puts("PASS: seeded and read all 4096 owned GDS bytes across two client VMs");
 	auto oaBefore = Info<amdgpu_oa_info>(monitor, AMDGPU_OA_INFO);
 	auto gwsBefore = Info<amdgpu_gws_info>(monitor, AMDGPU_GWS_INFO);
 	for (uint32 i = 0; i < 16; i++)
 		Require(oaBefore.counters[i] == 0 && oaBefore.addresses[i] == 0
 			&& oaBefore.ring_sizes[i] == 0, "OA state matches idle prerequisite snapshot");
-	uint32 returned[64]; for (uint32 i = 0; i < 64; i++) returned[i] = expected[0];
-	Run(c[1], AMDGPU_GDS_PROBE_OA_FULL, 2, 0, 0, 5, returned, false);
-	expected[0] += 5;
-	CheckAll(c[0], expected);
+	if (controls)
+		Ordered(c[1], c[0], AMDGPU_GDS_PROBE_OA_FULL, 0, 0, false, 5, expected, false);
+	if (addressControl) {
+		Ordered(c[1], c[0], AMDGPU_GDS_PROBE_OA_FULL, 1, 0, false, 7, expected, false);
+		Ordered(c[0], c[1], AMDGPU_GDS_PROBE_OA_FULL, 0, 4, false, 9, expected, false);
+		Ordered(c[1], c[0], AMDGPU_GDS_PROBE_OA_FULL, 1, 4, true, 0x12345678, expected, false);
+	}
+	if (extended || bounds) {
+		for (uint32 swap = 0; swap < 2; swap++) {
+			for (uint32 index = 0; index < 16; index++)
+				Ordered(c[index % 2], c[1 - index % 2], AMDGPU_GDS_PROBE_OA_FULL,
+					index, 256, swap, 0x200 + index, expected, false);
+			for (uint32 index = 4; index <= 5; index++)
+				Ordered(c[index % 2], c[1 - index % 2], AMDGPU_GDS_PROBE_OA_SLICE,
+					index, 256, swap, 0x400 + index, expected, false);
+		}
+	}
+	if (bounds) {
+		for (uint32 swap = 0; swap < 2; swap++) {
+			for (uint32 index : {16u, 63u})
+				Ordered(c[0], c[1], AMDGPU_GDS_PROBE_OA_FULL, index, 256, swap, 3, expected, true);
+			for (uint32 index : {0u, 3u, 6u, 15u})
+				Ordered(c[1], c[0], AMDGPU_GDS_PROBE_OA_SLICE, index, 256, swap, 3, expected, true);
+			for (uint32 index : {0u, 4u, 15u}) {
+				Ordered(c[0], c[1], AMDGPU_GDS_PROBE_OA_NONE, index, 256, swap, 3, expected, true);
+				Ordered(c[1], c[0], AMDGPU_GDS_PROBE_OA_NOGDS, index, 256, swap, 3, expected, true);
+				Ordered(c[0], c[1], -1, index, 256, swap, 3, expected, true);
+			}
+		}
+	}
 	auto oaAfter = Info<amdgpu_oa_info>(monitor, AMDGPU_OA_INFO);
 	auto gwsAfter = Info<amdgpu_gws_info>(monitor, AMDGPU_GWS_INFO);
 	Require(oaBefore.selector_before == oaBefore.selector_after
@@ -221,7 +308,7 @@ int main(int argc, char** argv)
 			oaBefore.ring_sizes[i], oaAfter.ring_sizes[i]);
 	Require(memcmp(gwsBefore.resources, gwsAfter.resources, sizeof(gwsBefore.resources)) == 0,
 		"all64 GWS states unchanged");
-	puts("PASS: ordered add index0/address0 returns old counter to64 lanes and increments only the owned GDS word");
+	puts("PASS: ordered operations preserve every GDS guard and all GWS resource states");
 	for (auto& client : c) {
 		Code(client); close(client.fd);
 		Require(delete_area(client.code.area) == B_OK && delete_area(client.output.area) == B_OK, "release revoked clones");
@@ -230,6 +317,6 @@ int main(int argc, char** argv)
 		&& Info<amdgpu_memory_info>(monitor, AMDGPU_MEMORY_INFO).allocated_bytes == vram.allocated_bytes, "complete memory reclamation");
 	auto final = Healthy(monitor); Require(final.completed_fences == initial.completed_fences + sJobs, "exact GDS completion count");
 	Revoked(monitor); close(monitor);
-	printf("PASS: OA first ordered add, %llu checked jobs, 2 VMs, all GDS/resource/VM guards, revoke and reclamation\n",
+	printf("PASS: OA ordered access, %llu checked jobs, 2 VMs, all GDS/resource/VM guards, revoke and reclamation\n",
 		(unsigned long long)sJobs);
 }
