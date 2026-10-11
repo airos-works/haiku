@@ -33,6 +33,7 @@
 		passive_temperature 80	release_temperature 76
 		hot_temperature 90		critical_temperature 96
 		critical_grace 30		seconds before the kernel shuts down itself
+		critical_margin 4		or degrees above critical before it does
 		max_big_mhz 1794		max_little_mhz 1404
 		throttle_devices false	the GPU and the video engine stay at 600 MHz
 		log_interval 5			a "watch" line every 5 s
@@ -93,10 +94,14 @@ static const int32 kThermalTicks = 12;			// a reading every 240 ms
 static const int32 kUpLoad = 80;				// percent: straight to the top
 static const int32 kTargetLoad = 60;			// percent below that
 static const bigtime_t kDownHold = 100000;		// after a raise
+// Above the passive trip a step at most every 2 s; 4 C above it two every
+// 480 ms, 8 C above three on every reading: with all eight cores at their
+// top speed the SoC warms by 6 C a second, from 63 C to 95 C in 5 s.
 static const bigtime_t kThrottleStep = 2000000;
-static const bigtime_t kThrottleFastStep = 1000000;
+static const bigtime_t kThrottleFastStep = 480000;
 static const bigtime_t kReleaseStep = 4000000;
-static const int32 kFastMargin = 4000;			// above passive: two steps
+static const int32 kFastMargin = 4000;
+static const int32 kRunawayMargin = 8000;
 
 // The throttle levels: each cluster's top speed (MHz), the big cores first,
 // and the steps of the GPU's and the video engine's clocks (below). With
@@ -186,6 +191,7 @@ static int32 sRelease = 76000;
 static int32 sHot = 90000;
 static int32 sCritical = 96000;
 static bigtime_t sCriticalGrace = 30000000;
+static int32 sCriticalMargin = 4000;
 static uint32 sMaxBigMhz;
 static uint32 sMaxLittleMhz;
 static bigtime_t sLogInterval;
@@ -420,6 +426,11 @@ apply_setting(const char* key, const char* value, bool runtime)
 		*target = degrees * 1000;
 	} else if (strcmp(key, "critical_grace") == 0) {
 		sCriticalGrace = strtol(value, NULL, 10) * 1000000LL;
+	} else if (strcmp(key, "critical_margin") == 0) {
+		int32 degrees = strtol(value, NULL, 10);
+		if (degrees < 1 || degrees > 30)
+			return B_BAD_VALUE;
+		sCriticalMargin = degrees * 1000;
 	} else if (strcmp(key, "max_big_mhz") == 0) {
 		sMaxBigMhz = strtoul(value, NULL, 10);
 		update_user_caps();
@@ -664,6 +675,7 @@ thermal_step(bigtime_t now)
 			TRACE("CRITICAL: %s C at or above the critical %s C: shutting "
 				"down\n", temperature, limit);
 			set_level(kLevelCount - 1, "critical");
+			sLastUp = sLastDown = now;
 			post_trip_event(TRIP_EVENT_CRITICAL);
 			if (atomic_get(&sTripOpenCount) == 0) {
 				// nobody to shut down the user way
@@ -675,7 +687,7 @@ thermal_step(bigtime_t now)
 	if (sCriticalFired) {
 		if (now - sCriticalTime > sCriticalGrace)
 			emergency_shutdown("still running after the critical temperature");
-		else if (hottest >= sCritical + 4000)
+		else if (hottest >= sCritical + sCriticalMargin)
 			emergency_shutdown("still heating after the critical temperature");
 	}
 
@@ -684,6 +696,7 @@ thermal_step(bigtime_t now)
 		if (++sHotCount >= 2) {
 			if (sLevel != kLevelCount - 1)
 				set_level(kLevelCount - 1, "hot");
+			sLastUp = sLastDown = now;
 			if (!sHotFired) {
 				sHotFired = true;
 				char limit[16];
@@ -701,14 +714,17 @@ thermal_step(bigtime_t now)
 
 	// passive: step the top speeds down and back up
 	if (sThrottle && sCpuFreq != NULL) {
-		if (hottest >= sPassive + kFastMargin
+		if (hottest >= sPassive + kRunawayMargin) {
+			set_level(sLevel + 3, "heating fast");
+			sLastUp = sLastDown = now;
+		} else if (hottest >= sPassive + kFastMargin
 			&& now - sLastUp >= kThrottleFastStep) {
 			set_level(sLevel + 2, "hot zone");
 			sLastUp = sLastDown = now;
 		} else if (hottest >= sPassive && now - sLastUp >= kThrottleStep) {
 			set_level(sLevel + 1, "above passive");
 			sLastUp = sLastDown = now;
-		} else if (hottest < sRelease && sLevel > 0
+		} else if (hottest < sRelease && sLevel > 0 && !sCriticalFired
 			&& now - sLastDown >= kReleaseStep) {
 			set_level(sLevel - 1, "cooled");
 			sLastDown = now;
