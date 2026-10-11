@@ -51,7 +51,8 @@ enum {
 	AMDGPU_DIAGNOSTIC_RAM_PAGE,
 	AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER,
 	AMDGPU_GFX_GDS_PROBE_COPY,
-	AMDGPU_GWS_INFO
+	AMDGPU_GWS_INFO,
+	AMDGPU_OA_INFO
 };
 
 // One GPU virtual address space per open client. Mappings retain their BO
@@ -135,7 +136,15 @@ enum {
 	AMDGPU_GDS_PROBE_SLICE = 1, // base 1024, size 256
 	AMDGPU_GDS_PROBE_NONE = 2, // base 0, size 0; ordinary client policy
 	AMDGPU_GDS_PROBE_GWS_FULL = 3, // GWS base 0, count 16; GDS/OA disabled
-	AMDGPU_GDS_PROBE_GWS_SLICE = 4 // GWS base 8, count 2; GDS/OA disabled
+	AMDGPU_GDS_PROBE_GWS_SLICE = 4, // GWS base 8, count 2; GDS/OA disabled
+	// OA modes reset this ring's ME/GDS wave IDs using the inherited
+	// GDS_COMPUTE_MAX_WAVE_ID, via a trusted same-value PM4 prefix.
+	AMDGPU_GDS_PROBE_OA_RESET = 5, // reset only; GDS/GWS/OA disabled
+	AMDGPU_GDS_PROBE_OA_FULL = 6, // GDS 0/4096; OA mask 0xffff
+	AMDGPU_GDS_PROBE_OA_SLICE = 7, // GDS 0/4096; OA mask 0x30 (indices 4/5)
+	AMDGPU_GDS_PROBE_OA_NONE = 8, // GDS 0/4096; OA mask 0
+	AMDGPU_GDS_PROBE_OA_NOGDS = 9, // GDS disabled; OA mask 0xffff
+	AMDGPU_GDS_PROBE_LAST = AMDGPU_GDS_PROBE_OA_NOGDS
 };
 
 // Root-only bounded observation of all 64 driver-owned GWS resources. Requires
@@ -146,6 +155,16 @@ struct amdgpu_gws_info {
 	uint32 version, size, flags, reserved;
 	uint32 selector_before, selector_after, gws_vmid2, resource_count;
 	uint32 resources[64];
+};
+
+// Root-only idle observation. Reads the 16 owned OA counters, addresses and
+// ring sizes; restores the fixed index selector. Does not write OA state or
+// reset wave counters. flags/reserved must be zero.
+struct amdgpu_oa_info {
+	uint32 version, size, flags, reserved;
+	uint32 selector_before, selector_after, oa_vmid0, oa_vmid2;
+	uint32 gds_base, gds_size, max_wave_id, resource_count;
+	uint32 counters[16], addresses[16], ring_sizes[16];
 };
 
 // Root-only asynchronous copied submission. Captures/optionally validates the

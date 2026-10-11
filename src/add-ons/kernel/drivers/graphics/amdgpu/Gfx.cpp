@@ -577,6 +577,35 @@ GfxEngine::GwsInfo(amdgpu_gws_info& result)
 }
 
 status_t
+GfxEngine::OaInfo(amdgpu_oa_info& result)
+{
+	if (!ready || faulted || !mecStarted)
+		return B_DEV_NOT_READY;
+	result = {};
+	result.version = AMDGPU_HAIKU_ABI_VERSION;
+	result.size = sizeof(result);
+	result.resource_count = 16;
+	result.oa_vmid0 = regs[0x3330];
+	result.oa_vmid2 = regs[0x3332];
+	result.gds_base = regs[0x3304];
+	result.gds_size = regs[0x3305];
+	result.max_wave_id = regs[0x3348];
+	// Fixed GFX8 OA index and state ports; caller drained all engines and
+	// holds the device mutex. In particular, never write INCDEC or RESET.
+	result.selector_before = regs[0xc41d];
+	for (uint32 index = 0; index < 16; index++) {
+		regs[0xc41d] = index;
+		(void)regs[0xc41d];
+		result.counters[index] = regs[0xc41e];
+		result.addresses[index] = regs[0xc41f];
+		result.ring_sizes[index] = regs[0xc421];
+	}
+	regs[0xc41d] = result.selector_before;
+	result.selector_after = regs[0xc41d];
+	return B_OK;
+}
+
+status_t
 GfxEngine::RenderInfo(const amdgpu::AtomRenderInfo& rom, amdgpu_render_info& result)
 {
 	if (!ready || faulted || !mecStarted)
@@ -1210,7 +1239,7 @@ status_t
 GfxEngine::ExecuteIB(uint64 directory, uint64 address, uint32 dwords,
 	Gart& gart, amdgpu_vm_test& result, uint32 diagnosticGds)
 {
-	if (diagnosticGds > 5)
+	if (diagnosticGds > AMDGPU_GDS_PROBE_LAST + 1)
 		return B_BAD_VALUE;
 	if (!ready || faulted || !mecStarted)
 		return B_DEV_NOT_READY;
@@ -1224,7 +1253,11 @@ GfxEngine::ExecuteIB(uint64 directory, uint64 address, uint32 dwords,
 	// GDS users. Probe windows are wholly within the first owned 4 KiB.
 	if (diagnosticGds != 0 && (r[0x3300] != 0 || r[0x3301] != 0x10000))
 		return B_NOT_SUPPORTED;
-	if (diagnosticGds >= 4 && r[0x3320] != (64 << 16))
+	if (diagnosticGds >= 4 && diagnosticGds <= 5 && r[0x3320] != (64 << 16))
+		return B_NOT_SUPPORTED;
+	const bool ordered = diagnosticGds >= 6;
+	const uint32 maxWaveId = ordered ? r[0x3348] : 0;
+	if (ordered && ((maxWaveId & ~0xfff) != 0 || r[0x3330] != 0xffff))
 		return B_NOT_SUPPORTED;
 	// VMID2 is leased only for this synchronous job. Between jobs it points
 	// at the kernel diagnostic's empty/private directory, never a client.
@@ -1257,15 +1290,19 @@ GfxEngine::ExecuteIB(uint64 directory, uint64 address, uint32 dwords,
 		r[0x3322] = 0; r[0x3332] = 0;
 		if (diagnosticGds != 0) {
 			const uint32 base = diagnosticGds == 2 ? 1024 : 0;
-			const uint32 size = diagnosticGds == 1 ? 4096 : diagnosticGds == 2 ? 256 : 0;
+			const uint32 size = diagnosticGds == 1
+				|| (diagnosticGds >= 7 && diagnosticGds <= 9) ? 4096
+				: diagnosticGds == 2 ? 256 : 0;
 			const uint32 gws = diagnosticGds == 4 ? 16 << 16
 				: diagnosticGds == 5 ? (2 << 16) | 8 : 0;
+			const uint32 oa = diagnosticGds == 7 || diagnosticGds == 10 ? 0xffff
+				: diagnosticGds == 8 ? 0x30 : 0;
 			// Matches Linux gfx_v8_0_ring_emit_gds_switch's byte units and
 			// fixed VMID register layout. No job is in flight at this point.
-			r[0x3304] = base; r[0x3305] = size; r[0x3322] = gws;
+			r[0x3304] = base; r[0x3305] = size; r[0x3322] = gws; r[0x3332] = oa;
 			if (r[0x3304] != base || r[0x3305] != size
-				|| r[0x3322] != gws || r[0x3332] != 0) {
-				r[0x3304] = 0; r[0x3305] = 0; r[0x3322] = 0;
+				|| r[0x3322] != gws || r[0x3332] != oa) {
+				r[0x3304] = 0; r[0x3305] = 0; r[0x3322] = 0; r[0x3332] = 0;
 				faulted = true;
 				Halt();
 				return B_BAD_DATA;
@@ -1284,6 +1321,12 @@ GfxEngine::ExecuteIB(uint64 directory, uint64 address, uint32 dwords,
 		emit(Packet(0x42, 0)); emit(0);
 		emit(Packet(0x28, 1)); emit(0x80000000); emit(0x80000000);
 		emit(Packet(0x76, 1) | 2); emit(0x2e14 - 0x2c00); emit(2);
+		if (ordered) {
+			// Same-value reset used by Linux gfx_v8_0_ring_emit_ib_compute:
+			// re-synchronize this ring's ME/GDS wave IDs before the private IB.
+			// Keep this privileged prefix out of the caller's command policy.
+			emit(Packet(0x68, 1)); emit(0x3348 - 0x2000); emit(maxWaveId);
+		}
 		emit(Packet(0x3f, 2)); emit((uint32)address); emit(address >> 32);
 		emit(dwords | 2 << 24);
 		// Both EOPs are in the trusted VMID0 ring. No client mapping includes
@@ -1331,8 +1374,9 @@ GfxEngine::ExecuteIB(uint64 directory, uint64 address, uint32 dwords,
 			// unmap or close; only then may page tables/backing BOs be reused.
 			status = bind(gpu - kScratchOffset + (24ULL << 20));
 			if (diagnosticGds != 0) {
-				r[0x3305] = 0; r[0x3304] = 0; r[0x3322] = 0;
-				if (r[0x3305] != 0 || r[0x3304] != 0 || r[0x3322] != 0)
+				r[0x3305] = 0; r[0x3304] = 0; r[0x3322] = 0; r[0x3332] = 0;
+				if (r[0x3305] != 0 || r[0x3304] != 0 || r[0x3322] != 0
+					|| r[0x3332] != 0 || (ordered && r[0x3348] != maxWaveId))
 					status = B_BAD_DATA;
 			}
 		}
