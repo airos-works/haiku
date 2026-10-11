@@ -214,6 +214,9 @@ private:
 							fPainter;
 			HWInterface*	fGraphicsCard;
 			bool			fCopyToFront;
+			bool			fRetraceRequested;
+								// drawing that is not on the screen yet
+								// asked for B_WAIT_FOR_RETRACE
 
 			void			_ScaleRegion(const BRegion& region,
 								BRegion& scaled) const;

@@ -136,6 +136,10 @@ public:
 	virtual sem_id				RetraceSemaphore() = 0;
 	virtual status_t			WaitForRetrace(
 									bigtime_t timeout = B_INFINITE_TIMEOUT) = 0;
+			void				WaitForRetraceBeforeCopy();
+									// B_WAIT_FOR_RETRACE: drawing that is
+									// in the back buffer goes to the screen
+									// after this (read locked)
 
 	virtual status_t			SetDPMSMode(uint32 state) = 0;
 	virtual uint32				DPMSMode() = 0;
@@ -299,6 +303,9 @@ protected:
 
 private:
 			BList				fListeners;
+
+			int32				fRetraceTimeouts;
+			bigtime_t			fRetraceIgnoredUntil;
 };
 
 #endif // HW_INTERFACE_H
