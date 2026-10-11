@@ -261,13 +261,15 @@ device_control(void* cookie, uint32 op, void* buffer, size_t length)
 		|| (op >= AMDGPU_VIDEO_CREATE && op <= AMDGPU_HEVC_DECODE)
 		|| op == AMDGPU_CREATE_DEVICE_BUFFER
 		|| op == AMDGPU_GFX_SUBMIT_COPY || op == AMDGPU_GFX_QUEUE_COPY
-		|| op == AMDGPU_SHADER_MEMORY_INFO
+		|| op == AMDGPU_SHADER_MEMORY_INFO || op == AMDGPU_DIAGNOSTIC_RAM_PAGE
+		|| op == AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER
 		|| (op >= AMDGPU_VM_INFO && op <= AMDGPU_RENDER_INFO))
 	{
 		// Raw PM4/shader privilege isolation and fault recovery remain under
 		// qualification. Bounded VM_TEST continues to accept ordinary clients.
 		if ((op == AMDGPU_GFX_SUBMIT || op == AMDGPU_GFX_SUBMIT_COPY
-			|| op == AMDGPU_GFX_QUEUE_COPY || op == AMDGPU_SHADER_MEMORY_INFO)
+			|| op == AMDGPU_GFX_QUEUE_COPY || op == AMDGPU_SHADER_MEMORY_INFO
+			|| op == AMDGPU_DIAGNOSTIC_RAM_PAGE || op == AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER)
 			&& geteuid() != 0)
 			return B_NOT_ALLOWED;
 		return amdgpu_client_control((AmdgpuClient*)cookie, op, buffer, length,

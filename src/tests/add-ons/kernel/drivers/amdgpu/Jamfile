@@ -26,6 +26,8 @@ SimpleTest amdgpu_shader_privilege : amdgpu_shader_privilege.cpp GfxCommandValid
 	: [ TargetLibstdc++ ] ;
 SimpleTest amdgpu_shader_resource : amdgpu_shader_resource.cpp GfxCommandValidator.cpp
 	: [ TargetLibstdc++ ] ;
+SimpleTest amdgpu_atc : amdgpu_atc.cpp GfxCommandValidator.cpp
+	: [ TargetLibstdc++ ] ;
 SimpleTest gfx_command_test : gfx_command_test.cpp GfxCommandValidator.cpp
 	: [ TargetLibstdc++ ] ;
 SimpleTest amdgpu_irq_fault : amdgpu_irq_fault.cpp ;

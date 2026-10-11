@@ -73,10 +73,16 @@ the default. A subsequent diagnostic kernel and corrected resource fixture
 verify 16,384 scalar/vector/flat/LDS records across four VMs, descriptor bounds,
 guards, memory reclamation and fixed translation readback. Two fixture errors
 are documented; all GPU jobs remain healthy. Follow-up queue, VM, DMA, GLES
-and concurrent media tests leave 248 completions on the new boot. Alternate
-translation and GDS access containment remain unqualified, and general
-submissions remain root-only. Driver `ffe50ea8…` and private Mesa
-`82098de9…` are installed with same-hash backups; `cb8672d6…`, `cefb183c…`/`afd206fa…`, prior `c579f1cd…`,
+and concurrent media tests leave 248 completions on that boot. A later owned-RAM
+ATC fixture verifies vector buffer reads, stores and atomic adds stay within
+GPUVM under the current translation configuration. Separate store/atomic
+read-only tests produce hardware VM faults, unchanged targets/guards and
+post-close quarantine. Each reviewed fault has a planned cold recovery;
+final graphics/queues/VM/DMA/concurrent-media checks pass at 255 completions,
+510 EOPs and zero errors. GDS access containment and remaining shader resource
+paths still need qualification, and general submissions remain root-only.
+Driver `f546422d…` and private Mesa `82098de9…` are installed with same-hash
+backups; prior `ffe50ea8…`, `cb8672d6…`, `cefb183c…`/`afd206fa…`, prior `c579f1cd…`,
 `7d1cf6e5…`/`ee6210e5…` and older checkpoints are
 preserved. The original global media addon is restored after qualification.
 System Mesa defaults remain

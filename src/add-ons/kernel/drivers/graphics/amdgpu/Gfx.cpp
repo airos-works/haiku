@@ -1294,6 +1294,13 @@ GfxEngine::ExecuteIB(uint64 directory, uint64 address, uint32 dwords,
 			irq.eop_events, irq.vectors, (unsigned)irq.rptr, (unsigned)irq.wptr,
 			(unsigned)irq.last[0], (unsigned)irq.last[1], (unsigned)irq.last[2], (unsigned)irq.last[3]);
 		DumpExecutionState("client VM fault");
+		// Alternate-translation configuration/fault evidence. Direct reads;
+		// no W1C acknowledgement or indexed data port is touched.
+		const uint32 atcRegisters[] = {0xcc9, 0xcca, 0xccc, 0xccd, 0xcce,
+			0xccf, 0xcd0, 0xcd1, 0xcd2, 0xce9};
+		for (uint32 index : atcRegisters)
+			dprintf("amdgpu: ATC fault register %#x = %#x\n", (unsigned)index,
+				(unsigned)r[index]);
 	}
 	dprintf("amdgpu: client VM seq %u status %#x faults %#x/%#x ring %u/%u\n",
 		(unsigned)vmSequence, (unsigned)status, (unsigned)result.vm_fault_status[0],

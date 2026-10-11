@@ -47,7 +47,9 @@ enum {
 	AMDGPU_RENDER_INFO,
 	AMDGPU_GFX_SUBMIT_COPY,
 	AMDGPU_GFX_QUEUE_COPY,
-	AMDGPU_SHADER_MEMORY_INFO
+	AMDGPU_SHADER_MEMORY_INFO,
+	AMDGPU_DIAGNOSTIC_RAM_PAGE,
+	AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER
 };
 
 // One GPU virtual address space per open client. Mappings retain their BO
@@ -195,6 +197,21 @@ struct amdgpu_shader_memory_info {
 	uint32 atc_ats_control, atc_ats_debug, atc_vmid_pasid, atc_l1_address_offset;
 	uint32 atc_aperture[2][4]; // low, high, access mode, VMID mask
 };
+
+// Root-only lab diagnostic: physical backing of one aligned, wired RAM page
+// in this file's live buffer handle. No foreign handles, VRAM or arbitrary
+// kernel addresses. The caller must keep the handle/mapping alive throughout
+// its experiment; ordinary allocation/VM APIs never expose physical addresses.
+// This permits translation probes with owned targets on both possible paths.
+struct amdgpu_diagnostic_ram_page {
+	uint32 version, size;
+	uint64 handle, offset, physical_address;
+	uint32 flags, reserved;
+};
+// CREATE_DIAGNOSTIC_RAM_BUFFER uses amdgpu_buffer, requires root and an
+// initialized device, and accepts exactly 8192 bytes with reserved=0. Its
+// wired backing is restricted to [4 GiB,64 GiB), outside VMID0's GART/PCI
+// apertures for the qualified board. Normal buffer lifetime/zeroing applies.
 
 // Read-only DCE 11.2 observation, available without starting any GPU engine.
 // Register reads are sequential, not an atomic modeset or vblank snapshot.
