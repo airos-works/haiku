@@ -52,6 +52,9 @@ SimpleTest media_probe : media_probe.cpp : be media [ TargetLibsupc++ ] ;
 # how busy the processors and some teams are, for the decoders' cost
 SimpleTest cpu_usage : cpu_usage.cpp ;
 
+# a fixed integer workload on N threads, for the cost of thermal throttling
+SimpleTest cubie_cpubench : cpubench.cpp ;
+
 # the AIC8800 Wi-Fi/Bluetooth module's firmware loader from userland, with
 # the driver's loader core
 local aicHost = [ FDirName $(HAIKU_TOP) src add-ons kernel drivers network

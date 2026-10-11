@@ -252,7 +252,7 @@ rule UserBuildConfigRulePreImage
 		# display registers
 		AddFilesToHaikuImage system non-packaged bin : cubie_reg cubie_fetch
 			cubie_send pvrinfo pvrtest cedar_decode media_probe cpu_usage aicload
-			cubie_audio_test screencheck ;
+			cubie_audio_test screencheck cubie_cpubench ;
 		if $(CUBIE_AIROS_IMAGE) {
 			# a Bluetooth diagnostic the regular image leaves out
 			AddFilesToHaikuImage system non-packaged bin : bt_dev_info ;
@@ -278,7 +278,8 @@ rule UserBuildConfigRulePreImage
 			SEARCH on $(labMedia) = $(CUBIE_LAB_MEDIA) ;
 			AddFilesToHaikuImage home media : $(labMedia) ;
 		}
-		local labSettings = <cubie-lab>sunxi_display <cubie-lab>aic8800wifi ;
+		local labSettings = <cubie-lab>sunxi_display <cubie-lab>aic8800wifi
+			<cubie-lab>sunxi_thermal ;
 		SEARCH on $(labSettings) = [ FDirName $(HAIKU_TOP) tools cubie-a7s lab ] ;
 		AddFilesToHaikuImage home config settings kernel drivers
 			: $(labSettings) ;
