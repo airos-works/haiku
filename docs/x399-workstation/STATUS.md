@@ -36,9 +36,18 @@ path passes the same two 5,400-frame GPU playback trials with zero drops.
 Final DMA and graphics checks pass at 43,657 completions with no GPU errors.
 Separate shader write/execute permission faults pass with unchanged data and
 quarantine; cold recovery plus complete command capture leaves the current
-boot healthy at 916 completions. Captured commands are not yet a validator.
-Driver `7d1cf6e5…` and private Mesa `96975aeb…` are installed with checked
-backups; the previous `89b64dd6…`/Mesa `18d872ff…` checkpoint remains preserved.
+boot healthy at 916 completions. Broader GLES 3.1 checks now cover indexed,
+instanced and indirect draws, queries, transform feedback, and direct/indirect
+compute, with every output checked. Their 25 command captures independently
+decode with 23 packet opcodes. A system-header BGLView application also passes
+fixed-function drawing, resize, desktop pixels and shared texture lifetime;
+the private renderer now chooses AMD automatically without a device override.
+Explicit software and unprivileged fallback also pass. The complete native
+renderer regression leaves this boot healthy at 1,399 completions. Captured
+commands are not yet a validator.
+Driver `7d1cf6e5…` and private Mesa `ee6210e5…` are installed with checked
+backups; Mesa `96975aeb…` and the previous `89b64dd6…`/Mesa `18d872ff…`
+checkpoint remain preserved.
 System Mesa defaults remain
 unchanged. Unprivileged general
 graphics submission, system Mesa defaults and native display remain unfinished. AMD UVD H.264 plays three minutes of 1080p30/AAC with zero drops
