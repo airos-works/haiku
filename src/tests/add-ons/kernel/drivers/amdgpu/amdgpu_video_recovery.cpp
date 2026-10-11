@@ -310,6 +310,28 @@ int main(int argc, char** argv)
 		Require(fd < 0 && errno == B_ENTRY_NOT_FOUND, "no GPU in emulator");
 		puts("PASS: video recovery command policy and no-device handling"); return 0;
 	}
+	if (argc == 2 && strcmp(argv[1], "--failed-recovery") == 0) {
+		Require(geteuid() == 0, "root failed-recovery observation");
+		int monitor = Open(); Memory before = Allocation(monitor);
+		auto failed = Info<amdgpu_recovery_info>(monitor, AMDGPU_RECOVERY_INFO);
+		auto policy = Policy(monitor);
+		Require(failed.status != B_OK && failed.videos && !failed.live_handles && !failed.live_vms
+			&& !failed.live_videos && !failed.pending && !policy.pending
+			&& policy.status != B_OK && policy.attempts > policy.successes,
+			"terminal failed automatic reset with closed retained video");
+		for (uint32 op : {uint32(AMDGPU_GFX_RECOVER), uint32(AMDGPU_GFX_RECOVER_LIVE)})
+			Require(Info<amdgpu_recovery_info>(monitor, op).status == B_NOT_ALLOWED,
+				"failed reset cannot be retried through either manual API");
+		auto after = Info<amdgpu_recovery_info>(monitor, AMDGPU_RECOVERY_INFO);
+		auto afterPolicy = Policy(monitor);
+		Require(after.generation == failed.generation && after.stage == failed.stage
+			&& after.videos == failed.videos && after.quarantined_vram == failed.quarantined_vram
+			&& after.quarantined_ram == failed.quarantined_ram
+			&& afterPolicy.attempts == policy.attempts && afterPolicy.successes == policy.successes
+			&& !afterPolicy.pending, "refusal preserves terminal state and quarantine");
+		CheckAllocation(monitor, before); close(monitor);
+		puts("PASS: failed reset remains terminal, both manual APIs refuse retry, all quarantine retained"); return 0;
+	}
 	Require(argc == 5 && geteuid() == 0,
 		"usage: amdgpu_video_recovery --baseline|--auto-cp|--auto-waiters|--auto-decode|--auto-hevc-decode|--manual-fault|--recover-closed|--uvd-baseline|--uvd-only|--uvd-auto|--uvd-manual avc.nv12 hevc.au hevc.padded");
 	bool noGfx = strcmp(argv[1], "--uvd-only") == 0 || strcmp(argv[1], "--uvd-baseline") == 0;
@@ -330,7 +352,10 @@ int main(int argc, char** argv)
 	Require(sHevc->Prepare(au.data() + 4, bytes) && !sHevc->skipPicture && sHevc->poc == 0
 		&& sHevc->picture.nal_type >= 16 && sHevc->picture.nal_type <= 20,
 		"independently repeatable first HEVC random access picture");
-	int monitor = Open(); auto start = Info<amdgpu_recovery_info>(monitor, AMDGPU_RECOVERY_INFO);
+	int monitor = Open();
+	// MEMORY_INFO initializes SDMA/GART without initializing graphics.
+	Memory initialMemory = Allocation(monitor);
+	auto start = Info<amdgpu_recovery_info>(monitor, AMDGPU_RECOVERY_INFO);
 	if (recoverClosed) {
 		Require(start.status != B_OK && !start.live_handles && !start.live_vms && !start.live_videos
 			&& !start.pending && start.videos && !Policy(monitor).enabled,
@@ -353,7 +378,7 @@ int main(int argc, char** argv)
 	}
 	Require(start.status == B_OK && !start.pending && !start.live_handles && !start.live_vms && !start.live_videos
 		&& !start.buffers && !start.vms && !start.videos, "idle clean device baseline");
-	Memory empty = Allocation(monitor); auto policy = Policy(monitor);
+	Memory empty = initialMemory; auto policy = Policy(monitor);
 	Require(policy.enabled == 1 && !policy.pending, "automatic recovery enabled initially");
 	if (!baseline && !automatic) Policy(monitor, 0);
 	Graphics graphics = {-1, {}};

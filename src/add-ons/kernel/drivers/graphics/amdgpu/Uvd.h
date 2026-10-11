@@ -43,7 +43,7 @@ struct UvdEngine {
 	status_t Test(volatile uint32* r, const amdgpu_info& info,
 		const amdgpu::AtomVramReservation& reservation, bool clocksQualified,
 		const amdgpu::FirmwareView& firmware, amdgpu_uvd_test& result, void* output);
-	status_t Start(const amdgpu::FirmwareView& firmware);
+	status_t Start(const amdgpu::FirmwareView& firmware, bool restarting = false);
 	status_t Recover(const amdgpu::FirmwareView& firmware, amdgpu_recovery_info& result);
 	status_t TimeoutTest(amdgpu_uvd_timeout_test& result);
 	status_t Submit(uint32 words, amdgpu_uvd_test& result);

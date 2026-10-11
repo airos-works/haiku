@@ -67,13 +67,14 @@ UvdEngine::Snapshot(amdgpu_uvd_test& result)
 }
 
 status_t
-UvdEngine::Start(const amdgpu::FirmwareView& firmware)
+UvdEngine::Start(const amdgpu::FirmwareView& firmware, bool restarting)
 {
 	auto write = [&](uint32 reg, uint32 value) { regs[reg] = value; (void)regs[reg]; };
 	// Initialize the board-qualified ATOM divider requests before UVD starts.
 	// Initialize() has checked the PCI identity and complete ROM digest.
 	amdgpu_smc_dump_uvd_clocks(regs);
-	status_t clockStatus = amdgpu_smc_set_uvd_clocks(regs);
+	status_t clockStatus = restarting ? amdgpu_smc_check_uvd_clocks(regs)
+		: amdgpu_smc_set_uvd_clocks(regs);
 	if (clockStatus != B_OK)
 		return clockStatus;
 	write(mmUVD_POWER_STATUS, UVD_POWER_STATUS__UVD_PG_EN_MASK);
@@ -216,7 +217,7 @@ UvdEngine::Recover(const amdgpu::FirmwareView& firmware, amdgpu_recovery_info& r
 	Copy(memory, 0, firmware.code, firmware.codeSize);
 	__sync_synchronize();
 	regs[0x1520] = 1; (void)regs[0x1520]; snooze(5000);
-	status_t status = Start(firmware);
+	status_t status = Start(firmware, true);
 	if (status == B_OK) {
 		result.stage = 10;
 		sequence = 0;
