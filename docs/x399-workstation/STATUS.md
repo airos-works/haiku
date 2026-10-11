@@ -68,9 +68,15 @@ graphics is queued and still excludes it behind ordinary DMA; both directions
 have gated regression tests. Queued Summit HEVC 900/0 now passes after an
 initial 900/80 trial exposed the scheduling issue. Both three-minute queued
 playback trials also pass 5,400 frames with zero drops. Final VM/DMA checks
-leave 44,699 healthy completions with no GPU errors. Synchronous Mesa remains the default. Shader/resource isolation remains incomplete
-and general submissions remain root-only. Driver `cb8672d6…` and private Mesa
-`82098de9…` are installed with same-hash backups; `cefb183c…`/`afd206fa…`, prior `c579f1cd…`,
+leave 44,699 healthy completions with no GPU errors. Synchronous Mesa remains
+the default. A subsequent diagnostic kernel and corrected resource fixture
+verify 16,384 scalar/vector/flat/LDS records across four VMs, descriptor bounds,
+guards, memory reclamation and fixed translation readback. Two fixture errors
+are documented; all GPU jobs remain healthy. Follow-up queue, VM, DMA, GLES
+and concurrent media tests leave 248 completions on the new boot. Alternate
+translation and GDS access containment remain unqualified, and general
+submissions remain root-only. Driver `ffe50ea8…` and private Mesa
+`82098de9…` are installed with same-hash backups; `cb8672d6…`, `cefb183c…`/`afd206fa…`, prior `c579f1cd…`,
 `7d1cf6e5…`/`ee6210e5…` and older checkpoints are
 preserved. The original global media addon is restored after qualification.
 System Mesa defaults remain
