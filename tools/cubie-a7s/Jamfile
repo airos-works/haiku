@@ -6,6 +6,8 @@ UsePrivateHeaders [ FDirName graphics powervr ] ;
 # lab programs for the Radxa Cubie A7S port
 SimpleTest cubie_reg : reg.cpp ;
 SimpleTest pvrinfo : pvrinfo.cpp ;
+# app_server's copy of the screen against the screen (direct presents)
+SimpleTest screencheck : screencheck.cpp ;
 
 # a multi_audio (hmulti) driver driven directly: a tone out, the input's
 # level, the sample rates the device really runs at (USB sound cards)
