@@ -519,7 +519,8 @@ A2dpSource::A2dpSource(const bdaddr_t& address)
 	fSequence(0),
 	fTimestamp(0),
 	fPageRepetitionMode(0x02),
-	fClockOffset(0)
+	fClockOffset(0),
+	fDeviceClass(0)
 {
 	memset(&fSinkInfo, 0, sizeof(fSinkInfo));
 	memset(fCapabilities, 0, sizeof(fCapabilities));
@@ -687,7 +688,7 @@ A2dpSource::_EnsureLink(bigtime_t deadline)
 		request.AddData("bdaddr", B_ANY_TYPE, &fAddress, sizeof(bdaddr_t));
 		char address[18];
 		request.AddString("name", address_string(fAddress, address));
-		request.AddUInt32("record", 0);
+		request.AddUInt32("record", fDeviceClass);
 
 		uint16 packetType = HCI_DM1 | HCI_DH1 | HCI_DM3 | HCI_DH3 | HCI_DM5
 			| HCI_DH5;

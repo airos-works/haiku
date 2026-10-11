@@ -208,16 +208,24 @@ public:
 					message->FindInt8("rssi", i, &rssi);
 					message->FindUInt8("page_repetition_mode", i, &mode);
 					message->FindUInt16("clock_offset", i, &offset);
+					const void* deviceClass;
+					uint32 record = 0;
+					if (message->FindData("dev_class", B_ANY_TYPE, i,
+							&deviceClass, &size) == B_OK && size == 3) {
+						const uint8* bytes = (const uint8*)deviceClass;
+						record = bytes[0] | (bytes[1] << 8) | (bytes[2] << 16);
+					}
 					const char* name = message->GetString("friendly_name", i,
 						"");
 					printf("  %s  rssi %4d  page scan R%u  clock offset "
-						"%#06x  %s\n",
+						"%#06x  class %#08" B_PRIx32 "  %s\n",
 						bdaddrUtils::ToString(address).String(), rssi, mode,
-						offset, name);
+						offset, record, name);
 					if (bdaddrUtils::Compare(address, fWanted)) {
 						fFound = true;
 						fMode = mode;
 						fOffset = offset;
+						fClass = record;
 					}
 				}
 				break;
@@ -242,12 +250,14 @@ public:
 	bool		fFound;
 	uint8		fMode;
 	uint16		fOffset;
+	uint32		fClass;
 	sem_id		fDone;
 };
 
 
 static bool
-inquire(const bdaddr_t& address, uint8& mode, uint16& offset)
+inquire(const bdaddr_t& address, uint8& mode, uint16& offset,
+	uint32& deviceClass)
 {
 	BMessenger server(BLUETOOTH_SIGNATURE);
 	BMessage acquire(BT_MSG_ACQUIRE_LOCAL_DEVICE);
@@ -282,6 +292,7 @@ inquire(const bdaddr_t& address, uint8& mode, uint16& offset)
 	if (found) {
 		mode = looper->fMode;
 		offset = looper->fOffset;
+		deviceClass = looper->fClass;
 	}
 	looper->Lock();
 	looper->Quit();
@@ -467,10 +478,12 @@ main(int argc, char** argv)
 	if (inquiry) {
 		uint8 mode;
 		uint16 offset;
-		if (inquire(address, mode, offset)) {
+		uint32 deviceClass;
+		if (inquire(address, mode, offset, deviceClass)) {
 			printf("found it; paging with R%u, clock offset %#x\n", mode,
 				offset);
 			source.SetPageParameters(mode, offset);
+			source.SetDeviceClass(deviceClass);
 		} else
 			printf("the device did not answer the inquiry\n");
 	}

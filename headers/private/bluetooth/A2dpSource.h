@@ -92,6 +92,9 @@ public:
 									{ fPageRepetitionMode = repetitionMode;
 									  fClockOffset = clockOffset; }
 				// from an inquiry: they make paging faster
+			void				SetDeviceClass(uint32 deviceClass)
+									{ fDeviceClass = deviceClass; }
+				// also from an inquiry; stored with the paired device
 			void				SetMaxBitpool(uint8 bitpool)
 									{ fBitpoolLimit = bitpool; }
 
@@ -172,6 +175,7 @@ private:
 			uint32				fTimestamp;
 			uint8				fPageRepetitionMode;
 			uint16				fClockOffset;
+			uint32				fDeviceClass;
 };
 
 
