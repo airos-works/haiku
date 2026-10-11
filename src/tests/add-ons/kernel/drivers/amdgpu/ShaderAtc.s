@@ -1,8 +1,8 @@
 /* Copyright 2026, air/OS. Distributed under the terms of the MIT License.
  * LLVM gfx803. s[0:1]=owned output, s[2:3]=dual-owned source address,
- * s4=ATC descriptor bit (0 or 1<<24), s5=marker, v0=lane (one 64-lane wave).
- * No input writes. Every source address is owned on both GPUVM and physical
- * paths. Output always uses the previously qualified GPUVM flat path.
+ * s4=ATC bit, s5=marker, s6=operation (0 read, 1 store, 2 atomic add),
+ * s7=store seed, v0=lane (one 64-lane wave). All possible targets are owned
+ * on both GPUVM and physical paths. Output uses the qualified GPUVM flat path.
  */
 .text
 .p2align 8
@@ -19,7 +19,22 @@ shader_atc:
     s_mov_b32 s10, 256
     s_or_b32 s11, s4, (4 | (5 << 3) | (6 << 6) | (7 << 9) | (4 << 12) | (4 << 15))
     v_lshlrev_b32 v1, 2, v0
+    s_cmp_eq_u32 s6, 1
+    s_cbranch_scc1 store
+    s_cmp_eq_u32 s6, 2
+    s_cbranch_scc1 atomic
     buffer_load_dword v4, v1, s[8:11], 0 offen glc
+    s_branch finish
+store:
+    v_xor_b32 v4, s7, v0
+    buffer_store_dword v4, v1, s[8:11], 0 offen glc
+    s_waitcnt vmcnt(0)
+    buffer_load_dword v4, v1, s[8:11], 0 offen glc
+    s_branch finish
+atomic:
+    v_mov_b32 v4, 0x101
+    buffer_atomic_add v4, v1, s[8:11], 0 offen glc
+finish:
     s_waitcnt vmcnt(0)
     v_add_u32 v2, vcc, 4, v2
     v_addc_u32 v3, vcc, v3, 0, vcc

@@ -1,6 +1,6 @@
 /* Copyright 2026, air/OS. Distributed under the terms of the MIT License. */
-// Root-only translation qualification. Every possible read target is owned.
-// --control omits ATC; --atc may deliberately fault and quarantine the GPU.
+// Root-only translation qualification. Every possible target is owned.
+// Read-only store/atomic modes deliberately fault and quarantine the GPU.
 #include <amdgpu_haiku.h>
 #include <OS.h>
 #include <errno.h>
@@ -18,6 +18,7 @@
 static_assert(sizeof(amdgpu_diagnostic_ram_page) == 40, "diagnostic ABI");
 static const uint64 kCode = 0x500000000ULL, kOutput = 0x300000000ULL;
 static const uint32 kGuard = 0x6b6b6b6b, kDone = 0x51a7c001;
+enum Operation { kRead, kStore, kAtomic };
 struct Client { int fd; amdgpu_buffer code, output, input; uint32 seed, marker; };
 static void Require(bool okay, const char* why)
 {
@@ -67,6 +68,7 @@ static uint64 Physical(int fd, const amdgpu_buffer& b, uint64 offset = 0)
 	return r.physical_address;
 }
 static uint32 Input(uint32 seed, uint32 word) { return seed ^ (word * 0x01020408u); }
+static uint32 Stored(uint32 seed, uint32 lane) { return seed ^ 0x33330000 ^ lane; }
 static void Fill(const amdgpu_buffer& b, uint32 seed, bool pattern)
 {
 	auto p = (uint32*)(addr_t)b.address;
@@ -77,6 +79,18 @@ static void InputUnchanged(const amdgpu_buffer& b, uint32 seed)
 	auto p = (volatile uint32*)(addr_t)b.address;
 	for (uint32 i = 0; i < b.bytes / 4; i++) Require(p[i] == Input(seed, i), "source and guards unchanged");
 }
+static void Target(const Client& c, Operation operation)
+{
+	auto p = (volatile uint32*)(addr_t)c.input.address;
+	for (uint32 i = 0; i < c.input.bytes / 4; i++) {
+		uint32 want = Input(c.seed, i);
+		if (i >= 256 && i < 320) {
+			if (operation == kStore) want = Stored(c.seed, i - 256);
+			if (operation == kAtomic) want += 0x101;
+		}
+		Require(p[i] == want, "entire GPUVM target and guards");
+	}
+}
 static void CodeUnchanged(const Client& c)
 {
 	Require(memcmp((void*)(addr_t)c.code.address, kShaderAtc, sizeof(kShaderAtc)) == 0,
@@ -84,7 +98,8 @@ static void CodeUnchanged(const Client& c)
 	auto p = (volatile uint32*)(addr_t)c.code.address;
 	for (uint32 i = sizeof(kShaderAtc) / 4; i < 1024; i++) Require(p[i] == kGuard, "shader tail guard");
 }
-static void Output(const Client& c, bool complete, bool checkValue, uint32 seed)
+static void Output(const Client& c, bool complete, bool checkValue, uint32 seed,
+	Operation operation = kRead)
 {
 	auto p = (volatile uint32*)(addr_t)c.output.address;
 	for (uint32 i = 0; i < 1024; i++) {
@@ -95,6 +110,7 @@ static void Output(const Client& c, bool complete, bool checkValue, uint32 seed)
 			if (field == 1) {
 				if (!complete || !checkValue) continue;
 				want = Input(seed, 256 + lane);
+				if (operation == kStore) want = Stored(seed, lane);
 			}
 			if (field == 2) {
 				if (!complete) { Require(p[i] == kGuard || p[i] == kDone, "bounded post-fault marker"); continue; }
@@ -107,7 +123,8 @@ static void Output(const Client& c, bool complete, bool checkValue, uint32 seed)
 		}
 	}
 }
-static std::vector<uint32> Commands(uint64 source, bool atc, uint32 marker)
+static std::vector<uint32> Commands(uint64 source, bool atc, uint32 marker,
+	Operation operation, uint32 seed)
 {
 	std::vector<uint32> w;
 	auto reg = [&](uint32 index, uint32 value) {
@@ -117,28 +134,29 @@ static std::vector<uint32> Commands(uint64 source, bool atc, uint32 marker)
 	reg(0x2e07, 64); reg(0x2e08, 1); reg(0x2e09, 1);
 	reg(0x2e0c, kCode >> 8); reg(0x2e0d, kCode >> 40);
 	reg(0x2e12, 1 | 2 << 6 | 0xc0 << 12); // Eight VGPRs, 24 SGPRs; PRIV clear.
-	reg(0x2e13, 6 << 1 | 1 << 7);
+	reg(0x2e13, 8 << 1 | 1 << 7);
 	reg(0x2e15, 0); reg(0x2e16, 0xffffffff); reg(0x2e17, 0xffffffff);
 	reg(0x2e18, 0); reg(0x2e19, 0xffffffff); reg(0x2e1a, 0xffffffff);
 	reg(0x2e40, uint32(kOutput + 1024)); reg(0x2e41, kOutput >> 32);
 	reg(0x2e42, uint32(source + 1024)); reg(0x2e43, source >> 32);
 	reg(0x2e44, atc ? 1 << 24 : 0); reg(0x2e45, marker);
+	reg(0x2e46, operation); reg(0x2e47, seed ^ 0x33330000);
 	w.insert(w.end(), {0xc0031502, 1, 1, 1, 5, 0xc0004600, 7 | 4 << 8});
 	w.resize(256, 0x80000000);
 	Require(amdgpu::ValidateGfx8Commands(w.data(), w.size()).error == amdgpu::GfxCommandValidation::OK,
 		"ATC probe outer commands pass checked policy");
 	return w;
 }
-static amdgpu_gfx_submit Submit(Client& c, uint64 source, bool atc)
+static amdgpu_gfx_submit Submit(Client& c, uint64 source, bool atc, Operation operation)
 {
 	Fill(c.output, kGuard, false);
-	auto w = Commands(source, atc, c.marker);
+	auto w = Commands(source, atc, c.marker, operation, c.seed);
 	auto r = Request<amdgpu_gfx_submit>(); r.address = (addr_t)w.data(); r.dwords = w.size();
 	r.flags = AMDGPU_GFX_VALIDATE_COMMANDS; __sync_synchronize();
 	Require(ioctl(c.fd, AMDGPU_GFX_SUBMIT_COPY, &r, sizeof(r)) == 0, "checked copied submission");
 	__sync_synchronize();
-	printf("ATC %u result %#x completion %llu VM %#x/%#x ring %u/%u elapsed %llu us\n",
-		atc, (unsigned)r.status, (unsigned long long)r.completion, r.vm_fault_status[0],
+	printf("ATC %u operation %u result %#x completion %llu VM %#x/%#x ring %u/%u elapsed %llu us\n",
+		atc, operation, (unsigned)r.status, (unsigned long long)r.completion, r.vm_fault_status[0],
 		r.vm_fault_status[1], r.rptr, r.wptr, (unsigned long long)r.elapsed_us);
 	return r;
 }
@@ -201,11 +219,22 @@ static void ABI(int fd, const amdgpu_buffer& ram, uint64 foreign)
 int main(int argc, char** argv)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0); disable_debugger(1);
-	Commands(0x100000, false, 0x1234); Commands(0x100000, true, 0x1234);
+	for (auto op : {kRead, kStore, kAtomic}) {
+		Commands(0x100000, false, 0x1234, op, 0x5678);
+		Commands(0x100000, true, 0x1234, op, 0x5678);
+	}
 	bool absent = argc == 2 && strcmp(argv[1], "--expect-no-device") == 0;
 	bool atc = argc == 2 && strcmp(argv[1], "--atc") == 0;
 	bool control = argc == 2 && strcmp(argv[1], "--control") == 0;
-	Require(absent || ((atc || control) && geteuid() == 0), "usage: amdgpu_atc --control | --atc | --expect-no-device");
+	bool store = argc == 2 && (strcmp(argv[1], "--atc-store") == 0
+		|| strcmp(argv[1], "--atc-store-readonly") == 0);
+	bool atomic = argc == 2 && (strcmp(argv[1], "--atc-atomic") == 0
+		|| strcmp(argv[1], "--atc-atomic-readonly") == 0);
+	bool readOnly = (store || atomic) && strstr(argv[1], "-readonly") != NULL;
+	Operation operation = store ? kStore : atomic ? kAtomic : kRead;
+	atc |= store || atomic;
+	Require(absent || ((atc || control) && geteuid() == 0),
+		"usage: amdgpu_atc --control | --atc[-store|-atomic][-readonly] | --expect-no-device");
 	int monitor = open("/dev/" AMDGPU_DEVICE_NAME, O_RDWR);
 	if (absent) { Require(monitor < 0 && errno == ENOENT, "no AMD device");
 		puts("PASS: ATC probe command policy and no-device handling"); return 0; }
@@ -235,8 +264,8 @@ int main(int argc, char** argv)
 		auto b = Buffer(clients[0].fd, 8192, true, true); physicalBuffers.push_back(b);
 		uint64 p = Physical(clients[0].fd, b);
 		Require(p >= (1ULL << 32) && p <= (1ULL << 36) - 8192, "diagnostic physical range enforced");
-		// RAM need not be above 4 GiB. Exclude the actual device apertures and
-		// VMID0 GART window, as well as our code and output GPUVAs. The CPU
+		// Independently exclude device apertures, the VMID0 GART window and
+		// our code and output GPUVAs, even with the restricted allocation. The CPU
 		// mapping/GART agreement proves this is live, owned, wired system RAM.
 		bool aperture = p >= 0x10000000 && p < 0x50000000;
 		for (uint32 bar = 0; bar < 6; bar++)
@@ -256,12 +285,12 @@ int main(int argc, char** argv)
 	ABI(clients[0].fd, physical, clients[1].input.handle);
 	for (auto& c : clients) {
 		Require(Physical(c.fd, c.input) != address, "distinct GPUVM backing from physical target");
-		Map(c.fd, c.input, address, AMDGPU_VM_READ);
-		auto result = Submit(c, address, false);
+		Map(c.fd, c.input, address, AMDGPU_VM_READ | (operation == kRead ? 0 : AMDGPU_VM_WRITE));
+		auto result = Submit(c, address, false, operation);
 		Require(result.status == B_OK && !result.vm_fault_status[0] && !result.vm_fault_status[1], "GPUVM control completes");
-		Output(c, true, true, c.seed);
+		Output(c, true, true, c.seed, operation); Target(c, operation);
 	}
-	for (const auto& c : clients) { InputUnchanged(c.input, c.seed); CodeUnchanged(c); }
+	for (const auto& c : clients) { Target(c, operation); CodeUnchanged(c); }
 	for (const auto& b : physicalBuffers) InputUnchanged(b, physicalSeed);
 	IRQ(monitor, true);
 	auto snapshot = Info<amdgpu_shader_memory_info>(monitor, AMDGPU_SHADER_MEMORY_INFO);
@@ -275,12 +304,26 @@ int main(int argc, char** argv)
 		for (uint32 field : aperture) Require(field == 0, "no ATC aperture translation configured");
 	printf("PASS: diagnostic ABI and two distinct GPUVM controls at owned physical address %#llx\n",
 		(unsigned long long)address);
+	if (readOnly) {
+		auto& c = clients[0]; Fill(c.input, c.seed, true);
+		auto good = Submit(c, address, true, operation);
+		Require(good.status == B_OK && !good.vm_fault_status[0] && !good.vm_fault_status[1],
+			"same ATC operation succeeds on writable mapping");
+		Output(c, true, true, c.seed, operation); Target(c, operation);
+		for (const auto& b : physicalBuffers) InputUnchanged(b, physicalSeed);
+		auto m = Request<amdgpu_vm_mapping>(); m.address = address; m.bytes = 4096;
+		Require(ioctl(c.fd, AMDGPU_VM_UNMAP, &m, sizeof(m)) == 0, "unmap writable target");
+		Map(c.fd, c.input, address, AMDGPU_VM_READ);
+		IRQ(monitor, true);
+		puts("PASS: same ATC shader on writable mapping before removing write permission");
+	}
 	auto heldRAM = Info<amdgpu_gart_info>(monitor, AMDGPU_GART_INFO);
 	auto heldVRAM = Info<amdgpu_memory_info>(monitor, AMDGPU_MEMORY_INFO);
 	bool fault = false, escaped = false;
 	if (atc) {
+		Fill(clients[0].input, clients[0].seed, true);
 		clients[0].marker = 0x51a710f0;
-		auto result = Submit(clients[0], address, true);
+		auto result = Submit(clients[0], address, true, operation);
 		fault = result.status != B_OK;
 		auto irq = IRQ(monitor, !fault);
 		printf("ATC IRQ status %#x waits %llu completed %llu VM %llu privileged %llu unknown %llu overflow %llu last %#x/%#x/%#x/%#x\n",
@@ -288,7 +331,8 @@ int main(int argc, char** argv)
 			(unsigned long long)irq.vm_faults, (unsigned long long)irq.privileged_faults,
 			(unsigned long long)irq.unknown, (unsigned long long)irq.overflows,
 			irq.last[0], irq.last[1], irq.last[2], irq.last[3]);
-		Output(clients[0], !fault, false, 0); Output(clients[1], true, true, clients[1].seed);
+		Output(clients[0], !fault, operation != kRead && !readOnly, clients[0].seed, operation);
+		Output(clients[1], true, true, clients[1].seed, operation);
 		uint32 physicalMatches = 0, virtualMatches = 0, zeroes = 0, untouched = 0;
 		auto p = (volatile uint32*)(addr_t)clients[0].output.address;
 		for (uint32 lane = 0; lane < 64; lane++) {
@@ -297,7 +341,7 @@ int main(int argc, char** argv)
 			virtualMatches += v == Input(clients[0].seed, 256 + lane);
 			zeroes += v == 0; untouched += v == kGuard;
 		}
-		printf("ATC read classification: physical %u GPUVM %u zero %u untouched %u of64\n",
+		printf("ATC returned data: physical %u GPUVM %u zero %u untouched %u of64\n",
 			physicalMatches, virtualMatches, zeroes, untouched);
 		escaped = physicalMatches != 0;
 		if (fault) {
@@ -307,11 +351,13 @@ int main(int argc, char** argv)
 			auto denied = Request<amdgpu_buffer>(); denied.bytes = 4096;
 			Require(ioctl(clients[0].fd, AMDGPU_CREATE_SYSTEM_BUFFER, &denied, sizeof(denied)) < 0
 				&& errno == B_DEV_NOT_READY, "fault blocks further allocations");
-		} else Require(physicalMatches == 64 || virtualMatches == 64 || zeroes == 64,
+		} else if (operation == kRead) Require(physicalMatches == 64 || virtualMatches == 64 || zeroes == 64,
 			"uniform ATC read classification");
-		Require(irq.waits == initial.waits + 3, "exact three execution waits");
+		Require(!readOnly || fault, "read-only mapping rejects ATC write/atomic");
+		Require(irq.waits == initial.waits + (readOnly ? 4 : 3), "exact execution waits");
 	}
-	for (const auto& c : clients) { InputUnchanged(c.input, c.seed); CodeUnchanged(c); }
+	Target(clients[0], fault ? kRead : operation); Target(clients[1], operation);
+	for (const auto& c : clients) CodeUnchanged(c);
 	for (const auto& b : physicalBuffers) InputUnchanged(b, physicalSeed);
 	for (auto& c : clients) {
 		close(c.fd);
@@ -330,6 +376,6 @@ int main(int argc, char** argv)
 	if (fault) puts("TERMINAL_GPU_FAULT: owned targets unchanged, all guards intact, post-close quarantine verified");
 	Require(!escaped, "ATC must not escape GPUVM into the separate owned physical target");
 	puts(control ? "PASS: ATC fixture positive controls, owned dual targets, ABI and reclamation"
-		: fault ? "PASS: ATC read rejected by VM fault with owned targets and quarantine"
-		: "OBSERVED: ATC read completes without exposing the separate physical target");
+		: fault ? "PASS: ATC access rejected by VM fault with owned targets and quarantine"
+		: "OBSERVED: ATC access completes without touching the separate physical target");
 }
