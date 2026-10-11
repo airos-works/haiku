@@ -41,7 +41,7 @@ struct GfxEngine {
 		const amdgpu::AtomVramReservation& reservation,
 		const amdgpu::AtomRenderInfo& topology,
 		const amdgpu::FirmwareView firmware[4], const amdgpu::MecFirmwareView& mec,
-		SdmaEngine& sdma, Gart& gart, amdgpu_recovery_info& result);
+		SdmaEngine& sdma, Gart& gart, amdgpu_recovery_info& result, bool preserveVideo);
 	void DumpExecutionState(const char* point);
 	void Halt();
 	void Uninitialize();
