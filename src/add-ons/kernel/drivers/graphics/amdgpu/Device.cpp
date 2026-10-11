@@ -907,7 +907,7 @@ VMControl(AmdgpuClient* client, uint32 op, void* data, size_t length)
 		amdgpu_gfx_submit request;
 		status_t status = ReadRequest(request, data, length);
 		if (status != B_OK) return status;
-		if ((probe ? request.flags > AMDGPU_GDS_PROBE_GWS_SLICE
+		if ((probe ? request.flags > AMDGPU_GDS_PROBE_LAST
 			: (request.flags & ~(copy ? AMDGPU_GFX_VALIDATE_COMMANDS : 0u)) != 0)
 			|| request.reserved != 0
 			|| (!copy && (request.address & (kIbAddressAlignment - 1)) != 0)
@@ -1099,6 +1099,16 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 			return B_BAD_DATA;
 		request.physical_address = entry.address;
 		return user_memcpy(data, &request, sizeof(request));
+	}
+	if (op == AMDGPU_OA_INFO) {
+		amdgpu_oa_info info;
+		status_t status = ReadRequest(info, data, length);
+		if (status != B_OK) return status;
+		if (info.flags != 0 || info.reserved != 0) return B_BAD_VALUE;
+		status = WaitDmaIdle();
+		if (status == B_OK) status = sGfx.OaInfo(info);
+		if (status != B_OK) return status;
+		return user_memcpy(data, &info, sizeof(info));
 	}
 	if (op == AMDGPU_GWS_INFO) {
 		amdgpu_gws_info info;

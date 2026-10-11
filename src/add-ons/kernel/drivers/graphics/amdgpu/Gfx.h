@@ -35,6 +35,7 @@ struct GfxEngine {
 	status_t RenderInfo(const amdgpu::AtomRenderInfo& rom, amdgpu_render_info& result);
 	status_t ShaderMemoryInfo(amdgpu_shader_memory_info& result);
 	status_t GwsInfo(amdgpu_gws_info& result);
+	status_t OaInfo(amdgpu_oa_info& result);
 	void DumpExecutionState(const char* point);
 	void Halt();
 	void Uninitialize();

@@ -183,7 +183,7 @@ static void ABI(Client& c)
 		auto bad = r; size_t bytes = sizeof(bad);
 		switch (variant) {
 			case 0: bad.version++; break; case 1: bad.size--; break;
-			case 2: bytes--; break; case 3: bad.flags = 5; break;
+			case 2: bytes--; break; case 3: bad.flags = AMDGPU_GDS_PROBE_LAST + 1; break;
 			case 4: bad.reserved = 1; break; case 5: bad.dwords = 0; break;
 			case 6: bad.dwords--; break; case 7: bad.dwords = 32768; break;
 		}
