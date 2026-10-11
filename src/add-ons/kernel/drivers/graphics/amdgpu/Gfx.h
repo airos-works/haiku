@@ -30,7 +30,7 @@ struct GfxEngine {
 	status_t ExecuteVM(uint64 directory, uint64 destination, uint32 value,
 		volatile uint32* commands, Gart& gart, amdgpu_vm_test& result);
 	status_t ExecuteIB(uint64 directory, uint64 address, uint32 dwords,
-		Gart& gart, amdgpu_vm_test& result);
+		Gart& gart, amdgpu_vm_test& result, uint32 diagnosticGds = 0);
 	void Snapshot(amdgpu_gfx_test& result);
 	status_t RenderInfo(const amdgpu::AtomRenderInfo& rom, amdgpu_render_info& result);
 	status_t ShaderMemoryInfo(amdgpu_shader_memory_info& result);

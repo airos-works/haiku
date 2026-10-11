@@ -900,12 +900,15 @@ VMControl(AmdgpuClient* client, uint32 op, void* data, size_t length)
 	ClientVM* vm = client->vm;
 	if (vm == NULL)
 		return B_DEV_NOT_READY;
-	if (op == AMDGPU_GFX_SUBMIT || op == AMDGPU_GFX_SUBMIT_COPY) {
-		const bool copy = op == AMDGPU_GFX_SUBMIT_COPY;
+	if (op == AMDGPU_GFX_SUBMIT || op == AMDGPU_GFX_SUBMIT_COPY
+		|| op == AMDGPU_GFX_GDS_PROBE_COPY) {
+		const bool probe = op == AMDGPU_GFX_GDS_PROBE_COPY;
+		const bool copy = probe || op == AMDGPU_GFX_SUBMIT_COPY;
 		amdgpu_gfx_submit request;
 		status_t status = ReadRequest(request, data, length);
 		if (status != B_OK) return status;
-		if ((request.flags & ~(copy ? AMDGPU_GFX_VALIDATE_COMMANDS : 0u)) != 0
+		if ((probe ? request.flags > AMDGPU_GDS_PROBE_NONE
+			: (request.flags & ~(copy ? AMDGPU_GFX_VALIDATE_COMMANDS : 0u)) != 0)
 			|| request.reserved != 0
 			|| (!copy && (request.address & (kIbAddressAlignment - 1)) != 0)
 			|| (request.dwords & (kIbSizeAlignment / 4 - 1)) != 0
@@ -914,7 +917,7 @@ VMControl(AmdgpuClient* client, uint32 op, void* data, size_t length)
 		if (copy) {
 			status = CopyCommands(vm, request.address, request.dwords * 4);
 			if (status != B_OK) return status;
-			if (request.flags & AMDGPU_GFX_VALIDATE_COMMANDS) {
+			if (probe || (request.flags & AMDGPU_GFX_VALIDATE_COMMANDS)) {
 				amdgpu::GfxCommandValidation checked = amdgpu::ValidateGfx8Commands(
 					(const volatile uint32*)vm->copiedCommands.cpu, request.dwords);
 				if (checked.error != amdgpu::GfxCommandValidation::OK) {
@@ -940,7 +943,7 @@ VMControl(AmdgpuClient* client, uint32 op, void* data, size_t length)
 		}
 		// All VM mappings remain immutable while WaitDmaIdle releases sMutex.
 		// Binding references also retain BOs whose public handles are freed.
-		status = WaitDmaIdle(false);
+		status = WaitDmaIdle(probe);
 		if (status == B_OK) status = StartGraphics();
 		amdgpu_vm_test result = {};
 		bigtime_t started = system_time();
@@ -948,7 +951,7 @@ VMControl(AmdgpuClient* client, uint32 op, void* data, size_t length)
 			status = ExecuteGraphics([&]() {
 				return sGfx.ExecuteIB(vm->table.directory.gpu,
 					copy ? AMDGPU_COPY_IB_ADDRESS : request.address,
-					request.dwords, sGart, result);
+					request.dwords, sGart, result, probe ? request.flags + 1 : 0);
 			});
 		}
 		request.elapsed_us = system_time() - started;
@@ -1143,7 +1146,7 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 		return status;
 	}
 	if ((op >= AMDGPU_VM_INFO && op <= AMDGPU_GFX_SUBMIT)
-		|| op == AMDGPU_GFX_SUBMIT_COPY) {
+		|| op == AMDGPU_GFX_SUBMIT_COPY || op == AMDGPU_GFX_GDS_PROBE_COPY) {
 		if (client->graphicsBusy || client->graphicsPending) return B_BUSY;
 		client->graphicsBusy = true;
 		status_t status = VMControl(client, op, data, length);

@@ -1185,8 +1185,10 @@ GfxEngine::ExecuteVM(uint64 directory, uint64 destination, uint32 value,
 
 status_t
 GfxEngine::ExecuteIB(uint64 directory, uint64 address, uint32 dwords,
-	Gart& gart, amdgpu_vm_test& result)
+	Gart& gart, amdgpu_vm_test& result, uint32 diagnosticGds)
 {
+	if (diagnosticGds > 3)
+		return B_BAD_VALUE;
 	if (!ready || faulted || !mecStarted)
 		return B_DEV_NOT_READY;
 	if (interrupts.Error() != B_OK)
@@ -1194,6 +1196,11 @@ GfxEngine::ExecuteIB(uint64 directory, uint64 address, uint32 dwords,
 	volatile uint32* r = regs;
 	if (r[0x21c0] != (wptr & kRingMask))
 		return B_BUSY;
+	// GFX8 GDS is byte-addressed, 64 KiB on the qualified Polaris device.
+	// VMID0's capacity is retained for firmware; this driver has no other
+	// GDS users. Probe windows are wholly within the first owned 4 KiB.
+	if (diagnosticGds != 0 && (r[0x3300] != 0 || r[0x3301] != 0x10000))
+		return B_NOT_SUPPORTED;
 	// VMID2 is leased only for this synchronous job. Between jobs it points
 	// at the kernel diagnostic's empty/private directory, never a client.
 	auto bind = [&](uint64 pageDirectory) {
@@ -1223,6 +1230,23 @@ GfxEngine::ExecuteIB(uint64 directory, uint64 address, uint32 dwords,
 		// Linux gfx_v8_0_init_gds_vmid applies the same zero allocation.
 		r[0x3304] = 0; r[0x3305] = 0;
 		r[0x3322] = 0; r[0x3332] = 0;
+		if (diagnosticGds != 0) {
+			const uint32 base = diagnosticGds == 2 ? 1024 : 0;
+			const uint32 size = diagnosticGds == 1 ? 4096 : diagnosticGds == 2 ? 256 : 0;
+			// Matches Linux gfx_v8_0_ring_emit_gds_switch's byte units and
+			// fixed VMID register layout. No job is in flight at this point.
+			r[0x3304] = base; r[0x3305] = size;
+			if (r[0x3304] != base || r[0x3305] != size
+				|| r[0x3322] != 0 || r[0x3332] != 0) {
+				r[0x3304] = 0; r[0x3305] = 0;
+				faulted = true;
+				Halt();
+				return B_BAD_DATA;
+			}
+			dprintf("amdgpu: GDS probe mode %u VMID2 base %u size %u GWS %u OA %u\n",
+				(unsigned)(diagnosticGds - 1), (unsigned)r[0x3304],
+				(unsigned)r[0x3305], (unsigned)r[0x3322], (unsigned)r[0x3332]);
+		}
 		volatile uint32* completion = gart.commandMemory + (kControlOffset + 0x600) / 4;
 		*completion = 0;
 		if (++vmSequence == 0) vmSequence++;
@@ -1279,6 +1303,10 @@ GfxEngine::ExecuteIB(uint64 directory, uint64 address, uint32 dwords,
 			// All work has retired. Detach and invalidate before a caller can
 			// unmap or close; only then may page tables/backing BOs be reused.
 			status = bind(gpu - kScratchOffset + (24ULL << 20));
+			if (diagnosticGds != 0) {
+				r[0x3305] = 0; r[0x3304] = 0;
+				if (r[0x3305] != 0 || r[0x3304] != 0) status = B_BAD_DATA;
+			}
 		}
 	}
 	result.vm_fault_status[0] = r[0x536];
