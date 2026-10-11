@@ -554,8 +554,9 @@ aic_preinit(struct aic_softc* sc)
 			AIC_MM_VERSION_CFM, confirm, AIC_VERSION_SIZE) != 0)
 		return EIO;
 	sc->sc_phy_2 = get32(confirm + AIC_VERSION_PHY_2);
-	DPRINTF("%s: lmac %#x, features %#x, %u stations\n", DEVNAME(sc),
-		get32(confirm + AIC_VERSION_LMAC),
+	DPRINTF("%s: lmac %#x, phy %#x, features %#x, %u stations\n",
+		DEVNAME(sc), get32(confirm + AIC_VERSION_LMAC),
+		get32(confirm + AIC_VERSION_PHY_1),
 		get32(confirm + AIC_VERSION_FEATURES),
 		get16(confirm + AIC_VERSION_MAX_STA));
 
@@ -1494,10 +1495,12 @@ aic_reorder_input(struct aic_softc* sc, int tid, uint16_t sequence,
 		// sender's numbers started over (a new block ack session); the
 		// window follows them then.
 		if (++r->behind < AIC_REORDER_WINDOW / 2) {
+			sc->sc_reorder_behind++;
 			mtx_leave(&sc->sc_rx_lock);
 			ml_purge(msdus);
 			return;
 		}
+		sc->sc_reorder_restart++;
 		while (r->held > 0) {
 			while (!r->filled[r->head % AIC_REORDER_WINDOW])
 				r->head = (r->head + 1) & 0xfff;
@@ -1514,12 +1517,15 @@ aic_reorder_input(struct aic_softc* sc, int tid, uint16_t sequence,
 			slot = r->head % AIC_REORDER_WINDOW;
 			if (r->filled[slot])
 				aic_reorder_take(r, slot, out);
+			else
+				sc->sc_reorder_skipped++;
 			r->head = (r->head + 1) & 0xfff;
 		}
 	}
 
 	slot = sequence % AIC_REORDER_WINDOW;
 	if (r->filled[slot]) {
+		sc->sc_reorder_dup++;
 		mtx_leave(&sc->sc_rx_lock);
 		ml_purge(msdus);
 		return;
@@ -1547,9 +1553,13 @@ aic_reorder_flush(struct aic_softc* sc, int all, struct mbuf_list* out)
 	for (tid = 0; tid < 8; tid++) {
 		struct aic_reorder* r = &sc->sc_reorder[tid];
 		if (r->held > 0 && (all || now - r->since >= AIC_REORDER_TIMEOUT)) {
+			if (!all)
+				sc->sc_reorder_timeouts++;
 			while (r->held > 0) {
-				while (!r->filled[r->head % AIC_REORDER_WINDOW])
+				while (!r->filled[r->head % AIC_REORDER_WINDOW]) {
 					r->head = (r->head + 1) & 0xfff;
+					sc->sc_reorder_skipped++;
+				}
 				aic_reorder_release(r, out);
 			}
 		}
@@ -2078,11 +2088,14 @@ aic_tick(struct aic_softc* sc)
 		sc->sc_stats_time = system_time();
 		for (tid = 0; tid < 8; tid++)
 			held += sc->sc_reorder[tid].held;
-		printf("%s: watch: state %d, reorder held %d, events %d, work %d, "
-			"send queue %d, receive queue %d (%llu dropped)\n", DEVNAME(sc),
-			ic->ic_state, held, sc->sc_event_count, sc->sc_work_count,
-			ifp->if_snd.ifq_len, ifp->receive_queue.ifq_len,
-			(unsigned long long)ifp->if_iqdrops);
+		printf("%s: watch: state %d, reorder held %d (behind %u, duplicate "
+			"%u, restarts %u, never came %u, timeouts %u), events %d, work "
+			"%d, send queue %d, receive queue %d (%llu dropped)\n",
+			DEVNAME(sc), ic->ic_state, held, sc->sc_reorder_behind,
+			sc->sc_reorder_dup, sc->sc_reorder_restart,
+			sc->sc_reorder_skipped, sc->sc_reorder_timeouts,
+			sc->sc_event_count, sc->sc_work_count, ifp->if_snd.ifq_len,
+			ifp->receive_queue.ifq_len, (unsigned long long)ifp->if_iqdrops);
 	}
 }
 

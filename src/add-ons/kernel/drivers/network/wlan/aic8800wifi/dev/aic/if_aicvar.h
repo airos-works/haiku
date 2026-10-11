@@ -108,6 +108,13 @@ struct aic_softc {
 	struct mutex		sc_rx_lock;		/* the reorder buffers */
 	struct aic_reorder	sc_reorder[8];
 	volatile int		sc_reorder_held;
+	/* for the watch: frames dropped as behind the window or duplicates,
+	   window restarts, frames never seen (skipped over), late releases */
+	uint32_t			sc_reorder_behind;
+	uint32_t			sc_reorder_dup;
+	uint32_t			sc_reorder_restart;
+	uint32_t			sc_reorder_skipped;
+	uint32_t			sc_reorder_timeouts;
 
 	/* EAPOL frames sent with a confirmation index, and the last index
 	   confirmed: the pairwise key waits for message 4 to have left */
