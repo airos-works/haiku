@@ -1438,14 +1438,15 @@ GfxEngine::Recover(const amdgpu_info& info,
 	snapshot(result.before);
 	// Reset only owned GFX/CP/RLC blocks, following Linux 6.18.52
 	// gfx_v8_0_pre/soft/post_soft_reset and matching GFX8/GMC8.1/OSS3 masks.
-	// The caller excluded all queued/executing work and video/DMA faults.
+	// The caller drained execution owners and recovered any failed DMA first.
 	// SEM is shared with other engines. Do not reset a busy semaphore block
 	// while firmware retains video sessions; that path needs a wider reset.
 	if (preserveVideo && (result.before[2] & 0x4000) != 0)
 		return B_NOT_SUPPORTED;
 	result.grbm_reset = 0xf0005; // CP, RLC, GFX, CPF, CPC, CPG
-	result.srbm_reset = 0x100 | ((result.before[2] & 0x4000) != 0 ? 0x8000 : 0);
-	if ((r[0x2008] & result.grbm_reset) != 0 || (r[0x398] & result.srbm_reset) != 0
+	const uint32 srbmMask = 0x100 | ((result.before[2] & 0x4000) != 0 ? 0x8000 : 0);
+	result.srbm_reset |= srbmMask;
+	if ((r[0x2008] & result.grbm_reset) != 0 || (r[0x398] & srbmMask) != 0
 		|| (r[0xd5f] & 3) != 0)
 		return B_NOT_ALLOWED;
 	const uint32 heads[] = {0x1a00, 0x1c00, 0x1e00, 0x4000, 0x4200, 0x4400};
@@ -1491,7 +1492,7 @@ GfxEngine::Recover(const amdgpu_info& info,
 	r[0xd5f] = gmcon | 3; (void)r[0xd5f]; snooze(50);
 	r[0x2008] = grbm | result.grbm_reset; (void)r[0x2008]; snooze(50);
 	r[0x2008] = grbm; (void)r[0x2008];
-	r[0x398] = srbm | result.srbm_reset; (void)r[0x398]; snooze(50);
+	r[0x398] = srbm | srbmMask; (void)r[0x398]; snooze(50);
 	r[0x398] = srbm; (void)r[0x398];
 	r[0xd5f] = gmcon; (void)r[0xd5f]; snooze(50);
 	Halt();

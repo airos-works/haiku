@@ -15,6 +15,7 @@
 #include <vector>
 
 static_assert(sizeof(amdgpu_uvd_timeout_test) == 48, "UVD timeout ABI");
+static_assert(sizeof(amdgpu_sdma_timeout_test) == 48, "SDMA timeout ABI");
 static const uint64 kVA = 0x300000000ULL;
 static const uint32 kGuard = 0x6b6b6b6b, kSeed = 0x5100dec0;
 static void Require(bool okay, const char* why)
@@ -252,37 +253,37 @@ static void FaultWithWaiters(Graphics& c, Decoder& decoder)
 	Require(close(create.createFD) == 0, "close failed create file");
 	puts("PASS: decode/create waiters rejected after reset; partial session cleaned; queued DMA canceled");
 }
-static void UvdTimeoutABI(int monitor)
+template<typename T> static void TimeoutABI(int monitor, uint32 op)
 {
 	for (uint32 variant = 0; variant < 5; variant++) {
-		auto r = Request<amdgpu_uvd_timeout_test>(); size_t length = sizeof(r);
+		auto r = Request<T>(); size_t length = sizeof(r);
 		if (variant == 0) r.version++;
 		if (variant == 1) r.size--;
 		if (variant == 2) length--;
 		if (variant == 3) r.flags = 1;
 		if (variant == 4) r.reserved = 1;
-		Require(ioctl(monitor, AMDGPU_UVD_TIMEOUT_TEST, &r, length) < 0 && errno == B_BAD_VALUE,
-			"malformed UVD timeout ABI rejected before hardware");
+		Require(ioctl(monitor, op, &r, length) < 0 && errno == B_BAD_VALUE,
+			"malformed engine timeout ABI rejected before hardware");
 	}
-	auto r = Request<amdgpu_uvd_timeout_test>();
+	auto r = Request<T>();
 	int ro = open("/dev/" AMDGPU_DEVICE_NAME, O_RDONLY);
-	Require(ro >= 0 && ioctl(ro, AMDGPU_UVD_TIMEOUT_TEST, &r, sizeof(r)) < 0
+	Require(ro >= 0 && ioctl(ro, op, &r, sizeof(r)) < 0
 		&& errno == B_NOT_ALLOWED, "read-only timeout test denied"); close(ro);
 	void* address = NULL;
-	area_id area = create_area("UVD timeout result protection", &address, B_ANY_ADDRESS,
+	area_id area = create_area("engine timeout result protection", &address, B_ANY_ADDRESS,
 		B_PAGE_SIZE, B_NO_LOCK, B_READ_AREA | B_WRITE_AREA);
 	Require(area >= 0, "create protected timeout request");
-	*(amdgpu_uvd_timeout_test*)address = r;
+	*(T*)address = r;
 	Require(set_area_protection(area, B_READ_AREA) == B_OK, "protect timeout result");
-	Require(ioctl(monitor, AMDGPU_UVD_TIMEOUT_TEST, address, sizeof(r)) < 0
+	Require(ioctl(monitor, op, address, sizeof(r)) < 0
 		&& errno == B_BAD_ADDRESS, "unwritable timeout result rejected before hardware");
 	Require(delete_area(area) == B_OK, "delete protected request");
 	pid_t child = fork(); Require(child >= 0, "fork timeout privilege test");
 	if (child == 0) {
 		Require(setgid(65534) == 0 && setuid(65534) == 0, "drop timeout test privilege");
 		int ordinary = Open();
-		Require(ioctl(ordinary, AMDGPU_UVD_TIMEOUT_TEST, &r, sizeof(r)) < 0
-			&& errno == B_NOT_ALLOWED, "ordinary client cannot inject UVD timeout");
+		Require(ioctl(ordinary, op, &r, sizeof(r)) < 0
+			&& errno == B_NOT_ALLOWED, "ordinary client cannot inject engine timeout");
 		close(ordinary); _exit(0);
 	}
 	int status;
@@ -293,7 +294,7 @@ static void UvdTimeoutABI(int monitor)
 }
 static void UvdTimeout(int monitor)
 {
-	UvdTimeoutABI(monitor);
+	TimeoutABI<amdgpu_uvd_timeout_test>(monitor, AMDGPU_UVD_TIMEOUT_TEST);
 	auto r = Request<amdgpu_uvd_timeout_test>();
 	int result = ioctl(monitor, AMDGPU_UVD_TIMEOUT_TEST, &r, sizeof(r));
 	printf("UVD timeout ioctl %d status %#x fence %u/%u ring %u/%u UVD %#x elapsed %llu us\n",
@@ -302,9 +303,130 @@ static void UvdTimeout(int monitor)
 	Require(result == 0 && r.status == B_TIMED_OUT && r.sequence && !r.fence
 		&& r.rptr != r.wptr && r.elapsed_us >= 900000, "actual non-retiring UVD ring reaches bounded timeout");
 }
+static void SdmaTimeout(int monitor)
+{
+	TimeoutABI<amdgpu_sdma_timeout_test>(monitor, AMDGPU_SDMA_TIMEOUT_TEST);
+	auto r = Request<amdgpu_sdma_timeout_test>();
+	int result = ioctl(monitor, AMDGPU_SDMA_TIMEOUT_TEST, &r, sizeof(r));
+	printf("SDMA timeout ioctl %d status %#x fence %u/%u ring %u/%u engine %#x elapsed %llu us\n",
+		result, (unsigned)r.status, r.fence, r.sequence, r.rptr, r.wptr, r.engine_status,
+		(unsigned long long)r.elapsed_us);
+	Require(result == 0 && (r.status == B_TIMED_OUT || r.status == B_DEV_NOT_READY)
+		&& r.sequence && !r.fence && r.elapsed_us >= 500000,
+		"actual non-retiring SDMA memory poll reaches bounded timeout");
+}
+
+// Standalone SDMA ownership before either graphics or video has initialized.
+static void SdmaOnly(bool manual)
+{
+	int monitor = Open(); Memory empty = Allocation(monitor);
+	auto initial = Info<amdgpu_recovery_info>(monitor, AMDGPU_RECOVERY_INFO);
+	Require(initial.status == B_OK && !initial.live_handles && !initial.live_vms
+		&& !initial.live_videos && !initial.pending && !initial.buffers && !initial.vms && !initial.videos
+		&& !Info<amdgpu_irq_info>(monitor, AMDGPU_IRQ_INFO).enabled, "clean pre-graphics SDMA baseline");
+	auto policy = Policy(monitor); Require(policy.enabled && !policy.pending, "automatic policy enabled");
+	struct Pair { int fd; amdgpu_buffer ram, vram; uint64 fence; };
+	auto create = []() {
+		Pair c = {}; c.fd = Open();
+		c.ram = Request<amdgpu_buffer>(); c.vram = Request<amdgpu_buffer>();
+		c.ram.bytes = c.vram.bytes = 16384;
+		Require(ioctl(c.fd, AMDGPU_CREATE_SYSTEM_BUFFER, &c.ram, sizeof(c.ram)) == 0
+			&& ioctl(c.fd, AMDGPU_CREATE_BUFFER, &c.vram, sizeof(c.vram)) == 0, "create RAM/VRAM peers");
+		for (auto* b : {&c.ram, &c.vram}) {
+			Require(ioctl(c.fd, AMDGPU_MAP_BUFFER, b, sizeof(*b)) == 0, "map DMA peer");
+			auto words = (volatile uint32*)(addr_t)b->address;
+			for (uint32 i = 0; i < b->bytes / 4; i++) {
+				Require(words[i] == 0, "fresh/reused DMA allocation zeroed"); words[i] = kGuard;
+			}
+		}
+		for (uint32 i = 1024; i < 2048; i++)
+			((volatile uint32*)(addr_t)c.ram.address)[i] = kSeed ^ (i * 0x10204081u);
+		__sync_synchronize();
+		auto copy = Request<amdgpu_dma_submit>(); copy.operation = AMDGPU_DMA_COPY;
+		copy.source = c.ram.handle; copy.destination = c.vram.handle;
+		copy.source_offset = copy.destination_offset = 4096; copy.bytes = 4096;
+		Require(ioctl(c.fd, AMDGPU_SUBMIT_DMA, &copy, sizeof(copy)) == 0 && copy.fence, "DMA positive copy");
+		c.fence = copy.fence;
+		auto wait = Request<amdgpu_fence_wait>(); wait.fence = c.fence; wait.timeout_us = 5000000;
+		Require(ioctl(c.fd, AMDGPU_WAIT_FENCE, &wait, sizeof(wait)) == 0 && wait.status == B_OK,
+			"DMA positive fence");
+		return c;
+	};
+	auto check = [](const Pair& c) {
+		for (const auto* b : {&c.ram, &c.vram})
+			for (uint32 i = 0; i < b->bytes / 4; i++)
+				Require(((volatile uint32*)(addr_t)b->address)[i]
+					== (i >= 1024 && i < 2048 ? kSeed ^ (i * 0x10204081u) : kGuard),
+					"all DMA peer words and guards retained");
+	};
+	auto closePair = [](Pair& c) {
+		Require(close(c.fd) == 0 && delete_area(c.ram.area) == B_OK && delete_area(c.vram.area) == B_OK,
+			"close DMA ownership and revoked CPU clones"); c.fd = -1;
+	};
+	Pair clients[2] = {create(), create()};
+	for (auto& c : clients) check(c);
+	Memory retained = {empty.vram + 32768, empty.ram + 32768}; CheckAllocation(monitor, retained);
+	if (manual) Policy(monitor, 0);
+	SdmaTimeout(monitor);
+	if (manual) {
+		check(clients[1]); closePair(clients[1]);
+		auto q = Info<amdgpu_recovery_info>(monitor, AMDGPU_RECOVERY_INFO);
+		Require(q.status != B_OK && q.buffers == 2 && !q.vms && !q.videos && q.live_handles == 2
+			&& q.quarantined_vram == 16384 && q.quarantined_ram == 16384, "exact closed DMA quarantine");
+		CheckAllocation(monitor, retained);
+		Require(Info<amdgpu_recovery_info>(monitor, AMDGPU_GFX_RECOVER).status == B_BUSY,
+			"strict recovery refuses live DMA buffers");
+		Require(Info<amdgpu_recovery_info>(monitor, AMDGPU_GFX_RECOVER_LIVE).status == B_OK,
+			"one explicit standalone SDMA recovery");
+		retained.vram -= 16384; retained.ram -= 16384;
+	}
+	auto recovered = initial; bigtime_t deadline = system_time() + 10000000;
+	do {
+		recovered = Info<amdgpu_recovery_info>(monitor, AMDGPU_RECOVERY_INFO);
+		if (recovered.generation != initial.generation) break;
+		Require(system_time() < deadline, "observe SDMA recovery without retry/reset"); snooze(1000);
+	} while (true);
+	Require(recovered.status == B_OK && recovered.stage == 7 && recovered.generation == initial.generation + 1
+		&& recovered.grbm_reset == 0 && recovered.srbm_reset == 0x100000
+		&& recovered.live_handles == (manual ? 2u : 4u) && !recovered.live_vms && !recovered.live_videos
+		&& !recovered.buffers && !recovered.vms && !recovered.videos && !recovered.pending
+		&& recovered.reclaimed_vram == (manual ? 16384u : 0u)
+		&& recovered.reclaimed_ram == (manual ? 16384u : 0u), "exact SDMA-only reset and ownership");
+	CheckAllocation(monitor, retained);
+	for (auto& c : clients) if (c.fd >= 0) {
+		check(c); auto lost = Info<amdgpu_client_status>(c.fd, AMDGPU_CLIENT_STATUS);
+		Require(lost.flags == (AMDGPU_CLIENT_LOST | AMDGPU_CLIENT_RESET_COMPLETED)
+			&& lost.status != B_OK && lost.device_status == B_OK && lost.generation == recovered.generation
+			&& lost.loss_generation == initial.generation && lost.submitted == c.fence
+			&& lost.completed == c.fence && !lost.failed_fence, "prior DMA success and permanent client loss");
+		auto wait = Request<amdgpu_fence_wait>(); wait.fence = c.fence; wait.timeout_us = 0;
+		Require(ioctl(c.fd, AMDGPU_WAIT_FENCE, &wait, sizeof(wait)) == 0 && wait.status == B_OK,
+			"old successful DMA fence remains successful");
+		auto denied = Request<amdgpu_dma_submit>(); denied.operation = AMDGPU_DMA_FILL;
+		denied.destination = c.ram.handle; denied.bytes = 4096; denied.value = 0xbadbad;
+		Require(ioctl(c.fd, AMDGPU_SUBMIT_DMA, &denied, sizeof(denied)) < 0 && errno == B_DEV_NOT_READY,
+			"lost client rejects fresh DMA"); check(c); closePair(c);
+	}
+	CheckAllocation(monitor, empty);
+	for (unsigned i = 0; i < 8; i++) { Pair fresh = create(); check(fresh); closePair(fresh); }
+	CheckAllocation(monitor, empty);
+	if (manual) Policy(monitor, 1);
+	auto final = Policy(monitor);
+	Require(final.enabled && !final.pending && final.attempts == policy.attempts + !manual
+		&& final.successes == policy.successes + !manual
+		&& !Info<amdgpu_irq_info>(monitor, AMDGPU_IRQ_INFO).enabled, "one recovery, graphics still uninitialized");
+	printf("PASS: standalone SDMA %s recovery generation %llu, exact peers/old fences/cleanup and eight fresh DMA clients\n",
+		manual ? "manual mixed live/closed" : "automatic retained", (unsigned long long)recovered.generation);
+	close(monitor);
+}
+
 int main(int argc, char** argv)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0); Commands(false); Commands(true);
+	if (argc == 2 && (strcmp(argv[1], "--sdma-only") == 0 || strcmp(argv[1], "--sdma-closed") == 0)) {
+		Require(geteuid() == 0, "root SDMA fault qualification");
+		SdmaOnly(strcmp(argv[1], "--sdma-closed") == 0); return 0;
+	}
 	if (argc == 2 && strcmp(argv[1], "--expect-no-device") == 0) {
 		int fd = open("/dev/" AMDGPU_DEVICE_NAME, O_RDWR);
 		Require(fd < 0 && errno == B_ENTRY_NOT_FOUND, "no GPU in emulator");
@@ -333,17 +455,21 @@ int main(int argc, char** argv)
 		puts("PASS: failed reset remains terminal, both manual APIs refuse retry, all quarantine retained"); return 0;
 	}
 	Require(argc == 5 && geteuid() == 0,
-		"usage: amdgpu_video_recovery --baseline|--auto-cp|--auto-waiters|--auto-decode|--auto-hevc-decode|--manual-fault|--recover-closed|--uvd-baseline|--uvd-only|--uvd-auto|--uvd-manual avc.nv12 hevc.au hevc.padded");
-	bool noGfx = strcmp(argv[1], "--uvd-only") == 0 || strcmp(argv[1], "--uvd-baseline") == 0;
-	bool uvd = noGfx || strcmp(argv[1], "--uvd-auto") == 0 || strcmp(argv[1], "--uvd-manual") == 0;
+		"usage: amdgpu_video_recovery --baseline|--auto-cp|--auto-waiters|--auto-decode|--auto-hevc-decode|--manual-fault|--recover-closed|--uvd-baseline|--uvd-only|--uvd-auto|--uvd-manual|--sdma-video|--sdma-auto|--sdma-manual avc.nv12 hevc.au hevc.padded");
+	bool noGfx = strcmp(argv[1], "--uvd-only") == 0 || strcmp(argv[1], "--uvd-baseline") == 0
+		|| strcmp(argv[1], "--sdma-video") == 0;
+	bool sdma = strcmp(argv[1], "--sdma-auto") == 0 || strcmp(argv[1], "--sdma-manual") == 0
+		|| strcmp(argv[1], "--sdma-video") == 0;
+	bool uvd = (noGfx && !sdma) || strcmp(argv[1], "--uvd-auto") == 0 || strcmp(argv[1], "--uvd-manual") == 0;
 	bool baseline = strcmp(argv[1], "--baseline") == 0 || strcmp(argv[1], "--uvd-baseline") == 0;
 	bool recoverClosed = strcmp(argv[1], "--recover-closed") == 0;
 	bool waiters = strcmp(argv[1], "--auto-waiters") == 0;
 	bool activeHevc = strcmp(argv[1], "--auto-hevc-decode") == 0;
 	bool active = activeHevc || strcmp(argv[1], "--auto-decode") == 0;
 	bool automatic = waiters || active || strcmp(argv[1], "--auto-cp") == 0
-		|| strcmp(argv[1], "--uvd-only") == 0 || strcmp(argv[1], "--uvd-auto") == 0;
-	Require(baseline || automatic || recoverClosed || uvd || strcmp(argv[1], "--manual-fault") == 0, "explicit recovery mode");
+		|| strcmp(argv[1], "--uvd-only") == 0 || strcmp(argv[1], "--uvd-auto") == 0
+		|| strcmp(argv[1], "--sdma-auto") == 0 || strcmp(argv[1], "--sdma-video") == 0;
+	Require(baseline || automatic || recoverClosed || uvd || sdma || strcmp(argv[1], "--manual-fault") == 0, "explicit recovery mode");
 	sAvcReference = Read(argv[2]); sHevcReference = Read(argv[4]);
 	auto au = Read(argv[3]); Require(au.size() >= 4, "HEVC access unit header");
 	uint32 bytes = au[0] | uint32(au[1]) << 8 | uint32(au[2]) << 16 | uint32(au[3]) << 24;
@@ -397,7 +523,8 @@ int main(int argc, char** argv)
 	CheckAllocation(monitor, all);
 	uint32 racingFrames = 0;
 	if (!baseline) {
-		if (uvd) UvdTimeout(monitor);
+		if (sdma) SdmaTimeout(monitor);
+		else if (uvd) UvdTimeout(monitor);
 		else if (waiters) FaultWithWaiters(graphics, d[0]);
 		else {
 			VideoThread running = {&d[activeHevc ? 1 : 0], -1, true, 0, 0}; thread_id worker = -1;
@@ -446,6 +573,7 @@ int main(int argc, char** argv)
 			&& recovered.reclaimed_vram == reclaim.vram && recovered.reclaimed_ram == reclaim.ram
 			&& !(recovered.srbm_reset & 0x8000), "one reset preserves live video storage, reclaims only closed ownership");
 		Require(((recovered.srbm_reset & 0x40000) != 0) == uvd
+			&& ((recovered.srbm_reset & 0x100000) != 0) == sdma
 			&& recovered.grbm_reset == (noGfx ? 0u : 0xf0005u),
 			"expected UVD/GFX reset blocks, including video before graphics startup");
 		auto afterPolicy = Policy(monitor);

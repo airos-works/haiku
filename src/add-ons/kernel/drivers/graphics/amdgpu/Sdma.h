@@ -29,9 +29,13 @@ struct SdmaEngine {
 	status_t Execute(uint32 operation, uint64 source, uint64 destination,
 		uint64 bytes, uint32 value);
 	status_t CopyRegions(const SdmaCopy* regions, uint32 count);
+	status_t Recover(amdgpu_recovery_info& result);
+	status_t TimeoutTest(amdgpu_sdma_timeout_test& result);
+	void Stop();
 	void Uninitialize();
 
 private:
+	void Configure();
 	status_t Submit(uint32 words);
 };
 #endif

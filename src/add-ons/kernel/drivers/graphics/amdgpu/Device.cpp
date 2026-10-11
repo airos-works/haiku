@@ -1242,11 +1242,11 @@ RecoverGraphics(bool allowLive)
 		|| (!allowLive && (sLiveHandles != 0 || sVMCount != 0 || sVideoSessions != 0)))
 		return B_BUSY;
 	if (sFault == B_OK || sRecoveryAttempted) return B_NOT_ALLOWED;
-	// SDMA reset is not qualified yet. A partial GFX initialization is also
-	// excluded; standalone video can recover before GFX has ever started.
-	if (sEngine.faulted || (sGfx.attempted && !sGfx.ready)
-		|| (!sGfx.faulted && !sUvd.faulted)) return B_NOT_SUPPORTED;
-	const bool resetGfx = sGfx.ready, resetUvd = sUvd.faulted;
+	// Partial GFX initialization remains excluded. Standalone DMA/video can
+	// recover without initializing graphics for the first time.
+	if ((sGfx.attempted && !sGfx.ready)
+		|| (!sEngine.faulted && !sGfx.faulted && !sUvd.faulted)) return B_NOT_SUPPORTED;
+	const bool resetGfx = sGfx.ready, resetUvd = sUvd.faulted, resetDma = sEngine.faulted;
 	for (AmdgpuClient* client = sClients; client != NULL; client = client->next) {
 		if (client->loss == B_OK) return B_BAD_DATA;
 	}
@@ -1274,15 +1274,17 @@ RecoverGraphics(bool allowLive)
 		out[0] = sEngine.regs[0x2004]; out[1] = sEngine.regs[0x2002];
 		out[2] = sEngine.regs[0x394]; out[3] = sEngine.regs[0x536] | sEngine.regs[0x537];
 	};
-	snapshot(sRecovery.before);
-	if (resetGfx) {
-		// A UVD fault loses every client too. Reset initialized GFX under the
-		// same transaction before making any of those addresses reusable.
-		sGfx.faulted = true; sGfx.Halt();
+	uint32 before[4]; snapshot(before);
+	memcpy(sRecovery.before, before, sizeof(before));
+	// GFX startup uses DMA. Halt initialized graphics before recovering SDMA,
+	// then restart graphics under this same retained-ownership transaction.
+	if (resetGfx) { sGfx.faulted = true; sGfx.Halt(); }
+	if (resetDma) status = sEngine.Recover(sRecovery);
+	if (status == B_OK && resetGfx) {
 		status = sGfx.Recover(sInfo, sReservation, sRenderInfo, firmware, images[4].mec,
 			sEngine, sGart, sRecovery, sVideoSessions != 0 || sQuarantinedVideos != NULL);
-	} else {
-		// The UVD failure path stopped the sole execution owner. Record and
+	} else if (status == B_OK) {
+		// The failure path stopped the sole execution owner. Record and
 		// acknowledge retained VM fault latches before testing fresh firmware.
 		sEngine.regs[0x50c] |= 1; sEngine.regs[0x50d] |= 1; (void)sEngine.regs[0x50d];
 		if (((sEngine.regs[0x536] | sEngine.regs[0x537]) & 0xff) != 0) status = B_BAD_DATA;
@@ -1298,14 +1300,16 @@ RecoverGraphics(bool allowLive)
 		sRecovery.generation++;
 		sRecovery.stage = 7;
 		sRecoveryAttempted = false;
-		dprintf("amdgpu: recovered engines GFX %u UVD %u generation %" B_PRIu64
+		dprintf("amdgpu: recovered engines GFX %u UVD %u SDMA %u generation %" B_PRIu64
 			" reclaimed VRAM %" B_PRIu64 " RAM %" B_PRIu64 "\n",
-			(unsigned)resetGfx, (unsigned)resetUvd, sRecovery.generation,
+			(unsigned)resetGfx, (unsigned)resetUvd, (unsigned)resetDma, sRecovery.generation,
 			sRecovery.reclaimed_vram, sRecovery.reclaimed_ram);
 	} else {
 		if (sGfx.ready) { sGfx.faulted = true; sGfx.Halt(); }
 		if (resetUvd && sUvd.attempted) { sUvd.faulted = true; sUvd.Stop(); }
+		if (resetDma) { sEngine.faulted = true; sEngine.Stop(); }
 	}
+	memcpy(sRecovery.before, before, sizeof(before));
 	snapshot(sRecovery.after);
 	sRecovery.status = status;
 	sCompleted.NotifyAll();
@@ -1322,11 +1326,6 @@ MaybeRecoverAutomatically()
 		|| sPending != 0 || sGraphicsExecuting || sVideoExecuting)
 		return;
 	sAutomaticPending = false;
-	if (sEngine.faulted) {
-		sAutomaticStatus = B_NOT_SUPPORTED;
-		dprintf("amdgpu: automatic recovery excludes SDMA faults\n");
-		return;
-	}
 	sAutomaticAttempts++;
 	sAutomaticStatus = RecoverGraphics(true);
 	if (sAutomaticStatus == B_OK) sAutomaticSuccesses++;
@@ -1344,6 +1343,21 @@ Control(AmdgpuClient* client, uint32 op, void* data, size_t length)
 	if (client->team != team_get_current_team_id()
 		|| (client->flags & O_ACCMODE) != O_RDWR)
 		return B_NOT_ALLOWED;
+	if (op == AMDGPU_SDMA_TIMEOUT_TEST) {
+		amdgpu_sdma_timeout_test request;
+		status_t status = ReadRequest(request, data, length);
+		if (status != B_OK) return status;
+		if (request.flags || request.reserved) return B_BAD_VALUE;
+		if (sFault != B_OK || client->loss != B_OK) return B_DEV_NOT_READY;
+		if (sPending || sGraphicsExecuting || sVideoExecuting) return B_BUSY;
+		request.status = B_OK; request.sequence = request.fence = request.rptr = request.wptr = 0;
+		request.engine_status = 0; request.elapsed_us = 0;
+		status = user_memcpy(data, &request, sizeof(request));
+		if (status != B_OK) return status;
+		status = sEngine.TimeoutTest(request);
+		if (status != B_OK) SetFault(status);
+		return user_memcpy(data, &request, sizeof(request));
+	}
 	if (op == AMDGPU_UVD_TIMEOUT_TEST) {
 		amdgpu_uvd_timeout_test request;
 		status_t status = ReadRequest(request, data, length);
