@@ -159,6 +159,89 @@ UvdEngine::Start(const amdgpu::FirmwareView& firmware)
 }
 
 status_t
+UvdEngine::TimeoutTest(amdgpu_uvd_timeout_test& result)
+{
+	if (!ready || faulted || area < 0) return B_DEV_NOT_READY;
+	volatile uint32* ib = memory + kIB / 4;
+	ib[0] = mmUVD_CONTEXT_ID; ib[1] = 0x52535454;
+	for (uint32 i = 2; i < 16; i++) ib[i] = 0x80000000;
+	regs[mmUVD_RBC_RB_CNTL] |= UVD_RBC_RB_CNTL__RB_NO_FETCH_MASK;
+	(void)regs[mmUVD_RBC_RB_CNTL];
+	amdgpu_uvd_test test = {};
+	bigtime_t start = system_time();
+	status_t status = Submit(16, test);
+	result.elapsed_us = system_time() - start;
+	result.sequence = test.sequence; result.fence = test.fence;
+	result.rptr = test.rptr; result.wptr = test.wptr; result.uvd_status = test.uvd_status;
+	// Even an unexpectedly retiring diagnostic leaves fetch disabled. Keep
+	// ownership faulted until a complete, separately requested recovery.
+	faulted = true;
+	Stop();
+	result.status = status == B_OK ? B_BAD_DATA : status;
+	return result.status;
+}
+
+status_t
+UvdEngine::Recover(const amdgpu::FirmwareView& firmware, amdgpu_recovery_info& result)
+{
+	if (!attempted || !faulted || area < 0 || regs == NULL || memory == NULL
+		|| firmware.version != 0x01008210 || firmware.codeSize > kRing - 8)
+		return B_DEV_NOT_READY;
+	const uint32 mask = SRBM_SOFT_RESET__SOFT_RESET_UVD_MASK;
+	uint32 reset = regs[mmSRBM_SOFT_RESET];
+	if ((reset & mask) != 0) return B_NOT_ALLOWED;
+	const uint32 heads[] = {0x1a00, 0x1c00, 0x1e00, 0x4000, 0x4200, 0x4400};
+	const uint32 offsets[] = {1, 4, 6, 7, 0x19c};
+	uint32 display[6][5];
+	for (uint32 h = 0; h < 6; h++)
+		for (uint32 i = 0; i < 5; i++) display[h][i] = regs[heads[h] + offsets[i]];
+	result.stage = 8;
+	Stop();
+	// Linux 6.18.52 uvd_v6_0_pre/soft/post_soft_reset and OSS3's UVD
+	// mask. All old session addresses remain owned throughout this reset.
+	dprintf("amdgpu: UVD recovery before status %#x SRBM %#x ring %u/%u\n",
+		(unsigned)regs[mmUVD_STATUS], (unsigned)regs[0x394],
+		(unsigned)regs[mmUVD_RBC_RB_RPTR], (unsigned)regs[mmUVD_RBC_RB_WPTR]);
+	result.srbm_reset |= mask;
+	regs[mmSRBM_SOFT_RESET] = reset | mask; (void)regs[mmSRBM_SOFT_RESET]; snooze(50);
+	regs[mmSRBM_SOFT_RESET] = reset; (void)regs[mmSRBM_SOFT_RESET]; snooze(50);
+	bigtime_t deadline = system_time() + 100000;
+	while ((regs[0x394] & 0x80002) != 0 && system_time() < deadline) snooze(10);
+	if ((regs[0x394] & 0x80002) != 0 || regs[mmSRBM_SOFT_RESET] != reset)
+		return B_DEV_NOT_READY;
+	// The reset has quiesced UVD. Erase the reserved VCPU session tables and
+	// reload firmware; client-owned DPB/output/readback storage stays intact.
+	result.stage = 9;
+	for (uint32 i = 0; i < kBytes / 4; i++) memory[i] = 0;
+	Copy(memory, 0, firmware.code, firmware.codeSize);
+	__sync_synchronize();
+	regs[0x1520] = 1; (void)regs[0x1520]; snooze(5000);
+	status_t status = Start(firmware);
+	if (status == B_OK) {
+		result.stage = 10;
+		sequence = 0;
+		regs[mmUVD_CONTEXT_ID] = 0xcafedead;
+		memory[kIB / 4] = mmUVD_CONTEXT_ID;
+		memory[kIB / 4 + 1] = 0x52535455;
+		for (uint32 i = 2; i < 16; i++) memory[kIB / 4 + i] = 0x80000000;
+		amdgpu_uvd_test proof = {};
+		status = Submit(16, proof);
+		if (status == B_OK && (proof.sequence != 1 || proof.fence != 1
+			|| proof.context != 1 || proof.rptr != proof.wptr)) status = B_BAD_DATA;
+	}
+	for (uint32 h = 0; status == B_OK && h < 6; h++)
+		for (uint32 i = 0; i < 5; i++)
+			if (regs[heads[h] + offsets[i]] != display[h][i]) status = B_BAD_DATA;
+	if (status == B_OK) {
+		faulted = false; ready = true;
+		dprintf("amdgpu: UVD reset firmware/ring/display proof passed; old sessions invalid\n");
+	} else {
+		faulted = true; Stop();
+	}
+	return status;
+}
+
+status_t
 UvdEngine::Submit(uint32 words, amdgpu_uvd_test& result)
 {
 	volatile uint32* ring = memory + kRing / 4;

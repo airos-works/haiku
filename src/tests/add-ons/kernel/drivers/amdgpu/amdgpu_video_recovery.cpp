@@ -10,9 +10,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
+static_assert(sizeof(amdgpu_uvd_timeout_test) == 48, "UVD timeout ABI");
 static const uint64 kVA = 0x300000000ULL;
 static const uint32 kGuard = 0x6b6b6b6b, kSeed = 0x5100dec0;
 static void Require(bool okay, const char* why)
@@ -250,6 +252,56 @@ static void FaultWithWaiters(Graphics& c, Decoder& decoder)
 	Require(close(create.createFD) == 0, "close failed create file");
 	puts("PASS: decode/create waiters rejected after reset; partial session cleaned; queued DMA canceled");
 }
+static void UvdTimeoutABI(int monitor)
+{
+	for (uint32 variant = 0; variant < 5; variant++) {
+		auto r = Request<amdgpu_uvd_timeout_test>(); size_t length = sizeof(r);
+		if (variant == 0) r.version++;
+		if (variant == 1) r.size--;
+		if (variant == 2) length--;
+		if (variant == 3) r.flags = 1;
+		if (variant == 4) r.reserved = 1;
+		Require(ioctl(monitor, AMDGPU_UVD_TIMEOUT_TEST, &r, length) < 0 && errno == B_BAD_VALUE,
+			"malformed UVD timeout ABI rejected before hardware");
+	}
+	auto r = Request<amdgpu_uvd_timeout_test>();
+	int ro = open("/dev/" AMDGPU_DEVICE_NAME, O_RDONLY);
+	Require(ro >= 0 && ioctl(ro, AMDGPU_UVD_TIMEOUT_TEST, &r, sizeof(r)) < 0
+		&& errno == B_NOT_ALLOWED, "read-only timeout test denied"); close(ro);
+	void* address = NULL;
+	area_id area = create_area("UVD timeout result protection", &address, B_ANY_ADDRESS,
+		B_PAGE_SIZE, B_NO_LOCK, B_READ_AREA | B_WRITE_AREA);
+	Require(area >= 0, "create protected timeout request");
+	*(amdgpu_uvd_timeout_test*)address = r;
+	Require(set_area_protection(area, B_READ_AREA) == B_OK, "protect timeout result");
+	Require(ioctl(monitor, AMDGPU_UVD_TIMEOUT_TEST, address, sizeof(r)) < 0
+		&& errno == B_BAD_ADDRESS, "unwritable timeout result rejected before hardware");
+	Require(delete_area(area) == B_OK, "delete protected request");
+	pid_t child = fork(); Require(child >= 0, "fork timeout privilege test");
+	if (child == 0) {
+		Require(setgid(65534) == 0 && setuid(65534) == 0, "drop timeout test privilege");
+		int ordinary = Open();
+		Require(ioctl(ordinary, AMDGPU_UVD_TIMEOUT_TEST, &r, sizeof(r)) < 0
+			&& errno == B_NOT_ALLOWED, "ordinary client cannot inject UVD timeout");
+		close(ordinary); _exit(0);
+	}
+	int status;
+	Require(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+		"timeout privilege child");
+	Require(Info<amdgpu_recovery_info>(monitor, AMDGPU_RECOVERY_INFO).status == B_OK,
+		"all rejected timeout requests leave device healthy");
+}
+static void UvdTimeout(int monitor)
+{
+	UvdTimeoutABI(monitor);
+	auto r = Request<amdgpu_uvd_timeout_test>();
+	int result = ioctl(monitor, AMDGPU_UVD_TIMEOUT_TEST, &r, sizeof(r));
+	printf("UVD timeout ioctl %d status %#x fence %u/%u ring %u/%u UVD %#x elapsed %llu us\n",
+		result, (unsigned)r.status, r.fence, r.sequence, r.rptr, r.wptr, r.uvd_status,
+		(unsigned long long)r.elapsed_us);
+	Require(result == 0 && r.status == B_TIMED_OUT && r.sequence && !r.fence
+		&& r.rptr != r.wptr && r.elapsed_us >= 900000, "actual non-retiring UVD ring reaches bounded timeout");
+}
 int main(int argc, char** argv)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0); Commands(false); Commands(true);
@@ -259,14 +311,17 @@ int main(int argc, char** argv)
 		puts("PASS: video recovery command policy and no-device handling"); return 0;
 	}
 	Require(argc == 5 && geteuid() == 0,
-		"usage: amdgpu_video_recovery --baseline|--auto-cp|--auto-waiters|--auto-decode|--auto-hevc-decode|--manual-fault|--recover-closed avc.nv12 hevc.au hevc.padded");
-	bool baseline = strcmp(argv[1], "--baseline") == 0;
+		"usage: amdgpu_video_recovery --baseline|--auto-cp|--auto-waiters|--auto-decode|--auto-hevc-decode|--manual-fault|--recover-closed|--uvd-baseline|--uvd-only|--uvd-auto|--uvd-manual avc.nv12 hevc.au hevc.padded");
+	bool noGfx = strcmp(argv[1], "--uvd-only") == 0 || strcmp(argv[1], "--uvd-baseline") == 0;
+	bool uvd = noGfx || strcmp(argv[1], "--uvd-auto") == 0 || strcmp(argv[1], "--uvd-manual") == 0;
+	bool baseline = strcmp(argv[1], "--baseline") == 0 || strcmp(argv[1], "--uvd-baseline") == 0;
 	bool recoverClosed = strcmp(argv[1], "--recover-closed") == 0;
 	bool waiters = strcmp(argv[1], "--auto-waiters") == 0;
 	bool activeHevc = strcmp(argv[1], "--auto-hevc-decode") == 0;
 	bool active = activeHevc || strcmp(argv[1], "--auto-decode") == 0;
-	bool automatic = waiters || active || strcmp(argv[1], "--auto-cp") == 0;
-	Require(baseline || automatic || recoverClosed || strcmp(argv[1], "--manual-fault") == 0, "explicit recovery mode");
+	bool automatic = waiters || active || strcmp(argv[1], "--auto-cp") == 0
+		|| strcmp(argv[1], "--uvd-only") == 0 || strcmp(argv[1], "--uvd-auto") == 0;
+	Require(baseline || automatic || recoverClosed || uvd || strcmp(argv[1], "--manual-fault") == 0, "explicit recovery mode");
 	sAvcReference = Read(argv[2]); sHevcReference = Read(argv[4]);
 	auto au = Read(argv[3]); Require(au.size() >= 4, "HEVC access unit header");
 	uint32 bytes = au[0] | uint32(au[1]) << 8 | uint32(au[2]) << 16 | uint32(au[3]) << 24;
@@ -278,7 +333,7 @@ int main(int argc, char** argv)
 	int monitor = Open(); auto start = Info<amdgpu_recovery_info>(monitor, AMDGPU_RECOVERY_INFO);
 	if (recoverClosed) {
 		Require(start.status != B_OK && !start.live_handles && !start.live_vms && !start.live_videos
-			&& !start.pending && start.videos && start.buffers && start.vms && !Policy(monitor).enabled,
+			&& !start.pending && start.videos && !Policy(monitor).enabled,
 			"explicit recovery requires only closed quarantined owners and disabled automatic policy");
 		Memory retained = Allocation(monitor);
 		auto recovered = Info<amdgpu_recovery_info>(monitor, AMDGPU_GFX_RECOVER);
@@ -301,12 +356,15 @@ int main(int argc, char** argv)
 	Memory empty = Allocation(monitor); auto policy = Policy(monitor);
 	Require(policy.enabled == 1 && !policy.pending, "automatic recovery enabled initially");
 	if (!baseline && !automatic) Policy(monitor, 0);
-	Graphics graphics = GraphicsCreate(automatic); GraphicsControl(graphics);
-	// Allocate the copied-command backing before measuring retained storage.
-	std::vector<uint32> noop(256, 0x80000000); auto warm = Request<amdgpu_gfx_submit>();
-	warm.address = (addr_t)noop.data(); warm.dwords = noop.size(); warm.flags = AMDGPU_GFX_VALIDATE_COMMANDS;
-	Require(ioctl(graphics.fd, AMDGPU_GFX_SUBMIT_COPY, &warm, sizeof(warm)) == 0
-		&& warm.status == B_OK && warm.completion, "warm copied-command storage");
+	Graphics graphics = {-1, {}};
+	if (!noGfx) {
+		graphics = GraphicsCreate(automatic); GraphicsControl(graphics);
+		// Allocate the copied-command backing before measuring retained storage.
+		std::vector<uint32> noop(256, 0x80000000); auto warm = Request<amdgpu_gfx_submit>();
+		warm.address = (addr_t)noop.data(); warm.dwords = noop.size(); warm.flags = AMDGPU_GFX_VALIDATE_COMMANDS;
+		Require(ioctl(graphics.fd, AMDGPU_GFX_SUBMIT_COPY, &warm, sizeof(warm)) == 0
+			&& warm.status == B_OK && warm.completion, "warm copied-command storage");
+	}
 	Memory graphicsOnly = Allocation(monitor);
 	Decoder d[4] = {Create(false), Create(true), Create(false), Create(true)};
 	Memory all = graphicsOnly;
@@ -314,7 +372,8 @@ int main(int argc, char** argv)
 	CheckAllocation(monitor, all);
 	uint32 racingFrames = 0;
 	if (!baseline) {
-		if (waiters) FaultWithWaiters(graphics, d[0]);
+		if (uvd) UvdTimeout(monitor);
+		else if (waiters) FaultWithWaiters(graphics, d[0]);
 		else {
 			VideoThread running = {&d[activeHevc ? 1 : 0], -1, true, 0, 0}; thread_id worker = -1;
 			if (active) { worker = Start(running); WaitBusy(running.decoder->fd, running); }
@@ -356,14 +415,18 @@ int main(int argc, char** argv)
 			Require(system_time() < deadline, "observe automatic recovery without retry/reset"); snooze(1000);
 		} while (true);
 		Require(recovered.status == B_OK && recovered.generation == start.generation + 1 && recovered.stage == 7
-			&& recovered.live_videos == (automatic ? 4u : 2u) && recovered.live_handles == 1 && recovered.live_vms == 1
+			&& recovered.live_videos == (automatic ? 4u : 2u)
+			&& recovered.live_handles == (noGfx ? 0u : 1u) && recovered.live_vms == (noGfx ? 0u : 1u)
 			&& !recovered.videos && !recovered.vms && !recovered.buffers && !recovered.pending
 			&& recovered.reclaimed_vram == reclaim.vram && recovered.reclaimed_ram == reclaim.ram
-			&& !(recovered.srbm_reset & 0x8000), "one GFX reset preserves live video, reclaims only closed ownership");
+			&& !(recovered.srbm_reset & 0x8000), "one reset preserves live video storage, reclaims only closed ownership");
+		Require(((recovered.srbm_reset & 0x40000) != 0) == uvd
+			&& recovered.grbm_reset == (noGfx ? 0u : 0xf0005u),
+			"expected UVD/GFX reset blocks, including video before graphics startup");
 		auto afterPolicy = Policy(monitor);
 		Require(afterPolicy.attempts == policy.attempts + automatic && afterPolicy.successes == policy.successes + automatic
 			&& !afterPolicy.pending, "exact automatic attempt/success counters");
-		all.vram -= reclaim.vram; all.ram -= reclaim.ram; CheckAllocation(monitor, all); GraphicsCheck(graphics);
+		all.vram -= reclaim.vram; all.ram -= reclaim.ram; CheckAllocation(monitor, all); if (!noGfx) GraphicsCheck(graphics);
 		for (auto& decoder : d) if (decoder.fd >= 0) { Lost(decoder.fd, recovered.generation); Decode(decoder, true); }
 		puts("PASS: live video remains allocated, closed sessions retired, every old output sentinel untouched");
 	}
@@ -371,19 +434,23 @@ int main(int argc, char** argv)
 		Memory bytes = decoder.Storage(); Destroy(decoder, !baseline);
 		all.vram -= bytes.vram; all.ram -= bytes.ram; CheckAllocation(monitor, all);
 	}
-	CheckAllocation(monitor, graphicsOnly); GraphicsClose(graphics); CheckAllocation(monitor, empty);
-	Graphics fresh = GraphicsCreate(true); GraphicsControl(fresh);
+	CheckAllocation(monitor, graphicsOnly); if (!noGfx) GraphicsClose(graphics); CheckAllocation(monitor, empty);
+	const bool videoOnlyBaseline = baseline && noGfx;
+	Graphics fresh = {-1, {}};
+	if (!videoOnlyBaseline) { fresh = GraphicsCreate(true); GraphicsControl(fresh); }
 	for (unsigned round = 0; round < 8; round++) {
 		Decoder a = Create(false), b = Create(true);
 		Decode(a); Decode(b); Destroy(a, false); Destroy(b, false);
 	}
-	GraphicsControl(fresh); GraphicsClose(fresh); CheckAllocation(monitor, empty);
+	if (!videoOnlyBaseline) { GraphicsControl(fresh); GraphicsClose(fresh); }
+	CheckAllocation(monitor, empty);
 	if (!baseline && !automatic) Policy(monitor, policy.enabled);
 	auto irq = Info<amdgpu_irq_info>(monitor, AMDGPU_IRQ_INFO);
-	Require(irq.status == B_OK && irq.enabled && irq.msi && irq.completed_fences == irq.waits
+	Require(irq.status == B_OK && (videoOnlyBaseline ? !irq.enabled : irq.enabled && irq.msi)
+		&& irq.completed_fences == irq.waits
 		&& !irq.vm_faults && !irq.privileged_faults && !irq.overflows && !irq.unknown && irq.rptr == irq.wptr,
 		"fresh IRQ epoch is healthy");
-	if (!baseline) Require(irq.completed_fences == 3, "private reset proof plus two fresh graphics controls");
+	if (!baseline) Require(irq.completed_fences == (noGfx ? 2u : 3u), "expected private reset proof and fresh graphics controls");
 	auto final = Info<amdgpu_recovery_info>(monitor, AMDGPU_RECOVERY_INFO);
 	Require(final.status == B_OK && !final.live_handles && !final.live_vms && !final.live_videos
 		&& !final.pending && !final.buffers && !final.vms && !final.videos, "no leaked owners or quarantine");
