@@ -199,7 +199,7 @@ rule UserBuildConfigRulePreImage
 		imagePackages = <cubie-app-pkg>$(imagePackages:BS) ;
 		SEARCH on $(imagePackages) = $(imagePackageDir) ;
 		AddFilesToHaikuImage system packages : $(imagePackages) ;
-		local airTime = <airtime-pkg>airtime-1.0.0-16-arm64.hpkg ;
+		local airTime = <airtime-pkg>airtime-1.0.0-18-arm64.hpkg ;
 		SEARCH on $(airTime) = /mnt/HaikuWork/apps/airTime/artifacts ;
 		AddFilesToHaikuImage system packages : $(airTime) ;
 
