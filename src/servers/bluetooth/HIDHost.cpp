@@ -24,6 +24,7 @@
 
 #include <bluetooth/L2CAP/btL2CAP.h>
 #include <bluetooth/SDPBuffer.h>
+#include <bluetooth/SDPHIDRecord.h>
 #include <bluetooth/sdp.h>
 #include <bluetooth_hid.h>
 #include <LELog.h>
@@ -66,140 +67,18 @@ enum {
 };
 
 // SDP attributes (Bluetooth Assigned Numbers, SDP; HID Profile 1.1, 5.3)
-static const char* kAttributeServiceClasses = "0x0001";
 static const char* kAttributeServiceName = "0x0100";
 static const char* kAttributeVendorID = "0x0201";
 static const char* kAttributeProductID = "0x0202";
 static const char* kAttributeHIDReconnect = "0x0205";
 static const char* kAttributeHIDDescriptors = "0x0206";
 static const uint16 kServiceClassPnPInformation = 0x1200;
-static const uint8 kHIDDescriptorReport = 0x22;
 
 
 static void
 format_address(const bdaddr_t& address, char buffer[18])
 {
 	LEAddressString(address.b, buffer);
-}
-
-
-/*!	Reads the header of the SDP data element at \a offset (Core Vol 3 Part B
-	3.3): its type descriptor and the size of its data, which then starts at
-	\a offset.
-*/
-static bool
-read_element_header(const uint8* data, size_t size, size_t& offset,
-	uint8& type, size_t& length)
-{
-	if (offset >= size)
-		return false;
-
-	uint8 header = data[offset++];
-	type = header >> 3;
-	uint8 sizeIndex = header & 0x07;
-	switch (sizeIndex) {
-		case 0:
-			length = type == 0 ? 0 : 1;
-			break;
-		case 1:
-			length = 2;
-			break;
-		case 2:
-			length = 4;
-			break;
-		case 3:
-			length = 8;
-			break;
-		case 4:
-			length = 16;
-			break;
-		case 5:
-			if (offset + 1 > size)
-				return false;
-			length = data[offset];
-			offset += 1;
-			break;
-		case 6:
-			if (offset + 2 > size)
-				return false;
-			length = (data[offset] << 8) | data[offset + 1];
-			offset += 2;
-			break;
-		default:
-			if (offset + 4 > size)
-				return false;
-			length = ((uint32)data[offset] << 24) | (data[offset + 1] << 16)
-				| (data[offset + 2] << 8) | data[offset + 3];
-			offset += 4;
-			break;
-	}
-	return length <= size - offset;
-}
-
-
-/*!	Finds the report descriptor in the contents of a HIDDescriptorList
-	attribute: a sequence of (descriptor type, descriptor) sequences.
-*/
-static bool
-find_report_descriptor(const uint8* data, size_t size, const uint8*& descriptor,
-	size_t& descriptorLength)
-{
-	enum { kSequence = 6, kUnsigned = 1, kString = 4 };
-
-	size_t offset = 0;
-	while (offset < size) {
-		uint8 type;
-		size_t length;
-		if (!read_element_header(data, size, offset, type, length))
-			return false;
-		size_t end = offset + length;
-		if (type != kSequence) {
-			offset = end;
-			continue;
-		}
-
-		uint8 classType;
-		size_t classLength;
-		if (!read_element_header(data, end, offset, classType, classLength)
-			|| classType != kUnsigned || classLength != 1)
-			return false;
-		uint8 descriptorType = data[offset];
-		offset += classLength;
-
-		uint8 valueType;
-		size_t valueLength;
-		if (!read_element_header(data, end, offset, valueType, valueLength))
-			return false;
-		if (descriptorType == kHIDDescriptorReport && valueType == kString
-			&& valueLength > 0) {
-			descriptor = data + offset;
-			descriptorLength = valueLength;
-			return true;
-		}
-		offset = end;
-	}
-	return false;
-}
-
-
-static bool
-has_service_class(const BMessage& record, uint16 serviceClass)
-{
-	const void* data;
-	ssize_t size;
-	if (record.FindData(kAttributeServiceClasses, B_RAW_TYPE, &data, &size)
-			!= B_OK)
-		return false;
-
-	BMemoryIO io(data, size);
-	SDPDataIO classes(&io);
-	while (true) {
-		sdp_uuid uuid = classes.ReadUUID();
-		if (classes.ReadingStatus() != B_OK)
-			return false;
-		if (uuid.type == SDP_UUID_16 && GET_UUID16(uuid) == serviceClass)
-			return true;
-	}
 }
 
 
@@ -651,12 +530,12 @@ HIDHost::AddDevice(const bdaddr_t& address, const BMessage& services,
 	BMessage record;
 	for (int32 i = 0; services.FindMessage("service", i, &record) == B_OK;
 			i++) {
-		if (has_service_class(record, kServiceClassPnPInformation)) {
+		if (Bluetooth::SDPHasServiceClass(record, kServiceClassPnPInformation)) {
 			vendor = record.GetUInt16(kAttributeVendorID, 0);
 			product = record.GetUInt16(kAttributeProductID, 0);
 			continue;
 		}
-		if (found || !has_service_class(record,
+		if (found || !Bluetooth::SDPHasServiceClass(record,
 				SDP_SERVICE_CLASS_HUMAN_INTERFACE_DEVICE))
 			continue;
 
@@ -666,7 +545,7 @@ HIDHost::AddDevice(const bdaddr_t& address, const BMessage& services,
 		size_t descriptorLength;
 		if (record.FindData(kAttributeHIDDescriptors, B_RAW_TYPE, &data,
 				&size) != B_OK
-			|| !find_report_descriptor((const uint8*)data, size, descriptor,
+			|| !Bluetooth::SDPFindHIDReportDescriptor((const uint8*)data, size, descriptor,
 				descriptorLength)) {
 			LOG(LE_LOG_ERROR, "%s: its HID service has no report descriptor",
 				addressString);

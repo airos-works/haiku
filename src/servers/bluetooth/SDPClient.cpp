@@ -9,6 +9,8 @@
 #include "Debug.h"
 #include "SDPClient.h"
 
+#include <bluetooth/SDPHIDRecord.h>
+
 
 SDPClient::SDPClient(ServerRemoteDevice* rd)
 	:
@@ -231,32 +233,10 @@ SDPClient::NotifyProfiles()
 void
 SDPClient::_ParseAttrLists(BMallocIO* attrListsDataIO)
 {
-	attrListsDataIO->Seek(0, SEEK_SET);
 	TRACE_BT("SDP: Parsing the AttrLists... Num Bytes=%ld\n", attrListsDataIO->BufferLength());
-
-	SDPDataIO attrLists(attrListsDataIO);
-	attrLists.ReadSeq();
-
-	size_t attrListSize = 0;
-	while ((attrListSize = attrLists.ReadSeq())) {
-
-		off_t endPos = attrListsDataIO->Position() + attrListSize;
-		BMessage attrListMsg;
-		while (attrListsDataIO->Position() < endPos) {
-			uint16 attrID = attrLists.ReadNumber<uint16>();
-
-			// attribute id's strings are formated in hex to match the bluetooth specification
-			// section 5 in assigned numbers specs:
-			// https://www.bluetooth.com/specifications/assigned-numbers/
-			BString attrIdStr;
-			attrIdStr.SetToFormat("0x%04X", attrID);
-
-			attrLists.ParseNext(&attrListMsg, attrIdStr);
-		}
-		if (attrLists.ReadingStatus() == B_OK)
-			fRemoteDevice->services.AddMessage("service", &attrListMsg);
-	}
-	TRACE_BT("SDP: Finished parsing\n");
+	status_t status = Bluetooth::SDPParseAttributeLists(attrListsDataIO,
+		fRemoteDevice->services);
+	TRACE_BT("SDP: Finished parsing: %s\n", strerror(status));
 }
 
 
