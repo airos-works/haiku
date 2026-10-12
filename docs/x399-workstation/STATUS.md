@@ -135,7 +135,8 @@ complete release remain open.
 `tools/check-workstation.sh` re-checks the machine against all of this in one
 pass, with nothing set in the environment of the programs it runs, because
 several of these have looked fine while being quietly broken. It last came back
-25 working, 0 not (2026-10-06, running air/OS hrev60206+686).
+25 working, 0 not (2026-10-13, running air/OS hrev60206+1165 with the WX 5100
+on amdgpu_drm).
 
 What still needs someone at the machine: a look at the scaled picture on the
 two 4K monitors, a monitor pulled out and plugged back in (the syslog says
