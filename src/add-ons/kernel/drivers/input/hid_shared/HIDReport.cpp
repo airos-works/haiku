@@ -146,7 +146,7 @@ HIDReport::AddMainItem(global_item_state &globalState,
 }
 
 
-void
+int32
 HIDReport::SetReport(status_t status, uint8 *report, size_t length)
 {
 	fReportStatus = status;
@@ -158,7 +158,9 @@ HIDReport::SetReport(status_t status, uint8 *report, size_t length)
 	}
 
 #ifndef USERLAND_HID
-	fConditionVariable.NotifyAll();
+	return fConditionVariable.NotifyAll();
+#else
+	return 0;
 #endif
 }
 
