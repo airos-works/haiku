@@ -49,7 +49,7 @@ Usage()
 		"       bt_le list\n"
 		"       bt_le forget <address> [public|random]\n"
 		"       bt_le log [0-3]\n"
-		"       bt_le params <min ms> <max ms> <latency> <timeout ms>\n"
+		"       bt_le params <min ms> <max ms> [latency] [timeout ms]\n"
 		"       bt_le probe <address> [seconds] [interval ms] [latency] "
 			"[public|random]\n"
 		"       bt_le inquiry [seconds]\n"
@@ -825,8 +825,10 @@ main(int argc, char** argv)
 		return Probe(address, type, argc > 3 ? atoi(argv[3]) : 20,
 			argc > 4 ? atof(argv[4]) : 0, argc > 5 ? atoi(argv[5]) : 0);
 	}
-	if (strcmp(command, "params") == 0 && argc > 5) {
-		// bt_le params <min ms> <max ms> <latency> <timeout ms>
+	if (strcmp(command, "params") == 0 && argc > 3) {
+		// bt_le params <min ms> <max ms> [latency] [timeout ms]: kept on
+		// the link until it closes; latency and timeout stay the link's
+		// unless given.
 		uint8 local[6];
 		LocalDevice* adapter = GetAdapter(local);
 		if (adapter == NULL)
@@ -835,8 +837,11 @@ main(int argc, char** argv)
 		request.AddInt32("hci_id", adapter->ID());
 		request.AddUInt16("interval_min", (uint16)(atof(argv[2]) / 1.25 + 0.5));
 		request.AddUInt16("interval_max", (uint16)(atof(argv[3]) / 1.25 + 0.5));
-		request.AddUInt16("latency", (uint16)atoi(argv[4]));
-		request.AddUInt16("timeout", (uint16)(atoi(argv[5]) / 10));
+		if (argc > 4)
+			request.AddUInt16("latency", (uint16)atoi(argv[4]));
+		if (argc > 5)
+			request.AddUInt16("timeout", (uint16)(atoi(argv[5]) / 10));
+		request.AddBool("keep_interval", true);
 		BMessage reply;
 		status_t status = BMessenger(BLUETOOTH_SIGNATURE).SendMessage(&request,
 			&reply, 5000000, 5000000);
