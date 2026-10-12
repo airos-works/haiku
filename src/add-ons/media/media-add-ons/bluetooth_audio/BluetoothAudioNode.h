@@ -30,6 +30,10 @@ public:
 	static	void				GetFormat(media_format& format);
 
 			void				SinkChanged();
+
+			void					ConnectNow();
+
+											// open the stream without waiting for sound
 				// the setting names another device, or none: drop the
 				// stream and connect to the new one
 
@@ -100,7 +104,7 @@ private:
 			bigtime_t			fLastSound;
 			bool				fConnectFailed;
 	volatile bool				fSinkChanged;
-			bool				fConnectNow;
+	volatile bool				fConnectNow;
 };
 
 

@@ -97,6 +97,14 @@ BluetoothAudioNode::GetFormat(media_format& format)
 
 
 void
+BluetoothAudioNode::ConnectNow()
+{
+	fConnectNow = true;
+	release_sem(fDataSem);
+}
+
+
+void
 BluetoothAudioNode::SinkChanged()
 {
 	fSinkChanged = true;

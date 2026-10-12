@@ -186,8 +186,14 @@ BluetoothAudioAddOn::SettingsChanged()
 			flavorName.SetToFormat("Bluetooth: %s", name.String());
 		const bool sameDevice = hasSink == fHasSink
 			&& (!hasSink || bdaddrUtils::Compare(address, fSink));
-		if (sameDevice && flavorName == fFlavorName)
+		if (sameDevice && flavorName == fFlavorName) {
+			// The same speaker written again: the user connected it in the
+			// Bluetooth preferences, and expects it to be connected now,
+			// not when sound next plays.
+			if (hasSink && fNode != NULL)
+				fNode->ConnectNow();
 			return;
+		}
 		hadSink = fHasSink;
 		fHasSink = hasSink;
 		fSink = address;
