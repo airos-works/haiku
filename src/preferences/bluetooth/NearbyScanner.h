@@ -84,6 +84,7 @@ private:
 			void				_ScheduleInquiry(bigtime_t delay);
 			void				_StartInquiry();
 			void				_EndInquiry();
+			void				_CancelInquiry();
 			void				_NotifyPausedIfIdle();
 			void				_SetStatus(int32 status);
 			void				_Timer(uint32 what, int32 generation,

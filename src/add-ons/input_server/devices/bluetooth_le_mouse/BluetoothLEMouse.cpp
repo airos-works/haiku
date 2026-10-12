@@ -304,6 +304,7 @@ private:
 				= service.FindInputReport(handle);
 			if (report == NULL)
 				continue;
+			_CountGap(text);
 			if (reports++ < 3 || Bluetooth::LELogLevel() >= LE_LOG_TRACE) {
 				Bluetooth::LELogHex(LE_LOG_DEBUG, "mouse", "input report",
 					value.data(), value.size());
@@ -441,6 +442,36 @@ private:
 		fHistoryY = deltaY - outY;
 	}
 
+	// How smoothly reports arrive while the mouse moves: a report every
+	// connection event (11.25 ms for most mice), gaps over 30 ms are missed
+	// events the user sees as jerks. Gaps over 300 ms are the hand resting.
+	void _CountGap(const char* mouse)
+	{
+		bigtime_t now = system_time();
+		bigtime_t gap = now - fLastReport;
+		fLastReport = now;
+		if (gap > 300000)
+			return;
+		fGaps++;
+		fMoving += gap;
+		if (gap > 30000)
+			fLate++;
+		if (gap > 60000)
+			fVeryLate++;
+		if (gap > fLongest)
+			fLongest = gap;
+		if (now - fGapsSince < 30000000 || fGaps < 200)
+			return;
+		LOG(LE_LOG_INFO, "mouse %s smoothness: %" B_PRIu32 " reports in %.1f "
+			"s moving (%.0f/s), %.1f%% of gaps over 30 ms, %.1f%% over 60 ms, "
+			"longest %" B_PRId64 " ms", mouse, fGaps, fMoving / 1000000.0,
+			fGaps * 1000000.0 / fMoving, 100.0 * fLate / fGaps,
+			100.0 * fVeryLate / fGaps, fLongest / 1000);
+		fGaps = fLate = fVeryLate = 0;
+		fMoving = fLongest = 0;
+		fGapsSince = now;
+	}
+
 	uint32 _RemapButtons(uint32 buttons) const
 	{
 		uint32 remapped = 0;
@@ -510,6 +541,14 @@ private:
 	float fHistoryY;
 	std::atomic<bool> fUpdateSettings;
 	mouse_settings fSettings;
+
+	bigtime_t fLastReport = 0;
+	bigtime_t fGapsSince = 0;
+	bigtime_t fMoving = 0;
+	bigtime_t fLongest = 0;
+	uint32 fGaps = 0;
+	uint32 fLate = 0;
+	uint32 fVeryLate = 0;
 };
 
 } // namespace

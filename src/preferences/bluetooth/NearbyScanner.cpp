@@ -13,6 +13,8 @@
 #include <Messenger.h>
 
 #include <bluetooth/DiscoveryAgent.h>
+#include <bluetooth/HCI/btHCI_command.h>
+#include <bluetooth/HCI/btHCI_event.h>
 #include <bluetooth/DiscoveryListener.h>
 #include <bluetooth/LocalDevice.h>
 #include <bluetooth/RemoteDevice.h>
@@ -45,6 +47,8 @@ static const uint32 kMsgInquiryDevice = 'iqDv';
 static const uint32 kMsgInquiryDone = 'iqDn';
 static const uint32 kMsgInquiryTimeout = 'iqTo';
 static const uint32 kMsgPausedNotify = 'psNt';
+static const uint32 kMsgInquiryWatch = 'iqWt';
+static const uint32 kMsgInquiryCancelled = 'iqCn';
 
 static const bigtime_t kLEStartTimeout = 10000000;
 static const bigtime_t kLEStopTimeout = 4000000;
@@ -63,6 +67,10 @@ static const bigtime_t kInquiryTimeout = 25000000;
 static const uint8 kInquiryLength = 3;
 static const bigtime_t kInquiryIdleTime = 2000000;
 static const bigtime_t kInquiryIdleCheck = 1000000;
+// While an inquiry runs: how often to look, and how recent an input event
+// cancels it.
+static const bigtime_t kInquiryWatchInterval = 200000;
+static const bigtime_t kInquiryInputActive = 250000;
 	// in units of 1.28 seconds
 
 enum {
@@ -437,6 +445,26 @@ NearbyScanner::MessageReceived(BMessage* message)
 			}
 			break;
 
+		case kMsgInquiryWatch:
+			if (generation != fInquiryGeneration || !fInquiryActive)
+				break;
+			if (idle_time() < kInquiryInputActive) {
+				// The mouse or keyboard is in use again: give the radio
+				// back. What the inquiry found so far is kept.
+				TRACE("input resumed: cancelling the inquiry");
+				_CancelInquiry();
+				_EndInquiry();
+				break;
+			}
+			_Timer(kMsgInquiryWatch, fInquiryGeneration,
+				kInquiryWatchInterval);
+			break;
+
+		case kMsgInquiryCancelled:
+			TRACE("inquiry cancel: status %" B_PRId32,
+				message->GetInt32("status", B_ERROR));
+			break;
+
 		case kMsgPausedNotify:
 			if (fPaused && fLEState == LE_IDLE && !fInquiryActive)
 				fListener->ScannerPaused();
@@ -581,6 +609,24 @@ NearbyScanner::_StartInquiry()
 		return;
 	}
 	_Timer(kMsgInquiryTimeout, fInquiryGeneration, kInquiryTimeout);
+	_Timer(kMsgInquiryWatch, fInquiryGeneration, kInquiryWatchInterval);
+}
+
+
+void
+NearbyScanner::_CancelInquiry()
+{
+	// Asynchronous: the scanner never waits for the server. The server
+	// drops the inquiry's pending request when the cancel completes.
+	const uint16 opcode = PACK_OPCODE(OGF_LINK_CONTROL, OCF_INQUIRY_CANCEL);
+	const uint8 command[3] = { (uint8)opcode, (uint8)(opcode >> 8), 0 };
+	BMessage request(BT_MSG_HANDLE_SIMPLE_REQUEST);
+	request.AddInt32("hci_id", _HCIID());
+	request.AddData("raw command", B_ANY_TYPE, command, sizeof(command));
+	request.AddInt16("eventExpected", HCI_EVENT_CMD_COMPLETE);
+	request.AddInt16("opcodeExpected", opcode);
+	BMessage result(kMsgInquiryCancelled);
+	SendServerRequestAsync(request, BMessenger(this), result);
 }
 
 
