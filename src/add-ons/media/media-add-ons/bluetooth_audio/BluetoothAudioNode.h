@@ -78,7 +78,13 @@ protected:
 private:
 	static	status_t			_SenderEntry(void* cookie);
 			void				_Sender();
+	static	status_t			_ListenerEntry(void* cookie);
+			void				_Listener();
 			bool				_Connect();
+			void				_AcceptStream(int signalSocket);
+			bool				_StreamReady(const BString& name,
+									status_t status);
+			void				_SetSource(Bluetooth::A2dpSource* source);
 			bool				_EnsureStream();
 			void				_CloseStream();
 			void				_Queue(const int16* samples, size_t frames);
@@ -99,6 +105,12 @@ private:
 			size_t				fRingFill;
 
 			Bluetooth::A2dpSource* fSource;
+			BLocker				fSourceLock;
+				// fSource itself, against the listener thread
+			thread_id			fListener;
+			int					fListenSocket;
+			int					fIncomingSignal;
+				// a signalling channel the speaker opened, for the sender
 			Bluetooth::SbcEncoder fEncoder;
 			bigtime_t			fLastConnectAttempt;
 			bigtime_t			fLastSound;

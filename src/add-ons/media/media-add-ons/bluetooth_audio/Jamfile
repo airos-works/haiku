@@ -8,7 +8,7 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 		Addon [ MultiArchDefaultGristFiles bluetooth_audio.media_addon ] :
 			BluetoothAudioAddOn.cpp
 			BluetoothAudioNode.cpp
-			: be media libbluetooth.so [ TargetLibsupc++ ]
+			: be media network libbluetooth.so [ TargetLibsupc++ ]
 		;
 	}
 }

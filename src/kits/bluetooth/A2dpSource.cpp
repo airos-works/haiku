@@ -511,6 +511,9 @@ A2dpSource::A2dpSource(const bdaddr_t& address)
 	fAssembly(NULL),
 	fAssembled(0),
 	fState(IDLE),
+	fAccepting(false),
+	fAwaitingMedia(false),
+	fLastSinkCommand(0),
 	fRemoteSEID(0),
 	fSinkDelayReporting(false),
 	fPreferredRate(44100),
@@ -627,6 +630,109 @@ A2dpSource::Connect(bigtime_t timeout)
 		Disconnect();
 		return status;
 	}
+	return B_OK;
+}
+
+
+status_t
+A2dpSource::Accept(int signalSocket, bigtime_t timeout)
+{
+	if (fState != IDLE || fSignalSocket >= 0) {
+		close(signalSocket);
+		return B_BUSY;
+	}
+	const bigtime_t deadline = system_time() + timeout;
+	char address[18];
+	LELog(LE_LOG_INFO, "a2dp", "%s opened the signalling channel",
+		address_string(fAddress, address));
+
+	timeval readTimeout = { 0, kReadTimeout };
+	setsockopt(signalSocket, SOL_SOCKET, SO_RCVTIMEO, &readTimeout,
+		sizeof(readTimeout));
+	fSignalSocket = signalSocket;
+	fAccepting = true;
+	fAwaitingMedia = false;
+	fLastSinkCommand = 0;
+	fQuit = false;
+	fReader = spawn_thread(&_ReaderEntry, "a2dp signalling",
+		B_URGENT_DISPLAY_PRIORITY, this);
+	if (fReader < 0) {
+		fAccepting = false;
+		close(fSignalSocket);
+		fSignalSocket = -1;
+		return _Fail(fReader, "no signalling thread");
+	}
+	resume_thread(fReader);
+
+	// A sink that opens the channel usually sets the stream up as well;
+	// one that has said nothing for a while waits for us to.
+	const bigtime_t opened = system_time();
+	status_t status = B_TIMED_OUT;
+	while (system_time() < deadline) {
+		if (fState == OPEN || fState == STREAMING) {
+			status = B_OK;
+			break;
+		}
+		thread_info reader;
+		if (get_thread_info(fReader, &reader) != B_OK) {
+			// the sink closed the signalling channel again
+			status = B_DEV_NOT_READY;
+			break;
+		}
+		const bigtime_t quietSince = fLastSinkCommand != 0
+			? fLastSinkCommand : opened;
+		if (fState == IDLE && system_time() - quietSince > 1500000) {
+			LELog(LE_LOG_INFO, "a2dp", "the sink waits; setting the stream "
+				"up ourselves");
+			fAccepting = false;
+			status = _Discover();
+			if (status == B_OK)
+				status = _Configure();
+			if (status == B_OK)
+				status = _Open();
+			break;
+		}
+		if (fState == CONFIGURED && !fAwaitingMedia
+			&& system_time() - quietSince > 1500000) {
+			// configured, but not opened: open it ourselves
+			fAccepting = false;
+			status = _Open();
+			break;
+		}
+		snooze(20000);
+	}
+	fAccepting = false;
+	fAwaitingMedia = false;
+	if (status != B_OK) {
+		if (status == B_TIMED_OUT)
+			_Fail(status, "the sink did not finish setting the stream up");
+		else if (status == B_DEV_NOT_READY)
+			_Fail(status, "the sink closed the signalling channel");
+		Disconnect();
+		return status;
+	}
+	return B_OK;
+}
+
+
+status_t
+A2dpSource::AdoptMediaChannel(int socket)
+{
+	uint16 mtu = 0;
+	socklen_t size = sizeof(mtu);
+	if (getsockopt(socket, BLUETOOTH_PROTO_L2CAP, B_L2CAP_OUTGOING_MTU, &mtu,
+			&size) != 0 || mtu < 48)
+		mtu = L2CAP_MTU_DEFAULT;
+
+	BAutolock _(fLock);
+	if (!fAwaitingMedia || fMediaSocket >= 0 || fState != CONFIGURED)
+		return B_NOT_ALLOWED;
+	fMediaSocket = socket;
+	fMediaMTU = mtu;
+	fAwaitingMedia = false;
+	fState = OPEN;
+	LELog(LE_LOG_INFO, "a2dp", "stream open (the sink's), media packets up "
+		"to %u bytes", mtu);
 	return B_OK;
 }
 
@@ -880,6 +986,7 @@ A2dpSource::_HandleCommand(uint8 label, uint8 signal, const uint8* data,
 	size_t length)
 {
 	LELog(LE_LOG_DEBUG, "a2dp", "sink sent signal %#x", signal);
+	fLastSinkCommand = system_time();
 
 	const uint8 seid = length > 0 ? data[0] >> 2 : 0;
 	uint8 reply[32];
@@ -950,16 +1057,45 @@ A2dpSource::_HandleCommand(uint8 label, uint8 signal, const uint8* data,
 			break;
 
 		case AVDTP_SET_CONFIGURATION:
+		{
+			// Only a sink that opened the signalling channel itself sets
+			// the stream up; otherwise we do.
+			uint8 category, error;
+			if (fAccepting && fState == IDLE && seid == kLocalSEID
+				&& _TakeConfiguration(data, length, category, error)) {
+				LELog(LE_LOG_INFO, "a2dp", "the sink configured the stream");
+				_LogConfiguration();
+				break;
+			}
+			type = AVDTP_REJECT;
+			if (!fAccepting || fState != IDLE) {
+				category = 0;
+				error = fState != IDLE ? AVDTP_ERROR_SEP_IN_USE
+					: AVDTP_ERROR_NOT_SUPPORTED_COMMAND;
+			} else if (seid != kLocalSEID) {
+				category = 0;
+				error = AVDTP_ERROR_BAD_ACP_SEID;
+			}
+			reply[0] = category;
+			reply[1] = error;
+			replyLength = 2;
+			break;
+		}
+
 		case AVDTP_RECONFIGURE:
-			// We set the stream up ourselves; the sink does not.
 			type = AVDTP_REJECT;
 			reply[0] = 0;
-			reply[1] = fState != IDLE ? AVDTP_ERROR_SEP_IN_USE
-				: AVDTP_ERROR_NOT_SUPPORTED_COMMAND;
+			reply[1] = AVDTP_ERROR_NOT_SUPPORTED_COMMAND;
 			replyLength = 2;
 			break;
 
 		case AVDTP_OPEN:
+			// The sink opens the transport channel next (AVDTP 1.3
+			// section 6.11).
+			if (fAccepting && fState == CONFIGURED && seid == kLocalSEID) {
+				fAwaitingMedia = true;
+				break;
+			}
 			type = AVDTP_REJECT;
 			reply[0] = AVDTP_ERROR_BAD_STATE;
 			replyLength = 1;
@@ -1295,13 +1431,121 @@ A2dpSource::_Configure()
 		BAutolock _(fLock);
 		fState = CONFIGURED;
 	}
+	_LogConfiguration();
+	return B_OK;
+}
+
+
+void
+A2dpSource::_LogConfiguration()
+{
+	const SbcConfiguration& config = fConfiguration;
 	LELog(LE_LOG_INFO, "a2dp", "configured SBC %" B_PRIu32 " Hz, mode %#x, "
 		"%u blocks, %u subbands, %s, bitpool %u: %" B_PRIuSIZE " byte frames, "
 		"%" B_PRIu32 " kbit/s", config.sampleRate, config.channelMode,
 		config.blocks, config.subbands,
 		config.allocation == SBC_ALLOCATION_LOUDNESS ? "loudness" : "SNR",
 		config.bitpool, config.FrameSize(), config.BitRate() / 1000);
-	return B_OK;
+}
+
+
+/*!	The sink's SET_CONFIGURATION (AVDTP 1.3 section 8.9.1): ACP and INT
+	SEID, then service capabilities. Takes an SBC configuration with one
+	choice per field that the encoder can do; otherwise names the category
+	and error to reject it with.
+*/
+bool
+A2dpSource::_TakeConfiguration(const uint8* data, size_t length,
+	uint8& category, uint8& error)
+{
+	category = 0;
+	error = AVDTP_ERROR_BAD_LENGTH;
+	if (length < 2)
+		return false;
+	const uint8 remote = data[1] >> 2;
+	bool haveCodec = false;
+	bool delayReporting = false;
+	SbcConfiguration config = {};
+	for (size_t offset = 2; offset + 2 <= length;) {
+		category = data[offset];
+		const uint8 size = data[offset + 1];
+		const uint8* value = data + offset + 2;
+		if (offset + 2 + size > length) {
+			error = AVDTP_ERROR_BAD_LENGTH;
+			return false;
+		}
+		offset += 2 + size;
+		if (category == AVDTP_MEDIA_TRANSPORT)
+			continue;
+		if (category == AVDTP_DELAY_REPORTING) {
+			delayReporting = true;
+			continue;
+		}
+		if (category != AVDTP_MEDIA_CODEC) {
+			error = AVDTP_ERROR_NOT_SUPPORTED_COMMAND;
+			return false;
+		}
+		// media type, codec, then the SBC element: one bit per field
+		if (size != 6 || (value[0] >> 4) != kMediaTypeAudio
+			|| value[1] != kCodecSBC) {
+			error = AVDTP_ERROR_NOT_SUPPORTED_COMMAND;
+			return false;
+		}
+		const uint8 frequency = value[2] & 0xf0;
+		const uint8 mode = value[2] & 0x0f;
+		const uint8 blocks = value[3] & 0xf0;
+		const uint8 subbands = value[3] & 0x0c;
+		const uint8 allocation = value[3] & 0x03;
+		if (frequency == SBC_FREQUENCY_44100)
+			config.sampleRate = 44100;
+		else if (frequency == SBC_FREQUENCY_48000)
+			config.sampleRate = 48000;
+		else {
+			error = AVDTP_ERROR_NOT_SUPPORTED_COMMAND;
+			return false;
+		}
+		if (mode != SBC_MODE_MONO && mode != SBC_MODE_DUAL_CHANNEL
+			&& mode != SBC_MODE_STEREO && mode != SBC_MODE_JOINT_STEREO) {
+			error = AVDTP_ERROR_NOT_SUPPORTED_COMMAND;
+			return false;
+		}
+		config.channelMode = mode;
+		config.blocks = blocks == SBC_BLOCKS_4 ? 4 : blocks == SBC_BLOCKS_8 ? 8
+			: blocks == SBC_BLOCKS_12 ? 12 : blocks == SBC_BLOCKS_16 ? 16 : 0;
+		config.subbands = subbands == SBC_SUBBANDS_4 ? 4
+			: subbands == SBC_SUBBANDS_8 ? 8 : 0;
+		if (config.blocks == 0 || config.subbands == 0
+			|| (allocation != SBC_ALLOCATION_SNR
+				&& allocation != SBC_ALLOCATION_LOUDNESS)) {
+			error = AVDTP_ERROR_NOT_SUPPORTED_COMMAND;
+			return false;
+		}
+		config.allocation = allocation;
+		const uint32 frameLimit = (mode == SBC_MODE_MONO
+			|| mode == SBC_MODE_DUAL_CHANNEL ? 16 : 32) * config.subbands;
+		config.minBitpool = max_c(value[4], (uint8)2);
+		config.maxBitpool = value[5];
+		uint32 bitpool = min_c((uint32)value[5], (uint32)fBitpoolLimit);
+		bitpool = min_c(bitpool, frameLimit);
+		if (bitpool < config.minBitpool) {
+			error = AVDTP_ERROR_NOT_SUPPORTED_COMMAND;
+			return false;
+		}
+		config.bitpool = bitpool;
+		haveCodec = true;
+	}
+	if (!haveCodec) {
+		category = AVDTP_MEDIA_CODEC;
+		error = AVDTP_ERROR_NOT_SUPPORTED_COMMAND;
+		return false;
+	}
+
+	BAutolock _(fLock);
+	fConfiguration = config;
+	fRemoteSEID = remote;
+	fSinkDelayReporting = delayReporting;
+	fState = CONFIGURED;
+	return true;
 }
 
 

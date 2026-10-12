@@ -55,6 +55,16 @@ public:
 			status_t			Connect(bigtime_t timeout = 30000000);
 		// Brings up the ACL link (pairing if needed, which may ask the
 		// user), then configures and opens an SBC stream.
+			status_t			Accept(int signalSocket,
+									bigtime_t timeout = 10000000);
+		// Takes the signalling channel the sink opened itself (a speaker
+		// switched on reconnects to its last source that way): answers
+		// the sink setting the stream up, or sets it up as initiator when
+		// the sink waits for that. Owns the socket from then on.
+			bool				WantsMediaChannel() const
+									{ return fAwaitingMedia; }
+			status_t			AdoptMediaChannel(int socket);
+		// The transport channel a sink opens after its AVDTP open.
 			status_t			Start();
 			status_t			Suspend();
 			void				Disconnect();
@@ -109,6 +119,10 @@ private:
 			status_t			_Discover();
 			status_t			_Configure();
 			status_t			_Open();
+			bool				_TakeConfiguration(const uint8* data,
+									size_t length, uint8& category,
+									uint8& error);
+			void				_LogConfiguration();
 
 			status_t			_Command(uint8 signal, const void* data,
 									size_t length, Response* response,
@@ -162,6 +176,10 @@ private:
 			uint8				fAssemblyType;
 
 	volatile State				fState;
+	volatile bool				fAccepting;
+		// the sink opened the signalling channel and may set up the stream
+	volatile bool				fAwaitingMedia;
+	volatile bigtime_t			fLastSinkCommand;
 			uint8				fRemoteSEID;
 			uint8				fCapabilities[4];
 				// the sink's SBC codec information element

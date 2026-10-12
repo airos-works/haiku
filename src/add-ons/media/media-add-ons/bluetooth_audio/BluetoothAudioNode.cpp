@@ -7,16 +7,21 @@
 #include "BluetoothAudioNode.h"
 
 #include <algorithm>
+#include <errno.h>
 #include <new>
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <Autolock.h>
 #include <Buffer.h>
 #include <TimeSource.h>
 
+#include <bluetooth/L2CAP/btL2CAP.h>
 #include <bluetooth/bdaddrUtils.h>
+#include <l2cap.h>
 
 #include "BluetoothAudioAddOn.h"
 
@@ -52,6 +57,10 @@ BluetoothAudioNode::BluetoothAudioNode(BluetoothAudioAddOn* addOn,
 	fRingRead(0),
 	fRingFill(0),
 	fSource(NULL),
+	fSourceLock("bluetooth audio source"),
+	fListener(-1),
+	fListenSocket(-1),
+	fIncomingSignal(-1),
 	fLastConnectAttempt(0),
 	fLastSound(0),
 	fConnectedAt(0),
@@ -79,6 +88,19 @@ BluetoothAudioNode::~BluetoothAudioNode()
 		status_t result;
 		wait_for_thread(fSender, &result);
 	}
+	{
+		BAutolock _(fSourceLock);
+		if (fListenSocket >= 0) {
+			// wakes its accept()
+			shutdown(fListenSocket, SHUT_RDWR);
+		}
+	}
+	if (fListener >= 0) {
+		status_t result;
+		wait_for_thread(fListener, &result);
+	}
+	if (fIncomingSignal >= 0)
+		close(fIncomingSignal);
 	_CloseStream();
 	delete_sem(fDataSem);
 	free(fRing);
@@ -147,6 +169,11 @@ BluetoothAudioNode::NodeRegistered()
 		B_URGENT_PRIORITY, this);
 	if (fSender >= 0)
 		resume_thread(fSender);
+
+	fListener = spawn_thread(&_ListenerEntry, "bluetooth audio listener",
+		B_NORMAL_PRIORITY, this);
+	if (fListener >= 0)
+		resume_thread(fListener);
 }
 
 
@@ -324,15 +351,171 @@ BluetoothAudioNode::_SenderEntry(void* cookie)
 }
 
 
+/*static*/ status_t
+BluetoothAudioNode::_ListenerEntry(void* cookie)
+{
+	((BluetoothAudioNode*)cookie)->_Listener();
+	return B_OK;
+}
+
+
+/*!	A speaker that is switched on reconnects to its last source by opening
+	the AVDTP signalling channel itself, and then usually the transport
+	channel too; refused, it hangs up after a few seconds. The first goes
+	to the sender thread to set the stream up with, the second to the
+	stream waiting for it.
+*/
+void
+BluetoothAudioNode::_Listener()
+{
+	int listener = socket(PF_BLUETOOTH, SOCK_SEQPACKET,
+		BLUETOOTH_PROTO_L2CAP);
+	if (listener < 0)
+		return;
+	sockaddr_l2cap local = {};
+	local.l2cap_len = sizeof(local);
+	local.l2cap_family = AF_BLUETOOTH;
+	local.l2cap_bdaddr = BDADDR_ANY;
+	local.l2cap_psm = L2CAP_PSM_AVDTP;
+	if (bind(listener, (sockaddr*)&local, sizeof(local)) != 0
+		|| listen(listener, 2) != 0) {
+		syslog(LOG_ERR, "bluetooth audio: cannot listen for speakers: %s\n",
+			strerror(errno));
+		close(listener);
+		return;
+	}
+	{
+		BAutolock _(fSourceLock);
+		fListenSocket = listener;
+	}
+
+	while (!fQuit) {
+		sockaddr_l2cap peer = {};
+		socklen_t peerLength = sizeof(peer);
+		int channel = accept(listener, (sockaddr*)&peer, &peerLength);
+		if (fQuit) {
+			if (channel >= 0)
+				close(channel);
+			break;
+		}
+		if (channel < 0) {
+			snooze(100000);
+			continue;
+		}
+
+		bdaddr_t sink;
+		BString name;
+		if (GetAudioSink(sink, name) != B_OK
+			|| bdaddrUtils::Compare(sink, peer.l2cap_bdaddr) == false) {
+			syslog(LOG_INFO, "bluetooth audio: %s is not the chosen speaker; "
+				"closing its AVDTP channel\n",
+				bdaddrUtils::ToString(peer.l2cap_bdaddr).String());
+			close(channel);
+			continue;
+		}
+
+		BAutolock _(fSourceLock);
+		if (fSource != NULL && fSource->WantsMediaChannel()
+			&& fSource->AdoptMediaChannel(channel) == B_OK)
+			continue;
+		if (fIncomingSignal >= 0)
+			close(fIncomingSignal);
+		fIncomingSignal = channel;
+		release_sem(fDataSem);
+	}
+
+	BAutolock _(fSourceLock);
+	fListenSocket = -1;
+	close(listener);
+}
+
+
+void
+BluetoothAudioNode::_SetSource(A2dpSource* source)
+{
+	BAutolock _(fSourceLock);
+	fSource = source;
+}
+
+
 void
 BluetoothAudioNode::_CloseStream()
 {
 	A2dpSource* source = fSource;
-	fSource = NULL;
+	_SetSource(NULL);
 	if (source != NULL) {
 		source->Disconnect();
 		delete source;
 	}
+}
+
+
+/*!	The speaker opened the signalling channel: take it, unless a stream is
+	up already.
+*/
+void
+BluetoothAudioNode::_AcceptStream(int signalSocket)
+{
+	if (fSource != NULL && fSource->IsOpen()) {
+		close(signalSocket);
+		return;
+	}
+	_CloseStream();
+
+	bdaddr_t address;
+	BString name;
+	if (GetAudioSink(address, name) != B_OK) {
+		close(signalSocket);
+		return;
+	}
+	A2dpSource* source = new(std::nothrow) A2dpSource(address);
+	if (source == NULL) {
+		close(signalSocket);
+		return;
+	}
+	source->SetPreferredSampleRate(kSampleRate);
+	_SetSource(source);
+	syslog(LOG_INFO, "bluetooth audio: %s connected to us\n", name.String());
+	if (_StreamReady(name, source->Accept(signalSocket))) {
+		fConnectFailed = false;
+		fConnectNow = false;
+	}
+}
+
+
+/*!	After Connect() or Accept(): the encoder, the latency, the log. */
+bool
+BluetoothAudioNode::_StreamReady(const BString& name, status_t status)
+{
+	if (status == B_OK && fSource->Configuration().sampleRate != kSampleRate) {
+		syslog(LOG_ERR, "bluetooth audio: %s only takes %" B_PRIu32
+			" Hz\n", name.String(), fSource->Configuration().sampleRate);
+		status = B_NOT_SUPPORTED;
+	}
+	if (status == B_OK)
+		status = fEncoder.SetTo(fSource->Configuration());
+	if (status != B_OK) {
+		syslog(LOG_ERR, "bluetooth audio: cannot connect to %s: %s\n",
+			name.String(), fSource->LastError());
+		_CloseStream();
+		return false;
+	}
+	fConnectedAt = system_time();
+	syslog(LOG_INFO, "bluetooth audio: connected to %s, %" B_PRIu32
+		" kbit/s SBC\n", name.String(),
+		fSource->Configuration().BitRate() / 1000);
+
+	const bigtime_t delay = fSource->SinkDelay();
+	const bigtime_t latency = kProcessingLatency
+		+ (delay > 0 ? delay : kDefaultSinkDelay);
+	if (latency != fLatency) {
+		fLatency = latency;
+		SetEventLatency(latency);
+		if (fInput.source != media_source::null)
+			SendLatencyChange(fInput.source, fInput.destination,
+				EventLatency() + SchedulingLatency());
+	}
+	return true;
 }
 
 
@@ -356,42 +539,16 @@ BluetoothAudioNode::_Connect()
 			return false;
 		}
 
-		fSource = new(std::nothrow) A2dpSource(address);
-		if (fSource == NULL)
+		A2dpSource* source = new(std::nothrow) A2dpSource(address);
+		if (source == NULL)
 			return false;
-		fSource->SetPreferredSampleRate(kSampleRate);
-		status_t status = fSource->Connect();
-		if (status == B_OK
-			&& fSource->Configuration().sampleRate != kSampleRate) {
-			syslog(LOG_ERR, "bluetooth audio: %s only takes %" B_PRIu32
-				" Hz\n", name.String(), fSource->Configuration().sampleRate);
-			status = B_NOT_SUPPORTED;
-		}
-		if (status == B_OK)
-			status = fEncoder.SetTo(fSource->Configuration());
-		if (status != B_OK) {
-			syslog(LOG_ERR, "bluetooth audio: cannot connect to %s: %s\n",
-				name.String(), fSource->LastError());
-			_CloseStream();
+		source->SetPreferredSampleRate(kSampleRate);
+		_SetSource(source);
+		if (!_StreamReady(name, source->Connect())) {
 			fConnectFailed = true;
 			return false;
 		}
 		fConnectFailed = false;
-		fConnectedAt = system_time();
-		syslog(LOG_INFO, "bluetooth audio: connected to %s, %" B_PRIu32
-			" kbit/s SBC\n", name.String(),
-			fSource->Configuration().BitRate() / 1000);
-
-		const bigtime_t delay = fSource->SinkDelay();
-		const bigtime_t latency = kProcessingLatency
-			+ (delay > 0 ? delay : kDefaultSinkDelay);
-		if (latency != fLatency) {
-			fLatency = latency;
-			SetEventLatency(latency);
-			if (fInput.source != media_source::null)
-				SendLatencyChange(fInput.source, fInput.destination,
-					EventLatency() + SchedulingLatency());
-		}
 	}
 	return true;
 }
@@ -463,6 +620,15 @@ BluetoothAudioNode::_Sender()
 			fConnectFailed = false;
 			fConnectNow = true;
 		}
+
+		int incoming;
+		{
+			BAutolock _(fSourceLock);
+			incoming = fIncomingSignal;
+			fIncomingSignal = -1;
+		}
+		if (incoming >= 0)
+			_AcceptStream(incoming);
 
 		const bigtime_t now = system_time();
 		bigtime_t lastSound;
