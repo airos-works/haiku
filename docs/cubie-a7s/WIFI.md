@@ -22,8 +22,8 @@ Measured on the lab's network ("Gaspers", a WPA2-PSK/CCMP mesh; joined on
   Deskbar list the networks.
 - Join through net_server and wpa_supplicant (`ifconfig ... join`, the
   Deskbar, or `wifiautojoin` at boot with a saved network): associated, both
-  keys installed and the port open in under 2 s, then DHCP. Link HT MCS 7
-  at 40 MHz (VHT MCS 9 with `vht true`, but see below).
+  keys installed and the port open in under 2 s, then DHCP. Link VHT MCS 8-9
+  at 40 MHz on the lab's AP (HT MCS 7 with `vht false`; see 802.11ac below).
 - Ping to a LAN host over Wi-Fi: about 1.7 ms, no loss (power save is off).
 - 1 GiB from the lab host in 121 s (about 71 Mbit/s, HT40) while a BLE scan
   ran; no USB errors.
@@ -75,19 +75,63 @@ nothing; Linux holds both CPU clusters at 416 MHz once the SoC is over
 So sustained video work cooks the board to its cut-off in about 6 minutes,
 Wi-Fi or not; the fix is thermal management for the A733 (THS, throttling).
 
-With the antenna, VHT turned out to cost three quarters of the download
-rate: on the lab's AP (26:5a:4c:21:6c:a2, now on 5805 MHz, 40 MHz, -48 dBm)
-the same 1 GiB download ran at 17.2-17.8 Mbit/s with VHT advertised (five
-runs) and 75.7 Mbit/s with HT only. With VHT the board's receive path idled
-and the lab host's TCP view showed the board's 64 KiB window taking 10-38 ms
-to cross: the AP delivered slowly. The cause is open (the PHY reports
-80 MHz, LDPC and beamformee; the vendor's driver also advertises SU
-beamformee, this one does not). The driver now advertises HT unless its
-settings say `vht true`. Also only with VHT: right after the replies to a
-host are moved onto Wi-Fi, one in 11 is lost for about 2.5 minutes.
+## 802.11ac (2026-10-12)
 
-Measured with the antenna on the branch cubie-wifi-hang (HT, mostly MCS 7
-at 40 MHz), evidence/wifi-hang/run9-final:
+With the antenna, VHT first cost three quarters of the download rate: on
+the lab's AP (26:5a:4c:21:6c:a2, a Ubiquiti Wi-Fi 6 AP, 5805 MHz, 40 MHz,
+-48 dBm) the lab's 1 GiB download ran at 17.2-17.8 Mbit/s with VHT and
+75.7 Mbit/s with HT, so for a while the driver advertised HT only. There
+were two causes (cubie/evidence/wifi-vht):
+
+- The TCP stack: a connection that is opened and then only receives (the
+  lab's `cubie_fetch` sends no request) never measured a round trip, and
+  without one the receive window stays at 64 KiB. Each round trip on the
+  AP took 25-33 ms with VHT, so 64 KiB per round trip was 17 Mbit/s. The
+  SYN is timed now (TCPEndpoint::_SynchronizeSentReceive()); the window
+  grows to 6-12 MB. Clients that send a request first (HTTP) had grown
+  their window all along: 38.5 Mbit/s with VHT on the old stack.
+- The AP and the firmware: the firmware's association request always
+  carries an Operating Mode Notification of 80 MHz. In this 40 MHz
+  network the AP then sent the board nothing for about 30 ms twice per
+  beacon interval (at the beacon and about 50 ms later), after which it
+  resent with CTS-to-self: over half the airtime gone, and many lost
+  MPDUs at MCS 8-9. The vendor's Linux driver is hit the same way (HT
+  100.4, VHT 48.1 Mbit/s). Once
+  the port is open the driver now sends the AP an Operating Mode
+  Notification action frame with the channel's real width (20 or 40
+  MHz); the stalls stop. With Linux and that frame, a UDP flood got
+  130.8 Mbit/s through with VHT against 105 with HT.
+
+256 MiB downloads from the lab host: VHT 17.1 Mbit/s before, 38.3 with
+the TCP change, 117.3 with both; HT 90.6 with the TCP change. VHT is the
+default again; `vht false` in the driver settings turns it off.
+
+The 802.11ax (HE) the AP and the chip both offer does not work here: with
+the vendor's Linux driver the downlink got 8.6 Mbit/s of a UDP flood, 34.7
+after the same notification. This driver does not advertise HE.
+
+Measured on the branch cubie-wifi-vht (evidence/wifi-vht/haiku), the lab's
+watch on, within the same two hours (2026-10-12 00:10-01:01Z):
+
+| 1 GiB from the lab host       | download (Mbit/s)          | 512 MiB upload |
+|-------------------------------|----------------------------|----------------|
+| HT, the TCP stack before      | 70.6, 73.0                 | 55.3           |
+| HT, SYN timed                 | 92.5, 93.1                 | 54.1           |
+| VHT + notification, SYN timed | 121.5, 115.1, 116.2        | 55.1           |
+
+- one more VHT download with a BLE scan running (it listed 10
+  advertisers): 118.9 Mbit/s;
+- ping from the lab host over Wi-Fi both ways: 180 of 180 in the first 3
+  minutes after the route change, then 600 of 600 in 10 minutes, median
+  1.4 ms, p99 9.6 ms (the loss after the route change that VHT showed
+  before is gone); no driver or USB errors after the boot, Ethernet
+  unaffected;
+- at these rates the interface drops a few TCP acknowledgements (about
+  4000 of 240000 per GiB) when the 64-frame USB transmit ring is full;
+  TCP does not notice.
+
+Measured earlier on the branch cubie-wifi-hang (HT, mostly MCS 7 at 40 MHz,
+the TCP stack before), evidence/wifi-hang/run9-final:
 
 - three 1 GiB downloads: 75.0, 75.5 and 75.7 Mbit/s (the plug at 5 W, the
   receive path about 0.8 of a core); one more with a BLE scan running (it
@@ -139,7 +183,7 @@ both Cubie images. Before a public release, AICSemi should confirm that
 
 Driver settings (`~/config/settings/kernel/drivers/aic8800wifi`):
 `debug true` logs what the driver does; `watch true` adds the 5 s watch
-(above); `vht true` advertises VHT (slower on the lab's AP, above);
+(above); `vht false` advertises HT only (802.11ac above);
 `attach_at_boot false` keeps it out
 of the first minute after boot (touch its file to bring it in later).
 
