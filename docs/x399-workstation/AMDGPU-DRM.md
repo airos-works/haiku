@@ -52,11 +52,16 @@ Known limits:
   runs under three Vulkan programs, and `gpu-soak.sh` (OpenGL windows,
   H.264 and HEVC Main 10, Vulkan, windows and decoders killed mid-frame,
   Wayland windows) clean with every picture exact.
-- One hang during that investigation (decoding into video memory beside
-  three Vulkan programs, before the fix): no network, no disk activity,
-  nothing in the syslog; a power cycle brought it back. It did not happen
-  again in that configuration; the cause is not known (a UVD hang from the
-  starvation above is a guess).
+- Hangs under one load: decoding into video memory (VL_VIDEO_BUFFER_GTT=0)
+  beside three Vulkan programs stopped the machine twice, once before and
+  once after the memory clock fix (about once in 40 minutes of that load;
+  20 minutes of gpu-soak.sh just before were clean). No network, no disk
+  activity, nothing in the syslog; the driver's synced log (drmparam
+  log_file) ended with "Fence fallback timer expired" on the gfx and sdma0
+  rings (missed fence interrupts), then nothing. A power cycle brings it
+  back. Everything stopping at once points to the kernel debugger; since
+  linux-drm ffc8db7 its console is drawn on the screen at the desktop's top
+  left (DP-4 here), so the next one shows its cause there.
 - Boot safety: the driver keeps a marker
   (`~/config/settings/kernel/drivers/amdgpu_drm.starting`) from its start
   until the GPU has run for 30 s; a boot that finds it leaves the GPU to the
