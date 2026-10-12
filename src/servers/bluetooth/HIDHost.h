@@ -49,6 +49,10 @@ public:
 			bool				AddDevice(const bdaddr_t& address,
 									const BMessage& services,
 									const char* name);
+			// A keyboard whose SDP records could not be read (its Class of
+			// Device says keyboard): driven in the boot protocol.
+			bool				AddBootKeyboard(const bdaddr_t& address,
+									const char* name);
 			void				RemoveDevice(const bdaddr_t& address);
 
 			// Opens the channels to a device the user connected.

@@ -697,6 +697,8 @@ LocalDeviceImpl::HandleEvent(struct hci_event_header* event)
 			// Finish that request so callers do not wait forever for an event
 			// that the controller will never send.
 			if (commandStatus->status != BT_OK) {
+				CLASSIC_LOG(LE_LOG_ERROR, "the controller refused command %#x: "
+					"status %#x", commandStatus->opcode, commandStatus->status);
 				request = FindPetition(HCI_EVENT_CMD_COMPLETE,
 					commandStatus->opcode, &eventIndexLocation);
 				if (request != NULL) {
@@ -2384,12 +2386,12 @@ LocalDeviceImpl::EncryptChange(struct hci_ev_encrypt_change* event)
 		return;
 
 	ServerRemoteDevice* rd = RemoteDeviceByHandle(handle);
+	CLASSIC_LOG(event->status == BT_OK ? LE_LOG_INFO : LE_LOG_ERROR,
+		"encryption of link %#x: status %#x, %s%s", handle, event->status,
+		event->encrypt ? "on" : "off", rd == NULL ? " (unknown link)" : "");
 	if (rd == NULL)
 		return;
 
-	CLASSIC_LOG(event->status == BT_OK ? LE_LOG_INFO : LE_LOG_ERROR,
-		"encryption of link %#x: status %#x, %s", handle, event->status,
-		event->encrypt ? "on" : "off");
 	rd->encryption_enabled = event->encrypt;
 	if (rd->encryption_enabled != 0)
 		((BluetoothServer*)be_app)->NotifyServices(rd);

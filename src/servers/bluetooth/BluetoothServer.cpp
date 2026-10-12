@@ -539,6 +539,7 @@ struct DiscoverServicesJob {
 	bdaddr_t	address;
 	BString		name;
 	bool		outgoing;
+	uint8		classOfDevice[3];
 };
 
 
@@ -566,6 +567,7 @@ BluetoothServer::DiscoverServices(ServerRemoteDevice* rd)
 	job->address = rd->bdaddr;
 	job->name = rd->friendly_name;
 	job->outgoing = rd->outgoing;
+	memcpy(job->classOfDevice, rd->classOfDevice, sizeof(job->classOfDevice));
 	thread_id thread = spawn_thread(&_DiscoverServicesThread,
 		"bluetooth SDP query", B_NORMAL_PRIORITY, job);
 	if (thread < 0 || resume_thread(thread) != B_OK)
@@ -593,14 +595,15 @@ BluetoothServer::_DiscoverServicesThread(void* data)
 		"SDP query of %s: %s", Bluetooth::LEAddressString(job->address.b,
 			address), status == B_OK ? "done" : strerror(status));
 
-	if (status == B_OK) {
-		BMessage result(kMsgServicesDiscovered);
-		result.AddData("bdaddr", B_ANY_TYPE, &job->address, sizeof(bdaddr_t));
-		result.AddString("name", job->name);
-		result.AddBool("outgoing", job->outgoing);
-		result.AddMessage("services", &device.services);
-		be_app->PostMessage(&result);
-	}
+	BMessage result(kMsgServicesDiscovered);
+	result.AddData("bdaddr", B_ANY_TYPE, &job->address, sizeof(bdaddr_t));
+	result.AddString("name", job->name);
+	result.AddBool("outgoing", job->outgoing);
+	result.AddData("class", B_RAW_TYPE, job->classOfDevice,
+		sizeof(job->classOfDevice));
+	result.AddInt32("status", status);
+	result.AddMessage("services", &device.services);
+	be_app->PostMessage(&result);
 
 	delete job;
 	return B_OK;
@@ -626,8 +629,24 @@ BluetoothServer::_ServicesDiscovered(BMessage* message)
 			rd->services = services;
 	}
 
-	if (fHIDHost->AddDevice(*address, services,
-			message->GetString("name", ""))) {
+	// Without SDP records, a keyboard (its Class of Device: major class
+	// Peripheral, minor keyboard bit) still works in the boot protocol.
+	bool added = false;
+	if (message->GetInt32("status", B_ERROR) == B_OK) {
+		added = fHIDHost->AddDevice(*address, services,
+			message->GetString("name", ""));
+	} else {
+		const uint8* deviceClass;
+		ssize_t classSize;
+		if (message->FindData("class", B_RAW_TYPE,
+				(const void**)&deviceClass, &classSize) == B_OK
+			&& classSize == 3 && (deviceClass[1] & 0x1f) == 0x05
+			&& (deviceClass[0] & 0x40) != 0) {
+			added = fHIDHost->AddBootKeyboard(*address,
+				message->GetString("name", ""));
+		}
+	}
+	if (added) {
 		// Bonded HID devices page us when they wake up.
 		for (int32 i = 0; i < fLocalDevicesList.CountItems(); i++) {
 			LocalDeviceImpl* local = fLocalDevicesList.ItemAt(i);

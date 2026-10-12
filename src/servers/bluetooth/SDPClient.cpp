@@ -10,6 +10,11 @@
 #include "SDPClient.h"
 
 #include <bluetooth/SDPHIDRecord.h>
+#include <errno.h>
+#include <LELog.h>
+
+#define SDP_LOG(level, format, args...) \
+	Bluetooth::LELog(level, "classic", "SDP: " format, ##args)
 
 
 SDPClient::SDPClient(ServerRemoteDevice* rd)
@@ -41,12 +46,17 @@ SDPClient::Start()
 
 	fClientSocket = socket(PF_BLUETOOTH, SOCK_SEQPACKET, BLUETOOTH_PROTO_L2CAP);
 
+	bigtime_t started = system_time();
 	status = connect(fClientSocket, (sockaddr*)&fSockAddrL2cap, sizeof(sockaddr_l2cap));
 	if (status < 0) {
-		TRACE_BT("SDP: Could not connect client socket (%s)...\n", strerror(status));
+		status = errno;
+		SDP_LOG(Bluetooth::LE_LOG_ERROR, "no L2CAP channel after %" B_PRId64
+			" ms: %s", (system_time() - started) / 1000, strerror(status));
 		Stop();
 		return status;
 	}
+	SDP_LOG(Bluetooth::LE_LOG_DEBUG, "L2CAP channel open after %" B_PRId64
+		" ms", (system_time() - started) / 1000);
 
 	int sockError = 0;
 	socklen_t errorLength = sizeof(sockError);
@@ -250,16 +260,27 @@ SDPClient::_IssueRequest(const void* request, int32 size, BMallocIO* reply)
 
 	status = send(fClientSocket, request, size, 0);
 
-	if (status < 0)
-		return B_ERROR;
+	if (status < 0) {
+		status = errno;
+		SDP_LOG(Bluetooth::LE_LOG_ERROR, "sending the request failed: %s",
+			strerror(status));
+		return status;
+	}
 
 	TRACE_BT("SDP: The request was sent\n");
 
 	char buffer[400];
+	bigtime_t sent = system_time();
 	ssize_t numBytes = recv(fClientSocket, &buffer, sizeof(buffer), 0);
 
-	if (numBytes < 0)
-		return B_ERROR;
+	if (numBytes < 0) {
+		status = errno;
+		SDP_LOG(Bluetooth::LE_LOG_ERROR, "no answer after %" B_PRId64
+			" ms: %s", (system_time() - sent) / 1000, strerror(status));
+		return status;
+	}
+	SDP_LOG(Bluetooth::LE_LOG_DEBUG, "%zd-byte answer after %" B_PRId64 " ms",
+		numBytes, (system_time() - sent) / 1000);
 
 	TRACE_BT("SDP: Recieved the response: num bytes=%ld\n", numBytes);
 

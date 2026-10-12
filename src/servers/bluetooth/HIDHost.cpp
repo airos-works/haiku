@@ -66,6 +66,23 @@ enum {
 	HIDP_VIRTUAL_CABLE_UNPLUG = 0x05
 };
 
+// The boot protocol keyboard (HID 1.11 Appendix B.1) with the report ID 1 the
+// Bluetooth HID Profile gives it (1.1, 3.3.2): what a keyboard sends after
+// SET_PROTOCOL(Boot).
+static const uint8 kBootKeyboardDescriptor[] = {
+	0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x85, 0x01,
+	0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0x00,
+	0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
+	0x95, 0x01, 0x75, 0x08, 0x81, 0x01,
+	0x95, 0x05, 0x75, 0x01, 0x05, 0x08, 0x19, 0x01,
+	0x29, 0x05, 0x91, 0x02, 0x95, 0x01, 0x75, 0x03,
+	0x91, 0x01,
+	0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65,
+	0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x81, 0x00,
+	0xc0
+};
+static const uint8 kHIDPSetProtocolBoot = 0x70;
+
 // SDP attributes (Bluetooth Assigned Numbers, SDP; HID Profile 1.1, 5.3)
 static const char* kAttributeServiceName = "0x0100";
 static const char* kAttributeVendorID = "0x0201";
@@ -329,6 +346,15 @@ HIDHost::Session::_CreateDevice()
 			fAddressString, strerror(errno));
 		return false;
 	}
+
+	if (device.GetBool("boot", false)) {
+		// The device answers with a HANDSHAKE on the control channel.
+		uint8 setProtocol = kHIDPSetProtocolBoot;
+		if (send(fControl, &setProtocol, 1, 0) < 0) {
+			LOG(LE_LOG_ERROR, "%s: SET_PROTOCOL(Boot) failed: %s",
+				fAddressString, strerror(errno));
+		}
+	}
 	return true;
 }
 
@@ -355,8 +381,9 @@ HIDHost::Session::_ReadControl()
 				fAddressString);
 			break;
 		}
-		LOG(LE_LOG_DEBUG, "%s: control channel header %#x (%zd bytes)",
-			fAddressString, buffer[0], length);
+		LOG(type == HIDP_HANDSHAKE ? LE_LOG_INFO : LE_LOG_DEBUG,
+			"%s: control channel header %#x (%zd bytes)", fAddressString,
+			buffer[0], length);
 	}
 
 	// Without its control channel the device is gone.
@@ -583,6 +610,33 @@ HIDHost::AddDevice(const bdaddr_t& address, const BMessage& services,
 		device.GetString("name", ""), vendor, product, descriptorSize,
 		device.GetBool("reconnect", true)
 			? "reconnects by itself" : "we reconnect it");
+	return true;
+}
+
+
+bool
+HIDHost::AddBootKeyboard(const bdaddr_t& address, const char* name)
+{
+	BMessage device;
+	device.AddData("address", B_RAW_TYPE, address.b, sizeof(address.b));
+	device.AddData("descriptor", B_RAW_TYPE, kBootKeyboardDescriptor,
+		sizeof(kBootKeyboardDescriptor));
+	device.AddBool("reconnect", true);
+	device.AddBool("boot", true);
+	device.AddString("name", name != NULL && name[0] != '\0'
+		? name : "Bluetooth keyboard");
+	device.AddUInt16("vendor", 0);
+	device.AddUInt16("product", 0);
+
+	BAutolock locker(fLock);
+	_RemoveStored(address);
+	fDevices.AddMessage("device", &device);
+	_Save();
+
+	char addressString[18];
+	format_address(address, addressString);
+	LOG(LE_LOG_INFO, "%s: keyboard \"%s\" without SDP records: boot protocol",
+		addressString, device.GetString("name", ""));
 	return true;
 }
 
