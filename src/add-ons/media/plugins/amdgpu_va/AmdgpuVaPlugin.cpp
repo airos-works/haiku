@@ -37,6 +37,10 @@ extern "C" {
 }
 #include <va/va.h>
 
+#if defined(__x86_64__)
+#include <emmintrin.h>
+#endif
+
 #include "../amduvd/H264Output.h"
 #include "../amduvd/HevcOutput.h"
 
@@ -111,6 +115,8 @@ private:
 			status_t			_Receive();
 			bool				_PrepareImage(uint32 fourcc, int width,
 									int height);
+			bool				_CopyPlanes(const uint8* data, bool p010,
+									uint8* output);
 			bool				_Convert(const AVFrame* frame, uint8* output);
 
 			bool				fHevc;
@@ -347,6 +353,67 @@ VaDecoder::_Receive()
 }
 
 
+/*!	Separates a row of interleaved chroma (U V U V ...) into its U and V
+	samples. */
+static void
+split_chroma_row(const uint8* source, uint8* u, uint8* v, uint32 pairs)
+{
+	uint32 i = 0;
+#if defined(__x86_64__)
+	const __m128i low = _mm_set1_epi16(0x00ff);
+	for (; i + 16 <= pairs; i += 16) {
+		__m128i a = _mm_loadu_si128((const __m128i*)(source + 2 * i));
+		__m128i b = _mm_loadu_si128((const __m128i*)(source + 2 * i + 16));
+		_mm_storeu_si128((__m128i*)(u + i), _mm_packus_epi16(
+			_mm_and_si128(a, low), _mm_and_si128(b, low)));
+		_mm_storeu_si128((__m128i*)(v + i), _mm_packus_epi16(
+			_mm_srli_epi16(a, 8), _mm_srli_epi16(b, 8)));
+	}
+#endif
+	for (; i < pairs; i++) {
+		u[i] = source[2 * i];
+		v[i] = source[2 * i + 1];
+	}
+}
+
+
+/*!	The outputs that only rearrange the samples (NV12, I420, P010 of a P010
+	picture) are written straight from the VA image, without the copy the
+	amduvd conversions take their input in. */
+bool
+VaDecoder::_CopyPlanes(const uint8* data, bool p010, uint8* output)
+{
+	if (fFormat != HevcOutput::NV12 && fFormat != HevcOutput::I420
+		&& !(fFormat == HevcOutput::P010 && p010))
+		return false;
+	if (fFormat == HevcOutput::I420 && p010)
+		return false;
+	uint32 sampleBytes = p010 ? 2 : 1;
+	uint32 rowBytes = fWidth * sampleBytes;
+	const uint8* luma = data + fImage.offsets[0];
+	const uint8* chroma = data + fImage.offsets[1];
+	for (int y = 0; y < fHeight; y++) {
+		memcpy(output + (size_t)y * rowBytes,
+			luma + (size_t)y * fImage.pitches[0], rowBytes);
+	}
+	uint8* planes = output + (size_t)rowBytes * fHeight;
+	if (fFormat == HevcOutput::I420) {
+		uint32 quarter = (fWidth / 2) * (fHeight / 2);
+		for (int y = 0; y < fHeight / 2; y++) {
+			split_chroma_row(chroma + (size_t)y * fImage.pitches[1],
+				planes + (size_t)y * (fWidth / 2),
+				planes + quarter + (size_t)y * (fWidth / 2), fWidth / 2);
+		}
+	} else {
+		for (int y = 0; y < fHeight / 2; y++) {
+			memcpy(planes + (size_t)y * rowBytes,
+				chroma + (size_t)y * fImage.pitches[1], rowBytes);
+		}
+	}
+	return true;
+}
+
+
 /*!	The image the pictures are read into: made for the first picture, again
 	when the format or size changes. */
 bool
@@ -408,6 +475,26 @@ VaDecoder::_Convert(const AVFrame* frame, uint8* output)
 	if (vaMapBuffer(fDisplay, fImage.buf, &data) != VA_STATUS_SUCCESS)
 		return false;
 	bigtime_t transferred = sTiming ? system_time() : 0;
+
+	if (_CopyPlanes((const uint8*)data, p010, output)) {
+		vaUnmapBuffer(fDisplay, fImage.buf);
+		if (sTiming) {
+			static bigtime_t sTransfer, sCopy;
+			static int sCount;
+			bigtime_t end = system_time();
+			sTransfer += transferred - start;
+			sCopy += end - transferred;
+			if (++sCount == 120) {
+				fprintf(stderr, "amduvd (VA-API): %dx%d %s, per picture: "
+					"transfer %.2f ms, copy %.2f ms\n", fWidth, fHeight,
+					p010 ? "P010" : "NV12", sTransfer / 120000.0,
+					sCopy / 120000.0);
+				sTransfer = sCopy = 0;
+				sCount = 0;
+			}
+		}
+		return true;
+	}
 
 	// the layout the amduvd conversions take: luma rows, then the
 	// interleaved chroma rows, one pitch

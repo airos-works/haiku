@@ -22,7 +22,7 @@ the same GPU.
 | Vulkan | RADV, Vulkan 1.4.328: `vkprobe` passes, `vkbench` compute 1.77 TFLOP/s, fill 33.5 Gpixel/s, VRAM copy 123 GB/s, host upload 5.7 GB/s |
 | Vulkan in windows | `VK_KHR_wayland_surface` through Haiku's in-process Wayland server: 60.0 fps with vsync (FIFO), a 1920x1080 swapchain at 167 fps (mailbox) |
 | Video decoding | UVD through VA-API: MPEG-2, VC-1, H.264, HEVC Main and Main 10, JPEG; VCE encoding for H.264 and HEVC. H.264, HEVC and HEVC Main 10 decode bit-exact against FFmpeg's software decoder |
-| airTime | 1.0.0-18 (installed) plays H.264 and HEVC/Main 10 on the GPU ("AMD UVD (amduvd ...) [hardware]"): 1080p at 4-5 ms a picture, 4K at 30 fps without drops |
+| airTime | 1.0.0-18 (installed) plays H.264 and HEVC/Main 10 on the GPU ("AMD UVD (amduvd ...) [hardware]"): 1080p at 2-5 ms a picture, 4K H.264 at 60 fps and 4K HEVC Main 10 at 30 fps without drops |
 | Summit | renders with radeonsi and plays H.264 and HEVC on the GPU (bundle-ci0334, the CI build of Summit 803d1c9; see Summit's docs/wx5100-media.md) |
 
 Known limits:
@@ -34,16 +34,14 @@ Known limits:
   until the GPU has run for 30 s; a boot that finds it leaves the GPU to the
   framebuffer driver until it is deleted. No real crash has exercised it yet.
 
-- GPU writes into system memory reach 1.55 GB/s (reads 5.7 GB/s), which
-  bounds readback: Summit's compositor reads every frame back, and 4K
-  pictures are copied out of video memory. Ruled out on 2026-10-13: the
-  link (held at 8 GT/s x8 during the copies; AER clean; root port and GPU
-  both at 256-byte payloads with relaxed ordering), the copy engine (CP DMA
-  and shaders alike) and snooping (non-snooped write-combined buffers,
-  `haiku_uswc`, write no faster). Cause open; comparing with Linux on this
-  machine would settle whether it is the platform.
-- 4K at 60 fps decodes on the GPU but misses frames: the 8-bit YUV to RGB
-  conversion takes 10 ms a picture.
+- GPU writes into system memory from the graphics and compute engines
+  (shaders, CP DMA) reach only 1.55 GB/s; SDMA writes 4.7 GB/s (reads 5.7
+  and 7.1). Not the link (8 GT/s x8 held, AER clean) nor snooping (the
+  experimental `haiku_uswc` buffers write no faster). Readbacks therefore
+  go through SDMA (radeonsi `si_sdma_readback`: whole textures into linear
+  system-memory ones, which transfers and vaGetImage do): GL readback of
+  1024x768 2.6 -> 0.9 ms. Vulkan copies still use the graphics/compute
+  queues (RADV offers no SDMA queue on Polaris).
 - Vulkan presents by copying (no dma-buf on Haiku): GPU blit to host memory,
   copy into the window's shared buffer.
 - Wayland clients (vkwayland) sometimes crash as they exit: the in-process
