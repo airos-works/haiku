@@ -670,6 +670,77 @@ mixed_scales()
 }
 
 
+static int32
+count_primary(const DisplayLayout& layout)
+{
+	int32 count = 0;
+	for (int32 i = 0; i < layout.CountDisplays(); i++)
+		count += layout.DisplayAt(i)->primary ? 1 : 0;
+	return count;
+}
+
+
+// The main display unplugged while another takes over, and back: the
+// settings stored meanwhile name the one that took over, and only it. Two
+// came back as main displays on the workstation, from settings that
+// remembered both; such settings still give one.
+static void
+one_main_display()
+{
+	printf("main display: unplugged while another takes over, and back\n");
+	FakeAccelerant hardware;
+	hardware.Add(1, "DP-1");
+	hardware.Add(2, "DP-4");
+	DisplayLayout layout;
+	BMessage saved;
+	configure(layout, hardware, saved, false);
+
+	BMessage primary;
+	primary.AddInt32("id", 1);
+	primary.AddBool("primary", true);
+	check(request_message(layout, hardware, saved, primary) == B_OK,
+		"DP-1 is the main display");
+	hardware.SetConnected(1, false);
+	configure(layout, hardware, saved, false);
+	check(layout.PrimaryDisplay() == layout.DisplayByID(2),
+		"DP-1 unplugged: DP-4 takes over");
+	BMessage scale;
+	scale.AddInt32("id", 2);
+	scale.AddInt32("scale", 200);
+	check(request_message(layout, hardware, saved, scale) == B_OK,
+		"DP-4 at 200%, stored");
+	hardware.SetConnected(1, true);
+	configure(layout, hardware, saved, false);
+	check(count_primary(layout) == 1
+		&& layout.PrimaryDisplay() == layout.DisplayByID(2),
+		"DP-1 back: DP-4 stays the one main display");
+
+	BMessage both;
+	const char* names[] = { "DP-1", "DP-4" };
+	for (int32 i = 0; i < 2; i++) {
+		BMessage entry;
+		BString key;
+		key.SetToFormat("connector:%s", names[i]);
+		entry.AddString("key", key);
+		entry.AddString("connector", names[i]);
+		entry.AddBool("enabled", true);
+		entry.AddBool("primary", true);
+		entry.AddInt32("x", i * 3840);
+		entry.AddInt32("y", 0);
+		entry.AddInt32("scale", 100);
+		entry.AddInt32("width", 3840);
+		entry.AddInt32("height", 2160);
+		entry.AddFloat("refresh", 60);
+		both.AddMessage("display", &entry);
+	}
+	DisplayLayout fresh;
+	configure(fresh, hardware, both, false);
+	check(count_primary(fresh) == 1
+		&& fresh.PrimaryDisplay() == fresh.DisplayByID(1),
+		"settings naming two main displays: the first one");
+}
+
+
 static void
 single_scaled_timing()
 {
@@ -698,6 +769,7 @@ main()
 	mirror_pair();
 	mirror_sizes();
 	mixed_scales();
+	one_main_display();
 	printf(sFailures == 0 ? "all passed\n" : "%d FAILED\n", sFailures);
 	return sFailures == 0 ? 0 : 1;
 }
