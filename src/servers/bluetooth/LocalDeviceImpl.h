@@ -89,6 +89,8 @@ public:
 	void Disconnect(BMessage* message);
 	void SetConnEncryption(uint16 handle, bool encryption_enabled);
 	void ConfirmPairing(bdaddr_t address, bool accepted);
+	void EnablePageScan();
+		// so that paired HID devices can reconnect
 
 	ServerRemoteDevice*	RemoteDeviceByAddr(bdaddr_t bdaddr);
 	ServerRemoteDevice*	RemoteDeviceByHandle(uint16 handle);
@@ -236,8 +238,14 @@ private:
 	void IOCapabilityResponse(struct hci_ev_io_capability_response* event,
 		BMessage* request);
 	void UserConfirmationRequest(struct hci_ev_user_confirmation_request* event, BMessage* request);
+	void UserPasskeyNotification(
+		struct hci_ev_user_passkey_notification* event);
+	void KeypressNotification(struct hci_ev_keypress_notification* event);
 	void SimplePairingComplete(struct hci_ev_simple_pairing_complete* event,
 		BMessage* request);
+	void _ClosePasskeyAlert();
+	BMessenger fPasskeyAlert;
+		// the "type this code on the keyboard" alert
 	void AuthComplete(struct hci_ev_auth_complete* eventData, BMessage* request);
 
 	void EncryptChange(struct hci_ev_encrypt_change* eventData);

@@ -207,6 +207,8 @@ LocalDeviceImpl::HandlePairSetupCommandComplete(struct hci_event_header* event)
 		case PAIR_SETUP_LE_HOST:
 			printf("Bluetooth SSP, Secure Connections and LE host enabled\n");
 			fPairSetupState = PAIR_SETUP_IDLE;
+			if (((BluetoothServer*)be_app)->GetHIDHost()->HasDevices())
+				EnablePageScan();
 			break;
 		default:
 			break;
@@ -463,6 +465,20 @@ LocalDeviceImpl::HandleUnexpectedEvent(struct hci_event_header* event)
 		case HCI_EVENT_USER_CONFIRMATION_REQUEST:
 			UserConfirmationRequest(JumpEventHeader
 				<struct hci_ev_user_confirmation_request>(event), NULL);
+			break;
+
+		case HCI_EVENT_USER_PASSKEY_NOTIFICATION:
+			if (event->elen >= sizeof(hci_ev_user_passkey_notification)) {
+				UserPasskeyNotification(JumpEventHeader
+					<struct hci_ev_user_passkey_notification>(event));
+			}
+			break;
+
+		case HCI_EVENT_KEYPRESS_NOTIFICATION:
+			if (event->elen >= sizeof(hci_ev_keypress_notification)) {
+				KeypressNotification(JumpEventHeader
+					<struct hci_ev_keypress_notification>(event));
+			}
 			break;
 
 		case HCI_EVENT_SIMPLE_PAIRING_COMPLETE:
@@ -1868,11 +1884,16 @@ LocalDeviceImpl::ConnectionComplete(struct hci_ev_conn_complete* event)
 			rd->link_type = event->link_type;
 			rd->conn_state = RemoteDevice::CONNECTED;
 			rd->encryption_enabled = event->encrypt_mode;
+			((BluetoothServer*)be_app)->GetHIDHost()->LinkEncrypted(
+				rd->bdaddr, event->encrypt_mode != 0);
 		}
 
 		// Tell the user about a device that connected on its own; one we
-		// connected to was asked for.
-		if (!rd->outgoing) {
+		// connected to was asked for, and a paired one (a keyboard waking
+		// up) is expected.
+		linkkey_t nullKey = LinkKeyUtils::NullKey();
+		bool paired = !LinkKeyUtils::Compare(&rd->link_key, &nullKey);
+		if (!rd->outgoing && !paired) {
 			// TODO: Review, this rDevice is leaked
 			ConnectionIncoming* iConnection = new ConnectionIncoming(
 				new RemoteDevice(event->bdaddr, rd->classOfDevice));
@@ -1936,6 +1957,7 @@ LocalDeviceImpl::DisconnectionComplete(hci_ev_disconnection_complete_reply* even
 		rd->conn_state = RemoteDevice::DISCONNECTED;
 		rd->outgoing = false;
 		rd->encryption_enabled = 0;
+		((BluetoothServer*)be_app)->GetHIDHost()->LinkDown(rd->bdaddr);
 	}
 
 
@@ -2222,9 +2244,75 @@ LocalDeviceImpl::ConfirmPairing(bdaddr_t address, bool accepted)
 
 
 void
+LocalDeviceImpl::EnablePageScan()
+{
+	// Page scan only: paired devices can connect, but we are not
+	// discoverable unless the user asks for it in the preferences.
+	uint8 scan = 0x02;
+	if (fProperties != NULL) {
+		int8 current;
+		if (fProperties->FindInt8("scan_enable", &current) == B_OK)
+			scan |= current;
+	}
+	CLASSIC_LOG(LE_LOG_INFO, "page scan on (scan enable %#x) for paired HID "
+		"devices", scan);
+	_SendLECommand(PACK_OPCODE(OGF_CONTROL_BASEBAND, OCF_WRITE_SCAN_ENABLE),
+		&scan, 1);
+}
+
+
+void
+LocalDeviceImpl::UserPasskeyNotification(
+	struct hci_ev_user_passkey_notification* event)
+{
+	// We have a display and the device a keyboard (Core Vol 3 Part C
+	// 5.2.2.6, Passkey Entry): the user types our number on it.
+	ServerRemoteDevice* rd = RemoteDeviceByAddr(event->bdaddr);
+	BString name = bdaddrUtils::ToString(event->bdaddr);
+	if (rd != NULL && !rd->friendly_name.IsEmpty())
+		name = rd->friendly_name;
+
+	CLASSIC_LOG(LE_LOG_INFO, "pairing with %s: the passkey is to be typed on "
+		"it", bdaddrUtils::ToString(event->bdaddr).String());
+
+	_ClosePasskeyAlert();
+	BString text;
+	text.SetToFormat("To pair %s, type this number on it and press Enter:"
+		"\n\n%06" B_PRIu32, name.String(), event->passkey);
+	BAlert* alert = new BAlert("Bluetooth pairing", text.String(), "Close",
+		NULL, NULL, B_WIDTH_AS_USUAL, B_INFO_ALERT);
+	alert->SetFlags(alert->Flags() | B_CLOSE_ON_ESCAPE);
+	fPasskeyAlert = BMessenger(alert);
+	alert->Go(NULL);
+}
+
+
+void
+LocalDeviceImpl::KeypressNotification(
+	struct hci_ev_keypress_notification* event)
+{
+	CLASSIC_LOG(LE_LOG_DEBUG, "pairing with %s: keypress notification %u",
+		bdaddrUtils::ToString(event->bdaddr).String(), event->type);
+}
+
+
+void
+LocalDeviceImpl::_ClosePasskeyAlert()
+{
+	if (fPasskeyAlert.IsValid())
+		fPasskeyAlert.SendMessage(B_QUIT_REQUESTED);
+	fPasskeyAlert = BMessenger();
+}
+
+
+void
 LocalDeviceImpl::SimplePairingComplete(struct hci_ev_simple_pairing_complete* event,
 	BMessage* request)
 {
+	_ClosePasskeyAlert();
+	CLASSIC_LOG(event->status == BT_OK ? LE_LOG_INFO : LE_LOG_ERROR,
+		"simple pairing with %s: status %#x",
+		bdaddrUtils::ToString(event->bdaddr).String(), event->status);
 	CLASSIC_LOG(event->status == BT_OK ? LE_LOG_INFO : LE_LOG_ERROR,
 		"pairing with %s finished: %#x",
 		bdaddrUtils::ToString(event->bdaddr).String(), event->status);

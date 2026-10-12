@@ -11,6 +11,7 @@ Application bluetooth_server
 	DeviceManager.cpp
 	HCIControllerAccessor.cpp
 	HCITransportAccessor.cpp
+	HIDHost.cpp
 	LocalDeviceHandler.cpp
 	LocalDeviceImpl.cpp
 	LocalDeviceLE.cpp
