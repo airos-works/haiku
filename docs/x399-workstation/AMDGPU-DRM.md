@@ -23,7 +23,7 @@ the same GPU.
 | Vulkan in windows | `VK_KHR_wayland_surface` through Haiku's in-process Wayland server: 60.0 fps with vsync (FIFO), a 1920x1080 swapchain at 167 fps (mailbox) |
 | Video decoding | UVD through VA-API: MPEG-2, VC-1, H.264, HEVC Main and Main 10, JPEG; VCE encoding for H.264 and HEVC. H.264, HEVC and HEVC Main 10 decode bit-exact against FFmpeg's software decoder |
 | airTime | 1.0.0-18 (installed) plays H.264 and HEVC/Main 10 on the GPU ("AMD UVD (amduvd ...) [hardware]"): 1080p at 2-5 ms a picture, 4K H.264 at 60 fps and 4K HEVC Main 10 at 30 fps without drops |
-| Summit | renders with radeonsi and plays H.264 and HEVC on the GPU (bundle-ci0334, the CI build of Summit 803d1c9; see Summit's docs/wx5100-media.md) |
+| Summit | renders with radeonsi, plays H.264 and HEVC on the GPU, looping videos start over, WebGL 1 and 2 through ANGLE on radeonsi (WebGL Aquarium 60 fps) (bundle-ci1631, the CI build of Summit ce257e0; see Summit's docs/wx5100-media.md and docs/webgl.md) |
 
 Known limits:
 
