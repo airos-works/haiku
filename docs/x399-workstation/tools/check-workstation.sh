@@ -41,9 +41,15 @@ $SSH 'set -u
 	echo "graphics"
 	# Ask the device tree, not the syslog: the syslog is trimmed as it grows
 	# and the driver announces itself only once, early.
-	[ -e /dev/graphics/nvidia0 ] \
-		&& say ok "the GPU driver started" "$(ls /dev/graphics | tr "\n" " ")" \
-		|| say no "the GPU driver started" "no /dev/graphics/nvidia0"
+	# The WX 5100 on amdgpu_drm (docs AMDGPU-DRM.md), or the GTX 1070 that
+	# was in its place until 2026-10-10.
+	if [ -e /dev/graphics/amdgpu_drm_0 ] && [ -e /dev/dri/renderD128 ]; then
+		say ok "the GPU driver started" "$(ls /dev/graphics /dev/dri | grep -v ":$" | tr "\n" " ")"
+	elif [ -e /dev/graphics/nvidia0 ]; then
+		say ok "the GPU driver started" "$(ls /dev/graphics | tr "\n" " ")"
+	else
+		say no "the GPU driver started" "no amdgpu_drm (or nvidia) device"
+	fi
 
 	mode=$(screenmode -s 2>/dev/null)
 	[ -n "$mode" ] && say ok "a display is being driven" "$mode" \
@@ -51,7 +57,7 @@ $SSH 'set -u
 
 	# Nothing set in the environment: this is how a program started from the
 	# Deskbar sees the machine.
-	vk=$(env -u VK_ICD_FILENAMES -u LD_LIBRARY_PATH /boot/home/tests/vkbench submit 2>&1 | grep -o "NVIDIA[^(]*" | head -1)
+	vk=$(env -u VK_ICD_FILENAMES -u LD_LIBRARY_PATH /boot/home/tests/vkbench submit 2>&1 | grep -o "NVIDIA[^(]*\|AMD Radeon[^(]*([A-Z]* [A-Z0-9]*)" | head -1)
 	[ -n "$vk" ] && say ok "Vulkan finds the GPU by itself" "$vk" \
 		|| say no "Vulkan finds the GPU by itself" "falls back to software"
 
@@ -65,7 +71,7 @@ $SSH 'set -u
 	sleep 12
 	gl=$(grep -ao "renderer:.*" /tmp/check-gl.log | head -1)
 	case "$gl" in
-		*zink*) say ok "OpenGL runs on the GPU" "$(grep -ao "[0-9.]* fps.*" /tmp/check-gl.log)";;
+		*zink*|*radeonsi*) say ok "OpenGL runs on the GPU" "$(grep -ao "[0-9.]* fps.*" /tmp/check-gl.log)";;
 		*) say no "OpenGL runs on the GPU" "${gl:-nothing rendered}";;
 	esac
 	grep -aq "present into the screen: 1" /tmp/check-gl.log 2>/dev/null
@@ -102,6 +108,10 @@ $SSH 'set -u
 	# when it is full: look in the one before as well.
 	lay=$(cat /var/log/syslog.1 /var/log/syslog 2>/dev/null \
 		| grep -a "nvidia_rm: layout:" | tail -1 | sed "s/.*layout: //")
+	# amdgpu_kms writes one line per monitor it lights
+	[ -n "$lay" ] || lay=$(cat /var/log/syslog.1 /var/log/syslog 2>/dev/null \
+		| grep -a "amdgpu_kms: .*@.*, region" | tail -2 \
+		| sed "s/.*amdgpu_kms: \([^:]*\): \([^,]*\), region \([0-9,]*\).*/\1 \2 at \3/" | tr "\n" " ")
 	[ -n "$lay" ] && say ok "the card was given a layout" "$lay" \
 		|| say no "the card was given a layout" "nothing in the syslog"
 
@@ -196,9 +206,13 @@ $SSH 'set -u
 	fi
 
 	echo "the rest"
+	# one root hub per USB controller on the PCI bus (five until the card
+	# change of 2026-10-10, four since)
 	usb=$(listusb | grep -c RootHub)
-	[ "$usb" -ge 5 ] && say ok "every USB controller is up" "$usb root hubs" \
-		|| say no "every USB controller is up" "$usb root hubs"
+	controllers=$(listdev 2>/dev/null | grep -c "USB controller")
+	[ "$usb" -ge "$controllers" ] && [ "$usb" -ge 1 ] \
+		&& say ok "every USB controller is up" "$usb root hubs for $controllers controllers" \
+		|| say no "every USB controller is up" "$usb root hubs for $controllers controllers"
 
 	echo
 	echo "$pass working, $fail not"
