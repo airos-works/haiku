@@ -438,6 +438,11 @@ struct hci_cp_le_start_encryption {
 		uint16		handle;
 	} __attribute__ ((packed));
 
+	#define OCF_WRITE_DEFAULT_LINK_POLICY	0x000F
+	#define HCI_LINK_POLICY_ROLE_SWITCH		0x0001
+	#define HCI_LINK_POLICY_HOLD			0x0002
+	#define HCI_LINK_POLICY_SNIFF			0x0004
+
 /* Status params */
 #define OGF_STATUS_PARAM				0x05
 

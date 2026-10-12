@@ -158,6 +158,10 @@ LocalDeviceImpl::HandlePairSetupCommandComplete(struct hci_event_header* event)
 			expected = PACK_OPCODE(OGF_CONTROL_BASEBAND,
 				OCF_WRITE_LE_HOST_SUPPORTED);
 			break;
+		case PAIR_SETUP_LINK_POLICY:
+			expected = PACK_OPCODE(OGF_LINK_POLICY,
+				OCF_WRITE_DEFAULT_LINK_POLICY);
+			break;
 		default:
 			return;
 	}
@@ -205,7 +209,21 @@ LocalDeviceImpl::HandlePairSetupCommandComplete(struct hci_event_header* event)
 				OCF_WRITE_LE_HOST_SUPPORTED), leHost, sizeof(leHost));
 			break;
 		case PAIR_SETUP_LE_HOST:
+		{
+			// Role switch and sniff mode for new links (both are off after
+			// a reset): a keyboard that cannot enter sniff mode is polled
+			// all the time, and the radio it shares with an LE mouse (and
+			// Wi-Fi) has that much less time for them.
 			printf("Bluetooth SSP, Secure Connections and LE host enabled\n");
+			fPairSetupState = PAIR_SETUP_LINK_POLICY;
+			const uint8 policy[2] = {
+				HCI_LINK_POLICY_ROLE_SWITCH | HCI_LINK_POLICY_SNIFF, 0 };
+			result = _SendLECommand(PACK_OPCODE(OGF_LINK_POLICY,
+				OCF_WRITE_DEFAULT_LINK_POLICY), policy, sizeof(policy));
+			break;
+		}
+		case PAIR_SETUP_LINK_POLICY:
+			CLASSIC_LOG(LE_LOG_INFO, "default link policy: role switch, sniff");
 			fPairSetupState = PAIR_SETUP_IDLE;
 			if (((BluetoothServer*)be_app)->GetHIDHost()->HasDevices())
 				EnablePageScan();
@@ -474,6 +492,11 @@ LocalDeviceImpl::HandleUnexpectedEvent(struct hci_event_header* event)
 			}
 			break;
 
+		case HCI_EVENT_MODE_CHANGE:
+			if (event->elen >= sizeof(hci_ev_mode_change))
+				ModeChange(JumpEventHeader<struct hci_ev_mode_change>(event));
+			break;
+
 		case HCI_EVENT_KEYPRESS_NOTIFICATION:
 			if (event->elen >= sizeof(hci_ev_keypress_notification)) {
 				KeypressNotification(JumpEventHeader
@@ -552,6 +575,7 @@ LocalDeviceImpl::HandleExpectedRequest(struct hci_event_header* event,
 			break;
 
 		case HCI_EVENT_MODE_CHANGE:
+			ModeChange(JumpEventHeader<struct hci_ev_mode_change>(event));
 			break;
 
 		case HCI_EVENT_RETURN_LINK_KEYS:
@@ -2286,6 +2310,19 @@ LocalDeviceImpl::UserPasskeyNotification(
 	alert->SetFlags(alert->Flags() | B_CLOSE_ON_ESCAPE);
 	fPasskeyAlert = BMessenger(alert);
 	alert->Go(NULL);
+}
+
+
+void
+LocalDeviceImpl::ModeChange(struct hci_ev_mode_change* event)
+{
+	static const char* kModes[] = { "active", "hold", "sniff", "park" };
+	uint16 interval = B_LENDIAN_TO_HOST_INT16(event->interval);
+	CLASSIC_LOG(event->status == BT_OK ? LE_LOG_INFO : LE_LOG_ERROR,
+		"link %#x: %s mode, interval %.2f ms (status %#x)",
+		B_LENDIAN_TO_HOST_INT16(event->handle),
+		event->mode < 4 ? kModes[event->mode] : "unknown",
+		interval * 0.625, event->status);
 }
 
 

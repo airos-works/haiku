@@ -106,7 +106,8 @@ private:
 		PAIR_SETUP_EVENT_MASK,
 		PAIR_SETUP_SSP,
 		PAIR_SETUP_SC,
-		PAIR_SETUP_LE_HOST
+		PAIR_SETUP_LE_HOST,
+		PAIR_SETUP_LINK_POLICY
 	};
 	PairSetupState fPairSetupState;
 	void HandlePairSetupCommandComplete(struct hci_event_header* event);
@@ -241,6 +242,7 @@ private:
 	void UserPasskeyNotification(
 		struct hci_ev_user_passkey_notification* event);
 	void KeypressNotification(struct hci_ev_keypress_notification* event);
+	void ModeChange(struct hci_ev_mode_change* event);
 	void SimplePairingComplete(struct hci_ev_simple_pairing_complete* event,
 		BMessage* request);
 	void _ClosePasskeyAlert();
