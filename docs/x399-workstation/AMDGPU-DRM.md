@@ -30,10 +30,11 @@ Known limits:
 - Display power management: an 8-minute DPMS sleep and wake keeps the
   layout; the hot plug events that waking raises are recognised as the same
   monitors and change nothing (events while asleep are checked on wake).
-- Monitors coming and going, tried by forcing a connector off and back
-  (`kmsforce DP-1 off`, `kmsforce DP-1 detect`; the cable itself was not
-  pulled): the other monitor keeps its CRTC and gets the desktop, and both
-  come back where they were.
+- Monitors coming and going: forcing a connector off and back
+  (`kmsforce DP-1 off`, `kmsforce DP-1 detect`), the other monitor keeps its
+  CRTC and gets the desktop, and both come back where they were; a
+  DisplayPort cable pulled and plugged back in at the machine (13 October)
+  recovered the same way.
 - The display engine (DCE 11.2) has no overlay cursor, so amdgpu_dm takes
   no hardware cursor over a region that is scaled (DP-4 at 100 % beside
   DP-1 at 200 % is drawn at 100 % and DP-1's region enlarged): app_server
@@ -85,11 +86,11 @@ Known limits:
 
 | Piece | Source | Installed |
 | --- | --- | --- |
-| kernel driver `amdgpu_drm` | `src/forks/linux-drm`, branch `airos-6.18.52` (local) | `~/config/non-packaged/add-ons/kernel/drivers/bin/amdgpu_drm`, links in `dev/dri` and `dev/graphics` |
+| kernel driver `amdgpu_drm` | `src/forks/linux-drm`, branch `airos-6.18.52` (https://github.com/jmgasper/linux-drm) | `~/config/non-packaged/add-ons/kernel/drivers/bin/amdgpu_drm`, links in `dev/dri` and `dev/graphics` |
 | firmware | linux-firmware `amdgpu/polaris10_*` | `~/config/non-packaged/data/firmware/amdgpu` |
 | accelerant `amdgpu_kms` | this tree, `src/add-ons/accelerants/amdgpu_kms` | haiku.hpkg |
 | VA-API media add-on | this tree, `src/add-ons/media/plugins/amdgpu_va` | `~/config/non-packaged/add-ons/media/plugins/amduvd` |
-| libdrm | `src/forks/libdrm`, `airos-2.4.134` (local) | `/boot/system/non-packaged/lib` |
+| libdrm | `src/forks/libdrm`, `airos-2.4.134` (https://github.com/jmgasper/libdrm) | `/boot/system/non-packaged/lib` |
 | libva | `src/forks/libva`, `airos-2.24.1` (local) | `/boot/system/non-packaged/lib` |
 | libglvnd | `src/forks/libglvnd`, `airos-1.7.0` | `/boot/system/non-packaged/lib` |
 | Mesa (radeonsi, RADV, VA) | `src/forks/mesa`, `airos-amdgpu` | `/boot/system/non-packaged/lib`, EGL vendor and Vulkan ICD files in `/boot/system/non-packaged/add-ons/{opengl/egl_vendor.d,vulkan/icd.d}` |
