@@ -94,7 +94,18 @@ LocalDeviceImpl::LocalDeviceImpl(HCIDelegate* hd)
 	  fLEConnectionAddressType(0),
 	  fLEConnectionHandle(0),
 	  fLEEncryptionPending(false),
-	  fLEEncrypted(false)
+	  fLEEncrypted(false),
+	  fLECreateIntervalMin(0x18),
+	  fLECreateIntervalMax(0x28),
+	  fLECreateLatency(0),
+	  fLECreateTimeout(0x1f4),
+	  fLEKeepIntervalMin(0),
+	  fLEKeepIntervalMax(0),
+	  fLEKeepRestores(0),
+	  fLEKeepRestoredAt(0),
+	  fLELinkInterval(0),
+	  fLELinkLatency(0),
+	  fLELinkTimeout(0)
 {
 	memset(fLEConnectionAddress, 0, sizeof(fLEConnectionAddress));
 	LoadRemoteDevices();

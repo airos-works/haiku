@@ -44,7 +44,10 @@
 // random_number (8 bytes) and encrypted_diversifier (uint16).
 #define BT_MSG_LE_START_ENCRYPTION      'leEN'
 // Asks the controller for other parameters on the LE link: "interval_min",
-// "interval_max" (1.25 ms units), "latency" (events), "timeout" (10 ms)
+// "interval_max" (1.25 ms units), "latency" (events), "timeout" (10 ms),
+// the last two the link's if left out; "keep_interval" (bool) asks for the
+// interval again whenever the peer changes it. BT_MSG_LE_CONNECT takes the same four fields (optional) for
+// the connection it creates.
 #define BT_MSG_LE_UPDATE_CONNECTION     'leUP'
 #define BT_MSG_LE_ENCRYPTED             'leED'
 #define BT_MSG_LE_ENCRYPTION_FAILED     'leEF'

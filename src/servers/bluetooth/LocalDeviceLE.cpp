@@ -165,6 +165,10 @@ LocalDeviceImpl::_ResetLEConnection()
 	fLEConnectionHandle = 0;
 	fLEEncryptionPending = false;
 	fLEEncrypted = false;
+	fLEKeepIntervalMin = fLEKeepIntervalMax = 0;
+	fLEKeepRestores = 0;
+	fLEKeepRestoredAt = 0;
+	fLELinkInterval = fLELinkLatency = fLELinkTimeout = 0;
 }
 
 
@@ -215,13 +219,19 @@ LocalDeviceImpl::_IssueLECreateConnection()
 	command.peer_address_type = fLEConnectionAddressType;
 	memcpy(&command.peer_address, fLEConnectionAddress,
 		sizeof(fLEConnectionAddress));
-	// 30-50 ms until the peripheral asks for something else; 5 s timeout.
-	command.connection_interval_min = B_HOST_TO_LENDIAN_INT16(0x0018);
-	command.connection_interval_max = B_HOST_TO_LENDIAN_INT16(0x0028);
-	command.supervision_timeout = B_HOST_TO_LENDIAN_INT16(0x01f4);
+	// Unless the client asked for others, 30-50 ms until the peripheral
+	// asks for something else; 5 s timeout.
+	command.connection_interval_min
+		= B_HOST_TO_LENDIAN_INT16(fLECreateIntervalMin);
+	command.connection_interval_max
+		= B_HOST_TO_LENDIAN_INT16(fLECreateIntervalMax);
+	command.connection_latency = B_HOST_TO_LENDIAN_INT16(fLECreateLatency);
+	command.supervision_timeout = B_HOST_TO_LENDIAN_INT16(fLECreateTimeout);
 	char address[18];
-	LOG(LE_LOG_INFO, "creating LE connection to %s (address type %u)",
-		AddressString(fLEConnectionAddress, address), fLEConnectionAddressType);
+	LOG(LE_LOG_INFO, "creating LE connection to %s (address type %u, interval "
+		"%.2f-%.2f ms)", AddressString(fLEConnectionAddress, address),
+		fLEConnectionAddressType, fLECreateIntervalMin * 1.25,
+		fLECreateIntervalMax * 1.25);
 	fLEConnectionState = LE_CONN_CREATE_SENT;
 	return _SendLECommand(kOpcodeLECreateConnection, &command,
 		sizeof(command));
@@ -350,10 +360,24 @@ LocalDeviceImpl::StopLEScan(const BMessenger* listener)
 
 status_t
 LocalDeviceImpl::StartLEConnection(const BMessenger& listener,
-	const uint8* address, uint8 addressType)
+	const uint8* address, uint8 addressType, const BMessage* parameters)
 {
 	if (!listener.IsValid() || address == NULL || addressType > 1)
 		return B_BAD_VALUE;
+	uint16 intervalMin = 0x18, intervalMax = 0x28, latency = 0;
+	uint16 timeout = 0x1f4;
+	if (parameters != NULL) {
+		intervalMin = parameters->GetUInt16("interval_min", intervalMin);
+		intervalMax = parameters->GetUInt16("interval_max", intervalMax);
+		latency = parameters->GetUInt16("latency", latency);
+		timeout = parameters->GetUInt16("timeout", timeout);
+		// Core Vol 4 Part E 7.8.12.
+		if (intervalMin < 6 || intervalMin > intervalMax
+			|| intervalMax > 3200 || latency > 499 || timeout < 10
+			|| timeout > 3200
+			|| (uint32)timeout * 4 <= (uint32)(1 + latency) * intervalMax)
+			return B_BAD_VALUE;
+	}
 	BAutolock lock(fLELock);
 	if (fLEConnectionState != LE_CONN_IDLE) {
 		LOG(LE_LOG_INFO, "LE connection request refused: link is %s",
@@ -370,6 +394,10 @@ LocalDeviceImpl::StartLEConnection(const BMessenger& listener,
 	fLEEncrypted = false;
 	fLEConnectionState = LE_CONN_PENDING;
 	fLEConnectionSince = system_time();
+	fLECreateIntervalMin = intervalMin;
+	fLECreateIntervalMax = intervalMax;
+	fLECreateLatency = latency;
+	fLECreateTimeout = timeout;
 	char text[18];
 	LOG(LE_LOG_INFO, "LE connection to %s requested (scan %s)",
 		AddressString(address, text), ScanStateName(fLEScanState));
@@ -842,6 +870,9 @@ LocalDeviceImpl::HandleLEConnectionComplete(struct hci_event_header* event)
 
 	fLEConnectionHandle = handle;
 	fLEConnectionState = LE_CONN_CONNECTED;
+	fLELinkInterval = B_LENDIAN_TO_HOST_INT16(complete->connection_interval);
+	fLELinkLatency = B_LENDIAN_TO_HOST_INT16(complete->connection_latency);
+	fLELinkTimeout = B_LENDIAN_TO_HOST_INT16(complete->supervision_timeout);
 	LOG(LE_LOG_INFO, "LE link up: handle %#x peer %s role %u interval %.2f ms "
 		"latency %u supervision %u ms", handle,
 		AddressString((const uint8*)&complete->peer_address, text),
@@ -863,11 +894,26 @@ LocalDeviceImpl::HandleLEConnectionComplete(struct hci_event_header* event)
 
 status_t
 LocalDeviceImpl::UpdateLEConnection(uint16 intervalMin, uint16 intervalMax,
-	uint16 latency, uint16 timeout)
+	uint16 latency, uint16 timeout, bool keepInterval)
 {
 	BAutolock lock(fLELock);
 	if (fLEConnectionState != LE_CONN_CONNECTED)
 		return B_DEV_NOT_READY;
+	if (keepInterval) {
+		fLEKeepIntervalMin = intervalMin;
+		fLEKeepIntervalMax = intervalMax;
+		fLEKeepRestores = 0;
+		fLEKeepRestoredAt = 0;
+	}
+	// Unspecified: what the link has (a peripheral's latency saves its
+	// battery; it is not ours to take away).
+	if (latency == 0xffff)
+		latency = fLELinkLatency;
+	if (timeout == 0)
+		timeout = fLELinkTimeout;
+	if (keepInterval && fLELinkInterval >= intervalMin
+		&& fLELinkInterval <= intervalMax)
+		return B_OK;
 	// Core Vol 4 Part E 7.8.18, with the limits of Vol 6 Part B 4.5.
 	if (intervalMin < 6 || intervalMin > intervalMax || intervalMax > 3200
 		|| latency > 499 || timeout < 10 || timeout > 3200
@@ -886,6 +932,54 @@ LocalDeviceImpl::UpdateLEConnection(uint16 intervalMin, uint16 intervalMax,
 		"ms on handle %#x", intervalMin * 1.25, intervalMax * 1.25, latency,
 		timeout * 10, handle);
 	return _SendLECommand(PACK_OPCODE(OGF_LE_CONTROL, 0x0013), command,
+		sizeof(command));
+}
+
+
+/*!	The peer changed the link's parameters (a mouse asks again every now
+	and then, and the controller picks the slowest interval it allows). If
+	a client asked for an interval to be kept, ask for it back, with the
+	latency and timeout the peer wanted. A peer that undoes it right away,
+	three times, wins.
+*/
+void
+LocalDeviceImpl::_KeepLEInterval(uint16 handle, uint16 interval,
+	uint16 latency, uint16 timeout)
+{
+	BAutolock lock(fLELock);
+	if (handle == fLEConnectionHandle) {
+		fLELinkInterval = interval;
+		fLELinkLatency = latency;
+		fLELinkTimeout = timeout;
+	}
+	if (fLEConnectionState != LE_CONN_CONNECTED || handle != fLEConnectionHandle
+		|| fLEKeepIntervalMin == 0
+		|| (interval >= fLEKeepIntervalMin && interval <= fLEKeepIntervalMax))
+		return;
+	// Undone again within seconds of asking means the peer will not have it.
+	const bigtime_t now = system_time();
+	if (fLEKeepRestoredAt != 0 && now - fLEKeepRestoredAt < 5000000
+		&& ++fLEKeepRestores >= 3) {
+		LOG(LE_LOG_INFO, "peer on handle %#x keeps choosing %.2f ms; "
+			"leaving it", handle, interval * 1.25);
+		fLEKeepIntervalMin = fLEKeepIntervalMax = 0;
+		return;
+	}
+	if ((uint32)timeout * 4 <= (uint32)(1 + latency) * fLEKeepIntervalMax)
+		return;
+	fLEKeepRestoredAt = now;
+	const uint8 command[14] = {
+		(uint8)handle, (uint8)(handle >> 8),
+		(uint8)fLEKeepIntervalMin, (uint8)(fLEKeepIntervalMin >> 8),
+		(uint8)fLEKeepIntervalMax, (uint8)(fLEKeepIntervalMax >> 8),
+		(uint8)latency, (uint8)(latency >> 8),
+		(uint8)timeout, (uint8)(timeout >> 8),
+		0, 0, 0, 0
+	};
+	LOG(LE_LOG_INFO, "asking for %.2f-%.2f ms again on handle %#x (latency "
+		"%u, timeout %u ms)", fLEKeepIntervalMin * 1.25,
+		fLEKeepIntervalMax * 1.25, handle, latency, timeout * 10);
+	_SendLECommand(PACK_OPCODE(OGF_LE_CONTROL, 0x0013), command,
 		sizeof(command));
 }
 
@@ -945,6 +1039,12 @@ LocalDeviceImpl::HandleLEMeta(struct hci_event_header* event)
 					(payload[4] | (payload[5] << 8)) * 1.25,
 					payload[6] | (payload[7] << 8),
 					(payload[8] | (payload[9] << 8)) * 10);
+				if (payload[1] == 0) {
+					_KeepLEInterval(payload[2] | (payload[3] << 8),
+						payload[4] | (payload[5] << 8),
+						payload[6] | (payload[7] << 8),
+						payload[8] | (payload[9] << 8));
+				}
 			}
 			break;
 		case kSubeventRemoteFeatures:

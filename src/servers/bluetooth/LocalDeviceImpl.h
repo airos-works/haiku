@@ -74,11 +74,12 @@ public:
 	status_t StopLEScan(const BMessenger* listener);
 		// NULL stops the scan for every listener.
 	status_t StartLEConnection(const BMessenger& listener,
-		const uint8* address, uint8 addressType);
+		const uint8* address, uint8 addressType,
+		const BMessage* parameters = NULL);
 	status_t CancelLEConnection(const BMessenger* listener);
 	status_t DisconnectLEConnection(const BMessenger* listener);
 	status_t UpdateLEConnection(uint16 intervalMin, uint16 intervalMax,
-		uint16 latency, uint16 timeout);
+		uint16 latency, uint16 timeout, bool keepInterval = false);
 	status_t StartLEEncryption(const uint8* key, const uint8* randomNumber,
 		uint16 encryptedDiversifier);
 	void LEPulse();
@@ -171,6 +172,23 @@ private:
 	uint16 fLEConnectionHandle;
 	bool fLEEncryptionPending;
 	bool fLEEncrypted;
+	// What the next connection is created with (1.25 ms, events, 10 ms).
+	uint16 fLECreateIntervalMin;
+	uint16 fLECreateIntervalMax;
+	uint16 fLECreateLatency;
+	uint16 fLECreateTimeout;
+	// An interval range the client wants kept on the link, 0 for none: the
+	// peer asking for something else gets it, with this interval.
+	uint16 fLEKeepIntervalMin;
+	uint16 fLEKeepIntervalMax;
+	int32 fLEKeepRestores;
+	bigtime_t fLEKeepRestoredAt;
+	// The link's parameters now.
+	uint16 fLELinkInterval;
+	uint16 fLELinkLatency;
+	uint16 fLELinkTimeout;
+	void _KeepLEInterval(uint16 handle, uint16 interval, uint16 latency,
+		uint16 timeout);
 
 	status_t _SendLECommand(uint16 opcode, const void* data, size_t length);
 	void _EnsureLEMasks();

@@ -296,7 +296,8 @@ void BluetoothServer::MessageReceived(BMessage* message)
 				&& addressSize == 6
 				&& message->FindUInt8("address_type", &addressType) == B_OK
 				? device->StartLEConnection(listener, (const uint8*)address,
-					addressType) : B_BAD_VALUE;
+					addressType, message->HasUInt16("interval_min")
+						? message : NULL) : B_BAD_VALUE;
 			break;
 		}
 
@@ -332,8 +333,9 @@ void BluetoothServer::MessageReceived(BMessage* message)
 				: device->UpdateLEConnection(
 					message->GetUInt16("interval_min", 0),
 					message->GetUInt16("interval_max", 0),
-					message->GetUInt16("latency", 0),
-					message->GetUInt16("timeout", 0));
+					message->GetUInt16("latency", 0xffff),
+					message->GetUInt16("timeout", 0),
+					message->GetBool("keep_interval", false));
 			break;
 		}
 
