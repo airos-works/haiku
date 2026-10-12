@@ -15,6 +15,11 @@ HAIKU_IMAGE_LABEL = airOS ;
 # packages are; without it they do not mount.
 HAIKU_ARM64_ZSTD_PACKAGES_DIR ?= /mnt/HaikuWork/rpi4/zstd/packages ;
 
+# libjpeg-turbo, libpng and libwebp for arm64 (built by
+# tools/rpi4/build-image-libs.sh). The JPEG, PNG and WebP translators and the
+# USB webcam's MJPEG are built only with them; the full image ships them.
+HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR ?= /mnt/HaikuWork/rpi4/image-libs/packages ;
+
 if $(HAIKU_BUILD_PROFILE) = minimum-cubie {
 	HAIKU_IMAGE_SIZE = 900 ;
 }
@@ -98,6 +103,15 @@ rule UserBuildConfigRulePreImage
 		local zstdPackage = <cubie-zstd>zstd-1.5.7-1-arm64.hpkg ;
 		SEARCH on $(zstdPackage) = $(HAIKU_ARM64_ZSTD_PACKAGES_DIR) ;
 		AddPackageFilesToHaikuImage system packages : $(zstdPackage) ;
+	}
+
+	# the libraries of the JPEG, PNG and WebP translators
+	if $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) && $(CUBIE_AIROS_IMAGE) {
+		local imageLibraries = <cubie-image-lib>libjpeg_turbo-3.0.4-1-arm64.hpkg
+			<cubie-image-lib>libpng16-1.6.44-1-arm64.hpkg
+			<cubie-image-lib>libwebp-1.4.0-1-arm64.hpkg ;
+		SEARCH on $(imageLibraries) = $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) ;
+		AddPackageFilesToHaikuImage system packages : $(imageLibraries) ;
 	}
 
 	# The AIC8800D80 Wi-Fi/Bluetooth module's firmware, unchanged, with
