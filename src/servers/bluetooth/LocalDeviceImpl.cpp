@@ -1909,6 +1909,7 @@ LocalDeviceImpl::ConnectionComplete(struct hci_ev_conn_complete* event)
 			rd->handle = event->handle;
 			rd->link_type = event->link_type;
 			rd->conn_state = RemoteDevice::CONNECTED;
+			rd->auth_retries = 0;
 			rd->encryption_enabled = event->encrypt_mode;
 			((BluetoothServer*)be_app)->GetHIDHost()->LinkEncrypted(
 				rd->bdaddr, event->encrypt_mode != 0);
@@ -1938,7 +1939,15 @@ LocalDeviceImpl::ConnectionComplete(struct hci_ev_conn_complete* event)
 		newrequest->AddInt16("eventExpected", HCI_EVENT_LINK_KEY_NOTIFY);
 		AddWantedEvent(newrequest);
 
-		Authenticate(event->handle);
+		// A device that connected by itself (a keyboard waking up) usually
+		// authenticates and encrypts the link itself; doing it at the same
+		// time ends in a transaction collision. Give it a moment first.
+		if (rd->outgoing)
+			Authenticate(event->handle);
+		else {
+			((BluetoothServer*)be_app)->CheckLinkSecurityLater(GetID(),
+				rd->bdaddr, 0);
+		}
 
 		reply.what = BT_MSG_CONN_COMPLETED;
 	} else {
@@ -2270,6 +2279,20 @@ LocalDeviceImpl::ConfirmPairing(bdaddr_t address, bool accepted)
 
 
 void
+LocalDeviceImpl::SecureLink(const bdaddr_t& address, int32 attempt)
+{
+	ServerRemoteDevice* rd = RemoteDeviceByAddr(address);
+	if (rd == NULL || rd->conn_state != RemoteDevice::CONNECTED
+		|| rd->encryption_enabled != 0)
+		return;
+	CLASSIC_LOG(LE_LOG_INFO, "link %#x to %s is not encrypted yet: "
+		"authenticating (attempt %" B_PRId32 ")", rd->handle,
+		bdaddrUtils::ToString(address).String(), attempt + 1);
+	Authenticate(rd->handle);
+}
+
+
+void
 LocalDeviceImpl::EnablePageScan()
 {
 	// Page scan only: paired devices can connect, but we are not
@@ -2388,7 +2411,9 @@ LocalDeviceImpl::AuthComplete(struct hci_ev_auth_complete* eventData, BMessage* 
 			handle, status);
 
 		ServerRemoteDevice* rd = RemoteDeviceByHandle(handle);
-		if (rd != NULL) {
+		if (rd != NULL && (status == BT_AUTHENTICATION_FAILURE
+				|| status == BT_PIN_OR_KEY_MISSING)) {
+			// The key is wrong or the device forgot it: pair again next time.
 			rd->link_key = LinkKeyUtils::NullKey();
 			SaveRemoteDevices();
 			BMessage disconnReq;
@@ -2396,6 +2421,19 @@ LocalDeviceImpl::AuthComplete(struct hci_ev_auth_complete* eventData, BMessage* 
 			disconnReq.AddData("bdaddr", B_ANY_TYPE, &bdaddr, sizeof(bdaddr_t));
 			disconnReq.AddUInt8("reason", BT_AUTHENTICATION_FAILURE);
 			Disconnect(&disconnReq);
+		} else if (rd != NULL) {
+			// Anything else, such as a collision with the device's own
+			// authentication (a keyboard reconnecting authenticates by
+			// itself), says nothing about the key: keep it and the link,
+			// and look again in a moment.
+			CLASSIC_LOG(LE_LOG_INFO, "keeping the link key of %s; checking "
+				"the link again shortly",
+				bdaddrUtils::ToString(rd->bdaddr).String());
+			if (rd->auth_retries < 2) {
+				rd->auth_retries++;
+				((BluetoothServer*)be_app)->CheckLinkSecurityLater(GetID(),
+					rd->bdaddr, rd->auth_retries);
+			}
 		}
 	}
 

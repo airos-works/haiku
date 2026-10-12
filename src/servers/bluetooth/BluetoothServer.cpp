@@ -13,6 +13,7 @@
 #include <Entry.h>
 #include <Directory.h>
 #include <Message.h>
+#include <MessageRunner.h>
 #include <Path.h>
 #include <Roster.h>
 #include <String.h>
@@ -94,6 +95,9 @@ BluetoothServer::BluetoothServer()
 // The SDP records of a device, read on a thread of their own (see
 // DiscoverServices()); internal to the server.
 static const uint32 kMsgServicesDiscovered = 'btSD';
+// A Classic link to authenticate if it is still not encrypted by then.
+static const uint32 kMsgCheckLinkSecurity = 'btCL';
+static const bigtime_t kLinkSecurityDelay = 2000000;
 
 
 bool BluetoothServer::QuitRequested(void)
@@ -438,6 +442,19 @@ void BluetoothServer::MessageReceived(BMessage* message)
 			_ServicesDiscovered(message);
 			break;
 
+		case kMsgCheckLinkSecurity:
+		{
+			LocalDeviceImpl* local = LocateDelegateFromMessage(message);
+			const bdaddr_t* address;
+			ssize_t size;
+			if (local != NULL && message->FindData("bdaddr", B_ANY_TYPE,
+					(const void**)&address, &size) == B_OK
+				&& size == sizeof(bdaddr_t)) {
+				local->SecureLink(*address, message->GetInt32("attempt", 0));
+			}
+			break;
+		}
+
 		case BT_START_WATCHING_CONNECTIONS:
 		{
 			BMessenger* messenger = new BMessenger();
@@ -656,6 +673,19 @@ BluetoothServer::_ServicesDiscovered(BMessage* message)
 		if (message->GetBool("outgoing", false))
 			fHIDHost->Connect(*address);
 	}
+}
+
+
+void
+BluetoothServer::CheckLinkSecurityLater(hci_id hid, const bdaddr_t& address,
+	int32 attempt)
+{
+	BMessage message(kMsgCheckLinkSecurity);
+	message.AddInt32("hci_id", hid);
+	message.AddData("bdaddr", B_ANY_TYPE, &address, sizeof(bdaddr_t));
+	message.AddInt32("attempt", attempt);
+	BMessageRunner::StartSending(be_app_messenger, &message,
+		kLinkSecurityDelay, 1);
 }
 
 

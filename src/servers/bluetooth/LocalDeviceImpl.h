@@ -41,6 +41,8 @@ struct ServerRemoteDevice
 		// from the IO Capability Response of the current pairing
 	bool				outgoing;
 		// the current link was asked for here
+	uint8				auth_retries;
+		// of the current link, after collisions
 
 	uint16				handle;
 	RemoteDevice::ConnectionState			conn_state;
@@ -90,6 +92,8 @@ public:
 	void SetConnEncryption(uint16 handle, bool encryption_enabled);
 	void ConfirmPairing(bdaddr_t address, bool accepted);
 	void EnablePageScan();
+	void SecureLink(const bdaddr_t& address, int32 attempt);
+		// authenticates (and so encrypts) a link that is not encrypted yet
 		// so that paired HID devices can reconnect
 
 	ServerRemoteDevice*	RemoteDeviceByAddr(bdaddr_t bdaddr);

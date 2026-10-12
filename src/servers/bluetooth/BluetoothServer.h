@@ -77,6 +77,8 @@ public:
 	void		DiscoverServices(ServerRemoteDevice* rd);
 	void		NotifyServices(ServerRemoteDevice* rd);
 	HIDHost*	GetHIDHost() { return fHIDHost; }
+	void		CheckLinkSecurityLater(hci_id hid, const bdaddr_t& address,
+					int32 attempt);
 
     LocalDeviceImpl*    LocateLocalDeviceImpl(hci_id hid);
 	
