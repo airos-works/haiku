@@ -6,6 +6,7 @@
 
 #include "BluetoothAudioNode.h"
 
+#include <algorithm>
 #include <new>
 #include <stdlib.h>
 #include <string.h>
@@ -53,9 +54,10 @@ BluetoothAudioNode::BluetoothAudioNode(BluetoothAudioAddOn* addOn,
 	fSource(NULL),
 	fLastConnectAttempt(0),
 	fLastSound(0),
+	fConnectedAt(0),
 	fConnectFailed(false),
 	fSinkChanged(false),
-	fConnectNow(true)
+	fConnectNow(false)
 {
 	fRing = (int16*)malloc(fRingFrames * kChannels * sizeof(int16));
 	fDataSem = create_sem(0, "bluetooth audio data");
@@ -375,6 +377,7 @@ BluetoothAudioNode::_Connect()
 			return false;
 		}
 		fConnectFailed = false;
+		fConnectedAt = system_time();
 		syslog(LOG_INFO, "bluetooth audio: connected to %s, %" B_PRIu32
 			" kbit/s SBC\n", name.String(),
 			fSource->Configuration().BitRate() / 1000);
@@ -394,9 +397,9 @@ BluetoothAudioNode::_Connect()
 }
 
 
-/*!	Gets the stream going when there is sound to play. Right after the
-	setting changed, connects without waiting for sound, so that the
-	speaker shows it is in use.
+/*!	Gets the stream going when there is sound to play. Right after a
+	speaker was chosen, or Connect in the preferences, connects without
+	waiting for sound, so that the speaker shows it is in use.
 */
 bool
 BluetoothAudioNode::_EnsureStream()
@@ -468,7 +471,10 @@ BluetoothAudioNode::_Sender()
 			lastSound = fLastSound;
 		}
 
-		if (fSource != NULL && now - lastSound > kDisconnectAfter) {
+		// A speaker connected without sound (from the preferences) gets
+		// its minute too, counted from the connection.
+		if (fSource != NULL
+			&& now - std::max(lastSound, fConnectedAt) > kDisconnectAfter) {
 			syslog(LOG_INFO, "bluetooth audio: silent for a minute, "
 				"letting the speaker go\n");
 			_CloseStream();

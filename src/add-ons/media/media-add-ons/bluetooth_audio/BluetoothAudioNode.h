@@ -102,6 +102,7 @@ private:
 			Bluetooth::SbcEncoder fEncoder;
 			bigtime_t			fLastConnectAttempt;
 			bigtime_t			fLastSound;
+			bigtime_t			fConnectedAt;
 			bool				fConnectFailed;
 	volatile bool				fSinkChanged;
 	volatile bool				fConnectNow;

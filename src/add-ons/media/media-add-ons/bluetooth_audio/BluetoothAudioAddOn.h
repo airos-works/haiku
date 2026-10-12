@@ -40,6 +40,7 @@ public:
 
 			void				SettingsChanged();
 			void				NodeDeleted(BluetoothAudioNode* node);
+			void				MakeDefaultOutput();
 
 private:
 			bool				_ReadSettings(bdaddr_t& address,
@@ -59,6 +60,7 @@ private:
 			media_node			fPreviousOutput;
 			bool				fStarted;
 			bool				fPinned;
+			bool				fConnectOnCreate;
 };
 
 

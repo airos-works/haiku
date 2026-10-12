@@ -9,6 +9,7 @@
 #include <new>
 #include <stdio.h>
 #include <string.h>
+#include <syslog.h>
 
 #include <Autolock.h>
 #include <Entry.h>
@@ -31,6 +32,11 @@ using namespace Bluetooth;
 /*!	Watches the directory of the settings file (it may not exist yet, and
 	writers replace it) and tells the add-on when it changes.
 */
+// Makes the speaker the system's audio output, from the watcher's thread:
+// the media roster calls wait for the node to show up.
+static const uint32 kMsgMakeDefaultOutput = 'btdo';
+
+
 class SettingsWatcher : public BLooper {
 public:
 	SettingsWatcher(BluetoothAudioAddOn* addOn)
@@ -67,6 +73,10 @@ public:
 
 	virtual void MessageReceived(BMessage* message)
 	{
+		if (message->what == kMsgMakeDefaultOutput) {
+			fAddOn->MakeDefaultOutput();
+			return;
+		}
 		if (message->what != B_NODE_MONITOR) {
 			BLooper::MessageReceived(message);
 			return;
@@ -116,7 +126,8 @@ BluetoothAudioAddOn::BluetoothAudioAddOn(image_id image)
 	fNode(NULL),
 	fPreviousOutput(media_node::null),
 	fStarted(false),
-	fPinned(false)
+	fPinned(false),
+	fConnectOnCreate(false)
 {
 	memset(&fSink, 0, sizeof(fSink));
 	BluetoothAudioNode::GetFormat(fFormat);
@@ -140,6 +151,11 @@ BluetoothAudioAddOn::BluetoothAudioAddOn(image_id image)
 		fWatcher->Run();
 		BAutolock _(fWatcher);
 		fWatcher->Watch();
+		// The media server does not bring a Bluetooth output back as the
+		// default after a restart (the node comes later than its check),
+		// and without one the mixer plays to nothing.
+		if (fHasSink)
+			fWatcher->PostMessage(kMsgMakeDefaultOutput);
 	}
 }
 
@@ -192,10 +208,15 @@ BluetoothAudioAddOn::SettingsChanged()
 			// not when sound next plays.
 			if (hasSink && fNode != NULL)
 				fNode->ConnectNow();
+			if (hasSink && fWatcher != NULL)
+				fWatcher->PostMessage(kMsgMakeDefaultOutput);
 			return;
 		}
 		hadSink = fHasSink;
 		fHasSink = hasSink;
+		// A speaker just chosen is connected at once, so that it shows it
+		// is in use; one remembered from before (at boot) waits for sound.
+		fConnectOnCreate = hasSink && fStarted;
 		fSink = address;
 		fFlavorName = flavorName;
 		fFlavor.name = (char*)fFlavorName.String();
@@ -226,6 +247,18 @@ BluetoothAudioAddOn::NodeDeleted(BluetoothAudioNode* node)
 
 
 void
+BluetoothAudioAddOn::MakeDefaultOutput()
+{
+	{
+		BAutolock _(fLock);
+		if (!fHasSink)
+			return;
+	}
+	_MakeDefaultOutput();
+}
+
+
+void
 BluetoothAudioAddOn::_MakeDefaultOutput()
 {
 	BMediaRoster* roster = BMediaRoster::Roster();
@@ -235,8 +268,9 @@ BluetoothAudioAddOn::_MakeDefaultOutput()
 	media_node current;
 	if (roster->GetAudioOutput(&current) == B_OK) {
 		BAutolock _(fLock);
-		if (fNode == NULL || current.node != fNode->ID())
-			fPreviousOutput = current;
+		if (fNode != NULL && current.node == fNode->ID())
+			return;
+		fPreviousOutput = current;
 	}
 
 	dormant_node_info info;
@@ -245,17 +279,19 @@ BluetoothAudioAddOn::_MakeDefaultOutput()
 	strlcpy(info.name, fFlavorName.String(), sizeof(info.name));
 
 	// The media add-on server creates the node a moment after the flavor
-	// shows up.
+	// shows up (at boot, after the media server is up).
 	status_t status = B_ERROR;
-	for (int32 tries = 0; tries < 50 && status != B_OK; tries++) {
+	for (int32 tries = 0; tries < 150 && status != B_OK; tries++) {
 		status = roster->SetAudioOutput(info);
 		if (status != B_OK)
 			snooze(100000);
 	}
 	if (status != B_OK) {
-		fprintf(stderr, "bluetooth audio: could not become the audio output: "
+		syslog(LOG_ERR, "bluetooth audio: could not become the audio output: "
 			"%s\n", strerror(status));
-	}
+	} else
+		syslog(LOG_INFO, "bluetooth audio: %s is the audio output\n",
+			fFlavorName.String());
 }
 
 
@@ -314,6 +350,9 @@ BluetoothAudioAddOn::InstantiateNodeFor(const flavor_info* info,
 	{
 		BAutolock _(fLock);
 		fNode = node;
+		if (fConnectOnCreate)
+			node->ConnectNow();
+		fConnectOnCreate = false;
 	}
 	*_error = B_OK;
 	return node;
