@@ -49,6 +49,9 @@
 // interval again whenever the peer changes it. BT_MSG_LE_CONNECT takes the same four fields (optional) for
 // the connection it creates.
 #define BT_MSG_LE_UPDATE_CONNECTION     'leUP'
+// Logs the signal strength of a link: "handle" (uint16, the LE link if left
+// out); the answer goes to the LE log.
+#define BT_MSG_READ_RSSI                'leRS'
 #define BT_MSG_LE_ENCRYPTED             'leED'
 #define BT_MSG_LE_ENCRYPTION_FAILED     'leEF'
 

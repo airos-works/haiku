@@ -80,6 +80,7 @@ public:
 	status_t DisconnectLEConnection(const BMessenger* listener);
 	status_t UpdateLEConnection(uint16 intervalMin, uint16 intervalMax,
 		uint16 latency, uint16 timeout, bool keepInterval = false);
+	status_t ReadRSSI(int32 handle);
 	status_t StartLEEncryption(const uint8* key, const uint8* randomNumber,
 		uint16 encryptedDiversifier);
 	void LEPulse();

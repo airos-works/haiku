@@ -53,6 +53,7 @@ Usage()
 		"       bt_le probe <address> [seconds] [interval ms] [latency] "
 			"[public|random]\n"
 		"       bt_le inquiry [seconds]\n"
+		"       bt_le rssi [handle] [count]\n"
 		"Addresses are written as AA:BB:CC:DD:EE:FF. Pair a device while it\n"
 		"is in pairing mode; the log is %s.\n", LELogFilePath());
 }
@@ -810,6 +811,31 @@ main(int argc, char** argv)
 		printf("level %" B_PRId32 " (0 errors, 1 steps, 2 debug + kernel, "
 			"3 packets)\nlog: %s\n", LELogLevel(), LELogFilePath());
 		return 0;
+	}
+	if (strcmp(command, "rssi") == 0) {
+		// bt_le rssi [handle] [count]: the LE link's unless a handle is
+		// given, twice a second; the values go to the log.
+		uint8 local[6];
+		LocalDevice* adapter = GetAdapter(local);
+		if (adapter == NULL)
+			return 1;
+		int32 count = argc > 3 ? atoi(argv[3]) : 1;
+		status_t status = B_OK;
+		for (int32 i = 0; i < count && status == B_OK; i++) {
+			BMessage request(BT_MSG_READ_RSSI), reply;
+			request.AddInt32("hci_id", adapter->ID());
+			if (argc > 2 && strcmp(argv[2], "le") != 0)
+				request.AddUInt16("handle", (uint16)strtol(argv[2], NULL, 0));
+			status = BMessenger(BLUETOOTH_SIGNATURE).SendMessage(&request,
+				&reply, 5000000, 5000000);
+			if (status == B_OK)
+				status = reply.GetInt32("status", B_ERROR);
+			if (i + 1 < count)
+				snooze(500000);
+		}
+		printf("RSSI requested: %s (the values are in the log)\n",
+			strerror(status));
+		return status == B_OK ? 0 : 1;
 	}
 	if (strcmp(command, "inquiry") == 0)
 		return Inquiry(argc > 2 ? atoi(argv[2]) : 5);

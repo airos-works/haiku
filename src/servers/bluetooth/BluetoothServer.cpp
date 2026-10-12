@@ -339,6 +339,15 @@ void BluetoothServer::MessageReceived(BMessage* message)
 			break;
 		}
 
+		case BT_MSG_READ_RSSI:
+		{
+			LocalDeviceImpl* device = LocateDelegateFromMessage(message);
+			status = device == NULL ? B_BAD_VALUE
+				: device->ReadRSSI(message->GetUInt16("handle", 0xffff) == 0xffff
+					? -1 : message->GetUInt16("handle", 0));
+			break;
+		}
+
 		case BT_MSG_LE_START_ENCRYPTION:
 		{
 			LocalDeviceImpl* device = LocateDelegateFromMessage(message);

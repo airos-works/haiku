@@ -49,15 +49,16 @@ namespace {
 static const char* kDeviceName = "Bluetooth LE mouse";
 // How long each reconnection scan waits for a bonded mouse to advertise.
 static const bigtime_t kScanWindow = 15000000;
-// Connection interval for mice, in 1.25 ms units: 7.5 ms, the shortest
-// there is. Mice ask for 7.5-11.25 ms and controllers give them the slow
-// end; a connection event the radio misses (to Wi-Fi, audio, a scan) then
-// shows as a 22.5 ms jump instead of 15 ms, and reports come 89 instead of
-// 133 times a second. "interval <ms>" in ~/config/settings/bluetooth/
-// le_mouse overrides it; 0 leaves the interval to the mouse.
-static const uint16 kDefaultMouseInterval = 6;
+// Connections to mice are created at 7.5-11.25 ms, what they ask for a
+// moment later anyway, instead of the server's 30-50 ms: encryption and the
+// first reports come sooner. The AIC8800 makes it 11.25 ms whatever the
+// range, and keeps a mouse there when asked for 7.5 ms. "interval <ms>" in
+// ~/config/settings/bluetooth/le_mouse asks for that interval, and keeps
+// asking when the mouse changes it, on controllers that allow it.
+static const uint16 kMouseIntervalMin = 6;
+static const uint16 kMouseIntervalMax = 9;
 
-
+// The interval asked for in the settings, 0 for none.
 static uint16
 MouseInterval()
 {
@@ -65,12 +66,12 @@ MouseInterval()
 	if (find_directory(B_USER_SETTINGS_DIRECTORY, -1, false, path,
 			sizeof(path)) != B_OK
 		|| strlcat(path, "/bluetooth/le_mouse", sizeof(path)) >= sizeof(path))
-		return kDefaultMouseInterval;
+		return 0;
 	void* handle = load_driver_settings(path);
 	if (handle == NULL)
-		return kDefaultMouseInterval;
+		return 0;
 	const char* value = get_driver_parameter(handle, "interval", NULL, NULL);
-	uint16 interval = kDefaultMouseInterval;
+	uint16 interval = 0;
 	if (value != NULL) {
 		double milliseconds = strtod(value, NULL);
 		interval = milliseconds <= 0 ? 0
@@ -240,10 +241,11 @@ private:
 		Bluetooth::LEAddressString(mouse.peerAddress, text);
 		Bluetooth::LEEncryptedLink link;
 		const uint16 interval = MouseInterval();
-		if (interval != 0) {
-			// Start where the mouse will be: encryption and the first
-			// reports then take milliseconds, not 50 ms connection events.
+		if (interval != 0)
 			link.SetConnectionParameters(interval, interval, 0, 500);
+		else {
+			link.SetConnectionParameters(kMouseIntervalMin, kMouseIntervalMax,
+				0, 500);
 		}
 		status_t status = link.ConnectBonded(hciID, mouse.localAddress,
 			mouse.peerAddress, mouse.peerAddressType, kScanWindow);

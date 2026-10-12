@@ -32,6 +32,7 @@ static const uint16 kOpcodeSetEventMask
 	= PACK_OPCODE(OGF_CONTROL_BASEBAND, OCF_SET_EVENT_MASK);
 static const uint16 kOpcodeLESetEventMask
 	= PACK_OPCODE(OGF_LE_CONTROL, OCF_LE_SET_EVENT_MASK);
+static const uint16 kOpcodeReadRSSI = PACK_OPCODE(OGF_STATUS_PARAM, 0x0005);
 static const uint16 kOpcodeLESetScanParameters
 	= PACK_OPCODE(OGF_LE_CONTROL, OCF_LE_SET_SCAN_PARAMETERS);
 static const uint16 kOpcodeLESetScanEnable
@@ -628,6 +629,17 @@ LocalDeviceImpl::HandleLECommandComplete(struct hci_event_header* event)
 	const uint8 status = payload[3];
 	BAutolock lock(fLELock);
 
+	if (opcode == kOpcodeReadRSSI) {
+		// Status, handle, RSSI (signed dBm; for BR/EDR, relative to the
+		// controller's golden receive range).
+		if (status == 0 && event->elen >= 7) {
+			LOG(LE_LOG_INFO, "RSSI on handle %#x: %d dBm",
+				payload[4] | (payload[5] << 8), (int8)payload[6]);
+		} else
+			LOG(LE_LOG_INFO, "reading the RSSI failed: %#x", status);
+		return;
+	}
+
 	if (opcode == kOpcodeSetEventMask && fLEMaskState == LE_MASKS_CLASSIC) {
 		if (status != 0)
 			LOG(LE_LOG_ERROR, "Set Event Mask failed: %#x", status);
@@ -933,6 +945,20 @@ LocalDeviceImpl::UpdateLEConnection(uint16 intervalMin, uint16 intervalMax,
 		timeout * 10, handle);
 	return _SendLECommand(PACK_OPCODE(OGF_LE_CONTROL, 0x0013), command,
 		sizeof(command));
+}
+
+
+status_t
+LocalDeviceImpl::ReadRSSI(int32 handle)
+{
+	BAutolock lock(fLELock);
+	if (handle < 0) {
+		if (fLEConnectionState != LE_CONN_CONNECTED)
+			return B_DEV_NOT_READY;
+		handle = fLEConnectionHandle;
+	}
+	const uint8 command[2] = { (uint8)handle, (uint8)(handle >> 8) };
+	return _SendLECommand(kOpcodeReadRSSI, command, sizeof(command));
 }
 
 
