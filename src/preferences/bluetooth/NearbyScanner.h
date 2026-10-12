@@ -56,6 +56,8 @@ public:
 
 			void				Pause();
 			void				Resume();
+			void				HoldInquiry(bigtime_t duration);
+									// no Classic inquiry for this long
 			bool				IsPaused() const { return fPaused; }
 
 			bool				IsSearching() const;
@@ -99,6 +101,7 @@ private:
 			le_state			fLEState;
 			int32				fLEGeneration;
 			bool				fInquiryActive;
+			bigtime_t			fInquiryNotBefore;
 			int32				fInquiryGeneration;
 			int32				fFailures;
 			int32				fStatus;

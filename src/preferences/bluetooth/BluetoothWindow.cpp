@@ -1961,6 +1961,11 @@ void
 BluetoothWindow::_EndOperation()
 {
 	device_key key = fOperationKey;
+	// A Classic device that just connected still has its service query
+	// and, for a keyboard, its HID channels ahead; an inquiry now would
+	// starve them.
+	if (fOperation == OPERATION_CLASSIC_CONNECT)
+		fScanner->HoldInquiry(30000000);
 	fOperation = OPERATION_NONE;
 	fOperationState = OPERATION_IDLE;
 	fOperationStage = -1;
