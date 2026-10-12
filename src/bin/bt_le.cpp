@@ -435,12 +435,13 @@ Services(const uint8 peer[6], uint8 type)
 }
 
 
-/*!	Times a stream of notifications from a test peer (tools/cubie-a7s
-	lepeer.py sends a sequence number and its clock every few milliseconds,
-	more often than any connection interval, so every connection event has
-	something to carry). Arrivals less than half an interval apart came in
-	the same connection event; the gaps between events, in intervals, show
-	the events the link lost. Raw arrivals go to $BT_LE_PROBE_CSV if set.
+/*!	Times a stream of notifications from a test peer (tools/cubie-a7s/
+	lepeer.py, a BlueZ peripheral on a Linux host, sends a sequence number
+	and its clock every few milliseconds, more often than any connection
+	interval, so every connection event has something to carry). Arrivals
+	less than half an interval apart came in the same connection event; the
+	gaps between events, in intervals, show the events the link lost. Raw
+	arrivals go to $BT_LE_PROBE_CSV if set.
 */
 static int
 ProbeNotifications(LEAttributeClient& client, uint16 handle, const char* text,
