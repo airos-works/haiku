@@ -13,6 +13,8 @@
 #include "registers.h"
 #include "twi.h"
 
+#include <sunxi_pmic.h>
+
 
 #define TRACE(x...)	dprintf("powervr: " x)
 
@@ -163,9 +165,13 @@ enable_pll_gpu(volatile uint8* ccu)
 	and Linux's regulator core turns it on at boot; the boot firmware does
 	not. Register 0x10 bit 3 enables it, 0x15[6:0] sets the voltage
 	(0x1e = 0.8 V; axp2101-regulator.c of the BSP).
+
+	Through the sunxi_regulator driver's PMIC module where there is one: it
+	serializes the bus with the CPU voltage scaling (sunxi_thermal). Without
+	it, directly on the controller.
 */
 static status_t
-enable_gpu_supply()
+enable_gpu_supply_direct()
 {
 	sunxi::r_pin_set_function(0, 0, 2);	// PL0, PL1: R_TWI0
 	sunxi::r_pin_set_function(0, 1, 2);
@@ -194,6 +200,34 @@ enable_gpu_supply()
 	if (status == B_OK)
 		status = twi.Read8(0x36, 0x10, enables);
 	TRACE("DCDC4 to 0.8 V: %s, enables now %#x\n", strerror(status), enables);
+	return status;
+}
+
+
+static status_t
+enable_gpu_supply()
+{
+	sunxi_pmic_module_info* pmic;
+	if (get_module(SUNXI_PMIC_MODULE_NAME, (module_info**)&pmic) != B_OK)
+		return enable_gpu_supply_direct();
+
+	uint8 enables, voltage;
+	status_t status = pmic->read(0x10, &enables);
+	if (status == B_OK)
+		status = pmic->read(0x15, &voltage);
+	if (status == B_OK) {
+		TRACE("DCDC4: %s, voltage code %#x\n",
+			(enables & (1u << 3)) != 0 ? "on" : "off", voltage & 0x7f);
+		if ((enables & (1u << 3)) == 0 || (voltage & 0x7f) != 0x1e) {
+			status = pmic->update(0x15, 0x7f, 0x1e);
+			if (status == B_OK)
+				status = pmic->update(0x10, 1u << 3, 1u << 3);
+			snooze(1000);
+			TRACE("DCDC4 to 0.8 V: %s\n", strerror(status));
+		}
+	} else
+		TRACE("PMIC unreadable: %s\n", strerror(status));
+	put_module(SUNXI_PMIC_MODULE_NAME);
 	return status;
 }
 

@@ -1,0 +1,114 @@
+/*
+ * UVD_6_0 Register documentation
+ *
+ * Copyright (C) 2014  Advanced Micro Devices, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included
+ * in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE COPYRIGHT HOLDER(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+ * AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+// Selected UVD6/OSS registers from Linux 6.18.52 AMD register headers.
+#ifndef AMDGPU_UVD_REGISTERS_H
+#define AMDGPU_UVD_REGISTERS_H
+#define SRBM_SOFT_RESET__SOFT_RESET_UVD_MASK 0x40000
+#define UVD_CGC_CTRL__DYN_CLOCK_MODE_MASK 0x1
+#define UVD_LMI_CTRL2__STALL_ARB_UMC_MASK 0x100
+#define UVD_LMI_CTRL__DATA_COHERENCY_EN_MASK 0x2000
+#define UVD_LMI_CTRL__DISABLE_ON_FWV_FAIL_MASK 0x100000
+#define UVD_LMI_CTRL__REQ_MODE_MASK 0x200
+#define UVD_LMI_CTRL__VCPU_DATA_COHERENCY_EN_MASK 0x200000
+#define UVD_LMI_CTRL__WRITE_CLEAN_TIMER_EN_MASK 0x100
+#define UVD_LMI_CTRL__WRITE_CLEAN_TIMER__SHIFT 0x0
+#define UVD_MASTINT_EN__SYS_EN_MASK 0x4
+#define UVD_MASTINT_EN__VCPU_EN_MASK 0x2
+#define UVD_POWER_STATUS__UVD_PG_EN_MASK 0x100
+#define UVD_POWER_STATUS__UVD_PG_MODE_MASK 0x4
+#define UVD_RBC_RB_CNTL__RB_BLKSZ__SHIFT 0x8
+#define UVD_RBC_RB_CNTL__RB_BUFSZ__SHIFT 0x0
+#define UVD_RBC_RB_CNTL__RB_NO_FETCH_MASK 0x10000
+#define UVD_RBC_RB_CNTL__RB_NO_UPDATE_MASK 0x1000000
+#define UVD_RBC_RB_CNTL__RB_RPTR_WR_EN_MASK 0x10000000
+#define UVD_SOFT_RESET__CSM_SOFT_RESET_MASK 0x20
+#define UVD_SOFT_RESET__CXW_SOFT_RESET_MASK 0x40
+#define UVD_SOFT_RESET__LBSI_SOFT_RESET_MASK 0x2
+#define UVD_SOFT_RESET__LMI_SOFT_RESET_MASK 0x4
+#define UVD_SOFT_RESET__LMI_UMC_SOFT_RESET_MASK 0x2000
+#define UVD_SOFT_RESET__RBC_SOFT_RESET_MASK 0x1
+#define UVD_SOFT_RESET__TAP_SOFT_RESET_MASK 0x80
+#define UVD_SOFT_RESET__VCPU_SOFT_RESET_MASK 0x8
+#define UVD_STATUS__VCPU_REPORT__SHIFT 0x1
+#define UVD_SUVD_CGC_GATE__SCM_H264_MASK 0x200
+#define UVD_SUVD_CGC_GATE__SCM_HEVC_MASK 0x400
+#define UVD_SUVD_CGC_GATE__SCM_MASK 0x8
+#define UVD_SUVD_CGC_GATE__SDB_H264_MASK 0x800
+#define UVD_SUVD_CGC_GATE__SDB_HEVC_MASK 0x1000
+#define UVD_SUVD_CGC_GATE__SDB_MASK 0x10
+#define UVD_SUVD_CGC_GATE__SIT_H264_MASK 0x80
+#define UVD_SUVD_CGC_GATE__SIT_HEVC_MASK 0x100
+#define UVD_SUVD_CGC_GATE__SIT_MASK 0x2
+#define UVD_SUVD_CGC_GATE__SMP_MASK 0x4
+#define UVD_SUVD_CGC_GATE__SRE_H264_MASK 0x20
+#define UVD_SUVD_CGC_GATE__SRE_HEVC_MASK 0x40
+#define UVD_SUVD_CGC_GATE__SRE_MASK 0x1
+#define UVD_VCPU_CNTL__CLK_EN_MASK 0x200
+#define mmSRBM_SOFT_RESET 0x398
+#define mmUVD_CGC_CTRL 0x3d2c
+#define mmUVD_CGC_GATE 0x3d2a
+#define mmUVD_CONTEXT_ID 0x3dbd
+#define mmUVD_ENGINE_CNTL 0x3bc6
+#define mmUVD_GPCOM_VCPU_CMD 0x3bc3
+#define mmUVD_GPCOM_VCPU_DATA0 0x3bc4
+#define mmUVD_GPCOM_VCPU_DATA1 0x3bc5
+#define mmUVD_GP_SCRATCH4 0x3d38
+#define mmUVD_LMI_CTRL 0x3d66
+#define mmUVD_LMI_CTRL2 0x3d3d
+#define mmUVD_LMI_RBC_IB_64BIT_BAR_HIGH 0x3c66
+#define mmUVD_LMI_RBC_IB_64BIT_BAR_LOW 0x3c67
+#define mmUVD_LMI_RBC_IB_VMID 0x3da1
+#define mmUVD_LMI_RBC_RB_64BIT_BAR_HIGH 0x3c68
+#define mmUVD_LMI_RBC_RB_64BIT_BAR_LOW 0x3c69
+#define mmUVD_LMI_SWAP_CNTL 0x3d6d
+#define mmUVD_LMI_VCPU_CACHE_64BIT_BAR_HIGH 0x3c5e
+#define mmUVD_LMI_VCPU_CACHE_64BIT_BAR_LOW 0x3c5f
+#define mmUVD_MASTINT_EN 0x3d40
+#define mmUVD_MPC_SET_ALU 0x3d7e
+#define mmUVD_MPC_SET_MUX 0x3d7d
+#define mmUVD_MPC_SET_MUXA0 0x3d79
+#define mmUVD_MPC_SET_MUXA1 0x3d7a
+#define mmUVD_MPC_SET_MUXB0 0x3d7b
+#define mmUVD_MPC_SET_MUXB1 0x3d7c
+#define mmUVD_MP_SWAP_CNTL 0x3d6f
+#define mmUVD_POWER_STATUS 0x38c4
+#define mmUVD_RBC_IB_SIZE 0x3da2
+#define mmUVD_RBC_RB_CNTL 0x3da9
+#define mmUVD_RBC_RB_RPTR 0x3da4
+#define mmUVD_RBC_RB_RPTR_ADDR 0x3daa
+#define mmUVD_RBC_RB_WPTR 0x3da5
+#define mmUVD_RBC_RB_WPTR_CNTL 0x3da6
+#define mmUVD_SOFT_RESET 0x3da0
+#define mmUVD_STATUS 0x3daf
+#define mmUVD_SUVD_CGC_GATE 0x3be4
+#define mmUVD_UDEC_ADDR_CONFIG 0x3bd3
+#define mmUVD_UDEC_DBW_ADDR_CONFIG 0x3bd5
+#define mmUVD_UDEC_DB_ADDR_CONFIG 0x3bd4
+#define mmUVD_VCPU_CACHE_OFFSET0 0x3d82
+#define mmUVD_VCPU_CACHE_OFFSET1 0x3d84
+#define mmUVD_VCPU_CACHE_OFFSET2 0x3d86
+#define mmUVD_VCPU_CACHE_SIZE0 0x3d83
+#define mmUVD_VCPU_CACHE_SIZE1 0x3d85
+#define mmUVD_VCPU_CACHE_SIZE2 0x3d87
+#define mmUVD_VCPU_CNTL 0x3d98
+#endif

@@ -2,3 +2,7 @@
 # keeps it out of the boot (touching its file in non-packaged/add-ons/
 # kernel/drivers/bin brings it in after the first minute).
 debug true
+# "watch true": every 5 s the processors' load, the busiest threads, free
+# memory, the USB transport's counters and what the driver's threads wait
+# for, on the serial port (for stalls and overloads)
+#watch true

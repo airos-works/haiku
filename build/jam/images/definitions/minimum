@@ -364,6 +364,7 @@ SYSTEM_ADD_ONS_DRIVERS_POWER = [ FFilterByBuildFeatures
 		pch_thermal
 	}@ # x86,x86_64
 	sunxi_regulator@arm64
+	sunxi_thermal@arm64
 ] ;
 
 SYSTEM_ADD_ONS_DRIVERS_SENSOR = [ FFilterByBuildFeatures

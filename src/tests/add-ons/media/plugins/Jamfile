@@ -1,3 +1,8 @@
 SubDir HAIKU_TOP src tests add-ons media plugins ;
 
 SubInclude HAIKU_TOP src tests add-ons media plugins musepack ;
+SubInclude HAIKU_TOP src tests add-ons media plugins nvdec ;
+
+if $(TARGET_ARCH) = x86_64 {
+	SubInclude HAIKU_TOP src tests add-ons media plugins amduvd ;
+}

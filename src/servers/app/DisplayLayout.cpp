@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include <algorithm>
+#include <functional>
 
 #include <edid.h>
 
@@ -878,25 +879,42 @@ DisplayLayout::Region() const
 }
 
 
-/*!	Everything is drawn at the density of the least scaled display: that
-	display then maps one to one, which keeps its text and edges crisp, and
-	the others are enlarged by the hardware. Displays that share a scale are
-	all crisp. (Drawing at more than a display needs would mean shrinking,
-	which the display engine refuses.)
+/*!	The density everything is drawn at, unless one was set: the largest
+	display scale. Every display then gets at least as many pixels as it
+	shows - the most scaled ones one to one, the others shrunk by the display
+	engine - so that 4K monitors at 200 percent stay crisp beside a 1080p one
+	at 100. Not every engine can shrink every region; the Desktop tries
+	RenderScales() in turn and keeps the first one the hardware takes.
 */
 uint16
 DisplayLayout::RenderScale() const
 {
 	if (fRenderScaleOverride != 0)
 		return fRenderScaleOverride;
-	uint16 smallest = 0;
+	std::vector<uint16> scales;
+	RenderScales(scales);
+	return scales[0];
+}
+
+
+/*!	The densities to draw at, best first: the scale of every enabled
+	display, from the largest down. At the smallest, displays are only ever
+	enlarged, which every display engine with a scaler can do.
+*/
+void
+DisplayLayout::RenderScales(std::vector<uint16>& scales) const
+{
+	scales.clear();
 	for (size_t i = 0; i < fDisplays.size(); i++) {
 		if (!fDisplays[i].IsEnabled())
 			continue;
-		if (smallest == 0 || fDisplays[i].scale < smallest)
-			smallest = fDisplays[i].scale;
+		if (std::find(scales.begin(), scales.end(), fDisplays[i].scale)
+				== scales.end())
+			scales.push_back(fDisplays[i].scale);
 	}
-	return smallest == 0 ? 100 : smallest;
+	std::sort(scales.begin(), scales.end(), std::greater<uint16>());
+	if (scales.empty())
+		scales.push_back(100);
 }
 
 

@@ -104,7 +104,8 @@ public:
 	DrawTransaction(DrawingEngine *engine, const BRect &bounds)
 		:
 		fEngine(engine),
-		fOverlaysHidden(false)
+		fOverlaysHidden(false),
+		fWaitForRetrace(false)
 	{
 		fDirty.Set(bounds);
 		fDirty.IntersectWith(fEngine->fPainter->ClippingRegion());
@@ -117,7 +118,8 @@ public:
 	DrawTransaction(DrawingEngine *engine)
 		:
 		fEngine(engine),
-		fOverlaysHidden(false)
+		fOverlaysHidden(false),
+		fWaitForRetrace(false)
 	{
 		fDirty = *fEngine->fPainter->ClippingRegion();
 		if (fDirty.CountRects() == 0)
@@ -129,7 +131,8 @@ public:
 	DrawTransaction(DrawingEngine *engine, const BRegion &region)
 		:
 		fEngine(engine),
-		fOverlaysHidden(false)
+		fOverlaysHidden(false),
+		fWaitForRetrace(false)
 	{
 		// region is already clipped
 		fDirty = region;
@@ -141,10 +144,21 @@ public:
 
 	~DrawTransaction()
 	{
-		if (fEngine->fCopyToFront)
+		if (fEngine->fCopyToFront) {
+			if (fWaitForRetrace && IsDirty())
+				fEngine->fGraphicsCard->WaitForRetraceBeforeCopy();
 			fEngine->fGraphicsCard->InvalidateRegion(fDirty);
+		} else if (fWaitForRetrace)
+			fEngine->fRetraceRequested = true;
 		if (fOverlaysHidden)
 			fEngine->fGraphicsCard->ShowFloatingOverlays();
+	}
+
+	// The drawing goes to the screen at the next vertical blank: now, when
+	// the drawing is copied there, or else when the update it is part of is.
+	void SetWaitForRetrace()
+	{
+		fWaitForRetrace = true;
 	}
 
 	bool IsDirty() const
@@ -171,6 +185,7 @@ public:
 private:
 	DrawingEngine *fEngine;
 	bool fOverlaysHidden;
+	bool fWaitForRetrace;
 	BRegion fDirty;
 };
 
@@ -182,7 +197,8 @@ DrawingEngine::DrawingEngine(HWInterface* interface)
 	:
 	fPainter(new Painter()),
 	fGraphicsCard(NULL),
-	fCopyToFront(true)
+	fCopyToFront(true),
+	fRetraceRequested(false)
 {
 	SetHWInterface(interface);
 }
@@ -290,6 +306,13 @@ DrawingEngine::SetCopyToFrontEnabled(bool enable)
 void
 DrawingEngine::CopyToFront(/*const*/ BRegion& region)
 {
+	// drawing in the region asked for B_WAIT_FOR_RETRACE
+	if (fRetraceRequested) {
+		fRetraceRequested = false;
+		if (region.CountRects() > 0)
+			fGraphicsCard->WaitForRetraceBeforeCopy();
+	}
+
 	if (fPainter->DeviceScale() != 1) {
 		BRegion scaled;
 		_ScaleRegion(region, scaled);
@@ -689,9 +712,22 @@ DrawingEngine::DrawBitmap(ServerBitmap* bitmap, const BRect& bitmapRect,
 {
 	ASSERT_PARALLEL_LOCKED();
 
-	DrawTransaction transaction(this, fPainter->TransformAndClipRect(viewRect));
-	if (transaction.IsDirty())
-		fPainter->DrawBitmap(bitmap, bitmapRect, viewRect, options);
+	BRect clipped = fPainter->TransformAndClipRect(viewRect);
+	bool waitForRetrace = (options & B_WAIT_FOR_RETRACE) != 0;
+	if (waitForRetrace && !fGraphicsCard->IsDoubleBuffered()
+		&& clipped.IsValid()) {
+		// drawn straight into the screen: the blank comes first
+		fGraphicsCard->WaitForRetraceBeforeCopy();
+		waitForRetrace = false;
+	}
+
+	DrawTransaction transaction(this, clipped);
+	if (!transaction.IsDirty())
+		return;
+
+	fPainter->DrawBitmap(bitmap, bitmapRect, viewRect, options);
+	if (waitForRetrace)
+		transaction.SetWaitForRetrace();
 }
 
 

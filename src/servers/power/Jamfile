@@ -9,6 +9,7 @@ Application power_daemon :
 	lid_monitor.cpp
 	power_daemon.cpp
 	power_button_monitor.cpp
+	thermal_trip_monitor.cpp
 	;
 
 LinkAgainst power_daemon : be [ TargetLibstdc++ TargetLibsupc++ ] ;

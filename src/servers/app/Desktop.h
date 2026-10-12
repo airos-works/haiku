@@ -333,6 +333,8 @@ private:
 			void				_ScreenChanged(Screen* screen);
 			status_t			_ConfigureDisplayLayout(
 									::HWInterface* interface, bool switchMode);
+			status_t			_SetDisplayLayout(::HWInterface* interface,
+									DisplayLayout& layout, bool switchMode);
 			void				_UpdateDisplays();
 			void				_StoreDisplayLayout();
 			void				_RememberScreenMode(Screen* screen);

@@ -2716,10 +2716,8 @@ ServerWindow::_DispatchViewDrawingMessage(int32 code,
 
 				fCurrentView->PenToScreenTransform().Apply(&info.viewRect);
 
-// TODO: Unbreak...
-//				if ((info.options & B_WAIT_FOR_RETRACE) != 0)
-//					fDesktop->HWInterface()->WaitForRetrace(20000);
-
+				// B_WAIT_FOR_RETRACE: the drawing engine copies the bitmap
+				// to the screen at the next vertical blank
 				drawingEngine->DrawBitmap(bitmap, info.bitmapRect,
 					info.viewRect, info.options);
 			}

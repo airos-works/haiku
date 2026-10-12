@@ -1,0 +1,583 @@
+/*
+ * Copyright 2026, air/OS. All rights reserved.
+ * Distributed under the terms of the MIT License.
+ */
+#ifndef AMDGPU_HAIKU_H
+#define AMDGPU_HAIKU_H
+
+#include <Drivers.h>
+#include <amdgpu_video.h>
+#include <amdgpu_hevc.h>
+
+// Native bring-up interface. This is not the Linux DRM ABI. Keep it separate
+// from the eventual Mesa command-submission interface.
+#define AMDGPU_HAIKU_ABI_VERSION 1
+#define AMDGPU_DEVICE_NAME "dri/amdgpu/0"
+
+enum {
+	AMDGPU_GET_INFO = B_DEVICE_OP_CODES_END + 1,
+	AMDGPU_READ_ROM,
+	AMDGPU_SDMA_TEST,
+	AMDGPU_SMC_BOOTSTRAP,
+	AMDGPU_START_DMA,
+	AMDGPU_CREATE_BUFFER,
+	AMDGPU_MAP_BUFFER,
+	AMDGPU_FREE_BUFFER,
+	AMDGPU_SUBMIT_DMA,
+	AMDGPU_WAIT_FENCE,
+	AMDGPU_MEMORY_INFO,
+	AMDGPU_CREATE_SYSTEM_BUFFER,
+	AMDGPU_GART_INFO,
+	AMDGPU_GFX_TEST,
+	AMDGPU_UVD_TEST,
+	AMDGPU_VIDEO_CREATE,
+	AMDGPU_VIDEO_DECODE,
+	AMDGPU_VIDEO_DESTROY,
+	AMDGPU_HEVC_CREATE,
+	AMDGPU_HEVC_DECODE,
+	AMDGPU_CREATE_DEVICE_BUFFER,
+	AMDGPU_DISPLAY_SNAPSHOT,
+	AMDGPU_GFX_MEC_TEST,
+	AMDGPU_VM_INFO,
+	AMDGPU_VM_MAP,
+	AMDGPU_VM_UNMAP,
+	AMDGPU_VM_TEST,
+	AMDGPU_GFX_SUBMIT,
+	AMDGPU_IRQ_INFO,
+	AMDGPU_RENDER_INFO,
+	AMDGPU_GFX_SUBMIT_COPY,
+	AMDGPU_GFX_QUEUE_COPY,
+	AMDGPU_SHADER_MEMORY_INFO,
+	AMDGPU_DIAGNOSTIC_RAM_PAGE,
+	AMDGPU_CREATE_DIAGNOSTIC_RAM_BUFFER,
+	AMDGPU_GFX_GDS_PROBE_COPY,
+	AMDGPU_GWS_INFO,
+	AMDGPU_OA_INFO,
+	AMDGPU_RECOVERY_INFO,
+	AMDGPU_GFX_RECOVER,
+	AMDGPU_GFX_RECOVER_LIVE,
+	AMDGPU_CLIENT_STATUS,
+	AMDGPU_RECOVERY_POLICY,
+	AMDGPU_UVD_TIMEOUT_TEST,
+	AMDGPU_SDMA_TIMEOUT_TEST,
+	AMDGPU_VIDEO_SDMA_TIMEOUT_TEST
+};
+
+// Root-only recovery bring-up. INFO only observes retained bookkeeping.
+// RECOVER requires a terminal GFX/UVD/SDMA fault and no live GPU resources or
+// work. It never retries a failed hardware reset. flags/reserved must be zero.
+// RECOVER_LIVE permits lost clients to retain BOs, VMs and video storage. It
+// never revives a client or recycles live backing. A UVD reset invalidates all
+// old firmware sessions. Executing work excludes reset.
+// stage 7 means success; 8..10 cover UVD reset/reload/proof, 11..12 SDMA.
+struct amdgpu_recovery_info {
+	uint32 version, size, flags, reserved;
+	int32 status;
+	uint32 stage;
+	uint64 generation;
+	uint32 grbm_reset, srbm_reset;
+	uint32 before[4], after[4]; // GRBM, GRBM2, SRBM, combined VM fault status
+	uint64 quarantined_vram, quarantined_ram, reclaimed_vram, reclaimed_ram;
+	uint32 buffers, vms, videos, live_handles, live_vms, live_videos, pending, reserved_out;
+};
+
+// Ordinary, owning O_RDWR client query; no GPU work or memory addresses.
+// Input flags/reserved must be zero. The first device fault permanently loses
+// every open client, including clients with no failed asynchronous fence.
+// RESET_COMPLETED means a successful device recovery followed that loss;
+// it does not make the old client usable. Fresh work needs a fresh open file.
+enum {
+	AMDGPU_CLIENT_LOST = 1,
+	AMDGPU_CLIENT_RESET_COMPLETED = 2
+};
+struct amdgpu_client_status {
+	uint32 version, size, flags, reserved;
+	int32 status, device_status;
+	uint64 generation, loss_generation;
+	uint64 submitted, completed, failed_fence;
+};
+
+// Root-only automatic engine recovery policy/query. Enabled by default. A first
+// terminal fault schedules one worker attempt after execution/queues drain;
+// a failed attempt never retries. flags=0 observes; SET_POLICY accepts enabled=0/1 only
+// on a healthy idle device and cannot rearm an existing fault. All reserved
+// input must be zero. Counters describe automatic attempts, not manual resets.
+#define AMDGPU_RECOVERY_SET_POLICY 1u
+struct amdgpu_recovery_policy {
+	uint32 version, size, flags, reserved;
+	uint32 enabled, pending;
+	int32 status;
+	uint32 reserved_out;
+	uint64 attempts, successes;
+};
+
+// Root-only, idle, initialized UVD qualification. Disable ring fetch, submit a
+// harmless private register/fence IB, and take the normal bounded timeout path.
+// No caller addresses or commands. flags/reserved must be zero; status and the
+// captured ring/fence state describe the fault before any automatic recovery.
+struct amdgpu_uvd_timeout_test {
+	uint32 version, size, flags, reserved;
+	int32 status;
+	uint32 sequence, fence, rptr, wptr, uvd_status;
+	uint64 elapsed_us;
+};
+
+// Root-only idle SDMA0 qualification. A private memory poll first succeeds,
+// then waits for a value that will not arrive, taking the normal DMA timeout.
+// No caller addresses/commands; flags/reserved must be zero. Output captures
+// the failed private job before automatic recovery can run.
+struct amdgpu_sdma_timeout_test {
+	uint32 version, size, flags, reserved;
+	int32 status;
+	uint32 sequence, fence, rptr, wptr, engine_status;
+	uint64 elapsed_us;
+};
+
+// Root-only, one-shot fault qualification on this file's decoder. Arm while
+// idle; the next valid decode substitutes the private SDMA memory-poll timeout
+// at the selected transfer boundary. Destroying the session discards the arm.
+// No caller GPU address/command is accepted. The request must be writable.
+enum {
+	AMDGPU_VIDEO_SDMA_CLEAR = 1,
+	AMDGPU_VIDEO_SDMA_READBACK = 2
+};
+struct amdgpu_video_sdma_timeout_test {
+	uint32 version, size;
+	uint64 handle;
+	uint32 stage, reserved;
+};
+
+// One GPU virtual address space per open client. Mappings retain their BO
+// until explicitly unmapped or the client closes; only that client's handles
+// may be mapped. UNMAP requires the exact address/size of a prior MAP and
+// zero handle, buffer_offset and permissions. No physical address is exposed.
+enum {
+	AMDGPU_VM_READ = 1,
+	AMDGPU_VM_WRITE = 2,
+	AMDGPU_VM_EXECUTE = 4
+};
+struct amdgpu_vm_info {
+	uint32 version, size;
+	uint64 address_start, address_end; // exclusive upper bound
+	uint64 mapped_bytes;
+	uint32 mapping_count, page_size;
+	uint32 reserved[2];
+};
+struct amdgpu_vm_mapping {
+	uint32 version, size;
+	uint64 handle, buffer_offset, address, bytes;
+	uint32 permissions, reserved;
+};
+// Bounded GPU execution for validating these mappings: a kernel-owned shader
+// writes 1024 DWORDs at address, value XOR (index * 0x10204081). This is not
+// the general command-submission interface; no user program or PM4 is accepted.
+struct amdgpu_vm_test {
+	uint32 version, size;
+	uint64 address;
+	uint32 value, reserved;
+	uint64 completion;
+	uint32 vm_fault_status[2], rptr, wptr;
+	int32 status;
+	uint32 reserved_out;
+};
+
+// Root-only user-command bring-up. The IB must lie entirely within an owned
+// READ|EXECUTE mapping. The caller supplies complete PM4 state and shaders;
+// command validation and recovery are not yet qualified for untrusted users.
+// One synchronous IB, 256-byte address alignment, 256-DWORD length alignment,
+// at most 64 KiB. flags/reserved must be zero. All mappings stay retained until
+// retirement and VMID detach. completion is an observation, not a wait handle.
+struct amdgpu_gfx_submit {
+	uint32 version, size;
+	uint64 address;
+	uint32 dwords, flags;
+	uint64 completion, elapsed_us;
+	uint32 vm_fault_status[2], rptr, wptr;
+	int32 status;
+	uint32 reserved;
+};
+
+// GFX_SUBMIT_COPY uses the same request, but address is a userspace pointer
+// instead of a GPU VA. The kernel copies exactly dwords * 4 bytes once into
+// this client's private READ|EXECUTE-only storage before execution. CPU
+// alignment is unrestricted; length limits and zero reserved are the same
+// as GFX_SUBMIT. The unused tail is zeroed on every copy, including a
+// failed user copy. This snapshots only the outer IB, not nested IBs/shaders;
+// raw command privilege/recovery qualification still requires root.
+// VM_INFO/RENDER_INFO report the usable VA interval; lower addresses are
+// reserved for the client's private commands and the public diagnostic shader.
+#define AMDGPU_COPY_IB_ADDRESS 0x10000ULL
+
+// Opt-in initial GFX8 command policy, only for GFX_SUBMIT_COPY. Still root-only:
+// rejects unsupported packets/control paths and direct privileged state before
+// execution. It does not establish arbitrary shader/resource isolation or
+// recovery. Failed validation clears the private copy and returns B_NOT_ALLOWED
+// without starting/submitting graphics. Zero flags retain the raw lab interface.
+#define AMDGPU_GFX_VALIDATE_COMMANDS 1u
+
+// Root-only GDS qualification, using amdgpu_gfx_submit with a privately copied,
+// always-validated outer IB. flags is exactly one of the modes below, not the
+// ordinary submission flags. Fixed byte ranges only; no caller-selected MMIO.
+// The driver owns GDS and ordinary clients have zero allocation. The probe
+// temporarily leases a window to VMID2 for one synchronous job, then revokes
+// it on healthy retirement. GWS-only modes leave GDS/OA disabled. These contents
+// are shared across probe jobs, not a per-client storage API. Faults retain
+// the usual terminal quarantine and require recovery before another probe.
+enum {
+	AMDGPU_GDS_PROBE_FULL = 0, // base 0, size 4096; initialize/check owned guards
+	AMDGPU_GDS_PROBE_SLICE = 1, // base 1024, size 256
+	AMDGPU_GDS_PROBE_NONE = 2, // base 0, size 0; ordinary client policy
+	AMDGPU_GDS_PROBE_GWS_FULL = 3, // GWS base 0, count 16; GDS/OA disabled
+	AMDGPU_GDS_PROBE_GWS_SLICE = 4, // GWS base 8, count 2; GDS/OA disabled
+	// OA modes reset this ring's ME/GDS wave IDs using the inherited
+	// GDS_COMPUTE_MAX_WAVE_ID, via a trusted same-value PM4 prefix.
+	AMDGPU_GDS_PROBE_OA_RESET = 5, // reset only; GDS/GWS/OA disabled
+	AMDGPU_GDS_PROBE_OA_FULL = 6, // GDS 0/4096; OA mask 0xffff
+	AMDGPU_GDS_PROBE_OA_SLICE = 7, // GDS 0/4096; OA resource mask 0x30
+	AMDGPU_GDS_PROBE_OA_NONE = 8, // GDS 0/4096; OA mask 0
+	AMDGPU_GDS_PROBE_OA_NOGDS = 9, // GDS disabled; OA mask 0xffff
+	AMDGPU_GDS_PROBE_LAST = AMDGPU_GDS_PROBE_OA_NOGDS
+};
+
+// Root-only bounded observation of all 64 driver-owned GWS resources. Requires
+// an initialized, healthy idle graphics engine. No resource values are written;
+// the fixed GDS_GWS_RESOURCE_CNTL index selector is restored after readback.
+// flags/reserved must be zero. gws_vmid2 reports the current allocation.
+struct amdgpu_gws_info {
+	uint32 version, size, flags, reserved;
+	uint32 selector_before, selector_after, gws_vmid2, resource_count;
+	uint32 resources[64];
+};
+
+// Root-only idle observation. Reads the 16 owned OA counters, addresses and
+// ring sizes; restores the fixed index selector. Does not write OA state or
+// reset wave counters. flags/reserved must be zero.
+struct amdgpu_oa_info {
+	uint32 version, size, flags, reserved;
+	uint32 selector_before, selector_after, oa_vmid0, oa_vmid2;
+	uint32 gds_base, gds_size, max_wave_id, resource_count;
+	uint32 counters[16], addresses[16], ring_sizes[16];
+};
+
+// Root-only asynchronous copied submission. Captures/optionally validates the
+// complete outer IB before returning. Queued jobs retain the client VM and all
+// bindings; VM operations return B_BUSY until this file's graphics jobs retire.
+// Commands cannot be changed by replacing the userspace source after enqueue.
+// Shaders/resources are still caller-controlled, with the same root restriction
+// as GFX_SUBMIT_COPY. flags accepts AMDGPU_GFX_VALIDATE_COMMANDS, reserved is zero.
+// At most 64 queued jobs per file and 256 per device (shared with DMA).
+// fence uses the same ordered file-local sequence and WAIT_FENCE as SUBMIT_DMA.
+// A successful enqueue is not GPU completion. Closing retains pending work;
+// terminal GPU errors fail outstanding fences and quarantine device storage.
+// A file with a failed fence remains lost after device recovery. Old waits and
+// resource cleanup stay valid; new allocations, VMs and work require reopening.
+struct amdgpu_gfx_queue {
+	uint32 version, size;
+	uint64 address;
+	uint32 dwords, flags;
+	uint64 fence;
+	uint32 reserved[2];
+};
+
+// Read-only observation after client engine startup; this does not initialize
+// graphics or alter interrupt routing. reserved must be zero. No DMA address
+// or writable ring mapping is exposed. Counts cover the current interrupt
+// epoch; successful recovery rearms IH and advances RECOVERY_INFO.generation.
+struct amdgpu_irq_info {
+	uint32 version, size;
+	uint32 enabled, msi, vector, ring_bytes;
+	uint64 interrupts, vectors, eop_events, completed_fences, vm_faults, privileged_faults;
+	uint64 unknown, overflows, waits;
+	uint32 rptr, wptr, last[4];
+	uint32 first_eop[2][4];
+	int32 status;
+	uint32 reserved;
+};
+
+// Starts the installed graphics engine, then returns a bounded snapshot for
+// the native Mesa backend. flags/reserved must be zero. No caller-selected
+// register access is accepted. Bank/SMC selectors are restored after reads;
+// timestamp capture is serialized with submissions. Clock defaults are ROM
+// boot defaults, not measured clocks or DPM maxima. All sizes are bytes.
+enum {
+	AMDGPU_RENDER_ROOT_SUBMIT = 1,
+	AMDGPU_RENDER_SYNC_SUBMIT = 2,
+	AMDGPU_RENDER_COPY_SUBMIT = 4,
+	AMDGPU_RENDER_CHECKED_COPY = 8,
+	AMDGPU_RENDER_QUEUE_COPY = 16
+};
+struct amdgpu_render_info {
+	uint32 version, size, flags, reserved;
+	uint32 capabilities, gfx_major, gfx_minor, chip_revision;
+	uint32 shader_engines, shader_arrays_per_engine, cu_per_array, backends_per_engine;
+	uint32 tile_pipes, tcc_blocks, active_cus, enabled_backends;
+	uint32 cu_mask[4][2], cu_disable[4][2], cu_user_disable[4][2];
+	uint32 rb_disable[4][2], rb_user_disable[4][2];
+	uint32 raster_config[4][2], raster_config_1[4][2];
+	uint32 gb_addr_config, tile_mode[32], macrotile_mode[16];
+	uint32 mc_arb_ramcfg, mc_shared_chmap, mc_seq_misc0;
+	uint32 vram_bus_width, vram_type; // MC_SEQ_MISC0 MT encoding, not DRM's enum
+	uint32 default_engine_khz, default_memory_khz, reference_khz, timestamp_khz;
+	uint32 firmware_version[5], firmware_feature[5]; // CE, PFP, ME, RLC, MEC
+	uint32 grbm_index_before, grbm_index_after;
+	uint64 gpu_timestamp, started_us, finished_us;
+	uint64 total_vram, visible_vram, total_gart, address_start, address_end;
+	uint64 max_buffer_bytes, max_mapping_bytes, max_mapped_bytes;
+	uint32 max_mappings, max_vm_clients, page_size, max_ib_bytes;
+	uint32 ib_address_alignment, ib_size_alignment, max_buffers, reserved_out;
+};
+
+// Root-only, bounded diagnostic for the leased graphics VMID2. Requires an
+// already started engine and idle queues. No caller-selected register access
+// or translation changes; the SRBM bank selector is restored after reading.
+// Raw ATC configuration is evidence, not a claim that ATC accesses are safe.
+struct amdgpu_shader_memory_info {
+	uint32 version, size, flags, reserved;
+	uint32 vmid, selector_before, selector_after, reserved_out;
+	uint32 sh_mem_config, sh_mem_bases, sh_mem_ape1_base, sh_mem_ape1_limit;
+	uint32 gds_base, gds_size, gws, oa;
+	uint32 atc_ats_control, atc_ats_debug, atc_vmid_pasid, atc_l1_address_offset;
+	uint32 atc_aperture[2][4]; // low, high, access mode, VMID mask
+};
+
+// Root-only lab diagnostic: physical backing of one aligned, wired RAM page
+// in this file's live buffer handle. No foreign handles, VRAM or arbitrary
+// kernel addresses. The caller must keep the handle/mapping alive throughout
+// its experiment; ordinary allocation/VM APIs never expose physical addresses.
+// This permits translation probes with owned targets on both possible paths.
+struct amdgpu_diagnostic_ram_page {
+	uint32 version, size;
+	uint64 handle, offset, physical_address;
+	uint32 flags, reserved;
+};
+// CREATE_DIAGNOSTIC_RAM_BUFFER uses amdgpu_buffer, requires root and an
+// initialized device, and accepts exactly 8192 bytes with reserved=0. Its
+// wired backing is restricted to [4 GiB,64 GiB), outside VMID0's GART/PCI
+// apertures for the qualified board. Normal buffer lifetime/zeroing applies.
+
+// Read-only DCE 11.2 observation, available without starting any GPU engine.
+// Register reads are sequential, not an atomic modeset or vblank snapshot.
+// No MMIO address, display ownership or modesetting capability is exposed.
+enum {
+	AMDGPU_DCE_CRTC_CONTROL, AMDGPU_DCE_CRTC_STATUS,
+	AMDGPU_DCE_POSITION, AMDGPU_DCE_FRAME_COUNT,
+	AMDGPU_DCE_H_TOTAL, AMDGPU_DCE_H_BLANK, AMDGPU_DCE_H_SYNC,
+	AMDGPU_DCE_V_TOTAL, AMDGPU_DCE_V_BLANK, AMDGPU_DCE_V_SYNC,
+	AMDGPU_DCE_GRPH_ENABLE, AMDGPU_DCE_GRPH_CONTROL, AMDGPU_DCE_PITCH,
+	AMDGPU_DCE_PRIMARY_LOW, AMDGPU_DCE_PRIMARY_HIGH,
+	AMDGPU_DCE_SECONDARY_LOW, AMDGPU_DCE_SECONDARY_HIGH,
+	AMDGPU_DCE_VIEWPORT_START, AMDGPU_DCE_VIEWPORT_SIZE,
+	AMDGPU_DCE_CURSOR_CONTROL, AMDGPU_DCE_CURSOR_LOW,
+	AMDGPU_DCE_CURSOR_HIGH, AMDGPU_DCE_CURSOR_SIZE,
+	AMDGPU_DCE_CURSOR_POSITION, AMDGPU_DCE_CURSOR_HOTSPOT,
+	AMDGPU_DCE_REGISTER_COUNT
+};
+#define AMDGPU_DCE_HEAD_COUNT 6
+struct amdgpu_display_head {
+	uint32 register_base; // dword index for identifying this head
+	uint32 registers[AMDGPU_DCE_REGISTER_COUNT];
+};
+struct amdgpu_display_snapshot {
+	uint32 version, size;
+	uint32 head_count, reserved; // reserved must be zero
+	int64 started_us, finished_us; // kernel monotonic time around the reads
+	amdgpu_display_head heads[AMDGPU_DCE_HEAD_COUNT];
+	uint32 hpd_status[AMDGPU_DCE_HEAD_COUNT]; // HPD0..5; no connector mapping implied
+};
+
+#define AMDGPU_ROM_SIZE (256 * 1024)
+struct amdgpu_rom {
+	uint32 version;
+	uint32 size;
+	uint64 data; // userspace destination, AMDGPU_ROM_SIZE bytes
+	uint32 capacity;
+	uint32 reserved;
+};
+
+// Root-only bring-up operation. The kernel builds all packets and addresses;
+// userspace supplies only the firmware image, never a GPU program or address.
+struct amdgpu_sdma_test_result {
+	uint32 version;
+	uint32 size;
+	uint64 firmware;
+	uint32 firmware_size;
+	uint32 reserved;
+	int32 status;
+	uint32 stage; // 1: validated, 2: VRAM mapped, 3: firmware, 4: submitted, 5: done
+	uint64 scratch_gpu;
+	uint32 firmware_version;
+	uint32 checked_bytes;
+	uint32 mismatches;
+	uint32 fence;
+	uint32 rptr;
+	uint32 wptr;
+	uint32 engine_status;
+	uint32 halted;
+	uint64 elapsed_us;
+};
+
+// Protected-mode SMU startup for the measured Polaris 10 hard-key board.
+// This starts signed controller firmware; it does not enable DPM or engines.
+struct amdgpu_smc_bootstrap {
+	uint32 version;
+	uint32 size;
+	uint64 firmware;
+	uint32 firmware_size;
+	uint32 reserved;
+	int32 status;
+	uint32 stage;
+	uint32 firmware_version;
+	uint32 clock;
+	uint32 pc;
+	uint32 security;
+	uint32 smu_status;
+	uint32 response;
+	uint32 soft_registers;
+	uint32 reserved_out;
+};
+
+// Root-only GFX8 command-processor bring-up. CE, PFP, ME, RLC images.
+// Every PM4 packet, shader and destination is kernel-owned; no user programs.
+struct amdgpu_gfx_test {
+	uint32 version, size;
+	uint64 firmware[4];
+	uint32 firmware_size[4];
+	int32 status;
+	uint32 stage, sequence, checked_bytes, mismatches;
+	uint32 cp_control, ring_control, rptr, wptr, grbm_status, rlc_status;
+	uint32 vm_fault_status, vm_fault_address, vm_fault_client;
+};
+
+// Optional root-only diagnostic: also authenticate/start MEC firmware with
+// every compute queue inactive. No userspace queue or shader is accepted.
+// gfx.size describes this complete structure for AMDGPU_GFX_MEC_TEST.
+struct amdgpu_gfx_mec_test {
+	amdgpu_gfx_test gfx;
+	uint64 mec_firmware;
+	uint32 mec_firmware_size;
+	uint32 reserved;
+};
+
+// Root-only UVD6 bring-up with one fixed H.264 picture. All messages,
+// bitstream data and GPU addresses are kernel-owned. Output is a copy only.
+#define AMDGPU_UVD_TEST_OUTPUT_BYTES 737280
+struct amdgpu_uvd_test {
+	uint32 version, size;
+	uint64 firmware;
+	uint32 firmware_size, output_capacity;
+	uint64 output;
+	int32 status;
+	uint32 stage, sequence, firmware_version;
+	uint32 uvd_status, power_status, ring_control, rptr, wptr, context, fence;
+	uint32 vm_fault_status, vm_fault_address;
+	uint32 checked_bytes, guard_mismatches, checksum;
+	uint32 feedback[8];
+};
+
+struct amdgpu_dma_init {
+	uint32 version;
+	uint32 size;
+	uint64 firmware;
+	uint32 firmware_size;
+	uint32 reserved;
+};
+
+// CREATE_BUFFER uses CPU-visible VRAM. CREATE_SYSTEM_BUFFER uses wired,
+// snooped system RAM; both use the same handle, mapping and command API.
+// CREATE_DEVICE_BUFFER uses VRAM beyond the CPU aperture, is zeroed by DMA
+// before publication, and rejects MAP. Transfer through a mapped RAM buffer.
+// File-local handles; no raw MMIO or arbitrary GPU addresses are accepted.
+// MAP creates a non-executable mapping in the calling team. FREE or closing
+// the file revokes every mapping (including clones) before memory can be reused.
+struct amdgpu_buffer {
+	uint32 version;
+	uint32 size;
+	uint64 handle;
+	uint64 bytes;
+	uint64 address;
+	int32 area;
+	uint32 reserved;
+};
+
+enum { AMDGPU_DMA_COPY = 1, AMDGPU_DMA_FILL = 2 };
+struct amdgpu_dma_submit {
+	uint32 version;
+	uint32 size;
+	uint32 operation;
+	uint32 value;
+	uint64 source;
+	uint64 destination;
+	uint64 source_offset;
+	uint64 destination_offset;
+	uint64 bytes;
+	uint64 fence;
+};
+
+struct amdgpu_fence_wait {
+	uint32 version;
+	uint32 size;
+	uint64 fence;
+	int64 timeout_us; // relative; 0 polls, maximum 5 seconds
+	int32 status; // GPU result; ioctl errors describe the wait/request itself
+	uint32 reserved;
+};
+
+struct amdgpu_memory_info {
+	uint32 version;
+	uint32 size;
+	uint64 total_vram;
+	uint64 visible_vram;
+	uint64 allocated_bytes;
+	uint64 client_bytes;
+	uint64 submitted;
+	uint64 completed;
+	uint32 pending_jobs;
+	uint32 faulted;
+};
+
+struct amdgpu_gart_info {
+	uint32 version;
+	uint32 size;
+	uint64 total_bytes;
+	uint64 allocated_bytes; // includes buffers retained by pending jobs
+	uint64 client_bytes;
+	uint64 bound_pages; // cumulative successful RAM bindings
+	uint64 scatter_boundaries; // physically nonadjacent pages within bindings
+	uint32 vm_fault_status;
+	uint32 vm_fault_address; // GPU virtual page number, not a CPU address
+};
+
+struct amdgpu_register_value {
+	uint32 index;	// AMD register indices are in dwords, not bytes
+	uint32 value;
+};
+
+#define AMDGPU_INFO_REGISTER_COUNT 40
+
+struct amdgpu_info {
+	uint32 version;	// caller must supply AMDGPU_HAIKU_ABI_VERSION
+	uint32 size;		// caller must supply sizeof(amdgpu_info)
+	uint16 vendor;
+	uint16 device;
+	uint16 subsystem_vendor;
+	uint16 subsystem_device;
+	uint8 revision;
+	uint8 bus;
+	uint8 slot;
+	uint8 function;
+	uint32 interrupt;
+	uint32 pci_command;
+	uint64 bar_address[6];
+	uint64 bar_size[6];
+	uint64 vram_size;
+	uint64 vram_gpu_base;
+	uint64 boot_framebuffer;
+	uint64 boot_framebuffer_size;
+	uint32 boot_width;
+	uint32 boot_height;
+	uint32 boot_stride;
+	uint32 register_count;
+	amdgpu_register_value registers[AMDGPU_INFO_REGISTER_COUNT];
+};
+
+#endif

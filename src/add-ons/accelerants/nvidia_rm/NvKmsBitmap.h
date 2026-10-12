@@ -9,6 +9,7 @@
 
 class NvKmsBitmap {
 private:
+	NvRmDevice *fRmDev = nullptr;
 	NvRmObject fMemory;
 	NvKmsSurface fSurface;
 	NvRmMemoryMapping fMapping;
@@ -26,8 +27,11 @@ public:
 	// memory. Do not ask for it for anything the display scans out: this card
 	// refuses, and the mode set fails - see STATUS. It is here for surfaces
 	// the display never reads.
+	// Without mapped, Bits() is NULL until Map(). Video memory is mapped for
+	// the CPU through the card's BAR1, which is only 256 MiB on a GTX 1070:
+	// a surface that is not drawn into yet need not take any of it.
 	NvKmsBitmap(NvRmDevice &rmDev, NvKmsDevice &kmsDev, uint32 width, uint32 height,
-		color_space colorSpace, bool systemMemory = false);
+		color_space colorSpace, bool systemMemory = false, bool mapped = true);
 
 	inline NvKmsBitmap &operator=(NvKmsBitmap &&other);
 
@@ -35,6 +39,8 @@ public:
 	inline NvKmsBitmap &operator=(const NvKmsBitmap &other) = delete;
 
 	inline bool IsSet() const;
+	void Map();
+	void Unmap();
 
 	inline uint32 Width() const;
 	inline uint32 Height() const;
@@ -58,6 +64,7 @@ NvKmsBitmap::NvKmsBitmap():
 }
 
 NvKmsBitmap::NvKmsBitmap(NvKmsBitmap &&other):
+	fRmDev(other.fRmDev),
 	fWidth(other.fWidth),
 	fHeight(other.fHeight),
 	fBytesPerRow(other.fBytesPerRow),
@@ -76,6 +83,7 @@ NvKmsBitmap::NvKmsBitmap(NvKmsBitmap &&other):
 
 NvKmsBitmap &NvKmsBitmap::operator=(NvKmsBitmap &&other)
 {
+	fRmDev = other.fRmDev;
 	fMapping = std::move(other.fMapping);
 	fSurface = std::move(other.fSurface);
 	fMemory = std::move(other.fMemory);

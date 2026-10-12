@@ -78,6 +78,7 @@ struct aic_softc {
 	int					sc_connecting;
 	int					sc_ap;			/* the AP's station index */
 	int					sc_qos;
+	int					sc_operating_width;	/* to notify the AP of, or -1 */
 	int					sc_key_tasks;
 	int					sc_hw_key[6];	/* by key ID; pairwise at 4 */
 	struct mbuf*		sc_early_eapol;
@@ -108,6 +109,13 @@ struct aic_softc {
 	struct mutex		sc_rx_lock;		/* the reorder buffers */
 	struct aic_reorder	sc_reorder[8];
 	volatile int		sc_reorder_held;
+	/* for the watch: frames dropped as behind the window or duplicates,
+	   window restarts, frames never seen (skipped over), late releases */
+	uint32_t			sc_reorder_behind;
+	uint32_t			sc_reorder_dup;
+	uint32_t			sc_reorder_restart;
+	uint32_t			sc_reorder_skipped;
+	uint32_t			sc_reorder_timeouts;
 
 	/* EAPOL frames sent with a confirmation index, and the last index
 	   confirmed: the pairwise key waits for message 4 to have left */
@@ -123,6 +131,8 @@ struct aic_softc {
 	/* when the link's rate and signal were last asked for */
 	bigtime_t			sc_link_time;
 	uint32_t			sc_link_rate;
+
+	bigtime_t			sc_stats_time;	/* the debug watch's last line */
 };
 
 

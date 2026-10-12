@@ -27,6 +27,7 @@ typedef struct {
 	size_t		size;
 	size_t		bytePos;
 	int		bitPos;
+	bool		failed; /* sticky: truncated or unrepresentable syntax */
 } H264Bits;
 
 void h264BitsInit(H264Bits *br, const uint8_t *data, size_t size);
@@ -53,6 +54,7 @@ typedef struct {
 	int		numRefFramesInPocCycle;
 	int		offsetForRefFrame[256];
 	int		maxNumRefFrames;
+	int		gapsInFrameNumAllowed;
 	int		picWidthInMbs;
 	int		picHeightInMapUnits;
 	int		frameMbsOnly;
@@ -60,6 +62,8 @@ typedef struct {
 	int		direct8x8Inference;
 	int		cropLeft, cropRight, cropTop, cropBottom;
 	bool		hasVui;
+	int		fullRange;
+	int		matrixCoefficients;	/* 2: unspecified */
 	bool		hasReorderFrames;
 	int		maxNumReorderFrames;
 	int		maxDecFrameBuffering;

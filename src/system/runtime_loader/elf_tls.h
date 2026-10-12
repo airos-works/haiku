@@ -52,7 +52,7 @@ private:
 
 	static	TLSBlockTemplates*	fInstance;
 
-			unsigned	fGeneration;
+			mutable int32		fGeneration;
 
 			utility::vector<TLSBlockTemplate>	fTemplates;
 			utility::vector<unsigned>	fFreeDSOs;
@@ -71,6 +71,7 @@ TLSBlockTemplate::TLSBlockTemplate(void* address, size_t fileSize,
 
 void*	get_tls_address(unsigned dso, addr_t offset);
 void	destroy_thread_tls();
+void	tls_reinit_after_fork();
 
 
 #endif	// ELF_TLS_H

@@ -26,6 +26,8 @@ SimpleTest pvrtest : pvrtest.cpp ;
 # (tools/rpi4/push.py serves it)
 SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) tools rpi4 ] ;
 SimpleTest cubie_fetch : fetch.cpp : network ;
+# and the other direction, for the Wi-Fi upload tests
+SimpleTest cubie_send : send.cpp : network ;
 
 # the sunxi_cedar media add-on's decoder on its own, for the video engine's
 # tests: per-picture hashes against FFmpeg's (evidence/video/proto/vectors)
@@ -49,6 +51,9 @@ SimpleTest media_probe : media_probe.cpp : be media [ TargetLibsupc++ ] ;
 
 # how busy the processors and some teams are, for the decoders' cost
 SimpleTest cpu_usage : cpu_usage.cpp ;
+
+# a fixed integer workload on N threads, for the cost of thermal throttling
+SimpleTest cubie_cpubench : cpubench.cpp ;
 
 # the AIC8800 Wi-Fi/Bluetooth module's firmware loader from userland, with
 # the driver's loader core

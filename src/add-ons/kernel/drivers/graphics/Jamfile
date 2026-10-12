@@ -1,6 +1,9 @@
 SubDir HAIKU_TOP src add-ons kernel drivers graphics ;
 
 SubInclude HAIKU_TOP src add-ons kernel drivers graphics 3dfx ;
+if $(TARGET_ARCH) = x86_64 {
+	SubInclude HAIKU_TOP src add-ons kernel drivers graphics amdgpu ;
+}
 SubInclude HAIKU_TOP src add-ons kernel drivers graphics ati ;
 SubInclude HAIKU_TOP src add-ons kernel drivers graphics common ;
 SubInclude HAIKU_TOP src add-ons kernel drivers graphics et6x00 ;

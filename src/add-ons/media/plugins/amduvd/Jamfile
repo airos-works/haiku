@@ -1,0 +1,6 @@
+SubDir HAIKU_TOP src add-ons media plugins amduvd ;
+UsePrivateHeaders media [ FDirName graphics amdgpu ] ;
+SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src add-ons media plugins nvdec ] ;
+Addon amduvd : AmdUvdPlugin.cpp H264Stream.cpp H264Packet.cpp H264Output.cpp h264_parse.c
+	HevcDecoder.cpp HevcStream.cpp HevcPacket.cpp HevcOutput.cpp hevc_parse.c
+	: be media [ TargetLibsupc++ ] [ TargetLibstdc++ ] ;

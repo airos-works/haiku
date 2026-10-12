@@ -23,6 +23,10 @@
 namespace sunxi {
 
 
+// TCON-TV1's interrupt: GIC SPI 58, level (Allwinner's device tree)
+static const uint32 kTconTv1Interrupt = 32 + 58;
+
+
 struct display_timing {
 	uint32	pixel_clock;		// kHz
 	uint16	h_display;
@@ -63,6 +67,9 @@ public:
 			// whether the sink still has the link: clock recovery, channel
 			// equalization and symbol lock on every lane, lanes aligned
 			bool				LinkOk();
+			// From the interrupt handler: whether TCON-TV1 started a
+			// vertical blank; clears its flag if so.
+			bool				AcknowledgeBlank();
 			void				DumpState(const char* when);
 
 			// lab access to the registers of the mapped blocks
@@ -127,6 +134,7 @@ private:
 
 			Mapping				fMappings[16];
 			int32				fMappingCount;
+			volatile uint32*	fTconInterrupts;
 			bool				fInitialized;
 			bool				fEnabled;
 			bool				fFlipped;

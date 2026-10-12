@@ -85,6 +85,12 @@ status_t	aic_usb_request(uint16 id, uint16 task, const void* parameters,
 status_t	aic_usb_send(const void* frame, size_t length);
 bool		aic_usb_send_space(void);
 
+/*	The debug watch (driver setting "watch"): the driver's own thread, and
+	locks whose waiters it names. */
+void		aic_usb_watch_thread(int32 thread);
+void		aic_usb_watch_lock(const char* name, const void* object,
+				const volatile int32* owner);
+
 /*	What the loader found. */
 uint32		aic_usb_chip_register(void);
 

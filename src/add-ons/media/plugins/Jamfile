@@ -1,5 +1,8 @@
 SubDir HAIKU_TOP src add-ons media plugins ;
 
+if $(TARGET_ARCH) = x86_64 {
+	SubInclude HAIKU_TOP src add-ons media plugins amduvd ;
+}
 SubInclude HAIKU_TOP src add-ons media plugins ape_reader ;
 SubInclude HAIKU_TOP src add-ons media plugins au_reader ;
 SubInclude HAIKU_TOP src add-ons media plugins ffmpeg ;

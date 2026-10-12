@@ -3800,10 +3800,7 @@ Desktop::_ConfigureDisplayLayout(::HWInterface* interface, bool switchMode)
 
 	fDisplays.Configure(*fSettings->DisplaysMessage(), false);
 
-	std::vector<display_output_config> configs;
-	fDisplays.GetConfigs(configs);
-	status = interface->SetDisplayLayout(configs.data(), configs.size(),
-		switchMode);
+	status = _SetDisplayLayout(interface, fDisplays, switchMode);
 	if (status != B_OK) {
 		debug_printf("app_server: arranging the displays failed: %s\n",
 			strerror(status));
@@ -3818,6 +3815,36 @@ Desktop::_ConfigureDisplayLayout(::HWInterface* interface, bool switchMode)
 	// the monitor is back.
 	fDisplays.ReadOutputs(interface);
 	return B_OK;
+}
+
+
+/*!	Hands \a layout to the accelerant, drawn at the densest render scale
+	the hardware agrees to: the largest display scale first, which shrinks
+	the less scaled displays' regions, down to the smallest, which only
+	enlarges. The screen lock must be held for writing.
+*/
+status_t
+Desktop::_SetDisplayLayout(::HWInterface* interface, DisplayLayout& layout,
+	bool switchMode)
+{
+	std::vector<uint16> renderScales;
+	layout.RenderScales(renderScales);
+
+	status_t status = B_ERROR;
+	for (size_t i = 0; i < renderScales.size(); i++) {
+		layout.SetRenderScale(renderScales[i]);
+		std::vector<display_output_config> configs;
+		layout.GetConfigs(configs);
+		status = interface->SetDisplayLayout(configs.data(), configs.size(),
+			switchMode);
+		if (status == B_OK)
+			return B_OK;
+		if (i + 1 < renderScales.size()) {
+			debug_printf("app_server: the displays cannot be drawn at %u%%, "
+				"trying %u%%\n", renderScales[i], renderScales[i + 1]);
+		}
+	}
+	return status;
 }
 
 
@@ -4050,10 +4077,7 @@ Desktop::SetDisplayLayout(const BMessage& request)
 				_StoreDisplayLayout();
 			}
 		} else if (status == B_OK) {
-			std::vector<display_output_config> configs;
-			layout.GetConfigs(configs);
-			status = HWInterface()->SetDisplayLayout(configs.data(),
-				configs.size(), true);
+			status = _SetDisplayLayout(HWInterface(), layout, true);
 			if (status == B_OK) {
 				fDisplays = layout;
 				fDisplays.ReadOutputs(HWInterface());

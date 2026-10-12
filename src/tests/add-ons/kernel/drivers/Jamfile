@@ -1,5 +1,8 @@
 SubDir HAIKU_TOP src tests add-ons kernel drivers ;
 
+if $(TARGET_ARCH) = x86_64 {
+	SubInclude HAIKU_TOP src tests add-ons kernel drivers amdgpu ;
+}
 SubInclude HAIKU_TOP src tests add-ons kernel drivers audio ;
 SubInclude HAIKU_TOP src tests add-ons kernel drivers edu ;
 SubInclude HAIKU_TOP src tests add-ons kernel drivers hpet ;

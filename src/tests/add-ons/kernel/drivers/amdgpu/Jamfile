@@ -1,0 +1,73 @@
+SubDir HAIKU_TOP src tests add-ons kernel drivers amdgpu ;
+
+UsePrivateHeaders [ FDirName graphics amdgpu ] ;
+SimpleTest amdgpu_probe : amdgpu_probe.cpp ;
+SimpleTest amdgpu_display : amdgpu_display.cpp ;
+SimpleTest amdgpu_sdma : amdgpu_sdma.cpp ;
+SimpleTest amdgpu_smc : amdgpu_smc.cpp ;
+SimpleTest amdgpu_buffers : amdgpu_buffers.cpp ;
+SimpleTest amdgpu_device_buffers : amdgpu_device_buffers.cpp : [ TargetLibstdc++ ] ;
+SimpleTest amdgpu_startup : amdgpu_startup.cpp ;
+SimpleTest amdgpu_gfx : amdgpu_gfx.cpp ;
+SimpleTest amdgpu_vm : amdgpu_vm.cpp : [ TargetLibstdc++ ] ;
+SimpleTest amdgpu_gfx_lifetime : amdgpu_gfx_lifetime.cpp ;
+SimpleTest amdgpu_checked_submit : amdgpu_checked_submit.cpp : [ TargetLibstdc++ ] ;
+SimpleTest amdgpu_copy_submit : amdgpu_copy_submit.cpp : [ TargetLibstdc++ ] ;
+SimpleTest amdgpu_irq : amdgpu_irq.cpp ;
+SimpleTest amdgpu_render : amdgpu_render.cpp ;
+SimpleTest amdgpu_uvd : amdgpu_uvd.cpp ;
+
+local driver = [ FDirName $(HAIKU_TOP) src add-ons kernel drivers graphics amdgpu ] ;
+SubDirHdrs $(driver) ;
+SEARCH_SOURCE += $(driver) ;
+SimpleTest amdgpu_gfx_queue : amdgpu_gfx_queue.cpp GfxCommandValidator.cpp
+	: [ TargetLibstdc++ ] ;
+SimpleTest amdgpu_shader_privilege : amdgpu_shader_privilege.cpp GfxCommandValidator.cpp
+	: [ TargetLibstdc++ ] ;
+SimpleTest amdgpu_shader_resource : amdgpu_shader_resource.cpp GfxCommandValidator.cpp
+	: [ TargetLibstdc++ ] ;
+SimpleTest amdgpu_atc : amdgpu_atc.cpp GfxCommandValidator.cpp
+	: [ TargetLibstdc++ ] ;
+SimpleTest amdgpu_gds : amdgpu_gds.cpp GfxCommandValidator.cpp
+	: [ TargetLibstdc++ ] ;
+SimpleTest amdgpu_gws : amdgpu_gws.cpp GfxCommandValidator.cpp
+	: [ TargetLibstdc++ ] ;
+SimpleTest amdgpu_oa : amdgpu_oa.cpp GfxCommandValidator.cpp
+	: [ TargetLibstdc++ ] ;
+SimpleTest amdgpu_oa_access : amdgpu_oa_access.cpp GfxCommandValidator.cpp
+	: [ TargetLibstdc++ ] ;
+SimpleTest amdgpu_recovery : amdgpu_recovery.cpp GfxCommandValidator.cpp
+	: [ TargetLibstdc++ ] ;
+SimpleTest gfx_command_test : gfx_command_test.cpp GfxCommandValidator.cpp
+	: [ TargetLibstdc++ ] ;
+SimpleTest amdgpu_irq_fault : amdgpu_irq_fault.cpp ;
+SimpleTest amdgpu_submit : amdgpu_submit.cpp : [ TargetLibstdc++ ] ;
+SimpleTest mec_firmware_test : mec_firmware_test.cpp Firmware.cpp
+	: [ TargetLibstdc++ ] ;
+SimpleTest atom_render_test : atom_render_test.cpp Firmware.cpp
+	: [ TargetLibstdc++ ] ;
+SimpleTest vram_allocator_test : vram_allocator_test.cpp VramAllocator.cpp
+	: [ TargetLibstdc++ ] ;
+SimpleTest gpu_page_table_test : gpu_page_table_test.cpp GpuPageTable.cpp
+	: [ TargetLibstdc++ ] ;
+SimpleTest uvd_hevc_test : uvd_hevc_test.cpp UvdHevc.cpp : [ TargetLibstdc++ ] ;
+SimpleTest uvd_h264_test : uvd_h264_test.cpp UvdH264.cpp Firmware.cpp
+	: [ TargetLibstdc++ ] ;
+SimpleTest amdgpu_video : amdgpu_video.cpp : [ TargetLibstdc++ ] ;
+SimpleTest amdgpu_video_concurrent : amdgpu_video_concurrent.cpp : [ TargetLibstdc++ ] ;
+local video = [ FDirName $(HAIKU_TOP) src add-ons media plugins ] ;
+SubDirHdrs $(video)/amduvd ;
+SEARCH_SOURCE += $(video)/amduvd $(video)/nvdec ;
+SimpleTest amdgpu_video_stream : amdgpu_video_stream.cpp H264Stream.cpp h264_parse.c UvdH264.cpp
+	: [ TargetLibstdc++ ] ;
+SimpleTest amdgpu_hevc_stream : amdgpu_hevc_stream.cpp HevcStream.cpp hevc_parse.c h264_parse.c UvdHevc.cpp
+	: [ TargetLibstdc++ ] ;
+SimpleTest amdgpu_video_recovery : amdgpu_video_recovery.cpp HevcStream.cpp hevc_parse.c h264_parse.c GfxCommandValidator.cpp
+	: [ TargetLibstdc++ ] ;
+SimpleTest amdgpu_rom : amdgpu_rom.cpp Firmware.cpp ;
+
+UsePrivateHeaders libroot ;
+SimpleTest amdgpu_uvd_clocks : amdgpu_uvd_clocks.cpp UvdClock.cpp SHA256.cpp
+	: [ TargetLibstdc++ ] ;
+SEARCH on [ FGristFiles SHA256.cpp ]
+	= [ FDirName $(HAIKU_TOP) src system libroot posix crypt ] ;

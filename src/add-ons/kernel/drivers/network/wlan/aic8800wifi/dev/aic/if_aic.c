@@ -72,6 +72,7 @@
 #define ETHERTYPE_EAPOL_BYTES(p)	((p)[0] == 0x88 && (p)[1] == 0x8e)
 
 static int aic_debug;
+static int aic_watch;
 
 #define DPRINTF(x...)	do { if (aic_debug) printf(x); } while (0)
 
@@ -553,8 +554,9 @@ aic_preinit(struct aic_softc* sc)
 			AIC_MM_VERSION_CFM, confirm, AIC_VERSION_SIZE) != 0)
 		return EIO;
 	sc->sc_phy_2 = get32(confirm + AIC_VERSION_PHY_2);
-	DPRINTF("%s: lmac %#x, features %#x, %u stations\n", DEVNAME(sc),
-		get32(confirm + AIC_VERSION_LMAC),
+	DPRINTF("%s: lmac %#x, phy %#x, features %#x, %u stations\n",
+		DEVNAME(sc), get32(confirm + AIC_VERSION_LMAC),
+		get32(confirm + AIC_VERSION_PHY_1),
 		get32(confirm + AIC_VERSION_FEATURES),
 		get16(confirm + AIC_VERSION_MAX_STA));
 
@@ -621,6 +623,7 @@ aic_init(struct ifnet* ifp)
 
 
 static void aic_reorder_flush(struct aic_softc*, int, struct mbuf_list*);
+static void aic_notify_operating_mode(struct aic_softc*);
 
 
 static void
@@ -632,6 +635,7 @@ aic_forget_association(struct aic_softc* sc)
 	ml_purge(&held);
 	sc->sc_connected = 0;
 	sc->sc_ap = -1;
+	sc->sc_operating_width = -1;
 	sc->sc_key_tasks = 0;
 	memset(sc->sc_hw_key, 0xff, sizeof(sc->sc_hw_key));
 	if (sc->sc_early_eapol != NULL) {
@@ -1003,6 +1007,7 @@ aic_connected(struct aic_softc* sc, const uint8_t* indication, size_t length)
 	uint8_t parameters[2];
 	struct mbuf* m;
 	uint16_t status;
+	int width;
 
 	if (length < AIC_CONNECTED_MIN)
 		return;
@@ -1031,9 +1036,18 @@ aic_connected(struct aic_softc* sc, const uint8_t* indication, size_t length)
 	sc->sc_qos = indication[AIC_CONNECTED_QOS];
 	sc->sc_key_tasks = 0;
 	ni->ni_associd = get16(indication + AIC_CONNECTED_AID) | 0xc000;
-	printf("%s: associated with %s (station %d, aid %u%s)\n", DEVNAME(sc),
-		ether_sprintf(indication + AIC_CONNECTED_BSSID), sc->sc_ap,
-		ni->ni_associd & 0x3fff, sc->sc_qos ? ", QoS" : "");
+	width = length > AIC_CONNECTED_WIDTH ? indication[AIC_CONNECTED_WIDTH] : -1;
+	printf("%s: associated with %s (station %d, aid %u%s, %d MHz)\n",
+		DEVNAME(sc), ether_sprintf(indication + AIC_CONNECTED_BSSID),
+		sc->sc_ap, ni->ni_associd & 0x3fff, sc->sc_qos ? ", QoS" : "",
+		width >= 0 && width <= 3 ? 20 << width : 0);
+
+	// with VHT on a channel narrower than 80 MHz the AP is told the real
+	// width once the port is open (aic_notify_operating_mode())
+	sc->sc_operating_width = -1;
+	if (sc->sc_vht && (width == 0 || width == 1)
+		&& (ni->ni_flags & IEEE80211_NODE_VHTCAP) != 0)
+		sc->sc_operating_width = width;
 
 	// OpenBSD's state machine wants ASSOC between AUTH and RUN
 	ieee80211_new_state(ic, IEEE80211_S_ASSOC, -1);
@@ -1045,6 +1059,7 @@ aic_connected(struct aic_softc* sc, const uint8_t* indication, size_t length)
 		aic_cmd(sc, AIC_ME_SET_CONTROL_PORT_REQ, AIC_TASK_ME, parameters, 2,
 			AIC_ME_SET_CONTROL_PORT_CFM, NULL, 0);
 		ni->ni_port_valid = 1;
+		aic_notify_operating_mode(sc);
 		return;
 	}
 
@@ -1300,6 +1315,7 @@ aic_do_set_key(struct aic_softc* sc, const struct aic_key* key)
 	printf("%s: keys installed, port open\n", DEVNAME(sc));
 	ni->ni_port_valid = 1;
 	ieee80211_set_link_state(ic, LINK_STATE_UP);
+	aic_notify_operating_mode(sc);
 }
 
 
@@ -1367,6 +1383,62 @@ aic_tx(struct aic_softc* sc, struct mbuf* m)
 	frame[3] = 0;
 
 	return aic_usb_send(frame, length) == B_OK ? 0 : EIO;
+}
+
+
+/*	Tells the AP the channel width the connection really has (a VHT
+	Operating Mode Notification action frame, one receive stream). The
+	firmware's association request claims 80 MHz whatever the network's
+	width, and in a 40 MHz network the lab's AP then left its VHT downlink
+	silent for about 30 ms twice per beacon interval: under half the HT
+	rate (cubie/evidence/wifi-vht, 2026-10-12). Told 40 MHz, it delivers
+	more than with HT. On the driver's thread. */
+static void
+aic_notify_operating_mode(struct aic_softc* sc)
+{
+	struct ieee80211com* ic = &sc->sc_ic;
+	struct ieee80211_node* ni = ic->ic_bss;
+	uint8_t frame[AIC_TX_HEADER + 28];
+	uint8_t* wh = frame + AIC_TX_HEADER;
+	const size_t frameLength = sizeof(struct ieee80211_frame) + 3;
+	size_t length;
+	int width = sc->sc_operating_width;
+
+	sc->sc_operating_width = -1;
+	if (width < 0 || !sc->sc_connected || sc->sc_ap < 0)
+		return;
+
+	memset(frame, 0, sizeof(frame));
+	wh[0] = IEEE80211_FC0_VERSION_0 | IEEE80211_FC0_TYPE_MGT
+		| IEEE80211_FC0_SUBTYPE_ACTION;
+	IEEE80211_ADDR_COPY(wh + 4, ni->ni_bssid);
+	IEEE80211_ADDR_COPY(wh + 10, ic->ic_myaddr);
+	IEEE80211_ADDR_COPY(wh + 16, ni->ni_bssid);
+	wh[24] = 21;
+		// the VHT category
+	wh[25] = 2;
+		// Operating Mode Notification
+	wh[26] = width;
+		// the channel width; receive streams - 1 in bits 4-6
+
+	put16(frame + AIC_TX_LENGTH, frameLength);
+	frame[AIC_TX_AC] = AIC_AC_VO;
+	frame[AIC_TX_TID] = 0xff;
+	frame[AIC_TX_VIF] = sc->sc_vif;
+	frame[AIC_TX_STA] = sc->sc_ap;
+	put16(frame + AIC_TX_FLAGS, AIC_TX_MGMT | AIC_TX_MGMT_NO_CCK);
+	length = (AIC_TX_HEADER + frameLength + 3) & ~(size_t)3;
+	put16(frame, length & 0x0fff);
+	frame[2] = AIC_TYPE_DATA_TX;
+	frame[3] = 0;
+
+	if (aic_usb_send(frame, length) != B_OK) {
+		printf("%s: the operating mode notification was not sent\n",
+			DEVNAME(sc));
+		return;
+	}
+	printf("%s: told the AP the channel is %d MHz wide\n", DEVNAME(sc),
+		20 << width);
 }
 
 
@@ -1493,10 +1565,12 @@ aic_reorder_input(struct aic_softc* sc, int tid, uint16_t sequence,
 		// sender's numbers started over (a new block ack session); the
 		// window follows them then.
 		if (++r->behind < AIC_REORDER_WINDOW / 2) {
+			sc->sc_reorder_behind++;
 			mtx_leave(&sc->sc_rx_lock);
 			ml_purge(msdus);
 			return;
 		}
+		sc->sc_reorder_restart++;
 		while (r->held > 0) {
 			while (!r->filled[r->head % AIC_REORDER_WINDOW])
 				r->head = (r->head + 1) & 0xfff;
@@ -1513,12 +1587,15 @@ aic_reorder_input(struct aic_softc* sc, int tid, uint16_t sequence,
 			slot = r->head % AIC_REORDER_WINDOW;
 			if (r->filled[slot])
 				aic_reorder_take(r, slot, out);
+			else
+				sc->sc_reorder_skipped++;
 			r->head = (r->head + 1) & 0xfff;
 		}
 	}
 
 	slot = sequence % AIC_REORDER_WINDOW;
 	if (r->filled[slot]) {
+		sc->sc_reorder_dup++;
 		mtx_leave(&sc->sc_rx_lock);
 		ml_purge(msdus);
 		return;
@@ -1546,9 +1623,13 @@ aic_reorder_flush(struct aic_softc* sc, int all, struct mbuf_list* out)
 	for (tid = 0; tid < 8; tid++) {
 		struct aic_reorder* r = &sc->sc_reorder[tid];
 		if (r->held > 0 && (all || now - r->since >= AIC_REORDER_TIMEOUT)) {
+			if (!all)
+				sc->sc_reorder_timeouts++;
 			while (r->held > 0) {
-				while (!r->filled[r->head % AIC_REORDER_WINDOW])
+				while (!r->filled[r->head % AIC_REORDER_WINDOW]) {
 					r->head = (r->head + 1) & 0xfff;
+					sc->sc_reorder_skipped++;
+				}
 				aic_reorder_release(r, out);
 			}
 		}
@@ -2071,6 +2152,21 @@ aic_tick(struct aic_softc* sc)
 		sc->sc_link_time = system_time();
 		aic_update_link(sc);
 	}
+
+	if (aic_watch && system_time() - sc->sc_stats_time >= 5000000) {
+		int held = 0, tid;
+		sc->sc_stats_time = system_time();
+		for (tid = 0; tid < 8; tid++)
+			held += sc->sc_reorder[tid].held;
+		printf("%s: watch: state %d, reorder held %d (behind %u, duplicate "
+			"%u, restarts %u, never came %u, timeouts %u), events %d, work "
+			"%d, send queue %d, receive queue %d (%llu dropped)\n",
+			DEVNAME(sc), ic->ic_state, held, sc->sc_reorder_behind,
+			sc->sc_reorder_dup, sc->sc_reorder_restart,
+			sc->sc_reorder_skipped, sc->sc_reorder_timeouts,
+			sc->sc_event_count, sc->sc_work_count, ifp->if_snd.ifq_len,
+			ifp->receive_queue.ifq_len, (unsigned long long)ifp->if_iqdrops);
+	}
 }
 
 
@@ -2170,6 +2266,7 @@ aic_attach(device_t dev)
 	sc->sc_dev = dev;
 	sc->sc_vif = -1;
 	sc->sc_ap = -1;
+	sc->sc_operating_width = -1;
 	memset(sc->sc_hw_key, 0xff, sizeof(sc->sc_hw_key));
 	mtx_init(&sc->sc_lock, IPL_NONE);
 	mtx_init(&sc->sc_rx_lock, IPL_NONE);
@@ -2183,10 +2280,17 @@ aic_attach(device_t dev)
 	ml_init(&sc->sc_rxq[0]);
 	ml_init(&sc->sc_rxq[1]);
 
+	// VHT unless the settings say "vht false". It was off by default for a
+	// while: on the lab's AP (5 GHz, 40 MHz) VHT downloads ran at a quarter
+	// of the HT rate. Two causes: a receive-only TCP connection never grew
+	// its window past 64 KiB (fixed in the TCP stack), and the AP took the
+	// firmware's 80 MHz operating mode at its word
+	// (aic_notify_operating_mode()).
 	sc->sc_vht = 1;
 	settings = load_driver_settings("aic8800wifi");
 	if (settings != NULL) {
 		aic_debug = get_driver_boolean_parameter(settings, "debug", 0, 1);
+		aic_watch = get_driver_boolean_parameter(settings, "watch", 0, 1);
 		sc->sc_vht = get_driver_boolean_parameter(settings, "vht", 1, 1);
 		unload_driver_settings(settings);
 	}
@@ -2265,6 +2369,12 @@ aic_attach(device_t dev)
 		goto fail;
 	}
 	resume_thread(sc->sc_thread);
+	aic_usb_watch_thread(sc->sc_thread);
+	aic_usb_watch_lock("Giant", &Giant.u.mutex_.lock, &Giant.u.mutex_.owner);
+	aic_usb_watch_lock("sc", &sc->sc_lock.mtx.u.mutex_.lock,
+		&sc->sc_lock.mtx.u.mutex_.owner);
+	aic_usb_watch_lock("sc rx", &sc->sc_rx_lock.mtx.u.mutex_.lock,
+		&sc->sc_rx_lock.mtx.u.mutex_.owner);
 
 	sc->sc_attached = 1;
 	printf("%s: address %s\n", DEVNAME(sc), ether_sprintf(ic->ic_myaddr));

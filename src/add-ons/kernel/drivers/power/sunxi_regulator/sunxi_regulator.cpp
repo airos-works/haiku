@@ -11,7 +11,10 @@
 	on USB.
 
 	The pin is made an output at the regulator's enable level. Nothing turns
-	them off again. */
+	them off again.
+
+	The add-on also carries the PMIC module (sunxi_pmic.cpp, sunxi_pmic.h):
+	the converters' voltages for the drivers that scale them. */
 
 
 #include <string.h>
@@ -20,6 +23,7 @@
 #include <KernelExport.h>
 #include <device_manager.h>
 #include <bus/FDT.h>
+#include <sunxi_pmic.h>
 
 
 #define SUNXI_REGULATOR_MODULE_NAME "drivers/power/sunxi_regulator/driver_v1"
@@ -280,7 +284,11 @@ static driver_module_info sSunxiRegulatorDriver = {
 };
 
 
+extern sunxi_pmic_module_info gSunxiPmicModule;
+
+
 module_info* modules[] = {
 	(module_info*)&sSunxiRegulatorDriver,
+	(module_info*)&gSunxiPmicModule,
 	NULL
 };

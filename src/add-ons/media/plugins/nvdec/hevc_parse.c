@@ -2,7 +2,29 @@
 
 #include "hevc_parse.h"
 
+#include <limits.h>
 #include <string.h>
+
+/* Check unsigned syntax before signed conversion and arithmetic. Failure is
+ * sticky so callers can reject a whole parameter set without partial use. */
+static int
+readUnsigned(H264Bits *br, uint32_t maximum)
+{
+	uint32_t value = h264UE(br);
+	if (value > maximum) {
+		br->failed = true;
+		return 0;
+	}
+	return (int)value;
+}
+
+static bool
+validHeader(const uint8_t *rbsp, size_t size, int type)
+{
+	return rbsp != NULL && size >= 3 && !(rbsp[0] & 0x81)
+		&& !(rbsp[1] & 0xf8) && (rbsp[1] & 7) != 0
+		&& ((rbsp[0] >> 1) & 63) == type;
+}
 
 static int
 ceilLog2(int value)
@@ -19,13 +41,12 @@ bitPosition(const H264Bits *br)
 	return br->bytePos * 8 + (size_t)br->bitPos;
 }
 
-/* The reader gives zeros past the end without moving, so a unit that ran out
- * shows as one with nothing left - where a whole one still has at least its
- * stop bit, and a slice header its slice data. */
+/* Whole parameter sets retain their stop bit; slice headers retain data.
+ * Also propagate the shared reader's sticky syntax/truncation failure. */
 static bool
 overran(const H264Bits *br)
 {
-	return br->bytePos >= br->size;
+	return br->failed || br->bytePos >= br->size;
 }
 
 /* ------------------------------------------------------- scaling lists */
@@ -135,9 +156,10 @@ parseScalingListData(H264Bits *br, HevcScalingList *lists)
 			}
 			int next = 8;
 			if (sizeId > 1) {
-				int dc = h264SE(br) + 8;
-				if (dc < 1 || dc > 255)
+				int dc = h264SE(br);
+				if (dc < -7 || dc > 247)
 					return false;
+				dc += 8;
 				next = dc;
 				if (sizeId == 2)
 					lists->dc16x16[matrixId] = (uint8_t)dc;
@@ -205,16 +227,17 @@ parseShortTermSet(H264Bits *br, const HevcSps *sps, int index,
 	if (interPrediction) {
 		int deltaIndex = 1;
 		if (index == sps->numShortTermSets)
-			deltaIndex = (int)h264UE(br) + 1;
+			deltaIndex = readUnsigned(br, index - 1) + 1;
 		if (deltaIndex > index)
 			return false;
 		const HevcShortTermSet *reference = &sps->shortTerm[index - deltaIndex];
 		int sign = (int)h264Bit(br);
-		int absDelta = (int)h264UE(br) + 1;
+		int absDelta = readUnsigned(br, 32767) + 1;
 		if (absDelta > 32768)
 			return false;
 		int deltaRps = (1 - 2 * sign) * absDelta;
 		int total = reference->numNegative + reference->numPositive;
+		set->numDeltaPocsOfRefRpsIdx = total;
 
 		bool used[2 * HEVC_MAX_DELTA_POCS + 1];
 		bool useDelta[2 * HEVC_MAX_DELTA_POCS + 1];
@@ -278,7 +301,7 @@ parseShortTermSet(H264Bits *br, const HevcSps *sps, int index,
 			}
 		}
 		set->numPositive = i;
-		return set->numNegative + set->numPositive <= HEVC_MAX_DELTA_POCS;
+		return !overran(br) && set->numNegative + set->numPositive <= HEVC_MAX_DELTA_POCS;
 	}
 
 	uint32_t negative = h264UE(br);
@@ -291,13 +314,13 @@ parseShortTermSet(H264Bits *br, const HevcSps *sps, int index,
 	set->numPositive = (int)positive;
 	int poc = 0;
 	for (uint32_t i = 0; i < negative; i++) {
-		poc -= (int)h264UE(br) + 1;
+		poc -= readUnsigned(br, 32767) + 1;
 		set->deltaPoc[0][i] = poc;
 		set->used[0][i] = h264Bit(br);
 	}
 	poc = 0;
 	for (uint32_t i = 0; i < positive; i++) {
-		poc += (int)h264UE(br) + 1;
+		poc += readUnsigned(br, 32767) + 1;
 		set->deltaPoc[1][i] = poc;
 		set->used[1][i] = h264Bit(br);
 	}
@@ -395,7 +418,7 @@ parseVui(H264Bits *br, HevcSps *sps)
 		h264UE(br);
 	}
 	h264Bit(br);				/* neutral_chroma_indication_flag */
-	h264Bit(br);				/* field_seq_flag */
+	sps->fieldSeq = (int)h264Bit(br);
 	h264Bit(br);				/* frame_field_info_present_flag */
 	if (h264Bit(br)) {			/* default_display_window_flag */
 		h264UE(br);
@@ -433,7 +456,7 @@ bool
 hevcParseSps(const uint8_t *rbsp, size_t size, HevcSps *sps)
 {
 	H264Bits br;
-	if (size < 3)
+	if (!validHeader(rbsp, size, HEVC_NAL_SPS))
 		return false;
 	h264BitsInit(&br, rbsp + 2, size - 2);	/* past the NAL unit header */
 	memset(sps, 0, sizeof(*sps));
@@ -452,13 +475,13 @@ hevcParseSps(const uint8_t *rbsp, size_t size, HevcSps *sps)
 	if (id >= HEVC_MAX_SPS)
 		return false;
 	sps->id = (int)id;
-	sps->chromaFormatIdc = (int)h264UE(&br);
+	sps->chromaFormatIdc = readUnsigned(&br, 3);
 	if (sps->chromaFormatIdc > 3)
 		return false;
 	if (sps->chromaFormatIdc == 3)
 		sps->separateColourPlane = (int)h264Bit(&br);
-	sps->width = (int)h264UE(&br);
-	sps->height = (int)h264UE(&br);
+	sps->width = readUnsigned(&br, 16384);
+	sps->height = readUnsigned(&br, 16384);
 	if (sps->width <= 0 || sps->height <= 0 || sps->width > 16384
 		|| sps->height > 16384) {
 		return false;
@@ -467,21 +490,20 @@ hevcParseSps(const uint8_t *rbsp, size_t size, HevcSps *sps)
 		int subWidth = (sps->chromaFormatIdc == 1 || sps->chromaFormatIdc == 2)
 			? 2 : 1;
 		int subHeight = sps->chromaFormatIdc == 1 ? 2 : 1;
-		sps->confLeft = (int)h264UE(&br) * subWidth;
-		sps->confRight = (int)h264UE(&br) * subWidth;
-		sps->confTop = (int)h264UE(&br) * subHeight;
-		sps->confBottom = (int)h264UE(&br) * subHeight;
+		sps->confLeft = readUnsigned(&br, sps->width / subWidth) * subWidth;
+		sps->confRight = readUnsigned(&br, sps->width / subWidth) * subWidth;
+		sps->confTop = readUnsigned(&br, sps->height / subHeight) * subHeight;
+		sps->confBottom = readUnsigned(&br, sps->height / subHeight) * subHeight;
 		if (sps->confLeft + sps->confRight >= sps->width
 			|| sps->confTop + sps->confBottom >= sps->height) {
-			sps->confLeft = sps->confRight = 0;
-			sps->confTop = sps->confBottom = 0;
+			return false;
 		}
 	}
-	sps->bitDepthLuma = (int)h264UE(&br) + 8;
-	sps->bitDepthChroma = (int)h264UE(&br) + 8;
+	sps->bitDepthLuma = readUnsigned(&br, 8) + 8;
+	sps->bitDepthChroma = readUnsigned(&br, 8) + 8;
 	if (sps->bitDepthLuma > 16 || sps->bitDepthChroma > 16)
 		return false;
-	sps->log2MaxPocLsb = (int)h264UE(&br) + 4;
+	sps->log2MaxPocLsb = readUnsigned(&br, 12) + 4;
 	if (sps->log2MaxPocLsb > 16)
 		return false;
 
@@ -489,21 +511,21 @@ hevcParseSps(const uint8_t *rbsp, size_t size, HevcSps *sps)
 	for (int i = orderingForEach ? 0 : sps->maxSubLayersMinus1;
 			i <= sps->maxSubLayersMinus1; i++) {
 		/* Keep what the highest sub-layer says: that is what is decoded. */
-		sps->maxDecPicBuffering = (int)h264UE(&br) + 1;
-		sps->maxNumReorderPics = (int)h264UE(&br);
-		sps->maxLatencyIncreasePlus1 = (int)h264UE(&br);
+		sps->maxDecPicBuffering = readUnsigned(&br, 15) + 1;
+		sps->maxNumReorderPics = readUnsigned(&br, sps->maxDecPicBuffering - 1);
+		sps->maxLatencyIncreasePlus1 = readUnsigned(&br, INT_MAX);
 	}
 	if (sps->maxDecPicBuffering > 16 || sps->maxNumReorderPics > 16)
 		return false;
 
-	sps->log2MinCbSize = (int)h264UE(&br) + 3;
-	sps->log2CtbSize = sps->log2MinCbSize + (int)h264UE(&br);
-	sps->log2MinTbSize = (int)h264UE(&br) + 2;
-	sps->log2MaxTbSize = sps->log2MinTbSize + (int)h264UE(&br);
+	sps->log2MinCbSize = readUnsigned(&br, 3) + 3;
+	sps->log2CtbSize = sps->log2MinCbSize + readUnsigned(&br, 3);
+	sps->log2MinTbSize = readUnsigned(&br, 3) + 2;
+	sps->log2MaxTbSize = sps->log2MinTbSize + readUnsigned(&br, 3);
 	if (sps->log2CtbSize < 4 || sps->log2CtbSize > 6 || sps->log2MaxTbSize > 5)
 		return false;
-	sps->maxTransformHierarchyDepthInter = (int)h264UE(&br);
-	sps->maxTransformHierarchyDepthIntra = (int)h264UE(&br);
+	sps->maxTransformHierarchyDepthInter = readUnsigned(&br, 4);
+	sps->maxTransformHierarchyDepthIntra = readUnsigned(&br, 4);
 
 	sps->scalingListEnabled = (int)h264Bit(&br);
 	setDefaultScaling(&sps->scaling);
@@ -517,8 +539,8 @@ hevcParseSps(const uint8_t *rbsp, size_t size, HevcSps *sps)
 	if (sps->pcmEnabled) {
 		sps->pcmBitDepthLuma = (int)h264Bits(&br, 4) + 1;
 		sps->pcmBitDepthChroma = (int)h264Bits(&br, 4) + 1;
-		sps->log2MinPcmCbSize = (int)h264UE(&br) + 3;
-		sps->log2MaxPcmCbSize = sps->log2MinPcmCbSize + (int)h264UE(&br);
+		sps->log2MinPcmCbSize = readUnsigned(&br, 2) + 3;
+		sps->log2MaxPcmCbSize = sps->log2MinPcmCbSize + readUnsigned(&br, 2);
 		sps->pcmLoopFilterDisabled = (int)h264Bit(&br);
 	}
 
@@ -584,7 +606,7 @@ hevcParsePps(const uint8_t *rbsp, size_t size, const HevcParamSets *sets,
 	HevcPps *pps)
 {
 	H264Bits br;
-	if (size < 3)
+	if (!validHeader(rbsp, size, HEVC_NAL_PPS))
 		return false;
 	h264BitsInit(&br, rbsp + 2, size - 2);
 	memset(pps, 0, sizeof(*pps));
@@ -596,24 +618,30 @@ hevcParsePps(const uint8_t *rbsp, size_t size, const HevcParamSets *sets,
 	pps->id = (int)id;
 	pps->spsId = (int)spsId;
 	const HevcSps *sps = &sets->sps[spsId];
+	if (!sps->valid)
+		return false;
 
 	pps->dependentSliceSegmentsEnabled = (int)h264Bit(&br);
 	pps->outputFlagPresent = (int)h264Bit(&br);
 	pps->numExtraSliceHeaderBits = (int)h264Bits(&br, 3);
 	pps->signDataHiding = (int)h264Bit(&br);
 	pps->cabacInitPresent = (int)h264Bit(&br);
-	pps->numRefIdxL0DefaultActive = (int)h264UE(&br) + 1;
-	pps->numRefIdxL1DefaultActive = (int)h264UE(&br) + 1;
+	pps->numRefIdxL0DefaultActive = readUnsigned(&br, 14) + 1;
+	pps->numRefIdxL1DefaultActive = readUnsigned(&br, 14) + 1;
 	if (pps->numRefIdxL0DefaultActive > 15 || pps->numRefIdxL1DefaultActive > 15)
 		return false;
 	pps->initQpMinus26 = h264SE(&br);
+	if (pps->initQpMinus26 < -(26 + 6 * (sps->bitDepthLuma - 8)) || pps->initQpMinus26 > 25)
+		return false;
 	pps->constrainedIntraPred = (int)h264Bit(&br);
 	pps->transformSkipEnabled = (int)h264Bit(&br);
 	pps->cuQpDeltaEnabled = (int)h264Bit(&br);
 	if (pps->cuQpDeltaEnabled)
-		pps->diffCuQpDeltaDepth = (int)h264UE(&br);
+		pps->diffCuQpDeltaDepth = readUnsigned(&br, sps->log2CtbSize - sps->log2MinCbSize);
 	pps->cbQpOffset = h264SE(&br);
 	pps->crQpOffset = h264SE(&br);
+	if (pps->cbQpOffset < -12 || pps->cbQpOffset > 12 || pps->crQpOffset < -12 || pps->crQpOffset > 12)
+		return false;
 	pps->sliceChromaQpOffsetsPresent = (int)h264Bit(&br);
 	pps->weightedPred = (int)h264Bit(&br);
 	pps->weightedBipred = (int)h264Bit(&br);
@@ -625,18 +653,25 @@ hevcParsePps(const uint8_t *rbsp, size_t size, const HevcParamSets *sets,
 	pps->uniformSpacing = 1;
 	pps->loopFilterAcrossTiles = 1;
 	if (pps->tilesEnabled) {
-		pps->numTileColumns = (int)h264UE(&br) + 1;
-		pps->numTileRows = (int)h264UE(&br) + 1;
+		pps->numTileColumns = readUnsigned(&br, HEVC_MAX_TILE_COLUMNS - 1) + 1;
+		pps->numTileRows = readUnsigned(&br, HEVC_MAX_TILE_ROWS - 1) + 1;
 		if (pps->numTileColumns > HEVC_MAX_TILE_COLUMNS
-			|| pps->numTileRows > HEVC_MAX_TILE_ROWS) {
+			|| pps->numTileRows > HEVC_MAX_TILE_ROWS
+			|| pps->numTileColumns > sps->ctbWidth || pps->numTileRows > sps->ctbHeight) {
 			return false;
 		}
 		pps->uniformSpacing = (int)h264Bit(&br);
 		if (!pps->uniformSpacing) {
-			for (int i = 0; i < pps->numTileColumns - 1; i++)
-				pps->columnWidth[i] = (int)h264UE(&br) + 1;
-			for (int i = 0; i < pps->numTileRows - 1; i++)
-				pps->rowHeight[i] = (int)h264UE(&br) + 1;
+			int width = 0, height = 0;
+			for (int i = 0; i < pps->numTileColumns - 1; i++) {
+				pps->columnWidth[i] = readUnsigned(&br, sps->ctbWidth - 1) + 1;
+				width += pps->columnWidth[i];
+			}
+			for (int i = 0; i < pps->numTileRows - 1; i++) {
+				pps->rowHeight[i] = readUnsigned(&br, sps->ctbHeight - 1) + 1;
+				height += pps->rowHeight[i];
+			}
+			if (width >= sps->ctbWidth || height >= sps->ctbHeight) return false;
 		}
 		pps->loopFilterAcrossTiles = (int)h264Bit(&br);
 	}
@@ -648,6 +683,8 @@ hevcParsePps(const uint8_t *rbsp, size_t size, const HevcParamSets *sets,
 		if (!pps->deblockingDisabled) {
 			pps->betaOffsetDiv2 = h264SE(&br);
 			pps->tcOffsetDiv2 = h264SE(&br);
+			if (pps->betaOffsetDiv2 < -6 || pps->betaOffsetDiv2 > 6
+				|| pps->tcOffsetDiv2 < -6 || pps->tcOffsetDiv2 > 6) return false;
 		}
 	}
 	pps->scalingListPresent = (int)h264Bit(&br);
@@ -656,7 +693,7 @@ hevcParsePps(const uint8_t *rbsp, size_t size, const HevcParamSets *sets,
 			return false;
 	}
 	pps->listsModificationPresent = (int)h264Bit(&br);
-	pps->log2ParallelMergeLevel = (int)h264UE(&br) + 2;
+	pps->log2ParallelMergeLevel = readUnsigned(&br, sps->log2CtbSize - 2) + 2;
 	pps->sliceHeaderExtensionPresent = (int)h264Bit(&br);
 	if (h264Bit(&br)) {			/* pps_extension_present_flag */
 		bool range = h264Bit(&br);
@@ -666,12 +703,12 @@ hevcParsePps(const uint8_t *rbsp, size_t size, const HevcParamSets *sets,
 		h264Bits(&br, 4);
 		if (range) {
 			if (pps->transformSkipEnabled)
-				pps->log2MaxTransformSkipSizeMinus2 = (int)h264UE(&br);
+				pps->log2MaxTransformSkipSizeMinus2 = readUnsigned(&br, 3);
 			pps->crossComponentPrediction = (int)h264Bit(&br);
 			pps->chromaQpOffsetListEnabled = (int)h264Bit(&br);
 			if (pps->chromaQpOffsetListEnabled) {
-				pps->diffCuChromaQpOffsetDepth = (int)h264UE(&br);
-				pps->chromaQpOffsetListLen = (int)h264UE(&br) + 1;
+				pps->diffCuChromaQpOffsetDepth = readUnsigned(&br, sps->log2CtbSize - sps->log2MinCbSize);
+				pps->chromaQpOffsetListLen = readUnsigned(&br, 5) + 1;
 				if (pps->chromaQpOffsetListLen > 6)
 					return false;
 				for (int i = 0; i < pps->chromaQpOffsetListLen; i++) {
@@ -679,11 +716,10 @@ hevcParsePps(const uint8_t *rbsp, size_t size, const HevcParamSets *sets,
 					pps->crQpOffsetList[i] = h264SE(&br);
 				}
 			}
-			pps->log2SaoOffsetScaleLuma = (int)h264UE(&br);
-			pps->log2SaoOffsetScaleChroma = (int)h264UE(&br);
+			pps->log2SaoOffsetScaleLuma = readUnsigned(&br, 6);
+			pps->log2SaoOffsetScaleChroma = readUnsigned(&br, 6);
 		}
 	}
-	(void)sps;
 	if (overran(&br))
 		return false;
 	pps->valid = true;
@@ -728,7 +764,8 @@ hevcParseSliceHeader(const uint8_t *rbsp, size_t size,
 	const HevcParamSets *sets, HevcSlice *slice)
 {
 	H264Bits br;
-	if (size < 3)
+	if (rbsp == NULL || size < 3 || !validHeader(rbsp, size, (rbsp[0] >> 1) & 63)
+		|| !hevcIsVcl((rbsp[0] >> 1) & 63))
 		return false;
 	memset(slice, 0, sizeof(*slice));
 	slice->nalType = (rbsp[0] >> 1) & 0x3f;
@@ -750,10 +787,11 @@ hevcParseSliceHeader(const uint8_t *rbsp, size_t size,
 	if (!slice->firstSliceInPicture) {
 		if (pps->dependentSliceSegmentsEnabled)
 			slice->dependentSliceSegment = (int)h264Bit(&br);
-		h264Bits(&br, ceilLog2(sps->ctbWidth * sps->ctbHeight));
+		uint32_t address = h264Bits(&br, ceilLog2(sps->ctbWidth * sps->ctbHeight));
+		if (address == 0 || address >= (uint32_t)(sps->ctbWidth * sps->ctbHeight)) return false;
 	}
 	if (slice->dependentSliceSegment)
-		return true;
+		return !overran(&br);
 
 	h264Bits(&br, pps->numExtraSliceHeaderBits);
 	uint32_t sliceType = h264UE(&br);
@@ -794,7 +832,7 @@ hevcParseSliceHeader(const uint8_t *rbsp, size_t size,
 				fromSps = h264UE(&br);
 			uint32_t own = h264UE(&br);
 			if (fromSps > (uint32_t)sps->numLongTermRefsSps
-				|| fromSps + own > HEVC_MAX_LONG_TERM) {
+				|| own > HEVC_MAX_LONG_TERM || fromSps + own > HEVC_MAX_LONG_TERM) {
 				return false;
 			}
 			slice->numLongTerm = (int)(fromSps + own);
@@ -804,6 +842,7 @@ hevcParseSliceHeader(const uint8_t *rbsp, size_t size,
 					if (sps->numLongTermRefsSps > 1)
 						index = (int)h264Bits(&br,
 							ceilLog2(sps->numLongTermRefsSps));
+					if (index >= sps->numLongTermRefsSps) return false;
 					slice->longTermPocLsb[i] = sps->longTermPocLsbSps[index];
 					slice->longTermUsed[i] = sps->longTermUsedSps[index];
 				} else {
@@ -812,12 +851,13 @@ hevcParseSliceHeader(const uint8_t *rbsp, size_t size,
 					slice->longTermUsed[i] = h264Bit(&br);
 				}
 				slice->longTermMsbPresent[i] = h264Bit(&br);
-				int cycle = 0;
+				int64_t cycle = 0;
 				if (slice->longTermMsbPresent[i])
-					cycle = (int)h264UE(&br);
+					cycle = readUnsigned(&br, INT_MAX);
 				/* 7-52: the cycles add up within each group. */
 				if (i != 0 && i != (int)fromSps)
 					cycle += slice->longTermMsbCycle[i - 1];
+				if (cycle > INT_MAX) return false;
 				slice->longTermMsbCycle[i] = cycle;
 			}
 		}

@@ -65,6 +65,7 @@ static inline bool hevcIsSubLayerNonReference(int type)
 typedef struct {
 	int	numNegative;
 	int	numPositive;
+	int	numDeltaPocsOfRefRpsIdx; /* UVD needs the predicted set's source size */
 	int	deltaPoc[2][HEVC_MAX_DELTA_POCS];	/* [0] before, [1] after */
 	bool	used[2][HEVC_MAX_DELTA_POCS];
 } HevcShortTermSet;
@@ -117,6 +118,7 @@ typedef struct {
 	/* Colour, from the VUI; 2 (unspecified) when it says nothing */
 	int		colourPrimaries, transferCharacteristics, matrixCoefficients;
 	int		fullRange;
+	int		fieldSeq;
 	/* sps_range_extension */
 	int		transformSkipRotation, transformSkipContext;
 	int		implicitRdpcm, explicitRdpcm;

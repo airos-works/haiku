@@ -27,6 +27,10 @@
 extern device_manager_info gDeviceManagerModule;
 
 const phys_size_t kMaxBounceBufferSize = 4 * B_PAGE_SIZE;
+	// A resource with a single bounce buffer may have it as large as its
+	// largest transfer, up to this: below it, every transfer that needs the
+	// buffer is split into pieces of its size.
+const phys_size_t kMaxSingleBounceBufferSize = 256 * B_PAGE_SIZE;
 
 
 DMABuffer*
@@ -187,8 +191,17 @@ DMAResource::Init(const dma_restrictions& restrictions,
 	if (_NeedsBoundsBuffers()) {
 		fBounceBufferSize = fRestrictions.max_segment_size
 			* min_c(fRestrictions.max_segment_count, 4);
-		if (fBounceBufferSize > kMaxBounceBufferSize)
-			fBounceBufferSize = kMaxBounceBufferSize;
+		phys_size_t maxBounceBufferSize = kMaxBounceBufferSize;
+		if (fBounceBufferCount == 1) {
+			// USB disks need all their transfers bounced on a machine with
+			// memory above 4 GiB: 16 KiB at a time held a USB 3 disk to a
+			// tenth of its speed.
+			maxBounceBufferSize = max_c(maxBounceBufferSize,
+				min_c(ROUNDUP(fRestrictions.max_transfer_size, B_PAGE_SIZE),
+					kMaxSingleBounceBufferSize));
+		}
+		if (fBounceBufferSize > maxBounceBufferSize)
+			fBounceBufferSize = maxBounceBufferSize;
 		TRACE("DMAResource::Init(): chose bounce buffer size %lu\n",
 			fBounceBufferSize);
 	}

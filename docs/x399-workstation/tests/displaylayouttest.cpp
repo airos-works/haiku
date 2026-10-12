@@ -81,9 +81,13 @@ fhd_timing()
 
 
 // Places outputs and works out their regions the way the nvidia_rm
-// accelerant does; a mirror's region is its source's.
+// accelerant does; a mirror's region is its source's. Like the GTX 1070's
+// display engine, it shrinks a region onto a monitor up to 1920 pixels
+// wide and refuses to shrink one onto anything wider.
 class FakeAccelerant : public HWInterface {
 public:
+	static const uint16 kWidestShrunk = 1920;
+
 	void Add(uint32 id, const char* name,
 		display_timing native = uhd_timing())
 	{
@@ -146,8 +150,19 @@ public:
 		return B_OK;
 	}
 
-	void Apply(const std::vector<display_output_config>& configs)
+	status_t Apply(const std::vector<display_output_config>& configs)
 	{
+		for (const display_output_config& config : configs) {
+			const FakeOutput* output = Output(config.id);
+			if (output == NULL || (config.flags & B_DISPLAY_OUTPUT_ENABLED) == 0)
+				continue;
+			uint16 renderScale = config.render_scale == 0
+				? 100 : config.render_scale;
+			uint16 width = config.timing.h_display != 0
+				? config.timing.h_display : output->native.h_display;
+			if (renderScale > config.scale && width > kWidestShrunk)
+				return B_BAD_VALUE;
+		}
 		for (FakeOutput& output : fOutputs) {
 			output.enabled = false;
 			output.mirror = false;
@@ -165,6 +180,7 @@ public:
 					? config.timing : output.native;
 			}
 		}
+		return B_OK;
 	}
 
 	const FakeOutput* Output(uint32 id) const
@@ -181,6 +197,24 @@ private:
 };
 
 
+// What Desktop::_SetDisplayLayout() does: the densest render scale the
+// hardware takes.
+static status_t
+apply(DisplayLayout& layout, FakeAccelerant& hardware)
+{
+	std::vector<uint16> renderScales;
+	layout.RenderScales(renderScales);
+	for (size_t i = 0; i < renderScales.size(); i++) {
+		layout.SetRenderScale(renderScales[i]);
+		std::vector<display_output_config> configs;
+		layout.GetConfigs(configs);
+		if (hardware.Apply(configs) == B_OK)
+			return B_OK;
+	}
+	return B_BAD_VALUE;
+}
+
+
 // What Desktop::_ConfigureDisplayLayout() does at boot, on a hot plug and
 // after a resume; the old version stored the result as well.
 static void
@@ -189,9 +223,7 @@ configure(DisplayLayout& layout, FakeAccelerant& hardware, BMessage& saved,
 {
 	layout.ReadOutputs(&hardware);
 	layout.Configure(saved, false);
-	std::vector<display_output_config> configs;
-	layout.GetConfigs(configs);
-	hardware.Apply(configs);
+	apply(layout, hardware);
 	layout.ReadOutputs(&hardware);
 	if (storeLikeBefore)
 		layout.Store(saved);
@@ -212,9 +244,7 @@ request(DisplayLayout& layout, FakeAccelerant& hardware, BMessage& saved,
 		printf("  request refused\n");
 		return;
 	}
-	std::vector<display_output_config> configs;
-	layout.GetConfigs(configs);
-	hardware.Apply(configs);
+	apply(layout, hardware);
 	layout.ReadOutputs(&hardware);
 	layout.Store(saved);
 }
@@ -232,10 +262,10 @@ request_message(DisplayLayout& layout, FakeAccelerant& hardware,
 	status_t status = changed.ApplyRequest(message);
 	if (status != B_OK)
 		return status;
+	status = apply(changed, hardware);
+	if (status != B_OK)
+		return status;
 	layout = changed;
-	std::vector<display_output_config> configs;
-	layout.GetConfigs(configs);
-	hardware.Apply(configs);
 	layout.ReadOutputs(&hardware);
 	layout.Store(saved);
 	return B_OK;
@@ -486,7 +516,9 @@ mirror_sizes()
 		"4K mirrors 1080p");
 	expect_mirror(layout, 2, 1, "4K mirrors 1080p");
 	check(layout.DisplayByID(2)->scale == 200, "the 4K monitor enlarges 2x");
-	check(layout.RenderScale() == 100, "drawn at the source's density");
+	check(layout.RenderScale() == 200
+		&& hardware.Output(1)->renderScale == 200,
+		"drawn at the 4K mirror's density, the 1080p source shrunk");
 
 	check(request_mirror(layout, hardware, saved, 2, -1) == B_OK,
 		"mirror off");
@@ -512,7 +544,8 @@ mirror_sizes()
 		&& layout.PrimaryDisplay()->id == 2,
 		"the main display made a mirror hands that role to its source");
 	check(layout.DisplayByID(1)->scale == 100
-		&& layout.RenderScale() == 100, "the 4K one is enlarged from 1080p");
+		&& layout.RenderScale() == 200,
+		"the 4K one is drawn one to one, the 1080p mirror shrunk");
 
 	// a mirror of another shape gets black bars
 	FakeAccelerant wide;
@@ -571,6 +604,72 @@ scale_pair()
 }
 
 
+// The workstation: two 4K monitors at 200% and a 1080p KVM at 100%. Drawn
+// at 200%, the 4K monitors show their regions one to one and the KVM's is
+// shrunk onto it; drawing at 100% would enlarge the 4K ones and blur them.
+static void
+mixed_scales()
+{
+	printf("mixed scales: two 4K monitors at 200%% and 1080p at 100%%\n");
+	FakeAccelerant hardware;
+	hardware.Add(1, "HDMI-0", fhd_timing());
+	hardware.Add(2, "DP-2");
+	hardware.Add(3, "DP-4");
+	DisplayLayout layout;
+	BMessage saved;
+	configure(layout, hardware, saved, false);
+
+	BMessage scale;
+	scale.AddInt32("id", 2);
+	scale.AddInt32("scale", 200);
+	check(request_message(layout, hardware, saved, scale) == B_OK,
+		"DP-2 at 200%");
+	scale.ReplaceInt32("id", 3);
+	check(request_message(layout, hardware, saved, scale) == B_OK,
+		"DP-4 at 200%");
+	std::vector<uint16> renderScales;
+	layout.RenderScales(renderScales);
+	check(renderScales.size() == 2 && renderScales[0] == 200
+		&& renderScales[1] == 100, "200% is tried before 100%");
+	check(layout.RenderScale() == 200
+		&& layout.DisplayByID(2)->renderScale == 200
+		&& layout.DisplayByID(3)->renderScale == 200
+		&& layout.DisplayByID(1)->renderScale == 200,
+		"everything is drawn at 200%");
+	check(layout.DisplayByID(1)->frame.Width() + 1 == 1920
+		&& layout.DisplayByID(2)->frame.Width() + 1 == 1920,
+		"each monitor is 1920 logical pixels wide");
+
+	// a hot plug arranges them again from the settings, at the same density
+	configure(layout, hardware, saved, false);
+	check(layout.RenderScale() == 200, "still 200% after a reconfiguration");
+
+	// the engine cannot shrink onto a 4K monitor: with one at 150% the
+	// density falls back to 150%, and only the 1080p one is shrunk
+	scale.ReplaceInt32("id", 2);
+	scale.ReplaceInt32("scale", 150);
+	check(request_message(layout, hardware, saved, scale) == B_OK,
+		"DP-2 at 150%");
+	check(layout.RenderScale() == 150
+		&& hardware.Output(1)->renderScale == 150,
+		"drawn at 150%, DP-4 enlarged");
+
+	// without the KVM, both 4K monitors at 200% again
+	scale.ReplaceInt32("scale", 200);
+	check(request_message(layout, hardware, saved, scale) == B_OK,
+		"DP-2 back at 200%");
+	hardware.SetConnected(1, false);
+	configure(layout, hardware, saved, false);
+	check(layout.RenderScale() == 200 && !layout.DisplayByID(1)->IsEnabled(),
+		"the KVM unplugged, 200%");
+	hardware.SetConnected(1, true);
+	configure(layout, hardware, saved, false);
+	check(layout.RenderScale() == 200 && layout.DisplayByID(1)->IsEnabled()
+		&& layout.DisplayByID(1)->scale == 100,
+		"the KVM plugged back in at 100%, still 200%");
+}
+
+
 static void
 single_scaled_timing()
 {
@@ -598,6 +697,7 @@ main()
 	column_of_three();
 	mirror_pair();
 	mirror_sizes();
+	mixed_scales();
 	printf(sFailures == 0 ? "all passed\n" : "%d FAILED\n", sFailures);
 	return sFailures == 0 ? 0 : 1;
 }

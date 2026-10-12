@@ -105,6 +105,9 @@
 /* MM_VERSION_CFM */
 #define AIC_VERSION_SIZE			28
 #define AIC_VERSION_LMAC			0
+#define AIC_VERSION_PHY_1			12	/* the PHY's features: bits 24-25 the
+										   widest channel (2: 80 MHz), 27
+										   LDPC decoding, 28 beamformee */
 #define AIC_VERSION_PHY_2			16
 #define AIC_VERSION_FEATURES		20
 #define AIC_VERSION_MAX_STA			24
@@ -207,6 +210,7 @@
 #define AIC_CONNECTED_AID			820	/* u16 */
 #define AIC_CONNECTED_FREQUENCY		824	/* u16 */
 #define AIC_CONNECTED_MIN			826
+#define AIC_CONNECTED_WIDTH			826	/* 0 20 MHz, 1 40, 2 80, 3 160, 4 80+80 */
 
 /* SM_DISCONNECT_REQ {u16 reason, vif}, SM_DISCONNECT_IND {u16 reason, vif} */
 #define AIC_DISCONNECT_SIZE			4
@@ -248,6 +252,8 @@
 #define AIC_TX_STA					29
 #define AIC_TX_FLAGS				30	/* u16 */
 #define AIC_TX_NEED_CONFIRM			(1U << 31)
+#define AIC_TX_MGMT					(1 << 3)	/* flags: an 802.11 frame */
+#define AIC_TX_MGMT_NO_CCK			(1 << 4)
 
 #define AIC_AC_BK					0
 #define AIC_AC_BE					1

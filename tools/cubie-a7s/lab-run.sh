@@ -45,7 +45,18 @@ if ! "${SSH[@]}" true 2>/dev/null; then
 	"${POWER[@]}" cycle > /dev/null
 	deadline=$((SECONDS + 240))
 	until "${SSH[@]}" true 2>/dev/null; do
-		(( SECONDS < deadline )) || { echo "Debian does not come up" >&2; exit 1; }
+		if (( SECONDS >= deadline )); then
+			# after a thermal power-off the board comes back only from a
+			# long plug-off; a 5 s cycle leaves it dark
+			if [[ -n ${long_cycle:-} ]]; then
+				echo "Debian does not come up" >&2
+				exit 1
+			fi
+			long_cycle=1
+			echo "no Debian: power cycling with a 60 s plug-off"
+			RPI4_OFF_SECONDS=60 "${POWER[@]}" cycle > /dev/null
+			deadline=$((SECONDS + 240))
+		fi
 		sleep 3
 	done
 fi
