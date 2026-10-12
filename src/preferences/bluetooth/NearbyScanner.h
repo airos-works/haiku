@@ -103,6 +103,8 @@ private:
 			int32				fLEGeneration;
 			bool				fInquiryActive;
 			bigtime_t			fInquiryNotBefore;
+			bigtime_t			fLastFullInquiry;
+			bool				fInquiryForced;
 			int32				fInquiryGeneration;
 			int32				fFailures;
 			int32				fStatus;

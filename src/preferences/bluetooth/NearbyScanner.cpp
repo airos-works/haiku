@@ -71,6 +71,10 @@ static const bigtime_t kInquiryIdleCheck = 1000000;
 // cancels it.
 static const bigtime_t kInquiryWatchInterval = 200000;
 static const bigtime_t kInquiryInputActive = 250000;
+// But someone who keeps using the mouse while waiting for a device to show
+// up still has to find it: after this long without a complete inquiry, the
+// next one starts and runs to its end regardless.
+static const bigtime_t kInquiryMaxWait = 15000000;
 	// in units of 1.28 seconds
 
 enum {
@@ -144,6 +148,8 @@ NearbyScanner::NearbyScanner(ScannerListener* listener)
 	fLEGeneration(0),
 	fInquiryActive(false),
 	fInquiryNotBefore(0),
+	fLastFullInquiry(0),
+	fInquiryForced(false),
 	fInquiryGeneration(0),
 	fFailures(0),
 	fStatus(STATUS_OFF)
@@ -391,8 +397,10 @@ NearbyScanner::MessageReceived(BMessage* message)
 				_ScheduleInquiry(fInquiryNotBefore - now);
 				break;
 			}
-			// Someone is using the mouse or keyboard: wait until they stop.
-			if (idle_time() < kInquiryIdleTime) {
+			// Someone is using the mouse or keyboard: wait until they stop,
+			// unless inquiries have been put off too long.
+			fInquiryForced = now - fLastFullInquiry > kInquiryMaxWait;
+			if (!fInquiryForced && idle_time() < kInquiryIdleTime) {
 				_ScheduleInquiry(kInquiryIdleCheck);
 				break;
 			}
@@ -417,6 +425,7 @@ NearbyScanner::MessageReceived(BMessage* message)
 			} else if (message->what == kMsgInquiryDone) {
 				TRACE("inquiry finished: type %" B_PRId32,
 					message->GetInt32("type", 0));
+				fLastFullInquiry = system_time();
 				_EndInquiry();
 			} else {
 				const uint8* address;
@@ -448,7 +457,7 @@ NearbyScanner::MessageReceived(BMessage* message)
 		case kMsgInquiryWatch:
 			if (generation != fInquiryGeneration || !fInquiryActive)
 				break;
-			if (idle_time() < kInquiryInputActive) {
+			if (!fInquiryForced && idle_time() < kInquiryInputActive) {
 				// The mouse or keyboard is in use again: give the radio
 				// back. What the inquiry found so far is kept.
 				TRACE("input resumed: cancelling the inquiry");
