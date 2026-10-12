@@ -29,6 +29,7 @@
 #include <util/AutoLock.h>
 #include <vm/vm.h>
 
+#include <retrace_follower.h>
 #include <rpi_display.h>
 #include <rpi_firmware.h>
 
@@ -59,6 +60,18 @@
 
 // The VideoCore sees the ARM's first gigabyte at this bus address.
 #define VC_BUS_OFFSET					0xc0000000
+
+// The compositor (HVS) of the BCM2711, read only: the firmware drives it
+// (Linux's vc4_regs.h, vc4_hvs.c and vc4_crtc.c). HDMI0 is pixel valve 2,
+// fed by the compositor's output 4; HDMI1 pixel valve 4, output 5. Each
+// output takes one of the three channels, as a mux says.
+#define HVS_DISPDITHER					0x14	// output 5's mux: 31..30
+#define HVS_DISPEOLN					0x18	// output 4's mux: 31..30
+#define HVS_DISPCTRLX(x)				(0x40 + (x) * 0x10)
+#define HVS_DISPCTRLX_ENABLE			(1u << 31)
+#define HVS_DISPSTAT1					0x58	// frame counts 0 and 1
+#define HVS_DISPSTAT2					0x68	// frame count 2
+#define HVS_MUX_NONE					3
 
 struct firmware_plane {
 	uint8	display;
@@ -106,6 +119,12 @@ struct display_info {
 	port_id			changePort;
 	int32			changeCode;
 	void*			notificationOwner;
+
+	// vertical blanks, from the compositor's frame counter
+	area_id			hvsArea;
+	volatile uint8*	hvs;
+	RetraceSemaphores* retrace;
+	class HvsRetraceFollower* retraceFollower;
 };
 
 
@@ -273,6 +292,107 @@ poll_outputs(void* cookie)
 		}
 	}
 	return B_OK;
+}
+
+
+//	#pragma mark - vertical blank
+
+
+/*!	The firmware gives no interrupt for the blanks, but the compositor
+	counts the frames of each channel, and the count goes up at the end of
+	a frame. The one followed is the channel of the first output shown.
+*/
+class HvsRetraceFollower : public RetraceFollower {
+public:
+	HvsRetraceFollower(display_info* info)
+		:
+		RetraceFollower(*info->retrace, 0x3f),
+		fInfo(info),
+		fChannel(-1),
+		fLooks(0)
+	{
+	}
+
+protected:
+	virtual int64 FrameCount()
+	{
+		// the outputs and their channels change now and then: once a second
+		if (fChannel < 0 || ++fLooks >= 300) {
+			fChannel = _Channel();
+			fLooks = 0;
+		}
+		if (fChannel < 0)
+			return -1;
+		switch (fChannel) {
+			case 0:
+				return (_Read(HVS_DISPSTAT1) >> 20) & 0x3f;
+			case 1:
+				return (_Read(HVS_DISPSTAT1) >> 14) & 0x3f;
+			default:
+				return (_Read(HVS_DISPSTAT2) >> 14) & 0x3f;
+		}
+	}
+
+private:
+	uint32 _Read(uint32 offset)
+	{
+		return *(volatile uint32*)(fInfo->hvs + offset);
+	}
+
+	int32 _Channel()
+	{
+		const rpi_display_shared_info& shared = *fInfo->shared;
+		for (uint32 i = 0; i < shared.output_count; i++) {
+			if ((shared.outputs[i].flags & RPI_DISPLAY_OUTPUT_ENABLED) == 0)
+				continue;
+			uint32 mux = _Read(i == 0 ? HVS_DISPEOLN : HVS_DISPDITHER) >> 30;
+			if (mux == HVS_MUX_NONE
+				|| (_Read(HVS_DISPCTRLX(mux)) & HVS_DISPCTRLX_ENABLE) == 0) {
+				continue;
+			}
+			return mux;
+		}
+		return -1;
+	}
+
+	display_info*	fInfo;
+	int32			fChannel;
+	int32			fLooks;
+};
+
+
+/*!	The compositor's registers, read only, from the device tree node the
+	driver is attached to.
+*/
+static void
+map_compositor(display_info* info)
+{
+	info->hvsArea = -1;
+	device_node* parent = sDeviceManager->get_parent_node(info->node);
+	fdt_device_module_info* fdt;
+	fdt_device* device;
+	uint64 base = 0, size = 0;
+	status_t status = parent != NULL ? sDeviceManager->get_driver(parent,
+		(driver_module_info**)&fdt, (void**)&device) : B_ERROR;
+	if (status == B_OK && !fdt->get_reg(device, 0, &base, &size))
+		status = B_BAD_DATA;
+	if (parent != NULL)
+		sDeviceManager->put_node(parent);
+	if (status != B_OK || size < HVS_DISPSTAT2 + 4) {
+		ERROR("no compositor registers, no vertical blanks\n");
+		return;
+	}
+
+	phys_addr_t page = base & ~(phys_addr_t)(B_PAGE_SIZE - 1);
+	void* address;
+	info->hvsArea = map_physical_memory("BCM2711 HVS", page, B_PAGE_SIZE,
+		B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY, B_KERNEL_READ_AREA,
+		&address);
+	if (info->hvsArea < 0) {
+		ERROR("cannot map the compositor: %s\n", strerror(info->hvsArea));
+		return;
+	}
+	info->hvs = (volatile uint8*)address + (base - page);
 }
 
 
@@ -524,6 +644,10 @@ display_init_device(void* _info, void** _cookie)
 		resume_thread(info->pollThread);
 	else
 		ERROR("cannot start HDMI hotplug thread\n");
+
+	map_compositor(info);
+	if (info->hvsArea >= 0)
+		info->retrace = new(std::nothrow) RetraceSemaphores;
 	*_cookie = info;
 	return B_OK;
 }
@@ -542,6 +666,10 @@ display_uninit_device(void* cookie)
 		if (info->hpdAreas[i] >= 0)
 			delete_area(info->hpdAreas[i]);
 	}
+	delete info->retraceFollower;
+	delete info->retrace;
+	if (info->hvsArea >= 0)
+		delete_area(info->hvsArea);
 	mutex_destroy(&info->lock);
 	if (info->bufferArea >= 0)
 		delete_area(info->bufferArea);
@@ -661,6 +789,26 @@ display_control(void* cookie, uint32 op, void* buffer, size_t length)
 			if (status == B_OK)
 				info->owner = cookie;
 			return status;
+		}
+
+		case RPI_DISPLAY_GET_RETRACE_SEMAPHORE:
+		{
+			if (info->retrace == NULL)
+				return B_NOT_SUPPORTED;
+			MutexLocker locker(info->lock);
+			sem_id semaphore = info->retrace->Get();
+			if (semaphore < 0)
+				return semaphore;
+			// followed from the first time a program wants the blanks
+			if (info->retraceFollower == NULL) {
+				info->retraceFollower
+					= new(std::nothrow) HvsRetraceFollower(info);
+				if (info->retraceFollower == NULL)
+					return B_NO_MEMORY;
+				info->retraceFollower->Start("rpi display blanks");
+			}
+			locker.Unlock();
+			return user_memcpy(buffer, &semaphore, sizeof(semaphore));
 		}
 
 		case RPI_DISPLAY_CLONE_FRAME_BUFFER:

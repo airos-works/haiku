@@ -30,7 +30,10 @@ enum {
 	// consistent snapshot of rpi_display_shared_info, including hotplug state
 	RPI_DISPLAY_GET_STATE,
 	// struct rpi_display_change_port; negative port unregisters notifications
-	RPI_DISPLAY_SET_CHANGE_PORT
+	RPI_DISPLAY_SET_CHANGE_PORT,
+	// sem_id: the calling team's semaphore, released at every vertical
+	// blank of the first output shown (B_ACCELERANT_RETRACE_SEMAPHORE)
+	RPI_DISPLAY_GET_RETRACE_SEMAPHORE
 };
 
 #define RPI_DISPLAY_OUTPUT_CONNECTED	0x1

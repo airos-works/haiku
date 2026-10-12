@@ -372,10 +372,19 @@ sunxi_get_accelerant_device_info(accelerant_device_info* info)
 }
 
 
+/*!	Released at every vertical blank of the DisplayPort output (at 60 Hz
+	while it shows nothing); app_server's own, which it gives to its
+	clients.
+*/
 static sem_id
 sunxi_accelerant_retrace_semaphore()
 {
-	return -1;
+	sem_id semaphore;
+	if (ioctl(gInfo->device, SUNXI_DISPLAY_GET_RETRACE_SEMAPHORE, &semaphore,
+			sizeof(semaphore)) != 0) {
+		return -1;
+	}
+	return semaphore;
 }
 
 

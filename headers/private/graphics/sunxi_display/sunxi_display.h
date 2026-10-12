@@ -38,7 +38,10 @@ enum {
 	SUNXI_DISPLAY_SET_CHANGE_PORT,
 	// struct sunxi_display_register: reads or writes a display register;
 	// only when the driver settings say "debug_registers true" (the lab)
-	SUNXI_DISPLAY_DEBUG_REGISTER
+	SUNXI_DISPLAY_DEBUG_REGISTER,
+	// sem_id: the calling team's semaphore, released at every vertical
+	// blank of the DisplayPort output (B_ACCELERANT_RETRACE_SEMAPHORE)
+	SUNXI_DISPLAY_GET_RETRACE_SEMAPHORE
 };
 
 #define SUNXI_DISPLAY_OUTPUT_CONNECTED	0x1
