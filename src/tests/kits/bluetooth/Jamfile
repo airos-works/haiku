@@ -9,3 +9,4 @@ SEARCH_SOURCE += [ FDirName $(TOP) src kits bluetooth ] ;
 UsePrivateHeaders bluetooth ;
 SubInclude HAIKU_TOP src tests kits bluetooth l2capClient ;
 SubInclude HAIKU_TOP src tests kits bluetooth bt_hid_test ;
+SubInclude HAIKU_TOP src tests kits bluetooth le_hid_layout_test ;
