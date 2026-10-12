@@ -8,6 +8,9 @@
 # both come from the GPU user land of amdgpu_drm (src/forks/linux-drm,
 # haiku/tools/x399-gpu-userland.sh ... libva ffmpeg).
 #
+# The add-on finds libva in /boot/system/non-packaged/lib through its RPATH:
+# Summit's LIBRARY_PATH leaves that directory out.
+#
 # HAIKU is the tree to build from (this one by default), REMOTE where on the
 # workstation to build it. With NO_INSTALL=1 the add-on is only built.
 # Installing replaces the file with a new one rather than writing over it:
@@ -34,5 +37,5 @@ $SSH "cd $REMOTE/amdgpu_va \
 	&& g++ -O2 -fPIC -c ../amduvd/HevcOutput.cpp \$INC \
 	&& g++ -shared -o amduvd AmdgpuVaPlugin.o H264Output.o HevcOutput.o \
 		-Wl,--exclude-libs,ALL \$F/lib/libavcodec.a \$F/lib/libavutil.a \
-		-L\$P/lib -lva -lva-drm -lbe -lmedia \
+		-L\$P/lib -lva -lva-drm -lbe -lmedia -Wl,-rpath,\$P/lib \
 	&& $INSTALL"
