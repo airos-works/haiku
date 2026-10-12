@@ -749,6 +749,16 @@ L2capEndpoint::_HandleConnectionReq(HciConnection* connection,
 
 	endpoint->fAcceptSemaphore = fAcceptSemaphore;
 
+	// accept() and getpeername() tell the server which device this is (a
+	// HID device opens its channels itself when it reconnects).
+	memcpy(&newSocket->address, &socket->address, sizeof(sockaddr_l2cap));
+	sockaddr_l2cap* peer = (sockaddr_l2cap*)&newSocket->peer;
+	memset(peer, 0, sizeof(sockaddr_l2cap));
+	peer->l2cap_len = sizeof(sockaddr_l2cap);
+	peer->l2cap_family = AF_BLUETOOTH;
+	peer->l2cap_psm = psm;
+	peer->l2cap_bdaddr = connection->destination;
+
 	endpoint->fConnection = connection;
 	endpoint->fState = CONFIGURATION;
 
