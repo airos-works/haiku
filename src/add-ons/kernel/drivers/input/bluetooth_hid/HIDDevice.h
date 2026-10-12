@@ -90,6 +90,7 @@ private:
 			uint32				fOutputHead;
 			uint32				fOutputCount;
 			ConditionVariable	fOutputCondition;
+			ConditionVariable	fQueueSpace;
 
 			uint32				fDropped;
 };

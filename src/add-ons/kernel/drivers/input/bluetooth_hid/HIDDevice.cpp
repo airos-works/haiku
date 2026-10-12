@@ -21,7 +21,11 @@
 // Reports of one ID that wait for their handler. A key press and release
 // that arrive together need two; a mouse that nobody reads fills them and
 // then loses its oldest movements, which is harmless.
-static const uint32 kQueueSlots = 32;
+static const uint32 kQueueSlots = 64;
+// How long the Bluetooth server waits for room when a device that is open
+// has a full queue: it then reads its channel more slowly, rather than
+// losing a key.
+static const bigtime_t kQueueFullWait = 500000;
 // Keyboard LED changes waiting for the Bluetooth server to send them.
 static const uint32 kOutputSlots = 8;
 
@@ -60,6 +64,7 @@ HIDDevice::HIDDevice(const uint8* descriptor, size_t descriptorLength,
 	strlcpy(fName, name, sizeof(fName));
 	mutex_init(&fLock, "bluetooth hid device");
 	fOutputCondition.Init(this, "bluetooth hid output");
+	fQueueSpace.Init(this, "bluetooth hid queue space");
 
 	status_t status = fParser.ParseReportDescriptor(descriptor,
 		descriptorLength);
@@ -169,6 +174,7 @@ HIDDevice::Removed()
 	MutexLocker locker(fLock);
 	fRemoved = true;
 	fOutputCondition.NotifyAll(B_DEV_NOT_READY);
+	fQueueSpace.NotifyAll(B_DEV_NOT_READY);
 	locker.Unlock();
 
 	// Wake the handlers waiting for reports; they see IsRemoved() and stop.
@@ -277,7 +283,21 @@ HIDDevice::InputReport(const uint8* data, size_t length)
 	}
 
 	size_t slotSize = sizeof(size_t) + fMaxReportSize;
+	bigtime_t deadline = system_time() + kQueueFullWait;
+	while (queue->count == kQueueSlots && IsOpen() && !fRemoved) {
+		ConditionVariableEntry entry;
+		fQueueSpace.Add(&entry);
+		locker.Unlock();
+		status_t status = entry.Wait(B_ABSOLUTE_TIMEOUT | B_CAN_INTERRUPT,
+			deadline);
+		locker.Lock();
+		if (status != B_OK)
+			break;
+	}
+	if (fRemoved)
+		return ENODEV;
 	if (queue->count == kQueueSlots) {
+		// nobody reads this report: lose the oldest
 		queue->head = (queue->head + 1) % kQueueSlots;
 		queue->count--;
 	}
@@ -360,5 +380,6 @@ HIDDevice::_Deliver(ReportQueue* queue)
 	if (queue->report->SetReport(B_OK, report, length) > 0) {
 		queue->head = (queue->head + 1) % kQueueSlots;
 		queue->count--;
+		fQueueSpace.NotifyAll();
 	}
 }
