@@ -34,12 +34,14 @@ Known limits:
   until the GPU has run for 30 s; a boot that finds it leaves the GPU to the
   framebuffer driver until it is deleted. No real crash has exercised it yet.
 
-- GPU writes into system memory reach about 1.5 GB/s (reads 5.7 GB/s), which
-  bounds readback: Summit's compositor reads every frame back, and decoded
-  pictures are copied out of video memory. Not the PCIe link (held at 8 GT/s
-  x8 it is the same; AER is clean). amdgpu is built without PAT, so it
-  makes no write-combined (unsnooped) system memory; that is the next
-  suspect.
+- GPU writes into system memory reach 1.55 GB/s (reads 5.7 GB/s), which
+  bounds readback: Summit's compositor reads every frame back, and 4K
+  pictures are copied out of video memory. Ruled out on 2026-10-13: the
+  link (held at 8 GT/s x8 during the copies; AER clean; root port and GPU
+  both at 256-byte payloads with relaxed ordering), the copy engine (CP DMA
+  and shaders alike) and snooping (non-snooped write-combined buffers,
+  `haiku_uswc`, write no faster). Cause open; comparing with Linux on this
+  machine would settle whether it is the platform.
 - 4K at 60 fps decodes on the GPU but misses frames: the 8-bit YUV to RGB
   conversion takes 10 ms a picture.
 - Vulkan presents by copying (no dma-buf on Haiku): GPU blit to host memory,
