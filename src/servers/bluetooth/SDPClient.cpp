@@ -101,8 +101,11 @@ SDPClient::RequestServiceRecords()
 	rawReq.AddDataSeq(5);
 	rawReq.AddUInt32(arrtRange);
 
+	// The continuation state is at most 16 bytes (Core spec, SDP 4.3).
 	char contStateData[17];
 	uint8 contStateNumBytes = 0;
+	const int32 kMaxRounds = 64;
+	int32 rounds = 0;
 	sdp_pdu pduHeader;
 	pduHeader.pdu_id = SDP_PDU_SERVICE_SEARCH_ATTRIBUTE_REQUEST;
 
@@ -133,20 +136,43 @@ SDPClient::RequestServiceRecords()
 			return B_ERROR;
 		}
 
-		reply.Seek(sizeof(sdp_pdu), SEEK_SET);
+		// Everything below comes from the remote device: check each length
+		// against what actually arrived before using it.
+		const uint8* replyData = (const uint8*)reply.Buffer();
+		size_t replySize = reply.BufferLength();
+		if (replySize < sizeof(sdp_pdu) + sizeof(uint16) + 1
+			|| replyData[0] != SDP_PDU_SERVICE_SEARCH_ATTRIBUTE_RESPONSE) {
+			TRACE_BT("SDP: Unexpected reply (%" B_PRIuSIZE " bytes, PDU %#x)\n",
+				replySize, replySize > 0 ? replyData[0] : 0);
+			return B_ERROR;
+		}
 
-		uint16 attrListsSize;
-		reply.ReadExactly(&attrListsSize, sizeof(uint16));
-		attrListsSize = B_BENDIAN_TO_HOST_INT16(attrListsSize);
+		size_t offset = sizeof(sdp_pdu);
+		uint16 attrListsSize = (replyData[offset] << 8) | replyData[offset + 1];
+		offset += sizeof(uint16);
+		if (attrListsSize > replySize - offset - 1) {
+			TRACE_BT("SDP: Reply claims %u attribute bytes, has %" B_PRIuSIZE "\n",
+				attrListsSize, replySize - offset - 1);
+			return B_ERROR;
+		}
 
-		fullAttrLists.WriteExactly((uint8*)reply.Buffer() + reply.Position(), attrListsSize);
-		reply.Seek(attrListsSize, SEEK_CUR);
+		fullAttrLists.WriteExactly(replyData + offset, attrListsSize);
+		offset += attrListsSize;
 
-		reply.ReadExactly(&contStateNumBytes, sizeof(uint8));
-		reply.ReadExactly(contStateData, contStateNumBytes);
+		contStateNumBytes = replyData[offset++];
+		if (contStateNumBytes > sizeof(contStateData) - 1
+			|| contStateNumBytes > replySize - offset) {
+			TRACE_BT("SDP: Bad continuation state length %u\n", contStateNumBytes);
+			return B_ERROR;
+		}
+		memcpy(contStateData, replyData + offset, contStateNumBytes);
 
 		if (contStateNumBytes == 0)
 			break;
+		if (++rounds > kMaxRounds) {
+			TRACE_BT("SDP: Too many continuation rounds\n");
+			return B_ERROR;
+		}
 	}
 
 	if (contStateNumBytes) {
