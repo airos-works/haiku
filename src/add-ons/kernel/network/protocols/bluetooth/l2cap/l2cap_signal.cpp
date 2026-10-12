@@ -243,6 +243,7 @@ l2cap_handle_disconnection_req(HciConnection* conn, uint8 ident, net_buffer* buf
 	const uint16 scid = le16toh(command->scid);
 
 	endpoint->_HandleDisconnectionReq(ident, scid);
+	endpoint->_AbortIfNeverAccepted();
 	gSocketModule->release_socket(endpoint->socket);
 	return B_OK;
 }

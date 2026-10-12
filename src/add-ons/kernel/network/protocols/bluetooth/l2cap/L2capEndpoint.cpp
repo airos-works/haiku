@@ -766,6 +766,34 @@ L2capEndpoint::_HandleConnectionReq(HciConnection* connection,
 
 	send_l2cap_connection_rsp(connection, ident, endpoint->fChannelID, scid,
 		l2cap_connection_rsp::RESULT_SUCCESS, 0);
+
+	// Our side of the configuration goes out now, as other stacks do: a
+	// peer that waits for it before sending its own (the Keychron K4 seems
+	// to) would otherwise leave the channel half open.
+	endpoint->_SendChannelConfig();
+}
+
+
+/*!	A channel the peer opened and closed again (or lost with its link)
+	before anyone accepted it. It still counted against the listener's
+	backlog; a handful of those and every new channel on that PSM was
+	refused for want of resources, until the listening server restarted.
+	The caller must hold a reference to the socket and not fLock: taking
+	the channel off the listener can drop the last but that reference.
+*/
+void
+L2capEndpoint::_AbortIfNeverAccepted()
+{
+	{
+		MutexLocker locker(fLock);
+		if (fState != CLOSED)
+			return;
+	}
+	if (gSocketModule->has_parent(socket)) {
+		dprintf("l2cap: channel %#x closed before it was accepted; off the "
+			"listener's backlog\n", fChannelID);
+		gSocketModule->set_aborted(socket);
+	}
 }
 
 

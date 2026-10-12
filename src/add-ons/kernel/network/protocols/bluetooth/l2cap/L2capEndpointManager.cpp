@@ -254,6 +254,7 @@ L2capEndpointManager::Disconnected(HciConnection* connection)
 			gSocketModule->notify(endpoint->socket, B_SELECT_READ, ENOTCONN);
 			if (releaseIdent)
 				gSocketModule->release_socket(endpoint->socket);
+			endpoint->_AbortIfNeverAccepted();
 			gSocketModule->release_socket(endpoint->socket);
 		}
 	}

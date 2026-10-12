@@ -61,6 +61,7 @@ public:
 							uint16 result, uint16* mtu, uint16* flush_timeout, l2cap_qos* flow);
 			void		_HandleDisconnectionReq(uint8 ident, uint16 scid);
 			void		_HandleDisconnectionRsp(uint8 ident, uint16 dcid, uint16 scid);
+			void		_AbortIfNeverAccepted();
 
 private:
 	inline bool
