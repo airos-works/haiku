@@ -454,20 +454,26 @@ private:
 			return;
 		fGaps++;
 		fMoving += gap;
+		if (gap <= 15000)
+			fOnTime++;
 		if (gap > 30000)
 			fLate++;
 		if (gap > 60000)
 			fVeryLate++;
 		if (gap > fLongest)
 			fLongest = gap;
-		if (now - fGapsSince < 30000000 || fGaps < 200)
+		if (now - fGapsSince < 15000000 || fGaps < 200)
 			return;
+		// On time: the next connection event (up to 15 ms); fast, steady
+		// movement has nearly all reports on time, slow movement skips
+		// events by itself.
 		LOG(LE_LOG_INFO, "mouse %s smoothness: %" B_PRIu32 " reports in %.1f "
-			"s moving (%.0f/s), %.1f%% of gaps over 30 ms, %.1f%% over 60 ms, "
-			"longest %" B_PRId64 " ms", mouse, fGaps, fMoving / 1000000.0,
-			fGaps * 1000000.0 / fMoving, 100.0 * fLate / fGaps,
+			"s moving (%.0f/s), %.1f%% on time, %.1f%% of gaps over 30 ms, "
+			"%.1f%% over 60 ms, longest %" B_PRId64 " ms", mouse, fGaps,
+			fMoving / 1000000.0, fGaps * 1000000.0 / fMoving,
+			100.0 * fOnTime / fGaps, 100.0 * fLate / fGaps,
 			100.0 * fVeryLate / fGaps, fLongest / 1000);
-		fGaps = fLate = fVeryLate = 0;
+		fGaps = fLate = fVeryLate = fOnTime = 0;
 		fMoving = fLongest = 0;
 		fGapsSince = now;
 	}
@@ -549,6 +555,7 @@ private:
 	uint32 fGaps = 0;
 	uint32 fLate = 0;
 	uint32 fVeryLate = 0;
+	uint32 fOnTime = 0;
 };
 
 } // namespace

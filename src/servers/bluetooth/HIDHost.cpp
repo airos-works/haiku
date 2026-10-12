@@ -264,7 +264,21 @@ HIDHost::Session::_Main()
 		uint8 buffer[1 + BLUETOOTH_HID_MAX_REPORT];
 		ssize_t length;
 		bool reported = false;
+		uint32 recent = 0;
+		bigtime_t recentSince = system_time();
 		while (_Receive(fInterrupt, buffer, sizeof(buffer), length)) {
+			// Show that the device is in use, at most every 30 s.
+			recent++;
+			if (system_time() - recentSince >= 30000000) {
+				LOG(LE_LOG_INFO, "%s: %" B_PRIu32 " reports in the last %"
+					B_PRId64 " s", fAddressString, recent,
+					(system_time() - recentSince) / 1000000);
+				recent = 0;
+				recentSince = system_time();
+			} else if (recent == 1 && reports == 0) {
+				LOG(LE_LOG_INFO, "%s: first input report (%zd bytes, id %u)",
+					fAddressString, length - 1, length > 1 ? buffer[1] : 0);
+			}
 			if (buffer[0] != (HIDP_DATA | HIDP_REPORT_INPUT)) {
 				LOG(LE_LOG_DEBUG, "%s: ignoring interrupt channel header "
 					"%#x", fAddressString, buffer[0]);
