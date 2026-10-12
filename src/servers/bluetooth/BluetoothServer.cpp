@@ -670,8 +670,10 @@ BluetoothServer::_ServicesDiscovered(BMessage* message)
 			if (local != NULL)
 				local->EnablePageScan();
 		}
-		if (message->GetBool("outgoing", false))
-			fHIDHost->Connect(*address);
+		// Opened from here whether we or the device made the link: a
+		// keyboard that connected by itself may wait for us (the HID host
+		// leaves alone a device that is opening its channels already).
+		fHIDHost->Connect(*address);
 	}
 }
 
@@ -694,7 +696,8 @@ BluetoothServer::CheckLinkSecurityLater(hci_id hid, const bdaddr_t& address,
 void
 BluetoothServer::NotifyServices(ServerRemoteDevice* rd)
 {
-	fHIDHost->LinkEncrypted(rd->bdaddr, rd->encryption_enabled != 0);
+	fHIDHost->LinkEncrypted(rd->bdaddr, rd->encryption_enabled != 0,
+		!rd->outgoing);
 }
 
 

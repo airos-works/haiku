@@ -59,7 +59,7 @@ public:
 			void				Connect(const bdaddr_t& address);
 
 			void				LinkEncrypted(const bdaddr_t& address,
-									bool encrypted);
+									bool encrypted, bool deviceInitiated);
 			void				LinkDown(const bdaddr_t& address);
 
 private:
@@ -78,6 +78,7 @@ private:
 	static	status_t			_ListenThread(void* data);
 			void				_Listen(uint16 psm, int index);
 	static	status_t			_ConnectThread(void* data);
+	static	status_t			_ReconnectCheckThread(void* data);
 			void				_ConnectChannels(const bdaddr_t& address);
 			int					_OpenChannel(const bdaddr_t& address,
 									uint16 psm);

@@ -352,9 +352,12 @@ LocalDeviceImpl::RemoteDeviceByAddr(bdaddr_t bdaddr)
 ServerRemoteDevice*
 LocalDeviceImpl::RemoteDeviceByHandle(uint16 handle)
 {
+	// Controllers reuse handles: one of a link that went down may now be
+	// another device's. Only a device with a link has a handle.
 	for (int32 i = 0; i < fRemoteDevicesList.CountItems(); i++) {
 		ServerRemoteDevice* rd = fRemoteDevicesList.ItemAt(i);
-		if (rd->handle == handle)
+		if (rd->handle == handle
+			&& rd->conn_state != RemoteDevice::DISCONNECTED)
 			return rd;
 	}
 	return NULL;
@@ -1912,7 +1915,7 @@ LocalDeviceImpl::ConnectionComplete(struct hci_ev_conn_complete* event)
 			rd->auth_retries = 0;
 			rd->encryption_enabled = event->encrypt_mode;
 			((BluetoothServer*)be_app)->GetHIDHost()->LinkEncrypted(
-				rd->bdaddr, event->encrypt_mode != 0);
+				rd->bdaddr, event->encrypt_mode != 0, false);
 		}
 
 		// Tell the user about a device that connected on its own; one we
@@ -1990,6 +1993,7 @@ LocalDeviceImpl::DisconnectionComplete(hci_ev_disconnection_complete_reply* even
 	if (rd != NULL && (event->status == BT_OK
 		|| event->status == BT_NO_CONNECTION)) {
 		rd->conn_state = RemoteDevice::DISCONNECTED;
+		rd->handle = 0xffff;
 		rd->outgoing = false;
 		rd->encryption_enabled = 0;
 		((BluetoothServer*)be_app)->GetHIDHost()->LinkDown(rd->bdaddr);
@@ -2468,8 +2472,14 @@ LocalDeviceImpl::EncryptChange(struct hci_ev_encrypt_change* event)
 		return;
 
 	rd->encryption_enabled = event->encrypt;
-	if (rd->encryption_enabled != 0)
+	if (rd->encryption_enabled != 0) {
 		((BluetoothServer*)be_app)->NotifyServices(rd);
+		// A device that connected and secured the link by itself never
+		// went through our authentication, which is what queries the
+		// services of a device we do not know yet.
+		if (!rd->outgoing && rd->services.IsEmpty())
+			((BluetoothServer*)be_app)->DiscoverServices(rd);
+	}
 }
 
 

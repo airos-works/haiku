@@ -690,10 +690,56 @@ HIDHost::Connect(const bdaddr_t& address)
 
 
 void
-HIDHost::LinkEncrypted(const bdaddr_t& address, bool encrypted)
+HIDHost::LinkEncrypted(const bdaddr_t& address, bool encrypted,
+	bool deviceInitiated)
 {
 	BAutolock locker(fLock);
 	fEncrypted[_Key(address)] = encrypted;
+	if (!encrypted || !deviceInitiated || fQuitting
+		|| _FindStored(address, NULL) < 0)
+		return;
+	locker.Unlock();
+
+	// A paired device that connected by itself should open its channels
+	// now; a Keychron K4 does not (it waits and gives up after a minute).
+	// If nothing came after a moment, open them from here.
+	ConnectJob* job = new(std::nothrow) ConnectJob;
+	if (job == NULL)
+		return;
+	job->host = this;
+	job->address = address;
+	thread_id thread = spawn_thread(&_ReconnectCheckThread,
+		"bluetooth HID reconnect", B_NORMAL_PRIORITY, job);
+	if (thread < 0 || resume_thread(thread) != B_OK)
+		delete job;
+}
+
+
+/*static*/ status_t
+HIDHost::_ReconnectCheckThread(void* data)
+{
+	ConnectJob* job = (ConnectJob*)data;
+	HIDHost* host = job->host;
+	bdaddr_t address = job->address;
+	delete job;
+
+	snooze(3000000);
+
+	BAutolock locker(host->fLock);
+	uint64 key = _Key(address);
+	if (host->fQuitting
+		|| host->fSessions.find(key) != host->fSessions.end()
+		|| host->fPending.find(key) != host->fPending.end()
+		|| host->fEncrypted.find(key) == host->fEncrypted.end())
+		return B_OK;
+	locker.Unlock();
+
+	char addressString[18];
+	format_address(address, addressString);
+	LOG(LE_LOG_INFO, "%s: reconnected without opening its HID channels; "
+		"opening them", addressString);
+	host->_ConnectChannels(address);
+	return B_OK;
 }
 
 
@@ -816,7 +862,8 @@ HIDHost::_ConnectChannels(const bdaddr_t& address)
 	format_address(address, addressString);
 	{
 		BAutolock locker(fLock);
-		if (fSessions.find(_Key(address)) != fSessions.end())
+		if (fSessions.find(_Key(address)) != fSessions.end()
+			|| fPending.find(_Key(address)) != fPending.end())
 			return;
 	}
 
