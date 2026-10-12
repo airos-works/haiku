@@ -2140,7 +2140,10 @@ aic_tick(struct aic_softc* sc)
 		printf("%s: the scan did not end\n", DEVNAME(sc));
 		aic_scan_done(sc);
 	} else if (!sc->sc_scanning && ic->ic_state == IEEE80211_S_SCAN
+		&& (ic->ic_xflags & IEEE80211_F_SCAN_PAUSED) == 0
 		&& system_time() - sc->sc_scan_started > 5000000) {
+		// (net80211 pauses scanning when there is nothing to join; that
+		// is not a scan that went missing)
 		uint8_t ssid[1 + IEEE80211_NWID_LEN];
 		ssid[0] = ic->ic_des_esslen;
 		memcpy(ssid + 1, ic->ic_des_essid, IEEE80211_NWID_LEN);
