@@ -127,6 +127,29 @@ reload it underneath itself. A changed build waits in
 swaps it in before app_server starts. Nor may a new file be put into a
 drivers directory: devfs starts it as a second driver for the GPU.
 
+## Another machine (other AMD GPUs)
+
+The driver is Linux's whole amdgpu (GFX 6 to 12, Display Core up to DCN 4.01,
+SMU 14, VCN 5): any AMD GPU or APU Linux 6.18 drives should start, given its
+firmware. Only the WX 5100 has been tried. The pieces, built by
+`src/forks/linux-drm` (copies in `/mnt/HaikuWork/artifacts/amdgpu`):
+
+- `amdgpu_firmwares-<date>-1-any.hpkg` (`haiku/tools/package.sh`): every
+  amdgpu firmware file of linux-firmware, 674 of them;
+- `amdgpu_drm-<version>-1-x86_64.hpkg` (same script): the driver, requiring
+  the firmware and at least the haiku it was linked against; its
+  post-install script blocks the image's native amdgpu and amduvd;
+- `amdgpu-userland-<date>.tar.gz` (`gpu-userland-build.sh bundle` on a
+  machine that has built the user land): libdrm, libva, libglvnd, Mesa
+  (radeonsi, RADV, VA driver) and the amduvd add-on for
+  `/boot/system/non-packaged`.
+
+On the machine: `pkgman install ./amdgpu_firmwares-*.hpkg ./amdgpu_drm-*.hpkg`,
+`tar -xzf amdgpu-userland-*.tar.gz -C /`, and a cold boot (twice the first
+time: the blocklist the post-install script writes takes effect at the boot
+after). An unknown chip that brings the machine down at its first start is
+left to the framebuffer driver on the next boot (the start marker).
+
 ## Tests
 
 In `src/forks/linux-drm/haiku/tests`, built on the workstation:
