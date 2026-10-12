@@ -121,6 +121,7 @@ struct accelerant_info {
 	uint32				changeCode;
 	thread_id			hotplugThread;
 	volatile bool		quitHotplug;
+	volatile bool		changedAsleep;	// hot plug events while DPMS was off
 	volatile bool		outputsChanged;	// monitors came or went: probe
 };
 
@@ -168,6 +169,7 @@ status_t amdgpu_get_pixel_clock_limits(display_mode* mode, uint32* low,
 uint32 amdgpu_dpms_capabilities(void);
 uint32 amdgpu_dpms_mode(void);
 status_t amdgpu_set_dpms_mode(uint32 mode);
+bool connected_outputs_changed(void);
 
 // layout.cpp
 uint32 amdgpu_display_output_count(void);

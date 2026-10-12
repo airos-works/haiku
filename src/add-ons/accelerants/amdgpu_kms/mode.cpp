@@ -704,6 +704,33 @@ amdgpu_dpms_mode(void)
 }
 
 
+/*!	Whether a monitor came, went or was exchanged for another since the
+	outputs were last probed. */
+bool
+connected_outputs_changed(void)
+{
+	Kms::Connector* connector = (Kms::Connector*)malloc(sizeof(Kms::Connector));
+	if (connector == NULL)
+		return true;
+	bool changed = false;
+	for (uint32 i = 0; i < gInfo->outputCount && !changed; i++) {
+		const Output& output = gInfo->outputs[i];
+		if (Kms::GetConnector(gInfo->device, output.connector, *connector)
+				!= B_OK) {
+			changed = true;
+			break;
+		}
+		bool connected = connector->connected && connector->modeCount > 0;
+		changed = connected != output.connected
+			|| (connected && (connector->edidLength != output.edidLength
+				|| memcmp(connector->edid, output.edid, output.edidLength)
+					!= 0));
+	}
+	free(connector);
+	return changed;
+}
+
+
 extern "C" status_t
 amdgpu_set_dpms_mode(uint32 dpmsMode)
 {
@@ -724,6 +751,19 @@ amdgpu_set_dpms_mode(uint32 dpmsMode)
 		gInfo->dpmsMode = dpmsMode;
 		if (active)
 			update_cursor();
+	}
+	if (status == B_OK && active && gInfo->changedAsleep) {
+		// Only a monitor that is really gone, or new, changes the layout;
+		// one that dropped its hot plug line while asleep and is back has
+		// had its link trained again by being switched on.
+		gInfo->changedAsleep = false;
+		if (connected_outputs_changed()) {
+			debug_printf("amdgpu_kms: monitors changed while asleep\n");
+			gInfo->outputsChanged = true;
+			write_port_etc(gInfo->changePort, gInfo->changeCode, NULL, 0,
+				B_RELATIVE_TIMEOUT, 0);
+		} else
+			debug_printf("amdgpu_kms: the same monitors after waking\n");
 	}
 	return status;
 }
