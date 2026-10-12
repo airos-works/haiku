@@ -27,8 +27,10 @@ the same GPU.
 
 Known limits:
 
-- Monitors coming and going (hot plug) and display power management are
-  implemented in the accelerant but not yet tested with a monitor unplugged.
+- Display power management: an 8-minute DPMS sleep and wake keeps the
+  layout; the hot plug events that waking raises are recognised as the same
+  monitors and change nothing (events while asleep are checked on wake).
+  Unplugging and plugging a monitor in is implemented but not yet tried.
 - Boot safety: the driver keeps a marker
   (`~/config/settings/kernel/drivers/amdgpu_drm.starting`) from its start
   until the GPU has run for 30 s; a boot that finds it leaves the GPU to the
