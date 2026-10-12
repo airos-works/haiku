@@ -14,6 +14,37 @@
 static const uint32 kCursorSize = 128;
 
 
+/*!	Whether every monitor can show the cursor: amdgpu_dm wants an overlay
+	cursor over a region that is scaled, which DCE display engines (Polaris
+	and older) do not have. app_server draws the cursor itself when it is
+	refused, and asks again when the layout changes. */
+static status_t
+try_cursor(void)
+{
+	if (gInfo->dpmsMode != B_DPMS_ON)
+		return B_OK;
+	status_t status = B_OK;
+	for (uint32 i = 0; i < gInfo->outputCount && status == B_OK; i++) {
+		const Output& output = gInfo->outputs[i];
+		if (!output.enabled || output.crtcIndex < 0)
+			continue;
+		status = Kms::SetCursor(gInfo->device,
+			gInfo->resources.crtcs[output.crtcIndex], gInfo->cursor.handle,
+			kCursorSize, kCursorSize, gInfo->cursorHotX, gInfo->cursorHotY);
+	}
+	if (status != B_OK) {
+		for (uint32 i = 0; i < gInfo->outputCount; i++) {
+			const Output& output = gInfo->outputs[i];
+			if (output.enabled && output.crtcIndex >= 0) {
+				Kms::SetCursor(gInfo->device,
+					gInfo->resources.crtcs[output.crtcIndex], 0, 0, 0, 0, 0);
+			}
+		}
+	}
+	return status;
+}
+
+
 extern "C" status_t
 amdgpu_set_cursor_bitmap(uint16 width, uint16 height, uint16 hotX,
 	uint16 hotY, color_space space, uint16 bytesPerRow, const uint8* data)
@@ -42,6 +73,17 @@ amdgpu_set_cursor_bitmap(uint16 width, uint16 height, uint16 hotX,
 	gInfo->cursorHotX = hotX;
 	gInfo->cursorHotY = hotY;
 	gInfo->cursorSet = false;
+	status_t status = try_cursor();
+	if ((status != B_OK) != gInfo->cursorRefused) {
+		gInfo->cursorRefused = status != B_OK;
+		debug_printf("amdgpu_kms: %s\n", status != B_OK
+			? "no hardware cursor on these monitors, app_server draws it"
+			: "hardware cursor");
+	}
+	if (status != B_OK) {
+		gInfo->cursorSet = true;
+		return status;
+	}
 	update_cursor();
 	return B_OK;
 }
