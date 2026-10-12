@@ -80,6 +80,19 @@ recompresses application package copies with Zstandard without changing
 their files, attributes or original release packages. Set
 `RPI4_PACKAGE_COMPRESSION=zlib` when staging for an older system.
 
+The bootstrap repository has no image libraries either, and without them the
+build leaves the JPEG, PNG and WebP translators out of `haiku_datatranslators`
+(and MJPEG out of the USB webcam add-on): nothing that reads pictures through
+the Translation Kit opens a JPEG or a PNG. `tools/rpi4/build-image-libs.sh`
+cross-builds libjpeg-turbo 3.0.4 (libjpeg 6.2 API), libpng 1.6.44 (from the
+air/OS fork, `jmgasper/libpng` branch `airos-v1.6.44`) and libwebp 1.4.0 into
+`/mnt/HaikuWork/rpi4/image-libs/packages`, as `libjpeg_turbo`, `libpng16` and
+`libwebp` packages with their `_devel` counterparts, named and providing like
+HaikuPorts'. `HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR` points the `jpeg`, `libpng`
+and `libwebp` build features at them; the Pi's and the Cubie's full images
+ship the three runtime packages. `SOURCES` there records the pins, the
+compiler and the package hashes.
+
 Run `tools/rpi4/build-cxx-runtime.sh` before building the full image. It stages
 the pinned GCC 13.3 C++ runtime with both SysV and GNU symbol hashes at
 `/mnt/HaikuWork/rpi4/cxx-runtime/stage/libstdc++.so.6`. The script verifies the
