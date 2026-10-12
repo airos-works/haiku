@@ -623,6 +623,7 @@ aic_init(struct ifnet* ifp)
 
 
 static void aic_reorder_flush(struct aic_softc*, int, struct mbuf_list*);
+static void aic_notify_operating_mode(struct aic_softc*);
 
 
 static void
@@ -634,6 +635,7 @@ aic_forget_association(struct aic_softc* sc)
 	ml_purge(&held);
 	sc->sc_connected = 0;
 	sc->sc_ap = -1;
+	sc->sc_operating_width = -1;
 	sc->sc_key_tasks = 0;
 	memset(sc->sc_hw_key, 0xff, sizeof(sc->sc_hw_key));
 	if (sc->sc_early_eapol != NULL) {
@@ -1005,6 +1007,7 @@ aic_connected(struct aic_softc* sc, const uint8_t* indication, size_t length)
 	uint8_t parameters[2];
 	struct mbuf* m;
 	uint16_t status;
+	int width;
 
 	if (length < AIC_CONNECTED_MIN)
 		return;
@@ -1033,9 +1036,18 @@ aic_connected(struct aic_softc* sc, const uint8_t* indication, size_t length)
 	sc->sc_qos = indication[AIC_CONNECTED_QOS];
 	sc->sc_key_tasks = 0;
 	ni->ni_associd = get16(indication + AIC_CONNECTED_AID) | 0xc000;
-	printf("%s: associated with %s (station %d, aid %u%s)\n", DEVNAME(sc),
-		ether_sprintf(indication + AIC_CONNECTED_BSSID), sc->sc_ap,
-		ni->ni_associd & 0x3fff, sc->sc_qos ? ", QoS" : "");
+	width = length > AIC_CONNECTED_WIDTH ? indication[AIC_CONNECTED_WIDTH] : -1;
+	printf("%s: associated with %s (station %d, aid %u%s, %d MHz)\n",
+		DEVNAME(sc), ether_sprintf(indication + AIC_CONNECTED_BSSID),
+		sc->sc_ap, ni->ni_associd & 0x3fff, sc->sc_qos ? ", QoS" : "",
+		width >= 0 && width <= 3 ? 20 << width : 0);
+
+	// with VHT on a channel narrower than 80 MHz the AP is told the real
+	// width once the port is open (aic_notify_operating_mode())
+	sc->sc_operating_width = -1;
+	if (sc->sc_vht && (width == 0 || width == 1)
+		&& (ni->ni_flags & IEEE80211_NODE_VHTCAP) != 0)
+		sc->sc_operating_width = width;
 
 	// OpenBSD's state machine wants ASSOC between AUTH and RUN
 	ieee80211_new_state(ic, IEEE80211_S_ASSOC, -1);
@@ -1047,6 +1059,7 @@ aic_connected(struct aic_softc* sc, const uint8_t* indication, size_t length)
 		aic_cmd(sc, AIC_ME_SET_CONTROL_PORT_REQ, AIC_TASK_ME, parameters, 2,
 			AIC_ME_SET_CONTROL_PORT_CFM, NULL, 0);
 		ni->ni_port_valid = 1;
+		aic_notify_operating_mode(sc);
 		return;
 	}
 
@@ -1302,6 +1315,7 @@ aic_do_set_key(struct aic_softc* sc, const struct aic_key* key)
 	printf("%s: keys installed, port open\n", DEVNAME(sc));
 	ni->ni_port_valid = 1;
 	ieee80211_set_link_state(ic, LINK_STATE_UP);
+	aic_notify_operating_mode(sc);
 }
 
 
@@ -1369,6 +1383,62 @@ aic_tx(struct aic_softc* sc, struct mbuf* m)
 	frame[3] = 0;
 
 	return aic_usb_send(frame, length) == B_OK ? 0 : EIO;
+}
+
+
+/*	Tells the AP the channel width the connection really has (a VHT
+	Operating Mode Notification action frame, one receive stream). The
+	firmware's association request claims 80 MHz whatever the network's
+	width, and in a 40 MHz network the lab's AP then left its VHT downlink
+	silent for about 30 ms twice per beacon interval: under half the HT
+	rate (cubie/evidence/wifi-vht, 2026-10-12). Told 40 MHz, it delivers
+	more than with HT. On the driver's thread. */
+static void
+aic_notify_operating_mode(struct aic_softc* sc)
+{
+	struct ieee80211com* ic = &sc->sc_ic;
+	struct ieee80211_node* ni = ic->ic_bss;
+	uint8_t frame[AIC_TX_HEADER + 28];
+	uint8_t* wh = frame + AIC_TX_HEADER;
+	const size_t frameLength = sizeof(struct ieee80211_frame) + 3;
+	size_t length;
+	int width = sc->sc_operating_width;
+
+	sc->sc_operating_width = -1;
+	if (width < 0 || !sc->sc_connected || sc->sc_ap < 0)
+		return;
+
+	memset(frame, 0, sizeof(frame));
+	wh[0] = IEEE80211_FC0_VERSION_0 | IEEE80211_FC0_TYPE_MGT
+		| IEEE80211_FC0_SUBTYPE_ACTION;
+	IEEE80211_ADDR_COPY(wh + 4, ni->ni_bssid);
+	IEEE80211_ADDR_COPY(wh + 10, ic->ic_myaddr);
+	IEEE80211_ADDR_COPY(wh + 16, ni->ni_bssid);
+	wh[24] = 21;
+		// the VHT category
+	wh[25] = 2;
+		// Operating Mode Notification
+	wh[26] = width;
+		// the channel width; receive streams - 1 in bits 4-6
+
+	put16(frame + AIC_TX_LENGTH, frameLength);
+	frame[AIC_TX_AC] = AIC_AC_VO;
+	frame[AIC_TX_TID] = 0xff;
+	frame[AIC_TX_VIF] = sc->sc_vif;
+	frame[AIC_TX_STA] = sc->sc_ap;
+	put16(frame + AIC_TX_FLAGS, AIC_TX_MGMT | AIC_TX_MGMT_NO_CCK);
+	length = (AIC_TX_HEADER + frameLength + 3) & ~(size_t)3;
+	put16(frame, length & 0x0fff);
+	frame[2] = AIC_TYPE_DATA_TX;
+	frame[3] = 0;
+
+	if (aic_usb_send(frame, length) != B_OK) {
+		printf("%s: the operating mode notification was not sent\n",
+			DEVNAME(sc));
+		return;
+	}
+	printf("%s: told the AP the channel is %d MHz wide\n", DEVNAME(sc),
+		20 << width);
 }
 
 
@@ -2196,6 +2266,7 @@ aic_attach(device_t dev)
 	sc->sc_dev = dev;
 	sc->sc_vif = -1;
 	sc->sc_ap = -1;
+	sc->sc_operating_width = -1;
 	memset(sc->sc_hw_key, 0xff, sizeof(sc->sc_hw_key));
 	mtx_init(&sc->sc_lock, IPL_NONE);
 	mtx_init(&sc->sc_rx_lock, IPL_NONE);
@@ -2209,17 +2280,18 @@ aic_attach(device_t dev)
 	ml_init(&sc->sc_rxq[0]);
 	ml_init(&sc->sc_rxq[1]);
 
-	// HT only unless the settings say "vht true": with VHT advertised the
-	// lab's AP (5 GHz, 40 MHz) delivered downloads at a quarter of the HT
-	// rate (17 against 76 Mbit/s, 2026-10-11): the board's 64 KiB TCP
-	// window took 10-38 ms to cross instead of a few, while the link
-	// reported VHT MCS 8-9 and the receive path idled. Why is not known.
-	sc->sc_vht = 0;
+	// VHT unless the settings say "vht false". It was off by default for a
+	// while: on the lab's AP (5 GHz, 40 MHz) VHT downloads ran at a quarter
+	// of the HT rate. Two causes: a receive-only TCP connection never grew
+	// its window past 64 KiB (fixed in the TCP stack), and the AP took the
+	// firmware's 80 MHz operating mode at its word
+	// (aic_notify_operating_mode()).
+	sc->sc_vht = 1;
 	settings = load_driver_settings("aic8800wifi");
 	if (settings != NULL) {
 		aic_debug = get_driver_boolean_parameter(settings, "debug", 0, 1);
 		aic_watch = get_driver_boolean_parameter(settings, "watch", 0, 1);
-		sc->sc_vht = get_driver_boolean_parameter(settings, "vht", 0, 1);
+		sc->sc_vht = get_driver_boolean_parameter(settings, "vht", 1, 1);
 		unload_driver_settings(settings);
 	}
 

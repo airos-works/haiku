@@ -78,6 +78,7 @@ struct aic_softc {
 	int					sc_connecting;
 	int					sc_ap;			/* the AP's station index */
 	int					sc_qos;
+	int					sc_operating_width;	/* to notify the AP of, or -1 */
 	int					sc_key_tasks;
 	int					sc_hw_key[6];	/* by key ID; pairwise at 4 */
 	struct mbuf*		sc_early_eapol;
