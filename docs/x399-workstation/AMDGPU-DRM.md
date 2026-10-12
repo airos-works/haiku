@@ -46,6 +46,12 @@ Known limits:
   conversion takes 10 ms a picture.
 - Vulkan presents by copying (no dma-buf on Haiku): GPU blit to host memory,
   copy into the window's shared buffer.
+- Wayland clients (vkwayland) sometimes crash as they exit: the in-process
+  Wayland server's window thread (`wayland_server` 0.1.20251004, HaikuPorts)
+  runs on in `BWindow::task_looper()` after the program has unloaded the
+  server's add-on. A roundtrip after destroying the window makes it rarer
+  (1 in 15 runs). Not the GPU stack's; debug_server is set to write a
+  report rather than stop with a dialog for the GPU test programs.
 - No sysfs: power management can only be set with module parameters.
 
 ## Where the pieces are
