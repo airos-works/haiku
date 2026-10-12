@@ -12,6 +12,47 @@ local developHeadersDir = develop/headers$(secondaryArchSubDir) ;
 local unavailableBuildFeatures ;
 
 
+rule ExtractArm64ImageLibraryBuildFeature feature : package : version : library
+	: headers
+{
+	# ExtractArm64ImageLibraryBuildFeature <feature> : <package> : <version>
+	#	: <library> [ : <header directories> ] ;
+	# The arm64 bootstrap repository has no image libraries. The pinned
+	# packages of tools/rpi4/build-image-libs.sh in
+	# HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR stand in for HaikuPorts' <package>
+	# and <package>_devel, the same way as zstd's below. <library> is the
+	# file in lib/ to link against; <header directories> default to
+	# develop/headers.
+	headers ?= develop/headers ;
+	local packageDirectory = $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) ;
+	local base = [ FDirName $(packageDirectory)
+		$(package)-$(version)-arm64.hpkg ] ;
+	local devel = [ FDirName $(packageDirectory)
+		$(package)_devel-$(version)-arm64.hpkg ] ;
+	if ! [ Glob $(packageDirectory) : $(base:BS) ]
+		|| ! [ Glob $(packageDirectory) : $(devel:BS) ] {
+		Exit "Missing arm64 $(package) packages; run"
+			"tools/rpi4/build-image-libs.sh" ;
+	}
+	local directory = [ FDirName $(HAIKU_OPTIONAL_BUILD_PACKAGES_DIR)
+		airos-$(package)-$(version)-arm64 ] ;
+	# Extraction shares the prefix (including .PackageInfo), so serialize it.
+	Depends $(directory:G=$(feature)-devel) : $(directory:G=$(feature)-base) ;
+	SetBuildFeatureAttribute $(feature) : runtime
+		: [ ExtractArchive $(directory:G=$(feature)-base) : lib
+			: $(base) : extracted-arm64-$(feature)-base ] : base ;
+	SetBuildFeatureAttribute $(feature) : library
+		: [ ExtractArchive $(directory:G=$(feature)-base) : lib/$(library)
+			: $(base) : extracted-arm64-$(feature)-base ] : base ;
+	SetBuildFeatureAttribute $(feature) : headers
+		: [ ExtractArchive $(directory:G=$(feature)-devel) : $(headers)
+			: $(devel) : extracted-arm64-$(feature)-devel ] : devel ;
+	SetBuildFeatureAttribute $(feature) : base:directory : $(directory) ;
+	SetBuildFeatureAttribute $(feature) : devel:directory : $(directory) ;
+	EnableBuildFeatures $(feature) ;
+}
+
+
 # SSL
 
 # Automatically enable the SSL feature, when the OpenSSL package is enabled.
@@ -376,7 +417,10 @@ if $(HAIKU_SUMMIT_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = x86_64 {
 
 
 # libpng
-if [ IsPackageAvailable libpng16_devel ] {
+if $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = arm64 {
+	ExtractArm64ImageLibraryBuildFeature libpng : libpng16 : 1.6.44-1
+		: libpng16.so.16.44.0 ;
+} else if [ IsPackageAvailable libpng16_devel ] {
 	ExtractBuildFeatureArchives libpng :
 		file: base libpng16
 			runtime: lib
@@ -427,7 +471,10 @@ if [ IsPackageAvailable jasper_devel ] {
 
 
 # jpeg
-if [ IsPackageAvailable libjpeg_turbo_devel ] {
+if $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = arm64 {
+	ExtractArm64ImageLibraryBuildFeature jpeg : libjpeg_turbo : 3.0.4-1
+		: libjpeg.so.62.4.0 ;
+} else if [ IsPackageAvailable libjpeg_turbo_devel ] {
 	ExtractBuildFeatureArchives jpeg :
 		file: base libjpeg_turbo
 			runtime: lib
@@ -565,7 +612,10 @@ if [ IsPackageAvailable libraw_devel ] {
 
 
 # libwebp
-if [ IsPackageAvailable libwebp_devel ] {
+if $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = arm64 {
+	ExtractArm64ImageLibraryBuildFeature libwebp : libwebp : 1.4.0-1
+		: libwebp.so.7.1.9 : develop/headers develop/headers/webp ;
+} else if [ IsPackageAvailable libwebp_devel ] {
 	if $(HAIKU_PACKAGING_ARCH) = x86 && $(TARGET_PACKAGING_ARCH) = x86_gcc2 {
 		ExtractBuildFeatureArchives libwebp :
 			file: base libwebp

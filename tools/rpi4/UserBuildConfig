@@ -13,6 +13,11 @@ HAIKU_RPI_FIRMWARE_DIR ?= /mnt/HaikuWork/rpi4/firmware/1.20260915 ;
 # and user package readers and selects Zstandard for newly built packages.
 HAIKU_ARM64_ZSTD_PACKAGES_DIR ?= /mnt/HaikuWork/rpi4/zstd/packages ;
 
+# libjpeg-turbo, libpng and libwebp for arm64 (built by
+# tools/rpi4/build-image-libs.sh). The JPEG, PNG and WebP translators and the
+# USB webcam's MJPEG are built only with them; the full image ships them.
+HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR ?= /mnt/HaikuWork/rpi4/image-libs/packages ;
+
 if $(HAIKU_BUILD_PROFILE) = minimum-rpi4 {
 	HAIKU_IMAGE_SIZE = 600 ;
 	HAIKU_RPI_IMAGE_NAME = airos-rpi4-minimum.img ;
@@ -57,6 +62,15 @@ rule UserBuildConfigRulePreImage
 		local zstdPackage = <rpi4-zstd>zstd-1.5.7-1-arm64.hpkg ;
 		SEARCH on $(zstdPackage) = $(HAIKU_ARM64_ZSTD_PACKAGES_DIR) ;
 		AddPackageFilesToHaikuImage system packages : $(zstdPackage) ;
+	}
+
+	# the libraries of the JPEG, PNG and WebP translators
+	if $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) && $(RPI4_AIROS_IMAGE) {
+		local imageLibraries = <rpi4-image-lib>libjpeg_turbo-3.0.4-1-arm64.hpkg
+			<rpi4-image-lib>libpng16-1.6.44-1-arm64.hpkg
+			<rpi4-image-lib>libwebp-1.4.0-1-arm64.hpkg ;
+		SEARCH on $(imageLibraries) = $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) ;
+		AddPackageFilesToHaikuImage system packages : $(imageLibraries) ;
 	}
 
 	if $(RPI4_LAB_IMAGE) = 1 {
