@@ -57,14 +57,16 @@ struct ScanLine {
 	virtual			~ScanLine() {}
 	// the line, and the frame's lines and where its blank starts
 	virtual	bool	Read(int32& line, int32& total, int32& blankStart) = 0;
-	// the register the line comes from, as read last
+	// the register the line comes from, and the line, as read last
 			uint32	raw;
+			int32	line;
 };
 
 
-/*!	TCON-TV1's debug register: the line it sends in bits 27..16, counted
-	from the start of the vertical sync; the active lines start after the
-	sync and the back porch (_InitTcon(): BASIC4/5).
+/*!	TCON-TV1's debug register: the line it sends in bits 11..0 (bit 28
+	changes every frame), counted from the start of the vertical sync; the
+	active lines start after the sync and the back porch (_InitTcon():
+	BASIC4).
 */
 struct SunxiScanLine : ScanLine {
 	SunxiScanLine()
@@ -102,10 +104,8 @@ struct SunxiScanLine : ScanLine {
 		total = (basic4 >> 16) / 2;
 		int32 vsyncAndBackPorch = (basic4 & 0xfff) + 1;
 		int32 active = (basic1 & 0xfff) + 1;
-		// as lines from the start of the active area
-		line = ((int32)((debug >> 16) & 0xfff) - vsyncAndBackPorch + total)
-			% total;
-		blankStart = active;
+		line = debug & 0xfff;
+		blankStart = (vsyncAndBackPorch + active) % total;
 		return true;
 	}
 
@@ -191,6 +191,7 @@ phase(ScanLine* source, double& fraction)
 	int32 line, total, blankStart;
 	if (source == NULL || !source->Read(line, total, blankStart) || total <= 0)
 		return false;
+	source->line = line;
 	fraction = (double)((line - blankStart + total) % total) / total;
 	return true;
 }
@@ -240,6 +241,7 @@ test_blanks(double seconds, ScanLine* source)
 
 	std::vector<bigtime_t> intervals;
 	std::vector<double> phases;
+	std::vector<int32> lines;
 	int32 timeouts = 0;
 	bigtime_t start = system_time();
 	bigtime_t last = start;
@@ -247,8 +249,10 @@ test_blanks(double seconds, ScanLine* source)
 		status = screen.WaitForRetrace(100000);
 		bigtime_t now = system_time();
 		double fraction;
-		if (phase(source, fraction))
+		if (phase(source, fraction)) {
 			phases.push_back(fraction);
+			lines.push_back(source->line);
+		}
 		if (status != B_OK) {
 			timeouts++;
 			last = now;
@@ -279,6 +283,12 @@ test_blanks(double seconds, ScanLine* source)
 		seconds, timeouts, mean / 1000, 1000000 / mean, deviation / 1000,
 		shortest / 1000.0, longest / 1000.0);
 	print_phases("where the scan was when the wait ended", phases);
+	if (!lines.empty()) {
+		std::sort(lines.begin(), lines.end());
+		printf("  the scan's line then: %" B_PRId32 " to %" B_PRId32
+			" (median %" B_PRId32 ")\n", lines.front(), lines.back(),
+			lines[lines.size() / 2]);
+	}
 
 	// A frame buffer driver may report a mode that is not the display's
 	// (the boot frame buffer's), so the rhythm counts, not the mode.
