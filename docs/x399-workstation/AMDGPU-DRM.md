@@ -22,8 +22,8 @@ the same GPU.
 | Vulkan | RADV, Vulkan 1.4.328: `vkprobe` passes, `vkbench` compute 1.77 TFLOP/s, fill 33.5 Gpixel/s, VRAM copy 123 GB/s, host upload 5.7 GB/s |
 | Vulkan in windows | `VK_KHR_wayland_surface` through Haiku's in-process Wayland server: 60.0 fps with vsync (FIFO), a 1920x1080 swapchain at 167 fps (mailbox) |
 | Video decoding | UVD through VA-API: MPEG-2, VC-1, H.264, HEVC Main and Main 10, JPEG; VCE encoding for H.264 and HEVC. H.264, HEVC and HEVC Main 10 decode bit-exact against FFmpeg's software decoder |
-| airTime | 1.0.0-18 (installed) plays H.264 and HEVC/Main 10 on the GPU ("AMD UVD (amduvd ...) [hardware]"): 1080p at 7-10 ms a picture, 4K at 30 fps without drops |
-| Summit | renders with radeonsi and plays H.264 on the GPU (bundle-6mitguy5) |
+| airTime | 1.0.0-18 (installed) plays H.264 and HEVC/Main 10 on the GPU ("AMD UVD (amduvd ...) [hardware]"): 1080p at 4-5 ms a picture, 4K at 30 fps without drops |
+| Summit | renders with radeonsi and plays H.264 and HEVC on the GPU (bundle-ci0334, the CI build of Summit 803d1c9; see Summit's docs/wx5100-media.md) |
 
 Known limits:
 
@@ -42,8 +42,6 @@ Known limits:
   suspect.
 - 4K at 60 fps decodes on the GPU but misses frames: the 8-bit YUV to RGB
   conversion takes 10 ms a picture.
-- Summit's HEVC selection (Summit efaa9b9) needs a newer Summit engine than
-  the installed bundle.
 - Vulkan presents by copying (no dma-buf on Haiku): GPU blit to host memory,
   copy into the window's shared buffer.
 - No sysfs: power management can only be set with module parameters.
@@ -155,6 +153,10 @@ add-on print its per-picture costs.
 - Mesa made a new staging buffer for every `vaGetImage()`, and FFmpeg a new
   image for every picture: on this kernel the allocations cost more than the
   copies (1080p HEVC Main 10 33 -> 9.6 ms a picture once both were kept).
+  Pictures up to 1080p are now decoded straight into system memory (Mesa's
+  `vl_video_buffer_usage`, `VL_VIDEO_BUFFER_GTT=0/1` to force), which takes
+  the GPU's slow writes to system memory out of the copy: 5.2 ms. 4K stays
+  in video memory, where UVD reads its references faster.
 - A Summit launched with its private zink Mesa finds no Vulkan driver for
   zink and every web process stops ("no EGL display"); Summit's
   `install-on-workstation.sh` now uses the system Mesa.
