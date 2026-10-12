@@ -3,6 +3,14 @@
 Status values are backed by observation on the workstation. Anything not
 listed as verified is untested.
 
+**2026-10-13 WX 5100 status:** the card runs on amdgpu_drm (Linux 6.18's
+amdgpu on Haiku) with the `amdgpu_kms` accelerant: both 4K monitors in one
+frame buffer, OpenGL/GLES/EGL on radeonsi, Vulkan 1.4 on RADV (including
+windows through the Wayland server), and H.264/HEVC/Main 10 decoding on UVD
+in airTime and (H.264) Summit. The system is master hrev60206+1165.
+[AMDGPU-DRM.md](AMDGPU-DRM.md) has the details and limits; the native
+driver's record below is history.
+
 **2026-10-11 WX 5100 status:** the X399 now has a Radeon Pro WX 5100.
 Current driver `a4aebce1…` and private Mesa `42352938…` remain installed.
 Actual airTime tests now recover from real H.264/Main/Main10 GPU faults,
