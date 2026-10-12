@@ -37,6 +37,7 @@ init_common(int device, bool isClone)
 	gInfo->frameBuffer.area = -1;
 	gInfo->cursor.area = -1;
 	gInfo->changePort = -1;
+	gInfo->hotplugThread = -1;
 	gInfo->dpmsMode = B_DPMS_ON;
 	return B_OK;
 }
@@ -221,6 +222,7 @@ amdgpu_uninit_accelerant(void)
 	if (gInfo == NULL)
 		return;
 	stop_retrace();
+	stop_hotplug();
 	if (gInfo->isClone) {
 		if (gInfo->clonedFrameBuffer >= 0)
 			delete_area(gInfo->clonedFrameBuffer);

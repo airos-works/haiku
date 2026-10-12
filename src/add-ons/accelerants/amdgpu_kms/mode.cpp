@@ -134,6 +134,44 @@ probe_outputs(void)
 }
 
 
+/*!	Probes the outputs again after monitors came or went; what drives the
+	ones still there stays as it is (app_server lays them out anew). */
+void
+refresh_outputs(void)
+{
+	if (!gInfo->outputsChanged)
+		return;
+	gInfo->outputsChanged = false;
+	Output* previous = (Output*)malloc(sizeof(Output) * kMaxOutputs);
+	if (previous == NULL)
+		return;
+	uint32 previousCount = gInfo->outputCount;
+	memcpy(previous, gInfo->outputs, sizeof(Output) * previousCount);
+	if (probe_outputs() == B_OK) {
+		for (uint32 i = 0; i < gInfo->outputCount; i++) {
+			Output& output = gInfo->outputs[i];
+			for (uint32 j = 0; j < previousCount; j++) {
+				const Output& old = previous[j];
+				if (old.connector != output.connector)
+					continue;
+				output.enabled = old.enabled;
+				output.mirror = old.mirror;
+				output.x = old.x;
+				output.y = old.y;
+				output.width = old.width;
+				output.height = old.height;
+				output.scale = old.scale;
+				output.renderScale = old.renderScale;
+				output.timing = old.timing;
+				output.crtcIndex = old.crtcIndex;
+			}
+		}
+		create_mode_list();
+	}
+	free(previous);
+}
+
+
 /*!	Every connected monitor at its preferred mode, side by side, as its
 	connectors are numbered. */
 void

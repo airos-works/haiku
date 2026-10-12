@@ -24,6 +24,7 @@ find_output(Layout& layout, uint32 id)
 extern "C" uint32
 amdgpu_display_output_count(void)
 {
+	refresh_outputs();
 	return gInfo->outputCount;
 }
 
@@ -31,6 +32,7 @@ amdgpu_display_output_count(void)
 extern "C" status_t
 amdgpu_get_display_outputs(display_output* outputs, uint32* _count)
 {
+	refresh_outputs();
 	uint32 count = min_c(*_count, gInfo->outputCount);
 	for (uint32 i = 0; i < count; i++) {
 		const Output& source = gInfo->outputs[i];
@@ -238,10 +240,59 @@ amdgpu_set_display_layout(const display_output_config* configs, uint32 count,
 }
 
 
+/*!	Tells app_server when monitors come and go (amdgpu_drm counts its hot
+	plug events); the outputs are probed again when it asks for them. */
+static status_t
+hotplug_thread(void*)
+{
+	drm_haiku_wait_hotplug wait = {};
+	// the current count
+	if (Kms::Ioctl(gInfo->device, DRM_HAIKU_IOCTL_WAIT_HOTPLUG, &wait) != B_OK)
+		return B_OK;
+	while (!gInfo->quitHotplug) {
+		uint32 seen = wait.generation;
+		wait.timeout_ms = 1000;
+		if (Kms::Ioctl(gInfo->device, DRM_HAIKU_IOCTL_WAIT_HOTPLUG, &wait)
+				!= B_OK) {
+			snooze(1000000);
+			continue;
+		}
+		if (wait.generation != seen && !gInfo->quitHotplug) {
+			debug_printf("amdgpu_kms: monitors changed\n");
+			gInfo->outputsChanged = true;
+			write_port_etc(gInfo->changePort, gInfo->changeCode, NULL, 0,
+				B_RELATIVE_TIMEOUT, 0);
+		}
+	}
+	return B_OK;
+}
+
+
+void
+stop_hotplug(void)
+{
+	if (gInfo->hotplugThread < 0)
+		return;
+	gInfo->quitHotplug = true;
+	status_t result;
+	wait_for_thread(gInfo->hotplugThread, &result);
+	gInfo->hotplugThread = -1;
+}
+
+
 extern "C" status_t
 amdgpu_set_display_change_port(port_id port, uint32 code)
 {
+	if (gInfo->isClone)
+		return B_NOT_ALLOWED;
 	gInfo->changePort = port;
 	gInfo->changeCode = code;
+	if (gInfo->hotplugThread < 0) {
+		gInfo->quitHotplug = false;
+		gInfo->hotplugThread = spawn_thread(hotplug_thread,
+			"amdgpu_kms hot plug", B_NORMAL_PRIORITY, NULL);
+		if (gInfo->hotplugThread >= 0)
+			resume_thread(gInfo->hotplugThread);
+	}
 	return B_OK;
 }

@@ -119,6 +119,9 @@ struct accelerant_info {
 
 	port_id				changePort;
 	uint32				changeCode;
+	thread_id			hotplugThread;
+	volatile bool		quitHotplug;
+	volatile bool		outputsChanged;	// monitors came or went: probe
 };
 
 
@@ -127,6 +130,8 @@ extern accelerant_info* gInfo;
 
 // outputs and modes (mode.cpp)
 status_t probe_outputs(void);
+void refresh_outputs(void);
+void stop_hotplug(void);
 void default_layout(Layout& layout);
 display_mode layout_mode(const Layout& layout);
 bool is_layout_mode(const Layout& layout, const display_mode& mode);

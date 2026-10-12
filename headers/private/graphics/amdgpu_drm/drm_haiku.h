@@ -59,4 +59,15 @@ struct drm_haiku_device_info {
 #define DRM_HAIKU_IOCTL_UNMAP	DRM_IOW(0xf1, struct drm_haiku_unmap)
 #define DRM_HAIKU_IOCTL_DEVICE_INFO	DRM_IOR(0xf2, struct drm_haiku_device_info)
 
+/*	Hot plugging: Linux sends a uevent, Haiku has this. Waits until a
+	monitor is attached or detached after \a generation (as returned by an
+	earlier call, 0 the first time) or \a timeout_ms have passed; returns
+	the current generation. */
+struct drm_haiku_wait_hotplug {
+	__u32 generation;	/* in: the last one seen; out: the current one */
+	__u32 timeout_ms;	/* in */
+};
+
+#define DRM_HAIKU_IOCTL_WAIT_HOTPLUG	DRM_IOWR(0xf3, struct drm_haiku_wait_hotplug)
+
 #endif /* _DRM_HAIKU_H */
