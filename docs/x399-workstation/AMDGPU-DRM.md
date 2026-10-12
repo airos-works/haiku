@@ -41,6 +41,21 @@ Known limits:
   monitors" in the syslog). Drawing such a layout at 200 % would need an
   11520x4320 frame buffer, more than the 256 MiB of video memory the CPU
   can reach.
+- Video under load: UVD's pictures came out wrong now and then while
+  Vulkan programs ran (a damaged reference, wrong to the next key frame:
+  1 to 4 runs of the 300-picture H.264 test stream in about 150), because
+  the memory clock idles at 300 MHz while UVD decodes and other GPU work
+  starves it there (held at 300 MHz, every run was wrong). amdgpu_drm
+  4400077 keeps the memory clock at its highest level while UVD or VCE is
+  powered (smu7); idle stays at 300 MHz and 10 W. Since then: 0 of 188
+  runs under three Vulkan programs, and `gpu-soak.sh` (OpenGL windows,
+  H.264 and HEVC Main 10, Vulkan, windows and decoders killed mid-frame,
+  Wayland windows) clean with every picture exact.
+- One hang during that investigation (decoding into video memory beside
+  three Vulkan programs, before the fix): no network, no disk activity,
+  nothing in the syslog; a power cycle brought it back. It did not happen
+  again in that configuration; the cause is not known (a UVD hang from the
+  starvation above is a guess).
 - Boot safety: the driver keeps a marker
   (`~/config/settings/kernel/drivers/amdgpu_drm.starting`) from its start
   until the GPU has run for 30 s; a boot that finds it leaves the GPU to the
@@ -173,6 +188,8 @@ In `src/forks/linux-drm/haiku/tests`, built on the workstation:
 - `kmstest`: modes, frame buffers and page flips on the KMS interface
 - `kmsforce [CONNECTOR off|on|detect]`: a monitor unplugged or plugged in
   without anybody at the machine (`DRM_HAIKU_IOCTL_FORCE_CONNECTOR`)
+- `amdgpu_churn [seconds] [pool]`: buffer objects made, moved and freed
+  with no GPU work of their own (VRAM moves, evictions, clears)
 - `drmparam NAME VALUE`: a module parameter of the running driver
   (`DRM_HAIKU_IOCTL_SET_PARAM`); `drmparam debug 0x16` around a refused
   mode set logs amdgpu_dm's reason (and fills the syslog quickly),
@@ -181,6 +198,10 @@ In `src/forks/linux-drm/haiku/tests`, built on the workstation:
   `ffmpeg -f framemd5` (media and MD5s in `tests/media` on the workstation)
 - `vabench`, `amdgpu_alloc_bench`, `amdgpu_map_bench`: where readback time goes
 - `vkwayland`: a Vulkan swapchain in a window
+
+`docs/x399-workstation/tools/gpu-soak.sh [seconds]` runs all of it at
+once and in the ways programs end, then checks the syslog, kernel memory
+and that pictures still decode exactly.
 
 and in `x399/tests`: `vkprobe`, `vkbench` (Vulkan), and Summit's
 `gles2-draw-probe` (GLES through EGL). `AMDGPU_VA_TIMING=1` makes the media
