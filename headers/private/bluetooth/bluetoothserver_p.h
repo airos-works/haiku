@@ -43,6 +43,9 @@
 // Request: either short_term_key (16 bytes), or long_term_key (16 bytes),
 // random_number (8 bytes) and encrypted_diversifier (uint16).
 #define BT_MSG_LE_START_ENCRYPTION      'leEN'
+// Asks the controller for other parameters on the LE link: "interval_min",
+// "interval_max" (1.25 ms units), "latency" (events), "timeout" (10 ms)
+#define BT_MSG_LE_UPDATE_CONNECTION     'leUP'
 #define BT_MSG_LE_ENCRYPTED             'leED'
 #define BT_MSG_LE_ENCRYPTION_FAILED     'leEF'
 

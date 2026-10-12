@@ -14,6 +14,7 @@
 #include "L2capEndpointManager.h"
 #include "l2cap_internal.h"
 #include "l2cap_signal.h"
+#include "l2cap_le.h"
 #include "l2cap_command.h"
 
 #include <btDebug.h>
@@ -374,9 +375,25 @@ send_l2cap_command(HciConnection* conn, uint8 code, uint8 ident, net_buffer* com
 		basicHeader->dcid = htole16(L2CAP_SIGNALING_CID);
 	}
 	command->type = conn->handle;
+	if (gL2capLELogLevel >= 3) {
+		// Classic signaling, at the LE trace's packet level: code, ident and
+		// the command's first parameters (CIDs, PSM, result).
+		uint8 bytes[12] = {};
+		size_t count = min_c(command->size - 4, sizeof(bytes));
+		gBufferModule->read(command, 4, bytes, count);
+		dprintf("l2cap: tx handle %#x code %#x ident %u%s\n", conn->handle,
+			code, ident, count > 4 ? "" : " (short)");
+		dprintf("l2cap:   %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
+			"%02x %02x\n", bytes[0], bytes[1], bytes[2], bytes[3], bytes[4],
+			bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10],
+			bytes[11]);
+	}
 	status_t status = btDevices->PostACL(conn->Hid, command);
-	if (status != B_OK)
+	if (status != B_OK) {
+		dprintf("l2cap: signaling command %#x to handle %#x not sent: %s\n",
+			code, conn->handle, strerror(status));
 		gBufferModule->free(command);
+	}
 	return status;
 }
 
@@ -510,6 +527,18 @@ l2cap_handle_signaling_command(HciConnection* connection, net_buffer* buffer)
 		}
 
 		commandHeader.Remove();
+
+		if (gL2capLELogLevel >= 3) {
+			uint8 bytes[8] = {};
+			gBufferModule->read(buffer, 0, bytes,
+				min_c(length, sizeof(bytes)));
+			dprintf("l2cap: rx handle %#x code %#x ident %u len %u: %02x %02x "
+				"%02x %02x %02x %02x %02x %02x%s\n", connection->handle, code,
+				ident, length, bytes[0], bytes[1], bytes[2], bytes[3],
+				bytes[4], bytes[5], bytes[6], bytes[7],
+				L2CAP_IS_SIGNAL_RSP(code) && endpoint == NULL
+					? " (no endpoint for ident)" : "");
+		}
 
 		switch (code) {
 			case L2CAP_COMMAND_REJECT_RSP:

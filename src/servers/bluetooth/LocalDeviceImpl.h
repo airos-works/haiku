@@ -77,6 +77,8 @@ public:
 		const uint8* address, uint8 addressType);
 	status_t CancelLEConnection(const BMessenger* listener);
 	status_t DisconnectLEConnection(const BMessenger* listener);
+	status_t UpdateLEConnection(uint16 intervalMin, uint16 intervalMax,
+		uint16 latency, uint16 timeout);
 	status_t StartLEEncryption(const uint8* key, const uint8* randomNumber,
 		uint16 encryptedDiversifier);
 	void LEPulse();

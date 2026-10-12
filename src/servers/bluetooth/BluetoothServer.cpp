@@ -325,6 +325,18 @@ void BluetoothServer::MessageReceived(BMessage* message)
 			break;
 		}
 
+		case BT_MSG_LE_UPDATE_CONNECTION:
+		{
+			LocalDeviceImpl* device = LocateDelegateFromMessage(message);
+			status = device == NULL ? B_BAD_VALUE
+				: device->UpdateLEConnection(
+					message->GetUInt16("interval_min", 0),
+					message->GetUInt16("interval_max", 0),
+					message->GetUInt16("latency", 0),
+					message->GetUInt16("timeout", 0));
+			break;
+		}
+
 		case BT_MSG_LE_START_ENCRYPTION:
 		{
 			LocalDeviceImpl* device = LocateDelegateFromMessage(message);

@@ -861,6 +861,35 @@ LocalDeviceImpl::HandleLEConnectionComplete(struct hci_event_header* event)
 }
 
 
+status_t
+LocalDeviceImpl::UpdateLEConnection(uint16 intervalMin, uint16 intervalMax,
+	uint16 latency, uint16 timeout)
+{
+	BAutolock lock(fLELock);
+	if (fLEConnectionState != LE_CONN_CONNECTED)
+		return B_DEV_NOT_READY;
+	// Core Vol 4 Part E 7.8.18, with the limits of Vol 6 Part B 4.5.
+	if (intervalMin < 6 || intervalMin > intervalMax || intervalMax > 3200
+		|| latency > 499 || timeout < 10 || timeout > 3200
+		|| (uint32)timeout * 4 <= (uint32)(1 + latency) * intervalMax)
+		return B_BAD_VALUE;
+	const uint16 handle = fLEConnectionHandle;
+	const uint8 command[14] = {
+		(uint8)handle, (uint8)(handle >> 8),
+		(uint8)intervalMin, (uint8)(intervalMin >> 8),
+		(uint8)intervalMax, (uint8)(intervalMax >> 8),
+		(uint8)latency, (uint8)(latency >> 8),
+		(uint8)timeout, (uint8)(timeout >> 8),
+		0, 0, 0, 0
+	};
+	LOG(LE_LOG_INFO, "asking for interval %.2f-%.2f ms latency %u timeout %u "
+		"ms on handle %#x", intervalMin * 1.25, intervalMax * 1.25, latency,
+		timeout * 10, handle);
+	return _SendLECommand(PACK_OPCODE(OGF_LE_CONTROL, 0x0013), command,
+		sizeof(command));
+}
+
+
 void
 LocalDeviceImpl::HandleLERemoteParameterRequest(struct hci_event_header* event)
 {
