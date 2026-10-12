@@ -5,9 +5,11 @@
 
 /*	H.264 and HEVC decoding on AMD GPUs: libavcodec parses the streams and
 	orders the pictures, VA-API (Mesa's radeonsi driver on amdgpu_drm, the
-	GPU's UVD/VCN) decodes them. Decoded pictures are copied to system memory
-	as NV12 or P010 and converted to what the caller negotiated with the
-	conversions of the amduvd add-on.
+	GPU's UVD/VCN) decodes them. Decoded pictures are read into one VA image
+	kept for the stream, as NV12 or P010, and converted to what the caller
+	negotiated with the conversions of the amduvd add-on. (A new image for
+	every picture, as av_hwframe_transfer_data() makes, costs more than the
+	copy: its memory is new each time.)
 
 	It is installed as "amduvd": airTime and Summit load decoders by name,
 	NewDecoder(0) for H.264 and NewDecoder(1) for HEVC, and keep their
@@ -19,16 +21,21 @@
 #include <DecoderPlugin.h>
 #include <MediaFormats.h>
 
+#include <OS.h>
+
 #include <dirent.h>
 #include <new>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_vaapi.h>
 #include <libavutil/pixdesc.h>
 }
+#include <va/va.h>
 
 #include "../amduvd/H264Output.h"
 #include "../amduvd/HevcOutput.h"
@@ -102,6 +109,8 @@ private:
 			status_t			_Fail(status_t status, const char* reason);
 			void				_Close();
 			status_t			_Receive();
+			bool				_PrepareImage(uint32 fourcc, int width,
+									int height);
 			bool				_Convert(const AVFrame* frame, uint8* output);
 
 			bool				fHevc;
@@ -118,7 +127,9 @@ private:
 			AVCodecContext*		fContext;
 			AVPacket*			fPacket;
 			AVFrame*			fFrame;		// from the decoder (a VA surface)
-			AVFrame*			fSoftware;	// copied to system memory
+			VADisplay			fDisplay;
+			VAImage				fImage;		// read into, kept for the stream
+			bool				fHaveImage;
 			bool				fHaveFrame;
 			HevcFrame			fPixels;
 };
@@ -139,7 +150,8 @@ VaDecoder::VaDecoder(bool hevc)
 	fContext(NULL),
 	fPacket(NULL),
 	fFrame(NULL),
-	fSoftware(NULL),
+	fDisplay(NULL),
+	fHaveImage(false),
 	fHaveFrame(false)
 {
 }
@@ -155,10 +167,13 @@ void
 VaDecoder::_Close()
 {
 	avcodec_free_context(&fContext);
+	if (fHaveImage)
+		vaDestroyImage(fDisplay, fImage.image_id);
+	fHaveImage = false;
+	fDisplay = NULL;
 	av_buffer_unref(&fDevice);
 	av_packet_free(&fPacket);
 	av_frame_free(&fFrame);
-	av_frame_free(&fSoftware);
 	fHaveFrame = false;
 }
 
@@ -210,15 +225,15 @@ VaDecoder::Setup(media_format* input, const void* info, size_t size)
 	if (av_hwdevice_ctx_create(&fDevice, AV_HWDEVICE_TYPE_VAAPI, node, NULL,
 			0) < 0)
 		return _Fail(B_DEVICE_NOT_FOUND, "no VA-API device");
+	fDisplay = ((AVVAAPIDeviceContext*)
+		((AVHWDeviceContext*)fDevice->data)->hwctx)->display;
 
 	const AVCodec* codec = avcodec_find_decoder(fHevc ? AV_CODEC_ID_HEVC
 		: AV_CODEC_ID_H264);
 	fContext = codec != NULL ? avcodec_alloc_context3(codec) : NULL;
 	fPacket = av_packet_alloc();
 	fFrame = av_frame_alloc();
-	fSoftware = av_frame_alloc();
-	if (fContext == NULL || fPacket == NULL || fFrame == NULL
-		|| fSoftware == NULL)
+	if (fContext == NULL || fPacket == NULL || fFrame == NULL)
 		return _Fail(B_NO_MEMORY, "no decoder");
 	if (info != NULL && size > 0) {
 		fContext->extradata = (uint8_t*)av_mallocz(size
@@ -332,39 +347,91 @@ VaDecoder::_Receive()
 }
 
 
-/*!	Copies the VA surface to system memory, then converts it into the
+/*!	The image the pictures are read into: made for the first picture, again
+	when the format or size changes. */
+bool
+VaDecoder::_PrepareImage(uint32 fourcc, int width, int height)
+{
+	if (fHaveImage && fImage.format.fourcc == fourcc
+		&& fImage.width >= width && fImage.height >= height)
+		return true;
+	if (fHaveImage)
+		vaDestroyImage(fDisplay, fImage.image_id);
+	fHaveImage = false;
+
+	int count = vaMaxNumImageFormats(fDisplay);
+	if (count <= 0)
+		return false;
+	VAImageFormat* formats = new(std::nothrow) VAImageFormat[count];
+	if (formats == NULL)
+		return false;
+	VAImageFormat* format = NULL;
+	if (vaQueryImageFormats(fDisplay, formats, &count) == VA_STATUS_SUCCESS) {
+		for (int i = 0; i < count; i++) {
+			if (formats[i].fourcc == fourcc) {
+				format = &formats[i];
+				break;
+			}
+		}
+	}
+	fHaveImage = format != NULL && vaCreateImage(fDisplay, format, width,
+		height, &fImage) == VA_STATUS_SUCCESS;
+	delete[] formats;
+	return fHaveImage;
+}
+
+
+/*!	Reads the VA surface into the stream's image, then converts it into the
 	caller's buffer. */
 bool
 VaDecoder::_Convert(const AVFrame* frame, uint8* output)
 {
-	av_frame_unref(fSoftware);
-	if (av_hwframe_transfer_data(fSoftware, frame, 0) < 0)
+	static const bool sTiming = getenv("AMDGPU_VA_TIMING") != NULL;
+	bigtime_t start = sTiming ? system_time() : 0;
+	if (frame->hw_frames_ctx == NULL)
 		return false;
-	bool p010 = fSoftware->format == AV_PIX_FMT_P010;
-	if (!p010 && fSoftware->format != AV_PIX_FMT_NV12)
+	AVPixelFormat softwareFormat
+		= ((AVHWFramesContext*)frame->hw_frames_ctx->data)->sw_format;
+	bool p010 = softwareFormat == AV_PIX_FMT_P010;
+	if (!p010 && softwareFormat != AV_PIX_FMT_NV12)
 		return false;
-	if (fSoftware->width < fWidth || fSoftware->height < fHeight)
+	if (frame->width < fWidth || frame->height < fHeight)
 		return false;
+	VASurfaceID surface = (VASurfaceID)(uintptr_t)frame->data[3];
+	if (vaSyncSurface(fDisplay, surface) != VA_STATUS_SUCCESS
+		|| !_PrepareImage(p010 ? VA_FOURCC_P010 : VA_FOURCC_NV12,
+			frame->width, frame->height)
+		|| vaGetImage(fDisplay, surface, 0, 0, frame->width, frame->height,
+			fImage.image_id) != VA_STATUS_SUCCESS)
+		return false;
+	void* data;
+	if (vaMapBuffer(fDisplay, fImage.buf, &data) != VA_STATUS_SUCCESS)
+		return false;
+	bigtime_t transferred = sTiming ? system_time() : 0;
 
 	// the layout the amduvd conversions take: luma rows, then the
 	// interleaved chroma rows, one pitch
 	uint32 sampleBytes = p010 ? 2 : 1;
-	uint32 pitch = fSoftware->width * sampleBytes;
-	uint32 height = fSoftware->height;
+	uint32 pitch = frame->width * sampleBytes;
+	uint32 height = frame->height;
 	try {
 		fPixels.pixels.resize((size_t)pitch * height * 3 / 2);
 	} catch (const std::bad_alloc&) {
+		vaUnmapBuffer(fDisplay, fImage.buf);
 		return false;
 	}
+	const uint8* luma = (const uint8*)data + fImage.offsets[0];
 	for (uint32 y = 0; y < height; y++) {
 		memcpy(fPixels.pixels.data() + (size_t)y * pitch,
-			fSoftware->data[0] + (size_t)y * fSoftware->linesize[0], pitch);
+			luma + (size_t)y * fImage.pitches[0], pitch);
 	}
+	const uint8* imageChroma = (const uint8*)data + fImage.offsets[1];
 	uint8* chroma = fPixels.pixels.data() + (size_t)pitch * height;
 	for (uint32 y = 0; y < height / 2; y++) {
 		memcpy(chroma + (size_t)y * pitch,
-			fSoftware->data[1] + (size_t)y * fSoftware->linesize[1], pitch);
+			imageChroma + (size_t)y * fImage.pitches[1], pitch);
 	}
+	vaUnmapBuffer(fDisplay, fImage.buf);
 	fPixels.pitch = pitch;
 	fPixels.codedHeight = height;
 	fPixels.width = fWidth;
@@ -377,8 +444,27 @@ VaDecoder::_Convert(const AVFrame* frame, uint8* output)
 			: AVCOL_SPC_SMPTE170M);
 	fPixels.p010 = p010;
 	fPixels.bitDepth = p010 ? 10 : 8;
-	return HevcOutput::Copy(fPixels, fFormat, output,
+	bigtime_t repacked = sTiming ? system_time() : 0;
+	bool converted = HevcOutput::Copy(fPixels, fFormat, output,
 		HevcOutput::Bytes(fWidth, fHeight, fFormat));
+	if (sTiming) {
+		static bigtime_t sTransfer, sRepack, sConvert;
+		static int sCount;
+		bigtime_t end = system_time();
+		sTransfer += transferred - start;
+		sRepack += repacked - transferred;
+		sConvert += end - repacked;
+		if (++sCount == 120) {
+			fprintf(stderr, "amduvd (VA-API): %dx%d %s, per picture: "
+				"transfer %.2f ms, repack %.2f ms, convert %.2f ms\n",
+				fWidth, fHeight, p010 ? "P010" : "NV12",
+				sTransfer / 120000.0, sRepack / 120000.0,
+				sConvert / 120000.0);
+			sTransfer = sRepack = sConvert = 0;
+			sCount = 0;
+		}
+	}
+	return converted;
 }
 
 
