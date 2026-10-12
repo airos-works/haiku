@@ -70,14 +70,26 @@ else
 fi
 echo "rebooting (a warm reboot ends in Debian, then air/OS once)"
 b "shutdown -r" 20 || true
+debian=
 for i in $(seq 1 72); do
 	sleep 5
 	if timeout 5 ssh -F "$RPI4_STATE/ssh_config" -o ConnectTimeout=3 \
 			cubie-recovery true 2>/dev/null; then
 		echo "Debian up after $((i * 5)) s"
+		debian=1
 		break
 	fi
 done
+if [[ -z $debian ]]; then
+	if b "ps" 10 2>/dev/null | grep -q "shutdown process"; then
+		echo "air/OS is still shutting down: an application is probably" \
+			"asking something (\"Save changes?\"); answer it, then run" \
+			"lab_restart_once (lab-esp.sh) once Debian is up" >&2
+	else
+		echo "Debian did not come up; power cycle, then lab_restart_once" >&2
+	fi
+	exit 2
+fi
 # shellcheck source=lab-esp.sh
 source "$TOOLS/lab-esp.sh"
 lab_restart_once
