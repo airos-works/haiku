@@ -320,12 +320,25 @@ apply_layout(Layout& layout, bool testOnly)
 			&& layout.height > gInfo->resources.maxHeight))
 		return B_BAD_VALUE;
 
-	// CRTCs
+	// CRTCs: a monitor keeps the one it has (moving it is a mode set on a
+	// monitor that did not change), the others get free ones
 	uint32 usedCrtcs = 0;
 	for (uint32 i = 0; i < gInfo->outputCount; i++) {
 		Output& output = layout.outputs[i];
+		const Output& current = gInfo->outputs[i];
+		int32 c = current.crtcIndex;
 		output.crtcIndex = -1;
-		if (!output.enabled)
+		if (output.enabled && current.connector == output.connector
+			&& current.enabled && c >= 0
+			&& (output.possibleCrtcs & (1 << c)) != 0
+			&& (usedCrtcs & (1 << c)) == 0 && gInfo->crtcPrimaryPlane[c] != 0) {
+			output.crtcIndex = c;
+			usedCrtcs |= 1 << c;
+		}
+	}
+	for (uint32 i = 0; i < gInfo->outputCount; i++) {
+		Output& output = layout.outputs[i];
+		if (!output.enabled || output.crtcIndex >= 0)
 			continue;
 		for (uint32 c = 0; c < gInfo->resources.crtcCount; c++) {
 			if ((output.possibleCrtcs & (1 << c)) != 0
@@ -381,6 +394,16 @@ apply_layout(Layout& layout, bool testOnly)
 		request.Add(plane, gInfo->planeCrtcY, y);
 		request.Add(plane, gInfo->planeCrtcW, w);
 		request.Add(plane, gInfo->planeCrtcH, h);
+	}
+	// The cursors go, and come back when the monitors are on (update_
+	// cursor()): a cursor left on a CRTC without its primary plane, or over
+	// a plane scaled differently, would need an overlay cursor, which DCE
+	// display engines do not have (amdgpu_dm refuses the commit).
+	for (uint32 c = 0; status == B_OK && c < gInfo->resources.crtcCount; c++) {
+		if (gInfo->crtcCursorPlane[c] != 0) {
+			request.Add(gInfo->crtcCursorPlane[c], gInfo->planeFbId, 0);
+			request.Add(gInfo->crtcCursorPlane[c], gInfo->planeCrtcId, 0);
+		}
 	}
 	for (uint32 c = 0; status == B_OK && c < gInfo->resources.crtcCount; c++) {
 		if ((usedCrtcs & (1 << c)) != 0)

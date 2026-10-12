@@ -30,7 +30,17 @@ Known limits:
 - Display power management: an 8-minute DPMS sleep and wake keeps the
   layout; the hot plug events that waking raises are recognised as the same
   monitors and change nothing (events while asleep are checked on wake).
-  Unplugging and plugging a monitor in is implemented but not yet tried.
+- Monitors coming and going, tried by forcing a connector off and back
+  (`kmsforce DP-1 off`, `kmsforce DP-1 detect`; the cable itself was not
+  pulled): the other monitor keeps its CRTC and gets the desktop, and both
+  come back where they were.
+- The display engine (DCE 11.2) has no overlay cursor, so amdgpu_dm takes
+  no hardware cursor over a region that is scaled (DP-4 at 100 % beside
+  DP-1 at 200 % is drawn at 100 % and DP-1's region enlarged): app_server
+  draws the cursor itself then ("amdgpu_kms: no hardware cursor on these
+  monitors" in the syslog). Drawing such a layout at 200 % would need an
+  11520x4320 frame buffer, more than the 256 MiB of video memory the CPU
+  can reach.
 - Boot safety: the driver keeps a marker
   (`~/config/settings/kernel/drivers/amdgpu_drm.starting`) from its start
   until the GPU has run for 30 s; a boot that finds it leaves the GPU to the
@@ -52,7 +62,9 @@ Known limits:
   server's add-on. A roundtrip after destroying the window makes it rarer
   (1 in 15 runs). Not the GPU stack's; debug_server is set to write a
   report rather than stop with a dialog for the GPU test programs.
-- No sysfs: power management can only be set with module parameters.
+- No sysfs: power management can only be set with module parameters (at
+  boot, in the settings file; `drmparam` sets one in the running driver,
+  but most are read only when the GPU starts).
 
 ## Where the pieces are
 
@@ -159,6 +171,12 @@ In `src/forks/linux-drm/haiku/tests`, built on the workstation:
 - `amdgpu_smoke`, `libdrm_amdgpu_test`: buffer objects, mappings, command
   submission, from the kernel interface up
 - `kmstest`: modes, frame buffers and page flips on the KMS interface
+- `kmsforce [CONNECTOR off|on|detect]`: a monitor unplugged or plugged in
+  without anybody at the machine (`DRM_HAIKU_IOCTL_FORCE_CONNECTOR`)
+- `drmparam NAME VALUE`: a module parameter of the running driver
+  (`DRM_HAIKU_IOCTL_SET_PARAM`); `drmparam debug 0x16` around a refused
+  mode set logs amdgpu_dm's reason (and fills the syslog quickly),
+  `drmparam debug 0` stops it
 - `vaprobe`, `vadecode`: VA-API profiles; per-picture MD5s to compare with
   `ffmpeg -f framemd5` (media and MD5s in `tests/media` on the workstation)
 - `vabench`, `amdgpu_alloc_bench`, `amdgpu_map_bench`: where readback time goes

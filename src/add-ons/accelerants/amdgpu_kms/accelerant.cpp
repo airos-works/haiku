@@ -90,11 +90,15 @@ amdgpu_init_accelerant(int device)
 	}
 	for (uint32 c = 0; c < gInfo->resources.crtcCount; c++) {
 		for (uint32 p = 0; p < gInfo->planeCount; p++) {
-			if (gInfo->planes[p].type == Kms::kPlanePrimary
-				&& (gInfo->planes[p].possibleCrtcs & (1 << c)) != 0) {
-				gInfo->crtcPrimaryPlane[c] = gInfo->planes[p].id;
-				break;
-			}
+			const Kms::Plane& plane = gInfo->planes[p];
+			if ((plane.possibleCrtcs & (1 << c)) == 0)
+				continue;
+			if (plane.type == Kms::kPlanePrimary
+				&& gInfo->crtcPrimaryPlane[c] == 0)
+				gInfo->crtcPrimaryPlane[c] = plane.id;
+			else if (plane.type == Kms::kPlaneCursor
+				&& gInfo->crtcCursorPlane[c] == 0)
+				gInfo->crtcCursorPlane[c] = plane.id;
 		}
 	}
 

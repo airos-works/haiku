@@ -82,6 +82,7 @@ struct accelerant_info {
 	Kms::Plane			planes[Kms::kMaxObjects];
 	uint32				planeCount;
 	uint32				crtcPrimaryPlane[Kms::kMaxObjects];
+	uint32				crtcCursorPlane[Kms::kMaxObjects];
 
 	// properties (the same ID on every object of a type)
 	uint32				connectorCrtcId;
@@ -116,6 +117,7 @@ struct accelerant_info {
 	uint16				cursorY;
 	bool				cursorVisible;
 	bool				cursorSet;
+	bool				cursorRefused;	// by a monitor: app_server draws it
 
 	port_id				changePort;
 	uint32				changeCode;

@@ -285,6 +285,9 @@ DisplayLayout::Configure(const BMessage& saved, bool keepCurrent)
 {
 	std::vector<BString> mirrorKeys(fDisplays.size());
 	std::vector<BString> mirrorConnectors(fDisplays.size());
+	std::vector<bool> wasPrimary(fDisplays.size());
+	for (size_t i = 0; i < fDisplays.size(); i++)
+		wasPrimary[i] = fDisplays[i].primary;
 
 	bool anyPrimary = false;
 	for (size_t i = 0; i < fDisplays.size(); i++) {
@@ -363,6 +366,19 @@ DisplayLayout::Configure(const BMessage& saved, bool keepCurrent)
 		}
 		anyPrimary |= display.primary;
 	}
+
+	// One main display. Settings stored before Store() made sure of that
+	// can remember several (a monitor that was the main one, unplugged
+	// while another took over); the one that is the main display now stays
+	// it, else the first.
+	int32 primary = -1;
+	for (size_t i = 0; i < fDisplays.size(); i++) {
+		if (fDisplays[i].primary
+			&& (primary < 0 || (wasPrimary[i] && !wasPrimary[primary])))
+			primary = i;
+	}
+	for (size_t i = 0; i < fDisplays.size(); i++)
+		fDisplays[i].primary = (int32)i == primary;
 
 	// The monitors the remembered mirrors show: the same monitor on the same
 	// connector first, then the same monitor anywhere.
@@ -650,7 +666,8 @@ DisplayLayout::GetConfigs(std::vector<display_output_config>& configs) const
 /*!	The settings: one "display" message per monitor ever configured, keyed
 	by the monitor's identity. Displays the layout no longer has are kept
 	from the previous settings, so that a monitor unplugged today comes back
-	where it was.
+	where it was; it is no longer the main display when one that is here
+	is.
 */
 status_t
 DisplayLayout::Store(BMessage& saved) const
@@ -698,8 +715,11 @@ DisplayLayout::Store(BMessage& saved) const
 				&& fDisplays[j].name == connector)
 				present = true;
 		}
-		if (!present)
-			saved.AddMessage("display", &entry);
+		if (present)
+			continue;
+		if (PrimaryDisplay() != NULL)
+			entry.SetBool("primary", false);
+		saved.AddMessage("display", &entry);
 	}
 	return B_OK;
 }
