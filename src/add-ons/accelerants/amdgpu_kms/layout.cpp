@@ -258,6 +258,20 @@ hotplug_thread(void*)
 			continue;
 		}
 		if (wait.generation != seen && !gInfo->quitHotplug) {
+			if (gInfo->dpmsMode != B_DPMS_ON) {
+				// Monitors asleep drop their hot plug line now and then (a
+				// Dell P2415Q five minutes into DPMS off, and raises it
+				// again): looked at when they are woken.
+				debug_printf("amdgpu_kms: hot plug event while asleep\n");
+				gInfo->changedAsleep = true;
+				continue;
+			}
+			// Links that are trained again (waking up, for one) raise hot
+			// plug events too: only a different set of monitors matters.
+			if (!connected_outputs_changed()) {
+				debug_printf("amdgpu_kms: hot plug event, the same monitors\n");
+				continue;
+			}
 			debug_printf("amdgpu_kms: monitors changed\n");
 			gInfo->outputsChanged = true;
 			write_port_etc(gInfo->changePort, gInfo->changeCode, NULL, 0,
