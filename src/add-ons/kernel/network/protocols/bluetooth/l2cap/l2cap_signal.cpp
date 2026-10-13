@@ -14,6 +14,7 @@
 #include "L2capEndpointManager.h"
 #include "l2cap_internal.h"
 #include "l2cap_signal.h"
+#include "l2cap_le.h"
 #include "l2cap_command.h"
 
 #include <btDebug.h>
@@ -61,8 +62,14 @@ l2cap_handle_connection_req(HciConnection* conn, uint8 ident, net_buffer* buffer
 
 
 static void
-l2cap_handle_connection_rsp(L2capEndpoint* endpoint, uint8 ident, net_buffer* buffer)
+l2cap_handle_connection_rsp(L2capEndpoint* endpoint, uint8 ident,
+	net_buffer* buffer, bool& releaseIdent)
 {
+	if (endpoint == NULL) {
+		ERROR("l2cap: connection response for unknown ident %d\n", ident);
+		return;
+	}
+
 	NetBufferHeaderReader<l2cap_connection_rsp> command(buffer);
 	if (command.Status() != B_OK)
 		return;
@@ -75,6 +82,10 @@ l2cap_handle_connection_rsp(L2capEndpoint* endpoint, uint8 ident, net_buffer* bu
 
 	TRACE("%s: dcid=%d scid=%d result=%d status%d\n",
 		__func__, response.dcid, response.scid, response.result, response.status);
+
+	// A pending response is followed by the final one, with the same ident.
+	if (response.result == l2cap_connection_rsp::RESULT_PENDING)
+		releaseIdent = false;
 
 	endpoint->_HandleConnectionRsp(ident, response);
 }
@@ -232,6 +243,7 @@ l2cap_handle_disconnection_req(HciConnection* conn, uint8 ident, net_buffer* buf
 	const uint16 scid = le16toh(command->scid);
 
 	endpoint->_HandleDisconnectionReq(ident, scid);
+	endpoint->_AbortIfNeverAccepted();
 	gSocketModule->release_socket(endpoint->socket);
 	return B_OK;
 }
@@ -240,6 +252,11 @@ l2cap_handle_disconnection_req(HciConnection* conn, uint8 ident, net_buffer* buf
 static status_t
 l2cap_handle_disconnection_rsp(L2capEndpoint* endpoint, uint8 ident, net_buffer* buffer)
 {
+	if (endpoint == NULL) {
+		ERROR("l2cap: disconnection response for unknown ident %d\n", ident);
+		return B_ERROR;
+	}
+
 	NetBufferHeaderReader<l2cap_disconnection_rsp> command(buffer);
 	if (command.Status() != B_OK)
 		return ENOBUFS;
@@ -287,6 +304,14 @@ l2cap_handle_info_req(HciConnection* conn, uint8 ident, net_buffer* buffer)
 		case l2cap_information_req::TYPE_CONNECTIONLESS_MTU:
 			reply = make_l2cap_information_rsp(replyCode, type,
 				l2cap_information_rsp::RESULT_SUCCESS, L2CAP_MTU_DEFAULT);
+			break;
+
+		case l2cap_information_req::TYPE_EXTENDED_FEATURES:
+			// Basic mode only: no ERTM, streaming mode, FCS option or fixed
+			// channels beyond signaling (Core Vol 3 Part A 4.12). Peers such
+			// as Linux hold a connection request pending until they know.
+			reply = make_l2cap_information_rsp(replyCode, type,
+				l2cap_information_rsp::RESULT_SUCCESS, 0);
 			break;
 
 	    default:
@@ -351,9 +376,25 @@ send_l2cap_command(HciConnection* conn, uint8 code, uint8 ident, net_buffer* com
 		basicHeader->dcid = htole16(L2CAP_SIGNALING_CID);
 	}
 	command->type = conn->handle;
+	if (gL2capLELogLevel >= 3) {
+		// Classic signaling, at the LE trace's packet level: code, ident and
+		// the command's first parameters (CIDs, PSM, result).
+		uint8 bytes[12] = {};
+		size_t count = min_c(command->size - 4, sizeof(bytes));
+		gBufferModule->read(command, 4, bytes, count);
+		dprintf("l2cap: tx handle %#x code %#x ident %u%s\n", conn->handle,
+			code, ident, count > 4 ? "" : " (short)");
+		dprintf("l2cap:   %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
+			"%02x %02x\n", bytes[0], bytes[1], bytes[2], bytes[3], bytes[4],
+			bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10],
+			bytes[11]);
+	}
 	status_t status = btDevices->PostACL(conn->Hid, command);
-	if (status != B_OK)
+	if (status != B_OK) {
+		dprintf("l2cap: signaling command %#x to handle %#x not sent: %s\n",
+			code, conn->handle, strerror(status));
 		gBufferModule->free(command);
+	}
 	return status;
 }
 
@@ -488,6 +529,18 @@ l2cap_handle_signaling_command(HciConnection* connection, net_buffer* buffer)
 
 		commandHeader.Remove();
 
+		if (gL2capLELogLevel >= 3) {
+			uint8 bytes[8] = {};
+			gBufferModule->read(buffer, 0, bytes,
+				min_c(length, sizeof(bytes)));
+			dprintf("l2cap: rx handle %#x code %#x ident %u len %u: %02x %02x "
+				"%02x %02x %02x %02x %02x %02x%s\n", connection->handle, code,
+				ident, length, bytes[0], bytes[1], bytes[2], bytes[3],
+				bytes[4], bytes[5], bytes[6], bytes[7],
+				L2CAP_IS_SIGNAL_RSP(code) && endpoint == NULL
+					? " (no endpoint for ident)" : "");
+		}
+
 		switch (code) {
 			case L2CAP_COMMAND_REJECT_RSP:
 				l2cap_handle_command_reject(endpoint, ident, buffer);
@@ -498,7 +551,8 @@ l2cap_handle_signaling_command(HciConnection* connection, net_buffer* buffer)
 				break;
 
 			case L2CAP_CONNECTION_RSP:
-				l2cap_handle_connection_rsp(endpoint, ident, buffer);
+				l2cap_handle_connection_rsp(endpoint, ident, buffer,
+					releaseIdent);
 				break;
 
 			case L2CAP_CONFIGURATION_REQ:

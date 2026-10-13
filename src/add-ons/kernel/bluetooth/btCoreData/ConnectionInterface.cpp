@@ -240,6 +240,9 @@ allocate_command_ident(HciConnection* conn, void* pointer)
 	while (ident != conn->fNextIdent) {
 		if (conn->fInUseIdents.Find(ident) == conn->fInUseIdents.End()) {
 			conn->fInUseIdents.Insert(ident, pointer);
+			// Rotate, so that a late answer to a request that was given up
+			// on does not match the next one.
+			conn->fNextIdent = ident;
 			return ident;
 		}
 

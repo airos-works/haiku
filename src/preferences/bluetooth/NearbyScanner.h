@@ -56,6 +56,8 @@ public:
 
 			void				Pause();
 			void				Resume();
+			void				HoldInquiry(bigtime_t duration);
+									// no Classic inquiry for this long
 			bool				IsPaused() const { return fPaused; }
 
 			bool				IsSearching() const;
@@ -82,6 +84,7 @@ private:
 			void				_ScheduleInquiry(bigtime_t delay);
 			void				_StartInquiry();
 			void				_EndInquiry();
+			void				_CancelInquiry();
 			void				_NotifyPausedIfIdle();
 			void				_SetStatus(int32 status);
 			void				_Timer(uint32 what, int32 generation,
@@ -99,6 +102,9 @@ private:
 			le_state			fLEState;
 			int32				fLEGeneration;
 			bool				fInquiryActive;
+			bigtime_t			fInquiryNotBefore;
+			bigtime_t			fLastFullInquiry;
+			bool				fInquiryForced;
 			int32				fInquiryGeneration;
 			int32				fFailures;
 			int32				fStatus;

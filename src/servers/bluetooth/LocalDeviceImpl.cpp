@@ -18,6 +18,7 @@
 #include <bluetooth/HCI/btHCI_event.h>
 
 #include <ConnectionIncoming.h>
+#include <LELog.h>
 #include <PincodeWindow.h>
 #include <Alert.h>
 #include <ByteOrder.h>
@@ -27,6 +28,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <new>
+
+
+// Classic links, pairing and encryption go to the Bluetooth log (see
+// LELog.h): connection problems are otherwise invisible.
+using namespace Bluetooth;
+
+#define CLASSIC_LOG(level, format, args...) \
+	LELog(level, "classic", format, ##args)
 
 
 #if 0
@@ -85,7 +94,18 @@ LocalDeviceImpl::LocalDeviceImpl(HCIDelegate* hd)
 	  fLEConnectionAddressType(0),
 	  fLEConnectionHandle(0),
 	  fLEEncryptionPending(false),
-	  fLEEncrypted(false)
+	  fLEEncrypted(false),
+	  fLECreateIntervalMin(0x18),
+	  fLECreateIntervalMax(0x28),
+	  fLECreateLatency(0),
+	  fLECreateTimeout(0x1f4),
+	  fLEKeepIntervalMin(0),
+	  fLEKeepIntervalMax(0),
+	  fLEKeepRestores(0),
+	  fLEKeepRestoredAt(0),
+	  fLELinkInterval(0),
+	  fLELinkLatency(0),
+	  fLELinkTimeout(0)
 {
 	memset(fLEConnectionAddress, 0, sizeof(fLEConnectionAddress));
 	LoadRemoteDevices();
@@ -97,13 +117,11 @@ LocalDeviceImpl::StartPairingSetup()
 {
 	if (fPairSetupState != PAIR_SETUP_IDLE)
 		return B_BUSY;
-	const uint8 eventMask[8] = {
-		0xff, 0xff, 0xfb, 0xff, 0x07, 0xf8, 0xbf, 0x3d
-	};
-	fPairSetupState = PAIR_SETUP_EVENT_MASK;
+	// The kernel picks the controller's ACL packet sizes out of these
+	// answers; L2CAP fragments and paces its data with them.
+	fPairSetupState = PAIR_SETUP_BUFFER_SIZE;
 	status_t result = _SendLECommand(
-		PACK_OPCODE(OGF_CONTROL_BASEBAND, OCF_SET_EVENT_MASK),
-		eventMask, sizeof(eventMask));
+		PACK_OPCODE(OGF_INFORMATIONAL_PARAM, OCF_READ_BUFFER_SIZE), NULL, 0);
 	if (result != B_OK)
 		fPairSetupState = PAIR_SETUP_IDLE;
 	return result;
@@ -116,9 +134,26 @@ LocalDeviceImpl::HandlePairSetupCommandComplete(struct hci_event_header* event)
 	if (fPairSetupState == PAIR_SETUP_IDLE || event->elen < 4)
 		return;
 	const uint8* response = (const uint8*)(event + 1);
+	// Command Complete carries ncmd, opcode, status; a controller that does
+	// not know a command may refuse it in a Command Status instead: status,
+	// ncmd, opcode.
 	uint16 opcode = response[1] | (response[2] << 8);
+	uint8 status = response[3];
+	if (event->ecode == HCI_EVENT_CMD_STATUS) {
+		opcode = response[2] | (response[3] << 8);
+		status = response[0];
+		if (status == 0)
+			return;
+	}
 	uint16 expected = 0;
 	switch (fPairSetupState) {
+		case PAIR_SETUP_BUFFER_SIZE:
+			expected = PACK_OPCODE(OGF_INFORMATIONAL_PARAM,
+				OCF_READ_BUFFER_SIZE);
+			break;
+		case PAIR_SETUP_LE_BUFFER_SIZE:
+			expected = PACK_OPCODE(OGF_LE_CONTROL, OCF_LE_READ_BUFFER_SIZE);
+			break;
 		case PAIR_SETUP_EVENT_MASK:
 			expected = PACK_OPCODE(OGF_CONTROL_BASEBAND, OCF_SET_EVENT_MASK);
 			break;
@@ -134,21 +169,41 @@ LocalDeviceImpl::HandlePairSetupCommandComplete(struct hci_event_header* event)
 			expected = PACK_OPCODE(OGF_CONTROL_BASEBAND,
 				OCF_WRITE_LE_HOST_SUPPORTED);
 			break;
+		case PAIR_SETUP_LINK_POLICY:
+			expected = PACK_OPCODE(OGF_LINK_POLICY,
+				OCF_WRITE_DEFAULT_LINK_POLICY);
+			break;
 		default:
 			return;
 	}
 	if (opcode != expected)
 		return;
-	if (response[3] != 0) {
+	// A controller without LE, or an old one, may not know the buffer size
+	// commands; carry on without them.
+	if (status != 0 && fPairSetupState != PAIR_SETUP_BUFFER_SIZE
+		&& fPairSetupState != PAIR_SETUP_LE_BUFFER_SIZE) {
 		printf("Bluetooth pairing setup opcode %#x failed: %#x\n",
-			opcode, response[3]);
+			opcode, status);
 		fPairSetupState = PAIR_SETUP_IDLE;
 		return;
 	}
 	const uint8 enabled = 1;
 	const uint8 leHost[2] = { 1, 1 };
+	const uint8 eventMask[8] = {
+		0xff, 0xff, 0xfb, 0xff, 0x07, 0xf8, 0xbf, 0x3d
+	};
 	status_t result = B_OK;
 	switch (fPairSetupState) {
+		case PAIR_SETUP_BUFFER_SIZE:
+			fPairSetupState = PAIR_SETUP_LE_BUFFER_SIZE;
+			result = _SendLECommand(PACK_OPCODE(OGF_LE_CONTROL,
+				OCF_LE_READ_BUFFER_SIZE), NULL, 0);
+			break;
+		case PAIR_SETUP_LE_BUFFER_SIZE:
+			fPairSetupState = PAIR_SETUP_EVENT_MASK;
+			result = _SendLECommand(PACK_OPCODE(OGF_CONTROL_BASEBAND,
+				OCF_SET_EVENT_MASK), eventMask, sizeof(eventMask));
+			break;
 		case PAIR_SETUP_EVENT_MASK:
 			fPairSetupState = PAIR_SETUP_SSP;
 			result = _SendLECommand(PACK_OPCODE(OGF_CONTROL_BASEBAND,
@@ -165,8 +220,24 @@ LocalDeviceImpl::HandlePairSetupCommandComplete(struct hci_event_header* event)
 				OCF_WRITE_LE_HOST_SUPPORTED), leHost, sizeof(leHost));
 			break;
 		case PAIR_SETUP_LE_HOST:
+		{
+			// Role switch and sniff mode for new links (both are off after
+			// a reset): a keyboard that cannot enter sniff mode is polled
+			// all the time, and the radio it shares with an LE mouse (and
+			// Wi-Fi) has that much less time for them.
 			printf("Bluetooth SSP, Secure Connections and LE host enabled\n");
+			fPairSetupState = PAIR_SETUP_LINK_POLICY;
+			const uint8 policy[2] = {
+				HCI_LINK_POLICY_ROLE_SWITCH | HCI_LINK_POLICY_SNIFF, 0 };
+			result = _SendLECommand(PACK_OPCODE(OGF_LINK_POLICY,
+				OCF_WRITE_DEFAULT_LINK_POLICY), policy, sizeof(policy));
+			break;
+		}
+		case PAIR_SETUP_LINK_POLICY:
+			CLASSIC_LOG(LE_LOG_INFO, "default link policy: role switch, sniff");
 			fPairSetupState = PAIR_SETUP_IDLE;
+			if (((BluetoothServer*)be_app)->GetHIDHost()->HasDevices())
+				EnablePageScan();
 			break;
 		default:
 			break;
@@ -216,6 +287,7 @@ LocalDeviceImpl::SaveRemoteDevices()
 		device.AddData("class_of_device", B_RAW_TYPE, rd->classOfDevice,
 			sizeof(rd->classOfDevice));
 		device.AddData("link key", B_ANY_TYPE, &link_key, sizeof(linkkey_t));
+		device.AddUInt8("key type", rd->key_type);
 		device.AddUInt8("link type", rd->link_type);
 
 		devices.AddMessage("remote", &device);
@@ -245,18 +317,29 @@ LocalDeviceImpl::LoadRemoteDevices()
 
 	BMessage device;
 	for (int32 i = 0; devices.FindMessage("remote", i, &device) == B_OK; i++) {
-		ServerRemoteDevice* rd = new ServerRemoteDevice();
+		const void* data;
 		ssize_t size;
-		bdaddr_t* bdaddr;
-		device.FindData("bdaddr", B_ANY_TYPE, (const void**)&bdaddr, &size);
-		rd->bdaddr = *bdaddr;
+		if (device.FindData("bdaddr", B_ANY_TYPE, &data, &size) != B_OK
+			|| size != sizeof(bdaddr_t))
+			continue;
+		bdaddr_t bdaddr;
+		memcpy(&bdaddr, data, sizeof(bdaddr));
+		if (RemoteDeviceByAddr(bdaddr) != NULL)
+			continue;
+
+		ServerRemoteDevice* rd = new ServerRemoteDevice();
+		rd->bdaddr = bdaddr;
 		device.FindString("name", &rd->friendly_name);
 		device.FindUInt16("clock_offset", &rd->clock_offset);
 		device.FindUInt8("pscan_rep_mode", &rd->pscan_rep_mode);
-		device.FindUInt8("class_of_device", 0, &rd->classOfDevice[0]);
-		device.FindUInt8("class_of_device", 1, &rd->classOfDevice[1]);
-		device.FindUInt8("class_of_device", 2, &rd->classOfDevice[2]);
-		device.FindData("link key", B_ANY_TYPE, (const void**)&rd->link_key, &size);
+		if (device.FindData("class_of_device", B_RAW_TYPE, &data, &size)
+				== B_OK && size == sizeof(rd->classOfDevice))
+			memcpy(rd->classOfDevice, data, sizeof(rd->classOfDevice));
+		rd->link_key = LinkKeyUtils::NullKey();
+		if (device.FindData("link key", B_ANY_TYPE, &data, &size) == B_OK
+			&& size == sizeof(linkkey_t))
+			memcpy(&rd->link_key, data, sizeof(linkkey_t));
+		device.FindUInt8("key type", &rd->key_type);
 		device.FindUInt8("link type", &rd->link_type);
 		rd->conn_state = RemoteDevice::DISCONNECTED;
 
@@ -280,9 +363,12 @@ LocalDeviceImpl::RemoteDeviceByAddr(bdaddr_t bdaddr)
 ServerRemoteDevice*
 LocalDeviceImpl::RemoteDeviceByHandle(uint16 handle)
 {
+	// Controllers reuse handles: one of a link that went down may now be
+	// another device's. Only a device with a link has a handle.
 	for (int32 i = 0; i < fRemoteDevicesList.CountItems(); i++) {
 		ServerRemoteDevice* rd = fRemoteDevicesList.ItemAt(i);
-		if (rd->handle == handle)
+		if (rd->handle == handle
+			&& rd->conn_state != RemoteDevice::DISCONNECTED)
 			return rd;
 	}
 	return NULL;
@@ -299,7 +385,11 @@ LocalDeviceImpl::AddRemoteDevice(ServerRemoteDevice* rd)
 void
 LocalDeviceImpl::RemoveRemoteDevice(ServerRemoteDevice* rd)
 {
+	if (rd == NULL)
+		return;
 	fRemoteDevicesList.RemoveItem(rd);
+	SaveRemoteDevices();
+		// a forgotten device must not come back with its key
 }
 
 
@@ -334,6 +424,7 @@ LocalDeviceImpl::HandleUnexpectedEvent(struct hci_event_header* event)
 			break;
 
 		case HCI_EVENT_CMD_STATUS:
+			HandlePairSetupCommandComplete(event);
 			HandleLECommandStatus(event);
 			break;
 
@@ -377,6 +468,69 @@ LocalDeviceImpl::HandleUnexpectedEvent(struct hci_event_header* event)
 		case HCI_EVENT_ENCRYPT_CHANGE:
 			if (event->elen >= sizeof(hci_ev_encrypt_change))
 				EncryptChange(JumpEventHeader<struct hci_ev_encrypt_change>(event));
+			break;
+
+		// Pairing and authentication events come whenever the controller or
+		// the peer needs them, not only after a request of ours that
+		// registered for them; answer them anyway, or the controller waits
+		// and the pairing (and the link key) is lost.
+		case HCI_EVENT_LINK_KEY_REQ:
+			LinkKeyRequested(
+				JumpEventHeader<struct hci_ev_link_key_req>(event), NULL);
+			break;
+
+		case HCI_EVENT_LINK_KEY_NOTIFY:
+			LinkKeyNotify(
+				JumpEventHeader<struct hci_ev_link_key_notify>(event), NULL);
+			break;
+
+		case HCI_EVENT_IO_CAPABILITY_REQUEST:
+			IOCapabilityRequest(JumpEventHeader
+				<struct hci_ev_io_capability_request>(event), NULL);
+			break;
+
+		case HCI_EVENT_IO_CAPABILITY_RESPONSE:
+			IOCapabilityResponse(JumpEventHeader
+				<struct hci_ev_io_capability_response>(event), NULL);
+			break;
+
+		case HCI_EVENT_USER_CONFIRMATION_REQUEST:
+			UserConfirmationRequest(JumpEventHeader
+				<struct hci_ev_user_confirmation_request>(event), NULL);
+			break;
+
+		case HCI_EVENT_USER_PASSKEY_NOTIFICATION:
+			if (event->elen >= sizeof(hci_ev_user_passkey_notification)) {
+				UserPasskeyNotification(JumpEventHeader
+					<struct hci_ev_user_passkey_notification>(event));
+			}
+			break;
+
+		case HCI_EVENT_MODE_CHANGE:
+			if (event->elen >= sizeof(hci_ev_mode_change))
+				ModeChange(JumpEventHeader<struct hci_ev_mode_change>(event));
+			break;
+
+		case HCI_EVENT_KEYPRESS_NOTIFICATION:
+			if (event->elen >= sizeof(hci_ev_keypress_notification)) {
+				KeypressNotification(JumpEventHeader
+					<struct hci_ev_keypress_notification>(event));
+			}
+			break;
+
+		case HCI_EVENT_SIMPLE_PAIRING_COMPLETE:
+			SimplePairingComplete(JumpEventHeader
+				<struct hci_ev_simple_pairing_complete>(event), NULL);
+			break;
+
+		case HCI_EVENT_AUTH_COMPLETE:
+			AuthComplete(
+				JumpEventHeader<struct hci_ev_auth_complete>(event), NULL);
+			break;
+
+		case HCI_EVENT_PIN_CODE_REQ:
+			PinCodeRequest(
+				JumpEventHeader<struct hci_ev_pin_code_req>(event), NULL);
 			break;
 
 		default:
@@ -435,6 +589,7 @@ LocalDeviceImpl::HandleExpectedRequest(struct hci_event_header* event,
 			break;
 
 		case HCI_EVENT_MODE_CHANGE:
+			ModeChange(JumpEventHeader<struct hci_ev_mode_change>(event));
 			break;
 
 		case HCI_EVENT_RETURN_LINK_KEYS:
@@ -580,6 +735,8 @@ LocalDeviceImpl::HandleEvent(struct hci_event_header* event)
 			// Finish that request so callers do not wait forever for an event
 			// that the controller will never send.
 			if (commandStatus->status != BT_OK) {
+				CLASSIC_LOG(LE_LOG_ERROR, "the controller refused command %#x: "
+					"status %#x", commandStatus->opcode, commandStatus->status);
 				request = FindPetition(HCI_EVENT_CMD_COMPLETE,
 					commandStatus->opcode, &eventIndexLocation);
 				if (request != NULL) {
@@ -1131,6 +1288,10 @@ LocalDeviceImpl::CommandStatus(struct hci_ev_cmd_status* event,
 		case PACK_OPCODE(OGF_LINK_CONTROL, OCF_CREATE_CONN):
 		{
 			TRACE_BT("LocalDeviceImpl: Command Status for create connection %x\n", event->status);
+			if (event->status != BT_OK) {
+				CLASSIC_LOG(LE_LOG_ERROR, "Create Connection refused: %#x",
+					event->status);
+			}
 
 			switch (event->status) {
 				case BT_OK:
@@ -1483,6 +1644,7 @@ LocalDeviceImpl::ConnectionRequest(struct hci_ev_conn_request* event,
 		ServerRemoteDevice* serverRd;
 		serverRd = RemoteDeviceByAddr(event->bdaddr);
 
+		bool known = serverRd != NULL;
 		if (serverRd == NULL) {
 			serverRd = new ServerRemoteDevice();
 			serverRd->bdaddr = event->bdaddr;
@@ -1491,6 +1653,7 @@ LocalDeviceImpl::ConnectionRequest(struct hci_ev_conn_request* event,
 
 		serverRd->link_type = event->link_type;
 		serverRd->conn_state = RemoteDevice::CONNECTING;
+		serverRd->outgoing = false;
 		memcpy(serverRd->classOfDevice, event->dev_class, 3 * sizeof(uint8));
 
 		BMessage notice(BT_MSG_NEW_REMOTE_DEVICE);
@@ -1499,7 +1662,8 @@ LocalDeviceImpl::ConnectionRequest(struct hci_ev_conn_request* event,
 			sizeof(serverRd->classOfDevice));
 
 		((BluetoothServer*)be_app)->NotifyWatchers(&notice);
-		AddRemoteDevice(serverRd);
+		if (!known)
+			AddRemoteDevice(serverRd);
 
 		// Keep ourselves as slave
 		command = buildAcceptConnectionRequest(event->bdaddr, 0x01 , &size);
@@ -1547,6 +1711,7 @@ LocalDeviceImpl::CreateConnection(BMessage* message)
 	ServerRemoteDevice* rdConn;
 	rdConn = RemoteDeviceByAddr(*bdaddr);
 
+	bool known = rdConn != NULL;
 	if (rdConn == NULL) {
 		rdConn = new ServerRemoteDevice();
 		rdConn->bdaddr = *bdaddr;
@@ -1565,8 +1730,10 @@ LocalDeviceImpl::CreateConnection(BMessage* message)
 
 	rdConn->conn_state = RemoteDevice::CONNECTING;
 	rdConn->link_type = HCI_ACL_CONN;
+	rdConn->outgoing = true;
 
-	AddRemoteDevice(rdConn);
+	if (!known)
+		AddRemoteDevice(rdConn);
 
 	BluetoothCommand<typed_command(hci_cp_create_conn)>
 		command(OGF_LINK_CONTROL, OCF_CREATE_CONN);
@@ -1576,16 +1743,19 @@ LocalDeviceImpl::CreateConnection(BMessage* message)
 	command->pkt_type &= ACL_PTYPE_MASK;
 	command->pscan_rep_mode = rdConn->pscan_rep_mode;
 	message->FindUInt8("pscan_mode", &command->pscan_mode); // Reserved in spec 2.1
-	command->clock_offset = rdConn->clock_offset;
-	command->clock_offset |= 0x8000; // substract!
+	// Bit 15 says the offset is valid; only an inquiry gives one.
+	command->clock_offset = rdConn->clock_offset & 0x7fff;
+	if (command->clock_offset != 0)
+		command->clock_offset |= 0x8000;
 	message->FindUInt8("role_switch", &command->role_switch);
 
 
+	CLASSIC_LOG(LE_LOG_INFO, "connecting to %s (packet types %#x, page scan "
+		"mode %u, clock offset %#x)", bdaddrUtils::ToString(*bdaddr).String(),
+		command->pkt_type, command->pscan_rep_mode, command->clock_offset);
 	if (fHCIDelegate->IssueCommand(command.Data(), command.Size()) == B_ERROR) {
-		TRACE_BT("LocalDeviceImpl: Command issued error for %s\n", __FUNCTION__);
+		CLASSIC_LOG(LE_LOG_ERROR, "could not issue Create Connection");
 		return;
-	} else {
-		TRACE_BT("LocalDeviceImpl: Command issued for %s\n", __FUNCTION__);
 	}
 
 	BMessage* newRequest = new BMessage;
@@ -1647,6 +1817,8 @@ LocalDeviceImpl::Disconnect(BMessage* message)
 	message->FindData("bdaddr", B_ANY_TYPE, (const void**)&bdaddr, &addr_size);
 
 	ServerRemoteDevice* rd = RemoteDeviceByAddr(*bdaddr);
+	if (rd == NULL || rd->conn_state != RemoteDevice::CONNECTED)
+		return;
 	command->handle = rd->handle;
 	message->FindUInt8("reason", &command->reason);
 
@@ -1742,18 +1914,32 @@ LocalDeviceImpl::ConnectionComplete(struct hci_ev_conn_complete* event)
 		reply.AddData("bdaddr", B_ANY_TYPE, &event->bdaddr, sizeof(bdaddr_t));
 
 	reply.AddUInt8("status", event->status);
+	CLASSIC_LOG(event->status == BT_OK ? LE_LOG_INFO : LE_LOG_ERROR,
+		"link to %s: status %#x, handle %#x, type %u, encryption %u",
+		bdaddrUtils::ToString(event->bdaddr).String(), event->status,
+		event->handle, event->link_type, event->encrypt_mode);
 	if (event->status == BT_OK) {
 		if (rd != NULL) {
 			rd->handle = event->handle;
 			rd->link_type = event->link_type;
 			rd->conn_state = RemoteDevice::CONNECTED;
+			rd->auth_retries = 0;
 			rd->encryption_enabled = event->encrypt_mode;
+			((BluetoothServer*)be_app)->GetHIDHost()->LinkEncrypted(
+				rd->bdaddr, event->encrypt_mode != 0, false);
 		}
 
-		// TODO: Review, this rDevice is leaked
-		ConnectionIncoming* iConnection = new ConnectionIncoming(
-			new RemoteDevice(event->bdaddr, rd->classOfDevice));
-		iConnection->Show();
+		// Tell the user about a device that connected on its own; one we
+		// connected to was asked for, and a paired one (a keyboard waking
+		// up) is expected.
+		linkkey_t nullKey = LinkKeyUtils::NullKey();
+		bool paired = !LinkKeyUtils::Compare(&rd->link_key, &nullKey);
+		if (!rd->outgoing && !paired) {
+			// TODO: Review, this rDevice is leaked
+			ConnectionIncoming* iConnection = new ConnectionIncoming(
+				new RemoteDevice(event->bdaddr, rd->classOfDevice));
+			iConnection->Show();
+		}
 
 		TRACE_BT("LocalDeviceImpl: %s: Address %s handle=%#x type=%d encrypt=%d\n", __FUNCTION__,
 				bdaddrUtils::ToString(event->bdaddr).String(), event->handle,
@@ -1767,7 +1953,15 @@ LocalDeviceImpl::ConnectionComplete(struct hci_ev_conn_complete* event)
 		newrequest->AddInt16("eventExpected", HCI_EVENT_LINK_KEY_NOTIFY);
 		AddWantedEvent(newrequest);
 
-		Authenticate(event->handle);
+		// A device that connected by itself (a keyboard waking up) usually
+		// authenticates and encrypts the link itself; doing it at the same
+		// time ends in a transaction collision. Give it a moment first.
+		if (rd->outgoing)
+			Authenticate(event->handle);
+		else {
+			((BluetoothServer*)be_app)->CheckLinkSecurityLater(GetID(),
+				rd->bdaddr, 0);
+		}
 
 		reply.what = BT_MSG_CONN_COMPLETED;
 	} else {
@@ -1796,6 +1990,8 @@ LocalDeviceImpl::DisconnectionComplete(hci_ev_disconnection_complete_reply* even
 		BluetoothError(event->reason), event->status);
 	uint16 handle = B_LENDIAN_TO_HOST_INT16(event->handle);
 	HandleLEDisconnection(handle, event->status, event->reason);
+	CLASSIC_LOG(LE_LOG_INFO, "link %#x down: status %#x, reason %#x", handle,
+		event->status, event->reason);
 
 	ServerRemoteDevice* rd;
 	rd = RemoteDeviceByHandle(handle);
@@ -1806,8 +2002,13 @@ LocalDeviceImpl::DisconnectionComplete(hci_ev_disconnection_complete_reply* even
 		reply.AddData("bdaddr", B_ANY_TYPE, &rd->bdaddr, sizeof(bdaddr_t));
 
 	if (rd != NULL && (event->status == BT_OK
-		|| event->status == BT_NO_CONNECTION))
+		|| event->status == BT_NO_CONNECTION)) {
 		rd->conn_state = RemoteDevice::DISCONNECTED;
+		rd->handle = 0xffff;
+		rd->outgoing = false;
+		rd->encryption_enabled = 0;
+		((BluetoothServer*)be_app)->GetHIDHost()->LinkDown(rd->bdaddr);
+	}
 
 
 	((BluetoothServer*)be_app)->NotifyWatchers(&reply);
@@ -1858,8 +2059,13 @@ LocalDeviceImpl::LinkKeyNotify(hci_ev_link_key_notify* event,
 	if (rd == NULL)
 		return;
 
+	CLASSIC_LOG(LE_LOG_INFO, "new link key for %s, type %u",
+		bdaddrUtils::ToString(event->bdaddr).String(), event->key_type);
 	rd->link_key = event->link_key;
-	rd->link_type = event->key_type;
+	rd->key_type = event->key_type;
+	// Keep the key now: the next time the device connects it is asked for,
+	// and losing it to a crash or power cut means pairing again.
+	SaveRemoteDevices();
 }
 
 
@@ -1872,7 +2078,12 @@ LocalDeviceImpl::LinkKeyRequested(struct hci_ev_link_key_req* keyRequested,
 
 	ServerRemoteDevice* rd = RemoteDeviceByAddr(keyRequested->bdaddr);
 	linkkey_t nullLinkKey = LinkKeyUtils::NullKey();
-	if (rd == NULL || LinkKeyUtils::Compare(&rd->link_key, &nullLinkKey)) {
+	const bool haveKey = rd != NULL
+		&& !LinkKeyUtils::Compare(&rd->link_key, &nullLinkKey);
+	CLASSIC_LOG(LE_LOG_INFO, "link key for %s requested: %s",
+		bdaddrUtils::ToString(keyRequested->bdaddr).String(),
+		haveKey ? "stored" : "none, pairing");
+	if (!haveKey) {
 		BluetoothCommand<typed_command(hci_cp_link_key_neg_reply)>
 			linkKeyNegativeReply(OGF_LINK_CONTROL, OCF_LINK_KEY_NEG_REPLY);
 
@@ -2014,6 +2225,13 @@ LocalDeviceImpl::IOCapabilityResponse(struct hci_ev_io_capability_response* even
 	TRACE_BT("LocalDeviceImpl: %s for %s - Capability: 0x%02x, OOB: 0x%02x, Auth: 0x%02x\n",
 		__FUNCTION__, bdaddrUtils::ToString(event->bdaddr).String(), event->capability,
 		event->oob_data, event->authentication);
+
+	ServerRemoteDevice* rd = RemoteDeviceByAddr(event->bdaddr);
+	if (rd != NULL)
+		rd->remote_io_capability = event->capability;
+	CLASSIC_LOG(LE_LOG_INFO, "pairing with %s: its IO capability %u, "
+		"authentication %#x", bdaddrUtils::ToString(event->bdaddr).String(),
+		event->capability, event->authentication);
 }
 
 
@@ -2023,10 +2241,31 @@ LocalDeviceImpl::UserConfirmationRequest(struct hci_ev_user_confirmation_request
 {
 	TRACE_BT("LocalDeviceImpl: User Confirmation Request for %s (Passkey: %06" B_PRIu32 ")\n",
 		bdaddrUtils::ToString(event->bdaddr).String(), event->passkey);
+
+	ServerRemoteDevice* rd = RemoteDeviceByAddr(event->bdaddr);
+	BString name = bdaddrUtils::ToString(event->bdaddr);
+	if (rd != NULL && !rd->friendly_name.IsEmpty())
+		name = rd->friendly_name;
+
 	BString prompt;
-	prompt.SetToFormat("Confirm pairing with %s only if the other device shows "
-		"the same code: %06" B_PRIu32,
-		bdaddrUtils::ToString(event->bdaddr).String(), event->passkey);
+	if (rd != NULL
+		&& rd->remote_io_capability == HCI_IO_CAP_NO_INPUT_NO_OUTPUT) {
+		// "Just Works" (Core Vol 3 Part C 5.2.2.6): a speaker or headset
+		// can neither show nor confirm a number, so there is nothing to
+		// compare. When the link was asked for here, the user already chose
+		// this device; otherwise ask, but without a meaningless code.
+		if (rd->outgoing) {
+			printf("Bluetooth: pairing with %s, which has no display or "
+				"input\n", name.String());
+			ConfirmPairing(event->bdaddr, true);
+			return;
+		}
+		prompt.SetToFormat("Pair with %s?", name.String());
+	} else {
+		prompt.SetToFormat("Confirm pairing with %s only if the other device "
+			"shows the same code: %06" B_PRIu32, name.String(),
+			event->passkey);
+	}
 	BMessage* decision = new BMessage(BT_MSG_PAIR_CONFIRM_RESULT);
 	decision->AddInt32("hci_id", GetID());
 	decision->AddData("bdaddr", B_ANY_TYPE, &event->bdaddr, sizeof(bdaddr_t));
@@ -2055,9 +2294,105 @@ LocalDeviceImpl::ConfirmPairing(bdaddr_t address, bool accepted)
 
 
 void
+LocalDeviceImpl::SecureLink(const bdaddr_t& address, int32 attempt)
+{
+	ServerRemoteDevice* rd = RemoteDeviceByAddr(address);
+	if (rd == NULL || rd->conn_state != RemoteDevice::CONNECTED
+		|| rd->encryption_enabled != 0)
+		return;
+	CLASSIC_LOG(LE_LOG_INFO, "link %#x to %s is not encrypted yet: "
+		"authenticating (attempt %" B_PRId32 ")", rd->handle,
+		bdaddrUtils::ToString(address).String(), attempt + 1);
+	Authenticate(rd->handle);
+}
+
+
+void
+LocalDeviceImpl::EnablePageScan()
+{
+	// Page scan only: paired devices can connect, but we are not
+	// discoverable unless the user asks for it in the preferences.
+	uint8 scan = 0x02;
+	if (fProperties != NULL) {
+		int8 current;
+		if (fProperties->FindInt8("scan_enable", &current) == B_OK)
+			scan |= current;
+	}
+	CLASSIC_LOG(LE_LOG_INFO, "page scan on (scan enable %#x) for paired HID "
+		"devices", scan);
+	_SendLECommand(PACK_OPCODE(OGF_CONTROL_BASEBAND, OCF_WRITE_SCAN_ENABLE),
+		&scan, 1);
+}
+
+
+void
+LocalDeviceImpl::UserPasskeyNotification(
+	struct hci_ev_user_passkey_notification* event)
+{
+	// We have a display and the device a keyboard (Core Vol 3 Part C
+	// 5.2.2.6, Passkey Entry): the user types our number on it.
+	ServerRemoteDevice* rd = RemoteDeviceByAddr(event->bdaddr);
+	BString name = bdaddrUtils::ToString(event->bdaddr);
+	if (rd != NULL && !rd->friendly_name.IsEmpty())
+		name = rd->friendly_name;
+
+	CLASSIC_LOG(LE_LOG_INFO, "pairing with %s: the passkey is to be typed on "
+		"it", bdaddrUtils::ToString(event->bdaddr).String());
+
+	_ClosePasskeyAlert();
+	BString text;
+	text.SetToFormat("To pair %s, type this number on it and press Enter:"
+		"\n\n%06" B_PRIu32, name.String(), event->passkey);
+	BAlert* alert = new BAlert("Bluetooth pairing", text.String(), "Close",
+		NULL, NULL, B_WIDTH_AS_USUAL, B_INFO_ALERT);
+	alert->SetFlags(alert->Flags() | B_CLOSE_ON_ESCAPE);
+	fPasskeyAlert = BMessenger(alert);
+	alert->Go(NULL);
+}
+
+
+void
+LocalDeviceImpl::ModeChange(struct hci_ev_mode_change* event)
+{
+	static const char* kModes[] = { "active", "hold", "sniff", "park" };
+	uint16 interval = B_LENDIAN_TO_HOST_INT16(event->interval);
+	CLASSIC_LOG(event->status == BT_OK ? LE_LOG_INFO : LE_LOG_ERROR,
+		"link %#x: %s mode, interval %.2f ms (status %#x)",
+		B_LENDIAN_TO_HOST_INT16(event->handle),
+		event->mode < 4 ? kModes[event->mode] : "unknown",
+		interval * 0.625, event->status);
+}
+
+
+void
+LocalDeviceImpl::KeypressNotification(
+	struct hci_ev_keypress_notification* event)
+{
+	CLASSIC_LOG(LE_LOG_DEBUG, "pairing with %s: keypress notification %u",
+		bdaddrUtils::ToString(event->bdaddr).String(), event->type);
+}
+
+
+void
+LocalDeviceImpl::_ClosePasskeyAlert()
+{
+	if (fPasskeyAlert.IsValid())
+		fPasskeyAlert.SendMessage(B_QUIT_REQUESTED);
+	fPasskeyAlert = BMessenger();
+}
+
+
+void
 LocalDeviceImpl::SimplePairingComplete(struct hci_ev_simple_pairing_complete* event,
 	BMessage* request)
 {
+	_ClosePasskeyAlert();
+	CLASSIC_LOG(event->status == BT_OK ? LE_LOG_INFO : LE_LOG_ERROR,
+		"simple pairing with %s: status %#x",
+		bdaddrUtils::ToString(event->bdaddr).String(), event->status);
+	CLASSIC_LOG(event->status == BT_OK ? LE_LOG_INFO : LE_LOG_ERROR,
+		"pairing with %s finished: %#x",
+		bdaddrUtils::ToString(event->bdaddr).String(), event->status);
 	if (event->status == BT_OK) {
 		TRACE_BT("LocalDeviceImpl: %s successfull for %s!\n", __FUNCTION__,
 			bdaddrUtils::ToString(event->bdaddr).String());
@@ -2076,25 +2411,44 @@ LocalDeviceImpl::AuthComplete(struct hci_ev_auth_complete* eventData, BMessage* 
 {
 	uint16 handle = B_LENDIAN_TO_HOST_INT16(eventData->handle);
 	uint8 status = eventData->status;
+	CLASSIC_LOG(status == BT_OK ? LE_LOG_INFO : LE_LOG_ERROR,
+		"authentication of link %#x: %#x", handle, status);
 
 	if (status == BT_OK) {
 		TRACE_BT("LocalDeviceImpl: Authentication Successful for handle %d\n", handle);
-		ServerRemoteDevice* rd = RemoteDeviceByHandle(eventData->handle);
-
-		SetConnEncryption(rd->handle, true);
-		((BluetoothServer*)be_app)->DiscoverServices(rd);
+		ServerRemoteDevice* rd = RemoteDeviceByHandle(handle);
+		if (rd != NULL) {
+			SetConnEncryption(rd->handle, true);
+			((BluetoothServer*)be_app)->DiscoverServices(rd);
+		}
 	} else {
 		TRACE_BT("LocalDeviceImpl: Authentication Failed for handle %d with status 0x%02x\n",
 			handle, status);
 
-		ServerRemoteDevice* rd = RemoteDeviceByHandle(eventData->handle);
-		if (rd != NULL) {
+		ServerRemoteDevice* rd = RemoteDeviceByHandle(handle);
+		if (rd != NULL && (status == BT_AUTHENTICATION_FAILURE
+				|| status == BT_PIN_OR_KEY_MISSING)) {
+			// The key is wrong or the device forgot it: pair again next time.
 			rd->link_key = LinkKeyUtils::NullKey();
+			SaveRemoteDevices();
 			BMessage disconnReq;
 			bdaddr_t bdaddr = rd->bdaddr;
 			disconnReq.AddData("bdaddr", B_ANY_TYPE, &bdaddr, sizeof(bdaddr_t));
 			disconnReq.AddUInt8("reason", BT_AUTHENTICATION_FAILURE);
 			Disconnect(&disconnReq);
+		} else if (rd != NULL) {
+			// Anything else, such as a collision with the device's own
+			// authentication (a keyboard reconnecting authenticates by
+			// itself), says nothing about the key: keep it and the link,
+			// and look again in a moment.
+			CLASSIC_LOG(LE_LOG_INFO, "keeping the link key of %s; checking "
+				"the link again shortly",
+				bdaddrUtils::ToString(rd->bdaddr).String());
+			if (rd->auth_retries < 2) {
+				rd->auth_retries++;
+				((BluetoothServer*)be_app)->CheckLinkSecurityLater(GetID(),
+					rd->bdaddr, rd->auth_retries);
+			}
 		}
 	}
 
@@ -2122,12 +2476,21 @@ LocalDeviceImpl::EncryptChange(struct hci_ev_encrypt_change* event)
 		return;
 
 	ServerRemoteDevice* rd = RemoteDeviceByHandle(handle);
+	CLASSIC_LOG(event->status == BT_OK ? LE_LOG_INFO : LE_LOG_ERROR,
+		"encryption of link %#x: status %#x, %s%s", handle, event->status,
+		event->encrypt ? "on" : "off", rd == NULL ? " (unknown link)" : "");
 	if (rd == NULL)
 		return;
 
 	rd->encryption_enabled = event->encrypt;
-	if (rd->encryption_enabled != 0)
+	if (rd->encryption_enabled != 0) {
 		((BluetoothServer*)be_app)->NotifyServices(rd);
+		// A device that connected and secured the link by itself never
+		// went through our authentication, which is what queries the
+		// services of a device we do not know yet.
+		if (!rd->outgoing && rd->services.IsEmpty())
+			((BluetoothServer*)be_app)->DiscoverServices(rd);
+	}
 }
 
 

@@ -25,6 +25,9 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 
 		SharedLibrary [ MultiArchDefaultGristFiles libbluetooth.so ] :
 			LocalDevice.cpp
+			A2dpSource.cpp
+			AudioSinkSetting.cpp
+			SbcEncoder.cpp
 			DiscoveryListener.cpp
 			DiscoveryAgent.cpp
 			RemoteDevice.cpp

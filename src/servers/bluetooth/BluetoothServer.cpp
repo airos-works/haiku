@@ -13,6 +13,7 @@
 #include <Entry.h>
 #include <Directory.h>
 #include <Message.h>
+#include <MessageRunner.h>
 #include <Path.h>
 #include <Roster.h>
 #include <String.h>
@@ -87,7 +88,16 @@ BluetoothServer::BluetoothServer()
 	fEventListener2 = new BluetoothPortListener(BT_USERLAND_PORT_NAME,
 		(BluetoothPortListener::port_listener_func)&DispatchEvent);
 	fSDPServer = new SDPServer();
+	fHIDHost = new HIDHost();
 }
+
+
+// The SDP records of a device, read on a thread of their own (see
+// DiscoverServices()); internal to the server.
+static const uint32 kMsgServicesDiscovered = 'btSD';
+// A Classic link to authenticate if it is still not encrypted by then.
+static const uint32 kMsgCheckLinkSecurity = 'btCL';
+static const bigtime_t kLinkSecurityDelay = 2000000;
 
 
 bool BluetoothServer::QuitRequested(void)
@@ -99,6 +109,10 @@ bool BluetoothServer::QuitRequested(void)
 
 	fSDPServer->Stop();
 	delete fSDPServer;
+
+	fHIDHost->Stop();
+	delete fHIDHost;
+	fHIDHost = NULL;
 
 	delete fEventListener2;
 	TRACE_BT("Shutting down bluetooth_server.\n");
@@ -138,6 +152,12 @@ void BluetoothServer::ReadyToRun(void)
 	status_t status = fSDPServer->Start();
 	if (status != B_OK)
 		TRACE_BT("BluetoothServer: Failed launching the SDP server thread\n");
+
+	status = fHIDHost->Start();
+	if (status != B_OK) {
+		Bluetooth::LELog(Bluetooth::LE_LOG_ERROR, "hid",
+			"the HID host did not start: %s", strerror(status));
+	}
 
 	// Drives the HCI command queue and LE watchdogs.
 	SetPulseRate(500000);
@@ -276,7 +296,8 @@ void BluetoothServer::MessageReceived(BMessage* message)
 				&& addressSize == 6
 				&& message->FindUInt8("address_type", &addressType) == B_OK
 				? device->StartLEConnection(listener, (const uint8*)address,
-					addressType) : B_BAD_VALUE;
+					addressType, message->HasUInt16("interval_min")
+						? message : NULL) : B_BAD_VALUE;
 			break;
 		}
 
@@ -302,6 +323,28 @@ void BluetoothServer::MessageReceived(BMessage* message)
 					&& !message->GetBool("force", false);
 			status = device != NULL ? device->DisconnectLEConnection(
 				hasListener ? &listener : NULL) : B_BAD_VALUE;
+			break;
+		}
+
+		case BT_MSG_LE_UPDATE_CONNECTION:
+		{
+			LocalDeviceImpl* device = LocateDelegateFromMessage(message);
+			status = device == NULL ? B_BAD_VALUE
+				: device->UpdateLEConnection(
+					message->GetUInt16("interval_min", 0),
+					message->GetUInt16("interval_max", 0),
+					message->GetUInt16("latency", 0xffff),
+					message->GetUInt16("timeout", 0),
+					message->GetBool("keep_interval", false));
+			break;
+		}
+
+		case BT_MSG_READ_RSSI:
+		{
+			LocalDeviceImpl* device = LocateDelegateFromMessage(message);
+			status = device == NULL ? B_BAD_VALUE
+				: device->ReadRSSI(message->GetUInt16("handle", 0xffff) == 0xffff
+					? -1 : message->GetUInt16("handle", 0));
 			break;
 		}
 
@@ -413,8 +456,27 @@ void BluetoothServer::MessageReceived(BMessage* message)
 
 			ServerRemoteDevice* rd = lDeviceImpl->RemoteDeviceByAddr(*bdaddr);
 			lDeviceImpl->RemoveRemoteDevice(rd);
+			if (addr_size == sizeof(bdaddr_t))
+				fHIDHost->RemoveDevice(*bdaddr);
 		}
 		break;
+
+		case kMsgServicesDiscovered:
+			_ServicesDiscovered(message);
+			break;
+
+		case kMsgCheckLinkSecurity:
+		{
+			LocalDeviceImpl* local = LocateDelegateFromMessage(message);
+			const bdaddr_t* address;
+			ssize_t size;
+			if (local != NULL && message->FindData("bdaddr", B_ANY_TYPE,
+					(const void**)&address, &size) == B_OK
+				&& size == sizeof(bdaddr_t)) {
+				local->SecureLink(*address, message->GetInt32("attempt", 0));
+			}
+			break;
+		}
 
 		case BT_START_WATCHING_CONNECTIONS:
 		{
@@ -473,6 +535,10 @@ void BluetoothServer::MessageReceived(BMessage* message)
 				rd = lDeviceImpl->RemoteDeviceByAddr(*bdaddr);
 			reply.AddUInt8("conn state", static_cast<uint8>(rd != NULL
 				? rd->conn_state : RemoteDevice::DISCONNECTED));
+			if (rd != NULL && rd->conn_state == RemoteDevice::CONNECTED) {
+				reply.AddBool("encrypted", rd->encryption_enabled != 0);
+				reply.AddUInt16("handle", rd->handle);
+			}
 
 			message->SendReply(&reply);
 		}
@@ -509,32 +575,152 @@ BluetoothServer::NotifyWatchers(BMessage* notice)
 }
 
 
+struct DiscoverServicesJob {
+	bdaddr_t	address;
+	BString		name;
+	bool		outgoing;
+	uint8		classOfDevice[3];
+};
+
+
+/*!	Called by the HCI event thread once a Classic link is authenticated.
+	The SDP query takes seconds and waits on the very events that thread
+	delivers, so it runs on a thread of its own and reports back with
+	kMsgServicesDiscovered.
+*/
 void
 BluetoothServer::DiscoverServices(ServerRemoteDevice* rd)
 {
 	TRACE_BT("BluetoothServer: Discovering Services for %s\n", rd->friendly_name.String());
-	SDPClient sdpClient(rd);
-	sdpClient.Start();
-	if (sdpClient.RequestServiceRecords() == B_OK)
-		TRACE_BT("SDP: Service records loaded successfully\n");
-	else
-		TRACE_BT("SDP: Error service records could not be loaded\n");
 
-	// rd->services.PrintToStream();
+	// A paired HID device: its records are known. One that woke up opens
+	// its channels itself; one the user connected gets them opened.
+	if (fHIDHost->IsHIDDevice(rd->bdaddr)) {
+		if (rd->outgoing)
+			fHIDHost->Connect(rd->bdaddr);
+		return;
+	}
+
+	DiscoverServicesJob* job = new(std::nothrow) DiscoverServicesJob;
+	if (job == NULL)
+		return;
+	job->address = rd->bdaddr;
+	job->name = rd->friendly_name;
+	job->outgoing = rd->outgoing;
+	memcpy(job->classOfDevice, rd->classOfDevice, sizeof(job->classOfDevice));
+	thread_id thread = spawn_thread(&_DiscoverServicesThread,
+		"bluetooth SDP query", B_NORMAL_PRIORITY, job);
+	if (thread < 0 || resume_thread(thread) != B_OK)
+		delete job;
+}
+
+
+/*static*/ status_t
+BluetoothServer::_DiscoverServicesThread(void* data)
+{
+	DiscoverServicesJob* job = (DiscoverServicesJob*)data;
+
+	ServerRemoteDevice device;
+	device.bdaddr = job->address;
+	device.friendly_name = job->name;
+	SDPClient sdpClient(&device);
+	status_t status = sdpClient.Start();
+	if (status == B_OK)
+		status = sdpClient.RequestServiceRecords();
+	sdpClient.Stop();
+
+	char address[18];
+	Bluetooth::LELog(status == B_OK ? Bluetooth::LE_LOG_INFO
+			: Bluetooth::LE_LOG_ERROR, "classic",
+		"SDP query of %s: %s", Bluetooth::LEAddressString(job->address.b,
+			address), status == B_OK ? "done" : strerror(status));
+
+	BMessage result(kMsgServicesDiscovered);
+	result.AddData("bdaddr", B_ANY_TYPE, &job->address, sizeof(bdaddr_t));
+	result.AddString("name", job->name);
+	result.AddBool("outgoing", job->outgoing);
+	result.AddData("class", B_RAW_TYPE, job->classOfDevice,
+		sizeof(job->classOfDevice));
+	result.AddInt32("status", status);
+	result.AddMessage("services", &device.services);
+	be_app->PostMessage(&result);
+
+	delete job;
+	return B_OK;
 }
 
 
 void
+BluetoothServer::_ServicesDiscovered(BMessage* message)
+{
+	const bdaddr_t* address;
+	ssize_t size;
+	BMessage services;
+	if (message->FindData("bdaddr", B_ANY_TYPE, (const void**)&address,
+			&size) != B_OK || size != sizeof(bdaddr_t)
+		|| message->FindMessage("services", &services) != B_OK)
+		return;
+
+	for (int32 i = 0; i < fLocalDevicesList.CountItems(); i++) {
+		LocalDeviceImpl* local = fLocalDevicesList.ItemAt(i);
+		ServerRemoteDevice* rd = local != NULL
+			? local->RemoteDeviceByAddr(*address) : NULL;
+		if (rd != NULL)
+			rd->services = services;
+	}
+
+	// Without SDP records, a keyboard (its Class of Device: major class
+	// Peripheral, minor keyboard bit) still works in the boot protocol.
+	bool added = false;
+	if (message->GetInt32("status", B_ERROR) == B_OK) {
+		added = fHIDHost->AddDevice(*address, services,
+			message->GetString("name", ""));
+	} else {
+		const uint8* deviceClass;
+		ssize_t classSize;
+		if (message->FindData("class", B_RAW_TYPE,
+				(const void**)&deviceClass, &classSize) == B_OK
+			&& classSize == 3 && (deviceClass[1] & 0x1f) == 0x05
+			&& (deviceClass[0] & 0x40) != 0) {
+			added = fHIDHost->AddBootKeyboard(*address,
+				message->GetString("name", ""));
+		}
+	}
+	if (added) {
+		// Bonded HID devices page us when they wake up.
+		for (int32 i = 0; i < fLocalDevicesList.CountItems(); i++) {
+			LocalDeviceImpl* local = fLocalDevicesList.ItemAt(i);
+			if (local != NULL)
+				local->EnablePageScan();
+		}
+		// Opened from here whether we or the device made the link: a
+		// keyboard that connected by itself may wait for us (the HID host
+		// leaves alone a device that is opening its channels already).
+		fHIDHost->Connect(*address);
+	}
+}
+
+
+void
+BluetoothServer::CheckLinkSecurityLater(hci_id hid, const bdaddr_t& address,
+	int32 attempt)
+{
+	BMessage message(kMsgCheckLinkSecurity);
+	message.AddInt32("hci_id", hid);
+	message.AddData("bdaddr", B_ANY_TYPE, &address, sizeof(bdaddr_t));
+	message.AddInt32("attempt", attempt);
+	BMessageRunner::StartSending(be_app_messenger, &message,
+		kLinkSecurityDelay, 1);
+}
+
+
+/*!	Called by the HCI event thread when a Classic link's encryption changes.
+*/
+void
 BluetoothServer::NotifyServices(ServerRemoteDevice* rd)
 {
-	TRACE_BT("BluetoothServer: Notifying Services for %s\n", rd->friendly_name.String());
-	SDPClient sdpClient(rd);
-
-	if (sdpClient.NotifyProfiles() == B_OK)
-		TRACE_BT("SDP: Notified the dedicated profile successfully\n");
-	else
-		TRACE_BT("SDP: Error could not notify the dedicated profile\n");
-
+	fHIDHost->LinkEncrypted(rd->bdaddr, rd->encryption_enabled != 0,
+		!rd->outgoing);
 }
 
 

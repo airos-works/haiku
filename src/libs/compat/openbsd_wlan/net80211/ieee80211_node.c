@@ -885,6 +885,7 @@ ieee80211_begin_scan(struct ifnet *ifp)
 	ieee80211_setmode(ic, ic->ic_curmode);
 
 	ic->ic_scan_count = 0;
+	ic->ic_xflags &= ~IEEE80211_F_SCAN_PAUSED;
 
 	/* Scan the next channel. */
 	ieee80211_next_scan(ifp);
@@ -1544,6 +1545,24 @@ ieee80211_end_scan(struct ifnet *ifp)
 			return;
 		}
 #endif
+		/*
+		 * Haiku: nobody asked us to join a network, so one pass over
+		 * the channels is enough for the list the network menu shows.
+		 * Scanning on and on keeps the radio off its channel, which on
+		 * chips with Bluetooth next to Wi-Fi (the Cubie A7S's AIC8800)
+		 * starves Bluetooth: a mouse stutters. A scan request, or a
+		 * network to join, starts scanning again.
+		 */
+		if (ic->ic_opmode == IEEE80211_M_STA && !bgscan &&
+		    ic->ic_des_esslen == 0 &&
+		    (ic->ic_flags & IEEE80211_F_AUTO_JOIN) == 0) {
+			ieee80211_reset_scan(ifp);
+			ic->ic_xflags |= IEEE80211_F_SCAN_PAUSED;
+			if (!scan_only)
+				ieee80211_notify_scan_done(ifp);
+			return;
+		}
+
 		/*
 		 * Reset the list of channels to scan and scan the next mode
 		 * if nothing has been found.

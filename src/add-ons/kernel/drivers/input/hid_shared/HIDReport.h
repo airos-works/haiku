@@ -39,8 +39,9 @@ public:
 									main_item_data &mainData,
 									HIDCollection *collection);
 
-		void					SetReport(status_t status, uint8 *report,
+		int32					SetReport(status_t status, uint8 *report,
 									size_t length);
+									// returns the number of readers woken
 		uint8 *					CurrentReport() { return fCurrentReport; };
 
 #ifndef USERLAND_HID
@@ -57,6 +58,13 @@ public:
 #ifndef USERLAND_HID
 		status_t				WaitForReport(bigtime_t timeout);
 		void					DoneProcessing();
+
+								// Whether SetReport() would reach a reader:
+								// transports that are handed reports (rather
+								// than asking for them) keep them until then.
+		bool					HasWaiters()
+									{ return fConditionVariable.EntriesCount()
+										> 0; }
 #endif
 
 		void					PrintToStream();

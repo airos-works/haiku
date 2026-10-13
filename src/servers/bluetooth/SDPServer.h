@@ -22,6 +22,8 @@ public:
 private:
         static int32        _ListenThread(void* data);
         int32               _Run();
+        static status_t     _ClientThread(void* cookie);
+        static void         _HandleClient(int client);
 
         thread_id           fThreadID;
 		int                 fServerSocket;

@@ -249,6 +249,11 @@ make_l2cap_information_rsp(uint8& code, uint16 type, uint16 result, uint16 _mtu)
 			gBufferModule->append(buffer.Get(), &mtu, sizeof(mtu));
 			break;
 		}
+		case l2cap_information_req::TYPE_EXTENDED_FEATURES: {
+			uint32 features = 0;
+			gBufferModule->append(buffer.Get(), &features, sizeof(features));
+			break;
+		}
 		}
 	}
 

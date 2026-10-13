@@ -252,7 +252,8 @@ ControlLink(BMessenger& server, uint32 what, int32 hciID,
 // example the input add-on reconnecting a mouse) holds the single LE link.
 static status_t
 RequestConnection(BMessenger& server, int32 hciID, PairingListener* listener,
-	const uint8 address[6], uint8 addressType, bigtime_t busyTimeout)
+	const uint8 address[6], uint8 addressType, bigtime_t busyTimeout,
+	const uint16* parameters = NULL)
 {
 	bigtime_t deadline = system_time() + busyTimeout;
 	for (;;) {
@@ -261,6 +262,12 @@ RequestConnection(BMessenger& server, int32 hciID, PairingListener* listener,
 		request.AddMessenger("listener", BMessenger(listener));
 		request.AddData("address", B_RAW_TYPE, address, 6);
 		request.AddUInt8("address_type", addressType);
+		if (parameters != NULL) {
+			request.AddUInt16("interval_min", parameters[0]);
+			request.AddUInt16("interval_max", parameters[1]);
+			request.AddUInt16("latency", parameters[2]);
+			request.AddUInt16("timeout", parameters[3]);
+		}
 		status_t status = SendRequest(server, request);
 		if (status != B_BUSY || system_time() > deadline)
 			return status;
@@ -415,9 +422,11 @@ struct LEEncryptedLink::Impl {
 		:
 		listener(NULL),
 		hciID(-1),
-		connected(false)
+		connected(false),
+		hasParameters(false)
 	{
 		memset(connectionAddress, 0, sizeof(connectionAddress));
+		memset(parameters, 0, sizeof(parameters));
 	}
 
 	BMessenger server;
@@ -425,6 +434,8 @@ struct LEEncryptedLink::Impl {
 	int32 hciID;
 	bool connected;
 	uint8 connectionAddress[6];
+	bool hasParameters;
+	uint16 parameters[4];
 };
 
 
@@ -492,7 +503,8 @@ LEEncryptedLink::ConnectBonded(int32 hciID, const uint8 localAddress[6],
 	BMessenger listener(fImpl->listener);
 	fImpl->hciID = hciID;
 	status = RequestConnection(fImpl->server, hciID, fImpl->listener,
-		currentAddress, currentType, 10000000);
+		currentAddress, currentType, 10000000,
+		fImpl->hasParameters ? fImpl->parameters : NULL);
 	if (status != B_OK) {
 		LOG(LE_LOG_ERROR, "LE connect request refused: %s", StatusText(status));
 		Disconnect();
@@ -528,6 +540,34 @@ LEEncryptedLink::ConnectBonded(int32 hciID, const uint8 localAddress[6],
 	} else
 		LOG(LE_LOG_INFO, "bonded peer connected and encrypted");
 	return status;
+}
+
+
+void
+LEEncryptedLink::SetConnectionParameters(uint16 intervalMin,
+	uint16 intervalMax, uint16 latency, uint16 timeout)
+{
+	if (fImpl == NULL)
+		return;
+	fImpl->hasParameters = true;
+	fImpl->parameters[0] = intervalMin;
+	fImpl->parameters[1] = intervalMax;
+	fImpl->parameters[2] = latency;
+	fImpl->parameters[3] = timeout;
+}
+
+
+status_t
+LEEncryptedLink::KeepInterval(uint16 intervalMin, uint16 intervalMax)
+{
+	if (fImpl == NULL || !fImpl->connected)
+		return B_NO_INIT;
+	BMessage request(BT_MSG_LE_UPDATE_CONNECTION);
+	request.AddInt32("hci_id", fImpl->hciID);
+	request.AddUInt16("interval_min", intervalMin);
+	request.AddUInt16("interval_max", intervalMax);
+	request.AddBool("keep_interval", true);
+	return SendRequest(fImpl->server, request);
 }
 
 

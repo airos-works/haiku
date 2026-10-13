@@ -1,0 +1,14 @@
+SubDir HAIKU_TOP src add-ons media media-add-ons bluetooth_audio ;
+
+UsePrivateHeaders bluetooth media ;
+
+local architectureObject ;
+for architectureObject in [ MultiArchSubDirSetup ] {
+	on $(architectureObject) {
+		Addon [ MultiArchDefaultGristFiles bluetooth_audio.media_addon ] :
+			BluetoothAudioAddOn.cpp
+			BluetoothAudioNode.cpp
+			: be media network libbluetooth.so [ TargetLibsupc++ ]
+		;
+	}
+}

@@ -109,6 +109,9 @@ l2cap_getsockopt(net_protocol* protocol, int level, int option,
 	void* value, int* _length)
 {
 	CALLED();
+	if (level == BLUETOOTH_PROTO_L2CAP)
+		return ((L2capEndpoint*)protocol)->GetOption(option, value, _length);
+
 	return gSocketModule->get_option(protocol->socket, level, option, value,
 		_length);
 }

@@ -15,6 +15,7 @@
 #include <LELog.h>
 #include <LEPairingSession.h>
 
+#include <FindDirectory.h>
 #include <InputServerDevice.h>
 #include <InterfaceDefs.h>
 #include <kb_mouse_settings.h>
@@ -22,10 +23,16 @@
 #include <OS.h>
 #include <bluetooth/LocalDevice.h>
 #include <bluetooth/bdaddrUtils.h>
+#include <driver_settings.h>
 
+#include <algorithm>
 #include <atomic>
+#include <limits.h>
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 
 using Bluetooth::LELog;
@@ -42,6 +49,38 @@ namespace {
 static const char* kDeviceName = "Bluetooth LE mouse";
 // How long each reconnection scan waits for a bonded mouse to advertise.
 static const bigtime_t kScanWindow = 15000000;
+// Connections to mice are created at 7.5-11.25 ms, what they ask for a
+// moment later anyway, instead of the server's 30-50 ms: encryption and the
+// first reports come sooner. The AIC8800 makes it 11.25 ms whatever the
+// range, and keeps a mouse there when asked for 7.5 ms. "interval <ms>" in
+// ~/config/settings/bluetooth/le_mouse asks for that interval, and keeps
+// asking when the mouse changes it, on controllers that allow it.
+static const uint16 kMouseIntervalMin = 6;
+static const uint16 kMouseIntervalMax = 9;
+
+// The interval asked for in the settings, 0 for none.
+static uint16
+MouseInterval()
+{
+	char path[PATH_MAX];
+	if (find_directory(B_USER_SETTINGS_DIRECTORY, -1, false, path,
+			sizeof(path)) != B_OK
+		|| strlcat(path, "/bluetooth/le_mouse", sizeof(path)) >= sizeof(path))
+		return 0;
+	void* handle = load_driver_settings(path);
+	if (handle == NULL)
+		return 0;
+	const char* value = get_driver_parameter(handle, "interval", NULL, NULL);
+	uint16 interval = 0;
+	if (value != NULL) {
+		double milliseconds = strtod(value, NULL);
+		interval = milliseconds <= 0 ? 0
+			: (uint16)std::min(std::max(milliseconds / 1.25 + 0.5, 6.0),
+				3200.0);
+	}
+	unload_driver_settings(handle);
+	return interval;
+}
 
 
 class BluetoothLEMouse : public BInputServerDevice {
@@ -201,6 +240,13 @@ private:
 		char text[18];
 		Bluetooth::LEAddressString(mouse.peerAddress, text);
 		Bluetooth::LEEncryptedLink link;
+		const uint16 interval = MouseInterval();
+		if (interval != 0)
+			link.SetConnectionParameters(interval, interval, 0, 500);
+		else {
+			link.SetConnectionParameters(kMouseIntervalMin, kMouseIntervalMax,
+				0, 500);
+		}
 		status_t status = link.ConnectBonded(hciID, mouse.localAddress,
 			mouse.peerAddress, mouse.peerAddressType, kScanWindow);
 		if (status != B_OK) {
@@ -212,6 +258,7 @@ private:
 			}
 			return;
 		}
+		const bigtime_t encrypted = system_time();
 		bdaddr_t peer = {};
 		link.ConnectionAddress(peer.b);
 		Bluetooth::LEAttributeClient client;
@@ -221,31 +268,80 @@ private:
 				strerror(status));
 			return;
 		}
+
+		// The layout found when the mouse was first used, else discover it
+		// (and keep it for next time). A mouse being woken up by a hand
+		// has already queued the reports the hand is waiting for.
+		char directory[1024];
+		char layoutPath[PATH_MAX];
+		const bool canSave = Bluetooth::DefaultLEBondDirectory(directory,
+				sizeof(directory)) == B_OK
+			&& Bluetooth::LEHIDLayoutPath(directory, mouse.localAddress,
+				mouse.peerAddress, mouse.peerAddressType, layoutPath,
+				sizeof(layoutPath)) == B_OK;
 		Bluetooth::LEHIDService service;
-		status = service.Discover(client);
-		if (status != B_OK) {
-			LOG(LE_LOG_ERROR, "mouse %s: HID discovery failed: %s", text,
-				strerror(status));
-			return;
-		}
 		Bluetooth::LEHIDMouseDecoder decoder;
-		status = decoder.Init(service.ReportMap().data(),
-			service.ReportMap().size());
-		if (status == B_OK)
-			status = service.EnableInputReports(client);
-		if (status != B_OK) {
-			LOG(LE_LOG_ERROR, "mouse %s: enabling input reports failed: %s",
-				text, strerror(status));
-			return;
+		bool saved = canSave && service.Load(layoutPath) == B_OK
+			&& decoder.Init(service.ReportMap().data(),
+				service.ReportMap().size()) == B_OK;
+		if (saved) {
+			// Check before writing: after a firmware update the saved
+			// handles could belong to something else.
+			status = service.Verify(client);
+			if (status == B_OK)
+				status = service.EnableInputReports(client);
+			if (status != B_OK) {
+				if (status != B_BAD_DATA && client.LastATTError() == 0) {
+					// No answer, or the link went: try again from the top.
+					LOG(LE_LOG_INFO, "mouse %s: enabling reports failed: %s",
+						text, strerror(status));
+					return;
+				}
+				LOG(LE_LOG_INFO, "mouse %s: saved layout does not fit (%s, "
+					"ATT error %#x); discovering it again", text,
+					strerror(status), client.LastATTError());
+				unlink(layoutPath);
+				saved = false;
+			}
 		}
-		LOG(LE_LOG_INFO, "mouse %s connected; %zu input report(s) enabled",
-			text, service.InputReports().size());
+		if (!saved) {
+			status = service.Discover(client);
+			if (status != B_OK) {
+				LOG(LE_LOG_ERROR, "mouse %s: HID discovery failed: %s", text,
+					strerror(status));
+				return;
+			}
+			status = decoder.Init(service.ReportMap().data(),
+				service.ReportMap().size());
+			if (status == B_OK)
+				status = service.EnableInputReports(client);
+			if (status != B_OK) {
+				LOG(LE_LOG_ERROR, "mouse %s: enabling input reports failed: "
+					"%s", text, strerror(status));
+				return;
+			}
+			if (canSave && service.Save(layoutPath) != B_OK) {
+				LOG(LE_LOG_ERROR, "mouse %s: could not save its layout",
+					text);
+			}
+		}
+		LOG(LE_LOG_INFO, "mouse %s connected; %zu input report(s) enabled "
+			"%" B_PRId64 " ms after encryption (%s)", text,
+			service.InputReports().size(), (system_time() - encrypted) / 1000,
+			saved ? "saved layout" : "discovered");
+		if (interval != 0) {
+			status_t result = link.KeepInterval(interval, interval);
+			if (result != B_OK) {
+				LOG(LE_LOG_INFO, "mouse %s: cannot keep the %.2f ms interval: "
+					"%s", text, interval * 1.25, strerror(result));
+			}
+		}
 
 		// Battery Service (optional): read it now, follow notifications,
 		// and publish it with the connection state for status displays.
-		uint16 batteryHandle = 0;
+		const uint16 batteryHandle = service.BatteryHandle();
 		bool batteryNotifies = false;
-		int32 battery = _ReadBattery(client, batteryHandle, batteryNotifies);
+		int32 battery = _ReadBattery(client, service, batteryNotifies);
 		LOG(LE_LOG_INFO, "mouse %s battery: %s%" B_PRId32 "%s", text,
 			battery < 0 ? "not reported (" : "", battery,
 			battery < 0 ? ")" : "%");
@@ -304,6 +400,12 @@ private:
 				= service.FindInputReport(handle);
 			if (report == NULL)
 				continue;
+			_CountGap(text);
+			if (reports == 0) {
+				LOG(LE_LOG_INFO, "mouse %s: first report %" B_PRId64 " ms "
+					"after encryption", text,
+					(system_time() - encrypted) / 1000);
+			}
 			if (reports++ < 3 || Bluetooth::LELogLevel() >= LE_LOG_TRACE) {
 				Bluetooth::LELogHex(LE_LOG_DEBUG, "mouse", "input report",
 					value.data(), value.size());
@@ -326,46 +428,21 @@ private:
 
 	// Returns the battery level in percent, or -1. Enables notifications
 	// when the characteristic supports them.
-	int32 _ReadBattery(Bluetooth::LEAttributeClient& client, uint16& handle,
-		bool& notifies)
+	int32 _ReadBattery(Bluetooth::LEAttributeClient& client,
+		const Bluetooth::LEHIDService& service, bool& notifies)
 	{
-		handle = 0;
 		notifies = false;
-		std::vector<Bluetooth::LEPrimaryService> services;
-		if (client.DiscoverPrimaryServices(services) != B_OK)
+		std::vector<uint8> value;
+		if (service.BatteryHandle() == 0
+			|| client.ReadAttribute(service.BatteryHandle(), value) != B_OK
+			|| value.empty() || value[0] > 100)
 			return -1;
-		for (const Bluetooth::LEPrimaryService& service : services) {
-			if (service.uuid16 != 0x180f)
-				continue;
-			std::vector<Bluetooth::LECharacteristic> characteristics;
-			if (client.DiscoverCharacteristics(service.startHandle,
-					service.endHandle, characteristics) != B_OK)
-				return -1;
-			for (size_t i = 0; i < characteristics.size(); i++) {
-				const Bluetooth::LECharacteristic& level = characteristics[i];
-				if (level.uuid16 != 0x2a19)
-					continue;
-				handle = level.valueHandle;
-				std::vector<uint8> value;
-				if (client.ReadAttribute(handle, value) != B_OK
-					|| value.empty() || value[0] > 100)
-					return -1;
-				if ((level.properties & 0x10) != 0) {
-					uint16 end = i + 1 < characteristics.size()
-						? characteristics[i + 1].declarationHandle - 1
-						: service.endHandle;
-					uint16 configuration;
-					const uint8 enable[2] = { 1, 0 };
-					notifies = end > handle
-						&& client.FindClientConfiguration(handle + 1, end,
-							configuration) == B_OK
-						&& client.WriteAttribute(configuration, enable, 2)
-							== B_OK;
-				}
-				return value[0];
-			}
+		if (service.BatteryConfiguration() != 0) {
+			const uint8 enable[2] = { 1, 0 };
+			notifies = client.WriteAttribute(service.BatteryConfiguration(),
+				enable, 2) == B_OK;
 		}
-		return -1;
+		return value[0];
 	}
 
 	void _Publish(const Bluetooth::LEHIDMouseDevice& mouse, bool connected,
@@ -441,6 +518,46 @@ private:
 		fHistoryY = deltaY - outY;
 	}
 
+	// How smoothly reports arrive while the mouse moves: a report every
+	// connection event (11.25 ms for most mice), gaps over 30 ms are missed
+	// events the user sees as jerks. Gaps over 300 ms are the hand resting.
+	void _CountGap(const char* mouse)
+	{
+		bigtime_t now = system_time();
+		bigtime_t gap = now - fLastReport;
+		fLastReport = now;
+		if (gap > 300000)
+			return;
+		fGaps++;
+		fMoving += gap;
+		if (gap <= 15000)
+			fOnTime++;
+		if (gap > 20000)
+			fFrameMissed++;
+		if (gap > 30000)
+			fLate++;
+		if (gap > 60000)
+			fVeryLate++;
+		if (gap > fLongest)
+			fLongest = gap;
+		if (now - fGapsSince < 15000000 || fGaps < 200)
+			return;
+		// On time: the next connection event (up to 15 ms); fast, steady
+		// movement has nearly all reports on time, slow movement skips
+		// events by itself. Over 20 ms, a 60 Hz screen showed a frame
+		// without the pointer moving, whatever the interval.
+		LOG(LE_LOG_INFO, "mouse %s smoothness: %" B_PRIu32 " reports in %.1f "
+			"s moving (%.0f/s), %.1f%% on time, %.1f%% of gaps over 20 ms, "
+			"%.1f%% over 30 ms, %.1f%% over 60 ms, longest %" B_PRId64 " ms",
+			mouse, fGaps, fMoving / 1000000.0, fGaps * 1000000.0 / fMoving,
+			100.0 * fOnTime / fGaps, 100.0 * fFrameMissed / fGaps,
+			100.0 * fLate / fGaps, 100.0 * fVeryLate / fGaps,
+			fLongest / 1000);
+		fGaps = fLate = fVeryLate = fOnTime = fFrameMissed = 0;
+		fMoving = fLongest = 0;
+		fGapsSince = now;
+	}
+
 	uint32 _RemapButtons(uint32 buttons) const
 	{
 		uint32 remapped = 0;
@@ -510,6 +627,16 @@ private:
 	float fHistoryY;
 	std::atomic<bool> fUpdateSettings;
 	mouse_settings fSettings;
+
+	bigtime_t fLastReport = 0;
+	bigtime_t fGapsSince = 0;
+	bigtime_t fMoving = 0;
+	bigtime_t fLongest = 0;
+	uint32 fGaps = 0;
+	uint32 fLate = 0;
+	uint32 fVeryLate = 0;
+	uint32 fOnTime = 0;
+	uint32 fFrameMissed = 0;
 };
 
 } // namespace

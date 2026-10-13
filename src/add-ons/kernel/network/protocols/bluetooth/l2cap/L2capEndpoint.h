@@ -47,6 +47,8 @@ public:
 			ssize_t		Sendable();
 			ssize_t		Receivable();
 
+			status_t	GetOption(int option, void* value, int* _length);
+
 public:
 			void		_HandleCommandRejected(uint8 ident, uint16 reason,
 							const l2cap_command_reject_data& data);
@@ -59,6 +61,7 @@ public:
 							uint16 result, uint16* mtu, uint16* flush_timeout, l2cap_qos* flow);
 			void		_HandleDisconnectionReq(uint8 ident, uint16 scid);
 			void		_HandleDisconnectionRsp(uint8 ident, uint16 dcid, uint16 scid);
+			void		_AbortIfNeverAccepted();
 
 private:
 	inline bool
@@ -68,12 +71,15 @@ private:
 	}
 
 			status_t	_WaitForStateChange(bigtime_t absoluteTimeout);
+			bool		_DropCommandIdent();
+			void		_ExpireCommand();
 
 	static	void		_SendTimer(net_timer* timer, void* _endpoint);
 			void		_SendQueued();
 
 			void		_SendChannelConfig();
 			status_t	_MarkEstablished();
+			void		_MarkRefused(status_t error);
 			void		_MarkClosed();
 
 private:
@@ -101,6 +107,9 @@ private:
 	uint16			fChannelID, fDestinationChannelID;
 	bool			fFixedChannel;
 	L2capEndpoint*	fNextFixed;
+	status_t		fConnectError;
+	uint8			fCommandIdent;
+	bigtime_t		fCommandDeadline;
 
 	net_fifo		fReceiveQueue, fSendQueue;
 	net_timer		fSendTimer;

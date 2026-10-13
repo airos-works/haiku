@@ -69,6 +69,13 @@ public:
 	status_t ConnectBonded(int32 hciID, const uint8 localAddress[6],
 		const uint8 peerAddress[6], uint8 peerAddressType,
 		bigtime_t scanTimeout = 8000000);
+	// For the connection ConnectBonded() creates (1.25 ms units, events,
+	// 10 ms units); the server's defaults otherwise.
+	void SetConnectionParameters(uint16 intervalMin, uint16 intervalMax,
+		uint16 latency, uint16 timeout);
+	// Asks for this interval range on the link now and whenever the peer
+	// moves it elsewhere, keeping the peer's latency and timeout.
+	status_t KeepInterval(uint16 intervalMin, uint16 intervalMax);
 	void Disconnect();
 	bool IsConnected() const;
 	void ConnectionAddress(uint8 address[6]) const;

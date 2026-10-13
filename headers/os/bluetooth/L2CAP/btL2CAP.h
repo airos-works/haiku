@@ -19,5 +19,10 @@ struct sockaddr_l2cap {
 	bdaddr_t	l2cap_bdaddr;	/* address */
 };
 
+/* getsockopt() options at level BLUETOOTH_PROTO_L2CAP, each a uint16, valid
+   once the channel is connected. */
+#define B_L2CAP_OUTGOING_MTU	1	/* largest packet the peer accepts */
+#define B_L2CAP_INCOMING_MTU	2	/* largest packet we accept */
+
 
 #endif // _BTL2CAP_H_
