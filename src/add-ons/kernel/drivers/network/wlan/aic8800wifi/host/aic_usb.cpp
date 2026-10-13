@@ -521,7 +521,21 @@ loader_thread(void*)
 			loader_release_file, loader_log, loader_sleep
 		};
 
-		TRACE_ALWAYS("loading the firmware\n");
+		// "bt_mode <n>" in the driver settings picks how Bluetooth uses
+		// the module's antenna pins (see aic_loader.h); read at every
+		// load, so that a firmware restart takes a changed setting.
+		int btMode = AIC_BT_MODE_DEFAULT;
+		void* settings = load_driver_settings(DRIVER_NAME);
+		if (settings != NULL) {
+			const char* value = get_driver_parameter(settings, "bt_mode",
+				NULL, NULL);
+			if (value != NULL)
+				btMode = strtol(value, NULL, 10);
+			unload_driver_settings(settings);
+		}
+		btMode = aic_loader_set_bt_mode(btMode);
+
+		TRACE_ALWAYS("loading the firmware (Bluetooth mode %d)\n", btMode);
 		bigtime_t start = system_time();
 		aic_loader_result result;
 		memset(&result, 0, sizeof(result));

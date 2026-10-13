@@ -32,3 +32,16 @@ for name in xhci; do
 		sync
 	fi
 done
+
+# amdgpu_drm: a new build waits outside the drivers' directories (devfs would
+# start a new file in them as a second driver for the GPU) until it can be
+# swapped in here, before app_server opens the display
+# (src/forks/linux-drm haiku/tools/x399-install.sh).
+s=/boot/home/amdgpu-drm/amdgpu_drm.new
+if [ -e $s ]; then
+	mv -f $s $unp/kernel/drivers/bin/amdgpu_drm
+	sync
+fi
+# amdgpu_drm bring-up: the lab build is never loaded at boot
+rm -f $unp/kernel/drivers/dev/amdgpu_test/amdgpu_drm
+sync

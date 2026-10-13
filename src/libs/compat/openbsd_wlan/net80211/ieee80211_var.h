@@ -471,6 +471,8 @@ struct ieee80211_ess {
 /* ic_xflags */
 #define	IEEE80211_F_TX_MGMT_ONLY 0x00000001	/* leave data frames on ifq */
 #define IEEE80211_F_SCAN_ONLY 0x00000002	/* user scan must not roam */
+#define IEEE80211_F_SCAN_PAUSED 0x00000004	/* nothing to join: idle until a
+						   scan request */
 
 /* ic_caps */
 #define	IEEE80211_C_WEP		0x00000001	/* CAPABILITY: WEP available */

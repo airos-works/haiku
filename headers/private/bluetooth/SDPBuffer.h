@@ -20,6 +20,9 @@
 
 class SDPDataIO {
 public:
+	// No SDP element a device sends us is anywhere near this big; larger
+	// lengths are corrupt or hostile data.
+	static const size_t kMaxElementSize = 64 * 1024;
 
 	SDPDataIO(BDataIO* data)
 		:
@@ -151,9 +154,23 @@ public:
 			case SDP_DATA_STR16:
 			case SDP_DATA_STR32:
 			{
+				// The length comes from the remote device: the string goes
+				// to the heap, never to a stack array of that size.
 				size_t length = ReadStringLength();
-				char value[length];
-				ReadString(value);
+				if (fReadingStatus != B_OK)
+					break;
+				if (length > kMaxElementSize) {
+					fReadingStatus = B_BAD_DATA;
+					break;
+				}
+				BString value;
+				char* buffer = value.LockBuffer(length);
+				if (buffer == NULL) {
+					fReadingStatus = B_NO_MEMORY;
+					break;
+				}
+				ReadString(buffer);
+				value.UnlockBuffer(fReadingStatus == B_OK ? length : 0);
 				if (fReadingStatus == B_OK)
 					message->AddString(label, value);
 			}
@@ -166,10 +183,24 @@ public:
 			case SDP_DATA_SEQ16:
 			case SDP_DATA_SEQ32:
 			{
-				ssize_t size = ReadSeq();
-				char buffer[size];
-				if (fReadingStatus == B_OK && fBuffer->ReadExactly(buffer, size) == B_OK)
+				size_t size = ReadSeq();
+				if (fReadingStatus != B_OK)
+					break;
+				if (size > kMaxElementSize) {
+					fReadingStatus = B_BAD_DATA;
+					break;
+				}
+				void* buffer = malloc(size > 0 ? size : 1);
+				if (buffer == NULL) {
+					fReadingStatus = B_NO_MEMORY;
+					break;
+				}
+				status_t status = fBuffer->ReadExactly(buffer, size);
+				if (status == B_OK)
 					message->AddData(label, B_RAW_TYPE, buffer, size);
+				else
+					fReadingStatus = status;
+				free(buffer);
 			}
 			break;
 		}
@@ -233,7 +264,7 @@ public:
 		status_t status = B_OK;
 
 		if (fNextStringLength > 0)
-			status = fBuffer->ReadExactly(&str, fNextStringLength);
+			status = fBuffer->ReadExactly(str, fNextStringLength);
 
 		if (status != B_OK) {
 			fReadingStatus = status;

@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include <algorithm>
+#include <functional>
 
 #include <edid.h>
 
@@ -284,6 +285,9 @@ DisplayLayout::Configure(const BMessage& saved, bool keepCurrent)
 {
 	std::vector<BString> mirrorKeys(fDisplays.size());
 	std::vector<BString> mirrorConnectors(fDisplays.size());
+	std::vector<bool> wasPrimary(fDisplays.size());
+	for (size_t i = 0; i < fDisplays.size(); i++)
+		wasPrimary[i] = fDisplays[i].primary;
 
 	bool anyPrimary = false;
 	for (size_t i = 0; i < fDisplays.size(); i++) {
@@ -362,6 +366,19 @@ DisplayLayout::Configure(const BMessage& saved, bool keepCurrent)
 		}
 		anyPrimary |= display.primary;
 	}
+
+	// One main display. Settings stored before Store() made sure of that
+	// can remember several (a monitor that was the main one, unplugged
+	// while another took over); the one that is the main display now stays
+	// it, else the first.
+	int32 primary = -1;
+	for (size_t i = 0; i < fDisplays.size(); i++) {
+		if (fDisplays[i].primary
+			&& (primary < 0 || (wasPrimary[i] && !wasPrimary[primary])))
+			primary = i;
+	}
+	for (size_t i = 0; i < fDisplays.size(); i++)
+		fDisplays[i].primary = (int32)i == primary;
 
 	// The monitors the remembered mirrors show: the same monitor on the same
 	// connector first, then the same monitor anywhere.
@@ -649,7 +666,8 @@ DisplayLayout::GetConfigs(std::vector<display_output_config>& configs) const
 /*!	The settings: one "display" message per monitor ever configured, keyed
 	by the monitor's identity. Displays the layout no longer has are kept
 	from the previous settings, so that a monitor unplugged today comes back
-	where it was.
+	where it was; it is no longer the main display when one that is here
+	is.
 */
 status_t
 DisplayLayout::Store(BMessage& saved) const
@@ -697,8 +715,11 @@ DisplayLayout::Store(BMessage& saved) const
 				&& fDisplays[j].name == connector)
 				present = true;
 		}
-		if (!present)
-			saved.AddMessage("display", &entry);
+		if (present)
+			continue;
+		if (PrimaryDisplay() != NULL)
+			entry.SetBool("primary", false);
+		saved.AddMessage("display", &entry);
 	}
 	return B_OK;
 }
@@ -878,25 +899,42 @@ DisplayLayout::Region() const
 }
 
 
-/*!	Everything is drawn at the density of the least scaled display: that
-	display then maps one to one, which keeps its text and edges crisp, and
-	the others are enlarged by the hardware. Displays that share a scale are
-	all crisp. (Drawing at more than a display needs would mean shrinking,
-	which the display engine refuses.)
+/*!	The density everything is drawn at, unless one was set: the largest
+	display scale. Every display then gets at least as many pixels as it
+	shows - the most scaled ones one to one, the others shrunk by the display
+	engine - so that 4K monitors at 200 percent stay crisp beside a 1080p one
+	at 100. Not every engine can shrink every region; the Desktop tries
+	RenderScales() in turn and keeps the first one the hardware takes.
 */
 uint16
 DisplayLayout::RenderScale() const
 {
 	if (fRenderScaleOverride != 0)
 		return fRenderScaleOverride;
-	uint16 smallest = 0;
+	std::vector<uint16> scales;
+	RenderScales(scales);
+	return scales[0];
+}
+
+
+/*!	The densities to draw at, best first: the scale of every enabled
+	display, from the largest down. At the smallest, displays are only ever
+	enlarged, which every display engine with a scaler can do.
+*/
+void
+DisplayLayout::RenderScales(std::vector<uint16>& scales) const
+{
+	scales.clear();
 	for (size_t i = 0; i < fDisplays.size(); i++) {
 		if (!fDisplays[i].IsEnabled())
 			continue;
-		if (smallest == 0 || fDisplays[i].scale < smallest)
-			smallest = fDisplays[i].scale;
+		if (std::find(scales.begin(), scales.end(), fDisplays[i].scale)
+				== scales.end())
+			scales.push_back(fDisplays[i].scale);
 	}
-	return smallest == 0 ? 100 : smallest;
+	std::sort(scales.begin(), scales.end(), std::greater<uint16>());
+	if (scales.empty())
+		scales.push_back(100);
 }
 
 

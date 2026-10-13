@@ -9,6 +9,13 @@
 #include "Debug.h"
 #include "SDPClient.h"
 
+#include <bluetooth/SDPHIDRecord.h>
+#include <errno.h>
+#include <LELog.h>
+
+#define SDP_LOG(level, format, args...) \
+	Bluetooth::LELog(level, "classic", "SDP: " format, ##args)
+
 
 SDPClient::SDPClient(ServerRemoteDevice* rd)
 	:
@@ -39,12 +46,17 @@ SDPClient::Start()
 
 	fClientSocket = socket(PF_BLUETOOTH, SOCK_SEQPACKET, BLUETOOTH_PROTO_L2CAP);
 
+	bigtime_t started = system_time();
 	status = connect(fClientSocket, (sockaddr*)&fSockAddrL2cap, sizeof(sockaddr_l2cap));
 	if (status < 0) {
-		TRACE_BT("SDP: Could not connect client socket (%s)...\n", strerror(status));
+		status = errno;
+		SDP_LOG(Bluetooth::LE_LOG_ERROR, "no L2CAP channel after %" B_PRId64
+			" ms: %s", (system_time() - started) / 1000, strerror(status));
 		Stop();
 		return status;
 	}
+	SDP_LOG(Bluetooth::LE_LOG_DEBUG, "L2CAP channel open after %" B_PRId64
+		" ms", (system_time() - started) / 1000);
 
 	int sockError = 0;
 	socklen_t errorLength = sizeof(sockError);
@@ -101,8 +113,11 @@ SDPClient::RequestServiceRecords()
 	rawReq.AddDataSeq(5);
 	rawReq.AddUInt32(arrtRange);
 
+	// The continuation state is at most 16 bytes (Core spec, SDP 4.3).
 	char contStateData[17];
 	uint8 contStateNumBytes = 0;
+	const int32 kMaxRounds = 64;
+	int32 rounds = 0;
 	sdp_pdu pduHeader;
 	pduHeader.pdu_id = SDP_PDU_SERVICE_SEARCH_ATTRIBUTE_REQUEST;
 
@@ -133,20 +148,43 @@ SDPClient::RequestServiceRecords()
 			return B_ERROR;
 		}
 
-		reply.Seek(sizeof(sdp_pdu), SEEK_SET);
+		// Everything below comes from the remote device: check each length
+		// against what actually arrived before using it.
+		const uint8* replyData = (const uint8*)reply.Buffer();
+		size_t replySize = reply.BufferLength();
+		if (replySize < sizeof(sdp_pdu) + sizeof(uint16) + 1
+			|| replyData[0] != SDP_PDU_SERVICE_SEARCH_ATTRIBUTE_RESPONSE) {
+			TRACE_BT("SDP: Unexpected reply (%" B_PRIuSIZE " bytes, PDU %#x)\n",
+				replySize, replySize > 0 ? replyData[0] : 0);
+			return B_ERROR;
+		}
 
-		uint16 attrListsSize;
-		reply.ReadExactly(&attrListsSize, sizeof(uint16));
-		attrListsSize = B_BENDIAN_TO_HOST_INT16(attrListsSize);
+		size_t offset = sizeof(sdp_pdu);
+		uint16 attrListsSize = (replyData[offset] << 8) | replyData[offset + 1];
+		offset += sizeof(uint16);
+		if (attrListsSize > replySize - offset - 1) {
+			TRACE_BT("SDP: Reply claims %u attribute bytes, has %" B_PRIuSIZE "\n",
+				attrListsSize, replySize - offset - 1);
+			return B_ERROR;
+		}
 
-		fullAttrLists.WriteExactly((uint8*)reply.Buffer() + reply.Position(), attrListsSize);
-		reply.Seek(attrListsSize, SEEK_CUR);
+		fullAttrLists.WriteExactly(replyData + offset, attrListsSize);
+		offset += attrListsSize;
 
-		reply.ReadExactly(&contStateNumBytes, sizeof(uint8));
-		reply.ReadExactly(contStateData, contStateNumBytes);
+		contStateNumBytes = replyData[offset++];
+		if (contStateNumBytes > sizeof(contStateData) - 1
+			|| contStateNumBytes > replySize - offset) {
+			TRACE_BT("SDP: Bad continuation state length %u\n", contStateNumBytes);
+			return B_ERROR;
+		}
+		memcpy(contStateData, replyData + offset, contStateNumBytes);
 
 		if (contStateNumBytes == 0)
 			break;
+		if (++rounds > kMaxRounds) {
+			TRACE_BT("SDP: Too many continuation rounds\n");
+			return B_ERROR;
+		}
 	}
 
 	if (contStateNumBytes) {
@@ -205,32 +243,10 @@ SDPClient::NotifyProfiles()
 void
 SDPClient::_ParseAttrLists(BMallocIO* attrListsDataIO)
 {
-	attrListsDataIO->Seek(0, SEEK_SET);
 	TRACE_BT("SDP: Parsing the AttrLists... Num Bytes=%ld\n", attrListsDataIO->BufferLength());
-
-	SDPDataIO attrLists(attrListsDataIO);
-	attrLists.ReadSeq();
-
-	size_t attrListSize = 0;
-	while ((attrListSize = attrLists.ReadSeq())) {
-
-		off_t endPos = attrListsDataIO->Position() + attrListSize;
-		BMessage attrListMsg;
-		while (attrListsDataIO->Position() < endPos) {
-			uint16 attrID = attrLists.ReadNumber<uint16>();
-
-			// attribute id's strings are formated in hex to match the bluetooth specification
-			// section 5 in assigned numbers specs:
-			// https://www.bluetooth.com/specifications/assigned-numbers/
-			BString attrIdStr;
-			attrIdStr.SetToFormat("0x%04X", attrID);
-
-			attrLists.ParseNext(&attrListMsg, attrIdStr);
-		}
-		if (attrLists.ReadingStatus() == B_OK)
-			fRemoteDevice->services.AddMessage("service", &attrListMsg);
-	}
-	TRACE_BT("SDP: Finished parsing\n");
+	status_t status = Bluetooth::SDPParseAttributeLists(attrListsDataIO,
+		fRemoteDevice->services);
+	TRACE_BT("SDP: Finished parsing: %s\n", strerror(status));
 }
 
 
@@ -244,16 +260,27 @@ SDPClient::_IssueRequest(const void* request, int32 size, BMallocIO* reply)
 
 	status = send(fClientSocket, request, size, 0);
 
-	if (status < 0)
-		return B_ERROR;
+	if (status < 0) {
+		status = errno;
+		SDP_LOG(Bluetooth::LE_LOG_ERROR, "sending the request failed: %s",
+			strerror(status));
+		return status;
+	}
 
 	TRACE_BT("SDP: The request was sent\n");
 
 	char buffer[400];
+	bigtime_t sent = system_time();
 	ssize_t numBytes = recv(fClientSocket, &buffer, sizeof(buffer), 0);
 
-	if (numBytes < 0)
-		return B_ERROR;
+	if (numBytes < 0) {
+		status = errno;
+		SDP_LOG(Bluetooth::LE_LOG_ERROR, "no answer after %" B_PRId64
+			" ms: %s", (system_time() - sent) / 1000, strerror(status));
+		return status;
+	}
+	SDP_LOG(Bluetooth::LE_LOG_DEBUG, "%zd-byte answer after %" B_PRId64 " ms",
+		numBytes, (system_time() - sent) / 1000);
 
 	TRACE_BT("SDP: Recieved the response: num bytes=%ld\n", numBytes);
 

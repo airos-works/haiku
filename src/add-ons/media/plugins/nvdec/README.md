@@ -74,3 +74,27 @@ cost a measurement to find. They are in the commit messages and in the comments
 where they matter: the arrangement of pixels, the field markings that decide
 whether a reference is a reference, the end of stream marker the bitstream
 length has to count, and the reference table place a picture must keep.
+
+## Parser regression checks
+
+`jam h264_parse_test` builds a CPU-only test; it needs no NVIDIA headers or
+GPU. It checks truncated parameter sets, unsigned-code limits, oversized
+IDs, unterminated and excessive reference-list modifications, and MMCO
+limits, then tries 25,000 reproducible malformed inputs. Optional arguments
+are Annex B H.264 files; `--hevc` switches subsequent files to HEVC. The
+stream checks parse every parameter set and slice header, without decoding
+pixels. SPS dimensions are bounded to 8192 pixels by this parser; that
+does not expand the engine's hardware capabilities.
+
+The shared bit reader reports sticky errors, including truncation and a
+code with 32 leading zero bits. H.264 parameter-set IDs and counts are
+checked before indexing or arithmetic, complete parameter sets require
+their RBSP stop bit, and overlong lists fail instead of silently dropping
+entries. HEVC propagates the same reader failure. These checks do not
+replace codec capability checks or validation at the kernel boundary.
+
+On 2026-10-10 the test passed under host AddressSanitizer and
+UndefinedBehaviorSanitizer and in x86_64 Haiku QEMU: 23 H.264 streams,
+1,214 slice headers, and two generated HEVC Main/Main 10 streams with
+24 slice headers each. The full NVDEC add-on cross-build also passed.
+This parser-only regression run does not establish new GPU decode support.

@@ -132,6 +132,21 @@ BuildMousePath(const char* directory, const uint8 localAddress[6],
 }
 
 
+status_t
+LEHIDLayoutPath(const char* directory, const uint8 localAddress[6],
+	const uint8 peerAddress[6], uint8 peerAddressType, char* path,
+	size_t capacity)
+{
+	char mousePath[PATH_MAX];
+	status_t status = BuildMousePath(directory, localAddress, peerAddress,
+		peerAddressType, mousePath, sizeof(mousePath));
+	if (status != B_OK)
+		return status;
+	int length = snprintf(path, capacity, "%s.layout", mousePath);
+	return length > 0 && (size_t)length < capacity ? B_OK : B_NAME_TOO_LONG;
+}
+
+
 static status_t
 CheckDirectory(const char* directory, bool create)
 {
@@ -323,6 +338,9 @@ RemoveLEBond(const char* directory, const uint8 localAddress[6],
 		if (BuildMousePath(directory, localAddress, peerAddress, peerType,
 				mousePath, sizeof(mousePath)) == B_OK)
 			unlink(mousePath);
+		if (LEHIDLayoutPath(directory, localAddress, peerAddress, peerType,
+				mousePath, sizeof(mousePath)) == B_OK)
+			unlink(mousePath);
 	}
 	return B_OK;
 }
@@ -367,6 +385,11 @@ SaveLEHIDMouse(const char* directory, const uint8 localAddress[6],
 		status = B_ERROR;
 	if (status != B_OK)
 		unlink(temporary);
+	// A new pairing starts from a fresh discovery.
+	char layoutPath[PATH_MAX];
+	if (status == B_OK && LEHIDLayoutPath(directory, localAddress, peerAddress,
+			peerAddressType, layoutPath, sizeof(layoutPath)) == B_OK)
+		unlink(layoutPath);
 	return status;
 }
 

@@ -29,6 +29,13 @@ static l2cap_qos sDefaultQOS = {
 };
 
 
+// Signaling timeouts (Core Vol 3 Part A 6.2): how long a request may go
+// unanswered, and how long a peer may keep a connection pending once it has
+// said so. ACL links are reliable, so requests are not retransmitted.
+static const bigtime_t kResponseTimeout = 20000000;
+static const bigtime_t kPendingTimeout = 60000000;
+
+
 static inline status_t
 posix_error(status_t error)
 {
@@ -51,7 +58,10 @@ L2capEndpoint::L2capEndpoint(net_socket* socket)
 	fChannelID(L2CAP_NULL_CID),
 	fDestinationChannelID(L2CAP_NULL_CID),
 	fFixedChannel(false),
-	fNextFixed(NULL)
+	fNextFixed(NULL),
+	fConnectError(ECONNREFUSED),
+	fCommandIdent(L2CAP_NULL_IDENT),
+	fCommandDeadline(B_INFINITE_TIMEOUT)
 {
 	CALLED();
 
@@ -98,13 +108,77 @@ L2capEndpoint::_WaitForStateChange(bigtime_t absoluteTimeout)
 {
 	channel_status state = fState;
 	while (fState == state) {
+		const bool expiring = fState == WAIT_FOR_CONNECTION_RSP
+			|| fState == CONFIGURATION || fState == WAIT_FOR_DISCONNECTION_RSP;
+		bigtime_t until = absoluteTimeout;
+		if (expiring && fCommandDeadline < until)
+			until = fCommandDeadline;
+
 		status_t status = fCommandWait.Wait(&fLock,
-			B_ABSOLUTE_TIMEOUT | B_CAN_INTERRUPT, absoluteTimeout);
+			B_ABSOLUTE_TIMEOUT | B_CAN_INTERRUPT, until);
+		if (status == B_TIMED_OUT && fState == state && expiring
+			&& system_time() >= fCommandDeadline) {
+			_ExpireCommand();
+			continue;
+		}
 		if (status != B_OK)
 			return posix_error(status);
 	}
 
 	return B_OK;
+}
+
+
+/*!	Forgets the request this endpoint is waiting on, so that a late answer is
+	ignored. Returns the socket reference the ident held; the caller must
+	release it, after unlocking if it may be the last one.
+*/
+bool
+L2capEndpoint::_DropCommandIdent()
+{
+	ASSERT_LOCKED_MUTEX(&fLock);
+
+	const uint8 ident = fCommandIdent;
+	fCommandIdent = L2CAP_NULL_IDENT;
+	if (ident == L2CAP_NULL_IDENT || fConnection == NULL)
+		return false;
+	if (btCoreData->lookup_command_ident(fConnection, ident) != this)
+		return false;
+
+	btCoreData->free_command_ident(fConnection, ident);
+	return true;
+}
+
+
+void
+L2capEndpoint::_ExpireCommand()
+{
+	ASSERT_LOCKED_MUTEX(&fLock);
+
+	dprintf("l2cap: cid %#x: no answer from the peer in state %d, giving "
+		"up\n", fChannelID, fState);
+
+	// The ident's socket reference is never the last one here: the thread
+	// waiting in Connect() or Shutdown() is inside a call on the socket.
+	if (_DropCommandIdent())
+		gSocketModule->release_socket(socket);
+
+	if (fState == WAIT_FOR_DISCONNECTION_RSP) {
+		_MarkClosed();
+		return;
+	}
+
+	if (fState == CONFIGURATION && fConnection != NULL) {
+		// The peer has a channel for us; ask it to go away, but do not wait.
+		uint8 ident = btCoreData->allocate_command_ident(fConnection, NULL);
+		if (ident != L2CAP_NULL_IDENT) {
+			send_l2cap_disconnection_req(fConnection, ident,
+				fDestinationChannelID, fChannelID);
+			btCoreData->free_command_ident(fConnection, ident);
+		}
+	}
+
+	_MarkRefused(ETIMEDOUT);
 }
 
 
@@ -150,8 +224,14 @@ L2capEndpoint::Shutdown()
 	else
 		timeout = gStackModule->set_syscall_restart_timeout(socket->receive.timeout);
 
-	// FIXME: If we are currently waiting for a connection or configuration,
-	// we need to wait for that command to return (and free its ident on timeout.)
+	if (fState == WAIT_FOR_CONNECTION_RSP) {
+		// The peer has not told us its channel yet, so there is nothing to
+		// disconnect. Forget the request; a late answer is ignored.
+		if (_DropCommandIdent())
+			gSocketModule->release_socket(socket);
+		_MarkRefused(ECONNABORTED);
+		return B_OK;
+	}
 
 	while (fState > OPEN) {
 		status = _WaitForStateChange(timeout);
@@ -174,6 +254,10 @@ L2capEndpoint::Shutdown()
 		return status;
 	}
 
+	if (_DropCommandIdent())
+		gSocketModule->release_socket(socket);
+	fCommandIdent = ident;
+	fCommandDeadline = system_time() + kResponseTimeout;
 	fState = WAIT_FOR_DISCONNECTION_RSP;
 
 	while (fState != CLOSED) {
@@ -294,7 +378,7 @@ L2capEndpoint::Connect(const struct sockaddr* _address)
 			if (status != B_OK)
 				return status;
 		}
-		return (fState == OPEN) ? B_OK : ECONNREFUSED;
+		return (fState == OPEN) ? B_OK : fConnectError;
 	} else {
 		timeout = gStackModule->set_syscall_restart_timeout(socket->send.timeout);
 	}
@@ -387,13 +471,16 @@ L2capEndpoint::Connect(const struct sockaddr* _address)
 	}
 
 	fState = WAIT_FOR_CONNECTION_RSP;
+	fConnectError = ECONNREFUSED;
+	fCommandIdent = ident;
+	fCommandDeadline = system_time() + kResponseTimeout;
 
 	while (fState != CLOSED && fState != OPEN) {
 		status = _WaitForStateChange(timeout);
 		if (status != B_OK)
 			return status;
 	}
-	return (fState == OPEN) ? B_OK : ECONNREFUSED;
+	return (fState == OPEN) ? B_OK : fConnectError;
 }
 
 
@@ -571,6 +658,34 @@ L2capEndpoint::Receivable()
 }
 
 
+status_t
+L2capEndpoint::GetOption(int option, void* value, int* _length)
+{
+	MutexLocker locker(fLock);
+
+	uint16 result;
+	switch (option) {
+		case B_L2CAP_OUTGOING_MTU:
+			result = fChannelConfig.outgoing_mtu;
+			break;
+		case B_L2CAP_INCOMING_MTU:
+			result = fChannelConfig.incoming_mtu;
+			break;
+		default:
+			return ENOPROTOOPT;
+	}
+
+	if (*_length < (int)sizeof(result))
+		return B_BAD_VALUE;
+	if (fState != OPEN)
+		return ENOTCONN;
+
+	memcpy(value, &result, sizeof(result));
+	*_length = sizeof(result);
+	return B_OK;
+}
+
+
 void
 L2capEndpoint::_HandleCommandRejected(uint8 ident, uint16 reason,
 	const l2cap_command_reject_data& data)
@@ -578,11 +693,13 @@ L2capEndpoint::_HandleCommandRejected(uint8 ident, uint16 reason,
 	CALLED();
 	MutexLocker locker(fLock);
 
+	if (ident == fCommandIdent)
+		fCommandIdent = L2CAP_NULL_IDENT;
+
 	switch (fState) {
 		case WAIT_FOR_CONNECTION_RSP:
 			// Connection request was rejected. Reset state.
-			fState = CLOSED;
-			socket->error = ECONNREFUSED;
+			_MarkRefused(ECONNREFUSED);
 		break;
 
 		case CONFIGURATION:
@@ -632,6 +749,16 @@ L2capEndpoint::_HandleConnectionReq(HciConnection* connection,
 
 	endpoint->fAcceptSemaphore = fAcceptSemaphore;
 
+	// accept() and getpeername() tell the server which device this is (a
+	// HID device opens its channels itself when it reconnects).
+	memcpy(&newSocket->address, &socket->address, sizeof(sockaddr_l2cap));
+	sockaddr_l2cap* peer = (sockaddr_l2cap*)&newSocket->peer;
+	memset(peer, 0, sizeof(sockaddr_l2cap));
+	peer->l2cap_len = sizeof(sockaddr_l2cap);
+	peer->l2cap_family = AF_BLUETOOTH;
+	peer->l2cap_psm = psm;
+	peer->l2cap_bdaddr = connection->destination;
+
 	endpoint->fConnection = connection;
 	endpoint->fState = CONFIGURATION;
 
@@ -639,6 +766,34 @@ L2capEndpoint::_HandleConnectionReq(HciConnection* connection,
 
 	send_l2cap_connection_rsp(connection, ident, endpoint->fChannelID, scid,
 		l2cap_connection_rsp::RESULT_SUCCESS, 0);
+
+	// Our side of the configuration goes out now, as other stacks do: a
+	// peer that waits for it before sending its own (the Keychron K4 seems
+	// to) would otherwise leave the channel half open.
+	endpoint->_SendChannelConfig();
+}
+
+
+/*!	A channel the peer opened and closed again (or lost with its link)
+	before anyone accepted it. It still counted against the listener's
+	backlog; a handful of those and every new channel on that PSM was
+	refused for want of resources, until the listening server restarted.
+	The caller must hold a reference to the socket and not fLock: taking
+	the channel off the listener can drop the last but that reference.
+*/
+void
+L2capEndpoint::_AbortIfNeverAccepted()
+{
+	{
+		MutexLocker locker(fLock);
+		if (fState != CLOSED)
+			return;
+	}
+	if (gSocketModule->has_parent(socket)) {
+		dprintf("l2cap: channel %#x closed before it was accepted; off the "
+			"listener's backlog\n", fChannelID);
+		gSocketModule->set_aborted(socket);
+	}
 }
 
 
@@ -666,23 +821,29 @@ L2capEndpoint::_HandleConnectionRsp(uint8 ident, const l2cap_connection_rsp& res
 	}
 
 	if (response.result == l2cap_connection_rsp::RESULT_PENDING) {
-		// The connection is still pending on the remote end.
-		// We will receive another CONNECTION_RSP later.
-
-		// TODO: Increase/reset timeout? (We don't have any timeouts presently.)
+		// The connection is still pending on the remote end, which is often
+		// busy authenticating or authorizing the link. It answers again later
+		// with the same identifier (Core Vol 3 Part A 4.3).
+		fCommandDeadline = system_time() + kPendingTimeout;
 		return;
-	} else if (response.result != l2cap_connection_rsp::RESULT_SUCCESS) {
-		// Some error response.
-		// TODO: Translate `result` if possible?
-		socket->error = ECONNREFUSED;
+	}
 
-		fState = CLOSED;
-		fCommandWait.NotifyAll();
+	if (ident == fCommandIdent)
+		fCommandIdent = L2CAP_NULL_IDENT;
+
+	if (response.result != l2cap_connection_rsp::RESULT_SUCCESS) {
+		dprintf("l2cap: connection refused by the peer, result %#x status "
+			"%#x\n", response.result, response.status);
+		_MarkRefused(response.result
+			== l2cap_connection_rsp::RESULT_SECURITY_BLOCK
+				? EACCES : ECONNREFUSED);
+		return;
 	}
 
 	// Success: channel is now open for configuration.
 	fState = CONFIGURATION;
 	fDestinationChannelID = response.dcid;
+	fCommandDeadline = system_time() + kResponseTimeout;
 
 	_SendChannelConfig();
 }
@@ -720,6 +881,10 @@ L2capEndpoint::_SendChannelConfig()
 		socket->error = status;
 		return;
 	}
+
+	if (_DropCommandIdent())
+		gSocketModule->release_socket(socket);
+	fCommandIdent = ident;
 
 	fConfigState.out = ConfigState::SENT;
 }
@@ -821,6 +986,9 @@ L2capEndpoint::_HandleConfigurationRsp(uint8 ident, uint16 scid, uint16 flags,
 		return;
 	}
 
+	if (ident == fCommandIdent)
+		fCommandIdent = L2CAP_NULL_IDENT;
+
 	if (result != l2cap_configuration_rsp::RESULT_SUCCESS) {
 		// Resend configuration request to try again.
 		_SendChannelConfig();
@@ -885,6 +1053,10 @@ L2capEndpoint::_HandleDisconnectionReq(uint8 ident, uint16 scid)
 		return;
 	}
 
+	// Our own request, if any, will not be answered now. The signal handler
+	// holds a reference to the socket, so this one is not the last.
+	if (_DropCommandIdent())
+		gSocketModule->release_socket(socket);
 	_MarkClosed();
 }
 
@@ -910,7 +1082,24 @@ L2capEndpoint::_HandleDisconnectionRsp(uint8 ident, uint16 dcid, uint16 scid)
 		return;
 	}
 
+	if (ident == fCommandIdent)
+		fCommandIdent = L2CAP_NULL_IDENT;
 	_MarkClosed();
+}
+
+
+void
+L2capEndpoint::_MarkRefused(status_t error)
+{
+	ASSERT_LOCKED_MUTEX(&fLock);
+
+	fState = CLOSED;
+	fConnectError = error;
+	socket->error = error;
+	fCommandWait.NotifyAll();
+	gSocketModule->notify(socket, B_SELECT_ERROR, error);
+
+	gL2capEndpointManager.UnbindFromChannel(this);
 }
 
 

@@ -214,17 +214,48 @@ L2capEndpointManager::Disconnected(HciConnection* connection)
 		gSocketModule->release_socket(endpoint->socket);
 	}
 
-	ReadLocker _(fChannelEndpointsLock);
-	auto iter = fChannelEndpoints.GetIterator();
-	while (iter.HasNext()) {
-		L2capEndpoint* endpoint = iter.Next();
-		if (endpoint->fConnection != connection)
-			continue;
+	// Close the dynamic channels too: wake anyone waiting in connect() or
+	// close(), give back the channel IDs, and drop the idents of requests
+	// the peer will now never answer. The connection, and its ident table,
+	// is deleted after this returns.
+	while (true) {
+		L2capEndpoint* channels[16];
+		int32 count = 0;
+		{
+			ReadLocker _(fChannelEndpointsLock);
+			auto iter = fChannelEndpoints.GetIterator();
+			while (iter.HasNext() && count < (int32)B_COUNT_OF(channels)) {
+				L2capEndpoint* endpoint = iter.Next();
+				if (endpoint->fConnection != connection)
+					continue;
+				gSocketModule->acquire_socket(endpoint->socket);
+				channels[count++] = endpoint;
+			}
+		}
+		if (count == 0)
+			break;
 
-		endpoint->fConnection = NULL;
-		endpoint->fState = L2capEndpoint::CLOSED;
-
-		endpoint->socket->error = ENOTCONN;
-		gSocketModule->notify(endpoint->socket, B_SELECT_ERROR, ENOTCONN);
+		for (int32 i = 0; i < count; i++) {
+			L2capEndpoint* endpoint = channels[i];
+			bool releaseIdent = false;
+			{
+				MutexLocker locker(endpoint->fLock);
+				if (endpoint->fConnection == connection) {
+					releaseIdent = endpoint->_DropCommandIdent();
+					endpoint->fConnection = NULL;
+					endpoint->fState = L2capEndpoint::CLOSED;
+					endpoint->fConnectError = EHOSTUNREACH;
+					endpoint->socket->error = ENOTCONN;
+					endpoint->fCommandWait.NotifyAll();
+					UnbindFromChannel(endpoint);
+				}
+			}
+			gSocketModule->notify(endpoint->socket, B_SELECT_ERROR, ENOTCONN);
+			gSocketModule->notify(endpoint->socket, B_SELECT_READ, ENOTCONN);
+			if (releaseIdent)
+				gSocketModule->release_socket(endpoint->socket);
+			endpoint->_AbortIfNeverAccepted();
+			gSocketModule->release_socket(endpoint->socket);
+		}
 	}
 }

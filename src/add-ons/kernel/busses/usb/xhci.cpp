@@ -1167,6 +1167,23 @@ XHCI::SubmitControlRequest(Transfer *transfer)
 }
 
 
+/*!	The length of the next TRB of a transfer straight from physical memory:
+	at most a burst, and never across a 64 KiB boundary, which a TRB's buffer
+	must not cross (XHCI 1.2 § 4.11.7.1 and Table 6-21). With the 16 KiB
+	bursts of a SuperSpeed bulk endpoint declaring Max Burst 15 and buffers
+	that are only page aligned, cutting at burst size alone would cross it.
+*/
+generic_size_t
+XHCI::_PhysicalTRBLength(phys_addr_t address, generic_size_t remaining,
+	const xhci_endpoint* endpoint) const
+{
+	generic_size_t length = min_c(remaining,
+		(generic_size_t)endpoint->max_burst_payload);
+	const generic_size_t toBoundary = 0x10000 - (address & 0xffff);
+	return min_c(length, toBoundary);
+}
+
+
 status_t
 XHCI::SubmitNormalRequest(Transfer *transfer)
 {
@@ -1234,14 +1251,23 @@ XHCI::SubmitNormalRequest(Transfer *transfer)
 		trbSize = 0;
 		trbCount = 0;
 
-		for (size_t i = 0; i < transfer->VectorCount(); i++) {
+		// Only the current fragment goes into this TD: a transfer larger
+		// than USB_MAX_FRAGMENT_SIZE is resubmitted for the rest when the TD
+		// completes, its vectors advanced (those already sent left at length
+		// zero). Covering every vector here sent the rest twice.
+		generic_size_t left = transfer->FragmentLength();
+		for (size_t i = 0; i < transfer->VectorCount() && left > 0; i++) {
 			// There's an XHCI context parameter to indicate if the controller is
 			// 64-bit capable, but for consistency we require 32-bit DMA.
 			if ((transferVec[i].base + transferVec[i].length) > UINT32_MAX)
 				return B_BAD_VALUE;
 
-			trbCount += (transferVec[i].length + endpoint->max_burst_payload - 1)
-				/ endpoint->max_burst_payload;
+			const generic_size_t length = min_c(transferVec[i].length, left);
+			for (generic_size_t offset = 0; offset < length; trbCount++) {
+				offset += _PhysicalTRBLength(transferVec[i].base + offset,
+					length - offset, endpoint);
+			}
+			left -= length;
 		}
 	}
 
@@ -1262,10 +1288,15 @@ XHCI::SubmitNormalRequest(Transfer *transfer)
 			else
 				trbLength = (remaining < trbSize) ? remaining : trbSize;
 		} else {
+			while (transferVecOffset == transferVec->length) {
+				// a vector the fragments before have used up
+				transferVec++;
+				transferVecOffset = 0;
+			}
 			address = transferVec->base + transferVecOffset;
-			trbLength = transferVec->length - transferVecOffset;
-			if (trbLength > endpoint->max_burst_payload)
-				trbLength = endpoint->max_burst_payload;
+			trbLength = _PhysicalTRBLength(address,
+				min_c(transferVec->length - transferVecOffset,
+					(generic_size_t)remaining), endpoint);
 
 			transferVecOffset += trbLength;
 			if (transferVecOffset == transferVec->length) {

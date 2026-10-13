@@ -23,6 +23,7 @@ struct hci_command_header {
 
 #define OGF_LE_CONTROL				0x08
 #define OCF_LE_SET_EVENT_MASK			0x0001
+#define OCF_LE_READ_BUFFER_SIZE		0x0002
 #define OCF_LE_SET_SCAN_PARAMETERS	0x000b
 #define OCF_LE_SET_SCAN_ENABLE		0x000c
 #define OCF_LE_CREATE_CONN			0x000d
@@ -436,6 +437,11 @@ struct hci_cp_le_start_encryption {
 		uint8		status;
 		uint16		handle;
 	} __attribute__ ((packed));
+
+	#define OCF_WRITE_DEFAULT_LINK_POLICY	0x000F
+	#define HCI_LINK_POLICY_ROLE_SWITCH		0x0001
+	#define HCI_LINK_POLICY_HOLD			0x0002
+	#define HCI_LINK_POLICY_SNIFF			0x0004
 
 /* Status params */
 #define OGF_STATUS_PARAM				0x05

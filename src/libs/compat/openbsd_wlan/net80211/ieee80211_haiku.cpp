@@ -184,7 +184,14 @@ wlan_control(void* cookie, uint32 op, void* arg, size_t length)
 			status_t status = EBUSY;
 
 			IFF_LOCKGIANT(ifp);
-			if (ic->ic_state == IEEE80211_S_SCAN || (ic->ic_flags & IEEE80211_F_BGSCAN) != 0)
+			if (ic->ic_state == IEEE80211_S_SCAN
+				&& (ic->ic_xflags & IEEE80211_F_SCAN_PAUSED) != 0) {
+				// Idle with nothing to join (see ieee80211_end_scan()):
+				// one more pass for whoever asks.
+				ieee80211_begin_scan(ifp);
+				status = B_OK;
+			} else if (ic->ic_state == IEEE80211_S_SCAN
+				|| (ic->ic_flags & IEEE80211_F_BGSCAN) != 0)
 				status = EINPROGRESS;
 			else if (ic->ic_state == IEEE80211_S_RUN) {
 				// A manual scan fills the visible-network list without selecting a

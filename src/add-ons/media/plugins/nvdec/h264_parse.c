@@ -11,13 +11,16 @@ h264BitsInit(H264Bits *br, const uint8_t *data, size_t size)
 	br->size = size;
 	br->bytePos = 0;
 	br->bitPos = 0;
+	br->failed = data == NULL || size == 0;
 }
 
 uint32_t
 h264Bit(H264Bits *br)
 {
-	if (br->bytePos >= br->size)
+	if (br->failed || br->bytePos >= br->size) {
+		br->failed = true;
 		return 0;
+	}
 	uint32_t value = (br->data[br->bytePos] >> (7 - br->bitPos)) & 1;
 	if (++br->bitPos == 8) {
 		br->bitPos = 0;
@@ -29,6 +32,10 @@ h264Bit(H264Bits *br)
 uint32_t
 h264Bits(H264Bits *br, int count)
 {
+	if (count < 0 || count > 32) {
+		br->failed = true;
+		return 0;
+	}
 	uint32_t value = 0;
 	while (count-- > 0)
 		value = (value << 1) | h264Bit(br);
@@ -38,26 +45,54 @@ h264Bits(H264Bits *br, int count)
 uint32_t
 h264UE(H264Bits *br)
 {
-	int zeros = 0;
-	while (zeros < 32 && br->bytePos < br->size && h264Bit(br) == 0)
-		zeros++;
-	if (zeros == 0)
-		return 0;
-	return (1u << zeros) - 1 + h264Bits(br, zeros);
+	unsigned zeros = 0;
+	while (h264Bit(br) == 0) {
+		if (br->failed || ++zeros == 32) {
+			br->failed = true;
+			return 0;
+		}
+	}
+	uint32_t suffix = h264Bits(br, zeros);
+	return br->failed ? 0 : ((1u << zeros) - 1) + suffix;
 }
 
 int32_t
 h264SE(H264Bits *br)
 {
 	uint32_t k = h264UE(br);
-	return (k & 1) ? (int32_t)((k + 1) / 2) : -(int32_t)(k / 2);
+	return (k & 1) ? (int32_t)(k / 2 + 1) : -(int32_t)(k / 2);
+}
+
+/* All stored unsigned syntax uses signed ints. Check before conversion,
+ * indexing or arithmetic, including values whose code fits uint32_t. */
+static int
+readUnsigned(H264Bits *br, uint32_t maximum)
+{
+	uint32_t value = h264UE(br);
+	if (value > maximum) {
+		br->failed = true;
+		return 0;
+	}
+	return (int)value;
+}
+
+static bool
+finishParameterSet(H264Bits *br)
+{
+	if (br->failed || h264Bit(br) != 1)
+		return false; // rbsp_stop_one_bit
+	while (br->bytePos < br->size) {
+		if (h264Bit(br) != 0)
+			return false;
+	}
+	return !br->failed;
 }
 
 bool
 h264MoreData(const H264Bits *br)
 {
 	/* There is more data unless what is left is the stop bit and padding. */
-	if (br->bytePos >= br->size)
+	if (br->failed || br->bytePos >= br->size)
 		return false;
 	size_t lastByte = br->size;
 	while (lastByte > 0 && br->data[lastByte - 1] == 0)
@@ -130,6 +165,10 @@ parseScalingList(H264Bits *br, uint8_t *list, int size, const uint8_t *zigzag,
 	for (int j = 0; j < size; j++) {
 		if (nextScale != 0) {
 			int delta = h264SE(br);
+			if (delta < -128 || delta > 127) {
+				br->failed = true;
+				return;
+			}
 			nextScale = (lastScale + delta + 256) % 256;
 			useDefault = (j == 0 && nextScale == 0);
 		}
@@ -173,7 +212,7 @@ setFlatScaling(uint8_t scaling4x4[6][16], uint8_t scaling8x8[2][64])
 static void
 skipHrd(H264Bits *br)
 {
-	int cpbCnt = h264UE(br) + 1;
+	int cpbCnt = readUnsigned(br, 31) + 1;
 	h264Bits(br, 4);		/* bit_rate_scale */
 	h264Bits(br, 4);		/* cpb_size_scale */
 	for (int i = 0; i < cpbCnt; i++) {
@@ -187,7 +226,7 @@ skipHrd(H264Bits *br)
 	h264Bits(br, 5);		/* time_offset_length */
 }
 
-/* Annex E. Only the bounds on reordering are wanted; the rest is skipped. */
+/* Annex E. Retain output colour interpretation and reordering bounds. */
 static void
 parseVui(H264Bits *br, H264Sps *sps)
 {
@@ -203,11 +242,11 @@ parseVui(H264Bits *br, H264Sps *sps)
 		h264Bit(br);
 	if (h264Bit(br)) {			/* video_signal_type_present_flag */
 		h264Bits(br, 3);
-		h264Bit(br);
+		sps->fullRange = h264Bit(br);
 		if (h264Bit(br)) {		/* colour_description_present_flag */
 			h264Bits(br, 8);
 			h264Bits(br, 8);
-			h264Bits(br, 8);
+			sps->matrixCoefficients = h264Bits(br, 8);
 		}
 	}
 	if (h264Bit(br)) {			/* chroma_loc_info_present_flag */
@@ -234,8 +273,8 @@ parseVui(H264Bits *br, H264Sps *sps)
 		h264UE(br);			/* max_bits_per_mb_denom */
 		h264UE(br);			/* log2_max_mv_length_horizontal */
 		h264UE(br);			/* log2_max_mv_length_vertical */
-		sps->maxNumReorderFrames = h264UE(br);
-		sps->maxDecFrameBuffering = h264UE(br);
+		sps->maxNumReorderFrames = readUnsigned(br, 16);
+		sps->maxDecFrameBuffering = readUnsigned(br, 16);
 		sps->hasReorderFrames = true;
 	}
 }
@@ -246,13 +285,14 @@ h264ParseSps(const uint8_t *rbsp, size_t size, H264Sps *sps)
 	H264Bits br;
 	h264BitsInit(&br, rbsp, size);
 	memset(sps, 0, sizeof(*sps));
+	sps->matrixCoefficients = 2;
 	setFlatScaling(sps->scaling4x4, sps->scaling8x8);
 
 	sps->profileIdc = h264Bits(&br, 8);
 	h264Bits(&br, 8);			/* constraint flags and reserved */
 	sps->levelIdc = h264Bits(&br, 8);
-	sps->id = h264UE(&br);
-	if (sps->id >= H264_MAX_SPS)
+	sps->id = readUnsigned(&br, H264_MAX_SPS - 1);
+	if (br.failed)
 		return false;
 	sps->chromaFormatIdc = 1;
 	sps->bitDepthLuma = 8;
@@ -261,11 +301,11 @@ h264ParseSps(const uint8_t *rbsp, size_t size, H264Sps *sps)
 	case 100: case 110: case 122: case 244: case 44:
 	case 83: case 86: case 118: case 128: case 138: case 139:
 	case 134: case 135:
-		sps->chromaFormatIdc = h264UE(&br);
+		sps->chromaFormatIdc = readUnsigned(&br, 3);
 		if (sps->chromaFormatIdc == 3)
 			sps->separateColourPlane = h264Bit(&br);
-		sps->bitDepthLuma = 8 + h264UE(&br);
-		sps->bitDepthChroma = 8 + h264UE(&br);
+		sps->bitDepthLuma = 8 + readUnsigned(&br, 6);
+		sps->bitDepthChroma = 8 + readUnsigned(&br, 6);
 		sps->qpprimeYZeroTransformBypass = h264Bit(&br);
 		if (h264Bit(&br)) {
 			parseScalingMatrices(&br, (sps->chromaFormatIdc != 3) ? 8 : 12,
@@ -273,36 +313,41 @@ h264ParseSps(const uint8_t *rbsp, size_t size, H264Sps *sps)
 		}
 		break;
 	}
-	sps->log2MaxFrameNumMinus4 = h264UE(&br);
-	sps->picOrderCntType = h264UE(&br);
+	sps->log2MaxFrameNumMinus4 = readUnsigned(&br, 12);
+	sps->picOrderCntType = readUnsigned(&br, 2);
 	if (sps->picOrderCntType == 0) {
-		sps->log2MaxPocLsbMinus4 = h264UE(&br);
+		sps->log2MaxPocLsbMinus4 = readUnsigned(&br, 12);
 	} else if (sps->picOrderCntType == 1) {
 		sps->deltaPicOrderAlwaysZero = h264Bit(&br);
 		sps->offsetForNonRefPic = h264SE(&br);
 		sps->offsetForTopToBottomField = h264SE(&br);
-		sps->numRefFramesInPocCycle = h264UE(&br);
-		if (sps->numRefFramesInPocCycle > 255)
+		sps->numRefFramesInPocCycle = readUnsigned(&br, 255);
+		if (br.failed)
 			return false;
 		for (int i = 0; i < sps->numRefFramesInPocCycle; i++)
 			sps->offsetForRefFrame[i] = h264SE(&br);
 	}
-	sps->maxNumRefFrames = h264UE(&br);
-	h264Bit(&br);				/* gaps_in_frame_num_allowed_flag */
-	sps->picWidthInMbs = h264UE(&br) + 1;
-	sps->picHeightInMapUnits = h264UE(&br) + 1;
+	sps->maxNumRefFrames = readUnsigned(&br, 16);
+	sps->gapsInFrameNumAllowed = h264Bit(&br);
+	// This decoder's parser supports coded dimensions through 8192 pixels.
+	// Keep downstream pitch, cropping and macroblock arithmetic bounded.
+	sps->picWidthInMbs = readUnsigned(&br, 511) + 1;
+	sps->picHeightInMapUnits = readUnsigned(&br, 511) + 1;
 	sps->frameMbsOnly = h264Bit(&br);
 	if (!sps->frameMbsOnly)
 		sps->mbAdaptiveFrameField = h264Bit(&br);
 	sps->direct8x8Inference = h264Bit(&br);
 	if (h264Bit(&br)) {			/* frame_cropping_flag */
-		sps->cropLeft = h264UE(&br);
-		sps->cropRight = h264UE(&br);
-		sps->cropTop = h264UE(&br);
-		sps->cropBottom = h264UE(&br);
+		sps->cropLeft = readUnsigned(&br, 8192);
+		sps->cropRight = readUnsigned(&br, 8192);
+		sps->cropTop = readUnsigned(&br, 8192);
+		sps->cropBottom = readUnsigned(&br, 8192);
 	}
 	if (h264Bit(&br))			/* vui_parameters_present_flag */
 		parseVui(&br, sps);
+	if (!finishParameterSet(&br)
+		|| sps->picHeightInMapUnits * (sps->frameMbsOnly ? 1 : 2) > 512)
+		return false;
 	sps->valid = true;
 	return true;
 }
@@ -315,9 +360,9 @@ h264ParsePps(const uint8_t *rbsp, size_t size, const H264ParamSets *sets, H264Pp
 	memset(pps, 0, sizeof(*pps));
 	setFlatScaling(pps->scaling4x4, pps->scaling8x8);
 
-	pps->id = h264UE(&br);
-	pps->spsId = h264UE(&br);
-	if (pps->id >= H264_MAX_PPS || pps->spsId >= H264_MAX_SPS)
+	pps->id = readUnsigned(&br, H264_MAX_PPS - 1);
+	pps->spsId = readUnsigned(&br, H264_MAX_SPS - 1);
+	if (br.failed)
 		return false;
 	const H264Sps *sps = &sets->sps[pps->spsId];
 	if (!sps->valid)
@@ -326,8 +371,8 @@ h264ParsePps(const uint8_t *rbsp, size_t size, const H264ParamSets *sets, H264Pp
 	pps->picOrderPresent = h264Bit(&br);
 	if (h264UE(&br) != 0)			/* num_slice_groups_minus1 */
 		return false;			/* slice groups are not supported */
-	pps->numRefIdxL0Minus1 = h264UE(&br);
-	pps->numRefIdxL1Minus1 = h264UE(&br);
+	pps->numRefIdxL0Minus1 = readUnsigned(&br, 31);
+	pps->numRefIdxL1Minus1 = readUnsigned(&br, 31);
 	pps->weightedPred = h264Bit(&br);
 	pps->weightedBipredIdc = h264Bits(&br, 2);
 	pps->picInitQpMinus26 = h264SE(&br);
@@ -349,6 +394,8 @@ h264ParsePps(const uint8_t *rbsp, size_t size, const H264ParamSets *sets, H264Pp
 		}
 		pps->secondChromaQpIndexOffset = h264SE(&br);
 	}
+	if (!finishParameterSet(&br))
+		return false;
 	pps->valid = true;
 	return true;
 }
@@ -365,15 +412,19 @@ parseRefPicListModification(H264Bits *br, H264Slice *slice)
 		if (!h264Bit(br))
 			continue;
 		for (;;) {
-			int idc = h264UE(br);
+			int idc = readUnsigned(br, 3);
+			if (br->failed)
+				return;
 			if (idc == 3)
 				break;
-			int value = h264UE(br);
-			if (slice->listModCount[list] < H264_MAX_LIST_MODS) {
-				H264ListMod *mod = &slice->listMod[list][slice->listModCount[list]++];
-				mod->idc = idc;
-				mod->value = value;
+			if (slice->listModCount[list] >= H264_MAX_LIST_MODS) {
+				br->failed = true;
+				return;
 			}
+			int value = readUnsigned(br, 65535);
+			H264ListMod *mod = &slice->listMod[list][slice->listModCount[list]++];
+			mod->idc = idc;
+			mod->value = value;
 		}
 	}
 }
@@ -415,20 +466,24 @@ parseDecRefPicMarking(H264Bits *br, H264Slice *slice)
 	if (!slice->adaptiveRefPicMarking)
 		return;
 	for (;;) {
-		int op = h264UE(br);
-		if (op == 0 || slice->mmcoCount >= H264_MAX_MMCO)
+		int op = readUnsigned(br, 6);
+		if (br->failed || op == 0)
 			break;
+		if (slice->mmcoCount >= H264_MAX_MMCO) {
+			br->failed = true;
+			return;
+		}
 		H264Mmco *mmco = &slice->mmco[slice->mmcoCount++];
 		memset(mmco, 0, sizeof(*mmco));
 		mmco->op = op;
 		if (op == 1 || op == 3)
-			mmco->differenceOfPicNumsMinus1 = h264UE(br);
+			mmco->differenceOfPicNumsMinus1 = readUnsigned(br, 65535);
 		if (op == 2)
-			mmco->longTermPicNum = h264UE(br);
+			mmco->longTermPicNum = readUnsigned(br, 65535);
 		if (op == 3 || op == 6)
-			mmco->longTermFrameIdx = h264UE(br);
+			mmco->longTermFrameIdx = readUnsigned(br, 31);
 		if (op == 4)
-			mmco->maxLongTermFrameIdxPlus1 = h264UE(br);
+			mmco->maxLongTermFrameIdxPlus1 = readUnsigned(br, 32);
 	}
 }
 
@@ -443,16 +498,18 @@ h264ParseSliceHeader(const uint8_t *rbsp, size_t size, const H264ParamSets *sets
 	slice->nalRefIdc = nalRefIdc;
 	slice->idr = (nalType == 5);
 
-	slice->firstMbInSlice = h264UE(&br);
-	slice->sliceType = h264UE(&br);
+	slice->firstMbInSlice = readUnsigned(&br, 512 * 512 - 1);
+	slice->sliceType = readUnsigned(&br, 9);
 	if (slice->sliceType >= 5)
 		slice->sliceType -= 5;
 	if (slice->sliceType > 4)
 		return false;
-	slice->ppsId = h264UE(&br);
-	if (slice->ppsId >= H264_MAX_PPS || !sets->pps[slice->ppsId].valid)
+	slice->ppsId = readUnsigned(&br, H264_MAX_PPS - 1);
+	if (br.failed || !sets->pps[slice->ppsId].valid)
 		return false;
 	const H264Pps *pps = &sets->pps[slice->ppsId];
+	if (pps->spsId < 0 || pps->spsId >= H264_MAX_SPS)
+		return false;
 	const H264Sps *sps = &sets->sps[pps->spsId];
 	if (!sps->valid)
 		return false;
@@ -467,7 +524,7 @@ h264ParseSliceHeader(const uint8_t *rbsp, size_t size, const H264ParamSets *sets
 			slice->bottomField = h264Bit(&br);
 	}
 	if (slice->idr)
-		slice->idrPicId = h264UE(&br);
+		slice->idrPicId = readUnsigned(&br, 65535);
 	if (sps->picOrderCntType == 0) {
 		slice->pocLsb = h264Bits(&br, sps->log2MaxPocLsbMinus4 + 4);
 		if (pps->picOrderPresent && !slice->fieldPic)
@@ -486,9 +543,9 @@ h264ParseSliceHeader(const uint8_t *rbsp, size_t size, const H264ParamSets *sets
 		h264Bit(&br);			/* direct_spatial_mv_pred_flag */
 	if (slice->sliceType == 0 || slice->sliceType == 1 || slice->sliceType == 3) {
 		if (h264Bit(&br)) {		/* num_ref_idx_active_override_flag */
-			slice->numRefIdxL0Minus1 = h264UE(&br);
+			slice->numRefIdxL0Minus1 = readUnsigned(&br, 31);
 			if (slice->sliceType == 1)
-				slice->numRefIdxL1Minus1 = h264UE(&br);
+				slice->numRefIdxL1Minus1 = readUnsigned(&br, 31);
 		}
 	}
 	parseRefPicListModification(&br, slice);
@@ -498,7 +555,7 @@ h264ParseSliceHeader(const uint8_t *rbsp, size_t size, const H264ParamSets *sets
 	}
 	if (nalRefIdc != 0)
 		parseDecRefPicMarking(&br, slice);
-	return true;
+	return !br.failed;
 }
 
 /* Table A-1, as MaxDpbMbs; the frame count follows from the picture size. */

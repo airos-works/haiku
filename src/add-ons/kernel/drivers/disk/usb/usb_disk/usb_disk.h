@@ -44,6 +44,7 @@ typedef struct disk_device_s {
 	// device state
 	usb_pipe	bulk_in;
 	usb_pipe	bulk_out;
+	uint16		bulk_max_packet_size;
 	usb_pipe	interrupt;
 	uint8		interface;
 	uint32		current_tag;

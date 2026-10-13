@@ -1,0 +1,8 @@
+SubDir HAIKU_TOP src tests kits bluetooth bt_hid_test ;
+
+UsePrivateHeaders bluetooth ;
+
+SimpleTest bt_hid_test :
+	bt_hid_test.cpp
+	: be [ TargetLibstdc++ ]
+;

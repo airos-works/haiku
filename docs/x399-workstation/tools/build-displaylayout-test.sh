@@ -3,15 +3,17 @@
 # and run it on the workstation.
 #
 # usage: build-displaylayout-test.sh [--no-run]
+#        (BUILD, HAIKU and TOOLS pick another build dir, source tree and
+#        cross compiler prefix)
 set -euo pipefail
 X399=${X399:-/mnt/HaikuWork/x399}
-BUILD=$X399/build/x86_64
-HAIKU=$X399/haiku
+BUILD=${BUILD:-$X399/build/x86_64}
+HAIKU=${HAIKU:-$X399/haiku}
 TESTS=$HAIKU/docs/x399-workstation/tests
 OUT=$BUILD/displaylayouttest
 SSH="ssh -F $X399/ssh/config -o ConnectTimeout=10 ws-haiku"
 
-TOOLS=$BUILD/cross-tools-x86_64/bin/x86_64-unknown-haiku
+TOOLS=${TOOLS:-$BUILD/cross-tools-x86_64/bin/x86_64-unknown-haiku}
 OBJ=$BUILD/objects/haiku/x86_64/release
 GCC_SYSLIBS=$(ls -d "$BUILD"/build_packages/gcc_syslibs_devel-*)
 GCC_SYSLIBS_RUNTIME=$(ls -d "$BUILD"/build_packages/gcc_syslibs-*)

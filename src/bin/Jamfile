@@ -223,6 +223,9 @@ UsePrivateHeaders bluetooth ;
 StdBinCommands
 	bt_le.cpp
 	: be libbluetooth.so [ TargetLibstdc++ ] : $(haiku-utils_rsrc) ;
+StdBinCommands
+	bt_a2dp.cpp
+	: be media libbluetooth.so [ TargetLibsupc++ ] : $(haiku-utils_rsrc) ;
 
 
 # standard commands that need libbe.so, libbnetapi.so, libtracker.so

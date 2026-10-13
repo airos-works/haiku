@@ -90,6 +90,15 @@ struct aic_loader_result {
 };
 
 
+/*	The Bluetooth mode the next load configures (AIC's aicbt_btmode_type):
+	0 Bluetooth only, with an external switch; 1 Wi-Fi and Bluetooth
+	combined; 2 Bluetooth only, without a switch; 5 Bluetooth only on the
+	shared antenna, without an external switch (AIC's D80 default). How the
+	module's antenna pins are wired decides which one hears anything. Other
+	values keep the default. Returns the mode set. */
+#define AIC_BT_MODE_DEFAULT			5
+int		aic_loader_set_bt_mode(int mode);
+
 /*	The whole loader sequence of a U02/U03 chip, up to and including the
 	start request. On success the chip re-enumerates as 0x8d81. */
 int		aic_load_firmware_d80(const struct aic_loader_ops* ops, void* cookie,

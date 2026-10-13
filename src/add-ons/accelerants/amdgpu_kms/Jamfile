@@ -1,0 +1,16 @@
+SubDir HAIKU_TOP src add-ons accelerants amdgpu_kms ;
+
+UsePrivateHeaders graphics ;
+UsePrivateHeaders [ FDirName graphics common ] ;
+UsePrivateHeaders [ FDirName graphics amdgpu_drm ] ;
+UsePrivateHeaders shared ;
+
+Addon amdgpu_kms.accelerant :
+	accelerant.cpp
+	cursor.cpp
+	hooks.cpp
+	kms.cpp
+	layout.cpp
+	mode.cpp
+	: libaccelerantscommon.a
+;

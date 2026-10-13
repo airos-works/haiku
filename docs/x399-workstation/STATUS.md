@@ -3,10 +3,141 @@
 Status values are backed by observation on the workstation. Anything not
 listed as verified is untested.
 
+**2026-10-13 WX 5100 status:** the card runs on amdgpu_drm (Linux 6.18's
+amdgpu on Haiku) with the `amdgpu_kms` accelerant: both 4K monitors in one
+frame buffer, OpenGL/GLES/EGL on radeonsi, Vulkan 1.4 on RADV (including
+windows through the Wayland server), and H.264/HEVC/Main 10 decoding on UVD
+in airTime and (H.264) Summit. The system is master hrev60206+1165.
+[AMDGPU-DRM.md](AMDGPU-DRM.md) has the details and limits; the native
+driver (removed from the tree on 2026-10-13) and its record below are
+history.
+
+**2026-10-11 WX 5100 status:** the X399 now has a Radeon Pro WX 5100.
+Current driver `a4aebce1…` and private Mesa `42352938…` remain installed.
+Actual airTime tests now recover from real H.264/Main/Main10 GPU faults,
+replay in software, seek, recreate hardware decoding and reach the end.
+Two player bugs were fixed and integrated: stale packets after decoder
+replacement, and suppression of all final pictures during hardware catch-up.
+Four cases pass with exact paused pixels; one clear-fault case reports one
+dropped frame. Summit software decoding reaches the end after a real fault,
+but GPU composition freezes and a delayed Mesa-thread abort is recorded.
+Summit recovery is not qualified. All eight automatic resets succeeded;
+this boot is generation 21, automatic 18/18, with no retained resources.
+Fresh EGL/GLES/window and both DMA suites pass afterward, leaving 117 healthy
+GFX completions and zero GPU errors. Production media and backups are verified.
+Details and remaining full-release work are in
+[the actual application recovery checkpoint](WX5100.md#actual-application-recovery-2026-10-11).
+
+The earlier checkpoints below trace this work. The NVIDIA results describe the previous card. AMD desktop output still
+uses the firmware framebuffer. SDMA and the full 61-submission bounded GFX diagnostic pass, including
+indirect buffers, compute, rasterization and VM switches with zero VM faults
+and data mismatches when the matching MEC firmware is loaded. Separate
+client GPU address spaces pass same-address isolation, concurrent clients,
+private diagnostic command pages and complete memory reclamation.
+Root-only userspace compute and raster submission also pass on cold boots,
+including device-only VRAM, changed shader instructions and exact triangle
+pixels. GFX client completion now requires IH3 MSI observation of its private
+fence: two 4,382-job cold-boot trials pass with ring wraps, exact data and
+media/DMA coexistence. Separate read-only-page and privileged-register
+faults fail the jobs and preserve quarantined allocations through close;
+recovery at that checkpoint required a cold boot. A native Mesa metadata candidate now
+reports measured CU/RB masks, tiling, firmware, timestamp clocks and explicit
+interface limits; its graphics/DMA/media regression trial passes. Private
+RadeonSI now passes compositor and EGL-window pixels, resizing and shared
+contexts; Summit's short native GPU rendering trial also passes. The windows
+still use CPU bitmap presentation. Concurrent UVD/GFX scheduling and cached
+guard readback pass decode/graphics/DMA, in-flight close, concurrent fault
+quarantine and cold recovery tests. Separate graphics execution ownership
+also passes 16 in-flight graphics close/reuse cycles. The combined 900-frame
+Summit HEVC Main10/AAC GPU trial now passes with zero drops, compared with
+560 before this work. Sustained H.264/AAC and HEVC Main10/AAC GPU playback
+each passes 5,400 frames over three minutes with zero drops. Mesa now submits
+private kernel copies of outer command buffers. Source replacement, failed
+CPU copies, zeroed tails, GPU write protection, terminal quarantine and cold
+recovery pass. Embedded firmware/media pointers now require complete userspace
+ranges; invalid video ranges fail before advancing decode state. The copied
+path passes the same two 5,400-frame GPU playback trials with zero drops.
+Final DMA and graphics checks pass at 43,657 completions with no GPU errors.
+Separate shader write/execute permission faults pass with unchanged data and
+quarantine; cold recovery plus complete command capture leaves the current
+boot healthy at 916 completions. Broader GLES 3.1 checks now cover indexed,
+instanced and indirect draws, queries, transform feedback, and direct/indirect
+compute, with every output checked. Their 25 command captures independently
+decode with 23 packet opcodes. A system-header BGLView application also passes
+fixed-function drawing, resize, desktop pixels and shared texture lifetime;
+the private renderer now chooses AMD automatically without a device override.
+Explicit software and unprivileged fallback also pass. The complete native
+renderer regression passed at 1,399 completions. An initial opt-in kernel
+command policy now validates the immutable copy and rejects unsupported
+packet/control and privileged-register operations before GPU execution.
+All 337 real command captures and 233,168 policy checks pass host sanitizers
+and QEMU; native tests reject 96 streams, verify each entire private copy was
+cleared, and complete 192 recovery/control jobs. The checked renderer suite,
+concurrent media and both three-minute Summit playback trials pass, with
+5,400 frames and zero drops for each codec. Final DMA/VM checks leave this
+boot healthy at 43,457 completions with zero errors; the desktop is intact.
+A subsequent compute-shader probe checks 16,384 lane records across four VMs:
+neither SETREG form raises privilege, trap-register writes are ignored, and
+ordinary MODE/M0 positive controls succeed. All output/peer guards and memory
+reclamation pass. DMA plus checked GLES 3.1 leaves 43,498 healthy completions
+without requiring a reboot.
+A kernel graphics queue now passes immutable snapshots, pending fences,
+64/client and 256/device limits, mixed DMA ordering, and pending-close memory
+lifetime checks. A deliberate VM fault fails all 23 affected/canceled fences
+and preserves quarantined memory; cold recovery repeats 1,213 graphics jobs,
+both DMA paths and concurrent video with no errors. Private Mesa now has an opt-in asynchronous path with verified pending fences,
+deadlines, sync generations, teardown and deliberate-fault propagation. Its
+queued rendering suite passes. A kernel correction lets decode start while
+graphics is queued and still excludes it behind ordinary DMA; both directions
+have gated regression tests. Queued Summit HEVC 900/0 now passes after an
+initial 900/80 trial exposed the scheduling issue. Both three-minute queued
+playback trials also pass 5,400 frames with zero drops. Final VM/DMA checks
+leave 44,699 healthy completions with no GPU errors. Synchronous Mesa remains
+the default. A subsequent diagnostic kernel and corrected resource fixture
+verify 16,384 scalar/vector/flat/LDS records across four VMs, descriptor bounds,
+guards, memory reclamation and fixed translation readback. Two fixture errors
+are documented; all GPU jobs remain healthy. Follow-up queue, VM, DMA, GLES
+and concurrent media tests leave 248 completions on that boot. A later owned-RAM
+ATC fixture verifies vector buffer reads, stores and atomic adds stay within
+GPUVM under the current translation configuration. Separate store/atomic
+read-only tests produce hardware VM faults, unchanged targets/guards and
+post-close quarantine. Each reviewed fault has a planned cold recovery;
+final graphics/queues/VM/DMA/concurrent-media checks pass at 255 completions,
+510 EOPs and zero errors. A subsequent bounded GDS diagnostic qualifies reads,
+writes, atomic adds, relocated windows and zero-allocation containment. After
+correcting an oversized M0 positive-control request, 52 positive jobs and 358
+bounds-suite jobs pass; all 18 denied access cases return zero, set the shader
+memory-violation flag and preserve the full owned region. Device IRQ state stays
+healthy, and no recovery boot is needed. Graphics/queue/VM/DMA/concurrent-media
+regressions leave 698 completions, 1,396 EOPs and zero device errors. The next
+kernel qualifies all six GWS operations with independent counter/state readback,
+relocated allocations, safe semaphore/barrier preconditions and 35 denial cases.
+All 64 resources remain unchanged after each denied operation. The extended
+83-job suite and GDS/ATC/shader/queue/VM/DMA/GLES/concurrent-media regressions
+leave 797 completions, 1,594 EOPs and zero device errors without a recovery boot.
+Ordered append and remaining shader paths still need qualification; general
+submissions remain root-only. That checkpoint installed driver `4559a441…` and
+private Mesa `82098de9…` with same-hash backups; prior `2894a05c…`, `f546422d…`,
+`ffe50ea8…`, `cb8672d6…`, `cefb183c…`/`afd206fa…`, prior `c579f1cd…`,
+`7d1cf6e5…`/`ee6210e5…` and older checkpoints are
+preserved. The original global media addon is restored after qualification.
+System Mesa defaults remain
+unchanged. Unprivileged general
+graphics submission, system Mesa defaults and native display remain unfinished. AMD UVD H.264 plays three minutes of 1080p30/AAC with zero drops
+in private airTime and Summit builds. HEVC Main/Main 10 has independent native
+pixel/format/lifecycle verification; both private applications also pass
+three-minute 1080p30 Main-10/AAC playback without drops. Summit also passes
+injected HEVC failure, paused-seek recovery and old-addon software fallback.
+Root and unprivileged clients also pass complete readback of 7.75 GiB of
+VRAM beyond the CPU aperture. General graphics, native display and the final
+complete release remain open.
+[WX5100.md](WX5100.md) records identities, evidence, limitations and next work.
+
 `tools/check-workstation.sh` re-checks the machine against all of this in one
 pass, with nothing set in the environment of the programs it runs, because
 several of these have looked fine while being quietly broken. It last came back
-25 working, 0 not (2026-10-06, running air/OS hrev60206+686).
+25 working, 0 not (2026-10-13, running air/OS hrev60206+1165 with the WX 5100
+on amdgpu_drm).
 
 What still needs someone at the machine: a look at the scaled picture on the
 two 4K monitors, a monitor pulled out and plugged back in (the syslog says
@@ -19,10 +150,10 @@ each USB port, the serial console, and a Bluetooth device to pair with.
 | SMP | all 32 hardware threads (16 cores) online | verified: `sysinfo` lists 32 CPUs |
 | NVMe | disk available and bootable | verified after multi-root PCI fix: 2 GiB raw read at 1.6 GiB/s, boot volume |
 | Ethernet | I211 up with DHCP | verified: ipro1000 link 1000BASE-T, DHCP lease, HTTP upload and SSH |
-| USB | all controllers and ports enumerate devices | all 5 xHCI controllers start and publish a root hub; the NanoKVM enumerates on the ASM2142. The individual ports need devices plugged into them |
+| USB | every port at its full speed | verified on every USB 3 port of the four controllers in use, with real devices: a USB 3 SSD reads 281-308 MB/s and writes 312-349 MB/s at SuperSpeed on a CPU rear port, a chipset front port and the ASM2142's USB-A port (43 MB/s before), data verified each time; a RTL8153 gigabit adapter links at SuperSpeed on the ASM2142's USB-C port and carries 815 Mbit/s (81 before); USB 2 flash drives read their 30-36 MB/s on every controller. Disks and network adapters plugged in while the system runs now attach. The Thunderbolt card is out of scope for now (its controller halts on its first DMA, under the BIOS too; its wiring is in doubt). The chipset's controller takes 3-4 ms per control transfer to a USB 2 device (one stage per frame, the controller's own pacing as far as can be told), which slows enumeration and the Bluetooth firmware load but not data |
 | Audio | ALC1220 analog output, HDMI audio | verified both: two outputs, each clocking its stream at the hardware's own rate (48322 and 48321 frames a second against the 48000 asked for). The graphics card's codec needed a change to Haiku's hda driver, which discarded any codec whose converters are all digital. The monitor reports it takes stereo. What nobody here can check is whether a speaker makes a sound |
 | Graphics | GTX 1070/1080 Ti accelerated 2D/3D, 3-4 monitors | 3D verified: Vulkan on the GPU (1.4 TFLOP/s compute, 57 Gpixel/s fill) and OpenGL 4.5 through it, with frames copied straight into the screen's own frame buffer in video memory rather than sent through the host - a lit sphere at 1600x900 goes from 209 to 970 frames a second. Vertical sync works (locks to 60.0) now that the accelerant hands out a retrace semaphore. Any program gets the GPU, with nothing set in its environment. Three heads driving one spanning desktop is verified, but with the third and second forced rather than plugged in. 2D is not accelerated at all: it runs four to eight times slower than drawing in memory, which is still far more than a desktop needs at one monitor |
-| Displays | two 4K monitors usable at arm's length: per-monitor scaling, arrangement, mirroring, per-monitor maximize, hot plug | verified on the two Dell P2415Q (DisplayPort): each monitor is a region of one frame buffer that the display engine scales up to the panel, at 100 to 250 percent in steps of 25, chosen per monitor. app_server arranges the monitors (side by side, stacked, swapped, one off, or one mirroring another), remembers the arrangement per monitor identity, keeps the mouse off the parts of the desktop no monitor shows, moves windows along with their monitor, and maximizes a window to the monitor most of it is on (the classic whole-desktop maximize is a setting). Two 24-inch 4K monitors come up at 200 percent, a 3840x1080 desktop drawn at full density with no settings at all; text is sharp in the frame buffer itself. The Screen preferences show the monitors as they stand and let them be dragged into place, identified by number on each screen, and read out from their EDID. Monitors coming and going are noticed two ways, but nobody was at the machine to plug one, so that path is untested. Frame buffer and VESA hardware gets the same scaling done in software, untested here |
+| Displays | two 4K monitors usable at arm's length: per-monitor scaling, arrangement, mirroring, per-monitor maximize, hot plug | verified on the two Dell P2415Q (DisplayPort): each monitor is a region of one frame buffer that the display engine scales up to the panel, at 100 to 250 percent in steps of 25, chosen per monitor. app_server arranges the monitors (side by side, stacked, swapped, one off, or one mirroring another), remembers the arrangement per monitor identity, keeps the mouse off the parts of the desktop no monitor shows, moves windows along with their monitor, and maximizes a window to the monitor most of it is on (the classic whole-desktop maximize is a setting). Two 24-inch 4K monitors come up at 200 percent, a 3840x1080 desktop drawn at full density with no settings at all; text is sharp in the frame buffer itself. Monitors at different scales share the largest density the engine can show: with the 1080p KVM at 100 percent beside them the 4K monitors stay one to one and the 1080p one is shrunk. The Screen preferences show the monitors as they stand and let them be dragged into place, identified by number on each screen, and read out from their EDID. Monitors coming and going are noticed two ways, but nobody was at the machine to plug one, so that path is untested. Frame buffer and VESA hardware gets the same scaling done in software, untested here |
 | Bluetooth | TP-Link Archer TX55E, working adapter and discovery | verified: the adapter answers as `90:74:ae:33:d7:cb` "MTK MT7922 #1" and an inquiry finds devices nearby, from a cold boot with nothing done by hand. The radio is a MediaTek MT7922 on USB, which runs a bootloader rather than a Bluetooth controller until it is given firmware - it takes the HCI Reset every stack opens with and never answers. The driver now hands it that firmware at open. Three further faults were in the way: `h2generic` took its event endpoint from the last interface that had one, which on this radio is MediaTek's audio interface, so it listened where no reply is ever sent; it stood isochronous transfers on the SCO endpoints at open, which nothing wants until there is a call; and the server never answered a request for a command the controller refuses outright, which hung the first program to ask for an adapter. Remote name lookup still fails, so discovered devices show an address and no name. Pairing and audio profiles are untried |
 | Wi-Fi | TP-Link Archer TX55E | verified: `mt7922wifi` joins WPA2-PSK/CCMP networks and carries traffic. Joining works from the Wi-Fi preferences (the password prompt, Remember this network, Known networks, Disconnect) and the WiFiStatus Deskbar applet lists networks with signal and lock, and shows the one joined. A saved network is joined again by net_server by itself once the card is up (it starts wpa_supplicant). DHCP configures the interface; with the wired card down the machine resolves names, fetches https pages and moves 50 MB each way (1.9 MB/s up, 2.5 MB/s down). Legacy 802.11a/g rates only for now (no HT/VHT/HE), chosen by the firmware's rate control. The driver is the Linux mt7921 layout in FreeBSD net80211 shape: firmware-offloaded scanning, the firmware's own channel management (remain-on-channel), software CCMP through net80211. It attaches at boot like any other driver and is part of the regular x86_64 image; the driver settings (`mt7922wifi`) can keep it out of the boot (`attach_at_boot false`, or `attach_at_boot_until <time>` for trying boot attachment where only the power switch reaches the machine) and turn on its diagnostics (`debug true`) |
 | Video decoding | H.264 on the card's video engine, and something that plays a film | verified: the GTX 1080 Ti has an NVDEC engine and an NVC2B0 decoder class, and thirteen H.264 streams together with 120 frames of 1080p Big Buck Bunny decode byte for byte identically to ffmpeg's own decoder - multiple references, B pictures, spatial and temporal direct prediction, B pictures used as references, weighted prediction and two coded sequences among them. 1080p decodes at 232 pictures a second, 4.3 ms each, about eight times what playing it needs. It is offered to the whole system as a media add-on, so any program that opens a film gets it, and `NVPlay` plays one with sound, stopping, starting and seeking. What it will not do is field pictures, 4:2:2 or more than eight bits a sample, and because Haiku picks one decoder for a format those refusals mean the film will not play rather than falling back |
@@ -30,6 +161,118 @@ each USB port, the serial console, and a Bluetooth device to pair with.
 | Sleep | S3 suspend and resume | sleeps and wakes; the display comes back, but the NVMe and the network card usually do not. Paused until a serial console arrives, which is also what the one untested path in the vertical sync work needs |
 
 ## Log
+
+- 2026-10-10: a 1080p monitor no longer blurs the 4K ones (branch
+  `x399-mixed-scale`). With both P2415Q at 200 percent and the KVM's 1080p
+  input at 100, everything was drawn at 100 percent and the 4K monitors were
+  enlarged from 1080p by the display engine - blurry until the KVM was
+  unplugged. The density was the smallest display scale because the engine
+  was thought unable to shrink a picture (a 4K monitor at 175 percent had
+  been refused). It can: `nvlayoutcheck`, which asks NVKMS whether a layout
+  is possible without applying it (a mode set with commit = false, allowed
+  while app_server owns the display), says a 3840x2160 region onto the
+  1080p monitor is fine and only a region shrunk onto a 4K monitor is not
+  (disp status 2, FAILED_EXTENDED_GPU_CAPABILITIES_CHECK - the bandwidth
+  check).
+  * app_server now draws at the largest display scale and lets the engine
+    shrink the less scaled monitors' regions; `Desktop::_SetDisplayLayout()`
+    tries `DisplayLayout::RenderScales()` from the largest down to the
+    smallest, which only enlarges. `nvidia_rm` checks every layout with
+    NVKMS before agreeing to it, so a refused one fails cleanly and the next
+    density is tried; rpi_display and rk3588_display refuse what they cannot
+    do as before.
+  * The card maps only 256 MiB of video memory for the CPU (BAR1), and the
+    11520x2160 frame buffer is 99.5 MiB. The accelerant kept the frame
+    buffer before the current one mapped and mapped the new one beside both,
+    so the second layout change in a row ran out (`NV_ERR_NO_MEMORY`) and
+    fell back to 100 percent. Now a layout's frame buffer is allocated
+    unmapped and mapped in place of the current one while the mode is set.
+  * On the workstation (repacked app_server, accelerant, two power cycles):
+    `nvidia_rm: layout: HDMI-0 ... scale 100% (3840x2160, drawn at 200%)`,
+    both P2415Q 3840x2160 one to one; the frame buffer (`nvscanout --dump`)
+    has text at full density in the 4K monitors' regions, and the NanoKVM's
+    capture shows a window on the 1080p monitor at its logical size, the
+    text shrunk cleanly. Five layout changes in a row stay at 200 percent;
+    DP-2 at 150 percent is refused at 200 and drawn at 150 (only the 1080p
+    region shrunk, DP-4 enlarged); the KVM disabled and enabled again stays
+    at 200. `displaylayouttest` has the three monitors as a case and a fake
+    engine that shrinks only onto monitors up to 1920 pixels wide.
+    `check-workstation.sh` 25 working, 0 not.
+  * Costs: the 1080p monitor's part of the desktop is drawn with four times
+    the pixels, and a desktop arranged with a lot of empty frame buffer
+    (monitors stacked in an L) can be too large to map at 200 percent; it
+    then falls back to a smaller density rather than failing.
+  * The workstation's wired address is now 192.168.1.247 (DHCP);
+    `ssh/config` and the airos_mcp registration were updated.
+
+- 2026-10-09: USB ports at full speed (branch `x399-usb3`, from master).
+  Two USB stack bugs and two throughput limits were found with the drives
+  and the RTL8153 adapter the owner plugged in:
+  * No USB disk or network adapter plugged in after boot was ever attached.
+    The device manager lists `drivers` for such a device, and the kernel's
+    module iterator ended the whole listing at the first entry it could not
+    stat - a stale `mt7922.aside` link in
+    `~/config/non-packaged/add-ons/kernel/drivers`. At boot the listing is
+    narrowed to `drivers/disk`, which skips that entry by name, so the same
+    drives worked when present from the start. Unreadable entries are now
+    skipped (`bc0d507f5e`); the link was left in place, and a drive replugged
+    at the front was attached at once.
+  * Every SuperSpeed endpoint was configured with bursts of one packet:
+    `Pipe::InitCommon()` announced the pipe to the xhci driver before the
+    burst size from the companion descriptor was set (`232a62851a`). The
+    RTL8153's bulk endpoints now get Max Burst 3, as it declares.
+  * `usb_ecm` read one frame at a time: 81 Mbit/s whatever the port. It
+    now keeps twelve reads queued and sends without waiting (`7771ffa726`),
+    and the xhci driver takes 15 transfers per endpoint instead of 7
+    (`f6ad8e2554`): 297 Mbit/s over USB 2, 815 Mbit/s of UDP and about 500
+    of TCP received and 650-780 sent over USB 3 on the ASM2142. The
+    interrupt moderation interval was tried at 40 us instead of 125: no
+    difference in throughput or latency, so it stays.
+  * The chipset controller (1022:43ba, an ASMedia ASM1042A core) serves a
+    control endpoint once per 1 ms frame, at microframe 4: the Setup stage
+    itself waits for it, so it is not NAK handling. Transfer layout (Event
+    Data, ENT, status-only events), periodic load and ASMedia's flow control
+    register were tried at run time without effect; so was an Evaluate
+    Context giving EP0 another interval, average TRB length or ESIT
+    payload, which the controller ignores (as the specification lets it;
+    at address time Haiku already uses the values Linux does). Bulk on the
+    same controller runs at full speed. The ASM2142 is not affected
+    (0.4 ms).
+  * The Thunderbolt card (Gigabyte GC-MAPLE RIDGE, xHCI 8086:1138) halts
+    with a Host System Error 22-50 ms after it is started, before any port
+    activity, and the BIOS leaves it the same way: its first DMA read never
+    completes. PCIe paths, ACS, AER, the IOMMU (off) and request attributes
+    were checked; its connection-manager firmware runs (FW_STS 0x800001a1).
+    The card most likely needs the Thunderbolt header this board does not
+    have; set aside at the owner's request.
+  * The NanoKVM's USB fails on every controller with two cables (the BIOS
+    cannot use it either), so it is a cable or device fault.
+  * USB 3 disks: a 180 GB SSD (Seagate enclosure, Bulk-Only) read 43 MB/s.
+    usb_disk keeps DMA below 4 GiB (the xhci driver requires it), so on
+    this machine nearly every transfer was bounced through a 16 KiB
+    buffer, one SCSI command per 16 KiB; with 16 segments a buffer in low
+    memory made at most 64 KiB; and commands were at most 128 KiB. A DMA
+    resource with one bounce buffer now gets it as large as its largest
+    transfer (up to 1 MiB), usb_disk allows enough segments, and
+    SuperSpeed disks get 1 MiB commands, as Linux gives USB 3 disks
+    (`1c3364e981`). Larger transfers exposed an xhci bug: a physical
+    transfer over 384 KiB was laid out whole and its remainder sent again
+    after each fragment, leaving the disk waiting for data and every later
+    command timing out; TRBs could also cross 64 KiB now that bursts are
+    16 KiB (`db80e86bf8`). The SSD now does 291/334 MB/s (front, chipset)
+    and 281/312 MB/s (rear, CPU), 308/349 MB/s (ASM2142 USB-A), read/write,
+    with 256 MiB written and read back identically in 1 MiB, 64 KiB and
+    4 KiB blocks
+    (`tests/usbdiskcheck.sh` in `/boot/home/x399-tests`).
+  New read-only tools look at the controllers while the driver runs
+  (`evtwatch`, `evtrate`, `portwatch`, `xhcirings`, `pcitree`, ...), and
+  `usbmsbench` and `tcpbench` measure storage and network throughput
+  (`aad1786ed6`). Installed on the X399 as a repacked haiku package
+  (kernel, usb, xhci, usb_disk, usb_ecm from `x399/build/usb3-x86_64`). The
+  diagnostics build used on the way is in
+  `x399/state/usb3-lab-instrumentation.patch`. Lesson: the X399 runs a
+  master build; `x399/haiku` is still on hrev60097, and a kernel built there
+  stopped the boot.
 
 - 2026-10-09: WiFi now has a native vector application icon: three blue
   arcs and a dot, with dark outlines, highlights and a small shadow. The
@@ -91,6 +334,69 @@ each USB port, the serial console, and a Bluetooth device to pair with.
     in [FRACTIONAL-SCALING.md](FRACTIONAL-SCALING.md). Raw logs, captures and
     the pinned source/compiler/artifact manifest are outside the repository
     under `/mnt/HaikuWork/artifacts/fractional-scaling`.
+
+- 2026-10-08: synchronize the runtime loader's TLS template registry. A
+  Summit startup crash showed a new IPC thread copying a corrupted TLS
+  template while another thread loaded Mesa. `Register()` could reallocate
+  the vector without synchronizing with `CreateBlock()` on other threads.
+  The new recursive lock covers template reads, mutation, and initialization
+  copies. Existing per-thread blocks keep their lock-free fast path; the
+  generation uses an atomic acquire read, and the lock is reset after fork.
+  * `test_tls_templates.sh` loads 256 TLS libraries while 12 workers create
+    576 fresh threads accessing a 1 MiB TLS template. Libraries stay loaded
+    until all workers finish. The original native loader passes 26 rounds
+    then reports two bad initializations; the candidate passes 100 rounds,
+    **57,600 checks**, with no crash or debugger event.
+  * Local x86_64 build, 100 QEMU rounds before and after a normal reboot,
+    22 standard loader tests, 2,000 TLS generation checks, and C++ TLS
+    construction/destruction pass. ARM64 loader deployment is untested.
+  * The automatic rollback guard was verified in QEMU: prior fix -> candidate
+    -> prior fix, followed by restoration of the original VM loader. Merely
+    copying two versions into the packages directory prompts for an upgrade;
+    the qualified procedure removes one, verifies the resulting loader hash,
+    then installs the next. The guard preloads the old package and restores
+    it with Python file operations, without launching another program.
+  * X399 now uses `summit_runtime_loader_tls_fix-1.1-1-x86_64.hpkg`, SHA-256
+    `25a64a61e4d68879ff1d821b96c0d61fcba4b7cecd1bebef0614cbfcff91adc4`.
+    Active loader SHA-256 is
+    `c9c57eae848f9b860ffffdd0b600631da181825c87a24d5fc8b40a6eaffd9d4c`.
+    Native activation and all tests above pass; the guard reports `verified`.
+    No native reboot occurred. The previous package is preserved in
+    `/boot/home/summit/bench/perf12h-tls-concurrency/baseline-disabled.hpkg`.
+    All 100 subsequent Summit startup/local-page/normal-quit cycles pass,
+    with no crash events or leftover helpers. The engine rebuild was active
+    during these correctness tests; this is not a performance claim.
+  * Evidence: `/mnt/HaikuWork/apps/summit/.vm/performance-12h-20261008/tls-concurrency/`.
+
+- 2026-10-08: the runtime loader now initializes a new dynamic TLS vector at
+  the current image generation. Previously, after an image unload, a new
+  thread's second access could discard the block created by its first access,
+  losing writes. A Summit WebProcess crash reached Mesa's once trampoline
+  with a null TLS callback after the callback had been stored; the isolated
+  TLS reproducer exposes the corresponding loader defect.
+  * `src/tests/system/runtime_loader/test_tls_generation.sh` builds two TLS
+    libraries and checks 100 unload/reload rounds with eight new threads each,
+    first-write retention, per-thread isolation, retained-image state and
+    reused-slot initialization. X399 fails 1,224 of 2,000 checks before the
+    fix and passes all 2,000 after it.
+  * The local x86_64 loader build passes. An isolated QEMU overlay reproduces
+    the failure, passes with the fix, fails again after package removal, and
+    passes after reinstall and normal reboot. All 22 existing loader tests
+    pass with `/boot/system/lib` in `LIBRARY_PATH`; the C++ TLS constructor /
+    destructor fixture also passes.
+  * Installed only `runtime_loader` through the removable local package
+    `summit_runtime_loader_tls_fix-1.0-1-x86_64.hpkg`, without rebooting X399.
+    Loader SHA-256 is
+    `d634caaba16cb92f5879f54370212d372d081de48a99d7cb5cbfc4114b8425ce`.
+    Moving that package out of `/boot/system/packages` restores the original
+    packaged loader after package activation completes; rollback was tested
+    in QEMU. Native activation was verified directly. The planned automatic
+    guard failed to start because of a generated-script quoting error; it
+    did not cover activation. This does not diagnose the separate earlier
+    condition-variable invalid-opcode crash.
+  * Evidence: `/mnt/HaikuWork/apps/summit/.vm/optimization-2026-10-08/tls-generation/`.
+    Browser stress validation continues in the Summit repository. ARM64
+    hardware was not changed or tested.
 
 - 2026-10-05: scaled screenshots no longer copy the screen first. At 200%
   `DrawingEngine::ReadBitmap` still copied the drawing buffer's rectangle

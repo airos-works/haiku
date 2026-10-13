@@ -58,7 +58,9 @@ HWInterface::HWInterface()
 	fHardwareCursorEnabled(false),
 	fCursorLocation(0, 0),
 	fVGADevice(-1),
-	fListeners(20)
+	fListeners(20),
+	fRetraceTimeouts(0),
+	fRetraceIgnoredUntil(0)
 {
 }
 
@@ -445,6 +447,37 @@ HWInterface::DrawingBuffer() const
 	if (IsDoubleBuffered())
 		return BackBuffer();
 	return FrontBuffer();
+}
+
+
+/*!	Waits for the display's next vertical blank, so that drawing that went
+	into the back buffer is copied to the screen while the display is not
+	showing it (B_WAIT_FOR_RETRACE). The copy then starts ahead of the scan
+	and outpaces it, and the picture does not tear.
+
+	The caller holds the interface read locked: other windows draw on, but
+	whoever wants it exclusively waits behind this. A display that stops
+	reporting blanks (switched off, say) would cost every such drawing the
+	whole timeout; after a few timeouts in a row the waits stop for a second.
+*/
+void
+HWInterface::WaitForRetraceBeforeCopy()
+{
+	if (system_time() < atomic_get64(&fRetraceIgnoredUntil))
+		return;
+
+	// a blank missed at 60 Hz still fits, and one at 24 Hz
+	status_t status = WaitForRetrace(50000);
+	if (status != B_TIMED_OUT) {
+		// waited, or there is nothing to wait for
+		atomic_set(&fRetraceTimeouts, 0);
+		return;
+	}
+
+	if (atomic_add(&fRetraceTimeouts, 1) + 1 >= 3) {
+		atomic_set(&fRetraceTimeouts, 0);
+		atomic_set64(&fRetraceIgnoredUntil, system_time() + 1000000);
+	}
 }
 
 

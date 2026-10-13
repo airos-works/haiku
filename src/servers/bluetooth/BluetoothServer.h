@@ -18,6 +18,7 @@
 
 #include "DeviceManager.h"
 #include "HCIDelegate.h"
+#include "HIDHost.h"
 #include "LocalDeviceImpl.h"
 #include "SDPServer.h"
 #include "SDPClient.h"
@@ -75,12 +76,17 @@ public:
 	void		NotifyWatchers(BMessage* notice);
 	void		DiscoverServices(ServerRemoteDevice* rd);
 	void		NotifyServices(ServerRemoteDevice* rd);
+	HIDHost*	GetHIDHost() { return fHIDHost; }
+	void		CheckLinkSecurityLater(hci_id hid, const bdaddr_t& address,
+					int32 attempt);
 
     LocalDeviceImpl*    LocateLocalDeviceImpl(hci_id hid);
 	
 private:
 
 	LocalDeviceImpl*	LocateDelegateFromMessage(BMessage* message);
+	static status_t		_DiscoverServicesThread(void* data);
+	void				_ServicesDiscovered(BMessage* message);
 
 	void 				ShowWindow(BWindow* pWindow);
 
@@ -100,6 +106,7 @@ private:
 	
 	SDPServer*              fSDPServer;
 	SDPClient*				fSDPClient;
+	HIDHost*				fHIDHost;
 };
 
 #endif

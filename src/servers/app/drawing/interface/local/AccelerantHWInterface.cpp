@@ -564,6 +564,7 @@ AccelerantHWInterface::Shutdown()
 			uninitAccelerant();
 
 		fAccelerantHook = NULL;
+		fRetraceSemaphore = -1;
 	}
 
 	if (fAccelerantImage >= 0) {
@@ -709,8 +710,12 @@ AccelerantHWInterface::_SetMode(const display_mode& mode, bool force)
 		status = fAccSetDisplayMode(&newMode);
 	if (status != B_OK) {
 		ATRACE(("setting display mode failed\n"));
-		if (!fInitialModeSwitch)
+		if (!fInitialModeSwitch) {
+			// The old mode stays, but the accelerant may have had to map
+			// its frame buffer anew while trying.
+			_UpdateFrameBufferConfig();
 			return status;
+		}
 
 		if (fModeList == NULL) {
 			status = _UpdateModeList();
@@ -1085,23 +1090,31 @@ AccelerantHWInterface::GetMonitorInfo(monitor_info* info)
 }
 
 
+/*!	Asked for with the interface read locked (WaitForRetraceBeforeCopy()),
+	so this must not lock it: the accelerant is asked once, and when two
+	threads happen to ask at the same time, both get the same answer.
+*/
 sem_id
 AccelerantHWInterface::RetraceSemaphore()
 {
-	AutoWriteLocker _(this);
-
-	if (fRetraceSemaphore != -1)
-		return fRetraceSemaphore;
+	sem_id semaphore = atomic_get(&fRetraceSemaphore);
+	if (semaphore != -1)
+		return semaphore;
+	if (fAccelerantHook == NULL)
+		return B_UNSUPPORTED;
 
 	accelerant_retrace_semaphore AccelerantRetraceSemaphore =
 		(accelerant_retrace_semaphore)fAccelerantHook(
 			B_ACCELERANT_RETRACE_SEMAPHORE, NULL);
-	if (!AccelerantRetraceSemaphore)
-		fRetraceSemaphore = B_UNSUPPORTED;
-	else
-		fRetraceSemaphore = AccelerantRetraceSemaphore();
+	semaphore = AccelerantRetraceSemaphore != NULL
+		? AccelerantRetraceSemaphore() : B_UNSUPPORTED;
+	if (semaphore < 0) {
+		// also -1, so that an accelerant without one is not asked again
+		semaphore = B_UNSUPPORTED;
+	}
 
-	return fRetraceSemaphore;
+	atomic_test_and_set(&fRetraceSemaphore, semaphore, -1);
+	return atomic_get(&fRetraceSemaphore);
 }
 
 

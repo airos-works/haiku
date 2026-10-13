@@ -32,8 +32,17 @@ struct ServerRemoteDevice
 	uint8				pscan_rep_mode;
 	uint8				classOfDevice[3];
 	linkkey_t			link_key;
+	uint8				key_type;
+		// of link_key, from Link Key Notification (Core Vol 4 Part E
+		// 7.7.24)
 	uint8				link_type;
 	uint8				encryption_enabled;
+	uint8				remote_io_capability;
+		// from the IO Capability Response of the current pairing
+	bool				outgoing;
+		// the current link was asked for here
+	uint8				auth_retries;
+		// of the current link, after collisions
 
 	uint16				handle;
 	RemoteDevice::ConnectionState			conn_state;
@@ -65,9 +74,13 @@ public:
 	status_t StopLEScan(const BMessenger* listener);
 		// NULL stops the scan for every listener.
 	status_t StartLEConnection(const BMessenger& listener,
-		const uint8* address, uint8 addressType);
+		const uint8* address, uint8 addressType,
+		const BMessage* parameters = NULL);
 	status_t CancelLEConnection(const BMessenger* listener);
 	status_t DisconnectLEConnection(const BMessenger* listener);
+	status_t UpdateLEConnection(uint16 intervalMin, uint16 intervalMax,
+		uint16 latency, uint16 timeout, bool keepInterval = false);
+	status_t ReadRSSI(int32 handle);
 	status_t StartLEEncryption(const uint8* key, const uint8* randomNumber,
 		uint16 encryptedDiversifier);
 	void LEPulse();
@@ -82,6 +95,10 @@ public:
 	void Disconnect(BMessage* message);
 	void SetConnEncryption(uint16 handle, bool encryption_enabled);
 	void ConfirmPairing(bdaddr_t address, bool accepted);
+	void EnablePageScan();
+	void SecureLink(const bdaddr_t& address, int32 attempt);
+		// authenticates (and so encrypts) a link that is not encrypted yet
+		// so that paired HID devices can reconnect
 
 	ServerRemoteDevice*	RemoteDeviceByAddr(bdaddr_t bdaddr);
 	ServerRemoteDevice*	RemoteDeviceByHandle(uint16 handle);
@@ -92,10 +109,13 @@ public:
 private:
 	enum PairSetupState {
 		PAIR_SETUP_IDLE,
+		PAIR_SETUP_BUFFER_SIZE,
+		PAIR_SETUP_LE_BUFFER_SIZE,
 		PAIR_SETUP_EVENT_MASK,
 		PAIR_SETUP_SSP,
 		PAIR_SETUP_SC,
-		PAIR_SETUP_LE_HOST
+		PAIR_SETUP_LE_HOST,
+		PAIR_SETUP_LINK_POLICY
 	};
 	PairSetupState fPairSetupState;
 	void HandlePairSetupCommandComplete(struct hci_event_header* event);
@@ -153,6 +173,23 @@ private:
 	uint16 fLEConnectionHandle;
 	bool fLEEncryptionPending;
 	bool fLEEncrypted;
+	// What the next connection is created with (1.25 ms, events, 10 ms).
+	uint16 fLECreateIntervalMin;
+	uint16 fLECreateIntervalMax;
+	uint16 fLECreateLatency;
+	uint16 fLECreateTimeout;
+	// An interval range the client wants kept on the link, 0 for none: the
+	// peer asking for something else gets it, with this interval.
+	uint16 fLEKeepIntervalMin;
+	uint16 fLEKeepIntervalMax;
+	int32 fLEKeepRestores;
+	bigtime_t fLEKeepRestoredAt;
+	// The link's parameters now.
+	uint16 fLELinkInterval;
+	uint16 fLELinkLatency;
+	uint16 fLELinkTimeout;
+	void _KeepLEInterval(uint16 handle, uint16 interval, uint16 latency,
+		uint16 timeout);
 
 	status_t _SendLECommand(uint16 opcode, const void* data, size_t length);
 	void _EnsureLEMasks();
@@ -227,8 +264,15 @@ private:
 	void IOCapabilityResponse(struct hci_ev_io_capability_response* event,
 		BMessage* request);
 	void UserConfirmationRequest(struct hci_ev_user_confirmation_request* event, BMessage* request);
+	void UserPasskeyNotification(
+		struct hci_ev_user_passkey_notification* event);
+	void KeypressNotification(struct hci_ev_keypress_notification* event);
+	void ModeChange(struct hci_ev_mode_change* event);
 	void SimplePairingComplete(struct hci_ev_simple_pairing_complete* event,
 		BMessage* request);
+	void _ClosePasskeyAlert();
+	BMessenger fPasskeyAlert;
+		// the "type this code on the keyboard" alert
 	void AuthComplete(struct hci_ev_auth_complete* eventData, BMessage* request);
 
 	void EncryptChange(struct hci_ev_encrypt_change* eventData);

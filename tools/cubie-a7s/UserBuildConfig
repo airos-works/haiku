@@ -266,7 +266,7 @@ rule UserBuildConfigRulePreImage
 		# display registers
 		AddFilesToHaikuImage system non-packaged bin : cubie_reg cubie_fetch
 			cubie_send pvrinfo pvrtest cedar_decode media_probe cpu_usage aicload
-			cubie_audio_test screencheck cubie_cpubench ;
+			cubie_audio_test screencheck cubie_cpubench retrace_test ;
 		if $(CUBIE_AIROS_IMAGE) {
 			# a Bluetooth diagnostic the regular image leaves out
 			AddFilesToHaikuImage system non-packaged bin : bt_dev_info ;

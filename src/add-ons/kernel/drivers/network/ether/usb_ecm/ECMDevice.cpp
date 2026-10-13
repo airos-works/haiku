@@ -24,8 +24,13 @@ ECMDevice::ECMDevice(usb_device device)
 		fNotifyEndpoint(0),
 		fReadEndpoint(0),
 		fWriteEndpoint(0),
+		fRingSize(0),
+		fReadHead(0),
+		fWriteNext(0),
 		fNotifyReadSem(-1),
 		fNotifyWriteSem(-1),
+		fWriteMaxPacketSize(0),
+		fRingStarted(false),
 		fNotifyBuffer(NULL),
 		fNotifyBufferLength(0),
 		fLinkStateChangeSem(-1),
@@ -51,16 +56,16 @@ ECMDevice::ECMDevice(usb_device device)
 		return;
 	}
 
-	fNotifyReadSem = create_sem(0, DRIVER_NAME"_notify_read");
-	if (fNotifyReadSem < B_OK) {
-		TRACE_ALWAYS("failed to create read notify sem\n");
-		return;
-	}
-
-	fNotifyWriteSem = create_sem(0, DRIVER_NAME"_notify_write");
-	if (fNotifyWriteSem < B_OK) {
-		TRACE_ALWAYS("failed to create write notify sem\n");
-		return;
+	for (int32 i = 0; i < kRingSlots; i++) {
+		fReadSlots[i].device = this;
+		fReadSlots[i].buffer = (uint8 *)malloc(kBufferSize);
+		fReadSlots[i].length = 0;
+		fReadSlots[i].status = B_OK;
+		fWriteBuffers[i] = (uint8 *)malloc(kBufferSize);
+		if (fReadSlots[i].buffer == NULL || fWriteBuffers[i] == NULL) {
+			TRACE_ALWAYS("out of memory for transfer buffers\n");
+			return;
+		}
 	}
 
 	if (_SetupDevice() != B_OK) {
@@ -79,15 +84,71 @@ ECMDevice::ECMDevice(usb_device device)
 
 ECMDevice::~ECMDevice()
 {
+	if (!fRemoved)
+		gUSBModule->cancel_queued_transfers(fNotifyEndpoint);
+	_StopRing();
+
+	for (int32 i = 0; i < kRingSlots; i++) {
+		free(fReadSlots[i].buffer);
+		free(fWriteBuffers[i]);
+	}
+	free(fNotifyBuffer);
+}
+
+
+status_t
+ECMDevice::_StartRing()
+{
+	fNotifyReadSem = create_sem(0, DRIVER_NAME"_notify_read");
+	if (fNotifyReadSem < B_OK) {
+		TRACE_ALWAYS("failed to create notify sems\n");
+		_StopRing();
+		return B_NO_MORE_SEMS;
+	}
+
+	fReadHead = 0;
+	fWriteNext = 0;
+	fRingStarted = true;
+	fRingSize = 0;
+	for (int32 i = 0; i < kRingSlots; i++) {
+		status_t result = gUSBModule->queue_bulk(fReadEndpoint,
+			fReadSlots[i].buffer, kBufferSize, _ReadCallback, &fReadSlots[i]);
+		if (result != B_OK) {
+			if (i == 0) {
+				TRACE_ALWAYS("failed to queue a read: %s\n", strerror(result));
+				_StopRing();
+				return result;
+			}
+			// the host controller takes no more on one endpoint
+			break;
+		}
+		fRingSize++;
+	}
+
+	fNotifyWriteSem = create_sem(fRingSize, DRIVER_NAME"_notify_write");
+	if (fNotifyWriteSem < B_OK) {
+		_StopRing();
+		return B_NO_MORE_SEMS;
+	}
+	return B_OK;
+}
+
+
+void
+ECMDevice::_StopRing()
+{
+	if (fRingStarted && !fRemoved) {
+		gUSBModule->cancel_queued_transfers(fReadEndpoint);
+		gUSBModule->cancel_queued_transfers(fWriteEndpoint);
+	}
+	fRingStarted = false;
+
+	// whoever waits in Read() or Write() gets B_BAD_SEM_ID and returns
 	if (fNotifyReadSem >= B_OK)
 		delete_sem(fNotifyReadSem);
 	if (fNotifyWriteSem >= B_OK)
 		delete_sem(fNotifyWriteSem);
-
-	if (!fRemoved)
-		gUSBModule->cancel_queued_transfers(fNotifyEndpoint);
-
-	free(fNotifyBuffer);
+	fNotifyReadSem = fNotifyWriteSem = -1;
 }
 
 
@@ -137,6 +198,16 @@ ECMDevice::Open()
 		return B_ERROR;
 	}
 
+	for (int32 i = 0; i < 2; i++) {
+		usb_endpoint_descriptor* descriptor = interface->endpoint[i].descr;
+		if ((descriptor->endpoint_address & USB_ENDPOINT_ADDR_DIR_IN) == 0)
+			fWriteMaxPacketSize = descriptor->max_packet_size & 0x7ff;
+	}
+
+	status_t ringStatus = _StartRing();
+	if (ringStatus != B_OK)
+		return ringStatus;
+
 	if (gUSBModule->queue_interrupt(fNotifyEndpoint, fNotifyBuffer,
 		fNotifyBufferLength, _NotifyCallback, this) != B_OK) {
 		// we cannot use notifications - hardcode to active connection
@@ -160,8 +231,7 @@ ECMDevice::Close()
 	}
 
 	gUSBModule->cancel_queued_transfers(fNotifyEndpoint);
-	gUSBModule->cancel_queued_transfers(fReadEndpoint);
-	gUSBModule->cancel_queued_transfers(fWriteEndpoint);
+	_StopRing();
 
 	// put the device into non-connected mode again by switching the data
 	// interface to the disabled alternate
@@ -191,21 +261,30 @@ ECMDevice::Read(uint8 *buffer, size_t *numBytes)
 		return B_DEVICE_NOT_FOUND;
 	}
 
-	status_t result = gUSBModule->queue_bulk(fReadEndpoint, buffer, *numBytes,
-		_ReadCallback, this);
-	if (result != B_OK) {
-		*numBytes = 0;
-		return result;
-	}
-
-	result = acquire_sem_etc(fNotifyReadSem, 1, B_CAN_INTERRUPT, 0);
+	status_t result = acquire_sem_etc(fNotifyReadSem, 1, B_CAN_INTERRUPT, 0);
 	if (result < B_OK) {
 		*numBytes = 0;
 		return result;
 	}
+	if (fRemoved) {
+		*numBytes = 0;
+		return B_DEVICE_NOT_FOUND;
+	}
 
-	if (fStatusRead != B_OK && fStatusRead != B_CANCELED && !fRemoved) {
-		TRACE_ALWAYS("device status error 0x%08" B_PRIx32 "\n", fStatusRead);
+	// reads complete in the order they were queued
+	ring_slot& slot = fReadSlots[fReadHead];
+	fReadHead = (fReadHead + 1) % fRingSize;
+
+	status_t status = slot.status;
+	size_t length = 0;
+	if (status == B_OK) {
+		length = min_c(slot.length, *numBytes);
+		memcpy(buffer, slot.buffer, length);
+	} else if (status == B_CANCELED) {
+		*numBytes = 0;
+		return B_CANCELED;
+	} else {
+		TRACE_ALWAYS("device status error 0x%08" B_PRIx32 "\n", status);
 		result = gUSBModule->clear_feature(fReadEndpoint,
 			USB_FEATURE_ENDPOINT_HALT);
 		if (result != B_OK) {
@@ -215,7 +294,16 @@ ECMDevice::Read(uint8 *buffer, size_t *numBytes)
 		}
 	}
 
-	*numBytes = fActualLengthRead;
+	// give the buffer back to the device right away
+	result = gUSBModule->queue_bulk(fReadEndpoint, slot.buffer, kBufferSize,
+		_ReadCallback, &slot);
+	if (result != B_OK) {
+		TRACE_ALWAYS("failed to queue read again: %s\n", strerror(result));
+		*numBytes = 0;
+		return result;
+	}
+
+	*numBytes = length;
 	return B_OK;
 }
 
@@ -228,31 +316,43 @@ ECMDevice::Write(const uint8 *buffer, size_t *numBytes)
 		return B_DEVICE_NOT_FOUND;
 	}
 
-	status_t result = gUSBModule->queue_bulk(fWriteEndpoint, (uint8 *)buffer,
-		*numBytes, _WriteCallback, this);
-	if (result != B_OK) {
+	size_t length = *numBytes;
+	if (length > kBufferSize - 1) {
 		*numBytes = 0;
-		return result;
+		return B_BAD_VALUE;
 	}
 
-	result = acquire_sem_etc(fNotifyWriteSem, 1, B_CAN_INTERRUPT, 0);
+	status_t result = acquire_sem_etc(fNotifyWriteSem, 1, B_CAN_INTERRUPT, 0);
 	if (result < B_OK) {
 		*numBytes = 0;
 		return result;
 	}
 
-	if (fStatusWrite != B_OK && fStatusWrite != B_CANCELED && !fRemoved) {
-		TRACE_ALWAYS("device status error 0x%08" B_PRIx32 "\n", fStatusWrite);
-		result = gUSBModule->clear_feature(fWriteEndpoint,
-			USB_FEATURE_ENDPOINT_HALT);
-		if (result != B_OK) {
-			TRACE_ALWAYS("failed to clear halt state on write\n");
-			*numBytes = 0;
-			return result;
-		}
+	// writes complete in order too, so the next buffer is free
+	int32 index;
+	int32 next;
+	do {
+		index = atomic_get(&fWriteNext);
+		next = (index + 1) % fRingSize;
+	} while (atomic_test_and_set(&fWriteNext, next, index) != index);
+	uint8* data = fWriteBuffers[index];
+	memcpy(data, buffer, length);
+
+	// A frame that fills its last packet would leave the device waiting for
+	// a zero length packet to end it; a byte of padding ends it instead, as
+	// other systems do for CDC Ethernet.
+	size_t transferLength = length;
+	if (fWriteMaxPacketSize != 0 && (length % fWriteMaxPacketSize) == 0)
+		data[transferLength++] = 0;
+
+	result = gUSBModule->queue_bulk(fWriteEndpoint, data, transferLength,
+		_WriteCallback, this);
+	if (result != B_OK) {
+		release_sem_etc(fNotifyWriteSem, 1, B_DO_NOT_RESCHEDULE);
+		*numBytes = 0;
+		return result;
 	}
 
-	*numBytes = fActualLengthWrite;
 	return B_OK;
 }
 
@@ -531,10 +631,10 @@ void
 ECMDevice::_ReadCallback(void *cookie, int32 status, void *data,
 	size_t actualLength)
 {
-	ECMDevice *device = (ECMDevice *)cookie;
-	device->fActualLengthRead = actualLength;
-	device->fStatusRead = status;
-	release_sem_etc(device->fNotifyReadSem, 1, B_DO_NOT_RESCHEDULE);
+	ring_slot *slot = (ring_slot *)cookie;
+	slot->length = actualLength;
+	slot->status = status;
+	release_sem_etc(slot->device->fNotifyReadSem, 1, B_DO_NOT_RESCHEDULE);
 }
 
 
@@ -543,8 +643,10 @@ ECMDevice::_WriteCallback(void *cookie, int32 status, void *data,
 	size_t actualLength)
 {
 	ECMDevice *device = (ECMDevice *)cookie;
-	device->fActualLengthWrite = actualLength;
-	device->fStatusWrite = status;
+	// No request can be made from here (this runs where the controller
+	// completes transfers); a stalled write pipe is the stack's to reset.
+	if (status != B_OK && status != B_CANCELED && !device->fRemoved)
+		TRACE_ALWAYS("write error 0x%08" B_PRIx32 "\n", status);
 	release_sem_etc(device->fNotifyWriteSem, 1, B_DO_NOT_RESCHEDULE);
 }
 

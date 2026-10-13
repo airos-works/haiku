@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 // from headers/private/drivers/poke.h
@@ -73,6 +74,14 @@ main()
 		printf("== %04x:%04x at %02x:%02x.%x  ports %u  IMAN %#x IMOD %#x\n",
 			info.vendor_id, info.device_id, info.bus, info.device,
 			info.function, ports, r32(rtsoff + 0x20), r32(rtsoff + 0x24));
+		{
+			uint32 op = capLength;
+			printf("   USBCMD %#x USBSTS %#x CRCR %#x%08x DNCTRL %#x CONFIG %#x"
+				" ERSTSZ %u ERDP %#x%08x HCSPARAMS2 %#x HCCPARAMS2 %#x\n",
+				r32(op), r32(op + 4), r32(op + 0x1c), r32(op + 0x18),
+				r32(op + 0x14), r32(op + 0x38), r32(rtsoff + 0x28),
+				r32(rtsoff + 0x3c), r32(rtsoff + 0x38), r32(8), r32(0x1c));
+		}
 		for (uint32 x = (hcc1 >> 16) << 2; x != 0;) {
 			uint32 d0 = r32(x);
 			if ((d0 & 0xff) == 2) {
@@ -90,8 +99,13 @@ main()
 		for (uint32 port = 1; port <= ports; port++) {
 			uint32 base = capLength + 0x400 + 0x10 * (port - 1);
 			uint32 sc = r32(base);
-			if ((sc & 1) == 0)
+			if ((sc & 1) == 0) {
+				if (getenv("XHCIREGS_ALL") != NULL) {
+					printf("   port %2u: PORTSC %#010x (empty: power %u link %u)\n",
+						port, sc, (sc >> 9) & 1, (sc >> 5) & 0xf);
+				}
 				continue;
+			}
 			printf("   port %2u: PORTSC %#010x speed %u link %u  PORTPMSC %#010x"
 				" (HLE %u, L1S %u, BESL %u)  PORTLI %#x  PORTHLPMC %#x\n",
 				port, sc, (sc >> 10) & 0xf, (sc >> 5) & 0xf, r32(base + 4),

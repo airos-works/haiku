@@ -36,8 +36,12 @@ bitmap path. Size and effect-count limits bound individual representations;
 allocation or rendering failure falls back to the bitmap.
 
 A bitmap-only icon has no vector detail to recover. Mixed-density monitors
-still use the fork's shared desktop rendering density and accelerant scaling
-policy; this change does not introduce a separate renderer for each monitor.
+still share one desktop rendering density; this change does not introduce a
+separate renderer for each monitor. Since 2026-10-10 that density is the
+largest display scale the display engine can show (`DisplayLayout::
+RenderScales()`, tried in turn by `Desktop::_SetDisplayLayout()`), so the
+most scaled monitors are drawn one to one and the others are shrunk by the
+hardware; see the STATUS.md entry of that day.
 
 ## Running the visual test
 

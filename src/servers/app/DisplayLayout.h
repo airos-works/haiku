@@ -115,9 +115,13 @@ public:
 			bool				HasMirror() const;
 			uint16				RenderScale() const;
 									// the density everything is drawn at, in
-									// percent: the smallest display scale,
-									// so that no display is ever shrunk
+									// percent: the one set, else the largest
+									// display scale
+			void				RenderScales(std::vector<uint16>& scales)
+									const;
+									// the densities worth trying, best first
 			void				SetRenderScale(uint16 renderScale);
+									// 0 goes back to the largest scale
 
 	static	uint16				DefaultScale(const DisplayInfo& display);
 			uint16				SavedScale(const BMessage& saved) const;

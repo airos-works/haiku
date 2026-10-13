@@ -367,7 +367,23 @@ struct hci_ev_simple_pairing_complete {
 
 #define HCI_EVENT_ENHANCED_FLUSH_COMPLETE			0x39
 
+#define HCI_EVENT_USER_PASSKEY_NOTIFICATION			0x3B
+struct hci_ev_user_passkey_notification {
+    bdaddr_t    bdaddr;
+    uint32      passkey;
+} __attribute__((packed));
+
 #define HCI_EVENT_KEYPRESS_NOTIFICATION				0x3C
+struct hci_ev_keypress_notification {
+    bdaddr_t    bdaddr;
+    uint8       type;
+} __attribute__((packed));
+
+#define HCI_KEYPRESS_ENTRY_STARTED		0x00
+#define HCI_KEYPRESS_DIGIT_ENTERED		0x01
+#define HCI_KEYPRESS_DIGIT_ERASED		0x02
+#define HCI_KEYPRESS_CLEARED			0x03
+#define HCI_KEYPRESS_ENTRY_COMPLETED	0x04
 
 #define HCI_EVENT_REMOTE_HOST_SUPPORTED_FEATURES_NOTIFICATION	0x3D
 

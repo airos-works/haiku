@@ -244,6 +244,9 @@ private:
 									const char* name);
 	inline	void				_DeviceMemoryBarrier();
 	inline	bool				_DirectPhysical(Transfer* transfer) const;
+			generic_size_t		_PhysicalTRBLength(phys_addr_t address,
+									generic_size_t remaining,
+									const xhci_endpoint* endpoint) const;
 			bool				_IsDisabledSuperSpeedPort(uint8 index) const;
 
 			// Commands

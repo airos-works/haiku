@@ -41,12 +41,14 @@
 
 /* The first nine values of the BTMODE record are the host's Bluetooth
    configuration, not the file's: hardware info invalid (1, then -1),
-   working mode 0, Bluetooth-only with a shared antenna (5), HCI over the
-   USB mailbox (1; the file says UART), 1500000 baud with flow control, no
-   low power mode, and the D80's TX power levels. */
+   working mode 0, the Bluetooth mode (sBluetoothMode), HCI over the USB
+   mailbox (1; the file says UART), 1500000 baud with flow control, no low
+   power mode, and the D80's TX power levels. */
+#define BT_CONFIG_MODE		3
 static const uint32_t kBluetoothConfig[9] = {
-	1, 0xffffffff, 0, 5, 1, 1500000, 1, 0, 0x00006f2f
+	1, 0xffffffff, 0, AIC_BT_MODE_DEFAULT, 1, 1500000, 1, 0, 0x00006f2f
 };
+static uint32_t sBluetoothMode = AIC_BT_MODE_DEFAULT;
 
 /* the Wi-Fi firmware's patch block */
 #define PATCH_MAGIC			0x48435450	/* "PTCH" */
@@ -356,6 +358,15 @@ parse_patch_table(const uint8_t* table, long size,
 
 
 int
+aic_loader_set_bt_mode(int mode)
+{
+	sBluetoothMode = mode >= 0 && mode <= 5 ? (uint32_t)mode
+		: AIC_BT_MODE_DEFAULT;
+	return (int)sBluetoothMode;
+}
+
+
+int
 aic_load_firmware_d80(const struct aic_loader_ops* ops, void* cookie,
 	struct aic_loader_result* result)
 {
@@ -449,8 +460,10 @@ aic_load_firmware_d80(const struct aic_loader_ops* ops, void* cookie,
 		for (k = 0; k < records[i].count; k++) {
 			uint32_t address = get32(records[i].pairs + k * 8);
 			uint32_t value = get32(records[i].pairs + k * 8 + 4);
-			if (records[i].type == TABLE_BTMODE && k < 9)
-				value = kBluetoothConfig[k];
+			if (records[i].type == TABLE_BTMODE && k < 9) {
+				value = k == BT_CONFIG_MODE
+					? sBluetoothMode : kBluetoothConfig[k];
+			}
 			status = memory_write(&loader, address, value);
 			if (status != 0)
 				goto out;

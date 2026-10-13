@@ -32,6 +32,8 @@
 
 
 #define MAX_IO_BLOCKS					(256)
+	// per command; SuperSpeed devices get 1 MiB, as on other systems
+#define MAX_SUPERSPEED_IO_SIZE			(1024 * 1024)
 
 #define USB_DISK_DEVICE_MODULE_NAME		"drivers/disk/usb_disk/device_v1"
 #define USB_DISK_DRIVER_MODULE_NAME		"drivers/disk/usb_disk/driver_v1"
@@ -973,6 +975,18 @@ usb_disk_update_capacity(device_lun *lun)
 		dma_restrictions restrictions = {};
 		restrictions.high_address = UINT32_MAX;
 		restrictions.max_transfer_size = (lun->block_size * MAX_IO_BLOCKS);
+		if (lun->device->bulk_max_packet_size >= 1024
+			&& lun->block_size <= MAX_SUPERSPEED_IO_SIZE) {
+			// A SuperSpeed device (bulk packets of 1024 bytes): commands of
+			// 128 KiB left a USB 3 disk at a third of its speed, the fixed
+			// cost of each command being as long as its data.
+			restrictions.max_transfer_size = MAX_SUPERSPEED_IO_SIZE
+				/ lun->block_size * lun->block_size;
+		}
+		// A buffer is pages scattered in memory: with the default of 16
+		// segments a transfer could not be larger than 64 KiB.
+		restrictions.max_segment_count = max_c(16,
+			restrictions.max_transfer_size / B_PAGE_SIZE + 1);
 
 		DMAResource* dmaResource = new DMAResource;
 		result = dmaResource->Init(restrictions, lun->block_size, 1, 1);
@@ -1107,6 +1121,8 @@ usb_disk_attach(device_node *node, usb_device newDevice, void **cookie)
 					& USB_ENDPOINT_ADDR_DIR_IN) != 0
 					&& endpoint->descr->attributes == USB_ENDPOINT_ATTR_BULK) {
 					device->bulk_in = endpoint->handle;
+					device->bulk_max_packet_size
+						= endpoint->descr->max_packet_size & 0x7ff;
 					hasIn = true;
 				} else if (!hasOut && (endpoint->descr->endpoint_address
 					& USB_ENDPOINT_ADDR_DIR_IN) == 0

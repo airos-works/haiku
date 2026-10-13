@@ -33,6 +33,7 @@
 #include <frame_buffer_console.h>
 #include <graphic_driver.h>
 #include <lock.h>
+#include <retrace_semaphores.h>
 #include <team.h>
 #include <util/AutoLock.h>
 #include <vm/vm.h>
@@ -89,6 +90,14 @@ struct display_info {
 	sunxi_display_timing wantedTiming;
 	uint32			wantedEdidLength;
 	uint8			wantedEdid[256];
+
+	// vertical blanks: TCON-TV1 interrupts at each one while it shows the
+	// frame buffer; a timer stands in for it while nothing is shown
+	RetraceSemaphores* retrace;
+	int32			interrupt;		// installed, or -1
+	int64			lastBlank;
+	timer			retraceTimer;
+	bool			retraceTimerAdded;
 };
 
 
@@ -460,6 +469,87 @@ poll_outputs(void* cookie)
 }
 
 
+//	#pragma mark - vertical blank
+
+
+static int32
+display_interrupt(void* data)
+{
+	display_info* info = (display_info*)data;
+	if (info->pipe == NULL || !info->pipe->AcknowledgeBlank())
+		return B_UNHANDLED_INTERRUPT;
+
+	atomic_set64(&info->lastBlank, system_time());
+	return info->retrace->Release() ? B_INVOKE_SCHEDULER : B_HANDLED_INTERRUPT;
+}
+
+
+/*!	At 60 Hz, while the output shows nothing (no display, or the display
+	is being retimed), so that waiting for a blank never waits long.
+*/
+static int32
+retrace_timer(timer* timer)
+{
+	display_info* info = (display_info*)timer->user_data;
+	if (system_time() - atomic_get64(&info->lastBlank) < 100000)
+		return B_HANDLED_INTERRUPT;
+	return info->retrace->Release() ? B_INVOKE_SCHEDULER : B_HANDLED_INTERRUPT;
+}
+
+
+/*!	TCON-TV1's interrupt from the device tree; the driver's addresses are
+	the A733's, so its own number when the tree has none.
+*/
+static uint32
+display_interrupt_number(display_info* info)
+{
+	uint64 interrupt = sunxi::kTconTv1Interrupt;
+	device_node* parent = sDeviceManager->get_parent_node(info->node);
+	fdt_device_module_info* fdt;
+	fdt_device* device;
+	if (parent != NULL && sDeviceManager->get_driver(parent,
+			(driver_module_info**)&fdt, (void**)&device) == B_OK
+		&& !fdt->get_interrupt(device, 0, NULL, &interrupt)) {
+		interrupt = sunxi::kTconTv1Interrupt;
+	}
+	if (parent != NULL)
+		sDeviceManager->put_node(parent);
+	return (uint32)interrupt;
+}
+
+
+static void
+init_retrace(display_info* info)
+{
+	info->interrupt = -1;
+	info->retrace = new(std::nothrow) RetraceSemaphores;
+	if (info->retrace == NULL || info->pipe == NULL)
+		return;
+
+	uint32 interrupt = display_interrupt_number(info);
+	status_t status = install_io_interrupt_handler(interrupt,
+		display_interrupt, info, 0);
+	if (status != B_OK) {
+		ERROR("no vertical blank interrupt %" B_PRIu32 ": %s\n", interrupt,
+			strerror(status));
+		return;
+	}
+	info->interrupt = interrupt;
+}
+
+
+static void
+uninit_retrace(display_info* info)
+{
+	if (info->retraceTimerAdded)
+		cancel_timer(&info->retraceTimer);
+	if (info->interrupt >= 0)
+		remove_io_interrupt_handler(info->interrupt, display_interrupt, info);
+	delete info->retrace;
+	info->retrace = NULL;
+}
+
+
 //	#pragma mark - frame buffer
 
 
@@ -709,6 +799,8 @@ display_init_device(void* _info, void** _cookie)
 			resume_thread(info->pollThread);
 	}
 
+	init_retrace(info);
+
 	*_cookie = info;
 	return B_OK;
 }
@@ -726,6 +818,7 @@ display_uninit_device(void* cookie)
 	delete info->typeC;
 	if (info->pipe != NULL)
 		info->pipe->Disable();
+	uninit_retrace(info);
 	delete info->pipe;
 	mutex_destroy(&info->lock);
 	if (info->bufferArea >= 0)
@@ -879,6 +972,24 @@ display_control(void* cookie, uint32 op, void* buffer, size_t length)
 			if (status != B_OK)
 				return status;
 			return user_memcpy(buffer, &request, sizeof(request));
+		}
+
+		case SUNXI_DISPLAY_GET_RETRACE_SEMAPHORE:
+		{
+			if (info->retrace == NULL)
+				return B_NOT_SUPPORTED;
+			MutexLocker locker(info->lock);
+			sem_id semaphore = info->retrace->Get();
+			if (semaphore < 0)
+				return semaphore;
+			if (!info->retraceTimerAdded) {
+				info->retraceTimer.user_data = info;
+				add_timer(&info->retraceTimer, retrace_timer, 1000000 / 60,
+					B_PERIODIC_TIMER);
+				info->retraceTimerAdded = true;
+			}
+			locker.Unlock();
+			return user_memcpy(buffer, &semaphore, sizeof(semaphore));
 		}
 
 		case SUNXI_DISPLAY_CLONE_FRAME_BUFFER:
