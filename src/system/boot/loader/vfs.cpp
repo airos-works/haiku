@@ -530,6 +530,7 @@ BootVolume::_SetTo(Directory* rootDirectory,
 	// find the system directory
 	Node* systemNode = fRootDirectory->Lookup("system", true);
 	if (systemNode == NULL || !S_ISDIR(systemNode->Type())) {
+		dprintf("diag: BootVolume: no system directory (%p)\n", systemNode);
 		if (systemNode != NULL)
 			systemNode->Release();
 		Unset();
@@ -546,6 +547,8 @@ BootVolume::_SetTo(Directory* rootDirectory,
 			"packages");
 		if (error != B_OK) {
 			// apparently not packaged
+			dprintf("diag: BootVolume: PackageVolumeInfo::SetTo: %#" B_PRIx32
+				", taken as not packaged\n", error);
 			return B_OK;
 		}
 
@@ -560,8 +563,13 @@ BootVolume::_SetTo(Directory* rootDirectory,
 
 	// try opening the system package
 	int packageFD = _OpenSystemPackage();
-	if (packageFD < 0)
+	if (packageFD < 0) {
+		dprintf("diag: BootVolume: opening the system package \"%s\": %d\n",
+			fPackageVolumeState != NULL && fPackageVolumeState->SystemPackage()
+				!= NULL ? fPackageVolumeState->SystemPackage() : "(none)",
+			packageFD);
 		return packageFD;
+	}
 
 	// mount packagefs
 	Directory* packageRootDirectory;
@@ -569,6 +577,8 @@ BootVolume::_SetTo(Directory* rootDirectory,
 		packageRootDirectory);
 	close(packageFD);
 	if (error != B_OK) {
+		dprintf("diag: BootVolume: packagefs_mount_file: %#" B_PRIx32 "\n",
+			error);
 		Unset();
 		return error;
 	}
@@ -711,11 +721,17 @@ get_boot_file_system(stage2_args* args, BootVolume& _bootVolume)
 		Node *device = iterator.Next();
 
 		error = add_partitions_for(device, false, true);
+		dprintf("diag: boot device %p (%" B_PRIdOFF " bytes): "
+			"add_partitions_for: %#" B_PRIx32 "\n", device, device->Size(),
+			error);
 		if (error != B_OK)
 			continue;
 
 		NodeList bootPartitions;
 		error = platform_get_boot_partitions(args, device, &gPartitions, &bootPartitions);
+		dprintf("diag: boot device %p: platform_get_boot_partitions: %#"
+			B_PRIx32 ", %" B_PRId32 " partition(s)\n", device, error,
+			bootPartitions.Count());
 		if (error != B_OK)
 			continue;
 
@@ -725,6 +741,9 @@ get_boot_file_system(stage2_args* args, BootVolume& _bootVolume)
 
 			Directory *fileSystem;
 			error = partition->Mount(&fileSystem, true);
+			dprintf("diag: partition %p (offset %" B_PRIdOFF ", size %" B_PRIdOFF
+				"): Mount: %#" B_PRIx32 "\n", partition, partition->offset,
+				partition->size, error);
 			if (error != B_OK) {
 				// this partition doesn't contain any known file system; we
 				// don't need it anymore
@@ -735,6 +754,8 @@ get_boot_file_system(stage2_args* args, BootVolume& _bootVolume)
 
 			// init the BootVolume
 			error = _bootVolume.SetTo(fileSystem);
+			dprintf("diag: partition %p: BootVolume::SetTo: %#" B_PRIx32 "\n",
+				partition, error);
 			if (error != B_OK)
 				continue;
 

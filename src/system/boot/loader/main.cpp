@@ -30,6 +30,13 @@
 void *__dso_handle;
 
 
+// Platforms that can store the log (EFI) replace this.
+__attribute__((weak)) void
+platform_save_boot_log(const char* stage)
+{
+}
+
+
 extern "C" int
 main(stage2_args *args)
 {
@@ -65,16 +72,22 @@ main(stage2_args *args)
 	BootVolume bootVolume;
 	PathBlocklist pathBlocklist;
 
-	if (get_boot_file_system(args, bootVolume) != B_OK
+	status_t bootStatus = get_boot_file_system(args, bootVolume);
+	dprintf("diag: get_boot_file_system: %#" B_PRIx32 "%s\n", bootStatus,
+		bootVolume.IsValid() ? " (boot volume found)" : "");
+	if (bootStatus != B_OK
 		|| (platform_boot_options() & BOOT_OPTION_MENU) != 0) {
 		if (!bootVolume.IsValid())
 			puts("\tno boot path found, scan for all partitions...\n");
 
-		if (mount_file_systems(args) < B_OK) {
+		status_t mountStatus = mount_file_systems(args);
+		dprintf("diag: mount_file_systems: %#" B_PRIx32 "\n", mountStatus);
+		if (mountStatus < B_OK) {
 			// That's unfortunate, but we still give the user the possibility
 			// to insert a CD-ROM or just rescan the available devices
 			puts("Could not locate any supported boot devices!\n");
 		}
+		platform_save_boot_log("before the boot menu");
 
 		// ToDo: check if there is only one bootable volume!
 

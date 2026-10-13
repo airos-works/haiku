@@ -15,6 +15,8 @@
 #include <boot/vfs.h>
 #include <boot/platform.h>
 #include <boot/stdio.h>
+
+#include <string.h>
 #include <boot/partitions.h>
 
 #include <unistd.h>
@@ -88,15 +90,27 @@ find_kernel(BootVolume& volume, const char** name = NULL)
 bool
 is_bootable(Directory *volume)
 {
-	if (volume->IsEmpty())
+	char name[B_FILE_NAME_LENGTH];
+	if (volume->GetName(name, sizeof(name)) != B_OK)
+		strlcpy(name, "?", sizeof(name));
+
+	if (volume->IsEmpty()) {
+		dprintf("diag: is_bootable(%p \"%s\"): empty\n", volume, name);
 		return false;
+	}
 
 	BootVolume bootVolume;
-	if (bootVolume.SetTo(volume) != B_OK)
+	status_t status = bootVolume.SetTo(volume);
+	if (status != B_OK) {
+		dprintf("diag: is_bootable(%p \"%s\"): BootVolume::SetTo: %#" B_PRIx32
+			"\n", volume, name, status);
 		return false;
+	}
 
 	// check for the existance of a kernel (for our platform)
 	int fd = find_kernel(bootVolume);
+	dprintf("diag: is_bootable(%p \"%s\"): find_kernel: %d\n", volume, name,
+		fd);
 	if (fd < 0)
 		return false;
 

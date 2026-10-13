@@ -1283,6 +1283,7 @@ add_boot_volume_menu()
 			// only list bootable volumes
 			if (volume != sBootVolume->RootDirectory() && !is_bootable(volume))
 				continue;
+			dprintf("diag: menu lists volume %p\n", volume);
 
 			char name[B_FILE_NAME_LENGTH];
 			if (volume->GetName(name, sizeof(name)) == B_OK) {
@@ -1293,6 +1294,9 @@ add_boot_volume_menu()
 		}
 		gRoot->Close(cookie);
 	}
+
+	dprintf("diag: boot volume menu lists %" B_PRId32 " volume(s)\n", count);
+	platform_save_boot_log("boot volume menu");
 
 	if (count == 0) {
 		// no boot volume found yet

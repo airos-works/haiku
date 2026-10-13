@@ -12,11 +12,14 @@
 #include <boot/net/NetStack.h>
 #include <boot/net/RemoteDisk.h>
 
+#include <boot/stdio.h>
+
 #include "Header.h"
 #include "device_path_match.h"
 
 #include "efi_platform.h"
 #include <efi/protocol/block-io.h>
+#include <efi/protocol/device-path-to-text.h>
 #include <efi/protocol/loaded-image.h>
 
 #include "gpt.h"
@@ -34,6 +37,56 @@
 static efi_guid BlockIoGUID = EFI_BLOCK_IO_PROTOCOL_GUID;
 static efi_guid sLoadedImageGUID = EFI_LOADED_IMAGE_PROTOCOL_GUID;
 static efi_guid sDevicePathGUID = EFI_DEVICE_PATH_PROTOCOL_GUID;
+static efi_guid sDevicePathToTextGUID = EFI_DEVICE_PATH_TO_TEXT_PROTOCOL_GUID;
+
+
+// Diagnostic build: prints a device path, as text if the firmware can convert
+// it, else as its nodes (type/subtype/length).
+static void
+diag_print_device_path(const char* label, efi_device_path_protocol* path)
+{
+	if (path == NULL) {
+		dprintf("diag:   %s: (none)\n", label);
+		return;
+	}
+
+	static efi_device_path_to_text_protocol* toText = NULL;
+	static bool lookedUp = false;
+	if (!lookedUp) {
+		lookedUp = true;
+		if (kBootServices->LocateProtocol(&sDevicePathToTextGUID, NULL,
+				(void**)&toText) != EFI_SUCCESS)
+			toText = NULL;
+	}
+
+	if (toText != NULL) {
+		char16_t* text = toText->ConvertDevicePathToText(path, false, false);
+		if (text != NULL) {
+			char buffer[400];
+			size_t i = 0;
+			for (; text[i] != 0 && i < sizeof(buffer) - 1; i++)
+				buffer[i] = text[i] < 0x80 ? (char)text[i] : '?';
+			buffer[i] = '\0';
+			kBootServices->FreePool(text);
+			dprintf("diag:   %s: %s\n", label, buffer);
+			return;
+		}
+	}
+
+	char buffer[400];
+	size_t length = 0;
+	const uint8* node = (const uint8*)path;
+	for (int i = 0; i < 24 && length < sizeof(buffer) - 16; i++) {
+		uint16 nodeLength = node[2] | (node[3] << 8);
+		length += snprintf(buffer + length, sizeof(buffer) - length,
+			"%02x/%02x/%u ", node[0], node[1], nodeLength);
+		if (node[0] == 0x7f || nodeLength < 4)
+			break;
+		node += nodeLength;
+	}
+	buffer[length] = '\0';
+	dprintf("diag:   %s (nodes): %s\n", label, buffer);
+}
 
 
 class EfiDevice : public Node
@@ -84,9 +137,18 @@ EfiDevice::ReadAt(void *cookie, off_t pos, void *buffer, size_t bufferSize)
 	char readBuffer[numBlocks * BlockSize()]
 		__attribute__((aligned(2048)));
 
-	if (fBlockIo->ReadBlocks(fBlockIo, fBlockIo->Media->MediaId,
-		pos, sizeof(readBuffer), readBuffer) != EFI_SUCCESS) {
-		dprintf("%s: blockIo error reading from device!\n", __func__);
+	efi_status status = fBlockIo->ReadBlocks(fBlockIo,
+		fBlockIo->Media->MediaId, pos, sizeof(readBuffer), readBuffer);
+	if (status != EFI_SUCCESS) {
+		static int errors = 0;
+		if (errors++ < 32) {
+			dprintf("%s: blockIo error reading from device! blockIo %p, "
+				"status %#" B_PRIx64 ", LBA %" B_PRIdOFF ", %" B_PRIuSIZE
+				" bytes, buffer %p, media id %" B_PRIu32 ", present %d, "
+				"IoAlign %" B_PRIu32 "\n", __func__, fBlockIo, (uint64)status,
+				pos, sizeof(readBuffer), readBuffer, fBlockIo->Media->MediaId,
+				fBlockIo->Media->MediaPresent, fBlockIo->Media->IoAlign);
+		}
 		return B_ERROR;
 	}
 
@@ -107,12 +169,18 @@ device_contains_partition(EfiDevice *device, boot::Partition *partition)
 			(gpt_table_header*)malloc(blockSize);
 		ssize_t bytesRead = device->ReadAt(NULL, blockSize, deviceHeader,
 			blockSize);
-		if (bytesRead != (ssize_t)blockSize)
+		if (bytesRead != (ssize_t)blockSize) {
+			dprintf("diag: device %p, GPT partition %p: reading the header "
+				"failed\n", device, partition);
 			return false;
+		}
 
 		if (memcmp(deviceHeader, &header->TableHeader(),
-				sizeof(gpt_table_header)) != 0)
+				sizeof(gpt_table_header)) != 0) {
+			dprintf("diag: device %p, GPT partition %p: on another disk\n",
+				device, partition);
 			return false;
+		}
 
 		// partition->cookie == int partition entry index
 		uint32 index = (uint32)(addr_t)partition->cookie;
@@ -133,12 +201,21 @@ device_contains_partition(EfiDevice *device, boot::Partition *partition)
 					return true;
 
 		// Our partition has an EFI header, but we couldn't find one, so bail
+		dprintf("diag: device %p, GPT partition %p: not BFS\n", device,
+			partition);
 		return false;
 	}
 
-	if ((partition->offset + partition->size) <= device->Size())
-			return true;
+	if ((partition->offset + partition->size) <= device->Size()) {
+		dprintf("diag: device %p: partition %p (offset %" B_PRIdOFF ", size %"
+			B_PRIdOFF ") is a boot partition candidate\n", device, partition,
+			partition->offset, partition->size);
+		return true;
+	}
 
+	dprintf("diag: device %p: partition %p (offset %" B_PRIdOFF ", size %"
+		B_PRIdOFF ") ends past the device (%" B_PRIdOFF ")\n", device, partition,
+		partition->offset, partition->size, device->Size());
 	return false;
 }
 
@@ -181,6 +258,25 @@ platform_add_boot_device(struct stage2_args *args, NodeList *devicesList)
 	EfiDevice* preferredDisk = NULL;
 	size_t bestPrefixLength = 0;
 
+	{
+		char vendor[64];
+		size_t i = 0;
+		for (; kSystemTable->FirmwareVendor != NULL
+				&& kSystemTable->FirmwareVendor[i] != 0
+				&& i < sizeof(vendor) - 1; i++) {
+			vendor[i] = kSystemTable->FirmwareVendor[i] < 0x80
+				? (char)kSystemTable->FirmwareVendor[i] : '?';
+		}
+		vendor[i] = '\0';
+		dprintf("diag: firmware \"%s\" revision %#" B_PRIx32 ", UEFI %#"
+			B_PRIx32 "\n", vendor, kSystemTable->FirmwareRevision,
+			kSystemTable->Hdr.Revision);
+	}
+	dprintf("diag: loader started from device handle %p\n", imageDevice);
+	diag_print_device_path("device", imagePath);
+	diag_print_device_path("file", loadedImage != NULL
+		? loadedImage->FilePath : NULL);
+
 	// Read to zero sized buffer to get memory needed for handles
 	if (kBootServices->LocateHandle(ByProtocol, &BlockIoGUID, 0, &memSize, 0)
 			!= EFI_BUFFER_TOO_SMALL)
@@ -202,25 +298,39 @@ platform_add_boot_device(struct stage2_args *args, NodeList *devicesList)
 				(void**)&blockIo) != EFI_SUCCESS)
 			panic("Cannot get block device handle!");
 
-		TRACE("%s: %p: present: %s, logical: %s, removeable: %s, "
-			"blocksize: %" PRIu32 ", lastblock: %" PRIu64 "\n",
-			__func__, blockIo,
-			blockIo->Media->MediaPresent ? "true" : "false",
-			blockIo->Media->LogicalPartition ? "true" : "false",
-			blockIo->Media->RemovableMedia ? "true" : "false",
-			blockIo->Media->BlockSize, blockIo->Media->LastBlock);
+		dprintf("diag: block device %" B_PRIu32 "/%" B_PRIu32 ": handle %p, "
+			"blockIo %p, rev %#" B_PRIx64 ", present %d, logical %d, "
+			"removable %d, read-only %d, block size %" B_PRIu32 ", last block %"
+			B_PRIu64 ", IoAlign %" B_PRIu32 ", media id %" B_PRIu32 "\n",
+			n, noOfHandles, handles[n], blockIo, blockIo->Revision,
+			blockIo->Media->MediaPresent, blockIo->Media->LogicalPartition,
+			blockIo->Media->RemovableMedia, blockIo->Media->ReadOnly,
+			blockIo->Media->BlockSize, blockIo->Media->LastBlock,
+			blockIo->Media->IoAlign, blockIo->Media->MediaId);
+		{
+			efi_device_path_protocol* path = NULL;
+			if (kBootServices->HandleProtocol(handles[n], &sDevicePathGUID,
+					(void**)&path) != EFI_SUCCESS)
+				path = NULL;
+			diag_print_device_path("path", path);
+		}
 
 		if (!blockIo->Media->MediaPresent
 			|| blockIo->Media->LogicalPartition
-			|| blockIo->Media->BlockSize == 0)
+			|| blockIo->Media->BlockSize == 0) {
+			dprintf("diag:   skipped (no media, a partition, or no block "
+				"size)\n");
 			continue;
+		}
 
 		// The qemu flash device with a 256K block sizes sometime show up
 		// in edk2. If flash is unconfigured, bad things happen on arm.
 		// edk2 bug: https://bugzilla.tianocore.org/show_bug.cgi?id=2856
 		// We're not ready for flash devices in efi, so skip anything odd.
-		if (blockIo->Media->BlockSize > 8192)
+		if (blockIo->Media->BlockSize > 8192) {
+			dprintf("diag:   skipped (block size)\n");
 			continue;
+		}
 
 		EfiDevice *device = new(std::nothrow)EfiDevice(blockIo);
 		if (device == NULL)
@@ -228,6 +338,8 @@ platform_add_boot_device(struct stage2_args *args, NodeList *devicesList)
 		devicesList->Insert(device);
 		if (firstDisk == NULL)
 			firstDisk = device;
+		dprintf("diag:   added as device %p (%" B_PRIdOFF " bytes)\n", device,
+			device->Size());
 
 		efi_device_path_protocol* diskPath = NULL;
 		size_t prefixLength = 0;
@@ -250,6 +362,8 @@ platform_add_boot_device(struct stage2_args *args, NodeList *devicesList)
 		devicesList->Remove(preferredDisk);
 		devicesList->InsertBefore(firstDisk, preferredDisk);
 	}
+	dprintf("diag: %" B_PRId32 " disk(s); the loader's disk: %p, first: %p\n",
+		devicesList->Count(), preferredDisk, firstDisk);
 
 	return devicesList->Count() > 0 ? B_OK : B_ENTRY_NOT_FOUND;
 }
