@@ -62,6 +62,8 @@ get_accelerant_hook(uint32 feature, void* data)
 			return (void*)amdgpu_set_display_layout;
 		case B_SET_DISPLAY_CHANGE_PORT:
 			return (void*)amdgpu_set_display_change_port;
+		case B_WAIT_FOR_DISPLAY_RESTORE:
+			return (void*)amdgpu_wait_for_display_restore;
 
 		case B_SET_CURSOR_BITMAP:
 			return (void*)amdgpu_set_cursor_bitmap;

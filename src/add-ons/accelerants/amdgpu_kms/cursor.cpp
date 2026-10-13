@@ -6,6 +6,7 @@
 
 #include "accelerant.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 
@@ -61,15 +62,20 @@ amdgpu_set_cursor_bitmap(uint16 width, uint16 height, uint16 hotX,
 			return status;
 	}
 	// B_RGBA32 is ARGB8888 in memory; app_server premultiplies it
-	uint8* bits = (uint8*)gInfo->cursor.address;
+	if (gInfo->cursorImage == NULL) {
+		gInfo->cursorImage = (uint32*)malloc(kCursorSize * kCursorSize * 4);
+		if (gInfo->cursorImage == NULL)
+			return B_NO_MEMORY;
+	}
 	for (uint32 y = 0; y < kCursorSize; y++) {
-		uint32* row = (uint32*)(bits + y * gInfo->cursor.pitch);
+		uint32* row = gInfo->cursorImage + y * kCursorSize;
 		if (y < height) {
 			memcpy(row, data + y * bytesPerRow, width * 4);
 			memset(row + width, 0, (kCursorSize - width) * 4);
 		} else
 			memset(row, 0, kCursorSize * 4);
 	}
+	restore_cursor_image();
 	gInfo->cursorHotX = hotX;
 	gInfo->cursorHotY = hotY;
 	gInfo->cursorSet = false;
@@ -86,6 +92,46 @@ amdgpu_set_cursor_bitmap(uint16 width, uint16 height, uint16 hotX,
 	}
 	update_cursor();
 	return B_OK;
+}
+
+
+/*!	Writes the cursor image into the cursor's buffer (in video memory). */
+void
+restore_cursor_image(void)
+{
+	if (gInfo->cursorImage == NULL || gInfo->cursor.address == NULL)
+		return;
+	uint8* bits = (uint8*)gInfo->cursor.address;
+	for (uint32 y = 0; y < kCursorSize; y++) {
+		memcpy(bits + y * gInfo->cursor.pitch,
+			gInfo->cursorImage + y * kCursorSize, kCursorSize * 4);
+	}
+}
+
+
+/*!	Video memory is lost when amdgpu resets the GPU (after a hang): the
+	frame buffer and the cursor have to be drawn again. Returns B_OK when that
+	happened (app_server then redraws everything), B_TIMED_OUT when it did not
+	within \a timeout. */
+extern "C" status_t
+amdgpu_wait_for_display_restore(bigtime_t timeout)
+{
+	if (gInfo->isClone)
+		return B_NOT_ALLOWED;
+	bigtime_t end = system_time() + timeout;
+	do {
+		uint32 lost;
+		if (Kms::VramLostCounter(gInfo->device, lost) == B_OK
+			&& lost != gInfo->vramLost) {
+			gInfo->vramLost = lost;
+			debug_printf("amdgpu_kms: video memory was lost (GPU reset); "
+				"the screen is drawn again\n");
+			restore_cursor_image();
+			return B_OK;
+		}
+		snooze(100000);
+	} while (system_time() < end);
+	return B_TIMED_OUT;
 }
 
 
