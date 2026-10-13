@@ -129,13 +129,36 @@ get_settings_from_file()
 }
 
 
+/*!	Whether all the audio group's outputs are digital: the audio of a graphics
+	card's HDMI and DisplayPort connectors, which is silent unless a display
+	with speakers is connected.
+*/
+static bool
+is_display_audio(hda_audio_group* audioGroup)
+{
+	bool hasOutput = false;
+	for (uint32 i = 0; i < audioGroup->widget_count; i++) {
+		hda_widget& widget = audioGroup->widgets[i];
+		if (widget.type != WT_AUDIO_OUTPUT)
+			continue;
+		if ((widget.capabilities.audio & AUDIO_CAP_DIGITAL) == 0)
+			return false;
+		hasOutput = true;
+	}
+	return hasOutput;
+}
+
+
 static status_t
 get_description(hda_audio_group* audioGroup, multi_description* data)
 {
 	data->interface_version = B_CURRENT_INTERFACE_VERSION;
 	data->interface_minimum = B_CURRENT_INTERFACE_VERSION;
 
-	strcpy(data->friendly_name, "HD Audio");
+	// The media server prefers other outputs to these when the user has not
+	// chosen one: a laptop's speakers, not its graphics card's HDMI.
+	strcpy(data->friendly_name,
+		is_display_audio(audioGroup) ? "HD Audio (HDMI)" : "HD Audio");
 	strcpy(data->vendor_info, "Haiku");
 
 	int32 inChannels = 0;
