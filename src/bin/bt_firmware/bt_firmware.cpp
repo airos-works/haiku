@@ -21,6 +21,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
+
 #include "BluetoothFirmware.h"
 #include "IntelBluetoothFirmware.h"
 #include "RealtekBluetoothFirmware.h"
@@ -28,6 +30,7 @@
 
 
 bool gVerbose = false;
+bool gControllerReset = false;
 
 
 enum Vendor {
@@ -182,7 +185,38 @@ SetupDevice(const char* path, bool infoOnly)
 	}
 	if (ok && !infoOnly)
 		LOG("%s: ready\n", path);
+	if (!ok && gControllerReset)
+		return kExitRetryAfterReset;
 	return ok ? 0 : 1;
+}
+
+
+/*!	Each controller gets its own process: a transfer that never completes
+	can only be ended by the watchdog signal terminating it.
+*/
+static int
+RunSetup(const std::string& path, bool info)
+{
+	fflush(stdout);
+	fflush(stderr);
+	const pid_t child = fork();
+	if (child == 0) {
+		const int result = SetupDevice(path.c_str(), info);
+		fflush(stdout);
+		fflush(stderr);
+		_exit(result);
+	}
+	int status = 0;
+	if (child < 0 || waitpid(child, &status, 0) != child)
+		return 1;
+	if (WIFSIGNALED(status)) {
+		ERROR("%s: %s\n", path.c_str(),
+			WTERMSIG(status) == SIGALRM
+				? "the controller stopped answering (timeout)"
+				: "setup crashed");
+		return 1;
+	}
+	return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
 
 
@@ -280,32 +314,46 @@ main(int argc, char** argv)
 		return 0;
 	}
 
-	// Each controller gets its own process: a transfer that never completes
-	// can only be ended by the watchdog signal terminating it.
 	int failures = 0;
+	std::vector<std::string> ready;
+	bool retry = false;
 	for (size_t i = 0; i < devices.size(); i++) {
-		fflush(stdout);
-		fflush(stderr);
-		const pid_t child = fork();
-		if (child == 0) {
-			const int result = SetupDevice(devices[i].c_str(), info);
-			fflush(stdout);
-			fflush(stderr);
-			_exit(result);
+		const int result = RunSetup(devices[i], info);
+		if (result == 0)
+			ready.push_back(devices[i]);
+		else if (result == kExitRetryAfterReset)
+			retry = true;
+		else
+			failures++;
+	}
+
+	if (retry) {
+		// A controller reset after a failed download comes back as a new USB
+		// device (with a new path, perhaps): give it one more try.
+		std::vector<std::string> again;
+		for (int attempt = 0; attempt < 20; attempt++) {
+			usleep(500000);
+			again.clear();
+			std::vector<std::string> found;
+			FindControllers("/dev/bus/usb", found);
+			for (size_t i = 0; i < found.size(); i++) {
+				if (std::find(ready.begin(), ready.end(), found[i])
+						== ready.end()) {
+					again.push_back(found[i]);
+				}
+			}
+			if (!again.empty() && attempt >= 2)
+				break;
 		}
-		int status = 0;
-		if (child < 0 || waitpid(child, &status, 0) != child) {
+		if (again.empty()) {
+			ERROR("the reset controller did not come back\n");
 			failures++;
-			continue;
 		}
-		if (WIFSIGNALED(status)) {
-			ERROR("%s: %s\n", devices[i].c_str(),
-				WTERMSIG(status) == SIGALRM
-					? "the controller stopped answering (timeout)"
-					: "setup crashed");
-			failures++;
-		} else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
-			failures++;
+		for (size_t i = 0; i < again.size(); i++) {
+			LOG("%s: trying again after the reset\n", again[i].c_str());
+			if (RunSetup(again[i], info) != 0)
+				failures++;
+		}
 	}
 	return failures == 0 ? 0 : 1;
 }
