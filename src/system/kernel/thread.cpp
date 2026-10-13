@@ -141,7 +141,7 @@ public:
 
 	void Notify(uint32 eventCode, Thread* thread)
 	{
-		return Notify(eventCode, thread->id, thread->team->id, thread);
+		return Notify(eventCode, thread->team->id, thread->id, thread);
 	}
 };
 
