@@ -13,26 +13,26 @@ local unavailableBuildFeatures ;
 
 
 rule ExtractArm64ImageLibraryBuildFeature feature : package : version : library
-	: headers
+	: headers : packageDirectory
 {
 	# ExtractArm64ImageLibraryBuildFeature <feature> : <package> : <version>
-	#	: <library> [ : <header directories> ] ;
+	#	: <library> [ : <header directories> [ : <package directory> ] ] ;
 	# The arm64 bootstrap repository has no image libraries. The pinned
 	# packages of tools/rpi4/build-image-libs.sh in
-	# HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR stand in for HaikuPorts' <package>
-	# and <package>_devel, the same way as zstd's below. <library> is the
-	# file in lib/ to link against; <header directories> default to
-	# develop/headers.
+	# HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR (or air/OS CI's builds of the same
+	# packages in <package directory>) stand in for HaikuPorts' <package> and
+	# <package>_devel, the same way as zstd's below. <library> is the file in
+	# lib/ to link against; <header directories> default to develop/headers.
 	headers ?= develop/headers ;
-	local packageDirectory = $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) ;
+	packageDirectory ?= $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) ;
 	local base = [ FDirName $(packageDirectory)
 		$(package)-$(version)-arm64.hpkg ] ;
 	local devel = [ FDirName $(packageDirectory)
 		$(package)_devel-$(version)-arm64.hpkg ] ;
 	if ! [ Glob $(packageDirectory) : $(base:BS) ]
 		|| ! [ Glob $(packageDirectory) : $(devel:BS) ] {
-		Exit "Missing arm64 $(package) packages; run"
-			"tools/rpi4/build-image-libs.sh" ;
+		Exit "Missing arm64 $(package) packages in $(packageDirectory); run"
+			"tools/rpi4/build-image-libs.sh (air/OS CI: deps/recipes)" ;
 	}
 	local directory = [ FDirName $(HAIKU_OPTIONAL_BUILD_PACKAGES_DIR)
 		airos-$(package)-$(version)-arm64 ] ;
@@ -310,9 +310,9 @@ if [ IsPackageAvailable libvorbis_devel ] {
 # Freetype
 if $(HAIKU_ARM64_FREETYPE_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = arm64 {
 	# The arm64 repository has only the bootstrap FreeType 2.6.3. air/OS
-	# builds a current one as HaikuPorts' freetype and freetype_devel
-	# (airos-ci deps/recipes/freetype.sh); the top Jamfile puts this freetype
-	# package in the image instead of the repository's.
+	# builds 2.14.3 as HaikuPorts does for x86_64, as freetype and
+	# freetype_devel (airos-ci deps/recipes/freetype.sh); the top Jamfile puts
+	# this freetype package in the image instead of the repository's.
 	local packageDirectory = $(HAIKU_ARM64_FREETYPE_PACKAGES_DIR) ;
 	local base = [ Glob $(packageDirectory) : freetype-*-arm64.hpkg ] ;
 	local devel = [ Glob $(packageDirectory) : freetype_devel-*-arm64.hpkg ] ;
@@ -447,7 +447,12 @@ if $(HAIKU_SUMMIT_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = x86_64 {
 
 
 # libpng
-if $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = arm64 {
+if $(HAIKU_ARM64_LIBPNG_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = arm64 {
+	# air/OS CI's libpng16 (airos-ci deps/recipes/libpng.sh), the same build
+	# as the lab's image library.
+	ExtractArm64ImageLibraryBuildFeature libpng : libpng16 : 1.6.44-1
+		: libpng16.so.16.44.0 : : $(HAIKU_ARM64_LIBPNG_PACKAGES_DIR) ;
+} else if $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = arm64 {
 	ExtractArm64ImageLibraryBuildFeature libpng : libpng16 : 1.6.44-1
 		: libpng16.so.16.44.0 ;
 } else if [ IsPackageAvailable libpng16_devel ] {
