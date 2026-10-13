@@ -54,15 +54,42 @@ Known limits:
   H.264 and HEVC Main 10, Vulkan, windows and decoders killed mid-frame,
   Wayland windows) clean with every picture exact.
 - Hangs under one load: decoding into video memory (VL_VIDEO_BUFFER_GTT=0)
-  beside three Vulkan programs stopped the machine twice, once before and
-  once after the memory clock fix (about once in 40 minutes of that load;
-  20 minutes of gpu-soak.sh just before were clean). No network, no disk
-  activity, nothing in the syslog; the driver's synced log (drmparam
-  log_file) ended with "Fence fallback timer expired" on the gfx and sdma0
-  rings (missed fence interrupts), then nothing. A power cycle brings it
-  back. Everything stopping at once points to the kernel debugger; since
-  linux-drm ffc8db7 its console is drawn on the screen at the desktop's top
-  left (DP-4 here), so the next one shows its cause there.
+  beside three Vulkan programs stopped the machine nine times, after 40 to
+  50 minutes each - no network, no disk, nothing in the syslog. The cause
+  was the compat layer's thread -> task table. Every Haiku thread that
+  calls into Linux code gets a task ("current"); a THREAD_REMOVED listener
+  frees it. Haiku's ThreadNotificationService::Notify(uint32, Thread*) has
+  passed the thread and team IDs the wrong way round since 2010, so the
+  listener freed the team's main thread's task (while it ran on) and never
+  any other thread's. The table was open addressing whose deleted slots
+  never became free again, looked up on every "current" under a global
+  spinlock with interrupts disabled: once 8192 threads had registered,
+  every lookup of a new thread walked all of it and registering failed, so
+  such threads got a new task at every "current" (~180000 allocations a
+  second), CPUs spun with interrupts off, and the machine stopped. Fixed in
+  linux-drm 608a7cc (the listener takes the thread from the event's Thread,
+  and the table has chains); the kernel's notification is fixed in the
+  Haiku fork's fffb079c8f. Since then the same load ran 2 h 7 min clean
+  (kernel allocations flat, 1 picture of 1700 runs not exact).
+  Found on the way, and fixed too: amdgpu never freed a closed file's
+  contexts (5d2bcaa: the compat IDR's idr_get_next() underflowed for IDRs
+  with base 1, so idr_for_each_entry() found nothing - their scheduler
+  entities piled up in the run queues with 32 fences each), and buffers
+  mapped into teams kept the page frames they had when they were mapped,
+  so after TTM moved a buffer the team read and wrote memory that was no
+  longer the buffer's (eefd858; see the trap below).
+  Lab tools that found them: `drmparam haiku_watchdog_ms 1000` (with
+  log_file) logs every second the interrupts and rings, the kmalloc() call
+  sites with the most objects alive, the kmem caches, and Haiku's threads,
+  ports and semaphores, and what the interrupt thread waits for when it is
+  slow; `drmparam haiku_track_objects 1` then `drmparam haiku_fence_report
+  1` lists the scheduler fences alive by scheduler and client, the files
+  and contexts open, TTM's buffers and the schedulers' jobs.
+- Open: twice, the first boot after `x399-install.sh` (the staged binary
+  swapped in under the running driver, "devfs: reload driver amdgpu_drm")
+  stopped right after that reload line; both outgoing builds counted
+  kmalloc() call sites. A second power cycle starts normally. Normal boots
+  and package installs do not reload the driver.
 - Boot safety: the driver keeps a marker
   (`~/config/settings/kernel/drivers/amdgpu_drm.starting`) from its start
   until the GPU has run for 30 s; a boot that finds it leaves the GPU to the
@@ -201,6 +228,14 @@ In `src/forks/linux-drm/haiku/tests`, built on the workstation:
   without anybody at the machine (`DRM_HAIKU_IOCTL_FORCE_CONNECTOR`)
 - `amdgpu_churn [seconds] [pool]`: buffer objects made, moved and freed
   with no GPU work of their own (VRAM moves, evictions, clears)
+- `amdgpu_mapmove [rounds] [--read-only]`: mapped VRAM buffers pushed out
+  of the CPU-visible window; checks what the old mappings read and that
+  what they write lands in the buffer (`--read-only` is safe on a driver
+  whose mappings go stale)
+- `fakemap [seconds]`, in a virtual machine (`haiku/tools/qemu-vm.sh`,
+  "haiku_selftest 2" in the driver settings): the same for the fake
+  device's buffers, whose "move" poisons the old pages - clones, fork(),
+  areas deleted by the team, moves racing with writes and new mappings
 - `drmparam NAME VALUE`: a module parameter of the running driver
   (`DRM_HAIKU_IOCTL_SET_PARAM`); `drmparam debug 0x16` around a refused
   mode set logs amdgpu_dm's reason (and fills the syslog quickly),
@@ -231,6 +266,17 @@ add-on print its per-picture costs.
   `util/futex` emulates it.
 - RADV maps buffer objects with `mmap()` on the device, which Haiku cannot
   do: on Haiku it uses `drmHaikuMmap()`.
+- **A mapping has to follow its buffer.** TTM moves buffers whenever it
+  likes (evictions, the CPU-visible window, back into VRAM for a command
+  submission) and calls `unmap_mapping_range()` first; a mapping that keeps
+  the old page frames reads and writes VRAM that belongs to another buffer
+  by then, or RAM TTM has given back. Each `DRM_HAIKU_IOCTL_MAP` mapping is
+  therefore an area on a cache of the driver's own (`BufferCache` in
+  driver.cpp) whose `Fault()` runs the buffer's Linux fault handler, and
+  the hook unmaps the moved pages from every area of it. The handler waits
+  for the buffer's reservation, which TTM holds while it unmaps, so it runs
+  with the cache unlocked and a generation number says whether the buffer
+  moved meanwhile.
 - Mesa made a new staging buffer for every `vaGetImage()`, and FFmpeg a new
   image for every picture: on this kernel the allocations cost more than the
   copies (1080p HEVC Main 10 33 -> 9.6 ms a picture once both were kept).
