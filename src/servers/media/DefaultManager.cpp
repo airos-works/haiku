@@ -486,6 +486,23 @@ DefaultManager::_FindPhysical(volatile media_node_id *id, uint32 default_type,
 	for (int i = 0; i < count; i++)
 		TRACE("info[%d].name %s\n", i, info[i].name);
 
+	// Without a saved default, the audio of a graphics card's HDMI and
+	// DisplayPort connectors comes last: it is silent unless a display with
+	// speakers is connected, and it is often found before the speakers.
+	if (isAudio && !isInput && msg == NULL) {
+		live_node_info ordered[MAX_NODE_INFOS];
+		int orderedCount = 0;
+		for (int pass = 0; pass < 2; pass++) {
+			for (int i = 0; i < count; i++) {
+				bool display = strstr(info[i].name, "(HDMI)") != NULL;
+				if (display == (pass == 1))
+					ordered[orderedCount++] = info[i];
+			}
+		}
+		for (int i = 0; i < count; i++)
+			info[i] = ordered[i];
+	}
+
 	for (int i = 0; i < count; i++) {
 		if (isAudio) {
 			if (isInput) {
@@ -519,8 +536,15 @@ DefaultManager::_FindPhysical(volatile media_node_id *id, uint32 default_type,
 			}
 			// (The flavor IDs of video devices that are plugged in, cameras,
 			// are given out in the order they turn up: go by their name.)
+			// (A default saved before the HDA driver called its HDMI devices
+			// "HD Audio (HDMI)" has their old name, "HD Audio".)
+			size_t savedLength = strlen(msgDninfo.name);
+			bool sameName = strcmp(dninfo.name, msgDninfo.name) == 0
+				|| (isAudio && strncmp(dninfo.name, msgDninfo.name,
+						savedLength) == 0
+					&& strcmp(dninfo.name + savedLength, " (HDMI)") == 0);
 			if ((isAudio && dninfo.flavor_id != msgDninfo.flavor_id)
-				|| strcmp(dninfo.name, msgDninfo.name) != 0) {
+				|| !sameName) {
 				ERROR("Doesn't match flavor or name\n");
 				continue;
 			}
