@@ -93,9 +93,10 @@ Known limits:
   `/boot/home/kdl_capture.log` - a panic reads like a crash log after the
   next boot (lab use: it also leaves every panic). `log_file` now appends
   after the text already in the file, with times since boot, and the driver
-  writes a line a second around the file system into its last MiB after the
-  start (the last one dates a whole-machine freeze); `trace_calls 2` traces
-  the calls of the stop (TRACE_CALLS also takes compat/ and glue/ files).
+  writes a heartbeat around the file system into its last MiB after the
+  start, as a ring (every second for two minutes, then every 10 s; the
+  newest line dates a whole-machine freeze); `trace_calls 2` traces the
+  calls of the stop (TRACE_CALLS also takes compat/ and glue/ files).
 - The first boot after `x399-install.sh` died most of the time (2026-10-13/14),
   right after "devfs: reload driver amdgpu_drm": devfs stopped the GPU it
   had just started and started it again. devfs reloads a driver none of
@@ -117,6 +118,12 @@ Known limits:
   work when stopped, and a start by devfs' kernel daemon while app_server
   runs (an installation onto a desktop on the framebuffer driver) waits for
   the next boot. Four installation boots since, each one start, no reload.
+  To check an installation: no "devfs: reload driver amdgpu_drm" in the
+  syslog, and the kernel team holding `/dev/dri/renderD128` open (the
+  driver's "keeping ... open" line can be lost from the syslog when the
+  kernel's buffer overflows early in a boot, as on the Framework 13).
+  A panic within 30 s of the start - anyone's - leaves the start marker
+  (the Framework 13's cpuidle swap did): delete it after such a crash.
 - Open: stopping the GPU soon after its start can free a kthread's task
   twice (the panic above); with the device kept open nothing stops a
   running GPU any more, but a failed start's cleanup still takes that path.
