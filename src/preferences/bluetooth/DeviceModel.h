@@ -103,6 +103,9 @@ struct NearbyDevice {
 			bool				IsHID() const;
 			bool				UsesLEPairing() const;
 			bool				CanConnect() const;
+			// Classic devices, and LE ones that are HID; other LE devices
+			// (beacons, speakers' setup channels) are only listed on request.
+			bool				IsSupported() const;
 			bool				InPairingMode() const;
 			bool				NeedsNameLookup() const;
 			bool				IsCompanionOf(const NearbyDevice& other) const;
