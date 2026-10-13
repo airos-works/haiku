@@ -182,6 +182,10 @@ acpi_std_ops(int32 op,...)
 			void *settings;
 			bool acpiDisabled = false;
 			AcpiGbl_CopyDsdtLocally = true;
+			// As Linux (unless "acpi=strict") and Windows: implicit returns
+			// and the like. AMD's ALIB, called by the Framework 13's _PSR,
+			// stores the result of a method that returns nothing.
+			AcpiGbl_EnableInterpreterSlack = true;
 
 			settings = load_driver_settings("kernel");
 			if (settings != NULL) {
