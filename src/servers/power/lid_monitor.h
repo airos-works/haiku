@@ -12,9 +12,12 @@
 #include "power_monitor.h"
 
 
+class PowerPolicy;
+
+
 class LidMonitor : public PowerMonitor {
 public:
-								LidMonitor();
+								LidMonitor(PowerPolicy* policy);
 	virtual	 					~LidMonitor();
 
 	virtual	void				HandleEvent(int fd);
@@ -23,6 +26,7 @@ public:
 								FDs() const { return fFDs; }
 private:
 			std::set<int>		fFDs;
+			PowerPolicy*		fPolicy;
 };
 
 

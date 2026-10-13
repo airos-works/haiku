@@ -8,6 +8,8 @@
 
 #include "lid_monitor.h"
 
+#include "power_policy.h"
+
 #include <Messenger.h>
 #include <Roster.h>
 
@@ -16,11 +18,15 @@
 #include <RosterPrivate.h>
 
 
-LidMonitor::LidMonitor()
+LidMonitor::LidMonitor(PowerPolicy* policy)
+	:
+	fPolicy(policy)
 {
 	int fd = open("/dev/power/acpi_lid/0", O_RDONLY);
-	if (fd > 0)
+	if (fd > 0) {
 		fFDs.insert(fd);
+		HandleEvent(fd);
+	}
 }
 
 
@@ -38,6 +44,5 @@ LidMonitor::HandleEvent(int fd)
 	if (read(fd, &status, 1) != 1)
 		return;
 
-	if (status == 1)
-		printf("lid status 1\n");
+	fPolicy->SetLidOpen(status != 0);
 }
