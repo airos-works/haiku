@@ -277,6 +277,11 @@ apic_set_lvt_timer_divide_config(uint32 config)
 status_t
 apic_init(kernel_args *args)
 {
+	// Not known until the MADT is read (ioapic_init()), which happens before
+	// the application processors set up their local APICs.
+	for (uint32 i = 0; i < args->num_cpus; i++)
+		gCPU[i].arch.acpi_processor_id = -1;
+
 	if (args->arch_args.apic == NULL)
 		return B_NO_INIT;
 
@@ -339,8 +344,6 @@ apic_per_cpu_init(kernel_args *args, int32 cpu)
 		gCPU[cpu].arch.logical_apic_id >>= 24;
 	TRACE("CPU %" B_PRId32 ": logical apic id: %#" B_PRIx32 "\n", cpu,
 		gCPU[cpu].arch.logical_apic_id);
-
-	gCPU[cpu].arch.acpi_processor_id = -1;
 
 	/* set spurious interrupt vector to 0xff */
 	uint32 config = apic_spurious_intr_vector() & 0xffffff00;

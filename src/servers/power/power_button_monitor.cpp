@@ -10,6 +10,8 @@
 
 #include "power_button_monitor.h"
 
+#include "power_policy.h"
+
 #include <string.h>
 
 #include <Directory.h>
@@ -23,9 +25,10 @@
 static const char* kBasePath = "/dev/power/button";
 
 
-PowerButtonMonitor::PowerButtonMonitor()
+PowerButtonMonitor::PowerButtonMonitor(PowerPolicy* policy)
 	:
-	fFDs()
+	fFDs(),
+	fPolicy(policy)
 {
 	BDirectory dir;
 	if (dir.SetTo(kBasePath) != B_OK)
@@ -58,7 +61,8 @@ PowerButtonMonitor::HandleEvent(int fd)
 	if (read(fd, &button_pressed, 1) != 1)
 		return;
 
-	if (button_pressed) {
+	// (the press that woke the machine is not one to shut it down)
+	if (button_pressed && !fPolicy->JustWokeUp()) {
 		BRoster roster;
 		BRoster::Private rosterPrivate(roster);
 

@@ -10,9 +10,12 @@
 #include "ac_monitor.h"
 #include "lid_monitor.h"
 #include "power_button_monitor.h"
+#include "power_policy.h"
 #include "thermal_trip_monitor.h"
 
 #include <Server.h>
+
+#include <PathMonitor.h>
 
 #include <map>
 
@@ -21,11 +24,15 @@ class PowerManagementDaemon : public BServer {
 public:
 								PowerManagementDaemon();
 	virtual 					~PowerManagementDaemon();
+
+	virtual	void				MessageReceived(BMessage* message);
+
 private:
 			void				_EventLoop();
 	static	status_t			_EventLooper(void *arg);
 
 			thread_id			fEventThread;
+			PowerPolicy			fPolicy;
 			PowerMonitor*		fPowerMonitors[4];
 			uint32				fMonitorCount;
 
@@ -46,22 +53,23 @@ main(void)
 PowerManagementDaemon::PowerManagementDaemon()
 	:
 	BServer("application/x-vnd.Haiku-powermanagement", false, NULL),
+	fPolicy(this),
 	fMonitorCount(0),
 	fQuitRequested(false)
 {
-	PowerMonitor* powerButtonMonitor = new PowerButtonMonitor;
+	PowerMonitor* powerButtonMonitor = new PowerButtonMonitor(&fPolicy);
 	if (powerButtonMonitor->FDs().size() > 0)
 		fPowerMonitors[fMonitorCount++] = powerButtonMonitor;
 	else
 		delete powerButtonMonitor;
 
-	PowerMonitor* lidMonitor = new LidMonitor;
+	PowerMonitor* lidMonitor = new LidMonitor(&fPolicy);
 	if (lidMonitor->FDs().size() > 0)
 		fPowerMonitors[fMonitorCount++] = lidMonitor;
 	else
 		delete lidMonitor;
 
-	PowerMonitor* acMonitor = new ACMonitor;
+	PowerMonitor* acMonitor = new ACMonitor(&fPolicy);
 	if (acMonitor->FDs().size() > 0)
 		fPowerMonitors[fMonitorCount++] = acMonitor;
 	else
@@ -72,6 +80,13 @@ PowerManagementDaemon::PowerManagementDaemon()
 		fPowerMonitors[fMonitorCount++] = thermalMonitor;
 	else
 		delete thermalMonitor;
+
+	// the Power preferences change the settings file
+	const char* settingsPath = PowerPolicy::SettingsPath();
+	if (settingsPath != NULL) {
+		BPrivate::BPathMonitor::StartWatching(settingsPath,
+			B_WATCH_STAT | B_WATCH_FILES_ONLY, BMessenger(this));
+	}
 
 	fEventThread = spawn_thread(_EventLooper, "_power_daemon_event_loop_",
 		B_NORMAL_PRIORITY, this);
@@ -92,6 +107,18 @@ PowerManagementDaemon::~PowerManagementDaemon()
 		delete fPowerMonitors[i];
 	status_t status;
 	wait_for_thread(fEventThread, &status);
+}
+
+
+void
+PowerManagementDaemon::MessageReceived(BMessage* message)
+{
+	if (message->what == B_PATH_MONITOR) {
+		fPolicy.LoadSettings();
+		return;
+	}
+
+	BServer::MessageReceived(message);
 }
 
 

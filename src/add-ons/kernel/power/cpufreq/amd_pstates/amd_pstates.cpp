@@ -76,8 +76,10 @@ set_normal_pstate(void* /* dummy */, int cpu)
 
 	uint64 request = AMD_CPPC_MIN_PERF(sHWPEfficient);
 	request |= AMD_CPPC_MAX_PERF(sAvoidBoost ? sHWPGuaranteed : sHWPHighest);
+	// (In power saving mode the hardware is asked to favour efficiency, as
+	// Linux's "balance_power": on a laptop's battery that matters.)
 	request |= AMD_CPPC_EPP_PERF(
-		sAvoidBoost ? AMD_CPPC_EPP_BALANCE_PERFORMANCE : AMD_CPPC_EPP_PERFORMANCE);
+		sAvoidBoost ? AMD_CPPC_EPP_BALANCE_POWERSAVE : AMD_CPPC_EPP_PERFORMANCE);
 	x86_write_msr(MSR_AMD_CPPC_REQ, request & 0xffffffff);
 }
 

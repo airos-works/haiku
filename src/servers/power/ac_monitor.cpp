@@ -8,17 +8,23 @@
 
 #include "ac_monitor.h"
 
+#include "power_policy.h"
+
 #include <Messenger.h>
 #include <Roster.h>
 
 #include <stdio.h>
 
 
-ACMonitor::ACMonitor()
+ACMonitor::ACMonitor(PowerPolicy* policy)
+	:
+	fPolicy(policy)
 {
 	int fd = open("/dev/power/acpi_ac/0", O_RDONLY);
-	if (fd > 0)
+	if (fd > 0) {
 		fFDs.insert(fd);
+		HandleEvent(fd);
+	}
 }
 
 
@@ -36,6 +42,5 @@ ACMonitor::HandleEvent(int fd)
 	if (read(fd, &status, 1) != 1)
 		return;
 
-	if (status == 1)
-		printf("ac status 1\n");
+	fPolicy->SetOnAC(status != 0);
 }

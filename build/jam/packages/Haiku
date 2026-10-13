@@ -111,6 +111,7 @@ AddFilesToPackage add-ons kernel power cpufreq :
 	intel_pstates@x86,x86_64
 	;
 AddFilesToPackage add-ons kernel power cpuidle :
+	x86_acpi_cstates@x86,x86_64
 	x86_cstates@x86,x86_64
 	;
 

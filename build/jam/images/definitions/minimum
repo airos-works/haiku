@@ -185,6 +185,7 @@ SYSTEM_PREFERENCES = [ FFilterByBuildFeatures
 	Network
 	WiFi
 	Notifications
+	Power@x86,x86_64
 	Screen
 	Shortcuts
 	Time
@@ -358,7 +359,9 @@ SYSTEM_ADD_ONS_DRIVERS_NET = [ FFilterByBuildFeatures
 
 SYSTEM_ADD_ONS_DRIVERS_POWER = [ FFilterByBuildFeatures
 	x86,x86_64 @{
+		acpi_ac
 		acpi_button
+		acpi_lid
 		acpi_thermal
 		amd_thermal
 		pch_thermal
