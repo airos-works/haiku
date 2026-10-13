@@ -223,6 +223,8 @@ enum node_flags {
 static device_node *sRootNode;
 static recursive_lock sLock;
 static int32 sNextNodeID = 1;
+static bool sNodeTreeBuilt = false;
+	// set once device_manager_init() has registered every node
 static const char* sGenericContextPath;
 
 
@@ -2483,6 +2485,14 @@ device_manager_probe(const char* path, uint32 updateCycle)
 	TRACE(("device_manager_probe(\"%s\")\n", path));
 	RecursiveLocker _(sLock);
 
+	// The node tree is built by device_manager_init(), one bus child at a
+	// time, and a driver registered on the way can end up here (a devfs lookup
+	// below /dev/disk, say, when a USB disk is unpublished while its
+	// controller is still being set up). Only the nodes registered so far
+	// would be probed. Tell the caller to come back.
+	if (!sNodeTreeBuilt)
+		return B_BUSY;
+
 	// first, publish directories in the driver directory
 	publish_directories(path);
 
@@ -2509,6 +2519,7 @@ device_manager_init(struct kernel_args* args)
 		"dump device node tree");
 
 	init_node_tree();
+	sNodeTreeBuilt = true;
 
 	return B_OK;
 }
