@@ -1,6 +1,5 @@
 SubDir HAIKU_TOP src tests servers app retrace ;
 
-UsePrivateHeaders [ FDirName graphics amdgpu ] ;
 UsePrivateHeaders [ FDirName graphics sunxi_display ] ;
 
 # whether B_WAIT_FOR_RETRACE drawing is timed to the display's blanks

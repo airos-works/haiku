@@ -38,7 +38,7 @@ with `BScreen::WaitForRetrace()` before they write; airTime does since
 | Display | Driver | Source |
 | --- | --- | --- |
 | GTX 1070 (X399 until 2026-10-10) | `nvidia_rm` accelerant | NVKMS vblank semaphore page, a polling thread in the accelerant (since 2026-09-18) |
-| Radeon Pro WX 5100 (X399) | `amdgpu` + `framebuffer` accelerant | the DCE 11.2 head scanning out the boot frame buffer: its frame counter, read by a kernel thread |
+| Radeon Pro WX 5100 (X399) and other AMD GPUs | `amdgpu_kms` accelerant (amdgpu_drm) | DRM vertical blank waits on the primary output's CRTC, a thread in the accelerant (the native `amdgpu` driver's frame counter on the boot frame buffer, measured below, was removed with that driver on 2026-10-13) |
 | Cubie A7S | `sunxi_display` | TCON-TV1's vertical blank interrupt (GIC SPI 58) |
 | Raspberry Pi 4 | `rpi_display` | the HVS frame counter of the channel feeding the first output shown, read by a kernel thread |
 
@@ -53,11 +53,6 @@ Shared pieces in `headers/private/graphics/common/`:
   counter is due, and releases only when it saw the advance within a
   millisecond, so a wait never ends in the middle of a frame. It sleeps when
   nobody has waited for two seconds.
-- `boot_frame_buffer_retrace.h`: lets the `framebuffer` accelerant, which
-  knows nothing of the hardware, ask a GPU driver for the blanks of the
-  display that shows the boot frame buffer. `amdgpu` answers it; the
-  accelerant keeps `/dev/dri/amdgpu/0` open while it uses the semaphore, so
-  that driver cannot be reloaded until app_server restarts.
 
 Limits: one semaphore per accelerant, so with several monitors the blanks are
 those of one of them (`nvidia_rm`: the primary head; `rpi_display`: the first
@@ -69,9 +64,9 @@ copy is timed instead, which works while the copy outpaces the scan.
 `retrace_test` (in `src/tests/servers/app/retrace`, in the Cubie lab image):
 
 ```
-retrace_test blanks 5 [--line sunxi|amdgpu]
+retrace_test blanks 5 [--line sunxi]
 retrace_test draw 5 [--no-wait] [--update] [--size WxH] [--line ...]
-retrace_test lines --line sunxi|amdgpu
+retrace_test lines --line sunxi
 ```
 
 `blanks` measures the semaphore's rhythm. `draw` draws a full bitmap a frame
@@ -82,6 +77,9 @@ wait, they end anywhere. The frames alternate between two greys, so a
 capture of the display shows a torn copy as both at once.
 
 ### WX 5100 on the X399, 2026-10-12
+
+(With the native `amdgpu` driver and the `framebuffer` accelerant, both
+since removed, and `--line amdgpu`, which went with them.)
 
 The boot frame buffer is 1600x1200, shown on a 3840x2160 timing (2222
 lines, 60 Hz).

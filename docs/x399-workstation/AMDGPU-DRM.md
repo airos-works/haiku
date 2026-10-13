@@ -9,9 +9,10 @@ Mesa's VA-API driver. The same code is meant to drive other AMD GPUs later
 (the Framework Desktop's Strix Halo, other Radeon cards); only firmware and
 testing are per device.
 
-The native driver for this card (`amdgpu`, [WX5100.md](WX5100.md)) is still in
-the image; on the X399 it is blocked (below), as two drivers must never start
-the same GPU.
+The native driver for this card that came first (`amdgpu` and its `amduvd`
+decoder, [WX5100.md](WX5100.md)) was removed from the tree on 2026-10-13.
+The x86_64 air/OS images built since carry amdgpu_drm and the amdgpu
+firmware instead (below).
 
 ## What works (verified on the X399, 2026-10-12/13)
 
@@ -104,10 +105,13 @@ Known limits:
 The user land libraries carry an RPATH to `/boot/system/non-packaged/lib`, as
 some programs (Summit) set a LIBRARY_PATH without it.
 
-### The native driver is blocked
+### The native driver (removed)
 
-The x86_64 image carries the native `amdgpu` driver (in `dev/graphics`) and
-its `amduvd` decoder. On the X399 `/boot/system/settings/packages` hides them:
+Images built before 2026-10-13 carry the native `amdgpu` driver (in
+`dev/graphics`) and its `amduvd` decoder, which must never start beside
+amdgpu_drm. There `/boot/system/settings/packages` hides them (the X399 has
+it, and the amdgpu_drm package's post-install script writes it when it finds
+the native driver):
 
 ```
 Package haiku {
@@ -172,8 +176,9 @@ firmware. Only the WX 5100 has been tried. The pieces, built by
 - `amdgpu_firmwares-<date>-1-any.hpkg` (`haiku/tools/package.sh`): every
   amdgpu firmware file of linux-firmware, 674 of them;
 - `amdgpu_drm-<version>-1-x86_64.hpkg` (same script): the driver, requiring
-  the firmware and at least the haiku it was linked against; its
-  post-install script blocks the image's native amdgpu and amduvd;
+  the firmware and at least the haiku it was linked against; on an
+  image that still has the native amdgpu and amduvd, its post-install
+  script blocks them;
 - `amdgpu-userland-<date>.tar.gz` (`gpu-userland-build.sh bundle` on a
   machine that has built the user land): libdrm, libva, libglvnd, Mesa
   (radeonsi, RADV, VA driver) and the amduvd add-on for

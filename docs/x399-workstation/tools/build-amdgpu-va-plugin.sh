@@ -26,15 +26,15 @@ TARGET=/boot/home/config/non-packaged/add-ons/media/plugins
 INSTALL="mkdir -p $TARGET && cp amduvd $TARGET/.amduvd.new && mv $TARGET/.amduvd.new $TARGET/amduvd && echo installed $TARGET/amduvd"
 [ "${NO_INSTALL:-0}" = 1 ] && INSTALL="echo built $REMOTE/amdgpu_va/amduvd"
 
-tar -C "$HAIKU/$PLUGINS" -cf - amdgpu_va amduvd \
+tar -C "$HAIKU/$PLUGINS" -cf - amdgpu_va \
 	| $SSH "rm -rf $REMOTE && mkdir -p $REMOTE && tar -C $REMOTE -xmf -"
 $SSH "cd $REMOTE/amdgpu_va \
 	&& F=$GPU/ffmpeg-va P=/boot/system/non-packaged \
 	&& INC=\"-I\$F/include -I\$P/develop/headers \
 		-I/boot/system/develop/headers/private/media\" \
 	&& g++ -O2 -Wall -fPIC -c AmdgpuVaPlugin.cpp \$INC \
-	&& g++ -O2 -fPIC -c ../amduvd/H264Output.cpp \$INC \
-	&& g++ -O2 -fPIC -c ../amduvd/HevcOutput.cpp \$INC \
+	&& g++ -O2 -fPIC -c H264Output.cpp \$INC \
+	&& g++ -O2 -fPIC -c HevcOutput.cpp \$INC \
 	&& g++ -shared -o amduvd AmdgpuVaPlugin.o H264Output.o HevcOutput.o \
 		-Wl,--exclude-libs,ALL \$F/lib/libavcodec.a \$F/lib/libavutil.a \
 		-L\$P/lib -lva -lva-drm -lbe -lmedia -Wl,-rpath,\$P/lib \

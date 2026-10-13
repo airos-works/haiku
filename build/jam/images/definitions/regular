@@ -235,7 +235,6 @@ SYSTEM_ADD_ONS_MEDIA += [ FFilterByBuildFeatures
 ] ;
 
 SYSTEM_ADD_ONS_MEDIA_PLUGINS += [ FFilterByBuildFeatures
-	amduvd@x86_64
 	ape_reader@x86
 	ffmpeg@ffmpeg
 	http_streamer
@@ -296,9 +295,6 @@ SYSTEM_ADD_ONS_DRIVERS_AUDIO_OLD +=
 ;
 
 SYSTEM_ADD_ONS_DRIVERS_GRAPHICS += [ FFilterByBuildFeatures
-	x86_64 @{
-		amdgpu
-	}@ # x86_64
 	x86,x86_64 @{
 		ati
 		intel_810
