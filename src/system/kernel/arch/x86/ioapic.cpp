@@ -615,9 +615,29 @@ acpi_configure_source_overrides(acpi_table_madt* madt)
 				TRACE("found local apic with id %u, processor id %u, "
 					"flags 0x%08" B_PRIx32 "\n", info->Id, info->ProcessorId,
 					(uint32)info->LapicFlags);
+				// (Entries of processors that are not there, often with APIC
+				// ID 0, would claim the boot CPU.)
+				if ((info->LapicFlags & ACPI_MADT_ENABLED) == 0)
+					break;
 				for (int32 i = 0; i < smp_get_num_cpus(); i++) {
 					if (x86_get_cpu_apic_id(i) == info->Id) {
 						gCPU[i].arch.acpi_processor_id = info->ProcessorId;
+						break;
+					}
+				}
+				break;
+			}
+
+			case ACPI_MADT_TYPE_LOCAL_X2APIC:
+			{
+				// purely informational
+				acpi_madt_local_x2apic* info
+					= (acpi_madt_local_x2apic*)apicEntry;
+				if ((info->LapicFlags & ACPI_MADT_ENABLED) == 0)
+					break;
+				for (int32 i = 0; i < smp_get_num_cpus(); i++) {
+					if (x86_get_cpu_apic_id(i) == info->LocalApicId) {
+						gCPU[i].arch.acpi_processor_id = info->Uid;
 						break;
 					}
 				}
