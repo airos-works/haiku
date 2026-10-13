@@ -170,7 +170,18 @@ drivers directory: devfs starts it as a second driver for the GPU.
 
 The driver is Linux's whole amdgpu (GFX 6 to 12, Display Core up to DCN 4.01,
 SMU 14, VCN 5): any AMD GPU or APU Linux 6.18 drives should start, given its
-firmware. Only the WX 5100 has been tried. The pieces, built by
+firmware. Only the WX 5100 has been tried.
+
+The air/OS x86_64 images the build server makes (jmgasper/airos-ci) carry
+all of it since 2026-10-13: the `amdgpu_drm` and `amdgpu_firmwares` packages
+in `system/packages`, and the user land and the amduvd add-on, cross-built
+from the same forks, in `system/non-packaged/amdgpu`. The image's boot script
+(`tools/airos/ci/boot/UserBootscript`) links that user land into
+`system/non-packaged` where amdgpu_drm drives a GPU and removes the links
+elsewhere, as its libGL and libEGL would take OpenGL from every other
+machine (Zink on NVIDIA cards). See airos-ci's `docs/x86_64-gpu.md`.
+
+For a machine that is already installed, the pieces, built by
 `src/forks/linux-drm` (copies in `/mnt/HaikuWork/artifacts/amdgpu`):
 
 - `amdgpu_firmwares-<date>-1-any.hpkg` (`haiku/tools/package.sh`): every
