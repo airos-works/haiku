@@ -38,6 +38,7 @@ PowerPolicy::PowerPolicy(BServer* server)
 	fOnAC(true),
 	fKnowSource(false),
 	fLidClosed(false),
+	fKnowLid(false),
 	fPowerSavingOnAC(false),
 	fPowerSavingOnBattery(true),
 	fBatteryBrightness(70),
@@ -145,10 +146,19 @@ PowerPolicy::SetLidOpen(bool open)
 	lid_action action;
 	{
 		BAutolock _(fLock);
+		bool firstTime = !fKnowLid;
+		fKnowLid = true;
 		if (open == !fLidClosed)
 			return;
 		fLidClosed = !open;
 		action = fLidAction;
+
+		// Only closing it does something: a machine that starts with its
+		// lid closed (on an external display) stays awake.
+		if (firstTime) {
+			printf("power_daemon: lid closed at start\n");
+			return;
+		}
 	}
 	printf("power_daemon: lid %s\n", open ? "opened" : "closed");
 

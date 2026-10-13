@@ -49,6 +49,7 @@ private:
 			bool				fOnAC;
 			bool				fKnowSource;
 			bool				fLidClosed;
+			bool				fKnowLid;
 
 			bool				fPowerSavingOnAC;
 			bool				fPowerSavingOnBattery;
