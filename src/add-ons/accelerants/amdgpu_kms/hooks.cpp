@@ -51,6 +51,10 @@ get_accelerant_hook(uint32 feature, void* data)
 			return (void*)amdgpu_dpms_mode;
 		case B_SET_DPMS_MODE:
 			return (void*)amdgpu_set_dpms_mode;
+		case B_SET_BRIGHTNESS:
+			return (void*)amdgpu_set_brightness;
+		case B_GET_BRIGHTNESS:
+			return (void*)amdgpu_get_brightness;
 
 		case B_GET_DISPLAY_OUTPUT_COUNT:
 			return (void*)amdgpu_display_output_count;
