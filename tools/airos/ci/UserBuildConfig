@@ -30,6 +30,10 @@
 #   AIROS_CI_FLUIDLITE      (arm64) a prefix with FluidLite for the MIDI kit,
 #                           read by build/jam/BuildFeatures
 #   AIROS_CI_FIRMWARE       a tree copied to system/non-packaged/data/firmware
+#   AIROS_CI_AMDGPU         (x86_64) the AMD GPU user land: a tree copied to
+#                           system/non-packaged/amdgpu, which the boot script
+#                           links into system/non-packaged where amdgpu_drm
+#                           drives a GPU
 #   AIROS_CI_IMAGE_SIZE     image size in MiB (optional)
 #   HAIKU_RPI_FIRMWARE_DIR  (Pi) the Raspberry Pi boot firmware files
 #
@@ -117,6 +121,13 @@ rule UserBuildConfigRulePreImage
 	if $(AIROS_CI_FIRMWARE) {
 		CopyDirectoryToHaikuImage system non-packaged data : $(AIROS_CI_FIRMWARE)
 			: firmware ;
+	}
+	# x86_64: libdrm, libva, libglvnd and Mesa (radeonsi, RADV, VA-API) and the
+	# amduvd decoder for amdgpu_drm, kept apart: the boot script links them
+	# into place only where amdgpu_drm drives a GPU.
+	if $(AIROS_CI_AMDGPU) {
+		CopyDirectoryToHaikuImage system non-packaged : $(AIROS_CI_AMDGPU)
+			: amdgpu ;
 	}
 
 	# Join remembered Wi-Fi networks at start (x86_64 and ROCK 5; the Pi and
