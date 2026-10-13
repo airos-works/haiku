@@ -321,13 +321,15 @@ i2c_hid_support(device_node *parent)
 	if (sDeviceManager->get_attr_string(parent, ACPI_DEVICE_HID_ITEM, &name,
 		false) == B_OK && name != NULL && strcmp(name, ACPI_NAME_HID_DEVICE) == 0) {
 		TRACE("i2c_hid_support found an hid i2c device\n");
-		return 0.6;
+		return 0.5;
 	}
 
 	if (sDeviceManager->get_attr_string(parent, ACPI_DEVICE_CID_ITEM, &name,
 		false) == B_OK && name != NULL && strcmp(name, ACPI_NAME_HID_DEVICE) == 0) {
+		// below i2c_elan, which knows the ELAN touchpads that also say
+		// they are HID devices
 		TRACE("i2c_hid_support found a compatible hid i2c device\n");
-		return 0.6;
+		return 0.5;
 	}
 
 	uint16 slaveAddress;
@@ -404,17 +406,21 @@ i2c_hid_init_driver(device_node *node, void **driverCookie)
 		(void **)&device->i2c_cookie);
 	sDeviceManager->put_node(parent);
 
-	// The interrupt line, if ACPI describes one this driver can use; the
-	// device is polled otherwise.
+	// The interrupt line: without it the input register can only be polled,
+	// and many devices answer such reads with whatever they last sent (or
+	// worse), so the device is left alone.
 	GpioInterrupt* interrupt = NULL;
 	acpi_handle handle;
-	if (sDeviceManager->get_attr_uint64(node, ACPI_DEVICE_HANDLE_ITEM,
-			(uint64*)&handle, true) == B_OK) {
-		status_t status = GpioInterrupt::Create(gACPI, handle, &interrupt);
-		if (status != B_OK && status != B_ENTRY_NOT_FOUND) {
-			TRACE_ALWAYS("no usable interrupt (%s), polling the device\n",
-				strerror(status));
-		}
+	status_t status = sDeviceManager->get_attr_uint64(node,
+		ACPI_DEVICE_HANDLE_ITEM, (uint64*)&handle, true);
+	if (status == B_OK)
+		status = GpioInterrupt::Create(gACPI, handle, &interrupt);
+	if (status != B_OK) {
+		TRACE_ALWAYS("no interrupt line this driver can use (%s), not "
+			"attaching\n", strerror(status));
+		free(device);
+		*driverCookie = NULL;
+		return B_NOT_SUPPORTED;
 	}
 
 	mutex_lock(&sDriverLock);
@@ -431,7 +437,13 @@ i2c_hid_init_driver(device_node *node, void **driverCookie)
 
 	mutex_unlock(&sDriverLock);
 
-	return device->hidDevice != NULL ? B_OK : B_IO_ERROR;
+	if (device->hidDevice == NULL) {
+		free(device);
+		*driverCookie = NULL;
+		return B_IO_ERROR;
+	}
+
+	return B_OK;
 }
 
 
