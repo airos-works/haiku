@@ -237,9 +237,6 @@ HIDDevice::HIDDevice(uint16 descriptorAddress, i2c_device_interface* i2c,
 	ProtocolHandler::AddHandlers(*this, fProtocolHandlerList,
 		fProtocolHandlerCount);
 
-	// Asleep until somebody opens it.
-	_SetPower(I2C_HID_POWER_OFF);
-
 	fReaderThread = spawn_kernel_thread(&_ReaderThread, "i2c hid reader",
 		B_REAL_TIME_DISPLAY_PRIORITY, this);
 	if (fReaderThread < 0) {
@@ -294,15 +291,11 @@ HIDDevice::Open(ProtocolHandler *handler, uint32 flags)
 	if (fRemoved)
 		return B_DEV_NOT_READY;
 
+	// The device stays powered, as on Linux: some do not wake up from a
+	// SET_POWER sleep the way the specification says.
 	MutexLocker locker(fLock);
-	if (fOpenCount++ == 0) {
-		status_t status = _SetPower(I2C_HID_POWER_ON);
-		if (status != B_OK) {
-			fOpenCount--;
-			return status;
-		}
+	if (fOpenCount++ == 0)
 		fOpenCondition.NotifyAll();
-	}
 
 	return B_OK;
 }
@@ -312,9 +305,7 @@ status_t
 HIDDevice::Close(ProtocolHandler *handler)
 {
 	MutexLocker locker(fLock);
-	if (--fOpenCount == 0)
-		_SetPower(I2C_HID_POWER_OFF);
-
+	fOpenCount--;
 	return B_OK;
 }
 
@@ -456,6 +447,15 @@ HIDDevice::_Reader()
 		errors = 0;
 
 		if (length == 0) {
+#ifdef I2C_HID_LAB_ARM
+			static int32 sEmptyLogged = 0;
+			if (atomic_add(&sEmptyLogged, 1) < 20) {
+				TRACE_ALWAYS("%04x:%04x: empty input %02x %02x %02x %02x\n",
+					fDescriptor.wVendorID, fDescriptor.wProductID,
+					fInputBuffer[0], fInputBuffer[1], fInputBuffer[2],
+					fInputBuffer[3]);
+			}
+#endif
 			// Nothing to report (or the answer to a reset). A line that
 			// stays asserted regardless must not keep us reading.
 			if (fInterrupt == NULL || ++emptyReads > 2)
@@ -464,6 +464,16 @@ HIDDevice::_Reader()
 		}
 		emptyReads = 0;
 
+#ifdef I2C_HID_LAB_ARM
+		static int32 sLogged = 0;
+		if (atomic_add(&sLogged, 1) < 40) {
+			TRACE_ALWAYS("%04x:%04x: input of %" B_PRIuSIZE " bytes: %02x %02x"
+				" %02x %02x %02x %02x\n", fDescriptor.wVendorID,
+				fDescriptor.wProductID, length, fInputBuffer[2],
+				fInputBuffer[3], fInputBuffer[4], fInputBuffer[5],
+				fInputBuffer[6], fInputBuffer[7]);
+		}
+#endif
 		_InputReport(fInputBuffer + 2, length);
 	}
 }
@@ -518,6 +528,13 @@ HIDDevice::_InputReport(const uint8* data, size_t length)
 
 	if (queue->report->HasWaiters())
 		_Deliver(queue);
+#ifdef I2C_HID_LAB_ARM
+	static int32 sLogged = 0;
+	if (atomic_add(&sLogged, 1) < 40) {
+		TRACE_ALWAYS("report %u queued, %" B_PRIu32 " waiting\n", id,
+			queue->count);
+	}
+#endif
 }
 
 
