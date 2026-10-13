@@ -19,6 +19,10 @@
 
 
 extern bool gVerbose;
+// set when a controller was reset after a failed download; it comes back as
+// a new USB device, ready to be tried again
+extern bool gControllerReset;
+static const int kExitRetryAfterReset = 4;
 
 
 #define LOG(...) \
