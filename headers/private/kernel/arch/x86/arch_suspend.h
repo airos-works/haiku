@@ -21,6 +21,32 @@ enum {
 		// uint32 flags or struct x86_suspend_s3_args
 	X86_SUSPEND_GET_TRACE		= 3,
 		// char buffer: the trace of the last suspend and resume
+	X86_SUSPEND_ENTER_S2IDLE	= 4,
+		// struct x86_suspend_s2idle_args: sleeps in S0 until the SCI (lid,
+		// power button) or the timeout, and reports how it went
+};
+
+struct x86_suspend_s2idle_args {
+	uint32	flags;
+		// X86_SUSPEND_SKIP_DEVICES, _SKIP_POWER_HOOKS, _SKIP_DEVICE_TREE
+	uint32	timeout_ms;
+		// 0 sleeps until the SCI
+
+	// returned
+	uint32	wake_reason;
+	uint32	idle_rounds;
+	uint64	slept_us;
+	uint64	s0i3_us;
+		// how long the SoC stayed in its deepest state (AMD), last time
+	uint32	s0i3_entered;
+	uint32	pmc_idle_mask;
+		// AMD: which IP blocks were still busy
+};
+
+// wake_reason
+enum {
+	X86_S2IDLE_WAKE_SCI		= 1,
+	X86_S2IDLE_WAKE_TIMEOUT	= 2,
 };
 
 // Debugging aid: without working devices after resume, the only observable
@@ -60,6 +86,7 @@ extern "C" {
 status_t x86_suspend_init(void);
 status_t x86_suspend_restart_cpu(int32 cpu);
 status_t x86_suspend_enter_s3(const struct x86_suspend_s3_args* args);
+status_t x86_suspend_enter_s2idle(struct x86_suspend_s2idle_args* args);
 
 #ifdef __cplusplus
 }
