@@ -14,6 +14,7 @@
 
 #include "DeviceList.h"
 #include "Driver.h"
+#include "GpioInterrupt.h"
 #include "HIDDevice.h"
 #include "ProtocolHandler.h"
 
@@ -23,6 +24,9 @@
 #include <new>
 #include <stdio.h>
 #include <string.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <unistd.h>
 
 
 
@@ -256,10 +260,45 @@ i2c_hid_free(void *_cookie)
 //	#pragma mark - driver module API
 
 
+#ifdef I2C_HID_LAB_ARM
+static const char* const kLabArmFile = "/var/tmp/i2c_hid.arm";
+
+
+/*!	Lab builds only attach until the time (seconds since the epoch) written
+	in the arm file, so that a driver that brings the machine down does not
+	do so again once the machine has been brought back.
+*/
+static bool
+i2c_hid_armed()
+{
+	int fd = open(kLabArmFile, O_RDONLY);
+	if (fd < 0)
+		return false;
+
+	char buffer[32];
+	ssize_t length = read(fd, buffer, sizeof(buffer) - 1);
+	close(fd);
+	if (length <= 0)
+		return false;
+	buffer[length] = '\0';
+
+	uint32 until = strtoul(buffer, NULL, 10);
+	bool armed = real_time_clock() < until;
+	TRACE_ALWAYS("lab build, %s\n", armed ? "armed" : "not armed");
+	return armed;
+}
+#endif
+
+
 static float
 i2c_hid_support(device_node *parent)
 {
 	CALLED();
+
+#ifdef I2C_HID_LAB_ARM
+	if (!i2c_hid_armed())
+		return 0.0;
+#endif
 
 	// make sure parent is really the I2C bus manager
 	const char *bus = NULL;
@@ -365,10 +404,25 @@ i2c_hid_init_driver(device_node *node, void **driverCookie)
 		(void **)&device->i2c_cookie);
 	sDeviceManager->put_node(parent);
 
+	// The interrupt line, if ACPI describes one this driver can use; the
+	// device is polled otherwise.
+	GpioInterrupt* interrupt = NULL;
+	acpi_handle handle;
+	if (sDeviceManager->get_attr_uint64(node, ACPI_DEVICE_HANDLE_ITEM,
+			(uint64*)&handle, true) == B_OK) {
+		status_t status = GpioInterrupt::Create(gACPI, handle, &interrupt);
+		if (status != B_OK && status != B_ENTRY_NOT_FOUND) {
+			TRACE_ALWAYS("no usable interrupt (%s), polling the device\n",
+				strerror(status));
+		}
+	}
+
 	mutex_lock(&sDriverLock);
 	HIDDevice *hidDevice
 		= new(std::nothrow) HIDDevice(descriptorAddress, device->i2c,
-			device->i2c_cookie);
+			device->i2c_cookie, interrupt);
+	if (hidDevice == NULL)
+		delete interrupt;
 
 	if (hidDevice != NULL && hidDevice->InitCheck() == B_OK) {
 		device->hidDevice = hidDevice;
