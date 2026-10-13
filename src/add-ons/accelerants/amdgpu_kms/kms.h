@@ -126,6 +126,10 @@ status_t SetCursor(int fd, uint32 crtc, uint32 handle, uint32 width,
 	uint32 height, int32 hotX, int32 hotY);
 status_t MoveCursor(int fd, uint32 crtc, int32 x, int32 y);
 
+// how often a GPU reset has lost the contents of video memory
+// (AMDGPU_INFO_VRAM_LOST_COUNTER)
+status_t VramLostCounter(int fd, uint32& counter);
+
 
 }	// namespace Kms
 

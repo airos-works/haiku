@@ -497,4 +497,27 @@ MoveCursor(int fd, uint32 crtc, int32 x, int32 y)
 }
 
 
+// amdgpu's DRM_IOCTL_AMDGPU_INFO (amdgpu_drm.h), the one query used here
+struct amdgpu_info_request {
+	uint64	return_pointer;
+	uint32	return_size;
+	uint32	query;
+	uint32	parameters[4];
+};
+static const uint32 kAmdgpuInfoVramLostCounter = 0x1f;
+static const unsigned long kAmdgpuIoctlInfo
+	= DRM_IOW(DRM_COMMAND_BASE + 0x05, struct amdgpu_info_request);
+
+
+status_t
+VramLostCounter(int fd, uint32& counter)
+{
+	amdgpu_info_request request = {};
+	request.return_pointer = (uint64)(addr_t)&counter;
+	request.return_size = sizeof(counter);
+	request.query = kAmdgpuInfoVramLostCounter;
+	return Ioctl(fd, kAmdgpuIoctlInfo, &request);
+}
+
+
 }	// namespace Kms

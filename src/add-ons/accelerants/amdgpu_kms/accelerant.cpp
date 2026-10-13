@@ -49,6 +49,7 @@ uninit_common(void)
 	if (gInfo == NULL)
 		return;
 	free(gInfo->modeList);
+	free(gInfo->cursorImage);
 	free(gInfo);
 	gInfo = NULL;
 }
@@ -145,6 +146,7 @@ amdgpu_init_accelerant(int device)
 		uninit_common();
 		return status;
 	}
+	Kms::VramLostCounter(device, gInfo->vramLost);
 
 	SharedInfo* shared;
 	gInfo->sharedArea = create_area("amdgpu_kms shared info", (void**)&shared,

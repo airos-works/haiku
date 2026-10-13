@@ -111,6 +111,8 @@ struct accelerant_info {
 	volatile bool		quitRetrace;
 
 	Kms::Buffer			cursor;
+	uint32*				cursorImage;	// what is in it: video memory can be lost
+	uint32				vramLost;		// AMDGPU_INFO_VRAM_LOST_COUNTER
 	uint16				cursorHotX;
 	uint16				cursorHotY;
 	uint16				cursorX;
@@ -181,6 +183,8 @@ status_t amdgpu_get_display_output_modes(uint32 id, display_mode* modes,
 status_t amdgpu_set_display_layout(const display_output_config* configs,
 	uint32 count, display_mode* mode);
 status_t amdgpu_set_display_change_port(port_id port, uint32 code);
+status_t amdgpu_wait_for_display_restore(bigtime_t timeout);
+void restore_cursor_image(void);
 
 // cursor.cpp
 status_t amdgpu_set_cursor_bitmap(uint16 width, uint16 height, uint16 hotX,
