@@ -85,15 +85,47 @@ Known limits:
   slow; `drmparam haiku_track_objects 1` then `drmparam haiku_fence_report
   1` lists the scheduler fences alive by scheduler and client, the files
   and contexts open, TTM's buffers and the schedulers' jobs.
-- Open: twice, the first boot after `x399-install.sh` (the staged binary
-  swapped in under the running driver, "devfs: reload driver amdgpu_drm")
-  stopped right after that reload line; both outgoing builds counted
-  kmalloc() call sites. A second power cycle starts normally. Normal boots
-  and package installs do not reload the driver.
+  For hangs that leave no trace (the X399 has no serial line, and its
+  kernel debugger shows on a monitor nobody sees): the kernel debugger
+  extension kdl_capture (`src/add-ons/kernel/debugger/kdl_capture`,
+  installed in `/boot/system/non-packaged/add-ons/kernel/debugger/`)
+  records a session, types `sc` and `co`, and a thread appends it to
+  `/boot/home/kdl_capture.log` - a panic reads like a crash log after the
+  next boot (lab use: it also leaves every panic). `log_file` now appends
+  after the text already in the file, with times since boot, and the driver
+  writes a line a second around the file system into its last MiB after the
+  start (the last one dates a whole-machine freeze); `trace_calls 2` traces
+  the calls of the stop (TRACE_CALLS also takes compat/ and glue/ files).
+- The first boot after `x399-install.sh` died most of the time (2026-10-13/14),
+  right after "devfs: reload driver amdgpu_drm": devfs stopped the GPU it
+  had just started and started it again. devfs reloads a driver none of
+  whose devices is open as soon as it takes the binary for changed, and
+  `add_driver()` (legacy_drivers.cpp) does that whenever it meets a known
+  driver again with equal priority - also the same binary through a second
+  link. amdgpu_drm was linked from dev/graphics and dev/dri, so the first
+  scan of the second directory marked the running driver changed; the boot
+  job's swap of a staged build did the same, its events handled after the
+  new build had loaded. Stopping a started GPU then panicked ("object_cache:
+  object ... is already freed" in `kthread_stop()` of a DRM vblank worker,
+  from `drm_vblank_init_release()`; caught by kdl_capture, see the tools
+  below) or froze the machine, depending on timing; the stop's
+  `_kern_sync()` (start marker) in devfs' driver lock was one place it
+  stopped. Fixed in linux-drm 651e81b: the driver keeps
+  `/dev/dri/renderD128` open while the GPU runs (devfs never reloads it; a
+  changed binary starts at the next boot), is linked from dev/graphics only,
+  syncs in a thread of its own waited for 3 s at most, does no file system
+  work when stopped, and a start by devfs' kernel daemon while app_server
+  runs (an installation onto a desktop on the framebuffer driver) waits for
+  the next boot. Four installation boots since, each one start, no reload.
+- Open: stopping the GPU soon after its start can free a kthread's task
+  twice (the panic above); with the device kept open nothing stops a
+  running GPU any more, but a failed start's cleanup still takes that path.
 - Boot safety: the driver keeps a marker
   (`~/config/settings/kernel/drivers/amdgpu_drm.starting`) from its start
-  until the GPU has run for 30 s; a boot that finds it leaves the GPU to the
-  framebuffer driver until it is deleted. No real crash has exercised it yet.
+  until the GPU has run for 30 s; a boot that finds a marker of an earlier
+  boot leaves the GPU to the framebuffer driver until it is deleted (a
+  marker of the same boot is a start devfs repeated). The reload hangs
+  exercised it: the boot after each one came up on the framebuffer driver.
 
 - GPU writes into system memory from the graphics and compute engines
   (shaders, CP DMA) reach only 1.55 GB/s; SDMA writes 4.7 GB/s (reads 5.7
@@ -187,11 +219,15 @@ this tree (builds on the workstation, installs as `amduvd`). The system
 packages of a build: `tools/install-system-packages.sh [build dir]`. Power
 cycle afterwards, never a warm reboot.
 
-`x399-install.sh` never replaces the binary of a loaded driver: devfs would
-reload it underneath itself. A changed build waits in
-`/boot/home/amdgpu-drm/amdgpu_drm.new` and the `x399-driver-safety` boot job
-swaps it in before app_server starts. Nor may a new file be put into a
-drivers directory: devfs starts it as a second driver for the GPU.
+A running build keeps one of its devices open, so devfs does not reload it
+when its binary changes: `x399-install.sh` moves a new build over it in
+place, and it starts at the next boot. Only a running build from before
+that (no "keeping /dev/dri/renderD128 open" in it) still has the new one
+wait in `/boot/home/amdgpu-drm/amdgpu_drm.new` for the `x399-driver-safety`
+boot job - whose swap devfs may handle after it has loaded the new build,
+reloading the started GPU (see above). The upload goes outside the drivers'
+directories first: devfs starts any new file there as a second driver for
+the GPU.
 
 ## Another machine (other AMD GPUs)
 
@@ -268,6 +304,14 @@ add-on print its per-picture costs.
 
 - **Two drivers for one GPU bring the machine down.** Keep the native
   driver blocked, and never stage a file inside a drivers directory.
+- **devfs reloads a driver it finds through a second link.** A driver that
+  none of its devices holds open is stopped and started again (in devfs'
+  driver lock) once devfs takes its binary for changed, which a scan of
+  any other directory linking the same binary does. Link a driver from one
+  devfs directory; publish other paths from it.
+- **No sync in devfs' driver lock.** `init_driver()` and `uninit_driver()`
+  run in it; `_kern_sync()` waits for every volume, network ones included,
+  whose mounting may wait for devfs.
 - `amdgpu` thinks a zeroed `boot_cpu_data` is an Intel CPU, decides the host
   cannot change PCIe speeds and leaves the link in training at 2.5 GT/s
   (BAR writes at 9 MB/s): the compat layer fills it from CPUID.
