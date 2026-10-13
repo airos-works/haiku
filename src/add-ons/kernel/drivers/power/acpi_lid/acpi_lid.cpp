@@ -257,15 +257,19 @@ acpi_lid_init_driver(device_node *node, void **_driverCookie)
 		(void **)&device->acpi_cookie);
 	sDeviceManager->put_node(parent);
 
+	device->last_status = 0;
+	device->updated = false;
+	device->select_pool = NULL;
+
 	status = device->acpi->install_notify_handler(device->acpi_cookie, ACPI_DEVICE_NOTIFY,
 		acpi_lid_notify_handler, device);
 	if (status != B_OK) {
 		ERROR("can't install notify handler\n");
 	}
 
-	device->last_status = 0;
-	device->updated = false;
-	device->select_pool = NULL;
+	// The firmware only notifies changes: what it is now (a reader that
+	// took 0 for a closed lid would put the machine to sleep at boot)
+	acpi_lid_read_status(device);
 
 	*_driverCookie = device;
 	return B_OK;
