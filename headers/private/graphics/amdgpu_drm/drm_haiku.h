@@ -91,4 +91,15 @@ struct drm_haiku_set_param {
 
 #define DRM_HAIKU_IOCTL_SET_PARAM	DRM_IOW(0xf5, struct drm_haiku_set_param)
 
+/*	The built-in panel's backlight (what Linux has in /sys/class/backlight):
+	sets \a brightness (0 to max_brightness) unless it is negative, and
+	returns the level and the maximum. Primary nodes only; ENODEV without a
+	panel backlight. */
+struct drm_haiku_backlight {
+	__s32 brightness;		/* in: the new level, or -1; out: the level */
+	__u32 max_brightness;	/* out */
+};
+
+#define DRM_HAIKU_IOCTL_BACKLIGHT	DRM_IOWR(0xf6, struct drm_haiku_backlight)
+
 #endif /* _DRM_HAIKU_H */

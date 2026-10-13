@@ -727,6 +727,46 @@ amdgpu_dpms_mode(void)
 }
 
 
+/*!	The built-in panel's backlight, from 0 to 1. All the way down it still
+	glows a little: a dark panel with nothing to tell why would be worse. */
+extern "C" status_t
+amdgpu_set_brightness(float brightness)
+{
+	if (gInfo->isClone)
+		return B_NOT_ALLOWED;
+
+	drm_haiku_backlight request = {};
+	request.brightness = -1;
+	status_t status = Kms::Ioctl(gInfo->device, DRM_HAIKU_IOCTL_BACKLIGHT,
+		&request);
+	if (status != B_OK)
+		return status;
+
+	int32 maximum = request.max_brightness;
+	int32 level = (int32)(brightness * maximum + 0.5f);
+	request.brightness = max_c(max_c(level, maximum / 100), 1);
+	request.brightness = min_c(request.brightness, maximum);
+	return Kms::Ioctl(gInfo->device, DRM_HAIKU_IOCTL_BACKLIGHT, &request);
+}
+
+
+extern "C" status_t
+amdgpu_get_brightness(float* brightness)
+{
+	drm_haiku_backlight request = {};
+	request.brightness = -1;
+	status_t status = Kms::Ioctl(gInfo->device, DRM_HAIKU_IOCTL_BACKLIGHT,
+		&request);
+	if (status != B_OK)
+		return status;
+	if (request.max_brightness == 0)
+		return B_ERROR;
+
+	*brightness = (float)request.brightness / request.max_brightness;
+	return B_OK;
+}
+
+
 /*!	Whether a monitor came, went or was exchanged for another since the
 	outputs were last probed. */
 bool
