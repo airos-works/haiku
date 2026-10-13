@@ -18,6 +18,7 @@
 #include <bluetooth/DiscoveryListener.h>
 #include <bluetooth/LocalDevice.h>
 #include <bluetooth/RemoteDevice.h>
+#include <bluetooth/bdaddrUtils.h>
 #include <bluetooth/DeviceClass.h>
 
 #include <LEAttributeClient.h>
@@ -710,11 +711,17 @@ Probe(const uint8 peer[6], uint8 type, int32 seconds, float intervalMs,
 }
 
 
-class QuietInquiryListener : public DiscoveryListener {
+class InquiryListener : public DiscoveryListener {
 public:
 	virtual void DeviceDiscovered(RemoteDevice* device, DeviceClass deviceClass)
 	{
-		delete device;
+		// (the listener keeps the device in its list, to recognize the
+		// device's next replies: not ours to delete)
+		BString major;
+		deviceClass.GetMajorDeviceClass(major);
+		printf("%s  class %06" B_PRIx32 " (%s)\n",
+			bdaddrUtils::ToString(device->GetBluetoothAddress()).String(),
+			deviceClass.Record(), major.String());
 	}
 	virtual void InquiryCompleted(int discType) {}
 	virtual void InquiryStarted(status_t status) {}
@@ -729,8 +736,8 @@ Inquiry(int32 seconds)
 	if (adapter == NULL)
 		return 1;
 	DiscoveryAgent* agent = adapter->GetDiscoveryAgent();
-	QuietInquiryListener* listener = new QuietInquiryListener();
-	listener->Run();
+	InquiryListener* listener = new InquiryListener();
+		// (DiscoveryListener runs itself)
 	// in 1.28 s units, as Classic inquiries are
 	int32 length = std::max((int32)1, std::min((int32)(seconds / 1.28f + 0.5f),
 		(int32)48));
