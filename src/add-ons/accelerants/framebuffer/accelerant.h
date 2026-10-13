@@ -25,9 +25,6 @@ typedef struct accelerant_info {
 	area_id				frame_buffer_area;
 		// cloned framebuffer
 	void*				frame_buffer;
-
-	int					retrace_device;
-		// the GPU driver that tells the display's vertical blanks
 } accelerant_info;
 
 extern accelerant_info *gInfo;

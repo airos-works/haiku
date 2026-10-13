@@ -9,7 +9,8 @@ frame buffer, OpenGL/GLES/EGL on radeonsi, Vulkan 1.4 on RADV (including
 windows through the Wayland server), and H.264/HEVC/Main 10 decoding on UVD
 in airTime and (H.264) Summit. The system is master hrev60206+1165.
 [AMDGPU-DRM.md](AMDGPU-DRM.md) has the details and limits; the native
-driver's record below is history.
+driver (removed from the tree on 2026-10-13) and its record below are
+history.
 
 **2026-10-11 WX 5100 status:** the X399 now has a Radeon Pro WX 5100.
 Current driver `a4aebce1…` and private Mesa `42352938…` remain installed.

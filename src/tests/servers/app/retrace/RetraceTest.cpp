@@ -24,8 +24,6 @@
 	outpace; without, they end anywhere. Scan line sources:
 		--line sunxi	the Cubie A7S (TCON-TV1; the lab's driver settings
 						allow the register reads)
-		--line amdgpu	the Radeon Pro WX 5100 (the DCE head showing the
-						boot frame buffer)
 */
 
 
@@ -46,7 +44,6 @@
 #include <View.h>
 #include <Window.h>
 
-#include <amdgpu_haiku.h>
 #include <sunxi_display.h>
 
 
@@ -113,50 +110,6 @@ struct SunxiScanLine : ScanLine {
 };
 
 
-/*!	CRTC_STATUS_POSITION of the head that shows the boot frame buffer (the
-	first enabled one). The DCE counts lines from the start of the vertical
-	sync; the blank runs from CRTC_V_BLANK_START to CRTC_V_BLANK_END.
-*/
-struct AmdgpuScanLine : ScanLine {
-	AmdgpuScanLine()
-	{
-		fDevice = open("/dev/" AMDGPU_DEVICE_NAME, O_RDWR);
-	}
-
-	~AmdgpuScanLine()
-	{
-		if (fDevice >= 0)
-			close(fDevice);
-	}
-
-	bool Read(int32& line, int32& total, int32& blankStart)
-	{
-		if (fDevice < 0)
-			return false;
-		amdgpu_display_snapshot snapshot = {};
-		snapshot.version = AMDGPU_HAIKU_ABI_VERSION;
-		snapshot.size = sizeof(snapshot);
-		if (ioctl(fDevice, AMDGPU_DISPLAY_SNAPSHOT, &snapshot,
-				sizeof(snapshot)) != 0) {
-			return false;
-		}
-		for (uint32 i = 0; i < snapshot.head_count; i++) {
-			const uint32* r = snapshot.heads[i].registers;
-			if ((r[AMDGPU_DCE_CRTC_CONTROL] & 1) == 0)
-				continue;
-			raw = r[AMDGPU_DCE_POSITION];
-			line = raw & 0x3fff;
-			total = (r[AMDGPU_DCE_V_TOTAL] & 0x3fff) + 1;
-			blankStart = r[AMDGPU_DCE_V_BLANK] & 0x3fff;
-			return true;
-		}
-		return false;
-	}
-
-	int fDevice;
-};
-
-
 static ScanLine*
 scan_line_source(const char* name)
 {
@@ -165,8 +118,6 @@ scan_line_source(const char* name)
 	ScanLine* source = NULL;
 	if (strcmp(name, "sunxi") == 0)
 		source = new SunxiScanLine;
-	else if (strcmp(name, "amdgpu") == 0)
-		source = new AmdgpuScanLine;
 	else {
 		fprintf(stderr, "unknown scan line source %s\n", name);
 		exit(1);
@@ -433,11 +384,10 @@ test_lines(ScanLine* source)
 static void
 usage()
 {
-	fprintf(stderr, "usage: retrace_test blanks [seconds] [--line "
-		"sunxi|amdgpu]\n"
+	fprintf(stderr, "usage: retrace_test blanks [seconds] [--line sunxi]\n"
 		"       retrace_test draw [seconds] [--no-wait] [--update] [--size WxH] "
-		"[--line sunxi|amdgpu]\n"
-		"       retrace_test lines --line sunxi|amdgpu\n");
+		"[--line sunxi]\n"
+		"       retrace_test lines --line sunxi\n");
 	exit(1);
 }
 

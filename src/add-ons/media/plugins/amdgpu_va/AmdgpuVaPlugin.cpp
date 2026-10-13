@@ -7,9 +7,9 @@
 	orders the pictures, VA-API (Mesa's radeonsi driver on amdgpu_drm, the
 	GPU's UVD/VCN) decodes them. Decoded pictures are read into one VA image
 	kept for the stream, as NV12 or P010, and converted to what the caller
-	negotiated with the conversions of the amduvd add-on. (A new image for
-	every picture, as av_hwframe_transfer_data() makes, costs more than the
-	copy: its memory is new each time.)
+	negotiated with the conversions of H264Output and HevcOutput. (A new
+	image for every picture, as av_hwframe_transfer_data() makes, costs more
+	than the copy: its memory is new each time.)
 
 	It is installed as "amduvd": airTime and Summit load decoders by name,
 	NewDecoder(0) for H.264 and NewDecoder(1) for HEVC, and keep their
@@ -41,8 +41,8 @@ extern "C" {
 #include <emmintrin.h>
 #endif
 
-#include "../amduvd/H264Output.h"
-#include "../amduvd/HevcOutput.h"
+#include "H264Output.h"
+#include "HevcOutput.h"
 
 
 static const color_space kNV12 = (color_space)0x4e563132;
@@ -379,7 +379,7 @@ split_chroma_row(const uint8* source, uint8* u, uint8* v, uint32 pairs)
 
 /*!	The outputs that only rearrange the samples (NV12, I420, P010 of a P010
 	picture) are written straight from the VA image, without the copy the
-	amduvd conversions take their input in. */
+	conversions take their input in. */
 bool
 VaDecoder::_CopyPlanes(const uint8* data, bool p010, uint8* output)
 {
@@ -496,7 +496,7 @@ VaDecoder::_Convert(const AVFrame* frame, uint8* output)
 		return true;
 	}
 
-	// the layout the amduvd conversions take: luma rows, then the
+	// the layout the conversions take: luma rows, then the
 	// interleaved chroma rows, one pitch
 	uint32 sampleBytes = p010 ? 2 : 1;
 	uint32 pitch = frame->width * sampleBytes;
@@ -646,7 +646,7 @@ public:
 	virtual status_t GetSupportedFormats(media_format** formats, size_t* count)
 	{
 		// applications select this add-on by name and keep their own
-		// software decoders for what it refuses (as with amduvd)
+		// software decoders for what it refuses
 		if (formats != NULL)
 			*formats = NULL;
 		if (count != NULL)
