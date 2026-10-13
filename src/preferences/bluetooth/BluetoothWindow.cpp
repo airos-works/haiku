@@ -1440,10 +1440,11 @@ BluetoothWindow::_UpdateNearbyItem(NearbyDevice* device)
 		&& fOperationKey == device->key && !fOperationFromPaired;
 	bool twinListed = device->companionOf != 0
 		&& fNearby.find(device->companionOf) != fNearby.end();
+	const bool showAll = fShowUnnamed->Value() == B_CONTROL_ON;
 	bool show = operationDevice
 		|| (fPaired.find(device->key) == fPaired.end() && !twinListed
-			&& (device->HasName() || device->IsHID()
-				|| fShowUnnamed->Value() == B_CONTROL_ON));
+			&& (device->IsSupported() || showAll)
+			&& (device->HasName() || device->IsHID() || showAll));
 
 	if (!show) {
 		if (device->item != NULL)
@@ -1457,7 +1458,9 @@ BluetoothWindow::_UpdateNearbyItem(NearbyDevice* device)
 		detail = _OperationProgressText();
 	else {
 		detail = KindLabel(kind);
-		if (device->InPairingMode())
+		if (!device->IsSupported())
+			detail << " · " << B_TRANSLATE("Not supported");
+		else if (device->InPairingMode())
 			detail << " · " << B_TRANSLATE("Pairing mode");
 		else if (device->UsesLEPairing() && !device->connectable)
 			detail << " · " << B_TRANSLATE("Not accepting connections");

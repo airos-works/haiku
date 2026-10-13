@@ -494,9 +494,18 @@ NearbyDevice::UsesLEPairing() const
 bool
 NearbyDevice::CanConnect() const
 {
+	// Over LE only mice and keyboards (HID over GATT) can be set up; a
+	// speaker's or phone's LE beacon is not the device to pair with.
 	if (UsesLEPairing())
-		return connectable && leAddressType <= 1;
+		return connectable && leAddressType <= 1 && IsHID();
 	return hasClassic;
+}
+
+
+bool
+NearbyDevice::IsSupported() const
+{
+	return hasClassic || IsHID();
 }
 
 
