@@ -23,6 +23,14 @@
 #                           airos_* libraries, rock5_ffmpeg, firmware packages,
 #                           and (x86_64) HaikuPorts packages the build system's
 #                           repository list lacks
+#   AIROS_CI_FONTS          (arm64) HaikuPorts' noto and noto_sans_cjk_jp
+#                           packages, added as system packages in place of
+#                           the arm64 repository's bootstrap noto
+#   HAIKU_ARM64_FREETYPE_PACKAGES_DIR
+#                           (arm64) air/OS's freetype and freetype_devel
+#                           packages: build/jam/BuildFeatures compiles Haiku
+#                           against them and the top Jamfile puts freetype in
+#                           the image instead of the bootstrap FreeType 2.6.3
 #   AIROS_CI_LIBS           libraries for system/non-packaged/lib (GL stack)
 #   AIROS_CI_EGL            EGL vendor files for .../add-ons/opengl/egl_vendor.d
 #   AIROS_CI_DEMOS          demos for system/non-packaged/demos (GLTeapot)
@@ -143,6 +151,27 @@ rule UserBuildConfigRulePreImage
 		# arm64 release package readers may not support the repository's zstd.
 		if ! [ Glob $(AIROS_CI_PACKAGES) : ca_root_certificates-*-any.hpkg ] {
 			Exit "The arm64 image requires the ca_root_certificates package." ;
+		}
+		# The system fonts: the arm64 repository's bootstrap noto has no Noto
+		# Sans Mono, app_server's default fixed font, which then falls back to
+		# a proportional serif. Added as system packages (not files), they
+		# satisfy the haiku package's noto requirement when jam resolves the
+		# image's dependencies, so the bootstrap noto stays out.
+		local fonts = [ Glob $(AIROS_CI_FONTS) : noto-*-any.hpkg
+			noto_sans_cjk_jp-*-any.hpkg ] ;
+		if ! $(fonts[2]) {
+			Exit "The arm64 image requires the noto and noto_sans_cjk_jp"
+				"packages (AIROS_CI_FONTS)." ;
+		}
+		fonts = <airos-ci-font>$(fonts:BS) ;
+		SEARCH on $(fonts) = $(AIROS_CI_FONTS) ;
+		AddPackageFilesToHaikuImage system packages : $(fonts) ;
+		# FreeType 2.13.3 rather than the repository's bootstrap 2.6.3; the
+		# build system does the rest when the packages are named.
+		if ! [ Glob $(HAIKU_ARM64_FREETYPE_PACKAGES_DIR)
+				: freetype-*-arm64.hpkg ] {
+			Exit "The arm64 image requires air/OS's freetype packages"
+				"(HAIKU_ARM64_FREETYPE_PACKAGES_DIR)." ;
 		}
 		# Keep the legacy arm64 engine's CA path pointing at the packaged
 		# trust store used by curl and current engines.

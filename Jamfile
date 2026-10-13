@@ -19,8 +19,20 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 
 # Include required packages:
 # primary architecture
+# FreeType: on arm64, the freetype package BuildFeatures compiled against when
+# HAIKU_ARM64_FREETYPE_PACKAGES_DIR names air/OS's packages, rather than the
+# repository's bootstrap one.
+local freetypePackage = freetype ;
+if $(HAIKU_ARM64_FREETYPE_PACKAGES_DIR) && $(HAIKU_PACKAGING_ARCHS[1]) = arm64 {
+	freetypePackage = [ Glob $(HAIKU_ARM64_FREETYPE_PACKAGES_DIR)
+		: freetype-*-arm64.hpkg ] ;
+	freetypePackage = <arm64-freetype>$(freetypePackage:BS) ;
+	SEARCH on $(freetypePackage) = $(HAIKU_ARM64_FREETYPE_PACKAGES_DIR) ;
+	AddPackageFilesToHaikuImage system packages : $(freetypePackage) ;
+	freetypePackage = ;
+}
 AddHaikuImageSystemPackages [ FFilterByBuildFeatures
-	bash bc freetype zlib
+	bash bc $(freetypePackage) zlib
 
 	!gcc2 @{
 		coreutils
