@@ -20,7 +20,7 @@ HAIKU_ARM64_ZSTD_PACKAGES_DIR ?= /mnt/HaikuWork/rpi4/zstd/packages ;
 # USB webcam's MJPEG are built only with them; the full image ships them.
 HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR ?= /mnt/HaikuWork/rpi4/image-libs/packages ;
 
-# FreeType 2.13.3 and the current Noto fonts, as the air/OS CI images have
+# FreeType 2.14.3 and the current Noto fonts, as the air/OS CI images have
 # them: copies of the build server's freetype and freetype_devel (airos-ci
 # deps/recipes/freetype.sh) and of the zlib noto and noto_sans_cjk_jp its
 # images/build-image.sh stages. Without them the images keep the arm64

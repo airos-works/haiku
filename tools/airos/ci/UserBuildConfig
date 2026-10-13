@@ -31,6 +31,10 @@
 #                           packages: build/jam/BuildFeatures compiles Haiku
 #                           against them and the top Jamfile puts freetype in
 #                           the image instead of the bootstrap FreeType 2.6.3
+#   HAIKU_ARM64_LIBPNG_PACKAGES_DIR
+#                           (arm64) air/OS's libpng16 and libpng16_devel: the
+#                           libpng build feature (the PNG translator), and
+#                           libpng16 in the image for it and for FreeType
 #   AIROS_CI_LIBS           libraries for system/non-packaged/lib (GL stack)
 #   AIROS_CI_EGL            EGL vendor files for .../add-ons/opengl/egl_vendor.d
 #   AIROS_CI_DEMOS          demos for system/non-packaged/demos (GLTeapot)
@@ -166,13 +170,25 @@ rule UserBuildConfigRulePreImage
 		fonts = <airos-ci-font>$(fonts:BS) ;
 		SEARCH on $(fonts) = $(AIROS_CI_FONTS) ;
 		AddPackageFilesToHaikuImage system packages : $(fonts) ;
-		# FreeType 2.13.3 rather than the repository's bootstrap 2.6.3; the
+		# FreeType 2.14.3 rather than the repository's bootstrap 2.6.3; the
 		# build system does the rest when the packages are named.
 		if ! [ Glob $(HAIKU_ARM64_FREETYPE_PACKAGES_DIR)
 				: freetype-*-arm64.hpkg ] {
 			Exit "The arm64 image requires air/OS's freetype packages"
 				"(HAIKU_ARM64_FREETYPE_PACKAGES_DIR)." ;
 		}
+		# libpng, which the arm64 repository does not have: BuildFeatures
+		# builds the PNG translator with libpng16_devel, and the translator and
+		# FreeType need libpng16 in the image.
+		local libpng = [ Glob $(HAIKU_ARM64_LIBPNG_PACKAGES_DIR)
+			: libpng16-*-arm64.hpkg ] ;
+		if ! $(libpng) {
+			Exit "The arm64 image requires air/OS's libpng16 packages"
+				"(HAIKU_ARM64_LIBPNG_PACKAGES_DIR)." ;
+		}
+		libpng = <airos-ci-libpng>$(libpng:BS) ;
+		SEARCH on $(libpng) = $(HAIKU_ARM64_LIBPNG_PACKAGES_DIR) ;
+		AddPackageFilesToHaikuImage system packages : $(libpng) ;
 		# Keep the legacy arm64 engine's CA path pointing at the packaged
 		# trust store used by curl and current engines.
 		AddSymlinkToHaikuImage system non-packaged data ssl
