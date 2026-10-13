@@ -60,34 +60,49 @@ cpu_init_post_vm(kernel_args *args)
 }
 
 
-static void
-load_cpufreq_module()
+/*!	Gets the best ranked module of those in \a prefix. Only the one it
+	returns is still loaded: the others were put again before anybody could
+	use them. (The other CPUs already run when the modules are loaded, so
+	the one in use must not be replaced by a better one found later: that
+	unloaded the first one under the CPUs idling in it.)
+*/
+template<typename ModuleInfo>
+static ModuleInfo*
+get_best_cpu_module(const char* prefix)
 {
-	void* cookie = open_module_list(CPUFREQ_MODULES_PREFIX);
+	ModuleInfo* best = NULL;
 
+	void* cookie = open_module_list(prefix);
 	while (true) {
 		char name[B_FILE_NAME_LENGTH];
 		size_t nameLength = sizeof(name);
-		cpufreq_module_info* current = NULL;
-
 		if (read_next_module_name(cookie, name, &nameLength) != B_OK)
 			break;
 
-		if (get_module(name, (module_info**)&current) == B_OK) {
-			dprintf("found cpufreq module: %s\n", name);
+		ModuleInfo* current = NULL;
+		if (get_module(name, (module_info**)&current) != B_OK)
+			continue;
 
-			if (sCPUPerformanceModule != NULL) {
-				if (sCPUPerformanceModule->rank < current->rank) {
-					put_module(sCPUPerformanceModule->info.name);
-					sCPUPerformanceModule = current;
-				} else
-					put_module(name);
-			} else
-				sCPUPerformanceModule = current;
-		}
+		dprintf("found %s module: %s\n", prefix, name);
+
+		if (best == NULL || best->rank < current->rank) {
+			if (best != NULL)
+				put_module(best->info.name);
+			best = current;
+		} else
+			put_module(name);
 	}
-
 	close_module_list(cookie);
+
+	return best;
+}
+
+
+static void
+load_cpufreq_module()
+{
+	sCPUPerformanceModule
+		= get_best_cpu_module<cpufreq_module_info>(CPUFREQ_MODULES_PREFIX);
 
 	if (sCPUPerformanceModule == NULL)
 		dprintf("no valid cpufreq module found\n");
@@ -99,34 +114,16 @@ load_cpufreq_module()
 static void
 load_cpuidle_module()
 {
-	void* cookie = open_module_list(CPUIDLE_MODULES_PREFIX);
-
-	while (true) {
-		char name[B_FILE_NAME_LENGTH];
-		size_t nameLength = sizeof(name);
-		cpuidle_module_info* current = NULL;
-
-		if (read_next_module_name(cookie, name, &nameLength) != B_OK)
-			break;
-
-		if (get_module(name, (module_info**)&current) == B_OK) {
-			dprintf("found cpuidle module: %s\n", name);
-
-			if (sCPUIdleModule != NULL) {
-				if (sCPUIdleModule->rank < current->rank) {
-					put_module(sCPUIdleModule->info.name);
-					sCPUIdleModule = current;
-				} else
-					put_module(name);
-			} else
-				sCPUIdleModule = current;
-		}
+	cpuidle_module_info* module
+		= get_best_cpu_module<cpuidle_module_info>(CPUIDLE_MODULES_PREFIX);
+	if (module == NULL) {
+		dprintf("no valid cpuidle module found\n");
+		return;
 	}
 
-	close_module_list(cookie);
-
-	if (sCPUIdleModule == NULL)
-		dprintf("no valid cpuidle module found\n");
+	dprintf("using cpuidle module %s\n", module->info.name);
+	memory_write_barrier();
+	sCPUIdleModule = module;
 }
 
 
