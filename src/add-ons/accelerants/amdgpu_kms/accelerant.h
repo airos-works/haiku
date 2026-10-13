@@ -173,6 +173,8 @@ status_t amdgpu_get_pixel_clock_limits(display_mode* mode, uint32* low,
 uint32 amdgpu_dpms_capabilities(void);
 uint32 amdgpu_dpms_mode(void);
 status_t amdgpu_set_dpms_mode(uint32 mode);
+status_t amdgpu_set_brightness(float brightness);
+status_t amdgpu_get_brightness(float* brightness);
 bool connected_outputs_changed(void);
 
 // layout.cpp
