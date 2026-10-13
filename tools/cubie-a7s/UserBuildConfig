@@ -20,6 +20,21 @@ HAIKU_ARM64_ZSTD_PACKAGES_DIR ?= /mnt/HaikuWork/rpi4/zstd/packages ;
 # USB webcam's MJPEG are built only with them; the full image ships them.
 HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR ?= /mnt/HaikuWork/rpi4/image-libs/packages ;
 
+# FreeType 2.13.3 and the current Noto fonts, as the air/OS CI images have
+# them: copies of the build server's freetype and freetype_devel (airos-ci
+# deps/recipes/freetype.sh) and of the zlib noto and noto_sans_cjk_jp its
+# images/build-image.sh stages. Without them the images keep the arm64
+# repository's bootstrap FreeType 2.6.3 and Noto, which has no Noto Sans
+# Mono: the fixed font falls back to a proportional serif.
+HAIKU_ARM64_FREETYPE_PACKAGES_DIR ?= /mnt/HaikuWork/airos/arm64-freetype ;
+CUBIE_FONT_PACKAGES_DIR ?= /mnt/HaikuWork/airos/arm64-fonts ;
+if ! [ Glob $(HAIKU_ARM64_FREETYPE_PACKAGES_DIR) : freetype-*-arm64.hpkg ] {
+	Echo "cubie-a7s: no freetype packages in"
+		"$(HAIKU_ARM64_FREETYPE_PACKAGES_DIR), the image has the bootstrap"
+		"FreeType" ;
+	HAIKU_ARM64_FREETYPE_PACKAGES_DIR = ;
+}
+
 if $(HAIKU_BUILD_PROFILE) = minimum-cubie {
 	HAIKU_IMAGE_SIZE = 900 ;
 }
@@ -196,6 +211,19 @@ rule UserBuildConfigRulePreImage
 			<cubie-pkg>wpa_supplicant-2.11.haiku.1-1-arm64.hpkg ;
 		SEARCH on $(packages) = [ FDirName $(extras) packages ] ;
 		AddFilesToHaikuImage system packages : $(packages) ;
+
+		# The current Noto and its CJK fallback (CUBIE_FONT_PACKAGES_DIR), as
+		# system packages, so that the bootstrap noto stays out.
+		local fontPackages = [ Glob $(CUBIE_FONT_PACKAGES_DIR)
+			: noto-*-any.hpkg noto_sans_cjk_jp-*-any.hpkg ] ;
+		if $(fontPackages[2]) {
+			fontPackages = <cubie-font>$(fontPackages:BS) ;
+			SEARCH on $(fontPackages) = $(CUBIE_FONT_PACKAGES_DIR) ;
+			AddPackageFilesToHaikuImage system packages : $(fontPackages) ;
+		} else {
+			Echo "cubie-a7s: no noto packages in $(CUBIE_FONT_PACKAGES_DIR),"
+				"the image has the bootstrap noto" ;
+		}
 
 		# ...without the ROCK 5's hardware decoder in rock5_ffmpeg, which
 		# takes H.264 from FFmpeg and then fails (same file as the Pi's).

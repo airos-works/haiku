@@ -308,7 +308,37 @@ if [ IsPackageAvailable libvorbis_devel ] {
 
 
 # Freetype
-if [ IsPackageAvailable freetype_devel ] {
+if $(HAIKU_ARM64_FREETYPE_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = arm64 {
+	# The arm64 repository has only the bootstrap FreeType 2.6.3. air/OS
+	# builds a current one as HaikuPorts' freetype and freetype_devel
+	# (airos-ci deps/recipes/freetype.sh); the top Jamfile puts this freetype
+	# package in the image instead of the repository's.
+	local packageDirectory = $(HAIKU_ARM64_FREETYPE_PACKAGES_DIR) ;
+	local base = [ Glob $(packageDirectory) : freetype-*-arm64.hpkg ] ;
+	local devel = [ Glob $(packageDirectory) : freetype_devel-*-arm64.hpkg ] ;
+	if ! $(base) || ! $(devel) || $(base[2]) || $(devel[2]) {
+		Exit "Need one arm64 freetype and one freetype_devel package in"
+			$(packageDirectory) ;
+	}
+	local directory = [ FDirName $(HAIKU_OPTIONAL_BUILD_PACKAGES_DIR)
+		airos-$(base:B) ] ;
+	# Extraction shares the prefix (including .PackageInfo), so serialize it.
+	Depends $(directory:G=freetype-devel) : $(directory:G=freetype-base) ;
+	SetBuildFeatureAttribute freetype : runtime
+		: [ ExtractArchive $(directory:G=freetype-base) : lib
+			: $(base) : extracted-arm64-freetype-base ] : base ;
+	SetBuildFeatureAttribute freetype : library
+		: [ ExtractArchive $(directory:G=freetype-devel)
+			: develop/lib/libfreetype.so
+			: $(devel) : extracted-arm64-freetype-devel ] : devel ;
+	SetBuildFeatureAttribute freetype : headers
+		: [ ExtractArchive $(directory:G=freetype-devel)
+			: develop/headers develop/headers/freetype2
+			: $(devel) : extracted-arm64-freetype-devel ] : devel ;
+	SetBuildFeatureAttribute freetype : base:directory : $(directory) ;
+	SetBuildFeatureAttribute freetype : devel:directory : $(directory) ;
+	EnableBuildFeatures freetype ;
+} else if [ IsPackageAvailable freetype_devel ] {
 	ExtractBuildFeatureArchives freetype :
 		file: base freetype
 			runtime: lib
