@@ -20,8 +20,9 @@
 //                into memory and into a pixel pack buffer, padding untouched
 //                (reading/read-pixels-pack-parameters)
 //   fboread      glReadPixels from a texture of each colour-renderable
-//                format, in its own and the implementation's read format
-//                (reading/read-pixels-from-fbo-test)
+//                format, in its own, the implementation's and ANGLE's read
+//                format (reading/read-pixels-from-fbo-test: ANGLE reports
+//                its own implementation read format to WebGL)
 //   blit         glBlitFramebuffer with source and destination partly
 //                outside the buffers (rendering/blitframebuffer-filter-
 //                outofbounds; Mesa core asserted on one)
@@ -838,6 +839,73 @@ fbo_read(const struct fbo_case* c, GLenum readFormat, GLenum readType,
 		want[3]);
 }
 
+// The implementation read format and type ANGLE's frontend reports for a
+// sized internal format (its format table), which WebGL then reads with:
+// the GL must accept it whatever the storage format is.
+static void
+angle_read_format(GLenum internalFormat, GLenum* format, GLenum* type)
+{
+	switch (internalFormat) {
+		case GL_R8: *format = GL_RED; *type = GL_UNSIGNED_BYTE; return;
+		case GL_RG8: *format = GL_RG; *type = GL_UNSIGNED_BYTE; return;
+		case GL_RGB8: *format = GL_RGB; *type = GL_UNSIGNED_BYTE; return;
+		case GL_RGB565:
+			*format = GL_RGB;
+			*type = GL_UNSIGNED_SHORT_5_6_5;
+			return;
+		case GL_RGBA8: case GL_SRGB8_ALPHA8:
+			*format = GL_RGBA;
+			*type = GL_UNSIGNED_BYTE;
+			return;
+		case GL_RGB5_A1:
+			*format = GL_RGBA;
+			*type = GL_UNSIGNED_SHORT_5_5_5_1;
+			return;
+		case GL_RGBA4:
+			*format = GL_RGBA;
+			*type = GL_UNSIGNED_SHORT_4_4_4_4;
+			return;
+		case GL_RGB10_A2:
+			*format = GL_RGBA;
+			*type = GL_UNSIGNED_INT_2_10_10_10_REV;
+			return;
+		case GL_RGB10_A2UI:
+			*format = GL_RGBA_INTEGER;
+			*type = GL_UNSIGNED_INT_2_10_10_10_REV;
+			return;
+	}
+	// integer formats: the component count's format, the component type
+	static const struct { GLenum internal, format, type; } kInteger[] = {
+		{ GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE },
+		{ GL_R8I, GL_RED_INTEGER, GL_BYTE },
+		{ GL_R16UI, GL_RED_INTEGER, GL_UNSIGNED_SHORT },
+		{ GL_R16I, GL_RED_INTEGER, GL_SHORT },
+		{ GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT },
+		{ GL_R32I, GL_RED_INTEGER, GL_INT },
+		{ GL_RG8UI, GL_RG_INTEGER, GL_UNSIGNED_BYTE },
+		{ GL_RG8I, GL_RG_INTEGER, GL_BYTE },
+		{ GL_RG16UI, GL_RG_INTEGER, GL_UNSIGNED_SHORT },
+		{ GL_RG16I, GL_RG_INTEGER, GL_SHORT },
+		{ GL_RG32UI, GL_RG_INTEGER, GL_UNSIGNED_INT },
+		{ GL_RG32I, GL_RG_INTEGER, GL_INT },
+		{ GL_RGBA8UI, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE },
+		{ GL_RGBA8I, GL_RGBA_INTEGER, GL_BYTE },
+		{ GL_RGBA16UI, GL_RGBA_INTEGER, GL_UNSIGNED_SHORT },
+		{ GL_RGBA16I, GL_RGBA_INTEGER, GL_SHORT },
+		{ GL_RGBA32UI, GL_RGBA_INTEGER, GL_UNSIGNED_INT },
+		{ GL_RGBA32I, GL_RGBA_INTEGER, GL_INT },
+	};
+	for (unsigned i = 0; i < sizeof(kInteger) / sizeof(kInteger[0]); i++) {
+		if (kInteger[i].internal == internalFormat) {
+			*format = kInteger[i].format;
+			*type = kInteger[i].type;
+			return;
+		}
+	}
+	*format = GL_RGBA;
+	*type = GL_UNSIGNED_BYTE;
+}
+
 static void
 case_fboread(void)
 {
@@ -891,6 +959,11 @@ case_fboread(void)
 		snprintf(how, sizeof(how), "in the implementation format 0x%x/0x%x",
 			implFormat, implType);
 		fbo_read(c, implFormat, implType, how);
+		GLenum angleFormat, angleType;
+		angle_read_format(c->internalFormat, &angleFormat, &angleType);
+		snprintf(how, sizeof(how), "in ANGLE's read format 0x%x/0x%x",
+			angleFormat, angleType);
+		fbo_read(c, angleFormat, angleType, how);
 		delete_fbo(fbo, texture);
 		if (sGetGraphicsResetStatus != NULL
 				&& sGetGraphicsResetStatus() != GL_NO_ERROR) {

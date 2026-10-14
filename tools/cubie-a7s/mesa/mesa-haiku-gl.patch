@@ -167,6 +167,12 @@ WebGL 2 conformance (Khronos conformance2 in Summit, through ANGLE):
       wholly outside the draw buffer (blitframebuffer-filter-outofbounds);
       rejected before the destination clip, which asserted (the WebProcess
       died in assertion builds)
+  src/mesa/main/framebuffer.c
+      GLES: the implementation read format and type of RGB8, RGB565,
+      RGBA4 and RGB5_A1 are ES 3.0's for the internal format, whatever the
+      driver stores (RGB8 and RGBA4 as RGBA8 here): ANGLE reports those to
+      WebGL and passes the reads through, which Mesa refused, and ANGLE
+      then lost the context (read-pixels-from-fbo-test)
 Left to ANGLE, which decides them before Mesa sees the call:
 immutable-tex-render-feedback (a mutable texture's base level above its
 max level is attachable) and blitframebuffer-test's sRGB-to-linear
@@ -2744,6 +2750,78 @@ diff -ruN a/src/gallium/winsys/sw/hgl/meson.build b/src/gallium/winsys/sw/hgl/me
 +  dependencies: [idep_mesautil, idep_mesautilformat],
    build_by_default : false,
  )
+diff -ruN a/src/mesa/main/framebuffer.c b/src/mesa/main/framebuffer.c
+--- a/src/mesa/main/framebuffer.c
++++ b/src/mesa/main/framebuffer.c
+@@ -846,6 +846,44 @@
+ }
+ 
+ /**
++ * On GLES, the read format and type of a renderbuffer whose sized internal
++ * format the driver stores in a wider format (RGB8 as RGBA8, RGBA4 as
++ * RGBA8, ...): the format and type OpenGL ES 3.0's Table 3.2 gives that
++ * internal format. What is read is converted anyway, and ANGLE reports
++ * these as WebGL's implementation read format whatever the driver says,
++ * then passes the reads through.
++ */
++static bool
++es_read_format_and_type(const struct gl_context *ctx,
++                        const struct gl_renderbuffer *rb,
++                        GLenum *format, GLenum *type)
++{
++   if (!_mesa_is_gles(ctx))
++      return false;
++
++   switch (rb->InternalFormat) {
++   case GL_RGB8:
++      *format = GL_RGB;
++      *type = GL_UNSIGNED_BYTE;
++      return true;
++   case GL_RGB565:
++      *format = GL_RGB;
++      *type = GL_UNSIGNED_SHORT_5_6_5;
++      return true;
++   case GL_RGBA4:
++      *format = GL_RGBA;
++      *type = GL_UNSIGNED_SHORT_4_4_4_4;
++      return true;
++   case GL_RGB5_A1:
++      *format = GL_RGBA;
++      *type = GL_UNSIGNED_SHORT_5_5_5_1;
++      return true;
++   default:
++      return false;
++   }
++}
++
++/**
+  * Used to answer the GL_IMPLEMENTATION_COLOR_READ_FORMAT_OES queries (using
+  * GetIntegerv, GetFramebufferParameteriv, etc)
+  *
+@@ -894,6 +932,11 @@
+    }
+    else {
+       const mesa_format format = fb->_ColorReadBuffer->Format;
++      GLenum es_format, es_type;
++
++      if (es_read_format_and_type(ctx, fb->_ColorReadBuffer, &es_format,
++                                  &es_type))
++         return es_format;
+ 
+       switch (format) {
+       case MESA_FORMAT_RGBA_UINT8:
+@@ -970,6 +1013,11 @@
+    }
+    else {
+       const mesa_format format = fb->_ColorReadBuffer->Format;
++      GLenum es_format, es_type;
++
++      if (es_read_format_and_type(ctx, fb->_ColorReadBuffer, &es_format,
++                                  &es_type))
++         return es_type;
+       return _mesa_uncompressed_format_to_type(format);
+    }
+ }
 diff -ruN a/src/mesa/main/image.c b/src/mesa/main/image.c
 --- a/src/mesa/main/image.c
 +++ b/src/mesa/main/image.c
