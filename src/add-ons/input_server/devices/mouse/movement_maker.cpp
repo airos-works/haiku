@@ -279,6 +279,7 @@ TouchpadMovement::TouchpadMovement()
 	fTapStarted = false;
 	fValidEdgeMotion = false;
 	fDoubleClick = false;
+	fFingers = 0;
 }
 
 TouchpadMovement::~TouchpadMovement() {
@@ -336,6 +337,16 @@ TouchpadMovement::EventToMovement(const touchpad_movement* _event, mouse_movemen
 	if (!_ClickFingerButtonEmulator(&event2))
 		_SoftwareButtonAreas(&event2);
 	const touchpad_movement* event = &event2;
+
+	// Where several fingers are is the point between them, which jumps when
+	// one of them comes or goes (lifting two fingers after scrolling ends in
+	// a frame with one): that is not a movement.
+	uint32 fingers = count_set_bits(event->fingers);
+	if (fingers != fFingers) {
+		if (fingers != 0 && fFingers != 0)
+			StartNewMovment();
+		fFingers = fingers;
+	}
 
 	if ((movement->timestamp - fTapTime) > fTapTimeOUT) {
 		if (fTapStarted)

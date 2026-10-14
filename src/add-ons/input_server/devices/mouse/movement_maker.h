@@ -100,6 +100,7 @@ private:
 			float				fRestEdgeMotion;
 
 			bool				fDoubleClick;
+			uint32				fFingers;
 
 			bigtime_t			fClickLastTime;
 			int32				fClickCount;
