@@ -131,6 +131,12 @@ shared V3D bitmaps, plus the zink pieces of the air/OS x86_64 fork
       cached token address is dropped when its shader is deleted
   include/renderdoc_app.h
       calling convention on Haiku
+  src/egl/drivers/haiku/egl_haiku.cpp, src/gallium/frontends/hgl/hgl.c
+      allow_compressed_fallback, the DRI loader's default: compressed
+      texture formats the driver lacks (RGTC on zink over PowerVR) are
+      decompressed in software; OpenGL 3.0 needs
+      ARB_texture_compression_rgtc, and without this zink stayed at 2.1 on
+      the board while the Linux shim reported 3.2
   src/util/disk_cache.c
       disk_cache_wait_for_idle() leaves a cache whose queue was never made
       alone, as disk_cache_put() and disk_cache_destroy() already do. With
@@ -808,7 +814,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
     haiku_display_destroy(disp);
     return EGL_TRUE;
  }
-@@ -428,8 +665,9 @@
+@@ -428,8 +665,14 @@
  
     struct haiku_egl_display *hgl_dpy = haiku_egl_display(disp);
  
@@ -817,10 +823,15 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
 +   struct st_context_attribs attribs = {};
 +   enum st_context_error error = ST_CONTEXT_SUCCESS;
 +   hgl_get_st_visual(&attribs.visual, HGL_DOUBLE | HGL_ALPHA | HGL_DEPTH);
++   /* (air/OS) As the DRI loader's default (driinfo_gallium.h): compressed
++    * texture formats the driver lacks (RGTC on zink over PowerVR) are
++    * decompressed in software. OpenGL 3.0 needs ARB_texture_compression_rgtc.
++    */
++   attribs.options.allow_compressed_fallback = true;
  
     struct haiku_egl_context *context =
        (struct haiku_egl_context *)calloc(1, sizeof(*context));
-@@ -441,11 +679,56 @@
+@@ -441,11 +684,56 @@
     if (!_eglInitContext(&context->base, disp, conf, share_list, attrib_list))
        goto cleanup;
  
@@ -881,7 +892,7 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
  
     return &context->base;
  
-@@ -488,23 +771,61 @@
+@@ -488,23 +776,61 @@
        return EGL_TRUE;
     }
  
@@ -955,24 +966,13 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
  
     return EGL_TRUE;
  }
-@@ -519,5 +840,6 @@
+@@ -519,5 +845,6 @@
     .CreatePixmapSurface = haiku_create_pixmap_surface,
     .CreatePbufferSurface = haiku_create_pbuffer_surface,
     .DestroySurface = haiku_destroy_surface,
 +   .QuerySurface = haiku_query_surface,
     .SwapBuffers = haiku_swap_buffers,
  };
-diff -ruN a/src/egl/egl-glvnd-symbols.txt b/src/egl/egl-glvnd-symbols.txt
---- a/src/egl/egl-glvnd-symbols.txt
-+++ b/src/egl/egl-glvnd-symbols.txt
-@@ -2,3 +2,7 @@
- MesaGLInteropEGLQueryDeviceInfo
- MesaGLInteropEGLExportObject
- MesaGLInteropEGLFlushObjects
-+haiku_mesa_readback_band_bytes (optional)
-+summit_haiku_present_framebuffer (optional)
-+summit_haiku_present_wait_idle (optional)
-+summit_haiku_present_release (optional)
 diff -ruN a/src/egl/egl-glvnd.sym b/src/egl/egl-glvnd.sym
 --- a/src/egl/egl-glvnd.sym
 +++ b/src/egl/egl-glvnd.sym
@@ -986,10 +986,10 @@ diff -ruN a/src/egl/egl-glvnd.sym b/src/egl/egl-glvnd.sym
  		__egl_Main;
  		MesaGLInteropEGLQueryDeviceInfo;
  		MesaGLInteropEGLExportObject;
-diff -ruN a/src/egl/egl-symbols.txt b/src/egl/egl-symbols.txt
---- a/src/egl/egl-symbols.txt
-+++ b/src/egl/egl-symbols.txt
-@@ -45,3 +45,7 @@
+diff -ruN a/src/egl/egl-glvnd-symbols.txt b/src/egl/egl-glvnd-symbols.txt
+--- a/src/egl/egl-glvnd-symbols.txt
++++ b/src/egl/egl-glvnd-symbols.txt
+@@ -2,3 +2,7 @@
  MesaGLInteropEGLQueryDeviceInfo
  MesaGLInteropEGLExportObject
  MesaGLInteropEGLFlushObjects
@@ -1010,6 +1010,17 @@ diff -ruN a/src/egl/egl.sym b/src/egl/egl.sym
  		egl*;
  		MesaGLInteropEGL*;
  	local:
+diff -ruN a/src/egl/egl-symbols.txt b/src/egl/egl-symbols.txt
+--- a/src/egl/egl-symbols.txt
++++ b/src/egl/egl-symbols.txt
+@@ -45,3 +45,7 @@
+ MesaGLInteropEGLQueryDeviceInfo
+ MesaGLInteropEGLExportObject
+ MesaGLInteropEGLFlushObjects
++haiku_mesa_readback_band_bytes (optional)
++summit_haiku_present_framebuffer (optional)
++summit_haiku_present_wait_idle (optional)
++summit_haiku_present_release (optional)
 diff -ruN a/src/egl/meson.build b/src/egl/meson.build
 --- a/src/egl/meson.build
 +++ b/src/egl/meson.build
@@ -2060,6 +2071,73 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.c b/src/gallium/drivers/
 +   wait_idle_locked();
 +   pthread_mutex_unlock(&state.lock);
 +}
+diff -ruN a/src/gallium/drivers/zink/zink_haiku_present_gl.c b/src/gallium/drivers/zink/zink_haiku_present_gl.c
+--- a/src/gallium/drivers/zink/zink_haiku_present_gl.c
++++ b/src/gallium/drivers/zink/zink_haiku_present_gl.c
+@@ -0,0 +1,63 @@
++/*
++ * Summit's entry points to zink_haiku_present.h, for the current OpenGL
++ * (ES) context. Summit's web process composites each page into a
++ * framebuffer object and finds these with get_image_symbol() in
++ * libEGL_mesa, so EGL's dispatch tables stay as they are. Built into the
++ * Haiku EGL driver, and into the DRI driver of the Linux host build, where
++ * build.sh's smoke test calls them.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++#include <string.h>
++
++#include "main/glthread.h"
++#include "main/mtypes.h"
++#include "glapi/glapi/glapi.h"
++#include "state_tracker/st_context.h"
++#include "util/macros.h"
++
++#include "zink/zink_haiku_present.h"
++
++/* The framebuffer object must be the one bound for drawing, as it is when a
++ * frame has just been composited into it. Returns 0 when the copies were
++ * submitted, a negative number when the caller has to present some other
++ * way (see zink_haiku_present.h; -10: no current context or not a zink one,
++ * -11: that framebuffer object is not bound or has no colour renderbuffer).
++ */
++PUBLIC int
++summit_haiku_present_framebuffer(unsigned framebuffer,
++                                 const struct summit_haiku_present *present)
++{
++   GET_CURRENT_CONTEXT(ctx);
++   if (ctx == NULL || ctx->st == NULL)
++      return -10;
++   _mesa_glthread_finish(ctx);
++
++   struct st_context *st = ctx->st;
++   struct pipe_screen *screen = st->screen;
++   if (screen == NULL || screen->get_name == NULL
++       || strncmp(screen->get_name(screen), "zink", 4) != 0)
++      return -10;
++
++   struct gl_framebuffer *fb = ctx->DrawBuffer;
++   if (fb == NULL || framebuffer == 0 || fb->Name != framebuffer)
++      return -11;
++   struct gl_renderbuffer *rb = fb->Attachment[BUFFER_COLOR0].Renderbuffer;
++   if (rb == NULL || rb->texture == NULL)
++      return -11;
++
++   return zink_haiku_present(st->pipe, rb->texture, present);
++}
++
++PUBLIC void
++summit_haiku_present_wait_idle(void)
++{
++   zink_haiku_present_wait_idle();
++}
++
++PUBLIC void
++summit_haiku_present_release(void)
++{
++   zink_haiku_present_release(NULL);
++}
 diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.h b/src/gallium/drivers/zink/zink_haiku_present.h
 --- a/src/gallium/drivers/zink/zink_haiku_present.h
 +++ b/src/gallium/drivers/zink/zink_haiku_present.h
@@ -2153,73 +2231,6 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.h b/src/gallium/drivers/
 +#endif
 +
 +#endif /* ZINK_HAIKU_PRESENT_H */
-diff -ruN a/src/gallium/drivers/zink/zink_haiku_present_gl.c b/src/gallium/drivers/zink/zink_haiku_present_gl.c
---- a/src/gallium/drivers/zink/zink_haiku_present_gl.c
-+++ b/src/gallium/drivers/zink/zink_haiku_present_gl.c
-@@ -0,0 +1,63 @@
-+/*
-+ * Summit's entry points to zink_haiku_present.h, for the current OpenGL
-+ * (ES) context. Summit's web process composites each page into a
-+ * framebuffer object and finds these with get_image_symbol() in
-+ * libEGL_mesa, so EGL's dispatch tables stay as they are. Built into the
-+ * Haiku EGL driver, and into the DRI driver of the Linux host build, where
-+ * build.sh's smoke test calls them.
-+ *
-+ * SPDX-License-Identifier: MIT
-+ */
-+
-+#include <string.h>
-+
-+#include "main/glthread.h"
-+#include "main/mtypes.h"
-+#include "glapi/glapi/glapi.h"
-+#include "state_tracker/st_context.h"
-+#include "util/macros.h"
-+
-+#include "zink/zink_haiku_present.h"
-+
-+/* The framebuffer object must be the one bound for drawing, as it is when a
-+ * frame has just been composited into it. Returns 0 when the copies were
-+ * submitted, a negative number when the caller has to present some other
-+ * way (see zink_haiku_present.h; -10: no current context or not a zink one,
-+ * -11: that framebuffer object is not bound or has no colour renderbuffer).
-+ */
-+PUBLIC int
-+summit_haiku_present_framebuffer(unsigned framebuffer,
-+                                 const struct summit_haiku_present *present)
-+{
-+   GET_CURRENT_CONTEXT(ctx);
-+   if (ctx == NULL || ctx->st == NULL)
-+      return -10;
-+   _mesa_glthread_finish(ctx);
-+
-+   struct st_context *st = ctx->st;
-+   struct pipe_screen *screen = st->screen;
-+   if (screen == NULL || screen->get_name == NULL
-+       || strncmp(screen->get_name(screen), "zink", 4) != 0)
-+      return -10;
-+
-+   struct gl_framebuffer *fb = ctx->DrawBuffer;
-+   if (fb == NULL || framebuffer == 0 || fb->Name != framebuffer)
-+      return -11;
-+   struct gl_renderbuffer *rb = fb->Attachment[BUFFER_COLOR0].Renderbuffer;
-+   if (rb == NULL || rb->texture == NULL)
-+      return -11;
-+
-+   return zink_haiku_present(st->pipe, rb->texture, present);
-+}
-+
-+PUBLIC void
-+summit_haiku_present_wait_idle(void)
-+{
-+   zink_haiku_present_wait_idle();
-+}
-+
-+PUBLIC void
-+summit_haiku_present_release(void)
-+{
-+   zink_haiku_present_release(NULL);
-+}
 diff -ruN a/src/gallium/drivers/zink/zink_resource.c b/src/gallium/drivers/zink/zink_resource.c
 --- a/src/gallium/drivers/zink/zink_resource.c
 +++ b/src/gallium/drivers/zink/zink_resource.c
@@ -2493,7 +2504,7 @@ diff -ruN a/src/gallium/frontends/hgl/hgl.c b/src/gallium/frontends/hgl/hgl.c
  
  	int i;
  	for (i = 0; i < ST_ATTACHMENT_COUNT; i++)
-@@ -264,10 +294,6 @@
+@@ -264,20 +294,33 @@
  struct hgl_context*
  hgl_create_context(struct hgl_display *display, struct st_visual* visual, struct st_context* shared)
  {
@@ -2504,7 +2515,11 @@ diff -ruN a/src/gallium/frontends/hgl/hgl.c b/src/gallium/frontends/hgl/hgl.c
  	struct st_context_attribs attribs;
  	memset(&attribs, 0, sizeof(attribs));
  	attribs.options.force_glsl_extensions_warn = false;
-@@ -277,7 +303,22 @@
++	/* (air/OS) As the DRI loader's default: see egl_haiku.cpp. */
++	attribs.options.allow_compressed_fallback = true;
+ 	attribs.profile = API_OPENGL_COMPAT;
+ 	attribs.visual = *visual;
+ 	attribs.major = 1;
  	attribs.minor = 0;
  
  	enum st_context_error result;
@@ -2528,7 +2543,7 @@ diff -ruN a/src/gallium/frontends/hgl/hgl.c b/src/gallium/frontends/hgl/hgl.c
  	if (context->st == NULL) {
  		FREE(context);
  		return NULL;
-@@ -310,6 +351,7 @@
+@@ -310,6 +353,7 @@
  	CALLED();
  
  	assert(visual);
@@ -2536,7 +2551,7 @@ diff -ruN a/src/gallium/frontends/hgl/hgl.c b/src/gallium/frontends/hgl/hgl.c
  
  	// Determine color format
  	if ((options & HGL_INDEX) != 0) {
-@@ -358,9 +400,13 @@
+@@ -358,9 +402,13 @@
  	struct hgl_display* display;
  
  	display = CALLOC_STRUCT(hgl_display);

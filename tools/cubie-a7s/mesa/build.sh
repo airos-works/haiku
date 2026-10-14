@@ -48,7 +48,8 @@ PATCHES=(mesa-haiku-pvr.patch mesa-haiku-gl.patch)
 TESTS=(pvr_vkprobe pvr_vkfill pvr_vkfence pvr_vktriangle pvr_vkhang
 	pvr_vkbench pvr_present pvr_copybench)
 # OpenGL ES programs (through libglvnd's libEGL/libGLESv2)
-GL_TESTS=(pvr_glprobe pvr_glbench pvr_glreset pvr_glpresent pvr_glcomposite)
+GL_TESTS=(pvr_glprobe pvr_glbench pvr_glreset pvr_glpresent pvr_glcomposite
+	pvr_glxfb)
 # the runtime loader's thread-local storage for dlopen()ed libraries: a
 # program and the library it loads, built from one file
 TLS_CHECK=(tls_generation_check libtls_generation_check.so)
@@ -558,6 +559,7 @@ shim() {
 		"SCANOUT=640x480 pvr_glpresent --shim --front-bpr 2560" \
 		"pvr_glbench --seconds 3 --interval 1 --expect zink" \
 		"pvr_glcomposite --frames 2 --shim --expect zink" \
+		"pvr_glxfb --shim" "pvr_glxfb --shim --desktop" \
 		"pvr_vkbench --dispatches 60 --timeline --rerecord --mark" \
 		"pvr_glbench --frames 60 --mark" \
 		"pvr_glbench --frames 60 --resize 5 --mark"; do
@@ -578,6 +580,7 @@ shim() {
 		*--cached) name=$name-cached ;;
 		*--expect-none) name=$name-none ;;
 		*--expect*) name=$name-expect-zink ;;
+		*--desktop*) name=$name-desktop ;;
 		esac
 		[ -z "$scanout" ] || name=$name-scanout
 		(ulimit -s 256

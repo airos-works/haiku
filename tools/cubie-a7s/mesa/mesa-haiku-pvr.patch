@@ -237,6 +237,41 @@ it).
                                     the ISP/ZLS/pixel control words, to match
                                     slow 3D jobs in a firmware trace with the
                                     renders that made them
+  pvr_xfb.[ch], pvr_arch_pipeline.c, VK_EXT_transform_feedback, emulated: a
+  pvr_arch_cmd_buffer.c,            vertex shader that captures outputs is
+  pvr_cmd_buffer.h, pvr_pipeline.h, also compiled as a compute kernel (one
+  pvr_query.[ch],                   invocation per output vertex, primitives
+  pvr_arch_cmd_query.c,             assembled as the draw would, strips and
+  pvr_arch_query_compute.c,         fans expanded, indices and instances read
+  pvr_arch_device.c, pvr_device.h,  by the kernel, attributes unpacked by
+  pvr_physical_device.c,            pco_nir_pvi as in the real shader). A
+  pds/pvr_pds.h,                    draw with transform feedback active also
+  pds/pvr_pipeline_pds.c,           dispatches it into a compute sub-command
+  pco/pco_data.h,                   kept open for the render, fenced kernel
+  pco/pco_trans_nir.c,              by kernel, followed by cs_xfb_post_common
+  pco/usclib/common.cl,             (offsets advanced by what fitted, query
+  common/pvr_iface.h,               counters); Begin/End TF run
+  common/pvr_debug.[ch]             cs_xfb_counters_common (counter buffers);
+                                    xfb query pools are two counters plus an
+                                    availability dword, cs_xfb_query_common
+                                    resets, marks and copies them. The
+                                    parameter block's address reaches the
+                                    kernel in shared registers
+                                    (PVR_BUFFER_TYPE_XFB_PARAMS,
+                                    PCO_XFB_PARAMS_BASE). Vertex stages and
+                                    TRANSFORM_FEEDBACK_BIT map to compute in
+                                    pvr_stage_mask(). PVR_DEBUG=xfb prints
+                                    the kernels. 1 stream, 4 buffers, no
+                                    transformFeedbackDraw; a primitive with
+                                    the restart index is dropped without
+                                    compaction, indirect draws are skipped.
+                                    Zink then offers OpenGL ES 3.1 and
+                                    OpenGL 3.2 (also needs the 16 uniform
+                                    buffers per stage below)
+  pvr_physical_device.c             maxPerStageDescriptorUniformBuffers 16,
+                                    not 12: Mesa's state tracker wants 12
+                                    uniform blocks besides the default one or
+                                    offers no UBOs (no ES 3.0 / GL 3.1)
 
 Not changed: the heap size (util/os_misc.c: sysconf(_SC_PHYS_PAGES), which
 Haiku's libroot answers from get_system_info()); the conformance gate
@@ -898,10 +933,158 @@ diff -ruN a/include/xf86drm.h b/include/xf86drm.h
 +#endif /* HAIKU_PVR_XF86DRM_H */
 +
 +#endif /* __HAIKU__ */
+diff -ruN a/src/imagination/common/pvr_debug.c b/src/imagination/common/pvr_debug.c
+--- a/src/imagination/common/pvr_debug.c
++++ b/src/imagination/common/pvr_debug.c
+@@ -38,6 +38,8 @@
+      "Dump descriptor set and pipeline layouts." },
+    { "info", PVR_DEBUG_INFO,
+      "Display information about the driver and device." },
++   { "xfb", PVR_DEBUG_DUMP_XFB,
++     "Print the transform feedback kernels (vertex shaders as compute) as NIR." },
+    DEBUG_NAMED_VALUE_END
+ };
+ /* clang-format on */
+diff -ruN a/src/imagination/common/pvr_debug.h b/src/imagination/common/pvr_debug.h
+--- a/src/imagination/common/pvr_debug.h
++++ b/src/imagination/common/pvr_debug.h
+@@ -38,6 +38,8 @@
+ #define PVR_DEBUG_TRACK_BOS BITFIELD_BIT(1)
+ #define PVR_DEBUG_VK_DUMP_DESCRIPTOR_SET_LAYOUT BITFIELD_BIT(2)
+ #define PVR_DEBUG_INFO BITFIELD_BIT(3)
++/* (air/OS) Print the transform feedback kernels (pvr_xfb.c) as NIR. */
++#define PVR_DEBUG_DUMP_XFB BITFIELD_BIT(4)
+ 
+ void pvr_process_debug_variable(void);
+ 
+diff -ruN a/src/imagination/common/pvr_iface.h b/src/imagination/common/pvr_iface.h
+--- a/src/imagination/common/pvr_iface.h
++++ b/src/imagination/common/pvr_iface.h
+@@ -101,6 +101,120 @@
+    _PVR_SPM_LOAD_DATA_COUNT = 50,
+ };
+ 
++/* (air/OS) Transform feedback emulation: a draw's vertex shader runs again as
++ * a compute kernel that writes the transform feedback buffers (pvr_xfb.c).
++ * These are the dword offsets of the per-draw parameter block it reads
++ * (struct written by pvr_xfb_draw(), read by the kernel and by
++ * cs_xfb_post_common), and the shared registers of the helper kernels.
++ */
++#define PVR_XFB_MAX_BUFFERS 4
++#define PVR_XFB_MAX_VERTEX_BINDINGS 16
++
++/** Per-draw parameters of the transform feedback kernels; dwords. */
++enum pvr_xfb_params_dw {
++   PVR_XFB_PARAMS_SELF_LO, /** This block's own device address. */
++   PVR_XFB_PARAMS_SELF_HI,
++   PVR_XFB_PARAMS_STATE_LO, /** Transform feedback state: offsets[4]. */
++   PVR_XFB_PARAMS_STATE_HI,
++   PVR_XFB_PARAMS_QUERY_LO, /** Active query's counters, or 0. */
++   PVR_XFB_PARAMS_QUERY_HI,
++   PVR_XFB_PARAMS_BUFFERS_WRITTEN, /** Mask of the buffers the shader writes. */
++   PVR_XFB_PARAMS_VERTS_PER_PRIM,
++   PVR_XFB_PARAMS_TOPOLOGY, /** VkPrimitiveTopology */
++   PVR_XFB_PARAMS_PRIM_COUNT, /** Primitives per instance. */
++   PVR_XFB_PARAMS_VERTEX_COUNT, /** Vertices (or indices) per instance. */
++   PVR_XFB_PARAMS_INSTANCE_COUNT,
++   PVR_XFB_PARAMS_FIRST_VERTEX, /** firstVertex, or vertexOffset. */
++   PVR_XFB_PARAMS_FIRST_INSTANCE,
++   PVR_XFB_PARAMS_INDEX_LO, /** Index buffer at firstIndex; 0 if not indexed. */
++   PVR_XFB_PARAMS_INDEX_HI,
++   PVR_XFB_PARAMS_INDEX_SIZE, /** Bytes per index: 0 (not indexed), 1, 2, 4. */
++   PVR_XFB_PARAMS_RESTART_ENABLE,
++   PVR_XFB_PARAMS_TOTAL_VERTICES, /** instance_count * prim_count * verts_per_prim */
++   PVR_XFB_PARAMS_PAD0,
++
++   /** Per transform feedback buffer: address lo, hi, size, stride (bytes). */
++   PVR_XFB_PARAMS_XFB0 = 20,
++   PVR_XFB_PARAMS_XFB_LO = 0,
++   PVR_XFB_PARAMS_XFB_HI = 1,
++   PVR_XFB_PARAMS_XFB_SIZE = 2,
++   PVR_XFB_PARAMS_XFB_STRIDE = 3,
++   PVR_XFB_PARAMS_XFB_DWORDS = 4,
++
++   /** Per vertex binding: address lo, hi, size, stride (bytes). */
++   PVR_XFB_PARAMS_VB0 = PVR_XFB_PARAMS_XFB0 +
++                        PVR_XFB_MAX_BUFFERS * PVR_XFB_PARAMS_XFB_DWORDS,
++   PVR_XFB_PARAMS_VB_LO = 0,
++   PVR_XFB_PARAMS_VB_HI = 1,
++   PVR_XFB_PARAMS_VB_SIZE = 2,
++   PVR_XFB_PARAMS_VB_STRIDE = 3,
++   PVR_XFB_PARAMS_VB_DWORDS = 4,
++
++   _PVR_XFB_PARAMS_COUNT = PVR_XFB_PARAMS_VB0 + PVR_XFB_MAX_VERTEX_BINDINGS *
++                                                  PVR_XFB_PARAMS_VB_DWORDS,
++};
++
++/** Transform feedback state block (per command buffer); dwords. */
++enum pvr_xfb_state_dw {
++   PVR_XFB_STATE_OFFSET0, /** Bytes written so far into buffer 0..3. */
++   PVR_XFB_STATE_OFFSET1,
++   PVR_XFB_STATE_OFFSET2,
++   PVR_XFB_STATE_OFFSET3,
++   _PVR_XFB_STATE_COUNT,
++};
++
++/** Transform feedback query counters (per query); dwords. */
++enum pvr_xfb_query_dw {
++   PVR_XFB_QUERY_WRITTEN_LO,
++   PVR_XFB_QUERY_WRITTEN_HI,
++   PVR_XFB_QUERY_GENERATED_LO,
++   PVR_XFB_QUERY_GENERATED_HI,
++   _PVR_XFB_QUERY_COUNT,
++};
++
++/** cs_xfb_counters: vkCmdBegin/EndTransformFeedbackEXT; shared registers. */
++enum pvr_xfb_counters_data {
++   PVR_XFB_COUNTERS_DATA_MODE, /** 0: begin (load), 1: end (store). */
++   PVR_XFB_COUNTERS_DATA_STATE_LO,
++   PVR_XFB_COUNTERS_DATA_STATE_HI,
++   PVR_XFB_COUNTERS_DATA_COUNTER0_LO, /** Counter buffer address, or 0. */
++   PVR_XFB_COUNTERS_DATA_COUNTER0_HI,
++   PVR_XFB_COUNTERS_DATA_COUNTER1_LO,
++   PVR_XFB_COUNTERS_DATA_COUNTER1_HI,
++   PVR_XFB_COUNTERS_DATA_COUNTER2_LO,
++   PVR_XFB_COUNTERS_DATA_COUNTER2_HI,
++   PVR_XFB_COUNTERS_DATA_COUNTER3_LO,
++   PVR_XFB_COUNTERS_DATA_COUNTER3_HI,
++   _PVR_XFB_COUNTERS_DATA_COUNT,
++};
++#define PVR_XFB_COUNTERS_MODE_BEGIN 0
++#define PVR_XFB_COUNTERS_MODE_END 1
++
++/** cs_xfb_post: after a draw's kernel; shared registers. */
++enum pvr_xfb_post_data {
++   PVR_XFB_POST_DATA_PARAMS_LO,
++   PVR_XFB_POST_DATA_PARAMS_HI,
++   _PVR_XFB_POST_DATA_COUNT,
++};
++
++/** cs_xfb_query: reset, availability and copy; shared registers. */
++enum pvr_xfb_query_data {
++   PVR_XFB_QUERY_DATA_MODE,
++   PVR_XFB_QUERY_DATA_COUNT,
++   PVR_XFB_QUERY_DATA_RESULT_LO, /** First query's counters. */
++   PVR_XFB_QUERY_DATA_RESULT_HI,
++   PVR_XFB_QUERY_DATA_AVAIL_LO, /** First query's availability dword. */
++   PVR_XFB_QUERY_DATA_AVAIL_HI,
++   PVR_XFB_QUERY_DATA_DEST_LO,
++   PVR_XFB_QUERY_DATA_DEST_HI,
++   PVR_XFB_QUERY_DATA_DEST_STRIDE,
++   PVR_XFB_QUERY_DATA_FLAGS, /** VkQueryResultFlags */
++   _PVR_XFB_QUERY_DATA_COUNT,
++};
++#define PVR_XFB_QUERY_MODE_RESET 0
++#define PVR_XFB_QUERY_MODE_AVAIL 1
++#define PVR_XFB_QUERY_MODE_COPY 2
++
+ /** Load/store sr shader data; vertex input registers. */
+ enum pvr_load_store_sr_data {
+    PVR_LOAD_STORE_SR_DATA_SIZE_ADDR_LO,
 diff -ruN a/src/imagination/pco/pco_data.h b/src/imagination/pco/pco_data.h
 --- a/src/imagination/pco/pco_data.h
 +++ b/src/imagination/pco/pco_data.h
-@@ -184,6 +184,24 @@
+@@ -184,6 +184,27 @@
     unsigned used;
  } pco_push_const_data;
  
@@ -923,10 +1106,13 @@ diff -ruN a/src/imagination/pco/pco_data.h b/src/imagination/pco/pco_data.h
 +/** load_preamble bases from here on are relative to ubo_promoted.start. */
 +#define PCO_UBO_PROMOTED_BASE 0x100000U
 +
++/** load_preamble bases from here on are relative to xfb_params.start. */
++#define PCO_XFB_PARAMS_BASE 0x200000U
++
  /** PCO common data. */
  typedef struct _pco_common_data {
     /** System value mappings. */
-@@ -195,6 +213,11 @@
+@@ -195,6 +216,16 @@
     /** Push constant data. */
     pco_push_const_data push_consts;
  
@@ -934,6 +1120,11 @@ diff -ruN a/src/imagination/pco/pco_data.h b/src/imagination/pco/pco_data.h
 +   pco_ubo_promotion ubo_promotions[PCO_MAX_UBO_PROMOTIONS];
 +   unsigned ubo_promotion_count;
 +   pco_range ubo_promoted;
++
++   /** (air/OS) Transform feedback kernel: the shared registers holding the
++    * address of its per-draw parameter block (vulkan/pvr_xfb.c).
++    */
++   pco_range xfb_params;
 +
     pco_range point_sampler;
     pco_range ia_sampler;
@@ -1399,7 +1590,7 @@ diff -ruN a/src/imagination/pco/pco_nir.c b/src/imagination/pco/pco_nir.c
 diff -ruN a/src/imagination/pco/pco_trans_nir.c b/src/imagination/pco/pco_trans_nir.c
 --- a/src/imagination/pco/pco_trans_nir.c
 +++ b/src/imagination/pco/pco_trans_nir.c
-@@ -2102,14 +2102,28 @@
+@@ -2102,14 +2102,38 @@
        instr = trans_flush_tile_buffer(tctx, intr, src[0], src[1]);
        break;
  
@@ -1407,10 +1598,20 @@ diff -ruN a/src/imagination/pco/pco_trans_nir.c b/src/imagination/pco/pco_trans_
 +   case nir_intrinsic_load_preamble: {
 +      unsigned base = nir_intrinsic_base(intr);
 +
++      /* (air/OS) The transform feedback kernel's parameter block address
++       * (pvr_xfb.c): the shared registers allocated for it.
++       */
++      if (base >= PCO_XFB_PARAMS_BASE) {
++         const pco_range *range = &tctx->shader->data.common.xfb_params;
++
++         base -= PCO_XFB_PARAMS_BASE;
++         assert(base + pco_ref_get_chans(dest) <= range->count);
++         base += range->start;
++      }
 +      /* (air/OS) A promoted uniform buffer load (pco_nir_promote_ubo_loads):
 +       * relative to the shared registers allocated for the promoted ranges.
 +       */
-+      if (base >= PCO_UBO_PROMOTED_BASE) {
++      else if (base >= PCO_UBO_PROMOTED_BASE) {
 +         const pco_range *range = &tctx->shader->data.common.ubo_promoted;
 +
 +         base -= PCO_UBO_PROMOTED_BASE;
@@ -1430,10 +1631,215 @@ diff -ruN a/src/imagination/pco/pco_trans_nir.c b/src/imagination/pco/pco_trans_
  
     case nir_intrinsic_store_preamble:
        instr = pco_mov(&tctx->b,
+diff -ruN a/src/imagination/pco/usclib/common.cl b/src/imagination/pco/usclib/common.cl
+--- a/src/imagination/pco/usclib/common.cl
++++ b/src/imagination/pco/usclib/common.cl
+@@ -251,3 +251,190 @@
+       }
+    }
+ }
++
++/* (air/OS) Transform feedback emulation (vulkan/pvr_xfb.c): the kernels that
++ * keep the per-command-buffer state (bytes written per buffer) and the query
++ * counters. The vertex-shader-as-compute kernel itself is compiled per
++ * pipeline. All addresses are 32+32 bit; the loads and stores are dwords.
++ */
++static inline uint
++xfb_ld_dw(uint lo, uint hi, uint dw)
++{
++   return nir_dma_ld_pco(1, nir_uadd64_32(lo, hi, dw * sizeof(uint32_t)));
++}
++
++static inline void
++xfb_st_dw(uint lo, uint hi, uint dw, uint value)
++{
++   nir_dma_st_pco(false, nir_uadd64_32(lo, hi, dw * sizeof(uint32_t)), value);
++}
++
++static inline void
++xfb_counter(uint mode, uint state_lo, uint state_hi, uint b, uint counter_lo,
++            uint counter_hi)
++{
++   bool has_counter = (counter_lo | counter_hi) != 0;
++   if (mode == PVR_XFB_COUNTERS_MODE_BEGIN) {
++      uint offset = 0;
++      if (has_counter)
++         offset = xfb_ld_dw(counter_lo, counter_hi, 0);
++      xfb_st_dw(state_lo, state_hi, PVR_XFB_STATE_OFFSET0 + b, offset);
++   } else if (has_counter) {
++      xfb_st_dw(counter_lo, counter_hi, 0,
++                xfb_ld_dw(state_lo, state_hi, PVR_XFB_STATE_OFFSET0 + b));
++   }
++}
++
++/* vkCmdBeginTransformFeedbackEXT loads the offsets from the counter buffers
++ * (0 without one); vkCmdEndTransformFeedbackEXT stores them.
++ */
++KERNEL(1)
++cs_xfb_counters_common(void)
++{
++   uint mode = nir_load_preamble(1, PVR_XFB_COUNTERS_DATA_MODE, 0);
++   uint state_lo = nir_load_preamble(1, PVR_XFB_COUNTERS_DATA_STATE_LO, 0);
++   uint state_hi = nir_load_preamble(1, PVR_XFB_COUNTERS_DATA_STATE_HI, 0);
++   xfb_counter(mode, state_lo, state_hi, 0,
++               nir_load_preamble(1, PVR_XFB_COUNTERS_DATA_COUNTER0_LO, 0),
++               nir_load_preamble(1, PVR_XFB_COUNTERS_DATA_COUNTER0_HI, 0));
++   xfb_counter(mode, state_lo, state_hi, 1,
++               nir_load_preamble(1, PVR_XFB_COUNTERS_DATA_COUNTER1_LO, 0),
++               nir_load_preamble(1, PVR_XFB_COUNTERS_DATA_COUNTER1_HI, 0));
++   xfb_counter(mode, state_lo, state_hi, 2,
++               nir_load_preamble(1, PVR_XFB_COUNTERS_DATA_COUNTER2_LO, 0),
++               nir_load_preamble(1, PVR_XFB_COUNTERS_DATA_COUNTER2_HI, 0));
++   xfb_counter(mode, state_lo, state_hi, 3,
++               nir_load_preamble(1, PVR_XFB_COUNTERS_DATA_COUNTER3_LO, 0),
++               nir_load_preamble(1, PVR_XFB_COUNTERS_DATA_COUNTER3_HI, 0));
++}
++
++/* How many whole primitives of verts_per_prim vertices still fit into buffer
++ * b, given the bytes written so far.
++ */
++static inline uint
++xfb_buffer_capacity(uint p_lo, uint p_hi, uint state_lo, uint state_hi,
++                    uint b, uint verts_per_prim)
++{
++   uint base = PVR_XFB_PARAMS_XFB0 + b * PVR_XFB_PARAMS_XFB_DWORDS;
++   uint size = xfb_ld_dw(p_lo, p_hi, base + PVR_XFB_PARAMS_XFB_SIZE);
++   uint stride = xfb_ld_dw(p_lo, p_hi, base + PVR_XFB_PARAMS_XFB_STRIDE);
++   uint offset = xfb_ld_dw(state_lo, state_hi, PVR_XFB_STATE_OFFSET0 + b);
++   uint avail = offset <= size ? size - offset : 0;
++   uint bytes_per_prim = stride * verts_per_prim;
++   return bytes_per_prim ? avail / bytes_per_prim : 0xffffffffu;
++}
++
++static inline void
++xfb_advance(uint p_lo, uint p_hi, uint state_lo, uint state_hi, uint b,
++            uint bytes)
++{
++   uint base = PVR_XFB_PARAMS_XFB0 + b * PVR_XFB_PARAMS_XFB_DWORDS;
++   uint stride = xfb_ld_dw(p_lo, p_hi, base + PVR_XFB_PARAMS_XFB_STRIDE);
++   uint offset = xfb_ld_dw(state_lo, state_hi, PVR_XFB_STATE_OFFSET0 + b);
++   xfb_st_dw(state_lo, state_hi, PVR_XFB_STATE_OFFSET0 + b,
++             offset + bytes * stride);
++}
++
++/* After a draw's kernel: the primitives that fit went into the buffers, so
++ * the offsets move on by them, and the active query (if any) counts them and
++ * the primitives the draw generated.
++ */
++KERNEL(1)
++cs_xfb_post_common(void)
++{
++   uint p_lo = nir_load_preamble(1, PVR_XFB_POST_DATA_PARAMS_LO, 0);
++   uint p_hi = nir_load_preamble(1, PVR_XFB_POST_DATA_PARAMS_HI, 0);
++   uint state_lo = xfb_ld_dw(p_lo, p_hi, PVR_XFB_PARAMS_STATE_LO);
++   uint state_hi = xfb_ld_dw(p_lo, p_hi, PVR_XFB_PARAMS_STATE_HI);
++   uint query_lo = xfb_ld_dw(p_lo, p_hi, PVR_XFB_PARAMS_QUERY_LO);
++   uint query_hi = xfb_ld_dw(p_lo, p_hi, PVR_XFB_PARAMS_QUERY_HI);
++   uint mask = xfb_ld_dw(p_lo, p_hi, PVR_XFB_PARAMS_BUFFERS_WRITTEN);
++   uint verts_per_prim = xfb_ld_dw(p_lo, p_hi, PVR_XFB_PARAMS_VERTS_PER_PRIM);
++   uint prim_count = xfb_ld_dw(p_lo, p_hi, PVR_XFB_PARAMS_PRIM_COUNT);
++   uint instance_count = xfb_ld_dw(p_lo, p_hi, PVR_XFB_PARAMS_INSTANCE_COUNT);
++   uint generated = prim_count * instance_count;
++   uint capacity = 0xffffffffu;
++
++   if (mask & 1u)
++      capacity = min(capacity, xfb_buffer_capacity(p_lo, p_hi, state_lo, state_hi, 0, verts_per_prim));
++   if (mask & 2u)
++      capacity = min(capacity, xfb_buffer_capacity(p_lo, p_hi, state_lo, state_hi, 1, verts_per_prim));
++   if (mask & 4u)
++      capacity = min(capacity, xfb_buffer_capacity(p_lo, p_hi, state_lo, state_hi, 2, verts_per_prim));
++   if (mask & 8u)
++      capacity = min(capacity, xfb_buffer_capacity(p_lo, p_hi, state_lo, state_hi, 3, verts_per_prim));
++
++   uint written = min(generated, capacity);
++   uint vertices = written * verts_per_prim;
++
++   if (mask & 1u)
++      xfb_advance(p_lo, p_hi, state_lo, state_hi, 0, vertices);
++   if (mask & 2u)
++      xfb_advance(p_lo, p_hi, state_lo, state_hi, 1, vertices);
++   if (mask & 4u)
++      xfb_advance(p_lo, p_hi, state_lo, state_hi, 2, vertices);
++   if (mask & 8u)
++      xfb_advance(p_lo, p_hi, state_lo, state_hi, 3, vertices);
++
++   if (query_lo | query_hi) {
++      xfb_st_dw(query_lo, query_hi, PVR_XFB_QUERY_WRITTEN_LO,
++                xfb_ld_dw(query_lo, query_hi, PVR_XFB_QUERY_WRITTEN_LO) + written);
++      xfb_st_dw(query_lo, query_hi, PVR_XFB_QUERY_GENERATED_LO,
++                xfb_ld_dw(query_lo, query_hi, PVR_XFB_QUERY_GENERATED_LO) + generated);
++   }
++}
++
++/* Transform feedback query pools: reset, mark available, copy results. One
++ * invocation per query.
++ */
++KERNEL(32)
++cs_xfb_query_common(void)
++{
++   uint mode = nir_load_preamble(1, PVR_XFB_QUERY_DATA_MODE, 0);
++   uint count = nir_load_preamble(1, PVR_XFB_QUERY_DATA_COUNT, 0);
++   uint result_lo = nir_load_preamble(1, PVR_XFB_QUERY_DATA_RESULT_LO, 0);
++   uint result_hi = nir_load_preamble(1, PVR_XFB_QUERY_DATA_RESULT_HI, 0);
++   uint avail_lo = nir_load_preamble(1, PVR_XFB_QUERY_DATA_AVAIL_LO, 0);
++   uint avail_hi = nir_load_preamble(1, PVR_XFB_QUERY_DATA_AVAIL_HI, 0);
++   uint dest_lo = nir_load_preamble(1, PVR_XFB_QUERY_DATA_DEST_LO, 0);
++   uint dest_hi = nir_load_preamble(1, PVR_XFB_QUERY_DATA_DEST_HI, 0);
++   uint dest_stride = nir_load_preamble(1, PVR_XFB_QUERY_DATA_DEST_STRIDE, 0);
++   uint flags = nir_load_preamble(1, PVR_XFB_QUERY_DATA_FLAGS, 0);
++   uint index = query_calc_global_id();
++
++   if (index < count) {
++      uint result_dw = index * _PVR_XFB_QUERY_COUNT;
++
++      if (mode == PVR_XFB_QUERY_MODE_RESET) {
++         xfb_st_dw(result_lo, result_hi, result_dw + PVR_XFB_QUERY_WRITTEN_LO, 0);
++         xfb_st_dw(result_lo, result_hi, result_dw + PVR_XFB_QUERY_WRITTEN_HI, 0);
++         xfb_st_dw(result_lo, result_hi, result_dw + PVR_XFB_QUERY_GENERATED_LO, 0);
++         xfb_st_dw(result_lo, result_hi, result_dw + PVR_XFB_QUERY_GENERATED_HI, 0);
++         xfb_st_dw(avail_lo, avail_hi, index, 0);
++      } else if (mode == PVR_XFB_QUERY_MODE_AVAIL) {
++         xfb_st_dw(avail_lo, avail_hi, index, 1);
++      } else {
++         uint available = xfb_ld_dw(avail_lo, avail_hi, index);
++         uint2 dest = nir_umad64_32(dest_stride, index, dest_lo, dest_hi);
++         bool wide = (flags & VK_QUERY_RESULT_64_BIT) != 0;
++
++         if (available || (flags & VK_QUERY_RESULT_PARTIAL_BIT)) {
++            uint written = xfb_ld_dw(result_lo, result_hi, result_dw + PVR_XFB_QUERY_WRITTEN_LO);
++            uint generated = xfb_ld_dw(result_lo, result_hi, result_dw + PVR_XFB_QUERY_GENERATED_LO);
++            if (wide) {
++               nir_dma_st_pco(false, dest, written, 0);
++               nir_dma_st_pco(false, nir_uadd64_32(dest.x, dest.y, 8), generated, 0);
++            } else {
++               nir_dma_st_pco(false, dest, written);
++               nir_dma_st_pco(false, nir_uadd64_32(dest.x, dest.y, 4), generated);
++            }
++         }
++         if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) {
++            if (wide)
++               nir_dma_st_pco(false, nir_uadd64_32(dest.x, dest.y, 16), available, 0);
++            else
++               nir_dma_st_pco(false, nir_uadd64_32(dest.x, dest.y, 8), available);
++         }
++      }
++   }
++}
+diff -ruN a/src/imagination/vulkan/meson.build b/src/imagination/vulkan/meson.build
+--- a/src/imagination/vulkan/meson.build
++++ b/src/imagination/vulkan/meson.build
+@@ -56,6 +56,7 @@
+   'pvr_spm.c',
+   'pvr_usc.c',
+   'pvr_wsi.c',
++  'pvr_xfb.c',
+ )
+ 
+ pvr_includes = [
 diff -ruN a/src/imagination/vulkan/pds/pvr_pds.h b/src/imagination/vulkan/pds/pvr_pds.h
 --- a/src/imagination/vulkan/pds/pvr_pds.h
 +++ b/src/imagination/vulkan/pds/pvr_pds.h
-@@ -928,6 +928,10 @@
+@@ -928,6 +928,12 @@
  #define PVR_BUFFER_TYPE_SCRATCH_INFO (13)
  #define PVR_BUFFER_TYPE_SAMPLE_LOCATIONS (14)
  #define PVR_BUFFER_TYPE_GLOBAL_SHMEM (15)
@@ -1441,13 +1847,25 @@ diff -ruN a/src/imagination/vulkan/pds/pvr_pds.h b/src/imagination/vulkan/pds/pv
 + * binding, buffer_id (the array element) and source_offset (bytes) name it.
 + */
 +#define PVR_BUFFER_TYPE_UBO_PROMOTED (16)
++/* (air/OS) The transform feedback kernel's parameter block (pvr_xfb.c). */
++#define PVR_BUFFER_TYPE_XFB_PARAMS (17)
  #define PVR_BUFFER_TYPE_INVALID (~0)
  
  struct pvr_pds_buffer {
 diff -ruN a/src/imagination/vulkan/pds/pvr_pipeline_pds.c b/src/imagination/vulkan/pds/pvr_pipeline_pds.c
 --- a/src/imagination/vulkan/pds/pvr_pipeline_pds.c
 +++ b/src/imagination/vulkan/pds/pvr_pipeline_pds.c
-@@ -1638,6 +1638,26 @@
+@@ -1617,7 +1617,8 @@
+       case PVR_BUFFER_TYPE_SPILL_INFO:
+       case PVR_BUFFER_TYPE_SCRATCH_INFO:
+       case PVR_BUFFER_TYPE_SAMPLE_LOCATIONS:
+-      case PVR_BUFFER_TYPE_GLOBAL_SHMEM: {
++      case PVR_BUFFER_TYPE_GLOBAL_SHMEM:
++      case PVR_BUFFER_TYPE_XFB_PARAMS: {
+          struct pvr_const_map_entry_special_buffer *special_buffer_entry;
+ 
+          special_buffer_entry =
+@@ -1638,6 +1639,26 @@
           }
           break;
        }
@@ -1477,7 +1895,24 @@ diff -ruN a/src/imagination/vulkan/pds/pvr_pipeline_pds.c b/src/imagination/vulk
 diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
 --- a/src/imagination/vulkan/pvr_arch_cmd_buffer.c
 +++ b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
-@@ -1152,7 +1152,7 @@
+@@ -56,6 +56,7 @@
+ #include "pvr_pass.h"
+ #include "pvr_pds.h"
+ #include "pvr_physical_device.h"
++#include "common/pvr_debug.h"
+ #include "pvr_pipeline.h"
+ #include "pvr_query.h"
+ #include "pvr_rt_dataset.h"
+@@ -318,6 +319,8 @@
+    return result;
+ }
+ 
++static VkResult pvr_xfb_flush(struct pvr_cmd_buffer *cmd_buffer);
++
+ static void pvr_cmd_buffer_update_barriers(struct pvr_cmd_buffer *cmd_buffer,
+                                            enum pvr_sub_cmd_type type)
+ {
+@@ -1152,7 +1155,7 @@
      * level?
      */
     surface_params.addr = PVR_DEV_ADDR_OFFSET(
@@ -1486,7 +1921,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
        plane->layer_size * view_index +
           plane->mip_levels[iview->vk.base_mip_level].offset);
  
-@@ -1593,7 +1593,8 @@
+@@ -1593,7 +1596,8 @@
  static VkResult pvr_render_targets_dataset_init(
     struct pvr_device *device,
     struct pvr_render_state *rstate,
@@ -1496,7 +1931,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
  
  static VkResult pvr_sub_cmd_gfx_job_init(const struct pvr_device_info *dev_info,
                                           struct pvr_cmd_buffer *cmd_buffer,
-@@ -1751,8 +1752,10 @@
+@@ -1751,8 +1755,10 @@
  
     if (cmd_buffer->state.current_sub_cmd->is_dynamic_render &&
         !cmd_buffer->state.current_sub_cmd->is_resume) {
@@ -1509,7 +1944,25 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
        if (result != VK_SUCCESS) {
           vk_command_buffer_set_error(&cmd_buffer->vk, result);
           return result;
-@@ -3208,7 +3211,8 @@
+@@ -2684,6 +2690,17 @@
+    if (vk_command_buffer_has_error(&cmd_buffer->vk))
+       return vk_command_buffer_get_record_result(&cmd_buffer->vk);
+ 
++   /* (air/OS) Anything that may depend on transform feedback kernels, or
++    * that they may depend on, ends their sub-command first, so that it runs
++    * before and not as part of what follows.
++    */
++   if (state->xfb.sub_cmd && state->current_sub_cmd != state->xfb.sub_cmd &&
++       type != PVR_SUB_CMD_TYPE_GRAPHICS && type != PVR_SUB_CMD_TYPE_COMPUTE) {
++      result = pvr_xfb_flush(cmd_buffer);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
+    pvr_cmd_buffer_update_barriers(cmd_buffer, type);
+ 
+    /* TODO: Add proper support for joining consecutive event sub_cmd? */
+@@ -3208,7 +3225,8 @@
     struct pvr_device *device,
     struct pvr_render_state *rstate,
     const struct pvr_renderpass_hwsetup_render *hw_render,
@@ -1519,7 +1972,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
  {
     const struct pvr_device_info *const dev_info = &device->pdevice->dev_info;
     const uint32_t layers =
-@@ -3223,16 +3227,30 @@
+@@ -3223,16 +3241,30 @@
        if (render_target->valid_mask & BITFIELD_BIT(view_idx))
           continue;
  
@@ -1560,7 +2013,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
        }
  
        render_target->valid_mask |= BITFIELD_BIT(view_idx);
-@@ -3247,7 +3265,8 @@
+@@ -3247,7 +3279,8 @@
  static VkResult pvr_render_targets_dataset_init(
     struct pvr_device *device,
     struct pvr_render_state *rstate,
@@ -1570,7 +2023,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
  {
     struct pvr_render_target *render_target =
        pvr_get_render_target(hw_render, rstate);
-@@ -3255,7 +3274,8 @@
+@@ -3255,7 +3288,8 @@
     return pvr_render_targets_datasets_create(device,
                                               rstate,
                                               hw_render,
@@ -1580,7 +2033,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
  }
  
  static VkResult
-@@ -3270,7 +3290,8 @@
+@@ -3270,7 +3304,8 @@
  
        result = pvr_render_targets_dataset_init(device,
                                                 framebuffer->rstate,
@@ -1590,12 +2043,78 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
        if (result != VK_SUCCESS)
           return result;
     }
-@@ -5619,6 +5640,75 @@
-                       special_buff_entry->const_offset,
-                       pds_info->data_size_in_dwords);
-             break;
-+         }
+@@ -4897,6 +4932,12 @@
+       goto exit_teardown_render;
+    }
+ 
++   result = pvr_xfb_flush(cmd_buffer);
++   if (result != VK_SUCCESS) {
++      vk_command_buffer_set_error(&cmd_buffer->vk, result);
++      goto exit_teardown_render;
++   }
 +
+    result = pvr_resolve_unemitted_resolve_attachments(cmd_buffer,
+                                                       &state->render_pass_info);
+    if (result != VK_SUCCESS) {
+@@ -5494,9 +5535,16 @@
+ static VkResult pvr_cmd_upload_push_consts(struct pvr_cmd_buffer *cmd_buffer,
+                                            enum pvr_stage_allocation stage);
+ 
+-static VkResult pvr_setup_descriptor_mappings(
++/* (air/OS) Writes the PDS descriptor program's data section for a shader
++ * with the given bound descriptor sets and shader data; stage selects the
++ * push constants. The transform feedback kernel is a compute shader that
++ * runs with the vertex stage's descriptors and push constants.
++ */
++static VkResult pvr_setup_descriptor_mappings_ex(
+    struct pvr_cmd_buffer *const cmd_buffer,
+    enum pvr_stage_allocation stage,
++   const struct pvr_descriptor_state *desc_state,
++   const pco_data *data,
+    const struct pvr_stage_allocation_descriptor_state *descriptor_state,
+    const pvr_dev_addr_t *const num_worgroups_buff_addr,
+    uint32_t *const descriptor_data_offset_out)
+@@ -5505,8 +5553,6 @@
+    const struct pvr_device *device = cmd_buffer->device;
+    const struct pvr_physical_device *pdevice = device->pdevice;
+    const struct pvr_device_info *dev_info = &pdevice->dev_info;
+-   const struct pvr_descriptor_state *desc_state;
+-   const pco_data *data;
+    struct pvr_suballoc_bo *pvr_bo;
+    const uint8_t *entries;
+    uint32_t *dword_buffer;
+@@ -5529,27 +5575,6 @@
+ 
+    entries = (uint8_t *)pds_info->entries;
+ 
+-   switch (stage) {
+-   case PVR_STAGE_ALLOCATION_VERTEX_GEOMETRY:
+-      desc_state = &cmd_buffer->state.gfx_desc_state;
+-      data = &cmd_buffer->state.gfx_pipeline->vs_data;
+-      break;
+-
+-   case PVR_STAGE_ALLOCATION_FRAGMENT:
+-      desc_state = &cmd_buffer->state.gfx_desc_state;
+-      data = &cmd_buffer->state.gfx_pipeline->fs_data;
+-      break;
+-
+-   case PVR_STAGE_ALLOCATION_COMPUTE:
+-      desc_state = &cmd_buffer->state.compute_desc_state;
+-      data = &cmd_buffer->state.compute_pipeline->cs_data;
+-      break;
+-
+-   default:
+-      UNREACHABLE("Unsupported stage.");
+-      break;
+-   }
+-
+    for (uint32_t i = 0; i < pds_info->entry_count; i++) {
+       const struct pvr_const_map_entry *const entry_header =
+          (struct pvr_const_map_entry *)entries;
+@@ -5621,6 +5646,87 @@
+             break;
+          }
+ 
 +         case PVR_BUFFER_TYPE_UBO_PROMOTED: {
 +            /* (air/OS) A uniform buffer range the shader reads from shared
 +             * registers: the PDS loads it from the bound buffer. A range the
@@ -1663,9 +2182,896 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
 +                      special_buff_entry->const_offset,
 +                      pds_info->data_size_in_dwords);
 +            break;
-          }
- 
++         }
++
++         case PVR_BUFFER_TYPE_XFB_PARAMS: {
++            /* (air/OS) The transform feedback kernel's parameter block; it
++             * starts with its own address.
++             */
++            assert(cmd_buffer->state.xfb.params_addr.addr);
++            PVR_WRITE(qword_buffer,
++                      cmd_buffer->state.xfb.params_addr.addr,
++                      special_buff_entry->const_offset,
++                      pds_info->data_size_in_dwords);
++            break;
++         }
++
           case PVR_BUFFER_TYPE_PUSH_CONSTS: {
+             struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
+ 
+@@ -6029,14 +6135,59 @@
+    return VK_SUCCESS;
+ }
+ 
+-static void pvr_compute_update_shared(struct pvr_cmd_buffer *cmd_buffer,
+-                                      struct pvr_sub_cmd_compute *const sub_cmd)
++static VkResult pvr_setup_descriptor_mappings(
++   struct pvr_cmd_buffer *const cmd_buffer,
++   enum pvr_stage_allocation stage,
++   const struct pvr_stage_allocation_descriptor_state *descriptor_state,
++   const pvr_dev_addr_t *const num_worgroups_buff_addr,
++   uint32_t *const descriptor_data_offset_out)
++{
++   const struct pvr_descriptor_state *desc_state;
++   const pco_data *data;
++
++   switch (stage) {
++   case PVR_STAGE_ALLOCATION_VERTEX_GEOMETRY:
++      desc_state = &cmd_buffer->state.gfx_desc_state;
++      data = &cmd_buffer->state.gfx_pipeline->vs_data;
++      break;
++
++   case PVR_STAGE_ALLOCATION_FRAGMENT:
++      desc_state = &cmd_buffer->state.gfx_desc_state;
++      data = &cmd_buffer->state.gfx_pipeline->fs_data;
++      break;
++
++   case PVR_STAGE_ALLOCATION_COMPUTE:
++      desc_state = &cmd_buffer->state.compute_desc_state;
++      data = &cmd_buffer->state.compute_pipeline->cs_data;
++      break;
++
++   default:
++      UNREACHABLE("Unsupported stage.");
++      break;
++   }
++
++   return pvr_setup_descriptor_mappings_ex(cmd_buffer,
++                                           stage,
++                                           desc_state,
++                                           data,
++                                           descriptor_state,
++                                           num_worgroups_buff_addr,
++                                           descriptor_data_offset_out);
++}
++
++/* (air/OS) The shared register allocation kernel of a compute pipeline, with
++ * the PDS descriptor data section at descriptor_data_offset.
++ */
++static void
++pvr_compute_update_shared_ex(struct pvr_cmd_buffer *cmd_buffer,
++                             struct pvr_sub_cmd_compute *const sub_cmd,
++                             const struct pvr_compute_pipeline *pipeline,
++                             uint32_t descriptor_data_offset)
+ {
+    const struct pvr_device *device = cmd_buffer->device;
+    const struct pvr_physical_device *pdevice = device->pdevice;
+    struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
+    struct pvr_csb *csb = &sub_cmd->control_stream;
+-   const struct pvr_compute_pipeline *pipeline = state->compute_pipeline;
+    const uint32_t const_shared_regs = pipeline->cs_data.common.shareds;
+    struct pvr_compute_kernel_info info;
+ 
+@@ -6076,7 +6227,7 @@
+       uint32_t pds_data_size_in_dwords =
+          pipeline->descriptor_state.pds_info.data_size_in_dwords;
+ 
+-      info.pds_data_offset = state->pds_compute_descriptor_data_offset;
++      info.pds_data_offset = descriptor_data_offset;
+       info.pds_data_size =
+          DIV_ROUND_UP(PVR_DW_TO_BYTES(pds_data_size_in_dwords),
+                       ROGUE_CDMCTRL_KERNEL0_PDS_DATA_SIZE_UNIT_SIZE);
+@@ -6102,6 +6253,17 @@
+    pvr_compute_generate_control_stream(csb, sub_cmd, &info);
+ }
+ 
++static void pvr_compute_update_shared(struct pvr_cmd_buffer *cmd_buffer,
++                                      struct pvr_sub_cmd_compute *const sub_cmd)
++{
++   struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
++
++   pvr_compute_update_shared_ex(cmd_buffer,
++                                sub_cmd,
++                                state->compute_pipeline,
++                                state->pds_compute_descriptor_data_offset);
++}
++
+ void pvr_arch_compute_update_shared_private(
+    struct pvr_cmd_buffer *cmd_buffer,
+    struct pvr_sub_cmd_compute *const sub_cmd,
+@@ -6246,16 +6408,15 @@
+ static void pvr_compute_update_kernel(
+    struct pvr_cmd_buffer *cmd_buffer,
+    struct pvr_sub_cmd_compute *const sub_cmd,
++   const struct pvr_compute_pipeline *pipeline,
+    pvr_dev_addr_t indirect_addr,
+    const uint32_t global_base_group[static const PVR_WORKGROUP_DIMENSIONS],
+    const uint32_t global_workgroup_size[static const PVR_WORKGROUP_DIMENSIONS])
+ {
+    const struct pvr_physical_device *pdevice = cmd_buffer->device->pdevice;
+-   struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
+    const struct pvr_device_runtime_info *dev_runtime_info =
+       &pdevice->dev_runtime_info;
+    struct pvr_csb *csb = &sub_cmd->control_stream;
+-   const struct pvr_compute_pipeline *pipeline = state->compute_pipeline;
+    const pco_data *const cs_data = &pipeline->cs_data;
+    const struct pvr_pds_info *program_info = &pipeline->pds_cs_program_info;
+    bool uses_wg_id = pipeline->base_workgroup_data_patching_offset != ~0u;
+@@ -6440,11 +6601,547 @@
+    pvr_compute_update_shared(cmd_buffer, sub_cmd);
+    pvr_compute_update_kernel(cmd_buffer,
+                              sub_cmd,
++                             compute_pipeline,
+                              indirect_addr,
+                              base_group,
+                              workgroup_size);
+ }
+ 
++
++/******************************************************************************
++   (air/OS) Transform feedback emulation (pvr_xfb.h)
++ ******************************************************************************/
++
++/* All of a render's kernels go into one compute sub-command, appended after
++ * the (still open) graphics one and kept in state->xfb.sub_cmd until it is
++ * flushed: at the end of the render, before any barrier, transfer or query
++ * sub-command, and at the end of the command buffer. Each kernel waits for
++ * the ones before it (a draw's kernel reads the offsets the previous draw's
++ * post kernel wrote).
++ */
++static void pvr_xfb_fence(struct pvr_cmd_buffer *cmd_buffer,
++                          struct pvr_sub_cmd_compute *const sub_cmd)
++{
++   pvr_compute_generate_idfwdf(cmd_buffer, sub_cmd);
++   pvr_arch_compute_generate_fence(cmd_buffer, sub_cmd, false);
++}
++
++/* Makes the transform feedback sub-command current, creating it if there is
++ * none; *prev_out gets the sub-command to restore with pvr_xfb_end_kernels().
++ */
++static VkResult pvr_xfb_begin_kernels(struct pvr_cmd_buffer *cmd_buffer,
++                                      struct pvr_sub_cmd **prev_out)
++{
++   struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
++   VkResult result;
++
++   *prev_out = state->current_sub_cmd;
++
++   if (!state->xfb.sub_cmd) {
++      state->current_sub_cmd = NULL;
++      result = pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer,
++                                                 PVR_SUB_CMD_TYPE_COMPUTE);
++      if (result != VK_SUCCESS) {
++         state->current_sub_cmd = *prev_out;
++         return result;
++      }
++
++      state->xfb.sub_cmd = state->current_sub_cmd;
++      state->xfb.kernels = 0;
++   } else {
++      state->current_sub_cmd = state->xfb.sub_cmd;
++   }
++
++   assert(state->current_sub_cmd->type == PVR_SUB_CMD_TYPE_COMPUTE);
++
++   if (state->xfb.kernels > 0)
++      pvr_xfb_fence(cmd_buffer, &state->current_sub_cmd->compute);
++
++   if (PVR_IS_DEBUG_SET(DUMP_XFB)) {
++      fprintf(stderr,
++              "pvr xfb: kernel %u into sub_cmd %p (previous %p)\n",
++              state->xfb.kernels,
++              (void *)state->xfb.sub_cmd,
++              (void *)*prev_out);
++   }
++
++   return VK_SUCCESS;
++}
++
++static void pvr_xfb_end_kernels(struct pvr_cmd_buffer *cmd_buffer,
++                                struct pvr_sub_cmd *prev)
++{
++   cmd_buffer->state.current_sub_cmd = prev;
++}
++
++/* Ends the transform feedback sub-command, if one is open. */
++static VkResult pvr_xfb_flush(struct pvr_cmd_buffer *cmd_buffer)
++{
++   struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
++   struct pvr_sub_cmd *prev = state->current_sub_cmd;
++   VkResult result;
++
++   if (!state->xfb.sub_cmd)
++      return VK_SUCCESS;
++
++   if (PVR_IS_DEBUG_SET(DUMP_XFB)) {
++      fprintf(stderr,
++              "pvr xfb: flush sub_cmd %p with %u kernels\n",
++              (void *)state->xfb.sub_cmd,
++              state->xfb.kernels);
++   }
++
++   assert(prev != state->xfb.sub_cmd);
++
++   state->current_sub_cmd = state->xfb.sub_cmd;
++   state->xfb.sub_cmd = NULL;
++   state->xfb.kernels = 0;
++   result = pvr_arch_cmd_buffer_end_sub_cmd(cmd_buffer);
++   state->current_sub_cmd = prev;
++
++   return result;
++}
++
++/* The command buffer's offsets block, made at the first use. */
++static VkResult pvr_xfb_ensure_state(struct pvr_cmd_buffer *cmd_buffer)
++{
++   struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
++   VkResult result;
++
++   if (state->xfb.state_bo)
++      return VK_SUCCESS;
++
++   result = pvr_arch_cmd_buffer_alloc_mem(cmd_buffer,
++                                          cmd_buffer->device->heaps.general_heap,
++                                          PVR_DW_TO_BYTES(_PVR_XFB_STATE_COUNT),
++                                          &state->xfb.state_bo);
++   if (result != VK_SUCCESS)
++      return result;
++
++   memset(pvr_bo_suballoc_get_map_addr(state->xfb.state_bo),
++          0,
++          PVR_DW_TO_BYTES(_PVR_XFB_STATE_COUNT));
++
++   return VK_SUCCESS;
++}
++
++static VkResult pvr_xfb_counters(struct pvr_cmd_buffer *cmd_buffer,
++                                 uint32_t mode,
++                                 uint32_t first_counter_buffer,
++                                 uint32_t counter_buffer_count,
++                                 const VkBuffer *counter_buffers,
++                                 const VkDeviceSize *counter_buffer_offsets)
++{
++   struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
++   uint32_t data[_PVR_XFB_COUNTERS_DATA_COUNT] = { 0 };
++   struct pvr_sub_cmd *prev;
++   VkResult result;
++
++   result = pvr_xfb_ensure_state(cmd_buffer);
++   if (result != VK_SUCCESS)
++      return result;
++
++   data[PVR_XFB_COUNTERS_DATA_MODE] = mode;
++   data[PVR_XFB_COUNTERS_DATA_STATE_LO] = state->xfb.state_bo->dev_addr.addr;
++   data[PVR_XFB_COUNTERS_DATA_STATE_HI] =
++      state->xfb.state_bo->dev_addr.addr >> 32;
++
++   for (uint32_t i = 0; i < counter_buffer_count; i++) {
++      const uint32_t buffer_index = first_counter_buffer + i;
++      uint64_t addr = 0;
++
++      if (buffer_index >= PVR_XFB_MAX_BUFFERS)
++         break;
++
++      if (counter_buffers && counter_buffers[i] != VK_NULL_HANDLE) {
++         VK_FROM_HANDLE(pvr_buffer, buffer, counter_buffers[i]);
++         addr = buffer->dev_addr.addr +
++                (counter_buffer_offsets ? counter_buffer_offsets[i] : 0);
++      }
++
++      data[PVR_XFB_COUNTERS_DATA_COUNTER0_LO + 2 * buffer_index] = addr;
++      data[PVR_XFB_COUNTERS_DATA_COUNTER0_HI + 2 * buffer_index] = addr >> 32;
++   }
++
++   result = pvr_xfb_begin_kernels(cmd_buffer, &prev);
++   if (result != VK_SUCCESS)
++      return result;
++
++   result = pvr_arch_cmd_buffer_dispatch_private_program(
++      cmd_buffer,
++      &cmd_buffer->device->xfb_counters_shader,
++      data,
++      _PVR_XFB_COUNTERS_DATA_COUNT,
++      1,
++      1);
++   state->xfb.kernels++;
++
++   pvr_xfb_end_kernels(cmd_buffer, prev);
++
++   return result;
++}
++
++void PVR_PER_ARCH(CmdBindTransformFeedbackBuffersEXT)(
++   VkCommandBuffer commandBuffer,
++   uint32_t firstBinding,
++   uint32_t bindingCount,
++   const VkBuffer *pBuffers,
++   const VkDeviceSize *pOffsets,
++   const VkDeviceSize *pSizes)
++{
++   VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
++   struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
++
++   PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
++
++   for (uint32_t i = 0; i < bindingCount; i++) {
++      const uint32_t binding = firstBinding + i;
++      VK_FROM_HANDLE(pvr_buffer, buffer, pBuffers[i]);
++
++      if (binding >= PVR_XFB_MAX_BUFFERS)
++         break;
++
++      state->xfb.buffers[binding].buffer = buffer;
++      state->xfb.buffers[binding].offset = pOffsets[i];
++      state->xfb.buffers[binding].size =
++         buffer ? vk_buffer_range(&buffer->vk,
++                                  pOffsets[i],
++                                  pSizes ? pSizes[i] : VK_WHOLE_SIZE)
++                : 0;
++   }
++}
++
++void PVR_PER_ARCH(CmdBeginTransformFeedbackEXT)(
++   VkCommandBuffer commandBuffer,
++   uint32_t firstCounterBuffer,
++   uint32_t counterBufferCount,
++   const VkBuffer *pCounterBuffers,
++   const VkDeviceSize *pCounterBufferOffsets)
++{
++   VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
++   VkResult result;
++
++   PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
++
++   cmd_buffer->state.xfb.enabled = true;
++
++   result = pvr_xfb_counters(cmd_buffer,
++                             PVR_XFB_COUNTERS_MODE_BEGIN,
++                             firstCounterBuffer,
++                             counterBufferCount,
++                             pCounterBuffers,
++                             pCounterBufferOffsets);
++   if (result != VK_SUCCESS)
++      vk_command_buffer_set_error(&cmd_buffer->vk, result);
++}
++
++void PVR_PER_ARCH(CmdEndTransformFeedbackEXT)(
++   VkCommandBuffer commandBuffer,
++   uint32_t firstCounterBuffer,
++   uint32_t counterBufferCount,
++   const VkBuffer *pCounterBuffers,
++   const VkDeviceSize *pCounterBufferOffsets)
++{
++   VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
++   VkResult result;
++
++   PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
++
++   result = pvr_xfb_counters(cmd_buffer,
++                             PVR_XFB_COUNTERS_MODE_END,
++                             firstCounterBuffer,
++                             counterBufferCount,
++                             pCounterBuffers,
++                             pCounterBufferOffsets);
++   if (result != VK_SUCCESS)
++      vk_command_buffer_set_error(&cmd_buffer->vk, result);
++
++   cmd_buffer->state.xfb.enabled = false;
++}
++
++/* A transform feedback query program (cs_xfb_query_common): into the
++ * transform feedback sub-command (the availability write at the end of a
++ * query, in order after the draws), or as a compute sub-command of its own
++ * (reset and copy, outside a render).
++ */
++VkResult PVR_PER_ARCH(cmd_buffer_xfb_query_program)(
++   struct pvr_cmd_buffer *cmd_buffer,
++   const struct pvr_query_pool *pool,
++   uint32_t mode,
++   uint32_t first_query,
++   uint32_t query_count,
++   pvr_dev_addr_t dest_addr,
++   uint32_t dest_stride,
++   VkQueryResultFlags flags,
++   bool with_draws)
++{
++   struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
++   const uint64_t result_addr =
++      pool->result_buffer->dev_addr.addr +
++      first_query * PVR_DW_TO_BYTES(_PVR_XFB_QUERY_COUNT);
++   const uint64_t avail_addr =
++      pool->availability_buffer->dev_addr.addr + first_query * sizeof(uint32_t);
++   const uint32_t data[_PVR_XFB_QUERY_DATA_COUNT] = {
++      [PVR_XFB_QUERY_DATA_MODE] = mode,
++      [PVR_XFB_QUERY_DATA_COUNT] = query_count,
++      [PVR_XFB_QUERY_DATA_RESULT_LO] = result_addr,
++      [PVR_XFB_QUERY_DATA_RESULT_HI] = result_addr >> 32,
++      [PVR_XFB_QUERY_DATA_AVAIL_LO] = avail_addr,
++      [PVR_XFB_QUERY_DATA_AVAIL_HI] = avail_addr >> 32,
++      [PVR_XFB_QUERY_DATA_DEST_LO] = dest_addr.addr,
++      [PVR_XFB_QUERY_DATA_DEST_HI] = dest_addr.addr >> 32,
++      [PVR_XFB_QUERY_DATA_DEST_STRIDE] = dest_stride,
++      [PVR_XFB_QUERY_DATA_FLAGS] = flags,
++   };
++   struct pvr_sub_cmd *prev;
++   VkResult result;
++
++   if (with_draws) {
++      result = pvr_xfb_begin_kernels(cmd_buffer, &prev);
++      if (result != VK_SUCCESS)
++         return result;
++
++      result = pvr_arch_cmd_buffer_dispatch_private_program(
++         cmd_buffer,
++         &cmd_buffer->device->xfb_query_shader,
++         data,
++         _PVR_XFB_QUERY_DATA_COUNT,
++         query_count,
++         ROGUE_MAX_INSTANCES_PER_TASK);
++      state->xfb.kernels++;
++
++      pvr_xfb_end_kernels(cmd_buffer, prev);
++
++      return result;
++   }
++
++   result = pvr_xfb_flush(cmd_buffer);
++   if (result != VK_SUCCESS)
++      return result;
++
++   result =
++      pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_COMPUTE);
++   if (result != VK_SUCCESS)
++      return result;
++
++   result = pvr_arch_cmd_buffer_dispatch_private_program(
++      cmd_buffer,
++      &cmd_buffer->device->xfb_query_shader,
++      data,
++      _PVR_XFB_QUERY_DATA_COUNT,
++      query_count,
++      ROGUE_MAX_INSTANCES_PER_TASK);
++   if (result != VK_SUCCESS)
++      return result;
++
++   return pvr_arch_cmd_buffer_end_sub_cmd(cmd_buffer);
++}
++
++/* After a draw's VDM commands: the same draw through the transform feedback
++ * kernel, then the post kernel that moves the offsets on and counts.
++ */
++static VkResult pvr_xfb_draw(struct pvr_cmd_buffer *cmd_buffer,
++                             uint32_t vertex_count,
++                             uint32_t instance_count,
++                             uint32_t first_vertex,
++                             uint32_t first_instance,
++                             uint32_t first_index)
++{
++   struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
++   const struct vk_dynamic_graphics_state *dynamic_state =
++      &cmd_buffer->vk.dynamic_graphics_state;
++   const struct pvr_graphics_pipeline *pipeline = state->gfx_pipeline;
++   const struct pvr_compute_pipeline *xfb_cs = &pipeline->xfb_cs;
++   struct pvr_suballoc_bo *params_bo;
++   struct pvr_sub_cmd *prev;
++   uint32_t *params;
++   VkResult result;
++
++   if (PVR_IS_DEBUG_SET(DUMP_XFB)) {
++      fprintf(stderr,
++              "pvr xfb: draw %u x %u (first %u/%u, index %u) enabled %d "
++              "kernel %d sub_cmd %p\n",
++              vertex_count,
++              instance_count,
++              first_vertex,
++              first_instance,
++              first_index,
++              state->xfb.enabled,
++              pipeline->has_xfb,
++              (void *)state->xfb.sub_cmd);
++   }
++
++   if (!state->xfb.enabled || !pipeline->has_xfb)
++      return VK_SUCCESS;
++
++   if (state->draw_state.draw_indirect) {
++      pvr_finishme("transform feedback with indirect draws");
++      return VK_SUCCESS;
++   }
++
++   const enum pvr_xfb_topology topology =
++      pvr_xfb_topology(dynamic_state->ia.primitive_topology);
++   if (topology == PVR_XFB_TOPOLOGY_UNSUPPORTED) {
++      pvr_finishme("transform feedback with topology %u",
++                   dynamic_state->ia.primitive_topology);
++      return VK_SUCCESS;
++   }
++
++   const uint32_t verts_per_prim = pvr_xfb_verts_per_prim(topology);
++   const uint32_t prim_count = pvr_xfb_prim_count(topology, vertex_count);
++   const uint64_t total =
++      (uint64_t)prim_count * verts_per_prim * instance_count;
++
++   if (!total)
++      return VK_SUCCESS;
++
++   if (total > UINT32_MAX) {
++      pvr_finishme("transform feedback of more than 2^32 vertices");
++      return VK_SUCCESS;
++   }
++
++   result = pvr_xfb_ensure_state(cmd_buffer);
++   if (result != VK_SUCCESS)
++      return result;
++
++   result =
++      pvr_arch_cmd_buffer_alloc_mem(cmd_buffer,
++                                    cmd_buffer->device->heaps.general_heap,
++                                    PVR_DW_TO_BYTES(_PVR_XFB_PARAMS_COUNT),
++                                    &params_bo);
++   if (result != VK_SUCCESS)
++      return result;
++
++   params = pvr_bo_suballoc_get_map_addr(params_bo);
++   memset(params, 0, PVR_DW_TO_BYTES(_PVR_XFB_PARAMS_COUNT));
++
++   params[PVR_XFB_PARAMS_SELF_LO] = params_bo->dev_addr.addr;
++   params[PVR_XFB_PARAMS_SELF_HI] = params_bo->dev_addr.addr >> 32;
++   params[PVR_XFB_PARAMS_STATE_LO] = state->xfb.state_bo->dev_addr.addr;
++   params[PVR_XFB_PARAMS_STATE_HI] = state->xfb.state_bo->dev_addr.addr >> 32;
++
++   if (state->xfb.query_pool) {
++      const uint64_t query_addr =
++         state->xfb.query_pool->result_buffer->dev_addr.addr +
++         state->xfb.query * PVR_DW_TO_BYTES(_PVR_XFB_QUERY_COUNT);
++      params[PVR_XFB_PARAMS_QUERY_LO] = query_addr;
++      params[PVR_XFB_PARAMS_QUERY_HI] = query_addr >> 32;
++   }
++
++   params[PVR_XFB_PARAMS_BUFFERS_WRITTEN] = pipeline->xfb_info.buffers_written;
++   params[PVR_XFB_PARAMS_VERTS_PER_PRIM] = verts_per_prim;
++   params[PVR_XFB_PARAMS_TOPOLOGY] = topology;
++   params[PVR_XFB_PARAMS_PRIM_COUNT] = prim_count;
++   params[PVR_XFB_PARAMS_VERTEX_COUNT] = vertex_count;
++   params[PVR_XFB_PARAMS_INSTANCE_COUNT] = instance_count;
++   params[PVR_XFB_PARAMS_FIRST_VERTEX] = first_vertex;
++   params[PVR_XFB_PARAMS_FIRST_INSTANCE] = first_instance;
++   params[PVR_XFB_PARAMS_RESTART_ENABLE] =
++      dynamic_state->ia.primitive_restart_enable;
++   params[PVR_XFB_PARAMS_TOTAL_VERTICES] = total;
++
++   if (state->draw_state.draw_indexed) {
++      const uint32_t index_size =
++         vk_index_type_to_bytes(state->index_buffer_binding.type);
++      const uint64_t index_addr =
++         state->index_buffer_binding.buffer->dev_addr.addr +
++         state->index_buffer_binding.offset + (uint64_t)first_index * index_size;
++
++      params[PVR_XFB_PARAMS_INDEX_LO] = index_addr;
++      params[PVR_XFB_PARAMS_INDEX_HI] = index_addr >> 32;
++      params[PVR_XFB_PARAMS_INDEX_SIZE] = index_size;
++   }
++
++   for (uint32_t b = 0; b < PVR_XFB_MAX_BUFFERS; b++) {
++      uint32_t *xfb = &params[PVR_XFB_PARAMS_XFB0 + b * PVR_XFB_PARAMS_XFB_DWORDS];
++
++      if (!(pipeline->xfb_info.buffers_written & BITFIELD_BIT(b)) ||
++          !state->xfb.buffers[b].buffer)
++         continue;
++
++      const uint64_t addr = state->xfb.buffers[b].buffer->dev_addr.addr +
++                            state->xfb.buffers[b].offset;
++      xfb[PVR_XFB_PARAMS_XFB_LO] = addr;
++      xfb[PVR_XFB_PARAMS_XFB_HI] = addr >> 32;
++      xfb[PVR_XFB_PARAMS_XFB_SIZE] = MIN2(state->xfb.buffers[b].size, UINT32_MAX);
++      xfb[PVR_XFB_PARAMS_XFB_STRIDE] = pipeline->xfb_info.strides[b];
++   }
++
++   for (uint32_t i = 0; i < PVR_XFB_MAX_VERTEX_BINDINGS; i++) {
++      const struct pvr_vertex_binding *binding = &state->vertex_bindings[i];
++      uint32_t *vb = &params[PVR_XFB_PARAMS_VB0 + i * PVR_XFB_PARAMS_VB_DWORDS];
++
++      if (!binding->buffer)
++         continue;
++
++      const uint64_t addr = binding->buffer->dev_addr.addr + binding->offset;
++      vb[PVR_XFB_PARAMS_VB_LO] = addr;
++      vb[PVR_XFB_PARAMS_VB_HI] = addr >> 32;
++      vb[PVR_XFB_PARAMS_VB_SIZE] = MIN2(binding->size, UINT32_MAX);
++      vb[PVR_XFB_PARAMS_VB_STRIDE] = dynamic_state->vi_binding_strides[i];
++   }
++
++   result = pvr_xfb_begin_kernels(cmd_buffer, &prev);
++   if (result != VK_SUCCESS)
++      return result;
++
++   struct pvr_sub_cmd_compute *const sub_cmd = &state->current_sub_cmd->compute;
++   uint32_t descriptor_data_offset = 0;
++
++   sub_cmd->uses_atomic_ops |= xfb_cs->cs_data.common.uses.atomics;
++   sub_cmd->uses_barrier |= xfb_cs->cs_data.common.uses.barriers;
++
++   /* The vertex stage's descriptors and push constants, and the parameter
++    * block, through the kernel's PDS descriptor program.
++    */
++   state->xfb.params_addr = params_bo->dev_addr;
++   result =
++      pvr_setup_descriptor_mappings_ex(cmd_buffer,
++                                       PVR_STAGE_ALLOCATION_VERTEX_GEOMETRY,
++                                       &state->gfx_desc_state,
++                                       &xfb_cs->cs_data,
++                                       &xfb_cs->descriptor_state,
++                                       NULL,
++                                       &descriptor_data_offset);
++   if (result != VK_SUCCESS)
++      goto out;
++
++   pvr_compute_update_shared_ex(cmd_buffer,
++                                sub_cmd,
++                                xfb_cs,
++                                descriptor_data_offset);
++   pvr_compute_update_kernel(
++      cmd_buffer,
++      sub_cmd,
++      xfb_cs,
++      PVR_DEV_ADDR_INVALID,
++      (uint32_t[]){ 0, 0, 0 },
++      (uint32_t[]){ DIV_ROUND_UP((uint32_t)total, PVR_XFB_WORKGROUP_SIZE),
++                    1,
++                    1 });
++   state->xfb.kernels++;
++
++   pvr_xfb_fence(cmd_buffer, sub_cmd);
++
++   const uint32_t post[_PVR_XFB_POST_DATA_COUNT] = {
++      [PVR_XFB_POST_DATA_PARAMS_LO] = params_bo->dev_addr.addr,
++      [PVR_XFB_POST_DATA_PARAMS_HI] = params_bo->dev_addr.addr >> 32,
++   };
++   result = pvr_arch_cmd_buffer_dispatch_private_program(
++      cmd_buffer,
++      &cmd_buffer->device->xfb_post_shader,
++      post,
++      _PVR_XFB_POST_DATA_COUNT,
++      1,
++      1);
++   state->xfb.kernels++;
++
++out:
++   pvr_xfb_end_kernels(cmd_buffer, prev);
++
++   return result;
++}
++
+ void PVR_PER_ARCH(CmdDispatchBase)(VkCommandBuffer commandBuffer,
+                                    uint32_t baseGroupX,
+                                    uint32_t baseGroupY,
+@@ -8795,6 +9492,15 @@
+                            0U,
+                            0U,
+                            0U);
++
++   result = pvr_xfb_draw(cmd_buffer,
++                         vertexCount,
++                         instanceCount,
++                         firstVertex,
++                         firstInstance,
++                         0U);
++   if (result != VK_SUCCESS)
++      vk_command_buffer_set_error(&cmd_buffer->vk, result);
+ }
+ 
+ void PVR_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
+@@ -8836,6 +9542,15 @@
+                            0U,
+                            0U,
+                            0U);
++
++   result = pvr_xfb_draw(cmd_buffer,
++                         indexCount,
++                         instanceCount,
++                         vertexOffset,
++                         firstInstance,
++                         firstIndex);
++   if (result != VK_SUCCESS)
++      vk_command_buffer_set_error(&cmd_buffer->vk, result);
+ }
+ 
+ void PVR_PER_ARCH(CmdDrawIndexedIndirect)(VkCommandBuffer commandBuffer,
+@@ -8935,6 +9650,10 @@
+    if (result != VK_SUCCESS)
+       return;
+ 
++   result = pvr_xfb_flush(cmd_buffer);
++   if (result != VK_SUCCESS)
++      return;
++
+    result = pvr_resolve_unemitted_resolve_attachments(cmd_buffer,
+                                                       &state->render_pass_info);
+    if (result != VK_SUCCESS)
+@@ -9951,6 +10670,10 @@
+    if (result != VK_SUCCESS)
+       pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
+ 
++   result = pvr_xfb_flush(cmd_buffer);
++   if (result != VK_SUCCESS)
++      pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
++
+    util_dynarray_fini(&state->query_indices);
+ 
+    return vk_command_buffer_end(&cmd_buffer->vk);
+diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_query.c b/src/imagination/vulkan/pvr_arch_cmd_query.c
+--- a/src/imagination/vulkan/pvr_arch_cmd_query.c
++++ b/src/imagination/vulkan/pvr_arch_cmd_query.c
+@@ -4,6 +4,7 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include "pvr_buffer.h"
+ #include "pvr_cmd_buffer.h"
+ #include "pvr_entrypoints.h"
+ #include "pvr_hw_pass.h"
+@@ -17,6 +18,7 @@
+                                      uint32_t queryCount)
+ {
+    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
++   VK_FROM_HANDLE(pvr_query_pool, pool, queryPool);
+    struct pvr_query_info query_info;
+    VkResult result;
+ 
+@@ -25,6 +27,23 @@
+    if (queryCount == 0)
+       return;
+ 
++   if (pool->type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {
++      /* (air/OS) A compute kernel, in order with the ones that count. */
++      result = pvr_arch_cmd_buffer_xfb_query_program(cmd_buffer,
++                                                     pool,
++                                                     PVR_XFB_QUERY_MODE_RESET,
++                                                     firstQuery,
++                                                     queryCount,
++                                                     PVR_DEV_ADDR_INVALID,
++                                                     0,
++                                                     0,
++                                                     false);
++      if (result != VK_SUCCESS)
++         vk_command_buffer_set_error(&cmd_buffer->vk, result);
++
++      return;
++   }
++
+    query_info.type = PVR_QUERY_TYPE_RESET_QUERY_POOL;
+ 
+    query_info.reset_query_pool.query_pool = queryPool;
+@@ -79,6 +98,7 @@
+                                            VkQueryResultFlags flags)
+ {
+    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
++   VK_FROM_HANDLE(pvr_query_pool, pool, queryPool);
+    struct pvr_query_info query_info;
+    VkResult result;
+ 
+@@ -87,6 +107,44 @@
+    if (queryCount == 0)
+       return;
+ 
++   if (pool->type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {
++      /* (air/OS) A compute kernel copies the counters; a transfer operation
++       * to the application, so transfers and graphics wait for it.
++       */
++      VK_FROM_HANDLE(pvr_buffer, buffer, dstBuffer);
++
++      result = pvr_arch_cmd_buffer_xfb_query_program(
++         cmd_buffer,
++         pool,
++         PVR_XFB_QUERY_MODE_COPY,
++         firstQuery,
++         queryCount,
++         PVR_DEV_ADDR_OFFSET(buffer->dev_addr, dstOffset),
++         stride,
++         flags,
++         false);
++      if (result != VK_SUCCESS) {
++         vk_command_buffer_set_error(&cmd_buffer->vk, result);
++         return;
++      }
++
++      result = pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer,
++                                                 PVR_SUB_CMD_TYPE_EVENT);
++      if (result != VK_SUCCESS)
++         return;
++
++      cmd_buffer->state.current_sub_cmd->event = (struct pvr_sub_cmd_event){
++         .type = PVR_EVENT_TYPE_BARRIER,
++         .barrier = {
++            .wait_for_stage_mask = PVR_PIPELINE_STAGE_COMPUTE_BIT,
++            .wait_at_stage_mask = PVR_PIPELINE_STAGE_ALL_GRAPHICS_BITS |
++                                  PVR_PIPELINE_STAGE_TRANSFER_BIT,
++         },
++      };
++
++      return;
++   }
++
+    query_info.type = PVR_QUERY_TYPE_COPY_QUERY_RESULTS;
+ 
+    query_info.copy_query_results.query_pool = queryPool;
+@@ -173,6 +231,13 @@
+ 
+    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+ 
++   if (pool->type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {
++      /* (air/OS) The draws' post kernels add to this query's counters. */
++      state->xfb.query_pool = pool;
++      state->xfb.query = query;
++      return;
++   }
++
+    /* Occlusion queries can't be nested. */
+    assert(!state->vis_test_enabled);
+ 
+@@ -222,10 +287,52 @@
+                                uint32_t query)
+ {
+    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
++   VK_FROM_HANDLE(pvr_query_pool, pool, queryPool);
+    struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
+ 
+    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+ 
++   if (pool->type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {
++      /* (air/OS) Available once the draws so far have been counted. */
++      VkResult result;
++
++      state->xfb.query_pool = NULL;
++
++      result = pvr_arch_cmd_buffer_xfb_query_program(cmd_buffer,
++                                                     pool,
++                                                     PVR_XFB_QUERY_MODE_AVAIL,
++                                                     query,
++                                                     1,
++                                                     PVR_DEV_ADDR_INVALID,
++                                                     0,
++                                                     0,
++                                                     true);
++      if (result != VK_SUCCESS)
++         vk_command_buffer_set_error(&cmd_buffer->vk, result);
++
++      return;
++   }
++
+    state->vis_test_enabled = false;
+    state->dirty.vis_test = true;
+ }
++
++/* (air/OS) VK_EXT_transform_feedback: one stream, so the index is moot. */
++void PVR_PER_ARCH(CmdBeginQueryIndexedEXT)(VkCommandBuffer commandBuffer,
++                                           VkQueryPool queryPool,
++                                           uint32_t query,
++                                           VkQueryControlFlags flags,
++                                           uint32_t index)
++{
++   assert(index == 0);
++   PVR_PER_ARCH(CmdBeginQuery)(commandBuffer, queryPool, query, flags);
++}
++
++void PVR_PER_ARCH(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
++                                         VkQueryPool queryPool,
++                                         uint32_t query,
++                                         uint32_t index)
++{
++   assert(index == 0);
++   PVR_PER_ARCH(CmdEndQuery)(commandBuffer, queryPool, query);
++}
 diff -ruN a/src/imagination/vulkan/pvr_arch_device.c b/src/imagination/vulkan/pvr_arch_device.c
 --- a/src/imagination/vulkan/pvr_arch_device.c
 +++ b/src/imagination/vulkan/pvr_arch_device.c
@@ -1688,7 +3094,23 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_device.c b/src/imagination/vulkan/pv
     pvr_bo_suballocator_init(&device->suballoc_general,
                              device->heaps.general_heap,
                              device,
-@@ -851,6 +856,7 @@
+@@ -808,10 +813,14 @@
+    if (result != VK_SUCCESS)
+       goto err_pvr_free_view_index;
+ 
+-   result = pvr_device_init_compute_idfwdf_state(device);
++   result = pvr_arch_device_create_xfb_programs(device);
+    if (result != VK_SUCCESS)
+       goto err_pvr_destroy_compute_query_programs;
+ 
++   result = pvr_device_init_compute_idfwdf_state(device);
++   if (result != VK_SUCCESS)
++      goto err_pvr_destroy_xfb_programs;
++
+    result = pvr_device_init_graphics_static_clear_state(device);
+    if (result != VK_SUCCESS)
+       goto err_pvr_finish_compute_idfwdf;
+@@ -851,6 +860,7 @@
  
     simple_mtx_init(&device->rs_mtx, mtx_plain);
     list_inithead(&device->render_states);
@@ -1696,7 +3118,17 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_device.c b/src/imagination/vulkan/pv
  
     *pDevice = pvr_device_to_handle(device);
  
-@@ -903,6 +909,9 @@
+@@ -874,6 +884,9 @@
+ err_pvr_finish_compute_idfwdf:
+    pvr_device_finish_compute_idfwdf_state(device);
+ 
++err_pvr_destroy_xfb_programs:
++   pvr_arch_device_destroy_xfb_programs(device);
++
+ err_pvr_destroy_compute_query_programs:
+    pvr_arch_device_destroy_compute_query_programs(device);
+ 
+@@ -903,6 +916,9 @@
     pvr_bo_suballocator_fini(&device->suballoc_pds);
     pvr_bo_suballocator_fini(&device->suballoc_general);
  
@@ -1706,7 +3138,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_device.c b/src/imagination/vulkan/pv
     pvr_bo_store_destroy(device);
  
  err_vk_device_finish:
-@@ -936,6 +945,12 @@
+@@ -936,6 +952,12 @@
     }
     simple_mtx_unlock(&device->rs_mtx);
     simple_mtx_destroy(&device->rs_mtx);
@@ -1719,7 +3151,15 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_device.c b/src/imagination/vulkan/pv
  
     pvr_arch_border_color_table_finish(device);
     pvr_robustness_buffer_finish(device);
-@@ -960,6 +975,9 @@
+@@ -945,6 +967,7 @@
+    pvr_arch_device_finish_spm_load_state(device);
+    pvr_device_finish_graphics_static_clear_state(device);
+    pvr_device_finish_compute_idfwdf_state(device);
++   pvr_arch_device_destroy_xfb_programs(device);
+    pvr_arch_device_destroy_compute_query_programs(device);
+    pvr_bo_suballoc_free(device->pds_compute_empty_program.pvr_bo);
+ 
+@@ -960,6 +983,9 @@
     pvr_bo_suballocator_fini(&device->suballoc_transfer);
     pvr_bo_suballocator_fini(&device->suballoc_pds);
     pvr_bo_suballocator_fini(&device->suballoc_general);
@@ -2089,7 +3529,15 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_job_transfer.c b/src/imagination/vul
 diff -ruN a/src/imagination/vulkan/pvr_arch_pipeline.c b/src/imagination/vulkan/pvr_arch_pipeline.c
 --- a/src/imagination/vulkan/pvr_arch_pipeline.c
 +++ b/src/imagination/vulkan/pvr_arch_pipeline.c
-@@ -545,6 +545,22 @@
+@@ -47,6 +47,7 @@
+ #include "pvr_entrypoints.h"
+ #include "pvr_hw_pass.h"
+ #include "pvr_macros.h"
++#include "common/pvr_debug.h"
+ #include "pvr_nir_lower_ycbcr.h"
+ #include "pvr_pass.h"
+ #include "pvr_pds.h"
+@@ -545,6 +546,22 @@
        };
     }
  
@@ -2112,7 +3560,79 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_pipeline.c b/src/imagination/vulkan/
     if (stage == MESA_SHADER_FRAGMENT && data->fs.blend_consts.count > 0) {
        program.buffers[program.buffer_count++] = (struct pvr_pds_buffer){
           .type = PVR_BUFFER_TYPE_BLEND_CONSTS,
-@@ -2619,6 +2635,12 @@
+@@ -618,6 +635,17 @@
+       };
+    }
+ 
++   /* (air/OS) The transform feedback kernel's parameter block: its first two
++    * dwords are its own address (pvr_xfb.c).
++    */
++   if (data->common.xfb_params.count > 0) {
++      program.buffers[program.buffer_count++] = (struct pvr_pds_buffer){
++         .type = PVR_BUFFER_TYPE_XFB_PARAMS,
++         .size_in_dwords = data->common.xfb_params.count,
++         .destination = data->common.xfb_params.start,
++      };
++   }
++
+    /* Pass the 64-bit address (as 2x32-bit regs) of the global shmem buffer. */
+    if (stage == MESA_SHADER_COMPUTE && data->cs.shmem.count > 0 &&
+        data->cs.global_shmem) {
+@@ -1203,6 +1231,9 @@
+ }
+ 
+ static void pvr_pipeline_destroy_shader_data(pco_data *data);
++static void pvr_xfb_kernel_destroy(struct pvr_device *const device,
++                                   const VkAllocationCallbacks *const allocator,
++                                   struct pvr_graphics_pipeline *gfx_pipeline);
+ 
+ static void pvr_compute_pipeline_destroy(
+    struct pvr_device *const device,
+@@ -1288,6 +1319,8 @@
+       allocator,
+       &gfx_pipeline->shader_state.vertex.descriptor_state);
+ 
++   pvr_xfb_kernel_destroy(device, allocator, gfx_pipeline);
++
+    for (uint32_t i = 0; i < num_vertex_attrib_programs; i++) {
+       struct pvr_pds_attrib_program *const attrib_program =
+          &gfx_pipeline->shader_state.vertex.pds_attrib_programs[i];
+@@ -2451,7 +2484,8 @@
+ 
+ static void pvr_init_descriptors(pco_data *data,
+                                  nir_shader *nir,
+-                                 struct vk_pipeline_layout *layout)
++                                 struct vk_pipeline_layout *layout,
++                                 mesa_shader_stage layout_stage)
+ {
+    const struct pvr_device *device = vk_to_pvr_device(layout->base.device);
+    data->common.robust_buffer_access =
+@@ -2469,7 +2503,7 @@
+          &data->common.desc_sets[desc_set];
+ 
+       /* If the descriptor set isn't for this stage, skip it. */
+-      if (!(BITFIELD_BIT(nir->info.stage) & set_layout->stage_flags))
++      if (!(BITFIELD_BIT(layout_stage) & set_layout->stage_flags))
+          continue;
+ 
+       desc_set_data->binding_count = set_layout->binding_count;
+@@ -2492,9 +2526,13 @@
+ 
+ static void pvr_setup_descriptors(pco_data *data,
+                                   nir_shader *nir,
+-                                  struct vk_pipeline_layout *layout)
++                                  struct vk_pipeline_layout *layout,
++                                  mesa_shader_stage layout_stage)
+ {
+-   mesa_shader_stage stage = nir->info.stage;
++   /* The stage the pipeline layout knows the shader as: the transform
++    * feedback kernel is a compute shader with the vertex stage's layout.
++    */
++   mesa_shader_stage stage = layout_stage;
+ 
+    data->common.shareds = ALIGN_POT(data->common.shareds, 4);
+ 
+@@ -2619,6 +2657,18 @@
        data->common.shareds += count;
     }
  
@@ -2122,9 +3642,355 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_pipeline.c b/src/imagination/vulkan/
 +      data->common.shareds += data->common.ubo_promoted.count;
 +   }
 +
++   /* (air/OS) The transform feedback kernel's parameter block address. */
++   if (data->common.xfb_params.count > 0) {
++      data->common.xfb_params.start = data->common.shareds;
++      data->common.shareds += data->common.xfb_params.count;
++   }
++
     if (data->common.uses.point_sampler) {
        data->common.shareds = ALIGN_POT(data->common.shareds, 4);
        data->common.point_sampler = (pco_range){
+@@ -2720,7 +2770,7 @@
+       UNREACHABLE("");
+    }
+ 
+-   pvr_init_descriptors(data, nir, layout);
++   pvr_init_descriptors(data, nir, layout, nir->info.stage);
+ 
+    /* TODO: common things, like large constants being put into shareds. */
+ }
+@@ -2779,7 +2829,7 @@
+       UNREACHABLE("");
+    }
+ 
+-   pvr_setup_descriptors(data, nir, layout);
++   pvr_setup_descriptors(data, nir, layout, nir->info.stage);
+ 
+    /* TODO: common things, like large constants being put into shareds. */
+ }
+@@ -2832,6 +2882,158 @@
+    return is_arch_rogue && no_fragment_shader;
+ }
+ 
++/* (air/OS) Transform feedback emulation: compiles the vertex shader (a copy
++ * taken after pco_preprocess_nir()) as the compute kernel of pvr_xfb.h, with
++ * the vertex stage's descriptor sets and push constants, into
++ * gfx_pipeline->xfb_cs. Not an error when the shader captures nothing.
++ */
++static VkResult
++pvr_xfb_kernel_compile(struct pvr_device *const device,
++                       const VkAllocationCallbacks *const allocator,
++                       const VkGraphicsPipelineCreateInfo *pCreateInfo,
++                       const struct vk_graphics_pipeline_state *state,
++                       struct pvr_graphics_pipeline *const gfx_pipeline,
++                       nir_shader *nir,
++                       void *shader_mem_ctx)
++{
++   struct vk_pipeline_layout *layout = gfx_pipeline->base.layout;
++   const uint32_t cache_line_size =
++      pvr_get_slc_cache_line_size(&device->pdevice->dev_info);
++   pco_ctx *pco_ctx = device->pdevice->pco_ctx;
++   struct pvr_compute_pipeline *xfb_cs = &gfx_pipeline->xfb_cs;
++   struct pvr_compute_shader_state *compute_state = &xfb_cs->shader_state;
++   pco_data shader_data = { 0 };
++   pco_data vs_formats = { 0 };
++   pco_shader *cs;
++   VkResult result;
++
++   pvr_init_vs_attribs(&vs_formats, pCreateInfo->pVertexInputState);
++
++   if (!pvr_xfb_lower_vs_to_cs(nir,
++                               state->vi,
++                               &vs_formats,
++                               &gfx_pipeline->xfb_info))
++      return VK_SUCCESS;
++
++   shader_data.common.xfb_params.count = 2;
++   pvr_init_descriptors(&shader_data, nir, layout, MESA_SHADER_VERTEX);
++
++   const struct lower_ycbcr_state ycbcr_state = {
++      .set_layout_count = layout->set_count,
++      .set_layouts = layout->set_layouts,
++   };
++   NIR_PASS(_,
++            nir,
++            nir_pvr_lower_ycbcr_tex,
++            lookup_ycbcr_conversion,
++            &ycbcr_state);
++   pco_lower_nir(pco_ctx, nir, &shader_data);
++   pco_postprocess_nir(pco_ctx, nir, &shader_data);
++
++   pvr_alloc_cs_sysvals(&shader_data, nir);
++   pvr_alloc_cs_shmem(&shader_data, nir);
++   pvr_setup_descriptors(&shader_data, nir, layout, MESA_SHADER_VERTEX);
++
++   cs = pco_trans_nir(pco_ctx, nir, &shader_data, shader_mem_ctx);
++   if (!cs)
++      return VK_ERROR_INITIALIZATION_FAILED;
++
++   pco_process_ir(pco_ctx, cs);
++   pco_encode_ir(pco_ctx, cs);
++
++   pvr_compute_state_save(xfb_cs, cs);
++
++   if (PVR_IS_DEBUG_SET(DUMP_XFB)) {
++      fprintf(stderr, "pvr: transform feedback kernel of pipeline %p\n",
++              (void *)gfx_pipeline);
++      nir_print_shader(nir, stderr);
++   }
++
++   result = pvr_gpu_upload_usc(device,
++                               pco_shader_binary_data(cs),
++                               pco_shader_binary_size(cs),
++                               cache_line_size,
++                               &compute_state->shader_bo);
++   if (result != VK_SUCCESS)
++      return result;
++
++   if (xfb_cs->cs_data.cs.zero_shmem && !xfb_cs->cs_data.cs.global_shmem) {
++      uint32_t start = xfb_cs->cs_data.cs.shmem.start;
++      uint32_t count = xfb_cs->cs_data.cs.shmem.count;
++      pco_shader *zero_init_shader =
++         pvr_usc_zero_init_wg_mem(pco_ctx, start, count);
++
++      compute_state->coeff_update_shader_temps =
++         pco_shader_data(zero_init_shader)->common.temps;
++
++      result = pvr_gpu_upload_usc(device,
++                                  pco_shader_binary_data(zero_init_shader),
++                                  pco_shader_binary_size(zero_init_shader),
++                                  cache_line_size,
++                                  &compute_state->coeff_update_shader_bo);
++      ralloc_free(zero_init_shader);
++
++      if (result != VK_SUCCESS)
++         goto err_free_shader;
++   }
++
++   result = pvr_pds_descriptor_program_create_and_upload(
++      device,
++      allocator,
++      layout,
++      MESA_SHADER_VERTEX,
++      &xfb_cs->cs_data,
++      &xfb_cs->descriptor_state);
++   if (result != VK_SUCCESS)
++      goto err_free_coeff_update_shader;
++
++   result = pvr_pds_compute_program_create_and_upload(device,
++                                                      allocator,
++                                                      compute_state,
++                                                      xfb_cs);
++   if (result != VK_SUCCESS)
++      goto err_free_descriptor_program;
++
++   gfx_pipeline->has_xfb = true;
++
++   return VK_SUCCESS;
++
++err_free_descriptor_program:
++   pvr_pds_descriptor_program_destroy(device,
++                                      allocator,
++                                      &xfb_cs->descriptor_state);
++
++err_free_coeff_update_shader:
++   pvr_bo_suballoc_free(compute_state->coeff_update_shader_bo);
++
++err_free_shader:
++   pvr_bo_suballoc_free(compute_state->shader_bo);
++
++   return result;
++}
++
++static void pvr_xfb_kernel_destroy(struct pvr_device *const device,
++                                   const VkAllocationCallbacks *const allocator,
++                                   struct pvr_graphics_pipeline *gfx_pipeline)
++{
++   struct pvr_compute_pipeline *xfb_cs = &gfx_pipeline->xfb_cs;
++
++   if (!gfx_pipeline->has_xfb)
++      return;
++
++   pvr_pds_compute_program_destroy(device,
++                                   allocator,
++                                   &xfb_cs->pds_cs_program,
++                                   xfb_cs->pds_cs_data_section);
++   pvr_pds_descriptor_program_destroy(device,
++                                      allocator,
++                                      &xfb_cs->descriptor_state);
++   pvr_bo_suballoc_free(xfb_cs->shader_state.coeff_update_shader_bo);
++   pvr_bo_suballoc_free(xfb_cs->shader_state.shader_bo);
++   pvr_pipeline_destroy_shader_data(&xfb_cs->cs_data);
++   gfx_pipeline->has_xfb = false;
++}
++
+ /* Compiles and uploads shaders and PDS programs. */
+ static VkResult
+ pvr_graphics_pipeline_compile(struct pvr_device *const device,
+@@ -2939,6 +3141,18 @@
+       pco_preprocess_nir(pco_ctx, nir_shaders[stage], &shader_data[stage]);
+    }
+ 
++   /* (air/OS) A vertex shader that captures outputs also becomes the
++    * transform feedback kernel; its copy is taken before the stages are
++    * linked, so that outputs the fragment shader does not read survive.
++    */
++   nir_shader *xfb_nir = NULL;
++   if (nir_shaders[MESA_SHADER_VERTEX] &&
++       nir_shaders[MESA_SHADER_VERTEX]->xfb_info &&
++       device->vk.enabled_features.transformFeedback) {
++      xfb_nir =
++         nir_shader_clone(shader_mem_ctx, nir_shaders[MESA_SHADER_VERTEX]);
++   }
++
+    for (mesa_shader_stage stage = 0; stage < MESA_SHADER_STAGES; ++stage) {
+       if (!nir_shaders[stage])
+          continue;
+@@ -3150,6 +3364,22 @@
+    if (result != VK_SUCCESS)
+       goto err_free_vertex_attrib_program;
+ 
++   if (xfb_nir) {
++      result = pvr_xfb_kernel_compile(device,
++                                      allocator,
++                                      pCreateInfo,
++                                      state,
++                                      gfx_pipeline,
++                                      xfb_nir,
++                                      shader_mem_ctx);
++      if (result != VK_SUCCESS) {
++         pvr_pds_descriptor_program_destroy(device,
++                                            allocator,
++                                            &vertex_state->descriptor_state);
++         goto err_free_vertex_attrib_program;
++      }
++   }
++
+    /* FIXME: When the temp_buffer_total_size is non-zero we need to allocate a
+     * scratch buffer for both vertex and fragment stage.
+     * Figure out the best place to do this.
+diff -ruN a/src/imagination/vulkan/pvr_arch_query_compute.c b/src/imagination/vulkan/pvr_arch_query_compute.c
+--- a/src/imagination/vulkan/pvr_arch_query_compute.c
++++ b/src/imagination/vulkan/pvr_arch_query_compute.c
+@@ -323,12 +323,13 @@
+ {
+    struct pvr_sub_cmd *sub_cmd = cmd_buffer->state.current_sub_cmd;
+    const uint32_t workgroup_size[PVR_WORKGROUP_DIMENSIONS] = {
+-      DIV_ROUND_UP(num_query_indices, 32),
++      DIV_ROUND_UP(num_query_indices, pipeline->workgroup_size.width),
+       1,
+       1,
+    };
+ 
+-   assert(sub_cmd->type == PVR_SUB_CMD_TYPE_QUERY);
++   assert(sub_cmd->type == PVR_SUB_CMD_TYPE_QUERY ||
++          sub_cmd->type == PVR_SUB_CMD_TYPE_COMPUTE);
+ 
+    pvr_arch_compute_update_shared_private(cmd_buffer,
+                                           &sub_cmd->compute,
+@@ -596,3 +597,101 @@
+ 
+    return pvr_arch_cmd_buffer_end_sub_cmd(cmd_buffer);
+ }
++
++/* (air/OS) Transform feedback emulation (pvr_xfb.h): the helper kernels of
++ * usclib/common.cl, and a generic dispatch of a precompiled program.
++ */
++VkResult PVR_PER_ARCH(device_create_xfb_programs)(struct pvr_device *device)
++{
++   VkResult result;
++
++   result = pvr_create_compute_query_precomp_program(
++      device,
++      CS_XFB_COUNTERS_COMMON,
++      _PVR_XFB_COUNTERS_DATA_COUNT,
++      &device->xfb_counters_shader);
++   if (result != VK_SUCCESS)
++      return result;
++
++   result = pvr_create_compute_query_precomp_program(device,
++                                                     CS_XFB_POST_COMMON,
++                                                     _PVR_XFB_POST_DATA_COUNT,
++                                                     &device->xfb_post_shader);
++   if (result != VK_SUCCESS)
++      goto err_destroy_counters;
++
++   result =
++      pvr_create_compute_query_precomp_program(device,
++                                               CS_XFB_QUERY_COMMON,
++                                               _PVR_XFB_QUERY_DATA_COUNT,
++                                               &device->xfb_query_shader);
++   if (result != VK_SUCCESS)
++      goto err_destroy_post;
++
++   return VK_SUCCESS;
++
++err_destroy_post:
++   pvr_destroy_compute_query_program(device, &device->xfb_post_shader);
++
++err_destroy_counters:
++   pvr_destroy_compute_query_program(device, &device->xfb_counters_shader);
++
++   return result;
++}
++
++void PVR_PER_ARCH(device_destroy_xfb_programs)(struct pvr_device *device)
++{
++   pvr_destroy_compute_query_program(device, &device->xfb_query_shader);
++   pvr_destroy_compute_query_program(device, &device->xfb_post_shader);
++   pvr_destroy_compute_query_program(device, &device->xfb_counters_shader);
++}
++
++VkResult PVR_PER_ARCH(cmd_buffer_dispatch_private_program)(
++   struct pvr_cmd_buffer *cmd_buffer,
++   const struct pvr_compute_query_shader *program,
++   const uint32_t *const_data,
++   uint32_t const_count,
++   uint32_t invocations,
++   uint32_t workgroup_size)
++{
++   struct pvr_private_compute_pipeline pipeline = { 0 };
++   struct pvr_suballoc_bo *pvr_bo;
++   VkResult result;
++
++   assert(cmd_buffer->state.current_sub_cmd &&
++          (cmd_buffer->state.current_sub_cmd->type ==
++              PVR_SUB_CMD_TYPE_COMPUTE ||
++           cmd_buffer->state.current_sub_cmd->type == PVR_SUB_CMD_TYPE_QUERY));
++
++   pipeline.pds_code_offset = program->pds_prim_code.code_offset;
++   pipeline.pds_data_offset = program->pds_prim_code.data_offset;
++   pipeline.pds_shared_update_code_offset = program->pds_sec_code.code_offset;
++   pipeline.pds_data_size_dw = program->primary_data_size_dw;
++   pipeline.pds_temps_used = program->primary_num_temps;
++   pipeline.const_shared_regs_count = const_count;
++   /* As the query programs: enough for these small kernels. */
++   pipeline.coeff_regs_count = 3;
++   pipeline.unified_store_regs_count = 8;
++
++   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer,
++                                               const_data,
++                                               PVR_DW_TO_BYTES(const_count),
++                                               &pvr_bo);
++   if (result != VK_SUCCESS)
++      return result;
++
++   pipeline.const_buffer_addr = pvr_bo->dev_addr;
++
++   result =
++      pvr_write_compute_query_pds_data_section(cmd_buffer, program, &pipeline);
++   if (result != VK_SUCCESS)
++      return result;
++
++   pipeline.workgroup_size.width = workgroup_size;
++   pipeline.workgroup_size.height = 1;
++   pipeline.workgroup_size.depth = 1;
++
++   pvr_write_private_compute_dispatch(cmd_buffer, &pipeline, invocations);
++
++   return VK_SUCCESS;
++}
 diff -ruN a/src/imagination/vulkan/pvr_arch_queue.c b/src/imagination/vulkan/pvr_arch_queue.c
 --- a/src/imagination/vulkan/pvr_arch_queue.c
 +++ b/src/imagination/vulkan/pvr_arch_queue.c
@@ -2509,6 +4375,74 @@ diff -ruN a/src/imagination/vulkan/pvr_bo.h b/src/imagination/vulkan/pvr_bo.h
  
  VkResult pvr_bo_alloc(struct pvr_device *device,
                        struct pvr_winsys_heap *heap,
+diff -ruN a/src/imagination/vulkan/pvr_cmd_buffer.h b/src/imagination/vulkan/pvr_cmd_buffer.h
+--- a/src/imagination/vulkan/pvr_cmd_buffer.h
++++ b/src/imagination/vulkan/pvr_cmd_buffer.h
+@@ -21,6 +21,7 @@
+ #include "pvr_job_render.h"
+ #include "pvr_hw_pass.h"
+ #include "pvr_types.h"
++#include "pvr_xfb.h"
+ 
+ struct pvr_pds_upload;
+ struct pvr_private_compute_pipeline;
+@@ -455,6 +456,35 @@
+ 
+    struct pvr_push_constants push_consts[PVR_STAGE_ALLOCATION_COUNT];
+ 
++   /* (air/OS) Transform feedback emulation (pvr_xfb.h). */
++   struct {
++      bool enabled;
++      struct {
++         struct pvr_buffer *buffer;
++         VkDeviceSize offset;
++         VkDeviceSize size;
++      } buffers[PVR_XFB_MAX_BUFFERS];
++      /* The bytes written so far into each buffer (pvr_xfb_state_dw),
++       * allocated at the first use.
++       */
++      struct pvr_suballoc_bo *state_bo;
++      /* The compute sub-command the kernels go into, kept open across the
++       * draws of a render; NULL when none is open.
++       */
++      struct pvr_sub_cmd *sub_cmd;
++      /* How many kernels that sub-command has: each one after the first
++       * waits for the ones before it.
++       */
++      uint32_t kernels;
++      /* The parameter block of the kernel being set up, for its PDS
++       * descriptor program (PVR_BUFFER_TYPE_XFB_PARAMS).
++       */
++      pvr_dev_addr_t params_addr;
++      /* The active transform feedback query, if any. */
++      const struct pvr_query_pool *query_pool;
++      uint32_t query;
++   } xfb;
++
+    VkFormat depth_format;
+ 
+    struct {
+@@ -655,6 +685,20 @@
+ VkResult
+    PVR_PER_ARCH(cmd_buffer_end_sub_cmd)(struct pvr_cmd_buffer *cmd_buffer);
+ 
++/* (air/OS) Transform feedback query programs (pvr_xfb.h). */
++VkResult PVR_PER_ARCH(cmd_buffer_xfb_query_program)(
++   struct pvr_cmd_buffer *cmd_buffer,
++   const struct pvr_query_pool *pool,
++   uint32_t mode,
++   uint32_t first_query,
++   uint32_t query_count,
++   pvr_dev_addr_t dest_addr,
++   uint32_t dest_stride,
++   VkQueryResultFlags flags,
++   bool with_draws);
++#   define pvr_arch_cmd_buffer_xfb_query_program \
++      PVR_PER_ARCH(cmd_buffer_xfb_query_program)
++
+ #   define pvr_arch_cmd_buffer_end_sub_cmd PVR_PER_ARCH(cmd_buffer_end_sub_cmd)
+ 
+ void PVR_PER_ARCH(compute_generate_fence)(
 diff -ruN a/src/imagination/vulkan/pvr_device.c b/src/imagination/vulkan/pvr_device.c
 --- a/src/imagination/vulkan/pvr_device.c
 +++ b/src/imagination/vulkan/pvr_device.c
@@ -3055,7 +4989,19 @@ diff -ruN a/src/imagination/vulkan/pvr_device.h b/src/imagination/vulkan/pvr_dev
  
  #include "pvr_bo.h"
  #include "pvr_common.h"
-@@ -130,6 +131,11 @@
+@@ -82,6 +83,11 @@
+    struct pvr_compute_query_shader reset_queries_shader;
+    struct pvr_compute_query_shader copy_results_shader;
+ 
++   /* (air/OS) Transform feedback emulation helper kernels (pvr_xfb.h). */
++   struct pvr_compute_query_shader xfb_counters_shader;
++   struct pvr_compute_query_shader xfb_post_shader;
++   struct pvr_compute_query_shader xfb_query_shader;
++
+    struct pvr_suballocator suballoc_general;
+    struct pvr_suballocator suballoc_pds;
+    struct pvr_suballocator suballoc_transfer;
+@@ -130,6 +136,11 @@
        simple_mtx_t mtx;
  
  #define PVR_MAX_TILE_BUFFER_COUNT 7U
@@ -3067,7 +5013,7 @@ diff -ruN a/src/imagination/vulkan/pvr_device.h b/src/imagination/vulkan/pvr_dev
        struct pvr_bo *buffers[PVR_MAX_TILE_BUFFER_COUNT];
        uint32_t buffer_count;
     } tile_buffer_state;
-@@ -138,21 +144,80 @@
+@@ -138,21 +149,80 @@
  
     struct pvr_bo_store *bo_store;
  
@@ -3457,9 +5403,11 @@ diff -ruN a/src/imagination/vulkan/pvr_instance.c b/src/imagination/vulkan/pvr_i
 diff -ruN a/src/imagination/vulkan/pvr_physical_device.c b/src/imagination/vulkan/pvr_physical_device.c
 --- a/src/imagination/vulkan/pvr_physical_device.c
 +++ b/src/imagination/vulkan/pvr_physical_device.c
-@@ -12,13 +12,22 @@
+@@ -11,14 +11,24 @@
+  */
  
  #include "pvr_physical_device.h"
++#include "pvr_xfb.h"
  
 +#ifdef __HAIKU__
 +/* Haiku's device nodes have no major and minor numbers:
@@ -3480,7 +5428,7 @@ diff -ruN a/src/imagination/vulkan/pvr_physical_device.c b/src/imagination/vulka
  
  #include "vk_util.h"
  #include "vk_log.h"
-@@ -115,7 +124,9 @@
+@@ -115,7 +125,9 @@
     disk_cache_destroy(pdevice->vk.disk_cache);
     pdevice->vk.disk_cache = NULL;
  #else
@@ -3491,7 +5439,51 @@ diff -ruN a/src/imagination/vulkan/pvr_physical_device.c b/src/imagination/vulka
  #endif /* ENABLE_SHADER_CACHE */
  }
  
-@@ -764,7 +775,7 @@
+@@ -216,6 +228,10 @@
+       .EXT_subgroup_size_control = true,
+       .EXT_texel_buffer_alignment = false,
+       .EXT_tooling_info = true,
++      /* (air/OS) Emulated: the vertex shader runs again as a compute
++       * kernel that writes the buffers (pvr_xfb.h).
++       */
++      .EXT_transform_feedback = true,
+       .EXT_vertex_attribute_divisor = true,
+       .EXT_zero_initialize_device_memory = true,
+ #ifdef PVR_USE_WSI_PLATFORM
+@@ -453,6 +469,10 @@
+       .provokingVertexLast = true,
+       .transformFeedbackPreservesProvokingVertex = false,
+ 
++      /* VK_EXT_transform_feedback (air/OS, emulated: pvr_xfb.h) */
++      .transformFeedback = true,
++      .geometryStreams = false,
++
+       /* Vulkan 1.2 / VK_EXT_scalar_block_layout */
+       .scalarBlockLayout = true,
+ 
+@@ -632,14 +652,18 @@
+       .sparseAddressSpaceSize = 0U, /* Requires sparseBinding */
+       .maxBoundDescriptorSets = 4U,
+       .maxPerStageDescriptorSamplers = 16,
+-      .maxPerStageDescriptorUniformBuffers = 12,
++      /* (air/OS) 16, not 12: Mesa's OpenGL state tracker wants 12 uniform
++       * blocks besides the default one, or it offers no UBOs at all (and no
++       * OpenGL 3.1 / ES 3.0).
++       */
++      .maxPerStageDescriptorUniformBuffers = 16,
+       .maxPerStageDescriptorStorageBuffers = 16,
+       .maxPerStageDescriptorSampledImages = 16,
+       .maxPerStageDescriptorStorageImages = 4,
+       .maxPerStageDescriptorInputAttachments = 4,
+-      .maxPerStageResources = 56,
++      .maxPerStageResources = 60,
+       .maxDescriptorSetSamplers = 3U * 16U,
+-      .maxDescriptorSetUniformBuffers = 3U * 12U,
++      .maxDescriptorSetUniformBuffers = 3U * 16U,
+       .maxDescriptorSetUniformBuffersDynamic = 8U,
+       .maxDescriptorSetStorageBuffers = 3U * 4U,
+       .maxDescriptorSetStorageBuffersDynamic = 4U,
+@@ -764,7 +788,7 @@
        .standardSampleLocations = true,
        .optimalBufferCopyOffsetAlignment = PVR_STORAGE_BUFFER_OFFSET_ALIGNMENT,
        .optimalBufferCopyRowPitchAlignment = PVR_STORAGE_BUFFER_OFFSET_ALIGNMENT,
@@ -3500,7 +5492,26 @@ diff -ruN a/src/imagination/vulkan/pvr_physical_device.c b/src/imagination/vulka
  
        /* Vulkan 1.1 */
        .subgroupSize = ROGUE_MAX_INSTANCES_PER_TASK,
-@@ -1118,7 +1129,8 @@
+@@ -843,6 +867,18 @@
+       .provokingVertexModePerPipeline = true,
+       .transformFeedbackPreservesTriangleFanProvokingVertex = false,
+ 
++      /* VK_EXT_transform_feedback (air/OS, emulated: pvr_xfb.h) */
++      .maxTransformFeedbackStreams = 1,
++      .maxTransformFeedbackBuffers = PVR_XFB_MAX_BUFFERS,
++      .maxTransformFeedbackBufferSize = UINT32_MAX,
++      .maxTransformFeedbackStreamDataSize = 512,
++      .maxTransformFeedbackBufferDataSize = 512,
++      .maxTransformFeedbackBufferDataStride = 2048,
++      .transformFeedbackQueries = true,
++      .transformFeedbackStreamsLinesTriangles = false,
++      .transformFeedbackRasterizationStreamSelect = false,
++      .transformFeedbackDraw = false,
++
+       /* Vulkan 1.1 / VK_KHR_robustness2 */
+       .robustStorageBufferAccessSizeAlignment = PVR_STORAGE_BUFFER_OFFSET_ALIGNMENT,
+       .robustUniformBufferAccessSizeAlignment = PVR_STORAGE_BUFFER_OFFSET_ALIGNMENT,
+@@ -1118,7 +1154,8 @@
     primary_path = drm_render_device->nodes[DRM_NODE_PRIMARY];
     pdevice->has_primary = false;
     pdevice->primary_devid = 0;
@@ -3510,7 +5521,7 @@ diff -ruN a/src/imagination/vulkan/pvr_physical_device.c b/src/imagination/vulka
        pdevice->has_primary = true;
        pdevice->primary_devid = primary_stat.st_rdev;
     }
-@@ -1176,6 +1188,20 @@
+@@ -1176,6 +1213,20 @@
        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     pdevice->memory.memoryTypes[0].heapIndex = 0;
  
@@ -3531,6 +5542,219 @@ diff -ruN a/src/imagination/vulkan/pvr_physical_device.c b/src/imagination/vulka
     pvr_physical_device_get_supported_extensions(&supported_extensions, instance);
     pvr_physical_device_get_supported_features(&pdevice->dev_info,
                                                &supported_features);
+diff -ruN a/src/imagination/vulkan/pvr_pipeline.h b/src/imagination/vulkan/pvr_pipeline.h
+--- a/src/imagination/vulkan/pvr_pipeline.h
++++ b/src/imagination/vulkan/pvr_pipeline.h
+@@ -20,6 +20,7 @@
+ #include "pvr_common.h"
+ #include "pvr_csb.h"
+ #include "pvr_pds.h"
++#include "pvr_xfb.h"
+ #include "util/shader_stats.h"
+ 
+ struct pvr_suballoc_bo;
+@@ -123,6 +124,14 @@
+ 
+    struct vk_dynamic_graphics_state dynamic_state;
+ 
++   /* (air/OS) Transform feedback emulation (pvr_xfb.h): the vertex shader
++    * compiled as a compute kernel, with the capture layout. xfb_cs.base is
++    * not used.
++    */
++   bool has_xfb;
++   struct pvr_xfb_shader_info xfb_info;
++   struct pvr_compute_pipeline xfb_cs;
++
+    /* Derived and other state */
+    size_t stage_indices[MESA_SHADER_STAGES];
+ 
+@@ -190,16 +199,24 @@
+    if (stage_mask & VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)
+       return PVR_PIPELINE_STAGE_ALL_BITS;
+ 
+-   if (stage_mask & (VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT))
+-      stages |= PVR_PIPELINE_STAGE_ALL_GRAPHICS_BITS;
++   /* (air/OS) Transform feedback runs on the compute data master
++    * (pvr_xfb.h): the vertex pipeline's stages take compute with them, so
++    * that a barrier on vertex input or transform feedback also fences those
++    * kernels.
++    */
++   if (stage_mask & (VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT)) {
++      stages |= PVR_PIPELINE_STAGE_ALL_GRAPHICS_BITS |
++                PVR_PIPELINE_STAGE_COMPUTE_BIT;
++   }
+ 
+    if (stage_mask & (VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
+                      VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                      VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                      VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT |
+                      VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT |
+-                     VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT)) {
+-      stages |= PVR_PIPELINE_STAGE_GEOM_BIT;
++                     VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT |
++                     VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT)) {
++      stages |= PVR_PIPELINE_STAGE_GEOM_BIT | PVR_PIPELINE_STAGE_COMPUTE_BIT;
+    }
+ 
+    if (stage_mask & (VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+diff -ruN a/src/imagination/vulkan/pvr_query.c b/src/imagination/vulkan/pvr_query.c
+--- a/src/imagination/vulkan/pvr_query.c
++++ b/src/imagination/vulkan/pvr_query.c
+@@ -32,6 +32,7 @@
+ #include <string.h>
+ #include <vulkan/vulkan.h>
+ 
++#include "common/pvr_iface.h"
+ #include "pvr_bo.h"
+ #include "pvr_csb.h"
+ #include "pvr_device.h"
+@@ -66,7 +67,9 @@
+     * VkPhysicalDeviceFeatures->pipelineStatisticsQuery = false.
+     */
+    assert(!device->vk.enabled_features.pipelineStatisticsQuery);
+-   assert(pCreateInfo->queryType == VK_QUERY_TYPE_OCCLUSION);
++   assert(pCreateInfo->queryType == VK_QUERY_TYPE_OCCLUSION ||
++          pCreateInfo->queryType ==
++             VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT);
+ 
+    pool = vk_object_alloc(&device->vk,
+                           pAllocator,
+@@ -75,10 +78,42 @@
+    if (!pool)
+       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+-   pool->result_stride = ALIGN_POT(query_size, ROGUE_OQUERY_ALIGN);
+-
++   pool->type = pCreateInfo->queryType;
+    pool->query_count = pCreateInfo->queryCount;
+ 
++   /* (air/OS) A transform feedback query holds two counters (primitives
++    * written, primitives generated: pvr_xfb_query_dw) per query, kept by
++    * the emulation's kernels (pvr_xfb.h), and an availability dword.
++    */
++   if (pool->type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {
++      const uint32_t xfb_size =
++         pool->query_count * PVR_DW_TO_BYTES(_PVR_XFB_QUERY_COUNT);
++
++      pool->result_stride = 0;
++
++      result = pvr_bo_suballoc(&device->suballoc_general,
++                               xfb_size,
++                               sizeof(uint64_t),
++                               false,
++                               &pool->result_buffer);
++      if (result != VK_SUCCESS)
++         goto err_free_pool;
++
++      result = pvr_bo_suballoc(&device->suballoc_general,
++                               query_size,
++                               sizeof(uint32_t),
++                               false,
++                               &pool->availability_buffer);
++      if (result != VK_SUCCESS)
++         goto err_free_result_buffer;
++
++      *pQueryPool = pvr_query_pool_to_handle(pool);
++
++      return VK_SUCCESS;
++   }
++
++   pool->result_stride = ALIGN_POT(query_size, ROGUE_OQUERY_ALIGN);
++
+    /* Each Phantom writes to a separate offset within the vis test heap so
+     * allocate space for the total number of Phantoms.
+     */
+@@ -240,6 +275,31 @@
+          is_available = true;
+       }
+ 
++      if (pool->type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {
++         /* (air/OS) Primitives written, then primitives generated. */
++         const volatile uint32_t *counters =
++            &query_results[(firstQuery + i) * _PVR_XFB_QUERY_COUNT];
++
++         if (is_available || (flags & VK_QUERY_RESULT_PARTIAL_BIT)) {
++            pvr_write_query_to_buffer(data,
++                                      flags,
++                                      0,
++                                      counters[PVR_XFB_QUERY_WRITTEN_LO]);
++            pvr_write_query_to_buffer(data,
++                                      flags,
++                                      1,
++                                      counters[PVR_XFB_QUERY_GENERATED_LO]);
++         } else {
++            result = VK_NOT_READY;
++         }
++
++         if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)
++            pvr_write_query_to_buffer(data, flags, 2, is_available);
++
++         data += stride;
++         continue;
++      }
++
+       for (uint32_t j = 0; j < core_count; j++)
+          count += query_results[pool->result_stride * j + firstQuery + i];
+ 
+@@ -276,4 +336,13 @@
+       pvr_bo_suballoc_get_map_addr(pool->availability_buffer);
+ 
+    memset(availability + firstQuery, 0, sizeof(uint32_t) * queryCount);
++
++   /* (air/OS) Transform feedback counters accumulate from zero. */
++   if (pool->type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {
++      uint32_t *counters = pvr_bo_suballoc_get_map_addr(pool->result_buffer);
++
++      memset(counters + firstQuery * _PVR_XFB_QUERY_COUNT,
++             0,
++             PVR_DW_TO_BYTES(_PVR_XFB_QUERY_COUNT) * queryCount);
++   }
+ }
+diff -ruN a/src/imagination/vulkan/pvr_query.h b/src/imagination/vulkan/pvr_query.h
+--- a/src/imagination/vulkan/pvr_query.h
++++ b/src/imagination/vulkan/pvr_query.h
+@@ -23,6 +23,8 @@
+ struct pvr_query_pool {
+    struct vk_object_base base;
+ 
++   VkQueryType type;
++
+    /* Stride of result_buffer to get to the start of the results for the next
+     * Phantom.
+     */
+@@ -87,6 +89,32 @@
+ #   define pvr_arch_device_destroy_compute_query_programs \
+       PVR_PER_ARCH(device_destroy_compute_query_programs)
+ 
++struct pvr_compute_query_shader;
++
++/* (air/OS) Transform feedback helper kernels (pvr_xfb.h). */
++VkResult PVR_PER_ARCH(device_create_xfb_programs)(struct pvr_device *device);
++#   define pvr_arch_device_create_xfb_programs \
++      PVR_PER_ARCH(device_create_xfb_programs)
++
++void PVR_PER_ARCH(device_destroy_xfb_programs)(struct pvr_device *device);
++#   define pvr_arch_device_destroy_xfb_programs \
++      PVR_PER_ARCH(device_destroy_xfb_programs)
++
++/* Dispatches one of the precompiled compute programs into the current
++ * compute (or query) sub-command, with its shared registers loaded from
++ * const_data, and fences it. invocations are spread over workgroups of
++ * workgroup_size.
++ */
++VkResult PVR_PER_ARCH(cmd_buffer_dispatch_private_program)(
++   struct pvr_cmd_buffer *cmd_buffer,
++   const struct pvr_compute_query_shader *program,
++   const uint32_t *const_data,
++   uint32_t const_count,
++   uint32_t invocations,
++   uint32_t workgroup_size);
++#   define pvr_arch_cmd_buffer_dispatch_private_program \
++      PVR_PER_ARCH(cmd_buffer_dispatch_private_program)
++
+ #endif
+ 
+ #endif /* PVR_QUERY_H*/
 diff -ruN a/src/imagination/vulkan/pvr_robustness.c b/src/imagination/vulkan/pvr_robustness.c
 --- a/src/imagination/vulkan/pvr_robustness.c
 +++ b/src/imagination/vulkan/pvr_robustness.c
@@ -3774,17 +5998,678 @@ diff -ruN a/src/imagination/vulkan/pvr_spm.c b/src/imagination/vulkan/pvr_spm.c
        buffer = store->head_ref;
     } else {
        VkResult result;
-diff -ruN a/src/imagination/vulkan/winsys/powervr/pvr_drm.c b/src/imagination/vulkan/winsys/powervr/pvr_drm.c
---- a/src/imagination/vulkan/winsys/powervr/pvr_drm.c
-+++ b/src/imagination/vulkan/winsys/powervr/pvr_drm.c
-@@ -398,6 +398,7 @@
-    .buffer_destroy = pvr_drm_winsys_buffer_destroy,
-    .buffer_get_fd = pvr_drm_winsys_buffer_get_fd,
-    .buffer_map = pvr_drm_winsys_buffer_map,
-+   .buffer_import_scanout = pvr_drm_winsys_buffer_import_scanout,
-    .buffer_unmap = pvr_drm_winsys_buffer_unmap,
-    .heap_alloc = pvr_drm_winsys_heap_alloc,
-    .heap_free = pvr_drm_winsys_heap_free,
+diff -ruN a/src/imagination/vulkan/pvr_xfb.c b/src/imagination/vulkan/pvr_xfb.c
+--- a/src/imagination/vulkan/pvr_xfb.c
++++ b/src/imagination/vulkan/pvr_xfb.c
+@@ -0,0 +1,596 @@
++/*
++ * Copyright 2026, air/OS. All rights reserved.
++ * Distributed under the terms of the MIT License.
++ */
++
++/* Transform feedback emulation: the vertex shader as a compute kernel.
++ * See pvr_xfb.h.
++ */
++
++#include "pvr_xfb.h"
++
++#include "compiler/nir/nir_builder.h"
++#include "pco/pco_data.h"
++#include "util/format/u_format.h"
++#include "util/u_math.h"
++#include "vk_graphics_state.h"
++
++bool pco_nir_pvi(nir_shader *shader, pco_vs_data *vs);
++
++enum pvr_xfb_topology pvr_xfb_topology(VkPrimitiveTopology topology)
++{
++   switch (topology) {
++   case VK_PRIMITIVE_TOPOLOGY_POINT_LIST:
++      return PVR_XFB_TOPOLOGY_POINTS;
++   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST:
++      return PVR_XFB_TOPOLOGY_LINES;
++   case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP:
++      return PVR_XFB_TOPOLOGY_LINE_STRIP;
++   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST:
++      return PVR_XFB_TOPOLOGY_TRIANGLES;
++   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
++      return PVR_XFB_TOPOLOGY_TRIANGLE_STRIP;
++   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN:
++      return PVR_XFB_TOPOLOGY_TRIANGLE_FAN;
++   default:
++      return PVR_XFB_TOPOLOGY_UNSUPPORTED;
++   }
++}
++
++uint32_t pvr_xfb_verts_per_prim(enum pvr_xfb_topology topology)
++{
++   switch (topology) {
++   case PVR_XFB_TOPOLOGY_POINTS:
++      return 1;
++   case PVR_XFB_TOPOLOGY_LINES:
++   case PVR_XFB_TOPOLOGY_LINE_STRIP:
++      return 2;
++   default:
++      return 3;
++   }
++}
++
++uint32_t pvr_xfb_prim_count(enum pvr_xfb_topology topology,
++                            uint32_t vertex_count)
++{
++   switch (topology) {
++   case PVR_XFB_TOPOLOGY_POINTS:
++      return vertex_count;
++   case PVR_XFB_TOPOLOGY_LINES:
++      return vertex_count / 2;
++   case PVR_XFB_TOPOLOGY_LINE_STRIP:
++      return vertex_count >= 2 ? vertex_count - 1 : 0;
++   case PVR_XFB_TOPOLOGY_TRIANGLES:
++      return vertex_count / 3;
++   case PVR_XFB_TOPOLOGY_TRIANGLE_STRIP:
++   case PVR_XFB_TOPOLOGY_TRIANGLE_FAN:
++      return vertex_count >= 3 ? vertex_count - 2 : 0;
++   default:
++      return 0;
++   }
++}
++
++struct xfb_state {
++   const struct vk_vertex_input_state *vi;
++   const pco_data *vs_data;
++   const nir_xfb_info *xfb;
++
++   /* lo/hi of the parameter block. */
++   nir_def *params;
++   /* The output vertex this invocation produces, over all instances. */
++   nir_def *slot;
++   nir_def *instance;
++   nir_def *first_vertex;
++   nir_def *first_instance;
++   nir_def *vertex_index;
++   /* lo/hi of this vertex's record in each buffer. */
++   nir_def *record[PVR_XFB_MAX_BUFFERS];
++};
++
++/* 64-bit address arithmetic on lo/hi pairs, as nir_lower_explicit_io does
++ * it for nir_address_format_2x32bit_global.
++ */
++static nir_def *addr_add(nir_builder *b, nir_def *addr, nir_def *offset)
++{
++   nir_def *lo = nir_channel(b, addr, 0);
++   nir_def *hi = nir_channel(b, addr, 1);
++   nir_def *res_lo = nir_iadd(b, lo, offset);
++   nir_def *carry = nir_b2i32(b, nir_ult(b, res_lo, lo));
++
++   return nir_vec2(b, res_lo, nir_iadd(b, hi, carry));
++}
++
++static nir_def *addr_add_imm(nir_builder *b, nir_def *addr, uint32_t offset)
++{
++   return offset ? addr_add(b, addr, nir_imm_int(b, offset)) : addr;
++}
++
++static nir_def *load_dw(nir_builder *b, nir_def *addr, unsigned count)
++{
++   return nir_load_global_2x32(b, count, 32, addr, .align_mul = 4);
++}
++
++static nir_def *param(nir_builder *b, struct xfb_state *st, unsigned dw)
++{
++   return load_dw(b, addr_add_imm(b, st->params, dw * sizeof(uint32_t)), 1);
++}
++
++static nir_def *param_addr(nir_builder *b, struct xfb_state *st, unsigned dw)
++{
++   return load_dw(b, addr_add_imm(b, st->params, dw * sizeof(uint32_t)), 2);
++}
++
++/* The vertex, counted from the draw's first one, that goes into slot k of
++ * primitive prim under the draw's topology: the order in which the
++ * primitives are assembled, strips and fans expanded into lists.
++ */
++static nir_def *source_vertex(nir_builder *b,
++                              nir_def *topology,
++                              nir_def *prim,
++                              nir_def *k,
++                              nir_def *list_vertex)
++{
++   nir_def *strip = nir_iadd(b, prim, k);
++   nir_def *odd = nir_i2b(b, nir_iand_imm(b, prim, 1));
++   /* Odd triangles of a strip are (i + 1, i, i + 2). */
++   nir_def *odd_k = nir_bcsel(b,
++                              nir_ieq_imm(b, k, 0),
++                              nir_imm_int(b, 1),
++                              nir_bcsel(b,
++                                        nir_ieq_imm(b, k, 1),
++                                        nir_imm_int(b, 0),
++                                        nir_imm_int(b, 2)));
++   nir_def *tri_strip =
++      nir_bcsel(b, odd, nir_iadd(b, prim, odd_k), strip);
++   nir_def *fan = nir_bcsel(b, nir_ieq_imm(b, k, 0), nir_imm_int(b, 0), strip);
++
++   nir_def *v = list_vertex;
++   v = nir_bcsel(b,
++                 nir_ieq_imm(b, topology, PVR_XFB_TOPOLOGY_LINE_STRIP),
++                 strip,
++                 v);
++   v = nir_bcsel(b,
++                 nir_ieq_imm(b, topology, PVR_XFB_TOPOLOGY_TRIANGLE_STRIP),
++                 tri_strip,
++                 v);
++   v = nir_bcsel(b,
++                 nir_ieq_imm(b, topology, PVR_XFB_TOPOLOGY_TRIANGLE_FAN),
++                 fan,
++                 v);
++   return v;
++}
++
++/* The dword holding the byte at addr, and that byte's bit position in it:
++ * the memory loads have to be dword-aligned (an unaligned one returns the
++ * bytes up to the next dword boundary only).
++ */
++static nir_def *load_dw_around(nir_builder *b, nir_def *addr, nir_def **shift)
++{
++   nir_def *lo = nir_channel(b, addr, 0);
++   nir_def *aligned =
++      nir_vec2(b, nir_iand_imm(b, lo, ~3u), nir_channel(b, addr, 1));
++
++   *shift = nir_imul_imm(b, nir_iand_imm(b, lo, 3), 8);
++   return load_dw(b, aligned, 1);
++}
++
++/* Reads index number i (from firstIndex) of index_size bytes. Indices are
++ * naturally aligned, so one never straddles a dword.
++ */
++static nir_def *load_index(nir_builder *b,
++                           nir_def *index_addr,
++                           nir_def *index_size,
++                           nir_def *i)
++{
++   nir_def *byte_offset = nir_imul(b, i, index_size);
++   nir_def *shift;
++   nir_def *dw = load_dw_around(b, addr_add(b, index_addr, byte_offset), &shift);
++   nir_def *mask = nir_bcsel(b,
++                             nir_ieq_imm(b, index_size, 4),
++                             nir_imm_int(b, 0xffffffff),
++                             nir_bcsel(b,
++                                       nir_ieq_imm(b, index_size, 2),
++                                       nir_imm_int(b, 0xffff),
++                                       nir_imm_int(b, 0xff)));
++   return nir_iand(b, nir_ushr(b, dw, shift), mask);
++}
++
++static bool lower_input(nir_builder *b,
++                        nir_intrinsic_instr *intr,
++                        struct xfb_state *st)
++{
++   gl_vert_attrib location = nir_intrinsic_io_semantics(intr).location;
++   unsigned component = nir_intrinsic_component(intr);
++   unsigned attrib = location - VERT_ATTRIB_GENERIC0;
++
++   assert(intr->def.num_components == 1 && intr->def.bit_size == 32);
++   assert(location >= VERT_ATTRIB_GENERIC0 && location <= VERT_ATTRIB_GENERIC15);
++   assert(nir_src_as_uint(intr->src[0]) == 0);
++
++   b->cursor = nir_before_instr(&intr->instr);
++
++   enum pipe_format format = st->vs_data->vs.attrib_formats[location];
++   unsigned format_dwords =
++      format == PIPE_FORMAT_NONE
++         ? 0
++         : DIV_ROUND_UP(util_format_get_blocksize(format), sizeof(uint32_t));
++
++   if (!(st->vi->attributes_valid & BITFIELD_BIT(attrib)) ||
++       component >= format_dwords) {
++      /* Not fed by the pipeline, or a dword the format does not have (the
++       * unpacking does not read it).
++       */
++      nir_def_replace(&intr->def, nir_imm_int(b, 0));
++      return true;
++   }
++
++   const struct vk_vertex_attribute_state *attr = &st->vi->attributes[attrib];
++   const struct vk_vertex_binding_state *binding =
++      &st->vi->bindings[attr->binding];
++   unsigned vb = PVR_XFB_PARAMS_VB0 + attr->binding * PVR_XFB_PARAMS_VB_DWORDS;
++
++   nir_def *vb_addr = param_addr(b, st, vb + PVR_XFB_PARAMS_VB_LO);
++   nir_def *vb_size = param(b, st, vb + PVR_XFB_PARAMS_VB_SIZE);
++   nir_def *vb_stride = param(b, st, vb + PVR_XFB_PARAMS_VB_STRIDE);
++
++   nir_def *index;
++   if (binding->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE) {
++      if (binding->divisor == 0) {
++         index = st->first_instance;
++      } else {
++         index = nir_iadd(b,
++                          st->first_instance,
++                          nir_udiv_imm(b, st->instance, binding->divisor));
++      }
++   } else {
++      index = st->vertex_index;
++   }
++
++   nir_def *offset =
++      nir_iadd_imm(b,
++                   nir_imul(b, index, vb_stride),
++                   attr->offset + component * sizeof(uint32_t));
++   /* robustBufferAccess: a dword past the bound range reads as zero, and
++    * the loads themselves stay inside the buffer.
++    */
++   nir_def *in_bounds =
++      nir_uge(b, vb_size, nir_iadd_imm(b, offset, sizeof(uint32_t)));
++   nir_def *safe_offset = nir_bcsel(b, in_bounds, offset, nir_imm_int(b, 0));
++   nir_def *safe_addr =
++      nir_bcsel(b, nir_ine_imm(b, vb_size, 0), vb_addr, st->params);
++   nir_def *addr = addr_add(b, safe_addr, safe_offset);
++
++   /* The attribute's dword may straddle two aligned ones (an offset or a
++    * stride that is not a multiple of 4): take the bytes from both. The
++    * second dword is only read where the buffer still has one.
++    */
++   nir_def *shift;
++   nir_def *lo_dw = load_dw_around(b, addr, &shift);
++   nir_def *aligned_offset = nir_iand_imm(b, safe_offset, ~3u);
++   nir_def *has_next =
++      nir_uge(b, vb_size, nir_iadd_imm(b, aligned_offset, 2 * sizeof(uint32_t)));
++   nir_def *next_offset =
++      nir_bcsel(b,
++                has_next,
++                nir_iadd_imm(b, aligned_offset, sizeof(uint32_t)),
++                aligned_offset);
++   nir_def *hi_dw = load_dw(b, addr_add(b, safe_addr, next_offset), 1);
++   nir_def *straddles = nir_ine_imm(b, shift, 0);
++   nir_def *joined =
++      nir_ior(b,
++              nir_ushr(b, lo_dw, shift),
++              nir_ishl(b, hi_dw, nir_isub(b, nir_imm_int(b, 32), shift)));
++   nir_def *value = nir_bcsel(b, straddles, joined, lo_dw);
++
++   nir_def_replace(&intr->def, nir_bcsel(b, in_bounds, value, nir_imm_int(b, 0)));
++   return true;
++}
++
++static const nir_xfb_output_info *find_output(const nir_xfb_info *xfb,
++                                              unsigned location,
++                                              unsigned component)
++{
++   for (unsigned i = 0; i < xfb->output_count; ++i) {
++      const nir_xfb_output_info *out = &xfb->outputs[i];
++      if (out->location == location &&
++          (out->component_mask & BITFIELD_BIT(component)))
++         return out;
++   }
++
++   return NULL;
++}
++
++static bool lower_output(nir_builder *b,
++                         nir_intrinsic_instr *intr,
++                         struct xfb_state *st)
++{
++   unsigned location = nir_intrinsic_io_semantics(intr).location +
++                       nir_src_as_uint(intr->src[1]);
++   unsigned component = nir_intrinsic_component(intr);
++   unsigned write_mask = nir_intrinsic_write_mask(intr);
++   nir_def *value = intr->src[0].ssa;
++
++   b->cursor = nir_before_instr(&intr->instr);
++
++   if (value->bit_size == 32) {
++      u_foreach_bit (i, write_mask) {
++         const nir_xfb_output_info *out =
++            find_output(st->xfb, location, component + i);
++         if (!out)
++            continue;
++
++         assert(!out->data_is_16bit);
++         unsigned offset =
++            out->offset +
++            (component + i - out->component_offset) * sizeof(uint32_t);
++         nir_store_global_2x32(b,
++                               nir_channel(b, value, i),
++                               addr_add_imm(b, st->record[out->buffer], offset),
++                               .write_mask = 1,
++                               .align_mul = 4);
++      }
++   }
++
++   nir_instr_remove(&intr->instr);
++   return true;
++}
++
++static bool lower_intr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
++{
++   struct xfb_state *st = data;
++   nir_def *replacement;
++
++   switch (intr->intrinsic) {
++   case nir_intrinsic_load_input:
++      return lower_input(b, intr, st);
++
++   case nir_intrinsic_store_output:
++      return lower_output(b, intr, st);
++
++   case nir_intrinsic_load_vertex_id:
++      replacement = st->vertex_index;
++      break;
++   case nir_intrinsic_load_instance_id:
++      b->cursor = nir_before_instr(&intr->instr);
++      replacement = nir_iadd(b, st->first_instance, st->instance);
++      break;
++   case nir_intrinsic_load_base_vertex:
++   case nir_intrinsic_load_first_vertex:
++      replacement = st->first_vertex;
++      break;
++   case nir_intrinsic_load_base_instance:
++      replacement = st->first_instance;
++      break;
++   case nir_intrinsic_load_draw_id:
++   case nir_intrinsic_load_view_index:
++      b->cursor = nir_before_instr(&intr->instr);
++      replacement = nir_imm_int(b, 0);
++      break;
++   case nir_intrinsic_load_is_indexed_draw:
++      b->cursor = nir_before_instr(&intr->instr);
++      replacement = nir_ine_imm(b, param(b, st, PVR_XFB_PARAMS_INDEX_SIZE), 0);
++      replacement = nir_b2i32(b, replacement);
++      break;
++
++   default:
++      return false;
++   }
++
++   nir_def_replace(&intr->def, replacement);
++   return true;
++}
++
++static unsigned glsl_type_size(const struct glsl_type *type,
++                               UNUSED bool bindless)
++{
++   return glsl_count_attribute_slots(type, false);
++}
++
++bool pvr_xfb_lower_vs_to_cs(nir_shader *nir,
++                            const struct vk_vertex_input_state *vi,
++                            pco_data *vs_data,
++                            struct pvr_xfb_shader_info *info)
++{
++   const nir_xfb_info *xfb = nir->xfb_info;
++
++   assert(nir->info.stage == MESA_SHADER_VERTEX);
++
++   if (!xfb || !xfb->output_count || !xfb->buffers_written)
++      return false;
++
++   for (unsigned i = 0; i < xfb->output_count; ++i) {
++      if (xfb->outputs[i].data_is_16bit)
++         return false;
++   }
++
++   *info = (struct pvr_xfb_shader_info){
++      .buffers_written = xfb->buffers_written,
++   };
++   for (unsigned i = 0; i < PVR_XFB_MAX_BUFFERS; ++i)
++      info->strides[i] = xfb->buffers[i].stride;
++
++   /* Inputs and outputs as intrinsics, inputs as the raw dwords the vertex
++    * DMA would deliver (pco_nir_pvi unpacks them, in any stage).
++    */
++   NIR_PASS(_,
++            nir,
++            nir_lower_io,
++            nir_var_shader_in | nir_var_shader_out,
++            glsl_type_size,
++            nir_lower_io_lower_64bit_to_32 |
++               nir_lower_io_use_interpolated_input_intrinsics);
++   NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_in, NULL, NULL);
++   /* The dead derefs of the variables must go before pvi retypes them. */
++   NIR_PASS(_, nir, nir_opt_copy_prop);
++   NIR_PASS(_, nir, nir_opt_dce);
++   NIR_PASS(_, nir, pco_nir_pvi, &vs_data->vs);
++   NIR_PASS(_, nir, nir_opt_constant_folding);
++
++   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
++   struct xfb_state st = {
++      .vi = vi,
++      .vs_data = vs_data,
++      .xfb = xfb,
++   };
++
++   /* From here on a compute shader: one invocation per output vertex. */
++   nir->info.stage = MESA_SHADER_COMPUTE;
++   memset(&nir->info.cs, 0, sizeof(nir->info.cs));
++   nir->info.workgroup_size[0] = PVR_XFB_WORKGROUP_SIZE;
++   nir->info.workgroup_size[1] = 1;
++   nir->info.workgroup_size[2] = 1;
++   nir->info.workgroup_size_variable = false;
++   nir->info.shared_size = 0;
++   nir->info.inputs_read = 0;
++   nir->info.outputs_written = 0;
++   nir->info.outputs_read = 0;
++   nir->info.clip_distance_array_size = 0;
++   nir->info.cull_distance_array_size = 0;
++   nir->xfb_info = NULL;
++
++   /* The vertex shader's body runs only for a slot the draw produces and
++    * that fits into every buffer: extract it, build the prologue, and put
++    * it back under the condition.
++    */
++   nir_cf_list body;
++   nir_cf_extract(&body, nir_before_impl(impl), nir_after_impl(impl));
++
++   nir_builder bld = nir_builder_at(nir_before_impl(impl));
++   nir_builder *b = &bld;
++
++   st.params = nir_load_preamble(b, 2, 32, .base = PCO_XFB_PARAMS_BASE);
++   st.slot = nir_channel(b, nir_load_global_invocation_id(b, 32), 0);
++
++   nir_def *total = param(b, &st, PVR_XFB_PARAMS_TOTAL_VERTICES);
++   nir_def *verts_per_prim = param(b, &st, PVR_XFB_PARAMS_VERTS_PER_PRIM);
++   nir_def *prim_count = param(b, &st, PVR_XFB_PARAMS_PRIM_COUNT);
++   nir_def *topology = param(b, &st, PVR_XFB_PARAMS_TOPOLOGY);
++   nir_def *index_size = param(b, &st, PVR_XFB_PARAMS_INDEX_SIZE);
++   nir_def *restart = param(b, &st, PVR_XFB_PARAMS_RESTART_ENABLE);
++   nir_def *index_addr = param_addr(b, &st, PVR_XFB_PARAMS_INDEX_LO);
++   nir_def *state_addr = param_addr(b, &st, PVR_XFB_PARAMS_STATE_LO);
++   st.first_vertex = param(b, &st, PVR_XFB_PARAMS_FIRST_VERTEX);
++   st.first_instance = param(b, &st, PVR_XFB_PARAMS_FIRST_INSTANCE);
++
++   nir_def *verts_per_instance = nir_imul(b, prim_count, verts_per_prim);
++   st.instance = nir_udiv(b, st.slot, verts_per_instance);
++   nir_def *in_instance =
++      nir_isub(b, st.slot, nir_imul(b, st.instance, verts_per_instance));
++   nir_def *prim = nir_udiv(b, in_instance, verts_per_prim);
++   nir_def *k = nir_isub(b, in_instance, nir_imul(b, prim, verts_per_prim));
++
++   nir_def *valid = nir_ult(b, st.slot, total);
++   nir_def *src = source_vertex(b, topology, prim, k, in_instance);
++   nir_def *indexed = nir_ine_imm(b, index_size, 0);
++   /* Loads from the index buffer only where the draw has indices: the
++    * invocations past the end of the draw read index 0 and are dropped.
++    */
++   nir_def *safe_index_addr = nir_bcsel(b, indexed, index_addr, st.params);
++   nir_def *index =
++      load_index(b,
++                 safe_index_addr,
++                 index_size,
++                 nir_bcsel(b, valid, src, nir_imm_int(b, 0)));
++   st.vertex_index =
++      nir_iadd(b, st.first_vertex, nir_bcsel(b, indexed, index, src));
++
++   /* Primitive restart: a primitive with the restart index in it is not
++    * assembled. (Its slots stay reserved: see DESIGN.md.)
++    */
++   nir_def *check_restart =
++      nir_iand(b, valid, nir_iand(b, indexed, nir_ine_imm(b, restart, 0)));
++   nir_def *restart_hit = nir_imm_false(b);
++   for (unsigned kk = 0; kk < 3; ++kk) {
++      nir_def *src_kk =
++         source_vertex(b,
++                       topology,
++                       prim,
++                       nir_imm_int(b, kk),
++                       nir_iadd_imm(b, nir_imul(b, prim, verts_per_prim), kk));
++      nir_def *in_prim = nir_ult(b, nir_imm_int(b, kk), verts_per_prim);
++      nir_def *load_it = nir_iand(b, check_restart, in_prim);
++      nir_def *idx = load_index(b,
++                                safe_index_addr,
++                                index_size,
++                                nir_bcsel(b, load_it, src_kk, nir_imm_int(b, 0)));
++      nir_def *restart_value =
++         nir_bcsel(b,
++                   nir_ieq_imm(b, index_size, 4),
++                   nir_imm_int(b, 0xffffffff),
++                   nir_bcsel(b,
++                             nir_ieq_imm(b, index_size, 2),
++                             nir_imm_int(b, 0xffff),
++                             nir_imm_int(b, 0xff)));
++      nir_def *hit = nir_iand(b, load_it, nir_ieq(b, idx, restart_value));
++      restart_hit = nir_ior(b, restart_hit, hit);
++   }
++
++   /* Does the primitive fit into every buffer, after what is already
++    * there? Then this vertex's record is at offset + slot * stride.
++    */
++   nir_def *fits = nir_imm_true(b);
++   u_foreach_bit (buffer, xfb->buffers_written) {
++      unsigned base = PVR_XFB_PARAMS_XFB0 + buffer * PVR_XFB_PARAMS_XFB_DWORDS;
++      unsigned stride = xfb->buffers[buffer].stride;
++      nir_def *buf_addr = param_addr(b, &st, base + PVR_XFB_PARAMS_XFB_LO);
++      nir_def *size = param(b, &st, base + PVR_XFB_PARAMS_XFB_SIZE);
++      nir_def *offset =
++         load_dw(b,
++                 addr_add_imm(b,
++                              state_addr,
++                              (PVR_XFB_STATE_OFFSET0 + buffer) * sizeof(uint32_t)),
++                 1);
++      nir_def *avail = nir_bcsel(b,
++                                 nir_uge(b, size, offset),
++                                 nir_isub(b, size, offset),
++                                 nir_imm_int(b, 0));
++      nir_def *needed =
++         nir_imul_imm(b, nir_imul(b, nir_iadd_imm(b, prim, 1), verts_per_prim),
++                      stride);
++      fits = nir_iand(b, fits, nir_uge(b, avail, needed));
++
++      st.record[buffer] =
++         addr_add(b,
++                  addr_add(b, buf_addr, offset),
++                  nir_imul_imm(b, st.slot, stride));
++   }
++
++   nir_def *run = nir_iand(b, valid, fits);
++   run = nir_iand(b, run, nir_inot(b, restart_hit));
++
++   nir_if *nif = nir_push_if(b, run);
++   nir_cf_reinsert(&body, b->cursor);
++   nir_pop_if(b, nif);
++
++   nir_progress(true, impl, nir_metadata_none);
++
++   nir_shader_intrinsics_pass(nir, lower_intr, nir_metadata_none, &st);
++
++   NIR_PASS(_,
++            nir,
++            nir_remove_dead_variables,
++            nir_var_shader_in | nir_var_shader_out | nir_var_system_value,
++            NULL);
++   NIR_PASS(_, nir, nir_lower_system_values);
++   NIR_PASS(_,
++            nir,
++            nir_lower_compute_system_values,
++            &(nir_lower_compute_system_values_options){
++               .lower_cs_local_id_to_index = true,
++            });
++   NIR_PASS(_, nir, nir_opt_constant_folding);
++   NIR_PASS(_, nir, nir_opt_idiv_const, 32);
++   NIR_PASS(_,
++            nir,
++            nir_lower_idiv,
++            &(nir_lower_idiv_options){
++               .allow_fp16 = false,
++            });
++   NIR_PASS(_, nir, nir_opt_dce);
++   NIR_PASS(_, nir, nir_opt_cse);
++   NIR_PASS(_, nir, nir_opt_dce);
++
++   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
++
++   return true;
++}
+diff -ruN a/src/imagination/vulkan/pvr_xfb.h b/src/imagination/vulkan/pvr_xfb.h
+--- a/src/imagination/vulkan/pvr_xfb.h
++++ b/src/imagination/vulkan/pvr_xfb.h
+@@ -0,0 +1,68 @@
++/*
++ * Copyright 2026, air/OS. All rights reserved.
++ * Distributed under the terms of the MIT License.
++ */
++
++/* Transform feedback emulation for the PowerVR Vulkan driver.
++ *
++ * The hardware path of the open driver has no transform feedback output. A
++ * pipeline whose vertex shader captures outputs therefore also gets a
++ * compute kernel built from that vertex shader: one invocation per output
++ * vertex (primitive by primitive, as the draw would assemble them), which
++ * fetches its own index and vertex data, runs the vertex shader's code and
++ * writes the captured outputs into the transform feedback buffers. The real
++ * draw is unchanged. See evidence/gpu/xfb/DESIGN.md in the air/OS tree.
++ */
++
++#ifndef PVR_XFB_H
++#define PVR_XFB_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <vulkan/vulkan.h>
++
++#include "common/pvr_iface.h"
++#include "compiler/nir/nir_xfb_info.h"
++#include "nir/nir.h"
++#include "pco/pco.h"
++
++struct vk_vertex_input_state;
++
++/* The topologies the kernel can expand; PVR_XFB_PARAMS_TOPOLOGY. */
++enum pvr_xfb_topology {
++   PVR_XFB_TOPOLOGY_POINTS,
++   PVR_XFB_TOPOLOGY_LINES,
++   PVR_XFB_TOPOLOGY_LINE_STRIP,
++   PVR_XFB_TOPOLOGY_TRIANGLES,
++   PVR_XFB_TOPOLOGY_TRIANGLE_STRIP,
++   PVR_XFB_TOPOLOGY_TRIANGLE_FAN,
++   PVR_XFB_TOPOLOGY_UNSUPPORTED,
++};
++
++/* What a draw needs to know about a pipeline's capture. */
++struct pvr_xfb_shader_info {
++   uint8_t buffers_written;
++   uint16_t strides[PVR_XFB_MAX_BUFFERS];
++};
++
++/* The kernel's workgroup: one task's worth of instances. */
++#define PVR_XFB_WORKGROUP_SIZE 32U
++
++/* Turns a copy of a vertex shader (after pco_preprocess_nir(), inputs and
++ * outputs still variables, system values intrinsics) into the compute
++ * kernel described above. vi is the pipeline's vertex input state (bindings
++ * and attributes), vs_data->vs.attrib_formats must be set up. Fills info.
++ * Returns false if the shader cannot be lowered (nothing captured, or an
++ * output type the kernel does not handle).
++ */
++bool pvr_xfb_lower_vs_to_cs(nir_shader *nir,
++                            const struct vk_vertex_input_state *vi,
++                            pco_data *vs_data,
++                            struct pvr_xfb_shader_info *info);
++
++enum pvr_xfb_topology pvr_xfb_topology(VkPrimitiveTopology topology);
++uint32_t pvr_xfb_verts_per_prim(enum pvr_xfb_topology topology);
++uint32_t pvr_xfb_prim_count(enum pvr_xfb_topology topology,
++                            uint32_t vertex_count);
++
++#endif /* PVR_XFB_H */
 diff -ruN a/src/imagination/vulkan/winsys/powervr/pvr_drm_bo.c b/src/imagination/vulkan/winsys/powervr/pvr_drm_bo.c
 --- a/src/imagination/vulkan/winsys/powervr/pvr_drm_bo.c
 +++ b/src/imagination/vulkan/winsys/powervr/pvr_drm_bo.c
@@ -4231,6 +7116,17 @@ diff -ruN a/src/imagination/vulkan/winsys/powervr/pvr_drm_bo.h b/src/imagination
  VkResult pvr_drm_winsys_buffer_unmap(struct pvr_winsys_bo *bo, bool reserve);
  
  VkResult pvr_drm_heap_alloc_carveout(struct pvr_winsys_heap *const heap,
+diff -ruN a/src/imagination/vulkan/winsys/powervr/pvr_drm.c b/src/imagination/vulkan/winsys/powervr/pvr_drm.c
+--- a/src/imagination/vulkan/winsys/powervr/pvr_drm.c
++++ b/src/imagination/vulkan/winsys/powervr/pvr_drm.c
+@@ -398,6 +398,7 @@
+    .buffer_destroy = pvr_drm_winsys_buffer_destroy,
+    .buffer_get_fd = pvr_drm_winsys_buffer_get_fd,
+    .buffer_map = pvr_drm_winsys_buffer_map,
++   .buffer_import_scanout = pvr_drm_winsys_buffer_import_scanout,
+    .buffer_unmap = pvr_drm_winsys_buffer_unmap,
+    .heap_alloc = pvr_drm_winsys_heap_alloc,
+    .heap_free = pvr_drm_winsys_heap_free,
 diff -ruN a/src/imagination/vulkan/winsys/powervr/pvr_drm_job_common.h b/src/imagination/vulkan/winsys/powervr/pvr_drm_job_common.h
 --- a/src/imagination/vulkan/winsys/powervr/pvr_drm_job_common.h
 +++ b/src/imagination/vulkan/winsys/powervr/pvr_drm_job_common.h
