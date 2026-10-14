@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# deploy-inplace.sh: swap haiku.hpkg (and the aic8800wifi driver) on the
-# Cubie's running air/OS lab install, keeping home, settings and Bluetooth
-# bonds, then reboot into it through Debian (lab_restart_once). Run under
-# board-lock.sh.
+# deploy-inplace.sh: swap haiku.hpkg (and the aic8800wifi driver) and the
+# image's Mesa files on the Cubie's running air/OS lab install, keeping home,
+# settings and Bluetooth bonds, then reboot into it through Debian
+# (lab_restart_once). Run under board-lock.sh.
 #
 # BUILD (default cubie/build-wifi), BOARD (192.168.1.118), HOST (this
-# machine as the board sees it), SKIP_PKG=1 for the driver only.
+# machine as the board sees it), SKIP_PKG=1 for the driver only, SKIP_MESA=1
+# to leave Mesa alone, MESA_DIR for a Mesa other than the pinned release.
 #
 # The package goes in under the installed package's file name: packagefs
 # activates what is in packages/, and keeping the name keeps the activated
@@ -27,6 +28,27 @@ TOOLS=$(cd "$(dirname "$0")" && pwd)
 export RPI4_STATE=${RPI4_STATE:-/mnt/HaikuWork/cubie/state}
 SHELL_PY=/mnt/HaikuWork/rpi4/haiku/tools/rpi4/shell.py
 SERVE_ONCE=/mnt/HaikuWork/retrace/serve-once.py
+# The image's Mesa (CUBIE_MESA_RELEASE in UserBuildConfig): zink, the PowerVR
+# Vulkan driver, the EGL vendor file and the GPU test programs are
+# non-packaged files, outside haiku.hpkg.
+MESA_RELEASE=$(sed -n 's/^CUBIE_MESA_RELEASE ?= \([0-9a-f]*\) ;.*/\1/p' \
+	"$TOOLS/UserBuildConfig")
+MESA_DIR=${MESA_DIR:-/mnt/HaikuWork/cubie/mesa/release/$MESA_RELEASE}
+mesa_files=()
+if [[ -z ${SKIP_MESA:-} ]]; then
+	[[ -f $MESA_DIR/MANIFEST ]] || { echo "no Mesa release in $MESA_DIR" >&2; exit 1; }
+	for f in libEGL_mesa.so.0 libvulkan_powervr_mesa.so libvulkan.so.1; do
+		mesa_files+=("$f /boot/system/non-packaged/lib")
+	done
+	mesa_files+=("10_mesa.json /boot/system/non-packaged/add-ons/opengl/egl_vendor.d")
+	for f in pvr_vkprobe pvr_vkfill pvr_vkfence pvr_vktriangle pvr_vkhang \
+			pvr_vkbench pvr_present pvr_copybench pvr_glprobe pvr_glbench \
+			pvr_glreset pvr_glpresent pvr_glcomposite pvr_glxfb \
+			tls_generation_check libtls_generation_check.so; do
+		[[ -e $MESA_DIR/$f ]] && mesa_files+=("$f /boot/system/non-packaged/bin")
+	done
+	echo "mesa    $MESA_DIR (${#mesa_files[@]} files)"
+fi
 
 b() { timeout "${2:-120}" python3 "$SHELL_PY" "$BOARD" "$1"; }
 
@@ -61,12 +83,26 @@ send() {
 }
 [[ -n ${SKIP_PKG:-} ]] || send "$PKG" haiku.hpkg 17781
 send "$WIFI" aic8800wifi 17782
+port=17783
+swap_mesa=true
+for entry in "${mesa_files[@]}"; do
+	name=${entry%% *}
+	dir=${entry#* }
+	b "[ -e $BACKUP/$name ] || [ ! -e $dir/$name ] || cp $dir/$name $BACKUP/; sync"
+	send "$MESA_DIR/$name" "$name" $port
+	port=$((port + 1))
+	swap_mesa="$swap_mesa && mkdir -p $dir && cp $STAGE/$name $dir/$name.new && chmod 755 $dir/$name.new && mv -f $dir/$name.new $dir/$name"
+done
 
 swap_wifi="cp $STAGE/aic8800wifi $WIFIPATH.new && mv -f $WIFIPATH.new $WIFIPATH"
 if [[ -n ${SKIP_PKG:-} ]]; then
 	b "$swap_wifi && sync && sha256sum $WIFIPATH" 300
 else
 	b "cp $STAGE/haiku.hpkg /boot/system/packages/$OLDPKG.new && mv -f /boot/system/packages/$OLDPKG.new /boot/system/packages/$OLDPKG && $swap_wifi && sync && sha256sum /boot/system/packages/$OLDPKG $WIFIPATH" 900
+fi
+if (( ${#mesa_files[@]} )); then
+	b "$swap_mesa && sync && ls -l /boot/system/non-packaged/lib/libEGL_mesa.so.0" 600
+	echo "Mesa $MESA_RELEASE installed"
 fi
 echo "rebooting (a warm reboot ends in Debian, then air/OS once)"
 b "shutdown -r" 20 || true
