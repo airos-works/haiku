@@ -279,6 +279,13 @@ it).
                                     block size instead of aborting the
                                     application (Summit's WebProcess died in
                                     the WebGL 2 conformance uniforms tests)
+  pvr_arch_formats.c                R9G9B9E5_FLOAT gets the F16 accumulation
+                                    format (as R11G11B10_FLOAT): zink clears
+                                    every new texture with
+                                    vkCmdClearColorImage, and the clear value
+                                    packing aborted on a format without one
+                                    (the conformance test with an RGB9_E5
+                                    texture took the WebProcess down)
 
 Not changed: the heap size (util/os_misc.c: sysconf(_SC_PHYS_PAGES), which
 Haiku's libroot answers from get_system_info()); the conformance gate
@@ -3176,6 +3183,19 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_device.c b/src/imagination/vulkan/pv
     pvr_bo_store_destroy(device);
     pvr_winsys_destroy(device->ws);
     p_atomic_dec(&device->instance->active_device_count);
+diff -ruN a/src/imagination/vulkan/pvr_arch_formats.c b/src/imagination/vulkan/pvr_arch_formats.c
+--- a/src/imagination/vulkan/pvr_arch_formats.c
++++ b/src/imagination/vulkan/pvr_arch_formats.c
+@@ -256,7 +256,8 @@
+    FORMAT(R32G32B32A32_SINT, S32S32S32S32, SINT32),
+    FORMAT(R32G32B32A32_FLOAT, F32F32F32F32, F32),
+    FORMAT(R11G11B10_FLOAT, F10F11F11, F16),
+-   FORMAT(R9G9B9E5_FLOAT, SE9995, INVALID),
++   /* (air/OS) F16 in, as R11G11B10: clears and copies pack through the PBE. */
++   FORMAT(R9G9B9E5_FLOAT, SE9995, F16),
+    FORMAT_DEPTH_STENCIL(Z16_UNORM, U16),
+    FORMAT_DEPTH_STENCIL(Z24X8_UNORM, X8U24),
+    FORMAT_DEPTH_STENCIL(Z32_FLOAT, F32),
 diff -ruN a/src/imagination/vulkan/pvr_arch_job_render.c b/src/imagination/vulkan/pvr_arch_job_render.c
 --- a/src/imagination/vulkan/pvr_arch_job_render.c
 +++ b/src/imagination/vulkan/pvr_arch_job_render.c
