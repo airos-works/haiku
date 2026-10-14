@@ -1033,6 +1033,22 @@ case_bench(void)
 			pass == 0 ? "alu 64 iterations" : "fill 16 blended quads",
 			total / frames, best, mpix);
 	}
+	// glFinish() with nothing to do, and after one small draw (WebGL 2's
+	// occlusion-query test calls gl.finish() 160000 times)
+	glUseProgram(pFlat);
+	glViewport(0, 0, 8, 8);
+	for (int draw = 0; draw < 2; draw++) {
+		glFinish();
+		double start = now_ms();
+		for (int i = 0; i < 200; i++) {
+			if (draw)
+				draw_quad();
+			glFinish();
+		}
+		printf("bench glFinish%s: %.3f ms each\n",
+			draw ? " after an 8x8 draw" : " with nothing to do",
+			(now_ms() - start) / 200);
+	}
 	check(gl_error() == GL_NO_ERROR, "bench: no GL error");
 	glUseProgram(0);
 	glDeleteProgram(pAlu);
