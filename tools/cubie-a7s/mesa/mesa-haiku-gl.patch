@@ -145,6 +145,33 @@ shared V3D bitmaps, plus the zink pieces of the air/OS x86_64 fork
       util_queue_finish() locked the zeroed queue mutex, which Haiku's
       libroot asserts on (pthread_mutex.cpp: owner 0, not -1)
 
+WebGL 2 conformance (Khronos conformance2 in Summit, through ANGLE):
+  src/gallium/drivers/zink/zink_screen.c
+      - 15 varyings on PowerVR (60 components, GLES 3.0's minimum), not 8:
+        its 64 output components are the whole vertex, gl_Position
+        included, and zink halved them for streamout outputs that the
+        driver's transform feedback (the vertex shader run again as a
+        compute kernel) does not need
+      - no storage images in the stages the device cannot store from
+        (PowerVR has no fragmentStoresAndAtomics), as for storage buffers:
+        Mesa's glReadPixels into a pixel pack buffer stored from fragment
+        shaders, helper pixels too (over the rows' padding), and r32ui
+        image stores from fragment shaders corrupted memory
+  src/gallium/drivers/zink/zink_resource.c
+      a write map that is not a discard and goes through a staging buffer
+      (the buffer is busy) starts from the buffer's contents: the whole
+      staging range is written back at unmap, so the bytes not written
+      (glReadPixels' row padding into a pixel pack buffer) were lost
+  src/mesa/main/image.c
+      _mesa_clip_blit(): clipping the source can move the destination
+      wholly outside the draw buffer (blitframebuffer-filter-outofbounds);
+      rejected before the destination clip, which asserted (the WebProcess
+      died in assertion builds)
+Left to ANGLE, which decides them before Mesa sees the call:
+immutable-tex-render-feedback (a mutable texture's base level above its
+max level is attachable) and blitframebuffer-test's sRGB-to-linear
+multisample resolve (ANGLE's EquivalentBlitInternalFormat allows it).
+
 Not ported: V3D/Mali screens, texture caches, GPU readback and shared
 bitmaps (driver-specific); the x86_64 fork's pipeline-library checks
 (66c695e: the PowerVR driver has no graphics pipeline libraries), Summit's
@@ -2297,7 +2324,22 @@ diff -ruN a/src/gallium/drivers/zink/zink_resource.c b/src/gallium/drivers/zink/
                !res->obj->host_visible) {
        /* any read, non-HV write, or unmappable that reaches this point needs staging */
        if ((usage & PIPE_MAP_READ) || !res->obj->host_visible || res->base.b.flags & PIPE_RESOURCE_FLAG_DONT_MAP_DIRECTLY) {
-@@ -2892,6 +2932,16 @@
+@@ -2738,6 +2778,14 @@
+             zink_screen_lock_context(screen);
+             ctx = screen->copy_context;
+          }
++         /* The whole staging range is written back at unmap, so a write
++          * map that is not a discard starts from the buffer's contents:
++          * the bytes it does not write must stay (glReadPixels into a
++          * pixel pack buffer writes the rows, not their padding). That is
++          * a read: wait for the copy (not "overwrite" again), invalidate.
++          */
++         if (!(usage & PIPE_MAP_DISCARD_RANGE))
++            usage |= PIPE_MAP_READ;
+          if (usage & PIPE_MAP_READ)
+             zink_copy_buffer(ctx, staging_res, res, trans->offset, box->x, box->width, false);
+          res = staging_res;
+@@ -2892,6 +2940,16 @@
        }
  
        ptr = map_resource(screen, staging_res);
@@ -2314,7 +2356,7 @@ diff -ruN a/src/gallium/drivers/zink/zink_resource.c b/src/gallium/drivers/zink/
     } else {
        assert(res->linear);
        ptr = map_resource(screen, res);
-@@ -2904,6 +2954,15 @@
+@@ -2904,6 +2962,15 @@
           else
              zink_resource_usage_wait(ctx, res, ZINK_RESOURCE_ACCESS_WRITE);
        }
@@ -2346,7 +2388,63 @@ diff -ruN a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zi
  #endif
  
     /* Hash in the Vulkan pipeline cache UUID to identify the combination of
-@@ -3541,8 +3547,26 @@
+@@ -649,21 +655,24 @@
+          MIN2(screen->info.props.limits.maxPerStageDescriptorStorageBuffers,
+               PIPE_MAX_SHADER_BUFFERS);
+ 
++      bool stores = true;
+       switch (i) {
+       case MESA_SHADER_VERTEX:
+       case MESA_SHADER_TESS_CTRL:
+       case MESA_SHADER_TESS_EVAL:
+       case MESA_SHADER_GEOMETRY:
+          if (!screen->info.feats.features.vertexPipelineStoresAndAtomics)
+-            caps->max_shader_buffers = 0;
++            stores = false;
+          break;
+       case MESA_SHADER_FRAGMENT:
+          if (!screen->info.feats.features.fragmentStoresAndAtomics)
+-            caps->max_shader_buffers = 0;
++            stores = false;
+          break;
+       default:
+          break;
+       }
++      if (!stores)
++         caps->max_shader_buffers = 0;
+ 
+       caps->supported_irs = (1 << PIPE_SHADER_IR_NIR) | (1 << PIPE_SHADER_IR_TGSI);
+ 
+@@ -672,6 +681,12 @@
+          caps->max_shader_images =
+             MIN2(screen->info.props.limits.maxPerStageDescriptorStorageImages,
+                  ZINK_MAX_SHADER_IMAGES);
++         /* GL images can be written, so like storage buffers none where
++          * the device cannot store (st's glReadPixels into a pixel pack
++          * buffer would store from fragment shaders, helpers included)
++          */
++         if (!stores)
++            caps->max_shader_images = 0;
+       }
+ 
+       caps->cont_supported = true;
+@@ -1148,6 +1163,15 @@
+    /* need to reserve up to 60 of our varying components and 16 slots for streamout */
+    caps->max_varyings =
+       MIN2(screen->info.props.limits.maxVertexOutputComponents / 4 / 2, 16);
++   /* PowerVR's 64 output components are the whole vertex, gl_Position
++    * included, and its transform feedback (the vertex shader run again as a
++    * compute kernel) needs no outputs of its own: halving would leave GL 8
++    * varyings, below the 15 of GLES 3.0 / WebGL 2. 15 fill the vertex with
++    * the position.
++    */
++   if (zink_driverid(screen) == VK_DRIVER_ID_IMAGINATION_OPEN_SOURCE_MESA)
++      caps->max_varyings =
++         MIN2(screen->info.props.limits.maxVertexOutputComponents / 4 - 1, 16);
+ 
+    caps->dmabuf =
+ #if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD)
+@@ -3541,8 +3565,26 @@
           assert(i == ZINK_HEAP_HOST_VISIBLE_COHERENT_CACHED || i == ZINK_HEAP_DEVICE_LOCAL_LAZY ||
                  i == ZINK_HEAP_DEVICE_LOCAL_VISIBLE);
           if (i == ZINK_HEAP_HOST_VISIBLE_COHERENT_CACHED) {
@@ -2646,6 +2744,29 @@ diff -ruN a/src/gallium/winsys/sw/hgl/meson.build b/src/gallium/winsys/sw/hgl/me
 +  dependencies: [idep_mesautil, idep_mesautilformat],
    build_by_default : false,
  )
+diff -ruN a/src/mesa/main/image.c b/src/mesa/main/image.c
+--- a/src/mesa/main/image.c
++++ b/src/mesa/main/image.c
+@@ -816,6 +816,19 @@
+    clip_left_or_bottom(dstX0, dstX1, srcX0, srcX1, srcXmin);
+    clip_left_or_bottom(dstY0, dstY1, srcY0, srcY1, srcYmin);
+ 
++   /* Clipping the src rect moved the dest rect proportionally, which can
++    * leave it empty or entirely outside the dest bounds (e.g. src x -2..4
++    * onto dst x 7..10 of an 8 wide buffer: dst becomes 8..10). The dest
++    * clip below expects one end inside, so reject these here.
++    */
++   if (*dstX0 == *dstX1 || *dstY0 == *dstY1)
++      return GL_FALSE;
++   if ((*dstX0 <= dstXmin && *dstX1 <= dstXmin) ||
++       (*dstX0 >= dstXmax && *dstX1 >= dstXmax) ||
++       (*dstY0 <= dstYmin && *dstY1 <= dstYmin) ||
++       (*dstY0 >= dstYmax && *dstY1 >= dstYmax))
++      return GL_FALSE;
++
+    /*
+     * dest clip (just swap src/dst values from above)
+     */
 diff -ruN a/src/mesa/state_tracker/st_cb_flush.c b/src/mesa/state_tracker/st_cb_flush.c
 --- a/src/mesa/state_tracker/st_cb_flush.c
 +++ b/src/mesa/state_tracker/st_cb_flush.c

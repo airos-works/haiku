@@ -35,7 +35,8 @@
 		critical_grace 30		seconds before the kernel shuts down itself
 		critical_margin 4		or degrees above critical before it does
 		max_big_mhz 1794		max_little_mhz 1404
-		throttle_devices false	the GPU and the video engine stay at 600 MHz
+		throttle_devices false	the GPU and the video engine stay at full
+								speed (GPU 800 MHz, or what powervr set)
 		log_interval 5			a "watch" line every 5 s
 		voltage_settle_percent 200	a raised voltage's settling time (of
 								the PMIC's nominal slew)
@@ -109,21 +110,23 @@ static const int32 kRunawayMargin = 8000;
 // the heat: the cores alone at 416 MHz do not hold it.
 static const struct { uint32 big, little; uint8 gpu, ve; } kLevels[] = {
 	{ 0xffffffff, 0xffffffff, 0, 0 },
-	{ 1794, 1794, 0, 1 },
-	{ 1612, 1716, 1, 1 },
-	{ 1404, 1612, 1, 2 },
-	{ 1196, 1404, 2, 2 },
-	{ 1014, 1196, 2, 2 },
-	{ 780, 1014, 3, 2 },
-	{ 416, 780, 3, 3 },
-	{ 416, 416, 3, 3 }
+	{ 1794, 1794, 1, 1 },
+	{ 1612, 1716, 2, 1 },
+	{ 1404, 1612, 2, 2 },
+	{ 1196, 1404, 3, 2 },
+	{ 1014, 1196, 3, 2 },
+	{ 780, 1014, 4, 2 },
+	{ 416, 780, 4, 3 },
+	{ 416, 416, 4, 3 }
 };
 
-// The GPU's clock (CCU 0xb20): the powervr driver runs it from pll-peri0-600m
-// (source 2); slower from the 400, 300 and 200 MHz taps (sources 3-5), as
-// Allwinner's GPU frequency scaling does. Bit 27 latches a new source.
-static const uint32 kGpuSources[] = { 2, 3, 4, 5 };
-static const uint32 kGpuMegahertz[] = { 600, 400, 300, 200 };
+// The GPU's clock (CCU 0xb20): the powervr driver runs it from pll-peri0-800m
+// (source 1), or -600m (source 2) when its settings say so; slower from the
+// 400, 300 and 200 MHz taps (sources 3-5), as Allwinner's GPU frequency
+// scaling does. Bit 27 latches a new source. A level's step is a cap: the
+// GPU never runs faster than its driver set it.
+static const uint32 kGpuSources[] = { 1, 2, 3, 4, 5 };
+static const uint32 kGpuMegahertz[] = { 800, 600, 400, 300, 200 };
 // The video engine's (CCU 0xa88): sunxi_ve runs it from pll-peri0-600m
 // (source 3) undivided; divided by 1-4 (bits 4:0 hold the divider - 1).
 static const uint32 kVeMegahertz[] = { 600, 300, 200, 150 };
@@ -200,6 +203,8 @@ static area_id sCcuArea = -1;
 static volatile uint8* sCcu;
 static bool sThrottleDevices = true;
 static int32 sGpuStep = -1;			// as last set; -1: not touched
+static int32 sGpuBase = 0;			// the step the powervr driver set
+static uint32 sGpuWritten = 0;		// the source last set here, 0: none
 static int32 sVeStep = -1;
 static uint32 sGpuChanges;
 static uint32 sVeChanges;
@@ -532,12 +537,18 @@ apply_device_clocks()
 	uint32 source = (value & CCU_SOURCE_MASK) >> CCU_SOURCE_SHIFT;
 	if ((value & CCU_CLOCK_GATE) != 0 && (value & 0xf) == 0
 		&& source >= kGpuSources[0]
-		&& source <= kGpuSources[B_COUNT_OF(kGpuSources) - 1]
-		&& source != kGpuSources[gpuStep]) {
-		*gpu = (value & ~CCU_SOURCE_MASK) | CCU_GPU_UPDATE
-			| kGpuSources[gpuStep] << CCU_SOURCE_SHIFT;
-		memory_full_barrier();
-		sGpuChanges++;
+		&& source <= kGpuSources[B_COUNT_OF(kGpuSources) - 1]) {
+		// a source not set here is the powervr driver's (at power-up)
+		if (source != sGpuWritten)
+			sGpuBase = source - kGpuSources[0];
+		gpuStep = max_c(gpuStep, sGpuBase);
+		if (source != kGpuSources[gpuStep]) {
+			*gpu = (value & ~CCU_SOURCE_MASK) | CCU_GPU_UPDATE
+				| kGpuSources[gpuStep] << CCU_SOURCE_SHIFT;
+			memory_full_barrier();
+			sGpuWritten = kGpuSources[gpuStep];
+			sGpuChanges++;
+		}
 	}
 	if (gpuStep != sGpuStep) {
 		sGpuStep = gpuStep;
