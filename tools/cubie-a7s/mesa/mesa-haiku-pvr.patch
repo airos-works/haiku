@@ -286,6 +286,17 @@ it).
                                     packing aborted on a format without one
                                     (the conformance test with an RGB9_E5
                                     texture took the WebProcess down)
+  pco/pco_nir_vk.c                  a texel fetch always uses the point
+                                    sampler (clamp to a transparent black
+                                    border, no LOD clamp), also on a
+                                    combined image/sampler, whose own
+                                    sampler wrapped coordinates outside the
+                                    image: GLES texelFetch() must return 0
+                                    there (WebGL 2 texel-fetch-undefined)
+  pvr_arch_cmd_buffer.c             a warning, once, when a vertex has more
+                                    output dwords than this core's vertex
+                                    store holds (64 on BXM-4-64, gl_Position
+                                    included; zink's 15 varyings fill it)
 
 Not changed: the heap size (util/os_misc.c: sysconf(_SC_PHYS_PAGES), which
 Haiku's libroot answers from get_system_info()); the conformance gate
@@ -1601,6 +1612,64 @@ diff -ruN a/src/imagination/pco/pco_nir.c b/src/imagination/pco/pco_nir.c
  
     if (nir->info.stage == MESA_SHADER_COMPUTE &&
         (PCO_DEBUG(GLOBAL_SHMEM) ||
+diff -ruN a/src/imagination/pco/pco_nir_vk.c b/src/imagination/pco/pco_nir_vk.c
+--- a/src/imagination/pco/pco_nir_vk.c
++++ b/src/imagination/pco/pco_nir_vk.c
+@@ -82,17 +82,6 @@
+    return nir_imm_int(b, array_elem);
+ }
+ 
+-static inline bool is_comb_img_smp(unsigned desc_set,
+-                                   unsigned binding,
+-                                   const pco_common_data *common)
+-{
+-   const pco_descriptor_set_data *desc_set_data = &common->desc_sets[desc_set];
+-   assert(desc_set_data->bindings && binding < desc_set_data->binding_count);
+-
+-   const pco_binding_data *binding_data = &desc_set_data->bindings[binding];
+-   return binding_data->is_img_smp;
+-}
+-
+ static bool lower_tex_deref_to_binding(nir_builder *b,
+                                        nir_tex_instr *tex,
+                                        unsigned deref_index,
+@@ -130,26 +119,18 @@
+ static bool
+ add_txf_sampler(nir_builder *b, nir_tex_instr *tex, pco_common_data *common)
+ {
+-   int deref_index = nir_tex_instr_src_index(tex, nir_tex_src_backend1);
+-   assert(deref_index >= 0);
+-   nir_tex_src *deref_src = &tex->src[deref_index];
+-
+-   unsigned desc_set;
+-   unsigned binding;
+-   pco_unpack_desc(tex->texture_index, &desc_set, &binding);
+-   nir_def *elem = deref_src->src.ssa;
+-
+-   /* If it's not a combined image/sampler, use the point sampler. */
+-   if (!is_comb_img_smp(desc_set, binding, common)) {
+-      desc_set = PCO_POINT_SAMPLER;
+-      binding = PCO_POINT_SAMPLER;
+-      elem = nir_imm_int(b, 0);
++   assert(nir_tex_instr_src_index(tex, nir_tex_src_backend1) >= 0);
+ 
+-      common->uses.point_sampler = true;
+-   }
++   /* A fetch takes no sampler: use the point sampler, also for a combined
++    * image/sampler. Its own sampler's address modes would wrap or clamp
++    * coordinates outside the image (OpenGL ES's texelFetch must return 0
++    * there, and so must robust image access) and its LOD range would
++    * clamp the level.
++    */
++   common->uses.point_sampler = true;
+ 
+-   tex->sampler_index = pco_pack_desc(desc_set, binding);
+-   nir_tex_instr_add_src(tex, nir_tex_src_backend2, elem);
++   tex->sampler_index = pco_pack_desc(PCO_POINT_SAMPLER, PCO_POINT_SAMPLER);
++   nir_tex_instr_add_src(tex, nir_tex_src_backend2, nir_imm_int(b, 0));
+    return true;
+ }
+ 
 diff -ruN a/src/imagination/pco/pco_trans_nir.c b/src/imagination/pco/pco_trans_nir.c
 --- a/src/imagination/pco/pco_trans_nir.c
 +++ b/src/imagination/pco/pco_trans_nir.c
@@ -2869,7 +2938,34 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
  void PVR_PER_ARCH(CmdDispatchBase)(VkCommandBuffer commandBuffer,
                                     uint32_t baseGroupX,
                                     uint32_t baseGroupY,
-@@ -8795,6 +9492,15 @@
+@@ -8128,7 +8825,7 @@
+    /* FIXME: Assume all state is dirty for the moment. */
+    struct pvr_device_info *const dev_info =
+       &cmd_buffer->device->pdevice->dev_info;
+-   ASSERTED const uint32_t max_user_vertex_output_components =
++   const uint32_t max_user_vertex_output_components =
+       pvr_get_max_user_vertex_output_components(dev_info);
+    struct ROGUE_VDMCTRL_VDM_STATE0 header = { pvr_cmd_header(
+       VDMCTRL_VDM_STATE0) };
+@@ -8145,6 +8842,17 @@
+ 
+    /* CAM Calculations and HW state take vertex size aligned to DWORDS. */
+    assert(vs_data->vs.vtxouts <= max_user_vertex_output_components);
++   /* (zink offers GL 15 varyings beside gl_Position, which fill the vertex;
++    * a point size on top is one dword over)
++    */
++   if (vs_data->vs.vtxouts > max_user_vertex_output_components) {
++      static bool warned;
++      if (!warned) {
++         warned = true;
++         mesa_logw("pvr: a vertex of %u output dwords, over this core's %u",
++                   vs_data->vs.vtxouts, max_user_vertex_output_components);
++      }
++   }
+ 
+    pvr_arch_calculate_vertex_cam_size(dev_info,
+                                       vs_data->vs.vtxouts,
+@@ -8795,6 +9503,15 @@
                             0U,
                             0U,
                             0U);
@@ -2885,7 +2981,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
  }
  
  void PVR_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
-@@ -8836,6 +9542,15 @@
+@@ -8836,6 +9553,15 @@
                             0U,
                             0U,
                             0U);
@@ -2901,7 +2997,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
  }
  
  void PVR_PER_ARCH(CmdDrawIndexedIndirect)(VkCommandBuffer commandBuffer,
-@@ -8935,6 +9650,10 @@
+@@ -8935,6 +9661,10 @@
     if (result != VK_SUCCESS)
        return;
  
@@ -2912,7 +3008,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
     result = pvr_resolve_unemitted_resolve_attachments(cmd_buffer,
                                                        &state->render_pass_info);
     if (result != VK_SUCCESS)
-@@ -9951,6 +10670,10 @@
+@@ -9951,6 +10681,10 @@
     if (result != VK_SUCCESS)
        pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
  

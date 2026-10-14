@@ -346,7 +346,7 @@ rule UserBuildConfigRulePreImage
 		for test in pvr_vkprobe pvr_vkfill pvr_vkfence pvr_vktriangle
 				pvr_vkhang pvr_vkbench pvr_present pvr_copybench pvr_glprobe
 				pvr_glbench pvr_glreset pvr_glpresent pvr_glcomposite pvr_glxfb
-				tls_generation_check libtls_generation_check.so {
+				pvr_glconform tls_generation_check libtls_generation_check.so {
 			# a release from before a test was written lacks it
 			if [ Glob $(CUBIE_MESA_DIR) : $(test) ] {
 				local testFile = <cubie-mesa>$(test) ;

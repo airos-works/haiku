@@ -43,7 +43,7 @@ if [[ -z ${SKIP_MESA:-} ]]; then
 	mesa_files+=("10_mesa.json /boot/system/non-packaged/add-ons/opengl/egl_vendor.d")
 	for f in pvr_vkprobe pvr_vkfill pvr_vkfence pvr_vktriangle pvr_vkhang \
 			pvr_vkbench pvr_present pvr_copybench pvr_glprobe pvr_glbench \
-			pvr_glreset pvr_glpresent pvr_glcomposite pvr_glxfb \
+			pvr_glreset pvr_glpresent pvr_glcomposite pvr_glxfb pvr_glconform \
 			tls_generation_check libtls_generation_check.so; do
 		[[ -e $MESA_DIR/$f ]] && mesa_files+=("$f /boot/system/non-packaged/bin")
 	done

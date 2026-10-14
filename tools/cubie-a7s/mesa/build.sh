@@ -35,6 +35,15 @@ SUNXI_HEADERS=$TREE/headers/private/graphics/sunxi_display
 CROSS=$WORK/build/arm64/cross-tools-arm64/bin/aarch64-unknown-haiku
 NATIVE_DEPS=$WORK/toolchains/mesa-native-deps
 JOBS=${HAIKU_JOBS:-16}
+# Assertions are off in the driver and GL builds (b_ndebug): images ship
+# what this builds, and an assertion there ends the application (a WebGL
+# page's web process). It also turns off NIR validation after every
+# compiler pass. CUBIE_MESA_ASSERTS=1 builds with them, for debugging.
+if [ -n "${CUBIE_MESA_ASSERTS:-}" ] && [ "$CUBIE_MESA_ASSERTS" != 0 ]; then
+	NDEBUG=false
+else
+	NDEBUG=true
+fi
 
 SRC=$ROOT/mesa-$MESA_VERSION
 HOST_BUILD=$ROOT/build-host
@@ -49,7 +58,7 @@ TESTS=(pvr_vkprobe pvr_vkfill pvr_vkfence pvr_vktriangle pvr_vkhang
 	pvr_vkbench pvr_present pvr_copybench)
 # OpenGL ES programs (through libglvnd's libEGL/libGLESv2)
 GL_TESTS=(pvr_glprobe pvr_glbench pvr_glreset pvr_glpresent pvr_glcomposite
-	pvr_glxfb)
+	pvr_glxfb pvr_glconform)
 # the runtime loader's thread-local storage for dlopen()ed libraries: a
 # program and the library it loads, built from one file
 TLS_CHECK=(tls_generation_check libtls_generation_check.so)
@@ -240,7 +249,7 @@ INI
 		--cross-file="$BASE/haiku-aarch64.ini" \
 		--cross-file="$ROOT/haiku-aarch64-pvr.ini" \
 		--prefix=/boot/system/non-packaged --libdir=lib \
-		--buildtype=debugoptimized --wrap-mode=nofallback \
+		--buildtype=debugoptimized -Db_ndebug=$NDEBUG --wrap-mode=nofallback \
 		-Dplatforms=haiku -Dvulkan-drivers=imagination '-Dgallium-drivers=[]' \
 		-Dimagination-srv=false -Dopengl=false -Dgles1=disabled \
 		-Dgles2=disabled -Degl=disabled -Dglx=disabled -Dgbm=disabled \
@@ -312,7 +321,7 @@ INI
 		--cross-file="$ROOT/haiku-aarch64-pvr.ini" \
 		--cross-file="$ROOT/haiku-aarch64-gl.ini" \
 		--prefix=/boot/system/non-packaged --libdir=lib \
-		--buildtype=debugoptimized --wrap-mode=nofallback \
+		--buildtype=debugoptimized -Db_ndebug=$NDEBUG --wrap-mode=nofallback \
 		-Dplatforms=haiku -Dgallium-drivers=zink,softpipe '-Dvulkan-drivers=[]' \
 		-Dopengl=true -Dgles1=disabled -Dgles2=enabled -Degl=enabled \
 		-Dglvnd=enabled -Dglx=disabled -Dgbm=disabled -Dllvm=disabled \
