@@ -5,9 +5,9 @@
 
 /*	/dev/misc/sunxi_ve: the video decoder of the Allwinner A733 (its Cedar
 	"VE") for the program that parses the stream (the sunxi_cedar media
-	add-on); see <sunxi_ve.h>. Without the device tree node
-	"allwinner,sun60i-a733-video-engine" no device is found and every open
-	fails.
+	add-on); see <sunxi_ve.h>. The driver attaches to the device tree node
+	"allwinner,sun60i-a733-video-engine" when the system starts, and stays
+	loaded.
 
 	The power-up follows what Allwinner's own driver does on this SoC
 	(drivers/ve/cedar-ve of the BSP), with the registers' meaning from the
@@ -19,7 +19,18 @@
 	Nothing reads the engine's registers unless the CCU says that its
 	clock runs and its reset is released: with either off, a read stalls
 	the bus and the whole system with it (the power domain being on says
-	nothing about that). */
+	nothing about that).
+
+	The engine's buffers come from a pool of physically contiguous memory
+	below 4 GiB that the driver takes when it is loaded, early in the
+	session (the media server looks for the device when it starts). After
+	a few hours of uptime the free memory is too fragmented for runs of a
+	few hundred pages: the decoder could not get a picture's memory and
+	the players fell back to software. A buffer is a page range of the
+	pool, mapped as an area of its own for the program to clone; only when
+	the pool is full does a buffer get contiguous memory of its own. The
+	driver settings file "sunxi_ve" sets the pool's size ("pool_size 128",
+	MiB; 0: no pool). */
 
 
 #include <Drivers.h>
@@ -36,6 +47,8 @@
 #include <lock.h>
 #include <util/AutoLock.h>
 #include <vm/vm.h>
+#include <vm/VMArea.h>
+#include <vm/VMCache.h>
 
 #include <sunxi_ve.h>
 
@@ -50,9 +63,17 @@
 #endif
 #define ERROR(x...)		dprintf("sunxi_ve: " x)
 
+#define DRIVER_MODULE_NAME	"drivers/misc/sunxi_ve/driver_v1"
+#define DEVICE_MODULE_NAME	"drivers/misc/sunxi_ve/device_v1"
+
 #define CACHE_LINE_SIZE		64
 #define SLICE_TIMEOUT		2000000LL
 #define POLL_TIMEOUT		10000LL
+
+// A decoder of a 1080p film takes 3 MiB and 3.4 MiB a picture, 36 pictures
+// at most (125 MiB); with YouTube, Summit's holds four.
+#define DEFAULT_POOL_SIZE	128
+#define MAX_POOL_SIZE		1024
 
 // what the device tree does not say: the SoC's clock, power and IOMMU blocks
 static const phys_addr_t kCcu			= 0x02002000;
@@ -117,12 +138,23 @@ struct ve_buffer {
 	uint8*		address;
 	phys_addr_t	physical;
 	size_t		size;
+	uint32		poolPage;		// its first page in the pool
+	uint32		poolPages;		// 0: memory of its own
 };
 
 struct ve_client {
 	mutex		lock;
 	ve_buffer	buffers[SUNXI_VE_MAX_BUFFERS];
 	int32		busy;
+	bool		poolFull;		// said so once
+};
+
+// a freed pool buffer that a program still maps
+struct pool_orphan {
+	pool_orphan*	next;
+	area_id			area;
+	uint32			page;
+	uint32			pages;
 };
 
 struct mapping {
@@ -130,10 +162,6 @@ struct mapping {
 	volatile uint8*		address;
 };
 
-
-int32 api_version = B_CUR_DRIVER_API_VERSION;
-
-static const char* sDeviceNames[] = { "misc/sunxi_ve", NULL };
 
 static device_manager_info* sDeviceManager;
 
@@ -160,6 +188,16 @@ static ve_client* sHolder;			// in the middle of a picture
 static bigtime_t sHoldUntil;
 static bool sIdentified;
 static uint32 sDecoderIp, sEncoderIp, sVersion;
+
+static mutex sPoolLock = MUTEX_INITIALIZER("sunxi_ve pool");
+static uint32 sPoolSize = DEFAULT_POOL_SIZE;	// MiB
+static area_id sPoolArea = -1;
+static phys_addr_t sPoolPhysical;
+static uint32 sPoolPages;
+static uint32* sPoolMap;		// a bit per page, set: in use
+static uint32 sPoolUsed;
+static uint32 sPoolPeak;
+static pool_orphan* sOrphans;
 
 
 static inline uint32
@@ -451,6 +489,148 @@ ve_interrupt(void* data)
 }
 
 
+//	#pragma mark - pool
+
+
+static status_t
+pool_init()
+{
+	if (sPoolSize == 0)
+		return B_OK;
+
+	size_t size = (size_t)sPoolSize << 20;
+	virtual_address_restrictions virtualRestrictions = {};
+	physical_address_restrictions physicalRestrictions = {};
+	physicalRestrictions.high_address = 1ull << 32;
+	void* address;
+	area_id area = create_area_etc(B_SYSTEM_TEAM, "sunxi_ve pool", size,
+		B_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, 0, 0,
+		&virtualRestrictions, &physicalRestrictions, &address);
+	if (area < 0)
+		return area;
+
+	physical_entry entry;
+	status_t status = get_memory_map(address, size, &entry, 1);
+	uint32 pages = size / B_PAGE_SIZE;
+	uint32* map = (uint32*)calloc((pages + 31) / 32, sizeof(uint32));
+	if (status != B_OK || map == NULL) {
+		free(map);
+		delete_area(area);
+		return status != B_OK ? status : B_NO_MEMORY;
+	}
+
+	sPoolArea = area;
+	sPoolPhysical = entry.address;
+	sPoolPages = pages;
+	sPoolMap = map;
+	return B_OK;
+}
+
+
+static inline bool
+pool_page_used(uint32 page)
+{
+	return (sPoolMap[page / 32] & (1u << (page % 32))) != 0;
+}
+
+
+static void
+pool_mark(uint32 first, uint32 count, bool used)
+{
+	for (uint32 page = first; page < first + count; page++) {
+		if (used)
+			sPoolMap[page / 32] |= 1u << (page % 32);
+		else
+			sPoolMap[page / 32] &= ~(1u << (page % 32));
+	}
+	if (used) {
+		sPoolUsed += count;
+		sPoolPeak = max_c(sPoolPeak, sPoolUsed);
+	} else
+		sPoolUsed -= count;
+}
+
+
+/*!	The first free run of \a count pages. Called with sPoolLock. */
+static bool
+pool_take(uint32 count, uint32* _first)
+{
+	uint32 run = 0;
+	for (uint32 page = 0; page < sPoolPages; page++) {
+		if (pool_page_used(page)) {
+			run = 0;
+			continue;
+		}
+		if (++run == count) {
+			*_first = page + 1 - count;
+			pool_mark(*_first, count, true);
+			return true;
+		}
+	}
+	return false;
+}
+
+
+/*!	Whether anything but the driver's own area maps a pool buffer: a clone
+	the program kept (a team that dies closes its file descriptors before
+	its areas go) or a fork()'s copy of one. Its pages are not handed out
+	again while something does.
+*/
+static bool
+mapped_elsewhere(area_id id)
+{
+	VMArea* area = VMAreas::Lookup(id);
+	if (area == NULL)
+		return false;
+	VMCache* cache = vm_area_get_locked_cache(area);
+	bool elsewhere = cache->areas.First() != area
+		|| VMArea::CacheList::GetNext(area) != NULL
+		|| !cache->consumers.IsEmpty();
+	vm_area_put_locked_cache(cache);
+	return elsewhere;
+}
+
+
+/*!	The orphans that nothing maps any more go back to the pool. Called with
+	sPoolLock.
+*/
+static void
+pool_collect_orphans()
+{
+	pool_orphan** link = &sOrphans;
+	while (pool_orphan* orphan = *link) {
+		if (mapped_elsewhere(orphan->area)) {
+			link = &orphan->next;
+			continue;
+		}
+		delete_area(orphan->area);
+		pool_mark(orphan->page, orphan->pages, false);
+		*link = orphan->next;
+		free(orphan);
+	}
+}
+
+
+static void
+pool_uninit()
+{
+	MutexLocker locker(sPoolLock);
+	pool_collect_orphans();
+	if (sPoolArea < 0)
+		return;
+	if (sPoolUsed != 0) {
+		// a program still maps some of it: it stays
+		ERROR("%" B_PRIu32 " pages of the pool still mapped\n", sPoolUsed);
+		return;
+	}
+	delete_area(sPoolArea);
+	free(sPoolMap);
+	sPoolArea = -1;
+	sPoolMap = NULL;
+	sPoolPages = 0;
+}
+
+
 //	#pragma mark - buffers
 
 
@@ -466,12 +646,101 @@ buffer_for(ve_client* client, uint32 index)
 static void
 free_buffer(ve_buffer& buffer)
 {
-	if (buffer.area >= 0)
+	if (buffer.area >= 0 && buffer.poolPages != 0) {
+		MutexLocker locker(sPoolLock);
+		if (!mapped_elsewhere(buffer.area)) {
+			delete_area(buffer.area);
+			pool_mark(buffer.poolPage, buffer.poolPages, false);
+		} else {
+			pool_orphan* orphan
+				= (pool_orphan*)malloc(sizeof(pool_orphan));
+			if (orphan != NULL) {
+				orphan->area = buffer.area;
+				orphan->page = buffer.poolPage;
+				orphan->pages = buffer.poolPages;
+				orphan->next = sOrphans;
+				sOrphans = orphan;
+			}
+			// else its pages stay taken
+		}
+	} else if (buffer.area >= 0)
 		delete_area(buffer.area);
 	buffer.area = -1;
 	buffer.address = NULL;
 	buffer.physical = 0;
 	buffer.size = 0;
+	buffer.poolPage = 0;
+	buffer.poolPages = 0;
+}
+
+
+/*!	A buffer from the pool: an area over a page range of it. */
+static status_t
+allocate_from_pool(ve_buffer& buffer, size_t size)
+{
+	MutexLocker locker(sPoolLock);
+	if (sPoolArea < 0)
+		return B_NO_MEMORY;
+	pool_collect_orphans();
+
+	uint32 pages = size / B_PAGE_SIZE;
+	uint32 first;
+	if (!pool_take(pages, &first))
+		return B_NO_MEMORY;
+
+	// cached like the pool's own mapping: the program cleans and
+	// invalidates the CPU cache (SUNXI_VE_SYNC)
+	phys_addr_t physical = sPoolPhysical + (phys_addr_t)first * B_PAGE_SIZE;
+	void* address;
+	area_id area = map_physical_memory("sunxi_ve buffer", physical, size,
+		B_ANY_KERNEL_ADDRESS | B_WRITE_BACK_MEMORY,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA | B_CLONEABLE_AREA,
+		&address);
+	if (area < 0) {
+		pool_mark(first, pages, false);
+		return area;
+	}
+
+	buffer.area = area;
+	buffer.address = (uint8*)address;
+	buffer.physical = physical;
+	buffer.size = size;
+	buffer.poolPage = first;
+	buffer.poolPages = pages;
+	return B_OK;
+}
+
+
+/*!	A buffer of its own, when the pool is full. */
+static status_t
+allocate_contiguous(ve_buffer& buffer, size_t size)
+{
+	// the engine's address registers are 32 bits wide
+	virtual_address_restrictions virtualRestrictions = {};
+	physical_address_restrictions physicalRestrictions = {};
+	physicalRestrictions.high_address = 1ull << 32;
+
+	void* address;
+	area_id area = create_area_etc(B_SYSTEM_TEAM, "sunxi_ve own buffer",
+		size, B_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA
+			| B_CLONEABLE_AREA, 0, 0, &virtualRestrictions,
+		&physicalRestrictions, &address);
+	if (area < 0)
+		return area;
+
+	physical_entry entry;
+	status_t status = get_memory_map(address, size, &entry, 1);
+	if (status != B_OK) {
+		delete_area(area);
+		return status;
+	}
+	buffer.area = area;
+	buffer.address = (uint8*)address;
+	buffer.physical = entry.address;
+	buffer.size = size;
+	buffer.poolPage = 0;
+	buffer.poolPages = 0;
+	return B_OK;
 }
 
 
@@ -490,36 +759,25 @@ allocate_buffer(ve_client* client, sunxi_ve_allocate& request)
 	if (index == SUNXI_VE_MAX_BUFFERS)
 		return B_NO_MEMORY;
 
-	// the engine's address registers are 32 bits wide
-	virtual_address_restrictions virtualRestrictions = {};
-	physical_address_restrictions physicalRestrictions = {};
-	physicalRestrictions.high_address = 1ull << 32;
-
 	ve_buffer& buffer = client->buffers[index];
-	void* address;
-	buffer.area = create_area_etc(B_SYSTEM_TEAM, "sunxi_ve buffer", size,
-		B_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA
-			| B_CLONEABLE_AREA, 0, 0, &virtualRestrictions,
-		&physicalRestrictions, &address);
-	if (buffer.area < 0) {
-		status_t status = buffer.area;
+	status_t status = allocate_from_pool(buffer, size);
+	if (status != B_OK) {
+		if (sPoolArea >= 0 && !client->poolFull) {
+			client->poolFull = true;
+			ERROR("pool full (%" B_PRIu32 " of %" B_PRIu32 " pages used): "
+				"memory of their own for the next buffers\n", sPoolUsed,
+				sPoolPages);
+		}
+		status = allocate_contiguous(buffer, size);
+	}
+	if (status != B_OK) {
 		buffer.area = -1;
 		return status;
 	}
 
-	physical_entry entry;
-	status_t status = get_memory_map(address, size, &entry, 1);
-	if (status != B_OK) {
-		free_buffer(buffer);
-		return status;
-	}
-	buffer.address = (uint8*)address;
-	buffer.physical = entry.address;
-	buffer.size = size;
-
 	// nothing of it in the cache when the engine first writes there
-	memset(address, 0, size);
-	sync_cache(address, size, true);
+	memset(buffer.address, 0, size);
+	sync_cache(buffer.address, size, true);
 
 	request.size = size;
 	request.buffer = index;
@@ -694,28 +952,30 @@ unmap_block(mapping& block)
 }
 
 
-static status_t
-find_engine(phys_addr_t* _registers, size_t* _size, uint32* _interrupt)
+static void
+unmap_blocks()
 {
-	device_node* root = sDeviceManager->get_root_node();
-	if (root == NULL)
-		return B_DEVICE_NOT_FOUND;
+	unmap_block(sVe);
+	unmap_block(sSystem);
+	unmap_block(sIommu);
+	unmap_block(sPpu);
+	unmap_block(sRCcu);
+	unmap_block(sCcu);
+	if (sDoneSem >= 0)
+		delete_sem(sDoneSem);
+	sDoneSem = -1;
+}
 
-	device_attr attributes[] = {
-		{ "fdt/compatible", B_STRING_TYPE,
-			{ .string = "allwinner,sun60i-a733-video-engine" } },
-		{}
-	};
-	device_node* node = NULL;
-	if (sDeviceManager->find_child_node(root, attributes, &node) != B_OK)
-		node = NULL;
-	sDeviceManager->put_node(root);
-	if (node == NULL)
-		return B_DEVICE_NOT_FOUND;
 
+/*!	The registers and the interrupt from the device tree node. */
+static status_t
+find_engine(device_node* node, phys_addr_t* _registers, size_t* _size,
+	uint32* _interrupt)
+{
+	device_node* parent = sDeviceManager->get_parent_node(node);
 	fdt_device_module_info* fdt;
 	fdt_device* device;
-	status_t status = sDeviceManager->get_driver(node,
+	status_t status = sDeviceManager->get_driver(parent,
 		(driver_module_info**)&fdt, (void**)&device);
 	if (status == B_OK) {
 		uint64 base, size, interrupt;
@@ -728,7 +988,7 @@ find_engine(phys_addr_t* _registers, size_t* _size, uint32* _interrupt)
 			status = B_BAD_DATA;
 	}
 
-	sDeviceManager->put_node(node);
+	sDeviceManager->put_node(parent);
 	return status;
 }
 
@@ -743,12 +1003,16 @@ read_settings()
 		NULL, NULL);
 	if (offset != NULL)
 		sAddressOffset = strtoul(offset, NULL, 0);
+	const char* poolSize = get_driver_parameter(handle, "pool_size", NULL,
+		NULL);
+	if (poolSize != NULL)
+		sPoolSize = min_c(strtoul(poolSize, NULL, 10), MAX_POOL_SIZE);
 	unload_driver_settings(handle);
 }
 
 
 static status_t
-ve_open(const char* name, uint32 flags, void** _cookie)
+ve_open(void* deviceCookie, const char* path, int openMode, void** _cookie)
 {
 	if (sVe.address == NULL)
 		return B_DEVICE_NOT_FOUND;
@@ -758,11 +1022,14 @@ ve_open(const char* name, uint32 flags, void** _cookie)
 		return B_NO_MEMORY;
 	mutex_init(&client->lock, "sunxi_ve client");
 	client->busy = 0;
+	client->poolFull = false;
 	for (uint32 i = 0; i < SUNXI_VE_MAX_BUFFERS; i++) {
 		client->buffers[i].area = -1;
 		client->buffers[i].address = NULL;
 		client->buffers[i].physical = 0;
 		client->buffers[i].size = 0;
+		client->buffers[i].poolPage = 0;
+		client->buffers[i].poolPages = 0;
 	}
 
 	MutexLocker locker(sOpenLock);
@@ -820,6 +1087,14 @@ ve_free(void* cookie)
 	if (--sOpenCount == 0) {
 		MutexLocker engineLocker(sEngineLock);
 		power_down();
+		engineLocker.Unlock();
+
+		MutexLocker poolLocker(sPoolLock);
+		if (sPoolArea >= 0) {
+			dprintf("sunxi_ve: closed; pool %" B_PRIu32 " of %" B_PRIu32
+				" pages used, at most %" B_PRIu32 "\n", sPoolUsed, sPoolPages,
+				sPoolPeak);
+		}
 	}
 	return B_OK;
 }
@@ -926,7 +1201,7 @@ ve_control(void* cookie, uint32 op, void* buffer, size_t length)
 
 
 static status_t
-ve_read_hook(void* cookie, off_t position, void* buffer, size_t* _length)
+ve_read(void* cookie, off_t position, void* buffer, size_t* _length)
 {
 	*_length = 0;
 	return B_NOT_ALLOWED;
@@ -934,50 +1209,63 @@ ve_read_hook(void* cookie, off_t position, void* buffer, size_t* _length)
 
 
 static status_t
-ve_write_hook(void* cookie, off_t position, const void* buffer,
-	size_t* _length)
+ve_write(void* cookie, off_t position, const void* buffer, size_t* _length)
 {
 	*_length = 0;
 	return B_NOT_ALLOWED;
 }
 
 
-static device_hooks sHooks = {
-	ve_open,
-	ve_close,
-	ve_free,
-	ve_control,
-	ve_read_hook,
-	ve_write_hook
-};
+//	#pragma mark - driver
 
 
-status_t
-init_hardware()
+static float
+ve_supports_device(device_node* parent)
 {
-	return B_OK;
+	const char* bus;
+	if (sDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
+			!= B_OK || strcmp(bus, "fdt") != 0) {
+		return 0.0f;
+	}
+	const char* compatible;
+	if (sDeviceManager->get_attr_string(parent, "fdt/compatible", &compatible,
+			false) != B_OK
+		|| strcmp(compatible, "allwinner,sun60i-a733-video-engine") != 0) {
+		return 0.0f;
+	}
+	return 1.0f;
 }
 
 
-status_t
-init_driver()
+static status_t
+ve_register_device(device_node* parent)
 {
-	status_t status = get_module(B_DEVICE_MANAGER_MODULE_NAME,
-		(module_info**)&sDeviceManager);
-	if (status != B_OK)
-		return status;
+	// kept loaded: the pool is taken while the memory is not fragmented
+	device_attr attrs[] = {
+		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
+			{ .string = "Allwinner A733 video decoder" } },
+		{ B_DEVICE_FLAGS, B_UINT32_TYPE, { .ui32 = B_KEEP_DRIVER_LOADED } },
+		{}
+	};
+	return sDeviceManager->register_node(parent, DRIVER_MODULE_NAME, attrs,
+		NULL, NULL);
+}
 
+
+static status_t
+ve_init_driver(device_node* node, void** _cookie)
+{
 	size_t size;
-	status = find_engine(&sVePhysical, &size, &sInterrupt);
+	status_t status = find_engine(node, &sVePhysical, &size, &sInterrupt);
 	if (status != B_OK) {
-		// another board: the device is there and cannot be opened
-		dprintf("sunxi_ve: no video engine in the device tree\n");
-		return B_OK;
+		ERROR("no registers or interrupt in the device tree: %s\n",
+			strerror(status));
+		return status;
 	}
 	if (size < SUNXI_VE_REGISTER_WINDOW) {
 		ERROR("register window of %#" B_PRIxSIZE " bytes is too small\n",
 			size);
-		return B_OK;
+		return B_BAD_DATA;
 	}
 	read_settings();
 
@@ -992,55 +1280,108 @@ init_driver()
 		|| map_block(sVe, "sunxi_ve registers", sVePhysical,
 			SUNXI_VE_REGISTER_WINDOW) != B_OK) {
 		ERROR("no memory for the device\n");
-		unmap_block(sVe);
-		return B_OK;
+		unmap_blocks();
+		return B_NO_MEMORY;
 	}
 
 	status = install_io_interrupt_handler(sInterrupt, ve_interrupt, NULL, 0);
 	if (status != B_OK) {
 		ERROR("interrupt %" B_PRIu32 ": %s\n", sInterrupt, strerror(status));
-		unmap_block(sVe);
-		return B_OK;
+		unmap_blocks();
+		return status;
 	}
 	sInterruptInstalled = true;
 
 	dprintf("sunxi_ve: decoder at %#" B_PRIxPHYSADDR ", interrupt %" B_PRIu32
 		", bus address offset %#" B_PRIx32 "\n", sVePhysical, sInterrupt,
 		sAddressOffset);
+
+	status = pool_init();
+	if (status != B_OK) {
+		ERROR("no pool of %" B_PRIu32 " MiB: %s; every buffer gets memory of "
+			"its own\n", sPoolSize, strerror(status));
+	} else if (sPoolArea >= 0) {
+		dprintf("sunxi_ve: a pool of %" B_PRIu32 " MiB at %#" B_PRIxPHYSADDR
+			"\n", sPoolSize, sPoolPhysical);
+	}
+
+	*_cookie = node;
 	return B_OK;
 }
 
 
-void
-uninit_driver()
+static void
+ve_uninit_driver(void* cookie)
 {
 	if (sInterruptInstalled)
 		remove_io_interrupt_handler(sInterrupt, ve_interrupt, NULL);
 	sInterruptInstalled = false;
-	unmap_block(sVe);
-	unmap_block(sSystem);
-	unmap_block(sIommu);
-	unmap_block(sPpu);
-	unmap_block(sRCcu);
-	unmap_block(sCcu);
-	if (sDoneSem >= 0)
-		delete_sem(sDoneSem);
-	sDoneSem = -1;
-	put_module(B_DEVICE_MANAGER_MODULE_NAME);
+	pool_uninit();
+	unmap_blocks();
 }
 
 
-const char**
-publish_devices()
+static status_t
+ve_register_child_devices(void* cookie)
 {
-	// nothing on boards without the engine (the arm64 packages are shared)
-	static const char* sNone[] = { NULL };
-	return sVe.address != NULL ? sDeviceNames : sNone;
+	return sDeviceManager->publish_device((device_node*)cookie,
+		"misc/sunxi_ve", DEVICE_MODULE_NAME);
 }
 
 
-device_hooks*
-find_device(const char* name)
+static status_t
+ve_init_device(void* driverCookie, void** _deviceCookie)
 {
-	return &sHooks;
+	*_deviceCookie = driverCookie;
+	return B_OK;
 }
+
+
+module_dependency module_dependencies[] = {
+	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&sDeviceManager },
+	{}
+};
+
+
+static device_module_info sVeDevice = {
+	{
+		DEVICE_MODULE_NAME,
+		0,
+		NULL
+	},
+	ve_init_device,
+	NULL,	// uninit
+	NULL,	// removed
+	ve_open,
+	ve_close,
+	ve_free,
+	ve_read,
+	ve_write,
+	NULL,	// io
+	ve_control,
+	NULL,	// select
+	NULL	// deselect
+};
+
+
+static driver_module_info sVeDriver = {
+	{
+		DRIVER_MODULE_NAME,
+		0,
+		NULL
+	},
+	ve_supports_device,
+	ve_register_device,
+	ve_init_driver,
+	ve_uninit_driver,
+	ve_register_child_devices,
+	NULL,	// rescan
+	NULL,	// removed
+};
+
+
+module_info* modules[] = {
+	(module_info*)&sVeDriver,
+	(module_info*)&sVeDevice,
+	NULL
+};

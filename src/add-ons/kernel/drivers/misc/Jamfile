@@ -40,8 +40,9 @@ if $(TARGET_ARCH) = arm64 {
 		rpi_gpio.cpp
 		;
 
-	# the Allwinner A733's video decoder for the sunxi_cedar media add-on
-	KernelAddon <driver>sunxi_ve :
+	# the Allwinner A733's video decoder for the sunxi_cedar media add-on (a
+	# device manager driver: it attaches to its device tree node at boot)
+	KernelAddon sunxi_ve :
 		sunxi_ve.cpp
 		;
 }
