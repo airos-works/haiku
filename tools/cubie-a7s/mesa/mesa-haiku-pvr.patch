@@ -272,6 +272,13 @@ it).
                                     not 12: Mesa's state tracker wants 12
                                     uniform blocks besides the default one or
                                     offers no UBOs (no ES 3.0 / GL 3.1)
+  pvr_formats.c                     a format without a PBE accumulation
+                                    format (VK_FORMAT_UNDEFINED, a
+                                    sampling-only one) on a render target
+                                    path is logged once and sized by its own
+                                    block size instead of aborting the
+                                    application (Summit's WebProcess died in
+                                    the WebGL 2 conformance uniforms tests)
 
 Not changed: the heap size (util/os_misc.c: sysconf(_SC_PHYS_PAGES), which
 Haiku's libroot answers from get_system_info()); the conformance gate
@@ -5094,6 +5101,46 @@ diff -ruN a/src/imagination/vulkan/pvr_device.h b/src/imagination/vulkan/pvr_dev
  VK_DEFINE_NONDISP_HANDLE_CASTS(pvr_device_memory,
                                 vk.base,
                                 VkDeviceMemory,
+diff -ruN a/src/imagination/vulkan/pvr_formats.c b/src/imagination/vulkan/pvr_formats.c
+--- a/src/imagination/vulkan/pvr_formats.c
++++ b/src/imagination/vulkan/pvr_formats.c
+@@ -43,6 +43,7 @@
+ #include "util/bitscan.h"
+ #include "util/compiler.h"
+ #include "util/format/format_utils.h"
++#include "util/format/u_format.h"
+ #include "util/format/u_formats.h"
+ #include "util/half_float.h"
+ #include "util/log.h"
+@@ -89,8 +90,26 @@
+       assert(nr_components == 4);
+       return 4;
+ 
+-   default:
+-      UNREACHABLE("Unknown pbe accum format. Implementation error");
++   default: {
++      /* (air/OS) A format the PBE table has no accumulation format for
++       * (VK_FORMAT_UNDEFINED, or one the device supports for sampling only)
++       * reached a render target path: say so once, and take the format's
++       * own size rather than aborting the application (Summit's WebProcess
++       * died this way under the WebGL 2 conformance tests).
++       */
++      static bool warned;
++      if (!warned) {
++         warned = true;
++         mesa_logw("pvr: no PBE accumulation format for VkFormat %u (%s)",
++                   vk_format,
++                   vk_format_to_pipe_format(vk_format) != PIPE_FORMAT_NONE
++                      ? util_format_short_name(
++                           vk_format_to_pipe_format(vk_format))
++                      : "undefined");
++      }
++      return vk_format == VK_FORMAT_UNDEFINED ? 0
++                                              : vk_format_get_blocksize(vk_format);
++   }
+    }
+ }
+ 
 diff -ruN a/src/imagination/vulkan/pvr_host_cache.h b/src/imagination/vulkan/pvr_host_cache.h
 --- a/src/imagination/vulkan/pvr_host_cache.h
 +++ b/src/imagination/vulkan/pvr_host_cache.h
