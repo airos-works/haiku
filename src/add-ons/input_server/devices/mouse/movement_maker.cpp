@@ -340,11 +340,15 @@ TouchpadMovement::EventToMovement(const touchpad_movement* _event, mouse_movemen
 
 	// Where several fingers are is the point between them, which jumps when
 	// one of them comes or goes (lifting two fingers after scrolling ends in
-	// a frame with one): that is not a movement.
+	// a frame with one): that is not a movement. Nor is the finger left of
+	// several the start of a tap.
 	uint32 fingers = count_set_bits(event->fingers);
 	if (fingers != fFingers) {
-		if (fingers != 0 && fFingers != 0)
+		if (fingers != 0 && fFingers != 0) {
 			StartNewMovment();
+			if (fingers < fFingers)
+				fMovementStarted = true;
+		}
 		fFingers = fingers;
 	}
 
