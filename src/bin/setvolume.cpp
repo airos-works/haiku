@@ -8,6 +8,8 @@
 #include <MediaRoster.h>
 #include <ParameterWeb.h>
 
+#include <OnScreenDisplay.h>
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -29,6 +31,33 @@ handleMute(BParameter *muteParameter, int mute = 2, bool toggle = false) {
 	if (muted != mute && mute < 2)
 		muteParameter->SetValue(&mute, sizeof(int32), system_time());
 	return muted;
+}
+
+
+// shows the volume on screen, as the volume keys change it
+static void
+showVolume(BContinuousParameter *gain, BParameter *muteParameter)
+{
+	float volume;
+	bigtime_t when;
+	size_t size = sizeof(volume);
+	if (gain->GetValue(&volume, &size, &when) != B_OK)
+		return;
+
+	int32 muted = 0;
+	size = sizeof(muted);
+	if (muteParameter != NULL)
+		muteParameter->GetValue(&muted, &size, &when);
+
+	float range = gain->MaxValue() - gain->MinValue();
+
+	BMessage message(kMsgShowLevel);
+	message.AddInt32("kind", B_OSD_VOLUME);
+	message.AddFloat("level",
+		range > 0 ? (volume - gain->MinValue()) / range : 0);
+	message.AddBool("muted", muted != 0);
+	message.AddFloat("gain", volume);
+	show_osd_level(message);
 }
 
 
@@ -84,19 +113,24 @@ main(int argc, char **argv)
 	}
 
 	float volume = 0.0;
+	bool stepped = false;
 
 	if (argc > 1) {
 		if (strcmp(argv[1], "-m") == 0 || strcmp(argv[1], "--mute") == 0) {
 			handleMute(mute, 1);
+			showVolume(gain, mute);
 			printf("Muted\n");
 			return 0;
 		} else if (strcmp(argv[1], "-u") == 0 || strcmp(argv[1], "--unmute") == 0) {
 			handleMute(mute, 0);
+			showVolume(gain, mute);
 			printf("Unmuted\n");
 			return 0;
 		} else if (strcmp(argv[1], "-t") == 0 || strcmp(argv[1], "--togglemute") == 0) {
 			int32 muted = handleMute(mute, 0, true);
-			printf("%s\n", muted ? "Muted" : "Unmuted");
+			showVolume(gain, mute);
+			printf("%s\n", muted ? "Unmuted" : "Muted");
+				// handleMute() returns the state before the toggle
 			return 0;
 		} else {
 			if (strcmp(argv[1], "-i") == 0 || strcmp(argv[1], "-d") == 0
@@ -104,6 +138,7 @@ main(int argc, char **argv)
 				bigtime_t when;
 				size_t size = sizeof(volume);
 				gain->GetValue(&volume, &size, &when);
+				stepped = true;
 				size_t step = 3;
 				if (argc > 2)
 					step = atoi(argv[2]);
@@ -132,7 +167,8 @@ main(int argc, char **argv)
 						"  -t  --togglemute\ttoggles muting\n"
 						"  -i  --increase x\tincreases volume by x dB\n"
 						"  -d  --decrease x\tdecreases volume by x dB\n"
-						"\t\t\tx defaults to 3 if not supplied\n" ,
+						"\t\t\tx defaults to 3 if not supplied\n"
+						"The options show the new volume on screen, too.\n",
 						sProgramName);
 					exit(1);
 				}
@@ -145,6 +181,8 @@ main(int argc, char **argv)
 				volume = gain->MinValue();
 
 			gain->SetValue(&volume, sizeof(volume), system_time());
+			if (stepped)
+				showVolume(gain, mute);
 		}
 	}
 	bigtime_t when;

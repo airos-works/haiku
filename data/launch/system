@@ -68,6 +68,12 @@ service x-vnd.Haiku-notification_server {
 	on_demand
 }
 
+service x-vnd.Haiku-osd_server {
+	launch /system/servers/osd_server
+	no_safemode
+	on_demand
+}
+
 service x-vnd.Haiku-power_daemon {
 	launch /system/servers/power_daemon
 	no_safemode
