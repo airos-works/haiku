@@ -144,6 +144,7 @@ status_t apply_layout(Layout& layout, bool testOnly);
 status_t create_mode_list(void);
 void mode_to_timing(const drm_mode_modeinfo& mode, display_timing& timing);
 void timing_to_mode(const display_timing& timing, drm_mode_modeinfo& mode);
+int32 find_output_mode(const Output& output, const display_timing& timing);
 Output* primary_output(void);
 void update_cursor(void);
 

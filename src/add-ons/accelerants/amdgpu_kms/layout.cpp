@@ -102,18 +102,7 @@ output_timing(const Output& output, const display_timing& timing)
 {
 	if (timing.h_display == 0)
 		return output.modes[output.preferred >= 0 ? output.preferred : 0];
-	int32 best = -1;
-	for (uint32 m = 0; m < output.modeCount; m++) {
-		const drm_mode_modeinfo& candidate = output.modes[m];
-		if (candidate.hdisplay != timing.h_display
-			|| candidate.vdisplay != timing.v_display
-			|| (candidate.flags & DRM_MODE_FLAG_INTERLACE) != 0)
-			continue;
-		if (best < 0 || abs((int32)candidate.clock - (int32)timing.pixel_clock)
-				< abs((int32)output.modes[best].clock
-					- (int32)timing.pixel_clock))
-			best = m;
-	}
+	int32 best = find_output_mode(output, timing);
 	if (best >= 0)
 		return output.modes[best];
 	drm_mode_modeinfo mode;
