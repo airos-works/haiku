@@ -812,8 +812,13 @@ amdgpu_set_dpms_mode(uint32 dpmsMode)
 		DRM_MODE_ATOMIC_ALLOW_MODESET);
 	if (status == B_OK) {
 		gInfo->dpmsMode = dpmsMode;
-		if (active)
+		if (active) {
+			// Set the cursor again, not only move it: one shown while the
+			// display was off (the screen saver quits on input before the
+			// display is switched on) was set to nothing then.
+			gInfo->cursorSet = false;
 			update_cursor();
+		}
 	}
 	if (status == B_OK && active && gInfo->changedAsleep) {
 		// Only a monitor that is really gone, or new, changes the layout;
