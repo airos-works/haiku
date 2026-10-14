@@ -75,7 +75,7 @@ if $(CUBIE_LAB_IMAGE) = 1 {
 # MANIFEST names the patches and every file's hash. The lab's work in
 # progress goes in with -sCUBIE_MESA_DIR=/mnt/HaikuWork/cubie/mesa/out (or
 # CUBIE_MESA_DIR set before including this file).
-CUBIE_MESA_RELEASE ?= 9d08434f42 ;
+CUBIE_MESA_RELEASE ?= b1d1d42edf ;
 CUBIE_MESA_DIR ?= /mnt/HaikuWork/cubie/mesa/release/$(CUBIE_MESA_RELEASE) ;
 
 rule UserBuildConfigRulePreImage
