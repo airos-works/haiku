@@ -1234,6 +1234,11 @@ DisplayPipe::Discover(bool flipped, uint8* edid, uint32* _edidLength,
 	if (!fInitialized)
 		return B_NO_INIT;
 	fFlipped = flipped;
+	// The AUX channel arrives through the connector's SBU pins, which a
+	// flipped plug swaps: the PHY's connection direction has to be right
+	// before the sink is spoken to, not only when the main link is
+	// configured (_PhyConfigure()).
+	_Update(kPhyLink + LINK_CTRL0, 1u << 12, fFlipped ? 1u << 12 : 0);
 
 	status_t status = _DpcdRead(0, fDpcd, sizeof(fDpcd));
 	if (status == B_OK && (fDpcd[0] == 0 || fDpcd[1] == 0))
