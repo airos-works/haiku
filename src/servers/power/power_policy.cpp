@@ -1,0 +1,278 @@
+/*
+ * Copyright 2026, Haiku, Inc. All rights reserved.
+ * Distributed under the terms of the MIT License.
+ */
+
+
+#include "power_policy.h"
+
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <Autolock.h>
+#include <driver_settings.h>
+#include <FindDirectory.h>
+#include <Path.h>
+#include <scheduler.h>
+#include <Screen.h>
+#include <Server.h>
+
+#if defined(__i386__) || defined(__x86_64__)
+#	include <arch/x86/arch_suspend.h>
+
+extern "C" status_t _kern_generic_syscall(const char* subsystem,
+	uint32 function, void* buffer, size_t bufferSize);
+#endif
+
+
+static const char* kSettingsName = "system/power";
+
+
+PowerPolicy::PowerPolicy(BServer* server)
+	:
+	fServer(server),
+	fLock("power policy"),
+	fOnAC(true),
+	fKnowSource(false),
+	fLidClosed(false),
+	fKnowLid(false),
+	fPowerSavingOnAC(false),
+	fPowerSavingOnBattery(true),
+	fBatteryBrightness(70),
+	fLidAction(kLidSleep),
+	fSleepCheck(300),
+	fACBrightness(-1),
+	fWokeUp(0)
+{
+	LoadSettings();
+}
+
+
+/*static*/ const char*
+PowerPolicy::SettingsPath()
+{
+	static char path[B_PATH_NAME_LENGTH];
+	BPath settings;
+	if (find_directory(B_USER_SETTINGS_DIRECTORY, &settings) != B_OK)
+		return NULL;
+	settings.Append(kSettingsName);
+	strlcpy(path, settings.Path(), sizeof(path));
+	return path;
+}
+
+
+/*!	The settings file has lines like "power_saving_on_battery true",
+	"battery_brightness 70", "lid_closed sleep" (or "display_off",
+	"nothing") and "sleep_check_seconds 300". A changed file applies to the
+	current power source at once.
+*/
+void
+PowerPolicy::LoadSettings()
+{
+	BAutolock _(fLock);
+
+	const char* path = SettingsPath();
+	void* handle = path != NULL ? load_driver_settings(path) : NULL;
+	if (handle != NULL) {
+		fPowerSavingOnAC = get_driver_boolean_parameter(handle,
+			"power_saving_on_ac", false, true);
+		fPowerSavingOnBattery = get_driver_boolean_parameter(handle,
+			"power_saving_on_battery", true, true);
+
+		const char* value = get_driver_parameter(handle, "battery_brightness",
+			NULL, NULL);
+		if (value != NULL)
+			fBatteryBrightness = atoi(value);
+
+		value = get_driver_parameter(handle, "lid_closed", NULL, NULL);
+		if (value != NULL) {
+			if (strcmp(value, "nothing") == 0)
+				fLidAction = kLidNothing;
+			else if (strcmp(value, "display_off") == 0)
+				fLidAction = kLidDisplayOff;
+			else
+				fLidAction = kLidSleep;
+		}
+
+		value = get_driver_parameter(handle, "sleep_check_seconds", NULL,
+			NULL);
+		if (value != NULL)
+			fSleepCheck = atoi(value);
+		unload_driver_settings(handle);
+	}
+
+	if (fKnowSource)
+		_ApplyProfile();
+}
+
+
+void
+PowerPolicy::SetOnAC(bool onAC)
+{
+	BAutolock _(fLock);
+
+	bool changed = !fKnowSource || onAC != fOnAC;
+	bool firstTime = !fKnowSource;
+	fOnAC = onAC;
+	fKnowSource = true;
+	if (!changed)
+		return;
+
+	printf("power_daemon: on %s\n", onAC ? "AC" : "battery");
+	_ApplyProfile();
+
+	// The display is dimmed on battery, and gets its brightness back when
+	// the machine is plugged in again. (Not at start-up: app_server is not
+	// there yet, and the brightness is what the user left it at.)
+	if (firstTime || fBatteryBrightness <= 0 || !_InitGUI())
+		return;
+
+	BScreen screen;
+	float brightness;
+	if (screen.GetBrightness(&brightness) != B_OK)
+		return;
+
+	if (!onAC) {
+		fACBrightness = brightness;
+		float limit = fBatteryBrightness / 100.f;
+		if (brightness > limit)
+			screen.SetBrightness(limit);
+	} else if (fACBrightness >= 0) {
+		screen.SetBrightness(fACBrightness);
+		fACBrightness = -1;
+	}
+}
+
+
+void
+PowerPolicy::SetLidOpen(bool open)
+{
+	lid_action action;
+	{
+		BAutolock _(fLock);
+		bool firstTime = !fKnowLid;
+		fKnowLid = true;
+		if (open == !fLidClosed)
+			return;
+		fLidClosed = !open;
+		action = fLidAction;
+
+		// Only closing it does something: a machine that starts with its
+		// lid closed (on an external display) stays awake.
+		if (firstTime) {
+			printf("power_daemon: lid closed at start\n");
+			return;
+		}
+	}
+	printf("power_daemon: lid %s\n", open ? "opened" : "closed");
+
+	if (action == kLidNothing || !_InitGUI())
+		return;
+
+	BScreen screen;
+	if (open) {
+		screen.SetDPMS(B_DPMS_ON);
+		return;
+	}
+
+	screen.SetDPMS(B_DPMS_OFF);
+	if (action != kLidSleep)
+		return;
+
+	// The embedded controller wakes the machine for other things than the
+	// lid, too (the battery, the power button): sleep again until it is
+	// opened.
+	while (_Sleep()) {
+		if (_WaitForLidOpen(3000000)) {
+			BAutolock _(fLock);
+			fLidClosed = false;
+			screen.SetDPMS(B_DPMS_ON);
+			printf("power_daemon: lid opened\n");
+			return;
+		}
+	}
+}
+
+
+bool
+PowerPolicy::JustWokeUp()
+{
+	BAutolock _(fLock);
+	return fWokeUp != 0 && system_time() - fWokeUp < 3000000;
+}
+
+
+void
+PowerPolicy::_ApplyProfile()
+{
+	bool powerSaving = fOnAC ? fPowerSavingOnAC : fPowerSavingOnBattery;
+	int32 mode = powerSaving
+		? SCHEDULER_MODE_POWER_SAVING : SCHEDULER_MODE_LOW_LATENCY;
+	if (get_scheduler_mode() != mode)
+		set_scheduler_mode(mode);
+}
+
+
+bool
+PowerPolicy::_InitGUI()
+{
+	return fServer->InitGUIContext() == B_OK;
+}
+
+
+/*!	Puts the machine to sleep until something wakes it (suspend to idle),
+	where the platform supports it.
+*/
+bool
+PowerPolicy::_Sleep()
+{
+#if defined(__i386__) || defined(__x86_64__)
+	x86_suspend_s2idle_args args = {};
+	args.flags = X86_SUSPEND_SKIP_DEVICES;
+	{
+		BAutolock _(fLock);
+		if (fSleepCheck > 0)
+			args.timeout_ms = fSleepCheck * 1000;
+	}
+	status_t status = _kern_generic_syscall(X86_SUSPEND_SYSCALLS,
+		X86_SUSPEND_ENTER_S2IDLE, &args, sizeof(args));
+	if (status != B_OK) {
+		printf("power_daemon: cannot sleep: %s\n", strerror(status));
+		return false;
+	}
+
+	BAutolock _(fLock);
+	fWokeUp = system_time();
+	printf("power_daemon: woke up after %" B_PRIu64 " s, S0i3 %s\n",
+		args.slept_us / 1000000, args.s0i3_entered ? "entered" : "not entered");
+	return true;
+#else
+	return false;
+#endif
+}
+
+
+/*!	Waits until the lid reports itself open (its notification follows the
+	wake-up). */
+bool
+PowerPolicy::_WaitForLidOpen(bigtime_t timeout)
+{
+	int fd = open("/dev/power/acpi_lid/0", O_RDONLY);
+	if (fd < 0)
+		return true;
+
+	bigtime_t end = system_time() + timeout;
+	bool lidOpen = false;
+	while (!lidOpen && system_time() < end) {
+		uint8 status;
+		if (read(fd, &status, 1) == 1 && status != 0)
+			lidOpen = true;
+		else
+			snooze(100000);
+	}
+	close(fd);
+	return lidOpen;
+}

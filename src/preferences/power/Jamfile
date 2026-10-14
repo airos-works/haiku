@@ -1,0 +1,8 @@
+SubDir HAIKU_TOP src preferences power ;
+
+Application Power : Power.cpp
+	: be localestub [ TargetLibstdc++ ]
+	: Power.rdef
+;
+
+DoCatalogs Power : x-vnd.Haiku-Power : Power.cpp ;

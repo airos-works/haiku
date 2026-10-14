@@ -1,0 +1,212 @@
+/* Copyright 2026 air/OS contributors. Distributed under the MIT License. */
+#include <Application.h>
+#include <Box.h>
+#include <Catalog.h>
+#include <CheckBox.h>
+#include <File.h>
+#include <Directory.h>
+#include <FindDirectory.h>
+#include <LayoutBuilder.h>
+#include <MenuField.h>
+#include <MenuItem.h>
+#include <Path.h>
+#include <PopUpMenu.h>
+#include <Slider.h>
+#include <String.h>
+#include <StringView.h>
+#include <Window.h>
+
+#include <driver_settings.h>
+#include <stdlib.h>
+#include <string.h>
+
+#undef B_TRANSLATION_CONTEXT
+#define B_TRANSLATION_CONTEXT "PowerWindow"
+
+// What the power daemon reads (src/servers/power/power_policy.cpp).
+static const char* kSettingsName = "system/power";
+
+static const uint32 kChanged = 'pchg';
+
+static const char* kLidActions[] = { "sleep", "display_off", "nothing" };
+
+
+class PowerWindow : public BWindow {
+public:
+	PowerWindow()
+		:
+		BWindow(BRect(0, 0, 400, 300), B_TRANSLATE_SYSTEM_NAME("Power"),
+			B_TITLED_WINDOW, B_NOT_RESIZABLE | B_NOT_ZOOMABLE
+				| B_AUTO_UPDATE_SIZE_LIMITS | B_QUIT_ON_WINDOW_CLOSE)
+	{
+		fBatterySaving = new BCheckBox("battery saving",
+			B_TRANSLATE("Save power: slower, but the battery lasts longer"),
+			new BMessage(kChanged));
+		fBatteryBrightness = new BSlider("battery brightness",
+			B_TRANSLATE("Display brightness at most:"), new BMessage(kChanged),
+			10, 100, B_HORIZONTAL);
+		fBatteryBrightness->SetModificationMessage(new BMessage(kChanged));
+		fBatteryBrightness->SetLimitLabels("10%", "100%");
+		fBatteryBrightness->SetHashMarks(B_HASH_MARKS_BOTTOM);
+		fBatteryBrightness->SetHashMarkCount(10);
+		fDimOnBattery = new BCheckBox("dim on battery",
+			B_TRANSLATE("Dim the display when unplugged"), new BMessage(kChanged));
+
+		fACSaving = new BCheckBox("ac saving",
+			B_TRANSLATE("Save power: slower, but quieter and cooler"),
+			new BMessage(kChanged));
+
+		BPopUpMenu* lidMenu = new BPopUpMenu("lid action");
+		lidMenu->AddItem(new BMenuItem(B_TRANSLATE("Sleep"),
+			new BMessage(kChanged)));
+		lidMenu->AddItem(new BMenuItem(B_TRANSLATE("Turn off the display"),
+			new BMessage(kChanged)));
+		lidMenu->AddItem(new BMenuItem(B_TRANSLATE("Do nothing"),
+			new BMessage(kChanged)));
+		fLidAction = new BMenuField("lid action",
+			B_TRANSLATE("When the lid is closed:"), lidMenu);
+
+		BBox* battery = new BBox("battery");
+		battery->SetLabel(B_TRANSLATE("On battery"));
+		BLayoutBuilder::Group<>(battery, B_VERTICAL, B_USE_SMALL_SPACING)
+			.SetInsets(B_USE_DEFAULT_SPACING, B_USE_BIG_SPACING,
+				B_USE_DEFAULT_SPACING, B_USE_DEFAULT_SPACING)
+			.Add(fBatterySaving)
+			.Add(fDimOnBattery)
+			.Add(fBatteryBrightness);
+
+		BBox* ac = new BBox("ac");
+		ac->SetLabel(B_TRANSLATE("Plugged in"));
+		BLayoutBuilder::Group<>(ac, B_VERTICAL, B_USE_SMALL_SPACING)
+			.SetInsets(B_USE_DEFAULT_SPACING, B_USE_BIG_SPACING,
+				B_USE_DEFAULT_SPACING, B_USE_DEFAULT_SPACING)
+			.Add(fACSaving);
+
+		BLayoutBuilder::Group<>(this, B_VERTICAL, B_USE_DEFAULT_SPACING)
+			.SetInsets(B_USE_WINDOW_INSETS)
+			.Add(battery)
+			.Add(ac)
+			.Add(fLidAction);
+
+		_Load();
+		CenterOnScreen();
+	}
+
+	virtual void MessageReceived(BMessage* message)
+	{
+		if (message->what == kChanged) {
+			fBatteryBrightness->SetEnabled(
+				fDimOnBattery->Value() == B_CONTROL_ON);
+			// (the slider sends one while it is dragged; the daemon only
+			// reads the file when the power source changes)
+			_Save();
+		} else
+			BWindow::MessageReceived(message);
+	}
+
+private:
+	static bool _SettingsPath(BPath& path)
+	{
+		if (find_directory(B_USER_SETTINGS_DIRECTORY, &path) != B_OK)
+			return false;
+		return path.Append(kSettingsName) == B_OK;
+	}
+
+	void _Load()
+	{
+		bool batterySaving = true;
+		bool acSaving = false;
+		int32 brightness = 70;
+		const char* lid = "sleep";
+
+		BPath path;
+		void* handle = _SettingsPath(path)
+			? load_driver_settings(path.Path()) : NULL;
+		if (handle != NULL) {
+			batterySaving = get_driver_boolean_parameter(handle,
+				"power_saving_on_battery", true, true);
+			acSaving = get_driver_boolean_parameter(handle,
+				"power_saving_on_ac", false, true);
+			const char* value = get_driver_parameter(handle,
+				"battery_brightness", NULL, NULL);
+			if (value != NULL)
+				brightness = atoi(value);
+			value = get_driver_parameter(handle, "lid_closed", NULL, NULL);
+			if (value != NULL)
+				lid = value;
+		}
+
+		fBatterySaving->SetValue(batterySaving);
+		fACSaving->SetValue(acSaving);
+		fDimOnBattery->SetValue(brightness > 0);
+		fBatteryBrightness->SetValue(brightness > 0 ? brightness : 70);
+		fBatteryBrightness->SetEnabled(brightness > 0);
+		int32 index = 0;
+		for (int32 i = 0; i < (int32)B_COUNT_OF(kLidActions); i++) {
+			if (strcmp(lid, kLidActions[i]) == 0)
+				index = i;
+		}
+		BMenuItem* item = fLidAction->Menu()->ItemAt(index);
+		if (item != NULL)
+			item->SetMarked(true);
+
+		if (handle != NULL)
+			unload_driver_settings(handle);
+	}
+
+	void _Save()
+	{
+		BPath path;
+		if (!_SettingsPath(path))
+			return;
+		BPath parent;
+		if (path.GetParent(&parent) == B_OK)
+			create_directory(parent.Path(), 0755);
+
+		int32 lid = fLidAction->Menu()->IndexOf(
+			fLidAction->Menu()->FindMarked());
+		if (lid < 0 || lid >= (int32)B_COUNT_OF(kLidActions))
+			lid = 0;
+
+		BString text;
+		text << "# Written by the Power preferences, read by the power daemon\n"
+			<< "power_saving_on_battery "
+			<< (fBatterySaving->Value() == B_CONTROL_ON ? "true" : "false")
+			<< "\nbattery_brightness "
+			<< (fDimOnBattery->Value() == B_CONTROL_ON
+				? fBatteryBrightness->Value() : 0)
+			<< "\npower_saving_on_ac "
+			<< (fACSaving->Value() == B_CONTROL_ON ? "true" : "false")
+			<< "\nlid_closed " << kLidActions[lid] << "\n";
+
+		BFile file(path.Path(), B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);
+		if (file.InitCheck() == B_OK)
+			file.Write(text.String(), text.Length());
+	}
+
+	BCheckBox* fBatterySaving;
+	BCheckBox* fDimOnBattery;
+	BSlider* fBatteryBrightness;
+	BCheckBox* fACSaving;
+	BMenuField* fLidAction;
+};
+
+
+class PowerApplication : public BApplication {
+public:
+	PowerApplication() : BApplication("application/x-vnd.Haiku-Power") {}
+
+	virtual void ReadyToRun()
+	{
+		(new PowerWindow)->Show();
+	}
+};
+
+
+int
+main()
+{
+	PowerApplication app;
+	app.Run();
+	return 0;
+}

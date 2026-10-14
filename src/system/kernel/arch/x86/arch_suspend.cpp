@@ -879,6 +879,21 @@ suspend_syscall(const char* subsystem, uint32 function, void* buffer,
 			return user_memcpy(buffer, trace, length + 1);
 		}
 
+		case X86_SUSPEND_ENTER_S2IDLE:
+		{
+			x86_suspend_s2idle_args args = {};
+			if (bufferSize != sizeof(args) || !IS_USER_ADDRESS(buffer)
+				|| user_memcpy(&args, buffer, sizeof(args)) != B_OK) {
+				return B_BAD_ADDRESS;
+			}
+			status_t status = x86_suspend_enter_s2idle(&args);
+			if (status == B_OK
+				&& user_memcpy(buffer, &args, sizeof(args)) != B_OK) {
+				return B_BAD_ADDRESS;
+			}
+			return status;
+		}
+
 		case X86_SUSPEND_ENTER_S3:
 		{
 			x86_suspend_s3_args args = {};

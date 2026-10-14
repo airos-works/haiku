@@ -185,6 +185,7 @@ SYSTEM_PREFERENCES = [ FFilterByBuildFeatures
 	Network
 	WiFi
 	Notifications
+	Power@x86,x86_64
 	Screen
 	Shortcuts
 	Time
