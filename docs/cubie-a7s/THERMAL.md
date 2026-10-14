@@ -101,10 +101,16 @@ same module, so that the two never share the I2C controller at once.
 Every 240 ms the driver reads the zones; the hottest one decides.
 
 - Passive, 80 C (release 76 C): the throttle level goes up a step at most
-  every 2 s while at or above it (two every 480 ms from 84 C, three on every
-  reading from 88 C: with all eight cores at their top speed the SoC warms
-  by 6 C a second), and down a step every 4 s below the release
-  temperature. The levels cap the clusters' top speed,
+  every 2 s while at or above it and the temperature is not falling (two
+  every 480 ms from 84 C, three on every reading from 88 C: with all eight
+  cores at their top speed the SoC warms by 6 C a second); it comes down a
+  step every 4 s below the release temperature, and every 6 s below 79 C
+  while the temperature is not rising ("steady", as Linux's step_wise
+  governor does). The trend is the hottest zone averaged over about a
+  second (a quarter of each reading) against the same 2.16 s before; a
+  quarter of a degree either way is rising or falling. Without the steady
+  steps a level stayed for as long as the load did: between 76 and 80 C
+  nothing took it back. The levels cap the clusters' top speed,
   the big cores first, and step the GPU's and the video engine's clocks
   down:
 
@@ -158,7 +164,9 @@ written to `/dev/power/sunxi_thermal/status`):
     dvfs false                  # no frequency changes (settings file only)
     governor performance        # or powersave, ondemand
     throttle false
-    throttle_devices false      # the GPU and the video engine stay at 600
+    steady_release false        # levels come off only below the release
+                                # temperature (before 2026-10-15)
+    throttle_devices false      # the GPU and the video engine stay at full speed
     throttle_level 3            # at run time only
     passive_temperature 80      # release_, hot_, critical_temperature too
     critical_grace 30           # critical_margin 4: kernel shutdown after
@@ -293,12 +301,33 @@ one thread busy (handoff/: 416/800 <-> 2002/1000 big, 416/800 <->
 1794/950 little, about 29000 changes per cluster), no hang and no error. The cause of the first one is not
 known.
 
+### Steady release (2026-10-15, evidence/thermal/steady)
+
+Before the steady steps, a level reached under a short burst stayed until
+the load ended. Each run below starts at 66 C; "off" is `steady_release
+false`, Summit plays the video:
+
+| load | order | mean level | fps / result |
+|---|---|---|---|
+| YouTube 720p60, 110 s | off, on, on, off | 2.17, 1.93, 1.90, 2.13 | 26.3, 28.7, 34.0, 24.2 fps |
+| one looping 1080p video, 6 min | off, on, on, off | 3.23, 4.04, 5.86, 6.26 | level 8 in runs 2-4 |
+| two looping 1080p videos, 6 min | off, on, on, off | 5.84, 6.14, 6.56, 6.34 | level 8 from minute 3-4 |
+
+With the steady steps the short run comes down 10-11 times and keeps
+more of its frames, at 0.3-1 C more. The six-minute loads keep the SoC
+at 79-80 C, where the steady steps do not act, and the level follows the
+run's place in the sequence rather than the setting: after the first run
+the board no longer cooled to 66 C within 400 s (66.7, 67.9, 69.5 C
+before runs 2-4). The hottest reading in all twelve runs was 81.5 C, in
+a run without the steady steps.
+
 ## Open ends
 
 - The first run's A76 hang (above): not reproduced since the margins.
-- The policy is a step controller with a 76-80 C dead band: the two-video
-  load settles at level 5 when it comes from below and stayed at 8 in a run
-  that overshot (m2c); a power budget per level would do better.
+- The policy is a step controller: the steady steps (2026-10-15) take
+  levels back between 76 and 79 C, but loads that hold the SoC at 80 C
+  still end at level 6-8 after a few minutes once the board has warmed
+  (below); a power budget per level would do better.
 - Not scaled: the DRAM (the BSP's dmcfreq, 400-2400 MHz, needs the
   firmware's retraining), the DSU (stays at 780 MHz), the NPU (off).
 - The cores only wait for interrupts when idle (no PSCI CPU_SUSPEND power

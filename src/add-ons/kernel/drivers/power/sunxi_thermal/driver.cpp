@@ -15,7 +15,9 @@
 	  scheduler's cpufreq hooks, which run with interrupts off);
 	- throttling: above the passive trip the clusters' top speed, the GPU's
 	  and the video engine's clocks come down a step at a time (the big
-	  cores first) and go back up below the release temperature;
+	  cores first) while the temperature is not falling; they go back up
+	  below the release temperature, and below the passive trip too while
+	  the temperature is not rising (as Linux's step_wise governor does);
 	- at the hot trip, everything to the lowest speed and an event for the
 	  power daemon (a notification); at the critical trip an event that has
 	  the power daemon shut the system down through the registrar, and, if
@@ -30,6 +32,8 @@
 		dvfs false				no frequency changes at all
 		governor performance	(or powersave, ondemand)
 		throttle false
+		steady_release false	the speeds go back up only below the
+								release temperature
 		passive_temperature 80	release_temperature 76
 		hot_temperature 90		critical_temperature 96
 		critical_grace 30		seconds before the kernel shuts down itself
@@ -103,6 +107,18 @@ static const bigtime_t kThrottleFastStep = 480000;
 static const bigtime_t kReleaseStep = 4000000;
 static const int32 kFastMargin = 4000;
 static const int32 kRunawayMargin = 8000;
+// Below the passive trip (a degree below it) a level down every 6 s while
+// the temperature holds or falls. Without it a level that the start of a
+// load needed stayed as long as the load did: YouTube in Summit went to
+// level 4 (GPU 300 MHz) within two minutes and stayed there at 76-79 C,
+// never below the release temperature.
+static const bigtime_t kSteadyReleaseStep = 6000000;
+static const int32 kSteadyMargin = 1000;
+// The trend: the hottest zone averaged over about a second (a quarter of
+// each reading), against the same 2.16 s (nine readings) before; more than
+// a quarter of a degree up is rising, down falling.
+static const int32 kTrendReadings = 9;
+static const int32 kTrendMargin = 250;
 
 // The throttle levels: each cluster's top speed (MHz), the big cores first,
 // and the steps of the GPU's and the video engine's clocks (below). With
@@ -189,6 +205,7 @@ static int32 sZoneCount;
 // settings and trips (millidegrees)
 static governor_type sGovernor = GOVERNOR_ONDEMAND;
 static bool sThrottle = true;
+static bool sSteadyRelease = true;
 static int32 sPassive = 80000;
 static int32 sRelease = 76000;
 static int32 sHot = 90000;
@@ -216,6 +233,10 @@ static thread_id sThread = -1;
 static volatile bool sStop;
 static int32 sTemperature;			// the hottest zone
 static int32 sMaxTemperature;
+static int32 sAverage = kNoTemperature;	// of the hottest zone
+static int32 sAverages[kTrendReadings];
+static int32 sAverageIndex;
+static int32 sTrend;				// millidegrees in 2.16 s
 static int32 sLevel;
 static int32 sHotCount;
 static int32 sCriticalCount;
@@ -413,6 +434,8 @@ apply_setting(const char* key, const char* value, bool runtime)
 			return B_BAD_VALUE;
 	} else if (strcmp(key, "throttle") == 0) {
 		sThrottle = parse_boolean(value);
+	} else if (strcmp(key, "steady_release") == 0) {
+		sSteadyRelease = parse_boolean(value);
 	} else if (strcmp(key, "throttle_devices") == 0) {
 		sThrottleDevices = parse_boolean(value);
 	} else if (strcmp(key, "throttle_level") == 0) {
@@ -631,8 +654,9 @@ log_watch()
 		used += snprintf(line + used, sizeof(line) - used, "%s%s",
 			i > 0 ? "," : "", sZones[i].valid ? temperature : "-");
 	}
-	used += snprintf(line + used, sizeof(line) - used, " level=%" B_PRId32,
-		sLevel);
+	format_temperature(temperature, sizeof(temperature), sTrend);
+	used += snprintf(line + used, sizeof(line) - used, " level=%" B_PRId32
+		" trend=%s%s", sLevel, sTrend >= 0 ? "+" : "", temperature);
 	if (sGpuStep >= 0) {
 		used += snprintf(line + used, sizeof(line) - used, " gpu=%" B_PRIu32
 			"MHz ve=%" B_PRIu32 "MHz", kGpuMegahertz[sGpuStep],
@@ -672,6 +696,18 @@ thermal_step(bigtime_t now)
 	}
 	sTemperature = hottest;
 	sMaxTemperature = max_c(sMaxTemperature, hottest);
+
+	if (sAverage == kNoTemperature) {
+		sAverage = hottest;
+		for (int32 i = 0; i < kTrendReadings; i++)
+			sAverages[i] = hottest;
+	} else
+		sAverage += (hottest - sAverage) / 4;
+	sTrend = sAverage - sAverages[sAverageIndex];
+	sAverages[sAverageIndex] = sAverage;
+	sAverageIndex = (sAverageIndex + 1) % kTrendReadings;
+	bool rising = sTrend > kTrendMargin;
+	bool falling = sTrend < -kTrendMargin;
 
 	char temperature[16];
 	format_temperature(temperature, sizeof(temperature), hottest);
@@ -732,12 +768,18 @@ thermal_step(bigtime_t now)
 			&& now - sLastUp >= kThrottleFastStep) {
 			set_level(sLevel + 2, "hot zone");
 			sLastUp = sLastDown = now;
-		} else if (hottest >= sPassive && now - sLastUp >= kThrottleStep) {
+		} else if (hottest >= sPassive && !falling
+			&& now - sLastUp >= kThrottleStep) {
 			set_level(sLevel + 1, "above passive");
 			sLastUp = sLastDown = now;
 		} else if (hottest < sRelease && sLevel > 0 && !sCriticalFired
 			&& now - sLastDown >= kReleaseStep) {
 			set_level(sLevel - 1, "cooled");
+			sLastDown = now;
+		} else if (sSteadyRelease && hottest < sPassive - kSteadyMargin
+			&& !rising && sLevel > 0 && !sCriticalFired
+			&& now - sLastDown >= kSteadyReleaseStep) {
+			set_level(sLevel - 1, "steady");
 			sLastDown = now;
 		}
 	}
@@ -894,13 +936,18 @@ status_text(char* buffer, size_t size)
 	format_temperature(b, sizeof(b), sRelease);
 	format_temperature(c, sizeof(c), sHot);
 	format_temperature(d, sizeof(d), sCritical);
+	char trend[16];
+	format_temperature(trend, sizeof(trend), sTrend);
 	used += snprintf(buffer + used, size - used, "\ntrips: passive %s, "
 		"release %s, hot %s, critical %s C; calibrated %s\n"
-		"throttle %s, level %" B_PRId32 " of %" B_PRId32 "; hot events %"
-		B_PRIu32 ", critical events %" B_PRIu32 ", power daemon %s\n",
+		"throttle %s, level %" B_PRId32 " of %" B_PRId32 " (trend %s%s C, "
+		"steady release %s); hot events %" B_PRIu32 ", critical events %"
+		B_PRIu32 ", power daemon %s\n",
 		a, b, c, d, sThs.Calibrated() ? "yes" : "no",
-		sThrottle ? "on" : "off", sLevel, kLevelCount - 1, sHotEvents,
-		sCriticalEvents, atomic_get(&sTripOpenCount) > 0 ? "listening" : "absent");
+		sThrottle ? "on" : "off", sLevel, kLevelCount - 1,
+		sTrend >= 0 ? "+" : "", trend, sSteadyRelease ? "on" : "off",
+		sHotEvents, sCriticalEvents,
+		atomic_get(&sTripOpenCount) > 0 ? "listening" : "absent");
 	if (sCcu != NULL) {
 		used += snprintf(buffer + used, size - used, "GPU %" B_PRIu32 " MHz "
 			"(clock %#" B_PRIx32 ", %" B_PRIu32 " changes), video engine %"

@@ -206,7 +206,9 @@ if $(TARGET_ARCH) = arm64 {
 		<driver>vchiq
 		<driver>rpi_hevc
 		<driver>rpi_gpio
-		<driver>sunxi_ve
+		;
+	AddNewDriversToPackage misc :
+		sunxi_ve
 		;
 	# the SoC temperature from the firmware, in the thermal drivers' format
 	AddDriversToPackage power :
