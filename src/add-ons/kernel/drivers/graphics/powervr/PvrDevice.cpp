@@ -46,6 +46,7 @@ PvrDevice::PvrDevice(uint64 registerBase, uint64 registerSize,
 	fBvnc(0),
 	fCoreId(0),
 	fCoreClock(0),
+	fCoreMegahertz(800),
 	fDevice(NULL),
 	fDisabled(false),
 	fFirmwareEnabled(false),
@@ -84,6 +85,8 @@ PvrDevice::~PvrDevice()
 									(off by default)
 		vendor_secure_config true	Allwinner's SMC/GPU_GLB writes before the
 									start (see DESIGN R7)
+		core_clock 600				the GPU's clock in MHz: 800 (default) or
+									600
 */
 void
 PvrDevice::_ReadSettings()
@@ -111,6 +114,9 @@ PvrDevice::_ReadSettings()
 	value = get_driver_parameter(handle, "fw_trace_lines", NULL, NULL);
 	if (value != NULL)
 		fOptions.trace_lines = strtoul(value, NULL, 0);
+	value = get_driver_parameter(handle, "core_clock", NULL, NULL);
+	if (value != NULL && strtoul(value, NULL, 0) == 600)
+		fCoreMegahertz = 600;
 	unload_driver_settings(handle);
 
 	TRACE("settings:%s firmware stage %s, firmware trace groups %#" B_PRIx32
@@ -131,7 +137,7 @@ PvrDevice::Init()
 		return B_OK;
 	}
 
-	status_t status = a733_gpu_power_on(&fCoreClock);
+	status_t status = a733_gpu_power_on(fCoreMegahertz, &fCoreClock);
 	if (status != B_OK) {
 		TRACE("the GPU does not power up: %s\n", strerror(status));
 		return status;

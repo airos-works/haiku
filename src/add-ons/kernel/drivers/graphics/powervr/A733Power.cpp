@@ -42,8 +42,10 @@ enum {
 	PPU_DEVICE_REQUESTS	= 0x020,	// PWCR
 	PPU_ON				= 0x8,
 
-	// gate, update, pll-gpu / pll-peri0-600m, / 1
+	// gate, update, pll-gpu / pll-peri0-800m / pll-peri0-600m, / 1
+	// (the mux: pll-gpu, peri0-800m, -600m, -400m, -300m, -200m)
 	GPU_CLOCK_PLL_GPU	= 0x88000000,
+	GPU_CLOCK_800MHZ	= 0x89000000,
 	GPU_CLOCK_600MHZ	= 0x8a000000
 };
 
@@ -232,8 +234,12 @@ enable_gpu_supply()
 }
 
 
+/*!	\a megahertz is 800 or 600: both run at 0.8 V on this chip's speed
+	grade (the BSP's GPU operating points for vf0500: 400, 600 and 800 MHz
+	at 0.8 V, 1008 MHz at 0.88 V).
+*/
 status_t
-a733_gpu_power_on(uint32* _coreClock)
+a733_gpu_power_on(uint32 megahertz, uint32* _coreClock)
 {
 	volatile uint8* ccu;
 	volatile uint8* rccu;
@@ -289,10 +295,13 @@ a733_gpu_power_on(uint32* _coreClock)
 		spin(1);
 
 		status = wait_power_domain(pck, PPU_GPU_CORE);
-		// then the 600 MHz the firmware is told about
-		write32(ccu, CCU_GPU_CLOCK, GPU_CLOCK_600MHZ);
+		// then the clock the firmware is told about (sunxi_thermal lowers
+		// it to the 600-200 MHz taps when it throttles)
+		const bool fast = megahertz != 600;
+		write32(ccu, CCU_GPU_CLOCK,
+			fast ? GPU_CLOCK_800MHZ : GPU_CLOCK_600MHZ);
 		log_state(ccu, rccu, pck, "after");
-		*_coreClock = 600000000;
+		*_coreClock = fast ? 800000000 : 600000000;
 	}
 
 	if (ccuArea >= 0)

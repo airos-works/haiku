@@ -13,9 +13,9 @@ namespace powervr {
 
 
 /*	The Allwinner A733's GPU (BXM-4-64 MC1): power domains, core clock
-	(600 MHz from pll-peri0-600m), bus gate and reset, as Allwinner's BSP
-	does it. The 0.8 V supply (AXP8191 DCDC4) is on from boot. */
-status_t	a733_gpu_power_on(uint32* _coreClock);
+	(800 or 600 MHz, from pll-peri0-800m or -600m), bus gate and reset, as
+	Allwinner's BSP does it. The 0.8 V supply is AXP8191 DCDC4. */
+status_t	a733_gpu_power_on(uint32 megahertz, uint32* _coreClock);
 
 
 }	// namespace powervr
