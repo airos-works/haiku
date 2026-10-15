@@ -724,6 +724,7 @@ struct HWInterface::FlushTarget {
 	int64			flushes;
 	int64			rects;
 	int64			late;
+	int32			lateReports;	// per minute
 	float			worstLate;
 	bigtime_t		longest;
 	bigtime_t		reported;
@@ -933,6 +934,7 @@ HWInterface::_AddFlushTarget(uint32 outputID, const char* name)
 	target.lastBlank = 0;
 	target.period = 16667;
 	target.flushes = target.rects = target.late = 0;
+	target.lateReports = 0;
 	target.worstLate = 0;
 	target.longest = target.reported = 0;
 	target.queued = target.flushed = 0;
@@ -1431,6 +1433,8 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 				behind = true;
 				worst = max_c(worst, (scan - r.top) / rows);
 			}
+			float scanAtStart = scan;
+			bigtime_t copyStart = system_time();
 			BRegion one((BRect)IntRect(r.left, r.top, r.right, r.bottom));
 			_CopyShadowToFront(one, which);
 			scan = _FlushScanRow(target, blank);
@@ -1438,8 +1442,19 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 				behind = true;
 				worst = max_c(worst, (scan - r.bottom - 1) / rows);
 			}
-			if (behind)
+			if (behind) {
 				late++;
+				if (target.lateReports < 3) {
+					target.lateReports++;
+					debug_printf("app_server: vertical blank flush %s: behind "
+						"the scan: rect %" B_PRId32 ",%" B_PRId32 "-%" B_PRId32
+						",%" B_PRId32 ", scan at row %.0f when the copy began "
+						"%.2f ms after the blank, at %.0f when it ended %.2f ms "
+						"after\n", target.name, r.left, r.top, r.right,
+						r.bottom, scanAtStart, (copyStart - blank) / 1000.0,
+						scan, (system_time() - blank) / 1000.0);
+				}
+			}
 		}
 	} else {
 		// bands of equal height from the top; this thread takes the first
@@ -1461,6 +1476,7 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 		}
 		float beganRow = _FlushScanRow(target, blank);
 		_CopyShadowToFront(first, which);
+		bigtime_t ended = system_time();
 		float endedRow = _FlushScanRow(target, blank);
 		for (int32 i = 1; i < bands; i++) {
 			while (acquire_sem(fFlushDoneSem) == B_INTERRUPTED)
@@ -1484,8 +1500,19 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 				behind = true;
 				worst = max_c(worst, (scan - bandFrame.bottom - 1) / rows);
 			}
-			if (behind)
+			if (behind) {
 				late++;
+				if (target.lateReports < 3) {
+					target.lateReports++;
+					debug_printf("app_server: vertical blank flush %s: behind "
+						"the scan: band %" B_PRId32 " rows %" B_PRId32 "-%"
+						B_PRId32 ", scan at row %.0f when its copy began, %.0f "
+						"when it ended %.2f ms after the blank\n", target.name,
+						i, bandFrame.top, bandFrame.bottom,
+						i == 0 ? beganRow : worker->beganRow, scan,
+						((i == 0 ? ended : worker->ended) - blank) / 1000.0);
+				}
+			}
 		}
 	}
 
@@ -1517,6 +1544,7 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 		target.flushes = 0;
 		target.rects = 0;
 		target.late = 0;
+		target.lateReports = 0;
 		target.worstLate = 0;
 		target.longest = 0;
 	}
