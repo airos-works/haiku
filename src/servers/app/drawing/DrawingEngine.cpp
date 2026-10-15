@@ -105,8 +105,7 @@ public:
 		:
 		fEngine(engine),
 		fOverlaysHidden(false),
-		fWaitForRetrace(false),
-		fGate(-1)
+		fWaitForRetrace(false)
 	{
 		fDirty.Set(bounds);
 		fDirty.IntersectWith(fEngine->fPainter->ClippingRegion());
@@ -114,30 +113,26 @@ public:
 			return;
 		fOverlaysHidden
 			= fEngine->fGraphicsCard->HideFloatingOverlays(fDirty.Frame());
-		fGate = fEngine->fGraphicsCard->BeginDrawing(IntRect(fDirty.Frame()));
 	}
 
 	DrawTransaction(DrawingEngine *engine)
 		:
 		fEngine(engine),
 		fOverlaysHidden(false),
-		fWaitForRetrace(false),
-		fGate(-1)
+		fWaitForRetrace(false)
 	{
 		fDirty = *fEngine->fPainter->ClippingRegion();
 		if (fDirty.CountRects() == 0)
 			return;
 		fOverlaysHidden
 			= fEngine->fGraphicsCard->HideFloatingOverlays(fDirty.Frame());
-		fGate = fEngine->fGraphicsCard->BeginDrawing(IntRect(fDirty.Frame()));
 	}
 
 	DrawTransaction(DrawingEngine *engine, const BRegion &region)
 		:
 		fEngine(engine),
 		fOverlaysHidden(false),
-		fWaitForRetrace(false),
-		fGate(-1)
+		fWaitForRetrace(false)
 	{
 		// region is already clipped
 		fDirty = region;
@@ -145,7 +140,6 @@ public:
 			return;
 		fOverlaysHidden
 			= fEngine->fGraphicsCard->HideFloatingOverlays(fDirty.Frame());
-		fGate = fEngine->fGraphicsCard->BeginDrawing(IntRect(fDirty.Frame()));
 	}
 
 	~DrawTransaction()
@@ -156,7 +150,6 @@ public:
 			fEngine->fGraphicsCard->InvalidateRegion(fDirty);
 		} else if (fWaitForRetrace)
 			fEngine->fRetraceRequested = true;
-		fEngine->fGraphicsCard->EndDrawing(fGate);
 		if (fOverlaysHidden)
 			fEngine->fGraphicsCard->ShowFloatingOverlays();
 	}
@@ -177,8 +170,6 @@ public:
 	{
 		fDirty.Set(rect);
 		fDirty.IntersectWith(fEngine->fPainter->ClippingRegion());
-		if (fGate < 0 && fDirty.CountRects() > 0)
-			fGate = fEngine->fGraphicsCard->BeginDrawing(IntRect(fDirty.Frame()));
 	}
 
 	const BRegion &DirtyRegion() const
@@ -195,7 +186,6 @@ private:
 	DrawingEngine *fEngine;
 	bool fOverlaysHidden;
 	bool fWaitForRetrace;
-	int32 fGate;
 	BRegion fDirty;
 };
 
@@ -616,14 +606,6 @@ DrawingEngine::CopyRegion(/*const*/ BRegion* region, int32 xOffset,
 		return false;
 
 	AutoFloatingOverlaysHider _(fGraphicsCard, frame);
-	// the flush keeps off the frame while the pixels move
-	struct Gate {
-		Gate(HWInterface* card, const BRect& frame)
-			: fCard(card), fSlot(card->BeginDrawing(IntRect(frame))) {}
-		~Gate() { fCard->EndDrawing(fSlot); }
-		HWInterface* fCard;
-		int32 fSlot;
-	} gate(fGraphicsCard, frame);
 
 	int32 count = region->CountRects();
 

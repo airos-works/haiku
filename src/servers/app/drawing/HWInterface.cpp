@@ -23,6 +23,7 @@
 #include <vesa/vesa_info.h>
 
 #include "drawing_support.h"
+#include "MallocBuffer.h"
 
 #include "DrawingEngine.h"
 #include "GlobalSubpixelSettings.h"
@@ -74,13 +75,8 @@ HWInterface::HWInterface()
 	fQuitFlush(false),
 	fFlushing(false),
 	fFlushKnobThread(-1),
-	fFlushWanted(false),
-	fGateLock("drawing gate")
+	fFlushWanted(false)
 {
-	for (int32 i = 0; i < 64; i++)
-		fDrawing[i].used = false;
-	for (int32 i = 0; i < 8; i++)
-		fCopying[i] = IntRect(0, 0, -1, -1);
 }
 
 
@@ -555,8 +551,29 @@ HWInterface::CopyBackToFront(const BRect& frame)
 	// make sure we don't copy out of bounds
 	area = bufferClip & area;
 
-	if (fFlushing && _QueueForFlush(area))
-		return B_OK;
+	if (fFlushing) {
+		// what is drawn goes into the shadow now, from which the flush
+		// copies at the blank: a drawing op under way by then does not
+		// get into the frame
+		RenderingBuffer* shadow = fFlushShadow.Get();
+		if (shadow != NULL && shadow->Width() == backBuffer->Width()
+			&& shadow->Height() == backBuffer->Height()) {
+			uint32 srcBPR = backBuffer->BytesPerRow();
+			uint32 dstBPR = shadow->BytesPerRow();
+			uint8* src = (uint8*)backBuffer->Bits() + area.top * srcBPR
+				+ area.left * 4;
+			uint8* dst = (uint8*)shadow->Bits() + area.top * dstBPR
+				+ area.left * 4;
+			size_t bytes = (area.right - area.left + 1) * 4;
+			for (int32 y = area.top; y <= area.bottom; y++) {
+				memcpy(dst, src, bytes);
+				src += srcBPR;
+				dst += dstBPR;
+			}
+		}
+		if (_QueueForFlush(area))
+			return B_OK;
+	}
 
 	return _CopyAreaToFront(area);
 }
@@ -597,6 +614,31 @@ HWInterface::_CopyBackToFront(/*const*/ BRegion& region)
 	for (int32 i = 0; i < count; i++) {
 		clipping_rect r = region.RectAtInt(i);
 		// offset to left top pixel in source buffer (always B_RGBA32)
+		uint8* srcOffset = src + r.top * srcBPR + r.left * 4;
+		_CopyToFront(srcOffset, srcBPR, r.left, r.top, r.right, r.bottom);
+	}
+}
+
+
+/*!	The flush's copy: from the shadow of the back buffer (what was drawn
+	when it was queued), or from the back buffer itself without one. */
+void
+HWInterface::_CopyShadowToFront(BRegion& region)
+{
+	RenderingBuffer* shadow = fFlushShadow.Get();
+	RenderingBuffer* backBuffer = BackBuffer();
+	if (shadow == NULL || backBuffer == NULL
+		|| shadow->Width() != backBuffer->Width()
+		|| shadow->Height() != backBuffer->Height()) {
+		_CopyBackToFront(region);
+		return;
+	}
+
+	uint32 srcBPR = shadow->BytesPerRow();
+	uint8* src = (uint8*)shadow->Bits();
+	int32 count = region.CountRects();
+	for (int32 i = 0; i < count; i++) {
+		clipping_rect r = region.RectAtInt(i);
 		uint8* srcOffset = src + r.top * srcBPR + r.left * 4;
 		_CopyToFront(srcOffset, srcBPR, r.left, r.top, r.right, r.bottom);
 	}
@@ -668,7 +710,6 @@ struct HWInterface::FlushWorker {
 	float			endedRow;
 	FlushTarget*	target;
 	bigtime_t		blank;
-	int32			band;
 };
 
 
@@ -941,6 +982,22 @@ HWInterface::_UpdateFlushTargets()
 	IntRect bufferFrame = backBuffer != NULL
 		? IntRect(backBuffer->Bounds()) : IntRect(0, 0, -1, -1);
 
+	// the shadow, the back buffer's size (the flush then copies from it)
+	if (backBuffer != NULL && (!fFlushShadow.IsSet()
+			|| fFlushShadow->Width() != backBuffer->Width()
+			|| fFlushShadow->Height() != backBuffer->Height())) {
+		fFlushShadow.Unset();
+		MallocBuffer* shadow = new(std::nothrow) MallocBuffer(
+			backBuffer->Width(), backBuffer->Height());
+		if (shadow != NULL && shadow->InitCheck() == B_OK) {
+			// the back buffer as it is, so that nothing stale is copied
+			memcpy(shadow->Bits(), backBuffer->Bits(),
+				min_c(shadow->BitsLength(), backBuffer->BitsLength()));
+			fFlushShadow.SetTo(shadow);
+		} else
+			delete shadow;
+	}
+
 	if (fFlushLock.Lock()) {
 		fFlushTargets[0].frame = bufferFrame;
 		bool perOutput = false;
@@ -1122,10 +1179,7 @@ HWInterface::_FlushWorkerEntry(void* data)
 		worker->began = system_time();
 		worker->beganRow = interface->_FlushScanRow(*worker->target,
 			worker->blank);
-		interface->_BeginCopying(IntRect(worker->region.Frame()),
-			1 + worker->band);
-		interface->_CopyBackToFront(worker->region);
-		interface->_EndCopying(1 + worker->band);
+		interface->_CopyShadowToFront(worker->region);
 		worker->ended = system_time();
 		worker->endedRow = interface->_FlushScanRow(*worker->target,
 			worker->blank);
@@ -1162,7 +1216,6 @@ HWInterface::_StartFlushWorkers(FlushTarget& target)
 		worker.interface = this;
 		worker.target = &target;
 		worker.blank = 0;
-		worker.band = i;
 		worker.start = create_sem(0, "vertical blank flush band");
 		worker.thread = worker.start < 0 ? -1 : spawn_thread(
 			_FlushWorkerEntry, "vertical blank flush band",
@@ -1285,11 +1338,8 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 				behind = true;
 				worst = max_c(worst, (scan - r.top) / rows);
 			}
-			IntRect rect(r.left, r.top, r.right, r.bottom);
-			BRegion one((BRect)rect);
-			_BeginCopying(rect, 0);
-			_CopyBackToFront(one);
-			_EndCopying(0);
+			BRegion one((BRect)IntRect(r.left, r.top, r.right, r.bottom));
+			_CopyShadowToFront(one);
 			scan = _FlushScanRow(target, blank);
 			if (scan > r.bottom + 1) {
 				behind = true;
@@ -1316,9 +1366,7 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 			}
 		}
 		float beganRow = _FlushScanRow(target, blank);
-		_BeginCopying(IntRect(first.Frame()), 0);
-		_CopyBackToFront(first);
-		_EndCopying(0);
+		_CopyShadowToFront(first);
 		float endedRow = _FlushScanRow(target, blank);
 		for (int32 i = 1; i < bands; i++) {
 			while (acquire_sem(fFlushDoneSem) == B_INTERRUPTED)
@@ -1377,119 +1425,6 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 		target.late = 0;
 		target.worstLate = 0;
 		target.longest = 0;
-	}
-}
-
-
-// #pragma mark - the gate between drawing and copying
-
-
-static inline bool
-rects_intersect(const IntRect& a, const IntRect& b)
-{
-	return a.IsValid() && b.IsValid() && a.left <= b.right
-		&& a.right >= b.left && a.top <= b.bottom && a.bottom >= b.top;
-}
-
-
-/*!	A drawing op is about to change the bounds in the back buffer: waits
-	while the flush is copying any of it (a copy takes a few ms at most),
-	then notes the bounds, so that the flush keeps off them until
-	EndDrawing(). Returns the note's slot (-1: none; nothing to end). */
-int32
-HWInterface::BeginDrawing(const IntRect& bounds)
-{
-	if (!fFlushing || !bounds.IsValid())
-		return -1;
-	if (!fGateLock.Lock())
-		return -1;
-
-	bigtime_t deadline = 0;
-	while (true) {
-		bool copying = false;
-		for (int32 i = 0; i < 8; i++) {
-			if (rects_intersect(fCopying[i], bounds)) {
-				copying = true;
-				break;
-			}
-		}
-		if (!copying)
-			break;
-		if (deadline == 0)
-			deadline = system_time() + 20000;
-		else if (system_time() > deadline)
-			break;
-		fGateLock.Unlock();
-		snooze(50);
-		if (!fGateLock.Lock())
-			return -1;
-	}
-
-	int32 slot = -1;
-	for (int32 i = 0; i < 64; i++) {
-		if (!fDrawing[i].used) {
-			fDrawing[i].rect = bounds;
-			fDrawing[i].used = true;
-			slot = i;
-			break;
-		}
-	}
-	fGateLock.Unlock();
-	return slot;
-}
-
-
-void
-HWInterface::EndDrawing(int32 slot)
-{
-	if (slot < 0)
-		return;
-	if (fGateLock.Lock()) {
-		fDrawing[slot].used = false;
-		fGateLock.Unlock();
-	}
-}
-
-
-/*!	The flush is about to copy the rect: waits while a drawing op is
-	changing any of it, then notes the rect so that drawing ops keep off
-	it until _EndCopying(). */
-void
-HWInterface::_BeginCopying(const IntRect& rect, int32 band)
-{
-	if (!fGateLock.Lock())
-		return;
-	bigtime_t deadline = 0;
-	while (true) {
-		bool drawing = false;
-		for (int32 i = 0; i < 64; i++) {
-			if (fDrawing[i].used && rects_intersect(fDrawing[i].rect, rect)) {
-				drawing = true;
-				break;
-			}
-		}
-		if (!drawing)
-			break;
-		if (deadline == 0)
-			deadline = system_time() + 20000;
-		else if (system_time() > deadline)
-			break;
-		fGateLock.Unlock();
-		snooze(50);
-		if (!fGateLock.Lock())
-			return;
-	}
-	fCopying[band] = rect;
-	fGateLock.Unlock();
-}
-
-
-void
-HWInterface::_EndCopying(int32 band)
-{
-	if (fGateLock.Lock()) {
-		fCopying[band] = IntRect(0, 0, -1, -1);
-		fGateLock.Unlock();
 	}
 }
 
