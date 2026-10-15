@@ -14,6 +14,24 @@
 #include "Settings.h"
 
 
+
+/*!	A descriptor shorter than what is read from it (a non-compliant device,
+	a webcam's microphone for example) must not be parsed: reading past it
+	is reading past the configuration buffer, in the kernel.
+*/
+static bool
+descriptor_too_short(const usb_audiocontrol_header_descriptor* header,
+	size_t needed, const char* what)
+{
+	if (header->length >= needed)
+		return false;
+
+	TRACE(ERR, "%s descriptor of %d bytes is shorter than %d: ignored\n",
+		what, header->length, (int)needed);
+	return true;
+}
+
+
 // control id is encoded in following way
 //	CS	CN	ID	IF where:
 //	CS				- control selector
@@ -247,6 +265,10 @@ InputTerminal::InputTerminal(AudioControlInterface*	interface,
 {
 	usb_audio_input_terminal_descriptor* Terminal
 		= (usb_audio_input_terminal_descriptor*) Header;
+	if (descriptor_too_short(Header,
+			fInterface->SpecReleaseNumber() < 0x200 ? 12 : 17, "Input terminal"))
+		return;
+
 	fID					= Terminal->terminal_id;
 	fTerminalType		= Terminal->terminal_type;
 	fAssociatedTerminal = Terminal->assoc_terminal;
@@ -303,6 +325,9 @@ OutputTerminal::OutputTerminal(AudioControlInterface*	interface,
 {
 	usb_audio_output_terminal_descriptor* Terminal
 		= (usb_audio_output_terminal_descriptor*) Header;
+	if (descriptor_too_short(Header,
+			fInterface->SpecReleaseNumber() < 0x200 ? 9 : 12, "Output terminal"))
+		return;
 
 	fID					= Terminal->terminal_id;
 	fTerminalType		= Terminal->terminal_type;
@@ -354,6 +379,11 @@ MixerUnit::MixerUnit(AudioControlInterface*	interface,
 {
 	usb_audio_mixer_unit_descriptor* Mixer
 		= (usb_audio_mixer_unit_descriptor*) Header;
+	if (descriptor_too_short(Header, 5, "Mixer unit")
+		|| descriptor_too_short(Header, (fInterface->SpecReleaseNumber() < 0x200
+				? 10 : 13) + Mixer->num_input_pins, "Mixer unit")) {
+		return;
+	}
 
 	fID = Mixer->unit_id;
 	TRACE(UAC, "Mixer ID:%d >>>\n", fID);
@@ -476,6 +506,11 @@ SelectorUnit::SelectorUnit(AudioControlInterface*	interface,
 {
 	usb_audio_selector_unit_descriptor* Selector
 		= (usb_audio_selector_unit_descriptor*) Header;
+	if (descriptor_too_short(Header, 5, "Selector unit")
+		|| descriptor_too_short(Header, (fInterface->SpecReleaseNumber() < 0x200
+				? 6 : 7) + Selector->num_input_pins, "Selector unit")) {
+		return;
+	}
 
 	fID = Selector->unit_id;
 	TRACE(UAC, "Selector ID:%d >>>\n", fID);
@@ -541,13 +576,25 @@ FeatureUnit::FeatureUnit(AudioControlInterface*	interface,
 	TRACE(UAC, "Source ID:%d\n", fSourceID);
 
 	uint8 controlSize = 4;
-	uint8 channelsCount = (Feature->length - 6) / controlSize;
+	uint8 channelsCount = 0;
 	uint8* ControlsBitmapPointer = (uint8*)&Feature->r2.bma_controls[0];
 
 	if (fInterface->SpecReleaseNumber() < 0x200) {
+		if (descriptor_too_short(Header, 7, "Feature unit"))
+			return;
 		controlSize = Feature->r1.control_size;
-		channelsCount = (Feature->length - 7) / Feature->r1.control_size;
+		if (controlSize != 1 && controlSize != 2 && controlSize != 4) {
+			// (a zero here used to divide the kernel by zero)
+			TRACE(ERR, "Feature unit with a control size of %d ignored\n",
+				controlSize);
+			return;
+		}
+		channelsCount = (Feature->length - 7) / controlSize;
 		ControlsBitmapPointer = &Feature->r1.bma_controls[0];
+	} else {
+		if (descriptor_too_short(Header, 6, "Feature unit"))
+			return;
+		channelsCount = (Feature->length - 6) / controlSize;
 	}
 
 	TRACE(UAC, "Channel bitmap size:%d\n", controlSize);
@@ -715,6 +762,11 @@ ProcessingUnit::ProcessingUnit(AudioControlInterface*	interface,
 {
 	usb_audio_processing_unit_descriptor* Processing
 		= (usb_audio_processing_unit_descriptor*) Header;
+	if (descriptor_too_short(Header, 7, "Processing unit")
+		|| descriptor_too_short(Header, (fInterface->SpecReleaseNumber() < 0x200
+				? 11 : 13) + Processing->num_input_pins, "Processing unit")) {
+		return;
+	}
 
 	fID = Processing->unit_id;
 	TRACE(UAC, "Processing ID:%d >>>\n", fID);
@@ -782,6 +834,11 @@ ExtensionUnit::ExtensionUnit(AudioControlInterface*	interface,
 {
 	usb_audio_extension_unit_descriptor* Extension
 		= (usb_audio_extension_unit_descriptor*) Header;
+	if (descriptor_too_short(Header, 7, "Extension unit")
+		|| descriptor_too_short(Header, (fInterface->SpecReleaseNumber() < 0x200
+				? 11 : 13) + Extension->num_input_pins, "Extension unit")) {
+		return;
+	}
 
 	fID = Extension->unit_id;
 	TRACE(UAC, "Extension ID:%d >>>\n", fID);
@@ -941,6 +998,11 @@ AudioControlInterface::Init(size_t interface, usb_interface_info* Interface)
 		usb_audiocontrol_header_descriptor* Header
 			= (usb_audiocontrol_header_descriptor* )Interface->generic[i];
 
+		if (Header->length < 3) {
+			TRACE(ERR, "Ignore Audio Control descriptor of %d bytes\n",
+				Header->length);
+			continue;
+		}
 		if (Header->descriptor_type != USB_AUDIO_CS_INTERFACE) {
 			TRACE(ERR, "Ignore Audio Control of "
 				"unknown descriptor type %#04x.\n",	Header->descriptor_type);
@@ -1055,12 +1117,20 @@ AudioControlInterface::InitACHeader(size_t interface,
 	TRACE(UAC, "ADCSpecification:%#06x\n", fADCSpecification);
 
 	if (fADCSpecification < 0x200) {
+		if (descriptor_too_short(Header, 8, "Audio control header"))
+			return fStatus = B_BAD_VALUE;
+		if (descriptor_too_short(Header, 8 + Header->r1.in_collection,
+				"Audio control header")) {
+			return fStatus = B_BAD_VALUE;
+		}
 		TRACE(UAC, "InterfacesCount:%d\n",	Header->r1.in_collection);
 		for (size_t i = 0; i < Header->r1.in_collection; i++) {
 			fStreams.PushBack(Header->r1.interface_numbers[i]);
 			TRACE(UAC, "Interface[%d] number is %d\n", i, fStreams[i]);
 		}
 	} else {
+		if (descriptor_too_short(Header, 9, "Audio control header"))
+			return fStatus = B_BAD_VALUE;
 		fFunctionCategory = Header->r2.function_category;
 		fControlsBitmap = Header->r2.bm_controls;
 		TRACE(UAC, "Function Category:%#04x\n", fFunctionCategory);

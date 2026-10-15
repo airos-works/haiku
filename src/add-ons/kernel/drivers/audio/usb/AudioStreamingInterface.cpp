@@ -156,15 +156,17 @@ TypeIFormatDescriptor::Init(usb_audio_format_descriptor* Descriptor)
 	fBitResolution = Descriptor->typeI.bit_resolution;
 	fSampleFrequencyType = Descriptor->typeI.sam_freq_type;
 
-	if (fSampleFrequencyType == 0) {
-		fSampleFrequencies.PushBack(
-			GetSamFreq(Descriptor->typeI.sam_freqs[0]));
-		fSampleFrequencies.PushBack(
-			GetSamFreq(Descriptor->typeI.sam_freqs[1]));
-	} else
-		for (size_t i = 0; i < fSampleFrequencyType; i++)
-			fSampleFrequencies.PushBack(
-				GetSamFreq(Descriptor->typeI.sam_freqs[i]));
+	// only the frequencies the descriptor is long enough to hold
+	// (a non-compliant device's must not be read past, in the kernel)
+	size_t frequencies = fSampleFrequencyType == 0 ? 2 : fSampleFrequencyType;
+	size_t room = Descriptor->length >= 8 ? (Descriptor->length - 8) / 3 : 0;
+	if (frequencies > room) {
+		TRACE(ERR, "Format descriptor of %d bytes holds %d of %d sample "
+			"frequencies\n", Descriptor->length, (int)room, (int)frequencies);
+		frequencies = room;
+	}
+	for (size_t i = 0; i < frequencies; i++)
+		fSampleFrequencies.PushBack(GetSamFreq(Descriptor->typeI.sam_freqs[i]));
 
 	TRACE(UAC, "fNumChannels:%d\n", fNumChannels);
 	TRACE(UAC, "fSubframeSize:%d\n", fSubframeSize);
@@ -420,6 +422,11 @@ AudioStreamingInterface::AudioStreamingInterface(
 			if (Header->descriptor_type == USB_AUDIO_CS_INTERFACE) {
 				switch(Header->descriptor_subtype) {
 					case USB_AUDIO_AS_GENERAL:
+						if (Header->length < 7) {
+							TRACE(ERR, "AStream interface descriptor of %d "
+								"bytes ignored\n", Header->length);
+							break;
+						}
 						if (ASInterface == 0)
 							ASInterface = new(std::nothrow)
 								ASInterfaceDescriptor(
@@ -428,6 +435,11 @@ AudioStreamingInterface::AudioStreamingInterface(
 							TRACE(ERR, "Duplicate AStream interface ignored.\n");
 						break;
 					case USB_AUDIO_AS_FORMAT_TYPE:
+						if (Header->length < 8) {
+							TRACE(ERR, "AStream format descriptor of %d "
+								"bytes ignored\n", Header->length);
+							break;
+						}
 						if (ASFormat == 0)
 							ASFormat = new(std::nothrow) TypeIFormatDescriptor(
 								(usb_audio_format_descriptor*) Header);
@@ -443,6 +455,11 @@ AudioStreamingInterface::AudioStreamingInterface(
 			}
 
 			if (Header->descriptor_type == USB_AUDIO_CS_ENDPOINT) {
+				if (Interface->endpoint_count < 1 || Header->length < 7) {
+					TRACE(ERR, "AStream endpoint descriptor without an "
+						"endpoint, or of %d bytes, ignored\n", Header->length);
+					continue;
+				}
 				if (ASEndpoint == 0) {
 					usb_endpoint_descriptor* Endpoint
 						= Interface->endpoint[0].descr;
