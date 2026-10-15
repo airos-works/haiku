@@ -196,6 +196,10 @@ public:
 	virtual	sem_id				OutputRetraceSemaphore(uint32 id);
 									// released at that display output's
 									// blanks; B_UNSUPPORTED without
+	virtual	status_t			OutputScanLine(uint32 id, int32* _line,
+									int32* _lines);
+									// where that output's scan is now, as
+									// a row of its frame buffer region
 			void				WaitForPendingFlush(bigtime_t timeout);
 									// until what was queued so far is on
 									// the screen (not locked)
@@ -222,6 +226,8 @@ private:
 	static	status_t			_FlushThreadEntry(void* data);
 			void				_FlushThread(FlushTarget& target);
 			void				_FlushPending(FlushTarget& target,
+									bigtime_t blank);
+			float				_FlushScanRow(FlushTarget& target,
 									bigtime_t blank);
 	static	status_t			_FlushWorkerEntry(void* data);
 			void				_StartFlushWorkers(FlushTarget& target);

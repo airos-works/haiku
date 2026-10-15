@@ -60,6 +60,8 @@ public:
 
 	virtual sem_id				RetraceSemaphore();
 	virtual	sem_id				OutputRetraceSemaphore(uint32 id);
+	virtual	status_t			OutputScanLine(uint32 id, int32* _line,
+									int32* _lines);
 	virtual status_t			WaitForRetrace(
 									bigtime_t timeout = B_INFINITE_TIMEOUT);
 
@@ -192,6 +194,8 @@ private:
 			set_display_change_port fAccSetDisplayChangePort;
 			get_display_output_retrace_semaphore
 								fAccGetDisplayOutputRetraceSemaphore;
+			get_display_output_scan_line
+								fAccGetDisplayOutputScanLine;
 			port_id				fDisplayChangePort;
 			thread_id			fDisplayChangeThread;
 
