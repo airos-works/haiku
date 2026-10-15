@@ -13,6 +13,7 @@
 #include <Button.h>
 #include <Catalog.h>
 #include <ControlLook.h>
+#include <MessageQueue.h>
 #include <MessageRunner.h>
 #include <Mime.h>
 #include <Roster.h>
@@ -38,9 +39,17 @@ enum {
 	kMsgAnimate		= 'anim'
 };
 
-// The zoom: this many frames, this far apart.
-static const int32 kAnimationSteps = 12;
-static const bigtime_t kAnimationInterval = 14000;
+// The zoom takes this long; a frame is drawn about this often, and frames
+// the server could not keep up with are dropped rather than queued, so the
+// zoom ends on time whatever the machine.
+static const bigtime_t kAnimationDuration = 220000;
+static const bigtime_t kAnimationInterval = 12000;
+
+#ifdef TRACE_ANIMATION
+#	define TRACE(x...) syslog(LOG_DEBUG, "quick_look: " x)
+#else
+#	define TRACE(x...) ;
+#endif
 
 static const float kMinimumWidth = 420;
 static const float kMinimumContentHeight = 160;
@@ -78,11 +87,14 @@ PreviewWindow::PreviewWindow(AddOnManager* addOns)
 	fAddOns(addOns),
 	fIndex(0),
 	fAnimation(NULL),
-	fAnimationStep(0),
+	fAnimationStart(0),
+	fAnimationFrames(0),
+	fAnimationLongest(0),
 	fAnimationHides(false),
 	fNotifyAfterHide(false),
 	fPreview(NULL),
 	fPreviewStarted(false),
+	fPreviewHidden(false),
 	fUserResized(false)
 {
 	// No window frame: a thin dark line around the panel is all.
@@ -200,17 +212,24 @@ PreviewWindow::ShowEntries(const BMessage* message)
 	if (wasHidden) {
 		BRect target = Frame();
 		if (fIconRect.IsValid()) {
-			// Out of the entry's icon, growing to its place.
+			// Out of the entry's icon, growing to its place. The content
+			// waits until the panel is there: laying out text, scaling a
+			// picture or rendering a page at every size in between is what
+			// made the zoom stutter, and the preview plays from a steady
+			// frame.
+			// The animation is set up first so that the layout leaves the
+			// hidden preview at its final size throughout: an add-on laid
+			// out for an icon-sized panel in between (the document preview
+			// showed blank pages after that) is spared the detour.
+			_HidePreview(true);
+			_StartAnimation(fIconRect, target, false);
 			MoveTo(fIconRect.LeftTop());
 			ResizeTo(fIconRect.Width(), fIconRect.Height());
 			_Layout();
 			Show();
-			_StartAnimation(fIconRect, target, false);
-		} else
+		} else {
 			Show();
-		if (fPreview != NULL && !fPreviewStarted) {
-			fPreview->Start();
-			fPreviewStarted = true;
+			_StartPreview();
 		}
 	}
 	_NotifyShown();
@@ -235,6 +254,7 @@ PreviewWindow::HidePanel(bool notifyOwner)
 		if (fPreviewStarted)
 			fPreview->Stop();
 		fPreviewStarted = false;
+		_HidePreview(true);
 		fNotifyAfterHide = notifyOwner;
 		_StartAnimation(Frame(), fIconRect, true);
 		return;
@@ -378,10 +398,33 @@ PreviewWindow::_ShowCurrent()
 	if (!fUserResized)
 		_FitToContent();
 	_UpdateFooter();
-	if (IsShowing()) {
-		fPreview->Start();
-		fPreviewStarted = true;
-	}
+	if (IsShowing() && fAnimation == NULL)
+		_StartPreview();
+}
+
+
+/*!	A view in a hidden window counts as hidden, so the view's own state is
+	kept here. */
+void
+PreviewWindow::_HidePreview(bool hide)
+{
+	if (fPreview == NULL || hide == fPreviewHidden)
+		return;
+	fPreviewHidden = hide;
+	if (hide)
+		fPreview->Hide();
+	else
+		fPreview->Show();
+}
+
+
+void
+PreviewWindow::_StartPreview()
+{
+	if (fPreview == NULL || fPreviewStarted)
+		return;
+	fPreview->Start();
+	fPreviewStarted = true;
 }
 
 
@@ -405,6 +448,7 @@ PreviewWindow::_SetPreview(BQuickLookPreview* preview)
 
 	preview->MoveTo(0, 0);
 	preview->ResizeTo(fContent->Bounds().Width(), fContent->Bounds().Height());
+	fPreviewHidden = false;
 	fContent->AddChild(preview);
 	std::lock_guard<std::mutex> lock(fPreviewLock);
 	fPreview = preview;
@@ -456,6 +500,10 @@ PreviewWindow::_TargetFrame()
 		floorf(content.height * scale)) + footer;
 
 	BRect frame = Frame();
+	if (fAnimation != NULL && !fAnimationHides) {
+		// Mid zoom the panel is on its way to where it belongs.
+		frame = fAnimationTo;
+	}
 	BPoint center(frame.left + frame.Width() / 2,
 		frame.top + frame.Height() / 2);
 	if (IsHidden()) {
@@ -494,11 +542,13 @@ PreviewWindow::_StartAnimation(BRect from, BRect to, bool hiding)
 	delete fAnimation;
 	fAnimationFrom = from;
 	fAnimationTo = to;
-	fAnimationStep = 0;
+	fAnimationStart = system_time();
+	fAnimationFrames = 0;
+	fAnimationLongest = 0;
 	fAnimationHides = hiding;
 	BMessage step(kMsgAnimate);
 	fAnimation = new BMessageRunner(BMessenger(this), &step,
-		kAnimationInterval, kAnimationSteps);
+		kAnimationInterval, -1);
 }
 
 
@@ -507,8 +557,15 @@ PreviewWindow::_AnimationStep()
 {
 	if (fAnimation == NULL)
 		return;
-	fAnimationStep++;
-	float t = (float)fAnimationStep / kAnimationSteps;
+	// A frame the server was late for is skipped for the next one waiting.
+	if (MessageQueue()->FindMessage(kMsgAnimate, 0) != NULL)
+		return;
+	bigtime_t now = system_time();
+	float t = (float)(now - fAnimationStart) / kAnimationDuration;
+	if (t >= 1) {
+		_FinishAnimation();
+		return;
+	}
 	// Fast at first, settling at the end.
 	float eased = 1 - (1 - t) * (1 - t) * (1 - t);
 	BRect frame;
@@ -520,13 +577,11 @@ PreviewWindow::_AnimationStep()
 		+ (fAnimationTo.right - fAnimationFrom.right) * eased;
 	frame.bottom = fAnimationFrom.bottom
 		+ (fAnimationTo.bottom - fAnimationFrom.bottom) * eased;
-	if (fAnimationStep >= kAnimationSteps) {
-		_FinishAnimation();
-		return;
-	}
 	MoveTo(floorf(frame.left), floorf(frame.top));
 	ResizeTo(floorf(frame.Width()), floorf(frame.Height()));
 	_Layout();
+	fAnimationFrames++;
+	fAnimationLongest = std::max(fAnimationLongest, system_time() - now);
 }
 
 
@@ -535,6 +590,10 @@ PreviewWindow::_FinishAnimation()
 {
 	delete fAnimation;
 	fAnimation = NULL;
+	TRACE("%s: %" B_PRId32 " frames in %" B_PRId64 " ms, the longest "
+		"%" B_PRId64 " ms", fAnimationHides ? "shrink" : "zoom",
+		fAnimationFrames, (system_time() - fAnimationStart) / 1000,
+		fAnimationLongest / 1000);
 	if (fAnimationHides) {
 		fAnimationHides = false;
 		_SetPreview(NULL);
@@ -548,6 +607,8 @@ PreviewWindow::_FinishAnimation()
 	MoveTo(fAnimationTo.LeftTop());
 	ResizeTo(fAnimationTo.Width(), fAnimationTo.Height());
 	_Layout();
+	_HidePreview(false);
+	_StartPreview();
 }
 
 
@@ -566,7 +627,8 @@ PreviewWindow::_Layout()
 	}
 	fContent->MoveTo(bounds.left, bounds.top);
 	fContent->ResizeTo(bounds.Width(), bounds.Height() - footer);
-	if (fPreview != NULL) {
+	// Not while zooming: the hidden preview is laid out once, at the end.
+	if (fPreview != NULL && fAnimation == NULL) {
 		fPreview->MoveTo(0, 0);
 		fPreview->ResizeTo(fContent->Bounds().Width(),
 			fContent->Bounds().Height());

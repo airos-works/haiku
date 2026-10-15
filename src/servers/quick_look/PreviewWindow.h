@@ -47,6 +47,8 @@ public:
 private:
 			void				_ShowCurrent();
 			void				_SetPreview(BQuickLookPreview* preview);
+			void				_HidePreview(bool hide);
+			void				_StartPreview();
 			void				_FitToContent();
 			BRect				_TargetFrame();
 			void				_StartAnimation(BRect from, BRect to,
@@ -72,7 +74,9 @@ private:
 			BMessageRunner*		fAnimation;
 			BRect				fAnimationFrom;
 			BRect				fAnimationTo;
-			int32				fAnimationStep;
+			bigtime_t			fAnimationStart;
+			int32				fAnimationFrames;
+			bigtime_t			fAnimationLongest;
 			bool				fAnimationHides;
 			bool				fNotifyAfterHide;
 
@@ -89,6 +93,7 @@ private:
 			std::mutex			fPreviewLock;
 			BQuickLookPreview*	fPreview;
 			bool				fPreviewStarted;
+			bool				fPreviewHidden;
 			BString				fMimeType;
 			BString				fDefaultSummary;
 			bool				fUserResized;
