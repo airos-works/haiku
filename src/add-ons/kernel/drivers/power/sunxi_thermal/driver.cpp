@@ -129,16 +129,21 @@ static const int32 kTrendMargin = 250;
 // and the steps of the GPU's and the video engine's clocks (below). With
 // two films playing the GPU, the video engine and the memory make most of
 // the heat: the cores alone at 416 MHz do not hold it.
+// The video engine stays at 300 MHz down to level 7 (at level 8, where the
+// hot trip puts everything, 200 MHz): at 200 MHz a 4K HEVC Main 10 picture
+// took it 42-45 ms, too slow for 24 a second, where 300 MHz took 27-30 ms;
+// a film it cannot keep up with drops pictures however cool the rest runs,
+// and airTime playing one held level 7.
 static const struct { uint32 big, little; uint8 gpu, ve; } kLevels[] = {
 	{ 0xffffffff, 0xffffffff, 0, 0 },
 	{ 1794, 1794, 1, 1 },
 	{ 1612, 1716, 2, 1 },
-	{ 1404, 1612, 2, 2 },
-	{ 1196, 1404, 3, 2 },
-	{ 1014, 1196, 3, 2 },
-	{ 780, 1014, 4, 2 },
-	{ 416, 780, 4, 3 },
-	{ 416, 416, 4, 3 }
+	{ 1404, 1612, 2, 1 },
+	{ 1196, 1404, 3, 1 },
+	{ 1014, 1196, 3, 1 },
+	{ 780, 1014, 4, 1 },
+	{ 416, 780, 4, 1 },
+	{ 416, 416, 4, 2 }
 };
 
 // The GPU's clock (CCU 0xb20): the powervr driver runs it from pll-peri0-800m
