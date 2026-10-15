@@ -27,6 +27,10 @@
 	- B_YCbCr422 or B_RGB32, for MediaPlayer and the other Media Kit users
 	  (ten bit pictures by their eight most significant bits).
 
+	A caller that asks for 'P010' or 'I420' pictures exactly half as wide and
+	high (display.line_width and line_count) gets them so, when the width and
+	height are multiples of four: each sample the mean of a 2x2 block.
+
 	A negative time_to_decode in Decode()'s media_decode_info is, negated,
 	the time before which the caller will drop the pictures anyway (it is
 	seeking); those are returned with their time but not copied. */
@@ -38,11 +42,14 @@
 #include <Path.h>
 #include <image.h>
 
+#include <condition_variable>
 #include <deque>
+#include <mutex>
 #include <new>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -109,6 +116,11 @@ private:
 	};
 
 			status_t			_NextPicture(CedarDecoder::Picture& picture);
+			status_t			_Feed(const void* chunk, size_t size,
+									const media_header& header);
+			void				_StartAhead();
+			status_t			_JoinAhead();
+			void				_AheadLoop();
 			status_t			_ReadChunk(const void** chunk, size_t* size,
 									media_header* header);
 			status_t			_PutUnits(const uint8* data, size_t size,
@@ -138,12 +150,32 @@ private:
 			CedarDecoder::Picture fPicture;
 			uint32				fWidth;
 			uint32				fHeight;
+			bool				fHalf;
+				// half as wide and high, as the caller asked
 
 			// chunks kept until the first picture, for the software
 			// decoder, and those it has yet to get
 			bool				fRecording;
 			std::deque<Chunk>	fRecorded;
 			Chunk				fReplaying;
+
+			// The access unit after the picture being handed out, decoded
+			// on a thread of its own meanwhile (CEDAR_NO_AHEAD=1: not).
+			// The picture is released only once that is done.
+			std::thread			fAheadThread;
+			std::mutex			fAheadLock;
+			std::condition_variable fAheadWake;
+			std::condition_variable fAheadDone;
+			bool				fAheadQuit;
+			bool				fAheadBusy;
+			bool				fAheadDrain;
+			std::vector<uint8>	fAheadChunk;
+				// a copy: the caller's chunk need not outlive the next
+				// call (Summit swaps chunk sources between seeks)
+			media_header		fAheadHeader;
+			status_t			fAheadStatus;
+			bool				fReleasePending;
+			CedarDecoder::Picture fPendingRelease;
 
 			// the software decoder, when the engine does not do the stream
 			image_id			fSoftwareImage;
@@ -172,7 +204,13 @@ SunxiCedarDecoder::SunxiCedarDecoder(bool fallback)
 	fHavePicture(false),
 	fWidth(0),
 	fHeight(0),
+	fHalf(false),
 	fRecording(false),
+	fAheadQuit(false),
+	fAheadBusy(false),
+	fAheadDrain(false),
+	fAheadStatus(B_OK),
+	fReleasePending(false),
 	fSoftwareImage(-1),
 	fSoftwarePlugin(NULL),
 	fSoftware(NULL)
@@ -182,6 +220,15 @@ SunxiCedarDecoder::SunxiCedarDecoder(bool fallback)
 
 SunxiCedarDecoder::~SunxiCedarDecoder()
 {
+	_JoinAhead();
+	if (fAheadThread.joinable()) {
+		{
+			std::lock_guard<std::mutex> lock(fAheadLock);
+			fAheadQuit = true;
+		}
+		fAheadWake.notify_all();
+		fAheadThread.join();
+	}
 	delete fDecoder;
 	// the FFmpeg decoder's code goes with its image: it goes first
 	delete fSoftware;
@@ -568,8 +615,16 @@ SunxiCedarDecoder::NegotiateOutputFormat(media_format* format)
 	} else if (space != B_YCbCr422)
 		space = B_RGB32;
 	fOutputSpace = space;
-	fWidth = fPicture.width;
-	fHeight = fPicture.height;
+	// Half as wide and high when asked for exactly that, made in the pass
+	// that copies the picture anyway: a 4K film on a 1080p screen needs no
+	// more, and the caller then scales a quarter of the samples.
+	const media_video_display_info& asked = format->u.raw_video.display;
+	fHalf = (space == kColorSpaceP010 || space == kColorSpaceI420)
+		&& fPicture.width % 4 == 0 && fPicture.height % 4 == 0
+		&& asked.line_width == fPicture.width / 2
+		&& asked.line_count == fPicture.height / 2;
+	fWidth = fHalf ? fPicture.width / 2 : fPicture.width;
+	fHeight = fHalf ? fPicture.height / 2 : fPicture.height;
 
 	media_raw_video_format raw = fInputFormat.u.encoded_video.output;
 	raw.interlace = 1;
@@ -599,6 +654,8 @@ SunxiCedarDecoder::SeekedTo(int64 frame, bigtime_t time)
 		return fSoftware->SeekedTo(frame, time);
 	if (fDecoder == NULL)
 		return B_NO_INIT;
+	_JoinAhead();
+	fAheadStatus = B_OK;
 	if (fHavePicture) {
 		fDecoder->ReleasePicture(fPicture);
 		fHavePicture = false;
@@ -680,25 +737,115 @@ SunxiCedarDecoder::_NextPicture(CedarDecoder::Picture& picture)
 		if (status != B_OK)
 			return status;
 
-		// after the start and a seek, the parameter sets again
-		if (!fParameterSetsSent && !fParameterSets.empty()) {
-			uint32 lengthSize = fNalLengthSize;
-			fNalLengthSize = 0;
-			status = _PutUnits(fParameterSets.data(), fParameterSets.size(),
-				header.start_time);
-			fNalLengthSize = lengthSize;
-		}
-		fParameterSetsSent = true;
+		status = _Feed(chunk, size, header);
+		if (status != B_OK)
+			return status;
+	}
+}
 
-		// a chunk is an access unit: the picture is complete with it
-		if (status == B_OK)
-			status = _PutUnits((const uint8*)chunk, size, header.start_time);
-		if (status == B_OK)
-			status = fDecoder->EndAccessUnit();
-		if (status != B_OK) {
-			fprintf(stderr, "sunxi_cedar: %s\n", fDecoder->Error());
-			return status == B_NOT_SUPPORTED ? status : B_ERROR;
-		}
+
+/*!	A chunk (an access unit) to the engine. */
+status_t
+SunxiCedarDecoder::_Feed(const void* chunk, size_t size,
+	const media_header& header)
+{
+	// after the start and a seek, the parameter sets again
+	status_t status = B_OK;
+	if (!fParameterSetsSent && !fParameterSets.empty()) {
+		uint32 lengthSize = fNalLengthSize;
+		fNalLengthSize = 0;
+		status = _PutUnits(fParameterSets.data(), fParameterSets.size(),
+			header.start_time);
+		fNalLengthSize = lengthSize;
+	}
+	fParameterSetsSent = true;
+
+	// a chunk is an access unit: the picture is complete with it
+	if (status == B_OK)
+		status = _PutUnits((const uint8*)chunk, size, header.start_time);
+	if (status == B_OK)
+		status = fDecoder->EndAccessUnit();
+	if (status != B_OK) {
+		fprintf(stderr, "sunxi_cedar: %s\n", fDecoder->Error());
+		return status == B_NOT_SUPPORTED ? status : B_ERROR;
+	}
+	return B_OK;
+}
+
+
+/*!	Reads the next chunk here (the caller's chunk provider stays on the
+	caller's thread) and has the engine decode it on the ahead thread while
+	the caller copies out the picture before it: the engine's time and the
+	copying's overlap rather than add up. */
+void
+SunxiCedarDecoder::_StartAhead()
+{
+	static const bool sNoAhead = getenv("CEDAR_NO_AHEAD") != NULL;
+	if (sNoAhead || fInputEnded || fAheadStatus != B_OK)
+		return;
+	const void* chunk;
+	size_t size;
+	media_header header;
+	status_t status = _ReadChunk(&chunk, &size, &header);
+	bool drain = false;
+	if (status == B_LAST_BUFFER_ERROR) {
+		fInputEnded = true;
+		drain = true;
+	} else if (status != B_OK) {
+		// a seek or the end of the caller's input: Decode() says so next
+		fAheadStatus = status;
+		return;
+	}
+	if (!fAheadThread.joinable())
+		fAheadThread = std::thread(&SunxiCedarDecoder::_AheadLoop, this);
+	std::lock_guard<std::mutex> lock(fAheadLock);
+	if (!drain)
+		fAheadChunk.assign((const uint8*)chunk, (const uint8*)chunk + size);
+	fAheadHeader = header;
+	fAheadDrain = drain;
+	fAheadBusy = true;
+	fAheadWake.notify_all();
+}
+
+
+/*!	Waits for the access unit given to the ahead thread, then releases the
+	picture copied meanwhile. */
+status_t
+SunxiCedarDecoder::_JoinAhead()
+{
+	{
+		std::unique_lock<std::mutex> lock(fAheadLock);
+		fAheadDone.wait(lock, [this] { return !fAheadBusy; });
+	}
+	if (fReleasePending && fDecoder != NULL) {
+		fDecoder->ReleasePicture(fPendingRelease);
+		fReleasePending = false;
+	}
+	return fAheadStatus;
+}
+
+
+void
+SunxiCedarDecoder::_AheadLoop()
+{
+	rename_thread(find_thread(NULL), "sunxi_cedar ahead");
+	set_thread_priority(find_thread(NULL), B_DISPLAY_PRIORITY);
+	std::unique_lock<std::mutex> lock(fAheadLock);
+	while (true) {
+		fAheadWake.wait(lock, [this] { return fAheadQuit || fAheadBusy; });
+		if (fAheadQuit)
+			return;
+		lock.unlock();
+		status_t status = B_OK;
+		if (fAheadDrain)
+			fDecoder->Drain();
+		else
+			status = _Feed(fAheadChunk.data(), fAheadChunk.size(), fAheadHeader);
+		lock.lock();
+		if (status != B_OK)
+			fAheadStatus = status;
+		fAheadBusy = false;
+		fAheadDone.notify_all();
 	}
 }
 
@@ -714,6 +861,12 @@ SunxiCedarDecoder::Decode(void* buffer, int64* frameCount,
 	if (buffer == NULL || frameCount == NULL || header == NULL)
 		return B_BAD_VALUE;
 
+	status_t aheadStatus = _JoinAhead();
+	if (aheadStatus != B_OK) {
+		fAheadStatus = B_OK;
+		return aheadStatus;
+	}
+
 	fDecoder->SetSkipBefore(info != NULL && info->time_to_decode < 0
 		? -info->time_to_decode : INT64_MIN);
 
@@ -724,7 +877,8 @@ SunxiCedarDecoder::Decode(void* buffer, int64* frameCount,
 	}
 	fHavePicture = false;
 
-	if (fPicture.width != fWidth || fPicture.height != fHeight) {
+	if (fPicture.width != (fHalf ? fWidth * 2 : fWidth)
+		|| fPicture.height != (fHalf ? fHeight * 2 : fHeight)) {
 		// the stream changed its pictures; nothing here renegotiates
 		fDecoder->ReleasePicture(fPicture);
 		fprintf(stderr, "sunxi_cedar: the pictures changed to %" B_PRIu32
@@ -735,8 +889,12 @@ SunxiCedarDecoder::Decode(void* buffer, int64* frameCount,
 	uint32 stride = _Stride();
 	bool skip = info != NULL && info->time_to_decode < 0
 		&& fPicture.pts < -info->time_to_decode;
+	_StartAhead();
 	if (!skip) {
-		if (fOutputSpace == kColorSpaceNV12 || fOutputSpace == kColorSpaceI420
+		if (fHalf)
+			fDecoder->CopyHalfPlanes(fPicture, (uint8*)buffer, stride);
+		else if (fOutputSpace == kColorSpaceNV12
+			|| fOutputSpace == kColorSpaceI420
 			|| fOutputSpace == kColorSpaceP010) {
 			fDecoder->CopyPlanes(fPicture, (uint8*)buffer, stride,
 				fOutputSpace != kColorSpaceI420);
@@ -758,7 +916,9 @@ SunxiCedarDecoder::Decode(void* buffer, int64* frameCount,
 	header->u.raw_video.line_count = fHeight;
 	*frameCount = 1;
 
-	fDecoder->ReleasePicture(fPicture);
+	// once the access unit decoded meanwhile is done (_JoinAhead())
+	fPendingRelease = fPicture;
+	fReleasePending = true;
 	return B_OK;
 }
 

@@ -6,7 +6,13 @@
 
 #include "CedarDecoder.h"
 
+#include <atomic>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
 #include <new>
+#include <thread>
+#include <vector>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,6 +69,8 @@ CedarDecoder::CedarDecoder(codec codec)
 	fDecoded(0)
 {
 	fParseError[0] = '\0';
+	// never moved: a picture is copied out while the next one is decoded
+	fFrames.reserve(kMaxFrames);
 }
 
 
@@ -280,6 +288,122 @@ merge_ten_bit(const uint8* row, const uint8* twoBit, uint32 first,
 }
 
 
+/*!	Half the row: each sample the mean of a 2x2 block of \a top and
+	\a bottom (sixteen bit samples; what the mean has below the ten bits
+	stays).
+*/
+static void
+halve_samples16(const uint16* top, const uint16* bottom, uint32 count,
+	uint16* target)
+{
+	uint32 i = 0;
+#if defined(__ARM_NEON)
+	const uint32x4_t two = vdupq_n_u32(2);
+	for (; i + 8 <= count; i += 8) {
+		uint32x4_t low = vaddq_u32(vpaddlq_u16(vld1q_u16(top + 2 * i)),
+			vpaddlq_u16(vld1q_u16(bottom + 2 * i)));
+		uint32x4_t high = vaddq_u32(vpaddlq_u16(vld1q_u16(top + 2 * i + 8)),
+			vpaddlq_u16(vld1q_u16(bottom + 2 * i + 8)));
+		vst1q_u16(target + i, vcombine_u16(
+			vmovn_u32(vshrq_n_u32(vaddq_u32(low, two), 2)),
+			vmovn_u32(vshrq_n_u32(vaddq_u32(high, two), 2))));
+	}
+#endif
+	for (; i < count; i++) {
+		target[i] = (uint16)(((uint32)top[2 * i] + top[2 * i + 1]
+			+ bottom[2 * i] + bottom[2 * i + 1] + 2) >> 2);
+	}
+}
+
+
+/*!	As halve_samples16(), for rows of Cb Cr pairs: \a count pairs out. */
+static void
+halve_pairs16(const uint16* top, const uint16* bottom, uint32 count,
+	uint16* target)
+{
+	uint32 i = 0;
+#if defined(__ARM_NEON)
+	const uint32x4_t two = vdupq_n_u32(2);
+	for (; i + 4 <= count; i += 4) {
+		uint16x8x2_t a = vld2q_u16(top + 4 * i);
+		uint16x8x2_t b = vld2q_u16(bottom + 4 * i);
+		uint16x4x2_t out;
+		out.val[0] = vmovn_u32(vshrq_n_u32(vaddq_u32(vaddq_u32(
+			vpaddlq_u16(a.val[0]), vpaddlq_u16(b.val[0])), two), 2));
+		out.val[1] = vmovn_u32(vshrq_n_u32(vaddq_u32(vaddq_u32(
+			vpaddlq_u16(a.val[1]), vpaddlq_u16(b.val[1])), two), 2));
+		vst2_u16(target + 2 * i, out);
+	}
+#endif
+	for (; i < count; i++) {
+		for (uint32 c = 0; c < 2; c++) {
+			target[2 * i + c] = (uint16)(((uint32)top[4 * i + c]
+				+ top[4 * i + 2 + c] + bottom[4 * i + c]
+				+ bottom[4 * i + 2 + c] + 2) >> 2);
+		}
+	}
+}
+
+
+/*!	As halve_samples16(), for eight bit samples. */
+static void
+halve_samples8(const uint8* top, const uint8* bottom, uint32 count,
+	uint8* target)
+{
+	uint32 i = 0;
+#if defined(__ARM_NEON)
+	for (; i + 8 <= count; i += 8) {
+		vst1_u8(target + i, vrshrn_n_u16(vaddq_u16(
+			vpaddlq_u8(vld1q_u8(top + 2 * i)),
+			vpaddlq_u8(vld1q_u8(bottom + 2 * i))), 2));
+	}
+#endif
+	for (; i < count; i++) {
+		target[i] = (uint8)(((uint32)top[2 * i] + top[2 * i + 1]
+			+ bottom[2 * i] + bottom[2 * i + 1] + 2) >> 2);
+	}
+}
+
+
+/*!	Rows of eight bit Cb Cr pairs halved into a Cb and a Cr row: \a count
+	samples of each out. */
+static void
+halve_pairs8(const uint8* top, const uint8* bottom, uint32 count, uint8* cb,
+	uint8* cr)
+{
+	uint32 i = 0;
+#if defined(__ARM_NEON)
+	for (; i + 16 <= count; i += 16) {
+		// Cb, Cr of the even pairs, then of the odd ones
+		uint8x16x4_t a = vld4q_u8(top + 4 * i);
+		uint8x16x4_t b = vld4q_u8(bottom + 4 * i);
+		uint16x8_t cbLow = vaddq_u16(vaddl_u8(vget_low_u8(a.val[0]),
+			vget_low_u8(a.val[2])), vaddl_u8(vget_low_u8(b.val[0]),
+			vget_low_u8(b.val[2])));
+		uint16x8_t cbHigh = vaddq_u16(vaddl_u8(vget_high_u8(a.val[0]),
+			vget_high_u8(a.val[2])), vaddl_u8(vget_high_u8(b.val[0]),
+			vget_high_u8(b.val[2])));
+		uint16x8_t crLow = vaddq_u16(vaddl_u8(vget_low_u8(a.val[1]),
+			vget_low_u8(a.val[3])), vaddl_u8(vget_low_u8(b.val[1]),
+			vget_low_u8(b.val[3])));
+		uint16x8_t crHigh = vaddq_u16(vaddl_u8(vget_high_u8(a.val[1]),
+			vget_high_u8(a.val[3])), vaddl_u8(vget_high_u8(b.val[1]),
+			vget_high_u8(b.val[3])));
+		vst1q_u8(cb + i, vcombine_u8(vrshrn_n_u16(cbLow, 2),
+			vrshrn_n_u16(cbHigh, 2)));
+		vst1q_u8(cr + i, vcombine_u8(vrshrn_n_u16(crLow, 2),
+			vrshrn_n_u16(crHigh, 2)));
+	}
+#endif
+	for (; i < count; i++) {
+		cb[i] = (uint8)(((uint32)top[4 * i] + top[4 * i + 2]
+			+ bottom[4 * i] + bottom[4 * i + 2] + 2) >> 2);
+		cr[i] = (uint8)(((uint32)top[4 * i + 1] + top[4 * i + 3]
+			+ bottom[4 * i + 1] + bottom[4 * i + 3] + 2) >> 2);
+	}
+}
+
+
 static void
 split_chroma(const uint8* source, uint8* cb, uint8* cr, uint32 count)
 {
@@ -298,6 +422,146 @@ split_chroma(const uint8* source, uint8* cb, uint8* cr, uint32 count)
 }
 
 
+
+
+extern "C" status_t _kern_set_thread_affinity(thread_id id,
+	const void* userMask, size_t size);
+
+
+/*!	Threads that merge and copy the rows of a picture between them while
+	the caller waits. Where the processors differ (the A733's two Cortex-A76
+	and six A55) they are the slow ones: a player scales and tone maps the
+	previous picture on the fast ones meanwhile (airTime does), and copying
+	is bound by memory more than by the core. A 4K Main 10 picture took
+	13-17 ms on whichever core the caller's thread was on.
+	CEDAR_MERGE_THREADS sets how many (0: the caller alone), CEDAR_MERGE_CORES
+	which ("fast", "slow" or "all").
+*/
+class MergePool {
+public:
+	static MergePool* Default()
+	{
+		static MergePool* sPool = new(std::nothrow) MergePool;
+		return sPool;
+	}
+
+	int32 Count() const { return (int32)fThreads.size(); }
+
+	// Calls function(first, last) for bands of [0, rows), returns when all
+	// are done.
+	void Run(uint32 rows, const std::function<void(uint32, uint32)>& function)
+	{
+		std::unique_lock<std::mutex> lock(fLock);
+		fFunction = &function;
+		fRows = rows;
+		fGrain = rows / (fThreads.size() * 8) + 1;
+		fNext.store(0);
+		fBusy = fThreads.size();
+		fGeneration++;
+		fWake.notify_all();
+		fDone.wait(lock, [this] { return fBusy == 0; });
+		fFunction = NULL;
+	}
+
+private:
+	MergePool()
+		:
+		fFunction(NULL),
+		fRows(0),
+		fGrain(1),
+		fBusy(0),
+		fGeneration(0)
+	{
+		const char* cores = getenv("CEDAR_MERGE_CORES");
+		std::vector<int32> processors = _Processors(cores != NULL
+			&& strcmp(cores, "fast") == 0 ? kFast
+			: cores != NULL && strcmp(cores, "all") == 0 ? kAll : kSlow);
+		int32 count = (int32)processors.size();
+		if (const char* value = getenv("CEDAR_MERGE_THREADS"))
+			count = atoi(value);
+		for (int32 i = 0; i < count; i++) {
+			int32 processor = processors.empty() ? -1
+				: processors[i % processors.size()];
+			fThreads.emplace_back(&MergePool::_Work, this, processor);
+		}
+	}
+
+	enum which { kFast, kSlow, kAll };
+
+	/*!	The processors of one kind where there are two (the slow ones by
+		their default frequency), else all of them. */
+	static std::vector<int32> _Processors(which kind)
+	{
+		std::vector<int32> chosen;
+		cpu_topology_node_info nodes[64];
+		uint32 count = 64;
+		if (get_cpu_topology_info(nodes, &count) != B_OK)
+			return chosen;
+		uint64 fastest = 0;
+		uint64 slowest = UINT64_MAX;
+		for (uint32 i = 0; i < count; i++) {
+			if (nodes[i].type != B_TOPOLOGY_CORE)
+				continue;
+			fastest = max_c(fastest, nodes[i].data.core.default_frequency);
+			slowest = min_c(slowest, nodes[i].data.core.default_frequency);
+		}
+		uint64 frequency = 0;
+		for (uint32 i = 0; i < count; i++) {
+			if (nodes[i].type == B_TOPOLOGY_CORE)
+				frequency = nodes[i].data.core.default_frequency;
+			else if (nodes[i].type == B_TOPOLOGY_SMT && nodes[i].id < 64
+				&& (kind == kAll || fastest == slowest
+					|| frequency == (kind == kFast ? fastest : slowest))) {
+				chosen.push_back(nodes[i].id);
+			}
+		}
+		return chosen;
+	}
+
+	void _Work(int32 processor)
+	{
+		// as the player's decoding thread: a picture waits on these
+		rename_thread(find_thread(NULL), "sunxi_cedar copy");
+		set_thread_priority(find_thread(NULL), B_DISPLAY_PRIORITY);
+		if (processor >= 0) {
+			uint32 mask[2] = { 0, 0 };
+			mask[processor / 32] |= 1u << (processor % 32);
+			_kern_set_thread_affinity(find_thread(NULL), mask, sizeof(mask));
+		}
+		uint64 seen = 0;
+		std::unique_lock<std::mutex> lock(fLock);
+		while (true) {
+			fWake.wait(lock, [&] { return fGeneration != seen; });
+			seen = fGeneration;
+			const std::function<void(uint32, uint32)>* function = fFunction;
+			uint32 rows = fRows;
+			uint32 grain = fGrain;
+			lock.unlock();
+			while (true) {
+				uint32 first = fNext.fetch_add(grain);
+				if (first >= rows)
+					break;
+				(*function)(first, min_c(first + grain, rows));
+			}
+			lock.lock();
+			if (--fBusy == 0)
+				fDone.notify_one();
+		}
+	}
+
+	std::vector<std::thread> fThreads;
+	std::mutex fLock;
+	std::condition_variable fWake;
+	std::condition_variable fDone;
+	const std::function<void(uint32, uint32)>* fFunction;
+	uint32 fRows;
+	uint32 fGrain;
+	std::atomic<uint32> fNext;
+	size_t fBusy;
+	uint64 fGeneration;
+};
+
+
 void
 CedarDecoder::CopyPlanes(const Picture& picture, uint8* target, uint32 stride,
 	bool interleaved)
@@ -310,22 +574,33 @@ CedarDecoder::CopyPlanes(const Picture& picture, uint8* target, uint32 stride,
 		// P010: the eight bit picture's samples, with their low two bits
 		fDevice.SyncForCpu(frame.picture, 0, frame.picture.size);
 		const uint8* twoBit = frame.picture.address + frame.twoBitOffset;
-		for (uint32 row = 0; row < frame.height; row++) {
-			uint32 y = frame.cropTop + row;
-			merge_ten_bit(frame.picture.address + (size_t)y * frame.stride,
-				twoBit + (size_t)y * frame.twoBitStride, frame.cropLeft,
-				frame.width, (uint16*)(target + (size_t)row * stride));
-		}
 		const uint8* chroma = frame.picture.address + frame.lumaSize;
 		const uint8* twoBitChroma = frame.picture.address + frame.twoBitChroma;
 		uint8* chromaTarget = target + (size_t)stride * frame.height;
-		for (uint32 row = 0; row < (frame.height + 1) / 2; row++) {
-			uint32 y = frame.cropTop / 2 + row;
-			merge_ten_bit(chroma + (size_t)y * frame.stride,
-				twoBitChroma + (size_t)y * frame.twoBitStride,
-				frame.cropLeft & ~1u, ((frame.width + 1) / 2) * 2,
-				(uint16*)(chromaTarget + (size_t)row * stride));
-		}
+		uint32 chromaRows = (frame.height + 1) / 2;
+		// luma rows, then chroma rows, as one run of rows
+		auto merge = [&](uint32 first, uint32 last) {
+			for (uint32 row = first; row < last; row++) {
+				if (row < frame.height) {
+					uint32 y = frame.cropTop + row;
+					merge_ten_bit(frame.picture.address + (size_t)y * frame.stride,
+						twoBit + (size_t)y * frame.twoBitStride, frame.cropLeft,
+						frame.width, (uint16*)(target + (size_t)row * stride));
+				} else {
+					uint32 chromaRow = row - frame.height;
+					uint32 y = frame.cropTop / 2 + chromaRow;
+					merge_ten_bit(chroma + (size_t)y * frame.stride,
+						twoBitChroma + (size_t)y * frame.twoBitStride,
+						frame.cropLeft & ~1u, ((frame.width + 1) / 2) * 2,
+						(uint16*)(chromaTarget + (size_t)chromaRow * stride));
+				}
+			}
+		};
+		MergePool* pool = MergePool::Default();
+		if (pool != NULL && pool->Count() > 0)
+			pool->Run(frame.height + chromaRows, merge);
+		else
+			merge(0, frame.height + chromaRows);
 		return;
 	}
 
@@ -447,6 +722,86 @@ pack_rgb32(const uint8* luma, const uint8* chroma, uint8* target,
 		target[4 * x] = clamp_sample((y + matrix[4] * cb + 32) >> 6);
 		target[4 * x + 3] = 255;
 	}
+}
+
+
+void
+CedarDecoder::CopyHalfPlanes(const Picture& picture, uint8* target,
+	uint32 stride)
+{
+	if (picture.frame < 0 || (size_t)picture.frame >= fFrames.size())
+		return;
+	const CedarFrame& frame = *fFrames[picture.frame];
+	bool tenBit = frame.bitDepth > 8;
+	uint32 width = frame.width / 2;
+	uint32 height = frame.height / 2;
+	uint32 chromaRows = height / 2;
+
+	// what the engine wrote is in memory, the cache may have older lines
+	fDevice.SyncForCpu(frame.picture, 0,
+		tenBit ? frame.picture.size : frame.lumaSize + frame.lumaSize / 2);
+
+	const uint8* luma = frame.picture.address;
+	const uint8* chroma = frame.picture.address + frame.lumaSize;
+	const uint8* twoBit = frame.picture.address + frame.twoBitOffset;
+	const uint8* twoBitChroma = frame.picture.address + frame.twoBitChroma;
+	uint8* chromaTarget = target + (size_t)stride * height;
+	uint32 halfStride = stride / 2;
+	uint8* cbTarget = chromaTarget;
+	uint8* crTarget = chromaTarget + (size_t)halfStride * chromaRows;
+
+	// luma rows, then chroma rows, as one run of rows
+	auto halve = [&](uint32 first, uint32 last) {
+		static thread_local std::vector<uint16> top, bottom;
+		if (tenBit) {
+			top.resize(frame.width);
+			bottom.resize(frame.width);
+		}
+		for (uint32 row = first; row < last; row++) {
+			if (row < height) {
+				uint32 y = frame.cropTop + 2 * row;
+				uint16* out = (uint16*)(target + (size_t)row * stride);
+				if (tenBit) {
+					merge_ten_bit(luma + (size_t)y * frame.stride,
+						twoBit + (size_t)y * frame.twoBitStride,
+						frame.cropLeft, frame.width, top.data());
+					merge_ten_bit(luma + (size_t)(y + 1) * frame.stride,
+						twoBit + (size_t)(y + 1) * frame.twoBitStride,
+						frame.cropLeft, frame.width, bottom.data());
+					halve_samples16(top.data(), bottom.data(), width, out);
+				} else {
+					halve_samples8(luma + (size_t)y * frame.stride
+							+ frame.cropLeft,
+						luma + (size_t)(y + 1) * frame.stride + frame.cropLeft,
+						width, target + (size_t)row * stride);
+				}
+				continue;
+			}
+			uint32 chromaRow = row - height;
+			uint32 y = frame.cropTop / 2 + 2 * chromaRow;
+			uint32 left = frame.cropLeft & ~1u;
+			if (tenBit) {
+				merge_ten_bit(chroma + (size_t)y * frame.stride,
+					twoBitChroma + (size_t)y * frame.twoBitStride, left,
+					frame.width, top.data());
+				merge_ten_bit(chroma + (size_t)(y + 1) * frame.stride,
+					twoBitChroma + (size_t)(y + 1) * frame.twoBitStride, left,
+					frame.width, bottom.data());
+				halve_pairs16(top.data(), bottom.data(), width / 2,
+					(uint16*)(chromaTarget + (size_t)chromaRow * stride));
+			} else {
+				halve_pairs8(chroma + (size_t)y * frame.stride + left,
+					chroma + (size_t)(y + 1) * frame.stride + left, width / 2,
+					cbTarget + (size_t)chromaRow * halfStride,
+					crTarget + (size_t)chromaRow * halfStride);
+			}
+		}
+	};
+	MergePool* pool = MergePool::Default();
+	if (pool != NULL && pool->Count() > 0)
+		pool->Run(height + chromaRows, halve);
+	else
+		halve(0, height + chromaRows);
 }
 
 
