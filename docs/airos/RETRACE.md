@@ -155,6 +155,22 @@ frame (3 to 8 % of the frames were made of both pictures before); and it
 never waits: a rect whose shadow is being written is left for the next
 blank (waiting for the write delayed 457 of 3064 copies behind the scan).
 
+### Cubie A7S, 2026-10-15 23:28 (the flush, ARM64)
+
+DisplayPort 1920x1080 at 60 Hz, `sunxi_display`'s TCON interrupt semaphore,
+one target for the screen (no per-output or scan-line hooks there), the
+arm64 app_server repacked into the board's package
+(`retrace/cubie-vblank-run.sh`, `cubie-vblank-test.sh`):
+
+| Minute | Flushes | Rectangles | Behind the scan (estimated) | Longest flush |
+| --- | --- | --- | --- | --- |
+| 1900x1000 window redrawn as fast as it can, no wait | 3564 | 4865 | 0 | 2.6 ms |
+| 1200x700 window dragged | 3566 | 10630 | 0 | 3.0 ms |
+| the tests before | 1324 | 3419 | 1 | 2.9 ms |
+
+The program redrew 147 times a second and moved the window 111 times a
+second; the display showed 60 whole frames of each.
+
 ## Checking it
 
 `retrace_test` (in `src/tests/servers/app/retrace`, in the Cubie lab image):
