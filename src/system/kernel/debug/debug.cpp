@@ -88,6 +88,27 @@ static arch_debug_registers sDebugRegisters[SMP_MAX_CPUS];
 static debug_page_fault_info sPageFaultInfo;
 
 static bool sSerialDebugEnabled = true;
+
+// Serial output has its own thread once the kernel runs threads. A 16550 at
+// 115200 baud takes 87 us per character, and with every line written by the
+// thread that logs it, a boot that prints a few hundred KB spends tens of
+// seconds in the UART wait loop with interrupts off, on a desktop whose
+// serial header nobody is watching. Lines go into sSerialBuffer and the
+// serial writer feeds them to the port. Before the thread exists, inside the
+// kernel debugger, or with serial_debug_sync set, each line is written at
+// once as before; entering the debugger first writes out whatever is queued.
+static struct ring_buffer* sSerialBuffer = NULL;
+static struct ring_buffer* sSerialPendingBuffer = NULL;
+	// allocated early, handed to sSerialBuffer once the writer thread runs
+static spinlock sSerialBufferLock = B_SPINLOCK_INITIALIZER;
+static sem_id sSerialWriterSem = -1;
+static thread_id sSerialWriter = -1;
+static int32 sSerialWriterWakeupPending = 0;
+static int32 sSerialDroppedBytes = 0;
+static bool sSerialSync = false;
+#define SERIAL_BUFFER_SIZE (1024 * 1024)
+#define SERIAL_CHUNK_SIZE 16
+	// what a 16550 FIFO takes in one go
 static bool sSyslogOutputEnabled = true;
 static bool sLogTimeStamps = false;
 static bool sBlueScreenEnabled = false;
@@ -128,6 +149,7 @@ DefaultDebugOutputFilter gDefaultDebugOutputFilter;
 static mutex sOutputLock = MUTEX_INITIALIZER("debug output");
 
 static void flush_pending_repeats(bool notifySyslog);
+static void serial_flush_queued();
 static void check_pending_repeats(void* data, int iter);
 
 static int64 sMessageRepeatFirstTime = 0;
@@ -1067,6 +1089,8 @@ kernel_debugger_internal(const char* messagePrefix, const char* message,
 		} else
 			enter_kernel_debugger(cpu, previousCPU);
 
+		serial_flush_queued();
+
 		kernel_debugger_loop(messagePrefix, message, args, cpu);
 
 		if (sHandOverKDLToCPU < 0 && previousCPU == -1) {
@@ -1389,8 +1413,11 @@ syslog_init_post_vm(struct kernel_args* args)
 				"syslog_buffer_size", NULL, NULL);
 			if (sizeString != NULL) {
 				bufferSize = strtoul(sizeString, NULL, 0);
-				if (bufferSize > 262144)
-					bufferSize = 262144;
+				// A modern x86 boot writes well over 256 KB before the
+				// syslog daemon can drain the buffer; the cap only has to
+				// keep a typo from eating the heap.
+				if (bufferSize > 4 * 1024 * 1024)
+					bufferSize = 4 * 1024 * 1024;
 				else if (bufferSize < SYSLOG_MESSAGE_BUFFER_SIZE)
 					bufferSize = SYSLOG_MESSAGE_BUFFER_SIZE;
 			}
@@ -1534,6 +1561,112 @@ call_modules_hook(bool enter)
 }
 
 
+/*!	Writes a chunk of queued serial output to the port. Returns false when the
+	queue was empty.
+*/
+static bool
+serial_write_queued_chunk()
+{
+	char chunk[SERIAL_CHUNK_SIZE + 1];
+	size_t length;
+	{
+		InterruptsSpinLocker locker(sSerialBufferLock);
+		length = ring_buffer_read(sSerialBuffer, (uint8*)chunk,
+			SERIAL_CHUNK_SIZE);
+	}
+	if (length == 0)
+		return false;
+
+	chunk[length] = '\0';
+	arch_debug_serial_puts(chunk);
+
+	int32 dropped = atomic_get_and_set(&sSerialDroppedBytes, 0);
+	if (dropped > 0) {
+		char note[64];
+		snprintf(note, sizeof(note),
+			"<%" B_PRId32 " bytes of serial debug output dropped>\n", dropped);
+		arch_debug_serial_puts(note);
+	}
+	return true;
+}
+
+
+static int32
+serial_writer(void*)
+{
+	// A chunk takes 16 character times to leave a 16550 FIFO at 115200
+	// baud; sleeping that long between chunks keeps the thread from
+	// spinning on the line status while the port drains.
+	const bigtime_t kChunkTime = SERIAL_CHUNK_SIZE * 10 * 1000000LL / 115200;
+
+	while (true) {
+		// the timeout catches output queued while a wakeup could not be sent
+		acquire_sem_etc(sSerialWriterSem, 1, B_RELATIVE_TIMEOUT, 1000000);
+		atomic_set(&sSerialWriterWakeupPending, 0);
+
+		while (serial_write_queued_chunk())
+			snooze(kChunkTime);
+	}
+	return 0;
+}
+
+
+/*!	Writes a line of debug output to the serial port: queued for the serial
+	writer when it runs, directly otherwise. Called with sSpinlock held.
+*/
+static void
+serial_puts(const char* string, size_t length)
+{
+	if (sSerialBuffer == NULL || sSerialSync || debug_debugger_running()) {
+		arch_debug_serial_puts(string);
+		return;
+	}
+
+	acquire_spinlock(&sSerialBufferLock);
+	if (ring_buffer_writable(sSerialBuffer) < length) {
+		release_spinlock(&sSerialBufferLock);
+		atomic_add(&sSerialDroppedBytes, length);
+		return;
+	}
+	ring_buffer_write(sSerialBuffer, (const uint8*)string, length);
+	release_spinlock(&sSerialBufferLock);
+
+	// release_sem_etc() does nothing during the kernel startup, so a wakeup
+	// armed then would never fire again; the writer's timeout picks up what
+	// was queued in the meantime.
+	if (gKernelStartup)
+		return;
+	if (atomic_get_and_set(&sSerialWriterWakeupPending, 1) == 0)
+		release_sem_etc(sSerialWriterSem, 1, B_DO_NOT_RESCHEDULE);
+}
+
+
+/*!	Writes out everything the serial writer has not sent yet. Called on
+	entering the kernel debugger, when the other CPUs are halted: the writer
+	may have been stopped holding the buffer lock, in which case the queue is
+	left alone rather than deadlocking.
+*/
+static void
+serial_flush_queued()
+{
+	if (sSerialBuffer == NULL || sSerialSync)
+		return;
+	if (!try_acquire_spinlock(&sSerialBufferLock))
+		return;
+
+	char chunk[SERIAL_CHUNK_SIZE + 1];
+	while (true) {
+		size_t length = ring_buffer_read(sSerialBuffer, (uint8*)chunk,
+			SERIAL_CHUNK_SIZE);
+		if (length == 0)
+			break;
+		chunk[length] = '\0';
+		arch_debug_serial_puts(chunk);
+	}
+	release_spinlock(&sSerialBufferLock);
+}
+
+
 //!	Must be called with the sSpinlock held.
 static void
 debug_output(const char* string, int32 length, bool notifySyslog)
@@ -1551,7 +1684,7 @@ debug_output(const char* string, int32 length, bool notifySyslog)
 		flush_pending_repeats(notifySyslog);
 
 		if (sSerialDebugEnabled)
-			arch_debug_serial_puts(string);
+			serial_puts(string, length);
 		if (sSyslogOutputEnabled)
 			syslog_write(string, length, notifySyslog);
 		if (sBlueScreenEnabled || sDebugScreenEnabled)
@@ -1583,7 +1716,7 @@ flush_pending_repeats(bool notifySyslog)
 		length = std::min(length, sizeof(temp) - 1);
 
 		if (sSerialDebugEnabled)
-			arch_debug_serial_puts(temp);
+			serial_puts(temp, length);
 		if (sSyslogOutputEnabled)
 			syslog_write(temp, length, notifySyslog);
 		if (sBlueScreenEnabled || sDebugScreenEnabled)
@@ -1599,7 +1732,7 @@ flush_pending_repeats(bool notifySyslog)
 		size_t length = strlen(sLastOutputBuffer);
 
 		if (sSerialDebugEnabled)
-			arch_debug_serial_puts(sLastOutputBuffer);
+			serial_puts(sLastOutputBuffer, length);
 		if (sSyslogOutputEnabled)
 			syslog_write(sLastOutputBuffer, length, notifySyslog);
 		if (sBlueScreenEnabled || sDebugScreenEnabled)
@@ -1816,6 +1949,35 @@ debug_init_post_settings(struct kernel_args* args)
 
 	arch_debug_console_init_settings(args);
 	syslog_init_post_vm(args);
+
+	// The serial writer's buffer is allocated here, next to the syslog
+	// buffer, where the heap is known to serve such sizes. The thread comes
+	// in debug_init_post_thread(); until then the buffer stays unused and
+	// serial output is written directly.
+	sSerialSync = get_safemode_boolean("serial_debug_sync", sSerialSync);
+	if (sSerialDebugEnabled && !sSerialSync)
+		sSerialPendingBuffer = create_ring_buffer(SERIAL_BUFFER_SIZE);
+}
+
+
+void
+debug_init_post_thread(struct kernel_args* args)
+{
+	if (sSerialPendingBuffer == NULL)
+		return;
+
+	sSerialWriterSem = create_sem(0, "serial debug writer");
+	if (sSerialWriterSem < 0)
+		return;
+	sSerialWriter = spawn_kernel_thread(serial_writer, "serial debug writer",
+		B_URGENT_DISPLAY_PRIORITY, NULL);
+	if (sSerialWriter < 0) {
+		delete_sem(sSerialWriterSem);
+		sSerialWriterSem = -1;
+		return;
+	}
+	sSerialBuffer = sSerialPendingBuffer;
+	resume_thread(sSerialWriter);
 }
 
 
