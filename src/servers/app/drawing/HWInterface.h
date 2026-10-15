@@ -196,6 +196,9 @@ public:
 	virtual	sem_id				OutputRetraceSemaphore(uint32 id);
 									// released at that display output's
 									// blanks; B_UNSUPPORTED without
+			void				WaitForPendingFlush(bigtime_t timeout);
+									// until what was queued so far is on
+									// the screen (not locked)
 
 protected:
 	virtual	void				_CopyBackToFront(/*const*/ BRegion& region);

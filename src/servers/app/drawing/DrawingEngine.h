@@ -65,6 +65,9 @@ public:
 
 	// for screen shots
 			ServerBitmap*	DumpToBitmap();
+			void			WaitForPendingFlush();
+								// what was drawn is on the screen (or a
+								// few frames passed); not locked
 	virtual	status_t		ReadBitmap(ServerBitmap *bitmap, bool drawCursor,
 								BRect bounds);
 
