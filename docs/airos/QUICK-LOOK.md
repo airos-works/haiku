@@ -41,7 +41,10 @@ src/kits/tracker/QuickLook.*   Tracker's side: finds or starts the server
   launching it through the roster when it is not running
   (`data/launch/system` lists it on demand). While the panel is up, every
   change of the selection sends the new refs (coalesced over 50 ms, for a
-  held arrow key); Escape, a closed window and the window losing the
+  held arrow key). The server is a `BServer`: only its constructor asks
+  launch_daemon for the port made for an on-demand service, and as a plain
+  `BApplication` it read its own port while Tracker's messages queued
+  unread in launch_daemon's (found after the first package install); Escape, a closed window and the window losing the
   keyboard hide it. The server tells the owner when the panel is up
   (`kMsgQuickLookShown`) and when it closed (`kMsgQuickLookClosed`), so the
   two agree even when the server was restarted in between.

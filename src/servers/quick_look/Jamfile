@@ -1,6 +1,6 @@
 SubDir HAIKU_TOP src servers quick_look ;
 
-UsePrivateHeaders interface quicklook shared ;
+UsePrivateHeaders app interface quicklook shared ;
 
 Application quick_look_server :
 	AddOnManager.cpp

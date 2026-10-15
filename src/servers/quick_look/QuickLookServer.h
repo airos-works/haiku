@@ -6,7 +6,7 @@
 #define QUICK_LOOK_SERVER_H
 
 
-#include <Application.h>
+#include <Server.h>
 
 
 class AddOnManager;
@@ -14,7 +14,11 @@ class BMessageRunner;
 class PreviewWindow;
 
 
-class QuickLookServer : public BApplication {
+/*!	A BServer rather than a BApplication: only BServer's constructor asks
+	launch_daemon for the port it made for an on-demand service, and a
+	plain BApplication would read its own port while the panel's messages
+	queued, unread, in launch_daemon's. */
+class QuickLookServer : public BServer {
 public:
 								QuickLookServer();
 	virtual						~QuickLookServer();

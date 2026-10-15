@@ -28,7 +28,7 @@ static const bigtime_t kIdleQuitDelay = 3 * 60 * 1000000LL;
 
 QuickLookServer::QuickLookServer()
 	:
-	BApplication(B_QUICK_LOOK_SIGNATURE),
+	BServer(B_QUICK_LOOK_SIGNATURE, true, NULL),
 	fAddOns(new AddOnManager()),
 	fWindow(NULL),
 	fQuitRunner(NULL)
@@ -78,7 +78,7 @@ QuickLookServer::MessageReceived(BMessage* message)
 			break;
 
 		default:
-			BApplication::MessageReceived(message);
+			BServer::MessageReceived(message);
 	}
 }
 
