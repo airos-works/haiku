@@ -533,6 +533,24 @@
 			status = "disabled";
 		};
 
+		usb3: usb@6a00000 {
+			/* The USB-C port's DesignWare USB3 core (the BSP's usbc2).
+			   The xhci driver powers its PCK-600 domain, clocks, reset
+			   and USB 2 PHY itself (U-Boot leaves them off); the USB 3
+			   lanes belong to the DisplayPort alt mode, so it runs USB 2
+			   only. */
+			compatible = "allwinner,sun60i-a733-dwc3", "snps,dwc3";
+			reg = <0x6a00000 0x100000>;
+			interrupts = <GIC_SPI 155 IRQ_TYPE_LEVEL_HIGH>;
+			dr_mode = "host";
+			maximum-speed = "high-speed";
+			phy_type = "utmi";
+			snps,dis_u2_susphy_quirk;
+			snps,dis_u3_susphy_quirk;
+			snps,dis_enblslpm_quirk;
+			status = "disabled";
+		};
+
 		gmac0: ethernet@4500000 {
 			compatible = "allwinner,sun60i-a733-gmac210",
 				     "snps,dwmac-5.20";

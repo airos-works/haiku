@@ -98,6 +98,10 @@
 	status = "okay";
 };
 
+&usb3 {
+	status = "okay";
+};
+
 &ohci1 {
 	status = "okay";
 };
