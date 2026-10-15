@@ -84,10 +84,15 @@ main(int, char **argv)
 		}
 
 		if (strcmp(argv[i], "--add-volume") == 0) {
+			// (our own path, not argv[0], which is a bare name when run
+			// from the shell's PATH)
+			image_info image;
 			entry_ref ref;
-			if (get_ref_for_path(argv[0], &ref) == B_OK) {
+			if (our_image(image) == B_OK
+				&& get_ref_for_path(image.name, &ref) == B_OK) {
 				deskbar.AddItem(&ref);
-			}
+			} else if (get_ref_for_path(argv[0], &ref) == B_OK)
+				deskbar.AddItem(&ref);
 			return 0;
 		}
 
