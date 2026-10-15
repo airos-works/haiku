@@ -853,12 +853,19 @@ DefaultManager::CleanupTeam(team_id team)
 void
 DefaultManager::NodeUnregistered(media_node_id node)
 {
-	if (fPhysicalVideoIn == node)
+	bool lost = false;
+	if (fPhysicalVideoIn == node) {
 		fPhysicalVideoIn = -1;
-	if (fPhysicalVideoOut == node)
+		lost = true;
+	}
+	if (fPhysicalVideoOut == node) {
 		fPhysicalVideoOut = -1;
-	if (fPhysicalAudioIn == node)
+		lost = true;
+	}
+	if (fPhysicalAudioIn == node) {
 		fPhysicalAudioIn = -1;
+		lost = true;
+	}
 	if (fTimeSource == node)
 		fTimeSource = -1;
 
@@ -876,4 +883,10 @@ DefaultManager::NodeUnregistered(media_node_id node)
 		fMixerToPhysicalAudioOut.node = media_node::null;
 		fPhysicalAudioOutFromMixer.node = media_node::null;
 	}
+
+	// A default that is gone is replaced at once (the media_addon_server
+	// asks for a rescan when a device of an add-on goes, but not when a
+	// whole add-on does); the rescan runs in its own thread.
+	if (lost || connectionLost)
+		Rescan();
 }
