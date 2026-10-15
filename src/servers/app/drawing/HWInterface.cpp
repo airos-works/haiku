@@ -1198,7 +1198,7 @@ HWInterface::_FlushThread(FlushTarget& target)
 			bigtime_t wakeAt = next - 1500;
 			if (wakeAt > system_time())
 				snooze_until(wakeAt, B_SYSTEM_TIMEBASE);
-			while (system_time() < next - 200)
+			while (system_time() < next - 500)
 				;
 			target.wokeLate = system_time() - next;
 			blank = next;
