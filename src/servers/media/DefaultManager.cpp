@@ -837,8 +837,11 @@ DefaultManager::CleanupTeam(team_id team)
 }
 
 
-/*!	A default video node that is gone (a camera that was unplugged) must not
-	stay the default: the next rescan then looks for another one.
+/*!	A default node that is gone (a camera that was unplugged, the sound card
+	node or the mixer of a media_addon_server that died) must not stay the
+	default: the next rescan then looks for another one. A gone mixer or
+	sound card also takes the mixer connection with it; the rescan makes a
+	new one and must not try to disconnect the old one first.
 */
 void
 DefaultManager::NodeUnregistered(media_node_id node)
@@ -847,4 +850,23 @@ DefaultManager::NodeUnregistered(media_node_id node)
 		fPhysicalVideoIn = -1;
 	if (fPhysicalVideoOut == node)
 		fPhysicalVideoOut = -1;
+	if (fPhysicalAudioIn == node)
+		fPhysicalAudioIn = -1;
+	if (fTimeSource == node)
+		fTimeSource = -1;
+
+	bool connectionLost = false;
+	if (fPhysicalAudioOut == node) {
+		fPhysicalAudioOut = -1;
+		connectionLost = true;
+	}
+	if (fAudioMixer == node) {
+		fAudioMixer = -1;
+		connectionLost = true;
+	}
+	if (connectionLost) {
+		fMixerConnected = false;
+		fMixerToPhysicalAudioOut.node = media_node::null;
+		fPhysicalAudioOutFromMixer.node = media_node::null;
+	}
 }

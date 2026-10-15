@@ -8,6 +8,7 @@
  */
 
 
+#include <algorithm>
 #include <driver_settings.h>
 
 #include "driver.h"
@@ -1133,8 +1134,24 @@ buffer_exchange(hda_audio_group* audioGroup, multi_buffer_info* data)
 #endif
 
 	/* do playback */
-	err = acquire_sem_etc(audioGroup->codec->controller->buffer_ready_sem,
-		1, B_CAN_INTERRUPT, 0);
+	// A buffer interrupt is due every buffer period. When none arrives in
+	// several periods, look for a stream status the controller left pending
+	// without an interrupt (see hda_recover_lost_interrupt()) rather than
+	// waiting for ever: the time source then stops, and every media node
+	// stalls with it.
+	hda_stream* playbackStream = audioGroup->playback_stream;
+	bigtime_t timeout = 100000;
+	if (playbackStream->sample_rate > 0) {
+		timeout = std::max(timeout, 4 * (bigtime_t)playbackStream->buffer_length
+			* 1000000 / playbackStream->sample_rate);
+	}
+	while (true) {
+		err = acquire_sem_etc(audioGroup->codec->controller->buffer_ready_sem,
+			1, B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT, timeout);
+		if (err != B_TIMED_OUT)
+			break;
+		hda_recover_lost_interrupt(audioGroup->codec->controller);
+	}
 	if (err != B_OK) {
 		ERROR("%s: Error waiting for playback buffer to finish (%s)!\n", __func__,
 			strerror(err));

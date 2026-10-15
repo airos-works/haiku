@@ -94,13 +94,15 @@ private:
 			BLocker				fLocker;
 			port_id				fControlPort;
 			thread_id			fControlThread;
+			bool				fQuitting;
 };
 
 
 ServerApp::ServerApp(status_t& error)
  	:
 	BServer(B_MEDIA_SERVER_SIGNATURE, true, &error),
-	fLocker("media server locker")
+	fLocker("media server locker"),
+	fQuitting(false)
 {
  	gNotificationManager = new NotificationManager;
  	gBufferManager = new BufferManager;
@@ -155,6 +157,7 @@ bool
 ServerApp::QuitRequested()
 {
 	TRACE("ServerApp::QuitRequested()\n");
+	fQuitting = true;
 	gMediaFilesManager->SaveState();
 	gNodeManager->SaveState();
 
@@ -955,6 +958,18 @@ ServerApp::MessageReceived(BMessage* msg)
 			if (msg->FindInt32("be:team", &id) == B_OK
 					&& gAppManager->HasTeam(id)) {
 				gAppManager->UnregisterTeam(id);
+			}
+
+			// The media_addon_server hosts the system mixer, the sound card
+			// nodes and the default time source. When it dies (a crash, a
+			// debugger kill) there is no audio at all until it is started
+			// again, so start it again: its nodes are forgotten above, the
+			// new server registers new ones and asks for a defaults rescan.
+			if (mimeSig == B_MEDIA_ADDON_SERVER_SIGNATURE && !fQuitting
+				&& !be_roster->IsRunning(B_MEDIA_ADDON_SERVER_SIGNATURE)) {
+				ERROR("media_server: media_addon_server (team %" B_PRId32
+					") quit unexpectedly, launching it again\n", id);
+				_LaunchAddOnServer();
 			}
 			break;
 		}

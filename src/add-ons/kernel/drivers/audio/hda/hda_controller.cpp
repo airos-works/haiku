@@ -346,8 +346,11 @@ stream_handle_interrupt(hda_controller* controller, hda_stream* stream,
 }
 
 
+/*!	Handles whatever the controller's interrupt status reports right now.
+	Interrupts must be disabled and the controller's interrupt_lock held.
+*/
 static int32
-hda_interrupt_handler(hda_controller* controller)
+hda_handle_interrupt_status(hda_controller* controller)
 {
 	int32 handled = B_HANDLED_INTERRUPT;
 
@@ -440,6 +443,71 @@ hda_interrupt_handler(hda_controller* controller)
 	// NOTE: See HDA001 => CIS/GIS cannot be cleared!
 
 	return handled;
+}
+
+
+/*!	Handles everything that is pending, not just what the first read of the
+	status shows. With MSI the controller only signals the rising edge of its
+	global interrupt status: when a stream completes a buffer while another
+	stream's status is being cleared, the global status never drops, no new
+	message follows, and both streams wait for ever. Seen on the AMD Family
+	17h/19h controller within a minute of playback, with the playback and
+	record streams running together. Linux loops the same way.
+	Interrupts must be disabled and the controller's interrupt_lock held.
+*/
+static int32
+hda_handle_pending_interrupts(hda_controller* controller)
+{
+	int32 handled = B_UNHANDLED_INTERRUPT;
+	for (int32 round = 0; round < 10; round++) {
+		int32 result = hda_handle_interrupt_status(controller);
+		if (result == B_UNHANDLED_INTERRUPT)
+			break;
+		if (handled != B_INVOKE_SCHEDULER)
+			handled = result;
+	}
+	return handled;
+}
+
+
+static int32
+hda_interrupt_handler(hda_controller* controller)
+{
+	acquire_spinlock(&controller->interrupt_lock);
+	int32 handled = hda_handle_pending_interrupts(controller);
+	release_spinlock(&controller->interrupt_lock);
+	return handled;
+}
+
+
+/*!	Called by buffer_exchange() when no buffer interrupt arrived in time:
+	handles a stream status the controller left pending without an interrupt.
+	Returns whether anything was pending (and so the buffer semaphore was
+	released).
+*/
+bool
+hda_recover_lost_interrupt(hda_controller* controller)
+{
+	cpu_status state = disable_interrupts();
+	acquire_spinlock(&controller->interrupt_lock);
+
+	uint32 intrStatus = controller->Read32(HDAC_INTR_STATUS);
+	bool pending = (intrStatus & INTR_STATUS_GLOBAL) != 0;
+	if (pending)
+		hda_handle_pending_interrupts(controller);
+
+	release_spinlock(&controller->interrupt_lock);
+	restore_interrupts(state);
+
+	if (pending) {
+		int32 count = atomic_add(&controller->lost_interrupts, 1) + 1;
+		if (count <= 5 || count % 100 == 0) {
+			dprintf("hda: handled a pending stream status without an "
+				"interrupt (status 0x%" B_PRIx32 ", %" B_PRId32 " so far)\n",
+				intrStatus, count);
+		}
+	}
+	return pending;
 }
 
 
@@ -1317,6 +1385,8 @@ hda_hw_init(hda_controller* controller)
 	}
 
 	controller->buffer_ready_sem = create_sem(0, "hda_buffer_sem");
+	B_INITIALIZE_SPINLOCK(&controller->interrupt_lock);
+	controller->lost_interrupts = 0;
 	if (controller->buffer_ready_sem < B_OK) {
 		dprintf("hda: failed to create semaphore\n");
 		status = ENODEV;
