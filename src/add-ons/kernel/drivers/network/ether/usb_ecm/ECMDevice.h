@@ -44,6 +44,14 @@ static	void				_NotifyCallback(void *cookie, int32 status,
 		status_t			_SetupDevice();
 		status_t			_ReadMACAddress(usb_device device, uint8 *buffer);
 
+		// Realtek RTL815x PHY power
+		bool				_HasRealtekPHY() const;
+		status_t			_RealtekRead(uint16 index, uint32 *value);
+		status_t			_RealtekWriteWord(uint16 index, uint16 value);
+		status_t			_RealtekPHYRead(uint16 reg, uint16 *value);
+		status_t			_RealtekPHYWrite(uint16 reg, uint16 value);
+		void				_SetPHYPower(bool on);
+
 		// state tracking
 		status_t			fStatus;
 		bool				fOpen;

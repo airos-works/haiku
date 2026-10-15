@@ -160,6 +160,8 @@ ECMDevice::Open()
 	if (fRemoved)
 		return B_ERROR;
 
+	_SetPHYPower(true);
+
 	// reset the device by switching the data interface to the disabled first
 	// interface and then enable it by setting the second actual data interface
 	const usb_configuration_info *config
@@ -240,6 +242,9 @@ ECMDevice::Close()
 
 	gUSBModule->set_alt_interface(fDevice,
 		&config->interface[fDataInterfaceIndex].alt[0]);
+
+	// no link (and no link lights) while the interface is down
+	_SetPHYPower(false);
 
 	fOpen = false;
 	return B_OK;
@@ -715,4 +720,150 @@ ECMDevice::_NotifyCallback(void *cookie, int32 status, void *data,
 	gUSBModule->queue_interrupt(device->fNotifyEndpoint, device->fNotifyBuffer,
 		device->fNotifyBufferLength, _NotifyCallback, device);
 	atomic_add(&device->fInsideNotify, -1);
+}
+
+
+//	#pragma mark - Realtek RTL815x PHY power
+
+
+/*!	The Realtek RTL815x adapters (USB Ethernet cards, docks, the Framework
+	Ethernet expansion card) keep their PHY powered, and so their link and its
+	lights, while nothing uses them. Their vendor register requests, as Linux'
+	r8152 driver uses them, work in the CDC ECM configuration as well: the PHY
+	is powered down while the interface is down. A PHY that was powered down
+	needs the data interface reset that Open() does before frames flow again.
+*/
+bool
+ECMDevice::_HasRealtekPHY() const
+{
+	if (fVendorID != 0x0bda)
+		return false;
+
+	switch (fProductID) {
+		case 0x8152:
+		case 0x8153:
+		case 0x8155:
+		case 0x8156:
+		case 0x8157:
+			return true;
+		default:
+			return false;
+	}
+}
+
+
+static const uint8 kRealtekRequestRegisters = 0x05;
+static const uint16 kRealtekTypePLA = 0x0100;
+static const uint16 kRealtekPHYBase = 0xe86c;
+	// PLA_OCP_GPHY_BASE
+static const uint16 kRealtekMIIBase = 0xa400;
+	// OCP_BASE_MII
+static const uint16 kBMCRPowerDown = 0x0800;
+static const uint16 kBMCRAutoNegotiate = 0x1000;
+static const uint16 kBMCRRestartAutoNegotiation = 0x0200;
+static const uint16 kBMSRLinkStatus = 0x0004;
+
+
+status_t
+ECMDevice::_RealtekRead(uint16 index, uint32 *value)
+{
+	size_t actualLength = 0;
+	status_t result = gUSBModule->send_request(fDevice,
+		USB_REQTYPE_VENDOR | USB_REQTYPE_DEVICE_IN, kRealtekRequestRegisters,
+		index & ~3, kRealtekTypePLA, sizeof(uint32), value, &actualLength);
+	if (result == B_OK && actualLength != sizeof(uint32))
+		result = B_IO_ERROR;
+	return result;
+}
+
+
+status_t
+ECMDevice::_RealtekWriteWord(uint16 index, uint16 value)
+{
+	// a 32 bit write with the bytes of the word enabled
+	uint16 byteEnable = 0x33;
+	uint32 data = value;
+	if ((index & 2) != 0) {
+		byteEnable <<= 2;
+		data <<= 16;
+	}
+
+	size_t actualLength = 0;
+	return gUSBModule->send_request(fDevice,
+		USB_REQTYPE_VENDOR | USB_REQTYPE_DEVICE_OUT, kRealtekRequestRegisters,
+		index & ~3, kRealtekTypePLA | byteEnable, sizeof(uint32), &data,
+		&actualLength);
+}
+
+
+status_t
+ECMDevice::_RealtekPHYRead(uint16 reg, uint16 *value)
+{
+	uint16 address = kRealtekMIIBase + reg * 2;
+	status_t result = _RealtekWriteWord(kRealtekPHYBase, address & 0xf000);
+	if (result != B_OK)
+		return result;
+
+	uint16 index = (address & 0x0fff) | 0xb000;
+	uint32 data;
+	result = _RealtekRead(index, &data);
+	if (result == B_OK)
+		*value = (index & 2) != 0 ? data >> 16 : data & 0xffff;
+	return result;
+}
+
+
+status_t
+ECMDevice::_RealtekPHYWrite(uint16 reg, uint16 value)
+{
+	uint16 address = kRealtekMIIBase + reg * 2;
+	status_t result = _RealtekWriteWord(kRealtekPHYBase, address & 0xf000);
+	if (result != B_OK)
+		return result;
+
+	return _RealtekWriteWord((address & 0x0fff) | 0xb000, value);
+}
+
+
+void
+ECMDevice::_SetPHYPower(bool on)
+{
+	if (fRemoved || !_HasRealtekPHY())
+		return;
+
+	uint16 control;
+	if (_RealtekPHYRead(0, &control) != B_OK) {
+		TRACE_ALWAYS("cannot read the PHY control register\n");
+		return;
+	}
+
+	if (on) {
+		if ((control & kBMCRPowerDown) == 0)
+			return;
+		control &= ~kBMCRPowerDown;
+		control |= kBMCRAutoNegotiate | kBMCRRestartAutoNegotiation;
+	} else
+		control |= kBMCRPowerDown;
+
+	if (_RealtekPHYWrite(0, control) != B_OK) {
+		TRACE_ALWAYS("cannot power the PHY %s\n", on ? "up" : "down");
+		return;
+	}
+	if (!on)
+		return;
+
+	// The data interface reset only brings the frames back with a link: wait
+	// for it (an adapter without a cable gives up after a while).
+	bigtime_t timeout = system_time() + 5000000;
+	while (system_time() < timeout) {
+		uint16 status;
+		// the link bit latches low: the second read tells the state
+		if (_RealtekPHYRead(1, &status) == B_OK
+			&& _RealtekPHYRead(1, &status) == B_OK
+			&& (status & kBMSRLinkStatus) != 0) {
+			return;
+		}
+		snooze(100000);
+	}
+	TRACE_ALWAYS("no link after powering the PHY up\n");
 }
