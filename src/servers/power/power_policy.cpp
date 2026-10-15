@@ -7,14 +7,20 @@
 #include "power_policy.h"
 
 #include <fcntl.h>
+#include <new>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
+#include <net/if.h>
+#include <net/if_media.h>
+
 #include <Autolock.h>
 #include <driver_settings.h>
 #include <FindDirectory.h>
+#include <NetworkInterface.h>
+#include <NetworkRoster.h>
 #include <Path.h>
 #include <scheduler.h>
 #include <Screen.h>
@@ -43,7 +49,7 @@ PowerPolicy::PowerPolicy(BServer* server)
 	fPowerSavingOnBattery(true),
 	fBatteryBrightness(70),
 	fLidAction(kLidSleep),
-	fSleepCheck(300),
+	fSleepCheck(0),
 	fACBrightness(-1),
 	fWokeUp(0)
 {
@@ -66,7 +72,7 @@ PowerPolicy::SettingsPath()
 
 /*!	The settings file has lines like "power_saving_on_battery true",
 	"battery_brightness 70", "lid_closed sleep" (or "display_off",
-	"nothing") and "sleep_check_seconds 300". A changed file applies to the
+	"nothing") and "sleep_check_seconds 0". A changed file applies to the
 	current power source at once.
 */
 void
@@ -182,18 +188,27 @@ PowerPolicy::SetLidOpen(bool open)
 	if (action != kLidSleep)
 		return;
 
-	// The embedded controller wakes the machine for other things than the
-	// lid, too (the battery, the power button): sleep again until it is
-	// opened.
+	// Wired network interfaces sleep down: their drivers can power the
+	// PHY off then (no link, no wake-on-LAN, no link lights), and the
+	// routes go with them.
+	InterfaceList interfaces;
+	_TakeDownWiredInterfaces(interfaces);
+
+	// A power button press wakes the machine, too: sleep again until the
+	// lid is opened.
 	while (_Sleep()) {
 		if (_WaitForLidOpen(3000000)) {
-			BAutolock _(fLock);
-			fLidClosed = false;
+			{
+				BAutolock _(fLock);
+				fLidClosed = false;
+			}
 			screen.SetDPMS(B_DPMS_ON);
 			printf("power_daemon: lid opened\n");
-			return;
+			break;
 		}
 	}
+
+	_BringUpInterfaces(interfaces);
 }
 
 
@@ -255,6 +270,55 @@ PowerPolicy::_Sleep()
 #else
 	return false;
 #endif
+}
+
+
+void
+PowerPolicy::_TakeDownWiredInterfaces(InterfaceList& _interfaces)
+{
+	BNetworkRoster& roster = BNetworkRoster::Default();
+	BNetworkInterface interface;
+	uint32 cookie = 0;
+	while (roster.GetNextInterface(&cookie, interface) == B_OK) {
+		uint32 flags = interface.Flags();
+		if ((flags & IFF_UP) == 0 || (flags & IFF_LOOPBACK) != 0
+			|| IFM_TYPE(interface.Media()) != IFM_ETHER) {
+			continue;
+		}
+
+		sleeping_interface* sleeping = new(std::nothrow) sleeping_interface;
+		if (sleeping == NULL)
+			break;
+		sleeping->name = interface.Name();
+		interface.GetDefaultGateway(AF_INET, sleeping->gateway);
+
+		if (interface.SetFlags(flags & ~IFF_UP) != B_OK
+			|| !_interfaces.AddItem(sleeping)) {
+			delete sleeping;
+			continue;
+		}
+		printf("power_daemon: %s down for the sleep\n", interface.Name());
+	}
+}
+
+
+void
+PowerPolicy::_BringUpInterfaces(const InterfaceList& interfaces)
+{
+	for (int32 i = 0; i < interfaces.CountItems(); i++) {
+		const sleeping_interface* sleeping = interfaces.ItemAt(i);
+		BNetworkInterface interface(sleeping->name);
+		if (interface.SetFlags(interface.Flags() | IFF_UP) != B_OK)
+			continue;
+
+		// Taking the interface down removed its default route.
+		BNetworkAddress gateway;
+		if (!sleeping->gateway.IsEmpty()
+			&& interface.GetDefaultGateway(AF_INET, gateway) != B_OK) {
+			interface.AddDefaultRoute(sleeping->gateway);
+		}
+		printf("power_daemon: %s up again\n", interface.Name());
+	}
 }
 
 
