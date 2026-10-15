@@ -382,7 +382,8 @@ amdgpu_get_display_output_retrace_semaphore(uint32 id)
 	blank, the pixel clock and the line length, scaled from the monitor's
 	rows to the region's. Negative while the blank lasts. */
 extern "C" status_t
-amdgpu_get_display_output_scan_line(uint32 id, int32* _line, int32* _lines)
+amdgpu_get_display_output_scan_line(uint32 id, int32* _line, int32* _lines,
+	bigtime_t* _scanStart, bigtime_t* _period)
 {
 	if (gInfo->isClone)
 		return B_UNSUPPORTED;
@@ -410,16 +411,23 @@ amdgpu_get_display_output_scan_line(uint32 id, int32* _line, int32* _lines)
 	int64 line = (now - scanStart) * output->timing.clock
 		/ (1000LL * output->timing.htotal);
 	int32 total = output->timing.vtotal;
+	bigtime_t period = (bigtime_t)output->timing.htotal * total * 1000
+		/ output->timing.clock;
 	if (line >= total) {
 		// a stale blank (its interrupt off): wrap, it is periodic
-		line %= total;
+		int64 frames = line / total;
+		line -= frames * total;
+		scanStart += frames * period;
 	}
 	if (line >= output->timing.vdisplay) {
 		// in the blank before the next scan
 		line -= total;
+		scanStart += period;
 	}
 	*_line = (int32)(line * (int64)output->height / output->timing.vdisplay);
 	*_lines = output->height;
+	*_scanStart = scanStart;
+	*_period = period;
 	return B_OK;
 }
 

@@ -706,6 +706,8 @@ struct HWInterface::FlushTarget {
 	sem_id			retraceSemaphore;	// -1: not asked for yet
 	int32			scanLineKnown;	// -1: not asked yet; the hardware
 									// tells where its scan is
+	bigtime_t		scanStart;		// when its frame's scan began, and
+	bigtime_t		scanPeriod;		// how long a frame takes (from it)
 	bigtime_t		period;			// between blanks
 	IntRect			scanFrame;		// what the scan runs over (the
 									// target's frame, or the buffer)
@@ -759,7 +761,8 @@ HWInterface::OutputRetraceSemaphore(uint32 id)
 
 
 status_t
-HWInterface::OutputScanLine(uint32 id, int32* _line, int32* _lines)
+HWInterface::OutputScanLine(uint32 id, int32* _line, int32* _lines,
+	bigtime_t* _scanStart, bigtime_t* _period)
 {
 	return B_UNSUPPORTED;
 }
@@ -774,9 +777,13 @@ HWInterface::_FlushScanRow(FlushTarget& target, bigtime_t blank)
 {
 	if (target.scanLineKnown != 0 && target.outputID != 0) {
 		int32 line, lines;
-		status_t status = OutputScanLine(target.outputID, &line, &lines);
+		bigtime_t scanStart, period;
+		status_t status = OutputScanLine(target.outputID, &line, &lines,
+			&scanStart, &period);
 		if (status == B_OK && lines > 0) {
 			target.scanLineKnown = 1;
+			target.scanStart = scanStart;
+			target.scanPeriod = period;
 			return target.scanFrame.top
 				+ float(line) * (target.scanFrame.Height() + 1) / lines;
 		}
@@ -926,6 +933,8 @@ HWInterface::_AddFlushTarget(uint32 outputID, const char* name)
 	target.frame = IntRect(0, 0, -1, -1);
 	target.retraceSemaphore = -1;
 	target.scanLineKnown = -1;
+	target.scanStart = 0;
+	target.scanPeriod = 0;
 	target.scanFrame = IntRect(0, 0, -1, -1);
 	target.workers = NULL;
 	target.workerCount = 0;
@@ -1154,16 +1163,41 @@ HWInterface::_FlushThread(FlushTarget& target)
 		// that a drawing op's copy into the one left behind (a memcpy of
 		// a few ms at most) is over by the time the flush copies from it:
 		// the copy then starts at the blank, not after a wait.
-		if (target.lastBlank != 0 && target.period > 0) {
-			bigtime_t now = system_time();
-			bigtime_t next = target.lastBlank
+		bigtime_t now = system_time();
+		bigtime_t next = 0;
+		bool fromScan = false;
+		if (target.scanLineKnown == 1 && target.scanStart != 0
+			&& target.scanPeriod > 0 && now - target.scanStart < 1000000) {
+			// The hardware told when its scans begin: the copy starts
+			// just before the next one, whatever the blank interrupt's
+			// own timing (on some GPUs it comes after the scan began).
+			next = target.scanStart + ((now - target.scanStart)
+				/ target.scanPeriod + 1) * target.scanPeriod;
+			if (next - now < 500)
+				next += target.scanPeriod;
+			fromScan = true;
+		} else if (target.lastBlank != 0 && target.period > 0) {
+			next = target.lastBlank
 				+ ((now - target.lastBlank) / target.period + 1) * target.period;
+		}
+		if (next != 0) {
 			bigtime_t flipAt = next - 4000;
 			if (flipAt > now + 200)
 				snooze_until(flipAt, B_SYSTEM_TIMEBASE);
 		}
 		int32 which = _FlipShadow();
-		if (system_time() >= target.ignoredUntil) {
+		if (fromScan) {
+			bigtime_t wakeAt = next - 300;
+			if (wakeAt > system_time())
+				snooze_until(wakeAt, B_SYSTEM_TIMEBASE);
+			blank = next;
+			target.lastBlank = next;
+			target.period = target.scanPeriod;
+			// the semaphore's release for this blank, if any, is not
+			// waited for; a stale count is harmless (consumed below)
+			if (target.retraceSemaphore >= 0)
+				acquire_sem_etc(target.retraceSemaphore, 1, B_RELATIVE_TIMEOUT, 0);
+		} else if (system_time() >= target.ignoredUntil) {
 			if (target.retraceSemaphore == -1) {
 				target.retraceSemaphore = target.outputID == 0
 					? RetraceSemaphore()

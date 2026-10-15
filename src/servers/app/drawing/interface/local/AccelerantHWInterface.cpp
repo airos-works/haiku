@@ -1149,11 +1149,13 @@ AccelerantHWInterface::OutputRetraceSemaphore(uint32 id)
 
 
 status_t
-AccelerantHWInterface::OutputScanLine(uint32 id, int32* _line, int32* _lines)
+AccelerantHWInterface::OutputScanLine(uint32 id, int32* _line, int32* _lines,
+	bigtime_t* _scanStart, bigtime_t* _period)
 {
 	if (fAccGetDisplayOutputScanLine == NULL)
 		return B_UNSUPPORTED;
-	return fAccGetDisplayOutputScanLine(id, _line, _lines);
+	return fAccGetDisplayOutputScanLine(id, _line, _lines, _scanStart,
+		_period);
 }
 
 
