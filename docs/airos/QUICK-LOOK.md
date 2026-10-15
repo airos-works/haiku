@@ -42,7 +42,10 @@ src/kits/tracker/QuickLook.*   Tracker's side: finds or starts the server
   launching it through the roster when it is not running
   (`data/launch/system` lists it on demand). While the panel is up, every
   change of the selection sends the new refs (coalesced over 50 ms, for a
-  held arrow key). The server is a `BServer`: only its constructor asks
+  held arrow key) marked `"update"`: the server only swaps the content of a
+  panel that is up for that window, and a server that is not running is
+  not started for it, so a restarted server never pops the panel up on a
+  plain click. The server is a `BServer`: only its constructor asks
   launch_daemon for the port made for an on-demand service, and as a plain
   `BApplication` it read its own port while Tracker's messages queued
   unread in launch_daemon's (found after the first package install); Escape, a closed window and the window losing the
@@ -54,8 +57,14 @@ src/kits/tracker/QuickLook.*   Tracker's side: finds or starts the server
   and `B_AVOID_FOCUS`: it floats over everything and never takes the
   keyboard, so Tracker's arrows keep working. Tracker sends where the
   selected entry is on screen (`"icon"`), and the panel zooms out of that
-  rectangle into its place over a dozen eased frames and shrinks back
-  into it when it closes, the picture stopped first. Its `DirectConnected()` is passed to the
+  rectangle into its place and shrinks back into it when it closes. The
+  zoom follows the clock (220 ms, eased, a frame about every 12 ms, late
+  frames dropped), and the preview is hidden while it runs and laid out
+  once when the panel is there: laying out text, scaling a picture or
+  rendering a page at every size in between is what made it stutter. The
+  preview is started when the zoom ends (and stopped before the shrink),
+  so a film's first picture and its clock begin together; on the X399 a
+  zoom is 18 frames in 228 ms with no frame over 8 ms. Its `DirectConnected()` is passed to the
   preview, so airTime's video view writes into the frame buffer as it does
   in its own window. The panel is centred on the Tracker window that asked
   (which keeps it on that monitor), sized to the content's preferred size
