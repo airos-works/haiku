@@ -297,9 +297,19 @@ AHCIPort::PortReset()
 
 	_ClearErrorRegister();
 
+	// The task file only means something once a device talks to the port.
+	// Without an established link it holds whatever the last FIS or a
+	// floating bus left there, usually with BSY or DRQ set, and waiting a
+	// second for that to clear buys nothing: on a board with eight empty
+	// SATA ports those seconds were most of the boot. An empty or
+	// half-detected port goes straight to the COMRESET.
+	bool linkEstablished = (fRegs->ssts & HBA_PORT_DET_MASK)
+		== SSTS_PORT_DET_PRESENT;
+
 	// Wait for BSY and DRQ to clear (idle port)
-	if (wait_until_clear(&fRegs->tfd, ATA_STATUS_BUSY | ATA_STATUS_DATA_REQUEST,
-		1000000) < B_OK) {
+	if (!linkEstablished
+		|| wait_until_clear(&fRegs->tfd,
+			ATA_STATUS_BUSY | ATA_STATUS_DATA_REQUEST, 1000000) < B_OK) {
 		// If we can't clear busy, do a full comreset
 
 		// Spec v1.3.1, §10.4.2 Port Reset
@@ -319,13 +329,45 @@ AHCIPort::PortReset()
 	if (!Enable())
 		return B_ERROR;
 
-	if (wait_until_set(&fRegs->ssts, SSTS_PORT_DET_PRESENT, 500000) < B_OK) {
+	if (!_WaitForDevice(500000)) {
 		TRACE("%s: port %d: no device detected\n", __func__, fIndex);
 		fDevicePresent = false;
 		return B_OK;
 	}
 
 	return Probe();
+}
+
+
+/*!	Waits for the PHY to report a device with an established link (DET 3),
+	for at most \a timeout. A port that reports no device at all for 100 ms
+	running has nothing attached, and the wait ends there: that is the
+	settling time Linux uses for the same decision, and after a COMRESET a
+	connected device answers within a few milliseconds. A device that is seen
+	but not yet talking (DET 1) keeps the wait going until the timeout.
+	Returns whether the link is established.
+*/
+bool
+AHCIPort::_WaitForDevice(bigtime_t timeout)
+{
+	const bigtime_t kPollInterval = 10000;
+	const bigtime_t kNoDeviceSettleTime = 100000;
+	bigtime_t waited = 0;
+	bigtime_t noDeviceSince = 0;
+	while (true) {
+		uint32 detection = fRegs->ssts & HBA_PORT_DET_MASK;
+		if (detection == SSTS_PORT_DET_PRESENT)
+			return true;
+		if (detection == SSTS_PORT_DET_NODEV) {
+			if (waited - noDeviceSince >= kNoDeviceSettleTime)
+				return false;
+		} else
+			noDeviceSince = waited + kPollInterval;
+		if (waited >= timeout)
+			return false;
+		snooze(kPollInterval);
+		waited += kPollInterval;
+	}
 }
 
 

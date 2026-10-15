@@ -69,6 +69,7 @@ private:
 	void		FinishTransfer();
 
 	inline	void				_ClearErrorRegister();
+			bool				_WaitForDevice(bigtime_t timeout);
 
 //	uint8 *		SetCommandFis(volatile command_list_entry *cmd, volatile fis *fis, const void *data, size_t dataSize);
 	status_t	FillPrdTable(volatile prd *prdTable, int *prdCount, int prdMax, const void *data, size_t dataSize);
