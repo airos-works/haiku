@@ -93,8 +93,13 @@ ucode_load(BootVolume& volume)
 extern "C" status_t
 boot_arch_cpu_init()
 {
-    // Nothing really to init on x86
-    return B_OK;
+	// The time stamp counter has run since the CPU left reset. The kernel
+	// resets it on its way in and reads it first, so this value tells it how
+	// long the firmware took before the loader and how long the loader took.
+	uint32 low, high;
+	asm volatile("rdtsc" : "=a" (low), "=d" (high));
+	gKernelArgs.arch_args.boot_loader_entry_tsc = ((uint64)high << 32) | low;
+	return B_OK;
 }
 
 

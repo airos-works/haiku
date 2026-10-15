@@ -21,7 +21,10 @@
 typedef struct {
 	// architecture specific
 	uint32	_unused1; // previously: system_time_cv_factor
-	uint64	_unused2; // previously: cpu_clock_speed
+	uint64	boot_loader_entry_tsc;
+		// time stamp counter when the boot loader started, 0 if unknown;
+		// it has counted since the CPU left reset, so the kernel can tell how
+		// long the firmware and the loader took (previously: cpu_clock_speed)
 	uint32	phys_pgdir;
 	uint64	vir_pgdir;
 	uint32	num_pgtables;

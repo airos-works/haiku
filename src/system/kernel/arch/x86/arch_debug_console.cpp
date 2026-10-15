@@ -28,6 +28,7 @@ enum serial_register_offsets {
 	SERIAL_RECEIVE_BUFFER		= 0,
 	SERIAL_DIVISOR_LATCH_LOW	= 0,
 	SERIAL_DIVISOR_LATCH_HIGH	= 1,
+	SERIAL_INTERRUPT_ID			= 2,
 	SERIAL_FIFO_CONTROL			= 2,
 	SERIAL_LINE_CONTROL			= 3,
 	SERIAL_MODEM_CONTROL		= 4,
@@ -66,6 +67,8 @@ static uint16 sSerialBasePort = 0x3f8;
 static spinlock sSerialOutputSpinlock = B_SPINLOCK_INITIALIZER;
 static int32 sEarlyBootMessageLock = 0;
 static bool sSerialTimedOut = false;
+static uint8 sSerialFifoSize = 1;
+	// how many characters a transmitter-empty status lets us write at once
 
 static bool sKeyboardHandlerInstalled = false;
 
@@ -82,21 +85,40 @@ init_serial_port(uint16 basePort, uint32 baudRate)
 	out8(divisor & 0xf, sSerialBasePort + SERIAL_DIVISOR_LATCH_LOW);
 	out8(divisor >> 8, sSerialBasePort + SERIAL_DIVISOR_LATCH_HIGH);
 	out8(3, sSerialBasePort + SERIAL_LINE_CONTROL);		/* 8N1 */
+
+	// A 16550A has a 16 byte transmit FIFO, and reports it in the interrupt
+	// identification register once it is enabled; "transmitter empty" then
+	// means the whole FIFO is free, so a line can go out sixteen characters
+	// at a time instead of one wait per character.
+	out8(0x07, sSerialBasePort + SERIAL_FIFO_CONTROL);
+	sSerialFifoSize = (in8(sSerialBasePort + SERIAL_INTERRUPT_ID) & 0xc0) == 0xc0
+		? 16 : 1;
+}
+
+
+/*!	Waits for the transmitter to be empty. Returns false once the port has
+	given up on the line for good.
+*/
+static bool
+wait_for_transmitter()
+{
+	int32 timeout = 256 * 1024;
+	while ((in8(sSerialBasePort + SERIAL_LINE_STATUS) & 0x20) == 0) {
+		if (--timeout == 0) {
+			sSerialTimedOut = true;
+			return false;
+		}
+		asm volatile ("pause");
+	}
+	return true;
 }
 
 
 static void
 put_char(const char c)
 {
-	// wait until the transmitter empty bit is set
-	int32 timeout = 256 * 1024;
-	while ((in8(sSerialBasePort + SERIAL_LINE_STATUS) & 0x20) == 0) {
-		if (--timeout == 0) {
-			sSerialTimedOut = true;
-			return;
-		}
-		asm volatile ("pause");
-	}
+	if (!wait_for_transmitter())
+		return;
 
 	out8(c, sSerialBasePort + SERIAL_TRANSMIT_BUFFER);
 }
@@ -403,8 +425,25 @@ static void
 arch_debug_serial_puts_locked(const char *string)
 {
 	while (*string != '\0') {
-		_arch_debug_serial_putchar(*string);
-		string++;
+		if (!wait_for_transmitter())
+			return;
+		// the FIFO is empty: fill it without looking at the status again,
+		// counting the carriage return a line feed turns into
+		uint8 room = sSerialFifoSize;
+		while (*string != '\0' && room > 0) {
+			char c = *string;
+			if (c == '\n') {
+				if (room < 2)
+					break;
+				out8('\r', sSerialBasePort + SERIAL_TRANSMIT_BUFFER);
+				room--;
+			}
+			string++;
+			if (c == '\r')
+				continue;
+			out8(c, sSerialBasePort + SERIAL_TRANSMIT_BUFFER);
+			room--;
+		}
 	}
 }
 

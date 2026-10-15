@@ -205,6 +205,7 @@ _start(kernel_args *bootKernelArgs, int currentCPU)
 		thread_init(&sKernelArgs);
 		TRACE("init kernel daemons\n");
 		kernel_daemon_init();
+		debug_init_post_thread(&sKernelArgs);
 		TRACE("init stack protector\n");
 		stack_protector_init();
 		arch_platform_init_post_thread(&sKernelArgs);
