@@ -15,9 +15,10 @@
 	  scheduler's cpufreq hooks, which run with interrupts off);
 	- throttling: above the passive trip the clusters' top speed, the GPU's
 	  and the video engine's clocks come down a step at a time (the big
-	  cores first) while the temperature is not falling; they go back up
-	  below the release temperature, and below the passive trip too while
-	  the temperature is not rising (as Linux's step_wise governor does);
+	  cores first) while the temperature rises, more slowly while it holds;
+	  they go back up below the release temperature, and below the passive
+	  trip too while the temperature is not rising (as Linux's step_wise
+	  governor does);
 	- at the hot trip, everything to the lowest speed and an event for the
 	  power daemon (a notification); at the critical trip an event that has
 	  the power daemon shut the system down through the registrar, and, if
@@ -99,10 +100,14 @@ static const int32 kThermalTicks = 12;			// a reading every 240 ms
 static const int32 kUpLoad = 80;				// percent: straight to the top
 static const int32 kTargetLoad = 60;			// percent below that
 static const bigtime_t kDownHold = 100000;		// after a raise
-// Above the passive trip a step at most every 2 s; 4 C above it two every
-// 480 ms, 8 C above three on every reading: with all eight cores at their
-// top speed the SoC warms by 6 C a second, from 63 C to 95 C in 5 s.
+// Above the passive trip a step at most every 2 s while the temperature
+// rises, every 8 s while it holds (none while it falls); 4 C above it two
+// every 480 ms, 8 C above three on every reading: with all eight cores at
+// their top speed the SoC warms by 6 C a second, from 63 C to 95 C in 5 s.
+// The temperature takes longer than 2 s to show a level: stepping every 2 s
+// while it held took a YouTube start from level 3 to 6 in 6 s at 81 C.
 static const bigtime_t kThrottleStep = 2000000;
+static const bigtime_t kThrottleHoldStep = 8000000;
 static const bigtime_t kThrottleFastStep = 480000;
 static const bigtime_t kReleaseStep = 4000000;
 static const int32 kFastMargin = 4000;
@@ -769,8 +774,10 @@ thermal_step(bigtime_t now)
 			set_level(sLevel + 2, "hot zone");
 			sLastUp = sLastDown = now;
 		} else if (hottest >= sPassive && !falling
-			&& now - sLastUp >= kThrottleStep) {
-			set_level(sLevel + 1, "above passive");
+			&& now - sLastUp
+				>= (rising ? kThrottleStep : kThrottleHoldStep)) {
+			set_level(sLevel + 1,
+				rising ? "above passive" : "above passive, holding");
 			sLastUp = sLastDown = now;
 		} else if (hottest < sRelease && sLevel > 0 && !sCriticalFired
 			&& now - sLastDown >= kReleaseStep) {

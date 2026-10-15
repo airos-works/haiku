@@ -101,9 +101,12 @@ same module, so that the two never share the I2C controller at once.
 Every 240 ms the driver reads the zones; the hottest one decides.
 
 - Passive, 80 C (release 76 C): the throttle level goes up a step at most
-  every 2 s while at or above it and the temperature is not falling (two
-  every 480 ms from 84 C, three on every reading from 88 C: with all eight
-  cores at their top speed the SoC warms by 6 C a second); it comes down a
+  every 2 s while at or above it and the temperature rises, every 8 s while
+  it holds and not while it falls (two every 480 ms from 84 C, three on
+  every reading from 88 C: with all eight cores at their top speed the SoC
+  warms by 6 C a second). The temperature shows a new level only after
+  more than 2 s: stepping every 2 s while it held took a YouTube start from
+  level 3 to 6 in 6 s at 81 C (summit-15, 2026-10-15). The level comes down a
   step every 4 s below the release temperature, and every 6 s below 79 C
   while the temperature is not rising ("steady", as Linux's step_wise
   governor does). The trend is the hottest zone averaged over about a
