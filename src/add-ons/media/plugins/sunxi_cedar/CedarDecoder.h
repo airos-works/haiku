@@ -85,6 +85,12 @@ public:
 			void				CopyPlanes(const Picture& picture,
 									uint8* target, uint32 stride,
 									bool interleaved);
+			/*!	As CopyPlanes(), half as wide and high, each sample the mean
+				of a 2x2 block: ten bit pictures as P010, eight bit ones as
+				I420. The picture's width and height are multiples of
+				four. */
+			void				CopyHalfPlanes(const Picture& picture,
+									uint8* target, uint32 stride);
 			/*!	The picture as Haiku's B_YCbCr422 (Y0 Cb Y1 Cr) or B_RGB32
 				(BT.601 below 720 rows, else BT.709; studio range), for the
 				Media Kit's users; ten bit pictures by their eight most
