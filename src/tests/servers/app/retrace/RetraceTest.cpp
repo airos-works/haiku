@@ -18,6 +18,10 @@
 		would (250 moves a second); the display shows whether it tears.
 	retrace_test scroll [seconds] [--size WxH]
 		a view of stripes scrolled up and down, as a wheel would.
+	With --jump, between two places (64 pixels apart) instead of across the
+	screen: the display then shows one of a few whole pictures a frame (the
+	window at either place, the uncovered strips redrawn or not yet), and a
+	capture or a CRC of the display tells a torn frame from them.
 	retrace_test lines --line ...
 		the scan line source's raw register, every 100 µs for 40 ms (to
 		check how it counts).
@@ -408,11 +412,13 @@ public:
 	it (and faster), the way windows are moved by the mouse: the contents
 	are copied in the buffer, the uncovered parts redrawn. */
 static int
-test_move(double seconds, int32 width, int32 height)
+test_move(double seconds, int32 width, int32 height, bool jump)
 {
 	BScreen screen;
 	BRect screenFrame = screen.Frame();
-	BRect frame(0, 60, width - 1, 60 + height - 1);
+	BRect frame(jump ? 200 : 0, jump ? 200 : 60, 0, 0);
+	frame.right = frame.left + width - 1;
+	frame.bottom = frame.top + height - 1;
 	BWindow* window = new BWindow(frame, "retrace_test move", B_TITLED_WINDOW,
 		B_NOT_RESIZABLE | B_NOT_ZOOMABLE);
 	window->AddChild(new StripesView(window->Bounds()));
@@ -422,19 +428,24 @@ test_move(double seconds, int32 width, int32 height)
 	float range = screenFrame.Width() - width;
 	if (range < 100)
 		range = 100;
-	float x = 0;
-	float step = 16;
+	float x = frame.left;
+	float step = jump ? 64 : 16;
 	int32 moves = 0;
 	bigtime_t start = system_time();
 	while (system_time() - start < (bigtime_t)(seconds * 1000000)) {
-		x += step;
-		if (x >= range || x <= 0) {
-			step = -step;
-			x += 2 * step;
+		if (jump) {
+			// between two places: a frame shows one of a few pictures
+			x = x == frame.left ? frame.left + step : frame.left;
+		} else {
+			x += step;
+			if (x >= range || x <= 0) {
+				step = -step;
+				x += 2 * step;
+			}
 		}
 		if (!window->Lock())
 			break;
-		window->MoveTo(x, 60);
+		window->MoveTo(x, frame.top);
 		window->Sync();
 		window->Unlock();
 		moves++;
@@ -456,9 +467,11 @@ test_move(double seconds, int32 width, int32 height)
 /*!	Scrolls a view of stripes, as a wheel or a dragged scroll bar does: the
 	contents are copied in the buffer, the uncovered strip redrawn. */
 static int
-test_scroll(double seconds, int32 width, int32 height)
+test_scroll(double seconds, int32 width, int32 height, bool jump)
 {
-	BRect frame(50, 60, 50 + width - 1, 60 + height - 1);
+	BRect frame(jump ? 200 : 50, jump ? 200 : 60, 0, 0);
+	frame.right = frame.left + width - 1;
+	frame.bottom = frame.top + height - 1;
 	BWindow* window = new BWindow(frame, "retrace_test scroll",
 		B_TITLED_WINDOW, B_NOT_RESIZABLE | B_NOT_ZOOMABLE);
 	StripesView* view = new StripesView(window->Bounds());
@@ -467,14 +480,18 @@ test_scroll(double seconds, int32 width, int32 height)
 	snooze(500000);
 
 	float y = 0;
-	float step = 24;
+	float step = jump ? 64 : 24;
 	int32 scrolls = 0;
 	bigtime_t start = system_time();
 	while (system_time() - start < (bigtime_t)(seconds * 1000000)) {
-		y += step;
-		if (y >= 100000 || y <= 0) {
-			step = -step;
-			y += 2 * step;
+		if (jump)
+			y = y == 0 ? step : 0;
+		else {
+			y += step;
+			if (y >= 100000 || y <= 0) {
+				step = -step;
+				y += 2 * step;
+			}
 		}
 		if (!window->Lock())
 			break;
@@ -527,8 +544,8 @@ usage()
 	fprintf(stderr, "usage: retrace_test blanks [seconds] [--line sunxi]\n"
 		"       retrace_test draw [seconds] [--no-wait] [--update] [--size WxH] "
 		"[--line sunxi]\n"
-		"       retrace_test move [seconds] [--size WxH]\n"
-		"       retrace_test scroll [seconds] [--size WxH]\n"
+		"       retrace_test move [seconds] [--size WxH] [--jump]\n"
+		"       retrace_test scroll [seconds] [--size WxH] [--jump]\n"
 		"       retrace_test lines --line sunxi\n");
 	exit(1);
 }
@@ -545,6 +562,7 @@ main(int argc, char** argv)
 	double seconds = 5;
 	bool wait = true;
 	bool update = false;
+	bool jump = false;
 	int32 width = 640, height = 480;
 	const char* line = NULL;
 	for (int i = 2; i < argc; i++) {
@@ -552,6 +570,8 @@ main(int argc, char** argv)
 			wait = false;
 		else if (strcmp(argv[i], "--update") == 0)
 			update = true;
+		else if (strcmp(argv[i], "--jump") == 0)
+			jump = true;
 		else if (strcmp(argv[i], "--size") == 0 && i + 1 < argc) {
 			if (sscanf(argv[++i], "%" B_SCNd32 "x%" B_SCNd32, &width, &height)
 					!= 2)
@@ -573,9 +593,9 @@ main(int argc, char** argv)
 	else if (strcmp(test, "draw") == 0)
 		result = test_draw(seconds, wait, update, width, height, source);
 	else if (strcmp(test, "move") == 0)
-		result = test_move(seconds, width, height);
+		result = test_move(seconds, width, height, jump);
 	else if (strcmp(test, "scroll") == 0)
-		result = test_scroll(seconds, width, height);
+		result = test_scroll(seconds, width, height, jump);
 	else if (strcmp(test, "lines") == 0)
 		result = test_lines(source);
 	else
