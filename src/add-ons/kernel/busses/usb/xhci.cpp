@@ -14,6 +14,7 @@
 
 #include <stdio.h>
 
+#include <ACPI.h>
 #include <bus/PCI.h>
 #include <USB3.h>
 #include <KernelExport.h>
@@ -104,7 +105,7 @@ uninit_bus(void* bus_cookie)
 static status_t
 suspend_bus(void* bus_cookie, int32 state)
 {
-	return ((XHCI*)bus_cookie)->Suspend();
+	return ((XHCI*)bus_cookie)->Suspend(state);
 }
 
 
@@ -380,6 +381,8 @@ XHCI::XHCI(pci_info *info, 	pci_device_module_info* pci, pci_device* device, Sta
 		fErstPhysical(0),
 		fCmdRingPhysical(0),
 		fPortsDisconnected(false),
+		fIdleSuspended(false),
+		fIdleHalted(false),
 		fCmdCompSem(-1),
 		fStopThreads(false),
 		fRootHub(NULL),
@@ -996,10 +999,16 @@ XHCI::_SetInterruptModeration()
 /*!	The controller loses its state while the system sleeps. Instead of saving
 	and restoring it, all devices are detached before suspending, and
 	enumerated again once the controller was reinitialized on resume.
+
+	Suspend to idle (\a state ACPI_POWER_STATE_ON) keeps the controller
+	powered, so the devices stay attached instead, see _SuspendToIdle().
 */
 status_t
-XHCI::Suspend()
+XHCI::Suspend(int32 state)
 {
+	if (state == ACPI_POWER_STATE_ON)
+		return _SuspendToIdle();
+
 	TRACE_ALWAYS("suspending\n");
 
 	fPortsDisconnected = true;
@@ -1012,6 +1021,9 @@ XHCI::Suspend()
 status_t
 XHCI::Resume()
 {
+	if (fIdleSuspended)
+		return _ResumeFromIdle();
+
 	TRACE_ALWAYS("resuming\n");
 
 	ControllerHalt();
@@ -1057,6 +1069,213 @@ XHCI::Resume()
 
 	// let the hub explore connected devices again
 	fPortsDisconnected = false;
+	return B_OK;
+}
+
+
+/*!	Suspends the bus while the system suspends to idle, as Linux does: the
+	endpoints are stopped with their transfers left queued, the root ports
+	with a device are suspended (U3), which suspends the devices behind them
+	(and behind their hubs), and the controller is halted. The devices stay
+	attached; resuming continues the transfers where they stopped.
+	Transfers submitted while the bus is suspended are queued and start on
+	resume (drivers would lose a buffer they cannot queue again); commands
+	are refused while the controller is halted.
+*/
+status_t
+XHCI::_SuspendToIdle()
+{
+	TRACE_ALWAYS("suspending to idle\n");
+
+	fIdleSuspended = true;
+
+	// Stop every running endpoint, so that the devices are idle before
+	// their ports are suspended. (XHCI 1.2 § 4.15.1)
+	int32 stoppedEndpoints = 0;
+	for (int32 slot = 1; slot < XHCI_MAX_DEVICES; slot++) {
+		xhci_device* device = &fDevices[slot];
+		if (device->slot == 0)
+			continue;
+
+		for (int32 i = 0; i < XHCI_MAX_ENDPOINTS - 1; i++) {
+			xhci_endpoint* endpoint = &device->endpoints[i];
+			if (endpoint->trbs == NULL
+				|| _GetEndpointState(endpoint) != ENDPOINT_STATE_RUNNING) {
+				continue;
+			}
+			if (StopEndpoint(true, endpoint) == B_OK)
+				stoppedEndpoints++;
+		}
+	}
+
+	// A SuperSpeed hub does not take the devices behind it along into U3 and
+	// back, as a USB 2 hub does: they would have to be suspended through
+	// the hub first, one by one. Until the stack can, ports with one stay up.
+	bool superSpeedHub[XHCI_MAX_PORTS] = {};
+	for (int32 slot = 1; slot < XHCI_MAX_DEVICES; slot++) {
+		xhci_device* device = &fDevices[slot];
+		if (device->slot == 0 || device->input_ctx == NULL)
+			continue;
+
+		uint32 dwslot0 = _ReadContext(&device->input_ctx->slot.dwslot0);
+		uint32 rhPort = SLOT_1_RH_PORT_GET(
+			_ReadContext(&device->input_ctx->slot.dwslot1));
+		if ((dwslot0 & SLOT_0_HUB_BIT) != 0 && SLOT_0_ROUTE_GET(dwslot0) == 0
+			&& SLOT_0_SPEED_GET(dwslot0) >= 4 && rhPort >= 1
+			&& rhPort <= fPortCount) {
+			superSpeedHub[rhPort - 1] = true;
+		}
+	}
+
+	int32 suspendedPorts = 0;
+	for (uint8 i = 0; i < fPortCount; i++) {
+		fPortIdleSuspended[i] = false;
+		if (_IsDisabledSuperSpeedPort(i))
+			continue;
+		if (superSpeedHub[i]) {
+			TRACE_ALWAYS("port %" B_PRIu8 " has a SuperSpeed hub, not "
+				"suspending it\n", i);
+			continue;
+		}
+
+		uint32 portStatus = ReadOpReg(XHCI_PORTSC(i));
+		if ((portStatus & PS_PED) == 0 || (portStatus & PS_PR) != 0
+			|| (portStatus & PS_PLS_MASK) > PS_XDEV_U2) {
+			continue;
+		}
+
+		WriteOpReg(XHCI_PORTSC(i),
+			(portStatus & ~(PS_CLEAR | PS_PLS_MASK)) | PS_LWS | PS_XDEV_U3);
+		fPortIdleSuspended[i] = true;
+		suspendedPorts++;
+	}
+
+	// A SuperSpeed link takes a few milliseconds to reach U3.
+	bigtime_t timeout = system_time() + 100000;
+	for (uint8 i = 0; i < fPortCount; i++) {
+		if (!fPortIdleSuspended[i])
+			continue;
+		uint32 portStatus;
+		while (((portStatus = ReadOpReg(XHCI_PORTSC(i))) & PS_PLS_MASK)
+				!= PS_XDEV_U3 && system_time() < timeout) {
+			snooze(1000);
+		}
+		if ((portStatus & PS_PLS_MASK) != PS_XDEV_U3) {
+			TRACE_ERROR("port %" B_PRIu8 " did not suspend: %#" B_PRIx32 "\n",
+				i, portStatus);
+		}
+	}
+
+	fIdleHalted = true;
+	status_t status = ControllerHalt();
+
+	TRACE_ALWAYS("suspended to idle: %" B_PRId32 " endpoints stopped, %"
+		B_PRId32 " ports suspended\n", stoppedEndpoints, suspendedPorts);
+	return status;
+}
+
+
+status_t
+XHCI::_ResumeFromIdle()
+{
+	TRACE_ALWAYS("resuming from idle\n");
+
+	WriteOpReg(XHCI_CMD, ReadOpReg(XHCI_CMD) | CMD_RUN);
+	if (WaitOpBits(XHCI_STS, STS_HCH, 0) != B_OK)
+		TRACE_ERROR("HCH start up timeout after suspend to idle\n");
+	fIdleHalted = false;
+
+	// A SuperSpeed link goes back to U0 directly, a USB 2 port signals
+	// resume for 20 ms first. (XHCI 1.2 § 4.15.2)
+	bool usb2Resume = false;
+	for (uint8 i = 0; i < fPortCount; i++) {
+		if (!fPortIdleSuspended[i])
+			continue;
+
+		uint32 portStatus = ReadOpReg(XHCI_PORTSC(i));
+		if ((portStatus & PS_PLS_MASK) != PS_XDEV_U3) {
+			// gone, or woken by the device: the hub sees to it
+			fPortIdleSuspended[i] = false;
+			continue;
+		}
+
+		uint32 state = PS_XDEV_U0;
+		if (fPortSpeeds[i] < USB_SPEED_SUPERSPEED) {
+			state = PS_XDEV_RESUME;
+			usb2Resume = true;
+		}
+		WriteOpReg(XHCI_PORTSC(i),
+			(portStatus & ~(PS_CLEAR | PS_PLS_MASK)) | PS_LWS | state);
+	}
+
+	if (usb2Resume) {
+		snooze(20000);
+		for (uint8 i = 0; i < fPortCount; i++) {
+			if (!fPortIdleSuspended[i]
+				|| fPortSpeeds[i] >= USB_SPEED_SUPERSPEED) {
+				continue;
+			}
+			uint32 portStatus = ReadOpReg(XHCI_PORTSC(i));
+			if ((portStatus & PS_PLS_MASK) != PS_XDEV_RESUME)
+				continue;
+			portStatus &= ~(PS_CLEAR | PS_PLS_MASK);
+			WriteOpReg(XHCI_PORTSC(i), portStatus | PS_LWS | PS_XDEV_U0);
+		}
+	}
+
+	int32 resumedPorts = 0;
+	bigtime_t timeout = system_time() + 100000;
+	for (uint8 i = 0; i < fPortCount; i++) {
+		if (!fPortIdleSuspended[i])
+			continue;
+		fPortIdleSuspended[i] = false;
+
+		uint32 portStatus;
+		while (((portStatus = ReadOpReg(XHCI_PORTSC(i))) & PS_PLS_MASK)
+				!= PS_XDEV_U0 && system_time() < timeout) {
+			snooze(1000);
+		}
+		if ((portStatus & PS_PLS_MASK) != PS_XDEV_U0) {
+			TRACE_ERROR("port %" B_PRIu8 " did not resume: %#" B_PRIx32 "\n",
+				i, portStatus);
+			continue;
+		}
+
+		// the link change was ours
+		WriteOpReg(XHCI_PORTSC(i), (portStatus & ~PS_CLEAR) | PS_PLC);
+		resumedPorts++;
+	}
+
+	// USB 2 devices take 10 ms to recover from a resume (USB 2.0 § 7.1.7.7).
+	if (usb2Resume)
+		snooze(10000);
+
+	fIdleSuspended = false;
+
+	// Restart the endpoints that still have transfers queued.
+	int32 restartedEndpoints = 0;
+	for (int32 slot = 1; slot < XHCI_MAX_DEVICES; slot++) {
+		xhci_device* device = &fDevices[slot];
+		if (device->slot == 0)
+			continue;
+
+		for (int32 i = 0; i < XHCI_MAX_ENDPOINTS - 1; i++) {
+			xhci_endpoint* endpoint = &device->endpoints[i];
+			if (endpoint->trbs == NULL)
+				continue;
+
+			mutex_lock(&endpoint->lock);
+			bool queued = !endpoint->td_list.IsEmpty();
+			mutex_unlock(&endpoint->lock);
+			if (queued) {
+				Ring(device->slot, endpoint->id + 1);
+				restartedEndpoints++;
+			}
+		}
+	}
+
+	TRACE_ALWAYS("resumed from idle: %" B_PRId32 " ports resumed, %" B_PRId32
+		" endpoints restarted\n", resumedPorts, restartedEndpoints);
 	return B_OK;
 }
 
@@ -2827,6 +3046,10 @@ XHCI::GetPortStatus(uint8 index, usb_port_status* status)
 			status->change |= PORT_CHANGE_BH_PORT_RESET;
 	}
 
+	// the ports change while they are suspended to idle, the devices stay
+	if (fIdleSuspended)
+		status->change = 0;
+
 	return B_OK;
 }
 
@@ -3025,6 +3248,10 @@ XHCI::Ring(uint8 slot, uint8 endpoint)
 		panic("Ring() invalid slot/endpoint combination\n");
 	if (slot > fSlotCount || endpoint >= XHCI_MAX_ENDPOINTS)
 		panic("Ring() invalid slot or endpoint\n");
+	if (slot != 0 && fIdleSuspended) {
+		// rung again on resume
+		return;
+	}
 
 	_DeviceMemoryBarrier();
 	WriteDoorReg32(XHCI_DOORBELL(slot), XHCI_DOORBELL_TARGET(endpoint)
@@ -3133,6 +3360,16 @@ XHCI::HandleTransferComplete(xhci_trb* trb)
 		// These occur on isochronous endpoints when there is no TRB ready to be
 		// executed at the appropriate time. (XHCI 1.2 § 4.10.3.1 p204.)
 		endpoint->status = completionCode;
+		return;
+	}
+
+	if ((completionCode == COMP_STOPPED
+			|| completionCode == COMP_STOPPED_LENGTH_INVALID
+			|| completionCode == COMP_STOPPED_SHORT_PACKET)
+		&& endpoint->cancel_count == 0) {
+		// Stopped for a suspend: the transfer continues at this TRB once the
+		// endpoint is rung again. (Or for its removal, which frees the
+		// descriptors itself.)
 		return;
 	}
 
@@ -3278,6 +3515,9 @@ XHCI::DumpRing(xhci_trb *trbs, uint32 size)
 status_t
 XHCI::DoCommand(xhci_trb* trb)
 {
+	if (fIdleHalted)
+		return B_DEV_NOT_READY;
+
 	if (!Lock()) {
 		TRACE("Unable to get lock!\n");
 		return B_ERROR;
