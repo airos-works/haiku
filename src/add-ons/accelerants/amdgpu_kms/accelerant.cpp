@@ -34,6 +34,10 @@ init_common(int device, bool isClone)
 	gInfo->clonedFrameBuffer = -1;
 	gInfo->retraceSemaphore = -1;
 	gInfo->retraceThread = -1;
+	for (uint32 i = 0; i < kMaxOutputs; i++) {
+		gInfo->outputRetraceSemaphores[i] = -1;
+		gInfo->outputRetraceThreads[i] = -1;
+	}
 	gInfo->frameBuffer.area = -1;
 	gInfo->cursor.area = -1;
 	gInfo->changePort = -1;
@@ -300,15 +304,97 @@ amdgpu_accelerant_retrace_semaphore(void)
 }
 
 
+/*!	One output's blanks: its CRTC's while it is driven, a 60 Hz clock
+	otherwise. The output is looked up by its connector every time, since a
+	probe rebuilds the outputs. */
+static status_t
+output_retrace_thread(void* data)
+{
+	uint32 index = (uint32)(addr_t)data;
+	uint32 connector = gInfo->outputRetraceConnectors[index];
+	while (!gInfo->quitRetrace) {
+		Output* output = NULL;
+		for (uint32 i = 0; i < gInfo->outputCount; i++) {
+			if (gInfo->outputs[i].connector == connector) {
+				output = &gInfo->outputs[i];
+				break;
+			}
+		}
+		if (output == NULL || !output->enabled || output->crtcIndex < 0
+			|| gInfo->dpmsMode != B_DPMS_ON
+			|| Kms::WaitVBlank(gInfo->device, output->crtcIndex) != B_OK) {
+			snooze(16667);
+		}
+		release_sem_etc(gInfo->outputRetraceSemaphores[index], 1,
+			B_RELEASE_ALL | B_DO_NOT_RESCHEDULE);
+	}
+	return B_OK;
+}
+
+
+extern "C" sem_id
+amdgpu_get_display_output_retrace_semaphore(uint32 id)
+{
+	if (gInfo->isClone)
+		return B_UNSUPPORTED;
+	refresh_outputs();
+	int32 index = -1;
+	for (uint32 i = 0; i < gInfo->outputCount; i++) {
+		if (gInfo->outputs[i].connector == id) {
+			index = i;
+			break;
+		}
+	}
+	if (index < 0)
+		return B_BAD_VALUE;
+	// an output keeps its slot: a probe keeps the order of the connectors
+	for (uint32 i = 0; i < kMaxOutputs; i++) {
+		if (gInfo->outputRetraceThreads[i] >= 0
+			&& gInfo->outputRetraceConnectors[i] == id)
+			return gInfo->outputRetraceSemaphores[i];
+	}
+	for (uint32 i = 0; i < kMaxOutputs; i++) {
+		if (gInfo->outputRetraceThreads[i] >= 0)
+			continue;
+		sem_id semaphore = create_sem(0, "amdgpu_kms output retrace");
+		if (semaphore < 0)
+			return semaphore;
+		gInfo->outputRetraceConnectors[i] = id;
+		gInfo->outputRetraceSemaphores[i] = semaphore;
+		gInfo->quitRetrace = false;
+		thread_id thread = spawn_thread(output_retrace_thread,
+			"amdgpu_kms output retrace", B_REAL_TIME_DISPLAY_PRIORITY,
+			(void*)(addr_t)i);
+		if (thread < 0) {
+			delete_sem(semaphore);
+			gInfo->outputRetraceSemaphores[i] = -1;
+			return thread;
+		}
+		gInfo->outputRetraceThreads[i] = thread;
+		resume_thread(thread);
+		return semaphore;
+	}
+	return B_NO_MEMORY;
+}
+
+
 static void
 stop_retrace(void)
 {
-	if (gInfo->retraceThread < 0)
-		return;
 	gInfo->quitRetrace = true;
 	status_t result;
-	wait_for_thread(gInfo->retraceThread, &result);
-	gInfo->retraceThread = -1;
-	delete_sem(gInfo->retraceSemaphore);
-	gInfo->retraceSemaphore = -1;
+	if (gInfo->retraceThread >= 0) {
+		wait_for_thread(gInfo->retraceThread, &result);
+		gInfo->retraceThread = -1;
+		delete_sem(gInfo->retraceSemaphore);
+		gInfo->retraceSemaphore = -1;
+	}
+	for (uint32 i = 0; i < kMaxOutputs; i++) {
+		if (gInfo->outputRetraceThreads[i] < 0)
+			continue;
+		wait_for_thread(gInfo->outputRetraceThreads[i], &result);
+		gInfo->outputRetraceThreads[i] = -1;
+		delete_sem(gInfo->outputRetraceSemaphores[i]);
+		gInfo->outputRetraceSemaphores[i] = -1;
+	}
 }

@@ -10,24 +10,46 @@ app_server draws into a back buffer in memory and copies what changed to the
 frame buffer the display scans out. A copy made while the scan passes through
 it shows the top of one picture and the bottom of the next: a tear.
 
-- `BView::DrawBitmap(..., B_WAIT_FOR_RETRACE)` draws into the back buffer
-  first; the copy to the screen then waits for the next blank
-  (`HWInterface::WaitForRetraceBeforeCopy()`, called from the drawing
-  engine's `DrawTransaction`). The copy starts ahead of the scan and runs
-  faster than it, so the picture stays whole.
-- Drawn inside an update (`Draw()`), the wait comes before the update's copy
-  in `Window::EndUpdate()` (`DrawingEngine::CopyToFront()`).
-- Without a back buffer, the wait comes before the drawing.
-- The waits use the accelerant's `B_ACCELERANT_RETRACE_SEMAPHORE`, the same
-  semaphore `BScreen::WaitForRetrace()` gives programs. An accelerant without
-  one is asked once; then nothing waits. A display that stops reporting
-  blanks costs three 50 ms timeouts, then the waits stop for a second.
-- The window thread waits with the window and the interface read locked:
-  other windows go on drawing, but whoever needs the interface exclusively
-  (a mode change) waits behind it, for at most a frame.
+Since branch `vblank-flush` (2026-10-15) every copy to the screen is timed:
 
-Only drawing that asks waits: MediaPlayer's video, airTime's copy through the
-app_server, `retrace_test`. Other drawing is copied at once, as before.
+- Drawing, window moves and scrolling only mark what changed. The copies to
+  the frame buffer are made by a *flush thread* once a frame, right after
+  the display's vertical blank (`HWInterface::_FlushThread()`). The copy
+  starts in the blank, goes from the top down in the order a `BRegion`
+  keeps its rectangles, and runs faster than the scan, so the display never
+  shows a half-copied picture. The thread holds the interface read locked
+  while it copies, as a drawing window would.
+- A large flush (over about 4 million pixels, a 4K display's half) is cut
+  into bands of rows, one for the flush thread and one per worker thread (up
+  to three, fewer with few processors): with N bands each has N times the
+  scan's time for its rows, and all stay ahead of it while the whole copy
+  takes less than a frame. On the X399 one core copies about 4 GB/s into
+  the WX 5100's frame buffer, so a flush of its two 4K displays alone would
+  take the whole frame.
+- Each display output of a layout gets its own flush target (`FlushTarget`:
+  the part of the frame buffer it shows, its own blanks, thread, pending
+  region and workers), because the monitors scan at their own phases. The
+  accelerant tells them apart with `B_GET_DISPLAY_OUTPUT_RETRACE_SEMAPHORE`
+  (a semaphore per output; `amdgpu_kms` has it). Without it, one target for
+  the whole frame buffer uses `B_ACCELERANT_RETRACE_SEMAPHORE`. Mirrors are
+  left out: they show another output's part, which is timed to that one.
+- A display that stops reporting blanks costs three 50 ms timeouts, then
+  the copies are made unsynchronized for a second. An accelerant with no
+  retrace semaphore at all gets the old behaviour: copies as drawn.
+- The threads count copies that ended up behind the scan (estimated from
+  the time since the blank over the output's rows; the blank's own lines
+  are the margin) and report once a minute to the syslog:
+  `app_server: vertical blank flush DP-1: N flushes, N rects, N behind the
+  scan (worst 0.00 frames), longest 9.2 ms, period 16.666 ms, 4 bands`.
+- `B_WAIT_FOR_RETRACE` drawing needs no wait of its own any more: it is
+  copied at the next blank like everything else. It no longer paces the
+  drawing program at the refresh rate (`retrace_test draw` reports hundreds
+  of frames a second; the display shows sixty).
+
+Before (branch `retrace-sync`, 2026-10-12), only drawing that asked for
+`B_WAIT_FOR_RETRACE` was timed, in the drawing thread
+(`HWInterface::WaitForRetraceBeforeCopy()`, still there for the unflushed
+case); other drawing was copied at once.
 
 Programs that write into the frame buffer themselves (`BDirectWindow`) wait
 with `BScreen::WaitForRetrace()` before they write; airTime does since
@@ -54,10 +76,11 @@ Shared pieces in `headers/private/graphics/common/`:
   millisecond, so a wait never ends in the middle of a frame. It sleeps when
   nobody has waited for two seconds.
 
-Limits: one semaphore per accelerant, so with several monitors the blanks are
-those of one of them (`nvidia_rm`: the primary head; `rpi_display`: the first
-output shown). Windows on the others can still tear. No page flipping: the
-copy is timed instead, which works while the copy outpaces the scan.
+Limits: only `amdgpu_kms` has the per-output semaphores, so with several
+monitors on the others the blanks are those of one of them (`nvidia_rm`: the
+primary head; `rpi_display`: the first output shown) and windows on the rest
+can still tear. No page flipping: the copy is timed instead, which works
+while the copy outpaces the scan.
 
 ## Checking it
 
@@ -66,8 +89,15 @@ copy is timed instead, which works while the copy outpaces the scan.
 ```
 retrace_test blanks 5 [--line sunxi]
 retrace_test draw 5 [--no-wait] [--update] [--size WxH] [--line ...]
+retrace_test move 10 [--size WxH]
+retrace_test scroll 10 [--size WxH]
 retrace_test lines --line sunxi
 ```
+
+`move` drags a window of stripes across the screen and back as the mouse
+would (a move every 4 ms); `scroll` scrolls a view of stripes up and down.
+Both are for watching the display (or its capture) for tears and for the
+flush statistics in the syslog.
 
 `blanks` measures the semaphore's rhythm. `draw` draws a full bitmap a frame
 and calls `Sync()`. With `--line`, both tell where the scan was when the wait

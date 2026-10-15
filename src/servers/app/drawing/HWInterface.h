@@ -191,8 +191,38 @@ public:
 	// while CopyBackToFront() actually performs the operation
 	virtual	status_t			CopyBackToFront(const BRect& frame);
 
+			bool				IsFlushingAtRetrace() const
+									{ return fFlushing; }
+	virtual	sem_id				OutputRetraceSemaphore(uint32 id);
+									// released at that display output's
+									// blanks; B_UNSUPPORTED without
+
 protected:
 	virtual	void				_CopyBackToFront(/*const*/ BRegion& region);
+
+	// The copies to the front buffer are gathered, and made once per frame
+	// right after the vertical blank, ahead of the scan, by a flush thread
+	// per display output (one for the whole frame buffer without the
+	// outputs' own blanks).
+			status_t			_StartFlushing();
+			void				_StopFlushing();
+			void				_UpdateFlushTargets();
+			status_t			_AddFlushTarget(uint32 outputID,
+									const char* name);
+			void				_AbandonFlushing();
+
+private:
+			struct FlushWorker;
+			struct FlushTarget;
+			status_t			_CopyAreaToFront(const IntRect& area);
+			bool				_QueueForFlush(const IntRect& area);
+	static	status_t			_FlushThreadEntry(void* data);
+			void				_FlushThread(FlushTarget& target);
+			void				_FlushPending(FlushTarget& target,
+									bigtime_t blank);
+	static	status_t			_FlushWorkerEntry(void* data);
+			void				_StartFlushWorkers(FlushTarget& target);
+			void				_StopFlushWorkers(FlushTarget& target);
 
 public:
 	// TODO: Just a quick and primitive way to get single buffered mode working.
@@ -306,6 +336,19 @@ private:
 
 			int32				fRetraceTimeouts;
 			bigtime_t			fRetraceIgnoredUntil;
+
+			// the vertical blank flush
+			BLocker				fFlushLock;
+									// the targets' pending regions, and
+									// the switch
+			FlushTarget*		fFlushTargets;
+			int32				fFlushTargetCount;
+			bool				fFlushPerOutput;
+									// the outputs' targets are in use
+			sem_id				fFlushDoneSem;
+			volatile bool		fQuitFlush;
+			volatile bool		fFlushing;
+									// copies go through the threads
 };
 
 #endif // HW_INTERFACE_H

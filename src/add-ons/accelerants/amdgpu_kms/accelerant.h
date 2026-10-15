@@ -109,6 +109,10 @@ struct accelerant_info {
 	sem_id				retraceSemaphore;
 	thread_id			retraceThread;
 	volatile bool		quitRetrace;
+	// per output (by index into outputs; connectors are stable)
+	sem_id				outputRetraceSemaphores[kMaxOutputs];
+	thread_id			outputRetraceThreads[kMaxOutputs];
+	uint32				outputRetraceConnectors[kMaxOutputs];
 
 	Kms::Buffer			cursor;
 	uint32*				cursorImage;	// what is in it: video memory can be lost
@@ -158,6 +162,7 @@ status_t amdgpu_clone_accelerant(void* info);
 void amdgpu_uninit_accelerant(void);
 status_t amdgpu_get_accelerant_device_info(accelerant_device_info* info);
 sem_id amdgpu_accelerant_retrace_semaphore(void);
+sem_id amdgpu_get_display_output_retrace_semaphore(uint32 id);
 
 // mode.cpp
 uint32 amdgpu_accelerant_mode_count(void);

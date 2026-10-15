@@ -87,6 +87,7 @@ enum {
 	B_GET_DISPLAY_OUTPUT_MODES,			/* optional */
 	B_SET_DISPLAY_LAYOUT,				/* optional */
 	B_SET_DISPLAY_CHANGE_PORT,			/* optional */
+	B_GET_DISPLAY_OUTPUT_RETRACE_SEMAPHORE,	/* optional */
 
 	/* 3D acceleration */
 	B_ACCELERANT_PRIVATE_START = (int)0x80000000
@@ -403,6 +404,10 @@ typedef status_t (*set_display_change_port)(port_id port, int32 code);
 	/* The accelerant writes an empty message with that code to the port
 	   whenever a monitor is connected or disconnected. A negative port id
 	   stops the notifications. */
+typedef sem_id (*get_display_output_retrace_semaphore)(uint32 id);
+	/* A semaphore released at each vertical blank of that output's monitor
+	   (B_ACCELERANT_RETRACE_SEMAPHORE is one output's). An output that is
+	   not being driven releases it at a steady rate instead. */
 
 typedef status_t (*set_cursor_shape)(uint16 width, uint16 height,
 	uint16 hotX, uint16 hotY, const uint8* andMask, const uint8* xorMask);
