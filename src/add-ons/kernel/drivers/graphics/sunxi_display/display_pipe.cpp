@@ -1418,7 +1418,26 @@ DisplayPipe::DebugRegister(phys_addr_t address, uint32& value, bool write)
 			value = _Read(address);
 		return B_OK;
 	}
-	return B_BAD_ADDRESS;
+
+	// Lab aid: any other register, mapped for this one access (the owner
+	// of the debug_registers setting can hang the SoC by reading an
+	// unclocked block, as with /dev/mem on Linux).
+	void* mapped;
+	area_id area = map_physical_memory("sunxi_display debug register",
+		address & ~(phys_addr_t)(B_PAGE_SIZE - 1), B_PAGE_SIZE,
+		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
+		&mapped);
+	if (area < 0)
+		return area;
+	volatile uint32* reg = (volatile uint32*)((uint8*)mapped
+		+ (address & (B_PAGE_SIZE - 1)));
+	if (write)
+		*reg = value;
+	else
+		value = *reg;
+	memory_full_barrier();
+	delete_area(area);
+	return B_OK;
 }
 
 

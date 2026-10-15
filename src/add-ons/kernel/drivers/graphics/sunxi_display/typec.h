@@ -115,6 +115,7 @@ private:
 			int32				fChanges;
 			uint16				fVendorId;
 			uint16				fProductId;
+			char				fPinPreference;	// 'C', 'D', 'E', 'N'one or 0
 };
 
 
