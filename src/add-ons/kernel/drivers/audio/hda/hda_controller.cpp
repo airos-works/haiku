@@ -1243,6 +1243,9 @@ hda_hw_init(hda_controller* controller)
 		goto no_irq_handler;
 	}
 
+	// (the lock the handler takes must exist before the handler can run)
+	B_INITIALIZE_SPINLOCK(&controller->interrupt_lock);
+	controller->lost_interrupts = 0;
 	status = install_io_interrupt_handler(controller->irq,
 		(interrupt_handler)hda_interrupt_handler, controller, 0);
 	if (status != B_OK)
@@ -1385,8 +1388,6 @@ hda_hw_init(hda_controller* controller)
 	}
 
 	controller->buffer_ready_sem = create_sem(0, "hda_buffer_sem");
-	B_INITIALIZE_SPINLOCK(&controller->interrupt_lock);
-	controller->lost_interrupts = 0;
 	if (controller->buffer_ready_sem < B_OK) {
 		dprintf("hda: failed to create semaphore\n");
 		status = ENODEV;
