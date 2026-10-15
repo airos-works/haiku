@@ -6,6 +6,8 @@
 
 #include "typec.h"
 
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "registers.h"
@@ -15,7 +17,7 @@
 #define ERROR(x...)	dprintf("sunxi_display: typec: " x)
 //#define TRACE_TYPEC
 #ifdef TRACE_TYPEC
-#	define TRACE(x...) dprintf("sunxi_display: typec: " x)
+#	define TRACE(x...) _Trace(x)
 #else
 #	define TRACE(x...) ;
 #endif
@@ -152,6 +154,22 @@ static const int32 kCapabilitiesCount = 50;
 static const bigtime_t kResponseTimeout = 300000;
 static const int32 kVdmRetries = 3;
 
+static bigtime_t sAttachedAt = 0;
+
+#ifdef TRACE_TYPEC
+static void
+_Trace(const char* format, ...)
+{
+	char buffer[256];
+	va_list args;
+	va_start(args, format);
+	vsnprintf(buffer, sizeof(buffer), format, args);
+	va_end(args);
+	dprintf("sunxi_display: typec: +%" B_PRId64 " ms: %s",
+		(system_time() - sAttachedAt) / 1000, buffer);
+}
+#endif
+
 
 using namespace sunxi;
 
@@ -196,8 +214,10 @@ TypeCPort::Init()
 	r_pin_set(PIN_BANK_L, PIN_VBUS, false);
 	r_pin_set_function(PIN_BANK_L, PIN_VBUS, PIN_FUNCTION_OUTPUT);
 
+	// 400 kHz as the BSP runs it: a sink expects the answer to its Request
+	// within tSenderResponse (24 ms), and a register read takes 48 clocks
 	status_t status = fTwi.Init(A733_R_TWI1_BASE, A733_R_CCU_TWI_GATE,
-		A733_R_CCU_TWI1_BIT);
+		A733_R_CCU_TWI1_BIT, Twi::kFastClock);
 	if (status != B_OK)
 		return status;
 
@@ -223,6 +243,14 @@ TypeCPort::Init()
 	fTwi.Write16(HUSB311_ADDRESS, HUSB311_DRP_DUTY_CTRL, 330);
 	fTwi.Write8(HUSB311_ADDRESS, HUSB311_VCONN_CLIMITEN, 0x01);
 	fTwi.Write8(HUSB311_ADDRESS, HUSB311_IDLE_CTRL, HUSB311_IDLE_SET(1));
+
+#ifdef TRACE_TYPEC
+	// how fast the bus is: a 16-bit register read is about 48 SCL periods
+	bigtime_t start = system_time();
+	for (int i = 0; i < 16; i++)
+		fTwi.Read16(HUSB311_ADDRESS, TCPC_VENDOR_ID, vendor);
+	TRACE("16 register reads took %" B_PRId64 " us\n", system_time() - start);
+#endif
 
 	fInitialized = true;
 	_Detach();
@@ -275,6 +303,7 @@ void
 TypeCPort::_Attach(bool flipped, bool vconn)
 {
 	fFlipped = flipped;
+	sAttachedAt = system_time();
 	INFO("attached (%s CC%d%s), sourcing VBUS\n", flipped ? "flipped" : "normal",
 		flipped ? 2 : 1, vconn ? ", VCONN" : "");
 
@@ -364,6 +393,7 @@ TypeCPort::_Transmit(uint8 type, const uint32* objects, int count,
 		}
 		snooze(500);
 	}
+	TRACE("sending %s %u: no TX result\n", isData ? "data" : "control", type);
 	return B_TIMED_OUT;
 }
 
@@ -384,24 +414,39 @@ bool
 TypeCPort::_Receive(Message& message)
 {
 	uint8 count = 0;
-	if (fTwi.Read8(HUSB311_ADDRESS, TCPC_RX_BYTE_CNT, count) != B_OK)
+	status_t countStatus = fTwi.Read8(HUSB311_ADDRESS, TCPC_RX_BYTE_CNT, count);
+	if (countStatus != B_OK) {
+		TRACE("rx: reading the byte count: %s\n", strerror(countStatus));
 		return false;
+	}
 	uint8 frameType = 0;
-	fTwi.Read8(HUSB311_ADDRESS, TCPC_RX_BUF_FRAME_TYPE, frameType);
+	status_t typeStatus = fTwi.Read8(HUSB311_ADDRESS, TCPC_RX_BUF_FRAME_TYPE,
+		frameType);
 	uint16 header = 0;
-	fTwi.Read16(HUSB311_ADDRESS, TCPC_RX_HDR, header);
+	status_t headerStatus = fTwi.Read16(HUSB311_ADDRESS, TCPC_RX_HDR, header);
 
 	// the count is one more than the header and data bytes
 	int payload = count > 3 ? count - 3 : 0;
 	if (payload > 28)
 		payload = 28;
 	uint8 data[28] = {};
+	status_t dataStatus = B_OK;
 	if (payload > 0)
-		fTwi.Read(HUSB311_ADDRESS, TCPC_RX_DATA, data, payload);
+		dataStatus = fTwi.Read(HUSB311_ADDRESS, TCPC_RX_DATA, data, payload);
 	fTwi.Write16(HUSB311_ADDRESS, TCPC_ALERT, ALERT_RX_STATUS);
-
-	if ((frameType & 7) != 0)
+	TRACE("rx: count %u, frame type %#x, header %#06x (reads %s/%s/%s)\n",
+		count, frameType, header, strerror(typeStatus), strerror(headerStatus),
+		strerror(dataStatus));
+	if (count < 3 || typeStatus != B_OK || headerStatus != B_OK
+		|| dataStatus != B_OK) {
+		// nothing (or nothing readable) in the buffer
 		return false;
+	}
+
+	if ((frameType & 7) != 0) {
+		TRACE("rx frame type %#x dropped (header %#06x)\n", frameType, header);
+		return false;
+	}
 
 	message.header = header;
 	for (int i = 0; i < 7; i++) {
@@ -410,6 +455,9 @@ TypeCPort::_Receive(Message& message)
 				| (uint32)data[4 * i + 2] << 16 | (uint32)data[4 * i + 3] << 24
 			: 0;
 	}
+	TRACE("rx %#06x: %#" B_PRIx32 " %#" B_PRIx32 " %#" B_PRIx32 " %#" B_PRIx32
+		"\n", header, message.objects[0], message.objects[1],
+		message.objects[2], message.objects[3]);
 	return true;
 }
 
@@ -417,7 +465,8 @@ TypeCPort::_Receive(Message& message)
 void
 TypeCPort::_HardReset()
 {
-	INFO("hard reset\n");
+	INFO("hard reset from the partner (state %d, %" B_PRId64 " ms after attach)\n",
+		fState, (system_time() - sAttachedAt) / 1000);
 	r_pin_set(PIN_BANK_L, PIN_VBUS, false);
 	fTwi.Write8(HUSB311_ADDRESS, TCPC_POWER_CTRL, 0);
 	if (fHotPlug || fState >= kStateDisplayPort)
@@ -487,10 +536,18 @@ TypeCPort::_HandleMessage(const Message& message)
 				_SendControl(PD_CONTROL_REJECT);
 				break;
 			}
-			_SendControl(PD_CONTROL_ACCEPT);
+			bigtime_t received = system_time();
+			status_t accepted = _SendControl(PD_CONTROL_ACCEPT);
+			bigtime_t acceptedAt = system_time();
 			// VBUS is at 5 V already: tSrcTransition, then ready
 			snooze(30000);
-			_SendControl(PD_CONTROL_PS_RDY);
+			status_t ready = _SendControl(PD_CONTROL_PS_RDY);
+			INFO("request %#" B_PRIx32 ": accept %s (%" B_PRId64 " ms after "
+				"the request, %" B_PRId64 " ms after attach), PS_RDY %s\n",
+				message.objects[0], accepted == B_OK ? "acknowledged"
+					: strerror(accepted), (acceptedAt - received) / 1000,
+				(acceptedAt - sAttachedAt) / 1000,
+				ready == B_OK ? "acknowledged" : strerror(ready));
 			if (fState <= kStateWaitRequest) {
 				INFO("power contract: 5 V\n");
 				fRetries = 0;
@@ -771,6 +828,8 @@ TypeCPort::Poll()
 	uint16 alert = 0;
 	if (fTwi.Read16(HUSB311_ADDRESS, TCPC_ALERT, alert) != B_OK)
 		return;
+	if (alert != 0 && fState != kStateUnattached)
+		TRACE("alert %#06x (state %d)\n", alert, fState);
 
 	if ((alert & ALERT_RX_HARD_RESET) != 0) {
 		fTwi.Write16(HUSB311_ADDRESS, TCPC_ALERT, ALERT_RX_HARD_RESET);
