@@ -698,13 +698,25 @@ HWInterface::_CopyShadowToFront(BRegion& region)
 		return;
 	}
 
+	// in bands of rows across all the rects, so that the copy goes down
+	// the screen as the scan does: rects side by side would otherwise be
+	// copied one after the other, the later ones behind the scan
+	const int32 kBandRows = 64;
 	uint32 srcBPR = shadow->BytesPerRow();
 	uint8* src = (uint8*)shadow->Bits();
 	int32 count = region.CountRects();
-	for (int32 i = 0; i < count; i++) {
-		clipping_rect r = region.RectAtInt(i);
-		uint8* srcOffset = src + r.top * srcBPR + r.left * 4;
-		_CopyToFront(srcOffset, srcBPR, r.left, r.top, r.right, r.bottom);
+	clipping_rect frame = region.FrameInt();
+	for (int32 top = frame.top; top <= frame.bottom; top += kBandRows) {
+		int32 bottom = min_c(top + kBandRows - 1, frame.bottom);
+		for (int32 i = 0; i < count; i++) {
+			clipping_rect r = region.RectAtInt(i);
+			if (r.top > bottom || r.bottom < top)
+				continue;
+			int32 from = max_c(r.top, top);
+			int32 to = min_c(r.bottom, bottom);
+			uint8* srcOffset = src + from * srcBPR + r.left * 4;
+			_CopyToFront(srcOffset, srcBPR, r.left, from, r.right, to);
+		}
 	}
 }
 
