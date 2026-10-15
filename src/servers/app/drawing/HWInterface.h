@@ -232,8 +232,10 @@ private:
 			float				_FlushScanRow(FlushTarget& target,
 									bigtime_t blank);
 			void				_CopyShadowToFront(BRegion& region);
-			void				_BeginCopying(const IntRect& rect,
+			bool				_BeginCopying(const IntRect& rect,
 									int32 band);
+			void				_RequeueForFlush(FlushTarget& target,
+									const BRegion& region);
 			void				_EndCopying(int32 band);
 	static	status_t			_FlushKnobEntry(void* data);
 			void				_FlushKnobThread();

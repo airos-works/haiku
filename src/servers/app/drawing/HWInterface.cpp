@@ -661,47 +661,26 @@ HWInterface::_CopyBackToFront(/*const*/ BRegion& region)
 }
 
 
-/*!	The flush is about to copy the rect: waits while a write into the
-	shadow (a memcpy, short) touches it, then notes the rect so that new
-	writes keep off it until _EndCopying(). */
-void
+/*!	The flush is about to copy the rect: not while a write into the shadow
+	(a memcpy, short) touches it, in which case it says so and the rect is
+	left for the next blank (the flush never waits: a copy that starts late
+	runs behind the scan). Else notes the rect so that new writes keep off
+	it until _EndCopying(). */
+bool
 HWInterface::_BeginCopying(const IntRect& rect, int32 band)
 {
 	if (!fFlushLock.Lock())
-		return;
-	bigtime_t deadline = 0;
-	while (true) {
-		bool writing = false;
-		for (int32 i = 0; i < 32; i++) {
-			if (fShadowWrites[i].used && fShadowWrites[i].rect.IsValid()
-				&& fShadowWrites[i].rect.Intersects(rect)) {
-				writing = true;
-				break;
-			}
+		return true;
+	for (int32 i = 0; i < 32; i++) {
+		if (fShadowWrites[i].used && fShadowWrites[i].rect.IsValid()
+			&& fShadowWrites[i].rect.Intersects(rect)) {
+			fFlushLock.Unlock();
+			return false;
 		}
-		if (!writing)
-			break;
-		if (deadline == 0)
-			deadline = system_time() + 5000;
-		else if (system_time() > deadline)
-			break;
-		fFlushLock.Unlock();
-		snooze(20);
-		if (!fFlushLock.Lock())
-			return;
 	}
 	fCopying[band] = rect;
 	fFlushLock.Unlock();
-}
-
-
-void
-HWInterface::_EndCopying(int32 band)
-{
-	if (fFlushLock.Lock()) {
-		fCopying[band] = IntRect(0, 0, -1, -1);
-		fFlushLock.Unlock();
-	}
+	return true;
 }
 
 
@@ -796,6 +775,7 @@ struct HWInterface::FlushWorker {
 	FlushTarget*	target;
 	bigtime_t		blank;
 	int32			band;
+	bool			skipped;		// being written: left for later
 };
 
 
@@ -1163,6 +1143,32 @@ HWInterface::_QueueForFlush(const IntRect& area, int32 shadowSlot)
 }
 
 
+/*!	Puts back what a flush left for the next blank, and sees to it that
+	the target's thread comes back for it. */
+void
+HWInterface::_RequeueForFlush(FlushTarget& target, const BRegion& region)
+{
+	if (region.CountRects() == 0 || !fFlushLock.Lock())
+		return;
+	bool wasEmpty = target.pending.CountRects() == 0;
+	target.pending.Include(&region);
+	target.queued++;
+	fFlushLock.Unlock();
+	if (wasEmpty)
+		release_sem_etc(target.wake, 1, B_DO_NOT_RESCHEDULE);
+}
+
+
+void
+HWInterface::_EndCopying(int32 band)
+{
+	if (fFlushLock.Lock()) {
+		fCopying[band] = IntRect(0, 0, -1, -1);
+		fFlushLock.Unlock();
+	}
+}
+
+
 /*static*/ status_t
 HWInterface::_FlushThreadEntry(void* data)
 {
@@ -1267,10 +1273,12 @@ HWInterface::_FlushWorkerEntry(void* data)
 		worker->began = system_time();
 		worker->beganRow = interface->_FlushScanRow(*worker->target,
 			worker->blank);
-		interface->_BeginCopying(IntRect(worker->region.Frame()),
-			1 + worker->band);
-		interface->_CopyShadowToFront(worker->region);
-		interface->_EndCopying(1 + worker->band);
+		worker->skipped = !interface->_BeginCopying(
+			IntRect(worker->region.Frame()), 1 + worker->band);
+		if (!worker->skipped) {
+			interface->_CopyShadowToFront(worker->region);
+			interface->_EndCopying(1 + worker->band);
+		}
 		worker->ended = system_time();
 		worker->endedRow = interface->_FlushScanRow(*worker->target,
 			worker->blank);
@@ -1432,7 +1440,11 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 			}
 			IntRect rect(r.left, r.top, r.right, r.bottom);
 			BRegion one((BRect)rect);
-			_BeginCopying(rect, 0);
+			if (!_BeginCopying(rect, 0)) {
+				// being written: at the next blank
+				_RequeueForFlush(target, one);
+				continue;
+			}
 			_CopyShadowToFront(one);
 			_EndCopying(0);
 			scan = _FlushScanRow(target, blank);
@@ -1461,9 +1473,11 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 			}
 		}
 		float beganRow = _FlushScanRow(target, blank);
-		_BeginCopying(IntRect(first.Frame()), 0);
-		_CopyShadowToFront(first);
-		_EndCopying(0);
+		bool firstSkipped = !_BeginCopying(IntRect(first.Frame()), 0);
+		if (!firstSkipped) {
+			_CopyShadowToFront(first);
+			_EndCopying(0);
+		}
 		float endedRow = _FlushScanRow(target, blank);
 		for (int32 i = 1; i < bands; i++) {
 			while (acquire_sem(fFlushDoneSem) == B_INTERRUPTED)
@@ -1475,6 +1489,10 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 			BRegion* band = i == 0 ? &first : &worker->region;
 			if (band->CountRects() == 0)
 				continue;
+			if (i == 0 ? firstSkipped : worker->skipped) {
+				_RequeueForFlush(target, *band);
+				continue;
+			}
 			IntRect bandFrame(band->Frame());
 			float scan = i == 0 ? beganRow : worker->beganRow;
 			bool behind = false;
