@@ -12,6 +12,7 @@
 #include <new>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -62,21 +63,12 @@ HWInterface::HWInterface()
 	fRetraceTimeouts(0),
 	fRetraceIgnoredUntil(0),
 	fFlushLock("vertical blank flush"),
-	fFlushSem(-1),
-	fFlushThread(-1),
-	fQuitFlush(false),
-	fFlushing(false),
-	fFlushWorkers(NULL),
-	fFlushWorkerCount(0),
+	fFlushTargets(NULL),
+	fFlushTargetCount(0),
+	fFlushPerOutput(false),
 	fFlushDoneSem(-1),
-	fLastBlank(0),
-	fBlankPeriod(16667),
-	fFlushCount(0),
-	fFlushRects(0),
-	fFlushLate(0),
-	fFlushWorstLate(0),
-	fFlushLongest(0),
-	fFlushReported(0)
+	fQuitFlush(false),
+	fFlushing(false)
 {
 }
 
@@ -84,15 +76,7 @@ HWInterface::HWInterface()
 HWInterface::~HWInterface()
 {
 	// the derived class, with the buffers, is gone: no draining here
-	if (fFlushThread >= 0) {
-		fFlushing = false;
-		fQuitFlush = true;
-		delete_sem(fFlushSem);
-		status_t result;
-		wait_for_thread(fFlushThread, &result);
-		fFlushThread = -1;
-		_StopFlushWorkers();
-	}
+	_AbandonFlushing();
 }
 
 
@@ -590,6 +574,24 @@ HWInterface::_CopyAreaToFront(const IntRect& area)
 }
 
 
+void
+HWInterface::_CopyBackToFront(/*const*/ BRegion& region)
+{
+	RenderingBuffer* backBuffer = BackBuffer();
+
+	uint32 srcBPR = backBuffer->BytesPerRow();
+	uint8* src = (uint8*)backBuffer->Bits();
+
+	int32 count = region.CountRects();
+	for (int32 i = 0; i < count; i++) {
+		clipping_rect r = region.RectAtInt(i);
+		// offset to left top pixel in source buffer (always B_RGBA32)
+		uint8* srcOffset = src + r.top * srcBPR + r.left * 4;
+		_CopyToFront(srcOffset, srcBPR, r.left, r.top, r.right, r.bottom);
+	}
+}
+
+
 // #pragma mark - vertical blank flush
 
 
@@ -598,140 +600,39 @@ HWInterface::_CopyAreaToFront(const IntRect& area)
 	the display's vertical blank. A copy that starts at the blank runs ahead
 	of the scan (it is faster), so what the display shows is never half of
 	one picture and half of the next: windows move and scroll without
-	tearing. The thread keeps the interface read locked while it copies, as
-	a drawing window would.
+	tearing. Each display output has its own target, with its blanks and the
+	part of the frame buffer it shows, when the accelerant tells them apart;
+	else one target, the whole frame buffer, with the accelerant's one
+	retrace semaphore. The threads keep the interface read locked while they
+	copy, as a drawing window would.
 
-	Without a retrace semaphore the copies are made at once, as before.
+	Without any retrace semaphore the copies are made at once, as before.
 */
-status_t
-HWInterface::_StartFlushing()
-{
-	if (fFlushThread >= 0)
-		return B_OK;
+struct HWInterface::FlushTarget {
+	HWInterface*	interface;
+	uint32			outputID;		// 0: the whole frame buffer
+	char			name[B_DISPLAY_OUTPUT_NAME_LENGTH];
+	IntRect			frame;			// what it shows, in buffer pixels
+									// (invalid: not driven)
+	sem_id			retraceSemaphore;	// -1: not asked for yet
+	thread_id		thread;
+	sem_id			wake;			// something is pending
+	BRegion			pending;		// fFlushLock
+	FlushWorker*	workers;
+	int32			workerCount;
 
-	fFlushSem = create_sem(0, "vertical blank flush");
-	if (fFlushSem < 0)
-		return fFlushSem;
+	int32			timeouts;
+	bigtime_t		ignoredUntil;
+	bigtime_t		lastBlank;
+	bigtime_t		period;
 
-	fQuitFlush = false;
-	fFlushThread = spawn_thread(_FlushThreadEntry, "vertical blank flush",
-		B_REAL_TIME_DISPLAY_PRIORITY, this);
-	if (fFlushThread < 0) {
-		delete_sem(fFlushSem);
-		fFlushSem = -1;
-		return fFlushThread;
-	}
-
-	_StartFlushWorkers();
-	fFlushing = true;
-	resume_thread(fFlushThread);
-	return B_OK;
-}
-
-
-void
-HWInterface::_StopFlushing()
-{
-	if (fFlushThread < 0)
-		return;
-
-	// from now on the copies are made as drawn (the switch is made under
-	// the lock, so that nothing is queued after the last drain)
-	if (fFlushLock.Lock()) {
-		fFlushing = false;
-		fFlushLock.Unlock();
-	}
-	fQuitFlush = true;
-	delete_sem(fFlushSem);
-	fFlushSem = -1;
-
-	status_t result;
-	wait_for_thread(fFlushThread, &result);
-	fFlushThread = -1;
-
-	// whatever was still waiting goes to the screen now
-	_FlushPending(0);
-	_StopFlushWorkers();
-}
-
-
-bool
-HWInterface::_QueueForFlush(const IntRect& area)
-{
-	if (!fFlushLock.Lock())
-		return false;
-	if (!fFlushing) {
-		fFlushLock.Unlock();
-		return false;
-	}
-
-	bool wasEmpty = fPendingFlush.CountRects() == 0;
-	fPendingFlush.Include((clipping_rect)area);
-	fFlushLock.Unlock();
-
-	if (wasEmpty)
-		release_sem_etc(fFlushSem, 1, B_DO_NOT_RESCHEDULE);
-	return true;
-}
-
-
-/*static*/ status_t
-HWInterface::_FlushThreadEntry(void* data)
-{
-	((HWInterface*)data)->_FlushThread();
-	return B_OK;
-}
-
-
-void
-HWInterface::_FlushThread()
-{
-	while (!fQuitFlush) {
-		// something to copy?
-		if (acquire_sem(fFlushSem) != B_OK)
-			break;
-		if (fQuitFlush)
-			break;
-
-		// the blank
-		bigtime_t blank = 0;
-		if (system_time() >= fRetraceIgnoredUntil) {
-			// a blank missed at 60 Hz still fits, and one at 24 Hz
-			bigtime_t waitStart = system_time();
-			status_t status = WaitForRetrace(50000);
-			if (status == B_OK) {
-				blank = system_time();
-				fRetraceTimeouts = 0;
-				if (fLastBlank != 0) {
-					// the blank after the last one only when the wait began
-					// in the first half of the time between them (else it
-					// may have begun after one or more went by)
-					bigtime_t period = blank - fLastBlank;
-					if (period > 2000 && period < 60000
-						&& waitStart - fLastBlank < period / 2)
-						fBlankPeriod = period;
-				}
-				fLastBlank = blank;
-			} else if (status == B_TIMED_OUT) {
-				// the display does not report blanks right now
-				if (++fRetraceTimeouts >= 3) {
-					fRetraceTimeouts = 0;
-					fRetraceIgnoredUntil = system_time() + 1000000;
-				}
-			} else {
-				// no retrace semaphore: copy as drawn, from now on
-				if (fFlushLock.Lock()) {
-					fFlushing = false;
-					fFlushLock.Unlock();
-				}
-				_FlushPending(0);
-				break;
-			}
-		}
-
-		_FlushPending(blank);
-	}
-}
+	int64			flushes;
+	int64			rects;
+	int64			late;
+	float			worstLate;
+	bigtime_t		longest;
+	bigtime_t		reported;
+};
 
 
 /*!	A thread that copies one band of a flush, so that a large one is done
@@ -747,6 +648,305 @@ struct HWInterface::FlushWorker {
 	bigtime_t		began;
 	bigtime_t		ended;
 };
+
+
+sem_id
+HWInterface::OutputRetraceSemaphore(uint32 id)
+{
+	return B_UNSUPPORTED;
+}
+
+
+/*!	Stops the threads without a last copy: for the destructor, when the
+	buffers are gone already. */
+void
+HWInterface::_AbandonFlushing()
+{
+	if (fFlushTargets == NULL)
+		return;
+	fFlushing = false;
+	fQuitFlush = true;
+	for (int32 i = 0; i < fFlushTargetCount; i++) {
+		FlushTarget& target = fFlushTargets[i];
+		delete_sem(target.wake);
+		status_t result;
+		wait_for_thread(target.thread, &result);
+		_StopFlushWorkers(target);
+	}
+	delete[] fFlushTargets;
+	fFlushTargets = NULL;
+	fFlushTargetCount = 0;
+	if (fFlushDoneSem >= 0) {
+		delete_sem(fFlushDoneSem);
+		fFlushDoneSem = -1;
+	}
+}
+
+
+status_t
+HWInterface::_StartFlushing()
+{
+	if (fFlushTargets != NULL)
+		return B_OK;
+
+	// one target for the whole frame buffer, and one per display output
+	display_output* outputs = NULL;
+	uint32 outputCount = 0;
+	if (GetDisplayOutputs(&outputs, &outputCount) != B_OK)
+		outputCount = 0;
+
+	fFlushDoneSem = create_sem(0, "vertical blank flush done");
+	if (fFlushDoneSem < 0) {
+		free(outputs);
+		return fFlushDoneSem;
+	}
+	fFlushTargets = new(std::nothrow) FlushTarget[1 + outputCount];
+	if (fFlushTargets == NULL) {
+		free(outputs);
+		delete_sem(fFlushDoneSem);
+		fFlushDoneSem = -1;
+		return B_NO_MEMORY;
+	}
+	fQuitFlush = false;
+	for (uint32 i = 0; i <= outputCount; i++) {
+		FlushTarget& target = fFlushTargets[i];
+		target.interface = this;
+		target.outputID = i == 0 ? 0 : outputs[i - 1].id;
+		strlcpy(target.name, i == 0 ? "screen" : outputs[i - 1].name,
+			sizeof(target.name));
+		target.frame = IntRect(0, 0, -1, -1);
+		target.retraceSemaphore = -1;
+		target.workers = NULL;
+		target.workerCount = 0;
+		target.timeouts = 0;
+		target.ignoredUntil = 0;
+		target.lastBlank = 0;
+		target.period = 16667;
+		target.flushes = target.rects = target.late = 0;
+		target.worstLate = 0;
+		target.longest = target.reported = 0;
+		target.wake = create_sem(0, "vertical blank flush");
+		target.thread = target.wake < 0 ? -1 : spawn_thread(_FlushThreadEntry,
+			"vertical blank flush", B_REAL_TIME_DISPLAY_PRIORITY, &target);
+		if (target.thread < 0) {
+			if (target.wake >= 0)
+				delete_sem(target.wake);
+			break;
+		}
+		fFlushTargetCount++;
+	}
+	free(outputs);
+	if (fFlushTargetCount == 0) {
+		delete[] fFlushTargets;
+		fFlushTargets = NULL;
+		delete_sem(fFlushDoneSem);
+		fFlushDoneSem = -1;
+		return B_ERROR;
+	}
+
+	_UpdateFlushTargets();
+	fFlushing = true;
+	for (int32 i = 0; i < fFlushTargetCount; i++)
+		resume_thread(fFlushTargets[i].thread);
+	return B_OK;
+}
+
+
+void
+HWInterface::_StopFlushing()
+{
+	if (fFlushTargets == NULL)
+		return;
+
+	// from now on the copies are made as drawn (the switch is made under
+	// the lock, so that nothing is queued after the last drain)
+	if (fFlushLock.Lock()) {
+		fFlushing = false;
+		fFlushLock.Unlock();
+	}
+	fQuitFlush = true;
+	for (int32 i = 0; i < fFlushTargetCount; i++) {
+		FlushTarget& target = fFlushTargets[i];
+		delete_sem(target.wake);
+		target.wake = -1;
+		status_t result;
+		wait_for_thread(target.thread, &result);
+		target.thread = -1;
+		// whatever was still waiting goes to the screen now
+		_FlushPending(target, 0);
+		_StopFlushWorkers(target);
+	}
+	delete[] fFlushTargets;
+	fFlushTargets = NULL;
+	fFlushTargetCount = 0;
+	delete_sem(fFlushDoneSem);
+	fFlushDoneSem = -1;
+}
+
+
+/*!	Tells the targets what their outputs show now: after a mode or layout
+	change. Write locked (or not locked yet, when starting).
+*/
+void
+HWInterface::_UpdateFlushTargets()
+{
+	if (fFlushTargets == NULL)
+		return;
+
+	display_output* outputs = NULL;
+	uint32 outputCount = 0;
+	if (fFlushTargetCount > 1
+		&& GetDisplayOutputs(&outputs, &outputCount) != B_OK)
+		outputCount = 0;
+
+	RenderingBuffer* backBuffer = BackBuffer();
+	IntRect bufferFrame = backBuffer != NULL
+		? IntRect(backBuffer->Bounds()) : IntRect(0, 0, -1, -1);
+
+	if (fFlushLock.Lock()) {
+		fFlushTargets[0].frame = bufferFrame;
+		bool perOutput = false;
+		for (int32 i = 1; i < fFlushTargetCount; i++) {
+			FlushTarget& target = fFlushTargets[i];
+			target.frame = IntRect(0, 0, -1, -1);
+			for (uint32 j = 0; j < outputCount; j++) {
+				const display_output& output = outputs[j];
+				if (output.id != target.outputID)
+					continue;
+				if ((output.flags & B_DISPLAY_OUTPUT_ENABLED) == 0
+					|| (output.flags & B_DISPLAY_OUTPUT_MIRROR) != 0)
+					break;
+				if (target.retraceSemaphore == -1) {
+					target.retraceSemaphore
+						= OutputRetraceSemaphore(output.id);
+					if (target.retraceSemaphore < 0)
+						target.retraceSemaphore = B_UNSUPPORTED;
+				}
+				if (target.retraceSemaphore < 0)
+					break;
+				target.frame = bufferFrame & IntRect(output.x, output.y,
+					output.x + output.width - 1, output.y + output.height - 1);
+				if (target.frame.IsValid())
+					perOutput = true;
+				break;
+			}
+		}
+		fFlushPerOutput = perOutput;
+		fFlushLock.Unlock();
+	}
+	free(outputs);
+}
+
+
+bool
+HWInterface::_QueueForFlush(const IntRect& area)
+{
+	if (!fFlushLock.Lock())
+		return false;
+	if (!fFlushing) {
+		fFlushLock.Unlock();
+		return false;
+	}
+
+	// to every output that shows some of it, or else to the whole screen
+	bool routed = false;
+	if (fFlushPerOutput) {
+		for (int32 i = 1; i < fFlushTargetCount; i++) {
+			FlushTarget& target = fFlushTargets[i];
+			if (!target.frame.IsValid() || !target.frame.Intersects(area))
+				continue;
+			bool wasEmpty = target.pending.CountRects() == 0;
+			target.pending.Include((clipping_rect)(target.frame & area));
+			if (wasEmpty)
+				release_sem_etc(target.wake, 1, B_DO_NOT_RESCHEDULE);
+			routed = true;
+		}
+	}
+	if (!routed) {
+		FlushTarget& target = fFlushTargets[0];
+		bool wasEmpty = target.pending.CountRects() == 0;
+		target.pending.Include((clipping_rect)area);
+		if (wasEmpty)
+			release_sem_etc(target.wake, 1, B_DO_NOT_RESCHEDULE);
+	}
+	fFlushLock.Unlock();
+	return true;
+}
+
+
+/*static*/ status_t
+HWInterface::_FlushThreadEntry(void* data)
+{
+	FlushTarget* target = (FlushTarget*)data;
+	target->interface->_FlushThread(*target);
+	return B_OK;
+}
+
+
+void
+HWInterface::_FlushThread(FlushTarget& target)
+{
+	while (!fQuitFlush) {
+		// something to copy?
+		if (acquire_sem(target.wake) != B_OK)
+			break;
+		if (fQuitFlush)
+			break;
+
+		// the blank
+		bigtime_t blank = 0;
+		if (system_time() >= target.ignoredUntil) {
+			if (target.retraceSemaphore == -1) {
+				target.retraceSemaphore = target.outputID == 0
+					? RetraceSemaphore()
+					: OutputRetraceSemaphore(target.outputID);
+				if (target.retraceSemaphore < 0)
+					target.retraceSemaphore = B_UNSUPPORTED;
+			}
+			// a blank missed at 60 Hz still fits, and one at 24 Hz
+			bigtime_t waitStart = system_time();
+			status_t status = target.retraceSemaphore < 0
+				? target.retraceSemaphore
+				: acquire_sem_etc(target.retraceSemaphore, 1,
+					B_RELATIVE_TIMEOUT, 50000);
+			if (status == B_OK) {
+				blank = system_time();
+				target.timeouts = 0;
+				if (target.lastBlank != 0) {
+					// the blank after the last one only when the wait began
+					// in the first half of the time between them (else it
+					// may have begun after one or more went by)
+					bigtime_t period = blank - target.lastBlank;
+					if (period > 2000 && period < 60000
+						&& waitStart - target.lastBlank < period / 2)
+						target.period = period;
+				}
+				target.lastBlank = blank;
+			} else if (status == B_TIMED_OUT) {
+				// the display does not report blanks right now
+				if (++target.timeouts >= 3) {
+					target.timeouts = 0;
+					target.ignoredUntil = system_time() + 1000000;
+				}
+			} else if (target.outputID == 0) {
+				// no retrace semaphore at all: copy as drawn, from now on
+				if (fFlushLock.Lock()) {
+					fFlushing = false;
+					fFlushLock.Unlock();
+				}
+				_FlushPending(target, 0);
+				break;
+			} else {
+				// the output's semaphore went away: copy as drawn, and
+				// ask again later
+				target.retraceSemaphore = -1;
+				target.ignoredUntil = system_time() + 1000000;
+			}
+		}
+
+		_FlushPending(target, blank);
+	}
+}
 
 
 /*static*/ status_t
@@ -766,22 +966,30 @@ HWInterface::_FlushWorkerEntry(void* data)
 }
 
 
+/*!	Up to three workers per target, and fewer with few processors, so that
+	the targets together do not ask for more than there are.
+*/
 void
-HWInterface::_StartFlushWorkers()
+HWInterface::_StartFlushWorkers(FlushTarget& target)
 {
 	system_info info;
 	if (get_system_info(&info) != B_OK || info.cpu_count < 2)
 		return;
-	int32 count = min_c((int32)info.cpu_count - 1, 3);
-
-	fFlushDoneSem = create_sem(0, "vertical blank flush done");
-	if (fFlushDoneSem < 0)
+	int32 outputs = 0;
+	for (int32 i = 1; i < fFlushTargetCount; i++) {
+		if (fFlushTargets[i].frame.IsValid())
+			outputs++;
+	}
+	int32 count = ((int32)info.cpu_count - 1) / max_c(outputs, 1);
+	count = min_c(count, 3);
+	if (count < 1)
 		return;
-	fFlushWorkers = new(std::nothrow) FlushWorker[count];
-	if (fFlushWorkers == NULL)
+
+	target.workers = new(std::nothrow) FlushWorker[count];
+	if (target.workers == NULL)
 		return;
 	for (int32 i = 0; i < count; i++) {
-		FlushWorker& worker = fFlushWorkers[i];
+		FlushWorker& worker = target.workers[i];
 		worker.interface = this;
 		worker.start = create_sem(0, "vertical blank flush band");
 		worker.thread = worker.start < 0 ? -1 : spawn_thread(
@@ -793,45 +1001,43 @@ HWInterface::_StartFlushWorkers()
 			break;
 		}
 		resume_thread(worker.thread);
-		fFlushWorkerCount++;
+		target.workerCount++;
 	}
 }
 
 
 void
-HWInterface::_StopFlushWorkers()
+HWInterface::_StopFlushWorkers(FlushTarget& target)
 {
-	for (int32 i = 0; i < fFlushWorkerCount; i++) {
-		FlushWorker& worker = fFlushWorkers[i];
+	for (int32 i = 0; i < target.workerCount; i++) {
+		FlushWorker& worker = target.workers[i];
 		delete_sem(worker.start);
 		status_t result;
 		wait_for_thread(worker.thread, &result);
 	}
-	fFlushWorkerCount = 0;
-	delete[] fFlushWorkers;
-	fFlushWorkers = NULL;
-	if (fFlushDoneSem >= 0) {
-		delete_sem(fFlushDoneSem);
-		fFlushDoneSem = -1;
-	}
+	target.workerCount = 0;
+	delete[] target.workers;
+	target.workers = NULL;
 }
 
 
-/*!	Copies what is waiting, in order from the top of the screen: a region's
+/*!	Copies what is waiting for the target, in order from the top: a region's
 	rectangles come sorted that way. A large flush is split into bands of
 	rows, one per worker thread and one for this thread. When the blank is
 	known, each copy is checked against where the scan should be by then (a
-	frame's time over the buffer's rows, which leaves the blank's own lines
+	frame's time over the output's rows, which leaves the blank's own lines
 	as a margin): behind it at the start, the rows up to the scan still
 	show the old picture; behind it at the end, the scan overtook the copy.
 */
 void
-HWInterface::_FlushPending(bigtime_t blank)
+HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 {
 	BRegion pending;
+	IntRect targetFrame;
 	if (fFlushLock.Lock()) {
-		pending = fPendingFlush;
-		fPendingFlush.MakeEmpty();
+		pending = target.pending;
+		target.pending.MakeEmpty();
+		targetFrame = target.frame;
 		fFlushLock.Unlock();
 	}
 	if (pending.CountRects() == 0)
@@ -848,8 +1054,11 @@ HWInterface::_FlushPending(bigtime_t blank)
 	// the buffer may have changed since these were queued
 	BRegion bufferRegion((BRect)IntRect(backBuffer->Bounds()));
 	pending.IntersectWith(&bufferRegion);
-	int32 rows = backBuffer->Height();
-	bigtime_t period = fBlankPeriod;
+	if (!targetFrame.IsValid())
+		targetFrame = IntRect(backBuffer->Bounds());
+	int32 rows = targetFrame.Height() + 1;
+	int32 scanTop = targetFrame.top;
+	bigtime_t period = target.period;
 	bigtime_t start = system_time();
 	float worst = 0;
 	int64 late = 0;
@@ -868,15 +1077,22 @@ HWInterface::_FlushPending(bigtime_t blank)
 		area += (int64)(r.right - r.left + 1) * (r.bottom - r.top + 1);
 	}
 	int32 bands = 1;
-	if (fFlushWorkerCount > 0 && area > kBandArea)
-		bands = min_c(fFlushWorkerCount + 1, (int32)(area / kBandArea) + 1);
+	if (area > kBandArea) {
+		if (target.workers == NULL)
+			_StartFlushWorkers(target);
+		if (target.workerCount > 0) {
+			bands = min_c(target.workerCount + 1,
+				(int32)(area / kBandArea) + 1);
+		}
+	}
 
 	if (bands == 1) {
 		for (int32 i = 0; i < count; i++) {
 			clipping_rect r = pending.RectAtInt(i);
 			bool behind = false;
-			if (blank != 0 && rows > 0) {
-				float scan = float(system_time() - blank) / period * rows;
+			if (blank != 0) {
+				float scan = scanTop
+					+ float(system_time() - blank) / period * rows;
 				if (scan > r.top) {
 					behind = true;
 					worst = max_c(worst, (scan - r.top) / rows);
@@ -884,8 +1100,9 @@ HWInterface::_FlushPending(bigtime_t blank)
 			}
 			BRegion one((BRect)IntRect(r.left, r.top, r.right, r.bottom));
 			_CopyBackToFront(one);
-			if (blank != 0 && rows > 0) {
-				float scan = float(system_time() - blank) / period * rows;
+			if (blank != 0) {
+				float scan = scanTop
+					+ float(system_time() - blank) / period * rows;
 				if (scan > r.bottom + 1) {
 					behind = true;
 					worst = max_c(worst, (scan - r.bottom - 1) / rows);
@@ -900,14 +1117,14 @@ HWInterface::_FlushPending(bigtime_t blank)
 		int32 bandRows = (frame.Height() + 1 + bands - 1) / bands;
 		BRegion first;
 		for (int32 i = 0; i < bands; i++) {
-			BRegion* band = i == 0 ? &first : &fFlushWorkers[i - 1].region;
+			BRegion* band = i == 0 ? &first : &target.workers[i - 1].region;
 			BRegion bandRegion(BRect(frame.left, top, frame.right,
 				min_c(top + bandRows - 1, frame.bottom)));
 			*band = pending;
 			band->IntersectWith(&bandRegion);
 			top += bandRows;
 			if (i > 0)
-				release_sem_etc(fFlushWorkers[i - 1].start, 1, 0);
+				release_sem_etc(target.workers[i - 1].start, 1, 0);
 		}
 		bigtime_t began = system_time();
 		_CopyBackToFront(first);
@@ -915,21 +1132,22 @@ HWInterface::_FlushPending(bigtime_t blank)
 		for (int32 i = 1; i < bands; i++)
 			acquire_sem(fFlushDoneSem);
 
-		if (blank != 0 && rows > 0) {
+		if (blank != 0) {
 			for (int32 i = 0; i < bands; i++) {
-				BRegion* band = i == 0 ? &first : &fFlushWorkers[i - 1].region;
+				FlushWorker* worker = i == 0 ? NULL : &target.workers[i - 1];
+				BRegion* band = i == 0 ? &first : &worker->region;
 				if (band->CountRects() == 0)
 					continue;
-				bigtime_t from = i == 0 ? began : fFlushWorkers[i - 1].began;
-				bigtime_t to = i == 0 ? ended : fFlushWorkers[i - 1].ended;
+				bigtime_t from = i == 0 ? began : worker->began;
+				bigtime_t to = i == 0 ? ended : worker->ended;
 				IntRect bandFrame(band->Frame());
-				float scan = float(from - blank) / period * rows;
+				float scan = scanTop + float(from - blank) / period * rows;
 				bool behind = false;
 				if (scan > bandFrame.top) {
 					behind = true;
 					worst = max_c(worst, (scan - bandFrame.top) / rows);
 				}
-				scan = float(to - blank) / period * rows;
+				scan = scanTop + float(to - blank) / period * rows;
 				if (scan > bandFrame.bottom + 1) {
 					behind = true;
 					worst = max_c(worst, (scan - bandFrame.bottom - 1) / rows);
@@ -947,57 +1165,27 @@ HWInterface::_FlushPending(bigtime_t blank)
 	UnlockParallelAccess();
 
 	bigtime_t took = system_time() - start;
-	fFlushCount++;
-	fFlushRects += count;
-	fFlushLate += late;
-	fFlushWorstLate = max_c(fFlushWorstLate, worst);
-	fFlushLongest = max_c(fFlushLongest, took);
+	target.flushes++;
+	target.rects += count;
+	target.late += late;
+	target.worstLate = max_c(target.worstLate, worst);
+	target.longest = max_c(target.longest, took);
 
-	if (start - fFlushReported > 60000000) {
-		if (fFlushReported != 0) {
-			debug_printf("app_server: vertical blank flush: %" B_PRId64
+	if (start - target.reported > 60000000) {
+		if (target.reported != 0) {
+			debug_printf("app_server: vertical blank flush %s: %" B_PRId64
 				" flushes, %" B_PRId64 " rects, %" B_PRId64 " behind the scan"
 				" (worst %.2f frames), longest %.1f ms, period %.3f ms, "
-				"%" B_PRId32 " bands\n",
-				fFlushCount, fFlushRects, fFlushLate, fFlushWorstLate,
-				fFlushLongest / 1000.0, period / 1000.0, bands);
+				"%" B_PRId32 " bands\n", target.name,
+				target.flushes, target.rects, target.late, target.worstLate,
+				target.longest / 1000.0, period / 1000.0, bands);
 		}
-		fFlushReported = start;
-		fFlushCount = 0;
-		fFlushRects = 0;
-		fFlushLate = 0;
-		fFlushWorstLate = 0;
-		fFlushLongest = 0;
-	}
-}
-
-
-void
-HWInterface::GetFlushStatistics(int64& flushes, int64& rects, int64& late,
-	float& worstLate, bigtime_t& longest)
-{
-	flushes = fFlushCount;
-	rects = fFlushRects;
-	late = fFlushLate;
-	worstLate = fFlushWorstLate;
-	longest = fFlushLongest;
-}
-
-
-void
-HWInterface::_CopyBackToFront(/*const*/ BRegion& region)
-{
-	RenderingBuffer* backBuffer = BackBuffer();
-
-	uint32 srcBPR = backBuffer->BytesPerRow();
-	uint8* src = (uint8*)backBuffer->Bits();
-
-	int32 count = region.CountRects();
-	for (int32 i = 0; i < count; i++) {
-		clipping_rect r = region.RectAtInt(i);
-		// offset to left top pixel in source buffer (always B_RGBA32)
-		uint8* srcOffset = src + r.top * srcBPR + r.left * 4;
-		_CopyToFront(srcOffset, srcBPR, r.left, r.top, r.right, r.bottom);
+		target.reported = start;
+		target.flushes = 0;
+		target.rects = 0;
+		target.late = 0;
+		target.worstLate = 0;
+		target.longest = 0;
 	}
 }
 

@@ -59,6 +59,7 @@ public:
 									uint32 count, bool switchMode = true);
 
 	virtual sem_id				RetraceSemaphore();
+	virtual	sem_id				OutputRetraceSemaphore(uint32 id);
 	virtual status_t			WaitForRetrace(
 									bigtime_t timeout = B_INFINITE_TIMEOUT);
 
@@ -189,6 +190,8 @@ private:
 			get_display_output_modes fAccGetDisplayOutputModes;
 			set_display_layout	fAccSetDisplayLayout;
 			set_display_change_port fAccSetDisplayChangePort;
+			get_display_output_retrace_semaphore
+								fAccGetDisplayOutputRetraceSemaphore;
 			port_id				fDisplayChangePort;
 			thread_id			fDisplayChangeThread;
 

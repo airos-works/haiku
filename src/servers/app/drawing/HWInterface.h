@@ -193,28 +193,34 @@ public:
 
 			bool				IsFlushingAtRetrace() const
 									{ return fFlushing; }
-			void				GetFlushStatistics(int64& flushes,
-									int64& rects, int64& late,
-									float& worstLate, bigtime_t& longest);
+	virtual	sem_id				OutputRetraceSemaphore(uint32 id);
+									// released at that display output's
+									// blanks; B_UNSUPPORTED without
 
 protected:
 	virtual	void				_CopyBackToFront(/*const*/ BRegion& region);
 
 	// The copies to the front buffer are gathered, and made once per frame
-	// right after the vertical blank, ahead of the scan: a flush thread.
+	// right after the vertical blank, ahead of the scan, by a flush thread
+	// per display output (one for the whole frame buffer without the
+	// outputs' own blanks).
 			status_t			_StartFlushing();
 			void				_StopFlushing();
+			void				_UpdateFlushTargets();
+			void				_AbandonFlushing();
 
 private:
+			struct FlushWorker;
+			struct FlushTarget;
 			status_t			_CopyAreaToFront(const IntRect& area);
 			bool				_QueueForFlush(const IntRect& area);
 	static	status_t			_FlushThreadEntry(void* data);
-			void				_FlushThread();
-			void				_FlushPending(bigtime_t blank);
-			struct FlushWorker;
+			void				_FlushThread(FlushTarget& target);
+			void				_FlushPending(FlushTarget& target,
+									bigtime_t blank);
 	static	status_t			_FlushWorkerEntry(void* data);
-			void				_StartFlushWorkers();
-			void				_StopFlushWorkers();
+			void				_StartFlushWorkers(FlushTarget& target);
+			void				_StopFlushWorkers(FlushTarget& target);
 
 public:
 	// TODO: Just a quick and primitive way to get single buffered mode working.
@@ -331,25 +337,16 @@ private:
 
 			// the vertical blank flush
 			BLocker				fFlushLock;
-			BRegion				fPendingFlush;
-									// in buffer pixels; fFlushLock
-			sem_id				fFlushSem;
-			thread_id			fFlushThread;
+									// the targets' pending regions, and
+									// the switch
+			FlushTarget*		fFlushTargets;
+			int32				fFlushTargetCount;
+			bool				fFlushPerOutput;
+									// the outputs' targets are in use
+			sem_id				fFlushDoneSem;
 			volatile bool		fQuitFlush;
 			volatile bool		fFlushing;
-									// copies go through the thread
-			FlushWorker*		fFlushWorkers;
-			int32				fFlushWorkerCount;
-			sem_id				fFlushDoneSem;
-
-			bigtime_t			fLastBlank;
-			bigtime_t			fBlankPeriod;
-			int64				fFlushCount;
-			int64				fFlushRects;
-			int64				fFlushLate;
-			float				fFlushWorstLate;
-			bigtime_t			fFlushLongest;
-			bigtime_t			fFlushReported;
+									// copies go through the threads
 };
 
 #endif // HW_INTERFACE_H

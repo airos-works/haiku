@@ -150,6 +150,7 @@ AccelerantHWInterface::AccelerantHWInterface()
 	fAccGetDisplayOutputModes(NULL),
 	fAccSetDisplayLayout(NULL),
 	fAccSetDisplayChangePort(NULL),
+	fAccGetDisplayOutputRetraceSemaphore(NULL),
 	fDisplayChangePort(-1),
 	fDisplayChangeThread(-1),
 
@@ -448,6 +449,9 @@ AccelerantHWInterface::_SetupDefaultHooks()
 		B_SET_DISPLAY_LAYOUT, NULL);
 	fAccSetDisplayChangePort = (set_display_change_port)fAccelerantHook(
 		B_SET_DISPLAY_CHANGE_PORT, NULL);
+	fAccGetDisplayOutputRetraceSemaphore
+		= (get_display_output_retrace_semaphore)fAccelerantHook(
+			B_GET_DISPLAY_OUTPUT_RETRACE_SEMAPHORE, NULL);
 	if (fAccGetDisplayOutputCount == NULL || fAccGetDisplayOutputs == NULL
 		|| fAccSetDisplayLayout == NULL) {
 		fAccGetDisplayOutputCount = NULL;
@@ -455,6 +459,7 @@ AccelerantHWInterface::_SetupDefaultHooks()
 		fAccGetDisplayOutputModes = NULL;
 		fAccSetDisplayLayout = NULL;
 		fAccSetDisplayChangePort = NULL;
+		fAccGetDisplayOutputRetraceSemaphore = NULL;
 	}
 
 	// Monitors coming and going: the accelerant writes to this port, and the
@@ -783,6 +788,9 @@ AccelerantHWInterface::_SetMode(const display_mode& mode, bool force)
 	status = _UpdateBackBuffer();
 	if (status != B_OK)
 		return status;
+
+	// the outputs may show other parts of it now
+	_UpdateFlushTargets();
 
 	// update color palette configuration if necessary
 	if (fDisplayMode.space == B_CMAP8)
@@ -1122,6 +1130,16 @@ AccelerantHWInterface::RetraceSemaphore()
 
 	atomic_test_and_set(&fRetraceSemaphore, semaphore, -1);
 	return atomic_get(&fRetraceSemaphore);
+}
+
+
+sem_id
+AccelerantHWInterface::OutputRetraceSemaphore(uint32 id)
+{
+	if (fAccGetDisplayOutputRetraceSemaphore == NULL)
+		return B_UNSUPPORTED;
+	sem_id semaphore = fAccGetDisplayOutputRetraceSemaphore(id);
+	return semaphore < 0 ? B_UNSUPPORTED : semaphore;
 }
 
 
