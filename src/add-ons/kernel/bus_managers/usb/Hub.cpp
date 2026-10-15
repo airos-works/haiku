@@ -341,14 +341,27 @@ Hub::Explore(change_item **changeList)
 			}
 		}
 
-		// other port changes we do not really handle, report and clear them
 		if (fPortStatus[i].change & PORT_STATUS_ENABLE) {
 			TRACE_ALWAYS("port %" B_PRId32 " %sabled\n", i,
 				(fPortStatus[i].status & PORT_STATUS_ENABLE) ? "en" : "dis");
 			DefaultPipe()->SendRequest(USB_REQTYPE_CLASS | USB_REQTYPE_OTHER_OUT,
 				USB_REQUEST_CLEAR_FEATURE, C_PORT_ENABLE, i + 1,
 				0, NULL, 0, NULL);
+
+			// A port with a device that the hardware disabled (after errors,
+			// noise on the bus) stays useless: remove the device, the next
+			// exploration enumerates it again, as Linux does.
+			if ((fPortStatus[i].status & PORT_STATUS_ENABLE) == 0
+				&& (fPortStatus[i].status & PORT_STATUS_CONNECTION) != 0
+				&& fChildren[i] != NULL) {
+				TRACE_ALWAYS("port %" B_PRId32 ": enumerating the disabled "
+					"device again\n", i);
+				fChildren[i]->Changed(changeList, false);
+				fChildren[i] = NULL;
+			}
 		}
+
+		// other port changes we do not really handle, report and clear them
 
 		if (fPortStatus[i].change & PORT_STATUS_SUSPEND) {
 			TRACE_ALWAYS("port %" B_PRId32 " is %ssuspended\n", i,

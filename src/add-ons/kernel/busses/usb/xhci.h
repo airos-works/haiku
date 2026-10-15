@@ -145,7 +145,7 @@ public:
 	virtual	const char *		TypeName() const { return "xhci"; }
 
 			status_t			Start();
-			status_t			Suspend();
+			status_t			Suspend(int32 state);
 			status_t			Resume();
 	virtual	status_t			SubmitTransfer(Transfer *transfer);
 			status_t			SubmitControlRequest(Transfer *transfer);
@@ -177,6 +177,10 @@ private:
 			// Controller resets
 			status_t			ControllerReset();
 			status_t			ControllerHalt();
+
+			// Suspend to idle
+			status_t			_SuspendToIdle();
+			status_t			_ResumeFromIdle();
 			void				_SetInterruptModeration();
 
 			// Interrupt functions
@@ -326,6 +330,11 @@ private:
 			phys_addr_t			fErstPhysical;
 			phys_addr_t			fCmdRingPhysical;
 			bool				fPortsDisconnected;
+			bool				fIdleSuspended;
+				// transfers are refused and doorbells held back
+			bool				fIdleHalted;
+				// commands are refused
+			bool				fPortIdleSuspended[XHCI_MAX_PORTS];
 
 			spinlock			fSpinlock;
 
