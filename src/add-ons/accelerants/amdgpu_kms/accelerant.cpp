@@ -378,6 +378,52 @@ amdgpu_get_display_output_retrace_semaphore(uint32 id)
 }
 
 
+/*!	The scan's row in the output's region now: from the end of the last
+	blank, the pixel clock and the line length, scaled from the monitor's
+	rows to the region's. Negative while the blank lasts. */
+extern "C" status_t
+amdgpu_get_display_output_scan_line(uint32 id, int32* _line, int32* _lines)
+{
+	if (gInfo->isClone)
+		return B_UNSUPPORTED;
+	Output* output = NULL;
+	for (uint32 i = 0; i < gInfo->outputCount; i++) {
+		if (gInfo->outputs[i].connector == id) {
+			output = &gInfo->outputs[i];
+			break;
+		}
+	}
+	if (output == NULL)
+		return B_BAD_VALUE;
+	if (!output->enabled || output->crtcIndex < 0
+		|| gInfo->dpmsMode != B_DPMS_ON || output->timing.clock == 0
+		|| output->timing.htotal == 0 || output->timing.vdisplay == 0)
+		return B_NOT_ALLOWED;
+
+	bigtime_t scanStart;
+	status_t status = Kms::LastVBlank(gInfo->device, output->crtcIndex,
+		&scanStart);
+	if (status != B_OK)
+		return status;
+	bigtime_t now = system_time();
+	// clock is in kHz: lines = us * kHz / 1000 / htotal
+	int64 line = (now - scanStart) * output->timing.clock
+		/ (1000LL * output->timing.htotal);
+	int32 total = output->timing.vtotal;
+	if (line >= total) {
+		// a stale blank (its interrupt off): wrap, it is periodic
+		line %= total;
+	}
+	if (line >= output->timing.vdisplay) {
+		// in the blank before the next scan
+		line -= total;
+	}
+	*_line = (int32)(line * (int64)output->height / output->timing.vdisplay);
+	*_lines = output->height;
+	return B_OK;
+}
+
+
 static void
 stop_retrace(void)
 {

@@ -615,6 +615,11 @@ struct HWInterface::FlushTarget {
 	IntRect			frame;			// what it shows, in buffer pixels
 									// (invalid: not driven)
 	sem_id			retraceSemaphore;	// -1: not asked for yet
+	int32			scanLineKnown;	// -1: not asked yet; the hardware
+									// tells where its scan is
+	bigtime_t		period;			// between blanks
+	IntRect			scanFrame;		// what the scan runs over (the
+									// target's frame, or the buffer)
 	thread_id		thread;
 	sem_id			wake;			// something is pending
 	BRegion			pending;		// fFlushLock
@@ -626,7 +631,6 @@ struct HWInterface::FlushTarget {
 	int32			timeouts;
 	bigtime_t		ignoredUntil;
 	bigtime_t		lastBlank;
-	bigtime_t		period;
 
 	int64			flushes;
 	int64			rects;
@@ -649,6 +653,10 @@ struct HWInterface::FlushWorker {
 	BRegion			region;
 	bigtime_t		began;
 	bigtime_t		ended;
+	float			beganRow;		// where the scan was then
+	float			endedRow;
+	FlushTarget*	target;
+	bigtime_t		blank;
 };
 
 
@@ -656,6 +664,38 @@ sem_id
 HWInterface::OutputRetraceSemaphore(uint32 id)
 {
 	return B_UNSUPPORTED;
+}
+
+
+status_t
+HWInterface::OutputScanLine(uint32 id, int32* _line, int32* _lines)
+{
+	return B_UNSUPPORTED;
+}
+
+
+/*!	The buffer row the target's scan is at right now: from the hardware when
+	it tells (a row above the frame while it is in the blank), else
+	estimated from the time since the blank over the frame's rows (which
+	leaves the blank's own lines as a margin). Without a blank, unknown. */
+float
+HWInterface::_FlushScanRow(FlushTarget& target, bigtime_t blank)
+{
+	if (target.scanLineKnown != 0 && target.outputID != 0) {
+		int32 line, lines;
+		status_t status = OutputScanLine(target.outputID, &line, &lines);
+		if (status == B_OK && lines > 0) {
+			target.scanLineKnown = 1;
+			return target.scanFrame.top
+				+ float(line) * (target.scanFrame.Height() + 1) / lines;
+		}
+		if (status == B_UNSUPPORTED)
+			target.scanLineKnown = 0;
+	}
+	if (blank == 0)
+		return -1e9;
+	return target.scanFrame.top + float(system_time() - blank) / target.period
+		* (target.scanFrame.Height() + 1);
 }
 
 
@@ -736,6 +776,8 @@ HWInterface::_AddFlushTarget(uint32 outputID, const char* name)
 	strlcpy(target.name, name, sizeof(target.name));
 	target.frame = IntRect(0, 0, -1, -1);
 	target.retraceSemaphore = -1;
+	target.scanLineKnown = -1;
+	target.scanFrame = IntRect(0, 0, -1, -1);
 	target.workers = NULL;
 	target.workerCount = 0;
 	target.timeouts = 0;
@@ -998,8 +1040,12 @@ HWInterface::_FlushWorkerEntry(void* data)
 		if (status != B_OK || interface->fQuitFlush)
 			break;
 		worker->began = system_time();
+		worker->beganRow = interface->_FlushScanRow(*worker->target,
+			worker->blank);
 		interface->_CopyBackToFront(worker->region);
 		worker->ended = system_time();
+		worker->endedRow = interface->_FlushScanRow(*worker->target,
+			worker->blank);
 		release_sem_etc(interface->fFlushDoneSem, 1, B_DO_NOT_RESCHEDULE);
 	}
 	return B_OK;
@@ -1031,6 +1077,8 @@ HWInterface::_StartFlushWorkers(FlushTarget& target)
 	for (int32 i = 0; i < count; i++) {
 		FlushWorker& worker = target.workers[i];
 		worker.interface = this;
+		worker.target = &target;
+		worker.blank = 0;
 		worker.start = create_sem(0, "vertical blank flush band");
 		worker.thread = worker.start < 0 ? -1 : spawn_thread(
 			_FlushWorkerEntry, "vertical blank flush band",
@@ -1114,8 +1162,8 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 	pending.IntersectWith(&bufferRegion);
 	if (!targetFrame.IsValid())
 		targetFrame = IntRect(backBuffer->Bounds());
+	target.scanFrame = targetFrame;
 	int32 rows = targetFrame.Height() + 1;
-	int32 scanTop = targetFrame.top;
 	bigtime_t period = target.period;
 	bigtime_t start = system_time();
 	float worst = 0;
@@ -1148,23 +1196,17 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 		for (int32 i = 0; i < count; i++) {
 			clipping_rect r = pending.RectAtInt(i);
 			bool behind = false;
-			if (blank != 0) {
-				float scan = scanTop
-					+ float(system_time() - blank) / period * rows;
-				if (scan > r.top) {
-					behind = true;
-					worst = max_c(worst, (scan - r.top) / rows);
-				}
+			float scan = _FlushScanRow(target, blank);
+			if (scan > r.top) {
+				behind = true;
+				worst = max_c(worst, (scan - r.top) / rows);
 			}
 			BRegion one((BRect)IntRect(r.left, r.top, r.right, r.bottom));
 			_CopyBackToFront(one);
-			if (blank != 0) {
-				float scan = scanTop
-					+ float(system_time() - blank) / period * rows;
-				if (scan > r.bottom + 1) {
-					behind = true;
-					worst = max_c(worst, (scan - r.bottom - 1) / rows);
-				}
+			scan = _FlushScanRow(target, blank);
+			if (scan > r.bottom + 1) {
+				behind = true;
+				worst = max_c(worst, (scan - r.bottom - 1) / rows);
 			}
 			if (behind)
 				late++;
@@ -1181,40 +1223,38 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 			*band = pending;
 			band->IntersectWith(&bandRegion);
 			top += bandRows;
-			if (i > 0)
+			if (i > 0) {
+				target.workers[i - 1].blank = blank;
 				release_sem_etc(target.workers[i - 1].start, 1, 0);
+			}
 		}
-		bigtime_t began = system_time();
+		float beganRow = _FlushScanRow(target, blank);
 		_CopyBackToFront(first);
-		bigtime_t ended = system_time();
+		float endedRow = _FlushScanRow(target, blank);
 		for (int32 i = 1; i < bands; i++) {
 			while (acquire_sem(fFlushDoneSem) == B_INTERRUPTED)
 				;
 		}
 
-		if (blank != 0) {
-			for (int32 i = 0; i < bands; i++) {
-				FlushWorker* worker = i == 0 ? NULL : &target.workers[i - 1];
-				BRegion* band = i == 0 ? &first : &worker->region;
-				if (band->CountRects() == 0)
-					continue;
-				bigtime_t from = i == 0 ? began : worker->began;
-				bigtime_t to = i == 0 ? ended : worker->ended;
-				IntRect bandFrame(band->Frame());
-				float scan = scanTop + float(from - blank) / period * rows;
-				bool behind = false;
-				if (scan > bandFrame.top) {
-					behind = true;
-					worst = max_c(worst, (scan - bandFrame.top) / rows);
-				}
-				scan = scanTop + float(to - blank) / period * rows;
-				if (scan > bandFrame.bottom + 1) {
-					behind = true;
-					worst = max_c(worst, (scan - bandFrame.bottom - 1) / rows);
-				}
-				if (behind)
-					late++;
+		for (int32 i = 0; i < bands; i++) {
+			FlushWorker* worker = i == 0 ? NULL : &target.workers[i - 1];
+			BRegion* band = i == 0 ? &first : &worker->region;
+			if (band->CountRects() == 0)
+				continue;
+			IntRect bandFrame(band->Frame());
+			float scan = i == 0 ? beganRow : worker->beganRow;
+			bool behind = false;
+			if (scan > bandFrame.top) {
+				behind = true;
+				worst = max_c(worst, (scan - bandFrame.top) / rows);
 			}
+			scan = i == 0 ? endedRow : worker->endedRow;
+			if (scan > bandFrame.bottom + 1) {
+				behind = true;
+				worst = max_c(worst, (scan - bandFrame.bottom - 1) / rows);
+			}
+			if (behind)
+				late++;
 		}
 	}
 
@@ -1235,9 +1275,11 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 		if (target.reported != 0) {
 			debug_printf("app_server: vertical blank flush %s: %" B_PRId64
 				" flushes, %" B_PRId64 " rects, %" B_PRId64 " behind the scan"
-				" (worst %.2f frames), longest %.1f ms, period %.3f ms, "
-				"%" B_PRId32 " bands\n", target.name,
+				" (worst %.2f frames, scan %s), longest %.1f ms, period "
+				"%.3f ms, %" B_PRId32 " bands\n", target.name,
 				target.flushes, target.rects, target.late, target.worstLate,
+				target.scanLineKnown == 1 ? "read from the hardware"
+					: "estimated from the blank",
 				target.longest / 1000.0, period / 1000.0, bands);
 		}
 		target.reported = start;

@@ -121,6 +121,8 @@ void DestroyBuffer(int fd, Buffer& buffer);
 
 // waits for the next vertical blank of the CRTC with the index \a crtcIndex
 status_t WaitVBlank(int fd, uint32 crtcIndex, uint32* sequence = NULL);
+status_t LastVBlank(int fd, uint32 crtcIndex, bigtime_t* _time);
+	// when the last vertical blank ended (the scan began), system_time()
 
 status_t SetCursor(int fd, uint32 crtc, uint32 handle, uint32 width,
 	uint32 height, int32 hotX, int32 hotY);

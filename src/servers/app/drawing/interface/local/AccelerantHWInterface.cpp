@@ -151,6 +151,7 @@ AccelerantHWInterface::AccelerantHWInterface()
 	fAccSetDisplayLayout(NULL),
 	fAccSetDisplayChangePort(NULL),
 	fAccGetDisplayOutputRetraceSemaphore(NULL),
+	fAccGetDisplayOutputScanLine(NULL),
 	fDisplayChangePort(-1),
 	fDisplayChangeThread(-1),
 
@@ -452,6 +453,9 @@ AccelerantHWInterface::_SetupDefaultHooks()
 	fAccGetDisplayOutputRetraceSemaphore
 		= (get_display_output_retrace_semaphore)fAccelerantHook(
 			B_GET_DISPLAY_OUTPUT_RETRACE_SEMAPHORE, NULL);
+	fAccGetDisplayOutputScanLine
+		= (get_display_output_scan_line)fAccelerantHook(
+			B_GET_DISPLAY_OUTPUT_SCAN_LINE, NULL);
 	if (fAccGetDisplayOutputCount == NULL || fAccGetDisplayOutputs == NULL
 		|| fAccSetDisplayLayout == NULL) {
 		fAccGetDisplayOutputCount = NULL;
@@ -460,6 +464,7 @@ AccelerantHWInterface::_SetupDefaultHooks()
 		fAccSetDisplayLayout = NULL;
 		fAccSetDisplayChangePort = NULL;
 		fAccGetDisplayOutputRetraceSemaphore = NULL;
+		fAccGetDisplayOutputScanLine = NULL;
 	}
 
 	// Monitors coming and going: the accelerant writes to this port, and the
@@ -1140,6 +1145,15 @@ AccelerantHWInterface::OutputRetraceSemaphore(uint32 id)
 		return B_UNSUPPORTED;
 	sem_id semaphore = fAccGetDisplayOutputRetraceSemaphore(id);
 	return semaphore < 0 ? B_UNSUPPORTED : semaphore;
+}
+
+
+status_t
+AccelerantHWInterface::OutputScanLine(uint32 id, int32* _line, int32* _lines)
+{
+	if (fAccGetDisplayOutputScanLine == NULL)
+		return B_UNSUPPORTED;
+	return fAccGetDisplayOutputScanLine(id, _line, _lines);
 }
 
 

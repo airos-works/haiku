@@ -163,6 +163,8 @@ void amdgpu_uninit_accelerant(void);
 status_t amdgpu_get_accelerant_device_info(accelerant_device_info* info);
 sem_id amdgpu_accelerant_retrace_semaphore(void);
 sem_id amdgpu_get_display_output_retrace_semaphore(uint32 id);
+status_t amdgpu_get_display_output_scan_line(uint32 id, int32* _line,
+	int32* _lines);
 
 // mode.cpp
 uint32 amdgpu_accelerant_mode_count(void);

@@ -469,6 +469,26 @@ WaitVBlank(int fd, uint32 crtcIndex, uint32* sequence)
 }
 
 
+/*!	The DRM timestamp of the last vertical blank marks the start of the
+	active scan that followed it (amdgpu derives it from the scan position,
+	so it is exact to a line), in system_time()'s base. */
+status_t
+LastVBlank(int fd, uint32 crtcIndex, bigtime_t* _time)
+{
+	drm_wait_vblank query = {};
+	query.request.type = (drm_vblank_seq_type)(_DRM_VBLANK_RELATIVE
+		| ((crtcIndex << _DRM_VBLANK_HIGH_CRTC_SHIFT)
+			& _DRM_VBLANK_HIGH_CRTC_MASK));
+	query.request.sequence = 0;
+	status_t status = Ioctl(fd, DRM_IOCTL_WAIT_VBLANK, &query);
+	if (status != B_OK)
+		return status;
+	*_time = (bigtime_t)query.reply.tval_sec * 1000000
+		+ query.reply.tval_usec;
+	return B_OK;
+}
+
+
 status_t
 SetCursor(int fd, uint32 crtc, uint32 handle, uint32 width, uint32 height,
 	int32 hotX, int32 hotY)
