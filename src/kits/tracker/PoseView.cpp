@@ -2472,7 +2472,7 @@ BPoseView::MessageReceived(BMessage* message)
 			fQuickLookRunner = NULL;
 			if (fQuickLookShowing) {
 				if (CountSelected() > 0)
-					_SendQuickLook(kMsgQuickLookShow);
+					_SendQuickLook(kMsgQuickLookShow, true);
 				else
 					HideQuickLook();
 			}
@@ -8418,7 +8418,7 @@ BPoseView::QuickLookSelectionChanged()
 
 
 void
-BPoseView::_SendQuickLook(uint32 what)
+BPoseView::_SendQuickLook(uint32 what, bool update)
 {
 	BMessage refs(what);
 	int32 count = CountSelected();
@@ -8449,10 +8449,14 @@ BPoseView::_SendQuickLook(uint32 what)
 			ConvertToScreen(&iconRect);
 		}
 	}
-	if (QuickLookShow(what, &refs, frame, iconRect, BMessenger(this))
-			== B_OK) {
+	status_t status = QuickLookShow(what, &refs, frame, iconRect,
+		BMessenger(this), update);
+	if (status == B_OK) {
 		// A toggle hides the panel when it was ours; the server says so.
 		fQuickLookShowing = what != kMsgQuickLookToggle || !fQuickLookShowing;
+	} else if (update) {
+		// The server went away with the panel.
+		fQuickLookShowing = false;
 	}
 }
 

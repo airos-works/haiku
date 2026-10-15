@@ -22,7 +22,7 @@ send_to_quick_look(BMessage* message, bool launch)
 	if (server.IsValid())
 		return server.SendMessage(message);
 	if (!launch)
-		return B_OK;
+		return B_NOT_ALLOWED;
 	// Not running: the roster starts it and hands it the message.
 	status_t status = be_roster->Launch(B_QUICK_LOOK_SIGNATURE, message);
 	if (status == B_ALREADY_RUNNING) {
@@ -35,7 +35,7 @@ send_to_quick_look(BMessage* message, bool launch)
 
 status_t
 QuickLookShow(uint32 what, const BMessage* refs, BRect ownerFrame,
-	BRect iconRect, const BMessenger& owner)
+	BRect iconRect, const BMessenger& owner, bool update)
 {
 	BMessage message(*refs);
 	message.what = what;
@@ -43,12 +43,15 @@ QuickLookShow(uint32 what, const BMessage* refs, BRect ownerFrame,
 	message.RemoveName("frame");
 	message.RemoveName("icon");
 	message.RemoveName("owner");
+	message.RemoveName("update");
 	message.AddInt32("index", 0);
 	message.AddRect("frame", ownerFrame);
 	if (iconRect.IsValid())
 		message.AddRect("icon", iconRect);
 	message.AddMessenger("owner", owner);
-	return send_to_quick_look(&message, true);
+	if (update)
+		message.AddBool("update", true);
+	return send_to_quick_look(&message, !update);
 }
 
 
@@ -56,7 +59,9 @@ status_t
 QuickLookHide()
 {
 	BMessage message(kMsgQuickLookHide);
-	return send_to_quick_look(&message, false);
+	status_t status = send_to_quick_look(&message, false);
+	// Not running: nothing to hide.
+	return status == B_NOT_ALLOWED ? B_OK : status;
 }
 
 

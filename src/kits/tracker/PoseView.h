@@ -293,7 +293,7 @@ public:
 	void QuickLookSelectionChanged();
 		// the panel follows the selection while it is up
 	bool _SpaceIsQuickLook();
-	void _SendQuickLook(uint32 what);
+	void _SendQuickLook(uint32 what, bool update = false);
 	void OpenSelectionUsing(BPose* clicked_pose = NULL, int32* index = NULL);
 		// launches the open with window
 	virtual void MoveSelectionTo(Model*, BPoint, BContainerWindow*, BPoint, uint32);

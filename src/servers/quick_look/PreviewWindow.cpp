@@ -167,6 +167,15 @@ PreviewWindow::ShowEntries(const BMessage* message)
 
 	BMessenger owner;
 	message->FindMessenger("owner", &owner);
+	if (message->GetBool("update", false)
+		&& (!IsShowing() || owner != fOwner)) {
+		// A selection change for a panel that is no longer up for that
+		// window (the server may have been restarted meanwhile): the
+		// owner learns that, and the panel stays where it is.
+		if (owner.IsValid())
+			owner.SendMessage(kMsgQuickLookClosed);
+		return;
+	}
 	BRect frame;
 	if (message->FindRect("frame", &frame) != B_OK)
 		frame = BRect();
@@ -591,9 +600,9 @@ PreviewWindow::_FinishAnimation()
 	delete fAnimation;
 	fAnimation = NULL;
 	TRACE("%s: %" B_PRId32 " frames in %" B_PRId64 " ms, the longest "
-		"%" B_PRId64 " ms", fAnimationHides ? "shrink" : "zoom",
+		"%" B_PRId64 " ms, done at %" B_PRId64, fAnimationHides ? "shrink" : "zoom",
 		fAnimationFrames, (system_time() - fAnimationStart) / 1000,
-		fAnimationLongest / 1000);
+		fAnimationLongest / 1000, real_time_clock_usecs());
 	if (fAnimationHides) {
 		fAnimationHides = false;
 		_SetPreview(NULL);

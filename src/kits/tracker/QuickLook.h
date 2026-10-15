@@ -21,8 +21,10 @@ namespace BPrivate {
 
 //! Shows (what = kMsgQuickLookShow) or toggles (kMsgQuickLookToggle) the
 //! panel for the "refs" in the message; the owner hears when it closes.
+//! With update, the entries only replace what a panel already up shows: a
+//! server that is not running is not started, and B_NOT_ALLOWED says so.
 status_t QuickLookShow(uint32 what, const BMessage* refs, BRect ownerFrame,
-	BRect iconRect, const BMessenger& owner);
+	BRect iconRect, const BMessenger& owner, bool update = false);
 //! Hides the panel.
 status_t QuickLookHide();
 

@@ -17,8 +17,11 @@ enum {
 		"index" (int32, 0). "frame" (BRect) is the client's window frame, so
 		the panel appears on that screen; "icon" (BRect) is where the entry
 		is shown on screen, which the panel zooms out of and back into;
-		"owner" (BMessenger) is told when the panel is closed. Sent again with new refs while the panel is up,
-		it shows those instead. */
+		"owner" (BMessenger) is told when the panel is closed. Sent again
+		with new refs while the panel is up, it shows those instead. With
+		"update" (bool) true it only replaces what a panel already up for
+		this owner shows; a hidden panel stays hidden and the owner is
+		told kMsgQuickLookClosed. */
 	kMsgQuickLookShow			= 'QLsh',
 	//! Hide the panel.
 	kMsgQuickLookHide			= 'QLhd',
