@@ -5,10 +5,13 @@
 
 
 /*!	xHCI controllers described by a flattened device tree, such as the
-	DesignWare USB3 cores (DWC3) of the Rockchip RK3588. The firmware (EDK2)
-	powers the PHYs, enables the clocks and puts the cores in host mode; this
-	attachment checks that state, completes the host mode setup where needed
-	and runs the controller with uncached DMA memory.
+	DesignWare USB3 cores (DWC3) of the Rockchip RK3588 and the Allwinner
+	A733. On the RK3588 the firmware (EDK2) powers the PHYs, enables the
+	clocks and puts the cores in host mode; this attachment checks that
+	state, completes the host mode setup where needed and runs the
+	controller with uncached DMA memory. On the A733 U-Boot leaves the core
+	unpowered, so its power domain, clocks, reset and USB 2 PHY are brought
+	up here.
 */
 
 
@@ -42,6 +45,83 @@ extern usb_for_controller_interface* gUSB;
 // whose mask is in the upper half
 #define RK3588_USB_GRF_BASE			0xfd5ac000
 #define RK3588_U3_PORT_DISABLED		0x0188
+
+// Allwinner A733 (sun60i): the USB-C port's DWC3 core ("usbc2"), from the
+// BSP's ccu-sun60iw2.c, pck600_domains.c, dwc3-sunxi-plat.c and
+// phy-sunxi-plat.c, and the registers of a running Radxa Debian
+// (cubie/evidence/usb3-debian-dump.txt).
+#define A733_DWC3_BASE				0x06a00000
+#define A733_CCU_BASE				0x02002000
+#define A733_R_CCU_BASE				0x07010000
+#define A733_PCK600_BASE			0x07060000
+#define A733_USB2_PHY_BASE			0x06b00000
+// R_CCU: the PCK-600's bus clock
+#define A733_R_CCU_PPU				0x01ac
+// PCK-600 power policy units: the USB2 domain (pd_usb2) holds the core,
+// the PCIE domain the NSI bus master shared by USB 3 and PCIe ("usb_pcie")
+#define A733_PPU_PCIE				7
+#define A733_PPU_USB2				8
+#define A733_PPU_POLICY				0x000
+#define A733_PPU_STATUS				0x008
+#define A733_PPU_ON					0x8
+// CCU
+#define A733_CCU_MBUS_GATES			0x05e0	// b28 serdes, with key
+#define A733_CCU_MBUS_GATES_KEY		0x41055800
+#define A733_CCU_AHB_GATES			0x05c0	// b8 serdes, b9 usb-sys-ahb-gate, with key
+#define A733_CCU_AHB_GATES_KEY		0x10000ff
+// The SerDes subsystem (the USB 3/DisplayPort combo PHY) holds the USB 3
+// block too: its registers answer only once the subsystem's bus reset is
+// released and its top register enables it, which the display driver does
+// later in the boot (sunxi_display, DisplayPipe::Init()).
+#define A733_CCU_SERDES_CLOCK		0x13c0	// b31 gate, b24 mux (pll-peri0-600m), M
+#define A733_CCU_SERDES_RESET		0x13c4	// b16 reset (1: released)
+#define A733_RTC_BASE				0x07090000
+#define A733_RTC_DCXO_SERDES		0x016c	// b4 DCXO to the SerDes
+#define A733_SERDES_TOP_BASE		0x06c00000
+#define A733_SERDES_PCIE_GATING		0x004	// b16-b18 (on in a running Debian)
+#define A733_SERDES_USB3_CONTROL	0x008	// SUBSYS_USB3P1_BGR
+#define A733_SERDES_USB3_HCLK		(1u << 16)
+#define A733_SERDES_USB3_ACLK		(1u << 17)
+#define A733_SERDES_USB2_PHY_RSTN	(1u << 4)
+// The core's PIPE interface clocked from the CCU's usb2-u2-pipe (120 MHz)
+// instead of the combo PHY, which carries DisplayPort (the BSP's
+// USB3_U2_ONLY mode); the UTMI interface runs from the USB 2 PHY, whose
+// PLL locks after a reset pulse once it is powered.
+#define A733_SERDES_USB3_PIPE_INTERNAL	(1u << 20)
+#define A733_SERDES_USB3_UTMI_INTERNAL	(1u << 21)
+#define A733_PHY_STATUS				0x24
+#define A733_PHY_STATUS_LOCKED		(1u << 3)
+#define A733_SERDES_DEBUG_CONTROL	0x0f0	// b29 set in a running Debian
+#define A733_CCU_USB2_U3_UTMI		0x1360	// b31 gate, [26:24] mux (1: pll-peri0-300m), [4:0] M
+#define A733_CCU_USB2_U2_PIPE		0x1364	// b31 gate, [26:24] mux (1: pll-peri0-480m), [4:0] M
+#define DWC3_DCTL					0xc704
+#define DWC3_DCTL_CSFTRST			(1u << 30)
+#define A733_CCU_MSI_LITE2			0x05a4	// b0 gate, b16/b17 resets
+#define A733_CCU_USB_REF			0x1340	// b31 gate, [26:24] mux (0: 24 MHz)
+#define A733_CCU_USB2_U2_REF		0x1348	// b31 gate, [26:24] mux
+#define A733_CCU_USB2_SUSPEND		0x1350	// b31 gate, b24 mux (1: 24 MHz), [4:0] M
+#define A733_CCU_USB2_MF			0x1354	// b31 gate, [26:24] mux (0: 24 MHz), [4:0] M
+#define A733_CCU_USB2_RESET			0x135c	// b16 reset (1: released)
+#define A733_CCU_RES_DCAP			0x1a00	// b3 res-dcap-24m (USB 2 PHY)
+// the PCIe side of the shared USB 3/PCIe block (on in a running Debian)
+#define A733_CCU_ITS_PCIE			0x0574	// b1 its-pcie0-aclk, b16 reset
+#define A733_CCU_PCIE_AUX			0x1380	// b31 gate (24 MHz)
+#define A733_CCU_PCIE_AXI_SLV		0x1384	// b31 gate, [26:24] mux (2: pll-peri0-400m)
+#define A733_CCU_PCIE_RESET			0x138c	// b16 power-up reset, b17 bus reset
+// USB 2 PHY ("u2_base")
+#define A733_PHY_CTRL				0x10
+#define A733_PHY_CTRL_OTGDISABLE	(1u << 10)
+#define A733_PHY_CTRL_VBUSVLDEXT	(1u << 5)
+#define A733_PHY_CTRL_SIDDQ			(1u << 3)
+#define A733_PHY_TUNE				0x18
+#define A733_PHY_TUNE_PARAM			0x143338d6	// aw,phy_tune_param
+// DWC3 PHY configuration (relative to the xHCI register base)
+#define DWC3_GUSB2PHYCFG0			0xc200
+#define DWC3_GUSB2PHYCFG_SUSPHY		(1u << 6)
+#define DWC3_GUSB2PHYCFG_ENBLSLPM	(1u << 8)
+#define DWC3_GUSB3PIPECTL0			0xc2c0
+#define DWC3_GUSB3PIPECTL_SUSPHY	(1u << 17)
+#define DWC3_GLOBALS_MAPPED			0xc300
 
 struct xhci_fdt_info {
 	device_node* node;
@@ -125,6 +205,292 @@ rk3588_dwc3_disable_u3_port(phys_addr_t base, const char* name)
 	dprintf("xhci: %s: USB 3 port disabled in the USB GRF (0x%04" B_PRIx32
 		" -> 0x%04" B_PRIx32 ")\n", name, previous, *control & 0xffff);
 	delete_area(area);
+}
+
+
+static inline uint32
+read32(volatile uint8* base, uint32 offset)
+{
+	return *(volatile uint32*)(base + offset);
+}
+
+
+static inline void
+write32(volatile uint8* base, uint32 offset, uint32 value)
+{
+	*(volatile uint32*)(base + offset) = value;
+	memory_full_barrier();
+}
+
+
+/*!	Switches a PCK-600 power domain on (Allwinner's sunxi_pd_init delays,
+	then the policy; a policy already saying ON while the domain is off is
+	taken back first so that the PPU sees a request, as the GPU driver does
+	it) and waits for it.
+*/
+static status_t
+sun60i_power_domain_on(volatile uint8* pck, uint32 domain, const char* name)
+{
+	volatile uint8* ppu = pck + domain * 0x1000;
+	write32(ppu, 0x170, 0x001f1f1f);
+	write32(ppu, 0x174, 0x00001f1f);
+	write32(ppu, 0xc00, 0x08080808);
+	write32(ppu, 0xc04, 0x00000808);
+	write32(ppu, 0xc10, 0x00000008);
+	if ((read32(ppu, A733_PPU_POLICY) & 0xf) == A733_PPU_ON) {
+		write32(ppu, A733_PPU_POLICY, read32(ppu, A733_PPU_POLICY) & ~0xfu);
+		spin(10);
+	}
+	write32(ppu, A733_PPU_POLICY,
+		(read32(ppu, A733_PPU_POLICY) & ~0xfu) | A733_PPU_ON);
+	bigtime_t deadline = system_time() + 10000;
+	while ((read32(ppu, A733_PPU_STATUS) & 0xf) != A733_PPU_ON) {
+		if (system_time() > deadline) {
+			dprintf("xhci: %s: power domain %" B_PRIu32 " does not come up "
+				"(status %#" B_PRIx32 ")\n", name, domain,
+				read32(ppu, A733_PPU_STATUS));
+			return B_TIMED_OUT;
+		}
+		spin(10);
+	}
+	return B_OK;
+}
+
+
+/*!	Powers the A733's USB-C DWC3 core: PCK-600 power domains, bus gates,
+	the 24 MHz reference, suspend and "mf" clocks, the SerDes subsystem
+	that houses the block, the controller reset, and the USB 2 PHY out of
+	power-down with the BSP's tuning and through a reset pulse until its PLL
+	locks. The combo PHY stays with DisplayPort: the core's PIPE interface
+	runs from the CCU's substitute clock instead, so the controller has
+	the USB 2 port only. Nothing of the core is read before its domain,
+	clocks and SerDes enable are up: an unpowered A733 block reads as zeros
+	or hangs the bus.
+*/
+static status_t
+sun60i_dwc3_power_up(phys_addr_t base, const char* name)
+{
+	if (base != A733_DWC3_BASE)
+		return B_NOT_SUPPORTED;
+	dprintf("xhci: %s: powering up the A733 DWC3 core\n", name);
+
+	void* address;
+	area_id rccuArea = map_physical_memory("a733 r_ccu (xhci)",
+		A733_R_CCU_BASE, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
+	if (rccuArea < 0)
+		return rccuArea;
+	volatile uint8* rccu = (volatile uint8*)address;
+	area_id pckArea = map_physical_memory("a733 pck-600 (xhci)",
+		A733_PCK600_BASE, 0xb000, B_ANY_KERNEL_ADDRESS,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
+	if (pckArea < 0) {
+		delete_area(rccuArea);
+		return pckArea;
+	}
+	volatile uint8* pck = (volatile uint8*)address;
+	area_id rtcArea = map_physical_memory("a733 rtc (xhci)", A733_RTC_BASE,
+		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
+	if (rtcArea < 0) {
+		delete_area(pckArea);
+		delete_area(rccuArea);
+		return rtcArea;
+	}
+	volatile uint8* rtc = (volatile uint8*)address;
+	area_id ccuArea = map_physical_memory("a733 ccu (xhci)", A733_CCU_BASE,
+		0x2000, B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
+		&address);
+	if (ccuArea < 0) {
+		delete_area(rtcArea);
+		delete_area(pckArea);
+		delete_area(rccuArea);
+		return ccuArea;
+	}
+	volatile uint8* ccu = (volatile uint8*)address;
+
+	// the power domains (the PCK-600's bus clock first)
+	write32(rccu, A733_R_CCU_PPU, read32(rccu, A733_R_CCU_PPU) | 1);
+	uint32 pcieBefore = read32(pck + A733_PPU_PCIE * 0x1000, A733_PPU_STATUS);
+	uint32 usb2Before = read32(pck + A733_PPU_USB2 * 0x1000, A733_PPU_STATUS);
+	status_t status = sun60i_power_domain_on(pck, A733_PPU_PCIE, name);
+	if (status == B_OK)
+		status = sun60i_power_domain_on(pck, A733_PPU_USB2, name);
+
+	if (status == B_OK) {
+		// bus gates: the USB system AHB master (keyed register) and
+		// MSI-lite 2 with its resets
+		if ((read32(ccu, A733_CCU_AHB_GATES) & (1u << 9)) == 0) {
+			write32(ccu, A733_CCU_AHB_GATES, read32(ccu, A733_CCU_AHB_GATES)
+				| A733_CCU_AHB_GATES_KEY | (1u << 9));
+		}
+		write32(ccu, A733_CCU_MSI_LITE2, read32(ccu, A733_CCU_MSI_LITE2)
+			| (1u << 0) | (1u << 16) | (1u << 17));
+		// clocks, all from the 24 MHz oscillator as the BSP sets them
+		write32(ccu, A733_CCU_USB_REF, 1u << 31);
+		write32(ccu, A733_CCU_USB2_U2_REF, 1u << 31);
+		write32(ccu, A733_CCU_USB2_SUSPEND, (1u << 31) | (1u << 24));
+		write32(ccu, A733_CCU_USB2_MF, 1u << 31);
+		// the SerDes subsystem: DCXO reference, 100 MHz configuration
+		// clock, bus gates, reset and its top enable (as the display driver
+		// does it; its later writes only set the same bits)
+		write32(rtc, A733_RTC_DCXO_SERDES, read32(rtc, A733_RTC_DCXO_SERDES)
+			| (1u << 4) | (1u << 5));
+		if ((read32(ccu, A733_CCU_SERDES_CLOCK) & (1u << 31)) == 0)
+			write32(ccu, A733_CCU_SERDES_CLOCK, 0x81000005);
+		write32(ccu, A733_CCU_SERDES_RESET, read32(ccu, A733_CCU_SERDES_RESET)
+			| (1u << 16));
+		if ((read32(ccu, A733_CCU_AHB_GATES) & (1u << 8)) == 0) {
+			write32(ccu, A733_CCU_AHB_GATES, read32(ccu, A733_CCU_AHB_GATES)
+				| A733_CCU_AHB_GATES_KEY | (1u << 8));
+		}
+		if ((read32(ccu, A733_CCU_MBUS_GATES) & (1u << 28)) == 0) {
+			write32(ccu, A733_CCU_MBUS_GATES, read32(ccu, A733_CCU_MBUS_GATES)
+				| A733_CCU_MBUS_GATES_KEY | (1u << 28));
+		}
+		area_id topArea = map_physical_memory("a733 serdes top (xhci)",
+			A733_SERDES_TOP_BASE, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
+		if (topArea >= 0) {
+			volatile uint8* top = (volatile uint8*)address;
+			write32(top, A733_SERDES_PCIE_GATING,
+				read32(top, A733_SERDES_PCIE_GATING) | 0x70000);
+			write32(top, A733_SERDES_DEBUG_CONTROL,
+				read32(top, A733_SERDES_DEBUG_CONTROL) | (1u << 29));
+			write32(top, A733_SERDES_USB3_CONTROL,
+				read32(top, A733_SERDES_USB3_CONTROL) | A733_SERDES_USB3_HCLK
+					| A733_SERDES_USB3_ACLK | A733_SERDES_USB2_PHY_RSTN
+					| A733_SERDES_USB3_PIPE_INTERNAL);
+			delete_area(topArea);
+		}
+		// the substitute PIPE clock: 480 MHz / 4
+		write32(ccu, A733_CCU_USB2_U2_PIPE, (1u << 31) | (1u << 24) | 3);
+		spin(100);
+		// the controller through a reset, now that it is clocked
+		write32(ccu, A733_CCU_USB2_RESET, read32(ccu, A733_CCU_USB2_RESET)
+			& ~(1u << 16));
+		spin(100);
+		write32(ccu, A733_CCU_USB2_RESET, read32(ccu, A733_CCU_USB2_RESET)
+			| (1u << 16));
+		// the PHY's clock
+		write32(ccu, A733_CCU_RES_DCAP, read32(ccu, A733_CCU_RES_DCAP)
+			| (1u << 3));
+		// the PCIe side's AXI slave clock, aux clock, ITS clock and resets,
+		// as the running Debian has them
+		write32(ccu, A733_CCU_PCIE_AXI_SLV, (1u << 31) | (2u << 24));
+		write32(ccu, A733_CCU_PCIE_AUX, 1u << 31);
+		write32(ccu, A733_CCU_ITS_PCIE, read32(ccu, A733_CCU_ITS_PCIE)
+			| (1u << 1) | (1u << 16));
+		write32(ccu, A733_CCU_PCIE_RESET, read32(ccu, A733_CCU_PCIE_RESET)
+			| (1u << 16) | (1u << 17));
+		spin(100);
+	}
+	uint32 ahbGates = read32(ccu, A733_CCU_AHB_GATES);
+	uint32 mbusGates = read32(ccu, A733_CCU_MBUS_GATES);
+	uint32 msiLite = read32(ccu, A733_CCU_MSI_LITE2);
+	uint32 usbReset = read32(ccu, A733_CCU_USB2_RESET);
+	uint32 usbRef = read32(ccu, A733_CCU_USB_REF);
+	uint32 usbSuspend = read32(ccu, A733_CCU_USB2_SUSPEND);
+	uint32 usbMf = read32(ccu, A733_CCU_USB2_MF);
+	uint32 pcieStatus = read32(pck + A733_PPU_PCIE * 0x1000, A733_PPU_STATUS);
+	uint32 usb2Status = read32(pck + A733_PPU_USB2 * 0x1000, A733_PPU_STATUS);
+	delete_area(ccuArea);
+	delete_area(rtcArea);
+	delete_area(pckArea);
+	delete_area(rccuArea);
+	if (status != B_OK)
+		return status;
+
+	// the USB 2 PHY: out of SIDDQ (power-down), external VBUS valid and
+	// OTG disabled as phy-sunxi-plat.c (v1) does, then the tuning
+	area_id phyArea = map_physical_memory("a733 usb2 phy (xhci)",
+		A733_USB2_PHY_BASE, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
+	if (phyArea < 0)
+		return phyArea;
+	volatile uint8* phy = (volatile uint8*)address;
+	uint32 phyControl = read32(phy, A733_PHY_CTRL);
+	phyControl |= A733_PHY_CTRL_OTGDISABLE | A733_PHY_CTRL_VBUSVLDEXT;
+	phyControl &= ~A733_PHY_CTRL_SIDDQ;
+	write32(phy, A733_PHY_CTRL, phyControl);
+	write32(phy, A733_PHY_TUNE, A733_PHY_TUNE_PARAM);
+	phyControl = read32(phy, A733_PHY_CTRL);
+	// a reset pulse now that it is powered, then its PLL locks
+	bigtime_t phyWaited = system_time();
+	uint32 phyStatus = 0;
+	area_id topArea = map_physical_memory("a733 serdes top (xhci)",
+		A733_SERDES_TOP_BASE, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
+	if (topArea >= 0) {
+		volatile uint8* top = (volatile uint8*)address;
+		write32(top, A733_SERDES_USB3_CONTROL,
+			read32(top, A733_SERDES_USB3_CONTROL)
+				& ~A733_SERDES_USB2_PHY_RSTN);
+		spin(100);
+		write32(top, A733_SERDES_USB3_CONTROL,
+			read32(top, A733_SERDES_USB3_CONTROL)
+				| A733_SERDES_USB2_PHY_RSTN);
+		delete_area(topArea);
+		bigtime_t phyDeadline = system_time() + 1000000;
+		while (((phyStatus = read32(phy, A733_PHY_STATUS))
+				& A733_PHY_STATUS_LOCKED) == 0
+			&& system_time() < phyDeadline) {
+			snooze(1000);
+		}
+	}
+	phyWaited = system_time() - phyWaited;
+	delete_area(phyArea);
+	if ((phyStatus & A733_PHY_STATUS_LOCKED) == 0) {
+		dprintf("xhci: %s: the USB 2 PHY does not lock (status %#" B_PRIx32
+			")\n", name, phyStatus);
+		return B_TIMED_OUT;
+	}
+
+	// the core's PHY interfaces: no PHY suspend, no sleep (the BSP's
+	// dis_u2_susphy, dis_u3_susphy and dis_enblslpm quirks)
+	area_id coreArea = map_physical_memory("DWC3 PHY config (xhci)", base,
+		DWC3_GLOBALS_MAPPED, B_ANY_KERNEL_ADDRESS,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
+	if (coreArea < 0)
+		return coreArea;
+	volatile uint8* core = (volatile uint8*)address;
+	// give the core a moment to answer after the reset
+	bigtime_t waited = system_time();
+	bigtime_t deadline = waited + 100000;
+	while ((read32(core, DWC3_GSNPSID) >> 16) == 0 && system_time() < deadline)
+		spin(100);
+	waited = system_time() - waited;
+	// a core soft reset (Linux does it for a dual-role core before host
+	// mode); it completes only with both interface clocks running, like
+	// the xHCI reset after it
+	write32(core, DWC3_DCTL, read32(core, DWC3_DCTL) | DWC3_DCTL_CSFTRST);
+	deadline = system_time() + 100000;
+	while ((read32(core, DWC3_DCTL) & DWC3_DCTL_CSFTRST) != 0
+		&& system_time() < deadline) {
+		spin(100);
+	}
+	uint32 deviceControl = read32(core, DWC3_DCTL);
+	uint32 usb2Config = read32(core, DWC3_GUSB2PHYCFG0);
+	write32(core, DWC3_GUSB2PHYCFG0, usb2Config
+		& ~(DWC3_GUSB2PHYCFG_SUSPHY | DWC3_GUSB2PHYCFG_ENBLSLPM));
+	uint32 usb3Config = read32(core, DWC3_GUSB3PIPECTL0);
+	write32(core, DWC3_GUSB3PIPECTL0, usb3Config & ~DWC3_GUSB3PIPECTL_SUSPHY);
+	dprintf("xhci: %s: A733 DWC3 up (GSNPSID %#" B_PRIx32 " after %" B_PRId64
+		" us, PHY locked after %" B_PRId64 " us, DCTL %#" B_PRIx32 "): PPU PCIE "
+		"%#" B_PRIx32 " (was %#"
+		B_PRIx32 "), USB2 %#" B_PRIx32 " (was %#" B_PRIx32 "), AHB gates %#"
+		B_PRIx32 ", MBUS gates %#" B_PRIx32 ", MSI-lite %#" B_PRIx32
+		", ref %#" B_PRIx32 ", suspend %#" B_PRIx32 ", mf %#" B_PRIx32
+		", reset %#" B_PRIx32 ", PHY control %#" B_PRIx32 ", GUSB2PHYCFG %#"
+		B_PRIx32 " -> %#" B_PRIx32 ", GUSB3PIPECTL %#" B_PRIx32 " -> %#"
+		B_PRIx32 "\n", name, read32(core, DWC3_GSNPSID), waited, phyWaited,
+		deviceControl, pcieStatus,
+		pcieBefore, usb2Status, usb2Before,
+		ahbGates, mbusGates, msiLite, usbRef, usbSuspend, usbMf, usbReset,
+		phyControl, usb2Config, read32(core, DWC3_GUSB2PHYCFG0), usb3Config,
+		read32(core, DWC3_GUSB3PIPECTL0));
+	delete_area(coreArea);
+	return B_OK;
 }
 
 
@@ -244,6 +610,12 @@ init_fdt(device_node* node, void** cookie)
 		if (usb_fdt_has_string(fdt, device, "compatible", "rockchip,rk3588-dwc3")
 			&& !rk3588_dwc3_clocks_running(platform.register_base, name)) {
 			status = B_NOT_SUPPORTED;
+		}
+		if (usb_fdt_has_string(fdt, device, "compatible",
+				"allwinner,sun60i-a733-dwc3")) {
+			// the USB 3 lanes carry DisplayPort: USB 2 only, always
+			platform.usb2_only = true;
+			status = sun60i_dwc3_power_up(platform.register_base, name);
 		}
 		if (status == B_OK) {
 			status = dwc3_prepare_host(platform.register_base,
