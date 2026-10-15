@@ -46,6 +46,12 @@ public:
 			bool				Idle() const
 									{ return fState == kStateUnattached
 										|| fState >= kStateDisplayPort; }
+			// a Power Delivery exchange is under way: the partner expects
+			// answers within tReceiverResponse (15 ms), and gives up on a
+			// contract with a hard reset after tSenderResponse (24-30 ms)
+			bool				Negotiating() const
+									{ return fState >= kStateSendCapabilities
+										&& fState < kStateDisplayPort; }
 
 private:
 			enum State {

@@ -35,6 +35,8 @@ public:
 									uint32 clockDivider = kSlowClock);
 
 	static	const uint32		kSlowClock = 15 << 3 | 2;
+			// 400 kHz from a 24 MHz bus clock (M = 5, N = 0)
+	static	const uint32		kFastClock = 5 << 3 | 0;
 
 			status_t			Read(uint8 address, uint8 reg, void* data,
 									size_t length);

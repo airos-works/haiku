@@ -423,7 +423,10 @@ poll_outputs(void* cookie)
 	bigtime_t lastPoll = 0;
 	bool hotPlugBounced = false;
 	while (atomic_get(&info->stopping) == 0) {
-		snooze(20000);
+		// while a Power Delivery exchange is under way the partner's
+		// messages need an answer within milliseconds (a hub hard resets
+		// when its Request is not accepted within 24 ms), so look often
+		snooze(info->typeC->Negotiating() ? 1000 : 20000);
 		bigtime_t now = system_time();
 		bool interrupt = !sunxi::r_pin_get(0, 3);
 		if (!interrupt && info->typeC->Idle() && now - lastPoll < 250000)
