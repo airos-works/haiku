@@ -211,6 +211,10 @@ private:
 	static	status_t			_FlushThreadEntry(void* data);
 			void				_FlushThread();
 			void				_FlushPending(bigtime_t blank);
+			struct FlushWorker;
+	static	status_t			_FlushWorkerEntry(void* data);
+			void				_StartFlushWorkers();
+			void				_StopFlushWorkers();
 
 public:
 	// TODO: Just a quick and primitive way to get single buffered mode working.
@@ -334,6 +338,9 @@ private:
 			volatile bool		fQuitFlush;
 			volatile bool		fFlushing;
 									// copies go through the thread
+			FlushWorker*		fFlushWorkers;
+			int32				fFlushWorkerCount;
+			sem_id				fFlushDoneSem;
 
 			bigtime_t			fLastBlank;
 			bigtime_t			fBlankPeriod;
