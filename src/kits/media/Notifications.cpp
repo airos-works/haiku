@@ -293,7 +293,17 @@ NodeStopped(const media_node& node, bigtime_t when)
 
 
 // TODO: missing: B_MEDIA_TRANSPORT_STATE: "state", "location", "realtime"
-// TODO: missing: B_MEDIA_DEFAULT_CHANGED: "default", "node"
+void
+DefaultChanged(int32 type, media_node_id node)
+{
+	CALLED();
+	BMessage msg(MEDIA_SERVER_SEND_NOTIFICATIONS);
+	msg.AddInt32(NOTIFICATION_PARAM_WHAT, B_MEDIA_DEFAULT_CHANGED);
+	msg.AddInt32("default", type);
+	msg.AddInt32("node", node);
+
+	BPrivate::media::dataexchange::SendToServer(&msg);
+}
 
 
 bool

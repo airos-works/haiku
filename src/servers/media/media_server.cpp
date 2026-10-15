@@ -54,6 +54,7 @@ char __dont_remove_copyright_from_binary[] = "Copyright (c) 2002, 2003 "
 #include "MediaFilesManager.h"
 #include "MediaMisc.h"
 #include "NodeManager.h"
+#include "Notifications.h"
 #include "NotificationManager.h"
 #include "ServerInterface.h"
 #include "media_server.h"
@@ -85,6 +86,7 @@ private:
 									size_t size);
 			void				_LaunchAddOnServer();
 			void				_QuitAddOnServer();
+			void				_NotifyDefaultChanged(node_type type);
 
 private:
 			port_id				_ControlPort() const { return fControlPort; }
@@ -556,6 +558,8 @@ ServerApp::_HandleMessage(int32 code, const void* data, size_t size)
 				request.use_dni ? &request.dni : NULL,
 				request.use_input ?  &request.input : NULL);
 			request.SendReply(status, &reply, sizeof(reply));
+			if (status == B_OK)
+				_NotifyDefaultChanged(request.type);
 			break;
 		}
 
@@ -922,6 +926,24 @@ ServerApp::_ControlThread(void* _server)
 }
 
 
+/*!	Tells those watching B_MEDIA_DEFAULT_CHANGED which node is now the
+	default of the given type (the volume control in the Deskbar shows the
+	audio input and output in use).
+*/
+void
+ServerApp::_NotifyDefaultChanged(node_type type)
+{
+	media_node_id nodeID = -1;
+	char inputName[B_MEDIA_NAME_LENGTH];
+	int32 inputID = 0;
+	if (gNodeManager->GetDefaultNode(type, &nodeID, inputName, &inputID)
+			!= B_OK) {
+		nodeID = -1;
+	}
+	BPrivate::media::notifications::DefaultChanged(type, nodeID);
+}
+
+
 void
 ServerApp::MessageReceived(BMessage* msg)
 {
@@ -943,6 +965,12 @@ ServerApp::MessageReceived(BMessage* msg)
 
 		case MEDIA_SERVER_RESCAN_COMPLETED:
 			gAppManager->NotifyRosters();
+			// The rescan may have chosen new defaults (at start-up, or after
+			// a device came or went): those who show them must know.
+			_NotifyDefaultChanged(AUDIO_OUTPUT);
+			_NotifyDefaultChanged(AUDIO_INPUT);
+			_NotifyDefaultChanged(VIDEO_OUTPUT);
+			_NotifyDefaultChanged(VIDEO_INPUT);
 			break;
 
 		case B_SOME_APP_QUIT:

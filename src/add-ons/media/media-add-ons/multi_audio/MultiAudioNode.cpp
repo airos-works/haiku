@@ -9,6 +9,8 @@
 
 #include "MultiAudioNode.h"
 
+#include "MultiAudioAddOn.h"
+
 #include <stdio.h>
 #include <string.h>
 
@@ -263,6 +265,11 @@ MultiAudioNode::~MultiAudioNode()
 
 	_StopOutputThread();
 	BMediaEventLooper::Quit();
+
+	// an unplugged device is the add-on's to free once we are done with it
+	MultiAudioAddOn* addOn = dynamic_cast<MultiAudioAddOn*>(fAddOn);
+	if (addOn != NULL)
+		addOn->DeviceReleased(fDevice);
 }
 
 
@@ -1782,7 +1789,13 @@ MultiAudioNode::_OutputThread()
 			// make sure the buffers don't change while we're playing with them
 
 		// send buffer
-		fDevice->BufferExchange(&bufferInfo);
+		if (fDevice->BufferExchange(&bufferInfo) != B_OK) {
+			// An unplugged device fails at once: do not spin until the
+			// node is destroyed.
+			locker.Unlock();
+			snooze(10000);
+			continue;
+		}
 
 		//PRINT(("MultiAudioNode::RunThread: buffer exchanged\n"));
 		//PRINT(("MultiAudioNode::RunThread: played_real_time: %lld\n", bufferInfo.played_real_time));

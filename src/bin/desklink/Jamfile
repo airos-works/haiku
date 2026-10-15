@@ -4,6 +4,7 @@ UsePrivateHeaders app interface locale shared ;
 
 Application desklink :
 	desklink.cpp
+	AudioDevices.cpp
 	DeskButton.cpp
 	MediaReplicant.cpp
 	MixerControl.cpp
@@ -20,4 +21,5 @@ DoCatalogs desklink :
 	DeskButton.cpp
 	MediaReplicant.cpp
 	VolumeControl.cpp
+	VolumeWindow.cpp
 ;

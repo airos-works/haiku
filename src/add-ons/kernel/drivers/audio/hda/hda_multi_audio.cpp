@@ -150,6 +150,43 @@ is_display_audio(hda_audio_group* audioGroup)
 }
 
 
+/*!	The codec's maker, to tell the devices of a machine apart by name: a
+	laptop's "Realtek HD Audio" from its graphics card's "AMD HD Audio (HDMI)".
+*/
+static const char*
+codec_vendor_name(uint16 vendorID)
+{
+	switch (vendorID) {
+		case 0x1002:
+			return "AMD";
+		case 0x1013:
+			return "Cirrus Logic";
+		case 0x10de:
+			return "NVIDIA";
+		case 0x10ec:
+			return "Realtek";
+		case 0x1106:
+			return "VIA";
+		case 0x111d:
+			return "IDT";
+		case 0x11d4:
+			return "Analog Devices";
+		case 0x14f1:
+			return "Conexant";
+		case 0x17e8:
+			return "Chrontel";
+		case 0x1aec:
+			return "Wolfson";
+		case 0x8086:
+			return "Intel";
+		case 0x8384:
+			return "SigmaTel";
+		default:
+			return NULL;
+	}
+}
+
+
 static status_t
 get_description(hda_audio_group* audioGroup, multi_description* data)
 {
@@ -157,9 +194,16 @@ get_description(hda_audio_group* audioGroup, multi_description* data)
 	data->interface_minimum = B_CURRENT_INTERFACE_VERSION;
 
 	// The media server prefers other outputs to these when the user has not
-	// chosen one: a laptop's speakers, not its graphics card's HDMI.
-	strcpy(data->friendly_name,
-		is_display_audio(audioGroup) ? "HD Audio (HDMI)" : "HD Audio");
+	// chosen one: a laptop's speakers, not its graphics card's HDMI. (The
+	// codecs of AMD, NVIDIA and Intel graphics cards are display audio even
+	// where their widgets do not say so.)
+	uint16 vendorID = audioGroup->codec->vendor_id;
+	bool display = is_display_audio(audioGroup)
+		|| vendorID == 0x1002 || vendorID == 0x10de || vendorID == 0x8086;
+	const char* vendor = codec_vendor_name(vendorID);
+	snprintf(data->friendly_name, sizeof(data->friendly_name), "%s%sHD Audio%s",
+		vendor != NULL ? vendor : "", vendor != NULL ? " " : "",
+		display ? " (HDMI)" : "");
 	strcpy(data->vendor_info, "Haiku");
 
 	int32 inChannels = 0;

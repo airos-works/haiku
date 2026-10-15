@@ -19,6 +19,8 @@
 
 #include <new>
 #include <stdio.h>
+#include <string.h>
+#include <vector>
 
 #include <Alert.h>
 #include <Bitmap.h>
@@ -26,6 +28,7 @@
 #include <Entry.h>
 #include <FindDirectory.h>
 #include <IconUtils.h>
+#include <Menu.h>
 #include <MenuItem.h>
 #include <Path.h>
 #include <PopUpMenu.h>
@@ -37,6 +40,7 @@
 #include <ToolTip.h>
 #include <ToolTipManager.h>
 
+#include "AudioDevices.h"
 #include "desklink.h"
 #include "MixerControl.h"
 #include "VolumeControl.h"
@@ -48,6 +52,8 @@
 
 
 static const uint32 kMsgOpenMediaSettings = 'mese';
+static const uint32 kMsgSetAudioOutput = 'saou';
+static const uint32 kMsgSetAudioInput = 'sain';
 
 static const char* kReplicantName = "MediaReplicant";
 	// R5 name needed, Media prefs manel removes by name
@@ -77,6 +83,13 @@ public:
 		fMuteMessage = (message == NULL ? "" : message);
 	}
 
+	//! Remembers which devices are in use, to name them under the volume
+	void SetDevices(const char* output, const char* input)
+	{
+		fOutput = output;
+		fInput = input;
+	}
+
 	void Update(MixerControl* control)
 	{
 		if (control == NULL)
@@ -89,13 +102,21 @@ public:
 		if (!Lock())
 			return;
 
-		if (control->IsMuted()) {
-			view->SetText(fMuteMessage.String());
-		} else {
-			BString text;
+		BString text;
+		if (control->IsMuted())
+			text = fMuteMessage;
+		else
 			text.SetToFormat(B_TRANSLATE("%g dB"), control->Volume());
-			view->SetText(text.String());
+
+		if (!fOutput.IsEmpty()) {
+			text << "\n" << B_TRANSLATE_COMMENT("Output:",
+				"Audio output device, in the volume tool tip") << " " << fOutput;
 		}
+		if (!fInput.IsEmpty()) {
+			text << "\n" << B_TRANSLATE_COMMENT("Input:",
+				"Audio input device, in the volume tool tip") << " " << fInput;
+		}
+		view->SetText(text.String());
 
 		Unlock();
 	}
@@ -103,6 +124,8 @@ public:
 private:
 	int32			fWhich;
 	BString			fMuteMessage;
+	BString			fOutput;
+	BString			fInput;
 };
 
 
@@ -137,6 +160,9 @@ private:
 
 			status_t		_DisconnectMixer();
 			status_t		_ConnectMixer();
+			void			_UpdateDeviceNames();
+			BMenu*			_MakeDeviceMenu(const char* label, bool outputs,
+								uint32 what);
 
 			MixerControl*	fMixerControl;
 			BBitmap*		fIcon;
@@ -245,6 +271,14 @@ MediaReplicant::MouseDown(BPoint where)
 
 		menu->AddSeparatorItem();
 
+		// where the sound goes to, and where it comes from
+		menu->AddItem(_MakeDeviceMenu(B_TRANSLATE("Output"), true,
+			kMsgSetAudioOutput));
+		menu->AddItem(_MakeDeviceMenu(B_TRANSLATE("Input"), false,
+			kMsgSetAudioInput));
+
+		menu->AddSeparatorItem();
+
 		BMenuItem* item;
 
 		item = new BMenuItem(B_TRANSLATE("Beep"), new BMessage(kMsgToggleBeep));
@@ -287,6 +321,31 @@ MediaReplicant::MessageReceived(BMessage* message)
 			_Launch("Media Preferences", "application/x-vnd.Haiku-Media",
 				B_SYSTEM_PREFERENCES_DIRECTORY, "Media");
 			break;
+
+		case kMsgSetAudioOutput:
+		case kMsgSetAudioInput:
+		{
+			int32 node;
+			if (message->FindInt32("node", &node) != B_OK)
+				break;
+			int32 inputID;
+			if (message->FindInt32("input", &inputID) != B_OK)
+				inputID = -1;
+
+			AudioDevices devices;
+			status_t status;
+			if (message->what == kMsgSetAudioOutput)
+				status = devices.SetOutput(node, inputID);
+			else
+				status = devices.SetInput(node);
+			if (status != B_OK) {
+				fprintf(stderr, "MediaReplicant: could not set the audio %s: "
+					"%s\n", message->what == kMsgSetAudioOutput
+						? "output" : "input", strerror(status));
+			}
+			// (the media server tells us with B_MEDIA_DEFAULT_CHANGED)
+			break;
+		}
 
 		case kMsgToggleBeep:
 		{
@@ -350,6 +409,10 @@ MediaReplicant::MessageReceived(BMessage* message)
 			Invalidate();
 			break;
 		}
+
+		case B_MEDIA_DEFAULT_CHANGED:
+			_UpdateDeviceNames();
+			break;
 
 		case B_MEDIA_SERVER_STARTED:
 			_ConnectMixer();
@@ -495,6 +558,7 @@ MediaReplicant::_DisconnectMixer()
 	roster->StopWatching(this, B_MEDIA_SERVER_STARTED);
 	roster->StopWatching(this, B_MEDIA_SERVER_QUIT);
 	roster->StopWatching(this, B_MEDIA_NODE_CREATED);
+	roster->StopWatching(this, B_MEDIA_DEFAULT_CHANGED);
 
 	if (fMixerControl == NULL)
 		return B_OK;
@@ -521,6 +585,7 @@ MediaReplicant::_ConnectMixer()
 	roster->StartWatching(this, B_MEDIA_SERVER_STARTED);
 	roster->StartWatching(this, B_MEDIA_SERVER_QUIT);
 	roster->StartWatching(this, B_MEDIA_NODE_CREATED);
+	roster->StartWatching(this, B_MEDIA_DEFAULT_CHANGED);
 
 	fMixerControl = new(std::nothrow) MixerControl();
 	if (fMixerControl == NULL)
@@ -539,12 +604,68 @@ MediaReplicant::_ConnectMixer()
 
 	VolumeToolTip* tip = new VolumeToolTip(fMixerControl->VolumeWhich());
 	SetToolTip(tip);
-	tip->Update(fMixerControl);
+	_UpdateDeviceNames();
 
 	if (fMixerControl->MuteNode() != media_node::null)
 		roster->StartWatching(this, fMixerControl->MuteNode(), B_MEDIA_NEW_PARAMETER_VALUE);
 
 	return B_OK;
+}
+
+
+/*!	Puts the names of the audio output and input in use into the tool tip.
+*/
+void
+MediaReplicant::_UpdateDeviceNames()
+{
+	VolumeToolTip* tip = dynamic_cast<VolumeToolTip*>(ToolTip());
+	if (tip == NULL)
+		return;
+
+	AudioDevices devices;
+	BString output;
+	BString input;
+	devices.GetDefaultOutputName(output);
+	devices.GetDefaultInputName(input);
+	tip->SetDevices(output.String(), input.String());
+	tip->Update(fMixerControl);
+}
+
+
+/*!	A menu of the physical audio outputs (or inputs), the one in use
+	marked; choosing another makes it the default for all applications.
+*/
+BMenu*
+MediaReplicant::_MakeDeviceMenu(const char* label, bool outputs, uint32 what)
+{
+	BMenu* menu = new BMenu(label);
+	menu->SetFont(be_plain_font);
+
+	AudioDevices devices;
+	std::vector<AudioDevices::Device> list;
+	if (outputs)
+		devices.GetOutputs(list);
+	else
+		devices.GetInputs(list);
+
+	for (size_t i = 0; i < list.size(); i++) {
+		BMessage* message = new BMessage(what);
+		message->AddInt32("node", list[i].node);
+		if (list[i].inputID >= 0)
+			message->AddInt32("input", list[i].inputID);
+		BMenuItem* item = new BMenuItem(list[i].name.String(), message);
+		item->SetMarked(list[i].isDefault);
+		menu->AddItem(item);
+	}
+
+	if (list.empty()) {
+		BMenuItem* item = new BMenuItem(B_TRANSLATE("<none>"), NULL);
+		item->SetEnabled(false);
+		menu->AddItem(item);
+	}
+
+	menu->SetTargetForItems(this);
+	return menu;
 }
 
 
