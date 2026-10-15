@@ -249,7 +249,6 @@ Stream::_SetupBuffers()
 		fAreaSize = 0;
 		return fStatus;
 	}
-	memset(fBuffers, 0, fAreaSize);
 
 	// The kernel is not allowed to touch userspace areas, so we clone our
 	// area into kernel space.
@@ -259,6 +258,10 @@ Stream::_SetupBuffers()
 		fStatus = fKernelArea;
 		return fStatus;
 	}
+
+	// (through the kernel clone: the user-accessible mapping must not be
+	// touched from the kernel, SMAP makes that a panic)
+	memset(fKernelBuffers, 0, fAreaSize);
 
 	TRACE(INF, "Created area id:%d at addr:%#010x size:%#010lx\n",
 		fArea, fBuffers, fAreaSize);
