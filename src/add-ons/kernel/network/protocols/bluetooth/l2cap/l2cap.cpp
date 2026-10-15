@@ -298,8 +298,15 @@ l2cap_receive_data(net_buffer* buffer)
 		{
 			HciConnection* connection = connection_for(buffer);
 			if (connection == NULL || !connection->isLE) {
-				dprintf("l2cap-le: fixed channel %#x PDU without an LE link "
-					"(connection %p)\n", dcid, connection);
+				// A peer the controller kept from before this boot sends
+				// these at its report rate until the server resets it.
+				static bigtime_t sComplainedAt = 0;
+				bigtime_t now = system_time();
+				if (now - sComplainedAt > 5000000) {
+					sComplainedAt = now;
+					dprintf("l2cap-le: fixed channel %#x PDU without an LE "
+						"link (connection %p)\n", dcid, connection);
+				}
 				gBufferModule->free(buffer);
 				return ENOTCONN;
 			}

@@ -117,11 +117,16 @@ LocalDeviceImpl::StartPairingSetup()
 {
 	if (fPairSetupState != PAIR_SETUP_IDLE)
 		return B_BUSY;
-	// The kernel picks the controller's ACL packet sizes out of these
-	// answers; L2CAP fragments and paces its data with them.
-	fPairSetupState = PAIR_SETUP_BUFFER_SIZE;
+	// Every stack opens with HCI Reset. The firmware loader leaves a
+	// controller that is already running alone (a warm reboot keeps an
+	// Intel radio operational), so without this the previous session's
+	// links live on inside it: a mouse that stays connected to a host that
+	// is gone never advertises for the new one, a keyboard pages a radio
+	// nobody listens to, and the setup below fails because Write Secure
+	// Connections Host Support is disallowed while a link exists.
+	fPairSetupState = PAIR_SETUP_RESET;
 	status_t result = _SendLECommand(
-		PACK_OPCODE(OGF_INFORMATIONAL_PARAM, OCF_READ_BUFFER_SIZE), NULL, 0);
+		PACK_OPCODE(OGF_CONTROL_BASEBAND, OCF_RESET), NULL, 0);
 	if (result != B_OK)
 		fPairSetupState = PAIR_SETUP_IDLE;
 	return result;
@@ -147,6 +152,9 @@ LocalDeviceImpl::HandlePairSetupCommandComplete(struct hci_event_header* event)
 	}
 	uint16 expected = 0;
 	switch (fPairSetupState) {
+		case PAIR_SETUP_RESET:
+			expected = PACK_OPCODE(OGF_CONTROL_BASEBAND, OCF_RESET);
+			break;
 		case PAIR_SETUP_BUFFER_SIZE:
 			expected = PACK_OPCODE(OGF_INFORMATIONAL_PARAM,
 				OCF_READ_BUFFER_SIZE);
@@ -178,14 +186,12 @@ LocalDeviceImpl::HandlePairSetupCommandComplete(struct hci_event_header* event)
 	}
 	if (opcode != expected)
 		return;
-	// A controller without LE, or an old one, may not know the buffer size
-	// commands; carry on without them.
-	if (status != 0 && fPairSetupState != PAIR_SETUP_BUFFER_SIZE
-		&& fPairSetupState != PAIR_SETUP_LE_BUFFER_SIZE) {
-		printf("Bluetooth pairing setup opcode %#x failed: %#x\n",
-			opcode, status);
-		fPairSetupState = PAIR_SETUP_IDLE;
-		return;
+	// A controller without LE, or an old one, may not know some of these
+	// commands, and a stale link makes it refuse others: carry on with the
+	// rest, the page scan for paired keyboards at the end most of all.
+	if (status != 0) {
+		CLASSIC_LOG(LE_LOG_ERROR, "setup command %#x failed: status %#x; "
+			"carrying on", opcode, status);
 	}
 	const uint8 enabled = 1;
 	const uint8 leHost[2] = { 1, 1 };
@@ -194,6 +200,15 @@ LocalDeviceImpl::HandlePairSetupCommandComplete(struct hci_event_header* event)
 	};
 	status_t result = B_OK;
 	switch (fPairSetupState) {
+		case PAIR_SETUP_RESET:
+			CLASSIC_LOG(LE_LOG_INFO, "controller reset: no links, page scan "
+				"off, settings to be made again");
+			// The kernel picks the controller's ACL packet sizes out of
+			// these answers; L2CAP fragments and paces its data with them.
+			fPairSetupState = PAIR_SETUP_BUFFER_SIZE;
+			result = _SendLECommand(PACK_OPCODE(OGF_INFORMATIONAL_PARAM,
+				OCF_READ_BUFFER_SIZE), NULL, 0);
+			break;
 		case PAIR_SETUP_BUFFER_SIZE:
 			fPairSetupState = PAIR_SETUP_LE_BUFFER_SIZE;
 			result = _SendLECommand(PACK_OPCODE(OGF_LE_CONTROL,
@@ -253,6 +268,11 @@ LocalDeviceImpl::HandlePairSetupCommandComplete(struct hci_event_header* event)
 LocalDeviceImpl::~LocalDeviceImpl()
 {
 	SaveRemoteDevices();
+	// Drop every link on the way out (the server quits for a restart or a
+	// reboot): the peers look for a host again at once instead of staying
+	// with one that is gone until their supervision timeout. The next
+	// server resets the controller as it starts anyway.
+	_SendLECommand(PACK_OPCODE(OGF_CONTROL_BASEBAND, OCF_RESET), NULL, 0);
 }
 
 

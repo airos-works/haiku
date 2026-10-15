@@ -112,6 +112,35 @@ RemoveConnection(const bdaddr_t& destination, hci_id hid)
 }
 
 
+/*!	Forgets every link of a controller: it was reset, so none of them
+	exists any more and no Disconnection Complete will say so.
+*/
+void
+RemoveConnections(hci_id hid)
+{
+	while (true) {
+		uint16 handle;
+		{
+			MutexLocker locker(&sConnectionListLock);
+			DoublyLinkedList<HciConnection>::Iterator iterator
+				= sConnectionList.GetIterator();
+			HciConnection* conn = NULL;
+			while ((conn = iterator.Next()) != NULL) {
+				if (conn->Hid == hid)
+					break;
+			}
+			if (conn == NULL)
+				return;
+			handle = conn->handle;
+		}
+		dprintf("btCoreData: controller %" B_PRId32 " reset: dropping link "
+			"handle %#x\n", hid, handle);
+		if (RemoveConnection(handle, hid) != B_OK)
+			return;
+	}
+}
+
+
 status_t
 RemoveConnection(uint16 handle, hci_id hid)
 {
