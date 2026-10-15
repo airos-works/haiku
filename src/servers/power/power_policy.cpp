@@ -231,7 +231,10 @@ PowerPolicy::_Sleep()
 {
 #if defined(__i386__) || defined(__x86_64__)
 	x86_suspend_s2idle_args args = {};
-	args.flags = X86_SUSPEND_SKIP_DEVICES;
+	// The devices with suspend hooks (USB, NVMe) go to sleep, too; the power
+	// hooks of the legacy drivers (Wi-Fi) are left out until those drivers
+	// are known to come back from a suspend to idle.
+	args.flags = X86_SUSPEND_SKIP_POWER_HOOKS;
 	{
 		BAutolock _(fLock);
 		if (fSleepCheck > 0)
