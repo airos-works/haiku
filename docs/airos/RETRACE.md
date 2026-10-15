@@ -122,38 +122,52 @@ boot runs on the plain `framebuffer` driver with no retrace semaphore: the
 flush then switches itself off (`vertical blank flush: no retrace
 semaphore`) and everything is copied as drawn, as before.
 
-### Torn frames counted at the WX 5100's scanout, 2026-10-15 23:10
+### Torn frames counted at the WX 5100's scanout, 2026-10-16 00:10
 
 The display controller computes a CRC of every frame it sends to the
-monitor (DC's stream CRC; `DRM_HAIKU_IOCTL_CRC` in amdgpu_drm, with a
+monitor (DC's stream CRC; `DRM_HAIKU_IOCTL_CRC` in amdgpu_drm, over a
 window of the frame since the Deskbar's CPU meter changes every 250 ms;
-temporal dithering is switched to truncation while it runs). With
-`retrace_test draw` alternating two greys a frame, exactly two CRCs are
-whole frames; a frame made of both pictures (a tear) has another.
+temporal dithering is switched to truncation while it runs). A frame made
+of parts of two pictures (a tear) has a CRC that is no whole picture's.
 `retrace/crcwatch` on the X399 reads the CRC after each blank;
-`retrace/x399-crc-ab.sh` runs the comparison, switching the flush off and
-on with the `no_vblank_flush` settings file (10 s, 598 frames each):
+`retrace/x399-crc-ab.sh` and `x399-crc-move.sh` run the comparisons,
+switching the flush off and on with the `no_vblank_flush` settings file
+(10 s, 598 frames each, the CRC window covering the whole test window):
 
-| Load | Flush off (copies as drawn) | Flush on |
-| --- | --- | --- |
-| 3840x1080 window (the whole screen at 200 %) drawn as fast as it can, no wait | 382 torn | 0 |
-| 1600x900 window drawn as fast as it can, no wait | 581 torn | 0 |
-| 1600x900 window drawn in updates | 0 (B_WAIT_FOR_RETRACE) | 0 |
-| 3840x1080 window drawn in updates | 0 (B_WAIT_FOR_RETRACE) | 0 |
-| 1600x900 window with B_WAIT_FOR_RETRACE | 0 | 0 |
-| idle desktop | 0 | 0 |
+| Load | Whole pictures | Flush off: torn frames | Flush on: torn frames |
+| --- | --- | --- | --- |
+| 3840x1080 window (the whole screen at 200 %) redrawn as fast as it can, no wait, two greys | 2 | 530 | 0 |
+| 1600x900 window redrawn as fast as it can, no wait | 2 | 503 | 0 |
+| 1600x900 window redrawn in updates | 2 | 0 (it asked for the blank) | 0 |
+| 3840x1080 window redrawn in updates | 2 | 0 (it asked for the blank) | 0 |
+| 1600x900 window with B_WAIT_FOR_RETRACE | 2 | 0 | 0 |
+| 1200x700 window of stripes jumping 64 px to and fro, 100 moves a second | up to 8 (either place, the uncovered strips redrawn or not yet) | 574 | 0 |
+| 1200x700 view of stripes scrolling 64 px to and fro, 115 scrolls a second | 4 | 445 | 0 |
+| idle desktop | 1 | 0 | 0 |
 
-The old code tears whenever a program draws without B_WAIT_FOR_RETRACE
-(most do), and already waited for the blank with it. The flush shows only
-whole frames in every case; its own count agreed (2 of 3046 flushes behind
-the hardware's scan line in that minute, at 0.00 frames).
+Every frame the flush produced was one of the whole pictures. Its own
+count agreed: 5 of 3068 flushes behind the hardware's scan line in the
+redraw minute (window-frame rects at the top of the screen, copied 1.5 ms
+after the blank while the test windows opened), 0 of 1826 in the moving
+minute. The old code tears whenever a program draws without
+B_WAIT_FOR_RETRACE, which is what moving windows, scrolling and most
+drawing do; it already waited for the blank with it.
 
-Two things the flush needed on the way there, both found by the CRC: the
-flush copies from a *shadow* of the back buffer, filled when a drawing op
-queues its area, so that a drawing op under way does not get into a
-frame (3 to 8 % of the frames were made of both pictures before); and it
-never waits: a rect whose shadow is being written is left for the next
-blank (waiting for the write delayed 457 of 3064 copies behind the scan).
+What the flush needed on the way there, each found by the CRC:
+
+- it copies from a *shadow* of the back buffer, filled when a drawing op
+  queues its area, so a drawing op under way does not get into a frame
+  (3 to 8 % of the frames were made of both pictures before);
+- two shadows, flipped at the blank: drawing ops write the current one,
+  the flush copies the other, and neither waits for the other (waiting for
+  writes had put 457 of 3064 copies behind the scan; skipping rects being
+  written had shown a moved window without its uncovered strip);
+- the flip comes 4 ms before the blank is due, so a large write that
+  picked the old shadow is over when the copy starts (copies had begun
+  with the scan at row 234);
+- the copy goes down the screen in bands of 64 rows across all rects,
+  as the scan does (rects side by side had been copied one after the
+  other, the later ones behind the scan).
 
 ### Cubie A7S, 2026-10-15 23:28 (the flush, ARM64)
 
