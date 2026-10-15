@@ -9,6 +9,10 @@
 
 #include "HWInterface.h"
 
+#include <Entry.h>
+#include <FindDirectory.h>
+#include <Path.h>
+
 #include <new>
 #include <math.h>
 #include <stdio.h>
@@ -736,6 +740,18 @@ HWInterface::_StartFlushing()
 {
 	if (fFlushTargets != NULL)
 		return B_OK;
+
+	// for comparisons: a file named no_vblank_flush in the user's
+	// app_server settings keeps the old copies as drawn
+	BPath settings;
+	if (find_directory(B_USER_SETTINGS_DIRECTORY, &settings) == B_OK) {
+		settings.Append("app_server/no_vblank_flush");
+		if (BEntry(settings.Path()).Exists()) {
+			debug_printf("app_server: vertical blank flush: off (%s)\n",
+				settings.Path());
+			return B_OK;
+		}
+	}
 
 	fFlushDoneSem = create_sem(0, "vertical blank flush done");
 	if (fFlushDoneSem < 0)
