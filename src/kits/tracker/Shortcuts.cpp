@@ -400,6 +400,20 @@ TShortcuts::GetInfoLabel()
 
 
 BMenuItem*
+TShortcuts::QuickLookItem()
+{
+	return new BMenuItem(QuickLookLabel(), new BMessage(kQuickLook), 'Y');
+}
+
+
+const char*
+TShortcuts::QuickLookLabel()
+{
+	return B_TRANSLATE("Quick Look");
+}
+
+
+BMenuItem*
 TShortcuts::IdentifyItem()
 {
 	BMessage* message = new BMessage(kIdentifyEntry);
@@ -801,6 +815,10 @@ TShortcuts::Update(BMenu* menu)
 				UpdateGetInfoItem(item);
 				break;
 
+			case kQuickLook:
+				UpdateQuickLookItem(item);
+				break;
+
 			case kIdentifyEntry:
 				UpdateIdentifyItem(item);
 				break;
@@ -1144,6 +1162,19 @@ TShortcuts::UpdateGetInfoItem(BMenuItem* item)
 
 	if (fInWindow) {
 		item->SetEnabled(true);
+		item->SetTarget(PoseView());
+	}
+}
+
+
+void
+TShortcuts::UpdateQuickLookItem(BMenuItem* item)
+{
+	if (item == NULL)
+		return;
+
+	if (fInWindow) {
+		item->SetEnabled(PoseView()->CountSelected() > 0);
 		item->SetTarget(PoseView());
 	}
 }

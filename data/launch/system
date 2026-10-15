@@ -74,6 +74,12 @@ service x-vnd.Haiku-osd_server {
 	on_demand
 }
 
+service x-vnd.Haiku-quick_look_server {
+	launch /system/servers/quick_look_server
+	no_safemode
+	on_demand
+}
+
 service x-vnd.Haiku-power_daemon {
 	launch /system/servers/power_daemon
 	no_safemode
