@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <driver_settings.h>
+
 #include "registers.h"
 
 
@@ -193,7 +195,8 @@ TypeCPort::TypeCPort()
 	fHotPlugIrq(false),
 	fChanges(0),
 	fVendorId(0),
-	fProductId(0)
+	fProductId(0),
+	fPinPreference(0)
 {
 }
 
@@ -251,6 +254,21 @@ TypeCPort::Init()
 		fTwi.Read16(HUSB311_ADDRESS, TCPC_VENDOR_ID, vendor);
 	TRACE("16 register reads took %" B_PRId64 " us\n", system_time() - start);
 #endif
+
+	// Lab setting: "typec_pin_assignment C|D|E" prefers that DisplayPort
+	// pin assignment when the partner offers it, "none" leaves the
+	// partner in USB mode (no DisplayPort)
+	void* settings = load_driver_settings("sunxi_display");
+	const char* preference = get_driver_parameter(settings,
+		"typec_pin_assignment", NULL, NULL);
+	if (preference != NULL) {
+		if (strcmp(preference, "none") == 0)
+			fPinPreference = 'N';
+		else if (strlen(preference) == 1 && strchr("CDE", preference[0]))
+			fPinPreference = preference[0];
+		INFO("pin assignment preference from the settings: %s\n", preference);
+	}
+	unload_driver_settings(settings);
 
 	fInitialized = true;
 	_Detach();
@@ -628,6 +646,11 @@ TypeCPort::_HandleVdm(const Message& message)
 				_SetState(kStateNoDisplayPort);
 				break;
 			}
+			if (fPinPreference == 'N') {
+				INFO("DisplayPort mode left alone (settings)\n");
+				_SetState(kStateNoDisplayPort);
+				break;
+			}
 			fRetries = 0;
 			_SetState(kStateDiscoverModes);
 			break;
@@ -791,9 +814,16 @@ TypeCPort::_RequestNext()
 		}
 		case kStateConfigure:
 		{
-			// four lanes if the partner can, else two next to USB
+			// four lanes if the partner can, else two next to USB; the
+			// settings may prefer one
 			uint8 pins = 0;
-			if ((fPinAssignments & DP_PIN_C) != 0) {
+			uint8 preferred = fPinPreference == 'C' ? DP_PIN_C
+				: fPinPreference == 'D' ? DP_PIN_D
+				: fPinPreference == 'E' ? DP_PIN_E : 0;
+			if ((fPinAssignments & preferred) != 0) {
+				pins = preferred;
+				fPinAssignment = fPinPreference;
+			} else if ((fPinAssignments & DP_PIN_C) != 0) {
 				pins = DP_PIN_C;
 				fPinAssignment = 'C';
 			} else if ((fPinAssignments & DP_PIN_E) != 0) {
