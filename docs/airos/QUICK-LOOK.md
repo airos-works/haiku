@@ -49,9 +49,13 @@ src/kits/tracker/QuickLook.*   Tracker's side: finds or starts the server
   keyboard hide it. The server tells the owner when the panel is up
   (`kMsgQuickLookShown`) and when it closed (`kMsgQuickLookClosed`), so the
   two agree even when the server was restarted in between.
-- **The panel** is a `BDirectWindow` with `B_FLOATING_ALL_WINDOW_FEEL` and
-  `B_AVOID_FOCUS`: it floats over everything and never takes the keyboard,
-  so Tracker's arrows keep working. Its `DirectConnected()` is passed to the
+- **The panel** is a frameless `BDirectWindow` (a dark line around it,
+  the file's name in bold in the footer) with `B_FLOATING_ALL_WINDOW_FEEL`
+  and `B_AVOID_FOCUS`: it floats over everything and never takes the
+  keyboard, so Tracker's arrows keep working. Tracker sends where the
+  selected entry is on screen (`"icon"`), and the panel zooms out of that
+  rectangle into its place over a dozen eased frames and shrinks back
+  into it when it closes, the picture stopped first. Its `DirectConnected()` is passed to the
   preview, so airTime's video view writes into the frame buffer as it does
   in its own window. The panel is centred on the Tracker window that asked
   (which keeps it on that monitor), sized to the content's preferred size
@@ -151,7 +155,6 @@ the program, see `src/add-ons/media/plugins/amdgpu_va`).
 
 ## Open
 
-- The panel does not animate from the icon, as the Finder's does.
 - A text preview reads the first 2 MiB only; a table shows 20,000 rows.
 - An add-on replaced while the server runs is seen when the server next
   starts (it quits three minutes after the panel closed).
