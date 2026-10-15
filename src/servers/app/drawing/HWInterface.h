@@ -207,6 +207,8 @@ protected:
 			status_t			_StartFlushing();
 			void				_StopFlushing();
 			void				_UpdateFlushTargets();
+			status_t			_AddFlushTarget(uint32 outputID,
+									const char* name);
 			void				_AbandonFlushing();
 
 private:

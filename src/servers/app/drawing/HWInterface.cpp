@@ -664,6 +664,7 @@ HWInterface::_AbandonFlushing()
 {
 	if (fFlushTargets == NULL)
 		return;
+	debug_printf("app_server: vertical blank flush: abandoned\n");
 	fFlushing = false;
 	fQuitFlush = true;
 	for (int32 i = 0; i < fFlushTargetCount; i++) {
@@ -683,71 +684,77 @@ HWInterface::_AbandonFlushing()
 }
 
 
+static const int32 kMaxFlushTargets = 16;
+
+
+/*!	Starts the target for the whole screen; the outputs' targets are added
+	as the mode sets tell of them (_UpdateFlushTargets()). */
 status_t
 HWInterface::_StartFlushing()
 {
 	if (fFlushTargets != NULL)
 		return B_OK;
 
-	// one target for the whole frame buffer, and one per display output
-	display_output* outputs = NULL;
-	uint32 outputCount = 0;
-	if (GetDisplayOutputs(&outputs, &outputCount) != B_OK)
-		outputCount = 0;
-
 	fFlushDoneSem = create_sem(0, "vertical blank flush done");
-	if (fFlushDoneSem < 0) {
-		free(outputs);
+	if (fFlushDoneSem < 0)
 		return fFlushDoneSem;
-	}
-	fFlushTargets = new(std::nothrow) FlushTarget[1 + outputCount];
+	fFlushTargets = new(std::nothrow) FlushTarget[kMaxFlushTargets];
 	if (fFlushTargets == NULL) {
-		free(outputs);
 		delete_sem(fFlushDoneSem);
 		fFlushDoneSem = -1;
 		return B_NO_MEMORY;
 	}
 	fQuitFlush = false;
-	for (uint32 i = 0; i <= outputCount; i++) {
-		FlushTarget& target = fFlushTargets[i];
-		target.interface = this;
-		target.outputID = i == 0 ? 0 : outputs[i - 1].id;
-		strlcpy(target.name, i == 0 ? "screen" : outputs[i - 1].name,
-			sizeof(target.name));
-		target.frame = IntRect(0, 0, -1, -1);
-		target.retraceSemaphore = -1;
-		target.workers = NULL;
-		target.workerCount = 0;
-		target.timeouts = 0;
-		target.ignoredUntil = 0;
-		target.lastBlank = 0;
-		target.period = 16667;
-		target.flushes = target.rects = target.late = 0;
-		target.worstLate = 0;
-		target.longest = target.reported = 0;
-		target.wake = create_sem(0, "vertical blank flush");
-		target.thread = target.wake < 0 ? -1 : spawn_thread(_FlushThreadEntry,
-			"vertical blank flush", B_REAL_TIME_DISPLAY_PRIORITY, &target);
-		if (target.thread < 0) {
-			if (target.wake >= 0)
-				delete_sem(target.wake);
-			break;
-		}
-		fFlushTargetCount++;
-	}
-	free(outputs);
-	if (fFlushTargetCount == 0) {
+	status_t status = _AddFlushTarget(0, "screen");
+	if (status != B_OK) {
+		debug_printf("app_server: vertical blank flush: no thread: %s\n",
+			strerror(status));
 		delete[] fFlushTargets;
 		fFlushTargets = NULL;
 		delete_sem(fFlushDoneSem);
 		fFlushDoneSem = -1;
-		return B_ERROR;
+		return status;
 	}
 
-	_UpdateFlushTargets();
 	fFlushing = true;
-	for (int32 i = 0; i < fFlushTargetCount; i++)
-		resume_thread(fFlushTargets[i].thread);
+	_UpdateFlushTargets();
+	return B_OK;
+}
+
+
+status_t
+HWInterface::_AddFlushTarget(uint32 outputID, const char* name)
+{
+	if (fFlushTargetCount >= kMaxFlushTargets)
+		return B_NO_MEMORY;
+
+	FlushTarget& target = fFlushTargets[fFlushTargetCount];
+	target.interface = this;
+	target.outputID = outputID;
+	strlcpy(target.name, name, sizeof(target.name));
+	target.frame = IntRect(0, 0, -1, -1);
+	target.retraceSemaphore = -1;
+	target.workers = NULL;
+	target.workerCount = 0;
+	target.timeouts = 0;
+	target.ignoredUntil = 0;
+	target.lastBlank = 0;
+	target.period = 16667;
+	target.flushes = target.rects = target.late = 0;
+	target.worstLate = 0;
+	target.longest = target.reported = 0;
+	target.wake = create_sem(0, "vertical blank flush");
+	if (target.wake < 0)
+		return target.wake;
+	target.thread = spawn_thread(_FlushThreadEntry, "vertical blank flush",
+		B_REAL_TIME_DISPLAY_PRIORITY, &target);
+	if (target.thread < 0) {
+		delete_sem(target.wake);
+		target.wake = -1;
+		return target.thread;
+	}
+	fFlushTargetCount++;
+	resume_thread(target.thread);
 	return B_OK;
 }
 
@@ -757,6 +764,7 @@ HWInterface::_StopFlushing()
 {
 	if (fFlushTargets == NULL)
 		return;
+	debug_printf("app_server: vertical blank flush: stopping\n");
 
 	// from now on the copies are made as drawn (the switch is made under
 	// the lock, so that nothing is queued after the last drain)
@@ -795,9 +803,19 @@ HWInterface::_UpdateFlushTargets()
 
 	display_output* outputs = NULL;
 	uint32 outputCount = 0;
-	if (fFlushTargetCount > 1
-		&& GetDisplayOutputs(&outputs, &outputCount) != B_OK)
+	if (GetDisplayOutputs(&outputs, &outputCount) != B_OK)
 		outputCount = 0;
+
+	// a target for every output not seen before
+	for (uint32 j = 0; j < outputCount; j++) {
+		bool known = false;
+		for (int32 i = 1; i < fFlushTargetCount; i++) {
+			if (fFlushTargets[i].outputID == outputs[j].id)
+				known = true;
+		}
+		if (!known && outputs[j].id != 0)
+			_AddFlushTarget(outputs[j].id, outputs[j].name);
+	}
 
 	RenderingBuffer* backBuffer = BackBuffer();
 	IntRect bufferFrame = backBuffer != NULL
@@ -830,6 +848,10 @@ HWInterface::_UpdateFlushTargets()
 					perOutput = true;
 				break;
 			}
+		}
+		if (perOutput != fFlushPerOutput) {
+			debug_printf("app_server: vertical blank flush: %s\n", perOutput
+				? "each output at its own blanks" : "the screen at one's");
 		}
 		fFlushPerOutput = perOutput;
 		fFlushLock.Unlock();
@@ -888,9 +910,11 @@ HWInterface::_FlushThread(FlushTarget& target)
 {
 	while (!fQuitFlush) {
 		// something to copy?
-		if (acquire_sem(target.wake) != B_OK)
-			break;
-		if (fQuitFlush)
+		status_t status;
+		do {
+			status = acquire_sem(target.wake);
+		} while (status == B_INTERRUPTED);
+		if (status != B_OK || fQuitFlush)
 			break;
 
 		// the blank
@@ -905,10 +929,13 @@ HWInterface::_FlushThread(FlushTarget& target)
 			}
 			// a blank missed at 60 Hz still fits, and one at 24 Hz
 			bigtime_t waitStart = system_time();
-			status_t status = target.retraceSemaphore < 0
-				? target.retraceSemaphore
-				: acquire_sem_etc(target.retraceSemaphore, 1,
+			status = target.retraceSemaphore;
+			while (status >= 0) {
+				status = acquire_sem_etc(target.retraceSemaphore, 1,
 					B_RELATIVE_TIMEOUT, 50000);
+				if (status != B_INTERRUPTED)
+					break;
+			}
 			if (status == B_OK) {
 				blank = system_time();
 				target.timeouts = 0;
@@ -946,6 +973,8 @@ HWInterface::_FlushThread(FlushTarget& target)
 
 		_FlushPending(target, blank);
 	}
+	debug_printf("app_server: vertical blank flush %s: thread ends (%s)\n",
+		target.name, fQuitFlush ? "quit" : "wake semaphore gone");
 }
 
 
@@ -954,8 +983,12 @@ HWInterface::_FlushWorkerEntry(void* data)
 {
 	FlushWorker* worker = (FlushWorker*)data;
 	HWInterface* interface = worker->interface;
-	while (acquire_sem(worker->start) == B_OK) {
-		if (interface->fQuitFlush)
+	while (true) {
+		status_t status;
+		do {
+			status = acquire_sem(worker->start);
+		} while (status == B_INTERRUPTED);
+		if (status != B_OK || interface->fQuitFlush)
 			break;
 		worker->began = system_time();
 		interface->_CopyBackToFront(worker->region);
@@ -1129,8 +1162,10 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 		bigtime_t began = system_time();
 		_CopyBackToFront(first);
 		bigtime_t ended = system_time();
-		for (int32 i = 1; i < bands; i++)
-			acquire_sem(fFlushDoneSem);
+		for (int32 i = 1; i < bands; i++) {
+			while (acquire_sem(fFlushDoneSem) == B_INTERRUPTED)
+				;
+		}
 
 		if (blank != 0) {
 			for (int32 i = 0; i < bands; i++) {
