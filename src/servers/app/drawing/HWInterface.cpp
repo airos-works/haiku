@@ -1187,9 +1187,14 @@ HWInterface::_FlushThread(FlushTarget& target)
 		}
 		int32 which = _FlipShadow();
 		if (fromScan) {
-			bigtime_t wakeAt = next - 300;
+			// A sleeping core can take a millisecond to wake from a deep
+			// idle state (the Framework 13 did): sleep until shortly
+			// before, then spin for the last stretch.
+			bigtime_t wakeAt = next - 1500;
 			if (wakeAt > system_time())
 				snooze_until(wakeAt, B_SYSTEM_TIMEBASE);
+			while (system_time() < next - 200)
+				;
 			blank = next;
 			target.lastBlank = next;
 			target.period = target.scanPeriod;
