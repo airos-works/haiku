@@ -410,10 +410,11 @@ typedef sem_id (*get_display_output_retrace_semaphore)(uint32 id);
 	   (B_ACCELERANT_RETRACE_SEMAPHORE is one output's). An output that is
 	   not being driven releases it at a steady rate instead. */
 typedef status_t (*get_display_output_scan_line)(uint32 id, int32* _line,
-	int32* _lines);
+	int32* _lines, bigtime_t* _scanStart, bigtime_t* _period);
 	/* Where the monitor's scan is right now, as a row of the output's
 	   frame buffer region: negative in the vertical blank (minus the rows
-	   until the scan starts), _lines the region's height. */
+	   until the scan starts), _lines the region's height; when the scan
+	   of the frame began (system_time()) and how long a frame takes. */
 
 typedef status_t (*set_cursor_shape)(uint16 width, uint16 height,
 	uint16 hotX, uint16 hotY, const uint8* andMask, const uint8* xorMask);

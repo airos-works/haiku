@@ -197,9 +197,12 @@ public:
 									// released at that display output's
 									// blanks; B_UNSUPPORTED without
 	virtual	status_t			OutputScanLine(uint32 id, int32* _line,
-									int32* _lines);
+									int32* _lines, bigtime_t* _scanStart,
+									bigtime_t* _period);
 									// where that output's scan is now, as
-									// a row of its frame buffer region
+									// a row of its frame buffer region,
+									// when its frame's scan began and how
+									// long a frame takes
 			void				WaitForPendingFlush(bigtime_t timeout);
 									// until what was queued so far is on
 									// the screen (not locked)

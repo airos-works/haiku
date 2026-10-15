@@ -61,7 +61,8 @@ public:
 	virtual sem_id				RetraceSemaphore();
 	virtual	sem_id				OutputRetraceSemaphore(uint32 id);
 	virtual	status_t			OutputScanLine(uint32 id, int32* _line,
-									int32* _lines);
+									int32* _lines, bigtime_t* _scanStart,
+									bigtime_t* _period);
 	virtual status_t			WaitForRetrace(
 									bigtime_t timeout = B_INFINITE_TIMEOUT);
 
