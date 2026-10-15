@@ -281,7 +281,11 @@ SYSTEM_ADD_ONS_SCREENSAVERS += [ FFilterByBuildFeatures
 	Spider
 ] ;
 
-SYSTEM_ADD_ONS_QUICK_LOOK = ImagePreview TextPreview ;
+SYSTEM_ADD_ONS_QUICK_LOOK = [ FFilterByBuildFeatures
+	ImagePreview
+	PDFPreview@mupdf
+	TextPreview
+] ;
 
 SYSTEM_ADD_ONS_DRIVERS_AUDIO +=
 	auich

@@ -471,6 +471,53 @@ if $(HAIKU_ARM64_LIBPNG_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = arm64 {
 }
 
 
+# MuPDF (the Quick Look document preview)
+if $(HAIKU_MUPDF_PACKAGES_DIR) {
+	# The build's pinned HaikuPorts snapshot has no mupdf: the packages come
+	# from a directory holding HaikuPorts' mupdf and mupdf_devel for the
+	# architecture (air/OS CI fetches them, images/build-image.sh; locally
+	# haikuports.py fetch --no-deps <arch> mupdf mupdf_devel). The image gets
+	# mupdf and its jbig2dec the same way.
+	local packageDirectory = $(HAIKU_MUPDF_PACKAGES_DIR) ;
+	local base = [ Glob $(packageDirectory) : mupdf-*-$(architecture).hpkg ] ;
+	local devel = [ Glob $(packageDirectory)
+		: mupdf_devel-*-$(architecture).hpkg ] ;
+	if ! $(base) || ! $(devel) || $(base[2]) || $(devel[2]) {
+		Exit "Need one $(architecture) mupdf and one mupdf_devel package in"
+			$(packageDirectory) ;
+	}
+	local directory = [ FDirName $(HAIKU_OPTIONAL_BUILD_PACKAGES_DIR)
+		airos-$(base:B) ] ;
+	# Extraction shares the prefix (including .PackageInfo), so serialize it.
+	Depends $(directory:G=mupdf-devel) : $(directory:G=mupdf-base) ;
+	SetBuildFeatureAttribute mupdf : runtime
+		: [ ExtractArchive $(directory:G=mupdf-base) : lib
+			: $(base) : extracted-$(architecture)-mupdf-base ] : base ;
+	SetBuildFeatureAttribute mupdf : library
+		: [ ExtractArchive $(directory:G=mupdf-base) : lib/libmupdf.so
+			: $(base) : extracted-$(architecture)-mupdf-base ] : base ;
+	SetBuildFeatureAttribute mupdf : headers
+		: [ ExtractArchive $(directory:G=mupdf-devel) : develop/headers
+			: $(devel) : extracted-$(architecture)-mupdf-devel ] : devel ;
+	SetBuildFeatureAttribute mupdf : base:directory : $(directory) ;
+	SetBuildFeatureAttribute mupdf : devel:directory : $(directory) ;
+	EnableBuildFeatures mupdf ;
+} else if [ IsPackageAvailable mupdf_devel ] {
+	ExtractBuildFeatureArchives mupdf :
+		file: base mupdf
+			runtime: lib
+		file: devel mupdf_devel
+			depends: base
+			library: $(developLibDir)/libmupdf.so
+			headers: $(developHeadersDir)
+		;
+
+	EnableBuildFeatures mupdf ;
+} else {
+	unavailableBuildFeatures += mupdf ;
+}
+
+
 # libicns
 if [ IsPackageAvailable libicns_devel ] {
 	ExtractBuildFeatureArchives libicns :

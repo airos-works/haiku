@@ -17,6 +17,7 @@ up; `⌘Y` and *File ▸ Quick Look* do the same as the space bar. Since branch
 | Pictures: everything the Translation Kit reads (`image/*`) | Scaled to fit, on a dark ground; the footer says the size and kind | `add-ons/quick_look/ImagePreview` (haiku package) |
 | Films, and songs when Amp is not installed: everything FFmpeg reads | airTime's own engine and video view, playing at once, with the metal controller; the footer says the codec, size, frame rate and whether the picture is decoded in hardware | `add-ons/quick_look/airTime` (airtime package) |
 | Songs: MP3, MP4/M4A/AAC, FLAC, WAV, OGG, AIFF | Amp's decoder and output, the artwork and tags, play/pause and a scrubber | `add-ons/quick_look/Amp` (amp package) |
+| Documents: PDF, XPS, EPUB, FB2, comic book archives (MuPDF) | The pages stacked in a scrolling view at the panel's width, rendered as they come into view at the desktop's density; the footer says the page count, title and format | `add-ons/quick_look/PDFPreview` (haiku package, x86_64) |
 | Anything else, and folders | The icon, name, kind, size and date (a folder's item count) | the server itself |
 
 Several selected files are shown one at a time, with `‹ 2 of 5 ›` in the
@@ -77,6 +78,20 @@ src/kits/tracker/QuickLook.*   Tracker's side: finds or starts the server
   it, with `QUICKLOOK_CPPFLAGS`/`QUICKLOOK_LDFLAGS` for headers and library
   elsewhere), so a CI with an older SDK still builds the applications.
 
+- **PDFPreview** links HaikuPorts' `libmupdf.so` (mupdf 1.20.3, AGPL;
+  jbig2dec with it). The build's pinned HaikuPorts snapshot has neither, so
+  the `mupdf` build feature takes the packages from
+  `HAIKU_MUPDF_PACKAGES_DIR` (air/OS CI fetches mupdf, mupdf_devel and
+  jbig2dec with `deps/haikuports.py` and puts the two runtime packages in
+  the image; locally `/mnt/HaikuWork/x399/pkgs/mupdf`). Without the
+  feature the add-on is left out (`PDFPreview@mupdf`), as on arm64 for
+  now, where PDFs fall back to the icon. Rendering happens on a thread of
+  the add-on's own that owns the MuPDF context (MuPDF contexts are single
+  threaded without locks): it first reports the page count, sizes and
+  metadata, then renders the pages the view asks for, nearest first, at
+  the view's scale times the desktop's device scale (from `BScreen`'s mode
+  against its frame, 2 on the X399), keeping the last 24 pages.
+
 ## Writing an add-on
 
 ```cpp
@@ -115,6 +130,9 @@ WX 5100, 200 % desktop, master `quick-look` branch built in
 - CSV as a table, JSON in a fixed font with horizontal scrolling, prose
   wrapped; PNG and JPEG scaled and labelled; untyped random bytes and a
   film without airTime's add-on fall back to the icon preview.
+- A three-page PDF made by hand and the 137-page AHCI 1.3.1 specification
+  show their pages, titles and formats; the wheel scrolls and pages render
+  as they appear.
 - `clip.mp4` (H.264 1080p30) and `hevc10.mkv` (HEVC Main 10) play in the
   panel decoded by the AMD UVD through the `amduvd` VA-API add-on; the
   footer says so. `song.mp3` plays through Amp's add-on with its artwork and
@@ -137,4 +155,8 @@ the program, see `src/add-ons/media/plugins/amdgpu_va`).
 - A text preview reads the first 2 MiB only; a table shows 20,000 rows.
 - An add-on replaced while the server runs is seen when the server next
   starts (it quits three minutes after the panel closed).
-- PDF and office documents have no add-on; they fall back to the icon.
+- Office documents have no add-on; they fall back to the icon. PDF needs
+  mupdf, which the arm64 builds do not have yet (an airos-ci recipe would
+  bring it there).
+- The document preview has no page jumping or zoom; the mouse wheel and
+  the scroll bar move through the pages.
