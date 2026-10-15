@@ -36,11 +36,19 @@ Since branch `vblank-flush` (2026-10-15) every copy to the screen is timed:
 - A display that stops reporting blanks costs three 50 ms timeouts, then
   the copies are made unsynchronized for a second. An accelerant with no
   retrace semaphore at all gets the old behaviour: copies as drawn.
-- The threads count copies that ended up behind the scan (estimated from
-  the time since the blank over the output's rows; the blank's own lines
-  are the margin) and report once a minute to the syslog:
+- The threads count copies that ended up behind the scan and report once
+  a minute to the syslog. Where the accelerant tells where the scan is
+  (`B_GET_DISPLAY_OUTPUT_SCAN_LINE`; `amdgpu_kms` computes it from the
+  DRM vblank timestamp, which amdgpu takes from the scan position, and the
+  mode's line time), each copy is checked against the hardware's scan
+  line at its start and end; elsewhere the scan is estimated from the time
+  since the blank over the output's rows, with the blank's own lines as
+  the margin:
   `app_server: vertical blank flush DP-1: N flushes, N rects, N behind the
-  scan (worst 0.00 frames), longest 9.2 ms, period 16.666 ms, 4 bands`.
+  scan (worst 0.00 frames, scan read from the hardware), longest 9.2 ms,
+  period 16.666 ms, 4 bands`. A copy behind the scan at its start or its
+  end is exactly what a capture of the display shows as a tear (the Cubie
+  measurements below checked that criterion against its capture).
 - `B_WAIT_FOR_RETRACE` drawing needs no wait of its own any more: it is
   copied at the next blank like everything else. It no longer paces the
   drawing program at the refresh rate (`retrace_test draw` reports hundreds
@@ -99,6 +107,14 @@ The drawing program ran at 123 to 142 full-screen frames a second (it no
 longer waits), the window moved 115 to 144 times a second; the display
 showed 60 of each. An earlier single-threaded build copied a 4800x2000 px
 window in 9.2 ms.
+
+With the scan line read from the hardware (22:12, the same two loads):
+3503 and 3568 flushes a minute, 6866 and 10981 rectangles, 0 behind the
+scan at either end, longest flush 10.0 and 5.4 ms. The DRM vblank
+timestamps are 16.667 ms apart and mark the start of the active scan,
+433 us after the blank's interrupt (62 blanking lines of 7.5 us): the
+flush thread starts with that much head start before the scan reaches
+row 0 (`retrace/vblprobe`).
 
 Trap: a boot cut short by a power cycle leaves
 `~/config/settings/kernel/drivers/amdgpu_drm.starting` behind, and the next
