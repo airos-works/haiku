@@ -6,11 +6,17 @@
 #define MULTI_AUDIO_ADDON_H
 
 
+#include <vector>
+
+#include <Locker.h>
 #include <MediaDefs.h>
 #include <MediaAddOn.h>
 #include <Message.h>
+#include <String.h>
 
 class BEntry;
+class BLooper;
+class MultiAudioDevice;
 
 
 class MultiAudioAddOn : public BMediaAddOn {
@@ -29,15 +35,36 @@ public:
 	virtual	status_t	AutoStart(int count, BMediaNode** _node,
 							int32* _internalID, bool* _hasMore);
 
+			// called by the device watcher when /dev/audio/hmulti changed
+			void		DevicesChanged();
+			// called by a node when it lets go of its device
+			void		DeviceReleased(MultiAudioDevice* device);
+
 private:
-			status_t	_RecursiveScan(const char* path, BEntry* rootEntry = NULL,
-							uint32 depth = 0);
+			struct device_entry {
+				MultiAudioDevice*	device;
+				int32				id;
+				BString				path;
+			};
+
+			bool		_UpdateDevices();
+			void		_ScanDevicePaths(const char* rootPath,
+							BEntry* rootEntry, uint32 depth,
+							std::vector<BString>& paths);
+			void		_WatchDevices();
+			void		_WatchDirectory(const char* path, bool recursive);
+			MultiAudioDevice* _DeviceFor(int32 id);
 			void		_SaveSettings();
 			void		_LoadSettings();
 
 private:
 	status_t 		fInitStatus;
-	BList			fDevices;
+	BLocker			fLock;
+	std::vector<device_entry> fDevices;
+	std::vector<MultiAudioDevice*> fRetiredDevices;
+		// unplugged, but their node may still hold them
+	int32			fNextID;
+	BLooper*		fWatcher;
 
 	BMessage		fSettings;
 		// loaded from settings directory
