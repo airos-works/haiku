@@ -169,6 +169,23 @@ What the flush needed on the way there, each found by the CRC:
   as the scan does (rects side by side had been copied one after the
   other, the later ones behind the scan).
 
+### Framework 13, 2026-10-16 06:58 (the flush, two displays)
+
+Radeon 760M (DCN 3.1) driving the 2256x1504 panel (eDP-1) and a 4K
+monitor (DP-2), a 6096x2160 frame buffer, two flush targets at their own
+blanks. The arm of the flush that the X399 could not show: the blank
+interrupt of this GPU, and so the retrace semaphore, comes 0.3 to 0.65 ms
+*after* the scan has begun (the hardware scan line was at row 46 to 128
+when the semaphore woke the thread), and a core in a deep idle state took
+up to a millisecond more to wake. The flush therefore wakes from the
+hardware's scan-start time (the scan-line hook returns it with the frame
+period), sleeps until 1.5 ms before the next scan and spins the rest, and
+flips the shadows 4 ms before. Loads of `retrace_test` on both outputs:
+3441 flushes a minute on DP-2 and 2028 on eDP-1 under window moves at 132
+to 154 a second, redraws at 211 a second and scrolls at 135 a second;
+before the wake change 67 copies began behind the scan on DP-2 (top rows),
+9 on eDP-1.
+
 ### Cubie A7S, 2026-10-15 23:28 (the flush, ARM64)
 
 DisplayPort 1920x1080 at 60 Hz, `sunxi_display`'s TCON interrupt semaphore,
