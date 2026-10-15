@@ -227,8 +227,9 @@ private:
 									int32 shadowSlot, int32 shadow);
 	static	status_t			_FlushThreadEntry(void* data);
 			void				_FlushThread(FlushTarget& target);
+			int32				_FlipShadow();
 			void				_FlushPending(FlushTarget& target,
-									bigtime_t blank);
+									bigtime_t blank, int32 which);
 			float				_FlushScanRow(FlushTarget& target,
 									bigtime_t blank);
 			void				_CopyShadowToFront(BRegion& region,

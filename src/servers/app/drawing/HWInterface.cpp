@@ -981,8 +981,8 @@ HWInterface::_StopFlushing()
 		wait_for_thread(target.thread, &result);
 		target.thread = -1;
 		// whatever was still waiting goes to the screen now (both shadows)
-		_FlushPending(target, 0);
-		_FlushPending(target, 0);
+		_FlushPending(target, 0, _FlipShadow());
+		_FlushPending(target, 0, _FlipShadow());
 		_StopFlushWorkers(target);
 	}
 	delete[] fFlushTargets;
@@ -1146,10 +1146,23 @@ HWInterface::_FlushThread(FlushTarget& target)
 		bigtime_t blank = 0;
 		if (!fFlushWanted) {
 			// switched off: whatever is pending goes now, from both shadows
-			_FlushPending(target, 0);
-			_FlushPending(target, 0);
+			_FlushPending(target, 0, _FlipShadow());
+			_FlushPending(target, 0, _FlipShadow());
 			continue;
 		}
+		// The shadows are flipped a few ms before the blank is due, so
+		// that a drawing op's copy into the one left behind (a memcpy of
+		// a few ms at most) is over by the time the flush copies from it:
+		// the copy then starts at the blank, not after a wait.
+		if (target.lastBlank != 0 && target.period > 0) {
+			bigtime_t now = system_time();
+			bigtime_t next = target.lastBlank
+				+ ((now - target.lastBlank) / target.period + 1) * target.period;
+			bigtime_t flipAt = next - 4000;
+			if (flipAt > now + 200)
+				snooze_until(flipAt, B_SYSTEM_TIMEBASE);
+		}
+		int32 which = _FlipShadow();
 		if (system_time() >= target.ignoredUntil) {
 			if (target.retraceSemaphore == -1) {
 				target.retraceSemaphore = target.outputID == 0
@@ -1194,7 +1207,7 @@ HWInterface::_FlushThread(FlushTarget& target)
 					fFlushing = false;
 					fFlushLock.Unlock();
 				}
-				_FlushPending(target, 0);
+				_FlushPending(target, 0, which);
 				return;
 			} else {
 				// the output's semaphore went away: copy as drawn, and
@@ -1204,7 +1217,7 @@ HWInterface::_FlushThread(FlushTarget& target)
 			}
 		}
 
-		_FlushPending(target, blank);
+		_FlushPending(target, blank, which);
 	}
 	debug_printf("app_server: vertical blank flush %s: thread ends (%s)\n",
 		target.name, fQuitFlush ? "quit" : "wake semaphore gone");
@@ -1302,24 +1315,34 @@ HWInterface::_StopFlushWorkers(FlushTarget& target)
 	as a margin): behind it at the start, the rows up to the scan still
 	show the old picture; behind it at the end, the scan overtook the copy.
 */
+/*!	The other shadow becomes the current one (the drawing ops' target),
+	unless a target is still copying from it: then the generation stays.
+	Returns the shadow to copy from. */
+int32
+HWInterface::_FlipShadow()
+{
+	if (!fFlushLock.Lock())
+		return 0;
+	if (fShadowReaders == 0)
+		fShadowCurrent ^= 1;
+	int32 which = fShadowCurrent ^ 1;
+	fFlushLock.Unlock();
+	return which;
+}
+
+
 void
-HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
+HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank, int32 which)
 {
 	BRegion pending;
 	IntRect targetFrame;
 	uint32 queued = 0;
-	int32 which;
 	bool more = false;
 	if (!fFlushLock.Lock())
 		return;
-	// the other shadow becomes the current one, unless another target is
-	// still copying from it: then this one copies the same generation
-	if (fShadowReaders == 0)
-		fShadowCurrent ^= 1;
-	which = fShadowCurrent ^ 1;
 	pending = target.pending[which];
 	target.pending[which].MakeEmpty();
-	more = target.pending[fShadowCurrent].CountRects() > 0;
+	more = target.pending[which ^ 1].CountRects() > 0;
 	targetFrame = target.frame;
 	queued = target.queued;
 	if (pending.CountRects() > 0)
@@ -1334,7 +1357,7 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 	}
 
 	// a drawing op that picked this shadow just before the flip may still
-	// be writing it: a memcpy, over in microseconds to a millisecond
+	// be writing it (the flip came early, so hardly ever): a memcpy
 	for (bigtime_t deadline = 0; ; ) {
 		bool writing = false;
 		if (fFlushLock.Lock()) {
@@ -1347,7 +1370,7 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 		if (!writing)
 			break;
 		if (deadline == 0)
-			deadline = system_time() + 4000;
+			deadline = system_time() + 1500;
 		else if (system_time() > deadline)
 			break;
 		snooze(20);
