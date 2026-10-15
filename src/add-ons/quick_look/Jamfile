@@ -1,0 +1,4 @@
+SubDir HAIKU_TOP src add-ons quick_look ;
+
+SubInclude HAIKU_TOP src add-ons quick_look image ;
+SubInclude HAIKU_TOP src add-ons quick_look text ;

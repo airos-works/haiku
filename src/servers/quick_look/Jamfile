@@ -1,0 +1,19 @@
+SubDir HAIKU_TOP src servers quick_look ;
+
+UsePrivateHeaders interface quicklook shared ;
+
+Application quick_look_server :
+	AddOnManager.cpp
+	GenericPreview.cpp
+	PreviewWindow.cpp
+	QuickLookServer.cpp
+	: be game quicklook localestub [ TargetLibstdc++ ]
+	: quick_look_server.rdef
+;
+
+DoCatalogs quick_look_server :
+	x-vnd.Haiku-quick_look_server
+	:
+	GenericPreview.cpp
+	PreviewWindow.cpp
+;

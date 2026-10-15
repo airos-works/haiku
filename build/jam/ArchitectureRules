@@ -188,7 +188,7 @@ rule ArchitectureSetup architecture
 	}
 	local i ;
 	for i in be bnetapi debug device game locale mail media midi midi2
-			network package root screensaver textencoding tracker
+			network package quicklook root screensaver textencoding tracker
 			translation z {
 		local library = lib$(i).so ;
 		HAIKU_LIBRARY_NAME_MAP_$(architecture)_$(i)
