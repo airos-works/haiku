@@ -60,13 +60,35 @@ HWInterface::HWInterface()
 	fVGADevice(-1),
 	fListeners(20),
 	fRetraceTimeouts(0),
-	fRetraceIgnoredUntil(0)
+	fRetraceIgnoredUntil(0),
+	fFlushLock("vertical blank flush"),
+	fFlushSem(-1),
+	fFlushThread(-1),
+	fQuitFlush(false),
+	fFlushing(false),
+	fLastBlank(0),
+	fBlankPeriod(16667),
+	fFlushCount(0),
+	fFlushRects(0),
+	fFlushLate(0),
+	fFlushWorstLate(0),
+	fFlushLongest(0),
+	fFlushReported(0)
 {
 }
 
 
 HWInterface::~HWInterface()
 {
+	// the derived class, with the buffers, is gone: no draining here
+	if (fFlushThread >= 0) {
+		fFlushing = false;
+		fQuitFlush = true;
+		delete_sem(fFlushSem);
+		status_t result;
+		wait_for_thread(fFlushThread, &result);
+		fFlushThread = -1;
+	}
 }
 
 
@@ -463,6 +485,10 @@ HWInterface::DrawingBuffer() const
 void
 HWInterface::WaitForRetraceBeforeCopy()
 {
+	if (fFlushing) {
+		// every copy waits for the blank
+		return;
+	}
 	if (system_time() < atomic_get64(&fRetraceIgnoredUntil))
 		return;
 
@@ -524,27 +550,270 @@ HWInterface::CopyBackToFront(const BRect& frame)
 	IntRect area(frame);
 	IntRect bufferClip(backBuffer->Bounds());
 
-	if (area.IsValid() && area.Intersects(bufferClip)) {
+	if (!area.IsValid() || !area.Intersects(bufferClip))
+		return B_BAD_VALUE;
 
-		// make sure we don't copy out of bounds
-		area = bufferClip & area;
+	// make sure we don't copy out of bounds
+	area = bufferClip & area;
 
-		bool cursorLocked = fFloatingOverlaysLock.Lock();
-
-		BRegion region((BRect)area);
-		if (IsDoubleBuffered())
-			region.Exclude((clipping_rect)_CursorFrame());
-
-		_CopyBackToFront(region);
-
-		_DrawCursor(area);
-
-		if (cursorLocked)
-			fFloatingOverlaysLock.Unlock();
-
+	if (fFlushing && _QueueForFlush(area))
 		return B_OK;
+
+	return _CopyAreaToFront(area);
+}
+
+
+/*!	Copies the area (within the back buffer) to the screen now, leaving out
+	the cursor's place and drawing the cursor over it. Read locked.
+*/
+status_t
+HWInterface::_CopyAreaToFront(const IntRect& area)
+{
+	bool cursorLocked = fFloatingOverlaysLock.Lock();
+
+	BRegion region((BRect)area);
+	if (IsDoubleBuffered())
+		region.Exclude((clipping_rect)_CursorFrame());
+
+	_CopyBackToFront(region);
+
+	_DrawCursor(area);
+
+	if (cursorLocked)
+		fFloatingOverlaysLock.Unlock();
+
+	return B_OK;
+}
+
+
+// #pragma mark - vertical blank flush
+
+
+/*!	Copies from the back buffer to the front one are not made as the windows
+	draw: they are gathered and made by a thread once a frame, right after
+	the display's vertical blank. A copy that starts at the blank runs ahead
+	of the scan (it is faster), so what the display shows is never half of
+	one picture and half of the next: windows move and scroll without
+	tearing. The thread keeps the interface read locked while it copies, as
+	a drawing window would.
+
+	Without a retrace semaphore the copies are made at once, as before.
+*/
+status_t
+HWInterface::_StartFlushing()
+{
+	if (fFlushThread >= 0)
+		return B_OK;
+
+	fFlushSem = create_sem(0, "vertical blank flush");
+	if (fFlushSem < 0)
+		return fFlushSem;
+
+	fQuitFlush = false;
+	fFlushThread = spawn_thread(_FlushThreadEntry, "vertical blank flush",
+		B_REAL_TIME_DISPLAY_PRIORITY, this);
+	if (fFlushThread < 0) {
+		delete_sem(fFlushSem);
+		fFlushSem = -1;
+		return fFlushThread;
 	}
-	return B_BAD_VALUE;
+
+	fFlushing = true;
+	resume_thread(fFlushThread);
+	return B_OK;
+}
+
+
+void
+HWInterface::_StopFlushing()
+{
+	if (fFlushThread < 0)
+		return;
+
+	// from now on the copies are made as drawn (the switch is made under
+	// the lock, so that nothing is queued after the last drain)
+	if (fFlushLock.Lock()) {
+		fFlushing = false;
+		fFlushLock.Unlock();
+	}
+	fQuitFlush = true;
+	delete_sem(fFlushSem);
+	fFlushSem = -1;
+
+	status_t result;
+	wait_for_thread(fFlushThread, &result);
+	fFlushThread = -1;
+
+	// whatever was still waiting goes to the screen now
+	_FlushPending(0);
+}
+
+
+bool
+HWInterface::_QueueForFlush(const IntRect& area)
+{
+	if (!fFlushLock.Lock())
+		return false;
+	if (!fFlushing) {
+		fFlushLock.Unlock();
+		return false;
+	}
+
+	bool wasEmpty = fPendingFlush.CountRects() == 0;
+	fPendingFlush.Include((clipping_rect)area);
+	fFlushLock.Unlock();
+
+	if (wasEmpty)
+		release_sem_etc(fFlushSem, 1, B_DO_NOT_RESCHEDULE);
+	return true;
+}
+
+
+/*static*/ status_t
+HWInterface::_FlushThreadEntry(void* data)
+{
+	((HWInterface*)data)->_FlushThread();
+	return B_OK;
+}
+
+
+void
+HWInterface::_FlushThread()
+{
+	while (!fQuitFlush) {
+		// something to copy?
+		if (acquire_sem(fFlushSem) != B_OK)
+			break;
+		if (fQuitFlush)
+			break;
+
+		// the blank
+		bigtime_t blank = 0;
+		if (system_time() >= fRetraceIgnoredUntil) {
+			// a blank missed at 60 Hz still fits, and one at 24 Hz
+			status_t status = WaitForRetrace(50000);
+			if (status == B_OK) {
+				blank = system_time();
+				fRetraceTimeouts = 0;
+				if (fLastBlank != 0) {
+					bigtime_t period = blank - fLastBlank;
+					if (period > 2000 && period < 60000)
+						fBlankPeriod = period;
+				}
+				fLastBlank = blank;
+			} else if (status == B_TIMED_OUT) {
+				// the display does not report blanks right now
+				if (++fRetraceTimeouts >= 3) {
+					fRetraceTimeouts = 0;
+					fRetraceIgnoredUntil = system_time() + 1000000;
+				}
+			} else {
+				// no retrace semaphore: copy as drawn, from now on
+				if (fFlushLock.Lock()) {
+					fFlushing = false;
+					fFlushLock.Unlock();
+				}
+				_FlushPending(0);
+				break;
+			}
+		}
+
+		_FlushPending(blank);
+	}
+}
+
+
+/*!	Copies what is waiting, in order from the top of the screen: a region's
+	rectangles come sorted that way. When the blank is known, each copy is
+	checked against where the scan should be by then (a frame's time over
+	the buffer's rows, which leaves the blank's own lines as a margin).
+*/
+void
+HWInterface::_FlushPending(bigtime_t blank)
+{
+	BRegion pending;
+	if (fFlushLock.Lock()) {
+		pending = fPendingFlush;
+		fPendingFlush.MakeEmpty();
+		fFlushLock.Unlock();
+	}
+	int32 count = pending.CountRects();
+	if (count == 0)
+		return;
+
+	if (!LockParallelAccess())
+		return;
+
+	RenderingBuffer* backBuffer = BackBuffer();
+	if (backBuffer == NULL || FrontBuffer() == NULL) {
+		UnlockParallelAccess();
+		return;
+	}
+	// the buffer may have changed since these were queued
+	IntRect bufferClip(backBuffer->Bounds());
+	int32 rows = backBuffer->Height();
+	bigtime_t period = fBlankPeriod;
+	bigtime_t start = system_time();
+	float worst = 0;
+	int64 late = 0;
+
+	for (int32 i = 0; i < count; i++) {
+		IntRect area(pending.RectAt(i));
+		if (!area.Intersects(bufferClip))
+			continue;
+		area = bufferClip & area;
+		if (blank != 0 && rows > 0) {
+			// where the scan is when this copy starts
+			float scan = float(system_time() - blank) / period * rows;
+			if (scan > area.top)
+				worst = max_c(worst, (scan - area.top) / rows);
+		}
+		_CopyAreaToFront(area);
+		if (blank != 0 && rows > 0) {
+			float scan = float(system_time() - blank) / period * rows;
+			if (scan > area.bottom + 1) {
+				late++;
+				worst = max_c(worst, (scan - area.bottom - 1) / rows);
+			}
+		}
+	}
+
+	UnlockParallelAccess();
+
+	bigtime_t took = system_time() - start;
+	fFlushCount++;
+	fFlushRects += count;
+	fFlushLate += late;
+	fFlushWorstLate = max_c(fFlushWorstLate, worst);
+	fFlushLongest = max_c(fFlushLongest, took);
+
+	if (start - fFlushReported > 60000000) {
+		if (fFlushReported != 0) {
+			debug_printf("app_server: vertical blank flush: %" B_PRId64
+				" flushes, %" B_PRId64 " rects, %" B_PRId64 " behind the scan"
+				" (worst %.2f frames), longest copy %.1f ms, period %.3f ms\n",
+				fFlushCount, fFlushRects, fFlushLate, fFlushWorstLate,
+				fFlushLongest / 1000.0, period / 1000.0);
+		}
+		fFlushReported = start;
+		fFlushCount = 0;
+		fFlushRects = 0;
+		fFlushLate = 0;
+		fFlushWorstLate = 0;
+		fFlushLongest = 0;
+	}
+}
+
+
+void
+HWInterface::GetFlushStatistics(int64& flushes, int64& rects, int64& late,
+	float& worstLate, bigtime_t& longest)
+{
+	flushes = fFlushCount;
+	rects = fFlushRects;
+	late = fFlushLate;
+	worstLate = fFlushWorstLate;
+	longest = fFlushLongest;
 }
 
 

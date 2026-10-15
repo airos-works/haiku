@@ -215,7 +215,12 @@ AccelerantHWInterface::Initialize()
 			// _OpenAccelerant() failed, try to open next graphics card
 		}
 
-		return fCardFD >= 0 ? B_OK : fCardFD;
+		if (fCardFD < 0)
+			return fCardFD;
+
+		// copies to the screen are made at the vertical blanks
+		_StartFlushing();
+		return B_OK;
 	}
 	return ret;
 }
@@ -540,6 +545,8 @@ AccelerantHWInterface::_UpdateHooksAfterModeChange()
 status_t
 AccelerantHWInterface::Shutdown()
 {
+	_StopFlushing();
+
 	if (fDisplayChangeThread >= 0) {
 		if (fAccSetDisplayChangePort != NULL)
 			fAccSetDisplayChangePort(-1, 0);

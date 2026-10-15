@@ -191,8 +191,26 @@ public:
 	// while CopyBackToFront() actually performs the operation
 	virtual	status_t			CopyBackToFront(const BRect& frame);
 
+			bool				IsFlushingAtRetrace() const
+									{ return fFlushing; }
+			void				GetFlushStatistics(int64& flushes,
+									int64& rects, int64& late,
+									float& worstLate, bigtime_t& longest);
+
 protected:
 	virtual	void				_CopyBackToFront(/*const*/ BRegion& region);
+
+	// The copies to the front buffer are gathered, and made once per frame
+	// right after the vertical blank, ahead of the scan: a flush thread.
+			status_t			_StartFlushing();
+			void				_StopFlushing();
+
+private:
+			status_t			_CopyAreaToFront(const IntRect& area);
+			bool				_QueueForFlush(const IntRect& area);
+	static	status_t			_FlushThreadEntry(void* data);
+			void				_FlushThread();
+			void				_FlushPending(bigtime_t blank);
 
 public:
 	// TODO: Just a quick and primitive way to get single buffered mode working.
@@ -306,6 +324,25 @@ private:
 
 			int32				fRetraceTimeouts;
 			bigtime_t			fRetraceIgnoredUntil;
+
+			// the vertical blank flush
+			BLocker				fFlushLock;
+			BRegion				fPendingFlush;
+									// in buffer pixels; fFlushLock
+			sem_id				fFlushSem;
+			thread_id			fFlushThread;
+			volatile bool		fQuitFlush;
+			volatile bool		fFlushing;
+									// copies go through the thread
+
+			bigtime_t			fLastBlank;
+			bigtime_t			fBlankPeriod;
+			int64				fFlushCount;
+			int64				fFlushRects;
+			int64				fFlushLate;
+			float				fFlushWorstLate;
+			bigtime_t			fFlushLongest;
+			bigtime_t			fFlushReported;
 };
 
 #endif // HW_INTERFACE_H
