@@ -184,7 +184,11 @@ flips the shadows 4 ms before. Loads of `retrace_test` on both outputs:
 3441 flushes a minute on DP-2 and 2028 on eDP-1 under window moves at 132
 to 154 a second, redraws at 211 a second and scrolls at 135 a second;
 before the wake change 67 copies began behind the scan on DP-2 (top rows),
-9 on eDP-1.
+9 on eDP-1; with it (07:40) 17 to 30 a minute on DP-2 (up to 0.19 frames,
+the top rows) and 2 on eDP-1 remain: the copy still began up to a
+millisecond after the predicted scan start there at times. Open: whether
+the sleep overshoots further on that machine, the wait for a shadow write
+under way, or the hook's scan-start time on DCN.
 
 ### Cubie A7S, 2026-10-15 23:28 (the flush, ARM64)
 
