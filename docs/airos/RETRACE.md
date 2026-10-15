@@ -82,6 +82,30 @@ primary head; `rpi_display`: the first output shown) and windows on the rest
 can still tear. No page flipping: the copy is timed instead, which works
 while the copy outpaces the scan.
 
+### WX 5100 on the X399, 2026-10-15 (the flush)
+
+One DELL P2415Q on DP-1, 3840x2160 at 60 Hz, the desktop at 200 %. Five
+targets (the screen and the four DisplayPort connectors), DP-1 at its own
+blanks. From the syslog during `retrace_test draw 50 --size 3840x1080` and
+`move 50 --size 1600x900`:
+
+| Minute | Flushes | Rectangles | Behind the scan | Longest flush | Bands |
+| --- | --- | --- | --- | --- | --- |
+| drawing full screen | 3499 | 6950 | 0 | 6.6 ms | 2 |
+| moving a 3200x1800 px window | 3569 | 11156 | 0 | 5.8 ms | 2 |
+| idle desktop | 241 | 540 | 0 | 0.0 ms | 1 |
+
+The drawing program ran at 123 to 142 full-screen frames a second (it no
+longer waits), the window moved 115 to 144 times a second; the display
+showed 60 of each. An earlier single-threaded build copied a 4800x2000 px
+window in 9.2 ms.
+
+Trap: a boot cut short by a power cycle leaves
+`~/config/settings/kernel/drivers/amdgpu_drm.starting` behind, and the next
+boot runs on the plain `framebuffer` driver with no retrace semaphore: the
+flush then switches itself off (`vertical blank flush: no retrace
+semaphore`) and everything is copied as drawn, as before.
+
 ## Checking it
 
 `retrace_test` (in `src/tests/servers/app/retrace`, in the Cubie lab image):
