@@ -618,6 +618,8 @@ struct HWInterface::FlushTarget {
 	thread_id		thread;
 	sem_id			wake;			// something is pending
 	BRegion			pending;		// fFlushLock
+	uint32			queued;			// counts, fFlushLock: each queueing,
+	uint32			flushed;		// and the queueing a flush got to
 	FlushWorker*	workers;
 	int32			workerCount;
 
@@ -743,6 +745,7 @@ HWInterface::_AddFlushTarget(uint32 outputID, const char* name)
 	target.flushes = target.rects = target.late = 0;
 	target.worstLate = 0;
 	target.longest = target.reported = 0;
+	target.queued = target.flushed = 0;
 	target.wake = create_sem(0, "vertical blank flush");
 	if (target.wake < 0)
 		return target.wake;
@@ -879,6 +882,7 @@ HWInterface::_QueueForFlush(const IntRect& area)
 				continue;
 			bool wasEmpty = target.pending.CountRects() == 0;
 			target.pending.Include((clipping_rect)(target.frame & area));
+			target.queued++;
 			if (wasEmpty)
 				release_sem_etc(target.wake, 1, B_DO_NOT_RESCHEDULE);
 			routed = true;
@@ -888,6 +892,7 @@ HWInterface::_QueueForFlush(const IntRect& area)
 		FlushTarget& target = fFlushTargets[0];
 		bool wasEmpty = target.pending.CountRects() == 0;
 		target.pending.Include((clipping_rect)area);
+		target.queued++;
 		if (wasEmpty)
 			release_sem_etc(target.wake, 1, B_DO_NOT_RESCHEDULE);
 	}
@@ -1069,14 +1074,32 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 {
 	BRegion pending;
 	IntRect targetFrame;
+	uint32 queued = 0;
 	if (fFlushLock.Lock()) {
 		pending = target.pending;
 		target.pending.MakeEmpty();
 		targetFrame = target.frame;
+		queued = target.queued;
 		fFlushLock.Unlock();
 	}
 	if (pending.CountRects() == 0)
 		return;
+
+	// whatever happens below, what was queued counts as dealt with
+	struct Flushed {
+		Flushed(HWInterface* interface, FlushTarget& target, uint32 queued)
+			: fInterface(interface), fTarget(target), fQueued(queued) {}
+		~Flushed()
+		{
+			if (fInterface->fFlushLock.Lock()) {
+				fTarget.flushed = fQueued;
+				fInterface->fFlushLock.Unlock();
+			}
+		}
+		HWInterface* fInterface;
+		FlushTarget& fTarget;
+		uint32 fQueued;
+	} flushed(this, target, queued);
 
 	if (!LockParallelAccess())
 		return;
@@ -1223,6 +1246,42 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 		target.late = 0;
 		target.worstLate = 0;
 		target.longest = 0;
+	}
+}
+
+
+/*!	Waits until everything queued so far has been copied to the screen (or
+	the timeout passes): for reading the screen back. Not to be called with
+	the interface locked, since the flush threads need it.
+*/
+void
+HWInterface::WaitForPendingFlush(bigtime_t timeout)
+{
+	if (!fFlushing || fFlushTargets == NULL)
+		return;
+
+	uint32 want[kMaxFlushTargets];
+	int32 count = 0;
+	if (!fFlushLock.Lock())
+		return;
+	count = fFlushTargetCount;
+	for (int32 i = 0; i < count; i++)
+		want[i] = fFlushTargets[i].queued;
+	fFlushLock.Unlock();
+
+	bigtime_t deadline = system_time() + timeout;
+	while (true) {
+		bool done = true;
+		if (!fFlushLock.Lock())
+			return;
+		for (int32 i = 0; i < count; i++) {
+			if ((int32)(fFlushTargets[i].flushed - want[i]) < 0)
+				done = false;
+		}
+		fFlushLock.Unlock();
+		if (done || system_time() >= deadline)
+			return;
+		snooze(1000);
 	}
 }
 

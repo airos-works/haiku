@@ -1467,6 +1467,13 @@ DrawingEngine::DumpToBitmap()
 }
 
 
+void
+DrawingEngine::WaitForPendingFlush()
+{
+	fGraphicsCard->WaitForPendingFlush(100000);
+}
+
+
 status_t
 DrawingEngine::ReadBitmap(ServerBitmap* bitmap, bool drawCursor, BRect bounds)
 {
