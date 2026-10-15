@@ -77,6 +77,10 @@ HWInterface::HWInterface()
 	fFlushKnobThread(-1),
 	fFlushWanted(false)
 {
+	for (int32 i = 0; i < 32; i++)
+		fShadowWrites[i].used = false;
+	for (int32 i = 0; i < 8; i++)
+		fCopying[i] = IntRect(0, 0, -1, -1);
 }
 
 
@@ -554,10 +558,43 @@ HWInterface::CopyBackToFront(const BRect& frame)
 	if (fFlushing) {
 		// what is drawn goes into the shadow now, from which the flush
 		// copies at the blank: a drawing op under way by then does not
-		// get into the frame
+		// get into the frame. Not while the flush is copying the area
+		// (a few ms at most), and the flush keeps off it meanwhile.
 		RenderingBuffer* shadow = fFlushShadow.Get();
+		int32 slot = -1;
 		if (shadow != NULL && shadow->Width() == backBuffer->Width()
-			&& shadow->Height() == backBuffer->Height()) {
+			&& shadow->Height() == backBuffer->Height()
+			&& fFlushLock.Lock()) {
+			bigtime_t deadline = 0;
+			while (true) {
+				bool copying = false;
+				for (int32 i = 0; i < 8; i++) {
+					if (fCopying[i].IsValid() && fCopying[i].Intersects(area)) {
+						copying = true;
+						break;
+					}
+				}
+				if (!copying)
+					break;
+				if (deadline == 0)
+					deadline = system_time() + 20000;
+				else if (system_time() > deadline)
+					break;
+				fFlushLock.Unlock();
+				snooze(50);
+				if (!fFlushLock.Lock())
+					return _CopyAreaToFront(area);
+			}
+			for (int32 i = 0; i < 32; i++) {
+				if (!fShadowWrites[i].used) {
+					fShadowWrites[i].rect = area;
+					fShadowWrites[i].used = true;
+					slot = i;
+					break;
+				}
+			}
+			fFlushLock.Unlock();
+
 			uint32 srcBPR = backBuffer->BytesPerRow();
 			uint32 dstBPR = shadow->BytesPerRow();
 			uint8* src = (uint8*)backBuffer->Bits() + area.top * srcBPR
@@ -571,8 +608,12 @@ HWInterface::CopyBackToFront(const BRect& frame)
 				dst += dstBPR;
 			}
 		}
-		if (_QueueForFlush(area))
+		if (_QueueForFlush(area, slot))
 			return B_OK;
+		if (slot >= 0 && fFlushLock.Lock()) {
+			fShadowWrites[slot].used = false;
+			fFlushLock.Unlock();
+		}
 	}
 
 	return _CopyAreaToFront(area);
@@ -616,6 +657,50 @@ HWInterface::_CopyBackToFront(/*const*/ BRegion& region)
 		// offset to left top pixel in source buffer (always B_RGBA32)
 		uint8* srcOffset = src + r.top * srcBPR + r.left * 4;
 		_CopyToFront(srcOffset, srcBPR, r.left, r.top, r.right, r.bottom);
+	}
+}
+
+
+/*!	The flush is about to copy the rect: waits while a write into the
+	shadow (a memcpy, short) touches it, then notes the rect so that new
+	writes keep off it until _EndCopying(). */
+void
+HWInterface::_BeginCopying(const IntRect& rect, int32 band)
+{
+	if (!fFlushLock.Lock())
+		return;
+	bigtime_t deadline = 0;
+	while (true) {
+		bool writing = false;
+		for (int32 i = 0; i < 32; i++) {
+			if (fShadowWrites[i].used && fShadowWrites[i].rect.IsValid()
+				&& fShadowWrites[i].rect.Intersects(rect)) {
+				writing = true;
+				break;
+			}
+		}
+		if (!writing)
+			break;
+		if (deadline == 0)
+			deadline = system_time() + 5000;
+		else if (system_time() > deadline)
+			break;
+		fFlushLock.Unlock();
+		snooze(20);
+		if (!fFlushLock.Lock())
+			return;
+	}
+	fCopying[band] = rect;
+	fFlushLock.Unlock();
+}
+
+
+void
+HWInterface::_EndCopying(int32 band)
+{
+	if (fFlushLock.Lock()) {
+		fCopying[band] = IntRect(0, 0, -1, -1);
+		fFlushLock.Unlock();
 	}
 }
 
@@ -710,6 +795,7 @@ struct HWInterface::FlushWorker {
 	float			endedRow;
 	FlushTarget*	target;
 	bigtime_t		blank;
+	int32			band;
 };
 
 
@@ -1038,10 +1124,12 @@ HWInterface::_UpdateFlushTargets()
 
 
 bool
-HWInterface::_QueueForFlush(const IntRect& area)
+HWInterface::_QueueForFlush(const IntRect& area, int32 shadowSlot)
 {
 	if (!fFlushLock.Lock())
 		return false;
+	if (shadowSlot >= 0)
+		fShadowWrites[shadowSlot].used = false;
 	if (!fFlushing) {
 		fFlushLock.Unlock();
 		return false;
@@ -1179,7 +1267,10 @@ HWInterface::_FlushWorkerEntry(void* data)
 		worker->began = system_time();
 		worker->beganRow = interface->_FlushScanRow(*worker->target,
 			worker->blank);
+		interface->_BeginCopying(IntRect(worker->region.Frame()),
+			1 + worker->band);
 		interface->_CopyShadowToFront(worker->region);
+		interface->_EndCopying(1 + worker->band);
 		worker->ended = system_time();
 		worker->endedRow = interface->_FlushScanRow(*worker->target,
 			worker->blank);
@@ -1216,6 +1307,7 @@ HWInterface::_StartFlushWorkers(FlushTarget& target)
 		worker.interface = this;
 		worker.target = &target;
 		worker.blank = 0;
+		worker.band = i;
 		worker.start = create_sem(0, "vertical blank flush band");
 		worker.thread = worker.start < 0 ? -1 : spawn_thread(
 			_FlushWorkerEntry, "vertical blank flush band",
@@ -1338,8 +1430,11 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 				behind = true;
 				worst = max_c(worst, (scan - r.top) / rows);
 			}
-			BRegion one((BRect)IntRect(r.left, r.top, r.right, r.bottom));
+			IntRect rect(r.left, r.top, r.right, r.bottom);
+			BRegion one((BRect)rect);
+			_BeginCopying(rect, 0);
 			_CopyShadowToFront(one);
+			_EndCopying(0);
 			scan = _FlushScanRow(target, blank);
 			if (scan > r.bottom + 1) {
 				behind = true;
@@ -1366,7 +1461,9 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 			}
 		}
 		float beganRow = _FlushScanRow(target, blank);
+		_BeginCopying(IntRect(first.Frame()), 0);
 		_CopyShadowToFront(first);
+		_EndCopying(0);
 		float endedRow = _FlushScanRow(target, blank);
 		for (int32 i = 1; i < bands; i++) {
 			while (acquire_sem(fFlushDoneSem) == B_INTERRUPTED)
