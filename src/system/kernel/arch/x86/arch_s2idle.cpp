@@ -14,6 +14,12 @@
 	The SCI ends the sleep: the lid or the power button (through the
 	embedded controller), or the end of a test timeout.
 
+	The firmware raises the SCI for its own business, too (the embedded
+	controller reports the battery about once a minute). The sleep only ends
+	when a driver reported a wakeup event meanwhile (a button pressed, the
+	lid opened) or the lid is open; otherwise the ACPI threads get to handle
+	the event and the system sleeps on, as with Linux' acpi_s2idle_wake().
+
 	This is the platform part only: what the devices do is up to their
 	drivers' suspend hooks; a device that keeps running keeps the SoC out of
 	its deepest state, but not the machine from sleeping.
@@ -108,6 +114,9 @@ static bool sLPS0Probed;
 static volatile uint8* sPMC;
 static volatile uint8* sFCH;
 static bool sPMCProbed;
+
+static char sLidPath[128];
+static bool sLidProbed;
 
 static int32 sSCI = -1;
 static int32 sActive;
@@ -330,6 +339,71 @@ fch_time(uint32 offset)
 }
 
 
+//	#pragma mark - wakeup events
+
+
+static void
+lid_probe()
+{
+	if (sLidProbed)
+		return;
+	sLidProbed = true;
+
+	if (sACPI->get_device("PNP0C0D", 0, sLidPath, sizeof(sLidPath)) != B_OK)
+		sLidPath[0] = '\0';
+}
+
+
+static bool
+lid_is_open()
+{
+	if (sLidPath[0] == '\0')
+		return false;
+
+	char method[sizeof(sLidPath) + 8];
+	snprintf(method, sizeof(method), "%s._LID", sLidPath);
+
+	acpi_data result = { ACPI_ALLOCATE_BUFFER, NULL };
+	bool open = false;
+	if (sACPI->evaluate_method(NULL, method, NULL, &result) == B_OK) {
+		acpi_object_type* object = (acpi_object_type*)result.pointer;
+		open = object != NULL && object->object_type == ACPI_TYPE_INTEGER
+			&& object->integer.integer != 0;
+	}
+	free(result.pointer);
+	return open;
+}
+
+
+/*!	Lets the ACPI threads handle the event that raised the SCI (the embedded
+	controller's query, the notifications it sends) and tells whether it is
+	one to wake up for. Without timer interrupts in the sleep, the timer runs
+	again for that time.
+*/
+static bool
+wakeup_is_real(int32 wakeupEvents, bool timerStopped)
+{
+	if (timerStopped) {
+		InterruptsLocker _;
+		arch_timer_set_hardware_timer(1000);
+	}
+
+	bool real = false;
+	for (int32 i = 0; i < 20 && !real; i++) {
+		snooze(10000);
+		real = device_manager_wakeup_events() != wakeupEvents;
+	}
+	if (!real)
+		real = lid_is_open();
+
+	if (timerStopped && !real) {
+		InterruptsLocker _;
+		arch_timer_clear_hardware_timer();
+	}
+	return real;
+}
+
+
 //	#pragma mark - the sleep
 
 
@@ -373,6 +447,7 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 
 	lps0_probe();
 	pmc_probe();
+	lid_probe();
 	if (sSCI < 0)
 		sSCI = find_sci();
 	if (sSCI < 0)
@@ -442,11 +517,22 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 		arch_timer_clear_hardware_timer();
 	}
 
+	int32 wakeupEvents = device_manager_wakeup_events();
 	atomic_set(&sActive, 1);
 	uint32 rounds = 0;
-	while (atomic_get(&sWakeReason) == 0) {
-		cpu_idle();
-		rounds++;
+	uint32 ignoredWakeups = 0;
+	while (true) {
+		while (atomic_get(&sWakeReason) == 0) {
+			cpu_idle();
+			rounds++;
+		}
+		if (atomic_get(&sWakeReason) != X86_S2IDLE_WAKE_SCI
+			|| wakeup_is_real(wakeupEvents, args->timeout_ms == 0)) {
+			break;
+		}
+
+		ignoredWakeups++;
+		atomic_set(&sWakeReason, 0);
 	}
 	atomic_set(&sActive, 0);
 	bigtime_t slept = system_time() - start;
@@ -495,11 +581,12 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 	args->s0i3_entered = entry != entryBefore && exit > entry;
 	args->s0i3_us = args->s0i3_entered ? (exit - entry) / 48 : 0;
 
-	INFO("woke up (%s) after %" B_PRIdBIGTIME " ms, %" B_PRIu32 " rounds; OS "
-		"hint %s/%s; S0i3 %s (%" B_PRIu64 " ms of the last); PMC idle mask %#"
-		B_PRIx32 "\n",
+	INFO("woke up (%s) after %" B_PRIdBIGTIME " ms, %" B_PRIu32 " rounds, %"
+		B_PRIu32 " SCIs slept through; OS hint %s/%s; S0i3 %s (%" B_PRIu64
+		" ms of the last); PMC idle mask %#" B_PRIx32 "\n",
 		args->wake_reason == X86_S2IDLE_WAKE_SCI ? "SCI" : "timeout",
-		slept / 1000, rounds, strerror(hintStatus), strerror(exitHintStatus),
+		slept / 1000, rounds, ignoredWakeups, strerror(hintStatus),
+		strerror(exitHintStatus),
 		args->s0i3_entered ? "entered" : "not entered", args->s0i3_us / 1000,
 		idleMask);
 	return B_OK;

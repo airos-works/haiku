@@ -44,6 +44,9 @@ enum {
 status_t device_manager_suspend(int32 state, uint32 flags);
 status_t device_manager_resume(uint32 flags);
 
+void device_manager_wakeup_event(const char* source);
+int32 device_manager_wakeup_events(void);
+
 #ifdef __cplusplus
 }
 #endif

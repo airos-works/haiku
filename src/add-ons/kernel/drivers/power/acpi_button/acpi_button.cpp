@@ -11,6 +11,7 @@
 #include <ACPI.h>
 
 #include <fs/select_sync_pool.h>
+#include <kdevice_manager.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -53,10 +54,12 @@ acpi_button_notify_handler(acpi_handle _device, uint32 value, void *context)
 	if (value == ACPI_NOTIFY_BUTTON_SLEEP) {
 		TRACE("sleep\n");
 		device->last_status = 1;
+		device_manager_wakeup_event("button");
 		if (device->select_pool != NULL)
 			notify_select_event_pool(device->select_pool, B_SELECT_READ);
 	} else if (value == ACPI_NOTIFY_BUTTON_WAKEUP) {
 		TRACE("wakeup\n");
+		device_manager_wakeup_event("button");
 	} else {
 		ERROR("unknown notification\n");
 	}
@@ -70,6 +73,7 @@ acpi_button_fixed_handler(void *context)
 	acpi_button_device_info *device = (acpi_button_device_info *)context;
 	TRACE("sleep\n");
 	device->last_status = 1;
+	device_manager_wakeup_event("button");
 	if (device->select_pool != NULL)
 		notify_select_event_pool(device->select_pool, B_SELECT_READ);
 	return B_OK;
