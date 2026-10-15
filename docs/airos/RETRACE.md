@@ -122,6 +122,39 @@ boot runs on the plain `framebuffer` driver with no retrace semaphore: the
 flush then switches itself off (`vertical blank flush: no retrace
 semaphore`) and everything is copied as drawn, as before.
 
+### Torn frames counted at the WX 5100's scanout, 2026-10-15 23:10
+
+The display controller computes a CRC of every frame it sends to the
+monitor (DC's stream CRC; `DRM_HAIKU_IOCTL_CRC` in amdgpu_drm, with a
+window of the frame since the Deskbar's CPU meter changes every 250 ms;
+temporal dithering is switched to truncation while it runs). With
+`retrace_test draw` alternating two greys a frame, exactly two CRCs are
+whole frames; a frame made of both pictures (a tear) has another.
+`retrace/crcwatch` on the X399 reads the CRC after each blank;
+`retrace/x399-crc-ab.sh` runs the comparison, switching the flush off and
+on with the `no_vblank_flush` settings file (10 s, 598 frames each):
+
+| Load | Flush off (copies as drawn) | Flush on |
+| --- | --- | --- |
+| 3840x1080 window (the whole screen at 200 %) drawn as fast as it can, no wait | 382 torn | 0 |
+| 1600x900 window drawn as fast as it can, no wait | 581 torn | 0 |
+| 1600x900 window drawn in updates | 0 (B_WAIT_FOR_RETRACE) | 0 |
+| 3840x1080 window drawn in updates | 0 (B_WAIT_FOR_RETRACE) | 0 |
+| 1600x900 window with B_WAIT_FOR_RETRACE | 0 | 0 |
+| idle desktop | 0 | 0 |
+
+The old code tears whenever a program draws without B_WAIT_FOR_RETRACE
+(most do), and already waited for the blank with it. The flush shows only
+whole frames in every case; its own count agreed (2 of 3046 flushes behind
+the hardware's scan line in that minute, at 0.00 frames).
+
+Two things the flush needed on the way there, both found by the CRC: the
+flush copies from a *shadow* of the back buffer, filled when a drawing op
+queues its area, so that a drawing op under way does not get into a
+frame (3 to 8 % of the frames were made of both pictures before); and it
+never waits: a rect whose shadow is being written is left for the next
+blank (waiting for the write delayed 457 of 3064 copies behind the scan).
+
 ## Checking it
 
 `retrace_test` (in `src/tests/servers/app/retrace`, in the Cubie lab image):
@@ -133,6 +166,9 @@ retrace_test move 10 [--size WxH]
 retrace_test scroll 10 [--size WxH]
 retrace_test lines --line sunxi
 ```
+
+`retrace_test draw --update` waits for each `Draw()` (the window's thread)
+so that every frame is a real update.
 
 `move` drags a window of stripes across the screen and back as the mouse
 would (a move every 4 ms); `scroll` scrolls a view of stripes up and down.

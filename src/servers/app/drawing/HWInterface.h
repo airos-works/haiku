@@ -204,6 +204,7 @@ public:
 									// until what was queued so far is on
 									// the screen (not locked)
 
+
 protected:
 	virtual	void				_CopyBackToFront(/*const*/ BRegion& region);
 
@@ -222,13 +223,23 @@ private:
 			struct FlushWorker;
 			struct FlushTarget;
 			status_t			_CopyAreaToFront(const IntRect& area);
-			bool				_QueueForFlush(const IntRect& area);
+			bool				_QueueForFlush(const IntRect& area,
+									int32 shadowSlot = -1);
 	static	status_t			_FlushThreadEntry(void* data);
 			void				_FlushThread(FlushTarget& target);
 			void				_FlushPending(FlushTarget& target,
 									bigtime_t blank);
 			float				_FlushScanRow(FlushTarget& target,
 									bigtime_t blank);
+			void				_CopyShadowToFront(BRegion& region);
+			bool				_BeginCopying(const IntRect& rect,
+									int32 band);
+			void				_RequeueForFlush(FlushTarget& target,
+									const BRegion& region);
+			void				_EndCopying(int32 band);
+	static	status_t			_FlushKnobEntry(void* data);
+			void				_FlushKnobThread();
+			void				_SetFlushing(bool flushing);
 	static	status_t			_FlushWorkerEntry(void* data);
 			void				_StartFlushWorkers(FlushTarget& target);
 			void				_StopFlushWorkers(FlushTarget& target);
@@ -358,6 +369,22 @@ private:
 			volatile bool		fQuitFlush;
 			volatile bool		fFlushing;
 									// copies go through the threads
+			thread_id			fFlushKnobThread;
+			bool				fFlushWanted;
+
+			// what the flush copies from: the drawing as it was queued, so
+			// that a drawing op under way does not get into a frame
+			ObjectDeleter<RenderingBuffer>
+								fFlushShadow;
+			// a write into the shadow and the flush's copy of the same
+			// area keep off each other (fFlushLock): the writes under
+			// way, and the rects being copied (one per band)
+			struct ShadowWrite {
+				IntRect			rect;
+				bool			used;
+			};
+			ShadowWrite			fShadowWrites[32];
+			IntRect				fCopying[8];
 };
 
 #endif // HW_INTERFACE_H

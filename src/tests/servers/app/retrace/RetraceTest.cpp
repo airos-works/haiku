@@ -265,9 +265,21 @@ public:
 		:
 		BView(frame, "draw", B_FOLLOW_ALL, B_WILL_DRAW),
 		fBitmap(NULL),
-		fOptions(0)
+		fOptions(0),
+		fDrawn(create_sem(0, "drawn"))
 	{
 		SetViewColor(B_TRANSPARENT_COLOR);
+	}
+
+	~DrawView()
+	{
+		delete_sem(fDrawn);
+	}
+
+	// waits until Draw() ran (an update, in the window's thread)
+	bool WaitForDraw()
+	{
+		return acquire_sem_etc(fDrawn, 1, B_RELATIVE_TIMEOUT, 200000) == B_OK;
 	}
 
 	void SetBitmap(BBitmap* bitmap, uint32 options)
@@ -284,11 +296,13 @@ public:
 			return;
 		}
 		DrawBitmap(fBitmap, fBitmap->Bounds(), Bounds(), fOptions);
+		release_sem_etc(fDrawn, 1, B_DO_NOT_RESCHEDULE);
 	}
 
 private:
 	BBitmap*	fBitmap;
 	uint32		fOptions;
+	sem_id		fDrawn;
 };
 
 
@@ -334,9 +348,13 @@ test_draw(double seconds, bool wait, bool update, int32 width, int32 height,
 		if (!window->Lock())
 			break;
 		if (update) {
+			// the window's thread draws it in an update; wait for that
 			view->SetBitmap(bitmaps[frames & 1], options);
 			view->Invalidate();
-			window->UpdateIfNeeded();
+			window->Unlock();
+			view->WaitForDraw();
+			if (!window->Lock())
+				break;
 		} else
 			view->DrawBitmap(bitmaps[frames & 1], bounds, bounds, options);
 		view->Sync();
