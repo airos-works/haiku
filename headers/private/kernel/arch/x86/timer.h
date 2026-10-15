@@ -8,6 +8,7 @@
 
 extern uint32 gSystemTimeConversionFactor;
 extern int64 gCPUClockSpeed;
+extern uint64 gKernelEntryTSC;
 
 
 void x86_init_tsc(kernel_args* args);
