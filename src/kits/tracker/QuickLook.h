@@ -22,7 +22,7 @@ namespace BPrivate {
 //! Shows (what = kMsgQuickLookShow) or toggles (kMsgQuickLookToggle) the
 //! panel for the "refs" in the message; the owner hears when it closes.
 status_t QuickLookShow(uint32 what, const BMessage* refs, BRect ownerFrame,
-	const BMessenger& owner);
+	BRect iconRect, const BMessenger& owner);
 //! Hides the panel.
 status_t QuickLookHide();
 

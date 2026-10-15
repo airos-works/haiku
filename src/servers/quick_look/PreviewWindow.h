@@ -48,6 +48,11 @@ private:
 			void				_ShowCurrent();
 			void				_SetPreview(BQuickLookPreview* preview);
 			void				_FitToContent();
+			BRect				_TargetFrame();
+			void				_StartAnimation(BRect from, BRect to,
+									bool hiding);
+			void				_AnimationStep();
+			void				_FinishAnimation();
 			void				_Layout();
 			void				_UpdateFooter();
 			void				_Step(int32 direction);
@@ -61,9 +66,20 @@ private:
 			int32				fIndex;
 			BMessenger			fOwner;
 			BRect				fOwnerFrame;
+			BRect				fIconRect;
 
+			// The zoom out of the entry's icon and back into it.
+			BMessageRunner*		fAnimation;
+			BRect				fAnimationFrom;
+			BRect				fAnimationTo;
+			int32				fAnimationStep;
+			bool				fAnimationHides;
+			bool				fNotifyAfterHide;
+
+			BView*				fBorder;
 			BView*				fContent;
 			FooterView*			fFooter;
+			BStringView*		fName;
 			BStringView*		fSummary;
 			BStringView*		fCount;
 			BButton*			fPrevious;

@@ -13,6 +13,7 @@
 #include <Button.h>
 #include <Catalog.h>
 #include <ControlLook.h>
+#include <MessageRunner.h>
 #include <Mime.h>
 #include <Roster.h>
 #include <Screen.h>
@@ -33,13 +34,19 @@
 enum {
 	kMsgPrevious	= 'prev',
 	kMsgNext		= 'next',
-	kMsgOpen		= 'open'
+	kMsgOpen		= 'open',
+	kMsgAnimate		= 'anim'
 };
+
+// The zoom: this many frames, this far apart.
+static const int32 kAnimationSteps = 12;
+static const bigtime_t kAnimationInterval = 14000;
 
 static const float kMinimumWidth = 420;
 static const float kMinimumContentHeight = 160;
 static const float kScreenShare = 0.85f;
 static const rgb_color kContentColor = {46, 46, 46, 255};
+static const rgb_color kBorderColor = {20, 20, 20, 255};
 
 
 //! The bar under the preview.
@@ -64,22 +71,37 @@ public:
 PreviewWindow::PreviewWindow(AddOnManager* addOns)
 	:
 	BDirectWindow(BRect(100, 100, 100 + kMinimumWidth, 400),
-		"Quick Look", B_TITLED_WINDOW_LOOK, B_FLOATING_ALL_WINDOW_FEEL,
-		B_NOT_ZOOMABLE | B_NOT_MINIMIZABLE | B_AVOID_FOCUS
+		"Quick Look", B_NO_BORDER_WINDOW_LOOK, B_FLOATING_ALL_WINDOW_FEEL,
+		B_NOT_ZOOMABLE | B_NOT_MINIMIZABLE | B_NOT_RESIZABLE | B_AVOID_FOCUS
 			| B_NO_WORKSPACE_ACTIVATION | B_NOT_ANCHORED_ON_ACTIVATE
 			| B_ASYNCHRONOUS_CONTROLS),
 	fAddOns(addOns),
 	fIndex(0),
+	fAnimation(NULL),
+	fAnimationStep(0),
+	fAnimationHides(false),
+	fNotifyAfterHide(false),
 	fPreview(NULL),
 	fPreviewStarted(false),
 	fUserResized(false)
 {
+	// No window frame: a thin dark line around the panel is all.
+	fBorder = new BView("border", 0);
+	fBorder->SetViewColor(kBorderColor);
+	AddChild(fBorder);
+
 	fContent = new BView("content", 0);
 	fContent->SetViewColor(kContentColor);
-	AddChild(fContent);
+	fBorder->AddChild(fContent);
 
 	fFooter = new FooterView();
-	AddChild(fFooter);
+	fBorder->AddChild(fFooter);
+
+	fName = new BStringView("name", "");
+	fName->SetFont(be_bold_font);
+	fName->SetHighUIColor(B_PANEL_TEXT_COLOR);
+	fName->SetTruncation(B_TRUNCATE_MIDDLE);
+	fFooter->AddChild(fName);
 
 	fSummary = new BStringView("summary", "");
 	fSummary->SetHighUIColor(B_PANEL_TEXT_COLOR);
@@ -102,14 +124,15 @@ PreviewWindow::PreviewWindow(AddOnManager* addOns)
 	// Resizing goes through here to keep the layout; the controls' sizes
 	// are fixed by the font.
 	_Layout();
-	SetSizeLimits(kMinimumWidth, 100000,
-		kMinimumContentHeight + _FooterHeight(), 100000);
+	// The zoom passes through every size.
+	SetSizeLimits(1, 100000, 1, 100000);
 	SetPulseRate(0);
 }
 
 
 PreviewWindow::~PreviewWindow()
 {
+	delete fAnimation;
 	_SetPreview(NULL);
 	Hide();
 	Sync();
@@ -135,11 +158,24 @@ PreviewWindow::ShowEntries(const BMessage* message)
 	BRect frame;
 	if (message->FindRect("frame", &frame) != B_OK)
 		frame = BRect();
+	BRect iconRect;
+	if (message->FindRect("icon", &iconRect) != B_OK)
+		iconRect = BRect();
 
 	if (IsShowing() && owner != fOwner && fOwner.IsValid())
 		fOwner.SendMessage(kMsgQuickLookClosed);
 	fOwner = owner;
 	fOwnerFrame = frame;
+	fIconRect = iconRect;
+
+	// Asked for something new while zooming: the zoom ends where it was
+	// going, at once.
+	if (fAnimation != NULL) {
+		bool hiding = fAnimationHides;
+		_FinishAnimation();
+		if (hiding)
+			return ShowEntries(message);
+	}
 
 	bool same = refs.size() == fRefs.size() && index == fIndex;
 	for (size_t i = 0; same && i < refs.size(); i++)
@@ -162,7 +198,16 @@ PreviewWindow::ShowEntries(const BMessage* message)
 	}
 	_ShowCurrent();
 	if (wasHidden) {
-		Show();
+		BRect target = Frame();
+		if (fIconRect.IsValid()) {
+			// Out of the entry's icon, growing to its place.
+			MoveTo(fIconRect.LeftTop());
+			ResizeTo(fIconRect.Width(), fIconRect.Height());
+			_Layout();
+			Show();
+			_StartAnimation(fIconRect, target, false);
+		} else
+			Show();
 		if (fPreview != NULL && !fPreviewStarted) {
 			fPreview->Start();
 			fPreviewStarted = true;
@@ -177,6 +222,23 @@ PreviewWindow::HidePanel(bool notifyOwner)
 {
 	if (IsHidden())
 		return;
+	if (fAnimation != NULL) {
+		if (fAnimationHides) {
+			fNotifyAfterHide = fNotifyAfterHide || notifyOwner;
+			return;
+		}
+		_FinishAnimation();
+	}
+	if (fIconRect.IsValid() && fPreview != NULL) {
+		// Back into the icon: the picture stops, the view shrinks with the
+		// panel, and the panel goes once it is icon sized.
+		if (fPreviewStarted)
+			fPreview->Stop();
+		fPreviewStarted = false;
+		fNotifyAfterHide = notifyOwner;
+		_StartAnimation(Frame(), fIconRect, true);
+		return;
+	}
 	_SetPreview(NULL);
 	Hide();
 	if (notifyOwner)
@@ -201,8 +263,14 @@ PreviewWindow::MessageReceived(BMessage* message)
 
 		case B_QUICK_LOOK_PREVIEW_CHANGED:
 			_UpdateFooter();
-			if (!fUserResized)
+			if (fAnimation != NULL && !fAnimationHides)
+				fAnimationTo = _TargetFrame();
+			else if (!fUserResized)
 				_FitToContent();
+			break;
+
+		case kMsgAnimate:
+			_AnimationStep();
 			break;
 
 		case kMsgQuickLookShow:
@@ -305,6 +373,7 @@ PreviewWindow::_ShowCurrent()
 	}
 
 	SetTitle(ref.name);
+	fName->SetText(ref.name);
 	_SetPreview(preview);
 	if (!fUserResized)
 		_FitToContent();
@@ -356,6 +425,19 @@ PreviewWindow::_FitToContent()
 {
 	if (fPreview == NULL)
 		return;
+	BRect target = _TargetFrame();
+	MoveTo(target.LeftTop());
+	ResizeTo(target.Width(), target.Height());
+	_Layout();
+}
+
+
+/*!	Where the panel belongs for the current preview: at the content's
+	preferred size, at most most of the screen, centred on the window
+	that asked (the first time) or where it is. */
+BRect
+PreviewWindow::_TargetFrame()
+{
 	BSize content = fPreview->PreferredContentSize();
 	if (!content.IsWidthSet() || !content.IsHeightSet()
 		|| content.width < 1 || content.height < 1)
@@ -402,9 +484,69 @@ PreviewWindow::_FitToContent()
 		target.OffsetTo(inside.left, target.top);
 	if (target.top < inside.top)
 		target.OffsetTo(target.left, inside.top);
+	return target;
+}
 
-	MoveTo(target.LeftTop());
-	ResizeTo(target.Width(), target.Height());
+
+void
+PreviewWindow::_StartAnimation(BRect from, BRect to, bool hiding)
+{
+	delete fAnimation;
+	fAnimationFrom = from;
+	fAnimationTo = to;
+	fAnimationStep = 0;
+	fAnimationHides = hiding;
+	BMessage step(kMsgAnimate);
+	fAnimation = new BMessageRunner(BMessenger(this), &step,
+		kAnimationInterval, kAnimationSteps);
+}
+
+
+void
+PreviewWindow::_AnimationStep()
+{
+	if (fAnimation == NULL)
+		return;
+	fAnimationStep++;
+	float t = (float)fAnimationStep / kAnimationSteps;
+	// Fast at first, settling at the end.
+	float eased = 1 - (1 - t) * (1 - t) * (1 - t);
+	BRect frame;
+	frame.left = fAnimationFrom.left
+		+ (fAnimationTo.left - fAnimationFrom.left) * eased;
+	frame.top = fAnimationFrom.top
+		+ (fAnimationTo.top - fAnimationFrom.top) * eased;
+	frame.right = fAnimationFrom.right
+		+ (fAnimationTo.right - fAnimationFrom.right) * eased;
+	frame.bottom = fAnimationFrom.bottom
+		+ (fAnimationTo.bottom - fAnimationFrom.bottom) * eased;
+	if (fAnimationStep >= kAnimationSteps) {
+		_FinishAnimation();
+		return;
+	}
+	MoveTo(floorf(frame.left), floorf(frame.top));
+	ResizeTo(floorf(frame.Width()), floorf(frame.Height()));
+	_Layout();
+}
+
+
+void
+PreviewWindow::_FinishAnimation()
+{
+	delete fAnimation;
+	fAnimation = NULL;
+	if (fAnimationHides) {
+		fAnimationHides = false;
+		_SetPreview(NULL);
+		Hide();
+		if (fNotifyAfterHide)
+			_NotifyClosed();
+		fNotifyAfterHide = false;
+		be_app->PostMessage(kMsgQuickLookHide);
+		return;
+	}
+	MoveTo(fAnimationTo.LeftTop());
+	ResizeTo(fAnimationTo.Width(), fAnimationTo.Height());
 	_Layout();
 }
 
@@ -414,7 +556,15 @@ PreviewWindow::_Layout()
 {
 	BRect bounds = Bounds();
 	float footer = _FooterHeight();
-	fContent->MoveTo(0, 0);
+	fBorder->MoveTo(0, 0);
+	fBorder->ResizeTo(bounds.Width(), bounds.Height());
+	// Inside the line.
+	bounds.InsetBy(1, 1);
+	if (bounds.Height() < footer + 2) {
+		// Icon sized, mid zoom: the footer waits below.
+		footer = std::max(0.0f, bounds.Height() - 2);
+	}
+	fContent->MoveTo(bounds.left, bounds.top);
 	fContent->ResizeTo(bounds.Width(), bounds.Height() - footer);
 	if (fPreview != NULL) {
 		fPreview->MoveTo(0, 0);
@@ -422,8 +572,10 @@ PreviewWindow::_Layout()
 			fContent->Bounds().Height());
 	}
 
-	fFooter->MoveTo(0, bounds.bottom - footer + 1);
+	fFooter->MoveTo(bounds.left, bounds.bottom - footer + 1);
 	fFooter->ResizeTo(bounds.Width(), footer);
+	if (footer < _FooterHeight())
+		return;
 
 	float spacing = be_control_look->DefaultItemSpacing();
 	float buttonHeight = footer - spacing;
@@ -431,6 +583,8 @@ PreviewWindow::_Layout()
 	fOpen->ResizeTo(buttonWidth, buttonHeight);
 	fOpen->MoveTo(bounds.Width() - buttonWidth - spacing / 2,
 		floorf((footer - buttonHeight) / 2) + 1);
+	// The name, then what the preview says of the file.
+	float nameWidth = fName->StringWidth(fName->Text()) + 4;
 
 	float arrowWidth = buttonHeight;
 	bool several = fRefs.size() > 1;
@@ -461,8 +615,14 @@ PreviewWindow::_Layout()
 	float textHeight = ceilf(height.ascent + height.descent);
 	float summaryRight = several ? fPrevious->Frame().left - spacing
 		: fOpen->Frame().left - spacing;
-	fSummary->MoveTo(spacing, floorf((footer - textHeight) / 2) + 1);
-	fSummary->ResizeTo(std::max(10.0f, summaryRight - spacing), textHeight);
+	float room = std::max(10.0f, summaryRight - spacing);
+	nameWidth = std::min(nameWidth, floorf(room * 0.45f));
+	fName->MoveTo(spacing, floorf((footer - textHeight) / 2) + 1);
+	fName->ResizeTo(nameWidth, textHeight);
+	fSummary->MoveTo(spacing + nameWidth + spacing / 2,
+		floorf((footer - textHeight) / 2) + 1);
+	fSummary->ResizeTo(std::max(10.0f, room - nameWidth - spacing / 2),
+		textHeight);
 }
 
 
@@ -474,6 +634,7 @@ PreviewWindow::_UpdateFooter()
 		summary = fPreview->Summary();
 	if (summary.Length() == 0)
 		summary = fDefaultSummary;
+	summary.Prepend("\xE2\x80\x94 ");
 	fSummary->SetText(summary);
 
 	if (fRefs.size() > 1) {

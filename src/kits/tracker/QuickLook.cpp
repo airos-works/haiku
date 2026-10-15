@@ -35,15 +35,18 @@ send_to_quick_look(BMessage* message, bool launch)
 
 status_t
 QuickLookShow(uint32 what, const BMessage* refs, BRect ownerFrame,
-	const BMessenger& owner)
+	BRect iconRect, const BMessenger& owner)
 {
 	BMessage message(*refs);
 	message.what = what;
 	message.RemoveName("index");
 	message.RemoveName("frame");
+	message.RemoveName("icon");
 	message.RemoveName("owner");
 	message.AddInt32("index", 0);
 	message.AddRect("frame", ownerFrame);
+	if (iconRect.IsValid())
+		message.AddRect("icon", iconRect);
 	message.AddMessenger("owner", owner);
 	return send_to_quick_look(&message, true);
 }

@@ -8431,7 +8431,26 @@ BPoseView::_SendQuickLook(uint32 what)
 		return;
 
 	BRect frame = Window() != NULL ? Window()->Frame() : BRect();
-	if (QuickLookShow(what, &refs, frame, BMessenger(this)) == B_OK) {
+	// Where the first selected entry is on screen: the panel zooms out of
+	// it and back into it.
+	BRect iconRect;
+	BPose* first = fSelectionList->FirstItem();
+	if (first != NULL) {
+		if (ViewMode() == kListMode) {
+			int32 index = CurrentPoseList()->IndexOf(first);
+			if (index >= 0) {
+				iconRect = first->CalcRect(BPoint(0, index * fListElemHeight),
+					this, true);
+			}
+		} else
+			iconRect = first->CalcRect(this);
+		if (iconRect.IsValid()) {
+			iconRect = iconRect & Bounds();
+			ConvertToScreen(&iconRect);
+		}
+	}
+	if (QuickLookShow(what, &refs, frame, iconRect, BMessenger(this))
+			== B_OK) {
 		// A toggle hides the panel when it was ours; the server says so.
 		fQuickLookShowing = what != kMsgQuickLookToggle || !fQuickLookShowing;
 	}

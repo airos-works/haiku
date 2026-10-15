@@ -15,8 +15,9 @@
 enum {
 	/*!	Show the panel for the entries in "refs" (entry_ref), starting with
 		"index" (int32, 0). "frame" (BRect) is the client's window frame, so
-		the panel appears on that screen; "owner" (BMessenger) is told when
-		the panel is closed. Sent again with new refs while the panel is up,
+		the panel appears on that screen; "icon" (BRect) is where the entry
+		is shown on screen, which the panel zooms out of and back into;
+		"owner" (BMessenger) is told when the panel is closed. Sent again with new refs while the panel is up,
 		it shows those instead. */
 	kMsgQuickLookShow			= 'QLsh',
 	//! Hide the panel.
