@@ -957,12 +957,14 @@ HWInterface::_FlushThread(FlushTarget& target)
 				}
 			} else if (target.outputID == 0) {
 				// no retrace semaphore at all: copy as drawn, from now on
+				debug_printf("app_server: vertical blank flush: no retrace "
+					"semaphore (%s), copies as drawn\n", strerror(status));
 				if (fFlushLock.Lock()) {
 					fFlushing = false;
 					fFlushLock.Unlock();
 				}
 				_FlushPending(target, 0);
-				break;
+				return;
 			} else {
 				// the output's semaphore went away: copy as drawn, and
 				// ask again later
