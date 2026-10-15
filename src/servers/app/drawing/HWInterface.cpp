@@ -72,8 +72,15 @@ HWInterface::HWInterface()
 	fFlushPerOutput(false),
 	fFlushDoneSem(-1),
 	fQuitFlush(false),
-	fFlushing(false)
+	fFlushing(false),
+	fFlushKnobThread(-1),
+	fFlushWanted(false),
+	fGateLock("drawing gate")
 {
+	for (int32 i = 0; i < 64; i++)
+		fDrawing[i].used = false;
+	for (int32 i = 0; i < 8; i++)
+		fCopying[i] = IntRect(0, 0, -1, -1);
 }
 
 
@@ -661,6 +668,7 @@ struct HWInterface::FlushWorker {
 	float			endedRow;
 	FlushTarget*	target;
 	bigtime_t		blank;
+	int32			band;
 };
 
 
@@ -713,6 +721,11 @@ HWInterface::_AbandonFlushing()
 	debug_printf("app_server: vertical blank flush: abandoned\n");
 	fFlushing = false;
 	fQuitFlush = true;
+	if (fFlushKnobThread >= 0) {
+		status_t result;
+		wait_for_thread(fFlushKnobThread, &result);
+		fFlushKnobThread = -1;
+	}
 	for (int32 i = 0; i < fFlushTargetCount; i++) {
 		FlushTarget& target = fFlushTargets[i];
 		delete_sem(target.wake);
@@ -741,17 +754,6 @@ HWInterface::_StartFlushing()
 	if (fFlushTargets != NULL)
 		return B_OK;
 
-	// for comparisons: a file named no_vblank_flush in the user's
-	// app_server settings keeps the old copies as drawn
-	BPath settings;
-	if (find_directory(B_USER_SETTINGS_DIRECTORY, &settings) == B_OK) {
-		settings.Append("app_server/no_vblank_flush");
-		if (BEntry(settings.Path()).Exists()) {
-			debug_printf("app_server: vertical blank flush: off (%s)\n",
-				settings.Path());
-			return B_OK;
-		}
-	}
 
 	fFlushDoneSem = create_sem(0, "vertical blank flush done");
 	if (fFlushDoneSem < 0)
@@ -774,9 +776,61 @@ HWInterface::_StartFlushing()
 		return status;
 	}
 
+	fFlushWanted = true;
 	fFlushing = true;
 	_UpdateFlushTargets();
+
+	// for comparisons: a file named no_vblank_flush in the user's
+	// app_server settings switches the flush off while it exists
+	fFlushKnobThread = spawn_thread(_FlushKnobEntry,
+		"vertical blank flush switch", B_LOW_PRIORITY, this);
+	if (fFlushKnobThread >= 0)
+		resume_thread(fFlushKnobThread);
 	return B_OK;
+}
+
+
+/*static*/ status_t
+HWInterface::_FlushKnobEntry(void* data)
+{
+	((HWInterface*)data)->_FlushKnobThread();
+	return B_OK;
+}
+
+
+void
+HWInterface::_FlushKnobThread()
+{
+	BPath settings;
+	if (find_directory(B_USER_SETTINGS_DIRECTORY, &settings) != B_OK)
+		return;
+	settings.Append("app_server/no_vblank_flush");
+	while (!fQuitFlush) {
+		bool off = BEntry(settings.Path()).Exists();
+		if (off == fFlushWanted) {
+			debug_printf("app_server: vertical blank flush: %s (%s)\n",
+				off ? "off" : "on", settings.Path());
+			_SetFlushing(!off);
+		}
+		snooze(500000);
+	}
+}
+
+
+/*!	Switches the flush off (copies as drawn from now on, whatever is
+	pending copied now) or on again. */
+void
+HWInterface::_SetFlushing(bool flushing)
+{
+	if (fFlushLock.Lock()) {
+		fFlushWanted = flushing;
+		fFlushing = flushing && fFlushTargets != NULL;
+		fFlushLock.Unlock();
+	}
+	if (!flushing && fFlushTargets != NULL) {
+		for (int32 i = 0; i < fFlushTargetCount; i++)
+			release_sem_etc(fFlushTargets[i].wake, 1, 0);
+	}
 }
 
 
@@ -834,6 +888,11 @@ HWInterface::_StopFlushing()
 		fFlushLock.Unlock();
 	}
 	fQuitFlush = true;
+	if (fFlushKnobThread >= 0) {
+		status_t result;
+		wait_for_thread(fFlushKnobThread, &result);
+		fFlushKnobThread = -1;
+	}
 	for (int32 i = 0; i < fFlushTargetCount; i++) {
 		FlushTarget& target = fFlushTargets[i];
 		delete_sem(target.wake);
@@ -982,6 +1041,11 @@ HWInterface::_FlushThread(FlushTarget& target)
 
 		// the blank
 		bigtime_t blank = 0;
+		if (!fFlushWanted) {
+			// switched off: whatever is pending goes now
+			_FlushPending(target, 0);
+			continue;
+		}
 		if (system_time() >= target.ignoredUntil) {
 			if (target.retraceSemaphore == -1) {
 				target.retraceSemaphore = target.outputID == 0
@@ -1058,7 +1122,10 @@ HWInterface::_FlushWorkerEntry(void* data)
 		worker->began = system_time();
 		worker->beganRow = interface->_FlushScanRow(*worker->target,
 			worker->blank);
+		interface->_BeginCopying(IntRect(worker->region.Frame()),
+			1 + worker->band);
 		interface->_CopyBackToFront(worker->region);
+		interface->_EndCopying(1 + worker->band);
 		worker->ended = system_time();
 		worker->endedRow = interface->_FlushScanRow(*worker->target,
 			worker->blank);
@@ -1095,6 +1162,7 @@ HWInterface::_StartFlushWorkers(FlushTarget& target)
 		worker.interface = this;
 		worker.target = &target;
 		worker.blank = 0;
+		worker.band = i;
 		worker.start = create_sem(0, "vertical blank flush band");
 		worker.thread = worker.start < 0 ? -1 : spawn_thread(
 			_FlushWorkerEntry, "vertical blank flush band",
@@ -1217,8 +1285,11 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 				behind = true;
 				worst = max_c(worst, (scan - r.top) / rows);
 			}
-			BRegion one((BRect)IntRect(r.left, r.top, r.right, r.bottom));
+			IntRect rect(r.left, r.top, r.right, r.bottom);
+			BRegion one((BRect)rect);
+			_BeginCopying(rect, 0);
 			_CopyBackToFront(one);
+			_EndCopying(0);
 			scan = _FlushScanRow(target, blank);
 			if (scan > r.bottom + 1) {
 				behind = true;
@@ -1245,7 +1316,9 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 			}
 		}
 		float beganRow = _FlushScanRow(target, blank);
+		_BeginCopying(IntRect(first.Frame()), 0);
 		_CopyBackToFront(first);
+		_EndCopying(0);
 		float endedRow = _FlushScanRow(target, blank);
 		for (int32 i = 1; i < bands; i++) {
 			while (acquire_sem(fFlushDoneSem) == B_INTERRUPTED)
@@ -1304,6 +1377,119 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank)
 		target.late = 0;
 		target.worstLate = 0;
 		target.longest = 0;
+	}
+}
+
+
+// #pragma mark - the gate between drawing and copying
+
+
+static inline bool
+rects_intersect(const IntRect& a, const IntRect& b)
+{
+	return a.IsValid() && b.IsValid() && a.left <= b.right
+		&& a.right >= b.left && a.top <= b.bottom && a.bottom >= b.top;
+}
+
+
+/*!	A drawing op is about to change the bounds in the back buffer: waits
+	while the flush is copying any of it (a copy takes a few ms at most),
+	then notes the bounds, so that the flush keeps off them until
+	EndDrawing(). Returns the note's slot (-1: none; nothing to end). */
+int32
+HWInterface::BeginDrawing(const IntRect& bounds)
+{
+	if (!fFlushing || !bounds.IsValid())
+		return -1;
+	if (!fGateLock.Lock())
+		return -1;
+
+	bigtime_t deadline = 0;
+	while (true) {
+		bool copying = false;
+		for (int32 i = 0; i < 8; i++) {
+			if (rects_intersect(fCopying[i], bounds)) {
+				copying = true;
+				break;
+			}
+		}
+		if (!copying)
+			break;
+		if (deadline == 0)
+			deadline = system_time() + 20000;
+		else if (system_time() > deadline)
+			break;
+		fGateLock.Unlock();
+		snooze(50);
+		if (!fGateLock.Lock())
+			return -1;
+	}
+
+	int32 slot = -1;
+	for (int32 i = 0; i < 64; i++) {
+		if (!fDrawing[i].used) {
+			fDrawing[i].rect = bounds;
+			fDrawing[i].used = true;
+			slot = i;
+			break;
+		}
+	}
+	fGateLock.Unlock();
+	return slot;
+}
+
+
+void
+HWInterface::EndDrawing(int32 slot)
+{
+	if (slot < 0)
+		return;
+	if (fGateLock.Lock()) {
+		fDrawing[slot].used = false;
+		fGateLock.Unlock();
+	}
+}
+
+
+/*!	The flush is about to copy the rect: waits while a drawing op is
+	changing any of it, then notes the rect so that drawing ops keep off
+	it until _EndCopying(). */
+void
+HWInterface::_BeginCopying(const IntRect& rect, int32 band)
+{
+	if (!fGateLock.Lock())
+		return;
+	bigtime_t deadline = 0;
+	while (true) {
+		bool drawing = false;
+		for (int32 i = 0; i < 64; i++) {
+			if (fDrawing[i].used && rects_intersect(fDrawing[i].rect, rect)) {
+				drawing = true;
+				break;
+			}
+		}
+		if (!drawing)
+			break;
+		if (deadline == 0)
+			deadline = system_time() + 20000;
+		else if (system_time() > deadline)
+			break;
+		fGateLock.Unlock();
+		snooze(50);
+		if (!fGateLock.Lock())
+			return;
+	}
+	fCopying[band] = rect;
+	fGateLock.Unlock();
+}
+
+
+void
+HWInterface::_EndCopying(int32 band)
+{
+	if (fGateLock.Lock()) {
+		fCopying[band] = IntRect(0, 0, -1, -1);
+		fGateLock.Unlock();
 	}
 }
 

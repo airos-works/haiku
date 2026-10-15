@@ -204,6 +204,13 @@ public:
 									// until what was queued so far is on
 									// the screen (not locked)
 
+	// Drawing into an area and the flush copying it keep off each other:
+	// a drawing op tells its bounds before it starts (and waits while
+	// they are being copied), the flush waits for drawing ops in an area
+	// before it copies it. Read locked, in buffer pixels.
+			int32				BeginDrawing(const IntRect& bounds);
+			void				EndDrawing(int32 slot);
+
 protected:
 	virtual	void				_CopyBackToFront(/*const*/ BRegion& region);
 
@@ -229,6 +236,12 @@ private:
 									bigtime_t blank);
 			float				_FlushScanRow(FlushTarget& target,
 									bigtime_t blank);
+			void				_BeginCopying(const IntRect& rect,
+									int32 band);
+			void				_EndCopying(int32 band);
+	static	status_t			_FlushKnobEntry(void* data);
+			void				_FlushKnobThread();
+			void				_SetFlushing(bool flushing);
 	static	status_t			_FlushWorkerEntry(void* data);
 			void				_StartFlushWorkers(FlushTarget& target);
 			void				_StopFlushWorkers(FlushTarget& target);
@@ -358,6 +371,17 @@ private:
 			volatile bool		fQuitFlush;
 			volatile bool		fFlushing;
 									// copies go through the threads
+			thread_id			fFlushKnobThread;
+			bool				fFlushWanted;
+
+			// the gate between drawing and copying
+			BLocker				fGateLock;
+			struct GateEntry {
+				IntRect			rect;
+				bool			used;
+			};
+			GateEntry			fDrawing[64];
+			IntRect				fCopying[8];
 };
 
 #endif // HW_INTERFACE_H
