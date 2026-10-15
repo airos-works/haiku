@@ -129,22 +129,26 @@ static const int32 kTrendMargin = 250;
 // and the steps of the GPU's and the video engine's clocks (below). With
 // two films playing the GPU, the video engine and the memory make most of
 // the heat: the cores alone at 416 MHz do not hold it.
-// The video engine stays at 300 MHz down to level 7 (at level 8, where the
-// hot trip puts everything, 200 MHz): at 200 MHz a 4K HEVC Main 10 picture
-// took it 42-45 ms, too slow for 24 a second, where 300 MHz took 27-30 ms;
-// a film it cannot keep up with drops pictures however cool the rest runs,
-// and airTime playing one held level 7.
+// The video engine keeps its full speed at every level; only the hot trip
+// slows it (to 150 MHz). It makes little of the heat: decoding a 4K HEVC
+// Main 10 film at 44 pictures a second at 600 MHz for 98 s took the
+// Cubie A7S from 68 to 71 C, while at 200 MHz a picture took it 42-45 ms,
+// too slow for 24 a second, and at 300 MHz 27-30 ms with the decoder's own
+// work on a throttled core still to come. A film the engine cannot keep up
+// with drops pictures however cool the rest runs.
 static const struct { uint32 big, little; uint8 gpu, ve; } kLevels[] = {
 	{ 0xffffffff, 0xffffffff, 0, 0 },
-	{ 1794, 1794, 1, 1 },
-	{ 1612, 1716, 2, 1 },
-	{ 1404, 1612, 2, 1 },
-	{ 1196, 1404, 3, 1 },
-	{ 1014, 1196, 3, 1 },
-	{ 780, 1014, 4, 1 },
-	{ 416, 780, 4, 1 },
-	{ 416, 416, 4, 2 }
+	{ 1794, 1794, 1, 0 },
+	{ 1612, 1716, 2, 0 },
+	{ 1404, 1612, 2, 0 },
+	{ 1196, 1404, 3, 0 },
+	{ 1014, 1196, 3, 0 },
+	{ 780, 1014, 4, 0 },
+	{ 416, 780, 4, 0 },
+	{ 416, 416, 4, 0 }
 };
+// the video engine's step while the hot trip holds
+static const uint8 kHotVeStep = 3;
 
 // The GPU's clock (CCU 0xb20): the powervr driver runs it from pll-peri0-800m
 // (source 1), or -600m (source 2) when its settings say so; slower from the
@@ -563,7 +567,8 @@ apply_device_clocks()
 	if (sCcu == NULL)
 		return;
 	int32 gpuStep = sThrottleDevices ? kLevels[sLevel].gpu : 0;
-	int32 veStep = sThrottleDevices ? kLevels[sLevel].ve : 0;
+	int32 veStep = !sThrottleDevices ? 0
+		: sHotFired ? kHotVeStep : kLevels[sLevel].ve;
 
 	volatile uint32* gpu = (volatile uint32*)(sCcu + CCU_GPU_CLOCK);
 	uint32 value = *gpu;
