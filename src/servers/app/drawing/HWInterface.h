@@ -224,19 +224,15 @@ private:
 			struct FlushTarget;
 			status_t			_CopyAreaToFront(const IntRect& area);
 			bool				_QueueForFlush(const IntRect& area,
-									int32 shadowSlot = -1);
+									int32 shadowSlot, int32 shadow);
 	static	status_t			_FlushThreadEntry(void* data);
 			void				_FlushThread(FlushTarget& target);
 			void				_FlushPending(FlushTarget& target,
 									bigtime_t blank);
 			float				_FlushScanRow(FlushTarget& target,
 									bigtime_t blank);
-			void				_CopyShadowToFront(BRegion& region);
-			bool				_BeginCopying(const IntRect& rect,
-									int32 band);
-			void				_RequeueForFlush(FlushTarget& target,
-									const BRegion& region);
-			void				_EndCopying(int32 band);
+			void				_CopyShadowToFront(BRegion& region,
+									int32 shadow);
 	static	status_t			_FlushKnobEntry(void* data);
 			void				_FlushKnobThread();
 			void				_SetFlushing(bool flushing);
@@ -372,19 +368,23 @@ private:
 			thread_id			fFlushKnobThread;
 			bool				fFlushWanted;
 
-			// what the flush copies from: the drawing as it was queued, so
-			// that a drawing op under way does not get into a frame
+			// What the flush copies from: two shadows of the back buffer.
+			// Drawing ops copy their finished areas into the current one;
+			// at a blank the flush makes the other one current and copies
+			// from the one just left, which no drawing op writes any more
+			// (fFlushLock): a drawing op under way never gets into a frame,
+			// and neither side waits for the other.
 			ObjectDeleter<RenderingBuffer>
-								fFlushShadow;
-			// a write into the shadow and the flush's copy of the same
-			// area keep off each other (fFlushLock): the writes under
-			// way, and the rects being copied (one per band)
+								fFlushShadow[2];
+			int32				fShadowCurrent;
+			int32				fShadowReaders;
+									// targets copying from the other
 			struct ShadowWrite {
 				IntRect			rect;
+				int32			shadow;
 				bool			used;
 			};
 			ShadowWrite			fShadowWrites[32];
-			IntRect				fCopying[8];
 };
 
 #endif // HW_INTERFACE_H
