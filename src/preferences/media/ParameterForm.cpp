@@ -42,12 +42,16 @@ static const uint32 kMsgTrailing = 'pfTR';
 static const uint32 kMsgChoice = 'pfCH';
 static const uint32 kMsgText = 'pfTX';
 static const uint32 kMsgPoll = 'pfPL';
+static const uint32 kMsgSettle = 'pfST';
 
 // Slider moves are sent to the node at most this often...
 static const bigtime_t kApplyInterval = 25000;
 // ...and the node's own notifications do not move a slider the user just
 // touched.
 static const bigtime_t kUserIdleTime = 400000;
+// A drag is over when the slider did not move for this long (BSlider sends
+// nothing when the thumb is let go where it started).
+static const bigtime_t kSettleTime = 150000;
 
 
 enum row_type {
@@ -162,6 +166,7 @@ struct ParameterForm::Binding {
 	int32				steps;
 	std::vector<float>	values;
 	std::vector<float>	base;
+	std::vector<float>	pending;
 	bool				dragging;
 	bigtime_t			lastApply;
 	bigtime_t			lastUser;
@@ -249,6 +254,22 @@ is_hidden(BParameter* parameter)
 			return true;
 	}
 	return false;
+}
+
+
+//! A continuous parameter that gets a slider (and so a Mute or Auto on its row)
+static bool
+is_slider(BParameter* parameter)
+{
+	if (parameter->Type() != BParameter::B_CONTINUOUS_PARAMETER
+		|| is_kind(parameter, B_BALANCE)) {
+		return false;
+	}
+	BContinuousParameter* continuous
+		= static_cast<BContinuousParameter*>(parameter);
+	float range = continuous->MaxValue() - continuous->MinValue();
+	return range > 0 && !(continuous->ValueStep() >= 1
+		&& range <= continuous->ValueStep());
 }
 
 
@@ -483,6 +504,7 @@ ParameterForm::ParameterForm(BParameterWeb* web, const char* nodeName,
 	fNode(web->Node()),
 	fBindings(20),
 	fPollRunner(NULL),
+	fSettleRunner(NULL),
 	fFlags(flags),
 	fIcons(icons),
 	fWatching(false),
@@ -507,6 +529,7 @@ ParameterForm::ParameterForm(BParameterWeb* web, const char* nodeName,
 ParameterForm::~ParameterForm()
 {
 	delete fPollRunner;
+	delete fSettleRunner;
 	fBindings.MakeEmpty();
 	delete fWeb;
 }
@@ -554,6 +577,8 @@ ParameterForm::DetachedFromWindow()
 	}
 	delete fPollRunner;
 	fPollRunner = NULL;
+	delete fSettleRunner;
+	fSettleRunner = NULL;
 
 	BGroupView::DetachedFromWindow();
 }
@@ -597,10 +622,40 @@ ParameterForm::MessageReceived(BMessage* message)
 					std::min(binding->maximum, values[i] + value - top));
 			}
 
+			binding->pending = values;
 			if (final || now - binding->lastApply >= kApplyInterval)
 				set_continuous(binding, values);
 			if (final)
 				binding->dragging = false;
+			else if (fSettleRunner == NULL) {
+				BMessage settle(kMsgSettle);
+				fSettleRunner = new BMessageRunner(BMessenger(this), &settle,
+					kSettleTime / 2);
+			}
+			break;
+		}
+
+		case kMsgSettle:
+		{
+			bool dragging = false;
+			bigtime_t now = system_time();
+			for (int32 i = 0; i < fBindings.CountItems(); i++) {
+				Binding* item = fBindings.ItemAt(i);
+				if (!item->dragging)
+					continue;
+				if (now - item->lastUser < kSettleTime) {
+					dragging = true;
+					continue;
+				}
+				// the last position the user left it at
+				if (item->pending != item->values)
+					set_continuous(item, item->pending);
+				item->dragging = false;
+			}
+			if (!dragging) {
+				delete fSettleRunner;
+				fSettleRunner = NULL;
+			}
 			break;
 		}
 
@@ -1092,7 +1147,7 @@ ParameterForm::_MakeRows(BParameterGroup* group, CardSpec& card)
 	int32 gains = 0;
 	int32 mutes = 0;
 	for (size_t i = first; i < count; i++) {
-		if (is_gain(parameters[i])) {
+		if (is_gain(parameters[i]) && is_slider(parameters[i])) {
 			gain = i;
 			gains++;
 		} else if (parameters[i]->Type() == BParameter::B_DISCRETE_PARAMETER
@@ -1120,8 +1175,7 @@ ParameterForm::_MakeRows(BParameterGroup* group, CardSpec& card)
 
 		for (size_t j = first; j < count; j++) {
 			if (j == i || used[j] || trailingOf[j] >= 0
-				|| parameters[j]->Type()
-					!= BParameter::B_CONTINUOUS_PARAMETER) {
+				|| !is_slider(parameters[j])) {
 				continue;
 			}
 			BString name = clean_name(parameters[j]->Name());
@@ -1141,7 +1195,7 @@ ParameterForm::_MakeRows(BParameterGroup* group, CardSpec& card)
 	for (size_t i = first; i + 1 < count; i++) {
 		if (used[i] || !is_toggle(parameters[i])
 			|| !clean_name(parameters[i]->Name()).IsEmpty()
-			|| parameters[i + 1]->Type() != BParameter::B_CONTINUOUS_PARAMETER
+			|| !is_slider(parameters[i + 1])
 			|| trailingOf[i + 1] >= 0) {
 			continue;
 		}

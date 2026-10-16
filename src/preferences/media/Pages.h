@@ -165,6 +165,9 @@ public:
 									const MediaModel* model);
 	virtual						~DevicePage();
 
+			//! Whether the page is about these nodes.
+			bool				Shows(const DeviceEntry& device) const;
+
 	virtual	void				Build();
 	virtual	void				ModelChanged();
 	virtual	void				AttachedToWindow();

@@ -31,6 +31,7 @@
 static const uint32 kMsgFrame = 'lvFr';
 static const uint32 kMsgStatus = 'lvSt';
 static const uint32 kMsgPulse = 'lvPu';
+static const uint32 kMsgStarted = 'lvSD';
 
 static const bigtime_t kPulse = 50000;
 
@@ -204,7 +205,6 @@ CameraPreview::Stop()
 		return;
 
 	// Stop the camera, so its light goes out, then let go of it.
-	recorder->SetHooks(NULL, NULL, NULL);
 	recorder->Stop();
 	BMediaRoster* roster = BMediaRoster::CurrentRoster();
 	if (roster != NULL)
@@ -231,6 +231,19 @@ status_t
 CameraPreview::_StartThread(void* data)
 {
 	CameraPreview* self = (CameraPreview*)data;
+	status_t status = self->_Connect();
+
+	// the view joins us, so that Start() can try again
+	BMessage started(kMsgStarted);
+	self->fMessenger.SendMessage(&started, (BHandler*)NULL, 0);
+	return status;
+}
+
+
+status_t
+CameraPreview::_Connect()
+{
+	CameraPreview* self = this;
 	BMediaRoster* roster = BMediaRoster::Roster();
 
 	media_output output;
@@ -342,6 +355,10 @@ CameraPreview::MessageReceived(BMessage* message)
 		case kMsgFrame:
 			atomic_and(&fFramePending, 0);
 			Invalidate();
+			break;
+
+		case kMsgStarted:
+			_WaitForStart();
 			break;
 
 		case kMsgStatus:
@@ -581,7 +598,6 @@ LevelMeter::_Stop()
 	}
 	if (recorder != NULL) {
 		// Only our own node stops: the input is often the output, too.
-		recorder->SetHooks(NULL, NULL, NULL);
 		recorder->Stop();
 		recorder->Disconnect();
 		delete recorder;

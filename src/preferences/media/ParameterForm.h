@@ -73,6 +73,7 @@ private:
 			media_node			fNode;
 			BObjectList<Binding, true> fBindings;
 			BMessageRunner*		fPollRunner;
+			BMessageRunner*		fSettleRunner;
 			uint32				fFlags;
 			const IconMap*		fIcons;
 			bool				fWatching;

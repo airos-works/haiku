@@ -48,6 +48,7 @@ public:
 
 private:
 	static	status_t			_StartThread(void* data);
+			status_t			_Connect();
 	static	void				_ProcessFrame(void* cookie,
 									bigtime_t timestamp, void* data,
 									size_t size, const media_format& format);

@@ -218,7 +218,7 @@ MediaWindow::_HandleScripting(BMessage* message)
 		reply.AddString("result", fPageKey);
 	else {
 		const char* key;
-		if (message->FindString("data", &key) == B_OK) {
+		if (fRestartThread < 0 && message->FindString("data", &key) == B_OK) {
 			_ShowPage(key);
 			reply.AddInt32("error", fPageKey == key ? B_OK : B_BAD_VALUE);
 		} else
@@ -239,7 +239,8 @@ MediaWindow::MessageReceived(BMessage* message)
 		case kMsgSidebarSelection:
 		{
 			const char* key;
-			if (message->FindString("key", &key) == B_OK) {
+			if (fRestartThread < 0
+				&& message->FindString("key", &key) == B_OK) {
 				fPendingKey = "";
 				_ShowPage(key);
 			}
@@ -249,8 +250,10 @@ MediaWindow::MessageReceived(BMessage* message)
 		case kMsgShowPage:
 		{
 			const char* key;
-			if (message->FindString("key", &key) == B_OK)
+			if (fRestartThread < 0
+				&& message->FindString("key", &key) == B_OK) {
 				_ShowPage(key);
+			}
 			break;
 		}
 
@@ -294,11 +297,14 @@ MediaWindow::MessageReceived(BMessage* message)
 			fPageKey = kRestartPageKey;
 			fPageHolder->GroupLayout()->AddView(fPage);
 			fPage->Rebuild();
-			fSidebar->DeselectAll();
+			// the devices come back with the services
+			for (int32 i = fSidebar->CountItems() - 1; i >= 0; i--)
+				delete fSidebar->RemoveItem(i);
 			fRestartButton->SetEnabled(false);
 
 			fRestartThread = spawn_thread(&_RestartThread,
-				"restart media services", B_NORMAL_PRIORITY, this);
+				"restart media services", B_NORMAL_PRIORITY,
+				new BMessenger(this));
 			if (fRestartThread >= 0)
 				resume_thread(fRestartThread);
 			else
@@ -314,7 +320,8 @@ MediaWindow::MessageReceived(BMessage* message)
 			if (page != NULL)
 				page->SetText(B_TRANSLATE("Starting the media services…"));
 			fRestartThread = spawn_thread(&_RestartThread,
-				"start media services", B_NORMAL_PRIORITY, this);
+				"start media services", B_NORMAL_PRIORITY,
+				new BMessenger(this));
 			if (fRestartThread >= 0)
 				resume_thread(fRestartThread);
 			break;
@@ -356,10 +363,8 @@ MediaWindow::MessageReceived(BMessage* message)
 				break;
 			}
 
-			if (!fWatching) {
-				BMediaRoster::Roster();
-				_StartWatching();
-			}
+			BMediaRoster::Roster();
+			_StartWatching();
 			if (fPage != NULL) {
 				fPage->RemoveSelf();
 				delete fPage;
@@ -372,6 +377,7 @@ MediaWindow::MessageReceived(BMessage* message)
 
 		case B_MEDIA_SERVER_STARTED:
 			fServerRunning = true;
+			_StartWatching();
 			_ScheduleRescan();
 			break;
 
@@ -448,13 +454,20 @@ MediaWindow::_StartWatching()
 		return;
 
 	BMessenger messenger(this);
-	roster->StartWatching(messenger, B_MEDIA_SERVER_STARTED);
-	roster->StartWatching(messenger, B_MEDIA_SERVER_QUIT);
-	roster->StartWatching(messenger, B_MEDIA_FLAVORS_CHANGED);
-	roster->StartWatching(messenger, B_MEDIA_NODE_CREATED);
-	roster->StartWatching(messenger, B_MEDIA_NODE_DELETED);
-	roster->StartWatching(messenger, B_MEDIA_DEFAULT_CHANGED);
-	fWatching = true;
+	if (!fWatching) {
+		// these two the local roster tells
+		roster->StartWatching(messenger, B_MEDIA_SERVER_STARTED);
+		roster->StartWatching(messenger, B_MEDIA_SERVER_QUIT);
+		fWatching = true;
+	}
+
+	// The media server keeps these, so a new server needs them again.
+	static const int32 kServerNotifications[] = { B_MEDIA_FLAVORS_CHANGED,
+		B_MEDIA_NODE_CREATED, B_MEDIA_NODE_DELETED, B_MEDIA_DEFAULT_CHANGED };
+	for (size_t i = 0; i < B_COUNT_OF(kServerNotifications); i++) {
+		roster->StopWatching(messenger, kServerNotifications[i]);
+		roster->StartWatching(messenger, kServerNotifications[i]);
+	}
 }
 
 
@@ -499,11 +512,15 @@ MediaWindow::_Rescan(bool force)
 		return;
 	}
 
-	if (fPageKey.StartsWith("device:")
-		&& fModel.DeviceFor(fPageKey) == NULL) {
-		// the device went away
-		_ShowPage("output");
-		return;
+	if (fPageKey.StartsWith("device:")) {
+		const DeviceEntry* device = fModel.DeviceFor(fPageKey);
+		DevicePage* page = dynamic_cast<DevicePage*>(fPage);
+		if (device == NULL || page == NULL || !page->Shows(*device)) {
+			// The device went away, or its name is another device's now
+			// ("HD Audio 2" became "HD Audio").
+			_ShowPage("output");
+			return;
+		}
 	}
 
 	fPage->ModelChanged();
@@ -715,7 +732,8 @@ MediaWindow::_SetDefault(BMessage* message)
 status_t
 MediaWindow::_RestartThread(void* data)
 {
-	MediaWindow* window = (MediaWindow*)data;
+	// a messenger: the window may be gone ("Quit anyway") before we are done
+	BMessenger* window = (BMessenger*)data;
 
 	if (BMediaRoster::IsRunning())
 		shutdown_media_server(B_INFINITE_TIMEOUT, &_RestartProgress, window);
@@ -737,10 +755,21 @@ MediaWindow::_RestartThread(void* data)
 			i++) {
 		snooze(100000);
 	}
+	BMediaRoster* roster = BMediaRoster::Roster();
+	for (int i = 0; status == B_OK && roster != NULL && i < 30; i++) {
+		dormant_node_info info;
+		int32 count = 1;
+		if (roster->GetDormantNodes(&info, &count, NULL, NULL, NULL,
+				B_PHYSICAL_OUTPUT) == B_OK && count > 0) {
+			break;
+		}
+		snooze(100000);
+	}
 
 	BMessage done(kMsgRestartDone);
 	done.AddInt32("status", status);
-	window->PostMessage(&done);
+	window->SendMessage(&done);
+	delete window;
 	return B_OK;
 }
 
@@ -748,10 +777,10 @@ MediaWindow::_RestartThread(void* data)
 bool
 MediaWindow::_RestartProgress(int stage, const char* message, void* cookie)
 {
-	MediaWindow* window = (MediaWindow*)cookie;
+	BMessenger* window = (BMessenger*)cookie;
 	BMessage progress(kMsgRestartProgress);
 	progress.AddInt32("stage", stage);
 	progress.AddString("text", message);
-	window->PostMessage(&progress);
+	window->SendMessage(&progress, (BHandler*)NULL, 0);
 	return true;
 }

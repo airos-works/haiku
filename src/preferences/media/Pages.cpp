@@ -118,12 +118,15 @@ public:
 		sPlayer->Start();
 		sPlayer->SetHasData(true);
 
+		// a new chime gets the whole time
 		BMessage done(kMsgTestSoundDone);
-		BMessageRunner::StartSending(target, &done, 1200000, 1);
+		sStopRunner = new BMessageRunner(target, &done, 1200000, 1);
 	}
 
 	static void Stop()
 	{
+		delete sStopRunner;
+		sStopRunner = NULL;
 		if (sPlayer == NULL)
 			return;
 		sPlayer->Stop();
@@ -176,11 +179,13 @@ private:
 	}
 
 	static BSoundPlayer*	sPlayer;
+	static BMessageRunner*	sStopRunner;
 	static int64			sFrame;
 };
 
 
 BSoundPlayer* TestSound::sPlayer = NULL;
+BMessageRunner* TestSound::sStopRunner = NULL;
 int64 TestSound::sFrame = 0;
 
 
@@ -967,6 +972,9 @@ MidiPage::MessageReceived(BMessage* message)
 			}
 			path.Append("synth");
 			create_directory(path.Path(), 0755);
+			// watch it, now that it is there
+			stop_watching(this);
+			_Watch();
 
 			entry_ref ref;
 			if (get_ref_for_path(path.Path(), &ref) != B_OK)
@@ -1038,6 +1046,22 @@ DevicePage::DevicePage(const DeviceEntry& device, const MediaModel* model)
 DevicePage::~DevicePage()
 {
 	_ReleaseNodes();
+}
+
+
+bool
+DevicePage::Shows(const DeviceEntry& device) const
+{
+	if (device.nodes.size() != fParts.size())
+		return false;
+	for (size_t i = 0; i < fParts.size(); i++) {
+		bool found = false;
+		for (size_t j = 0; j < device.nodes.size() && !found; j++)
+			found = device.nodes[j].Is(fParts[i].entry.info);
+		if (!found)
+			return false;
+	}
+	return true;
 }
 
 
