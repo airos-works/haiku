@@ -8,7 +8,9 @@
 
 #include <algorithm>
 #include <math.h>
+#include <string.h>
 
+#include <Bitmap.h>
 #include <GradientLinear.h>
 #include <InterfaceDefs.h>
 #include <Shape.h>
@@ -237,4 +239,28 @@ draw_glyph_badge(BView* view, BRect frame, glyph_kind kind, rgb_color color)
 	}
 
 	view->PopState();
+}
+
+
+BBitmap*
+make_glyph_bitmap(glyph_kind kind, rgb_color color, float size)
+{
+	BRect bounds(0, 0, size - 1, size - 1);
+	BBitmap* bitmap = new BBitmap(bounds, B_BITMAP_ACCEPTS_VIEWS, B_RGBA32);
+	if (bitmap->InitCheck() != B_OK) {
+		delete bitmap;
+		return NULL;
+	}
+
+	memset(bitmap->Bits(), 0, bitmap->BitsLength());
+	BView* view = new BView(bounds, "glyph", B_FOLLOW_NONE, B_WILL_DRAW);
+	bitmap->AddChild(view);
+	if (bitmap->Lock()) {
+		draw_glyph_badge(view, bounds, kind, color);
+		view->Sync();
+		bitmap->Unlock();
+	}
+	bitmap->RemoveChild(view);
+	delete view;
+	return bitmap;
 }

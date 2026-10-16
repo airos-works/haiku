@@ -26,6 +26,7 @@
 #include <MenuField.h>
 #include <MenuItem.h>
 #include <MessageRunner.h>
+#include <NodeInfo.h>
 #include <NodeMonitor.h>
 #include <ParameterWeb.h>
 #include <Path.h>
@@ -41,6 +42,8 @@
 #include <StringView.h>
 
 #include <MidiSettings.h>
+
+#include <map>
 
 #include "Cards.h"
 #include "LiveViews.h"
@@ -612,7 +615,73 @@ MixerPage::Build()
 		return;
 	}
 
-	AddView(new ParameterForm(web, B_TRANSLATE("Audio mixer")));
+	// The applications that play show their icons on their rows: the port
+	// of a mixer input's producer belongs to the application's team.
+	std::map<BString, BBitmap*> icons;
+	ParameterForm::IconMap iconMap;
+	float iconSize = ceilf(18 * ui_scale());
+	media_input inputs[64];
+	int32 count = 0;
+	if (roster->GetConnectedInputsFor(fMixer, inputs, 64, &count) == B_OK) {
+		for (int32 i = 0; i < count; i++) {
+			port_info portInfo;
+			app_info appInfo;
+			if (get_port_info(inputs[i].source.port, &portInfo) != B_OK
+				|| be_roster->GetRunningAppInfo(portInfo.team, &appInfo)
+					!= B_OK) {
+				continue;
+			}
+			BBitmap* icon = new BBitmap(BRect(0, 0, iconSize - 1,
+				iconSize - 1), B_RGBA32);
+			if (BNodeInfo::GetTrackerIcon(&appInfo.ref, icon,
+					(icon_size)iconSize) != B_OK) {
+				delete icon;
+				continue;
+			}
+			BString name(inputs[i].name);
+			name.Trim();
+			delete icons[name];
+			icons[name] = icon;
+			iconMap[name] = icon;
+		}
+	}
+
+	// the master output, and streams of no application, get a badge
+	BBitmap* master = make_glyph_bitmap(GLYPH_SPEAKER,
+		glyph_color(GLYPH_SPEAKER), iconSize);
+	BBitmap* stream = make_glyph_bitmap(GLYPH_SPEAKER, device_glyph_color(),
+		iconSize);
+	for (int32 i = 0; i < count; i++) {
+		BString name(inputs[i].name);
+		name.Trim();
+		if (iconMap.find(name) == iconMap.end() && stream != NULL)
+			iconMap[name] = stream;
+	}
+	for (int32 i = 0; i < web->CountParameters() && master != NULL; i++) {
+		BParameter* parameter = web->ParameterAt(i);
+		if (parameter->Type() != BParameter::B_CONTINUOUS_PARAMETER
+			|| strcmp(parameter->Kind(), B_MASTER_GAIN) != 0) {
+			continue;
+		}
+		BParameterGroup* group = parameter->Group();
+		if (group->CountParameters() > 0
+			&& group->ParameterAt(0)->Type() == BParameter::B_NULL_PARAMETER) {
+			BString name(group->ParameterAt(0)->Name());
+			name.Trim();
+			iconMap[name] = master;
+		}
+		break;
+	}
+
+	AddView(new ParameterForm(web, B_TRANSLATE("Audio mixer"), 0,
+		&iconMap));
+	delete master;
+	delete stream;
+
+	for (std::map<BString, BBitmap*>::iterator iterator = icons.begin();
+			iterator != icons.end(); iterator++) {
+		delete iterator->second;
+	}
 }
 
 

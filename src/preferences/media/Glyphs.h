@@ -10,6 +10,7 @@
 #include <Rect.h>
 
 
+class BBitmap;
 class BView;
 
 
@@ -35,6 +36,10 @@ rgb_color device_glyph_color();
 */
 void draw_glyph_badge(BView* view, BRect frame, glyph_kind kind,
 	rgb_color color);
+
+
+//! The badge as a bitmap of \a size pixels, for icon places.
+BBitmap* make_glyph_bitmap(glyph_kind kind, rgb_color color, float size);
 
 
 #endif	// GLYPHS_H

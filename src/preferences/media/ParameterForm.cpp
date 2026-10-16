@@ -476,7 +476,7 @@ binding_message(uint32 what, int32 index)
 
 
 ParameterForm::ParameterForm(BParameterWeb* web, const char* nodeName,
-	uint32 flags)
+	uint32 flags, const IconMap* icons)
 	:
 	BGroupView("parameter form", B_VERTICAL, B_USE_DEFAULT_SPACING),
 	fWeb(web),
@@ -484,6 +484,7 @@ ParameterForm::ParameterForm(BParameterWeb* web, const char* nodeName,
 	fBindings(20),
 	fPollRunner(NULL),
 	fFlags(flags),
+	fIcons(icons),
 	fWatching(false),
 	fHasControls(false)
 {
@@ -497,6 +498,9 @@ ParameterForm::ParameterForm(BParameterWeb* web, const char* nodeName,
 		if (type != ROW_STATUS && type != ROW_CAPTION && type != ROW_VALUE)
 			fHasControls = true;
 	}
+
+	// only used while building
+	fIcons = NULL;
 }
 
 
@@ -1398,6 +1402,17 @@ ParameterForm::_MakeRowView(RowSpec& row, BView** _label,
 		case ROW_CAPTION:
 			view = make_caption(row.text);
 			break;
+	}
+
+	if (fIcons != NULL && *_label != NULL) {
+		BStringView* labelView = dynamic_cast<BStringView*>(*_label);
+		IconMap::const_iterator found = labelView != NULL
+			? fIcons->find(labelView->Text()) : fIcons->end();
+		if (found != fIcons->end()) {
+			BView* iconLabel = new IconLabel(found->second, labelView->Text());
+			delete labelView;
+			*_label = iconLabel;
+		}
 	}
 
 	if (!row.toolTip.IsEmpty()) {

@@ -17,6 +17,7 @@
 #include "Glyphs.h"
 
 
+class BBitmap;
 class BGroupLayout;
 class BScrollView;
 
@@ -137,6 +138,26 @@ public:
 private:
 			glyph_kind			fKind;
 			rgb_color			fColor;
+};
+
+
+//! A label with a small icon in front, like an application's.
+class IconLabel : public BView {
+public:
+								IconLabel(const BBitmap* icon,
+									const char* text);
+	virtual						~IconLabel();
+
+			const char*			Text() const { return fText.String(); }
+
+	virtual	BSize				MinSize();
+	virtual	BSize				PreferredSize();
+	virtual	BSize				MaxSize();
+	virtual	void				Draw(BRect updateRect);
+
+private:
+			BBitmap*			fIcon;
+			BString				fText;
 };
 
 

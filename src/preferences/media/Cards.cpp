@@ -10,6 +10,7 @@
 #include <float.h>
 #include <math.h>
 
+#include <Bitmap.h>
 #include <ControlLook.h>
 #include <GroupLayout.h>
 #include <LayoutUtils.h>
@@ -493,6 +494,84 @@ void
 BadgeView::Draw(BRect updateRect)
 {
 	draw_glyph_badge(this, Bounds(), fKind, fColor);
+}
+
+
+// #pragma mark - IconLabel
+
+
+IconLabel::IconLabel(const BBitmap* icon, const char* text)
+	:
+	BView("label", B_WILL_DRAW | B_FULL_UPDATE_ON_RESIZE),
+	fIcon(icon != NULL ? new BBitmap(icon) : NULL),
+	fText(text)
+{
+	SetViewUIColor(B_PANEL_BACKGROUND_COLOR);
+	SetLowUIColor(B_PANEL_BACKGROUND_COLOR);
+	SetHighUIColor(B_PANEL_TEXT_COLOR);
+}
+
+
+IconLabel::~IconLabel()
+{
+	delete fIcon;
+}
+
+
+BSize
+IconLabel::MinSize()
+{
+	return BLayoutUtils::ComposeSize(ExplicitMinSize(), PreferredSize());
+}
+
+
+BSize
+IconLabel::PreferredSize()
+{
+	font_height height;
+	GetFontHeight(&height);
+	float iconSize = fIcon != NULL ? fIcon->Bounds().Width() + 1 : 0;
+	float spacing = fIcon != NULL
+		? ceilf(be_control_look->DefaultItemSpacing() / 2) : 0;
+	return BLayoutUtils::ComposeSize(ExplicitPreferredSize(),
+		BSize(iconSize + spacing + ceilf(StringWidth(fText)) + 2,
+			std::max(iconSize,
+				ceilf(height.ascent + height.descent + height.leading))));
+}
+
+
+BSize
+IconLabel::MaxSize()
+{
+	return BLayoutUtils::ComposeSize(ExplicitMaxSize(), PreferredSize());
+}
+
+
+void
+IconLabel::Draw(BRect updateRect)
+{
+	BRect bounds = Bounds();
+	float left = bounds.left;
+	if (fIcon != NULL) {
+		BRect iconRect = fIcon->Bounds();
+		iconRect.OffsetTo(left,
+			floorf(bounds.top + (bounds.Height() - iconRect.Height()) / 2));
+		SetDrawingMode(B_OP_ALPHA);
+		SetBlendingMode(B_PIXEL_ALPHA, B_ALPHA_OVERLAY);
+		DrawBitmap(fIcon, iconRect);
+		SetDrawingMode(B_OP_COPY);
+		left = iconRect.right + 1
+			+ ceilf(be_control_look->DefaultItemSpacing() / 2);
+	}
+
+	BString text(fText);
+	TruncateString(&text, B_TRUNCATE_END, bounds.right - left);
+	font_height height;
+	GetFontHeight(&height);
+	SetDrawingMode(B_OP_OVER);
+	DrawString(text, BPoint(left, floorf(bounds.top
+		+ (bounds.Height() + height.ascent - height.descent) / 2)));
+	SetDrawingMode(B_OP_COPY);
 }
 
 

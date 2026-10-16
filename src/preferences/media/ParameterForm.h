@@ -11,7 +11,10 @@
 #include <ObjectList.h>
 #include <String.h>
 
+#include <map>
 
+
+class BBitmap;
 class BMessageRunner;
 class BParameter;
 class BParameterGroup;
@@ -33,8 +36,12 @@ enum {
 */
 class ParameterForm : public BGroupView {
 public:
+	//! Icons for rows of these labels (the mixer's applications)
+	typedef std::map<BString, const BBitmap*> IconMap;
+
 								ParameterForm(BParameterWeb* web,
-									const char* nodeName, uint32 flags = 0);
+									const char* nodeName, uint32 flags = 0,
+									const IconMap* icons = NULL);
 	virtual						~ParameterForm();
 
 			bool				HasControls() const { return fHasControls; }
@@ -67,6 +74,7 @@ private:
 			BObjectList<Binding, true> fBindings;
 			BMessageRunner*		fPollRunner;
 			uint32				fFlags;
+			const IconMap*		fIcons;
 			bool				fWatching;
 			bool				fHasControls;
 };
