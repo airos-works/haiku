@@ -18,6 +18,11 @@
 // Resets of a port in a row: a device that still fails after that is broken.
 static const uint8 kMaxPlatformResets = 3;
 
+// A device that failed to enumerate is tried again after a pause that doubles
+// with each failure in a row, from 4 s to 64 s.
+static const bigtime_t kEnumerationRetryDelay = 4000000;
+static const uint8 kMaxEnumerationRetryShift = 4;
+
 
 Hub::Hub(Object *parent, int8 hubAddress, uint8 hubPort,
 	usb_device_descriptor &desc, int8 deviceAddress, usb_speed speed,
@@ -30,6 +35,8 @@ Hub::Hub(Object *parent, int8 hubAddress, uint8 hubPort,
 
 	memset(&fHubDescriptor, 0, sizeof(fHubDescriptor));
 	memset(fPlatformResets, 0, sizeof(fPlatformResets));
+	memset(fEnumerationFailures, 0, sizeof(fEnumerationFailures));
+	memset(fNextEnumeration, 0, sizeof(fNextEnumeration));
 	for (int32 i = 0; i < USB_MAX_PORT_COUNT; i++)
 		fChildren[i] = NULL;
 
@@ -242,6 +249,10 @@ Hub::Explore(change_item **changeList)
 		}
 #endif
 
+		// An empty port forgets the failures of the device it had.
+		if ((fPortStatus[i].status & PORT_STATUS_CONNECTION) == 0)
+			fEnumerationFailures[i] = 0;
+
 		if ((fPortStatus[i].change & PORT_STATUS_CONNECTION)
 				|| ((fPortStatus[i].status & PORT_STATUS_CONNECTION)
 					&& fChildren[i] == NULL)) {
@@ -250,7 +261,16 @@ Hub::Explore(change_item **changeList)
 				USB_REQUEST_CLEAR_FEATURE, C_PORT_CONNECTION, i + 1,
 				0, NULL, 0, NULL);
 
-			if (fPortStatus[i].status & PORT_STATUS_CONNECTION) {
+			if ((fPortStatus[i].status & PORT_STATUS_CONNECTION) != 0
+				&& fChildren[i] == NULL && fEnumerationFailures[i] > 0
+				&& system_time() < fNextEnumeration[i]) {
+				// The device failed to enumerate, and its pause is not over.
+				// A try can take seconds (5 s for a device that never answers
+				// its descriptor request), and holds up the exploration of
+				// every bus: at boot once per controller that is added. A
+				// connection change does not end the pause, as a device that
+				// does not answer may drop off and come back by itself.
+			} else if (fPortStatus[i].status & PORT_STATUS_CONNECTION) {
 				// new device attached!
 				TRACE_ALWAYS("port %" B_PRId32 ": new device connected\n", i);
 
@@ -340,14 +360,20 @@ Hub::Explore(change_item **changeList)
 					}
 				}
 
+				if (fChildren[i] == NULL)
+					_EnumerationFailed(i);
+				else
+					fEnumerationFailures[i] = 0;
+
 				// An internal device that does not even take an address (an
 				// Intel Bluetooth radio after a warm reboot) may have a reset
 				// line the platform can pulse. Out of reset, it connects
-				// again, and gets enumerated then.
+				// again, and gets enumerated then, without a pause.
 				if (setupFailed && GetBusManager()->GetRootHub() == this
 					&& fPlatformResets[i] < kMaxPlatformResets) {
 					fPlatformResets[i]++;
-					GetBusManager()->PlatformResetPort(i);
+					if (GetBusManager()->PlatformResetPort(i) == B_OK)
+						fEnumerationFailures[i] = 0;
 				}
 			} else {
 				// Device removed...
@@ -528,6 +554,20 @@ Hub::BuildDeviceName(char *string, uint32 *index, size_t bufferSize,
 	}
 
 	return B_OK;
+}
+
+
+void
+Hub::_EnumerationFailed(uint8 index)
+{
+	bigtime_t delay = kEnumerationRetryDelay << std::min(
+		fEnumerationFailures[index], kMaxEnumerationRetryShift);
+	if (fEnumerationFailures[index] < UINT8_MAX)
+		fEnumerationFailures[index]++;
+
+	fNextEnumeration[index] = system_time() + delay;
+	TRACE_ALWAYS("port %" B_PRIu8 ": the device failed to enumerate, trying "
+		"again in %" B_PRIdBIGTIME " s\n", index, delay / 1000000);
 }
 
 
