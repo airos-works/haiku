@@ -15,6 +15,67 @@
 #include "Settings.h"
 
 
+/*!	The device's product string, as the name of its audio device: "USB Audio"
+	tells a webcam's microphone from a DAC by nothing.
+*/
+static void
+get_product_name(usb_device device, uint8 index, char* name, size_t size)
+{
+	strlcpy(name, "USB Audio", size);
+	if (index == 0)
+		return;
+
+	uint8 buffer[256];
+	size_t length = 0;
+	if (gUSBModule->get_descriptor(device, USB_DESCRIPTOR_STRING, 0, 0, buffer,
+			sizeof(buffer), &length) != B_OK || length < 4) {
+		return;
+	}
+	uint16 language = buffer[2] | buffer[3] << 8;
+	if (gUSBModule->get_descriptor(device, USB_DESCRIPTOR_STRING, index,
+			language, buffer, sizeof(buffer), &length) != B_OK || length < 4) {
+		return;
+	}
+	length = min_c(length, (size_t)buffer[0]);
+
+	// UTF-16 to UTF-8
+	size_t used = 0;
+	for (size_t i = 2; i + 1 < length; i += 2) {
+		uint16 c = buffer[i] | buffer[i + 1] << 8;
+		char utf8[3];
+		size_t bytes;
+		if (c >= 0xd800 && c < 0xe000) {
+			// (a surrogate: not in a device name)
+			utf8[0] = '?';
+			bytes = 1;
+		} else if (c < 0x80) {
+			utf8[0] = c;
+			bytes = 1;
+		} else if (c < 0x800) {
+			utf8[0] = 0xc0 | c >> 6;
+			utf8[1] = 0x80 | (c & 0x3f);
+			bytes = 2;
+		} else {
+			utf8[0] = 0xe0 | c >> 12;
+			utf8[1] = 0x80 | ((c >> 6) & 0x3f);
+			utf8[2] = 0x80 | (c & 0x3f);
+			bytes = 3;
+		}
+		if (c == 0 || used + bytes >= size)
+			break;
+		memcpy(name + used, utf8, bytes);
+		used += bytes;
+	}
+	while (used > 0 && name[used - 1] == ' ')
+		used--;
+	if (used == 0) {
+		strlcpy(name, "USB Audio", size);
+		return;
+	}
+	name[used] = '\0';
+}
+
+
 Device::Device(usb_device device)
 	:
 	fStatus(B_ERROR),
@@ -25,6 +86,8 @@ Device::Device(usb_device device)
 	fAudioControl(this),
 	fBuffersReadySem(-1)
 {
+	strlcpy(fName, "USB Audio", sizeof(fName));
+
 	const usb_device_descriptor* deviceDescriptor
 		= gUSBModule->get_device_descriptor(device);
 
@@ -36,6 +99,7 @@ Device::Device(usb_device device)
 	fVendorID = deviceDescriptor->vendor_id;
 	fProductID = deviceDescriptor->product_id;
 	fUSBVersion = deviceDescriptor->usb_version;
+	get_product_name(device, deviceDescriptor->product, fName, sizeof(fName));
 
 	fBuffersReadySem = create_sem(0, DRIVER_NAME "_buffers_ready");
 	if (fBuffersReadySem < B_OK) {
@@ -169,7 +233,7 @@ Device::Control(uint32 op, void* buffer, size_t length)
 		case B_MULTI_GET_ENABLED_CHANNELS:
 		{
 			multi_channel_enable enable;
-			uint32 enable_bits;
+			uint32 enable_bits = 0;
 			uchar* orig_enable_bits;
 
 			if (user_memcpy(&enable, buffer, sizeof(enable)) != B_OK
@@ -466,7 +530,7 @@ Device::_MultiGetDescription(multi_description* multiDescription)
 	Description.interface_version = B_CURRENT_INTERFACE_VERSION;
 	Description.interface_minimum = B_CURRENT_INTERFACE_VERSION;
 
-	strlcpy(Description.friendly_name, "USB Audio",
+	strlcpy(Description.friendly_name, fName,
 		sizeof(Description.friendly_name));
 
 	strlcpy(Description.vendor_info, "S.Zharski",
@@ -827,7 +891,8 @@ Device::_SetupEndpoints()
 	}
 
 	if (fAudioControl.InitCheck() == B_OK && fStreams.Count() > 0) {
-		TRACE(INF, "Found device %#06x:%#06x\n", fVendorID, fProductID);
+		TRACE(ERR, "Found device %#06x:%#06x \"%s\"\n", fVendorID, fProductID,
+			fName);
 
 		status_t status = gUSBModule->set_configuration(fDevice, config);
 		if (status != B_OK)

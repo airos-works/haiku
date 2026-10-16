@@ -62,6 +62,7 @@ private:
 			uint16			fVendorID;
 			uint16			fProductID;
 	const	char*			fDescription;
+			char			fName[32];
 			bool			fNonBlocking;
 
 			AudioControlInterface	fAudioControl;
