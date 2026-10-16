@@ -16,6 +16,7 @@
 #include <MenuBar.h>
 #include <ScrollBar.h>
 #include <ScrollView.h>
+#include <SpaceLayoutItem.h>
 
 
 static float
@@ -110,6 +111,14 @@ Card::AddRow(BView* label, BView* control)
 	control->SetExplicitAlignment(BAlignment(B_ALIGN_LEFT,
 		B_ALIGN_VERTICAL_CENTER));
 	row->GroupLayout()->AddView(label, 0.0f);
+	if (control->MaxSize().width < 10000) {
+		// A control that does not grow leaves the room to a glue, not to
+		// the label, so it stays next to the label.
+		BGroupView* holder = new BGroupView(B_HORIZONTAL, 0);
+		holder->GroupLayout()->AddView(control, 0.0f);
+		holder->GroupLayout()->AddItem(BSpaceLayoutItem::CreateGlue(), 1.0f);
+		control = holder;
+	}
 	row->GroupLayout()->AddView(control, 1.0f);
 	fLayout->AddView(row);
 	fRowViews.push_back(row);
@@ -428,6 +437,23 @@ WrappingText::AllAttached()
 		SetViewColor(Parent()->LowColor());
 		SetLowColor(Parent()->LowColor());
 	}
+}
+
+
+void
+WrappingText::GetHeightForWidth(float width, float* min, float* max,
+	float* preferred)
+{
+	float minHeight, maxHeight, preferredHeight;
+	BTextView::GetHeightForWidth(width, &minHeight, &maxHeight,
+		&preferredHeight);
+	// as tall as the text, not taller
+	if (min != NULL)
+		*min = preferredHeight;
+	if (max != NULL)
+		*max = preferredHeight;
+	if (preferred != NULL)
+		*preferred = preferredHeight;
 }
 
 

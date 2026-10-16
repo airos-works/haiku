@@ -108,6 +108,8 @@ public:
 
 	virtual	void				AttachedToWindow();
 	virtual	void				AllAttached();
+	virtual	void				GetHeightForWidth(float width, float* min,
+									float* max, float* preferred);
 
 private:
 			bool				fDimmed;

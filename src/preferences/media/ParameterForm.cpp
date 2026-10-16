@@ -92,6 +92,7 @@ struct ParameterForm::RowSpec {
 	trailing_type		trailingType;
 	bool				genericLabel;
 		// the parameter has no name, the label says what kind it is
+	BString				toolTip;
 };
 
 
@@ -127,6 +128,7 @@ struct ParameterForm::Binding {
 		trailingType(TRAILING_NONE),
 		trailingCheck(NULL),
 		row(NULL),
+		inTrailingColumn(false),
 		minimum(0),
 		maximum(1),
 		step(1),
@@ -151,6 +153,8 @@ struct ParameterForm::Binding {
 	trailing_type		trailingType;
 	BCheckBox*			trailingCheck;
 	BGroupView*			row;
+	bool				inTrailingColumn;
+		// a lone Mute, shown where the Mute of a slider is
 
 	float				minimum;
 	float				maximum;
@@ -338,6 +342,8 @@ format_value(const ParameterForm::Binding& binding, float value)
 		}
 	} else if (binding.maximum - binding.minimum <= 10)
 		decimals = 1;
+	if (strcmp(parameter->Unit(), "dB") == 0)
+		decimals = std::min(decimals, 1);
 
 	// no "-0.0"
 	if (fabsf(value) < 0.5f * powf(10, -decimals))
@@ -687,12 +693,17 @@ ParameterForm::MessageReceived(BMessage* message)
 	it came from, unless its own name says more.
 */
 static void
-label_by_group(ParameterForm::RowSpec& row, const BString& group)
+label_by_group(ParameterForm::RowSpec& row, const BString& group,
+	bool keepNamed)
 {
-	if (row.type == ROW_CAPTION || group.IsEmpty() || group == row.label)
+	if (row.type == ROW_CAPTION || group.IsEmpty() || group == row.label
+		|| row.label.IFindFirst(group) >= 0) {
+		// "Input frequency" says enough in a group "Input"
 		return;
-	if (row.genericLabel || row.type == ROW_CHECK)
-		row.rowLabel = group;
+	}
+	if (keepNamed && !row.genericLabel && row.type != ROW_CHECK)
+		return;
+	row.rowLabel = group;
 }
 
 
@@ -720,6 +731,10 @@ align_rows(BObjectList<ParameterForm::Binding, true>& bindings, int32 first,
 	float spacing = ceilf(be_control_look->DefaultItemSpacing() / 2);
 	for (int32 i = first; i < last; i++) {
 		ParameterForm::Binding* binding = bindings.ItemAt(i);
+		if (binding->inTrailingColumn && trailingWidth > 0) {
+			binding->check->SetExplicitMinSize(
+				BSize(trailingWidth, B_SIZE_UNSET));
+		}
 		if (binding->valueView == NULL || binding->row == NULL)
 			continue;
 		binding->valueView->SetExplicitSize(BSize(valueWidth, B_SIZE_UNSET));
@@ -796,9 +811,21 @@ ParameterForm::_Build(const char* nodeName)
 			merged->title = section->heading;
 			for (int32 j = 0; j < cards.CountItems(); j++) {
 				CardSpec* card = cards.ItemAt(j);
+				// a group's notes ("48 kHz float") become its tool tip
+				BString notes;
+				for (size_t k = 0; k < card->rows.size(); k++) {
+					if (card->rows[k].type != ROW_CAPTION)
+						continue;
+					if (!notes.IsEmpty())
+						notes << "\n";
+					notes << card->rows[k].text;
+				}
 				for (size_t k = 0; k < card->rows.size(); k++) {
 					RowSpec row = card->rows[k];
-					label_by_group(row, card->title);
+					if (row.type == ROW_CAPTION)
+						continue;
+					label_by_group(row, card->title, false);
+					row.toolTip = notes;
 					merged->rows.push_back(row);
 				}
 			}
@@ -858,7 +885,7 @@ ParameterForm::_Build(const char* nodeName)
 					? sections.ItemAt(i)->heading : card->title;
 				for (size_t k = 0; k < card->rows.size(); k++) {
 					RowSpec row = card->rows[k];
-					label_by_group(row, group);
+					label_by_group(row, group, true);
 					merged->rows.push_back(row);
 				}
 			}
@@ -902,6 +929,7 @@ ParameterForm::_Build(const char* nodeName)
 	}
 
 	std::vector<Card*> cardViews;
+	std::vector<bool> cardHasSliders;
 	bool showHeadings = sections.CountItems() > 1;
 	BFont headingFont(be_bold_font);
 	headingFont.SetSize(ceilf(headingFont.Size() * 1.15f));
@@ -934,15 +962,28 @@ ParameterForm::_Build(const char* nodeName)
 			align_rows(fBindings, first, fBindings.CountItems());
 			layout->AddView(card);
 			cardViews.push_back(card);
+			bool sliders = false;
+			for (int32 k = first; k < fBindings.CountItems(); k++) {
+				if (fBindings.ItemAt(k)->slider != NULL)
+					sliders = true;
+			}
+			cardHasSliders.push_back(sliders);
 		}
 	}
 
-	// all labels of the form line up
+	// the sliders of all cards line up (a card of menus keeps its own
+	// labels, so that long ones there do not shorten the sliders)
 	float labelWidth = 0;
-	for (size_t i = 0; i < cardViews.size(); i++)
-		labelWidth = std::max(labelWidth, cardViews[i]->NaturalLabelWidth());
-	for (size_t i = 0; i < cardViews.size(); i++)
-		cardViews[i]->SetLabelWidth(labelWidth);
+	for (size_t i = 0; i < cardViews.size(); i++) {
+		if (cardHasSliders[i]) {
+			labelWidth = std::max(labelWidth,
+				cardViews[i]->NaturalLabelWidth());
+		}
+	}
+	for (size_t i = 0; i < cardViews.size(); i++) {
+		if (cardHasSliders[i])
+			cardViews[i]->SetLabelWidth(labelWidth);
+	}
 }
 
 
@@ -1302,6 +1343,13 @@ ParameterForm::_MakeRowView(RowSpec& row, BView** _label,
 			if (!rowLabel.IsEmpty() && rowLabel != row.label)
 				*_label = new BStringView("label", rowLabel);
 			view = binding->check;
+			if (*_label != NULL && is_kind(row.parameter, B_MUTE)) {
+				BGroupView* group = new BGroupView(B_HORIZONTAL, 0);
+				group->GroupLayout()->AddItem(BSpaceLayoutItem::CreateGlue());
+				group->GroupLayout()->AddView(binding->check, 0.0f);
+				binding->inTrailingColumn = true;
+				view = group;
+			}
 			break;
 
 		case ROW_CHOICE:
@@ -1318,10 +1366,8 @@ ParameterForm::_MakeRowView(RowSpec& row, BView** _label,
 				menu->AddItem(new BMenuItem(name, message));
 			}
 			binding->menuField = new BMenuField("choice", NULL, menu);
-			binding->menuField->SetExplicitMaxSize(
-				binding->menuField->PreferredSize());
 			BGroupView* group = new BGroupView(B_HORIZONTAL, 0);
-			group->GroupLayout()->AddView(binding->menuField);
+			group->GroupLayout()->AddView(binding->menuField, 0.0f);
 			group->GroupLayout()->AddItem(BSpaceLayoutItem::CreateGlue());
 			*_label = new BStringView("label", label);
 			view = group;
@@ -1352,6 +1398,13 @@ ParameterForm::_MakeRowView(RowSpec& row, BView** _label,
 		case ROW_CAPTION:
 			view = make_caption(row.text);
 			break;
+	}
+
+	if (!row.toolTip.IsEmpty()) {
+		if (*_label != NULL)
+			(*_label)->SetToolTip(row.toolTip);
+		else
+			view->SetToolTip(row.toolTip);
 	}
 
 	refresh_binding(binding);
