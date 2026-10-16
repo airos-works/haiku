@@ -80,6 +80,23 @@ its backing store at that density and draws it this way, and uses grey,
 vertically hinted text there. Qt programs such as Telegram were rendered at
 the logical size and enlarged before, which made them fuzzy at any scale.
 
+**Enlarged bitmaps** (`BilinearSeparable` in `DrawBitmapBilinear.h`). A
+program that does not know the scale draws bitmaps in logical pixels and
+app_server enlarges them. Without a filter the nearest pixel doubles every
+other row and column at fractional scales, so a one pixel line inside the
+bitmap is one or two pixels wide. A `BGLView` (libglvnd's Haiku GL kit,
+jmgasper/libglvnd `airos-1.7.0`) therefore asks for
+`B_FILTER_BITMAP_BILINEAR` when the scale is fractional, as macOS and Wayland
+compositors filter surfaces that are not drawn at the panel's density; whole
+scales stay exact. On x86_64 that filter was the per pixel default version
+(the SIMD one is i386 assembly), 3.5 ns per buffer pixel; it now filters
+each row in two passes, four pixels at a time with SSE2, about four times
+faster, and its weights add up to 256 so white stays 255 (it was 253). On
+the Framework 13 at 175 percent, a 400 x 300 bitmap filtered to the frame
+buffer takes 0.43 ms instead of 1.65 (0.21 unfiltered), and GLTeapot costs
+app_server 1.30 s of CPU time per 10 s filtered, 1.19 unfiltered (1.92 with
+the old filter).
+
 ## What is left
 
 - One pixel lines a program draws itself (Tracker list rows, custom views)
@@ -91,8 +108,11 @@ the logical size and enlarged before, which made them fuzzy at any scale.
   125 and 175) still redraws the view instead of copying it; with glyphs from
   the cache that is cheap for text, less so for large images.
 - OpenGL views and other programs that draw logical-size bitmaps are still
-  enlarged; they can use `BScreen::DeviceScale()` and
-  `B_DEVICE_PIXEL_BITMAP` as the Qt plugin does.
+  enlarged (filtered, so soft rather than uneven). Programs can use
+  `BScreen::DeviceScale()` and `B_DEVICE_PIXEL_BITMAP` as the Qt plugin
+  does; a `BGLView` option to render at buffer pixels (what macOS calls
+  `wantsBestResolutionOpenGLSurface`, SDL `SDL_WINDOW_ALLOW_HIGHDPI`) would
+  let GL programs and SDL do the same.
 
 ## Tools
 
@@ -103,7 +123,7 @@ the logical size and enlarged before, which made them fuzzy at any scale.
   `B_DEVICE_PIXEL_BITMAP`;
 - `devshot file.png [x y w h]`: the screen in buffer pixels (the screenshot
   APIs average a scaled desktop down to its logical size);
-- `scalebench [n]`: text view and window redraws, moves and scrolls;
+- `scalebench [n]`: text view, bitmap and window redraws, moves and scrolls;
 - `teamtime [name]`: a team's CPU time so far, for drag tests.
 
 A QEMU loop: boot the CI x86_64 image with the new `haiku.hpkg` swapped in
