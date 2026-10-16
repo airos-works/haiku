@@ -374,6 +374,12 @@ OutputPage::OutputPage(const MediaModel* model)
 }
 
 
+OutputPage::~OutputPage()
+{
+	TestSound::Stop();
+}
+
+
 void
 OutputPage::AttachedToWindow()
 {

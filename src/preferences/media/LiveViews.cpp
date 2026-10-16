@@ -204,6 +204,7 @@ CameraPreview::Stop()
 		return;
 
 	// Stop the camera, so its light goes out, then let go of it.
+	recorder->SetHooks(NULL, NULL, NULL);
 	recorder->Stop();
 	BMediaRoster* roster = BMediaRoster::CurrentRoster();
 	if (roster != NULL)
@@ -580,6 +581,7 @@ LevelMeter::_Stop()
 	}
 	if (recorder != NULL) {
 		// Only our own node stops: the input is often the output, too.
+		recorder->SetHooks(NULL, NULL, NULL);
 		recorder->Stop();
 		recorder->Disconnect();
 		delete recorder;

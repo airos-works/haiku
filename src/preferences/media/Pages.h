@@ -86,6 +86,7 @@ private:
 class OutputPage : public Page {
 public:
 								OutputPage(const MediaModel* model);
+	virtual						~OutputPage();
 
 	virtual	void				Build();
 	virtual	void				AttachedToWindow();
