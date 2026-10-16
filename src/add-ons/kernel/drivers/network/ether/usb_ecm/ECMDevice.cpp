@@ -17,6 +17,7 @@ ECMDevice::ECMDevice(usb_device device)
 		fRemoved(false),
 		fInsideNotify(0),
 		fDevice(device),
+		fKeepAwake(false),
 		fControlInterfaceIndex(0),
 		fDataInterfaceIndex(0),
 		fMACAddressIndex(0),
@@ -455,6 +456,7 @@ ECMDevice::CompareAndReattach(usb_device device)
 	// previously opened
 	fDevice = device;
 	fRemoved = false;
+	fKeepAwake = false;
 	status_t result = _SetupDevice();
 	if (result != B_OK) {
 		fRemoved = true;
@@ -732,6 +734,8 @@ ECMDevice::_NotifyCallback(void *cookie, int32 status, void *data,
 	r8152 driver uses them, work in the CDC ECM configuration as well: the PHY
 	is powered down while the interface is down. A PHY that was powered down
 	needs the data interface reset that Open() does before frames flow again.
+	Suspended (U3), the adapter powers the PHY up again on its own, whatever
+	its wake-on-LAN settings say: the bus keeps it awake meanwhile.
 */
 bool
 ECMDevice::_HasRealtekPHY() const
@@ -838,17 +842,29 @@ ECMDevice::_SetPHYPower(bool on)
 	}
 
 	if (on) {
-		if ((control & kBMCRPowerDown) == 0)
+		if ((control & kBMCRPowerDown) == 0) {
+			_SetKeepAwake(false);
 			return;
+		}
 		control &= ~kBMCRPowerDown;
 		control |= kBMCRAutoNegotiate | kBMCRRestartAutoNegotiation;
-	} else
+	} else {
+		// Without a link there are no lights to turn off, and a PHY powered
+		// up again would not find a link to wait for: leave it alone.
+		uint16 status;
+		if (_RealtekPHYRead(1, &status) != B_OK
+			|| _RealtekPHYRead(1, &status) != B_OK
+			|| (status & kBMSRLinkStatus) == 0) {
+			return;
+		}
 		control |= kBMCRPowerDown;
+	}
 
 	if (_RealtekPHYWrite(0, control) != B_OK) {
 		TRACE_ALWAYS("cannot power the PHY %s\n", on ? "up" : "down");
 		return;
 	}
+	_SetKeepAwake(!on);
 	if (!on)
 		return;
 
@@ -866,4 +882,16 @@ ECMDevice::_SetPHYPower(bool on)
 		snooze(100000);
 	}
 	TRACE_ALWAYS("no link after powering the PHY up\n");
+}
+
+
+void
+ECMDevice::_SetKeepAwake(bool keepAwake)
+{
+	if (keepAwake == fKeepAwake)
+		return;
+
+	usb_keep_awake_args args = { fDevice, keepAwake };
+	if (gUSBModule->usb_ioctl(B_USB_KEEP_AWAKE, &args, sizeof(args)) == B_OK)
+		fKeepAwake = keepAwake;
 }
