@@ -53,8 +53,12 @@ and shares out its pixels the same way on every side: the dark outline gets
 the scale rounded (2 px at 150 and 175 percent), the faint edge outside it
 what is left. Two logical pixels are always three buffer pixels at 150
 percent, so there outline and edge come out the same on all four sides of
-every button, text control, check box, scroll view and menu field. Bevels
+every button, text control, check box, scroll view, menu field and tab. Bevels
 are drawn over their surface, which is filled first, and keep their width.
+A tab view draws its selected tab last, as its neighbours' separators share
+a column with it. Window borders (`DefaultDecorator`) send their five rings
+per side the same way: the dark outlines keep their width (2 px at 150 and
+175 percent; the top ones were 1 px at 175), the middle ring takes the rest.
 Lines a program draws itself keep the grid (one or two pixels).
 
 **Translucent lines** (`B_OP_ALPHA`, blended frames) cover whole buffer pixels
@@ -102,8 +106,8 @@ the old filter).
 - One pixel lines a program draws itself (Tracker list rows, custom views)
   are still one or two buffer pixels thick depending on where they fall;
   only the control look knows which lines belong together.
-- Tabs, sliders and scroll bar parts draw their rings with different border
-  sets and are not grouped yet.
+- Scroll bar arrows and thumbs draw their rings alone; at 175 percent their
+  outlines come out even, but nothing guarantees it.
 - Scrolling by an odd number of logical pixels at 150 percent (most steps at
   125 and 175) still redraws the view instead of copying it; with glyphs from
   the cache that is cheap for text, less so for large images.
