@@ -1794,9 +1794,10 @@ Painter::DrawBitmap(const ServerBitmap* bitmap, BRect bitmapRect,
 
 	if (touched.IsValid()) {
 		BRect destination = viewRect;
+		BRect logical = viewRect;
 		if (fIdentityViewTransform && fDeviceScale != 1) {
 			if (!fSubpixelPrecise)
-				destination = AlignRect(destination);
+				logical = destination = AlignRect(destination);
 			destination = _DeviceRect(destination);
 		}
 		float scale = max_c((destination.Width() + 1) / (bitmapRect.Width() + 1),
@@ -1809,6 +1810,19 @@ Painter::DrawBitmap(const ServerBitmap* bitmap, BRect bitmapRect,
 			options |= B_FILTER_BITMAP_BILINEAR;
 		}
 		BitmapPainter bitmapPainter(this, bitmap, options);
+		if (!icon.IsSet() && fIdentityViewTransform
+			&& fDeviceScale != floorf(fDeviceScale)
+			&& (options & (B_FILTER_BITMAP_BILINEAR | B_TILE_BITMAP)) == 0
+			&& logical.Width() == bitmapRect.Width()
+			&& logical.Height() == bitmapRect.Height()) {
+			// drawn one to one: only the device scale enlarges it
+			BRect bounds = bitmap->Bounds();
+			bitmapPainter.SetAreaSampling(fDeviceScale,
+				BPoint((logical.left - (bitmapRect.left - bounds.left))
+						* fDeviceScale,
+					(logical.top - (bitmapRect.top - bounds.top))
+						* fDeviceScale));
+		}
 		bitmapPainter.Draw(bitmapRect, destination);
 	}
 
