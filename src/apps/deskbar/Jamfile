@@ -38,6 +38,7 @@ Application Deskbar :
 	TimeView.cpp
 	TruncatableMenuItem.cpp
 	WindowMenu.cpp
+	WindowIcons.cpp
 	WindowMenuItem.cpp
 	ResourceSet.cpp
 	Switcher.cpp
