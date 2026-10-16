@@ -15,6 +15,10 @@
 #include <algorithm>
 
 
+// Resets of a port in a row: a device that still fails after that is broken.
+static const uint8 kMaxPlatformResets = 3;
+
+
 Hub::Hub(Object *parent, int8 hubAddress, uint8 hubPort,
 	usb_device_descriptor &desc, int8 deviceAddress, usb_speed speed,
 	bool isRootHub, void *controllerCookie)
@@ -25,6 +29,7 @@ Hub::Hub(Object *parent, int8 hubAddress, uint8 hubPort,
 	TRACE("creating hub\n");
 
 	memset(&fHubDescriptor, 0, sizeof(fHubDescriptor));
+	memset(fPlatformResets, 0, sizeof(fPlatformResets));
 	for (int32 i = 0; i < USB_MAX_PORT_COUNT; i++)
 		fChildren[i] = NULL;
 
@@ -249,6 +254,7 @@ Hub::Explore(change_item **changeList)
 				// new device attached!
 				TRACE_ALWAYS("port %" B_PRId32 ": new device connected\n", i);
 
+				bool setupFailed = false;
 				int32 retry = 2;
 				while (retry--) {
 					// wait for stable device power
@@ -322,13 +328,26 @@ Hub::Explore(change_item **changeList)
 					if (newDevice) {
 						newDevice->Changed(changeList, true);
 						fChildren[i] = newDevice;
+						fPlatformResets[i] = 0;
+						setupFailed = false;
 						break;
 					} else {
 						// the device failed to setup correctly, disable the
 						// port so that the device doesn't get in the way of
 						// future addressing.
 						DisablePort(i);
+						setupFailed = true;
 					}
+				}
+
+				// An internal device that does not even take an address (an
+				// Intel Bluetooth radio after a warm reboot) may have a reset
+				// line the platform can pulse. Out of reset, it connects
+				// again, and gets enumerated then.
+				if (setupFailed && GetBusManager()->GetRootHub() == this
+					&& fPlatformResets[i] < kMaxPlatformResets) {
+					fPlatformResets[i]++;
+					GetBusManager()->PlatformResetPort(i);
 				}
 			} else {
 				// Device removed...
@@ -341,14 +360,27 @@ Hub::Explore(change_item **changeList)
 			}
 		}
 
-		// other port changes we do not really handle, report and clear them
 		if (fPortStatus[i].change & PORT_STATUS_ENABLE) {
 			TRACE_ALWAYS("port %" B_PRId32 " %sabled\n", i,
 				(fPortStatus[i].status & PORT_STATUS_ENABLE) ? "en" : "dis");
 			DefaultPipe()->SendRequest(USB_REQTYPE_CLASS | USB_REQTYPE_OTHER_OUT,
 				USB_REQUEST_CLEAR_FEATURE, C_PORT_ENABLE, i + 1,
 				0, NULL, 0, NULL);
+
+			// A port with a device that the hardware disabled (after errors,
+			// noise on the bus) stays useless: remove the device, the next
+			// exploration enumerates it again, as Linux does.
+			if ((fPortStatus[i].status & PORT_STATUS_ENABLE) == 0
+				&& (fPortStatus[i].status & PORT_STATUS_CONNECTION) != 0
+				&& fChildren[i] != NULL) {
+				TRACE_ALWAYS("port %" B_PRId32 ": enumerating the disabled "
+					"device again\n", i);
+				fChildren[i]->Changed(changeList, false);
+				fChildren[i] = NULL;
+			}
 		}
+
+		// other port changes we do not really handle, report and clear them
 
 		if (fPortStatus[i].change & PORT_STATUS_SUSPEND) {
 			TRACE_ALWAYS("port %" B_PRId32 " is %ssuspended\n", i,

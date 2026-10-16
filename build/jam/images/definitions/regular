@@ -130,6 +130,7 @@ rule HaikuImageGetSystemLibs
 			libnetwork.so
 			libnvmm.so@x86_64
 			libpackage.so
+			libquicklook.so
 			libscreensaver.so
 			libtextencoding.so
 			libtracker.so
@@ -158,6 +159,7 @@ SYSTEM_SERVERS += [ FFilterByBuildFeatures
 	bluetooth_server
 	print_server
 	print_addon_server
+	quick_look_server
 ] ;
 
 # Bluetooth stack + drivers
@@ -277,6 +279,12 @@ SYSTEM_ADD_ONS_SCREENSAVERS += [ FFilterByBuildFeatures
 	Nebula
 	Shelf
 	Spider
+] ;
+
+SYSTEM_ADD_ONS_QUICK_LOOK = [ FFilterByBuildFeatures
+	ImagePreview
+	PDFPreview@mupdf
+	TextPreview
 ] ;
 
 SYSTEM_ADD_ONS_DRIVERS_AUDIO +=

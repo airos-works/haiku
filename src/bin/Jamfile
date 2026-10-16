@@ -4,7 +4,7 @@ HAIKU_MULTIPLE_LOCALIZED_TARGETS on $(SUBDIR) = 1 ;
 
 AddSubDirSupportedPlatforms libbe_test ;
 
-UsePrivateHeaders app interface libroot shared storage support tracker usb ;
+UsePrivateHeaders app interface libroot osd shared storage support tracker usb ;
 UsePrivateSystemHeaders ;
 SubDirHdrs $(HAIKU_TOP) src add-ons kernel file_cache ;
 UseBuildFeatureHeaders ncurses ;
@@ -198,6 +198,11 @@ StdBinCommands
 StdBinCommands
 	setvolume.cpp
 	: be libmedia.so [ TargetLibsupc++ ] : $(haiku-utils_rsrc) ;
+
+# standard commands that need libbe.so, libsupc++.so and private shared headers
+StdBinCommands
+	mediakey.cpp
+	: be [ TargetLibsupc++ ] : $(haiku-utils_rsrc) ;
 
 # standard commands that need libbe.so, libpackage.so, libsupc++.so
 StdBinCommands

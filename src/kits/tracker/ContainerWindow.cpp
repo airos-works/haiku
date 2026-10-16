@@ -538,6 +538,9 @@ BContainerWindow::QuitRequested()
 		be_app->PostMessage(kCloseAllWindows);
 	}
 
+	if (PoseView() != NULL)
+		PoseView()->HideQuickLook();
+
 	Hide();
 		// this will close the window instantly, even if
 		// the file system is very busy right now
@@ -1277,6 +1280,16 @@ BContainerWindow::SelectionChanged()
 
 
 void
+BContainerWindow::WindowActivated(bool active)
+{
+	// The Quick Look panel belongs to the window that has the keyboard.
+	if (!active && PoseView() != NULL)
+		PoseView()->HideQuickLook();
+	_inherited::WindowActivated(active);
+}
+
+
+void
 BContainerWindow::Zoom(BPoint, float, float)
 {
 	BRect oldZoomRect(fSavedZoomRect);
@@ -1737,6 +1750,7 @@ BContainerWindow::AddFileMenu(BMenu* menu)
 	menu->AddItem(Shortcuts()->OpenItem());
 	// "Edit query" and "Open with..." inserted here,
 	// see UpdateMenu(), SetupEditQueryItem() and SetupOpenWithMenu()
+	menu->AddItem(Shortcuts()->QuickLookItem());
 	menu->AddItem(Shortcuts()->GetInfoItem());
 	menu->AddItem(Shortcuts()->EditNameItem());
 
@@ -1879,6 +1893,7 @@ BContainerWindow::AddShortcuts()
 	AddShortcut('N', B_COMMAND_KEY, new BMessage(kNewFolder), PoseView());
 	AddShortcut('O', B_COMMAND_KEY, new BMessage(kOpenSelection), PoseView());
 	AddShortcut('I', B_COMMAND_KEY, new BMessage(kGetInfo), PoseView());
+	AddShortcut('Y', B_COMMAND_KEY, new BMessage(kQuickLook), PoseView());
 	AddShortcut('E', B_COMMAND_KEY, new BMessage(kEditName), PoseView());
 	AddShortcut('D', B_COMMAND_KEY, new BMessage(kDuplicateSelection), PoseView());
 	AddShortcut('K', B_COMMAND_KEY, new BMessage(kCleanup), PoseView());
@@ -2553,6 +2568,7 @@ BContainerWindow::AddPoseContextMenu(BMenu* menu)
 	menu->AddItem(Shortcuts()->OpenItem());
 	// "Edit query" and "Open with..." inserted here,
 	// see UpdateMenu(), SetupEditQueryItem() and SetupOpenWithMenu()
+	menu->AddItem(Shortcuts()->QuickLookItem());
 	menu->AddItem(Shortcuts()->GetInfoItem());
 	menu->AddItem(Shortcuts()->EditNameItem());
 

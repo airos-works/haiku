@@ -14,6 +14,7 @@
 
 #include <stdio.h>
 
+#include <ACPI.h>
 #include <bus/PCI.h>
 #include <USB3.h>
 #include <KernelExport.h>
@@ -104,7 +105,7 @@ uninit_bus(void* bus_cookie)
 static status_t
 suspend_bus(void* bus_cookie, int32 state)
 {
-	return ((XHCI*)bus_cookie)->Suspend();
+	return ((XHCI*)bus_cookie)->Suspend(state);
 }
 
 
@@ -380,6 +381,8 @@ XHCI::XHCI(pci_info *info, 	pci_device_module_info* pci, pci_device* device, Sta
 		fErstPhysical(0),
 		fCmdRingPhysical(0),
 		fPortsDisconnected(false),
+		fIdleSuspended(false),
+		fIdleHalted(false),
 		fCmdCompSem(-1),
 		fStopThreads(false),
 		fRootHub(NULL),
@@ -996,10 +999,16 @@ XHCI::_SetInterruptModeration()
 /*!	The controller loses its state while the system sleeps. Instead of saving
 	and restoring it, all devices are detached before suspending, and
 	enumerated again once the controller was reinitialized on resume.
+
+	Suspend to idle (\a state ACPI_POWER_STATE_ON) keeps the controller
+	powered, so the devices stay attached instead, see _SuspendToIdle().
 */
 status_t
-XHCI::Suspend()
+XHCI::Suspend(int32 state)
 {
+	if (state == ACPI_POWER_STATE_ON)
+		return _SuspendToIdle();
+
 	TRACE_ALWAYS("suspending\n");
 
 	fPortsDisconnected = true;
@@ -1012,6 +1021,9 @@ XHCI::Suspend()
 status_t
 XHCI::Resume()
 {
+	if (fIdleSuspended)
+		return _ResumeFromIdle();
+
 	TRACE_ALWAYS("resuming\n");
 
 	ControllerHalt();
@@ -1057,6 +1069,223 @@ XHCI::Resume()
 
 	// let the hub explore connected devices again
 	fPortsDisconnected = false;
+	return B_OK;
+}
+
+
+/*!	Suspends the bus while the system suspends to idle, as Linux does: the
+	endpoints are stopped with their transfers left queued, the root ports
+	with a device are suspended (U3), which suspends the devices behind them
+	(and behind their hubs), and the controller is halted. The devices stay
+	attached; resuming continues the transfers where they stopped.
+	Transfers submitted while the bus is suspended are queued and start on
+	resume (drivers would lose a buffer they cannot queue again); commands
+	are refused while the controller is halted.
+*/
+status_t
+XHCI::_SuspendToIdle()
+{
+	TRACE_ALWAYS("suspending to idle\n");
+
+	fIdleSuspended = true;
+
+	// Stop every running endpoint, so that the devices are idle before
+	// their ports are suspended. (XHCI 1.2 § 4.15.1)
+	int32 stoppedEndpoints = 0;
+	for (int32 slot = 1; slot < XHCI_MAX_DEVICES; slot++) {
+		xhci_device* device = &fDevices[slot];
+		if (device->slot == 0)
+			continue;
+
+		for (int32 i = 0; i < XHCI_MAX_ENDPOINTS - 1; i++) {
+			xhci_endpoint* endpoint = &device->endpoints[i];
+			if (endpoint->trbs == NULL
+				|| _GetEndpointState(endpoint) != ENDPOINT_STATE_RUNNING) {
+				continue;
+			}
+			if (StopEndpoint(true, endpoint) == B_OK)
+				stoppedEndpoints++;
+		}
+	}
+
+	// A SuperSpeed hub does not take the devices behind it along into U3 and
+	// back, as a USB 2 hub does: they would have to be suspended through
+	// the hub first, one by one. Until the stack can, ports with one stay up.
+	// So do the ports of devices whose drivers asked to keep them awake.
+	bool superSpeedHub[XHCI_MAX_PORTS] = {};
+	bool keepAwake[XHCI_MAX_PORTS] = {};
+	for (int32 slot = 1; slot < XHCI_MAX_DEVICES; slot++) {
+		xhci_device* device = &fDevices[slot];
+		if (device->slot == 0 || device->input_ctx == NULL)
+			continue;
+
+		uint32 dwslot0 = _ReadContext(&device->input_ctx->slot.dwslot0);
+		uint32 rhPort = SLOT_1_RH_PORT_GET(
+			_ReadContext(&device->input_ctx->slot.dwslot1));
+		if (rhPort < 1 || rhPort > fPortCount)
+			continue;
+		if ((dwslot0 & SLOT_0_HUB_BIT) != 0 && SLOT_0_ROUTE_GET(dwslot0) == 0
+			&& SLOT_0_SPEED_GET(dwslot0) >= 4) {
+			superSpeedHub[rhPort - 1] = true;
+		}
+		if (device->keep_awake)
+			keepAwake[rhPort - 1] = true;
+	}
+
+	int32 suspendedPorts = 0;
+	for (uint8 i = 0; i < fPortCount; i++) {
+		fPortIdleSuspended[i] = false;
+		if (_IsDisabledSuperSpeedPort(i))
+			continue;
+		if (superSpeedHub[i]) {
+			TRACE_ALWAYS("port %" B_PRIu8 " has a SuperSpeed hub, not "
+				"suspending it\n", i);
+			continue;
+		}
+		if (keepAwake[i]) {
+			TRACE_ALWAYS("port %" B_PRIu8 " is kept awake by its driver\n",
+				i);
+			continue;
+		}
+
+		uint32 portStatus = ReadOpReg(XHCI_PORTSC(i));
+		if ((portStatus & PS_PED) == 0 || (portStatus & PS_PR) != 0
+			|| (portStatus & PS_PLS_MASK) > PS_XDEV_U2) {
+			continue;
+		}
+
+		WriteOpReg(XHCI_PORTSC(i),
+			(portStatus & ~(PS_CLEAR | PS_PLS_MASK)) | PS_LWS | PS_XDEV_U3);
+		fPortIdleSuspended[i] = true;
+		suspendedPorts++;
+	}
+
+	// A SuperSpeed link takes a few milliseconds to reach U3.
+	bigtime_t timeout = system_time() + 100000;
+	for (uint8 i = 0; i < fPortCount; i++) {
+		if (!fPortIdleSuspended[i])
+			continue;
+		uint32 portStatus;
+		while (((portStatus = ReadOpReg(XHCI_PORTSC(i))) & PS_PLS_MASK)
+				!= PS_XDEV_U3 && system_time() < timeout) {
+			snooze(1000);
+		}
+		if ((portStatus & PS_PLS_MASK) != PS_XDEV_U3) {
+			TRACE_ERROR("port %" B_PRIu8 " did not suspend: %#" B_PRIx32 "\n",
+				i, portStatus);
+		}
+	}
+
+	fIdleHalted = true;
+	status_t status = ControllerHalt();
+
+	TRACE_ALWAYS("suspended to idle: %" B_PRId32 " endpoints stopped, %"
+		B_PRId32 " ports suspended\n", stoppedEndpoints, suspendedPorts);
+	return status;
+}
+
+
+status_t
+XHCI::_ResumeFromIdle()
+{
+	TRACE_ALWAYS("resuming from idle\n");
+
+	WriteOpReg(XHCI_CMD, ReadOpReg(XHCI_CMD) | CMD_RUN);
+	if (WaitOpBits(XHCI_STS, STS_HCH, 0) != B_OK)
+		TRACE_ERROR("HCH start up timeout after suspend to idle\n");
+	fIdleHalted = false;
+
+	// A SuperSpeed link goes back to U0 directly, a USB 2 port signals
+	// resume for 20 ms first. (XHCI 1.2 § 4.15.2)
+	bool usb2Resume = false;
+	for (uint8 i = 0; i < fPortCount; i++) {
+		if (!fPortIdleSuspended[i])
+			continue;
+
+		uint32 portStatus = ReadOpReg(XHCI_PORTSC(i));
+		if ((portStatus & PS_PLS_MASK) != PS_XDEV_U3) {
+			// gone, or woken by the device: the hub sees to it
+			fPortIdleSuspended[i] = false;
+			continue;
+		}
+
+		uint32 state = PS_XDEV_U0;
+		if (fPortSpeeds[i] < USB_SPEED_SUPERSPEED) {
+			state = PS_XDEV_RESUME;
+			usb2Resume = true;
+		}
+		WriteOpReg(XHCI_PORTSC(i),
+			(portStatus & ~(PS_CLEAR | PS_PLS_MASK)) | PS_LWS | state);
+	}
+
+	if (usb2Resume) {
+		snooze(20000);
+		for (uint8 i = 0; i < fPortCount; i++) {
+			if (!fPortIdleSuspended[i]
+				|| fPortSpeeds[i] >= USB_SPEED_SUPERSPEED) {
+				continue;
+			}
+			uint32 portStatus = ReadOpReg(XHCI_PORTSC(i));
+			if ((portStatus & PS_PLS_MASK) != PS_XDEV_RESUME)
+				continue;
+			portStatus &= ~(PS_CLEAR | PS_PLS_MASK);
+			WriteOpReg(XHCI_PORTSC(i), portStatus | PS_LWS | PS_XDEV_U0);
+		}
+	}
+
+	int32 resumedPorts = 0;
+	bigtime_t timeout = system_time() + 100000;
+	for (uint8 i = 0; i < fPortCount; i++) {
+		if (!fPortIdleSuspended[i])
+			continue;
+		fPortIdleSuspended[i] = false;
+
+		uint32 portStatus;
+		while (((portStatus = ReadOpReg(XHCI_PORTSC(i))) & PS_PLS_MASK)
+				!= PS_XDEV_U0 && system_time() < timeout) {
+			snooze(1000);
+		}
+		if ((portStatus & PS_PLS_MASK) != PS_XDEV_U0) {
+			TRACE_ERROR("port %" B_PRIu8 " did not resume: %#" B_PRIx32 "\n",
+				i, portStatus);
+			continue;
+		}
+
+		// the link change was ours
+		WriteOpReg(XHCI_PORTSC(i), (portStatus & ~PS_CLEAR) | PS_PLC);
+		resumedPorts++;
+	}
+
+	// USB 2 devices take 10 ms to recover from a resume (USB 2.0 § 7.1.7.7).
+	if (usb2Resume)
+		snooze(10000);
+
+	fIdleSuspended = false;
+
+	// Restart the endpoints that still have transfers queued.
+	int32 restartedEndpoints = 0;
+	for (int32 slot = 1; slot < XHCI_MAX_DEVICES; slot++) {
+		xhci_device* device = &fDevices[slot];
+		if (device->slot == 0)
+			continue;
+
+		for (int32 i = 0; i < XHCI_MAX_ENDPOINTS - 1; i++) {
+			xhci_endpoint* endpoint = &device->endpoints[i];
+			if (endpoint->trbs == NULL)
+				continue;
+
+			mutex_lock(&endpoint->lock);
+			bool queued = !endpoint->td_list.IsEmpty();
+			mutex_unlock(&endpoint->lock);
+			if (queued) {
+				Ring(device->slot, endpoint->id + 1);
+				restartedEndpoints++;
+			}
+		}
+	}
+
+	TRACE_ALWAYS("resumed from idle: %" B_PRId32 " ports resumed, %" B_PRId32
+		" endpoints restarted\n", resumedPorts, restartedEndpoints);
 	return B_OK;
 }
 
@@ -1404,7 +1633,7 @@ XHCI::SubmitNormalRequest(Transfer *transfer)
 			return status;
 		}
 		WriteDescriptor(td, transfer->Vector(),
-			transfer->VectorCount(), transfer->IsPhysical());
+			transfer->VectorCount(), transfer->IsPhysical(), isochronousData);
 	}
 
 	td->transfer = transfer;
@@ -1586,7 +1815,7 @@ XHCI::CheckDebugTransfer(Transfer *transfer)
 
 		if (status == B_OK && directionIn && !_DirectPhysical(transfer)) {
 			ReadDescriptor(td, transfer->Vector(), transfer->VectorCount(),
-				transfer->IsPhysical());
+				transfer->IsPhysical(), transfer->IsochronousData());
 		}
 
 		FreeDescriptor(td);
@@ -1605,6 +1834,222 @@ XHCI::CancelDebugTransfer(Transfer *transfer)
 {
 	while (CheckDebugTransfer(transfer) == B_DEV_PENDING)
 		spin(100);
+}
+
+
+/*!	A device whose driver powered part of it down (a network adapter's
+	PHY) keeps its root port out of U3 in a suspend to idle: in U3 the device
+	may power it up again on its own. The controller still halts: a
+	SuperSpeed link just stays in U0, idle.
+*/
+status_t
+XHCI::SetKeepAwake(Device *usbDevice, bool keepAwake)
+{
+	xhci_device* device = (xhci_device*)usbDevice->ControllerCookie();
+	if (device == NULL || device->slot == 0)
+		return B_BAD_VALUE;
+
+	device->keep_awake = keepAwake;
+	return B_OK;
+}
+
+
+#if defined(__i386__) || defined(__x86_64__)
+
+
+static status_t
+acpi_integer(acpi_module_info* acpi, acpi_handle handle, const char* name,
+	uint64& value)
+{
+	acpi_object_type object;
+	acpi_data buffer;
+	buffer.pointer = &object;
+	buffer.length = sizeof(object);
+	status_t status = acpi->evaluate_method(handle, name, NULL, &buffer);
+	if (status != B_OK)
+		return status;
+	if (object.object_type != ACPI_TYPE_INTEGER)
+		return B_BAD_TYPE;
+
+	value = object.integer.integer;
+	return B_OK;
+}
+
+
+static acpi_handle
+acpi_child_at(acpi_module_info* acpi, acpi_handle parent, uint64 address)
+{
+	acpi_handle child = NULL;
+	while (acpi->get_next_object(ACPI_TYPE_DEVICE, parent, &child) == B_OK) {
+		uint64 value;
+		if (acpi_integer(acpi, child, "_ADR", value) == B_OK
+			&& value == address) {
+			return child;
+		}
+	}
+	return NULL;
+}
+
+
+/*!	Looks for the PCI function \a target among the ACPI devices below
+	\a parent, whose devices sit on PCI bus \a bus, and below the bridges
+	there whose bus range holds the target's bus.
+*/
+static acpi_handle
+acpi_find_pci_function(acpi_module_info* acpi, pci_module_info* pci,
+	acpi_handle parent, uint8 bus, const pci_info& target, int32 depth)
+{
+	acpi_handle child = NULL;
+	while (acpi->get_next_object(ACPI_TYPE_DEVICE, parent, &child) == B_OK) {
+		uint64 address;
+		if (acpi_integer(acpi, child, "_ADR", address) != B_OK)
+			continue;
+
+		uint16 device = address >> 16;
+		uint16 function = address & 0xffff;
+		if (device >= 32 || function >= 8)
+			continue;
+		if (bus == target.bus && device == target.device
+			&& function == target.function) {
+			return child;
+		}
+
+		if (depth == 0
+			|| pci->read_pci_config(bus, device, function, PCI_device_id, 2)
+				== 0xffff) {
+			continue;
+		}
+		uint8 headerType = pci->read_pci_config(bus, device, function,
+			PCI_header_type, 1);
+		if ((headerType & PCI_header_type_mask)
+				!= PCI_header_type_PCI_to_PCI_bridge) {
+			continue;
+		}
+		uint8 secondaryBus = pci->read_pci_config(bus, device, function,
+			PCI_secondary_bus, 1);
+		uint8 subordinateBus = pci->read_pci_config(bus, device, function,
+			PCI_subordinate_bus, 1);
+		if (secondaryBus <= bus || target.bus < secondaryBus
+			|| target.bus > subordinateBus) {
+			continue;
+		}
+
+		acpi_handle found = acpi_find_pci_function(acpi, pci, child,
+			secondaryBus, target, depth - 1);
+		if (found != NULL)
+			return found;
+	}
+	return NULL;
+}
+
+
+static acpi_handle
+acpi_find_pci_function(acpi_module_info* acpi, const pci_info& target)
+{
+	pci_module_info* pci;
+	if (get_module(B_PCI_MODULE_NAME, (module_info**)&pci) != B_OK)
+		return NULL;
+
+	acpi_handle found = NULL;
+	const char* rootBridgeIDs[] = { "PNP0A08", "PNP0A03" };
+	for (int32 i = 0; i < 2 && found == NULL; i++) {
+		char path[256];
+		for (uint32 index = 0; found == NULL
+				&& acpi->get_device(rootBridgeIDs[i], index, path,
+					sizeof(path)) == B_OK; index++) {
+			acpi_handle rootBridge;
+			if (acpi->get_handle(NULL, path, &rootBridge) != B_OK)
+				continue;
+
+			uint64 bus = 0;
+			acpi_integer(acpi, rootBridge, "_BBN", bus);
+			found = acpi_find_pci_function(acpi, pci, rootBridge, bus, target,
+				8);
+		}
+	}
+
+	put_module(B_PCI_MODULE_NAME);
+	return found;
+}
+
+
+/*!	Returns the power resource that resets the device behind port \a index
+	of the controller \a controller (the first one its ACPI port lists in
+	_PRR), or NULL. The root hub has address 0 below the controller, its
+	ports count from 1, as the controller's.
+*/
+static acpi_handle
+acpi_port_reset_resource(acpi_module_info* acpi, const pci_info& controller,
+	uint8 index)
+{
+	acpi_handle controllerHandle = acpi_find_pci_function(acpi, controller);
+	if (controllerHandle == NULL)
+		return NULL;
+	acpi_handle rootHub = acpi_child_at(acpi, controllerHandle, 0);
+	if (rootHub == NULL)
+		return NULL;
+	acpi_handle port = acpi_child_at(acpi, rootHub, index + 1);
+	if (port == NULL)
+		return NULL;
+
+	acpi_object_type resources[4];
+	if (acpi->evaluate_object(port, "_PRR", NULL, resources,
+			sizeof(resources)) != B_OK
+		|| resources[0].object_type != ACPI_TYPE_PACKAGE
+		|| resources[0].package.count == 0) {
+		return NULL;
+	}
+
+	acpi_handle resource = NULL;
+	acpi_object_type& reference = resources[0].package.objects[0];
+	if (reference.object_type == ACPI_TYPE_LOCAL_REFERENCE)
+		resource = reference.reference.handle;
+	else if (reference.object_type == ACPI_TYPE_STRING)
+		acpi->get_handle(NULL, reference.string.string, &resource);
+	return resource;
+}
+
+
+#endif	// __i386__ || __x86_64__
+
+
+/*!	A device built into the machine (the Bluetooth part of a Wi-Fi card) can
+	have a reset line the firmware describes as the _PRR power resource of
+	its port in ACPI. That resource's _RST holds the device in reset a moment
+	and lets it go; Linux resets Intel Bluetooth controllers the same way.
+*/
+status_t
+XHCI::PlatformResetPort(uint8 index)
+{
+#if defined(__i386__) || defined(__x86_64__)
+	if (fPCIInfo == NULL || index >= fPortCount)
+		return B_NOT_SUPPORTED;
+
+	acpi_module_info* acpi;
+	if (get_module(B_ACPI_MODULE_NAME, (module_info**)&acpi) != B_OK)
+		return B_NOT_SUPPORTED;
+
+	status_t status = B_NOT_SUPPORTED;
+	acpi_handle resource = acpi_port_reset_resource(acpi, *fPCIInfo, index);
+	if (resource != NULL) {
+		char name[128] = "?";
+		acpi_data nameBuffer;
+		nameBuffer.pointer = name;
+		nameBuffer.length = sizeof(name);
+		acpi->ns_handle_to_pathname(resource, &nameBuffer);
+
+		TRACE_ALWAYS("port %" B_PRIu8 ": device does not respond, resetting it "
+			"with %s._RST\n", index, name);
+		status = acpi->evaluate_method(resource, "_RST", NULL, NULL);
+		if (status != B_OK)
+			TRACE_ERROR("port %" B_PRIu8 ": %s._RST failed\n", index, name);
+	}
+
+	put_module(B_ACPI_MODULE_NAME);
+	return status;
+#else
+	return B_NOT_SUPPORTED;
+#endif
 }
 
 
@@ -1839,32 +2284,70 @@ XHCI::FreeDescriptor(xhci_td *descriptor)
 }
 
 
-size_t
-XHCI::WriteDescriptor(xhci_td *descriptor, generic_io_vec *vector, size_t vectorCount, bool physical)
+/*!	Copies between a transfer's vectors and its descriptor's buffers, one
+	buffer filled after the other. An isochronous transfer has a buffer per
+	packet instead, each holding that packet's request length: its data is
+	the packets back to back, as the other controllers take it. (Filling
+	each buffer to the largest packet put the start of the next packet into
+	a shorter one, and the data of a stream of 44 and 45 sample packets
+	went out of step.)
+*/
+static size_t
+copy_descriptor_data(xhci_td* descriptor, generic_io_vec* vector,
+	size_t vectorCount, bool physical,
+	const usb_isochronous_data* isochronous, bool toBuffers)
 {
-	size_t written = 0;
+	size_t bufferCount = descriptor->buffer_count;
+	if (isochronous != NULL)
+		bufferCount = min_c(bufferCount, isochronous->packet_count);
 
+	// what goes into buffer index
+	auto bufferSize = [&](size_t index) -> size_t {
+		if (isochronous == NULL)
+			return descriptor->buffer_size;
+		return min_c(descriptor->buffer_size,
+			(size_t)isochronous->packet_descriptors[index].request_length);
+	};
+
+	size_t copied = 0;
 	size_t bufIdx = 0, bufUsed = 0;
 	for (size_t vecIdx = 0; vecIdx < vectorCount; vecIdx++) {
 		size_t length = vector[vecIdx].length;
 
-		while (length > 0 && bufIdx < descriptor->buffer_count) {
-			size_t toCopy = min_c(length, descriptor->buffer_size - bufUsed);
-			status_t status = generic_memcpy(
-				(generic_addr_t)descriptor->buffers[bufIdx] + bufUsed, false,
-				vector[vecIdx].base + (vector[vecIdx].length - length), physical,
-				toCopy);
-			ASSERT_ALWAYS(status == B_OK);
+		while (length > 0 && bufIdx < bufferCount) {
+			size_t bufSize = bufferSize(bufIdx);
+			size_t toCopy = min_c(length, bufSize - bufUsed);
+			if (toCopy > 0) {
+				generic_addr_t buffer
+					= (generic_addr_t)descriptor->buffers[bufIdx] + bufUsed;
+				generic_addr_t data = vector[vecIdx].base
+					+ (vector[vecIdx].length - length);
+				status_t status = toBuffers
+					? generic_memcpy(buffer, false, data, physical, toCopy)
+					: generic_memcpy(data, physical, buffer, false, toCopy);
+				ASSERT_ALWAYS(status == B_OK);
+			}
 
-			written += toCopy;
+			copied += toCopy;
 			bufUsed += toCopy;
 			length -= toCopy;
-			if (bufUsed == descriptor->buffer_size) {
+			if (bufUsed == bufSize) {
 				bufIdx++;
 				bufUsed = 0;
 			}
 		}
 	}
+
+	return copied;
+}
+
+
+size_t
+XHCI::WriteDescriptor(xhci_td *descriptor, generic_io_vec *vector, size_t vectorCount, bool physical,
+	const usb_isochronous_data* isochronous)
+{
+	size_t written = copy_descriptor_data(descriptor, vector, vectorCount,
+		physical, isochronous, true);
 
 	TRACE("wrote descriptor (%" B_PRIuSIZE " bytes)\n", written);
 	return written;
@@ -1872,30 +2355,11 @@ XHCI::WriteDescriptor(xhci_td *descriptor, generic_io_vec *vector, size_t vector
 
 
 size_t
-XHCI::ReadDescriptor(xhci_td *descriptor, generic_io_vec *vector, size_t vectorCount, bool physical)
+XHCI::ReadDescriptor(xhci_td *descriptor, generic_io_vec *vector, size_t vectorCount, bool physical,
+	const usb_isochronous_data* isochronous)
 {
-	size_t read = 0;
-
-	size_t bufIdx = 0, bufUsed = 0;
-	for (size_t vecIdx = 0; vecIdx < vectorCount; vecIdx++) {
-		size_t length = vector[vecIdx].length;
-
-		while (length > 0 && bufIdx < descriptor->buffer_count) {
-			size_t toCopy = min_c(length, descriptor->buffer_size - bufUsed);
-			status_t status = generic_memcpy(
-				vector[vecIdx].base + (vector[vecIdx].length - length), physical,
-				(generic_addr_t)descriptor->buffers[bufIdx] + bufUsed, false, toCopy);
-			ASSERT_ALWAYS(status == B_OK);
-
-			read += toCopy;
-			bufUsed += toCopy;
-			length -= toCopy;
-			if (bufUsed == descriptor->buffer_size) {
-				bufIdx++;
-				bufUsed = 0;
-			}
-		}
-	}
+	size_t read = copy_descriptor_data(descriptor, vector, vectorCount,
+		physical, isochronous, false);
 
 	TRACE("read descriptor (%" B_PRIuSIZE " bytes)\n", read);
 	return read;
@@ -2827,6 +3291,10 @@ XHCI::GetPortStatus(uint8 index, usb_port_status* status)
 			status->change |= PORT_CHANGE_BH_PORT_RESET;
 	}
 
+	// the ports change while they are suspended to idle, the devices stay
+	if (fIdleSuspended)
+		status->change = 0;
+
 	return B_OK;
 }
 
@@ -3025,6 +3493,10 @@ XHCI::Ring(uint8 slot, uint8 endpoint)
 		panic("Ring() invalid slot/endpoint combination\n");
 	if (slot > fSlotCount || endpoint >= XHCI_MAX_ENDPOINTS)
 		panic("Ring() invalid slot or endpoint\n");
+	if (slot != 0 && fIdleSuspended) {
+		// rung again on resume
+		return;
+	}
 
 	_DeviceMemoryBarrier();
 	WriteDoorReg32(XHCI_DOORBELL(slot), XHCI_DOORBELL_TARGET(endpoint)
@@ -3133,6 +3605,16 @@ XHCI::HandleTransferComplete(xhci_trb* trb)
 		// These occur on isochronous endpoints when there is no TRB ready to be
 		// executed at the appropriate time. (XHCI 1.2 § 4.10.3.1 p204.)
 		endpoint->status = completionCode;
+		return;
+	}
+
+	if ((completionCode == COMP_STOPPED
+			|| completionCode == COMP_STOPPED_LENGTH_INVALID
+			|| completionCode == COMP_STOPPED_SHORT_PACKET)
+		&& endpoint->cancel_count == 0) {
+		// Stopped for a suspend: the transfer continues at this TRB once the
+		// endpoint is rung again. (Or for its removal, which frees the
+		// descriptors itself.)
 		return;
 	}
 
@@ -3278,6 +3760,9 @@ XHCI::DumpRing(xhci_trb *trbs, uint32 size)
 status_t
 XHCI::DoCommand(xhci_trb* trb)
 {
+	if (fIdleHalted)
+		return B_DEV_NOT_READY;
+
 	if (!Lock()) {
 		TRACE("Unable to get lock!\n");
 		return B_ERROR;
@@ -3643,7 +4128,8 @@ XHCI::FinishTransfers()
 				status_t status = transfer->PrepareKernelAccess();
 				if (status == B_OK) {
 					ReadDescriptor(td, transfer->Vector(),
-						transfer->VectorCount(), transfer->IsPhysical());
+						transfer->VectorCount(), transfer->IsPhysical(),
+						transfer->IsochronousData());
 				} else {
 					callbackStatus = status;
 				}

@@ -1377,6 +1377,12 @@ ShutdownProcess::_WorkerDoShutdown()
 		_WaitForDebuggedTeams();
 	}
 
+	// Apps save their settings as they quit. Write them back after each
+	// phase: should a later one bring the machine down (a driver's cleanup
+	// as its users end), files written but only cached come back with their
+	// size and the old contents of their blocks.
+	sync();
+
 	// tell TRoster not to accept new applications anymore
 	fRoster->SetShuttingDown(true);
 
@@ -1384,11 +1390,13 @@ ShutdownProcess::_WorkerDoShutdown()
 	_SetPhase(SYSTEM_APP_TERMINATION_PHASE);
 	_QuitApps(fSystemApps, true);
 	_WaitForDebuggedTeams();
+	sync();
 
 	// phase 3: terminate the background apps
 	_SetPhase(BACKGROUND_APP_TERMINATION_PHASE);
 	_QuitBackgroundApps();
 	_WaitForDebuggedTeams();
+	sync();
 
 	// phase 4: terminate the other processes
 	_SetPhase(OTHER_PROCESSES_TERMINATION_PHASE);
@@ -1397,6 +1405,7 @@ ShutdownProcess::_WorkerDoShutdown()
 	_WaitForBackgroundApps();
 	_KillBackgroundApps();
 	_WaitForDebuggedTeams();
+	sync();
 
 	// we're through: do the shutdown
 	_SetPhase(DONE_PHASE);

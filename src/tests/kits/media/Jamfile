@@ -31,4 +31,4 @@ SubInclude HAIKU_TOP src tests kits media playsound ;
 SubInclude HAIKU_TOP src tests kits media soundplayer ;
 SubInclude HAIKU_TOP src tests kits media streamer_sniff_test ;
 SubInclude HAIKU_TOP src tests kits media wav_reader_test ;
-
+SubInclude HAIKU_TOP src tests kits media lab_audio ;

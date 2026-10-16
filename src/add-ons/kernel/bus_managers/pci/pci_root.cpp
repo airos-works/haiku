@@ -123,9 +123,19 @@ pci_root_std_ops(int32 op, ...)
 }
 
 
+static bool sSuspendedToIdle;
+
+
 static status_t
 pci_root_suspend(void* cookie, int32 state)
 {
+	// Suspend to idle keeps the devices powered, and so their configuration;
+	// writing it back under devices that are still running would only
+	// disturb them (it disables them for a moment).
+	sSuspendedToIdle = state == ACPI_POWER_STATE_ON;
+	if (sSuspendedToIdle)
+		return B_OK;
+
 	gPCI->SaveConfiguration();
 	return B_OK;
 }
@@ -134,6 +144,11 @@ pci_root_suspend(void* cookie, int32 state)
 static status_t
 pci_root_resume(void* cookie)
 {
+	if (sSuspendedToIdle) {
+		sSuspendedToIdle = false;
+		return B_OK;
+	}
+
 	gPCI->RestoreConfiguration();
 	return B_OK;
 }

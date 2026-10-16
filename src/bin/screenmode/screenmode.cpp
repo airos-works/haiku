@@ -6,6 +6,7 @@
 
 #include <ctype.h>
 #include <getopt.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +16,7 @@
 #include <Application.h>
 #include <InterfacePrivate.h>
 #include <Message.h>
+#include <OnScreenDisplay.h>
 #include <Screen.h>
 
 #include "ScreenMode.h"
@@ -256,7 +258,9 @@ usage(int status)
 		"  -l  --list\t\tdisplay a list of the available modes.\n"
 		"  -q  --dont-confirm\tdo not confirm the mode after setting it.\n"
 		"  -b  --brightness f\tset brightness (range 0 to 1).\n"
-		"  -b  --brightness +/-f\tchange brightness by given amount.\n"
+		"  -b  --brightness +/-f\tchange brightness by given amount, to a "
+			"multiple of\n"
+		"\t\t\tit, and show it on screen.\n"
 		"  -B  --get-brightness\tprint the current brightness to stdout.\n"
 		"\t\t\tinstead of the screen mode\n"
 		"  -m  --modeline\taccept and print X-style modeline modes:\n"
@@ -548,7 +552,14 @@ main(int argc, char** argv)
 		if (relativeBrightness) {
 			float previousBrightness;
 			screen.GetBrightness(&previousBrightness);
+
+			// The steps land on multiples of their size, whatever the
+			// brightness was before: the brightness keys go through the
+			// same levels each time.
+			float step = fabsf(brightness);
 			brightness = previousBrightness + brightness;
+			if (step > 0)
+				brightness = roundf(brightness / step) * step;
 
 			// Clamp to min/max values
 			if (brightness < 0.f)
@@ -560,7 +571,13 @@ main(int argc, char** argv)
 
 		if (brightness < 0.f || brightness > 1.f)
 			printf("Brightness %f is out of range\n", brightness);
-		screen.SetBrightness(brightness);
+		if (screen.SetBrightness(brightness) == B_OK && relativeBrightness
+			&& screen.GetBrightness(&brightness) == B_OK) {
+			BMessage message(kMsgShowLevel);
+			message.AddInt32("kind", B_OSD_BRIGHTNESS);
+			message.AddFloat("level", brightness);
+			show_osd_level(message);
+		}
 	}
 
 	if (listModes) {

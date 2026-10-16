@@ -8,6 +8,7 @@
 #include <bluetooth/bdaddrUtils.h>
 #include <bluetooth/bluetooth_error.h>
 #include <bluetooth/HCI/btHCI_transport.h>
+#include <bluetooth/HCI/btHCI_command.h>
 #include <bluetooth/HCI/btHCI_event.h>
 #include <ByteOrder.h>
 
@@ -111,6 +112,22 @@ PostEvent(bluetooth_device* ndev, void* event, size_t size)
 			conn->isLE = true;
 			TRACE("%s: Registered LE connection handle=%#x\n",
 				__func__, handle);
+			break;
+		}
+
+		case HCI_EVENT_CMD_COMPLETE:
+		{
+			// Command Complete: ncmd, opcode, status. A successful HCI
+			// Reset ended every link the controller had, including those
+			// it kept from before this boot that we never saw come up.
+			if (outgoingEvent->elen < 4
+				|| size < sizeof(hci_event_header) + 4)
+				break;
+			const uint8* data = (const uint8*)(outgoingEvent + 1);
+			uint16 opcode = data[1] | (data[2] << 8);
+			if (opcode == PACK_OPCODE(OGF_CONTROL_BASEBAND, OCF_RESET)
+				&& data[3] == BT_OK)
+				RemoveConnections(ndev->index);
 			break;
 		}
 

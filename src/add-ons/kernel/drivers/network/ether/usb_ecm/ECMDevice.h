@@ -31,6 +31,8 @@ public:
 		status_t			CompareAndReattach(usb_device device);
 
 private:
+		bool				_HasECMInterfaces(
+								const usb_configuration_info* config) const;
 static	void				_ReadCallback(void *cookie, int32 status,
 								void *data, size_t actualLength);
 static	void				_WriteCallback(void *cookie, int32 status,
@@ -44,6 +46,15 @@ static	void				_NotifyCallback(void *cookie, int32 status,
 		status_t			_SetupDevice();
 		status_t			_ReadMACAddress(usb_device device, uint8 *buffer);
 
+		// Realtek RTL815x PHY power
+		bool				_HasRealtekPHY() const;
+		status_t			_RealtekRead(uint16 index, uint32 *value);
+		status_t			_RealtekWriteWord(uint16 index, uint16 value);
+		status_t			_RealtekPHYRead(uint16 reg, uint16 *value);
+		status_t			_RealtekPHYWrite(uint16 reg, uint16 value);
+		void				_SetPHYPower(bool on);
+		void				_SetKeepAwake(bool keepAwake);
+
 		// state tracking
 		status_t			fStatus;
 		bool				fOpen;
@@ -52,6 +63,8 @@ static	void				_NotifyCallback(void *cookie, int32 status,
 		usb_device			fDevice;
 		uint16				fVendorID;
 		uint16				fProductID;
+		bool				fKeepAwake;
+			// the bus keeps the device out of USB suspend
 
 		// interface and device infos
 		uint8				fControlInterfaceIndex;

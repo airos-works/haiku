@@ -236,6 +236,10 @@ virtual	status_t						CancelQueuedTransfers(Pipe *pipe,
 virtual	status_t						NotifyPipeChange(Pipe *pipe,
 											usb_change change);
 
+virtual	status_t						SetKeepAwake(Device *device,
+											bool keepAwake);
+virtual	status_t						PlatformResetPort(uint8 index);
+
 		Object *						RootObject() const
 											{ return fRootObject; }
 
@@ -683,6 +687,7 @@ private:
 		usb_port_status					fInterruptStatus[USB_MAX_PORT_COUNT];
 		usb_port_status					fPortStatus[USB_MAX_PORT_COUNT];
 		Device *						fChildren[USB_MAX_PORT_COUNT];
+		uint8							fPlatformResets[USB_MAX_PORT_COUNT];
 };
 
 

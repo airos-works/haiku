@@ -10,6 +10,8 @@
 
 #include "MainApp.h"
 
+#include <MediaKeys.h>
+
 #include <Alert.h>
 #include <Autolock.h>
 #include <Catalog.h>
@@ -297,6 +299,10 @@ MainApp::MessageReceived(BMessage* message)
 			_ShowSettingsWindow();
 			break;
 
+		case kMsgMediaKey:
+			_HandleMediaKey(message);
+			break;
+
 		case M_SHOW_OPEN_PANEL:
 			_ShowOpenFilePanel(message);
 			break;
@@ -341,6 +347,53 @@ MainApp::_BroadcastMessage(const BMessage& _message)
 		BMessage message(_message);
 		window->PostMessage(&message);
 	}
+}
+
+
+/*!	A media key from the mediakey command: a query is answered for all the
+	player windows, the key goes to the window that plays, else the active
+	one, else the first that can take it.
+*/
+void
+MainApp::_HandleMediaKey(BMessage* message)
+{
+	int32 key = message->GetInt32("key", -1);
+	bool query = message->GetBool("query", false);
+
+	MainWin* chosen = NULL;
+	bool chosenPlaying = false;
+	bool chosenActive = false;
+	for (int32 i = 0; BWindow* window = WindowAt(i); i++) {
+		MainWin* mainWindow = dynamic_cast<MainWin*>(window);
+		if (mainWindow == NULL || !mainWindow->Lock())
+			continue;
+
+		bool canHandle = mainWindow->CanHandleMediaKey(key);
+		bool playing = mainWindow->IsPlaying();
+		bool active = mainWindow->IsActive();
+		mainWindow->Unlock();
+
+		if (!canHandle)
+			continue;
+		if (chosen == NULL || (playing && !chosenPlaying)
+			|| (playing == chosenPlaying && active && !chosenActive)) {
+			chosen = mainWindow;
+			chosenPlaying = playing;
+			chosenActive = active;
+		}
+	}
+
+	if (query) {
+		reply_media_key_query(message, chosen != NULL, chosenPlaying);
+		return;
+	}
+
+	bool handled = false;
+	if (chosen != NULL && chosen->Lock()) {
+		handled = chosen->HandleMediaKey(key);
+		chosen->Unlock();
+	}
+	reply_media_key_handled(message, handled);
 }
 
 

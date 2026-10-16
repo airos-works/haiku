@@ -122,6 +122,7 @@ public:
 	virtual void MenusBeginning();
 	virtual void MenusEnded();
 	virtual void MessageReceived(BMessage*);
+	virtual void WindowActivated(bool active);
 	virtual void FrameResized(float, float);
 	virtual void FrameMoved(BPoint);
 	virtual void Zoom(BPoint, float, float);

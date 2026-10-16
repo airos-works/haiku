@@ -35,6 +35,7 @@ using Bluetooth::LEAddressString;
 using Bluetooth::LE_LOG_DEBUG;
 using Bluetooth::LE_LOG_ERROR;
 using Bluetooth::LE_LOG_INFO;
+using Bluetooth::LE_LOG_TRACE;
 
 #define LOG(level, format, args...) LELog(level, "hid", format, ##args)
 
@@ -278,6 +279,13 @@ HIDHost::Session::_Main()
 			} else if (recent == 1 && reports == 0) {
 				LOG(LE_LOG_INFO, "%s: first input report (%zd bytes, id %u)",
 					fAddressString, length - 1, length > 1 ? buffer[1] : 0);
+			}
+			if (Bluetooth::LELogLevel() >= LE_LOG_TRACE) {
+				char hex[3 * 24 + 4] = "";
+				for (ssize_t i = 0; i < length && i < 24; i++)
+					sprintf(hex + strlen(hex), "%02x ", buffer[i]);
+				LOG(LE_LOG_TRACE, "%s: interrupt data (%zd bytes): %s%s",
+					fAddressString, length, hex, length > 24 ? "..." : "");
 			}
 			if (buffer[0] != (HIDP_DATA | HIDP_REPORT_INPUT)) {
 				LOG(LE_LOG_DEBUG, "%s: ignoring interrupt channel header "

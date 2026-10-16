@@ -24,6 +24,7 @@
 #include <OS.h>
 
 #include <dirent.h>
+#include <mutex>
 #include <new>
 #include <stdio.h>
 #include <stdlib.h>
@@ -111,6 +112,7 @@ public:
 
 private:
 			status_t			_Fail(status_t status, const char* reason);
+			status_t			_ShareDevice(const char* node);
 			void				_Close();
 			status_t			_Receive();
 			bool				_PrepareImage(uint32 fourcc, int width,
@@ -206,6 +208,36 @@ VaDecoder::GetCodecInfo(media_codec_info* info)
 }
 
 
+/*!	One VA-API device for the whole program, shared by every decoder and
+	kept until it ends. Freeing the last device makes libva close the
+	driver, and the Mesa driver keeps worker threads ("frame copy") that
+	would be left in unmapped code; programs that open films one after
+	another (airTime, the Quick Look panel) then crashed. The device also
+	saves opening the driver again for each film. */
+static std::mutex sDeviceLock;
+static AVBufferRef* sDevice = NULL;
+static char sDeviceNode[64];
+
+
+status_t
+VaDecoder::_ShareDevice(const char* node)
+{
+	std::lock_guard<std::mutex> lock(sDeviceLock);
+	if (sDevice == NULL || strcmp(sDeviceNode, node) != 0) {
+		AVBufferRef* device = NULL;
+		if (av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_VAAPI, node,
+				NULL, 0) < 0)
+			return B_DEVICE_NOT_FOUND;
+		// The old one, if any, goes once its last decoder does.
+		av_buffer_unref(&sDevice);
+		sDevice = device;
+		strlcpy(sDeviceNode, node, sizeof(sDeviceNode));
+	}
+	fDevice = av_buffer_ref(sDevice);
+	return fDevice != NULL ? B_OK : B_NO_MEMORY;
+}
+
+
 status_t
 VaDecoder::Setup(media_format* input, const void* info, size_t size)
 {
@@ -228,8 +260,7 @@ VaDecoder::Setup(media_format* input, const void* info, size_t size)
 	const char* node = amd_render_node();
 	if (node[0] == '\0')
 		return B_DEVICE_NOT_FOUND;
-	if (av_hwdevice_ctx_create(&fDevice, AV_HWDEVICE_TYPE_VAAPI, node, NULL,
-			0) < 0)
+	if (_ShareDevice(node) != B_OK)
 		return _Fail(B_DEVICE_NOT_FOUND, "no VA-API device");
 	fDisplay = ((AVVAAPIDeviceContext*)
 		((AVHWDeviceContext*)fDevice->data)->hwctx)->display;

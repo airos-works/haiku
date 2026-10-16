@@ -168,6 +168,7 @@ struct kernel_args;
 extern void		debug_init(struct kernel_args *args);
 extern void		debug_init_post_vm(struct kernel_args *args);
 extern void		debug_init_post_settings(struct kernel_args *args);
+extern void		debug_init_post_thread(struct kernel_args *args);
 extern void		debug_init_post_modules(struct kernel_args *args);
 extern void		debug_early_boot_message(const char *string);
 extern void		debug_puts(const char *s, int32 length);

@@ -42,16 +42,32 @@ static struct RatePair {
 //
 //
 ASInterfaceDescriptor::ASInterfaceDescriptor(
-		usb_audio_streaming_interface_descriptor* Descriptor)
+		usb_audio_streaming_interface_descriptor* Descriptor, bool isUAC2)
 	:
 	fTerminalLink(0),
 	fDelay(0),
-	fFormatTag(0)
+	fFormatTag(0),
+	fNumChannels(0)
 {
-// TODO: what aboput rev 2???????
 	fTerminalLink = Descriptor->terminal_link;
-	fDelay = Descriptor->r1.delay;
-	fFormatTag = Descriptor->r1.format_tag;
+	if (!isUAC2) {
+		fDelay = Descriptor->r1.delay;
+		fFormatTag = Descriptor->r1.format_tag;
+	} else {
+		// a bitmap of the formats of its type: the R1 tag of the one used
+		uint32 formats = Descriptor->r2.bm_formats;
+		if (Descriptor->r2.format_type == USB_AUDIO_FORMAT_TYPE_I) {
+			if ((formats & USB_AUDIO_FORMAT_V2_PCM) != 0)
+				fFormatTag = USB_AUDIO_FORMAT_PCM;
+			else if ((formats & USB_AUDIO_FORMAT_V2_PCM8) != 0)
+				fFormatTag = USB_AUDIO_FORMAT_PCM8;
+			else if ((formats & USB_AUDIO_FORMAT_V2_IEEE_FLOAT) != 0)
+				fFormatTag = USB_AUDIO_FORMAT_IEEE_FLOAT;
+		}
+		fNumChannels = Descriptor->r2.num_output_pins;
+		TRACE(UAC, "bmFormats:%#010x\n", formats);
+		TRACE(UAC, "fNumChannels:%d\n", fNumChannels);
+	}
 
 	TRACE(UAC, "fTerminalLink:%d\n", fTerminalLink);
 	TRACE(UAC, "fDelay:%d\n", fDelay);
@@ -67,23 +83,35 @@ ASInterfaceDescriptor::~ASInterfaceDescriptor()
 
 
 ASEndpointDescriptor::ASEndpointDescriptor(usb_endpoint_descriptor* Endpoint,
-		usb_audio_streaming_endpoint_descriptor* Descriptor)
+		usb_audio_streaming_endpoint_descriptor* Descriptor, bool isUAC2)
 	:
 	fCSAttributes(0),
 	fLockDelayUnits(0),
 	fLockDelay(0),
 	fMaxPacketSize(0),
 	fEndpointAddress(0),
-	fEndpointAttributes(0)
+	fEndpointAttributes(0),
+	fInterval(0),
+	fFeedbackAddress(0),
+	fFeedbackMaxPacketSize(0),
+	fFeedbackInterval(0)
 {
 	fCSAttributes = Descriptor->attributes;
-	fLockDelayUnits = Descriptor->lock_delay_units;
-	fLockDelay = Descriptor->lock_delay;
+	if (!isUAC2) {
+		fLockDelayUnits = Descriptor->lock_delay_units;
+		fLockDelay = Descriptor->lock_delay;
+	} else if (Descriptor->length >= 8) {
+		usb_audio_streaming_endpoint_descriptor_r2* descriptor
+			= (usb_audio_streaming_endpoint_descriptor_r2*)Descriptor;
+		fLockDelayUnits = descriptor->lock_delay_units;
+		fLockDelay = descriptor->lock_delay;
+	}
 
 //	usb_endpoint_descriptor* endpoint = Interface->endpoint[0]->descr;
 	fEndpointAttributes = Endpoint->attributes;
 	fEndpointAddress = Endpoint->endpoint_address;
 	fMaxPacketSize = Endpoint->max_packet_size;
+	fInterval = Endpoint->interval;
 
 	TRACE(UAC, "fCSAttributes:%d\n", fCSAttributes);
 	TRACE(UAC, "fLockDelayUnits:%d\n", fLockDelayUnits);
@@ -91,6 +119,7 @@ ASEndpointDescriptor::ASEndpointDescriptor(usb_endpoint_descriptor* Endpoint,
 	TRACE(UAC, "fMaxPacketSize:%d\n", fMaxPacketSize);
 	TRACE(UAC, "fEndpointAddress:%#02x\n", fEndpointAddress);
 	TRACE(UAC, "fEndpointAttributes:%d\n", fEndpointAttributes);
+	TRACE(UAC, "fInterval:%d\n", fInterval);
 }
 
 
@@ -131,7 +160,7 @@ _ASFormatDescriptor::GetSamFreq(uint32 samplingRate)
 
 
 TypeIFormatDescriptor::TypeIFormatDescriptor(
-		usb_audio_format_descriptor* Descriptor)
+		usb_audio_format_descriptor* Descriptor, bool isUAC2)
 	:
 	_ASFormatDescriptor(Descriptor),
 	fNumChannels(0),
@@ -139,7 +168,17 @@ TypeIFormatDescriptor::TypeIFormatDescriptor(
 	fBitResolution(0),
 	fSampleFrequencyType(0)
 {
-	/*fStatus =*/ Init(Descriptor);
+	if (!isUAC2) {
+		/*fStatus =*/ Init(Descriptor);
+		return;
+	}
+
+	// the channel count is the AS interface's, the rates the clock's: both
+	// are set later
+	fSubframeSize = Descriptor->typeI_r2.subslot_size;
+	fBitResolution = Descriptor->typeI_r2.bit_resolution;
+	TRACE(UAC, "fSubslotSize:%d\n", fSubframeSize);
+	TRACE(UAC, "fBitResolution:%d\n", fBitResolution);
 }
 
 
@@ -156,15 +195,17 @@ TypeIFormatDescriptor::Init(usb_audio_format_descriptor* Descriptor)
 	fBitResolution = Descriptor->typeI.bit_resolution;
 	fSampleFrequencyType = Descriptor->typeI.sam_freq_type;
 
-	if (fSampleFrequencyType == 0) {
-		fSampleFrequencies.PushBack(
-			GetSamFreq(Descriptor->typeI.sam_freqs[0]));
-		fSampleFrequencies.PushBack(
-			GetSamFreq(Descriptor->typeI.sam_freqs[1]));
-	} else
-		for (size_t i = 0; i < fSampleFrequencyType; i++)
-			fSampleFrequencies.PushBack(
-				GetSamFreq(Descriptor->typeI.sam_freqs[i]));
+	// only the frequencies the descriptor is long enough to hold
+	// (a non-compliant device's must not be read past, in the kernel)
+	size_t frequencies = fSampleFrequencyType == 0 ? 2 : fSampleFrequencyType;
+	size_t room = Descriptor->length >= 8 ? (Descriptor->length - 8) / 3 : 0;
+	if (frequencies > room) {
+		TRACE(ERR, "Format descriptor of %d bytes holds %d of %d sample "
+			"frequencies\n", Descriptor->length, (int)room, (int)frequencies);
+		frequencies = room;
+	}
+	for (size_t i = 0; i < frequencies; i++)
+		fSampleFrequencies.PushBack(GetSamFreq(Descriptor->typeI.sam_freqs[i]));
 
 	TRACE(UAC, "fNumChannels:%d\n", fNumChannels);
 	TRACE(UAC, "fSubframeSize:%d\n", fSubframeSize);
@@ -175,6 +216,21 @@ TypeIFormatDescriptor::Init(usb_audio_format_descriptor* Descriptor)
 		TRACE(UAC, "Frequency #%d: %d\n", i, fSampleFrequencies[i]);
 
 	return B_OK;
+}
+
+
+/*!	USB Audio 2.0: the rates come from the stream's clock, a list of
+	single rates.
+*/
+void
+TypeIFormatDescriptor::SetSampleFrequencies(const Vector<uint32>& rates)
+{
+	fSampleFrequencies.MakeEmpty();
+	for (int32 i = 0; i < rates.Count(); i++) {
+		fSampleFrequencies.PushBack(rates[i]);
+		TRACE(UAC, "Frequency #%d: %d\n", i, rates[i]);
+	}
+	fSampleFrequencyType = fSampleFrequencies.Count();
 }
 
 
@@ -241,7 +297,12 @@ AudioStreamAlternate::SetSamplingRate(uint32 newRate)
 	}
 
 	Vector<uint32>& frequencies = format->fSampleFrequencies;
-	bool continuous = format->fSampleFrequencyType == 0;
+	if (frequencies.Count() == 0) {
+		TRACE(ERR, "No sampling rates known for the active alternate\n");
+		return B_NO_INIT;
+	}
+	bool continuous = format->fSampleFrequencyType == 0
+		&& frequencies.Count() >= 2;
 
 	if (newRate == 0) { // by default select max available
 		fSamplingRate = 0;
@@ -304,7 +365,8 @@ AudioStreamAlternate::GetSamplingRateIds()
 
 	uint32 rates = 0;
 	Vector<uint32>& frequencies = format->fSampleFrequencies;
-	if (format->fSampleFrequencyType == 0) { // continuous frequencies
+	if (format->fSampleFrequencyType == 0 && frequencies.Count() >= 2) {
+		// continuous frequencies
 		uint32 min = min_c(frequencies[0], frequencies[1]);
 		uint32 max = max_c(frequencies[0], frequencies[1]);
 
@@ -400,9 +462,15 @@ AudioStreamingInterface::AudioStreamingInterface(
 	fInterface(interface),
 	fControlInterface(controlInterface),
 	fIsInput(false),
+	fIsUAC2(false),
 	fActiveAlternate(0)
 {
 	TRACE(ERR, "if[%d]:alt_count:%d\n", interface, List->alt_count);
+
+	if (List->alt_count > 0 && List->alt[0].descr != NULL) {
+		fIsUAC2 = List->alt[0].descr->interface_protocol
+			== USB_AUDIO_PROTOCOL_IP_VERSION_02_00;
+	}
 
 	for (size_t alt = 0; alt < List->alt_count; alt++) {
 		ASInterfaceDescriptor*	ASInterface	= NULL;
@@ -410,6 +478,29 @@ AudioStreamingInterface::AudioStreamingInterface(
 		_ASFormatDescriptor*	ASFormat	= NULL;
 
 		usb_interface_info* Interface = &List->alt[alt];
+
+		// The audio data endpoint, and the explicit feedback endpoint of
+		// an asynchronous output stream (usage type 01): a USB Audio 2.0
+		// alternate has the data endpoint first, but go by the type.
+		usb_endpoint_descriptor* dataEndpoint = NULL;
+		usb_endpoint_descriptor* feedbackEndpoint = NULL;
+		for (size_t e = 0; e < Interface->endpoint_count; e++) {
+			usb_endpoint_descriptor* endpoint = Interface->endpoint[e].descr;
+			if (endpoint == NULL)
+				continue;
+			if ((endpoint->attributes & USB_ENDPOINT_ATTR_MASK)
+					!= USB_ENDPOINT_ATTR_ISOCHRONOUS) {
+				continue;
+			}
+			if ((endpoint->attributes & 0x30) == 0x10) {
+				if (feedbackEndpoint == NULL
+					&& (endpoint->endpoint_address & USB_ENDPOINT_ADDR_DIR_IN)
+						!= 0) {
+					feedbackEndpoint = endpoint;
+				}
+			} else if (dataEndpoint == NULL)
+				dataEndpoint = endpoint;
+		}
 
 		TRACE(ERR, "if[%d]:alt[%d]:descrs_count:%d\n",
 			interface, alt, Interface->generic_count);
@@ -420,17 +511,28 @@ AudioStreamingInterface::AudioStreamingInterface(
 			if (Header->descriptor_type == USB_AUDIO_CS_INTERFACE) {
 				switch(Header->descriptor_subtype) {
 					case USB_AUDIO_AS_GENERAL:
+						if (Header->length < (fIsUAC2 ? 16 : 7)) {
+							TRACE(ERR, "AStream interface descriptor of %d "
+								"bytes ignored\n", Header->length);
+							break;
+						}
 						if (ASInterface == 0)
 							ASInterface = new(std::nothrow)
 								ASInterfaceDescriptor(
-								(usb_audio_streaming_interface_descriptor*)Header);
+								(usb_audio_streaming_interface_descriptor*)Header,
+								fIsUAC2);
 						else
 							TRACE(ERR, "Duplicate AStream interface ignored.\n");
 						break;
 					case USB_AUDIO_AS_FORMAT_TYPE:
+						if (Header->length < (fIsUAC2 ? 6 : 8)) {
+							TRACE(ERR, "AStream format descriptor of %d "
+								"bytes ignored\n", Header->length);
+							break;
+						}
 						if (ASFormat == 0)
 							ASFormat = new(std::nothrow) TypeIFormatDescriptor(
-								(usb_audio_format_descriptor*) Header);
+								(usb_audio_format_descriptor*) Header, fIsUAC2);
 						else
 							TRACE(ERR, "Duplicate AStream format ignored.\n");
 						break;
@@ -443,11 +545,16 @@ AudioStreamingInterface::AudioStreamingInterface(
 			}
 
 			if (Header->descriptor_type == USB_AUDIO_CS_ENDPOINT) {
+				if (dataEndpoint == NULL || Header->length < 7) {
+					TRACE(ERR, "AStream endpoint descriptor without an "
+						"endpoint, or of %d bytes, ignored\n", Header->length);
+					continue;
+				}
 				if (ASEndpoint == 0) {
-					usb_endpoint_descriptor* Endpoint
-						= Interface->endpoint[0].descr;
-					ASEndpoint = new(std::nothrow) ASEndpointDescriptor(Endpoint,
-						(usb_audio_streaming_endpoint_descriptor*)Header);
+					ASEndpoint = new(std::nothrow) ASEndpointDescriptor(
+						dataEndpoint,
+						(usb_audio_streaming_endpoint_descriptor*)Header,
+						fIsUAC2);
 				} else
 					TRACE(ERR, "Duplicate AStream endpoint ignored.\n");
 				continue;
@@ -455,6 +562,23 @@ AudioStreamingInterface::AudioStreamingInterface(
 
 			TRACE(ERR, "Ignore Audio Stream of "
 				"unknown descriptor type %#04x.\n",	Header->descriptor_type);
+		}
+
+		if (fIsUAC2 && ASFormat != NULL && ASInterface != NULL
+			&& ASFormat->fFormatType == USB_AUDIO_FORMAT_TYPE_I) {
+			static_cast<TypeIFormatDescriptor*>(ASFormat)->fNumChannels
+				= ASInterface->fNumChannels;
+		}
+
+		if (ASEndpoint != NULL && feedbackEndpoint != NULL) {
+			ASEndpoint->fFeedbackAddress = feedbackEndpoint->endpoint_address;
+			ASEndpoint->fFeedbackMaxPacketSize
+				= feedbackEndpoint->max_packet_size & 0x7ff;
+			ASEndpoint->fFeedbackInterval = feedbackEndpoint->interval;
+			TRACE(UAC, "Feedback endpoint:%#02x, %d bytes, interval %d\n",
+				ASEndpoint->fFeedbackAddress,
+				ASEndpoint->fFeedbackMaxPacketSize,
+				ASEndpoint->fFeedbackInterval);
 		}
 
 		fAlternates.Add(new(std::nothrow) AudioStreamAlternate(alt, ASInterface,

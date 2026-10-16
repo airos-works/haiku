@@ -169,16 +169,14 @@ BTimeSource::PerformanceTimeFor(bigtime_t real_time)
 	if (GetTime(&last_perf_time, &last_real_time, &last_drift) != B_OK)
 		debugger("BTimeSource::PerformanceTimeFor: GetTime failed");
 
+	// The arithmetic is done in double: a float holds only 24 bits, so a
+	// difference of more than 16.7 s (a time source that stopped publishing,
+	// a sound card whose interrupts were lost) would lose precision. It used
+	// to call debugger() instead, which took down every media node in the
+	// team, the system mixer included.
 	bigtime_t real_time_difference = real_time - last_real_time;
-	if (real_time_difference >= (1 << FLT_MANT_DIG)) {
-		// The difference is too large fit in a float.
-		if (last_drift == 1.0f)
-			return last_perf_time + real_time_difference;
-
-		debugger("BTimeSource::PerformanceTimeFor: real time too large");
-	}
-
-	return last_perf_time + (bigtime_t)(real_time_difference * last_drift);
+	return last_perf_time
+		+ (bigtime_t)((double)real_time_difference * (double)last_drift);
 }
 
 
@@ -198,17 +196,10 @@ BTimeSource::RealTimeFor(bigtime_t performance_time,
 	if (GetTime(&last_perf_time, &last_real_time, &last_drift) != B_OK)
 		debugger("BTimeSource::RealTimeFor: GetTime failed");
 
+	// See PerformanceTimeFor() for why this is done in double.
 	bigtime_t perf_time_difference = performance_time - last_perf_time;
-	if (perf_time_difference >= (1 << FLT_MANT_DIG)) {
-		// The difference is too large to fit in a float.
-		if (last_drift == 1.0f)
-			return last_real_time - with_latency + perf_time_difference;
-
-		debugger("BTimeSource::RealTimeFor: performance time too large");
-	}
-
 	return last_real_time - with_latency
-		+ (bigtime_t)(perf_time_difference / last_drift);
+		+ (bigtime_t)((double)perf_time_difference / (double)last_drift);
 }
 
 

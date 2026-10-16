@@ -64,6 +64,7 @@ All rights reserved.
 #include <Path.h>
 #include <PopUpMenu.h>
 #include <Query.h>
+#include <QuickLookDefs.h>
 #include <Screen.h>
 #include <StopWatch.h>
 #include <String.h>
@@ -92,6 +93,7 @@ All rights reserved.
 #include "MimeTypes.h"
 #include "Navigator.h"
 #include "Pose.h"
+#include "QuickLook.h"
 #include "Shortcuts.h"
 #include "Tests.h"
 #include "Thread.h"
@@ -245,6 +247,8 @@ BPoseView::BPoseView(Model* model, uint32 viewMode)
 	fSelectionPivotPose(NULL),
 	fRealPivotPose(NULL),
 	fKeyRunner(NULL),
+	fQuickLookRunner(NULL),
+	fQuickLookShowing(false),
 	fDragMessage(NULL),
 	fCachedTypesList(NULL),
 	fFilterStrings(4),
@@ -299,6 +303,7 @@ BPoseView::~BPoseView()
 	delete fViewState;
 	delete fModel;
 	delete fKeyRunner;
+	delete fQuickLookRunner;
 	delete fBrokenLinks;
 	delete fDragMessage;
 	delete fCachedTypesList;
@@ -2403,6 +2408,10 @@ BPoseView::MessageReceived(BMessage* message)
 			break;
 
 		case B_CANCEL:
+			if (fQuickLookShowing) {
+				HideQuickLook();
+				break;
+			}
 			if (FSClipboardHasRefs())
 				FSClipboardClear();
 			if (IsTypeAheadFiltering())
@@ -2452,6 +2461,31 @@ BPoseView::MessageReceived(BMessage* message)
 
 		case kOpenSelection:
 			OpenSelection();
+			break;
+
+		case kQuickLook:
+			QuickLook();
+			break;
+
+		case kQuickLookUpdate:
+			delete fQuickLookRunner;
+			fQuickLookRunner = NULL;
+			if (fQuickLookShowing) {
+				if (CountSelected() > 0)
+					_SendQuickLook(kMsgQuickLookShow, true);
+				else
+					HideQuickLook();
+			}
+			break;
+
+		case kMsgQuickLookShown:
+			// The server says so even when a toggle found it gone and
+			// started it afresh, or another window had the panel.
+			fQuickLookShowing = true;
+			break;
+
+		case kMsgQuickLookClosed:
+			fQuickLookShowing = false;
 			break;
 
 		case kOpenSelectionWith:
@@ -4135,6 +4169,7 @@ BPoseView::AddPoseToSelection(BPose* pose, int32 index, bool scrollIntoView)
 		if (scrollIntoView)
 			ScrollIntoView(poseRect);
 
+		QuickLookSelectionChanged();
 		if (fSelectionChangedHook)
 			ContainerWindow()->SelectionChanged();
 	}
@@ -4172,6 +4207,7 @@ BPoseView::RemovePoseFromSelection(BPose* pose)
 	} else
 		Invalidate(pose->CalcRect(this));
 
+	QuickLookSelectionChanged();
 	if (fSelectionChangedHook)
 		ContainerWindow()->SelectionChanged();
 }
@@ -6580,6 +6616,7 @@ BPoseView::SelectAll()
 		loc.y += fListElemHeight;
 	}
 
+	QuickLookSelectionChanged();
 	if (fSelectionChangedHook)
 		ContainerWindow()->SelectionChanged();
 }
@@ -6631,6 +6668,7 @@ BPoseView::InvertSelection()
 		loc.y += fListElemHeight;
 	}
 
+	QuickLookSelectionChanged();
 	if (fSelectionChangedHook)
 		ContainerWindow()->SelectionChanged();
 }
@@ -6894,6 +6932,11 @@ BPoseView::KeyDown(const char* bytes, int32 count)
 
 		default:
 		{
+			if (key == B_SPACE && _SpaceIsQuickLook()) {
+				QuickLook();
+				break;
+			}
+
 			// handle typeahead selection / filtering
 
 			if (ViewMode() == kListMode && TrackerSettings().TypeAheadFiltering()) {
@@ -7209,6 +7252,7 @@ BPoseView::ShowContextMenu(BPoint where)
 	const entry_ref* ref = (clickedPose == NULL ? NULL : clickedPose->TargetModel()->EntryRef());
 	window->ShowContextMenu(where, ref);
 
+	QuickLookSelectionChanged();
 	if (fSelectionChangedHook)
 		window->SelectionChanged();
 }
@@ -7521,6 +7565,7 @@ BPoseView::MouseDown(BPoint where)
 			ShowContextMenu(where);
 	}
 
+	QuickLookSelectionChanged();
 	if (fSelectionChangedHook)
 		window->SelectionChanged();
 }
@@ -8308,6 +8353,114 @@ BPoseView::LastVisiblePose(int32* _index) const
 }
 
 
+bool
+BPoseView::_SpaceIsQuickLook()
+{
+	if ((modifiers() & (B_COMMAND_KEY | B_CONTROL_KEY | B_OPTION_KEY
+			| B_SHIFT_KEY)) != 0)
+		return false;
+
+	// A space typed into a type-ahead filter, or into a name being matched,
+	// is a space.
+	if (IsTypeAheadFiltering() && !fFilterStrings.IsEmpty()
+		&& fFilterStrings.LastItem()->Length() > 0)
+		return false;
+
+	if (sMatchString.Length() > 0) {
+		bigtime_t doubleClickSpeed;
+		get_click_speed(&doubleClickSpeed);
+		bigtime_t eventTime;
+		BMessage* message = Window()->CurrentMessage();
+		if (message == NULL || message->FindInt64("when", &eventTime) < B_OK)
+			eventTime = system_time();
+		if (eventTime - fLastKeyTime < doubleClickSpeed * 2)
+			return false;
+	}
+	return true;
+}
+
+
+void
+BPoseView::QuickLook()
+{
+	delete fQuickLookRunner;
+	fQuickLookRunner = NULL;
+	if (CountSelected() == 0) {
+		HideQuickLook();
+		return;
+	}
+	_SendQuickLook(kMsgQuickLookToggle);
+}
+
+
+void
+BPoseView::HideQuickLook()
+{
+	delete fQuickLookRunner;
+	fQuickLookRunner = NULL;
+	if (!fQuickLookShowing)
+		return;
+	fQuickLookShowing = false;
+	QuickLookHide();
+}
+
+
+void
+BPoseView::QuickLookSelectionChanged()
+{
+	if (!fQuickLookShowing)
+		return;
+	// Arrow keys held down, or a drag over many poses, send one update.
+	delete fQuickLookRunner;
+	BMessage update(kQuickLookUpdate);
+	fQuickLookRunner = new BMessageRunner(BMessenger(this), &update, 50000, 1);
+}
+
+
+void
+BPoseView::_SendQuickLook(uint32 what, bool update)
+{
+	BMessage refs(what);
+	int32 count = CountSelected();
+	for (int32 index = 0; index < count; index++) {
+		BPose* pose = fSelectionList->ItemAt(index);
+		if (pose != NULL && pose->TargetModel() != NULL)
+			refs.AddRef("refs", pose->TargetModel()->EntryRef());
+	}
+	if (!refs.HasRef("refs"))
+		return;
+
+	BRect frame = Window() != NULL ? Window()->Frame() : BRect();
+	// Where the first selected entry is on screen: the panel zooms out of
+	// it and back into it.
+	BRect iconRect;
+	BPose* first = fSelectionList->FirstItem();
+	if (first != NULL) {
+		if (ViewMode() == kListMode) {
+			int32 index = CurrentPoseList()->IndexOf(first);
+			if (index >= 0) {
+				iconRect = first->CalcRect(BPoint(0, index * fListElemHeight),
+					this, true);
+			}
+		} else
+			iconRect = first->CalcRect(this);
+		if (iconRect.IsValid()) {
+			iconRect = iconRect & Bounds();
+			ConvertToScreen(&iconRect);
+		}
+	}
+	status_t status = QuickLookShow(what, &refs, frame, iconRect,
+		BMessenger(this), update);
+	if (status == B_OK) {
+		// A toggle hides the panel when it was ours; the server says so.
+		fQuickLookShowing = what != kMsgQuickLookToggle || !fQuickLookShowing;
+	} else if (update) {
+		// The server went away with the panel.
+		fQuickLookShowing = false;
+	}
+}
+
+
 void
 BPoseView::OpenSelection(BPose* clickedPose, int32* index)
 {
@@ -8509,6 +8662,7 @@ BPoseView::ClearPoses()
 	ResetPosePlacementHint();
 	ClearExtent();
 
+	QuickLookSelectionChanged();
 	if (fSelectionChangedHook)
 		ContainerWindow()->SelectionChanged();
 }
@@ -10481,6 +10635,7 @@ BPoseView::EnsurePoseUnselected(BPose* pose)
 
 	if (pose->IsSelected()) {
 		pose->Select(false);
+		QuickLookSelectionChanged();
 		if (fSelectionChangedHook)
 			ContainerWindow()->SelectionChanged();
 	}

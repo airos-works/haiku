@@ -82,6 +82,36 @@ refresh_millihertz(const drm_mode_modeinfo& mode)
 }
 
 
+/*!	The monitor's own mode of \a timing's size whose refresh rate is
+	nearest to its, or -1. app_server asks for a size and a rate only (its
+	timings have no blanking), so pixel clocks cannot be compared: a 60 Hz
+	request has a clock nearer a panel's 48 Hz mode than its 60 Hz one.
+*/
+int32
+find_output_mode(const Output& output, const display_timing& timing)
+{
+	uint32 wanted = 0;
+	if (timing.h_total != 0 && timing.v_total != 0) {
+		wanted = (uint32)((uint64)timing.pixel_clock * 1000000
+			/ ((uint64)timing.h_total * timing.v_total));
+	}
+	int32 best = -1;
+	for (uint32 m = 0; m < output.modeCount; m++) {
+		const drm_mode_modeinfo& candidate = output.modes[m];
+		if (candidate.hdisplay != timing.h_display
+			|| candidate.vdisplay != timing.v_display
+			|| (candidate.flags & DRM_MODE_FLAG_INTERLACE) != 0)
+			continue;
+		if (best < 0 || abs((int32)refresh_millihertz(candidate)
+					- (int32)wanted)
+				< abs((int32)refresh_millihertz(output.modes[best])
+					- (int32)wanted))
+			best = m;
+	}
+	return best;
+}
+
+
 status_t
 probe_outputs(void)
 {
@@ -547,18 +577,7 @@ single_mode_layout(const display_mode& mode, Layout& layout)
 		output.height = mode.virtual_height;
 		if (!primaryDone) {
 			// the monitor's own mode of that size, else the timing asked for
-			int32 best = -1;
-			for (uint32 m = 0; m < output.modeCount; m++) {
-				const drm_mode_modeinfo& candidate = output.modes[m];
-				if (candidate.hdisplay != mode.timing.h_display
-					|| candidate.vdisplay != mode.timing.v_display)
-					continue;
-				if (best < 0 || abs((int32)candidate.clock
-						- (int32)mode.timing.pixel_clock)
-						< abs((int32)output.modes[best].clock
-							- (int32)mode.timing.pixel_clock))
-					best = m;
-			}
+			int32 best = find_output_mode(output, mode.timing);
 			if (best >= 0)
 				output.timing = output.modes[best];
 			else

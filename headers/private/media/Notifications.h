@@ -94,8 +94,12 @@ void		FormatChanged(const media_source& source,
 				const media_destination& destination,
 				const media_format& format);
 
+// called by the media_server when a default node (an audio output, for
+// example) was set or found: "default" is the node_type of ServerInterface.h,
+// "node" the media_node_id of the new default (-1 for none)
+void		DefaultChanged(int32 type, media_node_id node);
+
 // TODO: missing: B_MEDIA_TRANSPORT_STATE	"state", "location", "realtime"
-// TODO: missing: B_MEDIA_DEFAULT_CHANGED	"default", "node"
 
 }	// namespace notifications
 }	// namespace media

@@ -6,22 +6,27 @@ if ! [ FIsBuildFeatureEnabled fluidlite ] {
 	return ;
 }
 
-UsePrivateHeaders media midi shared ;
+UsePrivateHeaders app media midi shared ;
 
 Application Media :
+	Cards.cpp
+	Glyphs.cpp
+	LiveViews.cpp
 	Media.cpp
-	MediaIcons.cpp
-	MediaListItem.cpp
-	MediaViews.cpp
+	MediaModel.cpp
 	MediaWindow.cpp
-	MidiSettingsView.cpp
-	: media midi be localestub [ TargetLibsupc++ ]
+	Pages.cpp
+	ParameterForm.cpp
+	Sidebar.cpp
+	: media midi be localestub [ TargetLibsupc++ ] [ TargetLibstdc++ ]
 	: media.rdef
 	;
 
 DoCatalogs Media
 	: x-vnd.Haiku-Media
-	: MediaViews.cpp
+	: LiveViews.cpp
+	  MediaModel.cpp
 	  MediaWindow.cpp
-	  MidiSettingsView.cpp
+	  Pages.cpp
+	  ParameterForm.cpp
 ;

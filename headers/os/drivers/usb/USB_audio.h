@@ -23,7 +23,8 @@ enum { // Audio Interface Subclasses
 };
 
 enum { // Audio Interface Protocol Codes
-	USB_AUDIO_PROTOCOL_UNDEFINED = 0x00
+	USB_AUDIO_PROTOCOL_UNDEFINED = 0x00,
+	USB_AUDIO_PROTOCOL_IP_VERSION_02_00 = 0x20	// R2
 };
 
 enum { // Audio Interface Class-Specific Descriptor Types
@@ -303,6 +304,17 @@ typedef struct {
 	uint16 lock_delay;
 } _PACKED usb_audio_streaming_endpoint_descriptor;
 
+// R2: Table 4-34 p.87, one byte more than in R1
+typedef struct {
+	uint8 length;
+	uint8 descriptor_type;		// USB_AUDIO_CS_ENDPOINT
+	uint8 descriptor_subtype; 	// USB_AUDIO_EP_GENERAL
+	uint8 attributes;
+	uint8 bm_controls;
+	uint8 lock_delay_units;
+	uint16 lock_delay;
+} _PACKED usb_audio_streaming_endpoint_descriptor_r2;
+
 
 // Sampling Rate are represented as 3-byte integer
 typedef struct {
@@ -326,6 +338,13 @@ typedef struct {
 			uint8 sam_freq_type;
 			usb_audio_sampling_freq sam_freqs[1];
 		} _PACKED typeI;
+
+		// R2 (Formats 2.0 Table 2-2 p.15): the channels are in the AS
+		// interface descriptor, the sampling rates come from the clock
+		struct {
+			uint8 subslot_size;
+			uint8 bit_resolution;
+		} _PACKED typeI_r2;
 
 		struct {
 			uint16 max_bit_rate;
@@ -366,6 +385,27 @@ enum { // Audio Class-Specific Request Codes
 	USB_AUDIO_SET_MEM		= 0x05,
 	USB_AUDIO_GET_MEM		= 0x85,
 	USB_AUDIO_GET_STATUS	= 0xFF
+};
+
+// R2: A.14 Audio Class-Specific Request Codes (the direction is in the
+// request type)
+enum {
+	USB_AUDIO_V2_CUR		= 0x01,
+	USB_AUDIO_V2_RANGE		= 0x02,
+	USB_AUDIO_V2_MEM		= 0x03
+};
+
+// R2: A.17.1 Clock Source Control Selectors
+enum {
+	USB_AUDIO_CS_CONTROL_UNDEFINED		= 0x00,
+	USB_AUDIO_CS_SAM_FREQ_CONTROL		= 0x01,
+	USB_AUDIO_CS_CLOCK_VALID_CONTROL	= 0x02
+};
+
+// R2: A.17.2 Clock Selector Control Selectors
+enum {
+	USB_AUDIO_CX_CONTROL_UNDEFINED		= 0x00,
+	USB_AUDIO_CX_CLOCK_SELECTOR_CONTROL	= 0x01
 };
 
 enum { // Terminal Control Selectors
@@ -521,6 +561,16 @@ enum {
 	USB_AUDIO_FORMAT_IEEE_FLOAT			= 0x0003,
 	USB_AUDIO_FORMAT_ALAW				= 0x0004,
 	USB_AUDIO_FORMAT_MULAW				= 0x0005
+};
+
+// Formats R2: Table A-1, p.23, bmFormats of a Type I stream
+enum {
+	USB_AUDIO_FORMAT_V2_PCM				= 1 << 0,
+	USB_AUDIO_FORMAT_V2_PCM8			= 1 << 1,
+	USB_AUDIO_FORMAT_V2_IEEE_FLOAT		= 1 << 2,
+	USB_AUDIO_FORMAT_V2_ALAW			= 1 << 3,
+	USB_AUDIO_FORMAT_V2_MULAW			= 1 << 4,
+	USB_AUDIO_FORMAT_V2_RAW_DATA		= 1u << 31
 };
 
 

@@ -267,6 +267,12 @@ public:
 			BRect				InvertRect(const BRect& r) const;
 
 	inline	BRect				TransformAndClipRect(BRect rect) const;
+			BRect				DeviceBitmapRect(BRect bitmapRect,
+									BRect viewRect) const;
+			void				FillDeviceRect(const BRect& deviceRect,
+									const rgb_color& color) const;
+			bool				HasIdentityViewTransform() const
+									{ return fIdentityViewTransform; }
 	inline	BRect				ClipRect(BRect rect) const;
 									// rect is in buffer pixels already
 			BRect				ClipLogicalRect(BRect rect) const;
@@ -295,6 +301,10 @@ private:
 			BRect				_DeviceRect(const BRect& rect) const;
 									// a logical pixel rectangle in buffer
 									// pixels
+			BPoint				_DeviceBaseLine(BPoint baseLine) const;
+			const escapement_delta* _DeviceDelta(
+									const escapement_delta* delta,
+									escapement_delta& scaled) const;
 			void				_FillRectDevice(const BRect& rect,
 									const rgb_color& c) const;
 			void				_UpdateTextTransform();

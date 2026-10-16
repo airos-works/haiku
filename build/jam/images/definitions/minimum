@@ -62,6 +62,7 @@ SYSTEM_BIN = [ FFilterByBuildFeatures
 	login
 	lsindex
 	makebootable
+	mediakey
 	message
 	mimeset
 	mkfs
@@ -243,6 +244,7 @@ SYSTEM_SERVERS = [ FFilterByBuildFeatures
 	mount_server
 	net_server
 	notification_server
+	osd_server
 	package_daemon
 	power_daemon
 	registrar
@@ -302,6 +304,7 @@ SYSTEM_ADD_ONS_PRINT = ;
 SYSTEM_ADD_ONS_PRINT_TRANSPORT = ;
 
 SYSTEM_ADD_ONS_SCREENSAVERS = ;
+SYSTEM_ADD_ONS_QUICK_LOOK = ;
 
 SYSTEM_ADD_ONS_DRIVERS_AUDIO = ;
 

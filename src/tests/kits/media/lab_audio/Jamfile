@@ -1,0 +1,18 @@
+SubDir HAIKU_TOP src tests kits media lab_audio ;
+
+# A virtual speaker and microphone for testing audio device selection
+# (the Deskbar volume control, Media preferences) without a second sound
+# card. Not in any image: copy lab_audio.media_addon into a media-add-ons
+# directory of the machine under test.
+
+local architectureObject ;
+for architectureObject in [ MultiArchSubDirSetup ] {
+	on $(architectureObject) {
+		Addon [ MultiArchDefaultGristFiles lab_audio.media_addon ] :
+			LabAudioAddOn.cpp
+			LabMicrophone.cpp
+			LabSpeaker.cpp
+			: be media [ TargetLibsupc++ ]
+		;
+	}
+}

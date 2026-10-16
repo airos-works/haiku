@@ -486,10 +486,11 @@ DefaultManager::_FindPhysical(volatile media_node_id *id, uint32 default_type,
 	for (int i = 0; i < count; i++)
 		TRACE("info[%d].name %s\n", i, info[i].name);
 
-	// Without a saved default, the audio of a graphics card's HDMI and
-	// DisplayPort connectors comes last: it is silent unless a display with
-	// speakers is connected, and it is often found before the speakers.
-	if (isAudio && !isInput && msg == NULL) {
+	// The audio of a graphics card's HDMI and DisplayPort connectors comes
+	// last: it is silent unless a display with speakers is connected, and it
+	// is often found before the speakers. (With a saved default the order
+	// does not matter, as only the saved device is taken.)
+	if (isAudio && !isInput) {
 		live_node_info ordered[MAX_NODE_INFOS];
 		int orderedCount = 0;
 		for (int pass = 0; pass < 2; pass++) {
@@ -503,71 +504,77 @@ DefaultManager::_FindPhysical(volatile media_node_id *id, uint32 default_type,
 			info[i] = ordered[i];
 	}
 
-	for (int i = 0; i < count; i++) {
-		if (isAudio) {
-			if (isInput) {
-				if (0 == strcmp(info[i].name, "None In")) {
-					// we keep the Null audio driver if none else matchs
-					*id = info[i].node.node;
-					continue;
-				}
-				// skip the Firewire audio driver
-				if (0 == strcmp(info[i].name, "DV Input"))
-					continue;
-			} else {
-				if (0 == strcmp(info[i].name, "None Out")) {
-					// we keep the Null audio driver if none else matchs
-					*id = info[i].node.node;
-					if (msg)
-						fPhysicalAudioOutInputID = input_id;
-					continue;
-				}
-				// skip the Firewire audio driver
-				if (0 == strcmp(info[i].name, "DV Output"))
-					continue;
-			}
-		}
-		if (msg) {	// we have a default info msg
-			dormant_node_info dninfo;
-			if (fRoster->GetDormantNodeFor(info[i].node,
-					&dninfo) != B_OK) {
-				ERROR("Couldn't GetDormantNodeFor\n");
-				continue;
-			}
-			// (The flavor IDs of video devices that are plugged in, cameras,
-			// are given out in the order they turn up: go by their name.)
-			// (A default saved before the HDA driver called its HDMI devices
-			// "HD Audio (HDMI)" has their old name, "HD Audio".)
-			size_t savedLength = strlen(msgDninfo.name);
-			bool sameName = strcmp(dninfo.name, msgDninfo.name) == 0
-				|| (isAudio && strncmp(dninfo.name, msgDninfo.name,
-						savedLength) == 0
-					&& strcmp(dninfo.name + savedLength, " (HDMI)") == 0);
-			if ((isAudio && dninfo.flavor_id != msgDninfo.flavor_id)
-				|| !sameName) {
-				ERROR("Doesn't match flavor or name\n");
-				continue;
-			}
-			BPath path;
-			if (gDormantNodeManager->FindAddOnPath(&path, dninfo.addon) != B_OK
-				|| path != msgPath) {
-				ERROR("Doesn't match : path\n");
-				continue;
-			}
-		}
-		TRACE("Default physical %s %s \"%s\" created!\n",
-			isAudio ? "audio" : "video", isInput ? "input" : "output",
-			info[i].name);
-		*id = info[i].node.node;
-		if (msg && isAudio && !isInput)
-			fPhysicalAudioOutInputID = input_id;
-		return;
-	}
+	// The first round looks for the saved default; when that is not there
+	// (a USB headset that is not plugged in, a sound card that was renamed,
+	// a camera that is gone), the second round takes what there is: silence
+	// until the user chooses again helps nobody.
+	for (int round = 0; round < 2; round++) {
+		bool useSaved = msg != NULL && round == 0;
+		if (round == 1 && msg == NULL)
+			break;
 
-	// The video device that was saved as the default is not there (a camera
-	// that is not plugged in): any other is better than none.
-	if (!isAudio && *id == -1)
-		*id = info[0].node.node;
+		for (int i = 0; i < count; i++) {
+			if (isAudio) {
+				if (isInput) {
+					if (0 == strcmp(info[i].name, "None In")) {
+						// we keep the Null audio driver if none else matchs
+						*id = info[i].node.node;
+						continue;
+					}
+					// skip the Firewire audio driver
+					if (0 == strcmp(info[i].name, "DV Input"))
+						continue;
+				} else {
+					if (0 == strcmp(info[i].name, "None Out")) {
+						// we keep the Null audio driver if none else matchs
+						*id = info[i].node.node;
+						if (useSaved)
+							fPhysicalAudioOutInputID = input_id;
+						continue;
+					}
+					// skip the Firewire audio driver
+					if (0 == strcmp(info[i].name, "DV Output"))
+						continue;
+				}
+			}
+			if (useSaved) {	// we have a default info msg
+				dormant_node_info dninfo;
+				if (fRoster->GetDormantNodeFor(info[i].node,
+						&dninfo) != B_OK) {
+					ERROR("Couldn't GetDormantNodeFor\n");
+					continue;
+				}
+				// (The flavor IDs of video devices that are plugged in,
+				// cameras, are given out in the order they turn up: go by
+				// their name.)
+				// (A default saved before the HDA driver called its HDMI
+				// devices "HD Audio (HDMI)" has their old name, "HD Audio".)
+				size_t savedLength = strlen(msgDninfo.name);
+				bool sameName = strcmp(dninfo.name, msgDninfo.name) == 0
+					|| (isAudio && strncmp(dninfo.name, msgDninfo.name,
+							savedLength) == 0
+						&& strcmp(dninfo.name + savedLength, " (HDMI)") == 0);
+				if ((isAudio && dninfo.flavor_id != msgDninfo.flavor_id)
+					|| !sameName) {
+					ERROR("Doesn't match flavor or name\n");
+					continue;
+				}
+				BPath path;
+				if (gDormantNodeManager->FindAddOnPath(&path, dninfo.addon)
+						!= B_OK || path != msgPath) {
+					ERROR("Doesn't match : path\n");
+					continue;
+				}
+			}
+			TRACE("Default physical %s %s \"%s\" created!\n",
+				isAudio ? "audio" : "video", isInput ? "input" : "output",
+				info[i].name);
+			*id = info[i].node.node;
+			if (useSaved && isAudio && !isInput)
+				fPhysicalAudioOutInputID = input_id;
+			return;
+		}
+	}
 }
 
 
@@ -837,14 +844,49 @@ DefaultManager::CleanupTeam(team_id team)
 }
 
 
-/*!	A default video node that is gone (a camera that was unplugged) must not
-	stay the default: the next rescan then looks for another one.
+/*!	A default node that is gone (a camera that was unplugged, the sound card
+	node or the mixer of a media_addon_server that died) must not stay the
+	default: the next rescan then looks for another one. A gone mixer or
+	sound card also takes the mixer connection with it; the rescan makes a
+	new one and must not try to disconnect the old one first.
 */
 void
 DefaultManager::NodeUnregistered(media_node_id node)
 {
-	if (fPhysicalVideoIn == node)
+	bool lost = false;
+	if (fPhysicalVideoIn == node) {
 		fPhysicalVideoIn = -1;
-	if (fPhysicalVideoOut == node)
+		lost = true;
+	}
+	if (fPhysicalVideoOut == node) {
 		fPhysicalVideoOut = -1;
+		lost = true;
+	}
+	if (fPhysicalAudioIn == node) {
+		fPhysicalAudioIn = -1;
+		lost = true;
+	}
+	if (fTimeSource == node)
+		fTimeSource = -1;
+
+	bool connectionLost = false;
+	if (fPhysicalAudioOut == node) {
+		fPhysicalAudioOut = -1;
+		connectionLost = true;
+	}
+	if (fAudioMixer == node) {
+		fAudioMixer = -1;
+		connectionLost = true;
+	}
+	if (connectionLost) {
+		fMixerConnected = false;
+		fMixerToPhysicalAudioOut.node = media_node::null;
+		fPhysicalAudioOutFromMixer.node = media_node::null;
+	}
+
+	// A default that is gone is replaced at once (the media_addon_server
+	// asks for a rescan when a device of an add-on goes, but not when a
+	// whole add-on does); the rescan runs in its own thread.
+	if (lost || connectionLost)
+		Rescan();
 }

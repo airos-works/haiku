@@ -92,6 +92,9 @@ public:
 			BMenuItem*			GetInfoItem();
 			const char*			GetInfoLabel();
 
+			BMenuItem*			QuickLookItem();
+			const char*			QuickLookLabel();
+
 			BMenuItem*			IdentifyItem();
 			const char*			IdentifyLabel();
 
@@ -174,6 +177,7 @@ public:
 			void				UpdateEmptyTrashItem(BMenuItem*);
 			void				UpdateFindItem(BMenuItem*);
 			void				UpdateGetInfoItem(BMenuItem*);
+			void				UpdateQuickLookItem(BMenuItem*);
 			void				UpdateIdentifyItem(BMenuItem*);
 			void				UpdateInvertSelectionItem(BMenuItem*);
 			void				UpdateMakeActivePrinterItem(BMenuItem*);

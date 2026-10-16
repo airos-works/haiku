@@ -2168,6 +2168,18 @@ device_node::UninitUnusedDriver()
 void
 device_node::DeviceRemoved()
 {
+	if ((fFlags & NODE_FLAG_DEVICE_REMOVED) != 0) {
+		// Already done. A node whose driver was still in use survived its
+		// own removal (unregister_node() returned B_BUSY), and its parent is
+		// being removed now - a USB hub's node is unregistered after the
+		// nodes of the devices behind it, and reaches the survivors again
+		// through its children. Their drivers were notified the first time,
+		// and the references they still hold belong to them: dropping the
+		// creation reference a second time deleted the node under its open
+		// device (the free then ran again inside the destructor).
+		return;
+	}
+
 	// notify children
 	NodeList::ConstIterator iterator = Children().GetIterator();
 	while (iterator.HasNext()) {
@@ -2506,6 +2518,29 @@ device_manager_clear_suspend_trace()
 	InterruptsSpinLocker locker(sSuspendTraceLock);
 	sSuspendTraceLength = 0;
 	sSuspendTrace[0] = '\0';
+}
+
+
+static int32 sWakeupEvents;
+
+
+/*!	Drivers report what wakes the system from a suspend to idle: a power or
+	sleep button pressed, a lid opened. The firmware interrupts the sleep for
+	other reasons as well; the system only wakes up when an event was
+	reported meanwhile. Can be called from interrupt handlers.
+*/
+void
+device_manager_wakeup_event(const char* source)
+{
+	atomic_add(&sWakeupEvents, 1);
+	device_manager_suspend_trace("wakeup event: %s", source);
+}
+
+
+int32
+device_manager_wakeup_events()
+{
+	return atomic_get(&sWakeupEvents);
 }
 
 

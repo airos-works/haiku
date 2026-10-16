@@ -15,6 +15,8 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <vector>
 
 #include <Alert.h>
 #include <Application.h>
@@ -24,6 +26,7 @@
 #include <Roster.h>
 #include <String.h>
 
+#include "AudioDevices.h"
 #include "DeskButton.h"
 #include "VolumeWindow.h"
 
@@ -81,9 +84,58 @@ main(int, char **argv)
 		}
 
 		if (strcmp(argv[i], "--add-volume") == 0) {
+			// (our own path, not argv[0], which is a bare name when run
+			// from the shell's PATH)
+			image_info image;
 			entry_ref ref;
-			if (get_ref_for_path(argv[0], &ref) == B_OK) {
+			if (our_image(image) == B_OK
+				&& get_ref_for_path(image.name, &ref) == B_OK) {
 				deskbar.AddItem(&ref);
+			} else if (get_ref_for_path(argv[0], &ref) == B_OK)
+				deskbar.AddItem(&ref);
+			return 0;
+		}
+
+		if (strcmp(argv[i], "--audio-devices") == 0) {
+			// the physical audio outputs and inputs, the defaults marked
+			AudioDevices devices;
+			std::vector<AudioDevices::Device> list;
+			for (int32 pass = 0; pass < 2; pass++) {
+				bool outputs = pass == 0;
+				if (outputs)
+					devices.GetOutputs(list);
+				else
+					devices.GetInputs(list);
+				printf("%s:\n", outputs ? "Outputs" : "Inputs");
+				for (size_t j = 0; j < list.size(); j++) {
+					printf("  %c node %" B_PRId32, list[j].isDefault ? '*' : ' ',
+						list[j].node);
+					if (list[j].inputID >= 0)
+						printf(" input %" B_PRId32, list[j].inputID);
+					printf(" \"%s\"\n", list[j].name.String());
+				}
+			}
+			return 0;
+		}
+
+		if (strncmp(argv[i], "--audio-output=", 15) == 0
+			|| strncmp(argv[i], "--audio-input=", 14) == 0) {
+			// --audio-output=<node>[:<input>] | --audio-input=<node>
+			bool output = argv[i][8] == 'o';
+			const char* value = argv[i] + (output ? 15 : 14);
+			int32 node = atoi(value);
+			int32 inputID = -1;
+			const char* colon = strchr(value, ':');
+			if (colon != NULL)
+				inputID = atoi(colon + 1);
+
+			AudioDevices devices;
+			status_t status = output
+				? devices.SetOutput(node, inputID) : devices.SetInput(node);
+			if (status != B_OK) {
+				fprintf(stderr, "desklink: could not set the audio %s: %s\n",
+					output ? "output" : "input", strerror(status));
+				return 1;
 			}
 			return 0;
 		}
@@ -173,6 +225,8 @@ main(int, char **argv)
 		printf(	"usage: desklink { [ --list|--remove|[cmd=title:action ... ] [ path|signature ] } ...\n"
 			"--add-volume: install volume control into Deskbar.\n"
 			"--volume-control: show window with global volume control.\n"
+			"--audio-devices: list the audio outputs and inputs (* = default).\n"
+			"--audio-output=node[:input], --audio-input=node: set the default.\n"
 			"--list: list all Deskbar addons.\n"
 			"--remove: remove all desklink addons.\n"
 			"--remove=name: remove all 'name' addons.\n");

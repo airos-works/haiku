@@ -63,6 +63,7 @@ private:
 	virtual	void				MessageReceived(BMessage* message);
 
 private:
+			void				_HandleMediaKey(BMessage* message);
 			void				_ShowSettingsWindow();
 			void				_BroadcastMessage(const BMessage& message);
 

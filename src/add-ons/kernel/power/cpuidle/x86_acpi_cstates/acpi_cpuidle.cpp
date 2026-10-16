@@ -105,7 +105,25 @@ static acpi_cpuidle_driver_info *sAcpiProcessor[SMP_MAX_CPUS];
 static device_manager_info *sDeviceManager;
 static acpi_module_info *sAcpi;
 
+// the deepest state the scheduler mode allows
 static int32 sStateIndex = -1;
+// a state is worth entering when the CPU is expected to stay idle for this
+// many times its exit latency
+static uint32 sResidencyFactor = 4;
+
+// low latency mode leaves out states slower than this to come out of (us)
+#define LOW_LATENCY_MAX_EXIT	100
+
+// how long each CPU stayed idle recently (us), one cache line each
+struct idle_history {
+	bigtime_t	time;
+} __attribute__((aligned(64)));
+static idle_history sIdleTime[SMP_MAX_CPUS];
+
+#ifdef ACPI_CPUIDLE_STATS
+static int32 sStateEntered[MAX_CSTATES];
+static int32 sBusMasterDemoted;
+#endif
 
 
 static status_t
@@ -229,29 +247,30 @@ acpi_cstate_enter(acpi_cstate_info *ci)
 static void
 acpi_cstate_set_scheduler_mode(scheduler_mode mode)
 {
-	int maxState;
-	if (mode == SCHEDULER_MODE_POWER_SAVING)
-		maxState = ACPI_STATE_C3;
-	else
-		maxState = ACPI_STATE_C1;
+	bool powerSaving = mode == SCHEDULER_MODE_POWER_SAVING;
 
 	acpi_cpuidle_driver_info *pi = sAcpiProcessor[0];
 	int32 index = -1;
 	for (int i = 0; i < pi->state_count; i++) {
-		if (pi->states[i].type > maxState)
+		if (!powerSaving && i > 0
+			&& pi->states[i].latency > LOW_LATENCY_MAX_EXIT) {
 			break;
+		}
 
 		index = i;
 	}
 
+	sResidencyFactor = powerSaving ? 2 : 4;
 	sStateIndex = index;
 }
 
 
-/*!	Enters the C-state chosen for the scheduler mode, as Linux does: with
-	interrupts disabled, so that one that comes in between deciding and
-	entering it still wakes the CPU. MWAIT is told to treat interrupts as
-	break events, and the I/O port reads of C2 and C3 leave their state on a
+/*!	Enters the deepest C-state the scheduler mode allows that is worth its
+	exit latency, judging by how long this CPU stayed idle recently (much as
+	x86_cstates and Linux' governors do). Interrupts are disabled meanwhile,
+	as Linux does, so that one that comes in between deciding and entering
+	the state still wakes the CPU: MWAIT is told to treat interrupts as break
+	events, and the I/O port reads of C2 and C3 leave their state on a
 	pending interrupt anyway. Only HLT needs them enabled.
 */
 static void
@@ -264,50 +283,70 @@ acpi_cstate_idle()
 		return;
 	}
 
-	acpi_cpuidle_driver_info *pi = sAcpiProcessor[smp_get_current_cpu()];
+	int32 cpu = smp_get_current_cpu();
+	acpi_cpuidle_driver_info *pi = sAcpiProcessor[cpu];
+	bigtime_t expected = sIdleTime[cpu].time;
+	while (stateIndex > 0 && (bigtime_t)pi->states[stateIndex].latency
+			* sResidencyFactor > expected) {
+		stateIndex--;
+	}
+
 	acpi_cstate_info *ci = &pi->states[stateIndex];
 	if (ci->method == ACPI_CSTATE_HALT) {
+		bigtime_t start = system_time();
 		acpi_cstate_halt();
+		sIdleTime[cpu].time = (expected + system_time() - start) / 2;
 		return;
 	}
 
 	InterruptsLocker locker;
 
 	// With bus master activity, C3 would have to keep the caches coherent:
-	// C1 instead
+	// the deepest state short of it instead, as Linux does
 	if (ci->type == ACPI_STATE_C3 && !ci->skip_bm_sts
 		&& acpi_cstate_bm_check()) {
-		ci = &pi->states[0];
+		while (stateIndex > 0 && pi->states[stateIndex].type == ACPI_STATE_C3)
+			stateIndex--;
+		ci = &pi->states[stateIndex];
+#ifdef ACPI_CPUIDLE_STATS
+		atomic_add(&sBusMasterDemoted, 1);
+#endif
 		if (ci->method == ACPI_CSTATE_HALT) {
 			locker.Unlock();
+			bigtime_t start = system_time();
 			acpi_cstate_halt();
+			sIdleTime[cpu].time = (expected + system_time() - start) / 2;
 			return;
 		}
 	}
+#ifdef ACPI_CPUIDLE_STATS
+	atomic_add(&sStateEntered[stateIndex], 1);
+#endif
 
-	if (ci->type != ACPI_STATE_C3) {
+	bigtime_t start = system_time();
+	if (ci->type != ACPI_STATE_C3)
 		acpi_cstate_enter(ci);
-		return;
+	else {
+		// set BM_RLD for Bus Master to activity to wake the system from C3
+		// With Newer chipsets BM_RLD is a NOP Since DMA is automatically
+		// handled during C3 State
+		if (pi->flags & ACPI_FLAG_C_BM)
+			sAcpi->write_bit_register(ACPI_BITREG_BUS_MASTER_RLD, 1);
+
+		// disable bus master arbitration during C3
+		if (pi->flags & ACPI_FLAG_C_ARB)
+			sAcpi->write_bit_register(ACPI_BITREG_ARB_DISABLE, 1);
+
+		acpi_cstate_enter(ci);
+
+		// clear BM_RLD and re-enable the arbiter
+		if (pi->flags & ACPI_FLAG_C_BM)
+			sAcpi->write_bit_register(ACPI_BITREG_BUS_MASTER_RLD, 0);
+
+		if (pi->flags & ACPI_FLAG_C_ARB)
+			sAcpi->write_bit_register(ACPI_BITREG_ARB_DISABLE, 0);
 	}
-
-	// set BM_RLD for Bus Master to activity to wake the system from C3
-	// With Newer chipsets BM_RLD is a NOP Since DMA is automatically handled
-	// during C3 State
-	if (pi->flags & ACPI_FLAG_C_BM)
-		sAcpi->write_bit_register(ACPI_BITREG_BUS_MASTER_RLD, 1);
-
-	// disable bus master arbitration during C3
-	if (pi->flags & ACPI_FLAG_C_ARB)
-		sAcpi->write_bit_register(ACPI_BITREG_ARB_DISABLE, 1);
-
-	acpi_cstate_enter(ci);
-
-	// clear BM_RLD and re-enable the arbiter
-	if (pi->flags & ACPI_FLAG_C_BM)
-		sAcpi->write_bit_register(ACPI_BITREG_BUS_MASTER_RLD, 0);
-
-	if (pi->flags & ACPI_FLAG_C_ARB)
-		sAcpi->write_bit_register(ACPI_BITREG_ARB_DISABLE, 0);
+	sIdleTime[cpu].time = (expected + system_time() - start) / 2;
 }
 
 

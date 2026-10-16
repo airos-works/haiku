@@ -559,6 +559,22 @@ x86_init_tsc(kernel_args* args)
 
 	gSystemTimeConversionFactor = conversionFactor;
 
+	// How long the firmware and the boot loader took: the TSC counted from
+	// reset until the kernel zeroed it, and the loader noted its value on
+	// entry. Of use when a boot feels slow before the kernel has a say in it.
+	if (gKernelEntryTSC != 0 && gCPUClockSpeed > 0) {
+		const uint64 ticksPerMs = gCPUClockSpeed / 1000;
+		uint64 loaderEntry = args->arch_args.boot_loader_entry_tsc;
+		if (loaderEntry > 0 && loaderEntry < gKernelEntryTSC) {
+			dprintf("boot: firmware %" B_PRIu64 " ms, boot loader %" B_PRIu64
+				" ms before the kernel\n", loaderEntry / ticksPerMs,
+				(gKernelEntryTSC - loaderEntry) / ticksPerMs);
+		} else {
+			dprintf("boot: %" B_PRIu64 " ms from CPU reset to the kernel\n",
+				gKernelEntryTSC / ticksPerMs);
+		}
+	}
+
 	uint64 conversionFactorNsecs = (uint64)conversionFactor * 1000;
 
 #ifdef __x86_64__

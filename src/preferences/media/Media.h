@@ -1,5 +1,5 @@
 /*
- * Copyright 2003-2006, Haiku. All rights reserved.
+ * Copyright 2003-2026, Haiku. All rights reserved.
  * Distributed under the terms of the MIT License.
  *
  * Authors in chronological order:
@@ -10,22 +10,26 @@
 #define MEDIA_H
 
 
-#include "MediaWindow.h"
-
 #include <Application.h>
-#include <Catalog.h>
-#include <Locale.h>
+#include <Message.h>
+
+
+class MediaWindow;
+
+
+status_t load_media_settings(BMessage& settings);
+status_t save_media_settings(const BMessage& settings);
 
 
 class Media : public BApplication {
 public:
 								Media();
 
-			status_t			InitCheck();
+	virtual	void				ReadyToRun();
 
 private:
-			MediaIcons			fIcons;
 			MediaWindow*		fWindow;
 };
+
 
 #endif	// MEDIA_H

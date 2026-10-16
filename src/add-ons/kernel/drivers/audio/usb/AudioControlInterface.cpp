@@ -7,11 +7,33 @@
 
 #include "AudioControlInterface.h"
 
+#include <stdlib.h>
+#include <string.h>
+
+#include <ByteOrder.h>
 #include <usb/USB_audio.h>
 
 #include "Device.h"
 #include "Driver.h"
 #include "Settings.h"
+
+
+
+/*!	A descriptor shorter than what is read from it (a non-compliant device,
+	a webcam's microphone for example) must not be parsed: reading past it
+	is reading past the configuration buffer, in the kernel.
+*/
+static bool
+descriptor_too_short(const usb_audiocontrol_header_descriptor* header,
+	size_t needed, const char* what)
+{
+	if (header->length >= needed)
+		return false;
+
+	TRACE(ERR, "%s descriptor of %d bytes is shorter than %d: ignored\n",
+		what, header->length, (int)needed);
+	return true;
+}
 
 
 // control id is encoded in following way
@@ -247,6 +269,10 @@ InputTerminal::InputTerminal(AudioControlInterface*	interface,
 {
 	usb_audio_input_terminal_descriptor* Terminal
 		= (usb_audio_input_terminal_descriptor*) Header;
+	if (descriptor_too_short(Header,
+			fInterface->SpecReleaseNumber() < 0x200 ? 12 : 17, "Input terminal"))
+		return;
+
 	fID					= Terminal->terminal_id;
 	fTerminalType		= Terminal->terminal_type;
 	fAssociatedTerminal = Terminal->assoc_terminal;
@@ -303,6 +329,9 @@ OutputTerminal::OutputTerminal(AudioControlInterface*	interface,
 {
 	usb_audio_output_terminal_descriptor* Terminal
 		= (usb_audio_output_terminal_descriptor*) Header;
+	if (descriptor_too_short(Header,
+			fInterface->SpecReleaseNumber() < 0x200 ? 9 : 12, "Output terminal"))
+		return;
 
 	fID					= Terminal->terminal_id;
 	fTerminalType		= Terminal->terminal_type;
@@ -354,6 +383,11 @@ MixerUnit::MixerUnit(AudioControlInterface*	interface,
 {
 	usb_audio_mixer_unit_descriptor* Mixer
 		= (usb_audio_mixer_unit_descriptor*) Header;
+	if (descriptor_too_short(Header, 5, "Mixer unit")
+		|| descriptor_too_short(Header, (fInterface->SpecReleaseNumber() < 0x200
+				? 10 : 13) + Mixer->num_input_pins, "Mixer unit")) {
+		return;
+	}
 
 	fID = Mixer->unit_id;
 	TRACE(UAC, "Mixer ID:%d >>>\n", fID);
@@ -476,6 +510,11 @@ SelectorUnit::SelectorUnit(AudioControlInterface*	interface,
 {
 	usb_audio_selector_unit_descriptor* Selector
 		= (usb_audio_selector_unit_descriptor*) Header;
+	if (descriptor_too_short(Header, 5, "Selector unit")
+		|| descriptor_too_short(Header, (fInterface->SpecReleaseNumber() < 0x200
+				? 6 : 7) + Selector->num_input_pins, "Selector unit")) {
+		return;
+	}
 
 	fID = Selector->unit_id;
 	TRACE(UAC, "Selector ID:%d >>>\n", fID);
@@ -541,13 +580,25 @@ FeatureUnit::FeatureUnit(AudioControlInterface*	interface,
 	TRACE(UAC, "Source ID:%d\n", fSourceID);
 
 	uint8 controlSize = 4;
-	uint8 channelsCount = (Feature->length - 6) / controlSize;
+	uint8 channelsCount = 0;
 	uint8* ControlsBitmapPointer = (uint8*)&Feature->r2.bma_controls[0];
 
 	if (fInterface->SpecReleaseNumber() < 0x200) {
+		if (descriptor_too_short(Header, 7, "Feature unit"))
+			return;
 		controlSize = Feature->r1.control_size;
-		channelsCount = (Feature->length - 7) / Feature->r1.control_size;
+		if (controlSize != 1 && controlSize != 2 && controlSize != 4) {
+			// (a zero here used to divide the kernel by zero)
+			TRACE(ERR, "Feature unit with a control size of %d ignored\n",
+				controlSize);
+			return;
+		}
+		channelsCount = (Feature->length - 7) / controlSize;
 		ControlsBitmapPointer = &Feature->r1.bma_controls[0];
+	} else {
+		if (descriptor_too_short(Header, 6, "Feature unit"))
+			return;
+		channelsCount = (Feature->length - 6) / controlSize;
 	}
 
 	TRACE(UAC, "Channel bitmap size:%d\n", controlSize);
@@ -715,6 +766,11 @@ ProcessingUnit::ProcessingUnit(AudioControlInterface*	interface,
 {
 	usb_audio_processing_unit_descriptor* Processing
 		= (usb_audio_processing_unit_descriptor*) Header;
+	if (descriptor_too_short(Header, 7, "Processing unit")
+		|| descriptor_too_short(Header, (fInterface->SpecReleaseNumber() < 0x200
+				? 11 : 13) + Processing->num_input_pins, "Processing unit")) {
+		return;
+	}
 
 	fID = Processing->unit_id;
 	TRACE(UAC, "Processing ID:%d >>>\n", fID);
@@ -782,6 +838,11 @@ ExtensionUnit::ExtensionUnit(AudioControlInterface*	interface,
 {
 	usb_audio_extension_unit_descriptor* Extension
 		= (usb_audio_extension_unit_descriptor*) Header;
+	if (descriptor_too_short(Header, 7, "Extension unit")
+		|| descriptor_too_short(Header, (fInterface->SpecReleaseNumber() < 0x200
+				? 11 : 13) + Extension->num_input_pins, "Extension unit")) {
+		return;
+	}
 
 	fID = Extension->unit_id;
 	TRACE(UAC, "Extension ID:%d >>>\n", fID);
@@ -843,11 +904,25 @@ ExtensionUnit::~ExtensionUnit()
 ClockSource::ClockSource(AudioControlInterface*	interface,
 		usb_audiocontrol_header_descriptor* Header)
 	:
-	_AudioControl(interface, Header)
+	_AudioControl(interface, Header),
+	fAttributes(0),
+	fControls(0)
 {
-	usb_audio_input_terminal_descriptor* descriptor
-		= (usb_audio_input_terminal_descriptor*) Header;
-	TRACE(UAC, "Clock Source:%d >>>\n",	descriptor->terminal_id);
+	usb_audio_clocksource_descriptor* descriptor
+		= (usb_audio_clocksource_descriptor*)Header;
+	if (descriptor_too_short(Header, 8, "Clock source"))
+		return;
+
+	fID = descriptor->clock_id;
+	fAttributes = descriptor->bm_attributes;
+	fControls = descriptor->bm_controls;
+	fStringIndex = descriptor->clock_source_idx;
+
+	TRACE(UAC, "Clock Source:%d >>>\n", fID);
+	TRACE(UAC, "Attributes:%#04x\n", fAttributes);
+	TRACE(UAC, "Controls:%#04x\n", fControls);
+
+	fStatus = B_OK;
 }
 
 
@@ -859,11 +934,31 @@ ClockSource::~ClockSource()
 ClockSelector::ClockSelector(AudioControlInterface*	interface,
 		usb_audiocontrol_header_descriptor* Header)
 	:
-	_AudioControl(interface, Header)
+	_AudioControl(interface, Header),
+	fControls(0)
 {
-	usb_audio_input_terminal_descriptor* descriptor
-		= (usb_audio_input_terminal_descriptor*) Header;
-	TRACE(UAC, "Clock Selector:%d >>>\n", descriptor->terminal_id);
+	usb_audio_clockselector_descriptor* descriptor
+		= (usb_audio_clockselector_descriptor*)Header;
+	if (descriptor_too_short(Header, 5, "Clock selector")
+		|| descriptor_too_short(Header, 7 + descriptor->nrinpins,
+			"Clock selector")) {
+		return;
+	}
+
+	fID = descriptor->clock_id;
+	TRACE(UAC, "Clock Selector:%d >>>\n", fID);
+
+	// (the pins are followed by the controls and the string index)
+	const uint8* pins = descriptor->Csourceid;
+	for (size_t i = 0; i < descriptor->nrinpins; i++) {
+		fInputPins.PushBack(pins[i]);
+		TRACE(UAC, "Input pin #%d:%d\n", i, fInputPins[i]);
+	}
+	fControls = pins[descriptor->nrinpins];
+	fStringIndex = pins[descriptor->nrinpins + 1];
+	TRACE(UAC, "Controls:%#04x\n", fControls);
+
+	fStatus = B_OK;
 }
 
 
@@ -875,11 +970,21 @@ ClockSelector::~ClockSelector()
 ClockMultiplier::ClockMultiplier(AudioControlInterface*	interface,
 		usb_audiocontrol_header_descriptor* Header)
 	:
-	_AudioControl(interface, Header)
+	_AudioControl(interface, Header),
+	fClockSourceID(0)
 {
-	usb_audio_input_terminal_descriptor* descriptor
-		= (usb_audio_input_terminal_descriptor*) Header;
-	TRACE(UAC, "Clock Multiplier:%d >>>\n",	descriptor->terminal_id);
+	usb_audio_clockmultiplier_descriptor* descriptor
+		= (usb_audio_clockmultiplier_descriptor*)Header;
+	if (descriptor_too_short(Header, 7, "Clock multiplier"))
+		return;
+
+	fID = descriptor->clockid;
+	fClockSourceID = descriptor->clksourceid;
+	fStringIndex = descriptor->clockmultiplier;
+	TRACE(UAC, "Clock Multiplier:%d >>>\n", fID);
+	TRACE(UAC, "Clock Source:%d\n", fClockSourceID);
+
+	fStatus = B_OK;
 }
 
 
@@ -941,6 +1046,11 @@ AudioControlInterface::Init(size_t interface, usb_interface_info* Interface)
 		usb_audiocontrol_header_descriptor* Header
 			= (usb_audiocontrol_header_descriptor* )Interface->generic[i];
 
+		if (Header->length < 3) {
+			TRACE(ERR, "Ignore Audio Control descriptor of %d bytes\n",
+				Header->length);
+			continue;
+		}
 		if (Header->descriptor_type != USB_AUDIO_CS_INTERFACE) {
 			TRACE(ERR, "Ignore Audio Control of "
 				"unknown descriptor type %#04x.\n",	Header->descriptor_type);
@@ -958,7 +1068,8 @@ AudioControlInterface::Init(size_t interface, usb_interface_info* Interface)
 				TRACE(ERR, "Ignore Audio Control of undefined sub-type\n");
 				break;
 			case USB_AUDIO_AC_HEADER:
-				if (Header->bcd_release_no != USB_AUDIO_CLASS_VERSION_1) {
+				if (Header->bcd_release_no != USB_AUDIO_CLASS_VERSION_1
+					&& Header->bcd_release_no != USB_AUDIO_CLASS_VERSION_2) {
 					TRACE(ERR, "Ignore Audio Control of unknown version %#04x.\n",
 						Header->bcd_release_no);
 					continue;
@@ -981,13 +1092,13 @@ AudioControlInterface::Init(size_t interface, usb_interface_info* Interface)
 				control = new(std::nothrow) FeatureUnit(this, Header);
 				break;
 			case USB_AUDIO_AC_PROCESSING_UNIT:
-				if (SpecReleaseNumber() < 200)
+				if (SpecReleaseNumber() < 0x200)
 					control = new(std::nothrow) ProcessingUnit(this, Header);
 				else
 					control = new(std::nothrow) EffectUnit(this, Header);
 				break;
 			case USB_AUDIO_AC_EXTENSION_UNIT:
-				if (SpecReleaseNumber() < 200)
+				if (SpecReleaseNumber() < 0x200)
 					control = new(std::nothrow) ExtensionUnit(this, Header);
 				else
 					control = new(std::nothrow) ProcessingUnit(this, Header);
@@ -1055,12 +1166,20 @@ AudioControlInterface::InitACHeader(size_t interface,
 	TRACE(UAC, "ADCSpecification:%#06x\n", fADCSpecification);
 
 	if (fADCSpecification < 0x200) {
+		if (descriptor_too_short(Header, 8, "Audio control header"))
+			return fStatus = B_BAD_VALUE;
+		if (descriptor_too_short(Header, 8 + Header->r1.in_collection,
+				"Audio control header")) {
+			return fStatus = B_BAD_VALUE;
+		}
 		TRACE(UAC, "InterfacesCount:%d\n",	Header->r1.in_collection);
 		for (size_t i = 0; i < Header->r1.in_collection; i++) {
 			fStreams.PushBack(Header->r1.interface_numbers[i]);
 			TRACE(UAC, "Interface[%d] number is %d\n", i, fStreams[i]);
 		}
 	} else {
+		if (descriptor_too_short(Header, 9, "Audio control header"))
+			return fStatus = B_BAD_VALUE;
 		fFunctionCategory = Header->r2.function_category;
 		fControlsBitmap = Header->r2.bm_controls;
 		TRACE(UAC, "Function Category:%#04x\n", fFunctionCategory);
@@ -1120,9 +1239,26 @@ AudioControlInterface::GetTerminalChannels(Vector<multi_channel_info>& Channels,
 
 	// Haiku multi-aduio designations have the same bits
 	// as USB Audio 2.0 cluster spatial locations :-)
+	uint32 config = cluster->ChannelsConfig();
+	uint32 named = 0;
+	for (size_t i = 0; i < kChannels; i++) {
+		if ((config & (1 << i)) != 0)
+			named++;
+	}
+	// A cluster may give its channels no spatial locations (a stereo DAC with
+	// a channel config of 0), or fewer than it has: the others take the
+	// first free locations, so every channel of the stream is there.
+	for (size_t i = 0; i < kChannels && named < cluster->ChannelsCount();
+			i++) {
+		if ((config & (1 << i)) == 0) {
+			config |= 1 << i;
+			named++;
+		}
+	}
+
 	for (size_t i = 0; i < kChannels; i++) {
 		uint32 designation = 1 << i;
-		if ((cluster->ChannelsConfig() & designation) == designation) {
+		if ((config & designation) == designation) {
 			multi_channel_info info;
 			info.channel_id	= Channels.Count();
 			info.kind		= kind;
@@ -1259,6 +1395,47 @@ AudioControlInterface::_InitGainLimits(multi_mix_control& Control)
 	Control.gain.min_gain = 0.;
 	Control.gain.max_gain = 100.;
 	Control.gain.granularity = 1.;
+
+	if (fADCSpecification >= 0x200) {
+		// one current value, and the range as sub-ranges of minimum,
+		// maximum and resolution (R2 5.2.1)
+		size_t actualLength = 0;
+		int16 data = 0;
+		status_t status = gUSBModule->send_request(fDevice->USBDevice(),
+			USB_REQTYPE_INTERFACE_IN | USB_REQTYPE_CLASS, USB_AUDIO_V2_CUR,
+			REQ_VALUE(Control.id), REQ_INDEX(Control.id), sizeof(data), &data,
+			&actualLength);
+		if (status != B_OK || actualLength != sizeof(data)) {
+			TRACE(ERR, "Request (%04x:%04x) fail:%#08x; received %d of %d\n",
+				REQ_VALUE(Control.id), REQ_INDEX(Control.id), status,
+				actualLength, sizeof(data));
+			return false;
+		}
+		current = static_cast<float>(data) / 256.;
+
+		struct {
+			uint16	count;
+			int16	min;
+			int16	max;
+			int16	resolution;
+		} _PACKED range;
+		status = gUSBModule->send_request(fDevice->USBDevice(),
+			USB_REQTYPE_INTERFACE_IN | USB_REQTYPE_CLASS, USB_AUDIO_V2_RANGE,
+			REQ_VALUE(Control.id), REQ_INDEX(Control.id), sizeof(range),
+			&range, &actualLength);
+		if (status == B_OK && actualLength == sizeof(range)
+			&& range.count > 0) {
+			Control.gain.min_gain = static_cast<float>(range.min) / 256.;
+			Control.gain.max_gain = static_cast<float>(range.max) / 256.;
+			Control.gain.granularity
+				= static_cast<float>(range.resolution) / 256.;
+		}
+
+		TRACE(ERR, "Control %s: %f dB, from %f to %f dB, step %f dB.\n",
+			Control.name, current, Control.gain.min_gain,
+			Control.gain.max_gain, Control.gain.granularity);
+		return true;
+	}
 
 	size_t actualLength = 0;
 	for (size_t i = 0; i < B_COUNT_OF(gainInfos); i++) {
@@ -1935,7 +2112,7 @@ AudioControlInterface::GetMix(multi_mix_value_info* Info)
 
 		size_t actualLength = 0;
 		status_t status = gUSBModule->send_request(fDevice->USBDevice(),
-			USB_REQTYPE_INTERFACE_IN | USB_REQTYPE_CLASS, USB_AUDIO_GET_CUR,
+			USB_REQTYPE_INTERFACE_IN | USB_REQTYPE_CLASS, _GetCurRequest(),
 			REQ_VALUE(Info->values[i].id), REQ_INDEX(Info->values[i].id),
 			length, &data, &actualLength);
 
@@ -2088,3 +2265,215 @@ AudioControlInterface::SetMix(multi_mix_value_info* Info)
 	return B_OK;
 }
 
+
+
+/*!	A USB Audio 2.0 class request to an entity of this function: request
+	USB_AUDIO_V2_CUR or USB_AUDIO_V2_RANGE, value the control selector << 8
+	| the channel.
+*/
+status_t
+AudioControlInterface::_ClassRequest(bool in, uint8 request, uint16 value,
+	uint8 entity, uint16 length, void* data, size_t* actualLength)
+{
+	*actualLength = 0;
+	return gUSBModule->send_request(fDevice->USBDevice(),
+		(in ? USB_REQTYPE_INTERFACE_IN : USB_REQTYPE_INTERFACE_OUT)
+			| USB_REQTYPE_CLASS,
+		request, value, entity << 8 | fInterface, length, data, actualLength);
+}
+
+
+/*!	The clock source behind a terminal's clock: selectors and multipliers
+	are followed to it.
+*/
+ClockSource*
+AudioControlInterface::FindClockSource(uint8 clockID)
+{
+	for (int32 hops = 0; hops < 8; hops++) {
+		_AudioControl* control = Find(clockID);
+		if (control == NULL) {
+			TRACE(ERR, "No clock entity %d\n", clockID);
+			return NULL;
+		}
+
+		switch (control->SubType()) {
+			case USB_AUDIO_AC_CLOCK_SOURCE_R2:
+				return static_cast<ClockSource*>(control);
+
+			case USB_AUDIO_AC_CLOCK_MULTIPLIER_R2:
+				// (the rate it makes is not this one, but no device seen
+				// yet has one)
+				clockID = static_cast<ClockMultiplier*>(control)
+					->ClockSourceID();
+				break;
+
+			case USB_AUDIO_AC_CLOCK_SELECTOR_R2:
+			{
+				ClockSelector* selector = static_cast<ClockSelector*>(control);
+				uint8 pin = 1;
+				size_t actualLength = 0;
+				if (selector->CanReadSelection()) {
+					status_t status = _ClassRequest(true, USB_AUDIO_V2_CUR,
+						USB_AUDIO_CX_CLOCK_SELECTOR_CONTROL << 8, clockID,
+						sizeof(pin), &pin, &actualLength);
+					if (status == B_TIMED_OUT) {
+						// (a device that is going away: do not wait more)
+						TRACE(ERR, "Clock selector %d does not answer\n",
+							clockID);
+						return NULL;
+					}
+					if (status != B_OK || actualLength != sizeof(pin)
+						|| pin == 0) {
+						pin = 1;
+					}
+				}
+				clockID = selector->InputPin(pin - 1);
+				if (clockID == 0)
+					clockID = selector->InputPin(0);
+				TRACE(UAC, "Clock selector %d is at pin %d: clock %d\n",
+					control->ID(), pin, clockID);
+				break;
+			}
+
+			default:
+				TRACE(ERR, "Entity %d is no clock\n", clockID);
+				return NULL;
+		}
+	}
+
+	TRACE(ERR, "Clock %d: no clock source found\n", clockID);
+	return NULL;
+}
+
+
+/*!	The sampling rates the clock behind clockID can run at, of the usual
+	ones. The device gives them as sub-ranges of a minimum, a maximum and a
+	resolution (a list of single rates has the minimum equal to the maximum).
+*/
+status_t
+AudioControlInterface::GetClockRates(uint8 clockID, Vector<uint32>& rates)
+{
+	static const uint32 kRates[] = {
+		8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000,
+		88200, 96000, 176400, 192000, 352800, 384000, 705600, 768000
+	};
+	static const size_t kMaxSubRanges = 32;
+
+	rates.MakeEmpty();
+
+	ClockSource* source = FindClockSource(clockID);
+	if (source == NULL)
+		return B_ERROR;
+
+	uint16 count = 0;
+	size_t actualLength = 0;
+	status_t status = _ClassRequest(true, USB_AUDIO_V2_RANGE,
+		USB_AUDIO_CS_SAM_FREQ_CONTROL << 8, source->ID(), sizeof(count),
+		&count, &actualLength);
+	count = B_LENDIAN_TO_HOST_INT16(count);
+	if (status == B_TIMED_OUT) {
+		TRACE(ERR, "Clock %d does not answer\n", source->ID());
+		return status;
+	}
+	if (status != B_OK || actualLength != sizeof(count) || count == 0) {
+		// then at least the rate it runs at
+		uint32 current = 0;
+		status = _ClassRequest(true, USB_AUDIO_V2_CUR,
+			USB_AUDIO_CS_SAM_FREQ_CONTROL << 8, source->ID(), sizeof(current),
+			&current, &actualLength);
+		TRACE(ERR, "Clock %d has no rate range; it runs at %u Hz (%s)\n",
+			source->ID(), B_LENDIAN_TO_HOST_INT32(current), strerror(status));
+		if (status != B_OK || actualLength != sizeof(current))
+			return status != B_OK ? status : B_ERROR;
+		rates.PushBack(B_LENDIAN_TO_HOST_INT32(current));
+		return B_OK;
+	}
+
+	if (count > kMaxSubRanges)
+		count = kMaxSubRanges;
+	size_t length = 2 + 12 * count;
+	uint8* data = (uint8*)malloc(length);
+	if (data == NULL)
+		return B_NO_MEMORY;
+
+	status = _ClassRequest(true, USB_AUDIO_V2_RANGE,
+		USB_AUDIO_CS_SAM_FREQ_CONTROL << 8, source->ID(), length, data,
+		&actualLength);
+	if (status != B_OK || actualLength < 2 + 12) {
+		TRACE(ERR, "Clock %d rate ranges: %s, %d bytes\n", source->ID(),
+			strerror(status), (int)actualLength);
+		free(data);
+		return status != B_OK ? status : B_ERROR;
+	}
+
+	size_t subRanges = (actualLength - 2) / 12;
+	for (size_t i = 0; i < B_COUNT_OF(kRates); i++) {
+		for (size_t r = 0; r < subRanges; r++) {
+			uint32 range[3];
+			memcpy(range, data + 2 + 12 * r, sizeof(range));
+			uint32 min = B_LENDIAN_TO_HOST_INT32(range[0]);
+			uint32 max = B_LENDIAN_TO_HOST_INT32(range[1]);
+			uint32 resolution = B_LENDIAN_TO_HOST_INT32(range[2]);
+			if (kRates[i] < min || kRates[i] > max)
+				continue;
+			if (resolution != 0 && (kRates[i] - min) % resolution != 0)
+				continue;
+			rates.PushBack(kRates[i]);
+			break;
+		}
+	}
+
+	for (size_t r = 0; r < subRanges; r++) {
+		uint32 range[3];
+		memcpy(range, data + 2 + 12 * r, sizeof(range));
+		TRACE(UAC, "Clock %d range %d: %u - %u Hz, step %u\n", source->ID(),
+			(int)r, B_LENDIAN_TO_HOST_INT32(range[0]),
+			B_LENDIAN_TO_HOST_INT32(range[1]),
+			B_LENDIAN_TO_HOST_INT32(range[2]));
+	}
+
+	free(data);
+	return rates.Count() > 0 ? B_OK : B_BAD_VALUE;
+}
+
+
+status_t
+AudioControlInterface::SetClockRate(uint8 clockID, uint32 rate)
+{
+	ClockSource* source = FindClockSource(clockID);
+	if (source == NULL)
+		return B_ERROR;
+
+	status_t status = B_OK;
+	size_t actualLength = 0;
+	if (source->CanSetFrequency()) {
+		uint32 value = B_HOST_TO_LENDIAN_INT32(rate);
+		status = _ClassRequest(false, USB_AUDIO_V2_CUR,
+			USB_AUDIO_CS_SAM_FREQ_CONTROL << 8, source->ID(), sizeof(value),
+			&value, &actualLength);
+		if (status != B_OK) {
+			TRACE(ERR, "Clock %d: setting %u Hz failed: %s\n", source->ID(),
+				rate, strerror(status));
+		}
+	}
+
+	uint32 current = 0;
+	status_t readStatus = _ClassRequest(true, USB_AUDIO_V2_CUR,
+		USB_AUDIO_CS_SAM_FREQ_CONTROL << 8, source->ID(), sizeof(current),
+		&current, &actualLength);
+	current = B_LENDIAN_TO_HOST_INT32(current);
+
+	uint8 valid = 1;
+	if (source->CanReadValidity()) {
+		_ClassRequest(true, USB_AUDIO_V2_CUR,
+			USB_AUDIO_CS_CLOCK_VALID_CONTROL << 8, source->ID(), sizeof(valid),
+			&valid, &actualLength);
+	}
+
+	// (a device may take a moment to say it runs at the new rate: that is
+	// only logged)
+	TRACE(ERR, "Clock %d at %u Hz (%u asked, %s), %s\n", source->ID(),
+		current, rate, strerror(readStatus), valid ? "valid" : "not valid");
+
+	return status;
+}

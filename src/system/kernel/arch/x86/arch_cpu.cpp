@@ -114,6 +114,9 @@ static vint32 sTSCSyncRendezvous;
 
 /* Some specials for the double fault handler */
 static addr_t sDoubleFaultStacks = 0;
+
+uint64 gKernelEntryTSC = 0;
+	// time stamp counter when the kernel was entered, see x86_init_tsc()
 static const size_t kDoubleFaultStackSize = 4096;	// size per CPU
 
 static x86_cpu_module_info* sCpuModule;
@@ -1425,6 +1428,12 @@ arch_cpu_preboot_init_percpu(kernel_args* args, int cpu)
 	x86_write_cr0(CR0_PROTECTED_MODE | CR0_PAGING | CR0_WRITE_PROTECT | CR0_NUMERIC_ERROR);
 
 	if (cpu == 0) {
+		// time since the CPU left reset, before the TSC is reset below;
+		// x86_init_tsc() turns it into the firmware and loader boot times
+		uint32 low, high;
+		asm volatile("rdtsc" : "=a" (low), "=d" (high));
+		gKernelEntryTSC = ((uint64)high << 32) | low;
+
 		// We can't allocate pages at this stage in the boot process, only virtual addresses.
 		sDoubleFaultStacks = vm_allocate_early(args,
 			kDoubleFaultStackSize * smp_get_num_cpus(), 0, 0, 0);
