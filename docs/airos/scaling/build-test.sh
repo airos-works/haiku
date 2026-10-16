@@ -1,12 +1,13 @@
 #!/bin/bash
 # Cross-build a small test program from this directory against a build dir's
 # libraries:  build-test.sh <name> [extra libs...]  ->  $OUT/<name>
-# BUILD (default /mnt/HaikuWork/build/fracscale-x86_64) and OUT can be set.
+# BUILD (default /mnt/HaikuWork/build/master-x86_64) and OUT can be set;
+# LIBBE links against another libbe.so (for an older system).
 set -euo pipefail
 NAME=$1; shift
 HERE=$(cd "$(dirname "$0")" && pwd)
 HAIKU=$(cd "$HERE/../../.." && pwd)
-BUILD=${BUILD:-/mnt/HaikuWork/build/fracscale-x86_64}
+BUILD=${BUILD:-/mnt/HaikuWork/build/master-x86_64}
 OUT=${OUT:-$BUILD/scaling-tests}
 TOOLS=/mnt/HaikuWork/x399/build/x86_64/cross-tools-x86_64/bin/x86_64-unknown-haiku
 OBJ=$BUILD/objects/haiku/x86_64/release
