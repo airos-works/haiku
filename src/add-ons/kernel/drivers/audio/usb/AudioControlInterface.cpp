@@ -2312,12 +2312,20 @@ AudioControlInterface::FindClockSource(uint8 clockID)
 				ClockSelector* selector = static_cast<ClockSelector*>(control);
 				uint8 pin = 1;
 				size_t actualLength = 0;
-				if (selector->CanReadSelection()
-					&& (_ClassRequest(true, USB_AUDIO_V2_CUR,
-							USB_AUDIO_CX_CLOCK_SELECTOR_CONTROL << 8, clockID,
-							sizeof(pin), &pin, &actualLength) != B_OK
-						|| actualLength != sizeof(pin) || pin == 0)) {
-					pin = 1;
+				if (selector->CanReadSelection()) {
+					status_t status = _ClassRequest(true, USB_AUDIO_V2_CUR,
+						USB_AUDIO_CX_CLOCK_SELECTOR_CONTROL << 8, clockID,
+						sizeof(pin), &pin, &actualLength);
+					if (status == B_TIMED_OUT) {
+						// (a device that is going away: do not wait more)
+						TRACE(ERR, "Clock selector %d does not answer\n",
+							clockID);
+						return NULL;
+					}
+					if (status != B_OK || actualLength != sizeof(pin)
+						|| pin == 0) {
+						pin = 1;
+					}
 				}
 				clockID = selector->InputPin(pin - 1);
 				if (clockID == 0)
@@ -2363,6 +2371,10 @@ AudioControlInterface::GetClockRates(uint8 clockID, Vector<uint32>& rates)
 		USB_AUDIO_CS_SAM_FREQ_CONTROL << 8, source->ID(), sizeof(count),
 		&count, &actualLength);
 	count = B_LENDIAN_TO_HOST_INT16(count);
+	if (status == B_TIMED_OUT) {
+		TRACE(ERR, "Clock %d does not answer\n", source->ID());
+		return status;
+	}
 	if (status != B_OK || actualLength != sizeof(count) || count == 0) {
 		// then at least the rate it runs at
 		uint32 current = 0;

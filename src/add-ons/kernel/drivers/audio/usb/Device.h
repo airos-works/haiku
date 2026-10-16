@@ -33,8 +33,8 @@ public:
 
 			void			Removed();
 			bool			IsRemoved() { return fRemoved; };
+			void			OrphanBuffers();
 
-			status_t		CompareAndReattach(usb_device device);
 	virtual	status_t		SetupDevice(bool deviceReplugged);
 
 			usb_device		USBDevice() { return fDevice; }
