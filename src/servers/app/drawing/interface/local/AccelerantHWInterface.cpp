@@ -120,6 +120,7 @@ AccelerantHWInterface::AccelerantHWInterface()
 	fAccSetCursorBitmap(NULL),
 	fAccMoveCursor(NULL),
 	fAccShowCursor(NULL),
+	fCursorHookLock("cursor hooks"),
 
 	// dpms hooks
 	fAccDPMSCapabilities(NULL),
@@ -1643,6 +1644,7 @@ AccelerantHWInterface::_UpdateHardwareCursor(bool force)
 	ServerCursorReference cursor = CursorAndDragBitmap();
 	if (cursor.Get() == NULL || !LockExclusiveAccess())
 		return;
+	BAutolock hooks(fCursorHookLock);
 
 	// The accelerant makes a surface of every one it gets.
 	if (!force && fHardwareCursorEnabled && fHardwareCursor.Get() == cursor.Get()) {
@@ -1750,13 +1752,17 @@ AccelerantHWInterface::SetCursorVisible(bool visible)
 {
 	HWInterface::SetCursorVisible(visible);
 
-	if (fHardwareCursorEnabled && LockExclusiveAccess()) {
+	// The hooks are serialized among themselves only: the exclusive lock
+	// would make every mouse move wait for the drawing under way and hold
+	// up the vertical blank flush behind it (a waiting writer blocks new
+	// readers), for the sake of two registers.
+	if (fHardwareCursorEnabled && fCursorHookLock.Lock()) {
 		if (fAccShowCursor != NULL)
 				fAccShowCursor(visible);
 		else
 			fHardwareCursorEnabled = false;
 
-		UnlockExclusiveAccess();
+		fCursorHookLock.Unlock();
 	}
 }
 
@@ -1766,7 +1772,7 @@ AccelerantHWInterface::MoveCursorTo(float x, float y)
 {
 	HWInterface::MoveCursorTo(x, y);
 
-	if (fHardwareCursorEnabled && LockExclusiveAccess()) {
+	if (fHardwareCursorEnabled && fCursorHookLock.Lock()) {
 		if (fAccMoveCursor != NULL) {
 			// the hardware cursor lives in the front buffer's pixels
 			fAccMoveCursor((uint16)(x * RenderScaleFactor() * SoftwareScale() / 100),
@@ -1778,7 +1784,7 @@ AccelerantHWInterface::MoveCursorTo(float x, float y)
 				fAccShowCursor(false);
 		}
 
-		UnlockExclusiveAccess();
+		fCursorHookLock.Unlock();
 	}
 }
 
