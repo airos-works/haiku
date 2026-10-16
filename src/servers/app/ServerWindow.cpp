@@ -890,6 +890,8 @@ ServerWindow::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 
 			DTRACE(("ServerWindow %s: Message AS_WINDOW_RESIZE %.1f, %.1f\n",
 				Title(), xResizeTo, yResizeTo));
+			xResizeTo = limit_window_coordinate(xResizeTo);
+			yResizeTo = limit_window_coordinate(yResizeTo);
 
 			// comment this code for the time being, as some apps rely
 			// on the programmatically resize behavior during user resize
@@ -917,6 +919,8 @@ ServerWindow::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 
 			DTRACE(("ServerWindow %s: Message AS_WINDOW_MOVE: %.1f, %.1f\n",
 				Title(), xMoveTo, yMoveTo));
+			xMoveTo = limit_window_coordinate(xMoveTo);
+			yMoveTo = limit_window_coordinate(yMoveTo);
 
 			if (fWindow->IsDragging()) {
 				// While the user moves the window, we ignore

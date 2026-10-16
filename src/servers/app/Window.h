@@ -21,6 +21,8 @@
 #include "View.h"
 #include "WindowList.h"
 
+#include <math.h>
+
 #include <AutoDeleter.h>
 #include <ObjectList.h>
 #include <Referenceable.h>
@@ -29,6 +31,26 @@
 
 
 class Window;
+
+
+// How far a window's frame may go: clients send floats, but moves and
+// resizes are int32 steps (Window::MoveBy(), ResizeBy()). A frame from a
+// damaged settings file (7.2e22) could never be moved back, since no step
+// could cover the distance. Within these limits every step fits.
+static const float kMaxWindowCoordinate = 1048576.0f;
+
+
+static inline float
+limit_window_coordinate(float value)
+{
+	if (isnan(value))
+		return 0;
+	if (value < -kMaxWindowCoordinate)
+		return -kMaxWindowCoordinate;
+	if (value > kMaxWindowCoordinate)
+		return kMaxWindowCoordinate;
+	return value;
+}
 
 
 typedef	BObjectList<Window>	StackWindows;
