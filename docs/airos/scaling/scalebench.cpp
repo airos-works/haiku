@@ -5,7 +5,8 @@
  * Times what a scaled desktop costs app_server: drawing text, redrawing a
  * window of controls, moving that window, scrolling a text view by one
  * logical pixel at a time and enlarging a view sized bitmap to the frame
- * buffer (what a BGLView or a video view does), with and without filtering.
+ * buffer (what a BGLView or a video view does), with and without filtering,
+ * and a bitmap drawn one to one (an offscreen view).
  * Every step waits until app_server has done the work (Sync()) and the window
  * has redrawn what became dirty.
  *
@@ -38,7 +39,8 @@ public:
 		:
 		BView("bench text", B_WILL_DRAW),
 		fBitmap(BRect(0, 0, 399, 299), B_RGB32),
-		fBitmapOptions(-1)
+		fBitmapOptions(-1),
+		fOneToOne(false)
 	{
 		SetExplicitMinSize(BSize(400, 300));
 
@@ -52,16 +54,19 @@ public:
 		}
 	}
 
-	// -1 draws text, otherwise the bitmap with these options
-	void SetBitmapOptions(int32 options)
+	// -1 draws text, otherwise the bitmap with these options, scaled to the
+	// view or one to one
+	void SetBitmapOptions(int32 options, bool oneToOne = false)
 	{
 		fBitmapOptions = options;
+		fOneToOne = oneToOne;
 	}
 
 	virtual void Draw(BRect updateRect)
 	{
 		if (fBitmapOptions >= 0) {
-			DrawBitmap(&fBitmap, fBitmap.Bounds(), Bounds(), fBitmapOptions);
+			DrawBitmap(&fBitmap, fBitmap.Bounds(),
+				fOneToOne ? fBitmap.Bounds() : Bounds(), fBitmapOptions);
 			return;
 		}
 
@@ -77,6 +82,7 @@ public:
 private:
 	BBitmap		fBitmap;
 	int32		fBitmapOptions;
+	bool		fOneToOne;
 };
 
 
@@ -154,11 +160,12 @@ run_bench(BenchWindow* window)
 	}
 	printf("text view redraw: %.3f ms\n", elapsed_ms(start, iterations));
 
-	// a view sized bitmap, enlarged to the frame buffer
-	const int32 bitmapOptions[] = { 0, B_FILTER_BITMAP_BILINEAR };
-	const char* bitmapNames[] = { "nearest", "bilinear" };
-	for (int32 mode = 0; mode < 2; mode++) {
-		window->Text()->SetBitmapOptions(bitmapOptions[mode]);
+	// a view sized bitmap, enlarged to the frame buffer, and one drawn one
+	// to one (area sampled at fractional scales)
+	const int32 bitmapOptions[] = { 0, B_FILTER_BITMAP_BILINEAR, 0 };
+	const char* bitmapNames[] = { "nearest", "bilinear", "one to one" };
+	for (int32 mode = 0; mode < 3; mode++) {
+		window->Text()->SetBitmapOptions(bitmapOptions[mode], mode == 2);
 		start = system_time();
 		for (int i = 0; i < iterations; i++) {
 			window->Text()->Invalidate();
