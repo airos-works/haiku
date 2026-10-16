@@ -3,15 +3,18 @@
  * Distributed under the terms of the MIT License.
  *
  * Times what a scaled desktop costs app_server: drawing text, redrawing a
- * window of controls, moving that window and scrolling a text view by one
- * logical pixel at a time. Every step waits until app_server has done the
- * work (Sync()) and the window has redrawn what became dirty.
+ * window of controls, moving that window, scrolling a text view by one
+ * logical pixel at a time and enlarging a view sized bitmap to the frame
+ * buffer (what a BGLView or a video view does), with and without filtering.
+ * Every step waits until app_server has done the work (Sync()) and the window
+ * has redrawn what became dirty.
  *
  *   scalebench [iterations]
  */
 
 
 #include <Application.h>
+#include <Bitmap.h>
 #include <Button.h>
 #include <CheckBox.h>
 #include <LayoutBuilder.h>
@@ -33,13 +36,35 @@ class TextView : public BView {
 public:
 	TextView()
 		:
-		BView("bench text", B_WILL_DRAW)
+		BView("bench text", B_WILL_DRAW),
+		fBitmap(BRect(0, 0, 399, 299), B_RGB32),
+		fBitmapOptions(-1)
 	{
 		SetExplicitMinSize(BSize(400, 300));
+
+		uint32* bits = (uint32*)fBitmap.Bits();
+		for (int32 y = 0; y < 300; y++) {
+			for (int32 x = 0; x < 400; x++) {
+				bits[y * fBitmap.BytesPerRow() / 4 + x] = 0xff000000
+					| (x * 255 / 399) << 16 | (y * 255 / 299) << 8
+					| ((x / 8 + y / 8) % 2 != 0 ? 0xff : 0);
+			}
+		}
+	}
+
+	// -1 draws text, otherwise the bitmap with these options
+	void SetBitmapOptions(int32 options)
+	{
+		fBitmapOptions = options;
 	}
 
 	virtual void Draw(BRect updateRect)
 	{
+		if (fBitmapOptions >= 0) {
+			DrawBitmap(&fBitmap, fBitmap.Bounds(), Bounds(), fBitmapOptions);
+			return;
+		}
+
 		BFont font(be_plain_font);
 		for (int i = 0; i < 25; i++) {
 			BString text;
@@ -48,6 +73,10 @@ public:
 			DrawString(text.String(), BPoint(4, 12 + i * 12));
 		}
 	}
+
+private:
+	BBitmap		fBitmap;
+	int32		fBitmapOptions;
 };
 
 
@@ -93,11 +122,11 @@ public:
 
 	virtual void MessageReceived(BMessage* message);
 
-	BView* Text() const { return fText; }
+	TextView* Text() const { return fText; }
 	BTextView* Scrolling() const { return fTextView; }
 
 private:
-	BView*		fText;
+	TextView*	fText;
 	BTextView*	fTextView;
 };
 
@@ -124,6 +153,22 @@ run_bench(BenchWindow* window)
 		window->Text()->Sync();
 	}
 	printf("text view redraw: %.3f ms\n", elapsed_ms(start, iterations));
+
+	// a view sized bitmap, enlarged to the frame buffer
+	const int32 bitmapOptions[] = { 0, B_FILTER_BITMAP_BILINEAR };
+	const char* bitmapNames[] = { "nearest", "bilinear" };
+	for (int32 mode = 0; mode < 2; mode++) {
+		window->Text()->SetBitmapOptions(bitmapOptions[mode]);
+		start = system_time();
+		for (int i = 0; i < iterations; i++) {
+			window->Text()->Invalidate();
+			window->UpdateIfNeeded();
+			window->Text()->Sync();
+		}
+		printf("bitmap redraw, %s: %.3f ms\n", bitmapNames[mode],
+			elapsed_ms(start, iterations));
+	}
+	window->Text()->SetBitmapOptions(-1);
 
 	// the whole window
 	start = system_time();
