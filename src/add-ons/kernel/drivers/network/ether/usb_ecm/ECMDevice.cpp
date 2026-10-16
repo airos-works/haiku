@@ -167,12 +167,21 @@ ECMDevice::Open()
 	// interface and then enable it by setting the second actual data interface
 	const usb_configuration_info *config
 		= gUSBModule->get_configuration(fDevice);
+	if (!_HasECMInterfaces(config)) {
+		// The device is not in the configuration we set up (a device that
+		// came back behind a hub can start over in its first one): the
+		// interface indices and the second data alternate do not exist there.
+		TRACE_ALWAYS("the device is not in its ECM configuration\n");
+		return B_ERROR;
+	}
 
 	gUSBModule->set_alt_interface(fDevice,
 		&config->interface[fDataInterfaceIndex].alt[0]);
 
 	// update to the changed config
 	config = gUSBModule->get_configuration(fDevice);
+	if (!_HasECMInterfaces(config))
+		return B_ERROR;
 	gUSBModule->set_alt_interface(fDevice,
 		&config->interface[fDataInterfaceIndex].alt[1]);
 	gUSBModule->set_alt_interface(fDevice,
@@ -400,6 +409,17 @@ ECMDevice::Control(uint32 op, void *buffer, size_t length)
 }
 
 
+bool
+ECMDevice::_HasECMInterfaces(const usb_configuration_info* config) const
+{
+	return config != NULL
+		&& fControlInterfaceIndex < config->interface_count
+		&& fDataInterfaceIndex < config->interface_count
+		&& config->interface[fControlInterfaceIndex].alt_count >= 1
+		&& config->interface[fDataInterfaceIndex].alt_count >= 2;
+}
+
+
 void
 ECMDevice::Removed()
 {
@@ -548,7 +568,9 @@ ECMDevice::_SetupDevice()
 	}
 
 	// set the current configuration
-	gUSBModule->set_configuration(fDevice, config);
+	status_t status = gUSBModule->set_configuration(fDevice, config);
+	if (status != B_OK)
+		TRACE_ALWAYS("setting the configuration failed: %s\n", strerror(status));
 	if (controlIndex >= config->interface_count) {
 		TRACE_ALWAYS("control interface index invalid\n");
 		return B_ERROR;

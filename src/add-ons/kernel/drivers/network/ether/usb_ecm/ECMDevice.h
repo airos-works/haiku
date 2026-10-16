@@ -31,6 +31,8 @@ public:
 		status_t			CompareAndReattach(usb_device device);
 
 private:
+		bool				_HasECMInterfaces(
+								const usb_configuration_info* config) const;
 static	void				_ReadCallback(void *cookie, int32 status,
 								void *data, size_t actualLength);
 static	void				_WriteCallback(void *cookie, int32 status,
