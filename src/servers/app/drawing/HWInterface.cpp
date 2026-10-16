@@ -730,6 +730,8 @@ struct HWInterface::FlushTarget {
 	bigtime_t		wokeLate;		// this flush: the thread's wake after
 									// the blank it aimed at, and the wait
 	bigtime_t		waitedWrites;	// for shadow writes under way
+	bigtime_t		waitedLocks;	// and for the interface and cursor
+									// locks
 	float			worstLate;
 	bigtime_t		longest;
 	bigtime_t		reported;
@@ -954,6 +956,7 @@ HWInterface::_AddFlushTarget(uint32 outputID, const char* name)
 	target.lateReports = 0;
 	target.wokeLate = 0;
 	target.waitedWrites = 0;
+	target.waitedLocks = 0;
 	target.worstLate = 0;
 	target.longest = target.reported = 0;
 	target.queued = target.flushed = 0;
@@ -1466,6 +1469,7 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank, int32 which)
 		uint32 fQueued;
 	} flushed(this, target, queued);
 
+	bigtime_t lockBegan = system_time();
 	if (!LockParallelAccess())
 		return;
 
@@ -1488,6 +1492,7 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank, int32 which)
 	int32 count = pending.CountRects();
 
 	bool cursorLocked = fFloatingOverlaysLock.Lock();
+	target.waitedLocks = system_time() - lockBegan;
 	IntRect frame(pending.Frame());
 	if (IsDoubleBuffered())
 		pending.Exclude((clipping_rect)_CursorFrame());
@@ -1540,11 +1545,12 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank, int32 which)
 					B_PRId32 "-%" B_PRId32 ",%" B_PRId32 ", scan at row %.0f "
 					"when the copy began %.2f ms after the blank, at %.0f "
 					"when it ended %.2f ms after (woke %.2f ms after it, "
-					"waited %.2f ms for writes)\n", target.name, count,
-					frame.left, frame.top, frame.right, frame.bottom,
-					scanAtStart, (copyStart - blank) / 1000.0, scan,
-					(system_time() - blank) / 1000.0,
-					target.wokeLate / 1000.0, target.waitedWrites / 1000.0);
+					"waited %.2f ms for writes, %.2f for locks)\n",
+					target.name, count, frame.left, frame.top, frame.right,
+					frame.bottom, scanAtStart, (copyStart - blank) / 1000.0,
+					scan, (system_time() - blank) / 1000.0,
+					target.wokeLate / 1000.0, target.waitedWrites / 1000.0,
+					target.waitedLocks / 1000.0);
 			}
 		}
 	} else {
@@ -1565,6 +1571,7 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank, int32 which)
 				release_sem_etc(target.workers[i - 1].start, 1, 0);
 			}
 		}
+		bigtime_t began = system_time();
 		float beganRow = _FlushScanRow(target, blank);
 		_CopyShadowToFront(first, which);
 		bigtime_t ended = system_time();
@@ -1597,13 +1604,17 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank, int32 which)
 					target.lateReports++;
 					debug_printf("app_server: vertical blank flush %s: behind "
 						"the scan: band %" B_PRId32 " rows %" B_PRId32 "-%"
-						B_PRId32 ", scan at row %.0f when its copy began, %.0f "
-						"when it ended %.2f ms after the blank (woke %.2f ms "
-						"after it, waited %.2f ms for writes)\n", target.name,
+						B_PRId32 ", scan at row %.0f when its copy began "
+						"%.2f ms after the blank, %.0f when it ended %.2f ms "
+						"after (woke %.2f ms after it, waited %.2f ms for "
+						"writes, %.2f for locks)\n", target.name,
 						i, bandFrame.top, bandFrame.bottom,
-						i == 0 ? beganRow : worker->beganRow, scan,
+						i == 0 ? beganRow : worker->beganRow,
+						((i == 0 ? began : worker->began) - blank) / 1000.0,
+						scan,
 						((i == 0 ? ended : worker->ended) - blank) / 1000.0,
-						target.wokeLate / 1000.0, target.waitedWrites / 1000.0);
+						target.wokeLate / 1000.0, target.waitedWrites / 1000.0,
+						target.waitedLocks / 1000.0);
 				}
 			}
 		}
