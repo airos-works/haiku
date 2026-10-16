@@ -1,5 +1,5 @@
 /*
- * Copyright 2003-2015, Haiku, Inc.
+ * Copyright 2003-2026, Haiku, Inc.
  * Distributed under the terms of the MIT license.
  *
  * Authors:
@@ -10,321 +10,218 @@
 
 #include "MediaWindow.h"
 
+#include <algorithm>
+#include <math.h>
 #include <stdio.h>
+#include <string.h>
 
+#include <Alert.h>
 #include <Application.h>
-#include <Autolock.h>
 #include <Button.h>
-#include <CardLayout.h>
 #include <Catalog.h>
-#include <Debug.h>
-#include <Deskbar.h>
-#include <IconUtils.h>
+#include <ControlLook.h>
+#include <GroupView.h>
 #include <LayoutBuilder.h>
-#include <Locale.h>
 #include <MediaRoster.h>
-#include <MediaTheme.h>
-#include <Resources.h>
-#include <Roster.h>
-#include <Screen.h>
+#include <MessageRunner.h>
+#include <Path.h>
+#include <PropertyInfo.h>
 #include <ScrollView.h>
 #include <SeparatorView.h>
-#include <SpaceLayoutItem.h>
-#include <StorageKit.h>
-#include <String.h>
-#include <TextView.h>
+
+#include <MidiSettings.h>
 
 #include "Media.h"
-#include "MediaIcons.h"
-#include "MidiSettingsView.h"
+#include "MediaMessages.h"
+#include "Pages.h"
+#include "Sidebar.h"
+
 
 #undef B_TRANSLATION_CONTEXT
 #define B_TRANSLATION_CONTEXT "Media Window"
 
 
-const uint32 ML_SELECTED_NODE = 'MlSN';
-const uint32 ML_RESTART_THREAD_FINISHED = 'MlRF';
-
-
-class NodeListItemUpdater : public MediaListItem::Visitor {
-public:
-	typedef void (NodeListItem::*UpdateMethod)(bool);
-
-	NodeListItemUpdater(NodeListItem* target, UpdateMethod action)
-		:
-		fComparator(target),
-		fAction(action)
-	{
-	}
-
-
-	virtual	void	Visit(AudioMixerListItem*){}
-	virtual	void	Visit(DeviceListItem*){}
-	virtual	void	Visit(MidiListItem*){}
-	virtual void	Visit(NodeListItem* item)
-	{
-		item->Accept(fComparator);
-		(item->*(fAction))(fComparator.result == 0);
-	}
-
-private:
-
-			NodeListItem::Comparator		fComparator;
-			UpdateMethod					fAction;
+static property_info sProperties[] = {
+	{ "Page", { B_GET_PROPERTY, B_SET_PROPERTY, 0 },
+		{ B_DIRECT_SPECIFIER, 0 },
+		"The page shown: output, input, mixer, midi, camera or "
+		"device:<name>.", 0, { B_STRING_TYPE }
+	},
+	{ "Scroll", { B_GET_PROPERTY, B_SET_PROPERTY, 0 },
+		{ B_DIRECT_SPECIFIER, 0 },
+		"How far the page is scrolled down.", 0, { B_FLOAT_TYPE }
+	},
+	{ 0 }
 };
 
 
-MediaWindow::SmartNode::SmartNode(const BMessenger& notifyHandler)
-	:
-	fNode(NULL),
-	fMessenger(notifyHandler)
+static const char* kRestartPageKey = "restarting";
+static const char* kServerPageKey = "server";
+
+
+static float
+ui_scale()
 {
+	return std::max(1.0f, be_plain_font->Size() / 12.0f);
 }
 
 
-MediaWindow::SmartNode::~SmartNode()
+static BString
+soundfont_name()
 {
-	_FreeNode();
-}
-
-
-void
-MediaWindow::SmartNode::SetTo(const dormant_node_info* info)
-{
-	_FreeNode();
-	if (!info)
-		return;
-
-	fNode = new media_node();
-	BMediaRoster* roster = BMediaRoster::Roster();
-
-	status_t status = B_OK;
-	media_node_id node_id;
-	int32 instanceCount = 1;
-	if (roster->GetInstancesFor(info->addon, info->flavor_id, &node_id, &instanceCount) == B_OK
-		&& instanceCount > 0) {
-		status = roster->GetNodeFor(node_id, fNode);
-	} else {
-		status = roster->InstantiateDormantNode(*info, fNode, B_FLAVOR_IS_GLOBAL);
+	struct BPrivate::midi_settings settings;
+	if (BPrivate::read_midi_settings(&settings) != B_OK
+		|| settings.soundfont_file[0] == '\0') {
+		return B_TRANSLATE("No SoundFont");
 	}
-
-	if (status != B_OK) {
-		fprintf(stderr, "SmartNode::SetTo error with node %" B_PRId32
-			": %s\n", fNode->node, strerror(status));
-	}
-
-	status = roster->StartWatching(fMessenger, *fNode, B_MEDIA_WILDCARD);
-	if (status != B_OK) {
-		fprintf(stderr, "SmartNode::SetTo can't start watching for"
-			" node %" B_PRId32 "\n", fNode->node);
-	}
+	return BPath(settings.soundfont_file).Leaf();
 }
 
 
-void
-MediaWindow::SmartNode::SetTo(const media_node& node)
-{
-	_FreeNode();
-	fNode = new media_node(node);
-	BMediaRoster* roster = BMediaRoster::Roster();
-	roster->StartWatching(fMessenger, *fNode, B_MEDIA_WILDCARD);
-}
-
-
-bool
-MediaWindow::SmartNode::IsSet()
-{
-	return fNode != NULL;
-}
-
-
-MediaWindow::SmartNode::operator media_node()
-{
-	if (fNode)
-		return *fNode;
-	media_node node;
-	return node;
-}
-
-
-void
-MediaWindow::SmartNode::_FreeNode()
-{
-	if (!IsSet())
-		return;
-
-	BMediaRoster* roster = BMediaRoster::Roster();
-	if (roster != NULL) {
-		status_t status = roster->StopWatching(fMessenger,
-			*fNode, B_MEDIA_WILDCARD);
-		if (status != B_OK) {
-			fprintf(stderr, "SmartNode::_FreeNode can't unwatch"
-				" media services for node %" B_PRId32 "\n", fNode->node);
-		}
-
-		roster->ReleaseNode(*fNode);
-		if (status != B_OK) {
-			fprintf(stderr, "SmartNode::_FreeNode can't release"
-				" node %" B_PRId32 "\n", fNode->node);
-		}
-	}
-	delete fNode;
-	fNode = NULL;
-}
-
-
-// #pragma mark -
-
-
-MediaWindow::MediaWindow(BRect frame)
+MediaWindow::MediaWindow(BRect frame, const char* page)
 	:
 	BWindow(frame, B_TRANSLATE_SYSTEM_NAME("Media"), B_TITLED_WINDOW,
 		B_ASYNCHRONOUS_CONTROLS | B_AUTO_UPDATE_SIZE_LIMITS),
-	fCurrentNode(BMessenger(this)),
-	fParamWeb(NULL),
-	fAudioInputs(5),
-	fAudioOutputs(5),
-	fVideoInputs(5),
-	fVideoOutputs(5),
-	fInitCheck(B_OK),
+	fSidebar(NULL),
+	fPageHolder(NULL),
+	fPage(NULL),
+	fWantedKey(page != NULL && page[0] != '\0' ? page : "output"),
+	fRestartButton(NULL),
+	fServerRunning(false),
+	fWatching(false),
 	fRestartThread(-1),
-	fRestartAlert(NULL)
+	fRescanRunner(NULL)
 {
 	_InitWindow();
 
-	BMediaRoster* roster = BMediaRoster::Roster();
-	roster->StartWatching(BMessenger(this, this),
-		B_MEDIA_SERVER_STARTED);
-	roster->StartWatching(BMessenger(this, this),
-		B_MEDIA_SERVER_QUIT);
+	status_t status = B_ERROR;
+	BMediaRoster* roster = BMediaRoster::Roster(&status);
+	fServerRunning = roster != NULL && status == B_OK
+		&& BMediaRoster::IsRunning();
+	_StartWatching();
+	_Rescan(true);
 }
 
 
 MediaWindow::~MediaWindow()
 {
-	_EmptyNodeLists();
-	_ClearParamView();
-
-	char buffer[512];
-	BRect rect = Frame();
-	PRINT_OBJECT(rect);
-	snprintf(buffer, 512, "# MediaPrefs Settings\n rect = %i,%i,%i,%i\n",
-		int(rect.left), int(rect.top), int(rect.right), int(rect.bottom));
-
-	BPath path;
-	if (find_directory(B_USER_SETTINGS_DIRECTORY, &path) == B_OK) {
-		path.Append(SETTINGS_FILE);
-		BFile file(path.Path(), B_READ_WRITE | B_CREATE_FILE | B_ERASE_FILE);
-		if (file.InitCheck() == B_OK)
-			file.Write(buffer, strlen(buffer));
-	}
+	delete fRescanRunner;
 
 	BMediaRoster* roster = BMediaRoster::CurrentRoster();
-	roster->StopWatching(BMessenger(this, this),
-		B_MEDIA_SERVER_STARTED);
-	roster->StartWatching(BMessenger(this, this),
-		B_MEDIA_SERVER_QUIT);
-}
-
-
-status_t
-MediaWindow::InitCheck()
-{
-	return fInitCheck;
-}
-
-
-void
-MediaWindow::SelectNode(const dormant_node_info* node)
-{
-	fCurrentNode.SetTo(node);
-	_MakeParamView();
-	fTitleView->SetLabel(node->name);
-}
-
-
-void
-MediaWindow::SelectAudioSettings(const char* title)
-{
-	fContentLayout->SetVisibleItem(fContentLayout->IndexOfView(fAudioView));
-	fTitleView->SetLabel(title);
-}
-
-
-void
-MediaWindow::SelectVideoSettings(const char* title)
-{
-	fContentLayout->SetVisibleItem(fContentLayout->IndexOfView(fVideoView));
-	fTitleView->SetLabel(title);
-}
-
-
-void
-MediaWindow::SelectAudioMixer(const char* title)
-{
-	media_node mixerNode;
-	BMediaRoster* roster = BMediaRoster::Roster();
-	roster->GetAudioMixer(&mixerNode);
-	fCurrentNode.SetTo(mixerNode);
-	_MakeParamView();
-	fTitleView->SetLabel(title);
-}
-
-
-void
-MediaWindow::SelectMidiSettings(const char* title)
-{
-	fContentLayout->SetVisibleItem(fContentLayout->IndexOfView(fMidiView));
-	fTitleView->SetLabel(title);
-}
-
-
-void
-MediaWindow::UpdateInputListItem(MediaListItem::media_type type,
-	const dormant_node_info* node)
-{
-	NodeListItem compareTo(node, type);
-	NodeListItemUpdater updater(&compareTo, &NodeListItem::SetDefaultInput);
-	for (int32 i = 0; i < fListView->CountItems(); i++) {
-		MediaListItem* item = static_cast<MediaListItem*>(fListView->ItemAt(i));
-		item->Accept(updater);
+	if (fWatching && roster != NULL) {
+		BMessenger messenger(this);
+		roster->StopWatching(messenger, B_MEDIA_SERVER_STARTED);
+		roster->StopWatching(messenger, B_MEDIA_SERVER_QUIT);
+		roster->StopWatching(messenger, B_MEDIA_FLAVORS_CHANGED);
+		roster->StopWatching(messenger, B_MEDIA_NODE_CREATED);
+		roster->StopWatching(messenger, B_MEDIA_NODE_DELETED);
+		roster->StopWatching(messenger, B_MEDIA_DEFAULT_CHANGED);
 	}
-	fListView->Invalidate();
-}
 
-
-void
-MediaWindow::UpdateOutputListItem(MediaListItem::media_type type,
-	const dormant_node_info* node)
-{
-	NodeListItem compareTo(node, type);
-	NodeListItemUpdater updater(&compareTo, &NodeListItem::SetDefaultOutput);
-	for (int32 i = 0; i < fListView->CountItems(); i++) {
-		MediaListItem* item = static_cast<MediaListItem*>(fListView->ItemAt(i));
-		item->Accept(updater);
-	}
-	fListView->Invalidate();
+	for (int32 i = fSidebar->CountItems() - 1; i >= 0; i--)
+		delete fSidebar->RemoveItem(i);
 }
 
 
 bool
 MediaWindow::QuitRequested()
 {
-	if (fRestartThread > 0) {
+	if (fRestartThread >= 0) {
 		BString text(B_TRANSLATE("Quitting %prefname% now will stop the "
 			"restarting of the media services. Flaky or unavailable media "
 			"functionality is the likely result."));
 		text.ReplaceFirst("%prefname%", B_TRANSLATE_SYSTEM_NAME("Media"));
 
-		fRestartAlert = new BAlert(B_TRANSLATE("Warning!"), text,
-			B_TRANSLATE("Quit anyway"), NULL, NULL,
+		BAlert* alert = new BAlert(B_TRANSLATE("Warning!"), text,
+			B_TRANSLATE("Cancel"), B_TRANSLATE("Quit anyway"), NULL,
 			B_WIDTH_AS_USUAL, B_OFFSET_SPACING, B_WARNING_ALERT);
-
-		fRestartAlert->Go();
+		alert->SetShortcut(0, B_ESCAPE);
+		if (alert->Go() == 0)
+			return false;
 	}
-	// Stop watching the MediaRoster
-	fCurrentNode.SetTo(NULL);
+
+	BMessage settings;
+	settings.AddRect("frame", Frame());
+	settings.AddString("page", fPageKey == kServerPageKey
+		|| fPageKey == kRestartPageKey ? fWantedKey : fPageKey);
+	save_media_settings(settings);
+
+	// The page lets go of the nodes it uses.
+	if (fPage != NULL) {
+		fPage->RemoveSelf();
+		delete fPage;
+		fPage = NULL;
+	}
+
 	be_app->PostMessage(B_QUIT_REQUESTED);
+	return true;
+}
+
+
+BHandler*
+MediaWindow::ResolveSpecifier(BMessage* message, int32 index,
+	BMessage* specifier, int32 what, const char* property)
+{
+	BPropertyInfo info(sProperties);
+	if (info.FindMatch(message, index, specifier, what, property) >= 0)
+		return this;
+	return BWindow::ResolveSpecifier(message, index, specifier, what,
+		property);
+}
+
+
+status_t
+MediaWindow::GetSupportedSuites(BMessage* data)
+{
+	data->AddString("suites", "suite/vnd.Haiku-media-window");
+	BPropertyInfo info(sProperties);
+	data->AddFlat("messages", &info);
+	return BWindow::GetSupportedSuites(data);
+}
+
+
+bool
+MediaWindow::_HandleScripting(BMessage* message)
+{
+	if (message->what != B_GET_PROPERTY && message->what != B_SET_PROPERTY)
+		return false;
+
+	int32 index;
+	BMessage specifier;
+	int32 form;
+	const char* property;
+	if (message->GetCurrentSpecifier(&index, &specifier, &form, &property)
+			!= B_OK) {
+		return false;
+	}
+
+	BMessage reply(B_REPLY);
+	if (strcmp(property, "Scroll") == 0 && fPage != NULL) {
+		float position;
+		if (message->what == B_GET_PROPERTY)
+			reply.AddFloat("result", fPage->ScrollPosition());
+		else if (message->FindFloat("data", &position) == B_OK) {
+			fPage->SetScrollPosition(position);
+			reply.AddInt32("error", B_OK);
+		} else
+			reply.AddInt32("error", B_BAD_VALUE);
+		message->SendReply(&reply);
+		return true;
+	}
+	if (strcmp(property, "Page") != 0)
+		return false;
+
+	if (message->what == B_GET_PROPERTY)
+		reply.AddString("result", fPageKey);
+	else {
+		const char* key;
+		if (message->FindString("data", &key) == B_OK) {
+			_ShowPage(key);
+			reply.AddInt32("error", fPageKey == key ? B_OK : B_BAD_VALUE);
+		} else
+			reply.AddInt32("error", B_BAD_VALUE);
+	}
+	message->SendReply(&reply);
 	return true;
 }
 
@@ -332,46 +229,138 @@ MediaWindow::QuitRequested()
 void
 MediaWindow::MessageReceived(BMessage* message)
 {
+	if (_HandleScripting(message))
+		return;
+
 	switch (message->what) {
-		case ML_RESTART_THREAD_FINISHED:
-			fRestartThread = -1;
-			_InitMedia(false);
+		case kMsgSidebarSelection:
+		{
+			const char* key;
+			if (message->FindString("key", &key) == B_OK)
+				_ShowPage(key);
+			break;
+		}
+
+		case kMsgShowPage:
+		{
+			const char* key;
+			if (message->FindString("key", &key) == B_OK)
+				_ShowPage(key);
+			break;
+		}
+
+		case kMsgSetDefault:
+			_SetDefault(message);
 			break;
 
-		case ML_RESTART_MEDIA_SERVER:
+		case kMsgSetOutputChannel:
 		{
-			fRestartThread = spawn_thread(&MediaWindow::_RestartMediaServices,
-				"restart_thread", B_NORMAL_PRIORITY, this);
-			if (fRestartThread < 0)
-				fprintf(stderr, "couldn't create restart thread\n");
+			const media_input* input;
+			ssize_t size;
+			if (message->FindData("input", B_RAW_TYPE, (const void**)&input,
+					&size) == B_OK && size == sizeof(media_input)) {
+				BMediaRoster::Roster()->SetAudioOutput(*input);
+				_Rescan(false);
+			}
+			break;
+		}
+
+		case kMsgRescan:
+			delete fRescanRunner;
+			fRescanRunner = NULL;
+			_Rescan(false);
+			break;
+
+		case kMsgRestartServices:
+		{
+			if (fRestartThread >= 0)
+				break;
+
+			// Let go of the nodes before the servers go away.
+			fWantedKey = fPageKey == kServerPageKey ? fWantedKey : fPageKey;
+			if (fPage != NULL) {
+				fPage->RemoveSelf();
+				delete fPage;
+			}
+			fPage = new MessagePage(kRestartPageKey, GLYPH_WARNING,
+				B_TRANSLATE("Restarting media services"),
+				B_TRANSLATE("Stopping the media services…"), NULL, NULL,
+				&fModel);
+			fPageKey = kRestartPageKey;
+			fPageHolder->GroupLayout()->AddView(fPage);
+			fPage->Rebuild();
+			fSidebar->DeselectAll();
+			fRestartButton->SetEnabled(false);
+
+			fRestartThread = spawn_thread(&_RestartThread,
+				"restart media services", B_NORMAL_PRIORITY, this);
+			if (fRestartThread >= 0)
+				resume_thread(fRestartThread);
 			else
+				PostMessage(kMsgRestartDone);
+			break;
+		}
+
+		case kMsgStartServices:
+		{
+			if (fRestartThread >= 0)
+				break;
+			MessagePage* page = dynamic_cast<MessagePage*>(fPage);
+			if (page != NULL)
+				page->SetText(B_TRANSLATE("Starting the media services…"));
+			fRestartThread = spawn_thread(&_RestartThread,
+				"start media services", B_NORMAL_PRIORITY, this);
+			if (fRestartThread >= 0)
 				resume_thread(fRestartThread);
 			break;
 		}
 
-		case B_MEDIA_WEB_CHANGED:
-		case ML_SELECTED_NODE:
+		case kMsgRestartProgress:
 		{
-			PRINT_OBJECT(*message);
+			const char* text;
+			MessagePage* page = dynamic_cast<MessagePage*>(fPage);
+			if (page != NULL && message->FindString("text", &text) == B_OK)
+				page->SetText(text);
+			break;
+		}
 
-			MediaListItem* item = static_cast<MediaListItem*>(
-					fListView->ItemAt(fListView->CurrentSelection()));
-			if (item == NULL)
-				break;
-
-			fCurrentNode.SetTo(NULL);
-			_ClearParamView();
-			item->AlterWindow(this);
+		case kMsgRestartDone:
+		{
+			if (fRestartThread >= 0) {
+				status_t result;
+				wait_for_thread(fRestartThread, &result);
+				fRestartThread = -1;
+			}
+			fRestartButton->SetEnabled(true);
+			fServerRunning = BMediaRoster::IsRunning();
+			if (fPage != NULL) {
+				fPage->RemoveSelf();
+				delete fPage;
+				fPage = NULL;
+				fPageKey = "";
+			}
+			_Rescan(true);
 			break;
 		}
 
 		case B_MEDIA_SERVER_STARTED:
-		case B_MEDIA_SERVER_QUIT:
-		{
-			PRINT_OBJECT(*message);
-			_InitMedia(false);
+			fServerRunning = true;
+			_ScheduleRescan();
 			break;
-		}
+
+		case B_MEDIA_SERVER_QUIT:
+			if (fRestartThread < 0) {
+				fServerRunning = false;
+				_ShowServerDown();
+			}
+			break;
+
+		case B_MEDIA_FLAVORS_CHANGED:
+		case B_MEDIA_NODE_CREATED:
+		case B_MEDIA_NODE_DELETED:
+		case B_MEDIA_DEFAULT_CHANGED:
+			_ScheduleRescan();
+			break;
 
 		default:
 			BWindow::MessageReceived(message);
@@ -386,350 +375,325 @@ MediaWindow::MessageReceived(BMessage* message)
 void
 MediaWindow::_InitWindow()
 {
-	fListView = new BListView("media_list_view");
-	fListView->SetSelectionMessage(new BMessage(ML_SELECTED_NODE));
-	fListView->SetExplicitMinSize(BSize(140, B_SIZE_UNSET));
+	float scale = ui_scale();
+	float spacing = be_control_look->DefaultItemSpacing();
 
-	// Add ScrollView to Media Menu for pretty border
-	BScrollView* scrollView = new BScrollView("listscroller",
-		fListView, 0, false, false, B_FANCY_BORDER);
+	fSidebar = new Sidebar();
+	BScrollView* sidebarScroller = new BScrollView("sidebar scroller",
+		fSidebar, 0, false, false, B_NO_BORDER);
 
-	// Create the Views
-	fTitleView = new BSeparatorView(B_HORIZONTAL, B_FANCY_BORDER);
-	fTitleView->SetLabel(B_TRANSLATE("Audio settings"));
-	fTitleView->SetFont(be_bold_font);
+	fRestartButton = new BButton("restart",
+		B_TRANSLATE("Restart media services"),
+		new BMessage(kMsgRestartServices));
+	fRestartButton->SetToolTip(B_TRANSLATE("Stops and starts the media "
+		"services, which can help when sound or video stopped working."));
 
-	fContentLayout = new BCardLayout();
-	new BView("content view", 0, fContentLayout);
-	fContentLayout->Owner()->SetViewUIColor(B_PANEL_BACKGROUND_COLOR);
-	fContentLayout->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, B_SIZE_UNSET));
+	float sidebarWidth = std::max(ceilf(190 * scale),
+		fRestartButton->PreferredSize().width + spacing * 2);
+	sidebarScroller->SetExplicitMinSize(BSize(sidebarWidth, 100));
+	sidebarScroller->SetExplicitMaxSize(BSize(sidebarWidth, B_SIZE_UNLIMITED));
 
-	fAudioView = new AudioSettingsView();
-	fContentLayout->AddView(fAudioView);
+	BGroupView* column = new BGroupView(B_VERTICAL, 0);
+	column->SetViewColor(sidebar_color());
+	column->SetLowColor(sidebar_color());
+	BLayoutBuilder::Group<>(column)
+		.Add(sidebarScroller)
+		.AddGroup(B_HORIZONTAL)
+			.SetInsets(spacing)
+			.Add(fRestartButton)
+		.End();
 
-	fVideoView = new VideoSettingsView();
-	fContentLayout->AddView(fVideoView);
+	fPageHolder = new BGroupView(B_VERTICAL, 0);
+	fPageHolder->SetExplicitMinSize(BSize(ceilf(400 * scale), 200));
 
-	fMidiView = new MidiSettingsView();
-	fContentLayout->AddView(fMidiView);
-
-	// Layout all views
-	BLayoutBuilder::Group<>(this, B_HORIZONTAL)
-		.SetInsets(B_USE_WINDOW_SPACING)
-		.Add(scrollView, 0.0f)
-		.AddGroup(B_VERTICAL)
-			.SetInsets(0, 0, 0, 0)
-			.Add(fTitleView)
-			.Add(fContentLayout);
-
-	// Start the window
-	fInitCheck = _InitMedia(true);
-	if (fInitCheck != B_OK)
-		PostMessage(B_QUIT_REQUESTED);
-	else if (IsHidden())
-		Show();
-}
-
-
-status_t
-MediaWindow::_InitMedia(bool first)
-{
-	status_t err = B_OK;
-	BMediaRoster* roster = BMediaRoster::Roster(&err);
-
-	if (first && err != B_OK) {
-		BAlert* alert = new BAlert("start_media_server",
-			B_TRANSLATE("Could not connect to the media server.\n"
-				"Would you like to start it ?"),
-			B_TRANSLATE("Quit"),
-			B_TRANSLATE("Start media server"), NULL,
-			B_WIDTH_AS_USUAL, B_WARNING_ALERT);
-		alert->SetShortcut(0, B_ESCAPE);
-		if (alert->Go() == 0)
-			return B_ERROR;
-
-		Show();
-
-		launch_media_server();
-	}
-
-	Lock();
-
-	bool isVideoSelected = true;
-	if (!first && fListView->ItemAt(0) != NULL
-		&& fListView->ItemAt(0)->IsSelected())
-		isVideoSelected = false;
-
-	while (fListView->CountItems() > 0)
-		delete fListView->RemoveItem((int32)0);
-	_EmptyNodeLists();
-
-	// Grab Media Info
-	_FindNodes();
-
-	// Add video nodes first. They might have an additional audio
-	// output or input, but still should be listed as video node.
-	_AddNodeItems(fVideoOutputs, MediaListItem::VIDEO_TYPE);
-	_AddNodeItems(fVideoInputs, MediaListItem::VIDEO_TYPE);
-	_AddNodeItems(fAudioOutputs, MediaListItem::AUDIO_TYPE);
-	_AddNodeItems(fAudioInputs, MediaListItem::AUDIO_TYPE);
-
-	fAudioView->AddOutputNodes(fAudioOutputs);
-	fAudioView->AddInputNodes(fAudioInputs);
-	fVideoView->AddOutputNodes(fVideoOutputs);
-	fVideoView->AddInputNodes(fVideoInputs);
-
-	// build our list view
-	DeviceListItem* audio = new DeviceListItem(B_TRANSLATE("Audio settings"),
-		MediaListItem::AUDIO_TYPE);
-	fListView->AddItem(audio);
-
-	MidiListItem* midi = new MidiListItem(B_TRANSLATE("MIDI Settings"));
-	fListView->AddItem(midi);
-
-	MediaListItem* video = new DeviceListItem(B_TRANSLATE("Video settings"),
-		MediaListItem::VIDEO_TYPE);
-	fListView->AddItem(video);
-
-	MediaListItem* mixer = new AudioMixerListItem(B_TRANSLATE("Audio mixer"));
-	fListView->AddItem(mixer);
-
-	fListView->SortItems(&MediaListItem::Compare);
-	_UpdateListViewMinWidth();
-
-	// Set default nodes for our setting views
-	media_node defaultNode;
-	dormant_node_info nodeInfo;
-	int32 outputID;
-	BString outputName;
-
-	if (roster->GetAudioInput(&defaultNode) == B_OK) {
-		roster->GetDormantNodeFor(defaultNode, &nodeInfo);
-		fAudioView->SetDefaultInput(&nodeInfo);
-			// this causes our listview to be updated as well
-	}
-
-	if (roster->GetAudioOutput(&defaultNode, &outputID, &outputName) == B_OK) {
-		roster->GetDormantNodeFor(defaultNode, &nodeInfo);
-		fAudioView->SetDefaultOutput(&nodeInfo);
-		fAudioView->SetDefaultChannel(outputID);
-			// this causes our listview to be updated as well
-	}
-
-	if (roster->GetVideoInput(&defaultNode) == B_OK) {
-		roster->GetDormantNodeFor(defaultNode, &nodeInfo);
-		fVideoView->SetDefaultInput(&nodeInfo);
-			// this causes our listview to be updated as well
-	}
-
-	if (roster->GetVideoOutput(&defaultNode) == B_OK) {
-		roster->GetDormantNodeFor(defaultNode, &nodeInfo);
-		fVideoView->SetDefaultOutput(&nodeInfo);
-			// this causes our listview to be updated as well
-	}
-
-	if (first)
-		fListView->Select(fListView->IndexOf(mixer));
-	else if (isVideoSelected)
-		fListView->Select(fListView->IndexOf(video));
-	else
-		fListView->Select(fListView->IndexOf(audio));
-
-	Unlock();
-
-	return B_OK;
+	BLayoutBuilder::Group<>(this, B_HORIZONTAL, 0)
+		.Add(column, 0)
+		.Add(new BSeparatorView(B_VERTICAL, B_PLAIN_BORDER))
+		.Add(fPageHolder, 1);
 }
 
 
 void
-MediaWindow::_FindNodes()
+MediaWindow::_StartWatching()
 {
-	_FindNodes(B_MEDIA_RAW_AUDIO, B_PHYSICAL_OUTPUT, fAudioOutputs);
-	_FindNodes(B_MEDIA_RAW_AUDIO, B_PHYSICAL_INPUT, fAudioInputs);
-	_FindNodes(B_MEDIA_ENCODED_AUDIO, B_PHYSICAL_OUTPUT, fAudioOutputs);
-	_FindNodes(B_MEDIA_ENCODED_AUDIO, B_PHYSICAL_INPUT, fAudioInputs);
-	_FindNodes(B_MEDIA_RAW_VIDEO, B_PHYSICAL_OUTPUT, fVideoOutputs);
-	_FindNodes(B_MEDIA_RAW_VIDEO, B_PHYSICAL_INPUT, fVideoInputs);
-	_FindNodes(B_MEDIA_ENCODED_VIDEO, B_PHYSICAL_OUTPUT, fVideoOutputs);
-	_FindNodes(B_MEDIA_ENCODED_VIDEO, B_PHYSICAL_INPUT, fVideoInputs);
-}
-
-
-void
-MediaWindow::_FindNodes(media_type type, uint64 kind, NodeList& into)
-{
-	dormant_node_info nodeInfo[64];
-	int32 nodeInfoCount = 64;
-
-	media_format format;
-	media_format* nodeInputFormat = NULL;
-	media_format* nodeOutputFormat = NULL;
-	format.type = type;
-
-	// output nodes must be BBufferConsumers => they have an input format
-	// input nodes must be BBufferProducers => they have an output format
-	if ((kind & B_PHYSICAL_OUTPUT) != 0)
-		nodeInputFormat = &format;
-	else if ((kind & B_PHYSICAL_INPUT) != 0)
-		nodeOutputFormat = &format;
-	else
+	BMediaRoster* roster = BMediaRoster::CurrentRoster();
+	if (roster == NULL)
 		return;
 
-	BMediaRoster* roster = BMediaRoster::Roster();
+	BMessenger messenger(this);
+	roster->StartWatching(messenger, B_MEDIA_SERVER_STARTED);
+	roster->StartWatching(messenger, B_MEDIA_SERVER_QUIT);
+	roster->StartWatching(messenger, B_MEDIA_FLAVORS_CHANGED);
+	roster->StartWatching(messenger, B_MEDIA_NODE_CREATED);
+	roster->StartWatching(messenger, B_MEDIA_NODE_DELETED);
+	roster->StartWatching(messenger, B_MEDIA_DEFAULT_CHANGED);
+	fWatching = true;
+}
 
-	if (roster->GetDormantNodes(nodeInfo, &nodeInfoCount, nodeInputFormat,
-			nodeOutputFormat, NULL, kind) != B_OK) {
-		// TODO: better error reporting!
-		fprintf(stderr, "error\n");
+
+void
+MediaWindow::_ScheduleRescan()
+{
+	delete fRescanRunner;
+	BMessage message(kMsgRescan);
+	fRescanRunner = new BMessageRunner(BMessenger(this), &message, 300000, 1);
+}
+
+
+void
+MediaWindow::_Rescan(bool force)
+{
+	if (fRestartThread >= 0)
+		return;
+
+	MediaModel model;
+	if (!fServerRunning || model.Scan() != B_OK) {
+		_ShowServerDown();
 		return;
 	}
 
-	for (int32 i = 0; i < nodeInfoCount; i++) {
-		PRINT(("node : %s, media_addon %i, flavor_id %i\n",
-			nodeInfo[i].name, (int)nodeInfo[i].addon,
-			(int)nodeInfo[i].flavor_id));
+	bool showPage = fPage == NULL || fPageKey == kServerPageKey
+		|| fPageKey == kRestartPageKey;
+	if (!force && !showPage && model.Equals(fModel))
+		return;
 
-		dormant_node_info* info = new dormant_node_info();
-		strlcpy(info->name, nodeInfo[i].name, B_MEDIA_NAME_LENGTH);
-		info->flavor_id = nodeInfo[i].flavor_id;
-		info->addon = nodeInfo[i].addon;
-		into.AddItem(info);
+	fModel = model;
+	_RebuildSidebar();
+
+	if (showPage) {
+		_ShowPage(fWantedKey);
+		return;
 	}
+
+	if (fPageKey.StartsWith("device:")
+		&& fModel.DeviceFor(fPageKey) == NULL) {
+		// the device went away
+		_ShowPage("output");
+		return;
+	}
+
+	fPage->ModelChanged();
+	fSidebar->SelectKey(fPageKey);
 }
 
 
 void
-MediaWindow::_AddNodeItems(NodeList& list, MediaListItem::media_type type)
+MediaWindow::_RebuildSidebar()
 {
-	int32 count = list.CountItems();
-	for (int32 i = 0; i < count; i++) {
-		dormant_node_info* info = list.ItemAt(i);
-		if (_FindNodeListItem(info) == NULL)
-			fListView->AddItem(new NodeListItem(info, type));
+	for (int32 i = fSidebar->CountItems() - 1; i >= 0; i--)
+		delete fSidebar->RemoveItem(i);
+
+	BString none(B_TRANSLATE("None"));
+	BString name;
+
+	fSidebar->AddItem(new SidebarItem(B_TRANSLATE("Sound")));
+	name = fModel.DefaultName(ROLE_AUDIO_OUTPUT);
+	fSidebar->AddItem(new SidebarItem("output", B_TRANSLATE("Output"),
+		name.IsEmpty() ? none : name, GLYPH_SPEAKER,
+		glyph_color(GLYPH_SPEAKER)));
+	name = fModel.DefaultName(ROLE_AUDIO_INPUT);
+	fSidebar->AddItem(new SidebarItem("input", B_TRANSLATE("Input"),
+		name.IsEmpty() ? none : name, GLYPH_MICROPHONE,
+		glyph_color(GLYPH_MICROPHONE)));
+	fSidebar->AddItem(new SidebarItem("mixer", B_TRANSLATE("Mixer"),
+		B_TRANSLATE("Volume of each application"), GLYPH_MIXER,
+		glyph_color(GLYPH_MIXER)));
+	fSidebar->AddItem(new SidebarItem("midi", B_TRANSLATE("MIDI"),
+		soundfont_name(), GLYPH_MIDI, glyph_color(GLYPH_MIDI)));
+
+	fSidebar->AddItem(new SidebarItem(B_TRANSLATE("Video")));
+	name = fModel.DefaultName(ROLE_VIDEO_INPUT);
+	fSidebar->AddItem(new SidebarItem("camera", B_TRANSLATE("Camera"),
+		name.IsEmpty() ? none : name, GLYPH_CAMERA,
+		glyph_color(GLYPH_CAMERA)));
+
+	if (fModel.CountDevices() > 0)
+		fSidebar->AddItem(new SidebarItem(B_TRANSLATE("Devices")));
+
+	static const uint32 kRoles[] = { ROLE_AUDIO_OUTPUT, ROLE_AUDIO_INPUT,
+		ROLE_VIDEO_INPUT, ROLE_VIDEO_OUTPUT };
+	for (int32 i = 0; i < fModel.CountDevices(); i++) {
+		const DeviceEntry* device = fModel.DeviceAt(i);
+
+		BString uses;
+		for (size_t j = 0; j < B_COUNT_OF(kRoles); j++) {
+			const NodeEntry* node = device->NodeFor(kRoles[j]);
+			if (node == NULL || !fModel.IsDefault(node->info, kRoles[j]))
+				continue;
+			if (!uses.IsEmpty())
+				uses << ", ";
+			uses << MediaModel::RoleName(kRoles[j]);
+		}
+
+		BString subtitle;
+		if (uses.IsEmpty())
+			subtitle = device->Description();
+		else {
+			subtitle = B_TRANSLATE("In use: %uses%");
+			subtitle.ReplaceFirst("%uses%", uses);
+		}
+
+		fSidebar->AddItem(new SidebarItem(device->Key(), device->name,
+			subtitle, device->Glyph(), device_glyph_color()));
 	}
+
+	fSidebar->SelectKey(fPageKey);
 }
 
 
 void
-MediaWindow::_EmptyNodeLists()
+MediaWindow::_ShowPage(const char* key)
 {
-	fAudioOutputs.MakeEmpty();
-	fAudioInputs.MakeEmpty();
-	fVideoOutputs.MakeEmpty();
-	fVideoInputs.MakeEmpty();
+	if (fPage != NULL && fPageKey == key)
+		return;
+
+	Page* page = _CreatePage(key);
+	if (page == NULL) {
+		page = _CreatePage("output");
+		if (page == NULL)
+			return;
+	}
+
+	if (fPage != NULL) {
+		fPage->RemoveSelf();
+		delete fPage;
+	}
+
+	fPage = page;
+	fPageKey = page->Key();
+	fWantedKey = fPageKey;
+	fPageHolder->GroupLayout()->AddView(fPage);
+	fPage->Rebuild();
+	fSidebar->SelectKey(fPageKey);
 }
 
 
-NodeListItem*
-MediaWindow::_FindNodeListItem(dormant_node_info* info)
+Page*
+MediaWindow::_CreatePage(const char* key)
 {
-	NodeListItem audioItem(info, MediaListItem::AUDIO_TYPE);
-	NodeListItem videoItem(info, MediaListItem::VIDEO_TYPE);
+	BString name(key);
+	if (name == "output")
+		return new OutputPage(&fModel);
+	if (name == "input")
+		return new InputPage(&fModel);
+	if (name == "mixer")
+		return new MixerPage(&fModel);
+	if (name == "midi")
+		return new MidiPage(&fModel);
+	if (name == "camera")
+		return new CameraPage(&fModel);
 
-	NodeListItem::Comparator audioComparator(&audioItem);
-	NodeListItem::Comparator videoComparator(&videoItem);
-
-	for (int32 i = 0; i < fListView->CountItems(); i++) {
-		MediaListItem* item = static_cast<MediaListItem*>(fListView->ItemAt(i));
-		item->Accept(audioComparator);
-		if (audioComparator.result == 0)
-			return static_cast<NodeListItem*>(item);
-
-		item->Accept(videoComparator);
-		if (videoComparator.result == 0)
-			return static_cast<NodeListItem*>(item);
-	}
+	const DeviceEntry* device = fModel.DeviceFor(key);
+	if (device != NULL)
+		return new DevicePage(*device, &fModel);
 	return NULL;
 }
 
 
 void
-MediaWindow::_UpdateListViewMinWidth()
+MediaWindow::_ShowServerDown()
 {
-	float width = 0;
-	for (int32 i = 0; i < fListView->CountItems(); i++) {
-		BListItem* item = fListView->ItemAt(i);
-		width = max_c(width, item->Width());
+	if (fPageKey == kServerPageKey || fRestartThread >= 0)
+		return;
+
+	if (fPage != NULL) {
+		if (fPageKey != kRestartPageKey)
+			fWantedKey = fPageKey;
+		fPage->RemoveSelf();
+		delete fPage;
 	}
-	fListView->SetExplicitMinSize(BSize(width, B_SIZE_UNSET));
-	fListView->InvalidateLayout();
+
+	for (int32 i = fSidebar->CountItems() - 1; i >= 0; i--)
+		delete fSidebar->RemoveItem(i);
+
+	fPage = new MessagePage(kServerPageKey, GLYPH_WARNING,
+		B_TRANSLATE("Media services are not running"),
+		B_TRANSLATE("Sound and video need the media services. Start them to "
+			"use and set up your devices."),
+		B_TRANSLATE("Start media services"), new BMessage(kMsgStartServices),
+		&fModel);
+	fPageKey = kServerPageKey;
+	fPageHolder->GroupLayout()->AddView(fPage);
+	fPage->Rebuild();
+}
+
+
+void
+MediaWindow::_SetDefault(BMessage* message)
+{
+	int32 role;
+	int32 addon;
+	int32 flavor;
+	if (message->FindInt32("role", &role) != B_OK
+		|| message->FindInt32("addon", &addon) != B_OK
+		|| message->FindInt32("flavor", &flavor) != B_OK) {
+		return;
+	}
+
+	std::vector<const NodeEntry*> nodes;
+	fModel.NodesFor(role, nodes);
+	const dormant_node_info* info = NULL;
+	for (size_t i = 0; i < nodes.size(); i++) {
+		if (nodes[i]->info.addon == addon
+			&& nodes[i]->info.flavor_id == flavor) {
+			info = &nodes[i]->info;
+			break;
+		}
+	}
+	if (info == NULL || fModel.IsDefault(*info, role))
+		return;
+
+	BMediaRoster* roster = BMediaRoster::Roster();
+	status_t status = B_ERROR;
+	switch (role) {
+		case ROLE_AUDIO_OUTPUT:
+			status = roster->SetAudioOutput(*info);
+			break;
+		case ROLE_AUDIO_INPUT:
+			status = roster->SetAudioInput(*info);
+			break;
+		case ROLE_VIDEO_INPUT:
+			status = roster->SetVideoInput(*info);
+			break;
+		case ROLE_VIDEO_OUTPUT:
+			status = roster->SetVideoOutput(*info);
+			break;
+	}
+
+	if (status != B_OK) {
+		BString text(B_TRANSLATE("%device% could not be chosen: %error%."));
+		text.ReplaceFirst("%device%", info->name);
+		text.ReplaceFirst("%error%", strerror(status));
+		BAlert* alert = new BAlert(B_TRANSLATE("Media"), text,
+			B_TRANSLATE("OK"), NULL, NULL, B_WIDTH_AS_USUAL, B_STOP_ALERT);
+		alert->Go(NULL);
+	}
+
+	_Rescan(false);
 }
 
 
 status_t
-MediaWindow::_RestartMediaServices(void* data)
+MediaWindow::_RestartThread(void* data)
 {
 	MediaWindow* window = (MediaWindow*)data;
 
-	shutdown_media_server();
+	if (BMediaRoster::IsRunning())
+		shutdown_media_server(B_INFINITE_TIMEOUT, &_RestartProgress, window);
+	launch_media_server(B_INFINITE_TIMEOUT, &_RestartProgress, window);
 
-	if (window->fRestartAlert != NULL
-			&& window->fRestartAlert->Lock()) {
-		window->fRestartAlert->Quit();
-	}
-
-	return window->PostMessage(ML_RESTART_THREAD_FINISHED);
+	window->PostMessage(kMsgRestartDone);
+	return B_OK;
 }
 
 
-void
-MediaWindow::_ClearParamView()
+bool
+MediaWindow::_RestartProgress(int stage, const char* message, void* cookie)
 {
-	BLayoutItem* item = fContentLayout->VisibleItem();
-	if (!item)
-		return;
-
-	BView* view = item->View();
-	if (view != fVideoView && view != fAudioView && view != fMidiView) {
-		fContentLayout->RemoveItem(item);
-		delete view;
-		delete fParamWeb;
-		fParamWeb = NULL;
-	}
+	MediaWindow* window = (MediaWindow*)cookie;
+	BMessage progress(kMsgRestartProgress);
+	progress.AddInt32("stage", stage);
+	progress.AddString("text", message);
+	window->PostMessage(&progress);
+	return true;
 }
-
-
-void
-MediaWindow::_MakeParamView()
-{
-	if (!fCurrentNode.IsSet())
-		return;
-
-	fParamWeb = NULL;
-	BMediaRoster* roster = BMediaRoster::Roster();
-	if (roster->GetParameterWebFor(fCurrentNode, &fParamWeb) == B_OK) {
-		BRect hint(fContentLayout->Frame());
-		BView* paramView = BMediaTheme::ViewFor(fParamWeb, &hint);
-		if (paramView) {
-			fContentLayout->AddView(paramView);
-			fContentLayout->SetVisibleItem(fContentLayout->CountItems() - 1);
-			return;
-		}
-	}
-
-	_MakeEmptyParamView();
-}
-
-
-void
-MediaWindow::_MakeEmptyParamView()
-{
-	fParamWeb = NULL;
-
-	BStringView* stringView = new BStringView("noControls",
-		B_TRANSLATE("This hardware has no controls."));
-
-	BSize unlimited(B_SIZE_UNLIMITED, B_SIZE_UNLIMITED);
-	stringView->SetExplicitMaxSize(unlimited);
-
-	BAlignment centered(B_ALIGN_HORIZONTAL_CENTER,
-		B_ALIGN_VERTICAL_CENTER);
-	stringView->SetExplicitAlignment(centered);
-	stringView->SetAlignment(B_ALIGN_CENTER);
-
-	fContentLayout->AddView(stringView);
-	fContentLayout->SetVisibleItem(fContentLayout->CountItems() - 1);
-
-	stringView->SetHighUIColor(B_PANEL_TEXT_COLOR);
-}
-
