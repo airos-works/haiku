@@ -190,6 +190,18 @@ millisecond after the predicted scan start there at times. Open: whether
 the sleep overshoots further on that machine, the wait for a shadow write
 under way, or the hook's scan-start time on DCN.
 
+Two displays, 2026-10-16 11:33 to 12:11: the owner's photo of the external
+display showed trails of a dragged window (its uncovered strips painted
+back at earlier positions), then only when dragging a window from one
+screen to the other. Cause: each output's flush thread flipped the two
+shadows at its own blank, so one output could skip a generation and copy
+it later, older content over newer. A flip now waits until every output
+has copied the shadow about to be written again. After the reboot into
+that build the owner reported it looks right ("Looks better now").
+The laptop's frame buffer copies are slower than the X399's, so the
+single-thread path now also copies all its rects in row bands across
+them, as the worker path does.
+
 ### Cubie A7S, 2026-10-15 23:28 (the flush, ARM64)
 
 DisplayPort 1920x1080 at 60 Hz, `sunxi_display`'s TCON interrupt semaphore,
