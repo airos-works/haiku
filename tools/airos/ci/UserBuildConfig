@@ -22,7 +22,12 @@
 #                           applications, Summit and summit_webkit, the
 #                           airos_* libraries, rock5_ffmpeg, firmware packages,
 #                           and (x86_64) HaikuPorts packages the build system's
-#                           repository list lacks
+#                           repository list lacks, and qt6_base with air/OS's
+#                           Haiku platform plugin
+#   AIROS_CI_SYSTEM_PACKAGES
+#                           (x86_64) names of packages from the build system's
+#                           HaikuPorts list that CI's packages need (Qt's
+#                           dependencies), installed with theirs
 #   AIROS_CI_FONTS          (arm64) HaikuPorts' noto and noto_sans_cjk_jp
 #                           packages, added as system packages in place of
 #                           the arm64 repository's bootstrap noto
@@ -79,6 +84,11 @@ switch $(HAIKU_BUILD_PROFILE) {
 		# (FFmpeg 6), Burrow (OpenSSL 3) and Summit's TLS certificates.
 		AddHaikuImageSystemPackages curl sqlite libpcre2 openssl3 ffmpeg6 git
 			ca_root_certificates ;
+		# and what CI's packages need that this list has: Qt's dependencies
+		# (airos-ci deps/build-qt-airos.sh, images/build-image.sh)
+		if $(AIROS_CI_SYSTEM_PACKAGES) {
+			AddHaikuImageSystemPackages $(AIROS_CI_SYSTEM_PACKAGES) ;
+		}
 	}
 	case airos-arm64 : {
 		AIROS_ROCK5 = 1 ;

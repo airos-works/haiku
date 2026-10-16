@@ -164,15 +164,18 @@ area sampled; GTK programs and Firefox draw at 2x through the server above.
 - OpenGL views and other programs that draw logical-size bitmaps are still
   enlarged (GL filtered, other bitmaps area sampled: even, but with the
   detail of the logical size). Programs can use `BScreen::DeviceScale()` and
-  `B_DEVICE_PIXEL_BITMAP` as the Qt plugin does; a `BGLView` option to
-  render at buffer pixels (what macOS calls
-  `wantsBestResolutionOpenGLSurface`, SDL `SDL_WINDOW_ALLOW_HIGHDPI`) would
-  let GL programs and SDL do the same.
+  `B_DEVICE_PIXEL_BITMAP` as the Qt plugin does. `FULL-DENSITY.md` designs
+  the rest (not implemented): opt-in `BBitmap` and `BGLView` flags (what
+  macOS calls `wantsBestResolutionOpenGLSurface`, SDL
+  `SDL_WINDOW_ALLOW_HIGHDPI`), ports of the system programs, and dense
+  offscreen buffers in app_server for programs that do not ask.
 - GTK 3 only knows whole scales, so at 125 percent it draws at 2x and is
   filtered down to 62.5 percent of that.
-- The Qt plugin with the device pixel ratio (qt6_base 6.10.3-103) is
-  installed on the Framework 13 only; images carry no Qt, and programs such
-  as Telegram get HaikuPorts' qt6_base from HaikuDepot.
+- Qt: the x86_64 images carry qt6_base with the plugin that uses the device
+  pixel ratio (HaikuPorts' revision plus 100, airos-ci
+  `deps/build-qt-airos.sh`), so Telegram from HaikuDepot is sharp. ARM64
+  images have no Qt yet, and HaikuPorts' next Qt version replaces ours (and
+  draws at the logical size again) until an image brings the next one.
 
 ## Tools
 
