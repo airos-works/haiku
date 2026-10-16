@@ -99,6 +99,9 @@ public:
 	// Returns false when the destination must be redrawn instead.
 	virtual	bool			CopyRegion(/*const*/ BRegion* region,
 								int32 xOffset, int32 yOffset);
+			bool			CopyRegionByDeviceOffset(
+								/*const*/ BRegion* region,
+								int32 deviceX, int32 deviceY);
 
 	virtual	void			InvertRect(BRect r);
 
@@ -170,6 +173,9 @@ public:
 	virtual	void			StrokeLine(const BPoint& start,
 								const BPoint& end, const BGradient& gradient);
 
+			void			StrokeFrameLineArray(
+								const ViewFrameLineArrayInfo& info,
+								const ViewLineArrayInfo* lines);
 	virtual	void			StrokeLineArray(int32 numlines,
 								const ViewLineArrayInfo* data);
 
@@ -221,6 +227,8 @@ private:
 								// drawing that is not on the screen yet
 								// asked for B_WAIT_FOR_RETRACE
 
+			bool			_CopyRegion(/*const*/ BRegion* region,
+								int32 xOffset, int32 yOffset);
 			void			_ScaleRegion(const BRegion& region,
 								BRegion& scaled) const;
 };
