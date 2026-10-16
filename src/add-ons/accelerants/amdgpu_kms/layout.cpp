@@ -117,6 +117,17 @@ output_timing(const Output& output, const display_timing& timing)
 	engine cannot drive is refused, which makes app_server try a lower
 	render scale. The monitors change when the returned mode is set.
 */
+/*!	The first frame buffer pixel of logical pixel \a logical at
+	\a renderScale percent: app_server's floor(logical * scale).
+*/
+static int32
+buffer_pixel(int32 logical, uint16 renderScale)
+{
+	int64 scaled = (int64)logical * renderScale;
+	return (int32)(scaled >= 0 ? scaled / 100 : -((-scaled + 99) / 100));
+}
+
+
 extern "C" status_t
 amdgpu_set_display_layout(const display_output_config* configs, uint32 count,
 	display_mode* _mode)
@@ -158,10 +169,23 @@ amdgpu_set_display_layout(const display_output_config* configs, uint32 count,
 			/ output->scale;
 		uint32 logicalHeight = (output->timing.vdisplay * 100
 			+ output->scale / 2) / output->scale;
-		output->width = (logicalWidth * output->renderScale + 50) / 100;
-		output->height = (logicalHeight * output->renderScale + 50) / 100;
-		output->x = (config.x * output->renderScale + 50) / 100;
-		output->y = (config.y * output->renderScale + 50) / 100;
+		// The region starts where app_server draws the display's first
+		// logical pixel, and ends where it draws the one after its last.
+		output->x = buffer_pixel(config.x, output->renderScale);
+		output->y = buffer_pixel(config.y, output->renderScale);
+		if (output->scale == output->renderScale) {
+			// Drawn one to one: the monitor's own pixels. The logical size
+			// is rounded, so its scaled size can be a fraction of a pixel
+			// off (1503.25 rows for a 1504 row panel at 175%), and a region
+			// that size would be stretched by a pixel over the whole panel.
+			output->width = output->timing.hdisplay;
+			output->height = output->timing.vdisplay;
+		} else {
+			output->width = buffer_pixel(config.x + logicalWidth,
+				output->renderScale) - output->x;
+			output->height = buffer_pixel(config.y + logicalHeight,
+				output->renderScale) - output->y;
+		}
 		any = true;
 	}
 

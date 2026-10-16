@@ -335,9 +335,31 @@ destination(const Output& output, uint32& x, uint32& y, uint32& width,
 }
 
 
-/*!	Drives the monitors as \a layout says, on a new frame buffer, in one
-	atomic commit; with \a testOnly, only asks whether that would work.
-	Assigns the outputs' CRTCs.
+static uint32
+round_up(uint32 value, uint32 multiple)
+{
+	return (value + multiple - 1) / multiple * multiple;
+}
+
+
+/*!	Whether \a buffer can show \a layout: at least as large, and not so
+	much larger that keeping it wastes memory (after a monitor went away).
+*/
+static bool
+buffer_fits(const Kms::Buffer& buffer, const Layout& layout)
+{
+	return buffer.handle != 0 && buffer.framebuffer != 0
+		&& buffer.width >= layout.width && buffer.height >= layout.height
+		&& (uint64)buffer.width * buffer.height
+			<= (uint64)round_up(layout.width, 64) * round_up(layout.height, 16)
+				* 5 / 4;
+}
+
+
+/*!	Drives the monitors as \a layout says, in one atomic commit, on the
+	current frame buffer when it is large enough and on a new one otherwise;
+	with \a testOnly, only asks whether that would work. Assigns the outputs'
+	CRTCs.
 */
 status_t
 apply_layout(Layout& layout, bool testOnly)
@@ -383,9 +405,21 @@ apply_layout(Layout& layout, bool testOnly)
 			return B_NOT_SUPPORTED;
 	}
 
+	// The frame buffer: the current one when it is large enough, else a new
+	// one with a little room to spare. With 4K monitors one is tens of
+	// megabytes, and an APU has little VRAM to pin it in (512 MB on the
+	// Framework 13's 760M, shared with everything else the GPU does):
+	// pinning a second 9935x2160 buffer next to the current 9936x2160 one
+	// failed with ENOMEM when the scale went from 200 to 175%.
 	Kms::Buffer buffer;
-	status_t status = Kms::CreateBuffer(fd, layout.width, layout.height,
-		DRM_FORMAT_XRGB8888, buffer);
+	status_t status = B_OK;
+	bool reused = buffer_fits(gInfo->frameBuffer, layout);
+	if (reused)
+		buffer = gInfo->frameBuffer;
+	else {
+		status = Kms::CreateBuffer(fd, round_up(layout.width, 64),
+			round_up(layout.height, 16), DRM_FORMAT_XRGB8888, buffer);
+	}
 	if (status != B_OK) {
 		TRACE("no %" B_PRIu32 "x%" B_PRIu32 " frame buffer: %s\n",
 			layout.width, layout.height, strerror(status));
@@ -458,13 +492,16 @@ apply_layout(Layout& layout, bool testOnly)
 		}
 		for (uint32 c = 0; c < Kms::kMaxObjects; c++)
 			Kms::DestroyBlob(fd, blobs[c]);
-		Kms::DestroyBuffer(fd, buffer);
+		if (!reused)
+			Kms::DestroyBuffer(fd, buffer);
 		return status;
 	}
 
 	// it is on screen
-	Kms::DestroyBuffer(fd, gInfo->frameBuffer);
-	gInfo->frameBuffer = buffer;
+	if (!reused) {
+		Kms::DestroyBuffer(fd, gInfo->frameBuffer);
+		gInfo->frameBuffer = buffer;
+	}
 	for (uint32 c = 0; c < Kms::kMaxObjects; c++) {
 		Kms::DestroyBlob(fd, gInfo->modeBlobs[c]);
 		gInfo->modeBlobs[c] = blobs[c];
@@ -635,8 +672,9 @@ amdgpu_set_display_mode(display_mode* mode)
 	status_t status;
 	if (gInfo->hasPending && is_layout_mode(gInfo->pending, *mode)) {
 		status = apply_layout(gInfo->pending, false);
-		if (status == B_OK)
-			gInfo->hasPending = false;
+		// applied or not, it is done with: a layout that failed is not the
+		// one to report as preferred afterwards
+		gInfo->hasPending = false;
 	} else {
 		default_layout(layout);
 		if (!is_layout_mode(layout, *mode)) {

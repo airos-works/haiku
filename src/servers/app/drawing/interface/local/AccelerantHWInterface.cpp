@@ -1430,6 +1430,9 @@ AccelerantHWInterface::SetDisplayLayout(const display_output_config* configs,
 
 	display_mode mode;
 	status_t status;
+	int32 oldWidth = fLogicalWidth;
+	int32 oldHeight = fLogicalHeight;
+	uint16 oldRenderScale = RenderScale();
 	{
 		AutoWriteLocker _(this);
 		status = fAccSetDisplayLayout(configs, count, &mode);
@@ -1467,6 +1470,13 @@ AccelerantHWInterface::SetDisplayLayout(const display_output_config* configs,
 		return status;
 
 	status = _SetMode(mode, true);
+	if (status != B_OK) {
+		// The driver kept the monitors as they were (an atomic commit that
+		// failed, a frame buffer it could not pin); so does the drawing.
+		AutoWriteLocker _(this);
+		SetLogicalSize(oldWidth, oldHeight);
+		HWInterface::SetRenderScale(oldRenderScale);
+	}
 	// the cursor on the new layout, at its density
 	_UpdateHardwareCursor(true);
 	return status;
