@@ -23,7 +23,7 @@ INCLUDES=(-I"$GCC_SYSLIBS/develop/headers/c++"
 	-I"$HAIKU/headers/os/kernel" -I"$HAIKU/headers/os/storage"
 	-I"$HAIKU/headers/os/support" -I"$HAIKU/headers/os/translation"
 	-I"$HAIKU/headers/private/interface" -I"$HAIKU/headers/private/shared")
-LIBS=("$OBJ/kits/libbe.so")
+LIBS=("${LIBBE:-$OBJ/kits/libbe.so}")
 for l in "$@"; do
 	case $l in
 		game) LIBS+=("$OBJ/kits/game/libgame.so") ;;

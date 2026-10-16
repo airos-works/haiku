@@ -37,6 +37,7 @@
 #include <View.h>
 #include <Window.h>
 
+#include <dlfcn.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -134,7 +135,13 @@ public:
 			B_FILTER_BITMAP_BILINEAR);
 
 		// a checkerboard of single frame buffer pixels, drawn one to one
-		float scale = BScreen().DeviceScale();
+		// looked up at run time, so that the gallery also runs on systems
+		// without it (and then draws this at the logical size)
+		typedef float (*DeviceScaleFunction)(BScreen* screen);
+		DeviceScaleFunction deviceScale = (DeviceScaleFunction)dlsym(
+			RTLD_DEFAULT, "_ZN7BScreen11DeviceScaleEv");
+		BScreen screen;
+		float scale = deviceScale != NULL ? deviceScale(&screen) : 1.0f;
 		int32 size = (int32)ceilf(40 * scale);
 		BBitmap device(BRect(0, 0, size - 1, size - 1), B_RGB32);
 		uint32* bits = (uint32*)device.Bits();
