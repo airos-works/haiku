@@ -215,6 +215,19 @@ Stream::OnRemove()
 }
 
 
+/*!	The device is gone, and the buffers' user is let go before it knows: it
+	may still write to them (a media node fills them with silence when it
+	is disconnected), and nothing tells when it stops. So the user-visible
+	area is left alone; it is small, and an unplug while it is open is
+	rare.
+*/
+void
+Stream::OrphanBuffers()
+{
+	fArea = -1;
+}
+
+
 bool
 Stream::_IsHighSpeed()
 {

@@ -15,6 +15,10 @@
 #include "Settings.h"
 
 
+// A buffer is 48 ms at most: this long without one, the transfers stopped.
+static const bigtime_t kBufferExchangeTimeout = 1000000;
+
+
 /*!	The device's product string, as the name of its audio device: "USB Audio"
 	tells a webcam's microphone from a DAC by nothing.
 */
@@ -468,6 +472,20 @@ Device::Removed()
 
 	for (int i = 0; i < fStreams.Count(); i++)
 		fStreams[i]->OnRemove();
+
+	// a buffer exchange waiting for buffers that will never come
+	release_sem(fBuffersReadySem);
+}
+
+
+/*!	Before an unplugged device is deleted at its free: devfs disconnects
+	its users when it goes, while one may still write into its buffers.
+*/
+void
+Device::OrphanBuffers()
+{
+	for (int i = 0; i < fStreams.Count(); i++)
+		fStreams[i]->OrphanBuffers();
 }
 
 
@@ -475,47 +493,6 @@ status_t
 Device::SetupDevice(bool deviceReplugged)
 {
 	return B_OK;
-}
-
-
-status_t
-Device::CompareAndReattach(usb_device device)
-{
-	const usb_device_descriptor* deviceDescriptor
-		= gUSBModule->get_device_descriptor(device);
-
-	if (deviceDescriptor == NULL) {
-		TRACE(ERR, "Error of getting USB device descriptor.\n");
-		return B_ERROR;
-	}
-
-	if (deviceDescriptor->vendor_id != fVendorID
-		|| deviceDescriptor->product_id != fProductID)
-		// this certainly isn't the same device
-		return B_BAD_VALUE;
-
-	// this is the same device that was replugged - clear the removed state,
-	// re- setup the endpoints and transfers and open the device if it was
-	// previously opened
-	fDevice = device;
-	fRemoved = false;
-	status_t result = _SetupEndpoints();
-	if (result != B_OK) {
-		fRemoved = true;
-		return result;
-	}
-
-	// we need to setup hardware on device replug
-	result = SetupDevice(true);
-	if (result != B_OK)
-		return result;
-
-	if (fOpen) {
-		fOpen = false;
-		result = Open(fNonBlocking ? O_NONBLOCK : 0);
-	}
-
-	return result;
 }
 
 
@@ -758,17 +735,31 @@ Device::_MultiBufferExchange(multi_buffer_info* multiInfo)
 		return B_BAD_ADDRESS;
 	}
 
+	// An unplugged device fails at once. (The media node holds its buffer
+	// lock while it exchanges: waiting here for buffers that never come
+	// kept the mixer from ever being disconnected from it.)
+	if (fRemoved)
+		return B_DEV_NOT_READY;
+
 	for (int i = 0; i < fStreams.Count(); i++) {
 		if (!fStreams[i]->IsRunning())
 			fStreams[i]->Start();
 	}
 
 	status_t status = acquire_sem_etc(fBuffersReadySem, 1,
-		B_CAN_INTERRUPT, 0);
+		B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT, kBufferExchangeTimeout);
+	if (fRemoved)
+		return B_DEV_NOT_READY;
 	if (status == B_TIMED_OUT) {
-		TRACE(ERR, "Timeout during buffers exchange.\n");
+		// the transfers stopped: start them again with the next exchange
+		TRACE(ERR, "Timeout during buffers exchange: restarting the "
+			"streams.\n");
+		for (int i = 0; i < fStreams.Count(); i++)
+			fStreams[i]->Stop();
 		return status;
 	}
+	if (status != B_OK)
+		return status;
 
 	status = B_ERROR;
 	for (int i = 0; i < fStreams.Count(); i++) {

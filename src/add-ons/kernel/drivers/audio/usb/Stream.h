@@ -27,6 +27,7 @@ public:
 			status_t		Stop();
 			bool			IsRunning() { return fIsRunning; }
 			void			OnRemove();
+			void			OrphanBuffers();
 
 			status_t		GetBuffers(multi_buffer_list* List);
 
