@@ -60,6 +60,8 @@ private:
 			uint32				fModifierCount;
 
 			uint8				fLastModifiers;
+			HIDReportItem*		fFnKey;
+			uint32				fFunctionKeyCodes[12];
 			uint16 *			fCurrentKeys;
 			uint16 *			fLastKeys;
 

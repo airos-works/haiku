@@ -56,6 +56,30 @@ debug_get_keyboard_config(int argc, char **argv)
 //	#pragma mark -
 
 
+// Apple keyboards report their Fn key in a vendor usage (page 0xff, usage
+// 3); the function row then sends plain F1-F12 and the host turns them into
+// the media keys printed on the caps while Fn is up.
+static const uint16 kAppleFnUsagePage = 0xff;
+static const uint16 kAppleFnUsageID = 0x03;
+
+// What F1-F12 mean on such a keyboard (consumer page usages): brightness,
+// show all windows, launchpad, keyboard backlight, transport, sound.
+static const uint32 kAppleFunctionRow[12] = {
+	(B_HID_USAGE_PAGE_CONSUMER << 16) | B_HID_UID_CON_DISPLAY_BRIGHTNESS_DECREMENT,
+	(B_HID_USAGE_PAGE_CONSUMER << 16) | B_HID_UID_CON_DISPLAY_BRIGHTNESS_INCREMENT,
+	(B_HID_USAGE_PAGE_CONSUMER << 16) | 0x29f,	// AC Desktop Show All Windows
+	(B_HID_USAGE_PAGE_CONSUMER << 16) | 0x2a0,	// AC Soft Key Left (launchpad)
+	(B_HID_USAGE_PAGE_CONSUMER << 16) | B_HID_UID_CON_KEYBOARD_BRIGHTNESS_DECREMENT,
+	(B_HID_USAGE_PAGE_CONSUMER << 16) | B_HID_UID_CON_KEYBOARD_BRIGHTNESS_INCREMENT,
+	(B_HID_USAGE_PAGE_CONSUMER << 16) | B_HID_UID_CON_SCAN_PREVIOUS_TRACK,
+	(B_HID_USAGE_PAGE_CONSUMER << 16) | B_HID_UID_CON_PLAY_PAUSE,
+	(B_HID_USAGE_PAGE_CONSUMER << 16) | B_HID_UID_CON_SCAN_NEXT_TRACK,
+	(B_HID_USAGE_PAGE_CONSUMER << 16) | B_HID_UID_CON_MUTE,
+	(B_HID_USAGE_PAGE_CONSUMER << 16) | B_HID_UID_CON_VOLUME_DECREMENT,
+	(B_HID_USAGE_PAGE_CONSUMER << 16) | B_HID_UID_CON_VOLUME_INCREMENT
+};
+
+
 KeyboardProtocolHandler::KeyboardProtocolHandler(HIDReport &inputReport,
 	HIDReport *outputReport)
 	:
@@ -70,12 +94,14 @@ KeyboardProtocolHandler::KeyboardProtocolHandler(HIDReport &inputReport,
 	fKeyCount(0),
 	fModifierCount(0),
 	fLastModifiers(0),
+	fFnKey(NULL),
 	fCurrentKeys(NULL),
 	fLastKeys(NULL),
 	fHasReader(0),
 	fHasDebugReader(false)
 {
 	mutex_init(&fLock, DEVICE_PATH_SUFFIX " keyboard");
+	memset(fFunctionKeyCodes, 0, sizeof(fFunctionKeyCodes));
 
 	// find modifiers and keys
 	bool debugUsable = false;
@@ -84,6 +110,17 @@ KeyboardProtocolHandler::KeyboardProtocolHandler(HIDReport &inputReport,
 		HIDReportItem *item = inputReport.ItemAt(i);
 		if (!item->HasData())
 			continue;
+
+		if (item->UsagePage() == kAppleFnUsagePage
+			&& item->UsageID() == kAppleFnUsageID && !item->Array()) {
+			// An Apple style keyboard (or one that imitates it, like the
+			// Keychrons in their Mac mode): the Fn key comes to the host
+			// in this vendor item, and the function row is meant to be the
+			// media keys printed on it unless Fn is held. We map them as
+			// macOS does.
+			fFnKey = item;
+			continue;
+		}
 
 		if (item->UsagePage() == B_HID_USAGE_PAGE_KEYBOARD
 			|| item->UsagePage() == B_HID_USAGE_PAGE_CONSUMER
@@ -545,6 +582,10 @@ KeyboardProtocolHandler::_ReadReport(bigtime_t timeout, uint32 *cookie)
 		}
 	}
 
+	bool fnPressed = false;
+	if (fFnKey != NULL && fFnKey->Extract() == B_OK && fFnKey->Valid())
+		fnPressed = fFnKey->Data() != 0;
+
 	for (uint32 i = 0; i < fKeyCount; i++) {
 		HIDReportItem *key = fKeys[i];
 		if (key == NULL)
@@ -782,6 +823,22 @@ KeyboardProtocolHandler::_ReadReport(bigtime_t timeout, uint32 *cookie)
 			if (fKeys[i]->UsagePage() == B_HID_USAGE_PAGE_KEYBOARD) {
 				if (current[i] < kKeyTableSize)
 					key = kKeyTable[current[i]];
+
+				if (fFnKey != NULL && current[i] >= B_HID_UID_KB_F1
+					&& current[i] <= B_HID_UID_KB_F12) {
+					// the function row of an Apple style keyboard: a media
+					// key unless Fn is held; a release repeats whatever the
+					// press sent, even if Fn changed in between
+					uint32& pressed = fFunctionKeyCodes[current[i] - B_HID_UID_KB_F1];
+					if (keyDown) {
+						if (!fnPressed)
+							key = kAppleFunctionRow[current[i] - B_HID_UID_KB_F1];
+						pressed = key;
+					} else if (pressed != 0) {
+						key = pressed;
+						pressed = 0;
+					}
+				}
 
 				if (key == B_PAUSE_KEY && (modifiers & ALT_KEYS) != 0)
 					key = KEY_Break;
