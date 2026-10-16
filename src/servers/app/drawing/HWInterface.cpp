@@ -1510,43 +1510,41 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank, int32 which)
 	}
 
 	if (bands == 1) {
-		for (int32 i = 0; i < count; i++) {
-			clipping_rect r = pending.RectAtInt(i);
-			bool behind = false;
-			if (blank != 0 && r.bottom >= targetFrame.bottom - 120) {
-				// in the last rows: not before the previous frame's scan
-				// has passed them (the flush begins a little early)
-				while (system_time() < blank)
-					;
-			}
-			float scan = _FlushScanRow(target, blank);
-			if (scan > r.top) {
-				behind = true;
-				worst = max_c(worst, (scan - r.top) / rows);
-			}
-			float scanAtStart = scan;
-			bigtime_t copyStart = system_time();
-			BRegion one((BRect)IntRect(r.left, r.top, r.right, r.bottom));
-			_CopyShadowToFront(one, which);
-			scan = _FlushScanRow(target, blank);
-			if (scan > r.bottom + 1) {
-				behind = true;
-				worst = max_c(worst, (scan - r.bottom - 1) / rows);
-			}
-			if (behind) {
-				late++;
-				if (target.lateReports < 3) {
-					target.lateReports++;
-					debug_printf("app_server: vertical blank flush %s: behind "
-						"the scan: rect %" B_PRId32 ",%" B_PRId32 "-%" B_PRId32
-						",%" B_PRId32 ", scan at row %.0f when the copy began "
-						"%.2f ms after the blank, at %.0f when it ended %.2f ms "
-						"after (woke %.2f ms after it, waited %.2f ms for "
-						"writes)\n", target.name, r.left, r.top, r.right,
-						r.bottom, scanAtStart, (copyStart - blank) / 1000.0,
-						scan, (system_time() - blank) / 1000.0,
-						target.wokeLate / 1000.0, target.waitedWrites / 1000.0);
-				}
+		// all the rects at once, in bands of rows across them (the copy
+		// goes down the screen as the scan does)
+		bool behind = false;
+		if (blank != 0 && frame.top >= targetFrame.bottom - 120) {
+			// all in the last rows: not before the previous frame's scan
+			// has passed them (the flush begins a little early)
+			while (system_time() < blank)
+				;
+		}
+		float scanAtStart = _FlushScanRow(target, blank);
+		if (scanAtStart > frame.top) {
+			behind = true;
+			worst = max_c(worst, (scanAtStart - frame.top) / rows);
+		}
+		bigtime_t copyStart = system_time();
+		_CopyShadowToFront(pending, which);
+		float scan = _FlushScanRow(target, blank);
+		if (scan > frame.bottom + 1) {
+			behind = true;
+			worst = max_c(worst, (scan - frame.bottom - 1) / rows);
+		}
+		if (behind) {
+			late++;
+			if (target.lateReports < 3) {
+				target.lateReports++;
+				debug_printf("app_server: vertical blank flush %s: behind "
+					"the scan: %" B_PRId32 " rects in %" B_PRId32 ",%"
+					B_PRId32 "-%" B_PRId32 ",%" B_PRId32 ", scan at row %.0f "
+					"when the copy began %.2f ms after the blank, at %.0f "
+					"when it ended %.2f ms after (woke %.2f ms after it, "
+					"waited %.2f ms for writes)\n", target.name, count,
+					frame.left, frame.top, frame.right, frame.bottom,
+					scanAtStart, (copyStart - blank) / 1000.0, scan,
+					(system_time() - blank) / 1000.0,
+					target.wokeLate / 1000.0, target.waitedWrites / 1000.0);
 			}
 		}
 	} else {
