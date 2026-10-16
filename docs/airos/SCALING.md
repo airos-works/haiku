@@ -133,10 +133,12 @@ buffers at twice the density (`set_buffer_scale`), and a surface covers
 its buffer size divided by the scale: one to one at 200 percent, filtered
 down at 150 and 175, as macOS draws at 2x and shrinks. Buffer damage,
 viewport sources and cursors follow the scale, and a viewport destination
-without a source (Firefox's content) is honoured. On the X399 it is in
-`/boot/system/non-packaged/lib/wayland-server-inproc.so`, ahead of
-HaikuPorts' package; programs started before a scale change keep the
-density they started with.
+without a source (Firefox's content) is honoured. When the desktop's scale
+changes, the outputs say so and surfaces have entered them, so a running
+GTK program follows (200 -> 100 -> 200 percent: buffer scale 2 -> 1 -> 2).
+airos-ci builds it with the AMD GPU user land and puts it into
+`system/non-packaged/lib` of every x86_64 image, ahead of HaikuPorts'
+`wayland_server`.
 
 **What the programs on the laptop and the X399 look like at 150 and 175
 percent** (October 2026, device pixel captures): native Interface Kit
@@ -166,9 +168,11 @@ area sampled; GTK programs and Firefox draw at 2x through the server above.
   render at buffer pixels (what macOS calls
   `wantsBestResolutionOpenGLSurface`, SDL `SDL_WINDOW_ALLOW_HIGHDPI`) would
   let GL programs and SDL do the same.
-- The CI images still ship HaikuPorts' `wayland_server`; the scaled one is
-  installed on the X399 by hand. GTK 3 only knows whole scales, so at 125
-  percent it draws at 2x and is filtered down to 62.5 percent of that.
+- GTK 3 only knows whole scales, so at 125 percent it draws at 2x and is
+  filtered down to 62.5 percent of that.
+- The Qt plugin with the device pixel ratio (qt6_base 6.10.3-103) is
+  installed on the Framework 13 only; images carry no Qt, and programs such
+  as Telegram get HaikuPorts' qt6_base from HaikuDepot.
 
 ## Tools
 
