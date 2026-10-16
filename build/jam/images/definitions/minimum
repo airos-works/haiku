@@ -62,6 +62,7 @@ SYSTEM_BIN = [ FFilterByBuildFeatures
 	login
 	lsindex
 	makebootable
+	mediakey
 	message
 	mimeset
 	mkfs

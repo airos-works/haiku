@@ -223,6 +223,12 @@ ShortcutsWindow::ShortcutsWindow()
 		_AddNewSpec("/bin/setvolume -d", (B_HID_USAGE_PAGE_CONSUMER << 16) | B_HID_UID_CON_VOLUME_DECREMENT);
 		_AddNewSpec("/bin/screenmode -b +0.0625", (B_HID_USAGE_PAGE_CONSUMER << 16) | B_HID_UID_CON_DISPLAY_BRIGHTNESS_INCREMENT);
 		_AddNewSpec("/bin/screenmode -b -0.0625", (B_HID_USAGE_PAGE_CONSUMER << 16) | B_HID_UID_CON_DISPLAY_BRIGHTNESS_DECREMENT);
+		_AddNewSpec("/bin/mediakey play-pause", (B_HID_USAGE_PAGE_CONSUMER << 16) | B_HID_UID_CON_PLAY_PAUSE);
+		_AddNewSpec("/bin/mediakey play", (B_HID_USAGE_PAGE_CONSUMER << 16) | B_HID_UID_CON_PLAY);
+		_AddNewSpec("/bin/mediakey pause", (B_HID_USAGE_PAGE_CONSUMER << 16) | B_HID_UID_CON_PAUSE);
+		_AddNewSpec("/bin/mediakey stop", (B_HID_USAGE_PAGE_CONSUMER << 16) | B_HID_UID_CON_STOP);
+		_AddNewSpec("/bin/mediakey next", (B_HID_USAGE_PAGE_CONSUMER << 16) | B_HID_UID_CON_SCAN_NEXT_TRACK);
+		_AddNewSpec("/bin/mediakey previous", (B_HID_USAGE_PAGE_CONSUMER << 16) | B_HID_UID_CON_SCAN_PREVIOUS_TRACK);
 		fLastSaved = BEntry(&keySetRef);
 		PostMessage(SAVE_KEYSET);
 	}

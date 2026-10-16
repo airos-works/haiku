@@ -252,12 +252,14 @@ KeyboardProtocolHandler::AddHandlers(HIDDevice &device,
 				continue;
 
 			if (item->UsagePage() == B_HID_USAGE_PAGE_KEYBOARD
-				|| (item->UsagePage() == B_HID_USAGE_PAGE_CONSUMER
-					&& item->Array())
+				|| item->UsagePage() == B_HID_USAGE_PAGE_CONSUMER
 				|| (item->UsagePage() == B_HID_USAGE_PAGE_BUTTON
 					&& item->Array())) {
 				// found at least one item with a keyboard usage or with
-				// a consumer/button usage that is handled like a key
+				// a consumer/button usage that is handled like a key.
+				// Consumer usages come as an array of usage codes or as
+				// a bitmap with one bit per usage (Bluetooth keyboards
+				// report their media keys that way); both are keys.
 //				mayHaveOutput = item->UsagePage() == B_HID_USAGE_PAGE_KEYBOARD;
 				foundKeyboardUsage = true;
 				break;
@@ -812,7 +814,13 @@ KeyboardProtocolHandler::_ReadReport(bigtime_t timeout, uint32 *cookie)
 
 			if (key == 0) {
 				// unmapped normal key or consumer/button key
-				key = fInputReport.Usages()[0] + current[i];
+				if (fKeys[i]->Array()) {
+					key = fInputReport.Usages()[0] + current[i];
+				} else {
+					// a bitmap item: its own usage, with the page, so that
+					// the volume key is 0xc00e9 whichever report it is in
+					key = fKeys[i]->Usage();
+				}
 			}
 
 			_WriteKey(key, keyDown);

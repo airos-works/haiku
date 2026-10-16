@@ -11,6 +11,8 @@
 
 #include "MainWin.h"
 
+#include <MediaKeys.h>
+
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -1507,6 +1509,58 @@ MainWin::VideoFormatChange(int width, int height, int widthAspect,
 	 	FrameResized(Bounds().Width(), Bounds().Height());
 
 	printf("VideoFormatChange leave\n");
+}
+
+
+bool
+MainWin::IsPlaying() const
+{
+	return fHasFile && fController->IsPlaying();
+}
+
+
+bool
+MainWin::CanHandleMediaKey(int32 key) const
+{
+	switch (key) {
+		case B_MEDIA_KEY_NEXT:
+		case B_MEDIA_KEY_PREVIOUS:
+			return fPlaylist->CountItems() > 1;
+		default:
+			return fHasFile;
+	}
+}
+
+
+bool
+MainWin::HandleMediaKey(int32 key)
+{
+	if (!CanHandleMediaKey(key))
+		return false;
+
+	switch (key) {
+		case B_MEDIA_KEY_PLAY_PAUSE:
+			fController->TogglePlaying();
+			break;
+		case B_MEDIA_KEY_PLAY:
+			fController->Play();
+			break;
+		case B_MEDIA_KEY_PAUSE:
+			fController->Pause();
+			break;
+		case B_MEDIA_KEY_STOP:
+			fController->Stop();
+			break;
+		case B_MEDIA_KEY_NEXT:
+			fControls->SkipForward();
+			break;
+		case B_MEDIA_KEY_PREVIOUS:
+			fControls->SkipBackward();
+			break;
+		default:
+			return false;
+	}
+	return true;
 }
 
 

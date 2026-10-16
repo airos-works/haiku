@@ -199,6 +199,11 @@ StdBinCommands
 	setvolume.cpp
 	: be libmedia.so [ TargetLibsupc++ ] : $(haiku-utils_rsrc) ;
 
+# standard commands that need libbe.so, libsupc++.so and private shared headers
+StdBinCommands
+	mediakey.cpp
+	: be [ TargetLibsupc++ ] : $(haiku-utils_rsrc) ;
+
 # standard commands that need libbe.so, libpackage.so, libsupc++.so
 StdBinCommands
 	findpaths.cpp
