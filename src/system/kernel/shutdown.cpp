@@ -73,7 +73,13 @@ system_shutdown(bool reboot)
 	team_info info;
 	
 	gKernelShutdown = true;
-	
+
+	// Write back the caches before anything is torn down: ending the teams
+	// runs their drivers' cleanup (GPU contexts, for one), and a machine that
+	// stops there loses what was only cached - files come back with their
+	// new size but the old contents of their blocks.
+	sync();
+
 	// Now shutdown all system services!
 	// TODO: Once we are sure we can shutdown the system on all hardware
 	// checking reboot may not be necessary anymore.
