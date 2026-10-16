@@ -60,6 +60,7 @@ All rights reserved.
 #include "ResourceSet.h"
 #include "StatusView.h"
 #include "TeamMenuItem.h"
+#include "WindowIcons.h"
 
 
 const int32 kDefaultRecentDocCount = 10;
@@ -290,6 +291,11 @@ TBarView::MessageReceived(BMessage* message)
 			// received when an item is selected during DnD
 			// message is targeted here from Be menu
 			HandleDeskbarMenu(message);
+			break;
+
+		case kWindowIconsChanged:
+			if (fExpandoMenuBar != NULL)
+				fExpandoMenuBar->Invalidate();
 			break;
 
 		case B_ARCHIVED_OBJECT:

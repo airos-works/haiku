@@ -71,6 +71,7 @@ All rights reserved.
 #include "ResourceSet.h"
 #include "StatusView.h"
 #include "Switcher.h"
+#include "WindowIcons.h"
 
 #include "icons.h"
 
@@ -120,6 +121,9 @@ TBarApp::TBarApp()
 	fBarWindow = new TBarWindow();
 	fBarView = fBarWindow->BarView();
 
+	fWindowIcons = new WindowIcons(BMessenger(fBarView));
+	AddHandler(fWindowIcons);
+
 	be_roster->StartWatching(this);
 
 	gLocalizedNamePreferred
@@ -168,6 +172,9 @@ TBarApp::TBarApp()
 TBarApp::~TBarApp()
 {
 	be_roster->StopWatching(this);
+
+	RemoveHandler(fWindowIcons);
+	delete fWindowIcons;
 
 	int32 teamCount = sBarTeamInfoList.CountItems();
 	for (int32 i = 0; i < teamCount; i++) {
@@ -883,6 +890,13 @@ TBarApp::FetchWindowIcon(bool local, bool minimized)
 }
 
 
+std::shared_ptr<BBitmap>
+TBarApp::ApplicationWindowIcon(int32 serverToken)
+{
+	return fWindowIcons->IconFor(serverToken);
+}
+
+
 void
 TBarApp::AddTeam(team_id team, uint32 flags, const char* sig, entry_ref* ref)
 {
@@ -963,6 +977,8 @@ TBarApp::AddTeam(team_id team, uint32 flags, const char* sig, entry_ref* ref)
 void
 TBarApp::RemoveTeam(team_id team)
 {
+	fWindowIcons->RemoveTeam(team);
+
 	BAutolock autolock(sSubscriberLock);
 	if (!autolock.IsLocked())
 		return;

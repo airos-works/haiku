@@ -172,8 +172,30 @@ TWindowMenuItem::DrawContent()
 		GetContentSize(NULL, &height);
 		contentLocation.y += (height - bitmapHeight) / 2;
 
-		menu->MovePenTo(contentLocation);
-		menu->DrawBitmapAsync(fBitmap);
+		// The icon the application gave the window (a web page's site icon),
+		// at the size of the generic one; dimmed while minimized.
+		std::shared_ptr<BBitmap> windowIcon
+			= static_cast<TBarApp*>(be_app)->ApplicationWindowIcon(fID);
+		if (windowIcon != NULL) {
+			BRect target(contentLocation.x + shiftedBy, contentLocation.y,
+				contentLocation.x + shiftedBy + bitmapHeight,
+				contentLocation.y + bitmapHeight);
+			menu->SetDrawingMode(B_OP_ALPHA);
+			menu->SetBlendingMode(B_PIXEL_ALPHA, B_ALPHA_OVERLAY);
+			menu->DrawBitmapAsync(windowIcon.get(), windowIcon->Bounds(),
+				target, B_FILTER_BITMAP_BILINEAR);
+			if (fIsMinimized) {
+				rgb_color veil = menu->LowColor();
+				veil.alpha = 128;
+				menu->SetHighColor(veil);
+				menu->SetBlendingMode(B_CONSTANT_ALPHA, B_ALPHA_OVERLAY);
+				menu->FillRect(target);
+			}
+			menu->SetDrawingMode(B_OP_OVER);
+		} else {
+			menu->MovePenTo(contentLocation);
+			menu->DrawBitmapAsync(fBitmap);
+		}
 
 		contentLocation.x += shiftedBy;
 		contentLocation.x += (bitmapWidth - shiftedBy) + sLabelOffset;
@@ -271,6 +293,10 @@ TWindowMenuItem::_Init(const char* name)
 
 	TBarApp* app = static_cast<TBarApp*>(be_app);
 	fBitmap = app->FetchWindowIcon(fIsLocal, fIsMinimized);
+	if (fID >= 0) {
+		// Asks the window for an icon of its own the first time.
+		app->ApplicationWindowIcon(fID);
+	}
 
 	// use menu font (parent font not available yet)
 	menu_info info;
