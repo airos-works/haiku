@@ -680,6 +680,7 @@ virtual	status_t						BuildDeviceName(char *string,
 
 private:
 		status_t						_DebouncePort(uint8 index);
+		void							_EnumerationFailed(uint8 index);
 
 		InterruptPipe *					fInterruptPipe;
 		usb_hub_descriptor				fHubDescriptor;
@@ -688,6 +689,9 @@ private:
 		usb_port_status					fPortStatus[USB_MAX_PORT_COUNT];
 		Device *						fChildren[USB_MAX_PORT_COUNT];
 		uint8							fPlatformResets[USB_MAX_PORT_COUNT];
+		uint8							fEnumerationFailures[
+											USB_MAX_PORT_COUNT];
+		bigtime_t						fNextEnumeration[USB_MAX_PORT_COUNT];
 };
 
 

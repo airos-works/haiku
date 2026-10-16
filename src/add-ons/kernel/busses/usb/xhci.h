@@ -97,6 +97,9 @@ struct xhci_endpoint {
 	uint32			cancel_count;
 		// Cancellation drops lock while stopping the controller. Do not link
 		// new descriptors until every overlapping cancellation has finished.
+	bool			recovering;
+		// A halted endpoint is being reset: descriptors linked meanwhile are
+		// rung once it has been.
 
 	xhci_trb*		trbs; // [XHCI_ENDPOINT_RING_SIZE]
 	phys_addr_t 	trb_addr;
@@ -233,6 +236,8 @@ private:
 									xhci_endpoint *endpoint);
 			status_t			_UnlinkDescriptorForPipe(xhci_td *descriptor,
 									xhci_endpoint *endpoint);
+			void				_RecoverHaltedEndpoint(
+									xhci_endpoint* endpoint, xhci_td* td);
 
 			// Command
 			void				DumpRing(xhci_trb *trb, uint32 size);

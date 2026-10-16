@@ -2551,6 +2551,7 @@ XHCI::AllocateDevice(Hub *parent, int8 hubAddress, uint8 hubPort,
 	endpoint0->used = 0;
 	endpoint0->next = 0;
 	endpoint0->cancel_count = 0;
+	endpoint0->recovering = false;
 	endpoint0->trbs = device->trbs;
 	endpoint0->trb_addr = device->trb_addr;
 
@@ -2808,6 +2809,7 @@ XHCI::_InsertEndpointForPipe(Pipe *pipe)
 		endpoint->used = 0;
 		endpoint->next = 0;
 		endpoint->cancel_count = 0;
+		endpoint->recovering = false;
 
 		endpoint->trbs = device->trbs + id * XHCI_ENDPOINT_RING_STRIDE;
 		endpoint->trb_addr = device->trb_addr
@@ -3013,6 +3015,7 @@ XHCI::_LinkDescriptorForPipe(xhci_td *descriptor, xhci_endpoint *endpoint)
 		B_LENDIAN_TO_HOST_INT32(endpoint->trbs[link].flags));
 
 	endpoint->next = next;
+	const bool ring = !endpoint->recovering;
 	endpointLocker.Unlock();
 
 	TRACE("Endpoint status 0x%08" B_PRIx32 " 0x%08" B_PRIx32 " 0x%016" B_PRIx64 "\n",
@@ -3020,7 +3023,8 @@ XHCI::_LinkDescriptorForPipe(xhci_td *descriptor, xhci_endpoint *endpoint)
 		_ReadContext(&endpoint->device->device_ctx->endpoints[endpoint->id].dwendpoint1),
 		_ReadContext(&endpoint->device->device_ctx->endpoints[endpoint->id].qwendpoint2));
 
-	Ring(endpoint->device->slot, endpoint->id + 1);
+	if (ring)
+		Ring(endpoint->device->slot, endpoint->id + 1);
 
 	TRACE("Endpoint status 0x%08" B_PRIx32 " 0x%08" B_PRIx32 " 0x%016" B_PRIx64 "\n",
 		_ReadContext(&endpoint->device->device_ctx->endpoints[endpoint->id].dwendpoint0),
@@ -3040,6 +3044,65 @@ XHCI::_UnlinkDescriptorForPipe(xhci_td *descriptor, xhci_endpoint *endpoint)
 	endpoint->td_list.Remove(descriptor);
 	endpoint->used--;
 	return B_OK;
+}
+
+
+/*!	Resets an endpoint that halted on \a td, and moves its ring on past that
+	descriptor. A halted endpoint runs nothing until it is reset (XHCI 1.2
+	§ 4.8.3); left halted, the next transfer would wait for its timeout and
+	the cancellation that follows it.
+	Called from the finisher thread, before the transfer's callback.
+*/
+void
+XHCI::_RecoverHaltedEndpoint(xhci_endpoint* endpoint, xhci_td* td)
+{
+	if (endpoint == NULL || endpoint->trbs == NULL
+		|| _GetEndpointState(endpoint) != ENDPOINT_STATE_HALTED) {
+		return;
+	}
+
+	// The Link TRB at the end of the descriptor returns to its Event Data
+	// TRB on the endpoint's ring; the ring goes on after that one.
+	const phys_addr_t resume = B_LENDIAN_TO_HOST_INT64(
+		td->trbs[td->trb_used].address) + sizeof(xhci_trb);
+
+	MutexLocker endpointLocker(endpoint->lock);
+	if (endpoint->cancel_count != 0 || endpoint->recovering) {
+		// A cancellation resets the endpoint itself.
+		return;
+	}
+	endpoint->recovering = true;
+	endpointLocker.Unlock();
+
+	TRACE("recovering halted endpoint %" B_PRIu8 " of slot %" B_PRIu8 "\n",
+		endpoint->id, endpoint->device->slot);
+	status_t status = ResetEndpoint(false, endpoint);
+
+	endpointLocker.Lock();
+	if (status == B_OK && endpoint->td_list.IsEmpty()) {
+		// Start over at the beginning of the ring, as a cancellation does.
+		memset(endpoint->trbs, 0, sizeof(xhci_trb) * XHCI_ENDPOINT_RING_SIZE);
+		endpoint->used = 0;
+		endpoint->next = 0;
+		status = SetTRDequeue(endpoint->trb_addr, 0, endpoint->id + 1,
+			endpoint->device->slot);
+	} else if (status == B_OK && endpoint->cancel_count == 0) {
+		// Go on with the descriptors queued after this one. (A cancellation
+		// that is under way clears the ring and moves it to its start.)
+		status = SetTRDequeue(resume, 0, endpoint->id + 1,
+			endpoint->device->slot);
+	}
+	if (status != B_OK) {
+		TRACE_ERROR("recovering halted endpoint %" B_PRIu8 " of slot %" B_PRIu8
+			" failed: %s\n", endpoint->id, endpoint->device->slot,
+			strerror(status));
+	}
+	endpoint->recovering = false;
+	const bool ring = !endpoint->td_list.IsEmpty() && endpoint->cancel_count == 0;
+	endpointLocker.Unlock();
+
+	if (ring)
+		Ring(endpoint->device->slot, endpoint->id + 1);
 }
 
 
@@ -4133,6 +4196,18 @@ XHCI::FinishTransfers()
 				} else {
 					callbackStatus = status;
 				}
+			}
+
+			// A control endpoint that halted is reset at once: a device
+			// refuses a request it does not support with a stall, and takes
+			// the next one. (The halt of a bulk or interrupt endpoint is its
+			// driver's to clear.)
+			xhci_endpoint* endpoint
+				= (xhci_endpoint*)transfer->TransferPipe()->ControllerCookie();
+			if (completionCode != COMP_SUCCESS
+				&& completionCode != COMP_SHORT_PACKET
+				&& endpoint != NULL && endpoint->id == 0) {
+				_RecoverHaltedEndpoint(endpoint, td);
 			}
 
 			FreeDescriptor(td);
