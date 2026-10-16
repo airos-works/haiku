@@ -105,6 +105,9 @@ requires {
 #ifdef HAIKU_BUILD_FEATURE_%HAIKU_PACKAGING_ARCH%_ncurses_ENABLED
 	lib:libncurses >= 6.0
 #endif
+/* libbnetapi's HTTPS. build/jam/BuildFeatures enables SSL for every regular
+   build, with or without a profile (it used to depend on the profile, and a
+   build directory kept the package info of whichever kind built it first). */
 #ifdef HAIKU_BUILD_FEATURE_%HAIKU_PACKAGING_ARCH%_openssl_ENABLED
 	lib:libssl
 	lib:libcrypto

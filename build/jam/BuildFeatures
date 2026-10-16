@@ -56,7 +56,14 @@ rule ExtractArm64ImageLibraryBuildFeature feature : package : version : library
 # SSL
 
 # Automatically enable the SSL feature, when the OpenSSL package is enabled.
-if [ IsHaikuImagePackageAdded openssl3 ] {
+# air/OS: also for every regular build, profile or not. The SSL feature is
+# what gives libbnetapi HTTPS (BSecureSocket), which pkgman, HaikuDepot and
+# SoftwareUpdater download through. Only the release, nightly, minimum and test
+# profiles add openssl3, so a haiku.hpkg built without one (jam -q haiku.hpkg,
+# the lab builds) failed every https:// download with "Operation not
+# supported". openssl3 goes into the image with it, since the haiku package
+# then requires lib:libssl and lib:libcrypto.
+if [ IsHaikuImagePackageAdded openssl3 ] || $(HAIKU_BUILD_TYPE) = regular {
 	HAIKU_BUILD_FEATURE_SSL = 1 ;
 }
 
@@ -74,6 +81,7 @@ if $(HAIKU_BUILD_FEATURE_SSL) {
 			;
 
 		EnableBuildFeatures openssl ;
+		AddHaikuImageSystemPackages openssl3 ;
 	} else {
 		unavailableBuildFeatures += openssl ;
 	}
