@@ -483,20 +483,46 @@ HaikuControlLook::DrawStatusBar(BView* view, BRect& rect, const BRect& updateRec
 	bool filledSurface = filledRect.Width() > 0;
 	bool nonfilledSurface = nonfilledRect.Width() > 0;
 
+	// Each part's surface goes under its frame, with the gradient it has
+	// inside it: at a fractional scale the frame keeps its width and the
+	// surface takes up the rest.
 	if (filledSurface) {
+		BRect surface(filledRect);
+		surface.InsetBy(1, 1);
+		BGradientLinear gradient;
+		_MakeGlossyGradient(gradient, surface, barColor, 0.55, 0.68, 0.76,
+			0.90);
+		view->FillRect(filledRect, gradient);
+
+		FrameLines lines(view, filledRect, B_ALL_BORDERS);
+		lines.SetOverFill();
 		_DrawFrame(view, filledRect,
 			dark1FilledBorderColor, dark1FilledBorderColor,
-			dark2FilledBorderColor, dark2FilledBorderColor);
-
-		_FillGlossyGradient(view, filledRect, barColor, 0.55, 0.68, 0.76, 0.90);
+			dark2FilledBorderColor, dark2FilledBorderColor, B_ALL_BORDERS,
+			&lines, true);
+		lines.Draw();
 	}
 
 	if (nonfilledSurface) {
-		_DrawFrame(view, nonfilledRect, dark1BorderColor, dark1BorderColor,
-			dark2BorderColor, dark2BorderColor,
-			B_TOP_BORDER | B_BOTTOM_BORDER | B_RIGHT_BORDER);
+		const uint32 borders = B_TOP_BORDER | B_BOTTOM_BORDER | B_RIGHT_BORDER;
+		BRect surface(nonfilledRect);
+		surface.top++;
+		surface.bottom--;
+		surface.right--;
+		bool leftLine = surface.left < surface.right;
+		if (leftLine)
+			surface.left++;
+		BGradientLinear gradient;
+		_MakeGradient(gradient, surface, base, 0.25, 0.06);
+		view->FillRect(nonfilledRect, gradient);
 
-		if (nonfilledRect.left < nonfilledRect.right) {
+		FrameLines lines(view, nonfilledRect, borders);
+		lines.SetOverFill();
+		_DrawFrame(view, nonfilledRect, dark1BorderColor, dark1BorderColor,
+			dark2BorderColor, dark2BorderColor, borders, &lines, true);
+		lines.Draw();
+
+		if (leftLine) {
 			// shadow from fill bar, or left border
 			rgb_color leftBorder = dark1BorderColor;
 			if (filledSurface)
@@ -506,8 +532,6 @@ HaikuControlLook::DrawStatusBar(BView* view, BRect& rect, const BRect& updateRec
 				nonfilledRect.LeftBottom());
 			nonfilledRect.left++;
 		}
-
-		_FillGradient(view, nonfilledRect, base, 0.25, 0.06);
 	}
 }
 
@@ -694,36 +718,41 @@ HaikuControlLook::DrawScrollBarBorder(BView* view, BRect rect,
 
 	// stroke a line around the entire scrollbar
 	// take care of border highlighting, scroll target is focus view
+	// (drawn last, over the inside: at a fractional scale it keeps its width)
+	FrameLines lines(view, rect, B_ALL_BORDERS);
+	lines.SetOverFill();
 	if (isEnabled && isFocused) {
 		rgb_color borderColor = view->HighColor();
 		rgb_color highlightColor = ui_color(B_KEYBOARD_NAVIGATION_COLOR);
 
-		view->BeginLineArray(4);
-
-		view->AddLine(BPoint(rect.left + 1, rect.bottom),
+		lines.AddLine(BPoint(rect.left + 1, rect.bottom),
 			BPoint(rect.right, rect.bottom), borderColor);
-		view->AddLine(BPoint(rect.right, rect.top + 1),
+		lines.AddLine(BPoint(rect.right, rect.top + 1),
 			BPoint(rect.right, rect.bottom - 1), borderColor);
 
 		if (orientation == B_HORIZONTAL) {
-			view->AddLine(BPoint(rect.left, rect.top + 1),
+			lines.AddLine(BPoint(rect.left, rect.top + 1),
 				BPoint(rect.left, rect.bottom), borderColor);
 		} else {
-			view->AddLine(BPoint(rect.left, rect.top),
+			lines.AddLine(BPoint(rect.left, rect.top),
 				BPoint(rect.left, rect.bottom), highlightColor);
 		}
 
 		if (orientation == B_HORIZONTAL) {
-			view->AddLine(BPoint(rect.left, rect.top),
+			lines.AddLine(BPoint(rect.left, rect.top),
 				BPoint(rect.right, rect.top), highlightColor);
 		} else {
-			view->AddLine(BPoint(rect.left + 1, rect.top),
+			lines.AddLine(BPoint(rect.left + 1, rect.top),
 				BPoint(rect.right, rect.top), borderColor);
 		}
-
-		view->EndLineArray();
-	} else
-		view->StrokeRect(rect);
+		lines.EndRing(true);
+	} else {
+		rgb_color borderColor = view->HighColor();
+		BRect ring(rect);
+		_DrawFrame(view, ring, borderColor, borderColor, borderColor,
+			borderColor, B_ALL_BORDERS, &lines, true);
+	}
+	lines.Draw();
 
 	view->PopState();
 }
@@ -2190,11 +2219,19 @@ HaikuControlLook::DrawBorder(BView* view, BRect& rect, const BRect& updateRect,
 	if ((flags & B_FOCUSED) != 0)
 		scrollbarFrameColor = ui_color(B_KEYBOARD_NAVIGATION_COLOR);
 
+	// the frame keeps its width at any scale
+	FrameLines lines(view, rect, borders);
 	if (borderStyle == B_FANCY_BORDER)
-		_DrawOuterResessedFrame(view, rect, base, flags, borders);
+		_DrawOuterResessedFrame(view, rect, base, flags, borders, lines);
 
 	_DrawFrame(view, rect, scrollbarFrameColor, scrollbarFrameColor,
-		scrollbarFrameColor, scrollbarFrameColor, borders);
+		scrollbarFrameColor, scrollbarFrameColor, borders, &lines, true);
+
+	drawing_mode oldMode = view->DrawingMode();
+	if ((flags & B_BLEND_FRAME) != 0)
+		view->SetDrawingMode(B_OP_ALPHA);
+	lines.Draw();
+	view->SetDrawingMode(oldMode);
 }
 
 
@@ -2301,14 +2338,17 @@ HaikuControlLook::DrawGroupFrame(BView* view, BRect& rect, const BRect& updateRe
 	rgb_color bevelLight = tint_color(base, 0.8);
 	rgb_color bevelShadow = tint_color(base, 1.03);
 
+	// the frame between the bevels keeps its width at any scale
+	FrameLines lines(view, rect, borders);
 	_DrawFrame(view, rect, bevelShadow, bevelShadow, bevelLight, bevelLight,
-		borders);
+		borders, &lines, false);
 
 	_DrawFrame(view, rect, frameColor, frameColor, frameColor, frameColor,
-		borders);
+		borders, &lines, true);
 
 	_DrawFrame(view, rect, bevelLight, bevelLight, bevelShadow, bevelShadow,
-		borders);
+		borders, &lines, false);
+	lines.Draw();
 }
 
 
