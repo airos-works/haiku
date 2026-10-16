@@ -1373,7 +1373,17 @@ HWInterface::_FlipShadow()
 {
 	if (!fFlushLock.Lock())
 		return 0;
-	if (fShadowReaders == 0)
+	// The shadow about to be written again must have been copied by every
+	// target first: with two outputs flipping at their own blanks, a
+	// target could otherwise skip a generation and copy it later, older
+	// content over newer (trails of a moved window on the second display).
+	bool consumed = fShadowReaders == 0;
+	int32 old = fShadowCurrent ^ 1;
+	for (int32 i = 0; consumed && i < fFlushTargetCount; i++) {
+		if (fFlushTargets[i].pending[old].CountRects() > 0)
+			consumed = false;
+	}
+	if (consumed)
 		fShadowCurrent ^= 1;
 	int32 which = fShadowCurrent ^ 1;
 	fFlushLock.Unlock();
