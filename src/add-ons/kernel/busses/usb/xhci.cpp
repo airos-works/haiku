@@ -1854,6 +1854,205 @@ XHCI::SetKeepAwake(Device *usbDevice, bool keepAwake)
 }
 
 
+#if defined(__i386__) || defined(__x86_64__)
+
+
+static status_t
+acpi_integer(acpi_module_info* acpi, acpi_handle handle, const char* name,
+	uint64& value)
+{
+	acpi_object_type object;
+	acpi_data buffer;
+	buffer.pointer = &object;
+	buffer.length = sizeof(object);
+	status_t status = acpi->evaluate_method(handle, name, NULL, &buffer);
+	if (status != B_OK)
+		return status;
+	if (object.object_type != ACPI_TYPE_INTEGER)
+		return B_BAD_TYPE;
+
+	value = object.integer.integer;
+	return B_OK;
+}
+
+
+static acpi_handle
+acpi_child_at(acpi_module_info* acpi, acpi_handle parent, uint64 address)
+{
+	acpi_handle child = NULL;
+	while (acpi->get_next_object(ACPI_TYPE_DEVICE, parent, &child) == B_OK) {
+		uint64 value;
+		if (acpi_integer(acpi, child, "_ADR", value) == B_OK
+			&& value == address) {
+			return child;
+		}
+	}
+	return NULL;
+}
+
+
+/*!	Looks for the PCI function \a target among the ACPI devices below
+	\a parent, whose devices sit on PCI bus \a bus, and below the bridges
+	there whose bus range holds the target's bus.
+*/
+static acpi_handle
+acpi_find_pci_function(acpi_module_info* acpi, pci_module_info* pci,
+	acpi_handle parent, uint8 bus, const pci_info& target, int32 depth)
+{
+	acpi_handle child = NULL;
+	while (acpi->get_next_object(ACPI_TYPE_DEVICE, parent, &child) == B_OK) {
+		uint64 address;
+		if (acpi_integer(acpi, child, "_ADR", address) != B_OK)
+			continue;
+
+		uint16 device = address >> 16;
+		uint16 function = address & 0xffff;
+		if (device >= 32 || function >= 8)
+			continue;
+		if (bus == target.bus && device == target.device
+			&& function == target.function) {
+			return child;
+		}
+
+		if (depth == 0
+			|| pci->read_pci_config(bus, device, function, PCI_device_id, 2)
+				== 0xffff) {
+			continue;
+		}
+		uint8 headerType = pci->read_pci_config(bus, device, function,
+			PCI_header_type, 1);
+		if ((headerType & PCI_header_type_mask)
+				!= PCI_header_type_PCI_to_PCI_bridge) {
+			continue;
+		}
+		uint8 secondaryBus = pci->read_pci_config(bus, device, function,
+			PCI_secondary_bus, 1);
+		uint8 subordinateBus = pci->read_pci_config(bus, device, function,
+			PCI_subordinate_bus, 1);
+		if (secondaryBus <= bus || target.bus < secondaryBus
+			|| target.bus > subordinateBus) {
+			continue;
+		}
+
+		acpi_handle found = acpi_find_pci_function(acpi, pci, child,
+			secondaryBus, target, depth - 1);
+		if (found != NULL)
+			return found;
+	}
+	return NULL;
+}
+
+
+static acpi_handle
+acpi_find_pci_function(acpi_module_info* acpi, const pci_info& target)
+{
+	pci_module_info* pci;
+	if (get_module(B_PCI_MODULE_NAME, (module_info**)&pci) != B_OK)
+		return NULL;
+
+	acpi_handle found = NULL;
+	const char* rootBridgeIDs[] = { "PNP0A08", "PNP0A03" };
+	for (int32 i = 0; i < 2 && found == NULL; i++) {
+		char path[256];
+		for (uint32 index = 0; found == NULL
+				&& acpi->get_device(rootBridgeIDs[i], index, path,
+					sizeof(path)) == B_OK; index++) {
+			acpi_handle rootBridge;
+			if (acpi->get_handle(NULL, path, &rootBridge) != B_OK)
+				continue;
+
+			uint64 bus = 0;
+			acpi_integer(acpi, rootBridge, "_BBN", bus);
+			found = acpi_find_pci_function(acpi, pci, rootBridge, bus, target,
+				8);
+		}
+	}
+
+	put_module(B_PCI_MODULE_NAME);
+	return found;
+}
+
+
+/*!	Returns the power resource that resets the device behind port \a index
+	of the controller \a controller (the first one its ACPI port lists in
+	_PRR), or NULL. The root hub has address 0 below the controller, its
+	ports count from 1, as the controller's.
+*/
+static acpi_handle
+acpi_port_reset_resource(acpi_module_info* acpi, const pci_info& controller,
+	uint8 index)
+{
+	acpi_handle controllerHandle = acpi_find_pci_function(acpi, controller);
+	if (controllerHandle == NULL)
+		return NULL;
+	acpi_handle rootHub = acpi_child_at(acpi, controllerHandle, 0);
+	if (rootHub == NULL)
+		return NULL;
+	acpi_handle port = acpi_child_at(acpi, rootHub, index + 1);
+	if (port == NULL)
+		return NULL;
+
+	acpi_object_type resources[4];
+	if (acpi->evaluate_object(port, "_PRR", NULL, resources,
+			sizeof(resources)) != B_OK
+		|| resources[0].object_type != ACPI_TYPE_PACKAGE
+		|| resources[0].package.count == 0) {
+		return NULL;
+	}
+
+	acpi_handle resource = NULL;
+	acpi_object_type& reference = resources[0].package.objects[0];
+	if (reference.object_type == ACPI_TYPE_LOCAL_REFERENCE)
+		resource = reference.reference.handle;
+	else if (reference.object_type == ACPI_TYPE_STRING)
+		acpi->get_handle(NULL, reference.string.string, &resource);
+	return resource;
+}
+
+
+#endif	// __i386__ || __x86_64__
+
+
+/*!	A device built into the machine (the Bluetooth part of a Wi-Fi card) can
+	have a reset line the firmware describes as the _PRR power resource of
+	its port in ACPI. That resource's _RST holds the device in reset a moment
+	and lets it go; Linux resets Intel Bluetooth controllers the same way.
+*/
+status_t
+XHCI::PlatformResetPort(uint8 index)
+{
+#if defined(__i386__) || defined(__x86_64__)
+	if (fPCIInfo == NULL || index >= fPortCount)
+		return B_NOT_SUPPORTED;
+
+	acpi_module_info* acpi;
+	if (get_module(B_ACPI_MODULE_NAME, (module_info**)&acpi) != B_OK)
+		return B_NOT_SUPPORTED;
+
+	status_t status = B_NOT_SUPPORTED;
+	acpi_handle resource = acpi_port_reset_resource(acpi, *fPCIInfo, index);
+	if (resource != NULL) {
+		char name[128] = "?";
+		acpi_data nameBuffer;
+		nameBuffer.pointer = name;
+		nameBuffer.length = sizeof(name);
+		acpi->ns_handle_to_pathname(resource, &nameBuffer);
+
+		TRACE_ALWAYS("port %" B_PRIu8 ": device does not respond, resetting it "
+			"with %s._RST\n", index, name);
+		status = acpi->evaluate_method(resource, "_RST", NULL, NULL);
+		if (status != B_OK)
+			TRACE_ERROR("port %" B_PRIu8 ": %s._RST failed\n", index, name);
+	}
+
+	put_module(B_ACPI_MODULE_NAME);
+	return status;
+#else
+	return B_NOT_SUPPORTED;
+#endif
+}
+
+
 status_t
 XHCI::NotifyPipeChange(Pipe *pipe, usb_change change)
 {
