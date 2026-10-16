@@ -301,8 +301,30 @@ Sidebar::SelectionChanged()
 
 
 void
+Sidebar::_ScrollBy(float delta)
+{
+	// there is no scroll bar, the wheel and the keyboard scroll
+	float height = CountItems() > 0
+		? ItemFrame(CountItems() - 1).bottom + 1 : 0;
+	float maxTop = std::max(0.0f, height - Bounds().Height() - 1);
+	float top = std::max(0.0f, std::min(maxTop, Bounds().top + delta));
+	if (top != Bounds().top)
+		ScrollTo(0, top);
+}
+
+
+void
 Sidebar::MessageReceived(BMessage* message)
 {
+	if (message->what == B_MOUSE_WHEEL_CHANGED) {
+		float delta = 0;
+		if (message->FindFloat("be:wheel_delta_y", &delta) == B_OK
+			&& delta != 0) {
+			_ScrollBy(delta * ceilf(be_plain_font->Size() * 3));
+		}
+		return;
+	}
+
 	if (message->what == B_COLORS_UPDATED) {
 		SetViewColor(sidebar_color());
 		SetLowColor(sidebar_color());

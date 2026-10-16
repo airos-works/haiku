@@ -19,6 +19,7 @@
 #include <MediaRecorder.h>
 #include <MediaRoster.h>
 #include <MessageRunner.h>
+#include <TimeSource.h>
 
 #include "Cards.h"
 
@@ -47,6 +48,41 @@ post_status(BMessenger& messenger, const char* text)
 	BMessage message(kMsgStatus);
 	message.AddString("text", text);
 	messenger.SendMessage(&message, (BHandler*)NULL, 0);
+}
+
+
+/*!	An application that went away without disconnecting leaves the output
+	it recorded from connected to nothing, and a sound card does not notice:
+	disconnect what is connected to a port that is gone. Returns the free
+	output, if there is one then.
+*/
+static bool
+find_free_output(BMediaRoster* roster, const media_node& node,
+	media_type type, media_output& output)
+{
+	int32 count = 0;
+	if (roster->GetFreeOutputsFor(node, &output, 1, &count, type) == B_OK
+		&& count > 0) {
+		return true;
+	}
+
+	media_output outputs[16];
+	if (roster->GetConnectedOutputsFor(node, outputs, 16, &count) != B_OK)
+		return false;
+
+	bool cleared = false;
+	for (int32 i = 0; i < count; i++) {
+		port_info portInfo;
+		if (get_port_info(outputs[i].destination.port, &portInfo) == B_OK)
+			continue;
+		roster->Disconnect(node.node, outputs[i].source, node.node,
+			outputs[i].destination);
+		cleared = true;
+	}
+
+	count = 0;
+	return cleared && roster->GetFreeOutputsFor(node, &output, 1, &count,
+			type) == B_OK && count > 0;
 }
 
 
@@ -197,9 +233,7 @@ CameraPreview::_StartThread(void* data)
 	BMediaRoster* roster = BMediaRoster::Roster();
 
 	media_output output;
-	int32 count = 0;
-	if (roster->GetFreeOutputsFor(self->fNode, &output, 1, &count,
-			B_MEDIA_RAW_VIDEO) != B_OK || count < 1) {
+	if (!find_free_output(roster, self->fNode, B_MEDIA_RAW_VIDEO, output)) {
 		post_status(self->fMessenger, B_TRANSLATE("The camera is being used "
 			"by another application. Changes still apply."));
 		return B_BUSY;
@@ -477,9 +511,7 @@ LevelMeter::_StartThread(void* data)
 	}
 
 	media_output output;
-	int32 count = 0;
-	if (roster->GetFreeOutputsFor(input, &output, 1, &count,
-			B_MEDIA_RAW_AUDIO) != B_OK || count < 1) {
+	if (!find_free_output(roster, input, B_MEDIA_RAW_AUDIO, output)) {
 		roster->ReleaseNode(input);
 		post_status(self->fMessenger, B_TRANSLATE("The input is being used by "
 			"another application."));
@@ -497,6 +529,16 @@ LevelMeter::_StartThread(void* data)
 		status = recorder->Connect(input, &output, &format);
 		if (status == B_OK)
 			status = recorder->Start();
+		if (status == B_OK) {
+			// A sound input is its own time source, which is all
+			// BMediaRecorder starts; an input nothing plays to (a USB
+			// microphone) has to be started as a node to record.
+			BTimeSource* timeSource = roster->MakeTimeSourceFor(input);
+			if (timeSource != NULL) {
+				roster->StartNode(input, timeSource->Now());
+				timeSource->Release();
+			}
+		}
 	}
 
 	if (status != B_OK) {
@@ -544,8 +586,22 @@ LevelMeter::_Stop()
 	}
 	if (fHasInput) {
 		BMediaRoster* roster = BMediaRoster::CurrentRoster();
-		if (roster != NULL)
+		if (roster != NULL) {
+			// The input stops again when nothing else uses it.
+			media_output outputs[4];
+			media_input inputs[4];
+			int32 outputCount = 0;
+			int32 inputCount = 0;
+			if (recorder != NULL
+				&& roster->GetConnectedOutputsFor(fInput, outputs, 4,
+					&outputCount) == B_OK
+				&& roster->GetConnectedInputsFor(fInput, inputs, 4,
+					&inputCount) == B_OK
+				&& outputCount == 0 && inputCount == 0) {
+				roster->StopNode(fInput, 0, true);
+			}
 			roster->ReleaseNode(fInput);
+		}
 		fHasInput = false;
 	}
 }

@@ -711,8 +711,8 @@ label_by_group(ParameterForm::RowSpec& row, const BString& group,
 }
 
 
-/*!	The sliders of a card get value fields of one width, and room for the
-	Auto or Mute switch even where there is none, so they line up.
+/*!	The sliders get value fields of one width, and room for the Auto or
+	Mute switch even where there is none, so they line up.
 */
 static void
 align_rows(BObjectList<ParameterForm::Binding, true>& bindings, int32 first,
@@ -963,7 +963,6 @@ ParameterForm::_Build(const char* nodeName)
 				BView* control = _MakeRowView(row, &label, row.rowLabel);
 				card->AddRow(label, control);
 			}
-			align_rows(fBindings, first, fBindings.CountItems());
 			layout->AddView(card);
 			cardViews.push_back(card);
 			bool sliders = false;
@@ -974,6 +973,9 @@ ParameterForm::_Build(const char* nodeName)
 			cardHasSliders.push_back(sliders);
 		}
 	}
+
+	// the values and switches of all sliders line up
+	align_rows(fBindings, 0, fBindings.CountItems());
 
 	// the sliders of all cards line up (a card of menus keeps its own
 	// labels, so that long ones there do not shorten the sliders)

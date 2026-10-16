@@ -548,16 +548,61 @@ CameraPage::CameraPage(const MediaModel* model)
 	:
 	Page("camera", GLYPH_CAMERA, glyph_color(GLYPH_CAMERA),
 		B_TRANSLATE("Camera"),
-		B_TRANSLATE("Choose the camera applications use for video."), model)
+		B_TRANSLATE("Choose the camera applications use for video."), model),
+	fHasCamera(false),
+	fPreview(NULL)
 {
+}
+
+
+CameraPage::~CameraPage()
+{
+	// the preview goes first: it still uses the camera
+	if (fPreview != NULL) {
+		fPreview->RemoveSelf();
+		delete fPreview;
+	}
+	_ReleaseCamera();
+}
+
+
+void
+CameraPage::_ReleaseCamera()
+{
+	BMediaRoster* roster = BMediaRoster::CurrentRoster();
+	if (fHasCamera && roster != NULL)
+		roster->ReleaseNode(fCamera);
+	fHasCamera = false;
 }
 
 
 void
 CameraPage::Build()
 {
+	// a rebuild has deleted the old preview already
+	fPreview = NULL;
+	_ReleaseCamera();
+
 	AddTitle(B_TRANSLATE("Use camera"));
 	AddDeviceChoices(AddCard(), ROLE_VIDEO_INPUT);
+
+	const NodeEntry* camera = Model()->DefaultFor(ROLE_VIDEO_INPUT);
+	BMediaRoster* roster = BMediaRoster::CurrentRoster();
+	if (camera != NULL && roster != NULL
+		&& roster->GetVideoInput(&fCamera) == B_OK) {
+		fHasCamera = true;
+		AddTitle(B_TRANSLATE("Preview"));
+		Card* card = AddCard();
+		fPreview = new CameraPreview(fCamera);
+		card->AddFullRow(fPreview);
+
+		BButton* toggle = new BButton("toggle",
+			B_TRANSLATE("Pause preview"), new BMessage(kMsgTogglePreview));
+		toggle->SetTarget(this);
+		toggle->SetExplicitAlignment(BAlignment(B_ALIGN_LEFT,
+			B_ALIGN_VERTICAL_CENTER));
+		card->AddFullRow(toggle);
+	}
 
 	std::vector<const NodeEntry*> outputs;
 	Model()->NodesFor(ROLE_VIDEO_OUTPUT, outputs);
@@ -566,14 +611,34 @@ CameraPage::Build()
 		AddDeviceChoices(AddCard(), ROLE_VIDEO_OUTPUT);
 	}
 
-	const NodeEntry* camera = Model()->DefaultFor(ROLE_VIDEO_INPUT);
 	const DeviceEntry* device = camera != NULL
 		? Model()->DeviceFor(camera->info) : NULL;
 	if (device != NULL) {
-		BString label(B_TRANSLATE("Preview and settings for %device% ›"));
+		BString label(B_TRANSLATE("Settings for %device% ›"));
 		label.ReplaceFirst("%device%", device->name);
 		AddLink(label, device->Key());
 	}
+}
+
+
+void
+CameraPage::MessageReceived(BMessage* message)
+{
+	if (message->what == kMsgTogglePreview && fPreview != NULL) {
+		BButton* button = NULL;
+		message->FindPointer("source", (void**)&button);
+		if (fPreview->IsRunning()) {
+			fPreview->Stop();
+			if (button != NULL)
+				button->SetLabel(B_TRANSLATE("Show preview"));
+		} else {
+			fPreview->Start();
+			if (button != NULL)
+				button->SetLabel(B_TRANSLATE("Pause preview"));
+		}
+		return;
+	}
+	Page::MessageReceived(message);
 }
 
 

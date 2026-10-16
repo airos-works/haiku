@@ -109,8 +109,17 @@ public:
 class CameraPage : public Page {
 public:
 								CameraPage(const MediaModel* model);
+	virtual						~CameraPage();
 
 	virtual	void				Build();
+	virtual	void				MessageReceived(BMessage* message);
+
+private:
+			void				_ReleaseCamera();
+
+			media_node			fCamera;
+			bool				fHasCamera;
+			CameraPreview*		fPreview;
 };
 
 

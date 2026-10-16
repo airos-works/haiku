@@ -53,6 +53,8 @@ public:
 	virtual	void				MessageReceived(BMessage* message);
 
 private:
+			void				_ScrollBy(float delta);
+
 			int32				fLastSelection;
 			bool				fAdjusting;
 };
