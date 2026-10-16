@@ -202,6 +202,19 @@ The laptop's frame buffer copies are slower than the X399's, so the
 single-thread path now also copies all its rects in row bands across
 them, as the worker path does.
 
+The hardware cursor, 2026-10-16 14:18: under the owner's normal use the
+laptop reported whole-screen (three-band) flushes beginning their first
+band with the scan already 170 to 570 rows down, although the thread had
+woken on time and waited for no shadow write. Timing the locks showed 1.8
+to 3.8 ms spent taking the interface's read lock and the cursor lock. The
+cause is the hardware cursor, which the X399's DCE display block does not
+offer: `AccelerantHWInterface::MoveCursorTo()` took the interface's
+*exclusive* lock for the accelerant's move hook, and Haiku's `rw_lock`
+blocks new readers while a writer waits, so every mouse move made the
+flush thread (and any window about to draw) wait for the slowest drawing
+under way. The move and show hooks are now serialized by a mutex of their
+own; setting the cursor shape keeps the exclusive lock.
+
 ### Cubie A7S, 2026-10-15 23:28 (the flush, ARM64)
 
 DisplayPort 1920x1080 at 60 Hz, `sunxi_display`'s TCON interrupt semaphore,
