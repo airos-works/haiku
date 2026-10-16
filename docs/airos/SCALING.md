@@ -101,6 +101,54 @@ buffer takes 0.43 ms instead of 1.65 (0.21 unfiltered), and GLTeapot costs
 app_server 1.30 s of CPU time per 10 s filtered, 1.19 unfiltered (1.92 with
 the old filter).
 
+**Bitmaps drawn one to one** (`BitmapPainter::_DrawAreaSampled()`). Most
+programs that draw bitmaps draw them at their own size: offscreen views
+for flicker-free drawing (Cortex, Clock, ActivityMonitor's graphs, the
+switcher), raster pictures and icons, and surfaces of programs drawn
+through the in-process Wayland server. Enlarged with the nearest pixel, the
+strokes of their text and their one pixel lines were one or two buffer
+pixels wide; with bilinear filtering they would be even but soft, the
+fuzziness programs that are not aware of the scale have on Windows and
+under Xwayland. These copies are area sampled instead: a buffer pixel takes
+the average of the bitmap pixels it covers at their exact fractional
+positions, so a pixel inside one bitmap pixel keeps its colour and only
+those on its borders are mixed (what emulators call sharp bilinear). Every
+bitmap pixel is 1.75 buffer pixels wide at 175 percent and the picture
+stays as sharp as the scale allows. Positions come from the whole bitmap on
+the desktop's grid, so redrawing part of an offscreen view gives exactly
+the pixels drawing all of it does (host tests: within 3 levels of exact
+area sampling, no difference between partial and full draws). Alpha
+blended bitmaps are mixed with their alpha applied, so transparent pixels
+add no colour. A 400 x 300 bitmap drawn one to one costs 0.40 ms at 175
+percent on the Framework 13. Programs that ask for a filter or a scale of
+their own, vector icons and `B_DEVICE_PIXEL_BITMAP` keep what they had.
+
+**GTK, Firefox and other Wayland programs** (jmgasper/wayland-server,
+branch `airos`, on X547's in-process Wayland server). The server reported
+`wl_output` scale 1 and drew every buffer one to one, so GTK and Firefox
+drew at the logical size and app_server enlarged them (pixel doubling even
+at 200 percent). It now reports the device scale rounded up (2 at 125 to
+200 percent) with the mode in pixels of that scale; GTK 3 then draws its
+buffers at twice the density (`set_buffer_scale`), and a surface covers
+its buffer size divided by the scale: one to one at 200 percent, filtered
+down at 150 and 175, as macOS draws at 2x and shrinks. Buffer damage,
+viewport sources and cursors follow the scale, and a viewport destination
+without a source (Firefox's content) is honoured. On the X399 it is in
+`/boot/system/non-packaged/lib/wayland-server-inproc.so`, ahead of
+HaikuPorts' package; programs started before a scale change keep the
+density they started with.
+
+**What the programs on the laptop and the X399 look like at 150 and 175
+percent** (October 2026, device pixel captures): native Interface Kit
+programs, preferences and Deskbar replicants are drawn at the device
+density (Terminal, Tracker, HaikuDepot, Mail, Pe, Vision, Debugger, ShowImage,
+Icon-O-Matic, Screen, Media, Network, Keymap, Bluetooth, Wi-Fi and the other
+preferences); Qt programs (Telegram, Qt6Configurator) through the Qt
+plugin; WebPositive and Summit render their pages at device density; video
+(airTime, CodyCam) is filtered; GL views (GLTeapot, GLInfo) are filtered;
+programs with offscreen views or raster pictures (Cortex, Clock, Pulse) are
+area sampled; GTK programs and Firefox draw at 2x through the server above.
+
 ## What is left
 
 - One pixel lines a program draws itself (Tracker list rows, custom views)
@@ -112,11 +160,15 @@ the old filter).
   125 and 175) still redraws the view instead of copying it; with glyphs from
   the cache that is cheap for text, less so for large images.
 - OpenGL views and other programs that draw logical-size bitmaps are still
-  enlarged (filtered, so soft rather than uneven). Programs can use
-  `BScreen::DeviceScale()` and `B_DEVICE_PIXEL_BITMAP` as the Qt plugin
-  does; a `BGLView` option to render at buffer pixels (what macOS calls
+  enlarged (GL filtered, other bitmaps area sampled: even, but with the
+  detail of the logical size). Programs can use `BScreen::DeviceScale()` and
+  `B_DEVICE_PIXEL_BITMAP` as the Qt plugin does; a `BGLView` option to
+  render at buffer pixels (what macOS calls
   `wantsBestResolutionOpenGLSurface`, SDL `SDL_WINDOW_ALLOW_HIGHDPI`) would
   let GL programs and SDL do the same.
+- The CI images still ship HaikuPorts' `wayland_server`; the scaled one is
+  installed on the X399 by hand. GTK 3 only knows whole scales, so at 125
+  percent it draws at 2x and is filtered down to 62.5 percent of that.
 
 ## Tools
 
