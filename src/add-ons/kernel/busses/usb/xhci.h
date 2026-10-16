@@ -162,6 +162,7 @@ public:
 	virtual	status_t			NotifyPipeChange(Pipe *pipe,
 									usb_change change);
 	virtual	status_t			SetKeepAwake(Device *device, bool keepAwake);
+	virtual	status_t			PlatformResetPort(uint8 index);
 
 	virtual	Device *			AllocateDevice(Hub *parent,
 									int8 hubAddress, uint8 hubPort,
