@@ -778,6 +778,11 @@ HWInterface::OutputScanLine(uint32 id, int32* _line, int32* _lines,
 float
 HWInterface::_FlushScanRow(FlushTarget& target, bigtime_t blank)
 {
+	if (blank != 0 && system_time() < blank) {
+		// before the scan starts (the flush begins a little early): the
+		// previous frame's scan, in its last rows, is above everything
+		return target.scanFrame.top - 1e6;
+	}
 	if (target.scanLineKnown != 0 && target.outputID != 0) {
 		int32 line, lines;
 		bigtime_t scanStart, period;
@@ -1498,6 +1503,12 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank, int32 which)
 		for (int32 i = 0; i < count; i++) {
 			clipping_rect r = pending.RectAtInt(i);
 			bool behind = false;
+			if (blank != 0 && r.bottom >= targetFrame.bottom - 120) {
+				// in the last rows: not before the previous frame's scan
+				// has passed them (the flush begins a little early)
+				while (system_time() < blank)
+					;
+			}
 			float scan = _FlushScanRow(target, blank);
 			if (scan > r.top) {
 				behind = true;
