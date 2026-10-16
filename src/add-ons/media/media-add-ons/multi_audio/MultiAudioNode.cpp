@@ -889,6 +889,10 @@ MultiAudioNode::SetBufferGroup(const media_source& forSource,
 		return B_MEDIA_BAD_SOURCE;
 	}
 
+	BAutolock locker(fBufferLock);
+		// the output thread fills and sends this group's buffers with the
+		// lock held
+
 	// Are we being passed the buffer group we're already using?
 	if (newGroup == channel->fBufferGroup)
 		return B_OK;
@@ -896,11 +900,10 @@ MultiAudioNode::SetBufferGroup(const media_source& forSource,
 	// Ahh, someone wants us to use a different buffer group.  At this point
 	// we delete the one we are using and use the specified one instead.
 	// If the specified group is NULL, we need to recreate one ourselves, and
-	// use *that*.  Note that if we're caching a BBuffer that we requested
-	// earlier, we have to Recycle() that buffer *before* deleting the buffer
-	// group, otherwise we'll deadlock waiting for that buffer to be recycled!
+	// use *that*.
 	delete channel->fBufferGroup;
-		// waits for all buffers to recycle
+		// deletes the buffers and their areas at once, without waiting for
+		// them to be recycled
 	if (newGroup != NULL) {
 		// we were given a valid group; just use that one from now on
 		channel->fBufferGroup = newGroup;
@@ -1017,8 +1020,11 @@ MultiAudioNode::Connect(status_t error, const media_source& source,
 	// a buffer group (via SetBufferGroup()) prior to this.  That can happen,
 	// for example, if the consumer calls SetOutputBuffersFor() on us from
 	// within its Connected() method.
-	if (channel->fBufferGroup == NULL)
-		_AllocateBuffers(*channel);
+	{
+		BAutolock locker(fBufferLock);
+		if (channel->fBufferGroup == NULL)
+			_AllocateBuffers(*channel);
+	}
 
 	_StartOutputThreadIfNeeded();
 }
@@ -1041,6 +1047,8 @@ MultiAudioNode::Disconnect(const media_source& what,
 	// Make sure that our connection is the one being disconnected
 	if (where == channel->fOutput.destination
 		&& what == channel->fOutput.source) {
+		BAutolock locker(fBufferLock);
+			// the output thread may be filling one of the group's buffers
 		channel->fOutput.destination = media_destination::null;
 		channel->fOutput.format = channel->fPreferredFormat;
 		delete channel->fBufferGroup;
