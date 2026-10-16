@@ -18,13 +18,16 @@ class ASInterfaceDescriptor {
 public:
 							ASInterfaceDescriptor(
 								usb_audio_streaming_interface_descriptor*
-								Descriptor);
+								Descriptor, bool isUAC2);
 							~ASInterfaceDescriptor();
 
 // protected:
 			uint8			fTerminalLink;
 			uint8			fDelay;
 			uint16			fFormatTag;
+				// for USB Audio 2.0 the R1 tag of its format, if it has one
+			uint8			fNumChannels;
+				// USB Audio 2.0 only: R1 has it in the format descriptor
 };
 
 
@@ -33,7 +36,7 @@ public:
 							ASEndpointDescriptor(
 								usb_endpoint_descriptor* Endpoint,
 								usb_audio_streaming_endpoint_descriptor*
-								Descriptor);
+								Descriptor, bool isUAC2);
 							~ASEndpointDescriptor();
 
 // protected:
@@ -43,6 +46,13 @@ public:
 			uint16			fMaxPacketSize;
 			uint8			fEndpointAddress;
 			uint8			fEndpointAttributes;
+			uint8			fInterval;
+
+			// the explicit feedback endpoint of an asynchronous output
+			// stream, if the alternate has one
+			uint8			fFeedbackAddress;
+			uint16			fFeedbackMaxPacketSize;
+			uint8			fFeedbackInterval;
 };
 
 
@@ -62,10 +72,12 @@ public:
 class TypeIFormatDescriptor : public _ASFormatDescriptor {
 public:
 							TypeIFormatDescriptor(
-								usb_audio_format_descriptor* Descriptor);
+								usb_audio_format_descriptor* Descriptor,
+								bool isUAC2 = false);
 	virtual					~TypeIFormatDescriptor();
 
 			status_t		Init(usb_audio_format_descriptor* Descriptor);
+			void			SetSampleFrequencies(const Vector<uint32>& rates);
 
 // protected:
 			uint8			fNumChannels;
@@ -141,6 +153,7 @@ public:
 	//		status_t			InitCheck() { return fStatus; }
 			uint8				TerminalLink();
 			bool				IsInput() { return fIsInput; }
+			bool				IsUAC2() { return fIsUAC2; }
 
 			AudioChannelCluster* ChannelCluster();
 
@@ -152,6 +165,7 @@ protected:
 
 	//		status_t			fStatus;
 			bool				fIsInput;
+			bool				fIsUAC2;
 		// alternates of the streams
 			Vector<AudioStreamAlternate*>	fAlternates;
 			size_t				fActiveAlternate;

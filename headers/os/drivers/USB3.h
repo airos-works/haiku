@@ -275,6 +275,27 @@ typedef struct usb_keep_awake_args {
 	bool		keep_awake;
 } usb_keep_awake_args;
 
+/*
+ * usb_ioctl() opcode: the speed a device runs at, one of the
+ * B_USB_DEVICE_SPEED_* below. (A high-speed device's isochronous endpoints
+ * count their interval in 125 us microframes, a full-speed one's in 1 ms
+ * frames.)
+ */
+#define	B_USB_GET_DEVICE_SPEED		'gspd'
+
+enum {
+	B_USB_DEVICE_SPEED_LOW = 0,
+	B_USB_DEVICE_SPEED_FULL,
+	B_USB_DEVICE_SPEED_HIGH,
+	B_USB_DEVICE_SPEED_SUPER,
+	B_USB_DEVICE_SPEED_SUPER_PLUS
+};
+
+typedef struct usb_device_speed_args {
+	usb_device	device;
+	uint32		speed;
+} usb_device_speed_args;
+
 
 #ifdef __cplusplus
 }

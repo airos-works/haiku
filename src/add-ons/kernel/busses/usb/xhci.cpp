@@ -1633,7 +1633,7 @@ XHCI::SubmitNormalRequest(Transfer *transfer)
 			return status;
 		}
 		WriteDescriptor(td, transfer->Vector(),
-			transfer->VectorCount(), transfer->IsPhysical());
+			transfer->VectorCount(), transfer->IsPhysical(), isochronousData);
 	}
 
 	td->transfer = transfer;
@@ -1815,7 +1815,7 @@ XHCI::CheckDebugTransfer(Transfer *transfer)
 
 		if (status == B_OK && directionIn && !_DirectPhysical(transfer)) {
 			ReadDescriptor(td, transfer->Vector(), transfer->VectorCount(),
-				transfer->IsPhysical());
+				transfer->IsPhysical(), transfer->IsochronousData());
 		}
 
 		FreeDescriptor(td);
@@ -2085,32 +2085,70 @@ XHCI::FreeDescriptor(xhci_td *descriptor)
 }
 
 
-size_t
-XHCI::WriteDescriptor(xhci_td *descriptor, generic_io_vec *vector, size_t vectorCount, bool physical)
+/*!	Copies between a transfer's vectors and its descriptor's buffers, one
+	buffer filled after the other. An isochronous transfer has a buffer per
+	packet instead, each holding that packet's request length: its data is
+	the packets back to back, as the other controllers take it. (Filling
+	each buffer to the largest packet put the start of the next packet into
+	a shorter one, and the data of a stream of 44 and 45 sample packets
+	went out of step.)
+*/
+static size_t
+copy_descriptor_data(xhci_td* descriptor, generic_io_vec* vector,
+	size_t vectorCount, bool physical,
+	const usb_isochronous_data* isochronous, bool toBuffers)
 {
-	size_t written = 0;
+	size_t bufferCount = descriptor->buffer_count;
+	if (isochronous != NULL)
+		bufferCount = min_c(bufferCount, isochronous->packet_count);
 
+	// what goes into buffer index
+	auto bufferSize = [&](size_t index) -> size_t {
+		if (isochronous == NULL)
+			return descriptor->buffer_size;
+		return min_c(descriptor->buffer_size,
+			(size_t)isochronous->packet_descriptors[index].request_length);
+	};
+
+	size_t copied = 0;
 	size_t bufIdx = 0, bufUsed = 0;
 	for (size_t vecIdx = 0; vecIdx < vectorCount; vecIdx++) {
 		size_t length = vector[vecIdx].length;
 
-		while (length > 0 && bufIdx < descriptor->buffer_count) {
-			size_t toCopy = min_c(length, descriptor->buffer_size - bufUsed);
-			status_t status = generic_memcpy(
-				(generic_addr_t)descriptor->buffers[bufIdx] + bufUsed, false,
-				vector[vecIdx].base + (vector[vecIdx].length - length), physical,
-				toCopy);
-			ASSERT_ALWAYS(status == B_OK);
+		while (length > 0 && bufIdx < bufferCount) {
+			size_t bufSize = bufferSize(bufIdx);
+			size_t toCopy = min_c(length, bufSize - bufUsed);
+			if (toCopy > 0) {
+				generic_addr_t buffer
+					= (generic_addr_t)descriptor->buffers[bufIdx] + bufUsed;
+				generic_addr_t data = vector[vecIdx].base
+					+ (vector[vecIdx].length - length);
+				status_t status = toBuffers
+					? generic_memcpy(buffer, false, data, physical, toCopy)
+					: generic_memcpy(data, physical, buffer, false, toCopy);
+				ASSERT_ALWAYS(status == B_OK);
+			}
 
-			written += toCopy;
+			copied += toCopy;
 			bufUsed += toCopy;
 			length -= toCopy;
-			if (bufUsed == descriptor->buffer_size) {
+			if (bufUsed == bufSize) {
 				bufIdx++;
 				bufUsed = 0;
 			}
 		}
 	}
+
+	return copied;
+}
+
+
+size_t
+XHCI::WriteDescriptor(xhci_td *descriptor, generic_io_vec *vector, size_t vectorCount, bool physical,
+	const usb_isochronous_data* isochronous)
+{
+	size_t written = copy_descriptor_data(descriptor, vector, vectorCount,
+		physical, isochronous, true);
 
 	TRACE("wrote descriptor (%" B_PRIuSIZE " bytes)\n", written);
 	return written;
@@ -2118,30 +2156,11 @@ XHCI::WriteDescriptor(xhci_td *descriptor, generic_io_vec *vector, size_t vector
 
 
 size_t
-XHCI::ReadDescriptor(xhci_td *descriptor, generic_io_vec *vector, size_t vectorCount, bool physical)
+XHCI::ReadDescriptor(xhci_td *descriptor, generic_io_vec *vector, size_t vectorCount, bool physical,
+	const usb_isochronous_data* isochronous)
 {
-	size_t read = 0;
-
-	size_t bufIdx = 0, bufUsed = 0;
-	for (size_t vecIdx = 0; vecIdx < vectorCount; vecIdx++) {
-		size_t length = vector[vecIdx].length;
-
-		while (length > 0 && bufIdx < descriptor->buffer_count) {
-			size_t toCopy = min_c(length, descriptor->buffer_size - bufUsed);
-			status_t status = generic_memcpy(
-				vector[vecIdx].base + (vector[vecIdx].length - length), physical,
-				(generic_addr_t)descriptor->buffers[bufIdx] + bufUsed, false, toCopy);
-			ASSERT_ALWAYS(status == B_OK);
-
-			read += toCopy;
-			bufUsed += toCopy;
-			length -= toCopy;
-			if (bufUsed == descriptor->buffer_size) {
-				bufIdx++;
-				bufUsed = 0;
-			}
-		}
-	}
+	size_t read = copy_descriptor_data(descriptor, vector, vectorCount,
+		physical, isochronous, false);
 
 	TRACE("read descriptor (%" B_PRIuSIZE " bytes)\n", read);
 	return read;
@@ -3910,7 +3929,8 @@ XHCI::FinishTransfers()
 				status_t status = transfer->PrepareKernelAccess();
 				if (status == B_OK) {
 					ReadDescriptor(td, transfer->Vector(),
-						transfer->VectorCount(), transfer->IsPhysical());
+						transfer->VectorCount(), transfer->IsPhysical(),
+						transfer->IsochronousData());
 				} else {
 					callbackStatus = status;
 				}
