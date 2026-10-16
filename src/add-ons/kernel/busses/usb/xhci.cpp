@@ -1111,7 +1111,9 @@ XHCI::_SuspendToIdle()
 	// A SuperSpeed hub does not take the devices behind it along into U3 and
 	// back, as a USB 2 hub does: they would have to be suspended through
 	// the hub first, one by one. Until the stack can, ports with one stay up.
+	// So do the ports of devices whose drivers asked to keep them awake.
 	bool superSpeedHub[XHCI_MAX_PORTS] = {};
+	bool keepAwake[XHCI_MAX_PORTS] = {};
 	for (int32 slot = 1; slot < XHCI_MAX_DEVICES; slot++) {
 		xhci_device* device = &fDevices[slot];
 		if (device->slot == 0 || device->input_ctx == NULL)
@@ -1120,11 +1122,14 @@ XHCI::_SuspendToIdle()
 		uint32 dwslot0 = _ReadContext(&device->input_ctx->slot.dwslot0);
 		uint32 rhPort = SLOT_1_RH_PORT_GET(
 			_ReadContext(&device->input_ctx->slot.dwslot1));
+		if (rhPort < 1 || rhPort > fPortCount)
+			continue;
 		if ((dwslot0 & SLOT_0_HUB_BIT) != 0 && SLOT_0_ROUTE_GET(dwslot0) == 0
-			&& SLOT_0_SPEED_GET(dwslot0) >= 4 && rhPort >= 1
-			&& rhPort <= fPortCount) {
+			&& SLOT_0_SPEED_GET(dwslot0) >= 4) {
 			superSpeedHub[rhPort - 1] = true;
 		}
+		if (device->keep_awake)
+			keepAwake[rhPort - 1] = true;
 	}
 
 	int32 suspendedPorts = 0;
@@ -1135,6 +1140,11 @@ XHCI::_SuspendToIdle()
 		if (superSpeedHub[i]) {
 			TRACE_ALWAYS("port %" B_PRIu8 " has a SuperSpeed hub, not "
 				"suspending it\n", i);
+			continue;
+		}
+		if (keepAwake[i]) {
+			TRACE_ALWAYS("port %" B_PRIu8 " is kept awake by its driver\n",
+				i);
 			continue;
 		}
 
@@ -1824,6 +1834,23 @@ XHCI::CancelDebugTransfer(Transfer *transfer)
 {
 	while (CheckDebugTransfer(transfer) == B_DEV_PENDING)
 		spin(100);
+}
+
+
+/*!	A device whose driver powered part of it down (a network adapter's
+	PHY) keeps its root port out of U3 in a suspend to idle: in U3 the device
+	may power it up again on its own. The controller still halts: a
+	SuperSpeed link just stays in U0, idle.
+*/
+status_t
+XHCI::SetKeepAwake(Device *usbDevice, bool keepAwake)
+{
+	xhci_device* device = (xhci_device*)usbDevice->ControllerCookie();
+	if (device == NULL || device->slot == 0)
+		return B_BAD_VALUE;
+
+	device->keep_awake = keepAwake;
+	return B_OK;
 }
 
 

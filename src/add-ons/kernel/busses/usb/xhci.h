@@ -130,6 +130,9 @@ struct xhci_device {
 	struct xhci_device_ctx *device_ctx;
 
 	xhci_endpoint endpoints[XHCI_MAX_ENDPOINTS - 1];
+
+	bool keep_awake;
+		// its driver wants its root port kept out of U3 in a suspend to idle
 };
 
 
@@ -158,6 +161,7 @@ public:
 
 	virtual	status_t			NotifyPipeChange(Pipe *pipe,
 									usb_change change);
+	virtual	status_t			SetKeepAwake(Device *device, bool keepAwake);
 
 	virtual	Device *			AllocateDevice(Hub *parent,
 									int8 hubAddress, uint8 hubPort,

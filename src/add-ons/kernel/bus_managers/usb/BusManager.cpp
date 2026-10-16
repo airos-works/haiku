@@ -319,6 +319,14 @@ BusManager::NotifyPipeChange(Pipe *pipe, usb_change change)
 }
 
 
+status_t
+BusManager::SetKeepAwake(Device *device, bool keepAwake)
+{
+	// overridden by the controllers that suspend their ports
+	return B_NOT_SUPPORTED;
+}
+
+
 ControlPipe *
 BusManager::_GetDefaultPipe(usb_speed speed)
 {

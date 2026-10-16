@@ -13,4 +13,4 @@ Application power_daemon :
 	thermal_trip_monitor.cpp
 	;
 
-LinkAgainst power_daemon : be [ TargetLibstdc++ TargetLibsupc++ ] ;
+LinkAgainst power_daemon : be bnetapi [ TargetLibstdc++ TargetLibsupc++ ] ;

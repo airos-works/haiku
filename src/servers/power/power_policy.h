@@ -7,6 +7,9 @@
 
 
 #include <Locker.h>
+#include <NetworkAddress.h>
+#include <ObjectList.h>
+#include <String.h>
 #include <SupportDefs.h>
 
 
@@ -38,10 +41,21 @@ private:
 				kLidSleep
 			};
 
+			struct sleeping_interface {
+				BString			name;
+				BNetworkAddress	gateway;
+					// its default route, unset when it had none
+			};
+			typedef BObjectList<sleeping_interface, true> InterfaceList;
+
 			void				_ApplyProfile();
 			bool				_InitGUI();
 			bool				_Sleep();
 			bool				_WaitForLidOpen(bigtime_t timeout);
+			void				_TakeDownWiredInterfaces(
+									InterfaceList& _interfaces);
+			void				_BringUpInterfaces(
+									const InterfaceList& interfaces);
 
 			BServer*			fServer;
 			BLocker				fLock;
@@ -58,8 +72,8 @@ private:
 			lid_action			fLidAction;
 			int32				fSleepCheck;
 				// seconds: a sleeping machine wakes up this often to see
-				// whether its lid was opened (should the wake-up have been
-				// missed), 0 never
+				// whether its lid was opened, 0 never (the default: the kernel
+				// looks at the lid whenever the firmware interrupts the sleep)
 
 			float				fACBrightness;
 				// what it was on AC, restored when plugged in again

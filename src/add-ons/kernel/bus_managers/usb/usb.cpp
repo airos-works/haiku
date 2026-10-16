@@ -518,6 +518,19 @@ usb_ioctl(uint32 opcode, void *buffer, size_t bufferSize)
 			return device->BuildDeviceName((char *)buffer, &index,
 				bufferSize, NULL);
 		}
+
+		case B_USB_KEEP_AWAKE: {
+			if (buffer == NULL || bufferSize != sizeof(usb_keep_awake_args))
+				return B_BAD_VALUE;
+			usb_keep_awake_args *args = (usb_keep_awake_args *)buffer;
+			BReference<Object> object(gUSBStack->GetObject(args->device),
+				true);
+			if (!object.IsSet() || (object->Type() & USB_OBJECT_DEVICE) == 0)
+				return B_BAD_VALUE;
+			Device *device = (Device *)object.Get();
+			return device->GetBusManager()->SetKeepAwake(device,
+				args->keep_awake);
+		}
 	}
 
 	return B_DEV_INVALID_IOCTL;

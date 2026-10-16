@@ -2509,6 +2509,29 @@ device_manager_clear_suspend_trace()
 }
 
 
+static int32 sWakeupEvents;
+
+
+/*!	Drivers report what wakes the system from a suspend to idle: a power or
+	sleep button pressed, a lid opened. The firmware interrupts the sleep for
+	other reasons as well; the system only wakes up when an event was
+	reported meanwhile. Can be called from interrupt handlers.
+*/
+void
+device_manager_wakeup_event(const char* source)
+{
+	atomic_add(&sWakeupEvents, 1);
+	device_manager_suspend_trace("wakeup event: %s", source);
+}
+
+
+int32
+device_manager_wakeup_events()
+{
+	return atomic_get(&sWakeupEvents);
+}
+
+
 size_t
 device_manager_get_suspend_trace(char* buffer, size_t size)
 {
