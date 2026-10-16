@@ -14,6 +14,8 @@
 #include "HWInterface.h"
 
 #include <AutoDeleter.h>
+#include <Autolock.h>
+#include <Locker.h>
 #include <image.h>
 #include <video_overlay.h>
 
@@ -162,6 +164,10 @@ private:
 
 			// what the accelerant shows, while it shows the cursor
 			ServerCursorReference	fHardwareCursor;
+			// serializes the cursor hooks among themselves: a move takes no
+			// exclusive lock, which would block the drawing threads and the
+			// vertical blank flush behind every mouse move
+			BLocker				fCursorHookLock;
 
 			// dpms hooks
 			dpms_capabilities	fAccDPMSCapabilities;
