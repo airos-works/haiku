@@ -2168,6 +2168,18 @@ device_node::UninitUnusedDriver()
 void
 device_node::DeviceRemoved()
 {
+	if ((fFlags & NODE_FLAG_DEVICE_REMOVED) != 0) {
+		// Already done. A node whose driver was still in use survived its
+		// own removal (unregister_node() returned B_BUSY), and its parent is
+		// being removed now - a USB hub's node is unregistered after the
+		// nodes of the devices behind it, and reaches the survivors again
+		// through its children. Their drivers were notified the first time,
+		// and the references they still hold belong to them: dropping the
+		// creation reference a second time deleted the node under its open
+		// device (the free then ran again inside the destructor).
+		return;
+	}
+
 	// notify children
 	NodeList::ConstIterator iterator = Children().GetIterator();
 	while (iterator.HasNext()) {
