@@ -559,6 +559,8 @@ Desktop::Init()
 		}
 	}
 
+	_PublishDeviceScale();
+
 	// Restore brightness
 	{
 		Screen* screen = fVirtualScreen.ScreenAt(0);
@@ -1696,6 +1698,16 @@ Desktop::_CopyWindowApproximately(Window* window, BRegion& copyRegion,
 	copyRegion = valid;
 	window->SetContentApproximate(true);
 	return true;
+}
+
+
+/*!	Tells the applications, through the memory they share with us, how
+	many frame buffer pixels a coordinate unit is (BScreen::DeviceScale()).
+*/
+void
+Desktop::_PublishDeviceScale()
+{
+	fServerReadOnlyMemory->device_scale = HWInterface()->RenderScaleFactor();
 }
 
 
@@ -3858,10 +3870,12 @@ Desktop::_ScreenChanged(Screen* screen)
 	_TriggerWindowRedrawing(dirty, dirty);
 
 	// send B_SCREEN_CHANGED to windows on that screen
+	_PublishDeviceScale();
 	BMessage update(B_SCREEN_CHANGED);
 	update.AddInt64("when", real_time_clock_usecs());
 	update.AddRect("frame", screen->Frame());
 	update.AddInt32("mode", screen->ColorSpace());
+	update.AddFloat("device scale", fServerReadOnlyMemory->device_scale);
 
 	fVirtualScreen.UpdateFrame();
 

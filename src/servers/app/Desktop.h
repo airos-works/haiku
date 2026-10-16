@@ -346,6 +346,7 @@ private:
 									const DisplayLayout& before,
 									const DisplayLayout& after);
 			void				_SetCurrentWorkspaceConfiguration();
+			void				_PublishDeviceScale();
 			bool				_CopyWindowApproximately(Window* window,
 									BRegion& copyRegion, float x, float y);
 			void				_SetWorkspace(int32 index,

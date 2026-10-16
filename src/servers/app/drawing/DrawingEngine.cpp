@@ -735,7 +735,10 @@ DrawingEngine::DrawBitmap(ServerBitmap* bitmap, const BRect& bitmapRect,
 {
 	ASSERT_PARALLEL_LOCKED();
 
-	BRect clipped = fPainter->TransformAndClipRect(viewRect);
+	BRect clipped = (options & B_DEVICE_PIXEL_BITMAP) != 0
+			&& fPainter->HasIdentityViewTransform()
+		? fPainter->ClipRect(fPainter->DeviceBitmapRect(bitmapRect, viewRect))
+		: fPainter->TransformAndClipRect(viewRect);
 	bool waitForRetrace = (options & B_WAIT_FOR_RETRACE) != 0;
 	if (waitForRetrace && !fGraphicsCard->IsDoubleBuffered()
 		&& clipped.IsValid()) {

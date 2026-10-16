@@ -25,6 +25,7 @@
 #include <OptionPopUp.h>
 #include <PopUpMenu.h>
 #include <RadioButton.h>
+#include <Screen.h>
 #include <ScrollView.h>
 #include <Slider.h>
 #include <StatusBar.h>
@@ -36,6 +37,7 @@
 #include <View.h>
 #include <Window.h>
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -130,6 +132,19 @@ public:
 		DrawBitmap(&fBitmap, fBitmap.Bounds(), BRect(355, 55, 386, 86));
 		DrawBitmap(&fBitmap, fBitmap.Bounds(), BRect(330, 95, 353, 118),
 			B_FILTER_BITMAP_BILINEAR);
+
+		// a checkerboard of single frame buffer pixels, drawn one to one
+		float scale = BScreen().DeviceScale();
+		int32 size = (int32)ceilf(40 * scale);
+		BBitmap device(BRect(0, 0, size - 1, size - 1), B_RGB32);
+		uint32* bits = (uint32*)device.Bits();
+		int32 stride = device.BytesPerRow() / 4;
+		for (int32 y = 0; y < size; y++) {
+			for (int32 x = 0; x < size; x++)
+				bits[y * stride + x] = (x + y) % 2 == 0 ? 0xff000000 : 0xffffffff;
+		}
+		DrawBitmap(&device, device.Bounds(), BRect(365, 95, 404, 134),
+			B_DEVICE_PIXEL_BITMAP);
 	}
 
 private:
