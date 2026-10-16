@@ -59,6 +59,7 @@ private:
 			Page*				fPage;
 			BString				fPageKey;
 			BString				fWantedKey;
+			BString				fPendingKey;
 			BButton*			fRestartButton;
 
 			MediaModel			fModel;

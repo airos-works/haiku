@@ -201,6 +201,8 @@ Page::Page(const char* key, glyph_kind glyph, rgb_color color,
 	titleFont.SetSize(ceilf(titleFont.Size() * 1.4f));
 	fTitle = new TitleView(title, titleFont, false);
 	fSubtitle = new TitleView(subtitle, *be_plain_font, true);
+	if (subtitle == NULL || subtitle[0] == '\0')
+		fSubtitle->Hide();
 
 	fContent = new BGroupView(B_VERTICAL, B_USE_DEFAULT_SPACING);
 	fContent->GroupLayout()->SetInsets(B_USE_WINDOW_SPACING,

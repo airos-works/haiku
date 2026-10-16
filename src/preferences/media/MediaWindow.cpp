@@ -24,8 +24,10 @@
 #include <LayoutBuilder.h>
 #include <MediaRoster.h>
 #include <MessageRunner.h>
+#include <LaunchRoster.h>
 #include <Path.h>
 #include <PropertyInfo.h>
+#include <Roster.h>
 #include <ScrollView.h>
 #include <SeparatorView.h>
 
@@ -55,6 +57,7 @@ static property_info sProperties[] = {
 };
 
 
+static const char* kMediaServerJob = "x-vnd.haiku-media_server";
 static const char* kRestartPageKey = "restarting";
 static const char* kServerPageKey = "server";
 
@@ -236,8 +239,10 @@ MediaWindow::MessageReceived(BMessage* message)
 		case kMsgSidebarSelection:
 		{
 			const char* key;
-			if (message->FindString("key", &key) == B_OK)
+			if (message->FindString("key", &key) == B_OK) {
+				fPendingKey = "";
 				_ShowPage(key);
+			}
 			break;
 		}
 
@@ -333,6 +338,28 @@ MediaWindow::MessageReceived(BMessage* message)
 			}
 			fRestartButton->SetEnabled(true);
 			fServerRunning = BMediaRoster::IsRunning();
+
+			status_t status = B_OK;
+			message->FindInt32("status", &status);
+			if (!fServerRunning) {
+				MessagePage* page = dynamic_cast<MessagePage*>(fPage);
+				if (fPageKey != kServerPageKey || page == NULL) {
+					_ShowServerDown();
+					page = dynamic_cast<MessagePage*>(fPage);
+				}
+				BString text(B_TRANSLATE("The media services could not be "
+					"started: %error%."));
+				text.ReplaceFirst("%error%", strerror(status != B_OK
+					? status : B_ERROR));
+				if (page != NULL)
+					page->SetText(text);
+				break;
+			}
+
+			if (!fWatching) {
+				BMediaRoster::Roster();
+				_StartWatching();
+			}
 			if (fPage != NULL) {
 				fPage->RemoveSelf();
 				delete fPage;
@@ -460,6 +487,13 @@ MediaWindow::_Rescan(bool force)
 	fModel = model;
 	_RebuildSidebar();
 
+	if (!fPendingKey.IsEmpty() && fPageKey == "output"
+		&& fModel.DeviceFor(fPendingKey) != NULL) {
+		BString key(fPendingKey);
+		_ShowPage(key);
+		return;
+	}
+
 	if (showPage) {
 		_ShowPage(fWantedKey);
 		return;
@@ -549,10 +583,15 @@ MediaWindow::_ShowPage(const char* key)
 
 	Page* page = _CreatePage(key);
 	if (page == NULL) {
+		// A device that is not (yet) there, as right after the services
+		// started: show it when it comes, unless another page is chosen.
+		if (BString(key).StartsWith("device:"))
+			fPendingKey = key;
 		page = _CreatePage("output");
 		if (page == NULL)
 			return;
-	}
+	} else
+		fPendingKey = "";
 
 	if (fPage != NULL) {
 		fPage->RemoveSelf();
@@ -680,9 +719,28 @@ MediaWindow::_RestartThread(void* data)
 
 	if (BMediaRoster::IsRunning())
 		shutdown_media_server(B_INFINITE_TIMEOUT, &_RestartProgress, window);
-	launch_media_server(B_INFINITE_TIMEOUT, &_RestartProgress, window);
+	status_t status = launch_media_server(B_INFINITE_TIMEOUT,
+		&_RestartProgress, window);
+	if (status != B_OK && status != B_ALREADY_RUNNING) {
+		// launch_media_server() needs a media roster, which an application
+		// started without the media services does not get; and
+		// "launch_roster stop" disabled the job as well.
+		BLaunchRoster launchRoster;
+		launchRoster.SetEnabled(kMediaServerJob, true);
+		status = launchRoster.Start(kMediaServerJob);
+	}
+	if (status == B_ALREADY_RUNNING)
+		status = B_OK;
 
-	window->PostMessage(kMsgRestartDone);
+	// the add-on server registers its devices a moment later
+	for (int i = 0; status == B_OK && i < 50 && !BMediaRoster::IsRunning();
+			i++) {
+		snooze(100000);
+	}
+
+	BMessage done(kMsgRestartDone);
+	done.AddInt32("status", status);
+	window->PostMessage(&done);
 	return B_OK;
 }
 

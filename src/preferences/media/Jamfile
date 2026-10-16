@@ -6,7 +6,7 @@ if ! [ FIsBuildFeatureEnabled fluidlite ] {
 	return ;
 }
 
-UsePrivateHeaders media midi shared ;
+UsePrivateHeaders app media midi shared ;
 
 Application Media :
 	Cards.cpp
