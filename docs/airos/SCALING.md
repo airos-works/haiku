@@ -1,0 +1,112 @@
+# Fractional scaling
+
+air/OS draws the whole desktop at one density, the render scale
+(`HWInterface::RenderScale()`, 100 to 250 percent in 25 percent steps): every
+logical coordinate is multiplied by it on its way into the frame buffer, and
+monitors that want less are shrunk by the display engine. Whole scales are
+easy: every logical pixel is two buffer pixels at 200 percent. At 125, 150
+and 175 percent a logical pixel is one buffer pixel in some places and two in
+others (`floor(x * scale)` is where pixel `x` starts), which is where the
+problems of October 2026 came from. This note says what other systems do,
+what air/OS does now and why.
+
+## What others do
+
+| | Text | Thin lines and frames | Programs that render their own pixels |
+|---|---|---|---|
+| macOS | renders everything at 2x (`backingScaleFactor` is only ever 1 or 2) and the window server shrinks the frame to the panel (a 1.5x look renders 1.78 times the panel's pixels). No hinting; subpixel anti-aliasing removed in 10.14 | uniform, as the 2x picture is shrunk as a whole, but soft | at 2x, then shrunk |
+| Wayland (fractional-scale-v1 + viewporter) | clients render at the exact scale into buffers of physical pixels. GTK 4.16: grey anti-aliasing, slight hinting, unhinted metrics, glyph origins on quarter pixels horizontally and whole pixels vertically | GTK leaves borders unsnapped (anti-aliased) by default; 4.24 can snap per edge on request. Qt snaps nothing (QTBUG-86344) | X11 programs under Xwayland are enlarged (blurry) unless the toolkit scales itself (KWin's "apply scaling themselves") |
+| Chromium | slight hinting is turned off and glyphs are positioned on subpixels at any device scale above 1 | box edges round to the nearest device pixel; border widths are floored to whole device pixels (1 px at 125-175 percent) | n/a |
+| Windows | DirectWrite: vertical-only grid fitting, subpixel positions | WPF/WinUI layout rounding: border thickness rounded to whole pixels (2 px at 150 and 175 percent) | programs that are not DPI aware are stretched (blurry) |
+
+The common ground: grey anti-aliasing at high density, vertical-only hinting
+with unhinted advances, glyphs on whole device pixels vertically, lines of
+whole device pixels, and real pixels for programs that render their own.
+
+## What air/OS does
+
+**Text** (`ServerFont::IsDeviceScaled()`, `FontEngine`, `Painter::_DeviceBaseLine()`).
+Programs measure at the logical size without hinting. The Painter renders
+the same string with a font that many times larger, hinted vertically only
+(`FT_LOAD_TARGET_LIGHT`) at the exact fractional pixel size, with unhinted
+advances, so the string is as wide as measured. Its glyphs come from the
+glyph cache as bitmaps (before, every glyph was rasterized from its outline:
+a text view redraw took 5 to 7 ms in QEMU at 150 to 200 percent, now about
+1 ms). The base line goes on the top edge of the pixel row where filled
+rectangles put it; before it fell between rows at 125, 150 and 175 percent
+and blurred every horizontal stroke.
+
+**Anti-aliasing.** On a scaled desktop subpixel anti-aliasing is off for text
+and shapes (`subpixel_antialiasing_active()`): most edges fall between pixels
+there, where the colour stripes turned into fringes on round rectangles,
+circles and text, and the buffer's pixels are not always the panel's.
+
+**Frames** (`AS_STROKE_FRAME_LINEARRAY`, `HaikuControlLook::FrameLines`). Each
+one pixel ring drawn alone is one or two buffer pixels thick depending on
+where it falls, so a button's outline was 2 px on one side and 1 px on the
+other. Nothing in app_server can fix that alone: rings and fills are separate
+calls in logical pixels, and the next ring or the child view starts where
+the grid says. The control look therefore sends the rings of a frame
+together, with the band they cover. app_server keeps the band's outer and
+inner edges on the grid, so everything around and inside still meets it,
+and shares out its pixels the same way on every side: the dark outline gets
+the scale rounded (2 px at 150 and 175 percent), the faint edge outside it
+what is left. Two logical pixels are always three buffer pixels at 150
+percent, so there outline and edge come out the same on all four sides of
+every button, text control, check box, scroll view and menu field. Bevels
+are drawn over their surface, which is filled first, and keep their width.
+Lines a program draws itself keep the grid (one or two pixels).
+
+**Translucent lines** (`B_OP_ALPHA`, blended frames) cover whole buffer pixels
+like opaque ones instead of being rasterized between pixels.
+
+**Moving windows** (`Desktop::_CopyWindowApproximately()`). Most one pixel
+moves are a fraction of a buffer pixel at fractional scales, and a copy can
+only move whole pixels, so a dragged window used to be redrawn by its
+program at every step. While the user drags, the content now moves by the
+whole number of pixels its frame moves, a band of two logical pixels along
+the edges of the copy is redrawn, and the window is redrawn once when the
+drag ends. A 300 step drag in QEMU at 150 percent: app_server 1525 ms and the
+program 829 ms of CPU time before, 263 and 20 ms now.
+
+**Programs that render their own pixels.** `BScreen::DeviceScale()` says how
+many buffer pixels a coordinate unit is (from the memory app_server shares
+with applications; `B_SCREEN_CHANGED` carries it as `"device scale"`). A
+bitmap drawn with `B_DEVICE_PIXEL_BITMAP` holds buffer pixels and is drawn one
+to one from the buffer pixel the destination's top left corner falls on.
+The Qt platform plugin (jmgasper/qt6-haikuplugins, branch `airos`, packaged
+as qt6_base 6.10.3-103) reports the scale as the device pixel ratio, keeps
+its backing store at that density and draws it this way, and uses grey,
+vertically hinted text there. Qt programs such as Telegram were rendered at
+the logical size and enlarged before, which made them fuzzy at any scale.
+
+## What is left
+
+- One pixel lines a program draws itself (Tracker list rows, custom views)
+  are still one or two buffer pixels thick depending on where they fall;
+  only the control look knows which lines belong together.
+- Tabs, sliders and scroll bar parts draw their rings with different border
+  sets and are not grouped yet.
+- Scrolling by an odd number of logical pixels at 150 percent (most steps at
+  125 and 175) still redraws the view instead of copying it; with glyphs from
+  the cache that is cheap for text, less so for large images.
+- OpenGL views and other programs that draw logical-size bitmaps are still
+  enlarged; they can use `BScreen::DeviceScale()` and
+  `B_DEVICE_PIXEL_BITMAP` as the Qt plugin does.
+
+## Tools
+
+`docs/airos/scaling` (cross-build with `build-test.sh <name>`):
+
+- `gallery [x y] [--quit-after s]`: standard controls and primitives,
+  including a checkerboard of single buffer pixels drawn with
+  `B_DEVICE_PIXEL_BITMAP`;
+- `devshot file.png [x y w h]`: the screen in buffer pixels (the screenshot
+  APIs average a scaled desktop down to its logical size);
+- `scalebench [n]`: text view and window redraws, moves and scrolls;
+- `teamtime [name]`: a team's CPU time so far, for drag tests.
+
+A QEMU loop: boot the CI x86_64 image with the new `haiku.hpkg` swapped in
+with `bfs_shell --start-offset 6291456`, set `screenmode -q 1920 1080 32`,
+then `screenmode --display 1 --scale 150`, and use QMP `screendump` or
+`devshot`. The live image keeps nothing across a reboot.
