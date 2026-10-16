@@ -236,6 +236,9 @@ virtual	status_t						CancelQueuedTransfers(Pipe *pipe,
 virtual	status_t						NotifyPipeChange(Pipe *pipe,
 											usb_change change);
 
+virtual	status_t						SetKeepAwake(Device *device,
+											bool keepAwake);
+
 		Object *						RootObject() const
 											{ return fRootObject; }
 
