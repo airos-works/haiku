@@ -10,6 +10,10 @@
 
 #include <vector>
 
+#include "HardwareCaps.h"
+#include "LavcVideoEncoder.h"
+#include "SoftwareEncoders.h"
+
 
 static std::vector<Preset>* sPresets;
 
@@ -177,8 +181,31 @@ Presets::IndexOf(const char* name)
 }
 
 
+static bool
+can_make(const OutputSettings& settings)
+{
+	video_codec codec = settings.videoCodec;
+	if (codec == kVideoCopy || codec == kVideoNone
+		|| !container_info(settings.container).video)
+		return true;
+	if (SoftwareEncoders::IsAvailable(codec)
+		|| LavcVideoEncoder::IsAvailable(codec))
+		return true;
+	HardwareInventory& inventory = HardwareInventory::Default();
+	if (!inventory.IsProbed())
+		inventory.Probe();
+	return inventory.EncoderFor(codec, 1920, 1080) != NULL;
+}
+
+
 int32
 Presets::DefaultIndex()
 {
+	// The first one this computer can make: without x264 (arm64), not
+	// "Fast 1080p".
+	for (int32 i = 0; i < Count(); i++) {
+		if (can_make(At(i).settings))
+			return i;
+	}
 	return 0;
 }

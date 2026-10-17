@@ -106,9 +106,13 @@ decide_encoder(const OutputSettings& settings, const SourceInfo* info)
 		&& !LavcVideoEncoder::IsAvailable(codec)) {
 		decision.kind = kBadgeError;
 		decision.impossible = true;
-		if (!missing.IsEmpty()) {
+		if (!missing.IsEmpty() && SoftwareEncoders::Installable()) {
 			decision.text.SetToFormat(B_TRANSLATE("%s cannot be encoded here: "
 				"install the %s package."), name, missing.String());
+		} else if (!missing.IsEmpty()) {
+			decision.text.SetToFormat(B_TRANSLATE("%s cannot be encoded on "
+				"this computer: there is no %s for its processor yet."), name,
+				missing.String());
 		} else {
 			decision.text.SetToFormat(B_TRANSLATE("Nothing here can encode "
 				"%s."), name);

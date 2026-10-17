@@ -242,7 +242,7 @@ SYSTEM_ADD_ONS_MEDIA += [ FFilterByBuildFeatures
 
 SYSTEM_ADD_ONS_MEDIA_PLUGINS += [ FFilterByBuildFeatures
 	ape_reader@x86
-	ffmpeg@ffmpeg
+	ffmpeg@ffmpeg,!arm64
 	http_streamer
 	raw_decoder
 	rpi_hevc@arm64
