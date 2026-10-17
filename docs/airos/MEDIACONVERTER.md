@@ -61,7 +61,9 @@ turning and mirroring. The source's own rotation is applied.
 
 As in HandBrake, a disc is a source: a DVD folder (one holding `VIDEO_TS`,
 or `VIDEO_TS` itself), a DVD image (`.iso`, read through its ISO 9660
-directory), or a Blu-ray or AVCHD folder (one holding `BDMV`). It goes in
+directory, or its UDF one when it has none), a Blu-ray or AVCHD folder (one
+holding `BDMV`), or a Blu-ray image (UDF 2.50 with its metadata partition,
+as Blu-ray discs have it, or a plain UDF partition). It goes in
 the queue as its longest title; the Source panel's *Title* menu lists the
 others longer than ten seconds (with their length and chapters) and
 converts another one instead. A disc can be added again for a second title.
@@ -81,8 +83,13 @@ and goes next to it.
   languages of the streams by PID; a playlist plays through FFmpeg's concat
   demuxer, each clip from its in to its out time, so the timestamps run on
   across clips.
-- Encrypted discs (CSS, AACS) are not read: MediaConverter says so. A
-  Blu-ray image is not read (Blu-ray discs have no ISO 9660 directory).
+- A Blu-ray image's files are found through its UDF file system (the
+  reader in `DiscSource.cpp` follows the metadata file, embedded data,
+  long, short and extended allocation descriptors and their continuation
+  extents); a stream file is handed to FFmpeg as a byte range of the image
+  (`subfile,,start,…,end,…,,:image.iso`, several in a `concat:` when the
+  file is in pieces), so the playlist plays as from a folder.
+- Encrypted discs (CSS, AACS) are not read: MediaConverter says so.
 - MPEG program and transport streams may jump in time (cells from
   different VOBs, a recording whose clock was reset): as ffmpeg does, a
   jump of more than 10 s, or back in time, moves what follows to follow on,

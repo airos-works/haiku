@@ -160,6 +160,432 @@ language_from_disc(const uint8* code)
 }
 
 
+// #pragma mark - UDF images
+
+
+static uint16
+le16(const uint8* data)
+{
+	return (uint16)(data[1] << 8 | data[0]);
+}
+
+
+static uint64
+le64(const uint8* data)
+{
+	return (uint64)le32(data + 4) << 32 | le32(data);
+}
+
+
+/*!	A file or folder in a UDF image: where its bytes are. */
+struct UdfNode {
+	bool		directory;
+	off_t		size;
+	std::vector<std::pair<off_t, off_t> > extents;	// offset, length
+	std::vector<uint8> embedded;	// small data kept in its file entry
+
+	UdfNode() : directory(false), size(0) {}
+};
+
+
+/*!	The UDF file system of a disc image - Blu-ray discs have UDF 2.50 with a
+	metadata partition, others a plain one - read far enough to find files
+	by their paths and where their bytes are in the image. */
+class UdfImage {
+public:
+								UdfImage();
+								~UdfImage();
+
+			status_t			Open(const char* path);
+			// "BDMV/PLAYLIST", in any case
+			bool				Find(const char* path, UdfNode& node);
+			bool				List(const UdfNode& directory,
+									std::vector<std::pair<BString, UdfNode> >&
+										entries);
+			bool				Read(const UdfNode& node,
+									std::vector<uint8>& data, size_t maximum);
+
+private:
+	struct Map {
+		int				number;		// the partition's
+		bool			metadata;	// UDF 2.50: in the metadata file
+		std::vector<std::pair<off_t, off_t> > extents;
+	};
+
+			bool				_ReadAt(off_t offset, void* buffer,
+									size_t size);
+			bool				_Tag(const uint8* block, uint16 id,
+									uint32 location);
+			off_t				_Offset(int partition, uint32 block,
+									off_t* contiguous);
+			bool				_Block(int partition, uint32 block,
+									uint8* buffer);
+			bool				_AddExtent(int partition, uint32 block,
+									off_t length, UdfNode& node);
+			bool				_Allocations(int partition,
+									const uint8* descriptors, size_t length,
+									int type, UdfNode& node, int depth);
+			bool				_FileEntry(int partition, uint32 block,
+									UdfNode& node);
+
+			int					fFD;
+			std::map<int, uint32> fStarts;	// partition number: sector
+			std::vector<Map>	fMaps;			// by partition reference
+			UdfNode				fRoot;
+};
+
+
+UdfImage::UdfImage()
+	:
+	fFD(-1)
+{
+}
+
+
+UdfImage::~UdfImage()
+{
+	if (fFD >= 0)
+		close(fFD);
+}
+
+
+bool
+UdfImage::_ReadAt(off_t offset, void* buffer, size_t size)
+{
+	return pread(fFD, buffer, size, offset) == (ssize_t)size;
+}
+
+
+/*!	A descriptor tag: its identifier, its checksum and where it says it is
+	(a sector of the image, or a block of its partition). */
+bool
+UdfImage::_Tag(const uint8* block, uint16 id, uint32 location)
+{
+	if (le16(block) != id)
+		return false;
+	uint8 sum = 0;
+	for (int i = 0; i < 16; i++) {
+		if (i != 4)
+			sum += block[i];
+	}
+	return sum == block[4] && le32(block + 12) == location;
+}
+
+
+off_t
+UdfImage::_Offset(int partition, uint32 block, off_t* contiguous)
+{
+	*contiguous = 0;
+	if (partition < 0 || partition >= (int)fMaps.size())
+		return -1;
+	const Map& map = fMaps[partition];
+	std::map<int, uint32>::const_iterator start = fStarts.find(map.number);
+	if (start == fStarts.end())
+		return -1;
+	if (!map.metadata) {
+		*contiguous = INT64_MAX;
+		return ((off_t)start->second + block) * kSectorSize;
+	}
+	// a block of the metadata file
+	off_t logical = (off_t)block * kSectorSize;
+	for (size_t i = 0; i < map.extents.size(); i++) {
+		if (logical < map.extents[i].second) {
+			*contiguous = map.extents[i].second - logical;
+			return map.extents[i].first + logical;
+		}
+		logical -= map.extents[i].second;
+	}
+	return -1;
+}
+
+
+bool
+UdfImage::_Block(int partition, uint32 block, uint8* buffer)
+{
+	off_t contiguous;
+	off_t offset = _Offset(partition, block, &contiguous);
+	return offset >= 0 && _ReadAt(offset, buffer, kSectorSize)
+		&& le32(buffer + 12) == block;
+}
+
+
+bool
+UdfImage::_AddExtent(int partition, uint32 block, off_t length,
+	UdfNode& node)
+{
+	while (length > 0) {
+		off_t contiguous;
+		off_t offset = _Offset(partition, block, &contiguous);
+		if (offset < 0 || contiguous <= 0)
+			return false;
+		off_t part = std::min(length, contiguous);
+		if (!node.extents.empty() && node.extents.back().first
+				+ node.extents.back().second == offset)
+			node.extents.back().second += part;
+		else
+			node.extents.push_back(std::make_pair(offset, part));
+		length -= part;
+		block += (part + kSectorSize - 1) / kSectorSize;
+	}
+	return true;
+}
+
+
+/*!	A file entry's allocation descriptors (short, long or extended), and
+	the extents they continue in. */
+bool
+UdfImage::_Allocations(int partition, const uint8* descriptors, size_t length,
+	int type, UdfNode& node, int depth)
+{
+	size_t size = type == 0 ? 8 : type == 1 ? 16 : 20;
+	for (size_t at = 0; at + size <= length; at += size) {
+		const uint8* ad = descriptors + at;
+		uint32 raw = le32(ad);
+		uint32 extentLength = raw & 0x3fffffff;
+		int extentType = raw >> 30;
+		if (extentLength == 0)
+			break;
+		uint32 block = le32(ad + 4);
+		int where = partition;
+		if (type == 1)
+			where = le16(ad + 8);
+		else if (type == 2) {
+			block = le32(ad + 12);
+			where = le16(ad + 16);
+		}
+		if (extentType == 3) {
+			// the descriptors go on in an allocation extent descriptor
+			uint8 next[kSectorSize];
+			if (depth > 64 || !_Block(where, block, next)
+				|| le16(next) != 258)
+				return false;
+			size_t nextLength = std::min((size_t)le32(next + 20),
+				(size_t)kSectorSize - 24);
+			return _Allocations(where, next + 24, nextLength, type, node,
+				depth + 1);
+		}
+		if (extentType != 0)
+			return false;	// allocated but not recorded: no data
+		if (!_AddExtent(where, block, extentLength, node))
+			return false;
+	}
+	return true;
+}
+
+
+bool
+UdfImage::_FileEntry(int partition, uint32 block, UdfNode& node)
+{
+	uint8 entry[kSectorSize];
+	if (!_Block(partition, block, entry))
+		return false;
+	size_t start;
+	size_t length;
+	uint16 id = le16(entry);
+	if (id == 261) {
+		start = 176 + le32(entry + 168);
+		length = le32(entry + 172);
+	} else if (id == 266) {
+		start = 216 + le32(entry + 208);
+		length = le32(entry + 212);
+	} else
+		return false;
+	if (start > kSectorSize || length > kSectorSize - start)
+		return false;
+	node = UdfNode();
+	node.size = le64(entry + 56);
+	node.directory = entry[16 + 11] == 4;
+	int type = le16(entry + 16 + 18) & 7;
+	if (type == 3) {
+		size_t size = std::min(length, (size_t)node.size);
+		node.embedded.assign(entry + start, entry + start + size);
+		return true;
+	}
+	if (type > 2 || !_Allocations(partition, entry + start, length, type, node,
+			0))
+		return false;
+	// the last block's slack is not the file's
+	off_t left = node.size;
+	for (size_t i = 0; i < node.extents.size(); i++) {
+		if (node.extents[i].second > left)
+			node.extents[i].second = left;
+		left -= node.extents[i].second;
+	}
+	while (!node.extents.empty() && node.extents.back().second == 0)
+		node.extents.pop_back();
+	return true;
+}
+
+
+status_t
+UdfImage::Open(const char* path)
+{
+	fFD = open(path, O_RDONLY);
+	if (fFD < 0)
+		return B_ENTRY_NOT_FOUND;
+	uint8 block[kSectorSize];
+	if (!_ReadAt(256 * kSectorSize, block, sizeof(block))
+		|| !_Tag(block, 2, 256))
+		return B_BAD_DATA;
+	uint32 sequenceLength = le32(block + 16);
+	uint32 sequence = le32(block + 20);
+
+	std::vector<uint8> volume;
+	for (uint32 i = 0; i < sequenceLength / kSectorSize && i < 64; i++) {
+		if (!_ReadAt((off_t)(sequence + i) * kSectorSize, block,
+				sizeof(block)))
+			return B_BAD_DATA;
+		uint16 id = le16(block);
+		if (id == 5 && _Tag(block, 5, sequence + i))
+			fStarts[le16(block + 22)] = le32(block + 188);
+		else if (id == 6 && _Tag(block, 6, sequence + i))
+			volume.assign(block, block + sizeof(block));
+		else if (id == 8)
+			break;
+	}
+	if (volume.empty() || le32(volume.data() + 212) != kSectorSize)
+		return B_BAD_DATA;
+
+	// the partition maps
+	uint32 count = le32(volume.data() + 268);
+	size_t at = 440;
+	for (uint32 i = 0; i < count && at + 2 <= volume.size(); i++) {
+		const uint8* map = volume.data() + at;
+		Map entry;
+		entry.metadata = false;
+		entry.number = -1;
+		if (map[0] == 1 && map[1] == 6)
+			entry.number = le16(map + 4);
+		else if (map[0] == 2 && map[1] == 64 && at + 64 <= volume.size()) {
+			entry.number = le16(map + 38);
+			if (memcmp(map + 5, "*UDF Metadata Partition", 23) == 0) {
+				entry.metadata = true;
+				// the metadata file: its entry is in the physical partition
+				Map physical;
+				physical.number = entry.number;
+				physical.metadata = false;
+				fMaps.push_back(physical);
+				UdfNode file;
+				bool found = _FileEntry(fMaps.size() - 1, le32(map + 40),
+					file);
+				fMaps.pop_back();
+				if (!found)
+					return B_BAD_DATA;
+				entry.extents = file.extents;
+			}
+		}
+		fMaps.push_back(entry);
+		at += std::max((int)map[1], 2);
+	}
+
+	// the file set descriptor names the root folder
+	int fsdPartition = le16(volume.data() + 256);
+	uint32 fsdBlock = le32(volume.data() + 252);
+	if (!_Block(fsdPartition, fsdBlock, block) || le16(block) != 256)
+		return B_BAD_DATA;
+	if (!_FileEntry(le16(block + 408), le32(block + 404), fRoot)
+		|| !fRoot.directory)
+		return B_BAD_DATA;
+	return B_OK;
+}
+
+
+bool
+UdfImage::Read(const UdfNode& node, std::vector<uint8>& data,
+	size_t maximum)
+{
+	if (!node.embedded.empty()) {
+		data = node.embedded;
+		return true;
+	}
+	size_t size = (size_t)std::min((off_t)maximum, node.size);
+	data.resize(size);
+	size_t done = 0;
+	for (size_t i = 0; i < node.extents.size() && done < size; i++) {
+		size_t part = (size_t)std::min((off_t)(size - done),
+			node.extents[i].second);
+		if (!_ReadAt(node.extents[i].first, data.data() + done, part))
+			return false;
+		done += part;
+	}
+	data.resize(done);
+	return true;
+}
+
+
+bool
+UdfImage::List(const UdfNode& directory,
+	std::vector<std::pair<BString, UdfNode> >& entries)
+{
+	std::vector<uint8> data;
+	if (!directory.directory || !Read(directory, data, 16 * 1024 * 1024))
+		return false;
+	size_t at = 0;
+	while (at + 38 <= data.size()) {
+		const uint8* fid = data.data() + at;
+		if (le16(fid) != 257)
+			break;
+		uint8 characteristics = fid[18];
+		size_t nameLength = fid[19];
+		size_t implementationLength = le16(fid + 36);
+		size_t size = (38 + implementationLength + nameLength + 3) & ~3;
+		if (at + 38 + implementationLength + nameLength > data.size())
+			break;
+		// not the parent folder, not deleted
+		if ((characteristics & 0x0c) == 0 && nameLength > 1) {
+			const uint8* name = fid + 38 + implementationLength;
+			BString text;
+			if (name[0] == 8) {
+				text.SetTo((const char*)name + 1, nameLength - 1);
+			} else if (name[0] == 16) {
+				for (size_t i = 1; i + 1 < nameLength; i += 2) {
+					uint16 c = name[i] << 8 | name[i + 1];
+					text << (char)(c < 0x80 ? c : '_');
+				}
+			}
+			UdfNode node;
+			if (!text.IsEmpty()
+				&& _FileEntry(le16(fid + 28), le32(fid + 24), node))
+				entries.push_back(std::make_pair(text, node));
+		}
+		at += size;
+	}
+	return true;
+}
+
+
+bool
+UdfImage::Find(const char* path, UdfNode& node)
+{
+	node = fRoot;
+	BString rest(path);
+	while (!rest.IsEmpty()) {
+		int32 slash = rest.FindFirst('/');
+		BString name;
+		if (slash < 0) {
+			name = rest;
+			rest = "";
+		} else {
+			rest.CopyInto(name, 0, slash);
+			rest.Remove(0, slash + 1);
+		}
+		std::vector<std::pair<BString, UdfNode> > entries;
+		if (!List(node, entries))
+			return false;
+		bool found = false;
+		for (size_t i = 0; i < entries.size() && !found; i++) {
+			if (entries[i].first.ICompare(name) == 0) {
+				node = entries[i].second;
+				found = true;
+			}
+		}
+		if (!found)
+			return false;
+	}
+	return true;
+}
+
+
 // #pragma mark - the files of a DVD
 
 
@@ -182,6 +608,7 @@ public:
 
 private:
 	status_t	_OpenImage(const char* path);
+	status_t	_OpenUdfImage(const char* path);
 	status_t	_OpenFolder(const char* path);
 
 	std::map<BString, FileRun> fFiles;	// by upper case name
@@ -266,7 +693,7 @@ DvdFiles::_OpenImage(const char* path)
 	uint8 descriptor[kSectorSize];
 	if (!read_at(path, 16 * kSectorSize, descriptor, sizeof(descriptor))
 		|| descriptor[0] != 1 || memcmp(descriptor + 1, "CD001", 5) != 0)
-		return B_ENTRY_NOT_FOUND;
+		return _OpenUdfImage(path);
 	const uint8* root = descriptor + 156;
 	uint32 folderExtent = 0;
 	uint32 folderSize = 0;
@@ -291,6 +718,36 @@ DvdFiles::_OpenImage(const char* path)
 			upper.ToUpper();
 			fFiles[upper] = run;
 		});
+	if (fFiles.count("VIDEO_TS.IFO") == 0)
+		return _OpenUdfImage(path);
+	return B_OK;
+}
+
+
+/*!	A DVD image without an ISO 9660 directory: its UDF one. */
+status_t
+DvdFiles::_OpenUdfImage(const char* path)
+{
+	fFiles.clear();
+	UdfImage image;
+	UdfNode folder;
+	std::vector<std::pair<BString, UdfNode> > entries;
+	if (image.Open(path) != B_OK || !image.Find("VIDEO_TS", folder)
+		|| !image.List(folder, entries))
+		return B_ENTRY_NOT_FOUND;
+	for (size_t i = 0; i < entries.size(); i++) {
+		const UdfNode& node = entries[i].second;
+		// a VOB is one run of the image (DVD files are not fragmented)
+		if (node.directory || node.extents.size() != 1)
+			continue;
+		FileRun run;
+		run.path = path;
+		run.offset = node.extents[0].first;
+		run.length = node.extents[0].second;
+		BString name(entries[i].first);
+		name.ToUpper();
+		fFiles[name] = run;
+	}
 	return fFiles.count("VIDEO_TS.IFO") != 0 ? B_OK : B_ENTRY_NOT_FOUND;
 }
 
@@ -921,7 +1378,9 @@ open_dvd(AVFormatContext** context, const char* path, int32 number,
 
 
 struct BdPlayItem {
-	BString		clip;		// the stream file's path
+	BString		name;		// the clip's, "00001"
+	BString		clip;		// its stream file, as FFmpeg opens it
+	off_t		size;
 	uint32		in;			// 45 kHz
 	uint32		out;
 };
@@ -946,12 +1405,153 @@ bdmv_folder(const char* path)
 }
 
 
-/*!	The stream file of clip \a name ("00001"): STREAM/00001.m2ts, or .MTS
-	on an AVCHD disc. */
-static BString
-bd_clip_path(const BString& bdmv, const char* name)
+static bool
+is_playlist_name(const BString& name)
 {
-	BString stream = find_entry(bdmv.String(), "STREAM");
+	BString lower(name);
+	lower.ToLower();
+	return lower.EndsWith(".mpls") || lower.EndsWith(".mpl");
+}
+
+
+/*!	A Blu-ray's (or AVCHD disc's) BDMV files: in a folder, or in a disc
+	image through its UDF file system, the stream files then as byte ranges
+	of the image that FFmpeg reads with its subfile protocol. */
+class BdFiles {
+public:
+			status_t			Open(const char* path);
+			void				Playlists(std::vector<BString>& names);
+			bool				ReadPlaylist(const BString& name,
+									std::vector<uint8>& data);
+			// clip "00001": STREAM/00001.m2ts (.MTS on AVCHD), as a URL
+			BString				Clip(const char* name, off_t* size);
+			bool				ReadClip(const char* name, void* buffer,
+									size_t size);
+
+private:
+			const UdfNode*		_ImageClip(const char* name);
+
+			BString				fFolder;	// BDMV, for a folder
+			BString				fImage;
+			UdfImage			fUdf;
+			std::vector<std::pair<BString, UdfNode> > fPlaylists;
+			std::vector<std::pair<BString, UdfNode> > fStreams;
+};
+
+
+status_t
+BdFiles::Open(const char* path)
+{
+	if (is_directory(path)) {
+		fFolder = bdmv_folder(path);
+		if (fFolder.IsEmpty()
+			|| find_entry(fFolder.String(), "PLAYLIST").IsEmpty())
+			return B_ENTRY_NOT_FOUND;
+		return B_OK;
+	}
+	UdfNode playlists;
+	UdfNode streams;
+	if (fUdf.Open(path) != B_OK || !fUdf.Find("BDMV/PLAYLIST", playlists)
+		|| !fUdf.List(playlists, fPlaylists))
+		return B_ENTRY_NOT_FOUND;
+	if (fUdf.Find("BDMV/STREAM", streams))
+		fUdf.List(streams, fStreams);
+	fImage = path;
+	return B_OK;
+}
+
+
+void
+BdFiles::Playlists(std::vector<BString>& names)
+{
+	if (!fImage.IsEmpty()) {
+		for (size_t i = 0; i < fPlaylists.size(); i++) {
+			if (is_playlist_name(fPlaylists[i].first))
+				names.push_back(fPlaylists[i].first);
+		}
+	} else {
+		BString folder = find_entry(fFolder.String(), "PLAYLIST");
+		DIR* dir = folder.IsEmpty() ? NULL : opendir(folder.String());
+		if (dir == NULL)
+			return;
+		while (dirent* entry = readdir(dir)) {
+			if (is_playlist_name(entry->d_name))
+				names.push_back(entry->d_name);
+		}
+		closedir(dir);
+	}
+	std::sort(names.begin(), names.end());
+}
+
+
+bool
+BdFiles::ReadPlaylist(const BString& name, std::vector<uint8>& data)
+{
+	if (!fImage.IsEmpty()) {
+		for (size_t i = 0; i < fPlaylists.size(); i++) {
+			if (fPlaylists[i].first == name)
+				return fUdf.Read(fPlaylists[i].second, data, 1024 * 1024);
+		}
+		return false;
+	}
+	BString file;
+	file.SetToFormat("%s/%s", find_entry(fFolder.String(), "PLAYLIST").String(),
+		name.String());
+	FILE* handle = fopen(file.String(), "rb");
+	if (handle == NULL)
+		return false;
+	data.resize(1024 * 1024);
+	data.resize(fread(data.data(), 1, data.size(), handle));
+	fclose(handle);
+	return true;
+}
+
+
+const UdfNode*
+BdFiles::_ImageClip(const char* name)
+{
+	for (size_t i = 0; i < fStreams.size(); i++) {
+		const BString& file = fStreams[i].first;
+		int32 dot = file.FindLast('.');
+		if (dot < 0)
+			continue;
+		BString base;
+		file.CopyInto(base, 0, dot);
+		BString extension(file.String() + dot + 1);
+		if (base.ICompare(name) == 0 && (extension.ICompare("m2ts") == 0
+				|| extension.ICompare("mts") == 0))
+			return &fStreams[i].second;
+	}
+	return NULL;
+}
+
+
+BString
+BdFiles::Clip(const char* name, off_t* size)
+{
+	*size = 0;
+	if (!fImage.IsEmpty()) {
+		const UdfNode* node = _ImageClip(name);
+		if (node == NULL || node->extents.empty())
+			return BString();
+		// subfile,,start,<from>,end,<to>,,:<image>; pieces in a concat:
+		BString url;
+		for (size_t i = 0; i < node->extents.size(); i++) {
+			BString piece;
+			piece.SetToFormat("subfile,,start,%" B_PRIdOFF ",end,%" B_PRIdOFF
+				",,:%s", node->extents[i].first,
+				node->extents[i].first + node->extents[i].second,
+				fImage.String());
+			if (!url.IsEmpty())
+				url << "|";
+			url << piece;
+		}
+		if (node->extents.size() > 1)
+			url.Prepend("concat:");
+		*size = node->size;
+		return url;
+	}
+	BString stream = find_entry(fFolder.String(), "STREAM");
 	if (stream.IsEmpty())
 		return stream;
 	static const char* kExtensions[] = { "m2ts", "mts" };
@@ -959,10 +1559,28 @@ bd_clip_path(const BString& bdmv, const char* name)
 		BString file;
 		file.SetToFormat("%s.%s", name, kExtensions[i]);
 		BString found = find_entry(stream.String(), file.String());
-		if (!found.IsEmpty())
+		struct stat st;
+		if (!found.IsEmpty() && stat(found.String(), &st) == 0) {
+			*size = st.st_size;
 			return found;
+		}
 	}
 	return BString();
+}
+
+
+bool
+BdFiles::ReadClip(const char* name, void* buffer, size_t size)
+{
+	if (!fImage.IsEmpty()) {
+		const UdfNode* node = _ImageClip(name);
+		return node != NULL && !node->extents.empty()
+			&& node->extents[0].second >= (off_t)size
+			&& read_at(fImage.String(), node->extents[0].first, buffer, size);
+	}
+	off_t clipSize;
+	BString path = Clip(name, &clipSize);
+	return !path.IsEmpty() && read_at(path.String(), 0, buffer, size);
 }
 
 
@@ -1023,15 +1641,13 @@ bd_read_streams(const uint8* table, size_t size,
 
 
 static bool
-bd_read_playlist(const BString& bdmv, const char* file, int32 number,
+bd_read_playlist(BdFiles& files, const BString& file, int32 number,
 	BdPlaylist& playlist)
 {
-	FILE* handle = fopen(file, "rb");
-	if (handle == NULL)
+	std::vector<uint8> data;
+	if (!files.ReadPlaylist(file, data))
 		return false;
-	std::vector<uint8> data(1024 * 1024);
-	size_t size = fread(data.data(), 1, data.size(), handle);
-	fclose(handle);
+	size_t size = data.size();
 	const uint8* mpls = data.data();
 	if (size < 40 || memcmp(mpls, "MPLS", 4) != 0)
 		return false;
@@ -1053,8 +1669,8 @@ bd_read_playlist(const BString& bdmv, const char* file, int32 number,
 		if (at + 2 + length > size || length < 32)
 			return false;
 		BdPlayItem playItem;
-		BString name((const char*)item, 5);
-		playItem.clip = bd_clip_path(bdmv, name.String());
+		playItem.name.SetTo((const char*)item, 5);
+		playItem.clip = files.Clip(playItem.name.String(), &playItem.size);
 		bool multiAngle = (item[10] & 0x10) != 0;
 		playItem.in = be32(item + 12);
 		playItem.out = be32(item + 16);
@@ -1113,30 +1729,18 @@ static status_t
 bd_read_playlists(const char* path, std::vector<BdPlaylist>& playlists,
 	BString* error)
 {
-	BString bdmv = bdmv_folder(path);
-	BString folder = bdmv.IsEmpty() ? BString()
-		: find_entry(bdmv.String(), "PLAYLIST");
-	DIR* dir = folder.IsEmpty() ? NULL : opendir(folder.String());
-	if (dir == NULL) {
+	BdFiles files;
+	std::vector<BString> names;
+	if (files.Open(path) == B_OK)
+		files.Playlists(names);
+	if (names.empty()) {
 		if (error != NULL)
 			*error = "The Blu-ray has no playlists.";
 		return B_ENTRY_NOT_FOUND;
 	}
-	std::vector<BString> names;
-	while (dirent* entry = readdir(dir)) {
-		BString name(entry->d_name);
-		BString lower(name);
-		lower.ToLower();
-		if (lower.EndsWith(".mpls") || lower.EndsWith(".mpl"))
-			names.push_back(name);
-	}
-	closedir(dir);
-	std::sort(names.begin(), names.end());
 	for (size_t i = 0; i < names.size(); i++) {
-		BString file;
-		file.SetToFormat("%s/%s", folder.String(), names[i].String());
 		BdPlaylist playlist;
-		if (!bd_read_playlist(bdmv, file.String(), atoi(names[i].String()),
+		if (!bd_read_playlist(files, names[i], atoi(names[i].String()),
 				playlist))
 			continue;
 		bool copy = false;
@@ -1167,10 +1771,10 @@ bd_read_playlists(const char* path, std::vector<BdPlaylist>& playlists,
 /*!	AACS encrypted units have the copy permission bits of their first
 	packet set (and no sync bytes after their first 16 bytes). */
 static bool
-bd_is_encrypted(const char* clip)
+bd_is_encrypted(BdFiles& files, const char* clip)
 {
 	uint8 unit[6144];
-	if (!read_at(clip, 0, unit, sizeof(unit)))
+	if (!files.ReadClip(clip, unit, sizeof(unit)))
 		return false;
 	if ((unit[0] & 0xc0) != 0)
 		return true;
@@ -1241,7 +1845,9 @@ open_bluray(AVFormatContext** context, const char* path, int32 number,
 				(int)number);
 		return AVERROR(ENOENT);
 	}
-	if (bd_is_encrypted(playlist->items[0].clip.String())) {
+	BdFiles files;
+	if (files.Open(path) == B_OK
+		&& bd_is_encrypted(files, playlist->items[0].name.String())) {
 		if (error != NULL) {
 			*error = "This Blu-ray is encrypted (AACS), which MediaConverter "
 				"cannot read.";
@@ -1268,10 +1874,8 @@ open_bluray(AVFormatContext** context, const char* path, int32 number,
 	reader->script = "ffconcat version 1.0\n";
 	for (size_t i = 0; i < playlist->items.size(); i++) {
 		const BdPlayItem& item = playlist->items[i];
-		struct stat st;
-		if ((i == 0 || item.clip != playlist->items[i - 1].clip)
-			&& stat(item.clip.String(), &st) == 0)
-			reader->size += st.st_size;
+		if (i == 0 || item.clip != playlist->items[i - 1].clip)
+			reader->size += item.size;
 		BString line;
 		line.SetToFormat("file %s\ninpoint %.6f\noutpoint %.6f\n",
 			concat_quote(item.clip).String(), item.in / 45000.0,
@@ -1344,16 +1948,19 @@ identify_disc(const char* path)
 	if (path == NULL || path[0] == '\0')
 		return kDiscNone;
 	if (is_directory(path)) {
-		if (!bdmv_folder(path).IsEmpty()) {
-			BString playlists = find_entry(bdmv_folder(path).String(),
-				"PLAYLIST");
-			if (!playlists.IsEmpty())
-				return kDiscBluray;
-		}
+		BdFiles files;
+		if (files.Open(path) == B_OK)
+			return kDiscBluray;
 	}
 	DvdFiles files;
 	if (files.Open(path) == B_OK)
 		return kDiscDVD;
+	if (!is_directory(path)) {
+		// a Blu-ray image: UDF only
+		BdFiles image;
+		if (image.Open(path) == B_OK)
+			return kDiscBluray;
+	}
 	return kDiscNone;
 }
 
