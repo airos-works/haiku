@@ -154,17 +154,22 @@ SYSTEM_APPS = [ FFilterByBuildFeatures
 ] ;
 
 DESKBAR_APPLICATIONS =
-	CharacterMap
 	DeskCalc
+	Installer
+	StyledEdit
+	Terminal
+;
+
+# The "Utilities" folder of the Deskbar's Applications menu
+DESKBAR_UTILITIES = [ FFilterByBuildFeatures
+	CharacterMap
+	Debugger@libedit
 	Devices
 	DiskProbe
 	DiskUsage
 	DriveSetup
 	Expander
-	Installer
-	StyledEdit
-	Terminal
-;
+] ;
 
 DESKBAR_DESKTOP_APPLETS =
 	BluetoothStatus
