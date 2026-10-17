@@ -443,6 +443,8 @@ int
 main(int argc, char** argv)
 {
 	av_log_set_level(AV_LOG_ERROR);
+	if (argc == 3 && strcmp(argv[1], "--nvenc-self-test") == 0)
+		return NvencEncoder::SelfTestMain(argv[2]);
 	OutputSettings settings;
 	const char* source = NULL;
 	const char* destination = NULL;

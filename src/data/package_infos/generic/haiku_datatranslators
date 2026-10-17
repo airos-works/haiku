@@ -19,11 +19,14 @@ requires {
 
 #ifdef HAIKU_REGULAR_BUILD
 #ifdef HAIKU_BUILD_FEATURE_%HAIKU_PACKAGING_ARCH%_ffmpeg_ENABLED
+#ifndef HAIKU_PACKAGING_ARCH_arm64
+/* the ffmpeg media plugin; arm64's comes with its FFmpeg (rock5_ffmpeg) */
 	lib:libavcodec >= 60
 	lib:libavfilter >= 9
 	lib:libavformat >= 60
 	lib:libavutil >= 58
 	lib:libswresample >= 4
+#endif
 #endif
 #ifdef HAIKU_BUILD_FEATURE_%HAIKU_PACKAGING_ARCH%_libicns_ENABLED
 	lib:libicns

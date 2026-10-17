@@ -11,6 +11,7 @@
 
 	FAKE_NVENC_GOOD=n: only layout n gives correct pictures (default 0)
 	FAKE_NVENC_TIMEOUT=1: every picture times out
+	FAKE_NVENC_CRASH=1, FAKE_NVENC_HANG=1: the first picture crashes or hangs
 	It claims H.264 and H.265; H.265 always fails to open. */
 
 
@@ -18,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <deque>
 #include <vector>
@@ -196,6 +198,10 @@ fake_headers(nvenc_session* session, uint8_t* buffer, size_t* size)
 static int
 fake_encode(nvenc_session* session, const nvenc_picture* picture)
 {
+	if (getenv("FAKE_NVENC_CRASH") != NULL)
+		abort();
+	while (getenv("FAKE_NVENC_HANG") != NULL)
+		sleep(1000);
 	if (getenv("FAKE_NVENC_TIMEOUT") != NULL) {
 		snprintf(session->description, sizeof(session->description),
 			"NVENC: the encoder did not answer (stand-in)");
