@@ -1,25 +1,72 @@
 SubDir HAIKU_TOP src apps mediaconverter ;
 
-UsePrivateHeaders shared ;
+# MediaConverter: the air/OS converter. The engine (engine/) is FFmpeg for
+# reading, decoding, filtering and writing, with the encoders of
+# VideoEncoder: the GPUs' through VA-API (AMD) and NVENC (NVIDIA), and on the
+# CPU x264, x265 and SVT-AV1 (opened at run time) and FFmpeg's own.
 
-Application MediaConverter :
+UsePrivateHeaders interface shared media ;
+UsePrivateSystemHeaders ;
+SubDirHdrs [ FDirName $(SUBDIR) engine ] ;
+SubDirSysHdrs [ FDirName $(SUBDIR) thirdparty ] ;
+SubDirHdrs [ FDirName $(SUBDIR) app ] ;
+SubDirC++Flags -D__STDC_CONSTANT_MACROS ;
+
+SEARCH_SOURCE += [ FDirName $(SUBDIR) engine ] ;
+SEARCH_SOURCE += [ FDirName $(SUBDIR) app ] ;
+SEARCH_SOURCE += [ FDirName $(SUBDIR) cli ] ;
+
+local engineSources =
+	BitWriter.cpp
+	Formats.cpp
+	HardwareCaps.cpp
+	LavcVideoEncoder.cpp
+	MediaProbe.cpp
+	NvencEncoder.cpp
+	OutputSettings.cpp
+	Presets.cpp
+	SoftwareEncoders.cpp
+	Transcoder.cpp
+	VaapiEncoder.cpp
+	VaapiLibrary.cpp
+	VideoEncoder.cpp
+	;
+
+local appSources =
+	HardwareWindow.cpp
 	MediaConverterApp.cpp
 	MediaConverterWindow.cpp
-	MediaEncoderWindow.cpp
-	MediaFileInfo.cpp
-	MediaFileInfoView.cpp
-	MediaFileListView.cpp
+	OutputView.cpp
+	QueueView.cpp
+	SourceView.cpp
+	;
 
-	: be media tracker localestub [ TargetLibstdc++ ]
+UseBuildFeatureHeaders ffmpeg ;
+Includes [ FGristFiles $(engineSources) $(appSources) mediaconvert.cpp ]
+	: [ BuildFeatureAttribute ffmpeg : headers ] ;
+
+StaticLibrary libmediaconverter_engine.a : $(engineSources) ;
+
+Application MediaConverter :
+	$(appSources)
+	:
+	libmediaconverter_engine.a libcolumnlistview.a
+	[ BuildFeatureAttribute ffmpeg : libraries ]
+	be tracker translation localestub [ TargetLibstdc++ ]
 	: MediaConverter.rdef
+;
+
+# The engine from a shell, for tests (not part of the image).
+Application mediaconvert :
+	mediaconvert.cpp
+	:
+	libmediaconverter_engine.a
+	[ BuildFeatureAttribute ffmpeg : libraries ]
+	be [ TargetLibstdc++ ]
 ;
 
 DoCatalogs MediaConverter :
 	x-vnd.Haiku-MediaConverter
 	:
-	MediaFileInfoView.cpp
-	MediaFileInfo.cpp
-	MediaEncoderWindow.cpp
-	MediaConverterWindow.cpp
-	MediaConverterApp.cpp
+	$(appSources)
 ;

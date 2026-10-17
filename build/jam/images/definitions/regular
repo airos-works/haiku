@@ -41,7 +41,7 @@ SYSTEM_APPS += [ FFilterByBuildFeatures
 	LegacyPackageInstaller
 	Magnify
 	Mail
-	MediaConverter
+	MediaConverter@ffmpeg
 	MediaPlayer
 	MidiPlayer@fluidlite
 	People
@@ -60,7 +60,7 @@ DESKBAR_APPLICATIONS += [ FFilterByBuildFeatures
 	HaikuDepot
 	Icon-O-Matic
 	Mail
-	MediaConverter
+	MediaConverter@ffmpeg
 	MidiPlayer@fluidlite
 	People
 	SoftwareUpdater
