@@ -216,7 +216,8 @@ class LumaReader {
 public:
 	LumaReader()
 		: fContext(NULL), fDecoder(NULL), fScaler(NULL), fIndex(-1),
-		  fPacket(av_packet_alloc()), fFrame(av_frame_alloc()), fEnded(false)
+		  fPacket(av_packet_alloc()), fFrame(av_frame_alloc()), fEnded(false),
+		  fFirst(AV_NOPTS_VALUE)
 	{
 	}
 
@@ -248,13 +249,29 @@ public:
 
 	int Width() const { return fDecoder->width; }
 	int Height() const { return fDecoder->height; }
+	// seconds a picture lasts
+	double FrameDuration() const
+	{
+		AVRational rate = fContext->streams[fIndex]->avg_frame_rate;
+		return rate.num > 0 && rate.den > 0 ? av_q2d(av_inv_q(rate)) : 1 / 30.0;
+	}
 
-	// false at the end
-	bool Next(int width, int height, std::vector<uint8>& luma)
+	// false at the end; *time is seconds since the first picture
+	bool Next(int width, int height, std::vector<uint8>& luma,
+		double* time = NULL)
 	{
 		while (true) {
 			int result = avcodec_receive_frame(fDecoder, fFrame);
 			if (result == 0) {
+				int64 stamp = fFrame->best_effort_timestamp;
+				if (stamp != AV_NOPTS_VALUE && fFirst == AV_NOPTS_VALUE)
+					fFirst = stamp;
+				if (time != NULL) {
+					*time = stamp != AV_NOPTS_VALUE
+						? (stamp - fFirst) * av_q2d(
+							fContext->streams[fIndex]->time_base)
+						: -1;
+				}
 				// a few lines or columns more (coding alignment that the
 				// render size takes away again) are cut off, not scaled
 				int sourceWidth = fFrame->width;
@@ -298,6 +315,7 @@ private:
 	AVPacket*			fPacket;
 	AVFrame*			fFrame;
 	bool				fEnded;
+	int64				fFirst;
 };
 
 
@@ -319,9 +337,26 @@ compare(const char* source, const char* output)
 	int frames = 0;
 	double sum = 0, minimum = 1000;
 	int minimumAt = -1;
+	// Pictures are paired by time, so one an encoder dropped (the previous
+	// one is shown longer) does not shift every later pair;
+	// COMPARE_BY_ORDER pairs them in order instead.
+	bool byTime = getenv("COMPARE_BY_ORDER") == NULL;
+	double tolerance = a.FrameDuration() / 2;
+	int unpairedSource = 0, unpairedOutput = 0;
 	while (true) {
-		bool gotA = a.Next(width, height, la);
-		bool gotB = b.Next(width, height, lb);
+		double ta = 0, tb = 0;
+		bool gotA = a.Next(width, height, la, &ta);
+		bool gotB = b.Next(width, height, lb, &tb);
+		while (byTime && gotA && gotB && ta >= 0 && tb >= 0
+			&& tb - ta > tolerance) {
+			gotA = a.Next(width, height, la, &ta);
+			unpairedSource++;
+		}
+		while (byTime && gotA && gotB && ta >= 0 && tb >= 0
+			&& ta - tb > tolerance) {
+			gotB = b.Next(width, height, lb, &tb);
+			unpairedOutput++;
+		}
 		if (!gotA || !gotB) {
 			if (gotA != gotB) {
 				printf("frame counts differ: %s ends first after %d\n",
@@ -377,6 +412,10 @@ compare(const char* source, const char* output)
 			minimumAt = frames;
 		}
 		frames++;
+	}
+	if (unpairedSource > 0 || unpairedOutput > 0) {
+		printf("unpaired pictures: %d of the source (dropped), %d of the "
+			"output\n", unpairedSource, unpairedOutput);
 	}
 	printf("frames %d, luma PSNR average %.2f dB, lowest %.2f dB at %d\n",
 		frames, frames > 0 ? sum / frames : 0, minimum, minimumAt);

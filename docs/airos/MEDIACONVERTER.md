@@ -251,7 +251,8 @@ image):
 mediaconvert --hardware                     the GPUs, their formats, who encodes what
 mediaconvert --info <file>                  what a file holds
 mediaconvert [options] <source> <output>    convert (--help lists the options)
-mediaconvert --compare <source> <output>    luma PSNR, picture by picture
+mediaconvert --compare <source> <output>    luma PSNR, pictures paired by time
+                                            (COMPARE_BY_ORDER=1: in order)
 mediaconvert --dump <file> <n> <out>        extradata and the first n packets
 MEDIACONVERTER_PROFILE=1 mediaconvert ...   time per stage, and the VA-API upload/sync split
 MEDIACONVERTER_NVENC_RETEST=1 ...           run the NVENC self-test again
@@ -270,7 +271,7 @@ MEDIACONVERTER_FAKE_NVIDIA=1b81 ...         pretend there is a GTX 1070 (with th
 - Theora: now and then libtheora hands back no packet for a picture and
   FFmpeg's wrapper drops it (12 s of Big Buck Bunny: one picture, after the
   first key frame). Timestamps stay right, so playback holds the previous
-  picture once; `--compare`, which pairs pictures in order, shows it as a
-  dip at the next scene cut.
+  picture once; `--compare` reports it as an unpaired source picture (the
+  rest: 42.3 dB).
 - arm64 has no Theora, and no hardware encoding on the ROCK 5's or the
   Cubie's video engines yet.
