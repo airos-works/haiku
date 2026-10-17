@@ -7,6 +7,8 @@
 #include "VaapiEncoder.h"
 
 #include <math.h>
+#include <stdlib.h>
+#include <OS.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -15,6 +17,12 @@ extern "C" {
 }
 
 #include "BitWriter.h"
+
+
+static bool sProfile = getenv("MEDIACONVERTER_PROFILE") != NULL;
+static bigtime_t sUploadTime, sIssueTime, sSyncTime;
+static int64 sUploads;
+static bool sDerived;
 
 
 #define ALIGN(value, alignment) \
@@ -87,6 +95,12 @@ VaapiEncoder::VaapiEncoder(const char* renderNode, const char* deviceName)
 
 VaapiEncoder::~VaapiEncoder()
 {
+	if (sProfile && sUploads > 0) {
+		fprintf(stderr, "vaapi: %" B_PRId64 " pictures, upload %.3f ms (%s), "
+			"issue %.3f ms, sync %.3f ms\n", sUploads,
+			sUploadTime / 1e3 / sUploads, sDerived ? "derived" : "put image",
+			sIssueTime / 1e3 / sUploads, sSyncTime / 1e3 / sUploads);
+	}
 	if (fVA != NULL && fDisplay.Display() != NULL) {
 		VADisplay display = fDisplay.Display();
 		for (size_t i = 0; i < fInFlight.size(); i++) {
@@ -565,8 +579,10 @@ VaapiEncoder::_Upload(const AVFrame* frame, VASurfaceID surface)
 	bool derived = false;
 	if (fDeriveWorks) {
 		if (fVA->DeriveImage(display, surface, &image) == VA_STATUS_SUCCESS
-			&& image.format.fourcc == fImageFormat.fourcc)
+			&& image.format.fourcc == fImageFormat.fourcc) {
 			derived = true;
+			sDerived = true;
+		}
 		else {
 			if (image.image_id != VA_INVALID_ID)
 				fVA->DestroyImage(display, image.image_id);
@@ -1602,8 +1618,10 @@ VaapiEncoder::_Retrieve()
 
 	VADisplay display = fDisplay.Display();
 	status_t status = B_OK;
+	bigtime_t syncStart = system_time();
 	if (fVA->SyncSurface(display, picture.input) != VA_STATUS_SUCCESS)
 		status = B_ERROR;
+	sSyncTime += system_time() - syncStart;
 
 	VACodedBufferSegment* segment = NULL;
 	if (status == B_OK && fVA->MapBuffer(display, picture.coded,
@@ -1684,13 +1702,20 @@ VaapiEncoder::SendFrame(const AVFrame* frame)
 	picture.order = (int32)(picture.index * (fCodec == AV_CODEC_ID_H264
 		? 2 : 1));
 
-	if (_Upload(frame, picture.input) != B_OK) {
+	bigtime_t uploadStart = system_time();
+	status_t uploaded = _Upload(frame, picture.input);
+	sUploadTime += system_time() - uploadStart;
+	sUploads++;
+	if (uploaded != B_OK) {
 		fFreeInputs.push_back(picture.input);
 		fFreeRecons.push_back(picture.recon);
 		fFreeCoded.push_back(picture.coded);
 		return B_ERROR;
 	}
-	if (_Issue(picture) != B_OK) {
+	bigtime_t issueStart = system_time();
+	status_t issued = _Issue(picture);
+	sIssueTime += system_time() - issueStart;
+	if (issued != B_OK) {
 		_ReleaseBuffers(picture);
 		fFreeInputs.push_back(picture.input);
 		fFreeRecons.push_back(picture.recon);

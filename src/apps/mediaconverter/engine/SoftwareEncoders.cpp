@@ -14,6 +14,7 @@
 #include <Locker.h>
 
 #include <dlfcn.h>
+#include <stdlib.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -312,7 +313,14 @@ public:
 			return B_ERROR;
 		}
 		param.i_log_level = X264_LOG_ERROR;
-		param.i_threads = X264_THREADS_AUTO;
+		// x264 cannot count Haiku's processors itself: tell it, as many
+		// frame threads as x264 would pick (1.5 per processor)
+		int threads = encoder_thread_count();
+		param.i_threads = min_c(threads * 3 / 2, 128);
+		param.i_lookahead_threads = X264_THREADS_AUTO;
+		const char* forced = getenv("MEDIACONVERTER_X264_THREADS");
+		if (forced != NULL)
+			param.i_threads = atoi(forced);
 		param.i_width = params.width;
 		param.i_height = params.height;
 		param.i_csp = X264_CSP_I420;

@@ -5,7 +5,7 @@ SubDir HAIKU_TOP src apps mediaconverter ;
 # VideoEncoder: the GPUs' through VA-API (AMD) and NVENC (NVIDIA), and on the
 # CPU x264, x265 and SVT-AV1 (opened at run time) and FFmpeg's own.
 
-UsePrivateHeaders shared media ;
+UsePrivateHeaders interface shared media ;
 UsePrivateSystemHeaders ;
 SubDirHdrs [ FDirName $(SUBDIR) engine ] ;
 SubDirSysHdrs [ FDirName $(SUBDIR) thirdparty ] ;
@@ -32,14 +32,13 @@ local engineSources =
 	VideoEncoder.cpp
 	;
 
-# The window of the old MediaConverter, until the new one replaces it
 local appSources =
+	HardwareWindow.cpp
 	MediaConverterApp.cpp
 	MediaConverterWindow.cpp
-	MediaEncoderWindow.cpp
-	MediaFileInfo.cpp
-	MediaFileInfoView.cpp
-	MediaFileListView.cpp
+	OutputView.cpp
+	QueueView.cpp
+	SourceView.cpp
 	;
 
 UseBuildFeatureHeaders ffmpeg ;
@@ -51,9 +50,9 @@ StaticLibrary libmediaconverter_engine.a : $(engineSources) ;
 Application MediaConverter :
 	$(appSources)
 	:
-	libmediaconverter_engine.a
+	libmediaconverter_engine.a libcolumnlistview.a
 	[ BuildFeatureAttribute ffmpeg : libraries ]
-	be media tracker translation localestub [ TargetLibstdc++ ]
+	be tracker translation localestub [ TargetLibstdc++ ]
 	: MediaConverter.rdef
 ;
 

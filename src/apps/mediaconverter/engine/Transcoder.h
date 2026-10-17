@@ -163,6 +163,7 @@ private:
 			std::vector<SubtitleStream*> fSubtitles;
 			std::vector<int>	fStreamKinds;	// per input stream
 			std::vector<int>	fStreamSlots;
+			std::vector<int64>	fCopyStarted;	// per input stream
 			std::vector<std::pair<int, AVStream*> > fAttachments;
 
 			int					fBurnInStream;	// input index, -1: none

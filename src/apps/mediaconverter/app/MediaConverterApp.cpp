@@ -1,0 +1,128 @@
+/*
+ * Copyright 2026, air/OS. All rights reserved.
+ * Distributed under the terms of the MIT License.
+ */
+
+
+#include "MediaConverterApp.h"
+
+#include <AboutWindow.h>
+#include <Catalog.h>
+#include <Entry.h>
+#include <Path.h>
+
+#include <stdio.h>
+#include <string.h>
+
+extern "C" {
+#include <libavutil/log.h>
+}
+
+#include "MediaConverterWindow.h"
+
+
+#undef B_TRANSLATION_CONTEXT
+#define B_TRANSLATION_CONTEXT "MediaConverter"
+
+
+const char* kAppSignature = "application/x-vnd.Haiku-MediaConverter";
+
+
+MediaConverterApp::MediaConverterApp()
+	:
+	BApplication(kAppSignature),
+	fWindow(NULL),
+	fPendingRefs(B_REFS_RECEIVED)
+{
+	av_log_set_level(AV_LOG_ERROR);
+}
+
+
+MediaConverterApp::~MediaConverterApp()
+{
+}
+
+
+void
+MediaConverterApp::ReadyToRun()
+{
+	fWindow = new MediaConverterWindow();
+	if (!fPendingRefs.IsEmpty())
+		fWindow->PostMessage(&fPendingRefs);
+	fWindow->Show();
+}
+
+
+void
+MediaConverterApp::RefsReceived(BMessage* message)
+{
+	if (fWindow == NULL) {
+		entry_ref ref;
+		for (int32 i = 0; message->FindRef("refs", i, &ref) == B_OK; i++)
+			fPendingRefs.AddRef("refs", &ref);
+		return;
+	}
+	fWindow->PostMessage(message);
+}
+
+
+void
+MediaConverterApp::ArgvReceived(int32 argc, char** argv)
+{
+	BMessage refs(B_REFS_RECEIVED);
+	for (int32 i = 1; i < argc; i++) {
+		BEntry entry(argv[i], true);
+		entry_ref ref;
+		if (entry.Exists() && entry.GetRef(&ref) == B_OK)
+			refs.AddRef("refs", &ref);
+	}
+	if (!refs.IsEmpty())
+		RefsReceived(&refs);
+}
+
+
+bool
+MediaConverterApp::QuitRequested()
+{
+	if (fWindow != NULL && fWindow->Lock()) {
+		bool quit = fWindow->QuitRequested();
+		if (quit)
+			fWindow->Quit();
+		else
+			fWindow->Unlock();
+		if (!quit)
+			return false;
+		fWindow = NULL;
+	}
+	return true;
+}
+
+
+void
+MediaConverterApp::AboutRequested()
+{
+	BAboutWindow* about = new BAboutWindow(
+		B_TRANSLATE_SYSTEM_NAME("MediaConverter"), kAppSignature);
+	about->AddDescription(B_TRANSLATE("Converts video and audio files, on "
+		"the graphics card's video encoder when it has one."));
+	const char* authors[] = {
+		"air/OS",
+		"Jun Suzuki (the original MediaConverter)",
+		"Stephan Aßmus",
+		NULL
+	};
+	about->AddCopyright(2026, "air/OS");
+	about->AddAuthors(authors);
+	about->AddText(B_TRANSLATE("Uses FFmpeg, x264, x265, SVT-AV1, libva and "
+		"Mesa."));
+	about->Show();
+}
+
+
+int
+main(int, char**)
+{
+	MediaConverterApp app;
+	app.Run();
+	return 0;
+}

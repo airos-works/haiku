@@ -4,13 +4,13 @@ resource app_signature "application/x-vnd.Haiku-MediaConverter";
 resource app_name_catalog_entry "x-vnd.Haiku-MediaConverter:System name:MediaConverter";
 
 resource app_version {
-	major      = 1,
-	middle     = 3,
-	minor      = 1,
-	variety    = B_APPV_BETA,
+	major      = 2,
+	middle     = 0,
+	minor      = 0,
+	variety    = B_APPV_FINAL,
 	internal   = 0,
 	short_info = "MediaConverter",
-	long_info  = "MediaConverter ©1999, Be, Inc., ©2000-2004 Jun Suzuki, ©2009 Haiku, Inc."
+	long_info  = "MediaConverter ©2026 air/OS; ©1999 Be, Inc., ©2000-2004 Jun Suzuki, ©2009 Haiku, Inc."
 };
 
 resource app_flags B_SINGLE_LAUNCH;

@@ -37,6 +37,39 @@ extern "C" {
 #include "VideoEncoder.h"
 
 
+/*!	Where the time goes, when MEDIACONVERTER_PROFILE is set: summed per
+	stage and printed at the end. */
+struct StageClock {
+	const char*	name;
+	bigtime_t	total;
+	int64		count;
+};
+
+static StageClock sStages[] = {
+	{ "read", 0, 0 }, { "decode video", 0, 0 }, { "filter video", 0, 0 },
+	{ "encode video", 0, 0 }, { "audio", 0, 0 }, { "write", 0, 0 },
+};
+enum { kStageRead, kStageDecode, kStageFilter, kStageEncode, kStageAudio,
+	kStageWrite };
+static bool sProfile = getenv("MEDIACONVERTER_PROFILE") != NULL;
+
+class StageTimer {
+public:
+	StageTimer(int stage)
+		: fStage(stage), fStart(sProfile ? system_time() : 0) {}
+	~StageTimer()
+	{
+		if (sProfile) {
+			atomic_add64(&sStages[fStage].total, system_time() - fStart);
+			atomic_add64(&sStages[fStage].count, 1);
+		}
+	}
+private:
+	int			fStage;
+	bigtime_t	fStart;
+};
+
+
 enum {
 	kStreamIgnored = 0,
 	kStreamVideo,
@@ -278,7 +311,11 @@ Transcoder::_OpenInput(BString& error)
 	fStreamKinds.assign(fInput->nb_streams, kStreamIgnored);
 	fStreamSlots.assign(fInput->nb_streams, -1);
 
-	int64 base = fInput->start_time != AV_NOPTS_VALUE ? fInput->start_time : 0;
+	// Negative times are a pre-roll (an MP4 edit list, Matroska's codec
+	// delay): what is shown starts at 0. Positive ones (MPEG-TS) are where
+	// the source's clock starts.
+	int64 base = fInput->start_time != AV_NOPTS_VALUE
+		? max_c(fInput->start_time, (int64)0) : 0;
 	fStartTime = base + max_c(fJob.settings.start, 0);
 	if (fJob.settings.end > fJob.settings.start)
 		fEndTime = base + fJob.settings.end;
@@ -825,7 +862,8 @@ Transcoder::_VideoFilters(VideoStream& stream, int sourceWidth,
 
 	if (stream.forceRate) {
 		BString fps;
-		fps.SetToFormat("fps=fps=%d/%d", stream.rate.num, stream.rate.den);
+		fps.SetToFormat("fps=fps=%d/%d:eof_action=pass", stream.rate.num,
+			stream.rate.den);
 		add(fps);
 	}
 	return chain;
@@ -1505,7 +1543,11 @@ Transcoder::_FeedBurnIn(AVPacket* packet)
 status_t
 Transcoder::_DecodeVideo(VideoStream& stream, AVPacket* packet)
 {
-	int result = avcodec_send_packet(stream.decoder, packet);
+	int result;
+	{
+		StageTimer timer(kStageDecode);
+		result = avcodec_send_packet(stream.decoder, packet);
+	}
 	if (result < 0 && result != AVERROR_EOF && result != AVERROR(EAGAIN)) {
 		// a broken packet: carry on with the next one, as players do
 		return B_OK;
@@ -1513,7 +1555,10 @@ Transcoder::_DecodeVideo(VideoStream& stream, AVPacket* packet)
 	AVFrame* frame = av_frame_alloc();
 	status_t status = B_OK;
 	while (status == B_OK) {
-		result = avcodec_receive_frame(stream.decoder, frame);
+		{
+			StageTimer timer(kStageDecode);
+			result = avcodec_receive_frame(stream.decoder, frame);
+		}
 		if (result == AVERROR(EAGAIN) || result == AVERROR_EOF)
 			break;
 		if (result < 0)
@@ -1566,14 +1611,21 @@ Transcoder::_FilterVideo(VideoStream& stream, AVFrame* frame)
 		&& av_buffersrc_add_frame(stream.subtitleSource, NULL) < 0)
 		return B_ERROR;
 
-	if (av_buffersrc_add_frame_flags(stream.source, frame,
-			AV_BUFFERSRC_FLAG_KEEP_REF) < 0)
-		return B_ERROR;
+	{
+		StageTimer timer(kStageFilter);
+		if (av_buffersrc_add_frame_flags(stream.source, frame,
+				AV_BUFFERSRC_FLAG_KEEP_REF) < 0)
+			return B_ERROR;
+	}
 
 	AVFrame* filtered = av_frame_alloc();
 	status_t status = B_OK;
 	while (status == B_OK) {
-		int result = av_buffersink_get_frame(stream.sink, filtered);
+		int result;
+		{
+			StageTimer timer(kStageFilter);
+			result = av_buffersink_get_frame(stream.sink, filtered);
+		}
 		if (result == AVERROR(EAGAIN) || result == AVERROR_EOF)
 			break;
 		if (result < 0) {
@@ -1609,6 +1661,7 @@ Transcoder::_EncodeVideo(VideoStream& stream, AVFrame* frame)
 		}
 		frame->pts -= start;
 		frame->sample_aspect_ratio = stream.sampleAspect;
+		StageTimer timer(kStageEncode);
 		if (stream.encoder->SendFrame(frame) != B_OK)
 			return B_ERROR;
 		stream.frames++;
@@ -1890,6 +1943,7 @@ Transcoder::_ConvertSubtitle(SubtitleStream& stream, AVPacket* packet)
 status_t
 Transcoder::_Write(AVPacket* packet, AVStream* out, AVRational timeBase)
 {
+	StageTimer timer(kStageWrite);
 	packet->stream_index = out->index;
 	av_packet_rescale_ts(packet, timeBase, out->time_base);
 	int result = av_interleaved_write_frame(fOutput, packet);
@@ -1915,9 +1969,23 @@ Transcoder::_Copy(AVPacket* packet, AVStream* in, AVStream* out)
 	}
 	if (packet->dts != AV_NOPTS_VALUE)
 		packet->dts -= offset;
-	// cut copies at a key frame
-	if (packet->pts != AV_NOPTS_VALUE && packet->pts < 0
-		&& fJob.settings.start > 0)
+	// copies start at the first key frame at or after the start, and drop
+	// the pictures that lead it (they refer to the cut-off pictures)
+	int slot = in->index;
+	if (slot >= (int)fCopyStarted.size())
+		fCopyStarted.resize(fInput->nb_streams, AV_NOPTS_VALUE);
+	if (packet->pts != AV_NOPTS_VALUE) {
+		bool video = in->codecpar->codec_type == AVMEDIA_TYPE_VIDEO;
+		if (fCopyStarted[slot] == AV_NOPTS_VALUE) {
+			if (packet->pts < 0
+				|| (video && (packet->flags & AV_PKT_FLAG_KEY) == 0))
+				return B_OK;
+			fCopyStarted[slot] = packet->pts;
+		} else if (video && packet->pts < fCopyStarted[slot])
+			return B_OK;
+	} else if (fCopyStarted[slot] == AV_NOPTS_VALUE)
+		return B_OK;
+	if ((packet->flags & AV_PKT_FLAG_DISCARD) != 0)
 		return B_OK;
 	int64 position = packet->pts != AV_NOPTS_VALUE
 		? av_rescale_q(packet->pts, in->time_base, AV_TIME_BASE_Q) + fStartTime
@@ -2087,7 +2155,10 @@ Transcoder::Run(TranscodeListener* listener, BString& error)
 	AVPacket* packet = av_packet_alloc();
 	status = B_OK;
 	while (status == B_OK && !fCancelled) {
-		result = av_read_frame(fInput, packet);
+		{
+			StageTimer timer(kStageRead);
+			result = av_read_frame(fInput, packet);
+		}
 		if (result == AVERROR(EAGAIN))
 			continue;
 		if (result < 0)
@@ -2117,6 +2188,7 @@ Transcoder::Run(TranscodeListener* listener, BString& error)
 				break;
 			case kStreamAudio:
 			{
+				StageTimer timer(kStageAudio);
 				AudioStream* stream = fAudio[fStreamSlots[index]];
 				if (stream->copy)
 					status = _Copy(packet, stream->in, stream->out);
@@ -2179,6 +2251,16 @@ Transcoder::Run(TranscodeListener* listener, BString& error)
 	}
 	fHeaderWritten = false;
 	_Progress(fEndTime > 0 ? fEndTime : fStartTime + fDuration, true);
+	if (sProfile) {
+		bigtime_t wall = system_time() - fStarted;
+		fprintf(stderr, "profile: %.2f s wall\n", wall / 1e6);
+		for (size_t i = 0; i < sizeof(sStages) / sizeof(sStages[0]); i++) {
+			fprintf(stderr, "  %-13s %8.3f s %7" B_PRId64 " calls %7.3f ms\n",
+				sStages[i].name, sStages[i].total / 1e6, sStages[i].count,
+				sStages[i].count > 0
+					? sStages[i].total / 1e3 / sStages[i].count : 0.0);
+		}
+	}
 	_Cleanup();
 	return B_OK;
 }

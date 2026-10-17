@@ -1,0 +1,39 @@
+/*
+ * Copyright 2026, air/OS. All rights reserved.
+ * Distributed under the terms of the MIT License.
+ */
+#ifndef MESSAGES_H
+#define MESSAGES_H
+
+
+enum {
+	kMsgAddFiles				= 'adfl',
+	kMsgRemoveFiles				= 'rmfl',
+	kMsgClearFinished			= 'clfn',
+	kMsgQueueSelection			= 'qsel',
+	kMsgQueueInvoked			= 'qinv',
+
+	kMsgSettingsChanged			= 'stch',
+	kMsgPresetChosen			= 'prst',
+	kMsgChooseFolder			= 'chfd',
+	kMsgFolderChosen			= 'fdch',
+	kMsgSameFolder				= 'smfd',
+
+	kMsgConvert					= 'cnvt',
+	kMsgStop					= 'stop',
+	kMsgShowHardware			= 'shhw',
+	kMsgToggleCpuWarning		= 'tgcw',
+	kMsgShowInTracker			= 'shtr',
+	kMsgPlayOutput				= 'plyo',
+
+	// from the worker thread
+	kMsgJobStarted				= 'jbst',
+	kMsgJobProgress				= 'jbpr',
+	kMsgJobFinished				= 'jbfn',
+	kMsgQueueFinished			= 'qfin',
+	kMsgSourceProbed			= 'sprb',
+	kMsgPreviewReady			= 'prvw',
+};
+
+
+#endif	// MESSAGES_H
