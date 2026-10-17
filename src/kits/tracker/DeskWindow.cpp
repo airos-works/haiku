@@ -252,6 +252,7 @@ BDeskWindow::Init(const BMessage*)
 	fOldFrame = screen.Frame();
 
 	ResizeTo(fOldFrame.Width(), fOldFrame.Height());
+	PoseView()->UpdateDisplayRegion();
 
 	InitKeyIndices();
 	InitAddOnsList(false);
@@ -502,6 +503,7 @@ BDeskWindow::ScreenChanged(BRect frame, color_space space)
 	SaveDesktopPoseLocations();
 	fOldFrame = frame;
 	ResizeTo(frame.Width(), frame.Height());
+	PoseView()->UpdateDisplayRegion();
 
 	if (fBackgroundImage != NULL)
 		fBackgroundImage->ScreenChanged(frame, space);

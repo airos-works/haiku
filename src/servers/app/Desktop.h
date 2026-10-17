@@ -340,11 +340,24 @@ private:
 			void				_UpdateDisplays();
 			void				_StoreDisplayLayout();
 			void				_RememberScreenMode(Screen* screen);
-			void				_KeepWindowsOnDisplays();
+			void				_KeepWindowsOnDisplays(
+									const BRegion& previousScreen);
+			void				_BringOntoDisplays(Window* window);
 			void				_UpdateCursorDensity();
 			void				_MoveWindowsWithDisplays(
 									const DisplayLayout& before,
 									const DisplayLayout& after);
+			void				_SendWindowAway(Window* window,
+									const BString& key, BRect from,
+									BRect to);
+			void				_PlaceWindow(Window* window, BRect frame);
+			BRect				_FitOnDisplay(Window* window, BRect frame,
+									BRect area);
+	static	BRect				_DecoratedFrame(Window* window);
+	static	bool				_IsOnDisplays(BRect decoratedFrame,
+									const BRegion& displays);
+	static	BRect				_Proportional(BRect frame, BRect from,
+									BRect to);
 			void				_SetCurrentWorkspaceConfiguration();
 			void				_PublishDeviceScale();
 			bool				_CopyWindowApproximately(Window* window,

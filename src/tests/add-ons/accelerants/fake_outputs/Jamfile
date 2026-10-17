@@ -1,0 +1,27 @@
+SubDir HAIKU_TOP src tests add-ons accelerants fake_outputs ;
+
+# The framebuffer accelerant, pretending its frame buffer is shown by several
+# monitors that come and go; see fake_outputs.cpp. Install it in a virtual
+# machine as non-packaged add-ons/accelerants/framebuffer.accelerant.
+
+UsePrivateHeaders graphics ;
+UsePrivateHeaders [ FDirName graphics vesa ] ;
+UsePrivateHeaders [ FDirName graphics common ] ;
+UsePrivateHeaders shared ;
+
+local framebufferDir = [ FDirName $(HAIKU_TOP) src add-ons accelerants
+	framebuffer ] ;
+SEARCH_SOURCE += $(framebufferDir) ;
+SubDirHdrs $(framebufferDir) ;
+
+# the original's hook table, looked up for what the monitors do not change
+ObjectDefines hooks.cpp
+	: get_accelerant_hook=framebuffer_get_accelerant_hook ;
+
+Addon fake_outputs.accelerant :
+	accelerant.cpp
+	hooks.cpp
+	mode.cpp
+	fake_outputs.cpp
+	: libaccelerantscommon.a
+;

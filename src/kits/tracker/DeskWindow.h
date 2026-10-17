@@ -66,6 +66,8 @@ public:
 	DesktopPoseView* PoseView() const;
 
 	void SaveDesktopPoseLocations();
+	BRect DesktopFrame() const { return fOldFrame; }
+		// the screen frame the icon locations are kept for
 
 	virtual bool ShouldHaveDraggableFolderIcon() { return false; };
 

@@ -21,6 +21,8 @@
 
 #include "Desktop.h"
 
+#include <algorithm>
+#include <math.h>
 #include <stdio.h>
 #include <vector>
 #include <string.h>
@@ -1434,6 +1436,9 @@ Desktop::ShowWindow(Window* window)
 		return;
 
 	AutoWriteLocker locker(fWindowLock);
+
+	if (window->InWorkspace(fCurrentWorkspace))
+		_BringOntoDisplays(window);
 
 	window->SetHidden(false);
 	fFocusList.AddWindow(window);
@@ -3847,6 +3852,7 @@ Desktop::_ScreenChanged(Screen* screen)
 	BRegion dirty(screen->Frame());
 
 	// update our cached screen region
+	BRegion previousScreen(fScreenRegion);
 	fScreenRegion.Set(screen->Frame());
 	{
 		AutoWriteLocker screenLocker(fScreenLock);
@@ -3856,7 +3862,7 @@ Desktop::_ScreenChanged(Screen* screen)
 	}
 
 	// windows that would be left where no monitor is come along
-	_KeepWindowsOnDisplays();
+	_KeepWindowsOnDisplays(previousScreen);
 
 	BRegion background;
 	_RebuildClippingForAllWindows(background);
@@ -4021,10 +4027,12 @@ Desktop::_RememberScreenMode(Screen* screen)
 
 /*!	After the monitors changed, a window can find itself where nothing is
 	shown any more. Such windows are moved onto the monitor nearest to where
-	they were. The window lock must be held for writing.
+	they were. Windows that were out of sight before already stay there:
+	programs put the windows they do not want seen far outside the screen.
+	The window lock must be held for writing.
 */
 void
-Desktop::_KeepWindowsOnDisplays()
+Desktop::_KeepWindowsOnDisplays(const BRegion& previousScreen)
 {
 	BRegion displays;
 	{
@@ -4038,90 +4046,289 @@ Desktop::_KeepWindowsOnDisplays()
 			window = window->NextWindow(kAllWindowList)) {
 		if (window->IsHidden() || !window->InWorkspace(fCurrentWorkspace)
 			|| window->Feel() == kDesktopWindowFeel
-			|| window->IsOffscreenWindow())
+			|| window->IsOffscreenWindow()
+			|| window->TopLayerStackWindow() != window)
 			continue;
 
-		BRect frame = window->Frame();
-		::Decorator* decorator = window->Decorator();
-		if (decorator != NULL) {
-			if (decorator->TitleBarRect().IsValid())
-				frame = frame | decorator->TitleBarRect();
-			if (decorator->BorderRect().IsValid())
-				frame = frame | decorator->BorderRect();
-		}
-
-		// Enough of the title bar left to grab counts as on screen.
-		BRegion visible(frame);
-		visible.IntersectWith(&displays);
-		BRect visibleFrame = visible.Frame();
-		if (visibleFrame.IsValid()
-			&& visibleFrame.Width() >= min_c(64.0f, frame.Width())
-			&& visibleFrame.Height() >= min_c(32.0f, frame.Height()))
+		BRect frame = _DecoratedFrame(window);
+		if (_IsOnDisplays(frame, displays)
+			|| !previousScreen.Intersects(frame))
 			continue;
 
-		const DisplayInfo* target;
+		BRect area;
 		{
 			AutoReadLocker screenLocker(fScreenLock);
-			target = fDisplays.DisplayFor(frame);
+			const DisplayInfo* target = fDisplays.DisplayFor(frame);
+			if (target == NULL)
+				continue;
+			area = target->frame;
 		}
-		if (target == NULL)
-			continue;
-		BRect area = target->frame;
-
-		float dx = 0, dy = 0;
-		if (frame.right + dx > area.right)
-			dx = area.right - frame.right;
-		if (frame.left + dx < area.left)
-			dx = area.left - frame.left;
-		if (frame.bottom + dy > area.bottom)
-			dy = area.bottom - frame.bottom;
-		if (frame.top + dy < area.top)
-			dy = area.top - frame.top;
-		if (dx == 0 && dy == 0)
-			continue;
-
-		window->MoveBy((int32)dx, (int32)dy);
-		NotifyWindowMoved(window);
+		_PlaceWindow(window, _FitOnDisplay(window, window->Frame(), area));
 	}
+}
+
+
+/*!	A window about to be shown where no monitor is, but where one of the
+	monitors the settings remember was, belongs on that monitor: it goes
+	where that monitor is now, or, when it is not connected, onto the main
+	display, to return once it is. This is how a window comes up that a
+	program put back where it was last, on a monitor since unplugged.
+	A window within the screen, but beside a smaller monitor where none
+	shows it, goes onto the nearest one. Windows that are out of sight
+	elsewhere stay there. The window lock must be held for writing.
+*/
+void
+Desktop::_BringOntoDisplays(Window* window)
+{
+	if (window->Feel() == kDesktopWindowFeel || window->IsOffscreenWindow()
+		|| window->TopLayerStackWindow() != window)
+		return;
+
+	BRect frame = window->Frame();
+	BRect decorated = _DecoratedFrame(window);
+	BString key;
+	BRect remembered;
+	BRect target = frame;
+	BRect area;
+	bool away = false;
+	{
+		AutoReadLocker screenLocker(fScreenLock);
+		BRegion displays = fDisplays.Region();
+		if (displays.CountRects() == 0 || _IsOnDisplays(decorated, displays))
+			return;
+
+		const DisplayInfo* display;
+		if (DisplayLayout::RememberedDisplayFor(*fSettings->DisplaysMessage(),
+				frame, key, remembered)) {
+			display = fDisplays.DisplayByKey(key);
+			if (display != NULL) {
+				// that monitor is here, just somewhere else in the
+				// arrangement
+				target.OffsetBy(display->frame.LeftTop()
+					- remembered.LeftTop());
+			} else {
+				display = fDisplays.PrimaryDisplay();
+				away = true;
+			}
+		} else if (fDisplays.Frame().Intersects(decorated))
+			display = fDisplays.DisplayFor(decorated);
+		else
+			return;
+		if (display == NULL)
+			return;
+		area = display->frame;
+	}
+
+	if (away)
+		_SendWindowAway(window, key, remembered, area);
+	else
+		_PlaceWindow(window, _FitOnDisplay(window, target, area));
 }
 
 
 /*!	When monitors are rearranged or rescaled, the windows on each one go
 	along with it, keeping their place on it: swapping two monitors swaps
 	their windows, and a monitor that got smaller in desktop pixels keeps
-	its windows in proportion. The window lock must be held for writing.
+	its windows in proportion. The windows of a monitor that went away move
+	onto the main display, and back once that monitor returns, unless they
+	were moved meanwhile. Hidden windows and those of other workspaces are
+	moved as well, so that they come up where they belong.
+	The window lock must be held for writing.
 */
 void
 Desktop::_MoveWindowsWithDisplays(const DisplayLayout& before,
 	const DisplayLayout& after)
 {
+	BRegion displaysBefore = before.Region();
+
 	for (Window* window = fAllWindows.FirstWindow(); window != NULL;
 			window = window->NextWindow(kAllWindowList)) {
-		if (window->IsHidden() || !window->InWorkspace(fCurrentWorkspace)
-			|| window->Feel() == kDesktopWindowFeel
-			|| window->IsOffscreenWindow())
+		if (window->Feel() == kDesktopWindowFeel
+			|| window->IsOffscreenWindow()
+			|| window->TopLayerStackWindow() != window)
 			continue;
 
 		BRect frame = window->Frame();
+
+		if (window->HasHomeDisplay()) {
+			const DisplayInfo* home = after.DisplayByKey(
+				window->HomeDisplay());
+			if (window->AwayFrame() != frame)
+				window->ForgetHomeDisplay();
+			else if (home != NULL) {
+				BRect target = window->HomeFrame().OffsetByCopy(
+					home->frame.LeftTop());
+				_PlaceWindow(window,
+					_FitOnDisplay(window, target, home->frame));
+				window->ForgetHomeDisplay();
+				continue;
+			}
+		}
+
+		// windows nobody could see before stay out of sight
+		if (!displaysBefore.Intersects(_DecoratedFrame(window)))
+			continue;
+
 		const DisplayInfo* was = before.DisplayFor(frame);
-		if (was == NULL || !was->IsEnabled())
+		if (was == NULL)
 			continue;
 		const DisplayInfo* now = after.DisplayByID(was->id);
-		if (now == NULL || !now->IsEnabled() || now->frame == was->frame)
+		if (now != NULL && (!now->IsEnabled() || now->IsMirror()
+				|| now->key != was->key))
+			now = NULL;
+
+		if (now == NULL) {
+			// its monitor went away
+			const DisplayInfo* target = after.PrimaryDisplay();
+			if (target == NULL)
+				continue;
+			if (window->HasHomeDisplay()) {
+				// away already, from another monitor, which it still
+				// returns to
+				BRect away = _FitOnDisplay(window,
+					_Proportional(frame, was->frame, target->frame),
+					target->frame);
+				_PlaceWindow(window, away);
+				window->SetAwayFrame(window->Frame());
+			} else
+				_SendWindowAway(window, was->key, was->frame, target->frame);
+			continue;
+		}
+
+		if (now->frame == was->frame)
 			continue;
 
-		float scaleX = (now->frame.Width() + 1) / (was->frame.Width() + 1);
-		float scaleY = (now->frame.Height() + 1) / (was->frame.Height() + 1);
-		float left = now->frame.left + (frame.left - was->frame.left) * scaleX;
-		float top = now->frame.top + (frame.top - was->frame.top) * scaleY;
-		int32 dx = (int32)roundf(left - frame.left);
-		int32 dy = (int32)roundf(top - frame.top);
-		if (dx == 0 && dy == 0)
-			continue;
+		_PlaceWindow(window, _Proportional(frame, was->frame, now->frame));
+		if (window->HasHomeDisplay())
+			window->SetAwayFrame(window->Frame());
+	}
+}
 
+
+/*!	Moves \a window from the monitor it was on, whose place in the desktop
+	was \a from, onto \a to, at the same place in proportion, and remembers
+	the monitor by its \a key, to return to it.
+*/
+void
+Desktop::_SendWindowAway(Window* window, const BString& key, BRect from,
+	BRect to)
+{
+	BRect frame = window->Frame();
+	_PlaceWindow(window,
+		_FitOnDisplay(window, _Proportional(frame, from, to), to));
+	window->SetHomeDisplay(key, frame.OffsetByCopy(-from.left, -from.top),
+		window->Frame());
+}
+
+
+/*!	Moves and sizes \a window to \a frame, also when it is hidden or on
+	another workspace, where it keeps the new place too. The caller takes
+	care of the screen. The window lock must be held for writing.
+*/
+void
+Desktop::_PlaceWindow(Window* window, BRect frame)
+{
+	BPoint previous = window->Frame().LeftTop();
+
+	int32 width = frame.IntegerWidth() - window->Frame().IntegerWidth();
+	int32 height = frame.IntegerHeight() - window->Frame().IntegerHeight();
+	if (width != 0 || height != 0) {
+		BRegion dirty;
+		window->ResizeBy(width, height, window->IsVisible() ? &dirty : NULL);
+		NotifyWindowResized(window);
+	}
+
+	int32 dx = (int32)roundf(frame.left - window->Frame().left);
+	int32 dy = (int32)roundf(frame.top - window->Frame().top);
+	if (dx != 0 || dy != 0) {
 		window->MoveBy(dx, dy);
 		NotifyWindowMoved(window);
 	}
+
+	for (int32 i = 0; i < kMaxWorkspaces; i++) {
+		if (window->InWorkspace(i) && window->Anchor(i).position == previous)
+			window->Anchor(i).position = window->Frame().LeftTop();
+	}
+}
+
+
+/*!	\a frame, moved, and shrunk if it has to be and the window's size limits
+	allow it, so that the window with its border and tab lies within \a area.
+	When it cannot, the tab, which it is moved by, stays on it.
+*/
+BRect
+Desktop::_FitOnDisplay(Window* window, BRect frame, BRect area)
+{
+	BRect current = window->Frame();
+	BRect decorated = _DecoratedFrame(window);
+	float left = current.left - decorated.left;
+	float top = current.top - decorated.top;
+	float right = decorated.right - current.right;
+	float bottom = decorated.bottom - current.bottom;
+
+	int32 minWidth, maxWidth, minHeight, maxHeight;
+	window->GetSizeLimits(&minWidth, &maxWidth, &minHeight, &maxHeight);
+	float width = std::min(frame.Width(), area.Width() - left - right);
+	float height = std::min(frame.Height(), area.Height() - top - bottom);
+	frame.right = frame.left + roundf(std::max(width, (float)minWidth));
+	frame.bottom = frame.top + roundf(std::max(height, (float)minHeight));
+
+	float dx = 0, dy = 0;
+	if (frame.right + right > area.right)
+		dx = area.right - right - frame.right;
+	if (frame.left - left + dx < area.left)
+		dx = area.left + left - frame.left;
+	if (frame.bottom + bottom > area.bottom)
+		dy = area.bottom - bottom - frame.bottom;
+	if (frame.top - top + dy < area.top)
+		dy = area.top + top - frame.top;
+	frame.OffsetBy(roundf(dx), roundf(dy));
+	return frame;
+}
+
+
+/*!	The window's frame with its border and tab.
+*/
+/*static*/ BRect
+Desktop::_DecoratedFrame(Window* window)
+{
+	BRect frame = window->Frame();
+	::Decorator* decorator = window->Decorator();
+	if (decorator != NULL) {
+		if (decorator->TitleBarRect().IsValid())
+			frame = frame | decorator->TitleBarRect();
+		if (decorator->BorderRect().IsValid())
+			frame = frame | decorator->BorderRect();
+	}
+	return frame;
+}
+
+
+/*!	Whether enough of a window is on the monitors to grab it: some of its
+	title bar, or of its border.
+*/
+/*static*/ bool
+Desktop::_IsOnDisplays(BRect decoratedFrame, const BRegion& displays)
+{
+	BRegion visible(decoratedFrame);
+	visible.IntersectWith(&displays);
+	BRect visibleFrame = visible.Frame();
+	return visibleFrame.IsValid()
+		&& visibleFrame.Width() >= std::min(64.0f, decoratedFrame.Width())
+		&& visibleFrame.Height() >= std::min(32.0f, decoratedFrame.Height());
+}
+
+
+/*!	\a frame, which is on \a from, at the same place in proportion on \a to.
+*/
+/*static*/ BRect
+Desktop::_Proportional(BRect frame, BRect from, BRect to)
+{
+	float scaleX = (to.Width() + 1) / (from.Width() + 1);
+	float scaleY = (to.Height() + 1) / (from.Height() + 1);
+	return frame.OffsetToCopy(
+		roundf(to.left + (frame.left - from.left) * scaleX),
+		roundf(to.top + (frame.top - from.top) * scaleY));
 }
 
 
@@ -4423,6 +4630,7 @@ Desktop::_SetWorkspace(int32 index, bool moveFocusWindow)
 				BPoint offset = position - window->Frame().LeftTop();
 				window->MoveBy((int32)offset.x, (int32)offset.y);
 			}
+			_BringOntoDisplays(window);
 			continue;
 		}
 

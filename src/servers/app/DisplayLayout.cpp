@@ -803,6 +803,67 @@ DisplayLayout::DisplayByID(uint32 id) const
 
 
 const DisplayInfo*
+DisplayLayout::DisplayByKey(const BString& key) const
+{
+	for (size_t i = 0; i < fDisplays.size(); i++) {
+		const DisplayInfo& display = fDisplays[i];
+		if (display.key == key && display.IsConnected()
+			&& display.IsEnabled() && !display.IsMirror())
+			return &display;
+	}
+	return NULL;
+}
+
+
+/*!	Which monitor \a frame was on when the settings were stored: the one
+	whose remembered place holds most of it. A window keeps the coordinates
+	it had on a monitor after that monitor is unplugged or the monitors are
+	arranged anew; this tells which monitor they belong to, by its key, and
+	where that monitor was then, in \a _displayFrame.
+	Returns false when \a frame was on none of them, which is also where
+	programs put the windows they want out of sight.
+*/
+/*static*/ bool
+DisplayLayout::RememberedDisplayFor(const BMessage& saved, BRect frame,
+	BString& _key, BRect& _displayFrame)
+{
+	float bestArea = 0;
+	BMessage entry;
+	for (int32 i = 0; saved.FindMessage("display", i, &entry) == B_OK; i++) {
+		const char* key;
+		int32 x, y, width, height, scale;
+		if (entry.FindString("key", &key) != B_OK
+			|| entry.FindInt32("x", &x) != B_OK
+			|| entry.FindInt32("y", &y) != B_OK
+			|| entry.FindInt32("width", &width) != B_OK
+			|| entry.FindInt32("height", &height) != B_OK
+			|| entry.FindInt32("scale", &scale) != B_OK
+			|| width <= 0 || height <= 0 || !IsValidScale(scale))
+			continue;
+		if (entry.HasString("mirror key"))
+			continue;
+
+		int32 logicalWidth = (width * 100 + scale / 2) / scale;
+		int32 logicalHeight = (height * 100 + scale / 2) / scale;
+		BRect displayFrame(x, y, x + logicalWidth - 1, y + logicalHeight - 1);
+		BRect common = displayFrame & frame;
+		if (!common.IsValid())
+			continue;
+
+		// The settings list the monitors seen last first, so an older
+		// place of the same monitor only wins with more of the frame.
+		float area = (common.Width() + 1) * (common.Height() + 1);
+		if (area > bestArea) {
+			bestArea = area;
+			_key = key;
+			_displayFrame = displayFrame;
+		}
+	}
+	return bestArea > 0;
+}
+
+
+const DisplayInfo*
 DisplayLayout::PrimaryDisplay() const
 {
 	for (size_t i = 0; i < fDisplays.size(); i++) {

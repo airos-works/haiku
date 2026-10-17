@@ -74,6 +74,7 @@ All rights reserved.
 #include <VolumeRoster.h>
 #include <Window.h>
 
+#include <InterfacePrivate.h>
 #include <PathMonitor.h>
 
 #include "Attributes.h"
@@ -2037,6 +2038,8 @@ BPoseView::CreatePoses(Model** models, PoseInfo* poseInfoArray, int32 count,
 
 		// set location from poseinfo if saved loc was for this dir
 		if (poseInfo->fInitedDirectory != -1LL) {
+			if (IsDesktopView())
+				DesktopLocationForFrame(model, poseInfo->fLocation);
 			PinPointToValidRange(poseInfo->fLocation);
 			pose->SetLocation(poseInfo->fLocation, this);
 			AddToVSList(pose);
@@ -2083,16 +2086,16 @@ BPoseView::CreatePoses(Model** models, PoseInfo* poseInfoArray, int32 count,
 
 				poseBounds = pose->CalcRect(this);
 
-				if (fEnsurePosesVisible && !viewBounds.Intersects(poseBounds)) {
-					viewBounds.InsetBy(20, 20);
+				if (fEnsurePosesVisible && !IsOnDisplays(poseBounds)) {
+					// Nobody would see it, as where it was is on a monitor
+					// that is not there: it is placed like a new one,
+					// which keeps it clear of the others as well. Where it
+					// was is still remembered for when that monitor is back.
 					RemoveFromVSList(pose);
-					BPoint loc(pose->Location(this));
-					loc.ConstrainTo(viewBounds);
-					pose->SetLocation(loc, this);
-					pose->SetSaveLocation();
+					PlacePose(pose, viewBounds);
+					pose->SetAutoPlaced(true);
 					AddToVSList(pose);
 					poseBounds = pose->CalcRect(this);
-					viewBounds.InsetBy(-20, -20);
 				}
 
 				if (forceDraw && viewBounds.Intersects(poseBounds))
@@ -3727,9 +3730,16 @@ BPoseView::IsValidLocation(const BRect& rect)
 	if (!IsDesktopView())
 		return true;
 
-	// on the desktop, don't allow icons outside of the view bounds
+	// on the desktop, don't allow icons outside of the view bounds, nor
+	// between monitors where none shows the screen
 	if (!Bounds().Contains(rect))
 		return false;
+	if (fDisplayRegion.CountRects() > 0) {
+		BRegion outside(rect);
+		outside.Exclude(&fDisplayRegion);
+		if (outside.CountRects() > 0)
+			return false;
+	}
 
 	// also check the deskbar frame
 	BRect deskbarFrame;
@@ -3749,6 +3759,81 @@ BPoseView::IsValidLocation(const BRect& rect)
 
 	// location is ok
 	return true;
+}
+
+
+/*!	Whether enough of \a rect, a pose's, is on screen to see and drag it:
+	on the desktop, enough of it on one of the monitors.
+*/
+bool
+BPoseView::IsOnDisplays(const BRect& rect) const
+{
+	if (!IsDesktopView() || fDisplayRegion.CountRects() == 0) {
+		BRect bounds(Bounds());
+		bounds.InsetBy(20, 20);
+		return rect.Intersects(bounds);
+	}
+
+	BRegion visible(rect);
+	visible.IntersectWith(&fDisplayRegion);
+	BRect visibleFrame(visible.Frame());
+	return visibleFrame.IsValid()
+		&& visibleFrame.Width() >= std::min(20.0f, rect.Width())
+		&& visibleFrame.Height() >= std::min(20.0f, rect.Height());
+}
+
+
+/*!	The desktop knows where the monitors are, to keep its icons on them.
+	With monitors of different sizes side by side, parts of the screen are
+	shown by none of them.
+*/
+void
+BPoseView::UpdateDisplayRegion()
+{
+	fDisplayRegion.MakeEmpty();
+	if (!IsDesktopView())
+		return;
+
+	BMessage layout;
+	if (BPrivate::get_display_layout(layout) == B_OK) {
+		BMessage display;
+		for (int32 index = 0;
+				layout.FindMessage("display", index, &display) == B_OK;
+				index++) {
+			BRect frame;
+			if (!display.GetBool("enabled", false)
+				|| display.GetInt32("mirror", -1) >= 0
+				|| display.FindRect("frame", &frame) != B_OK)
+				continue;
+			fDisplayRegion.Include(frame);
+		}
+	}
+
+	// the Deskbar may have moved along
+	fLastDeskbarFrameCheckTime = 0;
+}
+
+
+/*!	The desktop remembers where each icon was for every size the screen
+	had, which stands for an arrangement of monitors. Sets \a location to
+	where \a model's icon was when the screen was last as it is now, if it
+	ever was.
+*/
+bool
+BPoseView::DesktopLocationForFrame(Model* model, BPoint& location)
+{
+	BDeskWindow* deskWindow = dynamic_cast<BDeskWindow*>(Window());
+	if (deskWindow == NULL)
+		return false;
+
+	ExtendedPoseInfo* info = ReadExtendedPoseInfo(model);
+	bool found = info != NULL
+		&& info->HasLocationForFrame(deskWindow->DesktopFrame());
+	if (found)
+		location = info->LocationForFrame(deskWindow->DesktopFrame());
+	delete[] (char*)info;
+
+	return found;
 }
 
 
@@ -3815,6 +3900,7 @@ BPoseView::CheckPoseVisibility(BRect* newFrame)
 	BRect bounds(Bounds());
 	bounds.InsetBy(20, 20);
 
+	BObjectList<BPose> lostPoses;
 	int32 poseCount = fPoseList->CountItems();
 	for (int32 index = 0; index < poseCount; index++) {
 		BPose* pose = fPoseList->ItemAt(index);
@@ -3844,7 +3930,19 @@ BPoseView::CheckPoseVisibility(BRect* newFrame)
 		}
 
 		BRect rect(pose->CalcRect(this));
-		if (!rect.Intersects(bounds)) {
+		if (IsDesktopView() && !IsOnDisplays(rect)) {
+			// It was on a monitor that is gone, or between monitors: it
+			// goes into a free spot below, once the poses that stay are
+			// where they belong.
+			if (!locationNeedsUpdating) {
+				// didn't already invalidate and remove in the desktop case
+				Invalidate(rect);
+				RemoveFromVSList(pose);
+			}
+			lostPoses.AddItem(pose);
+			continue;
+		}
+		if (!IsDesktopView() && !rect.Intersects(bounds)) {
 			// pose doesn't fit on screen
 			if (!locationNeedsUpdating) {
 				// didn't already invalidate and remove in the desktop case
@@ -3867,6 +3965,20 @@ BPoseView::CheckPoseVisibility(BRect* newFrame)
 				// add it at the new location
 			Invalidate(pose->CalcRect(this));
 				// make sure the new pose location updates properly
+		}
+	}
+
+	if (!lostPoses.IsEmpty()) {
+		// placed like new poses, from the top left, where none is yet
+		BRect viewBounds(Bounds());
+		ResetPosePlacementHint();
+		int32 lostCount = lostPoses.CountItems();
+		for (int32 index = 0; index < lostCount; index++) {
+			BPose* pose = lostPoses.ItemAt(index);
+			PlacePose(pose, viewBounds);
+			AddToVSList(pose);
+			AddToExtent(pose->CalcRect(this));
+			Invalidate(pose->CalcRect(this));
 		}
 	}
 }
