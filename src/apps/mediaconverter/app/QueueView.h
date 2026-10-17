@@ -41,7 +41,17 @@ public:
 
 			int32				ID() const { return fID; }
 	const	entry_ref&			Ref() const { return fRef; }
+			// the file, or for a disc the source string of its title
 			BString				Path() const;
+			BString				Name() const;
+
+			// a DVD or Blu-ray: which title (-1 until the main one is
+			// known)
+			bool				IsDisc() const { return fDisc; }
+			void				SetDisc(bool disc) { fDisc = disc; }
+			int32				DiscTitle() const { return fDiscTitle; }
+			void				SetDiscTitle(int32 title)
+									{ fDiscTitle = title; }
 
 			job_state			State() const { return fState; }
 			void				SetState(job_state state)
@@ -72,6 +82,8 @@ private:
 
 			int32				fID;
 			entry_ref			fRef;
+			bool				fDisc;
+			int32				fDiscTitle;
 			SourceInfo			fInfo;
 			job_state			fState;
 			float				fProgress;

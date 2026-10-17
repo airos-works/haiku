@@ -72,7 +72,9 @@ SourceInfo::SourceInfo()
 	:
 	fileSize(0),
 	duration(0),
-	bitRate(0)
+	bitRate(0),
+	discTitle(-1),
+	discMainTitle(-1)
 {
 }
 
@@ -323,28 +325,39 @@ MediaProbe::Probe(const char* path, SourceInfo& info, BString* error)
 	info.path = path;
 	info.name = BPath(path).Leaf();
 
-	AVFormatContext* context = NULL;
-	int result = avformat_open_input(&context, path, NULL, NULL);
-	if (result < 0) {
-		if (error != NULL) {
-			char message[AV_ERROR_MAX_STRING_SIZE];
-			av_strerror(result, message, sizeof(message));
-			error->SetToFormat("Cannot open the file: %s", message);
+	// a disc: one of its titles, the main one unless the source names one
+	BString disc;
+	int32 title = -1;
+	if (!parse_disc_source(path, &disc, &title)
+		&& identify_disc(path) != kDiscNone)
+		disc = path;
+	if (!disc.IsEmpty()) {
+		if (list_disc_titles(disc.String(), info.discTitles,
+				&info.discMainTitle, error) != B_OK)
+			return B_ERROR;
+		if (title < 0)
+			title = info.discMainTitle;
+		info.discTitle = title;
+		info.path = disc_source(disc.String(), title);
+		info.name = disc_name(disc.String());
+		if (title != info.discMainTitle) {
+			BString number;
+			number.SetToFormat(" (title %d)", (int)title);
+			info.name << number;
 		}
-		return B_ERROR;
-	}
-	result = avformat_find_stream_info(context, NULL);
-	if (result < 0) {
-		if (error != NULL)
-			*error = "The file's streams cannot be read.";
-		avformat_close_input(&context);
-		return B_ERROR;
 	}
 
-	if (context->pb != NULL)
-		info.fileSize = avio_size(context->pb);
+	AVFormatContext* context = NULL;
+	if (open_source(&context, info.path.String(), error) < 0)
+		return B_ERROR;
+
+	info.fileSize = source_size(context);
 	info.containerName = context->iformat->long_name != NULL
 		? context->iformat->long_name : context->iformat->name;
+	if (info.IsDisc()) {
+		info.containerName = identify_disc(disc.String()) == kDiscDVD
+			? "DVD-Video" : "Blu-ray";
+	}
 	info.duration = context->duration != AV_NOPTS_VALUE
 		? context->duration : 0;
 	info.bitRate = context->bit_rate;
@@ -402,7 +415,7 @@ MediaProbe::Probe(const char* path, SourceInfo& info, BString* error)
 		info.metadata.push_back(entry);
 	}
 
-	avformat_close_input(&context);
+	close_source(&context);
 	return B_OK;
 }
 
@@ -504,7 +517,7 @@ MediaProbe::Preview(const char* path, float position, int maxWidth,
 	int maxHeight)
 {
 	AVFormatContext* context = NULL;
-	if (avformat_open_input(&context, path, NULL, NULL) < 0)
+	if (open_source(&context, path) < 0)
 		return NULL;
 	BBitmap* bitmap = NULL;
 	AVCodecContext* decoder = NULL;
@@ -517,8 +530,6 @@ MediaProbe::Preview(const char* path, float position, int maxWidth,
 	int rotation = 0;
 	bool done = false;
 
-	if (avformat_find_stream_info(context, NULL) < 0)
-		goto out;
 	streamIndex = av_find_best_stream(context, AVMEDIA_TYPE_VIDEO, -1, -1,
 		&codec, 0);
 	if (streamIndex < 0 || codec == NULL)
@@ -566,7 +577,7 @@ out:
 	av_frame_free(&frame);
 	av_packet_free(&packet);
 	avcodec_free_context(&decoder);
-	avformat_close_input(&context);
+	close_source(&context);
 	return bitmap;
 }
 

@@ -11,6 +11,8 @@
 
 #include <vector>
 
+#include "DiscSource.h"
+
 extern "C" {
 #include <libavcodec/codec_id.h>
 #include <libavutil/rational.h>
@@ -113,6 +115,12 @@ struct SourceInfo {
 	std::vector<ChapterInfo>		chapters;
 	std::vector<MetadataEntry>		metadata;
 
+	// a DVD or Blu-ray title: the disc's titles and which one this is
+	// (path is then a disc source string, see DiscSource.h)
+	std::vector<DiscTitle>			discTitles;
+	int32			discTitle;		// -1: not a disc
+	int32			discMainTitle;
+
 					SourceInfo();
 
 	bool			HasVideo() const { return !video.empty(); }
@@ -122,6 +130,7 @@ struct SourceInfo {
 	const VideoTrackInfo* MainVideo() const
 						{ return video.empty() ? NULL : &video[0]; }
 	BString			Metadata(const char* key) const;
+	bool			IsDisc() const { return discTitle >= 0; }
 };
 
 

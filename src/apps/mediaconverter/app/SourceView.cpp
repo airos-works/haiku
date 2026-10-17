@@ -13,6 +13,9 @@
 #include <ControlLook.h>
 #include <GroupLayout.h>
 #include <LayoutBuilder.h>
+#include <MenuField.h>
+#include <MenuItem.h>
+#include <PopUpMenu.h>
 #include <MessageRunner.h>
 #include <StringView.h>
 #include <Window.h>
@@ -24,6 +27,7 @@
 
 #include "AudioPreview.h"
 #include "MediaProbe.h"
+#include "Messages.h"
 #include "airtime/AirTimeMessages.h"
 #include "airtime/ControlBar.h"
 
@@ -229,6 +233,10 @@ SourceView::SourceView()
 	fExtra = new BStringView("extra", "");
 	fExtra->SetExplicitMinSize(BSize(50, B_SIZE_UNSET));
 	fExtra->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, B_SIZE_UNSET));
+	// a disc's titles, as HandBrake lists them
+	fDiscTitles = new BMenuField("disc titles", B_TRANSLATE("Title:"),
+		new BPopUpMenu(""));
+	fDiscTitles->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, B_SIZE_UNSET));
 
 	fTracks = new BColumnListView("tracks", B_NAVIGABLE, B_FANCY_BORDER, true);
 	float spacing = be_control_look->DefaultLabelSpacing();
@@ -251,6 +259,7 @@ SourceView::SourceView()
 				.Add(fTitle)
 				.Add(fSummary)
 				.Add(fExtra)
+				.Add(fDiscTitles)
 				.AddGlue()
 			.End()
 		.End()
@@ -481,6 +490,7 @@ SourceView::SetSource(const SourceInfo* info, int32 itemID)
 
 	fItemID = itemID;
 	fTracks->Clear();
+	_UpdateDiscTitles(info);
 	if (info == NULL) {
 		fTitle->SetText(B_TRANSLATE("No source"));
 		fSummary->SetText(B_TRANSLATE("Add files with the + button or drop "
@@ -549,6 +559,41 @@ SourceView::SetSource(const SourceInfo* info, int32 itemID)
 	}
 	fExtra->SetText(extra.String());
 	_AddTracks(*info);
+}
+
+
+/*!	A disc's titles in the Title menu; choosing one tells the window, which
+	reads that title instead. */
+void
+SourceView::_UpdateDiscTitles(const SourceInfo* info)
+{
+	BMenu* menu = fDiscTitles->Menu();
+	menu->RemoveItems(0, menu->CountItems(), true);
+	if (info == NULL || !info->IsDisc() || info->discTitles.empty()) {
+		if (!fDiscTitles->IsHidden())
+			fDiscTitles->Hide();
+		return;
+	}
+	for (size_t i = 0; i < info->discTitles.size(); i++) {
+		const DiscTitle& title = info->discTitles[i];
+		BString label;
+		label.SetToFormat(B_TRANSLATE("%d · %s · %d chapters"),
+			(int)title.number,
+			MediaProbe::FormatDuration(title.duration).String(),
+			(int)title.chapters);
+		if (title.number == info->discMainTitle)
+			label << B_TRANSLATE(" · main");
+		BMessage* message = new BMessage(kMsgDiscTitleChosen);
+		message->AddInt32("id", fItemID);
+		message->AddInt32("title", title.number);
+		BMenuItem* item = new BMenuItem(label.String(), message);
+		item->SetMarked(title.number == info->discTitle);
+		menu->AddItem(item);
+	}
+	if (Window() != NULL)
+		menu->SetTargetForItems(Window());
+	if (fDiscTitles->IsHidden())
+		fDiscTitles->Show();
 }
 
 
