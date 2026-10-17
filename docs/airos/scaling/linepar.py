@@ -92,13 +92,15 @@ def main():
         for s in sa:
             la, (l0, l1) = key(s, oa, oa2)
             best = None
+            nearest = 0.9
             for k, t in enumerate(sb):
                 if k in used or t[2] != s[2]:
                     continue
                 lb, (m0, m1) = key(t, ob, ob2)
-                if abs(la - lb) < 0.9 and abs(l0 - m0) < 2 and abs(l1 - m1) < 2:
+                if abs(la - lb) < nearest and abs(l0 - m0) < 2 \
+                        and abs(l1 - m1) < 2:
                     best = k
-                    break
+                    nearest = abs(la - lb)
             if best is None:
                 continue
             used.add(best)
