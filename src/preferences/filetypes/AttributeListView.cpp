@@ -16,6 +16,7 @@
 
 #include <Catalog.h>
 #include <ControlLook.h>
+#include <FrameLines.h>
 #include <Locale.h>
 #include <ObjectList.h>
 
@@ -393,9 +394,11 @@ AttributeListView::Draw(BRect updateRect)
 {
 	BListView::Draw(updateRect);
 
-	SetHighColor(tint_color(ui_color(B_PANEL_BACKGROUND_COLOR),
-		B_DARKEN_2_TINT));
-
-	float middle = Bounds().Width() / 2.0f;
-	StrokeLine(BPoint(middle, 0.0f), BPoint(middle, Bounds().bottom));
+	// over the items: at a fractional scale the line keeps its width
+	BRect bounds = Bounds();
+	float middle = floorf(bounds.Width() / 2.0f);
+	stroke_line_over_fill(this,
+		BRect(bounds.left, bounds.top, middle, bounds.bottom),
+		BControlLook::B_RIGHT_BORDER,
+		tint_color(ui_color(B_PANEL_BACKGROUND_COLOR), B_DARKEN_2_TINT));
 }
