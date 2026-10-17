@@ -142,10 +142,25 @@ print_hardware()
 		if (!decode.IsEmpty())
 			printf("    decode %s\n", decode.String());
 	}
-	printf("CPU encoders: %s; %s; %s\n",
-		SoftwareEncoders::Version(kSoftwareX264).String(),
-		SoftwareEncoders::Version(kSoftwareX265).String(),
-		SoftwareEncoders::Version(kSoftwareSvtAv1).String());
+	static const struct {
+		software_encoder	encoder;
+		const char*			name;
+	} kCpuEncoders[] = {
+		{ kSoftwareX264, "x264" }, { kSoftwareX265, "x265" },
+		{ kSoftwareSvtAv1, "SVT-AV1" }
+	};
+	BString cpu;
+	for (size_t i = 0; i < sizeof(kCpuEncoders) / sizeof(kCpuEncoders[0]);
+			i++) {
+		BString version = SoftwareEncoders::Version(kCpuEncoders[i].encoder);
+		if (!cpu.IsEmpty())
+			cpu << "; ";
+		if (version.IsEmpty())
+			cpu << kCpuEncoders[i].name << " missing";
+		else
+			cpu << version;
+	}
+	printf("CPU encoders: %s\n", cpu.String());
 	for (int c = 0; c < kVideoCopy; c++) {
 		video_codec codec = (video_codec)c;
 		const GpuDevice* device = inventory.EncoderFor(codec, 1920, 1080);
@@ -180,6 +195,8 @@ print_info(const char* path)
 			v.transfer.String(), v.matrix.String(),
 			v.interlaced ? ", interlaced" : "",
 			v.fullRange ? ", full range" : "", v.rotation);
+		if (v.closedCaptions)
+			printf("closed captions: CEA-608 in the pictures\n");
 	}
 	for (size_t i = 0; i < info.audio.size(); i++) {
 		const AudioTrackInfo& a = info.audio[i];

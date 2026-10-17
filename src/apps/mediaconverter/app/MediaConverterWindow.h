@@ -17,11 +17,11 @@ class BMenuItem;
 class BStatusBar;
 class BStringView;
 class HardwareWindow;
+class JobProcess;
 class OutputView;
 class QueueItem;
 class QueueView;
 class SourceView;
-class Transcoder;
 
 
 class MediaConverterWindow : public BWindow {
@@ -76,7 +76,7 @@ private:
 			bool				fWarnCpu;
 			// what the conversion started with: for films and for songs
 			OutputSettings		fRunSettings[2];
-			Transcoder*			fTranscoder;
+			JobProcess*			fProcess;
 			thread_id			fThread;
 			int32				fCurrentID;
 			int32				fJobsDone;

@@ -12,6 +12,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <dirent.h>
+#include <algorithm>
 #include <string.h>
 
 extern "C" {
@@ -38,7 +39,8 @@ VideoTrackInfo::VideoTrackInfo()
 	fullRange(false),
 	interlaced(false),
 	rotation(0),
-	bitRate(0)
+	bitRate(0),
+	closedCaptions(false)
 {
 }
 
@@ -318,6 +320,56 @@ fill_subtitle(AVStream* stream, SubtitleTrackInfo& track)
 }
 
 
+/*!	Whether the video carries closed captions (CEA-608/708 as A/53 user
+	data): its first pictures say, as they have them in every picture or
+	group of pictures. */
+static bool
+has_closed_captions(AVFormatContext* context, AVStream* stream)
+{
+	AVCodecID id = stream->codecpar->codec_id;
+	if (id != AV_CODEC_ID_MPEG2VIDEO && id != AV_CODEC_ID_H264
+		&& id != AV_CODEC_ID_HEVC)
+		return false;
+	const AVCodec* codec = avcodec_find_decoder(id);
+	AVCodecContext* decoder = codec != NULL ? avcodec_alloc_context3(codec)
+		: NULL;
+	if (decoder == NULL) {
+		avcodec_free_context(&decoder);
+		return false;
+	}
+	// slices only: frame threads would hold the first pictures back
+	decoder->thread_count = 0;
+	decoder->thread_type = FF_THREAD_SLICE;
+	if (avcodec_parameters_to_context(decoder, stream->codecpar) < 0
+		|| avcodec_open2(decoder, codec, NULL) < 0) {
+		avcodec_free_context(&decoder);
+		return false;
+	}
+	AVPacket* packet = av_packet_alloc();
+	AVFrame* frame = av_frame_alloc();
+	bool found = false;
+	int frames = 0;
+	for (int reads = 0; reads < 400 && frames < 4 && !found; reads++) {
+		if (av_read_frame(context, packet) < 0)
+			break;
+		if (packet->stream_index == stream->index
+			&& avcodec_send_packet(decoder, packet) >= 0) {
+			while (avcodec_receive_frame(decoder, frame) == 0) {
+				frames++;
+				found |= av_frame_get_side_data(frame, AV_FRAME_DATA_A53_CC)
+					!= NULL;
+				av_frame_unref(frame);
+			}
+		}
+		av_packet_unref(packet);
+	}
+	av_frame_free(&frame);
+	av_packet_free(&packet);
+	avcodec_free_context(&decoder);
+	return found;
+}
+
+
 status_t
 MediaProbe::Probe(const char* path, SourceInfo& info, BString* error)
 {
@@ -393,6 +445,11 @@ MediaProbe::Probe(const char* path, SourceInfo& info, BString* error)
 		}
 	}
 
+	if (!info.video.empty()) {
+		info.video[0].closedCaptions = has_closed_captions(context,
+			context->streams[info.video[0].index]);
+	}
+
 	for (unsigned i = 0; i < context->nb_chapters; i++) {
 		const AVChapter* chapter = context->chapters[i];
 		ChapterInfo entry;
@@ -416,6 +473,7 @@ MediaProbe::Probe(const char* path, SourceInfo& info, BString* error)
 	}
 
 	close_source(&context);
+	AddSubtitleFiles(info);
 	return B_OK;
 }
 
@@ -801,6 +859,97 @@ static const LanguageCode kLanguages[] = {
 	{ "mao", "mri", "Māori" }, { "zxx", NULL, "No language" },
 	{ "und", NULL, "Unknown" }, { "mul", NULL, "Multiple languages" },
 };
+
+
+BString
+MediaProbe::LanguageCode(const char* code)
+{
+	if (code == NULL || code[0] == '\0')
+		return BString();
+	for (size_t i = 0; i < sizeof(kLanguages) / sizeof(kLanguages[0]); i++) {
+		if (strcasecmp(code, kLanguages[i].code) == 0
+			|| (kLanguages[i].alternative != NULL
+				&& strcasecmp(code, kLanguages[i].alternative) == 0))
+			return BString(kLanguages[i].code);
+	}
+	return BString();
+}
+
+
+void
+MediaProbe::AddSubtitleFiles(SourceInfo& info)
+{
+	if (info.IsDisc() || info.video.empty())
+		return;
+	BString folder(info.path);
+	int32 slash = folder.FindLast('/');
+	BString base(slash >= 0 ? folder.String() + slash + 1 : folder.String());
+	if (slash >= 0)
+		folder.Truncate(slash);
+	else
+		folder = ".";
+	int32 dot = base.FindLast('.');
+	if (dot > 0)
+		base.Truncate(dot);
+
+	DIR* directory = opendir(folder.String());
+	if (directory == NULL)
+		return;
+	std::vector<BString> names;
+	while (dirent* entry = readdir(directory)) {
+		BString name(entry->d_name);
+		if (name.Length() <= base.Length() + 1 || !name.StartsWith(base)
+			|| name[base.Length()] != '.')
+			continue;
+		BString lower(name);
+		lower.ToLower();
+		if (lower.EndsWith(".srt") || lower.EndsWith(".ass")
+			|| lower.EndsWith(".ssa") || lower.EndsWith(".vtt"))
+			names.push_back(name);
+	}
+	closedir(directory);
+	std::sort(names.begin(), names.end());
+
+	for (size_t i = 0; i < names.size(); i++) {
+		BString file;
+		file.SetToFormat("%s/%s", folder.String(), names[i].String());
+		AVFormatContext* context = NULL;
+		if (avformat_open_input(&context, file.String(), NULL, NULL) < 0)
+			continue;
+		if (avformat_find_stream_info(context, NULL) >= 0
+			&& context->nb_streams > 0
+			&& context->streams[0]->codecpar->codec_type
+				== AVMEDIA_TYPE_SUBTITLE) {
+			SubtitleTrackInfo track;
+			fill_subtitle(context->streams[0], track);
+			track.index = -1;
+			track.file = file;
+			track.title = names[i];
+			// the words between the name and the extension: a language,
+			// "forced", "default"
+			BString tags(names[i].String() + base.Length() + 1);
+			tags.Truncate(tags.FindLast('.'));
+			int32 start = 0;
+			while (start <= tags.Length()) {
+				int32 end = tags.FindFirst('.', start);
+				if (end < 0)
+					end = tags.Length();
+				BString tag;
+				tags.CopyInto(tag, start, end - start);
+				tag.ToLower();
+				if (tag == "forced")
+					track.forced = true;
+				else if (tag == "default")
+					track.isDefault = true;
+				else if (!LanguageCode(tag.String()).IsEmpty())
+					track.language = LanguageCode(tag.String());
+				start = end + 1;
+			}
+			info.subtitles.push_back(track);
+		}
+		avformat_close_input(&context);
+	}
+}
 
 
 BString

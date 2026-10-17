@@ -38,7 +38,16 @@ source's own tracks copied, with a mixdown (mono, stereo, 5.1, 7.1) and a
 sample rate. Subtitles are kept (text converted to the container's own text
 format: MP4 timed text, WebVTT, SubRip), left out, or burned into the
 picture (text through libass, pictures such as Blu-ray PGS and DVD subtitles
-over the source picture). Chapters and the title and other tags are kept;
+over the source picture). Subtitle files beside a video with its name are
+tracks too, as players pick them up: `Movie.srt`, `Movie.en.srt`,
+`Movie.eng.forced.ass` (SubRip, SSA/ASS, WebVTT; the language and "forced"
+from the name), kept or burned in like the source's own (a file is burned
+in when the source has no subtitle track for the choice). Closed
+captions in the pictures (CEA-608 as A/53 user data, as US broadcasts and
+NTSC DVDs carry them) become a text track, as HandBrake makes them: the
+probe looks at the first pictures, and the transcoder hands every decoded
+picture's caption data to FFmpeg's caption decoder (SubRip in Matroska,
+timed text in MP4, WebVTT in WebM; not when the video is copied). Chapters and the title and other tags are kept;
 chapter starts become key frames.
 
 The picture: a size limit (4K down to 360p; the aspect ratio is kept, the
@@ -152,7 +161,8 @@ src/apps/mediaconverter/engine/    the engine (libmediaconverter_engine.a)
   LavcVideoEncoder   FFmpeg's own and libvpx/libtheora
   HardwareCaps       the GPUs: device manager PCI walk, VA-API queries,
                      NVENC by chip generation
-src/apps/mediaconverter/app/       the window
+src/apps/mediaconverter/app/       the window; JobProcess runs each conversion
+                                   in a worker process (MediaConverter --worker)
 src/apps/mediaconverter/cli/       mediaconvert, the engine from a shell (tests)
 src/apps/mediaconverter/thirdparty headers of libva, x264, x265, SVT-AV1
 headers/private/media/nvenc_api.h  the nvenc add-on's interface
@@ -181,6 +191,23 @@ libtheora: the engine resamples with swresample's own, takes FFmpeg's own
 Opus and Vorbis encoders, and Theora cannot be made there. Where an encoder
 is missing the format says why, and the first preset is the first one the
 computer can make.
+
+### The worker process
+
+Each conversion runs in a process of its own, as HandBrake runs its
+encodes: the window starts its own executable with `--worker`, writes the
+job (source, destination, settings) on its standard input and reads the
+report and the progress from its standard output, a line at a time; the
+worker probes the source again (titles and subtitle files come out the
+same). A graphics card that hangs is reset by amdgpu, and Mesa then ends
+the process that used it (VA-API contexts are not robust) - seen once on
+the WX 5100's VCE; a decoder can crash on a damaged file. Either costs the
+job, not the window and its queue, and a worker that dies on the GPU's
+path is run again on the CPU ("... stopped during the conversion: it was
+done again on the CPU"). Stop closes the worker's input, which cancels it
+(it is killed after ten seconds if it has not ended), and a window that
+goes away takes its worker with it the same way. The worker runs with the
+debugger disabled, so a crash ends it at once.
 
 ### The transcoder
 
@@ -222,6 +249,13 @@ FFmpeg's VA-API encoders, which Mesa is tested against:
   parameters. Three pictures are in the encoder at once.
 - Upload: `vaDeriveImage` and a copy into the mapped surface (0.5 ms for
   1080p on the WX 5100), `vaPutImage` where deriving fails.
+- AV1 on AMD (VCN 4): the encoder codes whole blocks of 64 x 16 pixels and
+  an AV1 stream cannot say to crop them; VCN 4 codes 1080 lines as 1082 and
+  puts 1080 only in the render size, which players take as an aspect ratio
+  (1920 x 1082 with the bottom lines shown). The transcoder crops what goes
+  to it to whole blocks instead (1080 to 1072, 3840 x 1604 to 3840 x 1600,
+  854 to 832 wide) and says so in the report. H.264 and H.265 crop in their
+  parameter sets and keep every size.
 
 ### NVIDIA (NVENC)
 
@@ -279,6 +313,20 @@ Big Buck Bunny clip, luma PSNR against the source with
 | x265 medium, 720p, 8/10/12-bit | 45.8 / 45.6 / 44.5 dB |
 | SVT-AV1 preset 8, 720p, 8/10-bit | 46.1 / 46.0 dB |
 | VP9, VP8, MPEG-4, MPEG-2 | 43.8, 44.8, 46.3, 46.4 dB |
+
+On the Framework 13 (Radeon 760M, Phoenix, VCN 4), the same clip at 720p,
+each output decoded and compared:
+
+| Encoder | Result |
+| --- | --- |
+| 760M H.264 (B pictures), QP 24 | 42.6 dB; 1.8 s for the 12 s clip with AAC |
+| 760M H.265, QP 24 | 43.8 dB; 1.8 s |
+| 760M H.265 10-bit | 43.9 dB; 3.7 s |
+| 760M AV1, quantizer index 108 | 41.4 dB at 60 % of H.265's size; 2.0 s |
+| 760M AV1 10-bit | 41.5 dB; 4.3 s |
+
+A 4K HDR10 clip (3840 x 1604, 5 s) became AV1 10-bit on the 760M in 4.1 s
+with its HDR10 description and BT.2020/PQ colours kept.
 
 A 1:32 Matroska file with two audio tracks (AAC stereo, AC-3 5.1), three
 subtitle tracks and four chapters became an MP4 with both tracks as AAC

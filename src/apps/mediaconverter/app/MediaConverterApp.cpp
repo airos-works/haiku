@@ -18,6 +18,7 @@ extern "C" {
 #include <libavutil/log.h>
 }
 
+#include "JobProcess.h"
 #include "MediaConverterWindow.h"
 #include "Messages.h"
 #include "NvencEncoder.h"
@@ -167,6 +168,9 @@ main(int argc, char** argv)
 	// NvencEncoder::SelfTest() runs the NVENC test in a process of its own
 	if (argc == 3 && strcmp(argv[1], "--nvenc-self-test") == 0)
 		return NvencEncoder::SelfTestMain(argv[2]);
+	// JobProcess runs each conversion in one of these
+	if (argc == 2 && strcmp(argv[1], "--worker") == 0)
+		return JobProcess::WorkerMain();
 
 	MediaConverterApp app;
 	app.Run();

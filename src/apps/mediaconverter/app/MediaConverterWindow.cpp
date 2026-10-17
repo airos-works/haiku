@@ -37,6 +37,7 @@
 #include "DiscSource.h"
 #include "HardwareCaps.h"
 #include "HardwareWindow.h"
+#include "JobProcess.h"
 #include "MediaConverterApp.h"
 #include "MediaProbe.h"
 #include "Messages.h"
@@ -76,7 +77,7 @@ struct PreviewRequest {
 struct ConvertRequest {
 	BMessenger			target;
 	int32				id;
-	Transcoder*			transcoder;
+	JobProcess*			process;
 };
 
 
@@ -176,15 +177,16 @@ MediaConverterWindow::_ConvertThread(void* data)
 	ConvertRequest* request = (ConvertRequest*)data;
 	WindowListener listener(request->target, request->id);
 	BString error;
-	status_t status = request->transcoder->Run(&listener, error);
+	status_t status = request->process->Run(&listener, error);
 	BMessage message(kMsgJobFinished);
 	message.AddInt32("id", request->id);
 	message.AddInt32("status", status);
 	message.AddString("error", error);
-	const TranscodeReport& report = request->transcoder->Report();
+	const TranscodeReport& report = request->process->Report();
 	message.AddString("encoder", report.videoEncoder);
 	message.AddString("notes", report.notes);
 	message.AddBool("fallback", report.cpuFallback);
+	message.AddBool("retried", request->process->RetriedOnCpu());
 	request->target.SendMessage(&message);
 	delete request;
 	return B_OK;
@@ -205,7 +207,7 @@ MediaConverterWindow::MediaConverterWindow()
 	fConverting(false),
 	fStopping(false),
 	fWarnCpu(true),
-	fTranscoder(NULL),
+	fProcess(NULL),
 	fThread(-1),
 	fCurrentID(-1),
 	fJobsDone(0),
@@ -364,14 +366,14 @@ MediaConverterWindow::QuitRequested()
 		if (alert->Go() == 0)
 			return false;
 		fStopping = true;
-		if (fTranscoder != NULL)
-			fTranscoder->Cancel();
+		if (fProcess != NULL)
+			fProcess->Cancel();
 		if (fThread >= 0) {
 			status_t result;
 			wait_for_thread(fThread, &result);
 		}
-		delete fTranscoder;
-		fTranscoder = NULL;
+		delete fProcess;
+		fProcess = NULL;
 	}
 	_SaveSettings();
 	if (fHardwareWindow != NULL && fHardwareWindow->Lock())
@@ -550,8 +552,8 @@ MediaConverterWindow::MessageReceived(BMessage* message)
 		case kMsgStop:
 			if (fConverting) {
 				fStopping = true;
-				if (fTranscoder != NULL)
-					fTranscoder->Cancel();
+				if (fProcess != NULL)
+					fProcess->Cancel();
 				_UpdateControls();
 			}
 			break;
@@ -934,18 +936,18 @@ MediaConverterWindow::_StartNext()
 	next->SetProgress(zero);
 	fQueue->InvalidateItem(next);
 
-	fTranscoder = new Transcoder(job);
+	fProcess = new JobProcess(job);
 	fCurrentID = next->ID();
 	ConvertRequest* request = new ConvertRequest;
 	request->target = BMessenger(this);
 	request->id = next->ID();
-	request->transcoder = fTranscoder;
+	request->process = fProcess;
 	fThread = spawn_thread(_ConvertThread, "convert", B_NORMAL_PRIORITY,
 		request);
 	if (fThread < 0 || resume_thread(fThread) != B_OK) {
 		delete request;
-		delete fTranscoder;
-		fTranscoder = NULL;
+		delete fProcess;
+		fProcess = NULL;
 		next->SetState(kJobFailed);
 		next->SetMessage(B_TRANSLATE("Could not start."));
 		return false;
@@ -962,14 +964,15 @@ MediaConverterWindow::_JobFinished(BMessage* message)
 		wait_for_thread(fThread, &result);
 		fThread = -1;
 	}
-	delete fTranscoder;
-	fTranscoder = NULL;
+	delete fProcess;
+	fProcess = NULL;
 
 	int32 id = message->GetInt32("id", -1);
 	status_t status = message->GetInt32("status", B_ERROR);
 	QueueItem* item = fQueue->ItemByID(id);
 	if (item != NULL) {
 		fJobsDone++;
+		item->Report().notes = message->GetString("notes", "");
 		if (status == B_OK) {
 			item->SetState(kJobDone);
 			BEntry entry(item->Destination().String());
@@ -980,6 +983,8 @@ MediaConverterWindow::_JobFinished(BMessage* message)
 			text.SetToFormat(B_TRANSLATE("Done: %s, %s · %s"), path.Leaf(),
 				MediaProbe::FormatSize(size).String(),
 				message->GetString("encoder", ""));
+			if (message->GetBool("retried", false))
+				text << B_TRANSLATE(" (the graphics card stopped)");
 			item->SetMessage(text.String());
 			fLastOutput = item->Destination();
 			// let Tracker know what the new file is

@@ -109,6 +109,15 @@ private:
 			status_t			_SetUpSubtitles(BString& error);
 			void				_CopyChapters();
 			void				_FixDiscontinuity(AVPacket* packet);
+			status_t			_SetUpSubtitleFiles(BString& error);
+			status_t			_SetUpSubtitleOutput(SubtitleStream* stream,
+									AVCodecID convertTo,
+									const SubtitleTrackInfo* track,
+									BString& error);
+			status_t			_WriteSubtitleFiles(int64 until);
+			status_t			_SetUpCaptions(BString& error);
+			status_t			_DecodeCaptions(const AVFrame* frame);
+			void				_AlignForEncoder(video_codec codec);
 			void				_AddFolderCover();
 			status_t			_DetectCrop(int crop[4]);
 			void				_ProbeHdrMetadata(VideoEncoderParams& params);
@@ -176,6 +185,7 @@ private:
 			// timestamp jumps in MPEG program and transport streams
 			std::vector<int64>	fNextDts;		// per input stream, µs
 			int64				fTimestampOffset;	// µs
+			SubtitleStream*		fCaptions;		// closed captions, in fSubtitles
 			std::vector<int64>	fCopyStarted;	// per input stream
 			std::vector<std::pair<int, AVStream*> > fAttachments;
 			AVPacket*			fFolderCover;	// the album's cover.jpg
@@ -183,6 +193,7 @@ private:
 
 			int					fBurnInStream;	// input index, -1: none
 			bool				fBurnInText;
+			BString				fBurnInFile;	// a subtitle file, burned in
 			int					fCrop[4];		// top, bottom, left, right
 };
 

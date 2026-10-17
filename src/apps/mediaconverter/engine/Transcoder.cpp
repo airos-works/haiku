@@ -103,6 +103,8 @@ struct Transcoder::VideoStream {
 	AVRational			encoderTimeBase;
 	int					width;			// output
 	int					height;
+	int					scaleWidth;		// scaled to, before the encoder's
+	int					scaleHeight;	// crop (see _AlignForEncoder())
 	AVRational			sampleAspect;
 	int					rotation;		// to apply, clockwise
 	bool				forceRate;
@@ -130,7 +132,7 @@ struct Transcoder::VideoStream {
 		in(NULL), out(NULL), copy(false), decoder(NULL), graph(NULL),
 		source(NULL), subtitleSource(NULL), sink(NULL), graphWidth(0),
 		graphHeight(0), graphFormat(-1), encoder(NULL), width(0), height(0),
-		rotation(0), forceRate(false), frames(0), nextKey(0),
+		scaleWidth(0), scaleHeight(0), rotation(0), forceRate(false), frames(0), nextKey(0),
 		subtitleCanvas(NULL), subtitleDirty(false), subtitleEnd(INT64_MAX),
 		encoderThread(-1), stopEncoder(false), encoderDone(false),
 		encoderStatus(B_OK)
@@ -176,9 +178,16 @@ struct Transcoder::SubtitleStream {
 	AVCodecContext*		decoder;
 	AVCodecContext*		encoder;
 
+	// a subtitle file beside the source: read whole, on the source's clock,
+	// and written as the source's packets pass its times
+	AVFormatContext*	file;
+	std::vector<AVPacket*> pending;
+	size_t				next;
+
 	SubtitleStream()
 		:
-		in(NULL), out(NULL), copy(true), decoder(NULL), encoder(NULL)
+		in(NULL), out(NULL), copy(true), decoder(NULL), encoder(NULL),
+		file(NULL), next(0)
 	{
 	}
 };
@@ -248,6 +257,7 @@ Transcoder::Transcoder(const TranscodeJob& job)
 	fLastPosition(0),
 	fVideo(NULL),
 	fTimestampOffset(0),
+	fCaptions(NULL),
 	fFolderCover(NULL),
 	fFolderCoverStream(NULL),
 	fBurnInStream(-1),
@@ -589,6 +599,9 @@ Transcoder::_SetUpVideo(BString& error)
 	}
 	fVideo->rotation = (stream_rotation(in) + settings.rotation) % 360;
 	OutputSize(cropped, settings, &fVideo->width, &fVideo->height);
+	fVideo->scaleWidth = fVideo->width;
+	fVideo->scaleHeight = fVideo->height;
+	_AlignForEncoder(codec);
 	AVRational aspect = in->sample_aspect_ratio.num > 0
 		? in->sample_aspect_ratio : in->codecpar->sample_aspect_ratio;
 	if (aspect.num <= 0 || aspect.den <= 0)
@@ -930,9 +943,16 @@ Transcoder::_VideoFilters(VideoStream& stream, int sourceWidth,
 		add("hflip");
 
 	BString scale;
-	scale.SetToFormat("scale=w=%d:h=%d:flags=%s", stream.width, stream.height,
+	scale.SetToFormat("scale=w=%d:h=%d:flags=%s", stream.scaleWidth,
+		stream.scaleHeight,
 		settings.speed == kSpeedFastest ? "bicubic" : "lanczos");
 	add(scale);
+	if (stream.scaleWidth != stream.width
+		|| stream.scaleHeight != stream.height) {
+		BString crop;
+		crop.SetToFormat("crop=w=%d:h=%d", stream.width, stream.height);
+		add(crop);
+	}
 
 	// After the scaling, so a smaller picture costs less. hqdn3d is GPL and
 	// not in the system's FFmpeg, and NLMeans's integral image is not
@@ -1042,20 +1062,41 @@ Transcoder::_BuildVideoGraph(VideoStream& stream, const AVFrame* frame,
 		}
 	}
 
-	// text subtitles, rendered by libass from the file itself
-	if (fBurnInStream >= 0 && fBurnInText) {
+	// text subtitles, rendered by libass from the file itself (the source,
+	// or a subtitle file beside it)
+	bool burnFile = !fBurnInFile.IsEmpty();
+	int64 base = fInput->start_time != AV_NOPTS_VALUE
+		? max_c(fInput->start_time, (int64)0) : 0;
+	auto shift = [&](int64 by) -> bool {
+		// a file counts from the picture's start, the source's clock may
+		// start later (MPEG-TS)
+		char expression[64];
+		snprintf(expression, sizeof(expression), "PTS%+" B_PRId64,
+			av_rescale_q(by, AV_TIME_BASE_Q, stream.in->time_base));
+		AVFilterContext* setpts = NULL;
+		return avfilter_graph_create_filter(&setpts,
+			avfilter_get_by_name("setpts"), NULL, expression, NULL,
+			stream.graph) >= 0 && link(setpts);
+	};
+	if ((fBurnInStream >= 0 || burnFile) && fBurnInText) {
 		int subtitleIndex = 0;
 		for (int i = 0; i < fBurnInStream; i++) {
 			if (fInput->streams[i]->codecpar->codec_type
 					== AVMEDIA_TYPE_SUBTITLE)
 				subtitleIndex++;
 		}
+		if (burnFile && base > 0 && !shift(-base)) {
+			error = "The subtitles cannot be burned in.";
+			return B_ERROR;
+		}
 		AVFilterContext* subtitles = avfilter_graph_alloc_filter(stream.graph,
 			avfilter_get_by_name("subtitles"), "subtitles");
 		if (subtitles == NULL
-			|| av_opt_set(subtitles, "filename", fJob.source.String(),
+			|| av_opt_set(subtitles, "filename", burnFile
+				? fBurnInFile.String() : fJob.source.String(),
 				AV_OPT_SEARCH_CHILDREN) < 0
-			|| av_opt_set_int(subtitles, "stream_index", subtitleIndex,
+			|| av_opt_set_int(subtitles, "stream_index",
+				burnFile ? 0 : subtitleIndex,
 				AV_OPT_SEARCH_CHILDREN) < 0) {
 			error = "The subtitles cannot be burned in (libass).";
 			return B_ERROR;
@@ -1065,6 +1106,10 @@ Transcoder::_BuildVideoGraph(VideoStream& stream, const AVFrame* frame,
 		av_opt_set(subtitles, "original_size", size, AV_OPT_SEARCH_CHILDREN);
 		if (avfilter_init_str(subtitles, NULL) < 0 || !link(subtitles)) {
 			error = "The subtitles cannot be burned in (libass).";
+			return B_ERROR;
+		}
+		if (burnFile && base > 0 && !shift(base)) {
+			error = "The subtitles cannot be burned in.";
 			return B_ERROR;
 		}
 	}
@@ -1460,7 +1505,151 @@ Transcoder::_SetUpSubtitles(BString& error)
 		fStreamKinds[i] = kStreamSubtitle;
 		fStreamSlots[i] = (int)fSubtitles.size();
 		fSubtitles.push_back(stream);
+		status_t status = _SetUpSubtitleOutput(stream, convertTo, NULL,
+			error);
+		if (status != B_OK)
+			return status;
+	}
+	status_t status = _SetUpSubtitleFiles(error);
+	if (status != B_OK)
+		return status;
+	return _SetUpCaptions(error);
+}
 
+
+/*!	Closed captions in the pictures become a text track, as HandBrake makes
+	them: FFmpeg's caption decoder reads them from the decoded pictures'
+	A/53 data (see _DecodeVideo()). */
+status_t
+Transcoder::_SetUpCaptions(BString& error)
+{
+	const OutputSettings& settings = fJob.settings;
+	const VideoTrackInfo* video = fJob.info.MainVideo();
+	if (video == NULL || !video->closedCaptions || fVideo == NULL)
+		return B_OK;
+	if (fVideo->copy) {
+		_Note("The closed captions are left out: they are read from the "
+			"pictures, which are copied.");
+		return B_OK;
+	}
+	AVCodecID convertTo;
+	switch (settings.container) {
+		case kContainerMKV: convertTo = AV_CODEC_ID_SUBRIP; break;
+		case kContainerMP4:
+		case kContainerMOV: convertTo = AV_CODEC_ID_MOV_TEXT; break;
+		case kContainerWebM: convertTo = AV_CODEC_ID_WEBVTT; break;
+		default: return B_OK;
+	}
+	const AVCodec* decoderCodec = avcodec_find_decoder(AV_CODEC_ID_EIA_608);
+	const AVCodec* encoderCodec = avcodec_find_encoder(convertTo);
+	if (decoderCodec == NULL || encoderCodec == NULL)
+		return B_OK;
+
+	SubtitleStream* stream = new SubtitleStream;
+	stream->in = fVideo->in;
+	stream->copy = false;
+	fSubtitles.push_back(stream);
+	stream->decoder = avcodec_alloc_context3(decoderCodec);
+	stream->decoder->pkt_timebase = fVideo->in->time_base;
+	if (avcodec_open2(stream->decoder, decoderCodec, NULL) < 0) {
+		error = "The closed caption decoder did not start.";
+		return B_ERROR;
+	}
+	stream->encoder = avcodec_alloc_context3(encoderCodec);
+	stream->encoder->time_base = AV_TIME_BASE_Q;
+	if (stream->decoder->subtitle_header != NULL) {
+		stream->encoder->subtitle_header = (uint8*)av_mallocz(
+			stream->decoder->subtitle_header_size + 1);
+		memcpy(stream->encoder->subtitle_header,
+			stream->decoder->subtitle_header,
+			stream->decoder->subtitle_header_size);
+		stream->encoder->subtitle_header_size
+			= stream->decoder->subtitle_header_size;
+	}
+	stream->encoder->width = fVideo->width;
+	stream->encoder->height = fVideo->height;
+	if (avcodec_open2(stream->encoder, encoderCodec, NULL) < 0) {
+		error = "The closed caption encoder did not start.";
+		return B_ERROR;
+	}
+	stream->out = avformat_new_stream(fOutput, NULL);
+	if (stream->out == NULL)
+		return B_NO_MEMORY;
+	avcodec_parameters_from_context(stream->out->codecpar, stream->encoder);
+	stream->out->time_base = AV_TIME_BASE_Q;
+	av_dict_set(&stream->out->metadata, "title", "Closed captions", 0);
+	stream->out->disposition = AV_DISPOSITION_CAPTIONS;
+	fCaptions = stream;
+	BString line;
+	line.SetToFormat("Closed captions (%s, from CEA-608)",
+		avcodec_get_name(convertTo));
+	fReport.subtitleTracks.push_back(line);
+	return B_OK;
+}
+
+
+/*!	Subtitle files beside the source (MediaProbe::AddSubtitleFiles() found
+	them) become tracks like the source's own. */
+status_t
+Transcoder::_SetUpSubtitleFiles(BString& error)
+{
+	const OutputSettings& settings = fJob.settings;
+	int64 base = fInput->start_time != AV_NOPTS_VALUE
+		? max_c(fInput->start_time, (int64)0) : 0;
+	for (size_t i = 0; i < fJob.info.subtitles.size(); i++) {
+		const SubtitleTrackInfo& track = fJob.info.subtitles[i];
+		if (track.file.IsEmpty() || track.file == fBurnInFile)
+			continue;
+		AVFormatContext* file = NULL;
+		if (avformat_open_input(&file, track.file.String(), NULL, NULL) < 0
+			|| avformat_find_stream_info(file, NULL) < 0
+			|| file->nb_streams == 0) {
+			avformat_close_input(&file);
+			continue;
+		}
+		AVStream* in = file->streams[0];
+		AVCodecID convertTo;
+		if (!container_takes_subtitle(settings.container,
+				in->codecpar->codec_id, &convertTo)) {
+			avformat_close_input(&file);
+			continue;
+		}
+		SubtitleStream* stream = new SubtitleStream;
+		stream->in = in;
+		stream->file = file;
+		fSubtitles.push_back(stream);
+		// the file counts from the picture's start: put it on the source's
+		// clock, which may start later (MPEG-TS)
+		int64 offset = av_rescale_q(base, AV_TIME_BASE_Q, in->time_base);
+		AVPacket* packet = av_packet_alloc();
+		while (av_read_frame(file, packet) >= 0) {
+			if (packet->pts != AV_NOPTS_VALUE)
+				packet->pts += offset;
+			if (packet->dts != AV_NOPTS_VALUE)
+				packet->dts += offset;
+			stream->pending.push_back(av_packet_clone(packet));
+			av_packet_unref(packet);
+		}
+		av_packet_free(&packet);
+		std::stable_sort(stream->pending.begin(), stream->pending.end(),
+			[](const AVPacket* a, const AVPacket* b) {
+				return a->pts < b->pts;
+			});
+		status_t status = _SetUpSubtitleOutput(stream, convertTo, &track,
+			error);
+		if (status != B_OK)
+			return status;
+	}
+	return B_OK;
+}
+
+
+status_t
+Transcoder::_SetUpSubtitleOutput(SubtitleStream* stream, AVCodecID convertTo,
+	const SubtitleTrackInfo* track, BString& error)
+{
+	AVStream* in = stream->in;
+	{
 		stream->out = avformat_new_stream(fOutput, NULL);
 		if (stream->out == NULL)
 			return B_NO_MEMORY;
@@ -1468,10 +1657,24 @@ Transcoder::_SetUpSubtitles(BString& error)
 		stream->out->disposition = in->disposition
 			& (AV_DISPOSITION_DEFAULT | AV_DISPOSITION_FORCED
 				| AV_DISPOSITION_HEARING_IMPAIRED);
+		if (track != NULL) {
+			// a file: its name says its language and whether it is forced
+			if (!track->language.IsEmpty()) {
+				av_dict_set(&stream->out->metadata, "language",
+					track->language.String(), 0);
+			}
+			if (track->forced)
+				stream->out->disposition |= AV_DISPOSITION_FORCED;
+			if (track->isDefault)
+				stream->out->disposition |= AV_DISPOSITION_DEFAULT;
+		}
 
+		const AVDictionaryEntry* languageEntry = av_dict_get(
+			stream->out->metadata, "language", NULL, 0);
 		BString language = MediaProbe::LanguageName(
-			av_dict_get(in->metadata, "language", NULL, 0) != NULL
-				? av_dict_get(in->metadata, "language", NULL, 0)->value : "");
+			languageEntry != NULL ? languageEntry->value : "");
+		if (track != NULL)
+			language << ", " << track->title;
 		if (convertTo == AV_CODEC_ID_NONE) {
 			avcodec_parameters_copy(stream->out->codecpar, in->codecpar);
 			stream->out->codecpar->codec_tag = 0;
@@ -1480,7 +1683,7 @@ Transcoder::_SetUpSubtitles(BString& error)
 			line.SetToFormat("%s (%s), copied", language.String(),
 				avcodec_get_name(in->codecpar->codec_id));
 			fReport.subtitleTracks.push_back(line);
-			continue;
+			return B_OK;
 		}
 
 		// text to the container's text format
@@ -1528,6 +1731,77 @@ Transcoder::_SetUpSubtitles(BString& error)
 		fReport.subtitleTracks.push_back(line);
 	}
 	return B_OK;
+}
+
+
+/*!	Writes the subtitle files' events up to \a until (AV_TIME_BASE, on the
+	source's clock; INT64_MAX: all that are left). */
+status_t
+Transcoder::_WriteSubtitleFiles(int64 until)
+{
+	for (size_t i = 0; i < fSubtitles.size(); i++) {
+		SubtitleStream& stream = *fSubtitles[i];
+		while (stream.file != NULL && stream.next < stream.pending.size()) {
+			AVPacket* packet = stream.pending[stream.next];
+			int64 time = packet->pts != AV_NOPTS_VALUE ? av_rescale_q(
+				packet->pts, stream.in->time_base, AV_TIME_BASE_Q) : 0;
+			if (time > until)
+				break;
+			stream.next++;
+			status_t status = B_OK;
+			if (!stream.copy)
+				status = _ConvertSubtitle(stream, packet);
+			else if (time >= fStartTime
+				&& (fEndTime <= 0 || time < fEndTime)) {
+				int64 offset = av_rescale_q(fStartTime, AV_TIME_BASE_Q,
+					stream.in->time_base);
+				if (packet->pts != AV_NOPTS_VALUE)
+					packet->pts -= offset;
+				if (packet->dts != AV_NOPTS_VALUE)
+					packet->dts -= offset;
+				packet->pos = -1;
+				status = _Write(packet, stream.out, stream.in->time_base);
+			}
+			av_packet_free(&stream.pending[stream.next - 1]);
+			if (status != B_OK)
+				return status;
+		}
+	}
+	return B_OK;
+}
+
+
+/*!	AMD's AV1 encoders code the picture in blocks of 64 x 16 pixels, and an
+	AV1 stream cannot say to crop them (VCN 4 codes 1080 lines as 1082 and
+	puts 1080 only in the render size, which players take as an aspect
+	ratio): what goes to them is cropped to whole blocks instead, a few
+	pixels at the edges, so the picture is shown as it was meant. */
+void
+Transcoder::_AlignForEncoder(video_codec codec)
+{
+	const OutputSettings& settings = fJob.settings;
+	if ((codec != kVideoAV1 && codec != kVideoAV1_10)
+		|| settings.encoderPreference != kPreferHardware)
+		return;
+	HardwareInventory& inventory = HardwareInventory::Default();
+	if (!inventory.IsProbed())
+		inventory.Probe();
+	const GpuDevice* device = inventory.EncoderFor(codec, fVideo->width,
+		fVideo->height, settings.gpu.String());
+	if (device == NULL || device->vendor != kVendorAMD)
+		return;
+	int width = fVideo->width & ~63;
+	int height = fVideo->height & ~15;
+	if (width < 64 || height < 16
+		|| (width == fVideo->width && height == fVideo->height))
+		return;
+	BString note;
+	note.SetToFormat("%s codes AV1 in blocks of 64 by 16 pixels: %d by %d "
+		"becomes %d by %d, cropped at the edges.", device->name.String(),
+		fVideo->width, fVideo->height, width, height);
+	_Note(note.String());
+	fVideo->width = width;
+	fVideo->height = height;
 }
 
 
@@ -1703,10 +1977,37 @@ Transcoder::_DecodeVideo(VideoStream& stream, AVPacket* packet)
 			break;
 		if (result < 0)
 			break;
-		status = _FilterVideo(stream, frame);
+		if (fCaptions != NULL)
+			status = _DecodeCaptions(frame);
+		if (status == B_OK)
+			status = _FilterVideo(stream, frame);
 		av_frame_unref(frame);
 	}
 	av_frame_free(&frame);
+	return status;
+}
+
+
+/*!	A picture's caption data goes to the caption decoder as a packet of
+	its own, at the picture's time. */
+status_t
+Transcoder::_DecodeCaptions(const AVFrame* frame)
+{
+	const AVFrameSideData* side = av_frame_get_side_data(frame,
+		AV_FRAME_DATA_A53_CC);
+	if (side == NULL || side->size == 0)
+		return B_OK;
+	AVPacket* packet = av_packet_alloc();
+	if (packet == NULL || av_new_packet(packet, side->size) < 0) {
+		av_packet_free(&packet);
+		return B_NO_MEMORY;
+	}
+	memcpy(packet->data, side->data, side->size);
+	packet->pts = packet->dts = frame->best_effort_timestamp != AV_NOPTS_VALUE
+		? frame->best_effort_timestamp : frame->pts;
+	status_t status = packet->pts != AV_NOPTS_VALUE
+		? _ConvertSubtitle(*fCaptions, packet) : B_OK;
+	av_packet_free(&packet);
 	return status;
 }
 
@@ -2325,6 +2626,24 @@ Transcoder::Run(TranscodeListener* listener, BString& error)
 		}
 		fBurnInStream = settings.subtitles == kSubtitlesBurnFirst ? first
 			: forced >= 0 ? forced : fallback;
+		// none in the source: a subtitle file beside it (the first, or the
+		// one its name says is forced)
+		for (size_t i = 0; fBurnInStream < 0
+				&& i < fJob.info.subtitles.size(); i++) {
+			const SubtitleTrackInfo& track = fJob.info.subtitles[i];
+			if (track.file.IsEmpty() || !track.text
+				|| (settings.subtitles == kSubtitlesBurnForced
+					&& !track.forced))
+				continue;
+			fBurnInFile = track.file;
+			fBurnInText = true;
+			BString line;
+			line.SetToFormat("%s, %s, burned in",
+				MediaProbe::LanguageName(track.language.String()).String(),
+				track.title.String());
+			fReport.subtitleTracks.push_back(line);
+			break;
+		}
 		if (fBurnInStream >= 0) {
 			fStreamKinds[fBurnInStream] = kStreamBurnIn;
 			BString line;
@@ -2446,6 +2765,15 @@ Transcoder::Run(TranscodeListener* listener, BString& error)
 		}
 		if ((fInput->iformat->flags & AVFMT_TS_DISCONT) != 0)
 			_FixDiscontinuity(packet);
+		if (packet->pts != AV_NOPTS_VALUE
+			&& fStreamKinds[index] != kStreamIgnored) {
+			status = _WriteSubtitleFiles(av_rescale_q(packet->pts,
+				fInput->streams[index]->time_base, AV_TIME_BASE_Q));
+			if (status != B_OK) {
+				av_packet_unref(packet);
+				break;
+			}
+		}
 		// past the end of the range: stop once every stream is there
 		bool master = fVideo != NULL ? fStreamKinds[index] == kStreamVideo
 			: (fStreamKinds[index] == kStreamAudio && !fAudio.empty()
@@ -2500,6 +2828,8 @@ Transcoder::Run(TranscodeListener* listener, BString& error)
 	}
 
 	// drain everything
+	if (status == B_OK)
+		status = _WriteSubtitleFiles(INT64_MAX);
 	if (status == B_OK && fVideo != NULL && !fVideo->copy) {
 		_DecodeVideo(*fVideo, NULL);
 		status = _FilterVideo(*fVideo, NULL);
@@ -2607,9 +2937,13 @@ Transcoder::_Cleanup()
 	for (size_t i = 0; i < fSubtitles.size(); i++) {
 		avcodec_free_context(&fSubtitles[i]->decoder);
 		avcodec_free_context(&fSubtitles[i]->encoder);
+		for (size_t j = 0; j < fSubtitles[i]->pending.size(); j++)
+			av_packet_free(&fSubtitles[i]->pending[j]);
+		avformat_close_input(&fSubtitles[i]->file);
 		delete fSubtitles[i];
 	}
 	fSubtitles.clear();
+	fCaptions = NULL;
 
 	if (fOutput != NULL) {
 		if (fHeaderWritten)

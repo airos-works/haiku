@@ -693,6 +693,16 @@ SourceView::_AddTracks(const SourceInfo& info)
 		fTracks->AddRow(row);
 	}
 
+	if (info.MainVideo() != NULL && info.MainVideo()->closedCaptions) {
+		BRow* row = new BRow();
+		row->SetField(new BStringField(B_TRANSLATE("Captions")), 0);
+		row->SetField(new BStringField("CEA-608"), 1);
+		row->SetField(new BStringField(
+			B_TRANSLATE("Closed captions, in the pictures")), 2);
+		row->SetField(new BStringField(""), 3);
+		fTracks->AddRow(row);
+	}
+
 	for (size_t i = 0; i < info.subtitles.size(); i++) {
 		const SubtitleTrackInfo& s = info.subtitles[i];
 		BRow* row = new BRow();
