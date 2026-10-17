@@ -27,14 +27,20 @@ public:
 	// format only counts once a test picture encoded through the add-on
 	// decodes again (trying each way the add-on knows). Blocks, for up to
 	// some seconds the first time; the result is kept, also on disk, per
-	// card and add-on build. MEDIACONVERTER_NVENC_RETEST ignores what was
-	// kept, MEDIACONVERTER_NVENC_VARIANT=n tries only that way.
+	// card and add-on build. It runs in a process of its own, so a crash or
+	// a hang only costs the format. MEDIACONVERTER_NVENC_RETEST ignores what
+	// was kept, MEDIACONVERTER_NVENC_VARIANT=n tries only that way,
+	// MEDIACONVERTER_NVENC_IN_PROCESS runs it in this process.
 	static	bool				SelfTest(video_codec codec, BString* why = NULL);
 	// Whether the test has run, and what came of it.
 	static	bool				Tested(video_codec codec, bool* works,
 									BString* why = NULL);
 	// Tests every format the card has.
 	static	void				SelfTestAll();
+	// The test's own process: main() of MediaConverter and mediaconvert
+	// call this for "--nvenc-self-test <NVENC_CODEC_* bit>"; it prints
+	// "works <variant>" or "fails <reason>".
+	static	int					SelfTestMain(const char* codec);
 
 	virtual	status_t			Open(const VideoEncoderParams& params,
 									BString& error);

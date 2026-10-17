@@ -34,8 +34,12 @@ each with the chroma plane addressed two ways. MediaConverter encodes a small
 test picture with each until one decodes again (`NvencEncoder::SelfTest`), and
 uses only that one; a format for which none works counts as one the card
 cannot encode, and MediaConverter says so and encodes it on the CPU. Nothing is
-encoded on a card before it has passed. The result is kept in
-`~/config/settings/MediaConverter NVENC test` per card and add-on build.
+encoded on a card before it has passed. The test runs in a process of its own
+(the same executable with `--nvenc-self-test`, its debugger disabled), so an
+add-on that crashes or a card that hangs costs the format, not MediaConverter:
+a crash is reported at once, a hang after a minute and a half. The result is
+kept in `~/config/settings/MediaConverter NVENC test` per card and add-on
+build.
 
 This has not run on an NVIDIA card yet: the lab's X399 has had an AMD card
 since 2026-10-12. The card side - resman, the channels, the class list - is the
@@ -67,6 +71,7 @@ environment, MediaConverter and `mediaconvert` believe there is an NVIDIA card
 and run the self-test, the encoding and the CPU fallback through it.
 `FAKE_NVENC_GOOD=n` makes only way n give correct pictures (the others come
 back shifted, as a wrong arrangement would), `FAKE_NVENC_TIMEOUT=1` makes the
-engine never answer. On the X399 (2026-10-17) the test found the right way
+engine never answer, `FAKE_NVENC_CRASH=1` and `FAKE_NVENC_HANG=1` make the
+first picture crash or hang the test process. On the X399 (2026-10-17) the test found the right way
 among three, kept the result, stopped at the first time out, and a 1080p H.264
 conversion through the stand-in came back at 44.7 dB.

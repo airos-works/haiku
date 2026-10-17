@@ -20,6 +20,7 @@ extern "C" {
 
 #include "MediaConverterWindow.h"
 #include "Messages.h"
+#include "NvencEncoder.h"
 #include "Presets.h"
 
 
@@ -161,8 +162,12 @@ MediaConverterApp::AboutRequested()
 
 
 int
-main(int, char**)
+main(int argc, char** argv)
 {
+	// NvencEncoder::SelfTest() runs the NVENC test in a process of its own
+	if (argc == 3 && strcmp(argv[1], "--nvenc-self-test") == 0)
+		return NvencEncoder::SelfTestMain(argv[2]);
+
 	MediaConverterApp app;
 	app.Run();
 	return 0;

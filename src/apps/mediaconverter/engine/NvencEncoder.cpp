@@ -14,11 +14,16 @@
 #include <Path.h>
 #include <image.h>
 
+#include <errno.h>
 #include <math.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <vector>
 
@@ -460,6 +465,164 @@ NvencEncoder::Tested(video_codec codec, bool* works, BString* why)
 }
 
 
+/*!	Tries the add-on's ways of laying out the input until one gives the
+	test pictures back. */
+static TestResult
+test_in_this_process(const nvenc_api* api, uint32 bit)
+{
+	TestResult result;
+	result.state = kFails;
+	result.variant = 0;
+	uint32 variants = api->variants != NULL ? api->variants(0, NULL) : 1;
+	const char* forced = getenv("MEDIACONVERTER_NVENC_VARIANT");
+	uint32 first = forced != NULL ? (uint32)atoi(forced) : 0;
+	uint32 last = forced != NULL ? first + 1 : variants;
+	BString firstReason;
+	for (uint32 variant = first; variant < last && variant < variants;
+			variant++) {
+		BString reason;
+		bool timedOut;
+		if (run_test(api, bit, variant, reason, timedOut)) {
+			result.state = kWorks;
+			result.variant = variant;
+			return result;
+		}
+		const char* name = NULL;
+		if (api->variants != NULL)
+			api->variants(variant, &name);
+		fprintf(stderr, "NVENC self-test, %s: %s\n",
+			name != NULL ? name : "default", reason.String());
+		if (firstReason.IsEmpty())
+			firstReason = reason;
+		// an engine that does not answer at all will not for another layout
+		if (timedOut)
+			break;
+	}
+	result.reason = firstReason;
+	return result;
+}
+
+
+static BString
+own_executable()
+{
+	image_info info;
+	int32 cookie = 0;
+	while (get_next_image_info(B_CURRENT_TEAM, &cookie, &info) == B_OK) {
+		if (info.type == B_APP_IMAGE)
+			return BString(info.name);
+	}
+	return BString();
+}
+
+
+/*!	The test runs in a process of its own - this executable again, with
+	--nvenc-self-test (see SelfTestMain()) - so a card or an add-on that
+	crashes or hangs costs the format, not the application. */
+static TestResult
+test_in_child(uint32 bit)
+{
+	TestResult result;
+	result.state = kFails;
+	result.variant = 0;
+
+	BString executable = own_executable();
+	int fds[2];
+	if (executable.IsEmpty() || pipe(fds) != 0) {
+		result.reason = "The test could not be started.";
+		return result;
+	}
+	char codec[16];
+	snprintf(codec, sizeof(codec), "%" B_PRIu32, bit);
+	pid_t child = fork();
+	if (child == 0) {
+		dup2(fds[1], STDOUT_FILENO);
+		close(fds[0]);
+		close(fds[1]);
+		execl(executable.String(), executable.String(), "--nvenc-self-test",
+			codec, (char*)NULL);
+		_exit(127);
+	}
+	close(fds[1]);
+	if (child < 0) {
+		close(fds[0]);
+		result.reason = "The test could not be started.";
+		return result;
+	}
+
+	BString output;
+	bool finished = false;
+	bigtime_t deadline = system_time() + 90000000;
+	while (true) {
+		bigtime_t left = deadline - system_time();
+		if (left <= 0)
+			break;
+		struct pollfd wait = { fds[0], POLLIN, 0 };
+		int ready = poll(&wait, 1, (int)(left / 1000));
+		if (ready < 0 && errno == EINTR)
+			continue;
+		if (ready <= 0)
+			break;
+		char buffer[512];
+		ssize_t bytes = read(fds[0], buffer, sizeof(buffer));
+		if (bytes <= 0) {
+			finished = true;
+			break;
+		}
+		output.Append(buffer, bytes);
+	}
+	close(fds[0]);
+	if (!finished)
+		kill(child, SIGKILL);
+	int status = 0;
+	waitpid(child, &status, 0);
+
+	int32 at = output.FindFirst("works ");
+	if (at >= 0) {
+		result.state = kWorks;
+		result.variant = (uint32)atoi(output.String() + at + 6);
+		return result;
+	}
+	at = output.FindFirst("fails ");
+	if (at >= 0) {
+		output.Remove(0, at + 6);
+		output.RemoveAll("\n");
+		result.reason = output;
+	} else if (!finished)
+		result.reason = "The test did not finish in a minute and a half.";
+	else if (WIFSIGNALED(status) || (WIFEXITED(status) && WEXITSTATUS(status) != 0))
+		result.reason = "The test crashed.";
+	else
+		result.reason = "The test said nothing.";
+	return result;
+}
+
+
+int
+NvencEncoder::SelfTestMain(const char* codec)
+{
+	// a crash ends this process quietly: the parent reads it as a failure
+	disable_debugger(1);
+	uint32 bit = (uint32)strtoul(codec, NULL, 10);
+	const nvenc_api* api = nvenc_api_get();
+	if (api == NULL) {
+		printf("fails %s\n", sReason.String());
+		return 0;
+	}
+	if (codec_slot(bit) < 0 || (sCodecs & bit) == 0) {
+		printf("fails NVENC cannot encode this.\n");
+		return 0;
+	}
+	TestResult result = test_in_this_process(api, bit);
+	if (result.state == kWorks)
+		printf("works %" B_PRIu32 "\n", result.variant);
+	else
+		printf("fails %s\n", result.reason.String());
+	fflush(stdout);
+	return 0;
+}
+
+
 bool
 NvencEncoder::SelfTest(video_codec codec, BString* why)
 {
@@ -483,37 +646,12 @@ NvencEncoder::SelfTest(video_codec codec, BString* why)
 		}
 	}
 
-	TestResult result;
-	result.state = kFails;
-	result.variant = 0;
-	uint32 variants = api->variants != NULL ? api->variants(0, NULL) : 1;
-	const char* forced = getenv("MEDIACONVERTER_NVENC_VARIANT");
-	uint32 first = forced != NULL ? (uint32)atoi(forced) : 0;
-	uint32 last = forced != NULL ? first + 1 : variants;
-	BString firstReason;
-	for (uint32 variant = first; variant < last && variant < variants;
-			variant++) {
-		BString reason;
-		bool timedOut;
-		if (run_test(api, bit, variant, reason, timedOut)) {
-			result.state = kWorks;
-			result.variant = variant;
-			break;
-		}
-		const char* name = NULL;
-		if (api->variants != NULL)
-			api->variants(variant, &name);
-		fprintf(stderr, "NVENC self-test, %s: %s\n",
-			name != NULL ? name : "default", reason.String());
-		if (firstReason.IsEmpty())
-			firstReason = reason;
-		// an engine that does not answer at all will not for another layout
-		if (timedOut)
-			break;
-	}
+	TestResult result = getenv("MEDIACONVERTER_NVENC_IN_PROCESS") != NULL
+		? test_in_this_process(api, bit) : test_in_child(bit);
 	if (result.state != kWorks) {
+		BString reason = result.reason;
 		result.reason.SetToFormat("NVENC failed MediaConverter's test: %s",
-			firstReason.String());
+			reason.String());
 	}
 
 	BAutolock _(sLock);
