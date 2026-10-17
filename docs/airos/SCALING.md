@@ -80,9 +80,28 @@ outside it included), so the frame and the scroll bar agree on its pixels
 so it cannot grow inwards: it gets the whole part of the scale (1 pixel at
 125 to 175 percent, as Chromium floors border widths) against those views
 on every side (`kFrameLinesHugInside`), and the background fills what its
-pixel leaves outside. Checked with `parshot.sh` and
-`linepar.py`: a window is captured, moved by one logical pixel and
-captured again, and every line that changed width is listed.
+pixel leaves outside; so do plain `BBox` frames, `BColumnListView` without a
+border, plain separators, the inactive tabs' bevel, the slider thumb's
+shadow and the text caret (inverted as such a band, it was one or two
+pixels wide depending on where it was in the text). `BSeparatorView`'s
+fancy separators are a band of edge and dark line, as are boxes too thin
+for their rings (dividers). A square default button's indicator and the
+background between it and the edge are rings of the button's band; the
+background takes up what the scale leaves (`kFrameLinesOuterSlack`), so
+the indicator and the outline keep their widths. Calendars (`BCalendarView`)
+and status bars draw their frames over what is inside them. Scroll bars over
+a focused frame draw its ring in the focus colour, and also recognise
+`BColumnListView`'s fancy frame.
+
+Checked with `parshot.sh` and `linepar.py`: a window is captured, moved by
+one logical pixel and captured again, and every line that changed width is
+listed. A survey of the X399's programs at 175 percent (58 with windows;
+October 2026, master after the plain-frame work): 50 have no dark line
+whose width depends on the window's position; the others draw those lines
+themselves (Amp, Icon-O-Matic's colour swatches, People's picture frame,
+SoundRecorder, Workspaces, Backgrounds' preview, Burrow's separator).
+Before these changes 33 of them had such lines (separators, tab bevels,
+slider shadows, default buttons, list frames, scroll bar junctions).
 
 **Translucent lines** (`B_OP_ALPHA`, blended frames) cover whole buffer pixels
 like opaque ones instead of being rasterized between pixels.
@@ -181,11 +200,13 @@ area sampled; GTK programs and Firefox draw at 2x through the server above.
   they fall; only the kit knows which lines belong together.
 - Lines that are a gap between child views, painted in the parent's view
   colour (the edge of Tracker's windows, Deskbar's separators), are 1 or 2
-  pixels, as are the scroll bars' outer sides on a plain `BColumnListView`
-  frame (2 pixels, its other sides 1). Faint rings that
-  take up what the scale leaves next to a ring that keeps its width (a
-  box's outer edge, the bevel above a menu bar's border, a thumb's
-  highlight next to the scroll bar's border) vary between 1 and 2 pixels.
+  pixels. A plain `BColumnListView` frame is 1 pixel and its scroll bars'
+  outer sides 2 (both every time). Faint rings that take up what the scale
+  leaves next to a ring that keeps its width (a box's outer edge, the bevel
+  above a menu bar's border, a thumb's highlight next to the scroll bar's
+  border) vary between 1 and 2 pixels; the survey counts them separately.
+- Rounded default buttons (a control look other than the default) keep
+  their stroked indicator.
 - Scrolling by an odd number of logical pixels at 150 percent (most steps at
   125 and 175) still redraws the view instead of copying it; with glyphs from
   the cache that is cheap for text, less so for large images.
@@ -219,8 +240,10 @@ area sampled; GTK programs and Firefox draw at 2x through the server above.
 - `parshot.sh` (on the device) and `linepar.py` (on the host, Python with
   PIL): capture a window, move it by one logical pixel, capture it again,
   and list the lines whose width changed (example: `parshot.sh FileTypes 1
-  300 200 /boot/home/par-ft`, then `linepar.py 1.5 par-ft-a.png 300 200
-  par-ft-b.png 301 201 <w> <h>` with the size parshot.sh prints).
+  300 200 /boot/home/par-ft 1.75`, then `linepar.py 1.75 par-ft-a.png 300
+  200 par-ft-b.png 301 201 <what parshot.sh printed>`; with the scale it
+  captures only the window, about 15 seconds per program). At 175 percent
+  the grid repeats every four logical pixels, so check from two places.
 
 A QEMU loop: boot the CI x86_64 image with the new `haiku.hpkg` swapped in
 with `bfs_shell --start-offset 6291456`, set `screenmode -q 1920 1080 32`,
