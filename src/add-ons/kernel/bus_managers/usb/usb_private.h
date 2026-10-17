@@ -13,6 +13,9 @@
 #include <device_manager.h>
 #include <bus/USB.h>
 
+#include <USB_spec.h>
+#include <usb/USB_hub.h>
+
 #include "usbspec_private.h"
 #include <lock.h>
 #include <Referenceable.h>
@@ -342,8 +345,6 @@ virtual	const char *					TypeName() const { return "pipe"; }
 		size_t							MaxPacketSize() const
 											{ return fMaxPacketSize; }
 		uint8							Interval() const { return fInterval; }
-
-		// SuperSpeed-only parameters
 		uint8							MaxBurst() const
 											{ return fMaxBurst; }
 		uint16							BytesPerInterval() const
@@ -543,7 +544,7 @@ public:
 											uint8 hubPort,
 											usb_device_descriptor &desc,
 											int8 deviceAddress,
-											usb_speed speed, bool isRootHub,
+											usb_speed speed, uint8 depth,
 											void *controllerCookie = NULL);
 virtual									~Device();
 
@@ -568,6 +569,7 @@ virtual	status_t						GetDescriptor(uint8 descriptorType,
 											{ return fDeviceAddress; }
 		const usb_device_descriptor *	DeviceDescriptor() const;
 		usb_speed						Speed() const { return fSpeed; }
+		uint8							Depth() const { return fDepth; }
 
 		const usb_configuration_info *	Configuration() const;
 		const usb_configuration_info *	ConfigurationAt(uint8 index) const;
@@ -620,7 +622,7 @@ protected:
 
 private:
 		bool							fAvailable;
-		bool							fIsRootHub;
+		uint8							fDepth;
 		usb_configuration_info *		fConfigurations;
 		usb_configuration_info *		fCurrentConfiguration;
 		usb_speed						fSpeed;
@@ -639,7 +641,7 @@ public:
 											uint8 hubPort,
 											usb_device_descriptor &desc,
 											int8 deviceAddress,
-											usb_speed speed, bool isRootHub,
+											usb_speed speed, uint8 depth,
 											void *controllerCookie = NULL);
 virtual									~Hub();
 
@@ -683,7 +685,8 @@ private:
 		void							_EnumerationFailed(uint8 index);
 
 		InterruptPipe *					fInterruptPipe;
-		usb_hub_descriptor				fHubDescriptor;
+		uint8							fPortCount;
+		uint8							fPowerOnToPowerGood;
 
 		usb_port_status					fInterruptStatus[USB_MAX_PORT_COUNT];
 		usb_port_status					fPortStatus[USB_MAX_PORT_COUNT];

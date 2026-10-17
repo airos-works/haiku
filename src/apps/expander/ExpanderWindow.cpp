@@ -88,11 +88,12 @@ private:
 ExpanderWindow::ExpanderWindow(BRect frame, const entry_ref* ref,
 	BMessage* settings)
 	:
-	BWindow(frame, B_TRANSLATE_SYSTEM_NAME("Expander"), B_DOCUMENT_WINDOW,
-		B_NORMAL_WINDOW_FEEL),
+	BWindow(frame, B_TRANSLATE_SYSTEM_NAME("Expander"), B_DOCUMENT_WINDOW, B_NORMAL_WINDOW_FEEL),
 	fSourcePanel(NULL),
 	fDestPanel(NULL),
 	fSourceChanged(true),
+	fSourceValid(false),
+	fDestValid(false),
 	fListingThread(NULL),
 	fListingStarted(false),
 	fExpandingThread(NULL),
@@ -172,6 +173,7 @@ ExpanderWindow::ExpanderWindow(BRect frame, const entry_ref* ref,
 
 	fScrollView->Hide();
 
+	UpdateControls();
 	Show();
 }
 
@@ -242,6 +244,16 @@ ExpanderWindow::ValidateDest()
 
 	entry.GetRef(&fDestRef);
 	return true;
+}
+
+
+void
+ExpanderWindow::UpdateControls()
+{
+	fShowContents->SetEnabled(fSourceValid);
+	fExpandButton->SetEnabled(fSourceValid && fDestValid);
+	fExpandItem->SetEnabled(fSourceValid && fDestValid);
+	fShowItem->SetEnabled(fSourceValid);
 }
 
 
@@ -358,6 +370,8 @@ ExpanderWindow::MessageReceived(BMessage* message)
 					B_WIDTH_AS_USUAL, B_EVEN_SPACING, B_WARNING_ALERT);
 				alert->SetFlags(alert->Flags() | B_CLOSE_ON_ESCAPE);
 				alert->Go();
+				fSourceValid = false;
+				UpdateControls();
 				break;
 			}
 
@@ -367,10 +381,8 @@ ExpanderWindow::MessageReceived(BMessage* message)
 			if (rule) {
 				fSourceChanged = true;
 				fSourceRef = ref;
-				fShowContents->SetEnabled(true);
-				fExpandButton->SetEnabled(true);
-				fExpandItem->SetEnabled(true);
-				fShowItem->SetEnabled(true);
+				fSourceValid = true;
+				UpdateControls();
 				break;
 			}
 
@@ -382,16 +394,14 @@ ExpanderWindow::MessageReceived(BMessage* message)
 				NULL, NULL, B_WIDTH_AS_USUAL, B_EVEN_SPACING, B_INFO_ALERT);
 			alert->SetFlags(alert->Flags() | B_CLOSE_ON_ESCAPE);
 			alert->Go();
-
-			fShowContents->SetEnabled(false);
-			fExpandButton->SetEnabled(false);
-			fExpandItem->SetEnabled(false);
-			fShowItem->SetEnabled(false);
+			fSourceValid = false;
+			UpdateControls();
 			break;
 		}
 
 		case MSG_DESTTEXT:
-			ValidateDest();
+			fDestValid = ValidateDest();
+			UpdateControls();
 			break;
 
 		case MSG_PREFERENCES:
@@ -596,17 +606,15 @@ ExpanderWindow::RefsReceived(BMessage* message)
 			}
 
 			BEntry dEntry(&fDestRef, true);
-			if (dEntry.Exists()) {
-				fExpandButton->SetEnabled(true);
-				fExpandItem->SetEnabled(true);
-			}
+			if (dEntry.Exists())
+				fDestValid = true;
+
+			fSourceValid = true;
+			UpdateControls();
 
 			if (fShowContents->Value() == B_CONTROL_ON) {
 				StopListing();
 				StartListing();
-			} else {
-				fShowContents->SetEnabled(true);
-				fShowItem->SetEnabled(true);
 			}
 
 			bool fromApp;

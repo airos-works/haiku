@@ -334,6 +334,7 @@ inline	uint32						ReadCapReg32(uint32 reg);
 		uint32						fIRQ;
 		bool						fUseMSI;
 		bool						fInterruptInstalled;
+		spinlock					fInterruptLock;
 };
 
 

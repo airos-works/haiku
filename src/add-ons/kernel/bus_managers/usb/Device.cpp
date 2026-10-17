@@ -15,13 +15,13 @@
 
 Device::Device(Object* parent, int8 hubAddress, uint8 hubPort,
 	usb_device_descriptor& desc, int8 deviceAddress, usb_speed speed,
-	bool isRootHub, void* controllerCookie)
+	uint8 depth, void* controllerCookie)
 	:
 	Object(parent),
 	fDeviceDescriptor(desc),
 	fInitOK(false),
 	fAvailable(true),
-	fIsRootHub(isRootHub),
+	fDepth(depth),
 	fConfigurations(NULL),
 	fCurrentConfiguration(NULL),
 	fSpeed(speed),
@@ -33,6 +33,10 @@ Device::Device(Object* parent, int8 hubAddress, uint8 hubPort,
 {
 	TRACE("creating device\n");
 
+	if (depth > USB_MAX_DEPTH) {
+		TRACE_ERROR("usb device depth too high\n");
+		return;
+	}
 	fDefaultPipe = new(std::nothrow) ControlPipe(this);
 	if (fDefaultPipe == NULL) {
 		TRACE_ERROR("could not allocate default pipe\n");
@@ -300,6 +304,13 @@ Device::Device(Object* parent, int8 hubAddress, uint8 hubPort,
 				}
 
 				case USB_DESCRIPTOR_ENDPOINT_SS_COMPANION: {
+					if (currentInterface == NULL || currentInterface->endpoint_count == 0) {
+						TRACE_ERROR("found endpoint companion descriptor before any "
+									"valid %s descriptor, ignoring!\n",
+							currentInterface == NULL ? "interface" : "endpoint");
+						break;
+					}
+
 					if (currentInterface != NULL) {
 						usb_endpoint_descriptor* desc
 							= currentInterface->endpoint[
@@ -554,7 +565,7 @@ Device::SetConfigurationAt(uint8 index)
 	InitEndpoints(-1);
 
 	// Wait some for the configuration being finished
-	if (!fIsRootHub)
+	if (fDepth > 0)
 		snooze(USB_DELAY_SET_CONFIGURATION);
 	return B_OK;
 }

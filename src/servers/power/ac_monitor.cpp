@@ -13,7 +13,7 @@
 #include <Messenger.h>
 #include <Roster.h>
 
-#include <stdio.h>
+#include <syslog.h>
 
 
 ACMonitor::ACMonitor(PowerPolicy* policy)
@@ -43,4 +43,5 @@ ACMonitor::HandleEvent(int fd)
 		return;
 
 	fPolicy->SetOnAC(status != 0);
+	syslog(LOG_INFO, "AC adapter %s", status == 1 ? "online" : "offline");
 }

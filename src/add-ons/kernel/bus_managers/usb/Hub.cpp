@@ -26,14 +26,15 @@ static const uint8 kMaxEnumerationRetryShift = 4;
 
 Hub::Hub(Object *parent, int8 hubAddress, uint8 hubPort,
 	usb_device_descriptor &desc, int8 deviceAddress, usb_speed speed,
-	bool isRootHub, void *controllerCookie)
+	uint8 depth, void *controllerCookie)
 	:	Device(parent, hubAddress, hubPort, desc, deviceAddress, speed,
-			isRootHub, controllerCookie),
-		fInterruptPipe(NULL)
+			depth, controllerCookie),
+		fInterruptPipe(NULL),
+		fPortCount(0),
+		fPowerOnToPowerGood(0)
 {
 	TRACE("creating hub\n");
 
-	memset(&fHubDescriptor, 0, sizeof(fHubDescriptor));
 	memset(fPlatformResets, 0, sizeof(fPlatformResets));
 	memset(fEnumerationFailures, 0, sizeof(fEnumerationFailures));
 	memset(fNextEnumeration, 0, sizeof(fNextEnumeration));
@@ -54,54 +55,75 @@ Hub::Hub(Object *parent, int8 hubAddress, uint8 hubPort,
 	}
 
 	TRACE("getting hub descriptor...\n");
-	// Root hubs are emulated by their controller driver with the USB 2
-	// descriptor whatever their speed.
-	const bool superSpeed = speed >= USB_SPEED_SUPERSPEED && !isRootHub;
 	size_t actualLength;
-	status_t status = GetDescriptor(superSpeed
-			? USB_DESCRIPTOR_SUPERSPEED_HUB : USB_DESCRIPTOR_HUB, 0, 0,
-		(void *)&fHubDescriptor, sizeof(usb_hub_descriptor), &actualLength);
+	usb_hub_descriptor hubDescriptor;
+	usb_hub_ss_descriptor hubSsDescriptor;
+#ifdef TRACE_USB
+	usb_hub_descriptor* descriptor = &hubDescriptor;
+#endif
+	if (speed >= USB_SPEED_SUPERSPEED) {
+		status_t status;
+		if (depth > 0) {
+			status = DefaultPipe()->SendRequest(USB_REQTYPE_DEVICE_OUT | USB_REQTYPE_CLASS,
+				USB_REQUEST_SET_HUB_DEPTH, depth - 1, 0, 0, NULL, 0, NULL);
+			if (status < B_OK) {
+				TRACE_ERROR("error setting hub depth %s\n", strerror(status));
+				return;
+			}
+		}
+#ifdef TRACE_USB
+		descriptor = (usb_hub_descriptor*)&hubSsDescriptor;
+#endif
+		memset(&hubSsDescriptor, 0, sizeof(hubSsDescriptor));
+		status = GetDescriptor(USB_DESCRIPTOR_HUB_SS, 0, 0,
+			(void *)&hubSsDescriptor, sizeof(hubSsDescriptor), &actualLength);
+		if (status < B_OK || actualLength != 12) {
+			TRACE_ERROR("error getting hub descriptor %s\n", strerror(status));
+			return;
+		}
 
-	// we need at least 8 bytes
-	if (status < B_OK || actualLength < 8) {
-		TRACE_ERROR("error getting hub descriptor\n");
-		return;
+		if (hubSsDescriptor.num_ports > 16) {
+			TRACE_ALWAYS("hub supports more ports than we do (%d vs. %d)\n",
+				hubSsDescriptor.num_ports, 16);
+			hubSsDescriptor.num_ports = 16;
+		}
+		fPortCount = hubSsDescriptor.num_ports;
+		fPowerOnToPowerGood = hubSsDescriptor.power_on_to_power_good;
+	} else {
+		memset(&hubDescriptor, 0, sizeof(hubDescriptor));
+		status_t status = GetDescriptor(USB_DESCRIPTOR_HUB, 0, 0,
+			(void *)&hubDescriptor, sizeof(hubDescriptor), &actualLength);
+
+		// we need at least 8 bytes
+		if (status < B_OK || actualLength < 8) {
+			TRACE_ERROR("error getting hub descriptor\n");
+			return;
+		}
+
+		if (hubDescriptor.num_ports > 127) {
+			TRACE_ALWAYS("hub supports more ports than we do (%d vs. %d)\n",
+				hubDescriptor.num_ports, 127);
+			hubDescriptor.num_ports = 127;
+		}
+		fPortCount = hubDescriptor.num_ports;
+		fPowerOnToPowerGood = hubDescriptor.power_on_to_power_good;
 	}
 
 	TRACE("hub descriptor (%ld bytes):\n", actualLength);
-	TRACE("\tlength:..............%d\n", fHubDescriptor.length);
-	TRACE("\tdescriptor_type:.....0x%02x\n", fHubDescriptor.descriptor_type);
-	TRACE("\tnum_ports:...........%d\n", fHubDescriptor.num_ports);
-	TRACE("\tcharacteristics:.....0x%04x\n", fHubDescriptor.characteristics);
-	TRACE("\tpower_on_to_power_g:.%d\n", fHubDescriptor.power_on_to_power_good);
-	TRACE("\tdevice_removeable:...0x%02x\n", fHubDescriptor.device_removeable);
-	TRACE("\tpower_control_mask:..0x%02x\n", fHubDescriptor.power_control_mask);
-
-	if (fHubDescriptor.num_ports > USB_MAX_PORT_COUNT) {
-		TRACE_ALWAYS("hub supports more ports than we do (%d vs. %d)\n",
-			fHubDescriptor.num_ports, USB_MAX_PORT_COUNT);
-		fHubDescriptor.num_ports = USB_MAX_PORT_COUNT;
+	TRACE("\tlength:..............%d\n", descriptor->length);
+	TRACE("\tdescriptor_type:.....0x%02x\n", descriptor->descriptor_type);
+	TRACE("\tnum_ports:...........%d\n", descriptor->num_ports);
+	TRACE("\tcharacteristics:.....0x%04x\n", descriptor->characteristics);
+	TRACE("\tpower_on_to_power_g:.%d\n", descriptor->power_on_to_power_good);
+	TRACE("\tmax_power:...........%d\n", descriptor->max_power);
+	if (speed >= USB_SPEED_SUPERSPEED) {
+		TRACE("\tdelay:...............%d\n", hubSsDescriptor.delay);
+		TRACE("\tdecode_latency:......0x%04x\n", hubSsDescriptor.decode_latency);
+		TRACE("\tdevice_removeable:...0x%02x\n", hubSsDescriptor.device_removeable);
+	} else {
+		TRACE("\tpower_control_mask:..0x%02x\n", hubDescriptor.power_control_mask);
+		TRACE("\tdevice_removeable:...0x%02x\n", hubDescriptor.device_removeable);
 	}
-
-	if (superSpeed) {
-		// A hub on a root hub port is at depth 0, each hub above adds one.
-		uint16 depth = 0;
-		Object* rootObject = GetBusManager()->RootObject();
-		for (Object* object = Parent(); object != NULL
-				&& object->Parent() != rootObject; object = object->Parent()) {
-			if ((object->Type() & USB_OBJECT_HUB) != 0)
-				depth++;
-		}
-		status = DefaultPipe()->SendRequest(
-			USB_REQTYPE_CLASS | USB_REQTYPE_DEVICE_OUT,
-			USB_REQUEST_SET_HUB_DEPTH, depth, 0, 0, NULL, 0, NULL);
-		if (status < B_OK) {
-			TRACE_ERROR("setting the hub depth %u failed: %s\n", depth,
-				strerror(status));
-			return;
-		}
-	}
-
 	usb_interface_list *list = Configuration()->interface;
 	Object *object = GetStack()->GetObject(list->active->endpoint[0].handle);
 	if (object != NULL && (object->Type() & USB_OBJECT_INTERRUPT_PIPE) != 0) {
@@ -115,12 +137,12 @@ Hub::Hub(Object *parent, int8 hubAddress, uint8 hubPort,
 		object->ReleaseReference();
 
 	// Wait some time before powering up the ports
-	if (!isRootHub)
+	if (depth > 0)
 		snooze(USB_DELAY_HUB_POWER_UP);
 
 	// Enable port power on all ports
-	for (int32 i = 0; i < fHubDescriptor.num_ports; i++) {
-		status = DefaultPipe()->SendRequest(USB_REQTYPE_CLASS | USB_REQTYPE_OTHER_OUT,
+	for (int32 i = 0; i < fPortCount; i++) {
+		status_t status = DefaultPipe()->SendRequest(USB_REQTYPE_CLASS | USB_REQTYPE_OTHER_OUT,
 			USB_REQUEST_SET_FEATURE, PORT_POWER, i + 1, 0, NULL, 0, NULL);
 
 		if (status < B_OK)
@@ -128,7 +150,7 @@ Hub::Hub(Object *parent, int8 hubAddress, uint8 hubPort,
 	}
 
 	// Wait for power to stabilize
-	snooze(fHubDescriptor.power_on_to_power_good * 2000);
+	snooze(fPowerOnToPowerGood * 2000);
 
 	fInitOK = true;
 	TRACE("initialised ok\n");
@@ -148,7 +170,7 @@ Hub::Changed(change_item **changeList, bool added)
 	if (added || result < B_OK)
 		return result;
 
-	for (int32 i = 0; i < fHubDescriptor.num_ports; i++) {
+	for (int32 i = 0; i < fPortCount; i++) {
 		if (fChildren[i] == NULL)
 			continue;
 
@@ -234,7 +256,7 @@ Hub::DisablePort(uint8 index)
 void
 Hub::Explore(change_item **changeList)
 {
-	for (int32 i = 0; i < fHubDescriptor.num_ports; i++) {
+	for (int32 i = 0; i < fPortCount; i++) {
 		status_t result = UpdatePortStatus(i);
 		if (result < B_OK)
 			continue;
@@ -448,7 +470,7 @@ Hub::Explore(change_item **changeList)
 	}
 
 	// explore down the tree if we have hubs connected
-	for (int32 i = 0; i < fHubDescriptor.num_ports; i++) {
+	for (int32 i = 0; i < fPortCount; i++) {
 		if (!fChildren[i] || (fChildren[i]->Type() & USB_OBJECT_HUB) == 0)
 			continue;
 
@@ -469,6 +491,11 @@ status_t
 Hub::GetDescriptor(uint8 descriptorType, uint8 index, uint16 languageID,
 	void *data, size_t dataLength, size_t *actualLength)
 {
+	if (descriptorType != USB_DESCRIPTOR_HUB_SS && descriptorType != USB_DESCRIPTOR_HUB) {
+		return Device::GetDescriptor(descriptorType, index, languageID, data, dataLength,
+			actualLength);
+	}
+
 	return DefaultPipe()->SendRequest(
 		USB_REQTYPE_DEVICE_IN | USB_REQTYPE_CLASS,			// type
 		USB_REQUEST_GET_DESCRIPTOR,							// request
@@ -495,7 +522,7 @@ Hub::ReportDevice(usb_support_descriptor *supportDescriptors,
 			supportDescriptorCount, hooks, cookies, added, recursive);
 	}
 
-	for (int32 i = 0; recursive && i < fHubDescriptor.num_ports; i++) {
+	for (int32 i = 0; recursive && i < fPortCount; i++) {
 		if (!fChildren[i])
 			continue;
 
@@ -540,7 +567,7 @@ Hub::BuildDeviceName(char *string, uint32 *index, size_t bufferSize,
 		}
 	} else {
 		// find out where the requested device sitts
-		for (int32 i = 0; i < fHubDescriptor.num_ports; i++) {
+		for (int32 i = 0; i < fPortCount; i++) {
 			if (fChildren[i] == device) {
 				if (*index < bufferSize) {
 					size_t totalBytes = snprintf(string + *index,

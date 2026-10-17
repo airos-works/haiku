@@ -62,7 +62,7 @@ SDPClient::Start()
 	socklen_t errorLength = sizeof(sockError);
 	status = getsockopt(fClientSocket, SOL_SOCKET, SO_ERROR, &sockError, &errorLength);
 	if (status < 0)
-		TRACE_BT("SDP: Error occured\n");
+		TRACE_BT("SDP: Error occurred\n");
 	else if (sockError == 0)
 		TRACE_BT("SDP: Socket connected.\n");
 	else
@@ -109,9 +109,9 @@ SDPClient::RequestServiceRecords()
 	rawReqDataIO.WriteExactly(&maxAttrByteCount, 2);
 
 	// getting all attributes start_id = 0x0000, end_id = 0xFFFF
-	uint32 arrtRange = 0x0000FFFF;
+	uint32 attrRange = 0x0000FFFF;
 	rawReq.AddDataSeq(5);
-	rawReq.AddUInt32(arrtRange);
+	rawReq.AddUInt32(attrRange);
 
 	// The continuation state is at most 16 bytes (Core spec, SDP 4.3).
 	char contStateData[17];
@@ -144,7 +144,7 @@ SDPClient::RequestServiceRecords()
 
 		BMallocIO reply;
 		if (_IssueRequest(request.Buffer(), request.BufferLength(), &reply) != B_OK) {
-			TRACE_BT("SDP: Issueing Request failed\n");
+			TRACE_BT("SDP: Issuing Request failed\n");
 			return B_ERROR;
 		}
 
@@ -243,7 +243,7 @@ SDPClient::NotifyProfiles()
 void
 SDPClient::_ParseAttrLists(BMallocIO* attrListsDataIO)
 {
-	TRACE_BT("SDP: Parsing the AttrLists... Num Bytes=%ld\n", attrListsDataIO->BufferLength());
+	TRACE_BT("SDP: Parsing the AttrLists... Num Bytes=%" B_PRIuSIZE "\n", attrListsDataIO->BufferLength());
 	status_t status = Bluetooth::SDPParseAttributeLists(attrListsDataIO,
 		fRemoteDevice->services);
 	TRACE_BT("SDP: Finished parsing: %s\n", strerror(status));
@@ -282,7 +282,7 @@ SDPClient::_IssueRequest(const void* request, int32 size, BMallocIO* reply)
 	SDP_LOG(Bluetooth::LE_LOG_DEBUG, "%zd-byte answer after %" B_PRId64 " ms",
 		numBytes, (system_time() - sent) / 1000);
 
-	TRACE_BT("SDP: Recieved the response: num bytes=%ld\n", numBytes);
+	TRACE_BT("SDP: Received the response: num bytes=%" B_PRIdSSIZE "\n", numBytes);
 
 	reply->SetSize(0);
 	reply->Write(buffer, numBytes);

@@ -369,6 +369,8 @@ EHCI::EHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
 		fUseMSI(false),
 		fInterruptInstalled(false)
 {
+	B_INITIALIZE_SPINLOCK(&fInterruptLock);
+
 	// Create a lock for the isochronous transfer list
 	mutex_init(&fIsochronousLock, "EHCI isochronous lock");
 	memset(fSplitBudget, 0, sizeof(fSplitBudget));
@@ -1389,8 +1391,7 @@ EHCI::SubmitIsochronous(Transfer *transfer)
 			| EHCI_ITD_ADDRESS(pipe->DeviceAddress());
 		itd->buffer_phy[1] |= EHCI_ITD_MAXPACKETSIZE(pipe->MaxPacketSize())
 				| EHCI_ITD_DIR(directionIn);
-		itd->buffer_phy[2]
-			|= EHCI_ITD_MUL((pipe->MaxPacketSize() >> EHCI_ITD_MAXPACKETSIZE_LENGTH) + 1);
+		itd->buffer_phy[2] |= EHCI_ITD_MUL(pipe->MaxBurst() + 1);
 
 		TRACE("isochronous filled itd buffer_phy[0,1,2] 0x%" B_PRIx32 ", 0x%"
 			B_PRIx32 " 0x%" B_PRIx32 "\n",
@@ -2265,8 +2266,7 @@ EHCI::InterruptHandler(void *data)
 int32
 EHCI::Interrupt()
 {
-	static spinlock lock = B_SPINLOCK_INITIALIZER;
-	acquire_spinlock(&lock);
+	acquire_spinlock(&fInterruptLock);
 
 	// check if any interrupt was generated
 	uint32 status = ReadOpReg(EHCI_USBSTS) & EHCI_USBSTS_INTMASK;
@@ -2277,7 +2277,7 @@ EHCI::Interrupt()
 			WriteOpReg(EHCI_USBSTS, status);
 		}
 
-		release_spinlock(&lock);
+		release_spinlock(&fInterruptLock);
 		return B_UNHANDLED_INTERRUPT;
 	}
 
@@ -2313,7 +2313,7 @@ EHCI::Interrupt()
 		TRACE_ERROR("host system error!\n");
 
 	WriteOpReg(EHCI_USBSTS, status);
-	release_spinlock(&lock);
+	release_spinlock(&fInterruptLock);
 
 	if (asyncAdvance)
 		release_sem_etc(fAsyncAdvanceSem, 1, B_DO_NOT_RESCHEDULE);
