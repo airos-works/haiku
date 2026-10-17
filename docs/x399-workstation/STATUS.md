@@ -12,21 +12,29 @@ in airTime and (H.264) Summit. The system is master hrev60206+1165.
 driver (removed from the tree on 2026-10-13) and its record below are
 history.
 
-**2026-10-11 WX 5100 status:** the X399 now has a Radeon Pro WX 5100.
+**2026-10-12 WX 5100 status:** the X399 now has a Radeon Pro WX 5100.
 Current driver `a4aebce1…` and private Mesa `42352938…` remain installed.
 Actual airTime tests now recover from real H.264/Main/Main10 GPU faults,
 replay in software, seek, recreate hardware decoding and reach the end.
 Two player bugs were fixed and integrated: stale packets after decoder
 replacement, and suppression of all final pictures during hardware catch-up.
 Four cases pass with exact paused pixels; one clear-fault case reports one
-dropped frame. Summit software decoding reaches the end after a real fault,
-but GPU composition freezes and a delayed Mesa-thread abort is recorded.
-Summit recovery is not qualified. All eight automatic resets succeeded;
-this boot is generation 21, automatic 18/18, with no retained resources.
-Fresh EGL/GLES/window and both DMA suites pass afterward, leaving 117 healthy
-GFX completions and zero GPU errors. Production media and backups are verified.
+dropped frame. Private Summit compositor and main-thread Canvas 2D recovery
+are now qualified after actual GPU faults. Main10 MSE replays the interrupted
+decoder in software, then opens a fresh hardware decoder; both pixel outputs
+match independent references and the visible GPU-composited video reaches
+frame 47. Canvas loss resets state and suppresses drawing, then restores GPU
+storage and permits exact redraw. Native backend traces and completed GPU
+fences establish hardware execution. The last qualified checkpoint ends at
+generation 30, automatic 27/27, no live or quarantined resources, and 706
+healthy GFX completions after final EGL/GLES/window and DMA checks.
+Retained GPU snapshots still need recovery: a separate QEMU-only guard fixes
+their crash, but five loss cases remain blank. An unread-bitmap control confirms
+the pixel loss without a preread; an immutable-bitmap recovery candidate is
+being built and has no runtime qualification yet. Production media and the
+qualified browser bundle are preserved; system app defaults are unchanged.
 Details and remaining full-release work are in
-[the actual application recovery checkpoint](WX5100.md#actual-application-recovery-2026-10-11).
+[the Summit renderer and canvas checkpoint](WX5100.md#summit-renderer-and-canvas-recovery-2026-10-12).
 
 The earlier checkpoints below trace this work. The NVIDIA results describe the previous card. AMD desktop output still
 uses the firmware framebuffer. SDMA and the full 61-submission bounded GFX diagnostic pass, including
