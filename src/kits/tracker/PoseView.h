@@ -56,6 +56,7 @@ All rights reserved.
 #include <FilePanel.h>
 #include <HashSet.h>
 #include <MessageRunner.h>
+#include <Region.h>
 #include <String.h>
 #include <ScrollBar.h>
 #include <View.h>
@@ -201,6 +202,8 @@ public:
 	void CheckPoseSortOrder(BPose*, int32 index);
 	void CheckPoseVisibility(BRect* = NULL);
 		// make sure pose fits the screen and/or window bounds if needed
+	void UpdateDisplayRegion();
+		// learn where the monitors are, which desktop icons are kept on
 
 	// view metrics
 	font_height FontInfo() const;
@@ -535,6 +538,9 @@ protected:
 		// and place it
 	bool IsValidLocation(const BPose* pose);
 	bool IsValidLocation(const BRect& rect);
+	bool IsOnDisplays(const BRect& rect) const;
+		// whether enough of a pose is on screen to see and drag it
+	bool DesktopLocationForFrame(Model* model, BPoint& location);
 	status_t GetDeskbarFrame(BRect* frame);
 	bool SlotOccupied(BRect poseRect, BRect viewBounds) const;
 	void NextSlot(BPose*, BRect&poseRect, BRect viewBounds);
@@ -804,6 +810,9 @@ private:
 	bigtime_t fLastKeyTime;
 	bigtime_t fLastDeskbarFrameCheckTime;
 	BRect fDeskbarFrame;
+	BRegion fDisplayRegion;
+		// the desktop's monitors; parts of the screen between monitors of
+		// different sizes are shown by none
 
 	static OffscreenBitmap* sOffscreen;
 
