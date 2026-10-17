@@ -455,6 +455,20 @@ DestroyBuffer(int fd, Buffer& buffer)
 
 
 status_t
+PublishScanout(int fd, const Buffer& buffer, uint32 format)
+{
+	drm_haiku_scanout scanout = {};
+	scanout.op = DRM_HAIKU_SCANOUT_PUBLISH;
+	scanout.handle = buffer.handle;
+	scanout.width = buffer.width;
+	scanout.height = buffer.height;
+	scanout.pitch = buffer.pitch;
+	scanout.format = format;
+	return Ioctl(fd, DRM_HAIKU_IOCTL_SCANOUT, &scanout);
+}
+
+
+status_t
 WaitVBlank(int fd, uint32 crtcIndex, uint32* sequence)
 {
 	drm_wait_vblank wait = {};
