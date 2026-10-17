@@ -67,9 +67,11 @@ public:
 
 	virtual void TranscodeStarted(const TranscodeReport& report)
 	{
-		printf("video: %s %s %dx%d%s\n", report.videoEncoder.String(),
-			report.videoSettings.String(), report.width, report.height,
-			report.cpuFallback ? " (CPU fallback)" : "");
+		if (!report.videoEncoder.IsEmpty()) {
+			printf("video: %s %s %dx%d%s\n", report.videoEncoder.String(),
+				report.videoSettings.String(), report.width, report.height,
+				report.cpuFallback ? " (CPU fallback)" : "");
+		}
 		if (report.cpuFallback)
 			printf("  why not a GPU: %s\n", report.fallbackReason.String());
 		for (size_t i = 0; i < report.audioTracks.size(); i++)
@@ -445,6 +447,7 @@ main(int argc, char** argv)
 	const char* source = NULL;
 	const char* destination = NULL;
 	bool quiet = false;
+	bool containerChosen = false;
 
 	for (int i = 1; i < argc; i++) {
 		const char* arg = argv[i];
@@ -469,7 +472,9 @@ main(int argc, char** argv)
 				return 1;
 			}
 			settings = Presets::At(index).settings;
+			containerChosen = true;
 		} else if (strcmp(arg, "--container") == 0 && next != NULL) {
+			containerChosen = true;
 			bool found = false;
 			for (size_t c = 0; c < sizeof(kContainerNames)
 					/ sizeof(kContainerNames[0]); c++) {
@@ -576,6 +581,21 @@ main(int argc, char** argv)
 	}
 	if (source == NULL || destination == NULL)
 		usage();
+	// without --container or --preset, the output's name says which
+	const char* extension = strrchr(destination, '.');
+	if (!containerChosen && extension != NULL) {
+		BString name(extension + 1);
+		name.ToLower();
+		if (name == "m4v")
+			name = "mp4";
+		else if (name == "oga")
+			name = "ogg";
+		for (size_t c = 0; c < sizeof(kContainerNames)
+				/ sizeof(kContainerNames[0]); c++) {
+			if (name == kContainerNames[c].name)
+				settings.container = kContainerNames[c].kind;
+		}
+	}
 	if (settings.Validate())
 		fprintf(stderr, "note: settings adjusted to fit the container\n");
 
