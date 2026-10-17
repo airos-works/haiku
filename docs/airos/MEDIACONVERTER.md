@@ -18,7 +18,7 @@ only M4A, MP3, FLAC, Ogg, Opus and WAV.
 
 | Video | On the GPU | On the CPU |
 | --- | --- | --- |
-| H.264 | AMD VCE/VCN (VA-API), NVIDIA NVENC (Kepler and later) | x264 |
+| H.264 | AMD VCE/VCN (VA-API), NVIDIA NVENC (Maxwell and later) | x264 |
 | H.264 10-bit | – | x264 |
 | H.265 | AMD Polaris and later (VA-API), NVIDIA NVENC (second Maxwell and later) | x265 |
 | H.265 10-bit | AMD VCN 2 and later, NVIDIA Pascal and later | x265 |
@@ -161,9 +161,30 @@ FFmpeg's VA-API encoders, which Mesa is tested against:
 NVENC is reached the way the NVDEC add-on reaches NVDEC: through the
 nvidia_rm resource manager, with NVIDIA's class headers (`clc?b7.h`) and
 `nvenc_drv.h`. Those live in the NVK tree, so the encoder is an add-on built
-beside NVDEC (`system/non-packaged/add-ons/media/encoders/nvenc`), and
-MediaConverter talks to it through `headers/private/media/nvenc_api.h`. The
-hardware inventory knows every NVIDIA chip's encoder generation by PCI id
+beside NVDEC (`src/add-ons/media/encoders/nvenc`, installed as
+`system/non-packaged/add-ons/media/encoders/nvenc`), and MediaConverter talks
+to it through `headers/private/media/nvenc_api.h`. The add-on finds the card's
+encoder class in its class list (Maxwell's C0B7 to Blackwell's CFB7), opens a
+channel of the kind the card has (pre-Volta, or Volta and later with the
+usermode doorbell) and encodes H.264 Main and H.265 Main and Main 10 - I and P
+pictures, one reference, CABAC - writing the parameter sets itself and letting
+the engine write the slices. AV1, which Ada and Blackwell have, is not in the
+add-on yet: on those cards AV1 goes to the CPU, with the warning.
+
+No open driver drives NVENC, and the header does not say how each generation
+wants its input picture laid out. The add-on knows several ways
+(`variants`), and before a card encodes anything MediaConverter encodes a
+small test picture each way until one decodes again with libavcodec above
+32 dB (`NvencEncoder::SelfTest`, run in the background when the window
+opens, or before the first conversion). A format that fails counts as one
+the card cannot encode: the badge, the hardware window and the CPU warning
+say so, with the reason. Results are kept per card and add-on build in
+`~/config/settings/MediaConverter NVENC test`. This has not met an NVIDIA
+card yet - the lab has none since 2026-10-12 - and was tried end to end with a
+stand-in add-on that encodes with x264 (`nvenc/test/fake_nvenc.cpp`, see the
+add-on's README).
+
+The hardware inventory knows every NVIDIA chip's encoder generation by PCI id
 (no NVENC on GM108, GP108, GA100 and GH100), so the window can say what a
 card would do even before its driver is there.
 
@@ -216,10 +237,16 @@ mediaconvert [options] <source> <output>    convert (--help lists the options)
 mediaconvert --compare <source> <output>    luma PSNR, picture by picture
 mediaconvert --dump <file> <n> <out>        extradata and the first n packets
 MEDIACONVERTER_PROFILE=1 mediaconvert ...   time per stage, and the VA-API upload/sync split
+MEDIACONVERTER_NVENC_RETEST=1 ...           run the NVENC self-test again
+MEDIACONVERTER_NVENC_VARIANT=n ...          try only the add-on's input layout n
+MEDIACONVERTER_FAKE_NVIDIA=1b81 ...         pretend there is a GTX 1070 (with the
+                                            stand-in add-on, nvenc/test)
 ```
 
 ## Known limits
 
+- NVENC has not run on an NVIDIA card yet (see above); AV1 on Ada and
+  Blackwell is encoded on the CPU, and B pictures are not used on NVIDIA.
 - VP9 10-bit needs a libvpx built with high bit depth.
 - Theora output has single-picture dips at scene cuts.
 - arm64 images have no MediaConverter yet (no FFmpeg build feature, and no

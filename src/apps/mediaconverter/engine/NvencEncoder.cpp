@@ -7,21 +7,117 @@
 #include "NvencEncoder.h"
 
 #include <Autolock.h>
+#include <File.h>
 #include <FindDirectory.h>
 #include <Locker.h>
+#include <Message.h>
 #include <Path.h>
 #include <image.h>
 
+#include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
+#include <vector>
+
+
+static const char* kTestCacheName = "MediaConverter NVENC test";
+static const uint32 kCodecBits[] = {
+	NVENC_CODEC_H264, NVENC_CODEC_HEVC, NVENC_CODEC_HEVC_10, NVENC_CODEC_AV1,
+	NVENC_CODEC_AV1_10
+};
+static const int kCodecSlots = sizeof(kCodecBits) / sizeof(kCodecBits[0]);
+
+enum {
+	kUntested = 0,
+	kWorks = 1,
+	kFails = -1,
+};
+
+struct TestResult {
+	int		state;
+	uint32	variant;
+	BString	reason;
+};
 
 static BLocker sLock("nvenc add-on");
+static BLocker sTestLock("nvenc self-test");
 static bool sTried;
 static const nvenc_api* sApi;
 static uint32 sCodecs;
 static BString sReason;
 static BString sName;
+static BString sCacheKey;
+static TestResult sTests[kCodecSlots];
+
+
+static int
+codec_slot(uint32 bit)
+{
+	for (int i = 0; i < kCodecSlots; i++) {
+		if (kCodecBits[i] == bit)
+			return i;
+	}
+	return -1;
+}
+
+
+/*!	Test results are kept per card and add-on build, so the test runs once
+	and again only when either changes. */
+static void
+load_test_results()
+{
+	if (getenv("MEDIACONVERTER_NVENC_RETEST") != NULL)
+		return;
+	BPath path;
+	if (find_directory(B_USER_SETTINGS_DIRECTORY, &path) != B_OK
+		|| path.Append(kTestCacheName) != B_OK)
+		return;
+	BFile file(path.Path(), B_READ_ONLY);
+	BMessage archive;
+	if (file.InitCheck() != B_OK || archive.Unflatten(&file) != B_OK)
+		return;
+	if (sCacheKey != archive.GetString("key", ""))
+		return;
+	for (int i = 0; i < kCodecSlots; i++) {
+		BMessage result;
+		if (archive.FindMessage("result", i, &result) != B_OK)
+			break;
+		int slot = codec_slot(result.GetUInt32("codec", 0));
+		if (slot < 0)
+			continue;
+		sTests[slot].state = result.GetInt32("state", kUntested);
+		sTests[slot].variant = result.GetUInt32("variant", 0);
+		sTests[slot].reason = result.GetString("reason", "");
+	}
+}
+
+
+static void
+save_test_results()
+{
+	BMessage archive;
+	archive.AddString("key", sCacheKey);
+	for (int i = 0; i < kCodecSlots; i++) {
+		if (sTests[i].state == kUntested)
+			continue;
+		BMessage result;
+		result.AddUInt32("codec", kCodecBits[i]);
+		result.AddInt32("state", sTests[i].state);
+		result.AddUInt32("variant", sTests[i].variant);
+		result.AddString("reason", sTests[i].reason);
+		archive.AddMessage("result", &result);
+	}
+	BPath path;
+	if (find_directory(B_USER_SETTINGS_DIRECTORY, &path) != B_OK
+		|| path.Append(kTestCacheName) != B_OK)
+		return;
+	BFile file(path.Path(), B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);
+	if (file.InitCheck() == B_OK)
+		archive.Flatten(&file);
+}
 
 
 static const nvenc_api*
@@ -38,9 +134,9 @@ nvenc_api_get()
 		B_SYSTEM_ADDONS_DIRECTORY,
 	};
 	image_id image = -1;
+	BPath path;
 	for (size_t i = 0; i < sizeof(kDirectories) / sizeof(kDirectories[0]);
 			i++) {
-		BPath path;
 		if (find_directory(kDirectories[i], &path) != B_OK)
 			continue;
 		path.Append("media/encoders/nvenc");
@@ -78,7 +174,218 @@ nvenc_api_get()
 	sCodecs = codecs;
 	sName = name;
 	sApi = api;
+
+	struct stat st;
+	if (stat(path.Path(), &st) != 0)
+		st.st_mtime = 0;
+	sCacheKey.SetToFormat("%s|%s|%lld|%d", sName.String(), path.Path(),
+		(long long)st.st_mtime, NVENC_API_VERSION);
+	load_test_results();
 	return sApi;
+}
+
+
+// #pragma mark - self-test
+
+
+static const int kTestWidth = 352;
+static const int kTestHeight = 288;
+static const int kTestPictures = 6;
+
+
+/*!	A smooth ramp with a textured square moving across it: easy to encode
+	well, so a working encoder comes back above 40 dB, and any mix-up of
+	lines, planes or pictures shows at once. */
+static void
+make_test_picture(int index, bool tenBit, std::vector<uint8>& luma,
+	std::vector<uint8>& chroma, std::vector<int>& reference)
+{
+	int bytes = tenBit ? 2 : 1;
+	luma.assign((size_t)kTestWidth * kTestHeight * bytes, 0);
+	chroma.assign((size_t)kTestWidth * kTestHeight / 2 * bytes, 0);
+	reference.assign((size_t)kTestWidth * kTestHeight, 0);
+	int squareX = 40 + 12 * index;
+	int squareY = 60 + 6 * index;
+	for (int y = 0; y < kTestHeight; y++) {
+		for (int x = 0; x < kTestWidth; x++) {
+			int value = 32 + x * 160 / kTestWidth + y * 40 / kTestHeight;
+			if (x >= squareX && x < squareX + 64 && y >= squareY
+				&& y < squareY + 64)
+				value = 220 - ((x - squareX) + (y - squareY)) / 2;
+			size_t at = (size_t)y * kTestWidth + x;
+			reference[at] = tenBit ? value * 4 : value;
+			if (tenBit) {
+				uint16 sample = (uint16)(value * 4) << 6;
+				memcpy(&luma[at * 2], &sample, 2);
+			} else
+				luma[at] = (uint8)value;
+		}
+	}
+	for (int y = 0; y < kTestHeight / 2; y++) {
+		for (int x = 0; x < kTestWidth / 2; x++) {
+			int u = 128 + (x - kTestWidth / 4) / 4;
+			int v = 128 + (y - kTestHeight / 4) / 2;
+			if (2 * x >= squareX && 2 * x < squareX + 64 && 2 * y >= squareY
+				&& 2 * y < squareY + 64) {
+				u = 90;
+				v = 170;
+			}
+			size_t at = ((size_t)y * (kTestWidth / 2) + x) * 2;
+			if (tenBit) {
+				uint16 cb = (uint16)(u * 4) << 6, cr = (uint16)(v * 4) << 6;
+				memcpy(&chroma[at * 2], &cb, 2);
+				memcpy(&chroma[at * 2 + 2], &cr, 2);
+			} else {
+				chroma[at] = (uint8)u;
+				chroma[at + 1] = (uint8)v;
+			}
+		}
+	}
+}
+
+
+/*!	Encodes the test pictures through the add-on with one of its ways of
+	laying out the input, decodes them with libavcodec and compares. */
+static bool
+run_test(const nvenc_api* api, uint32 bit, uint32 variant, BString& why,
+	bool& timedOut)
+{
+	timedOut = false;
+	bool tenBit = bit == NVENC_CODEC_HEVC_10 || bit == NVENC_CODEC_AV1_10;
+	bool av1 = bit == NVENC_CODEC_AV1 || bit == NVENC_CODEC_AV1_10;
+
+	nvenc_config config;
+	memset(&config, 0, sizeof(config));
+	config.codec = bit;
+	config.width = kTestWidth;
+	config.height = kTestHeight;
+	config.frame_rate_num = 30;
+	config.frame_rate_den = 1;
+	config.sar_num = 1;
+	config.sar_den = 1;
+	config.rate_control = NVENC_RC_CONSTQP;
+	config.qp = av1 ? 80 : 22;
+	config.key_interval = 30;
+	config.preset = 4;
+	config.colour_primaries = 1;
+	config.transfer = 1;
+	config.matrix = 1;
+	config.variant = variant;
+	config.timeout_ms = 1000;
+
+	AVCodecID id = bit == NVENC_CODEC_H264 ? AV_CODEC_ID_H264
+		: av1 ? AV_CODEC_ID_AV1 : AV_CODEC_ID_HEVC;
+	const AVCodec* decoder = avcodec_find_decoder(id);
+	AVCodecContext* context = decoder != NULL
+		? avcodec_alloc_context3(decoder) : NULL;
+	if (context == NULL || avcodec_open2(context, decoder, NULL) < 0) {
+		avcodec_free_context(&context);
+		why = "There is no decoder to check NVENC's output with.";
+		return false;
+	}
+
+	char reason[256] = "";
+	nvenc_session* session = api->open(&config, reason, sizeof(reason));
+	if (session == NULL) {
+		avcodec_free_context(&context);
+		why = reason[0] != '\0' ? reason : "NVENC did not start.";
+		return false;
+	}
+
+	std::vector<std::vector<int> > references(kTestPictures);
+	AVPacket* packet = av_packet_alloc();
+	AVFrame* frame = av_frame_alloc();
+	double squared = 0;
+	int64 samples = 0;
+	int decoded = 0;
+	bool failed = false;
+
+	auto takeFrames = [&]() {
+		while (avcodec_receive_frame(context, frame) == 0) {
+			if (decoded < kTestPictures && frame->width >= kTestWidth
+				&& frame->height >= kTestHeight) {
+				const std::vector<int>& reference = references[decoded];
+				bool wide = frame->format != AV_PIX_FMT_YUV420P
+					&& frame->format != AV_PIX_FMT_YUVJ420P;
+				for (int y = 0; y < kTestHeight; y++) {
+					const uint8* line = frame->data[0] + (size_t)y * frame->linesize[0];
+					for (int x = 0; x < kTestWidth; x++) {
+						int value = wide ? ((const uint16*)line)[x] : line[x];
+						double difference = value - reference[(size_t)y * kTestWidth + x];
+						squared += difference * difference;
+					}
+				}
+				samples += (int64)kTestWidth * kTestHeight;
+			}
+			decoded++;
+			av_frame_unref(frame);
+		}
+	};
+	auto takePackets = [&]() -> bool {
+		nvenc_packet out;
+		int status;
+		while ((status = api->receive(session, &out)) == 0) {
+			if (av_new_packet(packet, (int)out.size) == 0) {
+				memcpy(packet->data, out.data, out.size);
+				packet->pts = out.pts;
+				packet->dts = out.dts;
+				avcodec_send_packet(context, packet);
+				av_packet_unref(packet);
+			}
+			api->release(session, &out);
+			takeFrames();
+		}
+		return status != -1;
+	};
+
+	std::vector<uint8> luma, chroma;
+	for (int i = 0; i < kTestPictures && !failed; i++) {
+		make_test_picture(i, tenBit, luma, chroma, references[i]);
+		nvenc_picture picture;
+		memset(&picture, 0, sizeof(picture));
+		picture.planes[0] = luma.data();
+		picture.planes[1] = chroma.data();
+		picture.strides[0] = kTestWidth * (tenBit ? 2 : 1);
+		picture.strides[1] = picture.strides[0];
+		picture.pts = i;
+		int status = api->encode(session, &picture);
+		if (status != 0) {
+			why = api->describe(session);
+			timedOut = status == NVENC_TIMED_OUT;
+			failed = true;
+		} else if (!takePackets()) {
+			why = "NVENC lost a picture.";
+			failed = true;
+		}
+	}
+	if (!failed) {
+		api->encode(session, NULL);
+		takePackets();
+		avcodec_send_packet(context, NULL);
+		takeFrames();
+	}
+	api->close(session);
+	av_frame_free(&frame);
+	av_packet_free(&packet);
+	avcodec_free_context(&context);
+	if (failed)
+		return false;
+
+	if (decoded < kTestPictures || samples == 0) {
+		why.SetToFormat("Only %d of %d test pictures NVENC encoded could be "
+			"decoded.", decoded, kTestPictures);
+		return false;
+	}
+	double peak = tenBit ? 1023.0 : 255.0;
+	double meanSquared = squared / samples;
+	double psnr = meanSquared > 0
+		? 10 * log10(peak * peak / meanSquared) : 99.0;
+	if (psnr < 32) {
+		why.SetToFormat("The test pictures NVENC encoded came back wrong "
+			"(PSNR %.1f dB).", psnr);
+		return false;
+	}
+	return true;
 }
 
 
@@ -126,8 +433,110 @@ NvencEncoder::Implements(video_codec codec)
 	uint32 bit = nvenc_codec(codec);
 	if (bit == 0)
 		return false;
-	// The add-on decides for the card; with no add-on nothing is implemented
-	return nvenc_api_get() != NULL && (sCodecs & bit) != 0;
+	// The add-on decides for the card; with no add-on nothing is
+	// implemented, and a format that failed the test is not either.
+	if (nvenc_api_get() == NULL || (sCodecs & bit) == 0)
+		return false;
+	BAutolock _(sLock);
+	return sTests[codec_slot(bit)].state != kFails;
+}
+
+
+bool
+NvencEncoder::Tested(video_codec codec, bool* works, BString* why)
+{
+	uint32 bit = nvenc_codec(codec);
+	if (bit == 0 || nvenc_api_get() == NULL)
+		return false;
+	BAutolock _(sLock);
+	const TestResult& result = sTests[codec_slot(bit)];
+	if (result.state == kUntested)
+		return false;
+	if (works != NULL)
+		*works = result.state == kWorks;
+	if (why != NULL)
+		*why = result.reason;
+	return true;
+}
+
+
+bool
+NvencEncoder::SelfTest(video_codec codec, BString* why)
+{
+	uint32 bit = nvenc_codec(codec);
+	const nvenc_api* api = nvenc_api_get();
+	if (bit == 0 || api == NULL || (sCodecs & bit) == 0) {
+		if (why != NULL)
+			*why = api == NULL ? sReason : BString("NVENC cannot encode this.");
+		return false;
+	}
+	int slot = codec_slot(bit);
+
+	// one test at a time; a second caller waits for the first one's result
+	BAutolock testing(sTestLock);
+	{
+		BAutolock _(sLock);
+		if (sTests[slot].state != kUntested) {
+			if (why != NULL)
+				*why = sTests[slot].reason;
+			return sTests[slot].state == kWorks;
+		}
+	}
+
+	TestResult result;
+	result.state = kFails;
+	result.variant = 0;
+	uint32 variants = api->variants != NULL ? api->variants(0, NULL) : 1;
+	const char* forced = getenv("MEDIACONVERTER_NVENC_VARIANT");
+	uint32 first = forced != NULL ? (uint32)atoi(forced) : 0;
+	uint32 last = forced != NULL ? first + 1 : variants;
+	BString firstReason;
+	for (uint32 variant = first; variant < last && variant < variants;
+			variant++) {
+		BString reason;
+		bool timedOut;
+		if (run_test(api, bit, variant, reason, timedOut)) {
+			result.state = kWorks;
+			result.variant = variant;
+			break;
+		}
+		const char* name = NULL;
+		if (api->variants != NULL)
+			api->variants(variant, &name);
+		fprintf(stderr, "NVENC self-test, %s: %s\n",
+			name != NULL ? name : "default", reason.String());
+		if (firstReason.IsEmpty())
+			firstReason = reason;
+		// an engine that does not answer at all will not for another layout
+		if (timedOut)
+			break;
+	}
+	if (result.state != kWorks) {
+		result.reason.SetToFormat("NVENC failed MediaConverter's test: %s",
+			firstReason.String());
+	}
+
+	BAutolock _(sLock);
+	sTests[slot] = result;
+	save_test_results();
+	if (why != NULL)
+		*why = result.reason;
+	return result.state == kWorks;
+}
+
+
+void
+NvencEncoder::SelfTestAll()
+{
+	if (nvenc_api_get() == NULL)
+		return;
+	static const video_codec kCodecs[] = {
+		kVideoH264, kVideoH265, kVideoH265_10, kVideoAV1, kVideoAV1_10
+	};
+	for (size_t i = 0; i < sizeof(kCodecs) / sizeof(kCodecs[0]); i++) {
+		if ((sCodecs & nvenc_codec(kCodecs[i])) != 0)
+			SelfTest(kCodecs[i]);
+	}
 }
 
 
@@ -156,6 +565,9 @@ NvencEncoder::Open(const VideoEncoderParams& params, BString& error)
 		error = sReason;
 		return B_NOT_SUPPORTED;
 	}
+	// nothing is encoded on a card before it has shown it can
+	if (!SelfTest(params.codec, &error))
+		return B_NOT_SUPPORTED;
 	if (!sName.IsEmpty())
 		fDeviceName = sName;
 	fBitDepth = video_codec_info(params.codec).bitDepth;
@@ -190,6 +602,10 @@ NvencEncoder::Open(const VideoEncoderParams& params, BString& error)
 	config.full_range = params.range == AVCOL_RANGE_JPEG;
 	config.chroma_location = params.chromaLocation > 0
 		? params.chromaLocation - 1 : 0;
+	{
+		BAutolock _(sLock);
+		config.variant = sTests[codec_slot(config.codec)].variant;
+	}
 
 	char reason[256] = "";
 	fSession = fApi->open(&config, reason, sizeof(reason));

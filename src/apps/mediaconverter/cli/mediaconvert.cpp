@@ -13,6 +13,7 @@
 #include "Formats.h"
 #include "HardwareCaps.h"
 #include "MediaProbe.h"
+#include "NvencEncoder.h"
 #include "OutputSettings.h"
 #include "Presets.h"
 #include "SoftwareEncoders.h"
@@ -110,12 +111,24 @@ print_hardware()
 			device.id.String(), device.vendorID, device.deviceID,
 			device.generation.String(), device.engine.String(),
 			device.status.String());
+		// NVIDIA formats count once a test picture has come back
+		if (device.backend == kBackendNVENC && device.ready)
+			NvencEncoder::SelfTestAll();
 		for (size_t f = 0; f < device.encode.size(); f++) {
 			const GpuEncodeFormat& format = device.encode[f];
-			printf("    encode %-14s up to %dx%d%s%s\n",
+			BString test;
+			bool works;
+			if (device.backend == kBackendNVENC
+				&& NvencEncoder::Tested(format.codec, &works, &test)) {
+				BString result = works ? BString(" (tested)")
+					: BString(" (") << test << ")";
+				test = result;
+			}
+			printf("    encode %-14s up to %dx%d%s%s%s\n",
 				video_codec_info(format.codec).name, format.maxWidth,
 				format.maxHeight, format.bFrames ? ", B pictures" : "",
-				device.CanEncode(format.codec, 16, 16) ? "" : " (not used)");
+				device.CanEncode(format.codec, 16, 16) ? "" : " (not used)",
+				test.String());
 		}
 		BString decode;
 		for (size_t d = 0; d < device.decode.size(); d++) {

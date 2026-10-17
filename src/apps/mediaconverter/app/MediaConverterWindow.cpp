@@ -39,6 +39,7 @@
 #include "MediaConverterApp.h"
 #include "MediaProbe.h"
 #include "Messages.h"
+#include "NvencEncoder.h"
 #include "OutputView.h"
 #include "Presets.h"
 #include "QueueView.h"
@@ -110,6 +111,21 @@ private:
 	BMessenger	fTarget;
 	int32		fID;
 };
+
+
+/*!	NVIDIA formats count once a test picture has come back through the
+	card (see NvencEncoder::SelfTest); the test runs here rather than in
+	the way of the first conversion, and the window is told what came of
+	it. */
+static status_t
+test_nvidia_encoders(void* data)
+{
+	BMessenger* target = (BMessenger*)data;
+	NvencEncoder::SelfTestAll();
+	target->SendMessage(kMsgHardwareTested);
+	delete target;
+	return B_OK;
+}
 
 
 status_t
@@ -309,6 +325,19 @@ MediaConverterWindow::MediaConverterWindow()
 	_SelectionChanged();
 	_UpdateControls();
 	_UpdateStatus();
+
+	HardwareInventory& inventory = HardwareInventory::Default();
+	for (int32 i = 0; i < inventory.CountDevices(); i++) {
+		const GpuDevice& device = inventory.DeviceAt(i);
+		if (device.backend != kBackendNVENC || !device.ready)
+			continue;
+		BMessenger* target = new BMessenger(this);
+		thread_id thread = spawn_thread(test_nvidia_encoders,
+			"test NVIDIA encoders", B_LOW_PRIORITY, target);
+		if (thread < 0 || resume_thread(thread) != B_OK)
+			delete target;
+		break;
+	}
 }
 
 
@@ -500,6 +529,14 @@ MediaConverterWindow::MessageReceived(BMessage* message)
 		case kMsgToggleCpuWarning:
 			fWarnCpu = !fWarnCpu;
 			fWarnItem->SetMarked(fWarnCpu);
+			break;
+
+		case kMsgHardwareTested:
+			fOutput->UpdateHardwareStatus();
+			if (fHardwareWindow != NULL && fHardwareWindow->Lock()) {
+				fHardwareWindow->PostMessage(kMsgHardwareTested);
+				fHardwareWindow->Unlock();
+			}
 			break;
 
 		case kMsgShowHardware:

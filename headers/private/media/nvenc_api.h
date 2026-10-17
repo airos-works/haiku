@@ -40,6 +40,13 @@ enum {
 };
 
 
+/* what encode() returns when it fails */
+enum {
+	NVENC_FAILED			= -1,
+	NVENC_TIMED_OUT			= -2,
+};
+
+
 /* rate control */
 enum {
 	NVENC_RC_CONSTQP		= 0,
@@ -72,7 +79,10 @@ typedef struct {
 	uint8_t		full_range;
 	uint8_t		chroma_location;	/* H.273, 0 = left */
 	uint8_t		reserved[3];
-	uint32_t	reserved2[8];
+	uint32_t	variant;			/* how pictures are handed to the */
+									/* engine, 0 .. variants() - 1 */
+	uint32_t	timeout_ms;			/* per picture, 0: 2 seconds */
+	uint32_t	reserved2[6];
 } nvenc_config;
 
 
@@ -110,7 +120,9 @@ typedef struct {
 	/* The parameter sets (or AV1 sequence header) of the stream. */
 	int			(*headers)(nvenc_session* session, uint8_t* buffer,
 					size_t* size);
-	/* picture == NULL drains the encoder. Returns 0 or -1. */
+	/* picture == NULL drains the encoder. Returns 0, NVENC_FAILED, or
+	 * NVENC_TIMED_OUT when the engine did not answer at all; describe()
+	 * then says why. */
 	int			(*encode)(nvenc_session* session,
 					const nvenc_picture* picture);
 	/* 0: a packet, 1: none yet, 2: drained, -1: error */
@@ -119,6 +131,13 @@ typedef struct {
 	void		(*close)(nvenc_session* session);
 	/* "constant QP 24, P pictures" */
 	const char*	(*describe)(nvenc_session* session);
+
+	/* The class headers do not say how each generation wants its input
+	 * pictures laid out, so the add-on knows several ways (variants). The
+	 * caller encodes a test picture with each until one decodes, and uses
+	 * that one from then on. Returns how many there are, and the name of
+	 * one when `name` is not NULL. */
+	uint32_t	(*variants)(uint32_t variant, const char** name);
 } nvenc_api;
 
 

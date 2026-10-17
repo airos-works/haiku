@@ -34,6 +34,7 @@ enum {
 	kMsgQueueFinished			= 'qfin',
 	kMsgSourceProbed			= 'sprb',
 	kMsgPreviewReady			= 'prvw',
+	kMsgHardwareTested			= 'hwts',
 };
 
 

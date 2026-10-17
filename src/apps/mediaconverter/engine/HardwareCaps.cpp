@@ -9,6 +9,7 @@
 #include <Autolock.h>
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -599,7 +600,8 @@ HardwareInventory::_AddTableDevice(uint16 vendor, uint16 deviceID)
 			}
 			if (device.encode.empty())
 				device.status = "This GPU has no video encoder.";
-			else if (!exists("/dev/nvidiactl"))
+			else if (!exists("/dev/nvidiactl")
+				&& getenv("MEDIACONVERTER_FAKE_NVIDIA") == NULL)
 				device.status = "Needs the nvidia_rm driver.";
 			else {
 				BString why;
@@ -633,6 +635,10 @@ HardwareInventory::Probe()
 	fDevices.clear();
 	_ProbeVaapi();
 	_ProbePci();
+	// A test hook: an NVIDIA card with this PCI device ID, to try the NVENC
+	// paths with the stand-in add-on (nvenc/test/fake_nvenc.cpp).
+	if (const char* fake = getenv("MEDIACONVERTER_FAKE_NVIDIA"))
+		_AddTableDevice(kNVIDIAVendor, (uint16)strtoul(fake, NULL, 16));
 	fProbed = true;
 }
 
@@ -697,8 +703,15 @@ HardwareInventory::WhyNotHardware(video_codec codec, int width,
 				device.name.String(), info.name, format->maxWidth,
 				format->maxHeight);
 		} else {
-			line.SetToFormat("MediaConverter cannot use %s for %s yet.",
-				device.name.String(), info.name);
+			bool works;
+			BString why;
+			if (device.backend == kBackendNVENC
+				&& NvencEncoder::Tested(codec, &works, &why) && !works) {
+				line.SetToFormat("%s: %s", device.name.String(), why.String());
+			} else {
+				line.SetToFormat("MediaConverter cannot use %s for %s yet.",
+					device.name.String(), info.name);
+			}
 		}
 		if (!reason.IsEmpty())
 			reason << " ";

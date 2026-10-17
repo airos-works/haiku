@@ -23,6 +23,19 @@ public:
 	// What the add-on says the card encodes, as NVENC_CODEC_* bits.
 	static	uint32				Codecs();
 
+	// Nothing documents how each NVIDIA generation wants its input, so a
+	// format only counts once a test picture encoded through the add-on
+	// decodes again (trying each way the add-on knows). Blocks, for up to
+	// some seconds the first time; the result is kept, also on disk, per
+	// card and add-on build. MEDIACONVERTER_NVENC_RETEST ignores what was
+	// kept, MEDIACONVERTER_NVENC_VARIANT=n tries only that way.
+	static	bool				SelfTest(video_codec codec, BString* why = NULL);
+	// Whether the test has run, and what came of it.
+	static	bool				Tested(video_codec codec, bool* works,
+									BString* why = NULL);
+	// Tests every format the card has.
+	static	void				SelfTestAll();
+
 	virtual	status_t			Open(const VideoEncoderParams& params,
 									BString& error);
 	virtual	AVPixelFormat		InputFormat() const;

@@ -21,6 +21,8 @@
 
 #include "HardwareCaps.h"
 #include "LavcVideoEncoder.h"
+#include "Messages.h"
+#include "NvencEncoder.h"
 #include "SoftwareEncoders.h"
 
 
@@ -74,6 +76,9 @@ HardwareWindow::MessageReceived(BMessage* message)
 			HardwareInventory::Default().Probe();
 			_Fill();
 			break;
+		case kMsgHardwareTested:
+			_Fill();
+			break;
 		default:
 			BWindow::MessageReceived(message);
 			break;
@@ -120,10 +125,17 @@ HardwareWindow::_Fill()
 			if (format == NULL)
 				text = "–";
 			else {
-				if (device.CanEncode(codec, 16, 16))
-					text = "✓ ";
-				else if (!device.ready)
+				// NVIDIA formats count once a test picture has come back
+				bool works = false;
+				bool tested = device.backend == kBackendNVENC
+					&& NvencEncoder::Tested(codec, &works);
+				if (device.CanEncode(codec, 16, 16)) {
+					text = device.backend == kBackendNVENC && !tested
+						? B_TRANSLATE("✓ (not tested yet) ") : "✓ ";
+				} else if (!device.ready)
 					text = B_TRANSLATE("(no driver) ");
+				else if (tested && !works)
+					text = B_TRANSLATE("(failed the test) ");
 				else
 					text = B_TRANSLATE("(not used yet) ");
 				if (format->maxWidth > 0) {
