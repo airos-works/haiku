@@ -89,9 +89,9 @@ switch $(HAIKU_BUILD_PROFILE) {
 		if $(AIROS_CI_SYSTEM_PACKAGES) {
 			AddHaikuImageSystemPackages $(AIROS_CI_SYSTEM_PACKAGES) ;
 		}
-		# CI's Vision (HaikuPorts' build with its Deskbar entry in the
-		# Applications menu's Utilities folder) instead of the repository's,
-		# which the nightly profile adds.
+		# CI's Vision (HaikuPorts' build with its Deskbar entry in the menu's
+		# Utilities folder) instead of the repository's, which the nightly
+		# profile adds.
 		if [ Glob $(AIROS_CI_PACKAGES) : vision-*-x86_64.hpkg ] {
 			SuppressHaikuImagePackages vision ;
 		}

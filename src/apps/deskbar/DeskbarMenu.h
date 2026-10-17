@@ -126,6 +126,8 @@ class TDeskbarMenu : public BNavMenu {
 		virtual bool	AddNextItem();
 		virtual void	ClearMenuBuildingState();
 
+				void	_OrderStandardFolders(int32 firstIndex);
+
 		// to keep track of the menu building state
 		State 			fAddState;
 		TBarView*		fBarView;

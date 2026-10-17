@@ -9,7 +9,11 @@
 # BUILD_DIR is a configured x86_64 build directory whose packages are built
 # (default /mnt/HaikuWork/build/master-x86_64):
 #   jam -q haiku.hpkg haiku_loader.hpkg haiku_datatranslators.hpkg \
-#       haiku_devel.hpkg webpositive.hpkg smbfs.hpkg userland_fs.hpkg
+#       haiku_devel.hpkg smbfs.hpkg userland_fs.hpkg
+# WebPositive is no longer built (2026-10-17, Summit replaces it): remove an
+# installed webpositive package with `pkgman uninstall webpositive` once
+# haiku_devel matches the haiku package again (before that, pkgman's solver
+# also takes away the mismatched haiku_devel).
 # The replaced packages and BOOTX64.EFI are kept in
 # /boot/home/x399-backup/system-<date>; the boot menu's "last state" goes
 # back to them too. Power cycle afterwards (never a warm reboot):
@@ -18,7 +22,7 @@ set -euo pipefail
 X399=${X399:-/mnt/HaikuWork/x399}
 BUILD=${1:-/mnt/HaikuWork/build/master-x86_64}
 SSH="ssh -F $X399/ssh/config -o ConnectTimeout=10 ws-haiku"
-PACKAGES="haiku haiku_loader haiku_datatranslators haiku_devel webpositive smbfs userland_fs"
+PACKAGES="haiku haiku_loader haiku_datatranslators haiku_devel smbfs userland_fs"
 DIR=$BUILD/objects/haiku/x86_64/packaging/packages
 LOADER=$BUILD/objects/haiku/x86_64/release/system/boot/efi/haiku_loader.efi
 ESP_DEVICE=/dev/disk/nvme/0/0
