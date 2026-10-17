@@ -967,6 +967,17 @@ private:
 
 
 bool
+SoftwareEncoders::Installable()
+{
+#if defined(__x86_64__) || defined(__i386__)
+	return true;
+#else
+	return false;
+#endif
+}
+
+
+bool
 SoftwareEncoders::IsAvailable(video_codec codec, BString* missing)
 {
 	const VideoCodecInfo& info = video_codec_info(codec);

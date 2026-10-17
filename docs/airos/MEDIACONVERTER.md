@@ -25,7 +25,7 @@ only M4A, MP3, FLAC, Ogg, Opus and WAV.
 | H.265 12-bit | – | x265 |
 | AV1, AV1 10-bit | AMD VCN 4 (RDNA 3, Phoenix and later), NVIDIA Ada Lovelace and later | SVT-AV1 |
 | VP9 | (Intel only, which has no VA-API driver here) | libvpx |
-| VP9 10-bit | – | needs a libvpx with high bit depth (HaikuPorts' has none) |
+| VP9 10-bit | – | libvpx with high bit depth (the image's own, see below) |
 | VP8, MPEG-4 Part 2, MPEG-2, Theora, FFV1 | – | FFmpeg |
 
 Those are HandBrake's video formats. The GPU column is what the cards can
@@ -108,12 +108,25 @@ src/apps/mediaconverter/thirdparty headers of libva, x264, x265, SVT-AV1
 headers/private/media/nvenc_api.h  the nvenc add-on's interface
 ```
 
-The engine links the system FFmpeg 6 (the `ffmpeg` build feature), so it is
-in images that have it (x86_64); arm64 images leave MediaConverter out until
-their FFmpeg is a build feature too. x264, x265 and SVT-AV1 (HaikuPorts'
+The engine links the system FFmpeg 6 (the `ffmpeg` build feature): HaikuPorts'
+`ffmpeg6` on x86_64, and on arm64 air/OS CI's own FFmpeg 6.1, `rock5_ffmpeg`,
+whose devel package the image build hands to the build system
+(`HAIKU_ARM64_FFMPEG_PACKAGES_DIR`; that package brings its own media plugin,
+so the image leaves this tree's out). x264, x265 and SVT-AV1 (HaikuPorts'
 `x264`, `x265`, `svt_av13`) and libva are opened at run time: MediaConverter
 starts without them and names the missing package. The air/OS x86_64 images
-carry all three (airos-ci `images/build-image.sh`).
+carry all three (airos-ci `images/build-image.sh`), and a libvpx 1.16 of their
+own in `system/non-packaged/lib` (airos-ci `deps/build-libvpx.sh`): HaikuPorts'
+is libvpx's generic C build without high bit depth, so VP9 10-bit was
+impossible and VP9 took twice as long.
+
+On arm64 there are no x264, x265, SVT-AV1, libvpx or LAME builds yet, so
+MediaConverter makes what FFmpeg makes by itself - MPEG-4, MPEG-2 and FFV1
+video, AAC, FLAC, ALAC, Opus, Vorbis, AC-3, E-AC-3, MP2 and PCM sound - and
+copies streams into another container; the other formats say why they cannot
+be made there, and the first preset is the first one that can ("Change
+container"). Tried on the Cubie A7S: MPEG-4 at 48.3 dB, FFV1, AAC, Opus,
+Vorbis and FLAC, remuxing.
 
 ### The transcoder
 
@@ -245,9 +258,11 @@ MEDIACONVERTER_FAKE_NVIDIA=1b81 ...         pretend there is a GTX 1070 (with th
 
 ## Known limits
 
-- NVENC has not run on an NVIDIA card yet (see above); AV1 on Ada and
-  Blackwell is encoded on the CPU, and B pictures are not used on NVIDIA.
-- VP9 10-bit needs a libvpx built with high bit depth.
+- NVENC has not run on an NVIDIA card yet (see above), and B pictures are
+  not used on NVIDIA.
+- AV1 on Ada and Blackwell is encoded on the CPU: NVENC's AV1 needs the
+  driver to supply default probability (CDF) tables in a layout nothing
+  documents, and to write frame headers from values the engine computes.
 - Theora output has single-picture dips at scene cuts.
-- arm64 images have no MediaConverter yet (no FFmpeg build feature, and no
-  x264/x265/SVT-AV1 for arm64).
+- arm64 has only FFmpeg's own encoders (see above); no hardware encoding on
+  the ROCK 5's VPU or the Cubie's yet.

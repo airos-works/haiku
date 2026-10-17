@@ -248,7 +248,40 @@ if [ IsPackageAvailable mesa_devel ] {
 
 
 # FFmpeg
-if [ IsPackageAvailable ffmpeg6_devel ] {
+if $(HAIKU_ARM64_FFMPEG_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = arm64 {
+	# The arm64 repository has no FFmpeg: air/OS CI's FFmpeg 6.1 for arm64
+	# (airos-ci deps/recipes/rock5_ffmpeg.sh), the rock5_ffmpeg and
+	# rock5_ffmpeg_devel packages, which every arm64 image carries. The
+	# package brings its own media plugin, so the image leaves this tree's out
+	# (images/definitions/regular).
+	local packageDirectory = $(HAIKU_ARM64_FFMPEG_PACKAGES_DIR) ;
+	local base = [ Glob $(packageDirectory) : rock5_ffmpeg-*-arm64.hpkg ] ;
+	local devel = [ Glob $(packageDirectory)
+		: rock5_ffmpeg_devel-*-arm64.hpkg ] ;
+	if ! $(base) || ! $(devel) || $(base[2]) || $(devel[2]) {
+		Exit "Need one rock5_ffmpeg and one rock5_ffmpeg_devel package in"
+			$(packageDirectory) ;
+	}
+	local directory = [ FDirName $(HAIKU_OPTIONAL_BUILD_PACKAGES_DIR)
+		airos-$(base:B) ] ;
+	# Extraction shares the prefix (including .PackageInfo), so serialize it.
+	Depends $(directory:G=ffmpeg-devel) : $(directory:G=ffmpeg-base) ;
+	SetBuildFeatureAttribute ffmpeg : runtime
+		: [ ExtractArchive $(directory:G=ffmpeg-base) : lib
+			: $(base) : extracted-arm64-ffmpeg-base ] : base ;
+	local ffmpegLibs = libavformat.so libavcodec.so libavfilter.so
+		libswscale.so libavutil.so libswresample.so ;
+	SetBuildFeatureAttribute ffmpeg : libraries
+		: [ ExtractArchive $(directory:G=ffmpeg-devel)
+			: develop/lib/$(ffmpegLibs)
+			: $(devel) : extracted-arm64-ffmpeg-devel ] : devel ;
+	SetBuildFeatureAttribute ffmpeg : headers
+		: [ ExtractArchive $(directory:G=ffmpeg-devel) : develop/headers
+			: $(devel) : extracted-arm64-ffmpeg-devel ] : devel ;
+	SetBuildFeatureAttribute ffmpeg : base:directory : $(directory) ;
+	SetBuildFeatureAttribute ffmpeg : devel:directory : $(directory) ;
+	EnableBuildFeatures ffmpeg ;
+} else if [ IsPackageAvailable ffmpeg6_devel ] {
 	local ffmpegLibs = libavformat.so libavcodec.so libavfilter.so libswscale.so
 		libavutil.so libswresample.so ;
 

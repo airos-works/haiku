@@ -156,9 +156,11 @@ HardwareWindow::_Fill()
 			cpu << "✓ " << SoftwareEncoders::Version(info.software);
 		else if (LavcVideoEncoder::IsAvailable(codec))
 			cpu << "✓ FFmpeg (" << info.lavcEncoder << ")";
-		else if (!missing.IsEmpty())
+		else if (!missing.IsEmpty() && SoftwareEncoders::Installable())
 			cpu.SetToFormat(B_TRANSLATE("needs the %s package"),
 				missing.String());
+		else if (!missing.IsEmpty())
+			cpu = B_TRANSLATE("not for this processor yet");
 		else
 			cpu = "–";
 		row->SetField(new BStringField(cpu.String()), columns);

@@ -31,6 +31,7 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
+#include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 }
 
@@ -737,9 +738,13 @@ Transcoder::_SetUpVideo(BString& error)
 				(AVPixelFormat)in->codecpar->format);
 		}
 		if (encoder == NULL) {
-			if (!missing.IsEmpty()) {
+			if (!missing.IsEmpty() && SoftwareEncoders::Installable()) {
 				error.SetToFormat("%s needs the %s package to encode on the "
 					"CPU.", codecInfo.name, missing.String());
+			} else if (!missing.IsEmpty()) {
+				error.SetToFormat("%s cannot be encoded on this computer: "
+					"there is no %s for its processor yet.", codecInfo.name,
+					missing.String());
 			} else
 				error.SetToFormat("Nothing here encodes %s.", codecInfo.name);
 			return B_NOT_SUPPORTED;
@@ -1238,6 +1243,8 @@ Transcoder::_SetUpAudio(BString& error)
 			? avcodec_find_encoder_by_name(info.lavcEncoder) : NULL;
 		if (encoderCodec == NULL && codec == kAudioOpus)
 			encoderCodec = avcodec_find_encoder_by_name("opus");
+		if (encoderCodec == NULL && codec == kAudioVorbis)
+			encoderCodec = avcodec_find_encoder_by_name("vorbis");
 		if (encoderCodec == NULL && codec == kAudioHEAAC) {
 			_Note("HE-AAC needs FFmpeg with libfdk_aac: AAC is used.");
 			encoderCodec = avcodec_find_encoder_by_name("aac");
@@ -1355,7 +1362,9 @@ Transcoder::_SetUpAudio(BString& error)
 				&& settings.audioBitrate <= 48 ? AV_PROFILE_AAC_HE_V2
 				: AV_PROFILE_AAC_HE;
 		}
-		if (codec == kAudioTrueHD)
+		// TrueHD's encoder is experimental, and so are FFmpeg's own Opus and
+		// Vorbis encoders where libopus and libvorbis are missing (arm64)
+		if ((encoderCodec->capabilities & AV_CODEC_CAP_EXPERIMENTAL) != 0)
 			encoder->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;
 		if ((fOutput->oformat->flags & AVFMT_GLOBALHEADER) != 0)
 			encoder->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
@@ -1904,10 +1913,14 @@ Transcoder::_BuildAudioGraph(AudioStream& stream, const AVFrame* frame)
 	char outLayout[128] = "";
 	av_channel_layout_describe(&stream.encoder->ch_layout, outLayout,
 		sizeof(outLayout));
+	// soxr where this FFmpeg has it (HaikuPorts' does, air/OS's arm64 build
+	// does not): asking for it otherwise fails when the graph is configured.
+	static const bool kHaveSoxr
+		= strstr(swresample_configuration(), "libsoxr") != NULL;
 	BString chain;
-	chain.SetToFormat("aresample=resampler=soxr:osr=%d,"
+	chain.SetToFormat("aresample=%sosr=%d,"
 		"aformat=sample_fmts=%s:sample_rates=%d:channel_layouts=%s",
-		stream.encoder->sample_rate,
+		kHaveSoxr ? "resampler=soxr:" : "", stream.encoder->sample_rate,
 		av_get_sample_fmt_name(stream.encoder->sample_fmt),
 		stream.encoder->sample_rate, outLayout);
 
@@ -2143,9 +2156,15 @@ Transcoder::_Copy(AVPacket* packet, AVStream* in, AVStream* out)
 {
 	int64 offset = av_rescale_q(fStartTime, AV_TIME_BASE_Q, in->time_base);
 	if (packet->pts != AV_NOPTS_VALUE) {
-		if (fEndTime > 0 && packet->pts >= av_rescale_q(fEndTime,
-				AV_TIME_BASE_Q, in->time_base))
-			return B_OK;
+		if (fEndTime > 0) {
+			int64 end = av_rescale_q(fEndTime, AV_TIME_BASE_Q, in->time_base);
+			if (packet->pts >= end)
+				return B_OK;
+			// a subtitle shown at the end goes only to the end
+			if (in->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE
+				&& packet->duration > 0 && packet->pts + packet->duration > end)
+				packet->duration = end - packet->pts;
+		}
 		packet->pts -= offset;
 	}
 	if (packet->dts != AV_NOPTS_VALUE)

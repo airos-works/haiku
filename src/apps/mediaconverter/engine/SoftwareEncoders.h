@@ -16,6 +16,9 @@
 namespace SoftwareEncoders {
 
 bool			IsAvailable(video_codec codec, BString* missing = NULL);
+// Whether the missing one can be installed: HaikuPorts has the packages for
+// x86_64 only.
+bool			Installable();
 VideoEncoder*	Create(video_codec codec);
 // "x264 0.164", for the hardware window
 BString			Version(software_encoder encoder);
