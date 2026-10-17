@@ -161,7 +161,8 @@ src/apps/mediaconverter/engine/    the engine (libmediaconverter_engine.a)
   LavcVideoEncoder   FFmpeg's own and libvpx/libtheora
   HardwareCaps       the GPUs: device manager PCI walk, VA-API queries,
                      NVENC by chip generation
-src/apps/mediaconverter/app/       the window
+src/apps/mediaconverter/app/       the window; JobProcess runs each conversion
+                                   in a worker process (MediaConverter --worker)
 src/apps/mediaconverter/cli/       mediaconvert, the engine from a shell (tests)
 src/apps/mediaconverter/thirdparty headers of libva, x264, x265, SVT-AV1
 headers/private/media/nvenc_api.h  the nvenc add-on's interface
@@ -190,6 +191,23 @@ libtheora: the engine resamples with swresample's own, takes FFmpeg's own
 Opus and Vorbis encoders, and Theora cannot be made there. Where an encoder
 is missing the format says why, and the first preset is the first one the
 computer can make.
+
+### The worker process
+
+Each conversion runs in a process of its own, as HandBrake runs its
+encodes: the window starts its own executable with `--worker`, writes the
+job (source, destination, settings) on its standard input and reads the
+report and the progress from its standard output, a line at a time; the
+worker probes the source again (titles and subtitle files come out the
+same). A graphics card that hangs is reset by amdgpu, and Mesa then ends
+the process that used it (VA-API contexts are not robust) - seen once on
+the WX 5100's VCE; a decoder can crash on a damaged file. Either costs the
+job, not the window and its queue, and a worker that dies on the GPU's
+path is run again on the CPU ("... stopped during the conversion: it was
+done again on the CPU"). Stop closes the worker's input, which cancels it
+(it is killed after ten seconds if it has not ended), and a window that
+goes away takes its worker with it the same way. The worker runs with the
+debugger disabled, so a crash ends it at once.
 
 ### The transcoder
 

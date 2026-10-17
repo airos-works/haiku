@@ -105,6 +105,7 @@ public:
 	virtual	void				MessageReceived(BMessage* message);
 	virtual	void				KeyDown(const char* bytes, int32 count);
 	virtual	void				Draw(BRect updateRect);
+	virtual	bool				GetToolTipAt(BPoint point, BToolTip** _tip);
 
 			QueueItem*			ItemByID(int32 id) const;
 			QueueItem*			QueueItemAt(int32 index) const

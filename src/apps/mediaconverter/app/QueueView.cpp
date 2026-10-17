@@ -11,6 +11,7 @@
 #include <ControlLook.h>
 #include <NodeInfo.h>
 #include <Path.h>
+#include <ToolTip.h>
 #include <Window.h>
 
 #include <stdio.h>
@@ -278,6 +279,22 @@ QueueView::Draw(BRect updateRect)
 	font.GetHeight(&height);
 	DrawString(hint.String(), BPoint(bounds.left + (bounds.Width() - width) / 2,
 		bounds.top + bounds.Height() / 2 + height.ascent / 2));
+}
+
+
+/*!	A finished file's notes (what was changed or left out, and why) show
+	over it. */
+bool
+QueueView::GetToolTipAt(BPoint point, BToolTip** _tip)
+{
+	QueueItem* item = QueueItemAt(IndexOf(point));
+	if (item == NULL || item->Report().notes.IsEmpty()) {
+		SetToolTip((const char*)NULL);
+		return false;
+	}
+	SetToolTip(item->Report().notes.String());
+	*_tip = ToolTip();
+	return *_tip != NULL;
 }
 
 

@@ -37,6 +37,7 @@ local engineSources =
 local appSources =
 	AudioPreview.cpp
 	HardwareWindow.cpp
+	JobProcess.cpp
 	MediaConverterApp.cpp
 	MediaConverterWindow.cpp
 	OutputView.cpp
