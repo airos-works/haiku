@@ -3,7 +3,7 @@ SubDir HAIKU_TOP src kits shared ;
 AddSubDirSupportedPlatforms libbe_test ;
 
 UseLibraryHeaders agg ;
-UsePrivateHeaders shared locale ;
+UsePrivateHeaders app interface shared locale ;
 
 local architectureObject ;
 for architectureObject in [ MultiArchSubDirSetup ] {
