@@ -922,15 +922,19 @@ Transcoder::_VideoFilters(VideoStream& stream, int sourceWidth,
 	if (settings.flip)
 		add("hflip");
 
-	static const char* kDenoise[] = { NULL, "hqdn3d=2:1:2:3", "hqdn3d=3:2:2:3",
-		"hqdn3d=7:7:5:5" };
-	if (settings.denoise > kFilterOff && settings.denoise <= kFilterStrong)
-		add(kDenoise[settings.denoise]);
-
 	BString scale;
 	scale.SetToFormat("scale=w=%d:h=%d:flags=%s", stream.width, stream.height,
 		settings.speed == kSpeedFastest ? "bicubic" : "lanczos");
 	add(scale);
+
+	// After the scaling, so a smaller picture costs less. hqdn3d is GPL and
+	// not in the system's FFmpeg, and NLMeans's integral image is not
+	// threaded (0.4 s a 480p picture on the X399): a temporal average, then
+	// the threaded FFT denoiser (1080p: about 60 and 30 pictures a second)
+	static const char* kDenoise[] = { NULL, "atadenoise", "fftdnoiz=sigma=4",
+		"fftdnoiz=sigma=8:block=16,atadenoise" };
+	if (settings.denoise > kFilterOff && settings.denoise <= kFilterStrong)
+		add(kDenoise[settings.denoise]);
 
 	static const char* kSharpen[] = { NULL, "unsharp=5:5:0.4:5:5:0",
 		"unsharp=5:5:0.8:5:5:0", "unsharp=7:7:1.2:7:7:0" };

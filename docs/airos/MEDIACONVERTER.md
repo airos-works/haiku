@@ -44,7 +44,7 @@ chapter starts become key frames.
 The picture: a size limit (4K down to 360p; the aspect ratio is kept, the
 source's sample aspect ratio too), frame rate (same, or 23.976 to 60, as a
 limit or constant), deinterlacing (bwdif, only the pictures marked
-interlaced or all of them), denoise (hqdn3d), sharpen (unsharp), black and
+interlaced or all of them), denoise (atadenoise, fftdnoiz), sharpen (unsharp), black and
 white, cutting off black borders (ten pictures from the film are measured),
 turning and mirroring. The source's own rotation is applied.
 
@@ -119,7 +119,7 @@ carry all three (airos-ci `images/build-image.sh`).
 
 One file is read with libavformat. Video is decoded with libavcodec (frame
 and slice threads), goes through a libavfilter graph built for the settings
-(`bwdif`, `crop`, `transpose`, `hqdn3d`, `scale`, `unsharp`, `hue`, `fps`,
+(`bwdif`, `crop`, `transpose`, `scale`, `atadenoise` or `fftdnoiz`, `unsharp`, `hue`, `fps`,
 `subtitles` or an `overlay` for picture subtitles, and `format` for what the
 encoder takes - NV12 or P010 for the GPUs, planar YUV for the CPU encoders)
 and is encoded by a `VideoEncoder`. Sound goes through `aresample` (soxr) and
