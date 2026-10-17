@@ -174,8 +174,9 @@ SourceView::SourceView()
 
 	fTracks = new BColumnListView("tracks", B_NAVIGABLE, B_FANCY_BORDER, true);
 	float spacing = be_control_look->DefaultLabelSpacing();
-	fTracks->AddColumn(new BStringColumn(B_TRANSLATE("Track"), spacing * 9,
-		spacing * 5, spacing * 20, B_TRUNCATE_END), 0);
+	fTracks->AddColumn(new BStringColumn(B_TRANSLATE("Track"),
+		be_plain_font->StringWidth(B_TRANSLATE("Subtitles 10")) + spacing * 4,
+		spacing * 5, spacing * 30, B_TRUNCATE_END), 0);
 	fTracks->AddColumn(new BStringColumn(B_TRANSLATE("Format"), spacing * 22,
 		spacing * 8, spacing * 60, B_TRUNCATE_END), 1);
 	fTracks->AddColumn(new BStringColumn(B_TRANSLATE("Details"), spacing * 50,

@@ -313,10 +313,12 @@ public:
 			return B_ERROR;
 		}
 		param.i_log_level = X264_LOG_ERROR;
-		// x264 cannot count Haiku's processors itself: tell it, as many
-		// frame threads as x264 would pick (1.5 per processor)
+		// x264 cannot count Haiku's processors itself (it runs on one), and
+		// more than about sixteen frame threads make it slower here: on the
+		// X399's 32 threads, 1080p medium went 16 fps with one, 57 with 12,
+		// 55 with 16 and 37 with 48
 		int threads = encoder_thread_count();
-		param.i_threads = min_c(threads * 3 / 2, 128);
+		param.i_threads = min_c(threads, 16);
 		param.i_lookahead_threads = X264_THREADS_AUTO;
 		const char* forced = getenv("MEDIACONVERTER_X264_THREADS");
 		if (forced != NULL)
