@@ -103,6 +103,8 @@ struct Transcoder::VideoStream {
 	AVRational			encoderTimeBase;
 	int					width;			// output
 	int					height;
+	int					scaleWidth;		// scaled to, before the encoder's
+	int					scaleHeight;	// crop (see _AlignForEncoder())
 	AVRational			sampleAspect;
 	int					rotation;		// to apply, clockwise
 	bool				forceRate;
@@ -130,7 +132,7 @@ struct Transcoder::VideoStream {
 		in(NULL), out(NULL), copy(false), decoder(NULL), graph(NULL),
 		source(NULL), subtitleSource(NULL), sink(NULL), graphWidth(0),
 		graphHeight(0), graphFormat(-1), encoder(NULL), width(0), height(0),
-		rotation(0), forceRate(false), frames(0), nextKey(0),
+		scaleWidth(0), scaleHeight(0), rotation(0), forceRate(false), frames(0), nextKey(0),
 		subtitleCanvas(NULL), subtitleDirty(false), subtitleEnd(INT64_MAX),
 		encoderThread(-1), stopEncoder(false), encoderDone(false),
 		encoderStatus(B_OK)
@@ -589,6 +591,9 @@ Transcoder::_SetUpVideo(BString& error)
 	}
 	fVideo->rotation = (stream_rotation(in) + settings.rotation) % 360;
 	OutputSize(cropped, settings, &fVideo->width, &fVideo->height);
+	fVideo->scaleWidth = fVideo->width;
+	fVideo->scaleHeight = fVideo->height;
+	_AlignForEncoder(codec);
 	AVRational aspect = in->sample_aspect_ratio.num > 0
 		? in->sample_aspect_ratio : in->codecpar->sample_aspect_ratio;
 	if (aspect.num <= 0 || aspect.den <= 0)
@@ -930,9 +935,16 @@ Transcoder::_VideoFilters(VideoStream& stream, int sourceWidth,
 		add("hflip");
 
 	BString scale;
-	scale.SetToFormat("scale=w=%d:h=%d:flags=%s", stream.width, stream.height,
+	scale.SetToFormat("scale=w=%d:h=%d:flags=%s", stream.scaleWidth,
+		stream.scaleHeight,
 		settings.speed == kSpeedFastest ? "bicubic" : "lanczos");
 	add(scale);
+	if (stream.scaleWidth != stream.width
+		|| stream.scaleHeight != stream.height) {
+		BString crop;
+		crop.SetToFormat("crop=w=%d:h=%d", stream.width, stream.height);
+		add(crop);
+	}
 
 	// After the scaling, so a smaller picture costs less. hqdn3d is GPL and
 	// not in the system's FFmpeg, and NLMeans's integral image is not
@@ -1528,6 +1540,40 @@ Transcoder::_SetUpSubtitles(BString& error)
 		fReport.subtitleTracks.push_back(line);
 	}
 	return B_OK;
+}
+
+
+/*!	AMD's AV1 encoders code the picture in blocks of 64 x 16 pixels, and an
+	AV1 stream cannot say to crop them (VCN 4 codes 1080 lines as 1082 and
+	puts 1080 only in the render size, which players take as an aspect
+	ratio): what goes to them is cropped to whole blocks instead, a few
+	pixels at the edges, so the picture is shown as it was meant. */
+void
+Transcoder::_AlignForEncoder(video_codec codec)
+{
+	const OutputSettings& settings = fJob.settings;
+	if ((codec != kVideoAV1 && codec != kVideoAV1_10)
+		|| settings.encoderPreference != kPreferHardware)
+		return;
+	HardwareInventory& inventory = HardwareInventory::Default();
+	if (!inventory.IsProbed())
+		inventory.Probe();
+	const GpuDevice* device = inventory.EncoderFor(codec, fVideo->width,
+		fVideo->height, settings.gpu.String());
+	if (device == NULL || device->vendor != kVendorAMD)
+		return;
+	int width = fVideo->width & ~63;
+	int height = fVideo->height & ~15;
+	if (width < 64 || height < 16
+		|| (width == fVideo->width && height == fVideo->height))
+		return;
+	BString note;
+	note.SetToFormat("%s codes AV1 in blocks of 64 by 16 pixels: %d by %d "
+		"becomes %d by %d, cropped at the edges.", device->name.String(),
+		fVideo->width, fVideo->height, width, height);
+	_Note(note.String());
+	fVideo->width = width;
+	fVideo->height = height;
 }
 
 

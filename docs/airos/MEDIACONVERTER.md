@@ -222,6 +222,13 @@ FFmpeg's VA-API encoders, which Mesa is tested against:
   parameters. Three pictures are in the encoder at once.
 - Upload: `vaDeriveImage` and a copy into the mapped surface (0.5 ms for
   1080p on the WX 5100), `vaPutImage` where deriving fails.
+- AV1 on AMD (VCN 4): the encoder codes whole blocks of 64 x 16 pixels and
+  an AV1 stream cannot say to crop them; VCN 4 codes 1080 lines as 1082 and
+  puts 1080 only in the render size, which players take as an aspect ratio
+  (1920 x 1082 with the bottom lines shown). The transcoder crops what goes
+  to it to whole blocks instead (1080 to 1072, 3840 x 1604 to 3840 x 1600,
+  854 to 832 wide) and says so in the report. H.264 and H.265 crop in their
+  parameter sets and keep every size.
 
 ### NVIDIA (NVENC)
 
@@ -279,6 +286,20 @@ Big Buck Bunny clip, luma PSNR against the source with
 | x265 medium, 720p, 8/10/12-bit | 45.8 / 45.6 / 44.5 dB |
 | SVT-AV1 preset 8, 720p, 8/10-bit | 46.1 / 46.0 dB |
 | VP9, VP8, MPEG-4, MPEG-2 | 43.8, 44.8, 46.3, 46.4 dB |
+
+On the Framework 13 (Radeon 760M, Phoenix, VCN 4), the same clip at 720p,
+each output decoded and compared:
+
+| Encoder | Result |
+| --- | --- |
+| 760M H.264 (B pictures), QP 24 | 42.6 dB; 1.8 s for the 12 s clip with AAC |
+| 760M H.265, QP 24 | 43.8 dB; 1.8 s |
+| 760M H.265 10-bit | 43.9 dB; 3.7 s |
+| 760M AV1, quantizer index 108 | 41.4 dB at 60 % of H.265's size; 2.0 s |
+| 760M AV1 10-bit | 41.5 dB; 4.3 s |
+
+A 4K HDR10 clip (3840 x 1604, 5 s) became AV1 10-bit on the 760M in 4.1 s
+with its HDR10 description and BT.2020/PQ colours kept.
 
 A 1:32 Matroska file with two audio tracks (AAC stereo, AC-3 5.1), three
 subtitle tracks and four chapters became an MP4 with both tracks as AAC

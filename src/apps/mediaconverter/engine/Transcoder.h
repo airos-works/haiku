@@ -109,6 +109,7 @@ private:
 			status_t			_SetUpSubtitles(BString& error);
 			void				_CopyChapters();
 			void				_FixDiscontinuity(AVPacket* packet);
+			void				_AlignForEncoder(video_codec codec);
 			void				_AddFolderCover();
 			status_t			_DetectCrop(int crop[4]);
 			void				_ProbeHdrMetadata(VideoEncoderParams& params);
