@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Find one pixel lines whose width depends on where they fall.
 
-linepar.py <scale> A.png <ax> <ay> B.png <bx> <by> <w> <h>
+linepar.py <scale> A.png <ax> <ay> B.png <bx> <by> <w> <h> [<ox> <oy>]
   A.png, B.png: buffer pixel captures (devshot, parshot.sh) of one window,
   its top left corner at logical (ax, ay) and (bx, by), w x h logical pixels
-  in size. With bx = ax + 1 and by = ay + 1 the grid changes at 150 percent.
+  in size; captures of part of the screen start at buffer pixel (ox, oy).
+  With bx = ax + 1 and by = ay + 1 the grid changes at 150 percent.
 Prints the straight thin lines (1 to 3 buffer pixels across, MIN long, with
 a clear contrast to both sides) found in both captures at the same logical
 place and colour whose width differs, then how many kept their width.
@@ -67,10 +68,12 @@ def main():
     B = Image.open(sys.argv[5]).convert('RGB')
     bx, by = int(sys.argv[6]), int(sys.argv[7])
     w, h = int(sys.argv[8]), int(sys.argv[9])
+    ox, oy = (int(sys.argv[10]), int(sys.argv[11])) if len(sys.argv) > 11 \
+        else (0, 0)
 
     def box(x, y):
-        return (int(floor(x * scale)), int(floor(y * scale)),
-            int(floor((x + w) * scale)), int(floor((y + h) * scale)))
+        return (int(floor(x * scale)) - ox, int(floor(y * scale)) - oy,
+            int(floor((x + w) * scale)) - ox, int(floor((y + h) * scale)) - oy)
 
     bad = good = 0
     for vertical in (True, False):
@@ -79,9 +82,12 @@ def main():
         oa, ob = (ax, bx) if vertical else (ay, by)
         oa2, ob2 = (ay, by) if vertical else (ax, bx)
         # logical position relative to the window
+        da, db = (ox, oy) if vertical else (oy, ox)
+
         def key(s, o, o2):
             across, width, colour, s0, s1 = s
-            return (across / scale - o, (s0 / scale - o2, s1 / scale - o2))
+            return ((across + da) / scale - o,
+                ((s0 + db) / scale - o2, (s1 + db) / scale - o2))
         used = set()
         for s in sa:
             la, (l0, l1) = key(s, oa, oa2)
