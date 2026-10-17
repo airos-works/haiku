@@ -109,6 +109,12 @@ private:
 			status_t			_SetUpSubtitles(BString& error);
 			void				_CopyChapters();
 			void				_FixDiscontinuity(AVPacket* packet);
+			status_t			_SetUpSubtitleFiles(BString& error);
+			status_t			_SetUpSubtitleOutput(SubtitleStream* stream,
+									AVCodecID convertTo,
+									const SubtitleTrackInfo* track,
+									BString& error);
+			status_t			_WriteSubtitleFiles(int64 until);
 			void				_AlignForEncoder(video_codec codec);
 			void				_AddFolderCover();
 			status_t			_DetectCrop(int crop[4]);
@@ -184,6 +190,7 @@ private:
 
 			int					fBurnInStream;	// input index, -1: none
 			bool				fBurnInText;
+			BString				fBurnInFile;	// a subtitle file, burned in
 			int					fCrop[4];		// top, bottom, left, right
 };
 

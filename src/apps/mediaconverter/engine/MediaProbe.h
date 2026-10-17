@@ -34,6 +34,12 @@ BString		FormatDuration(bigtime_t duration);
 BString		FormatSize(off_t size);
 BString		FormatBitRate(int64 bitsPerSecond);
 BString		LanguageName(const char* code);
+// The ISO 639-2 code muxers want for a two- or three-letter code ("en",
+// "deu"), or "" when it is not one.
+BString		LanguageCode(const char* code);
+// Subtitle files beside a video with its name, as players pick them up:
+// Movie.srt, Movie.en.srt, Movie.eng.forced.ass (SubRip, SSA/ASS, WebVTT).
+void		AddSubtitleFiles(SourceInfo& info);
 
 }	// namespace MediaProbe
 

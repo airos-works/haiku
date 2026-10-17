@@ -38,7 +38,11 @@ source's own tracks copied, with a mixdown (mono, stereo, 5.1, 7.1) and a
 sample rate. Subtitles are kept (text converted to the container's own text
 format: MP4 timed text, WebVTT, SubRip), left out, or burned into the
 picture (text through libass, pictures such as Blu-ray PGS and DVD subtitles
-over the source picture). Chapters and the title and other tags are kept;
+over the source picture). Subtitle files beside a video with its name are
+tracks too, as players pick them up: `Movie.srt`, `Movie.en.srt`,
+`Movie.eng.forced.ass` (SubRip, SSA/ASS, WebVTT; the language and "forced"
+from the name), kept or burned in like the source's own (a file is burned
+in when the source has no subtitle track for the choice). Chapters and the title and other tags are kept;
 chapter starts become key frames.
 
 The picture: a size limit (4K down to 360p; the aspect ratio is kept, the

@@ -83,6 +83,7 @@ struct SubtitleTrackInfo {
 	BString			title;
 	bool			isDefault;
 	bool			forced;
+	BString			file;			// a subtitle file beside the source
 
 					SubtitleTrackInfo();
 };
