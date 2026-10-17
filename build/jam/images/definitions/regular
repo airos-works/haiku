@@ -41,7 +41,7 @@ SYSTEM_APPS += [ FFilterByBuildFeatures
 	LegacyPackageInstaller
 	Magnify
 	Mail
-	MediaConverter
+	MediaConverter@ffmpeg
 	MediaPlayer
 	MidiPlayer@fluidlite
 	People
@@ -61,7 +61,7 @@ DESKBAR_APPLICATIONS += [ FFilterByBuildFeatures
 	Icon-O-Matic
 	Magnify
 	Mail
-	MediaConverter
+	MediaConverter@ffmpeg
 	MediaPlayer
 	MidiPlayer@fluidlite
 	People
