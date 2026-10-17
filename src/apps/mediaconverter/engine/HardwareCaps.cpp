@@ -34,6 +34,8 @@ vaapi_encoder_implements(video_codec codec)
 		case kVideoH264:
 		case kVideoH265:
 		case kVideoH265_10:
+		case kVideoAV1:
+		case kVideoAV1_10:
 			return true;
 		default:
 			return false;

@@ -240,14 +240,23 @@ public:
 		while (true) {
 			int result = avcodec_receive_frame(fDecoder, fFrame);
 			if (result == 0) {
-				fScaler = sws_getCachedContext(fScaler, fFrame->width,
-					fFrame->height, (AVPixelFormat)fFrame->format, width,
+				// a few lines or columns more (coding alignment that the
+				// render size takes away again) are cut off, not scaled
+				int sourceWidth = fFrame->width;
+				int sourceHeight = fFrame->height;
+				if (sourceWidth >= width && sourceWidth - width <= 16
+					&& sourceHeight >= height && sourceHeight - height <= 16) {
+					sourceWidth = width;
+					sourceHeight = height;
+				}
+				fScaler = sws_getCachedContext(fScaler, sourceWidth,
+					sourceHeight, (AVPixelFormat)fFrame->format, width,
 					height, AV_PIX_FMT_GRAY8, SWS_BICUBIC, NULL, NULL, NULL);
 				luma.resize((size_t)width * height);
 				uint8* planes[4] = { luma.data() };
 				int strides[4] = { width };
 				sws_scale(fScaler, fFrame->data, fFrame->linesize, 0,
-					fFrame->height, planes, strides);
+					sourceHeight, planes, strides);
 				av_frame_unref(fFrame);
 				return true;
 			}
@@ -287,6 +296,10 @@ compare(const char* source, const char* output)
 	}
 	int width = b.Width();
 	int height = b.Height();
+	if (getenv("COMPARE_AT_SOURCE") != NULL) {
+		width = a.Width();
+		height = a.Height();
+	}
 	std::vector<uint8> la, lb;
 	int frames = 0;
 	double sum = 0, minimum = 1000;

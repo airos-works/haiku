@@ -6,6 +6,7 @@
 #define TRANSCODER_H
 
 
+#include <Locker.h>
 #include <String.h>
 
 #include <vector>
@@ -23,6 +24,7 @@ struct AVPacket;
 struct AVStream;
 struct AVSubtitle;
 class VideoEncoder;
+struct VideoEncoderParams;
 
 
 struct TranscodeJob {
@@ -107,6 +109,7 @@ private:
 			status_t			_SetUpSubtitles(BString& error);
 			void				_CopyChapters();
 			status_t			_DetectCrop(int crop[4]);
+			void				_ProbeHdrMetadata(VideoEncoderParams& params);
 
 			status_t			_BuildVideoGraph(VideoStream& stream,
 									const AVFrame* frame, BString& error);
@@ -120,7 +123,10 @@ private:
 									AVFrame* frame);
 			status_t			_EncodeVideo(VideoStream& stream,
 									AVFrame* frame);
-			status_t			_DrainVideoEncoder(VideoStream& stream);
+			status_t			_EncodeQueued(VideoStream& stream,
+									AVFrame* frame);
+	static	status_t			_EncoderThread(void* data);
+			void				_StopEncoderThread();
 
 			status_t			_BuildAudioGraph(AudioStream& stream,
 									const AVFrame* frame);
@@ -147,6 +153,8 @@ private:
 			TranscodeReport		fReport;
 			TranscodeListener*	fListener;
 	volatile bool				fCancelled;
+			BLocker				fWriteLock;
+			BLocker				fProgressLock;
 
 			AVFormatContext*	fInput;
 			AVFormatContext*	fOutput;

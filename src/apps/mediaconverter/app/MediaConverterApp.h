@@ -7,6 +7,7 @@
 
 
 #include <Application.h>
+#include <List.h>
 
 
 class MediaConverterWindow;
@@ -27,8 +28,11 @@ public:
 	virtual	void				AboutRequested();
 
 private:
+			void				_PostPending();
+
 			MediaConverterWindow* fWindow;
 			BMessage			fPendingRefs;
+			BList				fPending;		// argv's presets and --convert
 };
 
 

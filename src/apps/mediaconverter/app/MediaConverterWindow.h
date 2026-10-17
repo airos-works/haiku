@@ -41,6 +41,8 @@ private:
 			void				_StartPreview(QueueItem* item);
 
 			void				_Convert();
+			void				_StartConverting(
+									const OutputSettings& settings);
 			bool				_StartNext();
 			void				_JobFinished(BMessage* message);
 			BString				_DestinationFor(QueueItem* item,
@@ -79,6 +81,7 @@ private:
 			int32				fJobsDone;
 			int32				fJobsTotal;
 			BString				fLastOutput;
+			bool				fConvertWhenReady;
 };
 
 

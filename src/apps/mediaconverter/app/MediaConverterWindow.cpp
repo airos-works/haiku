@@ -189,7 +189,8 @@ MediaConverterWindow::MediaConverterWindow()
 	fThread(-1),
 	fCurrentID(-1),
 	fJobsDone(0),
-	fJobsTotal(0)
+	fJobsTotal(0),
+	fConvertWhenReady(false)
 {
 	// the inventory first: the output view's menus ask it
 	HardwareInventory::Default().Probe();
@@ -422,6 +423,8 @@ MediaConverterWindow::MessageReceived(BMessage* message)
 			delete info;
 			_UpdateControls();
 			_UpdateStatus();
+			if (fConvertWhenReady)
+				_Convert();
 			break;
 		}
 
@@ -437,6 +440,12 @@ MediaConverterWindow::MessageReceived(BMessage* message)
 
 		case kMsgSettingsChanged:
 			_UpdateStatus();
+			break;
+
+		case kMsgPresetChosen:
+			// from the command line: the output view applies it
+			if (message->WasDelivered() && fOutput->Looper() == this)
+				PostMessage(message, fOutput);
 			break;
 
 		case kMsgChooseFolder:
@@ -465,6 +474,19 @@ MediaConverterWindow::MessageReceived(BMessage* message)
 		case kMsgConvert:
 			_Convert();
 			break;
+
+		case kMsgCpuWarningAnswer:
+		{
+			int32 which = message->GetInt32("which", 0);
+			if (which == 0 || fConverting)
+				break;
+			if (which == 1) {
+				fWarnCpu = false;
+				fWarnItem->SetMarked(false);
+			}
+			_StartConverting(fOutput->Settings());
+			break;
+		}
 
 		case kMsgStop:
 			if (fConverting) {
@@ -703,6 +725,14 @@ MediaConverterWindow::_Convert()
 {
 	if (fConverting)
 		return;
+	// files still being read: convert once they are
+	for (int32 i = 0; i < fQueue->CountItems(); i++) {
+		if (fQueue->QueueItemAt(i)->State() == kJobProbing) {
+			fConvertWhenReady = true;
+			return;
+		}
+	}
+	fConvertWhenReady = false;
 	OutputSettings settings = fOutput->Settings();
 
 	// what will run on the CPU against the user's wish, and what cannot run
@@ -736,14 +766,22 @@ MediaConverterWindow::_Convert()
 			B_TRANSLATE("Don't warn again"), B_TRANSLATE("Encode on the CPU"),
 			B_WIDTH_AS_USUAL, B_OFFSET_SPACING, B_WARNING_ALERT);
 		alert->SetShortcut(0, B_ESCAPE);
-		int32 choice = alert->Go();
-		if (choice == 0)
-			return;
-		if (choice == 1) {
-			fWarnCpu = false;
-			fWarnItem->SetMarked(false);
-		}
+		// asynchronous: the window goes on answering while it is up
+		alert->Go(new BInvoker(new BMessage(kMsgCpuWarningAnswer), this));
+		return;
 	}
+	_StartConverting(settings);
+}
+
+
+void
+MediaConverterWindow::_StartConverting(const OutputSettings& settings)
+{
+	int32 pending = 0;
+	for (int32 i = 0; i < fQueue->CountItems(); i++)
+		pending += fQueue->QueueItemAt(i)->IsPending() ? 1 : 0;
+	if (pending == 0)
+		return;
 
 	fRunSettings = settings;
 	fConverting = true;

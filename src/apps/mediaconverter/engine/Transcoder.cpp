@@ -6,6 +6,8 @@
 
 #include "Transcoder.h"
 
+#include <Autolock.h>
+#include <Locker.h>
 #include <OS.h>
 
 #include <math.h>
@@ -15,6 +17,8 @@
 
 #include <algorithm>
 #include <deque>
+
+#include <pthread.h>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -107,14 +111,29 @@ struct Transcoder::VideoStream {
 	bool				subtitleDirty;
 	int64				subtitleEnd;	// AV_TIME_BASE, INT64_MAX: none
 
+	// The encoder runs on a thread of its own, fed through a short queue,
+	// so decoding and filtering go on while it works (or waits for the
+	// GPU). A NULL frame in the queue drains it.
+	thread_id			encoderThread;
+	pthread_mutex_t		queueLock;
+	pthread_cond_t		queueChanged;
+	std::deque<AVFrame*> queue;
+	bool				stopEncoder;
+	bool				encoderDone;
+	status_t			encoderStatus;
+
 	VideoStream()
 		:
 		in(NULL), out(NULL), copy(false), decoder(NULL), graph(NULL),
 		source(NULL), subtitleSource(NULL), sink(NULL), graphWidth(0),
 		graphHeight(0), graphFormat(-1), encoder(NULL), width(0), height(0),
 		rotation(0), forceRate(false), frames(0), nextKey(0),
-		subtitleCanvas(NULL), subtitleDirty(false), subtitleEnd(INT64_MAX)
+		subtitleCanvas(NULL), subtitleDirty(false), subtitleEnd(INT64_MAX),
+		encoderThread(-1), stopEncoder(false), encoderDone(false),
+		encoderStatus(B_OK)
 	{
+		pthread_mutex_init(&queueLock, NULL);
+		pthread_cond_init(&queueChanged, NULL);
 		encoderTimeBase = (AVRational){1, 90000};
 		sampleAspect = (AVRational){1, 1};
 		rate = (AVRational){25, 1};
@@ -672,6 +691,10 @@ Transcoder::_SetUpVideo(BString& error)
 		params.lightLevel = *(const AVContentLightMetadata*)light->data;
 		params.haveLightLevel = true;
 	}
+	if ((params.transfer == AVCOL_TRC_SMPTE2084
+			|| params.transfer == AVCOL_TRC_ARIB_STD_B67)
+		&& !params.haveMastering && !params.haveLightLevel)
+		_ProbeHdrMetadata(params);
 	const VideoCodecInfo& codecInfo = video_codec_info(codec);
 	if (codecInfo.bitDepth == 8 && fJob.info.HasVideo()
 		&& fJob.info.video[0].transfer.Length() > 0
@@ -798,6 +821,62 @@ Transcoder::_SetUpVideo(BString& error)
 		}
 	}
 	return B_OK;
+}
+
+
+/*!	HDR10's mastering display and light level are often only in the video
+	stream itself (x265 writes them as SEI messages, the container has
+	none): decode the first picture to find them. */
+void
+Transcoder::_ProbeHdrMetadata(VideoEncoderParams& params)
+{
+	AVFormatContext* context = NULL;
+	if (avformat_open_input(&context, fJob.source.String(), NULL, NULL) < 0)
+		return;
+	AVCodecContext* decoder = NULL;
+	AVPacket* packet = av_packet_alloc();
+	AVFrame* frame = av_frame_alloc();
+	int index = fVideo->in->index;
+	const AVCodec* codec = NULL;
+	if (avformat_find_stream_info(context, NULL) < 0)
+		goto out;
+	codec = avcodec_find_decoder(context->streams[index]->codecpar->codec_id);
+	decoder = codec != NULL ? avcodec_alloc_context3(codec) : NULL;
+	if (decoder == NULL || avcodec_parameters_to_context(decoder,
+			context->streams[index]->codecpar) < 0
+		|| avcodec_open2(decoder, codec, NULL) < 0)
+		goto out;
+	for (int reads = 0; reads < 500; reads++) {
+		if (av_read_frame(context, packet) < 0)
+			break;
+		if (packet->stream_index == index)
+			avcodec_send_packet(decoder, packet);
+		av_packet_unref(packet);
+		if (avcodec_receive_frame(decoder, frame) != 0)
+			continue;
+		const AVFrameSideData* mastering = av_frame_get_side_data(frame,
+			AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+		if (mastering != NULL
+			&& mastering->size >= sizeof(AVMasteringDisplayMetadata)) {
+			params.mastering
+				= *(const AVMasteringDisplayMetadata*)mastering->data;
+			params.haveMastering = params.mastering.has_primaries
+				&& params.mastering.has_luminance;
+		}
+		const AVFrameSideData* light = av_frame_get_side_data(frame,
+			AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+		if (light != NULL && light->size >= sizeof(AVContentLightMetadata)) {
+			params.lightLevel = *(const AVContentLightMetadata*)light->data;
+			params.haveLightLevel = true;
+		}
+		break;
+	}
+
+out:
+	av_frame_free(&frame);
+	av_packet_free(&packet);
+	avcodec_free_context(&decoder);
+	avformat_close_input(&context);
 }
 
 
@@ -1643,6 +1722,7 @@ Transcoder::_FilterVideo(VideoStream& stream, AVFrame* frame)
 status_t
 Transcoder::_EncodeVideo(VideoStream& stream, AVFrame* frame)
 {
+	AVFrame* queued = NULL;
 	if (frame != NULL) {
 		if (frame->pts == AV_NOPTS_VALUE)
 			return B_OK;
@@ -1661,12 +1741,52 @@ Transcoder::_EncodeVideo(VideoStream& stream, AVFrame* frame)
 		}
 		frame->pts -= start;
 		frame->sample_aspect_ratio = stream.sampleAspect;
+		stream.frames++;
+		if (stream.encoderThread < 0)
+			return _EncodeQueued(stream, frame);
+		queued = av_frame_clone(frame);
+		if (queued == NULL)
+			return B_NO_MEMORY;
+	} else if (stream.encoderThread < 0)
+		return _EncodeQueued(stream, NULL);
+
+	static const size_t kQueueLength = 6;
+	pthread_mutex_lock(&stream.queueLock);
+	while (frame != NULL && stream.queue.size() >= kQueueLength
+		&& !stream.encoderDone)
+		pthread_cond_wait(&stream.queueChanged, &stream.queueLock);
+	if (stream.encoderDone) {
+		status_t status = stream.encoderStatus != B_OK
+			? stream.encoderStatus : B_ERROR;
+		pthread_mutex_unlock(&stream.queueLock);
+		av_frame_free(&queued);
+		return status;
+	}
+	stream.queue.push_back(queued);
+	pthread_cond_broadcast(&stream.queueChanged);
+	pthread_mutex_unlock(&stream.queueLock);
+
+	if (frame == NULL) {
+		// drained: wait for the thread, which ends after the last packet
+		status_t result;
+		wait_for_thread(stream.encoderThread, &result);
+		stream.encoderThread = -1;
+		return stream.encoderStatus;
+	}
+	return B_OK;
+}
+
+
+/*!	On the encoder thread (or the transcoder's, without one): one picture,
+	or NULL to drain, and the packets that come out. */
+status_t
+Transcoder::_EncodeQueued(VideoStream& stream, AVFrame* frame)
+{
+	{
 		StageTimer timer(kStageEncode);
 		if (stream.encoder->SendFrame(frame) != B_OK)
 			return B_ERROR;
-		stream.frames++;
-	} else if (stream.encoder->SendFrame(NULL) != B_OK)
-		return B_ERROR;
+	}
 
 	AVPacket* packet = av_packet_alloc();
 	status_t status = B_OK;
@@ -1687,6 +1807,62 @@ Transcoder::_EncodeVideo(VideoStream& stream, AVFrame* frame)
 	}
 	av_packet_free(&packet);
 	return status;
+}
+
+
+status_t
+Transcoder::_EncoderThread(void* data)
+{
+	Transcoder* transcoder = (Transcoder*)data;
+	VideoStream& stream = *transcoder->fVideo;
+	while (true) {
+		pthread_mutex_lock(&stream.queueLock);
+		while (stream.queue.empty() && !stream.stopEncoder)
+			pthread_cond_wait(&stream.queueChanged, &stream.queueLock);
+		if (stream.stopEncoder) {
+			stream.encoderDone = true;
+			pthread_cond_broadcast(&stream.queueChanged);
+			pthread_mutex_unlock(&stream.queueLock);
+			break;
+		}
+		AVFrame* frame = stream.queue.front();
+		stream.queue.pop_front();
+		pthread_cond_broadcast(&stream.queueChanged);
+		pthread_mutex_unlock(&stream.queueLock);
+
+		bool drain = frame == NULL;
+		status_t status = transcoder->_EncodeQueued(stream, frame);
+		av_frame_free(&frame);
+
+		if (status != B_OK || drain) {
+			pthread_mutex_lock(&stream.queueLock);
+			stream.encoderStatus = status;
+			stream.encoderDone = true;
+			pthread_cond_broadcast(&stream.queueChanged);
+			pthread_mutex_unlock(&stream.queueLock);
+			break;
+		}
+	}
+	return B_OK;
+}
+
+
+void
+Transcoder::_StopEncoderThread()
+{
+	if (fVideo == NULL || fVideo->encoderThread < 0)
+		return;
+	pthread_mutex_lock(&fVideo->queueLock);
+	fVideo->stopEncoder = true;
+	pthread_cond_broadcast(&fVideo->queueChanged);
+	pthread_mutex_unlock(&fVideo->queueLock);
+	status_t result;
+	wait_for_thread(fVideo->encoderThread, &result);
+	fVideo->encoderThread = -1;
+	while (!fVideo->queue.empty()) {
+		av_frame_free(&fVideo->queue.front());
+		fVideo->queue.pop_front();
+	}
 }
 
 
@@ -1944,6 +2120,7 @@ status_t
 Transcoder::_Write(AVPacket* packet, AVStream* out, AVRational timeBase)
 {
 	StageTimer timer(kStageWrite);
+	BAutolock _(fWriteLock);
 	packet->stream_index = out->index;
 	av_packet_rescale_ts(packet, timeBase, out->time_base);
 	int result = av_interleaved_write_frame(fOutput, packet);
@@ -2004,6 +2181,7 @@ Transcoder::_Progress(int64 position, bool force)
 {
 	if (fListener == NULL)
 		return;
+	BAutolock _(fProgressLock);
 	bigtime_t now = system_time();
 	if (position != AV_NOPTS_VALUE && position > fLastPosition)
 		fLastPosition = position;
@@ -2140,6 +2318,15 @@ Transcoder::Run(TranscodeListener* listener, BString& error)
 	if (fListener != NULL)
 		fListener->TranscodeStarted(fReport);
 
+	if (fVideo != NULL && !fVideo->copy
+		&& getenv("MEDIACONVERTER_NO_ENCODER_THREAD") == NULL) {
+		fVideo->encoderThread = spawn_thread(_EncoderThread, "video encoder",
+			B_NORMAL_PRIORITY, this);
+		if (fVideo->encoderThread < 0
+			|| resume_thread(fVideo->encoderThread) != B_OK)
+			fVideo->encoderThread = -1;
+	}
+
 	// the attached picture goes first
 	for (size_t i = 0; i < fAttachments.size(); i++) {
 		AVStream* in = fInput->streams[fAttachments[i].first];
@@ -2269,7 +2456,10 @@ Transcoder::Run(TranscodeListener* listener, BString& error)
 void
 Transcoder::_Cleanup()
 {
+	_StopEncoderThread();
 	if (fVideo != NULL) {
+		pthread_mutex_destroy(&fVideo->queueLock);
+		pthread_cond_destroy(&fVideo->queueChanged);
 		avcodec_free_context(&fVideo->decoder);
 		avfilter_graph_free(&fVideo->graph);
 		av_frame_free(&fVideo->subtitleCanvas);

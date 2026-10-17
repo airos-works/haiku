@@ -20,6 +20,7 @@ enum {
 	kMsgSameFolder				= 'smfd',
 
 	kMsgConvert					= 'cnvt',
+	kMsgCpuWarningAnswer		= 'cpwa',
 	kMsgStop					= 'stop',
 	kMsgShowHardware			= 'shhw',
 	kMsgToggleCpuWarning		= 'tgcw',

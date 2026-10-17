@@ -19,6 +19,8 @@ extern "C" {
 }
 
 #include "MediaConverterWindow.h"
+#include "Messages.h"
+#include "Presets.h"
 
 
 #undef B_TRANSLATION_CONTEXT
@@ -49,6 +51,7 @@ MediaConverterApp::ReadyToRun()
 	fWindow = new MediaConverterWindow();
 	if (!fPendingRefs.IsEmpty())
 		fWindow->PostMessage(&fPendingRefs);
+	_PostPending();
 	fWindow->Show();
 }
 
@@ -69,8 +72,24 @@ MediaConverterApp::RefsReceived(BMessage* message)
 void
 MediaConverterApp::ArgvReceived(int32 argc, char** argv)
 {
+	// MediaConverter [--preset <name>] [--convert] [files]
 	BMessage refs(B_REFS_RECEIVED);
 	for (int32 i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--preset") == 0 && i + 1 < argc) {
+			int32 index = Presets::IndexOf(argv[++i]);
+			if (index < 0) {
+				fprintf(stderr, "MediaConverter: no preset \"%s\"\n", argv[i]);
+				continue;
+			}
+			BMessage preset(kMsgPresetChosen);
+			preset.AddInt32("value", index);
+			fPending.AddItem(new BMessage(preset));
+			continue;
+		}
+		if (strcmp(argv[i], "--convert") == 0) {
+			fPending.AddItem(new BMessage(kMsgConvert));
+			continue;
+		}
 		BEntry entry(argv[i], true);
 		entry_ref ref;
 		if (entry.Exists() && entry.GetRef(&ref) == B_OK)
@@ -78,6 +97,28 @@ MediaConverterApp::ArgvReceived(int32 argc, char** argv)
 	}
 	if (!refs.IsEmpty())
 		RefsReceived(&refs);
+	if (fWindow != NULL)
+		_PostPending();
+}
+
+
+void
+MediaConverterApp::_PostPending()
+{
+	// the files first: a conversion asked for is of them
+	for (int32 i = 0; i < fPending.CountItems(); i++) {
+		BMessage* message = (BMessage*)fPending.ItemAt(i);
+		if (message->what == kMsgConvert)
+			continue;
+		fWindow->PostMessage(message);
+	}
+	for (int32 i = 0; i < fPending.CountItems(); i++) {
+		BMessage* message = (BMessage*)fPending.ItemAt(i);
+		if (message->what == kMsgConvert)
+			fWindow->PostMessage(message);
+		delete message;
+	}
+	fPending.MakeEmpty();
 }
 
 

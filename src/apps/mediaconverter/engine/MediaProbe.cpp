@@ -267,9 +267,16 @@ fill_audio(AVStream* stream, AudioTrackInfo& track)
 			sizeof(layout)) > 0)
 		track.layout = layout;
 	track.sampleRate = parameters->sample_rate;
-	track.bitDepth = parameters->bits_per_raw_sample;
-	if (track.bitDepth == 0)
-		track.bitDepth = parameters->bits_per_coded_sample;
+	// a bit depth only means something for lossless formats; lossy ones
+	// report the decoder's sample format
+	const AVCodecDescriptor* descriptor
+		= avcodec_descriptor_get(parameters->codec_id);
+	if (descriptor != NULL
+		&& (descriptor->props & AV_CODEC_PROP_LOSSLESS) != 0) {
+		track.bitDepth = parameters->bits_per_raw_sample;
+		if (track.bitDepth == 0)
+			track.bitDepth = parameters->bits_per_coded_sample;
+	}
 	track.bitRate = parameters->bit_rate;
 	if (track.bitRate == 0) {
 		BString bps = dictionary_value(stream->metadata, "BPS");
