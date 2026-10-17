@@ -79,6 +79,12 @@ switch $(HAIKU_BUILD_PROFILE) {
 		# (FFmpeg 6), Burrow (OpenSSL 3) and Summit's TLS certificates.
 		AddHaikuImageSystemPackages curl sqlite libpcre2 openssl3 ffmpeg6 git
 			ca_root_certificates ;
+		# CI's Vision (HaikuPorts' build with its Deskbar entry in the
+		# Applications menu's Utilities folder) instead of the repository's,
+		# which the nightly profile adds.
+		if [ Glob $(AIROS_CI_PACKAGES) : vision-*-x86_64.hpkg ] {
+			SuppressHaikuImagePackages vision ;
+		}
 	}
 	case airos-arm64 : {
 		AIROS_ROCK5 = 1 ;
