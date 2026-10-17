@@ -257,6 +257,7 @@ Transcoder::Transcoder(const TranscodeJob& job)
 	fLastPosition(0),
 	fVideo(NULL),
 	fTimestampOffset(0),
+	fCaptions(NULL),
 	fFolderCover(NULL),
 	fFolderCoverStream(NULL),
 	fBurnInStream(-1),
@@ -1509,7 +1510,81 @@ Transcoder::_SetUpSubtitles(BString& error)
 		if (status != B_OK)
 			return status;
 	}
-	return _SetUpSubtitleFiles(error);
+	status_t status = _SetUpSubtitleFiles(error);
+	if (status != B_OK)
+		return status;
+	return _SetUpCaptions(error);
+}
+
+
+/*!	Closed captions in the pictures become a text track, as HandBrake makes
+	them: FFmpeg's caption decoder reads them from the decoded pictures'
+	A/53 data (see _DecodeVideo()). */
+status_t
+Transcoder::_SetUpCaptions(BString& error)
+{
+	const OutputSettings& settings = fJob.settings;
+	const VideoTrackInfo* video = fJob.info.MainVideo();
+	if (video == NULL || !video->closedCaptions || fVideo == NULL)
+		return B_OK;
+	if (fVideo->copy) {
+		_Note("The closed captions are left out: they are read from the "
+			"pictures, which are copied.");
+		return B_OK;
+	}
+	AVCodecID convertTo;
+	switch (settings.container) {
+		case kContainerMKV: convertTo = AV_CODEC_ID_SUBRIP; break;
+		case kContainerMP4:
+		case kContainerMOV: convertTo = AV_CODEC_ID_MOV_TEXT; break;
+		case kContainerWebM: convertTo = AV_CODEC_ID_WEBVTT; break;
+		default: return B_OK;
+	}
+	const AVCodec* decoderCodec = avcodec_find_decoder(AV_CODEC_ID_EIA_608);
+	const AVCodec* encoderCodec = avcodec_find_encoder(convertTo);
+	if (decoderCodec == NULL || encoderCodec == NULL)
+		return B_OK;
+
+	SubtitleStream* stream = new SubtitleStream;
+	stream->in = fVideo->in;
+	stream->copy = false;
+	fSubtitles.push_back(stream);
+	stream->decoder = avcodec_alloc_context3(decoderCodec);
+	stream->decoder->pkt_timebase = fVideo->in->time_base;
+	if (avcodec_open2(stream->decoder, decoderCodec, NULL) < 0) {
+		error = "The closed caption decoder did not start.";
+		return B_ERROR;
+	}
+	stream->encoder = avcodec_alloc_context3(encoderCodec);
+	stream->encoder->time_base = AV_TIME_BASE_Q;
+	if (stream->decoder->subtitle_header != NULL) {
+		stream->encoder->subtitle_header = (uint8*)av_mallocz(
+			stream->decoder->subtitle_header_size + 1);
+		memcpy(stream->encoder->subtitle_header,
+			stream->decoder->subtitle_header,
+			stream->decoder->subtitle_header_size);
+		stream->encoder->subtitle_header_size
+			= stream->decoder->subtitle_header_size;
+	}
+	stream->encoder->width = fVideo->width;
+	stream->encoder->height = fVideo->height;
+	if (avcodec_open2(stream->encoder, encoderCodec, NULL) < 0) {
+		error = "The closed caption encoder did not start.";
+		return B_ERROR;
+	}
+	stream->out = avformat_new_stream(fOutput, NULL);
+	if (stream->out == NULL)
+		return B_NO_MEMORY;
+	avcodec_parameters_from_context(stream->out->codecpar, stream->encoder);
+	stream->out->time_base = AV_TIME_BASE_Q;
+	av_dict_set(&stream->out->metadata, "title", "Closed captions", 0);
+	stream->out->disposition = AV_DISPOSITION_CAPTIONS;
+	fCaptions = stream;
+	BString line;
+	line.SetToFormat("Closed captions (%s, from CEA-608)",
+		avcodec_get_name(convertTo));
+	fReport.subtitleTracks.push_back(line);
+	return B_OK;
 }
 
 
@@ -1902,10 +1977,37 @@ Transcoder::_DecodeVideo(VideoStream& stream, AVPacket* packet)
 			break;
 		if (result < 0)
 			break;
-		status = _FilterVideo(stream, frame);
+		if (fCaptions != NULL)
+			status = _DecodeCaptions(frame);
+		if (status == B_OK)
+			status = _FilterVideo(stream, frame);
 		av_frame_unref(frame);
 	}
 	av_frame_free(&frame);
+	return status;
+}
+
+
+/*!	A picture's caption data goes to the caption decoder as a packet of
+	its own, at the picture's time. */
+status_t
+Transcoder::_DecodeCaptions(const AVFrame* frame)
+{
+	const AVFrameSideData* side = av_frame_get_side_data(frame,
+		AV_FRAME_DATA_A53_CC);
+	if (side == NULL || side->size == 0)
+		return B_OK;
+	AVPacket* packet = av_packet_alloc();
+	if (packet == NULL || av_new_packet(packet, side->size) < 0) {
+		av_packet_free(&packet);
+		return B_NO_MEMORY;
+	}
+	memcpy(packet->data, side->data, side->size);
+	packet->pts = packet->dts = frame->best_effort_timestamp != AV_NOPTS_VALUE
+		? frame->best_effort_timestamp : frame->pts;
+	status_t status = packet->pts != AV_NOPTS_VALUE
+		? _ConvertSubtitle(*fCaptions, packet) : B_OK;
+	av_packet_free(&packet);
 	return status;
 }
 
@@ -2841,6 +2943,7 @@ Transcoder::_Cleanup()
 		delete fSubtitles[i];
 	}
 	fSubtitles.clear();
+	fCaptions = NULL;
 
 	if (fOutput != NULL) {
 		if (fHeaderWritten)

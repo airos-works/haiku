@@ -39,7 +39,8 @@ VideoTrackInfo::VideoTrackInfo()
 	fullRange(false),
 	interlaced(false),
 	rotation(0),
-	bitRate(0)
+	bitRate(0),
+	closedCaptions(false)
 {
 }
 
@@ -319,6 +320,56 @@ fill_subtitle(AVStream* stream, SubtitleTrackInfo& track)
 }
 
 
+/*!	Whether the video carries closed captions (CEA-608/708 as A/53 user
+	data): its first pictures say, as they have them in every picture or
+	group of pictures. */
+static bool
+has_closed_captions(AVFormatContext* context, AVStream* stream)
+{
+	AVCodecID id = stream->codecpar->codec_id;
+	if (id != AV_CODEC_ID_MPEG2VIDEO && id != AV_CODEC_ID_H264
+		&& id != AV_CODEC_ID_HEVC)
+		return false;
+	const AVCodec* codec = avcodec_find_decoder(id);
+	AVCodecContext* decoder = codec != NULL ? avcodec_alloc_context3(codec)
+		: NULL;
+	if (decoder == NULL) {
+		avcodec_free_context(&decoder);
+		return false;
+	}
+	// slices only: frame threads would hold the first pictures back
+	decoder->thread_count = 0;
+	decoder->thread_type = FF_THREAD_SLICE;
+	if (avcodec_parameters_to_context(decoder, stream->codecpar) < 0
+		|| avcodec_open2(decoder, codec, NULL) < 0) {
+		avcodec_free_context(&decoder);
+		return false;
+	}
+	AVPacket* packet = av_packet_alloc();
+	AVFrame* frame = av_frame_alloc();
+	bool found = false;
+	int frames = 0;
+	for (int reads = 0; reads < 400 && frames < 4 && !found; reads++) {
+		if (av_read_frame(context, packet) < 0)
+			break;
+		if (packet->stream_index == stream->index
+			&& avcodec_send_packet(decoder, packet) >= 0) {
+			while (avcodec_receive_frame(decoder, frame) == 0) {
+				frames++;
+				found |= av_frame_get_side_data(frame, AV_FRAME_DATA_A53_CC)
+					!= NULL;
+				av_frame_unref(frame);
+			}
+		}
+		av_packet_unref(packet);
+	}
+	av_frame_free(&frame);
+	av_packet_free(&packet);
+	avcodec_free_context(&decoder);
+	return found;
+}
+
+
 status_t
 MediaProbe::Probe(const char* path, SourceInfo& info, BString* error)
 {
@@ -392,6 +443,11 @@ MediaProbe::Probe(const char* path, SourceInfo& info, BString* error)
 			default:
 				break;
 		}
+	}
+
+	if (!info.video.empty()) {
+		info.video[0].closedCaptions = has_closed_captions(context,
+			context->streams[info.video[0].index]);
 	}
 
 	for (unsigned i = 0; i < context->nb_chapters; i++) {

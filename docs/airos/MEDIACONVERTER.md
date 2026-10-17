@@ -42,7 +42,12 @@ over the source picture). Subtitle files beside a video with its name are
 tracks too, as players pick them up: `Movie.srt`, `Movie.en.srt`,
 `Movie.eng.forced.ass` (SubRip, SSA/ASS, WebVTT; the language and "forced"
 from the name), kept or burned in like the source's own (a file is burned
-in when the source has no subtitle track for the choice). Chapters and the title and other tags are kept;
+in when the source has no subtitle track for the choice). Closed
+captions in the pictures (CEA-608 as A/53 user data, as US broadcasts and
+NTSC DVDs carry them) become a text track, as HandBrake makes them: the
+probe looks at the first pictures, and the transcoder hands every decoded
+picture's caption data to FFmpeg's caption decoder (SubRip in Matroska,
+timed text in MP4, WebVTT in WebM; not when the video is copied). Chapters and the title and other tags are kept;
 chapter starts become key frames.
 
 The picture: a size limit (4K down to 360p; the aspect ratio is kept, the

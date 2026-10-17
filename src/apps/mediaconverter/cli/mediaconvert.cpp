@@ -195,6 +195,8 @@ print_info(const char* path)
 			v.transfer.String(), v.matrix.String(),
 			v.interlaced ? ", interlaced" : "",
 			v.fullRange ? ", full range" : "", v.rotation);
+		if (v.closedCaptions)
+			printf("closed captions: CEA-608 in the pictures\n");
 	}
 	for (size_t i = 0; i < info.audio.size(); i++) {
 		const AudioTrackInfo& a = info.audio[i];

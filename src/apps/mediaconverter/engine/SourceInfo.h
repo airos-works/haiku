@@ -50,6 +50,9 @@ struct VideoTrackInfo {
 	int64			bitRate;
 	BString			language;
 	BString			title;
+	// CEA-608/708 captions in the pictures (A/53 user data), as US
+	// broadcasts and DVDs carry them
+	bool			closedCaptions;
 
 					VideoTrackInfo();
 };
