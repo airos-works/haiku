@@ -37,6 +37,15 @@ using namespace Bluetooth;
 #define CLASSIC_LOG(level, format, args...) \
 	LELog(level, "classic", format, ##args)
 
+// Page scan for paired keyboards waking up (0.625 ms slots). With the
+// defaults after a reset, one 11.25 ms standard scan every 1.28 s, a radio
+// that also serves an LE mouse link every few milliseconds misses most of a
+// keyboard's pages: a Keychron K4 needed 3-4 key presses and 8-10 s to
+// reconnect to an AX210. An interlaced scan every 320 ms listens on both
+// page trains four times as often, and the K4 comes back noticeably faster.
+static const uint16 kPageScanInterval = 0x0200;
+static const uint16 kPageScanWindow = 0x0012;
+
 
 #if 0
 #pragma mark - Class methods -
@@ -181,6 +190,14 @@ LocalDeviceImpl::HandlePairSetupCommandComplete(struct hci_event_header* event)
 			expected = PACK_OPCODE(OGF_LINK_POLICY,
 				OCF_WRITE_DEFAULT_LINK_POLICY);
 			break;
+		case PAIR_SETUP_PAGE_SCAN_ACTIVITY:
+			expected = PACK_OPCODE(OGF_CONTROL_BASEBAND,
+				OCF_WRITE_PAGE_SCAN_ACTIVITY);
+			break;
+		case PAIR_SETUP_PAGE_SCAN_TYPE:
+			expected = PACK_OPCODE(OGF_CONTROL_BASEBAND,
+				OCF_WRITE_PAGE_SCAN_TYPE);
+			break;
 		default:
 			return;
 	}
@@ -249,7 +266,28 @@ LocalDeviceImpl::HandlePairSetupCommandComplete(struct hci_event_header* event)
 			break;
 		}
 		case PAIR_SETUP_LINK_POLICY:
+		{
 			CLASSIC_LOG(LE_LOG_INFO, "default link policy: role switch, sniff");
+			fPairSetupState = PAIR_SETUP_PAGE_SCAN_ACTIVITY;
+			const hci_write_page_scan_activity activity = {
+				B_HOST_TO_LENDIAN_INT16(kPageScanInterval),
+				B_HOST_TO_LENDIAN_INT16(kPageScanWindow) };
+			result = _SendLECommand(PACK_OPCODE(OGF_CONTROL_BASEBAND,
+				OCF_WRITE_PAGE_SCAN_ACTIVITY), &activity, sizeof(activity));
+			break;
+		}
+		case PAIR_SETUP_PAGE_SCAN_ACTIVITY:
+		{
+			fPairSetupState = PAIR_SETUP_PAGE_SCAN_TYPE;
+			const uint8 type = HCI_PAGE_SCAN_INTERLACED;
+			result = _SendLECommand(PACK_OPCODE(OGF_CONTROL_BASEBAND,
+				OCF_WRITE_PAGE_SCAN_TYPE), &type, 1);
+			break;
+		}
+		case PAIR_SETUP_PAGE_SCAN_TYPE:
+			CLASSIC_LOG(LE_LOG_INFO, "page scan activity: %.2f ms every "
+				"%.2f ms, interlaced", kPageScanWindow * 0.625,
+				kPageScanInterval * 0.625);
 			fPairSetupState = PAIR_SETUP_IDLE;
 			if (((BluetoothServer*)be_app)->GetHIDHost()->HasDevices())
 				EnablePageScan();
