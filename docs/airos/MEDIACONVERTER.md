@@ -267,6 +267,10 @@ MEDIACONVERTER_FAKE_NVIDIA=1b81 ...         pretend there is a GTX 1070 (with th
 - AV1 on Ada and Blackwell is encoded on the CPU: NVENC's AV1 needs the
   driver to supply default probability (CDF) tables in a layout nothing
   documents, and to write frame headers from values the engine computes.
-- Theora output has single-picture dips at scene cuts.
+- Theora: now and then libtheora hands back no packet for a picture and
+  FFmpeg's wrapper drops it (12 s of Big Buck Bunny: one picture, after the
+  first key frame). Timestamps stay right, so playback holds the previous
+  picture once; `--compare`, which pairs pictures in order, shows it as a
+  dip at the next scene cut.
 - arm64 has no Theora, and no hardware encoding on the ROCK 5's or the
   Cubie's video engines yet.
