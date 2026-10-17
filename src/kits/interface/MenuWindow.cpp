@@ -17,6 +17,7 @@
 #include <MenuItem.h>
 #include <Screen.h>
 
+#include <InterfacePrivate.h>
 #include <MenuPrivate.h>
 #include <WindowPrivate.h>
 
@@ -240,9 +241,14 @@ BMenuFrame::LayoutChanged()
 	if (fMenu == NULL || Window() == NULL)
 		return BView::LayoutChanged();
 
-	// shift child menus over recursively
-	MoveSubmenusOver(fMenu, fMenu->ConvertToScreen(fMenu->Frame()),
-		(BScreen(fMenu->Window())).Frame());
+	// shift child menus over recursively, keeping them on the monitor the
+	// menu is on
+	BRect menuFrame = fMenu->ConvertToScreen(fMenu->Frame());
+	BRect screenFrame;
+	if (BPrivate::get_display_frame(menuFrame, false, screenFrame) != B_OK
+		|| !screenFrame.IsValid())
+		screenFrame = BScreen(fMenu->Window()).Frame();
+	MoveSubmenusOver(fMenu, menuFrame, screenFrame);
 
 	BView::LayoutChanged();
 }
@@ -305,7 +311,7 @@ BMenuFrame::MoveSubmenusOver(BMenu* menu, BRect menuFrame, BRect screenFrame)
 				submenuLoc.y += (screenFrame.top - submenuFrame.top);
 		} else {
 			// put menu at top of screen, turn on the scroll arrows
-			submenuLoc.y = 0;
+			submenuLoc.y = screenFrame.top;
 		}
 
 		// move submenu window into place
