@@ -15,6 +15,7 @@
 #include <MessageRunner.h>
 #include <Screen.h>
 
+#include <InterfacePrivate.h>
 #include <WindowPrivate.h>
 #include <ToolTip.h>
 
@@ -179,8 +180,13 @@ ToolTipView::ResetWindowFrame(BPoint where)
 
 	BSize size = PreferredSize();
 
-	BScreen screen(Window());
-	BRect screenFrame = screen.Frame().InsetBySelf(2, 2);
+	// the monitor the mouse is on: with monitors of different sizes side by
+	// side, parts of the screen are shown by none of them
+	BRect screenFrame;
+	if (BPrivate::get_display_frame(BRect(where, where), false, screenFrame)
+			!= B_OK || !screenFrame.IsValid())
+		screenFrame = BScreen(Window()).Frame();
+	screenFrame.InsetBy(2, 2);
 	BPoint offset = fToolTip->MouseRelativeLocation();
 
 	// Ensure that the tip can be placed on screen completely

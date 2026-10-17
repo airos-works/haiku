@@ -44,6 +44,7 @@
 #include <AutoDeleter.h>
 #include <binary_compatibility/Interface.h>
 #include <BMCPrivate.h>
+#include <InterfacePrivate.h>
 #include <MenuPrivate.h>
 #include <MenuWindow.h>
 #include <ServerProtocol.h>
@@ -2815,8 +2816,12 @@ BMenu::_CalcFrame(BPoint where, bool* scrollOn)
 	BRect bounds = Bounds();
 	BRect frame = bounds.OffsetToCopy(where);
 
-	BScreen screen(Window());
-	BRect screenFrame = screen.Frame();
+	// The monitor the menu opens on: with monitors of different sizes side
+	// by side, parts of the screen are shown by none of them.
+	BRect screenFrame;
+	if (BPrivate::get_display_frame(BRect(where, where), false, screenFrame)
+			!= B_OK || !screenFrame.IsValid())
+		screenFrame = BScreen(Window()).Frame();
 
 	BMenu* superMenu = Supermenu();
 	BMenuItem* superItem = Superitem();
@@ -2840,14 +2845,14 @@ BMenu::_CalcFrame(BPoint where, bool* scrollOn)
 		if (frame.bottom > screenFrame.bottom)
 			frame.OffsetBy(0, screenFrame.bottom - frame.bottom);
 		else if (frame.top < screenFrame.top)
-			frame.OffsetBy(0, -frame.top);
+			frame.OffsetBy(0, screenFrame.top - frame.top);
 
 		if (frame.right > screenFrame.right) {
 			frame.OffsetBy(screenFrame.right - frame.right, 0);
 			fExtraMenuData->frameShiftedLeft = true;
 		}
 		else if (frame.left < screenFrame.left)
-			frame.OffsetBy(-frame.left, 0);
+			frame.OffsetBy(screenFrame.left - frame.left, 0);
 	} else if (superMenu->Layout() == B_ITEMS_IN_COLUMN) {
 		if (frame.right > screenFrame.right
 				|| superMenu->fExtraMenuData->frameShiftedLeft) {
@@ -2855,8 +2860,8 @@ BMenu::_CalcFrame(BPoint where, bool* scrollOn)
 			fExtraMenuData->frameShiftedLeft = true;
 		}
 
-		if (frame.left < 0)
-			frame.OffsetBy(-frame.left + 6, 0);
+		if (frame.left < screenFrame.left)
+			frame.OffsetBy(screenFrame.left - frame.left + 6, 0);
 
 		if (frame.bottom > screenFrame.bottom)
 			frame.OffsetBy(0, screenFrame.bottom - frame.bottom);
@@ -3353,8 +3358,12 @@ BMenu::_UpdateWindowViewSize(const bool &move)
 
 			// Resize the window to fit the screen without overflowing the
 			// frame, and attach scrollers to our cached BMenuWindow.
-			BScreen screen(window);
-			frame = frame & screen.Frame();
+			BRect screenFrame;
+			if (BPrivate::get_display_frame(BRect(screenLocation,
+						screenLocation), false, screenFrame) != B_OK
+				|| !screenFrame.IsValid())
+				screenFrame = BScreen(window).Frame();
+			frame = frame & screenFrame;
 			window->ResizeTo(Bounds().Width(), frame.Height());
 
 			// we currently only support scrolling for B_ITEMS_IN_COLUMN
