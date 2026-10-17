@@ -254,7 +254,11 @@ Partition::_Mount(file_system_module_info *module, Directory **_fileSystem)
 		this, module->pretty_name));
 
 	Directory *fileSystem;
-	if (module->get_file_system(this, &fileSystem) == B_OK) {
+	status_t status = module->get_file_system(this, &fileSystem);
+	dprintf("diag: partition %p (offset %" B_PRIdOFF ", size %" B_PRIdOFF
+		"): %s: %#" B_PRIx32 "\n", this, offset, size, module->pretty_name,
+		status);
+	if (status == B_OK) {
 		gRoot->AddVolume(fileSystem, this);
 		if (_fileSystem)
 			*_fileSystem = fileSystem;

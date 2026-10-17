@@ -35,13 +35,23 @@ Volume::Volume(boot::Partition *partition)
 	fRootNode(NULL)
 {
 	fDevice = open_node(partition, O_RDONLY);
-	if (fDevice < B_OK)
+	if (fDevice < B_OK) {
+		dprintf("diag: bfs: open_node: %d\n", fDevice);
 		return;
+	}
 
-	if (read_pos(fDevice, 512, &fSuperBlock, sizeof(disk_super_block)) < B_OK)
+	ssize_t bytesRead = read_pos(fDevice, 512, &fSuperBlock,
+		sizeof(disk_super_block));
+	if (bytesRead < B_OK) {
+		dprintf("diag: bfs: reading the superblock: %#" B_PRIx32 "\n",
+			(status_t)bytesRead);
 		return;
+	}
 
 	if (!IsValidSuperBlock()) {
+		dprintf("diag: bfs: no valid superblock (magic1 %#" B_PRIx32
+			", block size %" B_PRIu32 ")\n", (uint32)fSuperBlock.magic1,
+			(uint32)fSuperBlock.block_size);
 #ifndef BFS_LITTLE_ENDIAN_ONLY
 		// try block 0 again (can only happen on the big endian BFS)
 		if (read_pos(fDevice, 0, &fSuperBlock, sizeof(disk_super_block)) < B_OK)
@@ -53,6 +63,7 @@ Volume::Volume(boot::Partition *partition)
 		return;
 #endif
 	}
+	dprintf("diag: bfs: superblock of \"%s\"\n", fSuperBlock.name);
 
 	TRACE(("bfs: we do have a valid superblock (name = %s)!\n", fSuperBlock.name));
 
@@ -61,7 +72,8 @@ Volume::Volume(boot::Partition *partition)
 		return;
 
 	if (fRootNode->InitCheck() < B_OK) {
-		TRACE(("bfs: init check for root node failed\n"));
+		dprintf("diag: bfs: init check for the root node failed: %#" B_PRIx32
+			"\n", fRootNode->InitCheck());
 		delete fRootNode;
 		fRootNode = NULL;
 		return;
