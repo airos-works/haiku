@@ -251,6 +251,26 @@ public:
 	inline	bool				IsContentApproximate() const
 									{ return fContentApproximate; }
 
+			// Where the window was when the monitor it was on went away: the
+			// monitor's key, and the frame relative to the monitor's left
+			// top. The Desktop brings it back there when the monitor returns,
+			// as long as the window is still where it was put meanwhile, the
+			// away frame.
+			void				SetHomeDisplay(const BString& key,
+									BRect homeFrame, BRect awayFrame)
+									{ fHomeDisplay = key;
+									  fHomeFrame = homeFrame;
+									  fAwayFrame = awayFrame; }
+			void				SetAwayFrame(BRect awayFrame)
+									{ fAwayFrame = awayFrame; }
+			void				ForgetHomeDisplay()
+									{ fHomeDisplay = ""; }
+			bool				HasHomeDisplay() const
+									{ return !fHomeDisplay.IsEmpty(); }
+			const BString&		HomeDisplay() const { return fHomeDisplay; }
+			BRect				HomeFrame() const { return fHomeFrame; }
+			BRect				AwayFrame() const { return fAwayFrame; }
+
 			void				SetCurrentWorkspace(int32 index)
 									{ fCurrentWorkspace = index; fPriorWorkspace = index; }
 			int32				CurrentWorkspace() const
@@ -474,6 +494,10 @@ protected:
 			int32				fMaxHeight;
 
 			int32				fWorkspacesViewCount;
+
+			BString				fHomeDisplay;
+			BRect				fHomeFrame;
+			BRect				fAwayFrame;
 
 		friend class DecorManager;
 

@@ -107,6 +107,14 @@ public:
 			const DisplayInfo*	PrimaryDisplay() const;
 			const DisplayInfo*	DisplayFor(BRect frame) const;
 			const DisplayInfo*	DisplayNearest(BPoint point) const;
+			const DisplayInfo*	DisplayByKey(const BString& key) const;
+									// the enabled display showing that
+									// monitor, mirrors aside
+	static	bool				RememberedDisplayFor(const BMessage& saved,
+									BRect frame, BString& _key,
+									BRect& _displayFrame);
+									// the monitor \a frame was on in the
+									// arrangement the settings remember
 
 			BRect				Frame() const;
 			BRegion				Region() const;
