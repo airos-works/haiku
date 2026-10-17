@@ -99,9 +99,11 @@ listed. A survey of the X399's programs at 175 percent (58 with windows;
 October 2026, master after the plain-frame work): 50 have no dark line
 whose width depends on the window's position; the others draw those lines
 themselves (Amp, Icon-O-Matic's colour swatches, People's picture frame,
-SoundRecorder, Workspaces, Backgrounds' preview, Burrow's separator).
-Before these changes 33 of them had such lines (separators, tab bevels,
-slider shadows, default buttons, list frames, scroll bar junctions).
+SoundRecorder, Workspaces, Backgrounds' preview, Burrow's separator; E-mail's
+one hit is an artifact of the comparison). Of the 36 programs surveyed
+before the last of these changes, 21 had such lines (separators, tab
+bevels, slider shadows, default buttons, list frames, scroll bar
+junctions); 18 of them have none now.
 
 **Translucent lines** (`B_OP_ALPHA`, blended frames) cover whole buffer pixels
 like opaque ones instead of being rasterized between pixels.
