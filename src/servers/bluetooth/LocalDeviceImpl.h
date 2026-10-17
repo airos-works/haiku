@@ -116,7 +116,9 @@ private:
 		PAIR_SETUP_SSP,
 		PAIR_SETUP_SC,
 		PAIR_SETUP_LE_HOST,
-		PAIR_SETUP_LINK_POLICY
+		PAIR_SETUP_LINK_POLICY,
+		PAIR_SETUP_PAGE_SCAN_ACTIVITY,
+		PAIR_SETUP_PAGE_SCAN_TYPE
 	};
 	PairSetupState fPairSetupState;
 	void HandlePairSetupCommandComplete(struct hci_event_header* event);

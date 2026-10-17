@@ -97,6 +97,9 @@ struct hci_cp_le_start_encryption {
 #define OGF_CONTROL_BASEBAND			0x03
 
 	#define OCF_SET_EVENT_MASK			0x0001
+	#define OCF_WRITE_PAGE_SCAN_TYPE	0x0047
+		#define HCI_PAGE_SCAN_STANDARD		0x00
+		#define HCI_PAGE_SCAN_INTERLACED	0x01
 	#define OCF_WRITE_SIMPLE_PAIRING_MODE	0x0056
 	#define OCF_WRITE_LE_HOST_SUPPORTED	0x006d
 	#define OCF_WRITE_SC_HOST_SUPPORT		0x007a
@@ -180,6 +183,13 @@ struct hci_cp_le_start_encryption {
 		#define HCI_SCAN_INQUIRY_PAGE	0x03 //All enabled
 	struct hci_write_scan_enable {
 		uint8		scan;
+	} __attribute__ ((packed));
+
+	#define OCF_READ_PAGE_SCAN_ACTIVITY		0x001B
+	#define OCF_WRITE_PAGE_SCAN_ACTIVITY	0x001C
+	struct hci_write_page_scan_activity {
+		uint16		interval;	// 0.625 ms slots, even, 0x12-0x1000
+		uint16		window;		// 0.625 ms slots, 0x11-0x1000
 	} __attribute__ ((packed));
 
 	#define OCF_READ_AUTH_ENABLE		0x001F
