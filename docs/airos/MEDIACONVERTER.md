@@ -199,6 +199,13 @@ and the chapters (42.1 dB over 2778 pictures), from the window.
 
 ## Testing
 
+The application takes files, a preset and a request to convert on its
+command line - `MediaConverter --preset "AV1 10-bit (MKV)" --convert
+film.mkv` - which scripts and tests use; the CPU warning, if it comes, is
+answered with the window's `'cpwa'` message (`which` 0 cancel, 1 don't warn
+again, 2 encode on the CPU), e.g. `hey MediaConverter cpwa of Window 0 with
+which=int32(2)`.
+
 `mediaconvert` is the engine from a shell (built with the app, not in the
 image):
 
@@ -213,7 +220,6 @@ MEDIACONVERTER_PROFILE=1 mediaconvert ...   time per stage, and the VA-API uploa
 
 ## Known limits
 
-- VA-API AV1 encoding (VCN 4) is not written yet; AV1 goes to SVT-AV1.
 - VP9 10-bit needs a libvpx built with high bit depth.
 - Theora output has single-picture dips at scene cuts.
 - arm64 images have no MediaConverter yet (no FFmpeg build feature, and no
