@@ -120,13 +120,17 @@ own in `system/non-packaged/lib` (airos-ci `deps/build-libvpx.sh`): HaikuPorts'
 is libvpx's generic C build without high bit depth, so VP9 10-bit was
 impossible and VP9 took twice as long.
 
-On arm64 there are no x264, x265, SVT-AV1, libvpx or LAME builds yet, so
-MediaConverter makes what FFmpeg makes by itself - MPEG-4, MPEG-2 and FFV1
-video, AAC, FLAC, ALAC, Opus, Vorbis, AC-3, E-AC-3, MP2 and PCM sound - and
-copies streams into another container; the other formats say why they cannot
-be made there, and the first preset is the first one that can ("Change
-container"). Tried on the Cubie A7S: MPEG-4 at 48.3 dB, FFV1, AAC, Opus,
-Vorbis and FLAC, remuxing.
+HaikuPorts has no arm64 packages, so air/OS CI builds the CPU encoders for the
+arm64 images itself (airos-ci `deps/recipes/x264.sh`, `x265.sh`, `svt_av1.sh`,
+`libvpx.sh`, `lame.sh`, from the releases HaikuPorts uses, with NEON) and
+builds rock5_ffmpeg with libvpx and LAME. On the Cubie A7S, two seconds of
+1080p: H.264 50.0 dB (8 s), H.265 49.2 (48 s; x265 3.5 has no AArch64
+assembly), H.265 10-bit 47.8, AV1 48.5 (25 s), VP9 46.0 and 10-bit 45.8,
+VP8 48.4, and MP3. arm64's FFmpeg has no soxr, libopus, libvorbis or
+libtheora: the engine resamples with swresample's own, takes FFmpeg's own
+Opus and Vorbis encoders, and Theora cannot be made there. Where an encoder
+is missing the format says why, and the first preset is the first one the
+computer can make.
 
 ### The transcoder
 
@@ -264,5 +268,5 @@ MEDIACONVERTER_FAKE_NVIDIA=1b81 ...         pretend there is a GTX 1070 (with th
   driver to supply default probability (CDF) tables in a layout nothing
   documents, and to write frame headers from values the engine computes.
 - Theora output has single-picture dips at scene cuts.
-- arm64 has only FFmpeg's own encoders (see above); no hardware encoding on
-  the ROCK 5's VPU or the Cubie's yet.
+- arm64 has no Theora, and no hardware encoding on the ROCK 5's or the
+  Cubie's video engines yet.
