@@ -1,0 +1,6 @@
+SubDir HAIKU_TOP src tests servers app window_placement ;
+
+Application WindowPlacement :
+	WindowPlacement.cpp
+	: be [ TargetLibstdc++ ] [ TargetLibsupc++ ]
+;
