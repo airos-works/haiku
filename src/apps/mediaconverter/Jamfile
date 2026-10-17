@@ -19,6 +19,7 @@ SEARCH_SOURCE += [ FDirName $(SUBDIR) cli ] ;
 
 local engineSources =
 	BitWriter.cpp
+	DiscSource.cpp
 	Formats.cpp
 	HardwareCaps.cpp
 	LavcVideoEncoder.cpp

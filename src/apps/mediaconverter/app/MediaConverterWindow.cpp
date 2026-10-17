@@ -34,6 +34,7 @@
 
 #include <stdio.h>
 
+#include "DiscSource.h"
 #include "HardwareCaps.h"
 #include "HardwareWindow.h"
 #include "MediaConverterApp.h"
@@ -396,7 +397,7 @@ MediaConverterWindow::MessageReceived(BMessage* message)
 		case kMsgAddFiles:
 			if (fOpenPanel == NULL) {
 				fOpenPanel = new BFilePanel(B_OPEN_PANEL, new BMessenger(this),
-					NULL, B_FILE_NODE, true);
+					NULL, B_FILE_NODE | B_DIRECTORY_NODE, true);
 				fOpenPanel->Window()->SetTitle(B_TRANSLATE(
 					"MediaConverter: Add files"));
 			}
@@ -441,6 +442,8 @@ MediaConverterWindow::MessageReceived(BMessage* message)
 				if (status == B_OK && (info->HasVideo()
 						|| !info->audio.empty())) {
 					item->SetInfo(*info);
+					if (info->IsDisc())
+						item->SetDiscTitle(info->discTitle);
 					item->SetState(kJobWaiting);
 				} else {
 					item->SetState(kJobUnreadable);
@@ -457,6 +460,26 @@ MediaConverterWindow::MessageReceived(BMessage* message)
 			_UpdateStatus();
 			if (fConvertWhenReady)
 				_Convert();
+			break;
+		}
+
+		case kMsgDiscTitleChosen:
+		{
+			// another title of a disc: read it as a new source
+			QueueItem* item = fQueue->ItemByID(message->GetInt32("id", -1));
+			int32 title = message->GetInt32("title", -1);
+			if (item == NULL || !item->IsDisc() || title < 0
+				|| title == item->DiscTitle() || !item->IsPending())
+				break;
+			item->SetDiscTitle(title);
+			item->SetInfo(SourceInfo());
+			item->SetState(kJobProbing);
+			fQueue->InvalidateItem(item);
+			BList items;
+			items.AddItem(item);
+			_StartProbing(&items);
+			_SelectionChanged();
+			_UpdateControls();
 			break;
 		}
 
@@ -610,15 +633,29 @@ MediaConverterWindow::_AddRefs(BMessage* message)
 	entry_ref ref;
 	for (int32 i = 0; message->FindRef("refs", i, &ref) == B_OK; i++) {
 		BEntry entry(&ref, true);
+		BPath path(&entry);
+		if (identify_disc(path.Path()) != kDiscNone) {
+			// a DVD or Blu-ray: its main title (a disc can be added again,
+			// for another title)
+			entry.GetRef(&ref);
+			QueueItem* item = new QueueItem(ref);
+			item->SetDisc(true);
+			fQueue->AddItem(item);
+			added.AddItem(item);
+			continue;
+		}
 		if (entry.IsDirectory()) {
-			// a folder: the files in it
+			// a folder: the files and discs in it
 			BDirectory directory(&entry);
 			entry_ref child;
 			while (directory.GetNextRef(&child) == B_OK) {
 				BEntry childEntry(&child, true);
-				if (childEntry.IsFile()) {
+				BPath childPath(&childEntry);
+				bool disc = identify_disc(childPath.Path()) != kDiscNone;
+				if (childEntry.IsFile() || disc) {
 					childEntry.GetRef(&child);
 					QueueItem* item = new QueueItem(child);
+					item->SetDisc(disc);
 					fQueue->AddItem(item);
 					added.AddItem(item);
 				}
@@ -740,9 +777,13 @@ MediaConverterWindow::_DestinationFor(QueueItem* item,
 	BPath source(&item->Ref());
 	BString folder;
 	if (fOutput->NextToSource() || fOutput->DestinationFolder().IsEmpty()) {
-		BPath parent;
-		source.GetParent(&parent);
-		folder = parent.Path();
+		if (item->IsDisc())
+			folder = disc_folder(source.Path());
+		else {
+			BPath parent;
+			source.GetParent(&parent);
+			folder = parent.Path();
+		}
 	} else
 		folder = fOutput->DestinationFolder();
 
@@ -750,6 +791,11 @@ MediaConverterWindow::_DestinationFor(QueueItem* item,
 	int32 dot = base.FindLast('.');
 	if (dot > 0)
 		base.Truncate(dot);
+	if (item->IsDisc()) {
+		// "Movie", or "Movie (title 3)" for another title than the main one
+		base = item->Name();
+		base.ReplaceAll('/', '-');
+	}
 	const char* extension = container_info(settings.container).extension;
 
 	BString path;

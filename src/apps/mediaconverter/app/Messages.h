@@ -26,6 +26,7 @@ enum {
 	kMsgToggleCpuWarning		= 'tgcw',
 	kMsgShowInTracker			= 'shtr',
 	kMsgPlayOutput				= 'plyo',
+	kMsgDiscTitleChosen			= 'dttl',
 
 	// from the worker thread
 	kMsgJobStarted				= 'jbst',

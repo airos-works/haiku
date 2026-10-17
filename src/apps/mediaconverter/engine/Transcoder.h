@@ -108,6 +108,7 @@ private:
 			status_t			_SetUpAudio(BString& error);
 			status_t			_SetUpSubtitles(BString& error);
 			void				_CopyChapters();
+			void				_FixDiscontinuity(AVPacket* packet);
 			void				_AddFolderCover();
 			status_t			_DetectCrop(int crop[4]);
 			void				_ProbeHdrMetadata(VideoEncoderParams& params);
@@ -172,6 +173,9 @@ private:
 			std::vector<SubtitleStream*> fSubtitles;
 			std::vector<int>	fStreamKinds;	// per input stream
 			std::vector<int>	fStreamSlots;
+			// timestamp jumps in MPEG program and transport streams
+			std::vector<int64>	fNextDts;		// per input stream, µs
+			int64				fTimestampOffset;	// µs
 			std::vector<int64>	fCopyStarted;	// per input stream
 			std::vector<std::pair<int, AVStream*> > fAttachments;
 			AVPacket*			fFolderCover;	// the album's cover.jpg

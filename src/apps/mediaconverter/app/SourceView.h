@@ -15,6 +15,7 @@ class AudioPreview;
 class BBitmap;
 class BColumnListView;
 class BGroupLayout;
+class BMenuField;
 class BMessageRunner;
 class BStringView;
 class BTextView;
@@ -45,6 +46,7 @@ public:
 
 private:
 			void				_AddTracks(const SourceInfo& info);
+			void				_UpdateDiscTitles(const SourceInfo* info);
 			void				_StopPlaying();
 			bool				_OpenPlayer();
 			void				_Seek(bigtime_t time);
@@ -54,6 +56,7 @@ private:
 			BStringView*		fTitle;
 			BStringView*		fSummary;
 			BStringView*		fExtra;
+			BMenuField*			fDiscTitles;
 			BColumnListView*	fTracks;
 			BGroupLayout*		fControlsSlot;
 			airtime::ControlBar* fControls;

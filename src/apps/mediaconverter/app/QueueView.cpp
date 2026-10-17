@@ -15,6 +15,7 @@
 
 #include <stdio.h>
 
+#include "DiscSource.h"
 #include "MediaProbe.h"
 #include "Messages.h"
 
@@ -31,6 +32,8 @@ QueueItem::QueueItem(const entry_ref& ref)
 	BListItem(),
 	fID(atomic_add(&sNextID, 1)),
 	fRef(ref),
+	fDisc(false),
+	fDiscTitle(-1),
 	fState(kJobProbing),
 	fProgress(0),
 	fIcon(NULL),
@@ -51,7 +54,22 @@ BString
 QueueItem::Path() const
 {
 	BPath path(&fRef);
+	if (fDisc)
+		return disc_source(path.Path(), fDiscTitle);
 	return BString(path.Path());
+}
+
+
+BString
+QueueItem::Name() const
+{
+	if (!fInfo.name.IsEmpty())
+		return fInfo.name;
+	if (fDisc) {
+		BPath path(&fRef);
+		return disc_name(path.Path());
+	}
+	return BString(fRef.name);
 }
 
 
@@ -172,7 +190,7 @@ QueueItem::DrawItem(BView* owner, BRect frame, bool complete)
 	owner->SetFont(&bold);
 	owner->SetHighColor(text);
 	float top = frame.top + 4;
-	BString name(fRef.name);
+	BString name = Name();
 	owner->TruncateString(&name, B_TRUNCATE_MIDDLE, frame.right - x - 6);
 	owner->DrawString(name.String(), BPoint(x, top + fBaseline));
 	owner->SetFont(&font);

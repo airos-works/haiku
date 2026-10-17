@@ -48,6 +48,38 @@ interlaced or all of them), denoise (atadenoise, fftdnoiz), sharpen (unsharp), b
 white, cutting off black borders (ten pictures from the film are measured),
 turning and mirroring. The source's own rotation is applied.
 
+## DVDs and Blu-rays
+
+As in HandBrake, a disc is a source: a DVD folder (one holding `VIDEO_TS`,
+or `VIDEO_TS` itself), a DVD image (`.iso`, read through its ISO 9660
+directory), or a Blu-ray or AVCHD folder (one holding `BDMV`). It goes in
+the queue as its longest title; the Source panel's *Title* menu lists the
+others longer than ten seconds (with their length and chapters) and
+converts another one instead. A disc can be added again for a second title.
+The output is named after the disc ("Movie.mp4", "Movie (title 3).mp4")
+and goes next to it.
+
+- **DVD** (`engine/DiscSource.cpp`): the IFO files give the titles, their
+  program chains' cells (the first angle of an angle block), chapter
+  starts, the audio and subtitle languages (commentary and forced flags
+  too) and the subpicture palette; the cells are read from the title set's
+  VOBs as one MPEG program stream. The subtitle streams are made before
+  reading starts, since they first appear when someone speaks, and the
+  DVD subtitle decoder gets the palette (so burned-in and passed-through
+  VobSub subtitles have their colours).
+- **Blu-ray**: the `.mpls` playlists give the titles (a playlist that only
+  repeats another is listed once), their play items, chapter marks and the
+  languages of the streams by PID; a playlist plays through FFmpeg's concat
+  demuxer, each clip from its in to its out time, so the timestamps run on
+  across clips.
+- Encrypted discs (CSS, AACS) are not read: MediaConverter says so. A
+  Blu-ray image is not read (Blu-ray discs have no ISO 9660 directory).
+- MPEG program and transport streams may jump in time (cells from
+  different VOBs, a recording whose clock was reset): as ffmpeg does, a
+  jump of more than 10 s, or back in time, moves what follows to follow on,
+  and sound that overlaps what was encoded is left out.
+- `mediaconvert --info <disc>` lists the titles, `--title <n>` picks one.
+
 ## Presets
 
 *General*: Fast 1080p (H.264 and AAC in MP4), High quality 1080p, Small 720p

@@ -38,6 +38,7 @@ extern "C" {
 
 #include "HardwareCaps.h"
 #include "LavcVideoEncoder.h"
+#include "DiscSource.h"
 #include "MediaProbe.h"
 #include "SoftwareEncoders.h"
 #include "VideoEncoder.h"
@@ -246,6 +247,7 @@ Transcoder::Transcoder(const TranscodeJob& job)
 	fLastProgress(0),
 	fLastPosition(0),
 	fVideo(NULL),
+	fTimestampOffset(0),
 	fFolderCover(NULL),
 	fFolderCoverStream(NULL),
 	fBurnInStream(-1),
@@ -316,16 +318,14 @@ Transcoder::OutputSize(const SourceInfo& info, const OutputSettings& settings,
 status_t
 Transcoder::_OpenInput(BString& error)
 {
-	int result = avformat_open_input(&fInput, fJob.source.String(), NULL,
-		NULL);
+	BString openError;
+	int result = open_source(&fInput, fJob.source.String(), &openError);
 	if (result < 0) {
-		error.SetToFormat("Cannot open the source: %s",
-			av_error(result).String());
-		return B_ERROR;
-	}
-	result = avformat_find_stream_info(fInput, NULL);
-	if (result < 0) {
-		error = "The source's streams cannot be read.";
+		if (openError.IsEmpty()) {
+			error.SetToFormat("Cannot open the source: %s",
+				av_error(result).String());
+		} else
+			error = openError;
 		return B_ERROR;
 	}
 	if (fJob.info.path.IsEmpty())
@@ -333,6 +333,8 @@ Transcoder::_OpenInput(BString& error)
 
 	fStreamKinds.assign(fInput->nb_streams, kStreamIgnored);
 	fStreamSlots.assign(fInput->nb_streams, -1);
+	fNextDts.assign(fInput->nb_streams, AV_NOPTS_VALUE);
+	fTimestampOffset = 0;
 
 	// Negative times are a pre-roll (an MP4 edit list, Matroska's codec
 	// delay): what is shown starts at 0. Positive ones (MPEG-TS) are where
@@ -382,9 +384,8 @@ Transcoder::_DetectCrop(int crop[4])
 		return B_OK;
 
 	AVFormatContext* context = NULL;
-	if (avformat_open_input(&context, fJob.source.String(), NULL, NULL) < 0)
+	if (open_source(&context, fJob.source.String()) < 0)
 		return B_ERROR;
-	avformat_find_stream_info(context, NULL);
 	int index = fVideo->in->index;
 	AVStream* stream = context->streams[index];
 	const AVCodec* codec = avcodec_find_decoder(stream->codecpar->codec_id);
@@ -394,7 +395,7 @@ Transcoder::_DetectCrop(int crop[4])
 		|| avcodec_parameters_to_context(decoder, stream->codecpar) < 0
 		|| avcodec_open2(decoder, codec, NULL) < 0) {
 		avcodec_free_context(&decoder);
-		avformat_close_input(&context);
+		close_source(&context);
 		return B_ERROR;
 	}
 
@@ -489,7 +490,7 @@ Transcoder::_DetectCrop(int crop[4])
 	av_frame_free(&frame);
 	av_packet_free(&packet);
 	avcodec_free_context(&decoder);
-	avformat_close_input(&context);
+	close_source(&context);
 
 	if (samples < 3)
 		return B_OK;
@@ -839,15 +840,13 @@ void
 Transcoder::_ProbeHdrMetadata(VideoEncoderParams& params)
 {
 	AVFormatContext* context = NULL;
-	if (avformat_open_input(&context, fJob.source.String(), NULL, NULL) < 0)
+	if (open_source(&context, fJob.source.String()) < 0)
 		return;
 	AVCodecContext* decoder = NULL;
 	AVPacket* packet = av_packet_alloc();
 	AVFrame* frame = av_frame_alloc();
 	int index = fVideo->in->index;
 	const AVCodec* codec = NULL;
-	if (avformat_find_stream_info(context, NULL) < 0)
-		goto out;
 	codec = avcodec_find_decoder(context->streams[index]->codecpar->codec_id);
 	decoder = codec != NULL ? avcodec_alloc_context3(codec) : NULL;
 	if (decoder == NULL || avcodec_parameters_to_context(decoder,
@@ -884,7 +883,7 @@ out:
 	av_frame_free(&frame);
 	av_packet_free(&packet);
 	avcodec_free_context(&decoder);
-	avformat_close_input(&context);
+	close_source(&context);
 }
 
 
@@ -1532,6 +1531,41 @@ Transcoder::_SetUpSubtitles(BString& error)
 }
 
 
+/*!	MPEG program and transport streams may jump in time: a DVD title whose
+	cells come from different VOBs, a recording whose clock was reset. As
+	ffmpeg does, a packet more than 10 s off where its stream would go on,
+	or going back, moves everything after it to follow on. */
+void
+Transcoder::_FixDiscontinuity(AVPacket* packet)
+{
+	AVStream* stream = fInput->streams[packet->stream_index];
+	int64 dts = packet->dts != AV_NOPTS_VALUE ? packet->dts : packet->pts;
+	if (dts == AV_NOPTS_VALUE)
+		return;
+	int64 time = av_rescale_q(dts, stream->time_base, AV_TIME_BASE_Q)
+		+ fTimestampOffset;
+	int64& next = fNextDts[packet->stream_index];
+	if (next != AV_NOPTS_VALUE) {
+		int64 delta = time - next;
+		if (delta > 10 * AV_TIME_BASE || delta < -AV_TIME_BASE / 10) {
+			fTimestampOffset -= delta;
+			time -= delta;
+		}
+	}
+	int64 duration = packet->duration > 0 ? av_rescale_q(packet->duration,
+		stream->time_base, AV_TIME_BASE_Q) : 0;
+	next = time + duration;
+	if (fTimestampOffset == 0)
+		return;
+	int64 offset = av_rescale_q(fTimestampOffset, AV_TIME_BASE_Q,
+		stream->time_base);
+	if (packet->pts != AV_NOPTS_VALUE)
+		packet->pts += offset;
+	if (packet->dts != AV_NOPTS_VALUE)
+		packet->dts += offset;
+}
+
+
 void
 Transcoder::_CopyChapters()
 {
@@ -2069,6 +2103,14 @@ Transcoder::_EncodeAudio(AudioStream& stream, AVFrame* frame)
 		if (frame->pts == AV_NOPTS_VALUE || (stream.nextPts != AV_NOPTS_VALUE
 				&& llabs(frame->pts - stream.nextPts) < frame->nb_samples / 2))
 			frame->pts = stream.nextPts != AV_NOPTS_VALUE ? stream.nextPts : 0;
+		else if (stream.nextPts != AV_NOPTS_VALUE
+			&& frame->pts < stream.nextPts) {
+			// sound that overlaps what was encoded: what is new follows on,
+			// what is not is left out
+			if (frame->pts + frame->nb_samples <= stream.nextPts)
+				return B_OK;
+			frame->pts = stream.nextPts;
+		}
 		if (frame->pts < 0)
 			frame->pts = 0;
 		stream.nextPts = frame->pts + frame->nb_samples;
@@ -2402,6 +2444,8 @@ Transcoder::Run(TranscodeListener* listener, BString& error)
 			av_packet_unref(packet);
 			continue;
 		}
+		if ((fInput->iformat->flags & AVFMT_TS_DISCONT) != 0)
+			_FixDiscontinuity(packet);
 		// past the end of the range: stop once every stream is there
 		bool master = fVideo != NULL ? fStreamKinds[index] == kStreamVideo
 			: (fStreamKinds[index] == kStreamAudio && !fAudio.empty()
@@ -2576,5 +2620,5 @@ Transcoder::_Cleanup()
 		fOutput = NULL;
 		fHeaderWritten = false;
 	}
-	avformat_close_input(&fInput);
+	close_source(&fInput);
 }

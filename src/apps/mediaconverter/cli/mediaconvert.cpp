@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "DiscSource.h"
 #include "Formats.h"
 #include "HardwareCaps.h"
 #include "MediaProbe.h"
@@ -195,6 +196,14 @@ print_info(const char* path)
 			s.forced ? ", forced" : "", s.isDefault ? ", default" : "");
 	}
 	printf("chapters: %d\n", (int)info.chapters.size());
+	for (size_t i = 0; i < info.discTitles.size(); i++) {
+		const DiscTitle& title = info.discTitles[i];
+		printf("title %d: %s, %d chapters%s%s%s\n", (int)title.number,
+			MediaProbe::FormatDuration(title.duration).String(),
+			(int)title.chapters, title.angles > 1 ? ", angles" : "",
+			title.number == info.discMainTitle ? " (main)" : "",
+			title.number == info.discTitle ? " <- this one" : "");
+	}
 }
 
 
@@ -473,7 +482,10 @@ usage()
 		"  --subs none|copy|burn|burn-forced  --crop  --deinterlace "
 		"off|auto|always\n"
 		"  --denoise 0-3  --sharpen 0-3  --gray  --rotate <degrees>  --flip\n"
-		"  --start <seconds>  --end <seconds>  --quiet\n");
+		"  --start <seconds>  --end <seconds>  --quiet\n"
+		"A source can be a DVD (folder or image) or a Blu-ray folder:\n"
+		"  --title <n>  its title (DVD) or playlist (Blu-ray), else the "
+		"longest\n");
 	exit(1);
 }
 
@@ -489,6 +501,7 @@ main(int argc, char** argv)
 	const char* destination = NULL;
 	bool quiet = false;
 	bool containerChosen = false;
+	int32 title = -1;
 
 	for (int i = 1; i < argc; i++) {
 		const char* arg = argv[i];
@@ -502,7 +515,10 @@ main(int argc, char** argv)
 			print_hardware();
 			return 0;
 		} else if (strcmp(arg, "--info") == 0 && next != NULL) {
-			print_info(next);
+			BString path(next);
+			if (i + 3 < argc && strcmp(argv[i + 2], "--title") == 0)
+				path = disc_source(next, atoi(argv[i + 3]));
+			print_info(path.String());
 			return 0;
 		} else if (strcmp(arg, "--preset") == 0 && next != NULL) {
 			int32 index = Presets::IndexOf(next);
@@ -590,6 +606,8 @@ main(int argc, char** argv)
 			settings.rotation = atoi(next);
 		else if (strcmp(arg, "--start") == 0 && next != NULL)
 			settings.start = (bigtime_t)(atof(next) * 1000000);
+		else if (strcmp(arg, "--title") == 0 && next != NULL)
+			title = atoi(next);
 		else if (strcmp(arg, "--end") == 0 && next != NULL)
 			settings.end = (bigtime_t)(atof(next) * 1000000);
 		else {
@@ -642,6 +660,11 @@ main(int argc, char** argv)
 
 	TranscodeJob job;
 	job.source = source;
+	if (identify_disc(source) != kDiscNone) {
+		char* absolute = realpath(source, NULL);
+		job.source = disc_source(absolute != NULL ? absolute : source, title);
+		free(absolute);
+	}
 	job.destination = destination;
 	job.settings = settings;
 
