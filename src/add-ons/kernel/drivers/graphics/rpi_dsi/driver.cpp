@@ -282,6 +282,8 @@ struct dsi_info {
 	registers		pixelValve;
 	registers		hvs;
 	registers		clocks;
+	registers		i2c;		// BSC0, the connector's I2C (GPIO 44/45)
+	registers		gpio;
 
 	char			name[64];
 	timing			panel;
@@ -372,16 +374,19 @@ cm_write(dsi_info* info, uint32 offset, uint32 value)
 }
 
 
-/*!	Finds the device tree node with \a compatible and maps its registers. */
+/*!	Finds the device tree node whose \a attribute ("fdt/compatible" or
+	"fdt/name") is \a value and maps its registers. */
 static status_t
-map_block(const char* compatible, const char* name, registers& regs)
+map_block_by(const char* attribute, const char* value, const char* name,
+	registers& regs)
 {
 	device_node* root = sDeviceManager->get_root_node();
 	if (root == NULL)
 		return B_DEVICE_NOT_FOUND;
 
+	const char* compatible = value;
 	device_attr attributes[] = {
-		{ "fdt/compatible", B_STRING_TYPE, { .string = compatible } },
+		{ attribute, B_STRING_TYPE, { .string = value } },
 		{}
 	};
 	device_node* node = NULL;
@@ -417,6 +422,13 @@ map_block(const char* compatible, const char* name, registers& regs)
 	regs.physical = base;
 	regs.size = size;
 	return B_OK;
+}
+
+
+static status_t
+map_block(const char* compatible, const char* name, registers& regs)
+{
+	return map_block_by("fdt/compatible", compatible, name, regs);
 }
 
 
@@ -1024,6 +1036,92 @@ present(dsi_info* info, uint32 index)
 }
 
 
+//	#pragma mark - touch controller probe
+
+
+// the BCM2835 BSC (I2C) controller
+#define BSC_C					0x00
+#define BSC_C_I2CEN				BIT(15)
+#define BSC_C_ST				BIT(7)
+#define BSC_C_CLEAR				(BIT(4) | BIT(5))
+#define BSC_C_READ				BIT(0)
+#define BSC_S					0x04
+#define BSC_S_CLKT				BIT(9)
+#define BSC_S_ERR				BIT(8)
+#define BSC_S_RXD				BIT(5)
+#define BSC_S_TXD				BIT(4)
+#define BSC_S_DONE				BIT(1)
+#define BSC_DLEN				0x08
+#define BSC_A					0x0c
+#define BSC_FIFO				0x10
+#define BSC_DIV					0x14
+#define GOODIX_REG_ID			0x8140
+
+
+static status_t
+bsc_wait_done(const registers& bsc, uint32* _status)
+{
+	for (int i = 0; i < 2000; i++) {
+		uint32 status = read32(bsc, BSC_S);
+		if ((status & BSC_S_DONE) != 0) {
+			*_status = status;
+			write32(bsc, BSC_S, BSC_S_CLKT | BSC_S_ERR | BSC_S_DONE);
+			if ((status & (BSC_S_ERR | BSC_S_CLKT)) != 0)
+				return B_IO_ERROR;
+			return B_OK;
+		}
+		spin(10);
+	}
+	*_status = read32(bsc, BSC_S);
+	write32(bsc, BSC_C, BSC_C_I2CEN | BSC_C_CLEAR);
+	return B_TIMED_OUT;
+}
+
+
+/*!	Reads \a length bytes from a 16-bit register of an I2C device, as the
+	Goodix touch controllers expect: the register address written, then a
+	read. The connector's pins are switched to the BSC first. */
+static status_t
+touch_probe(dsi_info* info, rpi_dsi_touch_probe& probe)
+{
+	if (info->i2c.base == NULL || info->gpio.base == NULL)
+		return B_DEVICE_NOT_FOUND;
+	const registers& bsc = info->i2c;
+
+	// GPIO 44/45 to ALT1 (SDA0/SCL0), pulled up
+	uint32 fsel = read32(info->gpio, 0x10);		// FSEL4: pins 40 to 49
+	fsel = (fsel & ~((7u << 12) | (7u << 15))) | (5u << 12) | (5u << 15);
+	write32(info->gpio, 0x10, fsel);
+	uint32 pull = read32(info->gpio, 0xec);		// PUP_PDN_CNTRL2: pins 32 to 47
+	pull = (pull & ~((3u << 24) | (3u << 26))) | (1u << 24) | (1u << 26);
+	write32(info->gpio, 0xec, pull);
+	barrier();
+
+	if (read32(bsc, BSC_DIV) == 0 || read32(bsc, BSC_DIV) > 0x8000)
+		write32(bsc, BSC_DIV, 2500);		// slow and safe
+	write32(bsc, BSC_C, BSC_C_I2CEN | BSC_C_CLEAR);
+	write32(bsc, BSC_S, BSC_S_CLKT | BSC_S_ERR | BSC_S_DONE);
+	write32(bsc, BSC_A, probe.address & 0x7f);
+	write32(bsc, BSC_DLEN, 2);
+	write32(bsc, BSC_FIFO, GOODIX_REG_ID >> 8);
+	write32(bsc, BSC_FIFO, GOODIX_REG_ID & 0xff);
+	write32(bsc, BSC_C, BSC_C_I2CEN | BSC_C_ST);
+	status_t status = bsc_wait_done(bsc, &probe.controller_status);
+	if (status != B_OK)
+		return status;
+
+	write32(bsc, BSC_DLEN, sizeof(probe.id));
+	write32(bsc, BSC_C, BSC_C_I2CEN | BSC_C_ST | BSC_C_READ);
+	status = bsc_wait_done(bsc, &probe.controller_status);
+	for (size_t i = 0; i < sizeof(probe.id); i++) {
+		if ((read32(bsc, BSC_S) & BSC_S_RXD) == 0)
+			break;
+		probe.id[i] = read32(bsc, BSC_FIFO) & 0xff;
+	}
+	return status;
+}
+
+
 //	#pragma mark - setup
 
 
@@ -1298,8 +1396,12 @@ dsi_control(void* cookie, uint32 op, void* buffer, size_t length)
 				case RPI_DSI_BLOCK_PIXEL_VALVE: block = &info->pixelValve; break;
 				case RPI_DSI_BLOCK_HVS: block = &info->hvs; break;
 				case RPI_DSI_BLOCK_CLOCKS: block = &info->clocks; break;
+				case RPI_DSI_BLOCK_GPIO: block = &info->gpio; break;
+				case RPI_DSI_BLOCK_I2C: block = &info->i2c; break;
 				default: return B_BAD_VALUE;
 			}
+			if (block->base == NULL)
+				return B_DEVICE_NOT_FOUND;
 			// the whole mapped page: DSI1's id sits right behind its reg size
 			if ((request.offset & 3) != 0
 				|| request.offset + 4 > ROUNDUP(block->size, B_PAGE_SIZE)) {
@@ -1314,6 +1416,19 @@ dsi_control(void* cookie, uint32 op, void* buffer, size_t length)
 			}
 			request.value = read32(*block, request.offset);
 			return user_memcpy(buffer, &request, sizeof(request));
+		}
+
+		case RPI_DSI_TOUCH_PROBE:
+		{
+			rpi_dsi_touch_probe probe;
+			if (length < sizeof(probe))
+				return B_BAD_VALUE;
+			status_t status = user_memcpy(&probe, buffer, sizeof(probe));
+			if (status != B_OK)
+				return status;
+			memset(probe.id, 0, sizeof(probe.id));
+			probe.status = touch_probe(info, probe);
+			return user_memcpy(buffer, &probe, sizeof(probe));
 		}
 
 		case RPI_DSI_READ_DISPLAY_LIST:
@@ -1380,7 +1495,7 @@ dsi_init_driver(device_node* node, void** _cookie)
 		return B_NO_MEMORY;
 	info->node = node;
 	info->dsi.area = info->pixelValve.area = info->hvs.area
-		= info->clocks.area = -1;
+		= info->clocks.area = info->i2c.area = info->gpio.area = -1;
 	info->bufferArea = -1;
 
 	status_t status = map_block("brcm,bcm2711-dsi1", "rpi dsi1", info->dsi);
@@ -1392,6 +1507,18 @@ dsi_init_driver(device_node* node, void** _cookie)
 		status = map_block("brcm,bcm2711-hvs", "rpi hvs", info->hvs);
 	if (status == B_OK)
 		status = map_block("brcm,bcm2711-cprman", "rpi clocks", info->clocks);
+	if (status == B_OK) {
+		// optional: the connector's I2C for the touch controller
+		info->i2c.area = info->gpio.area = -1;
+		if (map_block_by("fdt/name", "i2c@7e205000", "rpi bsc0", info->i2c)
+				!= B_OK
+			|| map_block("brcm,bcm2711-gpio", "rpi gpio (dsi)", info->gpio)
+				!= B_OK) {
+			unmap_block(info->i2c);
+			unmap_block(info->gpio);
+			info->i2c.base = info->gpio.base = NULL;
+		}
+	}
 	if (status == B_OK) {
 		read_settings(info);
 		status = create_buffers(info);
@@ -1438,6 +1565,8 @@ dsi_uninit_driver(void* cookie)
 	mutex_destroy(&info->lock);
 	if (info->bufferArea >= 0)
 		delete_area(info->bufferArea);
+	unmap_block(info->i2c);
+	unmap_block(info->gpio);
 	unmap_block(info->dsi);
 	unmap_block(info->pixelValve);
 	unmap_block(info->hvs);

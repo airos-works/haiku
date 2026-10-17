@@ -30,17 +30,17 @@
 #include <rpi_dsi.h>
 
 
-static const char* kBlocks[] = { "dsi", "pv", "hvs", "cm" };
+static const char* kBlocks[] = { "dsi", "pv", "hvs", "cm", "gpio", "i2c" };
 
 
 static int
 block_index(const char* name)
 {
-	for (int i = 0; i < 4; i++) {
+	for (int i = 0; i < 6; i++) {
 		if (strcmp(name, kBlocks[i]) == 0)
 			return i;
 	}
-	fprintf(stderr, "no block %s (dsi, pv, hvs, cm)\n", name);
+	fprintf(stderr, "no block %s (dsi, pv, hvs, cm, gpio, i2c)\n", name);
 	exit(1);
 }
 
@@ -272,6 +272,26 @@ main(int argc, char** argv)
 		return 0;
 	}
 
+	if (strcmp(command, "touch") == 0) {
+		static const uint32 kAddresses[] = { 0x14, 0x5d };
+		for (int i = 0; i < 2; i++) {
+			rpi_dsi_touch_probe probe = {};
+			probe.address = kAddresses[i];
+			if (ioctl(fd, RPI_DSI_TOUCH_PROBE, &probe, sizeof(probe)) != 0)
+				return fail("touch probe");
+			printf("0x%02x: %s (BSC status 0x%x)", (unsigned)probe.address,
+				probe.status == B_OK ? "answers" : strerror(probe.status),
+				(unsigned)probe.controller_status);
+			if (probe.status == B_OK) {
+				printf(", id \"%c%c%c%c\" firmware %02x%02x",
+					probe.id[0], probe.id[1], probe.id[2], probe.id[3],
+					probe.id[5], probe.id[4]);
+			}
+			printf("\n");
+		}
+		return 0;
+	}
+
 	if (strcmp(command, "dump") == 0 && argc > 2) {
 		aux_display_info info;
 		if (ioctl(fd, AUX_DISPLAY_GET_INFO, &info, sizeof(info)) != 0)
@@ -299,6 +319,6 @@ main(int argc, char** argv)
 
 	fprintf(stderr, "usage: rpi4_dsi state|info|step <n|off>|on|off|regs|"
 		"dlist [from [n]]|read <block> <offset>|write <block> <offset> "
-		"<value>|fill <rrggbb>|bars|dump <file>\n");
+		"<value>|fill <rrggbb>|bars|dump <file>|touch\n");
 	return 1;
 }

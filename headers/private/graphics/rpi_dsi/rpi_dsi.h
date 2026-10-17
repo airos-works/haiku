@@ -25,7 +25,17 @@ enum {
 	// rpi_dsi_register: write one (lab use)
 	RPI_DSI_WRITE_REGISTER,
 	// uint32[4096]: the HVS display list memory
-	RPI_DSI_READ_DISPLAY_LIST
+	RPI_DSI_READ_DISPLAY_LIST,
+	// rpi_dsi_touch_probe: read the touch controller's id over the
+	// connector's I2C (a sign the panel is powered and connected)
+	RPI_DSI_TOUCH_PROBE
+};
+
+struct rpi_dsi_touch_probe {
+	uint32	address;		// in: 7-bit I2C address
+	uint32	status;			// out: B_OK, B_TIMED_OUT (no transfer), B_IO_ERROR (no ack)
+	uint32	controller_status;	// the BSC status register at the end
+	uint8	id[6];			// Goodix: product id (4 ASCII) + firmware version (2)
 };
 
 // enable steps, in order
@@ -43,7 +53,9 @@ enum {
 	RPI_DSI_BLOCK_DSI = 0,
 	RPI_DSI_BLOCK_PIXEL_VALVE,
 	RPI_DSI_BLOCK_HVS,
-	RPI_DSI_BLOCK_CLOCKS
+	RPI_DSI_BLOCK_CLOCKS,
+	RPI_DSI_BLOCK_GPIO,
+	RPI_DSI_BLOCK_I2C
 };
 
 struct rpi_dsi_register {
