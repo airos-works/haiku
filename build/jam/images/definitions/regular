@@ -54,22 +54,25 @@ SYSTEM_APPS += [ FFilterByBuildFeatures
 	SoundRecorder
 ] ;
 
+# air/OS: ActivityMonitor and MediaPlayer stay in the image without a menu
+# entry (airTime is the media player)
 DESKBAR_APPLICATIONS += [ FFilterByBuildFeatures
-	ActivityMonitor
-	CodyCam
 	HaikuDepot
 	Icon-O-Matic
-	Magnify
 	Mail
 	MediaConverter
-	MediaPlayer
 	MidiPlayer@fluidlite
 	People
-	PoorMan
-	SerialConnect
 	SoftwareUpdater
 	SoundRecorder
 ] ;
+
+DESKBAR_UTILITIES +=
+	CodyCam
+	Magnify
+	PoorMan
+	SerialConnect
+;
 
 DESKBAR_DESKTOP_APPLETS +=
 	AutoRaise

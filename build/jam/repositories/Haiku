@@ -37,18 +37,4 @@ if $(HAIKU_BUILD_TYPE) = test {
 	packages += haiku_unittests ;
 }
 
-local webPositiveIsAvailable ;
-local architectureObject ;
-for architectureObject in [ MultiArchSubDirSetup ] {
-	on $(architectureObject) {
-		if [ FIsBuildFeatureEnabled webpositive ] {
-			webPositiveIsAvailable = true ;
-			break ;
-		}
-	}
-}
-if $(webPositiveIsAvailable) {
-	packages += webpositive ;
-}
-
 HaikuRepository $(haikuRepository) : $(repoInfo) : $(packages:S=.hpkg) ;

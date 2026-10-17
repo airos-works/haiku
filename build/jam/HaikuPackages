@@ -26,7 +26,6 @@ if $(HAIKU_BUILD_TYPE) = test {
 
 local archDependentPackages =
 	HaikuCrossDevel
-	WebPositive
 	;
 
 local secondaryArchPackages =

@@ -100,10 +100,6 @@ if $(HAIKU_CC_IS_LEGACY_GCC_$(architecture)) = 1 {
 }
 
 
-# Deskbar menu symlinks
-AddSymlinkToPackage data deskbar menu Applications
-	: ../../../../apps/Debugger : Debugger ;
-
 # Debugging tools
 SEARCH on leak_analyser.sh = [ FDirName $(HAIKU_TOP) src bin ] ;
 AddFilesToPackage bin : leak_analyser.sh ;

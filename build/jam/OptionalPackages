@@ -8,7 +8,6 @@
 #	DevelopmentBase			- basic development environment (gcc, headers, libs,...)
 #	DevelopmentMin			- development headers, libs, tools, from sources only
 #	Git						- the distributed version control system
-#	WebPositive				- native, WebKit-based web browser
 #	Welcome					- introductory documentation to Haiku
 
 
@@ -145,21 +144,6 @@ if [ IsOptionalHaikuImagePackageAdded DevelopmentMin ] {
 if [ IsOptionalHaikuImagePackageAdded Git ] {
 	AddHaikuImageSystemPackages git@!gcc2 git_x86@secondary_x86 perl@!gcc2 perl_x86@secondary_x86 ;
 	AddHaikuImageSourcePackages git@!gcc2 git_x86@secondary_x86 perl@!gcc2 perl_x86@secondary_x86 ;
-}
-
-
-# WebPositive
-if [ IsOptionalHaikuImagePackageAdded WebPositive ] {
-	local architectureObject ;
-	for architectureObject in [ MultiArchSubDirSetup ] {
-		on $(architectureObject) {
-			if [ FIsBuildFeatureEnabled webpositive ] {
-				AddPackageFilesToHaikuImage system packages : webpositive.hpkg
-					: nameFromMetaInfo ;
-				break ;
-			}
-		}
-	}
 }
 
 

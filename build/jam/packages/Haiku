@@ -537,6 +537,16 @@ for linkTarget in $(DESKBAR_APPLICATIONS) {
 		: ../../../../apps/$(linkTarget) : $(linkTarget) ;
 }
 
+# Its "Utilities" folder
+if $(DESKBAR_UTILITIES) {
+	AddDirectoryToPackage data deskbar menu Applications Utilities
+		: deskbar-utilities.rdef ;
+	for linkTarget in $(DESKBAR_UTILITIES) {
+		AddSymlinkToPackage data deskbar menu Applications Utilities
+			: ../../../../../apps/$(linkTarget) : $(linkTarget) ;
+	}
+}
+
 # "Desktop applets" links
 AddDirectoryToPackage data deskbar menu Desktop\ applets
 	: deskbar-applets.rdef ;

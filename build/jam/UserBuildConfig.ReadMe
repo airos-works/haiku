@@ -144,11 +144,10 @@ ExtractArchiveToHaikuImage develop tools
 # via wget (i.e. wget must be installed).
 AddHaikuImageSystemPackages WonderBrush ;
 
-# Add the optional package WebPositive to the image but don't add its
-# dependent SQLite optional package to the image. WebPositive still needs
-# SQLite to run, this allows you to test a different version of it though.
-AddOptionalHaikuImagePackages WebPositive ;
-SuppressHaikuImagePackages SQLite ;
+# Keep the repository's Vision package out of the image, even though the
+# nightly profile adds it, e.g. to put in your own build of it with
+# AddFilesToHaikuImage system packages.
+SuppressHaikuImagePackages vision ;
 
 # Specify scripts that shall be run when populating the image/installation
 # directory. The "early" script is run before anything has been copied onto

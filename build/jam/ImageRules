@@ -1183,6 +1183,21 @@ rule AddHaikuImageDisabledPackages packages
 	AddHaikuImagePackages $(packages) : _packages_ ;
 }
 
+rule SuppressHaikuImagePackages packages
+{
+	# SuppressHaikuImagePackages <packages> ;
+	# Keeps the given repository packages out of the image, even when a build
+	# profile adds them later, e.g. when the image gets its own build of one.
+
+	local package ;
+	for package in $(packages) {
+		local resolvedPackage = [ IsPackageAvailable $(package) ] ;
+		if $(resolvedPackage) {
+			HAIKU_PACKAGE_ADDED on $(resolvedPackage) = 1 ;
+		}
+	}
+}
+
 rule IsHaikuImagePackageAdded package
 {
 	local resolvedPackage = [ IsPackageAvailable $(package) ] ;

@@ -20,6 +20,7 @@ SYSTEM_APPS = [ FFilterByBuildFeatures
 	Workspaces ] ;
 
 DESKBAR_APPLICATIONS = SerialConnect Terminal ;
+DESKBAR_UTILITIES = [ FFilterByBuildFeatures Debugger@libedit ] ;
 
 rule HaikuImageGetSystemLibs
 {
