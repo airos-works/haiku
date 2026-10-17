@@ -53,6 +53,7 @@ private:
 		std::vector<VABufferID> buffers;
 		uint32			frameNum;		// H.264
 		int32			order;			// picture order count
+		int				slot;			// AV1 reference slot
 	};
 
 	enum { kPipelineDepth = 3 };
@@ -73,7 +74,7 @@ private:
 			status_t			_AddPacked(Picture& picture,
 									VAEncPackedHeaderType type,
 									const std::vector<uint8>& data,
-									size_t bits);
+									size_t bits, bool emulationBytes = true);
 			void				_ReleaseBuffers(Picture& picture);
 
 			// H.264
@@ -131,6 +132,7 @@ private:
 			VASurfaceID			fReference;
 			uint32				fReferenceFrameNum;
 			int32				fReferenceOrder;
+			int					fReferenceSlot;
 			int64				fCount;			// pictures sent
 			int64				fIndexInGop;
 			uint32				fIdrId;

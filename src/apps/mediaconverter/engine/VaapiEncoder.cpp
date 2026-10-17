@@ -84,6 +84,7 @@ VaapiEncoder::VaapiEncoder(const char* renderNode, const char* deviceName)
 	fReference(VA_INVALID_SURFACE),
 	fReferenceFrameNum(0),
 	fReferenceOrder(0),
+	fReferenceSlot(0),
 	fCount(0),
 	fIndexInGop(0),
 	fIdrId(0),
@@ -363,8 +364,9 @@ VaapiEncoder::Open(const VideoEncoderParams& params, BString& error)
 	const VideoCodecInfo& info = video_codec_info(params.codec);
 	fCodec = info.avCodec;
 	fBitDepth = info.bitDepth;
-	if (fCodec != AV_CODEC_ID_H264 && fCodec != AV_CODEC_ID_HEVC) {
-		error.SetToFormat("VA-API encoding of %s is not implemented yet.",
+	if (fCodec != AV_CODEC_ID_H264 && fCodec != AV_CODEC_ID_HEVC
+		&& fCodec != AV_CODEC_ID_AV1) {
+		error.SetToFormat("VA-API encoding of %s is not implemented.",
 			info.name);
 		return B_NOT_SUPPORTED;
 	}
@@ -383,8 +385,14 @@ VaapiEncoder::Open(const VideoEncoderParams& params, BString& error)
 
 	// QP for the constant-quality mode, from the same scale as the
 	// software encoders' rate factor
-	fQP = quality_to_crf(params.quality, 16, 36);
-	fQPIntra = max_c(fQP - 1, 1);
+	if (fCodec == AV_CODEC_ID_AV1) {
+		// AV1's quantizer index, 0..255
+		fQP = quality_to_crf(params.quality, 60, 180);
+		fQPIntra = max_c(fQP - 8, 1);
+	} else {
+		fQP = quality_to_crf(params.quality, 16, 36);
+		fQPIntra = max_c(fQP - 1, 1);
+	}
 
 	const char* profileName = "";
 	switch (fProfile) {
@@ -403,12 +411,16 @@ VaapiEncoder::Open(const VideoEncoderParams& params, BString& error)
 		case VAProfileHEVCMain10:
 			profileName = "Main 10";
 			break;
+		case VAProfileAV1Profile0:
+			profileName = "Main";
+			break;
 		default:
 			break;
 	}
 	if (fRateControl == VA_RC_CQP) {
-		fDescription.SetToFormat("%s profile, constant QP %d", profileName,
-			fQP);
+		fDescription.SetToFormat(fCodec == AV_CODEC_ID_AV1
+			? "%s profile, constant quantizer index %d"
+			: "%s profile, constant QP %d", profileName, fQP);
 	} else {
 		fDescription.SetToFormat("%s profile, %s %" B_PRId32 " kbit/s",
 			profileName, fRateControl == VA_RC_CBR ? "CBR" : "VBR",
@@ -417,8 +429,10 @@ VaapiEncoder::Open(const VideoEncoderParams& params, BString& error)
 
 	if (fCodec == AV_CODEC_ID_H264)
 		_WriteH264Headers(fExtradata);
-	else
+	else if (fCodec == AV_CODEC_ID_HEVC)
 		_WriteHevcHeaders(fExtradata);
+	else
+		_WriteAv1SequenceHeader(fExtradata);
 	return _PrimeExtradata();
 }
 
@@ -517,7 +531,38 @@ VaapiEncoder::_PrimeExtradata()
 		fOutput.pop_front();
 	}
 
-	if (packet != NULL) {
+	if (packet != NULL && fCodec == AV_CODEC_ID_AV1) {
+		// keep the sequence header OBU
+		const uint8* data = packet->data;
+		size_t size = packet->size;
+		size_t offset = 0;
+		while (offset < size) {
+			uint8 header = data[offset];
+			int type = (header >> 3) & 0xf;
+			bool extension = (header >> 2) & 1;
+			bool hasSize = (header >> 1) & 1;
+			size_t at = offset + 1 + (extension ? 1 : 0);
+			uint64 payload = size - at;
+			if (hasSize) {
+				payload = 0;
+				for (int i = 0; i < 8 && at < size; i++) {
+					uint8 byte = data[at++];
+					payload |= (uint64)(byte & 0x7f) << (7 * i);
+					if ((byte & 0x80) == 0)
+						break;
+				}
+			}
+			size_t end = at + payload;
+			if (end > size)
+				break;
+			if (type == 1) {
+				fExtradata.assign(data + offset, data + end);
+				break;
+			}
+			offset = end;
+		}
+		av_packet_free(&packet);
+	} else if (packet != NULL) {
 		// keep the parameter sets of the picture, in Annex B
 		std::vector<uint8> sets;
 		const uint8* data = packet->data;
@@ -676,13 +721,13 @@ VaapiEncoder::_AddMisc(Picture& picture, VAEncMiscParameterType type,
 
 status_t
 VaapiEncoder::_AddPacked(Picture& picture, VAEncPackedHeaderType type,
-	const std::vector<uint8>& data, size_t bits)
+	const std::vector<uint8>& data, size_t bits, bool emulationBytes)
 {
 	VAEncPackedHeaderParameterBuffer parameters;
 	memset(&parameters, 0, sizeof(parameters));
 	parameters.type = type;
 	parameters.bit_length = (uint32)bits;
-	parameters.has_emulation_bytes = 1;
+	parameters.has_emulation_bytes = emulationBytes;
 	if (_AddBuffer(picture, VAEncPackedHeaderParameterBufferType, &parameters,
 			sizeof(parameters)) != B_OK)
 		return B_ERROR;
@@ -1555,17 +1600,358 @@ VaapiEncoder::_BuildHevc(Picture& picture)
 // #pragma mark - AV1
 
 
+struct Av1Level {
+	int		index;		// seq_level_idx
+	int64	maxPictureSize;
+	int		maxWidth;
+	int		maxHeight;
+	int64	maxDisplayRate;
+};
+
+
+static const Av1Level kAv1Levels[] = {
+	{ 0, 147456, 2048, 1152, 4423680 },
+	{ 1, 278784, 2816, 1584, 8363520 },
+	{ 4, 665856, 4352, 2448, 19975680 },
+	{ 5, 1065024, 5504, 3096, 31950720 },
+	{ 8, 2359296, 6144, 3456, 70778880 },
+	{ 9, 2359296, 6144, 3456, 141557760 },
+	{ 12, 8912896, 8192, 4352, 267386880 },
+	{ 13, 8912896, 8192, 4352, 534773760 },
+	{ 14, 8912896, 8192, 4352, 1069547520 },
+	{ 16, 35651584, 16384, 8704, 1069547520 },
+	{ 17, 35651584, 16384, 8704, 2139095040 },
+	{ 18, 35651584, 16384, 8704, 4278190080LL },
+};
+
+
+static int
+av1_level(int width, int height, double rate)
+{
+	int64 size = (int64)width * height;
+	for (size_t i = 0; i < sizeof(kAv1Levels) / sizeof(kAv1Levels[0]); i++) {
+		const Av1Level& level = kAv1Levels[i];
+		if (size <= level.maxPictureSize && width <= level.maxWidth
+			&& height <= level.maxHeight
+			&& size * rate <= level.maxDisplayRate)
+			return level.index;
+	}
+	return 31;
+}
+
+
+static int
+bits_for(uint32 value)
+{
+	int bits = 1;
+	while ((value >> bits) != 0)
+		bits++;
+	return bits;
+}
+
+
+// tile_log2() of the AV1 specification
+static int
+tile_log2(int blockSize, int target)
+{
+	int k = 0;
+	while ((blockSize << k) < target)
+		k++;
+	return k;
+}
+
+
+static size_t
+append_obu(std::vector<uint8>& out, int type, const BitWriter& payload)
+{
+	size_t start = out.size();
+	out.push_back((uint8)(type << 3 | 1 << 1));	// has_size_field
+	uint32 size = (uint32)payload.Data().size();
+	do {
+		uint8 byte = size & 0x7f;
+		size >>= 7;
+		out.push_back(byte | (size != 0 ? 0x80 : 0));
+	} while (size != 0);
+	out.insert(out.end(), payload.Data().begin(), payload.Data().end());
+	return (out.size() - start) * 8;
+}
+
+
+/*!	The tiles: one, unless the picture is wider than a tile may be (4096). */
+static void
+av1_tiles(int width, int height, int* columnsLog2, int* rowsLog2,
+	int* sbColumns, int* sbRows)
+{
+	*sbColumns = (width + 63) / 64;
+	*sbRows = (height + 63) / 64;
+	int maxTileWidthSb = 4096 / 64;
+	int maxTileAreaSb = 4096 * 2304 / (64 * 64);
+	int minLog2TileCols = tile_log2(maxTileWidthSb, *sbColumns);
+	int minLog2Tiles = max_c(minLog2TileCols,
+		tile_log2(maxTileAreaSb, *sbRows * *sbColumns));
+	*columnsLog2 = minLog2TileCols;
+	*rowsLog2 = max_c(minLog2Tiles - *columnsLog2, 0);
+}
+
+
 void
 VaapiEncoder::_WriteAv1SequenceHeader(std::vector<uint8>& out)
 {
+	double rate = fParams.frameRate.num > 0 && fParams.frameRate.den > 0
+		? av_q2d(fParams.frameRate) : 30.0;
+	int level = av1_level(fParams.width, fParams.height, rate);
+	int widthBits = bits_for(fParams.width - 1);
+	int heightBits = bits_for(fParams.height - 1);
+
+	BitWriter b;
+	b.Bits(0, 3);				// seq_profile: Main
+	b.Bit(false);				// still_picture
+	b.Bit(false);				// reduced_still_picture_header
+	b.Bit(false);				// timing_info_present_flag
+	b.Bit(false);				// initial_display_delay_present_flag
+	b.Bits(0, 5);				// operating_points_cnt_minus_1
+	b.Bits(0, 12);				// operating_point_idc[0]
+	b.Bits(level, 5);			// seq_level_idx[0]
+	if (level > 7)
+		b.Bit(false);			// seq_tier[0]
+	b.Bits(widthBits - 1, 4);
+	b.Bits(heightBits - 1, 4);
+	b.Bits(fParams.width - 1, widthBits);
+	b.Bits(fParams.height - 1, heightBits);
+	b.Bit(false);				// frame_id_numbers_present_flag
+	b.Bit(false);				// use_128x128_superblock
+	b.Bit(false);				// enable_filter_intra
+	b.Bit(false);				// enable_intra_edge_filter
+	b.Bit(false);				// enable_interintra_compound
+	b.Bit(false);				// enable_masked_compound
+	b.Bit(false);				// enable_warped_motion
+	b.Bit(false);				// enable_dual_filter
+	b.Bit(true);				// enable_order_hint
+	b.Bit(false);				// enable_jnt_comp
+	b.Bit(false);				// enable_ref_frame_mvs
+	b.Bit(false);				// seq_choose_screen_content_tools
+	b.Bit(false);				// seq_force_screen_content_tools
+	b.Bits(7, 3);				// order_hint_bits_minus_1
+	b.Bit(false);				// enable_superres
+	b.Bit(false);				// enable_cdef
+	b.Bit(false);				// enable_restoration
+	// color_config()
+	b.Bit(fBitDepth > 8);		// high_bitdepth
+	b.Bit(false);				// mono_chrome
+	bool colour = fParams.primaries != AVCOL_PRI_UNSPECIFIED
+		|| fParams.transfer != AVCOL_TRC_UNSPECIFIED
+		|| fParams.matrix != AVCOL_SPC_UNSPECIFIED;
+	b.Bit(colour);
+	if (colour) {
+		b.Bits(fParams.primaries, 8);
+		b.Bits(fParams.transfer, 8);
+		b.Bits(fParams.matrix, 8);
+	}
+	b.Bit(fParams.range == AVCOL_RANGE_JPEG);	// color_range
+	// 4:2:0: chroma_sample_position
+	int position = fParams.chromaLocation == AVCHROMA_LOC_LEFT ? 1
+		: fParams.chromaLocation == AVCHROMA_LOC_TOPLEFT ? 2 : 0;
+	b.Bits(position, 2);
+	b.Bit(false);				// separate_uv_delta_q
+	b.Bit(false);				// film_grain_params_present
+	b.TrailingBits();
+
 	out.clear();
+	append_obu(out, 1, b);		// OBU_SEQUENCE_HEADER
 }
 
 
 status_t
 VaapiEncoder::_BuildAv1(Picture& picture)
 {
-	return B_NOT_SUPPORTED;
+	int qindex = picture.idr ? fQPIntra : fQP;
+	int slot = picture.idr ? 0 : !fReferenceSlot;
+	picture.slot = slot;
+	int columnsLog2, rowsLog2, sbColumns, sbRows;
+	av1_tiles(fParams.width, fParams.height, &columnsLog2, &rowsLog2,
+		&sbColumns, &sbRows);
+	int tileColumns = 1 << columnsLog2;
+	int tileRows = 1 << rowsLog2;
+	// a loop filter strength that grows with the quantizer, as encoders'
+	// searches end up choosing
+	int filterLevel = min_c(63, max_c(0, (qindex - 20) / 6));
+
+	if (picture.idr) {
+		VAEncSequenceParameterBufferAV1 sequence;
+		memset(&sequence, 0, sizeof(sequence));
+		double rate = fParams.frameRate.num > 0 && fParams.frameRate.den > 0
+			? av_q2d(fParams.frameRate) : 30.0;
+		sequence.seq_profile = 0;
+		sequence.seq_level_idx = av1_level(fParams.width, fParams.height,
+			rate);
+		sequence.intra_period = fParams.keyInterval;
+		sequence.ip_period = 1;
+		sequence.bits_per_second = fRateControl == VA_RC_CQP ? 0
+			: (uint32)fParams.bitrate * 1000;
+		sequence.order_hint_bits_minus_1 = 7;
+		sequence.seq_fields.bits.enable_order_hint = 1;
+		sequence.seq_fields.bits.bit_depth_minus8 = fBitDepth - 8;
+		sequence.seq_fields.bits.subsampling_x = 1;
+		sequence.seq_fields.bits.subsampling_y = 1;
+		if (_AddBuffer(picture, VAEncSequenceParameterBufferType, &sequence,
+				sizeof(sequence)) != B_OK)
+			return B_ERROR;
+		if (_AddRateControl(picture) != B_OK)
+			return B_ERROR;
+	}
+
+	VAEncPictureParameterBufferAV1 parameters;
+	memset(&parameters, 0, sizeof(parameters));
+	parameters.frame_width_minus_1 = fParams.width - 1;
+	parameters.frame_height_minus_1 = fParams.height - 1;
+	parameters.reconstructed_frame = picture.recon;
+	parameters.coded_buf = picture.coded;
+	for (int i = 0; i < 8; i++)
+		parameters.reference_frames[i] = VA_INVALID_SURFACE;
+	for (int i = 0; i < 7; i++)
+		parameters.ref_frame_idx[i] = picture.idr ? 0 : fReferenceSlot;
+	if (!picture.idr) {
+		parameters.reference_frames[fReferenceSlot] = fReference;
+		parameters.ref_frame_ctrl_l0.fields.search_idx0 = 1;	// LAST_FRAME
+	}
+	parameters.primary_ref_frame = picture.idr ? 7 : 0;	// 7: none
+	parameters.order_hint = (uint8)picture.order;
+	parameters.refresh_frame_flags = picture.idr ? 0xff : 1 << slot;
+	parameters.picture_flags.bits.frame_type = picture.idr ? 0 : 1;
+	parameters.picture_flags.bits.error_resilient_mode = picture.idr;
+	parameters.filter_level[0] = filterLevel;
+	parameters.filter_level[1] = filterLevel;
+	parameters.filter_level_u = filterLevel / 2;
+	parameters.filter_level_v = filterLevel / 2;
+	parameters.superres_scale_denominator = 8;
+	parameters.base_qindex = qindex;
+	parameters.min_base_qindex = 1;
+	parameters.max_base_qindex = 255;
+	parameters.mode_control_flags.bits.tx_mode = 2;	// TX_MODE_SELECT
+	parameters.tile_cols = tileColumns;
+	parameters.tile_rows = tileRows;
+	for (int i = 0; i < tileColumns; i++) {
+		parameters.width_in_sbs_minus_1[i] = (i + 1) * sbColumns / tileColumns
+			- i * sbColumns / tileColumns - 1;
+	}
+	for (int i = 0; i < tileRows; i++) {
+		parameters.height_in_sbs_minus_1[i] = (i + 1) * sbRows / tileRows
+			- i * sbRows / tileRows - 1;
+	}
+	parameters.tile_group_obu_hdr_info.bits.obu_has_size_field = 1;
+	static const int8_t kRefDeltas[8] = { 1, 0, 0, 0, -1, 0, -1, -1 };
+	memcpy(parameters.ref_deltas, kRefDeltas, sizeof(kRefDeltas));
+	if (_AddBuffer(picture, VAEncPictureParameterBufferType, &parameters,
+			sizeof(parameters)) != B_OK)
+		return B_ERROR;
+
+	if (picture.idr && (fPackedHeaders & VA_ENC_PACKED_HEADER_SEQUENCE) != 0) {
+		std::vector<uint8> header;
+		_WriteAv1SequenceHeader(header);
+		if (_AddPacked(picture, VAEncPackedHeaderSequence, header,
+				header.size() * 8, false) != B_OK)
+			return B_ERROR;
+	}
+
+	if ((fPackedHeaders & VA_ENC_PACKED_HEADER_PICTURE) != 0) {
+		// uncompressed_header() for a shown key frame or inter frame
+		BitWriter b;
+		b.Bit(false);				// show_existing_frame
+		b.Bits(picture.idr ? 0 : 1, 2);	// frame_type
+		b.Bit(true);				// show_frame
+		if (!picture.idr)
+			b.Bit(false);			// error_resilient_mode
+		b.Bit(false);				// disable_cdf_update
+		b.Bit(false);				// frame_size_override_flag
+		b.Bits(picture.order & 0xff, 8);	// order_hint
+		if (!picture.idr) {
+			b.Bits(0, 3);			// primary_ref_frame: LAST
+			b.Bits(1 << slot, 8);	// refresh_frame_flags
+			b.Bit(false);			// frame_refs_short_signaling
+			for (int i = 0; i < 7; i++)
+				b.Bits(fReferenceSlot, 3);	// ref_frame_idx[i]
+			// frame_size() takes the sequence's; render_size():
+			b.Bit(true);			// render_and_frame_size_different
+			b.Bits(fParams.width - 1, 16);
+			b.Bits(fParams.height - 1, 16);
+			b.Bit(false);			// allow_high_precision_mv
+			b.Bit(false);			// is_filter_switchable
+			b.Bits(0, 2);			// interpolation_filter: EIGHTTAP
+			b.Bit(false);			// is_motion_mode_switchable
+		} else {
+			// VCN 4 codes 1080 lines as 1082 (and its own sequence header
+			// says so): the picture's real size is the render size, which
+			// Mesa takes from here
+			b.Bit(true);			// render_and_frame_size_different
+			b.Bits(fParams.width - 1, 16);
+			b.Bits(fParams.height - 1, 16);
+		}
+		b.Bit(false);				// disable_frame_end_update_cdf
+		// tile_info()
+		b.Bit(true);				// uniform_tile_spacing_flag
+		int maxLog2TileCols = tile_log2(1, min_c(sbColumns, 64));
+		int maxLog2TileRows = tile_log2(1, min_c(sbRows, 64));
+		int minLog2TileCols = tile_log2(64, sbColumns);
+		for (int i = minLog2TileCols; i < maxLog2TileCols; i++) {
+			bool more = i < columnsLog2;
+			b.Bit(more);			// increment_tile_cols_log2
+			if (!more)
+				break;
+		}
+		int minLog2TileRows = max_c(tile_log2(2304, sbRows * sbColumns)
+			- columnsLog2, 0);
+		for (int i = minLog2TileRows; i < maxLog2TileRows; i++) {
+			bool more = i < rowsLog2;
+			b.Bit(more);			// increment_tile_rows_log2
+			if (!more)
+				break;
+		}
+		if (columnsLog2 + rowsLog2 > 0) {
+			b.Bits(0, columnsLog2 + rowsLog2);	// context_update_tile_id
+			b.Bits(3, 2);			// tile_size_bytes_minus_1
+		}
+		// quantization_params()
+		b.Bits(qindex, 8);			// base_q_idx
+		b.Bit(false);				// DeltaQYDc delta_coded
+		b.Bit(false);				// DeltaQUDc
+		b.Bit(false);				// DeltaQUAc
+		b.Bit(false);				// using_qmatrix
+		b.Bit(false);				// segmentation_enabled
+		if (qindex > 0)
+			b.Bit(false);			// delta_q_present
+		// loop_filter_params()
+		b.Bits(filterLevel, 6);
+		b.Bits(filterLevel, 6);
+		if (filterLevel != 0) {
+			b.Bits(filterLevel / 2, 6);
+			b.Bits(filterLevel / 2, 6);
+		}
+		b.Bits(0, 3);				// loop_filter_sharpness
+		b.Bit(false);				// loop_filter_delta_enabled
+		// read_tx_mode()
+		b.Bit(true);				// tx_mode_select
+		if (!picture.idr)
+			b.Bit(false);			// reference_select
+		b.Bit(false);				// reduced_tx_set
+		if (!picture.idr) {
+			for (int i = 0; i < 7; i++)
+				b.Bit(false);		// is_global
+		}
+		b.TrailingBits();
+
+		std::vector<uint8> header;
+		size_t bits = append_obu(header, 3, b);	// OBU_FRAME_HEADER
+		if (_AddPacked(picture, VAEncPackedHeaderPicture, header, bits,
+				false) != B_OK)
+			return B_ERROR;
+	}
+
+	VAEncTileGroupBufferAV1 tiles;
+	memset(&tiles, 0, sizeof(tiles));
+	tiles.tg_start = 0;
+	tiles.tg_end = tileColumns * tileRows - 1;
+	return _AddBuffer(picture, VAEncSliceParameterBufferType, &tiles,
+		sizeof(tiles));
 }
 
 
@@ -1701,6 +2087,7 @@ VaapiEncoder::SendFrame(const AVFrame* frame)
 	picture.frameNum = (uint32)(picture.index & 0xff);
 	picture.order = (int32)(picture.index * (fCodec == AV_CODEC_ID_H264
 		? 2 : 1));
+	picture.slot = 0;
 
 	bigtime_t uploadStart = system_time();
 	status_t uploaded = _Upload(frame, picture.input);
@@ -1728,6 +2115,7 @@ VaapiEncoder::SendFrame(const AVFrame* frame)
 	fReference = picture.recon;
 	fReferenceFrameNum = picture.frameNum;
 	fReferenceOrder = picture.order;
+	fReferenceSlot = picture.slot;
 	fCount++;
 	fIndexInGop++;
 
