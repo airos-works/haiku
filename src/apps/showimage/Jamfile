@@ -2,7 +2,7 @@ SubDir HAIKU_TOP src apps showimage ;
 
 UseLibraryHeaders icon ;
 UsePrivateSystemHeaders ;
-UsePrivateHeaders tracker shared ;
+UsePrivateHeaders app interface tracker shared ;
 UsePublicHeaders [ FDirName be_apps Tracker ] ;
 SubDirHdrs $(HAIKU_TOP) src kits tracker ;
 UseHeaders [ FDirName $(HAIKU_TOP) src kits tracker ] : false ;
