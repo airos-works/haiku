@@ -5,7 +5,7 @@ B_TRANSLATE_MARK_ALL("Applications",
 	"B_USER_DESKBAR_DIRECTORY/Applications", "");
 
 B_TRANSLATE_MARK_ALL("Utilities",
-	"B_USER_DESKBAR_DIRECTORY/Applications/Utilities", "");
+	"B_USER_DESKBAR_DIRECTORY/Utilities", "");
 
 B_TRANSLATE_MARK_ALL("Demos",
 	"B_USER_DESKBAR_DIRECTORY/Demos", "");

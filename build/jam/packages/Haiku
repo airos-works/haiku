@@ -537,13 +537,13 @@ for linkTarget in $(DESKBAR_APPLICATIONS) {
 		: ../../../../apps/$(linkTarget) : $(linkTarget) ;
 }
 
-# Its "Utilities" folder
+# "Utilities" links
 if $(DESKBAR_UTILITIES) {
-	AddDirectoryToPackage data deskbar menu Applications Utilities
+	AddDirectoryToPackage data deskbar menu Utilities
 		: deskbar-utilities.rdef ;
 	for linkTarget in $(DESKBAR_UTILITIES) {
-		AddSymlinkToPackage data deskbar menu Applications Utilities
-			: ../../../../../apps/$(linkTarget) : $(linkTarget) ;
+		AddSymlinkToPackage data deskbar menu Utilities
+			: ../../../../apps/$(linkTarget) : $(linkTarget) ;
 	}
 }
 

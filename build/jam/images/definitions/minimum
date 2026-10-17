@@ -160,7 +160,7 @@ DESKBAR_APPLICATIONS =
 	Terminal
 ;
 
-# The "Utilities" folder of the Deskbar's Applications menu
+# The Deskbar menu's "Utilities" folder, after Applications
 DESKBAR_UTILITIES = [ FFilterByBuildFeatures
 	CharacterMap
 	Debugger@libedit

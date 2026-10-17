@@ -146,8 +146,45 @@ TDeskbarMenu::DoneBuildingItemList()
 			= new BMenuItem(B_TRANSLATE("<Deskbar folder is empty>"), 0);
 		item->SetEnabled(false);
 		AddItem(item);
-	} else
+	} else {
+		// BNavMenu appends the folder's entries, sorted by name
+		int32 firstIndex = CountItems();
 		BNavMenu::DoneBuildingItemList();
+		_OrderStandardFolders(firstIndex);
+	}
+}
+
+
+void
+TDeskbarMenu::_OrderStandardFolders(int32 firstIndex)
+{
+	// The standard folders come first, in this order, by their entry names
+	// (the labels are localized); any other entry follows them as sorted.
+	static const char* const kStandardFolders[] = {
+		"Applications",
+		"Utilities",
+		"Demos",
+		"Desktop applets",
+		"Preferences"
+	};
+
+	int32 insertIndex = firstIndex;
+	for (size_t i = 0; i < B_COUNT_OF(kStandardFolders); i++) {
+		for (int32 index = insertIndex; index < CountItems(); index++) {
+			ModelMenuItem* item = dynamic_cast<ModelMenuItem*>(ItemAt(index));
+			if (item == NULL
+				|| strcmp(item->TargetModel()->Name(), kStandardFolders[i]) != 0) {
+				continue;
+			}
+
+			if (index != insertIndex) {
+				RemoveItem(item);
+				AddItem(item, insertIndex);
+			}
+			insertIndex++;
+			break;
+		}
+	}
 }
 
 
