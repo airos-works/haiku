@@ -46,6 +46,10 @@ EncoderDecision decide_encoder(const OutputSettings& settings,
 	const SourceInfo* info);
 
 
+/*!	What to make. Films and songs are set up apart - a song has no
+	pictures to encode, and its presets are MP3, AAC and FLAC at a few
+	rates - and each keeps its own settings: the view shows the ones for
+	the kind of source selected. */
 class OutputView : public BView {
 public:
 								OutputView();
@@ -53,10 +57,19 @@ public:
 	virtual	void				AttachedToWindow();
 	virtual	void				MessageReceived(BMessage* message);
 
+			// the settings of the kind the view shows now
 			void				SetSettings(const OutputSettings& settings,
 									const char* presetName);
 			OutputSettings		Settings() const;
 			BString				PresetName() const { return fPresetName; }
+
+			// the settings for songs (sound) or for films
+			void				SetSettingsFor(bool sound,
+									const OutputSettings& settings,
+									const char* presetName);
+			OutputSettings		SettingsFor(bool sound) const;
+			BString				PresetNameFor(bool sound) const;
+			bool				SoundMode() const { return fSoundMode; }
 
 			void				SetSource(const SourceInfo* info);
 			void				SetEnabled(bool enabled);
@@ -70,6 +83,9 @@ public:
 			void				UpdateHardwareStatus();
 
 private:
+			void				_SetSoundMode(bool sound);
+			void				_ReadSoundControls();
+			void				_UpdateSoundSummary();
 			void				_BuildPresetMenu();
 			void				_BuildVideoMenu(container_kind container);
 			void				_BuildAudioMenu(container_kind container);
@@ -80,6 +96,18 @@ private:
 
 			BMenuField*			fPreset;
 			BTabView*			fTabs;
+			BTabView*			fSoundTabs;
+
+			// a song's Summary and Range
+			BMenuField*			fSoundFormat;
+			BMenuField*			fSoundCodec;
+			BMenuField*			fSoundBitrate;
+			BMenuField*			fSoundChannels;
+			BMenuField*			fSoundRate;
+			BCheckBox*			fSoundTags;
+			BCheckBox*			fSoundCopy;
+			BTextControl*		fSoundStart;
+			BTextControl*		fSoundEnd;
 
 			BMenuField*			fContainer;
 			BMenuField*			fVideo;
@@ -123,6 +151,9 @@ private:
 
 			OutputSettings		fSettings;
 			BString				fPresetName;
+			bool				fSoundMode;
+			OutputSettings		fOtherSettings;		// of the kind not shown
+			BString				fOtherPreset;
 			BString				fFolder;
 			SourceInfo			fSource;
 			bool				fHaveSource;

@@ -41,8 +41,8 @@ private:
 			void				_StartPreview(QueueItem* item);
 
 			void				_Convert();
-			void				_StartConverting(
-									const OutputSettings& settings);
+			void				_StartConverting();
+			const OutputSettings& _RunSettingsFor(QueueItem* item) const;
 			bool				_StartNext();
 			void				_JobFinished(BMessage* message);
 			BString				_DestinationFor(QueueItem* item,
@@ -74,7 +74,8 @@ private:
 			bool				fConverting;
 			bool				fStopping;
 			bool				fWarnCpu;
-			OutputSettings		fRunSettings;
+			// what the conversion started with: for films and for songs
+			OutputSettings		fRunSettings[2];
 			Transcoder*			fTranscoder;
 			thread_id			fThread;
 			int32				fCurrentID;

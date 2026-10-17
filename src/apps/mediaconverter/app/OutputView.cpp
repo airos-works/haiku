@@ -24,9 +24,13 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+#include <algorithm>
 
 #include "HardwareCaps.h"
 #include "LavcVideoEncoder.h"
+#include "MediaProbe.h"
 #include "Messages.h"
 #include "Presets.h"
 #include "SoftwareEncoders.h"
@@ -340,6 +344,7 @@ parse_time(const char* text)
 OutputView::OutputView()
 	:
 	BView("output", B_WILL_DRAW),
+	fSoundMode(false),
 	fHaveSource(false),
 	fUpdating(false)
 {
@@ -478,6 +483,48 @@ OutputView::OutputView()
 	BStringView* rangeHint = new BStringView("range hint",
 		B_TRANSLATE("Hours:minutes:seconds; empty for the start and the end."));
 
+	// A song's summary: the format, the sound and where it goes
+	fSoundFormat = make_field("sound format", B_TRANSLATE("Format:"));
+	for (int i = 0; i < kContainerCount; i++) {
+		const ContainerInfo& info = container_info((container_kind)i);
+		if (info.video)
+			continue;
+		const char* name = info.name;
+		if (strncmp(name, "Audio: ", 7) == 0)
+			name += 7;
+		add_item(fSoundFormat, name, i);
+	}
+	fSoundCodec = make_field("sound codec", B_TRANSLATE("Sound:"));
+	fSoundBitrate = make_field("sound bitrate", B_TRANSLATE("Bit rate:"));
+	static const int kSoundBitrates[] = { 64, 96, 128, 160, 192, 224, 256,
+		320 };
+	for (size_t i = 0; i < sizeof(kSoundBitrates) / sizeof(kSoundBitrates[0]);
+			i++) {
+		BString label;
+		label.SetToFormat(B_TRANSLATE("%d kbit/s"), kSoundBitrates[i]);
+		add_item(fSoundBitrate, label.String(), kSoundBitrates[i]);
+	}
+	fSoundChannels = make_field("sound channels", B_TRANSLATE("Channels:"));
+	for (int i = 0; i < kMixdownCount; i++)
+		add_item(fSoundChannels, mixdown_name((audio_mixdown)i), i);
+	fSoundRate = make_field("sound rate", B_TRANSLATE("Sample rate:"));
+	add_item(fSoundRate, B_TRANSLATE("Same as the source"), 0);
+	add_item(fSoundRate, "44.1 kHz", 44100);
+	add_item(fSoundRate, "48 kHz", 48000);
+	add_item(fSoundRate, "96 kHz", 96000);
+	fSoundTags = new BCheckBox("sound tags",
+		B_TRANSLATE("Keep the tags, the album artwork and the chapters"),
+		new BMessage(kMsgSettingsChanged));
+	fSoundCopy = new BCheckBox("sound copy",
+		B_TRANSLATE("Copy the sound when it is already in this format"),
+		new BMessage(kMsgSettingsChanged));
+	fSoundStart = new BTextControl("sound start", B_TRANSLATE("From:"), "",
+		new BMessage(kMsgSettingsChanged));
+	fSoundEnd = new BTextControl("sound end", B_TRANSLATE("To:"), "",
+		new BMessage(kMsgSettingsChanged));
+	BStringView* soundRangeHint = new BStringView("sound range hint",
+		B_TRANSLATE("Hours:minutes:seconds; empty for the start and the end."));
+
 	fBadge = new EncoderBadge();
 	fFolderView = new BStringView("folder", "");
 	fFolderView->SetExplicitMinSize(BSize(50, B_SIZE_UNSET));
@@ -573,12 +620,44 @@ OutputView::OutputView()
 	fTabs->SetBorder(B_NO_BORDER);
 	fTabs->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, B_SIZE_UNLIMITED));
 
+	// for a song: no Video or Filters, and its sound on the summary
+	BView* soundSummary = new BView(B_TRANSLATE("Summary"), 0);
+	BLayoutBuilder::Grid<>(soundSummary, B_USE_DEFAULT_SPACING,
+			B_USE_SMALL_SPACING)
+		.SetInsets(B_USE_DEFAULT_SPACING)
+		.AddMenuField(fSoundFormat, 0, 0)
+		.AddMenuField(fSoundCodec, 0, 1)
+		.AddMenuField(fSoundBitrate, 0, 2)
+		.AddMenuField(fSoundChannels, 0, 3)
+		.AddMenuField(fSoundRate, 0, 4)
+		.Add(fSoundTags, 1, 5)
+		.Add(fSoundCopy, 1, 6)
+		.AddGlue(2, 0)
+		.AddGlue(0, 7, 3);
+	BView* soundRange = new BView(B_TRANSLATE("Range"), 0);
+	BLayoutBuilder::Group<>(soundRange, B_VERTICAL, B_USE_SMALL_SPACING)
+		.SetInsets(B_USE_DEFAULT_SPACING)
+		.AddGrid(B_USE_DEFAULT_SPACING, B_USE_SMALL_SPACING)
+			.AddTextControl(fSoundStart, 0, 0)
+			.AddTextControl(fSoundEnd, 0, 1)
+			.AddGlue(2, 0)
+		.End()
+		.Add(soundRangeHint)
+		.AddGlue();
+	fSoundTabs = new BTabView("sound tabs", B_WIDTH_FROM_LABEL);
+	fSoundTabs->AddTab(soundSummary);
+	fSoundTabs->AddTab(soundRange);
+	fSoundTabs->SetBorder(B_NO_BORDER);
+	fSoundTabs->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, B_SIZE_UNLIMITED));
+	fSoundTabs->Hide();
+
 	BLayoutBuilder::Group<>(this, B_VERTICAL, B_USE_SMALL_SPACING)
 		.AddGrid(B_USE_DEFAULT_SPACING, 0)
 			.AddMenuField(fPreset, 0, 0)
 			.AddGlue(2, 0)
 		.End()
 		.Add(fTabs, 1)
+		.Add(fSoundTabs, 1)
 		.Add(fBadge)
 		.AddGroup(B_HORIZONTAL, B_USE_SMALL_SPACING)
 			.Add(new BStringView("save to", B_TRANSLATE("Save to:")))
@@ -597,12 +676,14 @@ OutputView::AttachedToWindow()
 	BView::AttachedToWindow();
 	BView* controls[] = { fPreset, fContainer, fVideo, fSize, fAudio,
 		fAudioBitrate, fSubtitles, fEncoder, fSpeed, fFrameRate, fDeinterlace,
-		fDenoise, fSharpen, fRotate, fMixdown, fSampleRate, fTracks };
+		fDenoise, fSharpen, fRotate, fMixdown, fSampleRate, fTracks,
+		fSoundFormat, fSoundCodec, fSoundBitrate, fSoundChannels, fSoundRate };
 	for (size_t i = 0; i < sizeof(controls) / sizeof(controls[0]); i++)
 		((BMenuField*)controls[i])->Menu()->SetTargetForItems(this);
 	BControl* others[] = { fQuality, fConstantQuality, fAverageBitrate,
 		fBitrate, fConstantRate, fGrayscale, fAutoCrop, fFlip, fPassthrough,
-		fChapters, fMetadata, fStart, fEnd };
+		fChapters, fMetadata, fStart, fEnd, fSoundTags, fSoundCopy,
+		fSoundStart, fSoundEnd };
 	for (size_t i = 0; i < sizeof(others) / sizeof(others[0]); i++)
 		others[i]->SetTarget(this);
 	fFolderButton->SetTarget(Window());
@@ -610,23 +691,41 @@ OutputView::AttachedToWindow()
 }
 
 
+/*!	A song sees the presets for songs, by format; a film sees its own and
+	then those for songs, as "Sound only". */
 void
 OutputView::_BuildPresetMenu()
 {
 	BMenu* menu = fPreset->Menu();
 	menu->RemoveItems(0, menu->CountItems(), true);
 	add_item(fPreset, B_TRANSLATE("Custom"), -1, true, kMsgPresetChosen);
-	const char* category = NULL;
-	for (int32 i = 0; i < Presets::Count(); i++) {
-		const Preset& preset = Presets::At(i);
-		if (category == NULL || strcmp(category, preset.category) != 0) {
-			menu->AddSeparatorItem();
+	for (int pass = 0; pass < 2; pass++) {
+		bool sound = pass == 1;
+		if (fSoundMode && !sound)
+			continue;
+		const char* category = NULL;
+		for (int32 i = 0; i < Presets::Count(); i++) {
+			const Preset& preset = Presets::At(i);
+			if (preset.sound != sound)
+				continue;
+			bool newGroup = category == NULL
+				|| (fSoundMode && strcmp(category, preset.category) != 0)
+				|| (!sound && strcmp(category, preset.category) != 0);
+			if (newGroup)
+				menu->AddSeparatorItem();
 			category = preset.category;
+			BString label;
+			if (fSoundMode)
+				label = preset.name;
+			else if (sound)
+				label.SetToFormat(B_TRANSLATE("Sound only: %s"), preset.name);
+			else
+				label.SetToFormat("%s: %s", preset.category, preset.name);
+			add_item(fPreset, label.String(), i, true, kMsgPresetChosen);
 		}
-		BString label;
-		label.SetToFormat("%s: %s", preset.category, preset.name);
-		add_item(fPreset, label.String(), i, true, kMsgPresetChosen);
 	}
+	if (Window() != NULL)
+		menu->SetTargetForItems(this);
 }
 
 
@@ -659,22 +758,32 @@ OutputView::_BuildVideoMenu(container_kind container)
 }
 
 
-void
-OutputView::_BuildAudioMenu(container_kind container)
+static void
+fill_audio_menu(BMenuField* field, container_kind container)
 {
-	BMenu* menu = fAudio->Menu();
+	BMenu* menu = field->Menu();
 	menu->RemoveItems(0, menu->CountItems(), true);
 	for (int i = 0; i < kAudioCopy; i++) {
 		audio_codec codec = (audio_codec)i;
 		if (container_holds_audio(container, codec))
-			add_item(fAudio, audio_codec_info(codec).name, i);
+			add_item(field, audio_codec_info(codec).name, i);
 	}
 	menu->AddSeparatorItem();
-	add_item(fAudio, audio_codec_info(kAudioCopy).name, kAudioCopy);
+	add_item(field, audio_codec_info(kAudioCopy).name, kAudioCopy);
 	if (container_info(container).video)
-		add_item(fAudio, audio_codec_info(kAudioNone).name, kAudioNone);
-	if (Window() != NULL)
-		menu->SetTargetForItems(this);
+		add_item(field, audio_codec_info(kAudioNone).name, kAudioNone);
+}
+
+
+void
+OutputView::_BuildAudioMenu(container_kind container)
+{
+	fill_audio_menu(fAudio, container);
+	fill_audio_menu(fSoundCodec, container);
+	if (Window() != NULL) {
+		fAudio->Menu()->SetTargetForItems(this);
+		fSoundCodec->Menu()->SetTargetForItems(this);
+	}
 }
 
 
@@ -731,6 +840,15 @@ OutputView::SetSettings(const OutputSettings& settings,
 	select_value(fVideo, fSettings.videoCodec);
 	_BuildAudioMenu(fSettings.container);
 	select_value(fAudio, fSettings.audioCodec);
+	select_value(fSoundFormat, fSettings.container);
+	select_value(fSoundCodec, fSettings.audioCodec);
+	select_value(fSoundBitrate, fSettings.audioBitrate);
+	select_value(fSoundChannels, fSettings.mixdown);
+	select_value(fSoundRate, fSettings.sampleRate);
+	fSoundTags->SetValue(fSettings.copyMetadata);
+	fSoundCopy->SetValue(fSettings.passthroughWhenPossible);
+	fSoundStart->SetText(format_time(fSettings.start).String());
+	fSoundEnd->SetText(format_time(fSettings.end).String());
 	select_value(fSize, fSettings.maxHeight);
 	fQuality->SetValue(fSettings.quality);
 	select_value(fAudioBitrate, fSettings.audioBitrate);
@@ -790,11 +908,64 @@ OutputView::Settings() const
 
 
 void
+OutputView::SetSettingsFor(bool sound, const OutputSettings& settings,
+	const char* presetName)
+{
+	if (sound == fSoundMode) {
+		SetSettings(settings, presetName);
+		return;
+	}
+	fOtherSettings = settings;
+	fOtherSettings.Validate();
+	fOtherPreset = presetName != NULL ? presetName : "";
+}
+
+
+OutputSettings
+OutputView::SettingsFor(bool sound) const
+{
+	return sound == fSoundMode ? fSettings : fOtherSettings;
+}
+
+
+BString
+OutputView::PresetNameFor(bool sound) const
+{
+	return sound == fSoundMode ? fPresetName : fOtherPreset;
+}
+
+
+/*!	Shows the other kind's settings and keeps the ones shown so far. */
+void
+OutputView::_SetSoundMode(bool sound)
+{
+	if (sound == fSoundMode)
+		return;
+	OutputSettings settings = fOtherSettings;
+	BString preset = fOtherPreset;
+	fOtherSettings = fSettings;
+	fOtherPreset = fPresetName;
+	fSoundMode = sound;
+	_BuildPresetMenu();
+	if (sound) {
+		fTabs->Hide();
+		fSoundTabs->Show();
+	} else {
+		fSoundTabs->Hide();
+		fTabs->Show();
+	}
+	SetSettings(settings, preset.IsEmpty() ? NULL : preset.String());
+}
+
+
+void
 OutputView::SetSource(const SourceInfo* info)
 {
 	fHaveSource = info != NULL;
-	if (info != NULL)
+	if (info != NULL) {
 		fSource = *info;
+		_SetSoundMode(info->IsSoundOnly());
+	}
 	_BuildEncoderMenu(fSettings.videoCodec);
 	if (fSettings.encoderPreference == kPreferSoftware)
 		select_value(fEncoder, -1);
@@ -816,12 +987,14 @@ OutputView::SetEnabled(bool enabled)
 {
 	BMenuField* fields[] = { fPreset, fContainer, fVideo, fSize, fAudio,
 		fAudioBitrate, fSubtitles, fEncoder, fSpeed, fFrameRate, fDeinterlace,
-		fDenoise, fSharpen, fRotate, fMixdown, fSampleRate, fTracks };
+		fDenoise, fSharpen, fRotate, fMixdown, fSampleRate, fTracks,
+		fSoundFormat, fSoundCodec, fSoundBitrate, fSoundChannels, fSoundRate };
 	for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++)
 		fields[i]->SetEnabled(enabled);
 	BControl* others[] = { fQuality, fConstantQuality, fAverageBitrate,
 		fBitrate, fConstantRate, fGrayscale, fAutoCrop, fFlip, fPassthrough,
-		fChapters, fMetadata, fStart, fEnd, fFolderButton, fNextToSource };
+		fChapters, fMetadata, fStart, fEnd, fSoundTags, fSoundCopy,
+		fSoundStart, fSoundEnd, fFolderButton, fNextToSource };
 	for (size_t i = 0; i < sizeof(others) / sizeof(others[0]); i++)
 		others[i]->SetEnabled(enabled);
 	if (enabled)
@@ -877,6 +1050,11 @@ OutputView::_UpdateEnabling()
 		&& fSettings.audioCodec != kAudioCopy;
 	fAudioBitrate->SetEnabled(audio
 		&& !audio_codec_info(fSettings.audioCodec).lossless);
+	fSoundBitrate->SetEnabled(audio
+		&& !audio_codec_info(fSettings.audioCodec).lossless);
+	fSoundChannels->SetEnabled(audio);
+	fSoundRate->SetEnabled(audio);
+	fSoundCopy->SetEnabled(audio);
 	fMixdown->SetEnabled(audio);
 	fSampleRate->SetEnabled(audio);
 	fPassthrough->SetEnabled(audio);
@@ -946,10 +1124,127 @@ OutputView::_UpdateQualityLabel()
 void
 OutputView::UpdateHardwareStatus()
 {
+	if (fSoundMode) {
+		_UpdateSoundSummary();
+		return;
+	}
 	EncoderDecision decision = decide_encoder(fSettings,
 		fHaveSource ? &fSource : NULL);
 	fBadge->Set(decision);
 	_UpdateQualityLabel();
+}
+
+
+/*!	What a song becomes, and about how big it will be. */
+void
+OutputView::_UpdateSoundSummary()
+{
+	EncoderDecision decision;
+	decision.kind = kBadgeNeutral;
+	decision.cpuFallback = false;
+	decision.impossible = false;
+
+	const AudioTrackInfo* source = fHaveSource && !fSource.audio.empty()
+		? &fSource.audio[0] : NULL;
+	audio_codec codec = fSettings.audioCodec;
+	const AudioCodecInfo& info = audio_codec_info(codec);
+	BString what;
+	if (codec == kAudioCopy) {
+		what = B_TRANSLATE("The sound is copied as it is");
+	} else {
+		what = info.name;
+		if (!info.lossless) {
+			BString rate;
+			rate.SetToFormat(B_TRANSLATE(", %d kbit/s"),
+				(int)fSettings.audioBitrate);
+			what << rate;
+		}
+		int channels = source != NULL ? source->channels : 2;
+		switch (fSettings.mixdown) {
+			case kMixdownMono: channels = 1; break;
+			case kMixdownStereo: channels = 2; break;
+			case kMixdown51: channels = 6; break;
+			case kMixdown71: channels = 8; break;
+			default: break;
+		}
+		channels = std::min(channels, info.maxChannels);
+		what << ", " << (channels == 1 ? B_TRANSLATE("mono")
+			: channels == 2 ? B_TRANSLATE("stereo")
+			: B_TRANSLATE("surround"));
+		int sampleRate = fSettings.sampleRate > 0 ? fSettings.sampleRate
+			: source != NULL ? source->sampleRate : 0;
+		if (sampleRate > 0) {
+			BString rate;
+			rate.SetToFormat(", %g kHz", sampleRate / 1000.0);
+			what << rate;
+		}
+	}
+
+	// about how big: the bit rate over the duration; lossless as FLAC
+	// usually comes out, a little over half the size of the PCM
+	bigtime_t duration = fHaveSource ? fSource.duration : 0;
+	if (duration > 0 && fSettings.end > fSettings.start)
+		duration = fSettings.end - fSettings.start;
+	else if (duration > fSettings.start)
+		duration -= fSettings.start;
+	double bitsPerSecond = 0;
+	if (codec == kAudioCopy && source != NULL)
+		bitsPerSecond = source->bitRate;
+	else if (!info.lossless)
+		bitsPerSecond = fSettings.audioBitrate * 1000.0;
+	else if (source != NULL) {
+		int rate = fSettings.sampleRate > 0 ? fSettings.sampleRate
+			: source->sampleRate;
+		int bits = codec == kAudioFLAC16 || codec == kAudioALAC16
+			|| codec == kAudioPCM16 || source->bitDepth == 0
+			|| source->bitDepth <= 16 ? 16 : 24;
+		int channels = std::min(source->channels, info.maxChannels);
+		bitsPerSecond = (double)rate * bits * channels;
+		if (codec != kAudioPCM16 && codec != kAudioPCM24)
+			bitsPerSecond *= 0.6;
+	}
+	if (bitsPerSecond > 0 && duration > 0) {
+		off_t bytes = (off_t)(bitsPerSecond * duration / 8000000.0);
+		BString size;
+		size.SetToFormat(B_TRANSLATE(" · about %s"),
+			MediaProbe::FormatSize(bytes).String());
+		what << size;
+	}
+	decision.text = what;
+	fBadge->Set(decision);
+}
+
+
+/*!	A song's settings, from its Summary and Range. */
+void
+OutputView::_ReadSoundControls()
+{
+	container_kind container = (container_kind)field_value(fSoundFormat,
+		fSettings.container);
+	if (container != fSettings.container) {
+		// the sound the new format takes
+		fSettings.container = container;
+		fSettings.audioCodec = (audio_codec)field_value(fSoundCodec,
+			fSettings.audioCodec);
+		fSettings.Validate();
+		fUpdating = true;
+		_BuildAudioMenu(container);
+		select_value(fSoundCodec, fSettings.audioCodec);
+		select_value(fAudio, fSettings.audioCodec);
+		select_value(fContainer, container);
+		fUpdating = false;
+	}
+	fSettings.audioCodec = (audio_codec)field_value(fSoundCodec,
+		fSettings.audioCodec);
+	fSettings.audioBitrate = field_value(fSoundBitrate, fSettings.audioBitrate);
+	fSettings.mixdown = (audio_mixdown)field_value(fSoundChannels,
+		fSettings.mixdown);
+	fSettings.sampleRate = field_value(fSoundRate, 0);
+	fSettings.copyMetadata = fSoundTags->Value() == B_CONTROL_ON;
+	fSettings.copyChapters = fSettings.copyMetadata;
+	fSettings.passthroughWhenPossible = fSoundCopy->Value() == B_CONTROL_ON;
+	fSettings.start = parse_time(fSoundStart->Text());
+	fSettings.end = parse_time(fSoundEnd->Text());
 }
 
 
@@ -981,13 +1276,18 @@ OutputView::MessageReceived(BMessage* message)
 				break;
 			const Preset& preset = Presets::At(index);
 			OutputSettings settings = preset.settings;
+			// From the command line a preset goes to the settings of its
+			// kind; from the menu to the ones shown.
+			bool sound = message->GetBool("by kind", false)
+				? preset.sound : fSoundMode;
+			OutputSettings current = SettingsFor(sound);
 			// a preset says what to make, not where or which part
-			settings.start = fSettings.start;
-			settings.end = fSettings.end;
-			settings.gpu = fSettings.gpu;
-			if (fSettings.encoderPreference == kPreferSoftware)
+			settings.start = current.start;
+			settings.end = current.end;
+			settings.gpu = current.gpu;
+			if (current.encoderPreference == kPreferSoftware)
 				settings.encoderPreference = kPreferSoftware;
-			SetSettings(settings, preset.name);
+			SetSettingsFor(sound, settings, preset.name);
 			BMessage changed(kMsgSettingsChanged);
 			Window()->PostMessage(&changed);
 			break;
@@ -1003,6 +1303,14 @@ OutputView::MessageReceived(BMessage* message)
 			if (fUpdating)
 				break;
 			OutputSettings old = fSettings;
+			if (fSoundMode) {
+				_ReadSoundControls();
+				_UpdateEnabling();
+				UpdateHardwareStatus();
+				if (!(old == fSettings))
+					_Changed();
+				break;
+			}
 			fSettings.container = (container_kind)field_value(fContainer,
 				fSettings.container);
 			if (fSettings.container != old.container) {

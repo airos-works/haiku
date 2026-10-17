@@ -9,6 +9,7 @@
 #include <Autolock.h>
 #include <Locker.h>
 #include <OS.h>
+#include <Path.h>
 
 #include <math.h>
 #include <stdio.h>
@@ -245,6 +246,8 @@ Transcoder::Transcoder(const TranscodeJob& job)
 	fLastProgress(0),
 	fLastPosition(0),
 	fVideo(NULL),
+	fFolderCover(NULL),
+	fFolderCoverStream(NULL),
 	fBurnInStream(-1),
 	fBurnInText(false)
 {
@@ -1319,11 +1322,22 @@ Transcoder::_SetUpAudio(BString& error)
 				encoder->sample_rate = 48000;
 		}
 
-		// sample format: what the encoder prefers, deep enough for 24 bits
+		// sample format: what the encoder prefers, deep enough for 24 bits.
+		// FLAC and ALAC "up to 24-bit" keep a source of 16 bits or fewer
+		// (and any lossy one) at 16: more bits would only hold zeros.
 		AVSampleFormat sampleFormat = encoderCodec->sample_fmts != NULL
 			? encoderCodec->sample_fmts[0] : AV_SAMPLE_FMT_FLTP;
+		int sourceBits = in->codecpar->bits_per_raw_sample > 0
+			? in->codecpar->bits_per_raw_sample
+			: in->codecpar->bits_per_coded_sample;
+		bool lossySource = (avcodec_descriptor_get(sourceCodec) != NULL
+			&& (avcodec_descriptor_get(sourceCodec)->props
+				& AV_CODEC_PROP_LOSSLESS) == 0);
+		bool upTo24 = codec == kAudioFLAC24 || codec == kAudioALAC24;
+		bool keep16 = upTo24 && (lossySource
+			|| (sourceBits > 0 && sourceBits <= 16));
 		if (codec == kAudioFLAC16 || codec == kAudioALAC16
-			|| codec == kAudioPCM16) {
+			|| codec == kAudioPCM16 || keep16) {
 			for (const AVSampleFormat* f = encoderCodec->sample_fmts;
 					f != NULL && *f != AV_SAMPLE_FMT_NONE; f++) {
 				if (av_get_bytes_per_sample(*f) == 2) {
@@ -2290,13 +2304,15 @@ Transcoder::Run(TranscodeListener* listener, BString& error)
 		status = B_BAD_VALUE;
 	}
 
-	// cover art for audio files
-	if (status == B_OK && !container_info(settings.container).video) {
+	// album artwork for songs with their tags: the file's own picture, or
+	// else the album's cover.jpg (or folder.jpg ...) beside it
+	if (status == B_OK && !container_info(settings.container).video
+		&& settings.copyMetadata) {
 		for (unsigned i = 0; i < fInput->nb_streams; i++) {
 			AVStream* in = fInput->streams[i];
 			if ((in->disposition & AV_DISPOSITION_ATTACHED_PIC) == 0
-				|| !container_takes_stream(settings.container,
-					in->codecpar->codec_id, false))
+				|| !container_takes_cover(settings.container,
+					in->codecpar->codec_id))
 				continue;
 			AVStream* out = avformat_new_stream(fOutput, NULL);
 			if (out == NULL)
@@ -2307,6 +2323,8 @@ Transcoder::Run(TranscodeListener* listener, BString& error)
 			fAttachments.push_back(std::make_pair((int)i, out));
 			break;
 		}
+		if (fAttachments.empty())
+			_AddFolderCover();
 	}
 
 	if (status != B_OK) {
@@ -2360,6 +2378,12 @@ Transcoder::Run(TranscodeListener* listener, BString& error)
 			av_interleaved_write_frame(fOutput, picture);
 			av_packet_free(&picture);
 		}
+	}
+	if (fFolderCover != NULL) {
+		fFolderCover->stream_index = fFolderCoverStream->index;
+		fFolderCover->pts = fFolderCover->dts = 0;
+		av_interleaved_write_frame(fOutput, fFolderCover);
+		av_packet_free(&fFolderCover);
 	}
 
 	AVPacket* packet = av_packet_alloc();
@@ -2476,10 +2500,48 @@ Transcoder::Run(TranscodeListener* listener, BString& error)
 }
 
 
+/*!	The album's picture beside the song becomes the output's artwork: read
+	with FFmpeg's image demuxer, so the muxer learns its type and size. */
+void
+Transcoder::_AddFolderCover()
+{
+	BString path = MediaProbe::FolderCover(fJob.source.String());
+	if (path.IsEmpty())
+		return;
+	AVFormatContext* image = NULL;
+	if (avformat_open_input(&image, path.String(), NULL, NULL) < 0)
+		return;
+	AVPacket* packet = av_packet_alloc();
+	if (avformat_find_stream_info(image, NULL) >= 0 && image->nb_streams > 0
+		&& container_takes_cover(fJob.settings.container,
+			image->streams[0]->codecpar->codec_id)
+		&& av_read_frame(image, packet) >= 0) {
+		AVStream* out = avformat_new_stream(fOutput, NULL);
+		if (out != NULL) {
+			avcodec_parameters_copy(out->codecpar, image->streams[0]->codecpar);
+			out->codecpar->codec_tag = 0;
+			out->disposition = AV_DISPOSITION_ATTACHED_PIC;
+			out->time_base = (AVRational){ 1, 90000 };
+			fFolderCoverStream = out;
+			fFolderCover = packet;
+			packet = NULL;
+			BPath file(path.String());
+			BString note;
+			note.SetToFormat("The album artwork comes from %s.", file.Leaf());
+			_Note(note.String());
+		}
+	}
+	av_packet_free(&packet);
+	avformat_close_input(&image);
+}
+
+
 void
 Transcoder::_Cleanup()
 {
 	_StopEncoderThread();
+	av_packet_free(&fFolderCover);
+	fFolderCoverStream = NULL;
 	if (fVideo != NULL) {
 		pthread_mutex_destroy(&fVideo->queueLock);
 		pthread_cond_destroy(&fVideo->queueChanged);

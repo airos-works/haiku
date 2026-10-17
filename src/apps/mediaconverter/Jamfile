@@ -14,6 +14,7 @@ SubDirC++Flags -D__STDC_CONSTANT_MACROS ;
 
 SEARCH_SOURCE += [ FDirName $(SUBDIR) engine ] ;
 SEARCH_SOURCE += [ FDirName $(SUBDIR) app ] ;
+SEARCH_SOURCE += [ FDirName $(SUBDIR) app airtime ] ;
 SEARCH_SOURCE += [ FDirName $(SUBDIR) cli ] ;
 
 local engineSources =
@@ -33,12 +34,17 @@ local engineSources =
 	;
 
 local appSources =
+	AudioPreview.cpp
 	HardwareWindow.cpp
 	MediaConverterApp.cpp
 	MediaConverterWindow.cpp
 	OutputView.cpp
 	QueueView.cpp
 	SourceView.cpp
+
+	# airTime's controller (app/airtime/README.md)
+	ControlBar.cpp
+	Look.cpp
 	;
 
 UseBuildFeatureHeaders ffmpeg ;
@@ -52,7 +58,7 @@ Application MediaConverter :
 	:
 	libmediaconverter_engine.a libcolumnlistview.a
 	[ BuildFeatureAttribute ffmpeg : libraries ]
-	be tracker translation localestub [ TargetLibstdc++ ]
+	be media tracker translation localestub [ TargetLibstdc++ ]
 	: MediaConverter.rdef
 ;
 

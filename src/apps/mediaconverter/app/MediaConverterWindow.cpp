@@ -68,6 +68,7 @@ struct PreviewRequest {
 	int32				id;
 	BString				path;
 	float				position;
+	bool				cover;		// a song's artwork rather than a picture
 };
 
 
@@ -154,8 +155,10 @@ status_t
 MediaConverterWindow::_PreviewThread(void* data)
 {
 	PreviewRequest* request = (PreviewRequest*)data;
-	BBitmap* bitmap = MediaProbe::Preview(request->path.String(),
-		request->position, 640, 360);
+	BBitmap* bitmap = request->cover
+		? MediaProbe::CoverArt(request->path.String(), 480, 480)
+		: MediaProbe::Preview(request->path.String(), request->position, 640,
+			360);
 	BMessage message(kMsgPreviewReady);
 	message.AddInt32("id", request->id);
 	message.AddPointer("bitmap", bitmap);
@@ -472,9 +475,13 @@ MediaConverterWindow::MessageReceived(BMessage* message)
 			break;
 
 		case kMsgPresetChosen:
-			// from the command line: the output view applies it
-			if (message->WasDelivered() && fOutput->Looper() == this)
-				PostMessage(message, fOutput);
+			// from the command line: the output view applies it to the
+			// settings of the preset's kind
+			if (message->WasDelivered() && fOutput->Looper() == this) {
+				BMessage preset(*message);
+				preset.AddBool("by kind", true);
+				PostMessage(&preset, fOutput);
+			}
 			break;
 
 		case kMsgChooseFolder:
@@ -513,7 +520,7 @@ MediaConverterWindow::MessageReceived(BMessage* message)
 				fWarnCpu = false;
 				fWarnItem->SetMarked(false);
 			}
-			_StartConverting(fOutput->Settings());
+			_StartConverting();
 			break;
 		}
 
@@ -657,13 +664,14 @@ MediaConverterWindow::_StartProbing(BList* items)
 void
 MediaConverterWindow::_StartPreview(QueueItem* item)
 {
-	if (item == NULL || !item->Info().HasVideo())
+	if (item == NULL || (!item->Info().HasVideo() && item->Info().audio.empty()))
 		return;
 	PreviewRequest* request = new PreviewRequest;
 	request->target = BMessenger(this);
 	request->id = item->ID();
 	request->path = item->Path();
 	request->position = 0.1f;
+	request->cover = !item->Info().HasVideo();
 	thread_id thread = spawn_thread(_PreviewThread, "preview",
 		B_LOW_PRIORITY, request);
 	if (thread < 0 || resume_thread(thread) != B_OK)
@@ -770,9 +778,9 @@ MediaConverterWindow::_Convert()
 		}
 	}
 	fConvertWhenReady = false;
-	OutputSettings settings = fOutput->Settings();
 
-	// what will run on the CPU against the user's wish, and what cannot run
+	// what will run on the CPU against the user's wish, and what cannot run;
+	// films and songs each with their own settings
 	BString cpuFormats;
 	int32 pending = 0;
 	for (int32 i = 0; i < fQueue->CountItems(); i++) {
@@ -780,6 +788,8 @@ MediaConverterWindow::_Convert()
 		if (!item->IsPending())
 			continue;
 		pending++;
+		OutputSettings settings = fOutput->SettingsFor(
+			item->Info().IsSoundOnly());
 		EncoderDecision decision = decide_encoder(settings, &item->Info());
 		if (decision.impossible) {
 			BAlert* alert = new BAlert(B_TRANSLATE("Cannot convert"),
@@ -807,12 +817,19 @@ MediaConverterWindow::_Convert()
 		alert->Go(new BInvoker(new BMessage(kMsgCpuWarningAnswer), this));
 		return;
 	}
-	_StartConverting(settings);
+	_StartConverting();
+}
+
+
+const OutputSettings&
+MediaConverterWindow::_RunSettingsFor(QueueItem* item) const
+{
+	return fRunSettings[item->Info().IsSoundOnly() ? 1 : 0];
 }
 
 
 void
-MediaConverterWindow::_StartConverting(const OutputSettings& settings)
+MediaConverterWindow::_StartConverting()
 {
 	int32 pending = 0;
 	for (int32 i = 0; i < fQueue->CountItems(); i++)
@@ -820,7 +837,8 @@ MediaConverterWindow::_StartConverting(const OutputSettings& settings)
 	if (pending == 0)
 		return;
 
-	fRunSettings = settings;
+	fRunSettings[0] = fOutput->SettingsFor(false);
+	fRunSettings[1] = fOutput->SettingsFor(true);
 	fConverting = true;
 	fStopping = false;
 	fJobsDone = 0;
@@ -859,9 +877,9 @@ MediaConverterWindow::_StartNext()
 
 	TranscodeJob job;
 	job.source = next->Path();
-	job.settings = fRunSettings;
+	job.settings = _RunSettingsFor(next);
 	job.info = next->Info();
-	job.destination = _DestinationFor(next, fRunSettings);
+	job.destination = _DestinationFor(next, job.settings);
 	next->SetDestination(job.destination.String());
 	next->SetState(kJobConverting);
 	TranscodeProgress zero;
@@ -921,7 +939,8 @@ MediaConverterWindow::_JobFinished(BMessage* message)
 			// let Tracker know what the new file is
 			BNode node(item->Destination().String());
 			BNodeInfo nodeInfo(&node);
-			nodeInfo.SetType(container_info(fRunSettings.container).mimeType);
+			nodeInfo.SetType(container_info(
+				_RunSettingsFor(item).container).mimeType);
 		} else if (status == B_CANCELED) {
 			item->SetState(kJobCancelled);
 			item->SetMessage(B_TRANSLATE("Stopped."));
@@ -1047,6 +1066,9 @@ MediaConverterWindow::_LoadSettings()
 {
 	OutputSettings settings = Presets::At(Presets::DefaultIndex()).settings;
 	BString preset = Presets::At(Presets::DefaultIndex()).name;
+	OutputSettings soundSettings
+		= Presets::At(Presets::DefaultIndex(true)).settings;
+	BString soundPreset = Presets::At(Presets::DefaultIndex(true)).name;
 	BString folder;
 	bool nextToSource = true;
 
@@ -1065,6 +1087,11 @@ MediaConverterWindow::_LoadSettings()
 			if (archive.FindMessage("output", &output) == B_OK)
 				settings.Unarchive(output);
 			preset = archive.GetString("preset", "");
+			BMessage sound;
+			if (archive.FindMessage("sound output", &sound) == B_OK) {
+				soundSettings.Unarchive(sound);
+				soundPreset = archive.GetString("sound preset", "");
+			}
 			folder = archive.GetString("folder", "");
 			nextToSource = archive.GetBool("next to source", true);
 			fWarnCpu = archive.GetBool("warn cpu", true);
@@ -1075,7 +1102,10 @@ MediaConverterWindow::_LoadSettings()
 		if (find_directory(B_USER_DIRECTORY, &home) == B_OK)
 			folder = home.Path();
 	}
-	fOutput->SetSettings(settings, preset.IsEmpty() ? NULL : preset.String());
+	fOutput->SetSettingsFor(false, settings,
+		preset.IsEmpty() ? NULL : preset.String());
+	fOutput->SetSettingsFor(true, soundSettings,
+		soundPreset.IsEmpty() ? NULL : soundPreset.String());
 	fOutput->SetDestination(folder.String(), nextToSource);
 	MoveOnScreen();
 }
@@ -1091,9 +1121,13 @@ MediaConverterWindow::_SaveSettings()
 	BMessage archive;
 	archive.AddRect("frame", Frame());
 	BMessage output;
-	fOutput->Settings().Archive(output);
+	fOutput->SettingsFor(false).Archive(output);
 	archive.AddMessage("output", &output);
-	archive.AddString("preset", fOutput->PresetName());
+	archive.AddString("preset", fOutput->PresetNameFor(false));
+	BMessage sound;
+	fOutput->SettingsFor(true).Archive(sound);
+	archive.AddMessage("sound output", &sound);
+	archive.AddString("sound preset", fOutput->PresetNameFor(true));
 	archive.AddString("folder", fOutput->DestinationFolder());
 	archive.AddBool("next to source", fOutput->NextToSource());
 	archive.AddBool("warn cpu", fWarnCpu);

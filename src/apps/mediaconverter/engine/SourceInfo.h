@@ -116,6 +116,9 @@ struct SourceInfo {
 					SourceInfo();
 
 	bool			HasVideo() const { return !video.empty(); }
+	// a song: sound and no pictures (album artwork is not video)
+	bool			IsSoundOnly() const
+						{ return video.empty() && !audio.empty(); }
 	const VideoTrackInfo* MainVideo() const
 						{ return video.empty() ? NULL : &video[0]; }
 	BString			Metadata(const char* key) const;
