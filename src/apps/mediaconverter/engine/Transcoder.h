@@ -24,6 +24,7 @@ struct AVPacket;
 struct AVStream;
 struct AVSubtitle;
 class VideoEncoder;
+struct VideoEncoderParams;
 
 
 struct TranscodeJob {
@@ -108,6 +109,7 @@ private:
 			status_t			_SetUpSubtitles(BString& error);
 			void				_CopyChapters();
 			status_t			_DetectCrop(int crop[4]);
+			void				_ProbeHdrMetadata(VideoEncoderParams& params);
 
 			status_t			_BuildVideoGraph(VideoStream& stream,
 									const AVFrame* frame, BString& error);

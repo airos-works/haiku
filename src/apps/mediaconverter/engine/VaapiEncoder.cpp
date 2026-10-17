@@ -241,7 +241,8 @@ VaapiEncoder::_CreateSession(BString& error)
 	uint32 packed = attributes[2].value == VA_ATTRIB_NOT_SUPPORTED
 		? 0 : attributes[2].value;
 	fPackedHeaders = packed & (VA_ENC_PACKED_HEADER_SEQUENCE
-		| VA_ENC_PACKED_HEADER_SLICE | VA_ENC_PACKED_HEADER_PICTURE);
+		| VA_ENC_PACKED_HEADER_SLICE | VA_ENC_PACKED_HEADER_PICTURE
+		| VA_ENC_PACKED_HEADER_RAW_DATA);
 	if (fCodec != AV_CODEC_ID_AV1)
 		fPackedHeaders &= ~VA_ENC_PACKED_HEADER_PICTURE;
 	fQualityRange = attributes[3].value == VA_ATTRIB_NOT_SUPPORTED
@@ -1525,6 +1526,9 @@ VaapiEncoder::_BuildHevc(Picture& picture)
 				headers.size() * 8) != B_OK)
 			return B_ERROR;
 	}
+	if (picture.idr && (fPackedHeaders & VA_ENC_PACKED_HEADER_RAW_DATA) != 0
+		&& _AddHdrMetadata(picture) != B_OK)
+		return B_ERROR;
 
 	int sliceType = picture.idr ? 2 : 1;	// I, P
 	if ((fPackedHeaders & VA_ENC_PACKED_HEADER_SLICE) != 0) {
@@ -1852,6 +1856,9 @@ VaapiEncoder::_BuildAv1(Picture& picture)
 				header.size() * 8, false) != B_OK)
 			return B_ERROR;
 	}
+	if (picture.idr && (fPackedHeaders & VA_ENC_PACKED_HEADER_RAW_DATA) != 0
+		&& _AddHdrMetadata(picture) != B_OK)
+		return B_ERROR;
 
 	if ((fPackedHeaders & VA_ENC_PACKED_HEADER_PICTURE) != 0) {
 		// uncompressed_header() for a shown key frame or inter frame
@@ -1952,6 +1959,83 @@ VaapiEncoder::_BuildAv1(Picture& picture)
 	tiles.tg_end = tileColumns * tileRows - 1;
 	return _AddBuffer(picture, VAEncSliceParameterBufferType, &tiles,
 		sizeof(tiles));
+}
+
+
+/*!	HDR10's static metadata - the mastering display and the content light
+	level - for key frames: H.265 SEI messages, or AV1 metadata OBUs. Only
+	for 10-bit output with the PQ transfer, where it means something. */
+status_t
+VaapiEncoder::_AddHdrMetadata(Picture& picture)
+{
+	if (fBitDepth <= 8 || fParams.transfer != AVCOL_TRC_SMPTE2084
+		|| (!fParams.haveMastering && !fParams.haveLightLevel))
+		return B_OK;
+	const AVMasteringDisplayMetadata& m = fParams.mastering;
+
+	if (fCodec == AV_CODEC_ID_HEVC) {
+		BitWriter sei;
+		if (fParams.haveMastering) {
+			// mastering_display_colour_volume: G, B, R in 0.00002 units
+			sei.Bits(137, 8);
+			sei.Bits(24, 8);
+			static const int kOrder[3] = { 1, 2, 0 };
+			for (int i = 0; i < 3; i++) {
+				const AVRational* primary = m.display_primaries[kOrder[i]];
+				sei.Bits((uint32)lround(av_q2d(primary[0]) * 50000), 16);
+				sei.Bits((uint32)lround(av_q2d(primary[1]) * 50000), 16);
+			}
+			sei.Bits((uint32)lround(av_q2d(m.white_point[0]) * 50000), 16);
+			sei.Bits((uint32)lround(av_q2d(m.white_point[1]) * 50000), 16);
+			sei.Bits((uint32)llround(av_q2d(m.max_luminance) * 10000), 32);
+			sei.Bits((uint32)llround(av_q2d(m.min_luminance) * 10000), 32);
+		}
+		if (fParams.haveLightLevel) {
+			sei.Bits(144, 8);		// content_light_level_info
+			sei.Bits(4, 8);
+			sei.Bits(fParams.lightLevel.MaxCLL, 16);
+			sei.Bits(fParams.lightLevel.MaxFALL, 16);
+		}
+		sei.TrailingBits();
+		std::vector<uint8> data;
+		const uint8 header[2] = { 39 << 1, 1 };	// PREFIX_SEI_NUT
+		size_t bits = append_annexb_nal(data, header, 2, sei);
+		return _AddPacked(picture, VAEncPackedHeaderRawData, data, bits);
+	}
+
+	if (fCodec == AV_CODEC_ID_AV1) {
+		std::vector<uint8> data;
+		if (fParams.haveLightLevel) {
+			BitWriter cll;
+			cll.Bits(1, 8);			// metadata_type: HDR_CLL (leb128)
+			cll.Bits(fParams.lightLevel.MaxCLL, 16);
+			cll.Bits(fParams.lightLevel.MaxFALL, 16);
+			cll.TrailingBits();
+			append_obu(data, 5, cll);
+		}
+		if (fParams.haveMastering) {
+			BitWriter mdcv;
+			mdcv.Bits(2, 8);		// metadata_type: HDR_MDCV
+			for (int i = 0; i < 3; i++) {
+				mdcv.Bits((uint32)lround(av_q2d(m.display_primaries[i][0])
+					* (1 << 16)), 16);
+				mdcv.Bits((uint32)lround(av_q2d(m.display_primaries[i][1])
+					* (1 << 16)), 16);
+			}
+			mdcv.Bits((uint32)lround(av_q2d(m.white_point[0]) * (1 << 16)),
+				16);
+			mdcv.Bits((uint32)lround(av_q2d(m.white_point[1]) * (1 << 16)),
+				16);
+			mdcv.Bits((uint32)llround(av_q2d(m.max_luminance) * (1 << 8)), 32);
+			mdcv.Bits((uint32)llround(av_q2d(m.min_luminance) * (1 << 14)),
+				32);
+			mdcv.TrailingBits();
+			append_obu(data, 5, mdcv);
+		}
+		return _AddPacked(picture, VAEncPackedHeaderRawData, data,
+			data.size() * 8, false);
+	}
+	return B_OK;
 }
 
 

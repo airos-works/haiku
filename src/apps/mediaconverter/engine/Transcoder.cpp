@@ -691,6 +691,10 @@ Transcoder::_SetUpVideo(BString& error)
 		params.lightLevel = *(const AVContentLightMetadata*)light->data;
 		params.haveLightLevel = true;
 	}
+	if ((params.transfer == AVCOL_TRC_SMPTE2084
+			|| params.transfer == AVCOL_TRC_ARIB_STD_B67)
+		&& !params.haveMastering && !params.haveLightLevel)
+		_ProbeHdrMetadata(params);
 	const VideoCodecInfo& codecInfo = video_codec_info(codec);
 	if (codecInfo.bitDepth == 8 && fJob.info.HasVideo()
 		&& fJob.info.video[0].transfer.Length() > 0
@@ -817,6 +821,62 @@ Transcoder::_SetUpVideo(BString& error)
 		}
 	}
 	return B_OK;
+}
+
+
+/*!	HDR10's mastering display and light level are often only in the video
+	stream itself (x265 writes them as SEI messages, the container has
+	none): decode the first picture to find them. */
+void
+Transcoder::_ProbeHdrMetadata(VideoEncoderParams& params)
+{
+	AVFormatContext* context = NULL;
+	if (avformat_open_input(&context, fJob.source.String(), NULL, NULL) < 0)
+		return;
+	AVCodecContext* decoder = NULL;
+	AVPacket* packet = av_packet_alloc();
+	AVFrame* frame = av_frame_alloc();
+	int index = fVideo->in->index;
+	const AVCodec* codec = NULL;
+	if (avformat_find_stream_info(context, NULL) < 0)
+		goto out;
+	codec = avcodec_find_decoder(context->streams[index]->codecpar->codec_id);
+	decoder = codec != NULL ? avcodec_alloc_context3(codec) : NULL;
+	if (decoder == NULL || avcodec_parameters_to_context(decoder,
+			context->streams[index]->codecpar) < 0
+		|| avcodec_open2(decoder, codec, NULL) < 0)
+		goto out;
+	for (int reads = 0; reads < 500; reads++) {
+		if (av_read_frame(context, packet) < 0)
+			break;
+		if (packet->stream_index == index)
+			avcodec_send_packet(decoder, packet);
+		av_packet_unref(packet);
+		if (avcodec_receive_frame(decoder, frame) != 0)
+			continue;
+		const AVFrameSideData* mastering = av_frame_get_side_data(frame,
+			AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+		if (mastering != NULL
+			&& mastering->size >= sizeof(AVMasteringDisplayMetadata)) {
+			params.mastering
+				= *(const AVMasteringDisplayMetadata*)mastering->data;
+			params.haveMastering = params.mastering.has_primaries
+				&& params.mastering.has_luminance;
+		}
+		const AVFrameSideData* light = av_frame_get_side_data(frame,
+			AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+		if (light != NULL && light->size >= sizeof(AVContentLightMetadata)) {
+			params.lightLevel = *(const AVContentLightMetadata*)light->data;
+			params.haveLightLevel = true;
+		}
+		break;
+	}
+
+out:
+	av_frame_free(&frame);
+	av_packet_free(&packet);
+	avcodec_free_context(&decoder);
+	avformat_close_input(&context);
 }
 
 

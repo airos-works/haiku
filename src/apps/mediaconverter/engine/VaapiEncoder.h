@@ -91,6 +91,7 @@ private:
 			status_t			_BuildAv1(Picture& picture);
 
 			status_t			_AddRateControl(Picture& picture);
+			status_t			_AddHdrMetadata(Picture& picture);
 			int					_Level() const;
 
 			BString				fRenderNode;
