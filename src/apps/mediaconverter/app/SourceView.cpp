@@ -11,31 +11,59 @@
 #include <ColumnListView.h>
 #include <ColumnTypes.h>
 #include <ControlLook.h>
+#include <GroupLayout.h>
 #include <LayoutBuilder.h>
+#include <MessageRunner.h>
 #include <StringView.h>
+#include <Window.h>
 
 #include <math.h>
 #include <stdio.h>
 
+#include <algorithm>
+
+#include "AudioPreview.h"
 #include "MediaProbe.h"
+#include "airtime/AirTimeMessages.h"
+#include "airtime/ControlBar.h"
 
 
 #undef B_TRANSLATION_CONTEXT
 #define B_TRANSLATION_CONTEXT "Source"
 
 
-/*!	A picture from the source, letterboxed into the view. */
+static const uint32 kMsgPreviewPulse = 'pvpl';
+static const bigtime_t kSkipTime = 10 * 1000000LL;
+
+
+/*!	A picture from the source, letterboxed into the view; for a song its
+	album artwork, in a square. */
 class PreviewView : public BView {
 public:
 	PreviewView()
 		:
 		BView("preview", B_WILL_DRAW | B_FULL_UPDATE_ON_RESIZE),
-		fBitmap(NULL)
+		fBitmap(NULL),
+		fSquare(false)
 	{
-		float width = be_control_look->DefaultLabelSpacing() * 40;
-		SetExplicitMinSize(BSize(width, width * 9 / 16));
-		SetExplicitMaxSize(BSize(width * 1.5f, width * 1.5f * 9 / 16));
+		SetSquare(false);
 		SetViewColor(B_TRANSPARENT_COLOR);
+	}
+
+	void SetSquare(bool square)
+	{
+		fSquare = square;
+		float width = be_control_look->DefaultLabelSpacing() * 40;
+		float height = width * 9 / 16;
+		if (square) {
+			SetExplicitMinSize(BSize(height, height));
+			SetExplicitMaxSize(BSize(height * 1.5f, height * 1.5f));
+		} else {
+			SetExplicitMinSize(BSize(width, height));
+			SetExplicitMaxSize(BSize(width * 1.5f, height * 1.5f));
+		}
+		InvalidateLayout();
+		Invalidate();
 	}
 
 	~PreviewView()
@@ -57,12 +85,30 @@ public:
 		FillRect(bounds);
 		if (fBitmap == NULL) {
 			SetHighColor(110, 110, 115);
-			const char* text = B_TRANSLATE("No picture");
-			float width = StringWidth(text);
 			font_height height;
 			GetFontHeight(&height);
-			DrawString(text, BPoint((bounds.Width() - width) / 2,
-				(bounds.Height() + height.ascent) / 2));
+			float y = (bounds.Height() + height.ascent) / 2;
+			if (fSquare) {
+				// a note where the cover would be
+				BFont font;
+				GetFont(&font);
+				BFont big(font);
+				big.SetSize(bounds.Height() * 0.4f);
+				SetFont(&big);
+				const char* note = "♫";
+				font_height bigHeight;
+				big.GetHeight(&bigHeight);
+				DrawString(note, BPoint((bounds.Width()
+					- big.StringWidth(note)) / 2,
+					bounds.Height() * 0.55f));
+				SetFont(&font);
+				y = bounds.Height() * 0.55f + bigHeight.descent
+					+ height.ascent + 4;
+			}
+			const char* text = fSquare ? B_TRANSLATE("No artwork")
+				: B_TRANSLATE("No picture");
+			float width = StringWidth(text);
+			DrawString(text, BPoint((bounds.Width() - width) / 2, y));
 			return;
 		}
 		BRect source = fBitmap->Bounds();
@@ -78,6 +124,7 @@ public:
 
 private:
 	BBitmap*	fBitmap;
+	bool		fSquare;
 };
 
 
@@ -154,7 +201,18 @@ aspect_text(int width, int height, AVRational sampleAspect)
 SourceView::SourceView()
 	:
 	BView("source", B_WILL_DRAW),
-	fItemID(-1)
+	fControls(NULL),
+	fItemID(-1),
+	fAudioSource(false),
+	fAudioDuration(0),
+	fPlayer(NULL),
+	fPulse(NULL),
+	fVolume(1.0f),
+	fMuted(false),
+	fScrubbing(false),
+	fScrubWasPlaying(false),
+	fScanHeld(false),
+	fScanWasPlaying(false)
 {
 	SetViewUIColor(B_PANEL_BACKGROUND_COLOR);
 
@@ -196,6 +254,9 @@ SourceView::SourceView()
 				.AddGlue()
 			.End()
 		.End()
+		.AddGroup(B_VERTICAL, 0)
+			.GetLayout(&fControlsSlot)
+		.End()
 		.Add(fTracks, 1);
 
 	SetSource(NULL, -1);
@@ -204,12 +265,220 @@ SourceView::SourceView()
 
 SourceView::~SourceView()
 {
+	delete fPulse;
+	delete fPlayer;
+}
+
+
+void
+SourceView::AttachedToWindow()
+{
+	BView::AttachedToWindow();
+	if (fControls == NULL) {
+		// airTime's controller; its messages come here
+		float height = airtime::ControlBar::PreferredHeight(false);
+		fControls = new airtime::ControlBar(BRect(0, 0, 400, height - 1),
+			false, BMessenger(this));
+		fControls->SetExplicitMinSize(BSize(
+			airtime::ControlBar::MinimumWidth(false), height));
+		fControls->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, height));
+		fControlsSlot->AddView(fControls);
+		fControls->SetVolume(fVolume, fMuted);
+		if (!fAudioSource)
+			fControls->Hide();
+		_UpdateControls();
+	}
+}
+
+
+void
+SourceView::DetachedFromWindow()
+{
+	_StopPlaying();
+	BView::DetachedFromWindow();
+}
+
+
+void
+SourceView::MessageReceived(BMessage* message)
+{
+	using namespace airtime;
+	switch (message->what) {
+		case kMsgTogglePlay:
+			if (fPlayer != NULL && fPlayer->IsPlaying()) {
+				fPlayer->Pause();
+				_UpdateControls();
+			} else if (_OpenPlayer()) {
+				fPlayer->Play();
+				_UpdateControls();
+			}
+			break;
+
+		case kMsgGoToStart:
+			_Seek(0);
+			break;
+		case kMsgGoToEnd:
+			_Seek(fAudioDuration);
+			break;
+
+		case kMsgScanPress:
+			fScanHeld = true;
+			fScanWasPlaying = fPlayer != NULL && fPlayer->IsPlaying();
+			break;
+		case kMsgScanRelease:
+		{
+			if (!fScanHeld)
+				break;
+			fScanHeld = false;
+			// a click skips ten seconds, holding skips further
+			int32 direction = message->GetInt32("direction", 1);
+			bigtime_t held = message->GetInt64("held", 0);
+			bigtime_t distance = std::max(kSkipTime, held * 4);
+			bigtime_t now = fPlayer != NULL ? fPlayer->Position() : 0;
+			_Seek(now + direction * distance);
+			break;
+		}
+
+		case kMsgSeekTo:
+		{
+			bigtime_t time = message->GetInt64("time", 0);
+			bool final = message->GetBool("final", true);
+			if (!_OpenPlayer())
+				break;
+			if (!final && !fScrubbing) {
+				fScrubbing = true;
+				fScrubWasPlaying = fPlayer->IsPlaying();
+				fPlayer->Pause();
+			}
+			fPlayer->Seek(time);
+			if (final && fScrubbing) {
+				fScrubbing = false;
+				if (fScrubWasPlaying)
+					fPlayer->Play();
+			}
+			_UpdateControls();
+			break;
+		}
+
+		case kMsgSetVolume:
+			fVolume = message->GetFloat("volume", 1.0f);
+			fMuted = false;
+			if (fPlayer != NULL) {
+				fPlayer->SetVolume(fVolume);
+				fPlayer->SetMuted(false);
+			}
+			if (fControls != NULL)
+				fControls->SetVolume(fVolume, false);
+			break;
+		case kMsgToggleMute:
+			fMuted = !fMuted;
+			if (fPlayer != NULL)
+				fPlayer->SetMuted(fMuted);
+			if (fControls != NULL)
+				fControls->SetVolume(fVolume, fMuted);
+			break;
+
+		case kMsgPreviewPulse:
+			if (fPlayer != NULL && fPlayer->IsPlaying())
+				fPlayer->AtEnd();
+			_UpdateControls();
+			break;
+
+		case kMsgToggleTimeDisplay:
+		case kMsgControlsActivity:
+			break;
+
+		default:
+			BView::MessageReceived(message);
+			break;
+	}
+}
+
+
+/*!	The sound card is only taken when the song is played. */
+bool
+SourceView::_OpenPlayer()
+{
+	if (!fAudioSource || fAudioPath.IsEmpty())
+		return false;
+	if (fPlayer != NULL && fPlayer->IsOpen())
+		return true;
+	if (fPlayer == NULL)
+		fPlayer = new AudioPreview();
+	BString error;
+	if (fPlayer->Open(fAudioPath.String(), &error) != B_OK) {
+		fprintf(stderr, "MediaConverter: cannot play %s: %s\n",
+			fAudioPath.String(), error.String());
+		return false;
+	}
+	fPlayer->SetVolume(fVolume);
+	fPlayer->SetMuted(fMuted);
+	if (fPulse == NULL) {
+		BMessage pulse(kMsgPreviewPulse);
+		fPulse = new BMessageRunner(BMessenger(this), &pulse, 100000);
+	}
+	return true;
+}
+
+
+void
+SourceView::_Seek(bigtime_t time)
+{
+	if (!_OpenPlayer())
+		return;
+	time = std::max((bigtime_t)0, std::min(time, fAudioDuration));
+	fPlayer->Seek(time);
+	_UpdateControls();
+}
+
+
+void
+SourceView::_StopPlaying()
+{
+	delete fPulse;
+	fPulse = NULL;
+	if (fPlayer != NULL)
+		fPlayer->Close();
+	_UpdateControls();
+}
+
+
+void
+SourceView::_UpdateControls()
+{
+	if (fControls == NULL)
+		return;
+	bool open = fPlayer != NULL && fPlayer->IsOpen();
+	fControls->SetPosition(open ? fPlayer->Position() : 0, fAudioDuration);
+	fControls->SetPlaying(open && fPlayer->IsPlaying());
 }
 
 
 void
 SourceView::SetSource(const SourceInfo* info, int32 itemID)
 {
+	// a song plays with airTime's controller, under its artwork
+	bool audio = info != NULL && info->IsSoundOnly();
+	if (info == NULL || info->path != fAudioPath || !audio)
+		_StopPlaying();
+	fAudioSource = audio;
+	fAudioPath = audio ? info->path : BString();
+	fAudioDuration = audio ? info->duration : 0;
+	fPreview->SetSquare(audio);
+	if (fControls != NULL) {
+		if (audio && fControls->IsHidden())
+			fControls->Show();
+		else if (!audio && !fControls->IsHidden())
+			fControls->Hide();
+		if (audio) {
+			fControls->SetMedia(true, false, true);
+			BString title = info->Metadata("title");
+			fControls->SetTitle(title.IsEmpty() ? info->name.String()
+				: title.String());
+		}
+		_UpdateControls();
+	}
+
 	fItemID = itemID;
 	fTracks->Clear();
 	if (info == NULL) {
@@ -227,9 +496,31 @@ SourceView::SetSource(const SourceInfo* info, int32 itemID)
 	fTitle->SetText(title.String());
 
 	BString summary;
-	summary.SetToFormat("%s · %s · %s", info->containerName.String(),
-		MediaProbe::FormatDuration(info->duration).String(),
-		MediaProbe::FormatSize(info->fileSize).String());
+	if (audio) {
+		// a song by its sound rather than its container: "FLAC · 24-bit ·
+		// 96 kHz · stereo"
+		const AudioTrackInfo& a = info->audio[0];
+		summary = a.codecName;
+		if (a.bitDepth > 0) {
+			BString depth;
+			depth.SetToFormat(" · %d-bit", a.bitDepth);
+			summary << depth;
+		}
+		if (a.sampleRate > 0) {
+			BString rate;
+			rate.SetToFormat(" · %g kHz", a.sampleRate / 1000.0);
+			summary << rate;
+		}
+		summary << " · " << (a.channels == 1 ? B_TRANSLATE("mono")
+			: a.channels == 2 ? B_TRANSLATE("stereo")
+			: a.layout.IsEmpty() ? B_TRANSLATE("surround") : a.layout.String());
+		summary << " · " << MediaProbe::FormatDuration(info->duration)
+			<< " · " << MediaProbe::FormatSize(info->fileSize);
+	} else {
+		summary.SetToFormat("%s · %s · %s", info->containerName.String(),
+			MediaProbe::FormatDuration(info->duration).String(),
+			MediaProbe::FormatSize(info->fileSize).String());
+	}
 	BString rate = MediaProbe::FormatBitRate(info->bitRate);
 	if (!rate.IsEmpty())
 		summary << " · " << rate;

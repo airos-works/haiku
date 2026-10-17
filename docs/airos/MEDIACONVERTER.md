@@ -54,8 +54,18 @@ turning and mirroring. The source's own rotation is applied.
 (H.265), 4K H.265 10-bit (MKV, HDR kept), AV1 10-bit (MKV), Change container
 (MKV or MP4, copies everything). *Web*: WebM VP9, WebM AV1, Small for
 messaging. *Devices*: Apple (H.265), Android and Chromecast, Old players
-(MPEG-2 and AC-3). *Production*: Lossless archive (FFV1 and FLAC). *Audio*:
-AAC, Apple Lossless, MP3, FLAC, Opus, Ogg Vorbis, WAV.
+(MPEG-2 and AC-3). *Production*: Lossless archive (FFV1 and FLAC).
+
+For songs: MP3 at 128, 192, 256 and 320 kbit/s (the default), AAC (M4A) at
+128, 192 and 256 kbit/s, FLAC in CD quality (16-bit, 44.1 kHz) or as the
+source (24 bits only when the source has more than 16), Apple Lossless,
+Opus 160 kbit/s, Ogg Vorbis 192 kbit/s and WAV. They keep the tags, the
+chapters and the album artwork: the file's own picture, or else the
+`cover.jpg` (`folder`, `front`, `albumart*`, `album`; JPEG or PNG) beside it,
+written as an ID3 or FLAC picture or M4A's `covr` (Ogg, Opus and WAV take
+none). A song sees only these; a film sees them after its own, as *Sound
+only*, to take the sound out of it. Songs and films keep settings of their
+own, so a queue of both converts each with its kind's.
 
 ## The window
 
@@ -70,6 +80,14 @@ AAC, Apple Lossless, MP3, FLAC, Opus, Ogg Vorbis, WAV.
   bit depth and chroma, SDR/HDR10/HLG/Dolby Vision and the primaries,
   interlacing, rotation, bit rate; channel layout, sample rate, language,
   default, forced and commentary flags; and the chapters.
+- **A song** (a file with sound and no picture track) shows its album
+  artwork in a square, under it airTime's controller (play, scrub, skip,
+  volume; `app/airtime` is airTime's ControlBar and Look as they are), its
+  sound (codec, bit depth, sample rate, channels) and its tags. The sound
+  card is only taken when it plays. The output has two tabs: *Summary*
+  (format, codec, bit rate, channels, sample rate, the tags and artwork,
+  copying sound already in the format) and *Range*; the line under them says
+  what it becomes and about how big it will be.
 - **Output**: the preset, then *Summary* (format, video, size, quality,
   audio and bit rate, subtitles), *Video* (encoder: automatic, a given GPU or
   the CPU; speed; constant quality or average bit rate; frame rate),

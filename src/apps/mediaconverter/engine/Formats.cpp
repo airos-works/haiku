@@ -79,11 +79,11 @@ static const AudioCodecInfo kAudioCodecs[kAudioCodecCount] = {
 		0, 8 },
 	{ kAudioFLAC16, "FLAC 16-bit (lossless)", AV_CODEC_ID_FLAC, "flac", true,
 		0, 8 },
-	{ kAudioFLAC24, "FLAC 24-bit (lossless)", AV_CODEC_ID_FLAC, "flac", true,
+	{ kAudioFLAC24, "FLAC up to 24-bit (lossless)", AV_CODEC_ID_FLAC, "flac", true,
 		0, 8 },
 	{ kAudioALAC16, "ALAC 16-bit (lossless)", AV_CODEC_ID_ALAC, "alac", true,
 		0, 8 },
-	{ kAudioALAC24, "ALAC 24-bit (lossless)", AV_CODEC_ID_ALAC, "alac", true,
+	{ kAudioALAC24, "ALAC up to 24-bit (lossless)", AV_CODEC_ID_ALAC, "alac", true,
 		0, 8 },
 	{ kAudioOpus, "Opus", AV_CODEC_ID_OPUS, "libopus", false, 128, 8 },
 	{ kAudioVorbis, "Vorbis", AV_CODEC_ID_VORBIS, "libvorbis", false, 160,
@@ -270,6 +270,25 @@ container_takes_stream(container_kind kind, AVCodecID codec, bool video)
 	if (format == NULL)
 		return false;
 	return avformat_query_codec(format, codec, FF_COMPLIANCE_NORMAL) == 1;
+}
+
+
+bool
+container_takes_cover(container_kind kind, AVCodecID codec)
+{
+	// what the muxers write as pictures; avformat_query_codec() does not
+	// know them, as no muxer has a picture codec as a track of its own
+	switch (kind) {
+		case kContainerMP3:
+		case kContainerFLAC:
+			return codec == AV_CODEC_ID_MJPEG || codec == AV_CODEC_ID_PNG
+				|| codec == AV_CODEC_ID_BMP || codec == AV_CODEC_ID_GIF;
+		case kContainerM4A:
+			return codec == AV_CODEC_ID_MJPEG || codec == AV_CODEC_ID_PNG
+				|| codec == AV_CODEC_ID_BMP;
+		default:
+			return false;
+	}
 }
 
 

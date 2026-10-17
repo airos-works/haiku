@@ -10,6 +10,10 @@
 
 #include <vector>
 
+extern "C" {
+#include <libavcodec/avcodec.h>
+}
+
 #include "HardwareCaps.h"
 #include "LavcVideoEncoder.h"
 #include "SoftwareEncoders.h"
@@ -35,24 +39,30 @@ video(container_kind container, video_codec codec, int32 quality,
 }
 
 
+/*!	For songs: the channels and the rate of the source unless a preset says
+	otherwise, the tags, the artwork and the chapters kept. */
 static OutputSettings
-audio(container_kind container, audio_codec codec, int32 bitrate)
+sound(container_kind container, audio_codec codec, int32 bitrate,
+	int32 sampleRate = 0)
 {
 	OutputSettings settings;
 	settings.container = container;
 	settings.videoCodec = kVideoNone;
 	settings.audioCodec = codec;
 	settings.audioBitrate = bitrate;
+	settings.mixdown = kMixdownSource;
+	settings.sampleRate = sampleRate;
 	settings.audioTracks = kAudioTracksFirst;
 	settings.subtitles = kSubtitlesNone;
-	settings.copyChapters = false;
+	settings.copyChapters = true;
+	settings.copyMetadata = true;
 	return settings;
 }
 
 
 static void
 add(const char* category, const char* name, const char* description,
-	const OutputSettings& settings)
+	const OutputSettings& settings, bool forSound = false)
 {
 	Preset preset;
 	preset.category = category;
@@ -60,6 +70,7 @@ add(const char* category, const char* name, const char* description,
 	preset.description = description;
 	preset.settings = settings;
 	preset.settings.Validate();
+	preset.sound = forSound;
 	sPresets->push_back(preset);
 }
 
@@ -134,20 +145,34 @@ init_presets()
 		"FFV1 and FLAC in Matroska: bit-exact pictures, very large files.",
 		archive);
 
-	add("Audio", "AAC (M4A)", "Music for any device.",
-		audio(kContainerM4A, kAudioAAC, 256));
-	add("Audio", "Apple Lossless (M4A)", "Lossless, for Apple devices.",
-		audio(kContainerM4A, kAudioALAC16, 0));
-	add("Audio", "MP3", "MP3 at 256 kbit/s.", audio(kContainerMP3, kAudioMP3,
-		256));
-	add("Audio", "FLAC", "Lossless FLAC.", audio(kContainerFLAC, kAudioFLAC16,
-		0));
-	add("Audio", "Opus", "Opus: the best quality for its size.",
-		audio(kContainerOpus, kAudioOpus, 160));
-	add("Audio", "Ogg Vorbis", "Vorbis in Ogg.", audio(kContainerOgg,
-		kAudioVorbis, 192));
-	add("Audio", "WAV", "Uncompressed PCM.", audio(kContainerWAV, kAudioPCM16,
-		0));
+	// for songs
+	add("MP3", "MP3, 128 kbit/s", "Small MP3s for speech and casual listening.",
+		sound(kContainerMP3, kAudioMP3, 128), true);
+	add("MP3", "MP3, 192 kbit/s", "MP3 that sounds good on most music.",
+		sound(kContainerMP3, kAudioMP3, 192), true);
+	add("MP3", "MP3, 256 kbit/s", "High quality MP3.",
+		sound(kContainerMP3, kAudioMP3, 256), true);
+	add("MP3", "MP3, 320 kbit/s", "The best MP3 there is; plays everywhere.",
+		sound(kContainerMP3, kAudioMP3, 320), true);
+	add("AAC", "AAC, 128 kbit/s", "AAC in M4A: as good as MP3 at 192 kbit/s.",
+		sound(kContainerM4A, kAudioAAC, 128), true);
+	add("AAC", "AAC, 192 kbit/s", "AAC in M4A for phones and cars.",
+		sound(kContainerM4A, kAudioAAC, 192), true);
+	add("AAC", "AAC, 256 kbit/s", "AAC in M4A at the rate music stores sell.",
+		sound(kContainerM4A, kAudioAAC, 256), true);
+	add("FLAC", "FLAC, CD quality", "Lossless FLAC at 16 bits and 44.1 kHz.",
+		sound(kContainerFLAC, kAudioFLAC16, 0, 44100), true);
+	add("FLAC", "FLAC, as the source", "Lossless FLAC keeping the source's "
+		"bits (up to 24) and rate.",
+		sound(kContainerFLAC, kAudioFLAC24, 0), true);
+	add("Other", "Apple Lossless", "Lossless ALAC in M4A, for Apple devices.",
+		sound(kContainerM4A, kAudioALAC24, 0), true);
+	add("Other", "Opus, 160 kbit/s", "Opus: the best quality for its size.",
+		sound(kContainerOpus, kAudioOpus, 160), true);
+	add("Other", "Ogg Vorbis, 192 kbit/s", "Vorbis in Ogg.",
+		sound(kContainerOgg, kAudioVorbis, 192), true);
+	add("Other", "WAV", "Uncompressed 16-bit PCM.",
+		sound(kContainerWAV, kAudioPCM16, 0), true);
 }
 
 
@@ -182,8 +207,33 @@ Presets::IndexOf(const char* name)
 
 
 static bool
+can_encode_audio(audio_codec codec)
+{
+	if (codec == kAudioCopy || codec == kAudioNone)
+		return true;
+	const AudioCodecInfo& info = audio_codec_info(codec);
+	if (info.lavcEncoder != NULL
+		&& avcodec_find_encoder_by_name(info.lavcEncoder) != NULL)
+		return true;
+	// the stand-ins the transcoder takes
+	switch (codec) {
+		case kAudioOpus:
+			return avcodec_find_encoder_by_name("opus") != NULL;
+		case kAudioVorbis:
+			return avcodec_find_encoder_by_name("vorbis") != NULL;
+		case kAudioHEAAC:
+			return avcodec_find_encoder_by_name("aac") != NULL;
+		default:
+			return false;
+	}
+}
+
+
+static bool
 can_make(const OutputSettings& settings)
 {
+	if (!can_encode_audio(settings.audioCodec))
+		return false;
 	video_codec codec = settings.videoCodec;
 	if (codec == kVideoCopy || codec == kVideoNone
 		|| !container_info(settings.container).video)
@@ -199,13 +249,24 @@ can_make(const OutputSettings& settings)
 
 
 int32
-Presets::DefaultIndex()
+Presets::DefaultIndex(bool forSound)
 {
-	// The first one this computer can make: without x264 (arm64), not
-	// "Fast 1080p".
+	init_presets();
+	// "MP3, 320 kbit/s" for songs; the first video preset this computer
+	// can make (without x264, as on arm64, not "Fast 1080p")
+	if (forSound) {
+		int32 mp3 = IndexOf("MP3, 320 kbit/s");
+		if (mp3 >= 0 && can_make(At(mp3).settings))
+			return mp3;
+	}
 	for (int32 i = 0; i < Count(); i++) {
-		if (can_make(At(i).settings))
+		if (At(i).sound == forSound && can_make(At(i).settings))
+			return i;
+	}
+	for (int32 i = 0; i < Count(); i++) {
+		if (At(i).sound == forSound)
 			return i;
 	}
 	return 0;
 }
+

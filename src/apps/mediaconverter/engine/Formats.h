@@ -167,6 +167,10 @@ bool					container_holds_audio(container_kind kind,
 // Whether a source stream can be copied as it is.
 bool					container_takes_stream(container_kind kind,
 							AVCodecID codec, bool video);
+// Whether the container can carry an album picture of this kind: MP3 and
+// FLAC as tag pictures, M4A as its "covr" atom.
+bool					container_takes_cover(container_kind kind,
+							AVCodecID codec);
 bool					container_takes_subtitle(container_kind kind,
 							AVCodecID codec, AVCodecID* convertTo);
 

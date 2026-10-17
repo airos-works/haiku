@@ -22,6 +22,13 @@ status_t	Probe(const char* path, SourceInfo& info, BString* error);
 // maxWidth x maxHeight, as B_RGB32; NULL when the file has no video.
 BBitmap*	Preview(const char* path, float position, int maxWidth,
 				int maxHeight);
+// The album artwork of a song (the front cover when it says which picture
+// that is), or else the album's cover.jpg, folder.jpg ... beside it, scaled
+// to fit; NULL when there is none.
+BBitmap*	CoverArt(const char* path, int maxWidth, int maxHeight);
+// The album's picture beside a song, as music libraries keep it: cover.jpg,
+// folder.jpg, front.jpg and the like (JPEG or PNG); empty when there is none.
+BString		FolderCover(const char* path);
 
 BString		FormatDuration(bigtime_t duration);
 BString		FormatSize(off_t size);

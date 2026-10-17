@@ -11,6 +11,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <dirent.h>
 #include <string.h>
 
 extern "C" {
@@ -129,6 +130,14 @@ codec_long_name(AVCodecID codec)
 			return "Dolby TrueHD";
 		case AV_CODEC_ID_MP3:
 			return "MP3";
+		case AV_CODEC_ID_FLAC:
+			return "FLAC";
+		case AV_CODEC_ID_ALAC:
+			return "Apple Lossless (ALAC)";
+		case AV_CODEC_ID_OPUS:
+			return "Opus";
+		case AV_CODEC_ID_VORBIS:
+			return "Vorbis";
 		case AV_CODEC_ID_SUBRIP:
 			return "SubRip (SRT)";
 		case AV_CODEC_ID_ASS:
@@ -443,6 +452,53 @@ rotate_bitmap(BBitmap* bitmap, int rotation)
 }
 
 
+/*!	A decoded picture scaled to fit maxWidth x maxHeight (keeping its
+	shape) and turned upright, as B_RGB32. */
+static BBitmap*
+frame_to_bitmap(const AVFrame* frame, int maxWidth, int maxHeight,
+	int rotation)
+{
+	int width = frame->width;
+	int height = frame->height;
+	if (width <= 0 || height <= 0)
+		return NULL;
+	double aspect = (double)width / height;
+	if (frame->sample_aspect_ratio.num > 0)
+		aspect *= av_q2d(frame->sample_aspect_ratio);
+	bool swap = rotation == 90 || rotation == 270;
+	int boxWidth = swap ? maxHeight : maxWidth;
+	int boxHeight = swap ? maxWidth : maxHeight;
+	int outWidth = boxWidth;
+	int outHeight = (int)lround(boxWidth / aspect);
+	if (outHeight > boxHeight) {
+		outHeight = boxHeight;
+		outWidth = (int)lround(boxHeight * aspect);
+	}
+	outWidth = max_c(outWidth, 2);
+	outHeight = max_c(outHeight, 2);
+
+	SwsContext* scaler = sws_getContext(width, height,
+		(AVPixelFormat)frame->format, outWidth, outHeight, AV_PIX_FMT_BGRA,
+		SWS_BICUBIC, NULL, NULL, NULL);
+	if (scaler == NULL)
+		return NULL;
+	BBitmap* bitmap = new(std::nothrow) BBitmap(
+		BRect(0, 0, outWidth - 1, outHeight - 1), B_RGB32);
+	if (bitmap != NULL && bitmap->IsValid()) {
+		uint8* planes[4] = { (uint8*)bitmap->Bits() };
+		int strides[4] = { (int)bitmap->BytesPerRow() };
+		sws_scale(scaler, frame->data, frame->linesize, 0, height, planes,
+			strides);
+		bitmap = rotate_bitmap(bitmap, rotation);
+	} else {
+		delete bitmap;
+		bitmap = NULL;
+	}
+	sws_freeContext(scaler);
+	return bitmap;
+}
+
+
 BBitmap*
 MediaProbe::Preview(const char* path, float position, int maxWidth,
 	int maxHeight)
@@ -454,7 +510,6 @@ MediaProbe::Preview(const char* path, float position, int maxWidth,
 	AVCodecContext* decoder = NULL;
 	AVPacket* packet = av_packet_alloc();
 	AVFrame* frame = av_frame_alloc();
-	SwsContext* scaler = NULL;
 	int streamIndex = -1;
 	const AVCodec* codec = NULL;
 	AVStream* stream = NULL;
@@ -499,40 +554,7 @@ MediaProbe::Preview(const char* path, float position, int maxWidth,
 		}
 
 		while (avcodec_receive_frame(decoder, frame) == 0) {
-			int width = frame->width;
-			int height = frame->height;
-			double aspect = (double)width / height;
-			if (frame->sample_aspect_ratio.num > 0)
-				aspect *= av_q2d(frame->sample_aspect_ratio);
-			bool swap = rotation == 90 || rotation == 270;
-			int boxWidth = swap ? maxHeight : maxWidth;
-			int boxHeight = swap ? maxWidth : maxHeight;
-			int outWidth = boxWidth;
-			int outHeight = (int)lround(boxWidth / aspect);
-			if (outHeight > boxHeight) {
-				outHeight = boxHeight;
-				outWidth = (int)lround(boxHeight * aspect);
-			}
-			outWidth = max_c(outWidth, 2);
-			outHeight = max_c(outHeight, 2);
-
-			scaler = sws_getContext(width, height,
-				(AVPixelFormat)frame->format, outWidth, outHeight,
-				AV_PIX_FMT_BGRA, SWS_BICUBIC, NULL, NULL, NULL);
-			if (scaler != NULL) {
-				bitmap = new(std::nothrow) BBitmap(
-					BRect(0, 0, outWidth - 1, outHeight - 1), B_RGB32);
-				if (bitmap != NULL && bitmap->IsValid()) {
-					uint8* planes[4] = { (uint8*)bitmap->Bits() };
-					int strides[4] = { (int)bitmap->BytesPerRow() };
-					sws_scale(scaler, frame->data, frame->linesize, 0,
-						height, planes, strides);
-					bitmap = rotate_bitmap(bitmap, rotation);
-				} else {
-					delete bitmap;
-					bitmap = NULL;
-				}
-			}
+			bitmap = frame_to_bitmap(frame, maxWidth, maxHeight, rotation);
 			done = true;
 			break;
 		}
@@ -541,11 +563,145 @@ MediaProbe::Preview(const char* path, float position, int maxWidth,
 	}
 
 out:
-	sws_freeContext(scaler);
 	av_frame_free(&frame);
 	av_packet_free(&packet);
 	avcodec_free_context(&decoder);
 	avformat_close_input(&context);
+	return bitmap;
+}
+
+
+/*!	The first picture of a file - an image, here - scaled to fit. */
+static BBitmap*
+decode_image(const char* path, int maxWidth, int maxHeight)
+{
+	AVFormatContext* context = NULL;
+	if (avformat_open_input(&context, path, NULL, NULL) < 0)
+		return NULL;
+	BBitmap* bitmap = NULL;
+	const AVCodec* codec = NULL;
+	int index = avformat_find_stream_info(context, NULL) >= 0
+		? av_find_best_stream(context, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0)
+		: -1;
+	AVCodecContext* decoder = index >= 0 && codec != NULL
+		? avcodec_alloc_context3(codec) : NULL;
+	if (decoder != NULL && avcodec_parameters_to_context(decoder,
+			context->streams[index]->codecpar) >= 0
+		&& avcodec_open2(decoder, codec, NULL) >= 0) {
+		AVPacket* packet = av_packet_alloc();
+		AVFrame* frame = av_frame_alloc();
+		while (bitmap == NULL && av_read_frame(context, packet) >= 0) {
+			if (packet->stream_index == index
+				&& avcodec_send_packet(decoder, packet) >= 0) {
+				avcodec_send_packet(decoder, NULL);
+				if (avcodec_receive_frame(decoder, frame) == 0)
+					bitmap = frame_to_bitmap(frame, maxWidth, maxHeight, 0);
+			}
+			av_packet_unref(packet);
+		}
+		av_frame_free(&frame);
+		av_packet_free(&packet);
+	}
+	avcodec_free_context(&decoder);
+	avformat_close_input(&context);
+	return bitmap;
+}
+
+
+BString
+MediaProbe::FolderCover(const char* path)
+{
+	BString folder(path);
+	int32 slash = folder.FindLast('/');
+	if (slash < 0)
+		folder = ".";
+	else
+		folder.Truncate(slash);
+	DIR* directory = opendir(folder.String());
+	if (directory == NULL)
+		return BString();
+	static const char* kNames[] = { "cover", "folder", "front", "albumart",
+		"album" };
+	const int kNameCount = sizeof(kNames) / sizeof(kNames[0]);
+	BString best;
+	int bestRank = kNameCount;
+	while (dirent* entry = readdir(directory)) {
+		BString name(entry->d_name);
+		BString lower(name);
+		lower.ToLower();
+		int32 dot = lower.FindLast('.');
+		if (dot <= 0)
+			continue;
+		BString extension(lower.String() + dot + 1);
+		if (extension != "jpg" && extension != "jpeg" && extension != "png")
+			continue;
+		lower.Truncate(dot);
+		for (int rank = 0; rank < bestRank; rank++) {
+			if (lower == kNames[rank]
+				|| (rank == 3 && lower.StartsWith("albumart"))) {
+				best = name;
+				bestRank = rank;
+				break;
+			}
+		}
+	}
+	closedir(directory);
+	if (best.IsEmpty())
+		return BString();
+	if (slash < 0)
+		return best;
+	BString file;
+	file.SetToFormat("%s/%s", folder.String(), best.String());
+	return file;
+}
+
+
+BBitmap*
+MediaProbe::CoverArt(const char* path, int maxWidth, int maxHeight)
+{
+	AVFormatContext* context = NULL;
+	if (avformat_open_input(&context, path, NULL, NULL) < 0)
+		return NULL;
+	BBitmap* bitmap = NULL;
+	if (avformat_find_stream_info(context, NULL) >= 0) {
+		// the front cover when the file says which picture that is
+		AVStream* cover = NULL;
+		for (unsigned i = 0; i < context->nb_streams; i++) {
+			AVStream* stream = context->streams[i];
+			if ((stream->disposition & AV_DISPOSITION_ATTACHED_PIC) == 0
+				|| stream->attached_pic.size <= 0)
+				continue;
+			AVDictionaryEntry* comment = av_dict_get(stream->metadata,
+				"comment", NULL, 0);
+			bool front = comment != NULL
+				&& strcasestr(comment->value, "front") != NULL;
+			if (cover == NULL || front)
+				cover = stream;
+			if (front)
+				break;
+		}
+		const AVCodec* codec = cover != NULL
+			? avcodec_find_decoder(cover->codecpar->codec_id) : NULL;
+		AVCodecContext* decoder = codec != NULL
+			? avcodec_alloc_context3(codec) : NULL;
+		if (decoder != NULL
+			&& avcodec_parameters_to_context(decoder, cover->codecpar) >= 0
+			&& avcodec_open2(decoder, codec, NULL) >= 0
+			&& avcodec_send_packet(decoder, &cover->attached_pic) >= 0) {
+			avcodec_send_packet(decoder, NULL);
+			AVFrame* frame = av_frame_alloc();
+			if (avcodec_receive_frame(decoder, frame) == 0)
+				bitmap = frame_to_bitmap(frame, maxWidth, maxHeight, 0);
+			av_frame_free(&frame);
+		}
+		avcodec_free_context(&decoder);
+	}
+	avformat_close_input(&context);
+	if (bitmap == NULL) {
+		BString cover = FolderCover(path);
+		if (!cover.IsEmpty())
+			bitmap = decode_image(cover.String(), maxWidth, maxHeight);
+	}
 	return bitmap;
 }
 

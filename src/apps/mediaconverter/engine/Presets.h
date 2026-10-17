@@ -14,17 +14,22 @@ struct Preset {
 	const char*		name;
 	const char*		description;
 	OutputSettings	settings;
+	bool			sound;		// made for songs: sound in, sound out
 };
 
 
 /*!	A short list in the spirit of HandBrake's general presets: a handful of
-	everyday targets, a few for devices and the web, and audio only. */
+	everyday targets, a few for devices and the web - and for songs MP3, AAC
+	and FLAC at a few rates and a few others, which video sources offer as
+	"Sound only". */
 namespace Presets {
 
 int32			Count();
 const Preset&	At(int32 index);
 int32			IndexOf(const char* name);
-int32			DefaultIndex();
+// The first preset of the kind this computer can make: for a song
+// "MP3, 320 kbit/s" when it can.
+int32			DefaultIndex(bool sound = false);
 
 }	// namespace Presets
 
