@@ -15,6 +15,7 @@
 #include <BarberPole.h>
 #include <CardLayout.h>
 #include <ControlLook.h>
+#include <FrameLines.h>
 #include <LayoutBuilder.h>
 #include <StatusBar.h>
 #include <StatusView.h>
@@ -94,8 +95,9 @@ ProgressStatusView::Draw(BRect updateRect)
 	be_control_look->DrawMenuBarBackground(this, bounds, updateRect, ViewColor());
 
 	bounds = Bounds(); // needed, as DrawMenuBarBackground() modified it
-	SetHighColor(tint_color(ViewColor(), B_DARKEN_2_TINT));
-	StrokeLine(bounds.LeftTop(), bounds.RightTop());
+	// over the background: at a fractional scale it keeps its width
+	stroke_line_over_fill(this, bounds, BControlLook::B_TOP_BORDER,
+		tint_color(ViewColor(), B_DARKEN_2_TINT));
 
 	if (fStatusText.IsEmpty())
 		return;

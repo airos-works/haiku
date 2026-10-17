@@ -19,6 +19,7 @@
 #include <CharacterSet.h>
 #include <CharacterSetRoster.h>
 #include <ControlLook.h>
+#include <FrameLines.h>
 #include <MenuItem.h>
 #include <Message.h>
 #include <PopUpMenu.h>
@@ -127,14 +128,18 @@ StatusView::Draw(BRect updateRect)
 			bounds, updateRect,	ViewColor());
 	}
 
+	// the lines over the background: at a fractional scale they keep their
+	// width wherever the window is
 	BRect bounds(Bounds());
-	SetHighColor(tint_color(ViewColor(), B_DARKEN_2_TINT));
-	StrokeLine(bounds.LeftTop(), bounds.RightTop());
+	rgb_color lineColor = tint_color(ViewColor(), B_DARKEN_2_TINT);
+	stroke_line_over_fill(this, bounds, BControlLook::B_TOP_BORDER, lineColor);
 
 	float x = bounds.left;
 	for (size_t i = 0; i < kStatusCellCount - 1; i++) {
 		x += fCellWidth[i];
-		StrokeLine(BPoint(x, bounds.top + 3), BPoint(x, bounds.bottom - 3));
+		stroke_line_over_fill(this,
+			BRect(bounds.left, bounds.top + 3, x, bounds.bottom - 3),
+			BControlLook::B_RIGHT_BORDER, lineColor);
 	}
 
 	SetLowColor(ViewColor());

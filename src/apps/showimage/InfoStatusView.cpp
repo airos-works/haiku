@@ -12,6 +12,7 @@
 #include "InfoStatusView.h"
 
 #include <ControlLook.h>
+#include <FrameLines.h>
 #include <Entry.h>
 #include <MenuItem.h>
 #include <NumberFormat.h>
@@ -87,13 +88,17 @@ InfoStatusView::Draw(BRect updateRect)
 	BRect bounds(Bounds());
 	rgb_color highColor = ui_color(B_PANEL_TEXT_COLOR);
 
-	SetHighColor(tint_color(ViewColor(), B_DARKEN_2_TINT));
-	StrokeLine(bounds.LeftTop(), bounds.RightTop());
+	// the lines over the background: at a fractional scale they keep their
+	// width wherever the window is
+	rgb_color lineColor = tint_color(ViewColor(), B_DARKEN_2_TINT);
+	stroke_line_over_fill(this, bounds, BControlLook::B_TOP_BORDER, lineColor);
 
 	float x = bounds.left;
 	for (size_t i = 0; i < kStatusCellCount - 1; i++) {
 		x += fCellWidth[i];
-		StrokeLine(BPoint(x, bounds.top + 3), BPoint(x, bounds.bottom - 3));
+		stroke_line_over_fill(this,
+			BRect(bounds.left, bounds.top + 3, x, bounds.bottom - 3),
+			BControlLook::B_RIGHT_BORDER, lineColor);
 	}
 
 	SetLowColor(ViewColor());

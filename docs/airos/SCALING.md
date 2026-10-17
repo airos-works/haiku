@@ -75,7 +75,12 @@ frame and edge; the slider thumb's outline is drawn again over the thumb.
 A scroll bar lies on the dark ring of a fancy `BScrollView` frame; on those
 sides it draws that ring with the frame's two ring band (the faint edge
 outside it included), so the frame and the scroll bar agree on its pixels
-(the dark line there was 2 or 3 pixels). Checked with `parshot.sh` and
+(the dark line there was 2 or 3 pixels). A plain frame (`BScrollView`,
+`BColumnListView`) is one ring around views that cover all of its inside,
+so it cannot grow inwards: it gets the whole part of the scale (1 pixel at
+125 to 175 percent, as Chromium floors border widths) against those views
+on every side (`kFrameLinesHugInside`), and the background fills what its
+pixel leaves outside. Checked with `parshot.sh` and
 `linepar.py`: a window is captured, moved by one logical pixel and
 captured again, and every line that changed width is listed.
 
@@ -174,9 +179,10 @@ area sampled; GTK programs and Firefox draw at 2x through the server above.
 - One pixel lines a program draws itself (custom views, the primitives in
   `gallery`) are still one or two buffer pixels thick depending on where
   they fall; only the kit knows which lines belong together.
-- A one ring frame drawn around child views has no room to grow: the plain
-  frame of `BScrollView` and `BColumnListView` and the edge of Tracker's
-  windows (the gap between its views) are 1 or 2 pixels. Faint rings that
+- Lines that are a gap between child views, painted in the parent's view
+  colour (the edge of Tracker's windows, Deskbar's separators), are 1 or 2
+  pixels, as are the scroll bars' outer sides on a plain `BColumnListView`
+  frame (2 pixels, its other sides 1). Faint rings that
   take up what the scale leaves next to a ring that keeps its width (a
   box's outer edge, the bevel above a menu bar's border, a thumb's
   highlight next to the scroll bar's border) vary between 1 and 2 pixels.
