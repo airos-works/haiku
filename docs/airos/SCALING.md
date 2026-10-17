@@ -61,6 +61,24 @@ per side the same way: the dark outlines keep their width (2 px at 150 and
 175 percent; the top ones were 1 px at 175), the middle ring takes the rest.
 Lines a program draws itself keep the grid (one or two pixels).
 
+**Separators and edges** (`FrameLines.h`, `stroke_line_over_fill()`). A
+line that separates two areas or ends one is drawn after what it lies on,
+over that fill, with its rounded width from its outer edge inwards; it
+also covers its own logical pixel (`kFrameLinesCoverPixels`), so nothing
+is left undrawn in a transparent view. That way the bottom border of menu
+bars (drawn again over the background), the bottom line and column
+separators of Tracker's and `BColumnListView`'s headers, the dark ends of
+a scroll bar's track and a disabled thumb's bevel are 2 pixels at 150 and
+175 percent wherever the window is. A menu separator's dark and light
+lines are one band (2 + 1 pixels at 150 percent), as are a slider bar's
+frame and edge; the slider thumb's outline is drawn again over the thumb.
+A scroll bar lies on the dark ring of a fancy `BScrollView` frame; on those
+sides it draws that ring with the frame's two ring band (the faint edge
+outside it included), so the frame and the scroll bar agree on its pixels
+(the dark line there was 2 or 3 pixels). Checked with `parshot.sh` and
+`linepar.py`: a window is captured, moved by one logical pixel and
+captured again, and every line that changed width is listed.
+
 **Translucent lines** (`B_OP_ALPHA`, blended frames) cover whole buffer pixels
 like opaque ones instead of being rasterized between pixels.
 
@@ -153,11 +171,15 @@ area sampled; GTK programs and Firefox draw at 2x through the server above.
 
 ## What is left
 
-- One pixel lines a program draws itself (Tracker list rows, custom views)
-  are still one or two buffer pixels thick depending on where they fall;
-  only the control look knows which lines belong together.
-- Scroll bar arrows and thumbs draw their rings alone; at 175 percent their
-  outlines come out even, but nothing guarantees it.
+- One pixel lines a program draws itself (custom views, the primitives in
+  `gallery`) are still one or two buffer pixels thick depending on where
+  they fall; only the kit knows which lines belong together.
+- A one ring frame drawn around child views has no room to grow: the plain
+  frame of `BScrollView` and `BColumnListView` and the edge of Tracker's
+  windows (the gap between its views) are 1 or 2 pixels. Faint rings that
+  take up what the scale leaves next to a ring that keeps its width (a
+  box's outer edge, the bevel above a menu bar's border, a thumb's
+  highlight next to the scroll bar's border) vary between 1 and 2 pixels.
 - Scrolling by an odd number of logical pixels at 150 percent (most steps at
   125 and 175) still redraws the view instead of copying it; with glyphs from
   the cache that is cheap for text, less so for large images.
@@ -187,7 +209,12 @@ area sampled; GTK programs and Firefox draw at 2x through the server above.
 - `devshot file.png [x y w h]`: the screen in buffer pixels (the screenshot
   APIs average a scaled desktop down to its logical size);
 - `scalebench [n]`: text view, bitmap and window redraws, moves and scrolls;
-- `teamtime [name]`: a team's CPU time so far, for drag tests.
+- `teamtime [name]`: a team's CPU time so far, for drag tests;
+- `parshot.sh` (on the device) and `linepar.py` (on the host, Python with
+  PIL): capture a window, move it by one logical pixel, capture it again,
+  and list the lines whose width changed (example: `parshot.sh FileTypes 1
+  300 200 /boot/home/par-ft`, then `linepar.py 1.5 par-ft-a.png 300 200
+  par-ft-b.png 301 201 <w> <h>` with the size parshot.sh prints).
 
 A QEMU loop: boot the CI x86_64 image with the new `haiku.hpkg` swapped in
 with `bfs_shell --start-offset 6291456`, set `screenmode -q 1920 1080 32`,
