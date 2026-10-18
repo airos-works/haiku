@@ -60,11 +60,24 @@ follows them, sorted as before.
 Pe and Vision are x86_64 only: HaikuPorts has no arm64 builds, so the ROCK 5,
 Pi and Cubie images have the same menu without those two entries.
 
-On 2026-10-18, both x86_64 and ARM64 packages were checked for the Office
-links and their executable targets, then booted with the merged Haiku tree
-in disposable QEMU guests. Clipper, WordCraft, GridCraft, DeckCraft and
-PdfCraft launched and remained running; their windows were captured, and
-`pdfcraft-cli --version` succeeded on both architectures. The screenshot
-above shows all five entries, with Office between Applications and Utilities.
-The application sources are pinned in airos-ci's `apps/office.lock.json`.
-These are application and emulated boot checks, not physical GPU tests.
+On 2026-10-18, all four release images were built from Haiku `ea650d9960`
+(upstream through `8673bcc864`) with airos-ci `3e02433`. All five Office
+packages were read back from each image's BFS volume, matched against the
+manifest hashes, and checked for their Office links and executable targets.
+
+| Release image | Verification |
+| --- | --- |
+| x86_64 | QEMU BIOS and UEFI graphical boot; all five Office apps and PDF CLI |
+| ARM64 / ROCK 5 | QEMU UEFI graphical boot; all five Office apps and PDF CLI |
+| Raspberry Pi 4 | SD partition layout, required boot files and Office packages |
+| Cubie A7S | GPT, boot chain, ESP contents, Office packages and QEMU UEFI desktop |
+
+Clipper, WordCraft, GridCraft, DeckCraft and PdfCraft launched and remained
+running in disposable guests made from the final x86_64 and ARM64 images;
+`pdfcraft-cli --version` succeeded on both. An ARM64 crypto probe also passed
+SHA-256, AES-GCM, Ed25519 and system-randomness checks. The screenshot above
+shows all five entries, with Office between Applications and Utilities.
+Application sources are pinned in airos-ci's `apps/office.lock.json`; image
+manifests record those pins, the Haiku and buildtools revisions, and compiler
+versions. Physical GPU and board-peripheral tests were not rerun for this
+build integration.
