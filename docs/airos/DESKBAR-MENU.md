@@ -1,16 +1,18 @@
 # Deskbar menu
 
-The Deskbar menu of an air/OS install has six folders, in this order:
-Applications, Office, Utilities, Demos, Desktop applets and Preferences. Since
-the 2026-10-18 Office integration (following `airos-deskbar-menu` and
-`deskbar-utilities-root` on 2026-10-17).
+The Deskbar menu of an air/OS install has seven folders, in this order:
+Applications, Office, Media, Utilities, Demos, Desktop applets and
+Preferences. Media came on 2026-10-19, after the 2026-10-18 Office
+integration (following `airos-deskbar-menu` and `deskbar-utilities-root` on
+2026-10-17). Turbo Chook left the images on 2026-10-19.
 
-![The Deskbar menu and its Office folder](deskbar-menu.png)
+![The Deskbar menu and its Office folder, before Media was added](deskbar-menu.png)
 
 | Folder | Entries |
 | --- | --- |
-| Applications | airShot, airTime, Amp, Burrow, DeskCalc, HaikuDepot, Icon-O-Matic, Installer, Kiri, Mail, MediaConverter, MidiPlayer, Pe, People, SoftwareUpdater, SoundRecorder, StyledEdit, Summit, Terminal, TurboChook |
+| Applications | airShot, airTime, Amp, Burrow, DeskCalc, HaikuDepot, Icon-O-Matic, Installer, Kiri, Mail, MediaConverter, MidiPlayer, Pe, People, SoftwareUpdater, SoundRecorder, StyledEdit, Summit, Terminal |
 | Office | Clipper, WordCraft, GridCraft, DeckCraft, PdfCraft |
+| Media | PhotoCraft, LightCraft |
 | Utilities | CharacterMap, CodyCam, Debugger, Devices, DiskProbe, DiskUsage, DriveSetup, Expander, Magnify, PoorMan, SerialConnect, Vision |
 | Demos | Chart, Clock, Cortex, FontDemo, GLTeapot, Mandelbrot, OverlayImage, Pairs, PatchBay, Playground, Pulse, Sudoku |
 | Desktop applets | AutoRaise, BluetoothStatus, LaunchBox, NetworkStatus, PowerStatus, ProcessController, WiFiStatus, Workspaces |
@@ -35,9 +37,10 @@ The menu is the merge of the `data/deskbar/menu` directories listed in
   `build/jam/packages/Haiku`. Debugger's entry used to be
   in haiku_devel; it is in the haiku package now, under Utilities.
 - The applications air/OS CI builds (airShot, airTime, Amp, Burrow, Kiri,
-  Summit, Turbo Chook): each package's own
+  Summit): each package's own
   `data/deskbar/menu/Applications/<name>` link. Clipper and the four Craft
-  applications supply `data/deskbar/menu/Office/<name>` links. The new Terminal and
+  applications supply `data/deskbar/menu/Office/<name>` links, PhotoCraft and
+  LightCraft `data/deskbar/menu/Media/<name>` links. The new Terminal and
   MediaConverter replace the in-tree apps under the same names, so their
   entries stay as they are.
 - Pe: HaikuPorts' package (the nightly profile adds it), as it is.
@@ -48,12 +51,13 @@ The menu is the merge of the `data/deskbar/menu` directories listed in
   Vision out when CI staged one (`SuppressHaikuImagePackages`, a rule this
   branch added to `build/jam/ImageRules`).
 
-Office has its localized name in `src/data/directory_attrs/deskbar-office.rdef`
-and shares the same catalog and ordering mechanism. Utilities' localized name is `src/data/directory_attrs/deskbar-utilities.rdef`
+Office and Media have their localized names in
+`src/data/directory_attrs/deskbar-office.rdef` and `deskbar-media.rdef` and
+share the same catalog and ordering mechanism. Utilities' localized name is `src/data/directory_attrs/deskbar-utilities.rdef`
 with its catalog entry in `src/apps/deskbar/LocalizedFolders.h`. The menu
 itself would sort its folders by name, which puts Utilities last;
 `TDeskbarMenu::_OrderStandardFolders()` (`src/apps/deskbar/DeskbarMenu.cpp`)
-puts the six standard folders first in their own order, by entry name, and
+puts the seven standard folders first in their own order, by entry name, and
 anything else (a folder a user adds to `~/config/settings/deskbar/menu`)
 follows them, sorted as before.
 
