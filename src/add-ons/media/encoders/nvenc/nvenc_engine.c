@@ -450,8 +450,14 @@ nvencOpen(char *reason, size_t reasonSize)
 		engine->userd = engine->userdMapping.address;
 	}
 
+	/* which NVENC: the first (GP104 and later have two or three) */
+	NV_MSENC_ALLOCATION_PARAMETERS encoderParams = {
+		.size = sizeof(NV_MSENC_ALLOCATION_PARAMETERS),
+		.prohibitMultipleInstances = 0,
+		.engineInstance = 0,
+	};
 	status = nvRmApiAlloc(&engine->rm, engine->channel, &engine->encoder,
-		card->encoderClass, NULL);
+		card->encoderClass, &encoderParams);
 	if (status != NV_OK) {
 		fail(engine, "encoder object", status);
 		goto error;
@@ -581,6 +587,11 @@ nvencExecute(NvencEngine *engine, int timeoutMs, char *reason, size_t reasonSize
 		if (*semaphore == want)
 			return 0;
 		if (notifier[3] != 0) {
+			if (getenv("NVENC_DEBUG") != NULL) {
+				fprintf(stderr, "nvenc: class %#x, channel %#x: notifier %08x %08x "
+					"%08x %08x\n", engine->card.encoderClass, engine->card.channelClass,
+					notifier[0], notifier[1], notifier[2], notifier[3]);
+			}
 			/* timestamp, info32, then info16 and the status */
 			if (reason != NULL) {
 				snprintf(reason, reasonSize,

@@ -547,6 +547,19 @@ nvencH264Encode(NvencH264 *encoder, const nvenc_picture *picture, NvencQueue *qu
 		encoder->config.timeout_ms != 0 ? (int)encoder->config.timeout_ms : 2000, why,
 		sizeof(why));
 	if (executed != 0) {
+		if (getenv("NVENC_DEBUG") != NULL) {
+			const uint32_t *words = encoder->status.data;
+			fprintf(stderr, "nvenc: status");
+			for (int i = 0; i < 16; i++)
+				fprintf(stderr, " %08x", words[i]);
+			fprintf(stderr, "\n");
+			fprintf(stderr, "nvenc: status words:");
+			for (size_t i = 16; i < encoder->status.size / 4; i++) {
+				if (words[i] != 0)
+					fprintf(stderr, " %zx:%08x", i * 4, words[i]);
+			}
+			fprintf(stderr, "\n");
+		}
 		if (reason != NULL)
 			snprintf(reason, reasonSize, "NVENC: %s", why);
 		return executed;

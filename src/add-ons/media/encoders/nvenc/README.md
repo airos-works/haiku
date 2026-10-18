@@ -41,8 +41,20 @@ a crash is reported at once, a hang after a minute and a half. The result is
 kept in `~/config/settings/MediaConverter NVENC test` per card and add-on
 build.
 
-This has not run on an NVIDIA card yet: the lab's X399 has had an AMD card
-since 2026-10-12. The card side - resman, the channels, the class list - is the
+First run on a card (GTX 1070, GP104, class C2B7 on a Pascal channel, the
+X399, 2026-10-18): the add-on finds the card and its class, makes its
+channel and encoder object, and the engine takes the picture - it copies the
+picture type into the status buffer - and then stops it: the channel's
+error notifier says ROBUST_CHANNEL_NVENC0_ERROR (47), the status
+`error_status` 1 with no microcode error code, for every input arrangement
+and for H.264 and H.265 alike. The structures are not the cause: the 2021
+`nvenc_drv.h` NVIDIA published for C2B7 and earlier (open-gpu-doc
+97c510e793) lays them out byte for byte as the 2024 one Mesa carries. So
+MediaConverter's test fails, the formats are encoded on the CPU and the
+window says why. What the engine rejects is not known yet; a capture of
+NVIDIA's own driver encoding on the card (its picture setup, found by the
+magic 0xC2B70006) would show it. `NVENC_DEBUG=1` makes the add-on print the
+notifier and status words of a failed picture. The card side - resman, the channels, the class list - is the
 NVDEC add-on's, which works on the GTX 1080 Ti; the encoding is written from the
 header alone. On a first run with a card, `mediaconvert --hardware` says for
 each format whether it passed or what went wrong, and
