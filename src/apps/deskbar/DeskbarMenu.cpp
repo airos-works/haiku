@@ -163,6 +163,7 @@ TDeskbarMenu::_OrderStandardFolders(int32 firstIndex)
 	static const char* const kStandardFolders[] = {
 		"Applications",
 		"Office",
+		"Media",
 		"Utilities",
 		"Demos",
 		"Desktop applets",
