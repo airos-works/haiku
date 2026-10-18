@@ -2,9 +2,10 @@
 
 The Deskbar menu of an air/OS install has six folders, in this order:
 Applications, Office, Utilities, Demos, Desktop applets and Preferences. Since
-branches `airos-deskbar-menu` and `deskbar-utilities-root` (2026-10-17).
+the 2026-10-18 Office integration (following `airos-deskbar-menu` and
+`deskbar-utilities-root` on 2026-10-17).
 
-![The Deskbar menu before Office was added, and its Utilities folder](deskbar-menu.png)
+![The Deskbar menu and its Office folder](deskbar-menu.png)
 
 | Folder | Entries |
 | --- | --- |
@@ -59,8 +60,11 @@ follows them, sorted as before.
 Pe and Vision are x86_64 only: HaikuPorts has no arm64 builds, so the ROCK 5,
 Pi and Cubie images have the same menu without those two entries.
 
-The five-folder layout before Office was checked on x86_64 CI images with
-the packages of 2026-10-17 and the repacked Vision, booted in QEMU: Vision
-and Debugger start from Utilities. The screenshot above records that layout.
-Office was added on 2026-10-18; both architecture packages include the
-folder. Validation of the complete Office application set is still in progress.
+On 2026-10-18, both x86_64 and ARM64 packages were checked for the Office
+links and their executable targets, then booted with the merged Haiku tree
+in disposable QEMU guests. Clipper, WordCraft, GridCraft, DeckCraft and
+PdfCraft launched and remained running; their windows were captured, and
+`pdfcraft-cli --version` succeeded on both architectures. The screenshot
+above shows all five entries, with Office between Applications and Utilities.
+The application sources are pinned in airos-ci's `apps/office.lock.json`.
+These are application and emulated boot checks, not physical GPU tests.
