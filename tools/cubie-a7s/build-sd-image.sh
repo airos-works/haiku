@@ -35,7 +35,7 @@ done
 WORK=$(mktemp -d "${TMPDIR:-/mnt/HaikuWork/tmp}/cubie-sd.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 
-BOOTLOADER=$("$HERE/fetch-bootloader.sh")
+BOOTLOADER=$("$HERE/fetch-bootloader.sh" "${CUBIE_BOOTLOADER_DIR:-/mnt/HaikuWork/cubie/bootloader}")
 if [[ -z $UBOOT_BIN ]]; then
 	UBOOT_BIN=$("$HERE/u-boot/build.sh")
 fi

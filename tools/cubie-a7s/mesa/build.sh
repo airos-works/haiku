@@ -23,7 +23,7 @@ MESA_URL=https://archive.mesa3d.org/$MESA_ARCHIVE
 # Engestrom, 57551DE15B968F6341C248F68D8E31AFC32428A6
 MESA_SHA256=bce5f7fbebb934373b86c999a064d52fb5065878dc57f287f95346648ec832e9
 
-WORK=/mnt/HaikuWork
+WORK=${HAIKU_WORK_ROOT:-/mnt/HaikuWork}
 ROOT=${CUBIE_MESA_ROOT:-$WORK/cubie/mesa}
 # the ROCK 5's pinned arm64 Haiku sysroot and cross file (also used by rpi4)
 BASE=${CUBIE_MESA_BASE:-$WORK/artifacts/mali-system-opengl-build/20260918T125722Z}
@@ -32,8 +32,8 @@ TREE=$(cd "$TOOLS/../../.." && pwd)
 PVR_HEADERS=${PVR_HAIKU_HEADERS:-$TREE/headers/private/graphics/powervr}
 # the display driver's contract, for the frame buffer import (direct present)
 SUNXI_HEADERS=$TREE/headers/private/graphics/sunxi_display
-CROSS=$WORK/build/arm64/cross-tools-arm64/bin/aarch64-unknown-haiku
-NATIVE_DEPS=$WORK/toolchains/mesa-native-deps
+CROSS=${CUBIE_CROSS_PREFIX:-$WORK/build/arm64/cross-tools-arm64/bin/aarch64-unknown-haiku}
+NATIVE_DEPS=${CUBIE_NATIVE_DEPS:-$WORK/toolchains/mesa-native-deps}
 JOBS=${HAIKU_JOBS:-16}
 # Assertions are off in the driver and GL builds (b_ndebug): images ship
 # what this builds, and an assertion there ends the application (a WebGL
@@ -65,7 +65,7 @@ TLS_CHECK=(tls_generation_check libtls_generation_check.so)
 
 export PATH=$HOST_TOOLS/bin:$WORK/toolchains/mesa-python/bin:$WORK/toolchains/host/usr/bin:$PATH
 export LD_LIBRARY_PATH=$NATIVE_DEPS/usr/lib/x86_64-linux-gnu:$NATIVE_DEPS/usr/lib/llvm-18/lib
-export TMPDIR=$WORK/tmp
+export TMPDIR=${TMPDIR:-$WORK/tmp}
 unset PKG_CONFIG_PATH
 mkdir -p "$ROOT" "$TMPDIR"
 

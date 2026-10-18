@@ -3,6 +3,7 @@
 #   x86_64  airos-x86_64.iso   USB stick / CD, EFI and BIOS (X399 and other PCs)
 #   arm64   airos-arm64.iso    USB stick, UEFI (ROCK 5 ITX and other arm64 machines)
 #   rpi4    airos-rpi4.img     Raspberry Pi 4 SD card (Balena Etcher), boots directly
+#   cubie   airos-cubie.img    Radxa Cubie A7S SD card with U-Boot and UEFI
 # Each image is smoke-tested (Pi: SD layout) and published on the build server
 # and as a public, immutable GitHub prerelease. They are rebuilt nightly
 # too, to pick up new builds of the applications and Summit.
@@ -18,7 +19,7 @@ on:
     inputs:
       targets:
         description: images to build
-        default: x86_64 arm64 rpi4
+        default: x86_64 arm64 rpi4 cubie
 
 permissions:
   contents: write
@@ -32,14 +33,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [x86_64, arm64, rpi4]
+        target: [x86_64, arm64, rpi4, cubie]
     runs-on: [self-hosted, airos-build]
     timeout-minutes: 240
     steps:
       - name: Selected
         id: selected
         run: |
-          targets="${{ inputs.targets || 'x86_64 arm64 rpi4' }}"
+          targets="${{ inputs.targets || 'x86_64 arm64 rpi4 cubie' }}"
           [[ " $targets " == *" ${{ matrix.target }} "* ]] && echo "build=1" >> "$GITHUB_OUTPUT" || true
 
       - name: Fetch airos-ci
