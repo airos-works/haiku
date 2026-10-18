@@ -162,6 +162,7 @@ TDeskbarMenu::_OrderStandardFolders(int32 firstIndex)
 	// (the labels are localized); any other entry follows them as sorted.
 	static const char* const kStandardFolders[] = {
 		"Applications",
+		"Office",
 		"Utilities",
 		"Demos",
 		"Desktop applets",

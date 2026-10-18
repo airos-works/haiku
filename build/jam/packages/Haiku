@@ -538,6 +538,9 @@ for linkTarget in $(DESKBAR_APPLICATIONS) {
 		: ../../../../apps/$(linkTarget) : $(linkTarget) ;
 }
 
+# Office applications supply their links in their own packages.
+AddDirectoryToPackage data deskbar menu Office : deskbar-office.rdef ;
+
 # "Utilities" links
 if $(DESKBAR_UTILITIES) {
 	AddDirectoryToPackage data deskbar menu Utilities
