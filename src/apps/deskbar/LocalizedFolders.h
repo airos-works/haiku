@@ -7,6 +7,9 @@ B_TRANSLATE_MARK_ALL("Applications",
 B_TRANSLATE_MARK_ALL("Office",
 	"B_USER_DESKBAR_DIRECTORY/Office", "");
 
+B_TRANSLATE_MARK_ALL("Media",
+	"B_USER_DESKBAR_DIRECTORY/Media", "");
+
 B_TRANSLATE_MARK_ALL("Utilities",
 	"B_USER_DESKBAR_DIRECTORY/Utilities", "");
 

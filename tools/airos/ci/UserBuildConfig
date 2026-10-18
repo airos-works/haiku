@@ -80,7 +80,7 @@ switch $(HAIKU_BUILD_PROFILE) {
 		HAIKU_IMAGE_SIZE = $(AIROS_CI_IMAGE_SIZE:E=3072) ;
 		# What the x86_64 applications require that the HaikuPorts repository
 		# list of the build system has (the rest arrive as package files):
-		# Amp (curl, SQLite), Kiri and Turbo Chook (git, PCRE2), airTime
+		# Amp (curl, SQLite), Kiri (git, PCRE2), airTime
 		# (FFmpeg 6), Burrow (OpenSSL 3) and Summit's TLS certificates.
 		AddHaikuImageSystemPackages curl sqlite libpcre2 openssl3 ffmpeg6 git
 			ca_root_certificates ;
