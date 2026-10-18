@@ -118,6 +118,9 @@ struct Buffer {
 status_t CreateBuffer(int fd, uint32 width, uint32 height, uint32 format,
 	Buffer& buffer, bool addFramebuffer = true);
 void DestroyBuffer(int fd, Buffer& buffer);
+// offers \a buffer to renderers that draw into the screen
+// (DRM_HAIKU_IOCTL_SCANOUT)
+status_t PublishScanout(int fd, const Buffer& buffer, uint32 format);
 
 // waits for the next vertical blank of the CRTC with the index \a crtcIndex
 status_t WaitVBlank(int fd, uint32 crtcIndex, uint32* sequence = NULL);

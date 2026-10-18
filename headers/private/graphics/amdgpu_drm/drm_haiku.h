@@ -102,4 +102,30 @@ struct drm_haiku_backlight {
 
 #define DRM_HAIKU_IOCTL_BACKLIGHT	DRM_IOWR(0xf6, struct drm_haiku_backlight)
 
+/*	The screen's frame buffer, for a renderer that copies its finished frames
+	straight into it (Vulkan: VkImportScanoutMemoryHAIKU) instead of handing
+	them to app_server. The accelerant publishes the buffer it scans out
+	from whenever that changes (op 1, primary nodes only: its handle and
+	shape) and withdraws it (op 0); any client of the GPU then gets a handle
+	to it on its own file (op 2), with the shape, the size and a generation
+	that changes with every publish. The published buffer stays referenced
+	until it is replaced or withdrawn, or the publisher's file closes. */
+struct drm_haiku_scanout {
+	__u32 op;			/* in: 0 withdraw, 1 publish, 2 get */
+	__u32 handle;		/* in (1): the buffer; out (2): a handle on this file */
+	__u32 width;		/* in (1), out (2): pixels */
+	__u32 height;
+	__u32 pitch;		/* in (1), out (2): bytes per row */
+	__u32 format;		/* in (1), out (2): DRM_FORMAT_* */
+	__u32 generation;	/* out */
+	__u32 reserved;
+	__u64 size;			/* out (2): bytes */
+};
+
+#define DRM_HAIKU_SCANOUT_WITHDRAW	0
+#define DRM_HAIKU_SCANOUT_PUBLISH	1
+#define DRM_HAIKU_SCANOUT_GET		2
+
+#define DRM_HAIKU_IOCTL_SCANOUT	DRM_IOWR(0xf8, struct drm_haiku_scanout)
+
 #endif /* _DRM_HAIKU_H */

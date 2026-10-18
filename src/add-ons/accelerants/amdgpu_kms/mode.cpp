@@ -499,6 +499,13 @@ apply_layout(Layout& layout, bool testOnly)
 
 	// it is on screen
 	if (!reused) {
+		// Renderers that copy their frames straight into the screen (Summit)
+		// take it from the driver; an older driver does not offer that.
+		status_t published = Kms::PublishScanout(fd, buffer,
+			DRM_FORMAT_XRGB8888);
+		if (published != B_OK)
+			TRACE("frame buffer not offered to renderers: %s\n",
+				strerror(published));
 		Kms::DestroyBuffer(fd, gInfo->frameBuffer);
 		gInfo->frameBuffer = buffer;
 	}
