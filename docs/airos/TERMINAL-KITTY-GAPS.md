@@ -18,7 +18,7 @@ only), grapheme clusters, reflow, GPU drawing.
 
 | # | What | Effort | Why first |
 | --- | --- | --- | --- |
-| 1 | Shell integration for bash, on by default | S | Prompt jumps (Ctrl+Shift+Z/X) already work, but only for a shell that marks its prompts, and air/OS's bash does not. A profile snippet that emits OSC 133 and OSC 7 when `TERM_PROGRAM=airos-terminal` makes them work, and lets kitty-style features below build on it. |
+| 1 | ~~Shell integration for bash~~ | done | `data/profile.d/airos-terminal.sh` marks prompts (OSC 133) and reports the directory (OSC 7); prompt jumps work out of the box. |
 | 2 | Color emoji | M | The most visible difference from kitty: emoji are drawn as monochrome outlines today. Prompts, `git` tools and Claude Code use them. |
 | 3 | Faster full-screen drawing | S-M, then L | Because of reading back, the GPU path loses to software on both test machines (X399 with NVIDIA, Framework 13 with AMD), so Terminal draws in software there today. A multi-threaded software renderer (S-M) gives ~3x on full frames. Drawing straight into the screen without the read back (L) is what makes the GPU worth it. |
 | 4 | Notification clicks, icons, expiry | S-M | Lets `kitten notify`-style tools and long-running jobs bring you back to the right tab. |
@@ -32,8 +32,9 @@ kitty ships scripts for bash, zsh and fish that mark prompts and commands
 at the prompt to move the cursor there (`click_events`), redraw the prompt
 on resize (`redraw=0`), warn before closing a tab that runs a command
 (`cmdline`), open the last command's output in a pager, select it.
-Terminal reads the marks and jumps between prompts. Missing: the scripts
-(S: a `profile.d` snippet for bash) and the features on top (M).
+Terminal reads the marks and jumps between prompts, and air/OS's bash marks
+them (`data/profile.d/airos-terminal.sh`). Missing: the features on top (M),
+and scripts for zsh and fish (not in the image).
 
 ### Notifications (OSC 99) — S to M, partly blocked
 Missing: telling the program that a notification was clicked (`a=report`)

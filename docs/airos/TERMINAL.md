@@ -147,10 +147,21 @@ New shortcuts, as in kitty:
 
 | Keys | Does |
 | --- | --- |
-| Ctrl+Shift+Z / Ctrl+Shift+X | Scroll to the previous / next shell prompt (needs OSC 133 marks from the shell) |
+| Ctrl+Shift+Z / Ctrl+Shift+X | Scroll to the previous / next shell prompt |
 | Ctrl+Shift+Up / Down | Scroll the history one line |
 
 Shift+Page Up/Down/Home/End scroll the history, as before.
+
+### Shell integration
+
+Jumping between prompts needs the shell to mark them. The haiku package
+installs `data/profile.d/airos-terminal.sh`, which the profile reads: in an
+interactive bash running in Terminal, it marks the start of each prompt, the
+command typed and its output (OSC 133 `A`, `B`, `C`, and `D` with the exit
+status), and reports the working directory (OSC 7), the way kitty's bash
+integration does. It wraps `PS1` and `PS2` before each prompt, so a profile
+that sets its own prompt keeps the marks. `AIROS_TERMINAL_INTEGRATION=0` in
+the environment turns it off.
 
 ## Links
 
