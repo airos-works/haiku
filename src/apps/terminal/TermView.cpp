@@ -73,6 +73,7 @@
 
 #include "ActiveProcessInfo.h"
 #include "Base64.h"
+#include "TermDragAndDrop.h"
 #include "Colors.h"
 #include "InlineInput.h"
 #include "PrefHandler.h"
@@ -178,7 +179,8 @@ enum {
 	EVENT_WORKING_DIRECTORY,
 	EVENT_MODES,
 	EVENT_PROGRESS,
-	EVENT_REMOTE_CONTROL
+	EVENT_REMOTE_CONTROL,
+	EVENT_DRAG_AND_DROP
 };
 
 
@@ -509,6 +511,9 @@ TermView::_InitObject(const ShellParameters& shellParameters)
 	fResizeViewDisableCount = 0;
 	static int32 sNextRemoteControlID = 1;
 	fRemoteControlID = atomic_add(&sNextRemoteControlID, 1);
+	fDragAndDrop = new(std::nothrow) TermDragAndDrop(this,
+		[this](const std::string& data) { _Send(data); });
+	fDragGesture = false;
 	fLastActivityTime = 0;
 	fCursorState = 0;
 	fCursorBlinking = false;
@@ -605,6 +610,7 @@ TermView::~TermView()
 			= fNotificationIcons.begin(); it != fNotificationIcons.end(); it++) {
 		delete it->second;
 	}
+	delete fDragAndDrop;
 
 	delete fDefaultState;
 	delete fSelectState;
@@ -1849,6 +1855,17 @@ TermView::TerminalNotify(const TermNotification& notification)
 
 
 void
+TermView::TerminalDragAndDrop(const char* data)
+{
+	Event* event = new(std::nothrow) Event(EVENT_DRAG_AND_DROP);
+	if (event != NULL) {
+		event->text = data;
+		_PostEvent(event);
+	}
+}
+
+
+void
 TermView::TerminalRemoteControl(const char* json)
 {
 	Event* event = new(std::nothrow) Event(EVENT_REMOTE_CONTROL);
@@ -2095,6 +2112,11 @@ TermView::_HandleEvents()
 				BMessenger(kNotificationServerSignature).SendMessage(&request);
 				break;
 			}
+
+			case EVENT_DRAG_AND_DROP:
+				if (fDragAndDrop != NULL)
+					fDragAndDrop->Command(event->text);
+				break;
 
 			case EVENT_REMOTE_CONTROL:
 			{
@@ -3813,6 +3835,18 @@ TermView::MessageReceived(BMessage *message)
 
 	entry_ref ref;
 	const char *ctrl_l = "\x0c";
+
+	// a program that takes drops (kitty's drag and drop) gets them
+	if (message->WasDropped() && fDragAndDrop != NULL
+		&& fDragAndDrop->IsAcceptingDrops()) {
+		BPoint where = message->DropPoint();
+		ConvertFromScreen(&where);
+		if (fDragAndDrop->Dropped(message, (int32)(where.x / fFontWidth),
+				(int32)(where.y / fFontHeight), (int32)(where.x * fScale),
+				(int32)(where.y * fScale))) {
+			return;
+		}
+	}
 
 	// first check for any dropped message
 	if (message->WasDropped() && (message->what == B_SIMPLE_DATA

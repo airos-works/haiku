@@ -67,9 +67,13 @@ Copying files over the terminal connection, used by `kitten transfer` and
 rsync-style deltas, xxHash and zlib. Of little use until the kitten programs
 run on air/OS (see below).
 
-### Drag and drop (OSC 72) — L
-Programs in the terminal accepting drops and starting drags, MIME negotiated.
-Terminal already pastes the paths of files dropped on it. Very new protocol.
+### Drag and drop (OSC 72) — mostly done
+Drops (local and remote reads) and drags with pre-sent data work (see
+TERMINAL.md). Missing (M): data the target asks for after the drop
+(`t=e:x=5`, which would need Haiku's negotiated drag protocol), pulling
+files from a program on another machine (`t=k`), changing the image while
+dragging, and real "accepted", "dropped" and "finished" events: Haiku does
+not tell a drag's source what became of it.
 
 ### Background transparency (`transparent_background_color` in OSC 21) — blocked
 Needs translucent windows, which app_server does not have.

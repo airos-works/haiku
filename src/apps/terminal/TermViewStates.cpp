@@ -38,6 +38,7 @@
 #include "ActiveProcessInfo.h"
 #include "Shell.h"
 #include "TermConst.h"
+#include "TermDragAndDrop.h"
 
 
 #undef B_TRANSLATION_CONTEXT
@@ -292,6 +293,19 @@ TermView::DefaultState::KeyDown(const char* bytes, int32 numBytes)
 void
 TermView::DefaultState::MouseDown(BPoint where, int32 buttons, int32 modifiers)
 {
+	// A program offering drags (kitty's drag and drop) gets the drag
+	// gesture, rather than a selection starting.
+	TermDragAndDrop* dragAndDrop = fView->fDragAndDrop;
+	bool gesture = dragAndDrop != NULL && dragAndDrop->IsOfferingDrags()
+		&& buttons == B_PRIMARY_MOUSE_BUTTON && (modifiers & B_SHIFT_KEY) == 0;
+	if (gesture) {
+		dragAndDrop->MouseDown(where, (int32)(where.x / fView->fFontWidth),
+			(int32)(where.y / fView->fFontHeight),
+			(int32)(where.x * fView->fScale), (int32)(where.y * fView->fScale));
+		fView->fDragGesture = true;
+		fView->SetMouseEventMask(B_POINTER_EVENTS, B_NO_POINTER_HISTORY);
+	}
+
 	// with mouse reporting the program gets the clicks, unless shift is
 	// held to select text
 	if (fView->_ReportsMouse() && (modifiers & B_SHIFT_KEY) == 0) {
@@ -308,7 +322,7 @@ TermView::DefaultState::MouseDown(BPoint where, int32 buttons, int32 modifiers)
 	}
 
 	// select region
-	if (buttons == B_PRIMARY_MOUSE_BUTTON) {
+	if (buttons == B_PRIMARY_MOUSE_BUTTON && !gesture) {
 		fView->fSelectState->Prepare(where, modifiers);
 		fView->_NextState(fView->fSelectState);
 	}
@@ -319,6 +333,23 @@ void
 TermView::DefaultState::MouseMoved(BPoint where, uint32 transit,
 	const BMessage* dragMessage, int32 modifiers)
 {
+	TermDragAndDrop* dragAndDrop = fView->fDragAndDrop;
+	if (dragMessage != NULL && dragAndDrop != NULL
+		&& dragAndDrop->IsAcceptingDrops()) {
+		// a drag over a program that takes drops
+		if (transit == B_EXITED_VIEW || transit == B_OUTSIDE_VIEW)
+			dragAndDrop->DragExited();
+		else {
+			dragAndDrop->DragMoved((int32)(where.x / fView->fFontWidth),
+				(int32)(where.y / fView->fFontHeight),
+				(int32)(where.x * fView->fScale),
+				(int32)(where.y * fView->fScale), dragMessage);
+		}
+		return;
+	}
+	if (fView->fDragGesture && dragAndDrop != NULL)
+		dragAndDrop->MouseMoved(where);
+
 	if (_CheckEnterHyperLinkState(modifiers))
 		return;
 
@@ -336,6 +367,12 @@ TermView::DefaultState::MouseMoved(BPoint where, uint32 transit,
 void
 TermView::DefaultState::MouseUp(BPoint where, int32 buttons)
 {
+	if (fView->fDragGesture) {
+		fView->fDragGesture = false;
+		if (fView->fDragAndDrop != NULL)
+			fView->fDragAndDrop->MouseUp();
+	}
+
 	if (fView->_ReportsMouse()) {
 		// the button that went up
 		int32 released = fView->fMouseButtons & ~buttons;

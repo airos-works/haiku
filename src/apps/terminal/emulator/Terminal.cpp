@@ -70,6 +70,8 @@ void Terminal::Listener::TerminalProgressChanged(int32 state, int32 percent)
 	{}
 void Terminal::Listener::TerminalRemoteControl(const char* json)
 	{}
+void Terminal::Listener::TerminalDragAndDrop(const char* data)
+	{}
 
 
 // #pragma mark - Terminal
@@ -104,6 +106,7 @@ Terminal::Terminal()
 	fLastColumn(0),
 	fLastValid(false),
 	fColorsGeneration(0),
+	fDragAndDropQueryAnswered(0),
 	fExtraCursorsGeneration(0),
 	fFocused(true),
 	fDarkColorScheme(false),

@@ -47,6 +47,7 @@ class InlineInput;
 class ShellInfo;
 class ShellParameters;
 class Shell;
+class TermDragAndDrop;
 class TermRenderer;
 
 
@@ -226,6 +227,7 @@ private:
 	virtual	void				TerminalNotify(
 									const TermNotification& notification);
 	virtual	void				TerminalRemoteControl(const char* json);
+	virtual	void				TerminalDragAndDrop(const char* data);
 	virtual	void				TerminalCloseNotification(
 									const char* identifier);
 	virtual	void				TerminalPointerShapeChanged(
@@ -450,6 +452,8 @@ private:
 			BClipboard*			fMouseClipboard;
 			BString				fPointerShape;
 			int32				fRemoteControlID;
+			TermDragAndDrop*	fDragAndDrop;
+			bool				fDragGesture;
 			std::map<std::string, BBitmap*> fNotificationIcons;
 									// icon data programs sent, by key
 

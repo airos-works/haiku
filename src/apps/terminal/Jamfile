@@ -56,6 +56,7 @@ Application Terminal :
 	ShellParameters.cpp
 	SmartTabView.cpp
 	TermApp.cpp
+	TermDragAndDrop.cpp
 	TerminalCharClassifier.cpp
 	TerminalRoster.cpp
 	TermConst.cpp

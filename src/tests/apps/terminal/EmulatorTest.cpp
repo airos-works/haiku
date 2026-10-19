@@ -835,6 +835,14 @@ TestOperatingSystemCommands()
 		"{\"cmd\":\"ls\",\"version\":[0,14,2]}");
 	CHECK_EQUAL(rc.Row(0), "");
 
+	// kitty's drag and drop: the query is answered here (an echo of the
+	// answer right after it is not answered again), the rest goes on
+	Fixture dnd;
+	dnd.Feed("\x1b]72;t=q:i=5\x1b\\");
+	CHECK_EQUAL(dnd.Reply(), "\x1b]72;t=q:i=5\x1b\\");
+	dnd.Feed("\x1b]72;t=q:i=5\x1b\\");
+	CHECK_EQUAL(dnd.Reply(), "");
+
 	// kitty's multiple cursors
 	Fixture m(20, 10);
 	m.Feed("\x1b[> q");
