@@ -1068,9 +1068,31 @@ TermWindow::MessageReceived(BMessage *message)
 					Activate();
 					fTabView->Select(i);
 				}
-				if ((actions & 2) != 0)
-					termView->NotificationActivated(identifier);
+				if ((actions & 2) != 0) {
+					termView->NotificationActivated(identifier,
+						message->GetInt32("button", 0));
+				}
 				break;
+			}
+			break;
+		}
+
+		case MSG_NOTIFICATION_CLOSED:
+		{
+			const char* view;
+			const char* identifier;
+			if (message->FindString("view", &view) != B_OK
+				|| message->FindString("id", &identifier) != B_OK) {
+				break;
+			}
+			for (int32 i = 0; i < fSessions.CountItems(); i++) {
+				TermView* termView = _TermViewAt(i);
+				BString key;
+				key.SetToFormat("%p", termView);
+				if (key == view) {
+					termView->NotificationClosed(identifier);
+					break;
+				}
 			}
 			break;
 		}

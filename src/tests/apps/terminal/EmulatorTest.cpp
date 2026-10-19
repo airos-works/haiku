@@ -781,8 +781,8 @@ TestOperatingSystemCommands()
 	CHECK_EQUAL(n.recorder.notifications[1].body, "Body");
 	n.Feed("\x1b]99;i=q:p=?;\x1b\\");
 	std::string answer = n.Reply();
-	CHECK_EQUAL(answer, "\x1b]99;i=q:p=?;a=focus,report:o=always,unfocused"
-		":p=title,body,close,icon,?,alive:s=system,silent:u=0,1,2:w=1"
+	CHECK_EQUAL(answer, "\x1b]99;i=q:p=?;a=focus,report:c=1:o=always,unfocused"
+		":p=title,body,close,icon,?,alive,buttons:s=system,silent:u=0,1,2:w=1"
 		"\x1b\\");
 	n.Feed(answer);
 	CHECK_EQUAL(n.Reply(), "");
@@ -808,16 +808,25 @@ TestOperatingSystemCommands()
 	n.Feed("\x1b]99;a=report;No id\x1b\\");
 	n.terminal.ReportNotificationActivated("", 0);
 	CHECK_EQUAL(n.Reply(), "\x1b]99;i=0;\x1b\\");
-	// close events cannot be tracked; an icon, a name, a cache key, expiry
+	// an icon, a name, a cache key, expiry, a close event
 	n.Feed("\x1b]99;i=ic:d=0:c=1:w=5000:n=ZXJyb3I=:g=key1;Icon\x1b\\"
 		"\x1b]99;i=ic:p=icon:e=1;iVBORw==\x1b\\");
-	CHECK_EQUAL(n.Reply(), "\x1b]99;i=ic:p=close;untracked\x1b\\");
+	CHECK_EQUAL(n.Reply(), "");
+	n.terminal.ReportNotificationClosed("ic");
+	CHECK_EQUAL(n.Reply(), "\x1b]99;i=ic:p=close;\x1b\\");
 	const TermNotification& icon = n.recorder.notifications.back();
 	CHECK_EQUAL(icon.title, "Icon");
 	CHECK(icon.timeout == 5000);
 	CHECK(icon.iconNames.size() == 1 && icon.iconNames[0] == "error");
 	CHECK_EQUAL(icon.iconKey, "key1");
 	CHECK_EQUAL(icon.iconData, "\x89PNG");
+	// buttons, separated by U+2028; a click on the second
+	n.Feed("\x1b]99;i=b:d=0:a=report;Pick\x1b\\"
+		"\x1b]99;i=b:p=buttons;Yes\xe2\x80\xa8No\x1b\\");
+	CHECK(n.recorder.notifications.back().buttons.size() == 2
+		&& n.recorder.notifications.back().buttons[1] == "No");
+	n.terminal.ReportNotificationActivated("b", 2);
+	CHECK_EQUAL(n.Reply(), "\x1b]99;i=b;2\x1b\\");
 
 	// kitty's remote control: the command goes to the listener
 	Fixture rc;

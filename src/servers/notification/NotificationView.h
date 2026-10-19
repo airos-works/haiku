@@ -10,6 +10,8 @@
 
 #include <list>
 
+#include <Message.h>
+#include <Messenger.h>
 #include <String.h>
 #include <View.h>
 
@@ -20,12 +22,14 @@ class BMessageRunner;
 class BNotification;
 
 const uint32 kRemoveView = 'ReVi';
+const uint32 kNotificationButton = 'NtBt';
 
 
 class NotificationView : public BView {
 public:
 								NotificationView(BNotification* notification, bigtime_t timeout,
-									bool disableTimeout = false);
+									bool disableTimeout = false,
+									const BMessage* request = NULL);
 	virtual						~NotificationView();
 
 	virtual	void 				AttachedToWindow();
@@ -50,8 +54,13 @@ public:
 			const char*			MessageID() const;
 			int					ProgressPercent();
 
+			//! Replaced by a notification with the same ID: not closed.
+			void				SetReplaced()	{ fReplaced = true; }
+
 private:
 			void				_CalculateSize();
+			bool				_Reply(const BMessage& message,
+									int32 button = -1);
 			void				_DrawCloseButton(const BRect& updateRect);
 
 			struct LineInfo {
@@ -76,6 +85,14 @@ private:
 			rgb_color			fStripeColor;
 			bool				fCloseClicked;
 			bool				fPreviewModeOn;
+
+			// what the sender asked to hear (see the request fields in
+			// NotificationView.cpp)
+			BMessenger			fReplyTarget;
+			BMessage			fActivatedMessage;
+			BMessage			fClosedMessage;
+			BView*				fButtons;
+			bool				fReplaced;
 };
 
 #endif	// _NOTIFICATION_VIEW_H

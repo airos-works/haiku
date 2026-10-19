@@ -37,14 +37,12 @@ Terminal reads the marks and jumps between prompts, and air/OS's bash marks
 them (`data/profile.d/airos-terminal.sh`). Missing: the features on top (M),
 and scripts for zsh and fish (not in the image).
 
-### Notifications (OSC 99) — mostly done; the rest needs notification_server
-Clicks (`a=focus`, `a=report`), icons (`n=`, `p=icon`, `g=`), expiry (`w=`)
-and `p=close` work: a click starts Terminal with the team and view that
-sent the notification, which passes it on and quits. Missing: reports of
-a notification being closed (`c=1`, answered `untracked` as kitty specifies
-for such systems), buttons (`p=buttons`), sounds other than the system's.
-notification_server has no buttons and does not say when one closes; both
-need changes there (M).
+### Notifications (OSC 99) — done
+Clicks, buttons and close events come from air/OS's notification_server,
+which now answers a sender that asks (fields in the request the
+BNotification API has no calls for: a reply messenger, the messages for a
+click or a button and for the notification going away, button labels).
+Missing: sounds other than the system's (kitty's `s=` names).
 
 ### Text sizing (OSC 66) — done
 Blocks of larger, fitted or fractional text with the spec's editing rules.

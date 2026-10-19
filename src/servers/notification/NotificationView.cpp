@@ -19,8 +19,10 @@
 
 
 #include <Bitmap.h>
+#include <Button.h>
 #include <ControlLook.h>
 #include <GroupLayout.h>
+#include <GroupView.h>
 #include <LayoutUtils.h>
 #include <MessageRunner.h>
 #include <Messenger.h>
@@ -29,6 +31,7 @@
 #include <Path.h>
 #include <PropertyInfo.h>
 #include <Roster.h>
+#include <SpaceLayoutItem.h>
 #include <StatusBar.h>
 
 #include <Notifications.h>
@@ -57,8 +60,18 @@ property_info message_prop_list[] = {
 };
 
 
+/*!	Besides the archived BNotification, the request may ask for answers (an
+	extension of air/OS, which BNotification has no API for):
+	- "_reply:target" (BMessenger): where answers go;
+	- "_reply:activated" (BMessage): sent, with "button" set to 0, when the
+	  notification is clicked, instead of launching its application; with
+	  the number of a button (from 1) when that is clicked;
+	- "_reply:closed" (BMessage): sent when it goes away (clicked, closed,
+	  timed out), but not when replaced by one with the same ID;
+	- "_buttons" (strings): labels of buttons under the text.
+*/
 NotificationView::NotificationView(BNotification* notification, bigtime_t timeout,
-	bool disableTimeout)
+	bool disableTimeout, const BMessage* request)
 	:
 	BView("NotificationView", B_WILL_DRAW),
 	fNotification(notification),
@@ -69,8 +82,16 @@ NotificationView::NotificationView(BNotification* notification, bigtime_t timeou
 	fRunner(NULL),
 	fBitmap(NULL),
 	fCloseClicked(false),
-	fPreviewModeOn(false)
+	fPreviewModeOn(false),
+	fButtons(NULL),
+	fReplaced(false)
 {
+	if (request != NULL) {
+		request->FindMessenger("_reply:target", &fReplyTarget);
+		request->FindMessage("_reply:activated", &fActivatedMessage);
+		request->FindMessage("_reply:closed", &fClosedMessage);
+	}
+
 	if (fNotification->Icon() != NULL) {
 		fBitmap = new BBitmap(fNotification->Icon());
 		fIconSize = fNotification->Icon()->Bounds().IntegerWidth();
@@ -112,11 +133,27 @@ NotificationView::NotificationView(BNotification* notification, bigtime_t timeou
 				B_DARKEN_1_TINT);
 			break;
 	}
+
+	const char* label;
+	for (int32 i = 0; request != NULL
+			&& request->FindString("_buttons", i, &label) == B_OK; i++) {
+		if (fButtons == NULL) {
+			fButtons = new BGroupView(B_HORIZONTAL);
+			fButtons->GetLayout()->AddItem(BSpaceLayoutItem::CreateGlue());
+			layout->AddView(fButtons);
+		}
+		BMessage* message = new BMessage(kNotificationButton);
+		message->AddInt32("button", i + 1);
+		fButtons->GetLayout()->AddView(new BButton(label, message));
+	}
 }
 
 
 NotificationView::~NotificationView()
 {
+	if (!fReplaced && !fClosedMessage.IsEmpty())
+		_Reply(fClosedMessage);
+
 	delete fRunner;
 	delete fBitmap;
 	delete fNotification;
@@ -134,6 +171,12 @@ NotificationView::AttachedToWindow()
 
 	fGroupView = dynamic_cast<AppGroupView*>(Parent());
 
+	for (int32 i = 0; fButtons != NULL && i < fButtons->CountChildren(); i++) {
+		BButton* button = dynamic_cast<BButton*>(fButtons->ChildAt(i));
+		if (button != NULL)
+			button->SetTarget(this);
+	}
+
 	if (!fDisableTimeout) {
 		BMessage msg(kRemoveView);
 		msg.AddPointer("view", this);
@@ -146,6 +189,16 @@ void
 NotificationView::MessageReceived(BMessage* msg)
 {
 	switch (msg->what) {
+		case kNotificationButton:
+		{
+			if (!fActivatedMessage.IsEmpty())
+				_Reply(fActivatedMessage, msg->GetInt32("button", 0));
+
+			BMessage remove(kRemoveView);
+			remove.AddPointer("view", this);
+			BMessenger(Parent()).SendMessage(&remove);
+			break;
+		}
 		case B_GET_PROPERTY:
 		{
 			BMessage specifier;
@@ -320,7 +373,10 @@ NotificationView::MouseDown(BPoint point)
 			closeRect.left = closeRect.right - buttonSize;
 			closeRect.bottom = closeRect.top + buttonSize;
 
-			if (!closeRect.Contains(point)) {
+			if (!closeRect.Contains(point) && !fActivatedMessage.IsEmpty()) {
+				// the sender wants to know, rather than be launched
+				_Reply(fActivatedMessage, 0);
+			} else if (!closeRect.Contains(point)) {
 				entry_ref launchRef;
 				BString launchString;
 				BMessage argMsg(B_ARGV_RECEIVED);
@@ -538,10 +594,25 @@ NotificationView::ProgressPercent()
 }
 
 
+bool
+NotificationView::_Reply(const BMessage& message, int32 button)
+{
+	if (!fReplyTarget.IsValid())
+		return false;
+	BMessage reply(message);
+	if (button >= 0)
+		reply.SetInt32("button", button);
+	return fReplyTarget.SendMessage(&reply) == B_OK;
+}
+
+
 void
 NotificationView::_CalculateSize()
 {
 	float height = fHeight;
+
+	if (fButtons != NULL)
+		height += fButtons->PreferredSize().height + 8;
 
 	if (fNotification->Type() == B_PROGRESS_NOTIFICATION) {
 		font_height fh;

@@ -1250,10 +1250,8 @@ Terminal::_KittyNotification(const char* metadata, const char* payload)
 		return;
 
 	if (payloadType == "?") {
-		// Haiku's notifications cannot tell when they were closed, and have
-		// no buttons
-		fOutput += "\x1b]99;i=" + replyId + ":p=?;a=focus,report"
-			":o=always,unfocused:p=title,body,close,icon,?,alive"
+		fOutput += "\x1b]99;i=" + replyId + ":p=?;a=focus,report:c=1"
+			":o=always,unfocused:p=title,body,close,icon,?,alive,buttons"
 			":s=system,silent:u=0,1,2:w=1\x1b\\";
 		return;
 	}
@@ -1355,10 +1353,6 @@ Terminal::_KittyNotification(const char* metadata, const char* payload)
 	std::string id = complete.identifier.empty() ? "0" : complete.identifier;
 	fNotificationFlags[id] = (complete.reportActivation ? 1 : 0)
 		| (complete.reportClose ? 2 : 0);
-	if (complete.reportClose) {
-		// the system does not tell when a notification was closed
-		_Reply("\x1b]99;i=%s:p=close;untracked\x1b\\", id.c_str());
-	}
 	if (fListener != NULL)
 		fListener->TerminalNotify(complete);
 }

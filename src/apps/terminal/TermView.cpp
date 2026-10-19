@@ -53,6 +53,7 @@
 #include <Mime.h>
 #include <Node.h>
 #include <Notification.h>
+#include <Notifications.h>
 #include <Path.h>
 #include <PopUpMenu.h>
 #include <PropertyInfo.h>
@@ -701,11 +702,23 @@ TermView::RendererName() const
 
 
 void
-TermView::NotificationActivated(const char* identifier)
+TermView::NotificationActivated(const char* identifier, int32 button)
 {
 	std::string output;
 	fTerminal->Lock();
-	fTerminal->ReportNotificationActivated(identifier, 0);
+	fTerminal->ReportNotificationActivated(identifier, button);
+	fTerminal->TakeOutput(output);
+	fTerminal->Unlock();
+	_Send(output);
+}
+
+
+void
+TermView::NotificationClosed(const char* identifier)
+{
+	std::string output;
+	fTerminal->Lock();
+	fTerminal->ReportNotificationClosed(identifier);
 	fTerminal->TakeOutput(output);
 	fTerminal->Unlock();
 	_Send(output);
@@ -2047,7 +2060,39 @@ TermView::_HandleEvents()
 					timeout = (bigtime_t)notification.timeout * 1000;
 				else if (notification.timeout == 0)
 					timeout = 24LL * 3600 * 1000000;
-				message.Send(timeout);
+
+				// Sent as BNotification::Send() does, with the fields air/OS's
+				// notification_server answers: clicks and buttons, and the
+				// notification going away (see its NotificationView).
+				BMessage request(kNotificationMessage);
+				if (message.Archive(&request) != B_OK)
+					break;
+				if (timeout > 0)
+					request.AddInt64("timeout", timeout);
+				BString view;
+				view.SetToFormat("%p", this);
+				const char* id = notification.identifier.empty() ? "0"
+					: notification.identifier.c_str();
+				request.AddMessenger("_reply:target", BMessenger(Window()));
+				if (notification.focusOnActivation
+					|| notification.reportActivation) {
+					BMessage activated(MSG_NOTIFICATION_ACTIVATED);
+					activated.AddString("view", view);
+					activated.AddString("id", id);
+					activated.AddInt32("actions",
+						(notification.focusOnActivation ? 1 : 0)
+							| (notification.reportActivation ? 2 : 0));
+					request.AddMessage("_reply:activated", &activated);
+				}
+				if (notification.reportClose) {
+					BMessage closed(MSG_NOTIFICATION_CLOSED);
+					closed.AddString("view", view);
+					closed.AddString("id", id);
+					request.AddMessage("_reply:closed", &closed);
+				}
+				for (size_t i = 0; i < notification.buttons.size(); i++)
+					request.AddString("_buttons", notification.buttons[i].c_str());
+				BMessenger(kNotificationServerSignature).SendMessage(&request);
 				break;
 			}
 

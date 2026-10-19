@@ -92,6 +92,7 @@ static const uint32 MSG_SWITCH_TAB_LEFT					= 'swtl';
 static const uint32 MSG_SWITCH_TAB_RIGHT				= 'swtr';
 static const uint32 MSG_ACTIVATE_TERM					= 'msat';
 static const uint32 MSG_NOTIFICATION_ACTIVATED			= 'ntac';
+static const uint32 MSG_NOTIFICATION_CLOSED				= 'ntcl';
 static const uint32 MSG_REMOTE_CONTROL					= 'rmct';
 
 // A click on a notification starts Terminal with this argument, the team and

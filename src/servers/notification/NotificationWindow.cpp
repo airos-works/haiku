@@ -209,7 +209,8 @@ NotificationWindow::MessageReceived(BMessage* message)
 					} else
 						group = aIt->second;
 
-					NotificationView* view = new NotificationView(notification, timeout);
+					NotificationView* view = new NotificationView(notification,
+						timeout, false, message);
 
 					group->AddInfo(view);
 

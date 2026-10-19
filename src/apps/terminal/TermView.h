@@ -140,8 +140,11 @@ public:
 			//! "software".
 			const char*			RendererName() const;
 
-			//! One of the view's notifications was clicked.
-			void				NotificationActivated(const char* identifier);
+			//! One of the view's notifications was clicked (\a button 0) or
+			//! one of its buttons; or it went away.
+			void				NotificationActivated(const char* identifier,
+									int32 button = 0);
+			void				NotificationClosed(const char* identifier);
 
 			// kitty's remote control: TermWindow carries the commands out
 			int32				RemoteControlID() const
