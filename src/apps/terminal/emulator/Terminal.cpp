@@ -435,6 +435,7 @@ Terminal::_ClearLine(int32 row, int32 from, int32 to, bool selective)
 	if (from > to)
 		return;
 
+	_EraseMulticells(row, row, from, to);
 	_FixWideCharacters(row, from, to);
 	_ClearCells(_Cells(row) + from, to - from + 1, selective);
 	if (fGraphics != NULL)
@@ -446,6 +447,7 @@ Terminal::_ClearLine(int32 row, int32 from, int32 to, bool selective)
 void
 Terminal::_ClearRows(int32 firstRow, int32 lastRow, bool selective)
 {
+	_EraseMulticells(firstRow, lastRow, 0, fColumns - 1);
 	for (int32 row = firstRow; row <= lastRow; row++) {
 		_ClearCells(_Cells(row), fColumns, selective);
 		if (!selective)
@@ -572,6 +574,15 @@ Terminal::GetCharacter(uint32 character, uint32* codePoints,
 {
 	if (character == 0 || maxCount <= 0)
 		return 0;
+	if (is_multicell(character)) {
+		// the text of a block is in its first cell
+		TermMulticell multicell;
+		if (multicell_x(character) != 0 || multicell_y(character) != 0
+			|| !GetMulticell(multicell_index(character), multicell)) {
+			return 0;
+		}
+		return GetCharacter(multicell.text, codePoints, maxCount);
+	}
 	if ((character & kClusterBit) == 0) {
 		codePoints[0] = character;
 		return 1;
@@ -612,6 +623,14 @@ append_utf8(std::string& text, uint32 c)
 void
 Terminal::AppendCharacterUTF8(uint32 character, std::string& text) const
 {
+	if (is_multicell(character)) {
+		TermMulticell multicell;
+		if (multicell_x(character) == 0 && multicell_y(character) == 0
+			&& GetMulticell(multicell_index(character), multicell)) {
+			AppendCharacterUTF8(multicell.text, text);
+		}
+		return;
+	}
 	if ((character & kClusterBit) == 0) {
 		append_utf8(text, character);
 		return;
@@ -1124,6 +1143,14 @@ Terminal::_PrintASCII(const uint32* codePoints, int32 count)
 		}
 		int32 n = std::min(room, count);
 
+		if (_HasMulticells(fCursorY, fCursorX, fCursorX + n - 1)) {
+			// text sizing blocks in the way: one by one, by their rules
+			_PutCharacter(codePoints[0], 1);
+			codePoints++;
+			count--;
+			continue;
+		}
+
 		TerminalCell* cells = _Cells(fCursorY);
 		_FixWideCharacters(fCursorY, fCursorX, fCursorX + n - 1);
 		CellStyle style = fStyle;
@@ -1414,6 +1441,12 @@ Terminal::_PutCharacter(uint32 character, int width)
 		}
 		if (cells[right].IsWide())
 			_ClearCells(cells + right, 1);
+	}
+
+	if (_HasMulticells(fCursorY, fCursorX, fCursorX + width - 1)) {
+		_SkipMulticells(width);
+		right = fCursorX <= fRight ? fRight : fColumns - 1;
+		_EraseMulticells(fCursorY, fCursorY, fCursorX, fCursorX + width - 1);
 	}
 
 	TerminalCell* cells = _Cells(fCursorY);
@@ -1812,6 +1845,20 @@ Terminal::_InsertCharacters(int32 count)
 	int32 room = fRight - fCursorX + 1;
 	count = std::min(count, room);
 	TerminalCell* cells = _Cells(fCursorY);
+	// text sizing blocks that would be split, or are more than a line high
+	for (int32 x = fCursorX; x <= fRight; x++) {
+		uint32 character = cells[x].character;
+		TermMulticell multicell;
+		if (!is_multicell(character)
+			|| !GetMulticell(multicell_index(character), multicell)) {
+			continue;
+		}
+		int32 left = x - multicell_x(character);
+		if (multicell.scale > 1 || left < fCursorX
+			|| left + multicell.columns - 1 > fRight - count) {
+			_EraseMulticell(fCursorY, x);
+		}
+	}
 	_FixWideCharacters(fCursorY, fCursorX, fRight);
 	memmove(cells + fCursorX + count, cells + fCursorX,
 		(room - count) * sizeof(TerminalCell));
@@ -1834,6 +1881,18 @@ Terminal::_DeleteCharacters(int32 count)
 	int32 room = fRight - fCursorX + 1;
 	count = std::min(count, room);
 	TerminalCell* cells = _Cells(fCursorY);
+	// text sizing blocks that lose cells, or are more than a line high
+	for (int32 x = fCursorX; x <= fRight; x++) {
+		uint32 character = cells[x].character;
+		TermMulticell multicell;
+		if (!is_multicell(character)
+			|| !GetMulticell(multicell_index(character), multicell)) {
+			continue;
+		}
+		int32 left = x - multicell_x(character);
+		if (multicell.scale > 1 || left <= fCursorX + count - 1)
+			_EraseMulticell(fCursorY, x);
+	}
 	_FixWideCharacters(fCursorY, fCursorX, fCursorX + count - 1);
 	_FixWideCharacters(fCursorY, fRight, fRight);
 	memmove(cells + fCursorX, cells + fCursorX + count,
@@ -1862,6 +1921,14 @@ Terminal::_InsertLines(int32 count)
 		|| fCursorX > fRight) {
 		return;
 	}
+	// text sizing blocks cut at this line, or at the bottom
+	count = std::min(count, fBottom - fCursorY + 1);
+	for (int32 x = 0; x < fColumns; x++) {
+		uint32 character = _Cells(fCursorY)[x].character;
+		if (is_multicell(character) && multicell_y(character) > 0)
+			_EraseMulticell(fCursorY, x);
+	}
+	_EraseMulticells(fBottom - count + 1, fBottom, 0, fColumns - 1);
 	_ScrollRegionDown(fCursorY, fBottom, count);
 	_CarriageReturn();
 }
@@ -1874,7 +1941,10 @@ Terminal::_DeleteLines(int32 count)
 		|| fCursorX > fRight) {
 		return;
 	}
-	// deleted lines don't go into the history
+	// deleted lines don't go into the history; text sizing blocks on them
+	// go altogether
+	_EraseMulticells(fCursorY, std::min(fBottom, fCursorY + count - 1), 0,
+		fColumns - 1);
 	_ScrollRegionUp(fCursorY, fBottom, count, false);
 	_CarriageReturn();
 }
@@ -2309,6 +2379,10 @@ Terminal::Resize(int32 columns, int32 rows)
 		for (int32 row = -historySize; row <= lastRow; row++) {
 			uint16 flags = 0;
 			GetLine(row, cells, &flags);
+			if (columns != oldColumns) {
+				// text sizing blocks cannot be wrapped again
+				_FlattenMulticells(cells, oldColumns);
+			}
 			if (!continuing) {
 				logical.push_back(ReflowLine());
 				logical.back().flags = flags & ~LINE_WRAPPED;
@@ -2471,6 +2545,10 @@ Terminal::Resize(int32 columns, int32 rows)
 		memcpy(fAlternate.lines[row].cells, oldAlternate.lines[index].cells,
 			sizeof(TerminalCell) * std::min(columns, oldColumns));
 		fAlternate.lines[row].flags = oldAlternate.lines[index].flags;
+		if (columns != oldColumns) {
+			_FlattenMulticells(fAlternate.lines[row].cells,
+				std::min(columns, oldColumns));
+		}
 	}
 
 	fMain.savedCursor = oldMain.savedCursor;

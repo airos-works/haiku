@@ -407,7 +407,43 @@ FrameBuilder::_BuildRow(Terminal* terminal, const FrameState& state,
 			flags |= RENDER_DEFAULT_BACKGROUND;
 
 		uint32 glyph = 0;
-		if (source.character != 0 && source.character != ' '
+		TermMulticell multicell;
+		if (is_multicell(source.character)
+			&& terminal->GetMulticell(multicell_index(source.character),
+				multicell)) {
+			// a cell of a text sizing block: its piece of the text, and the
+			// lines along the block's edges only
+			int32 blockY = multicell_y(source.character);
+			if (blockY != multicell.scale - 1)
+				flags &= ~RENDER_UNDERLINE_MASK;
+			if (blockY != 0)
+				flags &= ~RENDER_OVERLINE;
+			if (multicell.scale > 1)
+				flags &= ~RENDER_STRIKE;
+			if ((style.flags & CELL_INVISIBLE) == 0) {
+				text.clear();
+				terminal->AppendCharacterUTF8(multicell.text, text);
+				uint32 glyphStyle = 0;
+				if ((style.flags & CELL_BOLD) != 0)
+					glyphStyle |= GLYPH_BOLD;
+				if ((style.flags & CELL_ITALIC) != 0)
+					glyphStyle |= GLYPH_ITALIC;
+				MulticellShape shape;
+				shape.columns = multicell.columns;
+				shape.rows = multicell.scale;
+				shape.numerator = multicell.numerator;
+				shape.denominator = multicell.denominator;
+				shape.verticalAlignment = multicell.verticalAlignment;
+				shape.horizontalAlignment = multicell.horizontalAlignment;
+				glyph = fGlyphs->LookupMulticell(
+					(uint64)source.character | (1ULL << 41), text.c_str(),
+					shape, multicell_x(source.character), blockY, glyphStyle);
+				if ((glyph & kColorGlyphSlot) != 0) {
+					glyph &= ~kColorGlyphSlot;
+					flags |= RENDER_COLOR_GLYPH;
+				}
+			}
+		} else if (source.character != 0 && source.character != ' '
 			&& (style.flags & CELL_INVISIBLE) == 0) {
 			int32 count = terminal->GetCharacter(source.character,
 				codePoints, 4);

@@ -20,6 +20,7 @@
 
 #include "Base64.h"
 #include "ColorNames.h"
+#include "TerminalGraphics.h"
 #include "UnicodeTables.h"
 
 
@@ -1388,9 +1389,76 @@ Terminal::ReportNotificationClosed(const char* identifier)
 // #pragma mark - text sizing
 
 
-/*!	kitty's text sizing protocol (OSC 66). Text in other sizes is not
-	supported: the text is printed in the normal size, taking the cells it
-	asks for (w), so that what follows it still lines up.
+//!	Splits code points into grapheme clusters (UAX #29, as Print() does).
+static void
+split_graphemes(const std::vector<uint32>& codePoints,
+	std::vector<std::vector<uint32> >& clusters)
+{
+	int32 regionalIndicators = 0;
+	for (size_t i = 0; i < codePoints.size(); i++) {
+		uint32 c = codePoints[i];
+		int current = unicode_grapheme_break(c);
+		bool join = false;
+		if (!clusters.empty()) {
+			uint32 previousCode = clusters.back().back();
+			int previous = unicode_grapheme_break(previousCode);
+			if (current == GRAPHEME_EXTEND || current == GRAPHEME_ZWJ
+				|| current == GRAPHEME_SPACING_MARK) {
+				join = true;	// GB9, GB9a
+			} else if (previous == GRAPHEME_PREPEND) {
+				join = true;	// GB9b
+			} else if (previous == GRAPHEME_L
+				&& (current == GRAPHEME_L || current == GRAPHEME_V
+					|| current == GRAPHEME_LV || current == GRAPHEME_LVT)) {
+				join = true;	// GB6
+			} else if ((previous == GRAPHEME_LV || previous == GRAPHEME_V)
+				&& (current == GRAPHEME_V || current == GRAPHEME_T)) {
+				join = true;	// GB7
+			} else if ((previous == GRAPHEME_LVT || previous == GRAPHEME_T)
+				&& current == GRAPHEME_T) {
+				join = true;	// GB8
+			} else if (previous == GRAPHEME_ZWJ
+				&& unicode_is_extended_pictographic(c)) {
+				join = true;	// GB11
+			} else if (previous == GRAPHEME_REGIONAL_INDICATOR
+				&& current == GRAPHEME_REGIONAL_INDICATOR
+				&& regionalIndicators % 2 == 1) {
+				join = true;	// GB12, GB13
+			}
+		}
+		if (join)
+			clusters.back().push_back(c);
+		else {
+			clusters.push_back(std::vector<uint32>(1, c));
+			regionalIndicators = 0;
+		}
+		if (current == GRAPHEME_REGIONAL_INDICATOR)
+			regionalIndicators++;
+	}
+}
+
+
+//!	How many cells a cluster takes, as Print() would give it.
+static int32
+cluster_width(const std::vector<uint32>& cluster)
+{
+	uint32 base = cluster[0];
+	int32 width = unicode_width(base);
+	if (unicode_grapheme_break(base) == GRAPHEME_REGIONAL_INDICATOR)
+		width = 2;
+	for (size_t i = 1; i < cluster.size(); i++) {
+		if (cluster[i] == 0xfe0f && (unicode_is_extended_pictographic(base)
+				|| base == '#' || base == '*' || (base >= '0' && base <= '9')))
+			width = 2;
+	}
+	return width;
+}
+
+
+/*!	kitty's text sizing protocol (OSC 66): s=scale ; w=width in cells (of
+	the scale) ; n/d a smaller size within that ; v and h where to put it.
+	Text is drawn in blocks of s * w by s cells (multicells); without w,
+	each grapheme cluster gets a block of its own width.
 */
 void
 Terminal::_TextSizing(const char* data)
@@ -1399,18 +1467,33 @@ Terminal::_TextSizing(const char* data)
 	if (separator == NULL)
 		return;
 
-	int32 width = 0;
-	int32 scale = 1;
+	// key=value pairs, each a single letter and a number; anything else
+	// drops the whole command, as kitty does
+	int32 values[6] = { 1, 0, 0, 0, 0, 0 };	// s w n d v h
+	static const char kKeys[] = "swndvh";
 	std::vector<std::string> pairs;
 	split(std::string(data, separator - data), ':', pairs);
 	for (size_t i = 0; i < pairs.size(); i++) {
-		if (pairs[i].compare(0, 2, "w=") == 0)
-			width = atoi(pairs[i].c_str() + 2);
-		else if (pairs[i].compare(0, 2, "s=") == 0)
-			scale = std::max(1, std::min(7, atoi(pairs[i].c_str() + 2)));
+		const std::string& pair = pairs[i];
+		if (pair.empty())
+			continue;
+		const char* key = strchr(kKeys, pair[0]);
+		if (key == NULL || pair.size() < 3 || pair[1] != '=')
+			return;
+		for (size_t j = 2; j < pair.size(); j++) {
+			if (!isdigit((unsigned char)pair[j]))
+				return;
+		}
+		values[key - kKeys] = atoi(pair.c_str() + 2);
 	}
+	int32 scale = std::max(1, std::min(7, (int)values[0]));
+	int32 width = std::min(7, (int)values[1]);
+	int32 numerator = std::min(15, (int)values[2]);
+	int32 denominator = std::min(15, (int)values[3]);
+	if (numerator == 0 || denominator <= numerator)
+		numerator = denominator = 0;
 
-	// decode the UTF-8 text and print it
+	// the text: UTF-8 without controls
 	const uint8* text = (const uint8*)separator + 1;
 	std::vector<uint32> codePoints;
 	while (*text != '\0') {
@@ -1429,21 +1512,277 @@ Terminal::_TextSizing(const char* data)
 			continue;
 		while (extra-- > 0 && (*text & 0xc0) == 0x80)
 			c = (c << 6) | (*text++ & 0x3f);
-		if (c >= 0x20)
+		if (c >= 0x20 && (c < 0x7f || c > 0x9f))
 			codePoints.push_back(c);
 	}
+	if (codePoints.empty())
+		return;
 
-	int32 startX = fCursorX;
-	int32 startY = fCursorY;
-	for (size_t i = 0; i < codePoints.size(); i++)
-		_PrintCodePoint(codePoints[i]);
+	std::vector<std::vector<uint32> > clusters;
+	split_graphemes(codePoints, clusters);
 
-	// take as many cells as the program expects: w (or the text's own
-	// width) times the scale
-	if (fCursorY == startY && !fPendingWrap) {
-		int32 printed = fCursorX - startX;
-		int32 wanted = startX + (width > 0 ? width : printed) * scale;
-		while (fCursorX < wanted && fCursorX < fColumns - 1)
-			_PutCharacter(' ', 1);
+	// plain text when nothing changes how it is drawn
+	if (scale == 1 && numerator == 0
+		&& (width == 0 || (clusters.size() == 1
+			&& cluster_width(clusters[0]) == width))) {
+		for (size_t i = 0; i < codePoints.size(); i++)
+			_PrintCodePoint(codePoints[i]);
+		return;
+	}
+
+	TermMulticell multicell;
+	multicell.scale = scale;
+	multicell.numerator = numerator;
+	multicell.denominator = denominator;
+	multicell.verticalAlignment = std::min(2, (int)values[4]);
+	multicell.horizontalAlignment = std::min(2, (int)values[5]);
+
+	if (width > 0) {
+		// all of the text in one block
+		if (codePoints.size() > 64)
+			codePoints.resize(64);
+		multicell.text = codePoints.size() == 1 ? codePoints[0]
+			: _InternCluster(codePoints.data(), codePoints.size());
+		multicell.columns = scale * width;
+		_PutMulticell(multicell);
+		return;
+	}
+
+	for (size_t i = 0; i < clusters.size(); i++) {
+		const std::vector<uint32>& cluster = clusters[i];
+		int32 clusterWidth = cluster_width(cluster);
+		if (clusterWidth <= 0)
+			continue;
+		multicell.text = cluster.size() == 1 ? cluster[0]
+			: _InternCluster(cluster.data(), std::min((int)cluster.size(), 32));
+		multicell.columns = scale * clusterWidth;
+		_PutMulticell(multicell);
+	}
+}
+
+
+bool
+Terminal::GetMulticell(uint32 index, TermMulticell& multicell) const
+{
+	if (index >= fMulticells.size())
+		return false;
+	multicell = fMulticells[index];
+	return true;
+}
+
+
+uint32
+Terminal::_InternMulticell(const TermMulticell& multicell)
+{
+	uint64 key = (uint64)multicell.text
+		| ((uint64)multicell.scale << 32) | ((uint64)multicell.columns << 35)
+		| ((uint64)multicell.numerator << 41)
+		| ((uint64)multicell.denominator << 45)
+		| ((uint64)multicell.verticalAlignment << 49)
+		| ((uint64)multicell.horizontalAlignment << 51);
+	std::unordered_map<uint64, uint32>::iterator found
+		= fMulticellIndex.find(key);
+	if (found != fMulticellIndex.end())
+		return found->second;
+	uint32 index = fMulticells.size();
+	if (index > 0x1fffff)
+		return 0;
+	fMulticells.push_back(multicell);
+	fMulticellIndex[key] = index;
+	return index;
+}
+
+
+/*!	Puts a block at the cursor: discarded when it cannot fit at all, on the
+	next line when it does not fit on this one (or moved back without auto
+	wrap), the lines scrolled up when it reaches below the bottom margin.
+	The cursor ends up after it on its top row.
+*/
+void
+Terminal::_PutMulticell(const TermMulticell& multicell)
+{
+	int32 columns = multicell.columns;
+	int32 rows = multicell.scale;
+	bool inRegion = fCursorY >= fTop && fCursorY <= fBottom;
+	int32 regionTop = inRegion ? fTop : 0;
+	int32 regionBottom = inRegion ? fBottom : fRows - 1;
+	if (columns > fColumns || rows > regionBottom - regionTop + 1)
+		return;
+
+	if (fPendingWrap && fModes.autoWrap) {
+		_Line(fCursorY).flags |= LINE_WRAPPED;
+		_CarriageReturn();
+		_LineFeed();
+	}
+
+	int32 left = fCursorX >= fLeft ? fLeft : 0;
+	int32 right = fCursorX <= fRight ? fRight : fColumns - 1;
+	if (columns > right - left + 1)
+		return;
+	if (fCursorX + columns - 1 > right) {
+		if (fModes.autoWrap) {
+			_Line(fCursorY).flags |= LINE_WRAPPED;
+			_CarriageReturn();
+			_LineFeed();
+		} else
+			fCursorX = right - columns + 1;
+	}
+
+	inRegion = fCursorY >= fTop && fCursorY <= fBottom;
+	regionBottom = inRegion ? fBottom : fRows - 1;
+	if (fCursorY + rows - 1 > regionBottom) {
+		int32 missing = fCursorY + rows - 1 - regionBottom;
+		if (inRegion) {
+			_ScrollUp(missing);
+			fCursorY -= missing;
+		} else
+			fCursorY = regionBottom - rows + 1;
+	}
+
+	_EraseMulticells(fCursorY, fCursorY + rows - 1, fCursorX,
+		fCursorX + columns - 1);
+	uint32 index = _InternMulticell(multicell);
+	CellStyle style = fStyle;
+	style.flags &= ~(CELL_WIDE | CELL_WIDE_TAIL);
+	for (int32 y = 0; y < rows; y++) {
+		int32 row = fCursorY + y;
+		_FixWideCharacters(row, fCursorX, fCursorX + columns - 1);
+		TerminalCell* cells = _Cells(row);
+		for (int32 x = 0; x < columns; x++) {
+			TerminalCell& cell = cells[fCursorX + x];
+			cell.character = make_multicell(index, x, y);
+			cell.hyperlink = fHyperLink;
+			cell.style = style;
+		}
+		if (fGraphics != NULL)
+			fGraphics->CellsChanged(row, fCursorX, fCursorX + columns - 1);
+		_Touch(row);
+	}
+
+	// nothing combines with a block
+	fLastValid = false;
+	fCursorX += columns;
+	if (fCursorX > right) {
+		fCursorX = right;
+		fPendingWrap = fModes.autoWrap;
+	}
+}
+
+
+bool
+Terminal::_HasMulticells(int32 row, int32 left, int32 right) const
+{
+	if (row < 0 || row >= fRows)
+		return false;
+	const TerminalCell* cells = _Line(row).cells;
+	left = std::max(left, (int32)0);
+	right = std::min(right, fColumns - 1);
+	for (int32 x = left; x <= right; x++) {
+		if (is_multicell(cells[x].character))
+			return true;
+	}
+	return false;
+}
+
+
+//!	Erases the blocks that have cells in the rectangle, all of their cells.
+void
+Terminal::_EraseMulticells(int32 top, int32 bottom, int32 left, int32 right)
+{
+	top = std::max(top, (int32)0);
+	bottom = std::min(bottom, fRows - 1);
+	left = std::max(left, (int32)0);
+	right = std::min(right, fColumns - 1);
+	for (int32 row = top; row <= bottom; row++) {
+		const TerminalCell* cells = _Line(row).cells;
+		for (int32 x = left; x <= right; x++) {
+			if (is_multicell(cells[x].character))
+				_EraseMulticell(row, x);
+		}
+	}
+}
+
+
+//!	Erases the block that has a cell at \a row, \a column.
+void
+Terminal::_EraseMulticell(int32 row, int32 column)
+{
+	uint32 character = _Cells(row)[column].character;
+	TermMulticell multicell;
+	if (!is_multicell(character)
+		|| !GetMulticell(multicell_index(character), multicell)) {
+		return;
+	}
+	int32 originX = column - multicell_x(character);
+	int32 originY = row - multicell_y(character);
+	uint32 index = multicell_index(character);
+	for (int32 y = std::max(originY, (int32)0);
+			y < std::min(originY + (int32)multicell.scale, fRows); y++) {
+		TerminalCell* cells = _Cells(y);
+		for (int32 x = std::max(originX, (int32)0);
+				x < std::min(originX + (int32)multicell.columns, fColumns);
+				x++) {
+			if (cells[x].character == make_multicell(index, x - originX,
+					y - originY)) {
+				cells[x].character = 0;
+			}
+		}
+		_Touch(y);
+	}
+}
+
+
+/*!	Text written over the lower rows of a block goes after the block on
+	that row (and to the next line when there is no room).
+*/
+void
+Terminal::_SkipMulticells(int32 width)
+{
+	for (int32 guard = 0; guard < fColumns; guard++) {
+		int32 right = fCursorX <= fRight ? fRight : fColumns - 1;
+		const TerminalCell* cells = _Line(fCursorY).cells;
+		int32 after = -1;
+		for (int32 x = fCursorX; x <= std::min(fCursorX + width - 1, right);
+				x++) {
+			uint32 character = cells[x].character;
+			TermMulticell multicell;
+			if (is_multicell(character) && multicell_y(character) > 0
+				&& GetMulticell(multicell_index(character), multicell)) {
+				after = std::max(after, x - multicell_x(character)
+					+ (int32)multicell.columns);
+			}
+		}
+		if (after < 0)
+			return;
+		fCursorX = after;
+		if (fCursorX + width - 1 <= right)
+			continue;
+		if (!fModes.autoWrap) {
+			fCursorX = right - width + 1;
+			return;
+		}
+		_Line(fCursorY).flags |= LINE_WRAPPED;
+		_CarriageReturn();
+		_LineFeed();
+	}
+}
+
+
+/*!	A resize wraps lines anew, which blocks do not survive: their text is
+	kept as normal text in their first cell.
+*/
+void
+Terminal::_FlattenMulticells(TerminalCell* cells, int32 count) const
+{
+	for (int32 x = 0; x < count; x++) {
+		uint32 character = cells[x].character;
+		if (!is_multicell(character))
+			continue;
+		TermMulticell multicell;
+		if (multicell_x(character) == 0 && multicell_y(character) == 0
+			&& GetMulticell(multicell_index(character), multicell)) {
+			cells[x].character = multicell.text;
+		} else
+			cells[x].character = 0;
 	}
 }

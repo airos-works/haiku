@@ -245,6 +245,22 @@ struct ExtraCursorColor {
 };
 
 
+/*!	A block of kitty's text sizing (OSC 66): \c text drawn \c scale times
+	the normal size over \c columns by \c scale cells, smaller still by
+	numerator / denominator (when that is below 1) and then placed in the
+	block by the alignments (0 top or left, 1 bottom or right, 2 centered).
+*/
+struct TermMulticell {
+	uint32		text;		// a code point or a cluster
+	uint8		scale;
+	uint8		columns;
+	uint8		numerator;
+	uint8		denominator;
+	uint8		verticalAlignment;
+	uint8		horizontalAlignment;
+};
+
+
 struct TermNotification {
 	std::string	identifier;
 	std::string	title;
@@ -468,6 +484,10 @@ public:
 									{ return fExtraCursorColors[which]; }
 			uint32				ExtraCursorsGeneration() const
 									{ return fExtraCursorsGeneration; }
+
+			//! The description of a text sizing block (multicell_index()).
+			bool				GetMulticell(uint32 index,
+									TermMulticell& multicell) const;
 			//! Resolves a cell color to RGB.
 			uint32				ResolveColor(TermColor color,
 									bool foreground) const;
@@ -674,6 +694,17 @@ private:
 			void				_MultipleCursors(const VTSequence& sequence);
 			void				_SetExtraCursor(int32 x, int32 y, int32 shape);
 			void				_ClearExtraCursors();
+			uint32				_InternMulticell(
+									const TermMulticell& multicell);
+			void				_PutMulticell(const TermMulticell& multicell);
+			bool				_HasMulticells(int32 row, int32 left,
+									int32 right) const;
+			void				_EraseMulticells(int32 top, int32 bottom,
+									int32 left, int32 right);
+			void				_EraseMulticell(int32 row, int32 column);
+			void				_SkipMulticells(int32 width);
+			void				_FlattenMulticells(TerminalCell* cells,
+									int32 count) const;
 			void				_RectangularOperation(
 									const VTSequence& sequence);
 			void				_CopyRectangle(const VTSequence& sequence);
@@ -779,6 +810,9 @@ private:
 			uint32				fDefaultColors[COLOR_COUNT];
 			uint32				fColors[COLOR_COUNT];
 			uint32				fColorsGeneration;
+
+			std::vector<TermMulticell> fMulticells;
+			std::unordered_map<uint64, uint32> fMulticellIndex;
 
 			std::map<uint32, uint8> fExtraCursors;
 			ExtraCursorColor	fExtraCursorColors[2];

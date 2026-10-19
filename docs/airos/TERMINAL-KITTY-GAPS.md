@@ -11,8 +11,9 @@ styled and colored underlines, pointer shapes, OSC 21 colors and the color
 stack, OSC 5522 clipboard and paste events, unscroll, DECCARA, the mode
 save/restore, SGR 221/222, ED 22, the mouse-leave event, synchronized
 output, in-band resize, color scheme reports, OSC 8 links, OSC 52, OSC 133
-marks with prompt jumps, OSC 99 notifications (partly), OSC 66 (width
-only), grapheme clusters, reflow, GPU drawing.
+marks with prompt jumps and bash integration, OSC 99 notifications (clicks,
+icons, expiry), OSC 66 text sizing, multiple cursors, color emoji, grapheme
+clusters, reflow, GPU drawing.
 
 ## Recommended next
 
@@ -45,11 +46,12 @@ for such systems), buttons (`p=buttons`), sounds other than the system's.
 notification_server has no buttons and does not say when one closes; both
 need changes there (M).
 
-### Text sizing (OSC 66) — L
-kitty draws text 2 to 7 times larger (headings in terminal programs), and
-fractional sizes with alignment. Terminal reserves the cells but draws the
-text at normal size. It touches the cell model, every editing operation,
-history, reflow and both renderers. Few programs use it yet.
+### Text sizing (OSC 66) — done
+Blocks of larger, fitted or fractional text with the spec's editing rules.
+Differences from kitty: a resize to another width turns blocks into normal
+text (kitty keeps those that still fit); the cursor is drawn on its cell,
+not over the whole block (a "should" in the spec); insert mode does not open
+room for a block first.
 
 ### Multiple cursors (`CSI > ... SP q`) — done
 All of it, drawn by both renderers.

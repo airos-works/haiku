@@ -30,6 +30,17 @@ enum {
 static const uint32 kColorGlyphSlot = 0x80000000;
 
 
+//! How the text of a text sizing block is laid out (see TermMulticell).
+struct MulticellShape {
+	int32		columns;
+	int32		rows;		// the scale
+	int32		numerator;
+	int32		denominator;
+	int32		verticalAlignment;
+	int32		horizontalAlignment;
+};
+
+
 /*!	Glyphs drawn once by app_server (so they look like all other text) at
 	the frame buffer's density, kept in an atlas of cell sized slots that
 	the renderers draw from. Box drawing and block characters are drawn
@@ -59,6 +70,13 @@ public:
 			uint32				Lookup(uint64 key, const char* utf8,
 									uint32 firstCodePoint, int32 cells,
 									uint32 style);
+			/*!	The slot of one cell of a text sizing block: the piece of
+				the block's text, drawn in its size, that falls into the
+				cell at \a x, \a y of the block.
+			*/
+			uint32				LookupMulticell(uint64 key, const char* utf8,
+									const MulticellShape& shape, int32 x,
+									int32 y, uint32 style);
 			bool				HasPending() const
 									{ return !fPending.empty(); }
 			//! Draws the glyphs looked up since the last call.
@@ -78,6 +96,10 @@ private:
 				int32			cells;
 				uint32			style;
 				uint32			emoji;	// the color font's glyph, or 0
+				bool			multicell;
+				MulticellShape	shape;	// of the multicell
+				int32			x;		// the cell in it
+				int32			y;
 			};
 
 			void				_Reset();
@@ -90,6 +112,7 @@ private:
 			void				_EmboldenSlot(uint32 slot, int32 cells);
 			void				_DrawCluster(const Pending& pending,
 									const BFont& font, BPoint origin);
+			void				_DrawMulticells(std::vector<Pending>& pending);
 
 private:
 			BFont				fFonts[4];		// by style

@@ -39,7 +39,7 @@ underlines (`Smulx`, `Setulc`) and true color (`RGB`, `Tc`).
 | Color control | `OSC 21`, `OSC 30001`, `OSC 30101` | Set, query and reset any palette or special color; the color stack. Not: background transparency (`transparent_background_color`). |
 | Clipboard | `OSC 5522`, mode `5522` | Reading and writing by MIME type, paste events. Reading asks the user every time. |
 | Unscroll | `CSI Pn + T` | Complete. |
-| Text sizing | `OSC 66` | The width part only: text takes the cells the program asks for (`w=`, `s=` times width). It is not drawn larger. |
+| Text sizing | `OSC 66` | Text 2 to 7 times larger (`s=`), in a given number of cells (`w=`), smaller within its cells (`n=`/`d=`, superscripts and subscripts) and placed (`v=`, `h=`); colored emoji too. Blocks follow the spec's rules for wrapping, scrolling to fit, overwriting, erasing (ICH, DCH, ECH, EL, ED, IL, DL) and the CPR test. A resize to another width turns blocks into normal text, since they cannot be wrapped again. |
 | Miscellaneous | `CSI ? s`/`r` without parameters, `SGR 221`/`222`, `CSI 22 J`, DECCARA/DECSACE with every SGR attribute, the mouse-leave event | Complete. |
 | Shell integration | `OSC 133` | Prompt and output marks; jumping between prompts. |
 | Multiple cursors | `CSI > ... SP q` | Complete: block, beam, underline and follow-the-cursor shapes at points, rectangles or the cursor; their two colors (`30`, `40`, including "special"); the support, cursor and color queries. They blink with the cursor, show when DECTCEM hides it, and go with ED 2/3/22, a reset, the other screen and a resize. |

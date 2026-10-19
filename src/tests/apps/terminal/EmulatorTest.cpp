@@ -842,10 +842,71 @@ TestOperatingSystemCommands()
 	m.Feed("\x1b[>q");
 	CHECK(m.Reply().find("\x1bP>|") == 0);
 
-	// text sizing falls back to normal text
-	Fixture t;
+	// text sizing: each character a block of 2 by 2 cells, the cursor
+	// after it on its top row
+	Fixture t(20, 6);
 	t.Feed("\x1b]66;s=2;Hi\x1b\\!");
-	CHECK_EQUAL(t.Row(0), "Hi  !");
+	CHECK(t.Cursor() == TermPoint(5, 0));
+	CHECK(is_multicell(t.Cell(0, 0).character));
+	CHECK(multicell_x(t.Cell(1, 1).character) == 1
+		&& multicell_y(t.Cell(1, 1).character) == 1);
+	CHECK(multicell_x(t.Cell(0, 2).character) == 0);
+	CHECK(t.Cell(0, 4).character == '!');
+	CHECK_EQUAL(t.Row(0), "Hi!");
+	CHECK_EQUAL(t.Row(1), "");
+	TermMulticell multicell;
+	CHECK(t.terminal.GetMulticell(multicell_index(t.Cell(0, 2).character),
+		multicell) && multicell.text == 'i' && multicell.scale == 2
+		&& multicell.columns == 2);
+	// writing over a block's top row takes it away
+	t.Feed("\x1b[1;2HX");
+	CHECK(t.Cell(0, 0).character == 0 && t.Cell(1, 1).character == 0);
+	CHECK(t.Cell(0, 1).character == 'X');
+	// on a lower row, the text goes after the block
+	t.Feed("\x1b[2;3HY");
+	CHECK(t.Cell(1, 4).character == 'Y');
+	CHECK(is_multicell(t.Cell(1, 3).character));
+	// erasing a line erases the blocks on it, all of them
+	t.Feed("\x1b[2;1H\x1b[2K");
+	CHECK(t.Cell(0, 2).character == 0);
+	// a block too high for the screen is dropped
+	t.Feed("\x1b[H\x1b[2J\x1b]66;s=7;x\x07");
+	CHECK(t.Cell(0, 0).character == 0 && t.Cursor() == TermPoint(0, 0));
+	// at the bottom the screen scrolls up for it
+	t.Feed("\x1b[6;1H\x1b]66;s=3;x\x07");
+	CHECK(t.Cursor() == TermPoint(3, 3));
+	CHECK(is_multicell(t.Cell(5, 2).character));
+	// clearing the screen takes it
+	t.Feed("\x1b[2J");
+	CHECK(t.Cell(3, 0).character == 0);
+
+	// widths: w cells for all the text, the fraction, plain text otherwise
+	Fixture w(20, 6);
+	w.Feed("\x1b]66;w=3;ab\x07|");
+	CHECK(w.Cursor() == TermPoint(4, 0));
+	CHECK(w.terminal.GetMulticell(multicell_index(w.Cell(0, 0).character),
+		multicell) && multicell.columns == 3 && multicell.scale == 1);
+	CHECK_EQUAL(w.Row(0), "ab|");
+	w.Feed("\r\n\x1b]66;n=1:d=2:v=1;x\x07");
+	CHECK(w.terminal.GetMulticell(multicell_index(w.Cell(1, 0).character),
+		multicell) && multicell.numerator == 1 && multicell.denominator == 2
+		&& multicell.verticalAlignment == 1 && multicell.columns == 1);
+	w.Feed("\r\n\x1b]66;;plain\x07\x1b]66;w=1;z\x07");
+	CHECK(w.Cell(2, 0).character == 'p' && w.Cell(2, 5).character == 'z');
+	w.Feed("\x1b]66;q=1;dropped\x07");	// an unknown key drops it all
+	CHECK(w.Cursor() == TermPoint(6, 2));
+
+	// kitty's way of telling what is supported: three cursor reports
+	Fixture c(20, 6);
+	c.Feed("\r\x1b[6n\x1b]66;w=2; \x07\x1b[6n\x1b]66;s=2; \x07\x1b[6n");
+	CHECK_EQUAL(c.Reply(), "\x1b[1;1R\x1b[1;3R\x1b[1;5R");
+
+	// a resize to another width leaves the text in normal size
+	Fixture r(20, 6);
+	r.Feed("\x1b]66;s=2;ab\x07");
+	r.terminal.Resize(10, 6);
+	CHECK_EQUAL(r.Row(0), "a b");
+	CHECK(!is_multicell(r.Cell(0, 0).character));
 }
 
 
