@@ -316,6 +316,10 @@ FrameBuilder::_BuildRow(Terminal* terminal, const FrameState& state,
 					: source.character;
 				glyph = fGlyphs->Lookup(key, text.c_str(), codePoints[0],
 					source.IsWide() ? 2 : 1, glyphStyle);
+				if ((glyph & kColorGlyphSlot) != 0) {
+					glyph &= ~kColorGlyphSlot;
+					flags |= RENDER_COLOR_GLYPH;
+				}
 			}
 		}
 

@@ -268,6 +268,17 @@ TestUnicode()
 	CHECK(v.Cell(0, 0).IsWide());
 	CHECK(v.Cell(0, 2).character == 'x');
 
+	// and a keycap: 1, VS16, combining enclosing keycap
+	Fixture k;
+	k.Feed("1\xef\xb8\x8f\xe2\x83\xa3x");
+	CHECK(k.Cell(0, 0).IsWide());
+	CHECK(k.Cell(0, 2).character == 'x');
+	// without VS16 it keeps the text presentation
+	Fixture t;
+	t.Feed("1\xe2\x83\xa3x");
+	CHECK(!t.Cell(0, 0).IsWide());
+	CHECK(t.Cell(0, 1).character == 'x');
+
 	// invalid UTF-8
 	Fixture i;
 	i.Feed("a\xff" "b\xe2\x82z");

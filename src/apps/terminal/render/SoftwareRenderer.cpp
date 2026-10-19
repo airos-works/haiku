@@ -36,6 +36,39 @@ blend(uint32 destination, uint32 color, uint32 alpha)
 }
 
 
+//!	A glyph with its own colors (premultiplied) over what is there.
+static void
+render_color_glyph(const uint32* source, int32 sourcePixelsPerRow,
+	uint32* bits, int32 pixelsPerRow, int32 width, int32 height,
+	uint32 alpha)
+{
+	for (int32 y = 0; y < height; y++) {
+		const uint32* from = source + (size_t)y * sourcePixelsPerRow;
+		uint32* to = bits + (size_t)y * pixelsPerRow;
+		for (int32 x = 0; x < width; x++) {
+			uint32 pixel = from[x];
+			uint32 a = pixel >> 24;
+			if (a == 0)
+				continue;
+			// faint text makes the glyph translucent
+			if (alpha < 255)
+				a = a * alpha / 255;
+			uint32 channels[3];
+			for (int32 c = 0; c < 3; c++) {
+				uint32 value = (pixel >> (8 * c)) & 0xff;
+				if (alpha < 255)
+					value = value * alpha / 255;
+				uint32 below = (to[x] >> (8 * c)) & 0xff;
+				channels[c] = std::min((uint32)255,
+					value + (below * (255 - a) + 127) / 255);
+			}
+			to[x] = 0xff000000 | channels[0] | (channels[1] << 8)
+				| (channels[2] << 16);
+		}
+	}
+}
+
+
 static void
 fill_rect(uint32* bits, int32 pixelsPerRow, int32 left, int32 top,
 	int32 right, int32 bottom, uint32 color)
@@ -380,7 +413,16 @@ SoftwareRenderer::Render(const RenderFrame& frame,
 				atlas.SlotLocation(cell.glyph, page, slotX, slotY);
 				if ((cell.flags & RENDER_GLYPH_RIGHT_HALF) != 0)
 					slotX += cellWidth;
-				if (page < atlas.pageCount) {
+				if (page < atlas.pageCount
+					&& (cell.flags & RENDER_COLOR_GLYPH) != 0) {
+					if (atlas.colorPages != NULL
+						&& atlas.colorPages[page] != NULL) {
+						render_color_glyph(atlas.colorPages[page]
+								+ (size_t)slotY * atlas.pageSize + slotX,
+							atlas.pageSize, cellBits, pixelsPerRow, cellWidth,
+							bottom - top, cell.foregroundAlpha);
+					}
+				} else if (page < atlas.pageCount) {
 					const uint8* coverage = atlas.pages[page]
 						+ (size_t)slotY * atlas.pageSize + slotX;
 					uint32 color = cell.foreground;

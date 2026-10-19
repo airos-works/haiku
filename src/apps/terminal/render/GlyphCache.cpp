@@ -13,6 +13,7 @@
 #include <algorithm>
 
 #include <Bitmap.h>
+#include <String.h>
 #include <View.h>
 
 #include "BoxDrawing.h"
@@ -45,8 +46,28 @@ GlyphCache::GlyphCache()
 GlyphCache::~GlyphCache()
 {
 	delete fStaging;
-	for (size_t i = 0; i < fPages.size(); i++)
+	for (size_t i = 0; i < fPages.size(); i++) {
 		free(fPages[i]);
+		free(fColorPages[i]);
+	}
+}
+
+
+static int32
+decode_utf8(const char* text, uint32* codePoints, int32 maxCount)
+{
+	const uint8* bytes = (const uint8*)text;
+	int32 count = 0;
+	while (*bytes != 0 && count < maxCount) {
+		uint32 c = *bytes++;
+		int32 more = c >= 0xf0 ? 3 : c >= 0xe0 ? 2 : c >= 0xc0 ? 1 : 0;
+		if (more > 0)
+			c &= 0x3f >> more;
+		for (; more > 0 && (*bytes & 0xc0) == 0x80; more--)
+			c = (c << 6) | (*bytes++ & 0x3f);
+		codePoints[count++] = c;
+	}
+	return count;
 }
 
 
@@ -155,9 +176,12 @@ GlyphCache::_Reset()
 	fNextSlot = 1;
 	fEpoch++;
 
-	for (size_t i = 0; i < fPages.size(); i++)
+	for (size_t i = 0; i < fPages.size(); i++) {
 		free(fPages[i]);
+		free(fColorPages[i]);
+	}
 	fPages.clear();
+	fColorPages.clear();
 	fDirty.clear();
 
 	fAtlas.pageSize = kPageSize;
@@ -189,13 +213,26 @@ GlyphCache::_AddPage()
 	if (page == NULL)
 		return false;
 	fPages.push_back(page);
+	fColorPages.push_back(NULL);
 	GlyphAtlasInfo::Dirty dirty = { 0, 0 };
 	fDirty.push_back(dirty);
 	fAtlas.pageCount = fPages.size();
 	fAtlas.pages = fPages.data();
+	fAtlas.colorPages = fColorPages.data();
 	fAtlas.dirty = fDirty.data();
 	fAtlas.generation++;
 	return true;
+}
+
+
+uint32*
+GlyphCache::_ColorPage(int32 page)
+{
+	if (fColorPages[page] == NULL) {
+		fColorPages[page] = (uint32*)calloc((size_t)kPageSize * kPageSize,
+			sizeof(uint32));
+	}
+	return fColorPages[page];
 }
 
 
@@ -253,6 +290,15 @@ GlyphCache::Lookup(uint64 key, const char* utf8, uint32 firstCodePoint,
 	if (found != fSlots.end())
 		return found->second;
 
+	// an emoji in color, when there is a font for it
+	uint32 emoji = 0;
+	uint32 codePoints[16];
+	int32 count = decode_utf8(utf8, codePoints, 16);
+	if (ColorEmoji::IsEmojiCluster(codePoints, count)
+		&& fEmoji.IsAvailable()) {
+		emoji = fEmoji.GlyphFor(codePoints, count);
+	}
+
 	uint32 slot = _AllocateSlot(cells);
 	if (slot == 0) {
 		// full: start over (callers see the new epoch)
@@ -262,14 +308,17 @@ GlyphCache::Lookup(uint64 key, const char* utf8, uint32 firstCodePoint,
 			return 0;
 	}
 
-	fSlots[key] = slot;
 	Pending pending;
 	pending.slot = slot;
 	pending.text = utf8;
 	pending.codePoint = firstCodePoint;
 	pending.cells = cells;
 	pending.style = style;
+	pending.emoji = emoji;
 	fPending.push_back(pending);
+	if (emoji != 0)
+		slot |= kColorGlyphSlot;
+	fSlots[key] = slot;
 	return slot;
 }
 
@@ -318,6 +367,17 @@ GlyphCache::DrawPending()
 		if (page >= (int32)fPages.size())
 			continue;
 
+		if (pending.emoji != 0) {
+			uint32* colorPage = _ColorPage(page);
+			if (colorPage != NULL) {
+				fEmoji.Draw(pending.emoji,
+					colorPage + (size_t)y * kPageSize + x, kPageSize,
+					cellWidth * pending.cells, cellHeight);
+				_MarkDirty(page, y, y + cellHeight);
+			}
+			continue;
+		}
+
 		if (is_box_character(pending.codePoint)) {
 			uint8* bits = fPages[page] + (size_t)y * kPageSize + x;
 			for (int32 row = 0; row < cellHeight; row++)
@@ -362,7 +422,7 @@ GlyphCache::DrawPending()
 			if (fEmulateBold)
 				style &= ~GLYPH_BOLD;
 			fStagingView->SetFont(&fFonts[style]);
-			fStagingView->DrawString(pending.text.c_str(),
+			_DrawCluster(pending, fFonts[style],
 				BPoint(left, top + fMetrics.baseline));
 		}
 		fStagingView->Sync();
@@ -394,6 +454,89 @@ GlyphCache::DrawPending()
 		}
 		fStaging->Unlock();
 	}
+}
+
+
+static bool
+is_diacritic(uint32 c)
+{
+	return (c >= 0x0300 && c <= 0x036f) || (c >= 0x1ab0 && c <= 0x1aff)
+		|| (c >= 0x1dc0 && c <= 0x1dff) || (c >= 0x20d0 && c <= 0x20ff)
+		|| (c >= 0xfe20 && c <= 0xfe2f);
+}
+
+
+static void
+append_utf8(BString& string, uint32 c)
+{
+	char bytes[4];
+	int32 length;
+	if (c < 0x80) {
+		bytes[0] = c;
+		length = 1;
+	} else if (c < 0x800) {
+		bytes[0] = 0xc0 | (c >> 6);
+		bytes[1] = 0x80 | (c & 0x3f);
+		length = 2;
+	} else if (c < 0x10000) {
+		bytes[0] = 0xe0 | (c >> 12);
+		bytes[1] = 0x80 | ((c >> 6) & 0x3f);
+		bytes[2] = 0x80 | (c & 0x3f);
+		length = 3;
+	} else {
+		bytes[0] = 0xf0 | (c >> 18);
+		bytes[1] = 0x80 | ((c >> 12) & 0x3f);
+		bytes[2] = 0x80 | ((c >> 6) & 0x3f);
+		bytes[3] = 0x80 | (c & 0x3f);
+		length = 4;
+	}
+	string.Append(bytes, length);
+}
+
+
+/*!	Draws a cluster into the staging view. app_server places the glyphs one
+	after the other without positioning marks, so a combining diacritic
+	(most fonts draw them just left of where the next character would go)
+	is centered over the cells instead.
+*/
+void
+GlyphCache::_DrawCluster(const Pending& pending, const BFont& font,
+	BPoint origin)
+{
+	uint32 codePoints[16];
+	int32 count = decode_utf8(pending.text.c_str(), codePoints, 16);
+	bool marks = false;
+	for (int32 i = 1; i < count; i++)
+		marks |= is_diacritic(codePoints[i]);
+	if (!marks) {
+		fStagingView->DrawString(pending.text.c_str(), origin);
+		return;
+	}
+
+	float boxWidth = fMetrics.cellWidth * pending.cells;
+	BPoint pen = origin;
+	BString run;
+	for (int32 i = 0; i < count; i++) {
+		if (i == 0 || !is_diacritic(codePoints[i])) {
+			append_utf8(run, codePoints[i]);
+			continue;
+		}
+		if (!run.IsEmpty()) {
+			fStagingView->DrawString(run.String(), pen);
+			pen.x += font.StringWidth(run.String());
+			run = "";
+		}
+
+		BString mark;
+		append_utf8(mark, codePoints[i]);
+		BRect bounds;
+		font.GetBoundingBoxesAsGlyphs(mark.String(), 1, B_SCREEN_METRIC,
+			&bounds);
+		float x = origin.x + (boxWidth - bounds.Width()) / 2 - bounds.left;
+		fStagingView->DrawString(mark.String(), BPoint(roundf(x), origin.y));
+	}
+	if (!run.IsEmpty())
+		fStagingView->DrawString(run.String(), pen);
 }
 
 

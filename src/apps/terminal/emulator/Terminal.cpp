@@ -1307,9 +1307,12 @@ Terminal::_AppendToPrevious(uint32 c, int width)
 	cell.character = character;
 	fLastCharacter = character;
 
-	// VS16 asks for the emoji presentation: two cells
+	// VS16 asks for the emoji presentation: two cells (also for the
+	// keycaps' digits, number sign and asterisk)
+	uint32 base = cluster[0];
 	if (c == 0xfe0f && !cell.IsWide()
-		&& unicode_is_extended_pictographic(cluster[0])) {
+		&& (unicode_is_extended_pictographic(base) || base == '#'
+			|| base == '*' || (base >= '0' && base <= '9'))) {
 		if (fLastColumn + 1 < fColumns) {
 			TerminalCell& next = _Cells(fLastRow)[fLastColumn + 1];
 			if (fCursorX == fLastColumn + 1 && !fPendingWrap) {
