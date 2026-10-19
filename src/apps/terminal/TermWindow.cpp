@@ -20,8 +20,11 @@
 #include <new>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <strings.h>
 #include <time.h>
+
+#include <regex>
 
 #include <Alert.h>
 #include <Application.h>
@@ -55,6 +58,7 @@
 #include <UnicodeChar.h>
 
 #include <AutoLocker.h>
+#include <Json.h>
 
 #include "ActiveProcessInfo.h"
 #include "Arguments.h"
@@ -65,6 +69,7 @@
 #include "PrefWindow.h"
 #include "PrefHandler.h"
 #include "SetTitleDialog.h"
+#include "ShellInfo.h"
 #include "ShellParameters.h"
 #include "TermConst.h"
 #include "TermScrollView.h"
@@ -1063,9 +1068,31 @@ TermWindow::MessageReceived(BMessage *message)
 					Activate();
 					fTabView->Select(i);
 				}
-				if ((actions & 2) != 0)
-					termView->NotificationActivated(identifier);
+				if ((actions & 2) != 0) {
+					termView->NotificationActivated(identifier,
+						message->GetInt32("button", 0));
+				}
 				break;
+			}
+			break;
+		}
+
+		case MSG_NOTIFICATION_CLOSED:
+		{
+			const char* view;
+			const char* identifier;
+			if (message->FindString("view", &view) != B_OK
+				|| message->FindString("id", &identifier) != B_OK) {
+				break;
+			}
+			for (int32 i = 0; i < fSessions.CountItems(); i++) {
+				TermView* termView = _TermViewAt(i);
+				BString key;
+				key.SetToFormat("%p", termView);
+				if (key == view) {
+					termView->NotificationClosed(identifier);
+					break;
+				}
 			}
 			break;
 		}
@@ -1164,6 +1191,10 @@ TermWindow::MessageReceived(BMessage *message)
 			break;
 		}
 
+		case MSG_REMOTE_CONTROL:
+			_RemoteControl(message);
+			break;
+
 		case kIncreaseFontSize:
 		case kDecreaseFontSize:
 		{
@@ -1187,34 +1218,7 @@ TermWindow::MessageReceived(BMessage *message)
 					size -= 4;
 			}
 
-			// constrain the font size
-			if (size < kMinimumFontSize)
-				size = kMinimumFontSize;
-			if (size > kMaximumFontSize)
-				size = kMaximumFontSize;
-
-			// mark the font size menu item
-			for (int32 i = 0; i < fFontSizeMenu->CountItems(); i++) {
-				BMenuItem* item = fFontSizeMenu->ItemAt(i);
-				if (item == NULL)
-					continue;
-
-				item->SetMarked(false);
-				if (atoi(item->Label()) == size)
-					item->SetMarked(true);
-			}
-
-			font.SetSize(size);
-			PrefHandler::Default()->setInt32(PREF_HALF_FONT_SIZE, (int32)size);
-			for (int32 i = 0; i < fTabView->CountTabs(); i++) {
-				TermView* view = _TermViewAt(i);
-				_TermViewAt(i)->SetTermFont(&font);
-				if (fFullScreen) {
-					view->SetTermSize(view->Frame(), true);
-					view->Invalidate();
-				} else
-					_ResizeView(view);
-			}
+			_SetFontSize(size);
 			break;
 		}
 
@@ -1480,13 +1484,13 @@ TermWindow::_AddTab(const Arguments* args, const BString& currentDirectory)
 
 
 void
-TermWindow::_RemoveTab(int32 index)
+TermWindow::_RemoveTab(int32 index, bool ask)
 {
 	_FinishTitleDialog();
 		// always close to avoid confusion
 
 	if (fSessions.CountItems() > 1) {
-		if (!_CanClose(index))
+		if (ask && !_CanClose(index))
 			return;
 		if (Session* session = (Session*)fSessions.RemoveItem(index)) {
 			if (fSessions.CountItems() == 1) {
@@ -1499,6 +1503,43 @@ TermWindow::_RemoveTab(int32 index)
 		}
 	} else
 		PostMessage(B_QUIT_REQUESTED);
+}
+
+
+void
+TermWindow::_SetFontSize(float size)
+{
+	BFont font;
+	_ActiveTermView()->GetTermFont(&font);
+
+	// constrain the font size
+	if (size < kMinimumFontSize)
+		size = kMinimumFontSize;
+	if (size > kMaximumFontSize)
+		size = kMaximumFontSize;
+
+	// mark the font size menu item
+	for (int32 i = 0; i < fFontSizeMenu->CountItems(); i++) {
+		BMenuItem* item = fFontSizeMenu->ItemAt(i);
+		if (item == NULL)
+			continue;
+
+		item->SetMarked(false);
+		if (atoi(item->Label()) == size)
+			item->SetMarked(true);
+	}
+
+	font.SetSize(size);
+	PrefHandler::Default()->setInt32(PREF_HALF_FONT_SIZE, (int32)size);
+	for (int32 i = 0; i < fTabView->CountTabs(); i++) {
+		TermView* view = _TermViewAt(i);
+		_TermViewAt(i)->SetTermFont(&font);
+		if (fFullScreen) {
+			view->SetTermSize(view->Frame(), true);
+			view->Invalidate();
+		} else
+			_ResizeView(view);
+	}
 }
 
 
@@ -2167,4 +2208,398 @@ TermWindow::_UpdateKeymap()
 		TermView* view = _TermViewAt(i);
 		view->SetKeymap(fKeymap, fKeymapChars);
 	}
+}
+
+
+// #pragma mark - remote control
+
+
+static void
+append_json_string(BString& json, const char* text)
+{
+	json << '"';
+	for (const uint8* c = (const uint8*)text; *c != '\0'; c++) {
+		switch (*c) {
+			case '"':
+				json << "\\\"";
+				break;
+			case '\\':
+				json << "\\\\";
+				break;
+			case '\n':
+				json << "\\n";
+				break;
+			case '\r':
+				json << "\\r";
+				break;
+			case '\t':
+				json << "\\t";
+				break;
+			default:
+				if (*c < 0x20)
+					json << BString().SetToFormat("\\u%04x", *c);
+				else
+					json << (char)*c;
+				break;
+		}
+	}
+	json << '"';
+}
+
+
+/*!	kitty's remote control (DCS @kitty-cmd): a program in one of the tabs
+	asks for something done to the tabs, kitty's "windows". Off unless the
+	settings have "RemoteControl" , "yes": otherwise any text printed in a
+	tab could type into the others.
+*/
+void
+TermWindow::_RemoteControl(BMessage* message)
+{
+	const char* json;
+	TermView* sender;
+	if (message->FindString("json", &json) != B_OK
+		|| message->FindPointer("view", (void**)&sender) != B_OK
+		|| _IndexOfTermView(sender) < 0) {
+		return;
+	}
+
+	BMessage command;
+	BString reply;
+	BList closing;
+	bool respond = true;
+	if (BJson::Parse(json, command) != B_OK)
+		reply = "{\"ok\":false,\"error\":\"The command is not valid JSON\"}";
+	else {
+		respond = !command.GetBool("no_response", false);
+		const char* setting = PrefHandler::Default()->getString(
+			PREF_REMOTE_CONTROL);
+		if (setting == NULL || strcmp(setting, "yes") != 0) {
+			reply = "{\"ok\":false,\"error\":\"Remote control is off: add "
+				"\\\"RemoteControl\\\" , \\\"yes\\\" to "
+				"~/config/settings/Terminal/Default\"}";
+		} else
+			_RunRemoteCommand(sender, command, reply, closing);
+	}
+
+	if (respond)
+		sender->RemoteControlReply(reply);
+
+	// tabs to close go after the answer, which may be theirs
+	for (int32 i = 0; i < closing.CountItems(); i++) {
+		int32 index = _IndexOfTermView((TermView*)closing.ItemAt(i));
+		if (index >= 0)
+			_RemoveTab(index, false);
+	}
+}
+
+
+bool
+TermWindow::_RunRemoteCommand(TermView* sender, const BMessage& command,
+	BString& _reply, BList& _closing)
+{
+	BString name = command.GetString("cmd", "");
+	name.ReplaceAll('_', '-');
+	BMessage payload;
+	command.FindMessage("payload", &payload);
+
+	BString data;
+	BString error;
+	bool hasData = false;
+	bool ok = true;
+
+	if (name == "ls") {
+		_RemoteList(sender, data);
+		hasData = true;
+	} else if (name == "launch" || name == "new-window") {
+		// a new tab, or a new window (another Terminal)
+		std::vector<BString> arguments;
+		BMessage args;
+		payload.FindMessage("args", &args);
+		const char* argument;
+		for (int32 i = 0; args.FindString(BString() << i, &argument) == B_OK;
+				i++) {
+			arguments.push_back(argument);
+		}
+		BString cwd = payload.GetString("cwd", "");
+		if (cwd == "current" || cwd == "last_reported" || cwd == "oldest") {
+			ActiveProcessInfo info;
+			cwd = _TermViewAt(_IndexOfTermView(sender))
+				->GetActiveProcessInfo(info) ? info.CurrentDirectory()
+				: BString();
+		}
+		BString title = payload.GetString("tab_title",
+			payload.GetString("window_title", payload.GetString("title", "")));
+		BString type = payload.GetString("type", "window");
+		bool newWindow = type == "os-window"
+			|| BString(payload.GetString("window_type", "")) == "os";
+
+		if (newWindow) {
+			std::vector<const char*> argv;
+			if (!cwd.IsEmpty()) {
+				argv.push_back("-w");
+				argv.push_back(cwd.String());
+			}
+			if (!title.IsEmpty()) {
+				argv.push_back("-t");
+				argv.push_back(title.String());
+			}
+			for (size_t i = 0; i < arguments.size(); i++)
+				argv.push_back(arguments[i].String());
+			status_t status = be_roster->Launch(TERM_SIGNATURE, argv.size(),
+				argv.data());
+			if (status != B_OK) {
+				ok = false;
+				error.SetToFormat("Cannot start Terminal: %s", strerror(status));
+			}
+		} else {
+			std::vector<const char*> argv;
+			argv.push_back("Terminal");
+			for (size_t i = 0; i < arguments.size(); i++)
+				argv.push_back(arguments[i].String());
+			Arguments parsed(0, NULL);
+			parsed.Parse(argv.size(), argv.data());
+			int32 previous = fTabView->Selection();
+			_AddTab(&parsed, cwd);
+			int32 index = fSessions.CountItems() - 1;
+			if (!title.IsEmpty()) {
+				Session* session = _SessionAt(index);
+				session->title.pattern = title;
+				session->title.pattern.ReplaceAll("%", "%%");
+				session->title.patternUserDefined = true;
+				_UpdateSessionTitle(index);
+			}
+			if (payload.GetBool("keep_focus", false))
+				fTabView->Select(previous);
+			data << _TermViewAt(index)->RemoteControlID();
+			hasData = true;
+		}
+	} else if (name == "set-font-size") {
+		BFont font;
+		_ActiveTermView()->GetTermFont(&font);
+		double size = payload.GetDouble("size", 0);
+		BString operation = payload.GetString("increment_op", "");
+		if (operation == "+")
+			size = font.Size() + size;
+		else if (operation == "-")
+			size = font.Size() - size;
+		else if (operation == "*")
+			size = font.Size() * size;
+		else if (operation == "/")
+			size = size != 0 ? font.Size() / size : font.Size();
+		else if (size <= 0)
+			size = 12;
+		_SetFontSize(size);
+	} else if (name == "resize-os-window") {
+		BString action = payload.GetString("action", "resize");
+		if (action == "toggle-fullscreen")
+			PostMessage(FULLSCREEN);
+		else if (action != "resize") {
+			ok = false;
+			error.SetToFormat("Not supported by Terminal: %s", action.String());
+		} else {
+			TermView* view = _ActiveTermView();
+			int32 width = (int32)payload.GetDouble("width", 0);
+			int32 height = (int32)payload.GetDouble("height", 0);
+			int32 columns = width;
+			int32 rows = height;
+			if (BString(payload.GetString("unit", "cells")) == "pixels") {
+				int rowsFromPixels;
+				int columnsFromPixels;
+				view->GetTermSizeFromRect(BRect(0, 0, width - 1, height - 1),
+					&rowsFromPixels, &columnsFromPixels);
+				rows = rowsFromPixels;
+				columns = columnsFromPixels;
+			}
+			if (payload.GetBool("incremental", false)) {
+				columns += view->Columns();
+				rows += view->Rows();
+			}
+			if (columns <= 0)
+				columns = view->Columns();
+			if (rows <= 0)
+				rows = view->Rows();
+			BMessage resize(MSG_COLS_CHANGED);
+			resize.AddInt32("columns", columns);
+			resize.AddInt32("rows", rows);
+			PostMessage(&resize);
+		}
+	} else {
+		// commands about tabs
+		std::vector<int32> indexes;
+		if (!_MatchRemoteTabs(payload, sender, indexes, error))
+			ok = false;
+		else if (name == "focus-window" || name == "focus-tab") {
+			if (IsMinimized())
+				Minimize(false);
+			Activate();
+			fTabView->Select(indexes[0]);
+		} else if (name == "close-window" || name == "close-tab") {
+			for (size_t i = 0; i < indexes.size(); i++)
+				_closing.AddItem(_TermViewAt(indexes[i]));
+		} else if (name == "set-tab-title") {
+			BString title = payload.GetString("title", "");
+			for (size_t i = 0; i < indexes.size(); i++) {
+				Session* session = _SessionAt(indexes[i]);
+				session->title.pattern = title;
+				session->title.pattern.ReplaceAll("%", "%%");
+				session->title.patternUserDefined = !title.IsEmpty();
+				_UpdateSessionTitle(indexes[i]);
+			}
+		} else {
+			// what one terminal does; text comes from the first
+			for (size_t i = 0; i < indexes.size() && ok; i++) {
+				BString text;
+				ok = _TermViewAt(indexes[i])->RemoteCommand(name.String(),
+					payload, text, error);
+				if (i == 0) {
+					data = text;
+					hasData = name == "get-text" || name == "get-colors";
+				}
+			}
+		}
+	}
+
+	if (!ok) {
+		_reply = "{\"ok\":false,\"error\":";
+		append_json_string(_reply, error.String());
+		_reply << "}";
+	} else if (hasData) {
+		_reply = "{\"ok\":true,\"data\":";
+		append_json_string(_reply, data.String());
+		_reply << "}";
+	} else
+		_reply = "{\"ok\":true}";
+	return ok;
+}
+
+
+/*!	The tabs a command is about: those its "match" (or "match_window")
+	expression names, or all of them, the sender's (self), or else the
+	active one. kitty's id:, title:, pid:, num:, recent:0 and state:
+	(focused, active, self) are understood.
+*/
+bool
+TermWindow::_MatchRemoteTabs(const BMessage& payload, TermView* sender,
+	std::vector<int32>& _indexes, BString& _error)
+{
+	int32 count = fSessions.CountItems();
+	if (payload.GetBool("all", false)) {
+		for (int32 i = 0; i < count; i++)
+			_indexes.push_back(i);
+		return true;
+	}
+	if (payload.GetBool("self", false)) {
+		_indexes.push_back(_IndexOfTermView(sender));
+		return true;
+	}
+
+	BString match = payload.GetString("match",
+		payload.GetString("match_window", ""));
+	if (match.IsEmpty()) {
+		_indexes.push_back(fTabView->Selection());
+		return true;
+	}
+
+	int32 colon = match.FindFirst(':');
+	BString field;
+	BString value;
+	if (colon > 0) {
+		match.CopyInto(field, 0, colon);
+		match.CopyInto(value, colon + 1, match.Length() - colon - 1);
+	}
+	for (int32 i = 0; i < count; i++) {
+		TermView* view = _TermViewAt(i);
+		bool matches = false;
+		if (field == "id")
+			matches = view->RemoteControlID() == atoi(value.String());
+		else if (field == "num")
+			matches = i == atoi(value.String());
+		else if (field == "recent")
+			matches = atoi(value.String()) == 0 && i == fTabView->Selection();
+		else if (field == "state") {
+			matches = value == "self" ? view == sender
+				: (value == "focused" || value == "active")
+					&& i == fTabView->Selection();
+		} else if (field == "pid") {
+			ShellInfo info;
+			matches = view->GetShellInfo(info)
+				&& info.ProcessID() == atoi(value.String());
+		} else if (field == "title") {
+			try {
+				std::regex pattern(value.String());
+				matches = std::regex_search(
+					_SessionAt(i)->title.title.String(), pattern);
+			} catch (...) {
+				_error.SetToFormat("Not a regular expression: %s",
+					value.String());
+				return false;
+			}
+		} else {
+			_error.SetToFormat("Not supported by Terminal: %s",
+				match.String());
+			return false;
+		}
+		if (matches)
+			_indexes.push_back(i);
+	}
+	if (_indexes.empty() && !payload.GetBool("ignore_no_match", false)) {
+		_error.SetToFormat("No matching tabs for expression: %s",
+			match.String());
+		return false;
+	}
+	return !_indexes.empty();
+}
+
+
+//!	kitty's ls: this window, its tabs, each with one "window", as JSON.
+void
+TermWindow::_RemoteList(TermView* sender, BString& json)
+{
+	int32 selection = fTabView->Selection();
+	json << "[{\"id\":" << fTerminalRoster.ID() + 1
+		<< ",\"is_active\":" << (IsActive() ? "true" : "false")
+		<< ",\"is_focused\":" << (IsActive() ? "true" : "false")
+		<< ",\"wm_class\":\"Terminal\",\"wm_name\":\"Terminal\""
+		<< ",\"tabs\":[";
+	for (int32 i = 0; i < fSessions.CountItems(); i++) {
+		TermView* view = _TermViewAt(i);
+		Session* session = _SessionAt(i);
+		int32 id = view->RemoteControlID();
+		bool active = i == selection;
+		const char* yes = active ? "true" : "false";
+		const char* focused = active && IsActive() ? "true" : "false";
+		ShellInfo shellInfo;
+		ActiveProcessInfo processInfo;
+		bool haveShell = view->GetShellInfo(shellInfo);
+		bool haveProcess = view->GetActiveProcessInfo(processInfo);
+
+		if (i > 0)
+			json << ",";
+		json << "{\"id\":" << id << ",\"is_active\":" << yes
+			<< ",\"is_focused\":" << focused << ",\"title\":";
+		append_json_string(json, session->title.title.String());
+		json << ",\"layout\":\"stack\",\"enabled_layouts\":[\"stack\"]"
+			<< ",\"active_window_history\":[" << id << "]"
+			<< ",\"groups\":[{\"id\":" << id << ",\"windows\":[" << id
+			<< "]}],\"windows\":[{\"id\":" << id << ",\"is_active\":" << yes
+			<< ",\"is_focused\":" << focused << ",\"is_self\":"
+			<< (view == sender ? "true" : "false") << ",\"title\":";
+		append_json_string(json, session->title.title.String());
+		json << ",\"pid\":" << (haveShell ? (int32)shellInfo.ProcessID() : 0)
+			<< ",\"cwd\":";
+		append_json_string(json, haveProcess
+			? processInfo.CurrentDirectory().String() : "");
+		json << ",\"cmdline\":[],\"env\":{},\"foreground_processes\":[";
+		if (haveProcess) {
+			json << "{\"pid\":" << (int32)processInfo.ID()
+				<< ",\"cmdline\":[";
+			append_json_string(json, processInfo.Name().String());
+			json << "],\"cwd\":";
+			append_json_string(json, processInfo.CurrentDirectory().String());
+			json << "}";
+		}
+		json << "],\"lines\":" << view->Rows() << ",\"columns\":"
+			<< view->Columns() << ",\"user_vars\":{}}]}";
+	}
+	json << "]}]";
 }

@@ -92,6 +92,8 @@ static const uint32 MSG_SWITCH_TAB_LEFT					= 'swtl';
 static const uint32 MSG_SWITCH_TAB_RIGHT				= 'swtr';
 static const uint32 MSG_ACTIVATE_TERM					= 'msat';
 static const uint32 MSG_NOTIFICATION_ACTIVATED			= 'ntac';
+static const uint32 MSG_NOTIFICATION_CLOSED				= 'ntcl';
+static const uint32 MSG_REMOTE_CONTROL					= 'rmct';
 
 // A click on a notification starts Terminal with this argument, the team and
 // the view that sent it, the notification's id and what to do (bit 0: show
@@ -107,6 +109,8 @@ static const char* const PREF_THEME_NAME = "Theme name";
 static const char* const PREF_HALF_FONT_FAMILY = "Half Font Family";
 static const char* const PREF_HALF_FONT_STYLE = "Half Font Style";
 static const char* const PREF_HALF_FONT_SIZE = "Half Font Size";
+// "yes" lets programs use kitty's remote control (not in the preferences)
+static const char* const PREF_REMOTE_CONTROL = "RemoteControl";
 
 static const char* const PREF_TEXT_FORE_COLOR = "Text";
 static const char* const PREF_TEXT_BACK_COLOR = "Background";

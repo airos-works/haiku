@@ -228,6 +228,7 @@ AppGroupView::AddInfo(NotificationView* view)
 					&& view->ProgressPercent() >= 0) {
 					system_beep("Notification progress");
 				}
+				oldView->SetReplaced();
 				oldView->RemoveSelf();
 				delete oldView;
 				fInfo[i] = view;

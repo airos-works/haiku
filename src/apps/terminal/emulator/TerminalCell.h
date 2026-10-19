@@ -124,6 +124,50 @@ struct CellStyle {
 static const uint32 kClusterBit = 0x80000000;
 
 
+/*!	A cell of a block of kitty's text sizing (OSC 66): text drawn larger
+	(or smaller, or in a given number of cells) over several cells. Every
+	cell of the block has the block's description (an index into the
+	terminal's table, bits 0-20) and its place in it: column (bits 21-26)
+	and row (bits 27-29). No code point or cluster has kMulticellBit set.
+*/
+static const uint32 kMulticellBit = 0x40000000;
+
+
+static inline bool
+is_multicell(uint32 character)
+{
+	return (character & (kClusterBit | kMulticellBit)) == kMulticellBit;
+}
+
+
+static inline uint32
+multicell_index(uint32 character)
+{
+	return character & 0x1fffff;
+}
+
+
+static inline int32
+multicell_x(uint32 character)
+{
+	return (character >> 21) & 0x3f;
+}
+
+
+static inline int32
+multicell_y(uint32 character)
+{
+	return (character >> 27) & 0x7;
+}
+
+
+static inline uint32
+make_multicell(uint32 index, int32 x, int32 y)
+{
+	return kMulticellBit | ((uint32)y << 27) | ((uint32)x << 21) | index;
+}
+
+
 struct TerminalCell {
 	uint32		character;
 	uint32		hyperlink;		// 0 or the id of an OSC 8 link

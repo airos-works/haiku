@@ -75,6 +75,7 @@ struct Recorder : Terminal::Listener {
 	std::vector<TermNotification> notifications;
 	std::string pointer;
 	std::string directory;
+	std::string remoteControl;
 
 	virtual void TerminalTitleChanged(const char* text) { title = text; }
 	virtual void TerminalBell() { bells++; }
@@ -94,6 +95,10 @@ struct Recorder : Terminal::Listener {
 	virtual void TerminalWorkingDirectoryChanged(const char* url)
 	{
 		directory = url;
+	}
+	virtual void TerminalRemoteControl(const char* json)
+	{
+		remoteControl = json;
 	}
 };
 
@@ -776,8 +781,8 @@ TestOperatingSystemCommands()
 	CHECK_EQUAL(n.recorder.notifications[1].body, "Body");
 	n.Feed("\x1b]99;i=q:p=?;\x1b\\");
 	std::string answer = n.Reply();
-	CHECK_EQUAL(answer, "\x1b]99;i=q:p=?;a=focus,report:o=always,unfocused"
-		":p=title,body,close,icon,?,alive:s=system,silent:u=0,1,2:w=1"
+	CHECK_EQUAL(answer, "\x1b]99;i=q:p=?;a=focus,report:c=1:o=always,unfocused"
+		":p=title,body,close,icon,?,alive,buttons:s=system,silent:u=0,1,2:w=1"
 		"\x1b\\");
 	n.Feed(answer);
 	CHECK_EQUAL(n.Reply(), "");
@@ -803,16 +808,32 @@ TestOperatingSystemCommands()
 	n.Feed("\x1b]99;a=report;No id\x1b\\");
 	n.terminal.ReportNotificationActivated("", 0);
 	CHECK_EQUAL(n.Reply(), "\x1b]99;i=0;\x1b\\");
-	// close events cannot be tracked; an icon, a name, a cache key, expiry
+	// an icon, a name, a cache key, expiry, a close event
 	n.Feed("\x1b]99;i=ic:d=0:c=1:w=5000:n=ZXJyb3I=:g=key1;Icon\x1b\\"
 		"\x1b]99;i=ic:p=icon:e=1;iVBORw==\x1b\\");
-	CHECK_EQUAL(n.Reply(), "\x1b]99;i=ic:p=close;untracked\x1b\\");
+	CHECK_EQUAL(n.Reply(), "");
+	n.terminal.ReportNotificationClosed("ic");
+	CHECK_EQUAL(n.Reply(), "\x1b]99;i=ic:p=close;\x1b\\");
 	const TermNotification& icon = n.recorder.notifications.back();
 	CHECK_EQUAL(icon.title, "Icon");
 	CHECK(icon.timeout == 5000);
 	CHECK(icon.iconNames.size() == 1 && icon.iconNames[0] == "error");
 	CHECK_EQUAL(icon.iconKey, "key1");
 	CHECK_EQUAL(icon.iconData, "\x89PNG");
+	// buttons, separated by U+2028; a click on the second
+	n.Feed("\x1b]99;i=b:d=0:a=report;Pick\x1b\\"
+		"\x1b]99;i=b:p=buttons;Yes\xe2\x80\xa8No\x1b\\");
+	CHECK(n.recorder.notifications.back().buttons.size() == 2
+		&& n.recorder.notifications.back().buttons[1] == "No");
+	n.terminal.ReportNotificationActivated("b", 2);
+	CHECK_EQUAL(n.Reply(), "\x1b]99;i=b;2\x1b\\");
+
+	// kitty's remote control: the command goes to the listener
+	Fixture rc;
+	rc.Feed("\x1bP@kitty-cmd{\"cmd\":\"ls\",\"version\":[0,14,2]}\x1b\\");
+	CHECK_EQUAL(rc.recorder.remoteControl,
+		"{\"cmd\":\"ls\",\"version\":[0,14,2]}");
+	CHECK_EQUAL(rc.Row(0), "");
 
 	// kitty's multiple cursors
 	Fixture m(20, 10);
@@ -842,10 +863,71 @@ TestOperatingSystemCommands()
 	m.Feed("\x1b[>q");
 	CHECK(m.Reply().find("\x1bP>|") == 0);
 
-	// text sizing falls back to normal text
-	Fixture t;
+	// text sizing: each character a block of 2 by 2 cells, the cursor
+	// after it on its top row
+	Fixture t(20, 6);
 	t.Feed("\x1b]66;s=2;Hi\x1b\\!");
-	CHECK_EQUAL(t.Row(0), "Hi  !");
+	CHECK(t.Cursor() == TermPoint(5, 0));
+	CHECK(is_multicell(t.Cell(0, 0).character));
+	CHECK(multicell_x(t.Cell(1, 1).character) == 1
+		&& multicell_y(t.Cell(1, 1).character) == 1);
+	CHECK(multicell_x(t.Cell(0, 2).character) == 0);
+	CHECK(t.Cell(0, 4).character == '!');
+	CHECK_EQUAL(t.Row(0), "Hi!");
+	CHECK_EQUAL(t.Row(1), "");
+	TermMulticell multicell;
+	CHECK(t.terminal.GetMulticell(multicell_index(t.Cell(0, 2).character),
+		multicell) && multicell.text == 'i' && multicell.scale == 2
+		&& multicell.columns == 2);
+	// writing over a block's top row takes it away
+	t.Feed("\x1b[1;2HX");
+	CHECK(t.Cell(0, 0).character == 0 && t.Cell(1, 1).character == 0);
+	CHECK(t.Cell(0, 1).character == 'X');
+	// on a lower row, the text goes after the block
+	t.Feed("\x1b[2;3HY");
+	CHECK(t.Cell(1, 4).character == 'Y');
+	CHECK(is_multicell(t.Cell(1, 3).character));
+	// erasing a line erases the blocks on it, all of them
+	t.Feed("\x1b[2;1H\x1b[2K");
+	CHECK(t.Cell(0, 2).character == 0);
+	// a block too high for the screen is dropped
+	t.Feed("\x1b[H\x1b[2J\x1b]66;s=7;x\x07");
+	CHECK(t.Cell(0, 0).character == 0 && t.Cursor() == TermPoint(0, 0));
+	// at the bottom the screen scrolls up for it
+	t.Feed("\x1b[6;1H\x1b]66;s=3;x\x07");
+	CHECK(t.Cursor() == TermPoint(3, 3));
+	CHECK(is_multicell(t.Cell(5, 2).character));
+	// clearing the screen takes it
+	t.Feed("\x1b[2J");
+	CHECK(t.Cell(3, 0).character == 0);
+
+	// widths: w cells for all the text, the fraction, plain text otherwise
+	Fixture w(20, 6);
+	w.Feed("\x1b]66;w=3;ab\x07|");
+	CHECK(w.Cursor() == TermPoint(4, 0));
+	CHECK(w.terminal.GetMulticell(multicell_index(w.Cell(0, 0).character),
+		multicell) && multicell.columns == 3 && multicell.scale == 1);
+	CHECK_EQUAL(w.Row(0), "ab|");
+	w.Feed("\r\n\x1b]66;n=1:d=2:v=1;x\x07");
+	CHECK(w.terminal.GetMulticell(multicell_index(w.Cell(1, 0).character),
+		multicell) && multicell.numerator == 1 && multicell.denominator == 2
+		&& multicell.verticalAlignment == 1 && multicell.columns == 1);
+	w.Feed("\r\n\x1b]66;;plain\x07\x1b]66;w=1;z\x07");
+	CHECK(w.Cell(2, 0).character == 'p' && w.Cell(2, 5).character == 'z');
+	w.Feed("\x1b]66;q=1;dropped\x07");	// an unknown key drops it all
+	CHECK(w.Cursor() == TermPoint(6, 2));
+
+	// kitty's way of telling what is supported: three cursor reports
+	Fixture c(20, 6);
+	c.Feed("\r\x1b[6n\x1b]66;w=2; \x07\x1b[6n\x1b]66;s=2; \x07\x1b[6n");
+	CHECK_EQUAL(c.Reply(), "\x1b[1;1R\x1b[1;3R\x1b[1;5R");
+
+	// a resize to another width leaves the text in normal size
+	Fixture r(20, 6);
+	r.Feed("\x1b]66;s=2;ab\x07");
+	r.terminal.Resize(10, 6);
+	CHECK_EQUAL(r.Row(0), "a b");
+	CHECK(!is_multicell(r.Cell(0, 0).character));
 }
 
 

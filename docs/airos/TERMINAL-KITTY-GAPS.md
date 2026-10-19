@@ -11,8 +11,9 @@ styled and colored underlines, pointer shapes, OSC 21 colors and the color
 stack, OSC 5522 clipboard and paste events, unscroll, DECCARA, the mode
 save/restore, SGR 221/222, ED 22, the mouse-leave event, synchronized
 output, in-band resize, color scheme reports, OSC 8 links, OSC 52, OSC 133
-marks with prompt jumps, OSC 99 notifications (partly), OSC 66 (width
-only), grapheme clusters, reflow, GPU drawing.
+marks with prompt jumps and bash integration, OSC 99 notifications (clicks,
+icons, expiry), OSC 66 text sizing, multiple cursors, color emoji, grapheme
+clusters, reflow, GPU drawing.
 
 ## Recommended next
 
@@ -36,30 +37,29 @@ Terminal reads the marks and jumps between prompts, and air/OS's bash marks
 them (`data/profile.d/airos-terminal.sh`). Missing: the features on top (M),
 and scripts for zsh and fish (not in the image).
 
-### Notifications (OSC 99) — mostly done; the rest needs notification_server
-Clicks (`a=focus`, `a=report`), icons (`n=`, `p=icon`, `g=`), expiry (`w=`)
-and `p=close` work: a click starts Terminal with the team and view that
-sent the notification, which passes it on and quits. Missing: reports of
-a notification being closed (`c=1`, answered `untracked` as kitty specifies
-for such systems), buttons (`p=buttons`), sounds other than the system's.
-notification_server has no buttons and does not say when one closes; both
-need changes there (M).
+### Notifications (OSC 99) — done
+Clicks, buttons and close events come from air/OS's notification_server,
+which now answers a sender that asks (fields in the request the
+BNotification API has no calls for: a reply messenger, the messages for a
+click or a button and for the notification going away, button labels).
+Missing: sounds other than the system's (kitty's `s=` names).
 
-### Text sizing (OSC 66) — L
-kitty draws text 2 to 7 times larger (headings in terminal programs), and
-fractional sizes with alignment. Terminal reserves the cells but draws the
-text at normal size. It touches the cell model, every editing operation,
-history, reflow and both renderers. Few programs use it yet.
+### Text sizing (OSC 66) — done
+Blocks of larger, fitted or fractional text with the spec's editing rules.
+Differences from kitty: a resize to another width turns blocks into normal
+text (kitty keeps those that still fit); the cursor is drawn on its cell,
+not over the whole block (a "should" in the spec); insert mode does not open
+room for a block first.
 
 ### Multiple cursors (`CSI > ... SP q`) — done
 All of it, drawn by both renderers.
 
-### Remote control (`DCS @kitty-cmd`) — M for a useful subset
-Scripting kitty from programs running in it (`kitten @ launch`, `send-text`,
-`get-text`, `set-colors`, `set-tab-title` ...). Terminal can already be
-scripted from outside with `hey` (see TERMINAL.md); this would add the kitty
-wire format and the commands that fit Terminal's windows and tabs. kitty's
-encrypted mode needs X25519 and AES-GCM.
+### Remote control (`DCS @kitty-cmd`) — the useful part done
+Off by default, like kitty's. The commands that fit Terminal's tabs work
+(see TERMINAL.md). Missing: the encrypted form with passwords (X25519,
+AES-GCM; S-M), commands for kitty's layouts, markers, background images and
+the like (no such things in Terminal), `send-key`, async and streaming
+commands, and the `kitten @` client itself (Go).
 
 ### File transfer (OSC 5113) — L
 Copying files over the terminal connection, used by `kitten transfer` and

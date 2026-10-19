@@ -7,10 +7,12 @@
 #include "GlyphCache.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <algorithm>
+#include <map>
 
 #include <Bitmap.h>
 #include <String.h>
@@ -278,6 +280,53 @@ GlyphCache::_MarkDirty(int32 page, int32 top, int32 bottom)
 
 
 uint32
+GlyphCache::LookupMulticell(uint64 key, const char* utf8,
+	const MulticellShape& shape, int32 x, int32 y, uint32 style)
+{
+	if (!fAllowBold)
+		style &= ~GLYPH_BOLD;
+	key = (key & 0xffffffffffffULL) | ((uint64)style << 56) | (1ULL << 60);
+
+	std::unordered_map<uint64, uint32>::iterator found = fSlots.find(key);
+	if (found != fSlots.end())
+		return found->second;
+
+	uint32 emoji = 0;
+	uint32 codePoints[16];
+	int32 count = decode_utf8(utf8, codePoints, 16);
+	if (ColorEmoji::IsEmojiCluster(codePoints, count)
+		&& fEmoji.IsAvailable()) {
+		emoji = fEmoji.GlyphFor(codePoints, count);
+	}
+
+	uint32 slot = _AllocateSlot(1);
+	if (slot == 0) {
+		_Reset();
+		slot = _AllocateSlot(1);
+		if (slot == 0)
+			return 0;
+	}
+
+	Pending pending;
+	pending.slot = slot;
+	pending.text = utf8;
+	pending.codePoint = count > 0 ? codePoints[0] : 0;
+	pending.cells = 1;
+	pending.style = style;
+	pending.emoji = emoji;
+	pending.multicell = true;
+	pending.shape = shape;
+	pending.x = x;
+	pending.y = y;
+	fPending.push_back(pending);
+	if (emoji != 0)
+		slot |= kColorGlyphSlot;
+	fSlots[key] = slot;
+	return slot;
+}
+
+
+uint32
 GlyphCache::Lookup(uint64 key, const char* utf8, uint32 firstCodePoint,
 	int32 cells, uint32 style)
 {
@@ -315,6 +364,7 @@ GlyphCache::Lookup(uint64 key, const char* utf8, uint32 firstCodePoint,
 	pending.cells = cells;
 	pending.style = style;
 	pending.emoji = emoji;
+	pending.multicell = false;
 	fPending.push_back(pending);
 	if (emoji != 0)
 		slot |= kColorGlyphSlot;
@@ -360,8 +410,13 @@ GlyphCache::DrawPending()
 	// what reaches out of its cells is cut off rather than smeared into
 	// the next glyph
 	std::vector<Pending> drawn;
+	std::vector<Pending> multicells;
 	for (size_t i = 0; i < fPending.size(); i++) {
 		Pending& pending = fPending[i];
+		if (pending.multicell) {
+			multicells.push_back(pending);
+			continue;
+		}
 		int32 page, x, y;
 		fAtlas.SlotLocation(pending.slot, page, x, y);
 		if (page >= (int32)fPages.size())
@@ -393,6 +448,9 @@ GlyphCache::DrawPending()
 		drawn.push_back(pending);
 	}
 	fPending.clear();
+
+	if (!multicells.empty())
+		_DrawMulticells(multicells);
 
 	int32 boxWidth = cellWidth * 4;
 	int32 boxHeight = cellHeight * 2;
@@ -537,6 +595,119 @@ GlyphCache::_DrawCluster(const Pending& pending, const BFont& font,
 	}
 	if (!run.IsEmpty())
 		fStagingView->DrawString(run.String(), pen);
+}
+
+
+/*!	Draws the pieces of text sizing blocks: each block's text once, in its
+	size (the scale, times the fraction) and place in the block, then cut
+	into its cells.
+*/
+void
+GlyphCache::_DrawMulticells(std::vector<Pending>& pending)
+{
+	int32 cellWidth = fMetrics.cellWidth;
+	int32 cellHeight = fMetrics.cellHeight;
+
+	// the pieces of a block together
+	std::map<std::string, std::vector<const Pending*> > blocks;
+	for (size_t i = 0; i < pending.size(); i++) {
+		const Pending& piece = pending[i];
+		const MulticellShape& shape = piece.shape;
+		char key[96];
+		snprintf(key, sizeof(key), "%d:%d:%d:%d:%d:%d:%u:",
+			(int)shape.columns, (int)shape.rows, (int)shape.numerator,
+			(int)shape.denominator, (int)shape.verticalAlignment,
+			(int)shape.horizontalAlignment, (unsigned)piece.style);
+		blocks[std::string(key) + piece.text].push_back(&piece);
+	}
+
+	for (std::map<std::string, std::vector<const Pending*> >::iterator it
+			= blocks.begin(); it != blocks.end(); it++) {
+		const std::vector<const Pending*>& pieces = it->second;
+		const Pending& first = *pieces[0];
+		const MulticellShape& shape = first.shape;
+		int32 width = cellWidth * shape.columns;
+		int32 height = cellHeight * shape.rows;
+
+		// the fraction: a smaller area, placed in the block
+		float fraction = shape.numerator > 0
+			&& shape.denominator > shape.numerator
+			? (float)shape.numerator / shape.denominator : 1.0f;
+		int32 areaWidth = std::max((int32)1, (int32)roundf(width * fraction));
+		int32 areaHeight = std::max((int32)1,
+			(int32)roundf(height * fraction));
+		int32 areaLeft = shape.horizontalAlignment == 1
+			? width - areaWidth : shape.horizontalAlignment == 2
+				? (width - areaWidth) / 2 : 0;
+		int32 areaTop = shape.verticalAlignment == 1
+			? height - areaHeight : shape.verticalAlignment == 2
+				? (height - areaHeight) / 2 : 0;
+		float scale = shape.rows * fraction;
+
+		if (first.emoji != 0) {
+			std::vector<uint32> block((size_t)width * height, 0);
+			fEmoji.Draw(first.emoji,
+				block.data() + (size_t)areaTop * width + areaLeft, width,
+				areaWidth, areaHeight);
+			for (size_t i = 0; i < pieces.size(); i++) {
+				const Pending& piece = *pieces[i];
+				int32 page, x, y;
+				fAtlas.SlotLocation(piece.slot, page, x, y);
+				uint32* colorPage = page < (int32)fPages.size()
+					? _ColorPage(page) : NULL;
+				if (colorPage == NULL)
+					continue;
+				for (int32 row = 0; row < cellHeight; row++) {
+					memcpy(colorPage + (size_t)(y + row) * kPageSize + x,
+						block.data() + (size_t)(piece.y * cellHeight + row)
+							* width + piece.x * cellWidth,
+						cellWidth * sizeof(uint32));
+				}
+				_MarkDirty(page, y, y + cellHeight);
+			}
+			continue;
+		}
+
+		if (!_EnsureStaging(width, height) || !fStaging->Lock())
+			continue;
+		uint32 style = first.style;
+		if (fEmulateBold)
+			style &= ~GLYPH_BOLD;
+		BFont font(fFonts[style]);
+		font.SetSize(fFonts[style].Size() * scale);
+		fStagingView->SetDrawingMode(B_OP_COPY);
+		fStagingView->SetHighColor(0, 0, 0);
+		fStagingView->FillRect(fStagingView->Bounds());
+		fStagingView->SetHighColor(255, 255, 255);
+		fStagingView->SetLowColor(0, 0, 0);
+		fStagingView->SetFont(&font);
+		fStagingView->DrawString(first.text.c_str(),
+			BPoint(areaLeft, areaTop + roundf(fMetrics.baseline * scale)));
+		fStagingView->Sync();
+
+		const uint8* bits = (const uint8*)fStaging->Bits();
+		int32 bytesPerRow = fStaging->BytesPerRow();
+		for (size_t i = 0; i < pieces.size(); i++) {
+			const Pending& piece = *pieces[i];
+			int32 page, x, y;
+			fAtlas.SlotLocation(piece.slot, page, x, y);
+			if (page >= (int32)fPages.size())
+				continue;
+			for (int32 row = 0; row < cellHeight; row++) {
+				const uint8* source = bits
+					+ (size_t)(piece.y * cellHeight + row) * bytesPerRow
+					+ piece.x * cellWidth * 4;
+				uint8* target = fPages[page] + (size_t)(y + row) * kPageSize
+					+ x;
+				for (int32 column = 0; column < cellWidth; column++) {
+					const uint8* pixel = source + column * 4;
+					target[column] = (pixel[0] + pixel[1] + pixel[2]) / 3;
+				}
+			}
+			_MarkDirty(page, y, y + cellHeight);
+		}
+		fStaging->Unlock();
+	}
 }
 
 
