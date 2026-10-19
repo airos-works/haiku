@@ -1510,6 +1510,14 @@ TermView::SetTermFont(const BFont *font)
 	fAllowBold = PrefHandler::Default() == NULL ? true
 		: PrefHandler::Default()->getBool(PREF_ALLOW_BOLD);
 
+	// kitty's disable_ligatures: never (the default), cursor or always
+	const char* ligatures = PrefHandler::Default() == NULL ? NULL
+		: PrefHandler::Default()->getString(PREF_DISABLE_LIGATURES);
+	fGlyphs.SetLigatureMode(ligatures != NULL
+		&& strcmp(ligatures, "cursor") == 0 ? LIGATURES_NOT_AT_CURSOR
+		: ligatures != NULL && strcmp(ligatures, "always") == 0
+			? LIGATURES_NEVER : LIGATURES_ALWAYS);
+
 	_UpdateMetrics();
 
 	int cursorStyle = PrefHandler::Default() == NULL ? BLOCK_CURSOR

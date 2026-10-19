@@ -91,6 +91,21 @@ from the font's ligatures (its GSUB table). Without a color font, emoji are
 drawn in one color as before. Color glyphs are faint, underlined and struck
 through like text.
 
+**Ligatures.** Coding fonts that join characters (Fira Code, JetBrains
+Mono, Cascadia Code: `->` as an arrow, `!=` as ≠, `===`, `&&`, `//`) show
+their ligatures. A word (the characters between spaces, in one style) with
+two symbols next to each other is shaped with HarfBuzz, loaded at run time
+from `libharfbuzz.so.0` (air/OS has it with Summit; without it there are no
+ligatures). Where the font puts other glyphs than the characters' own, those
+cells are drawn together with FreeType from the glyphs and cut into cells,
+so each keeps its color and the cursor still covers one cell. The font's file
+is found by its family and style names in the font directories; a style the
+family does not have (app_server's slanted italics) gets no ligatures. As
+kitty's `disable_ligatures`, the settings' `"DisableLigatures"` is `never`
+(the default), `cursor` (not in the word the cursor is on) or `always`.
+Printing 1.8 MB of C to the screen takes as long with ligatures as without
+(0.14 to 0.2 s on the X399).
+
 **Accents.** app_server places glyphs one after the other without
 positioning combining marks, which put the accent of a decomposed é past the
 e. Combining diacritics (U+0300 to U+036F and the other diacritical mark

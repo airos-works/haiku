@@ -37,6 +37,7 @@ local renderSources =
 	ColorEmoji.cpp
 	FrameBuilder.cpp
 	GlyphCache.cpp
+	Ligatures.cpp
 	SoftwareRenderer.cpp
 	;
 

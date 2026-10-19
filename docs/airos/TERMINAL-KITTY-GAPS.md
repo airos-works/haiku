@@ -1,6 +1,6 @@
 # Terminal compared with kitty: what is missing
 
-State on 2026-10-19, after the Terminal rewrite ([TERMINAL.md](TERMINAL.md)).
+State on 2026-10-20, after the Terminal rewrite ([TERMINAL.md](TERMINAL.md)).
 This list is for choosing what to add next. Each item says what it is, who
 would notice, how big the work is, and what on air/OS stands in the way.
 Effort: **S** is about a day, **M** a few days, **L** a week or more.
@@ -13,18 +13,25 @@ save/restore, SGR 221/222, ED 22, the mouse-leave event, synchronized
 output, in-band resize, color scheme reports, OSC 8 links, OSC 52, OSC 133
 marks with prompt jumps and bash integration, OSC 99 notifications (clicks,
 icons, expiry), OSC 66 text sizing, multiple cursors, remote control (with
-passwords), drag and drop, file transfer, color emoji, grapheme clusters,
-reflow, GPU drawing.
+passwords), drag and drop, file transfer, color emoji, ligatures, grapheme
+clusters, reflow, GPU drawing.
 
 ## Recommended next
 
-| # | What | Effort | Why first |
+The first list (bash integration, color emoji, faster software drawing,
+notification clicks, ligatures) is done, and so are text sizing, multiple
+cursors, remote control with passwords, drag and drop and file transfer.
+What is left, in the order that would help most:
+
+| # | What | Effort | Why |
 | --- | --- | --- | --- |
-| 1 | ~~Shell integration for bash~~ | done | `data/profile.d/airos-terminal.sh` marks prompts (OSC 133) and reports the directory (OSC 7); prompt jumps work out of the box. |
-| 2 | ~~Color emoji~~ | done | Drawn with FreeType from Noto Color Emoji (`noto_emoji_color`, added to the CI images), sequences through the font's GSUB ligatures. |
-| 3 | Faster full-screen drawing | ~~S-M~~ done, then L | Because of reading back, the GPU path loses to software on both test machines (X399 with NVIDIA, Framework 13 with AMD), so Terminal draws in software there today. The software renderer now uses up to four threads (4K frame 13 ms to 3.8 ms on the X399). Drawing straight into the screen without the read back (L) is what would make the GPU worth it. |
-| 4 | ~~Notification clicks, icons, expiry~~ | done | A click shows the tab and reports to the program; icons by name or data; `w=`; `p=close`. |
-| 5 | Ligatures | M-L | Wanted by users of coding fonts (Fira Code, JetBrains Mono). |
+| 1 | Drawing without reading back | L | The one thing that would make the GPU path faster than software (see *Drawing*); needs a scanout or shared buffer path per driver (amdgpu has one, NVK none). |
+| 2 | Shell integration features | M | Click at the prompt to move the cursor, warn before closing a tab that runs a command, the last command's output in a pager; zsh and fish scripts. |
+| 3 | rsync deltas for file transfer | M | `kitten transfer -x` resumes and updates big files; needs XXH3 (small enough to carry in Terminal). |
+| 4 | Remote control permissions | S | kitty's per-password lists of allowed commands, and asking the user about a password it does not know. |
+| 5 | Clipboard passwords | S | Lets a trusted program read the clipboard without the alert each time. |
+| 6 | Drag and drop leftovers | M | Data asked for after the drop, files pulled from another machine; partly blocked by Haiku's drag messages. |
+| 7 | Terminal features | S-M each | Rectangular selection, hints, marks, broadcast typing (see the table below); they add to the interface, which is to stay as it is. |
 
 ## Protocols
 
@@ -97,11 +104,15 @@ a font's COLRv0 layers. Not done: COLRv1 fonts (FreeType's paint API), and
 emoji newer than the font (Unicode 15.1 for Noto Color Emoji 2.042), which
 fall back to their first component or to the monochrome font.
 
-### Ligatures — M to L
-Shaping runs of text with HarfBuzz (a package other applications already
-pull in) and drawing glyphs by id, which app_server's `BFont` cannot do; it
-means FreeType in Terminal, as for emoji.
-kitty also offers `disable_ligatures` under the cursor.
+### Ligatures — done
+Words with two symbols next to each other are shaped with HarfBuzz, and the
+cells the font joins are drawn with FreeType (see TERMINAL.md). Differences
+from kitty, which shapes all text: ligatures without two symbols side by
+side (Fira Code's `www`, `0xFF`, `Fl`) are not looked for, nor ones across a
+change of bold or italic or a space; joined cells are drawn by FreeType and
+the rest by app_server, which hint a little differently; slanted italics
+(no italic face) get none. Shaping other scripts (Indic, Arabic marks)
+would build on the same code (M).
 
 ### Drawing without reading back — L
 The GPU renderer draws into an offscreen buffer and reads the changed rows

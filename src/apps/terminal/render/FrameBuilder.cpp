@@ -6,6 +6,7 @@
 
 #include "FrameBuilder.h"
 
+#include <ctype.h>
 #include <string.h>
 
 #include <algorithm>
@@ -335,6 +336,78 @@ FrameBuilder::_AddExtraCursors(Terminal* terminal, const FrameState& state,
 }
 
 
+//!	The style of a cell's glyph, if the cell can be part of a ligature: a
+//!	character of its own, one cell wide, shown.
+static bool
+ligature_style(const TerminalCell& cell, uint32& _style)
+{
+	uint32 character = cell.character;
+	if (character == 0 || character == ' ' || character >= 0x110000
+		|| (character & kClusterBit) != 0 || is_multicell(character)
+		|| character == kPlaceholderCharacter || cell.IsWide()
+		|| cell.IsWideTail() || (cell.style.flags & CELL_INVISIBLE) != 0) {
+		return false;
+	}
+	_style = 0;
+	if ((cell.style.flags & CELL_BOLD) != 0)
+		_style |= GLYPH_BOLD;
+	if ((cell.style.flags & CELL_ITALIC) != 0)
+		_style |= GLYPH_ITALIC;
+	return true;
+}
+
+
+static inline bool
+is_symbol(uint32 c)
+{
+	return c > 0x20 && c < 0x7f && !isalnum((int)c);
+}
+
+
+/*!	Ligatures: words (runs of characters between spaces, in one style)
+	with two symbols next to each other are shaped as a whole, as that is
+	where coding fonts have them (->, !=, ===, //, ...).
+*/
+void
+FrameBuilder::_FindLigatures(Terminal* terminal, const TerminalCell* cells,
+	int32 terminalRow, int32 columns)
+{
+	fLigatureSlots.assign(columns, 0);
+	int32 mode = fGlyphs->LigatureMode();
+	if (mode == LIGATURES_NEVER)
+		return;
+	Terminal::CursorInfo cursor = terminal->Cursor();
+
+	for (int32 x = 0; x < columns;) {
+		uint32 style;
+		if (!ligature_style(cells[x], style)) {
+			x++;
+			continue;
+		}
+		int32 start = x;
+		bool symbols = false;
+		fRunCodePoints.clear();
+		uint32 cellStyle;
+		while (x < columns && ligature_style(cells[x], cellStyle)
+			&& cellStyle == style) {
+			uint32 c = cells[x].character;
+			if (x > start && is_symbol(c) && is_symbol(fRunCodePoints.back()))
+				symbols = true;
+			fRunCodePoints.push_back(c);
+			x++;
+		}
+		if (!symbols)
+			continue;
+		if (mode == LIGATURES_NOT_AT_CURSOR && cursor.y == terminalRow
+			&& cursor.x >= start && cursor.x <= x) {
+			continue;
+		}
+		fGlyphs->LookupRun(fRunCodePoints.data(), fRunCodePoints.size(),
+			style, &fLigatureSlots[start]);
+	}
+}
+
+
 void
 FrameBuilder::_BuildRow(Terminal* terminal, const FrameState& state,
 	const TerminalCell* cells, int32 row, int32 terminalRow,
@@ -349,6 +422,8 @@ FrameBuilder::_BuildRow(Terminal* terminal, const FrameState& state,
 
 	std::string text;
 	uint32 codePoints[4];
+
+	_FindLigatures(terminal, cells, terminalRow, columns);
 
 	for (int32 x = 0; x < columns; x++) {
 		const TerminalCell& source = cells[x];
@@ -443,7 +518,9 @@ FrameBuilder::_BuildRow(Terminal* terminal, const FrameState& state,
 					flags |= RENDER_COLOR_GLYPH;
 				}
 			}
-		} else if (source.character != 0 && source.character != ' '
+		} else if (fLigatureSlots[x] != 0)
+			glyph = fLigatureSlots[x];
+		else if (source.character != 0 && source.character != ' '
 			&& (style.flags & CELL_INVISIBLE) == 0) {
 			int32 count = terminal->GetCharacter(source.character,
 				codePoints, 4);

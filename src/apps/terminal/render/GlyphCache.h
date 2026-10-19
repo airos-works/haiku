@@ -13,6 +13,7 @@
 #include <Font.h>
 
 #include "ColorEmoji.h"
+#include "Ligatures.h"
 #include "RenderFrame.h"
 
 
@@ -28,6 +29,14 @@ enum {
 
 //! Set in a slot Lookup() returns when the glyph is in color (an emoji).
 static const uint32 kColorGlyphSlot = 0x80000000;
+
+
+//! When ligatures are drawn, as kitty's disable_ligatures has it.
+enum {
+	LIGATURES_ALWAYS	= 0,
+	LIGATURES_NOT_AT_CURSOR,	// not in the word the cursor is on
+	LIGATURES_NEVER
+};
 
 
 //! How the text of a text sizing block is laid out (see TermMulticell).
@@ -77,8 +86,19 @@ public:
 			uint32				LookupMulticell(uint64 key, const char* utf8,
 									const MulticellShape& shape, int32 x,
 									int32 y, uint32 style);
+			/*!	The slots of the cells of a run of characters, one a cell, in
+				one style, where the font makes ligatures of them; 0 for the
+				other cells. Returns false when there is none.
+			*/
+			bool				LookupRun(const uint32* codePoints,
+									int32 count, uint32 style, uint32* slots);
+			void				SetLigatureMode(int32 mode);
+			int32				LigatureMode() const
+									{ return fLigatureMode; }
+
 			bool				HasPending() const
-									{ return !fPending.empty(); }
+									{ return !fPending.empty()
+										|| !fPendingRuns.empty(); }
 			//! Draws the glyphs looked up since the last call.
 			void				DrawPending();
 
@@ -113,6 +133,7 @@ private:
 			void				_DrawCluster(const Pending& pending,
 									const BFont& font, BPoint origin);
 			void				_DrawMulticells(std::vector<Pending>& pending);
+			void				_DrawRuns();
 
 private:
 			BFont				fFonts[4];		// by style
@@ -130,6 +151,19 @@ private:
 			std::vector<uint8*>	fPages;
 			std::vector<uint32*> fColorPages;	// NULL until a page has one
 			ColorEmoji			fEmoji;
+
+			struct PendingRun {
+				std::vector<uint32> codePoints;
+				uint32			style;
+				LigatureSegment	segment;
+				std::vector<uint32> slots;
+			};
+			Ligatures			fLigatures;
+			int32				fLigatureMode;
+			std::unordered_map<std::string, std::vector<uint32> > fRuns;
+									// slots by style and text, empty for
+									// runs without ligatures
+			std::vector<PendingRun> fPendingRuns;
 			std::vector<GlyphAtlasInfo::Dirty> fDirty;
 			GlyphAtlasInfo		fAtlas;
 
