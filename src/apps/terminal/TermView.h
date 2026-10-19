@@ -252,6 +252,7 @@ private:
 			// drawing
 			void				_ScheduleFrame();
 			void				_RenderFrame();
+			bool				_Render(int32& _firstRow, int32& _lastRow);
 			void				_InvalidateAll();
 			void				_LoadRenderer();
 			void				_PostEvent(Event* event);
@@ -363,6 +364,14 @@ private:
 			RenderFrame			fFrame;
 			TermRenderer*		fRenderer;
 			TermRenderer*		fSoftwareRenderer;
+			TermRenderer*		fGPURenderer;
+			bool				fChooseRenderer;
+			bool				fGPUStale;
+			int32				fGPUFrames;
+			int32				fComparisons;
+			bigtime_t			fLastComparison;
+			float				fGPUCost;		// microseconds per megapixel
+			float				fSoftwareCost;
 			BBitmap*			fBitmap;
 			bigtime_t			fLastFrameTime;
 			bool				fFrameNeeded;

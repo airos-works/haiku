@@ -479,6 +479,14 @@ TermView::_InitObject(const ShellParameters& shellParameters)
 	fScale = 1;
 	fRenderer = NULL;
 	fSoftwareRenderer = NULL;
+	fGPURenderer = NULL;
+	fChooseRenderer = true;
+	fGPUStale = false;
+	fGPUFrames = 0;
+	fComparisons = 0;
+	fLastComparison = 0;
+	fGPUCost = -1;
+	fSoftwareCost = -1;
 	fBitmap = NULL;
 	fLastFrameTime = 0;
 	fFrameNeeded = false;
@@ -589,8 +597,10 @@ TermView::~TermView()
 	for (size_t i = 0; i < fEvents.size(); i++)
 		delete fEvents[i];
 
-	if (fRenderer != fSoftwareRenderer)
-		delete fRenderer;
+	// a broken renderer is left alone, its context may not survive being
+	// destroyed
+	if (fGPURenderer != NULL && !fGPURenderer->IsBroken())
+		delete fGPURenderer;
 	delete fSoftwareRenderer;
 	delete fBitmap;
 	delete fTerminal;
@@ -1794,18 +1804,7 @@ TermView::_RenderFrame()
 	bigtime_t renderStart = system_time();
 	int32 firstRow;
 	int32 lastRow;
-	bool rendered = fRenderer->Render(fFrame, fGlyphs.Atlas(),
-		(uint8*)fBitmap->Bits(), fBitmap->BytesPerRow(), firstRow, lastRow);
-	if (!rendered && fRenderer->IsBroken()) {
-		// The GPU is gone: draw everything with the processor from now on.
-		// The broken renderer is left alone, its context may not survive
-		// being destroyed.
-		fRenderer = fSoftwareRenderer;
-		fFrame.allDirty = true;
-		rendered = fRenderer->Render(fFrame, fGlyphs.Atlas(),
-			(uint8*)fBitmap->Bits(), fBitmap->BytesPerRow(), firstRow,
-			lastRow);
-	}
+	bool rendered = _Render(firstRow, lastRow);
 
 	static bool sStatistics = getenv("TERMINAL_STATS") != NULL;
 	if (sStatistics && rendered) {
@@ -1839,6 +1838,122 @@ TermView::_RenderFrame()
 		}
 	}
 	fLastFrameTime = system_time();
+}
+
+
+/*!	Draws the frame with the processor or the GPU, whichever is faster.
+	Reading back what the GPU drew can cost more than drawing with the
+	processor: a 4K frame on the GTX 1070 with NVK takes 20 ms, against 9 ms
+	in software. When the choice is Terminal's, a large frame is drawn by
+	both now and then, and the faster one draws from then on.
+*/
+bool
+TermView::_Render(int32& _firstRow, int32& _lastRow)
+{
+	const GlyphAtlasInfo& atlas = fGlyphs.Atlas();
+	uint8* bits = (uint8*)fBitmap->Bits();
+	int32 bytesPerRow = fBitmap->BytesPerRow();
+
+	if (fGPURenderer == NULL || fGPURenderer->IsBroken()) {
+		// no GPU, or it is gone: the processor draws from now on
+		if (fRenderer != fSoftwareRenderer) {
+			fRenderer = fSoftwareRenderer;
+			fFrame.allDirty = true;
+		}
+		return fSoftwareRenderer->Render(fFrame, atlas, bits, bytesPerRow,
+			_firstRow, _lastRow);
+	}
+
+	int32 dirtyRows = 0;
+	for (int32 row = 0; row < fFrame.rows; row++) {
+		if (fFrame.allDirty || fFrame.dirtyRows[row])
+			dirtyRows++;
+	}
+	float frameSize = (float)fFrame.width * fFrame.height;
+	float dirtySize = fFrame.allDirty ? frameSize
+		: (float)fFrame.width * dirtyRows * fFrame.metrics.cellHeight;
+
+	bigtime_t now = system_time();
+	bool compare = fChooseRenderer && fGPUFrames >= 4
+		&& dirtySize >= frameSize / 2
+		&& now - fLastComparison > (fComparisons < 3 ? 500000 : 10000000);
+	if (!compare) {
+		if (fRenderer == fSoftwareRenderer) {
+			// the GPU's copy of the frame misses these rows now
+			fGPUStale = true;
+			return fSoftwareRenderer->Render(fFrame, atlas, bits,
+				bytesPerRow, _firstRow, _lastRow);
+		}
+		if (fGPUStale)
+			fFrame.allDirty = true;
+		if (fGPURenderer->Render(fFrame, atlas, bits, bytesPerRow, _firstRow,
+				_lastRow)) {
+			fGPUStale = false;
+			fGPUFrames++;
+			return true;
+		}
+		if (!fGPURenderer->IsBroken())
+			return false;
+		return _Render(_firstRow, _lastRow);
+	}
+
+	// Both draw the frame, the one in use last, so that its pixels stay.
+	bool dirty = fFrame.allDirty;
+	bigtime_t gpuTime = 0;
+	bigtime_t softwareTime = 0;
+	float gpuSize = fGPUStale ? frameSize : dirtySize;
+	int32 firstRow = 0;
+	int32 lastRow = 0;
+	bool rendered = false;
+	for (int32 i = 0; i < 2; i++) {
+		bool gpu = (i == 0) != (fRenderer == fGPURenderer);
+		bigtime_t start = system_time();
+		if (gpu) {
+			fFrame.allDirty = dirty || fGPUStale;
+			rendered = fGPURenderer->Render(fFrame, atlas, bits, bytesPerRow,
+				firstRow, lastRow);
+			gpuTime = system_time() - start;
+			fFrame.allDirty = dirty;
+			if (!rendered) {
+				if (fGPURenderer->IsBroken())
+					return _Render(_firstRow, _lastRow);
+				return false;
+			}
+			fGPUStale = false;
+		} else {
+			rendered = fSoftwareRenderer->Render(fFrame, atlas, bits,
+				bytesPerRow, firstRow, lastRow);
+			softwareTime = system_time() - start;
+		}
+	}
+	if (gpuSize > dirtySize)
+		fFrame.allDirty = true;
+	_firstRow = fFrame.allDirty ? 0 : firstRow;
+	_lastRow = fFrame.allDirty ? fFrame.rows - 1 : lastRow;
+
+	float gpuCost = gpuTime / (gpuSize / 1000000);
+	float softwareCost = softwareTime / (dirtySize / 1000000);
+	fGPUCost = fGPUCost < 0 ? gpuCost : (fGPUCost + gpuCost) / 2;
+	fSoftwareCost = fSoftwareCost < 0 ? softwareCost
+		: (fSoftwareCost + softwareCost) / 2;
+	fComparisons++;
+	fLastComparison = system_time();
+
+	// a clear difference only, so that it does not change back and forth
+	TermRenderer* faster = fRenderer;
+	if (fRenderer == fGPURenderer && fSoftwareCost < fGPUCost * 0.8f)
+		faster = fSoftwareRenderer;
+	else if (fRenderer == fSoftwareRenderer && fGPUCost < fSoftwareCost * 0.8f)
+		faster = fGPURenderer;
+
+	static bool sStatistics = getenv("TERMINAL_STATS") != NULL;
+	if (sStatistics) {
+		fprintf(stderr, "Terminal: %s %.0f us per megapixel, software %.0f:"
+			" %s\n", fGPURenderer->Name(), fGPUCost, fSoftwareCost,
+			faster->Name());
+	}
+	fRenderer = faster;
+	return rendered;
 }
 
 
@@ -2544,15 +2659,16 @@ TermView::DisableResizeView(int32 disableCount)
 // #pragma mark - the renderer
 
 
-/*!	Uses the OpenGL renderer add-on, unless OpenGL is not there or runs in
-	software (Terminal's own renderer is faster than Mesa's). The
-	TERMINAL_RENDERER environment variable ("software" or "opengl") or the
-	"Renderer" setting can choose.
+/*!	Loads the OpenGL renderer add-on, unless OpenGL is not there or runs in
+	software (Terminal's own renderer is faster than Mesa's). _Render() then
+	uses whichever of it and the software renderer is faster. The
+	TERMINAL_RENDERER environment variable or the "Renderer" setting can
+	choose one: "software" or "opengl" (Mesa's software renderers included).
 */
 void
 TermView::_LoadRenderer()
 {
-	if (fRenderer != fSoftwareRenderer)
+	if (fGPURenderer != NULL)
 		return;
 
 	BString choice = getenv("TERMINAL_RENDERER");
@@ -2621,7 +2737,9 @@ TermView::_LoadRenderer()
 		return;
 	}
 
+	fGPURenderer = renderer;
 	fRenderer = renderer;
+	fChooseRenderer = choice != "opengl";
 	fBuilder.Invalidate();
 }
 

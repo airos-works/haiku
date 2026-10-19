@@ -67,7 +67,13 @@
 	F(PFNGLDELETEFRAMEBUFFERSPROC, glDeleteFramebuffers) \
 	F(PFNGLGENVERTEXARRAYSPROC, glGenVertexArrays) \
 	F(PFNGLBINDVERTEXARRAYPROC, glBindVertexArray) \
-	F(PFNGLBLENDFUNCSEPARATEPROC, glBlendFuncSeparate)
+	F(PFNGLBLENDFUNCSEPARATEPROC, glBlendFuncSeparate) \
+	F(PFNGLGENBUFFERSPROC, glGenBuffers) \
+	F(PFNGLBINDBUFFERPROC, glBindBuffer) \
+	F(PFNGLBUFFERDATAPROC, glBufferData) \
+	F(PFNGLVERTEXATTRIBPOINTERPROC, glVertexAttribPointer) \
+	F(PFNGLENABLEVERTEXATTRIBARRAYPROC, glEnableVertexAttribArray) \
+	F(PFNGLBINDATTRIBLOCATIONPROC, glBindAttribLocation)
 
 #define DECLARE(type, name) static type p_##name;
 GL_FUNCTIONS(DECLARE)
@@ -79,16 +85,17 @@ static const char* const kVertexShader =
 	"uniform vec4 uRect;\n"
 	"uniform vec2 uViewport;\n"
 	"uniform vec4 uTextureRect;\n"
+	"in vec2 aCorner;\n"
 	"out vec2 vTexture;\n"
 	"void main() {\n"
-	"	vec2 corner = vec2(float(gl_VertexID & 1),\n"
-	"		float((gl_VertexID >> 1) & 1));\n"
+	"	vec2 corner = aCorner;\n"
 	"	vec2 pixel = uRect.xy + corner * uRect.zw;\n"
 	"	vTexture = mix(uTextureRect.xy, uTextureRect.zw, corner);\n"
 	"	gl_Position = vec4(pixel / uViewport * 2.0 - 1.0, 0.0, 1.0);\n"
 	"}\n";
 
-// the cells: backgrounds (uMode 0) or text and decorations (uMode 1)
+// the cells: backgrounds (uMode 0), text and decorations over them (uMode
+// 1), or both at once (uMode 2, where no image lies between them)
 static const char* const kCellShader =
 	"#version 130\n"
 	"uniform usampler2D uCells;\n"
@@ -177,10 +184,14 @@ static const char* const kCellShader =
 	"		line = (x < dash || x >= dash * 2) ? band(y, top, thickness) : 0.0;\n"
 	"	}\n"
 	"	line *= alpha;\n"
-	"	if (text <= 0.0 && line <= 0.0) discard;\n"
+	"	if (uMode == 1 && text <= 0.0 && line <= 0.0) discard;\n"
 	"	vec3 premultiplied = color(data.w) * line\n"
 	"		+ color(data.y) * text * (1.0 - line);\n"
 	"	float total = line + text * (1.0 - line);\n"
+	"	if (uMode == 2) {\n"
+	"		premultiplied += color(data.z) * (1.0 - total);\n"
+	"		total = 1.0;\n"
+	"	}\n"
 	"	fragColor = vec4(premultiplied.bgr, total);\n"
 	"}\n";
 
@@ -406,9 +417,18 @@ GLRenderer::Init(const char** error)
 		5);
 	p_glUseProgram(0);
 
+	// every draw is a rectangle: four corners, placed by the shader
 	GLuint vertexArray;
 	p_glGenVertexArrays(1, &vertexArray);
 	p_glBindVertexArray(vertexArray);
+	static const float kCorners[] = { 0, 0, 1, 0, 0, 1, 1, 1 };
+	GLuint corners;
+	p_glGenBuffers(1, &corners);
+	p_glBindBuffer(GL_ARRAY_BUFFER, corners);
+	p_glBufferData(GL_ARRAY_BUFFER, sizeof(kCorners), kCorners,
+		GL_STATIC_DRAW);
+	p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, NULL);
+	p_glEnableVertexAttribArray(0);
 
 	p_glGenFramebuffers(1, &fFramebuffer);
 	glGenTextures(1, &fTarget);
@@ -445,6 +465,7 @@ GLRenderer::_Compile(Program& program, const char* fragmentSource,
 	program.program = p_glCreateProgram();
 	p_glAttachShader(program.program, shaders[0]);
 	p_glAttachShader(program.program, shaders[1]);
+	p_glBindAttribLocation(program.program, 0, "aCorner");
 	p_glLinkProgram(program.program);
 	GLint status = 0;
 	p_glGetProgramiv(program.program, GL_LINK_STATUS, &status);
@@ -815,17 +836,17 @@ GLRenderer::Render(const RenderFrame& frame, const GlyphAtlasInfo& atlas,
 			glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 			_DrawImages(frame, top, bottom, INT32_MIN, kBelowBackgroundsZ - 1);
 			glDisable(GL_BLEND);
-		}
-		_DrawCells(frame, atlas, 0, images, top, bottom);
+			_DrawCells(frame, atlas, 0, true, top, bottom);
 
-		glEnable(GL_BLEND);
-		glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-		if (images)
+			glEnable(GL_BLEND);
 			_DrawImages(frame, top, bottom, kBelowBackgroundsZ, -1);
-		_DrawCells(frame, atlas, 1, false, top, bottom);
-		if (images)
+			_DrawCells(frame, atlas, 1, false, top, bottom);
 			_DrawImages(frame, top, bottom, 0, INT32_MAX);
-		glDisable(GL_BLEND);
+			glDisable(GL_BLEND);
+		} else {
+			// backgrounds and text in one pass
+			_DrawCells(frame, atlas, 2, false, top, bottom);
+		}
 
 		if (frame.cursorY >= bands[i].first
 			&& frame.cursorY <= bands[i].second) {
