@@ -367,11 +367,11 @@ private:
 			TermRenderer*		fGPURenderer;
 			bool				fChooseRenderer;
 			bool				fGPUStale;
-			int32				fGPUFrames;
-			int32				fComparisons;
-			bigtime_t			fLastComparison;
-			float				fGPUCost;		// microseconds per megapixel
-			float				fSoftwareCost;
+			int32				fWarmUpFrames;
+			int32				fMeasuredFrames;
+			float				fCost[2];		// software, GPU: microseconds
+												// per megapixel
+			bigtime_t			fMeasured[2];
 			BBitmap*			fBitmap;
 			bigtime_t			fLastFrameTime;
 			bool				fFrameNeeded;

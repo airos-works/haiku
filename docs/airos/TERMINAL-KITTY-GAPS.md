@@ -99,15 +99,18 @@ kitty also offers `disable_ligatures` under the cursor.
 ### Drawing without reading back — L
 The GPU renderer draws into an offscreen buffer and reads the changed rows
 back into a bitmap that app_server copies to the screen. On the X399
-(GTX 1070, NVK) reading back a 4K frame takes 12.5 ms, so Terminal chooses
-software there. On the Framework 13 (Radeon 760M, radeonsi) the GPU costs
-2.1 ms per megapixel against 1.4 ms in software, so software again. Presenting the GPU's image directly needs a scanout or shared
-buffer path per driver (amdgpu has one, used by Summit; NVK has none).
+(GTX 1070, NVK) reading back a 4K frame takes 12.5 ms, and a whole frame
+23.5 ms against 13 ms in software. On the Framework 13 (Radeon 760M,
+radeonsi) a 2223 x 1495 frame takes 2.8 ms against 1.8 ms. Terminal draws in
+software on both. (Reading back through a pixel buffer object was slower
+still: 3.2 ms on the 760M, 175 ms with Zink.) Presenting the GPU's image
+directly needs a scanout or shared buffer path per driver (amdgpu has one,
+used by Summit; NVK has none).
 
 ### Multi-threaded software drawing — S to M
 Not a kitty feature, but the cheapest way to faster full-screen redraws: rows
-can be drawn in bands on several cores (9 ms for a 4K frame now; an
-estimated 3 ms with four).
+can be drawn in bands on several cores (13 ms for a 4K frame on the X399
+now; an estimated 4 ms with four).
 
 ### Font options — S each
 kitty's `symbol_map` (a font per Unicode range), `narrow_symbols`,

@@ -93,17 +93,27 @@ density, which `Draw()` puts on screen 1:1. Text stays sharp at 150 % or 200 %.
   skipped when OpenGL is Mesa's software renderer (llvmpipe, softpipe).
 - **The software renderer** draws the same rows with the processor.
 
-Terminal uses whichever is faster. Reading pixels back from a GPU can cost
-more than drawing them with the processor. With the GPU in use, Terminal
-times both renderers on a large frame twice in the first seconds, then at
-most every 10 seconds. It changes renderer when the other one is clearly
-faster (20 %). On the X399 (GTX 1070, NVK through Zink, Mesa 22), a full
-3772 x 2036 frame takes 20 ms on the GPU (7.4 ms drawing, 12.5 ms reading
-back) and 9 ms in software, so Terminal draws there in software. On the
-Framework 13 (Radeon 760M, radeonsi), a 2223 x 1495 frame costs about 2.1 ms
-per megapixel on the GPU and 1.4 ms in software: software again. If the GPU
-is lost (a reset, a driver giving up, more than 2 seconds for a frame),
-Terminal draws in software from then on.
+Terminal uses whichever is faster, because reading pixels back from a GPU
+can cost more than drawing them with the processor. It times the large
+frames (more than half the view changed, as when scrolling). Each renderer
+draws a series of 8 of them after 4 that are not counted, since a GPU that
+was idle needs a few frames to speed up. After that, Terminal keeps the
+faster one, changes when the other is 20 % faster, and gives the other a new
+series after a minute. Timing steady series matters. Timing single frames
+drawn by both renderers made the GPU look worse (it had slowed down) and the
+processor too (the read back had emptied its caches).
+
+Full-screen scrolling, both machines on master 2026-10-19:
+
+| Machine | Frame | GPU | Software | Terminal uses |
+| --- | --- | --- | --- | --- |
+| X399, GTX 1070 (NVK through Zink, Mesa 22) | 3802 x 2150 | 23.5 ms | 12.4-13.4 ms | software |
+| Framework 13, Radeon 760M (radeonsi) | 2223 x 1495 | 2.8 ms | 1.8 ms | software |
+
+On the GTX 1070, 7.4 ms of a 4K frame is drawing (the GPU seems to run at
+low clocks) and 12.5 ms reading back. If the GPU is lost (a reset, a driver
+giving up, more than 2 seconds for a frame), Terminal draws in software from
+then on.
 
 To choose a renderer, add one line to `~/config/settings/Terminal/Default`:
 
