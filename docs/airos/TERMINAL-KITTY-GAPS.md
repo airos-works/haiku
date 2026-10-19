@@ -19,7 +19,7 @@ only), grapheme clusters, reflow, GPU drawing.
 | # | What | Effort | Why first |
 | --- | --- | --- | --- |
 | 1 | ~~Shell integration for bash~~ | done | `data/profile.d/airos-terminal.sh` marks prompts (OSC 133) and reports the directory (OSC 7); prompt jumps work out of the box. |
-| 2 | Color emoji | M | The most visible difference from kitty: emoji are drawn as monochrome outlines today. Prompts, `git` tools and Claude Code use them. |
+| 2 | ~~Color emoji~~ | done | Drawn with FreeType from Noto Color Emoji (`noto_emoji_color`, added to the CI images), sequences through the font's GSUB ligatures. |
 | 3 | Faster full-screen drawing | S-M, then L | Because of reading back, the GPU path loses to software on both test machines (X399 with NVIDIA, Framework 13 with AMD), so Terminal draws in software there today. A multi-threaded software renderer (S-M) gives ~3x on full frames. Drawing straight into the screen without the read back (L) is what makes the GPU worth it. |
 | 4 | Notification clicks, icons, expiry | S-M | Lets `kitten notify`-style tools and long-running jobs bring you back to the right tab. |
 | 5 | Ligatures | M-L | Wanted by users of coding fonts (Fira Code, JetBrains Mono). |
@@ -83,13 +83,11 @@ approved once. Terminal asks every time.
 
 ## Drawing
 
-### Color emoji — M
-app_server draws glyphs in grey levels only (no color bitmaps or color
-layers). Terminal would rasterize emoji itself with FreeType (in the system)
-from a color font. The emoji font in the image, Noto Emoji, is the
-monochrome one; Noto Color Emoji (about 10 MB) would have to be added. The
-atlas already has room for color pages (`GlyphAtlasInfo::colorPages`); both
-renderers need to draw them.
+### Color emoji — done
+Terminal draws them with FreeType from Noto Color Emoji's bitmaps (CBDT) or
+a font's COLRv0 layers. Not done: COLRv1 fonts (FreeType's paint API), and
+emoji newer than the font (Unicode 15.1 for Noto Color Emoji 2.042), which
+fall back to their first component or to the monochrome font.
 
 ### Ligatures — M to L
 Shaping runs of text with HarfBuzz (a package other applications already

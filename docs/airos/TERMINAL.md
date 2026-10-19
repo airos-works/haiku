@@ -76,6 +76,23 @@ and emoji tables. When the window is resized, lines that wrapped are wrapped
 again to the new width, in the history too, and the cursor and images stay
 with their text.
 
+**Emoji in color.** app_server draws glyphs in grey levels only, so
+Terminal draws emoji itself with FreeType from a color font: Noto Color
+Emoji (HaikuPorts' `noto_emoji_color`, in air/OS images), or any font file
+named `*ColorEmoji*` or `*Twemoji*` in the font directories;
+`TERMINAL_EMOJI_FONT` names a file. A cluster asking for emoji presentation
+(an emoji character, VS16, a keycap) is drawn in color, fitted into its two
+cells. Flags, skin tones, keycaps and ZWJ sequences such as families come
+from the font's ligatures (its GSUB table). Without a color font, emoji are
+drawn in one color as before. Color glyphs are faint, underlined and struck
+through like text.
+
+**Accents.** app_server places glyphs one after the other without
+positioning combining marks, which put the accent of a decomposed é past the
+e. Combining diacritics (U+0300 to U+036F and the other diacritical mark
+blocks) are centered over their character's cells instead. Marks of other
+scripts still need shaping (see the gaps).
+
 ## Drawing
 
 Everything in the view is drawn into one bitmap at the screen's pixel
