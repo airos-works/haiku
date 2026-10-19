@@ -20,7 +20,7 @@ What it does not do yet, compared with kitty, is in
 | `TERM_PROGRAM_VERSION` | `2.0` |
 | `BROWSER` | `/bin/open`, unless set (see *Links* below) |
 | `FORCE_HYPERLINK` | `1`, unless set |
-| `KITTY_PUBLIC_KEY` | `1:` and an X25519 public key, new for each Terminal; programs encrypt passwords for it (remote control, file transfer) |
+| `KITTY_PUBLIC_KEY` | `1:` and an X25519 public key, new for each Terminal; programs encrypt passwords for it (remote control, file transfer). Only in builds with OpenSSL (x86_64 today; the arm64 build has no OpenSSL package) |
 
 Programs that ask get these answers: XTVERSION gives
 `airos-terminal(2.0)`, DA1 `CSI ? 62 ; 22 ; 52 c` (VT220 class, color,
