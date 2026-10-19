@@ -20,7 +20,7 @@ only), grapheme clusters, reflow, GPU drawing.
 | --- | --- | --- | --- |
 | 1 | Shell integration for bash, on by default | S | Prompt jumps (Ctrl+Shift+Z/X) already work, but only for a shell that marks its prompts, and air/OS's bash does not. A profile snippet that emits OSC 133 and OSC 7 when `TERM_PROGRAM=airos-terminal` makes them work, and lets kitty-style features below build on it. |
 | 2 | Color emoji | M | The most visible difference from kitty: emoji are drawn as monochrome outlines today. Prompts, `git` tools and Claude Code use them. |
-| 3 | Faster full-screen drawing | S-M, then L | At 4K the GPU path loses to software on the X399 because of reading back. A multi-threaded software renderer (S-M) gives ~3x on full frames. Drawing straight into the screen without the read back (L) is what makes the GPU worth it. |
+| 3 | Faster full-screen drawing | S-M, then L | Because of reading back, the GPU path loses to software on both test machines (X399 with NVIDIA, Framework 13 with AMD), so Terminal draws in software there today. A multi-threaded software renderer (S-M) gives ~3x on full frames. Drawing straight into the screen without the read back (L) is what makes the GPU worth it. |
 | 4 | Notification clicks, icons, expiry | S-M | Lets `kitten notify`-style tools and long-running jobs bring you back to the right tab. |
 | 5 | Ligatures | M-L | Wanted by users of coding fonts (Fira Code, JetBrains Mono). |
 
@@ -100,7 +100,8 @@ kitty also offers `disable_ligatures` under the cursor.
 The GPU renderer draws into an offscreen buffer and reads the changed rows
 back into a bitmap that app_server copies to the screen. On the X399
 (GTX 1070, NVK) reading back a 4K frame takes 12.5 ms, so Terminal chooses
-software there. Presenting the GPU's image directly needs a scanout or shared
+software there. On the Framework 13 (Radeon 760M, radeonsi) the GPU costs
+2.1 ms per megapixel against 1.4 ms in software, so software again. Presenting the GPU's image directly needs a scanout or shared
 buffer path per driver (amdgpu has one, used by Summit; NVK has none).
 
 ### Multi-threaded software drawing — S to M

@@ -99,7 +99,9 @@ times both renderers on a large frame twice in the first seconds, then at
 most every 10 seconds. It changes renderer when the other one is clearly
 faster (20 %). On the X399 (GTX 1070, NVK through Zink, Mesa 22), a full
 3772 x 2036 frame takes 20 ms on the GPU (7.4 ms drawing, 12.5 ms reading
-back) and 9 ms in software, so Terminal draws there in software. If the GPU
+back) and 9 ms in software, so Terminal draws there in software. On the
+Framework 13 (Radeon 760M, radeonsi), a 2223 x 1495 frame costs about 2.1 ms
+per megapixel on the GPU and 1.4 ms in software: software again. If the GPU
 is lost (a reset, a driver giving up, more than 2 seconds for a frame),
 Terminal draws in software from then on.
 
