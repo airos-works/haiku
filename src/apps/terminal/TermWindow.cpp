@@ -72,6 +72,7 @@
 #include "ShellInfo.h"
 #include "ShellParameters.h"
 #include "TermConst.h"
+#include "TermCrypto.h"
 #include "TermScrollView.h"
 #include "ThemeWindow.h"
 #include "ThemeView.h"
@@ -2267,13 +2268,38 @@ TermWindow::_RemoteControl(BMessage* message)
 	BString reply;
 	BList closing;
 	bool respond = true;
+	bool authorized = false;
 	if (BJson::Parse(json, command) != B_OK)
 		reply = "{\"ok\":false,\"error\":\"The command is not valid JSON\"}";
-	else {
+	else if (command.HasString("encrypted")) {
+		// encrypted for KITTY_PUBLIC_KEY, with a password and the time in it
+		std::string plaintext;
+		BMessage decrypted;
+		if (!TermCrypto::Decrypt(json, plaintext)
+			|| BJson::Parse(plaintext.c_str(), decrypted) != B_OK
+			|| !TermCrypto::IsRecent(
+				(int64)decrypted.GetDouble("timestamp", 0))) {
+			reply = "{\"ok\":false,\"error\":\"The command could not be "
+				"decrypted, or is too old\"}";
+		} else {
+			const char* password = PrefHandler::Default()->getString(
+				PREF_REMOTE_CONTROL_PASSWORD);
+			authorized = password != NULL && password[0] != '\0'
+				&& TermCrypto::Equal(decrypted.GetString("password", ""),
+					password);
+			command = decrypted;
+		}
+	}
+
+	if (reply.IsEmpty()) {
 		respond = !command.GetBool("no_response", false);
 		const char* setting = PrefHandler::Default()->getString(
 			PREF_REMOTE_CONTROL);
-		if (setting == NULL || strcmp(setting, "yes") != 0) {
+		if (!authorized && command.HasString("password")) {
+			reply = "{\"ok\":false,\"error\":\"The password is not the "
+				"settings' RemoteControlPassword\"}";
+		} else if (!authorized
+			&& (setting == NULL || strcmp(setting, "yes") != 0)) {
 			reply = "{\"ok\":false,\"error\":\"Remote control is off: add "
 				"\\\"RemoteControl\\\" , \\\"yes\\\" to "
 				"~/config/settings/Terminal/Default\"}";

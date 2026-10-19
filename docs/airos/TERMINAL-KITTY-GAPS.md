@@ -1,6 +1,6 @@
 # Terminal compared with kitty: what is missing
 
-State on 2026-10-19, after the Terminal rewrite ([TERMINAL.md](TERMINAL.md)).
+State on 2026-10-20, after the Terminal rewrite ([TERMINAL.md](TERMINAL.md)).
 This list is for choosing what to add next. Each item says what it is, who
 would notice, how big the work is, and what on air/OS stands in the way.
 Effort: **S** is about a day, **M** a few days, **L** a week or more.
@@ -12,18 +12,26 @@ stack, OSC 5522 clipboard and paste events, unscroll, DECCARA, the mode
 save/restore, SGR 221/222, ED 22, the mouse-leave event, synchronized
 output, in-band resize, color scheme reports, OSC 8 links, OSC 52, OSC 133
 marks with prompt jumps and bash integration, OSC 99 notifications (clicks,
-icons, expiry), OSC 66 text sizing, multiple cursors, color emoji, grapheme
+icons, expiry), OSC 66 text sizing, multiple cursors, remote control (with
+passwords), drag and drop, file transfer, color emoji, ligatures, grapheme
 clusters, reflow, GPU drawing.
 
 ## Recommended next
 
-| # | What | Effort | Why first |
+The first list (bash integration, color emoji, faster software drawing,
+notification clicks, ligatures) is done, and so are text sizing, multiple
+cursors, remote control with passwords, drag and drop and file transfer.
+What is left, in the order that would help most:
+
+| # | What | Effort | Why |
 | --- | --- | --- | --- |
-| 1 | ~~Shell integration for bash~~ | done | `data/profile.d/airos-terminal.sh` marks prompts (OSC 133) and reports the directory (OSC 7); prompt jumps work out of the box. |
-| 2 | ~~Color emoji~~ | done | Drawn with FreeType from Noto Color Emoji (`noto_emoji_color`, added to the CI images), sequences through the font's GSUB ligatures. |
-| 3 | Faster full-screen drawing | ~~S-M~~ done, then L | Because of reading back, the GPU path loses to software on both test machines (X399 with NVIDIA, Framework 13 with AMD), so Terminal draws in software there today. The software renderer now uses up to four threads (4K frame 13 ms to 3.8 ms on the X399). Drawing straight into the screen without the read back (L) is what would make the GPU worth it. |
-| 4 | ~~Notification clicks, icons, expiry~~ | done | A click shows the tab and reports to the program; icons by name or data; `w=`; `p=close`. |
-| 5 | Ligatures | M-L | Wanted by users of coding fonts (Fira Code, JetBrains Mono). |
+| 1 | Drawing without reading back | L | The one thing that would make the GPU path faster than software (see *Drawing*); needs a scanout or shared buffer path per driver (amdgpu has one, NVK none). |
+| 2 | Shell integration features | M | Click at the prompt to move the cursor, warn before closing a tab that runs a command, the last command's output in a pager; zsh and fish scripts. |
+| 3 | rsync deltas for file transfer | M | `kitten transfer -x` resumes and updates big files; needs XXH3 (small enough to carry in Terminal). |
+| 4 | Remote control permissions | S | kitty's per-password lists of allowed commands, and asking the user about a password it does not know. |
+| 5 | Clipboard passwords | S | Lets a trusted program read the clipboard without the alert each time. |
+| 6 | Drag and drop leftovers | M | Data asked for after the drop, files pulled from another machine; partly blocked by Haiku's drag messages. |
+| 7 | Terminal features | S-M each | Rectangular selection, hints, marks, broadcast typing (see the table below); they add to the interface, which is to stay as it is. |
 
 ## Protocols
 
@@ -56,20 +64,30 @@ All of it, drawn by both renderers.
 
 ### Remote control (`DCS @kitty-cmd`) — the useful part done
 Off by default, like kitty's. The commands that fit Terminal's tabs work
-(see TERMINAL.md). Missing: the encrypted form with passwords (X25519,
-AES-GCM; S-M), commands for kitty's layouts, markers, background images and
-the like (no such things in Terminal), `send-key`, async and streaming
-commands, and the `kitten @` client itself (Go).
+(see TERMINAL.md), and so do commands sent with a password
+(`kitten @ --password`, encrypted for `KITTY_PUBLIC_KEY`), checked against
+the settings' `RemoteControlPassword`. Missing: kitty's per-password lists
+of allowed commands and its "ask the user" for unknown passwords (S),
+commands for kitty's layouts, markers, background images and the like (no
+such things in Terminal), `send-key`, async and streaming commands, and the
+`kitten @` client on air/OS itself (Go).
 
-### File transfer (OSC 5113) — L
-Copying files over the terminal connection, used by `kitten transfer` and
-`kitten ssh`. It needs an approval dialog, a file system state machine,
-rsync-style deltas, xxHash and zlib. Of little use until the kitten programs
-run on air/OS (see below).
+### File transfer (OSC 5113) — done but rsync deltas (M)
+`kitten transfer` on another machine (over ssh) copies files to and from
+air/OS, with an approval alert or a password (see TERMINAL.md). Missing:
+rsync-style deltas (`kitten transfer -x`: block signatures with xxHash's
+XXH3, which air/OS does not ship), so files always go whole. Plain `ssh`
+does not pass `KITTY_PUBLIC_KEY` on (kitty's `kitten ssh` does), so for
+passwords over ssh it has to be sent along (`SendEnv` with `AcceptEnv`) or
+set by hand.
 
-### Drag and drop (OSC 72) — L
-Programs in the terminal accepting drops and starting drags, MIME negotiated.
-Terminal already pastes the paths of files dropped on it. Very new protocol.
+### Drag and drop (OSC 72) — mostly done
+Drops (local and remote reads) and drags with pre-sent data work (see
+TERMINAL.md). Missing (M): data the target asks for after the drop
+(`t=e:x=5`, which would need Haiku's negotiated drag protocol), pulling
+files from a program on another machine (`t=k`), changing the image while
+dragging, and real "accepted", "dropped" and "finished" events: Haiku does
+not tell a drag's source what became of it.
 
 ### Background transparency (`transparent_background_color` in OSC 21) — blocked
 Needs translucent windows, which app_server does not have.
@@ -86,11 +104,15 @@ a font's COLRv0 layers. Not done: COLRv1 fonts (FreeType's paint API), and
 emoji newer than the font (Unicode 15.1 for Noto Color Emoji 2.042), which
 fall back to their first component or to the monochrome font.
 
-### Ligatures — M to L
-Shaping runs of text with HarfBuzz (a package other applications already
-pull in) and drawing glyphs by id, which app_server's `BFont` cannot do; it
-means FreeType in Terminal, as for emoji.
-kitty also offers `disable_ligatures` under the cursor.
+### Ligatures — done
+Words with two symbols next to each other are shaped with HarfBuzz, and the
+cells the font joins are drawn with FreeType (see TERMINAL.md). Differences
+from kitty, which shapes all text: ligatures without two symbols side by
+side (Fira Code's `www`, `0xFF`, `Fl`) are not looked for, nor ones across a
+change of bold or italic or a space; joined cells are drawn by FreeType and
+the rest by app_server, which hint a little differently; slanted italics
+(no italic face) get none. Shaping other scripts (Indic, Arabic marks)
+would build on the same code (M).
 
 ### Drawing without reading back — L
 The GPU renderer draws into an offscreen buffer and reads the changed rows
@@ -137,7 +159,9 @@ listed for completeness.
 kitty's helper programs (`icat`, `diff`, `ssh`, `transfer`, `themes`,
 `hints`, `unicode_input`, `clipboard`, `notify`, `choose-files`, `query_terminal`)
 are one Go program, `kitten`. Go does not support Haiku officially, so none of
-them run. The protocols they use do work: programs that draw images
+them run on air/OS. Run on another machine and reached over ssh, the ones
+that only talk to the terminal work: `kitten transfer` and `kitten @` were
+tested with kitty 0.49.2. The protocols they use do work locally too: programs that draw images
 through the graphics protocol (`chafa`, `timg`, `viu`, `yazi`, `mpv
 --vo=kitty`, notcurses) can be ported or built instead.
 

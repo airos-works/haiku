@@ -18,6 +18,8 @@
 
 #include <algorithm>
 
+#include <OS.h>
+
 #include "Base64.h"
 #include "ColorNames.h"
 #include "TerminalGraphics.h"
@@ -267,6 +269,41 @@ Terminal::OscDispatch(const char* data, size_t length)
 			break;
 		case 66:
 			_TextSizing(argument.c_str());
+			break;
+		case 72:
+		{
+			// kitty's drag and drop is the terminal's business, but the
+			// query is answered here: before the answer to a DA1 sent after
+			// it, as the protocol expects
+			std::string metadata = argument.substr(0, argument.find(';'));
+			std::vector<std::string> pairs;
+			split(metadata, ':', pairs);
+			bool query = false;
+			std::string id;
+			for (size_t i = 0; i < pairs.size(); i++) {
+				if (pairs[i] == "t=q")
+					query = true;
+				else if (pairs[i].compare(0, 2, "i=") == 0)
+					id = pairs[i].substr(2);
+			}
+			if (query && fListener != NULL) {
+				// The answer looks like the query: one coming right after
+				// an answer is that answer echoed back.
+				bigtime_t now = system_time();
+				if (now - fDragAndDropQueryAnswered < 100000)
+					break;
+				fDragAndDropQueryAnswered = now;
+				fOutput += "\x1b]72;t=q";
+				if (!id.empty() && isdigit((unsigned char)id[0]))
+					fOutput += ":i=" + id;
+				fOutput += "\x1b\\";
+			} else if (fListener != NULL)
+				fListener->TerminalDragAndDrop(argument.c_str());
+			break;
+		}
+		case 5113:
+			if (fListener != NULL)
+				fListener->TerminalFileTransfer(argument.c_str());
 			break;
 		case 99:
 		{

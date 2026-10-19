@@ -59,6 +59,9 @@ private:
 									const FrameState& state,
 									const TerminalCell* cells, int32 row,
 									int32 terminalRow, RenderFrame& frame);
+			void				_FindLigatures(Terminal* terminal,
+									const TerminalCell* cells,
+									int32 terminalRow, int32 columns);
 			uint64				_RowSignature(const FrameState& state,
 									int32 terminalRow, uint64 version,
 									Terminal* terminal) const;
@@ -70,6 +73,8 @@ private:
 			GlyphCache*			fGlyphs;
 			std::vector<uint64>	fRowSignatures;
 			std::vector<TerminalCell> fCells;
+			std::vector<uint32>	fLigatureSlots;	// of the row being built
+			std::vector<uint32>	fRunCodePoints;
 			int32				fColumns;
 			int32				fRows;
 			int32				fWidth;

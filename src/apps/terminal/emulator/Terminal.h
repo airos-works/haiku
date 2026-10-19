@@ -332,6 +332,10 @@ public:
 									int32 percent);
 		//! kitty's remote control: a command (JSON) a program sent.
 		virtual	void			TerminalRemoteControl(const char* json);
+		//! kitty's drag and drop (OSC 72): what follows "72;".
+		virtual	void			TerminalDragAndDrop(const char* data);
+		//! kitty's file transfer (OSC 5113): what follows "5113;".
+		virtual	void			TerminalFileTransfer(const char* data);
 	};
 
 	struct CursorInfo {
@@ -822,6 +826,7 @@ private:
 			uint32				fColors[COLOR_COUNT];
 			uint32				fColorsGeneration;
 
+			bigtime_t			fDragAndDropQueryAnswered;
 			std::vector<TermMulticell> fMulticells;
 			std::unordered_map<uint64, uint32> fMulticellIndex;
 

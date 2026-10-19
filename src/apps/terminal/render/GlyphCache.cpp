@@ -35,6 +35,7 @@ GlyphCache::GlyphCache()
 	fFontAscent(0),
 	fNextSlot(1),
 	fEpoch(0),
+	fLigatureMode(LIGATURES_ALWAYS),
 	fStaging(NULL),
 	fStagingView(NULL)
 {
@@ -152,6 +153,12 @@ GlyphCache::SetFont(const BFont& font, float scale, bool allowBold,
 	}
 	fFontAscent = ascent * scale;
 
+	// ligatures need the font's own italics: app_server slants the others
+	bool usable[4];
+	for (int32 style = 0; style < 4; style++)
+		usable[style] = (style & GLYPH_ITALIC) == 0 || hasItalic;
+	fLigatures.SetFonts(fFonts, 4, usable);
+
 	_Reset();
 }
 
@@ -175,6 +182,8 @@ GlyphCache::_Reset()
 {
 	fSlots.clear();
 	fPending.clear();
+	fRuns.clear();
+	fPendingRuns.clear();
 	fNextSlot = 1;
 	fEpoch++;
 
@@ -374,6 +383,66 @@ GlyphCache::Lookup(uint64 key, const char* utf8, uint32 firstCodePoint,
 
 
 bool
+GlyphCache::LookupRun(const uint32* codePoints, int32 count, uint32 style,
+	uint32* slots)
+{
+	if (fLigatureMode == LIGATURES_NEVER || count < 2)
+		return false;
+	if (!fAllowBold)
+		style &= ~GLYPH_BOLD;
+	uint32 drawStyle = fEmulateBold ? style & ~GLYPH_BOLD : style;
+
+	std::string key(1, (char)style);
+	key.append((const char*)codePoints, count * sizeof(uint32));
+	std::unordered_map<std::string, std::vector<uint32> >::iterator found
+		= fRuns.find(key);
+	if (found == fRuns.end()) {
+		std::vector<uint32> runSlots;
+		std::vector<LigatureSegment> segments;
+		if (fLigatures.IsAvailable(drawStyle))
+			fLigatures.Shape(drawStyle, codePoints, count, segments);
+		if (!segments.empty())
+			runSlots.assign(count, 0);
+		for (size_t i = 0; i < segments.size(); i++) {
+			PendingRun run;
+			run.codePoints.assign(codePoints, codePoints + count);
+			run.style = style;
+			run.segment = segments[i];
+			for (int32 cell = 0; cell < segments[i].length; cell++) {
+				uint32 slot = _AllocateSlot(1);
+				if (slot == 0) {
+					// full: start over (callers see the new epoch)
+					_Reset();
+					return false;
+				}
+				runSlots[segments[i].start + cell] = slot;
+				run.slots.push_back(slot);
+			}
+			fPendingRuns.push_back(run);
+		}
+		// most runs have none, and are many: forget them now and then
+		if (fRuns.size() > 20000)
+			fRuns.clear();
+		found = fRuns.insert(std::make_pair(key, runSlots)).first;
+	}
+	if (found->second.empty())
+		return false;
+	memcpy(slots, found->second.data(), count * sizeof(uint32));
+	return true;
+}
+
+
+void
+GlyphCache::SetLigatureMode(int32 mode)
+{
+	if (mode == fLigatureMode)
+		return;
+	fLigatureMode = mode;
+	_Reset();
+}
+
+
+bool
 GlyphCache::_EnsureStaging(int32 width, int32 height)
 {
 	if (fStaging != NULL && fStaging->Bounds().IntegerWidth() + 1 >= width
@@ -399,6 +468,8 @@ GlyphCache::_EnsureStaging(int32 width, int32 height)
 void
 GlyphCache::DrawPending()
 {
+	if (!fPendingRuns.empty())
+		_DrawRuns();
 	if (fPending.empty())
 		return;
 
@@ -708,6 +779,41 @@ GlyphCache::_DrawMulticells(std::vector<Pending>& pending)
 		}
 		fStaging->Unlock();
 	}
+}
+
+
+//!	Draws the cells of ligatures: each run of them at once, then cut into
+//!	its cells.
+void
+GlyphCache::_DrawRuns()
+{
+	int32 cellWidth = fMetrics.cellWidth;
+	int32 cellHeight = fMetrics.cellHeight;
+	std::vector<uint8> bits;
+	for (size_t i = 0; i < fPendingRuns.size(); i++) {
+		const PendingRun& run = fPendingRuns[i];
+		int32 width = cellWidth * run.segment.length;
+		bits.resize((size_t)width * cellHeight);
+		uint32 drawStyle = fEmulateBold ? run.style & ~GLYPH_BOLD : run.style;
+		fLigatures.Draw(drawStyle, run.codePoints.data(),
+			run.codePoints.size(), run.segment, bits.data(), width,
+			cellWidth, cellHeight, fMetrics.baseline);
+		for (int32 cell = 0; cell < run.segment.length; cell++) {
+			int32 page, x, y;
+			fAtlas.SlotLocation(run.slots[cell], page, x, y);
+			if (page >= (int32)fPages.size())
+				continue;
+			for (int32 row = 0; row < cellHeight; row++) {
+				memcpy(fPages[page] + (size_t)(y + row) * kPageSize + x,
+					bits.data() + (size_t)row * width + cell * cellWidth,
+					cellWidth);
+			}
+			if (fEmulateBold && (run.style & GLYPH_BOLD) != 0)
+				_EmboldenSlot(run.slots[cell], 1);
+			_MarkDirty(page, y, y + cellHeight);
+		}
+	}
+	fPendingRuns.clear();
 }
 
 

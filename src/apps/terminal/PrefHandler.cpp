@@ -94,6 +94,8 @@ static const pref_defaults kTermDefaults[] = {
 	{ PREF_WARN_ON_EXIT,		PREF_TRUE },
 	{ PREF_CURSOR_STYLE,		PREF_BLOCK_CURSOR },
 	{ PREF_EMULATE_BOLD,		PREF_FALSE },
+	{ PREF_FILE_TRANSFER_PASSWORD, "" },
+	{ PREF_REMOTE_CONTROL_PASSWORD, "" },
 
 	{ NULL, NULL},
 };

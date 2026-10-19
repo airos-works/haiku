@@ -111,6 +111,15 @@ static const char* const PREF_HALF_FONT_STYLE = "Half Font Style";
 static const char* const PREF_HALF_FONT_SIZE = "Half Font Size";
 // "yes" lets programs use kitty's remote control (not in the preferences)
 static const char* const PREF_REMOTE_CONTROL = "RemoteControl";
+// commands sent with this password (kitten @ --password) run even when
+// remote control is off (not in the preferences)
+static const char* const PREF_REMOTE_CONTROL_PASSWORD = "RemoteControlPassword";
+// lets kitty's file transfers that know it go without asking (not in the
+// preferences)
+static const char* const PREF_FILE_TRANSFER_PASSWORD = "FileTransferPassword";
+// as kitty's disable_ligatures: "never" (the default), "cursor" (not in the
+// word the cursor is on) or "always" (not in the preferences)
+static const char* const PREF_DISABLE_LIGATURES = "DisableLigatures";
 
 static const char* const PREF_TEXT_FORE_COLOR = "Text";
 static const char* const PREF_TEXT_BACK_COLOR = "Background";
