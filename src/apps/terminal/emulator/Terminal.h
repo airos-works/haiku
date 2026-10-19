@@ -486,7 +486,6 @@ private:
 				bool	metaSendsEscape;		// (1036, 1039)
 				bool	bracketedPaste;			// (2004)
 				bool	synchronizedOutput;		// (2026)
-				bool	graphemeClusters;		// (2027)
 				bool	colorSchemeReports;		// (2031)
 				bool	inBandResize;			// (2048)
 				bool	pasteEvents;			// (5522)

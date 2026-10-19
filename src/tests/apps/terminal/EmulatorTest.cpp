@@ -464,6 +464,9 @@ TestReplies()
 	f.Feed("\x1b[?2004h\x1b[?2004$p\x1b[?1$p\x1b[4$p\x1b[?9999$p");
 	CHECK_EQUAL(f.Reply(), "\x1b[?2004;1$y\x1b[?1;2$y\x1b[4;2$y"
 		"\x1b[?9999;0$y");
+	// grapheme clusters cannot be turned off
+	f.Feed("\x1b[?2027l\x1b[?2027$p");
+	CHECK_EQUAL(f.Reply(), "\x1b[?2027;3$y");
 	f.Feed("\x1b[>q");
 	CHECK_EQUAL(f.Reply(), "\x1bP>|airos-terminal(2.0)\x1b\\");
 	f.Feed("\x1b[14t\x1b[16t\x1b[18t");

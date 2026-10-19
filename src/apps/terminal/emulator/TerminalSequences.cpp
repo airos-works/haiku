@@ -742,9 +742,6 @@ Terminal::_SetMode(int32 mode, bool privateMode, bool set)
 				fSynchronizedSince = system_time();
 			_Changed();
 			break;
-		case 2027:
-			fModes.graphemeClusters = set;
-			break;
 		case 2031:
 			fModes.colorSchemeReports = set;
 			break;
@@ -847,8 +844,8 @@ Terminal::_ModeState(int32 mode, bool privateMode) const
 			return STATE(fModes.bracketedPaste);
 		case 2026:
 			return STATE(fModes.synchronizedOutput);
-		case 2027:
-			return STATE(fModes.graphemeClusters);
+		case 2027:	// grapheme clusters: always
+			return 3;
 		case 2031:
 			return STATE(fModes.colorSchemeReports);
 		case 2048:
