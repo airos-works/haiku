@@ -72,6 +72,8 @@ void Terminal::Listener::TerminalRemoteControl(const char* json)
 	{}
 void Terminal::Listener::TerminalDragAndDrop(const char* data)
 	{}
+void Terminal::Listener::TerminalFileTransfer(const char* data)
+	{}
 
 
 // #pragma mark - Terminal

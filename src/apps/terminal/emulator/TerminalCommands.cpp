@@ -301,6 +301,10 @@ Terminal::OscDispatch(const char* data, size_t length)
 				fListener->TerminalDragAndDrop(argument.c_str());
 			break;
 		}
+		case 5113:
+			if (fListener != NULL)
+				fListener->TerminalFileTransfer(argument.c_str());
+			break;
 		case 99:
 		{
 			size_t payloadStart = argument.find(';');

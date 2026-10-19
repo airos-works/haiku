@@ -8,6 +8,13 @@ UsePrivateHeaders libroot notification shared system ;
 UsePrivateHeaders textencoding ;
 UseBuildFeatureHeaders zlib ;
 UseBuildFeatureHeaders freetype ;
+if [ FIsBuildFeatureEnabled openssl ] {
+	SubDirC++Flags -DOPENSSL_ENABLED -DOPENSSL_API_COMPAT=10101
+		-DOPENSSL_NO_DEPRECATED=1 ;
+	UseBuildFeatureHeaders openssl ;
+	Includes [ FGristFiles TermCrypto.cpp ]
+		: [ BuildFeatureAttribute openssl : headers ] ;
+}
 
 SEARCH_SOURCE += [ FDirName $(SUBDIR) emulator ] ;
 SEARCH_SOURCE += [ FDirName $(SUBDIR) render ] ;
@@ -33,7 +40,8 @@ local renderSources =
 	SoftwareRenderer.cpp
 	;
 
-Includes [ FGristFiles $(emulatorSources) $(renderSources) ImageCodecs.cpp ]
+Includes [ FGristFiles $(emulatorSources) $(renderSources) ImageCodecs.cpp
+		TermFileTransfer.cpp ]
 	: [ BuildFeatureAttribute zlib : headers ]
 	  [ BuildFeatureAttribute freetype : headers ] ;
 
@@ -56,7 +64,9 @@ Application Terminal :
 	ShellParameters.cpp
 	SmartTabView.cpp
 	TermApp.cpp
+	TermCrypto.cpp
 	TermDragAndDrop.cpp
+	TermFileTransfer.cpp
 	TerminalCharClassifier.cpp
 	TerminalRoster.cpp
 	TermConst.cpp
@@ -74,6 +84,7 @@ Application Terminal :
 	: be localestub shared tracker translation textencoding
 	[ BuildFeatureAttribute zlib : library ]
 	[ BuildFeatureAttribute freetype : library ]
+	[ BuildFeatureAttribute openssl : libraries ]
 	[ TargetLibsupc++ ] [ TargetLibstdc++ ]
 	: Terminal.rdef XColors.rdef
 ;

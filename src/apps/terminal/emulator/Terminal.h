@@ -334,6 +334,8 @@ public:
 		virtual	void			TerminalRemoteControl(const char* json);
 		//! kitty's drag and drop (OSC 72): what follows "72;".
 		virtual	void			TerminalDragAndDrop(const char* data);
+		//! kitty's file transfer (OSC 5113): what follows "5113;".
+		virtual	void			TerminalFileTransfer(const char* data);
 	};
 
 	struct CursorInfo {

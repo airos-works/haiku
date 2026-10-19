@@ -31,6 +31,7 @@
 
 #include <Alert.h>
 #include <Application.h>
+#include <Autolock.h>
 #include <Beep.h>
 #include <Bitmap.h>
 #include <BitmapStream.h>
@@ -74,6 +75,7 @@
 #include "ActiveProcessInfo.h"
 #include "Base64.h"
 #include "TermDragAndDrop.h"
+#include "TermFileTransfer.h"
 #include "Colors.h"
 #include "InlineInput.h"
 #include "PrefHandler.h"
@@ -180,7 +182,8 @@ enum {
 	EVENT_MODES,
 	EVENT_PROGRESS,
 	EVENT_REMOTE_CONTROL,
-	EVENT_DRAG_AND_DROP
+	EVENT_DRAG_AND_DROP,
+	EVENT_FILE_TRANSFER
 };
 
 
@@ -479,6 +482,7 @@ TermView::_InitObject(const ShellParameters& shellParameters)
 	fWriterThread = -1;
 	fWriterQuit = false;
 	fWriteSemaphore = -1;
+	fWriteQueueSize = 0;
 	fFramePending = false;
 	fConverterState = 0;
 	fEventsPosted = false;
@@ -513,6 +517,9 @@ TermView::_InitObject(const ShellParameters& shellParameters)
 	fRemoteControlID = atomic_add(&sNextRemoteControlID, 1);
 	fDragAndDrop = new(std::nothrow) TermDragAndDrop(this,
 		[this](const std::string& data) { _Send(data); });
+	fFileTransfer = new(std::nothrow) TermFileTransfer(this,
+		[this](const std::string& data) { _Send(data); },
+		[this]() { return _WriteBacklog(); });
 	fDragGesture = false;
 	fLastActivityTime = 0;
 	fCursorState = 0;
@@ -611,6 +618,7 @@ TermView::~TermView()
 		delete it->second;
 	}
 	delete fDragAndDrop;
+	delete fFileTransfer;
 
 	delete fDefaultState;
 	delete fSelectState;
@@ -1648,6 +1656,7 @@ TermView::_StopReader()
 		fWriterThread = -1;
 		fWriteLock.Lock();
 		fWriteQueue.clear();
+		fWriteQueueSize = 0;
 		fWriteLock.Unlock();
 	}
 
@@ -1858,6 +1867,17 @@ void
 TermView::TerminalDragAndDrop(const char* data)
 {
 	Event* event = new(std::nothrow) Event(EVENT_DRAG_AND_DROP);
+	if (event != NULL) {
+		event->text = data;
+		_PostEvent(event);
+	}
+}
+
+
+void
+TermView::TerminalFileTransfer(const char* data)
+{
+	Event* event = new(std::nothrow) Event(EVENT_FILE_TRANSFER);
 	if (event != NULL) {
 		event->text = data;
 		_PostEvent(event);
@@ -2116,6 +2136,11 @@ TermView::_HandleEvents()
 			case EVENT_DRAG_AND_DROP:
 				if (fDragAndDrop != NULL)
 					fDragAndDrop->Command(event->text);
+				break;
+
+			case EVENT_FILE_TRANSFER:
+				if (fFileTransfer != NULL)
+					fFileTransfer->Command(event->text);
 				break;
 
 			case EVENT_REMOTE_CONTROL:
@@ -2706,9 +2731,19 @@ TermView::_Send(const std::string& data)
 
 	fWriteLock.Lock();
 	fWriteQueue.push_back(data);
+	fWriteQueueSize += data.size();
 	fWriteLock.Unlock();
 	if (fWriteSemaphore >= 0)
 		release_sem(fWriteSemaphore);
+}
+
+
+//!	What is waiting to be written to the shell, in bytes.
+size_t
+TermView::_WriteBacklog()
+{
+	BAutolock _(fWriteLock);
+	return fWriteQueueSize;
 }
 
 
@@ -2739,6 +2774,7 @@ TermView::_WriteLoop()
 			std::string data;
 			data.swap(fWriteQueue.front());
 			fWriteQueue.pop_front();
+			fWriteQueueSize -= data.size();
 			fWriteLock.Unlock();
 
 			size_t written = 0;
@@ -3835,6 +3871,16 @@ TermView::MessageReceived(BMessage *message)
 
 	entry_ref ref;
 	const char *ctrl_l = "\x0c";
+
+	if (message->what == kFileTransferAnswer && fFileTransfer != NULL) {
+		fFileTransfer->Answer(message->GetString("id", ""),
+			message->GetInt32("which", 0) == 1);
+		return;
+	}
+	if (message->what == kFileTransferPump && fFileTransfer != NULL) {
+		fFileTransfer->Pump();
+		return;
+	}
 
 	// a program that takes drops (kitty's drag and drop) gets them
 	if (message->WasDropped() && fDragAndDrop != NULL

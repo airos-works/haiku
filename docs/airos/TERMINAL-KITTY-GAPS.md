@@ -12,8 +12,9 @@ stack, OSC 5522 clipboard and paste events, unscroll, DECCARA, the mode
 save/restore, SGR 221/222, ED 22, the mouse-leave event, synchronized
 output, in-band resize, color scheme reports, OSC 8 links, OSC 52, OSC 133
 marks with prompt jumps and bash integration, OSC 99 notifications (clicks,
-icons, expiry), OSC 66 text sizing, multiple cursors, color emoji, grapheme
-clusters, reflow, GPU drawing.
+icons, expiry), OSC 66 text sizing, multiple cursors, remote control (with
+passwords), drag and drop, file transfer, color emoji, grapheme clusters,
+reflow, GPU drawing.
 
 ## Recommended next
 
@@ -56,16 +57,22 @@ All of it, drawn by both renderers.
 
 ### Remote control (`DCS @kitty-cmd`) — the useful part done
 Off by default, like kitty's. The commands that fit Terminal's tabs work
-(see TERMINAL.md). Missing: the encrypted form with passwords (X25519,
-AES-GCM; S-M), commands for kitty's layouts, markers, background images and
-the like (no such things in Terminal), `send-key`, async and streaming
-commands, and the `kitten @` client itself (Go).
+(see TERMINAL.md), and so do commands sent with a password
+(`kitten @ --password`, encrypted for `KITTY_PUBLIC_KEY`), checked against
+the settings' `RemoteControlPassword`. Missing: kitty's per-password lists
+of allowed commands and its "ask the user" for unknown passwords (S),
+commands for kitty's layouts, markers, background images and the like (no
+such things in Terminal), `send-key`, async and streaming commands, and the
+`kitten @` client on air/OS itself (Go).
 
-### File transfer (OSC 5113) — L
-Copying files over the terminal connection, used by `kitten transfer` and
-`kitten ssh`. It needs an approval dialog, a file system state machine,
-rsync-style deltas, xxHash and zlib. Of little use until the kitten programs
-run on air/OS (see below).
+### File transfer (OSC 5113) — done but rsync deltas (M)
+`kitten transfer` on another machine (over ssh) copies files to and from
+air/OS, with an approval alert or a password (see TERMINAL.md). Missing:
+rsync-style deltas (`kitten transfer -x`: block signatures with xxHash's
+XXH3, which air/OS does not ship), so files always go whole. Plain `ssh`
+does not pass `KITTY_PUBLIC_KEY` on (kitty's `kitten ssh` does), so for
+passwords over ssh it has to be sent along (`SendEnv` with `AcceptEnv`) or
+set by hand.
 
 ### Drag and drop (OSC 72) — mostly done
 Drops (local and remote reads) and drags with pre-sent data work (see
@@ -141,7 +148,9 @@ listed for completeness.
 kitty's helper programs (`icat`, `diff`, `ssh`, `transfer`, `themes`,
 `hints`, `unicode_input`, `clipboard`, `notify`, `choose-files`, `query_terminal`)
 are one Go program, `kitten`. Go does not support Haiku officially, so none of
-them run. The protocols they use do work: programs that draw images
+them run on air/OS. Run on another machine and reached over ssh, the ones
+that only talk to the terminal work: `kitten transfer` and `kitten @` were
+tested with kitty 0.49.2. The protocols they use do work locally too: programs that draw images
 through the graphics protocol (`chafa`, `timg`, `viu`, `yazi`, `mpv
 --vo=kitty`, notcurses) can be ported or built instead.
 

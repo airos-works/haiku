@@ -48,6 +48,7 @@ class ShellInfo;
 class ShellParameters;
 class Shell;
 class TermDragAndDrop;
+class TermFileTransfer;
 class TermRenderer;
 
 
@@ -228,6 +229,7 @@ private:
 									const TermNotification& notification);
 	virtual	void				TerminalRemoteControl(const char* json);
 	virtual	void				TerminalDragAndDrop(const char* data);
+	virtual	void				TerminalFileTransfer(const char* data);
 	virtual	void				TerminalCloseNotification(
 									const char* identifier);
 	virtual	void				TerminalPointerShapeChanged(
@@ -287,6 +289,7 @@ private:
 			// writing to the shell
 			void				_WritePTY(const char* text, int32 numBytes);
 			void				_Send(const std::string& data);
+			size_t				_WriteBacklog();
 			void				_SendKey(const TermKeyEvent& event);
 			bool				_TranslateKey(const BMessage* message,
 									bool keyUp, TermKeyEvent& event,
@@ -355,6 +358,7 @@ private:
 			sem_id				fWriteSemaphore;
 			BLocker				fWriteLock;
 			std::deque<std::string> fWriteQueue;
+			size_t				fWriteQueueSize;
 			std::atomic<bool>	fFramePending;
 			int32				fConverterState;	// non-UTF-8 encodings
 
@@ -453,6 +457,7 @@ private:
 			BString				fPointerShape;
 			int32				fRemoteControlID;
 			TermDragAndDrop*	fDragAndDrop;
+			TermFileTransfer*	fFileTransfer;
 			bool				fDragGesture;
 			std::map<std::string, BBitmap*> fNotificationIcons;
 									// icon data programs sent, by key

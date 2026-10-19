@@ -45,6 +45,7 @@
 
 #include "ActiveProcessInfo.h"
 #include "ShellParameters.h"
+#include "TermCrypto.h"
 #include "TermConst.h"
 
 
@@ -372,6 +373,10 @@ Shell::_Spawn(int row, int col, const ShellParameters& parameters)
 	thread_id terminalThread = find_thread(NULL);
 
 	/* Fork a child process. */
+	// kitty's programs encrypt passwords for it (made before forking, so
+	// that the key is this team's)
+	const char* publicKey = TermCrypto::PublicKey();
+
 	fShellInfo.SetProcessID(fork());
 	if (fShellInfo.ProcessID() < 0) {
 		close(master);
@@ -503,6 +508,8 @@ Shell::_Spawn(int row, int col, const ShellParameters& parameters)
 		// they find out by asking it
 		setenv("TERM_PROGRAM", "airos-terminal", true);
 		setenv("TERM_PROGRAM_VERSION", "2.0", true);
+		if (publicKey[0] != '\0')
+			setenv("KITTY_PUBLIC_KEY", publicKey, true);
 
 		// set the current working directory, if one is given
 		if (parameters.CurrentDirectory().Length() > 0)

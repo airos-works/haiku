@@ -100,6 +100,12 @@ struct Recorder : Terminal::Listener {
 	{
 		remoteControl = json;
 	}
+	virtual void TerminalFileTransfer(const char* data)
+	{
+		fileTransfers.push_back(data);
+	}
+
+	std::vector<std::string> fileTransfers;
 };
 
 
@@ -842,6 +848,17 @@ TestOperatingSystemCommands()
 	CHECK_EQUAL(dnd.Reply(), "\x1b]72;t=q:i=5\x1b\\");
 	dnd.Feed("\x1b]72;t=q:i=5\x1b\\");
 	CHECK_EQUAL(dnd.Reply(), "");
+
+	// kitty's file transfer: commands go to the listener, data and all,
+	// and nothing shows
+	Fixture ft;
+	std::string chunk(5464, 'A');
+	ft.Feed("\x1b]5113;id=abc;ac=send\x1b\\"
+		"\x1b]5113;id=abc;ac=data;fid=1;d=" + chunk + "\x1b\\");
+	CHECK(ft.recorder.fileTransfers.size() == 2);
+	CHECK_EQUAL(ft.recorder.fileTransfers[0], "id=abc;ac=send");
+	CHECK(ft.recorder.fileTransfers[1].size() == 23 + chunk.size());
+	CHECK_EQUAL(ft.Row(0), "");
 
 	// kitty's multiple cursors
 	Fixture m(20, 10);
