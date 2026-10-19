@@ -541,6 +541,15 @@ Terminal::_SetColors(int32 command, const char* spec)
 
 
 void
+Terminal::RemoteResetColors()
+{
+	_ResetColors(104, "");
+	for (int32 command = 110; command <= 119; command++)
+		_ResetColors(command, "");
+}
+
+
+void
 Terminal::_ResetColors(int32 command, const char* spec)
 {
 	if (command == 104) {

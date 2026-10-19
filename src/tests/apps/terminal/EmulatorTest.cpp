@@ -75,6 +75,7 @@ struct Recorder : Terminal::Listener {
 	std::vector<TermNotification> notifications;
 	std::string pointer;
 	std::string directory;
+	std::string remoteControl;
 
 	virtual void TerminalTitleChanged(const char* text) { title = text; }
 	virtual void TerminalBell() { bells++; }
@@ -94,6 +95,10 @@ struct Recorder : Terminal::Listener {
 	virtual void TerminalWorkingDirectoryChanged(const char* url)
 	{
 		directory = url;
+	}
+	virtual void TerminalRemoteControl(const char* json)
+	{
+		remoteControl = json;
 	}
 };
 
@@ -813,6 +818,13 @@ TestOperatingSystemCommands()
 	CHECK(icon.iconNames.size() == 1 && icon.iconNames[0] == "error");
 	CHECK_EQUAL(icon.iconKey, "key1");
 	CHECK_EQUAL(icon.iconData, "\x89PNG");
+
+	// kitty's remote control: the command goes to the listener
+	Fixture rc;
+	rc.Feed("\x1bP@kitty-cmd{\"cmd\":\"ls\",\"version\":[0,14,2]}\x1b\\");
+	CHECK_EQUAL(rc.recorder.remoteControl,
+		"{\"cmd\":\"ls\",\"version\":[0,14,2]}");
+	CHECK_EQUAL(rc.Row(0), "");
 
 	// kitty's multiple cursors
 	Fixture m(20, 10);

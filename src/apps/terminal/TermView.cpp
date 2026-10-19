@@ -20,8 +20,10 @@
 
 #include <errno.h>
 #include <math.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <termios.h>
 
 #include <algorithm>
@@ -69,6 +71,7 @@
 #include <image.h>
 
 #include "ActiveProcessInfo.h"
+#include "Base64.h"
 #include "Colors.h"
 #include "InlineInput.h"
 #include "PrefHandler.h"
@@ -173,7 +176,8 @@ enum {
 	EVENT_COLORS,
 	EVENT_WORKING_DIRECTORY,
 	EVENT_MODES,
-	EVENT_PROGRESS
+	EVENT_PROGRESS,
+	EVENT_REMOTE_CONTROL
 };
 
 
@@ -502,6 +506,8 @@ TermView::_InitObject(const ShellParameters& shellParameters)
 	fFrameNeeded = false;
 	fFrameResized = false;
 	fResizeViewDisableCount = 0;
+	static int32 sNextRemoteControlID = 1;
+	fRemoteControlID = atomic_add(&sNextRemoteControlID, 1);
 	fLastActivityTime = 0;
 	fCursorState = 0;
 	fCursorBlinking = false;
@@ -703,6 +709,277 @@ TermView::NotificationActivated(const char* identifier)
 	fTerminal->TakeOutput(output);
 	fTerminal->Unlock();
 	_Send(output);
+}
+
+
+// #pragma mark - remote control
+
+
+void
+TermView::RemoteControlReply(const BString& json)
+{
+	std::string reply = "\x1bP@kitty-cmd";
+	reply += json.String();
+	reply += "\x1b\\";
+	_Send(reply);
+}
+
+
+/*!	The rows of a command's output by the shell's marks (OSC 133): the last
+	one, the last one with text, or the first on the screen. The terminal
+	must be locked.
+*/
+static bool
+command_output_rows(Terminal* terminal, const char* extent, int32& _first,
+	int32& _last)
+{
+	int32 top = -terminal->HistorySize();
+	int32 rows = terminal->Rows();
+	bool firstOnScreen = strcmp(extent, "first_cmd_output_on_screen") == 0;
+	bool nonEmpty = strcmp(extent, "last_non_empty_output") == 0;
+
+	if (firstOnScreen) {
+		for (int32 row = 0; row < rows; row++) {
+			if ((terminal->LineFlags(row) & LINE_OUTPUT) == 0)
+				continue;
+			int32 end = row + 1;
+			while (end < rows && (terminal->LineFlags(end) & LINE_PROMPT) == 0)
+				end++;
+			_first = row;
+			_last = end - 1;
+			return true;
+		}
+		return false;
+	}
+
+	// backwards from the last prompt
+	int32 end = rows;
+	for (int32 row = rows - 1; row >= top; row--) {
+		uint16 flags = terminal->LineFlags(row);
+		if ((flags & LINE_PROMPT) != 0 && (flags & LINE_OUTPUT) == 0)
+			end = row;
+		if ((flags & LINE_OUTPUT) == 0 || row >= end)
+			continue;
+		bool empty = true;
+		for (int32 line = row; line < end && empty; line++)
+			empty = terminal->LineLength(line) == 0;
+		if (!nonEmpty || !empty) {
+			_first = row;
+			_last = end - 1;
+			return true;
+		}
+		end = row;
+	}
+	return false;
+}
+
+
+static int
+signal_for_name(const char* name)
+{
+	static const struct {
+		const char*	name;
+		int			number;
+	} kSignals[] = {
+		{ "SIGHUP", SIGHUP }, { "SIGINT", SIGINT }, { "SIGQUIT", SIGQUIT },
+		{ "SIGKILL", SIGKILL }, { "SIGTERM", SIGTERM }, { "SIGUSR1", SIGUSR1 },
+		{ "SIGUSR2", SIGUSR2 }, { "SIGSTOP", SIGSTOP }, { "SIGCONT", SIGCONT },
+		{ "SIGTSTP", SIGTSTP }, { "SIGWINCH", SIGWINCH },
+		{ "SIGALRM", SIGALRM }, { "SIGPIPE", SIGPIPE }
+	};
+	for (size_t i = 0; i < B_COUNT_OF(kSignals); i++) {
+		if (strcasecmp(name, kSignals[i].name) == 0
+			|| strcasecmp(name, kSignals[i].name + 3) == 0) {
+			return kSignals[i].number;
+		}
+	}
+	return atoi(name);
+}
+
+
+/*!	The commands of kitty's remote control that concern one terminal:
+	send-text, get-text, scroll-window, set-colors, get-colors,
+	set-window-title and signal-child. Returns false with \a _error set
+	when the command cannot be carried out.
+*/
+bool
+TermView::RemoteCommand(const char* command, const BMessage& payload,
+	BString& _data, BString& _error)
+{
+	if (strcmp(command, "send-text") == 0) {
+		BString data = payload.GetString("data", "");
+		std::string bytes;
+		if (data.StartsWith("text:"))
+			bytes = data.String() + 5;
+		else if (data.StartsWith("base64:")) {
+			if (!base64_decode(data.String() + 7, data.Length() - 7, bytes)) {
+				_error = "The data is not valid base64";
+				return false;
+			}
+		} else {
+			_error = "The data must start with text: or base64:";
+			return false;
+		}
+		BString paste = payload.GetString("bracketed_paste", "disable");
+		if (paste == "auto") {
+			// as a paste would be: bracketed if the program asked for it
+			std::string encoded;
+			fTerminal->Lock();
+			fTerminal->EncodePaste(bytes.data(), bytes.size(), encoded);
+			fTerminal->Unlock();
+			bytes = encoded;
+		} else if (paste == "enable")
+			bytes = "\x1b[200~" + bytes + "\x1b[201~";
+		_Send(bytes);
+		return true;
+	}
+
+	if (strcmp(command, "get-text") == 0) {
+		BString extent = payload.GetString("extent", "screen");
+		std::string text;
+		fTerminal->Lock();
+		int32 rows = fTerminal->Rows();
+		int32 columns = fTerminal->Columns();
+		TermPoint start(0, 0);
+		TermPoint end(columns, rows - 1);
+		bool found = true;
+		if (extent == "all")
+			start = TermPoint(0, -fTerminal->HistorySize());
+		else if (extent == "selection") {
+			found = !fSelection.IsEmpty();
+			start = fSelection.start;
+			end = fSelection.end;
+		} else if (extent.EndsWith("_output")) {
+			int32 first, last;
+			found = command_output_rows(fTerminal, extent.String(), first,
+				last);
+			if (found) {
+				start = TermPoint(0, first);
+				end = TermPoint(columns, last);
+			}
+		}
+		if (found)
+			fTerminal->GetText(start, end, text);
+		fTerminal->Unlock();
+		_data = text.c_str();
+		return true;
+	}
+
+	if (strcmp(command, "scroll-window") == 0) {
+		BMessage amount;
+		if (payload.FindMessage("amount", &amount) != B_OK) {
+			_error = "No amount to scroll by";
+			return false;
+		}
+		const char* keyword;
+		if (amount.FindString("0", &keyword) == B_OK) {
+			if (strcmp(keyword, "start") == 0) {
+				fTerminal->Lock();
+				int32 history = fTerminal->HistorySize();
+				fTerminal->Unlock();
+				_ScrollToRows(history);
+			} else
+				_ScrollToBottom();
+			return true;
+		}
+		int32 count = (int32)amount.GetDouble("0", 0);
+		BString unit = amount.GetString("1", "l");
+		if (unit == "p")
+			_ScrollToRows(fScrollRows - count * fRows);
+		else if (unit == "r") {
+			for (int32 i = 0; i < abs(count); i++)
+				_ScrollToPrompt(count > 0);
+		} else
+			_ScrollToRows(fScrollRows - count);
+		return true;
+	}
+
+	if (strcmp(command, "set-colors") == 0) {
+		fTerminal->Lock();
+		if (payload.GetBool("reset", false))
+			fTerminal->RemoteResetColors();
+		BMessage colors;
+		if (payload.FindMessage("colors", &colors) == B_OK) {
+			BString spec;
+			char* name;
+			type_code type;
+			for (int32 i = 0; colors.GetInfo(B_ANY_TYPE, i, &name, &type)
+					== B_OK; i++) {
+				double value;
+				const char* string;
+				if (colors.FindDouble(name, &value) == B_OK) {
+					spec << (spec.IsEmpty() ? "" : ";") << name << "=";
+					spec << BString().SetToFormat("#%06x",
+						(unsigned)value & 0xffffff);
+				} else if (colors.FindString(name, &string) == B_OK)
+					spec << (spec.IsEmpty() ? "" : ";") << name << "=" << string;
+			}
+			if (!spec.IsEmpty())
+				fTerminal->RemoteSetColors(spec.String());
+		}
+		fTerminal->Unlock();
+		return true;
+	}
+
+	if (strcmp(command, "get-colors") == 0) {
+		static const struct {
+			const char*	name;
+			int32		index;
+		} kColors[] = {
+			{ "foreground", COLOR_FOREGROUND },
+			{ "background", COLOR_BACKGROUND },
+			{ "cursor", COLOR_CURSOR },
+			{ "cursor_text", COLOR_CURSOR_TEXT },
+			{ "selection_foreground", COLOR_SELECTION_FOREGROUND },
+			{ "selection_background", COLOR_SELECTION_BACKGROUND }
+		};
+		fTerminal->Lock();
+		for (size_t i = 0; i < B_COUNT_OF(kColors); i++) {
+			uint32 color = fTerminal->Color(kColors[i].index);
+			if (color == kColorUnset)
+				continue;
+			_data << BString().SetToFormat("%-24s #%06x\n", kColors[i].name,
+				(unsigned)color);
+		}
+		for (int32 i = 0; i < 256; i++) {
+			_data << BString().SetToFormat("color%-19d #%06x\n", (int)i,
+				(unsigned)fTerminal->ResolveColor(palette_color(i), true));
+		}
+		fTerminal->Unlock();
+		return true;
+	}
+
+	if (strcmp(command, "set-window-title") == 0) {
+		fTerminal->Lock();
+		fTerminal->RemoteSetTitle(payload.GetString("title", ""));
+		fTerminal->Unlock();
+		return true;
+	}
+
+	if (strcmp(command, "signal-child") == 0) {
+		ActiveProcessInfo info;
+		if (!GetActiveProcessInfo(info)) {
+			_error = "No process to signal";
+			return false;
+		}
+		pid_t group = getpgid(info.ID());
+		BMessage signals;
+		payload.FindMessage("signals", &signals);
+		const char* name;
+		for (int32 i = 0; signals.FindString(BString() << i, &name) == B_OK;
+				i++) {
+			int number = signal_for_name(name);
+			if (number <= 0) {
+				_error.SetToFormat("Unknown signal: %s", name);
+				return false;
+			}
+			kill(group > 0 ? -group : info.ID(), number);
+		}
+		return true;
+	}
+
+	_error.SetToFormat("Not supported by Terminal: %s", command);
+	return false;
 }
 
 
@@ -1559,6 +1836,17 @@ TermView::TerminalNotify(const TermNotification& notification)
 
 
 void
+TermView::TerminalRemoteControl(const char* json)
+{
+	Event* event = new(std::nothrow) Event(EVENT_REMOTE_CONTROL);
+	if (event != NULL) {
+		event->text = json;
+		_PostEvent(event);
+	}
+}
+
+
+void
 TermView::TerminalCloseNotification(const char* identifier)
 {
 	Event* event = new(std::nothrow) Event(EVENT_CLOSE_NOTIFICATION);
@@ -1760,6 +2048,17 @@ TermView::_HandleEvents()
 				else if (notification.timeout == 0)
 					timeout = 24LL * 3600 * 1000000;
 				message.Send(timeout);
+				break;
+			}
+
+			case EVENT_REMOTE_CONTROL:
+			{
+				// the window has all the tabs a command may be about
+				BMessage message(MSG_REMOTE_CONTROL);
+				message.AddString("json", event->text.c_str());
+				message.AddPointer("view", this);
+				if (Window() != NULL)
+					Window()->PostMessage(&message);
 				break;
 			}
 

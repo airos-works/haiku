@@ -68,6 +68,8 @@ void Terminal::Listener::TerminalWorkingDirectoryChanged(const char* url) {}
 void Terminal::Listener::TerminalModesChanged() {}
 void Terminal::Listener::TerminalProgressChanged(int32 state, int32 percent)
 	{}
+void Terminal::Listener::TerminalRemoteControl(const char* json)
+	{}
 
 
 // #pragma mark - Terminal

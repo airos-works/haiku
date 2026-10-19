@@ -1495,8 +1495,17 @@ Terminal::DcsDispatch(const VTSequence& sequence, const char* data,
 		return;
 	}
 
-	// kitty's private DCS codes (remote control and kittens) are not
-	// supported; anything else is ignored too.
+	// kitty's remote control: DCS @kitty-cmd{JSON} ST, the @ is the final
+	// byte. The listener decides whether to carry it out.
+	if (sequence.marker == 0 && sequence.intermediateCount == 0
+		&& sequence.final == '@' && string.compare(0, 10, "kitty-cmd{") == 0) {
+		if (fListener != NULL)
+			fListener->TerminalRemoteControl(string.c_str() + 9);
+		return;
+	}
+
+	// other private DCS codes of kitty's (kittens) are not supported;
+	// anything else is ignored too.
 }
 
 

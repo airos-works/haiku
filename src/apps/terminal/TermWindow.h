@@ -32,6 +32,8 @@
 #define TERM_WINDOW_H
 
 
+#include <vector>
+
 #include <InterfaceDefs.h>
 #include <MessageRunner.h>
 #include <String.h>
@@ -156,7 +158,7 @@ private:
 			void				_AddTab(const Arguments* args,
 									const BString& currentDirectory
 										= BString());
-			void				_RemoveTab(int32 index);
+			void				_RemoveTab(int32 index, bool ask = true);
 			void				_NavigateTab(int32 index, int32 direction,
 									bool move);
 
@@ -190,6 +192,17 @@ private:
 			void				_MoveWindowInScreen(BWindow* window);
 
 			void				_UpdateKeymap();
+
+			void				_SetFontSize(float size);
+			void				_RemoteControl(BMessage* message);
+			bool				_RunRemoteCommand(TermView* sender,
+									const BMessage& command, BString& _reply,
+									BList& _closing);
+			bool				_MatchRemoteTabs(const BMessage& payload,
+									TermView* sender,
+									std::vector<int32>& _indexes,
+									BString& _error);
+			void				_RemoteList(TermView* sender, BString& json);
 
 private:
 			TerminalRoster		fTerminalRoster;

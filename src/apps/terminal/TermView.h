@@ -143,6 +143,14 @@ public:
 			//! One of the view's notifications was clicked.
 			void				NotificationActivated(const char* identifier);
 
+			// kitty's remote control: TermWindow carries the commands out
+			int32				RemoteControlID() const
+									{ return fRemoteControlID; }
+			void				RemoteControlReply(const BString& json);
+			bool				RemoteCommand(const char* command,
+									const BMessage& payload, BString& _data,
+									BString& _error);
+
 protected:
 	virtual void				AttachedToWindow();
 	virtual void				DetachedFromWindow();
@@ -214,6 +222,7 @@ private:
 									const char* programName);
 	virtual	void				TerminalNotify(
 									const TermNotification& notification);
+	virtual	void				TerminalRemoteControl(const char* json);
 	virtual	void				TerminalCloseNotification(
 									const char* identifier);
 	virtual	void				TerminalPointerShapeChanged(
@@ -437,6 +446,7 @@ private:
 			TermPoint			fPrevPos;
 			BClipboard*			fMouseClipboard;
 			BString				fPointerShape;
+			int32				fRemoteControlID;
 			std::map<std::string, BBitmap*> fNotificationIcons;
 									// icon data programs sent, by key
 

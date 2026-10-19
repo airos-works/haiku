@@ -56,12 +56,12 @@ room for a block first.
 ### Multiple cursors (`CSI > ... SP q`) — done
 All of it, drawn by both renderers.
 
-### Remote control (`DCS @kitty-cmd`) — M for a useful subset
-Scripting kitty from programs running in it (`kitten @ launch`, `send-text`,
-`get-text`, `set-colors`, `set-tab-title` ...). Terminal can already be
-scripted from outside with `hey` (see TERMINAL.md); this would add the kitty
-wire format and the commands that fit Terminal's windows and tabs. kitty's
-encrypted mode needs X25519 and AES-GCM.
+### Remote control (`DCS @kitty-cmd`) — the useful part done
+Off by default, like kitty's. The commands that fit Terminal's tabs work
+(see TERMINAL.md). Missing: the encrypted form with passwords (X25519,
+AES-GCM; S-M), commands for kitty's layouts, markers, background images and
+the like (no such things in Terminal), `send-key`, async and streaming
+commands, and the `kitten @` client itself (Go).
 
 ### File transfer (OSC 5113) — L
 Copying files over the terminal connection, used by `kitten transfer` and

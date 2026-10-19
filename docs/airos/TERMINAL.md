@@ -43,7 +43,8 @@ underlines (`Smulx`, `Setulc`) and true color (`RGB`, `Tc`).
 | Miscellaneous | `CSI ? s`/`r` without parameters, `SGR 221`/`222`, `CSI 22 J`, DECCARA/DECSACE with every SGR attribute, the mouse-leave event | Complete. |
 | Shell integration | `OSC 133` | Prompt and output marks; jumping between prompts. |
 | Multiple cursors | `CSI > ... SP q` | Complete: block, beam, underline and follow-the-cursor shapes at points, rectangles or the cursor; their two colors (`30`, `40`, including "special"); the support, cursor and color queries. They blink with the cursor, show when DECTCEM hides it, and go with ED 2/3/22, a reset, the other screen and a resize. |
-| File transfer, remote control, drag and drop | `OSC 5113`, `DCS @kitty-cmd`, `OSC 72` | Not done. |
+| Remote control | `DCS @kitty-cmd` | Off unless the settings say `"RemoteControl" , "yes"` (as kitty's `allow_remote_control` is off). The commands that fit Terminal's windows and tabs, kitty's "windows": `ls`, `launch` and `new-window` (a tab, or another Terminal), `send-text`, `get-text` (screen, all, selection, command outputs), `set-tab-title`, `set-window-title`, `set-colors`, `get-colors`, `scroll-window`, `focus-window`/`focus-tab`, `close-window`/`close-tab`, `set-font-size`, `resize-os-window`, `signal-child`; kitty's `match` expressions `id:`, `title:`, `pid:`, `num:`, `recent:0`, `state:`, and `self`/`all`. Not: the encrypted (password) form, async and streaming commands, kittens. |
+| File transfer, drag and drop | `OSC 5113`, `OSC 72` | Not done. |
 
 ### Other extensions
 

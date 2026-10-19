@@ -330,6 +330,8 @@ public:
 		virtual	void			TerminalModesChanged();
 		virtual	void			TerminalProgressChanged(int32 state,
 									int32 percent);
+		//! kitty's remote control: a command (JSON) a program sent.
+		virtual	void			TerminalRemoteControl(const char* json);
 	};
 
 	struct CursorInfo {
@@ -484,6 +486,15 @@ public:
 									{ return fExtraCursorColors[which]; }
 			uint32				ExtraCursorsGeneration() const
 									{ return fExtraCursorsGeneration; }
+
+			// kitty's remote control: what a program could do with OSC 2
+			// and OSC 21, without going through the parser (whose state
+			// belongs to the program's output)
+			void				RemoteSetTitle(const char* title)
+									{ _SetTitle(title, true, true); }
+			void				RemoteSetColors(const char* spec)
+									{ _KittyColors(spec); }
+			void				RemoteResetColors();
 
 			//! The description of a text sizing block (multicell_index()).
 			bool				GetMulticell(uint32 index,
