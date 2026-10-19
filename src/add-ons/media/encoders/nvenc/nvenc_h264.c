@@ -1,10 +1,11 @@
 /* See nvenc_h264.h.
  *
- * Everything the engine is told comes from NVIDIA's nvenc_drv.h (in Mesa's
- * nouveau headers); no open driver drives NVENC, so what the header does not
- * say - the arrangement of the input picture, which of the many tuning
- * fields must not stay zero - is chosen as the header suggests and checked
- * by MediaConverter's self-test, which decodes what comes out. */
+ * The structures are NVIDIA's nvenc_drv.h (in Mesa's nouveau headers). What
+ * the header does not say was found on a GTX 1070 (GP104, class C2B7) and
+ * is kept to what that card was seen to need; README.md has the list. The
+ * tuning values of the motion search, mode decision and quantisation
+ * controls are the ones NVIDIA's own driver uses, as recorded by an encoder
+ * written for an RTX 3050 (Mesa merge request 45349). */
 
 #include "nvenc_h264.h"
 
@@ -21,29 +22,25 @@ _Static_assert(sizeof(nvenc_h264_md_control_s) == 128, "md control");
 _Static_assert(sizeof(nvenc_h264_quant_control_s) == 192, "quant control");
 
 /* Where the parts of the picture setup buffer go; the engine is given the
- * offsets. Each part starts on 256 bytes. */
-#define SLICE_CONTROL_OFFSET	0x200
-#define ME_CONTROL_OFFSET	0x300
-#define MD_CONTROL_OFFSET	0x400
-#define QUANT_CONTROL_OFFSET	0x500
+ * offsets. */
+#define SLICE_CONTROL_OFFSET	0x400
+#define ME_CONTROL_OFFSET	0x480
+#define MD_CONTROL_OFFSET	0x540
+#define QUANT_CONTROL_OFFSET	0x5c0
 #define PIC_SETUP_SIZE		0x1000
 
-/* The status buffer: the picture's statistics first, then room for what
- * the engine may write about slices and macroblocks. */
-#define STATUS_SLICE_OFFSET	0x100
-#define STATUS_MPEC_OFFSET	0x1000
-#define STATUS_AQ_OFFSET	0x4000
-#define STATUS_FIFO_OFFSET	0x8000
-#define STATUS_SIZE		0x10000
+#define STATUS_SIZE		0x1000
 
 #define LOG2_MAX_FRAME_NUM	8
 #define MIN_QP			10
 #define MAX_QP			51
 
+/* what the status buffer's error_status says when a picture is done */
+#define PICTURE_DONE		2
+
 struct NvencH264 {
 	NvencEngine	*engine;
 	nvenc_config	config;
-	const NvencLayout *layout;
 	NvencPictureLayout input;
 	NvencPictureLayout reference;
 	int		widthInMbs, heightInMbs;
@@ -54,7 +51,7 @@ struct NvencH264 {
 	int		idrPicId;
 	NvencRateControl rc;
 
-	NvencBuffer	picSetup, inputPicture, bitstream, status, history, rcProcess;
+	NvencBuffer	picSetup, inputPicture, bitstream, status, history;
 	NvencBuffer	recon[2], coloc[2], mePred[2];
 
 	uint8_t		headers[256];
@@ -174,68 +171,22 @@ write_parameter_sets(NvencH264 *encoder)
 		&ppsHeader, 1, &bits);
 }
 
+
+/* Input, reference and reconstructed pictures are all in the video block
+ * linear arrangement (nvencBlockLinearOffset); block_height counts groups of
+ * eight lines. Chroma has its own address, so its offset stays 0. The size
+ * is the coded one, whole macroblocks: the engine refuses a width that is
+ * not a multiple of 16, and the SPS crops the picture. */
 static void
-fill_surface(nvenc_h264_surface_cfg_s *cfg, const NvencPictureLayout *picture,
-	const NvencLayout *layout, bool reference)
+fill_surface(nvenc_h264_surface_cfg_s *cfg, const NvencH264 *encoder,
+	const NvencPictureLayout *picture)
 {
 	memset(cfg, 0, sizeof(*cfg));
-	cfg->frame_width_minus1 = picture->width - 1;
-	cfg->frame_height_minus1 = picture->height - 1;
+	cfg->frame_width_minus1 = encoder->widthInMbs * 16 - 1;
+	cfg->frame_height_minus1 = encoder->heightInMbs * 16 - 1;
 	cfg->sfc_pitch = picture->pitch;
 	cfg->sfc_pitch_chroma = picture->pitch;
-	cfg->luma_top_frm_offset = 0;
-	cfg->chroma_top_frm_offset = layout->chromaFromBase ? picture->chromaOffset >> 8 : 0;
-	cfg->memory_mode = 0;			/* semi-planar */
-	if (reference) {
-		cfg->tiled_16x16 = 1;		/* the header: must be 1 for refpics */
-		return;
-	}
-	cfg->tiled_16x16 = layout->tiled;
-	cfg->block_height = layout->blockHeight;
-	cfg->input_bl_mode = 0;			/* GPU block linear */
-}
-
-static void
-fill_me_control(nvenc_h264_me_control_s *me)
-{
-	memset(me, 0, sizeof(*me));
-	me->me_predictor_mode = 0;
-	me->refinement_mode = 1;		/* quarter pel */
-	me->lambda_mode = 0;
-	me->refine_on_search_enable = 1;
-	me->mv_only_enable = 0;
-
-	/* Search around the neighbours' vectors and around zero. Temporal
-	 * hints would need the predictor buffers to be written as the engine
-	 * expects, which nothing documents. */
-	me->predsrc.self_spatial_enable = 1;
-	me->predsrc.self_spatial_search = 1;
-	me->predsrc.self_spatial_refine = 1;
-	me->predsrc.self_spatial_explicit = 1;
-	me->predsrc.const_mv_enable = 1;
-	me->predsrc.const_mv_search = 1;
-	me->predsrc.const_mv_refine = 1;
-	me->predsrc.const_mv_explicit = 1;
-
-	/* Every point of an 8 by 8 pattern for every priority */
-	nvenc_h264_me_stamp_s *shapes[] = { &me->shape0, &me->shape1, &me->shape2,
-		&me->shape3, &me->shape4, &me->shape5, &me->shape6, &me->shape7 };
-	for (int i = 0; i < 8; i++) {
-		shapes[i]->bitmask[0] = 0xffffffff;
-		shapes[i]->bitmask[1] = 0xffffffff;
-	}
-
-	/* the five hint kinds in order; the header says they must all appear */
-	me->hint_type0 = 0;
-	me->hint_type1 = 1;
-	me->hint_type2 = 2;
-	me->hint_type3 = 3;
-	me->hint_type4 = 4;
-	me->fbm_select_best_cu16_parttype_num = 1;
-	me->fbm_op_winner_num_p_frame = 1;
-	me->fbm_op_winner_num_b_frame_l0 = 1;
-	me->fbm_op_winner_num_b_frame_l1 = 1;
-	me->fbm_select_best_cu32_parttype_num = 1;
+	cfg->block_height = 2;
 }
 
 static void
@@ -246,40 +197,84 @@ fill_md_control(nvenc_h264_md_control_s *md)
 	md->intra_luma8x8_mode_enable = 0;	/* Main profile: no 8x8 transform */
 	md->intra_luma16x16_mode_enable = 0xf;
 	md->intra_chroma_mode_enable = 0xf;
+	md->ip_search_mode = 1 | 4;		/* 4x4 and 16x16 */
+	md->early_intra_mode_control = 3;
+	md->early_intra_mode_type_16x16dc = 1;
+	md->early_intra_mode_type_16x16h = 1;
+	md->early_intra_mode_type_16x16v = 1;
+	md->early_termination_ip1 = 1;
+	md->priority_ipred_type_ip1 = 1;
+	md->inter_penalty_factor_for_ip1 = 16;
 	md->l0_part_16x16_enable = 1;
 	md->l0_part_16x8_enable = 1;
 	md->l0_part_8x16_enable = 1;
 	md->l0_part_8x8_enable = 1;
 	md->pskip_enable = 1;
+	md->skip_evaluate_enable = 1;
 	md->mv_cost_enable = 1;
-	md->mv_cost_predictor_control = 1;
-	md->intra_most_prob_force_on = 1;
-	md->early_intra_mode_control = 3;	/* none: full intra search */
-	md->ip_search_mode = 1 | 4;		/* 4x4 and 16x16 */
+	md->rdo_level = 1;
+	md->tu_search_num = 3;
+	md->num_1div8_lambda_ssd = 1;
+	md->intra_ssd_cnt_4x4 = 1;
+	md->intra_ssd_cnt_8x8 = 1;
+	md->intra_ssd_cnt_16x16 = 1;
+
+	/* biases against costs, multiplied by lambda */
+	md->multiply_bias_with_lambda = 1;
+	md->bias_inter_16x8 = -1;
+	md->bias_inter_8x16 = -1;
+	md->bias_inter_8x8 = -1;
+	md->bias_pskip = -1;
+	md->bias_intra_over_inter = -2;
+	md->bias_intra_16x16 = -4;
+	md->bias_intra_8x8 = -2;
+	md->bias_intra_4x4 = -1;
+	md->intra_nxn_bias_multiplier = 32;
+	md->intra_most_prob_bias_multiplier = 3;
+	md->pskip_bias_multiplier = 2;
+	md->pskip_esc_threshold = 9;
+	md->tempmv_wt_spread_threshold = 0xffff;
+	md->tempmv_wt_distort_threshold = 0xffff;
 }
 
+/* Rounding towards zero by a third of a step for intra and a sixth for
+ * inter blocks, less for the higher frequencies of a 4x4 intra block, in
+ * 1/2048ths; left at zero the pictures lose 4 dB at the same QP. */
 static void
 fill_quant_control(nvenc_h264_quant_control_s *quant)
 {
-	/* No QPP, no saturation; zero dead zones round towards zero, which costs
-	 * a little quality but is valid whatever their unit is. */
+	static const uint16_t kIntra4x4[16] = { 1023, 878, 820, 682, 878, 820, 682, 512,
+		820, 682, 512, 410, 682, 512, 410, 410 };
+	static const uint16_t kInter4x4[16] = { 682, 586, 546, 456, 586, 546, 456, 342,
+		546, 456, 342, 292, 456, 342, 292, 274 };
 	memset(quant, 0, sizeof(*quant));
+	for (int i = 0; i < 16; i++) {
+		quant->dz_4x4_YI[i] = kIntra4x4[i];
+		quant->dz_4x4_YP[i] = kInter4x4[i];
+		quant->dz_8x8_YI[i] = 682;
+		quant->dz_8x8_YP[i] = 342;
+	}
+	quant->dz_4x4_CI = 682;
+	quant->dz_4x4_CP = 342;
+	/* dropping lone coefficients whose cost exceeds their worth */
+	quant->qpp_run_vector_4x4 = 0x056b;
+	quant->qpp_run_vector_8x8[0] = 0xaaff;
+	quant->qpp_run_vector_8x8[1] = 0xffaa;
+	quant->qpp_run_vector_8x8[2] = 0x000f;
+	quant->qpp_luma8x8_cost = 15;
+	quant->qpp_luma16x16_cost = 15;
+	quant->qpp_chroma_cost = 15;
 }
 
 static void
-fill_slice_control(NvencH264 *encoder, nvenc_h264_slice_control_s *slice, int qp,
-	bool intra)
+fill_slice_control(NvencH264 *encoder, nvenc_h264_slice_control_s *slice, int qp)
 {
 	memset(slice, 0, sizeof(*slice));
 	slice->num_mb = encoder->widthInMbs * encoder->heightInMbs;
 	slice->qp_avr = qp;
-	slice->qp_slice_min = MIN_QP;
-	slice->qp_slice_max = MAX_QP;
-	slice->force_intra = intra;
+	slice->qp_slice_min = qp;
+	slice->qp_slice_max = qp;
 	slice->disable_deblocking_filter_idc = 0;
-	slice->cabac_init_idc = 0;
-	slice->disable_slice_header = 0;	/* the engine writes it */
-	slice->num_ref_idx_active_override_flag = 0;
 }
 
 NvencH264 *
@@ -303,7 +298,6 @@ nvencH264Open(NvencEngine *engine, const nvenc_config *config, char *reason,
 	encoder->config = *config;
 	if (encoder->config.key_interval == 0)
 		encoder->config.key_interval = 250;
-	encoder->layout = &kNvencLayouts[config->variant];
 	encoder->widthInMbs = (config->width + 15) / 16;
 	encoder->heightInMbs = (config->height + 15) / 16;
 	double fps = config->frame_rate_den != 0
@@ -315,7 +309,10 @@ nvencH264Open(NvencEngine *engine, const nvenc_config *config, char *reason,
 	nvencPictureLayout(&encoder->input, config->width, config->height, 1, 16, 32);
 	nvencPictureLayout(&encoder->reference, config->width, config->height, 1, 16, 32);
 	int macroblocks = encoder->widthInMbs * encoder->heightInMbs;
-	size_t historySize = ((size_t)encoder->widthInMbs + 16) * 128 * 2;
+	/* The history keeps 384 bytes per column of macroblocks; NVIDIA's driver
+	 * says as much in hist_buf_size, and a smaller buffer faults the card's
+	 * memory unit at 1080p. */
+	size_t historySize = ((size_t)encoder->widthInMbs + 16) * 384;
 	size_t bitstreamSize = (size_t)encoder->input.pitch * encoder->input.alignedHeight * 2
 		+ 0x10000;
 
@@ -323,13 +320,14 @@ nvencH264Open(NvencEngine *engine, const nvenc_config *config, char *reason,
 		&& nvencAlloc(engine, &encoder->inputPicture, encoder->input.size, true)
 		&& nvencAlloc(engine, &encoder->bitstream, bitstreamSize, true)
 		&& nvencAlloc(engine, &encoder->status, STATUS_SIZE, true)
-		&& nvencAlloc(engine, &encoder->history, historySize, false)
-		&& nvencAlloc(engine, &encoder->rcProcess, 0x1000, false);
+		&& nvencAlloc(engine, &encoder->history, historySize, false);
 	for (int i = 0; ok && i < 2; i++) {
+		/* co-located data is 64 bytes a macroblock; the motion predictors
+		 * are not documented and get twice that */
 		ok = nvencAlloc(engine, &encoder->recon[i], encoder->reference.size, false)
 			&& nvencAlloc(engine, &encoder->coloc[i], (size_t)macroblocks * 64 + 0x1000,
 				false)
-			&& nvencAlloc(engine, &encoder->mePred[i], (size_t)macroblocks * 64 + 0x1000,
+			&& nvencAlloc(engine, &encoder->mePred[i], (size_t)macroblocks * 128 + 0x1000,
 				false);
 	}
 	if (!ok) {
@@ -362,7 +360,6 @@ nvencH264Close(NvencH264 *encoder)
 		nvencFree(engine, &encoder->coloc[i]);
 		nvencFree(engine, &encoder->mePred[i]);
 	}
-	nvencFree(engine, &encoder->rcProcess);
 	nvencFree(engine, &encoder->history);
 	nvencFree(engine, &encoder->status);
 	nvencFree(engine, &encoder->bitstream);
@@ -387,7 +384,7 @@ nvencH264Describe(NvencH264 *encoder)
 }
 
 static void
-fill_pic_setup(NvencH264 *encoder, bool idr, bool intra, int qp)
+fill_pic_setup(NvencH264 *encoder, bool idr, int qp)
 {
 	const nvenc_config *config = &encoder->config;
 	uint8_t *base = encoder->picSetup.data;
@@ -397,9 +394,9 @@ fill_pic_setup(NvencH264 *encoder, bool idr, bool intra, int qp)
 	/* The class number and the header's version 0, revision 6; the
 	 * microcode checks the upper 24 bits. */
 	setup->magic = (nvencCard(encoder->engine)->encoderClass << 16) | 0x0006;
-	fill_surface(&setup->refpic_cfg, &encoder->reference, encoder->layout, true);
-	fill_surface(&setup->input_cfg, &encoder->input, encoder->layout, false);
-	fill_surface(&setup->outputpic_cfg, &encoder->reference, encoder->layout, true);
+	fill_surface(&setup->refpic_cfg, encoder, &encoder->reference);
+	fill_surface(&setup->input_cfg, encoder, &encoder->input);
+	fill_surface(&setup->outputpic_cfg, encoder, &encoder->reference);
 
 	nvenc_h264_sps_data_s *sps = &setup->sps_data;
 	sps->profile_idc = 77;
@@ -407,86 +404,69 @@ fill_pic_setup(NvencH264 *encoder, bool idr, bool intra, int qp)
 	sps->chroma_format_idc = 1;
 	sps->pic_order_cnt_type = 2;
 	sps->log2_max_frame_num_minus4 = LOG2_MAX_FRAME_NUM - 4;
-	sps->log2_max_pic_order_cnt_lsb_minus4 = 0;
 	sps->frame_mbs_only = 1;
 
 	nvenc_h264_pps_data_s *pps = &setup->pps_data;
-	pps->pic_param_set_id = 0;
 	pps->entropy_coding_mode_flag = 1;
-	pps->num_ref_idx_l0_active_minus1 = 0;
-	pps->num_ref_idx_l1_active_minus1 = 0;
-	pps->weighted_bipred_idc = 0;
-	pps->pic_init_qp_minus26 = 0;
-	pps->chroma_qp_index_offset = 0;
-	pps->second_chroma_qp_index_offset = 0;
-	pps->constrained_intra_pred_flag = 0;
 	pps->deblocking_filter_control_present_flag = 1;
-	pps->transform_8x8_mode_flag = 0;
-	pps->pic_order_present_flag = 0;
-	pps->weighted_pred_flag = 0;
 
+	/* The engine runs at a constant QP chosen per picture (nvencRateQp). */
 	nvenc_h264_rc_s *rc = &setup->rate_control;
-	rc->QP[0] = qp;
-	rc->QP[1] = qp;
-	rc->QP[2] = qp;
-	rc->minQP[0] = rc->minQP[1] = rc->minQP[2] = MIN_QP;
-	rc->maxQP[0] = rc->maxQP[1] = rc->maxQP[2] = MAX_QP;
+	for (int i = 0; i < 3; i++) {
+		rc->QP[i] = rc->minQP[i] = rc->maxQP[i] = qp;
+		rc->rhopbi[i] = 1 << 8;
+	}
 	rc->framerate = config->frame_rate_den != 0
 		? (int)(config->frame_rate_num / config->frame_rate_den) : 30;
+	rc->buffersize = (uint32_t)encoder->bitstream.size;
 	rc->gop_length = config->key_interval;
 
 	nvenc_h264_pic_control_s *pic = &setup->pic_control;
 	memset(pic->l0, -1, sizeof(pic->l0));
 	memset(pic->l1, -1, sizeof(pic->l1));
-	if (!intra) {
+	if (!idr) {
 		pic->l0[0] = 0;			/* SET_IN_REF_PIC0 */
 		pic->temp_dist_l0[0] = 2;	/* POC type 2 counts in twos */
 	}
-	pic->max_byte_count_before_resid_zero = (uint32_t)encoder->bitstream.size;
 	pic->frame_num = encoder->frameNum;
-	pic->pic_order_cnt_lsb = (2 * encoder->frameNum) & 0xf;
 	pic->idr_pic_id = encoder->idrPicId;
-	pic->num_forced_slices_minus1 = 0;
-	pic->num_me_controls_minus1 = 0;
-	pic->num_md_controls_minus1 = 0;
-	pic->num_q_controls_minus1 = 0;
 	pic->slice_control_offset = SLICE_CONTROL_OFFSET;
 	pic->me_control_offset = ME_CONTROL_OFFSET;
 	pic->md_control_offset = MD_CONTROL_OFFSET;
 	pic->q_control_offset = QUANT_CONTROL_OFFSET;
 	pic->hist_buf_size = (uint32_t)encoder->history.size;
 	pic->bitstream_buf_size = (uint32_t)encoder->bitstream.size;
-	pic->bitstream_start_pos = 0;
-	pic->pic_struct = 0;			/* frame */
-	pic->pic_type = idr ? 3 : intra ? 2 : 0;
+	pic->pic_type = idr ? 3 : 0;
 	pic->ref_pic_flag = 1;
-	pic->slice_mode = 1;			/* the slice control array */
-	pic->base_view = 1;
-	pic->codec = 3;				/* H.264, the decoder's numbers */
-	pic->e4byteStartCode = 1;
-	pic->slice_stat_offset = STATUS_SLICE_OFFSET;
-	pic->mpec_stat_offset = STATUS_MPEC_OFFSET;
-	pic->aq_stat_offset = STATUS_AQ_OFFSET;
-	pic->stats_fifo_offset = STATUS_FIFO_OFFSET;
-	pic->strips_in_frame = 1;
-	pic->slice_encoding_row_start = 0;
-	pic->slice_encoding_row_num = encoder->heightInMbs;
+	/* One slice: dynamic insertion with no size limit. Static slices from
+	 * the slice control array (1) make the engine raise an error. */
+	pic->slice_mode = 0;
+	pic->cabac_zero_word_enable = 1;
+	/* Not the decoder's codec numbers: 3 makes the engine raise an error. */
+	pic->codec = 0;
+	/* skip the 4x4 intra search where the 8x8 blocks are flat */
+	pic->intra_sel_4x4_enable = 1;
+	pic->intra_sel_4x4_threshold = 1000;
+	pic->chroma_skip_threshold_4x4 = 8;
+	/* cycles for the application's timer, which only runs with GPTIMER_ON */
+	int macroblocks = encoder->widthInMbs * encoder->heightInMbs;
+	setup->gpTimer_timeout_val = 46080u * (macroblocks > 3600 ? macroblocks : 3600);
 
 	fill_slice_control(encoder, (nvenc_h264_slice_control_s *)(base + SLICE_CONTROL_OFFSET),
-		qp, intra);
-	fill_me_control((nvenc_h264_me_control_s *)(base + ME_CONTROL_OFFSET));
+		qp);
+	nvencFillMeControl(base + ME_CONTROL_OFFSET);
 	fill_md_control((nvenc_h264_md_control_s *)(base + MD_CONTROL_OFFSET));
 	fill_quant_control((nvenc_h264_quant_control_s *)(base + QUANT_CONTROL_OFFSET));
 }
 
-/* The chroma address the engine is given: the picture's base when it adds
- * the configured offset itself, the chroma plane otherwise. */
-static uint64_t
-chroma_address(const NvencH264 *encoder, const NvencBuffer *buffer,
-	const NvencPictureLayout *picture)
+static void
+dump_status(const char *what, const NvencBuffer *status)
 {
-	return encoder->layout->chromaFromBase ? buffer->gpuAddress
-		: buffer->gpuAddress + picture->chromaOffset;
+	const uint32_t *words = status->data;
+	fprintf(stderr, "nvenc: %s, status", what);
+	for (int i = 0; i < 16; i++)
+		fprintf(stderr, " %08x", words[i]);
+	fprintf(stderr, "\n");
 }
 
 int
@@ -501,72 +481,64 @@ nvencH264Encode(NvencH264 *encoder, const nvenc_picture *picture, NvencQueue *qu
 		if (encoder->count > 0)
 			encoder->idrPicId = (encoder->idrPicId + 1) & 0xffff;
 	}
-	bool intra = idr;
-	int qp = nvencRateQp(&encoder->rc, intra);
+	int qp = nvencRateQp(&encoder->rc, idr);
 
-	nvencStorePicture(encoder->inputPicture.data, &encoder->input, encoder->layout, picture);
-	fill_pic_setup(encoder, idr, intra, qp);
+	nvencStorePicture(encoder->inputPicture.data, &encoder->input,
+		&kNvencLayouts[encoder->config.variant], picture);
+	fill_pic_setup(encoder, idr, qp);
 	memset(encoder->status.data, 0, sizeof(nvenc_pic_stat_s));
-	memset(encoder->bitstream.data, 0, 64);
 
 	int current = encoder->count % 2;
 	int previous = 1 - current;
+	size_t inputChroma = encoder->input.chromaOffset;
+	size_t referenceChroma = encoder->reference.chromaOffset;
 	NvencEngine *engine = encoder->engine;
 	nvencBegin(engine);
 	nvencMethod(engine, NVENC_SET_APPLICATION_ID, NVENC_APPLICATION_H264);
-	nvencMethod(engine, NVENC_SET_WATCHDOG_TIMER, 0);
+	/* Without FORCE_OUT_PIC the reconstructed picture is not written, even
+	 * with ref_pic_flag set, and P pictures predict from black. */
 	nvencMethod(engine, NVENC_SET_CONTROL_PARAMS,
-		NVENC_CONTROL_CODEC_H264 | NVENC_CONTROL_FORCE_OUT_PIC
-		| NVENC_CONTROL_RCMODE(0));
-	nvencMethod(engine, NVENC_SET_PICTURE_INDEX, encoder->count);
+		NVENC_CONTROL_CODEC_H264 | NVENC_CONTROL_FORCE_OUT_PIC | NVENC_CONTROL_RCMODE(0));
+	nvencMethod(engine, NVENC_SET_PICTURE_INDEX, encoder->count + 1);
 	nvencAddress(engine, NVENC_SET_IN_DRV_PIC_SETUP, encoder->picSetup.gpuAddress);
-	nvencAddress(engine, NVENC_SET_IO_RC_PROCESS, encoder->rcProcess.gpuAddress);
-	nvencAddress(engine, NVENC_SET_OUT_ENC_STATUS, encoder->status.gpuAddress);
-	nvencAddress(engine, NVENC_SET_OUT_BITSTREAM, encoder->bitstream.gpuAddress);
-	nvencAddress(engine, NVENC_SET_IOHISTORY, encoder->history.gpuAddress);
 	nvencAddress(engine, NVENC_SET_IN_CUR_PIC, encoder->inputPicture.gpuAddress);
-	uint64_t inputChroma = chroma_address(encoder, &encoder->inputPicture, &encoder->input);
-	nvencAddress(engine, NVENC_SET_IN_CUR_PIC_CHROMA_U, inputChroma);
-	nvencAddress(engine, NVENC_SET_IN_CUR_PIC_CHROMA_V, inputChroma);
+	nvencAddress(engine, NVENC_SET_IN_CUR_PIC_CHROMA_U,
+		encoder->inputPicture.gpuAddress + inputChroma);
+	nvencAddress(engine, NVENC_SET_IN_CUR_PIC_CHROMA_V,
+		encoder->inputPicture.gpuAddress + inputChroma);
 	nvencAddress(engine, NVENC_SET_OUT_REF_PIC_LUMA, encoder->recon[current].gpuAddress);
 	nvencAddress(engine, NVENC_SET_OUT_REF_PIC_CHROMA,
-		chroma_address(encoder, &encoder->recon[current], &encoder->reference));
+		encoder->recon[current].gpuAddress + referenceChroma);
+	nvencAddress(engine, NVENC_SET_IOHISTORY, encoder->history.gpuAddress);
+	nvencAddress(engine, NVENC_SET_OUT_ENC_STATUS, encoder->status.gpuAddress);
+	nvencAddress(engine, NVENC_SET_OUT_BITSTREAM, encoder->bitstream.gpuAddress);
 	nvencAddress(engine, NVENC_SET_OUT_COLOC_DATA, encoder->coloc[current].gpuAddress);
-	nvencAddress(engine, NVENC_SET_IN_COLOC_DATA, encoder->coloc[previous].gpuAddress);
+	/* the temporal hints of the motion search read the previous picture's */
 	nvencAddress(engine, NVENC_SET_OUT_MEPRED_DATA, encoder->mePred[current].gpuAddress);
 	nvencAddress(engine, NVENC_SET_IN_MEPRED_DATA, encoder->mePred[previous].gpuAddress);
-	if (!intra) {
+	if (!idr) {
 		nvencAddress(engine, NVENC_SET_IN_REF_PIC_LUMA(0),
 			encoder->recon[previous].gpuAddress);
 		nvencAddress(engine, NVENC_SET_IN_REF_PIC_CHROMA(0),
-			chroma_address(encoder, &encoder->recon[previous], &encoder->reference));
+			encoder->recon[previous].gpuAddress + referenceChroma);
 	}
-	nvencMethod(engine, NVENC_EXECUTE, 1u << 0);
+	nvencMethod(engine, NVENC_EXECUTE, 0);
 	char why[160];
 	int executed = nvencExecute(engine,
 		encoder->config.timeout_ms != 0 ? (int)encoder->config.timeout_ms : 2000, why,
 		sizeof(why));
 	if (executed != 0) {
-		if (getenv("NVENC_DEBUG") != NULL) {
-			const uint32_t *words = encoder->status.data;
-			fprintf(stderr, "nvenc: status");
-			for (int i = 0; i < 16; i++)
-				fprintf(stderr, " %08x", words[i]);
-			fprintf(stderr, "\n");
-			fprintf(stderr, "nvenc: status words:");
-			for (size_t i = 16; i < encoder->status.size / 4; i++) {
-				if (words[i] != 0)
-					fprintf(stderr, " %zx:%08x", i * 4, words[i]);
-			}
-			fprintf(stderr, "\n");
-		}
+		if (getenv("NVENC_DEBUG") != NULL)
+			dump_status("failed", &encoder->status);
 		if (reason != NULL)
 			snprintf(reason, reasonSize, "NVENC: %s", why);
 		return executed;
 	}
 
 	const nvenc_pic_stat_s *stat = encoder->status.data;
-	if (stat->error_status != 0 || stat->ucode_error_status != 0) {
+	if (getenv("NVENC_DEBUG") != NULL)
+		dump_status("done", &encoder->status);
+	if (stat->error_status != PICTURE_DONE || stat->ucode_error_status != 0) {
 		if (reason != NULL) {
 			snprintf(reason, reasonSize, "NVENC reported error %u (microcode %#x)",
 				stat->error_status, stat->ucode_error_status);
@@ -614,7 +586,7 @@ nvencH264Encode(NvencH264 *encoder, const nvenc_picture *picture, NvencQueue *qu
 		return NVENC_FAILED;
 	}
 
-	nvencRateUpdate(&encoder->rc, bytes, intra);
+	nvencRateUpdate(&encoder->rc, bytes, idr);
 	encoder->count++;
 	encoder->indexInGop++;
 	encoder->frameNum = (encoder->frameNum + 1) % (1 << LOG2_MAX_FRAME_NUM);

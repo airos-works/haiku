@@ -20,8 +20,8 @@ only M4A, MP3, FLAC, Ogg, Opus and WAV.
 | --- | --- | --- |
 | H.264 | AMD VCE/VCN (VA-API), NVIDIA NVENC (Maxwell and later) | x264 |
 | H.264 10-bit | – | x264 |
-| H.265 | AMD Polaris and later (VA-API), NVIDIA NVENC (second Maxwell and later) | x265 |
-| H.265 10-bit | AMD VCN 2 and later, NVIDIA Pascal and later | x265 |
+| H.265 | AMD Polaris and later (VA-API), NVIDIA NVENC (second Maxwell and later; the add-on does not manage P pictures yet, so the self-test sends it to the CPU) | x265 |
+| H.265 10-bit | AMD VCN 2 and later, NVIDIA Pascal and later (as H.265) | x265 |
 | H.265 12-bit | – | x265 |
 | AV1, AV1 10-bit | AMD VCN 4 (RDNA 3, Phoenix and later), NVIDIA Ada Lovelace and later | SVT-AV1 |
 | VP9 | (Intel only, which has no VA-API driver here) | libvpx |
@@ -280,17 +280,24 @@ the engine write the slices. AV1, which Ada and Blackwell have, is not in the
 add-on yet: on those cards AV1 goes to the CPU, with the warning.
 
 No open driver drives NVENC, and the header does not say how each generation
-wants its input picture laid out. The add-on knows several ways
-(`variants`), and before a card encodes anything MediaConverter encodes a
-small test picture each way until one decodes again with libavcodec above
-32 dB (`NvencEncoder::SelfTest`, run in the background when the window
-opens, or before the first conversion). A format that fails counts as one
-the card cannot encode: the badge, the hardware window and the CPU warning
-say so, with the reason. Results are kept per card and add-on build in
-`~/config/settings/MediaConverter NVENC test`. This has not met an NVIDIA
-card yet - the lab has none since 2026-10-12 - and was tried end to end with a
-stand-in add-on that encodes with x264 (`nvenc/test/fake_nvenc.cpp`, see the
-add-on's README).
+wants its input picture laid out or which of its fields must be set how. What
+the add-on does was found on a GTX 1070 (GP104, class C2B7) in the X399 on
+2026-10-19; the add-on's README lists it. There H.264 works: a 12 second 1080p
+clip converts at 106 pictures/s (3.6 times real time) and comes back at
+44.6 dB. H.265 Main and Main 10 encode I pictures, but the engine refuses P
+pictures, so H.265 goes to the CPU for now.
+
+The add-on can know several ways of handing the engine a picture
+(`variants`; it has the one found on the card), and before a card encodes
+anything MediaConverter encodes a small test sequence (an IDR picture and
+five P pictures) each way until one decodes again with libavcodec above 32 dB
+(`NvencEncoder::SelfTest`, run in the background when the window opens, or
+before the first conversion). A format that fails counts as one the card
+cannot encode: the badge, the hardware window and the CPU warning say so,
+with the reason. Results are kept per card and add-on build in
+`~/config/settings/MediaConverter NVENC test`. MediaConverter's side was
+also tried end to end with a stand-in add-on that encodes with x264
+(`nvenc/test/fake_nvenc.cpp`, see the add-on's README).
 
 The hardware inventory knows every NVIDIA chip's encoder generation by PCI id
 (no NVENC on GM108, GP108, GA100 and GH100), so the window can say what a
@@ -368,8 +375,10 @@ MEDIACONVERTER_FAKE_NVIDIA=1b81 ...         pretend there is a GTX 1070 (with th
 
 ## Known limits
 
-- NVENC has not run on an NVIDIA card yet (see above), and B pictures are
-  not used on NVIDIA.
+- NVENC: H.264 is verified on a GTX 1070 (Pascal) only; other generations
+  run the same code and rely on the self-test. H.265 P pictures are refused
+  by the engine, so H.265 is encoded on the CPU on NVIDIA cards (see above).
+  B pictures are not used on NVIDIA.
 - AV1 on Ada and Blackwell is encoded on the CPU: NVENC's AV1 needs the
   driver to supply default probability (CDF) tables in a layout nothing
   documents, and to write frame headers from values the engine computes.
