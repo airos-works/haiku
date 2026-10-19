@@ -14,6 +14,7 @@ MediaConverter loads it from `non-packaged/add-ons/media/encoders/nvenc`.
 | `nvenc_hevc.c` | H.265 Main and Main 10, the same way, with 32x32 coding tree blocks (I pictures only work so far, see below). |
 | `nvenc_addon.c` | The `nvenc_api` table. |
 | `test/nvenctest.c` | Encodes test pictures with the add-on on a card and writes the stream (see below). |
+| `test/nvpoll.cpp` | Samples the engine's falcon registers through `/dev/misc/poke`, and dumps all of them when the engine hangs. |
 | `test/fake_nvenc.cpp` | A stand-in that implements the same interface with x264, to try MediaConverter's side without a card (see below). |
 
 ## What is known and what is not
@@ -82,8 +83,14 @@ input and `FORCE_OUT_COL`, `dist_scale_factor`, a half scaled reference,
 `SET_UCODE_STATE`, larger buffers. With `codec` 5 instead the engine does
 encode P pictures and reports microcode error 9, E_ME_PROGRAMMING (the
 ERROR_CODES list in `nvenc_drv.h`), but writes slice headers that do not
-parse. A capture of NVIDIA's driver encoding H.265 on a Pascal card would
-settle it.
+parse. Watching the engine's falcon (`test/nvpoll.cpp`, NVENC0 at BAR0 + 0x1c8000
+on GP104) shows what happens: on an H.265 P picture the falcon takes
+external interrupt 0x400 from the encoder hardware, the units stay busy
+(idle state 0x1d9a) and after about 0.9 s the watchdog fires (interrupt
+0x2) and resman resets the engine, which is the error 47. So a hardware unit
+hangs on something in the inter set-up; nothing in the registers says which.
+A capture of NVIDIA's driver encoding H.265 on a Pascal card would settle
+it.
 
 `NVENC_DEBUG=1` makes the add-on print the error notifier and the status
 words of each picture.
