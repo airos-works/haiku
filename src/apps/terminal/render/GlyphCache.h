@@ -12,6 +12,7 @@
 
 #include <Font.h>
 
+#include "ColorEmoji.h"
 #include "RenderFrame.h"
 
 
@@ -25,11 +26,16 @@ enum {
 	GLYPH_ITALIC	= 0x2
 };
 
+//! Set in a slot Lookup() returns when the glyph is in color (an emoji).
+static const uint32 kColorGlyphSlot = 0x80000000;
+
 
 /*!	Glyphs drawn once by app_server (so they look like all other text) at
 	the frame buffer's density, kept in an atlas of cell sized slots that
 	the renderers draw from. Box drawing and block characters are drawn
-	here instead, to meet exactly from cell to cell.
+	here instead, to meet exactly from cell to cell, and so are emoji when a
+	color emoji font is installed: into color pages beside the coverage
+	ones.
 */
 class GlyphCache {
 public:
@@ -47,7 +53,8 @@ public:
 
 			/*!	The slot of a glyph, given as UTF-8, that is \a cells wide.
 				New glyphs get a slot at once and are drawn by
-				DrawPending(). Returns 0 when there is no room.
+				DrawPending(). Returns 0 when there is no room, and has
+				kColorGlyphSlot set for a glyph in the color pages.
 			*/
 			uint32				Lookup(uint64 key, const char* utf8,
 									uint32 firstCodePoint, int32 cells,
@@ -70,15 +77,19 @@ private:
 				uint32			codePoint;
 				int32			cells;
 				uint32			style;
+				uint32			emoji;	// the color font's glyph, or 0
 			};
 
 			void				_Reset();
 			uint32				_AllocateSlot(int32 cells);
 			bool				_AddPage();
+			uint32*				_ColorPage(int32 page);
 			void				_MarkDirty(int32 page, int32 top,
 									int32 bottom);
 			bool				_EnsureStaging(int32 width, int32 height);
 			void				_EmboldenSlot(uint32 slot, int32 cells);
+			void				_DrawCluster(const Pending& pending,
+									const BFont& font, BPoint origin);
 
 private:
 			BFont				fFonts[4];		// by style
@@ -94,6 +105,8 @@ private:
 			uint32				fEpoch;
 
 			std::vector<uint8*>	fPages;
+			std::vector<uint32*> fColorPages;	// NULL until a page has one
+			ColorEmoji			fEmoji;
 			std::vector<GlyphAtlasInfo::Dirty> fDirty;
 			GlyphAtlasInfo		fAtlas;
 

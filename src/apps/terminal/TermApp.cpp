@@ -21,6 +21,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include <Alert.h>
@@ -42,7 +43,7 @@
 #include "TermWindow.h"
 
 
-static bool sUsageRequested = false;
+static bool sNoWindow = false;
 //static bool sGeometryRequested = false;
 
 rgb_color TermApp::fDefaultPalette[kTermColorCount];
@@ -83,8 +84,9 @@ TermApp::~TermApp()
 void
 TermApp::ReadyToRun()
 {
-	// Prevent opeing window when option -h is given.
-	if (sUsageRequested)
+	// Prevent opening a window when option -h is given, or when this team
+	// only passes a notification's click on.
+	if (sNoWindow)
 		return;
 
 	// Install a SIGCHLD signal handler, so that we will be notified, when
@@ -190,6 +192,11 @@ TermApp::MessageReceived(BMessage* message)
 			fTermWindow->Activate();
 			break;
 
+		case MSG_NOTIFICATION_ACTIVATED:
+			if (fTermWindow != NULL)
+				fTermWindow->PostMessage(message);
+			break;
+
 		default:
 			BApplication::MessageReceived(message);
 			break;
@@ -200,11 +207,23 @@ TermApp::MessageReceived(BMessage* message)
 void
 TermApp::ArgvReceived(int32 argc, char **argv)
 {
+	if (argc >= 6 && strcmp(argv[1], NOTIFICATION_ACTIVATED_ARGUMENT) == 0) {
+		// A notification of another Terminal was clicked: tell it, and go.
+		BMessage message(MSG_NOTIFICATION_ACTIVATED);
+		message.AddString("view", argv[3]);
+		message.AddString("id", argv[4]);
+		message.AddInt32("actions", atoi(argv[5]));
+		BMessenger(TERM_SIGNATURE, atoi(argv[2])).SendMessage(&message);
+		sNoWindow = true;
+		PostMessage(B_QUIT_REQUESTED);
+		return;
+	}
+
 	fArgs->Parse(argc, argv);
 
 	if (fArgs->UsageRequested()) {
 		_Usage(argv[0]);
-		sUsageRequested = true;
+		sNoWindow = true;
 		PostMessage(B_QUIT_REQUESTED);
 		return;
 	}

@@ -363,6 +363,11 @@ AddFilesToPackage data KeyboardLayouts ThinkPad
 local terminalThemes = [ Glob $(HAIKU_TOP)/data/system/data/terminal_themes : "[a-zA-Z0-9 ]*" ] ;
 AddFilesToPackage data Terminal Themes : $(terminalThemes) ;
 
+# Terminal's shell integration, read by the profile
+SEARCH on <terminal>airos-terminal.sh
+	= [ FDirName $(HAIKU_TOP) src apps terminal shell-integration ] ;
+AddFilesToPackage data profile.d : <terminal>airos-terminal.sh ;
+
 # boot module links
 AddBootModuleSymlinksToPackage
 	acpi@x86,x86_64,arm64

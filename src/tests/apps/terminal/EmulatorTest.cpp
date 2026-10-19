@@ -268,6 +268,17 @@ TestUnicode()
 	CHECK(v.Cell(0, 0).IsWide());
 	CHECK(v.Cell(0, 2).character == 'x');
 
+	// and a keycap: 1, VS16, combining enclosing keycap
+	Fixture k;
+	k.Feed("1\xef\xb8\x8f\xe2\x83\xa3x");
+	CHECK(k.Cell(0, 0).IsWide());
+	CHECK(k.Cell(0, 2).character == 'x');
+	// without VS16 it keeps the text presentation
+	Fixture t;
+	t.Feed("1\xe2\x83\xa3x");
+	CHECK(!t.Cell(0, 0).IsWide());
+	CHECK(t.Cell(0, 1).character == 'x');
+
 	// invalid UTF-8
 	Fixture i;
 	i.Feed("a\xff" "b\xe2\x82z");
@@ -765,7 +776,9 @@ TestOperatingSystemCommands()
 	CHECK_EQUAL(n.recorder.notifications[1].body, "Body");
 	n.Feed("\x1b]99;i=q:p=?;\x1b\\");
 	std::string answer = n.Reply();
-	CHECK(answer.find("\x1b]99;i=q:p=?;o=always") == 0);
+	CHECK_EQUAL(answer, "\x1b]99;i=q:p=?;a=focus,report:o=always,unfocused"
+		":p=title,body,close,icon,?,alive:s=system,silent:u=0,1,2:w=1"
+		"\x1b\\");
 	n.Feed(answer);
 	CHECK_EQUAL(n.Reply(), "");
 	n.Feed("\x1b]9;iTerm says hi\x07");
@@ -778,6 +791,56 @@ TestOperatingSystemCommands()
 	CHECK_EQUAL(n.recorder.notifications.back().title, "Hi");
 	n.terminal.ReportNotificationActivated("abc", 0);
 	CHECK_EQUAL(n.Reply(), "\x1b]99;i=abc;\x1b\\");
+	CHECK(n.recorder.notifications.back().focusOnActivation);
+	CHECK(n.recorder.notifications.back().reportActivation);
+	// no report unless asked for, and none without focus either
+	n.Feed("\x1b]99;i=quiet:a=-focus;Shh\x1b\\");
+	CHECK(!n.recorder.notifications.back().focusOnActivation);
+	CHECK(!n.recorder.notifications.back().reportActivation);
+	n.terminal.ReportNotificationActivated("quiet", 0);
+	CHECK_EQUAL(n.Reply(), "");
+	// without an id the reports say 0
+	n.Feed("\x1b]99;a=report;No id\x1b\\");
+	n.terminal.ReportNotificationActivated("", 0);
+	CHECK_EQUAL(n.Reply(), "\x1b]99;i=0;\x1b\\");
+	// close events cannot be tracked; an icon, a name, a cache key, expiry
+	n.Feed("\x1b]99;i=ic:d=0:c=1:w=5000:n=ZXJyb3I=:g=key1;Icon\x1b\\"
+		"\x1b]99;i=ic:p=icon:e=1;iVBORw==\x1b\\");
+	CHECK_EQUAL(n.Reply(), "\x1b]99;i=ic:p=close;untracked\x1b\\");
+	const TermNotification& icon = n.recorder.notifications.back();
+	CHECK_EQUAL(icon.title, "Icon");
+	CHECK(icon.timeout == 5000);
+	CHECK(icon.iconNames.size() == 1 && icon.iconNames[0] == "error");
+	CHECK_EQUAL(icon.iconKey, "key1");
+	CHECK_EQUAL(icon.iconData, "\x89PNG");
+
+	// kitty's multiple cursors
+	Fixture m(20, 10);
+	m.Feed("\x1b[> q");
+	CHECK_EQUAL(m.Reply(), "\x1b[>1;2;3;29;30;40;100;101 q");
+	m.Feed("\x1b[>29;2:4:5 q");
+	CHECK(m.terminal.ExtraCursors().size() == 1);
+	m.Feed("\x1b[>100 q");
+	CHECK_EQUAL(m.Reply(), "\x1b[>100;29:2:4:5 q");
+	m.Feed("\x1b[>1;2:7:1 q\x1b[>2;2:7:3 q\x1b[>3;2:7:5;2:7:7 q");
+	CHECK(m.terminal.ExtraCursors().size() == 5);
+	m.Feed("\x1b[>0;2:7:3 q");
+	CHECK(m.terminal.ExtraCursors().size() == 4);
+	m.Feed("\x1b[>40;2:255:0:0 q\x1b[>30;5:15 q\x1b[>101 q");
+	CHECK_EQUAL(m.Reply(), "\x1b[>101;30:5:15;40:2:255:0:0 q");
+	m.Feed("\x1b[>1;4:1:1:2:3 q");		// two rows of three
+	CHECK(m.terminal.ExtraCursors().size() == 10);
+	m.Feed("\x1b[>0;4 q");				// none anywhere
+	CHECK(m.terminal.ExtraCursors().empty());
+	m.Feed("\x1b[>2;2:999:999;2:1 q");	// off the screen, half a pair
+	CHECK(m.terminal.ExtraCursors().empty());
+	m.Feed("\x1b[>1;2:1:1;0 q\x1b[2J");	// clearing takes them away
+	CHECK(m.terminal.ExtraCursors().empty());
+	m.Feed("\x1b[>1;2:1:1 q\x1b[?1049h");	// so does the other screen
+	CHECK(m.terminal.ExtraCursors().empty());
+	// not DECSCUSR, not XTVERSION
+	m.Feed("\x1b[>q");
+	CHECK(m.Reply().find("\x1bP>|") == 0);
 
 	// text sizing falls back to normal text
 	Fixture t;

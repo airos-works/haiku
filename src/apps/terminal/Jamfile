@@ -7,6 +7,7 @@ UseHeaders [ FDirName $(SUBDIR) render ] ;
 UsePrivateHeaders libroot shared system ;
 UsePrivateHeaders textencoding ;
 UseBuildFeatureHeaders zlib ;
+UseBuildFeatureHeaders freetype ;
 
 SEARCH_SOURCE += [ FDirName $(SUBDIR) emulator ] ;
 SEARCH_SOURCE += [ FDirName $(SUBDIR) render ] ;
@@ -26,13 +27,15 @@ local emulatorSources =
 
 local renderSources =
 	BoxDrawing.cpp
+	ColorEmoji.cpp
 	FrameBuilder.cpp
 	GlyphCache.cpp
 	SoftwareRenderer.cpp
 	;
 
 Includes [ FGristFiles $(emulatorSources) $(renderSources) ImageCodecs.cpp ]
-	: [ BuildFeatureAttribute zlib : headers ] ;
+	: [ BuildFeatureAttribute zlib : headers ]
+	  [ BuildFeatureAttribute freetype : headers ] ;
 
 Application Terminal :
 	ActiveProcessInfo.cpp
@@ -69,6 +72,7 @@ Application Terminal :
 
 	: be localestub shared tracker translation textencoding
 	[ BuildFeatureAttribute zlib : library ]
+	[ BuildFeatureAttribute freetype : library ]
 	[ TargetLibsupc++ ] [ TargetLibstdc++ ]
 	: Terminal.rdef XColors.rdef
 ;

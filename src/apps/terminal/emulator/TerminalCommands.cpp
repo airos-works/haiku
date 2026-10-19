@@ -27,6 +27,7 @@ static const size_t kMaxColorStackSize = 10;
 static const size_t kMaxPointerStackSize = 16;
 static const size_t kMaxHyperLinks = 65536;
 static const size_t kMaxNotificationSize = 64 * 1024;
+static const size_t kMaxNotificationIconSize = 4 * 1024 * 1024;
 static const size_t kMaxClipboardSize = 64 * 1024 * 1024;
 
 static const char* const kPointerShapes[] = {
@@ -1159,7 +1160,9 @@ Terminal::_KittyNotification(const char* metadata, const char* payload)
 	bool reportClose = false;
 	bool onlyUnfocused = false;
 	int32 urgency = -1;
+	int32 timeout = -2;
 	std::vector<std::string> iconNames;
+	std::string iconKey;
 	std::string application;
 
 	std::vector<std::string> pairs;
@@ -1220,6 +1223,12 @@ Terminal::_KittyNotification(const char* metadata, const char* payload)
 			case 'f':
 				base64_decode(value.data(), value.size(), application);
 				break;
+			case 'g':
+				iconKey = sanitize_identifier(value);
+				break;
+			case 'w':
+				timeout = std::max((int32)-1, (int32)atoi(value.c_str()));
+				break;
 		}
 	}
 
@@ -1231,10 +1240,11 @@ Terminal::_KittyNotification(const char* metadata, const char* payload)
 		return;
 
 	if (payloadType == "?") {
-		// Haiku's notifications cannot tell a program that they were
-		// clicked or closed, have no buttons and cannot be taken back
-		fOutput += "\x1b]99;i=" + replyId + ":p=?;o=always,unfocused"
-			":p=title,body,?:s=system,silent:u=0,1,2\x1b\\";
+		// Haiku's notifications cannot tell when they were closed, and have
+		// no buttons
+		fOutput += "\x1b]99;i=" + replyId + ":p=?;a=focus,report"
+			":o=always,unfocused:p=title,body,close,icon,?,alive"
+			":s=system,silent:u=0,1,2:w=1\x1b\\";
 		return;
 	}
 
@@ -1243,6 +1253,8 @@ Terminal::_KittyNotification(const char* metadata, const char* payload)
 		for (std::map<std::string, int32>::iterator it
 				= fNotificationFlags.begin();
 				it != fNotificationFlags.end(); it++) {
+			if (it->first == "0")
+				continue;
 			if (!list.empty())
 				list += ",";
 			list += it->first;
@@ -1266,30 +1278,32 @@ Terminal::_KittyNotification(const char* metadata, const char* payload)
 
 	// without an id each one is a notification of its own
 	std::string key = identifier.empty() ? std::string("\x01") : identifier;
+	if (identifier.empty())
+		fPendingNotifications.erase(key);
 	TermNotification& notification = fPendingNotifications[key];
-	if (notification.identifier.empty() && !identifier.empty()) {
-		notification.identifier = identifier;
-		notification.reportActivation = false;
-		notification.reportClose = false;
-		notification.urgency = 1;
-		notification.onlyWhenUnfocused = false;
-	} else if (identifier.empty()) {
-		notification.reportActivation = false;
-		notification.reportClose = false;
-		notification.urgency = 1;
-		notification.onlyWhenUnfocused = false;
-	}
+	notification.identifier = identifier;
 
-	if (actions >= 0)
+	if (actions >= 0) {
+		notification.focusOnActivation = (actions & 1) != 0;
 		notification.reportActivation = (actions & 2) != 0;
+	}
 	if (reportClose)
 		notification.reportClose = true;
 	if (onlyUnfocused)
 		notification.onlyWhenUnfocused = true;
 	if (urgency >= 0)
 		notification.urgency = std::min(urgency, (int32)2);
-	if (!iconNames.empty() && notification.iconName.empty())
-		notification.iconName = iconNames[0];
+	if (timeout >= -1)
+		notification.timeout = timeout;
+	notification.iconNames.insert(notification.iconNames.end(),
+		iconNames.begin(), iconNames.end());
+	if (!iconKey.empty())
+		notification.iconKey = iconKey;
+	if (payloadType == "icon" && encoded
+		&& notification.iconData.size() + text.size()
+			<= kMaxNotificationIconSize) {
+		notification.iconData += text;
+	}
 
 	if (notification.title.size() + notification.body.size()
 			< kMaxNotificationSize) {
@@ -1327,10 +1341,13 @@ Terminal::_KittyNotification(const char* metadata, const char* payload)
 	if (complete.onlyWhenUnfocused && fFocused)
 		return;
 
-	if (!complete.identifier.empty()) {
-		fNotificationFlags[complete.identifier]
-			= (complete.reportActivation ? 1 : 0)
-				| (complete.reportClose ? 2 : 0);
+	// without an id, reports say 0
+	std::string id = complete.identifier.empty() ? "0" : complete.identifier;
+	fNotificationFlags[id] = (complete.reportActivation ? 1 : 0)
+		| (complete.reportClose ? 2 : 0);
+	if (complete.reportClose) {
+		// the system does not tell when a notification was closed
+		_Reply("\x1b]99;i=%s:p=close;untracked\x1b\\", id.c_str());
 	}
 	if (fListener != NULL)
 		fListener->TerminalNotify(complete);

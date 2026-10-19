@@ -83,6 +83,16 @@ struct GlyphAtlasInfo {
 };
 
 
+//! A cursor drawn over its cells: a bar, an underline or an outline.
+struct RenderCursor {
+	int32		x;
+	int32		y;
+	int32		width;			// in cells
+	int32		shape;			// RENDER_CURSOR_*
+	uint32		color;
+};
+
+
 struct RenderMetrics {
 	int32		cellWidth;		// in frame buffer pixels
 	int32		cellHeight;
@@ -116,6 +126,9 @@ struct RenderFrame {
 	uint32		cursorTextColor;
 	uint32		cursorTextGlyph;
 	uint16		cursorTextFlags;
+
+	// kitty's extra cursors that are not blocks (those color their cells)
+	std::vector<RenderCursor> extraCursors;
 
 	std::vector<ImageDraw> images;		// relative to the top left
 	bool		imagesChanged;

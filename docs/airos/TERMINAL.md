@@ -34,7 +34,7 @@ underlines (`Smulx`, `Setulc`) and true color (`RGB`, `Tc`).
 | Graphics | `APC G ... ST` | Complete: direct, file, temporary file and shared memory transfers; PNG, RGB, RGBA, zlib; chunking; placements with z-index layers (below the background, between background and text, above text); relative placements; Unicode placeholders (U+10EEEE with diacritics); every delete mode; animation (frames, composition, gaps, loops). Images move with the text when it scrolls and when a resize rewraps it. 320 MB of images per terminal. |
 | Keyboard | `CSI = > < ? u` | Complete: all five flags (disambiguate, event types, alternate keys, all keys as escapes, associated text), separate stacks for the main and alternate screens. |
 | Styled and colored underlines | `SGR 4:0`..`4:5`, `58`, `59` | Complete: straight, double, curly, dotted, dashed, in any color. |
-| Notifications | `OSC 99` | Title, body, urgency, `o=unfocused`, ids, chunked and base64 payloads, `p=?` and `p=alive` queries, through the system's notifications. Not: reports of clicks and closes, buttons, icons. |
+| Notifications | `OSC 99` | Through the system's notifications: title, body, urgency, `o=unfocused`, ids, chunked and base64 payloads, icons by name (`n=`: kitty's error, warn, info, question, help, file-manager, system-monitor, text-editor, or an application signature) or as PNG/JPEG/GIF data (`p=icon`, kept by its `g=` key), expiry (`w=`), clicks (`a=focus` shows the tab, `a=report` tells the program), taking one back (`p=close`), the `p=?` and `p=alive` queries. Closing cannot be reported (`c=1` gets kitty's `untracked`) and there are no buttons: the system's notifications have neither. |
 | Pointer shapes | `OSC 22` | Complete, including the stack (`>` `<`) and queries. CSS names map to Haiku's cursors; the few Haiku has no cursor for fall back to the nearest one. |
 | Color control | `OSC 21`, `OSC 30001`, `OSC 30101` | Set, query and reset any palette or special color; the color stack. Not: background transparency (`transparent_background_color`). |
 | Clipboard | `OSC 5522`, mode `5522` | Reading and writing by MIME type, paste events. Reading asks the user every time. |
@@ -42,7 +42,8 @@ underlines (`Smulx`, `Setulc`) and true color (`RGB`, `Tc`).
 | Text sizing | `OSC 66` | The width part only: text takes the cells the program asks for (`w=`, `s=` times width). It is not drawn larger. |
 | Miscellaneous | `CSI ? s`/`r` without parameters, `SGR 221`/`222`, `CSI 22 J`, DECCARA/DECSACE with every SGR attribute, the mouse-leave event | Complete. |
 | Shell integration | `OSC 133` | Prompt and output marks; jumping between prompts. |
-| File transfer, remote control, drag and drop, multiple cursors | `OSC 5113`, `DCS @kitty-cmd`, `OSC 72`, `CSI > ... SP q` | Not done. |
+| Multiple cursors | `CSI > ... SP q` | Complete: block, beam, underline and follow-the-cursor shapes at points, rectangles or the cursor; their two colors (`30`, `40`, including "special"); the support, cursor and color queries. They blink with the cursor, show when DECTCEM hides it, and go with ED 2/3/22, a reset, the other screen and a resize. |
+| File transfer, remote control, drag and drop | `OSC 5113`, `DCS @kitty-cmd`, `OSC 72` | Not done. |
 
 ### Other extensions
 
@@ -76,6 +77,23 @@ and emoji tables. When the window is resized, lines that wrapped are wrapped
 again to the new width, in the history too, and the cursor and images stay
 with their text.
 
+**Emoji in color.** app_server draws glyphs in grey levels only, so
+Terminal draws emoji itself with FreeType from a color font: Noto Color
+Emoji (HaikuPorts' `noto_emoji_color`, in air/OS images), or any font file
+named `*ColorEmoji*` or `*Twemoji*` in the font directories;
+`TERMINAL_EMOJI_FONT` names a file. A cluster asking for emoji presentation
+(an emoji character, VS16, a keycap) is drawn in color, fitted into its two
+cells. Flags, skin tones, keycaps and ZWJ sequences such as families come
+from the font's ligatures (its GSUB table). Without a color font, emoji are
+drawn in one color as before. Color glyphs are faint, underlined and struck
+through like text.
+
+**Accents.** app_server places glyphs one after the other without
+positioning combining marks, which put the accent of a decomposed é past the
+e. Combining diacritics (U+0300 to U+036F and the other diacritical mark
+blocks) are centered over their character's cells instead. Marks of other
+scripts still need shaping (see the gaps).
+
 ## Drawing
 
 Everything in the view is drawn into one bitmap at the screen's pixel
@@ -103,9 +121,11 @@ series after a minute. Timing steady series matters. Timing single frames
 drawn by both renderers made the GPU look worse (it had slowed down) and the
 processor too (the read back had emptied its caches).
 
-Full-screen scrolling, both machines on master 2026-10-19:
+Full-screen scrolling, both machines on master 2026-10-19 (software on one
+thread; the software renderer now shares large frames out among up to four
+threads, row by row: 3.8 ms for the X399's 4K frame):
 
-| Machine | Frame | GPU | Software | Terminal uses |
+| Machine | Frame | GPU | Software (one thread) | Terminal uses |
 | --- | --- | --- | --- | --- |
 | X399, GTX 1070 (NVK through Zink, Mesa 22) | 3802 x 2150 | 23.5 ms | 12.4-13.4 ms | software |
 | Framework 13, Radeon 760M (radeonsi) | 2223 x 1495 | 2.8 ms | 1.8 ms | software |
@@ -147,10 +167,21 @@ New shortcuts, as in kitty:
 
 | Keys | Does |
 | --- | --- |
-| Ctrl+Shift+Z / Ctrl+Shift+X | Scroll to the previous / next shell prompt (needs OSC 133 marks from the shell) |
+| Ctrl+Shift+Z / Ctrl+Shift+X | Scroll to the previous / next shell prompt |
 | Ctrl+Shift+Up / Down | Scroll the history one line |
 
 Shift+Page Up/Down/Home/End scroll the history, as before.
+
+### Shell integration
+
+Jumping between prompts needs the shell to mark them. The haiku package
+installs `data/profile.d/airos-terminal.sh`, which the profile reads: in an
+interactive bash running in Terminal, it marks the start of each prompt, the
+command typed and its output (OSC 133 `A`, `B`, `C`, and `D` with the exit
+status), and reports the working directory (OSC 7), the way kitty's bash
+integration does. It wraps `PS1` and `PS2` before each prompt, so a profile
+that sets its own prompt keeps the marks. `AIROS_TERMINAL_INTEGRATION=0` in
+the environment turns it off.
 
 ## Links
 

@@ -102,6 +102,7 @@ Terminal::Terminal()
 	fLastColumn(0),
 	fLastValid(false),
 	fColorsGeneration(0),
+	fExtraCursorsGeneration(0),
 	fFocused(true),
 	fDarkColorScheme(false),
 	fRectangularAttributes(false),
@@ -130,6 +131,7 @@ Terminal::Terminal()
 	fModes.autoRepeat = true;
 	fModes.cursorVisible = true;
 
+	memset(fExtraCursorColors, 0, sizeof(fExtraCursorColors));
 	memset(&fCharsets, 0, sizeof(fCharsets));
 	for (int32 i = 0; i < 4; i++)
 		fCharsets.designations[i] = 'B';
@@ -1307,9 +1309,12 @@ Terminal::_AppendToPrevious(uint32 c, int width)
 	cell.character = character;
 	fLastCharacter = character;
 
-	// VS16 asks for the emoji presentation: two cells
+	// VS16 asks for the emoji presentation: two cells (also for the
+	// keycaps' digits, number sign and asterisk)
+	uint32 base = cluster[0];
 	if (c == 0xfe0f && !cell.IsWide()
-		&& unicode_is_extended_pictographic(cluster[0])) {
+		&& (unicode_is_extended_pictographic(base) || base == '#'
+			|| base == '*' || (base >= '0' && base <= '9'))) {
 		if (fLastColumn + 1 < fColumns) {
 			TerminalCell& next = _Cells(fLastRow)[fLastColumn + 1];
 			if (fCursorX == fLastColumn + 1 && !fPendingWrap) {
@@ -1940,9 +1945,11 @@ Terminal::_EraseInDisplay(int32 mode, bool selective)
 			_ClearRows(0, fRows - 1, selective);
 			if (fGraphics != NULL && !selective)
 				fGraphics->ScreenCleared();
+			_ClearExtraCursors();
 			break;
 		case 3:
 			// the history (xterm)
+			_ClearExtraCursors();
 			if (fScreen == &fMain) {
 				fHistory.Clear();
 				if (fGraphics != NULL)
@@ -1964,6 +1971,7 @@ Terminal::_EraseInDisplay(int32 mode, bool selective)
 			_ClearRows(0, fRows - 1);
 			if (fGraphics != NULL)
 				fGraphics->ScreenCleared();
+			_ClearExtraCursors();
 			break;
 		}
 	}
@@ -2081,6 +2089,8 @@ Terminal::FullReset()
 	fModes.cursorVisible = true;
 	fSavedModes.clear();
 	_SoftReset();
+	_ClearExtraCursors();
+	memset(fExtraCursorColors, 0, sizeof(fExtraCursorColors));
 
 	for (int32 i = 0; i < COLOR_COUNT; i++)
 		fColors[i] = fDefaultColors[i];
@@ -2159,6 +2169,7 @@ Terminal::_SwitchScreen(bool alternate, bool clear, bool saveCursor)
 
 	fScreen = target;
 	fLastValid = false;
+	_ClearExtraCursors();
 
 	if (alternate && clear) {
 		CellStyle style = fStyle;
@@ -2266,6 +2277,7 @@ Terminal::Resize(int32 columns, int32 rows)
 	int32 oldColumns = fColumns;
 	int32 oldRows = fRows;
 	Screen* active = fScreen;
+	_ClearExtraCursors();
 
 	// --- the main screen: logical lines, history first
 	std::vector<ReflowLine> logical;

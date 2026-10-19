@@ -140,6 +140,9 @@ public:
 			//! "software".
 			const char*			RendererName() const;
 
+			//! One of the view's notifications was clicked.
+			void				NotificationActivated(const char* identifier);
+
 protected:
 	virtual void				AttachedToWindow();
 	virtual void				DetachedFromWindow();
@@ -187,6 +190,9 @@ private:
 			};
 
 			struct Event;
+
+			BBitmap*			_NotificationIcon(
+									const TermNotification& notification);
 
 private:
 	// Terminal::Listener, called on the reader thread with the terminal
@@ -431,6 +437,8 @@ private:
 			TermPoint			fPrevPos;
 			BClipboard*			fMouseClipboard;
 			BString				fPointerShape;
+			std::map<std::string, BBitmap*> fNotificationIcons;
+									// icon data programs sent, by key
 
 			// notifications the program sent, by our id
 			std::map<std::string, std::string> fNotifications;

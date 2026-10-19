@@ -103,6 +103,10 @@ static const char* const kCellShader =
 	"uniform sampler2D uAtlas1;\n"
 	"uniform sampler2D uAtlas2;\n"
 	"uniform sampler2D uAtlas3;\n"
+	"uniform sampler2D uColor0;\n"	// color glyphs, B, G, R, A
+	"uniform sampler2D uColor1;\n"
+	"uniform sampler2D uColor2;\n"
+	"uniform sampler2D uColor3;\n"
 	"uniform int uMode;\n"
 	"uniform int uSkipDefault;\n"
 	"uniform ivec2 uCellSize;\n"
@@ -121,6 +125,12 @@ static const char* const kCellShader =
 	"	if (page == 2) return texture(uAtlas2, position).r;\n"
 	"	return texture(uAtlas3, position).r;\n"
 	"}\n"
+	"vec4 colorGlyph(int page, vec2 position) {\n"
+	"	if (page == 0) return texture(uColor0, position);\n"
+	"	if (page == 1) return texture(uColor1, position);\n"
+	"	if (page == 2) return texture(uColor2, position);\n"
+	"	return texture(uColor3, position);\n"
+	"}\n"
 	"float band(int y, int top, int height) {\n"
 	"	return (y >= top && y < top + height) ? 1.0 : 0.0;\n"
 	"}\n"
@@ -137,7 +147,9 @@ static const char* const kCellShader =
 	"		return;\n"
 	"	}\n"
 	"	float alpha = float(data.y >> 24) / 255.0;\n"
+	"	bool colored = (flags & 64u) != 0u;\n"
 	"	float text = 0.0;\n"
+	"	vec4 emoji = vec4(0.0);\n"
 	"	if (data.x != 0u) {\n"
 	"		int slot = int(data.x);\n"
 	"		int page = slot / uSlots.y;\n"
@@ -145,7 +157,9 @@ static const char* const kCellShader =
 	"		ivec2 origin = ivec2(inPage % uSlots.x, inPage / uSlots.x)\n"
 	"			* uCellSize;\n"
 	"		if ((flags & 32u) != 0u) origin.x += uCellSize.x;\n"
-	"		text = coverage(page, (vec2(origin + local) + 0.5) / uPageSize);\n"
+	"		vec2 position = (vec2(origin + local) + 0.5) / uPageSize;\n"
+	"		if (colored) emoji = colorGlyph(page, position);\n"
+	"		else text = coverage(page, position);\n"
 	"	}\n"
 	"	int x = local.x;\n"
 	"	int y = local.y;\n"
@@ -153,9 +167,18 @@ static const char* const kCellShader =
 	"	int height = uCellSize.y;\n"
 	"	int top = uMetrics.x;\n"
 	"	int thickness = uMetrics.y;\n"
-	"	if ((flags & 8u) != 0u) text = max(text, band(y, uMetrics.z, uMetrics.w));\n"
-	"	if ((flags & 16u) != 0u) text = max(text, band(y, 0, uMetrics.w));\n"
-	"	text *= alpha;\n"
+	"	float marks = 0.0;\n"	// strike through and overline
+	"	if ((flags & 8u) != 0u) marks = max(marks, band(y, uMetrics.z, uMetrics.w));\n"
+	"	if ((flags & 16u) != 0u) marks = max(marks, band(y, 0, uMetrics.w));\n"
+	"	text = max(text, marks) * alpha;\n"
+	"	vec3 glyphColor = color(data.y) * text;\n"
+	"	float glyphAlpha = text;\n"
+	"	if (colored) {\n"
+	"		emoji *= alpha;\n"
+	"		float m = marks * alpha;\n"
+	"		glyphColor = color(data.y) * m + emoji.bgr * (1.0 - m);\n"
+	"		glyphAlpha = m + emoji.a * (1.0 - m);\n"
+	"	}\n"
 	"	float line = 0.0;\n"
 	"	int style = int(flags & 7u);\n"
 	"	if (style == 1) {\n"
@@ -184,10 +207,10 @@ static const char* const kCellShader =
 	"		line = (x < dash || x >= dash * 2) ? band(y, top, thickness) : 0.0;\n"
 	"	}\n"
 	"	line *= alpha;\n"
-	"	if (uMode == 1 && text <= 0.0 && line <= 0.0) discard;\n"
+	"	if (uMode == 1 && glyphAlpha <= 0.0 && line <= 0.0) discard;\n"
 	"	vec3 premultiplied = color(data.w) * line\n"
-	"		+ color(data.y) * text * (1.0 - line);\n"
-	"	float total = line + text * (1.0 - line);\n"
+	"		+ glyphColor * (1.0 - line);\n"
+	"	float total = line + glyphAlpha * (1.0 - line);\n"
 	"	if (uMode == 2) {\n"
 	"		premultiplied += color(data.z) * (1.0 - total);\n"
 	"		total = 1.0;\n"
@@ -263,7 +286,8 @@ private:
 			void				_DrawImages(const RenderFrame& frame,
 									int32 top, int32 bottom, int32 minimumZ,
 									int32 maximumZ);
-			void				_DrawCursor(const RenderFrame& frame);
+			void				_DrawCursor(const RenderFrame& frame,
+									const RenderCursor& cursor);
 			GLuint				_ImageTexture(const ImageDraw& draw);
 
 private:
@@ -294,6 +318,7 @@ private:
 			std::vector<uint32>	fCellData;
 
 			std::vector<GLuint>	fAtlasTextures;
+			std::vector<GLuint>	fColorTextures;	// 0 for pages without
 			int32				fAtlasPageSize;
 
 			std::map<const ImageFrame*, ImageTexture> fImages;
@@ -332,6 +357,10 @@ GLRenderer::~GLRenderer()
 		glDeleteTextures(1, &fCells);
 		if (!fAtlasTextures.empty()) {
 			glDeleteTextures(fAtlasTextures.size(), fAtlasTextures.data());
+		}
+		for (size_t i = 0; i < fColorTextures.size(); i++) {
+			if (fColorTextures[i] != 0)
+				glDeleteTextures(1, &fColorTextures[i]);
 		}
 		for (std::map<const ImageFrame*, ImageTexture>::iterator it
 				= fImages.begin(); it != fImages.end(); it++) {
@@ -404,6 +433,11 @@ GLRenderer::Init(const char** error)
 	p_glUniform1i(p_glGetUniformLocation(program, "uAtlas1"), 2);
 	p_glUniform1i(p_glGetUniformLocation(program, "uAtlas2"), 3);
 	p_glUniform1i(p_glGetUniformLocation(program, "uAtlas3"), 4);
+	for (int32 i = 0; i < 4; i++) {
+		char name[16];
+		snprintf(name, sizeof(name), "uColor%d", (int)i);
+		p_glUniform1i(p_glGetUniformLocation(program, name), 6 + i);
+	}
 	fCellMode = p_glGetUniformLocation(program, "uMode");
 	fCellSkipDefault = p_glGetUniformLocation(program, "uSkipDefault");
 	fCellCellSize = p_glGetUniformLocation(program, "uCellSize");
@@ -537,6 +571,11 @@ GLRenderer::_UploadAtlas(const GlyphAtlasInfo& atlas)
 	if (recreate && !fAtlasTextures.empty()) {
 		glDeleteTextures(fAtlasTextures.size(), fAtlasTextures.data());
 		fAtlasTextures.clear();
+		for (size_t i = 0; i < fColorTextures.size(); i++) {
+			if (fColorTextures[i] != 0)
+				glDeleteTextures(1, &fColorTextures[i]);
+		}
+		fColorTextures.clear();
 	}
 	fAtlasPageSize = atlas.pageSize;
 
@@ -565,12 +604,43 @@ GLRenderer::_UploadAtlas(const GlyphAtlasInfo& atlas)
 				dirty.bottom - dirty.top, GL_RED, GL_UNSIGNED_BYTE,
 				atlas.pages[page] + (size_t)dirty.top * atlas.pageSize);
 		}
+
+		// the color glyphs of the page, B, G, R, A as the frame buffer
+		if (fColorTextures.size() <= (size_t)page)
+			fColorTextures.resize(page + 1, 0);
+		const uint32* colorPage = atlas.colorPages != NULL
+			? atlas.colorPages[page] : NULL;
+		if (colorPage != NULL && fColorTextures[page] == 0) {
+			glGenTextures(1, &fColorTextures[page]);
+			glBindTexture(GL_TEXTURE_2D, fColorTextures[page]);
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, atlas.pageSize,
+				atlas.pageSize, 0, GL_RGBA, GL_UNSIGNED_BYTE, colorPage);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+				GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+				GL_CLAMP_TO_EDGE);
+		} else if (colorPage != NULL && dirty.top < dirty.bottom) {
+			glBindTexture(GL_TEXTURE_2D, fColorTextures[page]);
+			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, dirty.top, atlas.pageSize,
+				dirty.bottom - dirty.top, GL_RGBA, GL_UNSIGNED_BYTE,
+				colorPage + (size_t)dirty.top * atlas.pageSize);
+		}
 		dirty.top = dirty.bottom = 0;
 	}
 
 	for (size_t i = 0; i < fAtlasTextures.size() && i < 4; i++) {
 		p_glActiveTexture(GL_TEXTURE1 + i);
 		glBindTexture(GL_TEXTURE_2D, fAtlasTextures[i]);
+	}
+	for (size_t i = 0; i < 4; i++) {
+		// pages without color glyphs have none
+		GLuint texture = i < fColorTextures.size() ? fColorTextures[i] : 0;
+		if (texture == 0 && !fAtlasTextures.empty())
+			texture = fAtlasTextures[0];
+		p_glActiveTexture(GL_TEXTURE6 + i);
+		glBindTexture(GL_TEXTURE_2D, texture);
 	}
 	p_glActiveTexture(GL_TEXTURE0);
 }
@@ -725,23 +795,23 @@ GLRenderer::_DrawImages(const RenderFrame& frame, int32 top, int32 bottom,
 
 
 void
-GLRenderer::_DrawCursor(const RenderFrame& frame)
+GLRenderer::_DrawCursor(const RenderFrame& frame, const RenderCursor& cursor)
 {
-	if (frame.cursorShape == RENDER_CURSOR_NONE
-		|| frame.cursorShape == RENDER_CURSOR_BLOCK) {
+	if (cursor.shape == RENDER_CURSOR_NONE
+		|| cursor.shape == RENDER_CURSOR_BLOCK) {
 		return;
 	}
 
 	const RenderMetrics& metrics = frame.metrics;
-	float left = frame.cursorX * metrics.cellWidth;
-	float top = frame.cursorY * metrics.cellHeight;
-	float width = metrics.cellWidth * frame.cursorWidth;
+	float left = cursor.x * metrics.cellWidth;
+	float top = cursor.y * metrics.cellHeight;
+	float width = metrics.cellWidth * cursor.width;
 	float height = metrics.cellHeight;
 	float thickness = std::max((int32)2, metrics.lineThickness * 2);
 	float line = metrics.lineThickness;
-	uint32 color = frame.cursorColor;
+	uint32 color = cursor.color;
 
-	switch (frame.cursorShape) {
+	switch (cursor.shape) {
 		case RENDER_CURSOR_UNDERLINE:
 			_FillRect(left, top + height - thickness, width, thickness,
 				color);
@@ -850,7 +920,14 @@ GLRenderer::Render(const RenderFrame& frame, const GlyphAtlasInfo& atlas,
 
 		if (frame.cursorY >= bands[i].first
 			&& frame.cursorY <= bands[i].second) {
-			_DrawCursor(frame);
+			RenderCursor cursor = { frame.cursorX, frame.cursorY,
+				frame.cursorWidth, frame.cursorShape, frame.cursorColor };
+			_DrawCursor(frame, cursor);
+		}
+		for (size_t j = 0; j < frame.extraCursors.size(); j++) {
+			const RenderCursor& cursor = frame.extraCursors[j];
+			if (cursor.y >= bands[i].first && cursor.y <= bands[i].second)
+				_DrawCursor(frame, cursor);
 		}
 	}
 	glDisable(GL_SCISSOR_TEST);

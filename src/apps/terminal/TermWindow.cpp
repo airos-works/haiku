@@ -1039,6 +1039,37 @@ TermWindow::MessageReceived(BMessage *message)
 			_CheckChildren();
 			break;
 
+		case MSG_NOTIFICATION_ACTIVATED:
+		{
+			// one of our notifications was clicked: show its tab, tell the
+			// program
+			const char* view;
+			const char* identifier;
+			int32 actions;
+			if (message->FindString("view", &view) != B_OK
+				|| message->FindString("id", &identifier) != B_OK
+				|| message->FindInt32("actions", &actions) != B_OK) {
+				break;
+			}
+			for (int32 i = 0; i < fSessions.CountItems(); i++) {
+				TermView* termView = _TermViewAt(i);
+				BString key;
+				key.SetToFormat("%p", termView);
+				if (key != view)
+					continue;
+				if ((actions & 1) != 0) {
+					if (IsMinimized())
+						Minimize(false);
+					Activate();
+					fTabView->Select(i);
+				}
+				if ((actions & 2) != 0)
+					termView->NotificationActivated(identifier);
+				break;
+			}
+			break;
+		}
+
 		case MSG_MOVE_TAB_LEFT:
 		case MSG_MOVE_TAB_RIGHT:
 			_NavigateTab(_IndexOfTermView(_ActiveTermView()),

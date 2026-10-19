@@ -18,10 +18,10 @@ only), grapheme clusters, reflow, GPU drawing.
 
 | # | What | Effort | Why first |
 | --- | --- | --- | --- |
-| 1 | Shell integration for bash, on by default | S | Prompt jumps (Ctrl+Shift+Z/X) already work, but only for a shell that marks its prompts, and air/OS's bash does not. A profile snippet that emits OSC 133 and OSC 7 when `TERM_PROGRAM=airos-terminal` makes them work, and lets kitty-style features below build on it. |
-| 2 | Color emoji | M | The most visible difference from kitty: emoji are drawn as monochrome outlines today. Prompts, `git` tools and Claude Code use them. |
-| 3 | Faster full-screen drawing | S-M, then L | Because of reading back, the GPU path loses to software on both test machines (X399 with NVIDIA, Framework 13 with AMD), so Terminal draws in software there today. A multi-threaded software renderer (S-M) gives ~3x on full frames. Drawing straight into the screen without the read back (L) is what makes the GPU worth it. |
-| 4 | Notification clicks, icons, expiry | S-M | Lets `kitten notify`-style tools and long-running jobs bring you back to the right tab. |
+| 1 | ~~Shell integration for bash~~ | done | `data/profile.d/airos-terminal.sh` marks prompts (OSC 133) and reports the directory (OSC 7); prompt jumps work out of the box. |
+| 2 | ~~Color emoji~~ | done | Drawn with FreeType from Noto Color Emoji (`noto_emoji_color`, added to the CI images), sequences through the font's GSUB ligatures. |
+| 3 | Faster full-screen drawing | ~~S-M~~ done, then L | Because of reading back, the GPU path loses to software on both test machines (X399 with NVIDIA, Framework 13 with AMD), so Terminal draws in software there today. The software renderer now uses up to four threads (4K frame 13 ms to 3.8 ms on the X399). Drawing straight into the screen without the read back (L) is what would make the GPU worth it. |
+| 4 | ~~Notification clicks, icons, expiry~~ | done | A click shows the tab and reports to the program; icons by name or data; `w=`; `p=close`. |
 | 5 | Ligatures | M-L | Wanted by users of coding fonts (Fira Code, JetBrains Mono). |
 
 ## Protocols
@@ -32,19 +32,18 @@ kitty ships scripts for bash, zsh and fish that mark prompts and commands
 at the prompt to move the cursor there (`click_events`), redraw the prompt
 on resize (`redraw=0`), warn before closing a tab that runs a command
 (`cmdline`), open the last command's output in a pager, select it.
-Terminal reads the marks and jumps between prompts. Missing: the scripts
-(S: a `profile.d` snippet for bash) and the features on top (M).
+Terminal reads the marks and jumps between prompts, and air/OS's bash marks
+them (`data/profile.d/airos-terminal.sh`). Missing: the features on top (M),
+and scripts for zsh and fish (not in the image).
 
-### Notifications (OSC 99) — S to M, partly blocked
-Missing: telling the program that a notification was clicked (`a=report`)
-or closed (`c=1`), buttons (`p=buttons`), icons (`p=icon`, `n=`, `g=`),
-sounds other than the system's, expiry (`w=`).
-- Icons and expiry: S. `BNotification::SetIcon()` and `Send(timeout)`.
-- Clicks: M. `BNotification::SetOnClickApp()` with arguments relaunches
-  Terminal on a click; the new instance has to hand the click to the window
-  that sent the notification, then quit.
-- Close reports and buttons: blocked. notification_server has no buttons and
-  does not report closing; that would need changes there.
+### Notifications (OSC 99) — mostly done; the rest needs notification_server
+Clicks (`a=focus`, `a=report`), icons (`n=`, `p=icon`, `g=`), expiry (`w=`)
+and `p=close` work: a click starts Terminal with the team and view that
+sent the notification, which passes it on and quits. Missing: reports of
+a notification being closed (`c=1`, answered `untracked` as kitty specifies
+for such systems), buttons (`p=buttons`), sounds other than the system's.
+notification_server has no buttons and does not say when one closes; both
+need changes there (M).
 
 ### Text sizing (OSC 66) — L
 kitty draws text 2 to 7 times larger (headings in terminal programs), and
@@ -52,9 +51,8 @@ fractional sizes with alignment. Terminal reserves the cells but draws the
 text at normal size. It touches the cell model, every editing operation,
 history, reflow and both renderers. Few programs use it yet.
 
-### Multiple cursors (`CSI > ... SP q`) — S to M
-Extra cursors drawn by the terminal, for editors with multiple selections.
-Very new; few editors send it.
+### Multiple cursors (`CSI > ... SP q`) — done
+All of it, drawn by both renderers.
 
 ### Remote control (`DCS @kitty-cmd`) — M for a useful subset
 Scripting kitty from programs running in it (`kitten @ launch`, `send-text`,
@@ -82,13 +80,11 @@ approved once. Terminal asks every time.
 
 ## Drawing
 
-### Color emoji — M
-app_server draws glyphs in grey levels only (no color bitmaps or color
-layers). Terminal would rasterize emoji itself with FreeType (in the system)
-from a color font. The emoji font in the image, Noto Emoji, is the
-monochrome one; Noto Color Emoji (about 10 MB) would have to be added. The
-atlas already has room for color pages (`GlyphAtlasInfo::colorPages`); both
-renderers need to draw them.
+### Color emoji — done
+Terminal draws them with FreeType from Noto Color Emoji's bitmaps (CBDT) or
+a font's COLRv0 layers. Not done: COLRv1 fonts (FreeType's paint API), and
+emoji newer than the font (Unicode 15.1 for Noto Color Emoji 2.042), which
+fall back to their first component or to the monochrome font.
 
 ### Ligatures — M to L
 Shaping runs of text with HarfBuzz (a package other applications already
@@ -107,10 +103,9 @@ still: 3.2 ms on the 760M, 175 ms with Zink.) Presenting the GPU's image
 directly needs a scanout or shared buffer path per driver (amdgpu has one,
 used by Summit; NVK has none).
 
-### Multi-threaded software drawing — S to M
-Not a kitty feature, but the cheapest way to faster full-screen redraws: rows
-can be drawn in bands on several cores (13 ms for a 4K frame on the X399
-now; an estimated 4 ms with four).
+### Multi-threaded software drawing — done
+Large frames are shared out row by row among up to four threads: a 4K frame
+on the X399 went from 13 ms to 3.8 ms.
 
 ### Font options — S each
 kitty's `symbol_map` (a font per Unicode range), `narrow_symbols`,

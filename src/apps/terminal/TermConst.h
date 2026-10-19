@@ -91,6 +91,12 @@ static const uint32 MSG_MOVE_TAB_RIGHT					= 'mvtr';
 static const uint32 MSG_SWITCH_TAB_LEFT					= 'swtl';
 static const uint32 MSG_SWITCH_TAB_RIGHT				= 'swtr';
 static const uint32 MSG_ACTIVATE_TERM					= 'msat';
+static const uint32 MSG_NOTIFICATION_ACTIVATED			= 'ntac';
+
+// A click on a notification starts Terminal with this argument, the team and
+// the view that sent it, the notification's id and what to do (bit 0: show
+// the tab, bit 1: tell the program).
+#define NOTIFICATION_ACTIVATED_ARGUMENT "--notification-activated"
 static const uint32 MSG_SET_CURSOR_STYLE				= 'mscs';
 static const uint32 MSG_GET_TERMINAL_COLOR				= 'getc';
 static const uint32 MSG_SET_TERMINAL_CLIPBOARD			= 'setb';
