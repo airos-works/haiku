@@ -6,18 +6,49 @@
 #define SOFTWARE_RENDERER_H
 
 
+#include <OS.h>
+
+#include <atomic>
+#include <vector>
+
 #include "TermRenderer.h"
 
 
-//! Draws frames with the processor, where there is no OpenGL.
+/*!	Draws frames with the processor. A large frame (scrolling) is shared
+	out row by row among a few threads.
+*/
 class SoftwareRenderer : public TermRenderer {
 public:
+								SoftwareRenderer();
+	virtual						~SoftwareRenderer();
+
 	virtual	const char*			Name() const	{ return "software"; }
 
 	virtual	bool				Render(const RenderFrame& frame,
 									const GlyphAtlasInfo& atlas,
 									uint8* bits, int32 bytesPerRow,
 									int32& _firstRow, int32& _lastRow);
+
+private:
+	static	const int64			kShareMinimum = 512 * 1024;	// pixels
+	static	const int32			kRowsAtOnce = 2;
+
+			void				_DrawRows();
+	static	status_t			_HelperEntry(void* data);
+
+private:
+			std::vector<thread_id> fHelpers;
+			sem_id				fStart;
+			sem_id				fDone;
+			bool				fQuit;
+
+			// the frame being drawn
+			const RenderFrame*	fFrame;
+			const GlyphAtlasInfo* fAtlas;
+			uint32*				fBits;
+			int32				fPixelsPerRow;
+			std::vector<int32>	fRows;
+			std::atomic<int32>	fNextRow;
 };
 
 

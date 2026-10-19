@@ -120,9 +120,11 @@ series after a minute. Timing steady series matters. Timing single frames
 drawn by both renderers made the GPU look worse (it had slowed down) and the
 processor too (the read back had emptied its caches).
 
-Full-screen scrolling, both machines on master 2026-10-19:
+Full-screen scrolling, both machines on master 2026-10-19 (software on one
+thread; the software renderer now shares large frames out among up to four
+threads, row by row: 3.8 ms for the X399's 4K frame):
 
-| Machine | Frame | GPU | Software | Terminal uses |
+| Machine | Frame | GPU | Software (one thread) | Terminal uses |
 | --- | --- | --- | --- | --- |
 | X399, GTX 1070 (NVK through Zink, Mesa 22) | 3802 x 2150 | 23.5 ms | 12.4-13.4 ms | software |
 | Framework 13, Radeon 760M (radeonsi) | 2223 x 1495 | 2.8 ms | 1.8 ms | software |

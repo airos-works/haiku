@@ -20,7 +20,7 @@ only), grapheme clusters, reflow, GPU drawing.
 | --- | --- | --- | --- |
 | 1 | ~~Shell integration for bash~~ | done | `data/profile.d/airos-terminal.sh` marks prompts (OSC 133) and reports the directory (OSC 7); prompt jumps work out of the box. |
 | 2 | ~~Color emoji~~ | done | Drawn with FreeType from Noto Color Emoji (`noto_emoji_color`, added to the CI images), sequences through the font's GSUB ligatures. |
-| 3 | Faster full-screen drawing | S-M, then L | Because of reading back, the GPU path loses to software on both test machines (X399 with NVIDIA, Framework 13 with AMD), so Terminal draws in software there today. A multi-threaded software renderer (S-M) gives ~3x on full frames. Drawing straight into the screen without the read back (L) is what makes the GPU worth it. |
+| 3 | Faster full-screen drawing | ~~S-M~~ done, then L | Because of reading back, the GPU path loses to software on both test machines (X399 with NVIDIA, Framework 13 with AMD), so Terminal draws in software there today. The software renderer now uses up to four threads (4K frame 13 ms to 3.8 ms on the X399). Drawing straight into the screen without the read back (L) is what would make the GPU worth it. |
 | 4 | ~~Notification clicks, icons, expiry~~ | done | A click shows the tab and reports to the program; icons by name or data; `w=`; `p=close`. |
 | 5 | Ligatures | M-L | Wanted by users of coding fonts (Fira Code, JetBrains Mono). |
 
@@ -104,10 +104,9 @@ still: 3.2 ms on the 760M, 175 ms with Zink.) Presenting the GPU's image
 directly needs a scanout or shared buffer path per driver (amdgpu has one,
 used by Summit; NVK has none).
 
-### Multi-threaded software drawing — S to M
-Not a kitty feature, but the cheapest way to faster full-screen redraws: rows
-can be drawn in bands on several cores (13 ms for a 4K frame on the X399
-now; an estimated 4 ms with four).
+### Multi-threaded software drawing — done
+Large frames are shared out row by row among up to four threads: a 4K frame
+on the X399 went from 13 ms to 3.8 ms.
 
 ### Font options — S each
 kitty's `symbol_map` (a font per Unicode range), `narrow_symbols`,
