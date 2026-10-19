@@ -62,6 +62,9 @@ private:
 			uint64				_RowSignature(const FrameState& state,
 									int32 terminalRow, uint64 version,
 									Terminal* terminal) const;
+			void				_AddExtraCursors(Terminal* terminal,
+									const FrameState& state,
+									RenderFrame& frame);
 
 private:
 			GlyphCache*			fGlyphs;
@@ -73,6 +76,7 @@ private:
 			int32				fHeight;
 			uint32				fGlyphEpoch;
 			uint32				fColorsGeneration;
+			uint32				fExtraCursorsGeneration;
 			uint64				fGraphicsGeneration;
 			int32				fFirstRow;
 			bool				fHadImages;

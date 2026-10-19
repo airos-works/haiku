@@ -814,6 +814,34 @@ TestOperatingSystemCommands()
 	CHECK_EQUAL(icon.iconKey, "key1");
 	CHECK_EQUAL(icon.iconData, "\x89PNG");
 
+	// kitty's multiple cursors
+	Fixture m(20, 10);
+	m.Feed("\x1b[> q");
+	CHECK_EQUAL(m.Reply(), "\x1b[>1;2;3;29;30;40;100;101 q");
+	m.Feed("\x1b[>29;2:4:5 q");
+	CHECK(m.terminal.ExtraCursors().size() == 1);
+	m.Feed("\x1b[>100 q");
+	CHECK_EQUAL(m.Reply(), "\x1b[>100;29:2:4:5 q");
+	m.Feed("\x1b[>1;2:7:1 q\x1b[>2;2:7:3 q\x1b[>3;2:7:5;2:7:7 q");
+	CHECK(m.terminal.ExtraCursors().size() == 5);
+	m.Feed("\x1b[>0;2:7:3 q");
+	CHECK(m.terminal.ExtraCursors().size() == 4);
+	m.Feed("\x1b[>40;2:255:0:0 q\x1b[>30;5:15 q\x1b[>101 q");
+	CHECK_EQUAL(m.Reply(), "\x1b[>101;30:5:15;40:2:255:0:0 q");
+	m.Feed("\x1b[>1;4:1:1:2:3 q");		// two rows of three
+	CHECK(m.terminal.ExtraCursors().size() == 10);
+	m.Feed("\x1b[>0;4 q");				// none anywhere
+	CHECK(m.terminal.ExtraCursors().empty());
+	m.Feed("\x1b[>2;2:999:999;2:1 q");	// off the screen, half a pair
+	CHECK(m.terminal.ExtraCursors().empty());
+	m.Feed("\x1b[>1;2:1:1;0 q\x1b[2J");	// clearing takes them away
+	CHECK(m.terminal.ExtraCursors().empty());
+	m.Feed("\x1b[>1;2:1:1 q\x1b[?1049h");	// so does the other screen
+	CHECK(m.terminal.ExtraCursors().empty());
+	// not DECSCUSR, not XTVERSION
+	m.Feed("\x1b[>q");
+	CHECK(m.Reply().find("\x1bP>|") == 0);
+
 	// text sizing falls back to normal text
 	Fixture t;
 	t.Feed("\x1b]66;s=2;Hi\x1b\\!");

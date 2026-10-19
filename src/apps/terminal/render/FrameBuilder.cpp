@@ -33,6 +33,7 @@ FrameBuilder::FrameBuilder(GlyphCache* glyphs)
 	fHeight(0),
 	fGlyphEpoch(0),
 	fColorsGeneration(0),
+	fExtraCursorsGeneration(0),
 	fGraphicsGeneration(0),
 	fFirstRow(0),
 	fHadImages(false),
@@ -83,7 +84,8 @@ FrameBuilder::Build(Terminal* terminal, const FrameState& state, int32 width,
 	bool all = fForceAll || columns != fColumns || rows != fRows
 		|| width != fWidth || height != fHeight
 		|| fGlyphEpoch != fGlyphs->Epoch()
-		|| fColorsGeneration != terminal->ColorsGeneration();
+		|| fColorsGeneration != terminal->ColorsGeneration()
+		|| fExtraCursorsGeneration != terminal->ExtraCursorsGeneration();
 	fForceAll = false;
 
 	if (columns != fColumns || rows != fRows) {
@@ -96,6 +98,17 @@ FrameBuilder::Build(Terminal* terminal, const FrameState& state, int32 width,
 	fHeight = height;
 	fGlyphEpoch = fGlyphs->Epoch();
 	fColorsGeneration = terminal->ColorsGeneration();
+	fExtraCursorsGeneration = terminal->ExtraCursorsGeneration();
+
+	// rows with extra cursors blink with the cursor
+	std::vector<bool> extraCursorRows(rows, false);
+	const std::map<uint32, uint8>& extraCursors = terminal->ExtraCursors();
+	for (std::map<uint32, uint8>::const_iterator it = extraCursors.begin();
+			it != extraCursors.end(); it++) {
+		int32 row = (int32)(it->first >> 16) - state.firstRow;
+		if (row >= 0 && row < rows)
+			extraCursorRows[row] = true;
+	}
 
 	frame.columns = columns;
 	frame.rows = rows;
@@ -149,6 +162,11 @@ FrameBuilder::Build(Terminal* terminal, const FrameState& state, int32 width,
 
 		uint64 signature = _RowSignature(state, terminalRow, version,
 			terminal);
+		if (extraCursorRows[row]) {
+			signature = mix(signature, state.cursorVisible ? 0x51 : 0x52);
+			signature = mix(signature, state.focused ? 0x53 : 0x54);
+			signature = mix(signature, state.cursorColor);
+		}
 		if (!all && signature == fRowSignatures[row])
 			continue;
 		fRowSignatures[row] = signature;
@@ -223,6 +241,96 @@ FrameBuilder::Build(Terminal* terminal, const FrameState& state, int32 width,
 				cell.flags &= ~RENDER_DEFAULT_BACKGROUND;
 			}
 		}
+	}
+
+	_AddExtraCursors(terminal, state, frame);
+}
+
+
+static uint32
+resolve_extra_cursor_color(Terminal* terminal, const ExtraCursorColor& color,
+	uint32 unset)
+{
+	switch (color.space) {
+		case 2:
+			return color.value;
+		case 5:
+			return terminal->ResolveColor(palette_color(color.value), true);
+		default:
+			return unset;
+	}
+}
+
+
+/*!	kitty's extra cursors, on screen cells: they blink with the cursor and
+	take its colors unless told otherwise, but DECTCEM does not hide them.
+	Block cursors color their cells (only rows built anew are changed), the
+	others are drawn over them.
+*/
+void
+FrameBuilder::_AddExtraCursors(Terminal* terminal, const FrameState& state,
+	RenderFrame& frame)
+{
+	frame.extraCursors.clear();
+	const std::map<uint32, uint8>& extraCursors = terminal->ExtraCursors();
+	if (extraCursors.empty() || !state.cursorVisible)
+		return;
+
+	const ExtraCursorColor& textColor = terminal->ExtraCursorColors(0);
+	const ExtraCursorColor& cursorColor = terminal->ExtraCursorColors(1);
+	int32 mainShape = terminal->Cursor().shape;
+
+	for (std::map<uint32, uint8>::const_iterator it = extraCursors.begin();
+			it != extraCursors.end(); it++) {
+		int32 x = it->first & 0xffff;
+		int32 row = (int32)(it->first >> 16) - state.firstRow;
+		if (row < 0 || row >= frame.rows || x >= frame.columns)
+			continue;
+
+		int32 shape = it->second;
+		if (shape == EXTRA_CURSOR_FOLLOW_MAIN) {
+			shape = mainShape == CURSOR_SHAPE_UNDERLINE ? EXTRA_CURSOR_UNDERLINE
+				: mainShape == CURSOR_SHAPE_BEAM ? EXTRA_CURSOR_BEAM
+				: EXTRA_CURSOR_BLOCK;
+		}
+		int32 width = x + 1 < frame.columns
+			&& (frame.Cell(row, x + 1).flags & RENDER_GLYPH_RIGHT_HALF) != 0
+			? 2 : 1;
+		RenderCell& cell = frame.Cell(row, x);
+
+		// "special" is reverse video: for the cursor the cell's text
+		// color, for the text the cell's background
+		uint32 color = cursorColor.space == 1 ? cell.foreground
+			: resolve_extra_cursor_color(terminal, cursorColor,
+				state.cursorColor);
+		uint32 text = cursorColor.space == 1 || textColor.space == 1
+			? cell.background
+			: resolve_extra_cursor_color(terminal, textColor,
+				state.cursorTextColor);
+
+		if (shape == EXTRA_CURSOR_BLOCK && state.focused) {
+			if (!frame.allDirty && !frame.dirtyRows[row])
+				continue;
+			for (int32 i = 0; i < width; i++) {
+				RenderCell& covered = frame.Cell(row, x + i);
+				covered.background = color;
+				covered.foreground = text;
+				covered.decoration = text;
+				covered.foregroundAlpha = 255;
+				covered.flags &= ~RENDER_DEFAULT_BACKGROUND;
+			}
+			continue;
+		}
+
+		RenderCursor cursor;
+		cursor.x = x;
+		cursor.y = row;
+		cursor.width = width;
+		cursor.shape = shape == EXTRA_CURSOR_BLOCK ? RENDER_CURSOR_HOLLOW
+			: shape == EXTRA_CURSOR_BEAM ? RENDER_CURSOR_BEAM
+			: RENDER_CURSOR_UNDERLINE;
+		cursor.color = color;
+		frame.extraCursors.push_back(cursor);
 	}
 }
 

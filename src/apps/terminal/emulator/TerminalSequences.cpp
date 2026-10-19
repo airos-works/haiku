@@ -428,6 +428,12 @@ Terminal::CsiDispatch(const VTSequence& sequence)
 		return;
 	}
 
+	if (s.marker == '>' && s.intermediateCount == 1
+		&& s.intermediates[0] == ' ' && s.final == 'q') {
+		_MultipleCursors(s);	// kitty's multiple cursors
+		return;
+	}
+
 	if (s.marker == '>') {
 		if (s.intermediateCount == 0) {
 			switch (s.final) {
@@ -1713,4 +1719,171 @@ Terminal::ApcDispatch(const char* data, size_t length)
 {
 	if (length > 0 && data[0] == 'G' && fGraphics != NULL)
 		fGraphics->HandleCommand(data + 1, length - 1);
+}
+
+
+// #pragma mark - multiple cursors
+
+
+static void
+append_extra_cursor_color(std::string& reply, const ExtraCursorColor& color)
+{
+	char buffer[32];
+	switch (color.space) {
+		case 2:
+			snprintf(buffer, sizeof(buffer), "2:%u:%u:%u",
+				(unsigned)((color.value >> 16) & 0xff),
+				(unsigned)((color.value >> 8) & 0xff),
+				(unsigned)(color.value & 0xff));
+			break;
+		case 5:
+			snprintf(buffer, sizeof(buffer), "5:%u", (unsigned)color.value);
+			break;
+		default:
+			snprintf(buffer, sizeof(buffer), "%d", (int)color.space);
+			break;
+	}
+	reply += buffer;
+}
+
+
+/*!	kitty's multiple cursors: CSI > shape ; type : coordinates ... SP q
+	puts extra cursors on cells (type 0: the cursor's, 2: y:x pairs, 4:
+	top:left:bottom:right rectangles, none for the whole screen); shapes 30
+	and 40 set their colors, 100 and 101 ask for them.
+*/
+void
+Terminal::_MultipleCursors(const VTSequence& s)
+{
+	if (s.parameterCount == 0) {
+		_Reply("\x1b[>1;2;3;29;30;40;100;101 q");
+		return;
+	}
+
+	int32 shape = s.Parameter(0, 0);
+	switch (shape) {
+		case 100:
+		{
+			std::string reply = "\x1b[>100";
+			for (std::map<uint32, uint8>::const_iterator it
+					= fExtraCursors.begin(); it != fExtraCursors.end(); it++) {
+				char buffer[48];
+				snprintf(buffer, sizeof(buffer), ";%d:2:%d:%d",
+					(int)it->second, (int)(it->first >> 16) + 1,
+					(int)(it->first & 0xffff) + 1);
+				reply += buffer;
+			}
+			reply += " q";
+			fOutput += reply;
+			return;
+		}
+		case 101:
+		{
+			std::string reply = "\x1b[>101;30:";
+			append_extra_cursor_color(reply, fExtraCursorColors[0]);
+			reply += ";40:";
+			append_extra_cursor_color(reply, fExtraCursorColors[1]);
+			reply += " q";
+			fOutput += reply;
+			return;
+		}
+		case 30:
+		case 40:
+		{
+			ExtraCursorColor& color = fExtraCursorColors[shape == 30 ? 0 : 1];
+			int32 space = s.Parameter(1, -1);
+			int32 count = s.SubParameterCount(1);
+			if (space == 0 || space == 1) {
+				color.space = space;
+				color.value = 0;
+			} else if (space == 2 && count >= 3) {
+				color.space = 2;
+				color.value = ((s.Parameter(2, 0) & 0xff) << 16)
+					| ((s.Parameter(3, 0) & 0xff) << 8)
+					| (s.Parameter(4, 0) & 0xff);
+			} else if (space == 5 && count >= 1) {
+				color.space = 5;
+				color.value = s.Parameter(2, 0) & 0xff;
+			} else
+				return;
+			fExtraCursorsGeneration++;
+			_Changed();
+			return;
+		}
+		case 0:
+		case EXTRA_CURSOR_BLOCK:
+		case EXTRA_CURSOR_BEAM:
+		case EXTRA_CURSOR_UNDERLINE:
+		case EXTRA_CURSOR_FOLLOW_MAIN:
+			break;
+		default:
+			return;
+	}
+
+	for (int32 i = 1; i < s.parameterCount; i++) {
+		if (s.IsSubParameter(i))
+			continue;
+		int32 type = s.Parameter(i, 0);
+		int32 count = s.SubParameterCount(i);
+		int32 first = i + 1;
+		if (type == 0)
+			_SetExtraCursor(fCursorX, fCursorY, shape);
+		else if (type == 2) {
+			for (int32 j = 0; j + 1 < count; j += 2) {
+				_SetExtraCursor(s.Parameter(first + j + 1, 0) - 1,
+					s.Parameter(first + j, 0) - 1, shape);
+			}
+		} else if (type == 4) {
+			if (count == 0) {
+				// the whole screen
+				if (shape == 0)
+					fExtraCursors.clear();
+				else {
+					for (int32 y = 0; y < fRows; y++) {
+						for (int32 x = 0; x < fColumns; x++)
+							_SetExtraCursor(x, y, shape);
+					}
+				}
+			}
+			for (int32 j = 0; j + 3 < count; j += 4) {
+				int32 top = std::max(0, s.Parameter(first + j, 0) - 1);
+				int32 left = std::max(0, s.Parameter(first + j + 1, 0) - 1);
+				int32 bottom = std::min(fRows - 1,
+					s.Parameter(first + j + 2, 0) - 1);
+				int32 right = std::min(fColumns - 1,
+					s.Parameter(first + j + 3, 0) - 1);
+				for (int32 y = top; y <= bottom; y++) {
+					for (int32 x = left; x <= right; x++)
+						_SetExtraCursor(x, y, shape);
+				}
+			}
+		}
+	}
+	fExtraCursorsGeneration++;
+	_Changed();
+}
+
+
+void
+Terminal::_SetExtraCursor(int32 x, int32 y, int32 shape)
+{
+	if (x < 0 || y < 0 || x >= fColumns || y >= fRows)
+		return;
+	uint32 key = ((uint32)y << 16) | (uint32)x;
+	if (shape == 0)
+		fExtraCursors.erase(key);
+	else
+		fExtraCursors[key] = shape;
+}
+
+
+//!	Clearing the screen, a reset or the other screen takes them away.
+void
+Terminal::_ClearExtraCursors()
+{
+	if (fExtraCursors.empty())
+		return;
+	fExtraCursors.clear();
+	fExtraCursorsGeneration++;
+	_Changed();
 }

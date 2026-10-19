@@ -192,24 +192,26 @@ render_decorations(const RenderFrame& frame, const RenderCell& cell,
 }
 
 
+//!	A cursor that leaves its cell's colors alone: bar, underline, outline.
 void
-render_cursor(const RenderFrame& frame, uint32* bits, int32 pixelsPerRow)
+render_cursor(const RenderFrame& frame, const RenderCursor& cursor,
+	uint32* bits, int32 pixelsPerRow)
 {
-	if (frame.cursorShape == RENDER_CURSOR_NONE
-		|| frame.cursorShape == RENDER_CURSOR_BLOCK) {
+	if (cursor.shape == RENDER_CURSOR_NONE
+		|| cursor.shape == RENDER_CURSOR_BLOCK) {
 		return;
 	}
 
 	const RenderMetrics& metrics = frame.metrics;
-	int32 left = frame.cursorX * metrics.cellWidth;
-	int32 top = frame.cursorY * metrics.cellHeight;
+	int32 left = cursor.x * metrics.cellWidth;
+	int32 top = cursor.y * metrics.cellHeight;
 	int32 right = std::min(frame.width,
-		left + metrics.cellWidth * frame.cursorWidth);
+		left + metrics.cellWidth * cursor.width);
 	int32 bottom = std::min(frame.height, top + metrics.cellHeight);
 	int32 thickness = std::max((int32)2, metrics.lineThickness * 2);
-	uint32 color = frame.cursorColor;
+	uint32 color = cursor.color;
 
-	switch (frame.cursorShape) {
+	switch (cursor.shape) {
 		case RENDER_CURSOR_UNDERLINE:
 			fill_rect(bits, pixelsPerRow, left, bottom - thickness, right,
 				bottom, color);
@@ -430,8 +432,15 @@ render_row(const RenderFrame& frame, const GlyphAtlasInfo& atlas,
 			INT32_MAX);
 	}
 
-	if (frame.cursorY == row)
-		render_cursor(frame, bits, pixelsPerRow);
+	if (frame.cursorY == row) {
+		RenderCursor cursor = { frame.cursorX, frame.cursorY,
+			frame.cursorWidth, frame.cursorShape, frame.cursorColor };
+		render_cursor(frame, cursor, bits, pixelsPerRow);
+	}
+	for (size_t i = 0; i < frame.extraCursors.size(); i++) {
+		if (frame.extraCursors[i].y == row)
+			render_cursor(frame, frame.extraCursors[i], bits, pixelsPerRow);
+	}
 }
 
 

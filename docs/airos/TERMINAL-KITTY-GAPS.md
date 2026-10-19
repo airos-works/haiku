@@ -51,9 +51,8 @@ fractional sizes with alignment. Terminal reserves the cells but draws the
 text at normal size. It touches the cell model, every editing operation,
 history, reflow and both renderers. Few programs use it yet.
 
-### Multiple cursors (`CSI > ... SP q`) — S to M
-Extra cursors drawn by the terminal, for editors with multiple selections.
-Very new; few editors send it.
+### Multiple cursors (`CSI > ... SP q`) — done
+All of it, drawn by both renderers.
 
 ### Remote control (`DCS @kitty-cmd`) — M for a useful subset
 Scripting kitty from programs running in it (`kitten @ launch`, `send-text`,

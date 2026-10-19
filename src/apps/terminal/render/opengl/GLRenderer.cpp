@@ -286,7 +286,8 @@ private:
 			void				_DrawImages(const RenderFrame& frame,
 									int32 top, int32 bottom, int32 minimumZ,
 									int32 maximumZ);
-			void				_DrawCursor(const RenderFrame& frame);
+			void				_DrawCursor(const RenderFrame& frame,
+									const RenderCursor& cursor);
 			GLuint				_ImageTexture(const ImageDraw& draw);
 
 private:
@@ -794,23 +795,23 @@ GLRenderer::_DrawImages(const RenderFrame& frame, int32 top, int32 bottom,
 
 
 void
-GLRenderer::_DrawCursor(const RenderFrame& frame)
+GLRenderer::_DrawCursor(const RenderFrame& frame, const RenderCursor& cursor)
 {
-	if (frame.cursorShape == RENDER_CURSOR_NONE
-		|| frame.cursorShape == RENDER_CURSOR_BLOCK) {
+	if (cursor.shape == RENDER_CURSOR_NONE
+		|| cursor.shape == RENDER_CURSOR_BLOCK) {
 		return;
 	}
 
 	const RenderMetrics& metrics = frame.metrics;
-	float left = frame.cursorX * metrics.cellWidth;
-	float top = frame.cursorY * metrics.cellHeight;
-	float width = metrics.cellWidth * frame.cursorWidth;
+	float left = cursor.x * metrics.cellWidth;
+	float top = cursor.y * metrics.cellHeight;
+	float width = metrics.cellWidth * cursor.width;
 	float height = metrics.cellHeight;
 	float thickness = std::max((int32)2, metrics.lineThickness * 2);
 	float line = metrics.lineThickness;
-	uint32 color = frame.cursorColor;
+	uint32 color = cursor.color;
 
-	switch (frame.cursorShape) {
+	switch (cursor.shape) {
 		case RENDER_CURSOR_UNDERLINE:
 			_FillRect(left, top + height - thickness, width, thickness,
 				color);
@@ -919,7 +920,14 @@ GLRenderer::Render(const RenderFrame& frame, const GlyphAtlasInfo& atlas,
 
 		if (frame.cursorY >= bands[i].first
 			&& frame.cursorY <= bands[i].second) {
-			_DrawCursor(frame);
+			RenderCursor cursor = { frame.cursorX, frame.cursorY,
+				frame.cursorWidth, frame.cursorShape, frame.cursorColor };
+			_DrawCursor(frame, cursor);
+		}
+		for (size_t j = 0; j < frame.extraCursors.size(); j++) {
+			const RenderCursor& cursor = frame.extraCursors[j];
+			if (cursor.y >= bands[i].first && cursor.y <= bands[i].second)
+				_DrawCursor(frame, cursor);
 		}
 	}
 	glDisable(GL_SCISSOR_TEST);

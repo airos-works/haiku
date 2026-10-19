@@ -42,7 +42,8 @@ underlines (`Smulx`, `Setulc`) and true color (`RGB`, `Tc`).
 | Text sizing | `OSC 66` | The width part only: text takes the cells the program asks for (`w=`, `s=` times width). It is not drawn larger. |
 | Miscellaneous | `CSI ? s`/`r` without parameters, `SGR 221`/`222`, `CSI 22 J`, DECCARA/DECSACE with every SGR attribute, the mouse-leave event | Complete. |
 | Shell integration | `OSC 133` | Prompt and output marks; jumping between prompts. |
-| File transfer, remote control, drag and drop, multiple cursors | `OSC 5113`, `DCS @kitty-cmd`, `OSC 72`, `CSI > ... SP q` | Not done. |
+| Multiple cursors | `CSI > ... SP q` | Complete: block, beam, underline and follow-the-cursor shapes at points, rectangles or the cursor; their two colors (`30`, `40`, including "special"); the support, cursor and color queries. They blink with the cursor, show when DECTCEM hides it, and go with ED 2/3/22, a reset, the other screen and a resize. |
+| File transfer, remote control, drag and drop | `OSC 5113`, `DCS @kitty-cmd`, `OSC 72` | Not done. |
 
 ### Other extensions
 

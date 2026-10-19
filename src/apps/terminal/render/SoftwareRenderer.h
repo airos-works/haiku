@@ -55,8 +55,8 @@ private:
 // shared with the OpenGL renderer, which draws decorations the same way
 void render_decorations(const RenderFrame& frame, const RenderCell& cell,
 	uint32* pixels, int32 pixelsPerRow, int32 clipTop, int32 clipBottom);
-void render_cursor(const RenderFrame& frame, uint32* bits,
-	int32 pixelsPerRow);
+void render_cursor(const RenderFrame& frame, const RenderCursor& cursor,
+	uint32* bits, int32 pixelsPerRow);
 void render_images(const RenderFrame& frame, uint32* bits,
 	int32 pixelsPerRow, int32 top, int32 bottom, int32 minimumZ,
 	int32 maximumZ);

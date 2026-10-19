@@ -228,6 +228,23 @@ struct TermPoint {
 /*!	A desktop notification asked for with OSC 99 (kitty), OSC 9 or
 	OSC 777.
 */
+// kitty's multiple cursors: shapes of the extra cursors
+enum {
+	EXTRA_CURSOR_BLOCK			= 1,
+	EXTRA_CURSOR_BEAM			= 2,
+	EXTRA_CURSOR_UNDERLINE		= 3,
+	EXTRA_CURSOR_FOLLOW_MAIN	= 29
+};
+
+
+//! A color of the extra cursors: unset (as the main cursor), "special"
+//! (reverse video), RGB or a palette index.
+struct ExtraCursorColor {
+	int32		space;		// 0, 1, 2 (RGB in value) or 5 (index in value)
+	uint32		value;
+};
+
+
 struct TermNotification {
 	std::string	identifier;
 	std::string	title;
@@ -442,6 +459,15 @@ public:
 			uint32				Color(int32 index) const;
 			uint32				ColorsGeneration() const
 									{ return fColorsGeneration; }
+
+			//! kitty's extra cursors: shapes by (row << 16) | column, and
+			//! their colors (0: of the text under them, 1: of the cursors).
+			const std::map<uint32, uint8>& ExtraCursors() const
+									{ return fExtraCursors; }
+			const ExtraCursorColor& ExtraCursorColors(int32 which) const
+									{ return fExtraCursorColors[which]; }
+			uint32				ExtraCursorsGeneration() const
+									{ return fExtraCursorsGeneration; }
 			//! Resolves a cell color to RGB.
 			uint32				ResolveColor(TermColor color,
 									bool foreground) const;
@@ -645,6 +671,9 @@ private:
 			void				_RequestMode(const VTSequence& sequence);
 			void				_SetCursorStyle(int32 style);
 			void				_KeyboardProtocol(const VTSequence& sequence);
+			void				_MultipleCursors(const VTSequence& sequence);
+			void				_SetExtraCursor(int32 x, int32 y, int32 shape);
+			void				_ClearExtraCursors();
 			void				_RectangularOperation(
 									const VTSequence& sequence);
 			void				_CopyRectangle(const VTSequence& sequence);
@@ -750,6 +779,10 @@ private:
 			uint32				fDefaultColors[COLOR_COUNT];
 			uint32				fColors[COLOR_COUNT];
 			uint32				fColorsGeneration;
+
+			std::map<uint32, uint8> fExtraCursors;
+			ExtraCursorColor	fExtraCursorColors[2];
+			uint32				fExtraCursorsGeneration;
 			std::vector<std::vector<uint32> > fColorStack;
 			std::vector<CellStyle> fSGRStack;
 
