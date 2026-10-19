@@ -129,6 +129,12 @@ static const uint32 kClipboardReadAnswer = 'TCra';
 static const bigtime_t kFrameInterval = 1000000 / 120;
 static const bigtime_t kSynchronizedRetry = 20000;
 
+// choosing between the GPU and the software renderer: large frames timed
+// in a series, after some that are not
+static const int32 kRendererWarmUpFrames = 4;
+static const int32 kRendererSeriesFrames = 8;
+static const bigtime_t kRendererRetryInterval = 60000000;
+
 static const int32 kCursorBlinkIntervals = 3;
 static const int32 kCursorVisibleIntervals = 2;
 static const bigtime_t kCursorBlinkInterval = 500000;
@@ -482,11 +488,10 @@ TermView::_InitObject(const ShellParameters& shellParameters)
 	fGPURenderer = NULL;
 	fChooseRenderer = true;
 	fGPUStale = false;
-	fGPUFrames = 0;
-	fComparisons = 0;
-	fLastComparison = 0;
-	fGPUCost = -1;
-	fSoftwareCost = -1;
+	fWarmUpFrames = kRendererWarmUpFrames;
+	fMeasuredFrames = 0;
+	fCost[0] = fCost[1] = -1;
+	fMeasured[0] = fMeasured[1] = 0;
 	fBitmap = NULL;
 	fLastFrameTime = 0;
 	fFrameNeeded = false;
@@ -1843,9 +1848,12 @@ TermView::_RenderFrame()
 
 /*!	Draws the frame with the processor or the GPU, whichever is faster.
 	Reading back what the GPU drew can cost more than drawing with the
-	processor: a 4K frame on the GTX 1070 with NVK takes 20 ms, against 9 ms
-	in software. When the choice is Terminal's, a large frame is drawn by
-	both now and then, and the faster one draws from then on.
+	processor: a 3802x2150 frame takes 23.5 ms on the GTX 1070 with NVK
+	against 13 ms in software, a 2223x1495 frame 2.8 ms on the Radeon 760M
+	against 1.8 ms. When the choice is Terminal's, it times the large frames
+	(scrolling), and has each renderer draw a series of them now and then.
+	The first frames of a series are not counted: a GPU that was idle takes
+	a few frames to speed up.
 */
 bool
 TermView::_Render(int32& _firstRow, int32& _lastRow)
@@ -1864,6 +1872,12 @@ TermView::_Render(int32& _firstRow, int32& _lastRow)
 			_firstRow, _lastRow);
 	}
 
+	bool gpu = fRenderer == fGPURenderer;
+	if (gpu && fGPUStale) {
+		// its copy of the frame misses what the processor drew
+		fFrame.allDirty = true;
+	}
+
 	int32 dirtyRows = 0;
 	for (int32 row = 0; row < fFrame.rows; row++) {
 		if (fFrame.allDirty || fFrame.dirtyRows[row])
@@ -1871,89 +1885,52 @@ TermView::_Render(int32& _firstRow, int32& _lastRow)
 	}
 	float frameSize = (float)fFrame.width * fFrame.height;
 	float dirtySize = fFrame.allDirty ? frameSize
-		: (float)fFrame.width * dirtyRows * fFrame.metrics.cellHeight;
+		: std::min(frameSize,
+			(float)fFrame.width * dirtyRows * fFrame.metrics.cellHeight);
 
+	bigtime_t start = system_time();
+	if (!fRenderer->Render(fFrame, atlas, bits, bytesPerRow, _firstRow,
+			_lastRow)) {
+		if (gpu && fGPURenderer->IsBroken())
+			return _Render(_firstRow, _lastRow);
+		return false;
+	}
 	bigtime_t now = system_time();
-	bool compare = fChooseRenderer && fGPUFrames >= 4
-		&& dirtySize >= frameSize / 2
-		&& now - fLastComparison > (fComparisons < 3 ? 500000 : 10000000);
-	if (!compare) {
-		if (fRenderer == fSoftwareRenderer) {
-			// the GPU's copy of the frame misses these rows now
-			fGPUStale = true;
-			return fSoftwareRenderer->Render(fFrame, atlas, bits,
-				bytesPerRow, _firstRow, _lastRow);
-		}
-		if (fGPUStale)
-			fFrame.allDirty = true;
-		if (fGPURenderer->Render(fFrame, atlas, bits, bytesPerRow, _firstRow,
-				_lastRow)) {
-			fGPUStale = false;
-			fGPUFrames++;
-			return true;
-		}
-		if (!fGPURenderer->IsBroken())
-			return false;
-		return _Render(_firstRow, _lastRow);
+	fGPUStale = !gpu;
+
+	if (!fChooseRenderer || dirtySize < frameSize / 2)
+		return true;
+	if (fWarmUpFrames > 0) {
+		fWarmUpFrames--;
+		return true;
 	}
 
-	// Both draw the frame, the one in use last, so that its pixels stay.
-	bool dirty = fFrame.allDirty;
-	bigtime_t gpuTime = 0;
-	bigtime_t softwareTime = 0;
-	float gpuSize = fGPUStale ? frameSize : dirtySize;
-	int32 firstRow = 0;
-	int32 lastRow = 0;
-	bool rendered = false;
-	for (int32 i = 0; i < 2; i++) {
-		bool gpu = (i == 0) != (fRenderer == fGPURenderer);
-		bigtime_t start = system_time();
-		if (gpu) {
-			fFrame.allDirty = dirty || fGPUStale;
-			rendered = fGPURenderer->Render(fFrame, atlas, bits, bytesPerRow,
-				firstRow, lastRow);
-			gpuTime = system_time() - start;
-			fFrame.allDirty = dirty;
-			if (!rendered) {
-				if (fGPURenderer->IsBroken())
-					return _Render(_firstRow, _lastRow);
-				return false;
-			}
-			fGPUStale = false;
-		} else {
-			rendered = fSoftwareRenderer->Render(fFrame, atlas, bits,
-				bytesPerRow, firstRow, lastRow);
-			softwareTime = system_time() - start;
-		}
-	}
-	if (gpuSize > dirtySize)
-		fFrame.allDirty = true;
-	_firstRow = fFrame.allDirty ? 0 : firstRow;
-	_lastRow = fFrame.allDirty ? fFrame.rows - 1 : lastRow;
+	int32 index = gpu ? 1 : 0;
+	float cost = (now - start) / (dirtySize / 1000000);
+	fCost[index] = fCost[index] < 0 ? cost : fCost[index] * 0.75f + cost / 4;
+	fMeasured[index] = now;
+	if (++fMeasuredFrames < kRendererSeriesFrames)
+		return true;
 
-	float gpuCost = gpuTime / (gpuSize / 1000000);
-	float softwareCost = softwareTime / (dirtySize / 1000000);
-	fGPUCost = fGPUCost < 0 ? gpuCost : (fGPUCost + gpuCost) / 2;
-	fSoftwareCost = fSoftwareCost < 0 ? softwareCost
-		: (fSoftwareCost + softwareCost) / 2;
-	fComparisons++;
-	fLastComparison = system_time();
-
-	// a clear difference only, so that it does not change back and forth
-	TermRenderer* faster = fRenderer;
-	if (fRenderer == fGPURenderer && fSoftwareCost < fGPUCost * 0.8f)
-		faster = fSoftwareRenderer;
-	else if (fRenderer == fSoftwareRenderer && fGPUCost < fSoftwareCost * 0.8f)
-		faster = fGPURenderer;
+	// The other one draws a series when it has not for a while, and from
+	// then on when it is clearly faster.
+	int32 other = 1 - index;
+	bool change = fCost[other] < 0
+		|| now - fMeasured[other] > kRendererRetryInterval
+		|| fCost[other] < fCost[index] * 0.8f;
 
 	static bool sStatistics = getenv("TERMINAL_STATS") != NULL;
-	if (sStatistics) {
-		fprintf(stderr, "Terminal: %s %.0f us per megapixel, software %.0f:"
-			" %s\n", fGPURenderer->Name(), fGPUCost, fSoftwareCost,
-			faster->Name());
+	if (sStatistics && (change || fMeasuredFrames == kRendererSeriesFrames)) {
+		fprintf(stderr, "Terminal: software %.0f us per megapixel, %s %.0f:"
+			" %s\n", fCost[0], fGPURenderer->Name(), fCost[1],
+			change ? "changing" : "staying");
 	}
-	fRenderer = faster;
-	return rendered;
+	if (change) {
+		fRenderer = other == 1 ? fGPURenderer : fSoftwareRenderer;
+		fWarmUpFrames = kRendererWarmUpFrames;
+		fMeasuredFrames = 0;
+	}
+	return true;
 }
 
 
