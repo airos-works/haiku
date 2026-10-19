@@ -308,7 +308,7 @@ TestEditing()
 
 	// erase keeps the background color
 	f.Feed("\x1b[44m\x1b[2K\x1b[0m");
-	CHECK(f.Cell(0, 5).style.background == indexed_color(4));
+	CHECK(f.Cell(0, 5).style.background == palette_color(4));
 
 	// insert mode
 	Fixture i(10, 2);
@@ -388,14 +388,14 @@ TestStyles()
 	CHECK((cell.style.flags & CELL_BOLD) != 0);
 	CHECK((cell.style.flags & CELL_ITALIC) != 0);
 	CHECK(cell.style.underline == UNDERLINE_SINGLE);
-	CHECK(cell.style.foreground == indexed_color(196));
-	CHECK(cell.style.background == direct_color(1, 2, 3));
+	CHECK(cell.style.foreground == palette_color(196));
+	CHECK(cell.style.background == rgb_color_value(1, 2, 3));
 
 	f.Feed("\x1b[0;4:3;58:2::10:20:30;38:2::5:6:7mB");
 	cell = f.Cell(0, 1);
 	CHECK(cell.style.underline == UNDERLINE_CURLY);
-	CHECK(cell.style.underlineColor == direct_color(10, 20, 30));
-	CHECK(cell.style.foreground == direct_color(5, 6, 7));
+	CHECK(cell.style.underlineColor == rgb_color_value(10, 20, 30));
+	CHECK(cell.style.foreground == rgb_color_value(5, 6, 7));
 	CHECK((cell.style.flags & CELL_BOLD) == 0);
 
 	f.Feed("\x1b[0;1;2;221mC\x1b[222mD\x1b[53;9mE");
@@ -406,8 +406,8 @@ TestStyles()
 		== (CELL_OVERLINE | CELL_STRIKE));
 
 	f.Feed("\x1b[0;91;102mF");
-	CHECK(f.Cell(0, 5).style.foreground == indexed_color(9));
-	CHECK(f.Cell(0, 5).style.background == indexed_color(10));
+	CHECK(f.Cell(0, 5).style.foreground == palette_color(9));
+	CHECK(f.Cell(0, 5).style.background == palette_color(10));
 
 	// 4;3 is underline and italic, not curly
 	f.Feed("\x1b[0;4;3mG");
@@ -418,15 +418,15 @@ TestStyles()
 	Fixture d(10, 4);
 	d.Feed("aaaaa\r\nbbbbb\r\nccccc");
 	d.Feed("\x1b[2*x\x1b[1;2;2;3;44$r\x1b[*x");
-	CHECK(d.Cell(0, 1).style.background == indexed_color(4));
-	CHECK(d.Cell(1, 2).style.background == indexed_color(4));
+	CHECK(d.Cell(0, 1).style.background == palette_color(4));
+	CHECK(d.Cell(1, 2).style.background == palette_color(4));
 	CHECK(d.Cell(0, 3).style.background == kDefaultColor);
 	CHECK(d.Cell(2, 1).style.background == kDefaultColor);
 
 	// XTPUSHSGR / XTPOPSGR
 	Fixture p;
 	p.Feed("\x1b[31m\x1b[#{\x1b[32m\x1b[#}x");
-	CHECK(p.Cell(0, 0).style.foreground == indexed_color(1));
+	CHECK(p.Cell(0, 0).style.foreground == palette_color(1));
 }
 
 
@@ -512,6 +512,9 @@ TestKeyboardProtocol()
 	CHECK_EQUAL(f.Reply(), "\x1b[?4u");
 	f.Feed("\x1b[<5u\x1b[?u");
 	CHECK_EQUAL(f.Reply(), "\x1b[?0u");
+	// the answer itself, echoed back, is no query
+	f.Feed("\x1b[?0u");
+	CHECK_EQUAL(f.Reply(), "");
 
 	// separate flags for the alternate screen
 	f.Feed("\x1b[>1u\x1b[?1049h\x1b[?u");
@@ -706,6 +709,8 @@ TestOperatingSystemCommands()
 	f.Feed("\x1b]21;foreground=white;foreground=?;cursor=?;nonsense=?\x1b\\");
 	CHECK_EQUAL(f.Reply(), "\x1b]21;foreground=rgb:ff/ff/ff;cursor="
 		";unknown=bm9uc2Vuc2U\x1b\\");
+	f.Feed("\x1b]21;foreground=rgb:ff/ff/ff;cursor=;unknown=bm9uc2Vuc2U\x1b\\");
+	CHECK_EQUAL(f.Reply(), "");
 
 	// color stack
 	f.Feed("\x1b]30001\x1b\\\x1b]10;blue\x1b\\\x1b]30101\x1b\\");
@@ -756,7 +761,10 @@ TestOperatingSystemCommands()
 	CHECK_EQUAL(n.recorder.notifications[1].title, "Title");
 	CHECK_EQUAL(n.recorder.notifications[1].body, "Body");
 	n.Feed("\x1b]99;i=q:p=?;\x1b\\");
-	CHECK(n.Reply().find("\x1b]99;i=q:p=?;a=focus,report") == 0);
+	std::string answer = n.Reply();
+	CHECK(answer.find("\x1b]99;i=q:p=?;o=always") == 0);
+	n.Feed(answer);
+	CHECK_EQUAL(n.Reply(), "");
 	n.Feed("\x1b]9;iTerm says hi\x07");
 	CHECK(n.recorder.notifications.size() == 3);
 	n.Feed("\x1b]777;notify;Title;Body text\x07");
@@ -933,6 +941,10 @@ TestGraphics()
 		}
 	}
 	CHECK(found);
+
+	// our echoed answers are no commands
+	f.Feed("\x1b_Gi=31;OK\x1b\\\x1b_Gi=99;ENOENT:No such image\x1b\\");
+	CHECK_EQUAL(f.Reply(), "");
 
 	// put by id, missing image
 	f.Feed("\x1b_Ga=p,i=99\x1b\\");

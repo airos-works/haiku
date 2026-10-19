@@ -22,14 +22,14 @@ static const uint32 kColorTypeDirect = 0x02000000;
 
 
 static inline TermColor
-indexed_color(uint32 index)
+palette_color(uint32 index)
 {
 	return kColorTypeIndexed | (index & 0xff);
 }
 
 
 static inline TermColor
-direct_color(uint8 red, uint8 green, uint8 blue)
+rgb_color_value(uint8 red, uint8 green, uint8 blue)
 {
 	return kColorTypeDirect | ((uint32)red << 16) | ((uint32)green << 8)
 		| blue;

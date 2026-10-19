@@ -290,6 +290,10 @@ SYSTEM_ADD_ONS_QUICK_LOOK = [ FFilterByBuildFeatures
 	TextPreview
 ] ;
 
+SYSTEM_ADD_ONS_TERMINAL = [ FFilterByBuildFeatures
+	Terminal-OpenGL@mesa
+] ;
+
 SYSTEM_ADD_ONS_DRIVERS_AUDIO +=
 	auich
 	auvia

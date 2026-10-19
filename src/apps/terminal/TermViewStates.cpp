@@ -1,5 +1,5 @@
 /*
- * Copyright 2001-2015, Haiku, Inc.
+ * Copyright 2001-2026, Haiku, Inc.
  * Copyright 2003-2004 Kian Duffy, myob@users.sourceforge.net
  * Parts Copyright 1998-1999 Kazuho Okui and Takashi Murai.
  * All rights reserved. Distributed under the terms of the MIT license.
@@ -38,9 +38,6 @@
 #include "ActiveProcessInfo.h"
 #include "Shell.h"
 #include "TermConst.h"
-#include "TerminalBuffer.h"
-#include "VTkeymap.h"
-#include "VTKeyTbl.h"
 
 
 #undef B_TRANSLATION_CONTEXT
@@ -66,6 +63,23 @@ static const char* const kKnownURLProtocols = "http:https:ftp:mailto";
 
 // how many lines a link is followed over, at most
 static const int32 kMaxLinkLines = 64;
+
+
+static int32
+mouse_button(int32 buttons)
+{
+	if ((buttons & B_PRIMARY_MOUSE_BUTTON) != 0)
+		return MOUSE_BUTTON_LEFT;
+	if ((buttons & B_TERTIARY_MOUSE_BUTTON) != 0)
+		return MOUSE_BUTTON_MIDDLE;
+	if ((buttons & B_SECONDARY_MOUSE_BUTTON) != 0)
+		return MOUSE_BUTTON_RIGHT;
+	if ((buttons & B_MOUSE_BUTTON(4)) != 0)
+		return MOUSE_BUTTON_BACK;
+	if ((buttons & B_MOUSE_BUTTON(5)) != 0)
+		return MOUSE_BUTTON_FORWARD;
+	return MOUSE_BUTTON_NONE;
+}
 
 
 // #pragma mark - State
@@ -139,12 +153,6 @@ TermView::State::WindowActivated(bool active)
 }
 
 
-void
-TermView::State::VisibleTextBufferChanged()
-{
-}
-
-
 // #pragma mark - StandardBaseState
 
 
@@ -158,26 +166,24 @@ TermView::StandardBaseState::StandardBaseState(TermView* view)
 bool
 TermView::StandardBaseState::_StandardMouseMoved(BPoint where, int32 modifiers)
 {
-	bool reportButtonMouseEvent = fView->TextBuffer()->IsMode(MODE_REPORT_BUTTON_MOUSE_EVENT);
-	bool reportAnyMouseEvent = fView->TextBuffer()->IsMode(MODE_REPORT_ANY_MOUSE_EVENT);
-	if (!reportButtonMouseEvent && !reportAnyMouseEvent)
+	Terminal* terminal = fView->fTerminal;
+	terminal->Lock();
+	int32 tracking = terminal->MouseTracking();
+	bool pixels = terminal->MouseEncoding() == MOUSE_ENCODING_SGR_PIXELS;
+	terminal->Unlock();
+
+	if (tracking != MOUSE_TRACKING_BUTTON && tracking != MOUSE_TRACKING_ANY)
+		return false;
+	if ((modifiers & B_SHIFT_KEY) != 0 && fView->fMouseButtons != 0)
 		return false;
 
-	TermPos clickPos = fView->_ConvertToTerminal(where);
-
-	if (reportButtonMouseEvent
-		|| fView->TextBuffer()->IsMode(MODE_EXTENDED_MOUSE_COORDINATES)) {
-		if (fView->fPrevPos.x != clickPos.x
-			|| fView->fPrevPos.y != clickPos.y) {
-			fView->_SendMouseEvent(fView->fMouseButtons, modifiers,
-				clickPos.x, clickPos.y, true);
-		}
-		fView->fPrevPos = clickPos;
-	} else {
-		fView->_SendMouseEvent(fView->fMouseButtons, modifiers, clickPos.x,
-			clickPos.y, true);
+	// motion is reported when it reaches another cell (or pixel)
+	TermPoint position = fView->_ConvertToTerminal(where);
+	if (pixels || position != fView->fPrevPos) {
+		fView->_SendMouseEvent(MOUSE_MOTION,
+			mouse_button(fView->fMouseButtons), where, modifiers);
 	}
-
+	fView->fPrevPos = position;
 	return true;
 }
 
@@ -199,259 +205,99 @@ TermView::DefaultState::ModifiersChanged(int32 oldModifiers, int32 modifiers)
 }
 
 
-static char*
-_BuildXtermPCFunctionKeySequence(char* dest, int destN, int32 modifiers, const char* prefix,
-	char first, char last)
-{
-	// This helper function builds a sequence used specifically by Xterm-conforming terminals
-	// for encoding key modifiers (ctrl, alt, shift) used with arrow keys, Home/End, Ins/Del,
-	// PgUp/PgDn, and function keys F1-F12.
-
-	uint8 ctrl = (modifiers & B_CONTROL_KEY) != 0;
-	uint8 alt = (modifiers & B_OPTION_KEY) != 0;
-	uint8 shift = (modifiers & B_SHIFT_KEY) != 0;
-
-	if (!(ctrl || alt || shift)) {
-		if (last == '~')
-			snprintf(dest, destN, "%s%c%c", prefix, first, last);
-		else
-			snprintf(dest, destN, "%s%c", prefix, last);
-
-		return dest;
-	}
-
-	// Xterm's modifiers map can be computed as a bitmask of bits for ctrl, shift, alt plus 1.
-	uint xtermModifiers = (ctrl + alt + shift) == 0 ? 0 : (ctrl << 2 | alt << 1 | shift) + 1;
-
-	// When a modifier is set, prefix is always CSI.
-	snprintf(dest, destN, "\033[%c;%u%c", first, xtermModifiers, last);
-	return dest;
-}
-
-
 void
 TermView::DefaultState::KeyDown(const char* bytes, int32 numBytes)
 {
-	int32 key;
-	int32 mod;
-	int32 rawChar;
 	BMessage* currentMessage = fView->Looper()->CurrentMessage();
 	if (currentMessage == NULL)
 		return;
 
+	int32 key = 0;
+	int32 mod = 0;
+	int32 rawChar = 0;
 	currentMessage->FindInt32("modifiers", &mod);
 	currentMessage->FindInt32("key", &key);
 	currentMessage->FindInt32("raw_char", &rawChar);
 
 	fView->_ActivateCursor(true);
 
-	// Handle the Option key when used as Meta
-	bool interpretMetaKey = fView->TextBuffer()->IsMode(MODE_INTERPRET_META_KEY);
-	bool metaKeySendsEscape = fView->TextBuffer()->IsMode(MODE_META_KEY_SENDS_ESCAPE);
-	if ((mod & B_LEFT_OPTION_KEY) != 0 && fView->fUseOptionAsMetaKey
-		&& (interpretMetaKey || metaKeySendsEscape)) {
-		const char* bytes;
-		int8 numBytes;
-
-		// Determine the character produced by the same keypress without the
-		// Option key
-		mod &= B_SHIFT_KEY | B_CAPS_LOCK | B_CONTROL_KEY;
-		const int32 (*keymapTable)[128] = (mod == 0)
-			? NULL
-			: fView->fKeymapTableForModifiers.Get(mod);
-		if (keymapTable == NULL) {
-			bytes = (const char*)&rawChar;
-			numBytes = 1;
-		} else {
-			bytes = &fView->fKeymapChars[(*keymapTable)[key]];
-			numBytes = *(bytes++);
-		}
-
-		if (numBytes <= 0)
-			return;
-
-		fView->_ScrollTo(0, true);
-
-		char outputBuffer[2];
-		const char* toWrite = bytes;
-
-		if (metaKeySendsEscape) {
-			fView->fShell->Write("\e", 1);
-		} else if (numBytes == 1) {
-			char byte = *bytes | 0x80;
-
-			// The eighth bit has special meaning in UTF-8, so if that encoding
-			// is in use recode the output (as xterm does)
-			if (fView->fEncoding == M_UTF8) {
-				outputBuffer[0] = 0xc0 | ((byte >> 6) & 0x03);
-				outputBuffer[1] = 0x80 | (byte & 0x3f);
-				numBytes = 2;
-			} else {
-				outputBuffer[0] = byte;
-				numBytes = 1;
-			}
-			toWrite = outputBuffer;
-		}
-
-		fView->fShell->Write(toWrite, numBytes);
-		return;
-	}
-
-	// handle multi-byte chars
-	if (numBytes > 1) {
-		if (fView->fEncoding != M_UTF8) {
-			char destBuffer[16];
-			int32 destLen = sizeof(destBuffer);
-			int32 state = 0;
-			convert_from_utf8(fView->fEncoding, bytes, &numBytes, destBuffer,
-				&destLen, &state, '?');
-			fView->_ScrollTo(0, true);
-			fView->fShell->Write(destBuffer, destLen);
-			return;
-		}
-
-		fView->_ScrollTo(0, true);
-		fView->fShell->Write(bytes, numBytes);
-		return;
-	}
-
-	// Terminal filters RET, ENTER, F1...F12, and ARROW key code.
-	const char *toWrite = NULL;
-	char outputBuffer[12];
-	const char* prefix = "\033[";
-	if (fView->TextBuffer()->IsMode(MODE_APPLICATION_CURSOR_KEYS))
-		prefix = "\033O"; // SS3, 7-bit encoding.
-
-	switch (*bytes) {
-		case B_RETURN:
-			if (rawChar == B_RETURN)
-				toWrite = "\r";
-			break;
-
-		case B_DELETE:
-			toWrite = DELETE_KEY_CODE;
-			break;
-
-		case B_BACKSPACE:
-			// Translate only the actual backspace key to the backspace
-			// code. CTRL-H shall just be echoed.
-			if (!((mod & B_CONTROL_KEY) && rawChar == 'h'))
-				toWrite = BACKSPACE_KEY_CODE;
-			break;
-
-		case B_LEFT_ARROW:
-			if (rawChar == B_LEFT_ARROW) {
-				toWrite = _BuildXtermPCFunctionKeySequence(outputBuffer, sizeof(outputBuffer), mod,
-					prefix, '1', 'D');
-			}
-			break;
-
-		case B_RIGHT_ARROW:
-			if (rawChar == B_RIGHT_ARROW) {
-				toWrite = _BuildXtermPCFunctionKeySequence(outputBuffer, sizeof(outputBuffer), mod,
-					prefix, '1', 'C');
-			}
-			break;
-
-		case B_UP_ARROW:
-			if ((mod & B_CONTROL_KEY) && (mod & B_SHIFT_KEY)) {
-				fView->_ScrollTo(fView->fScrollOffset - fView->fFontHeight, true);
-				return;
-			}
-
-			if (rawChar == B_UP_ARROW) {
-				toWrite = _BuildXtermPCFunctionKeySequence(outputBuffer, sizeof(outputBuffer), mod,
-					prefix, '1', 'A');
-			}
-			break;
-
-		case B_DOWN_ARROW:
-			if ((mod & B_CONTROL_KEY) && (mod & B_SHIFT_KEY)) {
-				fView->_ScrollTo(fView->fScrollOffset + fView->fFontHeight, true);
-				return;
-			}
-
-			if (rawChar == B_DOWN_ARROW) {
-				toWrite = _BuildXtermPCFunctionKeySequence(outputBuffer, sizeof(outputBuffer), mod,
-					prefix, '1', 'B');
-			}
-			break;
-
-		case B_INSERT:
-			if (rawChar == B_INSERT)
-				toWrite = INSERT_KEY_CODE;
-			break;
-
-		case B_HOME:
-			if (rawChar == B_HOME) {
-				toWrite = _BuildXtermPCFunctionKeySequence(outputBuffer, sizeof(outputBuffer), mod,
-					prefix, '1', 'H');
-			}
-			break;
-
-		case B_END:
-			if (rawChar == B_END) {
-				toWrite = _BuildXtermPCFunctionKeySequence(outputBuffer, sizeof(outputBuffer), mod,
-					prefix, '1', 'F');
-			}
-			break;
-
-		case B_PAGE_UP:
-			if (mod & B_SHIFT_KEY) {
-				fView->_ScrollTo(fView->fScrollOffset - fView->fFontHeight * fView->fRows, true);
-				return;
-			}
-			if (rawChar == B_PAGE_UP)
-				toWrite = PAGE_UP_KEY_CODE;
-			break;
-
-		case B_PAGE_DOWN:
-			if (mod & B_SHIFT_KEY) {
-				fView->_ScrollTo(fView->fScrollOffset + fView->fFontHeight * fView->fRows, true);
-				return;
-			}
-			if (rawChar == B_PAGE_DOWN)
-				toWrite = PAGE_DOWN_KEY_CODE;
-			break;
-
-		case B_FUNCTION_KEY:
-			for (int32 i = 0; i < 12; i++) {
-				if (key == function_keycode_table[i]) {
-					toWrite = function_key_char_table[i];
-					break;
+	// Terminal's own keys: scrolling the history, and kitty's jumps from
+	// prompt to prompt
+	Terminal* terminal = fView->fTerminal;
+	terminal->Lock();
+	bool alternate = terminal->IsAlternateScreen();
+	terminal->Unlock();
+	if (numBytes == 1) {
+		bool controlShift = (mod & B_CONTROL_KEY) != 0
+			&& (mod & B_SHIFT_KEY) != 0;
+		switch (bytes[0]) {
+			case B_UP_ARROW:
+				if (controlShift) {
+					fView->_ScrollToRows(fView->fScrollRows + 1);
+					return;
 				}
-			}
-			break;
+				break;
+			case B_DOWN_ARROW:
+				if (controlShift) {
+					fView->_ScrollToRows(fView->fScrollRows - 1);
+					return;
+				}
+				break;
+			case B_PAGE_UP:
+				if ((mod & B_SHIFT_KEY) != 0 && !alternate) {
+					fView->_ScrollToRows(fView->fScrollRows + fView->fRows);
+					return;
+				}
+				break;
+			case B_PAGE_DOWN:
+				if ((mod & B_SHIFT_KEY) != 0 && !alternate) {
+					fView->_ScrollToRows(fView->fScrollRows - fView->fRows);
+					return;
+				}
+				break;
+			case B_HOME:
+				if ((mod & B_SHIFT_KEY) != 0 && !alternate) {
+					fView->_ScrollToRows(INT32_MAX);
+					return;
+				}
+				break;
+			case B_END:
+				if ((mod & B_SHIFT_KEY) != 0 && !alternate) {
+					fView->_ScrollToBottom();
+					return;
+				}
+				break;
+		}
+		if (controlShift && !alternate && (rawChar == 'z' || rawChar == 'x')) {
+			fView->_ScrollToPrompt(rawChar == 'x');
+			return;
+		}
 	}
 
-	// If the above code proposed an alternative string to write, we get it's
-	// length. Otherwise we write exactly the bytes passed to this method.
-	size_t toWriteLen;
-	if (toWrite != NULL) {
-		toWriteLen = strlen(toWrite);
-	} else {
-		toWrite = bytes;
-		toWriteLen = numBytes;
+	TermKeyEvent event;
+	BString text;
+	if (!fView->_TranslateKey(currentMessage, false, event, text)) {
+		// nothing the encoder knows: send what the keymap gives
+		fView->_ScrollToBottom();
+		fView->_WritePTY(bytes, numBytes);
+		return;
 	}
+	event.text = text.String();
 
-	fView->_ScrollTo(0, true);
-	fView->fShell->Write(toWrite, toWriteLen);
+	fView->_ScrollToBottom();
+	fView->_SendKey(event);
 }
 
 
 void
 TermView::DefaultState::MouseDown(BPoint where, int32 buttons, int32 modifiers)
 {
-	bool reportButtonMouseEvent = fView->TextBuffer()->IsMode(MODE_REPORT_BUTTON_MOUSE_EVENT);
-	bool reportAnyMouseEvent = fView->TextBuffer()->IsMode(MODE_REPORT_ANY_MOUSE_EVENT);
-	bool reportNormalMouseEvent = fView->TextBuffer()->IsMode(MODE_REPORT_NORMAL_MOUSE_EVENT);
-	bool reportX10MouseEvent = fView->TextBuffer()->IsMode(MODE_REPORT_X10_MOUSE_EVENT);
-
-	if (reportAnyMouseEvent || reportButtonMouseEvent || reportNormalMouseEvent
-		|| reportX10MouseEvent) {
-		TermPos clickPos = fView->_ConvertToTerminal(where);
-		fView->_SendMouseEvent(buttons, modifiers, clickPos.x, clickPos.y,
-			false, false);
+	// with mouse reporting the program gets the clicks, unless shift is
+	// held to select text
+	if (fView->_ReportsMouse() && (modifiers & B_SHIFT_KEY) == 0) {
+		fView->_SendMouseEvent(MOUSE_PRESS, mouse_button(buttons), where,
+			modifiers);
+		fView->fPrevPos = fView->_ConvertToTerminal(where);
 		return;
 	}
 
@@ -476,6 +322,13 @@ TermView::DefaultState::MouseMoved(BPoint where, uint32 transit,
 	if (_CheckEnterHyperLinkState(modifiers))
 		return;
 
+	if (transit == B_EXITED_VIEW) {
+		// SGR pixel mouse reporting tells the program
+		fView->_SendMouseEvent(MOUSE_LEAVE, MOUSE_BUTTON_NONE, where,
+			modifiers);
+		return;
+	}
+
 	_StandardMouseMoved(where, modifiers);
 }
 
@@ -483,16 +336,11 @@ TermView::DefaultState::MouseMoved(BPoint where, uint32 transit,
 void
 TermView::DefaultState::MouseUp(BPoint where, int32 buttons)
 {
-	bool reportButtonMouseEvent = fView->TextBuffer()->IsMode(MODE_REPORT_BUTTON_MOUSE_EVENT);
-	bool reportAnyMouseEvent = fView->TextBuffer()->IsMode(MODE_REPORT_ANY_MOUSE_EVENT);
-	bool reportNormalMouseEvent = fView->TextBuffer()->IsMode(MODE_REPORT_NORMAL_MOUSE_EVENT);
-	bool reportX10MouseEvent = fView->TextBuffer()->IsMode(MODE_REPORT_X10_MOUSE_EVENT);
-
-	if (reportAnyMouseEvent || reportButtonMouseEvent
-		|| reportNormalMouseEvent || reportX10MouseEvent) {
-		TermPos clickPos = fView->_ConvertToTerminal(where);
-		fView->_SendMouseEvent(buttons, 0, clickPos.x, clickPos.y,
-			false, true);
+	if (fView->_ReportsMouse()) {
+		// the button that went up
+		int32 released = fView->fMouseButtons & ~buttons;
+		fView->_SendMouseEvent(MOUSE_RELEASE, mouse_button(released), where,
+			modifiers());
 	}
 }
 
@@ -537,8 +385,9 @@ TermView::SelectState::Prepare(BPoint where, int32 modifiers)
 	fView->Window()->CurrentMessage()->FindInt32("clicks", &clicks);
 
 	if (fView->_HasSelection()) {
-		TermPos inPos = fView->_ConvertToTerminal(where);
-		if (fView->fSelection.RangeContains(inPos)) {
+		TermPoint inPos = fView->_ConvertToTerminal(where);
+		if (inPos >= fView->fSelection.start
+			&& inPos < fView->fSelection.end) {
 			if (modifiers & B_CONTROL_KEY) {
 				BPoint p;
 				uint32 bt;
@@ -568,7 +417,7 @@ TermView::SelectState::Prepare(BPoint where, int32 modifiers)
 	fView->SetMouseEventMask(B_POINTER_EVENTS | B_KEYBOARD_EVENTS,
 		B_NO_POINTER_HISTORY | B_LOCK_WINDOW_FOCUS);
 
-	TermPos clickPos = fView->_ConvertToTerminal(where);
+	TermPoint clickPos = fView->_ConvertToTerminal(where);
 
 	if (modifiers & B_SHIFT_KEY) {
 		fView->fInitialSelectionStart = clickPos;
@@ -620,9 +469,6 @@ void
 TermView::SelectState::MouseMoved(BPoint where, uint32 transit,
 	const BMessage* message, int32 modifiers)
 {
-	if (_StandardMouseMoved(where, modifiers))
-		return;
-
 	if (fCheckMouseTracking) {
 		if (fView->_MouseDistanceSinceLastClick(where) > 9)
 			fMouseTracking = true;
@@ -697,15 +543,7 @@ TermView::SelectState::MouseUp(BPoint where, int32 buttons)
 
 	// When releasing the first mouse button, we copy the selected text to the
 	// clipboard.
-
-	bool reportButtonMouseEvent = fView->TextBuffer()->IsMode(MODE_REPORT_BUTTON_MOUSE_EVENT);
-	bool reportAnyMouseEvent = fView->TextBuffer()->IsMode(MODE_REPORT_ANY_MOUSE_EVENT);
-	bool reportNormalMouseEvent = fView->TextBuffer()->IsMode(MODE_REPORT_NORMAL_MOUSE_EVENT);
-
-	if (reportAnyMouseEvent || reportButtonMouseEvent || reportNormalMouseEvent) {
-		TermPos clickPos = fView->_ConvertToTerminal(where);
-		fView->_SendMouseEvent(0, 0, clickPos.x, clickPos.y, false);
-	} else if ((buttons & B_PRIMARY_MOUSE_BUTTON) == 0
+	if ((buttons & B_PRIMARY_MOUSE_BUTTON) == 0
 		&& (fView->fMouseButtons & B_PRIMARY_MOUSE_BUTTON) != 0) {
 		fView->Copy(fView->fMouseClipboard);
 	}
@@ -717,10 +555,11 @@ TermView::SelectState::MouseUp(BPoint where, int32 buttons)
 void
 TermView::SelectState::_AutoScrollUpdate()
 {
-	if (fMouseTracking && fView->fAutoScrollRunner != NULL
-		&& fView->fScrollBar != NULL) {
-		float value = fView->fScrollBar->Value();
-		fView->_ScrollTo(value + fView->fAutoScrollSpeed, true);
+	if (fMouseTracking && fView->fAutoScrollRunner != NULL) {
+		int32 rows = (int32)(fView->fAutoScrollSpeed / fView->fFontHeight);
+		if (rows == 0)
+			rows = fView->fAutoScrollSpeed < 0 ? -1 : 1;
+		fView->_ScrollToRows(fView->fScrollRows - rows);
 		if (fView->fAutoScrollSpeed < 0) {
 			fView->_ExtendSelection(
 				fView->_ConvertToTerminal(BPoint(0, 0)), true, true);
@@ -743,10 +582,8 @@ TermView::HyperLinkState::HyperLinkState(TermView* view)
 	fPathComponentCharClassifier(
 		BString(kDefaultAdditionalWordCharacters).RemoveFirst("/")),
 	fCurrentDirectory(),
-	fHighlight(),
 	fHighlightActive(false)
 {
-	fHighlight.SetHighlighter(this);
 }
 
 
@@ -784,8 +621,8 @@ void
 TermView::HyperLinkState::MouseDown(BPoint where, int32 buttons,
 	int32 modifiers)
 {
-	TermPos start;
-	TermPos end;
+	TermPoint start;
+	TermPoint end;
 	HyperLink link;
 
 	bool pathPrefixOnly = (modifiers & B_SHIFT_KEY) != 0;
@@ -817,64 +654,42 @@ TermView::HyperLinkState::WindowActivated(bool active)
 }
 
 
-void
-TermView::HyperLinkState::VisibleTextBufferChanged()
-{
-	_UpdateHighlight();
-}
-
-
-rgb_color
-TermView::HyperLinkState::ForegroundColor()
-{
-	return make_color(0, 0, 255);
-}
-
-
-rgb_color
-TermView::HyperLinkState::BackgroundColor()
-{
-	return fView->fTextBackColor;
-}
-
-
-uint32
-TermView::HyperLinkState::AdjustTextAttributes(uint32 attributes)
-{
-	return attributes | UNDERLINE;
-}
-
-
 bool
 TermView::HyperLinkState::_GetHyperLinkAt(BPoint where, bool pathPrefixOnly,
-	HyperLink& _link, TermPos& _start, TermPos& _end)
+	HyperLink& _link, TermPoint& _start, TermPoint& _end)
 {
-	TerminalBuffer* textBuffer = fView->fTextBuffer;
-	BasicTerminalBuffer* visibleTextBuffer = fView->fVisibleTextBuffer;
-	BAutolock textBufferLocker(textBuffer);
-	int32 firstVisible = fView->_LineAt(0);
+	Terminal* terminal = fView->fTerminal;
+	TermPoint pos = fView->_ConvertToTerminal(where);
 
-	TermPos pos = fView->_ConvertToTerminal(where);
-
-	UTF8Char character;
-	Attributes attr;
-	if (visibleTextBuffer->GetChar(pos.y - firstVisible, pos.x, character, attr) == A_CHAR
-		&& attr.Hyperlink() != 0) {
-		if (!textBuffer->GetHyperLink(attr.Hyperlink(), _link))
+	// an OSC 8 link
+	terminal->Lock();
+	TerminalCell cell;
+	bool haveCell = terminal->GetCell(pos.y, pos.x, cell);
+	if (haveCell && cell.IsWideTail() && pos.x > 0)
+		haveCell = terminal->GetCell(pos.y, pos.x - 1, cell);
+	if (haveCell && cell.hyperlink != 0) {
+		std::string uri;
+		std::string identifier;
+		bool found = terminal->GetHyperLink(cell.hyperlink, uri, identifier);
+		terminal->Unlock();
+		if (!found)
 			return false;
-		_GetLinkRange(textBuffer, pos, attr.Hyperlink(), _start, _end);
+		_link = HyperLink(BString(uri.c_str()), cell.hyperlink,
+			BString(identifier.c_str()));
+		_GetLinkRange(pos, cell.hyperlink, _start, _end);
 		return true;
 	}
+	terminal->Unlock();
 
 	// try to get a URL first
 	BString text;
-	if (!textBuffer->FindWord(pos, &fURLCharClassifier, false, _start, _end))
+	if (!fView->_FindWord(pos, &fURLCharClassifier, false, _start, _end))
 		return false;
 
-	_ExtendURLOverLineBreaks(textBuffer, _start, _end);
+	_ExtendURLOverLineBreaks(_start, _end);
 
 	text.Truncate(0);
-	textBuffer->GetStringFromRegion(text, _start, _end);
+	fView->_GetText(_start, _end, text);
 	text.RemoveAll("\n");
 	text.Trim();
 
@@ -889,15 +704,15 @@ TermView::HyperLinkState::_GetHyperLinkAt(BPoint where, bool pathPrefixOnly,
 	}
 
 	// no obvious URL -- try file name
-	if (!textBuffer->FindWord(pos, fView->fCharClassifier, false, _start, _end))
+	if (!fView->_FindWord(pos, fView->fCharClassifier, false, _start, _end))
 		return false;
 
 	// In path-prefix-only mode we determine the end position anew by omitting
 	// the '/' in the allowed word chars.
 	if (pathPrefixOnly) {
-		TermPos componentStart;
-		TermPos componentEnd;
-		if (textBuffer->FindWord(pos, &fPathComponentCharClassifier, false,
+		TermPoint componentStart;
+		TermPoint componentEnd;
+		if (fView->_FindWord(pos, &fPathComponentCharClassifier, false,
 				componentStart, componentEnd)) {
 			_end = componentEnd;
 		} else {
@@ -906,14 +721,13 @@ TermView::HyperLinkState::_GetHyperLinkAt(BPoint where, bool pathPrefixOnly,
 			_end = pos;
 			if (_start == _end) {
 				// Well, must be just "/". Advance to the next position.
-				if (!textBuffer->NextLinePos(_end, false))
-					return false;
+				_end.x++;
 			}
 		}
 	}
 
 	text.Truncate(0);
-	textBuffer->GetStringFromRegion(text, _start, _end);
+	fView->_GetText(_start, _end, text);
 	text.Trim();
 	if (text.IsEmpty())
 		return false;
@@ -921,37 +735,40 @@ TermView::HyperLinkState::_GetHyperLinkAt(BPoint where, bool pathPrefixOnly,
 	// Collect a list of colons in the string and their respective positions in
 	// the text buffer. We do this up-front so we can unlock the text buffer
 	// while we're doing all the entry existence tests.
-	typedef Array<CharPosition> ColonList;
-	ColonList colonPositions;
-	TermPos searchPos = _start;
+	struct ColonPosition {
+		int32		index;
+		TermPoint	position;
+	};
+	std::vector<ColonPosition> colonPositions;
+	TermPoint searchPos = _start;
+	terminal->Lock();
 	for (int32 index = 0; (index = text.FindFirst(':', index)) >= 0;) {
-		TermPos foundStart;
-		TermPos foundEnd;
-		if (!textBuffer->Find(":", searchPos, true, true, false, foundStart,
+		TermPoint foundStart;
+		TermPoint foundEnd;
+		if (!terminal->Find(":", searchPos, true, true, false, foundStart,
 				foundEnd)) {
+			terminal->Unlock();
 			return false;
 		}
 
-		CharPosition colonPosition;
+		ColonPosition colonPosition;
 		colonPosition.index = index;
 		colonPosition.position = foundStart;
-		if (!colonPositions.Add(colonPosition))
-			return false;
+		colonPositions.push_back(colonPosition);
 
 		index++;
 		searchPos = foundEnd;
 	}
-
-	textBufferLocker.Unlock();
+	terminal->Unlock();
 
 	// Since we also want to consider ':' a potential path delimiter, in two
 	// nested loops we chop off components from the beginning respective the
 	// end.
 	BString originalText = text;
-	TermPos originalStart = _start;
-	TermPos originalEnd = _end;
+	TermPoint originalStart = _start;
+	TermPoint originalEnd = _end;
 
-	int32 colonCount = colonPositions.Count();
+	int32 colonCount = colonPositions.size();
 	for (int32 startColonIndex = -1; startColonIndex < colonCount;
 			startColonIndex++) {
 		int32 startIndex;
@@ -1034,62 +851,51 @@ TermView::HyperLinkState::_GetHyperLinkAt(BPoint where, bool pathPrefixOnly,
 	right margin when the next one starts with the same link.
 */
 void
-TermView::HyperLinkState::_GetLinkRange(TerminalBuffer* textBuffer,
-	const TermPos& pos, uint32 link, TermPos& _start, TermPos& _end) const
+TermView::HyperLinkState::_GetLinkRange(const TermPoint& pos, uint32 link,
+	TermPoint& _start, TermPoint& _end) const
 {
-	int32 width = textBuffer->Width();
+	int32 width = fView->fColumns;
 	int32 maxCells = width * kMaxLinkLines;
 
-	TermPos start = pos;
+	TermPoint start = pos;
 	for (int32 i = 0; i < maxCells; i++) {
-		TermPos previous = start;
+		TermPoint previous = start;
 		if (--previous.x < 0) {
 			previous.x = width - 1;
 			previous.y--;
 		}
-		if (!_CellHasLink(textBuffer, previous, link))
+		if (!_CellHasLink(previous, link))
 			break;
 		start = previous;
 	}
 
-	TermPos end = pos;
+	TermPoint end = pos;
 	for (int32 i = 0; i < maxCells; i++) {
-		TermPos next = end;
+		TermPoint next = end;
 		if (++next.x >= width) {
 			next.x = 0;
 			next.y++;
 		}
-		if (!_CellHasLink(textBuffer, next, link))
+		if (!_CellHasLink(next, link))
 			break;
 		end = next;
 	}
 
 	_start = start;
-	_end.SetTo(end.x + 1, end.y);
+	_end = TermPoint(end.x + 1, end.y);
 }
 
 
 bool
-TermView::HyperLinkState::_CellHasLink(TerminalBuffer* textBuffer,
-	const TermPos& pos, uint32 link) const
+TermView::HyperLinkState::_CellHasLink(const TermPoint& pos, uint32 link) const
 {
-	if (pos.y < -textBuffer->HistorySize() || pos.y >= textBuffer->Height())
-		return false;
-
-	UTF8Char character;
-	Attributes attributes;
-	switch (textBuffer->GetChar(pos.y, pos.x, character, attributes)) {
-		case A_CHAR:
-			return attributes.Hyperlink() == link;
-		case IN_STRING:
-			// the second half of a full width character
-			return pos.x > 0
-				&& textBuffer->GetChar(pos.y, pos.x - 1, character, attributes)
-					== A_CHAR
-				&& attributes.Hyperlink() == link;
-		default:
-			return false;
-	}
+	Terminal* terminal = fView->fTerminal;
+	terminal->Lock();
+	TerminalCell cell;
+	bool result = terminal->GetCell(pos.y, pos.x, cell)
+		&& cell.hyperlink == link;
+	terminal->Unlock();
+	return result;
 }
 
 
@@ -1101,21 +907,26 @@ TermView::HyperLinkState::_CellHasLink(TerminalBuffer* textBuffer,
 	backwards.
 */
 void
-TermView::HyperLinkState::_ExtendURLOverLineBreaks(TerminalBuffer* textBuffer,
-	TermPos& _start, TermPos& _end)
+TermView::HyperLinkState::_ExtendURLOverLineBreaks(TermPoint& _start,
+	TermPoint& _end)
 {
-	int32 width = textBuffer->Width();
+	Terminal* terminal = fView->fTerminal;
+	int32 width = fView->fColumns;
 
 	for (int32 i = 0; i < kMaxLinkLines && _start.x == 0; i++) {
 		int32 row = _start.y - 1;
-		if (row < -textBuffer->HistorySize() || textBuffer->LineLength(row) != width)
+		terminal->Lock();
+		bool full = row >= -terminal->HistorySize()
+			&& terminal->LineLength(row) == width;
+		terminal->Unlock();
+		if (!full)
 			break;
 
-		TermPos start;
-		TermPos end;
-		if (!textBuffer->FindWord(TermPos(width - 1, row), &fURLCharClassifier,
+		TermPoint start;
+		TermPoint end;
+		if (!fView->_FindWord(TermPoint(width - 1, row), &fURLCharClassifier,
 				false, start, end)
-			|| end != TermPos(width, row)) {
+			|| end != TermPoint(width, row)) {
 			break;
 		}
 		_start = start;
@@ -1123,14 +934,14 @@ TermView::HyperLinkState::_ExtendURLOverLineBreaks(TerminalBuffer* textBuffer,
 
 	for (int32 i = 0; i < kMaxLinkLines && _end.x == width; i++) {
 		int32 row = _end.y + 1;
-		if (row >= textBuffer->Height())
+		if (row >= fView->fRows)
 			break;
 
-		TermPos start;
-		TermPos end;
-		if (!textBuffer->FindWord(TermPos(0, row), &fURLCharClassifier, false,
+		TermPoint start;
+		TermPoint end;
+		if (!fView->_FindWord(TermPoint(0, row), &fURLCharClassifier, false,
 				start, end)
-			|| start != TermPos(0, row)) {
+			|| start != TermPoint(0, row)) {
 			break;
 		}
 		_end = end;
@@ -1178,8 +989,8 @@ TermView::HyperLinkState::_UpdateHighlight()
 void
 TermView::HyperLinkState::_UpdateHighlight(BPoint where, int32 modifiers)
 {
-	TermPos start;
-	TermPos end;
+	TermPoint start;
+	TermPoint end;
 	HyperLink link;
 
 	bool pathPrefixOnly = (modifiers & B_SHIFT_KEY) != 0;
@@ -1191,21 +1002,15 @@ TermView::HyperLinkState::_UpdateHighlight(BPoint where, int32 modifiers)
 
 
 void
-TermView::HyperLinkState::_ActivateHighlight(const TermPos& start,
-	const TermPos& end)
+TermView::HyperLinkState::_ActivateHighlight(const TermPoint& start,
+	const TermPoint& end)
 {
-	if (fHighlightActive) {
-		if (fHighlight.Start() == start && fHighlight.End() == end)
-			return;
-
-		_DeactivateHighlight();
+	fView->_SetLinkHighlight(start, end);
+	if (!fHighlightActive) {
+		BCursor cursor(B_CURSOR_ID_FOLLOW_LINK);
+		fView->SetViewCursor(&cursor);
+		fHighlightActive = true;
 	}
-
-	fHighlight.SetRange(start, end);
-	fView->_AddHighlight(&fHighlight);
-	BCursor cursor(B_CURSOR_ID_FOLLOW_LINK);
-	fView->SetViewCursor(&cursor);
-	fHighlightActive = true;
 }
 
 
@@ -1213,10 +1018,11 @@ void
 TermView::HyperLinkState::_DeactivateHighlight()
 {
 	if (fHighlightActive) {
-		fView->_RemoveHighlight(&fHighlight);
-		BCursor cursor(B_CURSOR_ID_SYSTEM_DEFAULT);
-		fView->SetViewCursor(&cursor);
+		fView->_ClearLinkHighlight();
 		fHighlightActive = false;
+		BCursor cursor(fView->_ReportsMouse() ? B_CURSOR_ID_SYSTEM_DEFAULT
+			: B_CURSOR_ID_I_BEAM);
+		fView->SetViewCursor(&cursor);
 	}
 }
 
@@ -1305,19 +1111,8 @@ TermView::HyperLinkMenuState::MessageReceived(BMessage* message)
 		{
 			if (fLink.IsValid()) {
 				BString toCopy = fLink.Address();
-
-				if (!be_clipboard->Lock())
-					return true;
-
-				be_clipboard->Clear();
-
-				if (BMessage *data = be_clipboard->Data()) {
-					data->AddData("text/plain", B_MIME_TYPE, toCopy.String(),
-						toCopy.Length());
-					be_clipboard->Commit();
-				}
-
-				be_clipboard->Unlock();
+				fView->_PutOnClipboard(be_clipboard, toCopy.String(),
+					toCopy.Length());
 			}
 			return true;
 		}

@@ -1,0 +1,105 @@
+/*
+ * Copyright 2026, Haiku, Inc. All rights reserved.
+ * Distributed under the terms of the MIT License.
+ */
+#ifndef GLYPH_CACHE_H
+#define GLYPH_CACHE_H
+
+
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include <Font.h>
+
+#include "RenderFrame.h"
+
+
+class BBitmap;
+class BView;
+
+
+// glyph styles
+enum {
+	GLYPH_BOLD		= 0x1,
+	GLYPH_ITALIC	= 0x2
+};
+
+
+/*!	Glyphs drawn once by app_server (so they look like all other text) at
+	the frame buffer's density, kept in an atlas of cell sized slots that
+	the renderers draw from. Box drawing and block characters are drawn
+	here instead, to meet exactly from cell to cell.
+*/
+class GlyphCache {
+public:
+								GlyphCache();
+								~GlyphCache();
+
+			//! Sets the font, at its size in view coordinates, and how
+			//! many frame buffer pixels a view coordinate has.
+			void				SetFont(const BFont& font, float scale,
+									bool allowBold, bool emulateBold);
+			const RenderMetrics& Metrics() const	{ return fMetrics; }
+			//! The cell size in view coordinates.
+			float				CellWidth() const;
+			float				CellHeight() const;
+
+			/*!	The slot of a glyph, given as UTF-8, that is \a cells wide.
+				New glyphs get a slot at once and are drawn by
+				DrawPending(). Returns 0 when there is no room.
+			*/
+			uint32				Lookup(uint64 key, const char* utf8,
+									uint32 firstCodePoint, int32 cells,
+									uint32 style);
+			bool				HasPending() const
+									{ return !fPending.empty(); }
+			//! Draws the glyphs looked up since the last call.
+			void				DrawPending();
+
+			//! Changes when every slot was given up (the atlas was full or
+			//! the font changed): renderers must look up all glyphs again.
+			uint32				Epoch() const		{ return fEpoch; }
+
+			const GlyphAtlasInfo& Atlas() const		{ return fAtlas; }
+
+private:
+			struct Pending {
+				uint32			slot;
+				std::string		text;
+				uint32			codePoint;
+				int32			cells;
+				uint32			style;
+			};
+
+			void				_Reset();
+			uint32				_AllocateSlot(int32 cells);
+			bool				_AddPage();
+			void				_MarkDirty(int32 page, int32 top,
+									int32 bottom);
+			bool				_EnsureStaging(int32 width, int32 height);
+			void				_EmboldenSlot(uint32 slot, int32 cells);
+
+private:
+			BFont				fFonts[4];		// by style
+			float				fScale;
+			bool				fAllowBold;
+			bool				fEmulateBold;
+			RenderMetrics		fMetrics;
+			float				fFontAscent;
+
+			std::unordered_map<uint64, uint32> fSlots;
+			std::vector<Pending> fPending;
+			uint32				fNextSlot;
+			uint32				fEpoch;
+
+			std::vector<uint8*>	fPages;
+			std::vector<GlyphAtlasInfo::Dirty> fDirty;
+			GlyphAtlasInfo		fAtlas;
+
+			BBitmap*			fStaging;
+			BView*				fStagingView;
+};
+
+
+#endif	// GLYPH_CACHE_H

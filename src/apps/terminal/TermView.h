@@ -1,5 +1,5 @@
 /*
- * Copyright 2001-2023, Haiku, Inc. All rights reserved.
+ * Copyright 2001-2026, Haiku, Inc. All rights reserved.
  * Copyright (c) 2003-4 Kian Duffy <myob@users.sourceforge.net>
  * Parts Copyright (C) 1998,99 Kazuho Okui and Takashi Murai.
  *
@@ -15,43 +15,44 @@
 #define TERMVIEW_H
 
 
-#include <Autolock.h>
 #include <HashMap.h>
 #include <InterfaceDefs.h>
+#include <Locker.h>
 #include <Messenger.h>
-#include <ObjectList.h>
 #include <String.h>
 #include <View.h>
 
-#include "TerminalLine.h"
-#include "TermPos.h"
-#include "TermViewHighlight.h"
+#include <atomic>
+#include <deque>
+#include <map>
+#include <string>
+#include <vector>
+
+#include "FrameBuilder.h"
+#include "GlyphCache.h"
+#include "RenderFrame.h"
+#include "Terminal.h"
 
 
 class ActiveProcessInfo;
+class BBitmap;
 class BClipboard;
 class BMessageRunner;
 class BScrollBar;
 class BScrollView;
 class BString;
 class BStringView;
-class BasicTerminalBuffer;
 class DefaultCharClassifier;
 class InlineInput;
-class ResizeWindow;
 class ShellInfo;
 class ShellParameters;
-class TermBuffer;
-class TerminalBuffer;
 class Shell;
+class TermRenderer;
 
 
-class TermView : public BView, private TermViewHighlighter {
+class TermView : public BView, private Terminal::Listener {
 public:
 			class Listener;
-
-			typedef TermViewHighlighter Highlighter;
-			typedef TermViewHighlight Highlight;
 
 public:
 								TermView(BRect frame,
@@ -74,8 +75,6 @@ public:
 			bool				GetShellInfo(ShellInfo& _info) const;
 
 			const char*			TerminalName() const;
-
-	inline	TerminalBuffer*		TextBuffer() const	{ return fTextBuffer; }
 
 			void				GetTermFont(BFont* font) const;
 			void				SetTermFont(const BFont* font);
@@ -137,6 +136,10 @@ public:
 			void				SetListener(Listener* listener)
 									{ fListener = listener; }
 
+			//! How the terminal is drawn: "OpenGL: <renderer>" or
+			//! "software".
+			const char*			RendererName() const;
+
 protected:
 	virtual void				AttachedToWindow();
 	virtual void				DetachedFromWindow();
@@ -144,6 +147,7 @@ protected:
 	virtual void				WindowActivated(bool active);
 	virtual void				MakeFocus(bool focusState = true);
 	virtual void				KeyDown(const char* bytes, int32 numBytes);
+	virtual void				KeyUp(const char* bytes, int32 numBytes);
 
 	virtual void				MouseDown(BPoint where);
 	virtual void				MouseMoved(BPoint where, uint32 transit,
@@ -162,9 +166,6 @@ protected:
 									const char* property);
 
 private:
-			class TextBufferSyncLocker;
-			friend class TextBufferSyncLocker;
-
 			class State;
 			class StandardBaseState;
 			class DefaultState;
@@ -179,65 +180,113 @@ private:
 			friend class HyperLinkState;
 			friend class HyperLinkMenuState;
 
-			typedef BObjectList<Highlight> HighlightList;
+			struct Highlight {
+				TermPoint	start;
+				TermPoint	end;		// exclusive
+				bool		IsEmpty() const	{ return start == end; }
+			};
+
+			struct Event;
 
 private:
-			// TermViewHighlighter
-	virtual	rgb_color			ForegroundColor();
-	virtual	rgb_color			BackgroundColor();
+	// Terminal::Listener, called on the reader thread with the terminal
+	// locked
+	virtual	void				TerminalContentsChanged();
+	virtual	void				TerminalTitleChanged(const char* title);
+	virtual	void				TerminalIconTitleChanged(const char* title);
+	virtual	void				TerminalBell();
+	virtual	void				TerminalSetClipboard(const char* selections,
+									const void* data, size_t length);
+	virtual	void				TerminalRequestClipboard(
+									const char* selections);
+	virtual	void				TerminalClipboardWrite(bool primary,
+									const ClipboardData& data,
+									const char* identifier);
+	virtual	void				TerminalClipboardRead(bool primary,
+									const std::vector<std::string>& types,
+									const char* identifier,
+									const char* programName);
+	virtual	void				TerminalNotify(
+									const TermNotification& notification);
+	virtual	void				TerminalCloseNotification(
+									const char* identifier);
+	virtual	void				TerminalPointerShapeChanged(
+									const char* shape);
+	virtual	void				TerminalColorsChanged();
+	virtual	void				TerminalWorkingDirectoryChanged(
+									const char* url);
+	virtual	void				TerminalModesChanged();
+	virtual	void				TerminalProgressChanged(int32 state,
+									int32 percent);
 
 private:
-			// point and text offset conversion
-			int32				_LineAt(float y) const;
-	inline	float				_LineOffset(int32 index) const;
-			TermPos				_ConvertToTerminal(const BPoint& point) const;
-	inline	BPoint				_ConvertFromTerminal(const TermPos& pos) const;
-
-	inline	void				_InvalidateTextRect(int32 x1, int32 y1,
-									int32 x2, int32 y2);
-
 			status_t			_InitObject(
 									const ShellParameters& shellParameters);
-
 			void				_GetArgumentsFromMessage(const BMessage* message,
 									const char**& argv, int32& argc);
 
-			status_t			_AttachShell(Shell* shell, const ShellParameters& shellParameters);
+			status_t			_AttachShell(Shell* shell,
+									const ShellParameters& shellParameters);
 			Shell*				_DetachShell();
+			status_t			_StartReader();
+			void				_StopReader();
+	static	status_t			_ReaderThread(void* data);
+			void				_ReadLoop();
+	static	status_t			_WriterThread(void* data);
+			void				_WriteLoop();
 
 			void				_Activate();
 			void				_Deactivate();
 
-			void				_DrawLinePart(float x1, float y1, Attributes attr,
-									char* buffer, int32 width,
-									Highlight* highlight, bool cursor,
-									BView* inView);
-			void				_DrawCursor();
-			void				_InvalidateTextRange(TermPos start,
-									TermPos end);
+			// geometry
+			float				_DeviceScale() const;
+			void				_UpdateMetrics();
+			void				_ResizeBitmap();
+			int32				_FirstRow() const;
+			TermPoint			_ConvertToTerminal(const BPoint& point) const;
+			BPoint				_ConvertFromTerminal(const TermPoint& pos)
+									const;
+			void				_PixelPosition(const BPoint& point,
+									int32& x, int32& y) const;
 
+			// drawing
+			void				_ScheduleFrame();
+			void				_RenderFrame();
+			void				_InvalidateAll();
+			void				_LoadRenderer();
+			void				_PostEvent(Event* event);
+			void				_HandleEvents();
+			void				_UpdateScrollBarRange();
+
+			// cursor
 			bool				_IsCursorVisible() const;
 			void				_BlinkCursor();
 			void				_ActivateCursor(bool invalidate);
 
-			void				_DoPrint(BRect updateRect);
-			void				_UpdateScrollBarRange();
-			void				_SecondaryMouseButtonDropped(BMessage* message);
-			void				_DoSecondaryMouseDropAction(BMessage* message);
-			void				_DoFileDrop(entry_ref &ref);
-
-			void				_SynchronizeWithTextBuffer(
-									int32 visibleDirtyTop,
-									int32 visibleDirtyBottom);
-			void				_VisibleTextBufferChanged();
-
+			// writing to the shell
 			void				_WritePTY(const char* text, int32 numBytes);
+			void				_Send(const std::string& data);
+			void				_SendKey(const TermKeyEvent& event);
+			bool				_TranslateKey(const BMessage* message,
+									bool keyUp, TermKeyEvent& event,
+									BString& text);
+			void				_SendMouseEvent(int32 type, int32 button,
+									BPoint where, int32 modifiers);
+			bool				_ReportsMouse() const;
+			void				_UpdateSIGWINCH();
+
+			// scrolling
+			void				_ScrollTo(float y, bool scrollGfx);
+			void				_ScrollToRows(int32 rows);
+			void				_ScrollToRange(TermPoint start, TermPoint end);
+			void				_ScrollToBottom();
+			void				_ScrollToPrompt(bool forward);
 
 			// selection
 			float				_MouseDistanceSinceLastClick(BPoint where);
-			void				_Select(TermPos start, TermPos end,
+			void				_Select(TermPoint start, TermPoint end,
 									bool inclusive, bool setInitialSelection);
-			void				_ExtendSelection(TermPos, bool inclusive,
+			void				_ExtendSelection(TermPoint, bool inclusive,
 									bool useInitialSelection);
 			void				_Deselect();
 			bool				_HasSelection() const;
@@ -245,80 +294,99 @@ private:
 									bool useInitialSelection);
 			void				_SelectLine(BPoint where, bool extend,
 									bool useInitialSelection);
+			bool				_FindWord(TermPoint position,
+									DefaultCharClassifier* classifier,
+									bool findNonWords, TermPoint& start,
+									TermPoint& end) const;
+			void				_GetText(TermPoint start, TermPoint end,
+									BString& text) const;
+			void				_SetLinkHighlight(TermPoint start,
+									TermPoint end);
+			void				_ClearLinkHighlight();
 
-			void				_AddHighlight(Highlight* highlight);
-			void				_RemoveHighlight(Highlight* highlight);
-			bool				_ClearHighlight(Highlight* highlight);
+			// drag and drop, clipboard
+			void				_SecondaryMouseButtonDropped(BMessage* message);
+			void				_DoSecondaryMouseDropAction(BMessage* message);
+			void				_DoFileDrop(entry_ref &ref);
+			void				_PasteText(const char* text, size_t length);
+			void				_PutOnClipboard(BClipboard* clipboard,
+									const char* text, size_t length);
 
-			Highlight*			_CheckHighlightRegion(const TermPos& pos) const;
-			Highlight*			_CheckHighlightRegion(int32 row,
-									int32 firstColumn, int32& lastColumn) const;
-
-			void				_UpdateSIGWINCH();
-
-			void				_ScrollTo(float y, bool scrollGfx);
-			void				_ScrollToRange(TermPos start, TermPos end);
-
-			void				_SendMouseEvent(int32 button, int32 mode,
-									int32 x, int32 y, bool motion,
-									bool upEvent = false);
-
+			// input methods
 			void				_DrawInlineMethodString();
 			void				_HandleInputMethodChanged(BMessage* message);
 			void				_HandleInputMethodLocationRequest();
 			void				_CancelInputMethod();
 
 			void				_UpdateModifiers();
-
 			void				_NextState(State* state);
+			void				_SetPointerShape(const char* shape);
 
 private:
 			Listener*			fListener;
 			Shell*				fShell;
+			Terminal*			fTerminal;
+
+			thread_id			fReaderThread;
+			std::atomic<bool>	fReaderQuit;
+			thread_id			fWriterThread;
+			std::atomic<bool>	fWriterQuit;
+			sem_id				fWriteSemaphore;
+			BLocker				fWriteLock;
+			std::deque<std::string> fWriteQueue;
+			std::atomic<bool>	fFramePending;
+			int32				fConverterState;	// non-UTF-8 encodings
+
+			std::vector<Event*>	fEvents;		// guarded by the terminal
+			bool				fEventsPosted;
 
 			BMessageRunner*		fWinchRunner;
 			BMessageRunner*		fCursorBlinkRunner;
 			BMessageRunner*		fAutoScrollRunner;
 			BMessageRunner*		fResizeRunner;
+			BMessageRunner*		fFrameRunner;
+			BMessageRunner*		fAnimationRunner;
 			BStringView*		fResizeView;
 			DefaultCharClassifier* fCharClassifier;
 
-			// Font and Width
-			BFont				fHalfFont;
-			BFont				fBoldFont;
-			float					fFontWidth;
-			int					fFontHeight;
-			int					fFontAscent;
-			struct escapement_delta fEscapement;
+			// the font and the cells
+			BFont				fFont;
 			bool				fEmulateBold;
 			bool				fAllowBold;
+			float				fFontWidth;		// view coordinates
+			float				fFontHeight;
+			float				fScale;
+
+			// drawing
+			GlyphCache			fGlyphs;
+			FrameBuilder		fBuilder;
+			RenderFrame			fFrame;
+			TermRenderer*		fRenderer;
+			TermRenderer*		fSoftwareRenderer;
+			BBitmap*			fBitmap;
+			bigtime_t			fLastFrameTime;
+			bool				fFrameNeeded;
 
 			// frame resized flag.
 			bool				fFrameResized;
 			int32				fResizeViewDisableCount;
 
-			// Cursor Blinking, draw flag.
+			// cursor blinking
 			bigtime_t			fLastActivityTime;
 			int32				fCursorState;
+			bool				fCursorBlinking;
 
-			// Cursor position.
-			TermPos				fCursor;
-
-			// Terminal rows and columns.
+			// terminal rows and columns
 			int					fColumns;
 			int					fRows;
 
 			int					fEncoding;
 			bool				fActive;
 
-			// Object pointer.
-			TerminalBuffer*		fTextBuffer;
-			BasicTerminalBuffer* fVisibleTextBuffer;
-			bool				fVisibleTextBufferChanged;
 			BScrollBar*			fScrollBar;
 			InlineInput*		fInline;
 
-			// Color and Attributes.
+			// colors
 			rgb_color			fTextForeColor;
 			rgb_color			fTextBackColor;
 			rgb_color			fCursorForeColor;
@@ -326,26 +394,19 @@ private:
 			rgb_color			fSelectForeColor;
 			rgb_color			fSelectBackColor;
 
-			// Scroll Region
-			float				fScrollOffset;
+			// scrolling: rows scrolled back into the history
+			int32				fScrollRows;
+			uint64				fLinesScrolled;
+			int32				fHistorySize;
 			int32				fScrBufSize;
-				// TODO: That's the history capacity -- only needed
-				// until the text buffer is created.
 			float				fAutoScrollSpeed;
-
-			// redraw management
-			bigtime_t			fLastSyncTime;
-			int32				fScrolledSinceLastSync;
-			BMessageRunner*		fSyncRunner;
-			bool				fConsiderClockedSync;
 
 			// selection
 			Highlight			fSelection;
-			TermPos				fInitialSelectionStart;
-			TermPos				fInitialSelectionEnd;
+			TermPoint			fInitialSelectionStart;
+			TermPoint			fInitialSelectionEnd;
 			BPoint				fLastClickPoint;
-
-			HighlightList		fHighlights;
+			Highlight			fLinkHighlight;
 
 			// keyboard
 			const key_map*		fKeymap;
@@ -353,12 +414,18 @@ private:
 			HashMap<HashKey32<int32>, const int32(*)[128]>
 								fKeymapTableForModifiers;
 			bool				fUseOptionAsMetaKey;
+			int32				fPressedModifierKeys;
 
 			// mouse
 			int32				fMouseButtons;
 			int32				fModifiers;
-			TermPos				fPrevPos;
+			TermPoint			fPrevPos;
 			BClipboard*			fMouseClipboard;
+			BString				fPointerShape;
+
+			// notifications the program sent, by our id
+			std::map<std::string, std::string> fNotifications;
+			int32				fNotificationCounter;
 
 			// states
 			DefaultState*		fDefaultState;

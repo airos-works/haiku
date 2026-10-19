@@ -409,7 +409,10 @@ Terminal::CsiDispatch(const VTSequence& sequence)
 				}
 				return;
 			case 'u':	// kitty keyboard protocol: query
-				_KeyboardProtocol(s);
+				// only without parameters: "CSI ? flags u" is the answer,
+				// which would come back with the terminal's echo on
+				if (s.parameterCount == 0)
+					_KeyboardProtocol(s);
 				return;
 			case 'W':	// DECST8C: tab stops every 8 columns
 				if (s.Parameter(0, 0) == 5)
@@ -1000,10 +1003,10 @@ Terminal::_ParseSGRColor(const VTSequence& s, int32 index, TermColor& color)
 		int32 count = s.SubParameterCount(index);
 		int32 type = s.Parameter(index + 1, -1);
 		if (type == 5 && count >= 2) {
-			color = indexed_color(s.Parameter(index + 2, 0) & 0xff);
+			color = palette_color(s.Parameter(index + 2, 0) & 0xff);
 		} else if (type == 2 && count >= 4) {
 			int32 first = count >= 5 ? index + 3 : index + 2;
-			color = direct_color(s.Parameter(first, 0) & 0xff,
+			color = rgb_color_value(s.Parameter(first, 0) & 0xff,
 				s.Parameter(first + 1, 0) & 0xff,
 				s.Parameter(first + 2, 0) & 0xff);
 		} else
@@ -1016,13 +1019,13 @@ Terminal::_ParseSGRColor(const VTSequence& s, int32 index, TermColor& color)
 	if (type == 5) {
 		if (index + 2 >= s.parameterCount)
 			return -1;
-		color = indexed_color(s.Parameter(index + 2, 0) & 0xff);
+		color = palette_color(s.Parameter(index + 2, 0) & 0xff);
 		return index + 2;
 	}
 	if (type == 2) {
 		if (index + 4 >= s.parameterCount)
 			return -1;
-		color = direct_color(s.Parameter(index + 2, 0) & 0xff,
+		color = rgb_color_value(s.Parameter(index + 2, 0) & 0xff,
 			s.Parameter(index + 3, 0) & 0xff,
 			s.Parameter(index + 4, 0) & 0xff);
 		return index + 4;
@@ -1180,13 +1183,13 @@ Terminal::_ApplySGR(const VTSequence& s, int32 start, int32 end,
 				break;
 			default:
 				if (value >= 30 && value <= 37)
-					style.foreground = indexed_color(value - 30);
+					style.foreground = palette_color(value - 30);
 				else if (value >= 40 && value <= 47)
-					style.background = indexed_color(value - 40);
+					style.background = palette_color(value - 40);
 				else if (value >= 90 && value <= 97)
-					style.foreground = indexed_color(value - 90 + 8);
+					style.foreground = palette_color(value - 90 + 8);
 				else if (value >= 100 && value <= 107)
-					style.background = indexed_color(value - 100 + 8);
+					style.background = palette_color(value - 100 + 8);
 				break;
 		}
 	}

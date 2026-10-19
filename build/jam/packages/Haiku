@@ -507,6 +507,7 @@ AddFilesToPackage add-ons kernel network protocols
 
 AddFilesToPackage add-ons Screen\ Savers : $(SYSTEM_ADD_ONS_SCREENSAVERS) ;
 AddFilesToPackage add-ons quick_look : $(SYSTEM_ADD_ONS_QUICK_LOOK) ;
+AddFilesToPackage add-ons Terminal : $(SYSTEM_ADD_ONS_TERMINAL) ;
 
 AddFilesToPackage add-ons disk_systems :
 	<disk_system>fat

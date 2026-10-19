@@ -46,8 +46,6 @@
 #include "ActiveProcessInfo.h"
 #include "ShellParameters.h"
 #include "TermConst.h"
-#include "TermParse.h"
-#include "TerminalBuffer.h"
 
 
 #ifndef CEOF
@@ -96,9 +94,7 @@ typedef struct
 Shell::Shell()
 	:
 	fFd(-1),
-	fProcessID(-1),
-	fTermParse(NULL),
-	fAttached(false)
+	fProcessID(-1)
 {
 }
 
@@ -115,26 +111,13 @@ Shell::Open(int row, int col, const ShellParameters& parameters)
 	if (fFd >= 0)
 		return B_ERROR;
 
-	status_t status = _Spawn(row, col, parameters);
-	if (status < B_OK)
-		return status;
-
-	fTermParse = new (std::nothrow) TermParse(fFd);
-	if (fTermParse == NULL) {
-		Close();
-		return B_NO_MEMORY;
-	}
-
-	return B_OK;
+	return _Spawn(row, col, parameters);
 }
 
 
 void
 Shell::Close()
 {
-	delete fTermParse;
-	fTermParse = NULL;
-
 	if (fFd >= 0) {
 		close(fFd);
 		kill(-fShellInfo.ProcessID(), SIGHUP);
@@ -174,11 +157,15 @@ Shell::Write(const void *buffer, size_t numBytes)
 
 
 status_t
-Shell::UpdateWindowSize(int rows, int columns)
+Shell::UpdateWindowSize(int rows, int columns, int pixelWidth,
+	int pixelHeight)
 {
+	// programs that show images ask the pixel size
 	struct winsize winSize;
 	winSize.ws_row = rows;
 	winSize.ws_col = columns;
+	winSize.ws_xpixel = pixelWidth;
+	winSize.ws_ypixel = pixelHeight;
 	if (ioctl(fFd, TIOCSWINSZ, &winSize) != 0)
 		return errno;
 	return B_OK;
@@ -257,28 +244,6 @@ Shell::GetActiveProcessInfo(ActiveProcessInfo& _info) const
 	_info.SetTo(process, name, cwdPath.Path());
 
 	return true;
-}
-
-
-status_t
-Shell::AttachBuffer(TerminalBuffer *buffer)
-{
-	if (fAttached)
-		return B_ERROR;
-
-	fAttached = true;
-
-	return fTermParse->StartThreads(buffer);
-}
-
-
-void
-Shell::DetachBuffer()
-{
-	if (fAttached) {
-		fTermParse->StopThreads();
-		fAttached = false;
-	}
 }
 
 
@@ -533,6 +498,11 @@ Shell::_Spawn(int row, int col, const ShellParameters& parameters)
 		// when told. Either is left as it is when already set.
 		setenv("BROWSER", "/bin/open", false);
 		setenv("FORCE_HYPERLINK", "1", false);
+
+		// for programs that look for the terminal by name; what it can do
+		// they find out by asking it
+		setenv("TERM_PROGRAM", "airos-terminal", true);
+		setenv("TERM_PROGRAM_VERSION", "2.0", true);
 
 		// set the current working directory, if one is given
 		if (parameters.CurrentDirectory().Length() > 0)

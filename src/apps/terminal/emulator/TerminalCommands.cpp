@@ -617,6 +617,10 @@ Terminal::_KittyColors(const char* spec)
 			}
 		}
 
+		// our own answer echoed back
+		if (key == "unknown")
+			continue;
+
 		bool known = index >= 0 || key == "visual_bell"
 			|| key.compare(0, 28, "transparent_background_color") == 0;
 		if (!known || index < 0) {
@@ -844,6 +848,8 @@ Terminal::_ClipboardProtocol(const char* data)
 			return;	// malformed
 		std::string key = pairs[i].substr(0, equals);
 		std::string value = pairs[i].substr(equals + 1);
+		if (key == "status")
+			return;	// an answer (echoed back), not a request
 		if (key == "type")
 			type = value;
 		else if (key == "mime") {
@@ -1219,10 +1225,16 @@ Terminal::_KittyNotification(const char* metadata, const char* payload)
 
 	std::string replyId = identifier.empty() ? "0" : identifier;
 
+	// The answers to these carry a payload; with the terminal's echo on they
+	// come back, and must not be answered again.
+	if ((payloadType == "?" || payloadType == "alive") && payload[0] != '\0')
+		return;
+
 	if (payloadType == "?") {
-		fOutput += "\x1b]99;i=" + replyId + ":p=?;a=focus,report:c=1"
-			":o=always,unfocused,invisible:p=title,body,close,?,alive"
-			":s=system,silent:u=0,1,2\x1b\\";
+		// Haiku's notifications cannot tell a program that they were
+		// clicked or closed, have no buttons and cannot be taken back
+		fOutput += "\x1b]99;i=" + replyId + ":p=?;o=always,unfocused"
+			":p=title,body,?:s=system,silent:u=0,1,2\x1b\\";
 		return;
 	}
 

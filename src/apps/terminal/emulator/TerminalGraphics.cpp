@@ -335,6 +335,21 @@ TerminalGraphics::HandleCommand(const char* data, size_t length)
 	std::string payload;
 	_ParseCommand(data, length, command, payload);
 
+	// Our own answer ("i=31;OK", "i=31;ENOENT:..."), echoed back by the
+	// terminal's line discipline, is not a command.
+	const char* separator = (const char*)memchr(data, ';', length);
+	if (separator != NULL && !fLoading) {
+		std::string keys(data, separator - data);
+		bool onlyIds = keys.find_first_not_of("iIp=0123456789,")
+			== std::string::npos;
+		bool answer = payload == "OK" || (payload.size() > 2
+			&& payload[0] == 'E' && payload.find(':') != std::string::npos
+			&& payload.find(':') <= payload.find_first_not_of(
+				"ABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+		if (onlyIds && answer)
+			return;
+	}
+
 	if (fLoading) {
 		// a chunk of a transmission in progress: only m, q and a=f count
 		if (command.action == 'd') {
