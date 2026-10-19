@@ -144,6 +144,19 @@ Known limits:
   queues (RADV offers no SDMA queue on Polaris).
 - Vulkan presents by copying (no dma-buf on Haiku): GPU blit to host memory,
   copy into the window's shared buffer.
+- Host memory imports (`DRM_AMDGPU_GEM_USERPTR`, RADV's
+  `VK_EXT_external_memory_host`, jmgasper/haiku#38) wire the pages for the
+  buffer's whole life instead of following them with HMM: the memory has to
+  stay mapped until the buffer is freed. `delete_area()` or `munmap()` of it
+  before then waits, uninterruptibly, until the buffer is gone, so a
+  program that frees the memory first hangs and cannot be killed. A team
+  that `exec()`s while it holds such a buffer is not covered either (its
+  areas go before its files; a KDEBUG kernel panics). A team that dies is:
+  the driver watches it, waits for the GPU and lets the pages go before its
+  address space goes. Verified on the Framework 13 (2026-10-19): Summit's
+  copy into app_server's back buffer, kill -9 of the importing program while
+  the GPU writes, a display layout change while the old back buffer is
+  imported.
 - Wayland clients (vkwayland) sometimes crash as they exit: the in-process
   Wayland server's window thread (`wayland_server` 0.1.20251004, HaikuPorts)
   runs on in `BWindow::task_looper()` after the program has unloaded the
@@ -290,6 +303,10 @@ In `src/forks/linux-drm/haiku/tests`, built on the workstation:
   "haiku_selftest 2" in the driver settings): the same for the fake
   device's buffers, whose "move" poisons the old pages - clones, fork(),
   areas deleted by the team, moves racing with writes and new mappings
+- `amdgpu_userptr [rounds]`: host memory (a clone of a `B_NO_LOCK` area)
+  imported and written by the GPU, refusals, and children killed while the
+  GPU writes into their memory; `fakeuserptr` does the same in the virtual
+  machine with the fake device
 - `drmparam NAME VALUE`: a module parameter of the running driver
   (`DRM_HAIKU_IOCTL_SET_PARAM`); `drmparam debug 0x16` around a refused
   mode set logs amdgpu_dm's reason (and fills the syslog quickly),
