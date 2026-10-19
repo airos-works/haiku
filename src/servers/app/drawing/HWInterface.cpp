@@ -709,6 +709,9 @@ struct HWInterface::FlushTarget {
 	bigtime_t		scanStart;		// when its frame's scan began, and
 	bigtime_t		scanPeriod;		// how long a frame takes (from it)
 	bigtime_t		period;			// between blanks
+	bigtime_t		modePeriod;		// a frame by the timing it is driven
+									// with (0: not known); written under
+									// fFlushLock
 	IntRect			scanFrame;		// what the scan runs over (the
 									// target's frame, or the buffer)
 	thread_id		thread;
@@ -840,6 +843,22 @@ HWInterface::_AbandonFlushing()
 
 
 static const int32 kMaxFlushTargets = 16;
+static const bigtime_t kDefaultFramePeriod = 16667;
+
+
+/*!	How long a frame takes with this timing, in microseconds; 0 when the
+	timing does not say (or says something no display does). */
+static bigtime_t
+frame_period(const display_timing& timing)
+{
+	if (timing.pixel_clock == 0 || timing.h_total == 0 || timing.v_total == 0)
+		return 0;
+	bigtime_t period = (bigtime_t)timing.h_total * timing.v_total * 1000
+		/ timing.pixel_clock;
+	if ((timing.flags & B_TIMING_INTERLACED) != 0)
+		period /= 2;
+	return period >= 2000 && period <= 60000 ? period : 0;
+}
 
 
 /*!	Starts the target for the whole screen; the outputs' targets are added
@@ -951,7 +970,8 @@ HWInterface::_AddFlushTarget(uint32 outputID, const char* name)
 	target.timeouts = 0;
 	target.ignoredUntil = 0;
 	target.lastBlank = 0;
-	target.period = 16667;
+	target.period = kDefaultFramePeriod;
+	target.modePeriod = 0;
 	target.flushes = target.rects = target.late = 0;
 	target.lateReports = 0;
 	target.wokeLate = 0;
@@ -1062,8 +1082,14 @@ HWInterface::_UpdateFlushTargets()
 			delete shadow;
 	}
 
+	// The screen's one semaphore follows the main display, the one the mode
+	// describes.
+	display_mode mode = {};
+	GetMode(&mode);
+
 	if (fFlushLock.Lock()) {
 		fFlushTargets[0].frame = bufferFrame;
+		fFlushTargets[0].modePeriod = frame_period(mode.timing);
 		bool perOutput = false;
 		for (int32 i = 1; i < fFlushTargetCount; i++) {
 			FlushTarget& target = fFlushTargets[i];
@@ -1072,6 +1098,7 @@ HWInterface::_UpdateFlushTargets()
 				const display_output& output = outputs[j];
 				if (output.id != target.outputID)
 					continue;
+				target.modePeriod = frame_period(output.timing);
 				if ((output.flags & B_DISPLAY_OUTPUT_ENABLED) == 0
 					|| (output.flags & B_DISPLAY_OUTPUT_MIRROR) != 0)
 					break;
@@ -1189,9 +1216,20 @@ HWInterface::_FlushThread(FlushTarget& target)
 			if (next - now < 500)
 				next += target.scanPeriod;
 			fromScan = true;
-		} else if (target.lastBlank != 0 && target.period > 0) {
-			next = target.lastBlank
-				+ ((now - target.lastBlank) / target.period + 1) * target.period;
+		} else {
+			// A frame takes what the timing the display is driven with says.
+			// The time between two wakes on the semaphore is a frame only
+			// when no blank went by unseen, which the waiter cannot tell (a
+			// period measured that way once stuck at four frames, and the
+			// flush, sleeping until the blank it expected, then copied at
+			// every fourth). The last blank tells where the frames begin,
+			// for a while: the wakes are a little late, the clocks drift.
+			target.period = target.modePeriod > 0
+				? target.modePeriod : kDefaultFramePeriod;
+			if (target.lastBlank != 0 && now - target.lastBlank < 1000000) {
+				next = target.lastBlank + ((now - target.lastBlank)
+					/ target.period + 1) * target.period;
+			}
 		}
 		if (next != 0) {
 			bigtime_t flipAt = next - 4000;
@@ -1225,7 +1263,6 @@ HWInterface::_FlushThread(FlushTarget& target)
 					target.retraceSemaphore = B_UNSUPPORTED;
 			}
 			// a blank missed at 60 Hz still fits, and one at 24 Hz
-			bigtime_t waitStart = system_time();
 			status = target.retraceSemaphore;
 			while (status >= 0) {
 				status = acquire_sem_etc(target.retraceSemaphore, 1,
@@ -1236,15 +1273,6 @@ HWInterface::_FlushThread(FlushTarget& target)
 			if (status == B_OK) {
 				blank = system_time();
 				target.timeouts = 0;
-				if (target.lastBlank != 0) {
-					// the blank after the last one only when the wait began
-					// in the first half of the time between them (else it
-					// may have begun after one or more went by)
-					bigtime_t period = blank - target.lastBlank;
-					if (period > 2000 && period < 60000
-						&& waitStart - target.lastBlank < period / 2)
-						target.period = period;
-				}
 				target.lastBlank = blank;
 			} else if (status == B_TIMED_OUT) {
 				// the display does not report blanks right now

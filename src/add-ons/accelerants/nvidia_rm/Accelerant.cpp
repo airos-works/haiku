@@ -1894,18 +1894,27 @@ void NvAccelerant::RetraceThread()
 	auto *data = (volatile NvKmsVblankSemControlData *)fVblankMapping.Address();
 	uint64 previous = 0;
 	bigtime_t lastChange = system_time();
+	bigtime_t lastWaiter = 0;
 
 	while (!fQuitRetraceThread.load()) {
 		// Following the display closely costs a few hundred wake-ups a second,
-		// which is worth paying only while somebody is waiting for a blank. A
-		// semaphore with a negative count has threads blocked on it; with none
-		// blocked, look every so often for one arriving and leave the
-		// processor alone in between. The cost of that is that the first wait
-		// after a quiet spell can be one look late.
+		// which is worth paying only while somebody waits for blanks. A
+		// semaphore with a negative count has threads blocked on it. Whoever
+		// waited is likely to wait again soon, and may start just before a
+		// blank (app_server's flush does, in every frame it has something to
+		// copy): the blanks are followed for a second after the last waiter
+		// was seen, so that such a wait is let go on the blank it aimed at,
+		// not on the one after. A look every so often, which leaves the
+		// processor alone in between, takes as the last blank the count after
+		// it, and a blank that went by while it slept is lost. Only after a
+		// quiet second is that the way: the first wait after a quiet spell
+		// can be one blank late.
 		int32 count = 0;
 		const bool waiting = get_sem_count(fRetraceSem, &count) == B_OK
 			&& count < 0;
-		if (!waiting) {
+		if (waiting)
+			lastWaiter = system_time();
+		else if (system_time() - lastWaiter > 1000000) {
 			snooze(10000);
 			previous = data->head[fHead].vblankCount;
 			lastChange = system_time();
@@ -1927,8 +1936,9 @@ void NvAccelerant::RetraceThread()
 				B_DO_NOT_RESCHEDULE | B_RELEASE_ALL);
 
 			// The next blank is a frame away; there is no sense looking for it
-			// until most of that frame has gone by.
-			bigtime_t period = 1000000 / MAX(1, (int)CalcRefreshRate(
+			// until most of that frame has gone by. (The refresh rate is in
+			// thousandths of a hertz, as NVKMS has it.)
+			bigtime_t period = 1000000000LL / MAX(1, (int64)CalcRefreshRate(
 				fCurrentHaikuMode.timing));
 			snooze(period > 2000 ? period - 1500 : 0);
 			continue;

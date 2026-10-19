@@ -43,7 +43,8 @@ Since branch `vblank-flush` (2026-10-15) every copy to the screen is timed:
   mode's line time), each copy is checked against the hardware's scan
   line at its start and end; elsewhere the scan is estimated from the time
   since the blank over the output's rows, with the blank's own lines as
-  the margin:
+  the margin, and a frame's time is the one the display's timing gives
+  (`period` in the report):
   `app_server: vertical blank flush DP-1: N flushes, N rects, N behind the
   scan (worst 0.00 frames, scan read from the hardware), longest 9.2 ms,
   period 16.666 ms, 4 bands`. A copy behind the scan at its start or its
@@ -67,7 +68,7 @@ with `BScreen::WaitForRetrace()` before they write; airTime does since
 
 | Display | Driver | Source |
 | --- | --- | --- |
-| GTX 1070 (X399 until 2026-10-10) | `nvidia_rm` accelerant | NVKMS vblank semaphore page, a polling thread in the accelerant (since 2026-09-18) |
+| GTX 1070 (X399) | `nvidia_rm` accelerant | NVKMS vblank semaphore page, a polling thread in the accelerant (since 2026-09-18; it follows the blanks for a second after the last wait since 2026-10-19) |
 | Radeon Pro WX 5100 (X399) and other AMD GPUs | `amdgpu_kms` accelerant (amdgpu_drm) | DRM vertical blank waits on the primary output's CRTC, a thread in the accelerant (the native `amdgpu` driver's frame counter on the boot frame buffer, measured below, was removed with that driver on 2026-10-13) |
 | Cubie A7S | `sunxi_display` | TCON-TV1's vertical blank interrupt (GIC SPI 58) |
 | Raspberry Pi 4 | `rpi_display` | the HVS frame counter of the channel feeding the first output shown, read by a kernel thread |
@@ -214,6 +215,41 @@ blocks new readers while a writer waits, so every mouse move made the
 flush thread (and any window about to draw) wait for the slowest drawing
 under way. The move and show hooks are now serialized by a mutex of their
 own; setting the cursor shape keeps the exclusive lock.
+
+### GTX 1070 on the X399, 2026-10-19 (the flush at every fourth blank)
+
+The owner found window drags choppy with the GTX 1070 back in the X399
+(two P2415Q at 200 %, a 7680x2160 frame buffer, one flush target for the
+whole screen at `nvidia_rm`'s one semaphore). Every syslog report of the
+running boot said `period 58.967 ms`; during a minute of `retrace_test
+move` (152 moves a second) the flush copied 900 times, 15 a second: at
+every fourth blank. The semaphore itself was fine (`retrace_test blanks`:
+60.00 Hz). Two faults made it:
+
+- The flush measured a frame's time as the time between two of its wakes,
+  taken when the wait had begun in the first half of it. But it sleeps
+  until 4 ms before the blank it expects before it waits, so that held
+  only for waits that missed one or more blanks: the measurement could
+  only ever take a multiple of the frame, and once it had one, the flush
+  slept until the blank that period predicted and never saw a shorter
+  interval again. The frame's time now comes from the timing the display
+  is driven with (the mode's for the screen's target, the output's for an
+  output's); the last blank only says where the frames begin, and for a
+  second at most.
+- `nvidia_rm`'s thread took 1000000 over the refresh rate as the frame's
+  time, but the rate is in thousandths of a hertz (as NVKMS has it), so it
+  never slept until just before the next blank; between waits it fell into
+  its idle look every 10 ms, which takes the frame count after its sleep as
+  the last blank. A wait begun after about 10 ms of the frame got the blank
+  after the next one (`retrace/vblaim`: a wait begun 12.7 ms after a blank,
+  where the flush begins its own, woke two frames later in 120 of 120
+  rounds; at 9 ms and less, one). The thread now follows the blanks for a
+  second after the last waiter, with the right frame time: 120 of 120 woke
+  one frame later at every delay up to 15.5 ms.
+
+With both (`vblank-period`, power cycled 14:57): 3600 flushes in the
+minute of moves, every blank, period 16.667 ms from the mode, none behind
+the scan, the longest 2.3 ms.
 
 ### Cubie A7S, 2026-10-15 23:28 (the flush, ARM64)
 
