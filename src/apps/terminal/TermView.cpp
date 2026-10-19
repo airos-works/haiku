@@ -34,17 +34,21 @@
 #include <BitmapStream.h>
 #include <Catalog.h>
 #include <Clipboard.h>
+#include <ControlLook.h>
 #include <Cursor.h>
+#include <DataIO.h>
 #include <Debug.h>
 #include <Directory.h>
 #include <Entry.h>
 #include <File.h>
 #include <FindDirectory.h>
+#include <IconUtils.h>
 #include <Input.h>
 #include <Locale.h>
 #include <MenuItem.h>
 #include <Message.h>
 #include <MessageRunner.h>
+#include <Mime.h>
 #include <Node.h>
 #include <Notification.h>
 #include <Path.h>
@@ -57,6 +61,7 @@
 #include <ScrollView.h>
 #include <String.h>
 #include <StringView.h>
+#include <TranslationUtils.h>
 #include <TranslatorFormats.h>
 #include <TranslatorRoster.h>
 #include <UTF8.h>
@@ -589,6 +594,11 @@ TermView::~TermView()
 	Shell* shell = _DetachShell();
 		// _DetachShell sets fShell to NULL
 
+	for (std::map<std::string, BBitmap*>::iterator it
+			= fNotificationIcons.begin(); it != fNotificationIcons.end(); it++) {
+		delete it->second;
+	}
+
 	delete fDefaultState;
 	delete fSelectState;
 	delete fHyperLinkState;
@@ -681,6 +691,173 @@ const char*
 TermView::RendererName() const
 {
 	return fRenderer != NULL ? fRenderer->Name() : "none";
+}
+
+
+void
+TermView::NotificationActivated(const char* identifier)
+{
+	std::string output;
+	fTerminal->Lock();
+	fTerminal->ReportNotificationActivated(identifier, 0);
+	fTerminal->TakeOutput(output);
+	fTerminal->Unlock();
+	_Send(output);
+}
+
+
+// #pragma mark - notifications
+
+
+//!	A picture made the size of an icon: averaged over the pixels it covers.
+static BBitmap*
+scale_icon(const BBitmap* source, BRect bounds)
+{
+	BBitmap rgba(source->Bounds(), 0, B_RGBA32);
+	if (rgba.InitCheck() != B_OK || rgba.ImportBits(source) != B_OK)
+		return NULL;
+	BBitmap* icon = new(std::nothrow) BBitmap(bounds, 0, B_RGBA32);
+	if (icon == NULL || icon->InitCheck() != B_OK) {
+		delete icon;
+		return NULL;
+	}
+
+	int32 sourceWidth = rgba.Bounds().IntegerWidth() + 1;
+	int32 sourceHeight = rgba.Bounds().IntegerHeight() + 1;
+	int32 width = bounds.IntegerWidth() + 1;
+	int32 height = bounds.IntegerHeight() + 1;
+	// keep the proportions, centered
+	float scale = std::min((float)width / sourceWidth,
+		(float)height / sourceHeight);
+	int32 targetWidth = std::max((int32)1, (int32)(sourceWidth * scale));
+	int32 targetHeight = std::max((int32)1, (int32)(sourceHeight * scale));
+	int32 left = (width - targetWidth) / 2;
+	int32 top = (height - targetHeight) / 2;
+
+	memset(icon->Bits(), 0, icon->BitsLength());
+	const uint8* bits = (const uint8*)rgba.Bits();
+	int32 sourceBytesPerRow = rgba.BytesPerRow();
+	for (int32 y = 0; y < targetHeight; y++) {
+		int32 sourceTop = y * sourceHeight / targetHeight;
+		int32 sourceBottom = std::max(sourceTop + 1,
+			(y + 1) * sourceHeight / targetHeight);
+		uint8* row = (uint8*)icon->Bits() + (top + y) * icon->BytesPerRow()
+			+ left * 4;
+		for (int32 x = 0; x < targetWidth; x++) {
+			int32 sourceLeft = x * sourceWidth / targetWidth;
+			int32 sourceRight = std::max(sourceLeft + 1,
+				(x + 1) * sourceWidth / targetWidth);
+			// premultiplied while summed, so that transparent pixels add
+			// no color
+			uint32 sum[4] = { 0, 0, 0, 0 };
+			for (int32 sy = sourceTop; sy < sourceBottom; sy++) {
+				const uint8* pixel = bits + sy * sourceBytesPerRow
+					+ sourceLeft * 4;
+				for (int32 sx = sourceLeft; sx < sourceRight; sx++) {
+					for (int32 c = 0; c < 3; c++)
+						sum[c] += pixel[c] * pixel[3];
+					sum[3] += pixel[3];
+					pixel += 4;
+				}
+			}
+			uint32 count = (sourceBottom - sourceTop)
+				* (sourceRight - sourceLeft);
+			uint8* target = row + x * 4;
+			for (int32 c = 0; c < 3; c++)
+				target[c] = sum[3] > 0 ? sum[c] / sum[3] : 0;
+			target[3] = sum[3] / count;
+		}
+	}
+	return icon;
+}
+
+
+/*!	The icon of a notification: the first of its names that is one of
+	kitty's (error, warning, info, question, help, the file manager, the
+	system monitor, the text editor) or an application signature, or else
+	the picture the program sent, kept by its key for later notifications.
+*/
+BBitmap*
+TermView::_NotificationIcon(const TermNotification& notification)
+{
+	static const struct {
+		const char*	name;
+		const char*	systemIcon;
+		const char*	signature;
+	} kIcons[] = {
+		{ "error", "dialog-error", NULL },
+		{ "warn", "dialog-warning", NULL },
+		{ "warning", "dialog-warning", NULL },
+		{ "info", "dialog-information", NULL },
+		{ "question", "dialog-idea", NULL },
+		{ "help", "dialog-idea", NULL },
+		{ "file-manager", NULL, "application/x-vnd.Be-TRAK" },
+		{ "system-monitor", NULL, "application/x-vnd.Haiku-ActivityMonitor" },
+		{ "text-editor", NULL, "application/x-vnd.Haiku-StyledEdit" }
+	};
+
+	BRect bounds(BPoint(0, 0), be_control_look->ComposeIconSize(32));
+	for (size_t i = 0; i < notification.iconNames.size(); i++) {
+		const char* name = notification.iconNames[i].c_str();
+		const char* systemIcon = NULL;
+		const char* signature = strchr(name, '/') != NULL ? name : NULL;
+		for (size_t j = 0; j < B_COUNT_OF(kIcons); j++) {
+			if (strcmp(name, kIcons[j].name) == 0) {
+				systemIcon = kIcons[j].systemIcon;
+				signature = kIcons[j].signature;
+				break;
+			}
+		}
+
+		BBitmap* icon = new(std::nothrow) BBitmap(bounds, 0, B_RGBA32);
+		if (icon == NULL || icon->InitCheck() != B_OK) {
+			delete icon;
+			return NULL;
+		}
+		if (systemIcon != NULL
+			&& BIconUtils::GetSystemIcon(systemIcon, icon) == B_OK) {
+			return icon;
+		}
+		uint8* data;
+		size_t size;
+		if (signature != NULL
+			&& BMimeType(signature).GetIcon(&data, &size) == B_OK) {
+			status_t status = BIconUtils::GetVectorIcon(data, size, icon);
+			delete[] data;
+			if (status == B_OK)
+				return icon;
+		}
+		delete icon;
+	}
+
+	if (!notification.iconData.empty()) {
+		BMemoryIO stream(notification.iconData.data(),
+			notification.iconData.size());
+		BBitmap* picture = BTranslationUtils::GetBitmap(&stream);
+		if (picture == NULL)
+			return NULL;
+		BBitmap* icon = scale_icon(picture, bounds);
+		delete picture;
+		if (icon != NULL && !notification.iconKey.empty()) {
+			// a few of them, for the notifications that only name them
+			if (fNotificationIcons.size() >= 16) {
+				delete fNotificationIcons.begin()->second;
+				fNotificationIcons.erase(fNotificationIcons.begin());
+			}
+			BBitmap*& cached = fNotificationIcons[notification.iconKey];
+			delete cached;
+			cached = new(std::nothrow) BBitmap(icon);
+		}
+		return icon;
+	}
+
+	if (!notification.iconKey.empty()) {
+		std::map<std::string, BBitmap*>::iterator found
+			= fNotificationIcons.find(notification.iconKey);
+		if (found != fNotificationIcons.end() && found->second != NULL)
+			return new(std::nothrow) BBitmap(found->second);
+	}
+	return NULL;
 }
 
 
@@ -1384,6 +1561,11 @@ TermView::TerminalNotify(const TermNotification& notification)
 void
 TermView::TerminalCloseNotification(const char* identifier)
 {
+	Event* event = new(std::nothrow) Event(EVENT_CLOSE_NOTIFICATION);
+	if (event != NULL) {
+		event->text = identifier;
+		_PostEvent(event);
+	}
 }
 
 
@@ -1545,7 +1727,53 @@ TermView::_HandleEvents()
 						notification.identifier.c_str());
 					message.SetMessageID(identifier);
 				}
-				message.Send();
+
+				BBitmap* icon = _NotificationIcon(notification);
+				if (icon != NULL) {
+					message.SetIcon(icon);
+					delete icon;
+				}
+
+				// A click starts Terminal, which passes it on to this view
+				// (see TermApp::ArgvReceived()).
+				if (notification.focusOnActivation
+					|| notification.reportActivation) {
+					message.SetOnClickApp(TERM_SIGNATURE);
+					message.AddOnClickArg(NOTIFICATION_ACTIVATED_ARGUMENT);
+					BString argument;
+					argument.SetToFormat("%" B_PRId32, be_app->Team());
+					message.AddOnClickArg(argument);
+					argument.SetToFormat("%p", this);
+					message.AddOnClickArg(argument);
+					message.AddOnClickArg(notification.identifier.empty()
+						? "0" : notification.identifier.c_str());
+					argument.SetToFormat("%d",
+						(notification.focusOnActivation ? 1 : 0)
+							| (notification.reportActivation ? 2 : 0));
+					message.AddOnClickArg(argument);
+				}
+
+				// w: milliseconds; 0 is "never", a day here
+				bigtime_t timeout = -1;
+				if (notification.timeout > 0)
+					timeout = (bigtime_t)notification.timeout * 1000;
+				else if (notification.timeout == 0)
+					timeout = 24LL * 3600 * 1000000;
+				message.Send(timeout);
+				break;
+			}
+
+			case EVENT_CLOSE_NOTIFICATION:
+			{
+				// Notifications cannot be taken back; one with the same id
+				// that goes at once takes its place.
+				BString identifier;
+				identifier.SetToFormat("terminal-%p-%s", this,
+					event->text.c_str());
+				BNotification message(B_INFORMATION_NOTIFICATION);
+				message.SetGroup(B_TRANSLATE_SYSTEM_NAME("Terminal"));
+				message.SetMessageID(identifier);
+				message.Send(1);
 				break;
 			}
 
@@ -1566,11 +1794,17 @@ TermView::_HandleEvents()
 				identifier.SetToFormat("terminal-progress-%p", this);
 				BNotification message(B_PROGRESS_NOTIFICATION);
 				message.SetGroup(B_TRANSLATE_SYSTEM_NAME("Terminal"));
-				message.SetTitle(fTerminal->Title());
+				// the program's title, or the window's
+				const char* title = fTerminal->Title();
+				if ((title == NULL || title[0] == '\0') && Window() != NULL)
+					title = Window()->Title();
+				message.SetTitle(title);
 				message.SetMessageID(identifier);
 				message.SetProgress(event->value1 == 0 ? 1.0f
 					: std::min(100, std::max(0, (int)event->value2)) / 100.0f);
-				message.Send(event->value1 == 0 ? 0 : -1);
+				// to remove it: a replacement that goes at once (no
+				// timeout means the default one)
+				message.Send(event->value1 == 0 ? 1 : -1);
 				break;
 			}
 		}

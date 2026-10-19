@@ -776,7 +776,9 @@ TestOperatingSystemCommands()
 	CHECK_EQUAL(n.recorder.notifications[1].body, "Body");
 	n.Feed("\x1b]99;i=q:p=?;\x1b\\");
 	std::string answer = n.Reply();
-	CHECK(answer.find("\x1b]99;i=q:p=?;o=always") == 0);
+	CHECK_EQUAL(answer, "\x1b]99;i=q:p=?;a=focus,report:o=always,unfocused"
+		":p=title,body,close,icon,?,alive:s=system,silent:u=0,1,2:w=1"
+		"\x1b\\");
 	n.Feed(answer);
 	CHECK_EQUAL(n.Reply(), "");
 	n.Feed("\x1b]9;iTerm says hi\x07");
@@ -789,6 +791,28 @@ TestOperatingSystemCommands()
 	CHECK_EQUAL(n.recorder.notifications.back().title, "Hi");
 	n.terminal.ReportNotificationActivated("abc", 0);
 	CHECK_EQUAL(n.Reply(), "\x1b]99;i=abc;\x1b\\");
+	CHECK(n.recorder.notifications.back().focusOnActivation);
+	CHECK(n.recorder.notifications.back().reportActivation);
+	// no report unless asked for, and none without focus either
+	n.Feed("\x1b]99;i=quiet:a=-focus;Shh\x1b\\");
+	CHECK(!n.recorder.notifications.back().focusOnActivation);
+	CHECK(!n.recorder.notifications.back().reportActivation);
+	n.terminal.ReportNotificationActivated("quiet", 0);
+	CHECK_EQUAL(n.Reply(), "");
+	// without an id the reports say 0
+	n.Feed("\x1b]99;a=report;No id\x1b\\");
+	n.terminal.ReportNotificationActivated("", 0);
+	CHECK_EQUAL(n.Reply(), "\x1b]99;i=0;\x1b\\");
+	// close events cannot be tracked; an icon, a name, a cache key, expiry
+	n.Feed("\x1b]99;i=ic:d=0:c=1:w=5000:n=ZXJyb3I=:g=key1;Icon\x1b\\"
+		"\x1b]99;i=ic:p=icon:e=1;iVBORw==\x1b\\");
+	CHECK_EQUAL(n.Reply(), "\x1b]99;i=ic:p=close;untracked\x1b\\");
+	const TermNotification& icon = n.recorder.notifications.back();
+	CHECK_EQUAL(icon.title, "Icon");
+	CHECK(icon.timeout == 5000);
+	CHECK(icon.iconNames.size() == 1 && icon.iconNames[0] == "error");
+	CHECK_EQUAL(icon.iconKey, "key1");
+	CHECK_EQUAL(icon.iconData, "\x89PNG");
 
 	// text sizing falls back to normal text
 	Fixture t;

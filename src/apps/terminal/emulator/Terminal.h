@@ -232,12 +232,27 @@ struct TermNotification {
 	std::string	identifier;
 	std::string	title;
 	std::string	body;
-	std::string	iconName;
+	std::vector<std::string> iconNames;	// to try in order
+	std::string	iconKey;	// names icon data for later notifications
+	std::string	iconData;	// PNG, JPEG or GIF
+	bool		focusOnActivation;
 	bool		reportActivation;
 	bool		reportClose;
 	int32		urgency;	// 0 low, 1 normal, 2 critical
+	int32		timeout;	// milliseconds, -1 for the default, 0 never
 	bool		onlyWhenUnfocused;
 	std::vector<std::string> buttons;
+
+				TermNotification()
+					:
+					focusOnActivation(true),
+					reportActivation(false),
+					reportClose(false),
+					urgency(1),
+					timeout(-1),
+					onlyWhenUnfocused(false)
+				{
+				}
 };
 
 

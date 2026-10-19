@@ -21,7 +21,7 @@ only), grapheme clusters, reflow, GPU drawing.
 | 1 | ~~Shell integration for bash~~ | done | `data/profile.d/airos-terminal.sh` marks prompts (OSC 133) and reports the directory (OSC 7); prompt jumps work out of the box. |
 | 2 | ~~Color emoji~~ | done | Drawn with FreeType from Noto Color Emoji (`noto_emoji_color`, added to the CI images), sequences through the font's GSUB ligatures. |
 | 3 | Faster full-screen drawing | S-M, then L | Because of reading back, the GPU path loses to software on both test machines (X399 with NVIDIA, Framework 13 with AMD), so Terminal draws in software there today. A multi-threaded software renderer (S-M) gives ~3x on full frames. Drawing straight into the screen without the read back (L) is what makes the GPU worth it. |
-| 4 | Notification clicks, icons, expiry | S-M | Lets `kitten notify`-style tools and long-running jobs bring you back to the right tab. |
+| 4 | ~~Notification clicks, icons, expiry~~ | done | A click shows the tab and reports to the program; icons by name or data; `w=`; `p=close`. |
 | 5 | Ligatures | M-L | Wanted by users of coding fonts (Fira Code, JetBrains Mono). |
 
 ## Protocols
@@ -36,16 +36,14 @@ Terminal reads the marks and jumps between prompts, and air/OS's bash marks
 them (`data/profile.d/airos-terminal.sh`). Missing: the features on top (M),
 and scripts for zsh and fish (not in the image).
 
-### Notifications (OSC 99) — S to M, partly blocked
-Missing: telling the program that a notification was clicked (`a=report`)
-or closed (`c=1`), buttons (`p=buttons`), icons (`p=icon`, `n=`, `g=`),
-sounds other than the system's, expiry (`w=`).
-- Icons and expiry: S. `BNotification::SetIcon()` and `Send(timeout)`.
-- Clicks: M. `BNotification::SetOnClickApp()` with arguments relaunches
-  Terminal on a click; the new instance has to hand the click to the window
-  that sent the notification, then quit.
-- Close reports and buttons: blocked. notification_server has no buttons and
-  does not report closing; that would need changes there.
+### Notifications (OSC 99) — mostly done; the rest needs notification_server
+Clicks (`a=focus`, `a=report`), icons (`n=`, `p=icon`, `g=`), expiry (`w=`)
+and `p=close` work: a click starts Terminal with the team and view that
+sent the notification, which passes it on and quits. Missing: reports of
+a notification being closed (`c=1`, answered `untracked` as kitty specifies
+for such systems), buttons (`p=buttons`), sounds other than the system's.
+notification_server has no buttons and does not say when one closes; both
+need changes there (M).
 
 ### Text sizing (OSC 66) — L
 kitty draws text 2 to 7 times larger (headings in terminal programs), and
