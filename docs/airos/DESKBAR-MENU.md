@@ -6,7 +6,7 @@ Preferences. Media came on 2026-10-19, after the 2026-10-18 Office
 integration (following `airos-deskbar-menu` and `deskbar-utilities-root` on
 2026-10-17). Turbo Chook left the images on 2026-10-19.
 
-![The Deskbar menu and its Office folder, before Media was added](deskbar-menu.png)
+![The Deskbar menu and its Media folder](deskbar-menu.png)
 
 | Folder | Entries |
 | --- | --- |
@@ -81,7 +81,21 @@ running in disposable guests made from the final x86_64 and ARM64 images;
 `pdfcraft-cli --version` succeeded on both. An ARM64 crypto probe also passed
 SHA-256, AES-GCM, Ed25519 and system-randomness checks. The screenshot above
 shows all five entries, with Office between Applications and Utilities.
-Application sources are pinned in airos-ci's `apps/office.lock.json`; image
+Application sources are pinned in airos-ci's `apps/office.lock.json` (and,
+since 2026-10-19, `apps/media.lock.json`); image
 manifests record those pins, the Haiku and buildtools revisions, and compiler
 versions. Physical GPU and board-peripheral tests were not rerun for this
 build integration.
+
+On 2026-10-19, Media was added and Turbo Chook dropped (airos-ci `0183522`:
+`apps/build-pinned.sh` and `images/verify-pinned.sh` build and check Office
+and Media from their lock files). The x86_64 image from `76c3386053` and the
+ARM64 and Raspberry Pi 4 images from `c28cd80a26` (built from the build
+server's dashboard, as the GitHub runner was down) passed their smoke tests;
+their manifests list PhotoCraft 0.10.0~airos1-2 and LightCraft 0.9.1~airos1-2
+and no Turbo Chook. In QEMU, the x86_64 and ARM64 menus show Media between
+Office and Utilities (screenshot above), Applications has no Turbo Chook, and
+PhotoCraft and LightCraft start from their Media entries, on the CPU there
+(QEMU has no GPU; the ARM64 images have no Vulkan loader, so the two apps
+render on the CPU on ARM64 boards too). The Pi image's haiku package has the
+Media folder.
