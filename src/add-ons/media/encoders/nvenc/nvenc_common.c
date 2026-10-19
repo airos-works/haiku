@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "video/nvenc_drv.h"
+
 void
 nvencBitsInit(NvencBits *bits, uint8_t *data, size_t capacity)
 {
@@ -78,17 +80,75 @@ nvencAppendNal(uint8_t *out, size_t outSize, size_t at, const uint8_t *header,
 	return at;
 }
 
-/* Most likely first: the arrangement NVDEC writes, which NVDEC-to-NVENC
- * transcoding hands the encoder unchanged, then the tiled 16x16 one the
- * engine's reference pictures must use, then the graphics arrangement. */
+/* Hints from the neighbours, the previous picture's vectors (the motion
+ * predictor buffers), the co-located block and zero, each searched with
+ * its own pattern of points. */
+void
+nvencFillMeControl(void *control)
+{
+	nvenc_h264_me_control_s *me = control;
+	memset(me, 0, sizeof(*me));
+	me->refinement_mode = 1;		/* quarter pel */
+	me->refine_on_search_enable = 1;
+	me->fps_mvcost = 1;
+	me->sps_mvcost = 1;
+	me->sps_cost_func = 1;
+
+	me->predsrc.self_spatial_enable = 1;
+	me->predsrc.self_spatial_search = 1;
+	me->predsrc.self_spatial_stamp_l0 = 2;
+	me->predsrc.self_spatial_stamp_l1 = 3;
+	me->predsrc.self_temporal_enable = 1;
+	me->predsrc.self_temporal_search = 1;
+	me->predsrc.self_temporal_stamp_l0 = 4;
+	me->predsrc.self_temporal_stamp_l1 = 5;
+	me->predsrc.coloc_stamp_l0 = 1;
+	me->predsrc.coloc_stamp_l1 = 1;
+	me->predsrc.const_mv_enable = 1;
+	me->predsrc.const_mv_search = 1;
+	me->predsrc.const_mv_stamp_l1 = 1;
+	me->predsrc.stamp_refidx1_stamp = 6;
+	me->predsrc.stamp_refidx2_stamp = 6;
+	me->predsrc.stamp_refidx3_stamp = 6;
+
+	/* Two patterns on an 8x8 grid of points, a line of eight with a column
+	 * through it and a diamond. */
+	nvenc_h264_me_stamp_s *stamps[] = { &me->shape0, &me->shape1, &me->shape2,
+		&me->shape3, &me->shape4, &me->shape5, &me->shape6 };
+	static const bool kDiamond[] = { false, true, false, true, false, false, true };
+	for (int i = 0; i < 7; i++) {
+		stamps[i]->bitmask[0] = kDiamond[i] ? 0x1e1e0c00 : 0xff0c0c00;
+		stamps[i]->bitmask[1] = kDiamond[i] ? 0x0000000c : 0x00000c0c;
+		stamps[i]->hor_adjust = 1;
+		stamps[i]->ver_adjust = kDiamond[i];
+	}
+	me->spatial_hint_pattern = 6;
+	me->temporal_hint_pattern = 4;
+	me->external_hint_order = 1;
+	me->coloc_hint_order = 1;
+	/* the five hint kinds in order; the header says they must all appear */
+	me->hint_type0 = 0;
+	me->hint_type1 = 1;
+	me->hint_type2 = 2;
+	me->hint_type3 = 3;
+	me->hint_type4 = 4;
+	me->fbm_op_winner_num_p_frame = 1;
+	me->fbm_op_winner_num_b_frame_l0 = 1;
+	me->fbm_op_winner_num_b_frame_l1 = 1;
+	me->Cu16partDecisionMadeByFPP = 1;
+	me->fbm_select_best_cu32_parttype_num = 3;
+	me->sps_evaluate_merge_cand_num = 5;
+	me->fps_quad_thresh_hold = 60;
+}
+
+
+/* The arrangement the engine reads its input in and writes its reference
+ * pictures in: the video block linear one NVDEC writes, two groups of eight
+ * lines to a block (found on a GTX 1070; NVIDIA's driver configures an RTX
+ * 3050 the same way). The interface leaves room for more, which the caller
+ * would try in turn. */
 const NvencLayout kNvencLayouts[] = {
-	{ false, true, 1, true, "video block linear, offsets from the base" },
-	{ false, true, 1, false, "video block linear, chroma addressed" },
-	{ true, false, 0, true, "tiled 16x16, offsets from the base" },
-	{ true, false, 0, false, "tiled 16x16, chroma addressed" },
-	{ false, true, 2, true, "video block linear (height 2), offsets from the base" },
-	{ false, false, 1, true, "graphics block linear, offsets from the base" },
-	{ false, false, 1, false, "graphics block linear, chroma addressed" },
+	{ false, true, 2, false, "video block linear" },
 };
 const uint32_t kNvencLayoutCount = sizeof(kNvencLayouts) / sizeof(kNvencLayouts[0]);
 

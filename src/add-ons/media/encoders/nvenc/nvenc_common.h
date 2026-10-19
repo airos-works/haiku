@@ -34,10 +34,9 @@ void nvencTrailingBits(NvencBits *bits);
 size_t nvencAppendNal(uint8_t *out, size_t outSize, size_t at,
 	const uint8_t *header, int headerSize, const NvencBits *bits);
 
-/* How a picture is laid out for the engine. Nothing in the class headers
- * says which arrangement each generation reads input in or how the chroma
- * address is taken, so the add-on knows a few and the caller tries them:
- * MediaConverter encodes a test picture with each until one decodes. */
+/* How a picture is laid out for the engine (kNvencLayouts in
+ * nvenc_common.c). MediaConverter encodes a test picture with each way the
+ * add-on knows and uses the first that decodes. */
 typedef struct {
 	bool		tiled;		/* tiled 16x16 rather than block linear */
 	bool		linesInFours;	/* the block linear arrangement */
@@ -66,6 +65,10 @@ void nvencPictureLayout(NvencPictureLayout *layout, int width, int height,
  * the last column and line into the alignment. */
 void nvencStorePicture(uint8_t *out, const NvencPictureLayout *picture,
 	const NvencLayout *layout, const nvenc_picture *source);
+
+/* The motion search control the codecs share (an nvenc_h264_me_control_s,
+ * which H.265 uses too). */
+void nvencFillMeControl(void *control);
 
 /* Finished packets, oldest first. */
 typedef struct NvencPacket {
