@@ -9,6 +9,8 @@
 
 #include <algorithm>
 
+#include <UnicodeChar.h>
+
 
 // #pragma mark - TerminalCharClassifier
 
@@ -24,23 +26,18 @@ TerminalCharClassifier::~TerminalCharClassifier()
 DefaultCharClassifier::DefaultCharClassifier(const char* additionalWordChars)
 {
 	const char* p = additionalWordChars;
-	while (p != NULL && *p != '\0') {
-		int count = UTF8Char::ByteCount(*p);
-		if (count <= 0 || count > 4)
-			break;
-		fAdditionalWordChars.push_back(UTF8Char(p, count));
-		p += count;
-	}
+	while (p != NULL && *p != '\0')
+		fAdditionalWordChars.push_back(BUnicodeChar::FromUTF8(&p));
 }
 
 
 int
-DefaultCharClassifier::Classify(const UTF8Char& character)
+DefaultCharClassifier::Classify(uint32 character)
 {
-	if (character.IsSpace())
+	if (BUnicodeChar::IsSpace(character))
 		return CHAR_TYPE_SPACE;
 
-	if (character.IsAlNum())
+	if (BUnicodeChar::IsAlNum(character))
 		return CHAR_TYPE_WORD_CHAR;
 
 	if (std::find(fAdditionalWordChars.begin(), fAdditionalWordChars.end(),

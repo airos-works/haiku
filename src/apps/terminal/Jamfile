@@ -1,20 +1,48 @@
 SubDir HAIKU_TOP src apps terminal ;
 
 UseHeaders [ FDirName $(HAIKU_TOP) src kits tracker ] ;
+UseHeaders [ FDirName $(SUBDIR) emulator ] ;
+UseHeaders [ FDirName $(SUBDIR) render ] ;
 
 UsePrivateHeaders libroot shared system ;
 UsePrivateHeaders textencoding ;
+UseBuildFeatureHeaders zlib ;
+
+SEARCH_SOURCE += [ FDirName $(SUBDIR) emulator ] ;
+SEARCH_SOURCE += [ FDirName $(SUBDIR) render ] ;
+
+local emulatorSources =
+	Base64.cpp
+	ColorNames.cpp
+	Terminal.cpp
+	TerminalCommands.cpp
+	TerminalGraphics.cpp
+	TerminalHistory.cpp
+	TerminalInput.cpp
+	TerminalSequences.cpp
+	UnicodeTables.cpp
+	VTParser.cpp
+	;
+
+local renderSources =
+	BoxDrawing.cpp
+	FrameBuilder.cpp
+	GlyphCache.cpp
+	SoftwareRenderer.cpp
+	;
+
+Includes [ FGristFiles $(emulatorSources) $(renderSources) ImageCodecs.cpp ]
+	: [ BuildFeatureAttribute zlib : headers ] ;
 
 Application Terminal :
 	ActiveProcessInfo.cpp
 	AppearPrefView.cpp
 	Arguments.cpp
-	BasicTerminalBuffer.cpp
 	Colors.cpp
 	FindWindow.cpp
 	Globals.cpp
-	HistoryBuffer.cpp
 	HyperLink.cpp
+	ImageCodecs.cpp
 	InlineInput.cpp
 	PatternEvaluator.cpp
 	PrefHandler.cpp
@@ -25,22 +53,22 @@ Application Terminal :
 	ShellParameters.cpp
 	SmartTabView.cpp
 	TermApp.cpp
-	TerminalBuffer.cpp
 	TerminalCharClassifier.cpp
 	TerminalRoster.cpp
 	TermConst.cpp
-	TermParse.cpp
 	TermScrollView.cpp
 	TermView.cpp
-	TermViewHighlight.cpp
 	TermViewStates.cpp
 	TermWindow.cpp
 	ThemeView.cpp
 	ThemeWindow.cpp
 	TitlePlaceholderMapper.cpp
-	VTKeyTbl.c
-	VTPrsTbl.c
+
+	$(emulatorSources)
+	$(renderSources)
+
 	: be localestub shared tracker translation textencoding
+	[ BuildFeatureAttribute zlib : library ]
 	[ TargetLibsupc++ ] [ TargetLibstdc++ ]
 	: Terminal.rdef XColors.rdef
 ;
@@ -66,3 +94,5 @@ DoCatalogs Terminal :
 	ThemeWindow.cpp
 	: en.catalog
 ;
+
+SubInclude HAIKU_TOP src apps terminal render opengl ;

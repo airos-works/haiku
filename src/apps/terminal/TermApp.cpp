@@ -15,6 +15,8 @@
 
 #include "TermApp.h"
 
+#include "ImageCodecs.h"
+
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
@@ -68,6 +70,7 @@ TermApp::TermApp()
 	fArgs = new Arguments(0, NULL);
 
 	_InitDefaultPalette();
+	register_image_codecs();
 }
 
 

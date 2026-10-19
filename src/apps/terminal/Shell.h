@@ -19,9 +19,6 @@
 
 class ActiveProcessInfo;
 class ShellParameters;
-// TODO: Maybe merge TermParse and Shell classes ?
-class TerminalBuffer;
-class TermParse;
 
 
 class Shell {
@@ -38,7 +35,8 @@ public:
 			ssize_t				Read(void* buffer, size_t numBytes) const;
 			ssize_t				Write(const void* buffer, size_t numBytes);
 
-			status_t			UpdateWindowSize(int row, int columns);
+			status_t			UpdateWindowSize(int row, int columns,
+									int pixelWidth = 0, int pixelHeight = 0);
 
 			status_t			GetAttr(struct termios& attr) const;
 			status_t			SetAttr(const struct termios& attr);
@@ -58,9 +56,6 @@ public:
 			bool				GetActiveProcessInfo(
 									ActiveProcessInfo& _info) const;
 
-	virtual	status_t			AttachBuffer(TerminalBuffer* buffer);
-	virtual void				DetachBuffer();
-
 private:
 			status_t			_Spawn(int row, int col,
 									const ShellParameters& parameters);
@@ -69,8 +64,6 @@ private:
 			ShellInfo			fShellInfo;
 			int					fFd;
 			pid_t				fProcessID;
-			TermParse*			fTermParse;
-			bool				fAttached;
 };
 
 

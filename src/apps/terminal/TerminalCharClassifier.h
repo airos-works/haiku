@@ -8,7 +8,7 @@
 
 #include <vector>
 
-#include "UTF8Char.h"
+#include <SupportDefs.h>
 
 
 enum {
@@ -18,13 +18,11 @@ enum {
 };
 
 
-struct UTF8Char;
-
 class TerminalCharClassifier {
 public:
 	virtual						~TerminalCharClassifier();
 
-	virtual	int					Classify(const UTF8Char& character) = 0;
+	virtual	int					Classify(uint32 character) = 0;
 };
 
 
@@ -33,10 +31,10 @@ public:
 								DefaultCharClassifier(
 									const char* additionalWordChars);
 
-	virtual	int					Classify(const UTF8Char& character);
+	virtual	int					Classify(uint32 character);
 
 private:
-			std::vector<UTF8Char> fAdditionalWordChars;
+			std::vector<uint32>	fAdditionalWordChars;
 };
 
 

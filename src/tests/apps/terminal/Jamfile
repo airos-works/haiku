@@ -1,0 +1,11 @@
+SubDir HAIKU_TOP src tests apps terminal ;
+
+# The emulator's own tests build on the build host: see the Makefile.
+
+SubDirHdrs [ FDirName $(HAIKU_TOP) src apps terminal emulator ] ;
+SubDirHdrs [ FDirName $(HAIKU_TOP) src apps terminal render ] ;
+
+SimpleTest GLStressTest :
+	GLStressTest.cpp
+	: be [ TargetLibstdc++ ]
+;

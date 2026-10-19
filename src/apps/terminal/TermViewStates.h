@@ -1,17 +1,16 @@
 /*
- * Copyright 2001-2013, Haiku, Inc.
- * Copyright (c) 2003-4 Kian Duffy <myob@users.sourceforge.net>
- * Parts Copyright (C) 1998,99 Kazuho Okui and Takashi Murai.
+ * Copyright 2001-2026, Haiku, Inc.
+ * Copyright 2003-2004 Kian Duffy, myob@users.sourceforge.net
+ * Parts Copyright 1998-1999 Kazuho Okui and Takashi Murai.
+ * All rights reserved. Distributed under the terms of the MIT license.
  *
- * Distributed under the terms of the MIT license.
  * Authors:
- *		Stefano Ceccherini, stefano.ceccherini@gmail.com
- *		Kian Duffy, myob@users.sourceforge.net
  *		Ingo Weinhold, ingo_weinhold@gmx.de
+ *		Clemens Zeidler, haiku@Clemens-Zeidler.de
  *		Siarzhuk Zharski, zharik@gmx.li
  */
-#ifndef TERMVIEW_STATES_H
-#define TERMVIEW_STATES_H
+#ifndef TERM_VIEW_STATES_H
+#define TERM_VIEW_STATES_H
 
 
 #include "HyperLink.h"
@@ -37,12 +36,10 @@ public:
 	virtual void				MouseDown(BPoint where, int32 buttons,
 									int32 modifiers);
 	virtual void				MouseMoved(BPoint where, uint32 transit,
-									const BMessage* dragMessage, int32 modifiers);
+									const BMessage* message, int32 modifiers);
 	virtual void				MouseUp(BPoint where, int32 buttons);
 
 	virtual	void				WindowActivated(bool active);
-
-	virtual	void				VisibleTextBufferChanged();
 
 protected:
 			TermView*			fView;
@@ -71,14 +68,13 @@ public:
 	virtual void				MouseDown(BPoint where, int32 buttons,
 									int32 modifiers);
 	virtual void				MouseMoved(BPoint where, uint32 transit,
-									const BMessage* dragMessage, int32 modifiers);
+									const BMessage* message, int32 modifiers);
 	virtual void				MouseUp(BPoint where, int32 buttons);
 
 	virtual	void				WindowActivated(bool active);
 
 private:
 			bool				_CheckEnterHyperLinkState(int32 modifiers);
-
 };
 
 
@@ -91,7 +87,7 @@ public:
 	virtual	bool				MessageReceived(BMessage* message);
 
 	virtual void				MouseMoved(BPoint where, uint32 transit,
-									const BMessage* dragMessage, int32 modifiers);
+									const BMessage* message, int32 modifiers);
 	virtual void				MouseUp(BPoint where, int32 buttons);
 
 private:
@@ -104,8 +100,7 @@ private:
 };
 
 
-class TermView::HyperLinkState : public TermView::State,
-	private TermViewHighlighter {
+class TermView::HyperLinkState : public TermView::State {
 public:
 								HyperLinkState(TermView* view);
 
@@ -118,50 +113,34 @@ public:
 	virtual void				MouseDown(BPoint where, int32 buttons,
 									int32 modifiers);
 	virtual void				MouseMoved(BPoint where, uint32 transit,
-									const BMessage* dragMessage, int32 modifiers);
+									const BMessage* message, int32 modifiers);
 
 	virtual	void				WindowActivated(bool active);
-
-	virtual	void				VisibleTextBufferChanged();
-
-private:
-	// TermViewHighlighter
-	virtual	rgb_color			ForegroundColor();
-	virtual	rgb_color			BackgroundColor();
-	virtual	uint32				AdjustTextAttributes(uint32 attributes);
-
-private:
-			struct CharPosition {
-				int32	index;
-				TermPos	position;
-			};
 
 private:
 			bool				_GetHyperLinkAt(BPoint where,
 									bool pathPrefixOnly, HyperLink& _link,
-									TermPos& _start, TermPos& _end);
-			void				_GetLinkRange(TerminalBuffer* textBuffer,
-									const TermPos& pos, uint32 link,
-									TermPos& _start, TermPos& _end) const;
-			bool				_CellHasLink(TerminalBuffer* textBuffer,
-									const TermPos& pos, uint32 link) const;
-			void				_ExtendURLOverLineBreaks(
-									TerminalBuffer* textBuffer,
-									TermPos& _start, TermPos& _end);
+									TermPoint& _start, TermPoint& _end);
+			void				_GetLinkRange(const TermPoint& pos,
+									uint32 link, TermPoint& _start,
+									TermPoint& _end) const;
+			bool				_CellHasLink(const TermPoint& pos,
+									uint32 link) const;
+			void				_ExtendURLOverLineBreaks(TermPoint& _start,
+									TermPoint& _end);
 			bool				_EntryExists(const BString& path,
 									BString& _actualPath) const;
 
 			void				_UpdateHighlight();
 			void				_UpdateHighlight(BPoint where, int32 modifiers);
-			void				_ActivateHighlight(const TermPos& start,
-									const TermPos& end);
+			void				_ActivateHighlight(const TermPoint& start,
+									const TermPoint& end);
 			void				_DeactivateHighlight();
 
 private:
 			DefaultCharClassifier fURLCharClassifier;
 			DefaultCharClassifier fPathComponentCharClassifier;
 			BString				fCurrentDirectory;
-			TermViewHighlight	fHighlight;
 			bool				fHighlightActive;
 };
 
@@ -184,4 +163,4 @@ private:
 };
 
 
-#endif // TERMVIEW_STATES_H
+#endif	// TERM_VIEW_STATES_H
