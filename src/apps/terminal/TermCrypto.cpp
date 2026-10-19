@@ -23,9 +23,13 @@
 #endif
 
 
+static const int64 kMaxClockDifference = 5 * 60 * 1000000000LL;
+
+
+#ifdef OPENSSL_ENABLED
+
 static const char kBase85[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 	"abcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
-static const int64 kMaxClockDifference = 5 * 60 * 1000000000LL;
 
 
 //!	Python's b85encode without padding, as kitty has it.
@@ -74,8 +78,6 @@ decode_base85(const std::string& text, std::string& _decoded)
 	return true;
 }
 
-
-#ifdef OPENSSL_ENABLED
 
 static pthread_once_t sKeyOnce = PTHREAD_ONCE_INIT;
 static EVP_PKEY* sKey = NULL;
