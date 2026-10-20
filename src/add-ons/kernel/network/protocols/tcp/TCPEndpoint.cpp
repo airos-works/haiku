@@ -1872,6 +1872,16 @@ TCPEndpoint::_Spawn(TCPEndpoint* parent, tcp_segment_header& segment,
 		goto abort;
 	}
 
+	// Arm the retransmit timer for it, exactly as Connect() does for the SYN
+	// it sends. Without this, a lost SYN-ACK was repaired only when the peer's
+	// own SYN retransmission arrived: the recovery became the peer's RTO
+	// rather than ours, and a peer with a shorter connect timeout than our
+	// silence took the connection with it. The timer also bounds the lifetime
+	// of the half-open connection (see _Retransmit()).
+	fRetransmitInitialCount = 0;
+	gStackModule->set_timer(&fRetransmitTimer, fRetransmitTimeout);
+	T(TimerSet(this, "retransmit", fRetransmitTimeout));
+
 	segment.flags &= ~TCP_FLAG_SYNCHRONIZE;
 		// we handled this flag now, it must not be set for further processing
 
@@ -1936,7 +1946,13 @@ TCPEndpoint::_SynchronizeSentReceive(tcp_segment_header &segment,
 	if ((segment.flags & TCP_FLAG_SYNCHRONIZE) == 0)
 		return DROP;
 
-	fSendUnacknowledged = segment.acknowledge;
+	// Only an actual acknowledgement may move fSendUnacknowledged: the
+	// crossing SYN of a simultaneous open carries none, and its unused
+	// acknowledgement field would corrupt our send state -- the
+	// acceptable-ACK check in _Receive() that later completes the handshake
+	// relies on it still sitting at the ISS.
+	if ((segment.flags & TCP_FLAG_ACKNOWLEDGE) != 0)
+		fSendUnacknowledged = segment.acknowledge;
 	_PrepareReceivePath(segment);
 
 	if (segment.flags & TCP_FLAG_ACKNOWLEDGE) {
@@ -1958,6 +1974,12 @@ TCPEndpoint::_SynchronizeSentReceive(tcp_segment_header &segment,
 		// simultaneous open
 		fState = SYNCHRONIZE_RECEIVED;
 		T(State(this));
+
+		// The SYN-ACK we owe now gets its own retransmission budget and
+		// schedule, as a passive child's does in _Spawn(): the SYN
+		// retransmissions spent so far must not count against it.
+		fRetransmitInitialCount = 0;
+		fRetransmitTimeout = TCP_SYN_RETRANSMIT_TIMEOUT;
 	}
 
 	segment.flags &= ~TCP_FLAG_SYNCHRONIZE;
@@ -2027,6 +2049,31 @@ TCPEndpoint::_Receive(tcp_segment_header& segment, net_buffer* buffer)
 				// TODO: this doesn't look right - review!
 				return DROP;
 			}
+
+			const uint8 handshake = TCP_FLAG_SYNCHRONIZE | TCP_FLAG_ACKNOWLEDGE;
+			if (fState == SYNCHRONIZE_RECEIVED
+				&& (segment.flags & handshake) == handshake
+				&& segment.sequence == fInitialReceiveSequence
+				&& fSendUnacknowledged < segment.acknowledge
+				&& fSendMax >= segment.acknowledge) {
+				// The segment itself is unacceptable, but the acknowledgement
+				// it carries completes our handshake, so process that before
+				// discarding (RFC 9293 section 3.10.7.4 would discard it
+				// unseen). This is what lets a simultaneous open converge:
+				// the peer's SYN-ACK repeats a SYN we have already counted,
+				// so it sits at RCV.NXT - 1 and never becomes acceptable --
+				// without this, the only ACK ever offered to us is thrown
+				// away here and both ends keep answering each other's
+				// SYN-ACKs with SYN-ACKs. The acknowledgement that goes out
+				// below is then sent from ESTABLISHED, and is the plain ACK
+				// the out-of-window segment must be answered with anyway.
+				// Only the peer's retransmitted SYN-ACK qualifies (SYN set,
+				// sequence == IRS): a blind out-of-window segment must not
+				// be able to establish with the ACK value alone.
+				_MarkEstablished();
+				_Acknowledged(segment);
+			}
+
 			return DROP | IMMEDIATE_ACKNOWLEDGE;
 		}
 	}
@@ -2597,6 +2644,54 @@ TCPEndpoint::_SendAcknowledge(bool force)
 	if (fRoute == NULL || fState == LISTEN)
 		return B_ERROR;
 
+	if (fState == SYNCHRONIZE_RECEIVED && fSendNext != fInitialSendSequence) {
+		// Once our SYN has consumed the ISS, answer anything this state would
+		// acknowledge with a (re)transmission of the SYN-ACK at the ISS. For
+		// a passive child that is every SYN-ACK after the first one _Spawn()
+		// sends; in a simultaneous open our SYN already went out from
+		// SYNCHRONIZE_SENT, so the first SYN-ACK comes through here too. The
+		// plain acknowledgement RFC 9293 section 3.10.7.4 prescribes for an
+		// unacceptable segment -- <SEQ=SND.NXT><ACK=RCV.NXT> -- is useless to
+		// a peer still in SYN-SENT, which drops any segment carrying neither
+		// SYN nor RST (section 3.10.7.3), so the strict exchange livelocks
+		// until the peer gives up; Linux (tcp_check_req()) and FreeBSD
+		// (syncache_respond()) retransmit the SYN-ACK for the same reason.
+		// Sending a fresh segment from here would also be actively wrong:
+		// _PrepareAndSend() stamps it with fSendNext -- ISS + 1 by now, which
+		// the peer takes for our initial sequence number, putting it one byte
+		// ahead of our stream -- and _PrepareSendSegment() only adds the MSS,
+		// window-scale and SACK-permitted options at the initial send
+		// sequence, so the reply silently withdraws what the handshake had
+		// already negotiated. This catches every path that acknowledges in
+		// this state: the peer's retransmitted SYN (out of window by
+		// construction, a zero-length segment at RCV.NXT - 1), the other
+		// out-of-window arms, the PAWS reject, and the delayed acknowledge
+		// timer.
+		if (fRetransmitInitialCount >= TCP_MAX_SYN_ACKNOWLEDGE_RETRANSMITS) {
+			// Out of budget: stop answering, and in particular stop pushing
+			// the retransmit timer back, so that the already-armed timer can
+			// fire and take the give-up arm in _Retransmit(). Answering here
+			// regardless would let a peer that keeps provoking us at sub-RTO
+			// intervals hold the half-open connection -- and its slot in the
+			// listener's backlog -- open indefinitely.
+			return B_OK;
+		}
+
+		status_t status = _RetransmitSynchronizeAcknowledge();
+		if (status == B_OK) {
+			// Push the retransmit timer back and charge the attempt to the
+			// same budget the timer uses: the timer measures silence since
+			// our last send, and this was a send. Without the push-back it
+			// fires an instant later and puts a second identical copy on the
+			// wire. In a simultaneous open this also charges the first
+			// SYN-ACK, which leaves that end one retransmission fewer.
+			fRetransmitInitialCount++;
+			gStackModule->set_timer(&fRetransmitTimer, fRetransmitTimeout);
+			T(TimerSet(this, "retransmit", fRetransmitTimeout));
+		}
+		return status;
+	}
+
 	tcp_segment_header segment = _PrepareSendSegment();
 
 	// Is there actually anything to do?
@@ -2634,6 +2729,58 @@ TCPEndpoint::_SendReset(bool force)
 		return B_NO_MEMORY;
 
 	return _PrepareAndSend(segment, buffer, false);
+}
+
+
+/*!	Retransmits the SYN-ACK of a connection still in SYNCHRONIZE_RECEIVED.
+
+	Both the sequence number and the handshake options follow from fSendNext:
+	_PrepareAndSend() stamps it as the segment's sequence, and
+	_PrepareSendSegment() adds the MSS, SACK-permitted and window-scale options
+	only when it sits at the initial send sequence. So rewinding it to the ISS
+	is what makes this a retransmission of the original segment rather than a
+	new one, and _PrepareAndSend() counts the SYN's sequence number forward
+	again, leaving fSendNext at ISS + 1. (From _Retransmit() fSendNext was
+	already rewound to SND.UNA, the ISS, before this is called.)
+
+	_SendQueued() cannot do this: it refuses any state below ESTABLISHED, and
+	with an empty send queue it would find nothing to send anyway.
+*/
+status_t
+TCPEndpoint::_RetransmitSynchronizeAcknowledge()
+{
+	if (fRoute == NULL)
+		return B_ERROR;
+
+	ASSERT(fState == SYNCHRONIZE_RECEIVED);
+
+	const tcp_sequence sendNext = fSendNext;
+	fSendNext = fInitialSendSequence;
+	tcp_segment_header segment = _PrepareSendSegment();
+
+	net_buffer* buffer = gBufferModule->create(256);
+	if (buffer == NULL) {
+		fSendNext = sendNext;
+		return B_NO_MEMORY;
+	}
+
+	// isRetransmit: this segment must not be timed. An acknowledgement of it
+	// may have been provoked by the SYN-ACK that was already sent, which would
+	// report a round trip shorter than the path has.
+	status_t status = _PrepareAndSend(segment, buffer, true);
+	if (status != B_OK) {
+		// _PrepareAndSend() advances fSendNext only once the segment is away,
+		// so on failure the rewind above is still in place. Put it back rather
+		// than leaving the endpoint ready to reuse a consumed sequence number.
+		fSendNext = sendNext;
+	} else {
+		// Karn's rule (RFC 6298 section 3): the acknowledgement that finally
+		// arrives may answer either transmission, so the round trip must not
+		// be sampled from the original send time either.
+		fSendTime = 0;
+	}
+
+	return status;
 }
 
 
@@ -2958,6 +3105,33 @@ TCPEndpoint::_Retransmit()
 	if (fState == SYNCHRONIZE_SENT) {
 		if (_SendAcknowledge() == B_OK)
 			fRetransmitInitialCount++;
+		gStackModule->set_timer(&fRetransmitTimer, fRetransmitTimeout);
+	} else if (fState == SYNCHRONIZE_RECEIVED) {
+		// The SYN-ACK. _SendQueued() below cannot retransmit it: it refuses
+		// every state under ESTABLISHED, so sending this state there left the
+		// timer firing into a function that declined to do anything.
+		//
+		// The attempt is counted whether or not it got out, unlike the
+		// SYNCHRONIZE_SENT arm above, so that a send that keeps failing (no
+		// route, no memory) still runs out of attempts. A passive child has
+		// nobody waiting on it until it is accepted, so nothing else would
+		// end it. An active open that got here by a simultaneous open is
+		// also bounded by connect()'s timeout if connect() blocks, but not
+		// if the socket is non-blocking.
+		if (fRetransmitInitialCount >= TCP_MAX_SYN_ACKNOWLEDGE_RETRANSMITS) {
+			// Give up on the half-open connection. ECONNREFUSED is what a
+			// reset arriving in this state reports, and this is the same
+			// outcome by a slower route: the peer never completed the
+			// handshake. For an unaccepted child, _Close() hands the
+			// parent's reference back through set_aborted(); the reference
+			// _RetransmitTimer() holds keeps that from deleting the endpoint
+			// under its own lock.
+			_HandleReset(ECONNREFUSED);
+			return;
+		}
+
+		fRetransmitInitialCount++;
+		_RetransmitSynchronizeAcknowledge();
 		gStackModule->set_timer(&fRetransmitTimer, fRetransmitTimeout);
 	} else
 		_SendQueued();
