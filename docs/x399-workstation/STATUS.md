@@ -3,6 +3,36 @@
 Status values are backed by observation on the workstation. Anything not
 listed as verified is untested.
 
+**2026-10-21 NVIDIA / Summit performance trial:** the workstation is back on
+its GTX 1070, running hrev60207+1733 (`3e7f3a491b`). Summit initially selected
+an AMD-only Mesa installation and fell back to llvmpipe. Selecting the existing
+`prefix-20261002` Mesa and its private nouveau ICD restores zink/NVK rendering.
+The restored user NVDEC plugin decodes H.264 on the card. A wedged media service
+was restarted; that recovery has not established a permanent audio-driver fix.
+
+The `summit-media-latency` topic branch experiments with eight video decoder
+threads, presentation timestamps for video chunks without FFmpeg packet
+metadata, and honoring NVDEC's negative `time_to_decode` preroll hint in the
+FFmpeg decoder. Reference decoding is preserved; progressive preroll skips
+RGB conversion/copy, while interlaced frames retain temporal-filter processing.
+QEMU and native checks match post-target RGB hashes for H.264 and four FFmpeg
+FATE AV1 fixtures; four full AV1 hashes also match the previous decoder.
+[`ffmpegpreroll.cpp`](tests/ffmpegpreroll.cpp) reproduces those checks. Its
+buffer-verification mode adds copying/comparison overhead and must be disabled
+for timing measurements.
+
+On YouTube 1080p60 AV1, three native seek-bar clicks and one drag reached the
+target frame in 926/654/724/355 ms, versus 1275/774/929/423 ms with the
+thread-limit-only plugin. The slowest seek now reaches its target before the
+engine's one-second preroll fallback starts the clock. This is one traced
+comparison, not a general throughput claim. The trial FFmpeg plugin is installed
+in `/boot/system/non-packaged/add-ons/media/plugins/ffmpeg`, below the user NVDEC
+plugin in lookup order. Putting both in the user directory made ordinary H.264
+choose software; relocation restored native NVDEC selection (60 frames, 115 fps).
+The packaged FFmpeg plugin remains available for rollback. Broader playback and
+Speedometer validation are still in progress. Local evidence is under
+`/mnt/HaikuWork/build/summit-media-perf/` on the build host.
+
 **2026-10-13 WX 5100 status:** the card runs on amdgpu_drm (Linux 6.18's
 amdgpu on Haiku) with the `amdgpu_kms` accelerant: both 4K monitors in one
 frame buffer, OpenGL/GLES/EGL on radeonsi, Vulkan 1.4 on RADV (including

@@ -15,6 +15,7 @@
 
 #include "AVCodecDecoder.h"
 
+#include <algorithm>
 #include <new>
 
 #include <assert.h>
@@ -312,7 +313,12 @@ AVCodecDecoder::NegotiateOutputFormat(media_format* inOutFormat)
 
 	fCodecContext->err_recognition = AV_EF_CAREFUL;
 	fCodecContext->error_concealment = 3;
-	fCodecContext->thread_count = info.cpu_count;
+	// Frame threading buffers pictures before returning the first one. Using
+	// every logical CPU on a large machine adds startup and seek latency, and
+	// dav1d warns against counts above 16. Keep decoding parallel without
+	// creating a worker for every hardware thread.
+	fCodecContext->thread_count = fIsAudio ? info.cpu_count
+		: std::min<uint32>(info.cpu_count, 8);
 
 	if (fIsAudio)
 		return _NegotiateAudioOutputFormat(inOutFormat);
@@ -640,7 +646,8 @@ AVCodecDecoder::_DecodeAudio(void* outBuffer, int64* outFrameCount,
 		copied video frames (usually one video frame).
 	\param mediaHeader Pointer to the output media header that contains the
 		decoded video frame properties.
-	\param info Specifies additional decoding parameters. (Note: unused).
+	\param info A negative time_to_decode requests metadata without pixels for
+		pictures before its absolute value (seek preroll, as in NVDEC).
 
 	\returns B_OK Decoding a video frame succeeded.
 	\returns B_LAST_BUFFER_ERROR There are no more video frames available.
@@ -650,15 +657,23 @@ status_t
 AVCodecDecoder::_DecodeVideo(void* outBuffer, int64* outFrameCount,
 	media_header* mediaHeader, media_decode_info* info)
 {
+	// As with NVDEC, a negative time_to_decode identifies seek preroll whose
+	// pixels the caller will discard. Keep decoding references and timestamps,
+	// but avoid converting and copying those pictures into the output buffer.
+	bigtime_t skipBefore = info != NULL && info->time_to_decode < 0
+		&& info->time_to_decode != INT64_MIN ? -info->time_to_decode : 0;
 	status_t videoDecodingStatus
-		= fDecodedDataSizeInBytes > 0 ? B_OK : _DecodeNextVideoFrame();
+		= fDecodedDataSizeInBytes > 0 ? B_OK : _DecodeNextVideoFrame(skipBefore);
 
 	if (videoDecodingStatus != B_OK)
 		return videoDecodingStatus;
 
 	*outFrameCount = 1;
 	*mediaHeader = fHeader;
-	memcpy(outBuffer, fDecodedData, mediaHeader->size_used);
+	if (!(skipBefore > 0 && fHeader.start_time != AV_NOPTS_VALUE
+		&& fHeader.start_time < skipBefore)) {
+		memcpy(outBuffer, fDecodedData, mediaHeader->size_used);
+	}
 
 	fDecodedDataSizeInBytes = 0;
 
@@ -1245,7 +1260,7 @@ AVCodecDecoder::_UpdateMediaHeaderForAudioFrame()
 	\returns Other Errors
 */
 status_t
-AVCodecDecoder::_DecodeNextVideoFrame()
+AVCodecDecoder::_DecodeNextVideoFrame(bigtime_t skipBefore)
 {
 	int error;
 	int send_error;
@@ -1264,7 +1279,7 @@ AVCodecDecoder::_DecodeNextVideoFrame()
 			status_t loadingChunkStatus
 				= _LoadNextChunkIfNeededAndAssignStartTime();
 			if (loadingChunkStatus == B_LAST_BUFFER_ERROR)
-				return _FlushOneVideoFrameFromDecoderBuffer();
+				return _FlushOneVideoFrameFromDecoderBuffer(skipBefore);
 			if (loadingChunkStatus != B_OK) {
 				TRACE("[v] AVCodecDecoder::_DecodeNextVideoFrame(): error from "
 					"GetNextChunk(): %s\n", strerror(loadingChunkStatus));
@@ -1300,7 +1315,7 @@ AVCodecDecoder::_DecodeNextVideoFrame()
 	bigtime_t formatConversionStart = system_time();
 #endif
 
-	status_t handleStatus = _HandleNewVideoFrameAndUpdateSystemState();
+	status_t handleStatus = _HandleNewVideoFrameAndUpdateSystemState(skipBefore);
 	if (handleStatus != B_OK)
 		return handleStatus;
 
@@ -1405,6 +1420,11 @@ AVCodecDecoder::_LoadNextChunkIfNeededAndAssignStartTime()
 	fTempPacket->size = fChunkBufferSize;
 
 	fTempPacket->dts = chunkMediaHeader.start_time;
+	// A Media Kit chunk carries its presentation time. In particular, dav1d
+	// needs packet PTS to return timed pictures; DTS alone leaves AV1 output
+	// untimed. Container-specific packet metadata below still takes precedence.
+	if (!fIsAudio)
+		fTempPacket->pts = chunkMediaHeader.start_time;
 		// Let FFMPEG handle the correct relationship between start_time and
 		// decoded a/v frame. By doing so we are simply copying the way how it
 		// is implemented in ffplay.c for video frames (for audio frames it
@@ -1495,9 +1515,18 @@ AVCodecDecoder::_CopyChunkToChunkBufferAndAddPadding(const void* chunk,
 	\returnb B_NO_MEMORY when no memory is left for correct operation.
 */
 status_t
-AVCodecDecoder::_HandleNewVideoFrameAndUpdateSystemState()
+AVCodecDecoder::_HandleNewVideoFrameAndUpdateSystemState(bigtime_t skipBefore)
 {
 	_UpdateMediaHeaderForVideoFrame();
+	// Interlaced pictures still pass through the temporal filter so it has
+	// the same history when the first displayed picture arrives.
+	if (skipBefore > 0 && fHeader.start_time != AV_NOPTS_VALUE
+		&& fHeader.start_time < skipBefore
+		&& !(fRawDecodedPicture->flags & AV_FRAME_FLAG_INTERLACED)) {
+		fDecodedDataSizeInBytes = 0;
+		fFrame++;
+		return B_OK;
+	}
 	status_t postProcessStatus = _DeinterlaceAndColorConvertVideoFrame();
 	if (postProcessStatus != B_OK)
 		return postProcessStatus;
@@ -1532,7 +1561,7 @@ AVCodecDecoder::_HandleNewVideoFrameAndUpdateSystemState()
 	\returns B_NO_MEMORY No memory left for correct operation.
 */
 status_t
-AVCodecDecoder::_FlushOneVideoFrameFromDecoderBuffer()
+AVCodecDecoder::_FlushOneVideoFrameFromDecoderBuffer(bigtime_t skipBefore)
 {
 	// Tell the decoder there is nothing to send anymore
 	avcodec_send_packet(fCodecContext, NULL);
@@ -1546,7 +1575,7 @@ AVCodecDecoder::_FlushOneVideoFrameFromDecoderBuffer()
 		return B_LAST_BUFFER_ERROR;
 	}
 
-	return _HandleNewVideoFrameAndUpdateSystemState();
+	return _HandleNewVideoFrameAndUpdateSystemState(skipBefore);
 }
 
 
