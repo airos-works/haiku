@@ -324,7 +324,10 @@ enum {
 	FLAG_OPTION_SACK_PERMITTED	= 0x80,
 	FLAG_AUTO_RECEIVE_BUFFER_SIZE = 0x100,
 	FLAG_CAN_NOTIFY 			= 0x200,
-	FLAG_USER_CLOSED			= 0x400
+	FLAG_USER_CLOSED			= 0x400,
+	FLAG_WAS_ESTABLISHED		= 0x800
+		// this connection reached ESTABLISHED; a send() once it is CLOSED
+		// without a pending error then fails with EPIPE, not ENOTCONN
 };
 
 
@@ -552,11 +555,24 @@ TCPEndpoint::Close()
 		return B_OK;
 	}
 
-	// handle linger with zero timeout
+	// handle linger with zero timeout: an abortive close, which resets the
+	// peer and discards what is queued. Unlike RFC 793 ABORT, the RST also
+	// goes out in CLOSING and LAST-ACK; only CLOSED and TIME_WAIT send none.
+	// The RST has to be sent through _SendReset(): _SendQueued() refuses to
+	// send anything once the state is CLOSED, so a peer never learnt of the
+	// abort until its next send bounced off the vanished endpoint.
 	if ((socket->options & SO_LINGER) != 0 && socket->linger == 0) {
+		bool sendReset = fState != CLOSED && fState != TIME_WAIT;
 		fState = CLOSED;
 		T(State(this));
-		return _SendQueued(true);
+		_CancelConnectionTimers();
+		if (sendReset) {
+			// The RST must carry the highest sequence sent, or an
+			// RFC 5961 conformant peer would discard it.
+			fSendNext = fSendMax;
+			_SendReset(true);
+		}
+		return B_OK;
 	}
 
 	status_t status = _Disconnect(true);
@@ -653,6 +669,12 @@ TCPEndpoint::Connect(const sockaddr* address)
 	TRACE("  Connect(): starting 3-way handshake...");
 
 	fFlags |= FLAG_CAN_NOTIFY;
+	// forget the state of any previous connection on this socket: a stale,
+	// unconsumed socket->error (e.g. from an earlier failed connect) would
+	// end the wait for this handshake at once, and be reported by every
+	// send() of this connection once it is CLOSED
+	fFlags &= ~FLAG_WAS_ESTABLISHED;
+	socket->error = B_OK;
 	fState = SYNCHRONIZE_SENT;
 	T(State(this));
 
@@ -828,12 +850,8 @@ TCPEndpoint::SendData(net_buffer *buffer)
 	if ((flags & ~(MSG_DONTWAIT | MSG_OOB | MSG_EOF)) != 0)
 		return EOPNOTSUPP;
 
-	if (fState == CLOSED) {
-		// report why the connection ended (reset, timed out, aborted)
-		if (socket->error != B_OK)
-			return socket->error;
-		return ENOTCONN;
-	}
+	if (fState == CLOSED)
+		return _ClosedSendStatus();
 	if (fState == LISTEN)
 		return EDESTADDRREQ;
 	if (!is_writable(fState) && !is_establishing(fState))
@@ -862,11 +880,10 @@ TCPEndpoint::SendData(net_buffer *buffer)
 				return posix_error(status);
 			}
 
-			if (!is_writable(fState) && !is_establishing(fState)) {
-				if (fState == CLOSED && socket->error != B_OK)
-					return socket->error;
+			if (fState == CLOSED)
+				return _ClosedSendStatus();
+			if (!is_writable(fState) && !is_establishing(fState))
 				return EPIPE;
-			}
 		}
 
 		size_t size = fSendQueue.Free();
@@ -1478,6 +1495,7 @@ void
 TCPEndpoint::_MarkEstablished()
 {
 	fState = ESTABLISHED;
+	fFlags |= FLAG_WAS_ESTABLISHED;
 	T(State(this));
 
 	fLastReceiveTime = system_time();
@@ -1508,6 +1526,26 @@ TCPEndpoint::_WaitForEstablished(MutexLocker &locker, bigtime_t timeout)
 	}
 
 	return B_OK;
+}
+
+
+/*!	What a send on a CLOSED endpoint returns. As long as the error that
+	ended the connection (reset, timed out, aborted, refused) is pending, every
+	send reports it, without a signal, so that a caller learns why the
+	connection is gone however often it retries. Without a pending error (an
+	orderly close, or getsockopt(SO_ERROR) consumed it) a connection that had
+	been established fails with EPIPE and SIGPIPE, as it does in the closing
+	states before CLOSED; one that never was reports ENOTCONN.
+*/
+status_t
+TCPEndpoint::_ClosedSendStatus() const
+{
+	// read it only once: SO_ERROR clears it without holding our lock
+	status_t error = socket->error;
+	if (error != B_OK)
+		return error;
+
+	return (fFlags & FLAG_WAS_ESTABLISHED) != 0 ? EPIPE : ENOTCONN;
 }
 
 
