@@ -21,6 +21,8 @@
 #   AIROS_CI_PACKAGES       directory of packages for system/packages: the
 #                           applications, Summit and summit_webkit, the
 #                           airos_* libraries, rock5_ffmpeg, firmware packages,
+#                           (arm64) openssh, nano, pe, git, mandoc and their
+#                           libraries under HaikuPorts' names,
 #                           and (x86_64) HaikuPorts packages the build system's
 #                           repository list lacks, and qt6_base with air/OS's
 #                           Haiku platform plugin
@@ -113,6 +115,15 @@ switch $(HAIKU_BUILD_PROFILE) {
 	}
 }
 
+# The arm64 images have the command line tools of Haiku's nightly package set
+# that x86_64 gets from it (openssh, nano, pe, git, mandoc: CI builds them
+# under HaikuPorts' names, airos-ci deps/recipes), and sshd is in the "party"
+# group with the root user as in the nightly profile. (The openssh package
+# adds the sshd user and group itself at first boot.)
+if $(AIROS_ROCK5) || $(AIROS_RPI4) || $(AIROS_CUBIE) {
+	AddGroupToHaikuImage party : 101 : $(HAIKU_ROOT_USER_NAME:E=baron) sshd ;
+}
+
 # The ROCK 5 ITX's drivers and Bluetooth tools (bt_le, the AX210 loader).
 if $(AIROS_ROCK5) {
 	DeferredSubInclude HAIKU_TOP tools rock5-itx ;
@@ -176,6 +187,13 @@ rule UserBuildConfigRulePreImage
 		# arm64 release package readers may not support the repository's zstd.
 		if ! [ Glob $(AIROS_CI_PACKAGES) : ca_root_certificates-*-any.hpkg ] {
 			Exit "The arm64 image requires the ca_root_certificates package." ;
+		}
+		# The command line tools x86_64 has from the nightly package set.
+		local tool ;
+		for tool in openssh nano pe git mandoc {
+			if ! [ Glob $(AIROS_CI_PACKAGES) : $(tool)-*-arm64.hpkg ] {
+				Exit "The arm64 image requires the $(tool) package." ;
+			}
 		}
 		# The system fonts: the arm64 repository's bootstrap noto has no Noto
 		# Sans Mono, app_server's default fixed font, which then falls back to
