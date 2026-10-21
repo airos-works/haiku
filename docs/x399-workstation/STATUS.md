@@ -3,14 +3,14 @@
 Status values are backed by observation on the workstation. Anything not
 listed as verified is untested.
 
-**2026-10-21 NVIDIA / Summit performance trial:** the workstation is back on
+**2026-10-21 NVIDIA / Summit performance recovery:** the workstation is back on
 its GTX 1070, running hrev60207+1733 (`3e7f3a491b`). Summit initially selected
 an AMD-only Mesa installation and fell back to llvmpipe. Selecting the existing
 `prefix-20261002` Mesa and its private nouveau ICD restores zink/NVK rendering.
 The restored user NVDEC plugin decodes H.264 on the card. A wedged media service
 was restarted; that recovery has not established a permanent audio-driver fix.
 
-The `summit-media-latency` topic branch experiments with eight video decoder
+The `summit-media-latency` change uses eight video decoder
 threads, presentation timestamps for video chunks without FFmpeg packet
 metadata, and honoring NVDEC's negative `time_to_decode` preroll hint in the
 FFmpeg decoder. Reference decoding is preserved; progressive preroll skips
@@ -29,9 +29,17 @@ comparison, not a general throughput claim. The trial FFmpeg plugin is installed
 in `/boot/system/non-packaged/add-ons/media/plugins/ffmpeg`, below the user NVDEC
 plugin in lookup order. Putting both in the user directory made ordinary H.264
 choose software; relocation restored native NVDEC selection (60 frames, 115 fps).
-The packaged FFmpeg plugin remains available for rollback. Broader playback and
-Speedometer validation are still in progress. Local evidence is under
-`/mnt/HaikuWork/build/summit-media-perf/` on the build host.
+The packaged FFmpeg plugin remains available for rollback. With Summit's exact
+union of overlapping direct-presentation damage, foreground playback dropped
+5 of 1,503 frames at 1080p60 AV1 and 47 of 1,503 at 4K60 VP9, with no waiting or
+stalled events in either 25-second interval. The installed launcher's automatic
+1440p60 VP9 selection dropped 5 of 1,750 frames over 29.2 seconds, without
+stalled samples or a lingering spinner. Native captures verified redraw after
+covering, moving and resizing the playing window. These measurements qualify
+the decoder with the tested non-PGO browser; the browser's full-engine PGO
+comparison remains separate work. Local evidence is under
+`/mnt/HaikuWork/build/summit-media-perf/` and Summit's
+`.vm/bench/x399-perf-20261021/` on the build host.
 
 **2026-10-13 WX 5100 status:** the card runs on amdgpu_drm (Linux 6.18's
 amdgpu on Haiku) with the `amdgpu_kms` accelerant: both 4K monitors in one
