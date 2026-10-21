@@ -152,6 +152,8 @@ FontCacheEntry::Init(const ServerFont& font, bool forceVector)
 	if (!fGlyphCache.IsSet())
 		return false;
 
+	fFontStyle.SetTo(font.GetStyle());
+
 	glyph_rendering renderingType = _RenderTypeFor(font, forceVector);
 
 	// TODO: encoding from font
@@ -400,9 +402,11 @@ FontCacheEntry::GenerateSignature(char* signature, size_t signatureSize,
 	bool hinting = font.Hinting();
 	uint8 averageWeight = gSubpixelAverageWeight;
 
+	// Manager addresses and family/style IDs can be reused after an app
+	// exits. This retained style stays unique for the cache entry's lifetime.
 	snprintf(signature, signatureSize,
-		"%" B_PRId32 ",%p,%u,%d,%d,%.2f,%d,%d,%d",
-		font.GetFamilyAndStyle(), font.Manager(), charMap,
+		"%" B_PRId32 ",%p,%p,%u,%d,%d,%.2f,%d,%d,%d",
+		font.GetFamilyAndStyle(), font.Manager(), font.GetStyle(), charMap,
 		font.Face(), int(renderingType), font.Size(), hinting, averageWeight,
 		font.IsDeviceScaled());
 }

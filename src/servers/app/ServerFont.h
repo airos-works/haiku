@@ -184,6 +184,8 @@ class ServerFont {
 
 			FontManager*		Manager() const
 									{ return fStyle->Manager(); }
+			FontStyle*			GetStyle() const
+									{ return fStyle.Get(); }
 
 			void  				SetFontData(FT_Byte* location, uint32 size);
 			uint32				FontDataSize() const
