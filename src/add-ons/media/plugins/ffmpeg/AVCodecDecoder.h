@@ -90,13 +90,14 @@ private:
 			status_t	_DecodeSomeAudioFramesIntoEmptyDecodedDataBuffer();
 			void		_UpdateMediaHeaderForAudioFrame();
 
-			status_t	_DecodeNextVideoFrame();
+			status_t	_DecodeNextVideoFrame(bigtime_t skipBefore = 0);
 			void		_ApplyEssentialVideoContainerPropertiesToContext();
 			status_t	_LoadNextChunkIfNeededAndAssignStartTime();
 			status_t	_CopyChunkToChunkBufferAndAddPadding(const void* chunk,
 							size_t chunkSize);
-			status_t	_HandleNewVideoFrameAndUpdateSystemState();
-			status_t	_FlushOneVideoFrameFromDecoderBuffer();
+			status_t	_HandleNewVideoFrameAndUpdateSystemState(
+							bigtime_t skipBefore = 0);
+			status_t	_FlushOneVideoFrameFromDecoderBuffer(bigtime_t skipBefore);
 			void		_UpdateMediaHeaderForVideoFrame();
 			status_t	_DeinterlaceAndColorConvertVideoFrame();
 
