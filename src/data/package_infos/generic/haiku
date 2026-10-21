@@ -24,6 +24,8 @@ provides {
 #else
 	haiku=%HAIKU_VERSION% compat>=R1~beta1
 #endif
+	/* Cached memory fonts retain their data across client exit. */
+	haiku_private_font_cache = 1
 	cmd:arp
 	cmd:chop
 	cmd:clear

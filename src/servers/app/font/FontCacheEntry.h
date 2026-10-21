@@ -147,6 +147,10 @@ class FontCacheEntry : public MultiLocker, public BReferenceable {
 
 			ObjectDeleter<GlyphCachePool>
 								fGlyphCache;
+			// FreeType's memory face borrows the style's font data. Retain it
+			// until after fEngine is destroyed, including after its app exits.
+			BReference<FontStyle>
+								fFontStyle;
 			FontEngine			fEngine;
 
 	static	BLocker				sUsageUpdateLock;
