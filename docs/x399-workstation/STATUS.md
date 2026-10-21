@@ -36,8 +36,13 @@ stalled events in either 25-second interval. The installed launcher's automatic
 1440p60 VP9 selection dropped 5 of 1,750 frames over 29.2 seconds, without
 stalled samples or a lingering spinner. Native captures verified redraw after
 covering, moving and resizing the playing window. These measurements qualify
-the decoder with the tested non-PGO browser; the browser's full-engine PGO
-comparison remains separate work. Local evidence is under
+the decoder with the tested non-PGO browser. The subsequent full-engine PGO
+bundle is installed as `bundle-perf-pgo-use-20261021`: its fresh-profile
+Speedometer score is 9.459±0.429 versus the matched non-PGO 8.278±0.377;
+the normal profile scores 8.869±0.403 with all four extensions loaded.
+Its foreground AV1/VP9 checks and native redraw checks also passed; Summit's
+`docs/performance.md` records the remaining roughly 1.3-second AV1 seek-preroll
+case and the detailed comparison. Local evidence is under
 `/mnt/HaikuWork/build/summit-media-perf/` and Summit's
 `.vm/bench/x399-perf-20261021/` on the build host.
 
