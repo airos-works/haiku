@@ -16,6 +16,7 @@
 #include <Menu.h>
 #include <MenuItem.h>
 #include <Messenger.h>
+#include <MimeType.h>
 #include <Path.h>
 #include <Roster.h>
 #include <Screen.h>
@@ -600,11 +601,13 @@ MainWindow::_AdjustLocation(BRect frame)
 void
 MainWindow::_AddDefaultButtons()
 {
-	// Mail
+	// Mail (air/OS: jmgasper/mail replaces Haiku's Mail where it is installed)
 	LaunchButton* button = new LaunchButton("launch button", NULL,
 		new BMessage(MSG_LAUNCH));
 	fPadView->AddButton(button);
-	button->SetTo("application/x-vnd.Be-MAIL", true);
+	BMimeType airosMail("application/x-vnd.air-Mail");
+	button->SetTo(airosMail.IsInstalled()
+		? "application/x-vnd.air-Mail" : "application/x-vnd.Be-MAIL", true);
 
 	// StyledEdit
 	button = new LaunchButton("launch button", NULL, new BMessage(MSG_LAUNCH));

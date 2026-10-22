@@ -567,6 +567,16 @@ MailDaemonApplication::SendPendingMessages(BMessage* msg)
 }
 
 
+// air/OS: Mail (jmgasper/mail) replaces Haiku's Mail where it is installed.
+static const char*
+preferred_mail_application()
+{
+	BMimeType airosMail("application/x-vnd.air-Mail");
+	return airosMail.IsInstalled()
+		? "application/x-vnd.air-Mail" : "application/x-vnd.Be-MAIL";
+}
+
+
 void
 MailDaemonApplication::MakeMimeTypes(bool remakeMIMETypes)
 {
@@ -613,11 +623,11 @@ MailDaemonApplication::MakeMimeTypes(bool remakeMIMETypes)
 			if (i == 0) {
 				mime.SetShortDescription("E-mail");
 				mime.SetLongDescription("Electronic Mail Message");
-				mime.SetPreferredApp("application/x-vnd.Be-MAIL");
+				mime.SetPreferredApp(preferred_mail_application());
 			} else {
 				mime.SetShortDescription("Partial E-mail");
 				mime.SetLongDescription("A Partially Downloaded E-mail");
-				mime.SetPreferredApp("application/x-vnd.Be-MAIL");
+				mime.SetPreferredApp(preferred_mail_application());
 			}
 		}
 	}
