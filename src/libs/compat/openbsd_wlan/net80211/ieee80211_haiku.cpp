@@ -365,6 +365,8 @@ wlan_control(void* cookie, uint32 op, void* arg, size_t length)
 			ifr.ifr_data = (uint8_t*)&nwid;
 
 			if (op == SIOCS80211) {
+				if (ireq.i_len > IEEE80211_NWID_LEN)
+					return EINVAL;
 				nwid.i_len = ireq.i_len;
 				if (user_memcpy(nwid.i_nwid, ireq.i_data, ireq.i_len) != B_OK)
 					return B_BAD_ADDRESS;
@@ -478,9 +480,10 @@ wlan_control(void* cookie, uint32 op, void* arg, size_t length)
 			if (user_memcpy(haiku_join, ireq.i_data, ireq.i_len) != B_OK)
 				return B_BAD_ADDRESS;
 
-			if (haiku_join->i_nwid_len > IEEE80211_NWID_LEN
-				|| haiku_join->i_key_len > IEEE80211_PMK_LEN
-				|| haiku_join->i_key_len > ireq.i_len - sizeof(*haiku_join))
+			// The SSID length comes from the caller and is copied into a
+			// fixed buffer below. The key length is checked only where a key
+			// is used: for open networks wpa_gui-haiku leaves it uninitialized.
+			if (haiku_join->i_nwid_len > IEEE80211_NWID_LEN)
 				return B_BAD_VALUE;
 
 			struct ifreq ifr;
@@ -520,6 +523,11 @@ wlan_control(void* cookie, uint32 op, void* arg, size_t length)
 					if ((haiku_join->i_key_mode & B_KEY_MODE_PSK_SHA256) != 0)
 						wpaparams.i_akms |= IEEE80211_WPA_AKM_SHA256_PSK;
 
+					if (haiku_join->i_key_len > IEEE80211_PMK_LEN
+						|| haiku_join->i_key_len > sizeof(wpapsk.i_psk)
+						|| haiku_join->i_key_len
+							> ireq.i_len - sizeof(*haiku_join))
+						return B_BAD_VALUE;
 					if (haiku_join->i_key_len != 0) {
 						wpapsk.i_enabled = 1;
 						memcpy(wpapsk.i_psk, haiku_join->i_key, haiku_join->i_key_len);
