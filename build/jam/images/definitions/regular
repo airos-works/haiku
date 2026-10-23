@@ -67,10 +67,11 @@ DESKBAR_APPLICATIONS += [ FFilterByBuildFeatures
 	SoundRecorder
 ] ;
 
-# air/OS: on x86_64, Mail (jmgasper/mail, the airos_mail package that the
-# image build adds) replaces Haiku's Mail as apps/Mail, with its Deskbar entry.
-# Other architectures keep Haiku's Mail until that package is built for them.
-if $(TARGET_ARCH) = x86_64 {
+# air/OS: on x86_64 and arm64, Mail (jmgasper/mail, the airos_mail package
+# that the image build adds) replaces Haiku's Mail as apps/Mail, with its
+# Deskbar entry. Other architectures keep Haiku's Mail until that package is
+# built for them.
+if $(TARGET_ARCH) = x86_64 || $(TARGET_ARCH) = arm64 {
 	SYSTEM_APPS = [ FFilter $(SYSTEM_APPS) : Mail ] ;
 	DESKBAR_APPLICATIONS = [ FFilter $(DESKBAR_APPLICATIONS) : Mail ] ;
 }
