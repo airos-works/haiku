@@ -750,18 +750,66 @@ dtb_exit_boot_services()
 }
 
 
+// Days since 1970-01-01 of a proleptic Gregorian date.
+static int64
+days_from_civil(int64 year, uint32 month, uint32 day)
+{
+	year -= month <= 2;
+	int64 era = (year >= 0 ? year : year - 399) / 400;
+	uint32 yearOfEra = (uint32)(year - era * 400);
+	uint32 dayOfYear = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+	uint32 dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100
+		+ dayOfYear;
+	return era * 146097 + dayOfEra - 719468;
+}
+
+
+/*!	The firmware's clock in seconds since 1970, as its fields read (the
+	kernel applies its own GMT or local time setting), or 0 if it has none.
+*/
+static uint64
+firmware_clock_seconds()
+{
+	efi_time time;
+	if (kRuntimeServices->GetTime(&time, NULL) != EFI_SUCCESS
+		|| time.Year < 2000 || time.Month < 1 || time.Month > 12
+		|| time.Day < 1 || time.Day > 31) {
+		return 0;
+	}
+
+	return days_from_civil(time.Year, time.Month, time.Day) * 86400
+		+ time.Hour * 3600 + time.Minute * 60 + time.Second;
+}
+
+
 void
 dtb_set_kernel_args()
 {
 	// pack into proper location if the architecture cares
 	if (sDtbTable != NULL) {
-		// libfdt requires 8-byte alignment
-		gKernelArgs.arch_args.fdt = (void*)(addr_t)kernel_args_malloc(sDtbSize, 8);
+		// The kernel has no driver for most boards' real-time clock, so the
+		// firmware's clock goes along as "haiku,firmware-clock" in /chosen.
+		uint64 clock = firmware_clock_seconds();
+		uint32 size = sDtbSize + (clock != 0 ? 64 : 0);
 
-		if (gKernelArgs.arch_args.fdt != NULL)
-			memcpy(gKernelArgs.arch_args.fdt, sDtbTable, sDtbSize);
-		else
+		// libfdt requires 8-byte alignment
+		gKernelArgs.arch_args.fdt = (void*)(addr_t)kernel_args_malloc(size, 8);
+
+		if (gKernelArgs.arch_args.fdt == NULL)
 			ERROR("unable to malloc for fdt!\n");
+		else if (clock == 0)
+			memcpy(gKernelArgs.arch_args.fdt, sDtbTable, sDtbSize);
+		else {
+			void* fdt = gKernelArgs.arch_args.fdt;
+			int chosen = -1;
+			if (fdt_open_into(sDtbTable, fdt, size) == 0)
+				chosen = fdt_path_offset(fdt, "/chosen");
+			if (chosen < 0 || fdt_setprop_u64(fdt, chosen,
+					"haiku,firmware-clock", clock) != 0) {
+				memcpy(fdt, sDtbTable, sDtbSize);
+			} else
+				dprintf("firmware clock: %" B_PRIu64 "\n", clock);
+		}
 	}
 
 	uart_info &uart = gKernelArgs.arch_args.uart;
