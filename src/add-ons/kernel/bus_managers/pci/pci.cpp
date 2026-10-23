@@ -2366,6 +2366,8 @@ PCI::_AllocateMSIVectors(PCIDev* device, uint32 count, uint32* startVector,
 	device_node* root = _GetDomainData(device->domain)->root_node;
 	if (root == NULL || gDeviceManager->get_attr_uint64(root, B_PCI_MSI_CONTROLLER_ADDRESS,
 			&requester.controller_address, true) != B_OK) {
+		dprintf("PCI: domain %u has %s, no MSI controller\n", device->domain,
+			root == NULL ? "no root node" : "a root node");
 		return msi_allocate_vectors_for_device(NULL, count, startVector, address, data);
 	}
 	uint32 base, range;

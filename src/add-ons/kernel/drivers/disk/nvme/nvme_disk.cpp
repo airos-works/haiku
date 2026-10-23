@@ -9,6 +9,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <algorithm>
 #include <condition_variable.h>
@@ -364,18 +365,24 @@ nvme_disk_init_device(void* _info, void** _cookie)
 
 	if (pci->get_msix_count(pcidev)) {
 		uint32 msixVector = 0;
-		if (pci->configure_msix(pcidev, 1, &msixVector) == B_OK
-			&& pci->enable_msix(pcidev) == B_OK) {
+		status_t status = pci->configure_msix(pcidev, 1, &msixVector);
+		if (status == B_OK)
+			status = pci->enable_msix(pcidev);
+		if (status == B_OK) {
 			TRACE_ALWAYS("using MSI-X\n");
 			irq = msixVector;
-		}
+		} else
+			TRACE_ALWAYS("MSI-X unavailable: %s\n", strerror(status));
 	} else if (pci->get_msi_count(pcidev) >= 1) {
 		uint32 msiVector = 0;
-		if (pci->configure_msi(pcidev, 1, &msiVector) == B_OK
-			&& pci->enable_msi(pcidev) == B_OK) {
+		status_t status = pci->configure_msi(pcidev, 1, &msiVector);
+		if (status == B_OK)
+			status = pci->enable_msi(pcidev);
+		if (status == B_OK) {
 			TRACE_ALWAYS("using message signaled interrupts\n");
 			irq = msiVector;
-		}
+		} else
+			TRACE_ALWAYS("MSI unavailable: %s\n", strerror(status));
 	}
 
 	if (irq == 0) {
