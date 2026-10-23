@@ -252,6 +252,17 @@ platform_init_video(void)
 		return B_ERROR;
 	}
 
+	// Keep the mode the firmware set up for the attached display when it is
+	// a usable one: the largest mode can be more than the display (or a KVM
+	// capturing it) accepts, which leaves the screen dark, as on the Radxa
+	// Dragon Q8B's Qualcomm firmware.
+	efi_graphics_output_mode_information* current = sGraphicsOutput->Mode->Info;
+	if (current != NULL && depth_from_mode_info(current) > 0
+		&& current->HorizontalResolution >= 1024
+		&& current->VerticalResolution >= 768) {
+		sGraphicsMode = sGraphicsOutput->Mode->Mode;
+	}
+
 	gKernelArgs.frame_buffer.enabled = true;
 	sModeChosen = false;
 	sSettingsLoaded = false;

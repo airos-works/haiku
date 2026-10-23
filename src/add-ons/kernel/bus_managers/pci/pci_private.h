@@ -74,4 +74,8 @@ void		pci_write_io_32(int mapped_io_addr, uint32 value);
 }
 #endif
 
+#ifdef __cplusplus
+phys_addr_t		pci_ram_address(uint8 domain, phys_addr_t childAddress);
+#endif
+
 #endif	/* __PCI_PRIV_H__ */

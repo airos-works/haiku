@@ -31,6 +31,7 @@
 #endif
 #include "efi_platform.h"
 #include "load_options.h"
+#include "../../loader/load_driver_settings.h"
 #include "mmu.h"
 #include "quirks.h"
 #include "serial.h"
@@ -176,6 +177,14 @@ get_kernel_regions(addr_range& text, addr_range& data)
 extern "C" void
 platform_start_kernel(void)
 {
+#ifdef __aarch64__
+	// Debug output (ESC at boot) without a serial console also goes to the
+	// screen: on boards whose firmware leaves no UART running it is all
+	// there is to see.
+	if ((sBootOptions & BOOT_OPTION_DEBUG_OUTPUT) != 0 && gUART == NULL)
+		add_safe_mode_settings("debug_screen true\n");
+#endif
+
 	smp_init_other_cpus();
 #ifdef _BOOT_FDT_SUPPORT
 	dtb_set_kernel_args();

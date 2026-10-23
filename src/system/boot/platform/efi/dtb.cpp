@@ -85,6 +85,8 @@ const struct supported_uarts {
 	{ "fsl,s32-linflexuart", UART_KIND_LINFLEX, &get_uart<ArchUARTlinflex> },
 	{ "brcm,bcm2835-aux-uart", UART_KIND_8250, &get_uart<DebugUART8250> },
 	{ "apple,s5l-uart", UART_KIND_SAMSUNG, &get_uart<ArchUARTSamsung> },
+	// Not "qcom,geni-debug-uart": the firmware may leave the engine unclocked,
+	// and touching it then ends in a bus error.
 #endif
 };
 

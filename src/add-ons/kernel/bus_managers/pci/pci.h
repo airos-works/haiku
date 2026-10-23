@@ -116,6 +116,8 @@ public:
 								void *controllerCookie, device_node *rootNode,
 								domain_data **domainData);
 
+			status_t		LookupRange(uint8 domain, uint32 type,
+								phys_addr_t pciAddr, pci_resource_range &range);
 			status_t		LookupRange(uint32 type, phys_addr_t pciAddr,
 								uint8 &domain, pci_resource_range &range, uint8 **mappedAdr = NULL);
 

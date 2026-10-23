@@ -106,7 +106,7 @@ pci_device_module_info gPCIDeviceModule = {
 		pci_write_io_32(mappedIOAddress, value);
 	},
 	.ram_address = [](pci_device *device, phys_addr_t physicalAddress) {
-		return pci_ram_address(physicalAddress);
+		return pci_ram_address(device->device->domain, physicalAddress);
 	},
 	.read_pci_config = [](pci_device *device, uint16 offset, uint8 size) {
 		return gPCI->ReadConfig(device->device, offset, size);

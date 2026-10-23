@@ -33,6 +33,7 @@ struct platform_cpu_info {
 };
 
 void arch_smp_register_cpu(platform_cpu_info** cpu);
+platform_cpu_info* arch_smp_find_cpu(uint64 mpidr);
 #endif
 
 int arch_smp_get_current_cpu(void);

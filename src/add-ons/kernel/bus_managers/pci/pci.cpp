@@ -144,6 +144,23 @@ pci_ram_address(phys_addr_t childAdr)
 }
 
 
+// Host controllers may use the same bus addresses (the Qualcomm SC8280XP's
+// all start their windows at 0x40000000): translate within the device's
+// domain.
+phys_addr_t
+pci_ram_address(uint8 domain, phys_addr_t childAdr)
+{
+#if defined(__i386__) || defined(__x86_64__)
+	return childAdr;
+#else
+	pci_resource_range range;
+	if (gPCI->LookupRange(domain, B_IO_MEMORY, childAdr, range) >= B_OK)
+		return childAdr - range.pci_address + range.host_address;
+	return 0;
+#endif
+}
+
+
 status_t
 pci_find_capability(uint8 virtualBus, uint8 device, uint8 function,
 	uint8 capID, uint8 *offset)
@@ -745,6 +762,26 @@ PCI::AddController(pci_controller_module_info *controller,
 
 	*domainData = &data;
 	return B_OK;
+}
+
+
+status_t
+PCI::LookupRange(uint8 domain, uint32 type, phys_addr_t pciAddr,
+	pci_resource_range &range)
+{
+	domain_data* data = _GetDomainData(domain);
+	if (data == NULL)
+		return B_BAD_VALUE;
+
+	for (int32 i = 0; i < data->ranges.Count(); i++) {
+		const pci_resource_range& curRange = data->ranges[i];
+		if (curRange.type == type && pciAddr >= curRange.pci_address
+			&& pciAddr < curRange.pci_address + curRange.size) {
+			range = curRange;
+			return B_OK;
+		}
+	}
+	return B_ENTRY_NOT_FOUND;
 }
 
 
@@ -1580,7 +1617,7 @@ PCI::_GetBarInfo(PCIDev *dev, uint8 offset, uint32 &_ramAddress,
 	size &= ((uint64)0xffffffff << 32) | mask;
 
 	size = _BarSize(size);
-	uint64 ramAddress = pci_ram_address(pciAddress);
+	uint64 ramAddress = pci_ram_address(dev->domain, pciAddress);
 
 	_ramAddress = ramAddress;
 	_pciAddress = pciAddress;
@@ -1692,7 +1729,7 @@ PCI::_ReadHeaderInfo(PCIDev *dev)
 			WriteConfig(dev->domain, dev->bus, dev->device, dev->function,
 				PCI_command, 2, pcicmd);
 
-			dev->info.u.h0.rom_base = (uint32)pci_ram_address(
+			dev->info.u.h0.rom_base = (uint32)pci_ram_address(dev->domain,
 				dev->info.u.h0.rom_base_pci);
 
 			dev->info.u.h0.cardbus_cis = ReadConfig(dev->domain, dev->bus,
@@ -1740,7 +1777,7 @@ PCI::_ReadHeaderInfo(PCIDev *dev)
 			WriteConfig(dev->domain, dev->bus, dev->device, dev->function,
 				PCI_command, 2, pcicmd);
 
-			dev->info.u.h1.rom_base = (uint32)pci_ram_address(
+			dev->info.u.h1.rom_base = (uint32)pci_ram_address(dev->domain,
 				dev->info.u.h1.rom_base_pci);
 
 			dev->info.u.h1.primary_bus = ReadConfig(dev->domain, dev->bus,
@@ -2329,6 +2366,8 @@ PCI::_AllocateMSIVectors(PCIDev* device, uint32 count, uint32* startVector,
 	device_node* root = _GetDomainData(device->domain)->root_node;
 	if (root == NULL || gDeviceManager->get_attr_uint64(root, B_PCI_MSI_CONTROLLER_ADDRESS,
 			&requester.controller_address, true) != B_OK) {
+		dprintf("PCI: domain %u has %s, no MSI controller\n", device->domain,
+			root == NULL ? "no root node" : "a root node");
 		return msi_allocate_vectors_for_device(NULL, count, startVector, address, data);
 	}
 	uint32 base, range;

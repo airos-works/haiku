@@ -12,7 +12,7 @@
 
 #include "soc.h"
 
-class GICv3Its;
+class GICv3LpiProvider;
 
 class GICv3InterruptController : public InterruptController, public MSIInterface {
 public:
@@ -46,7 +46,9 @@ private:
 	spinlock fMbiLock = B_SPINLOCK_INITIALIZER;
 	Gicv3Mbi::VectorPool fMbiVectors;
 	int32 fMbiInterrupts[Gicv3Mbi::kVectorCount]{};
-	GICv3Its* fIts = nullptr;
+	GICv3LpiProvider* fIts = nullptr;
+
+	bool _InitGenericIts(phys_addr_t redistributor);
 
 	// Register accessors.
 	// All register offsets are given in the spec (and in gicv3_regs.h) at byte offsets.

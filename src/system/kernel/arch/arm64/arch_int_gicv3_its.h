@@ -9,9 +9,18 @@
 #include <arch/generic/msi.h>
 #include <lock.h>
 
+// What the GICv3 driver needs from an LPI provider besides MSI allocation.
+class GICv3LpiProvider : public MSIInterface {
+public:
+	virtual bool Contains(uint32 vector) const = 0;
+	virtual void SetEnabled(uint32 vector, bool enabled) = 0;
+	virtual void TraceInterrupt(uint32 vector) {}
+};
+
+
 // RK3588 firmware profile: ITS1/NVMe and ITS0/AX210, targeting CPU 0.
 // Tables and reservations live for the kernel lifetime, including on failure.
-class GICv3Its : public MSIInterface {
+class GICv3Its : public GICv3LpiProvider {
 public:
 	status_t Init(volatile uint8* redistributors, uint32 count, bool trace,
 		bool forceHighTables);
@@ -20,9 +29,9 @@ public:
 	status_t AllocateVectorsForDevice(const msi_requester* requester, uint32 count,
 		uint32& startVector, uint64& address, uint32& data) override;
 	void FreeVectors(uint32 count, uint32 startVector) override;
-	void SetEnabled(uint32 vector, bool enabled);
-	void TraceInterrupt(uint32 vector);
-	bool Contains(uint32 vector) const;
+	void SetEnabled(uint32 vector, bool enabled) override;
+	void TraceInterrupt(uint32 vector) override;
+	bool Contains(uint32 vector) const override;
 
 private:
 	struct Memory {
