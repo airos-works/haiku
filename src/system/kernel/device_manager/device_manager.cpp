@@ -6,6 +6,8 @@
 
 #include <kdevice_manager.h>
 
+#include <driver_settings.h>
+
 #include <syscalls.h>
 
 #include <stdarg.h>
@@ -2656,6 +2658,8 @@ struct power_hook : DoublyLinkedListLinkImpl<power_hook> {
 	device_manager_power_hook	hook;
 	void*						cookie;
 	const char*					name;
+	bool						skipped;
+		// by the "suspend" settings, this time
 };
 
 typedef DoublyLinkedList<power_hook> PowerHookList;
@@ -2677,6 +2681,7 @@ device_manager_add_power_hook(device_manager_power_hook hook, void* cookie,
 	entry->hook = hook;
 	entry->cookie = cookie;
 	entry->name = name != NULL ? name : "?";
+	entry->skipped = false;
 
 	RecursiveLocker _(sLock);
 	sPowerHooks.Add(entry);
@@ -2710,10 +2715,33 @@ device_manager_suspend(int32 state, uint32 flags)
 {
 	RecursiveLocker _(sLock);
 
+	// A driver that does not come back from a suspend can be left out:
+	// "skip_power_hooks <name> ..." in the "suspend" kernel settings.
+	void* settings = (flags & DEVICE_MANAGER_SKIP_POWER_HOOKS) == 0
+		? load_driver_settings("suspend") : NULL;
+	const driver_settings* skipSettings = get_driver_settings(settings);
+
 	PowerHookList::ReverseIterator iterator = sPowerHooks.GetReverseIterator();
 	while (power_hook* entry = iterator.Next()) {
+		entry->skipped = false;
 		if ((flags & DEVICE_MANAGER_SKIP_POWER_HOOKS) != 0)
 			break;
+
+		for (int32 i = 0; skipSettings != NULL && i < skipSettings->parameter_count;
+				i++) {
+			const driver_parameter& parameter = skipSettings->parameters[i];
+			if (strcmp(parameter.name, "skip_power_hooks") != 0)
+				continue;
+			for (int32 j = 0; j < parameter.value_count; j++) {
+				if (strcmp(parameter.values[j], entry->name) == 0)
+					entry->skipped = true;
+			}
+		}
+		if (entry->skipped) {
+			device_manager_suspend_trace("suspend hook %s: skipped",
+				entry->name);
+			continue;
+		}
 		suspend_step("device_manager: calling suspend hook %s\n",
 			entry->name);
 		status_t status = entry->hook(entry->cookie, false, state);
@@ -2722,6 +2750,8 @@ device_manager_suspend(int32 state, uint32 flags)
 		dprintf("device_manager: suspend hook %s: %s\n", entry->name,
 			strerror(status));
 	}
+
+	unload_driver_settings(settings);
 
 	if ((flags & DEVICE_MANAGER_SKIP_DEVICE_TREE) == 0)
 		suspend_nodes(state);
@@ -2743,6 +2773,8 @@ device_manager_resume(uint32 flags)
 	while (power_hook* entry = iterator.Next()) {
 		if ((flags & DEVICE_MANAGER_SKIP_POWER_HOOKS) != 0)
 			break;
+		if (entry->skipped)
+			continue;
 		suspend_step("device_manager: calling resume hook %s\n", entry->name);
 		status_t status = entry->hook(entry->cookie, true, 0);
 		device_manager_suspend_trace("resume hook %s: %s", entry->name,
