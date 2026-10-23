@@ -1892,8 +1892,17 @@ debug_init(kernel_args* args)
 	debug_paranoia_init();
 	arch_debug_console_init(args);
 
-	if (frame_buffer_console_init(args) == B_OK && blue_screen_init_early() == B_OK)
+	if (frame_buffer_console_init(args) == B_OK && blue_screen_init_early() == B_OK) {
 		sBlueScreenOutput = true;
+		// With the frame buffer already reachable (KERNEL_PMAP_BASE), on
+		// screen debug output can start right away instead of after the
+		// settings are read: on a machine without serial output the early
+		// boot is otherwise invisible.
+		if (get_safemode_boolean_early(args, "debug_screen", false)) {
+			sDebugScreenEnabled = true;
+			blue_screen_enter(true);
+		}
+	}
 }
 
 
