@@ -601,7 +601,7 @@ lid_is_open()
 	again for that time.
 */
 static bool
-wakeup_is_real(int32 wakeupEvents)
+wakeup_is_real(int32 wakeupEvents, bool ignoreLid)
 {
 	{
 		InterruptsLocker _;
@@ -613,7 +613,7 @@ wakeup_is_real(int32 wakeupEvents)
 		snooze(10000);
 		real = device_manager_wakeup_events() != wakeupEvents;
 	}
-	if (!real)
+	if (!real && !ignoreLid)
 		real = lid_is_open();
 
 	if (!real) {
@@ -798,7 +798,8 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 			break;
 		}
 		if (atomic_get(&sWakeReason) != X86_S2IDLE_WAKE_SCI
-			|| wakeup_is_real(wakeupEvents)) {
+			|| wakeup_is_real(wakeupEvents,
+				(flags & X86_SUSPEND_IGNORE_LID) != 0)) {
 			break;
 		}
 

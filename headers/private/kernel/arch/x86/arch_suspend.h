@@ -83,6 +83,9 @@ enum {
 	X86_SUSPEND_LIGHT_SLEEP				= 0x100,
 		// s2idle: leaves out the power hooks only for a deep sleep (the
 		// graphics)
+	X86_SUSPEND_IGNORE_LID				= 0x200,
+		// s2idle, for testing: sleeps on through SCIs as with the lid
+		// closed
 	X86_SUSPEND_RTC_WAKE_ONLY			= 0x80,
 		// s2idle, for testing: only the RTC alarm ends the timeout (no local
 		// APIC deadline, which stops in S0i3 anyway)
