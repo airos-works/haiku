@@ -95,7 +95,39 @@ enum {
 #define AMD_PMC_RESPONSE			0x980
 #define AMD_PMC_IDLE_MASK			0xd14
 #define AMD_PMC_MSG_OS_HINT			0x03
+#define AMD_PMC_MSG_LOG_ADDRESS_HI	0x04
+#define AMD_PMC_MSG_LOG_ADDRESS_LO	0x05
+#define AMD_PMC_MSG_LOG_START		0x06
+#define AMD_PMC_MSG_LOG_RESET		0x07
+#define AMD_PMC_MSG_LOG_DUMP		0x08
+#define AMD_PMC_MSG_ACTIVE_IPS		0x09
 #define AMD_PMC_RESPONSE_OK			0x01
+
+// The power management firmware's log of a sleep (Linux' struct smu_metrics):
+// above all, for how long each IP block kept the SoC out of S0i3.
+struct amd_pmc_metrics {
+	uint32	table_version;
+	uint32	hint_count;
+	uint32	s0i3_last_entry_status;
+	uint32	time_in_s0i2;
+	uint64	time_entering_s0i3_last;
+	uint64	time_entering_s0i3_total;
+	uint64	time_to_resume_last;
+	uint64	time_to_resume_total;
+	uint64	time_in_s0i3_last;
+	uint64	time_in_s0i3_total;
+	uint64	time_in_sw_drips_last;
+	uint64	time_in_sw_drips_total;
+	uint64	time_condition_not_met_last[32];
+	uint64	time_condition_not_met_total[32];
+} _PACKED;
+
+// the IP blocks the log knows on Phoenix (Linux' soc15_ip_blk)
+static const char* const kAMDIPBlocks[] = {
+	"DISPLAY", "CPU", "GFX", "VDD", "ACP", "VCN", "ISP", "NBIO", "DF",
+	"USB3_0", "USB3_1", "LAPIC", "USB3_2", "USB3_3", "USB3_4", "USB4_0",
+	"USB4_1", "MPM", "JPEG", "IPU", "UMSCH"
+};
 
 // the FCH's S0i3 entry and exit time stamps (48 MHz)
 #define AMD_FCH_PM_BASE				0xfed81000
@@ -113,6 +145,8 @@ static bool sLPS0Probed;
 
 static volatile uint8* sPMC;
 static volatile uint8* sFCH;
+static volatile amd_pmc_metrics* sPMCMetrics;
+static uint32 sPMCActiveIPs;
 static bool sPMCProbed;
 
 static char sLidPath[128];
@@ -121,7 +155,6 @@ static bool sLidProbed;
 static int32 sSCI = -1;
 static int32 sActive;
 static int32 sWakeReason;
-static timer sTimeoutTimer;
 
 
 //	#pragma mark - LPS0
@@ -242,7 +275,7 @@ pmc_wait_response(uint32* _response)
 
 
 static status_t
-pmc_send(uint32 message, uint32 argument)
+pmc_send(uint32 message, uint32 argument, uint32* _data = NULL)
 {
 	if (sPMC == NULL)
 		return B_NO_INIT;
@@ -262,6 +295,11 @@ pmc_send(uint32 message, uint32 argument)
 		INFO("PMC message %#" B_PRIx32 ": response %#" B_PRIx32 "\n", message,
 			response);
 		return B_ERROR;
+	}
+	if (_data != NULL) {
+		// the firmware may take a while to put its answer there
+		spin(10000);
+		*_data = pmc_read(AMD_PMC_ARGUMENT);
 	}
 	return B_OK;
 }
@@ -325,6 +363,73 @@ pmc_probe()
 
 	INFO("AMD PMC at %#" B_PRIxPHYSADDR ", idle mask %#" B_PRIx32 "\n", base,
 		pmc_read(AMD_PMC_IDLE_MASK));
+
+	// the firmware's log, as Linux' amd_pmc_setup_smu_logging()
+	uint32 low = 0;
+	uint32 high = 0;
+	if (pmc_send(AMD_PMC_MSG_ACTIVE_IPS, 0, &sPMCActiveIPs) == B_OK
+		&& pmc_send(AMD_PMC_MSG_LOG_ADDRESS_LO, 0, &low) == B_OK
+		&& pmc_send(AMD_PMC_MSG_LOG_ADDRESS_HI, 0, &high) == B_OK
+		&& (low | high) != 0) {
+		phys_addr_t table = ((phys_addr_t)high << 32) | low;
+		phys_addr_t page = table & ~(phys_addr_t)(B_PAGE_SIZE - 1);
+		size_t size = ROUNDUP(table - page + sizeof(amd_pmc_metrics),
+			B_PAGE_SIZE);
+		if (map_physical_memory("amd pmc metrics", page, size,
+				B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
+				&address) >= 0) {
+			sPMCMetrics = (volatile amd_pmc_metrics*)((uint8*)address
+				+ (table - page));
+		}
+	}
+}
+
+
+static void
+pmc_start_log()
+{
+	if (sPMCMetrics == NULL)
+		return;
+
+	memset((void*)sPMCMetrics, 0, sizeof(amd_pmc_metrics));
+	pmc_send(AMD_PMC_MSG_LOG_RESET, 0);
+	pmc_send(AMD_PMC_MSG_LOG_START, 0);
+}
+
+
+/*!	Logs which IP blocks kept the SoC out of S0i3, and returns their mask. */
+static uint32
+pmc_report_log(bigtime_t slept)
+{
+	if (sPMCMetrics == NULL || pmc_send(AMD_PMC_MSG_LOG_DUMP, 0) != B_OK)
+		return 0;
+
+	amd_pmc_metrics metrics;
+	memcpy(&metrics, (const void*)sPMCMetrics, sizeof(metrics));
+
+	char blockers[256];
+	size_t length = 0;
+	blockers[0] = '\0';
+	uint32 mask = 0;
+	for (uint32 i = 0; i < B_COUNT_OF(kAMDIPBlocks); i++) {
+		uint64 notMet = metrics.time_condition_not_met_last[i];
+		if ((sPMCActiveIPs & (1u << i)) == 0 || notMet == 0
+			|| notMet > (uint64)slept * 2) {
+			// (more than the sleep is junk)
+			continue;
+		}
+		mask |= 1u << i;
+		if (length < sizeof(blockers)) {
+			length += snprintf(blockers + length, sizeof(blockers) - length,
+				" %s %" B_PRIu64 "%%", kAMDIPBlocks[i],
+				slept > 0 ? notMet * 100 / slept : 0);
+		}
+	}
+
+	INFO("PMC log: S0i3 %s, %" B_PRIu64 " ms in S0i3; kept out by%s\n",
+		metrics.s0i3_last_entry_status != 0 ? "reached" : "not reached",
+		metrics.time_in_s0i3_last / 1000, mask != 0 ? blockers : " nothing");
+	return mask;
 }
 
 
@@ -381,9 +486,9 @@ lid_is_open()
 	again for that time.
 */
 static bool
-wakeup_is_real(int32 wakeupEvents, bool timerStopped)
+wakeup_is_real(int32 wakeupEvents)
 {
-	if (timerStopped) {
+	{
 		InterruptsLocker _;
 		arch_timer_set_hardware_timer(1000);
 	}
@@ -396,11 +501,35 @@ wakeup_is_real(int32 wakeupEvents, bool timerStopped)
 	if (!real)
 		real = lid_is_open();
 
-	if (timerStopped && !real) {
+	if (!real) {
 		InterruptsLocker _;
 		arch_timer_clear_hardware_timer();
 	}
 	return real;
+}
+
+
+/*!	As Linux' amd_pmc_s2idle_check(): after the SoC came out of S0i3 (for
+	an SCI that is not one to wake up for), it is given 2.5 s before it may
+	go back (against tripping its over-voltage protection).
+*/
+static void
+s0i3_settle(uint64* _lastEntry)
+{
+	uint64 entry = fch_time(AMD_FCH_S0I3_ENTRY);
+	if (entry == *_lastEntry)
+		return;
+	*_lastEntry = entry;
+
+	{
+		InterruptsLocker _;
+		arch_timer_set_hardware_timer(1000);
+	}
+	snooze(2500000);
+	{
+		InterruptsLocker _;
+		arch_timer_clear_hardware_timer();
+	}
 }
 
 
@@ -413,14 +542,6 @@ sci_wake(void* /*data*/)
 	if (atomic_get(&sActive) != 0)
 		atomic_test_and_set(&sWakeReason, X86_S2IDLE_WAKE_SCI, 0);
 	return B_UNHANDLED_INTERRUPT;
-}
-
-
-static int32
-timeout_wake(timer* /*timer*/)
-{
-	atomic_test_and_set(&sWakeReason, X86_S2IDLE_WAKE_TIMEOUT, 0);
-	return B_HANDLED_INTERRUPT;
 }
 
 
@@ -497,6 +618,7 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 		lps0_microsoft(LPS0_MS_STANDBY_ENTRY);
 		lps0_microsoft(LPS0_MS_ENTRY);
 	}
+	pmc_start_log();
 	status_t hintStatus = pmc_send(AMD_PMC_MSG_OS_HINT, 1);
 	uint64 entryBefore = fch_time(AMD_FCH_S0I3_ENTRY);
 
@@ -507,12 +629,13 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 	int32 oldPriority = thread->priority;
 	set_thread_priority(thread->id, B_REAL_TIME_PRIORITY);
 
+	// No timer interrupts: only the SCI (and devices) end the idling, or the
+	// one timer interrupt at the end of the timeout. (The kernel's own timers
+	// would wake the CPU hundreds of times a second.)
 	bigtime_t start = system_time();
-	if (args->timeout_ms != 0) {
-		add_timer(&sTimeoutTimer, &timeout_wake,
-			(bigtime_t)args->timeout_ms * 1000, B_ONE_SHOT_RELATIVE_TIMER);
-	} else {
-		// no timer interrupts: only the SCI (and devices) end the idling
+	bigtime_t deadline = args->timeout_ms != 0
+		? start + (bigtime_t)args->timeout_ms * 1000 : 0;
+	{
 		InterruptsLocker _;
 		arch_timer_clear_hardware_timer();
 	}
@@ -521,25 +644,37 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 	atomic_set(&sActive, 1);
 	uint32 rounds = 0;
 	uint32 ignoredWakeups = 0;
+	uint64 lastEntry = entryBefore;
 	while (true) {
 		while (atomic_get(&sWakeReason) == 0) {
+			if (deadline != 0) {
+				// (any interrupt lets the kernel program the timer for its
+				// own next timer; the hardware timer only goes so far, too)
+				InterruptsLocker _;
+				bigtime_t now = system_time();
+				if (now >= deadline) {
+					atomic_test_and_set(&sWakeReason, X86_S2IDLE_WAKE_TIMEOUT,
+						0);
+					break;
+				}
+				arch_timer_set_hardware_timer(deadline - now);
+			}
 			cpu_idle();
 			rounds++;
 		}
 		if (atomic_get(&sWakeReason) != X86_S2IDLE_WAKE_SCI
-			|| wakeup_is_real(wakeupEvents, args->timeout_ms == 0)) {
+			|| wakeup_is_real(wakeupEvents)) {
 			break;
 		}
 
 		ignoredWakeups++;
+		s0i3_settle(&lastEntry);
 		atomic_set(&sWakeReason, 0);
 	}
 	atomic_set(&sActive, 0);
 	bigtime_t slept = system_time() - start;
 
-	if (args->timeout_ms != 0)
-		cancel_timer(&sTimeoutTimer);
-	else {
+	{
 		// the timers that came due get handled now
 		InterruptsLocker _;
 		arch_timer_set_hardware_timer(1000);
@@ -552,6 +687,7 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 	uint64 entry = fch_time(AMD_FCH_S0I3_ENTRY);
 	uint64 exit = fch_time(AMD_FCH_S0I3_EXIT);
 	uint32 idleMask = sPMC != NULL ? pmc_read(AMD_PMC_IDLE_MASK) : 0;
+	uint32 blockers = pmc_report_log(slept);
 
 	// as Linux's amd_pmc_s2idle_restore() and acpi_s2idle_restore_early()
 	if (sLPS0Path[0] != '\0') {
@@ -580,6 +716,7 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 	args->pmc_idle_mask = idleMask;
 	args->s0i3_entered = entry != entryBefore && exit > entry;
 	args->s0i3_us = args->s0i3_entered ? (exit - entry) / 48 : 0;
+	args->s0i3_blockers = blockers;
 
 	INFO("woke up (%s) after %" B_PRIdBIGTIME " ms, %" B_PRIu32 " rounds, %"
 		B_PRIu32 " SCIs slept through; OS hint %s/%s; S0i3 %s (%" B_PRIu64

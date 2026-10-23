@@ -62,6 +62,14 @@ typedef struct pci_device_module_info {
 				uint32 *startVector);
 	status_t (*enable_msix)(pci_device *device);
 
+	// Power management for drivers that suspend their device while the
+	// system sleeps: suspend_device() saves the configuration space and
+	// puts the function into the given state (D3hot), resume_device() takes
+	// it back to D0 and restores the configuration (BARs, MSI, MSI-X), which
+	// a function without "No_Soft_Reset" loses on the way.
+	status_t (*suspend_device)(pci_device *device, uint8 state);
+	status_t (*resume_device)(pci_device *device);
+
 } pci_device_module_info;
 
 

@@ -382,6 +382,7 @@ XHCI::XHCI(pci_info *info, 	pci_device_module_info* pci, pci_device* device, Sta
 		fPortsDisconnected(false),
 		fIdleSuspended(false),
 		fIdleHalted(false),
+		fIdlePoweredDown(false),
 		fCmdCompSem(-1),
 		fStopThreads(false),
 		fRootHub(NULL),
@@ -1132,6 +1133,7 @@ XHCI::_SuspendToIdle()
 	}
 
 	int32 suspendedPorts = 0;
+	bool portsKeptUp = false;
 	for (uint8 i = 0; i < fPortCount; i++) {
 		fPortIdleSuspended[i] = false;
 		if (_IsDisabledSuperSpeedPort(i))
@@ -1139,11 +1141,13 @@ XHCI::_SuspendToIdle()
 		if (superSpeedHub[i]) {
 			TRACE_ALWAYS("port %" B_PRIu8 " has a SuperSpeed hub, not "
 				"suspending it\n", i);
+			portsKeptUp = true;
 			continue;
 		}
 		if (keepAwake[i]) {
 			TRACE_ALWAYS("port %" B_PRIu8 " is kept awake by its driver\n",
 				i);
+			portsKeptUp = true;
 			continue;
 		}
 
@@ -1178,9 +1182,136 @@ XHCI::_SuspendToIdle()
 	fIdleHalted = true;
 	status_t status = ControllerHalt();
 
+	// With nothing left running behind it, the controller itself can sleep,
+	// which the SoC may need before it enters its deepest state.
+	bool poweredDown = status == B_OK && !portsKeptUp && _PowerDown() == B_OK;
+
 	TRACE_ALWAYS("suspended to idle: %" B_PRId32 " endpoints stopped, %"
-		B_PRId32 " ports suspended\n", stoppedEndpoints, suspendedPorts);
+		B_PRId32 " ports suspended%s\n", stoppedEndpoints, suspendedPorts,
+		poweredDown ? ", controller in D3" : "");
 	return status;
+}
+
+
+/*!	Saves the halted controller's state and puts it into D3hot, as Linux'
+	xhci_suspend() does (XHCI 1.2 § 4.23.2). The function resets itself on
+	the way back to D0 (no "No_Soft_Reset" on AMD's), so its configuration
+	and registers come back from what is saved here.
+*/
+status_t
+XHCI::_PowerDown()
+{
+	if (fPci->suspend_device == NULL)
+		return B_NOT_SUPPORTED;
+
+	for (uint8 i = 0; i < fPortCount; i++)
+		fIdlePortStatus[i] = ReadOpReg(XHCI_PORTSC(i));
+
+	fSavedRegisters.command = ReadOpReg(XHCI_CMD);
+	fSavedRegisters.dnctrl = ReadOpReg(XHCI_DNCTRL);
+	fSavedRegisters.dcbaap_lo = ReadOpReg(XHCI_DCBAAP_LO);
+	fSavedRegisters.dcbaap_hi = ReadOpReg(XHCI_DCBAAP_HI);
+	fSavedRegisters.config = ReadOpReg(XHCI_CONFIG);
+	fSavedRegisters.erstsz = ReadRunReg32(XHCI_ERSTSZ(0));
+	fSavedRegisters.erstba_lo = ReadRunReg32(XHCI_ERSTBA_LO(0));
+	fSavedRegisters.erstba_hi = ReadRunReg32(XHCI_ERSTBA_HI(0));
+	fSavedRegisters.erdp_lo = ReadRunReg32(XHCI_ERDP_LO(0));
+	fSavedRegisters.erdp_hi = ReadRunReg32(XHCI_ERDP_HI(0));
+	fSavedRegisters.iman = ReadRunReg32(XHCI_IMAN(0));
+	fSavedRegisters.imod = ReadRunReg32(XHCI_IMOD(0));
+
+	WriteOpReg(XHCI_CMD, ReadOpReg(XHCI_CMD) | CMD_CSS);
+	if (WaitOpBits(XHCI_STS, STS_SSS, 0) != B_OK
+		|| (ReadOpReg(XHCI_STS) & (STS_SRE | STS_HCE)) != 0) {
+		TRACE_ERROR("saving the controller state failed: %#" B_PRIx32 "\n",
+			ReadOpReg(XHCI_STS));
+		return B_ERROR;
+	}
+
+	status_t status = fPci->suspend_device(fDevice, PCI_pm_state_d3);
+	if (status != B_OK) {
+		TRACE_ERROR("cannot enter D3: %s\n", strerror(status));
+		fPci->resume_device(fDevice);
+		return status;
+	}
+
+	fIdlePoweredDown = true;
+	return B_OK;
+}
+
+
+/*!	Takes the controller back to D0 and restores its state, see
+	_PowerDown(). Fails when the controller could not restore it.
+*/
+status_t
+XHCI::_PowerUp()
+{
+	if (!fIdlePoweredDown)
+		return B_OK;
+
+	status_t status = fPci->resume_device(fDevice);
+	fIdlePoweredDown = false;
+	if (status != B_OK) {
+		TRACE_ERROR("the controller did not come back to D0\n");
+		return status;
+	}
+
+	if (WaitOpBits(XHCI_STS, STS_CNR, 0) != B_OK)
+		return B_ERROR;
+
+	WriteOpReg(XHCI_CMD, fSavedRegisters.command & ~CMD_RUN);
+	WriteOpReg(XHCI_DNCTRL, fSavedRegisters.dnctrl);
+	WriteOpReg(XHCI_DCBAAP_LO, fSavedRegisters.dcbaap_lo);
+	WriteOpReg(XHCI_DCBAAP_HI, fSavedRegisters.dcbaap_hi);
+	WriteOpReg(XHCI_CONFIG, fSavedRegisters.config);
+	WriteRunReg32(XHCI_ERSTSZ(0), fSavedRegisters.erstsz);
+	WriteRunReg32(XHCI_ERSTBA_LO(0), fSavedRegisters.erstba_lo);
+	WriteRunReg32(XHCI_ERSTBA_HI(0), fSavedRegisters.erstba_hi);
+	WriteRunReg32(XHCI_ERDP_LO(0), fSavedRegisters.erdp_lo);
+	WriteRunReg32(XHCI_ERDP_HI(0), fSavedRegisters.erdp_hi);
+	WriteRunReg32(XHCI_IMAN(0), fSavedRegisters.iman);
+	WriteRunReg32(XHCI_IMOD(0), fSavedRegisters.imod);
+
+	// The command ring pointer is not part of the saved state: it continues
+	// where the ring stands.
+	phys_addr_t dequeue = fCmdRingPhysical + fCmdIdx * sizeof(xhci_trb);
+	WriteOpReg(XHCI_CRCR_LO, (uint32)dequeue | (fCmdCcs ? CRCR_RCS : 0));
+	WriteOpReg(XHCI_CRCR_HI, (uint32)(dequeue >> 32));
+
+	// Restoring may take more than 55 ms (Linux waits for 100 ms).
+	WriteOpReg(XHCI_CMD, ReadOpReg(XHCI_CMD) | CMD_CRS);
+	if (WaitOpBits(XHCI_STS, STS_RSS, 0) != B_OK)
+		return B_ERROR;
+
+	uint32 controllerStatus = ReadOpReg(XHCI_STS);
+	if ((controllerStatus & (STS_SRE | STS_HCE)) != 0) {
+		TRACE_ERROR("restoring the controller state failed: %#" B_PRIx32
+			"\n", controllerStatus);
+		return B_ERROR;
+	}
+	return B_OK;
+}
+
+
+/*!	The controller lost what it knew about the devices: they are detached
+	(their commands refused while the controller stays halted), and
+	enumerated again once it was reinitialized, as after an S3 resume.
+*/
+status_t
+XHCI::_StartOver()
+{
+	TRACE_ERROR("the controller lost its state, enumerating the devices "
+		"again\n");
+
+	fIdleSuspended = false;
+	for (uint8 i = 0; i < fPortCount; i++)
+		fPortIdleSuspended[i] = false;
+
+	fPortsDisconnected = true;
+	fStack->Explore();
+	fIdleHalted = false;
+
+	return Resume();
 }
 
 
@@ -1188,6 +1319,9 @@ status_t
 XHCI::_ResumeFromIdle()
 {
 	TRACE_ALWAYS("resuming from idle\n");
+
+	if (_PowerUp() != B_OK)
+		return _StartOver();
 
 	WriteOpReg(XHCI_CMD, ReadOpReg(XHCI_CMD) | CMD_RUN);
 	if (WaitOpBits(XHCI_STS, STS_HCH, 0) != B_OK)
@@ -3295,7 +3429,9 @@ XHCI::GetPortStatus(uint8 index, usb_port_status* status)
 	if (_IsDisabledSuperSpeedPort(index))
 		return B_OK;
 
-	uint32 portStatus = ReadOpReg(XHCI_PORTSC(index));
+	// a function in D3 answers all ones
+	uint32 portStatus = fIdlePoweredDown
+		? fIdlePortStatus[index] : ReadOpReg(XHCI_PORTSC(index));
 	TRACE("port %" B_PRId8 " status=0x%08" B_PRIx32 "\n", index, portStatus);
 
 	// build the status
@@ -3503,6 +3639,9 @@ int32
 XHCI::Interrupt()
 {
 	SpinLocker _(&fSpinlock);
+
+	if (fIdlePoweredDown)
+		return B_UNHANDLED_INTERRUPT;
 
 	uint32 status = ReadOpReg(XHCI_STS);
 	uint32 temp = ReadRunReg32(XHCI_IMAN(0));

@@ -3016,34 +3016,83 @@ PCI::RestoreConfiguration()
 }
 
 
+/*!	Suspends a single function for its driver, while the system suspends
+	to idle: its configuration is saved, and it enters \a state. A function
+	that lacks "No_Soft_Reset" resets itself on the way back to D0, and is
+	given its configuration back by ResumeDevice().
+*/
+status_t
+PCI::SuspendDevice(PCIDev *device, uint8 state)
+{
+	uint8 capability;
+	if (FindCapability(device, PCI_cap_id_pm, &capability) != B_OK)
+		return B_NOT_SUPPORTED;
+
+	_SaveDeviceConfiguration(device);
+	if (!device->config_saved)
+		return B_ERROR;
+
+	SetPowerstate(device, state);
+	if (GetPowerstate(device) != state)
+		return B_ERROR;
+
+	// the function may take 10 ms to get there (PCI PM 1.2 § 5.6.1)
+	if (state == PCI_pm_state_d3)
+		snooze(10000);
+
+	device->suspended = true;
+	return B_OK;
+}
+
+
+status_t
+PCI::ResumeDevice(PCIDev *device)
+{
+	if (!device->suspended)
+		return B_OK;
+
+	device->suspended = false;
+	_RestoreDeviceConfiguration(device);
+	return (ReadConfig(device, PCI_vendor_id, 2) & 0xffff) != 0xffff
+		? B_OK : B_ERROR;
+}
+
+
+void
+PCI::_SaveDeviceConfiguration(PCIDev *device)
+{
+	for (uint16 i = 0; i < B_COUNT_OF(device->saved_config); i++)
+		device->saved_config[i] = ReadConfig(device, i * 4, 4);
+	device->config_saved = (device->saved_config[0] & 0xffff) != 0xffff;
+
+	msix_info *msix = &device->msix;
+	if (msix->configured_count > 0 && msix->table_address != 0) {
+		uint32 count = std::min(msix->configured_count, (uint32)32) * 4;
+		volatile uint32 *table = (uint32 *)msix->table_address;
+		for (uint32 i = 0; i < count; i++)
+			device->saved_msix_table[i] = table[i];
+	}
+
+	// Stop the device from asserting PME while the system sleeps: Haiku
+	// does not support waking from devices, and a device that keeps
+	// signalling wake-ups (a network card that was left in wake on LAN
+	// mode, for instance) wakes the machine again right away.
+	uint8 capability = saved_capability(device, PCI_cap_id_pm);
+	if (capability != 0) {
+		uint16 control = ReadConfig(device, capability + PCI_pm_status, 2);
+		if ((control & PCI_pm_status_pme_enable) != 0) {
+			WriteConfig(device, capability + PCI_pm_status, 2,
+				control & ~PCI_pm_status_pme_enable);
+		}
+	}
+}
+
+
 void
 PCI::_SaveConfiguration(PCIBus *bus)
 {
 	for (PCIDev *device = bus->child; device != NULL; device = device->next) {
-		for (uint16 i = 0; i < B_COUNT_OF(device->saved_config); i++)
-			device->saved_config[i] = ReadConfig(device, i * 4, 4);
-		device->config_saved = (device->saved_config[0] & 0xffff) != 0xffff;
-
-		msix_info *msix = &device->msix;
-		if (msix->configured_count > 0 && msix->table_address != 0) {
-			uint32 count = std::min(msix->configured_count, (uint32)32) * 4;
-			volatile uint32 *table = (uint32 *)msix->table_address;
-			for (uint32 i = 0; i < count; i++)
-				device->saved_msix_table[i] = table[i];
-		}
-
-		// Stop the device from asserting PME while the system sleeps: Haiku
-		// does not support waking from devices, and a device that keeps
-		// signalling wake-ups (a network card that was left in wake on LAN
-		// mode, for instance) wakes the machine again right away.
-		uint8 capability = saved_capability(device, PCI_cap_id_pm);
-		if (capability != 0) {
-			uint16 control = ReadConfig(device, capability + PCI_pm_status, 2);
-			if ((control & PCI_pm_status_pme_enable) != 0) {
-				WriteConfig(device, capability + PCI_pm_status, 2,
-					control & ~PCI_pm_status_pme_enable);
-			}
-		}
+		_SaveDeviceConfiguration(device);
 
 		if (device->child != NULL)
 			_SaveConfiguration(device->child);

@@ -41,6 +41,12 @@ private:
 				kLidSleep
 			};
 
+			enum sleep_result {
+				kSleepFailed,
+				kWokeUp,
+				kSleepTimedOut
+			};
+
 			struct sleeping_interface {
 				BString			name;
 				BNetworkAddress	gateway;
@@ -50,7 +56,7 @@ private:
 
 			void				_ApplyProfile();
 			bool				_InitGUI();
-			bool				_Sleep();
+			sleep_result		_Sleep(bool deep, bigtime_t timeout);
 			bool				_WaitForLidOpen(bigtime_t timeout);
 			void				_TakeDownWiredInterfaces(
 									InterfaceList& _interfaces);
@@ -74,6 +80,10 @@ private:
 				// seconds: a sleeping machine wakes up this often to see
 				// whether its lid was opened, 0 never (the default: the kernel
 				// looks at the lid whenever the firmware interrupts the sleep)
+			int32				fDeepSleepMinutes;
+				// with the lid closed this long, the machine sleeps deeper:
+				// the devices that take longer to come back (wireless, the
+				// GPU) sleep, too; 0 never
 
 			float				fACBrightness;
 				// what it was on AC, restored when plugged in again

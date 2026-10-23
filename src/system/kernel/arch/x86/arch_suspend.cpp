@@ -881,14 +881,17 @@ suspend_syscall(const char* subsystem, uint32 function, void* buffer,
 
 		case X86_SUSPEND_ENTER_S2IDLE:
 		{
+			// (callers built before s0i3_blockers pass less)
 			x86_suspend_s2idle_args args = {};
-			if (bufferSize != sizeof(args) || !IS_USER_ADDRESS(buffer)
-				|| user_memcpy(&args, buffer, sizeof(args)) != B_OK) {
+			if (bufferSize > sizeof(args)
+				|| bufferSize < offsetof(x86_suspend_s2idle_args, s0i3_blockers)
+				|| !IS_USER_ADDRESS(buffer)
+				|| user_memcpy(&args, buffer, bufferSize) != B_OK) {
 				return B_BAD_ADDRESS;
 			}
 			status_t status = x86_suspend_enter_s2idle(&args);
 			if (status == B_OK
-				&& user_memcpy(buffer, &args, sizeof(args)) != B_OK) {
+				&& user_memcpy(buffer, &args, bufferSize) != B_OK) {
 				return B_BAD_ADDRESS;
 			}
 			return status;

@@ -30,6 +30,10 @@ static const uint32 kChanged = 'pchg';
 
 static const char* kLidActions[] = { "sleep", "display_off", "nothing" };
 
+// minutes with the lid closed before the sleep gets deeper, 0 never
+static const int32 kDeepSleepMinutes[] = { 5, 15, 30, 60, 120, 240, 0 };
+static const int32 kDefaultDeepSleepMinutes = 30;
+
 
 class PowerWindow : public BWindow {
 public:
@@ -66,6 +70,29 @@ public:
 		fLidAction = new BMenuField("lid action",
 			B_TRANSLATE("When the lid is closed:"), lidMenu);
 
+		BPopUpMenu* deepMenu = new BPopUpMenu("deep sleep");
+		for (int32 i = 0; i < (int32)B_COUNT_OF(kDeepSleepMinutes); i++) {
+			int32 minutes = kDeepSleepMinutes[i];
+			BString label;
+			if (minutes == 0)
+				label = B_TRANSLATE("Never");
+			else if (minutes < 60) {
+				label.SetToFormat(B_TRANSLATE("%d minutes"), (int)minutes);
+			} else if (minutes == 60)
+				label = B_TRANSLATE("1 hour");
+			else {
+				label.SetToFormat(B_TRANSLATE("%d hours"),
+					(int)(minutes / 60));
+			}
+			deepMenu->AddItem(new BMenuItem(label, new BMessage(kChanged)));
+		}
+		fDeepSleep = new BMenuField("deep sleep",
+			B_TRANSLATE("Sleep deeper after:"), deepMenu);
+		fDeepSleep->SetToolTip(B_TRANSLATE("After the lid has been closed "
+			"this long, wireless networking and the graphics go to sleep, "
+			"too: the battery lasts longer, waking up takes a little "
+			"longer."));
+
 		BBox* battery = new BBox("battery");
 		battery->SetLabel(B_TRANSLATE("On battery"));
 		BLayoutBuilder::Group<>(battery, B_VERTICAL, B_USE_SMALL_SPACING)
@@ -82,11 +109,19 @@ public:
 				B_USE_DEFAULT_SPACING, B_USE_DEFAULT_SPACING)
 			.Add(fACSaving);
 
+		BBox* lid = new BBox("lid");
+		lid->SetLabel(B_TRANSLATE("Lid"));
+		BLayoutBuilder::Grid<>(lid, B_USE_DEFAULT_SPACING, B_USE_SMALL_SPACING)
+			.SetInsets(B_USE_DEFAULT_SPACING, B_USE_BIG_SPACING,
+				B_USE_DEFAULT_SPACING, B_USE_DEFAULT_SPACING)
+			.AddMenuField(fLidAction, 0, 0)
+			.AddMenuField(fDeepSleep, 0, 1);
+
 		BLayoutBuilder::Group<>(this, B_VERTICAL, B_USE_DEFAULT_SPACING)
 			.SetInsets(B_USE_WINDOW_INSETS)
 			.Add(battery)
 			.Add(ac)
-			.Add(fLidAction);
+			.Add(lid);
 
 		_Load();
 		CenterOnScreen();
@@ -97,6 +132,7 @@ public:
 		if (message->what == kChanged) {
 			fBatteryBrightness->SetEnabled(
 				fDimOnBattery->Value() == B_CONTROL_ON);
+			_UpdateDeepSleep();
 			// (the slider sends one while it is dragged; the daemon only
 			// reads the file when the power source changes)
 			_Save();
@@ -105,6 +141,13 @@ public:
 	}
 
 private:
+	void _UpdateDeepSleep()
+	{
+		// (only sleeping can get deeper)
+		fDeepSleep->SetEnabled(fLidAction->Menu()->IndexOf(
+			fLidAction->Menu()->FindMarked()) == 0);
+	}
+
 	static bool _SettingsPath(BPath& path)
 	{
 		if (find_directory(B_USER_SETTINGS_DIRECTORY, &path) != B_OK)
@@ -118,6 +161,7 @@ private:
 		bool acSaving = false;
 		int32 brightness = 70;
 		const char* lid = "sleep";
+		int32 deepSleep = kDefaultDeepSleepMinutes;
 
 		BPath path;
 		void* handle = _SettingsPath(path)
@@ -134,6 +178,10 @@ private:
 			value = get_driver_parameter(handle, "lid_closed", NULL, NULL);
 			if (value != NULL)
 				lid = value;
+			value = get_driver_parameter(handle, "deep_sleep_minutes", NULL,
+				NULL);
+			if (value != NULL)
+				deepSleep = atoi(value);
 		}
 
 		fBatterySaving->SetValue(batterySaving);
@@ -149,6 +197,20 @@ private:
 		BMenuItem* item = fLidAction->Menu()->ItemAt(index);
 		if (item != NULL)
 			item->SetMarked(true);
+
+		// the nearest choice
+		index = 0;
+		for (int32 i = 0; i < (int32)B_COUNT_OF(kDeepSleepMinutes); i++) {
+			int32 minutes = kDeepSleepMinutes[i];
+			if ((deepSleep <= 0 && minutes == 0)
+				|| (deepSleep > 0 && minutes > 0 && minutes <= deepSleep)) {
+				index = i;
+			}
+		}
+		item = fDeepSleep->Menu()->ItemAt(index);
+		if (item != NULL)
+			item->SetMarked(true);
+		_UpdateDeepSleep();
 
 		if (handle != NULL)
 			unload_driver_settings(handle);
@@ -167,6 +229,11 @@ private:
 			fLidAction->Menu()->FindMarked());
 		if (lid < 0 || lid >= (int32)B_COUNT_OF(kLidActions))
 			lid = 0;
+		int32 deepSleep = fDeepSleep->Menu()->IndexOf(
+			fDeepSleep->Menu()->FindMarked());
+		deepSleep = deepSleep >= 0
+				&& deepSleep < (int32)B_COUNT_OF(kDeepSleepMinutes)
+			? kDeepSleepMinutes[deepSleep] : kDefaultDeepSleepMinutes;
 
 		BString text;
 		text << "# Written by the Power preferences, read by the power daemon\n"
@@ -177,7 +244,8 @@ private:
 				? fBatteryBrightness->Value() : 0)
 			<< "\npower_saving_on_ac "
 			<< (fACSaving->Value() == B_CONTROL_ON ? "true" : "false")
-			<< "\nlid_closed " << kLidActions[lid] << "\n";
+			<< "\nlid_closed " << kLidActions[lid]
+			<< "\ndeep_sleep_minutes " << deepSleep << "\n";
 
 		BFile file(path.Path(), B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);
 		if (file.InitCheck() == B_OK)
@@ -189,6 +257,7 @@ private:
 	BSlider* fBatteryBrightness;
 	BCheckBox* fACSaving;
 	BMenuField* fLidAction;
+	BMenuField* fDeepSleep;
 };
 
 

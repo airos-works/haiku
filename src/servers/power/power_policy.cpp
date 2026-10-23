@@ -6,6 +6,7 @@
 
 #include "power_policy.h"
 
+#include <algorithm>
 #include <fcntl.h>
 #include <new>
 #include <stdio.h>
@@ -50,6 +51,7 @@ PowerPolicy::PowerPolicy(BServer* server)
 	fBatteryBrightness(70),
 	fLidAction(kLidSleep),
 	fSleepCheck(0),
+	fDeepSleepMinutes(30),
 	fACBrightness(-1),
 	fWokeUp(0)
 {
@@ -72,8 +74,8 @@ PowerPolicy::SettingsPath()
 
 /*!	The settings file has lines like "power_saving_on_battery true",
 	"battery_brightness 70", "lid_closed sleep" (or "display_off",
-	"nothing") and "sleep_check_seconds 0". A changed file applies to the
-	current power source at once.
+	"nothing"), "deep_sleep_minutes 30" and "sleep_check_seconds 0". A
+	changed file applies to the current power source at once.
 */
 void
 PowerPolicy::LoadSettings()
@@ -107,6 +109,11 @@ PowerPolicy::LoadSettings()
 			NULL);
 		if (value != NULL)
 			fSleepCheck = atoi(value);
+
+		value = get_driver_parameter(handle, "deep_sleep_minutes", NULL,
+			NULL);
+		if (value != NULL)
+			fDeepSleepMinutes = atoi(value);
 		unload_driver_settings(handle);
 	}
 
@@ -194,9 +201,35 @@ PowerPolicy::SetLidOpen(bool open)
 	InterfaceList interfaces;
 	_TakeDownWiredInterfaces(interfaces);
 
+	// After a while with the lid closed, the sleep gets deeper.
+	bigtime_t deepAt = 0;
+	{
+		BAutolock _(fLock);
+		if (fDeepSleepMinutes > 0)
+			deepAt = system_time() + fDeepSleepMinutes * 60000000LL;
+	}
+
 	// A power button press wakes the machine, too: sleep again until the
 	// lid is opened.
-	while (_Sleep()) {
+	bool deep = false;
+	while (true) {
+		bigtime_t timeout = 0;
+		if (!deep && deepAt != 0)
+			timeout = std::max(deepAt - system_time(), (bigtime_t)1000);
+
+		sleep_result result = _Sleep(deep, timeout);
+		if (result == kSleepFailed)
+			break;
+		if (result == kSleepTimedOut && !deep) {
+			// (the lid may have been opened just now)
+			if (!_WaitForLidOpen(0)) {
+				printf("power_daemon: lid closed for %" B_PRId32 " minutes, "
+					"sleeping deeper\n", fDeepSleepMinutes);
+				deep = true;
+				continue;
+			}
+		}
+
 		if (_WaitForLidOpen(3000000)) {
 			{
 				BAutolock _(fLock);
@@ -239,36 +272,48 @@ PowerPolicy::_InitGUI()
 
 
 /*!	Puts the machine to sleep until something wakes it (suspend to idle),
-	where the platform supports it.
+	where the platform supports it, or until \a timeout passed (0 never).
+	A \a deep sleep takes the devices along that take longer to come back.
 */
-bool
-PowerPolicy::_Sleep()
+PowerPolicy::sleep_result
+PowerPolicy::_Sleep(bool deep, bigtime_t timeout)
 {
 #if defined(__i386__) || defined(__x86_64__)
 	x86_suspend_s2idle_args args = {};
-	// The devices with suspend hooks (USB, NVMe) go to sleep, too; the power
-	// hooks of the legacy drivers (Wi-Fi) are left out until those drivers
-	// are known to come back from a suspend to idle.
-	args.flags = X86_SUSPEND_SKIP_POWER_HOOKS;
+	// The devices with suspend hooks (USB, NVMe) go to sleep, too. The power
+	// hooks of the legacy drivers (Wi-Fi) only run for a deep sleep: those
+	// drivers take seconds to come back.
+	if (!deep)
+		args.flags = X86_SUSPEND_SKIP_POWER_HOOKS;
 	{
 		BAutolock _(fLock);
 		if (fSleepCheck > 0)
 			args.timeout_ms = fSleepCheck * 1000;
 	}
+	if (timeout > 0 && (args.timeout_ms == 0
+			|| timeout / 1000 < (bigtime_t)args.timeout_ms)) {
+		args.timeout_ms = std::max(timeout / 1000, (bigtime_t)1);
+	}
 	status_t status = _kern_generic_syscall(X86_SUSPEND_SYSCALLS,
 		X86_SUSPEND_ENTER_S2IDLE, &args, sizeof(args));
 	if (status != B_OK) {
 		printf("power_daemon: cannot sleep: %s\n", strerror(status));
-		return false;
+		return kSleepFailed;
 	}
 
 	BAutolock _(fLock);
 	fWokeUp = system_time();
-	printf("power_daemon: woke up after %" B_PRIu64 " s, S0i3 %s\n",
-		args.slept_us / 1000000, args.s0i3_entered ? "entered" : "not entered");
-	return true;
+	printf("power_daemon: woke up from a%s sleep after %" B_PRIu64 " s, S0i3 "
+		"%s (kept out by %#" B_PRIx32 ")\n", deep ? " deep" : "",
+		args.slept_us / 1000000, args.s0i3_entered ? "entered" : "not entered",
+		args.s0i3_blockers);
+	if (args.wake_reason == X86_S2IDLE_WAKE_TIMEOUT
+		&& timeout > 0 && (bigtime_t)args.slept_us >= timeout - 1000000) {
+		return kSleepTimedOut;
+	}
+	return kWokeUp;
 #else
-	return false;
+	return kSleepFailed;
 #endif
 }
 
@@ -323,7 +368,7 @@ PowerPolicy::_BringUpInterfaces(const InterfaceList& interfaces)
 
 
 /*!	Waits until the lid reports itself open (its notification follows the
-	wake-up). */
+	wake-up); a \a timeout of 0 only looks. */
 bool
 PowerPolicy::_WaitForLidOpen(bigtime_t timeout)
 {
@@ -333,12 +378,13 @@ PowerPolicy::_WaitForLidOpen(bigtime_t timeout)
 
 	bigtime_t end = system_time() + timeout;
 	bool lidOpen = false;
-	while (!lidOpen && system_time() < end) {
+	while (true) {
 		uint8 status;
 		if (read(fd, &status, 1) == 1 && status != 0)
 			lidOpen = true;
-		else
-			snooze(100000);
+		if (lidOpen || system_time() >= end)
+			break;
+		snooze(100000);
 	}
 	close(fd);
 	return lidOpen;

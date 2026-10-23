@@ -41,6 +41,10 @@ struct x86_suspend_s2idle_args {
 	uint32	s0i3_entered;
 	uint32	pmc_idle_mask;
 		// AMD: which IP blocks were still busy
+	uint32	s0i3_blockers;
+		// AMD: the IP blocks that kept the SoC out of S0i3, as the power
+		// management firmware logged it (bit 0 display, 2 GFX, 5 VCN, 9 and
+		// 10 the USB 3 controllers, ...)
 };
 
 // wake_reason
