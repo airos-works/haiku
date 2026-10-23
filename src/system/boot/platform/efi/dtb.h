@@ -14,6 +14,8 @@
 
 extern void dtb_init();
 extern void dtb_set_kernel_args();
+// Called right after ExitBootServices, before the native UART is used.
+extern void dtb_exit_boot_services();
 
 bool dtb_get_reg(const void* fdt, int node, size_t idx, addr_range& range);
 uint32 dtb_get_interrupt(const void* fdt, int node);
