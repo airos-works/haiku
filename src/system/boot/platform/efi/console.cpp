@@ -16,6 +16,7 @@
 #include <boot/platform.h>
 #include <boot/platform/generic/video.h>
 #include <efi/protocol/console-control.h>
+#include <efi/protocol/graphics-output.h>
 #include <utf8_functions.h>
 #include <util/kernel_cpp.h>
 
@@ -231,11 +232,29 @@ console_wait_for_key(void)
 }
 
 
+static efi_graphics_output_protocol*
+graphics_output(uint32* width, uint32* height)
+{
+	static efi_guid graphicsOutputGuid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
+	efi_graphics_output_protocol* graphicsOutput = NULL;
+	*width = *height = 0;
+	if (kBootServices->LocateProtocol(&graphicsOutputGuid, NULL,
+			(void**)&graphicsOutput) != EFI_SUCCESS || graphicsOutput == NULL
+		|| graphicsOutput->Mode == NULL || graphicsOutput->Mode->Info == NULL) {
+		return NULL;
+	}
+	*width = graphicsOutput->Mode->Info->HorizontalResolution;
+	*height = graphicsOutput->Mode->Info->VerticalResolution;
+	return graphicsOutput;
+}
+
+
 static void update_screen_size(void)
 {
 	size_t width, height;
 	size_t area = 0;
 	efi_simple_text_output_protocol *ConOut = kSystemTable->ConOut;
+	int32 currentMode = ConOut->Mode->Mode;
 
 	for (int mode = 0; mode < ConOut->Mode->MaxMode; ++mode) {
 		if (ConOut->QueryMode(ConOut, mode, &width, &height) == EFI_SUCCESS) {
@@ -243,11 +262,32 @@ static void update_screen_size(void)
 				sConsole.fScreenWidth = width;
 				sConsole.fScreenHeight = height;
 				sScreenMode = mode;
+				area = width * height;
 			}
 		}
 	}
 
+	// A graphics console may change the display resolution with the text
+	// mode; keep the firmware's resolution, which the display is known to
+	// show.
+	uint32 graphicsWidth, graphicsHeight;
+	efi_graphics_output_protocol* graphicsOutput
+		= graphics_output(&graphicsWidth, &graphicsHeight);
+	uint32 graphicsMode = graphicsOutput != NULL ? graphicsOutput->Mode->Mode : 0;
 	ConOut->SetMode(ConOut, sScreenMode);
+	uint32 newWidth, newHeight;
+	graphics_output(&newWidth, &newHeight);
+	if ((newWidth != graphicsWidth || newHeight != graphicsHeight)
+		&& currentMode >= 0 && ConOut->QueryMode(ConOut, currentMode, &width,
+			&height) == EFI_SUCCESS) {
+		sConsole.fScreenWidth = width;
+		sConsole.fScreenHeight = height;
+		sScreenMode = currentMode;
+		ConOut->SetMode(ConOut, sScreenMode);
+		graphics_output(&newWidth, &newHeight);
+		if (newWidth != graphicsWidth || newHeight != graphicsHeight)
+			graphicsOutput->SetMode(graphicsOutput, graphicsMode);
+	}
 }
 
 
