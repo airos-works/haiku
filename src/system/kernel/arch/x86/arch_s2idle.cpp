@@ -155,6 +155,7 @@ static bool sLidProbed;
 static int32 sSCI = -1;
 static int32 sActive;
 static int32 sWakeReason;
+static int32 sAlarmFired;
 
 
 //	#pragma mark - LPS0
@@ -444,6 +445,120 @@ fch_time(uint32 offset)
 }
 
 
+//	#pragma mark - RTC alarm
+
+
+/*!	In S0i3 the local APIC timer stops with the cores: a timeout needs the
+	CMOS clock's alarm, which raises the ACPI RTC fixed event (an SCI), as
+	Linux's rtc-cmos wake alarm does.
+*/
+static uint8
+rtc_read(uint8 index)
+{
+	out8(index, 0x70);
+	return in8(0x71);
+}
+
+
+static void
+rtc_write(uint8 index, uint8 value)
+{
+	out8(index, 0x70);
+	out8(value, 0x71);
+}
+
+
+static uint32
+rtc_alarm_event(void* /*data*/)
+{
+	atomic_set(&sAlarmFired, 1);
+	atomic_test_and_set(&sWakeReason, X86_S2IDLE_WAKE_TIMEOUT, 0);
+	return 1;
+		// ACPI_INTERRUPT_HANDLED
+}
+
+
+/*!	Sets the alarm \a seconds (less than a day) from now; the SCI handler
+	must be installed. */
+static bool
+rtc_arm_alarm(uint32 seconds)
+{
+	if (seconds >= 24 * 60 * 60)
+		return false;
+
+	// FADT DAY_ALRM, the CMOS index of the day of month alarm (0 none)
+	uint8 dayAlarm = 0;
+	void* table;
+	if (sACPI->get_table("FACP", 0, &table) == B_OK)
+		dayAlarm = *((uint8*)table + 106);
+
+	// wait out an update in progress
+	for (int32 i = 0; i < 10000 && (rtc_read(0x0a) & 0x80) != 0; i++)
+		spin(1);
+
+	uint8 statusB = rtc_read(0x0b);
+	bool binary = (statusB & 0x04) != 0;
+	bool twelveHour = (statusB & 0x02) == 0;
+	auto fromRTC = [binary](uint8 value) {
+		return binary ? value : (value >> 4) * 10 + (value & 0x0f);
+	};
+	auto toRTC = [binary](uint32 value) {
+		return (uint8)(binary ? value : ((value / 10) << 4) | (value % 10));
+	};
+
+	uint8 hourValue = rtc_read(0x04);
+	uint32 hour = fromRTC(hourValue & 0x7f);
+	if (twelveHour)
+		hour = hour % 12 + ((hourValue & 0x80) != 0 ? 12 : 0);
+	uint32 time = (hour * 60 + fromRTC(rtc_read(0x02))) * 60
+		+ fromRTC(rtc_read(0x00)) + seconds;
+	uint32 day = fromRTC(rtc_read(0x07));
+	uint32 month = fromRTC(rtc_read(0x08));
+	uint32 year = fromRTC(rtc_read(0x09));
+
+	if (time >= 24 * 60 * 60) {
+		time -= 24 * 60 * 60;
+		static const uint8 kDays[] = {
+			31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+		uint32 days = month >= 1 && month <= 12 ? kDays[month - 1] : 31;
+		if (month == 2 && year % 4 == 0)
+			days = 29;
+		day = day >= days ? 1 : day + 1;
+	}
+
+	uint32 alarmHour = time / 3600;
+	uint8 alarmHourValue;
+	if (twelveHour) {
+		alarmHourValue = toRTC(alarmHour % 12 == 0 ? 12 : alarmHour % 12)
+			| (alarmHour >= 12 ? 0x80 : 0);
+	} else
+		alarmHourValue = toRTC(alarmHour);
+
+	rtc_write(0x0b, statusB & ~0x20);
+	rtc_write(0x01, toRTC(time % 60));
+	rtc_write(0x03, toRTC(time / 60 % 60));
+	rtc_write(0x05, alarmHourValue);
+	if (dayAlarm != 0)
+		rtc_write(dayAlarm, toRTC(day));
+	rtc_read(0x0c);
+		// clears a pending alarm flag
+	sACPI->reset_fixed_event(ACPI_EVENT_RTC);
+	rtc_write(0x0b, statusB | 0x20);
+	sACPI->enable_fixed_event(ACPI_EVENT_RTC);
+	return true;
+}
+
+
+static void
+rtc_disarm_alarm()
+{
+	sACPI->disable_fixed_event(ACPI_EVENT_RTC);
+	rtc_write(0x0b, rtc_read(0x0b) & ~0x20);
+	rtc_read(0x0c);
+	sACPI->reset_fixed_event(ACPI_EVENT_RTC);
+}
+
+
 //	#pragma mark - wakeup events
 
 
@@ -625,6 +740,17 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 	install_io_interrupt_handler(sSCI, &sci_wake, NULL, 0);
 	atomic_set(&sWakeReason, 0);
 
+	// (rounded up to the next second, after the APIC deadline)
+	atomic_set(&sAlarmFired, 0);
+	bool rtcAlarm = false;
+	if (args->timeout_ms != 0
+		&& sACPI->install_fixed_event_handler(ACPI_EVENT_RTC,
+			&rtc_alarm_event, NULL) == B_OK) {
+		rtcAlarm = rtc_arm_alarm((args->timeout_ms + 1999) / 1000);
+		if (!rtcAlarm)
+			sACPI->remove_fixed_event_handler(ACPI_EVENT_RTC, &rtc_alarm_event);
+	}
+
 	// Nothing else runs on the boot CPU while it sleeps.
 	int32 oldPriority = thread->priority;
 	set_thread_priority(thread->id, B_REAL_TIME_PRIORITY);
@@ -646,7 +772,8 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 	uint32 ignoredWakeups = 0;
 	uint64 lastEntry = entryBefore;
 	while (true) {
-		while (atomic_get(&sWakeReason) == 0) {
+		while (atomic_get(&sWakeReason) == 0
+			&& atomic_get(&sAlarmFired) == 0) {
 			if (deadline != 0) {
 				// (any interrupt lets the kernel program the timer for its
 				// own next timer; the hardware timer only goes so far, too)
@@ -661,6 +788,11 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 			}
 			cpu_idle();
 			rounds++;
+		}
+		// (the alarm's SCI may have been taken for another one)
+		if (atomic_get(&sAlarmFired) != 0) {
+			atomic_set(&sWakeReason, X86_S2IDLE_WAKE_TIMEOUT);
+			break;
 		}
 		if (atomic_get(&sWakeReason) != X86_S2IDLE_WAKE_SCI
 			|| wakeup_is_real(wakeupEvents)) {
@@ -681,6 +813,10 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 	}
 
 	set_thread_priority(thread->id, oldPriority);
+	if (rtcAlarm) {
+		rtc_disarm_alarm();
+		sACPI->remove_fixed_event_handler(ACPI_EVENT_RTC, &rtc_alarm_event);
+	}
 	remove_io_interrupt_handler(sSCI, &sci_wake, NULL);
 
 	status_t exitHintStatus = pmc_send(AMD_PMC_MSG_OS_HINT, 0);
@@ -718,10 +854,12 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 	args->s0i3_us = args->s0i3_entered ? (exit - entry) / 48 : 0;
 	args->s0i3_blockers = blockers;
 
-	INFO("woke up (%s) after %" B_PRIdBIGTIME " ms, %" B_PRIu32 " rounds, %"
+	INFO("woke up (%s%s) after %" B_PRIdBIGTIME " ms, %" B_PRIu32 " rounds, %"
 		B_PRIu32 " SCIs slept through; OS hint %s/%s; S0i3 %s (%" B_PRIu64
 		" ms of the last); PMC idle mask %#" B_PRIx32 "\n",
 		args->wake_reason == X86_S2IDLE_WAKE_SCI ? "SCI" : "timeout",
+		atomic_get(&sAlarmFired) != 0 ? ", RTC alarm"
+			: rtcAlarm ? "" : ", no RTC alarm",
 		slept / 1000, rounds, ignoredWakeups, strerror(hintStatus),
 		strerror(exitHintStatus),
 		args->s0i3_entered ? "entered" : "not entered", args->s0i3_us / 1000,
