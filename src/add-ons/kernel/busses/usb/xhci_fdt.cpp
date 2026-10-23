@@ -542,6 +542,144 @@ dwc3_prepare_host(phys_addr_t base, size_t size, const char* name,
 }
 
 
+/*!	The SC8280XP's DWC3 cores, as the Qualcomm UEFI leaves them. Reading an
+	unpowered or unclocked core is a fatal bus error, so look at the global
+	clock controller first. Their DMA goes through the apps SMMU (MMU-500,
+	"iommus" in the device tree): accept a core only if the SMMU passes its
+	stream through untranslated.
+*/
+static status_t
+sc8280xp_dwc3_check(phys_addr_t base, const char* name)
+{
+	static const struct {
+		phys_addr_t base;
+		uint32 gccBlock;
+		uint16 stream;
+	} kControllers[] = {
+		{ 0xa600000, 0x0f000, 0x820 },	// usb_0 (primary)
+		{ 0xa800000, 0x10000, 0x860 },	// usb_1 (secondary)
+		{ 0xa400000, 0xab000, 0x800 },	// usb_2 (multiport)
+	};
+	static const phys_addr_t kGccBase = 0x100000;
+	static const phys_addr_t kAppsSmmuBase = 0x15000000;
+
+	uint32 gccBlock = 0, stream = 0;
+	for (size_t i = 0; i < B_COUNT_OF(kControllers); i++) {
+		if (kControllers[i].base == base) {
+			gccBlock = kControllers[i].gccBlock;
+			stream = kControllers[i].stream;
+		}
+	}
+	if (gccBlock == 0) {
+		dprintf("xhci: %s: unknown SC8280XP DWC3 instance %#" B_PRIxPHYSADDR "\n",
+			name, base);
+		return B_NOT_SUPPORTED;
+	}
+
+	void* address;
+	area_id area = map_physical_memory("SC8280XP GCC (xhci)", kGccBase + gccBlock,
+		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA, &address);
+	if (area < 0)
+		return area;
+	uint32 gdsc = *(volatile uint32*)((uint8*)address + 0x004);
+	uint32 master = *(volatile uint32*)((uint8*)address + 0x010);
+	delete_area(area);
+	dprintf("xhci: %s: gdsc %#" B_PRIx32 ", master clock %#" B_PRIx32 "\n", name,
+		gdsc, master);
+	if ((gdsc & (1u << 31)) == 0 || (master & (1u << 31)) != 0) {
+		dprintf("xhci: %s: left powered down by the firmware\n", name);
+		return B_NOT_SUPPORTED;
+	}
+
+	area = map_physical_memory("SC8280XP apps SMMU (xhci)", kAppsSmmuBase,
+		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA, &address);
+	if (area < 0)
+		return area;
+	volatile uint32* smmu = (volatile uint32*)address;
+	uint32 control = smmu[0];
+	uint32 groups = smmu[0x20 / 4] & 0xff;
+	bool extendedIds = (control & (1u << 3)) != 0;
+	int32 type = -1;
+	for (uint32 i = 0; i < groups && i < 256; i++) {
+		uint32 smr = smmu[0x800 / 4 + i];
+		uint32 s2cr = smmu[0xc00 / 4 + i];
+		bool valid = extendedIds ? (s2cr & (1u << 28)) != 0 : (smr & (1u << 31)) != 0;
+		uint32 id = smr & (extendedIds ? 0xffff : 0x7fff);
+		uint32 mask = (smr >> 16) & (extendedIds ? 0xffff : 0x7fff);
+		if (valid && ((stream ^ id) & ~mask) == 0) {
+			type = (s2cr >> 16) & 3;
+			dprintf("xhci: %s: SMMU stream %#" B_PRIx32 " group %" B_PRIu32
+				" SMR %#" B_PRIx32 " S2CR %#" B_PRIx32 "\n", name, stream, i, smr,
+				s2cr);
+			break;
+		}
+	}
+	uint32 idr1 = smmu[0x24 / 4];
+	delete_area(area);
+	dprintf("xhci: %s: SMMU sCR0 %#" B_PRIx32 ", %" B_PRIu32 " groups, sIDR1 %#"
+		B_PRIx32 "\n", name, control, groups, idr1);
+
+	// A translating context bank whose translation is off passes DMA through.
+	int32 contextBank = -1;
+	if (type == 0) {
+		size_t pageSize = (idr1 & (1u << 31)) != 0 ? 65536 : 4096;
+		size_t pages = 1u << (((idr1 >> 28) & 7) + 1);
+		// the s2cr of the matched group holds the context bank index
+		area = map_physical_memory("SC8280XP apps SMMU (xhci)", kAppsSmmuBase,
+			B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA, &address);
+		if (area >= 0) {
+			smmu = (volatile uint32*)address;
+			for (uint32 i = 0; i < groups && i < 256; i++) {
+				uint32 smr = smmu[0x800 / 4 + i];
+				if ((smr & (1u << 31)) != 0
+					&& ((stream ^ (smr & 0x7fff)) & ~((smr >> 16) & 0x7fff)) == 0) {
+					contextBank = smmu[0xc00 / 4 + i] & 0xff;
+					break;
+				}
+			}
+			delete_area(area);
+		}
+		if (contextBank >= 0) {
+			phys_addr_t gr1 = kAppsSmmuBase + pageSize;
+			phys_addr_t bank = kAppsSmmuBase + pages * pageSize
+				+ contextBank * pageSize;
+			uint32 cbar = 0, sctlr = 0, tcr = 0;
+			uint64 ttbr0 = 0;
+			area = map_physical_memory("SC8280XP SMMU GR1 (xhci)", gr1, B_PAGE_SIZE,
+				B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA, &address);
+			if (area >= 0) {
+				cbar = ((volatile uint32*)address)[contextBank];
+				delete_area(area);
+			}
+			area = map_physical_memory("SC8280XP SMMU bank (xhci)", bank,
+				B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA, &address);
+			if (area >= 0) {
+				volatile uint32* cb = (volatile uint32*)address;
+				sctlr = cb[0];
+				tcr = cb[0x30 / 4];
+				ttbr0 = cb[0x20 / 4] | ((uint64)cb[0x24 / 4] << 32);
+				delete_area(area);
+			}
+			dprintf("xhci: %s: context bank %" B_PRId32 " at %#" B_PRIxPHYSADDR
+				": CBAR %#" B_PRIx32 " SCTLR %#" B_PRIx32 " TCR %#" B_PRIx32
+				" TTBR0 %#" B_PRIx64 "\n", name, contextBank, bank, cbar, sctlr,
+				tcr, ttbr0);
+			if ((sctlr & 1) == 0)
+				type = 1;
+		}
+	}
+
+	bool bypass = (control & 1) != 0	// CLIENTPD: the SMMU is off
+		|| type == 1
+		|| (type < 0 && (control & (1u << 10)) == 0);	// unmatched pass
+	if (!bypass) {
+		dprintf("xhci: %s: DMA is translated or faulted by the SMMU\n", name);
+		return B_NOT_SUPPORTED;
+	}
+	return B_OK;
+}
+
+
 static float
 supports_fdt(device_node* parent)
 {
@@ -584,7 +722,8 @@ init_fdt(device_node* node, void** cookie)
 		(driver_module_info**)&fdt, (void**)&device);
 	usb_fdt_resources resources;
 	if (status == B_OK)
-		status = usb_fdt_get_resources(gDeviceManager, parent, "xhci", &resources);
+		status = usb_fdt_get_resources(gDeviceManager, parent, "xhci", &resources,
+			true);
 	if (status != B_OK) {
 		gDeviceManager->put_node(parent);
 		return status;
@@ -597,7 +736,32 @@ init_fdt(device_node* node, void** cookie)
 	platform.interrupt = resources.interrupt;
 	platform.dma_coherent = resources.dma_coherent;
 
-	if (usb_fdt_has_string(fdt, device, "compatible", "snps,dwc3")) {
+	// The Qualcomm glue is the core's parent node.
+	bool qualcomm = false;
+	device_node* glue = gDeviceManager->get_parent_node(parent);
+	if (glue != NULL) {
+		fdt_device_module_info* glueFDT;
+		fdt_device* glueDevice;
+		const char* bus;
+		if (gDeviceManager->get_attr_string(glue, B_DEVICE_BUS, &bus, false) == B_OK
+			&& strcmp(bus, "fdt") == 0
+			&& gDeviceManager->get_driver(glue, (driver_module_info**)&glueFDT,
+				(void**)&glueDevice) == B_OK) {
+			qualcomm = usb_fdt_has_string(glueFDT, glueDevice, "compatible",
+					"qcom,sc8280xp-dwc3")
+				|| usb_fdt_has_string(glueFDT, glueDevice, "compatible",
+					"qcom,sc8280xp-dwc3-mp");
+		}
+		gDeviceManager->put_node(glue);
+	}
+	if (resources.iommu && !qualcomm) {
+		dprintf("xhci: unsupported IOMMU for %s\n", name);
+		status = B_NOT_SUPPORTED;
+	}
+	if (status == B_OK && qualcomm)
+		status = sc8280xp_dwc3_check(resources.register_base, name);
+
+	if (status == B_OK && usb_fdt_has_string(fdt, device, "compatible", "snps,dwc3")) {
 		// With the GL3523 on the ROCK 5 ITX's USB 3 link the system soon
 		// stopped taking input and starting programs, so these cores' USB 3
 		// ports stay off unless the "xhci" driver settings ask for them with

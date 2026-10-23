@@ -24,6 +24,7 @@ struct usb_fdt_resources {
 	size_t		register_size;
 	uint32		interrupt;
 	bool		dma_coherent;
+	bool		iommu;
 };
 
 
@@ -98,10 +99,11 @@ usb_fdt_get_device(device_manager_info* manager, device_node* parent,
 */
 static inline bool
 usb_fdt_ranges_are_identity(device_manager_info* manager, device_node* node,
-	fdt_device_module_info* fdt, fdt_device* device)
+	fdt_device_module_info* fdt, fdt_device* device,
+	const char* property = "ranges")
 {
 	int length;
-	const uint32* ranges = (const uint32*)fdt->get_prop(device, "ranges",
+	const uint32* ranges = (const uint32*)fdt->get_prop(device, property,
 		&length);
 	if (ranges == NULL)
 		return false;
@@ -166,7 +168,8 @@ usb_fdt_ranges_are_identity(device_manager_info* manager, device_node* node,
 */
 static inline status_t
 usb_fdt_get_resources(device_manager_info* manager, device_node* parent,
-	const char* driverName, usb_fdt_resources* resources)
+	const char* driverName, usb_fdt_resources* resources,
+	bool allowIommu = false)
 {
 	fdt_device_module_info* fdt;
 	fdt_device* device;
@@ -206,10 +209,14 @@ usb_fdt_get_resources(device_manager_info* manager, device_node* parent,
 			supported = false;
 		}
 	}
+	// An IOMMU is accepted only when the caller checked that it passes the
+	// controller's DMA through untranslated.
 	const char* unsupported[] = {
-		"big-endian", "big-endian-regs", "big-endian-desc", "iommus",
-		"iommu-map", NULL
+		"big-endian", "big-endian-regs", "big-endian-desc", "iommu-map", NULL
 	};
+	resources->iommu = fdt->get_prop(device, "iommus", NULL) != NULL;
+	if (resources->iommu && !allowIommu)
+		supported = false;
 	for (size_t i = 0; unsupported[i] != NULL; i++) {
 		if (fdt->get_prop(device, unsupported[i], NULL) != NULL)
 			supported = false;
@@ -237,8 +244,11 @@ usb_fdt_get_resources(device_manager_info* manager, device_node* parent,
 		int length;
 		const void* ranges = ancestorFDT->get_prop(ancestor, "dma-ranges",
 			&length);
-		if (ranges != NULL && length != 0)
+		if (ranges != NULL && length != 0
+			&& !usb_fdt_ranges_are_identity(manager, current, ancestorFDT,
+				ancestor, "dma-ranges")) {
 			supported = false;
+		}
 		if (ancestorFDT->get_prop(ancestor, "dma-coherent", NULL) != NULL)
 			resources->dma_coherent = true;
 		if (!usb_fdt_is_enabled(ancestorFDT, ancestor))
