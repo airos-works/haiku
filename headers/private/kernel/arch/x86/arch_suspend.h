@@ -80,6 +80,9 @@ enum {
 	X86_SUSPEND_VERBOSE					= 0x04,
 		// log every step and pause afterwards, so that the log is written
 		// before a step that hangs
+	X86_SUSPEND_RTC_WAKE_ONLY			= 0x80,
+		// s2idle, for testing: only the RTC alarm ends the timeout (no local
+		// APIC deadline, which stops in S0i3 anyway)
 };
 
 

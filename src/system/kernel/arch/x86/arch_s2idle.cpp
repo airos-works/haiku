@@ -760,6 +760,7 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 	// would wake the CPU hundreds of times a second.)
 	bigtime_t start = system_time();
 	bigtime_t deadline = args->timeout_ms != 0
+			&& (!rtcAlarm || (flags & X86_SUSPEND_RTC_WAKE_ONLY) == 0)
 		? start + (bigtime_t)args->timeout_ms * 1000 : 0;
 	{
 		InterruptsLocker _;
