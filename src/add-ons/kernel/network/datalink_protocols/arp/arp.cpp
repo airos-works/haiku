@@ -1009,6 +1009,32 @@ arp_uninit_protocol(net_datalink_protocol *protocol)
 	sStackModule->unregister_device_handler(protocol->interface->device,
 		B_NET_FRAME_TYPE(IFT_ETHER, ETHER_TYPE_IP));
 
+	// Entries resolved or being resolved through this interface point to the
+	// protocol; their timers would use it after it is gone (when a USB
+	// network device is unplugged, for example). Deleting an entry waits for
+	// its timer, which takes the cache lock, so it is done unlocked.
+	while (true) {
+		MutexLocker locker(sCacheLock);
+
+		arp_entry* entry = NULL;
+		AddressCache::Iterator iterator = sCache->GetIterator();
+		while (iterator.HasNext()) {
+			arp_entry* candidate = iterator.Next();
+			if (candidate->protocol == protocol) {
+				entry = candidate;
+				break;
+			}
+		}
+		if (entry == NULL)
+			break;
+
+		sCache->Remove(entry);
+		entry->flags |= ARP_FLAG_REMOVED;
+		locker.Unlock();
+
+		delete entry;
+	}
+
 	delete protocol;
 	return B_OK;
 }
