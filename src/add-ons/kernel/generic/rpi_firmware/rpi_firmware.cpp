@@ -4,9 +4,8 @@
  */
 
 /*	The property interface of the Raspberry Pi's VideoCore firmware
-	(mailbox channel 8), for kernel drivers. Only a driver that sits on a
-	Raspberry Pi device may load this module: the mailbox address is the
-	BCM2711's and nothing here probes for it. */
+	(mailbox channel 8), for kernel drivers. The mailbox address is the
+	BCM2711's: on any other SoC every request fails without touching it. */
 
 
 #include <rpi_firmware.h>
@@ -14,6 +13,8 @@
 #include <string.h>
 
 #include <KernelExport.h>
+
+#include <libfdt.h>
 
 #include <lock.h>
 #include <util/AutoLock.h>
@@ -41,11 +42,20 @@ static volatile uint8* sMailbox;
 static area_id sMessageArea = -1;
 static uint32* sMessage;
 static phys_addr_t sMessageAddress;
+static status_t sInitStatus = B_NO_INIT;
+
+extern void* gFDT;
 
 
+// Set up on first use, not at module load: the drivers that depend on this
+// module are loaded on every board to probe for their devices, and on boards
+// without RAM below 1 GB the message buffer cannot be allocated at all.
 static status_t
 init()
 {
+	if (gFDT == NULL || fdt_node_check_compatible(gFDT, 0, "brcm,bcm2711") != 0)
+		return B_DEVICE_NOT_FOUND;
+
 	sMailboxArea = map_physical_memory("rpi firmware mailbox", MAILBOX_BASE,
 		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
 		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&sMailbox);
@@ -94,6 +104,11 @@ firmware_property(uint32 tag, void* data, size_t size)
 		return B_BAD_VALUE;
 
 	MutexLocker locker(sLock);
+
+	if (sInitStatus == B_NO_INIT)
+		sInitStatus = init();
+	if (sInitStatus != B_OK)
+		return sInitStatus;
 
 	uint32 words = size / 4;
 	sMessage[0] = (6 + words) * 4;
@@ -175,11 +190,14 @@ std_ops(int32 op, ...)
 {
 	switch (op) {
 		case B_MODULE_INIT:
-			return init();
+			return B_OK;
 
 		case B_MODULE_UNINIT:
-			delete_area(sMessageArea);
-			delete_area(sMailboxArea);
+			if (sInitStatus == B_OK) {
+				delete_area(sMessageArea);
+				delete_area(sMailboxArea);
+			}
+			sInitStatus = B_NO_INIT;
 			return B_OK;
 	}
 

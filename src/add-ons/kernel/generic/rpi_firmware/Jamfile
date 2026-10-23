@@ -2,7 +2,18 @@ SubDir HAIKU_TOP src add-ons kernel generic rpi_firmware ;
 
 UsePrivateKernelHeaders ;
 UsePrivateHeaders drivers ;
+UseLibraryHeaders [ FDirName libfdt ] ;
+
+# the root node's compatible tells whether this is a BCM2711
+local libFDTSources =
+	fdt.c
+	fdt_ro.c
+;
 
 KernelAddon rpi_firmware :
 	rpi_firmware.cpp
+	$(libFDTSources)
 ;
+
+SEARCH on [ FGristFiles $(libFDTSources) ]
+	= [ FDirName $(HAIKU_TOP) src libs libfdt ] ;

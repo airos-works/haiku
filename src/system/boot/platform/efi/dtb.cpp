@@ -21,6 +21,7 @@
 #	include <arch/arm/arch_uart_pl011.h>
 #	include <arch/arm64/arch_uart_linflex.h>
 #	include <arch/arm64/arch_uart_samsung.h>
+#	include <arch/arm64/arch_uart_geni.h>
 #endif
 
 
@@ -85,10 +86,71 @@ const struct supported_uarts {
 	{ "fsl,s32-linflexuart", UART_KIND_LINFLEX, &get_uart<ArchUARTlinflex> },
 	{ "brcm,bcm2835-aux-uart", UART_KIND_8250, &get_uart<DebugUART8250> },
 	{ "apple,s5l-uart", UART_KIND_SAMSUNG, &get_uart<ArchUARTSamsung> },
-	// Not "qcom,geni-debug-uart": the firmware may leave the engine unclocked,
-	// and touching it then ends in a bus error.
+	// Only used when its clocks are known to run, see kGeniUartClocks.
+	{ "qcom,geni-debug-uart", UART_KIND_GENI, &get_uart<ArchUARTGeni> },
 #endif
 };
+
+
+#if defined(__aarch64__)
+// A GENI serial engine whose clocks are off ends any access to it in a bus
+// error that hangs the SoC. The firmware runs them while it owns the console,
+// but may drop its votes in ExitBootServices: so the engine is only used on
+// SoCs whose clock controller is known here, and its votes are cast again
+// once boot services are gone.
+static const struct geni_uart_clocks {
+	const char*	soc_compat;
+	phys_addr_t	uart;
+	phys_addr_t	vote;			// branch enable vote register
+	uint32		vote_mask;
+	phys_addr_t	branches[5];	// CBCRs: bit 31 = clock off
+} kGeniUartClocks[] = {
+	// SC8280XP debug UART (QUP2 SE1): core, s_ahb, m_ahb, core_2x, se
+	{ "qcom,sc8280xp", 0x884000, 0x152010, 0x2f,
+		{ 0x11e00c, 0x11e008, 0x11e004, 0x11e014, 0x11e274 } },
+};
+
+static const geni_uart_clocks* sGeniUartClocks = NULL;
+
+
+static bool
+geni_uart_clocks_running(const geni_uart_clocks& clocks)
+{
+	for (uint32 i = 0; i < B_COUNT_OF(clocks.branches); i++) {
+		// A branch under hardware control (bit 1) reads as off while idle,
+		// and wakes up on access.
+		uint32 branch = *(volatile uint32*)clocks.branches[i];
+		if ((branch & (1u << 31)) != 0 && (branch & (1u << 1)) == 0)
+			return false;
+	}
+	return true;
+}
+
+
+static bool
+geni_uart_usable(const void* fdt, addr_t base)
+{
+	for (uint32 i = 0; i < B_COUNT_OF(kGeniUartClocks); i++) {
+		const geni_uart_clocks& clocks = kGeniUartClocks[i];
+		if (clocks.uart != base
+			|| fdt_node_check_compatible(fdt, 0, clocks.soc_compat) != 0) {
+			continue;
+		}
+		if (!geni_uart_clocks_running(clocks)) {
+			dprintf("GENI UART %#" B_PRIxADDR ": clocks off, not used (vote %#"
+				B_PRIx32 ";", base, *(volatile uint32*)clocks.vote);
+			for (uint32 j = 0; j < B_COUNT_OF(clocks.branches); j++)
+				dprintf(" %#" B_PRIx32, *(volatile uint32*)clocks.branches[j]);
+			dprintf(")\n");
+			return false;
+		}
+		sGeniUartClocks = &clocks;
+		return true;
+	}
+	dprintf("GENI UART %#" B_PRIxADDR ": unknown SoC, not used\n", base);
+	return false;
+}
+#endif
 
 
 #ifdef TRACE_DUMP_FDT
@@ -573,10 +635,18 @@ dtb_handle_fdt(const void* fdt, int node)
 			if (dtb_has_fdt_string(compatible, compatibleLen,
 					kSupportedUarts[i].dtb_compat)) {
 
+				addr_range regs;
+				dtb_get_reg(fdt, node, 0, regs);
+#if defined(__aarch64__)
+				if (strcmp(kSupportedUarts[i].kind, UART_KIND_GENI) == 0
+					&& !geni_uart_usable(fdt, regs.start)) {
+					continue;
+				}
+#endif
+
 				memcpy(uart.kind, kSupportedUarts[i].kind,
 					sizeof(uart.kind));
-
-				dtb_get_reg(fdt, node, 0, uart.regs);
+				uart.regs = regs;
 				uart.irq = dtb_get_interrupt(fdt, node);
 				uart.clock = dtb_get_clock_frequency(fdt, node);
 
@@ -660,17 +730,86 @@ dtb_init()
 
 
 void
+dtb_exit_boot_services()
+{
+#if defined(__aarch64__)
+	if (sGeniUartClocks == NULL)
+		return;
+
+	// Vote the UART clocks on again, and give up on the UART if they still
+	// do not run.
+	volatile uint32* vote = (volatile uint32*)sGeniUartClocks->vote;
+	*vote = *vote | sGeniUartClocks->vote_mask;
+	for (int i = 0; i < 1000000; i++) {
+		if (geni_uart_clocks_running(*sGeniUartClocks))
+			return;
+	}
+	gUART = NULL;
+	memset(&gKernelArgs.arch_args.uart, 0, sizeof(gKernelArgs.arch_args.uart));
+#endif
+}
+
+
+// Days since 1970-01-01 of a proleptic Gregorian date.
+static int64
+days_from_civil(int64 year, uint32 month, uint32 day)
+{
+	year -= month <= 2;
+	int64 era = (year >= 0 ? year : year - 399) / 400;
+	uint32 yearOfEra = (uint32)(year - era * 400);
+	uint32 dayOfYear = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+	uint32 dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100
+		+ dayOfYear;
+	return era * 146097 + dayOfEra - 719468;
+}
+
+
+/*!	The firmware's clock in seconds since 1970, as its fields read (the
+	kernel applies its own GMT or local time setting), or 0 if it has none.
+*/
+static uint64
+firmware_clock_seconds()
+{
+	efi_time time;
+	if (kRuntimeServices->GetTime(&time, NULL) != EFI_SUCCESS
+		|| time.Year < 2000 || time.Month < 1 || time.Month > 12
+		|| time.Day < 1 || time.Day > 31) {
+		return 0;
+	}
+
+	return days_from_civil(time.Year, time.Month, time.Day) * 86400
+		+ time.Hour * 3600 + time.Minute * 60 + time.Second;
+}
+
+
+void
 dtb_set_kernel_args()
 {
 	// pack into proper location if the architecture cares
 	if (sDtbTable != NULL) {
-		// libfdt requires 8-byte alignment
-		gKernelArgs.arch_args.fdt = (void*)(addr_t)kernel_args_malloc(sDtbSize, 8);
+		// The kernel has no driver for most boards' real-time clock, so the
+		// firmware's clock goes along as "haiku,firmware-clock" in /chosen.
+		uint64 clock = firmware_clock_seconds();
+		uint32 size = sDtbSize + (clock != 0 ? 64 : 0);
 
-		if (gKernelArgs.arch_args.fdt != NULL)
-			memcpy(gKernelArgs.arch_args.fdt, sDtbTable, sDtbSize);
-		else
+		// libfdt requires 8-byte alignment
+		gKernelArgs.arch_args.fdt = (void*)(addr_t)kernel_args_malloc(size, 8);
+
+		if (gKernelArgs.arch_args.fdt == NULL)
 			ERROR("unable to malloc for fdt!\n");
+		else if (clock == 0)
+			memcpy(gKernelArgs.arch_args.fdt, sDtbTable, sDtbSize);
+		else {
+			void* fdt = gKernelArgs.arch_args.fdt;
+			int chosen = -1;
+			if (fdt_open_into(sDtbTable, fdt, size) == 0)
+				chosen = fdt_path_offset(fdt, "/chosen");
+			if (chosen < 0 || fdt_setprop_u64(fdt, chosen,
+					"haiku,firmware-clock", clock) != 0) {
+				memcpy(fdt, sDtbTable, sDtbSize);
+			} else
+				dprintf("firmware clock: %" B_PRIu64 "\n", clock);
+		}
 	}
 
 	uart_info &uart = gKernelArgs.arch_args.uart;

@@ -16,6 +16,7 @@
 #include "smp.h"
 
 #include "aarch64.h"
+#include "dtb.h"
 
 
 extern const char* granule_type_str(int tg);
@@ -202,6 +203,7 @@ arch_start_kernel(addr_t kernelEntry)
 
 	// Use the native UART as soon as boot services are gone, so failures
 	// while installing the runtime map are visible on the serial console.
+	dtb_exit_boot_services();
 	serial_init();
 	serial_enable();
 	dprintf("Exited EFI boot services: ISR_EL1=%#" B_PRIx64 "\n", isrAfterExit);
