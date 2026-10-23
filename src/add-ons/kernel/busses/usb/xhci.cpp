@@ -647,10 +647,27 @@ XHCI::XHCI(pci_info *info, 	pci_device_module_info* pci, pci_device* device, Sta
 	memset(fPortSpeeds, 0, sizeof(fPortSpeeds));
 	memset((void*)fDevices, 0, sizeof(fDevices));
 
+	// "idle_d3 true" for every controller, or "idle_d3 c1:00.4 ..." for
+	// those
 	void* settings = load_driver_settings("xhci");
-	fIdleD3Allowed = get_driver_boolean_parameter(settings, "idle_d3", false,
-		true);
+	const driver_settings* parsed = get_driver_settings(settings);
+	char location[16];
+	snprintf(location, sizeof(location), "%02x:%02x.%x", fPCIInfo->bus,
+		fPCIInfo->device, fPCIInfo->function);
+	for (int32 i = 0; parsed != NULL && i < parsed->parameter_count; i++) {
+		const driver_parameter& parameter = parsed->parameters[i];
+		if (strcmp(parameter.name, "idle_d3") != 0)
+			continue;
+		for (int32 j = 0; j < parameter.value_count; j++) {
+			if (strcmp(parameter.values[j], "true") == 0
+				|| strcmp(parameter.values[j], location) == 0) {
+				fIdleD3Allowed = true;
+			}
+		}
+	}
 	unload_driver_settings(settings);
+	if (fIdleD3Allowed)
+		TRACE_ALWAYS("%s: D3 while suspended to idle\n", location);
 
 	fInitOK = true;
 	TRACE("driver construction successful\n");
@@ -1245,6 +1262,8 @@ XHCI::_PowerDown()
 	}
 
 	fIdlePoweredDown = true;
+	TRACE_ALWAYS("in D3, state saved (usbcmd %#" B_PRIx32 ")\n",
+		fSavedRegisters.command);
 	return B_OK;
 }
 
@@ -1260,6 +1279,17 @@ XHCI::_PowerUp()
 
 	status_t status = fPci->resume_device(fDevice);
 	fIdlePoweredDown = false;
+
+	uint8 pmCapability = 0;
+	fPci->find_pci_capability(fDevice, PCI_cap_id_pm, &pmCapability);
+	TRACE_ALWAYS("back in D0: %s, pmcsr %#" B_PRIx32 ", command %#" B_PRIx32
+		", bar0 %#" B_PRIx32 ", usbcmd %#" B_PRIx32 ", usbsts %#" B_PRIx32 "\n",
+		strerror(status), pmCapability != 0
+			? fPci->read_pci_config(fDevice, pmCapability + PCI_pm_status, 2)
+			: 0,
+		fPci->read_pci_config(fDevice, PCI_command, 2),
+		fPci->read_pci_config(fDevice, PCI_base_registers, 4),
+		ReadOpReg(XHCI_CMD), ReadOpReg(XHCI_STS));
 	if (status != B_OK) {
 		TRACE_ERROR("the controller did not come back to D0\n");
 		return status;
@@ -1293,6 +1323,8 @@ XHCI::_PowerUp()
 		return B_ERROR;
 
 	uint32 controllerStatus = ReadOpReg(XHCI_STS);
+	TRACE_ALWAYS("state restored: usbcmd %#" B_PRIx32 ", usbsts %#" B_PRIx32
+		"\n", ReadOpReg(XHCI_CMD), controllerStatus);
 	if ((controllerStatus & (STS_SRE | STS_HCE)) != 0) {
 		TRACE_ERROR("restoring the controller state failed: %#" B_PRIx32
 			"\n", controllerStatus);
