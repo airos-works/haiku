@@ -20,6 +20,7 @@
 #include <KernelExport.h>
 
 #include <ByteOrder.h>
+#include <driver_settings.h>
 #include <util/AutoLock.h>
 
 #include "xhci.h"
@@ -382,6 +383,7 @@ XHCI::XHCI(pci_info *info, 	pci_device_module_info* pci, pci_device* device, Sta
 		fPortsDisconnected(false),
 		fIdleSuspended(false),
 		fIdleHalted(false),
+		fIdleD3Allowed(false),
 		fIdlePoweredDown(false),
 		fCmdCompSem(-1),
 		fStopThreads(false),
@@ -644,6 +646,11 @@ XHCI::XHCI(pci_info *info, 	pci_device_module_info* pci, pci_device* device, Sta
 
 	memset(fPortSpeeds, 0, sizeof(fPortSpeeds));
 	memset((void*)fDevices, 0, sizeof(fDevices));
+
+	void* settings = load_driver_settings("xhci");
+	fIdleD3Allowed = get_driver_boolean_parameter(settings, "idle_d3", false,
+		true);
+	unload_driver_settings(settings);
 
 	fInitOK = true;
 	TRACE("driver construction successful\n");
@@ -1203,6 +1210,8 @@ XHCI::_PowerDown()
 {
 	if (fPci->suspend_device == NULL)
 		return B_NOT_SUPPORTED;
+	if (!fIdleD3Allowed)
+		return B_NOT_ALLOWED;
 
 	for (uint8 i = 0; i < fPortCount; i++)
 		fIdlePortStatus[i] = ReadOpReg(XHCI_PORTSC(i));

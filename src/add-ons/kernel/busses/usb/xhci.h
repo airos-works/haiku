@@ -350,6 +350,9 @@ private:
 			bool				fIdleHalted;
 				// commands are refused
 			bool				fPortIdleSuspended[XHCI_MAX_PORTS];
+			bool				fIdleD3Allowed;
+				// not yet by default: "idle_d3 true" in the xhci driver
+				// settings
 			bool				fIdlePoweredDown;
 				// in D3hot, with its state saved (XHCI 1.2 § 4.23.2)
 			uint32				fIdlePortStatus[XHCI_MAX_PORTS];
