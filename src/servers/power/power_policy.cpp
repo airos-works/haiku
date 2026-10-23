@@ -201,12 +201,15 @@ PowerPolicy::SetLidOpen(bool open)
 	InterfaceList interfaces;
 	_TakeDownWiredInterfaces(interfaces);
 
-	// After a while with the lid closed, the sleep gets deeper.
+	// After a while with the lid closed, the sleep gets deeper. (In real
+	// time: the system time may stand still in the deepest sleep.)
 	bigtime_t deepAt = 0;
 	{
 		BAutolock _(fLock);
-		if (fDeepSleepMinutes > 0)
-			deepAt = system_time() + fDeepSleepMinutes * 60000000LL;
+		if (fDeepSleepMinutes > 0) {
+			deepAt = real_time_clock_usecs()
+				+ fDeepSleepMinutes * 60000000LL;
+		}
 	}
 
 	// A power button press wakes the machine, too: sleep again until the
@@ -215,7 +218,8 @@ PowerPolicy::SetLidOpen(bool open)
 	while (true) {
 		bigtime_t timeout = 0;
 		if (!deep && deepAt != 0)
-			timeout = std::max(deepAt - system_time(), (bigtime_t)1000);
+			timeout = std::max(deepAt - real_time_clock_usecs(),
+				(bigtime_t)1000);
 
 		sleep_result result = _Sleep(deep, timeout);
 		if (result == kSleepFailed)
@@ -290,9 +294,11 @@ PowerPolicy::_Sleep(bool deep, bigtime_t timeout)
 		if (fSleepCheck > 0)
 			args.timeout_ms = fSleepCheck * 1000;
 	}
+	bool forTimeout = false;
 	if (timeout > 0 && (args.timeout_ms == 0
 			|| timeout / 1000 < (bigtime_t)args.timeout_ms)) {
 		args.timeout_ms = std::max(timeout / 1000, (bigtime_t)1);
+		forTimeout = true;
 	}
 	status_t status = _kern_generic_syscall(X86_SUSPEND_SYSCALLS,
 		X86_SUSPEND_ENTER_S2IDLE, &args, sizeof(args));
@@ -307,10 +313,9 @@ PowerPolicy::_Sleep(bool deep, bigtime_t timeout)
 		"%s (kept out by %#" B_PRIx32 ")\n", deep ? " deep" : "",
 		args.slept_us / 1000000, args.s0i3_entered ? "entered" : "not entered",
 		args.s0i3_blockers);
-	if (args.wake_reason == X86_S2IDLE_WAKE_TIMEOUT
-		&& timeout > 0 && (bigtime_t)args.slept_us >= timeout - 1000000) {
+	// (the RTC alarm or the deadline, which do not come early)
+	if (args.wake_reason == X86_S2IDLE_WAKE_TIMEOUT && forTimeout)
 		return kSleepTimedOut;
-	}
 	return kWokeUp;
 #else
 	return kSleepFailed;
