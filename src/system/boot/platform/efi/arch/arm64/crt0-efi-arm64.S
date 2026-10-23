@@ -17,6 +17,7 @@
  */
 
 	.section	.text.head
+	.hidden	_data_size
 
 	/*
 	 * Magic "MZ" signature for PE/COFF
@@ -31,7 +32,7 @@ pe_header:
 	.short 	0
 coff_header:
 	.short	0xaa64				// AArch64
-	.short	2				// nr_sections
+	.short	3				// nr_sections
 	.long	0 				// TimeDateStamp
 	.long	0				// PointerToSymbolTable
 	.long	1				// NumberOfSymbols
@@ -44,16 +45,19 @@ optional_header:
 	.short	0x20b				// PE32+ format
 	.byte	0x02				// MajorLinkerVersion
 	.byte	0x14				// MinorLinkerVersion
-	.long	_edata - _start			// SizeOfCode
-	.long	0			// SizeOfInitializedData
+	.long	_etext - _start			// SizeOfCode
+	.long	_data_size			// SizeOfInitializedData
 	.long	0				// SizeOfUninitializedData
 	.long	_start - ImageBase		// AddressOfEntryPoint
 	.long	_start - ImageBase		// BaseOfCode
 
 extra_header_fields:
 	.quad	0				// ImageBase
-	.long	32				// SectionAlignment
-	.long	8				// FileAlignment
+	// Page aligned sections, so that firmware enforcing W^X on images (as
+	// the Qualcomm UEFI of the Radxa Dragon Q8B does) can map .text
+	// read-only/executable and .data writable.
+	.long	4096				// SectionAlignment
+	.long	4096				// FileAlignment
 	.short	0				// MajorOperatingSystemVersion
 	.short	0				// MinorOperatingSystemVersion
 	.short	0				// MajorImageVersion
@@ -117,16 +121,31 @@ section_table:
 	.byte	0
 	.byte	0
 	.byte	0
-	.long	_edata - _start		// VirtualSize
+	.long	_etext - _start		// VirtualSize
 	.long	_start - ImageBase	// VirtualAddress
-	.long	_edata - _start		// SizeOfRawData
+	.long	_etext - _start		// SizeOfRawData
 	.long	_start - ImageBase	// PointerToRawData
 
 	.long	0		// PointerToRelocations (0 for executables)
 	.long	0		// PointerToLineNumbers (0 for executables)
 	.short	0		// NumberOfRelocations  (0 for executables)
 	.short	0		// NumberOfLineNumbers  (0 for executables)
-	.long	0xe0500020	// Characteristics (section flags)
+	.long	0x60000020	// Characteristics: code, execute, read
+
+	.ascii	".data"
+	.byte	0
+	.byte	0
+	.byte	0
+	.long	_data_size		// VirtualSize
+	.long	_etext - ImageBase	// VirtualAddress
+	.long	_data_size		// SizeOfRawData
+	.long	_etext - ImageBase	// PointerToRawData
+
+	.long	0		// PointerToRelocations (0 for executables)
+	.long	0		// PointerToLineNumbers (0 for executables)
+	.short	0		// NumberOfRelocations  (0 for executables)
+	.short	0		// NumberOfLineNumbers  (0 for executables)
+	.long	0xc0000040	// Characteristics: initialized data, read, write
 
 	.align		12
 

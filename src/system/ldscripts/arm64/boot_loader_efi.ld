@@ -11,7 +11,7 @@ SECTIONS
 		*(.gnu.linkonce.t.*)
 		*(.srodata)
 		*(.rodata*)
-		. = ALIGN(16);
+		. = ALIGN(4096);
 	}
 	_etext = .;
 	_text_size = . - _text;
@@ -49,8 +49,9 @@ SECTIONS
 	.rela.got : { *(.rela.got) }
 	.rela.data : { *(.rela.data) *(.rela.data*) }
 
+	. = ALIGN(4096);
 	_edata = .;
-	_data_size = . - _etext;
+	_data_size = ABSOLUTE(_edata - _etext);
 
 	. = ALIGN(4096);
 	.dynsym   : { *(.dynsym) }
