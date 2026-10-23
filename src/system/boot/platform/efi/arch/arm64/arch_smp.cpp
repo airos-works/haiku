@@ -75,6 +75,19 @@ arch_smp_register_cpu(platform_cpu_info** cpu)
 }
 
 
+// Firmware that offers both ACPI and a device tree (the Qualcomm UEFI of the
+// Radxa Dragon Q8B) describes every CPU twice; register each MPIDR once.
+platform_cpu_info*
+arch_smp_find_cpu(uint64 mpidr)
+{
+	for (uint32 i = 0; i < sCpuCount; i++) {
+		if (sCpus[i].mpidr == mpidr)
+			return &sCpus[i];
+	}
+	return NULL;
+}
+
+
 int
 arch_smp_get_current_cpu(void)
 {
@@ -220,20 +233,22 @@ arch_smp_init(void)
 void
 arm64_handle_fdt_cpu_node(const void *fdt, int node)
 {
-	platform_cpu_info* info = NULL;
-	arch_smp_register_cpu(&info);
-	if (info == NULL)
-		return;
-	info->id = sCpuCount - 1;
-
+	uint64 mpidr;
 	int parent = fdt_parent_offset(fdt, node);
 	if (fdt32_to_cpu(*(uint32*)fdt_getprop(fdt, parent,
 		"#address-cells", NULL)) == 1) {
-		info->mpidr = fdt32_to_cpu(*(uint32*)fdt_getprop(fdt, node,
-			"reg", NULL));
+		mpidr = fdt32_to_cpu(*(uint32*)fdt_getprop(fdt, node, "reg", NULL));
 	} else {
-		info->mpidr = fdt64_to_cpu(*(uint64*)fdt_getprop(fdt, node,
-			"reg", NULL));
+		mpidr = fdt64_to_cpu(*(uint64*)fdt_getprop(fdt, node, "reg", NULL));
+	}
+
+	platform_cpu_info* info = arch_smp_find_cpu(mpidr);
+	if (info == NULL) {
+		arch_smp_register_cpu(&info);
+		if (info == NULL)
+			return;
+		info->id = sCpuCount - 1;
+		info->mpidr = mpidr;
 	}
 
 	const char* enableMethod = (const char*)fdt_getprop(fdt, node,
