@@ -284,11 +284,11 @@ PowerPolicy::_Sleep(bool deep, bigtime_t timeout)
 {
 #if defined(__i386__) || defined(__x86_64__)
 	x86_suspend_s2idle_args args = {};
-	// The devices with suspend hooks (USB, NVMe) go to sleep, too. The power
-	// hooks of the legacy drivers (Wi-Fi) only run for a deep sleep: those
-	// drivers take seconds to come back.
+	// The devices with suspend hooks (USB, NVMe) and the legacy drivers'
+	// power hooks (Wi-Fi) go to sleep, too; those for a deep sleep only (the
+	// graphics, which take seconds to come back) wait for one.
 	if (!deep)
-		args.flags = X86_SUSPEND_SKIP_POWER_HOOKS;
+		args.flags = X86_SUSPEND_LIGHT_SLEEP;
 	{
 		BAutolock _(fLock);
 		if (fSleepCheck > 0)

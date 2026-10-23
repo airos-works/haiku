@@ -89,9 +89,8 @@ public:
 		fDeepSleep = new BMenuField("deep sleep",
 			B_TRANSLATE("Sleep deeper after:"), deepMenu);
 		fDeepSleep->SetToolTip(B_TRANSLATE("After the lid has been closed "
-			"this long, wireless networking and the graphics go to sleep, "
-			"too: the battery lasts longer, waking up takes a little "
-			"longer."));
+			"this long, the graphics go to sleep, too: the battery lasts "
+			"longer, waking up takes a little longer."));
 
 		BBox* battery = new BBox("battery");
 		battery->SetLabel(B_TRANSLATE("On battery"));

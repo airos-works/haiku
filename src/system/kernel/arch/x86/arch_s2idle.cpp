@@ -722,6 +722,8 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 		deviceFlags |= DEVICE_MANAGER_SKIP_POWER_HOOKS;
 	if ((flags & X86_SUSPEND_SKIP_DEVICE_TREE) != 0)
 		deviceFlags |= DEVICE_MANAGER_SKIP_DEVICE_TREE;
+	if ((flags & X86_SUSPEND_LIGHT_SLEEP) != 0)
+		deviceFlags |= DEVICE_MANAGER_LIGHT_SLEEP;
 	if ((flags & X86_SUSPEND_SKIP_DEVICES) == 0)
 		device_manager_suspend(ACPI_POWER_STATE_ON, deviceFlags);
 

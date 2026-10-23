@@ -2658,8 +2658,9 @@ struct power_hook : DoublyLinkedListLinkImpl<power_hook> {
 	device_manager_power_hook	hook;
 	void*						cookie;
 	const char*					name;
+	uint32						flags;
 	bool						skipped;
-		// by the "suspend" settings, this time
+		// by the "suspend" settings or a light sleep, this time
 };
 
 typedef DoublyLinkedList<power_hook> PowerHookList;
@@ -2674,6 +2675,18 @@ status_t
 device_manager_add_power_hook(device_manager_power_hook hook, void* cookie,
 	const char* name)
 {
+	return device_manager_add_power_hook_etc(hook, cookie, name, 0);
+}
+
+
+/*!	As device_manager_add_power_hook(); with
+	DEVICE_MANAGER_POWER_HOOK_DEEP_SLEEP the hook is left out of a light
+	sleep.
+*/
+status_t
+device_manager_add_power_hook_etc(device_manager_power_hook hook,
+	void* cookie, const char* name, uint32 flags)
+{
 	power_hook* entry = new(std::nothrow) power_hook;
 	if (entry == NULL)
 		return B_NO_MEMORY;
@@ -2681,6 +2694,7 @@ device_manager_add_power_hook(device_manager_power_hook hook, void* cookie,
 	entry->hook = hook;
 	entry->cookie = cookie;
 	entry->name = name != NULL ? name : "?";
+	entry->flags = flags;
 	entry->skipped = false;
 
 	RecursiveLocker _(sLock);
@@ -2736,6 +2750,10 @@ device_manager_suspend(int32 state, uint32 flags)
 				if (strcmp(parameter.values[j], entry->name) == 0)
 					entry->skipped = true;
 			}
+		}
+		if ((flags & DEVICE_MANAGER_LIGHT_SLEEP) != 0
+			&& (entry->flags & DEVICE_MANAGER_POWER_HOOK_DEEP_SLEEP) != 0) {
+			entry->skipped = true;
 		}
 		if (entry->skipped) {
 			device_manager_suspend_trace("suspend hook %s: skipped",
