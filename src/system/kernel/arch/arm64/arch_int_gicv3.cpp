@@ -6,6 +6,7 @@
 
 #include "arch_int_gicv3.h"
 #include "arch_int_gicv3_its.h"
+#include "arch_int_gicv3_its_generic.h"
 
 #include "debug.h"
 #include "gicv3_regs.h"
@@ -17,6 +18,10 @@
 #include <driver_settings.h>
 #include <new>
 #include <util/AutoLock.h>
+
+extern "C" {
+#include <libfdt.h>
+}
 
 extern void* gFDT;
 
@@ -114,6 +119,9 @@ GICv3InterruptController::GICv3InterruptController(phys_addr_t gicd_phys_addr,
 void
 GICv3InterruptController::_InitIts(phys_addr_t distributor, phys_addr_t redistributor)
 {
+	if (_InitGenericIts(redistributor))
+		return;
+
 	void* settings = load_driver_settings("gicv3_its");
 	if (settings == nullptr)
 		return;
@@ -130,15 +138,65 @@ GICv3InterruptController::_InitIts(phys_addr_t distributor, phys_addr_t redistri
 		dprintf("GICv3 ITS: firmware profile rejected\n");
 		return;
 	}
-	fIts = new(std::nothrow) GICv3Its;
-	if (fIts == nullptr)
+	GICv3Its* its = new(std::nothrow) GICv3Its;
+	if (its == nullptr)
 		return;
-	status_t status = fIts->Init(fGicrBase, fNumCpus, trace, forceHighTables);
+	status_t status = its->Init(fGicrBase, fNumCpus, trace, forceHighTables);
 	if (status != B_OK) {
 		dprintf("GICv3 ITS: initialization rejected/failed: %" B_PRId32 "\n", status);
 		return;
 	}
+	fIts = its;
 	msi_set_interface(fIts);
+}
+
+
+/*!	Sets up the ITSs listed under the GIC's device tree node from scratch, on
+	machines whose firmware leaves LPIs off. Enabled on the SC8280XP so far.
+*/
+bool
+GICv3InterruptController::_InitGenericIts(phys_addr_t redistributor)
+{
+	if (gFDT == NULL || fdt_node_check_compatible(gFDT, 0, "qcom,sc8280xp") != 0)
+		return false;
+	int gic = fdt_node_offset_by_compatible(gFDT, -1, "arm,gic-v3");
+	if (gic < 0)
+		return false;
+
+	phys_addr_t controllers[GICv3ItsGeneric::kMaxControllers];
+	uint32 count = 0;
+	int node;
+	fdt_for_each_subnode(node, gFDT, gic) {
+		if (fdt_node_check_compatible(gFDT, node, "arm,gic-v3-its") != 0
+			|| count == GICv3ItsGeneric::kMaxControllers) {
+			continue;
+		}
+		const char* status = (const char*)fdt_getprop(gFDT, node, "status", NULL);
+		if (status != NULL && strcmp(status, "okay") != 0 && strcmp(status, "ok") != 0)
+			continue;
+		int length;
+		const uint32* reg = (const uint32*)fdt_getprop(gFDT, node, "reg", &length);
+		if (reg == NULL || length < 8)
+			continue;
+		// the GIC node has two address cells, as everywhere it carries an ITS
+		controllers[count++] = ((uint64)fdt32_to_cpu(reg[0]) << 32)
+			| fdt32_to_cpu(reg[1]);
+	}
+	if (count == 0)
+		return false;
+
+	GICv3ItsGeneric* its = new(std::nothrow) GICv3ItsGeneric;
+	if (its == nullptr)
+		return false;
+	status_t status = its->Init(fGicrBase, redistributor, fGicrStride, fNumCpus,
+		controllers, count);
+	if (status != B_OK) {
+		dprintf("GICv3 ITS: generic set-up failed: %" B_PRId32 "\n", status);
+		return false;
+	}
+	fIts = its;
+	msi_set_interface(fIts);
+	return true;
 }
 
 

@@ -24,6 +24,12 @@
 #include <new>
 #include <string.h>
 
+extern "C" {
+#include <libfdt.h>
+}
+
+extern void* gFDT;
+
 
 #define DRIVER_NAME "busses/pci/qcom_pcie/driver_v1"
 #define INTX_MODULE_NAME "busses/pci/qcom_pcie/intx_v1"
@@ -527,23 +533,27 @@ RegisterDevice(device_node* parent)
 	};
 
 	// msi-map = <rid-base &its its-base length>: the ITS device ID of a
-	// function is its-base + RID.
+	// function is its-base + RID. The ITS sits below the GIC, which comes
+	// after the PCIe controllers in the device tree, so its device node may
+	// not exist yet: read its registers from the tree itself.
 	int length;
 	const void* map = fdt->get_prop(device, "msi-map", &length);
-	if (map != NULL && length == 16 && GetCell(map, 0) == 0
+	if (map != NULL && length == 16 && GetCell(map, 0) == 0 && gFDT != NULL
 		&& fdt->get_prop(device, "msi-map-mask", NULL) == NULL) {
-		fdt_bus_module_info* busModule;
-		fdt_bus* bus;
-		uint64 itsBase, itsSize;
-		device_node* itsNode = NULL;
-		fdt_device_module_info* itsModule;
-		fdt_device* itsDevice;
-		if (sDeviceManager->get_driver(fdt->get_bus(device),
-				(driver_module_info**)&busModule, (void**)&bus) == B_OK) {
-			itsNode = busModule->node_by_phandle(bus, GetCell(map, 1));
-		}
-		if (itsNode != NULL && GetFdt(itsNode, &itsModule, &itsDevice)
-			&& itsModule->get_reg(itsDevice, 0, &itsBase, &itsSize)) {
+		int its = fdt_node_offset_by_phandle(gFDT, GetCell(map, 1));
+		int regLength;
+		const uint32* reg = its >= 0
+			? (const uint32*)fdt_getprop(gFDT, its, "reg", &regLength) : NULL;
+		int gic = its >= 0 ? fdt_parent_offset(gFDT, its) : -1;
+		const uint32* cells = gic >= 0
+			? (const uint32*)fdt_getprop(gFDT, gic, "#address-cells", NULL) : NULL;
+		uint32 addressCells = cells != NULL ? fdt32_to_cpu(*cells) : 2;
+		if (reg != NULL && fdt_node_check_compatible(gFDT, its, "arm,gic-v3-its") == 0
+			&& (addressCells == 1 || addressCells == 2)
+			&& regLength >= (int)(addressCells * 4)) {
+			uint64 itsBase = addressCells == 2
+				? ((uint64)fdt32_to_cpu(reg[0]) << 32) | fdt32_to_cpu(reg[1])
+				: fdt32_to_cpu(reg[0]);
 			attrs[3] = { B_PCI_MSI_CONTROLLER_ADDRESS, B_UINT64_TYPE,
 				{.ui64 = itsBase} };
 			attrs[4] = { B_PCI_MSI_REQUESTER_BASE, B_UINT32_TYPE,
