@@ -22,6 +22,7 @@ AddFilesToPackage add-ons kernel busses ata :
 AddFilesToPackage add-ons kernel busses pci :
 	<pci>designware@riscv64
 	<pci>ecam@riscv64,arm,arm64
+	<pci>qcom_pcie@arm64
 	<pci>rk3588_firmware@arm64
 	<pci>x86@x86,x86_64
 	;
@@ -326,6 +327,7 @@ AddBootModuleSymlinksToPackage
 	pci
 	<pci>designware@riscv64
 	<pci>ecam@riscv64,arm,arm64
+	<pci>qcom_pcie@arm64
 	<pci>rk3588_firmware@arm64
 	<pci>x86@x86,x86_64
 	fdt@riscv64,arm,arm64

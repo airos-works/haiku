@@ -1,0 +1,8 @@
+SubDir HAIKU_TOP src add-ons kernel busses pci qcom ;
+
+SubDirC++Flags -fno-rtti ;
+UsePrivateKernelHeaders ;
+
+KernelAddon <pci>qcom_pcie :
+	qcom_pcie.cpp
+;
