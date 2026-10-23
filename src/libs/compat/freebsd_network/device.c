@@ -583,18 +583,45 @@ __haiku_probe_drivers(device_t device, driver_t *drivers[])
 //	#pragma mark - power management
 
 
-/*!	Suspends or resumes the devices attached below all root devices. */
+// the interfaces suspend_resume_devices() took down for the sleep
+static bool sDownForSleep[MAX_DEVICES];
+
+
+/*!	Suspends or resumes the devices attached below all root devices: the
+	interfaces that are up go down for the sleep (that stops the hardware,
+	Wi-Fi firmware included), and come up again after it.
+*/
 void
 suspend_resume_devices(bool resume)
 {
+	if (!resume) {
+		for (int32 i = 0; i < gDeviceCount; i++) {
+			struct ifnet *ifp = gDevices[i];
+			sDownForSleep[i] = false;
+			if (ifp == NULL || ifp->if_ioctl == NULL
+				|| (ifp->flags & DEVICE_CLOSED) != 0
+				|| (ifp->if_flags & IFF_UP) == 0) {
+				continue;
+			}
+
+			// as compat_open(): the drivers sleep with Giant held
+			IFF_LOCKGIANT(ifp);
+			ifp->if_flags &= ~IFF_UP;
+			ifp->if_ioctl(ifp, SIOCSIFFLAGS, NULL);
+			IFF_UNLOCKGIANT(ifp);
+			sDownForSleep[i] = true;
+
+			dprintf("%s: %s down for the sleep\n", gDriverName,
+				ifp->device_name);
+		}
+		return;
+	}
+
 	device_t root = NULL;
 	while ((root = list_get_next_item(&sRootDevices, root)) != NULL) {
 		device_t child = NULL;
 		while ((child = list_get_next_item(&root->children, child)) != NULL) {
 			int error = 0;
-
-			if (!resume)
-				continue;
 
 			dprintf("%s: resuming %s\n", gDriverName,
 				device_get_nameunit(child));
@@ -603,7 +630,7 @@ suspend_resume_devices(bool resume)
 			// LAN, which wakes the machine again right away, and the
 			// device loses power anyway. Resuming reinitializes it
 			// completely.
-			if (resume && child->methods.device_resume != NULL)
+			if (child->methods.device_resume != NULL)
 				error = child->methods.device_resume(child);
 
 			dprintf("%s: resumed %s: %d\n", gDriverName,
@@ -611,28 +638,30 @@ suspend_resume_devices(bool resume)
 		}
 	}
 
-	if (!resume)
-		return;
-
-	// Restart the interfaces the same way they are started when opened:
+	// Start the interfaces again the same way they are started when opened:
 	// resuming alone does not always get the hardware going again.
 	for (int32 i = 0; i < gDeviceCount; i++) {
 		struct ifnet *ifp = gDevices[i];
-		if (ifp == NULL || ifp->if_ioctl == NULL
+		if (!sDownForSleep[i] || ifp == NULL || ifp->if_ioctl == NULL
 			|| (ifp->flags & DEVICE_CLOSED) != 0) {
 			continue;
 		}
+		sDownForSleep[i] = false;
+
+		IFF_LOCKGIANT(ifp);
 
 		struct ifreq request;
-		ifp->if_flags &= ~IFF_UP;
-		ifp->if_ioctl(ifp, SIOCSIFFLAGS, NULL);
 
-		memset(&request, 0, sizeof(request));
-		request.ifr_media = IFM_MAKEWORD(IFM_ETHER, IFM_AUTO, 0, 0);
-		ifp->if_ioctl(ifp, SIOCSIFMEDIA, (caddr_t)&request);
+		if (!HAIKU_DRIVER_REQUIRES(FBSD_WLAN_FEATURE)) {
+			memset(&request, 0, sizeof(request));
+			request.ifr_media = IFM_MAKEWORD(IFM_ETHER, IFM_AUTO, 0, 0);
+			ifp->if_ioctl(ifp, SIOCSIFMEDIA, (caddr_t)&request);
+		}
 
 		ifp->if_flags |= IFF_UP;
 		ifp->if_ioctl(ifp, SIOCSIFFLAGS, NULL);
+
+		IFF_UNLOCKGIANT(ifp);
 
 		dprintf("%s: restarted %s\n", gDriverName, ifp->device_name);
 	}
