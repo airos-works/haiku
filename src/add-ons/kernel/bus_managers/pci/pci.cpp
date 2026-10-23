@@ -3032,15 +3032,17 @@ PCI::SuspendDevice(PCIDev *device, uint8 state)
 	if (!device->config_saved)
 		return B_ERROR;
 
-	SetPowerstate(device, state);
-	if (GetPowerstate(device) != state)
-		return B_ERROR;
-
-	// the function may take 10 ms to get there (PCI PM 1.2 § 5.6.1)
-	if (state == PCI_pm_state_d3)
-		snooze(10000);
-
+	// From here on, ResumeDevice() brings it back, whatever state it is in.
 	device->suspended = true;
+	SetPowerstate(device, state);
+
+	// The function may take 10 ms to get there (PCI PM 1.2 § 5.6.1), and
+	// does not necessarily report the new state before.
+	snooze(10000);
+	if (GetPowerstate(device) != state) {
+		ResumeDevice(device);
+		return B_ERROR;
+	}
 	return B_OK;
 }
 
