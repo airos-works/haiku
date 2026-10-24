@@ -18,9 +18,9 @@
 	it hands the firmware. One open at a time owns the codec; its buffers go
 	when it closes.
 
-	Buffers are physically contiguous, below what the firmware addresses
-	(0xe0000000), cached and coherent with the codec; their device address
-	is what HFI packets name. */
+	Buffers are pages anywhere, which the driver maps for the codec (cached
+	and coherent with it); their device address, below 0x80000000, is what
+	HFI packets name. */
 
 #define QCOM_IRIS_DEVICE		"/dev/video/qcom_iris/0"
 #define QCOM_IRIS_VERSION		1

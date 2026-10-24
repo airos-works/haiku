@@ -1,0 +1,24 @@
+SubDir HAIKU_TOP src add-ons media plugins qcom_video ;
+
+UsePrivateHeaders drivers media shared ;
+
+# sunxi_cedar's parameter set parsers, which say whether a stream is one
+# the codec decodes
+SubDirHdrs $(HAIKU_TOP) src add-ons media plugins sunxi_cedar ;
+
+local architectureObject ;
+for architectureObject in [ MultiArchSubDirSetup ] {
+	on $(architectureObject) {
+		SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src add-ons media plugins
+			sunxi_cedar ] ;
+		Addon [ MultiArchDefaultGristFiles qcom_video ] :
+			bits.c
+			h264_parse.c
+			hevc_parse.c
+			IrisDecoder.cpp
+			IrisDevice.cpp
+			IrisPlugin.cpp
+			: be media [ TargetLibsupc++ ] [ TargetLibstdc++ ]
+		;
+	}
+}

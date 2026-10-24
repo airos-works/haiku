@@ -203,6 +203,12 @@ rule UserBuildConfigRulePreImage
 		fonts = <airos-ci-font>$(fonts:BS) ;
 		SEARCH on $(fonts) = $(AIROS_CI_FONTS) ;
 		AddPackageFilesToHaikuImage system packages : $(fonts) ;
+		# Fontconfig's system configuration, which x86_64 gets from the
+		# fontconfig package: Summit includes it in the configuration it
+		# generates.
+		local fontconfig = <airos-ci-fontconfig>fonts.conf ;
+		SEARCH on $(fontconfig) = [ FDirName $(tree) fonts ] ;
+		AddFilesToHaikuImage system settings fonts : $(fontconfig) ;
 		# FreeType 2.14.3 rather than the repository's bootstrap 2.6.3; the
 		# build system does the rest when the packages are named.
 		if ! [ Glob $(HAIKU_ARM64_FREETYPE_PACKAGES_DIR)

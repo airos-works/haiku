@@ -14,6 +14,19 @@ Application iris_test :
 	iris_test.cpp
 ;
 
+SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src add-ons media plugins qcom_video ] ;
+
+SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) tools cubie-a7s ] ;
+
+SimpleTest media_probe : media_probe.cpp : be media [ TargetLibsupc++ ] ;
+
+Application iris_decode :
+	iris_decode.cpp
+	IrisDecoder.cpp
+	IrisDevice.cpp
+	: be [ TargetLibsupc++ ] [ TargetLibstdc++ ]
+;
+
 Application display_layout :
 	display_layout.cpp
 	: be [ TargetLibsupc++ ]

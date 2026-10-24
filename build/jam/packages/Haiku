@@ -213,6 +213,10 @@ if $(TARGET_ARCH) = arm64 {
 	AddNewDriversToPackage misc :
 		sunxi_ve
 		;
+	# the SC8280XP's video codec (Dragon Q8B) for the qcom_video add-on
+	AddDriversToPackage video :
+		qcom_iris
+		;
 	# the SoC temperature from the firmware, in the thermal drivers' format
 	AddDriversToPackage power :
 		<driver>rpi_thermal
