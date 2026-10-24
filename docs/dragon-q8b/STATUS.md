@@ -31,8 +31,10 @@ table set and a device tree; the kernel prefers the device tree.
   did not submit (generic status 0x0b, as from a zeroed submission entry);
   it is logged and skipped instead of panicking, and the command it took
   the place of times out once.
-- Summit shows only digits of page text on the CI install, with software
-  OpenGL too: a font fallback problem of that build, not the GPU.
+- Summit showed only digits of page text on arm64 CI installs: it includes
+  `/boot/system/settings/fonts/fonts.conf`, which only x86_64's fontconfig
+  package provides, so it found only its emoji fonts. arm64 CI images now
+  ship that file, including the configuration Summit's engine carries.
 
 ## Lab
 
