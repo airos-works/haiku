@@ -180,6 +180,11 @@ test_tone(AudioDevice* device)
 		"stream_only", false, true);
 	unload_driver_settings(settings);
 	TRACE("test tone: starting the graph%s\n", startOnly ? " (no buffers)" : "");
+	// the RX macro takes the codec DMA's samples before the graph runs, as
+	// DAPM powers its path before the trigger in Linux
+	device->codec.EnableHeadphonePath(48000);
+	// the codec's ports and amplifiers, at -9 dB
+	device->codec.EnableHeadphones(6);
 	snooze(100000);
 	status_t status = device->playback.Start(startDevice);
 	TRACE("test tone: graph start: %s\n", strerror(status));
@@ -257,6 +262,8 @@ test_tone(AudioDevice* device)
 	bigtime_t elapsed = system_time() - start;
 	int32 done = device->doneCount;
 	device->playback.Stop();
+	device->codec.DisableHeadphones();
+	device->codec.DisableHeadphonePath();
 	TRACE("test tone: %" B_PRId32 " buffers of %" B_PRIu32 " frames played in %"
 		B_PRId64 " us: %" B_PRId64 " frames a second\n", done, kBufferFrames,
 		elapsed, elapsed > 0 ? (int64)done * kBufferFrames * 1000000 / elapsed
