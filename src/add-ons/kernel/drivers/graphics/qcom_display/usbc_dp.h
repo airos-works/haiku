@@ -15,13 +15,16 @@ namespace qcom {
 
 
 class DisplayPort;
+struct usbc_connector;
 
 
-/*!	DisplayPort over USB-C connector 0 of the SC8280XP (DP0, its QMP USB43DP
-	combo PHY, the PI3USB102 SBU mux), and a second DPU path to it: VIG0,
-	LM_0, CTL_0 and INTF_0, made from the path the firmware lit for the
-	HDMI output (VIG2, LM_2, CTL_2, INTF_6), with its timing and format, on
-	another region of the frame buffer (docs/dragon-q8b/USB-C-DISPLAYPORT.md).
+/*!	DisplayPort over a USB-C connector of the SC8280XP (connector 0: DP0,
+	connector 1: DP1; each with its QMP USB43DP combo PHY and PI3USB102 SBU
+	mux), and a DPU path to it (connector 0: VIG0, LM_0, CTL_0, INTF_0;
+	connector 1: VIG1, LM_1, CTL_1, INTF_4) made from the path the firmware
+	lit for the HDMI output (VIG2, LM_2, CTL_2, INTF_6), with its timing and
+	format, on another region of the frame buffer
+	(docs/dragon-q8b/USB-C-DISPLAYPORT.md).
 
 	PowerUp() brings the PHY up in DisplayPort mode at RBR (four lanes, the
 	normal orientation), DP0's link, AUX and pixel clocks and its AUX
@@ -34,7 +37,7 @@ class DisplayPort;
 */
 class UsbcDisplayPort {
 public:
-								UsbcDisplayPort();
+								UsbcDisplayPort(uint32 connector);
 								~UsbcDisplayPort();
 
 			status_t			PowerUp();
@@ -69,6 +72,11 @@ private:
 			void				_Link(const display_timing& timing,
 									bool wideBus);
 
+			const usbc_connector& fConnector;
+			uint32				fMixerBase;
+			uint32				fControlBase;
+			uint32				fLayer;			// CTL_LAYER(lm)
+			uint32				fLayerExt;		// CTL_LAYER_EXT(lm)
 			area_id				fGccArea;
 			volatile uint8*		fGcc;
 			area_id				fDispccArea;

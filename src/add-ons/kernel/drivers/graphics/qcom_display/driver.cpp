@@ -50,6 +50,7 @@
 
 // what a headless output stands for
 static const uint16 kVirtualWidth = 1920;
+static const uint32 kUsbcConnectors = 2;
 static const uint16 kVirtualHeight = 1080;
 
 // MDSS 0's interrupt (SPI 83) when the device tree names none
@@ -79,9 +80,10 @@ struct display_info {
 
 	qcom::Dpu*		dpu;			// NULL: nothing to show on
 	qcom::DisplayPort* port;		// the DisplayPort controller it feeds
-	qcom::UsbcDisplayPort* usbc;	// USB-C connector 0, output 1
-	bool			usbcRunning;
-	bool			usbcForced;
+	// the USB-C connectors, outputs 1 and 2
+	qcom::UsbcDisplayPort* usbc[kUsbcConnectors];
+	bool			usbcRunning[kUsbcConnectors];
+	bool			usbcForced[kUsbcConnectors];
 	qcom_usbc_ports_module_info* usbcPorts;
 	thread_id		hotPlugThread;
 	volatile bool	quit;
@@ -190,8 +192,8 @@ virtual_timing()
 //	#pragma mark - outputs
 
 
-static bool usbc_forced();
-static status_t connect_usbc(display_info* info);
+static bool usbc_forced(uint32 connector);
+static status_t connect_usbc(display_info* info, uint32 connector);
 
 
 static void
@@ -274,55 +276,61 @@ init_outputs(display_info* info)
 			output.native_width, output.native_height);
 	}
 
-	// USB-C connector 0 as output 1, connected when the ADSP reports a
-	// DisplayPort sink on it (hot_plug_thread()). Its link is not trained
-	// and its mainlink sends nothing yet (that needs a monitor): it shows the
-	// HDMI output's mode, scanning its region out to nowhere. The lab's
-	// "usbc_dp0 forced" has it connected from the start.
+	// the USB-C connectors as outputs 1 and 2, connected when the ADSP
+	// reports a DisplayPort sink on them (hot_plug_thread()): they show the
+	// HDMI output's mode, trained to the sink if one answers. The lab's
+	// "usbc_dp0 forced" ("usbc_dp1 ...") has one connected from the start.
 	if (info->dpu == NULL || info->dpu->Interface() != 6)
 		return;
-	qcom_display_output& usbc = shared.outputs[1];
-	usbc = output;
-	usbc.id = QCOM_DISPLAY_OUTPUT_DP0;
-	usbc.flags = 0;
-	usbc.edid_length = 0;
-	shared.output_count = 2;
-	info->usbcForced = usbc_forced();
-	if (info->usbcForced && connect_usbc(info) == B_OK) {
-		INFO("DP-1: forced on as output 1, %ux%u\n", usbc.native_width,
-			usbc.native_height);
+	static const uint32 kIds[] = {QCOM_DISPLAY_OUTPUT_DP0,
+		QCOM_DISPLAY_OUTPUT_DP1};
+	for (uint32 connector = 0; connector < kUsbcConnectors; connector++) {
+		qcom_display_output& usbc = shared.outputs[1 + connector];
+		usbc = output;
+		usbc.id = kIds[connector];
+		usbc.flags = 0;
+		usbc.edid_length = 0;
+		info->usbcForced[connector] = usbc_forced(connector);
+		if (info->usbcForced[connector]
+			&& connect_usbc(info, connector) == B_OK) {
+			INFO("DP-%" B_PRIu32 ": forced on as output %" B_PRIu32 ", %ux%u\n",
+				connector + 1, connector + 1, usbc.native_width,
+				usbc.native_height);
+		}
 	}
+	shared.output_count = 1 + kUsbcConnectors;
 }
 
 
-/*!	Powers USB-C connector 0's DisplayPort up and marks output 1 connected.
-	The caller holds the lock, or nobody else runs yet. */
+/*!	Powers a USB-C connector's DisplayPort up and marks its output
+	connected. The caller holds the lock, or nobody else runs yet. */
 static status_t
-connect_usbc(display_info* info)
+connect_usbc(display_info* info, uint32 connector)
 {
-	if (info->usbc == NULL) {
-		info->usbc = new(std::nothrow) qcom::UsbcDisplayPort;
-		if (info->usbc == NULL)
+	if (info->usbc[connector] == NULL) {
+		qcom::UsbcDisplayPort* usbc
+			= new(std::nothrow) qcom::UsbcDisplayPort(connector);
+		if (usbc == NULL)
 			return B_NO_MEMORY;
-		status_t status = info->usbc->PowerUp();
+		status_t status = usbc->PowerUp();
 		if (status != B_OK) {
-			delete info->usbc;
-			info->usbc = NULL;
+			delete usbc;
 			return status;
 		}
+		info->usbc[connector] = usbc;
 	}
-	info->shared->outputs[1].flags |= QCOM_DISPLAY_OUTPUT_CONNECTED;
+	info->shared->outputs[1 + connector].flags |= QCOM_DISPLAY_OUTPUT_CONNECTED;
 	return B_OK;
 }
 
 
 static void
-disconnect_usbc(display_info* info)
+disconnect_usbc(display_info* info, uint32 connector)
 {
-	if (info->usbcRunning)
-		info->usbc->Stop();
-	info->usbcRunning = false;
-	info->shared->outputs[1].flags = 0;
+	if (info->usbcRunning[connector])
+		info->usbc[connector]->Stop();
+	info->usbcRunning[connector] = false;
+	info->shared->outputs[1 + connector].flags = 0;
 }
 
 
@@ -336,51 +344,59 @@ notify_change(display_info* info)
 }
 
 
-/*!	Follows the ADSP's reports on USB-C port 0 (qcom_adsp's
+/*!	Follows the ADSP's reports on the USB-C ports (qcom_adsp's
 	qcom_usbc_ports module): a DisplayPort sink with its hot plug detect up
-	connects output 1, anything else disconnects it; app_server is told. */
+	connects the port's output, anything else disconnects it; app_server is
+	told. */
 static status_t
 hot_plug_thread(void* data)
 {
 	display_info* info = (display_info*)data;
-	uint32 generation = 0;
+	uint32 generations[kUsbcConnectors] = {};
 	while (!info->quit) {
 		snooze(300000);
-		qcom_usbc_port port;
-		if (info->usbcPorts->get_port(0, &port) != B_OK
-			|| port.generation == generation)
-			continue;
-		generation = port.generation;
-		bool sink = port.display_port && port.hpd;
-		MutexLocker locker(info->lock);
-		bool connected = (info->shared->outputs[1].flags
-			& QCOM_DISPLAY_OUTPUT_CONNECTED) != 0;
-		if (sink && !connected) {
-			status_t status = connect_usbc(info);
-			INFO("DP-1: a DisplayPort sink on USB-C port 0 (pin assignment %u,"
-				" orientation %u): %s\n", port.pin_assignment, port.orientation,
-				status == B_OK ? "connected" : strerror(status));
-			if (status == B_OK)
+		for (uint32 connector = 0; connector < kUsbcConnectors; connector++) {
+			qcom_usbc_port port;
+			if (info->usbcPorts->get_port(connector, &port) != B_OK
+				|| port.generation == generations[connector])
+				continue;
+			generations[connector] = port.generation;
+			bool sink = port.display_port && port.hpd;
+			MutexLocker locker(info->lock);
+			bool connected = (info->shared->outputs[1 + connector].flags
+				& QCOM_DISPLAY_OUTPUT_CONNECTED) != 0;
+			if (sink && !connected) {
+				status_t status = connect_usbc(info, connector);
+				INFO("DP-%" B_PRIu32 ": a DisplayPort sink on USB-C port %"
+					B_PRIu32 " (pin assignment %u, orientation %u): %s\n",
+					connector + 1, connector, port.pin_assignment,
+					port.orientation,
+					status == B_OK ? "connected" : strerror(status));
+				if (status == B_OK)
+					notify_change(info);
+			} else if (!sink && connected && !info->usbcForced[connector]) {
+				disconnect_usbc(info, connector);
+				INFO("DP-%" B_PRIu32 ": the sink on USB-C port %" B_PRIu32
+					" is gone\n", connector + 1, connector);
 				notify_change(info);
-		} else if (!sink && connected && !info->usbcForced) {
-			disconnect_usbc(info);
-			INFO("DP-1: the sink on USB-C port 0 is gone\n");
-			notify_change(info);
+			}
 		}
 	}
 	return B_OK;
 }
 
 
-/*!	Whether the driver settings ask for USB-C connector 0 without a
-	monitor (lab: "usbc_dp0 forced"). */
+/*!	Whether the driver settings ask for a USB-C connector without a
+	monitor (lab: "usbc_dp0 forced", "usbc_dp1 forced"). */
 static bool
-usbc_forced()
+usbc_forced(uint32 connector)
 {
 	void* handle = load_driver_settings("qcom_display");
 	if (handle == NULL)
 		return false;
-	const char* value = get_driver_parameter(handle, "usbc_dp0", "", "");
+	char name[16];
+	snprintf(name, sizeof(name), "usbc_dp%" B_PRIu32, connector);
+	const char* value = get_driver_parameter(handle, name, "", "");
 	bool forced = strcmp(value, "forced") == 0;
 	unload_driver_settings(handle);
 	return forced;
@@ -398,35 +414,37 @@ has_layout(display_info* info)
 
 
 static void
-update_usbc_scanout(display_info* info)
+update_usbc_scanout(display_info* info, uint32 connector)
 {
 	const qcom_display_shared_info& shared = *info->shared;
-	if (info->usbc == NULL || shared.output_count < 2)
+	qcom::UsbcDisplayPort* usbc = info->usbc[connector];
+	if (usbc == NULL || shared.output_count < 2 + connector)
 		return;
-	const qcom_display_output& output = shared.outputs[1];
+	const qcom_display_output& output = shared.outputs[1 + connector];
 	if ((output.flags & QCOM_DISPLAY_OUTPUT_ENABLED) == 0
 		|| shared.bytes_per_row == 0) {
-		if (info->usbcRunning)
-			info->usbc->Stop();
-		info->usbcRunning = false;
+		if (info->usbcRunning[connector])
+			usbc->Stop();
+		info->usbcRunning[connector] = false;
 		return;
 	}
 	phys_addr_t address = info->bufferAddress
 		+ (phys_addr_t)output.y * shared.bytes_per_row + output.x * 4;
-	status_t status = info->usbcRunning
-		? info->usbc->SetScanout(address, shared.bytes_per_row, output.width,
+	status_t status = info->usbcRunning[connector]
+		? usbc->SetScanout(address, shared.bytes_per_row, output.width,
 			output.height)
-		: info->usbc->Start(address, shared.bytes_per_row, output.width,
+		: usbc->Start(address, shared.bytes_per_row, output.width,
 			output.height, info->dpu->Timing(), info->dpu->WideBus());
 	if (status == B_OK) {
-		INFO("DP-1: scans out %ux%u at %" B_PRId32 ",%" B_PRId32 " (%#"
-			B_PRIxPHYSADDR ", frame buffer %#" B_PRIxPHYSADDR ")\n",
-			output.width, output.height, output.x, output.y, address,
-			info->bufferAddress);
-		info->usbcRunning = true;
+		INFO("DP-%" B_PRIu32 ": scans out %ux%u at %" B_PRId32 ",%" B_PRId32
+			" (%#" B_PRIxPHYSADDR ", frame buffer %#" B_PRIxPHYSADDR ")\n",
+			connector + 1, output.width, output.height, output.x, output.y,
+			address, info->bufferAddress);
+		info->usbcRunning[connector] = true;
 	} else {
-		ERROR("DP-1: cannot show %ux%u at %" B_PRId32 ",%" B_PRId32 ": %s\n",
-			output.width, output.height, output.x, output.y, strerror(status));
+		ERROR("DP-%" B_PRIu32 ": cannot show %ux%u at %" B_PRId32 ",%" B_PRId32
+			": %s\n", connector + 1, output.width, output.height, output.x,
+			output.y, strerror(status));
 	}
 }
 
@@ -434,7 +452,8 @@ update_usbc_scanout(display_info* info)
 static void
 update_scanout(display_info* info)
 {
-	update_usbc_scanout(info);
+	for (uint32 connector = 0; connector < kUsbcConnectors; connector++)
+		update_usbc_scanout(info, connector);
 	if (info->dpu == NULL || !has_layout(info))
 		return;
 	const qcom_display_shared_info& shared = *info->shared;
@@ -797,7 +816,8 @@ display_init_device(void* _info, void** _cookie)
 	status_t status = ensure_buffer(info, width * 4 * height);
 	if (status != B_OK) {
 		ERROR("no memory for the frame buffer: %s\n", strerror(status));
-		delete info->usbc;
+		for (qcom::UsbcDisplayPort* usbc : info->usbc)
+			delete usbc;
 		delete info->port;
 		delete info->dpu;
 		delete_area(info->sharedArea);
@@ -836,7 +856,8 @@ display_uninit_device(void* cookie)
 	}
 	if (info->usbcPorts != NULL)
 		put_module(QCOM_USBC_PORTS_MODULE_NAME);
-	delete info->usbc;
+	for (qcom::UsbcDisplayPort* usbc : info->usbc)
+		delete usbc;
 	delete info->port;
 	delete info->dpu;
 	mutex_destroy(&info->lock);

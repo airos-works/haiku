@@ -1,5 +1,7 @@
 # DisplayPort over the Dragon Q8B's USB-C ports
 
+Both connectors are outputs of `qcom_display` now: connector 0 is DP-1 (output 1: VIG0, LM_0, CTL_0, INTF_0), connector 1 is DP-2 (output 2: VIG1, LM_1, CTL_1, INTF_4), each hot plugged on its port's reports. With both forced on (`usbc_dp0 forced`, `usbc_dp1 forced`) app_server shows three displays (5760x1080) and both paths run without underruns; a simulated report on port 1 (`simulate_dp_report 1`) adds DP-2 and takes it away again.
+
 What a second (and third) display needs, what is already proven on the board without a monitor, and what is left. The HDMI output (DP2 through the CH7218A bridge) is the firmware's trained link and does not need any of this.
 
 ## The chain, per USB-C connector
