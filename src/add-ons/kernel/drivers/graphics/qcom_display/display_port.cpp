@@ -562,6 +562,23 @@ DisplayPort::ReadDpcd(uint32 address, uint8* buffer, size_t size)
 	the base block and, when it names one, the first extension.
 */
 status_t
+DisplayPort::WriteDpcd(uint32 address, const uint8* buffer, size_t size)
+{
+	while (size > 0) {
+		size_t chunk = size > 16 ? 16 : size;
+		status_t status = _Transfer(true, false, address, (uint8*)buffer,
+			chunk, true);
+		if (status != B_OK)
+			return status;
+		address += chunk;
+		buffer += chunk;
+		size -= chunk;
+	}
+	return B_OK;
+}
+
+
+status_t
 DisplayPort::ReadEdid(uint8* edid, uint32* _length)
 {
 	uint32 length = 0;
