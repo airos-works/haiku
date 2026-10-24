@@ -1231,9 +1231,21 @@ unsigned int nvme_qpair_poll(struct nvme_qpair *qpair,
 		if (tr->active) {
 			nvme_qpair_complete_tracker(qpair, tr, cpl, true);
 		} else {
+#ifdef __HAIKU__
+			// Seen now and then on the Dragon Q8B's first reads at boot.
+			// As Linux does, report the entry and go on: at worst the
+			// command it should have completed times out, where a panic
+			// stops the boot.
+			nvme_crit("qpair %u: completion at %u (phase %u) for command %u,"
+				" which is not outstanding: sqid %u sqhd %u status %#x"
+				" cdw0 %#x\n", qpair->id, qpair->cq_head, qpair->phase,
+				cpl->cid, cpl->sqid, cpl->sqhd,
+				((volatile uint16_t*)cpl)[7], cpl->cdw0);
+#else
 			nvme_info("cpl does not map to outstanding cmd\n");
 			nvme_qpair_print_completion(qpair, cpl);
 			nvme_panic("received completion for unknown cmd\n");
+#endif
 		}
 
 		if (++qpair->cq_head == qpair->entries) {
