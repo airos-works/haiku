@@ -356,6 +356,13 @@ static void nvme_qpair_submit_tracker(struct nvme_qpair *qpair,
 
 	qpair->tr[tr->cid].active = true;
 	nvme_qpair_copy_command(&qpair->cmd[qpair->sq_tail], &req->cmd);
+#if defined(NVME_HAIKU_NONCOHERENT_DMA)
+	if (!qpair->sq_in_cmb) {
+		nvme_dma_clean_alias(qpair->cmd_bus_addr
+			+ qpair->sq_tail * sizeof(struct nvme_cmd),
+			sizeof(struct nvme_cmd));
+	}
+#endif
 
 	if (++qpair->sq_tail == qpair->entries)
 		qpair->sq_tail = 0;
@@ -567,7 +574,11 @@ static int nvme_qpair_build_dma_request(struct nvme_qpair *qpair,
 		req->cmd.dptr.prp.prp2 = tr->prp_sgl_bus_addr;
 		for (uint32_t page = 1; page < pages; page++)
 			tr->u.prp[page - 1] = address + page * PAGE_SIZE;
+		nvme_dma_clean_alias(tr->prp_sgl_bus_addr,
+			(pages - 1) * sizeof(uint64_t));
 	}
+	if (operation == NVME_DMA_FROM_HOST)
+		nvme_dma_clean_alias(address, req->payload_size);
 	return 0;
 }
 #endif

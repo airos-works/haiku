@@ -21,6 +21,12 @@ enum nvme_dma_copy {
 struct nvme_request;
 int nvme_dma_copy_payload(const struct nvme_request* request, void* buffer,
 	enum nvme_dma_copy operation);
+// What the CPU wrote through the noncached mapping, for the controller to
+// read: the cached linear map's lines of it cleaned and invalidated. A
+// cache-coherent PCIe (the SC8280XP's) answers the controller's reads from
+// a stale line the linear map left there by speculation, which then reads
+// a zeroed submission entry.
+void nvme_dma_clean_alias(uint64_t physical, size_t size);
 #endif
 
 #endif

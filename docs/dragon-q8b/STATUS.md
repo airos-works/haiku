@@ -29,10 +29,12 @@ table set and a device tree; the kernel prefers the device tree.
   restart.
 - Each process gets an 8 GiB window of the one GPU address space (no
   per-process GPU page tables yet).
-- NVMe: now and then, at boot, the controller completes a command the host
-  did not submit (generic status 0x0b, as from a zeroed submission entry);
-  it is logged and skipped instead of panicking, and the command it took
-  the place of times out once.
+- NVMe: now and then (2 of 109 logged boots) the controller completed a
+  zeroed submission entry while the slot held the real command: arm64's
+  NVMe DMA memory is noncached, the cached linear map's stale line of it
+  answered the controller's read on the Dragon's cache-coherent PCIe. The
+  driver now cleans those lines before the doorbell; whether that ends it
+  takes more boots to tell (the entry is still logged and skipped).
 - Summit showed only digits of page text on arm64 CI installs: it includes
   `/boot/system/settings/fonts/fonts.conf`, which only x86_64's fontconfig
   package provides, so it found only its emoji fonts. arm64 CI images now
