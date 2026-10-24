@@ -29,6 +29,7 @@
 #include <vm/vm.h>
 
 #include <libfdt.h>
+#include <sys/stat.h>
 
 #include "a690_tables.h"
 #include "adreno_private.h"
@@ -363,6 +364,21 @@ public:
 		memory_full_barrier();
 	}
 
+	/*!	The physical address \a address maps to, for the fault dump. */
+	bool Translate(uint64 address, phys_addr_t& physical)
+	{
+		uint64* level2 = FindTable(fLevel1, (address >> 30) & 511);
+		uint64* level3 = level2 != NULL
+			? FindTable(level2, (address >> 21) & 511) : NULL;
+		if (level3 == NULL)
+			return false;
+		uint64 entry = level3[(address >> 12) & 511];
+		if ((entry & PTE_VALID) == 0)
+			return false;
+		physical = (entry & PTE_ADDRESS_MASK) | (address & (B_PAGE_SIZE - 1));
+		return true;
+	}
+
 private:
 	uint64* FindTable(uint64* table, uint32 index)
 	{
@@ -541,14 +557,31 @@ struct gmu_buffer {
 static gmu_buffer sIcache, sDummy, sDebug, sLog, sHfi;
 
 
+static const char* kFirmwareDirectories[] = {
+	"/boot/system/non-packaged/data/firmware",
+	"/boot/system/data/firmware",
+};
+
+
+static bool
+firmware_present(const char* name)
+{
+	for (size_t i = 0; i < B_COUNT_OF(kFirmwareDirectories); i++) {
+		char path[B_PATH_NAME_LENGTH];
+		snprintf(path, sizeof(path), "%s/%s", kFirmwareDirectories[i], name);
+		struct stat st;
+		if (stat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0)
+			return true;
+	}
+	return false;
+}
+
+
 static void*
 load_firmware(const char* name, size_t* _size)
 {
-	static const char* kDirectories[] = {
-		"/boot/system/non-packaged/data/firmware",
-		"/boot/system/data/firmware",
-	};
-	for (size_t i = 0; i < B_COUNT_OF(kDirectories); i++) {
+	const char** kDirectories = kFirmwareDirectories;
+	for (size_t i = 0; i < B_COUNT_OF(kFirmwareDirectories); i++) {
 		char path[B_PATH_NAME_LENGTH];
 		snprintf(path, sizeof(path), "%s/%s", kDirectories[i], name);
 		int fd = open(path, O_RDONLY);
@@ -1488,6 +1521,23 @@ zap_shader_load()
 #define  INT_UCHE_OOB_ACCESS	(1u << 24)
 #define GPU_INT_MASK			(INT_CP_AHB_ERROR | INT_CP_HW_ERROR \
 	| INT_CP_CACHE_FLUSH_TS | INT_RBBM_HANG_DETECT | INT_UCHE_OOB_ACCESS)
+// what a CP_HW_ERROR was (a6xx.xml: A6XX_CP_INT)
+#define CP_HW_FAULT				0x00821
+#define CP_INTERRUPT_STATUS		0x00823
+#define CP_PROTECT_STATUS		0x00824
+#define CP_RB_RPTR				0x00806
+#define CP_RB_WPTR				0x00807
+#define CP_SQE_STAT_ADDR		0x00908
+#define CP_SQE_STAT_DATA		0x00909
+#define CP_IB1_BASE				0x00928
+#define CP_IB1_REM_SIZE			0x0092a
+#define CP_IB2_BASE				0x0092b
+#define CP_IB2_REM_SIZE			0x0092d
+#define  CP_INT_OPCODE_ERROR	(1u << 0)
+#define  CP_INT_UCODE_ERROR		(1u << 1)
+#define  CP_INT_HW_FAULT		(1u << 2)
+#define  CP_INT_PROTECTION		(1u << 4)
+#define  CP_INT_ILLEGAL_INSTR	(1u << 7)
 #define GMU_ALWAYS_ON_COUNTER_L	0x1f888
 #define GMU_ALWAYS_ON_COUNTER_H	0x1f889
 
@@ -1786,6 +1836,73 @@ static uint32 sInterrupt;
 static bool sInterruptInstalled;
 static int32 sFaults;
 
+// the first fault's state, dumped by a thread (the interrupt handler cannot
+// map memory)
+static sem_id sFaultSemaphore = -1;
+static uint64 sFaultIb1;
+static uint32 sFaultIb1Left;
+static uint32 sFaultRptr;
+
+
+static void
+dump_gpu_words(const char* what, uint64 iova, int32 count)
+{
+	for (int32 i = 0; i < count; i += 4) {
+		uint32 words[4] = {};
+		for (int32 j = 0; j < 4; j++) {
+			phys_addr_t physical;
+			if (!sGpuSpace.Translate(iova + (i + j) * 4, physical)
+				|| vm_memcpy_from_physical(&words[j], physical, 4, false)
+					!= B_OK) {
+				words[j] = 0xdeaddead;
+			}
+		}
+		dprintf("adreno: %s %#" B_PRIx64 ": %08" B_PRIx32 " %08" B_PRIx32
+			" %08" B_PRIx32 " %08" B_PRIx32 "\n", what, iova + i * 4, words[0],
+			words[1], words[2], words[3]);
+	}
+}
+
+
+/*!	Where the CP was at the first fault: the ring's last indirect buffers
+	and the words around the fetch point of the one it ran.
+*/
+static status_t
+fault_dumper(void*)
+{
+	if (acquire_sem(sFaultSemaphore) != B_OK)
+		return B_OK;
+	uint32 size = RING_SIZE / 4;
+	uint32* ring = (uint32*)sRing.virt;
+	uint32 ibSize = 0;
+	dprintf("adreno: fault: IB1 %#" B_PRIx64 ", %#" B_PRIx32 " dwords left, "
+		"ring read pointer %#" B_PRIx32 "\n", sFaultIb1, sFaultIb1Left,
+		sFaultRptr);
+	// the CP_INDIRECT_BUFFER packets before the read pointer
+	for (uint32 back = 1; back < 256; back++) {
+		uint32 index = (sFaultRptr - back) & (size - 1);
+		if ((ring[index] >> 28) != 7 || ((ring[index] >> 16) & 0x7f) != 0x3f)
+			continue;
+		uint64 base = ring[(index + 1) & (size - 1)]
+			| (uint64)ring[(index + 2) & (size - 1)] << 32;
+		uint32 dwords = ring[(index + 3) & (size - 1)] & 0xfffff;
+		dprintf("adreno: fault: ring %#" B_PRIx32 ": IB %#" B_PRIx64 ", %#"
+			B_PRIx32 " dwords\n", index, base, dwords);
+		if (base == sFaultIb1 && ibSize == 0)
+			ibSize = dwords;
+	}
+	uint64 fetch = sFaultIb1;
+	if (ibSize != 0 && sFaultIb1Left <= ibSize)
+		fetch += (uint64)(ibSize - sFaultIb1Left) * 4;
+	dump_gpu_words("IB", fetch, 16);
+	phys_addr_t physical = 0;
+	sGpuSpace.Translate(fetch, physical);
+	dprintf("adreno: fault: the GPU's page is at %#" B_PRIxPHYSADDR "\n",
+		physical);
+	adreno_dump_buffer(fetch, 16);
+	return B_OK;
+}
+
 
 static int32
 gpu_interrupt(void*)
@@ -1796,9 +1913,50 @@ gpu_interrupt(void*)
 	gpu_write(RBBM_INT_CLEAR_CMD, status);
 
 	if ((status & ~INT_CP_CACHE_FLUSH_TS) != 0) {
-		atomic_add(&sFaults, 1);
-		dprintf("adreno: GPU interrupt %#" B_PRIx32 ", RBBM status %#" B_PRIx32
-			"\n", status, gpu_read(REG_A6XX_RBBM_STATUS));
+		int32 faults = atomic_add(&sFaults, 1);
+		// the first few in detail, as a6xx_cp_hw_err_irq() reports them
+		if (faults < 4) {
+			dprintf("adreno: GPU interrupt %#" B_PRIx32 ", RBBM status %#"
+				B_PRIx32 ", ring %#" B_PRIx32 "/%#" B_PRIx32 ", IB1 %#" B_PRIx32
+				" (%#" B_PRIx32 " left), IB2 %#" B_PRIx32 " (%#" B_PRIx32
+				" left)\n", status, gpu_read(REG_A6XX_RBBM_STATUS),
+				gpu_read(CP_RB_RPTR), gpu_read(CP_RB_WPTR),
+				gpu_read(CP_IB1_BASE), gpu_read(CP_IB1_REM_SIZE),
+				gpu_read(CP_IB2_BASE), gpu_read(CP_IB2_REM_SIZE));
+		}
+		if (faults == 0 && sFaultSemaphore >= 0) {
+			sFaultIb1 = gpu_read(CP_IB1_BASE)
+				| (uint64)gpu_read(CP_IB1_BASE + 1) << 32;
+			sFaultIb1Left = gpu_read(CP_IB1_REM_SIZE);
+			sFaultRptr = gpu_read(CP_RB_RPTR);
+			release_sem_etc(sFaultSemaphore, 1, B_DO_NOT_RESCHEDULE);
+		}
+		if (faults < 4 && (status & INT_CP_HW_ERROR) != 0) {
+			uint32 cp = gpu_read(CP_INTERRUPT_STATUS);
+			if ((cp & CP_INT_OPCODE_ERROR) != 0) {
+				gpu_write(CP_SQE_STAT_ADDR, 1);
+				dprintf("adreno: CP opcode error, opcode %#" B_PRIx32 "\n",
+					gpu_read(CP_SQE_STAT_DATA));
+			}
+			if ((cp & CP_INT_UCODE_ERROR) != 0)
+				dprintf("adreno: CP microcode error\n");
+			if ((cp & CP_INT_HW_FAULT) != 0) {
+				dprintf("adreno: CP hardware fault %#" B_PRIx32 "\n",
+					gpu_read(CP_HW_FAULT));
+			}
+			if ((cp & CP_INT_PROTECTION) != 0) {
+				uint32 protect = gpu_read(CP_PROTECT_STATUS);
+				dprintf("adreno: CP protected register %s at %#" B_PRIx32
+					" (status %#" B_PRIx32 ")\n",
+					(protect & (1u << 20)) != 0 ? "read" : "write",
+					protect & 0x3ffff, protect);
+			}
+			if ((cp & CP_INT_ILLEGAL_INSTR) != 0)
+				dprintf("adreno: CP illegal instruction\n");
+			if (cp == 0)
+				dprintf("adreno: CP interrupt status 0\n");
+		} else if (faults == 4)
+			dprintf("adreno: more GPU faults, not logged\n");
 	}
 	if ((status & INT_CP_CACHE_FLUSH_TS) != 0)
 		sFenceCondition.NotifyAll();
@@ -1909,6 +2067,13 @@ bring_up()
 		return status;
 
 	gpu_write(RBBM_INT_CLEAR_CMD, 0xffffffff);
+	sFaultSemaphore = create_sem(0, "adreno fault");
+	if (sFaultSemaphore >= 0) {
+		thread_id dumper = spawn_kernel_thread(fault_dumper, "adreno fault",
+			B_NORMAL_PRIORITY, NULL);
+		if (dumper >= 0)
+			resume_thread(dumper);
+	}
 	status = install_io_interrupt_handler(sInterrupt, gpu_interrupt, NULL, 0);
 	if (status != B_OK)
 		return status;
@@ -1926,6 +2091,14 @@ adreno_gpu_start()
 {
 	MutexLocker locker(sStartLock);
 	if (sStartStatus == B_NO_INIT) {
+		// without its firmware nothing is touched, and a later request
+		// tries again (the boot may not have put it in place yet)
+		static const char* kFirmware[] = {"qcom/a660_gmu.bin",
+			"qcom/a660_sqe.fw", "qcom/sc8280xp/qcdxkmsuc8280.mbn"};
+		for (size_t i = 0; i < B_COUNT_OF(kFirmware); i++) {
+			if (!firmware_present(kFirmware[i]))
+				return B_ENTRY_NOT_FOUND;
+		}
 		sStartStatus = bring_up();
 		if (sStartStatus != B_OK)
 			ERROR("bring-up failed: %s\n", strerror(sStartStatus));

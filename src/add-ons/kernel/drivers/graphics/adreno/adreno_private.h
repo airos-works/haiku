@@ -92,5 +92,8 @@ uint32		adreno_faults();
 
 uint32		adreno_pkt7(uint32 opcode, uint32 count);
 
+// adreno_drm.cpp: the buffers at an address and their words, for a fault
+void		adreno_dump_buffer(uint64 iova, int32 count);
+
 
 #endif	// ADRENO_PRIVATE_H

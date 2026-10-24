@@ -54,9 +54,9 @@ link_gpu_user_land()
 ls /dev/graphics/amdgpu_drm_* > /dev/null 2>&1
 link_gpu_user_land /boot/system/non-packaged/amdgpu $?
 
-# The Dragon Q8B's (arm64): Turnip, libvulkan.so.1, the GPU firmware and
-# zink's EGL vendor library, whose vendor file sorts before the ROCK 5's
-# Panfrost one, which every other machine keeps.
+# The Dragon Q8B's (arm64): Turnip, libvulkan.so.1 and zink's EGL vendor
+# library, whose vendor file sorts before the ROCK 5's Panfrost one, which
+# every other machine keeps.
 [ -e /dev/graphics/adreno/0 ]
 link_gpu_user_land /boot/system/non-packaged/adreno $?
 
