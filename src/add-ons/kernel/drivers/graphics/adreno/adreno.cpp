@@ -23,6 +23,7 @@
 #include <KernelExport.h>
 #include <arch/atomic.h>
 #include <condition_variable.h>
+#include <driver_settings.h>
 #include <lock.h>
 #include <util/AutoLock.h>
 #include <smp.h>
@@ -1124,11 +1125,21 @@ hfi_send(uint32 id, uint32* message, uint32 size, uint32* reply = NULL,
 /*!	Linux' a6xx_hfi_start() for the A650 family: performance and bandwidth
 	tables, the core firmware start, the start.
 */
+// the GPU's performance levels (level 0 is off), what is voted
+static uint32 sGpuLevelCount;
+static uint32 sGpuLevelKHz[16];
+static uint32 sGpuLevel;
+static mutex sHfiLock = MUTEX_INITIALIZER("adreno hfi");
+
+
 static status_t
 hfi_start()
 {
 	performance_level gpuLevels[16], gmuLevels[4];
 	uint32 gpuCount = opp_levels("qcom,adreno-690.0", gpuLevels, 16);
+	sGpuLevelCount = gpuCount;
+	for (uint32 i = 0; i < gpuCount; i++)
+		sGpuLevelKHz[i] = gpuLevels[i].frequency / 1000;
 	uint32 gmuCount = opp_levels("qcom,adreno-gmu-690.0", gmuLevels, 4);
 
 	struct {
@@ -1866,6 +1877,60 @@ recoverer(void*)
 }
 
 
+/*!	The GPU's clock: level \a level of its table (GX_BW_PERF_VOTE, as
+	a6xx_hfi_set_freq()), the bus vote left at the table's one level. */
+static status_t
+gpu_set_level(uint32 level)
+{
+	MutexLocker locker(sHfiLock);
+	if (level == 0 || level >= sGpuLevelCount)
+		return B_BAD_VALUE;
+	if (level == sGpuLevel)
+		return B_OK;
+	uint32 vote[4] = {0, 1, level, 0};
+	status_t status = hfi_send(HFI_H2F_MSG_GX_BW_PERF_VOTE, vote, sizeof(vote));
+	if (status != B_OK)
+		return status;
+	static int32 sChanges;
+	if (sChanges++ < 8) {
+		dprintf("adreno: GPU clock %" B_PRIu32 " MHz (level %" B_PRIu32 ")\n",
+			sGpuLevelKHz[level] / 1000, level);
+	}
+	sGpuLevel = level;
+	return B_OK;
+}
+
+
+/*	A simple governor: the top level while there is GPU work, the lowest
+	once it was idle for kGovernorIdle. Submissions wake it, so that they
+	do not wait for the GMU themselves. "gpu_level <n>" in the adreno driver
+	settings pins a level instead. */
+static const bigtime_t kGovernorIdle = 500000;
+static sem_id sGovernorSemaphore = -1;
+static bigtime_t sLastSubmission;
+static uint32 sPinnedLevel;
+
+
+static status_t
+governor(void*)
+{
+	while (true) {
+		status_t status = acquire_sem_etc(sGovernorSemaphore, 1,
+			B_RELATIVE_TIMEOUT, 100000);
+		if (status != B_OK && status != B_TIMED_OUT)
+			return B_OK;
+		uint32 top = sGpuLevelCount - 1;
+		if (sPinnedLevel != 0) {
+			gpu_set_level(min_c(sPinnedLevel, top));
+			continue;
+		}
+		bool busy = system_time() - atomic_get64(&sLastSubmission)
+			< kGovernorIdle;
+		gpu_set_level(busy ? top : 1);
+	}
+}
+
+
 static status_t
 bring_up()
 {
@@ -1943,8 +2008,7 @@ bring_up()
 		return status;
 
 	// the lowest GPU level to start with (Linux' a6xx_gmu_set_initial_freq())
-	uint32 vote[4] = {0, 1, 1, 0};
-	status = hfi_send(HFI_H2F_MSG_GX_BW_PERF_VOTE, vote, sizeof(vote));
+	status = gpu_set_level(1);
 	if (status != B_OK)
 		return status;
 
@@ -1969,6 +2033,21 @@ bring_up()
 		return status;
 
 	gpu_write(RBBM_INT_CLEAR_CMD, 0xffffffff);
+	void* settings = load_driver_settings("adreno");
+	if (settings != NULL) {
+		const char* level = get_driver_parameter(settings, "gpu_level", NULL,
+			NULL);
+		if (level != NULL)
+			sPinnedLevel = strtoul(level, NULL, 10);
+		unload_driver_settings(settings);
+	}
+	sGovernorSemaphore = create_sem(0, "adreno governor");
+	if (sGovernorSemaphore >= 0) {
+		thread_id thread = spawn_kernel_thread(governor, "adreno governor",
+			B_NORMAL_PRIORITY, NULL);
+		if (thread >= 0)
+			resume_thread(thread);
+	}
 	sRecoverySemaphore = create_sem(0, "adreno recovery");
 	if (sRecoverySemaphore >= 0) {
 		thread_id recovery = spawn_kernel_thread(recoverer, "adreno recovery",
@@ -2086,6 +2165,10 @@ adreno_ring_emit(uint32 value)
 uint32
 adreno_ring_flush_fence()
 {
+	// the governor raises the clock for it
+	atomic_set64(&sLastSubmission, system_time());
+	if (sGpuLevel != sGpuLevelCount - 1 && sGovernorSemaphore >= 0)
+		release_sem_etc(sGovernorSemaphore, 1, B_DO_NOT_RESCHEDULE);
 	uint32 fence = sNextFence++;
 	ring_emit(pkt7(CP_EVENT_WRITE, 4));
 	ring_emit(EVENT_CACHE_FLUSH_TS | EVENT_IRQ);
