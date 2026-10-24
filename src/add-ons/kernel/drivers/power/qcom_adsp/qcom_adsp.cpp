@@ -1259,6 +1259,93 @@ pmic_glink_tick()
 }
 
 
+// #pragma mark - GPR (the audio DSP's AudioReach)
+
+
+/*	The ADSP's audio framework (AudioReach: the Audio Processing Manager,
+	"APM", and its modules) is reached through GPR packets on the GLINK
+	channel "adsp_apps" (Linux' drivers/soc/qcom/apr.c, gpr): a 24 byte
+	header (version, header size in words, packet size; destination and
+	source domain; ports, token, opcode), then the payload. So far only
+	whether the framework is up: APM_CMD_GET_SPF_STATE, as
+	q6apm_is_adsp_ready(). */
+
+static const uint32 kGprDomainAdsp = 2, kGprDomainApps = 3;
+static const uint32 kGprApmPort = 1;			// APM_MODULE_INSTANCE_ID
+static const uint32 kGprClientPort = 1;			// q6apm's service
+static const uint32 kApmGetSpfState = 0x01001021;
+static const uint32 kApmGetSpfStateResponse = 0x02001007;
+static const uint32 kGprBasicResult = 0x02001005;
+
+static glink_channel* sGpr;
+static bool sAudioReady;
+static bigtime_t sAudioRequested;
+
+
+static status_t
+gpr_send(uint32 destinationPort, uint32 opcode, const void* payload,
+	uint32 length)
+{
+	uint32 packet[32] = {};
+	if (length > sizeof(packet) - 24)
+		return B_BAD_VALUE;
+	packet[0] = 0 | 6u << 4 | (24 + length) << 8;	// version, header, size
+	packet[1] = kGprDomainAdsp | kGprDomainApps << 8;
+	packet[2] = kGprClientPort;
+	packet[3] = destinationPort;
+	packet[4] = 1;									// token
+	packet[5] = opcode;
+	memcpy(packet + 6, payload, length);
+	return glink_write(sGpr, packet, 24 + length);
+}
+
+
+static void
+gpr_receive(glink_channel* channel, const uint8* data, uint32 length)
+{
+	if (length < 24)
+		return;
+	uint32 header[6];
+	memcpy(header, data, sizeof(header));
+	uint32 opcode = header[5];
+	uint32 result = 0;
+	if (length >= 28)
+		memcpy(&result, data + 24, 4);
+	if (opcode == kApmGetSpfStateResponse) {
+		if (!sAudioReady || result != 1) {
+			TRACE("audio: the ADSP's AudioReach framework is %s (%" B_PRIu32
+				")\n", result == 1 ? "ready" : "not ready", result);
+		}
+		sAudioReady = result == 1;
+		return;
+	}
+	// a basic result: the command's opcode, then its status
+	uint32 status = 0;
+	if (length >= 32)
+		memcpy(&status, data + 28, 4);
+	static uint32 sLastStatus = 0xffffffff;
+	if (opcode == kGprBasicResult && status == sLastStatus)
+		return;
+	sLastStatus = status;
+	TRACE("audio: GPR opcode %#" B_PRIx32 " from port %" B_PRIu32 ", %"
+		B_PRIu32 " bytes: %#" B_PRIx32 ", status %#" B_PRIx32 "\n", opcode,
+		header[2], length, result, status);
+}
+
+
+//!	Asks whether the audio framework is up until it says it is.
+static void
+gpr_tick()
+{
+	if (sGpr == NULL || !sGpr->openAcked || sAudioReady)
+		return;
+	if (system_time() - sAudioRequested < 1000000)
+		return;
+	if (gpr_send(kGprApmPort, kApmGetSpfState, NULL, 0) != B_WOULD_BLOCK)
+		sAudioRequested = system_time();
+}
+
+
 // #pragma mark - the start
 
 
@@ -1416,6 +1503,9 @@ boot_thread(void*)
 	sPmicGlink = glink_add_channel("PMIC_RTR_ADSP_APPS");
 	sPmicGlink->wanted = true;
 	sPmicGlink->hook = pmic_glink_receive;
+	sGpr = glink_add_channel("adsp_apps");
+	sGpr->wanted = true;
+	sGpr->hook = gpr_receive;
 	sGlinkSem = create_sem(0, "qcom adsp glink");
 	if (sGlinkSem >= 0)
 		ipcc_interrupt_start();
@@ -1427,6 +1517,7 @@ boot_thread(void*)
 	while (!sQuit) {
 		glink_poll();
 		pmic_glink_tick();
+		gpr_tick();
 		simulation_tick();
 		// woken by the doorbell; now and then anyway, for the requests
 		// pmic_glink_tick() repeats
