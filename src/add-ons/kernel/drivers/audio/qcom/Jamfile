@@ -1,0 +1,12 @@
+SubDir HAIKU_TOP src add-ons kernel drivers audio qcom ;
+
+UsePrivateKernelHeaders ;
+UsePrivateHeaders audio drivers ;
+
+KernelAddon qcom_audio :
+	audioreach.cpp
+	codec.cpp
+	driver.cpp
+	dsp.cpp
+	multi_audio.cpp
+;

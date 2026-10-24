@@ -33,6 +33,9 @@
 #include <arch/atomic.h>
 #include <device_manager.h>
 #include <driver_settings.h>
+#include <lock.h>
+#include <util/AutoLock.h>
+#include <qcom_gpr.h>
 #include <qcom_usbc_ports.h>
 
 #include <libfdt.h>
@@ -567,7 +570,7 @@ static const uint32 kGlinkIntentSize = 1024;
 static const uint32 kGlinkIntentCount = 5;
 static const uint32 kGlinkMaxMessage = 4096;
 static const int kGlinkMaxChannels = 16;
-static const int kGlinkMaxRemoteIntents = 16;
+static const int kGlinkMaxRemoteIntents = 64;
 
 
 struct glink_message {
@@ -603,6 +606,7 @@ struct glink_channel {
 	glink_receive_hook	hook;
 	glink_remote_intent	remoteIntents[kGlinkMaxRemoteIntents];
 	uint32				remoteIntentCount;
+	bigtime_t			intentRequested;	// one asked for (0: none)
 	uint32				nextIntentId;
 	uint8*				rxBuffer;		// a message in chunks
 	uint32				rxLength;
@@ -829,7 +833,11 @@ glink_write(glink_channel* channel, const void* data, uint32 length)
 			intent = &candidate;
 	}
 	if (intent == NULL) {
-		glink_send_command(kGlinkRxIntentRequest, channel->localId, length);
+		// one request until it is answered (or seems lost)
+		if (system_time() - channel->intentRequested > 500000) {
+			channel->intentRequested = system_time();
+			glink_send_command(kGlinkRxIntentRequest, channel->localId, length);
+		}
 		return B_WOULD_BLOCK;
 	}
 	intent->inUse = true;
@@ -968,11 +976,35 @@ glink_poll()
 				for (uint32 i = 0; i < message.param2; i++) {
 					uint32 pair[2];
 					rx_peek(sizeof(message) + 8 * i, pair, sizeof(pair));
-					if (channel == NULL || channel->remoteIntentCount
-							== (uint32)kGlinkMaxRemoteIntents)
+					if (channel == NULL)
 						continue;
-					channel->remoteIntents[channel->remoteIntentCount++]
-						= { pair[1], pair[0], false };
+					glink_remote_intent* slot = NULL;
+					if (channel->remoteIntentCount
+							< (uint32)kGlinkMaxRemoteIntents) {
+						slot = &channel->remoteIntents[
+							channel->remoteIntentCount++];
+					} else {
+						// the ADSP hands out many small ones: a bigger one
+						// takes the place of the smallest free one (which
+						// stays the ADSP's, unused)
+						for (uint32 j = 0; j < channel->remoteIntentCount;
+								j++) {
+							glink_remote_intent& candidate
+								= channel->remoteIntents[j];
+							if (!candidate.inUse && candidate.size < pair[0]
+								&& (slot == NULL
+									|| candidate.size < slot->size))
+								slot = &candidate;
+						}
+					}
+					if (slot == NULL)
+						continue;
+					*slot = { pair[1], pair[0], false };
+					if (channel->intentRequested != 0) {
+						TRACE("glink: %s: an intent of %" B_PRIu32 " bytes\n",
+							channel->name, pair[0]);
+						channel->intentRequested = 0;
+					}
 				}
 				break;
 			}
@@ -1027,6 +1059,15 @@ glink_poll()
 				glink_kick();
 				break;
 			case kGlinkRxIntentRequestAck:
+			{
+				glink_channel* channel
+					= glink_channel_by_remote_id(message.param1);
+				if (message.param2 == 0) {
+					ERROR("glink: %s: the ADSP refused an intent\n",
+						channel != NULL ? channel->name : "?");
+				}
+				break;
+			}
 			case kGlinkCloseAck:
 			case kGlinkSignals:
 				break;
@@ -1266,37 +1307,61 @@ pmic_glink_tick()
 	"APM", and its modules) is reached through GPR packets on the GLINK
 	channel "adsp_apps" (Linux' drivers/soc/qcom/apr.c, gpr): a 24 byte
 	header (version, header size in words, packet size; destination and
-	source domain; ports, token, opcode), then the payload. So far only
-	whether the framework is up: APM_CMD_GET_SPF_STATE, as
-	q6apm_is_adsp_ready(). */
+	source domain; ports, token, opcode), then the payload. qcom_adsp asks
+	whether the framework is up (APM_CMD_GET_SPF_STATE, as
+	q6apm_is_adsp_ready()); the audio driver does the rest through the
+	qcom_gpr module (qcom_gpr.h), each of its ports with its hook. */
 
 static const uint32 kGprDomainAdsp = 2, kGprDomainApps = 3;
 static const uint32 kGprApmPort = 1;			// APM_MODULE_INSTANCE_ID
 static const uint32 kGprClientPort = 1;			// q6apm's service
 static const uint32 kApmGetSpfState = 0x01001021;
 static const uint32 kApmGetSpfStateResponse = 0x02001007;
-static const uint32 kGprBasicResult = 0x02001005;
+static const uint32 kGprMaxPacket = 4096;
 
 static glink_channel* sGpr;
 static bool sAudioReady;
 static bigtime_t sAudioRequested;
 
+// GLINK is run by the start thread; the audio driver's sends come from its
+// own threads (and from its hooks, on the start thread)
+static recursive_lock sGlinkLock = RECURSIVE_LOCK_INITIALIZER("qcom adsp glink");
+
+static const int kGprMaxPorts = 8;
+static struct {
+	uint32			port;
+	qcom_gpr_hook	hook;
+	void*			cookie;
+} sGprPorts[kGprMaxPorts];
+
 
 static status_t
-gpr_send(uint32 destinationPort, uint32 opcode, const void* payload,
-	uint32 length)
+gpr_send(uint32 sourcePort, uint32 destinationPort, uint32 opcode,
+	uint32 token, const void* payload, uint32 length)
 {
-	uint32 packet[32] = {};
-	if (length > sizeof(packet) - 24)
+	if (sGpr == NULL)
+		return B_NO_INIT;
+	if (length > kGprMaxPacket - 24)
 		return B_BAD_VALUE;
+	uint32 small[32];
+	uint32* packet = small;
+	if (24 + length > sizeof(small)) {
+		packet = (uint32*)malloc(24 + length);
+		if (packet == NULL)
+			return B_NO_MEMORY;
+	}
 	packet[0] = 0 | 6u << 4 | (24 + length) << 8;	// version, header, size
 	packet[1] = kGprDomainAdsp | kGprDomainApps << 8;
-	packet[2] = kGprClientPort;
+	packet[2] = sourcePort;
 	packet[3] = destinationPort;
-	packet[4] = 1;									// token
+	packet[4] = token;
 	packet[5] = opcode;
-	memcpy(packet + 6, payload, length);
-	return glink_write(sGpr, packet, 24 + length);
+	if (length > 0)
+		memcpy(packet + 6, payload, length);
+	status_t status = glink_write(sGpr, packet, 24 + length);
+	if (packet != small)
+		free(packet);
+	return status;
 }
 
 
@@ -1307,9 +1372,21 @@ gpr_receive(glink_channel* channel, const uint8* data, uint32 length)
 		return;
 	uint32 header[6];
 	memcpy(header, data, sizeof(header));
+	uint32 headerSize = (header[0] >> 4 & 0xf) * 4;
+	uint32 packetSize = header[0] >> 8;
+	if (headerSize < 24 || packetSize > length || packetSize < headerSize)
+		return;
 	uint32 opcode = header[5];
+	for (int i = 0; i < kGprMaxPorts; i++) {
+		if (sGprPorts[i].hook == NULL || sGprPorts[i].port != header[3])
+			continue;
+		qcom_gpr_packet packet = { header[2], header[3], header[4], opcode,
+			data + headerSize, packetSize - headerSize };
+		sGprPorts[i].hook(sGprPorts[i].cookie, &packet);
+		return;
+	}
 	uint32 result = 0;
-	if (length >= 28)
+	if (packetSize >= 28)
 		memcpy(&result, data + 24, 4);
 	if (opcode == kApmGetSpfStateResponse) {
 		if (!sAudioReady || result != 1) {
@@ -1321,15 +1398,11 @@ gpr_receive(glink_channel* channel, const uint8* data, uint32 length)
 	}
 	// a basic result: the command's opcode, then its status
 	uint32 status = 0;
-	if (length >= 32)
+	if (packetSize >= 32)
 		memcpy(&status, data + 28, 4);
-	static uint32 sLastStatus = 0xffffffff;
-	if (opcode == kGprBasicResult && status == sLastStatus)
-		return;
-	sLastStatus = status;
-	TRACE("audio: GPR opcode %#" B_PRIx32 " from port %" B_PRIu32 ", %"
-		B_PRIu32 " bytes: %#" B_PRIx32 ", status %#" B_PRIx32 "\n", opcode,
-		header[2], length, result, status);
+	TRACE("audio: GPR opcode %#" B_PRIx32 " from port %#" B_PRIx32 " to %#"
+		B_PRIx32 ", %" B_PRIu32 " bytes: %#" B_PRIx32 ", status %#" B_PRIx32
+		"\n", opcode, header[2], header[3], packetSize, result, status);
 }
 
 
@@ -1341,9 +1414,88 @@ gpr_tick()
 		return;
 	if (system_time() - sAudioRequested < 1000000)
 		return;
-	if (gpr_send(kGprApmPort, kApmGetSpfState, NULL, 0) != B_WOULD_BLOCK)
+	if (gpr_send(kGprClientPort, kGprApmPort, kApmGetSpfState, 1, NULL, 0)
+			!= B_WOULD_BLOCK)
 		sAudioRequested = system_time();
 }
+
+
+static bool
+gpr_module_ready()
+{
+	return sAudioReady;
+}
+
+
+static status_t
+gpr_module_register_port(uint32 port, qcom_gpr_hook hook, void* cookie)
+{
+	if (port < 0x100 || hook == NULL)
+		return B_BAD_VALUE;
+	RecursiveLocker locker(sGlinkLock);
+	int free = -1;
+	for (int i = 0; i < kGprMaxPorts; i++) {
+		if (sGprPorts[i].hook != NULL && sGprPorts[i].port == port)
+			return B_NAME_IN_USE;
+		if (sGprPorts[i].hook == NULL && free < 0)
+			free = i;
+	}
+	if (free < 0)
+		return B_NO_MEMORY;
+	sGprPorts[free].port = port;
+	sGprPorts[free].cookie = cookie;
+	sGprPorts[free].hook = hook;
+	return B_OK;
+}
+
+
+static void
+gpr_module_unregister_port(uint32 port)
+{
+	RecursiveLocker locker(sGlinkLock);
+	for (int i = 0; i < kGprMaxPorts; i++) {
+		if (sGprPorts[i].hook != NULL && sGprPorts[i].port == port)
+			sGprPorts[i].hook = NULL;
+	}
+}
+
+
+static status_t
+gpr_module_send(uint32 sourcePort, uint32 destinationPort, uint32 opcode,
+	uint32 token, const void* payload, uint32 payloadSize)
+{
+	if (!sAudioReady)
+		return B_NOT_INITIALIZED;
+	status_t status;
+	{
+		RecursiveLocker locker(sGlinkLock);
+		status = gpr_send(sourcePort, destinationPort, opcode, token, payload,
+			payloadSize);
+	}
+	if (status == B_WOULD_BLOCK) {
+		// an intent was asked for: the start thread takes it in
+		if (sGlinkSem >= 0)
+			release_sem_etc(sGlinkSem, 1, B_DO_NOT_RESCHEDULE);
+		return B_BUSY;
+	}
+	return status;
+}
+
+
+static status_t
+gpr_std_ops(int32 op, ...)
+{
+	return op == B_MODULE_INIT || op == B_MODULE_UNINIT ? B_OK : B_ERROR;
+}
+
+
+static qcom_gpr_module_info sGprModule = {
+	{ QCOM_GPR_MODULE_NAME, 0, gpr_std_ops },
+	gpr_module_ready,
+	gpr_module_register_port,
+	gpr_module_unregister_port,
+	gpr_module_send
+};
 
 
 // #pragma mark - the start
@@ -1515,10 +1667,12 @@ boot_thread(void*)
 		return B_OK;
 	}
 	while (!sQuit) {
+		recursive_lock_lock(&sGlinkLock);
 		glink_poll();
 		pmic_glink_tick();
 		gpr_tick();
 		simulation_tick();
+		recursive_lock_unlock(&sGlinkLock);
 		// woken by the doorbell; now and then anyway, for the requests
 		// pmic_glink_tick() repeats
 		if (sIpccHandler)
@@ -1662,5 +1816,6 @@ static driver_module_info sQcomAdspDriver = {
 module_info* modules[] = {
 	(module_info*)&sQcomAdspDriver,
 	(module_info*)&sUsbcPortsModule,
+	(module_info*)&sGprModule,
 	NULL
 };
