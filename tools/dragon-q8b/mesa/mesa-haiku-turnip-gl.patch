@@ -1,0 +1,65 @@
+air/OS (Haiku arm64): what OpenGL needs on the Dragon Q8B, applied after
+mesa-haiku-turnip.patch and tools/cubie-a7s/mesa/mesa-haiku-gl.patch.
+
+  src/egl/drivers/haiku/egl_haiku.cpp
+      zink also when the "adreno" kernel driver published its device
+      (HAIKU_ADRENO_DEVICE or /dev/graphics/adreno/0), after the PowerVR
+      one; libvulkan.so.1 is then the shim on Turnip
+
+diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haiku.cpp
+--- a/src/egl/drivers/haiku/egl_haiku.cpp
++++ b/src/egl/drivers/haiku/egl_haiku.cpp
+@@ -493,13 +493,34 @@
+    disp->DriverData = NULL;
+ }
+ 
+-/* The Cubie A7S's PowerVR GPU is reachable only through its Vulkan driver
+- * (libvulkan_powervr_mesa.so, loaded through libvulkan.so.1), so OpenGL and
+- * GLES go through zink. Only when the "powervr" kernel driver published its
+- * device (HAIKU_PVR_DEVICE names another), and no software renderer was
+- * asked for (LIBGL_ALWAYS_SOFTWARE, or GALLIUM_DRIVER naming another
+- * driver). NULL leaves softpipe.
++/* The Cubie A7S's PowerVR GPU and the Dragon Q8B's Adreno are reachable only
++ * through their Vulkan drivers (libvulkan_powervr_mesa.so,
++ * libvulkan_freedreno.so, loaded through libvulkan.so.1), so OpenGL and GLES
++ * go through zink. Only when a kernel driver published its device ("powervr":
++ * HAIKU_PVR_DEVICE names another; "adreno": HAIKU_ADRENO_DEVICE), and no
++ * software renderer was asked for (LIBGL_ALWAYS_SOFTWARE, or GALLIUM_DRIVER
++ * naming another driver). NULL leaves softpipe.
+  */
++static const char *
++haiku_gpu_device(void)
++{
++   static const struct {
++      const char *variable;
++      const char *path;
++   } kDevices[] = {
++      { "HAIKU_PVR_DEVICE", "/dev/graphics/powervr/0" },
++      { "HAIKU_ADRENO_DEVICE", "/dev/graphics/adreno/0" },
++   };
++   for (size_t i = 0; i < sizeof(kDevices) / sizeof(kDevices[0]); i++) {
++      const char *device = getenv(kDevices[i].variable);
++      if (device == NULL || *device == '\0')
++         device = kDevices[i].path;
++      if (access(device, R_OK | W_OK) == 0)
++         return device;
++   }
++   return NULL;
++}
++
+ static struct pipe_screen *
+ haiku_create_gpu_screen(_EGLDisplay *disp)
+ {
+@@ -510,10 +531,8 @@
+    const char *driver = getenv("GALLIUM_DRIVER");
+    if (driver != NULL && *driver != '\0' && strcmp(driver, "zink") != 0)
+       return NULL;
+-   const char *device = getenv("HAIKU_PVR_DEVICE");
+-   if (device == NULL || *device == '\0')
+-      device = "/dev/graphics/powervr/0";
+-   if (access(device, R_OK | W_OK) != 0)
++   const char *device = haiku_gpu_device();
++   if (device == NULL)
+       return NULL;
+ 
+    /* Mesa does not count this PowerVR core (BXM-4-64 36.56.104.183) as a
