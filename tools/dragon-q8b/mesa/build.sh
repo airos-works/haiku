@@ -5,7 +5,7 @@
 # through zink. Like tools/cubie-a7s/mesa/build.sh, whose pinned Mesa,
 # sysroot, cross file, OpenGL patch (EGL, hgl, zink) and GL tests it uses.
 #
-#   tools/dragon-q8b/mesa/build.sh [fetch|patch|configure|driver|tests|gl|collect|all]
+#   tools/dragon-q8b/mesa/build.sh [fetch|patch|configure|driver|tests|gl|collect|userland|all]
 #
 # Everything lives under /mnt/HaikuWork/dragon/mesa (DRAGON_MESA_ROOT).
 set -euo pipefail
@@ -251,6 +251,40 @@ JSON
 	log "results in $OUT"
 }
 
+# The tree the arm64 image carries as system/non-packaged/adreno
+# (AIROS_CI_ADRENO in tools/airos/ci/UserBuildConfig), which its boot script
+# links into system/non-packaged where the adreno driver publishes the GPU:
+# Turnip and libvulkan.so.1 in lib, the GPU firmware (linux-firmware's,
+# FIRMWARE=<a linux-firmware tree>), and the EGL vendor file, sorting before
+# the ROCK 5's Panfrost one, that names this EGL vendor library in place.
+userland() {
+	local tree=$OUT/adreno fw=${FIRMWARE:-$WORK/dragon/firmware} f
+	[ -f "$OUT/libEGL_mesa.so.0" ] || { echo "run collect first" >&2; exit 1; }
+	rm -rf "$tree"
+	mkdir -p "$tree/lib" "$tree/add-ons/opengl/egl_vendor.d" \
+		"$tree/data/firmware/qcom/sc8280xp"
+	cp "$OUT/libvulkan_freedreno.so" "$OUT/libvulkan.so.1" \
+		"$OUT/libEGL_mesa.so.0" "$tree/lib/"
+	cat > "$tree/add-ons/opengl/egl_vendor.d/05_mesa_adreno.json" <<'JSON'
+{
+  "file_format_version": "1.0.0",
+  "ICD": {
+    "library_path": "/boot/system/non-packaged/adreno/lib/libEGL_mesa.so.0"
+  }
+}
+JSON
+	for f in a660_sqe.fw a660_gmu.bin; do
+		cp "$fw/qcom/$f" "$tree/data/firmware/qcom/"
+	done
+	# the zap shader: linux-firmware's qcom/sc8280xp/LENOVO/21BX copy, the
+	# same file as Radxa's
+	f=$fw/qcom/sc8280xp/qcdxkmsuc8280.mbn
+	[ -f "$f" ] || f=$fw/qcom/sc8280xp/LENOVO/21BX/qcdxkmsuc8280.mbn
+	cp "$f" "$tree/data/firmware/qcom/sc8280xp/"
+	(cd "$tree" && find . -type f | sort | xargs sha256sum) > "$OUT/adreno.MANIFEST"
+	log "user land in $tree"
+}
+
 case ${1:-all} in
 fetch) fetch ;;
 patch) patch_source ;;
@@ -259,6 +293,7 @@ driver) driver ;;
 tests) tests ;;
 gl) gl_configure; gl ;;
 collect) collect ;;
-all) fetch; patch_source; driver; tests; gl_configure; gl; collect ;;
-*) echo "usage: $0 [fetch|patch|configure|driver|tests|gl|collect|all]" >&2; exit 2 ;;
+userland) userland ;;
+all) fetch; patch_source; driver; tests; gl_configure; gl; collect; userland ;;
+*) echo "usage: $0 [fetch|patch|configure|driver|tests|gl|collect|userland|all]" >&2; exit 2 ;;
 esac

@@ -14,38 +14,51 @@ if [ ! -e "$HOME/config/settings/boot/launch/wifiautojoin" ]; then
 	[ -x "$wifi_autojoin" ] && "$wifi_autojoin" > /dev/dprintf 2>&1 &
 fi
 
-# The AMD GPU user land (x86_64): libdrm, libva, libglvnd and Mesa (radeonsi,
-# RADV, the VA-API driver) and the amduvd decoder, linked from
-# system/non-packaged/amdgpu into system/non-packaged only where amdgpu_drm
-# drives a GPU. Its libGL and libEGL come before the system's, which every
-# other machine keeps (Zink on NVIDIA cards, llvmpipe elsewhere). Files of
-# the same name that are not such links (a user land installed by hand) are
-# left alone.
-amdgpu=/boot/system/non-packaged/amdgpu
-if [ -d "$amdgpu" ]; then
+# A GPU user land kept apart in system/non-packaged/<name>, linked into
+# system/non-packaged only where its driver publishes the GPU, and unlinked
+# elsewhere. Files of the same name that are not such links (a user land
+# installed by hand, or the system's own) are left alone.
+#   link_gpu_user_land <directory> <whether the GPU is there: 0 = yes>
+link_gpu_user_land()
+{
+	userLand=$1
 	nonPackaged=/boot/system/non-packaged
-	if ls /dev/graphics/amdgpu_drm_* > /dev/null 2>&1; then
-		(cd "$amdgpu" && find . \( -type f -o -type l \)) | while read -r file; do
+	[ -d "$userLand" ] || return
+	if [ "$2" = 0 ]; then
+		(cd "$userLand" && find . \( -type f -o -type l \)) | while read -r file; do
 			file=${file#./}
 			target=$nonPackaged/$file
 			if [ -e "$target" ] || [ -L "$target" ]; then
 				case $(readlink "$target") in
-					"$amdgpu"/*) ;;
+					"$userLand"/*) ;;
 					*) continue ;;
 				esac
 			fi
 			mkdir -p "$(dirname "$target")"
-			ln -sfn "$amdgpu/$file" "$target"
+			ln -sfn "$userLand/$file" "$target"
 		done
 	else
 		find "$nonPackaged/lib" "$nonPackaged/data" "$nonPackaged/add-ons" \
 				-type l 2> /dev/null | while read -r link; do
 			case $(readlink "$link") in
-				"$amdgpu"/*) rm -f "$link" ;;
+				"$userLand"/*) rm -f "$link" ;;
 			esac
 		done
 	fi
-fi
+}
+
+# The AMD GPU user land (x86_64): libdrm, libva, libglvnd and Mesa (radeonsi,
+# RADV, the VA-API driver) and the amduvd decoder, where amdgpu_drm drives a
+# GPU. Its libGL and libEGL come before the system's, which every other
+# machine keeps (Zink on NVIDIA cards, llvmpipe elsewhere).
+ls /dev/graphics/amdgpu_drm_* > /dev/null 2>&1
+link_gpu_user_land /boot/system/non-packaged/amdgpu $?
+
+# The Dragon Q8B's (arm64): Turnip, libvulkan.so.1, the GPU firmware and
+# zink's EGL vendor library, whose vendor file sorts before the ROCK 5's
+# Panfrost one, which every other machine keeps.
+[ -e /dev/graphics/adreno/0 ]
+link_gpu_user_land /boot/system/non-packaged/adreno $?
 
 # The Zink OpenGL renderer (x86_64), only where nvidia_rm drives a card and NVK
 # gives it a GPU: the GL kit takes the first renderer it finds, and anywhere
