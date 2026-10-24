@@ -1186,15 +1186,17 @@ struct usbc_dp {
 	uint32		auxRcg, auxBranch;
 	phys_addr_t	controller;
 	uint32		sbuEnable, sbuSelect;
+	uint32		pixelRcg, pixelSource, pixelBranch, linkIntfBranch;
+	uint32		intf;			// its timing engine, from the MDP's base
 };
 
 static const usbc_dp kUsbcDp[] = {
 	{0x88eb000, 0xf004, {0xf054, 0x8c02c, 0xf058}, {0x50000, 0x4a008},
 		"ldod9", "ldod4", 0x21a4, 1, 0x205c, 0x2238, 0x206c, 0xae90000,
-		101, 164},
+		101, 164, 0x21d8, 2, 0x2070, 0x2060, 0x34000},
 	{0x8903000, 0x10004, {0x10054, 0x8c010, 0x10058}, {0x5000c, 0xb9020},
 		"ldob4", "ldob3", 0x2268, 2, 0x2084, 0x22d0, 0x20a0, 0xae98000,
-		48, 47},
+		48, 47, 0x2250, 4, 0x2078, 0x2088, 0x38000},
 };
 
 
@@ -1291,6 +1293,63 @@ dp_aux_test(const usbc_dp& port)
 		status == 0 ? " nothing" : "", rd(dp, aux + 0x30),
 		rd(dp, aux + 0xbc));
 	delete_area(area);
+}
+
+
+/*!	The connector's pixel clock from its PHY's VCO divider (810 MHz at RBR)
+	at 148.5 MHz (M/N 11/60), and its DPU timing engine running on it with
+	the timing of the HDMI output's (INTF_6, the firmware's 1080p): its
+	frame counter has to advance, a monitor or not. Then it is stopped. */
+static void
+dp_stream_test(const usbc_dp& port)
+{
+	area_id dispccArea;
+	volatile uint8* dispcc = map_rw({"probe dispcc pixel", 0xaf00000, 0x20000},
+		dispccArea);
+	if (dispcc == NULL)
+		return;
+	uint32 rcg = port.pixelRcg;
+	const uint32 m = 11, n = 60, d = n;		// d: 50 % duty, clamped as Linux
+	wr32(dispcc, rcg + 8, m);
+	wr32(dispcc, rcg + 0xc, ~(n - m) & 0xffff);
+	wr32(dispcc, rcg + 0x10, ~d & 0xffff);
+	wr32(dispcc, rcg + 4, port.pixelSource << 8 | 2u << 12);	// dual edge
+	wr32(dispcc, rcg, rd(dispcc, rcg) | 1);
+	bool updated = wait_bits(dispcc, rcg, 1, 0);
+	wr32(dispcc, port.pixelBranch, rd(dispcc, port.pixelBranch) | 1);
+	bool pixel = wait_bits(dispcc, port.pixelBranch, 1u << 31, 0);
+	wr32(dispcc, port.linkIntfBranch, rd(dispcc, port.linkIntfBranch) | 1);
+	bool linkIntf = wait_bits(dispcc, port.linkIntfBranch, 1u << 31, 0);
+	dprintf("qcom_probe: dp stream: pixel rcg %s cfg %#" B_PRIx32 ", pixel "
+		"branch %#" B_PRIx32 " (%s), link intf %#" B_PRIx32 " (%s)\n",
+		updated ? "updated" : "stuck", rd(dispcc, rcg + 4),
+		rd(dispcc, port.pixelBranch), pixel ? "running" : "off",
+		rd(dispcc, port.linkIntfBranch), linkIntf ? "running" : "off");
+	delete_area(dispccArea);
+	if (!pixel)
+		return;
+
+	area_id mdpArea;
+	volatile uint8* mdp = map_rw({"probe mdp", 0xae01000, 0x40000}, mdpArea);
+	if (mdp == NULL)
+		return;
+	volatile uint8* hdmi = mdp + 0x3a000;
+	volatile uint8* intf = mdp + port.intf;
+	static const uint32 kTiming[] = {0x004, 0x008, 0x00c, 0x014, 0x01c, 0x024,
+		0x02c, 0x034, 0x03c, 0x040, 0x04c, 0x050, 0x060, 0x064, 0x068};
+	for (uint32 offset : kTiming)
+		wr32(intf, offset, rd(hdmi, offset));
+	wr32(intf, 0x0a8, 3);			// frame and line counters on
+	wr32(intf, 0x000, 1);			// the timing engine on
+	uint32 first = rd(intf, 0x0ac);
+	snooze(500000);
+	uint32 second = rd(intf, 0x0ac);
+	wr32(intf, 0x000, 0);
+	dprintf("qcom_probe: dp stream: INTF at %#" B_PRIx32 ": %" B_PRIu32
+		" frames in 0.5 s (counter %#" B_PRIx32 " -> %#" B_PRIx32 "), HDMI "
+		"timing hctl %#" B_PRIx32 " vperiod %#" B_PRIx32 "\n", port.intf,
+		second - first, first, second, rd(hdmi, 0x008), rd(hdmi, 0x00c));
+	delete_area(mdpArea);
 }
 
 
@@ -1441,8 +1500,10 @@ dp_phy_test(const usbc_dp& port)
 			delete_area(dispccArea);
 		}
 	}
-	if (ready)
+	if (ready) {
 		dp_aux_test(port);
+		dp_stream_test(port);
+	}
 	dprintf("qcom_probe: dp phy %#" B_PRIxPHYSADDR ": PLL %s, PHY %s (c_ready %#"
 		B_PRIx32
 		" cmn %#" B_PRIx32 " dp phy status %#" B_PRIx32 ")\n",
