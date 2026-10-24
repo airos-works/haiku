@@ -13,6 +13,10 @@ changes are #ifdef __HAIKU__ except fd_path's size.
                                     (tools/cubie-a7s/mesa) on ADRENO_HAIKU_OP:
                                     drmIoctl, drmCommand*, version, caps,
                                     syncobjs, drmDevice types
+  include/vk_haiku_scanout.h        the private scanout import (from the
+                                    PowerVR patch), which zink's direct
+                                    present (mesa-haiku-gl.patch) includes;
+                                    Turnip does not take it yet
   src/util/libdrm.h                 that stand-in rather than the no-op shim
   src/util/u_sync_provider_haiku.c  the Vulkan runtime's syncobj provider on
   src/util/u_sync_provider.h          those wrappers (from the PowerVR patch)
@@ -31,9 +35,9 @@ changes are #ifdef __HAIKU__ except fd_path's size.
   tu_device.h                       fd_path 64 bytes: "/dev/graphics/adreno/0"
                                     does not fit 20
 
-diff -ruN -x .haiku-patches pristine/include/drm-uapi/drm.h mesa-26.2.4/include/drm-uapi/drm.h
---- pristine/include/drm-uapi/drm.h	2026-10-02 00:39:53.000000000 +1000
-+++ mesa-26.2.4/include/drm-uapi/drm.h	2026-10-24 13:41:43.603455328 +1100
+diff -ruN a/include/drm-uapi/drm.h b/include/drm-uapi/drm.h
+--- a/include/drm-uapi/drm.h
++++ b/include/drm-uapi/drm.h
 @@ -47,6 +47,8 @@
  #include <sys/types.h>
  #if defined(__GNU__)
@@ -43,9 +47,60 @@ diff -ruN -x .haiku-patches pristine/include/drm-uapi/drm.h mesa-26.2.4/include/
  #else
  #include <sys/ioccom.h>
  #endif
-diff -ruN -x .haiku-patches pristine/include/xf86drm.h mesa-26.2.4/include/xf86drm.h
---- pristine/include/xf86drm.h	1970-01-01 11:00:00.000000000 +1100
-+++ mesa-26.2.4/include/xf86drm.h	2026-10-24 13:41:38.275035665 +1100
+diff -ruN a/include/vk_haiku_scanout.h b/include/vk_haiku_scanout.h
+--- a/include/vk_haiku_scanout.h
++++ b/include/vk_haiku_scanout.h
+@@ -0,0 +1,47 @@
++/*
++ * Drawing straight into the screen on Haiku.
++ *
++ * The frame buffer the display scans out is ordinary memory, and the display
++ * driver lets another program take hold of it. A renderer that copies its
++ * finished frame there never reads it back to the processor, which is what
++ * presenting through the window system costs otherwise.
++ *
++ * This is a private agreement between the Vulkan drivers on air/OS (NVK on
++ * the X399, PowerVR on the Cubie A7S) and the programs that present with
++ * them (zink's zink_haiku_present.c), not a registered Vulkan extension. It
++ * rides on the pNext chain of vkAllocateMemory, so it needs nothing of the
++ * loader: pass a VkImportScanoutMemoryHAIKU (allocationSize is ignored) and
++ * the memory that comes back is the screen, with its shape filled in.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef VK_HAIKU_SCANOUT_H
++#define VK_HAIKU_SCANOUT_H
++
++#include <vulkan/vulkan_core.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Private sType, from the range reserved for unregistered extensions. */
++#define VK_STRUCTURE_TYPE_IMPORT_SCANOUT_MEMORY_HAIKU \
++   ((VkStructureType)1000399000)
++
++typedef struct VkImportScanoutMemoryHAIKU {
++   VkStructureType sType;
++   void *pNext;
++   /* Filled in by the driver: the shape of the frame buffer that came back.
++    * The memory is a linear surface of `height` rows of `rowPitch` bytes.
++    */
++   uint32_t width;
++   uint32_t height;
++   uint32_t rowPitch;
++   VkDeviceSize size;
++} VkImportScanoutMemoryHAIKU;
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* VK_HAIKU_SCANOUT_H */
+diff -ruN a/include/xf86drm.h b/include/xf86drm.h
+--- a/include/xf86drm.h
++++ b/include/xf86drm.h
 @@ -0,0 +1,576 @@
 +/*
 + * Copyright 2026, air/OS. All rights reserved.
@@ -623,15 +678,9 @@ diff -ruN -x .haiku-patches pristine/include/xf86drm.h mesa-26.2.4/include/xf86d
 +#endif /* HAIKU_ADRENO_XF86DRM_H */
 +
 +#endif /* __HAIKU__ */
-Binary files pristine/src/compiler/isaspec/__pycache__/isa.cpython-314.pyc and mesa-26.2.4/src/compiler/isaspec/__pycache__/isa.cpython-314.pyc differ
-Binary files pristine/src/compiler/nir/__pycache__/nir_algebraic.cpython-314.pyc and mesa-26.2.4/src/compiler/nir/__pycache__/nir_algebraic.cpython-314.pyc differ
-Binary files pristine/src/compiler/nir/__pycache__/nir_intrinsics.cpython-314.pyc and mesa-26.2.4/src/compiler/nir/__pycache__/nir_intrinsics.cpython-314.pyc differ
-Binary files pristine/src/compiler/nir/__pycache__/nir_opcodes.cpython-314.pyc and mesa-26.2.4/src/compiler/nir/__pycache__/nir_opcodes.cpython-314.pyc differ
-Binary files pristine/src/compiler/__pycache__/builtin_types.cpython-314.pyc and mesa-26.2.4/src/compiler/__pycache__/builtin_types.cpython-314.pyc differ
-Binary files pristine/src/freedreno/common/__pycache__/freedreno_dev_info.cpython-314.pyc and mesa-26.2.4/src/freedreno/common/__pycache__/freedreno_dev_info.cpython-314.pyc differ
-diff -ruN -x .haiku-patches pristine/src/freedreno/ir3/ir3_disk_cache.c mesa-26.2.4/src/freedreno/ir3/ir3_disk_cache.c
---- pristine/src/freedreno/ir3/ir3_disk_cache.c	2026-10-02 00:39:53.000000000 +1000
-+++ mesa-26.2.4/src/freedreno/ir3/ir3_disk_cache.c	2026-10-24 13:46:13.029098050 +1100
+diff -ruN a/src/freedreno/ir3/ir3_disk_cache.c b/src/freedreno/ir3/ir3_disk_cache.c
+--- a/src/freedreno/ir3/ir3_disk_cache.c
++++ b/src/freedreno/ir3/ir3_disk_cache.c
 @@ -33,6 +33,11 @@
     if (ir3_shader_debug & IR3_DBG_NOCACHE)
        return;
@@ -652,9 +701,9 @@ diff -ruN -x .haiku-patches pristine/src/freedreno/ir3/ir3_disk_cache.c mesa-26.
  }
  
  void
-diff -ruN -x .haiku-patches pristine/src/freedreno/vulkan/tu_device.h mesa-26.2.4/src/freedreno/vulkan/tu_device.h
---- pristine/src/freedreno/vulkan/tu_device.h	2026-10-02 00:39:53.000000000 +1000
-+++ mesa-26.2.4/src/freedreno/vulkan/tu_device.h	2026-10-24 13:53:00.202743783 +1100
+diff -ruN a/src/freedreno/vulkan/tu_device.h b/src/freedreno/vulkan/tu_device.h
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
 @@ -100,7 +100,7 @@
  
     struct wsi_device wsi_device;
@@ -664,9 +713,9 @@ diff -ruN -x .haiku-patches pristine/src/freedreno/vulkan/tu_device.h mesa-26.2.
     int local_fd;
     bool has_local;
     int64_t local_major;
-diff -ruN -x .haiku-patches pristine/src/freedreno/vulkan/tu_knl.cc mesa-26.2.4/src/freedreno/vulkan/tu_knl.cc
---- pristine/src/freedreno/vulkan/tu_knl.cc	2026-10-02 00:39:53.000000000 +1000
-+++ mesa-26.2.4/src/freedreno/vulkan/tu_knl.cc	2026-10-24 13:43:33.920676382 +1100
+diff -ruN a/src/freedreno/vulkan/tu_knl.cc b/src/freedreno/vulkan/tu_knl.cc
+--- a/src/freedreno/vulkan/tu_knl.cc
++++ b/src/freedreno/vulkan/tu_knl.cc
 @@ -15,6 +15,13 @@
  #ifdef MAJOR_IN_SYSMACROS
  #include <sys/sysmacros.h>
@@ -734,9 +783,9 @@ diff -ruN -x .haiku-patches pristine/src/freedreno/vulkan/tu_knl.cc mesa-26.2.4/
     struct tu_instance *instance =
        container_of(vk_instance, struct tu_instance, vk);
  
-diff -ruN -x .haiku-patches pristine/src/freedreno/vulkan/tu_knl_drm_msm.cc mesa-26.2.4/src/freedreno/vulkan/tu_knl_drm_msm.cc
---- pristine/src/freedreno/vulkan/tu_knl_drm_msm.cc	2026-10-02 00:39:53.000000000 +1000
-+++ mesa-26.2.4/src/freedreno/vulkan/tu_knl_drm_msm.cc	2026-10-24 13:43:33.921862786 +1100
+diff -ruN a/src/freedreno/vulkan/tu_knl_drm_msm.cc b/src/freedreno/vulkan/tu_knl_drm_msm.cc
+--- a/src/freedreno/vulkan/tu_knl_drm_msm.cc
++++ b/src/freedreno/vulkan/tu_knl_drm_msm.cc
 @@ -11,6 +11,10 @@
  #include <sys/ioctl.h>
  #include <sys/mman.h>
@@ -778,11 +827,9 @@ diff -ruN -x .haiku-patches pristine/src/freedreno/vulkan/tu_knl_drm_msm.cc mesa
     }
  
     TU_RMV(bo_destroy, dev, bo);
-Binary files pristine/src/util/format/__pycache__/u_format_pack.cpython-314.pyc and mesa-26.2.4/src/util/format/__pycache__/u_format_pack.cpython-314.pyc differ
-Binary files pristine/src/util/format/__pycache__/u_format_parse.cpython-314.pyc and mesa-26.2.4/src/util/format/__pycache__/u_format_parse.cpython-314.pyc differ
-diff -ruN -x .haiku-patches pristine/src/util/libdrm.h mesa-26.2.4/src/util/libdrm.h
---- pristine/src/util/libdrm.h	2026-10-02 00:39:53.000000000 +1000
-+++ mesa-26.2.4/src/util/libdrm.h	2026-10-24 13:43:45.974184189 +1100
+diff -ruN a/src/util/libdrm.h b/src/util/libdrm.h
+--- a/src/util/libdrm.h
++++ b/src/util/libdrm.h
 @@ -30,7 +30,7 @@
  #ifndef LIBDRM_H
  #define LIBDRM_H
@@ -792,9 +839,9 @@ diff -ruN -x .haiku-patches pristine/src/util/libdrm.h mesa-26.2.4/src/util/libd
  #include <xf86drm.h>
  #else
  
-diff -ruN -x .haiku-patches pristine/src/util/meson.build mesa-26.2.4/src/util/meson.build
---- pristine/src/util/meson.build	2026-10-02 00:39:53.000000000 +1000
-+++ mesa-26.2.4/src/util/meson.build	2026-10-24 13:41:43.628574302 +1100
+diff -ruN a/src/util/meson.build b/src/util/meson.build
+--- a/src/util/meson.build
++++ b/src/util/meson.build
 @@ -317,6 +317,9 @@
  if dep_libdrm.found()
    files_mesa_util += files('u_sync_provider.c', 'u_sync_provider.h')
@@ -805,11 +852,9 @@ diff -ruN -x .haiku-patches pristine/src/util/meson.build mesa-26.2.4/src/util/m
  endif
  
  if with_platform_android
-Binary files pristine/src/util/perf/__pycache__/u_trace.cpython-314.pyc and mesa-26.2.4/src/util/perf/__pycache__/u_trace.cpython-314.pyc differ
-Binary files pristine/src/util/__pycache__/drirc_gen.cpython-314.pyc and mesa-26.2.4/src/util/__pycache__/drirc_gen.cpython-314.pyc differ
-diff -ruN -x .haiku-patches pristine/src/util/u_sync_provider.h mesa-26.2.4/src/util/u_sync_provider.h
---- pristine/src/util/u_sync_provider.h	2026-10-02 00:39:53.000000000 +1000
-+++ mesa-26.2.4/src/util/u_sync_provider.h	2026-10-24 13:41:43.617267112 +1100
+diff -ruN a/src/util/u_sync_provider.h b/src/util/u_sync_provider.h
+--- a/src/util/u_sync_provider.h
++++ b/src/util/u_sync_provider.h
 @@ -37,7 +37,8 @@
     struct util_sync_provider * (*clone)(struct util_sync_provider *p);
  };
@@ -820,9 +865,9 @@ diff -ruN -x .haiku-patches pristine/src/util/u_sync_provider.h mesa-26.2.4/src/
  struct util_sync_provider * util_sync_provider_drm(int drm_fd);
  #else
  static inline struct util_sync_provider *
-diff -ruN -x .haiku-patches pristine/src/util/u_sync_provider_haiku.c mesa-26.2.4/src/util/u_sync_provider_haiku.c
---- pristine/src/util/u_sync_provider_haiku.c	1970-01-01 11:00:00.000000000 +1100
-+++ mesa-26.2.4/src/util/u_sync_provider_haiku.c	2026-10-24 13:41:55.425017199 +1100
+diff -ruN a/src/util/u_sync_provider_haiku.c b/src/util/u_sync_provider_haiku.c
+--- a/src/util/u_sync_provider_haiku.c
++++ b/src/util/u_sync_provider_haiku.c
 @@ -0,0 +1,197 @@
 +/*
 + * Copyright 2026 air/OS
@@ -1021,9 +1066,9 @@ diff -ruN -x .haiku-patches pristine/src/util/u_sync_provider_haiku.c mesa-26.2.
 +
 +   return &provider->base;
 +}
-diff -ruN -x .haiku-patches pristine/src/vulkan/runtime/meson.build mesa-26.2.4/src/vulkan/runtime/meson.build
---- pristine/src/vulkan/runtime/meson.build	2026-10-02 00:39:53.000000000 +1000
-+++ mesa-26.2.4/src/vulkan/runtime/meson.build	2026-10-24 13:41:43.625874374 +1100
+diff -ruN a/src/vulkan/runtime/meson.build b/src/vulkan/runtime/meson.build
+--- a/src/vulkan/runtime/meson.build
++++ b/src/vulkan/runtime/meson.build
 @@ -57,6 +57,9 @@
  if dep_libdrm.found()
    vulkan_lite_runtime_files += files('vk_drm_syncobj.c')
@@ -1034,6 +1079,3 @@ diff -ruN -x .haiku-patches pristine/src/vulkan/runtime/meson.build mesa-26.2.4/
  endif
  
  if with_platform_android
-Binary files pristine/src/vulkan/util/__pycache__/vk_entrypoints.cpython-314.pyc and mesa-26.2.4/src/vulkan/util/__pycache__/vk_entrypoints.cpython-314.pyc differ
-Binary files pristine/src/vulkan/util/__pycache__/vk_extensions.cpython-314.pyc and mesa-26.2.4/src/vulkan/util/__pycache__/vk_extensions.cpython-314.pyc differ
-Binary files pristine/src/vulkan/util/__pycache__/vk_physical_device_features_gen.cpython-314.pyc and mesa-26.2.4/src/vulkan/util/__pycache__/vk_physical_device_features_gen.cpython-314.pyc differ
