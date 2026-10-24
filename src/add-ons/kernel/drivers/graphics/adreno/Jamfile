@@ -1,0 +1,17 @@
+SubDir HAIKU_TOP src add-ons kernel drivers graphics adreno ;
+
+UsePrivateKernelHeaders ;
+UseLibraryHeaders [ FDirName libfdt ] ;
+
+local libFDTSources =
+	fdt.c
+	fdt_ro.c
+;
+
+KernelAddon adreno :
+	adreno.cpp
+	$(libFDTSources)
+;
+
+SEARCH on [ FGristFiles $(libFDTSources) ]
+	= [ FDirName $(HAIKU_TOP) src libs libfdt ] ;
