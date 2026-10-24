@@ -44,12 +44,12 @@ cat > "$ROOT/cache-cross.ini" <<INI
 pkg_config_libdir = ['$ROOT/cache-pkgconfig', '$BASE/sysroot/boot/system/develop/lib/pkgconfig', '$BASE/sysroot/boot/system/lib/pkgconfig']
 INI
 
-# CPU tuning, like SetCPUProfile in build/jam/ArchitectureRules, e.g.
-# RPI4_MESA_CPU_FLAGS="-mtune=cortex-a72 -mno-outline-atomics" (inline atomics:
-# libgcc's outlined helpers never take their LSE path on Haiku, and the A72
-# has none). Generic code by default, see docs/rpi4/CPU-TUNING.md. This file's
-# arguments replace the base cross file's, so they repeat its sysroot.
-CPU_FLAGS=${RPI4_MESA_CPU_FLAGS:-}
+# Mesa runs only on the Pi 4 here: tune it for the Cortex-A72 like the rest of
+# the image (SetCPUProfile in build/jam/ArchitectureRules). Inline atomics
+# matter most: libgcc's outlined helpers never take their LSE path on Haiku,
+# and the A72 has none. RPI4_MESA_CPU_FLAGS= (empty) builds generic code.
+# This file's arguments replace the base cross file's: they repeat its sysroot.
+CPU_FLAGS=${RPI4_MESA_CPU_FLAGS--mtune=cortex-a72 -mno-outline-atomics}
 cpuArgs=$(printf "'%s', " "--sysroot=$BASE/sysroot" $CPU_FLAGS)
 cat > "$ROOT/cpu-cross.ini" <<INI
 [built-in options]

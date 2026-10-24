@@ -9,10 +9,10 @@ Evidence: `/mnt/HaikuWork/rpi4/evidence/cpu-tuning-20261024`.
 
 `SetCPUProfile <architecture> : <profile>` (`build/jam/ArchitectureRules`)
 adds code generation flags to userland, kernel and boot loaders of a build.
-Call it from `UserBuildConfig`. The Pi build switches it on with
-`RPI4_CPU_PROFILE = rpi4 ;` before including `tools/rpi4/UserBuildConfig`.
-Use an object directory of its own: objects built with other flags are not
-rebuilt.
+Call it from `UserBuildConfig`. `tools/rpi4/UserBuildConfig` applies profile
+`rpi4` to every Pi image; `RPI4_CPU_PROFILE = none ;` before including it
+builds generic code (for comparisons). Use an object directory per profile:
+objects built with other flags are not rebuilt.
 
 Profile `rpi4` keeps the instruction set floor (`-march=armv8-a+crc`; the
 BCM2711 has no crypto extension) and adds:
@@ -25,12 +25,12 @@ BCM2711 has no crypto extension) and adds:
   operation (Haiku's `atomic_*()`, `std::atomic`, reference counts) was a
   call plus a flag load for nothing.
 
-Hand-written assembly is unchanged. Mesa takes the same flags through
-`RPI4_MESA_CPU_FLAGS` in `tools/rpi4/mesa/build.sh`.
+Hand-written assembly is unchanged. `tools/rpi4/mesa/build.sh` gives Mesa the
+same flags (`RPI4_MESA_CPU_FLAGS=` builds generic code).
 
-**It is not the default.** Tuned images do not boot in QEMU; the cause is a
-race that the baseline also hits (see below). Enable it after that race is
-fixed and the native A/B below shows a gain.
+No native measurement exists yet: the Pi was not connected. The gain is the
+removed call per atomic operation plus A72 scheduling; how much that is in
+applications is for the native comparison at the end of this page.
 
 ## Code generation, generic against tuned
 
@@ -64,57 +64,39 @@ inline atomics a single `ldaxr`/`stlxr` attempt can fail, and the first
 tuned QEMU boot panicked in the kernel's page-access debugging
 (`first-tuned-weak-cas.log`). Both functions are strong now.
 
-## Blocker: kernel add-on loading race (QEMU)
+## QEMU runs stale translated code after add-on reloads
 
-After that fix, tuned images still stop in QEMU, while driver probing or
-unloading kernel add-ons loaded from the system package:
+The first tuned images stopped in QEMU while probing drivers: a NULL
+`gDeviceManager`, a GOT entry of 0, a jump into relocation data. The generic
+image failed the same way about once in seven boots. All of it is QEMU's,
+not air/OS's:
 
-- NULL `gDeviceManager` in `virtio_input` (its dependency pointer unset),
-- `bindfs` calling a GOT entry that holds 0,
-- `scsi_disk` writing a page past its own image, from an instruction that
-  is a `mov` in the file. The page tables (read with the QEMU monitor) show
-  the right code at that address.
+- The kernel's FNV hash of each segment right after loading matches the
+  file on the build host; KDL and the QEMU monitor show the right code,
+  GOT entries and `gDeviceManager` at the time of the fault.
+- With a single CPU it still happens, deterministically.
+- The registers at the fault hold pc-relative values (`adrp` results, the
+  link register) that are off by exactly the distance to another virtual
+  address: translated code of an earlier add-on that occupied the same
+  addresses ran instead.
+- `-accel tcg,one-insn-per-tb=on` boots every time; QEMU 9.2.4 and 10.2.0
+  both fail without it. A global `tlbi vmalle1is` or a 200 us delay after
+  each `load_kernel_add_on()` also hide it, page-level `tlbi` does not.
 
-The baseline image is affected too: it booted 6 of 7 times; the failure
-was a NULL call in `net_server`'s thread (`final-base1.log`). The add-ons
-involved load at `0xffff0000021xxxxx`, just above the loader's 32 MB kernel
-window, in its freed ranges.
+`tools/rpi4/qemu-run.sh` therefore uses one instruction per translation block
+(`RPI4_QEMU_TB=multi` for the old behaviour). The full image then needs about
+1200 seconds instead of 240 to reach the desktop; tuned and generic images
+both get there without a panic (`qemu-resolution/long-*`). Experiments that ruled out the
+kernel (page scrubber, page queue debugging, live page tracking, segment
+re-reads, SD driver, boot loader block mappings, TLB flushes on unmap) are
+in the evidence directory with their scripts: `qemu_kdl.py` runs KDL
+commands at the panic, `qemu-probe.sh` QEMU monitor commands.
 
-What changes the outcome (all with the `-mtune`-only build):
-
-| Change | Result |
-| --- | --- |
-| `-mtune` only, or `-mno-outline-atomics` only | both fail |
-| tuned kernel and boot modules, generic system package | boots |
-| generic kernel, tuned system package | fails |
-| system package stored uncompressed (not Zstandard) | fails |
-| TLB flush in `flush_va_if_accessed` regardless of access flag | fails |
-| loader maps only the physical map with block descriptors | fails |
-| `tlbi vmalle1is` after each `load_kernel_add_on()` | boots 3/3 |
-| I-cache sync only, or `tlbi` of the add-on's own range only | fails |
-| 200 µs `spin()` after each `load_kernel_add_on()` | boots 3/3 |
-
-A delay works as well as a TLB flush: this is a timing race, not a stale
-translation. Something changes add-on memory after it is loaded and
-relocated, or the add-on runs before data it depends on is in place. The
-exact writer is not found. Look at what runs concurrently with `main2` at
-`device_manager_init_post_modules` / `module_init_post_boot_device`, and at
-what used the freed boot loader ranges (`vm_free_unused_boot_loader_range`
-frees pages before it unmaps them). `qemu_kdl.py` in the evidence directory
-runs KDL commands at the panic; `qemu-probe.sh` runs QEMU monitor commands.
-
-Two related defects were found on the way and kept as patches in the
-evidence directory, not committed, because neither can be validated while
-the race shifts with any timing change:
-
-- `addon-icache-sync.patch`: `load_kernel_add_on()` writes code through a
-  data mapping and makes it executable with `set_area_protection()`, but
-  never cleans the D-cache or invalidates the I-cache. `Protect()` does not
-  either. Real hardware can run stale instructions from reused pages.
-- `rpi-loader-no-blocks.patch`: the loader maps its regions with block
-  descriptors when size and alignment allow; the kernel's `GetOrMakeTable()`
-  can neither split nor unmap blocks (its assertion is compiled out in
-  release builds). Only the physical map should use blocks.
+Found on the way and fixed: `load_kernel_add_on()` wrote add-on code through
+a data mapping and never synchronised the instruction cache (real hardware
+can run stale instructions from reused pages). Kept as a patch, not applied:
+`rpi-loader-no-blocks.patch` (the loader may map its regions with block
+descriptors, which the kernel cannot split or unmap).
 
 `FreeTable()` flushed the address without the kernel's upper bits (it
 computed `fullVa` and passed `nextVa`); fixed. It only runs for user maps
@@ -131,14 +113,13 @@ today, where both are the same.
 
 ## Native measurement, when the Pi is back
 
-1. Fix the race above; QEMU boots of both images must pass repeatedly.
-2. Flash or install `build-tune-base`, then `build-tune-a72`, alternating
+1. Flash or install `build-tune-base`, then `build-tune-a72`, alternating
    (ABBA), same packages and firmware.
-3. `rpi4_atomic_bench` (lab image, `tools/rpi4/atomic_bench.cpp`) built in
+2. `rpi4_atomic_bench` (lab image, `tools/rpi4/atomic_bench.cpp`) built in
    each directory: uncontended `atomic_add`, `atomic_test_and_set`,
    `std::atomic`, mutexes, a semaphore round trip and four-thread contention.
-4. The existing workloads in [PERFORMANCE.md](PERFORMANCE.md): app launch
+3. The existing workloads in [PERFORMANCE.md](PERFORMANCE.md): app launch
    (`rpi4_app_bench`), drawing, memory, VM, the browser DOM fixture and
    boot markers.
-5. Enable `RPI4_CPU_PROFILE` (and the Mesa flags) by default only for
-   measured gains.
+4. Keep the profile only if nothing regresses; `RPI4_CPU_PROFILE = none`
+   and `RPI4_MESA_CPU_FLAGS=` undo it.

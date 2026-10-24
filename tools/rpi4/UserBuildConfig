@@ -24,11 +24,11 @@ if $(HAIKU_BUILD_PROFILE) = minimum-rpi4 {
 }
 HAIKU_IMAGE_LABEL = airOS ;
 
-# Tune all code for the Pi 4's Cortex-A72 (see SetCPUProfile in
-# build/jam/ArchitectureRules): RPI4_CPU_PROFILE = rpi4 ; before including
-# this file. Not the default yet: tuned images stop at a kernel add-on race
-# in QEMU (docs/rpi4/CPU-TUNING.md). Use an object directory of its own.
-RPI4_CPU_PROFILE ?= none ;
+# These images only run on the Pi 4: tune all code for its Cortex-A72 (see
+# SetCPUProfile in build/jam/ArchitectureRules, docs/rpi4/CPU-TUNING.md).
+# RPI4_CPU_PROFILE = none ; before including this file builds generic code.
+# Switching it needs an object directory of its own.
+RPI4_CPU_PROFILE ?= rpi4 ;
 if $(RPI4_CPU_PROFILE) != none {
 	SetCPUProfile arm64 : $(RPI4_CPU_PROFILE) ;
 }

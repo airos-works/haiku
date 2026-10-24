@@ -6,6 +6,7 @@
 #   RPI4_SD=<image>             attach an SD card image
 #   RPI4_SCREENSHOT=<file.png>  save the frame buffer at the end
 #   RPI4_QEMU_ARGS=...          more QEMU arguments
+#   RPI4_QEMU_TB=multi          QEMU's normal translation blocks (faster)
 set -euo pipefail
 WORK=/mnt/HaikuWork/rpi4
 BUILD=${RPI4_BUILD:-$WORK/build}
@@ -25,6 +26,11 @@ fdtput -d "$LOG.dtb" /soc/hvs@7e400000 compatible
 fdtput -d "$LOG.dtb" /v3dbus/v3d@7ec04000 compatible
 args=(-M raspi4b -kernel "$LOADER" -dtb "$LOG.dtb"
     -append "$*" -serial "file:$LOG" -display none -monitor stdio)
+# QEMU 9.2 and 10.2 run stale translated code once the kernel loads an add-on
+# where an unloaded one was: wrong pc-relative values, a jump into data. The
+# guest's memory and page tables are right; one instruction per block avoids
+# it (docs/rpi4/CPU-TUNING.md).
+[ "${RPI4_QEMU_TB:-}" = multi ] || args+=(-accel tcg,one-insn-per-tb=on)
 [ -f "$ARCHIVE" ] && args+=(-initrd "$ARCHIVE")
 [ -n "${RPI4_SD:-}" ] && args+=(-drive "file=$RPI4_SD,if=sd,format=raw")
 {
