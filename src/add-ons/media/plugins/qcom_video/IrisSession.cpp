@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 
 static const bigtime_t kAnswerTimeout = 1000000;
@@ -52,9 +53,19 @@ IrisSession::_OpenSession(uint32 type, uint32 codec)
 			strerror(status));
 	}
 
-	fSession = atomic_add((int32*)&sNextSession, 1);
-	uint32 init[5] = { 20, HFI_CMD_SYS_SESSION_INIT, fSession, type, codec };
-	status = _Send(init);
+	// unique among the teams that use the codec: the driver refuses a
+	// session another open has
+	for (int32 attempt = 0; attempt < 16; attempt++) {
+		fSession = ((uint32)getpid() << 12)
+			| (atomic_add((int32*)&sNextSession, 1) & 0xfff);
+		uint32 init[5] = { 20, HFI_CMD_SYS_SESSION_INIT, fSession, type,
+			codec };
+		status = fDevice.Send(init);
+		if (status != B_BUSY)
+			break;
+	}
+	if (status != B_OK)
+		_Fail(status, "cannot send to the firmware: %s", strerror(status));
 	if (status == B_OK)
 		status = _WaitFor(HFI_MSG_SYS_SESSION_INIT);
 	if (status != B_OK) {

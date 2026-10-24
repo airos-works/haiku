@@ -15,8 +15,11 @@
 	runs HFI's system init; userland speaks HFI (generation 1, the packets
 	of Linux' iris_hfi_gen1_defines.h) to it from there on: it sends command
 	packets and receives the firmware's messages, and allocates the buffers
-	it hands the firmware. One open at a time owns the codec; its buffers go
-	when it closes.
+	it hands the firmware. Several opens can use the codec: each sends
+	commands only for the sessions it began (SYS_SESSION_INIT with a session
+	id no other open has) and receives only their messages and the
+	firmware's own. When an open closes, its sessions still running are
+	aborted and its buffers freed.
 
 	Buffers are pages anywhere, which the driver maps for the codec (cached
 	and coherent with it); their device address, below 0x80000000, is what

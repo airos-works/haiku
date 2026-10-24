@@ -12,7 +12,7 @@
 /*!	/dev/video/qcom_iris/0 (qcom_iris.h): the SC8280XP's video codec, whose
 	firmware the driver has started. HFI command packets go in, the
 	firmware's messages come out, and buffers for it are allocated here.
-	One IrisDevice at a time owns the codec.
+	Each IrisDevice is an open of its own, with the sessions it began.
 */
 class IrisDevice {
 public:
