@@ -2,6 +2,12 @@ SubDir HAIKU_TOP tools dragon-q8b ;
 
 # Lab tools for the Radxa Dragon Q8B, built only by a UserBuildConfig that
 # includes this directory.
+UsePrivateHeaders graphics ;
+
+Application adreno_test :
+	adreno_test.cpp
+;
+
 UsePrivateKernelHeaders ;
 
 KernelAddon qcom_probe :

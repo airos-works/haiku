@@ -10,8 +10,8 @@
 	arm-smmu. The firmware leaves the GPU off and its SMMU at its reset
 	state, so everything is set up here.
 
-	Nothing is published yet: the bring-up runs when devfs loads the driver
-	and logs what it gets. */
+	The bring-up runs on the first open of the device (adreno_drm.cpp), which
+	then uses the ring, fences and address space provided here. */
 
 
 #include <fcntl.h>
@@ -22,20 +22,19 @@
 #include <Drivers.h>
 #include <KernelExport.h>
 #include <arch/atomic.h>
+#include <condition_variable.h>
+#include <lock.h>
+#include <util/AutoLock.h>
+#include <smp.h>
 #include <vm/vm.h>
 
 #include <libfdt.h>
 
 #include "a690_tables.h"
+#include "adreno_private.h"
 
 
 extern void* gFDT;
-
-int32 api_version = B_CUR_DRIVER_API_VERSION;
-
-
-#define INFO(x...)	dprintf("adreno: " x)
-#define ERROR(x...)	dprintf("adreno: " x)
 
 
 // SC8280XP blocks
@@ -171,6 +170,7 @@ int32 api_version = B_CUR_DRIVER_API_VERSION;
 #define CB_TTBR0				0x20
 #define CB_TCR					0x30
 #define  CBTCR_T0SZ_32			32
+#define  CBTCR_T0SZ_39			25
 #define  CBTCR_IRGN0_WB			(1u << 8)
 #define  CBTCR_ORGN0_WB			(1u << 10)
 #define  CBTCR_SH0_INNER			(3u << 12)
@@ -205,42 +205,6 @@ int32 api_version = B_CUR_DRIVER_API_VERSION;
 #define GPU_CONTEXT_BANK		0
 #define GMU_CONTEXT_BANK		1
 #define GPU_STREAM_MASK			0xc00
-
-
-struct register_window {
-	area_id			area;
-	volatile uint8*	base;
-
-	status_t Map(const char* name, phys_addr_t physical, size_t size)
-	{
-		area = map_physical_memory(name, physical, size, B_ANY_KERNEL_ADDRESS,
-			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&base);
-		return area < 0 ? area : B_OK;
-	}
-
-	void Unmap()
-	{
-		if (area >= 0)
-			delete_area(area);
-		area = -1;
-	}
-
-	uint32 Read(uint32 offset) const
-		{ return *(volatile uint32*)(base + offset); }
-	void Write(uint32 offset, uint32 value)
-		{ *(volatile uint32*)(base + offset) = value; }
-
-	bool Wait(uint32 offset, uint32 mask, uint32 value, bigtime_t timeout)
-	{
-		bigtime_t end = system_time() + timeout;
-		while ((Read(offset) & mask) != value) {
-			if (system_time() > end)
-				return false;
-			spin(10);
-		}
-		return true;
-	}
-};
 
 
 static register_window sGcc, sGpucc, sGmu, sRscc, sPdc, sSmmu;
@@ -336,8 +300,8 @@ power_up_cx()
 //	#pragma mark - SMMU
 
 
-/*!	A stage 1 address space of 4 GiB (one level 1 table of 4 entries, level
-	2 and 3 tables as needed), walked coherently by the SMMU.
+/*!	A stage 1 address space of up to 512 GiB (a level 1 table, level 2 and
+	3 tables as needed), walked coherently by the SMMU.
 */
 class AddressSpace {
 public:
@@ -352,10 +316,10 @@ public:
 	/*!	\a privileged pages are for privileged accesses only, which may then
 		execute them (a page writable without privileges never is).
 	*/
-	status_t Map(uint32 address, phys_addr_t physical, uint32 attribute,
+	status_t Map(uint64 address, phys_addr_t physical, uint32 attribute,
 		bool privileged)
 	{
-		uint64* level2 = NextTable(fLevel1, (address >> 30) & 3);
+		uint64* level2 = NextTable(fLevel1, (address >> 30) & 511);
 		if (level2 == NULL)
 			return B_NO_MEMORY;
 		uint64* level3 = NextTable(level2, (address >> 21) & 511);
@@ -368,7 +332,7 @@ public:
 	}
 
 	/*!	Maps every page of a locked kernel area at \a address. */
-	status_t MapArea(void* virtualAddress, size_t size, uint32 address,
+	status_t MapArea(void* virtualAddress, size_t size, uint64 address,
 		uint32 attribute, bool privileged)
 	{
 		for (size_t offset = 0; offset < size; offset += B_PAGE_SIZE) {
@@ -386,7 +350,32 @@ public:
 		return B_OK;
 	}
 
+	void Unmap(uint64 address, size_t size)
+	{
+		for (uint64 page = address; page < address + size;
+				page += B_PAGE_SIZE) {
+			uint64* level2 = FindTable(fLevel1, (page >> 30) & 511);
+			uint64* level3 = level2 != NULL
+				? FindTable(level2, (page >> 21) & 511) : NULL;
+			if (level3 != NULL)
+				level3[(page >> 12) & 511] = 0;
+		}
+		memory_full_barrier();
+	}
+
 private:
+	uint64* FindTable(uint64* table, uint32 index)
+	{
+		if ((table[index] & PTE_VALID) == 0)
+			return NULL;
+		phys_addr_t physical = table[index] & PTE_ADDRESS_MASK;
+		for (size_t i = 0; i < fTableCount; i++) {
+			if (fTablePhysical[i] == physical)
+				return fTables[i];
+		}
+		return NULL;
+	}
+
 	uint64* AllocateTable(phys_addr_t& physical)
 	{
 		void* table;
@@ -427,8 +416,8 @@ private:
 
 	uint64*		fLevel1 = NULL;
 	phys_addr_t	fLevel1Physical = 0;
-	uint64*		fTables[64];
-	phys_addr_t	fTablePhysical[64];
+	uint64*		fTables[1024];
+	phys_addr_t	fTablePhysical[1024];
 	size_t		fTableCount = 0;
 };
 
@@ -450,7 +439,7 @@ smmu_sync_context(uint32 bank)
 */
 static void
 smmu_attach(uint32 entry, uint32 stream, uint32 mask, uint32 bank,
-	const AddressSpace& space)
+	const AddressSpace& space, uint32 vaSizeField)
 {
 	uint32 cb = SMMU_CB(bank);
 	sSmmu.Write(cb + CB_SCTLR, 0);
@@ -458,7 +447,7 @@ smmu_attach(uint32 entry, uint32 stream, uint32 mask, uint32 bank,
 	sSmmu.Write(SMMU_CBAR(bank), CBAR_TYPE_S1_S2BYPASS | CBAR_S1_MEMATTR_WB
 		| CBAR_S1_BPSHCFG_NSH | (bank + 1));
 	sSmmu.Write(cb + CB_TCR2, CBTCR2_SEP_UPSTREAM | CBTCR2_PASIZE_40);
-	sSmmu.Write(cb + CB_TCR, CBTCR_T0SZ_32 | CBTCR_IRGN0_WB | CBTCR_ORGN0_WB
+	sSmmu.Write(cb + CB_TCR, vaSizeField | CBTCR_IRGN0_WB | CBTCR_ORGN0_WB
 		| CBTCR_SH0_INNER | CBTCR_EPD1);
 	uint64 root = space.Root();
 	sSmmu.Write(cb + CB_TTBR0, (uint32)root);
@@ -1251,46 +1240,71 @@ struct elf32_program_header {
 };
 
 
-/*!	A standard (yielding) SMC64 call to the SIP service \a service. */
+struct scm_arguments {
+	uint64	function;
+	uint64	info;
+	uint64	a0, a1, a2;
+	uint64	r0, r1;
+	uint32	interrupted;
+};
+
+
+static void
+scm_smc(void* data, int cpu)
+{
+	scm_arguments* arguments = (scm_arguments*)data;
+	register uint64 r0 asm("x0") = arguments->function;
+	register uint64 r1 asm("x1") = arguments->info;
+	register uint64 r2 asm("x2") = arguments->a0;
+	register uint64 r3 asm("x3") = arguments->a1;
+	register uint64 r4 asm("x4") = arguments->a2;
+	register uint64 r5 asm("x5") = 0;
+	register uint64 r6 asm("x6") = 0;
+	register uint64 r7 asm("x7") = 0;
+	while (true) {
+		asm volatile("smc #0"
+			: "+r" (r0), "+r" (r1), "+r" (r2), "+r" (r3), "+r" (r4),
+				"+r" (r5), "+r" (r6), "+r" (r7)
+			:
+			: "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+				"x16", "x17", "memory");
+		if (r0 != SCM_INTERRUPTED)
+			break;
+		// resume the interrupted call
+		arguments->interrupted++;
+		r1 = arguments->info;
+		r2 = arguments->a0;
+		r3 = arguments->a1;
+		r4 = arguments->a2;
+		r5 = r6 = r7 = 0;
+	}
+	arguments->r0 = r0;
+	arguments->r1 = r1;
+}
+
+
+/*!	A standard (yielding) SMC64 call to the SIP service \a service, made on
+	CPU 0: on the Dragon, PAS calls from other CPUs never return.
+*/
 static int64
 scm_call(uint32 service, uint32 command, uint32 argumentInfo, uint64 a0,
 	uint64 a1 = 0, uint64 a2 = 0, uint64* result = NULL)
 {
-	const uint64 function = 1ull << 30 | 2ull << 24 | service << 8 | command;
-	uint64 x0;
+	scm_arguments arguments = {};
+	arguments.function = 1ull << 30 | 2ull << 24 | service << 8 | command;
+	arguments.info = argumentInfo;
+	arguments.a0 = a0;
+	arguments.a1 = a1;
+	arguments.a2 = a2;
 	for (int attempt = 0; attempt < 100; attempt++) {
-		register uint64 r0 asm("x0") = function;
-		register uint64 r1 asm("x1") = argumentInfo;
-		register uint64 r2 asm("x2") = a0;
-		register uint64 r3 asm("x3") = a1;
-		register uint64 r4 asm("x4") = a2;
-		register uint64 r5 asm("x5") = 0;
-		register uint64 r6 asm("x6") = 0;
-		register uint64 r7 asm("x7") = 0;
-		do {
-			asm volatile("smc #0"
-				: "+r" (r0), "+r" (r1), "+r" (r2), "+r" (r3), "+r" (r4),
-					"+r" (r5), "+r" (r6), "+r" (r7)
-				:
-				: "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
-					"x16", "x17", "memory");
-			if (r0 == SCM_INTERRUPTED) {
-				// resume the interrupted call
-				r1 = argumentInfo;
-				r2 = a0;
-				r3 = a1;
-				r4 = a2;
-				r5 = r6 = r7 = 0;
-			}
-		} while (r0 == SCM_INTERRUPTED);
-		x0 = r0;
-		if (result != NULL)
-			*result = r1;
-		if (x0 != SCM_V2_EBUSY)
+		call_single_cpu_sync(0, scm_smc, &arguments);
+		if (arguments.r0 != SCM_V2_EBUSY)
 			break;
 		snooze(30000);
 	}
-	return (int64)x0;
+	if (result != NULL)
+		*result = arguments.r1;
+	return (int64)arguments.r0;
 }
 
 
@@ -1457,6 +1471,25 @@ zap_shader_load()
 #define CP_MEM_WRITE			0x3d
 #define CP_ME_INIT				0x48
 #define CP_SET_SECURE_MODE		0x66
+#define CP_EVENT_WRITE			0x46
+#define  EVENT_CACHE_FLUSH_TS	4
+#define  EVENT_PC_CCU_INVALIDATE_DEPTH 24
+#define  EVENT_PC_CCU_INVALIDATE_COLOR 25
+#define  EVENT_IRQ				(1u << 31)
+#define MEMPTR_RPTR				0
+#define MEMPTR_FENCE			4
+
+#define RBBM_INT_0_MASK			0x00038
+#define RBBM_INT_CLEAR_CMD		0x00037
+#define  INT_CP_AHB_ERROR		(1u << 1)
+#define  INT_CP_HW_ERROR		(1u << 9)
+#define  INT_CP_CACHE_FLUSH_TS	(1u << 20)
+#define  INT_RBBM_HANG_DETECT	(1u << 23)
+#define  INT_UCHE_OOB_ACCESS	(1u << 24)
+#define GPU_INT_MASK			(INT_CP_AHB_ERROR | INT_CP_HW_ERROR \
+	| INT_CP_CACHE_FLUSH_TS | INT_RBBM_HANG_DETECT | INT_UCHE_OOB_ACCESS)
+#define GMU_ALWAYS_ON_COUNTER_L	0x1f888
+#define GMU_ALWAYS_ON_COUNTER_H	0x1f889
 
 static AddressSpace sGpuSpace;
 static register_window sGpu;
@@ -1522,7 +1555,7 @@ ring_flush()
 static uint32
 ring_rptr()
 {
-	return ((volatile uint32*)sMemptrs.virt)[0];
+	return ((volatile uint32*)sMemptrs.virt)[MEMPTR_RPTR / 4];
 }
 
 
@@ -1603,8 +1636,10 @@ gpu_hw_init()
 	free(sqe);
 	memory_full_barrier();
 
-	smmu_attach(0, 0x0, GPU_STREAM_MASK, GPU_CONTEXT_BANK, sGpuSpace);
-	smmu_attach(1, 0x1, GPU_STREAM_MASK, GPU_CONTEXT_BANK, sGpuSpace);
+	smmu_attach(0, 0x0, GPU_STREAM_MASK, GPU_CONTEXT_BANK, sGpuSpace,
+		CBTCR_T0SZ_39);
+	smmu_attach(1, 0x1, GPU_STREAM_MASK, GPU_CONTEXT_BANK, sGpuSpace,
+		CBTCR_T0SZ_39);
 
 	// GBIF out of halt, no trusted memory range, 64 bit addressing
 	gpu_write(REG_A6XX_GBIF_HALT, 0);
@@ -1693,7 +1728,7 @@ gpu_hw_init()
 	gpu_write(REG_A6XX_UCHE_CMDQ_CONFIG, 0x90);
 	gpu_write(REG_A6XX_CP_APRIV_CNTL, 1u << 6 | 1u << 5 | 1u << 3 | 1u << 2
 		| 1u << 1);
-	gpu_write(REG_A6XX_RBBM_INT_0_MASK, 0);
+	gpu_write(REG_A6XX_RBBM_INT_0_MASK, GPU_INT_MASK);
 
 	// the ring: 32 KiB, 32 byte blocks, the hardware's rptr shadow
 	gpu_write64(REG_A6XX_CP_SQE_INSTR_BASE, sSqe.iova);
@@ -1742,6 +1777,35 @@ gpu_hw_init()
 //	#pragma mark - bring-up
 
 
+static mutex sStartLock = MUTEX_INITIALIZER("adreno start");
+static status_t sStartStatus = B_NO_INIT;
+static mutex sRingLock = MUTEX_INITIALIZER("adreno ring");
+static uint32 sNextFence = 1;
+static ConditionVariable sFenceCondition;
+static uint32 sInterrupt;
+static bool sInterruptInstalled;
+static int32 sFaults;
+
+
+static int32
+gpu_interrupt(void*)
+{
+	uint32 status = gpu_read(REG_A6XX_RBBM_INT_0_STATUS);
+	if (status == 0)
+		return B_UNHANDLED_INTERRUPT;
+	gpu_write(RBBM_INT_CLEAR_CMD, status);
+
+	if ((status & ~INT_CP_CACHE_FLUSH_TS) != 0) {
+		atomic_add(&sFaults, 1);
+		dprintf("adreno: GPU interrupt %#" B_PRIx32 ", RBBM status %#" B_PRIx32
+			"\n", status, gpu_read(REG_A6XX_RBBM_STATUS));
+	}
+	if ((status & INT_CP_CACHE_FLUSH_TS) != 0)
+		sFenceCondition.NotifyAll();
+	return B_INVOKE_SCHEDULER;
+}
+
+
 static status_t
 bring_up()
 {
@@ -1769,14 +1833,13 @@ bring_up()
 		return B_NO_MEMORY;
 
 	if (gmu_read(GMU_CM3_SYSRESET) == 0) {
-		INFO("the GMU is running already\n");
+		ERROR("the GMU runs already (a second driver?)\n");
 		return B_BUSY;
 	}
 
 	INFO("SMMU sCR0 %#" B_PRIx32 ", %" B_PRIu32 " stream groups, %" B_PRIu32
-		" context banks; GMU in reset %" B_PRIu32 "\n", sSmmu.Read(SMMU_sCR0),
-		sSmmu.Read(SMMU_IDR0) & 0xff, sSmmu.Read(SMMU_IDR1) & 0xff,
-		gmu_read(GMU_CM3_SYSRESET));
+		" context banks\n", sSmmu.Read(SMMU_sCR0),
+		sSmmu.Read(SMMU_IDR0) & 0xff, sSmmu.Read(SMMU_IDR1) & 0xff);
 
 	status = sGmuSpace.Init();
 	if (status != B_OK)
@@ -1795,11 +1858,7 @@ bring_up()
 		return B_NO_MEMORY;
 	}
 	smmu_attach(2, GMU_STREAM_ID, GMU_STREAM_MASK, GMU_CONTEXT_BANK,
-		sGmuSpace);
-	INFO("GMU stream %#x routed to context bank %d, SCTLR %#" B_PRIx32
-		", page tables at %#" B_PRIxPHYSADDR "\n", GMU_STREAM_ID,
-		GMU_CONTEXT_BANK, sSmmu.Read(SMMU_CB(GMU_CONTEXT_BANK) + CB_SCTLR),
-		sGmuSpace.Root());
+		sGmuSpace, CBTCR_T0SZ_32);
 
 	size_t firmwareSize;
 	uint8* firmware = (uint8*)load_firmware("qcom/a660_gmu.bin",
@@ -1822,60 +1881,187 @@ bring_up()
 	smmu_report(GMU_CONTEXT_BANK, "after the HFI start");
 	if (status != B_OK)
 		return status;
-	INFO("HFI started\n");
 
 	// the lowest GPU level to start with (Linux' a6xx_gmu_set_initial_freq())
 	uint32 vote[4] = {0, 1, 1, 0};
 	status = hfi_send(HFI_H2F_MSG_GX_BW_PERF_VOTE, vote, sizeof(vote));
-	INFO("GPU level 1 vote: %s\n", strerror(status));
+	if (status != B_OK)
+		return status;
 
 	status = gmu_gpu_set();
 	if (status != B_OK)
 		return status;
 
+	sFenceCondition.Init(&sFenceCondition, "adreno fence");
+
+	// the GPU's interrupt, an SPI
+	int node = fdt_node_offset_by_compatible(gFDT, -1, "qcom,adreno-690.0");
+	int length;
+	const fdt32_t* interrupts = (const fdt32_t*)fdt_getprop(gFDT, node,
+		"interrupts", &length);
+	if (interrupts == NULL || length < 12 || fdt32_to_cpu(interrupts[0]) != 0)
+		return B_BAD_DATA;
+	sInterrupt = fdt32_to_cpu(interrupts[1]) + 32;
+
 	status = gpu_hw_init();
 	smmu_report(GPU_CONTEXT_BANK, "after the GPU start");
-	return status;
+	if (status != B_OK)
+		return status;
+
+	gpu_write(RBBM_INT_CLEAR_CMD, 0xffffffff);
+	status = install_io_interrupt_handler(sInterrupt, gpu_interrupt, NULL, 0);
+	if (status != B_OK)
+		return status;
+	sInterruptInstalled = true;
+	INFO("GPU running, interrupt %" B_PRIu32 "\n", sInterrupt);
+	return B_OK;
 }
 
 
-// devfs calls init_hardware() when it loads the driver: the bring-up runs
-// then, once, and the driver reports no device yet.
+//	#pragma mark - interface
+
+
 status_t
-init_hardware()
+adreno_gpu_start()
 {
-	static bool sDone = false;
-	if (!sDone) {
-		sDone = true;
-		status_t status = bring_up();
-		INFO("bring-up: %s\n", strerror(status));
+	MutexLocker locker(sStartLock);
+	if (sStartStatus == B_NO_INIT) {
+		sStartStatus = bring_up();
+		if (sStartStatus != B_OK)
+			ERROR("bring-up failed: %s\n", strerror(sStartStatus));
+		else
+			sStartStatus = B_OK;
 	}
-	return B_ERROR;
+	return sStartStatus;
+}
+
+
+bool
+adreno_gpu_running()
+{
+	return sStartStatus == B_OK;
 }
 
 
 status_t
-init_driver()
+adreno_gpu_map(uint64 iova, void* address, size_t size, bool cached)
 {
-	return B_ERROR;
+	return sGpuSpace.MapArea(address, size, iova,
+		cached ? ATTR_CACHED : ATTR_UNCACHED, false);
 }
 
 
 void
-uninit_driver()
+adreno_gpu_unmap(uint64 iova, size_t size)
 {
+	sGpuSpace.Unmap(iova, size);
+	uint32 cb = SMMU_CB(GPU_CONTEXT_BANK);
+	sSmmu.Write(cb + CB_TLBIALL, 0);
+	smmu_sync_context(GPU_CONTEXT_BANK);
 }
 
 
-const char**
-publish_devices()
+void
+adreno_ring_lock()
 {
-	return NULL;
+	mutex_lock(&sRingLock);
 }
 
 
-device_hooks*
-find_device(const char* name)
+void
+adreno_ring_unlock()
 {
-	return NULL;
+	mutex_unlock(&sRingLock);
+}
+
+
+status_t
+adreno_ring_reserve(uint32 dwords)
+{
+	const uint32 size = RING_SIZE / 4;
+	if (dwords + 16 >= size)
+		return B_BAD_VALUE;
+	bigtime_t timeout = system_time() + 5000000;
+	while (((ring_rptr() - sRingNext - 1) & (size - 1)) < dwords + 16) {
+		if (system_time() > timeout) {
+			ERROR("the ring stays full (rptr %" B_PRIu32 ", wptr %" B_PRIu32
+				")\n", ring_rptr(), sRingNext);
+			return B_TIMED_OUT;
+		}
+		snooze(100);
+	}
+	return B_OK;
+}
+
+
+void
+adreno_ring_emit(uint32 value)
+{
+	ring_emit(value);
+}
+
+
+uint32
+adreno_ring_flush_fence()
+{
+	uint32 fence = sNextFence++;
+	ring_emit(pkt7(CP_EVENT_WRITE, 4));
+	ring_emit(EVENT_CACHE_FLUSH_TS | EVENT_IRQ);
+	uint64 fenceAddress = (uint64)sMemptrs.iova + MEMPTR_FENCE;
+	ring_emit((uint32)fenceAddress);
+	ring_emit((uint32)(fenceAddress >> 32));
+	ring_emit(fence);
+	ring_flush();
+	return fence;
+}
+
+
+uint32
+adreno_completed_fence()
+{
+	return ((volatile uint32*)sMemptrs.virt)[MEMPTR_FENCE / 4];
+}
+
+
+status_t
+adreno_wait_fence(uint32 fence, bigtime_t deadline)
+{
+	while ((int32)(adreno_completed_fence() - fence) < 0) {
+		ConditionVariableEntry entry;
+		sFenceCondition.Add(&entry);
+		if ((int32)(adreno_completed_fence() - fence) >= 0)
+			break;
+		status_t status = entry.Wait(B_ABSOLUTE_TIMEOUT | B_CAN_INTERRUPT,
+			deadline == B_INFINITE_TIMEOUT ? B_INFINITE_TIMEOUT : deadline);
+		if (status == B_TIMED_OUT || status == B_INTERRUPTED)
+			return (int32)(adreno_completed_fence() - fence) >= 0
+				? B_OK : status;
+	}
+	return B_OK;
+}
+
+
+uint64
+adreno_timestamp()
+{
+	uint32 high, low;
+	do {
+		high = gmu_read(GMU_ALWAYS_ON_COUNTER_H);
+		low = gmu_read(GMU_ALWAYS_ON_COUNTER_L);
+	} while (gmu_read(GMU_ALWAYS_ON_COUNTER_H) != high);
+	return (uint64)high << 32 | low;
+}
+
+
+uint32
+adreno_faults()
+{
+	return (uint32)sFaults;
+}
+
+
+uint32
+adreno_pkt7(uint32 opcode, uint32 count)
+{
+	return pkt7(opcode, count);
 }

@@ -153,11 +153,27 @@ gpu_power_up()
 		return;
 
 	area_id area;
-	volatile uint8* smmu = map({"probe gpu smmu", 0x3da0000, 0x1000}, area);
+	volatile uint8* smmu = map({"probe gpu smmu", 0x3da0000, 0x20000}, area);
 	if (smmu != NULL) {
 		dprintf("qcom_probe: gpu smmu sCR0 %#" B_PRIx32 " IDR0 %#" B_PRIx32
-			" IDR1 %#" B_PRIx32 " IDR7 %#" B_PRIx32 "\n", rd(smmu, 0),
-			rd(smmu, 0x20), rd(smmu, 0x24), rd(smmu, 0x3c));
+			" IDR1 %#" B_PRIx32 " IDR2 %#" B_PRIx32 " IDR7 %#" B_PRIx32 "\n",
+			rd(smmu, 0), rd(smmu, 0x20), rd(smmu, 0x24), rd(smmu, 0x28),
+			rd(smmu, 0x3c));
+		uint32 groups = rd(smmu, 0x20) & 0xff;
+		for (uint32 i = 0; i < groups; i++) {
+			dprintf("qcom_probe: gpu smmu SMR%" B_PRIu32 " %#" B_PRIx32 " S2CR %#"
+				B_PRIx32 "\n", i, rd(smmu, 0x800 + 4 * i),
+				rd(smmu, 0xc00 + 4 * i));
+		}
+		uint32 banks = rd(smmu, 0x24) & 0xff;
+		for (uint32 i = 0; i < banks; i++) {
+			volatile uint8* cb = smmu + 0x10000 + 0x1000 * i;
+			dprintf("qcom_probe: gpu smmu CB%" B_PRIu32 " CBAR %#" B_PRIx32
+				" CBA2R %#" B_PRIx32 " SCTLR %#" B_PRIx32 " TCR %#" B_PRIx32
+				" TTBR0 %#" B_PRIx32 "%08" B_PRIx32 " FSR %#" B_PRIx32 "\n", i,
+				rd(smmu, 0x1000 + 4 * i), rd(smmu, 0x1800 + 4 * i), rd(cb, 0),
+				rd(cb, 0x30), rd(cb, 0x24), rd(cb, 0x20), rd(cb, 0x58));
+		}
 		delete_area(area);
 	}
 	volatile uint8* gmu = map({"probe gmu", 0x3d6a000, 0x34000}, area);
