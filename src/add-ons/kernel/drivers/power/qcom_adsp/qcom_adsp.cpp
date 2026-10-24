@@ -1281,6 +1281,30 @@ static glink_channel* sGpr;
 static bool sAudioReady;
 static bigtime_t sAudioRequested;
 
+// PRM, the DSP's power and resource manager (q6prm.c): hardware votes and
+// LPASS clocks
+static const uint32 kGprPrmPort = 2;			// GPR_PRM_MODULE_IID
+static const uint32 kPrmRequest = 0x0100100f;	// PRM_CMD_REQUEST_HW_RSC
+static const uint32 kPrmRequestResponse = 0x02001002;
+static const uint32 kPrmHwCore = 0x08001032;	// PARAM_ID_RSC_HW_CORE
+static const uint32 kPrmAudioClock = 0x0800102c;	// PARAM_ID_RSC_AUDIO_HW_CLK
+// lab ("audio_probe"): what the RX macro (the headphone path) needs, as
+// lpass-rx-macro asks for it: the macro and digital codec votes, its two
+// core clocks at 19.2 MHz (DT: LPASS_CLK_ID_RX_CORE_TX_MCLK, _2X_MCLK)
+static bool sAudioProbe;
+static int sPrmStep;
+static int sPrmPending = -1;
+static const struct {
+	bool		clock;
+	uint32		id;
+	const char*	name;
+} kPrmRequests[] = {
+	{false, 1, "LPASS macro vote"},
+	{false, 2, "digital codec vote"},
+	{true, 0x312, "RX core TX MCLK"},
+	{true, 0x313, "RX core TX 2X MCLK"},
+};
+
 
 static status_t
 gpr_send(uint32 destinationPort, uint32 opcode, const void* payload,
@@ -1311,6 +1335,20 @@ gpr_receive(glink_channel* channel, const uint8* data, uint32 length)
 	uint32 result = 0;
 	if (length >= 28)
 		memcpy(&result, data + 24, 4);
+	if (opcode == kPrmRequestResponse
+		|| (opcode == kGprBasicResult && result == kPrmRequest)) {
+		// both answers: the command's parameter (or opcode), then the status
+		uint32 status = 0xffffffff;
+		if (length >= 32)
+			memcpy(&status, data + 28, 4);
+		if (sPrmPending >= 0) {
+			TRACE("audio: PRM %s: status %#" B_PRIx32 "\n",
+				kPrmRequests[sPrmPending].name, status);
+			sPrmPending = -1;
+			sPrmStep++;
+		}
+		return;
+	}
 	if (opcode == kApmGetSpfStateResponse) {
 		if (!sAudioReady || result != 1) {
 			TRACE("audio: the ADSP's AudioReach framework is %s (%" B_PRIu32
@@ -1333,12 +1371,261 @@ gpr_receive(glink_channel* channel, const uint8* data, uint32 length)
 }
 
 
+/*!	One PRM request (q6prm_set_hw_core_req(), q6prm_request_lpass_clock()):
+	the APM command header (no shared memory), the parameter's header, its
+	data. */
+static status_t
+prm_request(bool clock, uint32 id)
+{
+	uint32 payload[16] = {};
+	uint32 dataWords = clock ? 5 : 1;	// clock count + id, rate, attr, root
+	// apm_cmd_header: payload address (none), memory map handle, size
+	payload[3] = 16 + dataWords * 4;
+	// apm_module_param_data: instance, parameter, size, error
+	payload[4] = kGprPrmPort;
+	payload[5] = clock ? kPrmAudioClock : kPrmHwCore;
+	payload[6] = dataWords * 4;
+	payload[7] = 0;
+	if (clock) {
+		payload[8] = 1;				// one clock
+		payload[9] = id;
+		payload[10] = 19200000;
+		payload[11] = 1;			// LPASS_CLK_ATTRIBUTE_COUPLE_NO
+		payload[12] = 0;			// the default root
+	} else
+		payload[8] = id;
+	return gpr_send(kGprPrmPort, kPrmRequest, payload,
+		(8 + dataWords) * 4);
+}
+
+
+static inline uint32
+mmio_read(volatile uint8* base, uint32 offset)
+{
+	return *(volatile uint32*)(base + offset);
+}
+
+
+static inline void
+mmio_write(volatile uint8* base, uint32 offset, uint32 value)
+{
+	*(volatile uint32*)(base + offset) = value;
+	memory_full_barrier();
+}
+
+
+/*!	Reads one register of SoundWire device \a device through the
+	controller's command FIFO (qcom_swrm_cmd_fifo_rd_cmd()); -1 when it does
+	not answer. */
+static int
+swr_read(volatile uint8* swr, uint32 device, uint16 reg)
+{
+	static uint32 sCommandID = 0;
+	sCommandID = sCommandID < 14 ? sCommandID + 1 : 0;
+	// a byte (QCOM_SWRM_MAX_RD_LEN in the data field; 0 reads 17)
+	uint32 command = reg | sCommandID << 16 | device << 20 | 1u << 24;
+	snooze(100);
+	mmio_write(swr, 0x304, command);
+	snooze(250);
+	for (int attempt = 0; attempt < 3; attempt++) {
+		bool available = false;
+		for (int i = 0; i < 30 && !available; i++) {
+			available = (mmio_read(swr, 0x30c) >> 16 & 0x1f) != 0;
+			if (!available)
+				snooze(500);
+		}
+		if (!available)
+			break;
+		uint32 data = mmio_read(swr, 0x318);
+		if ((data >> 8 & 0xf) == sCommandID)
+			return data & 0xff;
+		// a stale answer: flush and ask again
+		snooze(500);
+		mmio_write(swr, 0x308, 1);
+		mmio_write(swr, 0x304, command);
+		snooze(250);
+	}
+	TRACE("audio: SoundWire read %#x of device %" B_PRIu32 " unanswered "
+		"(FIFO status %#" B_PRIx32 ", interrupts %#" B_PRIx32 ")\n", reg,
+		device, mmio_read(swr, 0x30c), mmio_read(swr, 0x200));
+	return -1;
+}
+
+
+/*!	Lab: with the RX macro clocked, its registers read their reset values,
+	then the RX SoundWire bus (soundwire@3210000, "qcom,soundwire-v1.6.0")
+	the WCD9385's RX device sits on: the macro's MCLK, frame counter and
+	SoundWire clock (lpass-rx-macro.c), the controller set up as
+	qcom_swrm_init() does (50 rows, 16 columns, auto enumeration, the bus
+	clock started, its pins on the LPASS LPI pin controller), the codec out
+	of reset (GPIO 106, active low), and who answered: the slave status, the
+	enumerated device IDs, and the device's own SCP registers read over the
+	bus. Seen on the board: the WCD9385's RX device (sdw20217010d00, unique
+	ID 4) attaches as device 1 and its DevId registers read back. */
+static void
+audio_probe_registers()
+{
+	volatile uint8* rx;
+	area_id rxArea = map_physical_memory("qcom adsp rx macro", 0x3200000,
+		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&rx);
+	if (rxArea < 0)
+		return;
+	// CDC_RX_TOP_DSD0/1_DEBUG_CFG0/1: 0x11, 0x20, 0x11, 0x20 after reset
+	TRACE("audio: RX macro DSD debug registers %#" B_PRIx32 " %#" B_PRIx32
+		" %#" B_PRIx32 " %#" B_PRIx32 " (0x11 0x20 0x11 0x20 when clocked)\n",
+		mmio_read(rx, 0x70), mmio_read(rx, 0x74), mmio_read(rx, 0x80),
+		mmio_read(rx, 0x84));
+	// MCLK and MCLK2 on, the frame counter, the SoundWire clock after a
+	// reset (CDC_RX_CLK_RST_CTRL_MCLK/FS_CNT/SWR_CONTROL)
+	mmio_write(rx, 0x100, mmio_read(rx, 0x100) | 3);
+	mmio_write(rx, 0x104, mmio_read(rx, 0x104) & ~2u);
+	mmio_write(rx, 0x104, mmio_read(rx, 0x104) | 1);
+	mmio_write(rx, 0x108, mmio_read(rx, 0x108) | 2);
+	spin(100);
+	mmio_write(rx, 0x108, mmio_read(rx, 0x108) & ~2u);
+	mmio_write(rx, 0x108, mmio_read(rx, 0x108) | 1);
+
+	// the bus' pins on the LPASS LPI pin controller (rx-swr-default-state:
+	// gpio3 swr_rx_clk, gpio4/5 swr_rx_data with bus hold; function 1, 2 mA;
+	// pinctrl-sc8280xp-lpass-lpi.c: a page a pin). Lab: read first.
+	snooze(100000);
+	volatile uint8* lpi;
+	area_id lpiArea = map_physical_memory("qcom adsp lpi pins", 0x33c0000,
+		0x20000, B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&lpi);
+	if (lpiArea >= 0) {
+		TRACE("audio: LPI pin 0 %#" B_PRIx32 "\n", mmio_read(lpi, 0));
+		snooze(100000);
+		for (uint32 pin = 3; pin <= 5; pin++) {
+			TRACE("audio: LPI gpio%" B_PRIu32 " cfg %#" B_PRIx32 "\n", pin,
+				mmio_read(lpi, pin * 0x1000));
+		}
+		snooze(100000);
+		static const struct { uint32 pin, config; } kPins[] = {
+			{3, 0 | 1u << 2}, {4, 2 | 1u << 2}, {5, 2 | 1u << 2}};
+		for (const auto& pin : kPins)
+			mmio_write(lpi, pin.pin * 0x1000, pin.config);
+		TRACE("audio: LPI gpio3-5 now %#" B_PRIx32 " %#" B_PRIx32 " %#"
+			B_PRIx32 "\n", mmio_read(lpi, 0x3000), mmio_read(lpi, 0x4000),
+			mmio_read(lpi, 0x5000));
+		delete_area(lpiArea);
+	}
+	snooze(100000);
+
+	volatile uint8* swr;
+	area_id swrArea = map_physical_memory("qcom adsp rx soundwire",
+		0x3210000, 0x2000, B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&swr);
+	if (swrArea < 0) {
+		delete_area(rxArea);
+		return;
+	}
+	TRACE("audio: RX SoundWire controller version %#" B_PRIx32 "\n",
+		mmio_read(swr, 0x00));
+	// rows 50 (index 1), columns 16 (index 7) in bank 0
+	mmio_write(swr, 0x101c, 7 | 1u << 3);
+	mmio_write(swr, 0x500, 1);					// auto enumeration
+	mmio_write(swr, 0x204, 0x1ffff);			// interrupts masked
+	uint32 config = mmio_read(swr, 0x1048);
+	config = (config & ~(0x1fu << 17)) | 0x1fu << 17;	// no pings
+	mmio_write(swr, 0x1048, config);
+	mmio_write(swr, 0x1044, 1u << 1);			// the bus clock
+	mmio_write(swr, 0x314, 7 | 1u << 31);		// retries, continue
+	mmio_write(swr, 0x04, 1);					// enable
+	mmio_write(swr, 0x04, 2);
+	mmio_write(swr, 0x208, 0xffffffff);
+	mmio_write(swr, 0x04, 3);
+	bool frames = false;
+	for (int i = 0; i < 100 && !frames; i++) {
+		frames = (mmio_read(swr, 0x14) & 1) != 0;
+		if (!frames)
+			snooze(500);
+	}
+	TRACE("audio: RX SoundWire frames %s (status %#" B_PRIx32 ")\n",
+		frames ? "running" : "not running", mmio_read(swr, 0x14));
+
+	// the codec out of reset
+	volatile uint8* tlmm;
+	area_id tlmmArea = map_physical_memory("qcom adsp wcd reset",
+		0xf100000 + 106 * 0x1000, B_PAGE_SIZE,
+		B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&tlmm);
+	if (tlmmArea >= 0) {
+		mmio_write(tlmm, 4, 0);
+		mmio_write(tlmm, 0, 1u << 9);		// GPIO, output, low: reset
+		snooze(20000);
+		mmio_write(tlmm, 4, 2);				// high: out of reset
+		delete_area(tlmmArea);
+	}
+	// the codec's RX device enumerates (the hardware enumerator gives it a
+	// device number); the pings report its status
+	uint32 slaves = 0;
+	for (int i = 0; i < 20 && (slaves & ~3u) == 0; i++) {
+		snooze(50000);
+		slaves = mmio_read(swr, 0x1090);
+	}
+	TRACE("audio: RX SoundWire slave status %#" B_PRIx32 "\n", slaves);
+	for (uint32 m = 1; m < 4; m++) {
+		uint32 id1 = mmio_read(swr, 0x530 + 8 * m);
+		uint32 id2 = mmio_read(swr, 0x534 + 8 * m);
+		if (id1 == 0 && id2 == 0)
+			continue;
+		// qcom_swrm_enumerate(): DevId_0 to 5, the 48-bit address
+		uint64 address = (id2 >> 8 & 0xff) | (id2 & 0xff) << 8
+			| (id1 >> 24 & 0xff) << 16 | (uint64)(id1 >> 16 & 0xff) << 24
+			| (uint64)(id1 >> 8 & 0xff) << 32 | (uint64)(id1 & 0xff) << 40;
+		TRACE("audio: RX SoundWire device %" B_PRIu32 ": version %u, unique ID"
+			" %u, manufacturer %#x, part %#x, class %#x\n", m,
+			(unsigned)(address >> 44 & 0xf), (unsigned)(address >> 40 & 0xf),
+			(unsigned)(address >> 24 & 0xffff), (unsigned)(address >> 8 & 0xffff),
+			(unsigned)(address & 0xff));
+
+		// its SCP registers over the command FIFO: status and DevId_0 to 5
+		TRACE("audio: RX SoundWire FIFO status %#" B_PRIx32 ", interrupts %#"
+			B_PRIx32 ", FIFO config %#" B_PRIx32 "\n", mmio_read(swr, 0x30c),
+			mmio_read(swr, 0x200), mmio_read(swr, 0x314));
+		mmio_write(swr, 0x308, 1);
+		mmio_write(swr, 0x208, 0xffffffff);
+		snooze(1000);
+		TRACE("audio: RX SoundWire flushed: FIFO status %#" B_PRIx32 "\n",
+			mmio_read(swr, 0x30c));
+		static const uint16 kRegisters[] = {0x44, 0x50, 0x51, 0x52, 0x53,
+			0x54, 0x55};
+		char line[96];
+		size_t length = 0;
+		for (uint16 reg : kRegisters) {
+			int value = swr_read(swr, m, reg);
+			length += snprintf(line + length, sizeof(line) - length,
+				value < 0 ? " -" : " %02x", value);
+		}
+		TRACE("audio: RX SoundWire device %" B_PRIu32 " SCP stat, DevId:%s\n",
+			m, line);
+	}
+	delete_area(swrArea);
+	delete_area(rxArea);
+}
+
+
 //!	Asks whether the audio framework is up until it says it is.
 static void
 gpr_tick()
 {
-	if (sGpr == NULL || !sGpr->openAcked || sAudioReady)
+	if (sGpr == NULL || !sGpr->openAcked)
 		return;
+	if (sAudioReady) {
+		if (!sAudioProbe || sPrmPending >= 0)
+			return;
+		if (sPrmStep < (int)B_COUNT_OF(kPrmRequests)) {
+			if (prm_request(kPrmRequests[sPrmStep].clock,
+					kPrmRequests[sPrmStep].id) == B_OK)
+				sPrmPending = sPrmStep;
+		} else if (sPrmStep == (int)B_COUNT_OF(kPrmRequests)) {
+			audio_probe_registers();
+			sPrmStep++;
+		}
+		return;
+	}
 	if (system_time() - sAudioRequested < 1000000)
 		return;
 	if (gpr_send(kGprApmPort, kApmGetSpfState, NULL, 0) != B_WOULD_BLOCK)
@@ -1497,6 +1784,8 @@ boot_thread(void*)
 			NULL, NULL);
 		if (port != NULL)
 			sSimulatedPort = atoi(port);
+		sAudioProbe = get_driver_boolean_parameter(settings, "audio_probe",
+			false, true);
 		unload_driver_settings(settings);
 	}
 
