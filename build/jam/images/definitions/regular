@@ -257,7 +257,7 @@ SYSTEM_ADD_ONS_MEDIA_PLUGINS += [ FFilterByBuildFeatures
 	raw_decoder
 	rpi_hevc@arm64
 	rpi_mmal@arm64
-	sunxi_cedar@arm64
+	00_sunxi_cedar@arm64
 ] ;
 
 SYSTEM_ADD_ONS_PRINT += [ FFilterByBuildFeatures
