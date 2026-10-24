@@ -35,6 +35,7 @@
 #include <vm/vm.h>
 
 #include <qcom_display.h>
+#include <qcom_usbc_ports.h>
 
 #include "display_port.h"
 #include "dpu.h"
@@ -80,6 +81,10 @@ struct display_info {
 	qcom::DisplayPort* port;		// the DisplayPort controller it feeds
 	qcom::UsbcDisplayPort* usbc;	// USB-C connector 0, output 1
 	bool			usbcRunning;
+	bool			usbcForced;
+	qcom_usbc_ports_module_info* usbcPorts;
+	thread_id		hotPlugThread;
+	volatile bool	quit;
 
 	// vertical blanks: the timing engine's interrupt while it runs; a
 	// timer stands in for it when it does not
@@ -186,6 +191,7 @@ virtual_timing()
 
 
 static bool usbc_forced();
+static status_t connect_usbc(display_info* info);
 
 
 static void
@@ -268,26 +274,101 @@ init_outputs(display_info* info)
 			output.native_width, output.native_height);
 	}
 
-	// USB-C connector 0 as output 1. Until its link is trained and its
-	// mainlink sends (which needs a monitor), only on request: the lab's
-	// "usbc_dp0 forced" makes it a display of the HDMI output's mode that
-	// scans out its region to nowhere, for app_server's layouts.
-	if (info->dpu == NULL || info->dpu->Interface() != 6 || !usbc_forced())
+	// USB-C connector 0 as output 1, connected when the ADSP reports a
+	// DisplayPort sink on it (hot_plug_thread()). Its link is not trained
+	// and its mainlink sends nothing yet (that needs a monitor): it shows the
+	// HDMI output's mode, scanning its region out to nowhere. The lab's
+	// "usbc_dp0 forced" has it connected from the start.
+	if (info->dpu == NULL || info->dpu->Interface() != 6)
 		return;
-	info->usbc = new(std::nothrow) qcom::UsbcDisplayPort;
-	if (info->usbc == NULL || info->usbc->PowerUp() != B_OK) {
-		delete info->usbc;
-		info->usbc = NULL;
-		return;
-	}
 	qcom_display_output& usbc = shared.outputs[1];
 	usbc = output;
 	usbc.id = QCOM_DISPLAY_OUTPUT_DP0;
-	usbc.flags = QCOM_DISPLAY_OUTPUT_CONNECTED;
+	usbc.flags = 0;
 	usbc.edid_length = 0;
 	shared.output_count = 2;
-	INFO("DP-1: forced on as output 1, %ux%u\n", usbc.native_width,
-		usbc.native_height);
+	info->usbcForced = usbc_forced();
+	if (info->usbcForced && connect_usbc(info) == B_OK) {
+		INFO("DP-1: forced on as output 1, %ux%u\n", usbc.native_width,
+			usbc.native_height);
+	}
+}
+
+
+/*!	Powers USB-C connector 0's DisplayPort up and marks output 1 connected.
+	The caller holds the lock, or nobody else runs yet. */
+static status_t
+connect_usbc(display_info* info)
+{
+	if (info->usbc == NULL) {
+		info->usbc = new(std::nothrow) qcom::UsbcDisplayPort;
+		if (info->usbc == NULL)
+			return B_NO_MEMORY;
+		status_t status = info->usbc->PowerUp();
+		if (status != B_OK) {
+			delete info->usbc;
+			info->usbc = NULL;
+			return status;
+		}
+	}
+	info->shared->outputs[1].flags |= QCOM_DISPLAY_OUTPUT_CONNECTED;
+	return B_OK;
+}
+
+
+static void
+disconnect_usbc(display_info* info)
+{
+	if (info->usbcRunning)
+		info->usbc->Stop();
+	info->usbcRunning = false;
+	info->shared->outputs[1].flags = 0;
+}
+
+
+static void
+notify_change(display_info* info)
+{
+	if (info->changePort >= 0) {
+		write_port_etc(info->changePort, info->changeCode, NULL, 0,
+			B_RELATIVE_TIMEOUT, 0);
+	}
+}
+
+
+/*!	Follows the ADSP's reports on USB-C port 0 (qcom_adsp's
+	qcom_usbc_ports module): a DisplayPort sink with its hot plug detect up
+	connects output 1, anything else disconnects it; app_server is told. */
+static status_t
+hot_plug_thread(void* data)
+{
+	display_info* info = (display_info*)data;
+	uint32 generation = 0;
+	while (!info->quit) {
+		snooze(300000);
+		qcom_usbc_port port;
+		if (info->usbcPorts->get_port(0, &port) != B_OK
+			|| port.generation == generation)
+			continue;
+		generation = port.generation;
+		bool sink = port.display_port && port.hpd;
+		MutexLocker locker(info->lock);
+		bool connected = (info->shared->outputs[1].flags
+			& QCOM_DISPLAY_OUTPUT_CONNECTED) != 0;
+		if (sink && !connected) {
+			status_t status = connect_usbc(info);
+			INFO("DP-1: a DisplayPort sink on USB-C port 0 (pin assignment %u,"
+				" orientation %u): %s\n", port.pin_assignment, port.orientation,
+				status == B_OK ? "connected" : strerror(status));
+			if (status == B_OK)
+				notify_change(info);
+		} else if (!sink && connected && !info->usbcForced) {
+			disconnect_usbc(info);
+			INFO("DP-1: the sink on USB-C port 0 is gone\n");
+			notify_change(info);
+		}
+	}
+	return B_OK;
 }
 
 
@@ -727,6 +808,17 @@ display_init_device(void* _info, void** _cookie)
 	info->changePort = -1;
 	init_retrace(info);
 
+	// the USB-C ports' reports, from the ADSP's driver
+	info->hotPlugThread = -1;
+	if (info->shared->output_count > 1
+		&& get_module(QCOM_USBC_PORTS_MODULE_NAME,
+			(module_info**)&info->usbcPorts) == B_OK) {
+		info->hotPlugThread = spawn_kernel_thread(hot_plug_thread,
+			"qcom display hot plug", B_LOW_PRIORITY, info);
+		if (info->hotPlugThread >= 0)
+			resume_thread(info->hotPlugThread);
+	}
+
 	*_cookie = info;
 	return B_OK;
 }
@@ -737,6 +829,13 @@ display_uninit_device(void* cookie)
 {
 	display_info* info = (display_info*)cookie;
 	uninit_retrace(info);
+	if (info->hotPlugThread >= 0) {
+		info->quit = true;
+		status_t result;
+		wait_for_thread(info->hotPlugThread, &result);
+	}
+	if (info->usbcPorts != NULL)
+		put_module(QCOM_USBC_PORTS_MODULE_NAME);
 	delete info->usbc;
 	delete info->port;
 	delete info->dpu;

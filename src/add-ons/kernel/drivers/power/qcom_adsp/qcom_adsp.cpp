@@ -32,6 +32,8 @@
 #include <KernelExport.h>
 #include <arch/atomic.h>
 #include <device_manager.h>
+#include <driver_settings.h>
+#include <qcom_usbc_ports.h>
 
 #include <libfdt.h>
 
@@ -1103,6 +1105,13 @@ struct usbc_notify {
 
 static glink_channel* sPmicGlink;
 static bool sAltmodeEnabled;
+
+// the ports' last reports, for the display driver (qcom_usbc_ports.h)
+static qcom_usbc_port sPorts[QCOM_USBC_PORT_COUNT];
+static spinlock sPortsLock = B_SPINLOCK_INITIALIZER;
+// lab: a DisplayPort sink reported on this port, then gone ("simulate_dp_report")
+static int32 sSimulatedPort = -1;
+static bool sSimulating;
 static bigtime_t sAltmodeRequested;
 
 
@@ -1148,12 +1157,93 @@ pmic_glink_receive(glink_channel* channel, const uint8* data, uint32 length)
 		: notify.mux == 4 ? "tunnelling" : notify.mux == 0 ? "nothing"
 		: "USB";
 	TRACE("usb-c port %u: %s, orientation %u, mux %u, svid %#x, pin "
-		"assignment %u, hpd %u%s\n", notify.port, mode, notify.orientation,
+		"assignment %u, hpd %u%s%s\n", notify.port, mode, notify.orientation,
 		notify.mux, svid, notify.pinAssignmentHpd & 0x3f,
 		(notify.pinAssignmentHpd >> 6) & 1,
-		(notify.pinAssignmentHpd & 0x80) != 0 ? " (irq)" : "");
-	altmode_request(kAltmodeAck, notify.port);
+		(notify.pinAssignmentHpd & 0x80) != 0 ? " (irq)" : "",
+		sSimulating ? " (simulated)" : "");
+	if (notify.port < QCOM_USBC_PORT_COUNT) {
+		cpu_status state = disable_interrupts();
+		acquire_spinlock(&sPortsLock);
+		qcom_usbc_port& port = sPorts[notify.port];
+		port.generation++;
+		port.display_port = svid == 0xff01;
+		port.hpd = (notify.pinAssignmentHpd >> 6) & 1;
+		port.hpd_irq = (notify.pinAssignmentHpd >> 7) & 1;
+		port.pin_assignment = notify.pinAssignmentHpd & 0x3f;
+		port.orientation = notify.orientation;
+		port.mux = notify.mux;
+		release_spinlock(&sPortsLock);
+		restore_interrupts(state);
+	}
+	if (!sSimulating)
+		altmode_request(kAltmodeAck, notify.port);
 }
+
+
+/*!	Lab: a DisplayPort sink on port sSimulatedPort 20 s after the reports
+	are on, gone 30 s later, through the same path as the ADSP's reports
+	(without acknowledging them to it). */
+static void
+simulate_report(bool connected)
+{
+	usbc_notify notify = {};
+	notify.header = { kPmicGlinkOwnerAltmode, 2,
+		(connected ? 0xff01u << 16 : 0) | kUsbcNotify };
+	notify.pinAssignmentHpd = connected ? (1u << 6 | 3) : 0;
+	notify.port = sSimulatedPort;
+	notify.mux = connected ? 2 : 0;
+	sSimulating = true;
+	pmic_glink_receive(sPmicGlink, (const uint8*)&notify, sizeof(notify));
+	sSimulating = false;
+}
+
+
+static void
+simulation_tick()
+{
+	static bigtime_t sStart;
+	static int sStep;
+	if (sSimulatedPort < 0 || !sAltmodeEnabled || sStep == 2)
+		return;
+	if (sStart == 0)
+		sStart = system_time();
+	bigtime_t elapsed = system_time() - sStart;
+	if (sStep == 0 && elapsed > 20000000) {
+		simulate_report(true);
+		sStep = 1;
+	} else if (sStep == 1 && elapsed > 50000000) {
+		simulate_report(false);
+		sStep = 2;
+	}
+}
+
+
+static status_t
+usbc_get_port(uint32 index, qcom_usbc_port* port)
+{
+	if (index >= QCOM_USBC_PORT_COUNT || port == NULL)
+		return B_BAD_VALUE;
+	cpu_status state = disable_interrupts();
+	acquire_spinlock(&sPortsLock);
+	*port = sPorts[index];
+	release_spinlock(&sPortsLock);
+	restore_interrupts(state);
+	return B_OK;
+}
+
+
+static status_t
+usbc_std_ops(int32 op, ...)
+{
+	return op == B_MODULE_INIT || op == B_MODULE_UNINIT ? B_OK : B_ERROR;
+}
+
+
+static qcom_usbc_ports_module_info sUsbcPortsModule = {
+	{ QCOM_USBC_PORTS_MODULE_NAME, 0, usbc_std_ops },
+	usbc_get_port
+};
 
 
 //!	Turns the reports on, again and again until the ADSP answers.
@@ -1314,6 +1404,15 @@ boot_thread(void*)
 	if (adsp_start() != B_OK)
 		return B_OK;
 
+	void* settings = load_driver_settings("qcom_adsp");
+	if (settings != NULL) {
+		const char* port = get_driver_parameter(settings, "simulate_dp_report",
+			NULL, NULL);
+		if (port != NULL)
+			sSimulatedPort = atoi(port);
+		unload_driver_settings(settings);
+	}
+
 	sPmicGlink = glink_add_channel("PMIC_RTR_ADSP_APPS");
 	sPmicGlink->wanted = true;
 	sPmicGlink->hook = pmic_glink_receive;
@@ -1328,6 +1427,7 @@ boot_thread(void*)
 	while (!sQuit) {
 		glink_poll();
 		pmic_glink_tick();
+		simulation_tick();
 		// woken by the doorbell; now and then anyway, for the requests
 		// pmic_glink_tick() repeats
 		if (sIpccHandler)
@@ -1470,5 +1570,6 @@ static driver_module_info sQcomAdspDriver = {
 
 module_info* modules[] = {
 	(module_info*)&sQcomAdspDriver,
+	(module_info*)&sUsbcPortsModule,
 	NULL
 };
