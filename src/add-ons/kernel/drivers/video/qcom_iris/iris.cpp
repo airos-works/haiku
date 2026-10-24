@@ -460,9 +460,10 @@ power_up()
 
 
 /*!	The codec's address space on the apps SMMU: a stage 1 table of 4 GiB
-	(T0SZ 32, from level 1), identity mapped where the driver puts memory
-	for the firmware. Anything else faults in the context bank, which the
-	SoC survives; an unmatched or bypassed stream that strays does not.
+	(T0SZ 32, from level 1). The driver's queues are identity mapped, the
+	buffers it allocates for userland are in kBufferWindow. Anything else
+	faults in the context bank, which the SoC survives; an unmatched or
+	bypassed stream that strays does not.
 */
 class IrisSpace {
 public:
@@ -480,13 +481,10 @@ public:
 		bool cached)
 	{
 		for (size_t offset = 0; offset < size; offset += B_PAGE_SIZE) {
-			uint64 va = address + offset;
-			uint64* level2 = NextTable(fLevel1, (va >> 30) & 511);
-			uint64* level3 = level2 != NULL
-				? NextTable(level2, (va >> 21) & 511) : NULL;
+			uint64* level3 = Level3(address + offset, true);
 			if (level3 == NULL)
 				return B_NO_MEMORY;
-			level3[(va >> 12) & 511] = ((physical + offset)
+			level3[((address + offset) >> 12) & 511] = ((physical + offset)
 					& 0x0000fffffffff000ull)
 				| 1ull << 0 | 1ull << 1 | (cached ? 0 : 1ull << 2) | 1ull << 6
 				| 3ull << 8 | 1ull << 10;
@@ -498,12 +496,9 @@ public:
 	void Unmap(uint64 address, size_t size)
 	{
 		for (size_t offset = 0; offset < size; offset += B_PAGE_SIZE) {
-			uint64 va = address + offset;
-			uint64* level2 = FindTable(fLevel1, (va >> 30) & 511);
-			uint64* level3 = level2 != NULL
-				? FindTable(level2, (va >> 21) & 511) : NULL;
+			uint64* level3 = Level3(address + offset, false);
 			if (level3 != NULL)
-				level3[(va >> 12) & 511] = 0;
+				level3[((address + offset) >> 12) & 511] = 0;
 		}
 		memory_full_barrier();
 	}
@@ -526,46 +521,40 @@ private:
 		return (uint64*)table;
 	}
 
-	uint64* FindTable(uint64* table, uint32 index)
+	//!	The level 3 table of \a address, made when \a create.
+	uint64* Level3(uint64 address, bool create)
 	{
-		if ((table[index] & 1) == 0)
+		if (address >= (1ull << 32))
 			return NULL;
-		phys_addr_t physical = table[index] & 0x0000fffffffff000ull;
-		for (size_t i = 0; i < fTableCount; i++) {
-			if (fTablePhysical[i] == physical)
-				return fTables[i];
-		}
-		return NULL;
-	}
-
-	uint64* NextTable(uint64* table, uint32 index)
-	{
-		if ((table[index] & 1) == 0) {
-			if (fTableCount == B_COUNT_OF(fTables))
+		uint32 gigabyte = address >> 30;
+		uint32 block = address >> 21;
+		if (fLevel2[gigabyte] == NULL) {
+			if (!create)
 				return NULL;
 			phys_addr_t physical;
-			uint64* next = AllocateTable(physical);
-			if (next == NULL)
+			fLevel2[gigabyte] = AllocateTable(physical);
+			if (fLevel2[gigabyte] == NULL)
 				return NULL;
 			memory_full_barrier();
-			table[index] = physical | 3;
-			fTables[fTableCount] = next;
-			fTablePhysical[fTableCount++] = physical;
-			return next;
+			fLevel1[gigabyte] = physical | 3;
 		}
-		phys_addr_t physical = table[index] & 0x0000fffffffff000ull;
-		for (size_t i = 0; i < fTableCount; i++) {
-			if (fTablePhysical[i] == physical)
-				return fTables[i];
+		if (fLevel3[block] == NULL) {
+			if (!create)
+				return NULL;
+			phys_addr_t physical;
+			fLevel3[block] = AllocateTable(physical);
+			if (fLevel3[block] == NULL)
+				return NULL;
+			memory_full_barrier();
+			fLevel2[gigabyte][block & 511] = physical | 3;
 		}
-		return NULL;
+		return fLevel3[block];
 	}
 
 	uint64*		fLevel1 = NULL;
 	phys_addr_t	fLevel1Physical = 0;
-	uint64*		fTables[64];
-	phys_addr_t	fTablePhysical[64];
-	size_t		fTableCount = 0;
+	uint64*		fLevel2[4] = {};
+	uint64*		fLevel3[2048] = {};	// one for each 2 MiB
 };
 
 
@@ -1161,11 +1150,17 @@ iris_start()
 /*	The open that owns the codec, and the buffers it allocated. */
 
 struct IrisBuffer {
-	IrisBuffer*	next;
+	IrisBuffer*	next;		// by device address
 	area_id		area;
-	phys_addr_t	physical;
+	uint32		device;		// address
 	size_t		size;
 };
+
+/*	Where the buffers are for the codec: from the end of what Linux keeps
+	for content protection (0x25800000, iris_platform_sm8250.c) to the start
+	of DRAM, below which nothing is identity mapped. */
+static const uint32 kBufferWindow = 0x30000000;
+static const uint32 kBufferWindowEnd = 0x80000000;
 
 static void* sOwner;
 static IrisBuffer* sBuffers;
@@ -1174,7 +1169,7 @@ static IrisBuffer* sBuffers;
 static void
 buffer_free(IrisBuffer* buffer)
 {
-	sSpace.Unmap(buffer->physical, buffer->size);
+	sSpace.Unmap(buffer->device, buffer->size);
 	uint32 cb = smmu_context(sContextBank);
 	sSmmu.Write(cb + 0x618, 0);				// TLBIALL
 	sSmmu.Write(cb + 0x7f0, 0);				// TLBSYNC
@@ -1184,37 +1179,63 @@ buffer_free(IrisBuffer* buffer)
 }
 
 
+/*!	A buffer of pages anywhere, mapped for the codec at the first free
+	place of kBufferWindow, and cloned into the caller's team.
+*/
 static status_t
 buffer_alloc(qcom_iris_buffer* request)
 {
-	if (request->size == 0 || request->size > 256 * 1024 * 1024)
+	if (request->size == 0 || request->size > 768 * 1024 * 1024)
 		return B_BAD_VALUE;
 	size_t size = ROUNDUP(request->size, B_PAGE_SIZE);
+
+	// the first gap in the window, sBuffers being sorted
+	uint32 device = kBufferWindow;
+	IrisBuffer** link = &sBuffers;
+	while (*link != NULL) {
+		if ((uint64)device + size <= (*link)->device)
+			break;
+		device = (*link)->device + ROUNDUP((*link)->size, 0x10000);
+		link = &(*link)->next;
+	}
+	if ((uint64)device + size > kBufferWindowEnd)
+		return B_NO_MEMORY;
+
 	IrisBuffer* buffer = (IrisBuffer*)calloc(1, sizeof(IrisBuffer));
 	if (buffer == NULL)
 		return B_NO_MEMORY;
-
 	void* address;
-	virtual_address_restrictions virtualRestrictions = {};
-	physical_address_restrictions physicalRestrictions = {};
-	physicalRestrictions.high_address = kDmaLimit;
-	buffer->area = create_area_etc(B_SYSTEM_TEAM, "qcom iris buffer", size,
-		B_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA
-			| B_CLONEABLE_AREA, 0, 0, &virtualRestrictions,
-		&physicalRestrictions, &address);
+	buffer->area = create_area("qcom iris buffer", &address,
+		B_ANY_KERNEL_ADDRESS, size, B_FULL_LOCK,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA | B_CLONEABLE_AREA);
 	if (buffer->area < 0) {
 		status_t status = buffer->area;
 		free(buffer);
 		return status;
 	}
 	memset(address, 0, size);
-	physical_entry entry;
-	get_memory_map(address, B_PAGE_SIZE, &entry, 1);
-	buffer->physical = entry.address;
+	buffer->device = device;
 	buffer->size = size;
-	status_t status = sSpace.Map(buffer->physical, buffer->physical, size,
-		true);
+
+	status_t status = B_OK;
+	for (size_t offset = 0; offset < size && status == B_OK;) {
+		physical_entry entries[16];
+		uint32 count = B_COUNT_OF(entries);
+		status = get_memory_map_etc(B_SYSTEM_TEAM, (uint8*)address + offset,
+			size - offset, entries, &count);
+		// more runs than entries: the next call goes on from these
+		if (status == B_BUFFER_OVERFLOW)
+			status = B_OK;
+		for (uint32 i = 0; status == B_OK && i < count; i++) {
+			status = sSpace.Map(device + offset, entries[i].address,
+				entries[i].size, true);
+			offset += entries[i].size;
+		}
+		if (status == B_OK && count == 0)
+			status = B_ERROR;
+	}
 	if (status != B_OK) {
+		sSpace.Unmap(device, size);
 		delete_area(buffer->area);
 		free(buffer);
 		return status;
@@ -1228,11 +1249,11 @@ buffer_alloc(qcom_iris_buffer* request)
 		buffer_free(buffer);
 		return clone;
 	}
-	buffer->next = sBuffers;
-	sBuffers = buffer;
+	buffer->next = *link;
+	*link = buffer;
 	request->area = clone;
 	request->address = userAddress;
-	request->device_address = (uint32)buffer->physical;
+	request->device_address = device;
 	return B_OK;
 }
 
@@ -1394,7 +1415,7 @@ iris_control(void* cookie, uint32 op, void* buffer, size_t length)
 			MutexLocker locker(sLock);
 			for (IrisBuffer** link = &sBuffers; *link != NULL;
 					link = &(*link)->next) {
-				if ((uint32)(*link)->physical != deviceAddress)
+				if ((*link)->device != deviceAddress)
 					continue;
 				IrisBuffer* found = *link;
 				*link = found->next;
