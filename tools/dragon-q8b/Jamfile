@@ -8,6 +8,13 @@ Application adreno_test :
 	adreno_test.cpp
 ;
 
+UsePrivateHeaders interface ;
+
+Application display_layout :
+	display_layout.cpp
+	: be [ TargetLibsupc++ ]
+;
+
 UsePrivateKernelHeaders ;
 
 KernelAddon qcom_probe :

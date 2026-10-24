@@ -6,6 +6,8 @@
 
 #include "display_port.h"
 
+#include "dp_tu.h"
+
 #include <string.h>
 
 #include <KernelExport.h>
@@ -24,11 +26,24 @@ static const struct {
 	phys_addr_t	base;
 	uint32		auxClock;
 	uint32		linkClock;
+	uint32		pixelClock;		// its pixel 0 RCG
 } kControllers[] = {
-	{0xae90000, 0x206c, 0x205c},
-	{0xae98000, 0x20a0, 0x2084},
-	{0xae9a000, 0x20a4, 0x2090},
+	{0xae90000, 0x206c, 0x205c, 0x21d8},
+	{0xae98000, 0x20a0, 0x2084, 0x2250},
+	{0xae9a000, 0x20a4, 0x2090, 0x2208},
 };
+// an RCG: CMD (bit 0 updates the configuration), CFG, M, N, D
+enum {
+	RCG_CMD	= 0x0,
+	RCG_CFG	= 0x4,
+	RCG_M	= 0x8,
+	RCG_N	= 0xc,
+	RCG_D	= 0x10,
+};
+static const uint32 kRcgUpdate = 1u << 0;
+static const uint32 kRcgModeMask = 3u << 12;
+static const uint32 kRcgDualEdge = 2u << 12;
+static const uint32 kRcgMndMask = 0xffff;
 static const phys_addr_t kDispccBase = 0xaf00000;
 
 // the controller's blocks (the device tree's "reg"): ahb, aux, link
@@ -40,7 +55,10 @@ static const uint32 kLink = 0x400;
 // the mask bit above that
 enum {
 	REG_DP_INTR_STATUS	= kAhb + 0x020,
+	REG_DP_INTR_STATUS2	= kAhb + 0x024,
 };
+static const uint32 kReadyForVideo = 1u << 0;
+static const uint32 kIdlePatternSent = 1u << 3;
 static const uint32 kAuxDone = 1u << 3;
 static const uint32 kAuxWrongAddress = 1u << 6;
 static const uint32 kAuxTimeout = 1u << 9;
@@ -72,12 +90,26 @@ static const uint32 kTransNoSendStop = 1u << 11;
 
 // link
 enum {
+	REG_DP_STATE_CTRL			= kLink + 0x004,
 	REG_DP_CONFIGURATION_CTRL	= kLink + 0x008,
+	REG_DP_SOFTWARE_MVID		= kLink + 0x010,
+	REG_DP_SOFTWARE_NVID		= kLink + 0x018,
 	REG_DP_TOTAL_HOR_VER		= kLink + 0x01c,
 	REG_DP_START_HOR_VER_FROM_SYNC = kLink + 0x020,
 	REG_DP_HSYNC_VSYNC_WIDTH_POLARITY = kLink + 0x024,
 	REG_DP_ACTIVE_HOR_VER		= kLink + 0x028,
+	REG_DP_VALID_BOUNDARY		= kLink + 0x030,
+	REG_DP_VALID_BOUNDARY_2		= kLink + 0x034,
+	REG_DP_MAINLINK_READY		= kLink + 0x040,
+	REG_DP_TU					= kLink + 0x04c,
 };
+static const uint32 kStateSendVideo = 1u << 7;
+static const uint32 kStatePushIdle = 1u << 8;
+static const uint32 kMainlinkReadyForVideo = 1u << 0;
+
+// DPCD
+static const uint32 kDpcdLinkBandwidthSet = 0x100;
+static const uint32 kNvidFixed = 0x8000;	// DP_LINK_CONSTANT_N_VALUE
 
 static const uint32 kEdidAddress = 0x50;
 
@@ -98,11 +130,54 @@ branch_on(uint32 offset)
 }
 
 
+/*!	The best fraction \a _numerator / \a _denominator of \a value / \a over
+	with neither larger than \a max (Linux's rational_best_approximation()).
+*/
+static void
+best_fraction(uint64 value, uint64 over, uint64 max, uint64* _numerator,
+	uint64* _denominator)
+{
+	uint64 n = value, d = over;
+	uint64 n0 = 0, d1 = 0, n1 = 1, d0 = 1;
+	while (d != 0) {
+		uint64 dp = d;
+		uint64 a = n / d;
+		d = n % d;
+		n = dp;
+
+		uint64 n2 = n0 + a * n1;
+		uint64 d2 = d0 + a * d1;
+		if (n2 > max || d2 > max) {
+			// the largest semiconvergent, when it is the closer one
+			uint64 t = UINT64_MAX;
+			if (d1 != 0)
+				t = (max - d0) / d1;
+			if (n1 != 0 && (max - n0) / n1 < t)
+				t = (max - n0) / n1;
+			if (d1 == 0 || 2 * t > a || (2 * t == a && d0 * dp > d1 * d)) {
+				n1 = n0 + t * n1;
+				d1 = d0 + t * d1;
+			}
+			break;
+		}
+		n0 = n1;
+		n1 = n2;
+		d0 = d1;
+		d1 = d2;
+	}
+	*_numerator = n1;
+	*_denominator = d1;
+}
+
+
 DisplayPort::DisplayPort(uint32 index)
 	:
 	fIndex(index),
 	fArea(-1),
-	fBase(NULL)
+	fBase(NULL),
+	fClockArea(-1),
+	fClocks(NULL),
+	fLinkRate(0)
 {
 }
 
@@ -111,6 +186,8 @@ DisplayPort::~DisplayPort()
 {
 	if (fArea >= 0)
 		delete_area(fArea);
+	if (fClockArea >= 0)
+		delete_area(fClockArea);
 }
 
 
@@ -132,6 +209,237 @@ DisplayPort::Init()
 	if ((_Read(REG_DP_AUX_CTRL) & kAuxEnable) == 0) {
 		ERROR("DP %" B_PRIu32 ": AUX is off\n", fIndex);
 		return B_DEVICE_NOT_FOUND;
+	}
+	uint32 rcg = kControllers[fIndex].pixelClock;
+	fClockArea = map_physical_memory("qcom dp pixel clock",
+		kDispccBase + (rcg & ~(B_PAGE_SIZE - 1)), B_PAGE_SIZE,
+		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
+		(void**)&fClocks);
+	if (fClockArea < 0)
+		return fClockArea;
+	fClocks += rcg & (B_PAGE_SIZE - 1);
+	return B_OK;
+}
+
+
+uint32
+DisplayPort::LinkRate()
+{
+	if (fLinkRate != 0 || !HotPlug())
+		return fLinkRate;
+	uint8 bandwidth;
+	if (ReadDpcd(kDpcdLinkBandwidthSet, &bandwidth, 1) == B_OK) {
+		// in units of 0.27 Gbit/s: 6, 10, 20, 30
+		switch (bandwidth) {
+			case 0x06: fLinkRate = 162; break;
+			case 0x0a: fLinkRate = 270; break;
+			case 0x14: fLinkRate = 540; break;
+			case 0x1e: fLinkRate = 810; break;
+		}
+	}
+	return fLinkRate;
+}
+
+
+uint32
+DisplayPort::MaxPixelClock()
+{
+	// 8b/10b: each lane carries a byte per link symbol clock
+	return LinkRate() * 1000 * Lanes() / 3;
+}
+
+
+uint32
+DisplayPort::PixelClock(bool wideBus)
+{
+	uint32 linkRate = LinkRate();
+	if (fClocks == NULL || linkRate == 0)
+		return 0;
+	uint32 divider = linkRate == 810 ? 6 : linkRate == 540 ? 4 : 2;
+	uint64 parent = (uint64)linkRate * 1000 * 10 / divider;
+	uint32 config = *(volatile uint32*)(fClocks + RCG_CFG);
+	uint64 rate = parent;
+	if ((config & kRcgModeMask) == kRcgDualEdge) {
+		uint32 m = *(volatile uint32*)(fClocks + RCG_M) & kRcgMndMask;
+		uint32 n = ((~*(volatile uint32*)(fClocks + RCG_N)) & kRcgMndMask) + m;
+		if (m == 0 || n == 0)
+			return 0;
+		rate = parent * m / n;
+	}
+	// a pre-divider other than 1 (CFG bits 0-4 = 2 * divider - 1) is not
+	// what this driver sets
+	if ((config & 0x1f) > 1)
+		return 0;
+	return wideBus ? rate * 2 : rate;
+}
+
+
+/*!	The pixel RCG at \a rate kHz. Its parent is the PHY's link clock divided
+	for the pixel path, fixed by the link rate (msm_dp_ctrl_config_msa()'s
+	dispcc_input_rate); M/N do the rest.
+*/
+status_t
+DisplayPort::_SetPixelClock(uint32 rate)
+{
+	uint32 linkRate = LinkRate();
+	uint32 divider = linkRate == 810 ? 6 : linkRate == 540 ? 4 : 2;
+	uint64 parent = (uint64)linkRate * 1000 * 10 / divider;
+	if (linkRate == 0 || rate == 0 || rate > parent)
+		return B_BAD_VALUE;
+
+	uint64 m, n;
+	best_fraction(rate, parent, kRcgMndMask, &m, &n);
+	if (m == 0 || n == 0)
+		return B_BAD_VALUE;
+
+	uint32 config = *(volatile uint32*)(fClocks + RCG_CFG) & ~kRcgModeMask;
+	if (m != n) {
+		uint32 d = n;
+		uint32 twiceNMinusM = (n - m) * 2;
+		if (d < m)
+			d = m;
+		if (d > twiceNMinusM)
+			d = twiceNMinusM;
+		*(volatile uint32*)(fClocks + RCG_M) = m;
+		*(volatile uint32*)(fClocks + RCG_N) = ~(n - m) & kRcgMndMask;
+		*(volatile uint32*)(fClocks + RCG_D) = ~d & kRcgMndMask;
+		config |= kRcgDualEdge;
+	}
+	*(volatile uint32*)(fClocks + RCG_CFG) = config;
+	*(volatile uint32*)(fClocks + RCG_CMD) |= kRcgUpdate;
+	bigtime_t timeout = system_time() + 10000;
+	while ((*(volatile uint32*)(fClocks + RCG_CMD) & kRcgUpdate) != 0) {
+		if (system_time() > timeout)
+			return B_TIMED_OUT;
+		spin(1);
+	}
+	return B_OK;
+}
+
+
+/*!	Sends the idle pattern instead of the stream, for the stream to be
+	retimed.
+*/
+status_t
+DisplayPort::StopStream()
+{
+	if (fBase == NULL)
+		return B_NO_INIT;
+	_Write(REG_DP_INTR_STATUS2, kIdlePatternSent << 1);
+	_Write(REG_DP_STATE_CTRL, kStatePushIdle);
+	bigtime_t timeout = system_time() + 50000;
+	while ((_Read(REG_DP_INTR_STATUS2) & kIdlePatternSent) == 0) {
+		if (system_time() > timeout) {
+			ERROR("DP %" B_PRIu32 ": no idle pattern (status %#" B_PRIx32
+				")\n", fIndex, _Read(REG_DP_INTR_STATUS2));
+			return B_TIMED_OUT;
+		}
+		spin(20);
+	}
+	_Write(REG_DP_INTR_STATUS2, kIdlePatternSent << 1);
+	return B_OK;
+}
+
+
+/*!	The stream's clock, attributes and transfer units for \a timing on the
+	trained link (msm_dp_ctrl_on_stream() without the training). With the
+	wide data bus the pixel clock runs at half the pixel rate.
+*/
+status_t
+DisplayPort::SetStream(const display_timing& timing, bool wideBus)
+{
+	uint32 linkRate = LinkRate();
+	uint32 lanes = Lanes();
+	if (linkRate == 0 || lanes == 0)
+		return B_NO_INIT;
+	if (timing.pixel_clock > MaxPixelClock())
+		return B_BAD_VALUE;
+
+	status_t status = _SetPixelClock(wideBus
+		? timing.pixel_clock / 2 : timing.pixel_clock);
+	if (status != B_OK) {
+		ERROR("DP %" B_PRIu32 ": pixel clock %" B_PRIu32 " kHz: %s\n", fIndex,
+			timing.pixel_clock, strerror(status));
+		return status;
+	}
+
+	// main stream attributes: totals, start from the syncs (sync and back
+	// porch), sync widths and polarities, active size
+	uint32 hStart = timing.h_total - timing.h_sync_start;
+	uint32 vStart = timing.v_total - timing.v_sync_start;
+	_Write(REG_DP_TOTAL_HOR_VER, (uint32)timing.v_total << 16 | timing.h_total);
+	_Write(REG_DP_START_HOR_VER_FROM_SYNC, vStart << 16 | hStart);
+	_Write(REG_DP_HSYNC_VSYNC_WIDTH_POLARITY,
+		(timing.v_sync_positive ? 0 : 1u << 31)
+		| (uint32)(timing.v_sync_end - timing.v_sync_start) << 16
+		| (timing.h_sync_positive ? 0 : 1u << 15)
+		| (timing.h_sync_end - timing.h_sync_start));
+	_Write(REG_DP_ACTIVE_HOR_VER,
+		(uint32)timing.v_display << 16 | timing.h_display);
+
+	// Mvid/Nvid, as msm_dp_ctrl_config_msa()
+	uint32 divider = linkRate == 810 ? 6 : linkRate == 540 ? 4 : 2;
+	uint64 input = (uint64)linkRate * 1000 * 10 / divider;
+	uint64 m, n;
+	best_fraction(timing.pixel_clock, input, kRcgMndMask, &m, &n);
+	uint32 mvid = m * 5;
+	uint32 nvid = n;
+	if (nvid < kNvidFixed) {
+		uint32 factor = kNvidFixed / nvid;
+		mvid *= factor;
+		nvid *= factor;
+	}
+	if (linkRate == 540)
+		nvid *= 2;
+	else if (linkRate == 810)
+		nvid *= 3;
+	_Write(REG_DP_SOFTWARE_MVID, mvid);
+	_Write(REG_DP_SOFTWARE_NVID, nvid);
+
+	uint32 tu, valid, valid2;
+	status = qcom_dp_calc_tu(linkRate, timing.pixel_clock, timing.h_display,
+		timing.h_total - timing.h_display, lanes, 24, &tu, &valid, &valid2);
+	if (status != B_OK)
+		return status;
+	_Write(REG_DP_VALID_BOUNDARY, valid);
+	_Write(REG_DP_TU, tu);
+	_Write(REG_DP_VALID_BOUNDARY_2, valid2);
+	INFO("DP %" B_PRIu32 ": %ux%u at %" B_PRIu32 " kHz on %" B_PRIu32
+		" lanes at %" B_PRIu32 " MHz: M/N %" B_PRIu32 "/%" B_PRIu32 ", TU %#"
+		B_PRIx32 " %#" B_PRIx32 " %#" B_PRIx32 "\n", fIndex, timing.h_display,
+		timing.v_display, timing.pixel_clock, lanes, linkRate, mvid, nvid, tu,
+		valid, valid2);
+	return B_OK;
+}
+
+
+/*!	The stream again, once the timing engine runs. */
+status_t
+DisplayPort::StartStream()
+{
+	if (fBase == NULL)
+		return B_NO_INIT;
+	_Write(REG_DP_INTR_STATUS2, kReadyForVideo << 1);
+	_Write(REG_DP_STATE_CTRL, kStateSendVideo);
+	bigtime_t timeout = system_time() + 100000;
+	while ((_Read(REG_DP_INTR_STATUS2) & kReadyForVideo) == 0
+		&& (_Read(REG_DP_MAINLINK_READY) & kMainlinkReadyForVideo) == 0) {
+		if (system_time() > timeout) {
+			ERROR("DP %" B_PRIu32 ": no video (ready %#" B_PRIx32 ")\n", fIndex,
+				_Read(REG_DP_MAINLINK_READY));
+			return B_TIMED_OUT;
+		}
+		spin(50);
+	}
+	_Write(REG_DP_INTR_STATUS2, kReadyForVideo << 1);
+
+	// what the sink says of the link (sink count, lane status, alignment,
+	// sink status)
+	uint8 status[6];
+	if (ReadDpcd(0x200, status, sizeof(status)) == B_OK) {
+		INFO("DP %" B_PRIu32 ": sink count %#x, lanes %#x %#x, align %#x, "
+			"sink %#x\n", fIndex, status[0], status[2], status[3], status[4],
+			status[5]);
 	}
 	return B_OK;
 }

@@ -37,6 +37,20 @@ public:
 			status_t			StreamTiming(display_timing& timing);
 				// h_display etc., not the pixel clock
 			uint32				Lanes();
+			uint32				LinkRate();
+				// MHz of the link symbol clock (162, 270, 540, 810), from
+				// the sink's DPCD: the rate the firmware trained
+			uint32				MaxPixelClock();
+				// kHz the link carries at 24 bits per pixel
+			uint32				PixelClock(bool wideBus);
+				// kHz, from the pixel RCG's M/N; 0 if it cannot tell
+
+			// a new mode on the trained link: StopStream(), the timing
+			// engine reprogrammed, StartStream()
+			status_t			StopStream();
+			status_t			SetStream(const display_timing& timing,
+									bool wideBus);
+			status_t			StartStream();
 
 private:
 			uint32				_Read(uint32 offset) const
@@ -45,6 +59,7 @@ private:
 			void				_Write(uint32 offset, uint32 value)
 									{ *(volatile uint32*)(fBase + offset)
 										= value; }
+			status_t			_SetPixelClock(uint32 rate);
 			status_t			_Transfer(bool native, bool read,
 									uint32 address, uint8* buffer,
 									size_t size, bool stop);
@@ -52,6 +67,9 @@ private:
 			uint32				fIndex;
 			area_id				fArea;
 			volatile uint8*		fBase;
+			area_id				fClockArea;
+			volatile uint8*		fClocks;	// the pixel RCG's page of dispcc
+			uint32				fLinkRate;
 };
 
 

@@ -48,9 +48,19 @@ public:
 				// INTF number, 6 for the HDMI output
 			const display_timing& Timing() const { return fTiming; }
 
+			bool				WideBus() const { return fWideBus; }
+
 			status_t			SetScanout(phys_addr_t address,
 									uint32 bytesPerRow, uint32 width,
 									uint32 height);
+
+			// a new mode: the timing engine stopped, reprogrammed (the
+			// pipe then shows nothing until SetScanout()), started
+			void				StopTiming();
+			status_t			SetTiming(const display_timing& timing);
+			void				StartTiming();
+			void				LogState(const char* when);
+				// frames counted over 100 ms, underruns, sizes
 
 			// the interface's vertical blank interrupt
 			void				EnableBlankInterrupt(bool enable);
@@ -78,7 +88,9 @@ private:
 			uint32				fControlBase;
 			uint32				fPipeBase;
 			uint32				fPipeFlush;
+			uint32				fMixerBase;
 			uint32				fMixerFlush;
+			bool				fWideBus;
 			uint32				fBlankBit;
 			display_timing		fTiming;
 };

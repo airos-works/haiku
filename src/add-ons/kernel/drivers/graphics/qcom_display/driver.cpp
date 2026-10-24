@@ -53,6 +53,9 @@ static const uint16 kVirtualHeight = 1080;
 // MDSS 0's interrupt (SPI 83) when the device tree names none
 static const uint32 kMdssInterrupt = 83 + 32;
 
+// the board's CH7218A bridge: HDMI 2.0, 600 MHz
+static const uint32 kBridgeMaxPixelClock = 600000;
+
 
 struct display_info {
 	device_node*	node;
@@ -112,6 +115,51 @@ to_shared(const qcom::display_timing& timing)
 }
 
 
+static qcom::display_timing
+from_shared(const qcom_display_timing& shared)
+{
+	qcom::display_timing timing;
+	timing.pixel_clock = shared.pixel_clock;
+	timing.h_display = shared.h_display;
+	timing.h_sync_start = shared.h_sync_start;
+	timing.h_sync_end = shared.h_sync_end;
+	timing.h_total = shared.h_total;
+	timing.v_display = shared.v_display;
+	timing.v_sync_start = shared.v_sync_start;
+	timing.v_sync_end = shared.v_sync_end;
+	timing.v_total = shared.v_total;
+	timing.h_sync_positive = (shared.flags & B_POSITIVE_HSYNC) != 0;
+	timing.v_sync_positive = (shared.flags & B_POSITIVE_VSYNC) != 0;
+	return timing;
+}
+
+
+static bool
+same_timing(const qcom_display_timing& a, const qcom_display_timing& b)
+{
+	return memcmp(&a, &b, sizeof(a)) == 0;
+}
+
+
+/*!	A mode the driver can set: a sane size and a pixel clock the output
+	carries.
+*/
+static bool
+valid_timing(const qcom_display_timing& timing, uint32 maxPixelClock)
+{
+	return timing.h_display >= 320 && timing.h_display <= 5120
+		&& timing.v_display >= 200 && timing.v_display <= 4096
+		&& timing.h_sync_start >= timing.h_display
+		&& timing.h_sync_end > timing.h_sync_start
+		&& timing.h_total >= timing.h_sync_end
+		&& timing.v_sync_start >= timing.v_display
+		&& timing.v_sync_end > timing.v_sync_start
+		&& timing.v_total >= timing.v_sync_end
+		&& timing.pixel_clock >= 20000
+		&& (maxPixelClock == 0 || timing.pixel_clock <= maxPixelClock);
+}
+
+
 /*!	What a headless output stands for: 1920x1080 at 60 Hz (CEA-861). */
 static qcom_display_timing
 virtual_timing()
@@ -146,8 +194,14 @@ init_outputs(display_info* info)
 	output.edid_length = 0;
 	if (info->dpu != NULL) {
 		qcom::display_timing timing = info->dpu->Timing();
-		// the stream's own attributes have the real porches and polarities
+		// the stream's own attributes have the real porches and polarities,
+		// and the pixel RCG the exact clock
 		if (info->port != NULL) {
+			uint32 pixelClock = info->port->PixelClock(info->dpu->WideBus());
+			if (pixelClock != 0 && pixelClock > timing.pixel_clock * 99 / 100
+				&& pixelClock < timing.pixel_clock * 101 / 100) {
+				timing.pixel_clock = pixelClock;
+			}
 			qcom::display_timing stream;
 			if (info->port->StreamTiming(stream) == B_OK
 				&& stream.h_display == timing.h_display
@@ -170,7 +224,12 @@ init_outputs(display_info* info)
 		output.native_height = timing.v_display;
 		output.native_timing = to_shared(timing);
 		output.timing = output.native_timing;
+		// modes are set on the link the firmware trained
 		output.max_pixel_clock = timing.pixel_clock;
+		if (info->port != NULL && info->port->MaxPixelClock() != 0) {
+			output.max_pixel_clock = min_c(info->port->MaxPixelClock(),
+				kBridgeMaxPixelClock);
+		}
 		INFO("HDMI-1: %ux%u, %" B_PRIu32 " kHz (%u/%u/%u, %u/%u/%u), the "
 			"firmware's mode; %s, EDID %" B_PRIu32 " bytes\n",
 			output.native_width, output.native_height, timing.pixel_clock,
@@ -230,6 +289,48 @@ update_scanout(display_info* info)
 		ERROR("HDMI-1: cannot show %ux%u: %s\n", output.width, output.height,
 			strerror(status));
 	}
+}
+
+
+/*!	Output 0 at \a wanted, on the link the firmware trained: the timing
+	engine stopped, the stream idle, both retimed, started again. Back to the
+	mode it had when the new one does not come up.
+*/
+static status_t
+set_mode(display_info* info, const qcom_display_timing& wanted)
+{
+	if (info->dpu == NULL || info->port == NULL)
+		return B_NOT_SUPPORTED;
+	qcom::display_timing timing = from_shared(wanted);
+	qcom::display_timing old = info->dpu->Timing();
+	bool wideBus = info->dpu->WideBus();
+
+	// the stream goes idle while the timing engine still feeds it, as
+	// Linux disables the bridge before the encoder
+	status_t status = info->port->StopStream();
+	info->dpu->StopTiming();
+	if (status == B_OK)
+		status = info->port->SetStream(timing, wideBus);
+	if (status == B_OK)
+		status = info->dpu->SetTiming(timing);
+	if (status == B_OK) {
+		info->dpu->StartTiming();
+		status = info->port->StartStream();
+	}
+	if (status == B_OK)
+		return B_OK;
+
+	ERROR("HDMI-1: %ux%u at %" B_PRIu32 " kHz does not come up (%s), back to "
+		"%ux%u\n", timing.h_display, timing.v_display, timing.pixel_clock,
+		strerror(status), old.h_display, old.v_display);
+	info->port->StopStream();
+	info->dpu->StopTiming();
+	if (info->port->SetStream(old, wideBus) == B_OK
+		&& info->dpu->SetTiming(old) == B_OK) {
+		info->dpu->StartTiming();
+		info->port->StartStream();
+	}
+	return status;
 }
 
 
@@ -392,13 +493,19 @@ set_layout(display_info* info, const qcom_display_layout& layout)
 		if ((request.flags & QCOM_DISPLAY_OUTPUT_ENABLED) == 0)
 			continue;
 		const qcom_display_output& output = shared.outputs[i];
+		const qcom_display_timing& timing = request.timing.h_display != 0
+			? request.timing : output.timing;
 		if ((output.flags & QCOM_DISPLAY_OUTPUT_CONNECTED) == 0
 			|| request.x < 0 || request.y < 0 || request.width == 0
 			|| request.height == 0
 			|| request.x + request.width > (int32)layout.width
 			|| request.y + request.height > (int32)layout.height
-			|| request.width > output.timing.h_display
-			|| request.height > output.timing.v_display) {
+			|| request.width > timing.h_display
+			|| request.height > timing.v_display) {
+			return B_BAD_VALUE;
+		}
+		if (request.timing.h_display != 0
+			&& !valid_timing(request.timing, output.max_pixel_clock)) {
 			return B_BAD_VALUE;
 		}
 		enabled++;
@@ -410,6 +517,7 @@ set_layout(display_info* info, const qcom_display_layout& layout)
 	status_t status = ensure_buffer(info, (size_t)bytesPerRow * layout.height);
 	if (status != B_OK)
 		return status;
+	bool modeChanged = false;
 
 	for (uint32 i = 0; i < shared.output_count; i++) {
 		qcom_display_output& output = shared.outputs[i];
@@ -426,10 +534,21 @@ set_layout(display_info* info, const qcom_display_layout& layout)
 
 		output.flags = kept | QCOM_DISPLAY_OUTPUT_ENABLED
 			| (request.flags & QCOM_DISPLAY_OUTPUT_MIRROR);
-		// a headless output just takes the mode
-		if ((output.flags & QCOM_DISPLAY_OUTPUT_VIRTUAL) != 0
-			&& request.timing.h_display != 0) {
-			output.timing = request.timing;
+		// a headless output just takes the mode; a display gets it set
+		if (request.timing.h_display != 0
+			&& !same_timing(request.timing, output.timing)) {
+			if ((output.flags & QCOM_DISPLAY_OUTPUT_VIRTUAL) != 0)
+				output.timing = request.timing;
+			else if (i == 0) {
+				INFO("HDMI-1: mode %ux%u, %" B_PRIu32 " kHz\n",
+					request.timing.h_display, request.timing.v_display,
+					request.timing.pixel_clock);
+				status = set_mode(info, request.timing);
+				if (status != B_OK)
+					return status;
+				output.timing = request.timing;
+				modeChanged = true;
+			}
 		}
 		output.x = request.x;
 		output.y = request.y;
@@ -452,6 +571,8 @@ set_layout(display_info* info, const qcom_display_layout& layout)
 	shared.height = layout.height;
 	shared.bytes_per_row = bytesPerRow;
 	update_scanout(info);
+	if (modeChanged)
+		info->dpu->LogState("HDMI-1 after the mode change");
 
 	// the kernel's console and debugger follow
 	frame_buffer_update((addr_t)info->buffer, layout.width, layout.height, 32,

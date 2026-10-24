@@ -7,10 +7,10 @@
 	a copy of the Allwinner A733's (sunxi_display), itself the Raspberry Pi's
 	(rpi_display), for the same protocol.
 
-	The driver keeps each output at the mode it found and shows the output's
-	region of the frame buffer unscaled, so a display offers that one mode;
-	app_server arranges the regions through the display layout hooks. There
-	is no acceleration and no hardware cursor yet. */
+	The driver sets the modes a display's EDID offers (on the link the
+	firmware trained) and shows the output's region of the frame buffer
+	unscaled; app_server arranges the regions through the display layout
+	hooks. There is no acceleration and no hardware cursor yet. */
 
 
 #include <errno.h>
@@ -594,10 +594,6 @@ output_modes(const qcom_display_output& output, display_mode* modes,
 	uint32 count = 0;
 	if (count < maxCount)
 		modes[count++] = native;
-
-	// the driver cannot set modes yet: a real display offers the one it shows
-	if ((output.flags & QCOM_DISPLAY_OUTPUT_VIRTUAL) == 0)
-		return count;
 
 	if ((output.flags & QCOM_DISPLAY_OUTPUT_VIRTUAL) == 0
 		&& output.edid_length >= 128) {

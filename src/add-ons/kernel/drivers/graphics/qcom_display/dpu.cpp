@@ -41,10 +41,17 @@ static const uint32 kControls = kMdp + 0x15000;
 static const uint32 kControlCount = 6;
 enum {
 	CTL_FLUSH			= 0x018,
+	CTL_INTF_FLUSH		= 0x110,
 	CTL_INTF_ACTIVE		= 0x0f4,
 	CTL_FETCH_PIPE_ACTIVE = 0x0fc,
 };
 static const uint32 kControlFlush = 1u << 17;
+static const uint32 kInterfaceFlush = 1u << 31;
+
+static const uint32 kMixers = kMdp + 0x44000;
+enum {
+	LM_OUT_SIZE			= 0x04,
+};
 
 // layer mixers: CTL_LAYER(lm) and their flush bits
 static const uint32 kMixerLayer[] = {0x00, 0x04, 0x08, 0x0c, 0x10, 0x24};
@@ -92,14 +99,25 @@ enum {
 	INTF_VSYNC_PULSE_WIDTH_F0 = 0x014,
 	INTF_DISPLAY_V_START_F0	= 0x01c,
 	INTF_DISPLAY_V_END_F0	= 0x024,
+	INTF_CONFIG				= 0x004,
+	INTF_ACTIVE_V_START_F0	= 0x02c,
+	INTF_ACTIVE_V_END_F0	= 0x034,
 	INTF_DISPLAY_HCTL		= 0x03c,
 	INTF_ACTIVE_HCTL		= 0x040,
+	INTF_BORDER_COLOR		= 0x044,
+	INTF_HSYNC_SKEW			= 0x04c,
 	INTF_POLARITY_CTL		= 0x050,
 	INTF_CONFIG2			= 0x060,
+	INTF_DISPLAY_DATA_HCTL	= 0x064,
+	INTF_ACTIVE_DATA_HCTL	= 0x068,
 	INTF_FRAME_LINE_COUNT_EN = 0x0a8,
 	INTF_FRAME_COUNT		= 0x0ac,
 };
 static const uint32 kDataBusWiden = 1u << 0;
+static const uint32 kDataHctlEnable = 1u << 4;
+static const uint32 kActiveHEnable = 1u << 29;
+static const uint32 kActiveVEnable = 1u << 30;
+static const uint32 kProgrammableFetch = 1u << 31;
 
 
 /*!	Bit 31 of a clock controller register: a branch's CBCR reads it set
@@ -129,7 +147,9 @@ Dpu::Dpu()
 	fControlBase(0),
 	fPipeBase(0),
 	fPipeFlush(0),
+	fMixerBase(0),
 	fMixerFlush(0),
+	fWideBus(false),
 	fBlankBit(0),
 	fTiming()
 {
@@ -215,9 +235,20 @@ Dpu::_FindPath()
 			fControlBase = controlBase;
 			fPipeBase = kPipes[pipe].base;
 			fPipeFlush = kPipes[pipe].flush;
+			fMixerBase = kMixers + 0x1000 * mixer;
 			fMixerFlush = kMixerFlush[mixer];
 			fBlankBit = kInterfaces[i].blank;
 			_ReadTiming();
+			if (pipe < 4) {
+				// a VIG pipe's QSEED3 scaler (+0xa00): OP_MODE, source and
+				// destination sizes
+				uint32 scaler = fPipeBase + 0xa00;
+				INFO("%s scaler: op %#" B_PRIx32 " src %#" B_PRIx32 " dst %#"
+					B_PRIx32 " phase step %#" B_PRIx32 " %#" B_PRIx32 "\n",
+					kPipes[pipe].name, _Read(scaler + 0x04),
+					_Read(scaler + 0x40), _Read(scaler + 0x48),
+					_Read(scaler + 0x10), _Read(scaler + 0x14));
+			}
 			INFO("the firmware's path: %s -> LM_%" B_PRId32 " -> CTL_%" B_PRIu32
 				" -> INTF_%" B_PRIu32 ", %ux%u, %" B_PRIu32 " kHz, buffer %#"
 				B_PRIx32 "\n", kPipes[pipe].name, mixer, control, fInterface,
@@ -239,8 +270,8 @@ Dpu::_FindPath()
 void
 Dpu::_ReadTiming()
 {
-	uint32 scale = (_Read(fInterfaceBase + INTF_CONFIG2) & kDataBusWiden) != 0
-		? 2 : 1;
+	fWideBus = (_Read(fInterfaceBase + INTF_CONFIG2) & kDataBusWiden) != 0;
+	uint32 scale = fWideBus ? 2 : 1;
 	uint32 hsync = _Read(fInterfaceBase + INTF_HSYNC_CTL);
 	uint32 hPeriod = hsync >> 16;
 	uint32 hPulse = hsync & 0xffff;
@@ -334,6 +365,140 @@ Dpu::SetScanout(phys_addr_t address, uint32 bytesPerRow, uint32 width,
 	// the pipe takes it at the next vertical blank
 	_Write(fControlBase + CTL_FLUSH, fPipeFlush | fMixerFlush | kControlFlush);
 	return B_OK;
+}
+
+
+void
+Dpu::StopTiming()
+{
+	if (fMdss == NULL || fInterfaceBase == 0)
+		return;
+	_Write(fInterfaceBase + INTF_TIMING_ENGINE_EN, 0);
+	// let the frame under way end (Linux waits a frame's time and more)
+	uint32 rate = fTiming.h_total != 0 && fTiming.v_total != 0
+		? (uint32)((uint64)fTiming.pixel_clock * 1000 / fTiming.h_total
+			/ fTiming.v_total) : 60;
+	snooze(2 * 1000000 / (rate > 0 ? rate : 60));
+}
+
+
+/*!	The timing engine's registers for \a timing, as
+	dpu_encoder_phys_vid_setup_timing_engine() and
+	dpu_hw_intf_setup_timing_engine() write them for DisplayPort: the front
+	porches folded into the back porches, with the wide data bus every
+	horizontal value halved, the window shifted to the bottom right. The
+	mixer and, with SetScanout(), the pipe follow.
+*/
+status_t
+Dpu::SetTiming(const display_timing& timing)
+{
+	if (fMdss == NULL || fInterfaceBase == 0)
+		return B_NO_INIT;
+	uint32 divider = fWideBus ? 2 : 1;
+	if (timing.h_display % divider != 0 || timing.h_display == 0
+		|| timing.v_display == 0 || timing.h_total <= timing.h_display
+		|| timing.v_total <= timing.v_display) {
+		return B_BAD_VALUE;
+	}
+
+	uint32 width = timing.h_display / divider;
+	uint32 hPulse = (timing.h_sync_end - timing.h_sync_start) / divider;
+	uint32 hBack = (timing.h_total - timing.h_sync_end
+		+ timing.h_sync_start - timing.h_display) / divider;
+	uint32 height = timing.v_display;
+	uint32 vPulse = timing.v_sync_end - timing.v_sync_start;
+	uint32 vBack = timing.v_total - timing.v_sync_end + timing.v_sync_start
+		- timing.v_display;
+
+	uint32 hPeriod = hPulse + hBack + width;
+	uint32 vPeriod = vPulse + vBack + height;
+	uint32 displayVStart = (vPulse + vBack) * hPeriod;
+	uint32 displayVEnd = vPeriod * hPeriod - 1;
+	uint32 hStartX = hBack + hPulse;
+
+	// DisplayPort: the active window from the start of the data on
+	displayVStart += hPulse + hBack;
+	uint32 activeHEnd = hStartX + width - 1;
+	uint32 activeHctl = activeHEnd << 16 | hStartX;
+	uint32 activeVStart = displayVStart;
+	uint32 activeVEnd = activeVStart + height * hPeriod - 1;
+
+	// polarity 1 = active low
+	uint32 polarity = (timing.v_sync_positive ? 0 : 2)
+		| (timing.h_sync_positive ? 0 : 1);
+
+	uint32 config = _Read(fInterfaceBase + INTF_CONFIG) | kActiveHEnable
+		| kActiveVEnable;
+	config &= ~kProgrammableFetch;
+	uint32 config2 = _Read(fInterfaceBase + INTF_CONFIG2) | kDataHctlEnable;
+	if (fWideBus)
+		config2 |= kDataBusWiden;
+
+	_Write(fInterfaceBase + INTF_HSYNC_CTL, hPeriod << 16 | hPulse);
+	_Write(fInterfaceBase + INTF_VSYNC_PERIOD_F0, vPeriod * hPeriod);
+	_Write(fInterfaceBase + INTF_VSYNC_PULSE_WIDTH_F0, vPulse * hPeriod);
+	_Write(fInterfaceBase + INTF_DISPLAY_HCTL, activeHctl);
+	_Write(fInterfaceBase + INTF_DISPLAY_V_START_F0, displayVStart);
+	_Write(fInterfaceBase + INTF_DISPLAY_V_END_F0, displayVEnd);
+	_Write(fInterfaceBase + INTF_ACTIVE_HCTL, activeHctl);
+	_Write(fInterfaceBase + INTF_ACTIVE_V_START_F0, activeVStart);
+	_Write(fInterfaceBase + INTF_ACTIVE_V_END_F0, activeVEnd);
+	_Write(fInterfaceBase + INTF_BORDER_COLOR, 0);
+	_Write(fInterfaceBase + INTF_HSYNC_SKEW, 0);
+	_Write(fInterfaceBase + INTF_POLARITY_CTL, polarity);
+	_Write(fInterfaceBase + INTF_FRAME_LINE_COUNT_EN, 0x3);
+	_Write(fInterfaceBase + INTF_CONFIG, config);
+	_Write(fInterfaceBase + INTF_CONFIG2, config2);
+	_Write(fInterfaceBase + INTF_DISPLAY_DATA_HCTL,
+		(hStartX + width - 1) << 16 | hStartX);
+	_Write(fInterfaceBase + INTF_ACTIVE_DATA_HCTL, 0);
+
+	_Write(fMixerBase + LM_OUT_SIZE,
+		(uint32)timing.v_display << 16 | timing.h_display);
+	// the pipe no larger than the mixer until SetScanout() gives it a region
+	uint32 size = _Read(fPipeBase + SSPP_SRC_SIZE);
+	uint32 pipeWidth = min_c(size & 0xffff, (uint32)timing.h_display);
+	uint32 pipeHeight = min_c(size >> 16, (uint32)timing.v_display);
+	size = pipeHeight << 16 | pipeWidth;
+	_Write(fPipeBase + SSPP_SRC_SIZE, size);
+	_Write(fPipeBase + SSPP_OUT_SIZE, size);
+	fTiming = timing;
+	return B_OK;
+}
+
+
+void
+Dpu::StartTiming()
+{
+	if (fMdss == NULL || fInterfaceBase == 0)
+		return;
+	// mixer, pipe and timing engine together
+	_Write(fControlBase + CTL_INTF_FLUSH, 1u << fInterface);
+	_Write(fControlBase + CTL_FLUSH, fPipeFlush | fMixerFlush | kControlFlush
+		| kInterfaceFlush);
+	_Write(fInterfaceBase + INTF_TIMING_ENGINE_EN, 1);
+}
+
+
+void
+Dpu::LogState(const char* when)
+{
+	if (fMdss == NULL || fInterfaceBase == 0)
+		return;
+	// INTF_6's underrun bit is the one below its vertical blank's
+	uint32 underrun = fBlankBit >> 1;
+	_Write(kInterruptClear, underrun);
+	uint32 frames = _Read(fInterfaceBase + INTF_FRAME_COUNT);
+	snooze(100000);
+	frames = _Read(fInterfaceBase + INTF_FRAME_COUNT) - frames;
+	INFO("%s: INTF_%" B_PRIu32 " %s, %" B_PRIu32 " frames in 100 ms, line %"
+		B_PRIu32 ", underrun %s; LM %#" B_PRIx32 ", pipe %#" B_PRIx32 " -> %#"
+		B_PRIx32 " stride %#" B_PRIx32 "\n", when, fInterface,
+		(_Read(fInterfaceBase + INTF_TIMING_ENGINE_EN) & 1) != 0
+			? "on" : "off", frames, _Read(fInterfaceBase + 0xb0),
+		(_Read(kInterruptStatus) & underrun) != 0 ? "yes" : "no",
+		_Read(fMixerBase + LM_OUT_SIZE), _Read(fPipeBase + SSPP_SRC_SIZE),
+		_Read(fPipeBase + SSPP_OUT_SIZE), _Read(fPipeBase + SSPP_SRC_YSTRIDE0));
 }
 
 
