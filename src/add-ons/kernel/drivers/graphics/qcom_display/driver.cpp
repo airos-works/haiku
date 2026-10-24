@@ -36,6 +36,7 @@
 
 #include <qcom_display.h>
 
+#include "display_port.h"
 #include "dpu.h"
 
 
@@ -72,6 +73,7 @@ struct display_info {
 	void*			notificationOwner;
 
 	qcom::Dpu*		dpu;			// NULL: nothing to show on
+	qcom::DisplayPort* port;		// the DisplayPort controller it feeds
 
 	// vertical blanks: the timing engine's interrupt while it runs; a
 	// timer stands in for it when it does not
@@ -143,14 +145,53 @@ init_outputs(display_info* info)
 	output.flags = QCOM_DISPLAY_OUTPUT_CONNECTED;
 	output.edid_length = 0;
 	if (info->dpu != NULL) {
-		const qcom::display_timing& timing = info->dpu->Timing();
+		qcom::display_timing timing = info->dpu->Timing();
+		// the stream's own attributes have the real porches and polarities
+		if (info->port != NULL) {
+			qcom::display_timing stream;
+			if (info->port->StreamTiming(stream) == B_OK
+				&& stream.h_display == timing.h_display
+				&& stream.v_display == timing.v_display
+				&& stream.h_total == timing.h_total
+				&& stream.v_total == timing.v_total) {
+				stream.pixel_clock = timing.pixel_clock;
+				timing = stream;
+			}
+			if (info->port->HotPlug()) {
+				uint32 length = 0;
+				status_t status = info->port->ReadEdid(output.edid, &length);
+				if (status == B_OK)
+					output.edid_length = length;
+				else
+					ERROR("HDMI-1: no EDID: %s\n", strerror(status));
+			}
+		}
 		output.native_width = timing.h_display;
 		output.native_height = timing.v_display;
 		output.native_timing = to_shared(timing);
 		output.timing = output.native_timing;
 		output.max_pixel_clock = timing.pixel_clock;
-		INFO("HDMI-1: %ux%u, %" B_PRIu32 " kHz, the firmware's mode\n",
-			output.native_width, output.native_height, timing.pixel_clock);
+		INFO("HDMI-1: %ux%u, %" B_PRIu32 " kHz (%u/%u/%u, %u/%u/%u), the "
+			"firmware's mode; %s, EDID %" B_PRIu32 " bytes\n",
+			output.native_width, output.native_height, timing.pixel_clock,
+			timing.h_sync_start, timing.h_sync_end, timing.h_total,
+			timing.v_sync_start, timing.v_sync_end, timing.v_total,
+			info->port != NULL && info->port->HotPlug()
+				? "hot plug" : "no hot plug", output.edid_length);
+		if (output.edid_length >= 128) {
+			// the monitor's name, from the descriptors
+			for (uint32 d = 54; d + 18 <= 126; d += 18) {
+				const uint8* descriptor = output.edid + d;
+				if (descriptor[0] != 0 || descriptor[1] != 0
+					|| descriptor[3] != 0xfc) {
+					continue;
+				}
+				char name[14] = {};
+				for (int c = 0; c < 13 && descriptor[5 + c] != '\n'; c++)
+					name[c] = descriptor[5 + c];
+				INFO("HDMI-1: %s\n", name);
+			}
+		}
 	} else {
 		output.flags |= QCOM_DISPLAY_OUTPUT_VIRTUAL;
 		output.native_width = kVirtualWidth;
@@ -454,6 +495,14 @@ display_init_device(void* _info, void** _cookie)
 		delete info->dpu;
 		info->dpu = NULL;
 	}
+	// INTF_6 feeds DisplayPort controller 2, the HDMI bridge's
+	if (info->dpu != NULL && info->dpu->Interface() == 6) {
+		info->port = new(std::nothrow) qcom::DisplayPort(2);
+		if (info->port != NULL && info->port->Init() != B_OK) {
+			delete info->port;
+			info->port = NULL;
+		}
+	}
 
 	init_outputs(info);
 
@@ -464,6 +513,7 @@ display_init_device(void* _info, void** _cookie)
 		(size_t)first.native_width * 4 * first.native_height);
 	if (status != B_OK) {
 		ERROR("no memory for the frame buffer: %s\n", strerror(status));
+		delete info->port;
 		delete info->dpu;
 		delete_area(info->sharedArea);
 		return status;
@@ -483,6 +533,7 @@ display_uninit_device(void* cookie)
 {
 	display_info* info = (display_info*)cookie;
 	uninit_retrace(info);
+	delete info->port;
 	delete info->dpu;
 	mutex_destroy(&info->lock);
 	if (info->bufferArea >= 0)

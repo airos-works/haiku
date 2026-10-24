@@ -596,10 +596,8 @@ output_modes(const qcom_display_output& output, display_mode* modes,
 		modes[count++] = native;
 
 	// the driver cannot set modes yet: a real display offers the one it shows
-	if ((output.flags & QCOM_DISPLAY_OUTPUT_VIRTUAL) == 0
-		&& output.edid_length < 128) {
+	if ((output.flags & QCOM_DISPLAY_OUTPUT_VIRTUAL) == 0)
 		return count;
-	}
 
 	if ((output.flags & QCOM_DISPLAY_OUTPUT_VIRTUAL) == 0
 		&& output.edid_length >= 128) {

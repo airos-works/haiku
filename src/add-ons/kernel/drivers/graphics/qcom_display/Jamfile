@@ -8,6 +8,7 @@ UsePrivateHeaders [ FDirName graphics common ] ;
 UsePrivateHeaders [ FDirName graphics qcom_display ] ;
 
 KernelAddon qcom_display :
+	display_port.cpp
 	dpu.cpp
 	driver.cpp
 ;
