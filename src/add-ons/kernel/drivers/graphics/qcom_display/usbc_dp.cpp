@@ -22,22 +22,51 @@
 namespace qcom {
 
 
-// USB-C connector 0 (gcc-sc8280xp.c, dispcc-sc8280xp.c, the device tree)
+// the USB-C connectors (gcc-sc8280xp.c, dispcc-sc8280xp.c,
+// dpu_8_0_sc8280xp.h, dpu_hw_ctl.c, the device tree)
 static const phys_addr_t kGccBase = 0x100000;
-static const uint32 kGdsc = 0xf004;						// USB30_PRIM_GDSC
-static const uint32 kPhyBranches[] = {0xf054, 0x8c02c, 0xf058};
-	// aux, ref (usb4 eud clkref), com aux
-static const uint32 kPhyResets[] = {0x50000, 0x4a008};
-	// GCC_USB3_PHY_PRIM_BCR, GCC_USB4_DP_PHY_PRIM_BCR
-static const phys_addr_t kPhyBase = 0x88eb000;
 static const phys_addr_t kDispccBase = 0xaf00000;
-static const uint32 kLinkRcg = 0x21a4, kLinkSource = 1, kLinkBranch = 0x205c;
-static const uint32 kLinkIntfBranch = 0x2060;
-static const uint32 kAuxRcg = 0x2238, kAuxBranch = 0x206c;
-static const uint32 kPixelRcg = 0x21d8, kPixelSource = 2, kPixelBranch = 0x2070;
-static const phys_addr_t kControllerBase = 0xae90000;
 static const phys_addr_t kTlmmBase = 0xf100000;
-static const uint32 kSbuEnablePin = 101, kSbuSelectPin = 164;
+static const uint32 kMdp = 0x1000;
+
+struct usbc_connector {
+	const char*	name;
+	uint32		controller;		// DisplayPort controller of MDSS 0
+	phys_addr_t	controllerBase;
+	// the combo PHY: its GDSC, aux/ref/com aux clocks, phy/common resets
+	phys_addr_t	phyBase;
+	uint32		gdsc;
+	uint32		phyBranches[3];
+	uint32		phyResets[2];
+	// dispcc 0
+	uint32		linkRcg, linkSource, linkBranch, linkIntfBranch;
+	uint32		auxRcg, auxBranch;
+	uint32		pixelRcg, pixelSource, pixelBranch;
+	// the SBU mux (PI3USB102)
+	uint32		sbuEnablePin, sbuSelectPin;
+	// its DPU path: pipe, mixer, control path, timing engine
+	uint32		pipe, mixer, control, interface;
+	uint32		pipeFlush, mixerFlush;
+	uint32		pipeFetch;		// CTL_FETCH_PIPE_ACTIVE bit
+	uint32		layerShift;		// the pipe's field in CTL_LAYER
+	uint32		layerExtShift;	// and in CTL_LAYER_EXT
+	uint32		interfaceNumber;
+	uint32		underrun;		// MDP interrupt bit
+};
+
+static const usbc_connector kConnectors[] = {
+	{"DP-1", 0, 0xae90000, 0x88eb000, 0xf004, {0xf054, 0x8c02c, 0xf058},
+		{0x50000, 0x4a008}, 0x21a4, 1, 0x205c, 0x2060, 0x2238, 0x206c,
+		0x21d8, 2, 0x2070, 101, 164,
+		kMdp + 0x4000, 0, 0, kMdp + 0x34000,	// VIG0, LM_0, CTL_0, INTF_0
+		1u << 0, 1u << 6, 1u << 16, 0, 0, 0, 1u << 24},
+	{"DP-2", 1, 0xae98000, 0x8903000, 0x10004, {0x10054, 0x8c010, 0x10058},
+		{0x5000c, 0xb9020}, 0x2268, 2, 0x2084, 0x2088, 0x22d0, 0x20a0,
+		0x2250, 4, 0x2078, 48, 47,
+		kMdp + 0x6000, 1, 1, kMdp + 0x38000,	// VIG1, LM_1, CTL_1, INTF_4
+		1u << 1, 1u << 7, 1u << 17, 3, 2, 4, 1u << 20},
+};
+
 
 // the combo PHY (phy-qcom-qmp-combo.c, qmp_combo_offsets_v5)
 static const uint32 kPhyCom = 0x0000, kPhyTxA = 0x0400, kPhyTxB = 0x0a00,
@@ -100,18 +129,16 @@ enum {
 // the DPU (dpu_8_0_sc8280xp.h): the firmware's HDMI path and the new one
 static const phys_addr_t kMdssBase = 0xae00000;
 static const size_t kMdssSize = 0x90000;
-static const uint32 kMdp = 0x1000;
-static const uint32 kVig0 = kMdp + 0x4000, kVig2 = kMdp + 0x8000;
-static const uint32 kLm0 = kMdp + 0x44000, kLm2 = kMdp + 0x46000;
-static const uint32 kCtl0 = kMdp + 0x15000, kCtl2 = kMdp + 0x17000;
-static const uint32 kIntf0 = kMdp + 0x34000, kIntf6 = kMdp + 0x3a000;
+static const uint32 kVig2 = kMdp + 0x8000;
+static const uint32 kMixers = kMdp + 0x44000, kLm2 = kMixers + 0x2000;
+static const uint32 kControls = kMdp + 0x15000, kCtl2 = kControls + 0x2000;
+static const uint32 kIntf6 = kMdp + 0x3a000;
 static const uint32 kInterruptStatus = kMdp + 0x14;
 static const uint32 kInterruptClear = kMdp + 0x18;
-static const uint32 kUnderrunIntf0 = 1u << 24;
 
 enum {
-	CTL_LAYER_LM0 = 0x00, CTL_LAYER_LM2 = 0x08, CTL_TOP = 0x14,
-	CTL_FLUSH = 0x18, CTL_LAYER_EXT_LM0 = 0x40, CTL_LAYER_EXT_LM2 = 0x48,
+	CTL_LAYER_LM2 = 0x08, CTL_TOP = 0x14,
+	CTL_FLUSH = 0x18, CTL_LAYER_EXT_LM2 = 0x48,
 	CTL_INTF_ACTIVE = 0xf4, CTL_FETCH_PIPE_ACTIVE = 0xfc,
 	CTL_INTF_FLUSH = 0x110,
 
@@ -123,7 +150,6 @@ enum {
 	INTF_TIMING_ENGINE_EN = 0x000, INTF_FRAME_LINE_COUNT_EN = 0x0a8,
 	INTF_FRAME_COUNT = 0x0ac,
 };
-static const uint32 kFlushVig0 = 1u << 0, kFlushLm0 = 1u << 6;
 static const uint32 kFlushCtl = 1u << 17, kFlushIntf = 1u << 31;
 // the HDMI path's timing registers, which INTF_0 takes
 static const uint32 kIntfTiming[] = {0x004, 0x008, 0x00c, 0x014, 0x01c, 0x024,
@@ -166,8 +192,14 @@ branch_on(volatile uint8* cc, uint32 offset)
 }
 
 
-UsbcDisplayPort::UsbcDisplayPort()
+UsbcDisplayPort::UsbcDisplayPort(uint32 connector)
 	:
+	fConnector(kConnectors[connector < B_COUNT_OF(kConnectors)
+		? connector : 0]),
+	fMixerBase(kMixers + 0x1000 * fConnector.mixer),
+	fControlBase(kControls + 0x1000 * fConnector.control),
+	fLayer(4 * fConnector.mixer),
+	fLayerExt(0x40 + 4 * fConnector.mixer),
 	fGccArea(-1), fGcc(NULL), fDispccArea(-1), fDispcc(NULL), fPhyArea(-1),
 	fPhy(NULL), fControllerArea(-1), fController(NULL), fPort(NULL),
 	fMdssArea(-1), fMdss(NULL), fRate(0), fPowered(false), fRunning(false)
@@ -206,19 +238,19 @@ UsbcDisplayPort::_Map(area_id& area, volatile uint8*& base, const char* name,
 status_t
 UsbcDisplayPort::_PowerPhy()
 {
-	uint32 gdsc = rd(fGcc, kGdsc);
+	uint32 gdsc = rd(fGcc, fConnector.gdsc);
 	if ((gdsc & 1) != 0)
-		wr(fGcc, kGdsc, gdsc & ~1u);
-	if (!wait_bits(fGcc, kGdsc, 1u << 31, 1u << 31)) {
-		ERROR("DP-1: USB30_PRIM_GDSC does not come on\n");
+		wr(fGcc, fConnector.gdsc, gdsc & ~1u);
+	if (!wait_bits(fGcc, fConnector.gdsc, 1u << 31, 1u << 31)) {
+		ERROR("%s: its PHY's GDSC does not come on\n", fConnector.name);
 		return B_ERROR;
 	}
-	for (uint32 branch : kPhyBranches)
+	for (uint32 branch : fConnector.phyBranches)
 		branch_on(fGcc, branch);
-	for (uint32 reset : kPhyResets)
+	for (uint32 reset : fConnector.phyResets)
 		wr(fGcc, reset, rd(fGcc, reset) | 1);
 	spin(200);
-	for (uint32 reset : kPhyResets)
+	for (uint32 reset : fConnector.phyResets)
 		wr(fGcc, reset, rd(fGcc, reset) & ~1u);
 	spin(200);
 
@@ -292,8 +324,9 @@ UsbcDisplayPort::_ConfigureRate(uint32 rate)
 	wr(serdes, SERDES_RESETSM_CNTRL, 0x20);
 	if (!wait_bits(serdes, SERDES_C_READY_STATUS, 1, 1)
 		|| !wait_bits(serdes, SERDES_CMN_STATUS, 3, 3)) {
-		ERROR("DP-1: the PHY's PLL does not lock at %" B_PRIu32 " MHz (cmn %#"
-			B_PRIx32 ")\n", rate, rd(serdes, SERDES_CMN_STATUS));
+		ERROR("%s: the PHY's PLL does not lock at %" B_PRIu32 " MHz (cmn %#"
+			B_PRIx32 ")\n", fConnector.name, rate,
+			rd(serdes, SERDES_CMN_STATUS));
 		return B_ERROR;
 	}
 	wr(dp, DP_PHY_CFG, 0x19);
@@ -324,28 +357,34 @@ UsbcDisplayPort::_ConfigureRate(uint32 rate)
 status_t
 UsbcDisplayPort::_Clocks()
 {
-	uint32 cfg = rd(fDispcc, kLinkRcg + 4);
-	wr(fDispcc, kLinkRcg + 4, (cfg & ~(7u << 8 | 0x1fu)) | kLinkSource << 8);
-	wr(fDispcc, kLinkRcg, rd(fDispcc, kLinkRcg) | 1);
-	wait_bits(fDispcc, kLinkRcg, 1, 0);
-	wr(fDispcc, kAuxRcg + 4, 0);
-	wr(fDispcc, kAuxRcg, rd(fDispcc, kAuxRcg) | 1);
-	wait_bits(fDispcc, kAuxRcg, 1, 0);
+	uint32 cfg = rd(fDispcc, fConnector.linkRcg + 4);
+	wr(fDispcc, fConnector.linkRcg + 4, (cfg & ~(7u << 8 | 0x1fu))
+		| fConnector.linkSource << 8);
+	wr(fDispcc, fConnector.linkRcg, rd(fDispcc, fConnector.linkRcg) | 1);
+	wait_bits(fDispcc, fConnector.linkRcg, 1, 0);
+	wr(fDispcc, fConnector.auxRcg + 4, 0);
+	wr(fDispcc, fConnector.auxRcg, rd(fDispcc, fConnector.auxRcg) | 1);
+	wait_bits(fDispcc, fConnector.auxRcg, 1, 0);
 
 	const uint32 m = 11, n = 120, d = n;
-	wr(fDispcc, kPixelRcg + 8, m);
-	wr(fDispcc, kPixelRcg + 0xc, ~(n - m) & 0xffff);
-	wr(fDispcc, kPixelRcg + 0x10, ~d & 0xffff);
-	wr(fDispcc, kPixelRcg + 4, kPixelSource << 8 | 2u << 12);	// dual edge
-	wr(fDispcc, kPixelRcg, rd(fDispcc, kPixelRcg) | 1);
-	wait_bits(fDispcc, kPixelRcg, 1, 0);
+	wr(fDispcc, fConnector.pixelRcg + 8, m);
+	wr(fDispcc, fConnector.pixelRcg + 0xc, ~(n - m) & 0xffff);
+	wr(fDispcc, fConnector.pixelRcg + 0x10, ~d & 0xffff);
+	// dual edge
+	wr(fDispcc, fConnector.pixelRcg + 4,
+		fConnector.pixelSource << 8 | 2u << 12);
+	wr(fDispcc, fConnector.pixelRcg, rd(fDispcc, fConnector.pixelRcg) | 1);
+	wait_bits(fDispcc, fConnector.pixelRcg, 1, 0);
 
-	if (!branch_on(fDispcc, kLinkBranch) || !branch_on(fDispcc, kAuxBranch)
-		|| !branch_on(fDispcc, kLinkIntfBranch)
-		|| !branch_on(fDispcc, kPixelBranch)) {
-		ERROR("DP-1: its clocks do not run (link %#" B_PRIx32 " aux %#" B_PRIx32
-			" pixel %#" B_PRIx32 ")\n", rd(fDispcc, kLinkBranch),
-			rd(fDispcc, kAuxBranch), rd(fDispcc, kPixelBranch));
+	if (!branch_on(fDispcc, fConnector.linkBranch)
+		|| !branch_on(fDispcc, fConnector.auxBranch)
+		|| !branch_on(fDispcc, fConnector.linkIntfBranch)
+		|| !branch_on(fDispcc, fConnector.pixelBranch)) {
+		ERROR("%s: its clocks do not run (link %#" B_PRIx32 " aux %#" B_PRIx32
+			" pixel %#" B_PRIx32 ")\n", fConnector.name,
+			rd(fDispcc, fConnector.linkBranch),
+			rd(fDispcc, fConnector.auxBranch),
+			rd(fDispcc, fConnector.pixelBranch));
 		return B_ERROR;
 	}
 	return B_OK;
@@ -371,29 +410,30 @@ UsbcDisplayPort::PowerUp()
 {
 	if (fPowered)
 		return B_OK;
-	status_t status = _Map(fGccArea, fGcc, "qcom dp1 gcc", kGccBase, 0x1f4200);
+	status_t status = _Map(fGccArea, fGcc, "qcom usbc gcc", kGccBase, 0x1f4200);
 	if (status == B_OK) {
-		status = _Map(fDispccArea, fDispcc, "qcom dp1 dispcc", kDispccBase,
+		status = _Map(fDispccArea, fDispcc, "qcom usbc dispcc", kDispccBase,
 			0x20000);
 	}
 	if (status == B_OK)
-		status = _Map(fPhyArea, fPhy, "qcom dp1 phy", kPhyBase, 0x4000);
+		status = _Map(fPhyArea, fPhy, "qcom usbc phy", fConnector.phyBase,
+			0x4000);
 	if (status == B_OK) {
-		status = _Map(fControllerArea, fController, "qcom dp1", kControllerBase,
-			0x1000);
+		status = _Map(fControllerArea, fController, "qcom usbc dp",
+			fConnector.controllerBase, 0x1000);
 	}
 	if (status == B_OK)
-		status = _Map(fMdssArea, fMdss, "qcom dp1 mdss", kMdssBase, kMdssSize);
+		status = _Map(fMdssArea, fMdss, "qcom usbc mdss", kMdssBase, kMdssSize);
 	if (status != B_OK)
 		return status;
 
 	// the SBU mux on, the normal orientation (gpio-sbu-mux: enable active
 	// low; select set for the reverse one)
-	static const uint32 kPins[] = {kSbuEnablePin, kSbuSelectPin};
+	const uint32 kPins[] = {fConnector.sbuEnablePin, fConnector.sbuSelectPin};
 	for (uint32 pin : kPins) {
 		volatile uint8* tlmm;
 		area_id area;
-		if (_Map(area, tlmm, "qcom dp1 sbu", kTlmmBase + pin * 0x1000,
+		if (_Map(area, tlmm, "qcom usbc sbu", kTlmmBase + pin * 0x1000,
 				B_PAGE_SIZE) != B_OK)
 			return B_NO_MEMORY;
 		wr(tlmm, 4, 0);				// low
@@ -408,7 +448,7 @@ UsbcDisplayPort::PowerUp()
 		return status;
 	_EnableAux();
 	fPowered = true;
-	INFO("DP-1: PHY at RBR, clocks and AUX on (no link training yet)\n");
+	INFO("%s: PHY at RBR, clocks and AUX on\n", fConnector.name);
 	return B_OK;
 }
 
@@ -424,46 +464,51 @@ UsbcDisplayPort::Start(phys_addr_t address, uint32 bytesPerRow, uint32 width,
 	if ((rd(fMdss, kCtl2 + CTL_INTF_ACTIVE) & (1u << 6)) == 0
 		|| (rd(fMdss, kCtl2 + CTL_FETCH_PIPE_ACTIVE) & (1u << 18)) == 0
 		|| (rd(fMdss, kIntf6 + INTF_TIMING_ENGINE_EN) & 1) == 0) {
-		ERROR("DP-1: the firmware's path is not VIG2 -> CTL_2 -> INTF_6\n");
+		ERROR("%s: the firmware's path is not VIG2 -> CTL_2 -> INTF_6\n",
+			fConnector.name);
 		return B_NOT_SUPPORTED;
 	}
-	if ((rd(fMdss, kCtl0 + CTL_FETCH_PIPE_ACTIVE) & ~(1u << 16)) != 0
-		|| (rd(fMdss, kCtl0 + CTL_INTF_ACTIVE) & ~1u) != 0) {
-		ERROR("DP-1: CTL_0 is in use\n");
+	uint32 interfaceBit = 1u << fConnector.interfaceNumber;
+	if ((rd(fMdss, fControlBase + CTL_FETCH_PIPE_ACTIVE)
+			& ~fConnector.pipeFetch) != 0
+		|| (rd(fMdss, fControlBase + CTL_INTF_ACTIVE) & ~interfaceBit) != 0) {
+		ERROR("%s: its control path is in use\n", fConnector.name);
 		return B_BUSY;
 	}
 
 	for (uint32 offset = 0; offset < 0x200; offset += 4)
-		wr(fMdss, kVig0 + offset, rd(fMdss, kVig2 + offset));
+		wr(fMdss, fConnector.pipe + offset, rd(fMdss, kVig2 + offset));
 	for (uint32 offset = 0xa00; offset < 0xb00; offset += 4)
-		wr(fMdss, kVig0 + offset, rd(fMdss, kVig2 + offset));
+		wr(fMdss, fConnector.pipe + offset, rd(fMdss, kVig2 + offset));
 	for (uint32 offset = 0; offset < 0x100; offset += 4)
-		wr(fMdss, kLm0 + offset, rd(fMdss, kLm2 + offset));
+		wr(fMdss, fMixerBase + offset, rd(fMdss, kLm2 + offset));
 
 	// VIG2's stage in LM_2's layer (bits 8:6, extension bit 4) as VIG0's
 	// (bits 2:0, extension bit 0), and the border out bit (dpu_hw_ctl.c)
 	uint32 layer2 = rd(fMdss, kCtl2 + CTL_LAYER_LM2);
 	uint32 layerExt2 = rd(fMdss, kCtl2 + CTL_LAYER_EXT_LM2);
-	wr(fMdss, kCtl0 + CTL_TOP, rd(fMdss, kCtl2 + CTL_TOP));
-	wr(fMdss, kCtl0 + CTL_LAYER_LM0, (layer2 & (1u << 24)) | ((layer2 >> 6) & 7));
-	wr(fMdss, kCtl0 + CTL_LAYER_EXT_LM0, (layerExt2 >> 4) & 1);
-	wr(fMdss, kCtl0 + CTL_INTF_ACTIVE, 1u << 0);
-	wr(fMdss, kCtl0 + CTL_FETCH_PIPE_ACTIVE, 1u << 16);
+	wr(fMdss, fControlBase + CTL_TOP, rd(fMdss, kCtl2 + CTL_TOP));
+	wr(fMdss, fControlBase + fLayer, (layer2 & (1u << 24))
+		| ((layer2 >> 6) & 7) << fConnector.layerShift);
+	wr(fMdss, fControlBase + fLayerExt,
+		((layerExt2 >> 4) & 1) << fConnector.layerExtShift);
+	wr(fMdss, fControlBase + CTL_INTF_ACTIVE, interfaceBit);
+	wr(fMdss, fControlBase + CTL_FETCH_PIPE_ACTIVE, fConnector.pipeFetch);
 
 	for (uint32 offset : kIntfTiming)
-		wr(fMdss, kIntf0 + offset, rd(fMdss, kIntf6 + offset));
-	wr(fMdss, kIntf0 + INTF_FRAME_LINE_COUNT_EN, 3);
+		wr(fMdss, fConnector.interface + offset, rd(fMdss, kIntf6 + offset));
+	wr(fMdss, fConnector.interface + INTF_FRAME_LINE_COUNT_EN, 3);
 
 	status_t status = SetScanout(address, bytesPerRow, width, height);
 	if (status != B_OK)
 		return status;
-	wr(fMdss, kCtl0 + CTL_INTF_FLUSH, 1u << 0);
-	wr(fMdss, kCtl0 + CTL_FLUSH, kFlushVig0 | kFlushLm0 | kFlushCtl
-		| kFlushIntf);
-	wr(fMdss, kInterruptClear, kUnderrunIntf0);
-	wr(fMdss, kIntf0 + INTF_TIMING_ENGINE_EN, 1);
+	wr(fMdss, fControlBase + CTL_INTF_FLUSH, interfaceBit);
+	wr(fMdss, fControlBase + CTL_FLUSH, fConnector.pipeFlush
+		| fConnector.mixerFlush | kFlushCtl | kFlushIntf);
+	wr(fMdss, kInterruptClear, fConnector.underrun);
+	wr(fMdss, fConnector.interface + INTF_TIMING_ENGINE_EN, 1);
 	fRunning = true;
-	LogState("DP-1 started");
+	LogState("started");
 	_Link(timing, wideBus);
 	return B_OK;
 }
@@ -581,7 +626,8 @@ UsbcDisplayPort::_Train(uint32* _lanes)
 	uint32 interval = caps[14] & 0x7f;
 	bigtime_t crDelay = interval == 0 ? 100 : interval * 4000;
 	bigtime_t eqDelay = interval == 0 ? 400 : interval * 4000;
-	INFO("DP-1: sink DPCD %#x, max rate %#x, %" B_PRIu32 " lanes%s%s\n",
+	INFO("%s: sink DPCD %#x, max rate %#x, %" B_PRIu32 " lanes%s%s\n",
+		fConnector.name,
 		caps[0], caps[1], lanes, enhanced ? ", enhanced framing" : "",
 		tps3 ? ", TPS3" : "");
 	*_lanes = lanes;
@@ -666,8 +712,8 @@ UsbcDisplayPort::_TrainAt(uint32 rate, uint32 lanes, bool enhanced, bool tps3,
 		}
 		if (status == B_OK && !done)
 			status = B_TIMED_OUT;
-		INFO("DP-1: training at %" B_PRIu32 " MHz, %s: %s, swing %" B_PRIu32
-			" pre-emphasis %" B_PRIu32 "\n", rate,
+		INFO("%s: training at %" B_PRIu32 " MHz, %s: %s, swing %" B_PRIu32
+			" pre-emphasis %" B_PRIu32 "\n", fConnector.name, rate,
 			phase == 1 ? "clock recovery" : "equalization", strerror(status),
 			swing, preEmphasis);
 	}
@@ -685,9 +731,9 @@ void
 UsbcDisplayPort::_Link(const display_timing& timing, bool wideBus)
 {
 	if (fPort == NULL) {
-		fPort = new(std::nothrow) DisplayPort(0);
+		fPort = new(std::nothrow) DisplayPort(fConnector.controller);
 		if (fPort == NULL || fPort->Init() != B_OK) {
-			ERROR("DP-1: no AUX channel\n");
+			ERROR("%s: no AUX channel\n", fConnector.name);
 			delete fPort;
 			fPort = NULL;
 			return;
@@ -696,17 +742,19 @@ UsbcDisplayPort::_Link(const display_timing& timing, bool wideBus)
 	uint32 lanes = 4;
 	status_t status = _Train(&lanes);
 	if (status != B_OK) {
-		INFO("DP-1: link not trained (%s)\n", strerror(status));
+		INFO("%s: link not trained (%s)\n", fConnector.name, strerror(status));
 		// what can be known without a sink: the PLL at each rate
 		for (size_t i = 1; i < B_COUNT_OF(kRates); i++) {
-			INFO("DP-1: PLL at %" B_PRIu32 " MHz: %s\n", kRates[i].rate,
+			INFO("%s: PLL at %" B_PRIu32 " MHz: %s\n", fConnector.name,
+				kRates[i].rate,
 				_ConfigureRate(kRates[i].rate) == B_OK ? "locked" : "no lock");
 		}
 		_ConfigureRate(162);
 		_EnableMainlink(4);
 		lanes = 4;
 		for (uint32 pattern = 1; pattern <= 3; pattern++) {
-			INFO("DP-1: training pattern %" B_PRIu32 ": %s\n", pattern,
+			INFO("%s: training pattern %" B_PRIu32 ": %s\n", fConnector.name,
+				pattern,
 				_SendPattern(pattern) == B_OK ? "sent" : "not sent");
 		}
 		wr(fController, DP_STATE_CTRL, 0);
@@ -715,8 +763,9 @@ UsbcDisplayPort::_Link(const display_timing& timing, bool wideBus)
 	status = fPort->SetStream(timing, wideBus);
 	if (status == B_OK)
 		status = fPort->StartStream();
-	INFO("DP-1: stream on %" B_PRIu32 " lanes at %" B_PRIu32 " MHz: %s "
-		"(mainlink ready %#" B_PRIx32 ")\n", lanes, fRate, strerror(status),
+	INFO("%s: stream on %" B_PRIu32 " lanes at %" B_PRIu32 " MHz: %s "
+		"(mainlink ready %#" B_PRIx32 ")\n", fConnector.name, lanes, fRate,
+		strerror(status),
 		rd(fController, DP_MAINLINK_READY));
 }
 
@@ -734,14 +783,14 @@ UsbcDisplayPort::SetScanout(phys_addr_t address, uint32 bytesPerRow,
 		return B_BAD_VALUE;
 	}
 	uint32 sizes = height << 16 | width;
-	wr(fMdss, kVig0 + SSPP_SRC_SIZE, sizes);
-	wr(fMdss, kVig0 + SSPP_SRC_XY, 0);
-	wr(fMdss, kVig0 + SSPP_OUT_SIZE, sizes);
-	wr(fMdss, kVig0 + SSPP_OUT_XY, 0);
-	wr(fMdss, kVig0 + SSPP_SRC0_ADDR, (uint32)address);
-	wr(fMdss, kVig0 + SSPP_SRC_YSTRIDE0, bytesPerRow);
+	wr(fMdss, fConnector.pipe + SSPP_SRC_SIZE, sizes);
+	wr(fMdss, fConnector.pipe + SSPP_SRC_XY, 0);
+	wr(fMdss, fConnector.pipe + SSPP_OUT_SIZE, sizes);
+	wr(fMdss, fConnector.pipe + SSPP_OUT_XY, 0);
+	wr(fMdss, fConnector.pipe + SSPP_SRC0_ADDR, (uint32)address);
+	wr(fMdss, fConnector.pipe + SSPP_SRC_YSTRIDE0, bytesPerRow);
 	if (fRunning)
-		wr(fMdss, kCtl0 + CTL_FLUSH, kFlushVig0);
+		wr(fMdss, fControlBase + CTL_FLUSH, fConnector.pipeFlush);
 	return B_OK;
 }
 
@@ -751,12 +800,13 @@ UsbcDisplayPort::Stop()
 {
 	if (!fRunning || fMdss == NULL)
 		return;
-	wr(fMdss, kIntf0 + INTF_TIMING_ENGINE_EN, 0);
-	wr(fMdss, kCtl0 + CTL_LAYER_LM0, 0);
-	wr(fMdss, kCtl0 + CTL_LAYER_EXT_LM0, 0);
-	wr(fMdss, kCtl0 + CTL_INTF_ACTIVE, 0);
-	wr(fMdss, kCtl0 + CTL_FETCH_PIPE_ACTIVE, 0);
-	wr(fMdss, kCtl0 + CTL_FLUSH, kFlushVig0 | kFlushLm0 | kFlushCtl);
+	wr(fMdss, fConnector.interface + INTF_TIMING_ENGINE_EN, 0);
+	wr(fMdss, fControlBase + fLayer, 0);
+	wr(fMdss, fControlBase + fLayerExt, 0);
+	wr(fMdss, fControlBase + CTL_INTF_ACTIVE, 0);
+	wr(fMdss, fControlBase + CTL_FETCH_PIPE_ACTIVE, 0);
+	wr(fMdss, fControlBase + CTL_FLUSH, fConnector.pipeFlush
+		| fConnector.mixerFlush | kFlushCtl);
 	fRunning = false;
 }
 
@@ -766,18 +816,21 @@ UsbcDisplayPort::LogState(const char* when)
 {
 	if (fMdss == NULL)
 		return;
-	wr(fMdss, kInterruptClear, kUnderrunIntf0);
-	uint32 frames = rd(fMdss, kIntf0 + INTF_FRAME_COUNT);
+	wr(fMdss, kInterruptClear, fConnector.underrun);
+	uint32 frames = rd(fMdss, fConnector.interface + INTF_FRAME_COUNT);
 	snooze(100000);
-	frames = rd(fMdss, kIntf0 + INTF_FRAME_COUNT) - frames;
-	INFO("%s: INTF_0 %s, %" B_PRIu32 " frames in 100 ms, flush %#" B_PRIx32
-		", underrun %s, VIG0 %#" B_PRIx32 " at %#" B_PRIx32 " stride %#"
-		B_PRIx32 "\n", when,
-		(rd(fMdss, kIntf0 + INTF_TIMING_ENGINE_EN) & 1) != 0 ? "on" : "off",
-		frames, rd(fMdss, kCtl0 + CTL_FLUSH),
-		(rd(fMdss, kInterruptStatus) & kUnderrunIntf0) != 0 ? "yes" : "no",
-		rd(fMdss, kVig0 + SSPP_SRC_SIZE), rd(fMdss, kVig0 + SSPP_SRC0_ADDR),
-		rd(fMdss, kVig0 + SSPP_SRC_YSTRIDE0));
+	frames = rd(fMdss, fConnector.interface + INTF_FRAME_COUNT) - frames;
+	INFO("%s %s: timing engine %s, %" B_PRIu32 " frames in 100 ms, flush %#"
+		B_PRIx32
+		", underrun %s, pipe %#" B_PRIx32 " at %#" B_PRIx32 " stride %#"
+		B_PRIx32 "\n", fConnector.name, when,
+		(rd(fMdss, fConnector.interface + INTF_TIMING_ENGINE_EN) & 1) != 0
+			? "on" : "off",
+		frames, rd(fMdss, fControlBase + CTL_FLUSH),
+		(rd(fMdss, kInterruptStatus) & fConnector.underrun) != 0 ? "yes" : "no",
+		rd(fMdss, fConnector.pipe + SSPP_SRC_SIZE),
+		rd(fMdss, fConnector.pipe + SSPP_SRC0_ADDR),
+		rd(fMdss, fConnector.pipe + SSPP_SRC_YSTRIDE0));
 }
 
 
