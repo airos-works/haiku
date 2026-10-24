@@ -361,6 +361,7 @@ SYSTEM_ADD_ONS_DRIVERS_NET = [ FFilterByBuildFeatures
 	}@ # x86,x86_64,riscv64,arm64
 
 	etherpci
+	tc956x@arm64
 	usb_davicom
 	usb_rndis
 	wb840

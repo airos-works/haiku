@@ -1,0 +1,8 @@
+SubDir HAIKU_TOP src add-ons kernel drivers network ether tc956x ;
+
+UsePrivateKernelHeaders ;
+UsePrivateHeaders drivers net ;
+
+KernelAddon tc956x :
+	tc956x.cpp
+;
