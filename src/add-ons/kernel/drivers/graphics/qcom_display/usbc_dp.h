@@ -53,6 +53,9 @@ private:
 									const char* name, phys_addr_t address,
 									size_t size);
 			status_t			_PowerPhy();
+			status_t			_ConfigureRate(uint32 rate);
+			status_t			_SetPhyLevels(uint32 swing,
+									uint32 preEmphasis);
 			status_t			_Clocks();
 			void				_EnableAux();
 			void				_EnableMainlink(uint32 lanes);
@@ -60,6 +63,9 @@ private:
 			status_t			_SetLevels(uint32 swing, uint32 preEmphasis,
 									uint32 lanes);
 			status_t			_Train(uint32* _lanes);
+			status_t			_TrainAt(uint32 rate, uint32 lanes,
+									bool enhanced, bool tps3,
+									bigtime_t crDelay, bigtime_t eqDelay);
 			void				_Link(const display_timing& timing,
 									bool wideBus);
 
@@ -74,6 +80,7 @@ private:
 			DisplayPort*		fPort;			// its AUX and stream
 			area_id				fMdssArea;
 			volatile uint8*		fMdss;
+			uint32				fRate;			// MHz, the PHY's link rate
 			bool				fPowered;
 			bool				fRunning;
 };
