@@ -1442,6 +1442,9 @@ gpu_buffer(gmu_buffer& buffer, const char* name, size_t size, uint32 address)
 }
 
 
+static status_t gpu_hw_start();
+
+
 static status_t
 gpu_hw_init()
 {
@@ -1474,7 +1477,16 @@ gpu_hw_init()
 		CBTCR_T0SZ_39);
 	smmu_attach(1, 0x1, GPU_STREAM_MASK, GPU_CONTEXT_BANK, sGpuSpace,
 		CBTCR_T0SZ_39);
+	return gpu_hw_start();
+}
 
+
+/*!	The GPU's registers, its ring and the CP's start (a6xx_hw_init()), at
+	the bring-up and again after a recovery.
+*/
+static status_t
+gpu_hw_start()
+{
 	// GBIF out of halt, no trusted memory range, 64 bit addressing
 	gpu_write(REG_A6XX_GBIF_HALT, 0);
 	gpu_read(REG_A6XX_GBIF_HALT);
@@ -1584,7 +1596,12 @@ gpu_hw_init()
 		return B_TIMED_OUT;
 	INFO("the CP runs its ring (rptr %" B_PRIu32 ")\n", ring_rptr());
 
-	if (zap_shader_load() == B_OK) {
+	// the zap shader stays with the secure world once it is loaded
+	// (a6xx_zap_shader_init())
+	static bool sZapLoaded;
+	if (!sZapLoaded)
+		sZapLoaded = zap_shader_load() == B_OK;
+	if (sZapLoaded) {
 		ring_emit(pkt7(CP_SET_SECURE_MODE, 1));
 		ring_emit(0);
 		ring_flush();
@@ -1619,14 +1636,15 @@ static ConditionVariable sFenceCondition;
 static uint32 sInterrupt;
 static bool sInterruptInstalled;
 static int32 sFaults;
-// a fault the GPU does not come back from: until there is a recovery, GPU
-// work fails from then on (Turnip then reports the device lost, and new
-// processes' OpenGL falls back to software)
+// a fault the GPU does not come back from by itself: its work fails (Turnip
+// reports the device lost) until gpu_recover() has reset it
 static int32 sGpuLost;
 
 // the first fault's state, dumped by a thread (the interrupt handler cannot
 // map memory)
 static sem_id sFaultSemaphore = -1;
+static sem_id sRecoverySemaphore = -1;
+static int32 sRecoveries;
 static uint64 sFaultIb1;
 static uint32 sFaultIb1Left;
 static uint32 sFaultRptr;
@@ -1751,12 +1769,100 @@ gpu_interrupt(void*)
 		// halt the CP and stop hearing about it; waiters fail
 		gpu_write(REG_A6XX_CP_SQE_CNTL, 3);
 		gpu_write(RBBM_INT_0_MASK, INT_CP_CACHE_FLUSH_TS);
-		dprintf("adreno: the GPU is lost; GPU work fails until a restart\n");
+		dprintf("adreno: the GPU is lost; it is reset\n");
 		sFenceCondition.NotifyAll();
+		if (sRecoverySemaphore >= 0)
+			release_sem_etc(sRecoverySemaphore, 1, B_DO_NOT_RESCHEDULE);
 	}
 	if ((status & INT_CP_CACHE_FLUSH_TS) != 0)
 		sFenceCondition.NotifyAll();
 	return B_INVOKE_SCHEDULER;
+}
+
+
+#define REG_A6XX_RBBM_GBIF_HALT_ACK		0x00017
+#define REG_A6XX_RBBM_SW_RESET_CMD		0x00043
+#define REG_A6XX_GBIF_HALT_ACK			0x03c46
+#define GBIF_CLIENT_HALT				(1u << 0)
+#define GBIF_ARB_HALT					(1u << 1)
+
+
+static bool
+gpu_wait(uint32 reg, uint32 mask)
+{
+	bigtime_t deadline = system_time() + 100000;
+	while ((gpu_read(reg) & mask) != mask) {
+		if (system_time() > deadline)
+			return false;
+		spin(10);
+	}
+	return true;
+}
+
+
+/*!	A lost GPU back to work: its bus traffic halted, a software reset, then
+	its start again, with the CP halted meanwhile (a6xx_recover() does the
+	same with a power collapse of the GPU's domain). Fences of the work it
+	lost count as done; the ring starts empty.
+*/
+static status_t
+gpu_recover()
+{
+	MutexLocker locker(sRingLock);
+	gpu_write(REG_A6XX_CP_SQE_CNTL, 3);
+
+	// a6xx_bus_clear_pending_transactions()
+	gpu_write(REG_A6XX_RBBM_GBIF_HALT, 1);
+	bool halted = gpu_wait(REG_A6XX_RBBM_GBIF_HALT_ACK, 1);
+	gpu_write(REG_A6XX_GBIF_HALT, GBIF_CLIENT_HALT);
+	halted &= gpu_wait(REG_A6XX_GBIF_HALT_ACK, GBIF_CLIENT_HALT);
+	gpu_write(REG_A6XX_GBIF_HALT, GBIF_ARB_HALT);
+	halted &= gpu_wait(REG_A6XX_GBIF_HALT_ACK, GBIF_ARB_HALT);
+	gpu_write(REG_A6XX_GBIF_HALT, 0);
+	if (!halted)
+		dprintf("adreno: the GPU's bus did not halt\n");
+
+	// a6xx_gpu_sw_reset()
+	gpu_write(REG_A6XX_RBBM_SW_RESET_CMD, 1);
+	gpu_read(REG_A6XX_RBBM_SW_RESET_CMD);
+	spin(100);
+	gpu_write(REG_A6XX_RBBM_SW_RESET_CMD, 0);
+	gpu_read(REG_A6XX_RBBM_SW_RESET_CMD);
+	spin(1);
+
+	memset(sRing.virt, 0, RING_SIZE);
+	uint32* memptrs = (uint32*)sMemptrs.virt;
+	memptrs[MEMPTR_RPTR / 4] = 0;
+	memptrs[MEMPTR_FENCE / 4] = sNextFence - 1;
+	memory_full_barrier();
+
+	gpu_write(RBBM_INT_CLEAR_CMD, 0xffffffff);
+	status_t status = gpu_hw_start();
+	if (status != B_OK) {
+		dprintf("adreno: the GPU did not start again: %s\n", strerror(status));
+		return status;
+	}
+	gpu_write(RBBM_INT_CLEAR_CMD, 0xffffffff);
+	atomic_set(&sFaults, 0);
+	atomic_set(&sGpuLost, 0);
+	int32 recoveries = atomic_add(&sRecoveries, 1) + 1;
+	dprintf("adreno: the GPU runs again (recovery %" B_PRId32 ")\n",
+		recoveries);
+	sFenceCondition.NotifyAll();
+	return B_OK;
+}
+
+
+static status_t
+recoverer(void*)
+{
+	while (acquire_sem(sRecoverySemaphore) == B_OK) {
+		// what the fault dumper reads is read first
+		snooze(100000);
+		if (atomic_get(&sGpuLost) != 0)
+			gpu_recover();
+	}
+	return B_OK;
 }
 
 
@@ -1863,6 +1969,13 @@ bring_up()
 		return status;
 
 	gpu_write(RBBM_INT_CLEAR_CMD, 0xffffffff);
+	sRecoverySemaphore = create_sem(0, "adreno recovery");
+	if (sRecoverySemaphore >= 0) {
+		thread_id recovery = spawn_kernel_thread(recoverer, "adreno recovery",
+			B_NORMAL_PRIORITY, NULL);
+		if (recovery >= 0)
+			resume_thread(recovery);
+	}
 	sFaultSemaphore = create_sem(0, "adreno fault");
 	if (sFaultSemaphore >= 0) {
 		thread_id dumper = spawn_kernel_thread(fault_dumper, "adreno fault",
