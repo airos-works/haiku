@@ -22,9 +22,10 @@ table set and a device tree; the kernel prefers the device tree.
 
 ## Known problems
 
-- A GPU fault cannot be recovered from yet: the GPU is then marked lost,
-  its users get errors (Vulkan: device lost) and new processes fall back to
-  software OpenGL until a restart.
+- A GPU fault or hang loses the work in flight (its users get errors,
+  Vulkan reports the device lost); the driver then resets the GPU (bus
+  halt, software reset, its start again) and new work runs, without a
+  restart.
 - Each process gets an 8 GiB window of the one GPU address space (no
   per-process GPU page tables yet).
 - NVMe: now and then, at boot, the controller completes a command the host
