@@ -303,6 +303,7 @@ SdhciBus::ExecuteCommand(uint8_t command, uint32_t argument, uint32_t* response)
 			break;
 		case ALL_SEND_CID:
 		case SEND_CSD:
+		case SEND_CID:
 			replyType = Command::kR2Type;
 			break;
 		case MMC_SEND_OP_COND:

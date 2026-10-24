@@ -193,8 +193,18 @@ virtual_timing()
 
 
 static bool usbc_forced(uint32 connector);
+
+
+//!	Pin assignments D and F (4 and 6 as reported) leave two lanes to USB 3.
+static uint32
+usbc_port_lanes(const qcom_usbc_port& port)
+{
+	return port.pin_assignment == 4 || port.pin_assignment == 6 ? 2 : 4;
+}
 static status_t connect_usbc(display_info* info, uint32 connector,
 	const qcom_usbc_port* port = NULL);
+static status_t power_usbc(display_info* info, uint32 connector,
+	const qcom_usbc_port* port);
 
 
 static void
@@ -309,26 +319,34 @@ static status_t
 connect_usbc(display_info* info, uint32 connector,
 	const qcom_usbc_port* port)
 {
-	if (info->usbc[connector] == NULL) {
-		qcom::UsbcDisplayPort* usbc
-			= new(std::nothrow) qcom::UsbcDisplayPort(connector);
-		if (usbc == NULL)
-			return B_NO_MEMORY;
-		// pin assignments D and F (4 and 6 as reported) leave two lanes to
-		// USB 3
-		if (port != NULL) {
-			usbc->SetPortMode(port->orientation == 1,
-				port->pin_assignment == 4 || port->pin_assignment == 6
-					? 2 : 4);
-		}
-		status_t status = usbc->PowerUp();
-		if (status != B_OK) {
-			delete usbc;
-			return status;
-		}
-		info->usbc[connector] = usbc;
-	}
+	status_t status = power_usbc(info, connector, port);
+	if (status != B_OK)
+		return status;
 	info->shared->outputs[1 + connector].flags |= QCOM_DISPLAY_OUTPUT_CONNECTED;
+	return B_OK;
+}
+
+
+/*!	A USB-C connector's PHY, clocks and AUX up, the output not connected
+	yet: a USB-C to DisplayPort cable raises HPD only once its AUX side has
+	power. */
+static status_t
+power_usbc(display_info* info, uint32 connector, const qcom_usbc_port* port)
+{
+	if (info->usbc[connector] != NULL)
+		return B_OK;
+	qcom::UsbcDisplayPort* usbc
+		= new(std::nothrow) qcom::UsbcDisplayPort(connector);
+	if (usbc == NULL)
+		return B_NO_MEMORY;
+	if (port != NULL)
+		usbc->SetPortMode(port->orientation == 1, usbc_port_lanes(*port));
+	status_t status = usbc->PowerUp();
+	if (status != B_OK) {
+		delete usbc;
+		return status;
+	}
+	info->usbc[connector] = usbc;
 	return B_OK;
 }
 
@@ -340,6 +358,9 @@ disconnect_usbc(display_info* info, uint32 connector)
 		info->usbc[connector]->Stop();
 	info->usbcRunning[connector] = false;
 	info->shared->outputs[1 + connector].flags = 0;
+	// a new sink gets the PHY and link set up from the start
+	delete info->usbc[connector];
+	info->usbc[connector] = NULL;
 }
 
 
@@ -374,6 +395,29 @@ hot_plug_thread(void* data)
 			MutexLocker locker(info->lock);
 			bool connected = (info->shared->outputs[1 + connector].flags
 				& QCOM_DISPLAY_OUTPUT_CONNECTED) != 0;
+			if (info->usbcForced[connector] && port.display_port
+				&& info->usbc[connector] != NULL
+				&& !info->usbc[connector]->MatchesPort(port.orientation == 1,
+					usbc_port_lanes(port))) {
+				// lab: a forced output, set up before the port's first report:
+				// again with its orientation and lanes, whatever HPD says
+				disconnect_usbc(info, connector);
+				status_t status = connect_usbc(info, connector, &port);
+				INFO("DP-%" B_PRIu32 ": forced, now as USB-C port %" B_PRIu32
+					" reports (pin assignment %u, orientation %u, hpd %u): %s\n",
+					connector + 1, connector, port.pin_assignment,
+					port.orientation, port.hpd, strerror(status));
+				notify_change(info);
+				continue;
+			}
+			if (port.display_port && !port.hpd && !connected
+				&& info->usbc[connector] == NULL) {
+				status_t status = power_usbc(info, connector, &port);
+				INFO("DP-%" B_PRIu32 ": USB-C port %" B_PRIu32 " in DisplayPort "
+					"mode, no HPD yet: PHY and AUX %s\n", connector + 1,
+					connector, status == B_OK ? "on" : strerror(status));
+				continue;
+			}
 			if (sink && !connected) {
 				status_t status = connect_usbc(info, connector, &port);
 				INFO("DP-%" B_PRIu32 ": a DisplayPort sink on USB-C port %"
@@ -383,9 +427,17 @@ hot_plug_thread(void* data)
 					status == B_OK ? "connected" : strerror(status));
 				if (status == B_OK)
 					notify_change(info);
-			} else if (sink && connected && port.hpd_irq
-				&& info->usbc[connector] != NULL) {
+			} else if (sink && connected && info->usbc[connector] != NULL
+				&& (port.hpd_irq || !info->usbc[connector]->Trained())) {
+				// the sink asks (IRQ_HPD), or its HPD came up after the link
+				// went untrained (a forced output; a USB-C to DisplayPort
+				// cable raises it once its AUX side has power)
 				info->usbc[connector]->Attention();
+			} else if (!port.display_port && !connected
+				&& info->usbc[connector] != NULL
+				&& !info->usbcForced[connector]) {
+				delete info->usbc[connector];
+				info->usbc[connector] = NULL;
 			} else if (!sink && connected && !info->usbcForced[connector]) {
 				disconnect_usbc(info, connector);
 				INFO("DP-%" B_PRIu32 ": the sink on USB-C port %" B_PRIu32

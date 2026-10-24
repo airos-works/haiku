@@ -44,6 +44,9 @@ public:
 			//! (the port report: pin assignments C and E four, D two),
 			//! before PowerUp().
 			void				SetPortMode(bool reverse, uint32 lanes);
+			bool				MatchesPort(bool reverse, uint32 lanes) const
+									{ return fReverse == reverse
+										&& fPhyLanes == lanes; }
 			status_t			PowerUp();
 			status_t			Start(phys_addr_t address, uint32 bytesPerRow,
 									uint32 width, uint32 height,
@@ -58,6 +61,7 @@ public:
 			//! The sink's IRQ_HPD: its link status read, its IRQ vector
 			//! cleared, the link trained again if it lost it.
 			void				Attention();
+			bool				Trained() const { return fTrained; }
 
 private:
 			status_t			_Map(area_id& area, volatile uint8*& base,
@@ -69,6 +73,8 @@ private:
 									uint32 preEmphasis);
 			status_t			_Clocks();
 			void				_SetPixelClock();
+			void				_DumpAgainstHdmi();
+			void				_TestPattern(const display_timing& timing);
 			void				_EnableAux();
 			void				_EnableMainlink(uint32 lanes);
 			status_t			_SendPattern(uint32 pattern);
@@ -103,6 +109,8 @@ private:
 			bool				fReverse;		// the plug's orientation
 			uint32				fPhyLanes;		// DisplayPort's lanes: 2 or 4
 			uint32				fLanes;			// the trained link's
+			bool				fTrained;
+			uint32				fRetrainings;	// since the last trained link
 			bool				fPowered;
 			bool				fRunning;
 };

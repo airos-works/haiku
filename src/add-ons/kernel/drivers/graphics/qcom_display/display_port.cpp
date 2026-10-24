@@ -386,6 +386,9 @@ DisplayPort::SetStream(const display_timing& timing, bool wideBus)
 	// (msm_dp_panel_timing_cfg(); the firmware sets both on its output)
 	uint32 misc = _Read(REG_DP_MISC1_MISC0) & ~(7u << 5);
 	_Write(REG_DP_MISC1_MISC0, misc | 1u << 5 | 1);
+	// no DSC: its DTO off (msm_dp_panel_clear_dsc_dto(); after a reset
+	// the USB-C controllers have it at 2)
+	_Write(kPixelInterface + 0x7c, 0);
 	uint32 intfConfig = _Read(kPixelInterface + 0x14);
 	_Write(kPixelInterface + 0x14,
 		wideBus ? intfConfig | 1u << 4 : intfConfig & ~(1u << 4));
