@@ -1,6 +1,7 @@
 SubDir HAIKU_TOP src add-ons kernel drivers video qcom_iris ;
 
 UsePrivateKernelHeaders ;
+UsePrivateHeaders drivers ;
 UseLibraryHeaders [ FDirName libfdt ] ;
 UseHeaders [ FDirName $(HAIKU_TOP) src add-ons kernel drivers common qcom ] ;
 

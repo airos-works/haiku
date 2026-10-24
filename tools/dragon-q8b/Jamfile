@@ -8,7 +8,11 @@ Application adreno_test :
 	adreno_test.cpp
 ;
 
-UsePrivateHeaders interface ;
+UsePrivateHeaders interface drivers ;
+
+Application iris_test :
+	iris_test.cpp
+;
 
 Application display_layout :
 	display_layout.cpp

@@ -30,6 +30,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <qcom_iris.h>
+#include <team.h>
+
 #include "qcom_scm.h"
 
 
@@ -262,6 +265,9 @@ static phys_addr_t sQueuesPhysical;
 static size_t sQueuesSize;
 static hfi_queue_table_header* sQueueTable;
 
+static char sFirmwareVersion[128];
+static uint32 sSysInitProperties;
+
 static ConditionVariable sMessageCondition;
 static int32 sInterrupts;
 static bool sInterruptInstalled;
@@ -468,7 +474,10 @@ public:
 
 	phys_addr_t Root() const { return fLevel1Physical; }
 
-	status_t Map(uint64 address, phys_addr_t physical, size_t size)
+	/*!	\a cached: write-back (the codec is coherent), else non-cacheable
+		(MAIR below: index 0 and 1). */
+	status_t Map(uint64 address, phys_addr_t physical, size_t size,
+		bool cached)
 	{
 		for (size_t offset = 0; offset < size; offset += B_PAGE_SIZE) {
 			uint64 va = address + offset;
@@ -477,14 +486,26 @@ public:
 				? NextTable(level2, (va >> 21) & 511) : NULL;
 			if (level3 == NULL)
 				return B_NO_MEMORY;
-			// attribute index 1: non-cacheable (MAIR below)
 			level3[(va >> 12) & 511] = ((physical + offset)
 					& 0x0000fffffffff000ull)
-				| 1ull << 0 | 1ull << 1 | 1ull << 2 | 1ull << 6 | 3ull << 8
-				| 1ull << 10;
+				| 1ull << 0 | 1ull << 1 | (cached ? 0 : 1ull << 2) | 1ull << 6
+				| 3ull << 8 | 1ull << 10;
 		}
 		memory_full_barrier();
 		return B_OK;
+	}
+
+	void Unmap(uint64 address, size_t size)
+	{
+		for (size_t offset = 0; offset < size; offset += B_PAGE_SIZE) {
+			uint64 va = address + offset;
+			uint64* level2 = FindTable(fLevel1, (va >> 30) & 511);
+			uint64* level3 = level2 != NULL
+				? FindTable(level2, (va >> 21) & 511) : NULL;
+			if (level3 != NULL)
+				level3[(va >> 12) & 511] = 0;
+		}
+		memory_full_barrier();
 	}
 
 private:
@@ -503,6 +524,18 @@ private:
 		get_memory_map(table, B_PAGE_SIZE, &entry, 1);
 		physical = entry.address;
 		return (uint64*)table;
+	}
+
+	uint64* FindTable(uint64* table, uint32 index)
+	{
+		if ((table[index] & 1) == 0)
+			return NULL;
+		phys_addr_t physical = table[index] & 0x0000fffffffff000ull;
+		for (size_t i = 0; i < fTableCount; i++) {
+			if (fTablePhysical[i] == physical)
+				return fTables[i];
+		}
+		return NULL;
 	}
 
 	uint64* NextTable(uint64* table, uint32 index)
@@ -758,7 +791,7 @@ queues_init()
 		return status;
 	memset(sQueues, 0, sQueuesSize);
 
-	status = sSpace.Map(sQueuesPhysical, sQueuesPhysical, sQueuesSize);
+	status = sSpace.Map(sQueuesPhysical, sQueuesPhysical, sQueuesSize, false);
 	if (status != B_OK)
 		return status;
 
@@ -1014,6 +1047,7 @@ hfi_core_init()
 			case HFI_MSG_SYS_INIT:
 				INFO("SYS_INIT done: error %#" B_PRIx32 ", %" B_PRIu32
 					" properties\n", packet[2], packet[3]);
+				sSysInitProperties = packet[3];
 				initDone = true;
 				if (packet[2] != 0)
 					return B_ERROR;
@@ -1028,6 +1062,7 @@ hfi_core_init()
 							text[i] = ' ';
 					}
 					INFO("firmware image: %s\n", text);
+					strlcpy(sFirmwareVersion, text, sizeof(sFirmwareVersion));
 				}
 				versionDone = true;
 				break;
@@ -1123,13 +1158,99 @@ iris_start()
 //	#pragma mark - device
 
 
+/*	The open that owns the codec, and the buffers it allocated. */
+
+struct IrisBuffer {
+	IrisBuffer*	next;
+	area_id		area;
+	phys_addr_t	physical;
+	size_t		size;
+};
+
+static void* sOwner;
+static IrisBuffer* sBuffers;
+
+
+static void
+buffer_free(IrisBuffer* buffer)
+{
+	sSpace.Unmap(buffer->physical, buffer->size);
+	uint32 cb = smmu_context(sContextBank);
+	sSmmu.Write(cb + 0x618, 0);				// TLBIALL
+	sSmmu.Write(cb + 0x7f0, 0);				// TLBSYNC
+	sSmmu.Wait(cb + 0x7f4, 1, 0, 100000);
+	delete_area(buffer->area);
+	free(buffer);
+}
+
+
+static status_t
+buffer_alloc(qcom_iris_buffer* request)
+{
+	if (request->size == 0 || request->size > 256 * 1024 * 1024)
+		return B_BAD_VALUE;
+	size_t size = ROUNDUP(request->size, B_PAGE_SIZE);
+	IrisBuffer* buffer = (IrisBuffer*)calloc(1, sizeof(IrisBuffer));
+	if (buffer == NULL)
+		return B_NO_MEMORY;
+
+	void* address;
+	virtual_address_restrictions virtualRestrictions = {};
+	physical_address_restrictions physicalRestrictions = {};
+	physicalRestrictions.high_address = kDmaLimit;
+	buffer->area = create_area_etc(B_SYSTEM_TEAM, "qcom iris buffer", size,
+		B_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA
+			| B_CLONEABLE_AREA, 0, 0, &virtualRestrictions,
+		&physicalRestrictions, &address);
+	if (buffer->area < 0) {
+		status_t status = buffer->area;
+		free(buffer);
+		return status;
+	}
+	memset(address, 0, size);
+	physical_entry entry;
+	get_memory_map(address, B_PAGE_SIZE, &entry, 1);
+	buffer->physical = entry.address;
+	buffer->size = size;
+	status_t status = sSpace.Map(buffer->physical, buffer->physical, size,
+		true);
+	if (status != B_OK) {
+		delete_area(buffer->area);
+		free(buffer);
+		return status;
+	}
+
+	void* userAddress = NULL;
+	area_id clone = vm_clone_area(team_get_current_team_id(),
+		"qcom iris buffer", &userAddress, B_RANDOMIZED_ANY_ADDRESS,
+		B_READ_AREA | B_WRITE_AREA, REGION_NO_PRIVATE_MAP, buffer->area, true);
+	if (clone < 0) {
+		buffer_free(buffer);
+		return clone;
+	}
+	buffer->next = sBuffers;
+	sBuffers = buffer;
+	request->area = clone;
+	request->address = userAddress;
+	request->device_address = (uint32)buffer->physical;
+	return B_OK;
+}
+
+
 static status_t
 iris_open(const char* name, uint32 flags, void** _cookie)
 {
 	status_t status = iris_start();
 	if (status != B_OK)
 		return status;
-	*_cookie = NULL;
+	MutexLocker locker(sLock);
+	if (sOwner != NULL)
+		return B_BUSY;
+	void* cookie = malloc(1);
+	if (cookie == NULL)
+		return B_NO_MEMORY;
+	sOwner = cookie;
+	*_cookie = cookie;
 	return B_OK;
 }
 
@@ -1144,6 +1265,15 @@ iris_close(void* cookie)
 static status_t
 iris_free(void* cookie)
 {
+	MutexLocker locker(sLock);
+	while (sBuffers != NULL) {
+		IrisBuffer* buffer = sBuffers;
+		sBuffers = buffer->next;
+		buffer_free(buffer);
+	}
+	if (sOwner == cookie)
+		sOwner = NULL;
+	free(cookie);
 	return B_OK;
 }
 
@@ -1167,6 +1297,113 @@ iris_write(void* cookie, off_t position, const void* buffer, size_t* _length)
 static status_t
 iris_control(void* cookie, uint32 op, void* buffer, size_t length)
 {
+	switch (op) {
+		case QCOM_IRIS_GET_INFO:
+		{
+			qcom_iris_info info = {};
+			info.version = QCOM_IRIS_VERSION;
+			info.sys_init_properties = sSysInitProperties;
+			strlcpy(info.firmware, sFirmwareVersion, sizeof(info.firmware));
+			return user_memcpy(buffer, &info, min_c(length, sizeof(info)));
+		}
+
+		case QCOM_IRIS_SEND:
+		{
+			qcom_iris_packet request;
+			if (length != sizeof(request)
+				|| user_memcpy(&request, buffer, sizeof(request)) != B_OK) {
+				return B_BAD_VALUE;
+			}
+			if (request.size < 8 || request.size > IFACEQ_CORE_PKT_SIZE
+				|| (request.size & 3) != 0) {
+				return B_BAD_VALUE;
+			}
+			uint32 packet[IFACEQ_CORE_PKT_SIZE / 4];
+			if (user_memcpy(packet, request.data, request.size) != B_OK)
+				return B_BAD_ADDRESS;
+			if (packet[0] != request.size)
+				return B_BAD_VALUE;
+			MutexLocker locker(sLock);
+			status_t status = queue_write(IFACEQ_CMDQ_ID, packet, request.size);
+			if (status == B_OK)
+				raise_interrupt();
+			return status;
+		}
+
+		case QCOM_IRIS_RECEIVE:
+		{
+			qcom_iris_receive request;
+			if (length != sizeof(request)
+				|| user_memcpy(&request, buffer, sizeof(request)) != B_OK) {
+				return B_BAD_VALUE;
+			}
+			static uint32 packet[IFACEQ_CORE_PKT_SIZE / 4];
+			bigtime_t deadline = system_time() + request.timeout;
+			MutexLocker locker(sLock);
+			while (true) {
+				uint32 size = 0;
+				status_t status = queue_read(IFACEQ_MSGQ_ID, packet,
+					sizeof(packet), &size);
+				if (status == B_OK) {
+					request.received = min_c(size, request.size);
+					if (user_memcpy(request.buffer, packet, request.received)
+							!= B_OK
+						|| user_memcpy(buffer, &request, sizeof(request))
+							!= B_OK) {
+						return B_BAD_ADDRESS;
+					}
+					return size > request.size ? B_BUFFER_OVERFLOW : B_OK;
+				}
+				if (status != B_WOULD_BLOCK)
+					return status;
+				if (request.timeout <= 0 || system_time() >= deadline)
+					return B_TIMED_OUT;
+				ConditionVariableEntry entry;
+				sMessageCondition.Add(&entry);
+				locker.Unlock();
+				status = entry.Wait(B_ABSOLUTE_TIMEOUT | B_CAN_INTERRUPT,
+					deadline);
+				locker.Lock();
+				if (status == B_INTERRUPTED)
+					return B_INTERRUPTED;
+			}
+		}
+
+		case QCOM_IRIS_ALLOC:
+		{
+			qcom_iris_buffer request;
+			if (length != sizeof(request)
+				|| user_memcpy(&request, buffer, sizeof(request)) != B_OK) {
+				return B_BAD_VALUE;
+			}
+			MutexLocker locker(sLock);
+			status_t status = buffer_alloc(&request);
+			if (status != B_OK)
+				return status;
+			return user_memcpy(buffer, &request, sizeof(request));
+		}
+
+		case QCOM_IRIS_FREE:
+		{
+			uint32 deviceAddress;
+			if (length != sizeof(deviceAddress)
+				|| user_memcpy(&deviceAddress, buffer, sizeof(deviceAddress))
+					!= B_OK) {
+				return B_BAD_VALUE;
+			}
+			MutexLocker locker(sLock);
+			for (IrisBuffer** link = &sBuffers; *link != NULL;
+					link = &(*link)->next) {
+				if ((uint32)(*link)->physical != deviceAddress)
+					continue;
+				IrisBuffer* found = *link;
+				*link = found->next;
+				buffer_free(found);
+				return B_OK;
+			}
+			return B_ENTRY_NOT_FOUND;
+		}
+	}
 	return B_DEV_INVALID_IOCTL;
 }
 
