@@ -1353,6 +1353,95 @@ dp_stream_test(const usbc_dp& port)
 }
 
 
+/*!	A second DPU path for DP0, made from the one the firmware lit for the
+	HDMI output (VIG2 -> LM_2 -> CTL_2 -> INTF_6): VIG0 fetching the same
+	frame buffer with VIG2's settings, LM_0 with LM_2's, CTL_0 putting VIG0
+	in LM_0's blend stage and driving INTF_0 (dpu_hw_ctl.c's encodings),
+	INTF_0 with INTF_6's timing on DP0's pixel clock. With no monitor the
+	DisplayPort controller sends nothing, but the path fetches and scans
+	out: the flush has to complete, the frames count, and INTF_0 must not
+	underrun. Then it is all taken down again. */
+static void
+dp0_pipeline_test()
+{
+	area_id area;
+	volatile uint8* mdss = map_rw({"probe mdss", 0xae00000, 0x90000}, area);
+	if (mdss == NULL)
+		return;
+	const uint32 mdp = 0x1000;
+	volatile uint8* vig0 = mdss + mdp + 0x4000;
+	volatile uint8* vig2 = mdss + mdp + 0x8000;
+	volatile uint8* lm0 = mdss + mdp + 0x44000;
+	volatile uint8* lm2 = mdss + mdp + 0x46000;
+	volatile uint8* ctl0 = mdss + mdp + 0x15000;
+	volatile uint8* ctl2 = mdss + mdp + 0x17000;
+	volatile uint8* intf0 = mdss + mdp + 0x34000;
+	volatile uint8* intf6 = mdss + mdp + 0x3a000;
+	const uint32 interruptStatus = mdp + 0x14, interruptClear = mdp + 0x18;
+	const uint32 underrun0 = 1u << 24, underrun6 = 1u << 16;
+
+	if ((rd(ctl2, 0xf4) & (1u << 6)) == 0 || (rd(ctl2, 0xfc) & (1u << 18)) == 0
+		|| (rd(intf6, 0) & 1) == 0) {
+		dprintf("qcom_probe: dp0 pipeline: the firmware's path is not VIG2 -> "
+			"CTL_2 -> INTF_6 (intf active %#" B_PRIx32 " fetch %#" B_PRIx32
+			")\n", rd(ctl2, 0xf4), rd(ctl2, 0xfc));
+		delete_area(area);
+		return;
+	}
+	for (uint32 offset = 0; offset < 0x200; offset += 4)
+		wr32(vig0, offset, rd(vig2, offset));
+	for (uint32 offset = 0xa00; offset < 0xb00; offset += 4)
+		wr32(vig0, offset, rd(vig2, offset));
+	for (uint32 offset = 0; offset < 0x100; offset += 4)
+		wr32(lm0, offset, rd(lm2, offset));
+
+	// VIG2's stage in LM_2's layer (bits 8:6, extension bit 4) as VIG0's
+	// (bits 2:0, extension bit 0), and the border out bit
+	uint32 layer2 = rd(ctl2, 0x08), layerExt2 = rd(ctl2, 0x40 + 0x08);
+	uint32 layer0 = (layer2 & (1u << 24)) | ((layer2 >> 6) & 7);
+	uint32 layerExt0 = (layerExt2 >> 4) & 1;
+	wr32(ctl0, 0x14, rd(ctl2, 0x14));		// CTL_TOP: the mode
+	wr32(ctl0, 0x00, layer0);
+	wr32(ctl0, 0x40, layerExt0);
+	wr32(ctl0, 0xf4, 1u << 0);				// INTF_0 active
+	wr32(ctl0, 0xfc, 1u << 16);				// VIG0 fetches
+
+	static const uint32 kTiming[] = {0x004, 0x008, 0x00c, 0x014, 0x01c, 0x024,
+		0x02c, 0x034, 0x03c, 0x040, 0x04c, 0x050, 0x060, 0x064, 0x068};
+	for (uint32 offset : kTiming)
+		wr32(intf0, offset, rd(intf6, offset));
+	wr32(intf0, 0x0a8, 3);
+
+	wr32(ctl0, 0x110, 1u << 0);				// CTL_INTF_FLUSH: INTF_0
+	wr32(ctl0, 0x018, 1u << 0 | 1u << 6 | 1u << 17 | 1u << 31);
+	wr32(mdss, interruptClear, underrun0 | underrun6);
+	wr32(intf0, 0x000, 1);
+	uint32 first = rd(intf0, 0x0ac);
+	snooze(500000);
+	uint32 frames = rd(intf0, 0x0ac) - first;
+	uint32 flush = rd(ctl0, 0x018);
+	uint32 status = rd(mdss, interruptStatus);
+	dprintf("qcom_probe: dp0 pipeline: layer %#" B_PRIx32 "/%#" B_PRIx32 " (from "
+		"%#" B_PRIx32 "/%#" B_PRIx32 "), %" B_PRIu32 " frames in 0.5 s, flush "
+		"%#" B_PRIx32 "%s, INTF_0 underrun %s (INTF_6 %s), VIG0 %#" B_PRIx32
+		" -> %#" B_PRIx32 " at %#" B_PRIx32 ", LM_0 %#" B_PRIx32 "\n", layer0,
+		layerExt0, layer2, layerExt2, frames, flush,
+		flush == 0 ? " (done)" : " (pending)",
+		(status & underrun0) != 0 ? "yes" : "no",
+		(status & underrun6) != 0 ? "yes" : "no", rd(vig0, 0x00),
+		rd(vig0, 0x0c), rd(vig0, 0x14), rd(lm0, 0x04));
+
+	// taken down again
+	wr32(intf0, 0x000, 0);
+	wr32(ctl0, 0x00, 0);
+	wr32(ctl0, 0x40, 0);
+	wr32(ctl0, 0xf4, 0);
+	wr32(ctl0, 0xfc, 0);
+	wr32(ctl0, 0x018, 1u << 0 | 1u << 6 | 1u << 17);
+	delete_area(area);
+}
+
+
 static void
 dp_phy_test(const usbc_dp& port)
 {
@@ -1503,6 +1592,8 @@ dp_phy_test(const usbc_dp& port)
 	if (ready) {
 		dp_aux_test(port);
 		dp_stream_test(port);
+		if (port.intf == 0x34000)
+			dp0_pipeline_test();
 	}
 	dprintf("qcom_probe: dp phy %#" B_PRIxPHYSADDR ": PLL %s, PHY %s (c_ready %#"
 		B_PRIx32
