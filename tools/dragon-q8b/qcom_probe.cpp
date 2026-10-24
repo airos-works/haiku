@@ -489,7 +489,9 @@ probe()
 		}
 	}
 
-	// the SD slot's card detect (TLMM GPIO 131, low with a card in) and its
+	// the SD slot's card detect (TLMM GPIO 131: the schematic's switch is
+	// closed to ground without a card and open with one, whatever the
+	// device tree's GPIO_ACTIVE_LOW says) and its
 	// pin configuration, and the SD pins' (sdc2 clk/cmd/data in their own
 	// register)
 	{
@@ -506,14 +508,14 @@ probe()
 			spin(1000);
 			io = rd(tlmm, 4);
 			dprintf("qcom_probe: sd card detect, no bias: in/out %#" B_PRIx32
-				": %s\n", io, (io & 1) == 0 ? "card in" : "no card");
+				": %s\n", io, (io & 1) == 0 ? "no card" : "card in");
 			// and with the pin's own pull-up, in case the board's is to a
 			// supply that is off
 			*(volatile uint32*)tlmm = 3;
 			spin(1000);
 			io = rd(tlmm, 4);
 			dprintf("qcom_probe: sd card detect, pull-up: in/out %#" B_PRIx32
-				": %s\n", io, (io & 1) == 0 ? "card in" : "no card");
+				": %s\n", io, (io & 1) == 0 ? "no card" : "card in");
 			*(volatile uint32*)tlmm = 0;
 			sd_identify();
 			delete_area(area);
@@ -713,11 +715,13 @@ sd_power_ack(volatile uint8* sd, const char* what)
 			continue;
 		}
 		wr32(sd, 0x248, status);
+		// as sdhci_msm_handle_pwr_irq(): a bus on or off is an I/O level
+		// change as well, both acknowledged
 		uint32 ack = 0;
 		if ((status & 0x3) != 0)
-			ack |= 1u << 0;		// bus on/off done
+			ack |= 1u << 0 | 1u << 2;	// bus, I/O done
 		if ((status & 0xc) != 0)
-			ack |= 1u << 2;		// I/O high/low done
+			ack |= 1u << 2;				// I/O high/low done
 		wr32(sd, 0x24c, ack);
 		dprintf("qcom_probe: sd %s: power event %#" B_PRIx32 ", ack %#" B_PRIx32
 			"\n", what, status, ack);
@@ -795,6 +799,49 @@ sd_identify()
 		}
 	}
 
+	// the SD pins as sdc2-default-state has them (pinctrl-sc8280xp.c: one
+	// register at TLMM + 0xe8000; clk pull 15:14 drive 8:6, cmd pull 12:11
+	// drive 5:3, data pull 10:9 drive 2:0; pull 3 = up, drive 7 = 16 mA)
+	{
+		area_id tlmmArea;
+		volatile uint8* tlmm = map_rw({"probe tlmm sdc2", 0xf100000 + 0xe8000,
+			0x1000}, tlmmArea);
+		if (tlmm != NULL) {
+			uint32 before = rd(tlmm, 0);
+			uint32 value = before & ~(3u << 14 | 7u << 6 | 3u << 11 | 7u << 3
+				| 3u << 9 | 7u << 0);
+			value |= 0u << 14 | 7u << 6 | 3u << 11 | 7u << 3 | 3u << 9
+				| 7u << 0;
+			wr32(tlmm, 0, value);
+			dprintf("qcom_probe: sdc2 pins %#" B_PRIx32 " -> %#" B_PRIx32 "\n",
+				before, rd(tlmm, 0));
+			delete_area(tlmmArea);
+		}
+	}
+
+	// sdhci_msm_probe(): the block reset through GCC (GCC_SDCC2_BCR), the
+	// vendor register's power on value with the pad voltage switch on and
+	// at 3 V, 3.0 V and 8 bits in the capabilities, the power interrupts
+	// unmasked
+	{
+		area_id gccArea;
+		volatile uint8* gcc = map_rw({"probe gcc bcr", 0x100000, 0x1f4200},
+			gccArea);
+		if (gcc != NULL) {
+			wr32(gcc, 0x14000, rd(gcc, 0x14000) | 1);
+			spin(200);
+			wr32(gcc, 0x14000, rd(gcc, 0x14000) & ~1u);
+			spin(200);
+			delete_area(gccArea);
+		}
+	}
+	dprintf("qcom_probe: sd mci version %#" B_PRIx32 ", vendor spec %#" B_PRIx32
+		"\n", rd(sd, 0x50), rd(sd, 0x20c));
+	wr32(sd, 0x20c, 0xa9c);
+	wr32(sd, 0x21c, rd(sd, 0x40) | 1u << 25 | 1u << 18);
+	wr32(sd, 0x20c, (rd(sd, 0x20c) | 1u << 15) & ~(1u << 16));
+	wr32(sd, 0x244, 0xf);
+
 	// the card's supply (vmmc, L9C) and its pins' (vqmmc, L6C), 2.96 V
 	ldo_on("ldoc9", 2960);
 	ldo_on("ldoc6", 2960);
@@ -808,8 +855,12 @@ sd_identify()
 	wr32(sd, 0x34, 0xffffffff);	// status bits latch
 	wr32(sd, 0x38, 0);			// no interrupt signals
 
-	wr8(sd, 0x29, 0x0e);		// 3.3 V
-	wr8(sd, 0x29, 0x0f);		// bus power on
+	// 3.0 V: the capabilities (sdhci-msm's CORE_VENDOR_SPEC_CAPABILITIES0)
+	// offer 3.0 and 1.8 V, not 3.3; the pads at 3 V (CORE_VENDOR_SPEC at
+	// 0x20c: CORE_IO_PAD_PWR_SWITCH, bit 16, clear)
+	wr32(sd, 0x20c, rd(sd, 0x20c) & ~(1u << 16));
+	wr8(sd, 0x29, 0x0c);
+	wr8(sd, 0x29, 0x0d);		// bus power on
 	sd_power_ack(sd, "bus power");
 	spin(10000);
 
@@ -1066,6 +1117,232 @@ adsp_state()
 }
 
 
+// #pragma mark - USB-C DisplayPort PHY (a PLL lock test)
+
+
+/*	The QMP USB43DP combo PHY of USB-C port 0 (0x88eb000) in DisplayPort
+	mode, as Linux' phy-qcom-qmp-combo.c does it for the SC8280XP
+	(sc8280xp_usb43dpphy_cfg, qmp_combo_offsets_v5): its GDSC, clocks,
+	supplies and resets, the common block in USB3+DP mode, the AUX block,
+	the DP PLL at RBR (1.62 Gbit/s) for four lanes in the normal
+	orientation. Without a sink this can only show the PLL locking and the
+	PHY saying it is ready. */
+
+struct qmp_setting {
+	uint16	offset;
+	uint8	value;
+};
+
+static const qmp_setting kDpSerdes[] = {
+	{0x184, 0x05}, {0x094, 0x3b}, {0x04c, 0x02}, {0x048, 0x0c},
+	{0x050, 0x06}, {0x154, 0x30}, {0x058, 0x0f}, {0x084, 0x36},
+	{0x088, 0x36}, {0x07c, 0x16}, {0x080, 0x16}, {0x074, 0x06},
+	{0x078, 0x06}, {0x17c, 0x02}, {0x0ec, 0x3f}, {0x0f0, 0x00},
+	{0x10c, 0x02}, {0x0cc, 0x00}, {0x00c, 0x0a}, {0x168, 0x0a},
+	{0x108, 0x00}, {0x044, 0x17}, {0x174, 0x1f},
+};
+
+static const qmp_setting kDpSerdesRbr[] = {
+	{0x158, 0x05}, {0x0bc, 0x69}, {0x0d0, 0x80}, {0x0d4, 0x07},
+	{0x0ac, 0x6f}, {0x0b0, 0x08}, {0x0a4, 0x04},
+};
+
+static const qmp_setting kDpTx[] = {
+	{0x80, 0x51}, {0x48, 0x1a}, {0xb0, 0x40}, {0x20, 0x00},
+	{0xe4, 0xff}, {0x08, 0x0f}, {0x1c, 0x03}, {0xac, 0x0f},
+	{0x54, 0x00}, {0x30, 0x11}, {0x34, 0x11}, {0xd8, 0x01},
+};
+
+enum {
+	kComPhyModeCtrl = 0x00, kComSwReset = 0x04, kComPowerDownCtrl = 0x08,
+	kComSwiCtrl = 0x0c, kComTypecCtrl = 0x10, kComResetOverride = 0x1c,
+
+	kSerdesResetsmCntrl = 0x09c, kSerdesCReadyStatus = 0x178,
+	kSerdesCmnStatus = 0x140, kSerdesBiasEn = 0x044,
+
+	kDpPhyCfg = 0x010, kDpPhyCfg1 = 0x014, kDpPhyPdCtl = 0x018,
+	kDpPhyMode = 0x01c, kDpPhyAuxCfg0 = 0x020, kDpPhyAuxInterruptMask = 0x054,
+	kDpPhyVcoDiv = 0x070, kDpPhyTx01LaneCtl = 0x078,
+	kDpPhyTx23LaneCtl = 0x09c, kDpPhyStatus = 0x0dc,
+
+	kTxEmpPost1Level = 0x0c, kTxDrvLevel = 0x14,
+	kTxTransceiverBias = 0x48, kTxHighzDriver = 0x4c, kTxPolInv = 0x50,
+};
+
+static const uint32 kPhyCom = 0x0000, kPhyTxA = 0x0400, kPhyTxB = 0x0a00,
+	kPhyDpSerdes = 0x2000, kPhyDpPhy = 0x2200;
+
+
+static bool
+poll_bits(volatile uint8* base, uint32 offset, uint32 bits, const char* what)
+{
+	for (int i = 0; i < 100; i++) {
+		if ((rd(base, offset) & bits) == bits)
+			return true;
+		spin(100);
+	}
+	dprintf("qcom_probe: dp phy: no %s (%#" B_PRIx32 " = %#" B_PRIx32 ")\n",
+		what, offset, rd(base, offset));
+	return false;
+}
+
+
+static void
+dp_phy_test()
+{
+	area_id gccArea;
+	volatile uint8* gcc = map_rw({"probe gcc dp", 0x100000, 0x1f4200},
+		gccArea);
+	if (gcc == NULL)
+		return;
+
+	// USB30_PRIM_GDSC: on (bit 0 SW_COLLAPSE clear), status in bit 31
+	uint32 gdsc = rd(gcc, 0xf004);
+	if ((gdsc & 1) != 0)
+		wr32(gcc, 0xf004, gdsc & ~1u);
+	wait_bits(gcc, 0xf004, 1u << 31, 1u << 31);
+	dprintf("qcom_probe: dp phy: usb30 prim gdsc %#" B_PRIx32 " -> %#" B_PRIx32
+		"\n", gdsc, rd(gcc, 0xf004));
+	// aux, ref (usb4 eud clkref), com aux
+	static const uint32 kBranches[] = {0xf054, 0x8c02c, 0xf058};
+	for (uint32 branch : kBranches) {
+		uint32 before = rd(gcc, branch);
+		wr32(gcc, branch, before | 1);
+		spin(100);
+		dprintf("qcom_probe: dp phy: gcc %#" B_PRIx32 " %#" B_PRIx32 " -> %#"
+			B_PRIx32 "\n", branch, before, rd(gcc, branch));
+	}
+
+	// vdda-phy L9D 0.912 V, vdda-pll L4D 1.2 V
+	ldo_on("ldod9", 912);
+	ldo_on("ldod4", 1200);
+
+	// phy and common resets (GCC_USB3_PHY_PRIM_BCR, GCC_USB4_DP_PHY_PRIM_BCR)
+	wr32(gcc, 0x50000, rd(gcc, 0x50000) | 1);
+	wr32(gcc, 0x4a008, rd(gcc, 0x4a008) | 1);
+	spin(200);
+	wr32(gcc, 0x50000, rd(gcc, 0x50000) & ~1u);
+	wr32(gcc, 0x4a008, rd(gcc, 0x4a008) & ~1u);
+	spin(200);
+	delete_area(gccArea);
+
+	area_id phyArea;
+	volatile uint8* phy = map_rw({"probe usb43dp phy", 0x88eb000, 0x4000},
+		phyArea);
+	if (phy == NULL)
+		return;
+	volatile uint8* com = phy + kPhyCom;
+	volatile uint8* serdes = phy + kPhyDpSerdes;
+	volatile uint8* dp = phy + kPhyDpPhy;
+	volatile uint8* tx[2] = {phy + kPhyTxA, phy + kPhyTxB};
+	dprintf("qcom_probe: dp phy: dp_com mode %#" B_PRIx32 " typec %#" B_PRIx32
+		", dp phy revision %#" B_PRIx32 "\n", rd(com, kComPhyModeCtrl),
+		rd(com, kComTypecCtrl), rd(dp, 0));
+
+	// qmp_combo_com_init(), USB3 + DP, normal orientation
+	wr32(com, kComPowerDownCtrl, rd(com, kComPowerDownCtrl) | 1);
+	wr32(com, kComResetOverride, rd(com, kComResetOverride) | 0xf);
+	wr32(com, kComTypecCtrl, 1u << 1);
+	wr32(com, kComPhyModeCtrl, 3);
+	wr32(com, kComResetOverride, rd(com, kComResetOverride) & ~0xfu);
+	wr32(com, kComSwiCtrl, rd(com, kComSwiCtrl) & ~3u);
+	wr32(com, kComSwReset, rd(com, kComSwReset) & ~1u);
+
+	// qmp_v4_dp_aux_init()
+	wr32(dp, kDpPhyPdCtl, 0x01 | 0x02 | 0x04 | 0x20 | 0x40);
+	wr32(serdes, kSerdesBiasEn, 0x17);
+	static const uint8 kAux[] = {0x00, 0x13, 0xa4, 0x00, 0x0a, 0x26, 0x0a,
+		0x03, 0xb7, 0x03};
+	for (uint32 i = 0; i < sizeof(kAux); i++)
+		wr32(dp, kDpPhyAuxCfg0 + 4 * i, kAux[i]);
+	wr32(dp, kDpPhyAuxInterruptMask, 0x1f);
+
+	// qmp_combo_dp_power_on(): serdes at RBR, both lanes' TX
+	for (const qmp_setting& setting : kDpSerdes)
+		wr32(serdes, setting.offset, setting.value);
+	for (const qmp_setting& setting : kDpSerdesRbr)
+		wr32(serdes, setting.offset, setting.value);
+	for (int lane = 0; lane < 2; lane++) {
+		for (const qmp_setting& setting : kDpTx)
+			wr32(tx[lane], setting.offset, setting.value);
+		// qmp_v4_configure_dp_tx(): swing and pre-emphasis level 0
+		wr32(tx[lane], kTxDrvLevel, 0x27);
+		wr32(tx[lane], kTxEmpPost1Level, 0x20);
+		wr32(tx[lane], kTxDrvLevel, 0x28 | 0x20);
+		wr32(tx[lane], kTxEmpPost1Level, 0x20 | 0x20);
+	}
+
+	// qmp_v456_configure_dp_phy(): four lanes, normal orientation
+	wr32(dp, kDpPhyCfg1, 0x0f);
+	wr32(dp, kDpPhyPdCtl, 0x01 | 0x04 | 0x20 | 0x40 | 0x08 | 0x10);
+	wr32(dp, kDpPhyMode, 0x5c);
+	wr32(dp, kDpPhyAuxCfg0 + 4, 0x13);
+	wr32(dp, kDpPhyAuxCfg0 + 8, 0xa4);
+	wr32(dp, kDpPhyTx01LaneCtl, 0x05);
+	wr32(dp, kDpPhyTx23LaneCtl, 0x05);
+	wr32(dp, kDpPhyVcoDiv, 0x1);	// RBR
+	wr32(dp, kDpPhyCfg, 0x01);
+	wr32(dp, kDpPhyCfg, 0x05);
+	wr32(dp, kDpPhyCfg, 0x01);
+	wr32(dp, kDpPhyCfg, 0x09);
+	wr32(serdes, kSerdesResetsmCntrl, 0x20);
+	bool locked = poll_bits(serdes, kSerdesCReadyStatus, 1, "C_READY")
+		&& poll_bits(serdes, kSerdesCmnStatus, 1, "PLL lock")
+		&& poll_bits(serdes, kSerdesCmnStatus, 2, "PLL ready");
+	bool ready = false;
+	if (locked) {
+		wr32(dp, kDpPhyCfg, 0x19);
+		ready = poll_bits(dp, kDpPhyStatus, 1, "PHY status 0")
+			&& poll_bits(dp, kDpPhyStatus, 2, "PHY status 1");
+	}
+	if (ready) {
+		// qmp_v4_configure_dp_phy(): drivers and bias for four lanes
+		for (int lane = 0; lane < 2; lane++) {
+			wr32(tx[lane], kTxHighzDriver, 0x10);
+			wr32(tx[lane], kTxTransceiverBias, 0x3f);
+		}
+		wr32(dp, kDpPhyCfg, 0x18);
+		snooze(2000);
+		wr32(dp, kDpPhyCfg, 0x19);
+		ready = poll_bits(dp, kDpPhyStatus, 2, "PHY ready");
+		for (int lane = 0; lane < 2; lane++) {
+			wr32(tx[lane], kTxPolInv, 0x0a);
+			wr32(tx[lane], kTxDrvLevel, 0x27);
+			wr32(tx[lane], kTxEmpPost1Level, 0x20);
+		}
+	}
+	if (ready) {
+		// dispcc 0: DP0's link RCG (0x21a4) from the PHY's link clock
+		// (disp_cc_parent_map_0: source 1), undivided, then its link
+		// branch: running only if the PHY's clock comes
+		area_id dispccArea;
+		volatile uint8* dispcc = map_rw({"probe dispcc dp0", 0xaf00000,
+			0x20000}, dispccArea);
+		if (dispcc != NULL) {
+			uint32 cfg = rd(dispcc, 0x21a8);
+			wr32(dispcc, 0x21a8, (cfg & ~(7u << 8 | 0x1fu)) | 1u << 8);
+			wr32(dispcc, 0x21a4, rd(dispcc, 0x21a4) | 1);
+			wait_bits(dispcc, 0x21a4, 1, 0);
+			uint32 before = rd(dispcc, 0x205c);
+			wr32(dispcc, 0x205c, before | 1);
+			bool running = wait_bits(dispcc, 0x205c, 1u << 31, 0);
+			dprintf("qcom_probe: dp phy: dp0 link rcg cfg %#" B_PRIx32 " -> %#"
+				B_PRIx32 " (cmd %#" B_PRIx32 "), link branch %#" B_PRIx32
+				" -> %#" B_PRIx32 ": %s\n", cfg, rd(dispcc, 0x21a8),
+				rd(dispcc, 0x21a4), before, rd(dispcc, 0x205c),
+				running ? "running" : "off");
+			delete_area(dispccArea);
+		}
+	}
+	dprintf("qcom_probe: dp phy: PLL %s, PHY %s (c_ready %#" B_PRIx32
+		" cmn %#" B_PRIx32 " dp phy status %#" B_PRIx32 ")\n",
+		locked ? "locked" : "not locked", ready ? "ready" : "not ready",
+		rd(serdes, kSerdesCReadyStatus), rd(serdes, kSerdesCmnStatus),
+		rd(dp, kDpPhyStatus));
+	delete_area(phyArea);
+}
+
+
 // devfs calls init_hardware() when it loads the driver: the probe runs then,
 // and the driver reports no device.
 status_t
@@ -1073,6 +1350,7 @@ init_hardware()
 {
 	probe();
 	adsp_state();
+	dp_phy_test();
 	return B_ERROR;
 }
 
