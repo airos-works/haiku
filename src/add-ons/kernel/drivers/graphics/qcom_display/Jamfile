@@ -12,4 +12,5 @@ KernelAddon qcom_display :
 	dp_tu.c
 	dpu.cpp
 	driver.cpp
+	usbc_dp.cpp
 ;
