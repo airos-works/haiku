@@ -370,6 +370,7 @@ struct tc956x_device {
 	bool			linkUp;
 	uint32			linkSpeed;	// Mbit/s
 	bool			fullDuplex;
+	int32			interrupts;
 };
 
 
@@ -541,7 +542,7 @@ chip_init(const pci_info& function0)
 		mmio_write(bridge, ATR_ENTRY(i) + ATR_TRSL_PARAM, 0);
 	}
 
-	INFO("translation %#" B_PRIx32 " %#" B_PRIx32 " -> %#" B_PRIx32 " %#"
+	TRACE("translation %#" B_PRIx32 " %#" B_PRIx32 " -> %#" B_PRIx32 " %#"
 		B_PRIx32 ", parameters %#" B_PRIx32 "\n",
 		mmio_read(bridge, ATR_ENTRY(0) + ATR_SRC_ADDR_LO),
 		mmio_read(bridge, ATR_ENTRY(0) + ATR_SRC_ADDR_HI),
@@ -959,6 +960,7 @@ update_link(tc956x_device* device)
 }
 
 
+#ifdef TRACE_TC956X
 static void
 dump_state(tc956x_device* device)
 {
@@ -992,6 +994,9 @@ dump_state(tc956x_device* device)
 		xpcs_read(device, MMD_VEND2, 0x8002),
 		mmio_read(sChip.sfr, EMAC_CTL(device->mac)));
 
+	INFO("%s: %" B_PRId32 " interrupts, MAC interrupt status %#" B_PRIx32
+		", MTL %#" B_PRIx32 "\n", device->name, device->interrupts,
+		read32(device, 0x00b0), read32(device, 0x1020));
 	INFO("%s: PHY rx %" B_PRId32 ":%" B_PRId32 " errors %" B_PRId32 ", tx %"
 		B_PRId32 ":%" B_PRId32 " errors %" B_PRId32 ", status %#" B_PRIx32
 		", SerDes FIFO %#" B_PRIx32 "\n", device->name,
@@ -1005,18 +1010,23 @@ dump_state(tc956x_device* device)
 		mdio_read_mmd(device, PHY_ADDRESS + 1, MMD_PMAPMD,
 			QCA8081_SERDES_FIFO_CTRL));
 }
+#endif
 
 
 static status_t
 link_thread(void* data)
 {
 	tc956x_device* device = (tc956x_device*)data;
+#ifdef TRACE_TC956X
 	int32 upSeconds = 0;
+#endif
 	while (!device->stopping) {
 		update_link(device);
+#ifdef TRACE_TC956X
 		upSeconds = device->linkUp ? upSeconds + 1 : 0;
 		if (upSeconds == 3 || upSeconds == 10)
 			dump_state(device);
+#endif
 		snooze(1000000);
 	}
 	return B_OK;
@@ -1030,6 +1040,7 @@ static int32
 tc956x_interrupt(void* data)
 {
 	tc956x_device* device = (tc956x_device*)data;
+	device->interrupts++;
 
 	uint32 sources = mmio_read(device->msigen, MSI_INT_STS);
 	uint32 status = read32(device, DMA_CH0_STATUS);
@@ -1218,8 +1229,9 @@ tc956x_start(tc956x_device* device)
 	set32(device, DMA_CH0_TX_CONTROL, TX_CONTROL_ST);
 	set32(device, DMA_CH0_RX_CONTROL, RX_CONTROL_SR);
 
-	mmio_write(device->msigen, MSI_OUT_EN,
-		1u << HWIRQ_EVENT | 1u << HWIRQ_TX0 | 1u << HWIRQ_RX0);
+	// Only channel 0's lines: the common one (MAC and MTL events) would
+	// need its sources handled, or it asserts forever.
+	mmio_write(device->msigen, MSI_OUT_EN, 1u << HWIRQ_TX0 | 1u << HWIRQ_RX0);
 	mmio_write(device->msigen, MSI_MASK_CLR, 1);
 
 	device->linkUp = false;
