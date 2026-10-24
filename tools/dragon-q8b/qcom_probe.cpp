@@ -489,7 +489,9 @@ probe()
 		}
 	}
 
-	// the SD slot's card detect (TLMM GPIO 131, low with a card in) and its
+	// the SD slot's card detect (TLMM GPIO 131: the schematic's switch is
+	// closed to ground without a card and open with one, whatever the
+	// device tree's GPIO_ACTIVE_LOW says) and its
 	// pin configuration, and the SD pins' (sdc2 clk/cmd/data in their own
 	// register)
 	{
@@ -506,14 +508,14 @@ probe()
 			spin(1000);
 			io = rd(tlmm, 4);
 			dprintf("qcom_probe: sd card detect, no bias: in/out %#" B_PRIx32
-				": %s\n", io, (io & 1) == 0 ? "card in" : "no card");
+				": %s\n", io, (io & 1) == 0 ? "no card" : "card in");
 			// and with the pin's own pull-up, in case the board's is to a
 			// supply that is off
 			*(volatile uint32*)tlmm = 3;
 			spin(1000);
 			io = rd(tlmm, 4);
 			dprintf("qcom_probe: sd card detect, pull-up: in/out %#" B_PRIx32
-				": %s\n", io, (io & 1) == 0 ? "card in" : "no card");
+				": %s\n", io, (io & 1) == 0 ? "no card" : "card in");
 			*(volatile uint32*)tlmm = 0;
 			sd_identify();
 			delete_area(area);
@@ -713,11 +715,13 @@ sd_power_ack(volatile uint8* sd, const char* what)
 			continue;
 		}
 		wr32(sd, 0x248, status);
+		// as sdhci_msm_handle_pwr_irq(): a bus on or off is an I/O level
+		// change as well, both acknowledged
 		uint32 ack = 0;
 		if ((status & 0x3) != 0)
-			ack |= 1u << 0;		// bus on/off done
+			ack |= 1u << 0 | 1u << 2;	// bus, I/O done
 		if ((status & 0xc) != 0)
-			ack |= 1u << 2;		// I/O high/low done
+			ack |= 1u << 2;				// I/O high/low done
 		wr32(sd, 0x24c, ack);
 		dprintf("qcom_probe: sd %s: power event %#" B_PRIx32 ", ack %#" B_PRIx32
 			"\n", what, status, ack);
@@ -795,6 +799,49 @@ sd_identify()
 		}
 	}
 
+	// the SD pins as sdc2-default-state has them (pinctrl-sc8280xp.c: one
+	// register at TLMM + 0xe8000; clk pull 15:14 drive 8:6, cmd pull 12:11
+	// drive 5:3, data pull 10:9 drive 2:0; pull 3 = up, drive 7 = 16 mA)
+	{
+		area_id tlmmArea;
+		volatile uint8* tlmm = map_rw({"probe tlmm sdc2", 0xf100000 + 0xe8000,
+			0x1000}, tlmmArea);
+		if (tlmm != NULL) {
+			uint32 before = rd(tlmm, 0);
+			uint32 value = before & ~(3u << 14 | 7u << 6 | 3u << 11 | 7u << 3
+				| 3u << 9 | 7u << 0);
+			value |= 0u << 14 | 7u << 6 | 3u << 11 | 7u << 3 | 3u << 9
+				| 7u << 0;
+			wr32(tlmm, 0, value);
+			dprintf("qcom_probe: sdc2 pins %#" B_PRIx32 " -> %#" B_PRIx32 "\n",
+				before, rd(tlmm, 0));
+			delete_area(tlmmArea);
+		}
+	}
+
+	// sdhci_msm_probe(): the block reset through GCC (GCC_SDCC2_BCR), the
+	// vendor register's power on value with the pad voltage switch on and
+	// at 3 V, 3.0 V and 8 bits in the capabilities, the power interrupts
+	// unmasked
+	{
+		area_id gccArea;
+		volatile uint8* gcc = map_rw({"probe gcc bcr", 0x100000, 0x1f4200},
+			gccArea);
+		if (gcc != NULL) {
+			wr32(gcc, 0x14000, rd(gcc, 0x14000) | 1);
+			spin(200);
+			wr32(gcc, 0x14000, rd(gcc, 0x14000) & ~1u);
+			spin(200);
+			delete_area(gccArea);
+		}
+	}
+	dprintf("qcom_probe: sd mci version %#" B_PRIx32 ", vendor spec %#" B_PRIx32
+		"\n", rd(sd, 0x50), rd(sd, 0x20c));
+	wr32(sd, 0x20c, 0xa9c);
+	wr32(sd, 0x21c, rd(sd, 0x40) | 1u << 25 | 1u << 18);
+	wr32(sd, 0x20c, (rd(sd, 0x20c) | 1u << 15) & ~(1u << 16));
+	wr32(sd, 0x244, 0xf);
+
 	// the card's supply (vmmc, L9C) and its pins' (vqmmc, L6C), 2.96 V
 	ldo_on("ldoc9", 2960);
 	ldo_on("ldoc6", 2960);
@@ -808,8 +855,12 @@ sd_identify()
 	wr32(sd, 0x34, 0xffffffff);	// status bits latch
 	wr32(sd, 0x38, 0);			// no interrupt signals
 
-	wr8(sd, 0x29, 0x0e);		// 3.3 V
-	wr8(sd, 0x29, 0x0f);		// bus power on
+	// 3.0 V: the capabilities (sdhci-msm's CORE_VENDOR_SPEC_CAPABILITIES0)
+	// offer 3.0 and 1.8 V, not 3.3; the pads at 3 V (CORE_VENDOR_SPEC at
+	// 0x20c: CORE_IO_PAD_PWR_SWITCH, bit 16, clear)
+	wr32(sd, 0x20c, rd(sd, 0x20c) & ~(1u << 16));
+	wr8(sd, 0x29, 0x0c);
+	wr8(sd, 0x29, 0x0d);		// bus power on
 	sd_power_ack(sd, "bus power");
 	spin(10000);
 
