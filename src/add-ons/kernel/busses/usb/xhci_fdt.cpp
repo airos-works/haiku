@@ -765,10 +765,13 @@ init_fdt(device_node* node, void** cookie)
 		// With the GL3523 on the ROCK 5 ITX's USB 3 link the system soon
 		// stopped taking input and starting programs, so these cores' USB 3
 		// ports stay off unless the "xhci" driver settings ask for them with
-		// "dwc3_superspeed true". USB 3 devices then run at high speed.
+		// "dwc3_superspeed true". USB 3 devices then run at high speed. The
+		// SC8280XP's run at SuperSpeed by default (an RTL9210 NVMe adapter
+		// reads 177 MB/s on the Dragon Q8B); "dwc3_superspeed false" turns
+		// them down.
 		void* settings = load_driver_settings("xhci");
 		platform.usb2_only = !get_driver_boolean_parameter(settings,
-			"dwc3_superspeed", false, true);
+			"dwc3_superspeed", qualcomm, true);
 		unload_driver_settings(settings);
 
 		if (usb_fdt_has_string(fdt, device, "compatible", "rockchip,rk3588-dwc3")

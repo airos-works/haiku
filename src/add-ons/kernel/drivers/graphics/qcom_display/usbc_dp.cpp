@@ -202,7 +202,8 @@ UsbcDisplayPort::UsbcDisplayPort(uint32 connector)
 	fLayerExt(0x40 + 4 * fConnector.mixer),
 	fGccArea(-1), fGcc(NULL), fDispccArea(-1), fDispcc(NULL), fPhyArea(-1),
 	fPhy(NULL), fControllerArea(-1), fController(NULL), fPort(NULL),
-	fMdssArea(-1), fMdss(NULL), fRate(0), fPowered(false), fRunning(false)
+	fMdssArea(-1), fMdss(NULL), fRate(0), fWideBus(false),
+	fReverse(false), fPhyLanes(4), fLanes(4), fPowered(false), fRunning(false)
 {
 }
 
@@ -260,8 +261,10 @@ UsbcDisplayPort::_PowerPhy()
 
 	wr(com, COM_POWER_DOWN_CTRL, rd(com, COM_POWER_DOWN_CTRL) | 1);
 	wr(com, COM_RESET_OVRD_CTRL, rd(com, COM_RESET_OVRD_CTRL) | 0xf);
-	wr(com, COM_TYPEC_CTRL, 1u << 1);		// software port select, normal
-	wr(com, COM_PHY_MODE_CTRL, 3);			// USB3 + DP
+	// software port select, the orientation; DisplayPort only with four
+	// lanes, USB 3 beside it with two
+	wr(com, COM_TYPEC_CTRL, 1u << 1 | (fReverse ? 1 : 0));
+	wr(com, COM_PHY_MODE_CTRL, fPhyLanes == 4 ? 2 : 3);
 	wr(com, COM_RESET_OVRD_CTRL, rd(com, COM_RESET_OVRD_CTRL) & ~0xfu);
 	wr(com, COM_SWI_CTRL, rd(com, COM_SWI_CTRL) & ~3u);
 	wr(com, COM_SW_RESET, rd(com, COM_SW_RESET) & ~1u);
@@ -309,9 +312,16 @@ UsbcDisplayPort::_ConfigureRate(uint32 rate)
 	}
 	_SetPhyLevels(0, 0);
 
+	// qmp_combo_configure_dp_mode(): the lanes in use powered (lanes 0/1
+	// for the reverse orientation, 2/3 for the normal one, all four)
 	wr(dp, DP_PHY_CFG_1, 0x0f);
-	wr(dp, DP_PHY_PD_CTL, 0x01 | 0x04 | 0x20 | 0x40 | 0x08 | 0x10);
-	wr(dp, DP_PHY_MODE, 0x5c);
+	uint32 powerDown = 0x01 | 0x04 | 0x20 | 0x40;
+	if (fPhyLanes == 4 || fReverse)
+		powerDown |= 0x08;
+	if (fPhyLanes == 4 || !fReverse)
+		powerDown |= 0x10;
+	wr(dp, DP_PHY_PD_CTL, powerDown);
+	wr(dp, DP_PHY_MODE, fReverse ? 0x4c : 0x5c);
 	wr(dp, DP_PHY_AUX_CFG0 + 4, 0x13);
 	wr(dp, DP_PHY_AUX_CFG0 + 8, 0xa4);
 	wr(dp, DP_PHY_TX0_TX1_LANE_CTL, 0x05);
@@ -332,9 +342,16 @@ UsbcDisplayPort::_ConfigureRate(uint32 rate)
 	wr(dp, DP_PHY_CFG, 0x19);
 	if (!wait_bits(dp, DP_PHY_STATUS, 3, 3))
 		return B_ERROR;
-	for (volatile uint8* lane : tx) {
-		wr(lane, TX_HIGHZ_DRVR_EN, 0x10);
-		wr(lane, TX_TRANSCEIVER_BIAS, 0x3f);
+	// qmp_v4_configure_dp_phy(): the TX blocks' drivers and biases for the
+	// lanes in use
+	uint32 bias[2] = {0x3f, 0x3f};
+	if (fPhyLanes == 2) {
+		bias[0] = fReverse ? 0x3f : 0x15;
+		bias[1] = fReverse ? 0x15 : 0x3f;
+	}
+	for (int i = 0; i < 2; i++) {
+		wr(tx[i], TX_HIGHZ_DRVR_EN, 0x10);
+		wr(tx[i], TX_TRANSCEIVER_BIAS, bias[i]);
 	}
 	wr(dp, DP_PHY_CFG, 0x18);
 	snooze(2000);
@@ -366,15 +383,7 @@ UsbcDisplayPort::_Clocks()
 	wr(fDispcc, fConnector.auxRcg, rd(fDispcc, fConnector.auxRcg) | 1);
 	wait_bits(fDispcc, fConnector.auxRcg, 1, 0);
 
-	const uint32 m = 11, n = 120, d = n;
-	wr(fDispcc, fConnector.pixelRcg + 8, m);
-	wr(fDispcc, fConnector.pixelRcg + 0xc, ~(n - m) & 0xffff);
-	wr(fDispcc, fConnector.pixelRcg + 0x10, ~d & 0xffff);
-	// dual edge
-	wr(fDispcc, fConnector.pixelRcg + 4,
-		fConnector.pixelSource << 8 | 2u << 12);
-	wr(fDispcc, fConnector.pixelRcg, rd(fDispcc, fConnector.pixelRcg) | 1);
-	wait_bits(fDispcc, fConnector.pixelRcg, 1, 0);
+	_SetPixelClock();
 
 	if (!branch_on(fDispcc, fConnector.linkBranch)
 		|| !branch_on(fDispcc, fConnector.auxBranch)
@@ -391,6 +400,24 @@ UsbcDisplayPort::_Clocks()
 }
 
 
+/*!	The pixel clock at 74.25 MHz from the PHY's VCO divider clock, which
+	runs at 810 MHz at RBR and at 1350 MHz at HBR to HBR3
+	(qmp_v4_configure_dp_clocks()): M/N 11/120 or 11/200. */
+void
+UsbcDisplayPort::_SetPixelClock()
+{
+	const uint32 m = 11, n = fRate == 162 ? 120 : 200, d = n;
+	wr(fDispcc, fConnector.pixelRcg + 8, m);
+	wr(fDispcc, fConnector.pixelRcg + 0xc, ~(n - m) & 0xffff);
+	wr(fDispcc, fConnector.pixelRcg + 0x10, ~d & 0xffff);
+	// dual edge
+	wr(fDispcc, fConnector.pixelRcg + 4,
+		fConnector.pixelSource << 8 | 2u << 12);
+	wr(fDispcc, fConnector.pixelRcg, rd(fDispcc, fConnector.pixelRcg) | 1);
+	wait_bits(fDispcc, fConnector.pixelRcg, 1, 0);
+}
+
+
 //!	The controller's AUX channel (msm_dp_aux): reset, limits, enabled.
 void
 UsbcDisplayPort::_EnableAux()
@@ -402,6 +429,14 @@ UsbcDisplayPort::_EnableAux()
 	wr(fController, 0x200 + 0x3c, 0xffff);		// timeout count
 	wr(fController, 0x200 + 0x40, 0xffff);		// limits
 	wr(fController, auxControl, rd(fController, auxControl) | 1);
+}
+
+
+void
+UsbcDisplayPort::SetPortMode(bool reverse, uint32 lanes)
+{
+	fReverse = reverse;
+	fPhyLanes = lanes == 2 ? 2 : 4;
 }
 
 
@@ -427,8 +462,8 @@ UsbcDisplayPort::PowerUp()
 	if (status != B_OK)
 		return status;
 
-	// the SBU mux on, the normal orientation (gpio-sbu-mux: enable active
-	// low; select set for the reverse one)
+	// the SBU mux on (gpio-sbu-mux: enable active low), select set for the
+	// reverse orientation
 	const uint32 kPins[] = {fConnector.sbuEnablePin, fConnector.sbuSelectPin};
 	for (uint32 pin : kPins) {
 		volatile uint8* tlmm;
@@ -436,7 +471,8 @@ UsbcDisplayPort::PowerUp()
 		if (_Map(area, tlmm, "qcom usbc sbu", kTlmmBase + pin * 0x1000,
 				B_PAGE_SIZE) != B_OK)
 			return B_NO_MEMORY;
-		wr(tlmm, 4, 0);				// low
+		bool high = pin == fConnector.sbuSelectPin && fReverse;
+		wr(tlmm, 4, high ? 2 : 0);
 		wr(tlmm, 0, 1u << 9);		// GPIO, output, 2 mA
 		delete_area(area);
 	}
@@ -448,7 +484,8 @@ UsbcDisplayPort::PowerUp()
 		return status;
 	_EnableAux();
 	fPowered = true;
-	INFO("%s: PHY at RBR, clocks and AUX on\n", fConnector.name);
+	INFO("%s: PHY at RBR (%" B_PRIu32 " lanes, %s orientation), clocks and "
+		"AUX on\n", fConnector.name, fPhyLanes, fReverse ? "reverse" : "normal");
 	return B_OK;
 }
 
@@ -618,7 +655,15 @@ UsbcDisplayPort::_Train(uint32* _lanes)
 	status_t status = fPort->ReadDpcd(0x000, caps, sizeof(caps));
 	if (status != B_OK)
 		return status;
-	uint32 lanes = caps[2] & 0x1f;
+	// the sink (or branch device) in D0 (msm_dp_link_psm_config(),
+	// DP_SET_POWER)
+	uint8 power;
+	if (fPort->ReadDpcd(0x600, &power, 1) == B_OK && (power & 7) != 1) {
+		power = (power & ~7u) | 1;
+		fPort->WriteDpcd(0x600, &power, 1);
+		snooze(1000);
+	}
+	uint32 lanes = min_c(caps[2] & 0x1fu, fPhyLanes);
 	if (lanes != 1 && lanes != 2 && lanes != 4)
 		return B_BAD_DATA;
 	bool enhanced = (caps[2] & 0x80) != 0, tps3 = (caps[2] & 0x40) != 0;
@@ -728,8 +773,39 @@ UsbcDisplayPort::_TrainAt(uint32 rate, uint32 lanes, bool enhanced, bool tps3,
 	the controller's training patterns checked, and the stream started on
 	an untrained link (where it goes nowhere), so that path is known too. */
 void
+UsbcDisplayPort::Attention()
+{
+	if (fPort == NULL || !fRunning)
+		return;
+	// DPCD 0x200: sink count, the device service IRQ vector, lane 0/1 and
+	// 2/3 status, alignment, sink status
+	uint8 status[6];
+	if (fPort->ReadDpcd(0x200, status, sizeof(status)) != B_OK) {
+		INFO("%s: attention, but no AUX answer\n", fConnector.name);
+		return;
+	}
+	if (status[1] != 0)
+		fPort->WriteDpcd(0x201, &status[1], 1);
+	// each lane in use: clock recovery, equalization, symbol lock
+	bool locked = (status[4] & 1) != 0;
+	for (uint32 i = 0; i < fLanes; i++) {
+		if (((status[2 + i / 2] >> (4 * (i % 2))) & 7) != 7)
+			locked = false;
+	}
+	INFO("%s: attention: sink count %#x, IRQ %#x, lanes %#x %#x, align %#x, "
+		"sink %#x: %s\n", fConnector.name, status[0], status[1], status[2],
+		status[3], status[4], status[5],
+		locked ? "link fine" : "training again");
+	if (!locked)
+		_Link(fTiming, fWideBus);
+}
+
+
+void
 UsbcDisplayPort::_Link(const display_timing& timing, bool wideBus)
 {
+	fTiming = timing;
+	fWideBus = wideBus;
 	if (fPort == NULL) {
 		fPort = new(std::nothrow) DisplayPort(fConnector.controller);
 		if (fPort == NULL || fPort->Init() != B_OK) {
@@ -739,7 +815,7 @@ UsbcDisplayPort::_Link(const display_timing& timing, bool wideBus)
 			return;
 		}
 	}
-	uint32 lanes = 4;
+	uint32 lanes = fPhyLanes;
 	status_t status = _Train(&lanes);
 	if (status != B_OK) {
 		INFO("%s: link not trained (%s)\n", fConnector.name, strerror(status));
@@ -750,8 +826,8 @@ UsbcDisplayPort::_Link(const display_timing& timing, bool wideBus)
 				_ConfigureRate(kRates[i].rate) == B_OK ? "locked" : "no lock");
 		}
 		_ConfigureRate(162);
-		_EnableMainlink(4);
-		lanes = 4;
+		_EnableMainlink(fPhyLanes);
+		lanes = fPhyLanes;
 		for (uint32 pattern = 1; pattern <= 3; pattern++) {
 			INFO("%s: training pattern %" B_PRIu32 ": %s\n", fConnector.name,
 				pattern,
@@ -759,10 +835,18 @@ UsbcDisplayPort::_Link(const display_timing& timing, bool wideBus)
 		}
 		wr(fController, DP_STATE_CTRL, 0);
 	}
+	fLanes = lanes;
+	_SetPixelClock();
 	fPort->SetLinkRate(fRate);
 	status = fPort->SetStream(timing, wideBus);
 	if (status == B_OK)
 		status = fPort->StartStream();
+	uint8 sinkStatus[6] = {};
+	snooze(200000);
+	fPort->ReadDpcd(0x200, sinkStatus, sizeof(sinkStatus));
+	INFO("%s: 200 ms later: sink count %#x, lanes %#x, align %#x, sink "
+		"status %#x\n", fConnector.name, sinkStatus[0], sinkStatus[2],
+		sinkStatus[4], sinkStatus[5]);
 	INFO("%s: stream on %" B_PRIu32 " lanes at %" B_PRIu32 " MHz: %s "
 		"(mainlink ready %#" B_PRIx32 ")\n", fConnector.name, lanes, fRate,
 		strerror(status),

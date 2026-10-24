@@ -15,14 +15,14 @@
 	 - the power interrupt ("pwr_irq"): the controller waits for each bus
 	   power and I/O level change it makes to be acknowledged.
 	The controller's own card detect is not wired: the slot's switch is GPIO
-	131, closed to ground without a card (schematic page 38), and a thread
+	131, low with a card in (seen with a card; schematic page 38), and a thread
 	polls it and drives the SDHCI card detect test level, so the generic
 	insertion path runs. Its DMA goes through the apps SMMU's context bank
 	2, which the firmware leaves untranslated (SCTLR.M 0), and the bus is
 	cache coherent ("dma-coherent").
 
 	Settings (the "sdhci" driver settings file): qcom_sd false turns it off,
-	qcom_cd_active_low true reads the switch the other way round. */
+	qcom_cd_active_low false reads the switch the other way round. */
 
 
 #include "sdhci.h"
@@ -169,13 +169,13 @@ static bool
 qcom_settings(bool& readOnly, bool& cdActiveLow)
 {
 	readOnly = false;
-	cdActiveLow = false;
+	cdActiveLow = true;
 	void* handle = load_driver_settings("sdhci");
 	if (handle == NULL)
 		return true;
 	bool enabled = get_driver_boolean_parameter(handle, "qcom_sd", true, true);
 	cdActiveLow = get_driver_boolean_parameter(handle, "qcom_cd_active_low",
-		false, true);
+		true, true);
 	unload_driver_settings(handle);
 	return enabled;
 }

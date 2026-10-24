@@ -193,7 +193,8 @@ virtual_timing()
 
 
 static bool usbc_forced(uint32 connector);
-static status_t connect_usbc(display_info* info, uint32 connector);
+static status_t connect_usbc(display_info* info, uint32 connector,
+	const qcom_usbc_port* port = NULL);
 
 
 static void
@@ -305,13 +306,21 @@ init_outputs(display_info* info)
 /*!	Powers a USB-C connector's DisplayPort up and marks its output
 	connected. The caller holds the lock, or nobody else runs yet. */
 static status_t
-connect_usbc(display_info* info, uint32 connector)
+connect_usbc(display_info* info, uint32 connector,
+	const qcom_usbc_port* port)
 {
 	if (info->usbc[connector] == NULL) {
 		qcom::UsbcDisplayPort* usbc
 			= new(std::nothrow) qcom::UsbcDisplayPort(connector);
 		if (usbc == NULL)
 			return B_NO_MEMORY;
+		// pin assignments D and F (4 and 6 as reported) leave two lanes to
+		// USB 3
+		if (port != NULL) {
+			usbc->SetPortMode(port->orientation == 1,
+				port->pin_assignment == 4 || port->pin_assignment == 6
+					? 2 : 4);
+		}
 		status_t status = usbc->PowerUp();
 		if (status != B_OK) {
 			delete usbc;
@@ -366,7 +375,7 @@ hot_plug_thread(void* data)
 			bool connected = (info->shared->outputs[1 + connector].flags
 				& QCOM_DISPLAY_OUTPUT_CONNECTED) != 0;
 			if (sink && !connected) {
-				status_t status = connect_usbc(info, connector);
+				status_t status = connect_usbc(info, connector, &port);
 				INFO("DP-%" B_PRIu32 ": a DisplayPort sink on USB-C port %"
 					B_PRIu32 " (pin assignment %u, orientation %u): %s\n",
 					connector + 1, connector, port.pin_assignment,
@@ -374,6 +383,9 @@ hot_plug_thread(void* data)
 					status == B_OK ? "connected" : strerror(status));
 				if (status == B_OK)
 					notify_change(info);
+			} else if (sink && connected && port.hpd_irq
+				&& info->usbc[connector] != NULL) {
+				info->usbc[connector]->Attention();
 			} else if (!sink && connected && !info->usbcForced[connector]) {
 				disconnect_usbc(info, connector);
 				INFO("DP-%" B_PRIu32 ": the sink on USB-C port %" B_PRIu32

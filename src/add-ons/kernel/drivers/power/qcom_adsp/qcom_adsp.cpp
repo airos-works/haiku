@@ -1132,16 +1132,17 @@ struct usbc_write_request {
 	uint32	reserved;
 };
 
+// USBC_NOTIFY_IND (pmic_glink_altmode_sc8280xp_notify()): the SVID is in
+// the opcode's top half
 struct usbc_notify {
 	pmic_glink_header header;
-	uint8	pinAssignmentHpd;	// pin assignment 5:0, HPD 6, HPD IRQ 7
-	uint8	reserved1[7];
 	uint8	port;
 	uint8	orientation;
 	uint8	mux;
-	uint8	reserved2;
-	uint16	vid;
-	uint16	svid;
+	uint8	reserved1[5];
+	uint8	pinAssignmentHpd;	// DPAM (A = 1) 5:0, HPD 6, HPD IRQ 7
+	uint8	reserved2[7];
+	uint32	reserved3;
 } _PACKED;
 
 static glink_channel* sPmicGlink;
