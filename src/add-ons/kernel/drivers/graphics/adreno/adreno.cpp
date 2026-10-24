@@ -79,6 +79,11 @@ int32 api_version = B_CUR_DRIVER_API_VERSION;
 #define GMU_HFI_QTBL_INFO		0x1f984
 #define GMU_HFI_QTBL_ADDR		0x1f985
 #define GMU_HFI_CTRL_INIT		0x1f986
+#define GMU_GMU2HOST_INTR_CLR	0x1f991
+#define GMU_GMU2HOST_INTR_INFO	0x1f992
+#define  GMU2HOST_MSGQ			(1u << 0)
+#define GMU_GMU2HOST_INTR_MASK	0x1f993
+#define GMU_HOST2GMU_INTR_SET	0x1f994
 #define GMU_GENERAL_7			0x1f9cc
 #define GMU_AO_HOST_INTERRUPT_CLR 0x23b04
 #define GMU_AO_HOST_INTERRUPT_MASK 0x23b06
@@ -115,6 +120,12 @@ int32 api_version = B_CUR_DRIVER_API_VERSION;
 #define GMU_HFI_SIZE			(16 * 1024)
 #define DTCM_BASE				0x10004000	// A650 family
 #define TCM_SIZE				(16 * 1024)
+
+// GPU registers (32 bit words), GX side
+#define RBBM_STATUS				0x0210
+
+#define CMD_DB_BASE				0x80860000
+#define CMD_DB_SIZE				0x20000
 
 // the GPU's chip ID, in the GMU's layout
 #define A690_CHIP_ID			0x06090000
@@ -749,6 +760,432 @@ gmu_start(const uint8* firmware, size_t firmwareSize)
 }
 
 
+//	#pragma mark - cmd-db, performance levels
+
+
+/*	The AOP's command DB: the RPMh resources and, for the voltage arcs, the
+	levels they accept (Linux' drivers/soc/qcom/cmd-db.c). */
+
+struct cmd_db_rsc_header {
+	uint16	slave_id;
+	uint16	header_offset;
+	uint16	data_offset;
+	uint16	count;
+	uint16	version;
+	uint16	reserved[3];
+};
+
+struct cmd_db_entry {
+	char	id[8];
+	uint32	priority[2];
+	uint32	address;
+	uint16	length;
+	uint16	offset;
+};
+
+struct cmd_db_header {
+	uint32	version;
+	uint8	magic[4];
+	cmd_db_rsc_header resources[8];
+	uint32	checksum;
+	uint32	reserved;
+	uint8	data[];
+};
+
+static register_window sCmdDb;
+
+
+/*!	Returns the auxiliary data (the level list of an arc) of \a id. */
+static const uint16*
+cmd_db_levels(const char* id, uint32* _count)
+{
+	const cmd_db_header* header = (const cmd_db_header*)sCmdDb.base;
+	static const uint8 kMagic[] = {0xdb, 0x30, 0x03, 0x0c};
+	if (memcmp(header->magic, kMagic, 4) != 0)
+		return NULL;
+
+	char query[8] = {};
+	memcpy(query, id, strnlen(id, 8));
+	for (int i = 0; i < 8 && header->resources[i].slave_id != 0; i++) {
+		const cmd_db_rsc_header& rsc = header->resources[i];
+		const cmd_db_entry* entry
+			= (const cmd_db_entry*)(header->data + rsc.header_offset);
+		for (int j = 0; j < rsc.count; j++, entry++) {
+			if (memcmp(entry->id, query, 8) == 0) {
+				*_count = entry->length / 2;
+				return (const uint16*)(header->data + rsc.data_offset
+					+ entry->offset);
+			}
+		}
+	}
+	return NULL;
+}
+
+
+struct performance_level {
+	uint32	frequency;	// Hz, 0 = off
+	uint32	level;		// RPMh arc level
+};
+
+
+/*!	The "off" level, then the OPP table of the node compatible with
+	\a compatible, as Linux' a6xx_gmu_build_freq_table() lists them.
+*/
+static uint32
+opp_levels(const char* compatible, performance_level* levels, uint32 max)
+{
+	uint32 count = 0;
+	levels[count++] = {0, 0};
+	int node = fdt_node_offset_by_compatible(gFDT, -1, compatible);
+	int length;
+	const fdt32_t* phandle = node >= 0 ? (const fdt32_t*)fdt_getprop(gFDT,
+		node, "operating-points-v2", &length) : NULL;
+	int table = phandle != NULL
+		? fdt_node_offset_by_phandle(gFDT, fdt32_to_cpu(*phandle)) : -1;
+	if (table < 0)
+		return count;
+	int opp;
+	fdt_for_each_subnode(opp, gFDT, table) {
+		const fdt32_t* hz = (const fdt32_t*)fdt_getprop(gFDT, opp, "opp-hz",
+			&length);
+		const fdt32_t* level = (const fdt32_t*)fdt_getprop(gFDT, opp,
+			"opp-level", NULL);
+		if (hz == NULL || length != 8 || level == NULL || count == max)
+			continue;
+		levels[count++] = {fdt32_to_cpu(hz[1]), fdt32_to_cpu(*level)};
+	}
+	// ascending, like dev_pm_opp_find_freq_ceil() walks them
+	for (uint32 i = 1; i < count; i++) {
+		for (uint32 j = i + 1; j < count; j++) {
+			if (levels[j].frequency < levels[i].frequency) {
+				performance_level swap = levels[i];
+				levels[i] = levels[j];
+				levels[j] = swap;
+			}
+		}
+	}
+	return count;
+}
+
+
+/*!	Linux' a6xx_gmu_rpmh_arc_votes_init(): for each level, the index of the
+	first primary arc level that covers it, and a secondary one.
+*/
+static status_t
+arc_votes(const performance_level* levels, uint32 count, const char* primary,
+	const char* secondary, uint32* votes)
+{
+	uint32 primaryCount, secondaryCount;
+	const uint16* pri = cmd_db_levels(primary, &primaryCount);
+	const uint16* sec = cmd_db_levels(secondary, &secondaryCount);
+	if (pri == NULL || sec == NULL || primaryCount == 0
+		|| secondaryCount == 0) {
+		ERROR("cmd-db has no %s or %s\n", primary, secondary);
+		return B_ENTRY_NOT_FOUND;
+	}
+
+	for (uint32 i = 0; i < count; i++) {
+		uint32 level = levels[i].level;
+		uint32 p = 0, s = 0, j;
+		for (j = 0; j < primaryCount; j++) {
+			if (pri[j] >= level) {
+				p = j;
+				break;
+			}
+		}
+		if (j == primaryCount) {
+			ERROR("level %" B_PRIu32 " not in %s\n", level, primary);
+			return B_BAD_VALUE;
+		}
+		for (j = 0; j < secondaryCount; j++) {
+			if (sec[j] >= level) {
+				s = j;
+				break;
+			} else if (sec[j] != 0)
+				s = j;
+		}
+		votes[i] = (uint32)(pri[p] & 0xffff) << 16 | s << 8 | p;
+	}
+	return B_OK;
+}
+
+
+//	#pragma mark - HFI
+
+
+struct hfi_queue_table_header {
+	uint32	version;
+	uint32	size;
+	uint32	queue_header_offset;
+	uint32	queue_header_size;
+	uint32	queue_count;
+	uint32	active_queues;
+};
+
+struct hfi_queue_header {
+	uint32	status;
+	uint32	iova;
+	uint32	type;
+	uint32	size;
+	uint32	message_size;
+	uint32	dropped;
+	uint32	rx_watermark;
+	uint32	tx_watermark;
+	uint32	rx_request;
+	uint32	tx_request;
+	uint32	read_index;
+	uint32	write_index;
+};
+
+#define HFI_COMMAND_QUEUE		0
+#define HFI_RESPONSE_QUEUE		1
+#define HFI_QUEUE_DWORDS		1024
+
+#define HFI_H2F_MSG_INIT		0
+#define HFI_H2F_MSG_FW_VERSION	1
+#define HFI_H2F_MSG_BW_TABLE	3
+#define HFI_H2F_MSG_PERF_TABLE	4
+#define HFI_H2F_MSG_TEST		5
+#define HFI_H2F_MSG_START		10
+#define HFI_H2F_MSG_CORE_FW_START 14
+#define HFI_H2F_MSG_GX_BW_PERF_VOTE 30
+#define HFI_F2H_MSG_ERROR		100
+
+static hfi_queue_header* sQueueHeaders;
+static uint32* sQueueData[2];
+static uint32 sSequence;
+
+
+/*!	The queue table and the command and response queues, 4 KiB each, in the
+	HFI buffer (Linux' a6xx_hfi_init()). Before the GMU starts.
+*/
+static void
+hfi_init()
+{
+	hfi_queue_table_header* table = (hfi_queue_table_header*)sHfi.virt;
+	sQueueHeaders = (hfi_queue_header*)(table + 1);
+	table->version = 0;
+	table->size = sizeof(*table) + 2 * sizeof(hfi_queue_header);
+	table->queue_header_offset = sizeof(*table) / 4;
+	table->queue_header_size = sizeof(hfi_queue_header) / 4;
+	table->queue_count = 2;
+	table->active_queues = 2;
+	for (uint32 i = 0; i < 2; i++) {
+		hfi_queue_header& header = sQueueHeaders[i];
+		uint32 offset = (i + 1) * B_PAGE_SIZE;
+		sQueueData[i] = (uint32*)(sHfi.virt + offset);
+		header.iova = sHfi.iova + offset;
+		header.type = 10 << 8 | i;
+		header.status = 1;
+		header.size = HFI_QUEUE_DWORDS;
+		header.message_size = 0;
+		header.dropped = 0;
+		header.rx_watermark = 1;
+		header.tx_watermark = 1;
+		header.rx_request = 1;
+		header.tx_request = 0;
+		header.read_index = 0;
+		header.write_index = 0;
+	}
+	memory_full_barrier();
+}
+
+
+static status_t
+hfi_queue_write(const uint32* data, uint32 dwords)
+{
+	volatile hfi_queue_header& header = sQueueHeaders[HFI_COMMAND_QUEUE];
+	uint32 index = header.write_index;
+	uint32 space = (header.read_index - index - 1) & (HFI_QUEUE_DWORDS - 1);
+	if (space < dwords + 3)
+		return B_BUSY;
+	uint32* queue = sQueueData[HFI_COMMAND_QUEUE];
+	for (uint32 i = 0; i < dwords; i++) {
+		queue[index] = data[i];
+		index = (index + 1) % HFI_QUEUE_DWORDS;
+	}
+	for (; index % 4 != 0; index = (index + 1) % HFI_QUEUE_DWORDS)
+		queue[index] = 0xfafafafa;
+	memory_full_barrier();
+	header.write_index = index;
+	memory_full_barrier();
+	gmu_write(GMU_HOST2GMU_INTR_SET, 1);
+	return B_OK;
+}
+
+
+static uint32
+hfi_queue_read(uint32* data, uint32 max)
+{
+	volatile hfi_queue_header& header = sQueueHeaders[HFI_RESPONSE_QUEUE];
+	uint32 index = header.read_index;
+	if (index == header.write_index) {
+		header.rx_request = 1;
+		return 0;
+	}
+	uint32* queue = sQueueData[HFI_RESPONSE_QUEUE];
+	uint32 size = (queue[index] >> 8) & 0xff;
+	if (size > max)
+		size = max;
+	for (uint32 i = 0; i < size; i++) {
+		data[i] = queue[index];
+		index = (index + 1) % HFI_QUEUE_DWORDS;
+	}
+	index = ((index + 3) & ~3u) % HFI_QUEUE_DWORDS;
+	memory_full_barrier();
+	header.read_index = index;
+	return size;
+}
+
+
+/*!	Sends a message (whose first word is left for its header) and waits for
+	the GMU's acknowledgement.
+*/
+static status_t
+hfi_send(uint32 id, uint32* message, uint32 size, uint32* reply = NULL,
+	uint32 replySize = 0)
+{
+	uint32 sequence = ++sSequence % 0xfff;
+	uint32 dwords = size / 4;
+	message[0] = sequence << 20 | 0 << 16 | dwords << 8 | id;
+	status_t status = hfi_queue_write(message, dwords);
+	if (status != B_OK) {
+		ERROR("HFI message %" B_PRIu32 " does not fit the queue\n", id);
+		return status;
+	}
+
+	bigtime_t timeout = system_time() + 1000000;
+	while (system_time() < timeout) {
+		if ((gmu_read(GMU_GMU2HOST_INTR_INFO) & GMU2HOST_MSGQ) == 0) {
+			spin(100);
+			continue;
+		}
+		gmu_write(GMU_GMU2HOST_INTR_CLR, GMU2HOST_MSGQ);
+
+		uint32 response[3 + 16];
+		uint32 length;
+		while ((length = hfi_queue_read(response, B_COUNT_OF(response))) != 0) {
+			if ((response[0] & 0xff) == HFI_F2H_MSG_ERROR) {
+				ERROR("GMU firmware error %" B_PRIu32 "\n", response[1]);
+				continue;
+			}
+			if (length < 3 || ((response[1] >> 20) & 0xfff) != sequence)
+				continue;
+			if (response[2] != 0) {
+				ERROR("HFI message %" B_PRIu32 " failed: %" B_PRIu32 "\n", id,
+					response[2]);
+				return B_ERROR;
+			}
+			if (reply != NULL)
+				memcpy(reply, response + 3, min_c(replySize, (length - 3) * 4));
+			return B_OK;
+		}
+	}
+	ERROR("HFI message %" B_PRIu32 " was not answered\n", id);
+	return B_TIMED_OUT;
+}
+
+
+/*!	Linux' a6xx_hfi_start() for the A650 family: performance and bandwidth
+	tables, the core firmware start, the start.
+*/
+static status_t
+hfi_start()
+{
+	performance_level gpuLevels[16], gmuLevels[4];
+	uint32 gpuCount = opp_levels("qcom,adreno-690.0", gpuLevels, 16);
+	uint32 gmuCount = opp_levels("qcom,adreno-gmu-690.0", gmuLevels, 4);
+
+	struct {
+		uint32	header;
+		uint32	gpu_levels;
+		uint32	gmu_levels;
+		struct { uint32 vote, acd, frequency; } gx[16];
+		struct { uint32 vote, frequency; } cx[4];
+	} perf = {};
+	uint32 gxVotes[16], cxVotes[4];
+	const char* secondary = "mx.lvl";
+	uint32 unused;
+	if (cmd_db_levels("gmxc.lvl", &unused) != NULL)
+		secondary = "gmxc.lvl";
+	if (arc_votes(gpuLevels, gpuCount, "gfx.lvl", secondary, gxVotes) != B_OK
+		|| arc_votes(gmuLevels, gmuCount, "cx.lvl", "mx.lvl", cxVotes)
+			!= B_OK) {
+		return B_ERROR;
+	}
+	perf.gpu_levels = gpuCount;
+	perf.gmu_levels = gmuCount;
+	for (uint32 i = 0; i < gpuCount; i++) {
+		perf.gx[i] = {gxVotes[i], 0xffffffff, gpuLevels[i].frequency / 1000};
+		INFO("GPU level %" B_PRIu32 ": %" B_PRIu32 " kHz, arc %" B_PRIu32
+			", vote %#" B_PRIx32 "\n", i, gpuLevels[i].frequency / 1000,
+			gpuLevels[i].level, gxVotes[i]);
+	}
+	for (uint32 i = 0; i < gmuCount; i++)
+		perf.cx[i] = {cxVotes[i], gmuLevels[i].frequency / 1000};
+	status_t status = hfi_send(HFI_H2F_MSG_PERF_TABLE, (uint32*)&perf,
+		sizeof(perf));
+	if (status != B_OK)
+		return status;
+
+	// the A690's fixed table: one "off" level (Linux' a690_build_bw_table())
+	struct {
+		uint32	header;
+		uint32	bw_level_num;
+		uint32	cnoc_cmds_num;
+		uint32	ddr_cmds_num;
+		uint32	cnoc_wait_bitmask;
+		uint32	ddr_wait_bitmask;
+		uint32	cnoc_cmds_addrs[6];
+		uint32	cnoc_cmds_data[2][6];
+		uint32	ddr_cmds_addrs[8];
+		uint32	ddr_cmds_data[16][8];
+	} bw = {};
+	bw.bw_level_num = 1;
+	bw.ddr_cmds_num = 3;
+	bw.ddr_wait_bitmask = 0x01;
+	bw.ddr_cmds_addrs[0] = 0x50004;
+	bw.ddr_cmds_addrs[1] = 0x50000;
+	bw.ddr_cmds_addrs[2] = 0x500ac;
+	bw.ddr_cmds_data[0][0] = 0x40000000;
+	bw.ddr_cmds_data[0][1] = 0x40000000;
+	bw.ddr_cmds_data[0][2] = 0x40000000;
+	bw.cnoc_cmds_num = 1;
+	bw.cnoc_wait_bitmask = 0x01;
+	bw.cnoc_cmds_addrs[0] = 0x5003c;
+	bw.cnoc_cmds_data[0][0] = 0x40000000;
+	bw.cnoc_cmds_data[1][0] = 0x60000001;
+	status = hfi_send(HFI_H2F_MSG_BW_TABLE, (uint32*)&bw, sizeof(bw));
+	if (status != B_OK)
+		return status;
+
+	uint32 coreStart[2] = {};
+	status = hfi_send(HFI_H2F_MSG_CORE_FW_START, coreStart, sizeof(coreStart));
+	if (status != B_OK)
+		return status;
+
+	uint32 start[1] = {};
+	return hfi_send(HFI_H2F_MSG_START, start, sizeof(start));
+}
+
+
+/*!	Asks the GMU to keep the GPU (GX) powered: the "GPU set" out-of-band
+	request of the A650 family's firmware.
+*/
+static status_t
+gmu_gpu_set()
+{
+	gmu_write(GMU_HOST2GMU_INTR_SET, 1u << 30);
+	if (!gmu_wait(GMU_GMU2HOST_INTR_INFO, 1u << 31, 1u << 31, 100000)) {
+		ERROR("the GMU does not acknowledge the GPU power request (%#" B_PRIx32
+			")\n", gmu_read(GMU_GMU2HOST_INTR_INFO));
+		return B_TIMED_OUT;
+	}
+	gmu_write(GMU_GMU2HOST_INTR_CLR, 1u << 31);
+	return B_OK;
+}
+
+
 //	#pragma mark - bring-up
 
 
@@ -817,11 +1254,38 @@ bring_up()
 	if (firmware == NULL)
 		return B_ENTRY_NOT_FOUND;
 
+	if (sCmdDb.Map("adreno cmd-db", CMD_DB_BASE, CMD_DB_SIZE) != B_OK)
+		return B_NO_MEMORY;
+
+	hfi_init();
 	gmu_rpmh_init();
 	status = gmu_start(firmware, firmwareSize);
 	free(firmware);
 	smmu_report(GMU_CONTEXT_BANK, "after the GMU start");
-	return status;
+	if (status != B_OK)
+		return status;
+
+	status = hfi_start();
+	smmu_report(GMU_CONTEXT_BANK, "after the HFI start");
+	if (status != B_OK)
+		return status;
+	INFO("HFI started\n");
+
+	// the lowest GPU level to start with (Linux' a6xx_gmu_set_initial_freq())
+	uint32 vote[4] = {0, 1, 1, 0};
+	status = hfi_send(HFI_H2F_MSG_GX_BW_PERF_VOTE, vote, sizeof(vote));
+	INFO("GPU level 1 vote: %s\n", strerror(status));
+
+	status = gmu_gpu_set();
+	if (status != B_OK)
+		return status;
+
+	register_window gpu;
+	if (gpu.Map("adreno gpu", GPU_BASE, 0x40000) != B_OK)
+		return B_NO_MEMORY;
+	INFO("GX powered: RBBM status %#" B_PRIx32 "\n", gpu.Read(RBBM_STATUS * 4));
+	gpu.Unmap();
+	return B_OK;
 }
 
 
