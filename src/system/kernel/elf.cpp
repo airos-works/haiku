@@ -2486,6 +2486,10 @@ load_kernel_add_on(const char *path)
 	set_area_protection(image->text_region.id,
 		B_KERNEL_READ_AREA | B_KERNEL_EXECUTE_AREA
 		| (textSectionWritable ? B_KERNEL_WRITE_AREA : 0));
+	// The code was written through the data side; the instruction cache can
+	// still hold what its pages contained before.
+	arch_cpu_sync_icache((void*)image->text_region.start,
+		image->text_region.size);
 
 	// There might be a hole between the two segments, and we don't need to
 	// reserve this any longer
