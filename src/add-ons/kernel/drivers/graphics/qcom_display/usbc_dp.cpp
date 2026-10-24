@@ -57,10 +57,21 @@ static const qmp_setting kDpSerdes[] = {
 	{0x108, 0x00}, {0x044, 0x17}, {0x174, 0x1f},
 };
 
-// RBR (qmp_v4_dp_serdes_tbl_rbr)
-static const qmp_setting kDpSerdesRbr[] = {
-	{0x158, 0x05}, {0x0bc, 0x69}, {0x0d0, 0x80}, {0x0d4, 0x07},
-	{0x0ac, 0x6f}, {0x0b0, 0x08}, {0x0a4, 0x04},
+// per link rate (qmp_v4_dp_serdes_tbl_rbr, _hbr, _hbr2, _hbr3): HSCLK_SEL,
+// DEC_START, DIV_FRAC_START2/3, LOCK_CMP1/2, LOCK_CMP_EN; and the PHY's VCO
+// divider (qmp_v3_configure_dp_clocks)
+static const uint16 kRateRegisters[] = {0x158, 0x0bc, 0x0d0, 0x0d4, 0x0ac,
+	0x0b0, 0x0a4};
+static const struct {
+	uint32	rate;			// MHz of the link symbol clock
+	uint8	values[7];
+	uint8	vcoDivider;
+	uint8	dpcd;			// LINK_BW_SET
+} kRates[] = {
+	{162, {0x05, 0x69, 0x80, 0x07, 0x6f, 0x08, 0x04}, 1, 0x06},
+	{270, {0x03, 0x69, 0x80, 0x07, 0x0f, 0x0e, 0x08}, 1, 0x0a},
+	{540, {0x01, 0x8c, 0x00, 0x0a, 0x1f, 0x1c, 0x08}, 2, 0x14},
+	{810, {0x00, 0x69, 0x80, 0x07, 0x2f, 0x2a, 0x08}, 0, 0x1e},
 };
 
 static const qmp_setting kDpTx[] = {
@@ -159,7 +170,7 @@ UsbcDisplayPort::UsbcDisplayPort()
 	:
 	fGccArea(-1), fGcc(NULL), fDispccArea(-1), fDispcc(NULL), fPhyArea(-1),
 	fPhy(NULL), fControllerArea(-1), fController(NULL), fPort(NULL),
-	fMdssArea(-1), fMdss(NULL), fPowered(false), fRunning(false)
+	fMdssArea(-1), fMdss(NULL), fRate(0), fPowered(false), fRunning(false)
 {
 }
 
@@ -214,7 +225,6 @@ UsbcDisplayPort::_PowerPhy()
 	volatile uint8* com = fPhy + kPhyCom;
 	volatile uint8* serdes = fPhy + kPhyDpSerdes;
 	volatile uint8* dp = fPhy + kPhyDpPhy;
-	volatile uint8* tx[2] = {fPhy + kPhyTxA, fPhy + kPhyTxB};
 
 	wr(com, COM_POWER_DOWN_CTRL, rd(com, COM_POWER_DOWN_CTRL) | 1);
 	wr(com, COM_RESET_OVRD_CTRL, rd(com, COM_RESET_OVRD_CTRL) | 0xf);
@@ -233,16 +243,39 @@ UsbcDisplayPort::_PowerPhy()
 		wr(dp, DP_PHY_AUX_CFG0 + 4 * i, kAux[i]);
 	wr(dp, DP_PHY_AUX_INTERRUPT_MASK, 0x1f);
 
+	return _ConfigureRate(162);
+}
+
+
+/*!	The DP PLL and TX at \a rate (162, 270, 540 or 810 MHz: RBR to HBR3), the
+	lanes as _PowerPhy() leaves them (qmp_combo_dp_power_on(),
+	qmp_v456_configure_dp_phy(), qmp_v4_configure_dp_phy()). */
+status_t
+UsbcDisplayPort::_ConfigureRate(uint32 rate)
+{
+	int32 index = -1;
+	for (size_t i = 0; i < B_COUNT_OF(kRates); i++) {
+		if (kRates[i].rate == rate)
+			index = i;
+	}
+	if (index < 0)
+		return B_BAD_VALUE;
+	volatile uint8* serdes = fPhy + kPhyDpSerdes;
+	volatile uint8* dp = fPhy + kPhyDpPhy;
+	volatile uint8* tx[2] = {fPhy + kPhyTxA, fPhy + kPhyTxB};
+
 	for (const qmp_setting& setting : kDpSerdes)
 		wr(serdes, setting.offset, setting.value);
-	for (const qmp_setting& setting : kDpSerdesRbr)
-		wr(serdes, setting.offset, setting.value);
+	for (size_t i = 0; i < B_COUNT_OF(kRateRegisters); i++)
+		wr(serdes, kRateRegisters[i], kRates[index].values[i]);
+	fRate = rate;
 	for (volatile uint8* lane : tx) {
 		for (const qmp_setting& setting : kDpTx)
 			wr(lane, setting.offset, setting.value);
-		wr(lane, TX_DRV_LVL, 0x28 | 0x20);	// swing, pre-emphasis level 0
-		wr(lane, TX_EMP_POST1_LVL, 0x20 | 0x20);
+		wr(lane, TX_DRV_LVL, 0x27);
+		wr(lane, TX_EMP_POST1_LVL, 0x20);
 	}
+	_SetPhyLevels(0, 0);
 
 	wr(dp, DP_PHY_CFG_1, 0x0f);
 	wr(dp, DP_PHY_PD_CTL, 0x01 | 0x04 | 0x20 | 0x40 | 0x08 | 0x10);
@@ -251,7 +284,7 @@ UsbcDisplayPort::_PowerPhy()
 	wr(dp, DP_PHY_AUX_CFG0 + 8, 0xa4);
 	wr(dp, DP_PHY_TX0_TX1_LANE_CTL, 0x05);
 	wr(dp, DP_PHY_TX2_TX3_LANE_CTL, 0x05);
-	wr(dp, DP_PHY_VCO_DIV, 0x1);			// RBR
+	wr(dp, DP_PHY_VCO_DIV, kRates[index].vcoDivider);
 	wr(dp, DP_PHY_CFG, 0x01);
 	wr(dp, DP_PHY_CFG, 0x05);
 	wr(dp, DP_PHY_CFG, 0x01);
@@ -259,8 +292,8 @@ UsbcDisplayPort::_PowerPhy()
 	wr(serdes, SERDES_RESETSM_CNTRL, 0x20);
 	if (!wait_bits(serdes, SERDES_C_READY_STATUS, 1, 1)
 		|| !wait_bits(serdes, SERDES_CMN_STATUS, 3, 3)) {
-		ERROR("DP-1: the PHY's PLL does not lock (cmn %#" B_PRIx32 ")\n",
-			rd(serdes, SERDES_CMN_STATUS));
+		ERROR("DP-1: the PHY's PLL does not lock at %" B_PRIu32 " MHz (cmn %#"
+			B_PRIx32 ")\n", rate, rd(serdes, SERDES_CMN_STATUS));
 		return B_ERROR;
 	}
 	wr(dp, DP_PHY_CFG, 0x19);
@@ -444,12 +477,19 @@ enum {
 };
 // the PHY's swing and pre-emphasis for RBR and HBR, by level
 // (qmp_dp_v5_voltage_swing_hbr_rbr, qmp_dp_v5_pre_emphasis_hbr_rbr)
-static const uint8 kSwing[4][4] = {
+static const uint8 kSwingLow[4][4] = {
 	{0x28, 0x2f, 0x36, 0x3f}, {0x31, 0x3e, 0x3f, 0xff},
 	{0x36, 0x3f, 0xff, 0xff}, {0x3f, 0xff, 0xff, 0xff}};
-static const uint8 kPreEmphasis[4][4] = {
+static const uint8 kPreEmphasisLow[4][4] = {
 	{0x20, 0x2d, 0x34, 0x3a}, {0x20, 0x2e, 0x35, 0xff},
 	{0x20, 0x2e, 0xff, 0xff}, {0x24, 0xff, 0xff, 0xff}};
+// for HBR2 and HBR3 (qmp_dp_v5_voltage_swing_hbr3_hbr2, _pre_emphasis_)
+static const uint8 kSwingHigh[4][4] = {
+	{0x22, 0x32, 0x36, 0x3a}, {0x29, 0x39, 0x3f, 0xff},
+	{0x30, 0x3f, 0xff, 0xff}, {0x3f, 0xff, 0xff, 0xff}};
+static const uint8 kPreEmphasisHigh[4][4] = {
+	{0x20, 0x2c, 0x35, 0x3b}, {0x22, 0x2e, 0x36, 0xff},
+	{0x22, 0x31, 0xff, 0xff}, {0x24, 0xff, 0xff, 0xff}};
 
 
 //!	msm_dp_ctrl_config_ctrl(), msm_dp_ctrl_lane_mapping(),
@@ -489,18 +529,31 @@ UsbcDisplayPort::_SendPattern(uint32 pattern)
 }
 
 
-//!	The PHY's levels on both TX blocks, and the sink told (DPCD 0x103).
+//!	The PHY's levels on both TX blocks (qmp_combo_configure_dp_swing()).
 status_t
-UsbcDisplayPort::_SetLevels(uint32 swing, uint32 preEmphasis, uint32 lanes)
+UsbcDisplayPort::_SetPhyLevels(uint32 swing, uint32 preEmphasis)
 {
-	if (swing > 3 || preEmphasis > 3 || kSwing[swing][preEmphasis] == 0xff)
+	bool high = fRate > 270;
+	const uint8 (*swings)[4] = high ? kSwingHigh : kSwingLow;
+	const uint8 (*emphases)[4] = high ? kPreEmphasisHigh : kPreEmphasisLow;
+	if (swing > 3 || preEmphasis > 3 || swings[swing][preEmphasis] == 0xff)
 		return B_BAD_VALUE;
 	static const uint32 kLanes[] = {kPhyTxA, kPhyTxB};
 	for (uint32 lane : kLanes) {
-		wr(fPhy + lane, TX_DRV_LVL, kSwing[swing][preEmphasis] | 0x20);
-		wr(fPhy + lane, TX_EMP_POST1_LVL, kPreEmphasis[swing][preEmphasis]
-			| 0x20);
+		wr(fPhy + lane, TX_DRV_LVL, swings[swing][preEmphasis] | 0x20);
+		wr(fPhy + lane, TX_EMP_POST1_LVL, emphases[swing][preEmphasis] | 0x20);
 	}
+	return B_OK;
+}
+
+
+//!	The PHY's levels, and the sink told (DPCD 0x103).
+status_t
+UsbcDisplayPort::_SetLevels(uint32 swing, uint32 preEmphasis, uint32 lanes)
+{
+	status_t status = _SetPhyLevels(swing, preEmphasis);
+	if (status != B_OK)
+		return status;
 	uint8 set[4];
 	for (uint32 i = 0; i < 4; i++) {
 		set[i] = swing | preEmphasis << 3
@@ -531,14 +584,47 @@ UsbcDisplayPort::_Train(uint32* _lanes)
 	INFO("DP-1: sink DPCD %#x, max rate %#x, %" B_PRIu32 " lanes%s%s\n",
 		caps[0], caps[1], lanes, enhanced ? ", enhanced framing" : "",
 		tps3 ? ", TPS3" : "");
+	*_lanes = lanes;
 
+	// the sink's highest rate first, lower ones when that does not train
+	status = B_NOT_SUPPORTED;
+	for (int32 i = B_COUNT_OF(kRates) - 1; i >= 0; i--) {
+		if (kRates[i].dpcd > caps[1])
+			continue;
+		// HBR3 needs TPS3 at least; TPS4 is not used
+		if (kRates[i].rate == 810 && !tps3)
+			continue;
+		if (fRate != kRates[i].rate) {
+			status = _ConfigureRate(kRates[i].rate);
+			if (status != B_OK)
+				continue;
+		}
+		status = _TrainAt(kRates[i].rate, lanes, enhanced, tps3, crDelay,
+			eqDelay);
+		if (status == B_OK)
+			return B_OK;
+	}
+	return status;
+}
+
+
+status_t
+UsbcDisplayPort::_TrainAt(uint32 rate, uint32 lanes, bool enhanced, bool tps3,
+	bigtime_t crDelay, bigtime_t eqDelay)
+{
+	uint8 bandwidth = 0;
+	for (size_t i = 0; i < B_COUNT_OF(kRates); i++) {
+		if (kRates[i].rate == rate)
+			bandwidth = kRates[i].dpcd;
+	}
 	_EnableMainlink(lanes);
-	uint8 link[2] = {0x06, (uint8)(lanes | (enhanced ? 0x80 : 0))};	// RBR
+	uint8 link[2] = {bandwidth, (uint8)(lanes | (enhanced ? 0x80 : 0))};
 	uint8 coding[2] = {0, 1};			// no down spread, 8b/10b
 	if (fPort->WriteDpcd(0x100, link, 2) != B_OK
 		|| fPort->WriteDpcd(0x107, coding, 2) != B_OK)
 		return B_IO_ERROR;
 
+	status_t status = B_OK;
 	uint32 swing = 0, preEmphasis = 0;
 	bool done = false;
 	for (int phase = 1; phase <= 2 && status == B_OK; phase++) {
@@ -580,14 +666,14 @@ UsbcDisplayPort::_Train(uint32* _lanes)
 		}
 		if (status == B_OK && !done)
 			status = B_TIMED_OUT;
-		INFO("DP-1: training %s: %s, swing %" B_PRIu32 " pre-emphasis %"
-			B_PRIu32 "\n", phase == 1 ? "clock recovery" : "equalization",
-			strerror(status), swing, preEmphasis);
+		INFO("DP-1: training at %" B_PRIu32 " MHz, %s: %s, swing %" B_PRIu32
+			" pre-emphasis %" B_PRIu32 "\n", rate,
+			phase == 1 ? "clock recovery" : "equalization", strerror(status),
+			swing, preEmphasis);
 	}
 	uint8 off = 0;
 	fPort->WriteDpcd(0x102, &off, 1);
 	wr(fController, DP_STATE_CTRL, 0);
-	*_lanes = lanes;
 	return status;
 }
 
@@ -611,6 +697,12 @@ UsbcDisplayPort::_Link(const display_timing& timing, bool wideBus)
 	status_t status = _Train(&lanes);
 	if (status != B_OK) {
 		INFO("DP-1: link not trained (%s)\n", strerror(status));
+		// what can be known without a sink: the PLL at each rate
+		for (size_t i = 1; i < B_COUNT_OF(kRates); i++) {
+			INFO("DP-1: PLL at %" B_PRIu32 " MHz: %s\n", kRates[i].rate,
+				_ConfigureRate(kRates[i].rate) == B_OK ? "locked" : "no lock");
+		}
+		_ConfigureRate(162);
 		_EnableMainlink(4);
 		lanes = 4;
 		for (uint32 pattern = 1; pattern <= 3; pattern++) {
@@ -619,12 +711,12 @@ UsbcDisplayPort::_Link(const display_timing& timing, bool wideBus)
 		}
 		wr(fController, DP_STATE_CTRL, 0);
 	}
-	fPort->SetLinkRate(162);
+	fPort->SetLinkRate(fRate);
 	status = fPort->SetStream(timing, wideBus);
 	if (status == B_OK)
 		status = fPort->StartStream();
-	INFO("DP-1: stream on %" B_PRIu32 " lanes at RBR: %s (mainlink ready %#"
-		B_PRIx32 ")\n", lanes, strerror(status),
+	INFO("DP-1: stream on %" B_PRIu32 " lanes at %" B_PRIu32 " MHz: %s "
+		"(mainlink ready %#" B_PRIx32 ")\n", lanes, fRate, strerror(status),
 		rd(fController, DP_MAINLINK_READY));
 }
 
