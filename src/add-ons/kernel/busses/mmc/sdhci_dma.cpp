@@ -8,6 +8,7 @@
 #include <arch/atomic.h>
 #include <vm/vm.h>
 #if defined(__aarch64__)
+#include <arch/arm64/arch_kernel.h>
 #include <arch/arm64/cache_line_size.h>
 
 static void
@@ -23,6 +24,23 @@ evict_allocation(void* memory, size_t size)
 	memory_full_barrier();
 }
 #endif
+
+
+void
+sdhci_clean_dma_alias(phys_addr_t address, size_t size)
+{
+#if defined(__aarch64__)
+	// as the NVMe driver's nvme_dma_clean_alias()
+	uint64 ctr;
+	asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+	size_t lineSize = arm64_data_cache_line_size(ctr);
+	addr_t start = (KERNEL_PMAP_BASE + address) & ~(addr_t)(lineSize - 1);
+	addr_t end = KERNEL_PMAP_BASE + address + size;
+	for (addr_t p = start; p < end; p += lineSize)
+		asm volatile("dc civac, %0" :: "r"(p) : "memory");
+	memory_full_barrier();
+#endif
+}
 
 
 status_t

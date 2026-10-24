@@ -573,6 +573,8 @@ SdhciBus::DoIO(uint8_t command, IOOperation* operation, bool offsetAsSectors)
 			} else
 				memset(fDMABuffer, 0, size);
 			memory_full_barrier();
+			if (fPlatform.dma_coherent)
+				sdhci_clean_dma_alias(fDMAAddress, size);
 		}
 		fRegisters->host_control.SetDMAMode(HostControl::kSdma);
 		fRegisters->system_address = fDMABuffer != NULL ? fDMAAddress : vecs[i].base;
@@ -1103,5 +1105,9 @@ module_info* modules[] = {
 	(module_info* )&gSDHCIACPIDeviceModule,
 	(module_info* )&gSDHCIFDTDriverModule,
 	(module_info* )&gSDHCIFDTDeviceModule,
+#if defined(__aarch64__)
+	(module_info* )&gSDHCIQcomDriverModule,
+	(module_info* )&gSDHCIQcomDeviceModule,
+#endif
 	NULL
 };

@@ -35,6 +35,7 @@
 
 #include <libfdt.h>
 
+#include "qcom_rpmh.h"
 #include "qcom_scm.h"
 
 
@@ -90,10 +91,7 @@ struct register_window {
 static register_window sSmem;
 static register_window sIpcc;
 static register_window sQmp;
-static register_window sRsc;
-static register_window sCmdDb;
 static register_window sMutex;
-static uint32 sTcsOffset;
 static phys_addr_t sRegionBase;
 static size_t sRegionSize;
 static char sFirmwareName[128];
@@ -141,117 +139,9 @@ map_compatible(register_window& window, const char* name,
 // #pragma mark - RPMh
 
 
-/*	The AOP's command DB: the RPMh resources, and the levels of the voltage
-	arcs (Linux' cmd-db.c). */
-
-struct cmd_db_rsc_header {
-	uint16	slave_id;
-	uint16	header_offset;
-	uint16	data_offset;
-	uint16	count;
-	uint16	version;
-	uint16	reserved[3];
-};
-
-struct cmd_db_entry {
-	char	id[8];
-	uint32	priority[2];
-	uint32	address;
-	uint16	length;
-	uint16	offset;
-};
-
-struct cmd_db_header {
-	uint32	version;
-	uint8	magic[4];
-	cmd_db_rsc_header resources[8];
-	uint32	checksum;
-	uint32	reserved;
-	uint8	data[];
-};
-
-
-//!	The address of RPMh resource \a id and its number of levels, if an arc.
-static uint32
-cmd_db_lookup(const char* id, uint32* _levels)
-{
-	const cmd_db_header* header = (const cmd_db_header*)sCmdDb.base;
-	static const uint8 kMagic[] = {0xdb, 0x30, 0x03, 0x0c};
-	if (header == NULL || memcmp((const void*)header->magic, kMagic, 4) != 0)
-		return 0;
-
-	char query[8] = {};
-	memcpy(query, id, strnlen(id, 8));
-	for (int i = 0; i < 8 && header->resources[i].slave_id != 0; i++) {
-		const cmd_db_rsc_header& rsc = header->resources[i];
-		const cmd_db_entry* entry
-			= (const cmd_db_entry*)(header->data + rsc.header_offset);
-		for (int j = 0; j < rsc.count; j++, entry++) {
-			if (memcmp(entry->id, query, 8) == 0) {
-				if (_levels != NULL)
-					*_levels = entry->length / 2;
-				return entry->address;
-			}
-		}
-	}
-	return 0;
-}
-
-
-/*!	One active-mode request through the apps RSC's first active TCS (as
-	rpmh-rsc's tcs_write()), waited for: \a count writes of \a data to
-	\a addresses. */
-static status_t
-rpmh_write(const uint32* addresses, const uint32* data, int count)
-{
-	uint32 version = sRsc.Read(0);
-	bool v3 = ((version >> 16) & 0xff) >= 3;
-	// rpmh_rsc_reg_offset_ver_3_0 / _2_7
-	const uint32 cmdSize = v3 ? 24 : 20;
-	const uint32 irqStatus = 0x04, irqClear = 0x08;
-	const uint32 waitForCompletion = v3 ? 0x20 : 0x10;
-	const uint32 control = v3 ? 0x24 : 0x14, enable = v3 ? 0x2c : 0x1c;
-	const uint32 msgId = v3 ? 0x34 : 0x30, addr = v3 ? 0x38 : 0x34;
-	const uint32 dataRegister = v3 ? 0x3c : 0x38;
-	// TCS 0, the first active one (qcom,tcs-config); the registers from
-	// the TCS base (qcom,tcs-offset)
-	const uint32 tcs = sTcsOffset;
-
-	uint32 mask = 0;
-	for (int i = 0; i < count; i++) {
-		uint32 c = tcs + cmdSize * i;
-		sRsc.Write(c + msgId, 8 | 1u << 16 | 1u << 8);	// write, response
-		sRsc.Write(c + addr, addresses[i]);
-		sRsc.Write(c + dataRegister, data[i]);
-		mask |= 1u << i;
-	}
-	sRsc.Write(tcs + waitForCompletion, mask);
-	sRsc.Write(tcs + enable, mask);
-	// __tcs_set_trigger(): AMC mode, then the trigger
-	uint32 value = sRsc.Read(tcs + control);
-	value &= ~(1u << 24);
-	sRsc.Write(tcs + control, value);
-	value &= ~(1u << 16);
-	sRsc.Write(tcs + control, value);
-	value = 1u << 16;
-	sRsc.Write(tcs + control, value);
-	value |= 1u << 24;
-	sRsc.Write(tcs + control, value);
-
-	bool done = false;
-	for (bigtime_t deadline = system_time() + 100000;
-			system_time() < deadline;) {
-		if ((sRsc.Read(sTcsOffset + irqStatus) & 1) != 0) {
-			done = true;
-			break;
-		}
-		spin(10);
-	}
-	sRsc.Write(sTcsOffset + irqClear, 1);
-	sRsc.Write(tcs + control, 0);
-	sRsc.Write(tcs + enable, 0);
-	return done ? B_OK : B_TIMED_OUT;
-}
+// the first of the apps RSC's active TCSes (sdhci votes through the second)
+static const uint32 kAdspTcs = 0;
+static qcom_rpmh sRpmh;
 
 
 //!	Votes the arc \a name to \a level, or to its top level when negative.
@@ -259,13 +149,13 @@ static status_t
 arc_vote(const char* name, int32 level)
 {
 	uint32 levels = 0;
-	uint32 address = cmd_db_lookup(name, &levels);
+	uint32 address = qcom_cmd_db_address(sRpmh, name, &levels);
 	if (address == 0 || levels == 0) {
 		ERROR("no arc %s in the command DB\n", name);
 		return B_DEVICE_NOT_FOUND;
 	}
 	uint32 value = level < 0 ? levels - 1 : (uint32)level;
-	status_t status = rpmh_write(&address, &value, 1);
+	status_t status = qcom_rpmh_write(sRpmh, kAdspTcs, &address, &value, 1);
 	TRACE("%s (%#" B_PRIx32 ", %" B_PRIu32 " levels) to %" B_PRIu32 ": %s\n",
 		name, address, levels, value, strerror(status));
 	return status;
@@ -1414,8 +1304,7 @@ unmap_all()
 	sSmem.Unmap();
 	sIpcc.Unmap();
 	sQmp.Unmap();
-	sRsc.Unmap();
-	sCmdDb.Unmap();
+	qcom_rpmh_uninit(sRpmh);
 	sMutex.Unmap();
 }
 
@@ -1441,28 +1330,13 @@ qcom_adsp_init_driver(device_node* node, void** _cookie)
 	}
 	strlcpy(sFirmwareName, firmware, sizeof(sFirmwareName));
 
-	int rsc = fdt_compatible_node("qcom,rpmh-rsc");
-	const fdt32_t* drvId = rsc >= 0 ? (const fdt32_t*)fdt_getprop(gFDT, rsc,
-		"qcom,drv-id", NULL) : NULL;
-	const fdt32_t* tcsOffset = rsc >= 0 ? (const fdt32_t*)fdt_getprop(gFDT,
-		rsc, "qcom,tcs-offset", NULL) : NULL;
-	if (drvId == NULL || tcsOffset == NULL) {
-		ERROR("no apps RSC in the device tree\n");
-		return B_DEVICE_NOT_FOUND;
-	}
-	sTcsOffset = fdt32_to_cpu(*tcsOffset);
-
 	status_t status = map_compatible(sSmem, "qcom adsp smem", "qcom,smem");
 	if (status == B_OK)
 		status = map_compatible(sIpcc, "qcom adsp ipcc", "qcom,ipcc");
 	if (status == B_OK)
 		status = map_compatible(sQmp, "qcom adsp aoss qmp", "qcom,aoss-qmp");
-	if (status == B_OK) {
-		status = map_compatible(sRsc, "qcom adsp apps rsc", "qcom,rpmh-rsc",
-			fdt32_to_cpu(*drvId));
-	}
 	if (status == B_OK)
-		status = map_compatible(sCmdDb, "qcom adsp cmd-db", "qcom,cmd-db");
+		status = qcom_rpmh_init(sRpmh);
 	if (status == B_OK)
 		status = map_compatible(sMutex, "qcom adsp mutex", "qcom,tcsr-mutex");
 	if (status != B_OK) {
