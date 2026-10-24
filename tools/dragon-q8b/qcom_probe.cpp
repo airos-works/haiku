@@ -259,7 +259,44 @@ probe()
 				rd(dispcc, 0x2078), rd(dispcc, 0x2090));
 			bool mdssOn = (gdsc & (1u << 31)) != 0 && clock_on(dispcc, 0x20bc)
 				&& clock_on(dispcc, 0x200c);
+			// DisplayPort controller 2 (the HDMI bridge): its clocks and the
+			// pixel and link RCGs (CMD, CFG, M, N, D)
+			bool dp2On = mdssOn && clock_on(dispcc, 0x20a4)
+				&& clock_on(dispcc, 0x2090);
+			dprintf("qcom_probe: dptx2 aux %#" B_PRIx32 " link %#" B_PRIx32
+				" link intf %#" B_PRIx32 " pixel0 %#" B_PRIx32 " pixel rcg %#"
+				B_PRIx32 " %#" B_PRIx32 " %#" B_PRIx32 " %#" B_PRIx32 " %#"
+				B_PRIx32 " link rcg %#" B_PRIx32 " %#" B_PRIx32 "\n",
+				rd(dispcc, 0x20a4), rd(dispcc, 0x2090), rd(dispcc, 0x2094),
+				rd(dispcc, 0x207c), rd(dispcc, 0x2208), rd(dispcc, 0x220c),
+				rd(dispcc, 0x2210), rd(dispcc, 0x2214), rd(dispcc, 0x2218),
+				rd(dispcc, 0x2284), rd(dispcc, 0x2288));
 			delete_area(area);
+			if (dp2On) {
+				volatile uint8* dp = map({"probe dp2", 0xae9a000, 0x2000}, area);
+				if (dp != NULL) {
+					volatile uint8* aux = dp + 0x200;
+					volatile uint8* link = dp + 0x400;
+					dprintf("qcom_probe: dp2 version %#" B_PRIx32 " intr %#"
+						B_PRIx32 " %#" B_PRIx32 " hpd ctrl %#" B_PRIx32
+						" hpd status %#" B_PRIx32 " aux ctrl %#" B_PRIx32
+						" aux status %#" B_PRIx32 " limits %#" B_PRIx32 "\n",
+						rd(dp, 0x0), rd(dp, 0x20), rd(dp, 0x24), rd(aux, 0x0),
+						rd(aux, 0x4), rd(aux, 0x30), rd(aux, 0x44),
+						rd(aux, 0x40));
+					dprintf("qcom_probe: dp2 mainlink %#" B_PRIx32 " state %#"
+						B_PRIx32 " config %#" B_PRIx32 " mvid %#" B_PRIx32
+						" nvid %#" B_PRIx32 " total %#" B_PRIx32 " start %#"
+						B_PRIx32 " sync %#" B_PRIx32 " active %#" B_PRIx32
+						" misc %#" B_PRIx32 " ready %#" B_PRIx32 " tu %#" B_PRIx32
+						" lanes %#" B_PRIx32 "\n", rd(link, 0x0), rd(link, 0x4),
+						rd(link, 0x8), rd(link, 0x10), rd(link, 0x18),
+						rd(link, 0x1c), rd(link, 0x20), rd(link, 0x24),
+						rd(link, 0x28), rd(link, 0x2c), rd(link, 0x40),
+						rd(link, 0x4c), rd(link, 0x38));
+					delete_area(area);
+				}
+			}
 			if (mdssOn) {
 				volatile uint8* mdss = map({"probe mdss", 0xae00000, 0x100000},
 					area);
@@ -276,6 +313,62 @@ probe()
 							rd(mdss, 0x35000 + 0x1000 * i + 0x8),
 							rd(mdss, 0x35000 + 0x1000 * i + 0xa8));
 					}
+					// what feeds the timing engines (DPU 8.0 offsets from the
+					// MDP block at +0x1000, Linux's dpu_8_0_sc8280xp.h):
+					// control paths, layer mixers and source pipes in use
+					volatile uint8* mdp = mdss + 0x1000;
+					for (int i = 0; i < 6; i++) {
+						volatile uint8* ctl = mdp + 0x15000 + 0x1000 * i;
+						dprintf("qcom_probe: ctl %d layer %#" B_PRIx32 " %#"
+							B_PRIx32 " %#" B_PRIx32 " %#" B_PRIx32 " %#" B_PRIx32
+							" top %#" B_PRIx32 " intf %#" B_PRIx32 " fetch %#"
+							B_PRIx32 " pipes %#" B_PRIx32 " layers %#" B_PRIx32
+							"\n", i, rd(ctl, 0x0), rd(ctl, 0x4), rd(ctl, 0x8),
+							rd(ctl, 0xc), rd(ctl, 0x10), rd(ctl, 0x14),
+							rd(ctl, 0xf4), rd(ctl, 0xfc), rd(ctl, 0x12c),
+							rd(ctl, 0x130));
+					}
+					for (int i = 0; i < 6; i++) {
+						volatile uint8* lm = mdp + 0x44000 + 0x1000 * i;
+						dprintf("qcom_probe: lm %d op %#" B_PRIx32 " out %#"
+							B_PRIx32 " border %#" B_PRIx32 "\n", i, rd(lm, 0x0),
+							rd(lm, 0x4), rd(lm, 0x8));
+					}
+					static const uint32 kPipes[] = {0x4000, 0x6000, 0x8000,
+						0xa000, 0x24000, 0x26000, 0x28000, 0x2a000};
+					for (int i = 0; i < 8; i++) {
+						volatile uint8* pipe = mdp + kPipes[i];
+						dprintf("qcom_probe: sspp %#" B_PRIx32 " src %#" B_PRIx32
+							" xy %#" B_PRIx32 " out %#" B_PRIx32 " oxy %#" B_PRIx32
+							" addr %#" B_PRIx32 " stride %#" B_PRIx32 " format %#"
+							B_PRIx32 " unpack %#" B_PRIx32 " op %#" B_PRIx32 "\n",
+							kPipes[i], rd(pipe, 0x0), rd(pipe, 0x8),
+							rd(pipe, 0xc), rd(pipe, 0x10), rd(pipe, 0x14),
+							rd(pipe, 0x24), rd(pipe, 0x30), rd(pipe, 0x34),
+							rd(pipe, 0x38));
+					}
+					// the DisplayPort INTFs (0, 4, 5, 6): their timing
+					static const uint32 kInterfaces[] = {0x34000, 0x38000,
+						0x39000, 0x3a000};
+					for (int i = 0; i < 4; i++) {
+						volatile uint8* intf = mdp + kInterfaces[i];
+						if (rd(intf, 0x0) == 0)
+							continue;
+						dprintf("qcom_probe: intf %#" B_PRIx32 " config %#"
+							B_PRIx32 " hsync %#" B_PRIx32 " vperiod %#" B_PRIx32
+							" vpulse %#" B_PRIx32 " vstart %#" B_PRIx32 " vend %#"
+							B_PRIx32 " hctl %#" B_PRIx32 " polarity %#" B_PRIx32
+							" panel %#" B_PRIx32 " config2 %#" B_PRIx32
+							" line %#" B_PRIx32 "\n", kInterfaces[i],
+							rd(intf, 0x4), rd(intf, 0x8), rd(intf, 0xc),
+							rd(intf, 0x14), rd(intf, 0x1c), rd(intf, 0x24),
+							rd(intf, 0x3c), rd(intf, 0x50), rd(intf, 0x90),
+							rd(intf, 0x60), rd(intf, 0xb0));
+					}
+					dprintf("qcom_probe: mdp top split %#" B_PRIx32 " clk %#"
+						B_PRIx32 " intr en %#" B_PRIx32 " %#" B_PRIx32 "\n",
+						rd(mdp, 0x2f4), rd(mdp, 0x2ac), rd(mdp, 0x10),
+						rd(mdp, 0x20));
 					delete_area(area);
 				}
 			}
