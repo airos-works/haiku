@@ -446,6 +446,20 @@ fch_time(uint32 offset)
 }
 
 
+//	#pragma mark - fan
+
+
+/*!	Framework laptops: the Chrome EC memory map at I/O 0xe00 ("EC" at 0xe20)
+	has fan 1's speed (rpm) at 0xe10. Returns -1 elsewhere. */
+static int32
+ec_fan_rpm()
+{
+	if (in8(0xe20) != 'E' || in8(0xe21) != 'C')
+		return -1;
+	return in16(0xe10);
+}
+
+
 //	#pragma mark - RTC alarm
 
 
@@ -799,6 +813,11 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 	}
 
 	int32 wakeupEvents = device_manager_wakeup_events();
+	// the fan, whenever the CPU wakes up in the sleep
+	int32 fanFirst = ec_fan_rpm();
+	int32 fanMax = fanFirst;
+	int32 fanLast = fanFirst;
+	uint32 fanSamples = 0;
 	atomic_set(&sActive, 1);
 	uint32 rounds = 0;
 	uint32 ignoredWakeups = 0;
@@ -820,6 +839,11 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 			}
 			cpu_idle();
 			rounds++;
+			if (fanFirst >= 0) {
+				fanLast = ec_fan_rpm();
+				fanMax = std::max(fanMax, fanLast);
+				fanSamples++;
+			}
 		}
 		// (the alarm's SCI may have been taken for another one)
 		if (atomic_get(&sAlarmFired) != 0) {
@@ -914,5 +938,10 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 		idleMask);
 	if (lidPolls != 0)
 		INFO("looked at the lid %" B_PRIu32 " times\n", lidPolls);
+	if (fanFirst >= 0) {
+		INFO("fan in the sleep: %" B_PRId32 " rpm at the start, at most %"
+			B_PRId32 ", %" B_PRId32 " at the end (%" B_PRIu32 " looks)\n",
+			fanFirst, fanMax, fanLast, fanSamples);
+	}
 	return B_OK;
 }
