@@ -24,8 +24,10 @@
 	- MSM_INFO_GET_OFFSET returns 0; only IOVA, SET_IOVA, FLAGS and NAME of
 	  DRM_MSM_GEM_INFO are answered.
 	- One GPU address space for every open (no per-process page tables
-	  yet): VA_START/VA_SIZE describe the part userland may place buffers
-	  in with SET_IOVA; buffers without one get an address from the driver.
+	  yet): each process gets a window of its own, which VA_START/VA_SIZE
+	  describe and SET_IOVA must stay in, so that two processes never put
+	  buffers at the same address; buffers without one get an address from
+	  the driver.
 	- Sync objects are per open; there is no DRM prime/dma-buf. */
 
 

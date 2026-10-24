@@ -60,6 +60,16 @@ int32 api_version = B_CUR_DRIVER_API_VERSION;
 // buffers without an address of userland's get one up here
 #define KERNEL_VA_START			(ADRENO_VA_USER_START + ADRENO_VA_USER_SIZE / 2)
 
+/*	Every open shares the one GPU address space (no per-process page tables
+	yet), so each team gets a window of its own below KERNEL_VA_START for the
+	addresses it chooses (MSM_PARAM_VA_START/VA_SIZE, which Turnip allocates
+	from): two processes would otherwise put buffers at the same address,
+	and one's mapping would replace the other's. All opens of a team share
+	its window (Turnip asks for it on one and places buffers on another). */
+#define FILE_VA_WINDOW			(8ull * 1024 * 1024 * 1024)
+#define FILE_VA_WINDOWS			((KERNEL_VA_START - ADRENO_VA_USER_START) \
+									/ FILE_VA_WINDOW)
+
 
 static const char* sDeviceNames[] = { "graphics/adreno/0", NULL };
 
@@ -68,6 +78,8 @@ static const char* sDeviceNames[] = { "graphics/adreno/0", NULL };
 
 
 struct Buffer {
+	Buffer*		next;		// in sBuffers
+	Buffer*		previous;
 	int32		references;
 	area_id		area;
 	uint8*		address;
@@ -81,6 +93,15 @@ struct Buffer {
 
 static mutex sVaLock = MUTEX_INITIALIZER("adreno va");
 static uint64 sKernelVaNext = KERNEL_VA_START;
+static struct {
+	team_id		team;
+	int32		opens;			// 0: free
+} sVaWindows[FILE_VA_WINDOWS];
+
+
+// every buffer, for the fault dump
+static mutex sBuffersLock = MUTEX_INITIALIZER("adreno buffers");
+static Buffer* sBuffers;
 
 
 static Buffer*
@@ -102,7 +123,48 @@ buffer_create(uint64 size, uint32 flags)
 		return NULL;
 	}
 	memset(buffer->address, 0, buffer->size);
+	MutexLocker locker(sBuffersLock);
+	buffer->next = sBuffers;
+	if (sBuffers != NULL)
+		sBuffers->previous = buffer;
+	sBuffers = buffer;
 	return buffer;
+}
+
+
+/*!	The buffers at \a iova and their words there, for the fault dump. */
+void
+adreno_dump_buffer(uint64 iova, int32 count)
+{
+	MutexLocker locker(sBuffersLock);
+	int32 found = 0;
+	for (Buffer* buffer = sBuffers; buffer != NULL; buffer = buffer->next) {
+		if (buffer->iova == 0 || iova < buffer->iova
+			|| iova >= buffer->iova + buffer->size) {
+			continue;
+		}
+		found++;
+		uint64 offset = iova - buffer->iova;
+		dprintf("adreno: fault: buffer %#" B_PRIx64 "+%#" B_PRIxSIZE " flags %#"
+			B_PRIx32 " \"%s\", offset %#" B_PRIx64 ", last fence %" B_PRIu32
+			"\n", buffer->iova, buffer->size, buffer->flags, buffer->name, offset,
+			buffer->lastFence);
+		uint32* words = (uint32*)(buffer->address + offset);
+		for (int32 i = 0; i < count && offset + i * 4 + 16 <= buffer->size;
+				i += 4) {
+			dprintf("adreno: buffer %#" B_PRIx64 ": %08" B_PRIx32 " %08" B_PRIx32
+				" %08" B_PRIx32 " %08" B_PRIx32 "\n", iova + i * 4, words[i],
+				words[i + 1], words[i + 2], words[i + 3]);
+		}
+		phys_addr_t physical = 0;
+		physical_entry entry;
+		if (get_memory_map(words, 4, &entry, 1) == B_OK)
+			physical = entry.address;
+		dprintf("adreno: fault: the CPU's page is at %#" B_PRIxPHYSADDR "\n",
+			physical);
+	}
+	if (found == 0)
+		dprintf("adreno: fault: no buffer at %#" B_PRIx64 "\n", iova);
 }
 
 
@@ -140,6 +202,15 @@ buffer_release(Buffer* buffer)
 {
 	if (atomic_add(&buffer->references, -1) != 1)
 		return;
+	{
+		MutexLocker locker(sBuffersLock);
+		if (buffer->previous != NULL)
+			buffer->previous->next = buffer->next;
+		else
+			sBuffers = buffer->next;
+		if (buffer->next != NULL)
+			buffer->next->previous = buffer->previous;
+	}
 	buffer_unmap(buffer);
 	delete_area(buffer->area);
 	free(buffer);
@@ -284,6 +355,9 @@ struct File {
 	uint32		syncobjCount;
 	uint32		nextQueue;
 	uint32		lastFence;
+	uint64		vaStart;	// its window of the address space
+	uint64		vaSize;
+	int32		vaWindow;
 };
 
 
@@ -389,10 +463,10 @@ get_param(File* file, drm_msm_param* param)
 			param->value = adreno_faults();
 			return B_OK;
 		case MSM_PARAM_VA_START:
-			param->value = ADRENO_VA_USER_START;
+			param->value = file->vaStart;
 			return B_OK;
 		case MSM_PARAM_VA_SIZE:
-			param->value = KERNEL_VA_START - ADRENO_VA_USER_START;
+			param->value = file->vaSize;
 			return B_OK;
 		case MSM_PARAM_HIGHEST_BANK_BIT:
 			param->value = ADRENO_HIGHEST_BANK_BIT;
@@ -486,6 +560,17 @@ gem_info(File* file, drm_msm_gem_info* args)
 				return B_OK;
 			if (buffer->iova != 0)
 				return EBUSY;
+			// only in its own window
+			if (args->value < file->vaStart
+				|| args->value + buffer->size > file->vaStart + file->vaSize) {
+				static int32 sReported;
+				if (atomic_add(&sReported, 1) < 8) {
+					ERROR("SET_IOVA %#" B_PRIx64 "+%#" B_PRIxSIZE " outside the "
+						"open's window %#" B_PRIx64 "+%#" B_PRIx64 "\n",
+						args->value, buffer->size, file->vaStart, file->vaSize);
+				}
+				return EINVAL;
+			}
 			return buffer_map(buffer, args->value) == B_OK ? B_OK : EINVAL;
 		case MSM_INFO_GET_FLAGS:
 			args->value = buffer->flags;
@@ -591,8 +676,16 @@ gem_submit(File* file, drm_msm_gem_submit* args)
 	MutexLocker locker(file->lock);
 	for (uint32 i = 0; status == B_OK && i < args->nr_bos; i++) {
 		buffers[i] = lookup_buffer(file, bos[i].handle);
-		if (buffers[i] == NULL || buffers[i]->iova == 0)
+		if (buffers[i] == NULL || buffers[i]->iova == 0) {
+			static int32 sReported;
+			if (atomic_add(&sReported, 1) < 8) {
+				ERROR("submit: buffer %" B_PRIu32 " (handle %" B_PRIu32 ") %s\n",
+					i, bos[i].handle, buffers[i] == NULL
+						? "does not exist" : "has no address");
+			}
+			buffers[i] = NULL;
 			status = EINVAL;
+		}
 		else {
 			atomic_add(&buffers[i]->references, 1);
 			bos[i].presumed = buffers[i]->iova;
@@ -605,6 +698,13 @@ gem_submit(File* file, drm_msm_gem_submit* args)
 			|| (cmd.size & 3) != 0 || cmd.size == 0
 			|| (uint64)cmd.submit_offset + cmd.size
 				> buffers[cmd.submit_idx]->size) {
+			static int32 sReported;
+			if (atomic_add(&sReported, 1) < 8) {
+				ERROR("submit: command %" B_PRIu32 " refused: type %" B_PRIu32
+					" buffer %" B_PRIu32 " offset %#" B_PRIx32 " size %#" B_PRIx32
+					" relocs %" B_PRIu32 "\n", i, cmd.type, cmd.submit_idx,
+					cmd.submit_offset, cmd.size, cmd.nr_relocs);
+			}
 			status = EINVAL;
 		} else if (cmd.type == MSM_SUBMIT_CMD_BUF
 			|| cmd.type == MSM_SUBMIT_CMD_CTX_RESTORE_BUF) {
@@ -964,12 +1064,38 @@ syncobj_transfer(File* file, drm_syncobj_transfer* args)
 static status_t
 adreno_open(const char* name, uint32 flags, void** _cookie)
 {
-	status_t status = adreno_gpu_start();
-	if (status != B_OK)
-		return status;
+	// The GPU comes up at the first request, not here: app_server opens
+	// every graphics device at boot to ask for an accelerant, before the
+	// firmware may be in place.
 	File* file = (File*)calloc(1, sizeof(File));
 	if (file == NULL)
 		return B_NO_MEMORY;
+	{
+		MutexLocker vaLocker(sVaLock);
+		team_id team = team_get_current_team_id();
+		file->vaWindow = -1;
+		for (uint32 i = 0; i < FILE_VA_WINDOWS; i++) {
+			if (sVaWindows[i].opens > 0 && sVaWindows[i].team == team) {
+				file->vaWindow = i;
+				break;
+			}
+		}
+		for (uint32 i = 0; file->vaWindow < 0 && i < FILE_VA_WINDOWS; i++) {
+			if (sVaWindows[i].opens == 0) {
+				sVaWindows[i].team = team;
+				file->vaWindow = i;
+			}
+		}
+		if (file->vaWindow >= 0)
+			sVaWindows[file->vaWindow].opens++;
+	}
+	if (file->vaWindow < 0) {
+		ERROR("no GPU address window left for another team\n");
+		free(file);
+		return B_BUSY;
+	}
+	file->vaStart = ADRENO_VA_USER_START + file->vaWindow * FILE_VA_WINDOW;
+	file->vaSize = FILE_VA_WINDOW;
 	mutex_init(&file->lock, "adreno file");
 	file->nextQueue = 1;
 	*_cookie = file;
@@ -1000,6 +1126,10 @@ adreno_free(void* cookie)
 	mutex_unlock(&sSyncLock);
 	free(file->syncobjs);
 	mutex_destroy(&file->lock);
+	{
+		MutexLocker vaLocker(sVaLock);
+		sVaWindows[file->vaWindow].opens--;
+	}
 	free(file);
 	return B_OK;
 }
@@ -1259,7 +1389,9 @@ adreno_control(void* cookie, uint32 op, void* buffer, size_t length)
 		return B_BAD_ADDRESS;
 	}
 
-	status_t status = dispatch(file, nr, data);
+	status_t status = adreno_gpu_start();
+	if (status == B_OK)
+		status = dispatch(file, nr, data);
 	if (copy > 0 && user_memcpy(buffer, data, copy) != B_OK && status == B_OK)
 		status = B_BAD_ADDRESS;
 	return status;

@@ -58,10 +58,10 @@
 #                           drives a GPU
 #   AIROS_CI_ADRENO         (arm64) the Dragon Q8B's GPU user land: a tree
 #                           copied to system/non-packaged/adreno (Turnip,
-#                           zink's EGL vendor library, libvulkan.so.1, the
-#                           GPU firmware), which the boot script links into
-#                           system/non-packaged where the adreno driver
-#                           publishes the GPU
+#                           zink's EGL vendor library, libvulkan.so.1), which
+#                           the boot script links into system/non-packaged
+#                           where the adreno driver publishes the GPU; its
+#                           firmware comes with AIROS_CI_FIRMWARE
 #   AIROS_CI_IMAGE_SIZE     image size in MiB (optional)
 #   HAIKU_RPI_FIRMWARE_DIR  (Pi) the Raspberry Pi boot firmware files
 #

@@ -254,16 +254,16 @@ JSON
 # The tree the arm64 image carries as system/non-packaged/adreno
 # (AIROS_CI_ADRENO in tools/airos/ci/UserBuildConfig), which its boot script
 # links into system/non-packaged where the adreno driver publishes the GPU:
-# Turnip and libvulkan.so.1 in lib, the GPU firmware and its licence
-# (FIRMWARE=<directory>, as tools/dragon-q8b/fetch-gpu-firmware.sh fills
-# it), and the EGL vendor file, sorting before
+# Turnip and libvulkan.so.1 in lib, and the EGL vendor file, sorting before
 # the ROCK 5's Panfrost one, that names this EGL vendor library in place.
+# The GPU firmware is not in it: the driver needs it before the boot script
+# runs, so it goes in the image's firmware tree (AIROS_CI_FIRMWARE, from
+# tools/dragon-q8b/fetch-gpu-firmware.sh).
 userland() {
-	local tree=$OUT/adreno fw=${FIRMWARE:-$WORK/dragon/firmware} f
+	local tree=$OUT/adreno
 	[ -f "$OUT/libEGL_mesa.so.0" ] || { echo "run collect first" >&2; exit 1; }
 	rm -rf "$tree"
-	mkdir -p "$tree/lib" "$tree/add-ons/opengl/egl_vendor.d" \
-		"$tree/data/firmware/qcom/sc8280xp"
+	mkdir -p "$tree/lib" "$tree/add-ons/opengl/egl_vendor.d"
 	cp "$OUT/libvulkan_freedreno.so" "$OUT/libvulkan.so.1" \
 		"$OUT/libEGL_mesa.so.0" "$tree/lib/"
 	cat > "$tree/add-ons/opengl/egl_vendor.d/05_mesa_adreno.json" <<'JSON'
@@ -274,11 +274,6 @@ userland() {
   }
 }
 JSON
-	cp "$fw/qcom/a660_sqe.fw" "$fw/qcom/a660_gmu.bin" "$tree/data/firmware/qcom/"
-	cp "$fw/qcom/sc8280xp/qcdxkmsuc8280.mbn" "$tree/data/firmware/qcom/sc8280xp/"
-	for f in LICENSE.qcom NOTICE.qcom; do
-		[ ! -f "$fw/$f" ] || cp "$fw/$f" "$tree/data/firmware/qcom/"
-	done
 	(cd "$tree" && find . -type f | sort | xargs sha256sum) > "$OUT/adreno.MANIFEST"
 	log "user land in $tree"
 }

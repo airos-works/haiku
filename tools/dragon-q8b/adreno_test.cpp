@@ -201,6 +201,87 @@ main()
 	printf("1000 submissions: %s, %lld us\n", strerror(error),
 		(long long)(system_time() - start));
 
+	// coherency: every submission a new command buffer, written by the CPU
+	// just before, at a new place (CP_MEM_WRITE of a new value into a word
+	// the CPU cleared); what the CP fetches must be what the CPU wrote
+	{
+		drm_msm_gem_new big = {};
+		big.size = 4 * 1024 * 1024;
+		big.flags = MSM_BO_CACHED_COHERENT;
+		uint64 bigIova = iova + 0x1000000;
+		drm_msm_gem_info bigInfo = {};
+		adreno_haiku_map_bo bigMap = {};
+		if (msm(DRM_MSM_GEM_NEW, &big, sizeof(big)) == 0) {
+			bigInfo.handle = big.handle;
+			bigInfo.info = MSM_INFO_SET_IOVA;
+			bigInfo.value = bigIova;
+			msm(DRM_MSM_GEM_INFO, &bigInfo, sizeof(bigInfo));
+			bigMap.handle = big.handle;
+			call(ADRENO_HAIKU_NR_MAP_BO, &bigMap, sizeof(bigMap));
+		}
+		uint32* bigWords = (uint32*)(addr_t)bigMap.address;
+		drm_msm_gem_submit_bo bigBo = {};
+		bigBo.flags = MSM_SUBMIT_BO_READ | MSM_SUBMIT_BO_WRITE;
+		bigBo.handle = big.handle;
+		uint32 wrong = 0, failed = 0, runs = 20000;
+		start = system_time();
+		for (uint32 run = 0; bigWords != NULL && run < runs; run++) {
+			// a 64-byte command buffer in the first 3 MiB, the result word
+			// in the last MiB
+			uint32 slot = (run * 7919) % (3 * 1024 * 1024 / 64);
+			uint32* commands = bigWords + slot * 16;
+			uint32 result = 3 * 1024 * 1024 / 4 + (run % (256 * 1024));
+			uint64 target = bigIova + result * 4;
+			uint32 value = 0x5a000000u ^ run;
+			bigWords[result] = 0;
+			commands[0] = pkt7(0x3d, 3);
+			commands[1] = (uint32)target;
+			commands[2] = (uint32)(target >> 32);
+			commands[3] = value;
+			drm_msm_gem_submit_cmd bigCmd = {};
+			bigCmd.type = MSM_SUBMIT_CMD_BUF;
+			bigCmd.submit_offset = slot * 64;
+			bigCmd.size = 16;
+			drm_msm_gem_submit bigSubmit = {};
+			bigSubmit.flags = MSM_PIPE_3D0;
+			bigSubmit.nr_bos = 1;
+			bigSubmit.nr_cmds = 1;
+			bigSubmit.bos = (addr_t)&bigBo;
+			bigSubmit.cmds = (addr_t)&bigCmd;
+			bigSubmit.queueid = queue.id;
+			if (msm(DRM_MSM_GEM_SUBMIT, &bigSubmit, sizeof(bigSubmit)) != 0) {
+				failed++;
+				continue;
+			}
+			drm_msm_wait_fence bigWait = {};
+			bigWait.fence = bigSubmit.fence;
+			bigWait.queueid = queue.id;
+			bigtime_t bigDeadline = system_time() + 1000000;
+			bigWait.timeout.tv_sec = bigDeadline / 1000000;
+			bigWait.timeout.tv_nsec = (bigDeadline % 1000000) * 1000;
+			if (msm(DRM_MSM_WAIT_FENCE, &bigWait, sizeof(bigWait)) != 0) {
+				failed++;
+				break;
+			}
+			if (bigWords[result] != value) {
+				if (wrong++ < 8) {
+					printf("run %" B_PRIu32 ": slot %" B_PRIu32 " word %#"
+						B_PRIx32 ", not %#" B_PRIx32 "\n", run, slot,
+						bigWords[result], value);
+				}
+			}
+		}
+		printf("coherency: %" B_PRIu32 " runs, %" B_PRIu32 " wrong, %" B_PRIu32
+			" failed, %lld us\n", runs, wrong, failed,
+			(long long)(system_time() - start));
+		if (wrong != 0 || failed != 0)
+			error = B_ERROR;
+		drm_gem_close bigClose = {};
+		bigClose.handle = big.handle;
+		call(ADRENO_HAIKU_NR_GEM_CLOSE, &bigClose, sizeof(bigClose));
+		delete_area(bigMap.area);
+	}
+
 	drm_gem_close close_ = {};
 	close_.handle = gem.handle;
 	call(ADRENO_HAIKU_NR_GEM_CLOSE, &close_, sizeof(close_));
