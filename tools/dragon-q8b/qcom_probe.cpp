@@ -1311,6 +1311,29 @@ dp_phy_test()
 			wr32(tx[lane], kTxEmpPost1Level, 0x20);
 		}
 	}
+	if (ready) {
+		// dispcc 0: DP0's link RCG (0x21a4) from the PHY's link clock
+		// (disp_cc_parent_map_0: source 1), undivided, then its link
+		// branch: running only if the PHY's clock comes
+		area_id dispccArea;
+		volatile uint8* dispcc = map_rw({"probe dispcc dp0", 0xaf00000,
+			0x20000}, dispccArea);
+		if (dispcc != NULL) {
+			uint32 cfg = rd(dispcc, 0x21a8);
+			wr32(dispcc, 0x21a8, (cfg & ~(7u << 8 | 0x1fu)) | 1u << 8);
+			wr32(dispcc, 0x21a4, rd(dispcc, 0x21a4) | 1);
+			wait_bits(dispcc, 0x21a4, 1, 0);
+			uint32 before = rd(dispcc, 0x205c);
+			wr32(dispcc, 0x205c, before | 1);
+			bool running = wait_bits(dispcc, 0x205c, 1u << 31, 0);
+			dprintf("qcom_probe: dp phy: dp0 link rcg cfg %#" B_PRIx32 " -> %#"
+				B_PRIx32 " (cmd %#" B_PRIx32 "), link branch %#" B_PRIx32
+				" -> %#" B_PRIx32 ": %s\n", cfg, rd(dispcc, 0x21a8),
+				rd(dispcc, 0x21a4), before, rd(dispcc, 0x205c),
+				running ? "running" : "off");
+			delete_area(dispccArea);
+		}
+	}
 	dprintf("qcom_probe: dp phy: PLL %s, PHY %s (c_ready %#" B_PRIx32
 		" cmn %#" B_PRIx32 " dp phy status %#" B_PRIx32 ")\n",
 		locked ? "locked" : "not locked", ready ? "ready" : "not ready",
