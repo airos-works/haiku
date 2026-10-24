@@ -26,6 +26,8 @@
 
 #include <libfdt.h>
 
+#include "a690_tables.h"
+
 
 extern void* gFDT;
 
@@ -90,6 +92,10 @@ int32 api_version = B_CUR_DRIVER_API_VERSION;
 #define GMU_RSCC_CONTROL_REQ	0x23b07
 #define GMU_RSCC_CONTROL_ACK	0x23b08
 #define GMU_AHB_FENCE_RANGE_0	0x23b11
+#define GPU_GMU_GX_SPTPRAC_CLOCK_CONTROL 0x1a880
+#define GPU_GMU_AO_GMU_CGC_MODE_CNTL 0x23b09
+#define GPU_GMU_AO_GMU_CGC_DELAY_CNTL 0x23b0a
+#define GPU_GMU_AO_GMU_CGC_HYST_CNTL 0x23b0b
 
 // RSCC registers, 32 bit word offsets
 #define RSCC_RSC_STATUS0_DRV0	0x0004
@@ -123,6 +129,8 @@ int32 api_version = B_CUR_DRIVER_API_VERSION;
 
 // GPU registers (32 bit words), GX side
 #define RBBM_STATUS				0x0210
+
+#define GPU_SIZE				0x40000
 
 #define CMD_DB_BASE				0x80860000
 #define CMD_DB_SIZE				0x20000
@@ -192,7 +200,11 @@ int32 api_version = B_CUR_DRIVER_API_VERSION;
 
 #define GMU_STREAM_ID			0x5
 #define GMU_STREAM_MASK			0xc00
-#define GMU_CONTEXT_BANK		0
+// Linux' Adreno SMMU keeps context bank 0 for the GPU (its CP switches
+// that bank's page tables), the GMU gets the next one
+#define GPU_CONTEXT_BANK		0
+#define GMU_CONTEXT_BANK		1
+#define GPU_STREAM_MASK			0xc00
 
 
 struct register_window {
@@ -1186,6 +1198,297 @@ gmu_gpu_set()
 }
 
 
+//	#pragma mark - GPU
+
+
+/*	The GPU's own address space (context bank 0, streams 0 and 1), and what
+	Linux' a6xx hw_init() and a6xx_cp_init() do with it. */
+
+#define GPU_VA_SQE				0x01000000
+#define GPU_VA_RING				0x01100000
+#define GPU_VA_MEMPTRS			0x01200000
+#define GPU_VA_SCRATCH			0x01300000
+#define RING_SIZE				(32 * 1024)
+
+#define CP_TYPE4_PKT			(4u << 28)
+#define CP_TYPE7_PKT			(7u << 28)
+#define CP_NOP					0x10
+#define CP_MEM_WRITE			0x3d
+#define CP_ME_INIT				0x48
+#define CP_SET_SECURE_MODE		0x66
+
+static AddressSpace sGpuSpace;
+static register_window sGpu;
+static gmu_buffer sSqe, sRing, sMemptrs, sScratch;
+static uint32 sRingNext;
+
+
+static inline uint32
+gpu_read(uint32 reg)
+{
+	return sGpu.Read(reg * 4);
+}
+
+
+static inline void
+gpu_write(uint32 reg, uint32 value)
+{
+	sGpu.Write(reg * 4, value);
+}
+
+
+static inline void
+gpu_write64(uint32 reg, uint64 value)
+{
+	gpu_write(reg, (uint32)value);
+	gpu_write(reg + 1, (uint32)(value >> 32));
+}
+
+
+static inline uint32
+pm4_parity(uint32 value)
+{
+	return (0x9669 >> (0xf & (value ^ (value >> 4) ^ (value >> 8)
+		^ (value >> 12) ^ (value >> 16) ^ (value >> 20) ^ (value >> 24)
+		^ (value >> 28)))) & 1;
+}
+
+
+static inline uint32
+pkt7(uint32 opcode, uint32 count)
+{
+	return CP_TYPE7_PKT | count | pm4_parity(count) << 15
+		| (opcode & 0x7f) << 16 | pm4_parity(opcode) << 23;
+}
+
+
+static void
+ring_emit(uint32 value)
+{
+	((uint32*)sRing.virt)[sRingNext] = value;
+	sRingNext = (sRingNext + 1) % (RING_SIZE / 4);
+}
+
+
+static void
+ring_flush()
+{
+	memory_full_barrier();
+	gpu_write(REG_A6XX_CP_RB_WPTR, sRingNext);
+}
+
+
+static uint32
+ring_rptr()
+{
+	return ((volatile uint32*)sMemptrs.virt)[0];
+}
+
+
+static bool
+gpu_idle(const char* what)
+{
+	bigtime_t timeout = system_time() + 1000000;
+	while (ring_rptr() != sRingNext || gpu_read(REG_A6XX_CP_RB_RPTR)
+			!= sRingNext) {
+		if (system_time() > timeout) {
+			ERROR("%s: the CP does not drain its ring: rptr %" B_PRIu32
+				" (register %" B_PRIu32 ") wptr %" B_PRIu32 ", status %#"
+				B_PRIx32 ", interrupts %#" B_PRIx32 "\n", what, ring_rptr(),
+				gpu_read(REG_A6XX_CP_RB_RPTR), sRingNext,
+				gpu_read(REG_A6XX_RBBM_STATUS),
+				gpu_read(REG_A6XX_RBBM_INT_0_STATUS));
+			return false;
+		}
+		spin(10);
+	}
+	// no block busy but the hang detector (bit 0 is "GPU busy ignoring AHB")
+	timeout = system_time() + 1000000;
+	while ((gpu_read(REG_A6XX_RBBM_STATUS) & ~1u) != 0) {
+		if (system_time() > timeout) {
+			ERROR("%s: the GPU stays busy: status %#" B_PRIx32 "\n", what,
+				gpu_read(REG_A6XX_RBBM_STATUS));
+			return false;
+		}
+		spin(10);
+	}
+	return true;
+}
+
+
+static status_t
+gpu_buffer(gmu_buffer& buffer, const char* name, size_t size, uint32 address)
+{
+	buffer.size = (size + B_PAGE_SIZE - 1) & ~(size_t)(B_PAGE_SIZE - 1);
+	buffer.iova = address;
+	buffer.area = create_area(name, (void**)&buffer.virt, B_ANY_KERNEL_ADDRESS,
+		buffer.size, B_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
+	if (buffer.area < 0)
+		return buffer.area;
+	memset(buffer.virt, 0, buffer.size);
+	physical_entry entry;
+	get_memory_map(buffer.virt, buffer.size, &entry, 1);
+	// the GPU's accesses are I/O coherent through the SMMU's cached attribute
+	return sGpuSpace.MapArea(buffer.virt, buffer.size, address, ATTR_CACHED,
+		false);
+}
+
+
+static status_t
+gpu_hw_init()
+{
+	if (sGpu.Map("adreno gpu", GPU_BASE, GPU_SIZE) != B_OK)
+		return B_NO_MEMORY;
+
+	status_t status = sGpuSpace.Init();
+	if (status != B_OK)
+		return status;
+	size_t sqeSize;
+	uint8* sqe = (uint8*)load_firmware("qcom/a660_sqe.fw", &sqeSize);
+	if (sqe == NULL)
+		return B_ENTRY_NOT_FOUND;
+	if (gpu_buffer(sSqe, "adreno sqe", sqeSize, GPU_VA_SQE) != B_OK
+		|| gpu_buffer(sRing, "adreno ring", RING_SIZE, GPU_VA_RING) != B_OK
+		|| gpu_buffer(sMemptrs, "adreno memptrs", B_PAGE_SIZE, GPU_VA_MEMPTRS)
+			!= B_OK
+		|| gpu_buffer(sScratch, "adreno scratch", B_PAGE_SIZE, GPU_VA_SCRATCH)
+			!= B_OK) {
+		free(sqe);
+		return B_NO_MEMORY;
+	}
+	// the firmware's first word is not loaded (adreno_fw_create_bo())
+	memcpy(sSqe.virt, sqe + 4, sqeSize - 4);
+	INFO("SQE firmware version %#" B_PRIx32 "\n", ((uint32*)sqe)[1]);
+	free(sqe);
+	memory_full_barrier();
+
+	smmu_attach(0, 0x0, GPU_STREAM_MASK, GPU_CONTEXT_BANK, sGpuSpace);
+	smmu_attach(1, 0x1, GPU_STREAM_MASK, GPU_CONTEXT_BANK, sGpuSpace);
+
+	// GBIF out of halt, no trusted memory range, 64 bit addressing
+	gpu_write(REG_A6XX_GBIF_HALT, 0);
+	gpu_read(REG_A6XX_GBIF_HALT);
+	gpu_write(REG_A6XX_RBBM_GBIF_HALT, 0);
+	gpu_read(REG_A6XX_RBBM_GBIF_HALT);
+	gpu_write(REG_A6XX_RBBM_SECVID_TSB_CNTL, 0);
+	gpu_write64(REG_A6XX_RBBM_SECVID_TSB_TRUSTED_BASE, 0);
+	gpu_write(REG_A6XX_RBBM_SECVID_TSB_TRUSTED_SIZE, 0);
+	static const uint32 kAddressModes[] = {
+		REG_A6XX_CP_ADDR_MODE_CNTL, REG_A6XX_VSC_ADDR_MODE_CNTL,
+		REG_A6XX_GRAS_ADDR_MODE_CNTL, REG_A6XX_RB_ADDR_MODE_CNTL,
+		REG_A6XX_PC_ADDR_MODE_CNTL, REG_A6XX_HLSQ_ADDR_MODE_CNTL,
+		REG_A6XX_VFD_ADDR_MODE_CNTL, REG_A6XX_VPC_ADDR_MODE_CNTL,
+		REG_A6XX_UCHE_ADDR_MODE_CNTL, REG_A6XX_SP_ADDR_MODE_CNTL,
+		REG_A6XX_TPL1_ADDR_MODE_CNTL,
+		REG_A6XX_RBBM_SECVID_TSB_ADDR_MODE_CNTL,
+	};
+	for (uint32 reg : kAddressModes)
+		gpu_write(reg, 1);
+
+	// hardware clock gating (a6xx_set_hwcg(), A690 values)
+	gmu_write(GPU_GMU_AO_GMU_CGC_MODE_CNTL, 0x00020200);
+	gmu_write(GPU_GMU_AO_GMU_CGC_DELAY_CNTL, 0x10111);
+	gmu_write(GPU_GMU_AO_GMU_CGC_HYST_CNTL, 0x5555);
+	gmu_write(GPU_GMU_GX_SPTPRAC_CLOCK_CONTROL,
+		gmu_read(GPU_GMU_GX_SPTPRAC_CLOCK_CONTROL) & ~1u);
+	for (size_t i = 0; i < B_COUNT_OF(kA690ClockGating); i++)
+		gpu_write(kA690ClockGating[i].offset, kA690ClockGating[i].value);
+	gmu_write(GPU_GMU_GX_SPTPRAC_CLOCK_CONTROL,
+		gmu_read(GPU_GMU_GX_SPTPRAC_CLOCK_CONTROL) | 1u);
+	gpu_write(REG_A6XX_RBBM_CLOCK_CNTL, 0x8aa8aa82);
+
+	// GBIF
+	gpu_write(REG_A6XX_GBIF_QSB_SIDE0, 0x00071620);
+	gpu_write(REG_A6XX_GBIF_QSB_SIDE1, 0x00071620);
+	gpu_write(REG_A6XX_GBIF_QSB_SIDE2, 0x00071620);
+	gpu_write(REG_A6XX_GBIF_QSB_SIDE3, 0x00071620);
+	gpu_write(REG_A6XX_RBBM_GBIF_CLIENT_QOS_CNTL, 0x3);
+	gpu_write(REG_A6XX_RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
+
+	// UCHE: the trap range at the top of the address space
+	const uint64 trapBase = 0x1fffffffff000ull;
+	gpu_write64(REG_A6XX_UCHE_WRITE_RANGE_MAX, trapBase + 0xfc0);
+	gpu_write64(REG_A6XX_UCHE_TRAP_BASE, trapBase);
+	gpu_write64(REG_A6XX_UCHE_WRITE_THRU_BASE, trapBase);
+	gpu_write(REG_A6XX_UCHE_FILTER_CNTL, 0x804);
+	gpu_write(REG_A6XX_UCHE_CACHE_WAYS, 0x4);
+	gpu_write(REG_A6XX_CP_ROQ_THRESHOLDS_2, 0x02000140);
+	gpu_write(REG_A6XX_CP_ROQ_THRESHOLDS_1, 0x8040362c);
+	gpu_write(REG_A6XX_CP_LPAC_PROG_FIFO_SIZE, 0x00000020);
+	gpu_write(REG_A6XX_CP_MEM_POOL_SIZE, 128);
+	gpu_write(REG_A6XX_PC_DBG_ECO_CNTL, 0x00800200);
+	gpu_write(REG_A6XX_CP_AHB_CNTL, 0x1);
+	gpu_write(REG_A6XX_RBBM_PERFCTR_CNTL, 0x1);
+	gpu_write(REG_A6XX_CP_PERFCTR_CP_SEL(0), 0);
+
+	// UBWC 4.0, highest bank bit 16, level 2 swizzling on, macrotiles
+	const uint32 hbb = 16 - 13, hbbHi = hbb >> 2, hbbLo = hbb & 3;
+	gpu_write(REG_A6XX_RB_NC_MODE_CNTL, 1u << 11 | hbbHi << 10 | 1u << 4
+		| hbbLo << 1);
+	gpu_write(REG_A6XX_TPL1_NC_MODE_CNTL, hbbHi << 4 | hbbLo << 1);
+	gpu_write(REG_A6XX_SP_NC_MODE_CNTL, hbbHi << 10 | 2u << 4 | hbbLo << 1);
+	gpu_write(REG_A6XX_UCHE_MODE_CNTL, hbbLo << 21);
+	gpu_write(REG_A6XX_RBBM_NC_MODE_CNTL, 1);
+
+	gpu_write(REG_A6XX_RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | 0x4fffff);
+	gpu_write(REG_A6XX_UCHE_CLIENT_PF, 1u << 7 | 0x1);
+	gpu_write(REG_A6XX_TPL1_BICUBIC_WEIGHTS_TABLE(0), 0);
+	gpu_write(REG_A6XX_TPL1_BICUBIC_WEIGHTS_TABLE(1), 0x3fe05ff4);
+	gpu_write(REG_A6XX_TPL1_BICUBIC_WEIGHTS_TABLE(2), 0x3fa0ebee);
+	gpu_write(REG_A6XX_TPL1_BICUBIC_WEIGHTS_TABLE(3), 0x3f5193ed);
+	gpu_write(REG_A6XX_TPL1_BICUBIC_WEIGHTS_TABLE(4), 0x3f0243f0);
+
+	// CP register protection
+	gpu_write(REG_A6XX_CP_PROTECT_CNTL, 1u << 0 | 1u << 1 | 1u << 3);
+	for (size_t i = 0; i < B_COUNT_OF(kA690Protect) - 1; i++) {
+		if (kA690Protect[i] != 0)
+			gpu_write(REG_A6XX_CP_PROTECT(i), kA690Protect[i]);
+	}
+	gpu_write(REG_A6XX_CP_PROTECT(A690_PROTECT_COUNT - 1),
+		kA690Protect[B_COUNT_OF(kA690Protect) - 1]);
+
+	gpu_write(REG_A6XX_CP_CHICKEN_DBG, 0x00028801);
+	gpu_write(REG_A6XX_RBBM_GBIF_CLIENT_QOS_CNTL, 0x0);
+	gpu_write(REG_A6XX_UCHE_CMDQ_CONFIG, 0x90);
+	gpu_write(REG_A6XX_CP_APRIV_CNTL, 1u << 6 | 1u << 5 | 1u << 3 | 1u << 2
+		| 1u << 1);
+	gpu_write(REG_A6XX_RBBM_INT_0_MASK, 0);
+
+	// the ring: 32 KiB, 32 byte blocks, the hardware's rptr shadow
+	gpu_write64(REG_A6XX_CP_SQE_INSTR_BASE, sSqe.iova);
+	gpu_write64(REG_A6XX_CP_RB_BASE, sRing.iova);
+	gpu_write(REG_A6XX_CP_RB_CNTL, 12u | 2u << 8);
+	gpu_write64(REG_A6XX_CP_RB_RPTR_ADDR, sMemptrs.iova);
+	sRingNext = 0;
+
+	gpu_write(REG_A6XX_CP_SQE_CNTL, 1);
+
+	ring_emit(pkt7(CP_ME_INIT, 8));
+	ring_emit(0x0000002f);
+	ring_emit(0x00000003);
+	ring_emit(0x20000000);
+	for (int i = 0; i < 5; i++)
+		ring_emit(0);
+	ring_flush();
+	if (!gpu_idle("CP_ME_INIT"))
+		return B_TIMED_OUT;
+	INFO("the CP runs its ring (rptr %" B_PRIu32 ")\n", ring_rptr());
+
+	// a test: the CP writes a word to memory
+	ring_emit(pkt7(CP_MEM_WRITE, 3));
+	ring_emit((uint32)sScratch.iova);
+	ring_emit(0);
+	ring_emit(0xcafe0690);
+	ring_flush();
+	bool idle = gpu_idle("CP_MEM_WRITE");
+	memory_full_barrier();
+	INFO("CP_MEM_WRITE: %s, memory reads %#" B_PRIx32 "\n",
+		idle ? "done" : "timed out", ((volatile uint32*)sScratch.virt)[0]);
+	return idle && ((volatile uint32*)sScratch.virt)[0] == 0xcafe0690
+		? B_OK : B_ERROR;
+}
+
+
 //	#pragma mark - bring-up
 
 
@@ -1241,7 +1544,7 @@ bring_up()
 		ERROR("GMU memory\n");
 		return B_NO_MEMORY;
 	}
-	smmu_attach(0, GMU_STREAM_ID, GMU_STREAM_MASK, GMU_CONTEXT_BANK,
+	smmu_attach(2, GMU_STREAM_ID, GMU_STREAM_MASK, GMU_CONTEXT_BANK,
 		sGmuSpace);
 	INFO("GMU stream %#x routed to context bank %d, SCTLR %#" B_PRIx32
 		", page tables at %#" B_PRIxPHYSADDR "\n", GMU_STREAM_ID,
@@ -1280,12 +1583,9 @@ bring_up()
 	if (status != B_OK)
 		return status;
 
-	register_window gpu;
-	if (gpu.Map("adreno gpu", GPU_BASE, 0x40000) != B_OK)
-		return B_NO_MEMORY;
-	INFO("GX powered: RBBM status %#" B_PRIx32 "\n", gpu.Read(RBBM_STATUS * 4));
-	gpu.Unmap();
-	return B_OK;
+	status = gpu_hw_init();
+	smmu_report(GPU_CONTEXT_BANK, "after the GPU start");
+	return status;
 }
 
 
