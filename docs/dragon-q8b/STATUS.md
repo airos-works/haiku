@@ -6,7 +6,7 @@ table set and a device tree; the kernel prefers the device tree.
 
 | Area | State | Evidence |
 |---|---|---|
-| Boot (UEFI, NVMe) | air/OS installs onto the NVMe with the arm64 ISO's Installer ("whole disk") and boots to the desktop | Samsung PM981; `haiku_loader` page-aligned RX/RW sections for the firmware's W^X |
+| Boot (UEFI, NVMe) | air/OS installs onto the NVMe with the arm64 ISO's Installer ("whole disk") and boots to the desktop; checked again with the CI image of 2026-10-24 (display, GPU, video codec and their firmware all in it) | Samsung PM981; `haiku_loader` page-aligned RX/RW sections for the firmware's W^X |
 | Serial console | the GENI debug UART carries the kernel log | loader re-votes the QUP2 SE1 clocks after ExitBootServices |
 | Clock | the firmware's GetTime(), passed as `haiku,firmware-clock` | |
 | Ethernet (2 x 2.5GbE, TC9563 switch, QCA8081 PHYs) | both ports, 1 Gbit/s tested (the lab switch is gigabit), DHCP; 106 MB/s down, 73 MB/s up | `tc956x` driver; MACs from the board's I2C EEPROM |
@@ -19,7 +19,7 @@ table set and a device tree; the kernel prefers the device tree.
 | Video decode (Iris) | H.264 and HEVC Main (eight bit 4:2:0, up to 4096x2304) on the codec, through the Media Kit (`qcom_video` add-on, FFmpeg fallback for what it does not decode) and airTime | `qcom_iris` driver, linux-firmware's `qcom/vpu/vpu20_p4.mbn`; byte-exact with libavcodec at 320x240, 720p and 1080p; 1080p H.264 at 306 pictures/s, 720p HEVC at 568/s through the Media Kit, at under one core |
 | Video encode | H.264 High and HEVC Main on the codec (`qcom_video`'s IrisEncoder), in MediaConverter as the "Iris" hardware backend | 720p H.264 transcoded at 531 pictures/s (36.4 dB luma PSNR), HEVC at 596/s (35.2 dB); 1080p at ~320 pictures/s; several teams can use the codec at once |
 | Applications | Amp, Burrow, DeckCraft, GridCraft, Kiri, Mail, PdfCraft, WordCraft, airShot and airTime open their windows on the NVMe install; LightCraft and PhotoCraft draw with Vulkan on Turnip; Snap runs its effects through zink at 60 frames/s (1 ms a frame); Summit plays video on the codec | the boot script sets the ROCK 5's Panfrost EGL vendor aside on the Dragon: with both Mesas in one team Snap crashed making its second context current |
-| SD card | SDHC2 is clocked by the firmware (SDHCI v3); no card in the slot yet, and `sdhci_fdt` needs a Qualcomm glue | |
+| SD card | no driver yet (`sdhci_fdt` needs a Qualcomm glue); the lab probe brings SDHC2 up without one: its supplies on through RPMh (L9C and L6C at 2.96 V, `ldoc9`/`ldoc6` in cmd-db, apps RSC v2.4), the sdhci-msm v5 power handshake (0x240..0x24c), a 343 kHz card clock (the firmware runs the core clock at XO/14 = 1.37 MHz, not the 200 MHz the capabilities say); no card answers CMD8 | card detect (GPIO 131) reads low even with a pull-up, so it says nothing; the SD stream (0x4e0) goes through context bank 2 with the firmware's tables, so a driver needs its own SMMU context or PIO |
 
 ## Known problems
 
@@ -29,10 +29,12 @@ table set and a device tree; the kernel prefers the device tree.
   restart.
 - Each process gets an 8 GiB window of the one GPU address space (no
   per-process GPU page tables yet).
-- NVMe: now and then, at boot, the controller completes a command the host
-  did not submit (generic status 0x0b, as from a zeroed submission entry);
-  it is logged and skipped instead of panicking, and the command it took
-  the place of times out once.
+- NVMe: now and then (2 of 109 logged boots) the controller completed a
+  zeroed submission entry while the slot held the real command: arm64's
+  NVMe DMA memory is noncached, the cached linear map's stale line of it
+  answered the controller's read on the Dragon's cache-coherent PCIe. The
+  driver now cleans those lines before the doorbell; whether that ends it
+  takes more boots to tell (the entry is still logged and skipped).
 - Summit showed only digits of page text on arm64 CI installs: it includes
   `/boot/system/settings/fonts/fonts.conf`, which only x86_64's fontconfig
   package provides, so it found only its emoji fonts. arm64 CI images now

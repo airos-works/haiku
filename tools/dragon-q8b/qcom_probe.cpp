@@ -10,6 +10,7 @@
 	drivers/dev/misc by hand; publishes nothing. */
 
 
+#include <string.h>
 #include <Drivers.h>
 #include <KernelExport.h>
 #include <arch/atomic.h>
@@ -58,6 +59,9 @@ map_rw(const region& r, area_id& area)
 		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&address);
 	return area < 0 ? NULL : address;
 }
+
+
+static void sd_identify();
 
 
 static inline void
@@ -428,6 +432,435 @@ probe()
 			delete_area(area);
 		}
 	}
+
+	// the apps SMMU: how the SD controller's stream (0x4e0) is routed
+	{
+		area_id area;
+		volatile uint8* smmu = map({"probe apps smmu", 0x15000000, 0x1000},
+			area);
+		if (smmu != NULL) {
+			uint32 groups = rd(smmu, 0x20) & 0xff;
+			dprintf("qcom_probe: apps smmu sCR0 %#" B_PRIx32 ", %" B_PRIu32
+				" stream groups\n", rd(smmu, 0), groups);
+			for (uint32 i = 0; i < groups; i++) {
+				uint32 smr = rd(smmu, 0x800 + 4 * i);
+				if ((smr & (1u << 31)) == 0)
+					continue;
+				uint32 id = smr & 0xffff, mask = (smr >> 16) & 0x7fff;
+				if (((id ^ 0x4e0) & ~mask & 0x7fff) != 0)
+					continue;
+				dprintf("qcom_probe: apps smmu SMR%" B_PRIu32 " id %#" B_PRIx32
+					" mask %#" B_PRIx32 " S2CR %#" B_PRIx32 "\n", i, id, mask,
+					rd(smmu, 0xc00 + 4 * i));
+			}
+			delete_area(area);
+		}
+	}
+
+	// the SD slot's card detect (TLMM GPIO 131, low with a card in) and its
+	// pin configuration, and the SD pins' (sdc2 clk/cmd/data in their own
+	// register)
+	{
+		area_id area;
+		volatile uint8* tlmm = map_rw({"probe tlmm", 0xf100000 + 131 * 0x1000,
+			0x1000}, area);
+		if (tlmm != NULL) {
+			uint32 cfg = rd(tlmm, 0), io = rd(tlmm, 4);
+			dprintf("qcom_probe: sd card detect gpio131 cfg %#" B_PRIx32
+				" in/out %#" B_PRIx32 "\n", cfg, io);
+			// as sdc2-default-state wants it: gpio, 2 mA, no bias (the
+			// board pulls it up); the firmware leaves a pull-down
+			*(volatile uint32*)tlmm = 0;
+			spin(1000);
+			io = rd(tlmm, 4);
+			dprintf("qcom_probe: sd card detect, no bias: in/out %#" B_PRIx32
+				": %s\n", io, (io & 1) == 0 ? "card in" : "no card");
+			// and with the pin's own pull-up, in case the board's is to a
+			// supply that is off
+			*(volatile uint32*)tlmm = 3;
+			spin(1000);
+			io = rd(tlmm, 4);
+			dprintf("qcom_probe: sd card detect, pull-up: in/out %#" B_PRIx32
+				": %s\n", io, (io & 1) == 0 ? "card in" : "no card");
+			*(volatile uint32*)tlmm = 0;
+			sd_identify();
+			delete_area(area);
+		}
+	}
+}
+
+
+// #pragma mark - SD card identification (no data transfers, so no DMA)
+
+
+static inline void
+wr8(volatile uint8* base, uint32 offset, uint8 value)
+{
+	base[offset] = value;
+}
+
+
+static inline void
+wr16(volatile uint8* base, uint32 offset, uint16 value)
+{
+	*(volatile uint16*)(base + offset) = value;
+}
+
+
+static inline void
+wr32(volatile uint8* base, uint32 offset, uint32 value)
+{
+	*(volatile uint32*)(base + offset) = value;
+}
+
+
+static inline uint16
+rd16(volatile uint8* base, uint32 offset)
+{
+	return *(volatile uint16*)(base + offset);
+}
+
+
+// #pragma mark - RPMh (the SD card's supplies)
+
+
+struct probe_cmd_db_rsc {
+	uint16	slave_id;
+	uint16	header_offset;
+	uint16	data_offset;
+	uint16	count;
+	uint16	version;
+	uint16	reserved[3];
+};
+
+struct probe_cmd_db_entry {
+	char	id[8];
+	uint32	priority[2];
+	uint32	address;
+	uint16	length;
+	uint16	offset;
+};
+
+struct probe_cmd_db_header {
+	uint32	version;
+	uint8	magic[4];
+	probe_cmd_db_rsc resources[8];
+	uint32	checksum;
+	uint32	reserved;
+	uint8	data[];
+};
+
+
+//!	An RPMh resource's address from the command DB, 0 when it has none.
+static uint32
+cmd_db_address(const char* id)
+{
+	area_id area;
+	volatile uint8* base = map({"probe cmd-db", 0x80860000, 0x20000}, area);
+	if (base == NULL)
+		return 0;
+	const probe_cmd_db_header* header = (const probe_cmd_db_header*)base;
+	uint32 address = 0;
+	static const uint8 kMagic[] = {0xdb, 0x30, 0x03, 0x0c};
+	char query[8] = {};
+	memcpy(query, id, strnlen(id, 8));
+	if (memcmp((const void*)header->magic, kMagic, 4) == 0) {
+		for (int i = 0; i < 8 && header->resources[i].slave_id != 0
+				&& address == 0; i++) {
+			const probe_cmd_db_rsc& rsc = header->resources[i];
+			const probe_cmd_db_entry* entry = (const probe_cmd_db_entry*)
+				(header->data + rsc.header_offset);
+			for (int j = 0; j < rsc.count; j++, entry++) {
+				if (memcmp(entry->id, query, 8) == 0) {
+					address = entry->address;
+					break;
+				}
+			}
+		}
+	}
+	delete_area(area);
+	return address;
+}
+
+
+/*!	One active-mode request on the apps RSC (DRV 2, its first active TCS, as
+	rpmh-rsc's tcs_write()): \a count writes of \a data to \a addresses,
+	each waited for. */
+static bool
+rpmh_write(const uint32* addresses, const uint32* data, int count)
+{
+	area_id area;
+	volatile uint8* drv = map_rw({"probe apps rsc", 0x18220000, 0x10000},
+		area);
+	if (drv == NULL)
+		return false;
+	uint32 version = rd(drv, 0);
+	uint32 major = (version >> 16) & 0xff;
+	// rpmh_rsc_reg_offset_ver_3_0 / _2_7
+	bool v3 = major >= 3;
+	const uint32 tcsSize = 672, cmdSize = v3 ? 24 : 20;
+	const uint32 irqStatus = 0x04, irqClear = 0x08;
+	const uint32 waitForCompletion = v3 ? 0x20 : 0x10;
+	const uint32 control = v3 ? 0x24 : 0x14, enableRegister = v3 ? 0x2c : 0x1c;
+	const uint32 msgId = v3 ? 0x34 : 0x30, addr = v3 ? 0x38 : 0x34;
+	const uint32 dataRegister = v3 ? 0x3c : 0x38, cmdStatus = v3 ? 0x40 : 0x3c;
+	volatile uint8* tcs = drv + 0xd00;
+	const int tcsId = 0;
+	volatile uint8* t = tcs + tcsSize * tcsId;
+
+	uint32 enable = 0;
+	for (int i = 0; i < count; i++) {
+		volatile uint8* c = t + cmdSize * i;
+		wr32(c, msgId, 8 | 1u << 16 | 1u << 8);	// write, response wanted
+		wr32(c, addr, addresses[i]);
+		wr32(c, dataRegister, data[i]);
+		enable |= 1u << i;
+	}
+	wr32(t, waitForCompletion, enable);
+	wr32(t, enableRegister, enable);
+	// __tcs_set_trigger(): AMC mode on, then the trigger
+	uint32 value = rd(t, control);
+	value &= ~(1u << 24);
+	wr32(t, control, value);
+	value &= ~(1u << 16);
+	wr32(t, control, value);
+	value = 1u << 16;
+	wr32(t, control, value);
+	value |= 1u << 24;
+	wr32(t, control, value);
+
+	bigtime_t deadline = system_time() + 100000;
+	bool done = false;
+	while (system_time() < deadline) {
+		if ((rd(tcs, irqStatus) & (1u << tcsId)) != 0) {
+			done = true;
+			break;
+		}
+		spin(10);
+	}
+	uint32 status[4] = {};
+	for (int i = 0; i < count && i < 4; i++)
+		status[i] = rd(t + cmdSize * i, cmdStatus);
+	wr32(tcs, irqClear, 1u << tcsId);
+	wr32(t, control, 0);
+	wr32(t, enableRegister, 0);
+	dprintf("qcom_probe: rpmh v%" B_PRIu32 ".%" B_PRIu32 " write of %d: %s, "
+		"status %#" B_PRIx32 " %#" B_PRIx32 " %#" B_PRIx32 "\n", major,
+		(version >> 8) & 0xff, count, done ? "done" : "timed out", status[0],
+		status[1], status[2]);
+	delete_area(area);
+	return done;
+}
+
+
+//!	An LDO of the VRM on, at \a millivolts (rpmh-regulator: voltage at +0,
+//	enable at +4, mode at +8; PMIC5 LDO HPM is mode 7).
+static void
+ldo_on(const char* name, uint32 millivolts)
+{
+	uint32 base = cmd_db_address(name);
+	dprintf("qcom_probe: %s at %#" B_PRIx32 "\n", name, base);
+	if (base == 0)
+		return;
+	uint32 addresses[3] = {base + 0, base + 8, base + 4};
+	uint32 data[3] = {millivolts, 7, 1};
+	rpmh_write(addresses, data, 3);
+}
+
+
+/*!	sdhci-msm v5's power handshake: the controller waits for the host to
+	acknowledge bus and I/O voltage changes (CORE_PWRCTL_* at 0x240..0x24c). */
+static void
+sd_power_ack(volatile uint8* sd, const char* what)
+{
+	bigtime_t deadline = system_time() + 50000;
+	while (system_time() < deadline) {
+		uint32 status = rd(sd, 0x240);
+		if (status == 0) {
+			spin(100);
+			continue;
+		}
+		wr32(sd, 0x248, status);
+		uint32 ack = 0;
+		if ((status & 0x3) != 0)
+			ack |= 1u << 0;		// bus on/off done
+		if ((status & 0xc) != 0)
+			ack |= 1u << 2;		// I/O high/low done
+		wr32(sd, 0x24c, ack);
+		dprintf("qcom_probe: sd %s: power event %#" B_PRIx32 ", ack %#" B_PRIx32
+			"\n", what, status, ack);
+		return;
+	}
+}
+
+
+/*!	One command; \a flags as in the command register's low byte (response
+	type, CRC and index checks). Returns false on an error or timeout. */
+static bool
+sd_command(volatile uint8* sd, uint32 index, uint32 argument, uint16 flags,
+	uint32* response)
+{
+	wr16(sd, 0x30, 0xffff);
+	wr16(sd, 0x32, 0xffff);
+	bigtime_t deadline = system_time() + 100000;
+	while ((rd(sd, 0x24) & 1) != 0) {
+		if (system_time() > deadline)
+			return false;
+		spin(10);
+	}
+	wr32(sd, 0x08, argument);
+	wr16(sd, 0x0e, (uint16)(index << 8) | flags);
+	deadline = system_time() + 250000;
+	while (true) {
+		uint16 status = rd16(sd, 0x30);
+		if ((status & 0x8000) != 0) {
+			dprintf("qcom_probe: sd CMD%" B_PRIu32 ": error %#x\n", index,
+				rd16(sd, 0x32));
+			wr8(sd, 0x2f, 0x06);	// reset the command and data lines
+			spin(1000);
+			return false;
+		}
+		if ((status & 1) != 0)
+			break;
+		if (system_time() > deadline) {
+			dprintf("qcom_probe: sd CMD%" B_PRIu32 ": no response\n", index);
+			return false;
+		}
+		spin(10);
+	}
+	for (int i = 0; i < 4; i++)
+		response[i] = rd(sd, 0x10 + 4 * i);
+	return true;
+}
+
+
+static void
+sd_identify()
+{
+	area_id area;
+	volatile uint8* sd = map_rw({"probe sdhc2 rw", 0x8804000, 0x1000}, area);
+	if (sd == NULL)
+		return;
+
+	// the controller's core clock (gcc_sdcc2_apps_clk, its RCG at 0x14018)
+	{
+		area_id gccArea;
+		volatile uint8* gcc = map_rw({"probe gcc rw", 0x100000, 0x1f4200},
+			gccArea);
+		if (gcc != NULL) {
+			dprintf("qcom_probe: sd apps clock cbcr %#" B_PRIx32 ", rcg cmd %#"
+				B_PRIx32 " cfg %#" B_PRIx32 " m %#" B_PRIx32 " n %#" B_PRIx32
+				" d %#" B_PRIx32 "\n", rd(gcc, 0x14004), rd(gcc, 0x14018),
+				rd(gcc, 0x1401c), rd(gcc, 0x14020), rd(gcc, 0x14024),
+				rd(gcc, 0x14028));
+			if ((rd(gcc, 0x14004) & (1u << 31)) != 0) {
+				wr32(gcc, 0x14004, rd(gcc, 0x14004) | 1);
+				spin(100);
+				dprintf("qcom_probe: sd apps clock on: cbcr %#" B_PRIx32 "\n",
+					rd(gcc, 0x14004));
+			}
+			delete_area(gccArea);
+		}
+	}
+
+	// the card's supply (vmmc, L9C) and its pins' (vqmmc, L6C), 2.96 V
+	ldo_on("ldoc9", 2960);
+	ldo_on("ldoc6", 2960);
+	snooze(20000);
+
+	wr8(sd, 0x2f, 0x01);	// reset all
+	bigtime_t deadline = system_time() + 100000;
+	while ((sd[0x2f] & 1) != 0 && system_time() < deadline)
+		spin(10);
+	sd_power_ack(sd, "reset");
+	wr32(sd, 0x34, 0xffffffff);	// status bits latch
+	wr32(sd, 0x38, 0);			// no interrupt signals
+
+	wr8(sd, 0x29, 0x0e);		// 3.3 V
+	wr8(sd, 0x29, 0x0f);		// bus power on
+	sd_power_ack(sd, "bus power");
+	spin(10000);
+
+	// <= 400 kHz from the RCG's rate (XO 19.2 MHz / ((div + 1) / 2) when
+	// it runs from the XO), the 10-bit divider being N for base / 2N
+	uint32 divider = 250;
+	{
+		area_id gccArea;
+		volatile uint8* gcc = map({"probe gcc rd", 0x100000, 0x1f4200},
+			gccArea);
+		if (gcc != NULL) {
+			uint32 cfg = rd(gcc, 0x1401c);
+			if (((cfg >> 8) & 7) == 0) {
+				uint32 halfDiv = cfg & 0x1f;
+				uint32 base = halfDiv != 0 ? 19200000 * 2 / (halfDiv + 1)
+					: 19200000;
+				divider = (base + 2 * 400000 - 1) / (2 * 400000);
+				dprintf("qcom_probe: sd base clock %" B_PRIu32 " Hz, divider %"
+					B_PRIu32 " (%" B_PRIu32 " Hz)\n", base, divider,
+					base / (2 * divider));
+			}
+			delete_area(gccArea);
+		}
+	}
+	wr16(sd, 0x2c, (uint16)((divider & 0xff) << 8 | ((divider >> 8) & 3) << 6
+		| 1));
+	deadline = system_time() + 100000;
+	while ((rd16(sd, 0x2c) & 2) == 0 && system_time() < deadline)
+		spin(10);
+	wr16(sd, 0x2c, rd16(sd, 0x2c) | 4);
+	wr8(sd, 0x2e, 0x0e);
+	spin(5000);
+	dprintf("qcom_probe: sd powered: power %#x clock %#x present %#" B_PRIx32
+		" caps %#" B_PRIx32 "\n", sd[0x29], rd16(sd, 0x2c), rd(sd, 0x24),
+		rd(sd, 0x40));
+
+	uint32 response[4];
+	sd_command(sd, 0, 0, 0x00, response);
+	spin(2000);
+	if (!sd_command(sd, 8, 0x1aa, 0x1a, response)) {
+		dprintf("qcom_probe: sd: no answer to CMD8 (no card, no power, or an "
+			"old card)\n");
+		delete_area(area);
+		return;
+	}
+	dprintf("qcom_probe: sd CMD8: %#" B_PRIx32 "\n", response[0]);
+
+	uint32 ocr = 0;
+	deadline = system_time() + 1500000;
+	while (system_time() < deadline) {
+		if (!sd_command(sd, 55, 0, 0x1a, response)
+			|| !sd_command(sd, 41, 0x40ff8000, 0x02, response))
+			break;
+		ocr = response[0];
+		if ((ocr & (1u << 31)) != 0)
+			break;
+		snooze(10000);
+	}
+	dprintf("qcom_probe: sd ACMD41: OCR %#" B_PRIx32 "%s\n", ocr,
+		(ocr & (1u << 31)) != 0 ? ((ocr & (1u << 30)) != 0
+			? " (ready, SDHC/SDXC)" : " (ready, SDSC)") : " (not ready)");
+	if ((ocr & (1u << 31)) == 0) {
+		delete_area(area);
+		return;
+	}
+
+	if (sd_command(sd, 2, 0, 0x09, response)) {
+		// R2 without its CRC byte: CID bits 127..8 in response[3..0]
+		char name[6];
+		uint64 high = (uint64)response[3] << 32 | response[2];
+		for (int i = 0; i < 5; i++)
+			name[i] = (char)(high >> (8 * (4 - i)) & 0xff);
+		name[5] = '\0';
+		dprintf("qcom_probe: sd CID %08" B_PRIx32 " %08" B_PRIx32 " %08"
+			B_PRIx32 " %08" B_PRIx32 ": manufacturer %#" B_PRIx32 ", \"%s\"\n",
+			response[3], response[2], response[1], response[0],
+			response[3] >> 16, name);
+	}
+	if (sd_command(sd, 3, 0, 0x1a, response)) {
+		dprintf("qcom_probe: sd CMD3: RCA %#" B_PRIx32 "\n",
+			response[0] >> 16);
+	}
+	delete_area(area);
 }
 
 
