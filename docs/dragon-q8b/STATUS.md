@@ -11,6 +11,7 @@ table set and a device tree; the kernel prefers the device tree.
 | Clock | the firmware's GetTime(), passed as `haiku,firmware-clock` | |
 | Ethernet (2 x 2.5GbE, TC9563 switch, QCA8081 PHYs) | both ports, 1 Gbit/s tested (the lab switch is gigabit), DHCP; 106 MB/s down, 73 MB/s up | `tc956x` driver; MACs from the board's I2C EEPROM |
 | Wi-Fi (Intel AX210) | joins WPA2 networks over 802.11ax, 38.6 MB/s on the LAN | `iaxwifi200` |
+| Bluetooth (AX210) | the controller comes up with Intel's firmware (ibt-0041-0041) over USB | `h2generic`; not yet paired with a device |
 | USB | the three DWC3 controllers at USB 2 | SuperSpeed ports show Rx.Detect with `dwc3_superspeed true`; no USB 3 device tested yet |
 | GPU (Adreno 690) | Vulkan 1.3 (Mesa Turnip), OpenGL ES 3.2 and OpenGL through zink | `adreno` kernel driver; GLTeapot ~885 fps in its window, `pvr_glbench` 2650 frames/s with readback; WebGL in Summit |
 | Display | HDMI (DisplayPort 2 through the board's CH7218A bridge): own frame buffer, vertical blank interrupt (60.00 Hz), EDID over DP AUX, mode setting on the trained link | `qcom_display`; 1080p set again through the full path; other modes are correct on the Dragon's side but the lab's NanoKVM does not lock onto them, so they need a monitor to verify |
