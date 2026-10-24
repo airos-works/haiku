@@ -581,6 +581,640 @@ smp2p_entry(uint16 item, const char* name, uint32* _value)
 }
 
 
+// #pragma mark - GLINK
+
+
+/*	GLINK over SMEM (Linux' qcom_glink_smem.c and qcom_glink_native.c): a
+	ring FIFO each way, ours (item 479) and the ADSP's (480), their tails
+	and heads in the descriptor (478: of ours, then of the ADSP's). On them
+	8 byte aligned messages of an 8 byte header {command, a 16 and a 32-bit
+	parameter}. A doorbell on the IPCC (client 3, signal 0) tells the ADSP
+	to look; its doorbells are not needed, the FIFO is polled.
+
+	Channels are opened by name. Before a message can be sent on one, the
+	other side must have announced a buffer ("intent") big enough for it;
+	ours are announced when a channel opens. */
+
+enum {
+	kGlinkVersion = 0, kGlinkVersionAck = 1, kGlinkOpen = 2, kGlinkClose = 3,
+	kGlinkOpenAck = 4, kGlinkIntent = 5, kGlinkRxDone = 6,
+	kGlinkRxIntentRequest = 7, kGlinkRxIntentRequestAck = 8,
+	kGlinkTxData = 9, kGlinkCloseAck = 11, kGlinkTxDataContinued = 12,
+	kGlinkReadNotify = 13, kGlinkRxDoneReuse = 14, kGlinkSignals = 15,
+};
+
+static const uint32 kGlinkVersion1 = 1;
+static const uint32 kGlinkFeatureIntentReuse = 1;
+static const uint32 kGlinkFifoReserve = 8 + 16;
+	// FIFO_FULL_RESERVE, TX_BLOCKED_SIGNAL_RESERVE
+static const uint32 kGlinkIntentSize = 1024;
+static const uint32 kGlinkIntentCount = 5;
+static const uint32 kGlinkMaxMessage = 4096;
+static const int kGlinkMaxChannels = 16;
+static const int kGlinkMaxRemoteIntents = 16;
+
+
+struct glink_message {
+	uint16	command;
+	uint16	param1;
+	uint32	param2;
+};
+
+struct glink_pipe {
+	volatile uint32*	tail;
+	volatile uint32*	head;
+	volatile uint8*		fifo;
+	uint32				length;
+};
+
+struct glink_remote_intent {
+	uint32	id;
+	uint32	size;
+	bool	inUse;
+};
+
+struct glink_channel;
+typedef void (*glink_receive_hook)(glink_channel* channel, const uint8* data,
+	uint32 length);
+
+struct glink_channel {
+	char				name[32];
+	uint16				localId;
+	uint16				remoteId;		// 0: the ADSP has not opened it
+	bool				wanted;			// a hook of ours takes it
+	bool				openSent;
+	bool				openAcked;
+	glink_receive_hook	hook;
+	glink_remote_intent	remoteIntents[kGlinkMaxRemoteIntents];
+	uint32				remoteIntentCount;
+	uint32				nextIntentId;
+	uint8*				rxBuffer;		// a message in chunks
+	uint32				rxLength;
+};
+
+
+static glink_pipe sTx, sRx;
+static uint32 sGlinkFeatures = kGlinkFeatureIntentReuse;
+static bool sGlinkUp;
+static glink_channel sChannels[kGlinkMaxChannels];
+static int sChannelCount;
+static volatile bool sQuit;
+
+
+static void
+glink_kick()
+{
+	ipcc_signal(3, 0);
+}
+
+
+static bool
+glink_rx_fifo()
+{
+	if (sRx.fifo != NULL)
+		return true;
+	uint32 size = 0;
+	sRx.fifo = smem_item(kHostApps, kHostAdsp, 480, &size);
+	sRx.length = size;
+	return sRx.fifo != NULL && size > 0;
+}
+
+
+static uint32
+rx_avail()
+{
+	if (!glink_rx_fifo())
+		return 0;
+	uint32 head = *sRx.head, tail = *sRx.tail;
+	if (head >= sRx.length || tail >= sRx.length)
+		return 0;
+	return head >= tail ? head - tail : sRx.length - tail + head;
+}
+
+
+static void
+rx_peek(uint32 offset, void* buffer, uint32 count)
+{
+	uint32 tail = *sRx.tail + offset;
+	if (tail >= sRx.length)
+		tail -= sRx.length;
+	uint8* out = (uint8*)buffer;
+	for (uint32 i = 0; i < count; i++) {
+		out[i] = sRx.fifo[tail];
+		if (++tail == sRx.length)
+			tail = 0;
+	}
+}
+
+
+static void
+rx_advance(uint32 count)
+{
+	uint32 tail = *sRx.tail + count;
+	if (tail >= sRx.length)
+		tail -= sRx.length;
+	memory_full_barrier();
+	*sRx.tail = tail;
+	memory_full_barrier();
+}
+
+
+static uint32
+tx_avail()
+{
+	uint32 head = *sTx.head, tail = *sTx.tail;
+	uint32 avail = tail <= head ? sTx.length - head + tail : tail - head;
+	return avail < kGlinkFifoReserve ? 0 : avail - kGlinkFifoReserve;
+}
+
+
+static uint32
+tx_write_one(uint32 head, const void* data, uint32 count)
+{
+	const uint8* in = (const uint8*)data;
+	for (uint32 i = 0; i < count; i++) {
+		sTx.fifo[head] = in[i];
+		if (++head == sTx.length)
+			head = 0;
+	}
+	return head;
+}
+
+
+//!	Puts a message (its header, then \a data) into our FIFO, and rings.
+static status_t
+glink_send(const void* header, uint32 headerLength, const void* data = NULL,
+	uint32 dataLength = 0)
+{
+	uint32 total = (headerLength + dataLength + 7) & ~7u;
+	for (bigtime_t deadline = system_time() + 1000000; tx_avail() < total;
+			snooze(1000)) {
+		if (system_time() > deadline) {
+			ERROR("glink: no room for %" B_PRIu32 " bytes\n", total);
+			return B_TIMED_OUT;
+		}
+	}
+	uint32 head = *sTx.head;
+	head = tx_write_one(head, header, headerLength);
+	if (dataLength > 0)
+		head = tx_write_one(head, data, dataLength);
+	head = (head + 7) & ~7u;
+	if (head >= sTx.length)
+		head -= sTx.length;
+	memory_full_barrier();
+	*sTx.head = head;
+	memory_full_barrier();
+	glink_kick();
+	return B_OK;
+}
+
+
+static status_t
+glink_send_command(uint16 command, uint16 param1, uint32 param2)
+{
+	glink_message message = { command, param1, param2 };
+	return glink_send(&message, sizeof(message));
+}
+
+
+static glink_channel*
+glink_channel_by_name(const char* name)
+{
+	for (int i = 0; i < sChannelCount; i++) {
+		if (strcmp(sChannels[i].name, name) == 0)
+			return &sChannels[i];
+	}
+	return NULL;
+}
+
+
+static glink_channel*
+glink_channel_by_remote_id(uint16 id)
+{
+	for (int i = 0; i < sChannelCount; i++) {
+		if (sChannels[i].remoteId == id)
+			return &sChannels[i];
+	}
+	return NULL;
+}
+
+
+static glink_channel*
+glink_channel_by_local_id(uint16 id)
+{
+	for (int i = 0; i < sChannelCount; i++) {
+		if (sChannels[i].localId == id)
+			return &sChannels[i];
+	}
+	return NULL;
+}
+
+
+static glink_channel*
+glink_add_channel(const char* name)
+{
+	if (sChannelCount == kGlinkMaxChannels)
+		return NULL;
+	glink_channel* channel = &sChannels[sChannelCount];
+	memset(channel, 0, sizeof(*channel));
+	strlcpy(channel->name, name, sizeof(channel->name));
+	channel->localId = ++sChannelCount;
+	channel->nextIntentId = 1;
+	return channel;
+}
+
+
+/*!	Our open of a channel the ADSP opened (qcom_glink_create_remote()): our
+	acknowledgement of its open, then our own open. */
+static void
+glink_open(glink_channel* channel)
+{
+	glink_send_command(kGlinkOpenAck, channel->remoteId, 0);
+	struct {
+		glink_message	message;
+		char			name[32];
+	} request = {};
+	uint32 nameLength = strlen(channel->name) + 1;
+	request.message = { kGlinkOpen, channel->localId, nameLength };
+	memcpy(request.name, channel->name, nameLength);
+	glink_send(&request, sizeof(glink_message) + nameLength);
+	channel->openSent = true;
+}
+
+
+static void
+glink_announce_intents(glink_channel* channel, uint32 size, uint32 count)
+{
+	for (uint32 i = 0; i < count; i++) {
+		struct {
+			glink_message	message;
+			uint32			size;
+			uint32			id;
+		} intent = { { kGlinkIntent, channel->localId, 1 }, size,
+			channel->nextIntentId++ };
+		glink_send(&intent, sizeof(intent));
+	}
+}
+
+
+/*!	Sends \a data on \a channel, in an intent of the ADSP's that is big
+	enough. Returns B_WOULD_BLOCK when it has none (yet), after asking it
+	for one. */
+static status_t
+glink_write(glink_channel* channel, const void* data, uint32 length)
+{
+	if (channel->remoteId == 0 || !channel->openAcked)
+		return B_NOT_ALLOWED;
+	glink_remote_intent* intent = NULL;
+	for (uint32 i = 0; i < channel->remoteIntentCount; i++) {
+		glink_remote_intent& candidate = channel->remoteIntents[i];
+		if (!candidate.inUse && candidate.size >= length
+			&& (intent == NULL || candidate.size < intent->size))
+			intent = &candidate;
+	}
+	if (intent == NULL) {
+		glink_send_command(kGlinkRxIntentRequest, channel->localId, length);
+		return B_WOULD_BLOCK;
+	}
+	intent->inUse = true;
+	struct {
+		glink_message	message;
+		uint32			chunkSize;
+		uint32			leftSize;
+	} header = { { kGlinkTxData, channel->localId, intent->id }, length, 0 };
+	return glink_send(&header, sizeof(header), data, length);
+}
+
+
+static void
+glink_receive_open(uint16 remoteId, const char* name)
+{
+	glink_channel* channel = glink_channel_by_name(name);
+	if (channel == NULL)
+		channel = glink_add_channel(name);
+	if (channel == NULL)
+		return;
+	channel->remoteId = remoteId;
+	TRACE("glink: the ADSP opened \"%s\" (%u)%s\n", name, remoteId,
+		channel->wanted ? "" : ", not used");
+	if (channel->wanted)
+		glink_open(channel);
+}
+
+
+static void
+glink_receive_data(const glink_message& message, uint32 chunkSize,
+	uint32 leftSize, uint32 offset)
+{
+	glink_channel* channel = glink_channel_by_remote_id(message.param1);
+	if (channel == NULL || channel->hook == NULL)
+		return;
+	if (channel->rxBuffer == NULL)
+		channel->rxBuffer = (uint8*)malloc(kGlinkMaxMessage);
+	if (channel->rxBuffer == NULL
+		|| channel->rxLength + chunkSize > kGlinkMaxMessage) {
+		ERROR("glink: a message on \"%s\" too big\n", channel->name);
+		channel->rxLength = 0;
+		return;
+	}
+	if (message.command == kGlinkTxData)
+		channel->rxLength = 0;
+	rx_peek(offset, channel->rxBuffer + channel->rxLength, chunkSize);
+	channel->rxLength += chunkSize;
+	if (leftSize != 0)
+		return;
+	uint32 length = channel->rxLength;
+	channel->rxLength = 0;
+	// our intents are reused (ours are only the ones announced at the open)
+	glink_send_command(kGlinkRxDoneReuse, channel->localId, message.param2);
+	channel->hook(channel, channel->rxBuffer, length);
+}
+
+
+//!	Takes what the ADSP sent (qcom_glink_native_rx()).
+static void
+glink_poll()
+{
+	while (true) {
+		uint32 avail = rx_avail();
+		if (avail < sizeof(glink_message))
+			return;
+		glink_message message;
+		rx_peek(0, &message, sizeof(message));
+		uint32 consumed = sizeof(message);
+		switch (message.command) {
+			case kGlinkVersion:
+				if (message.param1 == 0)
+					break;
+				if (message.param1 == kGlinkVersion1)
+					sGlinkFeatures &= message.param2;
+				glink_send_command(kGlinkVersionAck, kGlinkVersion1,
+					sGlinkFeatures);
+				break;
+			case kGlinkVersionAck:
+				if (message.param1 == 0)
+					break;
+				if (message.param1 == kGlinkVersion1
+					&& message.param2 == sGlinkFeatures) {
+					if (!sGlinkUp)
+						TRACE("glink: up, features %#" B_PRIx32 "\n",
+							sGlinkFeatures);
+					sGlinkUp = true;
+					break;
+				}
+				sGlinkFeatures &= message.param2;
+				glink_send_command(kGlinkVersion, kGlinkVersion1,
+					sGlinkFeatures);
+				break;
+			case kGlinkOpen:
+			{
+				consumed += message.param2;
+				if (avail < consumed)
+					return;
+				char name[33] = {};
+				rx_peek(sizeof(message), name, min_c(message.param2, 32u));
+				glink_receive_open(message.param1, name);
+				break;
+			}
+			case kGlinkClose:
+			{
+				glink_channel* channel
+					= glink_channel_by_remote_id(message.param1);
+				TRACE("glink: the ADSP closed \"%s\"\n",
+					channel != NULL ? channel->name : "?");
+				if (channel != NULL) {
+					channel->remoteId = 0;
+					channel->openSent = channel->openAcked = false;
+					channel->remoteIntentCount = 0;
+				}
+				glink_send_command(kGlinkCloseAck, message.param1, 0);
+				break;
+			}
+			case kGlinkOpenAck:
+			{
+				glink_channel* channel
+					= glink_channel_by_local_id(message.param1);
+				if (channel != NULL && !channel->openAcked) {
+					channel->openAcked = true;
+					TRACE("glink: \"%s\" open\n", channel->name);
+					glink_announce_intents(channel, kGlinkIntentSize,
+						kGlinkIntentCount);
+				}
+				break;
+			}
+			case kGlinkIntent:
+			{
+				consumed += 8 * message.param2;
+				if (avail < consumed)
+					return;
+				glink_channel* channel
+					= glink_channel_by_remote_id(message.param1);
+				for (uint32 i = 0; i < message.param2; i++) {
+					uint32 pair[2];
+					rx_peek(sizeof(message) + 8 * i, pair, sizeof(pair));
+					if (channel == NULL || channel->remoteIntentCount
+							== (uint32)kGlinkMaxRemoteIntents)
+						continue;
+					channel->remoteIntents[channel->remoteIntentCount++]
+						= { pair[1], pair[0], false };
+				}
+				break;
+			}
+			case kGlinkRxDone:
+			case kGlinkRxDoneReuse:
+			{
+				glink_channel* channel
+					= glink_channel_by_remote_id(message.param1);
+				if (channel == NULL)
+					break;
+				for (uint32 i = 0; i < channel->remoteIntentCount; i++) {
+					glink_remote_intent& intent = channel->remoteIntents[i];
+					if (intent.id != message.param2)
+						continue;
+					if (message.command == kGlinkRxDoneReuse)
+						intent.inUse = false;
+					else {
+						intent = channel->remoteIntents[
+							--channel->remoteIntentCount];
+					}
+					break;
+				}
+				break;
+			}
+			case kGlinkRxIntentRequest:
+			{
+				glink_channel* channel
+					= glink_channel_by_remote_id(message.param1);
+				if (channel == NULL)
+					break;
+				bool granted = message.param2 <= kGlinkMaxMessage;
+				if (granted)
+					glink_announce_intents(channel, message.param2, 1);
+				glink_send_command(kGlinkRxIntentRequestAck, channel->localId,
+					granted ? 1 : 0);
+				break;
+			}
+			case kGlinkTxData:
+			case kGlinkTxDataContinued:
+			{
+				if (avail < 16)
+					return;
+				uint32 sizes[2];
+				rx_peek(sizeof(message), sizes, sizeof(sizes));
+				consumed = 16 + sizes[0];
+				if (avail < consumed)
+					return;
+				glink_receive_data(message, sizes[0], sizes[1], 16);
+				break;
+			}
+			case kGlinkReadNotify:
+				glink_kick();
+				break;
+			case kGlinkRxIntentRequestAck:
+			case kGlinkCloseAck:
+			case kGlinkSignals:
+				break;
+			default:
+				ERROR("glink: unknown command %u, the rest dropped\n",
+					message.command);
+				consumed = avail;
+				break;
+		}
+		rx_advance((consumed + 7) & ~7u);
+	}
+}
+
+
+static status_t
+glink_start()
+{
+	uint32 size = 0;
+	volatile uint32* descriptor = (volatile uint32*)smem_allocate(kHostApps,
+		kHostAdsp, 478, 32);
+	volatile uint8* fifo = smem_allocate(kHostApps, kHostAdsp, 479, 16384);
+	if (descriptor == NULL || fifo == NULL
+		|| smem_item(kHostApps, kHostAdsp, 479, &size) == NULL)
+		return B_NO_MEMORY;
+	sTx = { &descriptor[0], &descriptor[1], fifo, size };
+	sRx = { &descriptor[2], &descriptor[3], NULL, 0 };
+	*sRx.tail = 0;
+	*sTx.head = 0;
+	memory_full_barrier();
+	return glink_send_command(kGlinkVersion, kGlinkVersion1, sGlinkFeatures);
+}
+
+
+// #pragma mark - pmic_glink
+
+
+/*	The PMIC's services on the ADSP, on the GLINK channel
+	"PMIC_RTR_ADSP_APPS" (Linux' pmic_glink.c, pmic_glink_altmode.c):
+	messages of a header {owner, type, opcode}. The USB-C ports' alternate
+	modes are owner 32780: once enabled with a request (ALTMODE_PAN_EN),
+	the ADSP reports each port's state (cable orientation, mux, the
+	DisplayPort pin assignment and HPD), each report acknowledged
+	(ALTMODE_PAN_ACK). */
+
+static const uint32 kPmicGlinkOwnerAltmode = 32780;	// USBC_PAN
+static const uint32 kPmicGlinkRequest = 1;
+static const uint32 kUsbcWriteRequest = 0x15;
+static const uint32 kUsbcNotify = 0x16;
+static const uint32 kAltmodeEnable = 0x10;
+static const uint32 kAltmodeAck = 0x11;
+
+struct pmic_glink_header {
+	uint32	owner;
+	uint32	type;
+	uint32	opcode;
+};
+
+struct usbc_write_request {
+	pmic_glink_header header;
+	uint32	command;
+	uint32	argument;
+	uint32	reserved;
+};
+
+struct usbc_notify {
+	pmic_glink_header header;
+	uint8	pinAssignmentHpd;	// pin assignment 5:0, HPD 6, HPD IRQ 7
+	uint8	reserved1[7];
+	uint8	port;
+	uint8	orientation;
+	uint8	mux;
+	uint8	reserved2;
+	uint16	vid;
+	uint16	svid;
+} _PACKED;
+
+static glink_channel* sPmicGlink;
+static bool sAltmodeEnabled;
+static bigtime_t sAltmodeRequested;
+
+
+static status_t
+altmode_request(uint32 command, uint32 argument)
+{
+	usbc_write_request request = {
+		{ kPmicGlinkOwnerAltmode, kPmicGlinkRequest, kUsbcWriteRequest },
+		command, argument, 0 };
+	return glink_write(sPmicGlink, &request, sizeof(request));
+}
+
+
+static void
+pmic_glink_receive(glink_channel* channel, const uint8* data, uint32 length)
+{
+	pmic_glink_header header;
+	if (length < sizeof(header))
+		return;
+	memcpy(&header, data, sizeof(header));
+	uint32 opcode = header.opcode & 0xff;
+	if (header.owner != kPmicGlinkOwnerAltmode) {
+		TRACE("pmic_glink: owner %" B_PRIu32 " type %" B_PRIu32 " opcode %#"
+			B_PRIx32 ", %" B_PRIu32 " bytes\n", header.owner, header.type,
+			header.opcode, length);
+		return;
+	}
+	if (opcode == kUsbcWriteRequest) {
+		if (!sAltmodeEnabled)
+			TRACE("pmic_glink: alternate mode reports on\n");
+		sAltmodeEnabled = true;
+		return;
+	}
+	if (opcode != kUsbcNotify || length != sizeof(usbc_notify)) {
+		TRACE("pmic_glink: alternate mode opcode %#" B_PRIx32 ", %" B_PRIu32
+			" bytes\n", header.opcode, length);
+		return;
+	}
+	usbc_notify notify;
+	memcpy(&notify, data, sizeof(notify));
+	uint16 svid = header.opcode >> 16;
+	const char* mode = svid == 0xff01 ? "DisplayPort"
+		: notify.mux == 4 ? "tunnelling" : notify.mux == 0 ? "nothing"
+		: "USB";
+	TRACE("usb-c port %u: %s, orientation %u, mux %u, svid %#x, pin "
+		"assignment %u, hpd %u%s\n", notify.port, mode, notify.orientation,
+		notify.mux, svid, notify.pinAssignmentHpd & 0x3f,
+		(notify.pinAssignmentHpd >> 6) & 1,
+		(notify.pinAssignmentHpd & 0x80) != 0 ? " (irq)" : "");
+	altmode_request(kAltmodeAck, notify.port);
+}
+
+
+//!	Turns the reports on, again and again until the ADSP answers.
+static void
+pmic_glink_tick()
+{
+	if (sPmicGlink == NULL || !sPmicGlink->openAcked || sAltmodeEnabled)
+		return;
+	if (system_time() - sAltmodeRequested < 2000000)
+		return;
+	if (altmode_request(kAltmodeEnable, 0) != B_WOULD_BLOCK)
+		sAltmodeRequested = system_time();
+}
+
+
 // #pragma mark - the start
 
 
@@ -723,7 +1357,21 @@ adsp_start()
 static status_t
 boot_thread(void*)
 {
-	adsp_start();
+	if (adsp_start() != B_OK)
+		return B_OK;
+
+	sPmicGlink = glink_add_channel("PMIC_RTR_ADSP_APPS");
+	sPmicGlink->wanted = true;
+	sPmicGlink->hook = pmic_glink_receive;
+	if (glink_start() != B_OK) {
+		ERROR("glink: cannot start\n");
+		return B_OK;
+	}
+	while (!sQuit) {
+		glink_poll();
+		pmic_glink_tick();
+		snooze(10000);
+	}
 	return B_OK;
 }
 
@@ -835,6 +1483,7 @@ qcom_adsp_init_driver(device_node* node, void** _cookie)
 static void
 qcom_adsp_uninit_driver(void* cookie)
 {
+	sQuit = true;
 	if (sBootThread >= 0) {
 		status_t result;
 		wait_for_thread(sBootThread, &result);
