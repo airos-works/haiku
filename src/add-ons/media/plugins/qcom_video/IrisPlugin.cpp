@@ -8,8 +8,8 @@
 
 	As sunxi_cedar: the formats are only registered where the codec is
 	(/dev/video/qcom_iris/0 exists), and a stream it does not decode (fields,
-	more than eight bits, not 4:2:0, larger than 4096x2304), or a second one
-	while the codec is taken, goes on in software: the decoder then hands
+	more than eight bits, not 4:2:0, larger than 4096x2304), or one the
+	firmware has no room for next to others, goes on in software: the decoder then hands
 	everything to one of the FFmpeg add-on's decoders. What the firmware
 	only finds out at the first picture sends the chunks read until then to
 	the FFmpeg decoder again.

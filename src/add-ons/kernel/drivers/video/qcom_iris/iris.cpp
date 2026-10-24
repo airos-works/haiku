@@ -1149,11 +1149,33 @@ iris_start()
 
 /*	The open that owns the codec, and the buffers it allocated. */
 
+struct IrisOpen;
+
 struct IrisBuffer {
 	IrisBuffer*	next;		// by device address
+	IrisOpen*	owner;
 	area_id		area;
 	uint32		device;		// address
 	size_t		size;
+};
+
+/*	A message of the firmware for another open than the one that read it. */
+struct IrisMessage {
+	IrisMessage*	next;
+	uint32			size;
+	uint32			data[];
+};
+
+/*	An open of the device: the HFI sessions it began, which only it may send
+	commands for, and their messages that another open read. */
+static const int32 kMaxOpenSessions = 16;
+
+struct IrisOpen {
+	IrisOpen*		next;
+	uint32			sessions[kMaxOpenSessions];
+	int32			sessionCount;
+	IrisMessage*	messages;
+	IrisMessage**	lastMessage;
 };
 
 /*	Where the buffers are for the codec: from the end of what Linux keeps
@@ -1162,8 +1184,14 @@ struct IrisBuffer {
 static const uint32 kBufferWindow = 0x30000000;
 static const uint32 kBufferWindowEnd = 0x80000000;
 
-static void* sOwner;
+static IrisOpen* sOpens;
 static IrisBuffer* sBuffers;
+
+#define HFI_CMD_SYS_SESSION_INIT		0x10007
+#define HFI_CMD_SYS_SESSION_END			0x10008
+#define HFI_CMD_SYS_SESSION_ABORT		0x210001
+#define HFI_MSG_SYS_SESSION_END			0x20007
+#define HFI_MSG_SYS_SESSION_ABORT		0x220004
 
 
 static void
@@ -1183,7 +1211,7 @@ buffer_free(IrisBuffer* buffer)
 	place of kBufferWindow, and cloned into the caller's team.
 */
 static status_t
-buffer_alloc(qcom_iris_buffer* request)
+buffer_alloc(IrisOpen* owner, qcom_iris_buffer* request)
 {
 	if (request->size == 0 || request->size > 768 * 1024 * 1024)
 		return B_BAD_VALUE;
@@ -1214,6 +1242,7 @@ buffer_alloc(qcom_iris_buffer* request)
 		return status;
 	}
 	memset(address, 0, size);
+	buffer->owner = owner;
 	buffer->device = device;
 	buffer->size = size;
 
@@ -1258,20 +1287,125 @@ buffer_alloc(qcom_iris_buffer* request)
 }
 
 
+static bool
+open_has_session(IrisOpen* open, uint32 session)
+{
+	for (int32 i = 0; i < open->sessionCount; i++) {
+		if (open->sessions[i] == session)
+			return true;
+	}
+	return false;
+}
+
+
+static IrisOpen*
+session_owner(uint32 session)
+{
+	for (IrisOpen* open = sOpens; open != NULL; open = open->next) {
+		if (open_has_session(open, session))
+			return open;
+	}
+	return NULL;
+}
+
+
+static void
+open_remove_session(IrisOpen* open, uint32 session)
+{
+	for (int32 i = 0; i < open->sessionCount; i++) {
+		if (open->sessions[i] == session) {
+			open->sessions[i] = open->sessions[--open->sessionCount];
+			return;
+		}
+	}
+}
+
+
+static void
+open_queue_message(IrisOpen* open, const uint32* packet, uint32 size)
+{
+	IrisMessage* message = (IrisMessage*)malloc(sizeof(IrisMessage) + size);
+	if (message == NULL)
+		return;
+	message->next = NULL;
+	message->size = size;
+	memcpy(message->data, packet, size);
+	*open->lastMessage = message;
+	open->lastMessage = &message->next;
+}
+
+
+/*!	Reads the firmware's next message for \a reader, keeping those of other
+	opens' sessions for them. Called with sLock held. B_WOULD_BLOCK when
+	there is none yet.
+*/
+static status_t
+next_message(IrisOpen* reader, uint32* packet, uint32 size, uint32* _size)
+{
+	if (reader->messages != NULL) {
+		IrisMessage* message = reader->messages;
+		reader->messages = message->next;
+		if (reader->messages == NULL)
+			reader->lastMessage = &reader->messages;
+		uint32 copy = min_c(message->size, size);
+		memcpy(packet, message->data, copy);
+		*_size = message->size;
+		free(message);
+		return B_OK;
+	}
+
+	while (true) {
+		uint32 received = 0;
+		status_t status = queue_read(IFACEQ_MSGQ_ID, packet, size, &received);
+		if (status != B_OK)
+			return status;
+		if (received < 12)
+			continue;
+		uint32 session = packet[2];
+		IrisOpen* owner = session_owner(session);
+		if (packet[1] == HFI_MSG_SYS_SESSION_END
+			|| packet[1] == HFI_MSG_SYS_SESSION_ABORT) {
+			if (owner != NULL)
+				open_remove_session(owner, session);
+		}
+		if (owner == NULL) {
+			if (session != 0) {
+				INFO("message %#" B_PRIx32 " of no open's session %#" B_PRIx32
+					"\n", packet[1], session);
+				continue;
+			}
+			// the firmware's own (a system error): for everyone
+			for (IrisOpen* open = sOpens; open != NULL; open = open->next) {
+				if (open != reader)
+					open_queue_message(open, packet, received);
+			}
+			*_size = received;
+			return B_OK;
+		}
+		if (owner == reader) {
+			*_size = received;
+			return B_OK;
+		}
+		open_queue_message(owner, packet, received);
+		sMessageCondition.NotifyAll();
+	}
+}
+
+
 static status_t
 iris_open(const char* name, uint32 flags, void** _cookie)
 {
 	status_t status = iris_start();
 	if (status != B_OK)
 		return status;
-	MutexLocker locker(sLock);
-	if (sOwner != NULL)
-		return B_BUSY;
-	void* cookie = malloc(1);
-	if (cookie == NULL)
+	IrisOpen* open = (IrisOpen*)calloc(1, sizeof(IrisOpen));
+	if (open == NULL)
 		return B_NO_MEMORY;
-	sOwner = cookie;
-	*_cookie = cookie;
+	open->lastMessage = &open->messages;
+	MutexLocker locker(sLock);
+	open->next = sOpens;
+	sOpens = open;
+	*_cookie = open;
 	return B_OK;
 }
 
@@ -1283,18 +1417,73 @@ iris_close(void* cookie)
 }
 
 
+/*!	The open's sessions the team did not end (it quit or crashed): aborted,
+	so that the firmware lets go of their buffers before they are freed.
+*/
+static void
+abort_sessions(IrisOpen* open)
+{
+	for (int32 i = 0; i < open->sessionCount; i++) {
+		uint32 abort[3] = { 12, HFI_CMD_SYS_SESSION_ABORT, open->sessions[i] };
+		INFO("aborting session %#" B_PRIx32 "\n", open->sessions[i]);
+		if (queue_write(IFACEQ_CMDQ_ID, abort, sizeof(abort)) == B_OK)
+			raise_interrupt();
+	}
+
+	static uint32 packet[IFACEQ_CORE_PKT_SIZE / 4];
+	bigtime_t deadline = system_time() + 1000000;
+	while (open->sessionCount > 0 && system_time() < deadline) {
+		uint32 size;
+		status_t status = next_message(open, packet, sizeof(packet), &size);
+		if (status == B_OK)
+			continue;
+		ConditionVariableEntry entry;
+		sMessageCondition.Add(&entry);
+		mutex_unlock(&sLock);
+		entry.Wait(B_ABSOLUTE_TIMEOUT, min_c(deadline, system_time() + 10000));
+		mutex_lock(&sLock);
+	}
+	if (open->sessionCount > 0) {
+		ERROR("%" B_PRId32 " sessions did not end; their buffers stay\n",
+			open->sessionCount);
+	}
+}
+
+
 static status_t
 iris_free(void* cookie)
 {
+	IrisOpen* open = (IrisOpen*)cookie;
 	MutexLocker locker(sLock);
-	while (sBuffers != NULL) {
-		IrisBuffer* buffer = sBuffers;
-		sBuffers = buffer->next;
+	abort_sessions(open);
+	for (IrisBuffer** link = &sBuffers; *link != NULL;) {
+		IrisBuffer* buffer = *link;
+		if (buffer->owner != open) {
+			link = &buffer->next;
+			continue;
+		}
+		// what a session that did not end may still use is kept, its
+		// addresses taken
+		if (open->sessionCount > 0) {
+			buffer->owner = NULL;
+			link = &buffer->next;
+			continue;
+		}
+		*link = buffer->next;
 		buffer_free(buffer);
 	}
-	if (sOwner == cookie)
-		sOwner = NULL;
-	free(cookie);
+	while (open->messages != NULL) {
+		IrisMessage* message = open->messages;
+		open->messages = message->next;
+		free(message);
+	}
+	for (IrisOpen** link = &sOpens; *link != NULL; link = &(*link)->next) {
+		if (*link == open) {
+			*link = open->next;
+			break;
+		}
+	}
+	free(open);
 	return B_OK;
 }
 
@@ -1318,6 +1507,7 @@ iris_write(void* cookie, off_t position, const void* buffer, size_t* _length)
 static status_t
 iris_control(void* cookie, uint32 op, void* buffer, size_t length)
 {
+	IrisOpen* open = (IrisOpen*)cookie;
 	switch (op) {
 		case QCOM_IRIS_GET_INFO:
 		{
@@ -1335,7 +1525,7 @@ iris_control(void* cookie, uint32 op, void* buffer, size_t length)
 				|| user_memcpy(&request, buffer, sizeof(request)) != B_OK) {
 				return B_BAD_VALUE;
 			}
-			if (request.size < 8 || request.size > IFACEQ_CORE_PKT_SIZE
+			if (request.size < 12 || request.size > IFACEQ_CORE_PKT_SIZE
 				|| (request.size & 3) != 0) {
 				return B_BAD_VALUE;
 			}
@@ -1344,10 +1534,27 @@ iris_control(void* cookie, uint32 op, void* buffer, size_t length)
 				return B_BAD_ADDRESS;
 			if (packet[0] != request.size)
 				return B_BAD_VALUE;
+
+			// sessions are the opens' own; the system's commands the driver's
 			MutexLocker locker(sLock);
+			uint32 type = packet[1];
+			uint32 session = packet[2];
+			if (type == HFI_CMD_SYS_SESSION_INIT) {
+				if (session == 0 || session_owner(session) != NULL)
+					return B_BUSY;
+				if (open->sessionCount == kMaxOpenSessions)
+					return B_NO_MEMORY;
+				open->sessions[open->sessionCount++] = session;
+			} else if (type != HFI_CMD_SYS_SESSION_END && type < 0x11000)
+				return B_NOT_ALLOWED;
+			else if (!open_has_session(open, session))
+				return B_PERMISSION_DENIED;
+
 			status_t status = queue_write(IFACEQ_CMDQ_ID, packet, request.size);
 			if (status == B_OK)
 				raise_interrupt();
+			else if (type == HFI_CMD_SYS_SESSION_INIT)
+				open_remove_session(open, session);
 			return status;
 		}
 
@@ -1363,8 +1570,8 @@ iris_control(void* cookie, uint32 op, void* buffer, size_t length)
 			MutexLocker locker(sLock);
 			while (true) {
 				uint32 size = 0;
-				status_t status = queue_read(IFACEQ_MSGQ_ID, packet,
-					sizeof(packet), &size);
+				status_t status = next_message(open, packet, sizeof(packet),
+					&size);
 				if (status == B_OK) {
 					request.received = min_c(size, request.size);
 					if (user_memcpy(request.buffer, packet, request.received)
@@ -1398,7 +1605,7 @@ iris_control(void* cookie, uint32 op, void* buffer, size_t length)
 				return B_BAD_VALUE;
 			}
 			MutexLocker locker(sLock);
-			status_t status = buffer_alloc(&request);
+			status_t status = buffer_alloc(open, &request);
 			if (status != B_OK)
 				return status;
 			return user_memcpy(buffer, &request, sizeof(request));
@@ -1415,8 +1622,10 @@ iris_control(void* cookie, uint32 op, void* buffer, size_t length)
 			MutexLocker locker(sLock);
 			for (IrisBuffer** link = &sBuffers; *link != NULL;
 					link = &(*link)->next) {
-				if ((*link)->device != deviceAddress)
+				if ((*link)->device != deviceAddress
+					|| (*link)->owner != open) {
 					continue;
+				}
 				IrisBuffer* found = *link;
 				*link = found->next;
 				buffer_free(found);
