@@ -32,6 +32,7 @@
 #include <sys/stat.h>
 
 #include "a690_tables.h"
+#include "qcom_scm.h"
 #include "adreno_private.h"
 
 
@@ -1229,116 +1230,7 @@ gmu_gpu_set()
 	and mdt_loader do it: the ELF header and hash segment as metadata, the
 	loadable segments into the reserved region, then authentication. */
 
-#define SCM_SVC_PIL				0x02
-#define SCM_PAS_INIT_IMAGE		0x01
-#define SCM_PAS_MEM_SETUP		0x02
-#define SCM_PAS_AUTH_AND_RESET	0x05
-#define SCM_ARG_VAL				0
-#define SCM_ARG_RW				2
-#define SCM_INTERRUPTED			1
-#define SCM_V2_EBUSY			((uint64)-12)
 #define GPU_PAS_ID				13
-
-#define MDT_TYPE_MASK			(7u << 24)
-#define MDT_TYPE_HASH			(2u << 24)
-#define MDT_RELOCATABLE			(1u << 27)
-#define ELF_PT_LOAD				1
-
-struct elf32_header {
-	uint8	ident[16];
-	uint16	type;
-	uint16	machine;
-	uint32	version;
-	uint32	entry;
-	uint32	phoff;
-	uint32	shoff;
-	uint32	flags;
-	uint16	ehsize;
-	uint16	phentsize;
-	uint16	phnum;
-	uint16	shentsize;
-	uint16	shnum;
-	uint16	shstrndx;
-};
-
-struct elf32_program_header {
-	uint32	type;
-	uint32	offset;
-	uint32	vaddr;
-	uint32	paddr;
-	uint32	filesz;
-	uint32	memsz;
-	uint32	flags;
-	uint32	align;
-};
-
-
-struct scm_arguments {
-	uint64	function;
-	uint64	info;
-	uint64	a0, a1, a2;
-	uint64	r0, r1;
-	uint32	interrupted;
-};
-
-
-static void
-scm_smc(void* data, int cpu)
-{
-	scm_arguments* arguments = (scm_arguments*)data;
-	register uint64 r0 asm("x0") = arguments->function;
-	register uint64 r1 asm("x1") = arguments->info;
-	register uint64 r2 asm("x2") = arguments->a0;
-	register uint64 r3 asm("x3") = arguments->a1;
-	register uint64 r4 asm("x4") = arguments->a2;
-	register uint64 r5 asm("x5") = 0;
-	register uint64 r6 asm("x6") = 0;
-	register uint64 r7 asm("x7") = 0;
-	while (true) {
-		asm volatile("smc #0"
-			: "+r" (r0), "+r" (r1), "+r" (r2), "+r" (r3), "+r" (r4),
-				"+r" (r5), "+r" (r6), "+r" (r7)
-			:
-			: "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
-				"x16", "x17", "memory");
-		if (r0 != SCM_INTERRUPTED)
-			break;
-		// resume the interrupted call
-		arguments->interrupted++;
-		r1 = arguments->info;
-		r2 = arguments->a0;
-		r3 = arguments->a1;
-		r4 = arguments->a2;
-		r5 = r6 = r7 = 0;
-	}
-	arguments->r0 = r0;
-	arguments->r1 = r1;
-}
-
-
-/*!	A standard (yielding) SMC64 call to the SIP service \a service, made on
-	CPU 0: on the Dragon, PAS calls from other CPUs never return.
-*/
-static int64
-scm_call(uint32 service, uint32 command, uint32 argumentInfo, uint64 a0,
-	uint64 a1 = 0, uint64 a2 = 0, uint64* result = NULL)
-{
-	scm_arguments arguments = {};
-	arguments.function = 1ull << 30 | 2ull << 24 | service << 8 | command;
-	arguments.info = argumentInfo;
-	arguments.a0 = a0;
-	arguments.a1 = a1;
-	arguments.a2 = a2;
-	for (int attempt = 0; attempt < 100; attempt++) {
-		call_single_cpu_sync(0, scm_smc, &arguments);
-		if (arguments.r0 != SCM_V2_EBUSY)
-			break;
-		snooze(30000);
-	}
-	if (result != NULL)
-		*result = arguments.r1;
-	return (int64)arguments.r0;
-}
 
 
 static status_t
@@ -1366,121 +1258,13 @@ zap_shader_load()
 		&size);
 	if (image == NULL)
 		return B_ENTRY_NOT_FOUND;
-
-	const elf32_header* header = (const elf32_header*)image;
-	const elf32_program_header* phdrs
-		= (const elf32_program_header*)(image + header->phoff);
-	if (size < sizeof(elf32_header) || memcmp(header->ident, "\x7f" "ELF", 4)
-			!= 0 || header->phnum < 2
-		|| header->phoff + header->phnum * sizeof(*phdrs) > size) {
-		free(image);
-		return B_BAD_DATA;
-	}
-
-	uint32 hash = 0;
-	uint32 minAddress = 0xffffffff, maxAddress = 0;
-	bool relocatable = false;
-	for (uint32 i = 0; i < header->phnum; i++) {
-		const elf32_program_header& phdr = phdrs[i];
-		if (hash == 0 && i > 0 && (phdr.flags & MDT_TYPE_MASK) == MDT_TYPE_HASH)
-			hash = i;
-		if (phdr.type != ELF_PT_LOAD || phdr.memsz == 0
-			|| (phdr.flags & MDT_TYPE_MASK) == MDT_TYPE_HASH) {
-			continue;
-		}
-		relocatable |= (phdr.flags & MDT_RELOCATABLE) != 0;
-		minAddress = min_c(minAddress, phdr.paddr);
-		maxAddress = max_c(maxAddress,
-			(phdr.paddr + phdr.memsz + B_PAGE_SIZE - 1) & ~(B_PAGE_SIZE - 1));
-	}
-	if (hash == 0) {
-		free(image);
-		return B_BAD_DATA;
-	}
-
-	// the metadata: physically contiguous, page aligned, not cached
-	size_t metadataSize = phdrs[0].filesz + phdrs[hash].filesz;
-	uint8* metadata;
-	area_id metadataArea = create_area("adreno zap metadata", (void**)&metadata,
-		B_ANY_KERNEL_ADDRESS, (metadataSize + B_PAGE_SIZE - 1)
-			& ~(B_PAGE_SIZE - 1), B_CONTIGUOUS,
-		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
-	if (metadataArea < 0) {
-		free(image);
-		return metadataArea;
-	}
-	physical_entry entry;
-	get_memory_map(metadata, B_PAGE_SIZE, &entry, 1);
-	memcpy(metadata, image, phdrs[0].filesz);
-	memcpy(metadata + phdrs[0].filesz, image + phdrs[hash].offset,
-		phdrs[hash].filesz);
-	for (addr_t line = (addr_t)metadata; line < (addr_t)metadata + metadataSize;
-			line += 64)
-		asm volatile("dc civac, %0" : : "r" (line) : "memory");
-	memory_full_barrier();
-
-	INFO("zap shader: %" B_PRIu32 " segments, %s, %#" B_PRIx32 "-%#" B_PRIx32
-		", region %#" B_PRIxPHYSADDR " (%#zx)\n", header->phnum,
-		relocatable ? "relocatable" : "fixed", minAddress, maxAddress,
+	status_t status = qcom_pas_load("zap shader", GPU_PAS_ID, image, size,
 		regionBase, regionSize);
-
-	int64 result = scm_call(SCM_SVC_PIL, SCM_PAS_INIT_IMAGE,
-		2 | SCM_ARG_VAL << 4 | SCM_ARG_RW << 6, GPU_PAS_ID, entry.address);
-	delete_area(metadataArea);
-	if (result != 0) {
-		ERROR("zap shader: PAS init image failed: %" B_PRId64 "\n", result);
-		free(image);
-		return B_ERROR;
-	}
-	if (relocatable) {
-		result = scm_call(SCM_SVC_PIL, SCM_PAS_MEM_SETUP, 3, GPU_PAS_ID,
-			regionBase, maxAddress - minAddress);
-		if (result != 0) {
-			ERROR("zap shader: PAS memory setup failed: %" B_PRId64 "\n",
-				result);
-			free(image);
-			return B_ERROR;
-		}
-	}
-
-	register_window target;
-	if (target.Map("adreno zap region", regionBase, regionSize) != B_OK) {
-		free(image);
-		return B_NO_MEMORY;
-	}
-	uint32 base = relocatable ? minAddress : (uint32)regionBase;
-	status_t status = B_OK;
-	for (uint32 i = 0; i < header->phnum && status == B_OK; i++) {
-		const elf32_program_header& phdr = phdrs[i];
-		if (phdr.type != ELF_PT_LOAD || phdr.memsz == 0
-			|| (phdr.flags & MDT_TYPE_MASK) == MDT_TYPE_HASH) {
-			continue;
-		}
-		uint32 offset = phdr.paddr - base;
-		if (phdr.paddr < base || offset + phdr.memsz > regionSize
-			|| phdr.filesz > phdr.memsz || phdr.offset + phdr.filesz > size) {
-			ERROR("zap shader: segment %" B_PRIu32 " does not fit\n", i);
-			status = B_BAD_DATA;
-			break;
-		}
-		for (uint32 b = 0; b < phdr.memsz; b += 4) {
-			uint32 word = 0;
-			if (b < phdr.filesz)
-				memcpy(&word, image + phdr.offset + b, min_c(4, phdr.filesz - b));
-			target.Write(offset + b, word);
-		}
-	}
-	memory_full_barrier();
-	target.Unmap();
 	free(image);
+	if (status == B_OK)
+		status = qcom_pas_auth_and_reset("zap shader", GPU_PAS_ID);
 	if (status != B_OK)
 		return status;
-
-	result = scm_call(SCM_SVC_PIL, SCM_PAS_AUTH_AND_RESET, 1, GPU_PAS_ID);
-	if (result != 0) {
-		ERROR("zap shader: PAS authentication failed: %" B_PRId64 "\n", result);
-		return B_ERROR;
-	}
 	INFO("zap shader loaded\n");
 	return B_OK;
 }
@@ -1835,6 +1619,10 @@ static ConditionVariable sFenceCondition;
 static uint32 sInterrupt;
 static bool sInterruptInstalled;
 static int32 sFaults;
+// a fault the GPU does not come back from: until there is a recovery, GPU
+// work fails from then on (Turnip then reports the device lost, and new
+// processes' OpenGL falls back to software)
+static int32 sGpuLost;
 
 // the first fault's state, dumped by a thread (the interrupt handler cannot
 // map memory)
@@ -1957,6 +1745,14 @@ gpu_interrupt(void*)
 				dprintf("adreno: CP interrupt status 0\n");
 		} else if (faults == 4)
 			dprintf("adreno: more GPU faults, not logged\n");
+	}
+	if ((status & (INT_CP_HW_ERROR | INT_RBBM_HANG_DETECT)) != 0
+		&& atomic_get_and_set(&sGpuLost, 1) == 0) {
+		// halt the CP and stop hearing about it; waiters fail
+		gpu_write(REG_A6XX_CP_SQE_CNTL, 3);
+		gpu_write(RBBM_INT_0_MASK, INT_CP_CACHE_FLUSH_TS);
+		dprintf("adreno: the GPU is lost; GPU work fails until a restart\n");
+		sFenceCondition.NotifyAll();
 	}
 	if ((status & INT_CP_CACHE_FLUSH_TS) != 0)
 		sFenceCondition.NotifyAll();
@@ -2196,14 +1992,25 @@ adreno_completed_fence()
 }
 
 
+bool
+adreno_gpu_lost()
+{
+	return atomic_get(&sGpuLost) != 0;
+}
+
+
 status_t
 adreno_wait_fence(uint32 fence, bigtime_t deadline)
 {
 	while ((int32)(adreno_completed_fence() - fence) < 0) {
+		if (adreno_gpu_lost())
+			return B_DEV_NOT_READY;
 		ConditionVariableEntry entry;
 		sFenceCondition.Add(&entry);
 		if ((int32)(adreno_completed_fence() - fence) >= 0)
 			break;
+		if (adreno_gpu_lost())
+			return B_DEV_NOT_READY;
 		status_t status = entry.Wait(B_ABSOLUTE_TIMEOUT | B_CAN_INTERRUPT,
 			deadline == B_INFINITE_TIMEOUT ? B_INFINITE_TIMEOUT : deadline);
 		if (status == B_TIMED_OUT || status == B_INTERRUPTED)

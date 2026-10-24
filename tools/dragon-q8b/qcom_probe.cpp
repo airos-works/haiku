@@ -216,6 +216,7 @@ probe()
 	bool gpuAhb = clock_on(gcc, 0x71004);
 	bool dispAhb = clock_on(gcc, 0x27004);
 	bool sdAhb = clock_on(gcc, 0x14008);
+	bool videoAhb = clock_on(gcc, 0x28004);
 	delete_area(gccArea);
 
 	if (gpuAhb) {
@@ -372,6 +373,47 @@ probe()
 					delete_area(area);
 				}
 			}
+		}
+	}
+
+	// the video codec's clock controller (videocc-sm8350.c, the SC8280XP
+	// values): GDSCs mvs0c/mvs0 (bit 31 on), branches mvs0c/mvs0, PLL modes
+	if (videoAhb) {
+		area_id area;
+		volatile uint8* videocc = map({"probe videocc", 0xabf0000, 0x10000},
+			area);
+		if (videocc != NULL) {
+			dprintf("qcom_probe: videocc mvs0c gdsc %#" B_PRIx32 " mvs0 gdsc %#"
+				B_PRIx32 " mvs0c clk %#" B_PRIx32 " mvs0 clk %#" B_PRIx32
+				" pll0 %#" B_PRIx32 " pll1 %#" B_PRIx32 " ahb rcg %#" B_PRIx32
+				" mvs0 rcg %#" B_PRIx32 " %#" B_PRIx32 "\n", rd(videocc, 0xbf8),
+				rd(videocc, 0xd18), rd(videocc, 0xc34), rd(videocc, 0xd34),
+				rd(videocc, 0x0), rd(videocc, 0x400), rd(videocc, 0xbd4),
+				rd(videocc, 0xb94), rd(videocc, 0xb98));
+			delete_area(area);
+		}
+	} else
+		dprintf("qcom_probe: video_ahb off, video clock controller left alone\n");
+
+	// the apps SMMU: who has stream mappings (SMR valid), and how
+	{
+		area_id area;
+		volatile uint8* smmu = map({"probe apps smmu", 0x15000000, 0x1000},
+			area);
+		if (smmu != NULL) {
+			uint32 idr0 = rd(smmu, 0x20);
+			uint32 groups = idr0 & 0xff;
+			dprintf("qcom_probe: apps smmu sCR0 %#" B_PRIx32 " IDR0 %#" B_PRIx32
+				", %" B_PRIu32 " stream groups\n", rd(smmu, 0), idr0, groups);
+			for (uint32 i = 0; i < groups && i < 128; i++) {
+				uint32 smr = rd(smmu, 0x800 + 4 * i);
+				if ((smr & (1u << 31)) == 0)
+					continue;
+				dprintf("qcom_probe: apps smmu SMR %" B_PRIu32 " id %#" B_PRIx32
+					" mask %#" B_PRIx32 " S2CR %#" B_PRIx32 "\n", i,
+					smr & 0xffff, (smr >> 16) & 0x7fff, rd(smmu, 0xc00 + 4 * i));
+			}
+			delete_area(area);
 		}
 	}
 
