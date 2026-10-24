@@ -22,6 +22,7 @@
 #include <kdevice_manager.h>
 #include <ACPI.h>
 #include <bus/PCI.h>
+#include <driver_settings.h>
 #include <vm/vm.h>
 
 #include "IORequest.h"
@@ -127,6 +128,13 @@ typedef struct {
 	rw_lock					suspend_lock;
 		// read locked for every command, write locked while suspended
 	bool					suspended;
+
+	pci_device_module_info*	pci;
+	pci_device*				pci_device_cookie;
+	bool					idle_d3;
+		// "s2idle_d3 true" in the nvme_disk driver settings: D3hot in a
+		// suspend to idle, as the platform's low power constraints ask
+	bool					in_idle_d3;
 
 	ConditionVariable		interrupt;
 	uint32					interrupt_id;
@@ -280,6 +288,13 @@ nvme_disk_init_device(void* _info, void** _cookie)
 		(void**)&pcidev);
 	pci->get_pci_info(pcidev, &info->info);
 	sDeviceManager->put_node(parent);
+	info->pci = pci;
+	info->pci_device_cookie = pcidev;
+	info->in_idle_d3 = false;
+	void* settings = load_driver_settings("nvme_disk");
+	info->idle_d3 = get_driver_boolean_parameter(settings, "s2idle_d3", false,
+		true);
+	unload_driver_settings(settings);
 
 	// construct the libnvme pci_device struct
 	pci_device* device = new pci_device;
@@ -1323,8 +1338,26 @@ nvme_disk_suspend(void* _cookie, int32 state)
 
 	// Suspend to idle keeps the controller powered; autonomous power state
 	// transitions already take it to its lowest power state when it idles.
-	if (state == ACPI_POWER_STATE_ON)
+	// With "s2idle_d3", the function goes to D3hot as well (its state stays:
+	// the controller is neither shut down nor reset), with its volatile
+	// write cache flushed and new commands held back until it is back.
+	if (state == ACPI_POWER_STATE_ON) {
+		if (!info->idle_d3 || info->pci->suspend_device == NULL)
+			return B_OK;
+
+		nvme_disk_flush(info);
+		rw_lock_write_lock(&info->suspend_lock);
+		status_t status = info->pci->suspend_device(info->pci_device_cookie,
+			PCI_pm_state_d3);
+		if (status != B_OK) {
+			rw_lock_write_unlock(&info->suspend_lock);
+			TRACE_ALWAYS("no D3 while suspended to idle: %s\n",
+				strerror(status));
+			return B_OK;
+		}
+		info->in_idle_d3 = true;
 		return B_OK;
+	}
 
 	// Wait for pending commands; new ones are blocked until resumed.
 	rw_lock_write_lock(&info->suspend_lock);
@@ -1339,6 +1372,14 @@ static status_t
 nvme_disk_resume(void* _cookie)
 {
 	nvme_disk_driver_info* info = (nvme_disk_driver_info*)_cookie;
+	if (info->ctrlr != NULL && info->in_idle_d3) {
+		info->in_idle_d3 = false;
+		status_t status = info->pci->resume_device(info->pci_device_cookie);
+		if (status != B_OK)
+			TRACE_ERROR("back from D3: %s\n", strerror(status));
+		rw_lock_write_unlock(&info->suspend_lock);
+		return status;
+	}
 	if (info->ctrlr == NULL || !info->suspended)
 		return B_OK;
 	info->suspended = false;
