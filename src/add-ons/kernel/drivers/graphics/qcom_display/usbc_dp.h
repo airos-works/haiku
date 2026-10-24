@@ -62,6 +62,7 @@ public:
 			//! cleared, the link trained again if it lost it.
 			void				Attention();
 			bool				Trained() const { return fTrained; }
+			status_t			ReadEdid(uint8* edid, uint32* _length);
 
 private:
 			status_t			_Map(area_id& area, volatile uint8*& base,
@@ -73,6 +74,7 @@ private:
 									uint32 preEmphasis);
 			status_t			_Clocks();
 			void				_SetPixelClock();
+			status_t			_InitPort();
 			void				_DumpAgainstHdmi();
 			void				_TestPattern(const display_timing& timing);
 			void				_EnableAux();

@@ -364,6 +364,30 @@ disconnect_usbc(display_info* info, uint32 connector)
 }
 
 
+//!	The sink's EDID into its output, for app_server.
+static void
+read_usbc_edid(display_info* info, uint32 connector)
+{
+	qcom_display_output& output = info->shared->outputs[1 + connector];
+	uint32 length = 0;
+	status_t status = info->usbc[connector]->ReadEdid(output.edid, &length);
+	output.edid_length = status == B_OK ? length : 0;
+	// the monitor's name, in its name descriptor (tag 0xfc)
+	char name[14] = "?";
+	for (uint32 offset = 54; status == B_OK && offset <= 108; offset += 18) {
+		const uint8* descriptor = output.edid + offset;
+		if (descriptor[0] != 0 || descriptor[1] != 0 || descriptor[3] != 0xfc)
+			continue;
+		uint32 i = 0;
+		for (; i < 13 && descriptor[5 + i] != '\n'; i++)
+			name[i] = descriptor[5 + i];
+		name[i] = '\0';
+	}
+	INFO("DP-%" B_PRIu32 ": EDID %s (%" B_PRIu32 " bytes, \"%s\")\n",
+		connector + 1, strerror(status), length, name);
+}
+
+
 static void
 notify_change(display_info* info)
 {
@@ -420,6 +444,8 @@ hot_plug_thread(void* data)
 			}
 			if (sink && !connected) {
 				status_t status = connect_usbc(info, connector, &port);
+				if (status == B_OK)
+					read_usbc_edid(info, connector);
 				INFO("DP-%" B_PRIu32 ": a DisplayPort sink on USB-C port %"
 					B_PRIu32 " (pin assignment %u, orientation %u): %s\n",
 					connector + 1, connector, port.pin_assignment,

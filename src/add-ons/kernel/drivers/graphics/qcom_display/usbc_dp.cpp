@@ -889,6 +889,37 @@ UsbcDisplayPort::_DumpAgainstHdmi()
 }
 
 
+status_t
+UsbcDisplayPort::_InitPort()
+{
+	if (fPort != NULL)
+		return B_OK;
+	fPort = new(std::nothrow) DisplayPort(fConnector.controller);
+	if (fPort == NULL || fPort->Init() != B_OK) {
+		ERROR("%s: no AUX channel\n", fConnector.name);
+		delete fPort;
+		fPort = NULL;
+		return B_ERROR;
+	}
+	return B_OK;
+}
+
+
+/*!	The sink's EDID over I2C over AUX (for a DisplayPort to HDMI converter,
+	its monitor's): for app_server, and some converters do not drive their
+	output for a source that never reads it. */
+status_t
+UsbcDisplayPort::ReadEdid(uint8* edid, uint32* _length)
+{
+	if (!fPowered)
+		return B_NO_INIT;
+	status_t status = _InitPort();
+	if (status != B_OK)
+		return status;
+	return fPort->ReadEdid(edid, _length);
+}
+
+
 void
 UsbcDisplayPort::Attention()
 {
@@ -926,15 +957,8 @@ UsbcDisplayPort::_Link(const display_timing& timing, bool wideBus)
 {
 	fTiming = timing;
 	fWideBus = wideBus;
-	if (fPort == NULL) {
-		fPort = new(std::nothrow) DisplayPort(fConnector.controller);
-		if (fPort == NULL || fPort->Init() != B_OK) {
-			ERROR("%s: no AUX channel\n", fConnector.name);
-			delete fPort;
-			fPort = NULL;
-			return;
-		}
-	}
+	if (_InitPort() != B_OK)
+		return;
 	uint32 lanes = fPhyLanes;
 	status_t status = _Train(&lanes);
 	fTrained = status == B_OK;
