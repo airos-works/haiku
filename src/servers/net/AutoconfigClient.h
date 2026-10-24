@@ -21,6 +21,8 @@ public:
 	virtual						~AutoconfigClient();
 
 	virtual	status_t			Start();
+	virtual	void				KeepLease() {}
+									// the link went: the address stays ours
 
 			const BMessenger&	Target() const { return fTarget; }
 			const char*			Device() const { return fDevice.String(); }

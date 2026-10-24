@@ -185,6 +185,8 @@ AutoconfigLooper::_NetworkMonitorNotification(BMessage* message)
 				_ConfigureIPv4();
 				//_ConfigureIPv6();	// TODO: router advertisement and dhcpv6
 			} else if ((media & IFM_ACTIVE) == 0) {
+				if (fCurrentClient != NULL)
+					fCurrentClient->KeepLease();
 				_RemoveClient();
 			}
 
