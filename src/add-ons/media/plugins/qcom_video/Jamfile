@@ -17,7 +17,9 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 			hevc_parse.c
 			IrisDecoder.cpp
 			IrisDevice.cpp
+			IrisEncoder.cpp
 			IrisPlugin.cpp
+			IrisSession.cpp
 			: be media [ TargetLibsupc++ ] [ TargetLibstdc++ ]
 		;
 	}
