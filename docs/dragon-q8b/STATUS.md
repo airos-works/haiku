@@ -6,7 +6,7 @@ table set and a device tree; the kernel prefers the device tree.
 
 | Area | State | Evidence |
 |---|---|---|
-| Boot (UEFI, NVMe) | air/OS installs onto the NVMe with the arm64 ISO's Installer ("whole disk") and boots to the desktop | Samsung PM981; `haiku_loader` page-aligned RX/RW sections for the firmware's W^X |
+| Boot (UEFI, NVMe) | air/OS installs onto the NVMe with the arm64 ISO's Installer ("whole disk") and boots to the desktop; checked again with the CI image of 2026-10-24 (display, GPU, video codec and their firmware all in it) | Samsung PM981; `haiku_loader` page-aligned RX/RW sections for the firmware's W^X |
 | Serial console | the GENI debug UART carries the kernel log | loader re-votes the QUP2 SE1 clocks after ExitBootServices |
 | Clock | the firmware's GetTime(), passed as `haiku,firmware-clock` | |
 | Ethernet (2 x 2.5GbE, TC9563 switch, QCA8081 PHYs) | both ports, 1 Gbit/s tested (the lab switch is gigabit), DHCP; 106 MB/s down, 73 MB/s up | `tc956x` driver; MACs from the board's I2C EEPROM |
