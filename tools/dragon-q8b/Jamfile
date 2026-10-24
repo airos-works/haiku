@@ -1,0 +1,9 @@
+SubDir HAIKU_TOP tools dragon-q8b ;
+
+# Lab tools for the Radxa Dragon Q8B, built only by a UserBuildConfig that
+# includes this directory.
+UsePrivateKernelHeaders ;
+
+KernelAddon qcom_probe :
+	qcom_probe.cpp
+;
