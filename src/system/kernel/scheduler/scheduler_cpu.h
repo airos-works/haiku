@@ -401,7 +401,10 @@ CoreEntry::GetLoad() const
 {
 	SCHEDULER_ENTER_FUNCTION();
 
-	ASSERT(fCPUCount > 0);
+	// (a thread still running on the core's last CPU while that is being
+	// disabled can ask, when it is rescheduled)
+	if (fCPUCount <= 0)
+		return 0;
 	return std::min(fLoad / fCPUCount, kMaxLoad);
 }
 
@@ -413,7 +416,8 @@ CoreEntry::GetRequestedLoad() const
 {
 	SCHEDULER_ENTER_FUNCTION();
 
-	ASSERT(fCPUCount > 0);
+	if (fCPUCount <= 0)
+		return 0;
 	return fLoad / fCPUCount;
 }
 
