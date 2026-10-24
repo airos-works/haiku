@@ -17,7 +17,7 @@ table set and a device tree; the kernel prefers the device tree.
 | Multiple displays | not yet: the USB-C ports' DisplayPort alt mode goes through the ADSP's pmic-glink | |
 | Video decode (Iris) | H.264 and HEVC Main (eight bit 4:2:0, up to 4096x2304) on the codec, through the Media Kit (`qcom_video` add-on, FFmpeg fallback for what it does not decode) and airTime | `qcom_iris` driver, linux-firmware's `qcom/vpu/vpu20_p4.mbn`; byte-exact with libavcodec at 320x240, 720p and 1080p; 1080p H.264 at 306 pictures/s, 720p HEVC at 568/s through the Media Kit, at under one core |
 | Video encode | not started | |
-| Applications | Amp, Burrow, DeckCraft, GridCraft, Kiri, Mail, PdfCraft, WordCraft, airShot, airTime open their windows on the NVMe install | LightCraft and PhotoCraft show empty windows (not looked into) |
+| Applications | Amp, Burrow, DeckCraft, GridCraft, Kiri, Mail, PdfCraft, WordCraft, airShot and airTime open their windows on the NVMe install; LightCraft and PhotoCraft draw with Vulkan on Turnip; Snap runs its effects through zink at 60 frames/s (1 ms a frame); Summit plays video on the codec | the boot script sets the ROCK 5's Panfrost EGL vendor aside on the Dragon: with both Mesas in one team Snap crashed making its second context current |
 | SD card | SDHC2 is clocked by the firmware (SDHCI v3); no card in the slot yet, and `sdhci_fdt` needs a Qualcomm glue | |
 
 ## Known problems
