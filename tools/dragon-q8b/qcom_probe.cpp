@@ -10,6 +10,7 @@
 	drivers/dev/misc by hand; publishes nothing. */
 
 
+#include <stdio.h>
 #include <string.h>
 #include <Drivers.h>
 #include <KernelExport.h>
@@ -433,6 +434,37 @@ probe()
 		}
 	}
 
+	// the CPUs' clocks: EPSS frequency domains (qcom-cpufreq-hw's epss
+	// layout: LUT at 0x100, 4 bytes a row, source in bits 31:30, L in 7:0;
+	// the current L in domain state 0x20; the requested index at 0x320)
+	for (uint32 domain = 0; domain < 2; domain++) {
+		area_id area;
+		volatile uint8* epss = map({"probe epss",
+			0x18591000 + domain * 0x1000, 0x1000}, area);
+		if (epss == NULL)
+			continue;
+		char table[256] = "";
+		size_t used = 0;
+		uint32 entries = 0, previous = 0;
+		for (uint32 i = 0; i < 40; i++) {
+			uint32 row = rd(epss, 0x100 + 4 * i);
+			uint32 mhz = ((row >> 30) != 0 ? 19200 * (row & 0xff) : 300000)
+				/ 1000;
+			if (mhz == previous)
+				break;
+			previous = mhz;
+			entries++;
+			if (used < sizeof(table) - 8)
+				used += snprintf(table + used, sizeof(table) - used, " %u", mhz);
+		}
+		uint32 state = rd(epss, 0x20) & 0xff;
+		dprintf("qcom_probe: cpu domain %" B_PRIu32 ": enable %#" B_PRIx32
+			", running %" B_PRIu32 " MHz, requested index %" B_PRIu32 " of %"
+			B_PRIu32 "; MHz:%s\n", domain, rd(epss, 0), 19200 * state / 1000,
+			rd(epss, 0x320), entries, table);
+		delete_area(area);
+	}
+
 	// the apps SMMU: how the SD controller's stream (0x4e0) is routed
 	{
 		area_id area;
@@ -742,7 +774,7 @@ sd_identify()
 	if (sd == NULL)
 		return;
 
-	// the controller's core clock (gcc_sdcc2_apps_clk, its RCG at 0x14018)
+	// the controller's core clock (gcc_sdcc2_apps_clk, its RCG at 0x1400c)
 	{
 		area_id gccArea;
 		volatile uint8* gcc = map_rw({"probe gcc rw", 0x100000, 0x1f4200},
@@ -750,9 +782,9 @@ sd_identify()
 		if (gcc != NULL) {
 			dprintf("qcom_probe: sd apps clock cbcr %#" B_PRIx32 ", rcg cmd %#"
 				B_PRIx32 " cfg %#" B_PRIx32 " m %#" B_PRIx32 " n %#" B_PRIx32
-				" d %#" B_PRIx32 "\n", rd(gcc, 0x14004), rd(gcc, 0x14018),
-				rd(gcc, 0x1401c), rd(gcc, 0x14020), rd(gcc, 0x14024),
-				rd(gcc, 0x14028));
+				" d %#" B_PRIx32 "\n", rd(gcc, 0x14004), rd(gcc, 0x1400c),
+				rd(gcc, 0x14010), rd(gcc, 0x14014), rd(gcc, 0x14018),
+				rd(gcc, 0x1401c));
 			if ((rd(gcc, 0x14004) & (1u << 31)) != 0) {
 				wr32(gcc, 0x14004, rd(gcc, 0x14004) | 1);
 				spin(100);
@@ -781,24 +813,35 @@ sd_identify()
 	sd_power_ack(sd, "bus power");
 	spin(10000);
 
-	// <= 400 kHz from the RCG's rate (XO 19.2 MHz / ((div + 1) / 2) when
-	// it runs from the XO), the 10-bit divider being N for base / 2N
+	// <= 400 kHz from the RCG's rate (gcc_parent_map_15: XO, GPLL0, GPLL9,
+	// -, -, GPLL4, GPLL0 even; half divider; M/N in dual edge mode), the
+	// 10-bit divider being N for base / 2N
 	uint32 divider = 250;
 	{
 		area_id gccArea;
 		volatile uint8* gcc = map({"probe gcc rd", 0x100000, 0x1f4200},
 			gccArea);
 		if (gcc != NULL) {
-			uint32 cfg = rd(gcc, 0x1401c);
-			if (((cfg >> 8) & 7) == 0) {
-				uint32 halfDiv = cfg & 0x1f;
-				uint32 base = halfDiv != 0 ? 19200000 * 2 / (halfDiv + 1)
-					: 19200000;
-				divider = (base + 2 * 400000 - 1) / (2 * 400000);
-				dprintf("qcom_probe: sd base clock %" B_PRIu32 " Hz, divider %"
-					B_PRIu32 " (%" B_PRIu32 " Hz)\n", base, divider,
-					base / (2 * divider));
+			uint32 cfg = rd(gcc, 0x14010);
+			static const uint64 kSources[8] = {19200000, 600000000,
+				808000000, 0, 0, 806400000, 300000000, 0};
+			uint64 base = kSources[(cfg >> 8) & 7];
+			uint32 halfDiv = cfg & 0x1f;
+			if (halfDiv != 0)
+				base = base * 2 / (halfDiv + 1);
+			if (((cfg >> 12) & 3) == 2) {
+				uint32 m = rd(gcc, 0x14014) & 0xff;
+				uint32 n = ((~rd(gcc, 0x14018)) & 0xff) + m;
+				if (n != 0)
+					base = base * m / n;
 			}
+			if (base != 0)
+				divider = (uint32)((base + 2 * 400000 - 1) / (2 * 400000));
+			if (divider == 0)
+				divider = 1;
+			dprintf("qcom_probe: sd base clock %" B_PRIu64 " Hz (cfg %#" B_PRIx32
+				"), divider %" B_PRIu32 " (%" B_PRIu64 " Hz)\n", base, cfg,
+				divider, base / (2 * divider));
 			delete_area(gccArea);
 		}
 	}
