@@ -251,11 +251,26 @@ physical_page(phys_addr_t address)
 static void
 save_trace_to_memory()
 {
+	x86_suspend_save_trace();
+}
+
+
+/*!	Keeps the end of the suspend trace (what happened last) in a page that a
+	warm reboot leaves alone; the next boot prints it. Safe in an interrupt
+	handler. */
+void
+x86_suspend_save_trace()
+{
+	static char trace[16384];
+	size_t length = device_manager_get_suspend_trace(trace, sizeof(trace));
+	size_t room = B_PAGE_SIZE - 9;
+	size_t start = length > room ? length - room : 0;
+
 	uint32* page = (uint32*)physical_page(kTracePage);
 	char* text = (char*)(page + 2);
-	size_t length = device_manager_get_suspend_trace(text, B_PAGE_SIZE - 8);
+	memcpy(text, trace + start, length - start);
 	page[0] = kTraceMagic;
-	page[1] = (uint32)length;
+	page[1] = (uint32)(length - start);
 }
 
 
@@ -871,9 +886,12 @@ suspend_syscall(const char* subsystem, uint32 function, void* buffer,
 
 		case X86_SUSPEND_GET_TRACE:
 		{
-			char trace[4096];
-			size_t length = device_manager_get_suspend_trace(trace,
-				sizeof(trace));
+			const size_t size = 16384;
+			char* trace = (char*)malloc(size);
+			if (trace == NULL)
+				return B_NO_MEMORY;
+			MemoryDeleter traceDeleter(trace);
+			size_t length = device_manager_get_suspend_trace(trace, size);
 			if (bufferSize < length + 1 || !IS_USER_ADDRESS(buffer))
 				return B_BAD_VALUE;
 			return user_memcpy(buffer, trace, length + 1);

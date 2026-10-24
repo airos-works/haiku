@@ -37,6 +37,7 @@
 
 #include <cpu.h>
 #include <debug.h>
+#include <driver_settings.h>
 #include <interrupts.h>
 #include <kdevice_manager.h>
 #include <kernel.h>
@@ -45,6 +46,7 @@
 #include <syscalls.h>
 #include <thread.h>
 #include <timer.h>
+#include <arch/cpu.h>
 #include <arch/timer.h>
 #include <util/AutoLock.h>
 #include <vm/vm.h>
@@ -135,6 +137,24 @@ static const char* const kAMDIPBlocks[] = {
 #define AMD_FCH_S0I3_ENTRY			0x130
 #define AMD_FCH_S0I3_EXIT			0x138
 
+// The response register of the mailbox ALIB talks to the firmware through
+// (SMN address); 0 while a message is pending.
+#define AMD_ALIB_RESPONSE			0x03b10578
+
+// AMD's USB4 host interfaces (PCI class 0c0340)
+#define USB4_MAX_NHIS				4
+#define USB4_CLASS_API				0x40
+
+struct usb4_nhi {
+	uint8	bus;
+	uint8	device;
+	uint8	function;
+	uint8	pm_capability;
+	char	path[128];
+	uint32	config[16];
+	bool	off;
+};
+
 
 static mutex sLock = MUTEX_INITIALIZER("s2idle");
 
@@ -152,6 +172,10 @@ static bool sPMCProbed;
 
 static char sLidPath[128];
 static bool sLidProbed;
+
+static usb4_nhi sNHIs[USB4_MAX_NHIS];
+static int32 sNHICount;
+static bool sNHIProbed;
 
 static int32 sSCI = -1;
 static int32 sActive;
@@ -678,7 +702,261 @@ s0i3_settle(uint64* _lastEntry)
 }
 
 
+//	#pragma mark - USB4
+
+
+/*!	Without a USB4 connection manager, the USB4 host routers stay up, and
+	with them the USB3 controllers behind them ("USB3_0", "USB3_1" in the
+	PMC log): what Linux does in its place is to put the host interfaces
+	into D3 in the sleep, and their _PS3 asks the firmware (ALIB function
+	0x14) to power the USB4 domain down. Opt-in, "usb4_power_off true" in
+	the "suspend" kernel settings: it runs after the drivers' suspend hooks
+	and is undone before their resume hooks, so the USB3 controllers sleep
+	before their domain goes and come back after it.
+*/
+static status_t
+acpi_address(const char* path, uint64* _address)
+{
+	char method[160];
+	snprintf(method, sizeof(method), "%s._ADR", path);
+
+	acpi_data result = { ACPI_ALLOCATE_BUFFER, NULL };
+	status_t status = sACPI->evaluate_method(NULL, method, NULL, &result);
+	if (status == B_OK) {
+		acpi_object_type* object = (acpi_object_type*)result.pointer;
+		if (object != NULL && object->object_type == ACPI_TYPE_INTEGER)
+			*_address = object->integer.integer;
+		else
+			status = B_BAD_DATA;
+	}
+	free(result.pointer);
+	return status;
+}
+
+
+/*!	Finds the NHI's ACPI device: the child (by _ADR) of the root port
+	whose secondary bus it is on. */
+static bool
+usb4_find_path(pci_module_info* pci, usb4_nhi& nhi)
+{
+	char root[128];
+	if (sACPI->get_device("PNP0A08", 0, root, sizeof(root)) != B_OK)
+		return false;
+
+	char bridge[128];
+	void* bridgeCounter = NULL;
+	while (sACPI->get_next_entry(ACPI_TYPE_DEVICE, root, bridge,
+			sizeof(bridge), &bridgeCounter) == B_OK) {
+		uint64 address;
+		if (acpi_address(bridge, &address) != B_OK)
+			continue;
+		uint8 device = (address >> 16) & 0x1f;
+		uint8 function = address & 0x7;
+		if ((pci->read_pci_config(0, device, function, PCI_header_type, 1)
+					& PCI_header_type_mask) != PCI_header_type_PCI_to_PCI_bridge
+			|| pci->read_pci_config(0, device, function, PCI_secondary_bus, 1)
+				!= nhi.bus) {
+			continue;
+		}
+
+		char child[128];
+		void* counter = NULL;
+		while (sACPI->get_next_entry(ACPI_TYPE_DEVICE, bridge, child,
+				sizeof(child), &counter) == B_OK) {
+			if (acpi_address(child, &address) == B_OK
+				&& address == (((uint64)nhi.device << 16) | nhi.function)) {
+				strlcpy(nhi.path, child, sizeof(nhi.path));
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+
+static void
+usb4_probe(pci_module_info* pci)
+{
+	if (sNHIProbed)
+		return;
+	sNHIProbed = true;
+
+	pci_info info;
+	for (int32 i = 0; pci->get_nth_pci_info(i, &info) == B_OK
+			&& sNHICount < USB4_MAX_NHIS; i++) {
+		if (info.vendor_id != 0x1022 || info.class_base != PCI_serial_bus
+			|| info.class_sub != PCI_usb || info.class_api != USB4_CLASS_API) {
+			continue;
+		}
+		usb4_nhi& nhi = sNHIs[sNHICount];
+		nhi.bus = info.bus;
+		nhi.device = info.device;
+		nhi.function = info.function;
+		if (pci->find_pci_capability(nhi.bus, nhi.device, nhi.function,
+				PCI_cap_id_pm, &nhi.pm_capability) != B_OK
+			|| !usb4_find_path(pci, nhi)) {
+			INFO("USB4 host interface %02x:%02x.%x: no power management or "
+				"ACPI device\n", nhi.bus, nhi.device, nhi.function);
+			continue;
+		}
+		INFO("USB4 host interface %02x:%02x.%x is %s\n", nhi.bus, nhi.device,
+			nhi.function, nhi.path);
+		sNHICount++;
+	}
+}
+
+
+static uint32
+alib_response(pci_module_info* pci)
+{
+	InterruptsLocker _;
+	pci->write_pci_config(0, 0, 0, AMD_SMN_INDEX, 4, AMD_ALIB_RESPONSE);
+	return pci->read_pci_config(0, 0, 0, AMD_SMN_DATA, 4);
+}
+
+
+static bool
+usb4_power_off_wanted()
+{
+	void* settings = load_driver_settings("suspend");
+	bool wanted = get_driver_boolean_parameter(settings, "usb4_power_off",
+		false, true);
+	unload_driver_settings(settings);
+	return wanted;
+}
+
+
+static void
+usb4_power_off()
+{
+	pci_module_info* pci;
+	if (get_module(B_PCI_MODULE_NAME, (module_info**)&pci) != B_OK)
+		return;
+	usb4_probe(pci);
+
+	for (int32 i = 0; i < sNHICount; i++) {
+		usb4_nhi& nhi = sNHIs[i];
+		nhi.off = false;
+
+		// a mailbox that never answers would hold the _PS3 for the ACPI
+		// loop timeout (and the next message, too)
+		uint32 response = alib_response(pci);
+		if (response == 0) {
+			INFO("USB4 %s: the firmware's mailbox is busy, stays on\n",
+				nhi.path);
+			continue;
+		}
+
+		for (uint32 j = 0; j < B_COUNT_OF(nhi.config); j++) {
+			nhi.config[j] = pci->read_pci_config(nhi.bus, nhi.device,
+				nhi.function, j * 4, 4);
+		}
+		uint16 control = pci->read_pci_config(nhi.bus, nhi.device,
+			nhi.function, nhi.pm_capability + PCI_pm_status, 2);
+		// with PME on, as Linux leaves it (the routers' wakes come that way)
+		pci->write_pci_config(nhi.bus, nhi.device, nhi.function,
+			nhi.pm_capability + PCI_pm_status, 2,
+			(control & ~PCI_pm_mask) | PCI_pm_status_pme_enable
+				| PCI_pm_status_pme_status | PCI_pm_state_d3);
+		snooze(10000);
+		nhi.off = true;
+
+		char method[sizeof(nhi.path) + 8];
+		snprintf(method, sizeof(method), "%s._PS3", nhi.path);
+		INFO("USB4 %s: in D3, %s\n", nhi.path, method);
+		bigtime_t start = system_time();
+		status_t status = sACPI->evaluate_method(NULL, method, NULL, NULL);
+		INFO("USB4 %s off: pmcsr %#" B_PRIx32 ", _PS3 %s in %" B_PRIdBIGTIME
+			" ms, mailbox %#" B_PRIx32 " -> %#" B_PRIx32 "\n", nhi.path,
+			pci->read_pci_config(nhi.bus, nhi.device, nhi.function,
+				nhi.pm_capability + PCI_pm_status, 2),
+			strerror(status), (system_time() - start) / 1000, response,
+			alib_response(pci));
+	}
+	put_module(B_PCI_MODULE_NAME);
+}
+
+
+static void
+usb4_power_on()
+{
+	pci_module_info* pci;
+	if (get_module(B_PCI_MODULE_NAME, (module_info**)&pci) != B_OK)
+		return;
+
+	for (int32 i = sNHICount - 1; i >= 0; i--) {
+		usb4_nhi& nhi = sNHIs[i];
+		if (!nhi.off)
+			continue;
+		nhi.off = false;
+
+		uint16 control = pci->read_pci_config(nhi.bus, nhi.device,
+			nhi.function, nhi.pm_capability + PCI_pm_status, 2);
+		pci->write_pci_config(nhi.bus, nhi.device, nhi.function,
+			nhi.pm_capability + PCI_pm_status, 2,
+			(control & ~(PCI_pm_mask | PCI_pm_status_pme_enable))
+				| PCI_pm_status_pme_status);
+		snooze(10000);
+
+		char method[sizeof(nhi.path) + 8];
+		snprintf(method, sizeof(method), "%s._PS0", nhi.path);
+		status_t status = sACPI->evaluate_method(NULL, method, NULL, NULL);
+
+		// D3hot to D0 resets it (No_Soft_Reset is clear): the BARs and the
+		// rest of the header come back, the command register last
+		for (uint32 j = B_COUNT_OF(nhi.config) - 1; j >= 2; j--) {
+			pci->write_pci_config(nhi.bus, nhi.device, nhi.function, j * 4, 4,
+				nhi.config[j]);
+		}
+		pci->write_pci_config(nhi.bus, nhi.device, nhi.function, PCI_command,
+			2, nhi.config[1] & 0xffff);
+
+		INFO("USB4 %s on: pmcsr %#" B_PRIx32 ", _PS0 %s, id %#" B_PRIx32
+			", bar0 %#" B_PRIx32 "\n", nhi.path,
+			pci->read_pci_config(nhi.bus, nhi.device, nhi.function,
+				nhi.pm_capability + PCI_pm_status, 2),
+			strerror(status),
+			pci->read_pci_config(nhi.bus, nhi.device, nhi.function, 0, 4),
+			pci->read_pci_config(nhi.bus, nhi.device, nhi.function, 0x10, 4));
+	}
+
+	// the USB3 controllers on the same bus (the ones behind the routers)
+	for (int32 i = 0; i < sNHICount; i++) {
+		if (i > 0 && sNHIs[i].bus == sNHIs[i - 1].bus)
+			continue;
+		for (uint8 function = 0; function < 8; function++) {
+			uint32 id = pci->read_pci_config(sNHIs[i].bus, 0, function, 0, 4);
+			if (id == 0xffffffff)
+				continue;
+			INFO("USB4 domain back: %02x:00.%u id %#" B_PRIx32 " class %#"
+				B_PRIx32 "\n", sNHIs[i].bus, function, id,
+				pci->read_pci_config(sNHIs[i].bus, 0, function, 8, 4) >> 8);
+		}
+	}
+	put_module(B_PCI_MODULE_NAME);
+}
+
+
 //	#pragma mark - the sleep
+
+
+/*!	A suspend or resume that does not finish (a driver that never comes
+	back) leaves nothing to look at: the machine reboots instead, warm, so
+	that the next boot prints the end of the suspend trace. */
+static const bigtime_t kResumeWatchdogTimeout = 90000000;
+static timer sResumeWatchdog;
+static const char* sWatchdogPhase;
+
+
+static int32
+resume_watchdog(timer* /*timer*/)
+{
+	device_manager_suspend_trace("the %s did not finish in %" B_PRIdBIGTIME
+		" s: rebooting", sWatchdogPhase, kResumeWatchdogTimeout / 1000000);
+	x86_suspend_save_trace();
+	arch_cpu_shutdown(true);
+	return B_HANDLED_INTERRUPT;
+}
 
 
 static int32
@@ -757,8 +1035,18 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 		deviceFlags |= DEVICE_MANAGER_SKIP_DEVICE_TREE;
 	if ((flags & X86_SUSPEND_LIGHT_SLEEP) != 0)
 		deviceFlags |= DEVICE_MANAGER_LIGHT_SLEEP;
+	// (read before the disks may sleep)
+	bool usb4Off = (flags & (X86_SUSPEND_SKIP_DEVICES
+			| X86_SUSPEND_LIGHT_SLEEP)) == 0
+		&& gCPU[0].arch.vendor == VENDOR_AMD && usb4_power_off_wanted();
+
+	sWatchdogPhase = "suspend";
+	add_timer(&sResumeWatchdog, &resume_watchdog, kResumeWatchdogTimeout,
+		B_ONE_SHOT_RELATIVE_TIMER);
 	if ((flags & X86_SUSPEND_SKIP_DEVICES) == 0)
 		device_manager_suspend(ACPI_POWER_STATE_ON, deviceFlags);
+	if (usb4Off)
+		usb4_power_off();
 
 	// as Linux's acpi_s2idle_prepare_late() and amd_pmc_s2idle_prepare()
 	if (sLPS0Path[0] != '\0') {
@@ -803,6 +1091,7 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 	// No timer interrupts: only the SCI (and devices) end the idling, or the
 	// one timer interrupt at the end of the timeout. (The kernel's own timers
 	// would wake the CPU hundreds of times a second.)
+	cancel_timer(&sResumeWatchdog);
 	bigtime_t start = system_time();
 	bigtime_t deadline = args->timeout_ms != 0
 			&& (!rtcAlarm || (flags & X86_SUSPEND_RTC_WAKE_ONLY) == 0)
@@ -884,6 +1173,10 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 		arch_timer_set_hardware_timer(1000);
 	}
 
+	sWatchdogPhase = "resume";
+	add_timer(&sResumeWatchdog, &resume_watchdog, kResumeWatchdogTimeout,
+		B_ONE_SHOT_RELATIVE_TIMER);
+
 	set_thread_priority(thread->id, oldPriority);
 	if (rtcAlarm) {
 		rtc_disarm_alarm();
@@ -907,9 +1200,12 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 		lps0_amd(LPS0_AMD_SCREEN_ON);
 	}
 
+	if (usb4Off)
+		usb4_power_on();
 	if ((flags & X86_SUSPEND_SKIP_DEVICES) == 0)
 		device_manager_resume(deviceFlags);
 
+	cancel_timer(&sResumeWatchdog);
 	scheduler_set_operation_mode((scheduler_mode)oldMode);
 
 	thread_unpin_from_current_cpu(thread);

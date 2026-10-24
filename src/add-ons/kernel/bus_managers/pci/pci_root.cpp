@@ -129,12 +129,14 @@ static bool sSuspendedToIdle;
 static status_t
 pci_root_suspend(void* cookie, int32 state)
 {
-	// Suspend to idle keeps the devices powered, and so their configuration;
-	// writing it back under devices that are still running would only
-	// disturb them (it disables them for a moment).
+	// Suspend to idle keeps the devices powered, and so their configuration,
+	// unless the SoC reached its deepest state: it is only written back to
+	// those that lost it, see PCI::SaveConfigurationForIdle().
 	sSuspendedToIdle = state == ACPI_POWER_STATE_ON;
-	if (sSuspendedToIdle)
+	if (sSuspendedToIdle) {
+		gPCI->SaveConfigurationForIdle();
 		return B_OK;
+	}
 
 	gPCI->SaveConfiguration();
 	return B_OK;
@@ -146,6 +148,7 @@ pci_root_resume(void* cookie)
 {
 	if (sSuspendedToIdle) {
 		sSuspendedToIdle = false;
+		gPCI->RestoreLostConfiguration();
 		return B_OK;
 	}
 

@@ -100,6 +100,7 @@ status_t x86_suspend_init(void);
 status_t x86_suspend_restart_cpu(int32 cpu);
 status_t x86_suspend_enter_s3(const struct x86_suspend_s3_args* args);
 status_t x86_suspend_enter_s2idle(struct x86_suspend_s2idle_args* args);
+void x86_suspend_save_trace(void);
 
 #ifdef __cplusplus
 }

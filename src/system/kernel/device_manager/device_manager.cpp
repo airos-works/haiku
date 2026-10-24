@@ -2488,7 +2488,7 @@ static bool sSuspendVerbose;
 
 // A short trace of the last suspend and resume. Kept in memory, because a
 // machine that resumed badly often cannot write its log to disk any more.
-static char sSuspendTrace[4096];
+static char sSuspendTrace[16384];
 static size_t sSuspendTraceLength;
 static spinlock sSuspendTraceLock = B_SPINLOCK_INITIALIZER;
 

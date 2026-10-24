@@ -172,6 +172,8 @@ public:
 
 			void			SaveConfiguration();
 			void			RestoreConfiguration();
+			void			SaveConfigurationForIdle();
+			void			RestoreLostConfiguration();
 
 			status_t		SuspendDevice(PCIDev *device, uint8 state);
 			status_t		ResumeDevice(PCIDev *device);
@@ -221,6 +223,9 @@ private:
 			void			_SaveConfiguration(PCIBus *bus);
 			void			_SaveDeviceConfiguration(PCIDev *device);
 			void			_RestoreConfiguration(PCIBus *bus);
+			void			_SaveConfigurationForIdle(PCIBus *bus);
+			void			_RestoreLostConfiguration(PCIBus *bus);
+			bool			_ConfigurationLost(PCIDev *device);
 			void			_RestoreDeviceConfiguration(PCIDev *device);
 
 			uint64			_BarSize(uint64 bits);
