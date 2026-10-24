@@ -41,6 +41,11 @@
 
 #include "ether_driver.h"
 
+#include <libfdt.h>
+
+
+extern void* gFDT;
+
 
 //#define TRACE_TC956X
 #ifdef TRACE_TC956X
@@ -1589,6 +1594,271 @@ static device_hooks sDeviceHooks = {
 };
 
 
+//	#pragma mark - MAC addresses from the board's EEPROM
+
+
+/*	The device tree gives each function's address as an "nvmem-cells" cell
+	of an I2C EEPROM; on the Dragon that is a 24C16 at 0x50 on a Qualcomm
+	GENI serial engine. The engine is only touched when its clocks are
+	known to run: they are voted on and checked first. */
+
+#define GENI_SER_M_CLK_CFG		0x048
+#define GENI_FW_REVISION		0x068
+#define  FW_PROTOCOL_I2C		3
+#define SE_GENI_CLK_SEL			0x07c
+#define SE_GENI_BYTE_GRAN		0x254
+#define SE_GENI_DMA_MODE_EN		0x258
+#define SE_GENI_TX_PACKING_CFG0	0x260
+#define SE_GENI_TX_PACKING_CFG1	0x264
+#define SE_I2C_TX_TRANS_LEN		0x26c
+#define SE_I2C_RX_TRANS_LEN		0x270
+#define SE_I2C_SCL_COUNTERS		0x278
+#define SE_GENI_RX_PACKING_CFG0	0x284
+#define SE_GENI_RX_PACKING_CFG1	0x288
+#define SE_GENI_M_CMD0			0x600
+#define SE_GENI_M_CMD_CTRL		0x604
+#define  M_GENI_CMD_ABORT		(1u << 1)
+#define SE_GENI_M_IRQ_STATUS	0x610
+#define SE_GENI_M_IRQ_CLEAR		0x618
+#define  M_CMD_DONE				(1u << 0)
+#define  M_CMD_FAILURE			(1u << 3)
+#define  M_CMD_ABORT			(1u << 5)
+#define  M_NACK					(1u << 10)
+#define SE_GENI_TX_FIFO			0x700
+#define SE_GENI_RX_FIFO			0x780
+#define SE_GENI_RX_FIFO_STATUS	0x804
+#define  RX_FIFO_WORDS(x)		((x) & 0x1ffffff)
+#define I2C_WRITE				1
+#define I2C_READ				2
+#define I2C_STOP_STRETCH		(1u << 2)
+#define I2C_ADDRESS_SHIFT		9
+// 8 bit words, four to a FIFO entry, as Linux' geni_se_config_packing()
+#define PACKING_CFG0			0x7f8fe
+#define PACKING_CFG1			0xffefe
+// 400 kHz from 19.2 MHz: divider 2, high 5, low 11, cycle 22
+#define I2C_CLOCK_DIVIDER		2
+#define I2C_SCL_COUNTERS		(5u << 20 | 11u << 10 | 22u)
+
+static const struct geni_i2c_clocks {
+	const char*	soc_compat;
+	phys_addr_t	engine;
+	uint32		vote;			// offset in the clock controller
+	uint32		vote_mask;
+	uint32		branches[5];	// CBCRs: bit 31 = off, bit 1 = hardware gated
+} kGeniI2cClocks[] = {
+	// SC8280XP QUP1 SE4: core_2x, core, m_ahb, s_ahb, se
+	{ "qcom,sc8280xp", 0xa90000, 0x52008,
+		1u << 18 | 1u << 19 | 1u << 20 | 1u << 21 | 1u << 26,
+		{ 0x18014, 0x1800c, 0x18004, 0x18008, 0x18604 } },
+};
+#define SC8280XP_GCC			0x100000
+#define SC8280XP_GCC_SIZE		0x1f4200
+
+
+static bool
+geni_i2c_power_up(phys_addr_t engine)
+{
+	const geni_i2c_clocks* clocks = NULL;
+	for (size_t i = 0; i < B_COUNT_OF(kGeniI2cClocks); i++) {
+		if (kGeniI2cClocks[i].engine == engine && fdt_node_check_compatible(
+				gFDT, 0, kGeniI2cClocks[i].soc_compat) == 0) {
+			clocks = &kGeniI2cClocks[i];
+		}
+	}
+	if (clocks == NULL)
+		return false;
+
+	volatile uint8* gcc;
+	area_id area = map_physical_memory("tc956x clock controller",
+		SC8280XP_GCC, SC8280XP_GCC_SIZE, B_ANY_KERNEL_ADDRESS,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&gcc);
+	if (area < 0)
+		return false;
+
+	mmio_write(gcc, clocks->vote, mmio_read(gcc, clocks->vote)
+		| clocks->vote_mask);
+	bool running = false;
+	for (int attempt = 0; attempt < 100 && !running; attempt++) {
+		running = true;
+		for (size_t i = 0; i < B_COUNT_OF(clocks->branches); i++) {
+			uint32 branch = mmio_read(gcc, clocks->branches[i]);
+			if ((branch & (1u << 31)) != 0 && (branch & (1u << 1)) == 0)
+				running = false;
+		}
+		if (!running)
+			spin(10);
+	}
+	delete_area(area);
+	return running;
+}
+
+
+static size_t
+geni_i2c_drain(volatile uint8* se, uint8* data, size_t length, size_t received)
+{
+	uint32 words = RX_FIFO_WORDS(mmio_read(se, SE_GENI_RX_FIFO_STATUS));
+	for (uint32 i = 0; i < words; i++) {
+		uint32 word = mmio_read(se, SE_GENI_RX_FIFO);
+		for (int b = 0; b < 4 && received < length; b++, word >>= 8)
+			data[received++] = word & 0xff;
+	}
+	return received;
+}
+
+
+/*!	Waits for the command to finish, collecting \a length bytes into \a data
+	if it reads.
+*/
+static status_t
+geni_i2c_wait(volatile uint8* se, uint8* data, size_t length)
+{
+	size_t received = 0;
+	bigtime_t timeout = system_time() + 100000;
+	while (true) {
+		if (data != NULL)
+			received = geni_i2c_drain(se, data, length, received);
+
+		uint32 status = mmio_read(se, SE_GENI_M_IRQ_STATUS);
+		if ((status & (M_CMD_FAILURE | M_NACK)) != 0) {
+			mmio_write(se, SE_GENI_M_IRQ_CLEAR, status);
+			return B_IO_ERROR;
+		}
+		if ((status & M_CMD_DONE) != 0) {
+			if (data != NULL)
+				received = geni_i2c_drain(se, data, length, received);
+			mmio_write(se, SE_GENI_M_IRQ_CLEAR, status);
+			return received == length ? B_OK : B_IO_ERROR;
+		}
+		if (system_time() > timeout) {
+			mmio_write(se, SE_GENI_M_CMD_CTRL, M_GENI_CMD_ABORT);
+			spin(1000);
+			mmio_write(se, SE_GENI_M_IRQ_CLEAR, 0xffffffff);
+			return B_TIMED_OUT;
+		}
+		spin(10);
+	}
+}
+
+
+/*!	Reads \a length bytes at \a offset of the 24Cxx EEPROM at \a address. */
+static status_t
+geni_i2c_read_eeprom(phys_addr_t engine, uint32 address, uint32 offset,
+	uint8* data, size_t length)
+{
+	if (!geni_i2c_power_up(engine))
+		return B_NOT_SUPPORTED;
+
+	volatile uint8* se;
+	area_id area = map_physical_memory("tc956x eeprom i2c", engine, 0x4000,
+		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
+		(void**)&se);
+	if (area < 0)
+		return area;
+
+	status_t status = B_NOT_SUPPORTED;
+	if (((mmio_read(se, GENI_FW_REVISION) >> 8) & 0xff) == FW_PROTOCOL_I2C) {
+		mmio_write(se, SE_GENI_CLK_SEL, 0);
+		mmio_write(se, GENI_SER_M_CLK_CFG, I2C_CLOCK_DIVIDER << 4 | 1);
+		mmio_write(se, SE_I2C_SCL_COUNTERS, I2C_SCL_COUNTERS);
+		mmio_write(se, SE_GENI_TX_PACKING_CFG0, PACKING_CFG0);
+		mmio_write(se, SE_GENI_TX_PACKING_CFG1, PACKING_CFG1);
+		mmio_write(se, SE_GENI_RX_PACKING_CFG0, PACKING_CFG0);
+		mmio_write(se, SE_GENI_RX_PACKING_CFG1, PACKING_CFG1);
+		mmio_write(se, SE_GENI_BYTE_GRAN, 0);
+		mmio_write(se, SE_GENI_DMA_MODE_EN, 0);
+		mmio_write(se, SE_GENI_M_IRQ_CLEAR, 0xffffffff);
+
+		// the word address, then a repeated start to read
+		uint32 device = (address | ((offset >> 8) & 7)) << I2C_ADDRESS_SHIFT;
+		mmio_write(se, SE_I2C_TX_TRANS_LEN, 1);
+		mmio_write(se, SE_GENI_M_CMD0, I2C_WRITE << 27 | device
+			| I2C_STOP_STRETCH);
+		mmio_write(se, SE_GENI_TX_FIFO, offset & 0xff);
+		status = geni_i2c_wait(se, NULL, 0);
+		if (status == B_OK) {
+			mmio_write(se, SE_I2C_RX_TRANS_LEN, length);
+			mmio_write(se, SE_GENI_M_CMD0, I2C_READ << 27 | device);
+			status = geni_i2c_wait(se, data, length);
+		}
+	}
+
+	delete_area(area);
+	return status;
+}
+
+
+static inline uint32
+fdt_cell(const void* property, int index)
+{
+	return fdt32_to_cpu(((const fdt32_t*)property)[index]);
+}
+
+
+/*!	Gets the address the device tree's "nvmem-cells" of the TC956x function
+	\a function names, if it is in an EEPROM this driver can read.
+*/
+static bool
+board_mac_address(uint8 function, uint8* address)
+{
+	if (gFDT == NULL)
+		return false;
+
+	int node = -1;
+	while ((node = fdt_node_offset_by_compatible(gFDT, node, "pci1179,0220"))
+			>= 0) {
+		int length;
+		const void* reg = fdt_getprop(gFDT, node, "reg", &length);
+		if (reg != NULL && length >= 4
+			&& ((fdt_cell(reg, 0) >> 8) & 7) == function) {
+			break;
+		}
+	}
+	if (node < 0)
+		return false;
+
+	int length;
+	const void* cells = fdt_getprop(gFDT, node, "nvmem-cells", &length);
+	if (cells == NULL || length < 4)
+		return false;
+	int cell = fdt_node_offset_by_phandle(gFDT, fdt_cell(cells, 0));
+	const void* cellReg = cell >= 0
+		? fdt_getprop(gFDT, cell, "reg", &length) : NULL;
+	if (cellReg == NULL || length != 8 || fdt_cell(cellReg, 1) != 6)
+		return false;
+
+	// the cell's layout, the EEPROM, its I2C controller
+	int layout = fdt_parent_offset(gFDT, cell);
+	int eeprom = layout >= 0 ? fdt_parent_offset(gFDT, layout) : -1;
+	int controller = eeprom >= 0 ? fdt_parent_offset(gFDT, eeprom) : -1;
+	if (controller < 0
+		|| fdt_node_check_compatible(gFDT, eeprom, "atmel,24c16") != 0
+		|| fdt_node_check_compatible(gFDT, controller, "qcom,geni-i2c") != 0) {
+		return false;
+	}
+	const void* eepromReg = fdt_getprop(gFDT, eeprom, "reg", &length);
+	const void* controllerReg = fdt_getprop(gFDT, controller, "reg", &length);
+	if (eepromReg == NULL || controllerReg == NULL || length < 8)
+		return false;
+	phys_addr_t engine = (phys_addr_t)fdt_cell(controllerReg, 0) << 32
+		| fdt_cell(controllerReg, 1);
+
+	uint8 data[6];
+	status_t status = geni_i2c_read_eeprom(engine, fdt_cell(eepromReg, 0),
+		fdt_cell(cellReg, 0), data, sizeof(data));
+	if (status != B_OK) {
+		ERROR("reading the MAC address from the EEPROM failed: %s\n",
+			strerror(status));
+		return false;
+	}
+	if ((data[0] & 1) != 0 || memcmp(data, "\0\0\0\0\0\0", 6) == 0
+		|| memcmp(data, "\xff\xff\xff\xff\xff\xff", 6) == 0) {
+		return false;
+	}
+	memcpy(address, data, 6);
+	return true;
+}
+
+
 //	#pragma mark - driver
 
 
@@ -1702,12 +1972,12 @@ device_init(tc956x_device* device)
 	device->linkChangeSemaphore = -1;
 	device->linkThread = -1;
 
-	// TODO: the board's addresses are in the I2C EEPROM the device tree
-	// names ("nvmem-cells"); until there is a driver for it, a locally
-	// administered one per MAC.
-	const uint8 address[6] = {0x02, 0x11, 0x79, 0x02, 0x20,
-		(uint8)device->mac};
-	memcpy(device->macAddress, address, 6);
+	// The board's address, or a locally administered one per MAC.
+	if (!board_mac_address(device->mac, device->macAddress)) {
+		const uint8 address[6] = {0x02, 0x11, 0x79, 0x02, 0x20,
+			(uint8)device->mac};
+		memcpy(device->macAddress, address, 6);
+	}
 
 	INFO("%s: function %u.%u.%u, MSI vector %" B_PRIu32 ", revision %#x, "
 		"%02x:%02x:%02x:%02x:%02x:%02x\n", device->name, pci.bus, pci.device,
