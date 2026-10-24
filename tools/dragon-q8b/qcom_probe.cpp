@@ -1343,6 +1343,64 @@ dp_phy_test()
 }
 
 
+// #pragma mark - the SD stream's SMMU context bank
+
+
+/*!	What context bank 2 of the apps SMMU (the SD controller's stream 0x4e0)
+	holds: its registers, and its stage 1 walk for a few addresses. */
+static void
+sd_smmu_bank()
+{
+	area_id area;
+	volatile uint8* smmu = map({"probe apps smmu all", 0x15000000, 0x100000},
+		area);
+	if (smmu == NULL)
+		return;
+	uint32 idr1 = rd(smmu, 0x24);
+	uint32 page = (idr1 & (1u << 31)) != 0 ? 0x10000 : 0x1000;
+	uint32 pages = 1u << (((idr1 >> 28) & 7) + 1);
+	uint32 bank = 2;
+	volatile uint8* cb = smmu + pages * page + bank * page;
+	uint32 sctlr = rd(cb, 0), tcr = rd(cb, 0x30), tcr2 = rd(cb, 0x10);
+	uint64 ttbr0 = rd(cb, 0x20) | (uint64)rd(cb, 0x24) << 32;
+	dprintf("qcom_probe: smmu cb2: cbar %#" B_PRIx32 " cba2r %#" B_PRIx32
+		" sctlr %#" B_PRIx32 " tcr %#" B_PRIx32 " tcr2 %#" B_PRIx32 " ttbr0 %#"
+		B_PRIx64 " mair %#" B_PRIx32 " fsr %#" B_PRIx32 "\n",
+		rd(smmu, page + 4 * bank), rd(smmu, page + 0x800 + 4 * bank), sctlr,
+		tcr, tcr2, ttbr0, rd(cb, 0x38), rd(cb, 0x58));
+	delete_area(area);
+	if ((sctlr & 1) == 0)
+		return;
+
+	// a 4 KiB granule walk (TG0 in TCR 15:14 = 0), from the level T0SZ gives
+	uint32 t0sz = tcr & 0x3f;
+	int startLevel = t0sz >= 25 ? 1 : 0;
+	static const uint64 kAddresses[] = {0x80000000, 0x90000000, 0xc0000000,
+		0x100000000ull, 0x200000000ull};
+	for (uint64 va : kAddresses) {
+		uint64 table = ttbr0 & 0xfffffffff000ull;
+		char trail[160] = "";
+		size_t length = 0;
+		for (int level = startLevel; level <= 3; level++) {
+			uint32 index = (va >> (39 - 9 * level)) & 0x1ff;
+			area_id tableArea;
+			volatile uint8* t = map({"probe smmu table", table, 0x1000},
+				tableArea);
+			if (t == NULL)
+				break;
+			uint64 entry = rd(t, index * 8) | (uint64)rd(t, index * 8 + 4) << 32;
+			delete_area(tableArea);
+			length += snprintf(trail + length, sizeof(trail) - length,
+				" L%d[%u]=%#" B_PRIx64, level, index, entry);
+			if ((entry & 1) == 0 || (entry & 2) == 0 || level == 3)
+				break;
+			table = entry & 0xfffffffff000ull;
+		}
+		dprintf("qcom_probe: smmu cb2 va %#" B_PRIx64 ":%s\n", va, trail);
+	}
+}
+
+
 // devfs calls init_hardware() when it loads the driver: the probe runs then,
 // and the driver reports no device.
 status_t
@@ -1350,7 +1408,7 @@ init_hardware()
 {
 	probe();
 	adsp_state();
-	dp_phy_test();
+	sd_smmu_bank();
 	return B_ERROR;
 }
 

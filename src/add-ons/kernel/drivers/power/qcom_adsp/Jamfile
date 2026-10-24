@@ -11,11 +11,12 @@ local libFDTSources =
 
 KernelAddon qcom_adsp :
 	qcom_adsp.cpp
+	qcom_rpmh.cpp
 	qcom_scm.cpp
 	$(libFDTSources)
 ;
 
-SEARCH on [ FGristFiles qcom_scm.cpp ]
+SEARCH on [ FGristFiles qcom_rpmh.cpp qcom_scm.cpp ]
 	= [ FDirName $(HAIKU_TOP) src add-ons kernel drivers common qcom ] ;
 
 SEARCH on [ FGristFiles $(libFDTSources) ]

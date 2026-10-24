@@ -27,6 +27,10 @@ struct sdhci_platform_info {
 	uint32 identification_clock;
 	// Optional scheduler CPU-vector restriction; private SDMA stays below 4 GiB.
 	uint64 cpu_address_floor;
+	// The controller snoops the CPU caches (the SC8280XP's): the payload's
+	// cached linear-map alias is cleaned before each transfer, or a stale
+	// line of it answers the controller instead of memory.
+	bool dma_coherent;
 };
 
 
@@ -81,6 +85,7 @@ class SdhciBus {
 
 const size_t kSdhciDmaSize = 512 * 1024;
 status_t sdhci_allocate_dma(area_id* area, void** buffer, phys_addr_t* address);
+void sdhci_clean_dma_alias(phys_addr_t address, size_t size);
 
 
 class SdhciDevice {
@@ -567,6 +572,8 @@ extern mmc_bus_interface gSDHCIACPIDeviceModule;
 extern mmc_bus_interface gSDHCIPCIDeviceModule;
 extern driver_module_info gSDHCIFDTDriverModule;
 extern mmc_bus_interface gSDHCIFDTDeviceModule;
+extern driver_module_info gSDHCIQcomDriverModule;
+extern mmc_bus_interface gSDHCIQcomDeviceModule;
 
 extern device_manager_info* gDeviceManager;
 
