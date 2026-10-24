@@ -28,6 +28,7 @@
 
 #include <arch/x86/arch_suspend.h>
 
+#include <algorithm>
 #include <stdio.h>
 #include <string.h>
 
@@ -559,6 +560,21 @@ rtc_disarm_alarm()
 }
 
 
+static const uint32 kLidPollSeconds = 30;
+
+
+/*!	The next alarm: the rest of the timeout (0 none), or the next look at the
+	lid if that comes first. */
+static uint32
+alarm_period(uint32 timeoutLeft, bool pollLid)
+{
+	if (!pollLid)
+		return timeoutLeft;
+	return timeoutLeft != 0 ? std::min(timeoutLeft, kLidPollSeconds)
+		: kLidPollSeconds;
+}
+
+
 //	#pragma mark - wakeup events
 
 
@@ -694,6 +710,9 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 	INFO("entering s2idle, flags %#" B_PRIx32 ", timeout %" B_PRIu32 " ms\n",
 		flags, args->timeout_ms);
 
+	// (the syslog daemon gets to write that first: a sleep that never ends
+	// leaves it behind)
+	snooze(300000);
 	_kern_sync();
 
 	// Everything moves to the boot CPU: the others idle (their interrupts
@@ -742,16 +761,26 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 	install_io_interrupt_handler(sSCI, &sci_wake, NULL, 0);
 	atomic_set(&sWakeReason, 0);
 
-	// (rounded up to the next second, after the APIC deadline)
+	// The RTC alarm ends the timeout (rounded up to the next second, after
+	// the APIC deadline), and looks at the lid every kLidPollSeconds on the
+	// way: the lid's SCI must not be the only way out.
+	bool ignoreLid = (flags & X86_SUSPEND_IGNORE_LID) != 0;
+	bool pollLid = !ignoreLid && sLidPath[0] != '\0';
+	uint32 alarmSeconds = args->timeout_ms != 0
+		? (args->timeout_ms + 1999) / 1000 : 0;
+		// what is left of the timeout, 0 none
+	uint32 armedSeconds = 0;
 	atomic_set(&sAlarmFired, 0);
 	bool rtcAlarm = false;
-	if (args->timeout_ms != 0
+	if ((alarmSeconds != 0 || pollLid)
 		&& sACPI->install_fixed_event_handler(ACPI_EVENT_RTC,
 			&rtc_alarm_event, NULL) == B_OK) {
-		rtcAlarm = rtc_arm_alarm((args->timeout_ms + 1999) / 1000);
+		armedSeconds = alarm_period(alarmSeconds, pollLid);
+		rtcAlarm = rtc_arm_alarm(armedSeconds);
 		if (!rtcAlarm)
 			sACPI->remove_fixed_event_handler(ACPI_EVENT_RTC, &rtc_alarm_event);
 	}
+	uint32 lidPolls = 0;
 
 	// Nothing else runs on the boot CPU while it sleeps.
 	int32 oldPriority = thread->priority;
@@ -794,12 +823,27 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 		}
 		// (the alarm's SCI may have been taken for another one)
 		if (atomic_get(&sAlarmFired) != 0) {
-			atomic_set(&sWakeReason, X86_S2IDLE_WAKE_TIMEOUT);
-			break;
+			if (alarmSeconds != 0) {
+				alarmSeconds -= std::min(alarmSeconds, armedSeconds);
+				if (alarmSeconds == 0) {
+					atomic_set(&sWakeReason, X86_S2IDLE_WAKE_TIMEOUT);
+					break;
+				}
+			}
+			lidPolls++;
+			if (pollLid && lid_is_open()) {
+				atomic_set(&sWakeReason, X86_S2IDLE_WAKE_SCI);
+				INFO("the lid is open (the alarm's look)\n");
+				break;
+			}
+			armedSeconds = alarm_period(alarmSeconds, pollLid);
+			atomic_set(&sAlarmFired, 0);
+			atomic_set(&sWakeReason, 0);
+			rtc_arm_alarm(armedSeconds);
+			continue;
 		}
 		if (atomic_get(&sWakeReason) != X86_S2IDLE_WAKE_SCI
-			|| wakeup_is_real(wakeupEvents,
-				(flags & X86_SUSPEND_IGNORE_LID) != 0)) {
+			|| wakeup_is_real(wakeupEvents, ignoreLid)) {
 			break;
 		}
 
@@ -868,5 +912,7 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 		strerror(exitHintStatus),
 		args->s0i3_entered ? "entered" : "not entered", args->s0i3_us / 1000,
 		idleMask);
+	if (lidPolls != 0)
+		INFO("looked at the lid %" B_PRIu32 " times\n", lidPolls);
 	return B_OK;
 }
