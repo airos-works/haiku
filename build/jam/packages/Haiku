@@ -171,6 +171,7 @@ AddNewDriversToPackage display :
 #	display_adapter@x86
 	;
 AddNewDriversToPackage audio hmulti :
+	qcom_audio@arm64
 #	virtio_sound
 	;
 AddNewDriversToPackage hyperv :
