@@ -1241,6 +1241,18 @@ unsigned int nvme_qpair_poll(struct nvme_qpair *qpair,
 				" cdw0 %#x\n", qpair->id, qpair->cq_head, qpair->phase,
 				cpl->cid, cpl->sqid, cpl->sqhd,
 				((volatile uint16_t*)cpl)[7], cpl->cdw0);
+			// the submission entry the controller just took, and the
+			// host's tail: a zeroed entry means it fetched one the host
+			// had not written yet
+			if (!qpair->sq_in_cmb && cpl->sqhd < qpair->entries) {
+				uint16_t slot = (cpl->sqhd + qpair->entries - 1)
+					% qpair->entries;
+				volatile uint32_t* entry
+					= (volatile uint32_t*)&qpair->cmd[slot];
+				nvme_crit("qpair %u: entry %u: %08x %08x %08x %08x, "
+					"tail %u\n", qpair->id, slot, entry[0], entry[1],
+					entry[10], entry[12], qpair->sq_tail);
+			}
 #else
 			nvme_info("cpl does not map to outstanding cmd\n");
 			nvme_qpair_print_completion(qpair, cpl);
