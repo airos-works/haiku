@@ -67,9 +67,53 @@ pkt7(uint32 opcode, uint32 count)
 }
 
 
-int
-main()
+/*!	--hang: an indirect buffer of zeroes (a CP opcode error) loses the GPU;
+	the wait for it must fail at once, and a new open must be refused.
+*/
+static int
+hang_test(uint32* words, uint64 iova, uint32 handle, uint32 queue)
 {
+	for (int i = 0; i < 16; i++)
+		words[i] = 0;
+	__sync_synchronize();
+	drm_msm_gem_submit_bo bo = {};
+	bo.flags = MSM_SUBMIT_BO_READ;
+	bo.handle = handle;
+	drm_msm_gem_submit_cmd cmd = {};
+	cmd.type = MSM_SUBMIT_CMD_BUF;
+	cmd.size = 64;
+	drm_msm_gem_submit submit = {};
+	submit.flags = MSM_PIPE_3D0;
+	submit.nr_bos = 1;
+	submit.nr_cmds = 1;
+	submit.bos = (addr_t)&bo;
+	submit.cmds = (addr_t)&cmd;
+	submit.queueid = queue;
+	int error = msm(DRM_MSM_GEM_SUBMIT, &submit, sizeof(submit));
+	printf("hang: submit %s\n", strerror(error));
+	drm_msm_wait_fence wait = {};
+	wait.fence = submit.fence;
+	wait.queueid = queue;
+	bigtime_t start = system_time();
+	bigtime_t deadline = start + 5000000;
+	wait.timeout.tv_sec = deadline / 1000000;
+	wait.timeout.tv_nsec = (deadline % 1000000) * 1000;
+	error = msm(DRM_MSM_WAIT_FENCE, &wait, sizeof(wait));
+	printf("hang: wait %s after %lld us\n", strerror(error),
+		(long long)(system_time() - start));
+	error = msm(DRM_MSM_GEM_SUBMIT, &submit, sizeof(submit));
+	printf("hang: next submit %s\n", strerror(error));
+	const char* path = getenv(ADRENO_HAIKU_DEVICE_ENV);
+	int fd = open(path != NULL ? path : ADRENO_HAIKU_DEVICE_PATH, O_RDWR);
+	printf("hang: new open %s\n", fd < 0 ? strerror(errno) : "allowed");
+	return 0;
+}
+
+
+int
+main(int argc, char** argv)
+{
+	bool hang = argc > 1 && strcmp(argv[1], "--hang") == 0;
 	const char* path = getenv(ADRENO_HAIKU_DEVICE_ENV);
 	sFd = open(path != NULL ? path : ADRENO_HAIKU_DEVICE_PATH, O_RDWR);
 	if (sFd < 0) {
@@ -123,6 +167,12 @@ main()
 	uint32* words = (uint32*)(addr_t)map.address;
 	printf("buffer %u at GPU %#llx, mapped at %p (%llu bytes)\n", gem.handle,
 		(unsigned long long)iova, words, (unsigned long long)map.size);
+
+	if (hang) {
+		drm_msm_submitqueue hangQueue = {};
+		msm(DRM_MSM_SUBMITQUEUE_NEW, &hangQueue, sizeof(hangQueue));
+		return hang_test(words, iova, gem.handle, hangQueue.id);
+	}
 
 	// commands at 0, the target word at 0x8000
 	uint64 target = iova + 0x8000;

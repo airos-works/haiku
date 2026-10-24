@@ -618,6 +618,8 @@ gem_cpu_prep(File* file, drm_msm_gem_cpu_prep* args)
 		deadline_from_timespec(args->timeout));
 	if (status == B_TIMED_OUT)
 		return ETIMEDOUT;
+	if (status == B_DEV_NOT_READY)
+		return EIO;
 	return status == B_OK ? B_OK : EINTR;
 }
 
@@ -733,6 +735,8 @@ gem_submit(File* file, drm_msm_gem_submit* args)
 	}
 	syncLocker.Unlock();
 
+	if (status == B_OK && adreno_gpu_lost())
+		status = EIO;
 	if (status == B_OK) {
 		adreno_ring_lock();
 		status = adreno_ring_reserve(4 + ibs * 4 + 8);
@@ -815,6 +819,8 @@ wait_fence(File* file, drm_msm_wait_fence* args)
 		deadline_from_timespec(args->timeout));
 	if (status == B_TIMED_OUT)
 		return ETIMEDOUT;
+	if (status == B_DEV_NOT_READY)
+		return EIO;
 	return status == B_OK ? B_OK : EINTR;
 }
 
@@ -898,6 +904,9 @@ syncobj_wait_array(File* file, const uint32* handles, const uint64* points,
 		bigtime_t now = system_time();
 		if (deadline != B_INFINITE_TIMEOUT && now >= deadline)
 			return ETIME;
+		// its fences never come
+		if (adreno_gpu_lost())
+			return EIO;
 
 		// wait for a fence or a change of the sync objects
 		bigtime_t until = now + 2000;
@@ -1066,7 +1075,10 @@ adreno_open(const char* name, uint32 flags, void** _cookie)
 {
 	// The GPU comes up at the first request, not here: app_server opens
 	// every graphics device at boot to ask for an accelerant, before the
-	// firmware may be in place.
+	// firmware may be in place. A lost GPU takes no new users: their
+	// OpenGL falls back to software.
+	if (adreno_gpu_lost())
+		return B_DEV_NOT_READY;
 	File* file = (File*)calloc(1, sizeof(File));
 	if (file == NULL)
 		return B_NO_MEMORY;

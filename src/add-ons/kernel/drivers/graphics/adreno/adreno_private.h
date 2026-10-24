@@ -86,7 +86,9 @@ uint32		adreno_ring_flush_fence();
 
 uint32		adreno_completed_fence();
 status_t	adreno_wait_fence(uint32 fence, bigtime_t deadline);
-	// absolute system_time() deadline, B_INFINITE_TIMEOUT for none
+	// absolute system_time() deadline, B_INFINITE_TIMEOUT for none;
+	// B_DEV_NOT_READY once the GPU is lost
+bool		adreno_gpu_lost();
 uint64		adreno_timestamp();
 uint32		adreno_faults();
 

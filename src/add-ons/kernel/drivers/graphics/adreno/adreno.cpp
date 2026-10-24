@@ -1619,6 +1619,10 @@ static ConditionVariable sFenceCondition;
 static uint32 sInterrupt;
 static bool sInterruptInstalled;
 static int32 sFaults;
+// a fault the GPU does not come back from: until there is a recovery, GPU
+// work fails from then on (Turnip then reports the device lost, and new
+// processes' OpenGL falls back to software)
+static int32 sGpuLost;
 
 // the first fault's state, dumped by a thread (the interrupt handler cannot
 // map memory)
@@ -1741,6 +1745,14 @@ gpu_interrupt(void*)
 				dprintf("adreno: CP interrupt status 0\n");
 		} else if (faults == 4)
 			dprintf("adreno: more GPU faults, not logged\n");
+	}
+	if ((status & (INT_CP_HW_ERROR | INT_RBBM_HANG_DETECT)) != 0
+		&& atomic_get_and_set(&sGpuLost, 1) == 0) {
+		// halt the CP and stop hearing about it; waiters fail
+		gpu_write(REG_A6XX_CP_SQE_CNTL, 3);
+		gpu_write(RBBM_INT_0_MASK, INT_CP_CACHE_FLUSH_TS);
+		dprintf("adreno: the GPU is lost; GPU work fails until a restart\n");
+		sFenceCondition.NotifyAll();
 	}
 	if ((status & INT_CP_CACHE_FLUSH_TS) != 0)
 		sFenceCondition.NotifyAll();
@@ -1980,14 +1992,25 @@ adreno_completed_fence()
 }
 
 
+bool
+adreno_gpu_lost()
+{
+	return atomic_get(&sGpuLost) != 0;
+}
+
+
 status_t
 adreno_wait_fence(uint32 fence, bigtime_t deadline)
 {
 	while ((int32)(adreno_completed_fence() - fence) < 0) {
+		if (adreno_gpu_lost())
+			return B_DEV_NOT_READY;
 		ConditionVariableEntry entry;
 		sFenceCondition.Add(&entry);
 		if ((int32)(adreno_completed_fence() - fence) >= 0)
 			break;
+		if (adreno_gpu_lost())
+			return B_DEV_NOT_READY;
 		status_t status = entry.Wait(B_ABSOLUTE_TIMEOUT | B_CAN_INTERRUPT,
 			deadline == B_INFINITE_TIMEOUT ? B_INFINITE_TIMEOUT : deadline);
 		if (status == B_TIMED_OUT || status == B_INTERRUPTED)
