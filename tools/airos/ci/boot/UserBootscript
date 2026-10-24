@@ -56,9 +56,19 @@ link_gpu_user_land /boot/system/non-packaged/amdgpu $?
 
 # The Dragon Q8B's (arm64): Turnip, libvulkan.so.1 and zink's EGL vendor
 # library, whose vendor file sorts before the ROCK 5's Panfrost one, which
-# every other machine keeps.
+# every other machine keeps. On the Dragon the Panfrost vendor is set aside:
+# libglvnd loads every vendor library, and with two Mesas in one team an
+# application that makes a second BGLView after the first is gone (Snap)
+# crashed in Mesa making the new context current.
 [ -e /dev/graphics/adreno/0 ]
-link_gpu_user_land /boot/system/non-packaged/adreno $?
+adreno=$?
+link_gpu_user_land /boot/system/non-packaged/adreno $adreno
+vendors=/boot/system/non-packaged/add-ons/opengl/egl_vendor.d
+if [ $adreno = 0 ] && [ -e $vendors/10_mesa_panfrost.json ]; then
+	mv -f $vendors/10_mesa_panfrost.json $vendors/10_mesa_panfrost.json.off
+elif [ $adreno != 0 ] && [ -e $vendors/10_mesa_panfrost.json.off ]; then
+	mv -f $vendors/10_mesa_panfrost.json.off $vendors/10_mesa_panfrost.json
+fi
 
 # The Zink OpenGL renderer (x86_64), only where nvidia_rm drives a card and NVK
 # gives it a GPU: the GL kit takes the first renderer it finds, and anywhere
