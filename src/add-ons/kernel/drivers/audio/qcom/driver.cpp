@@ -20,15 +20,16 @@
 #include <device_manager.h>
 #include <kernel.h>
 #include <driver_settings.h>
+#include <util/AutoLock.h>
 
-#include "audioreach.h"
-#include "codec.h"
-#include "dsp.h"
+#include "driver.h"
 
 
 #define TRACE(x...) dprintf("qcom_audio: " x)
 
 #define QCOM_AUDIO_DRIVER_NAME "drivers/audio/hmulti/qcom_audio/driver_v1"
+#define QCOM_AUDIO_DEVICE_NAME "drivers/audio/hmulti/qcom_audio/device_v1"
+#define QCOM_AUDIO_DEVICE_PATH "audio/hmulti/qcom/1"
 
 
 using namespace qcom_audio;
@@ -37,36 +38,18 @@ using namespace qcom_audio;
 static device_manager_info* sDeviceManager;
 
 
-struct AudioDevice {
-	device_node*	node;
-	Dsp				dsp;
-	Codec			codec;
-	Playback		playback;
-	thread_id		startThread;
-	bool			ready;
-
-	// the playback buffers: one physically contiguous area
-	area_id			bufferArea;
-	uint8*			buffers;
-	phys_addr_t		buffersPhysical;
-	sem_id			doneSem;
-	int32			doneCount;
-
-	AudioDevice() : playback(dsp) {}
-};
-
-
-static const uint32 kBufferCount = 2;
-static const uint32 kBufferFrames = 1024;
-static const uint32 kFrameSize = 4;			// two 16-bit channels
-static const uint32 kBufferSize = kBufferFrames * kFrameSize;
-
-
 static void
 data_hook(void* cookie, const qcom_gpr_packet* packet)
 {
 	AudioDevice* device = (AudioDevice*)cookie;
 	if (packet->opcode == Playback::kWriteDone) {
+		cpu_status state = disable_interrupts();
+		acquire_spinlock(&device->streamLock);
+		device->lastPlayed = packet->token % kBufferCount;
+		device->framesPlayed += kBufferFrames;
+		device->playedTime = system_time();
+		release_spinlock(&device->streamLock);
+		restore_interrupts(state);
 		atomic_add(&device->doneCount, 1);
 		release_sem_etc(device->doneSem, 1, B_DO_NOT_RESCHEDULE);
 		return;
@@ -145,8 +128,8 @@ allocate_buffers(AudioDevice* device)
 
 
 //!	The DSP reads the buffers from memory: our lines of them cleaned first.
-static void
-clean_buffer(AudioDevice* device, uint32 index)
+void
+qcom_audio::clean_buffer(AudioDevice* device, uint32 index)
 {
 	addr_t start = (addr_t)device->buffers + index * kBufferSize;
 	for (addr_t line = start; line < start + kBufferSize; line += 64)
@@ -271,11 +254,23 @@ test_tone(AudioDevice* device)
 }
 
 
-//!	Waits for the DSP, then brings the codec and the graph up.
+static status_t start_up(AudioDevice* device);
+
+
 static status_t
 start_thread(void* cookie)
 {
 	AudioDevice* device = (AudioDevice*)cookie;
+	status_t status = start_up(device);
+	device->startDone = true;
+	return status;
+}
+
+
+//!	Waits for the DSP, then brings the codec and the graph up.
+static status_t
+start_up(AudioDevice* device)
+{
 	// lab only for now: the codec's bring-up hung the board now and then
 	// (docs/dragon-q8b/STATUS.md), so nothing runs without "enabled true"
 	void* enableSettings = load_driver_settings("qcom_audio");
@@ -359,9 +354,17 @@ qcom_audio_init_driver(device_node* node, void** _cookie)
 		return B_NO_MEMORY;
 	device->node = node;
 	device->ready = false;
+	device->startDone = false;
 	device->bufferArea = -1;
 	device->buffers = NULL;
 	device->doneCount = 0;
+	device->openCount = 0;
+	device->running = false;
+	device->lastPlayed = device->toRefill = -1;
+	device->framesPlayed = 0;
+	device->playedTime = 0;
+	B_INITIALIZE_SPINLOCK(&device->streamLock);
+	mutex_init(&device->lock, "qcom audio");
 	device->doneSem = create_sem(0, "qcom audio buffer done");
 	status_t status = device->dsp.Init(data_hook, device);
 	if (status != B_OK) {
@@ -392,7 +395,95 @@ qcom_audio_uninit_driver(void* cookie)
 	if (device->bufferArea >= 0)
 		delete_area(device->bufferArea);
 	delete_sem(device->doneSem);
+	mutex_destroy(&device->lock);
 	delete device;
+}
+
+
+static status_t
+qcom_audio_register_child_devices(void* cookie)
+{
+	AudioDevice* device = (AudioDevice*)cookie;
+	return sDeviceManager->publish_device(device->node, QCOM_AUDIO_DEVICE_PATH,
+		QCOM_AUDIO_DEVICE_NAME);
+}
+
+
+// #pragma mark - device
+
+
+static status_t
+qcom_audio_init_device(void* driverCookie, void** _deviceCookie)
+{
+	*_deviceCookie = driverCookie;
+	return B_OK;
+}
+
+
+static void
+qcom_audio_uninit_device(void*)
+{
+}
+
+
+static status_t
+qcom_audio_open(void* deviceCookie, const char*, int, void** _cookie)
+{
+	AudioDevice* device = (AudioDevice*)deviceCookie;
+	// the DSP and the codec come up a while after boot
+	for (int i = 0; !device->ready; i++) {
+		if (i == 300 || device->startThread < 0 || device->startDone)
+			return B_DEV_NOT_READY;
+		snooze(100000);
+	}
+	if (atomic_add(&device->openCount, 1) != 0) {
+		atomic_add(&device->openCount, -1);
+		return B_BUSY;
+	}
+	*_cookie = device;
+	return B_OK;
+}
+
+
+static status_t
+qcom_audio_close(void* cookie)
+{
+	AudioDevice* device = (AudioDevice*)cookie;
+	MutexLocker locker(device->lock);
+	multi_audio_stop(device);
+	return B_OK;
+}
+
+
+static status_t
+qcom_audio_free(void* cookie)
+{
+	atomic_add(&((AudioDevice*)cookie)->openCount, -1);
+	return B_OK;
+}
+
+
+static status_t
+qcom_audio_read(void*, off_t, void*, size_t* _length)
+{
+	*_length = 0;
+	return B_NOT_SUPPORTED;
+}
+
+
+static status_t
+qcom_audio_write(void*, off_t, const void*, size_t* _length)
+{
+	*_length = 0;
+	return B_NOT_SUPPORTED;
+}
+
+
+static status_t
+qcom_audio_control(void* cookie, uint32 operation, void* buffer, size_t length)
+{
+	return multi_audio_control((AudioDevice*)cookie, operation, buffer,
+		length);
 }
 
 
@@ -412,7 +503,28 @@ static driver_module_info sQcomAudioDriver = {
 	qcom_audio_register_device,
 	qcom_audio_init_driver,
 	qcom_audio_uninit_driver,
+	qcom_audio_register_child_devices,
 	NULL,
+	NULL
+};
+
+
+static device_module_info sQcomAudioDevice = {
+	{
+		QCOM_AUDIO_DEVICE_NAME,
+		0,
+		NULL
+	},
+	qcom_audio_init_device,
+	qcom_audio_uninit_device,
+	NULL,
+	qcom_audio_open,
+	qcom_audio_close,
+	qcom_audio_free,
+	qcom_audio_read,
+	qcom_audio_write,
+	NULL,
+	qcom_audio_control,
 	NULL,
 	NULL
 };
@@ -420,5 +532,6 @@ static driver_module_info sQcomAudioDriver = {
 
 module_info* modules[] = {
 	(module_info*)&sQcomAudioDriver,
+	(module_info*)&sQcomAudioDevice,
 	NULL
 };

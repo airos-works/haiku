@@ -8,4 +8,5 @@ KernelAddon qcom_audio :
 	codec.cpp
 	driver.cpp
 	dsp.cpp
+	multi_audio.cpp
 ;
