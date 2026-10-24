@@ -6,6 +6,9 @@
 
 #include "usbc_dp.h"
 
+#include "display_port.h"
+
+#include <new>
 #include <string.h>
 
 #include <KernelExport.h>
@@ -155,8 +158,8 @@ branch_on(volatile uint8* cc, uint32 offset)
 UsbcDisplayPort::UsbcDisplayPort()
 	:
 	fGccArea(-1), fGcc(NULL), fDispccArea(-1), fDispcc(NULL), fPhyArea(-1),
-	fPhy(NULL), fControllerArea(-1), fController(NULL), fMdssArea(-1),
-	fMdss(NULL), fPowered(false), fRunning(false)
+	fPhy(NULL), fControllerArea(-1), fController(NULL), fPort(NULL),
+	fMdssArea(-1), fMdss(NULL), fPowered(false), fRunning(false)
 {
 }
 
@@ -164,6 +167,7 @@ UsbcDisplayPort::UsbcDisplayPort()
 UsbcDisplayPort::~UsbcDisplayPort()
 {
 	Stop();
+	delete fPort;
 	area_id areas[] = {fGccArea, fDispccArea, fPhyArea, fControllerArea,
 		fMdssArea};
 	for (area_id area : areas) {
@@ -380,7 +384,7 @@ UsbcDisplayPort::PowerUp()
 	-> INTF_6, fetching \a width x \a height at \a address. */
 status_t
 UsbcDisplayPort::Start(phys_addr_t address, uint32 bytesPerRow, uint32 width,
-	uint32 height)
+	uint32 height, const display_timing& timing, bool wideBus)
 {
 	if (!fPowered)
 		return B_NO_INIT;
@@ -427,7 +431,201 @@ UsbcDisplayPort::Start(phys_addr_t address, uint32 bytesPerRow, uint32 width,
 	wr(fMdss, kIntf0 + INTF_TIMING_ENGINE_EN, 1);
 	fRunning = true;
 	LogState("DP-1 started");
+	_Link(timing, wideBus);
 	return B_OK;
+}
+
+
+// the controller's link block (dp_reg.h), from its base
+enum {
+	DP_MAINLINK_CTRL = 0x400, DP_STATE_CTRL = 0x404,
+	DP_CONFIGURATION_CTRL = 0x408, DP_LANE_MAPPING = 0x438,
+	DP_MAINLINK_READY = 0x440,
+};
+// the PHY's swing and pre-emphasis for RBR and HBR, by level
+// (qmp_dp_v5_voltage_swing_hbr_rbr, qmp_dp_v5_pre_emphasis_hbr_rbr)
+static const uint8 kSwing[4][4] = {
+	{0x28, 0x2f, 0x36, 0x3f}, {0x31, 0x3e, 0x3f, 0xff},
+	{0x36, 0x3f, 0xff, 0xff}, {0x3f, 0xff, 0xff, 0xff}};
+static const uint8 kPreEmphasis[4][4] = {
+	{0x20, 0x2d, 0x34, 0x3a}, {0x20, 0x2e, 0x35, 0xff},
+	{0x20, 0x2e, 0xff, 0xff}, {0x24, 0xff, 0xff, 0xff}};
+
+
+//!	msm_dp_ctrl_config_ctrl(), msm_dp_ctrl_lane_mapping(),
+//	msm_dp_ctrl_mainlink_enable(): 8 bits a component, RGB.
+void
+UsbcDisplayPort::_EnableMainlink(uint32 lanes)
+{
+	uint32 config = 2u << 13		// LSCLK = link clock / 4
+		| 1u << 8					// 8 bpc
+		| (lanes - 1) << 4
+		| 0x40						// enhanced framing
+		| 0x04 | 0x02 | 0x01;		// progressive, static Mvid, sync clock
+	wr(fController, DP_CONFIGURATION_CTRL, config);
+	wr(fController, DP_LANE_MAPPING, 0 | 1u << 2 | 2u << 4 | 3u << 6);
+	uint32 control = rd(fController, DP_MAINLINK_CTRL) & ~3u;
+	wr(fController, DP_MAINLINK_CTRL, control);
+	wr(fController, DP_MAINLINK_CTRL, control | 2);			// reset
+	wr(fController, DP_MAINLINK_CTRL, control);
+	wr(fController, DP_MAINLINK_CTRL, control | 1 | 0x02000000);
+		// enable, frame boundary select
+}
+
+
+//!	Training pattern \a pattern (1..4) on the link, the controller saying
+//	it sends it (msm_dp_ctrl_set_pattern_state_bit()).
+status_t
+UsbcDisplayPort::_SendPattern(uint32 pattern)
+{
+	wr(fController, DP_STATE_CTRL, 1u << (pattern - 1));
+	uint32 ready = 1u << (pattern - 1 + 3);
+	for (int i = 0; i < 500; i++) {
+		if ((rd(fController, DP_MAINLINK_READY) & ready) != 0)
+			return B_OK;
+		spin(10);
+	}
+	return B_TIMED_OUT;
+}
+
+
+//!	The PHY's levels on both TX blocks, and the sink told (DPCD 0x103).
+status_t
+UsbcDisplayPort::_SetLevels(uint32 swing, uint32 preEmphasis, uint32 lanes)
+{
+	if (swing > 3 || preEmphasis > 3 || kSwing[swing][preEmphasis] == 0xff)
+		return B_BAD_VALUE;
+	static const uint32 kLanes[] = {kPhyTxA, kPhyTxB};
+	for (uint32 lane : kLanes) {
+		wr(fPhy + lane, TX_DRV_LVL, kSwing[swing][preEmphasis] | 0x20);
+		wr(fPhy + lane, TX_EMP_POST1_LVL, kPreEmphasis[swing][preEmphasis]
+			| 0x20);
+	}
+	uint8 set[4];
+	for (uint32 i = 0; i < 4; i++) {
+		set[i] = swing | preEmphasis << 3
+			| (swing == 3 ? 1u << 2 : 0) | (preEmphasis == 3 ? 1u << 5 : 0);
+	}
+	return fPort->WriteDpcd(0x103, set, lanes);
+}
+
+
+/*!	Link training at RBR with the sink (msm_dp_ctrl_link_train()): its
+	capabilities, the link set, clock recovery on TPS1, channel equalization
+	on TPS2 or TPS3, the swing and pre-emphasis the sink asks for. */
+status_t
+UsbcDisplayPort::_Train(uint32* _lanes)
+{
+	uint8 caps[16];
+	status_t status = fPort->ReadDpcd(0x000, caps, sizeof(caps));
+	if (status != B_OK)
+		return status;
+	uint32 lanes = caps[2] & 0x1f;
+	if (lanes != 1 && lanes != 2 && lanes != 4)
+		return B_BAD_DATA;
+	bool enhanced = (caps[2] & 0x80) != 0, tps3 = (caps[2] & 0x40) != 0;
+	// the read interval for the status (TRAINING_AUX_RD_INTERVAL)
+	uint32 interval = caps[14] & 0x7f;
+	bigtime_t crDelay = interval == 0 ? 100 : interval * 4000;
+	bigtime_t eqDelay = interval == 0 ? 400 : interval * 4000;
+	INFO("DP-1: sink DPCD %#x, max rate %#x, %" B_PRIu32 " lanes%s%s\n",
+		caps[0], caps[1], lanes, enhanced ? ", enhanced framing" : "",
+		tps3 ? ", TPS3" : "");
+
+	_EnableMainlink(lanes);
+	uint8 link[2] = {0x06, (uint8)(lanes | (enhanced ? 0x80 : 0))};	// RBR
+	uint8 coding[2] = {0, 1};			// no down spread, 8b/10b
+	if (fPort->WriteDpcd(0x100, link, 2) != B_OK
+		|| fPort->WriteDpcd(0x107, coding, 2) != B_OK)
+		return B_IO_ERROR;
+
+	uint32 swing = 0, preEmphasis = 0;
+	bool done = false;
+	for (int phase = 1; phase <= 2 && status == B_OK; phase++) {
+		uint32 pattern = phase == 1 ? 1 : tps3 ? 3 : 2;
+		status = _SendPattern(pattern);
+		uint8 set = pattern | 0x20;		// scrambling off
+		if (status == B_OK)
+			status = fPort->WriteDpcd(0x102, &set, 1);
+		if (status == B_OK)
+			status = _SetLevels(swing, preEmphasis, lanes);
+		done = false;
+		for (int attempt = 0; attempt < 6 && status == B_OK; attempt++) {
+			snooze(phase == 1 ? crDelay : eqDelay);
+			uint8 lane[6];
+			status = fPort->ReadDpcd(0x202, lane, sizeof(lane));
+			if (status != B_OK)
+				break;
+			// per lane: clock recovery bit 0, equalization 1, symbol lock 2
+			uint32 need = phase == 1 ? 0x1 : 0x7;
+			done = phase == 1 || (lane[2] & 1) != 0;	// interlane align
+			for (uint32 i = 0; i < lanes; i++) {
+				if (((lane[i / 2] >> (4 * (i % 2))) & need) != need)
+					done = false;
+			}
+			if (done)
+				break;
+			// what the sink asks for: the highest of the lanes
+			uint32 wantSwing = 0, wantPre = 0;
+			for (uint32 i = 0; i < lanes; i++) {
+				uint8 adjust = lane[4 + i / 2] >> (4 * (i % 2));
+				wantSwing = max_c(wantSwing, (uint32)(adjust & 3));
+				wantPre = max_c(wantPre, (uint32)((adjust >> 2) & 3));
+			}
+			if (wantSwing != swing || wantPre != preEmphasis) {
+				swing = wantSwing;
+				preEmphasis = wantPre;
+				status = _SetLevels(swing, preEmphasis, lanes);
+			}
+		}
+		if (status == B_OK && !done)
+			status = B_TIMED_OUT;
+		INFO("DP-1: training %s: %s, swing %" B_PRIu32 " pre-emphasis %"
+			B_PRIu32 "\n", phase == 1 ? "clock recovery" : "equalization",
+			strerror(status), swing, preEmphasis);
+	}
+	uint8 off = 0;
+	fPort->WriteDpcd(0x102, &off, 1);
+	wr(fController, DP_STATE_CTRL, 0);
+	*_lanes = lanes;
+	return status;
+}
+
+
+/*!	The link and the stream: trained with the sink if one answers; if not,
+	the controller's training patterns checked, and the stream started on
+	an untrained link (where it goes nowhere), so that path is known too. */
+void
+UsbcDisplayPort::_Link(const display_timing& timing, bool wideBus)
+{
+	if (fPort == NULL) {
+		fPort = new(std::nothrow) DisplayPort(0);
+		if (fPort == NULL || fPort->Init() != B_OK) {
+			ERROR("DP-1: no AUX channel\n");
+			delete fPort;
+			fPort = NULL;
+			return;
+		}
+	}
+	uint32 lanes = 4;
+	status_t status = _Train(&lanes);
+	if (status != B_OK) {
+		INFO("DP-1: link not trained (%s)\n", strerror(status));
+		_EnableMainlink(4);
+		lanes = 4;
+		for (uint32 pattern = 1; pattern <= 3; pattern++) {
+			INFO("DP-1: training pattern %" B_PRIu32 ": %s\n", pattern,
+				_SendPattern(pattern) == B_OK ? "sent" : "not sent");
+		}
+		wr(fController, DP_STATE_CTRL, 0);
+	}
+	fPort->SetLinkRate(162);
+	status = fPort->SetStream(timing, wideBus);
+	if (status == B_OK)
+		status = fPort->StartStream();
+	INFO("DP-1: stream on %" B_PRIu32 " lanes at RBR: %s (mainlink ready %#"
+		B_PRIx32 ")\n", lanes, strerror(status),
+		rd(fController, DP_MAINLINK_READY));
 }
 
 

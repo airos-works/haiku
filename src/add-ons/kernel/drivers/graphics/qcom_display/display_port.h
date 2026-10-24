@@ -32,12 +32,17 @@ public:
 			bool				HotPlug();
 			status_t			ReadDpcd(uint32 address, uint8* buffer,
 									size_t size);
+			status_t			WriteDpcd(uint32 address, const uint8* buffer,
+									size_t size);
 			status_t			ReadEdid(uint8* edid, uint32* _length);
 				// 128 or 256 bytes
 			status_t			StreamTiming(display_timing& timing);
 				// h_display etc., not the pixel clock
 			uint32				Lanes();
 			uint32				LinkRate();
+			void				SetLinkRate(uint32 rate)
+									{ fLinkRate = rate; }
+				// for a link the driver trained: its MHz, as LinkRate()
 				// MHz of the link symbol clock (162, 270, 540, 810), from
 				// the sink's DPCD: the rate the firmware trained
 			uint32				MaxPixelClock();

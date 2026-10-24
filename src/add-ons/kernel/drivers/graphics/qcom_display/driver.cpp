@@ -417,7 +417,7 @@ update_usbc_scanout(display_info* info)
 		? info->usbc->SetScanout(address, shared.bytes_per_row, output.width,
 			output.height)
 		: info->usbc->Start(address, shared.bytes_per_row, output.width,
-			output.height);
+			output.height, info->dpu->Timing(), info->dpu->WideBus());
 	if (status == B_OK) {
 		INFO("DP-1: scans out %ux%u at %" B_PRId32 ",%" B_PRId32 " (%#"
 			B_PRIxPHYSADDR ", frame buffer %#" B_PRIxPHYSADDR ")\n",
