@@ -38,6 +38,7 @@
 
 #include "display_port.h"
 #include "dpu.h"
+#include "usbc_dp.h"
 
 
 #define QCOM_DISPLAY_DRIVER_MODULE_NAME	"drivers/graphics/qcom_display/driver_v1"
@@ -77,6 +78,8 @@ struct display_info {
 
 	qcom::Dpu*		dpu;			// NULL: nothing to show on
 	qcom::DisplayPort* port;		// the DisplayPort controller it feeds
+	qcom::UsbcDisplayPort* usbc;	// USB-C connector 0, output 1
+	bool			usbcRunning;
 
 	// vertical blanks: the timing engine's interrupt while it runs; a
 	// timer stands in for it when it does not
@@ -182,6 +185,9 @@ virtual_timing()
 //	#pragma mark - outputs
 
 
+static bool usbc_forced();
+
+
 static void
 init_outputs(display_info* info)
 {
@@ -261,6 +267,42 @@ init_outputs(display_info* info)
 		INFO("HDMI-1: nothing lit, standing in for a %ux%u display\n",
 			output.native_width, output.native_height);
 	}
+
+	// USB-C connector 0 as output 1. Until its link is trained and its
+	// mainlink sends (which needs a monitor), only on request: the lab's
+	// "usbc_dp0 forced" makes it a display of the HDMI output's mode that
+	// scans out its region to nowhere, for app_server's layouts.
+	if (info->dpu == NULL || info->dpu->Interface() != 6 || !usbc_forced())
+		return;
+	info->usbc = new(std::nothrow) qcom::UsbcDisplayPort;
+	if (info->usbc == NULL || info->usbc->PowerUp() != B_OK) {
+		delete info->usbc;
+		info->usbc = NULL;
+		return;
+	}
+	qcom_display_output& usbc = shared.outputs[1];
+	usbc = output;
+	usbc.id = QCOM_DISPLAY_OUTPUT_DP0;
+	usbc.flags = QCOM_DISPLAY_OUTPUT_CONNECTED;
+	usbc.edid_length = 0;
+	shared.output_count = 2;
+	INFO("DP-1: forced on as output 1, %ux%u\n", usbc.native_width,
+		usbc.native_height);
+}
+
+
+/*!	Whether the driver settings ask for USB-C connector 0 without a
+	monitor (lab: "usbc_dp0 forced"). */
+static bool
+usbc_forced()
+{
+	void* handle = load_driver_settings("qcom_display");
+	if (handle == NULL)
+		return false;
+	const char* value = get_driver_parameter(handle, "usbc_dp0", "", "");
+	bool forced = strcmp(value, "forced") == 0;
+	unload_driver_settings(handle);
+	return forced;
 }
 
 
@@ -275,8 +317,43 @@ has_layout(display_info* info)
 
 
 static void
+update_usbc_scanout(display_info* info)
+{
+	const qcom_display_shared_info& shared = *info->shared;
+	if (info->usbc == NULL || shared.output_count < 2)
+		return;
+	const qcom_display_output& output = shared.outputs[1];
+	if ((output.flags & QCOM_DISPLAY_OUTPUT_ENABLED) == 0
+		|| shared.bytes_per_row == 0) {
+		if (info->usbcRunning)
+			info->usbc->Stop();
+		info->usbcRunning = false;
+		return;
+	}
+	phys_addr_t address = info->bufferAddress
+		+ (phys_addr_t)output.y * shared.bytes_per_row + output.x * 4;
+	status_t status = info->usbcRunning
+		? info->usbc->SetScanout(address, shared.bytes_per_row, output.width,
+			output.height)
+		: info->usbc->Start(address, shared.bytes_per_row, output.width,
+			output.height);
+	if (status == B_OK) {
+		INFO("DP-1: scans out %ux%u at %" B_PRId32 ",%" B_PRId32 " (%#"
+			B_PRIxPHYSADDR ", frame buffer %#" B_PRIxPHYSADDR ")\n",
+			output.width, output.height, output.x, output.y, address,
+			info->bufferAddress);
+		info->usbcRunning = true;
+	} else {
+		ERROR("DP-1: cannot show %ux%u at %" B_PRId32 ",%" B_PRId32 ": %s\n",
+			output.width, output.height, output.x, output.y, strerror(status));
+	}
+}
+
+
+static void
 update_scanout(display_info* info)
 {
+	update_usbc_scanout(info);
 	if (info->dpu == NULL || !has_layout(info))
 		return;
 	const qcom_display_shared_info& shared = *info->shared;
@@ -629,11 +706,17 @@ display_init_device(void* _info, void** _cookie)
 
 	// a frame buffer for the first output, taken while contiguous memory is
 	// still easy to find
-	const qcom_display_output& first = info->shared->outputs[0];
-	status_t status = ensure_buffer(info,
-		(size_t)first.native_width * 4 * first.native_height);
+	// (side by side if there are two)
+	const qcom_display_shared_info& shared = *info->shared;
+	size_t width = 0, height = 0;
+	for (uint32 i = 0; i < shared.output_count; i++) {
+		width += shared.outputs[i].native_width;
+		height = max_c(height, (size_t)shared.outputs[i].native_height);
+	}
+	status_t status = ensure_buffer(info, width * 4 * height);
 	if (status != B_OK) {
 		ERROR("no memory for the frame buffer: %s\n", strerror(status));
+		delete info->usbc;
 		delete info->port;
 		delete info->dpu;
 		delete_area(info->sharedArea);
@@ -654,6 +737,7 @@ display_uninit_device(void* cookie)
 {
 	display_info* info = (display_info*)cookie;
 	uninit_retrace(info);
+	delete info->usbc;
 	delete info->port;
 	delete info->dpu;
 	mutex_destroy(&info->lock);
