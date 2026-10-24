@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Fetch the Dragon Q8B GPU and video codec firmware (SC8280XP, Adreno 690,
-# Iris) from linux-firmware at a pinned commit:
+# Fetch the Dragon Q8B GPU, video codec and audio DSP firmware (SC8280XP,
+# Adreno 690, Iris, ADSP) from linux-firmware at a pinned commit:
 #
 #   qcom/a660_sqe.fw                  the command processor's microcode (v1.12)
 #   qcom/a660_gmu.bin                 the GPU management unit's (v3.01.0A)
@@ -13,9 +13,16 @@
 #                                     SC8280XP authenticates and runs; the
 #                                     X13s' qcvss8280.mbn boots but its
 #                                     watchdog fires once decoding starts
+#   qcom/sc8280xp/radxa/dragon-q8b/qcadsp8280.mbn
+#                                     the audio DSP's, which also runs the
+#                                     USB-C ports' pmic_glink service
+#                                     (ADSP.HT.5.6.c2-00037-MAKENA-1, the
+#                                     version of Radxa's image, signed
+#                                     differently)
 #   LICENSE.qcom, NOTICE.qcom         their licence: redistributable
 #
-# The adreno and qcom_iris drivers load them from data/firmware/qcom. The firmware is not
+# The adreno, qcom_iris and qcom_adsp drivers load them from
+# data/firmware/qcom. The firmware is not
 # kept in git; tools/dragon-q8b/mesa/build.sh userland puts these files in
 # the GPU user land (FIRMWARE=<directory>).
 #
@@ -33,6 +40,7 @@ declare -A SOURCES=(
 	[qcom/a660_gmu.bin]=qcom/a660_gmu.bin
 	[qcom/sc8280xp/qcdxkmsuc8280.mbn]=qcom/sc8280xp/LENOVO/21BX/qcdxkmsuc8280.mbn
 	[qcom/vpu/vpu20_p4.mbn]=qcom/vpu/vpu20_p4.mbn
+	[qcom/sc8280xp/radxa/dragon-q8b/qcadsp8280.mbn]=qcom/sc8280xp/radxa/dragon-q8b/qcadsp8280.mbn
 	[LICENSE.qcom]=LICENSES/LICENSE.qcom
 	[NOTICE.qcom]=LICENSES/NOTICE.qcom
 )
@@ -41,6 +49,7 @@ declare -A SHA256=(
 	[qcom/a660_gmu.bin]=8acab7b417d9ebde89a1de9ae1e2c261d352fcab122e31ecd580cec9fe2ae5e7
 	[qcom/sc8280xp/qcdxkmsuc8280.mbn]=d7b8cc648c2f020c0fb7770b2d844b40688e99fb541e45514533049611b34d5c
 	[qcom/vpu/vpu20_p4.mbn]=a66e86e34dc69a870fe631c73ed4a93d9fcfea6f3f2a4ac02cb118cb505bbbb2
+	[qcom/sc8280xp/radxa/dragon-q8b/qcadsp8280.mbn]=2ef923ce579865c00657acb50b779eae1b6bac75129fcfb38e2d2753e7e32e2f
 	[LICENSE.qcom]=be904cd28cb292b80cdb6cf412ab0d9159d431671e987ad433c1f62e0988a9bc
 	[NOTICE.qcom]=fa43e1b9a13b341a07adca9dbe73d0f9072d7966fdfe811c01f0dd2872d7309a
 )

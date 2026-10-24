@@ -376,6 +376,7 @@ SYSTEM_ADD_ONS_DRIVERS_POWER = [ FFilterByBuildFeatures
 		amd_thermal
 		pch_thermal
 	}@ # x86,x86_64
+	qcom_adsp@arm64
 	sunxi_regulator@arm64
 	sunxi_thermal@arm64
 ] ;

@@ -1,0 +1,1521 @@
+/*
+ * Copyright 2026, air/OS. All rights reserved.
+ * Distributed under the terms of the MIT License.
+ */
+
+/*	The audio DSP ("ADSP", LPASS) of the Qualcomm SC8280XP (Radxa Dragon
+	Q8B). Besides audio it runs the PMIC's USB-C side: port roles, cable
+	orientation and the DisplayPort alternate mode of the two USB-C ports,
+	which the applications processor gets as "pmic_glink" messages over
+	GLINK. The firmware leaves it off.
+
+	Its start, as Linux' qcom_q6v5_pas (sc8280xp_adsp_resource):
+	 - the AOSS is told the image is being loaded (a QMP message);
+	 - the LCX and LMX power domains are voted to their top level through
+	   the apps RSC (RPMh), until the DSP says it has voted for itself
+	   ("handover");
+	 - TrustZone's PAS (peripheral 1) authenticates the signed image that is
+	   loaded into its reserved region, and starts it;
+	 - the DSP reports "ready" (or "fatal") in its SMP2P entry in SMEM.
+
+	All of it is polled: the interrupts (IPCC, SMP2P) are not needed for a
+	start. */
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+
+#include <KernelExport.h>
+#include <arch/atomic.h>
+#include <device_manager.h>
+
+#include <libfdt.h>
+
+#include "qcom_scm.h"
+
+
+#define QCOM_ADSP_MODULE_NAME "drivers/power/qcom_adsp/driver_v1"
+
+#define TRACE(x...)	dprintf("qcom_adsp: " x)
+#define ERROR(x...)	dprintf("qcom_adsp: " x)
+
+
+extern void* gFDT;
+
+static device_manager_info* sDeviceManager;
+
+static const uint32 kAdspPasId = 1;
+
+
+struct register_window {
+	area_id			area;
+	volatile uint8*	base;
+	size_t			size;
+
+	register_window() : area(-1), base(NULL), size(0) {}
+
+	status_t Map(const char* name, phys_addr_t address, size_t length)
+	{
+		size = length;
+		area = map_physical_memory(name, address, length,
+			B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY,
+			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&base);
+		return area < 0 ? area : B_OK;
+	}
+
+	void Unmap()
+	{
+		if (area >= 0)
+			delete_area(area);
+		area = -1;
+		base = NULL;
+	}
+
+	uint32 Read(uint32 offset) const
+		{ return *(volatile uint32*)(base + offset); }
+	uint16 Read16(uint32 offset) const
+		{ return *(volatile uint16*)(base + offset); }
+	void Write(uint32 offset, uint32 value)
+	{
+		*(volatile uint32*)(base + offset) = value;
+		memory_full_barrier();
+	}
+};
+
+
+static register_window sSmem;
+static register_window sIpcc;
+static register_window sQmp;
+static register_window sRsc;
+static register_window sCmdDb;
+static register_window sMutex;
+static uint32 sTcsOffset;
+static phys_addr_t sRegionBase;
+static size_t sRegionSize;
+static char sFirmwareName[128];
+static thread_id sBootThread = -1;
+
+
+// #pragma mark - device tree
+
+
+static bool
+fdt_reg(int node, int index, phys_addr_t* _base, size_t* _size)
+{
+	int length;
+	const fdt32_t* reg = (const fdt32_t*)fdt_getprop(gFDT, node, "reg",
+		&length);
+	if (reg == NULL || length < (index + 1) * 16)
+		return false;
+	reg += index * 4;
+	*_base = (uint64)fdt32_to_cpu(reg[0]) << 32 | fdt32_to_cpu(reg[1]);
+	*_size = (uint64)fdt32_to_cpu(reg[2]) << 32 | fdt32_to_cpu(reg[3]);
+	return true;
+}
+
+
+static int
+fdt_compatible_node(const char* compatible)
+{
+	return fdt_node_offset_by_compatible(gFDT, -1, compatible);
+}
+
+
+static status_t
+map_compatible(register_window& window, const char* name,
+	const char* compatible, int index = 0)
+{
+	int node = fdt_compatible_node(compatible);
+	phys_addr_t base;
+	size_t size;
+	if (node < 0 || !fdt_reg(node, index, &base, &size))
+		return B_DEVICE_NOT_FOUND;
+	return window.Map(name, base, size);
+}
+
+
+// #pragma mark - RPMh
+
+
+/*	The AOP's command DB: the RPMh resources, and the levels of the voltage
+	arcs (Linux' cmd-db.c). */
+
+struct cmd_db_rsc_header {
+	uint16	slave_id;
+	uint16	header_offset;
+	uint16	data_offset;
+	uint16	count;
+	uint16	version;
+	uint16	reserved[3];
+};
+
+struct cmd_db_entry {
+	char	id[8];
+	uint32	priority[2];
+	uint32	address;
+	uint16	length;
+	uint16	offset;
+};
+
+struct cmd_db_header {
+	uint32	version;
+	uint8	magic[4];
+	cmd_db_rsc_header resources[8];
+	uint32	checksum;
+	uint32	reserved;
+	uint8	data[];
+};
+
+
+//!	The address of RPMh resource \a id and its number of levels, if an arc.
+static uint32
+cmd_db_lookup(const char* id, uint32* _levels)
+{
+	const cmd_db_header* header = (const cmd_db_header*)sCmdDb.base;
+	static const uint8 kMagic[] = {0xdb, 0x30, 0x03, 0x0c};
+	if (header == NULL || memcmp((const void*)header->magic, kMagic, 4) != 0)
+		return 0;
+
+	char query[8] = {};
+	memcpy(query, id, strnlen(id, 8));
+	for (int i = 0; i < 8 && header->resources[i].slave_id != 0; i++) {
+		const cmd_db_rsc_header& rsc = header->resources[i];
+		const cmd_db_entry* entry
+			= (const cmd_db_entry*)(header->data + rsc.header_offset);
+		for (int j = 0; j < rsc.count; j++, entry++) {
+			if (memcmp(entry->id, query, 8) == 0) {
+				if (_levels != NULL)
+					*_levels = entry->length / 2;
+				return entry->address;
+			}
+		}
+	}
+	return 0;
+}
+
+
+/*!	One active-mode request through the apps RSC's first active TCS (as
+	rpmh-rsc's tcs_write()), waited for: \a count writes of \a data to
+	\a addresses. */
+static status_t
+rpmh_write(const uint32* addresses, const uint32* data, int count)
+{
+	uint32 version = sRsc.Read(0);
+	bool v3 = ((version >> 16) & 0xff) >= 3;
+	// rpmh_rsc_reg_offset_ver_3_0 / _2_7
+	const uint32 cmdSize = v3 ? 24 : 20;
+	const uint32 irqStatus = 0x04, irqClear = 0x08;
+	const uint32 waitForCompletion = v3 ? 0x20 : 0x10;
+	const uint32 control = v3 ? 0x24 : 0x14, enable = v3 ? 0x2c : 0x1c;
+	const uint32 msgId = v3 ? 0x34 : 0x30, addr = v3 ? 0x38 : 0x34;
+	const uint32 dataRegister = v3 ? 0x3c : 0x38;
+	// TCS 0, the first active one (qcom,tcs-config); the registers from
+	// the TCS base (qcom,tcs-offset)
+	const uint32 tcs = sTcsOffset;
+
+	uint32 mask = 0;
+	for (int i = 0; i < count; i++) {
+		uint32 c = tcs + cmdSize * i;
+		sRsc.Write(c + msgId, 8 | 1u << 16 | 1u << 8);	// write, response
+		sRsc.Write(c + addr, addresses[i]);
+		sRsc.Write(c + dataRegister, data[i]);
+		mask |= 1u << i;
+	}
+	sRsc.Write(tcs + waitForCompletion, mask);
+	sRsc.Write(tcs + enable, mask);
+	// __tcs_set_trigger(): AMC mode, then the trigger
+	uint32 value = sRsc.Read(tcs + control);
+	value &= ~(1u << 24);
+	sRsc.Write(tcs + control, value);
+	value &= ~(1u << 16);
+	sRsc.Write(tcs + control, value);
+	value = 1u << 16;
+	sRsc.Write(tcs + control, value);
+	value |= 1u << 24;
+	sRsc.Write(tcs + control, value);
+
+	bool done = false;
+	for (bigtime_t deadline = system_time() + 100000;
+			system_time() < deadline;) {
+		if ((sRsc.Read(sTcsOffset + irqStatus) & 1) != 0) {
+			done = true;
+			break;
+		}
+		spin(10);
+	}
+	sRsc.Write(sTcsOffset + irqClear, 1);
+	sRsc.Write(tcs + control, 0);
+	sRsc.Write(tcs + enable, 0);
+	return done ? B_OK : B_TIMED_OUT;
+}
+
+
+//!	Votes the arc \a name to \a level, or to its top level when negative.
+static status_t
+arc_vote(const char* name, int32 level)
+{
+	uint32 levels = 0;
+	uint32 address = cmd_db_lookup(name, &levels);
+	if (address == 0 || levels == 0) {
+		ERROR("no arc %s in the command DB\n", name);
+		return B_DEVICE_NOT_FOUND;
+	}
+	uint32 value = level < 0 ? levels - 1 : (uint32)level;
+	status_t status = rpmh_write(&address, &value, 1);
+	TRACE("%s (%#" B_PRIx32 ", %" B_PRIu32 " levels) to %" B_PRIu32 ": %s\n",
+		name, address, levels, value, strerror(status));
+	return status;
+}
+
+
+// #pragma mark - AOSS QMP
+
+
+/*	The AOSS's message RAM (Linux' qcom_aoss.c): a descriptor of both sides'
+	link and channel states, and the mailbox of ours ("mcore"). A doorbell
+	on the IPCC (client 0, the AOP; signal 0) tells it to look. */
+
+enum {
+	kQmpMagic = 0x00, kQmpVersion = 0x04,
+	kQmpUcoreLinkState = 0x0c, kQmpUcoreLinkStateAck = 0x10,
+	kQmpUcoreChannelState = 0x14, kQmpUcoreChannelStateAck = 0x18,
+	kQmpMcoreLinkState = 0x24, kQmpMcoreLinkStateAck = 0x28,
+	kQmpMcoreChannelState = 0x2c, kQmpMcoreChannelStateAck = 0x30,
+	kQmpMcoreMailboxSize = 0x34, kQmpMcoreMailboxOffset = 0x38,
+};
+
+static const uint32 kQmpStateUp = 0x0000ffff;
+static const uint32 kQmpMessageLength = 64;
+static bool sQmpOpen;
+
+
+static void
+ipcc_signal(uint32 client, uint32 signal)
+{
+	// IPCC_REG_SEND_ID: the client in 31:16, the signal in 15:0
+	sIpcc.Write(0x0c, client << 16 | signal);
+}
+
+
+static bool
+qmp_wait(uint32 offset, uint32 value)
+{
+	for (bigtime_t deadline = system_time() + 1000000;
+			system_time() < deadline; snooze(1000)) {
+		if (sQmp.Read(offset) == value)
+			return true;
+	}
+	return false;
+}
+
+
+static status_t
+qmp_open()
+{
+	if (sQmpOpen)
+		return B_OK;
+	if (sQmp.Read(kQmpMagic) != 0x4d41494c || sQmp.Read(kQmpVersion) != 1
+		|| sQmp.Read(kQmpMcoreMailboxSize) < kQmpMessageLength + 4) {
+		ERROR("aoss qmp: no version 1 message RAM\n");
+		return B_DEVICE_NOT_FOUND;
+	}
+	sQmp.Write(kQmpUcoreLinkStateAck, sQmp.Read(kQmpUcoreLinkState));
+	sQmp.Write(kQmpMcoreLinkState, kQmpStateUp);
+	ipcc_signal(0, 0);
+	if (!qmp_wait(kQmpMcoreLinkStateAck, kQmpStateUp)) {
+		ERROR("aoss qmp: link not acknowledged\n");
+		return B_TIMED_OUT;
+	}
+	sQmp.Write(kQmpMcoreChannelState, kQmpStateUp);
+	ipcc_signal(0, 0);
+	if (!qmp_wait(kQmpUcoreChannelState, kQmpStateUp)) {
+		ERROR("aoss qmp: its channel does not come up\n");
+		return B_TIMED_OUT;
+	}
+	sQmp.Write(kQmpUcoreChannelStateAck, kQmpStateUp);
+	ipcc_signal(0, 0);
+	if (!qmp_wait(kQmpMcoreChannelStateAck, kQmpStateUp)) {
+		ERROR("aoss qmp: our channel not acknowledged\n");
+		return B_TIMED_OUT;
+	}
+	sQmpOpen = true;
+	return B_OK;
+}
+
+
+static status_t
+qmp_send(const char* message)
+{
+	uint32 words[kQmpMessageLength / 4] = {};
+	size_t length = strlen(message);
+	if (length >= kQmpMessageLength)
+		return B_BAD_VALUE;
+	memcpy(words, message, length);
+
+	uint32 mailbox = sQmp.Read(kQmpMcoreMailboxOffset);
+	// the message RAM takes 32-bit accesses only
+	for (uint32 i = 0; i < kQmpMessageLength / 4; i++)
+		sQmp.Write(mailbox + 4 + i * 4, words[i]);
+	sQmp.Write(mailbox, kQmpMessageLength);
+	ipcc_signal(0, 0);
+	// the AOSS clears the length when it has the message
+	status_t status = qmp_wait(mailbox, 0) ? B_OK : B_TIMED_OUT;
+	if (status != B_OK)
+		sQmp.Write(mailbox, 0);
+	TRACE("aoss: \"%s\": %s\n", message, strerror(status));
+	return status;
+}
+
+
+// #pragma mark - SMEM, SMP2P
+
+
+/*	SMEM (Linux' smem.c): a table of partitions at the end of the region,
+	one per pair of hosts (0 the applications processor, 2 the ADSP, 0xfffe
+	the global one), each a list of items. */
+
+static const uint16 kHostApps = 0;
+static const uint16 kHostAdsp = 2;
+static const uint16 kHostGlobal = 0xfffe;
+
+
+//!	An item of the partition of \a host0 and \a host1 (uncached ones only).
+static volatile uint8*
+smem_item(uint16 host0, uint16 host1, uint16 item, uint32* _size = NULL)
+{
+	uint32 table = sSmem.size - 4096;
+	if (sSmem.Read(table) != 0x434f5424)	// "$TOC"
+		return NULL;
+	uint32 count = sSmem.Read(table + 8);
+	for (uint32 i = 0; i < count && i < 64; i++) {
+		uint32 entry = table + 32 + 48 * i;
+		uint32 offset = sSmem.Read(entry), size = sSmem.Read(entry + 4);
+		uint16 a = sSmem.Read16(entry + 12), b = sSmem.Read16(entry + 14);
+		if (!((a == host0 && b == host1) || (a == host1 && b == host0))
+			|| offset == 0 || offset + size > sSmem.size)
+			continue;
+		if (sSmem.Read(offset) != 0x54525024)	// "$PRT"
+			return NULL;
+		uint32 freeUncached = sSmem.Read(offset + 12);
+		uint32 position = 32;
+		while (position + 16 <= freeUncached && freeUncached <= size) {
+			uint32 header = offset + position;
+			if (sSmem.Read16(header) != 0xa5a5)
+				break;
+			uint32 itemSize = sSmem.Read(header + 4);
+			uint16 paddingData = sSmem.Read16(header + 8);
+			uint16 paddingHeader = sSmem.Read16(header + 10);
+			if (sSmem.Read16(header + 2) == item) {
+				if (_size != NULL)
+					*_size = itemSize - paddingData;
+				return sSmem.base + header + 16 + paddingHeader;
+			}
+			position += 16 + paddingHeader + itemSize;
+		}
+		return NULL;
+	}
+	return NULL;
+}
+
+
+/*!	Takes the hardware mutex SMEM's allocations are made under (the TCSR
+	mutex of its "hwlocks"; locks 4 KiB apart, held by writing one's own
+	ID, 1 for the applications processor). */
+static bool
+smem_lock()
+{
+	for (bigtime_t deadline = system_time() + 1000000;
+			system_time() < deadline; spin(10)) {
+		sMutex.Write(0x3000, 1);
+		if (sMutex.Read(0x3000) == 1)
+			return true;
+	}
+	return false;
+}
+
+
+static void
+smem_unlock()
+{
+	sMutex.Write(0x3000, 0);
+}
+
+
+/*!	Allocates the uncached item \a item of \a size bytes in the partition
+	of \a host0 and \a host1, or returns it if it is there (as
+	qcom_smem_alloc_private()). */
+static volatile uint8*
+smem_allocate(uint16 host0, uint16 host1, uint16 item, uint32 size)
+{
+	volatile uint8* existing = smem_item(host0, host1, item);
+	if (existing != NULL)
+		return existing;
+
+	uint32 table = sSmem.size - 4096;
+	uint32 count = sSmem.Read(table + 8);
+	for (uint32 i = 0; i < count && i < 64; i++) {
+		uint32 entry = table + 32 + 48 * i;
+		uint32 offset = sSmem.Read(entry), partitionSize = sSmem.Read(entry + 4);
+		uint16 a = sSmem.Read16(entry + 12), b = sSmem.Read16(entry + 14);
+		if (!((a == host0 && b == host1) || (a == host1 && b == host0))
+			|| offset == 0 || offset + partitionSize > sSmem.size
+			|| sSmem.Read(offset) != 0x54525024)
+			continue;
+		if (!smem_lock())
+			return NULL;
+		volatile uint8* data = smem_item(host0, host1, item);
+		uint32 freeUncached = sSmem.Read(offset + 12);
+		uint32 freeCached = sSmem.Read(offset + 16);
+		uint32 alignedSize = (size + 7) & ~7u;
+		if (data == NULL && freeUncached + 16 + alignedSize <= freeCached) {
+			uint32 header = offset + freeUncached;
+			sSmem.Write(header, item << 16 | 0xa5a5);
+			sSmem.Write(header + 4, alignedSize);
+			sSmem.Write(header + 8, alignedSize - size);	// padding: data, header
+			sSmem.Write(header + 12, 0);
+			for (uint32 w = 0; w < alignedSize; w += 4)
+				sSmem.Write(header + 16 + w, 0);
+			sSmem.Write(offset + 12, freeUncached + 16 + alignedSize);
+			data = sSmem.base + header + 16;
+		}
+		smem_unlock();
+		if (data == NULL)
+			ERROR("smem: no room for item %u\n", item);
+		return data;
+	}
+	return NULL;
+}
+
+
+/*!	Our SMP2P item for the ADSP (item 429, as Linux' smp2p.c makes it when
+	it starts, before any remote processor): its one entry, "master-kernel",
+	is where a stop would be asked for. Then the ADSP is told. */
+static status_t
+smp2p_create()
+{
+	const uint32 entries = 16;
+	volatile uint8* out = smem_allocate(kHostApps, kHostAdsp, 429,
+		20 + 20 * entries);
+	if (out == NULL)
+		return B_NO_MEMORY;
+	volatile uint32* words = (volatile uint32*)out;
+	if (words[0] != 0x504d5324) {
+		// version 1, the SSR acknowledgement feature
+		words[1] = 1 | 1u << 8;
+		words[2] = kHostApps | (uint32)kHostAdsp << 16;
+		words[3] = entries | 1u << 16;	// total, valid
+		words[4] = 0;
+		static const char kName[16] = "master-kernel";
+		for (int w = 0; w < 4; w++)
+			words[5 + w] = ((const uint32*)kName)[w];
+		words[9] = 0;
+		memory_full_barrier();
+		words[0] = 0x504d5324;
+		memory_full_barrier();
+	}
+	// IPCC: client 3 (LPASS), signal 2 (SMP2P)
+	ipcc_signal(3, 2);
+	return B_OK;
+}
+
+
+static void
+smem_log_items(uint16 host0, uint16 host1)
+{
+	uint32 table = sSmem.size - 4096;
+	uint32 count = sSmem.Read(table + 8);
+	for (uint32 i = 0; i < count && i < 64; i++) {
+		uint32 entry = table + 32 + 48 * i;
+		uint32 offset = sSmem.Read(entry), size = sSmem.Read(entry + 4);
+		uint16 a = sSmem.Read16(entry + 12), b = sSmem.Read16(entry + 14);
+		if (!((a == host0 && b == host1) || (a == host1 && b == host0))
+			|| offset == 0 || offset + size > sSmem.size)
+			continue;
+		char list[192] = {};
+		size_t length = 0;
+		uint32 freeUncached = sSmem.Read(offset + 12);
+		uint32 position = 32;
+		while (position + 16 <= freeUncached && freeUncached <= size) {
+			uint32 header = offset + position;
+			if (sSmem.Read16(header) != 0xa5a5)
+				break;
+			if (length + 16 < sizeof(list)) {
+				length += snprintf(list + length, sizeof(list) - length,
+					" %u", sSmem.Read16(header + 2));
+			}
+			position += 16 + sSmem.Read16(header + 10)
+				+ sSmem.Read(header + 4);
+		}
+		TRACE("smem %#x-%#x: items%s; free %#" B_PRIx32 "-%#" B_PRIx32 "\n",
+			host0, host1, list, freeUncached, sSmem.Read(offset + 16));
+	}
+}
+
+
+/*!	The value of the entry \a name in the SMP2P item \a item that the ADSP
+	writes, or false when it has none (yet). Its layout (smp2p.c): magic
+	"$SMP", version and features, the two hosts, the entry counts, flags;
+	then entries of a 16 character name and a 32-bit value. */
+static bool
+smp2p_entry(uint16 item, const char* name, uint32* _value)
+{
+	volatile uint8* smp2p = smem_item(kHostApps, kHostAdsp, item);
+	if (smp2p == NULL || *(volatile uint32*)smp2p != 0x504d5324)
+		return false;
+	uint32 valid = *(volatile uint32*)(smp2p + 12) >> 16;
+	for (uint32 i = 0; i < valid && i < 16; i++) {
+		volatile uint8* entry = smp2p + 20 + 20 * i;
+		char entryName[17] = {};
+		for (int c = 0; c < 16; c++)
+			entryName[c] = entry[c];
+		if (strcmp(entryName, name) == 0) {
+			*_value = *(volatile uint32*)(entry + 16);
+			return true;
+		}
+	}
+	return false;
+}
+
+
+// #pragma mark - GLINK
+
+
+/*	GLINK over SMEM (Linux' qcom_glink_smem.c and qcom_glink_native.c): a
+	ring FIFO each way, ours (item 479) and the ADSP's (480), their tails
+	and heads in the descriptor (478: of ours, then of the ADSP's). On them
+	8 byte aligned messages of an 8 byte header {command, a 16 and a 32-bit
+	parameter}. A doorbell on the IPCC (client 3, signal 0) tells the ADSP
+	to look; its doorbells are not needed, the FIFO is polled.
+
+	Channels are opened by name. Before a message can be sent on one, the
+	other side must have announced a buffer ("intent") big enough for it;
+	ours are announced when a channel opens. */
+
+enum {
+	kGlinkVersion = 0, kGlinkVersionAck = 1, kGlinkOpen = 2, kGlinkClose = 3,
+	kGlinkOpenAck = 4, kGlinkIntent = 5, kGlinkRxDone = 6,
+	kGlinkRxIntentRequest = 7, kGlinkRxIntentRequestAck = 8,
+	kGlinkTxData = 9, kGlinkCloseAck = 11, kGlinkTxDataContinued = 12,
+	kGlinkReadNotify = 13, kGlinkRxDoneReuse = 14, kGlinkSignals = 15,
+};
+
+static const uint32 kGlinkVersion1 = 1;
+static const uint32 kGlinkFeatureIntentReuse = 1;
+static const uint32 kGlinkFifoReserve = 8 + 16;
+	// FIFO_FULL_RESERVE, TX_BLOCKED_SIGNAL_RESERVE
+static const uint32 kGlinkIntentSize = 1024;
+static const uint32 kGlinkIntentCount = 5;
+static const uint32 kGlinkMaxMessage = 4096;
+static const int kGlinkMaxChannels = 16;
+static const int kGlinkMaxRemoteIntents = 16;
+
+
+struct glink_message {
+	uint16	command;
+	uint16	param1;
+	uint32	param2;
+};
+
+struct glink_pipe {
+	volatile uint32*	tail;
+	volatile uint32*	head;
+	volatile uint8*		fifo;
+	uint32				length;
+};
+
+struct glink_remote_intent {
+	uint32	id;
+	uint32	size;
+	bool	inUse;
+};
+
+struct glink_channel;
+typedef void (*glink_receive_hook)(glink_channel* channel, const uint8* data,
+	uint32 length);
+
+struct glink_channel {
+	char				name[32];
+	uint16				localId;
+	uint16				remoteId;		// 0: the ADSP has not opened it
+	bool				wanted;			// a hook of ours takes it
+	bool				openSent;
+	bool				openAcked;
+	glink_receive_hook	hook;
+	glink_remote_intent	remoteIntents[kGlinkMaxRemoteIntents];
+	uint32				remoteIntentCount;
+	uint32				nextIntentId;
+	uint8*				rxBuffer;		// a message in chunks
+	uint32				rxLength;
+};
+
+
+static glink_pipe sTx, sRx;
+static uint32 sGlinkFeatures = kGlinkFeatureIntentReuse;
+static bool sGlinkUp;
+static glink_channel sChannels[kGlinkMaxChannels];
+static int sChannelCount;
+static volatile bool sQuit;
+
+
+static void
+glink_kick()
+{
+	ipcc_signal(3, 0);
+}
+
+
+static bool
+glink_rx_fifo()
+{
+	if (sRx.fifo != NULL)
+		return true;
+	uint32 size = 0;
+	sRx.fifo = smem_item(kHostApps, kHostAdsp, 480, &size);
+	sRx.length = size;
+	return sRx.fifo != NULL && size > 0;
+}
+
+
+static uint32
+rx_avail()
+{
+	if (!glink_rx_fifo())
+		return 0;
+	uint32 head = *sRx.head, tail = *sRx.tail;
+	if (head >= sRx.length || tail >= sRx.length)
+		return 0;
+	return head >= tail ? head - tail : sRx.length - tail + head;
+}
+
+
+static void
+rx_peek(uint32 offset, void* buffer, uint32 count)
+{
+	uint32 tail = *sRx.tail + offset;
+	if (tail >= sRx.length)
+		tail -= sRx.length;
+	uint8* out = (uint8*)buffer;
+	for (uint32 i = 0; i < count; i++) {
+		out[i] = sRx.fifo[tail];
+		if (++tail == sRx.length)
+			tail = 0;
+	}
+}
+
+
+static void
+rx_advance(uint32 count)
+{
+	uint32 tail = *sRx.tail + count;
+	if (tail >= sRx.length)
+		tail -= sRx.length;
+	memory_full_barrier();
+	*sRx.tail = tail;
+	memory_full_barrier();
+}
+
+
+static uint32
+tx_avail()
+{
+	uint32 head = *sTx.head, tail = *sTx.tail;
+	uint32 avail = tail <= head ? sTx.length - head + tail : tail - head;
+	return avail < kGlinkFifoReserve ? 0 : avail - kGlinkFifoReserve;
+}
+
+
+static uint32
+tx_write_one(uint32 head, const void* data, uint32 count)
+{
+	const uint8* in = (const uint8*)data;
+	for (uint32 i = 0; i < count; i++) {
+		sTx.fifo[head] = in[i];
+		if (++head == sTx.length)
+			head = 0;
+	}
+	return head;
+}
+
+
+//!	Puts a message (its header, then \a data) into our FIFO, and rings.
+static status_t
+glink_send(const void* header, uint32 headerLength, const void* data = NULL,
+	uint32 dataLength = 0)
+{
+	uint32 total = (headerLength + dataLength + 7) & ~7u;
+	for (bigtime_t deadline = system_time() + 1000000; tx_avail() < total;
+			snooze(1000)) {
+		if (system_time() > deadline) {
+			ERROR("glink: no room for %" B_PRIu32 " bytes\n", total);
+			return B_TIMED_OUT;
+		}
+	}
+	uint32 head = *sTx.head;
+	head = tx_write_one(head, header, headerLength);
+	if (dataLength > 0)
+		head = tx_write_one(head, data, dataLength);
+	head = (head + 7) & ~7u;
+	if (head >= sTx.length)
+		head -= sTx.length;
+	memory_full_barrier();
+	*sTx.head = head;
+	memory_full_barrier();
+	glink_kick();
+	return B_OK;
+}
+
+
+static status_t
+glink_send_command(uint16 command, uint16 param1, uint32 param2)
+{
+	glink_message message = { command, param1, param2 };
+	return glink_send(&message, sizeof(message));
+}
+
+
+static glink_channel*
+glink_channel_by_name(const char* name)
+{
+	for (int i = 0; i < sChannelCount; i++) {
+		if (strcmp(sChannels[i].name, name) == 0)
+			return &sChannels[i];
+	}
+	return NULL;
+}
+
+
+static glink_channel*
+glink_channel_by_remote_id(uint16 id)
+{
+	for (int i = 0; i < sChannelCount; i++) {
+		if (sChannels[i].remoteId == id)
+			return &sChannels[i];
+	}
+	return NULL;
+}
+
+
+static glink_channel*
+glink_channel_by_local_id(uint16 id)
+{
+	for (int i = 0; i < sChannelCount; i++) {
+		if (sChannels[i].localId == id)
+			return &sChannels[i];
+	}
+	return NULL;
+}
+
+
+static glink_channel*
+glink_add_channel(const char* name)
+{
+	if (sChannelCount == kGlinkMaxChannels)
+		return NULL;
+	glink_channel* channel = &sChannels[sChannelCount];
+	memset(channel, 0, sizeof(*channel));
+	strlcpy(channel->name, name, sizeof(channel->name));
+	channel->localId = ++sChannelCount;
+	channel->nextIntentId = 1;
+	return channel;
+}
+
+
+/*!	Our open of a channel the ADSP opened (qcom_glink_create_remote()): our
+	acknowledgement of its open, then our own open. */
+static void
+glink_open(glink_channel* channel)
+{
+	glink_send_command(kGlinkOpenAck, channel->remoteId, 0);
+	struct {
+		glink_message	message;
+		char			name[32];
+	} request = {};
+	uint32 nameLength = strlen(channel->name) + 1;
+	request.message = { kGlinkOpen, channel->localId, nameLength };
+	memcpy(request.name, channel->name, nameLength);
+	glink_send(&request, sizeof(glink_message) + nameLength);
+	channel->openSent = true;
+}
+
+
+static void
+glink_announce_intents(glink_channel* channel, uint32 size, uint32 count)
+{
+	for (uint32 i = 0; i < count; i++) {
+		struct {
+			glink_message	message;
+			uint32			size;
+			uint32			id;
+		} intent = { { kGlinkIntent, channel->localId, 1 }, size,
+			channel->nextIntentId++ };
+		glink_send(&intent, sizeof(intent));
+	}
+}
+
+
+/*!	Sends \a data on \a channel, in an intent of the ADSP's that is big
+	enough. Returns B_WOULD_BLOCK when it has none (yet), after asking it
+	for one. */
+static status_t
+glink_write(glink_channel* channel, const void* data, uint32 length)
+{
+	if (channel->remoteId == 0 || !channel->openAcked)
+		return B_NOT_ALLOWED;
+	glink_remote_intent* intent = NULL;
+	for (uint32 i = 0; i < channel->remoteIntentCount; i++) {
+		glink_remote_intent& candidate = channel->remoteIntents[i];
+		if (!candidate.inUse && candidate.size >= length
+			&& (intent == NULL || candidate.size < intent->size))
+			intent = &candidate;
+	}
+	if (intent == NULL) {
+		glink_send_command(kGlinkRxIntentRequest, channel->localId, length);
+		return B_WOULD_BLOCK;
+	}
+	intent->inUse = true;
+	struct {
+		glink_message	message;
+		uint32			chunkSize;
+		uint32			leftSize;
+	} header = { { kGlinkTxData, channel->localId, intent->id }, length, 0 };
+	return glink_send(&header, sizeof(header), data, length);
+}
+
+
+static void
+glink_receive_open(uint16 remoteId, const char* name)
+{
+	glink_channel* channel = glink_channel_by_name(name);
+	if (channel == NULL)
+		channel = glink_add_channel(name);
+	if (channel == NULL)
+		return;
+	channel->remoteId = remoteId;
+	TRACE("glink: the ADSP opened \"%s\" (%u)%s\n", name, remoteId,
+		channel->wanted ? "" : ", not used");
+	if (channel->wanted)
+		glink_open(channel);
+}
+
+
+static void
+glink_receive_data(const glink_message& message, uint32 chunkSize,
+	uint32 leftSize, uint32 offset)
+{
+	glink_channel* channel = glink_channel_by_remote_id(message.param1);
+	if (channel == NULL || channel->hook == NULL)
+		return;
+	if (channel->rxBuffer == NULL)
+		channel->rxBuffer = (uint8*)malloc(kGlinkMaxMessage);
+	if (channel->rxBuffer == NULL
+		|| channel->rxLength + chunkSize > kGlinkMaxMessage) {
+		ERROR("glink: a message on \"%s\" too big\n", channel->name);
+		channel->rxLength = 0;
+		return;
+	}
+	if (message.command == kGlinkTxData)
+		channel->rxLength = 0;
+	rx_peek(offset, channel->rxBuffer + channel->rxLength, chunkSize);
+	channel->rxLength += chunkSize;
+	if (leftSize != 0)
+		return;
+	uint32 length = channel->rxLength;
+	channel->rxLength = 0;
+	// our intents are reused (ours are only the ones announced at the open)
+	glink_send_command(kGlinkRxDoneReuse, channel->localId, message.param2);
+	channel->hook(channel, channel->rxBuffer, length);
+}
+
+
+//!	Takes what the ADSP sent (qcom_glink_native_rx()).
+static void
+glink_poll()
+{
+	while (true) {
+		uint32 avail = rx_avail();
+		if (avail < sizeof(glink_message))
+			return;
+		glink_message message;
+		rx_peek(0, &message, sizeof(message));
+		uint32 consumed = sizeof(message);
+		switch (message.command) {
+			case kGlinkVersion:
+				if (message.param1 == 0)
+					break;
+				if (message.param1 == kGlinkVersion1)
+					sGlinkFeatures &= message.param2;
+				glink_send_command(kGlinkVersionAck, kGlinkVersion1,
+					sGlinkFeatures);
+				break;
+			case kGlinkVersionAck:
+				if (message.param1 == 0)
+					break;
+				if (message.param1 == kGlinkVersion1
+					&& message.param2 == sGlinkFeatures) {
+					if (!sGlinkUp)
+						TRACE("glink: up, features %#" B_PRIx32 "\n",
+							sGlinkFeatures);
+					sGlinkUp = true;
+					break;
+				}
+				sGlinkFeatures &= message.param2;
+				glink_send_command(kGlinkVersion, kGlinkVersion1,
+					sGlinkFeatures);
+				break;
+			case kGlinkOpen:
+			{
+				consumed += message.param2;
+				if (avail < consumed)
+					return;
+				char name[33] = {};
+				rx_peek(sizeof(message), name, min_c(message.param2, 32u));
+				glink_receive_open(message.param1, name);
+				break;
+			}
+			case kGlinkClose:
+			{
+				glink_channel* channel
+					= glink_channel_by_remote_id(message.param1);
+				TRACE("glink: the ADSP closed \"%s\"\n",
+					channel != NULL ? channel->name : "?");
+				if (channel != NULL) {
+					channel->remoteId = 0;
+					channel->openSent = channel->openAcked = false;
+					channel->remoteIntentCount = 0;
+				}
+				glink_send_command(kGlinkCloseAck, message.param1, 0);
+				break;
+			}
+			case kGlinkOpenAck:
+			{
+				glink_channel* channel
+					= glink_channel_by_local_id(message.param1);
+				if (channel != NULL && !channel->openAcked) {
+					channel->openAcked = true;
+					TRACE("glink: \"%s\" open\n", channel->name);
+					glink_announce_intents(channel, kGlinkIntentSize,
+						kGlinkIntentCount);
+				}
+				break;
+			}
+			case kGlinkIntent:
+			{
+				consumed += 8 * message.param2;
+				if (avail < consumed)
+					return;
+				glink_channel* channel
+					= glink_channel_by_remote_id(message.param1);
+				for (uint32 i = 0; i < message.param2; i++) {
+					uint32 pair[2];
+					rx_peek(sizeof(message) + 8 * i, pair, sizeof(pair));
+					if (channel == NULL || channel->remoteIntentCount
+							== (uint32)kGlinkMaxRemoteIntents)
+						continue;
+					channel->remoteIntents[channel->remoteIntentCount++]
+						= { pair[1], pair[0], false };
+				}
+				break;
+			}
+			case kGlinkRxDone:
+			case kGlinkRxDoneReuse:
+			{
+				glink_channel* channel
+					= glink_channel_by_remote_id(message.param1);
+				if (channel == NULL)
+					break;
+				for (uint32 i = 0; i < channel->remoteIntentCount; i++) {
+					glink_remote_intent& intent = channel->remoteIntents[i];
+					if (intent.id != message.param2)
+						continue;
+					if (message.command == kGlinkRxDoneReuse)
+						intent.inUse = false;
+					else {
+						intent = channel->remoteIntents[
+							--channel->remoteIntentCount];
+					}
+					break;
+				}
+				break;
+			}
+			case kGlinkRxIntentRequest:
+			{
+				glink_channel* channel
+					= glink_channel_by_remote_id(message.param1);
+				if (channel == NULL)
+					break;
+				bool granted = message.param2 <= kGlinkMaxMessage;
+				if (granted)
+					glink_announce_intents(channel, message.param2, 1);
+				glink_send_command(kGlinkRxIntentRequestAck, channel->localId,
+					granted ? 1 : 0);
+				break;
+			}
+			case kGlinkTxData:
+			case kGlinkTxDataContinued:
+			{
+				if (avail < 16)
+					return;
+				uint32 sizes[2];
+				rx_peek(sizeof(message), sizes, sizeof(sizes));
+				consumed = 16 + sizes[0];
+				if (avail < consumed)
+					return;
+				glink_receive_data(message, sizes[0], sizes[1], 16);
+				break;
+			}
+			case kGlinkReadNotify:
+				glink_kick();
+				break;
+			case kGlinkRxIntentRequestAck:
+			case kGlinkCloseAck:
+			case kGlinkSignals:
+				break;
+			default:
+				ERROR("glink: unknown command %u, the rest dropped\n",
+					message.command);
+				consumed = avail;
+				break;
+		}
+		rx_advance((consumed + 7) & ~7u);
+	}
+}
+
+
+static status_t
+glink_start()
+{
+	uint32 size = 0;
+	volatile uint32* descriptor = (volatile uint32*)smem_allocate(kHostApps,
+		kHostAdsp, 478, 32);
+	volatile uint8* fifo = smem_allocate(kHostApps, kHostAdsp, 479, 16384);
+	if (descriptor == NULL || fifo == NULL
+		|| smem_item(kHostApps, kHostAdsp, 479, &size) == NULL)
+		return B_NO_MEMORY;
+	sTx = { &descriptor[0], &descriptor[1], fifo, size };
+	sRx = { &descriptor[2], &descriptor[3], NULL, 0 };
+	*sRx.tail = 0;
+	*sTx.head = 0;
+	memory_full_barrier();
+	return glink_send_command(kGlinkVersion, kGlinkVersion1, sGlinkFeatures);
+}
+
+
+// #pragma mark - pmic_glink
+
+
+/*	The PMIC's services on the ADSP, on the GLINK channel
+	"PMIC_RTR_ADSP_APPS" (Linux' pmic_glink.c, pmic_glink_altmode.c):
+	messages of a header {owner, type, opcode}. The USB-C ports' alternate
+	modes are owner 32780: once enabled with a request (ALTMODE_PAN_EN),
+	the ADSP reports each port's state (cable orientation, mux, the
+	DisplayPort pin assignment and HPD), each report acknowledged
+	(ALTMODE_PAN_ACK). */
+
+static const uint32 kPmicGlinkOwnerAltmode = 32780;	// USBC_PAN
+static const uint32 kPmicGlinkRequest = 1;
+static const uint32 kUsbcWriteRequest = 0x15;
+static const uint32 kUsbcNotify = 0x16;
+static const uint32 kAltmodeEnable = 0x10;
+static const uint32 kAltmodeAck = 0x11;
+
+struct pmic_glink_header {
+	uint32	owner;
+	uint32	type;
+	uint32	opcode;
+};
+
+struct usbc_write_request {
+	pmic_glink_header header;
+	uint32	command;
+	uint32	argument;
+	uint32	reserved;
+};
+
+struct usbc_notify {
+	pmic_glink_header header;
+	uint8	pinAssignmentHpd;	// pin assignment 5:0, HPD 6, HPD IRQ 7
+	uint8	reserved1[7];
+	uint8	port;
+	uint8	orientation;
+	uint8	mux;
+	uint8	reserved2;
+	uint16	vid;
+	uint16	svid;
+} _PACKED;
+
+static glink_channel* sPmicGlink;
+static bool sAltmodeEnabled;
+static bigtime_t sAltmodeRequested;
+
+
+static status_t
+altmode_request(uint32 command, uint32 argument)
+{
+	usbc_write_request request = {
+		{ kPmicGlinkOwnerAltmode, kPmicGlinkRequest, kUsbcWriteRequest },
+		command, argument, 0 };
+	return glink_write(sPmicGlink, &request, sizeof(request));
+}
+
+
+static void
+pmic_glink_receive(glink_channel* channel, const uint8* data, uint32 length)
+{
+	pmic_glink_header header;
+	if (length < sizeof(header))
+		return;
+	memcpy(&header, data, sizeof(header));
+	uint32 opcode = header.opcode & 0xff;
+	if (header.owner != kPmicGlinkOwnerAltmode) {
+		TRACE("pmic_glink: owner %" B_PRIu32 " type %" B_PRIu32 " opcode %#"
+			B_PRIx32 ", %" B_PRIu32 " bytes\n", header.owner, header.type,
+			header.opcode, length);
+		return;
+	}
+	if (opcode == kUsbcWriteRequest) {
+		if (!sAltmodeEnabled)
+			TRACE("pmic_glink: alternate mode reports on\n");
+		sAltmodeEnabled = true;
+		return;
+	}
+	if (opcode != kUsbcNotify || length != sizeof(usbc_notify)) {
+		TRACE("pmic_glink: alternate mode opcode %#" B_PRIx32 ", %" B_PRIu32
+			" bytes\n", header.opcode, length);
+		return;
+	}
+	usbc_notify notify;
+	memcpy(&notify, data, sizeof(notify));
+	uint16 svid = header.opcode >> 16;
+	const char* mode = svid == 0xff01 ? "DisplayPort"
+		: notify.mux == 4 ? "tunnelling" : notify.mux == 0 ? "nothing"
+		: "USB";
+	TRACE("usb-c port %u: %s, orientation %u, mux %u, svid %#x, pin "
+		"assignment %u, hpd %u%s\n", notify.port, mode, notify.orientation,
+		notify.mux, svid, notify.pinAssignmentHpd & 0x3f,
+		(notify.pinAssignmentHpd >> 6) & 1,
+		(notify.pinAssignmentHpd & 0x80) != 0 ? " (irq)" : "");
+	altmode_request(kAltmodeAck, notify.port);
+}
+
+
+//!	Turns the reports on, again and again until the ADSP answers.
+static void
+pmic_glink_tick()
+{
+	if (sPmicGlink == NULL || !sPmicGlink->openAcked || sAltmodeEnabled)
+		return;
+	if (system_time() - sAltmodeRequested < 2000000)
+		return;
+	if (altmode_request(kAltmodeEnable, 0) != B_WOULD_BLOCK)
+		sAltmodeRequested = system_time();
+}
+
+
+// #pragma mark - the start
+
+
+enum {
+	kStateFatal = 1 << 0,
+	kStateReady = 1 << 1,
+	kStateHandover = 1 << 2,
+};
+
+
+static uint8*
+load_firmware(const char* name, size_t* _size)
+{
+	static const char* kDirectories[] = {
+		"/boot/system/non-packaged/data/firmware",
+		"/boot/system/data/firmware",
+	};
+	for (const char* directory : kDirectories) {
+		char path[B_PATH_NAME_LENGTH];
+		snprintf(path, sizeof(path), "%s/%s", directory, name);
+		int fd = open(path, O_RDONLY);
+		if (fd < 0)
+			continue;
+		struct stat st;
+		uint8* data = NULL;
+		if (fstat(fd, &st) == 0 && st.st_size > 0)
+			data = (uint8*)malloc(st.st_size);
+		if (data != NULL && read(fd, data, st.st_size) != st.st_size) {
+			free(data);
+			data = NULL;
+		}
+		close(fd);
+		if (data != NULL) {
+			TRACE("firmware %s, %" B_PRIdOFF " bytes\n", path, st.st_size);
+			*_size = st.st_size;
+			return data;
+		}
+	}
+	ERROR("firmware %s not found\n", name);
+	return NULL;
+}
+
+
+static void
+log_crash_reason()
+{
+	// crash_reason_smem 423, in the global partition
+	uint32 size = 0;
+	volatile uint8* reason = smem_item(kHostGlobal, kHostGlobal, 423, &size);
+	if (reason == NULL || size == 0)
+		return;
+	char text[128] = {};
+	for (uint32 i = 0; i < size && i < sizeof(text) - 1; i++)
+		text[i] = reason[i];
+	ERROR("crash reason: %s\n", text);
+}
+
+
+static status_t
+adsp_start()
+{
+	size_t size;
+	uint8* image = load_firmware(sFirmwareName, &size);
+	if (image == NULL)
+		return B_ENTRY_NOT_FOUND;
+
+	status_t status = qmp_open();
+	if (status == B_OK)
+		status = qmp_send("{class: image, res: load_state, name: adsp, val: on}");
+	if (status != B_OK) {
+		free(image);
+		return status;
+	}
+	status = smp2p_create();
+	if (status != B_OK) {
+		free(image);
+		return status;
+	}
+	// the proxy votes, until the DSP has made its own
+	arc_vote("lcx.lvl", -1);
+	arc_vote("lmx.lvl", -1);
+
+	bigtime_t start = system_time();
+	status = qcom_pas_load("adsp", kAdspPasId, image, size, sRegionBase,
+		sRegionSize);
+	free(image);
+	if (status == B_OK)
+		status = qcom_pas_auth_and_reset("adsp", kAdspPasId);
+	if (status != B_OK) {
+		arc_vote("lcx.lvl", 0);
+		arc_vote("lmx.lvl", 0);
+		qmp_send("{class: image, res: load_state, name: adsp, val: off}");
+		return status;
+	}
+	TRACE("authenticated and started in %" B_PRId64 " ms\n",
+		(system_time() - start) / 1000);
+
+	// its state, in the SMP2P entry it writes (item 443, "slave-kernel";
+	// the device tree's "qcom,smem" names the inbound item first)
+	uint32 state = 0;
+	bool seen = false;
+	int polls = 0;
+	for (bigtime_t deadline = system_time() + 10000000;
+			system_time() < deadline; snooze(10000)) {
+		// (lab: does it wait for a doorbell after its start?)
+		if (!seen && ++polls % 20 == 0)
+			ipcc_signal(3, 2);
+		uint32 value;
+		if (smp2p_entry(443, "slave-kernel", &value)) {
+			if (!seen || value != state) {
+				TRACE("state %#" B_PRIx32 " after %" B_PRId64 " ms\n", value,
+					(system_time() - start) / 1000);
+			}
+			seen = true;
+			state = value;
+			if ((state & (kStateFatal | kStateHandover)) != 0)
+				break;
+		}
+	}
+	if ((state & kStateFatal) != 0) {
+		log_crash_reason();
+		return B_ERROR;
+	}
+	if ((state & kStateHandover) != 0) {
+		arc_vote("lcx.lvl", 0);
+		arc_vote("lmx.lvl", 0);
+	}
+	if ((state & kStateReady) == 0) {
+		smem_log_items(kHostApps, kHostAdsp);
+		log_crash_reason();
+		ERROR("not ready after 10 s (%s)\n", seen ? "it has an SMP2P entry"
+			: "no SMP2P entry");
+		return B_TIMED_OUT;
+	}
+	TRACE("ready\n");
+	return B_OK;
+}
+
+
+static status_t
+boot_thread(void*)
+{
+	if (adsp_start() != B_OK)
+		return B_OK;
+
+	sPmicGlink = glink_add_channel("PMIC_RTR_ADSP_APPS");
+	sPmicGlink->wanted = true;
+	sPmicGlink->hook = pmic_glink_receive;
+	if (glink_start() != B_OK) {
+		ERROR("glink: cannot start\n");
+		return B_OK;
+	}
+	while (!sQuit) {
+		glink_poll();
+		pmic_glink_tick();
+		snooze(10000);
+	}
+	return B_OK;
+}
+
+
+// #pragma mark - driver
+
+
+static float
+qcom_adsp_supports_device(device_node* parent)
+{
+	const char* bus;
+	const char* compatible;
+	if (sDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
+			!= B_OK || strcmp(bus, "fdt") != 0
+		|| sDeviceManager->get_attr_string(parent, "fdt/compatible",
+			&compatible, false) != B_OK
+		|| strcmp(compatible, "qcom,sc8280xp-adsp-pas") != 0) {
+		return 0.0f;
+	}
+	return 0.8f;
+}
+
+
+static status_t
+qcom_adsp_register_device(device_node* parent)
+{
+	device_attr attrs[] = {
+		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
+			{ .string = "Qualcomm audio DSP" } },
+		{}
+	};
+	return sDeviceManager->register_node(parent, QCOM_ADSP_MODULE_NAME,
+		attrs, NULL, NULL);
+}
+
+
+static void
+unmap_all()
+{
+	sSmem.Unmap();
+	sIpcc.Unmap();
+	sQmp.Unmap();
+	sRsc.Unmap();
+	sCmdDb.Unmap();
+	sMutex.Unmap();
+}
+
+
+static status_t
+qcom_adsp_init_driver(device_node* node, void** _cookie)
+{
+	if (gFDT == NULL)
+		return B_DEVICE_NOT_FOUND;
+	int adsp = fdt_compatible_node("qcom,sc8280xp-adsp-pas");
+	if (adsp < 0)
+		return B_DEVICE_NOT_FOUND;
+	const char* firmware = (const char*)fdt_getprop(gFDT, adsp,
+		"firmware-name", NULL);
+	const fdt32_t* region = (const fdt32_t*)fdt_getprop(gFDT, adsp,
+		"memory-region", NULL);
+	int regionNode = region != NULL
+		? fdt_node_offset_by_phandle(gFDT, fdt32_to_cpu(*region)) : -1;
+	if (firmware == NULL || regionNode < 0
+		|| !fdt_reg(regionNode, 0, &sRegionBase, &sRegionSize)) {
+		ERROR("no firmware name or memory region in the device tree\n");
+		return B_DEVICE_NOT_FOUND;
+	}
+	strlcpy(sFirmwareName, firmware, sizeof(sFirmwareName));
+
+	int rsc = fdt_compatible_node("qcom,rpmh-rsc");
+	const fdt32_t* drvId = rsc >= 0 ? (const fdt32_t*)fdt_getprop(gFDT, rsc,
+		"qcom,drv-id", NULL) : NULL;
+	const fdt32_t* tcsOffset = rsc >= 0 ? (const fdt32_t*)fdt_getprop(gFDT,
+		rsc, "qcom,tcs-offset", NULL) : NULL;
+	if (drvId == NULL || tcsOffset == NULL) {
+		ERROR("no apps RSC in the device tree\n");
+		return B_DEVICE_NOT_FOUND;
+	}
+	sTcsOffset = fdt32_to_cpu(*tcsOffset);
+
+	status_t status = map_compatible(sSmem, "qcom adsp smem", "qcom,smem");
+	if (status == B_OK)
+		status = map_compatible(sIpcc, "qcom adsp ipcc", "qcom,ipcc");
+	if (status == B_OK)
+		status = map_compatible(sQmp, "qcom adsp aoss qmp", "qcom,aoss-qmp");
+	if (status == B_OK) {
+		status = map_compatible(sRsc, "qcom adsp apps rsc", "qcom,rpmh-rsc",
+			fdt32_to_cpu(*drvId));
+	}
+	if (status == B_OK)
+		status = map_compatible(sCmdDb, "qcom adsp cmd-db", "qcom,cmd-db");
+	if (status == B_OK)
+		status = map_compatible(sMutex, "qcom adsp mutex", "qcom,tcsr-mutex");
+	if (status != B_OK) {
+		ERROR("cannot map its blocks: %s\n", strerror(status));
+		unmap_all();
+		return status;
+	}
+
+	sBootThread = spawn_kernel_thread(boot_thread, "qcom adsp start",
+		B_NORMAL_PRIORITY, NULL);
+	if (sBootThread >= 0)
+		resume_thread(sBootThread);
+	*_cookie = NULL;
+	return B_OK;
+}
+
+
+static void
+qcom_adsp_uninit_driver(void* cookie)
+{
+	sQuit = true;
+	if (sBootThread >= 0) {
+		status_t result;
+		wait_for_thread(sBootThread, &result);
+		sBootThread = -1;
+	}
+	unmap_all();
+}
+
+
+module_dependency module_dependencies[] = {
+	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&sDeviceManager },
+	{}
+};
+
+
+static driver_module_info sQcomAdspDriver = {
+	{
+		QCOM_ADSP_MODULE_NAME,
+		0,
+		NULL
+	},
+	qcom_adsp_supports_device,
+	qcom_adsp_register_device,
+	qcom_adsp_init_driver,
+	qcom_adsp_uninit_driver,
+	NULL,
+	NULL,
+	NULL
+};
+
+
+module_info* modules[] = {
+	(module_info*)&sQcomAdspDriver,
+	NULL
+};

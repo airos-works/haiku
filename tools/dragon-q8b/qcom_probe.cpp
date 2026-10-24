@@ -907,12 +907,172 @@ sd_identify()
 }
 
 
+// #pragma mark - ADSP (what the firmware leaves of it)
+
+
+/*!	An SMEM item's data in the partition of \a host0 and \a host1 (0xfffe
+	both: the global one), from Linux' smem.c layout; NULL when it is not
+	there. Only the uncached items: SMP2P and GLINK's are. */
+static volatile uint8*
+smem_item(volatile uint8* smem, size_t smemSize, uint16 host0, uint16 host1,
+	uint16 item, uint32* _size)
+{
+	volatile uint8* table = smem + smemSize - 4096;
+	if (rd(table, 0) != 0x434f5424)	// "$TOC"
+		return NULL;
+	uint32 count = rd(table, 8);
+	for (uint32 i = 0; i < count && i < 64; i++) {
+		volatile uint8* entry = table + 32 + 48 * i;
+		uint32 offset = rd(entry, 0), size = rd(entry, 4);
+		uint16 a = rd16(entry, 12), b = rd16(entry, 14);
+		if (!((a == host0 && b == host1) || (a == host1 && b == host0))
+			|| offset == 0 || offset + size > smemSize)
+			continue;
+		volatile uint8* partition = smem + offset;
+		if (rd(partition, 0) != 0x54525024)	// "$PRT"
+			return NULL;
+		uint32 freeUncached = rd(partition, 12);
+		uint32 position = 32;
+		while (position + 16 <= freeUncached && freeUncached <= size) {
+			volatile uint8* header = partition + position;
+			if (rd16(header, 0) != 0xa5a5)
+				break;
+			uint32 itemSize = rd(header, 4);
+			uint16 paddingData = rd16(header, 8);
+			uint16 paddingHeader = rd16(header, 10);
+			if (rd16(header, 2) == item) {
+				if (_size != NULL)
+					*_size = itemSize - paddingData;
+				return header + 16 + paddingHeader;
+			}
+			position += 16 + paddingHeader + itemSize;
+		}
+		return NULL;
+	}
+	return NULL;
+}
+
+
+static void
+smem_partitions(volatile uint8* smem, size_t smemSize)
+{
+	dprintf("qcom_probe: smem version %#" B_PRIx32 "\n", rd(smem, 64 + 7 * 4));
+	volatile uint8* table = smem + smemSize - 4096;
+	if (rd(table, 0) != 0x434f5424) {
+		dprintf("qcom_probe: smem: no partition table\n");
+		return;
+	}
+	uint32 count = rd(table, 8);
+	for (uint32 i = 0; i < count && i < 64; i++) {
+		volatile uint8* entry = table + 32 + 48 * i;
+		uint32 offset = rd(entry, 0), size = rd(entry, 4);
+		uint16 a = rd16(entry, 12), b = rd16(entry, 14);
+		if (offset == 0 || offset + size > smemSize)
+			continue;
+		volatile uint8* partition = smem + offset;
+		uint32 items = 0;
+		char list[160] = {};
+		size_t length = 0;
+		if (rd(partition, 0) == 0x54525024) {
+			uint32 freeUncached = rd(partition, 12);
+			uint32 position = 32;
+			while (position + 16 <= freeUncached && freeUncached <= size) {
+				volatile uint8* header = partition + position;
+				if (rd16(header, 0) != 0xa5a5)
+					break;
+				if (length + 8 < sizeof(list)) {
+					length += snprintf(list + length, sizeof(list) - length,
+						" %u", rd16(header, 2));
+				}
+				items++;
+				position += 16 + rd16(header, 10) + rd(header, 4);
+			}
+		}
+		dprintf("qcom_probe: smem partition %#x-%#x at %#" B_PRIx32 " (%#"
+			B_PRIx32 "): %" B_PRIu32 " uncached items:%s\n", a, b, offset,
+			size, items, a == 0xfffe ? " (global)" : list);
+	}
+}
+
+
+static void
+smp2p_log(volatile uint8* smem, size_t smemSize, uint16 remote, uint16 item,
+	const char* what)
+{
+	uint32 size = 0;
+	volatile uint8* smp2p = smem_item(smem, smemSize, 0, remote, item, &size);
+	if (smp2p == NULL) {
+		dprintf("qcom_probe: smp2p %s (item %u): none\n", what, item);
+		return;
+	}
+	uint32 magic = rd(smp2p, 0), features = rd(smp2p, 4);
+	uint32 pids = rd(smp2p, 8), entries = rd(smp2p, 12);
+	dprintf("qcom_probe: smp2p %s (item %u, %" B_PRIu32 " bytes): magic %#"
+		B_PRIx32 " version %" B_PRIu32 " features %#" B_PRIx32 ", pid %"
+		B_PRIu32 " -> %" B_PRIu32 ", %" B_PRIu32 " of %" B_PRIu32
+		" entries, flags %#" B_PRIx32 "\n", what, item, size, magic,
+		features & 0xff, features >> 8, pids & 0xffff, pids >> 16,
+		entries >> 16, entries & 0xffff, rd(smp2p, 16));
+	for (uint32 i = 0; i < (entries >> 16) && i < 16; i++) {
+		volatile uint8* entry = smp2p + 20 + 20 * i;
+		char name[17] = {};
+		for (int c = 0; c < 16; c++)
+			name[c] = entry[c];
+		dprintf("qcom_probe: smp2p %s entry \"%s\" = %#" B_PRIx32 "\n", what,
+			name, rd(entry, 16));
+	}
+}
+
+
+static void
+adsp_state()
+{
+	area_id area;
+	const size_t smemSize = 0x200000;
+	volatile uint8* smem = map({"probe smem", 0x80900000, smemSize}, area);
+	if (smem == NULL)
+		return;
+	smem_partitions(smem, smemSize);
+	smp2p_log(smem, smemSize, 2, 443, "apps->adsp");
+	smp2p_log(smem, smemSize, 2, 429, "adsp->apps");
+	static const uint16 kGlinkItems[] = {478, 479, 480};
+	for (uint16 item : kGlinkItems) {
+		uint32 size = 0;
+		volatile uint8* data = smem_item(smem, smemSize, 0, 2, item, &size);
+		dprintf("qcom_probe: glink adsp item %u: %s %#" B_PRIx32 " bytes\n",
+			item, data != NULL ? "there," : "none", size);
+		if (data != NULL && item == 478) {
+			dprintf("qcom_probe: glink adsp descriptor: tx tail %#" B_PRIx32
+				" head %#" B_PRIx32 ", rx tail %#" B_PRIx32 " head %#" B_PRIx32
+				"\n", rd(data, 0), rd(data, 4), rd(data, 8), rd(data, 12));
+		}
+	}
+	delete_area(area);
+
+	// the AOSS's QMP message RAM (qcom_aoss.c's layout)
+	volatile uint8* qmp = map({"probe aoss qmp", 0xc300000, 0x400}, area);
+	if (qmp == NULL)
+		return;
+	dprintf("qcom_probe: aoss qmp magic %#" B_PRIx32 " version %#" B_PRIx32
+		" features %#" B_PRIx32 "; ucore link %#" B_PRIx32 "/%#" B_PRIx32
+		" channel %#" B_PRIx32 "/%#" B_PRIx32 " mailbox %#" B_PRIx32 " at %#"
+		B_PRIx32 "; mcore link %#" B_PRIx32 "/%#" B_PRIx32 " channel %#"
+		B_PRIx32 "/%#" B_PRIx32 " mailbox %#" B_PRIx32 " at %#" B_PRIx32 "\n",
+		rd(qmp, 0), rd(qmp, 4), rd(qmp, 8), rd(qmp, 0xc), rd(qmp, 0x10),
+		rd(qmp, 0x14), rd(qmp, 0x18), rd(qmp, 0x1c), rd(qmp, 0x20),
+		rd(qmp, 0x24), rd(qmp, 0x28), rd(qmp, 0x2c), rd(qmp, 0x30),
+		rd(qmp, 0x34), rd(qmp, 0x38));
+	delete_area(area);
+}
+
+
 // devfs calls init_hardware() when it loads the driver: the probe runs then,
 // and the driver reports no device.
 status_t
 init_hardware()
 {
 	probe();
+	adsp_state();
 	return B_ERROR;
 }
 
