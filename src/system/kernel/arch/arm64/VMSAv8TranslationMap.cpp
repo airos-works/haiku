@@ -326,7 +326,7 @@ VMSAv8TranslationMap::FreeTable(phys_addr_t ptPa, uint64_t va, int level,
 
 			// Use this rather than FlushVAIfAccessed so that we don't have to
 			// acquire sAsidLock for every entry.
-			flush_va_if_accessed(oldPte, nextVa, fASID);
+			flush_va_if_accessed(oldPte, fullVa, fASID);
 		}
 
 		nextVa += entrySize;
