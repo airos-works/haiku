@@ -214,8 +214,11 @@ qcom_pas_load(const char* name, uint32 pasId, const uint8* image, size_t size,
 			continue;
 		}
 		uint32 offset = phdr.paddr - base;
+		// (a segment with nothing in the file, as the ADSP's last, may have
+		// an offset past its end)
 		if (phdr.paddr < base || offset + phdr.memsz > regionSize
-			|| phdr.filesz > phdr.memsz || phdr.offset + phdr.filesz > size) {
+			|| phdr.filesz > phdr.memsz
+			|| (phdr.filesz > 0 && phdr.offset + phdr.filesz > size)) {
 			ERROR("%s: segment %" B_PRIu32 " does not fit\n", name, i);
 			status = B_BAD_DATA;
 			break;
