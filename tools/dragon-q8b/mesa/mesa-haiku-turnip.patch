@@ -1,0 +1,1039 @@
+air/OS (Haiku arm64): Mesa 26.2.4's Turnip (freedreno Vulkan, "msm" kernel
+interface) on the native "adreno" kernel driver (/dev/graphics/adreno/0,
+Radxa Dragon Q8B, SC8280XP Adreno 690).
+
+The kernel takes Linux's drm.h / msm_drm.h structures unchanged behind op
+codes ADRENO_HAIKU_OP(nr) (headers/private/graphics/adreno/adreno_haiku.h in
+the air/OS tree, put on the include path by build.sh, not copied). All
+changes are #ifdef __HAIKU__ except fd_path's size.
+
+  include/drm-uapi/drm.h            BSD ioctl encoding from <bsd/sys/ioccom.h>
+  include/xf86drm.h                 libdrm stand-in (Haiku only, #include_next
+                                    elsewhere), the PowerVR one's
+                                    (tools/cubie-a7s/mesa) on ADRENO_HAIKU_OP:
+                                    drmIoctl, drmCommand*, version, caps,
+                                    syncobjs, drmDevice types
+  src/util/libdrm.h                 that stand-in rather than the no-op shim
+  src/util/u_sync_provider_haiku.c  the Vulkan runtime's syncobj provider on
+  src/util/u_sync_provider.h          those wrappers (from the PowerVR patch)
+  src/util/meson.build
+  src/vulkan/runtime/meson.build    build vk_drm_syncobj.c without libdrm
+  ir3_disk_cache.c                  no build-id notes on Haiku: no ir3 disk
+                                    cache (the shader cache is off anyway)
+  tu_knl.cc                         no device list: HAIKU_ADRENO_DEVICE or
+                                    /dev/graphics/adreno/0 as the only, render
+                                    only, platform device; no major()/minor();
+                                    unmapping deletes the clone's area
+  tu_knl_drm_msm.cc                 buffers are mapped with
+                                    ADRENO_HAIKU_NR_MAP_BO (no mmap of
+                                    devices), placed or not, and unmapped with
+                                    delete_area()
+  tu_device.h                       fd_path 64 bytes: "/dev/graphics/adreno/0"
+                                    does not fit 20
+
+diff -ruN -x .haiku-patches pristine/include/drm-uapi/drm.h mesa-26.2.4/include/drm-uapi/drm.h
+--- pristine/include/drm-uapi/drm.h	2026-10-02 00:39:53.000000000 +1000
++++ mesa-26.2.4/include/drm-uapi/drm.h	2026-10-24 13:41:43.603455328 +1100
+@@ -47,6 +47,8 @@
+ #include <sys/types.h>
+ #if defined(__GNU__)
+ #include <sys/ioctl.h>
++#elif defined(__HAIKU__)
++#include <bsd/sys/ioccom.h>
+ #else
+ #include <sys/ioccom.h>
+ #endif
+diff -ruN -x .haiku-patches pristine/include/xf86drm.h mesa-26.2.4/include/xf86drm.h
+--- pristine/include/xf86drm.h	1970-01-01 11:00:00.000000000 +1100
++++ mesa-26.2.4/include/xf86drm.h	2026-10-24 13:41:38.275035665 +1100
+@@ -0,0 +1,576 @@
++/*
++ * Copyright 2026, air/OS. All rights reserved.
++ * SPDX-License-Identifier: MIT
++ */
++
++/* air/OS (Haiku): the part of libdrm that Mesa's Turnip (freedreno, "msm"
++ * kernel interface) uses, on top of the native "adreno" kernel driver
++ * (/dev/graphics/adreno/0). Made from the PowerVR driver's stand-in.
++ *
++ * The kernel takes Linux's drm.h and msm_drm.h structures unchanged. Its
++ * contract is headers/private/graphics/adreno/adreno_haiku.h in the air/OS
++ * tree: a request goes out as op code ADRENO_HAIKU_OP(nr), nr being the
++ * Linux DRM ioctl number (the request's low 8 bits), with the length of the
++ * structure the request encodes (IOCPARM_LEN). So this needs no table.
++ *
++ * Semantics follow libdrm 2.4.123, with two deliberate differences:
++ *  - every function returns 0 on success and -1 with errno set on failure
++ *    (libdrm's waits return -errno, which is positive on Haiku);
++ *  - a syncobj wait that runs out of time fails with errno ETIME, whatever
++ *    timeout code the kernel used (B_TIMED_OUT, B_WOULD_BLOCK), and is not
++ *    retried on EAGAIN (which is B_WOULD_BLOCK on Haiku).
++ * Syncobj wait timeouts are absolute CLOCK_MONOTONIC nanoseconds, as on
++ * Linux (on Haiku that is system_time() * 1000); INT64_MAX waits for good.
++ *
++ * There is no device list (drmGetDevices2() finds nothing; tu_knl.cc opens
++ * the node itself), no display device, and no file descriptors for buffers
++ * or sync objects yet: the PRIME and syncobj fd functions fail with
++ * EOPNOTSUPP.
++ */
++#ifndef __HAIKU__
++/* everywhere else (the host tools' build, for one): the real libdrm */
++#include_next <xf86drm.h>
++#else
++
++#ifndef HAIKU_ADRENO_XF86DRM_H
++#define HAIKU_ADRENO_XF86DRM_H
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "drm-uapi/drm.h"
++#include "drm-uapi/msm_drm.h"
++
++/* from the air/OS tree, by path (the build adds its directory) */
++#include <adreno_haiku.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* The kernel's op numbers are Linux's; the length is the request's size. */
++#ifndef __cplusplus
++#define HAIKU_ADRENO_CHECK_REQUEST(request, nr, type)                         \
++   _Static_assert(((request) & 0xff) == (nr), #request " number");            \
++   _Static_assert(IOCPARM_LEN(request) == sizeof(type), #request " size")
++HAIKU_ADRENO_CHECK_REQUEST(DRM_IOCTL_VERSION, ADRENO_HAIKU_NR_VERSION,
++                           struct drm_version);
++HAIKU_ADRENO_CHECK_REQUEST(DRM_IOCTL_GEM_CLOSE, ADRENO_HAIKU_NR_GEM_CLOSE,
++                           struct drm_gem_close);
++HAIKU_ADRENO_CHECK_REQUEST(DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL,
++                           ADRENO_HAIKU_NR_SYNCOBJ_TIMELINE_SIGNAL,
++                           struct drm_syncobj_timeline_array);
++HAIKU_ADRENO_CHECK_REQUEST(DRM_IOCTL_MSM_GET_PARAM, ADRENO_HAIKU_NR_MSM_FIRST,
++                           struct drm_msm_param);
++HAIKU_ADRENO_CHECK_REQUEST(DRM_IOCTL_MSM_GEM_SUBMIT,
++                           ADRENO_HAIKU_NR_MSM_FIRST + DRM_MSM_GEM_SUBMIT,
++                           struct drm_msm_gem_submit);
++#undef HAIKU_ADRENO_CHECK_REQUEST
++#endif
++
++static inline int
++drmIoctl(int fd, unsigned long request, void *arg)
++{
++   int ret;
++
++   do {
++      ret = ioctl(fd, ADRENO_HAIKU_OP(request & 0xff), arg,
++                  (size_t)IOCPARM_LEN(request));
++   } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
++
++   return ret;
++}
++
++/* A syncobj wait: restarted after a signal (the timeout is absolute), never
++ * spun on EAGAIN, and any way of running out of time reads ETIME. */
++static inline int
++haiku_adreno_wait_ioctl(int fd, unsigned long request, void *arg)
++{
++   int ret;
++
++   do {
++      ret = ioctl(fd, ADRENO_HAIKU_OP(request & 0xff), arg,
++                  (size_t)IOCPARM_LEN(request));
++   } while (ret == -1 && errno == EINTR);
++
++   if (ret == -1 && (errno == ETIMEDOUT || errno == EWOULDBLOCK))
++      errno = ETIME;
++
++   return ret == 0 ? 0 : -1;
++}
++
++static inline int
++haiku_adreno_unsupported(void)
++{
++   errno = EOPNOTSUPP;
++   return -1;
++}
++
++/* The driver's own ioctls (libdrm's drmCommand*): DRM_COMMAND_BASE + index,
++ * the length given. */
++static inline int
++drmCommandWriteRead(int fd, unsigned long index, void *data,
++                    unsigned long size)
++{
++   int ret;
++
++   do {
++      ret = ioctl(fd, ADRENO_HAIKU_OP(DRM_COMMAND_BASE + index), data,
++                  (size_t)size);
++   } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
++
++   return ret == 0 ? 0 : -errno;
++}
++
++static inline int
++drmCommandWrite(int fd, unsigned long index, void *data, unsigned long size)
++{
++   return drmCommandWriteRead(fd, index, data, size);
++}
++
++static inline int
++drmCommandRead(int fd, unsigned long index, void *data, unsigned long size)
++{
++   return drmCommandWriteRead(fd, index, data, size);
++}
++
++static inline void
++drmFree(void *pt)
++{
++   free(pt);
++}
++
++/* -- version, capabilities, master ------------------------------------- */
++
++typedef struct _drmVersion {
++   int version_major;
++   int version_minor;
++   int version_patchlevel;
++   int name_len;
++   char *name;
++   int date_len;
++   char *date;
++   int desc_len;
++   char *desc;
++} drmVersion, *drmVersionPtr;
++
++static inline void
++drmFreeVersion(drmVersionPtr version)
++{
++   if (version == NULL)
++      return;
++
++   free(version->name);
++   free(version->date);
++   free(version->desc);
++   free(version);
++}
++
++/* Two calls, as libdrm: the lengths, then the strings. */
++static inline drmVersionPtr
++drmGetVersion(int fd)
++{
++   struct drm_version request;
++   drmVersionPtr version;
++
++   memset(&request, 0, sizeof(request));
++   if (drmIoctl(fd, DRM_IOCTL_VERSION, &request) != 0)
++      return NULL;
++
++   version = (drmVersionPtr)calloc(1, sizeof(*version));
++   if (version == NULL)
++      return NULL;
++
++   version->name = (char *)calloc(1, request.name_len + 1);
++   version->date = (char *)calloc(1, request.date_len + 1);
++   version->desc = (char *)calloc(1, request.desc_len + 1);
++   if (version->name == NULL || version->date == NULL ||
++       version->desc == NULL) {
++      drmFreeVersion(version);
++      return NULL;
++   }
++
++   request.name = version->name;
++   request.date = version->date;
++   request.desc = version->desc;
++   if (drmIoctl(fd, DRM_IOCTL_VERSION, &request) != 0) {
++      drmFreeVersion(version);
++      return NULL;
++   }
++
++   version->version_major = request.version_major;
++   version->version_minor = request.version_minor;
++   version->version_patchlevel = request.version_patchlevel;
++   version->name_len = (int)request.name_len;
++   version->date_len = (int)request.date_len;
++   version->desc_len = (int)request.desc_len;
++   return version;
++}
++
++static inline int
++drmGetCap(int fd, uint64_t capability, uint64_t *value)
++{
++   struct drm_get_cap request;
++
++   memset(&request, 0, sizeof(request));
++   request.capability = capability;
++   if (drmIoctl(fd, DRM_IOCTL_GET_CAP, &request) != 0)
++      return -1;
++
++   *value = request.value;
++   return 0;
++}
++
++/* there is no display device and so no master */
++static inline int
++drmDropMaster(int fd)
++{
++   (void)fd;
++   return 0;
++}
++
++/* -- devices --------------------------------------------------------------- */
++
++#define DRM_NODE_PRIMARY 0
++#define DRM_NODE_CONTROL 1
++#define DRM_NODE_RENDER  2
++#define DRM_NODE_MAX     3
++
++#define DRM_BUS_PCI      0
++#define DRM_BUS_USB      1
++#define DRM_BUS_PLATFORM 2
++#define DRM_BUS_HOST1X   3
++
++typedef struct _drmPlatformBusInfo {
++   char fullname[512];
++} drmPlatformBusInfo, *drmPlatformBusInfoPtr;
++
++typedef struct _drmPlatformDeviceInfo {
++   char **compatible; /* NULL terminated list of compatible strings */
++} drmPlatformDeviceInfo, *drmPlatformDeviceInfoPtr;
++
++/* libdrm's layout; only platform devices exist here */
++typedef struct _drmDevice {
++   char **nodes; /* DRM_NODE_MAX sized array */
++   int available_nodes; /* DRM_NODE_* bitmask */
++   int bustype;
++   union {
++      void *pci;
++      void *usb;
++      drmPlatformBusInfoPtr platform;
++      void *host1x;
++   } businfo;
++   union {
++      void *pci;
++      void *usb;
++      drmPlatformDeviceInfoPtr platform;
++      void *host1x;
++   } deviceinfo;
++} drmDevice, *drmDevicePtr;
++
++/* No device list: the Adreno device is opened by path (tu_knl.cc). */
++static inline int
++drmGetDevices2(uint32_t flags, drmDevicePtr devices[], int max_devices)
++{
++   (void)flags; (void)devices; (void)max_devices;
++   return 0;
++}
++
++static inline int
++drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device)
++{
++   (void)fd; (void)flags; (void)device;
++   errno = ENODEV;
++   return -1;
++}
++
++static inline void
++drmFreeDevice(drmDevicePtr *device)
++{
++   (void)device;
++}
++
++static inline void
++drmFreeDevices(drmDevicePtr devices[], int count)
++{
++   (void)devices; (void)count;
++}
++
++/* -- PRIME (buffer file descriptors) --------------------------------------- */
++
++static inline int
++drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd)
++{
++#ifdef ADRENO_HAIKU_NR_PRIME_HANDLE_TO_FD
++   struct drm_prime_handle request;
++
++   memset(&request, 0, sizeof(request));
++   request.handle = handle;
++   request.flags = flags;
++   request.fd = -1;
++   if (drmIoctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &request) != 0)
++      return -1;
++
++   *prime_fd = request.fd;
++   return 0;
++#else
++   (void)fd; (void)handle; (void)flags; (void)prime_fd;
++   return haiku_adreno_unsupported();
++#endif
++}
++
++static inline int
++drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
++{
++#ifdef ADRENO_HAIKU_NR_PRIME_FD_TO_HANDLE
++   struct drm_prime_handle request;
++
++   memset(&request, 0, sizeof(request));
++   request.fd = prime_fd;
++   if (drmIoctl(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &request) != 0)
++      return -1;
++
++   *handle = request.handle;
++   return 0;
++#else
++   (void)fd; (void)prime_fd; (void)handle;
++   return haiku_adreno_unsupported();
++#endif
++}
++
++/* -- sync objects ---------------------------------------------------------- */
++
++static inline int
++drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle)
++{
++   struct drm_syncobj_create request;
++
++   memset(&request, 0, sizeof(request));
++   request.flags = flags;
++   if (drmIoctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &request) != 0)
++      return -1;
++
++   *handle = request.handle;
++   return 0;
++}
++
++static inline int
++drmSyncobjDestroy(int fd, uint32_t handle)
++{
++   struct drm_syncobj_destroy request;
++
++   memset(&request, 0, sizeof(request));
++   request.handle = handle;
++   return drmIoctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &request) == 0 ? 0 : -1;
++}
++
++static inline int
++drmSyncobjHandleToFD(int fd, uint32_t handle, int *obj_fd)
++{
++#ifdef ADRENO_HAIKU_NR_SYNCOBJ_HANDLE_TO_FD
++   struct drm_syncobj_handle request;
++
++   memset(&request, 0, sizeof(request));
++   request.handle = handle;
++   request.fd = -1;
++   if (drmIoctl(fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &request) != 0)
++      return -1;
++
++   *obj_fd = request.fd;
++   return 0;
++#else
++   (void)fd; (void)handle; (void)obj_fd;
++   return haiku_adreno_unsupported();
++#endif
++}
++
++static inline int
++drmSyncobjFDToHandle(int fd, int obj_fd, uint32_t *handle)
++{
++#ifdef ADRENO_HAIKU_NR_SYNCOBJ_FD_TO_HANDLE
++   struct drm_syncobj_handle request;
++
++   memset(&request, 0, sizeof(request));
++   request.fd = obj_fd;
++   if (drmIoctl(fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &request) != 0)
++      return -1;
++
++   *handle = request.handle;
++   return 0;
++#else
++   (void)fd; (void)obj_fd; (void)handle;
++   return haiku_adreno_unsupported();
++#endif
++}
++
++static inline int
++drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd)
++{
++#ifdef ADRENO_HAIKU_NR_SYNCOBJ_FD_TO_HANDLE
++   struct drm_syncobj_handle request;
++
++   memset(&request, 0, sizeof(request));
++   request.fd = sync_file_fd;
++   request.handle = handle;
++   request.flags = DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE;
++   return drmIoctl(fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &request) == 0 ? 0 : -1;
++#else
++   (void)fd; (void)handle; (void)sync_file_fd;
++   return haiku_adreno_unsupported();
++#endif
++}
++
++static inline int
++drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd)
++{
++#ifdef ADRENO_HAIKU_NR_SYNCOBJ_HANDLE_TO_FD
++   struct drm_syncobj_handle request;
++
++   memset(&request, 0, sizeof(request));
++   request.fd = -1;
++   request.handle = handle;
++   request.flags = DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE;
++   if (drmIoctl(fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &request) != 0)
++      return -1;
++
++   *sync_file_fd = request.fd;
++   return 0;
++#else
++   (void)fd; (void)handle; (void)sync_file_fd;
++   return haiku_adreno_unsupported();
++#endif
++}
++
++/* flags: DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, _WAIT_FOR_SUBMIT */
++static inline int
++drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles,
++               int64_t timeout_nsec, unsigned flags, uint32_t *first_signaled)
++{
++   struct drm_syncobj_wait request;
++
++   memset(&request, 0, sizeof(request));
++   request.handles = (uintptr_t)handles;
++   request.timeout_nsec = timeout_nsec;
++   request.count_handles = num_handles;
++   request.flags = flags;
++   if (haiku_adreno_wait_ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &request) != 0)
++      return -1;
++
++   if (first_signaled != NULL)
++      *first_signaled = request.first_signaled;
++   return 0;
++}
++
++static inline int
++drmSyncobjReset(int fd, const uint32_t *handles, uint32_t handle_count)
++{
++   struct drm_syncobj_array request;
++
++   memset(&request, 0, sizeof(request));
++   request.handles = (uintptr_t)handles;
++   request.count_handles = handle_count;
++   return drmIoctl(fd, DRM_IOCTL_SYNCOBJ_RESET, &request) == 0 ? 0 : -1;
++}
++
++static inline int
++drmSyncobjSignal(int fd, const uint32_t *handles, uint32_t handle_count)
++{
++   struct drm_syncobj_array request;
++
++   memset(&request, 0, sizeof(request));
++   request.handles = (uintptr_t)handles;
++   request.count_handles = handle_count;
++   return drmIoctl(fd, DRM_IOCTL_SYNCOBJ_SIGNAL, &request) == 0 ? 0 : -1;
++}
++
++static inline int
++drmSyncobjTimelineSignal(int fd, const uint32_t *handles, uint64_t *points,
++                         uint32_t handle_count)
++{
++   struct drm_syncobj_timeline_array request;
++
++   memset(&request, 0, sizeof(request));
++   request.handles = (uintptr_t)handles;
++   request.points = (uintptr_t)points;
++   request.count_handles = handle_count;
++   return drmIoctl(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, &request) == 0
++      ? 0 : -1;
++}
++
++/* flags: also DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE (until the point has a
++ * fence, not until it signals) */
++static inline int
++drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points,
++                       unsigned num_handles, int64_t timeout_nsec,
++                       unsigned flags, uint32_t *first_signaled)
++{
++   struct drm_syncobj_timeline_wait request;
++
++   memset(&request, 0, sizeof(request));
++   request.handles = (uintptr_t)handles;
++   request.points = (uintptr_t)points;
++   request.timeout_nsec = timeout_nsec;
++   request.count_handles = num_handles;
++   request.flags = flags;
++   if (haiku_adreno_wait_ioctl(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT,
++                            &request) != 0) {
++      return -1;
++   }
++
++   if (first_signaled != NULL)
++      *first_signaled = request.first_signaled;
++   return 0;
++}
++
++/* flags: DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED */
++static inline int
++drmSyncobjQuery2(int fd, uint32_t *handles, uint64_t *points,
++                 uint32_t handle_count, uint32_t flags)
++{
++   struct drm_syncobj_timeline_array request;
++
++   memset(&request, 0, sizeof(request));
++   request.handles = (uintptr_t)handles;
++   request.points = (uintptr_t)points;
++   request.count_handles = handle_count;
++   request.flags = flags;
++   return drmIoctl(fd, DRM_IOCTL_SYNCOBJ_QUERY, &request) == 0 ? 0 : -1;
++}
++
++static inline int
++drmSyncobjQuery(int fd, uint32_t *handles, uint64_t *points,
++                uint32_t handle_count)
++{
++   return drmSyncobjQuery2(fd, handles, points, handle_count, 0);
++}
++
++/* point 0 is the binary payload; the null job moves fences between
++ * timeline points with this */
++static inline int
++drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point,
++                   uint32_t src_handle, uint64_t src_point, uint32_t flags)
++{
++   struct drm_syncobj_transfer request;
++
++   memset(&request, 0, sizeof(request));
++   request.src_handle = src_handle;
++   request.dst_handle = dst_handle;
++   request.src_point = src_point;
++   request.dst_point = dst_point;
++   request.flags = flags;
++   return drmIoctl(fd, DRM_IOCTL_SYNCOBJ_TRANSFER, &request) == 0 ? 0 : -1;
++}
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* HAIKU_ADRENO_XF86DRM_H */
++
++#endif /* __HAIKU__ */
+Binary files pristine/src/compiler/isaspec/__pycache__/isa.cpython-314.pyc and mesa-26.2.4/src/compiler/isaspec/__pycache__/isa.cpython-314.pyc differ
+Binary files pristine/src/compiler/nir/__pycache__/nir_algebraic.cpython-314.pyc and mesa-26.2.4/src/compiler/nir/__pycache__/nir_algebraic.cpython-314.pyc differ
+Binary files pristine/src/compiler/nir/__pycache__/nir_intrinsics.cpython-314.pyc and mesa-26.2.4/src/compiler/nir/__pycache__/nir_intrinsics.cpython-314.pyc differ
+Binary files pristine/src/compiler/nir/__pycache__/nir_opcodes.cpython-314.pyc and mesa-26.2.4/src/compiler/nir/__pycache__/nir_opcodes.cpython-314.pyc differ
+Binary files pristine/src/compiler/__pycache__/builtin_types.cpython-314.pyc and mesa-26.2.4/src/compiler/__pycache__/builtin_types.cpython-314.pyc differ
+Binary files pristine/src/freedreno/common/__pycache__/freedreno_dev_info.cpython-314.pyc and mesa-26.2.4/src/freedreno/common/__pycache__/freedreno_dev_info.cpython-314.pyc differ
+diff -ruN -x .haiku-patches pristine/src/freedreno/ir3/ir3_disk_cache.c mesa-26.2.4/src/freedreno/ir3/ir3_disk_cache.c
+--- pristine/src/freedreno/ir3/ir3_disk_cache.c	2026-10-02 00:39:53.000000000 +1000
++++ mesa-26.2.4/src/freedreno/ir3/ir3_disk_cache.c	2026-10-24 13:46:13.029098050 +1100
+@@ -33,6 +33,11 @@
+    if (ir3_shader_debug & IR3_DBG_NOCACHE)
+       return;
+ 
++#ifdef __HAIKU__
++   /* no build-id notes to key the cache on (no dl_iterate_phdr()) */
++   (void)compiler;
++#else
++
+    const char *renderer = fd_dev_name(compiler->dev_id);
+    const struct build_id_note *note =
+       build_id_find_nhdr_for_addr(ir3_disk_cache_init);
+@@ -55,6 +60,7 @@
+ 
+    uint64_t driver_flags = ir3_shader_debug_hash_key();
+    compiler->disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
++#endif
+ }
+ 
+ void
+diff -ruN -x .haiku-patches pristine/src/freedreno/vulkan/tu_device.h mesa-26.2.4/src/freedreno/vulkan/tu_device.h
+--- pristine/src/freedreno/vulkan/tu_device.h	2026-10-02 00:39:53.000000000 +1000
++++ mesa-26.2.4/src/freedreno/vulkan/tu_device.h	2026-10-24 13:53:00.202743783 +1100
+@@ -100,7 +100,7 @@
+ 
+    struct wsi_device wsi_device;
+ 
+-   char fd_path[20];
++   char fd_path[64];
+    int local_fd;
+    bool has_local;
+    int64_t local_major;
+diff -ruN -x .haiku-patches pristine/src/freedreno/vulkan/tu_knl.cc mesa-26.2.4/src/freedreno/vulkan/tu_knl.cc
+--- pristine/src/freedreno/vulkan/tu_knl.cc	2026-10-02 00:39:53.000000000 +1000
++++ mesa-26.2.4/src/freedreno/vulkan/tu_knl.cc	2026-10-24 13:43:33.920676382 +1100
+@@ -15,6 +15,13 @@
+ #ifdef MAJOR_IN_SYSMACROS
+ #include <sys/sysmacros.h>
+ #endif
++#ifdef __HAIKU__
++#include <OS.h>
++#include <adreno_haiku.h>
++/* Haiku's device nodes have no major and minor numbers. */
++#define major(devid) ((void)(devid), 0)
++#define minor(devid) ((void)(devid), 0)
++#endif
+ 
+ #include <sys/mman.h>
+ 
+@@ -151,6 +158,12 @@
+ 
+    TU_RMV(bo_unmap, dev, bo);
+ 
++#ifdef __HAIKU__
++   /* a clone of the buffer's area (ADRENO_HAIKU_NR_MAP_BO); nothing keeps
++    * the range reserved */
++   (void)reserve;
++   delete_area(area_for(bo->map));
++#else
+    if (reserve) {
+       void *map = mmap(bo->map, bo->size, PROT_NONE,
+                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+@@ -160,6 +173,7 @@
+    } else {
+       munmap(bo->map, bo->size);
+    }
++#endif
+ 
+    bo->map = NULL;
+ 
+@@ -336,7 +350,30 @@
+ VkResult
+ tu_enumerate_devices(struct vk_instance *vk_instance)
+ {
+-#ifdef TU_HAS_KGSL
++#if defined(__HAIKU__) && defined(TU_HAS_MSM)
++   /* No DRM device list on Haiku: the native "adreno" driver's node,
++    * ADRENO_HAIKU_DEVICE_PATH, or what HAIKU_ADRENO_DEVICE names. */
++   struct tu_instance *instance =
++      container_of(vk_instance, struct tu_instance, vk);
++   const char *path = getenv(ADRENO_HAIKU_DEVICE_ENV);
++   if (path == NULL)
++      path = ADRENO_HAIKU_DEVICE_PATH;
++
++   char *nodes[DRM_NODE_MAX] = { (char *)"", (char *)"", (char *)path };
++   struct _drmDevice device = {};
++   device.nodes = nodes;
++   device.available_nodes = 1 << DRM_NODE_RENDER;
++   device.bustype = DRM_BUS_PLATFORM;
++
++   struct vk_physical_device *physical_device;
++   VkResult result =
++      tu_physical_device_try_create(vk_instance, &device, &physical_device);
++   if (result != VK_SUCCESS)
++      return result == VK_ERROR_INCOMPATIBLE_DRIVER ? VK_SUCCESS : result;
++
++   list_addtail(&physical_device->link, &instance->vk.physical_devices.list);
++   return VK_SUCCESS;
++#elif defined(TU_HAS_KGSL)
+    struct tu_instance *instance =
+       container_of(vk_instance, struct tu_instance, vk);
+ 
+diff -ruN -x .haiku-patches pristine/src/freedreno/vulkan/tu_knl_drm_msm.cc mesa-26.2.4/src/freedreno/vulkan/tu_knl_drm_msm.cc
+--- pristine/src/freedreno/vulkan/tu_knl_drm_msm.cc	2026-10-02 00:39:53.000000000 +1000
++++ mesa-26.2.4/src/freedreno/vulkan/tu_knl_drm_msm.cc	2026-10-24 13:43:33.921862786 +1100
+@@ -11,6 +11,10 @@
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+ #include <xf86drm.h>
++#ifdef __HAIKU__
++#include <OS.h>
++#include <adreno_haiku.h>
++#endif
+ 
+ #include "util/hash_table.h"
+ #include "util/libsync.h"
+@@ -1033,6 +1037,17 @@
+ static VkResult
+ msm_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
+ {
++#ifdef __HAIKU__
++   /* no mmap() of devices: the buffer's area is cloned into the team */
++   struct adreno_haiku_map_bo map_bo = {};
++   map_bo.handle = bo->gem_handle;
++   map_bo.address = (uint64_t)(uintptr_t)placed_addr;
++   if (drmIoctl(dev->fd, ADRENO_HAIKU_OP(ADRENO_HAIKU_NR_MAP_BO), &map_bo) != 0)
++      return vk_error(dev, VK_ERROR_MEMORY_MAP_FAILED);
++   bo->map = (void *)(uintptr_t)map_bo.address;
++   TU_RMV(bo_map, dev, bo);
++   return VK_SUCCESS;
++#endif
+    uint64_t offset = tu_gem_info(dev, bo->gem_handle, MSM_INFO_GET_OFFSET);
+    if (!offset)
+       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+@@ -1136,7 +1151,11 @@
+ 
+    if (bo->map) {
+       TU_RMV(bo_unmap, dev, bo);
++#ifdef __HAIKU__
++      delete_area(area_for(bo->map));
++#else
+       munmap(bo->map, bo->size);
++#endif
+    }
+ 
+    TU_RMV(bo_destroy, dev, bo);
+Binary files pristine/src/util/format/__pycache__/u_format_pack.cpython-314.pyc and mesa-26.2.4/src/util/format/__pycache__/u_format_pack.cpython-314.pyc differ
+Binary files pristine/src/util/format/__pycache__/u_format_parse.cpython-314.pyc and mesa-26.2.4/src/util/format/__pycache__/u_format_parse.cpython-314.pyc differ
+diff -ruN -x .haiku-patches pristine/src/util/libdrm.h mesa-26.2.4/src/util/libdrm.h
+--- pristine/src/util/libdrm.h	2026-10-02 00:39:53.000000000 +1000
++++ mesa-26.2.4/src/util/libdrm.h	2026-10-24 13:43:45.974184189 +1100
+@@ -30,7 +30,7 @@
+ #ifndef LIBDRM_H
+ #define LIBDRM_H
+ 
+-#ifdef HAVE_LIBDRM
++#if defined(HAVE_LIBDRM) || defined(__HAIKU__)
+ #include <xf86drm.h>
+ #else
+ 
+diff -ruN -x .haiku-patches pristine/src/util/meson.build mesa-26.2.4/src/util/meson.build
+--- pristine/src/util/meson.build	2026-10-02 00:39:53.000000000 +1000
++++ mesa-26.2.4/src/util/meson.build	2026-10-24 13:41:43.628574302 +1100
+@@ -317,6 +317,9 @@
+ if dep_libdrm.found()
+   files_mesa_util += files('u_sync_provider.c', 'u_sync_provider.h')
+   deps_for_libmesa_util += dep_libdrm
++elif host_machine.system() == 'haiku'
++  # sync objects of the render device, through include/xf86drm.h
++  files_mesa_util += files('u_sync_provider_haiku.c', 'u_sync_provider.h')
+ endif
+ 
+ if with_platform_android
+Binary files pristine/src/util/perf/__pycache__/u_trace.cpython-314.pyc and mesa-26.2.4/src/util/perf/__pycache__/u_trace.cpython-314.pyc differ
+Binary files pristine/src/util/__pycache__/drirc_gen.cpython-314.pyc and mesa-26.2.4/src/util/__pycache__/drirc_gen.cpython-314.pyc differ
+diff -ruN -x .haiku-patches pristine/src/util/u_sync_provider.h mesa-26.2.4/src/util/u_sync_provider.h
+--- pristine/src/util/u_sync_provider.h	2026-10-02 00:39:53.000000000 +1000
++++ mesa-26.2.4/src/util/u_sync_provider.h	2026-10-24 13:41:43.617267112 +1100
+@@ -37,7 +37,8 @@
+    struct util_sync_provider * (*clone)(struct util_sync_provider *p);
+ };
+ 
+-#if HAVE_LIBDRM
++#if HAVE_LIBDRM || defined(__HAIKU__)
++/* on Haiku: u_sync_provider_haiku.c */
+ struct util_sync_provider * util_sync_provider_drm(int drm_fd);
+ #else
+ static inline struct util_sync_provider *
+diff -ruN -x .haiku-patches pristine/src/util/u_sync_provider_haiku.c mesa-26.2.4/src/util/u_sync_provider_haiku.c
+--- pristine/src/util/u_sync_provider_haiku.c	1970-01-01 11:00:00.000000000 +1100
++++ mesa-26.2.4/src/util/u_sync_provider_haiku.c	2026-10-24 13:41:55.425017199 +1100
+@@ -0,0 +1,197 @@
++/*
++ * Copyright 2026 air/OS
++ * SPDX-License-Identifier: MIT
++ */
++
++/* DRM sync objects on air/OS (Haiku), for the render device of the GPU's
++ * native driver (here the Adreno one, /dev/graphics/adreno/0).
++ *
++ * The kernel driver implements Linux's syncobj ioctls with Linux's
++ * structures behind its op codes (adreno_haiku.h, ADRENO_HAIKU_NR_SYNCOBJ_*):
++ * binary and timeline sync objects, WAIT_ALL / WAIT_FOR_SUBMIT /
++ * WAIT_AVAILABLE, reset, signal, timeline signal and wait, query and
++ * transfer between points. include/xf86drm.h (the libdrm stand-in) carries
++ * each request; this is the provider Mesa's Vulkan runtime reaches them
++ * through (vk_drm_syncobj.c, vk_device_set_drm_fd()).
++ *
++ * Timelines are offered when the kernel answers DRM_CAP_SYNCOBJ_TIMELINE.
++ * There are no file descriptors for sync objects or sync files yet: those
++ * entries fail with EOPNOTSUPP (see xf86drm.h).
++ *
++ * Every entry returns 0 or -1 with errno set; a timed out wait has errno
++ * ETIME, which is what vk_drm_syncobj.c looks for.
++ */
++
++#include "u_sync_provider.h"
++
++#include <errno.h>
++#include <stdlib.h>
++
++#include <xf86drm.h>
++
++struct haiku_sync_provider {
++   struct util_sync_provider base;
++   int fd;
++};
++
++static int
++haiku_fd(struct util_sync_provider *p)
++{
++   return ((struct haiku_sync_provider *)p)->fd;
++}
++
++/* ADRENO_HAIKU_NR_SYNCOBJ_CREATE; flags: DRM_SYNCOBJ_CREATE_SIGNALED */
++static int
++haiku_create(struct util_sync_provider *p, uint32_t flags, uint32_t *handle)
++{
++   return drmSyncobjCreate(haiku_fd(p), flags, handle);
++}
++
++/* ADRENO_HAIKU_NR_SYNCOBJ_DESTROY */
++static int
++haiku_destroy(struct util_sync_provider *p, uint32_t handle)
++{
++   return drmSyncobjDestroy(haiku_fd(p), handle);
++}
++
++static int
++haiku_handle_to_fd(struct util_sync_provider *p, uint32_t handle,
++                   int *out_obj_fd)
++{
++   return drmSyncobjHandleToFD(haiku_fd(p), handle, out_obj_fd);
++}
++
++static int
++haiku_fd_to_handle(struct util_sync_provider *p, int obj_fd,
++                   uint32_t *handle)
++{
++   return drmSyncobjFDToHandle(haiku_fd(p), obj_fd, handle);
++}
++
++static int
++haiku_import_sync_file(struct util_sync_provider *p, uint32_t handle,
++                       int sync_file_fd)
++{
++   return drmSyncobjImportSyncFile(haiku_fd(p), handle, sync_file_fd);
++}
++
++static int
++haiku_export_sync_file(struct util_sync_provider *p, uint32_t handle,
++                       int *out_sync_file_fd)
++{
++   return drmSyncobjExportSyncFile(haiku_fd(p), handle, out_sync_file_fd);
++}
++
++/* ADRENO_HAIKU_NR_SYNCOBJ_WAIT; timeout_nsec is absolute (CLOCK_MONOTONIC);
++ * flags: DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, _WAIT_FOR_SUBMIT */
++static int
++haiku_wait(struct util_sync_provider *p, uint32_t *handles,
++           unsigned num_handles, int64_t timeout_nsec, unsigned flags,
++           uint32_t *first_signaled)
++{
++   return drmSyncobjWait(haiku_fd(p), handles, num_handles, timeout_nsec,
++                         flags, first_signaled);
++}
++
++/* ADRENO_HAIKU_NR_SYNCOBJ_RESET */
++static int
++haiku_reset(struct util_sync_provider *p, const uint32_t *handles,
++            uint32_t handle_count)
++{
++   return drmSyncobjReset(haiku_fd(p), handles, handle_count);
++}
++
++/* ADRENO_HAIKU_NR_SYNCOBJ_SIGNAL */
++static int
++haiku_signal(struct util_sync_provider *p, const uint32_t *handles,
++             uint32_t handle_count)
++{
++   return drmSyncobjSignal(haiku_fd(p), handles, handle_count);
++}
++
++/* ADRENO_HAIKU_NR_SYNCOBJ_TIMELINE_SIGNAL */
++static int
++haiku_timeline_signal(struct util_sync_provider *p, const uint32_t *handles,
++                      uint64_t *points, uint32_t handle_count)
++{
++   return drmSyncobjTimelineSignal(haiku_fd(p), handles, points,
++                                   handle_count);
++}
++
++/* ADRENO_HAIKU_NR_SYNCOBJ_TIMELINE_WAIT; flags as haiku_wait() plus
++ * DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE (vkWaitSemaphores for "pending",
++ * and the runtime's wait-before-signal check) */
++static int
++haiku_timeline_wait(struct util_sync_provider *p, uint32_t *handles,
++                    uint64_t *points, unsigned num_handles,
++                    int64_t timeout_nsec, unsigned flags,
++                    uint32_t *first_signaled)
++{
++   return drmSyncobjTimelineWait(haiku_fd(p), handles, points, num_handles,
++                                 timeout_nsec, flags, first_signaled);
++}
++
++/* ADRENO_HAIKU_NR_SYNCOBJ_QUERY; flags: DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED */
++static int
++haiku_query(struct util_sync_provider *p, uint32_t *handles, uint64_t *points,
++            uint32_t handle_count, uint32_t flags)
++{
++   return drmSyncobjQuery2(haiku_fd(p), handles, points, handle_count, flags);
++}
++
++/* ADRENO_HAIKU_NR_SYNCOBJ_TRANSFER */
++static int
++haiku_transfer(struct util_sync_provider *p, uint32_t dst_handle,
++               uint64_t dst_point, uint32_t src_handle, uint64_t src_point,
++               uint32_t flags)
++{
++   return drmSyncobjTransfer(haiku_fd(p), dst_handle, dst_point, src_handle,
++                             src_point, flags);
++}
++
++static void
++haiku_finalize(struct util_sync_provider *p)
++{
++   free(p);
++}
++
++static struct util_sync_provider *
++haiku_clone(struct util_sync_provider *p)
++{
++   return util_sync_provider_drm(haiku_fd(p));
++}
++
++struct util_sync_provider *
++util_sync_provider_drm(int drm_fd)
++{
++   struct haiku_sync_provider *provider = calloc(1, sizeof(*provider));
++   if (provider == NULL)
++      return NULL;
++
++   provider->fd = drm_fd;
++   provider->base = (struct util_sync_provider) {
++      .create = haiku_create,
++      .destroy = haiku_destroy,
++      .handle_to_fd = haiku_handle_to_fd,
++      .fd_to_handle = haiku_fd_to_handle,
++      .import_sync_file = haiku_import_sync_file,
++      .export_sync_file = haiku_export_sync_file,
++      .wait = haiku_wait,
++      .reset = haiku_reset,
++      .signal = haiku_signal,
++      .query = haiku_query,
++      .transfer = haiku_transfer,
++      .finalize = haiku_finalize,
++      .clone = haiku_clone,
++   };
++
++   /* ADRENO_HAIKU_NR_GET_CAP */
++   uint64_t timelines = 0;
++   if (drmGetCap(drm_fd, DRM_CAP_SYNCOBJ_TIMELINE, &timelines) == 0 &&
++       timelines != 0) {
++      provider->base.timeline_signal = haiku_timeline_signal;
++      provider->base.timeline_wait = haiku_timeline_wait;
++   }
++
++   return &provider->base;
++}
+diff -ruN -x .haiku-patches pristine/src/vulkan/runtime/meson.build mesa-26.2.4/src/vulkan/runtime/meson.build
+--- pristine/src/vulkan/runtime/meson.build	2026-10-02 00:39:53.000000000 +1000
++++ mesa-26.2.4/src/vulkan/runtime/meson.build	2026-10-24 13:41:43.625874374 +1100
+@@ -57,6 +57,9 @@
+ if dep_libdrm.found()
+   vulkan_lite_runtime_files += files('vk_drm_syncobj.c')
+   vulkan_lite_runtime_deps += dep_libdrm
++elif host_machine.system() == 'haiku'
++  # on src/util/u_sync_provider_haiku.c
++  vulkan_lite_runtime_files += files('vk_drm_syncobj.c')
+ endif
+ 
+ if with_platform_android
+Binary files pristine/src/vulkan/util/__pycache__/vk_entrypoints.cpython-314.pyc and mesa-26.2.4/src/vulkan/util/__pycache__/vk_entrypoints.cpython-314.pyc differ
+Binary files pristine/src/vulkan/util/__pycache__/vk_extensions.cpython-314.pyc and mesa-26.2.4/src/vulkan/util/__pycache__/vk_extensions.cpython-314.pyc differ
+Binary files pristine/src/vulkan/util/__pycache__/vk_physical_device_features_gen.cpython-314.pyc and mesa-26.2.4/src/vulkan/util/__pycache__/vk_physical_device_features_gen.cpython-314.pyc differ
