@@ -246,7 +246,10 @@ JSON
 		done
 		echo "adreno_haiku.h $(sha256sum "$ADRENO_HEADERS/adreno_haiku.h" | cut -d' ' -f1)"
 		echo "sysroot $BASE"
-		(cd "$OUT" && sha256sum $(ls | grep -v -e MANIFEST -e debug))
+		# the files only: the user land tree (adreno) from an earlier run
+		# and the debug copies are not results of this one
+		(cd "$OUT" && find . -maxdepth 1 -type f ! -name 'MANIFEST' \
+			! -name '*.MANIFEST' -printf '%P\n' | sort | xargs sha256sum)
 	} > "$OUT/MANIFEST"
 	log "results in $OUT"
 }
