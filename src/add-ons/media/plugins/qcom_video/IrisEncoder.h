@@ -70,6 +70,8 @@ public:
 									uint32 lumaStride, const uint8* cb,
 									const uint8* cr, uint32 chromaStride,
 									int64 pts, bigtime_t timeout = 1000000);
+			//!	The next picture an IDR picture.
+			status_t			RequestKeyPicture();
 			/*!	The end of the stream: what the codec still holds comes out,
 				then NextPacket() says B_LAST_BUFFER_ERROR. */
 			status_t			EndOfStream();

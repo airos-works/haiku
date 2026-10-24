@@ -26,6 +26,7 @@
 #define HFI_PROPERTY_CONFIG_VENC_TARGET_BITRATE 0x2006001
 #define HFI_PROPERTY_CONFIG_VENC_IDR_PERIOD	0x2006002
 #define HFI_PROPERTY_CONFIG_VENC_INTRA_PERIOD 0x2006003
+#define HFI_PROPERTY_CONFIG_VENC_REQUEST_SYNC_FRAME 0x2006004
 #define HFI_PROPERTY_CONFIG_VENC_SYNC_FRAME_SEQUENCE_HEADER 0x2006008
 
 #define HFI_RATE_CONTROL_OFF				0x1000001
@@ -574,6 +575,17 @@ IrisEncoder::PutPicture420(const uint8* luma, uint32 lumaStride,
 		}
 	}
 	return _SendInput(index, pts);
+}
+
+
+status_t
+IrisEncoder::RequestKeyPicture()
+{
+	if (!fOpen || fFailed)
+		return fFailed ? B_ERROR : B_NO_INIT;
+	// a property without a value (venus' venc_ctrls.c)
+	return _SetProperty(HFI_PROPERTY_CONFIG_VENC_REQUEST_SYNC_FRAME,
+		(const uint32*)NULL, 0);
 }
 
 

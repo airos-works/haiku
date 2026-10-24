@@ -126,7 +126,8 @@ IrisSession::_SetProperty(uint32 property, const uint32* payload,
 {
 	uint32 packet[32] = { 20 + words * 4, HFI_CMD_SESSION_SET_PROPERTY,
 		fSession, 1, property };
-	memcpy(packet + 5, payload, words * 4);
+	if (words > 0)
+		memcpy(packet + 5, payload, words * 4);
 	return _Send(packet);
 }
 
