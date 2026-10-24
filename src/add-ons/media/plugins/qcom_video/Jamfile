@@ -6,12 +6,15 @@ UsePrivateHeaders drivers media shared ;
 # the codec decodes
 SubDirHdrs $(HAIKU_TOP) src add-ons media plugins sunxi_cedar ;
 
+# "00_": the Media Kit takes the first decoder of a directory that knows a
+# format, in the order of their names, and the FFmpeg add-on's also knows
+# H.264 and HEVC (as 00_rockchip_mpp)
 local architectureObject ;
 for architectureObject in [ MultiArchSubDirSetup ] {
 	on $(architectureObject) {
 		SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src add-ons media plugins
 			sunxi_cedar ] ;
-		Addon [ MultiArchDefaultGristFiles qcom_video ] :
+		Addon [ MultiArchDefaultGristFiles 00_qcom_video ] :
 			bits.c
 			h264_parse.c
 			hevc_parse.c

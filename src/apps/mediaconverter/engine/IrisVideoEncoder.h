@@ -9,6 +9,7 @@
 #include "VideoEncoder.h"
 
 #include <deque>
+#include <map>
 
 
 class IrisEncoder;
@@ -40,6 +41,10 @@ private:
 			BString				fDeviceName;
 			IrisEncoder*		fEncoder;
 			BString				fDescription;
+			AVRational			fTimeBase;
+			// the firmware's rate control takes picture times in
+			// microseconds: those sent, to the frames' own
+			std::map<int64, int64> fTimes;
 			std::deque<AVPacket*> fPackets;
 			bool				fDraining;
 			bool				fDrained;
