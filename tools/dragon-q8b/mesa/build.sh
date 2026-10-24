@@ -254,8 +254,9 @@ JSON
 # The tree the arm64 image carries as system/non-packaged/adreno
 # (AIROS_CI_ADRENO in tools/airos/ci/UserBuildConfig), which its boot script
 # links into system/non-packaged where the adreno driver publishes the GPU:
-# Turnip and libvulkan.so.1 in lib, the GPU firmware (linux-firmware's,
-# FIRMWARE=<a linux-firmware tree>), and the EGL vendor file, sorting before
+# Turnip and libvulkan.so.1 in lib, the GPU firmware and its licence
+# (FIRMWARE=<directory>, as tools/dragon-q8b/fetch-gpu-firmware.sh fills
+# it), and the EGL vendor file, sorting before
 # the ROCK 5's Panfrost one, that names this EGL vendor library in place.
 userland() {
 	local tree=$OUT/adreno fw=${FIRMWARE:-$WORK/dragon/firmware} f
@@ -273,14 +274,11 @@ userland() {
   }
 }
 JSON
-	for f in a660_sqe.fw a660_gmu.bin; do
-		cp "$fw/qcom/$f" "$tree/data/firmware/qcom/"
+	cp "$fw/qcom/a660_sqe.fw" "$fw/qcom/a660_gmu.bin" "$tree/data/firmware/qcom/"
+	cp "$fw/qcom/sc8280xp/qcdxkmsuc8280.mbn" "$tree/data/firmware/qcom/sc8280xp/"
+	for f in LICENSE.qcom NOTICE.qcom; do
+		[ ! -f "$fw/$f" ] || cp "$fw/$f" "$tree/data/firmware/qcom/"
 	done
-	# the zap shader: linux-firmware's qcom/sc8280xp/LENOVO/21BX copy, the
-	# same file as Radxa's
-	f=$fw/qcom/sc8280xp/qcdxkmsuc8280.mbn
-	[ -f "$f" ] || f=$fw/qcom/sc8280xp/LENOVO/21BX/qcdxkmsuc8280.mbn
-	cp "$f" "$tree/data/firmware/qcom/sc8280xp/"
 	(cd "$tree" && find . -type f | sort | xargs sha256sum) > "$OUT/adreno.MANIFEST"
 	log "user land in $tree"
 }
