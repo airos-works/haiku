@@ -23,6 +23,7 @@ IrisVideoEncoder::IrisVideoEncoder(const char* deviceName)
 	:
 	fDeviceName(deviceName),
 	fEncoder(NULL),
+	fTimeBase(AVRational{0, 1}),
 	fDraining(false),
 	fDrained(false)
 {
@@ -83,6 +84,7 @@ IrisVideoEncoder::Open(const VideoEncoderParams& params, BString& error)
 	}
 	config.keyInterval = params.keyInterval > 0 ? params.keyInterval
 		: config.framesPerSecond * 2;
+	fTimeBase = params.timeBase;
 
 	// The container wants the parameter sets before the first picture: a
 	// session of the same settings encodes a picture of black for them.
@@ -159,8 +161,14 @@ IrisVideoEncoder::_Take(bigtime_t timeout)
 		return B_NO_MEMORY;
 	}
 	memcpy(packet->data, result.data, result.size);
-	packet->pts = result.pts;
-	packet->dts = result.pts;
+	int64 pts = result.pts;
+	auto time = fTimes.find(result.pts);
+	if (time != fTimes.end()) {
+		pts = time->second;
+		fTimes.erase(fTimes.begin(), ++time);
+	}
+	packet->pts = pts;
+	packet->dts = pts;
 	if (result.key)
 		packet->flags |= AV_PKT_FLAG_KEY;
 	fEncoder->ReleasePacket(result);
@@ -183,9 +191,13 @@ IrisVideoEncoder::SendFrame(const AVFrame* frame)
 		&& fEncoder->PicturesEncoded() > 0) {
 		fEncoder->RequestKeyPicture();
 	}
+	int64 time = frame->pts;
+	if (fTimeBase.num > 0 && fTimeBase.den > 0)
+		time = av_rescale_q(frame->pts, fTimeBase, AVRational{1, 1000000});
+	fTimes[time] = frame->pts;
 	while (true) {
 		status_t status = fEncoder->PutPicture(frame->data[0],
-			frame->linesize[0], frame->data[1], frame->linesize[1], frame->pts,
+			frame->linesize[0], frame->data[1], frame->linesize[1], time,
 			kTimeout);
 		if (status != B_WOULD_BLOCK)
 			return status;
