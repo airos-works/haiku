@@ -13,13 +13,14 @@ table set and a device tree; the kernel prefers the device tree.
 | Wi-Fi (Intel AX210) | joins WPA2 networks over 802.11ax, 38.6 MB/s on the LAN | `iaxwifi200` |
 | Bluetooth (AX210) | the controller comes up with Intel's firmware (ibt-0041-0041) over USB | `h2generic`; not yet paired with a device |
 | USB | the three DWC3 controllers at USB 2 | SuperSpeed ports show Rx.Detect with `dwc3_superspeed true`; no USB 3 device tested yet |
+| CPUs | the firmware leaves both EPSS frequency domains at their top level (4 x 2438 MHz, 4 x 2995 MHz), each with a table of 21 levels | a cpufreq module that followed the scheduler's hints was tried: no difference at idle (9 W at the wall either way, the plug reads in watts) and none measurable under load, so the clocks stay where the firmware puts them |
 | GPU (Adreno 690) | Vulkan 1.3 (Mesa Turnip), OpenGL ES 3.2 and OpenGL through zink | `adreno` kernel driver; the clock follows the load (270 MHz idle, 690 MHz busy); `pvr_glbench` 3600 frames/s with readback (2650 at the lowest clock), 1880/s at 1080p; WebGL in Summit |
 | Display | HDMI (DisplayPort 2 through the board's CH7218A bridge): own frame buffer, vertical blank interrupt (60.00 Hz), EDID over DP AUX, mode setting on the trained link | `qcom_display`; 1080p set again through the full path; other modes are correct on the Dragon's side but the lab's NanoKVM does not lock onto them, so they need a monitor to verify |
 | Multiple displays | not yet: the USB-C ports' DisplayPort alt mode goes through the ADSP's pmic-glink | |
 | Video decode (Iris) | H.264 and HEVC Main (eight bit 4:2:0, up to 4096x2304) on the codec, through the Media Kit (`qcom_video` add-on, FFmpeg fallback for what it does not decode) and airTime | `qcom_iris` driver, linux-firmware's `qcom/vpu/vpu20_p4.mbn`; byte-exact with libavcodec at 320x240, 720p and 1080p; 1080p H.264 at 306 pictures/s, 720p HEVC at 568/s through the Media Kit, at under one core |
 | Video encode | H.264 High and HEVC Main on the codec (`qcom_video`'s IrisEncoder), in MediaConverter as the "Iris" hardware backend | 720p H.264 transcoded at 531 pictures/s (36.4 dB luma PSNR), HEVC at 596/s (35.2 dB); 1080p at ~320 pictures/s; several teams can use the codec at once |
 | Applications | Amp, Burrow, DeckCraft, GridCraft, Kiri, Mail, PdfCraft, WordCraft, airShot and airTime open their windows on the NVMe install; LightCraft and PhotoCraft draw with Vulkan on Turnip; Snap runs its effects through zink at 60 frames/s (1 ms a frame); Summit plays video on the codec | the boot script sets the ROCK 5's Panfrost EGL vendor aside on the Dragon: with both Mesas in one team Snap crashed making its second context current |
-| SD card | no driver yet (`sdhci_fdt` needs a Qualcomm glue); the lab probe brings SDHC2 up without one: its supplies on through RPMh (L9C and L6C at 2.96 V, `ldoc9`/`ldoc6` in cmd-db, apps RSC v2.4), the sdhci-msm v5 power handshake (0x240..0x24c), a 343 kHz card clock (the firmware runs the core clock at XO/14 = 1.37 MHz, not the 200 MHz the capabilities say); no card answers CMD8 | card detect (GPIO 131) reads low even with a pull-up, so it says nothing; the SD stream (0x4e0) goes through context bank 2 with the firmware's tables, so a driver needs its own SMMU context or PIO |
+| SD card | no driver yet (`sdhci_fdt` needs a Qualcomm glue); the lab probe brings SDHC2 up without one: its supplies on through RPMh (L9C and L6C at 2.96 V, `ldoc9`/`ldoc6` in cmd-db, apps RSC v2.4), the sdhci-msm v5 power handshake (0x240..0x24c), a 399 kHz card clock from the 202 MHz the firmware gives the controller (GPLL9 / 4); no card answers CMD8, so the slot is taken to be empty | card detect (GPIO 131) reads low even with a pull-up, so it says nothing; the SD stream (0x4e0) goes through context bank 2 with the firmware's tables, so a driver needs its own SMMU context or PIO |
 
 ## Known problems
 
@@ -33,8 +34,9 @@ table set and a device tree; the kernel prefers the device tree.
   zeroed submission entry while the slot held the real command: arm64's
   NVMe DMA memory is noncached, the cached linear map's stale line of it
   answered the controller's read on the Dragon's cache-coherent PCIe. The
-  driver now cleans those lines before the doorbell; whether that ends it
-  takes more boots to tell (the entry is still logged and skipped).
+  driver now cleans those lines before the doorbell: 30 boots in a row
+  since without one (at 2% that is still possible by chance, so the entry
+  stays logged and skipped).
 - Summit showed only digits of page text on arm64 CI installs: it includes
   `/boot/system/settings/fonts/fonts.conf`, which only x86_64's fontconfig
   package provides, so it found only its emoji fonts. arm64 CI images now
