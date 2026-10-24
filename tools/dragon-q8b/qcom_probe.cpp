@@ -1173,6 +1173,31 @@ static const uint32 kPhyCom = 0x0000, kPhyTxA = 0x0400, kPhyTxB = 0x0a00,
 	kPhyDpSerdes = 0x2000, kPhyDpPhy = 0x2200;
 
 
+// the two USB-C connectors' DisplayPort chains (gcc-sc8280xp.c,
+// dispcc-sc8280xp.c, the device tree)
+struct usbc_dp {
+	phys_addr_t	phy;
+	uint32		gdsc;
+	uint32		branches[3];	// aux, ref, com aux
+	uint32		resets[2];		// phy, common
+	const char*	vddaPhy;		// 0.912 V
+	const char*	vddaPll;		// 1.2 V
+	uint32		linkRcg, linkSource, linkBranch;
+	uint32		auxRcg, auxBranch;
+	phys_addr_t	controller;
+	uint32		sbuEnable, sbuSelect;
+};
+
+static const usbc_dp kUsbcDp[] = {
+	{0x88eb000, 0xf004, {0xf054, 0x8c02c, 0xf058}, {0x50000, 0x4a008},
+		"ldod9", "ldod4", 0x21a4, 1, 0x205c, 0x2238, 0x206c, 0xae90000,
+		101, 164},
+	{0x8903000, 0x10004, {0x10054, 0x8c010, 0x10058}, {0x5000c, 0xb9020},
+		"ldob4", "ldob3", 0x2268, 2, 0x2084, 0x22d0, 0x20a0, 0xae98000,
+		48, 47},
+};
+
+
 static bool
 poll_bits(volatile uint8* base, uint32 offset, uint32 bits, const char* what)
 {
@@ -1187,8 +1212,90 @@ poll_bits(volatile uint8* base, uint32 offset, uint32 bits, const char* what)
 }
 
 
+/*!	DP0's AUX channel over USB-C port 0, with nothing plugged in: the SBU
+	mux (PI3USB102, "gpio-sbu-mux": enable GPIO 101 active low, select
+	GPIO 164 for the orientation) on, the AUX clock from XO, the
+	controller's AUX reset and enabled (msm_dp_aux), then one native read of
+	DPCD 0. Without a sink it must end in a timeout or NACK, not hang. */
 static void
-dp_phy_test()
+dp_aux_test(const usbc_dp& port)
+{
+	const uint32 kPins[][2] = {{port.sbuEnable, 0}, {port.sbuSelect, 0}};
+	for (const uint32* pin : kPins) {
+		area_id area;
+		volatile uint8* tlmm = map_rw({"probe tlmm sbu", 0xf100000
+			+ pin[0] * 0x1000, 0x1000}, area);
+		if (tlmm == NULL)
+			return;
+		wr32(tlmm, 4, pin[1] << 1);		// the output value
+		wr32(tlmm, 0, 1u << 9);			// GPIO, output enabled, 2 mA
+		dprintf("qcom_probe: dp aux: gpio %" B_PRIu32 " cfg %#" B_PRIx32
+			" io %#" B_PRIx32 "\n", pin[0], rd(tlmm, 0), rd(tlmm, 4));
+		delete_area(area);
+	}
+
+	area_id dispccArea;
+	volatile uint8* dispcc = map_rw({"probe dispcc aux", 0xaf00000, 0x20000},
+		dispccArea);
+	if (dispcc == NULL)
+		return;
+	// the AUX RCG (0x2238) from XO, then its branch
+	wr32(dispcc, port.auxRcg + 4, 0);
+	wr32(dispcc, port.auxRcg, rd(dispcc, port.auxRcg) | 1);
+	wait_bits(dispcc, port.auxRcg, 1, 0);
+	wr32(dispcc, port.auxBranch, rd(dispcc, port.auxBranch) | 1);
+	bool auxOn = wait_bits(dispcc, port.auxBranch, 1u << 31, 0);
+	dprintf("qcom_probe: dp aux: clock %#" B_PRIx32 " (%s)\n",
+		rd(dispcc, port.auxBranch), auxOn ? "on" : "off");
+	delete_area(dispccArea);
+	if (!auxOn)
+		return;
+
+	area_id area;
+	volatile uint8* dp = map_rw({"probe dp", port.controller, 0x1000}, area);
+	if (dp == NULL)
+		return;
+	const uint32 aux = 0x200, intrStatus = 0x020;
+	wr32(dp, aux + 0x30, rd(dp, aux + 0x30) | 2);		// AUX reset
+	snooze(1000);
+	wr32(dp, aux + 0x30, rd(dp, aux + 0x30) & ~2u);
+	wr32(dp, aux + 0x3c, 0xffff);						// timeout count
+	wr32(dp, aux + 0x40, 0xffff);						// limits
+	wr32(dp, aux + 0x30, rd(dp, aux + 0x30) | 1);		// enable
+
+	// a native read of one byte at DPCD 0: the request's four bytes
+	static const uint8 kHeader[4] = {0x10, 0, 0, 0};
+	for (int i = 0; i < 4; i++)
+		wr32(dp, aux + 0x34, (uint32)kHeader[i] << 8 | (i == 0 ? 1u << 31 : 0));
+	wr32(dp, aux + 0x38, 0);
+	wr32(dp, aux + 0x4c, 0x1f);
+	wr32(dp, aux + 0x4c, 0x9f);
+	wr32(dp, aux + 0x4c, 0);
+	wr32(dp, intrStatus, rd(dp, intrStatus) << 1);
+	wr32(dp, aux + 0x38, 1u << 9);						// go
+	uint32 status = 0;
+	bigtime_t start = system_time();
+	while (system_time() - start < 500000) {
+		status = rd(dp, intrStatus) & 0x0a249248;
+		if (status != 0)
+			break;
+		spin(20);
+	}
+	wr32(dp, intrStatus, status << 1);
+	wr32(dp, aux + 0x38, 0);
+	dprintf("qcom_probe: dp aux: DPCD read after %" B_PRId64 " us: status %#"
+		B_PRIx32 "%s%s%s, aux ctrl %#" B_PRIx32 ", phy aux status %#" B_PRIx32
+		"\n", system_time() - start, status,
+		(status & (1u << 3)) != 0 ? " done" : "",
+		(status & (1u << 9)) != 0 ? " timeout" : "",
+		status == 0 ? " nothing" : "", rd(dp, aux + 0x30),
+		rd(dp, aux + 0xbc));
+	delete_area(area);
+}
+
+
+static void
+dp_phy_test(const usbc_dp& port)
 {
 	area_id gccArea;
 	volatile uint8* gcc = map_rw({"probe gcc dp", 0x100000, 0x1f4200},
@@ -1197,15 +1304,14 @@ dp_phy_test()
 		return;
 
 	// USB30_PRIM_GDSC: on (bit 0 SW_COLLAPSE clear), status in bit 31
-	uint32 gdsc = rd(gcc, 0xf004);
+	uint32 gdsc = rd(gcc, port.gdsc);
 	if ((gdsc & 1) != 0)
-		wr32(gcc, 0xf004, gdsc & ~1u);
-	wait_bits(gcc, 0xf004, 1u << 31, 1u << 31);
+		wr32(gcc, port.gdsc, gdsc & ~1u);
+	wait_bits(gcc, port.gdsc, 1u << 31, 1u << 31);
 	dprintf("qcom_probe: dp phy: usb30 prim gdsc %#" B_PRIx32 " -> %#" B_PRIx32
 		"\n", gdsc, rd(gcc, 0xf004));
 	// aux, ref (usb4 eud clkref), com aux
-	static const uint32 kBranches[] = {0xf054, 0x8c02c, 0xf058};
-	for (uint32 branch : kBranches) {
+	for (uint32 branch : port.branches) {
 		uint32 before = rd(gcc, branch);
 		wr32(gcc, branch, before | 1);
 		spin(100);
@@ -1214,20 +1320,20 @@ dp_phy_test()
 	}
 
 	// vdda-phy L9D 0.912 V, vdda-pll L4D 1.2 V
-	ldo_on("ldod9", 912);
-	ldo_on("ldod4", 1200);
+	ldo_on(port.vddaPhy, 912);
+	ldo_on(port.vddaPll, 1200);
 
 	// phy and common resets (GCC_USB3_PHY_PRIM_BCR, GCC_USB4_DP_PHY_PRIM_BCR)
-	wr32(gcc, 0x50000, rd(gcc, 0x50000) | 1);
-	wr32(gcc, 0x4a008, rd(gcc, 0x4a008) | 1);
+	for (uint32 reset : port.resets)
+		wr32(gcc, reset, rd(gcc, reset) | 1);
 	spin(200);
-	wr32(gcc, 0x50000, rd(gcc, 0x50000) & ~1u);
-	wr32(gcc, 0x4a008, rd(gcc, 0x4a008) & ~1u);
+	for (uint32 reset : port.resets)
+		wr32(gcc, reset, rd(gcc, reset) & ~1u);
 	spin(200);
 	delete_area(gccArea);
 
 	area_id phyArea;
-	volatile uint8* phy = map_rw({"probe usb43dp phy", 0x88eb000, 0x4000},
+	volatile uint8* phy = map_rw({"probe usb43dp phy", port.phy, 0x4000},
 		phyArea);
 	if (phy == NULL)
 		return;
@@ -1319,24 +1425,29 @@ dp_phy_test()
 		volatile uint8* dispcc = map_rw({"probe dispcc dp0", 0xaf00000,
 			0x20000}, dispccArea);
 		if (dispcc != NULL) {
-			uint32 cfg = rd(dispcc, 0x21a8);
-			wr32(dispcc, 0x21a8, (cfg & ~(7u << 8 | 0x1fu)) | 1u << 8);
-			wr32(dispcc, 0x21a4, rd(dispcc, 0x21a4) | 1);
-			wait_bits(dispcc, 0x21a4, 1, 0);
-			uint32 before = rd(dispcc, 0x205c);
-			wr32(dispcc, 0x205c, before | 1);
-			bool running = wait_bits(dispcc, 0x205c, 1u << 31, 0);
-			dprintf("qcom_probe: dp phy: dp0 link rcg cfg %#" B_PRIx32 " -> %#"
+			uint32 cfg = rd(dispcc, port.linkRcg + 4);
+			wr32(dispcc, port.linkRcg + 4, (cfg & ~(7u << 8 | 0x1fu))
+				| port.linkSource << 8);
+			wr32(dispcc, port.linkRcg, rd(dispcc, port.linkRcg) | 1);
+			wait_bits(dispcc, port.linkRcg, 1, 0);
+			uint32 before = rd(dispcc, port.linkBranch);
+			wr32(dispcc, port.linkBranch, before | 1);
+			bool running = wait_bits(dispcc, port.linkBranch, 1u << 31, 0);
+			dprintf("qcom_probe: dp phy: link rcg cfg %#" B_PRIx32 " -> %#"
 				B_PRIx32 " (cmd %#" B_PRIx32 "), link branch %#" B_PRIx32
-				" -> %#" B_PRIx32 ": %s\n", cfg, rd(dispcc, 0x21a8),
-				rd(dispcc, 0x21a4), before, rd(dispcc, 0x205c),
+				" -> %#" B_PRIx32 ": %s\n", cfg, rd(dispcc, port.linkRcg + 4),
+				rd(dispcc, port.linkRcg), before, rd(dispcc, port.linkBranch),
 				running ? "running" : "off");
 			delete_area(dispccArea);
 		}
 	}
-	dprintf("qcom_probe: dp phy: PLL %s, PHY %s (c_ready %#" B_PRIx32
+	if (ready)
+		dp_aux_test(port);
+	dprintf("qcom_probe: dp phy %#" B_PRIxPHYSADDR ": PLL %s, PHY %s (c_ready %#"
+		B_PRIx32
 		" cmn %#" B_PRIx32 " dp phy status %#" B_PRIx32 ")\n",
-		locked ? "locked" : "not locked", ready ? "ready" : "not ready",
+		port.phy, locked ? "locked" : "not locked",
+		ready ? "ready" : "not ready",
 		rd(serdes, kSerdesCReadyStatus), rd(serdes, kSerdesCmnStatus),
 		rd(dp, kDpPhyStatus));
 	delete_area(phyArea);
@@ -1408,7 +1519,8 @@ init_hardware()
 {
 	probe();
 	adsp_state();
-	sd_smmu_bank();
+	for (const usbc_dp& port : kUsbcDp)
+		dp_phy_test(port);
 	return B_ERROR;
 }
 
