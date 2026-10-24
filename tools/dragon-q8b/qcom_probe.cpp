@@ -1186,15 +1186,17 @@ struct usbc_dp {
 	uint32		auxRcg, auxBranch;
 	phys_addr_t	controller;
 	uint32		sbuEnable, sbuSelect;
+	uint32		pixelRcg, pixelSource, pixelBranch, linkIntfBranch;
+	uint32		intf;			// its timing engine, from the MDP's base
 };
 
 static const usbc_dp kUsbcDp[] = {
 	{0x88eb000, 0xf004, {0xf054, 0x8c02c, 0xf058}, {0x50000, 0x4a008},
 		"ldod9", "ldod4", 0x21a4, 1, 0x205c, 0x2238, 0x206c, 0xae90000,
-		101, 164},
+		101, 164, 0x21d8, 2, 0x2070, 0x2060, 0x34000},
 	{0x8903000, 0x10004, {0x10054, 0x8c010, 0x10058}, {0x5000c, 0xb9020},
 		"ldob4", "ldob3", 0x2268, 2, 0x2084, 0x22d0, 0x20a0, 0xae98000,
-		48, 47},
+		48, 47, 0x2250, 4, 0x2078, 0x2088, 0x38000},
 };
 
 
@@ -1290,6 +1292,152 @@ dp_aux_test(const usbc_dp& port)
 		(status & (1u << 9)) != 0 ? " timeout" : "",
 		status == 0 ? " nothing" : "", rd(dp, aux + 0x30),
 		rd(dp, aux + 0xbc));
+	delete_area(area);
+}
+
+
+/*!	The connector's pixel clock from its PHY's VCO divider (810 MHz at RBR)
+	at 148.5 MHz (M/N 11/60), and its DPU timing engine running on it with
+	the timing of the HDMI output's (INTF_6, the firmware's 1080p): its
+	frame counter has to advance, a monitor or not. Then it is stopped. */
+static void
+dp_stream_test(const usbc_dp& port)
+{
+	area_id dispccArea;
+	volatile uint8* dispcc = map_rw({"probe dispcc pixel", 0xaf00000, 0x20000},
+		dispccArea);
+	if (dispcc == NULL)
+		return;
+	uint32 rcg = port.pixelRcg;
+	const uint32 m = 11, n = 60, d = n;		// d: 50 % duty, clamped as Linux
+	wr32(dispcc, rcg + 8, m);
+	wr32(dispcc, rcg + 0xc, ~(n - m) & 0xffff);
+	wr32(dispcc, rcg + 0x10, ~d & 0xffff);
+	wr32(dispcc, rcg + 4, port.pixelSource << 8 | 2u << 12);	// dual edge
+	wr32(dispcc, rcg, rd(dispcc, rcg) | 1);
+	bool updated = wait_bits(dispcc, rcg, 1, 0);
+	wr32(dispcc, port.pixelBranch, rd(dispcc, port.pixelBranch) | 1);
+	bool pixel = wait_bits(dispcc, port.pixelBranch, 1u << 31, 0);
+	wr32(dispcc, port.linkIntfBranch, rd(dispcc, port.linkIntfBranch) | 1);
+	bool linkIntf = wait_bits(dispcc, port.linkIntfBranch, 1u << 31, 0);
+	dprintf("qcom_probe: dp stream: pixel rcg %s cfg %#" B_PRIx32 ", pixel "
+		"branch %#" B_PRIx32 " (%s), link intf %#" B_PRIx32 " (%s)\n",
+		updated ? "updated" : "stuck", rd(dispcc, rcg + 4),
+		rd(dispcc, port.pixelBranch), pixel ? "running" : "off",
+		rd(dispcc, port.linkIntfBranch), linkIntf ? "running" : "off");
+	delete_area(dispccArea);
+	if (!pixel)
+		return;
+
+	area_id mdpArea;
+	volatile uint8* mdp = map_rw({"probe mdp", 0xae01000, 0x40000}, mdpArea);
+	if (mdp == NULL)
+		return;
+	volatile uint8* hdmi = mdp + 0x3a000;
+	volatile uint8* intf = mdp + port.intf;
+	static const uint32 kTiming[] = {0x004, 0x008, 0x00c, 0x014, 0x01c, 0x024,
+		0x02c, 0x034, 0x03c, 0x040, 0x04c, 0x050, 0x060, 0x064, 0x068};
+	for (uint32 offset : kTiming)
+		wr32(intf, offset, rd(hdmi, offset));
+	wr32(intf, 0x0a8, 3);			// frame and line counters on
+	wr32(intf, 0x000, 1);			// the timing engine on
+	uint32 first = rd(intf, 0x0ac);
+	snooze(500000);
+	uint32 second = rd(intf, 0x0ac);
+	wr32(intf, 0x000, 0);
+	dprintf("qcom_probe: dp stream: INTF at %#" B_PRIx32 ": %" B_PRIu32
+		" frames in 0.5 s (counter %#" B_PRIx32 " -> %#" B_PRIx32 "), HDMI "
+		"timing hctl %#" B_PRIx32 " vperiod %#" B_PRIx32 "\n", port.intf,
+		second - first, first, second, rd(hdmi, 0x008), rd(hdmi, 0x00c));
+	delete_area(mdpArea);
+}
+
+
+/*!	A second DPU path for DP0, made from the one the firmware lit for the
+	HDMI output (VIG2 -> LM_2 -> CTL_2 -> INTF_6): VIG0 fetching the same
+	frame buffer with VIG2's settings, LM_0 with LM_2's, CTL_0 putting VIG0
+	in LM_0's blend stage and driving INTF_0 (dpu_hw_ctl.c's encodings),
+	INTF_0 with INTF_6's timing on DP0's pixel clock. With no monitor the
+	DisplayPort controller sends nothing, but the path fetches and scans
+	out: the flush has to complete, the frames count, and INTF_0 must not
+	underrun. Then it is all taken down again. */
+static void
+dp0_pipeline_test()
+{
+	area_id area;
+	volatile uint8* mdss = map_rw({"probe mdss", 0xae00000, 0x90000}, area);
+	if (mdss == NULL)
+		return;
+	const uint32 mdp = 0x1000;
+	volatile uint8* vig0 = mdss + mdp + 0x4000;
+	volatile uint8* vig2 = mdss + mdp + 0x8000;
+	volatile uint8* lm0 = mdss + mdp + 0x44000;
+	volatile uint8* lm2 = mdss + mdp + 0x46000;
+	volatile uint8* ctl0 = mdss + mdp + 0x15000;
+	volatile uint8* ctl2 = mdss + mdp + 0x17000;
+	volatile uint8* intf0 = mdss + mdp + 0x34000;
+	volatile uint8* intf6 = mdss + mdp + 0x3a000;
+	const uint32 interruptStatus = mdp + 0x14, interruptClear = mdp + 0x18;
+	const uint32 underrun0 = 1u << 24, underrun6 = 1u << 16;
+
+	if ((rd(ctl2, 0xf4) & (1u << 6)) == 0 || (rd(ctl2, 0xfc) & (1u << 18)) == 0
+		|| (rd(intf6, 0) & 1) == 0) {
+		dprintf("qcom_probe: dp0 pipeline: the firmware's path is not VIG2 -> "
+			"CTL_2 -> INTF_6 (intf active %#" B_PRIx32 " fetch %#" B_PRIx32
+			")\n", rd(ctl2, 0xf4), rd(ctl2, 0xfc));
+		delete_area(area);
+		return;
+	}
+	for (uint32 offset = 0; offset < 0x200; offset += 4)
+		wr32(vig0, offset, rd(vig2, offset));
+	for (uint32 offset = 0xa00; offset < 0xb00; offset += 4)
+		wr32(vig0, offset, rd(vig2, offset));
+	for (uint32 offset = 0; offset < 0x100; offset += 4)
+		wr32(lm0, offset, rd(lm2, offset));
+
+	// VIG2's stage in LM_2's layer (bits 8:6, extension bit 4) as VIG0's
+	// (bits 2:0, extension bit 0), and the border out bit
+	uint32 layer2 = rd(ctl2, 0x08), layerExt2 = rd(ctl2, 0x40 + 0x08);
+	uint32 layer0 = (layer2 & (1u << 24)) | ((layer2 >> 6) & 7);
+	uint32 layerExt0 = (layerExt2 >> 4) & 1;
+	wr32(ctl0, 0x14, rd(ctl2, 0x14));		// CTL_TOP: the mode
+	wr32(ctl0, 0x00, layer0);
+	wr32(ctl0, 0x40, layerExt0);
+	wr32(ctl0, 0xf4, 1u << 0);				// INTF_0 active
+	wr32(ctl0, 0xfc, 1u << 16);				// VIG0 fetches
+
+	static const uint32 kTiming[] = {0x004, 0x008, 0x00c, 0x014, 0x01c, 0x024,
+		0x02c, 0x034, 0x03c, 0x040, 0x04c, 0x050, 0x060, 0x064, 0x068};
+	for (uint32 offset : kTiming)
+		wr32(intf0, offset, rd(intf6, offset));
+	wr32(intf0, 0x0a8, 3);
+
+	wr32(ctl0, 0x110, 1u << 0);				// CTL_INTF_FLUSH: INTF_0
+	wr32(ctl0, 0x018, 1u << 0 | 1u << 6 | 1u << 17 | 1u << 31);
+	wr32(mdss, interruptClear, underrun0 | underrun6);
+	wr32(intf0, 0x000, 1);
+	uint32 first = rd(intf0, 0x0ac);
+	snooze(500000);
+	uint32 frames = rd(intf0, 0x0ac) - first;
+	uint32 flush = rd(ctl0, 0x018);
+	uint32 status = rd(mdss, interruptStatus);
+	dprintf("qcom_probe: dp0 pipeline: layer %#" B_PRIx32 "/%#" B_PRIx32 " (from "
+		"%#" B_PRIx32 "/%#" B_PRIx32 "), %" B_PRIu32 " frames in 0.5 s, flush "
+		"%#" B_PRIx32 "%s, INTF_0 underrun %s (INTF_6 %s), VIG0 %#" B_PRIx32
+		" -> %#" B_PRIx32 " at %#" B_PRIx32 ", LM_0 %#" B_PRIx32 "\n", layer0,
+		layerExt0, layer2, layerExt2, frames, flush,
+		flush == 0 ? " (done)" : " (pending)",
+		(status & underrun0) != 0 ? "yes" : "no",
+		(status & underrun6) != 0 ? "yes" : "no", rd(vig0, 0x00),
+		rd(vig0, 0x0c), rd(vig0, 0x14), rd(lm0, 0x04));
+
+	// taken down again
+	wr32(intf0, 0x000, 0);
+	wr32(ctl0, 0x00, 0);
+	wr32(ctl0, 0x40, 0);
+	wr32(ctl0, 0xf4, 0);
+	wr32(ctl0, 0xfc, 0);
+	wr32(ctl0, 0x018, 1u << 0 | 1u << 6 | 1u << 17);
 	delete_area(area);
 }
 
@@ -1441,8 +1589,12 @@ dp_phy_test(const usbc_dp& port)
 			delete_area(dispccArea);
 		}
 	}
-	if (ready)
+	if (ready) {
 		dp_aux_test(port);
+		dp_stream_test(port);
+		if (port.intf == 0x34000)
+			dp0_pipeline_test();
+	}
 	dprintf("qcom_probe: dp phy %#" B_PRIxPHYSADDR ": PLL %s, PHY %s (c_ready %#"
 		B_PRIx32
 		" cmn %#" B_PRIx32 " dp phy status %#" B_PRIx32 ")\n",
