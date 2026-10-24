@@ -1303,6 +1303,8 @@ static const struct {
 	{false, 2, "digital codec vote"},
 	{true, 0x312, "RX core TX MCLK"},
 	{true, 0x313, "RX core TX 2X MCLK"},
+	{true, 0x30c, "TX core MCLK"},
+	{true, 0x30d, "TX core NPL MCLK"},
 };
 
 
@@ -1452,76 +1454,44 @@ swr_read(volatile uint8* swr, uint32 device, uint16 reg)
 }
 
 
-/*!	Lab: with the RX macro clocked, its registers read their reset values,
-	then the RX SoundWire bus (soundwire@3210000, "qcom,soundwire-v1.6.0")
-	the WCD9385's RX device sits on: the macro's MCLK, frame counter and
-	SoundWire clock (lpass-rx-macro.c), the controller set up as
-	qcom_swrm_init() does (50 rows, 16 columns, auto enumeration, the bus
-	clock started, its pins on the LPASS LPI pin controller), the codec out
-	of reset (GPIO 106, active low), and who answered: the slave status, the
-	enumerated device IDs, and the device's own SCP registers read over the
-	bus. Seen on the board: the WCD9385's RX device (sdw20217010d00, unique
-	ID 4) attaches as device 1 and its DevId registers read back. */
-static void
-audio_probe_registers()
+static area_id
+audio_map(const char* name, phys_addr_t address, size_t size,
+	volatile uint8*& base)
 {
-	volatile uint8* rx;
-	area_id rxArea = map_physical_memory("qcom adsp rx macro", 0x3200000,
-		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY,
-		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&rx);
-	if (rxArea < 0)
-		return;
-	// CDC_RX_TOP_DSD0/1_DEBUG_CFG0/1: 0x11, 0x20, 0x11, 0x20 after reset
-	TRACE("audio: RX macro DSD debug registers %#" B_PRIx32 " %#" B_PRIx32
-		" %#" B_PRIx32 " %#" B_PRIx32 " (0x11 0x20 0x11 0x20 when clocked)\n",
-		mmio_read(rx, 0x70), mmio_read(rx, 0x74), mmio_read(rx, 0x80),
-		mmio_read(rx, 0x84));
-	// MCLK and MCLK2 on, the frame counter, the SoundWire clock after a
-	// reset (CDC_RX_CLK_RST_CTRL_MCLK/FS_CNT/SWR_CONTROL)
-	mmio_write(rx, 0x100, mmio_read(rx, 0x100) | 3);
-	mmio_write(rx, 0x104, mmio_read(rx, 0x104) & ~2u);
-	mmio_write(rx, 0x104, mmio_read(rx, 0x104) | 1);
-	mmio_write(rx, 0x108, mmio_read(rx, 0x108) | 2);
-	spin(100);
-	mmio_write(rx, 0x108, mmio_read(rx, 0x108) & ~2u);
-	mmio_write(rx, 0x108, mmio_read(rx, 0x108) | 1);
+	return map_physical_memory(name, address, size,
+		B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&base);
+}
 
-	// the bus' pins on the LPASS LPI pin controller (rx-swr-default-state:
-	// gpio3 swr_rx_clk, gpio4/5 swr_rx_data with bus hold; function 1, 2 mA;
-	// pinctrl-sc8280xp-lpass-lpi.c: a page a pin). Lab: read first.
-	snooze(100000);
+
+/*!	Sets SoundWire bus pins up on the LPASS LPI pin controller
+	(pinctrl-sc8280xp-lpass-lpi.c: a page a pin; bits 1:0 pull, 5:2
+	function, 8:6 drive strength): the clock pin without a pull, the data
+	pins with bus hold, function 1, 2 mA. */
+static void
+audio_lpi_pins(uint32 clockPin, uint32 firstDataPin)
+{
 	volatile uint8* lpi;
-	area_id lpiArea = map_physical_memory("qcom adsp lpi pins", 0x33c0000,
-		0x20000, B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY,
-		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&lpi);
-	if (lpiArea >= 0) {
-		TRACE("audio: LPI pin 0 %#" B_PRIx32 "\n", mmio_read(lpi, 0));
-		snooze(100000);
-		for (uint32 pin = 3; pin <= 5; pin++) {
-			TRACE("audio: LPI gpio%" B_PRIu32 " cfg %#" B_PRIx32 "\n", pin,
-				mmio_read(lpi, pin * 0x1000));
-		}
-		snooze(100000);
-		static const struct { uint32 pin, config; } kPins[] = {
-			{3, 0 | 1u << 2}, {4, 2 | 1u << 2}, {5, 2 | 1u << 2}};
-		for (const auto& pin : kPins)
-			mmio_write(lpi, pin.pin * 0x1000, pin.config);
-		TRACE("audio: LPI gpio3-5 now %#" B_PRIx32 " %#" B_PRIx32 " %#"
-			B_PRIx32 "\n", mmio_read(lpi, 0x3000), mmio_read(lpi, 0x4000),
-			mmio_read(lpi, 0x5000));
-		delete_area(lpiArea);
-	}
-	snooze(100000);
-
-	volatile uint8* swr;
-	area_id swrArea = map_physical_memory("qcom adsp rx soundwire",
-		0x3210000, 0x2000, B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY,
-		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&swr);
-	if (swrArea < 0) {
-		delete_area(rxArea);
+	area_id area = audio_map("qcom adsp lpi pins", 0x33c0000, 0x20000, lpi);
+	if (area < 0)
 		return;
-	}
-	TRACE("audio: RX SoundWire controller version %#" B_PRIx32 "\n",
+	mmio_write(lpi, clockPin * 0x1000, 1u << 2);
+	mmio_write(lpi, firstDataPin * 0x1000, 2 | 1u << 2);
+	mmio_write(lpi, (firstDataPin + 1) * 0x1000, 2 | 1u << 2);
+	delete_area(area);
+}
+
+
+/*!	Starts a SoundWire bus controller ("qcom,soundwire-v1.6.0") as
+	qcom_swrm_init() does: 50 rows, 16 columns, auto enumeration, the bus
+	clock started. */
+static area_id
+swr_start(const char* label, phys_addr_t address, volatile uint8*& swr)
+{
+	area_id area = audio_map("qcom adsp soundwire", address, 0x2000, swr);
+	if (area < 0)
+		return area;
+	TRACE("audio: %s SoundWire controller version %#" B_PRIx32 "\n", label,
 		mmio_read(swr, 0x00));
 	// rows 50 (index 1), columns 16 (index 7) in bank 0
 	mmio_write(swr, 0x101c, 7 | 1u << 3);
@@ -1542,30 +1512,26 @@ audio_probe_registers()
 		if (!frames)
 			snooze(500);
 	}
-	TRACE("audio: RX SoundWire frames %s (status %#" B_PRIx32 ")\n",
+	TRACE("audio: %s SoundWire frames %s (status %#" B_PRIx32 ")\n", label,
 		frames ? "running" : "not running", mmio_read(swr, 0x14));
+	return area;
+}
 
-	// the codec out of reset
-	volatile uint8* tlmm;
-	area_id tlmmArea = map_physical_memory("qcom adsp wcd reset",
-		0xf100000 + 106 * 0x1000, B_PAGE_SIZE,
-		B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY,
-		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&tlmm);
-	if (tlmmArea >= 0) {
-		mmio_write(tlmm, 4, 0);
-		mmio_write(tlmm, 0, 1u << 9);		// GPIO, output, low: reset
-		snooze(20000);
-		mmio_write(tlmm, 4, 2);				// high: out of reset
-		delete_area(tlmmArea);
-	}
-	// the codec's RX device enumerates (the hardware enumerator gives it a
-	// device number); the pings report its status
+
+//!	Who is on a bus: the slave status, the enumerated IDs, their SCP state.
+static void
+swr_report(const char* label, volatile uint8* swr)
+{
+	// the hardware enumerator gives each device a number; the pings report
+	// its status
 	uint32 slaves = 0;
 	for (int i = 0; i < 20 && (slaves & ~3u) == 0; i++) {
 		snooze(50000);
 		slaves = mmio_read(swr, 0x1090);
 	}
-	TRACE("audio: RX SoundWire slave status %#" B_PRIx32 "\n", slaves);
+	TRACE("audio: %s SoundWire slave status %#" B_PRIx32 "\n", label, slaves);
+	mmio_write(swr, 0x308, 1);					// the command FIFO flushed
+	mmio_write(swr, 0x208, 0xffffffff);
 	for (uint32 m = 1; m < 4; m++) {
 		uint32 id1 = mmio_read(swr, 0x530 + 8 * m);
 		uint32 id2 = mmio_read(swr, 0x534 + 8 * m);
@@ -1575,21 +1541,13 @@ audio_probe_registers()
 		uint64 address = (id2 >> 8 & 0xff) | (id2 & 0xff) << 8
 			| (id1 >> 24 & 0xff) << 16 | (uint64)(id1 >> 16 & 0xff) << 24
 			| (uint64)(id1 >> 8 & 0xff) << 32 | (uint64)(id1 & 0xff) << 40;
-		TRACE("audio: RX SoundWire device %" B_PRIu32 ": version %u, unique ID"
-			" %u, manufacturer %#x, part %#x, class %#x\n", m,
+		TRACE("audio: %s SoundWire device %" B_PRIu32 ": version %u, unique "
+			"ID %u, manufacturer %#x, part %#x, class %#x\n", label, m,
 			(unsigned)(address >> 44 & 0xf), (unsigned)(address >> 40 & 0xf),
 			(unsigned)(address >> 24 & 0xffff), (unsigned)(address >> 8 & 0xffff),
 			(unsigned)(address & 0xff));
 
 		// its SCP registers over the command FIFO: status and DevId_0 to 5
-		TRACE("audio: RX SoundWire FIFO status %#" B_PRIx32 ", interrupts %#"
-			B_PRIx32 ", FIFO config %#" B_PRIx32 "\n", mmio_read(swr, 0x30c),
-			mmio_read(swr, 0x200), mmio_read(swr, 0x314));
-		mmio_write(swr, 0x308, 1);
-		mmio_write(swr, 0x208, 0xffffffff);
-		snooze(1000);
-		TRACE("audio: RX SoundWire flushed: FIFO status %#" B_PRIx32 "\n",
-			mmio_read(swr, 0x30c));
 		static const uint16 kRegisters[] = {0x44, 0x50, 0x51, 0x52, 0x53,
 			0x54, 0x55};
 		char line[96];
@@ -1599,11 +1557,132 @@ audio_probe_registers()
 			length += snprintf(line + length, sizeof(line) - length,
 				value < 0 ? " -" : " %02x", value);
 		}
-		TRACE("audio: RX SoundWire device %" B_PRIu32 " SCP stat, DevId:%s\n",
-			m, line);
+		TRACE("audio: %s SoundWire device %" B_PRIu32 " SCP stat, DevId:%s\n",
+			label, m, line);
 	}
-	delete_area(swrArea);
+}
+
+
+/*!	Lab: the two SoundWire buses the WCD9385 sits on, with their macros
+	clocked, and who answers on them. RX (soundwire@3210000, the RX macro's
+	SoundWire clock, LPI gpio3-5) carries the codec's RX device; TX
+	(soundwire@3330000, the TX macro's SoundWire clock with the VA macro's
+	frame sync, LPI gpio0-2) its TX device, which Linux reaches the codec's
+	own registers through. Then the codec out of reset (GPIO 106, active
+	low). Seen on the board: the RX device (sdw20217010d00, unique ID 4)
+	attaches as device 1 and its DevId registers read back. */
+static void
+audio_probe_registers()
+{
+	volatile uint8* rx;
+	area_id rxArea = audio_map("qcom adsp rx macro", 0x3200000, B_PAGE_SIZE,
+		rx);
+	volatile uint8* tx;
+	area_id txArea = audio_map("qcom adsp tx macro", 0x3220000, B_PAGE_SIZE,
+		tx);
+	volatile uint8* va;
+	area_id vaArea = audio_map("qcom adsp va macro", 0x3370000, B_PAGE_SIZE,
+		va);
+	if (rxArea < 0 || txArea < 0 || vaArea < 0) {
+		delete_area(rxArea);
+		delete_area(txArea);
+		delete_area(vaArea);
+		return;
+	}
+	// CDC_RX_TOP_DSD0/1_DEBUG_CFG0/1: 0x11, 0x20, 0x11, 0x20 after reset
+	TRACE("audio: RX macro DSD debug registers %#" B_PRIx32 " %#" B_PRIx32
+		" %#" B_PRIx32 " %#" B_PRIx32 " (0x11 0x20 0x11 0x20 when clocked)\n",
+		mmio_read(rx, 0x70), mmio_read(rx, 0x74), mmio_read(rx, 0x80),
+		mmio_read(rx, 0x84));
+	// RX: MCLK and MCLK2 on, the frame counter, the SoundWire clock after a
+	// reset (CDC_RX_CLK_RST_CTRL_MCLK/FS_CNT/SWR_CONTROL)
+	mmio_write(rx, 0x100, mmio_read(rx, 0x100) | 3);
+	mmio_write(rx, 0x104, mmio_read(rx, 0x104) & ~2u);
+	mmio_write(rx, 0x104, mmio_read(rx, 0x104) | 1);
+	mmio_write(rx, 0x108, mmio_read(rx, 0x108) | 2);
+	spin(100);
+	mmio_write(rx, 0x108, mmio_read(rx, 0x108) & ~2u);
+	mmio_write(rx, 0x108, mmio_read(rx, 0x108) | 1);
+	// VA: the frame sync generator (va_clk_rsc_fs_gen_request(): MCLK, the
+	// frame counter, its broadcast)
+	mmio_write(va, 0x00, mmio_read(va, 0x00) | 1);
+	mmio_write(va, 0x04, mmio_read(va, 0x04) | 1);
+	mmio_write(va, 0x80, mmio_read(va, 0x80) | 2);
+	// the VA macro drives the TX bus too (sm8450_va_data: has_swr_master):
+	// its SoundWire mic clocks undivided, its SoundWire clock in a reset
+	for (uint32 reg = 0xd0; reg <= 0xd8; reg += 4)
+		mmio_write(va, reg, (mmio_read(va, reg) & ~0xeeu) | 0xcc);
+	mmio_write(va, 0x08, mmio_read(va, 0x08) | 2);
+	mmio_write(va, 0x08, mmio_read(va, 0x08) | 1);
+	spin(100);
+	mmio_write(va, 0x08, mmio_read(va, 0x08) & ~2u);
+	// TX: tx_macro_mclk_enable(), then its SoundWire clock in a reset
+	// (LPASS_MACRO_FLAG_RESET_SWR)
+	mmio_write(tx, 0x90, mmio_read(tx, 0x90) | 1);
+	mmio_write(tx, 0x00, mmio_read(tx, 0x00) | 1);
+	mmio_write(tx, 0x04, mmio_read(tx, 0x04) | 1);
+	mmio_write(tx, 0x08, mmio_read(tx, 0x08) | 2);
+	mmio_write(tx, 0x08, mmio_read(tx, 0x08) | 1);
+	spin(100);
+	mmio_write(tx, 0x08, mmio_read(tx, 0x08) & ~2u);
+	TRACE("audio: TX macro MCLK %#" B_PRIx32 ", SoundWire clock %#" B_PRIx32
+		", VA MCLK %#" B_PRIx32 "\n", mmio_read(tx, 0x00), mmio_read(tx, 0x08),
+		mmio_read(va, 0x00));
+
+	audio_lpi_pins(3, 4);
+	audio_lpi_pins(0, 1);
+
+	// the TX bus' reset (lpasscc LPASS_AUDIO_SWR_TX_CGCR: 0xc010 bit 1)
+	volatile uint8* lpasscc;
+	area_id ccArea = audio_map("qcom adsp lpasscc", 0x33e0000, 0x12000,
+		lpasscc);
+	if (ccArea >= 0) {
+		mmio_write(lpasscc, 0xc010, mmio_read(lpasscc, 0xc010) | 2);
+		spin(10);
+		mmio_write(lpasscc, 0xc010, mmio_read(lpasscc, 0xc010) & ~2u);
+		delete_area(ccArea);
+	}
+
+	volatile uint8* rxBus = NULL;
+	volatile uint8* txBus = NULL;
+	area_id rxBusArea = swr_start("RX", 0x3210000, rxBus);
+	area_id txBusArea = swr_start("TX", 0x3330000, txBus);
+
+	// the codec out of reset
+	volatile uint8* tlmm;
+	area_id tlmmArea = audio_map("qcom adsp wcd reset",
+		0xf100000 + 106 * 0x1000, B_PAGE_SIZE, tlmm);
+	if (tlmmArea >= 0) {
+		mmio_write(tlmm, 4, 0);
+		mmio_write(tlmm, 0, 1u << 9);		// GPIO, output, low: reset
+		snooze(20000);
+		mmio_write(tlmm, 4, 2);				// high: out of reset
+		delete_area(tlmmArea);
+	}
+	if (rxBusArea >= 0)
+		swr_report("RX", rxBus);
+	if (txBusArea >= 0) {
+		swr_report("TX", txBus);
+		// the codec's own registers, through its TX device (wcd938x.h:
+		// WCD938X_DIGITAL_CHIP_ID0-3, EFUSE_REG_0 with the variant in bits
+		// 4:1)
+		static const uint16 kRegisters[] = {0x3401, 0x3402, 0x3403, 0x3404,
+			0x34b0, 0x3001};
+		char line[96];
+		size_t length = 0;
+		for (uint16 reg : kRegisters) {
+			int value = swr_read(txBus, 1, reg);
+			length += snprintf(line + length, sizeof(line) - length,
+				value < 0 ? " -" : " %02x", value);
+		}
+		TRACE("audio: WCD938x chip ID, efuse 0, bias:%s\n", line);
+	}
+
+	delete_area(rxBusArea);
+	delete_area(txBusArea);
 	delete_area(rxArea);
+	delete_area(txArea);
+	delete_area(vaArea);
 }
 
 
