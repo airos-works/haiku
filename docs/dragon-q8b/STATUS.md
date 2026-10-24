@@ -11,7 +11,7 @@ table set and a device tree; the kernel prefers the device tree.
 | Clock | the firmware's GetTime(), passed as `haiku,firmware-clock` | |
 | Ethernet (2 x 2.5GbE, TC9563 switch, QCA8081 PHYs) | both ports, 1 Gbit/s tested (the lab switch is gigabit), DHCP; 106 MB/s down, 73 MB/s up | `tc956x` driver; MACs from the board's I2C EEPROM |
 | Wi-Fi (Intel AX210) | joins WPA2 networks over 802.11ax, 38.6 MB/s on the LAN | `iaxwifi200` |
-| Bluetooth (AX210) | the controller comes up with Intel's firmware (ibt-0041-0041) over USB | `h2generic`; not yet paired with a device |
+| Bluetooth (AX210) | the controller comes up with Intel's firmware (ibt-0041-0041) over USB; the radio receives: `bt_le scan 15` lists 21 LE advertisers in range (-74 to -101 dBm), `bt_le inquiry` finds classic devices with their class | `h2generic`; not yet paired: no device of the lab's own was in pairing mode, and the ones in range belong to others |
 | USB | the three DWC3 controllers at USB 2 | SuperSpeed ports show Rx.Detect with `dwc3_superspeed true`; no USB 3 device tested yet |
 | CPUs | the firmware leaves both EPSS frequency domains at their top level (4 x 2438 MHz, 4 x 2995 MHz), each with a table of 21 levels | a cpufreq module that followed the scheduler's hints was tried: no difference at idle (9 W at the wall either way, the plug reads in watts) and none measurable under load, so the clocks stay where the firmware puts them |
 | Temperature | the hottest of the SoC's TSENS sensors, as /dev/power/qcom_thermal/0 (for AirTop and the like): 31 C idle, 45 C after 30 s of all eight cores busy; critical at 105 C (the device tree's trips) | `qcom_thermal` |
