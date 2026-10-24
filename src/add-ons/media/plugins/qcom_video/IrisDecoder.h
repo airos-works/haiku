@@ -13,7 +13,7 @@
 #include <OS.h>
 #include <String.h>
 
-#include "IrisDevice.h"
+#include "IrisSession.h"
 
 
 /*!	H.264 and HEVC on the SC8280XP's video codec (Iris, HFI generation 1),
@@ -27,7 +27,7 @@
 
 	Not thread safe; one thread feeds it and takes its pictures.
 */
-class IrisDecoder {
+class IrisDecoder : public IrisSession {
 public:
 	enum codec {
 		H264,
@@ -97,9 +97,6 @@ public:
 			bool				EndOfStreamSent() const
 									{ return fEndOfStream; }
 
-			const char*			Error() const { return fError.String(); }
-			const char*			FirmwareVersion() const
-									{ return fDevice.FirmwareVersion(); }
 			uint32				PicturesDecoded() const { return fDecoded; }
 			uint32				Width() const { return fWidth; }
 			uint32				Height() const { return fHeight; }
@@ -112,30 +109,12 @@ private:
 				bool		held;		// with the caller
 			};
 
-			status_t			_Fail(status_t status, const char* format,
-									...);
-
-			status_t			_Send(const uint32* packet);
-			status_t			_SetProperty(uint32 property,
-									const uint32* payload, uint32 words);
-			status_t			_SetProperty(uint32 property, uint32 a);
-			status_t			_SetProperty(uint32 property, uint32 a,
-									uint32 b);
-			status_t			_SetProperty(uint32 property, uint32 a,
-									uint32 b, uint32 c);
-			status_t			_Simple(uint32 command, uint32 answer);
-			status_t			_WaitFor(uint32 type, uint32* packet = NULL);
-			status_t			_Pump(bigtime_t timeout);
-			status_t			_Handle(const uint32* packet, size_t size);
+	virtual	status_t			_Handle(const uint32* packet, size_t size);
 			status_t			_HandleEvent(const uint32* packet,
 									size_t size);
 			status_t			_Service();
 
 			status_t			_ConfigurePorts(bool input);
-			status_t			_SetInternal(uint32 type,
-									IrisDevice::Buffer& buffer, size_t size);
-			status_t			_ReleaseInternal(uint32 type,
-									IrisDevice::Buffer& buffer);
 			status_t			_StartOutput();
 			status_t			_QueueOutput(int32 index);
 			status_t			_QueueReference(int32 index);
@@ -147,12 +126,6 @@ private:
 			size_t				_PersistSize() const;
 
 			codec				fCodec;
-			IrisDevice			fDevice;
-			BString				fError;
-			uint32				fSession;
-			bool				fOpen;
-			bool				fStarted;	// LOAD_RESOURCES and START done
-			bool				fFailed;
 
 			// the stream's geometry: as given, then as the firmware said
 			uint32				fWidth;

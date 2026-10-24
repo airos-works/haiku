@@ -18,6 +18,7 @@
 #include <generic_syscall_defs.h>
 #include <syscalls.h>
 
+#include "IrisVideoEncoder.h"
 #include "NvencEncoder.h"
 #include "VaapiEncoder.h"
 #include "VaapiLibrary.h"
@@ -51,6 +52,13 @@ nvenc_encoder_implements(video_codec codec)
 }
 
 
+bool
+iris_encoder_implements(video_codec codec)
+{
+	return IrisVideoEncoder::Implements(codec);
+}
+
+
 // #pragma mark - GpuDevice
 
 
@@ -76,6 +84,8 @@ GpuDevice::CanEncode(video_codec codec, int width, int height) const
 	if (backend == kBackendVAAPI && !vaapi_encoder_implements(codec))
 		return false;
 	if (backend == kBackendNVENC && !nvenc_encoder_implements(codec))
+		return false;
+	if (backend == kBackendIris && !iris_encoder_implements(codec))
 		return false;
 	return (format->maxWidth == 0 || width <= format->maxWidth)
 		&& (format->maxHeight == 0 || height <= format->maxHeight);
@@ -628,6 +638,34 @@ HardwareInventory::_AddTableDevice(uint16 vendor, uint16 deviceID)
 }
 
 
+/*!	The Qualcomm SC8280XP's video codec (Radxa Dragon Q8B), where the
+	qcom_iris driver publishes it: H.264 High and HEVC Main up to 4096x2304,
+	no B pictures.
+*/
+void
+HardwareInventory::_ProbeIris()
+{
+	if (!IrisVideoEncoder::IsAvailable())
+		return;
+	GpuDevice device;
+	device.id = "iris:/dev/video/qcom_iris/0";
+	device.name = "Qualcomm SC8280XP";
+	device.vendor = kVendorOther;
+	device.vendorID = 0;
+	device.deviceID = 0;
+	device.generation = "Snapdragon 8cx Gen 3";
+	device.engine = "Iris (VPU 2.0)";
+	device.backend = kBackendIris;
+	device.devicePath = "/dev/video/qcom_iris/0";
+	device.ready = true;
+	device.encode.push_back(GpuEncodeFormat{ kVideoH264, 4096, 2304, false });
+	device.encode.push_back(GpuEncodeFormat{ kVideoH265, 4096, 2304, false });
+	device.decode.push_back("H.264");
+	device.decode.push_back("H.265");
+	fDevices.push_back(device);
+}
+
+
 void
 HardwareInventory::Probe()
 {
@@ -635,6 +673,7 @@ HardwareInventory::Probe()
 	fDevices.clear();
 	_ProbeVaapi();
 	_ProbePci();
+	_ProbeIris();
 	// A test hook: an NVIDIA card with this PCI device ID, to try the NVENC
 	// paths with the stand-in add-on (nvenc/test/fake_nvenc.cpp).
 	if (const char* fake = getenv("MEDIACONVERTER_FAKE_NVIDIA"))
@@ -741,6 +780,8 @@ HardwareInventory::CreateEncoder(const GpuDevice& device)
 				device.name.String());
 		case kBackendNVENC:
 			return new(std::nothrow) NvencEncoder(device.name.String());
+		case kBackendIris:
+			return new(std::nothrow) IrisVideoEncoder(device.name.String());
 		default:
 			return NULL;
 	}

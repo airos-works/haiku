@@ -20,10 +20,20 @@ SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) tools cubie-a7s ] ;
 
 SimpleTest media_probe : media_probe.cpp : be media [ TargetLibsupc++ ] ;
 
+Application iris_encode :
+	iris_encode.cpp
+	IrisDecoder.cpp
+	IrisDevice.cpp
+	IrisEncoder.cpp
+	IrisSession.cpp
+	: be [ TargetLibsupc++ ] [ TargetLibstdc++ ]
+;
+
 Application iris_decode :
 	iris_decode.cpp
 	IrisDecoder.cpp
 	IrisDevice.cpp
+	IrisSession.cpp
 	: be [ TargetLibsupc++ ] [ TargetLibstdc++ ]
 ;
 
