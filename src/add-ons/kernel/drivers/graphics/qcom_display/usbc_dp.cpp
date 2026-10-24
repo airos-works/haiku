@@ -241,35 +241,51 @@ UsbcDisplayPort::_Map(area_id& area, volatile uint8*& base, const char* name,
 status_t
 UsbcDisplayPort::_PowerPhy()
 {
-	uint32 gdsc = rd(fGcc, fConnector.gdsc);
-	if ((gdsc & 1) != 0)
-		wr(fGcc, fConnector.gdsc, gdsc & ~1u);
-	if (!wait_bits(fGcc, fConnector.gdsc, 1u << 31, 1u << 31)) {
-		ERROR("%s: its PHY's GDSC does not come on\n", fConnector.name);
-		return B_ERROR;
-	}
-	for (uint32 branch : fConnector.phyBranches)
-		branch_on(fGcc, branch);
-	for (uint32 reset : fConnector.phyResets)
-		wr(fGcc, reset, rd(fGcc, reset) | 1);
-	spin(200);
-	for (uint32 reset : fConnector.phyResets)
-		wr(fGcc, reset, rd(fGcc, reset) & ~1u);
-	spin(200);
-
 	volatile uint8* com = fPhy + kPhyCom;
 	volatile uint8* serdes = fPhy + kPhyDpSerdes;
 	volatile uint8* dp = fPhy + kPhyDpPhy;
 
-	wr(com, COM_POWER_DOWN_CTRL, rd(com, COM_POWER_DOWN_CTRL) | 1);
-	wr(com, COM_RESET_OVRD_CTRL, rd(com, COM_RESET_OVRD_CTRL) | 0xf);
-	// software port select, the orientation; DisplayPort only with four
-	// lanes, USB 3 beside it with two
-	wr(com, COM_TYPEC_CTRL, 1u << 1 | (fReverse ? 1 : 0));
-	wr(com, COM_PHY_MODE_CTRL, fPhyLanes == 4 ? 2 : 3);
-	wr(com, COM_RESET_OVRD_CTRL, rd(com, COM_RESET_OVRD_CTRL) & ~0xfu);
-	wr(com, COM_SWI_CTRL, rd(com, COM_SWI_CTRL) & ~3u);
-	wr(com, COM_SW_RESET, rd(com, COM_SW_RESET) & ~1u);
+	// With two lanes USB 3 runs beside DisplayPort on the same PHY: if the
+	// firmware (or the USB side) has the common block up in USB 3 mode, in
+	// our orientation, it is left alone, as Linux' qmp_combo_com_init() runs
+	// once for both halves; resetting it drops the USB 3 link.
+	uint32 gdsc = rd(fGcc, fConnector.gdsc);
+	bool usbRunning = fPhyLanes == 2 && (gdsc & (1u << 31)) != 0
+		&& (rd(com, COM_PHY_MODE_CTRL) & 1) != 0
+		&& (rd(com, COM_SW_RESET) & 1) == 0
+		&& (rd(com, COM_TYPEC_CTRL) & 3) == (1u << 1 | (fReverse ? 1 : 0));
+	if (usbRunning) {
+		INFO("%s: USB 3 runs on the PHY: its common block kept\n",
+			fConnector.name);
+		wr(com, COM_PHY_MODE_CTRL, 3);
+	} else {
+		if ((gdsc & 1) != 0)
+			wr(fGcc, fConnector.gdsc, gdsc & ~1u);
+		if (!wait_bits(fGcc, fConnector.gdsc, 1u << 31, 1u << 31)) {
+			ERROR("%s: its PHY's GDSC does not come on\n", fConnector.name);
+			return B_ERROR;
+		}
+		for (uint32 branch : fConnector.phyBranches)
+			branch_on(fGcc, branch);
+		for (uint32 reset : fConnector.phyResets)
+			wr(fGcc, reset, rd(fGcc, reset) | 1);
+		spin(200);
+		for (uint32 reset : fConnector.phyResets)
+			wr(fGcc, reset, rd(fGcc, reset) & ~1u);
+		spin(200);
+
+		wr(com, COM_POWER_DOWN_CTRL, rd(com, COM_POWER_DOWN_CTRL) | 1);
+		wr(com, COM_RESET_OVRD_CTRL, rd(com, COM_RESET_OVRD_CTRL) | 0xf);
+		// software port select, the orientation; DisplayPort only with
+		// four lanes, USB 3 beside it with two
+		wr(com, COM_TYPEC_CTRL, 1u << 1 | (fReverse ? 1 : 0));
+		wr(com, COM_PHY_MODE_CTRL, fPhyLanes == 4 ? 2 : 3);
+		wr(com, COM_RESET_OVRD_CTRL, rd(com, COM_RESET_OVRD_CTRL) & ~0xfu);
+		wr(com, COM_SWI_CTRL, rd(com, COM_SWI_CTRL) & ~3u);
+		wr(com, COM_SW_RESET, rd(com, COM_SW_RESET) & ~1u);
+	}
+	for (uint32 branch : fConnector.phyBranches)
+		branch_on(fGcc, branch);
 
 	// the AUX block
 	wr(dp, DP_PHY_PD_CTL, 0x01 | 0x02 | 0x04 | 0x20 | 0x40);
