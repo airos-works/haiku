@@ -516,6 +516,8 @@ IrisDecoder::PutAccessUnit(const uint8* data, size_t size, int64 pts,
 		}
 		if (index >= 0)
 			break;
+		if (!fReady.empty())
+			return B_WOULD_BLOCK;
 		bigtime_t left = deadline - system_time();
 		if (left <= 0)
 			return B_WOULD_BLOCK;
@@ -693,6 +695,96 @@ IrisDecoder::CopyPlanes(const Picture& picture, uint8* target, uint32 stride,
 		for (uint32 x = 0; x < chromaWidth; x++) {
 			cbRow[x] = source[2 * x];
 			crRow[x] = source[2 * x + 1];
+		}
+	}
+}
+
+
+void
+IrisDecoder::CopyHalfPlanes(const Picture& picture, uint8* target,
+	uint32 stride) const
+{
+	uint32 width = picture.width / 2;
+	uint32 height = picture.height / 2;
+	const uint8* luma = picture.data + (size_t)picture.cropTop * picture.stride
+		+ picture.cropLeft;
+	for (uint32 y = 0; y < height; y++) {
+		const uint8* top = luma + (size_t)(2 * y) * picture.stride;
+		const uint8* bottom = top + picture.stride;
+		uint8* row = target + (size_t)y * stride;
+		for (uint32 x = 0; x < width; x++) {
+			row[x] = (uint8)(((uint32)top[2 * x] + top[2 * x + 1]
+				+ bottom[2 * x] + bottom[2 * x + 1] + 2) >> 2);
+		}
+	}
+
+	const uint8* chroma = picture.data
+		+ (size_t)picture.lumaRows * picture.stride
+		+ (size_t)(picture.cropTop / 2) * picture.stride
+		+ (picture.cropLeft & ~1u);
+	uint32 chromaStride = stride / 2;
+	uint8* cb = target + (size_t)height * stride;
+	uint8* cr = cb + (size_t)(height / 2) * chromaStride;
+	for (uint32 y = 0; y < height / 2; y++) {
+		const uint8* top = chroma + (size_t)(2 * y) * picture.stride;
+		const uint8* bottom = top + picture.stride;
+		uint8* cbRow = cb + (size_t)y * chromaStride;
+		uint8* crRow = cr + (size_t)y * chromaStride;
+		for (uint32 x = 0; x < width / 2; x++) {
+			cbRow[x] = (uint8)(((uint32)top[4 * x] + top[4 * x + 2]
+				+ bottom[4 * x] + bottom[4 * x + 2] + 2) >> 2);
+			crRow[x] = (uint8)(((uint32)top[4 * x + 1] + top[4 * x + 3]
+				+ bottom[4 * x + 1] + bottom[4 * x + 3] + 2) >> 2);
+		}
+	}
+}
+
+
+static inline uint8
+clamp_sample(int32 value)
+{
+	return value < 0 ? 0 : value > 255 ? 255 : (uint8)value;
+}
+
+
+void
+IrisDecoder::CopyPacked(const Picture& picture, uint8* target, uint32 stride,
+	color_space space) const
+{
+	// luma scale (255/219), then Cr to R, Cb to G, Cr to G, Cb to B with
+	// studio range chroma (255/224), all in 1/64 (as sunxi_cedar)
+	static const int16 kBt601[] = { 75, 102, 25, 52, 129 };
+	static const int16 kBt709[] = { 75, 115, 14, 34, 135 };
+	const int16* matrix = picture.height >= 720 ? kBt709 : kBt601;
+
+	const uint8* luma = picture.data + (size_t)picture.cropTop * picture.stride
+		+ picture.cropLeft;
+	const uint8* chroma = picture.data
+		+ (size_t)picture.lumaRows * picture.stride
+		+ (size_t)(picture.cropTop / 2) * picture.stride
+		+ (picture.cropLeft & ~1u);
+	for (uint32 y = 0; y < picture.height; y++) {
+		const uint8* lumaRow = luma + (size_t)y * picture.stride;
+		const uint8* chromaRow = chroma + (size_t)(y / 2) * picture.stride;
+		uint8* row = target + (size_t)y * stride;
+		if (space == B_YCbCr422) {
+			for (uint32 x = 0; x < picture.width / 2; x++) {
+				row[4 * x] = lumaRow[2 * x];
+				row[4 * x + 1] = chromaRow[2 * x];
+				row[4 * x + 2] = lumaRow[2 * x + 1];
+				row[4 * x + 3] = chromaRow[2 * x + 1];
+			}
+			continue;
+		}
+		for (uint32 x = 0; x < picture.width; x++) {
+			int32 value = ((int32)lumaRow[x] - 16) * matrix[0];
+			int32 cb = (int32)chromaRow[x & ~1u] - 128;
+			int32 cr = (int32)chromaRow[(x & ~1u) + 1] - 128;
+			row[4 * x + 2] = clamp_sample((value + matrix[1] * cr + 32) >> 6);
+			row[4 * x + 1] = clamp_sample((value - matrix[2] * cb
+				- matrix[3] * cr + 32) >> 6);
+			row[4 * x] = clamp_sample((value + matrix[4] * cb + 32) >> 6);
+			row[4 * x + 3] = 255;
 		}
 	}
 }

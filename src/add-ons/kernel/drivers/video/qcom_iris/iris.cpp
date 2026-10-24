@@ -1459,6 +1459,18 @@ init_driver()
 void
 uninit_driver()
 {
+	// unloaded (a new driver file): the firmware stops, so that the next
+	// load can start it again; the memory it used stays (the codec's
+	// address space may still name it)
+	if (sStartStatus == B_OK) {
+		qcom_pas_shutdown(IRIS_PAS_ID);
+		INFO("firmware stopped\n");
+	}
+	if (sInterruptInstalled) {
+		remove_io_interrupt_handler(kIrisInterrupt, iris_interrupt, NULL);
+		sInterruptInstalled = false;
+	}
+	sStartStatus = B_NO_INIT;
 }
 
 

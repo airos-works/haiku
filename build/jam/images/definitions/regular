@@ -253,6 +253,7 @@ SYSTEM_ADD_ONS_MEDIA_PLUGINS += [ FFilterByBuildFeatures
 	ape_reader@x86
 	ffmpeg@ffmpeg,!arm64
 	http_streamer
+	qcom_video@arm64
 	raw_decoder
 	rpi_hevc@arm64
 	rpi_mmal@arm64

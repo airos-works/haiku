@@ -9,6 +9,7 @@
 #include <deque>
 #include <vector>
 
+#include <GraphicsDefs.h>
 #include <OS.h>
 #include <String.h>
 
@@ -57,8 +58,8 @@ public:
 			void				Close();
 
 			/*!	One access unit, Annex B. B_WOULD_BLOCK when no input buffer
-				came free within \a timeout: the caller takes the pictures
-				that are ready, then tries again. */
+				came free within \a timeout, or pictures are ready while
+				none is: the caller takes those, then tries again. */
 			status_t			PutAccessUnit(const uint8* data, size_t size,
 									int64 pts, bigtime_t timeout = 1000000);
 			/*!	The end of the stream: the pictures the firmware still
@@ -83,6 +84,18 @@ public:
 			void				CopyPlanes(const Picture& picture,
 									uint8* target, uint32 stride,
 									bool interleaved) const;
+			/*!	As CopyPlanes() (I420), half as wide and high, each sample
+				the mean of a 2x2 block. The picture's width and height are
+				multiples of four. */
+			void				CopyHalfPlanes(const Picture& picture,
+									uint8* target, uint32 stride) const;
+			/*!	The picture as B_YCbCr422 (Y0 Cb Y1 Cr) or B_RGB32 (BT.601
+				below 720 rows, else BT.709; studio range). */
+			void				CopyPacked(const Picture& picture,
+									uint8* target, uint32 stride,
+									color_space space) const;
+			bool				EndOfStreamSent() const
+									{ return fEndOfStream; }
 
 			const char*			Error() const { return fError.String(); }
 			const char*			FirmwareVersion() const
