@@ -218,8 +218,10 @@ if $(TARGET_ARCH) = arm64 {
 		qcom_iris
 		;
 	# the SoC temperature, in the thermal drivers' format: from the Pi's
-	# firmware, from the Qualcomm SoCs' TSENS (Dragon Q8B)
+	# firmware, from the Qualcomm SoCs' TSENS (Dragon Q8B); the Qualcomm
+	# PMICs' power key, as acpi_button's power button
 	AddDriversToPackage power :
+		<driver>qcom_pwrkey
 		<driver>qcom_thermal
 		<driver>rpi_thermal
 		;

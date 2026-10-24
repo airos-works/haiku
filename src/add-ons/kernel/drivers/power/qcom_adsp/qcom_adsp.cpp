@@ -183,11 +183,75 @@ static const uint32 kQmpMessageLength = 64;
 static bool sQmpOpen;
 
 
+// IPCC (qcom-ipcc.c): the receive side; the signal of the ADSP's GLINK
+// doorbells (client 3, signal 0)
+enum {
+	kIpccSend = 0x0c, kIpccReceive = 0x10, kIpccEnable = 0x14,
+	kIpccDisable = 0x18, kIpccClear = 0x1c,
+};
+static const uint32 kIpccGlinkAdsp = 3u << 16 | 0;
+static uint32 sIpccVector;
+static bool sIpccHandler;
+static sem_id sGlinkSem = -1;
+
+
+static int32
+ipcc_interrupt(void*)
+{
+	bool handled = false, wake = false;
+	for (int i = 0; i < 32; i++) {
+		uint32 id = sIpcc.Read(kIpccReceive);
+		if (id == 0xffffffff)
+			break;
+		sIpcc.Write(kIpccClear, id);
+		handled = true;
+		wake |= id == kIpccGlinkAdsp;
+	}
+	if (wake && sGlinkSem >= 0) {
+		release_sem_etc(sGlinkSem, 1, B_DO_NOT_RESCHEDULE);
+		return B_INVOKE_SCHEDULER;
+	}
+	return handled ? B_HANDLED_INTERRUPT : B_UNHANDLED_INTERRUPT;
+}
+
+
+/*!	The ADSP's GLINK doorbells as an interrupt, so the GLINK thread sleeps
+	until there is something; without it, it polls. */
+static void
+ipcc_interrupt_start()
+{
+	int ipcc = fdt_compatible_node("qcom,ipcc");
+	int length;
+	const fdt32_t* interrupts = ipcc >= 0 ? (const fdt32_t*)fdt_getprop(gFDT,
+		ipcc, "interrupts", &length) : NULL;
+	if (interrupts == NULL || length < 12 || fdt32_to_cpu(interrupts[0]) != 0)
+		return;
+	// a GIC SPI
+	sIpccVector = fdt32_to_cpu(interrupts[1]) + 32;
+	if (install_io_interrupt_handler(sIpccVector, ipcc_interrupt, NULL, 0)
+			!= B_OK)
+		return;
+	sIpccHandler = true;
+	sIpcc.Write(kIpccEnable, kIpccGlinkAdsp);
+}
+
+
+static void
+ipcc_interrupt_stop()
+{
+	if (!sIpccHandler)
+		return;
+	sIpcc.Write(kIpccDisable, kIpccGlinkAdsp);
+	remove_io_interrupt_handler(sIpccVector, ipcc_interrupt, NULL);
+	sIpccHandler = false;
+}
+
+
 static void
 ipcc_signal(uint32 client, uint32 signal)
 {
 	// IPCC_REG_SEND_ID: the client in 31:16, the signal in 15:0
-	sIpcc.Write(0x0c, client << 16 | signal);
+	sIpcc.Write(kIpccSend, client << 16 | signal);
 }
 
 
@@ -1253,6 +1317,10 @@ boot_thread(void*)
 	sPmicGlink = glink_add_channel("PMIC_RTR_ADSP_APPS");
 	sPmicGlink->wanted = true;
 	sPmicGlink->hook = pmic_glink_receive;
+	sGlinkSem = create_sem(0, "qcom adsp glink");
+	if (sGlinkSem >= 0)
+		ipcc_interrupt_start();
+	TRACE("glink: %s\n", sIpccHandler ? "doorbell interrupt" : "polled");
 	if (glink_start() != B_OK) {
 		ERROR("glink: cannot start\n");
 		return B_OK;
@@ -1260,7 +1328,12 @@ boot_thread(void*)
 	while (!sQuit) {
 		glink_poll();
 		pmic_glink_tick();
-		snooze(10000);
+		// woken by the doorbell; now and then anyway, for the requests
+		// pmic_glink_tick() repeats
+		if (sIpccHandler)
+			acquire_sem_etc(sGlinkSem, 1, B_RELATIVE_TIMEOUT, 500000);
+		else
+			snooze(10000);
 	}
 	return B_OK;
 }
@@ -1358,11 +1431,17 @@ static void
 qcom_adsp_uninit_driver(void* cookie)
 {
 	sQuit = true;
+	if (sGlinkSem >= 0)
+		release_sem(sGlinkSem);
 	if (sBootThread >= 0) {
 		status_t result;
 		wait_for_thread(sBootThread, &result);
 		sBootThread = -1;
 	}
+	ipcc_interrupt_stop();
+	if (sGlinkSem >= 0)
+		delete_sem(sGlinkSem);
+	sGlinkSem = -1;
 	unmap_all();
 }
 
