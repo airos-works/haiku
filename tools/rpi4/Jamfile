@@ -34,6 +34,7 @@ SimpleTest rpi4_view_visibility : view_visibility.cpp : be [ TargetLibsupc++ ] ;
 SimpleTest rpi4_memory_move_probe : memory_move_probe.cpp : [ TargetLibstdc++ ] ;
 SimpleTest rpi4_memory_bench : memory_bench.cpp : [ TargetLibstdc++ ] ;
 SimpleTest rpi4_vm_bench : vm_bench.cpp ;
+SimpleTest rpi4_atomic_bench : atomic_bench.cpp : [ TargetLibstdc++ ] ;
 SimpleTest rpi4_cache_loop_probe : cache_loop_probe.cpp : [ TargetLibstdc++ ] ;
 SimpleTest rpi4_memory_set_probe : memory_set_probe.cpp : [ TargetLibstdc++ ] ;
 SimpleTest rpi4_string_compare_probe : string_compare_probe.cpp : [ TargetLibstdc++ ] ;

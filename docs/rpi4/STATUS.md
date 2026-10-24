@@ -384,3 +384,5 @@ The port still needs physical HDMI1 and audio verification, Bluetooth pairing
 and profiles, wider board/AP coverage, and Vulkan presentation. No result here
 claims those gaps are closed. See `DISPLAY.md`, `MEDIA.md`, `WIFI.md`,
 `BLUETOOTH.md`, `GPU.md`, and `PERFORMANCE.md` for implementation details.
+`CPU-TUNING.md` describes the opt-in Cortex-A72 build profile and the QEMU
+kernel add-on race that keeps it off by default.

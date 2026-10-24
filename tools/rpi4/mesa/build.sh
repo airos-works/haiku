@@ -44,12 +44,26 @@ cat > "$ROOT/cache-cross.ini" <<INI
 pkg_config_libdir = ['$ROOT/cache-pkgconfig', '$BASE/sysroot/boot/system/develop/lib/pkgconfig', '$BASE/sysroot/boot/system/lib/pkgconfig']
 INI
 
+# CPU tuning, like SetCPUProfile in build/jam/ArchitectureRules, e.g.
+# RPI4_MESA_CPU_FLAGS="-mtune=cortex-a72 -mno-outline-atomics" (inline atomics:
+# libgcc's outlined helpers never take their LSE path on Haiku, and the A72
+# has none). Generic code by default, see docs/rpi4/CPU-TUNING.md. This file's
+# arguments replace the base cross file's, so they repeat its sysroot.
+CPU_FLAGS=${RPI4_MESA_CPU_FLAGS:-}
+cpuArgs=$(printf "'%s', " "--sysroot=$BASE/sysroot" $CPU_FLAGS)
+cat > "$ROOT/cpu-cross.ini" <<INI
+[built-in options]
+c_args = [${cpuArgs%, }]
+cpp_args = [${cpuArgs%, }]
+INI
+
 CONFIGURE=${1:-}
 reconfigure=()
 [ ! -f "$ROOT/build/build.ninja" ] || reconfigure=(--reconfigure)
 meson setup "${reconfigure[@]}" "$ROOT/build" "$ROOT/mesa-25.3.6" \
         --cross-file="$BASE/haiku-aarch64.ini" \
-        --cross-file="$ROOT/cache-cross.ini" --prefix="$ROOT/install" \
+        --cross-file="$ROOT/cache-cross.ini" --cross-file="$ROOT/cpu-cross.ini" \
+        --prefix="$ROOT/install" \
         --libdir=lib --buildtype=debugoptimized --wrap-mode=nofallback \
         -Dplatforms=haiku -Dexpat=disabled -Dgallium-drivers=v3d,softpipe \
         -Dgallium-va=disabled '-Dvulkan-drivers=[]' -Dshader-cache=enabled \
@@ -68,7 +82,8 @@ meson setup "${reconfigure[@]}" "$ROOT/build" "$ROOT/mesa-25.3.6" \
 if [ "$CONFIGURE" = configure ] || [ ! -f "$ROOT/build-vk/build.ninja" ]; then
     rm -rf "$ROOT/build-vk"
     meson setup "$ROOT/build-vk" "$ROOT/mesa-25.3.6" \
-        --cross-file="$BASE/haiku-aarch64.ini" --prefix="$ROOT/install-vk" \
+        --cross-file="$BASE/haiku-aarch64.ini" --cross-file="$ROOT/cpu-cross.ini" \
+        --prefix="$ROOT/install-vk" \
         --libdir=lib --buildtype=debugoptimized --wrap-mode=nofallback \
         -Dplatforms=haiku -Dexpat=disabled '-Dgallium-drivers=[]' \
         -Dgallium-va=disabled -Dvulkan-drivers=broadcom \
