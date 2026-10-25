@@ -44,7 +44,7 @@ QcomSmmuDomain::~QcomSmmuDomain()
 
 /*!	As qcom_iris' smmu_attach(): a context bank no valid stream match entry
 	translates to and that is off, a table, the bank set up (CBAR: stage 1,
-	stage 2 bypass, write-back, VMID bank + 1; TCR: T0SZ 32; MAIR 0
+	stage 2 bypass, write-back, VMID bank + 1; TCR: T0SZ 31; MAIR 0
 	write-back, 1 non-cacheable) and switched on, then each stream's match
 	entry (its own, if it has one, else a free one) pointed at it.
 */
@@ -102,7 +102,9 @@ QcomSmmuDomain::Attach(const char* name, const uint32 (*streams)[2],
 	_Write(fPageSize + 4 * fBank, 1u << 16 | 0xfu << 12 | 3u << 8
 		| (fBank + 1));									// CBAR
 	_Write(cb + 0x10, 7u << 15 | 2);					// TCR2: 40-bit PA
-	_Write(cb + 0x30, 32 | 1u << 8 | 1u << 10 | 3u << 12 | 1u << 23);
+	// TCR: T0SZ 31 (8 GiB), table walks write-back, inner shareable, TTBR1
+	// off
+	_Write(cb + 0x30, 31 | 1u << 8 | 1u << 10 | 3u << 12 | 1u << 23);
 	_Write(cb + 0x20, (uint32)fLevel1Physical);		// TTBR0
 	_Write(cb + 0x24, (uint32)(fLevel1Physical >> 32));
 	_Write(cb + 0x38, 0xffu | 0x44u << 8 | 0x04u << 16);	// MAIR0
@@ -283,7 +285,7 @@ QcomSmmuDomain::_Table(phys_addr_t& physical)
 uint64*
 QcomSmmuDomain::_Level3(uint64 address, bool create)
 {
-	if (address >= (1ull << 32))
+	if (address >= kAddressSpace)
 		return NULL;
 	uint32 gigabyte = address >> 30;
 	uint32 block = address >> 21;

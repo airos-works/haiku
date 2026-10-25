@@ -62,23 +62,28 @@ data_hook(void* cookie, const qcom_gpr_packet* packet)
 
 /*!	The DSP reaches the buffers it is given as stream 0xc01 (the device
 	tree's q6apm "dais" node): a context bank of its own that maps only
-	them. They are given to it at an I/O address at the top of the low
-	4 GiB, where Linux' IOMMU allocator puts them (lab: "dsp_iova" sets
-	another; 0 for their physical address).
+	them. The address the DSP is given has bit 32 set, as Linux' (0x1fff80000
+	in a trace of Linux playing on this board): below 4 GiB the DSP takes
+	an address as physical and reads it on its own untranslated path, and
+	its audio process crashed on the first buffer. With bit 32, it reads
+	through the SMMU at the low 32 bits (lab: "dsp_iova" sets another
+	address; 0 for their physical address).
 */
 static status_t
 map_dsp_stream(AudioDevice* device)
 {
 	void* settings = load_driver_settings("qcom_audio");
 	device->buffersDsp = strtoull(get_driver_parameter(settings, "dsp_iova",
-		"0xfff00000", "0xfff00000"), NULL, 0);
+		"0x1fff00000", "0x1fff00000"), NULL, 0);
 	unload_driver_settings(settings);
 	if (device->buffersDsp == 0)
 		device->buffersDsp = device->buffersPhysical;
 	static const uint32 kStreams[][2] = {{0xc01, 0}};
 	status_t status = device->smmu.Attach("qcom_audio", kStreams, 1);
+	// bit 32 only selects the DSP's path through the SMMU: the address the
+	// SMMU sees is the low 32 bits (its fault said so)
 	if (status == B_OK) {
-		status = device->smmu.Map(device->buffersDsp,
+		status = device->smmu.Map(device->buffersDsp & 0xffffffff,
 			device->buffersPhysical,
 			ROUNDUP(kBufferCount * kBufferSize, B_PAGE_SIZE), false);
 	}
@@ -167,7 +172,7 @@ test_tone(AudioDevice* device)
 			"access_probe", false, true);
 		unload_driver_settings(probeSettings);
 		if (accessProbe) {
-			device->smmu.ClearAccessFlags(device->buffersDsp,
+			device->smmu.ClearAccessFlags(device->buffersDsp & 0xffffffff,
 				ROUNDUP(kBufferCount * kBufferSize, B_PAGE_SIZE));
 			TRACE("one buffer: the buffers' access flags cleared\n");
 		}
@@ -302,11 +307,10 @@ start_thread(void* cookie)
 static status_t
 start_up(AudioDevice* device)
 {
-	// lab only for now: the codec's bring-up hung the board now and then
-	// (docs/dragon-q8b/STATUS.md), so nothing runs without "enabled true"
+	// on unless the settings say "enabled false"
 	void* enableSettings = load_driver_settings("qcom_audio");
 	bool enabled = get_driver_boolean_parameter(enableSettings, "enabled",
-		false, true);
+		true, true);
 	unload_driver_settings(enableSettings);
 	if (!enabled)
 		return B_OK;
