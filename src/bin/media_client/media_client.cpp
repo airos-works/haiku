@@ -6,9 +6,11 @@
 #include <Application.h>
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "MediaPlay.h"
+#include "MediaRecord.h"
 #include "MediaTest.h"
 
 
@@ -16,6 +18,7 @@ void print_usage()
 {
 	printf("Usage:\n");
 	printf("  media_client play <uri>\n");
+	printf("  media_client record [seconds]\n");
 	printf("  media_client test\n");
 }
 
@@ -35,6 +38,9 @@ int main(int argc, char *argv[])
 			print_usage();
 		} else
 			ret = media_play(argv[2]);
+	} else if (strcmp(argv[1], "record") == 0) {
+		double seconds = argc >= 3 ? atof(argv[2]) : 3;
+		ret = media_record((bigtime_t)(seconds * 1000000));
 	} else if (strcmp(argv[1], "test") == 0)
 		media_test();
 	else
