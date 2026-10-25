@@ -3377,6 +3377,14 @@ XHCI::SetPortFeature(uint8 index, uint16 feature)
 		case PORT_RESET:
 			WriteOpReg(portRegister, portStatus | PS_PR);
 			break;
+		case PORT_BH_PORT_RESET:
+			// a warm reset, SuperSpeed ports only
+			if (fPortSpeeds[index] < USB_SPEED_SUPERSPEED
+				&& (portStatus & PS_PLS_MASK) != PS_XDEV_INACTIVE
+				&& (portStatus & PS_PLS_MASK) != PS_XDEV_COMP_MODE)
+				return B_BAD_VALUE;
+			WriteOpReg(portRegister, portStatus | PS_WPR);
+			break;
 		case PORT_POWER:
 			WriteOpReg(portRegister, portStatus | PS_PP);
 			break;
