@@ -35,6 +35,7 @@
 #include <vm/vm.h>
 
 #include <qcom_display.h>
+#include <qcom_dp_audio.h>
 #include <qcom_usbc_ports.h>
 
 #include "display_port.h"
@@ -862,6 +863,11 @@ release_layout(display_info* info)
 //	#pragma mark - device
 
 
+// the display the DisplayPort audio module (qcom_dp_audio.h) works on
+static mutex sAudioLock = MUTEX_INITIALIZER("qcom display audio");
+static display_info* sAudioDisplay;
+
+
 static status_t
 display_init_device(void* _info, void** _cookie)
 {
@@ -929,6 +935,10 @@ display_init_device(void* _info, void** _cookie)
 			resume_thread(info->hotPlugThread);
 	}
 
+	mutex_lock(&sAudioLock);
+	sAudioDisplay = info;
+	mutex_unlock(&sAudioLock);
+
 	*_cookie = info;
 	return B_OK;
 }
@@ -938,6 +948,13 @@ static void
 display_uninit_device(void* cookie)
 {
 	display_info* info = (display_info*)cookie;
+	mutex_lock(&sAudioLock);
+	if (sAudioDisplay == info) {
+		if (info->port != NULL)
+			info->port->StopAudio();
+		sAudioDisplay = NULL;
+	}
+	mutex_unlock(&sAudioLock);
 	uninit_retrace(info);
 	if (info->hotPlugThread >= 0) {
 		info->quit = true;
@@ -1221,6 +1238,57 @@ display_register_child_devices(void* cookie)
 }
 
 
+// #pragma mark - DisplayPort audio
+
+
+/*!	The audio DSP's DISPLAY_PORT_RX module feeds controller \a controller:
+	its audio engine on, if a sink is there on a trained link. Only the HDMI
+	bridge's controller so far: a USB-C hub's converter is kept in its DVI
+	output (dp_sink.h), which carries no audio.
+*/
+static status_t
+dp_audio_start(uint32 controller, uint32 channels)
+{
+	MutexLocker audioLocker(sAudioLock);
+	display_info* info = sAudioDisplay;
+	if (info == NULL)
+		return B_NO_INIT;
+	if (controller != QCOM_DP_AUDIO_HDMI)
+		return B_NOT_SUPPORTED;
+	MutexLocker locker(info->lock);
+	if (info->port == NULL || info->dpu == NULL)
+		return B_DEV_NOT_READY;
+	return info->port->StartAudio(channels);
+}
+
+
+static void
+dp_audio_stop(uint32 controller)
+{
+	MutexLocker audioLocker(sAudioLock);
+	display_info* info = sAudioDisplay;
+	if (info == NULL || controller != QCOM_DP_AUDIO_HDMI)
+		return;
+	MutexLocker locker(info->lock);
+	if (info->port != NULL)
+		info->port->StopAudio();
+}
+
+
+static status_t
+dp_audio_std_ops(int32 op, ...)
+{
+	return op == B_MODULE_INIT || op == B_MODULE_UNINIT ? B_OK : B_ERROR;
+}
+
+
+static qcom_dp_audio_module_info sDpAudioModule = {
+	{ QCOM_DP_AUDIO_MODULE_NAME, 0, dp_audio_std_ops },
+	dp_audio_start,
+	dp_audio_stop
+};
+
+
 module_dependency module_dependencies[] = {
 	{B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&sDeviceManager},
 	{}
@@ -1264,5 +1332,6 @@ static driver_module_info sDisplayDriver = {
 module_info* modules[] = {
 	(module_info*)&sDisplayDriver,
 	(module_info*)&sDisplayDevice,
+	(module_info*)&sDpAudioModule,
 	NULL
 };

@@ -58,6 +58,7 @@ static const uint32 kParamLoggingConfig = 0x08001031;
 static const uint32 kParamVolumeGain = 0x08001035;
 static const uint32 kParamCodecDmaInterface = 0x08001063;
 static const uint32 kParamPowerMode = 0x08001176;
+static const uint32 kParamDisplayPortInterface = 0x08001154;
 
 static const uint32 kMediaFormatPcm = 0x09001000;
 static const uint32 kFixedPoint = 1;
@@ -74,6 +75,7 @@ enum {
 	kVolume = 0x0700101b,
 	kCodecDmaSink = 0x07001023,
 	kCodecDmaSource = 0x07001024,
+	kDisplayPortSink = 0x07001069,
 };
 
 static const uint32 kReadBuffer = 0x0400100b;	// DATA_CMD_RD_SH_MEM_EP_DATA_BUFFER_V2
@@ -88,7 +90,7 @@ struct Module {
 	uint32	interleave;		// the PCM modules' layout
 	uint32	logCode;
 	uint32	hwType;			// the codec DMA's LPAIF type, index, data format
-	uint32	hwIndex;
+	uint32	hwIndex;		// (display port: the DisplayPort controller)
 	uint32	dataFormat;
 };
 
@@ -152,6 +154,29 @@ static const SubGraph kCaptureStream = { 0x4005, 2, 1, 2, 0x4005, 2, 0x2000,
 	4, 2, kCaptureStreamModules, B_COUNT_OF(kCaptureStreamModules) };
 
 
+/*	HDMI: MultiMedia4's stream (stream3) into the routing mixer of
+	DISPLAY_PORT_RX_2 (the DisplayPort controller of the board's HDMI
+	bridge), as the topology and Linux' trace of `speaker-test -D hw:0,3`
+	on this board have them; no clock of the PRM's. */
+static const Module kHdmiStreamModules[] = {
+	{ kWriteEndpoint, 0x6030, 0, 1, 0x6031, 0, 0, 0, 0, 0 },
+	{ kPcmDecoder, 0x6031, 1, 1, 0x6032, 1, 0, 0, 0, 0 },
+	{ kPcmConverter, 0x6032, 1, 1, 0x6033, 3, 0, 0, 0, 0 },
+	{ kVolume, 0x6033, 1, 1, 0x6034, 0, 0, 0, 0, 0 },
+	{ kMfc, 0x6034, 1, 1, 0x6035, 0, 0, 0, 0, 0 },
+	{ kLogger, 0x6035, 1, 1, 0, 0, 0x19af, 0, 0, 0 },
+};
+static const SubGraph kHdmiStream = { 0x4004, 2, 2, 1, 0x4004, 2, 0x2000, 1,
+	2, kHdmiStreamModules, B_COUNT_OF(kHdmiStreamModules) };
+
+static const Module kHdmiDeviceModules[] = {
+	{ kLogger, 0x6140, 1, 1, 0x6141, 0, 0x19ab, 0, 0, 0 },
+	{ kDisplayPortSink, 0x6141, 1, 0, 0, 0, 0, 0, 2, 1 },
+};
+static const SubGraph kHdmiDevice = { 0x4014, 2, 1, 1, 0x4014, 3, 0x2000, 1,
+	2, kHdmiDeviceModules, B_COUNT_OF(kHdmiDeviceModules) };
+
+
 /*!	A path: the device's and the stream's sub-graphs, the routing mixer's
 	connection between them (in the stream's graph for playback, the
 	device's for capture), the shared memory endpoint, the volume module. */
@@ -172,6 +197,10 @@ static const PathDescription kPaths[] = {
 	// capture: the device's logger into the stream's (in the stream's graph,
 	// opened when both modules are there)
 	{ &kCaptureDevice, &kCaptureStream, 0x6161, 0x6040, false, 0x6044, 0,
+		true },
+	// display port: the stream's logger into the device's; the stream
+	// started first, as Linux does it there
+	{ &kHdmiDevice, &kHdmiStream, 0x6035, 0x6140, false, 0x6030, 0x6033,
 		true },
 };
 
@@ -218,7 +247,7 @@ private:
 AudioPath::AudioPath(Dsp& dsp, Direction direction)
 	:
 	fDsp(dsp),
-	fPath(kPaths[direction == kCapture ? 1 : 0]),
+	fPath(kPaths[direction]),
 	fDirection(direction),
 	fSampleRate(48000),
 	fChannels(2),
@@ -274,7 +303,9 @@ AudioPath::Open(uint32 sampleRate, uint32 channels, uint32 bitsPerSample)
 	}
 	TRACE("AudioReach %s graph open: %" B_PRIu32 " Hz, %" B_PRIu32
 		" channels, %" B_PRIu32 " bit\n",
-		fDirection == kCapture ? "capture" : "playback", fSampleRate,
+		fDirection == kCapture ? "capture"
+			: fDirection == kDisplayPort ? "display port" : "playback",
+		fSampleRate,
 		fChannels, fBits);
 	return B_OK;
 }
@@ -649,6 +680,30 @@ AudioPath::_SetFormats(const SubGraph& subGraph)
 					kParamPowerMode);
 				payload.Add(0);
 				payload.Align8();
+				payload.EndParameter(sizeAt);
+				break;
+			case kDisplayPortSink:
+				// the format, the frame size factor, the interface: no
+				// channel allocation (two channels), no MST stream, the
+				// controller
+				sizeAt = payload.BeginParameter(module.instance,
+					kParamHwEndpointFormat);
+				payload.Add(fSampleRate);
+				payload.Add16(fBits, fChannels);
+				payload.Add(module.dataFormat);
+				payload.Align8();
+				payload.EndParameter(sizeAt);
+				sizeAt = payload.BeginParameter(module.instance,
+					kParamFrameSizeFactor);
+				payload.Add(1);
+				payload.Align8();
+				payload.EndParameter(sizeAt);
+				sizeAt = payload.BeginParameter(module.instance,
+					kParamDisplayPortInterface);
+				payload.Add(0);
+				payload.Add(0);
+				payload.Add(module.hwIndex);
+				payload.Add(0);
 				payload.EndParameter(sizeAt);
 				break;
 			default:
