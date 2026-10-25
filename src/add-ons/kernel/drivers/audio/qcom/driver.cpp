@@ -43,7 +43,7 @@ static void
 data_hook(void* cookie, const qcom_gpr_packet* packet)
 {
 	AudioDevice* device = (AudioDevice*)cookie;
-	if (packet->opcode == Playback::kWriteDone) {
+	if (packet->opcode == AudioPath::kWriteDone) {
 		cpu_status state = disable_interrupts();
 		acquire_spinlock(&device->streamLock);
 		device->lastPlayed = packet->token % kBufferCount;
@@ -53,6 +53,25 @@ data_hook(void* cookie, const qcom_gpr_packet* packet)
 		restore_interrupts(state);
 		atomic_add(&device->doneCount, 1);
 		release_sem_etc(device->doneSem, 1, B_DO_NOT_RESCHEDULE);
+		return;
+	}
+	if (packet->opcode == AudioPath::kReadDone) {
+		// data_cmd_rsp_rd_sh_mem_ep_data_buffer_done_v2: status, address,
+		// handle, the size filled
+		const uint32* words = (const uint32*)packet->payload;
+		uint32 size = packet->payload_size >= 20 ? words[4] : 0;
+		cpu_status state = disable_interrupts();
+		acquire_spinlock(&device->streamLock);
+		device->lastRecorded = packet->token % kRecordBufferCount;
+		device->lastRecordedSize = size;
+		if (size != 0) {
+			device->framesRecorded += kRecordBufferFrames;
+			device->recordedTime = system_time();
+		}
+		release_spinlock(&device->streamLock);
+		restore_interrupts(state);
+		atomic_add(&device->recordDoneCount, 1);
+		release_sem_etc(device->recordSem, 1, B_DO_NOT_RESCHEDULE);
 		return;
 	}
 	TRACE("data event %#" B_PRIx32 " (token %" B_PRIu32 ")\n", packet->opcode,
@@ -90,6 +109,122 @@ map_dsp_stream(AudioDevice* device)
 	TRACE("the DSP's buffers at %#" B_PRIx64 " (physical %#" B_PRIxPHYSADDR
 		")\n", device->buffersDsp, device->buffersPhysical);
 	return status;
+}
+
+
+/*!	The capture buffers: their own area, mapped for the DSP kRecordDspOffset
+	above the playback buffers (bit 32 set for the DSP, the low 32 bits in
+	our context bank), and their own shared memory region.
+*/
+static status_t
+open_capture(AudioDevice* device)
+{
+	size_t size = ROUNDUP(kRecordBufferCount * kRecordBufferSize, B_PAGE_SIZE);
+	device->recordArea = create_area("qcom audio record buffers",
+		(void**)&device->recordBuffers, B_ANY_KERNEL_ADDRESS, size,
+		B_CONTIGUOUS, B_READ_AREA | B_WRITE_AREA);
+	if (device->recordArea < 0)
+		return device->recordArea;
+	physical_entry entry;
+	get_memory_map(device->recordBuffers, B_PAGE_SIZE, &entry, 1);
+	device->recordPhysical = entry.address;
+	memset(device->recordBuffers, 0, size);
+	for (addr_t line = (addr_t)device->recordBuffers;
+			line < (addr_t)device->recordBuffers + size; line += 64)
+		asm volatile("dc civac, %0" : : "r" (line) : "memory");
+	memory_full_barrier();
+	device->recordDsp = device->buffersDsp + kRecordDspOffset;
+	status_t status = device->smmu.Map(device->recordDsp & 0xffffffff,
+		device->recordPhysical, size, false);
+	if (status == B_OK)
+		status = device->capture.Open(48000, 2, 16);
+	if (status == B_OK)
+		status = device->capture.MapMemory(device->recordDsp, size);
+	device->captureOpen = status == B_OK;
+	return status;
+}
+
+
+//!	A filled capture buffer as the DSP wrote it: out of our cache first.
+void
+qcom_audio::invalidate_record_buffer(AudioDevice* device, uint32 index)
+{
+	addr_t start = (addr_t)device->recordBuffers + index * kRecordBufferSize;
+	for (addr_t line = start; line < start + kRecordBufferSize; line += 64)
+		asm volatile("dc ivac, %0" : : "r" (line) : "memory");
+	memory_full_barrier();
+}
+
+
+/*!	Lab ("record_test" in the qcom_audio settings): two seconds from the
+	capture path; how many buffers came back, at what rate, and their level.
+*/
+static void
+record_test(AudioDevice* device)
+{
+	status_t status = device->codec.EnableHeadsetMic(48000);
+	if (status != B_OK)
+		TRACE("record test: headset microphone: %s\n", strerror(status));
+	while (acquire_sem_etc(device->recordSem, 1, B_RELATIVE_TIMEOUT, 0)
+			== B_OK)
+		;
+	device->recordDoneCount = 0;
+	// as Linux: the stream started, the buffers queued, then the device
+	status = device->capture.Start(false);
+	for (uint32 i = 0; status == B_OK && i < kRecordBufferCount; i++) {
+		device->capture.Read(device->recordDsp + i * kRecordBufferSize,
+			kRecordBufferSize, i);
+	}
+	if (status == B_OK)
+		status = device->capture.StartDevice();
+	TRACE("record test: capture start: %s\n", strerror(status));
+	if (status != B_OK) {
+		device->capture.Stop();
+		device->codec.DisableHeadsetMic();
+		return;
+	}
+	bigtime_t start = system_time();
+	int32 peak[2] = {}, minimum[2] = {};
+	uint64 energy[2] = {};
+	uint64 samples = 0;
+	uint32 firstSize = 0;
+	while (system_time() - start < 2000000) {
+		if (acquire_sem_etc(device->recordSem, 1, B_RELATIVE_TIMEOUT, 500000)
+				!= B_OK) {
+			TRACE("record test: no buffer filled for 0.5 s (%" B_PRId32
+				" done)\n", device->recordDoneCount);
+			device->smmu.Faults("record test");
+			break;
+		}
+		int32 index = device->lastRecorded;
+		if (firstSize == 0)
+			firstSize = device->lastRecordedSize;
+		invalidate_record_buffer(device, index);
+		const int16* frames = (const int16*)(device->recordBuffers
+			+ index * kRecordBufferSize);
+		for (uint32 i = 0; i < kRecordBufferSize / 2; i++) {
+			int32 value = frames[i];
+			uint32 channel = i & 1;
+			peak[channel] = max_c(peak[channel], value);
+			minimum[channel] = min_c(minimum[channel], value);
+			energy[channel] += (uint64)(value * value);
+		}
+		samples += kRecordBufferSize / 4;
+		device->capture.Read(device->recordDsp + index * kRecordBufferSize,
+			kRecordBufferSize, index);
+	}
+	bigtime_t elapsed = system_time() - start;
+	int32 done = device->recordDoneCount;
+	device->capture.Stop();
+	device->codec.DisableHeadsetMic();
+	TRACE("record test: %" B_PRId32 " buffers (the first %" B_PRIu32 " bytes) in %"
+		B_PRId64 " us: %" B_PRId64 " frames a second; left %" B_PRId32 "..%"
+		B_PRId32 " mean square %" B_PRIu64 ", right %" B_PRId32 "..%" B_PRId32
+		" mean square %" B_PRIu64 "\n", done, firstSize,
+		elapsed, elapsed > 0 ? (int64)done * (kRecordBufferSize / 4) * 1000000
+			/ elapsed : 0, minimum[0], peak[0],
+		samples > 0 ? energy[0] / samples : 0, minimum[1], peak[1],
+		samples > 0 ? energy[1] / samples : 0);
 }
 
 
@@ -331,12 +466,17 @@ start_up(AudioDevice* device)
 		TRACE("codec: %s\n", strerror(status));
 		return status;
 	}
+	// lab ("record_only"): no playback graph open while capturing
+	void* labSettings = load_driver_settings("qcom_audio");
+	bool recordOnly = get_driver_boolean_parameter(labSettings, "record_only",
+		false, true);
+	unload_driver_settings(labSettings);
 	status = allocate_buffers(device);
 	if (status == B_OK)
 		status = map_dsp_stream(device);
-	if (status == B_OK)
+	if (status == B_OK && !recordOnly)
 		status = device->playback.Open(48000, 2, 16);
-	if (status == B_OK) {
+	if (status == B_OK && !recordOnly) {
 		status = device->playback.MapMemory(device->buffersDsp,
 			kBufferCount * kBufferSize);
 	}
@@ -349,9 +489,17 @@ start_up(AudioDevice* device)
 	void* settings = load_driver_settings("qcom_audio");
 	bool tone = get_driver_boolean_parameter(settings, "test_tone", false,
 		true);
+	bool record = get_driver_boolean_parameter(settings, "record_test", false,
+		true);
 	unload_driver_settings(settings);
+	// the headset input, for multi_audio and the lab test
+	status = open_capture(device);
+	if (status != B_OK)
+		TRACE("capture: %s\n", strerror(status));
 	if (tone)
 		test_tone(device);
+	if (record && device->captureOpen)
+		record_test(device);
 	return B_OK;
 }
 
@@ -408,6 +556,17 @@ qcom_audio_init_driver(device_node* node, void** _cookie)
 	B_INITIALIZE_SPINLOCK(&device->streamLock);
 	mutex_init(&device->lock, "qcom audio");
 	device->doneSem = create_sem(0, "qcom audio buffer done");
+	device->recordArea = -1;
+	device->recordBuffers = NULL;
+	device->recordSem = create_sem(0, "qcom audio buffer filled");
+	device->recordDoneCount = 0;
+	device->lastRecorded = -1;
+	device->lastRecordedSize = 0;
+	device->captureOpen = false;
+	device->capturing = false;
+	device->recordToRefill = -1;
+	device->framesRecorded = 0;
+	device->recordedTime = 0;
 	status_t status = device->dsp.Init(data_hook, device);
 	if (status != B_OK) {
 		TRACE("no GPR (qcom_adsp): %s\n", strerror(status));
@@ -431,13 +590,17 @@ qcom_audio_uninit_driver(void* cookie)
 		status_t result;
 		wait_for_thread(device->startThread, &result);
 	}
+	device->capture.Close();
 	device->playback.Close();
 	device->codec.PowerDown();
 	device->dsp.Uninit();
 	device->smmu.Detach();
 	if (device->bufferArea >= 0)
 		delete_area(device->bufferArea);
+	if (device->recordArea >= 0)
+		delete_area(device->recordArea);
 	delete_sem(device->doneSem);
+	delete_sem(device->recordSem);
 	mutex_destroy(&device->lock);
 	delete device;
 }

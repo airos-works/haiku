@@ -131,17 +131,17 @@ Dsp::Command(uint32 destination, uint32 opcode, const void* payload,
 status_t
 Dsp::DataCommand(uint32 destination, uint32 opcode, const void* payload,
 	uint32 size, uint32 responseOpcode, void* response,
-	uint32* _responseSize)
+	uint32* _responseSize, int32 token)
 {
 	return _Command(kDataPort, destination, opcode, payload, size,
-		responseOpcode, response, _responseSize, 1000000);
+		responseOpcode, response, _responseSize, 1000000, token);
 }
 
 
 status_t
 Dsp::_Command(uint32 sourcePort, uint32 destination, uint32 opcode,
 	const void* payload, uint32 size, uint32 responseOpcode, void* response,
-	uint32* _responseSize, bigtime_t timeout)
+	uint32* _responseSize, bigtime_t timeout, int32 token)
 {
 	if (fGpr == NULL)
 		return B_NO_INIT;
@@ -149,7 +149,9 @@ Dsp::_Command(uint32 sourcePort, uint32 destination, uint32 opcode,
 
 	cpu_status state = disable_interrupts();
 	acquire_spinlock(&fStateLock);
-	uint32 token = ++fToken;
+	if (token < 0)
+		token = ++fToken & 0x7fffffff;
+	fToken = token;
 	fOpcode = opcode;
 	fResponseOpcode = responseOpcode;
 	fPending = true;

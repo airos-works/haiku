@@ -6,9 +6,11 @@
 
 #include "codec.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include <KernelExport.h>
+#include <driver_settings.h>
 
 #include "dsp.h"
 
@@ -959,6 +961,142 @@ Codec::_ResetCodec()
 	snooze(20000);
 	write32(gpio, 4, 2);
 	delete_area(area);
+}
+
+
+}	// namespace qcom_audio
+
+
+namespace qcom_audio {
+
+
+/*	The TX macro as Linux has it while recording from the headset input
+	(regmap of 3220000.txmacro during arecord on this board, the UCM's TX DEC0
+	MUX SWR_MIC, TX SMIC MUX0 ADC1, TX_AIF1_CAP Mixer DEC0, TX_DEC0 Volume
+	110): its MCLK, frame sync counter and SoundWire clock; the MCLK
+	frequency, the I2S and SoundWire microphone controls; decimator 0's
+	input (SWR_MIC, ADC1), its path configuration and volume; its path last
+	(enabled, 48 kHz). Where its reset values differ from the defaults
+	Linux' regcache_sync() writes once the MCLK is on (SWR_CTRL, the
+	SoundWire analog microphone controls, decimator 0's SEC0), Linux'. */
+static const struct { uint16 offset; uint8 value; } kTxMacroMic[] = {
+	{0x000, 0x01}, {0x004, 0x01}, {0x008, 0x01}, {0x090, 0x01},
+	{0x088, 0x00}, {0x0d0, 0x00}, {0x0d4, 0x00}, {0x410, 0x00},
+	{0x0a4, 0x0c}, {0x0c0, 0x0e}, {0x0c4, 0x0e}, {0x0c8, 0x0e},
+	{0x0cc, 0x0e}, {0x100, 0x02}, {0x104, 0x01}, {0x404, 0x10},
+	{0x408, 0x0b}, {0x40c, 0x1a}, {0x418, 0x01}, {0x41c, 0x3c},
+	{0x420, 0x20}, {0x42c, 0x0a}, {0x400, 0x24},
+};
+
+
+// the WCD9385's TX device's port on the TX bus (the device tree's
+// qcom,ports-* of soundwire@3330000: port 1, sample interval 1, offset 1,
+// lane 0; wcd938x_sdw_ch_info: ADC2 is its second channel)
+static const SoundWirePort kTxPorts[] = {
+	{ 0x01, 0x01, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff },
+};
+static const uint8 kHeadsetMicChannels[] = { 0x2 };
+
+/*	The WCD938x's TX side as Linux sets it up (its registers while recording
+	that differ from ours, but the headphone path's, status and interrupts):
+	TX channel 2 (ADC2), the headset detection (MBHC: its mechanism, button
+	thresholds, plug detection, the microphone bias it gates), the
+	microphone bias test controls, the TX reference and front end currents,
+	the TX analog clocks, the request and DMIC controls and the TX request
+	feedback. */
+static const struct { uint16 reg; uint8 value; } kWcdTxInit[] = {
+	{0x3014, 0x8d}, {0x301a, 0x18}, {0x301b, 0x30}, {0x301c, 0x48},
+	{0x301d, 0xa0}, {0x301e, 0xa0}, {0x301f, 0xa0}, {0x3020, 0xa0},
+	{0x3021, 0xa0}, {0x306b, 0xfa}, {0x306e, 0xfa}, {0x3071, 0xfa},
+	{0x3074, 0xfa}, {0x3081, 0x0a}, {0x3089, 0x0a}, {0x308f, 0xfa},
+	{0x3120, 0x82}, {0x3121, 0x06}, {0x3122, 0xe6}, {0x3124, 0x03},
+	{0x31b1, 0x08}, {0x31dd, 0xd5}, {0x31de, 0xca}, {0x31df, 0x08},
+	{0x31e1, 0x14}, {0x3417, 0x1f}, {0x3457, 0x02}, {0x345b, 0x06},
+	{0x34d0, 0x55}, {0x34d1, 0x44}, {0x34d2, 0x11}, {0x34d3, 0x00},
+	{0x34d4, 0x00}, {0x300f, 0x0a},
+};
+
+/*	The WCD938x registers Linux changes when recording starts from the
+	headset input (idle against recording, the same boot): the microphone
+	bias, the TX channel, the analog and digital clocks, the ADC power. */
+static const struct { uint16 reg; uint8 value; } kWcdHeadsetMic[] = {
+	{0x3408, 0x18}, {0x3409, 0xf0}, {0x3410, 0x30}, {0x3015, 0x89},
+	{0x3023, 0x50},
+};
+
+
+status_t
+Codec::EnableHeadsetMic(uint32 sampleRate)
+{
+	if (!fPowered)
+		return B_NO_INIT;
+	for (const auto& setting : kWcdTxInit)
+		Write(setting.reg, setting.value);
+	for (const auto& setting : kWcdHeadsetMic) {
+		int before = Read(setting.reg);
+		Write(setting.reg, setting.value);
+		TRACE("WCD938x %#x: %#x -> %#x\n", setting.reg, before, Read(setting.reg));
+	}
+	status_t portStatus = fTxBus.SetPorts(fTxDevice, kTxPorts,
+		kHeadsetMicChannels, B_COUNT_OF(kTxPorts), true);
+	if (portStatus != B_OK)
+		TRACE("TX SoundWire: ports: %s\n", strerror(portStatus));
+	char changed[256] = "";
+	size_t length = 0;
+	for (const auto& setting : kTxMacroMic) {
+		uint32 value = read32(fTx, setting.offset);
+		if (value != setting.value && length + 16 < sizeof(changed)) {
+			length += snprintf(changed + length, sizeof(changed) - length,
+				" %03x:%" B_PRIx32 ">%x", setting.offset, value, setting.value);
+		}
+		write32(fTx, setting.offset, setting.value);
+	}
+	TRACE("TX macro: decimator 0 from the SoundWire microphone on, set:%s\n",
+		changed);
+	// lab ("dump_macros"): the TX and VA macros' registers, as Linux'
+	// regmap prints them, to compare
+	void* settings = load_driver_settings("qcom_audio");
+	bool dump = get_driver_boolean_parameter(settings, "dump_macros", false,
+		true);
+	unload_driver_settings(settings);
+	if (dump) {
+		volatile uint8* macros[2] = {fTx, fVa};
+		const char* names[2] = {"tx", "va"};
+		for (int m = 0; m < 2; m++) {
+			for (uint32 offset = 0; offset < 0x800; offset += 0x40) {
+				char line[200];
+				size_t at = 0;
+				for (uint32 i = 0; i < 0x40; i += 4) {
+					at += snprintf(line + at, sizeof(line) - at, " %" B_PRIx32,
+						read32(macros[m], offset + i));
+				}
+				TRACE("dump %s %03" B_PRIx32 ":%s\n", names[m], offset, line);
+			}
+		}
+		// the WCD938x's registers (through its TX device)
+		for (uint32 reg = 0x3000; reg < 0x3500; reg += 16) {
+			char line[100];
+			size_t at = 0;
+			for (uint32 i = 0; i < 16; i++)
+				at += snprintf(line + at, sizeof(line) - at, " %x", Read(reg + i));
+			TRACE("dump wcd %04" B_PRIx32 ":%s\n", reg, line);
+		}
+	}
+	return B_OK;
+}
+
+
+void
+Codec::DisableHeadsetMic()
+{
+	if (fTx == NULL)
+		return;
+	fTxBus.SetPorts(fTxDevice, kTxPorts, kHeadsetMicChannels,
+		B_COUNT_OF(kTxPorts), false);
+	// decimator 0's path off, its input disconnected
+	write32(fTx, 0x400, 0x04);
+	write32(fTx, 0x100, 0);
+	write32(fTx, 0x104, 0);
 }
 
 
