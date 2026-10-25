@@ -288,6 +288,18 @@ Hub::Explore(change_item **changeList)
 		if ((fPortStatus[i].status & PORT_STATUS_CONNECTION) == 0)
 			fEnumerationFailures[i] = 0;
 
+		// A warm reset leaves the device on the port in its default state,
+		// without its address: it is enumerated again (as after Linux'
+		// hub_port_reset()).
+		if ((fPortStatus[i].change & PORT_CHANGE_BH_PORT_RESET) != 0
+			&& (fPortStatus[i].status & PORT_STATUS_CONNECTION) != 0
+			&& fChildren[i] != NULL) {
+			TRACE_ALWAYS("port %" B_PRId32 ": enumerating the device again "
+				"after its warm reset\n", i);
+			fChildren[i]->Changed(changeList, false);
+			fChildren[i] = NULL;
+		}
+
 		if ((fPortStatus[i].change & PORT_STATUS_CONNECTION)
 				|| ((fPortStatus[i].status & PORT_STATUS_CONNECTION)
 					&& fChildren[i] == NULL)) {
