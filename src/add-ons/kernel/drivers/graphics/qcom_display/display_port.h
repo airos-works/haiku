@@ -57,7 +57,16 @@ public:
 									bool wideBus);
 			status_t			StartStream();
 
+			// the audio the DSP's DISPLAY_PORT_RX module feeds the
+			// controller with: its secondary data packets, the audio clock
+			// recovery and the audio engine on (again after a mode set)
+			status_t			StartAudio(uint32 channels);
+			void				StopAudio();
+			bool				AudioRunning() const
+									{ return fAudioChannels != 0; }
+
 private:
+			void				_SetUpAudio();
 			uint32				_Read(uint32 offset) const
 									{ return *(volatile uint32*)(fBase
 										+ offset); }
@@ -75,6 +84,7 @@ private:
 			area_id				fClockArea;
 			volatile uint8*		fClocks;	// the pixel RCG's page of dispcc
 			uint32				fLinkRate;
+			uint32				fAudioChannels;		// 0: off
 };
 
 

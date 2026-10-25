@@ -7,7 +7,10 @@
 	card node ("qcom,sc8280xp-sndcard"), played through the audio DSP's
 	AudioReach graphs (the board's topology, linux-firmware's
 	SC8280XP-Radxa-Dragon-Q8B-tplg.bin) to the WCD9385's headphone output.
-	The DSP is run by qcom_adsp; its packets go through qcom_gpr.
+	The DSP is run by qcom_adsp; its packets go through qcom_gpr. A second
+	device plays to HDMI: the DSP's DISPLAY_PORT_RX into the DisplayPort
+	controller of the board's HDMI bridge, whose audio engine qcom_display
+	turns on.
 */
 
 
@@ -31,6 +34,7 @@
 #define QCOM_AUDIO_DRIVER_NAME "drivers/audio/hmulti/qcom_audio/driver_v1"
 #define QCOM_AUDIO_DEVICE_NAME "drivers/audio/hmulti/qcom_audio/device_v1"
 #define QCOM_AUDIO_DEVICE_PATH "audio/hmulti/qcom/1"
+#define QCOM_AUDIO_HDMI_DEVICE_PATH "audio/hmulti/qcom/2"
 
 
 using namespace qcom_audio;
@@ -44,15 +48,17 @@ data_hook(void* cookie, const qcom_gpr_packet* packet)
 {
 	AudioDevice* device = (AudioDevice*)cookie;
 	if (packet->opcode == AudioPath::kWriteDone) {
+		Output* output = (packet->token & kHdmiToken) != 0
+			? &device->hdmi : &device->headphones;
 		cpu_status state = disable_interrupts();
 		acquire_spinlock(&device->streamLock);
-		device->lastPlayed = packet->token % kBufferCount;
-		device->framesPlayed += kBufferFrames;
-		device->playedTime = system_time();
+		output->lastPlayed = (packet->token & 0xff) % kBufferCount;
+		output->framesPlayed += kBufferFrames;
+		output->playedTime = system_time();
 		release_spinlock(&device->streamLock);
 		restore_interrupts(state);
-		atomic_add(&device->doneCount, 1);
-		release_sem_etc(device->doneSem, 1, B_DO_NOT_RESCHEDULE);
+		atomic_add(&output->doneCount, 1);
+		release_sem_etc(output->doneSem, 1, B_DO_NOT_RESCHEDULE);
 		return;
 	}
 	if (packet->opcode == AudioPath::kReadDone) {
@@ -86,28 +92,51 @@ data_hook(void* cookie, const qcom_gpr_packet* packet)
 	an address as physical and reads it on its own untranslated path, and
 	its audio process crashed on the first buffer. With bit 32, it reads
 	through the SMMU at the low 32 bits (lab: "dsp_iova" sets another
-	address; 0 for their physical address).
+	address; 0 for the headphones' buffers' physical address).
 */
 static status_t
-map_dsp_stream(AudioDevice* device)
+attach_dsp_stream(AudioDevice* device)
 {
 	void* settings = load_driver_settings("qcom_audio");
-	device->buffersDsp = strtoull(get_driver_parameter(settings, "dsp_iova",
+	device->dspBase = strtoull(get_driver_parameter(settings, "dsp_iova",
 		"0x1fff00000", "0x1fff00000"), NULL, 0);
 	unload_driver_settings(settings);
-	if (device->buffersDsp == 0)
-		device->buffersDsp = device->buffersPhysical;
 	static const uint32 kStreams[][2] = {{0xc01, 0}};
-	status_t status = device->smmu.Attach("qcom_audio", kStreams, 1);
+	return device->smmu.Attach("qcom_audio", kStreams, 1);
+}
+
+
+/*!	An output's buffers, mapped for the DSP its dspOffset above the others'
+	base, and its graph opened with them as its shared memory (\a openGraph).
+*/
+static status_t
+open_output(Output* output, bool openGraph)
+{
+	AudioDevice* device = output->device;
+	size_t size = ROUNDUP(kBufferCount * kBufferSize, B_PAGE_SIZE);
+	output->bufferArea = create_area("qcom audio buffers",
+		(void**)&output->buffers, B_ANY_KERNEL_ADDRESS, size, B_CONTIGUOUS,
+		B_READ_AREA | B_WRITE_AREA);
+	if (output->bufferArea < 0)
+		return output->bufferArea;
+	physical_entry entry;
+	get_memory_map(output->buffers, B_PAGE_SIZE, &entry, 1);
+	output->buffersPhysical = entry.address;
+	memset(output->buffers, 0, kBufferCount * kBufferSize);
+	output->buffersDsp = device->dspBase != 0
+		? device->dspBase + output->dspOffset : output->buffersPhysical;
 	// bit 32 only selects the DSP's path through the SMMU: the address the
 	// SMMU sees is the low 32 bits (its fault said so)
-	if (status == B_OK) {
-		status = device->smmu.Map(device->buffersDsp & 0xffffffff,
-			device->buffersPhysical,
-			ROUNDUP(kBufferCount * kBufferSize, B_PAGE_SIZE), false);
-	}
-	TRACE("the DSP's buffers at %#" B_PRIx64 " (physical %#" B_PRIxPHYSADDR
-		")\n", device->buffersDsp, device->buffersPhysical);
+	status_t status = device->smmu.Map(output->buffersDsp & 0xffffffff,
+		output->buffersPhysical, size, false);
+	TRACE("the DSP's %s buffers at %#" B_PRIx64 " (physical %#"
+		B_PRIxPHYSADDR ")\n", output->name, output->buffersDsp,
+		output->buffersPhysical);
+	if (status == B_OK && openGraph)
+		status = output->path.Open(48000, 2, 16);
+	if (status == B_OK && openGraph)
+		status = output->path.MapMemory(output->buffersDsp, size);
+	output->open = status == B_OK && openGraph;
 	return status;
 }
 
@@ -133,7 +162,7 @@ open_capture(AudioDevice* device)
 			line < (addr_t)device->recordBuffers + size; line += 64)
 		asm volatile("dc civac, %0" : : "r" (line) : "memory");
 	memory_full_barrier();
-	device->recordDsp = device->buffersDsp + kRecordDspOffset;
+	device->recordDsp = device->dspBase + kRecordDspOffset;
 	status_t status = device->smmu.Map(device->recordDsp & 0xffffffff,
 		device->recordPhysical, size, false);
 	if (status == B_OK)
@@ -228,49 +257,68 @@ record_test(AudioDevice* device)
 }
 
 
-static status_t
-allocate_buffers(AudioDevice* device)
-{
-	device->bufferArea = create_area("qcom audio buffers",
-		(void**)&device->buffers, B_ANY_KERNEL_ADDRESS,
-		ROUNDUP(kBufferCount * kBufferSize, B_PAGE_SIZE), B_CONTIGUOUS,
-		B_READ_AREA | B_WRITE_AREA);
-	if (device->bufferArea < 0)
-		return device->bufferArea;
-	physical_entry entry;
-	get_memory_map(device->buffers, B_PAGE_SIZE, &entry, 1);
-	device->buffersPhysical = entry.address;
-	memset(device->buffers, 0, kBufferCount * kBufferSize);
-	return B_OK;
-}
-
-
 //!	The DSP reads the buffers from memory: our lines of them cleaned first.
 void
-qcom_audio::clean_buffer(AudioDevice* device, uint32 index)
+qcom_audio::clean_buffer(Output* output, uint32 index)
 {
-	addr_t start = (addr_t)device->buffers + index * kBufferSize;
+	addr_t start = (addr_t)output->buffers + index * kBufferSize;
 	for (addr_t line = start; line < start + kBufferSize; line += 64)
 		asm volatile("dc cvac, %0" : : "r" (line) : "memory");
 	memory_full_barrier();
 }
 
 
+/*!	What an output needs beside its graph: the headphones the RX macro's
+	path (it takes the codec DMA's samples before the graph runs, as DAPM
+	powers it before the trigger in Linux) and the codec's ports and
+	amplifiers; HDMI the DisplayPort controller's audio engine, which the
+	display driver turns on when the bridge has a link.
+*/
+status_t
+qcom_audio::output_power_up(Output* output)
+{
+	AudioDevice* device = output->device;
+	if (output == &device->hdmi) {
+		if (device->dpAudio == NULL)
+			return B_DEV_NOT_READY;
+		return device->dpAudio->start(QCOM_DP_AUDIO_HDMI, 2);
+	}
+	device->codec.EnableHeadphonePath(48000);
+	return device->codec.EnableHeadphones(kHeadphoneGain);
+}
+
+
+void
+qcom_audio::output_power_down(Output* output)
+{
+	AudioDevice* device = output->device;
+	if (output == &device->hdmi) {
+		if (device->dpAudio != NULL)
+			device->dpAudio->stop(QCOM_DP_AUDIO_HDMI);
+		return;
+	}
+	device->codec.DisableHeadphones();
+	device->codec.DisableHeadphonePath();
+}
+
+
 /*!	Lab ("test_tone" in the qcom_audio settings): a 750 Hz tone for two
 	seconds through the graph; how many buffers the DSP played in that time
-	says whether it plays at 48 kHz.
+	says whether it plays at 48 kHz. On the headphones, or HDMI with
+	"test_tone_hdmi".
 */
 static void
-test_tone(AudioDevice* device)
+test_tone(Output* output)
 {
+	AudioDevice* device = output->device;
 	// a 750 Hz square wave at a quarter of full scale: 64 frames a period
 	for (uint32 index = 0; index < kBufferCount; index++) {
-		int16* samples = (int16*)(device->buffers + index * kBufferSize);
+		int16* samples = (int16*)(output->buffers + index * kBufferSize);
 		for (uint32 frame = 0; frame < kBufferFrames; frame++) {
 			int16 value = (frame & 32) != 0 ? 8192 : -8192;
 			samples[frame * 2] = samples[frame * 2 + 1] = value;
 		}
-		clean_buffer(device, index);
+		clean_buffer(output, index);
 	}
 	void* settings = load_driver_settings("qcom_audio");
 	bool startOnly = get_driver_boolean_parameter(settings, "start_only",
@@ -283,19 +331,22 @@ test_tone(AudioDevice* device)
 	TRACE("test tone: starting the graph%s at %" B_PRId64 " ms\n",
 		startOnly ? " (no buffers)" : "", system_time() / 1000);
 	device->smmu.Faults("before the graph");
-	// the RX macro takes the codec DMA's samples before the graph runs, as
-	// DAPM powers its path before the trigger in Linux
-	device->codec.EnableHeadphonePath(48000);
-	// the codec's ports and amplifiers, at -9 dB
-	device->codec.EnableHeadphones(6);
-	snooze(100000);
-	status_t status = device->playback.Start(startDevice);
-	TRACE("test tone: graph start: %s\n", strerror(status));
-	if (status != B_OK)
+	status_t status = output_power_up(output);
+	if (status != B_OK) {
+		TRACE("test tone: %s: %s\n", output->name, strerror(status));
 		return;
+	}
+	snooze(100000);
+	status = output->path.Start(startDevice);
+	TRACE("test tone: graph start: %s\n", strerror(status));
+	if (status != B_OK) {
+		output_power_down(output);
+		return;
+	}
 	if (startOnly) {
 		snooze(2000000);
-		device->playback.Stop();
+		output->path.Stop();
+		output_power_down(output);
 		TRACE("test tone: stopped\n");
 		return;
 	}
@@ -307,7 +358,7 @@ test_tone(AudioDevice* device)
 			"access_probe", false, true);
 		unload_driver_settings(probeSettings);
 		if (accessProbe) {
-			device->smmu.ClearAccessFlags(device->buffersDsp & 0xffffffff,
+			device->smmu.ClearAccessFlags(output->buffersDsp & 0xffffffff,
 				ROUNDUP(kBufferCount * kBufferSize, B_PAGE_SIZE));
 			TRACE("one buffer: the buffers' access flags cleared\n");
 		}
@@ -324,7 +375,7 @@ test_tone(AudioDevice* device)
 				" FAR %#" B_PRIx32 "%08" B_PRIx32 "\n", cb4[0], cb4[0x58 / 4],
 				cb4[0x64 / 4], cb4[0x60 / 4]);
 		}
-		device->playback.Write(device->buffersDsp, kBufferSize, 0);
+		output->path.Write(output->buffersDsp, kBufferSize, output->token);
 		uint32 loopState = device->dsp.State(NULL, 0);
 		TRACE("one buffer: DSP state %#" B_PRIx32 " before\n", loopState);
 		for (int i = 0; i < 300; i++) {
@@ -338,10 +389,10 @@ test_tone(AudioDevice* device)
 			}
 			uint32 bank4 = cb4Area >= 0 ? cb4[0x58 / 4] & ~0x600u : 0;
 			if (device->smmu.Faults("one buffer") != 0 || bank4 != 0
-				|| device->doneCount > 0 || i == 299) {
+				|| output->doneCount > 0 || i == 299) {
 				TRACE("one buffer after %d ms: %" B_PRId32 " done; bank 4 FSR %#"
 					B_PRIx32 " FAR %#" B_PRIx32 "%08" B_PRIx32 " FSYNR0 %#"
-					B_PRIx32 "\n", i, device->doneCount,
+					B_PRIx32 "\n", i, output->doneCount,
 					cb4Area >= 0 ? cb4[0x58 / 4] : 0,
 					cb4Area >= 0 ? cb4[0x64 / 4] : 0,
 					cb4Area >= 0 ? cb4[0x60 / 4] : 0,
@@ -362,39 +413,41 @@ test_tone(AudioDevice* device)
 			if (state != lastState || i % 10 == 0) {
 				TRACE("one buffer: alive %d on CPU %" B_PRId32 ", %" B_PRId32
 					" done, DSP state %#" B_PRIx32 "%s%s\n", i,
-					smp_get_current_cpu(), device->doneCount, state,
+					smp_get_current_cpu(), output->doneCount, state,
 					(state & 1) != 0 ? ", crashed: " : "",
 					(state & 1) != 0 ? reason : "");
 				lastState = state;
 			}
 		}
-		device->playback.Stop();
-		TRACE("test tone: stopped, %" B_PRId32 " done\n", device->doneCount);
+		output->path.Stop();
+		output_power_down(output);
+		TRACE("test tone: stopped, %" B_PRId32 " done\n", output->doneCount);
 		return;
 	}
 	bigtime_t start = system_time();
 	int32 written = 0;
 	for (; written < (int32)kBufferCount; written++) {
-		device->playback.Write(device->buffersDsp
-			+ (written % kBufferCount) * kBufferSize, kBufferSize, written);
+		output->path.Write(output->buffersDsp
+			+ (written % kBufferCount) * kBufferSize, kBufferSize,
+			output->token | (written % kBufferCount));
 	}
 	while (system_time() - start < 2000000) {
-		if (acquire_sem_etc(device->doneSem, 1, B_RELATIVE_TIMEOUT, 500000)
+		if (acquire_sem_etc(output->doneSem, 1, B_RELATIVE_TIMEOUT, 500000)
 				!= B_OK) {
 			TRACE("test tone: no buffer done for 0.5 s (%" B_PRId32 " done)\n",
-				device->doneCount);
+				output->doneCount);
 			device->smmu.Faults("test tone");
 			break;
 		}
-		device->playback.Write(device->buffersDsp
-			+ (written % kBufferCount) * kBufferSize, kBufferSize, written);
+		output->path.Write(output->buffersDsp
+			+ (written % kBufferCount) * kBufferSize, kBufferSize,
+			output->token | (written % kBufferCount));
 		written++;
 	}
 	bigtime_t elapsed = system_time() - start;
-	int32 done = device->doneCount;
-	device->playback.Stop();
-	device->codec.DisableHeadphones();
-	device->codec.DisableHeadphonePath();
+	int32 done = output->doneCount;
+	output->path.Stop();
+	output_power_down(output);
 	TRACE("test tone: %" B_PRId32 " buffers of %" B_PRIu32 " frames played in %"
 		B_PRId64 " us: %" B_PRId64 " frames a second\n", done, kBufferFrames,
 		elapsed, elapsed > 0 ? (int64)done * kBufferFrames * 1000000 / elapsed
@@ -471,24 +524,31 @@ start_up(AudioDevice* device)
 	bool recordOnly = get_driver_boolean_parameter(labSettings, "record_only",
 		false, true);
 	unload_driver_settings(labSettings);
-	status = allocate_buffers(device);
+	status = attach_dsp_stream(device);
 	if (status == B_OK)
-		status = map_dsp_stream(device);
-	if (status == B_OK && !recordOnly)
-		status = device->playback.Open(48000, 2, 16);
-	if (status == B_OK && !recordOnly) {
-		status = device->playback.MapMemory(device->buffersDsp,
-			kBufferCount * kBufferSize);
-	}
+		status = open_output(&device->headphones, !recordOnly);
 	if (status != B_OK) {
 		TRACE("playback: %s\n", strerror(status));
 		return status;
+	}
+
+	// HDMI: the display driver turns the DisplayPort's audio on
+	if (get_module(QCOM_DP_AUDIO_MODULE_NAME,
+			(module_info**)&device->dpAudio) != B_OK) {
+		device->dpAudio = NULL;
+	}
+	if (device->dpAudio != NULL && !recordOnly) {
+		status = open_output(&device->hdmi, true);
+		if (status != B_OK)
+			TRACE("HDMI: %s\n", strerror(status));
 	}
 	device->ready = true;
 
 	void* settings = load_driver_settings("qcom_audio");
 	bool tone = get_driver_boolean_parameter(settings, "test_tone", false,
 		true);
+	bool hdmiTone = get_driver_boolean_parameter(settings, "test_tone_hdmi",
+		false, true);
 	bool record = get_driver_boolean_parameter(settings, "record_test", false,
 		true);
 	unload_driver_settings(settings);
@@ -497,7 +557,9 @@ start_up(AudioDevice* device)
 	if (status != B_OK)
 		TRACE("capture: %s\n", strerror(status));
 	if (tone)
-		test_tone(device);
+		test_tone(&device->headphones);
+	if (hdmiTone && device->hdmi.open)
+		test_tone(&device->hdmi);
 	if (record && device->captureOpen)
 		record_test(device);
 	return B_OK;
@@ -545,17 +607,12 @@ qcom_audio_init_driver(device_node* node, void** _cookie)
 	device->node = node;
 	device->ready = false;
 	device->startDone = false;
-	device->bufferArea = -1;
-	device->buffers = NULL;
-	device->doneCount = 0;
-	device->openCount = 0;
-	device->running = false;
-	device->lastPlayed = device->toRefill = -1;
-	device->framesPlayed = 0;
-	device->playedTime = 0;
+	device->dspBase = 0;
+	device->dpAudio = NULL;
 	B_INITIALIZE_SPINLOCK(&device->streamLock);
 	mutex_init(&device->lock, "qcom audio");
-	device->doneSem = create_sem(0, "qcom audio buffer done");
+	device->headphones.doneSem = create_sem(0, "qcom audio buffer done");
+	device->hdmi.doneSem = create_sem(0, "qcom audio HDMI buffer done");
 	device->recordArea = -1;
 	device->recordBuffers = NULL;
 	device->recordSem = create_sem(0, "qcom audio buffer filled");
@@ -591,15 +648,21 @@ qcom_audio_uninit_driver(void* cookie)
 		wait_for_thread(device->startThread, &result);
 	}
 	device->capture.Close();
-	device->playback.Close();
+	device->hdmi.path.Close();
+	device->headphones.path.Close();
+	if (device->dpAudio != NULL)
+		put_module(QCOM_DP_AUDIO_MODULE_NAME);
 	device->codec.PowerDown();
 	device->dsp.Uninit();
 	device->smmu.Detach();
-	if (device->bufferArea >= 0)
-		delete_area(device->bufferArea);
+	Output* outputs[] = { &device->headphones, &device->hdmi };
+	for (Output* output : outputs) {
+		if (output->bufferArea >= 0)
+			delete_area(output->bufferArea);
+		delete_sem(output->doneSem);
+	}
 	if (device->recordArea >= 0)
 		delete_area(device->recordArea);
-	delete_sem(device->doneSem);
 	delete_sem(device->recordSem);
 	mutex_destroy(&device->lock);
 	delete device;
@@ -610,8 +673,13 @@ static status_t
 qcom_audio_register_child_devices(void* cookie)
 {
 	AudioDevice* device = (AudioDevice*)cookie;
-	return sDeviceManager->publish_device(device->node, QCOM_AUDIO_DEVICE_PATH,
-		QCOM_AUDIO_DEVICE_NAME);
+	status_t status = sDeviceManager->publish_device(device->node,
+		QCOM_AUDIO_DEVICE_PATH, QCOM_AUDIO_DEVICE_NAME);
+	if (status == B_OK) {
+		status = sDeviceManager->publish_device(device->node,
+			QCOM_AUDIO_HDMI_DEVICE_PATH, QCOM_AUDIO_DEVICE_NAME);
+	}
+	return status;
 }
 
 
@@ -632,8 +700,9 @@ qcom_audio_uninit_device(void*)
 }
 
 
+//!	The output a published device is: the headphones (1) or HDMI (2).
 static status_t
-qcom_audio_open(void* deviceCookie, const char*, int, void** _cookie)
+qcom_audio_open(void* deviceCookie, const char* path, int, void** _cookie)
 {
 	AudioDevice* device = (AudioDevice*)deviceCookie;
 	// the DSP and the codec come up a while after boot
@@ -642,11 +711,16 @@ qcom_audio_open(void* deviceCookie, const char*, int, void** _cookie)
 			return B_DEV_NOT_READY;
 		snooze(100000);
 	}
-	if (atomic_add(&device->openCount, 1) != 0) {
-		atomic_add(&device->openCount, -1);
+	Output* output = path != NULL
+			&& strcmp(path, QCOM_AUDIO_HDMI_DEVICE_PATH) == 0
+		? &device->hdmi : &device->headphones;
+	if (!output->open)
+		return B_DEV_NOT_READY;
+	if (atomic_add(&output->openCount, 1) != 0) {
+		atomic_add(&output->openCount, -1);
 		return B_BUSY;
 	}
-	*_cookie = device;
+	*_cookie = output;
 	return B_OK;
 }
 
@@ -654,9 +728,9 @@ qcom_audio_open(void* deviceCookie, const char*, int, void** _cookie)
 static status_t
 qcom_audio_close(void* cookie)
 {
-	AudioDevice* device = (AudioDevice*)cookie;
-	MutexLocker locker(device->lock);
-	multi_audio_stop(device);
+	Output* output = (Output*)cookie;
+	MutexLocker locker(output->device->lock);
+	multi_audio_stop(output);
 	return B_OK;
 }
 
@@ -664,7 +738,7 @@ qcom_audio_close(void* cookie)
 static status_t
 qcom_audio_free(void* cookie)
 {
-	atomic_add(&((AudioDevice*)cookie)->openCount, -1);
+	atomic_add(&((Output*)cookie)->openCount, -1);
 	return B_OK;
 }
 
@@ -688,8 +762,7 @@ qcom_audio_write(void*, off_t, const void*, size_t* _length)
 static status_t
 qcom_audio_control(void* cookie, uint32 operation, void* buffer, size_t length)
 {
-	return multi_audio_control((AudioDevice*)cookie, operation, buffer,
-		length);
+	return multi_audio_control((Output*)cookie, operation, buffer, length);
 }
 
 

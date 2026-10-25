@@ -23,13 +23,16 @@ struct SubGraph;
 	joined to the device's (a logger, MFC, the codec DMA sink); capture: the
 	device's (the codec DMA source, a logger) joined to the stream's (a
 	logger, MFC, the PCM converter and encoder, a shared memory read
-	endpoint); both as the board's topology describes them. Opened, given
+	endpoint); both as the board's topology describes them. Display port:
+	playback into the DSP's DISPLAY_PORT_RX module, which feeds the HDMI
+	bridge's DisplayPort controller (the display driver turns its audio
+	engine on, qcom_dp_audio.h). Opened, given
 	their media format, prepared and started; then handed buffers from one
 	shared memory region, each answered once it is played or filled.
 */
 class AudioPath {
 public:
-			enum Direction { kPlayback, kCapture };
+			enum Direction { kPlayback, kCapture, kDisplayPort };
 
 								AudioPath(Dsp& dsp, Direction direction);
 								~AudioPath();

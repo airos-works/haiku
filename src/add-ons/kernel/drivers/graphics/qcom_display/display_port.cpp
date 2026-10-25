@@ -104,11 +104,31 @@ enum {
 	REG_DP_VALID_BOUNDARY		= kLink + 0x030,
 	REG_DP_VALID_BOUNDARY_2		= kLink + 0x034,
 	REG_DP_MAINLINK_READY		= kLink + 0x040,
+	REG_DP_MAINLINK_LEVELS		= kLink + 0x044,
 	REG_DP_TU					= kLink + 0x04c,
+	MMSS_DP_AUDIO_CFG			= kLink + 0x200,
+	MMSS_DP_AUDIO_ACR_CTRL		= kLink + 0x210,
+	MMSS_DP_SDP_CFG				= kLink + 0x228,
+	MMSS_DP_SDP_CFG2			= kLink + 0x22c,
+	MMSS_DP_AUDIO_TIMESTAMP_0	= kLink + 0x230,
+	MMSS_DP_AUDIO_STREAM_0		= kLink + 0x240,
+	MMSS_DP_AUDIO_COPYMANAGEMENT_0 = kLink + 0x278,
+	MMSS_DP_AUDIO_ISRC_0		= kLink + 0x290,
+	MMSS_DP_AUDIO_INFOFRAME_0	= kLink + 0x2a8,
 };
 static const uint32 kStateSendVideo = 1u << 7;
 static const uint32 kStatePushIdle = 1u << 8;
 static const uint32 kMainlinkReadyForVideo = 1u << 0;
+static const uint32 kAudioEngineEnable = 1u << 0;
+// MMSS_DP_SDP_CFG: the audio time stamp, stream, copy management, ISRC and
+// InfoFrame packets sent
+static const uint32 kAudioSdps = 1u << 1 | 1u << 2 | 1u << 5 | 1u << 6
+	| 1u << 20;
+// MMSS_DP_SDP_CFG2: the InfoFrame's and the stream's HB3 from the hardware,
+// not the registers
+static const uint32 kSdpHeadersFromRegisters = 3u << 0;
+// MMSS_DP_AUDIO_ACR_CTRL: on, with the link rate's divider (select, bits 4-5)
+static const uint32 kAcrEnable = 1u << 31 | 1u << 14 | 1u << 8;
 
 // DPCD
 static const uint32 kDpcdLinkBandwidthSet = 0x100;
@@ -173,6 +193,37 @@ best_fraction(uint64 value, uint64 over, uint64 max, uint64* _numerator,
 }
 
 
+/*!	The parity byte of an SDP header byte: the DisplayPort RS(15,13) code
+	over its two nibbles in GF(16) (x^4 + x + 1), as msm's
+	dp_utils_calculate_parity() works it out for one byte.
+*/
+static uint8
+sdp_parity(uint8 data)
+{
+	auto times2 = [](uint8 c) {
+		return (uint8)(((c << 1) & 0xf) ^ ((c & 0x8) != 0 ? 0x3 : 0));
+	};
+	uint8 x0 = 0, x1 = 0;
+	for (int i = 0; i < 2; i++) {
+		uint8 c = ((data >> (i * 4)) & 0xf) ^ x1;
+		x1 = x0 ^ times2(c) ^ c;
+		x0 = times2(c);
+	}
+	return x1 | x0 << 4;
+}
+
+
+//!	An SDP's header bytes 1-3 (HB0 is 0) with their parity, in its two
+//!	registers.
+static void
+sdp_header(uint32* words, uint8 hb1, uint8 hb2, uint8 hb3)
+{
+	words[0] = (uint32)hb1 << 16 | (uint32)sdp_parity(hb1) << 24;
+	words[1] = hb2 | (uint32)sdp_parity(hb2) << 8 | (uint32)hb3 << 16
+		| (uint32)sdp_parity(hb3) << 24;
+}
+
+
 DisplayPort::DisplayPort(uint32 index)
 	:
 	fIndex(index),
@@ -180,7 +231,8 @@ DisplayPort::DisplayPort(uint32 index)
 	fBase(NULL),
 	fClockArea(-1),
 	fClocks(NULL),
-	fLinkRate(0)
+	fLinkRate(0),
+	fAudioChannels(0)
 {
 }
 
@@ -457,7 +509,90 @@ DisplayPort::StartStream()
 			"sink %#x\n", fIndex, status[0], status[2], status[3], status[4],
 			status[5]);
 	}
+	if (fAudioChannels != 0)
+		_SetUpAudio();
 	return B_OK;
+}
+
+
+/*!	Audio on the link, as msm's msm_dp_audio_hw_params() sets it up: the
+	five audio SDPs' headers (DP 1.2 2.2.5.3: the stream's HB3 its channel
+	count, the others version 0x11), the audio clock recovery for the link
+	rate, the "safe to exit" level of the main link for its lane count, and
+	the audio engine. The DSP's DISPLAY_PORT_RX module then feeds it.
+*/
+status_t
+DisplayPort::StartAudio(uint32 channels)
+{
+	if (fBase == NULL)
+		return B_NO_INIT;
+	if (channels == 0 || channels > 8)
+		return B_BAD_VALUE;
+	if (!HotPlug() || LinkRate() == 0)
+		return B_DEV_NOT_READY;
+	fAudioChannels = channels;
+	_SetUpAudio();
+	INFO("DP %" B_PRIu32 ": audio on, %" B_PRIu32 " channels (SDP %#" B_PRIx32
+		", ACR %#" B_PRIx32 ", levels %#" B_PRIx32 ")\n", fIndex, channels,
+		_Read(MMSS_DP_SDP_CFG), _Read(MMSS_DP_AUDIO_ACR_CTRL),
+		_Read(REG_DP_MAINLINK_LEVELS));
+	return B_OK;
+}
+
+
+void
+DisplayPort::StopAudio()
+{
+	if (fBase == NULL || fAudioChannels == 0)
+		return;
+	fAudioChannels = 0;
+	_Write(MMSS_DP_AUDIO_CFG, _Read(MMSS_DP_AUDIO_CFG) & ~kAudioEngineEnable);
+	memory_write_barrier();
+}
+
+
+void
+DisplayPort::_SetUpAudio()
+{
+	_Write(MMSS_DP_SDP_CFG, _Read(MMSS_DP_SDP_CFG) | kAudioSdps);
+	_Write(MMSS_DP_SDP_CFG2,
+		_Read(MMSS_DP_SDP_CFG2) & ~kSdpHeadersFromRegisters);
+
+	static const struct {
+		uint32	offset;
+		uint8	hb1, hb2, hb3;
+	} kHeaders[] = {
+		{ MMSS_DP_AUDIO_STREAM_0, 0x02, 0x00, 0 },
+		{ MMSS_DP_AUDIO_TIMESTAMP_0, 0x01, 0x17, 0x11 << 2 },
+		{ MMSS_DP_AUDIO_INFOFRAME_0, 0x84, 0x1b, 0x11 << 2 },
+		{ MMSS_DP_AUDIO_COPYMANAGEMENT_0, 0x05, 0x0f, 0 },
+		{ MMSS_DP_AUDIO_ISRC_0, 0x06, 0x0f, 0 },
+	};
+	for (const auto& header : kHeaders) {
+		uint32 words[2];
+		sdp_header(words, header.hb1, header.hb2,
+			header.offset == MMSS_DP_AUDIO_STREAM_0
+				? fAudioChannels - 1 : header.hb3);
+		_Write(header.offset, words[0]);
+		_Write(header.offset + 4, words[1]);
+	}
+
+	uint32 select;
+	switch (LinkRate()) {
+		case 270: select = 1; break;
+		case 540: select = 2; break;
+		case 810: select = 3; break;
+		default: select = 0; break;
+	}
+	_Write(MMSS_DP_AUDIO_ACR_CTRL, kAcrEnable | select << 4);
+
+	uint32 lanes = Lanes();
+	uint32 safeToExit = lanes == 4 ? 5 : lanes == 2 ? 8 : 14;
+	_Write(REG_DP_MAINLINK_LEVELS,
+		(_Read(REG_DP_MAINLINK_LEVELS) & 0xfe0) | safeToExit);
+
+	_Write(MMSS_DP_AUDIO_CFG, _Read(MMSS_DP_AUDIO_CFG) | kAudioEngineEnable);
+	memory_write_barrier();
 }
 
 

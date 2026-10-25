@@ -43,20 +43,30 @@ static const multi_channel_info kOutputChannels[] = {
 	{3, B_MULTI_OUTPUT_BUS, B_CHANNEL_RIGHT | B_CHANNEL_STEREO_BUS,
 		B_CHANNEL_MINI_JACK_STEREO},
 };
+// HDMI's two
+static const multi_channel_info kHdmiChannels[] = {
+	{0, B_MULTI_OUTPUT_CHANNEL, B_CHANNEL_LEFT | B_CHANNEL_STEREO_BUS, 0},
+	{1, B_MULTI_OUTPUT_CHANNEL, B_CHANNEL_RIGHT | B_CHANNEL_STEREO_BUS, 0},
+	{2, B_MULTI_OUTPUT_BUS, B_CHANNEL_LEFT | B_CHANNEL_STEREO_BUS, 0},
+	{3, B_MULTI_OUTPUT_BUS, B_CHANNEL_RIGHT | B_CHANNEL_STEREO_BUS, 0},
+};
 
 
 static status_t
-get_description(AudioDevice* device, multi_description* userData)
+get_description(Output* output, multi_description* userData)
 {
-	bool input = device->captureOpen;
+	bool hdmi = output == &output->device->hdmi;
+	bool input = !hdmi && output->device->captureOpen;
 	multi_description description;
 	if (user_memcpy(&description, userData, sizeof(description)) != B_OK)
 		return B_BAD_ADDRESS;
 	description.interface_version = B_CURRENT_INTERFACE_VERSION;
 	description.interface_minimum = B_CURRENT_INTERFACE_VERSION;
-	strlcpy(description.friendly_name, input ? "Headset" : "Headphones",
+	strlcpy(description.friendly_name,
+		hdmi ? "HDMI" : input ? "Headset" : "Headphones",
 		sizeof(description.friendly_name));
-	strlcpy(description.vendor_info, "Qualcomm SC8280XP / WCD9385",
+	strlcpy(description.vendor_info,
+		hdmi ? "Qualcomm SC8280XP / CH7218A" : "Qualcomm SC8280XP / WCD9385",
 		sizeof(description.vendor_info));
 	description.output_channel_count = 2;
 	description.input_channel_count = input ? 2 : 0;
@@ -77,8 +87,10 @@ get_description(AudioDevice* device, multi_description* userData)
 	description.control_panel[0] = '\0';
 	if (user_memcpy(userData, &description, sizeof(description)) != B_OK)
 		return B_BAD_ADDRESS;
-	const multi_channel_info* channels = input ? kChannels : kOutputChannels;
-	size_t size = input ? sizeof(kChannels) : sizeof(kOutputChannels);
+	const multi_channel_info* channels
+		= hdmi ? kHdmiChannels : input ? kChannels : kOutputChannels;
+	size_t size = hdmi ? sizeof(kHdmiChannels)
+		: input ? sizeof(kChannels) : sizeof(kOutputChannels);
 	if (description.request_channel_count
 			>= (int32)(size / sizeof(multi_channel_info))
 		&& user_memcpy(description.channels, channels, size) != B_OK) {
@@ -128,8 +140,9 @@ set_global_format(const multi_format_info* userData)
 
 //!	The buffers are the driver's (allocated with the graph): their layout.
 static status_t
-get_buffers(AudioDevice* device, multi_buffer_list* userData)
+get_buffers(Output* output, multi_buffer_list* userData)
 {
+	AudioDevice* device = output->device;
 	multi_buffer_list data;
 	if (user_memcpy(&data, userData, sizeof(data)) != B_OK)
 		return B_BAD_ADDRESS;
@@ -143,13 +156,14 @@ get_buffers(AudioDevice* device, multi_buffer_list* userData)
 			sizeof(playbackBuffers)) != B_OK)
 		return B_BAD_ADDRESS;
 
-	multi_audio_stop(device);
-	memset(device->buffers, 0, kBufferCount * kBufferSize);
+	multi_audio_stop(output);
+	memset(output->buffers, 0, kBufferCount * kBufferSize);
 	data.flags = B_MULTI_BUFFER_PLAYBACK;
 	data.return_playback_buffers = kBufferCount;
 	data.return_playback_channels = 2;
 	data.return_playback_buffer_size = kBufferFrames;
-	bool record = device->captureOpen && data.request_record_buffers
+	bool record = output == &device->headphones && device->captureOpen
+		&& data.request_record_buffers
 			>= (int32)kRecordBufferCount
 		&& data.request_record_channels >= 2 && data.record_buffers != NULL;
 	data.return_record_buffers = record ? kRecordBufferCount : 0;
@@ -178,7 +192,7 @@ get_buffers(AudioDevice* device, multi_buffer_list* userData)
 	for (uint32 index = 0; index < kBufferCount; index++) {
 		buffer_desc descriptors[2];
 		for (uint32 channel = 0; channel < 2; channel++) {
-			descriptors[channel].base = (char*)device->buffers
+			descriptors[channel].base = (char*)output->buffers
 				+ index * kBufferSize + channel * 2;
 			descriptors[channel].stride = kFrameSize;
 		}
@@ -191,43 +205,44 @@ get_buffers(AudioDevice* device, multi_buffer_list* userData)
 }
 
 
-/*!	The headphone path up (the RX macro, the codec), the graph started, and
-	both buffers (silent) handed to the DSP.
+/*!	The output's path up (the headphones' RX macro and codec, HDMI's
+	DisplayPort audio), the graph started, and both buffers (silent) handed
+	to the DSP; the headset input with the headphones.
 */
 static void start_capture(AudioDevice* device);
 
 
 static status_t
-start(AudioDevice* device)
+start(Output* output)
 {
-	if (device->running)
+	if (output->running)
 		return B_OK;
-	device->codec.EnableHeadphonePath(48000);
-	status_t status = device->codec.EnableHeadphones(kHeadphoneGain);
+	AudioDevice* device = output->device;
+	status_t status = output_power_up(output);
 	if (status == B_OK)
-		status = device->playback.Start();
+		status = output->path.Start();
 	if (status != B_OK) {
-		device->codec.DisableHeadphones();
-		device->codec.DisableHeadphonePath();
+		output_power_down(output);
 		return status;
 	}
-	while (acquire_sem_etc(device->doneSem, 1, B_RELATIVE_TIMEOUT, 0) == B_OK)
+	while (acquire_sem_etc(output->doneSem, 1, B_RELATIVE_TIMEOUT, 0) == B_OK)
 		;
 	cpu_status state = disable_interrupts();
 	acquire_spinlock(&device->streamLock);
-	device->lastPlayed = -1;
-	device->toRefill = -1;
-	device->framesPlayed = 0;
-	device->playedTime = system_time();
+	output->lastPlayed = -1;
+	output->toRefill = -1;
+	output->framesPlayed = 0;
+	output->playedTime = system_time();
 	release_spinlock(&device->streamLock);
 	restore_interrupts(state);
 	for (uint32 index = 0; index < kBufferCount; index++) {
-		clean_buffer(device, index);
-		device->playback.Write(device->buffersDsp + index * kBufferSize,
-			kBufferSize, index);
+		clean_buffer(output, index);
+		output->path.Write(output->buffersDsp + index * kBufferSize,
+			kBufferSize, output->token | index);
 	}
-	device->running = true;
-	start_capture(device);
+	output->running = true;
+	if (output == &device->headphones)
+		start_capture(device);
 	return B_OK;
 }
 
@@ -273,15 +288,15 @@ start_capture(AudioDevice* device)
 
 
 void
-multi_audio_stop(AudioDevice* device)
+multi_audio_stop(Output* output)
 {
-	if (!device->running)
+	if (!output->running)
 		return;
-	device->running = false;
-	device->playback.Stop();
-	device->codec.DisableHeadphones();
-	device->codec.DisableHeadphonePath();
-	if (device->capturing) {
+	AudioDevice* device = output->device;
+	output->running = false;
+	output->path.Stop();
+	output_power_down(output);
+	if (output == &device->headphones && device->capturing) {
 		device->capturing = false;
 		device->capture.Stop();
 		device->codec.DisableHeadsetMic();
@@ -293,50 +308,51 @@ multi_audio_stop(AudioDevice* device)
 	Then the next one the DSP played is the add-on's to fill.
 */
 static status_t
-buffer_exchange(AudioDevice* device, multi_buffer_info* userInfo)
+buffer_exchange(Output* output, multi_buffer_info* userInfo)
 {
+	AudioDevice* device = output->device;
 	multi_buffer_info info;
 	if (user_memcpy(&info, userInfo, sizeof(info)) != B_OK)
 		return B_BAD_ADDRESS;
 
 	{
 		MutexLocker locker(device->lock);
-		status_t status = start(device);
+		status_t status = start(output);
 		if (status != B_OK)
 			return status;
-		if (device->toRefill >= 0) {
-			clean_buffer(device, device->toRefill);
-			device->playback.Write(device->buffersDsp
-				+ device->toRefill * kBufferSize, kBufferSize,
-				device->toRefill);
-			device->toRefill = -1;
+		if (output->toRefill >= 0) {
+			clean_buffer(output, output->toRefill);
+			output->path.Write(output->buffersDsp
+				+ output->toRefill * kBufferSize, kBufferSize,
+				output->token | output->toRefill);
+			output->toRefill = -1;
 		}
 	}
 
-	status_t status = acquire_sem_etc(device->doneSem, 1,
+	status_t status = acquire_sem_etc(output->doneSem, 1,
 		B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT, 500000);
 	if (status != B_OK) {
 		if (status == B_TIMED_OUT) {
-			TRACE("the DSP played no buffer for 0.5 s\n");
+			TRACE("the DSP played no %s buffer for 0.5 s\n", output->name);
 			device->smmu.Faults("buffer exchange");
 		}
 		return status;
 	}
 	cpu_status state = disable_interrupts();
 	acquire_spinlock(&device->streamLock);
-	int32 played = device->lastPlayed;
-	info.played_frames_count = device->framesPlayed;
-	info.played_real_time = device->playedTime;
+	int32 played = output->lastPlayed;
+	info.played_frames_count = output->framesPlayed;
+	info.played_real_time = output->playedTime;
 	release_spinlock(&device->streamLock);
 	restore_interrupts(state);
-	device->toRefill = played;
+	output->toRefill = played;
 	info.playback_buffer_cycle = played;
 	info.flags = B_MULTI_BUFFER_PLAYBACK;
 
 	// the record buffer the DSP filled meanwhile (it fills at the rate the
 	// other plays: one an exchange); the one handed out before goes back
 	info.record_buffer_cycle = -1;
-	if (device->capturing) {
+	if (output == &device->headphones && device->capturing) {
 		if (device->recordToRefill >= 0) {
 			device->capture.Read(device->recordDsp
 				+ device->recordToRefill * kRecordBufferSize,
@@ -365,16 +381,16 @@ buffer_exchange(AudioDevice* device, multi_buffer_info* userInfo)
 
 
 status_t
-multi_audio_control(AudioDevice* device, uint32 operation, void* buffer,
+multi_audio_control(Output* output, uint32 operation, void* buffer,
 	size_t length)
 {
 	// the exchange waits for the DSP without the lock
 	if (operation == B_MULTI_BUFFER_EXCHANGE)
-		return buffer_exchange(device, (multi_buffer_info*)buffer);
-	MutexLocker locker(device->lock);
+		return buffer_exchange(output, (multi_buffer_info*)buffer);
+	MutexLocker locker(output->device->lock);
 	switch (operation) {
 		case B_MULTI_GET_DESCRIPTION:
-			return get_description(device, (multi_description*)buffer);
+			return get_description(output, (multi_description*)buffer);
 		case B_MULTI_GET_ENABLED_CHANNELS:
 			return get_enabled_channels((multi_channel_enable*)buffer);
 		case B_MULTI_SET_ENABLED_CHANNELS:
@@ -384,9 +400,9 @@ multi_audio_control(AudioDevice* device, uint32 operation, void* buffer,
 		case B_MULTI_SET_GLOBAL_FORMAT:
 			return set_global_format((const multi_format_info*)buffer);
 		case B_MULTI_GET_BUFFERS:
-			return get_buffers(device, (multi_buffer_list*)buffer);
+			return get_buffers(output, (multi_buffer_list*)buffer);
 		case B_MULTI_BUFFER_FORCE_STOP:
-			multi_audio_stop(device);
+			multi_audio_stop(output);
 			return B_OK;
 		case B_MULTI_LIST_MIX_CONTROLS:
 		{
