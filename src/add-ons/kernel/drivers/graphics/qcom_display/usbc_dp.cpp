@@ -770,7 +770,13 @@ UsbcDisplayPort::_EnableMainlink(uint32 lanes)
 		| 0x40						// enhanced framing
 		| 0x04 | 0x02 | 0x01;		// progressive, static Mvid, sync clock
 	wr(fController, DP_CONFIGURATION_CTRL, config);
-	wr(fController, DP_LANE_MAPPING, 0 | 1u << 2 | 2u << 4 | 3u << 6);
+	// logical lane n onto physical lane (map >> 2n) & 3, one to one (lab:
+	// "usbc_lane_map 0xe1" swaps lanes 0 and 1)
+	void* settings = load_driver_settings("qcom_display");
+	uint32 laneMap = strtoul(get_driver_parameter(settings, "usbc_lane_map",
+		"0xe4", "0xe4"), NULL, 0) & 0xff;
+	unload_driver_settings(settings);
+	wr(fController, DP_LANE_MAPPING, laneMap);
 	uint32 control = rd(fController, DP_MAINLINK_CTRL) & ~3u;
 	wr(fController, DP_MAINLINK_CTRL, control);
 	wr(fController, DP_MAINLINK_CTRL, control | 2);			// reset
@@ -1102,7 +1108,12 @@ void
 UsbcDisplayPort::_DumpBranch()
 {
 	static const struct { uint32 address, length; } kRanges[] = {
-		{0x000, 16}, {0x080, 16}, {0x500, 12}, {0x3050, 4}};
+		{0x000, 16}, {0x080, 16}, {0x200, 16}, {0x500, 16}, {0x510, 16},
+		{0x600, 1}, {0x2002, 14},
+		// the protocol converter's capabilities, controls and HDMI link
+		// status (DisplayPort 1.4/2.0 PCON registers)
+		{0x3000, 16}, {0x3010, 16}, {0x3020, 16}, {0x3030, 16},
+		{0x3040, 16}, {0x3050, 16}, {0x3060, 16}};
 	for (const auto& range : kRanges) {
 		uint8 data[16] = {};
 		status_t status = fPort->ReadDpcd(range.address, data, range.length);
