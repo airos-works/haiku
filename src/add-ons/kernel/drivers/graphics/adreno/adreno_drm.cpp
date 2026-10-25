@@ -347,6 +347,10 @@ syncobj_add_point(Syncobj* syncobj, uint64 point, uint32 fence)
 //	#pragma mark - files
 
 
+// a queue's GPU losses are counted from its creation: kQueueSlots of a
+// file's queues have their own count, the rest share the file's
+#define QUEUE_SLOTS				64
+
 struct File {
 	mutex		lock;
 	Buffer**	buffers;
@@ -358,7 +362,41 @@ struct File {
 	uint64		vaStart;	// its window of the address space
 	uint64		vaSize;
 	int32		vaWindow;
+	// adreno_faults() when each queue was created: work of a queue from
+	// before the GPU was last lost fails (the reset dropped what it had
+	// queued, and what it sends next builds on that)
+	uint32		openLosses;
+	uint32		queueLosses[QUEUE_SLOTS];
 };
+
+
+static uint32
+queue_losses(File* file, uint32 queue)
+{
+	return queue < QUEUE_SLOTS ? file->queueLosses[queue] : file->openLosses;
+}
+
+
+/*!	The CPU's lines of the buffers the CP fetches (the command streams,
+	which Turnip makes GPU read-only and write-combined) cleaned to memory
+	before the CP runs them: they are mapped cacheable on both sides, and
+	the CP read a stream as zeros (an opcode error) while the CPU still held
+	it. */
+static void
+clean_command_buffers(Buffer** buffers, uint32 count)
+{
+	for (uint32 i = 0; i < count; i++) {
+		Buffer* buffer = buffers[i];
+		if (buffer == NULL || (buffer->flags & MSM_BO_GPU_READONLY) == 0
+			|| (buffer->flags & MSM_BO_CACHED_COHERENT) != 0) {
+			continue;
+		}
+		addr_t end = (addr_t)buffer->address + buffer->size;
+		for (addr_t line = (addr_t)buffer->address; line < end; line += 64)
+			asm volatile("dc cvac, %0" : : "r" (line) : "memory");
+	}
+	asm volatile("dsb sy" : : : "memory");
+}
 
 
 template<typename T> static uint32
@@ -735,9 +773,12 @@ gem_submit(File* file, drm_msm_gem_submit* args)
 	}
 	syncLocker.Unlock();
 
-	if (status == B_OK && adreno_gpu_lost())
+	if (status == B_OK && (adreno_gpu_lost()
+			|| adreno_faults() != queue_losses(file, args->queueid))) {
 		status = EIO;
+	}
 	if (status == B_OK) {
+		clean_command_buffers(buffers, args->nr_bos);
 		adreno_ring_lock();
 		status = adreno_ring_reserve(4 + ibs * 4 + 8);
 		if (status == B_OK) {
@@ -1110,6 +1151,9 @@ adreno_open(const char* name, uint32 flags, void** _cookie)
 	file->vaSize = FILE_VA_WINDOW;
 	mutex_init(&file->lock, "adreno file");
 	file->nextQueue = 1;
+	file->openLosses = adreno_faults();
+	for (uint32 i = 0; i < QUEUE_SLOTS; i++)
+		file->queueLosses[i] = file->openLosses;
 	*_cookie = file;
 	return B_OK;
 }
@@ -1300,6 +1344,8 @@ dispatch(File* file, uint32 nr, void* data)
 				return EINVAL;
 			MutexLocker locker(file->lock);
 			args->id = file->nextQueue++;
+			if (args->id < QUEUE_SLOTS)
+				file->queueLosses[args->id] = adreno_faults();
 			return B_OK;
 		}
 		case DRM_COMMAND_BASE + DRM_MSM_SUBMITQUEUE_CLOSE:
@@ -1309,7 +1355,11 @@ dispatch(File* file, uint32 nr, void* data)
 			drm_msm_submitqueue_query* args = (drm_msm_submitqueue_query*)data;
 			if (args->param != MSM_SUBMITQUEUE_PARAM_FAULTS)
 				return EINVAL;
-			uint32 faults = 0;
+			uint32 faults;
+			{
+				MutexLocker locker(file->lock);
+				faults = adreno_faults() - queue_losses(file, args->id);
+			}
 			if (args->data != 0 && args->len >= sizeof(faults)
 				&& user_memcpy((void*)(addr_t)args->data, &faults,
 					sizeof(faults)) != B_OK) {
