@@ -3331,6 +3331,12 @@ PCI::_RestoreDeviceConfiguration(PCIDev *device)
 			volatile uint32 *table = (uint32 *)msix->table_address;
 			for (uint32 i = 0; i < count; i++)
 				table[i] = device->saved_msix_table[i];
+			device_manager_suspend_trace("pci: %02x:%02x.%x MSI-X: %" B_PRIu32
+				" vectors back, the first %#" B_PRIx32 "/%#" B_PRIx32
+				" (saved %#" B_PRIx32 "/%#" B_PRIx32 ")", device->bus,
+				device->device, device->function, count / 4, table[0],
+				table[2], device->saved_msix_table[0],
+				device->saved_msix_table[2]);
 		}
 		WriteConfig(device, msixCapability + PCI_msix_control, 2, msixControl);
 	}
