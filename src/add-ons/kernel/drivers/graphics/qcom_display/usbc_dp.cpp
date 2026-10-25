@@ -317,9 +317,16 @@ UsbcDisplayPort::_PowerPhy()
 	uint32 gdsc = rd(fGcc, fConnector.gdsc);
 	bool keep = fPhyLanes == 2 && connector < B_COUNT_OF(kConnectors)
 		&& sUsbSetUp[connector] && (gdsc & (1u << 31)) != 0
-		&& rd(com, COM_PHY_MODE_CTRL) == 3
+		&& (rd(com, COM_PHY_MODE_CTRL) & 0xff) == 3
 		&& (rd(com, COM_TYPEC_CTRL) & 3) == (1u << 1 | (fReverse ? 1 : 0))
 		&& (rd(fPhy + kPhyUsbPcs, 0x14) & (1u << 6)) == 0;
+	if (!keep && fPhyLanes == 2 && connector < B_COUNT_OF(kConnectors)
+		&& sUsbSetUp[connector]) {
+		INFO("%s: the PHY set up again: GDSC %#" B_PRIx32 ", mode %#" B_PRIx32
+			", port select %#" B_PRIx32 ", USB 3 PCS status %#" B_PRIx32 "\n",
+			fConnector.name, gdsc, rd(com, COM_PHY_MODE_CTRL),
+			rd(com, COM_TYPEC_CTRL), rd(fPhy + kPhyUsbPcs, 0x14));
+	}
 	if (keep) {
 		INFO("%s: the PHY's USB 3 half runs: kept\n", fConnector.name);
 		for (uint32 branch : fConnector.phyBranches)
