@@ -65,13 +65,18 @@ static const uint32 kSharedMemoryPool = 3;	// APM_MEMORY_MAP_SHMEM8_4K_POOL
 
 enum {
 	kWriteEndpoint = 0x07001000,
+	kReadEndpoint = 0x07001001,
 	kPcmConverter = 0x07001003,
+	kPcmEncoder = 0x07001004,
 	kPcmDecoder = 0x07001005,
 	kMfc = 0x07001015,
 	kLogger = 0x0700101a,
 	kVolume = 0x0700101b,
 	kCodecDmaSink = 0x07001023,
+	kCodecDmaSource = 0x07001024,
 };
+
+static const uint32 kReadBuffer = 0x0400100b;	// DATA_CMD_RD_SH_MEM_EP_DATA_BUFFER_V2
 
 
 struct Module {
@@ -125,10 +130,50 @@ static const Module kDeviceModules[] = {
 static const SubGraph kDevice = { 0x4011, 2, 1, 1, 0x4011, 3, 0x2000, 1, 2,
 	kDeviceModules, B_COUNT_OF(kDeviceModules) };
 
-// the routing mixer's connection: the stream's logger into the device's
-static const uint32 kStreamOutput = 0x6006, kDeviceInput = 0x6110;
-static const uint32 kWriteEndpointInstance = 0x6001;
-static const uint32 kVolumeInstance = 0x6004;
+/*	The capture path: TX_CODEC_DMA_TX_3 (device118, the TX macro's codec DMA
+	interface, the WCD9385's headset microphone through it) into the
+	routing mixer of MultiMedia5's stream (stream4), as the topology and
+	Linux' trace on this board have them. */
+static const Module kCaptureDeviceModules[] = {
+	{ kCodecDmaSource, 0x6160, 0, 1, 0x6161, 0, 0, 1, 4, 1 },
+	{ kLogger, 0x6161, 1, 1, 0, 0, 0x19ab, 0, 0, 0 },
+};
+static const SubGraph kCaptureDevice = { 0x4016, 2, 1, 2, 0x4016, 3, 0x2000,
+	4, 2, kCaptureDeviceModules, B_COUNT_OF(kCaptureDeviceModules) };
+
+static const Module kCaptureStreamModules[] = {
+	{ kLogger, 0x6040, 1, 1, 0x6041, 0, 0x19af, 0, 0, 0 },
+	{ kMfc, 0x6041, 1, 1, 0x6042, 0, 0, 0, 0, 0 },
+	{ kPcmConverter, 0x6042, 1, 1, 0x6043, 1, 0, 0, 0, 0 },
+	{ kPcmEncoder, 0x6043, 1, 1, 0x6044, 1, 0, 0, 0, 0 },
+	{ kReadEndpoint, 0x6044, 1, 0, 0, 0, 0, 0, 0, 0 },
+};
+static const SubGraph kCaptureStream = { 0x4005, 2, 1, 2, 0x4005, 2, 0x2000,
+	4, 2, kCaptureStreamModules, B_COUNT_OF(kCaptureStreamModules) };
+
+
+/*!	A path: the device's and the stream's sub-graphs, the routing mixer's
+	connection between them (in the stream's graph for playback, the
+	device's for capture), the shared memory endpoint, the volume module. */
+struct PathDescription {
+	const SubGraph*	device;
+	const SubGraph*	stream;
+	uint32			crossFrom;
+	uint32			crossTo;
+	bool			crossInDevice;
+	uint32			endpoint;
+	uint32			volume;			// 0: none
+	bool			streamFirst;	// started before the device (capture)
+};
+
+static const PathDescription kPaths[] = {
+	// playback: the stream's logger into the device's
+	{ &kDevice, &kStream, 0x6006, 0x6110, false, 0x6001, 0x6004, false },
+	// capture: the device's logger into the stream's (in the stream's graph,
+	// opened when both modules are there)
+	{ &kCaptureDevice, &kCaptureStream, 0x6161, 0x6040, false, 0x6044, 0,
+		true },
+};
 
 
 //!	A packet's payload, built in 32-bit words.
@@ -170,9 +215,11 @@ private:
 };
 
 
-Playback::Playback(Dsp& dsp)
+AudioPath::AudioPath(Dsp& dsp, Direction direction)
 	:
 	fDsp(dsp),
+	fPath(kPaths[direction == kCapture ? 1 : 0]),
+	fDirection(direction),
 	fSampleRate(48000),
 	fChannels(2),
 	fBits(16),
@@ -186,14 +233,14 @@ Playback::Playback(Dsp& dsp)
 }
 
 
-Playback::~Playback()
+AudioPath::~AudioPath()
 {
 	Close();
 }
 
 
 status_t
-Playback::Open(uint32 sampleRate, uint32 channels, uint32 bitsPerSample)
+AudioPath::Open(uint32 sampleRate, uint32 channels, uint32 bitsPerSample)
 {
 	fSampleRate = sampleRate;
 	fChannels = channels;
@@ -206,33 +253,35 @@ Playback::Open(uint32 sampleRate, uint32 channels, uint32 bitsPerSample)
 		true);
 	unload_driver_settings(settings);
 
-	status_t status = _OpenGraph(kDevice, false);
+	status_t status = _OpenGraph(*fPath.device, fPath.crossInDevice);
 	if (status != B_OK)
 		return status;
 	fBackOpen = true;
-	status = _OpenGraph(kStream, true);
+	status = _OpenGraph(*fPath.stream, !fPath.crossInDevice);
 	if (status != B_OK) {
 		Close();
 		return status;
 	}
 	fFrontOpen = true;
-	status = _SetFormats(kDevice);
+	status = _SetFormats(*fPath.device);
 	if (status == B_OK)
-		status = _SetFormats(kStream);
-	if (status == B_OK && !fSkipVolume)
+		status = _SetFormats(*fPath.stream);
+	if (status == B_OK && fPath.volume != 0 && !fSkipVolume)
 		status = SetVolume(0x2000);		// VOL_CTRL_DEFAULT_GAIN: unity
 	if (status != B_OK) {
 		Close();
 		return status;
 	}
-	TRACE("AudioReach playback graph open: %" B_PRIu32 " Hz, %" B_PRIu32
-		" channels, %" B_PRIu32 " bit\n", fSampleRate, fChannels, fBits);
+	TRACE("AudioReach %s graph open: %" B_PRIu32 " Hz, %" B_PRIu32
+		" channels, %" B_PRIu32 " bit\n",
+		fDirection == kCapture ? "capture" : "playback", fSampleRate,
+		fChannels, fBits);
 	return B_OK;
 }
 
 
 void
-Playback::Close()
+AudioPath::Close()
 {
 	Stop();
 	if (fMemoryHandle != 0) {
@@ -241,15 +290,15 @@ Playback::Close()
 		fMemoryHandle = 0;
 	}
 	if (fFrontOpen)
-		_GraphCommand(kGraphClose, kStream);
+		_GraphCommand(kGraphClose, *fPath.stream);
 	if (fBackOpen)
-		_GraphCommand(kGraphClose, kDevice);
+		_GraphCommand(kGraphClose, *fPath.device);
 	fFrontOpen = fBackOpen = false;
 }
 
 
 status_t
-Playback::MapMemory(phys_addr_t address, size_t size)
+AudioPath::MapMemory(phys_addr_t address, size_t size)
 {
 	// apm_cmd_shared_mem_map_regions, one region (no APM command header);
 	// the DSP wants whole 4 KiB pages
@@ -260,8 +309,10 @@ Playback::MapMemory(phys_addr_t address, size_t size)
 	uint32 handleSize = sizeof(handle);
 	// from the port the buffers go from: the DSP keeps the handle for it
 	// (as Linux sends both from the graph's port)
+	// its token the direction, as audioreach_map_memory_regions() sends it
 	status_t status = fDsp.DataCommand(kApmPort, kMapMemory, payload,
-		sizeof(payload), kMapMemoryResponse, &handle, &handleSize);
+		sizeof(payload), kMapMemoryResponse, &handle, &handleSize,
+		fDirection == kCapture ? 1 : 0);
 	if (status == B_OK && (handleSize < 4 || handle == 0))
 		status = B_ERROR;
 	if (status != B_OK)
@@ -274,39 +325,59 @@ Playback::MapMemory(phys_addr_t address, size_t size)
 
 
 status_t
-Playback::Start(bool startDevice)
+AudioPath::Start(bool startDevice)
 {
 	if (fRunning)
 		return B_OK;
-	status_t status = _GraphCommand(kGraphPrepare, kDevice);
+	status_t status = _GraphCommand(kGraphPrepare, *fPath.device);
 	if (status == B_OK)
-		status = _GraphCommand(kGraphPrepare, kStream);
+		status = _GraphCommand(kGraphPrepare, *fPath.stream);
+	if (status == B_OK && fPath.streamFirst)
+		status = _GraphCommand(kGraphStart, *fPath.stream);
 	if (status == B_OK && startDevice)
-		status = _GraphCommand(kGraphStart, kDevice);
-	if (status == B_OK)
-		status = _GraphCommand(kGraphStart, kStream);
+		status = _GraphCommand(kGraphStart, *fPath.device);
+	if (status == B_OK && !fPath.streamFirst)
+		status = _GraphCommand(kGraphStart, *fPath.stream);
 	fRunning = status == B_OK;
 	return status;
 }
 
 
 status_t
-Playback::Stop()
+AudioPath::StartDevice()
+{
+	if (!fRunning)
+		return B_NO_INIT;
+	return _GraphCommand(kGraphStart, *fPath.device);
+}
+
+
+status_t
+AudioPath::Stop()
 {
 	if (!fRunning)
 		return B_OK;
 	fRunning = false;
-	status_t status = _GraphCommand(kGraphStop, kStream);
-	_GraphCommand(kGraphStop, kDevice);
+	// capture: the device stops first, as Linux stops them
+	status_t status;
+	if (fPath.streamFirst) {
+		_GraphCommand(kGraphStop, *fPath.device);
+		status = _GraphCommand(kGraphStop, *fPath.stream);
+	} else {
+		status = _GraphCommand(kGraphStop, *fPath.stream);
+		_GraphCommand(kGraphStop, *fPath.device);
+	}
 	return status;
 }
 
 
 status_t
-Playback::SetVolume(uint16 gain)
+AudioPath::SetVolume(uint16 gain)
 {
 	Payload payload;
-	uint32 sizeAt = payload.BeginParameter(kVolumeInstance, kParamVolumeGain);
+	if (fPath.volume == 0)
+		return B_NOT_SUPPORTED;
+	uint32 sizeAt = payload.BeginParameter(fPath.volume, kParamVolumeGain);
 	payload.Add16(gain, 0);
 	payload.EndParameter(sizeAt);
 	return _SetConfig(payload.Data(), payload.Size());
@@ -314,14 +385,25 @@ Playback::SetVolume(uint16 gain)
 
 
 status_t
-Playback::Write(phys_addr_t address, uint32 size, uint32 token)
+AudioPath::Write(phys_addr_t address, uint32 size, uint32 token)
 {
 	// apm_data_cmd_wr_sh_mem_ep_data_buffer_v2: no time stamp (flags
 	// 0xff00, as Linux sends them), no metadata
 	uint32 payload[11] = { (uint32)address, (uint32)((uint64)address >> 32),
 		fMemoryHandle, size, 0, 0, 0xff00, 0, 0, 0, 0 };
-	return fDsp.SendData(kWriteEndpointInstance, kWriteBuffer, token,
+	return fDsp.SendData(fPath.endpoint, kWriteBuffer, token,
 		payload, sizeof(payload));
+}
+
+
+status_t
+AudioPath::Read(phys_addr_t address, uint32 size, uint32 token)
+{
+	// apm_data_cmd_rd_sh_mem_ep_data_buffer_v2: no metadata
+	uint32 payload[8] = { (uint32)address, (uint32)((uint64)address >> 32),
+		fMemoryHandle, size, 0, 0, 0, 0 };
+	return fDsp.SendData(fPath.endpoint, kReadBuffer, token, payload,
+		sizeof(payload));
 }
 
 
@@ -331,7 +413,7 @@ Playback::Write(phys_addr_t address, uint32 size, uint32 token)
 	connections (and, for the stream, the one into the device's sub-graph).
 */
 status_t
-Playback::_OpenGraph(const SubGraph& subGraph, bool withConnection)
+AudioPath::_OpenGraph(const SubGraph& subGraph, bool withConnection)
 {
 	Payload payload;
 
@@ -400,10 +482,13 @@ Playback::_OpenGraph(const SubGraph& subGraph, bool withConnection)
 	uint32 countAt = payload.Mark();
 	payload.Add(0);
 	uint32 connections = 0;
+	bool crossAdded = false;
 	for (uint32 i = 0; i < subGraph.moduleCount; i++) {
 		uint32 next = subGraph.modules[i].next;
-		if (subGraph.modules[i].instance == kStreamOutput && withConnection)
-			next = kDeviceInput;
+		if (subGraph.modules[i].instance == fPath.crossFrom && withConnection) {
+			next = fPath.crossTo;
+			crossAdded = true;
+		}
 		if (next == 0)
 			continue;
 		// apm_module_conn_obj: source and its output port, destination
@@ -411,6 +496,14 @@ Playback::_OpenGraph(const SubGraph& subGraph, bool withConnection)
 		payload.Add(subGraph.modules[i].instance);
 		payload.Add(1);
 		payload.Add(next);
+		payload.Add(2);
+		connections++;
+	}
+	// the routing mixer's connection from the other sub-graph's module
+	if (withConnection && !crossAdded) {
+		payload.Add(fPath.crossFrom);
+		payload.Add(1);
+		payload.Add(fPath.crossTo);
 		payload.Add(2);
 		connections++;
 	}
@@ -429,7 +522,7 @@ Playback::_OpenGraph(const SubGraph& subGraph, bool withConnection)
 
 
 status_t
-Playback::_GraphCommand(uint32 opcode, const SubGraph& subGraph)
+AudioPath::_GraphCommand(uint32 opcode, const SubGraph& subGraph)
 {
 	Payload payload;
 	uint32 sizeAt = payload.BeginParameter(kApmPort, kParamSubGraphList);
@@ -449,7 +542,7 @@ Playback::_GraphCommand(uint32 opcode, const SubGraph& subGraph)
 
 //!	Each module's media format, as audioreach_set_media_format() sets it.
 status_t
-Playback::_SetFormats(const SubGraph& subGraph)
+AudioPath::_SetFormats(const SubGraph& subGraph)
 {
 	for (uint32 i = 0; i < subGraph.moduleCount; i++) {
 		const Module& module = subGraph.modules[i];
@@ -480,6 +573,7 @@ Playback::_SetFormats(const SubGraph& subGraph)
 			}
 			case kPcmDecoder:
 			case kPcmConverter:
+			case kPcmEncoder:
 			{
 				// PARAM_ID_PCM_OUTPUT_FORMAT_CFG
 				sizeAt = payload.BeginParameter(module.instance,
@@ -529,6 +623,7 @@ Playback::_SetFormats(const SubGraph& subGraph)
 				break;
 			}
 			case kCodecDmaSink:
+			case kCodecDmaSource:
 				// the format, the frame size factor, the interface, the
 				// power mode, each a parameter of its own
 				sizeAt = payload.BeginParameter(module.instance,
@@ -575,7 +670,7 @@ Playback::_SetFormats(const SubGraph& subGraph)
 
 
 status_t
-Playback::_SetConfig(const void* payload, uint32 size)
+AudioPath::_SetConfig(const void* payload, uint32 size)
 {
 	return fDsp.ApmCommand(kApmPort, kSetConfig, payload, size);
 }

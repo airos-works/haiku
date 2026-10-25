@@ -97,6 +97,10 @@ public:
 			//! The WCD9385's side: its RX device's HPH and class H ports on
 			//! the RX bus, then its headphone DACs and amplifiers (class H,
 			//! HiFi), at \a gain (0: 0 dB, to 20: -30 dB in 1.5 dB steps).
+			//! The headset microphone (the WCD938x's ADC2 into the TX
+			//! macro's decimator 0, TX_CODEC_DMA_TX_3).
+			status_t			EnableHeadsetMic(uint32 sampleRate);
+			void				DisableHeadsetMic();
 			status_t			EnableHeadphones(uint8 gain);
 			void				DisableHeadphones();
 

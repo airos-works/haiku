@@ -59,12 +59,15 @@ public:
 									void* response = NULL,
 									uint32* _responseSize = NULL,
 									bool fromDataPort = false);
-			//! Command() from the data port.
+			//! Command() from the data port; \a token, if not negative,
+			//! the packet's (the shared memory map's direction, as Linux
+			//! sends it), else one of ours.
 			status_t			DataCommand(uint32 destination, uint32 opcode,
 									const void* payload, uint32 size,
 									uint32 responseOpcode = 0,
 									void* response = NULL,
-									uint32* _responseSize = NULL);
+									uint32* _responseSize = NULL,
+									int32 token = -1);
 			status_t			SendData(uint32 destination, uint32 opcode,
 									uint32 token, const void* payload,
 									uint32 size);
@@ -85,7 +88,8 @@ private:
 									uint32 destination, uint32 opcode,
 									const void* payload, uint32 size,
 									uint32 responseOpcode, void* response,
-									uint32* _responseSize, bigtime_t timeout);
+									uint32* _responseSize, bigtime_t timeout,
+									int32 token = -1);
 			status_t			_Send(uint32 sourcePort, uint32 destination,
 									uint32 opcode, uint32 token,
 									const void* payload, uint32 size);
