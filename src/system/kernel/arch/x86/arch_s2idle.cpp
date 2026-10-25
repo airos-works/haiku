@@ -715,10 +715,11 @@ s0i3_settle(uint64* _lastEntry)
 	with them the USB3 controllers behind them ("USB3_0", "USB3_1" in the
 	PMC log): what Linux does in its place is to put the host interfaces
 	into D3 in the sleep, and their _PS3 asks the firmware (ALIB function
-	0x14) to power the USB4 domain down. Opt-in, "usb4_power_off true" in
-	the "suspend" kernel settings: it runs after the drivers' suspend hooks
-	and is undone before their resume hooks, so the USB3 controllers sleep
-	before their domain goes and come back after it.
+	0x14) to power the USB4 domain down. Only in a deep sleep, and on by
+	default ("usb4_power_off false" in the "suspend" kernel settings turns it
+	off): it runs after the drivers' suspend hooks and is undone before their
+	resume hooks, so the USB3 controllers sleep before their domain goes and
+	come back after it.
 */
 static status_t
 acpi_address(const char* path, uint64* _address)
@@ -1098,8 +1099,9 @@ static bool
 usb4_power_off_wanted()
 {
 	void* settings = load_driver_settings("suspend");
+	// (on by default: only AMD's host interfaces are probed)
 	bool wanted = get_driver_boolean_parameter(settings, "usb4_power_off",
-		false, true);
+		true, true);
 	unload_driver_settings(settings);
 	return wanted;
 }

@@ -132,8 +132,9 @@ typedef struct {
 	pci_device_module_info*	pci;
 	pci_device*				pci_device_cookie;
 	bool					idle_d3;
-		// "s2idle_d3 true" in the nvme_disk driver settings: D3hot in a
-		// suspend to idle, as the platform's low power constraints ask
+		// "s2idle_d3" in the nvme_disk driver settings (the default with
+		// AMD's processors): D3 in a suspend to idle, as the platform's low
+		// power constraints ask
 	bool					in_idle_d3;
 	volatile uint32*		msix_table;
 	area_id					msix_area;
@@ -280,6 +281,18 @@ nvme_disk_configure_features(nvme_disk_driver_info* info)
 }
 
 
+/*!	D3 in a suspend to idle is the default with AMD's processors, as Linux
+	has it there (acpi_storage_d3(): their platforms ask for it, and their
+	S0i3 takes the disk's power): "s2idle_d3 false" turns it off. */
+static bool
+idle_d3_default()
+{
+	cpuid_info cpuid;
+	return get_cpuid(&cpuid, 0, 0) == B_OK
+		&& memcmp(cpuid.eax_0.vendor_id, "AuthenticAMD", 12) == 0;
+}
+
+
 static status_t
 nvme_disk_init_device(void* _info, void** _cookie)
 {
@@ -300,8 +313,8 @@ nvme_disk_init_device(void* _info, void** _cookie)
 	info->msix_table = NULL;
 	info->msix_area = -1;
 	void* settings = load_driver_settings("nvme_disk");
-	info->idle_d3 = get_driver_boolean_parameter(settings, "s2idle_d3", false,
-		true);
+	info->idle_d3 = get_driver_boolean_parameter(settings, "s2idle_d3",
+		idle_d3_default(), true);
 	unload_driver_settings(settings);
 
 	// construct the libnvme pci_device struct
@@ -1418,7 +1431,7 @@ nvme_disk_suspend(void* _cookie, int32 state)
 		// (read again, so that a change applies to the next sleep)
 		void* settings = load_driver_settings("nvme_disk");
 		info->idle_d3 = get_driver_boolean_parameter(settings, "s2idle_d3",
-			false, true);
+			idle_d3_default(), true);
 		unload_driver_settings(settings);
 		if (!info->idle_d3 || info->pci->suspend_device == NULL)
 			return B_OK;
