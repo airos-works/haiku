@@ -13,6 +13,8 @@
 #include <bus/PCI.h>
 
 
+#include <util/AutoLock.h>
+
 #include "pch_i2c.h"
 
 
@@ -403,6 +405,50 @@ release_bus(i2c_bus_cookie cookie)
 //	#pragma mark -
 
 
+/*!	Programs the controller: at the start, and again after the SoC's
+	deepest sleep (S0i3), which loses its registers. */
+static void
+program_controller(pch_i2c_sim_info* bus)
+{
+	enable_device(bus, false);
+
+	write32(bus->registers + PCH_IC_SS_SCL_HCNT, bus->ss_hcnt);
+	write32(bus->registers + PCH_IC_SS_SCL_LCNT, bus->ss_lcnt);
+	write32(bus->registers + PCH_IC_FS_SCL_HCNT, bus->fs_hcnt);
+	write32(bus->registers + PCH_IC_FS_SCL_LCNT, bus->fs_lcnt);
+	if (bus->hs_hcnt > 0)
+		write32(bus->registers + PCH_IC_HS_SCL_HCNT, bus->hs_hcnt);
+	if (bus->hs_lcnt > 0)
+		write32(bus->registers + PCH_IC_HS_SCL_LCNT, bus->hs_lcnt);
+	{
+		uint32 reg = read32(bus->registers + PCH_IC_COMP_VERSION);
+		if (reg >= PCH_IC_COMP_VERSION_MIN)
+			write32(bus->registers + PCH_IC_SDA_HOLD, bus->sda_hold_time);
+	}
+
+	{
+		bus->tx_fifo_depth = 32;
+		bus->rx_fifo_depth = 32;
+		uint32 reg = read32(bus->registers + PCH_IC_COMP_PARAM1);
+		uint32 rx_fifo_depth = PCH_IC_COMP_PARAM1_RX(reg);
+		uint32 tx_fifo_depth = PCH_IC_COMP_PARAM1_TX(reg);
+		if (rx_fifo_depth > 1 && rx_fifo_depth < bus->rx_fifo_depth)
+			bus->rx_fifo_depth = rx_fifo_depth;
+		if (tx_fifo_depth > 1 && tx_fifo_depth < bus->tx_fifo_depth)
+			bus->tx_fifo_depth = tx_fifo_depth;
+		write32(bus->registers + PCH_IC_RX_TL, 0);
+		write32(bus->registers + PCH_IC_TX_TL, bus->tx_fifo_depth / 2);
+	}
+
+	bus->masterConfig = PCH_IC_CON_MASTER | PCH_IC_CON_SLAVE_DISABLE |
+	    PCH_IC_CON_RESTART_EN | PCH_IC_CON_SPEED_FAST;
+	write32(bus->registers + PCH_IC_CON, bus->masterConfig);
+
+	write32(bus->registers + PCH_IC_INTR_MASK, 0);
+	read32(bus->registers + PCH_IC_CLR_INTR);
+}
+
+
 static status_t
 init_bus(device_node* node, void** bus_cookie)
 {
@@ -462,42 +508,7 @@ init_bus(device_node* node, void** bus_cookie)
 		" 0x%04" B_PRIx16 " 0x%08" B_PRIx32 "\n", bus->ss_hcnt, bus->ss_lcnt,
 		bus->fs_hcnt, bus->fs_lcnt, bus->sda_hold_time);
 
-	enable_device(bus, false);
-
-	write32(bus->registers + PCH_IC_SS_SCL_HCNT, bus->ss_hcnt);
-	write32(bus->registers + PCH_IC_SS_SCL_LCNT, bus->ss_lcnt);
-	write32(bus->registers + PCH_IC_FS_SCL_HCNT, bus->fs_hcnt);
-	write32(bus->registers + PCH_IC_FS_SCL_LCNT, bus->fs_lcnt);
-	if (bus->hs_hcnt > 0)
-		write32(bus->registers + PCH_IC_HS_SCL_HCNT, bus->hs_hcnt);
-	if (bus->hs_lcnt > 0)
-		write32(bus->registers + PCH_IC_HS_SCL_LCNT, bus->hs_lcnt);
-	{
-		uint32 reg = read32(bus->registers + PCH_IC_COMP_VERSION);
-		if (reg >= PCH_IC_COMP_VERSION_MIN)
-			write32(bus->registers + PCH_IC_SDA_HOLD, bus->sda_hold_time);
-	}
-
-	{
-		bus->tx_fifo_depth = 32;
-		bus->rx_fifo_depth = 32;
-		uint32 reg = read32(bus->registers + PCH_IC_COMP_PARAM1);
-		uint32 rx_fifo_depth = PCH_IC_COMP_PARAM1_RX(reg);
-		uint32 tx_fifo_depth = PCH_IC_COMP_PARAM1_TX(reg);
-		if (rx_fifo_depth > 1 && rx_fifo_depth < bus->rx_fifo_depth)
-			bus->rx_fifo_depth = rx_fifo_depth;
-		if (tx_fifo_depth > 1 && tx_fifo_depth < bus->tx_fifo_depth)
-			bus->tx_fifo_depth = tx_fifo_depth;
-		write32(bus->registers + PCH_IC_RX_TL, 0);
-		write32(bus->registers + PCH_IC_TX_TL, bus->tx_fifo_depth / 2);
-	}
-
-	bus->masterConfig = PCH_IC_CON_MASTER | PCH_IC_CON_SLAVE_DISABLE |
-	    PCH_IC_CON_RESTART_EN | PCH_IC_CON_SPEED_FAST;
-	write32(bus->registers + PCH_IC_CON, bus->masterConfig);
-
-	write32(bus->registers + PCH_IC_INTR_MASK, 0);
-	read32(bus->registers + PCH_IC_CLR_INTR);
+	program_controller(bus);
 
 	status = install_io_interrupt_handler(bus->irq,
 		(interrupt_handler)pch_i2c_interrupt_handler, bus, 0);
@@ -513,6 +524,26 @@ err:
 	if (bus->registersArea >= 0)
 		delete_area(bus->registersArea);
 	return status;
+}
+
+
+static status_t
+suspend_bus(void* bus_cookie, int32 state)
+{
+	return B_OK;
+}
+
+
+static status_t
+resume_bus(void* bus_cookie)
+{
+	pch_i2c_sim_info* bus = (pch_i2c_sim_info*)bus_cookie;
+	MutexLocker locker(bus->lock);
+	if (read32(bus->registers + PCH_IC_CON) != bus->masterConfig) {
+		TRACE_ALWAYS("lost its configuration, programming it again\n");
+		program_controller(bus);
+	}
+	return B_OK;
 }
 
 
@@ -555,6 +586,8 @@ static i2c_sim_interface sPchI2cDeviceModule = {
 		NULL,	// register child devices
 		NULL,	// rescan
 		NULL, 	// device removed
+		suspend_bus,
+		resume_bus,
 	},
 
 	set_sim,
