@@ -9,6 +9,7 @@
 #include "display_port.h"
 
 #include <new>
+#include <stdio.h>
 #include <string.h>
 
 #include <KernelExport.h>
@@ -204,7 +205,7 @@ UsbcDisplayPort::UsbcDisplayPort(uint32 connector)
 	fLayerExt(0x40 + 4 * fConnector.mixer),
 	fGccArea(-1), fGcc(NULL), fDispccArea(-1), fDispcc(NULL), fPhyArea(-1),
 	fPhy(NULL), fControllerArea(-1), fController(NULL), fPort(NULL),
-	fMdssArea(-1), fMdss(NULL), fRate(0), fWideBus(false),
+	fMdssArea(-1), fMdss(NULL), fRate(0), fWideBus(false), fFirmwarePhy(NULL),
 	fReverse(false), fPhyLanes(4), fLanes(4), fTrained(false), fRetrainings(0), fPowered(false), fRunning(false)
 {
 }
@@ -324,6 +325,16 @@ UsbcDisplayPort::_PowerPhy()
 		for (uint32 branch : fConnector.phyBranches)
 			branch_on(fGcc, branch);
 	} else {
+		// the firmware's USB 3 set-up of this PHY (common block, lanes, USB
+		// serdes, PCS), for _PowerUsb()
+		static uint32 sFirmware[0x1800 / 4];
+		static bool sHaveFirmware = false;
+		if (fPhyLanes == 2 && !sHaveFirmware && (gdsc & (1u << 31)) != 0) {
+			for (uint32 offset = 0; offset < 0x1800; offset += 4)
+				sFirmware[offset / 4] = rd(fPhy, offset);
+			sHaveFirmware = true;
+		}
+		fFirmwarePhy = sHaveFirmware ? sFirmware : NULL;
 		if ((gdsc & 1) != 0)
 			wr(fGcc, fConnector.gdsc, gdsc & ~1u);
 		if (!wait_bits(fGcc, fConnector.gdsc, 1u << 31, 1u << 31)) {
@@ -355,6 +366,7 @@ UsbcDisplayPort::_PowerPhy()
 	if (fPhyLanes == 2 && !keep && _PowerUsb() == B_OK
 		&& connector < B_COUNT_OF(kConnectors))
 		sUsbSetUp[connector] = true;
+	fFirmwarePhy = NULL;
 	for (uint32 branch : fConnector.phyBranches)
 		branch_on(fGcc, branch);
 
@@ -392,6 +404,29 @@ UsbcDisplayPort::_PowerUsb()
 	}
 	for (const qmp_lane_setting& setting : kUsbPcs)
 		wr(fPhy + kPhyUsbPcs, setting.offset, setting.value);
+	// Where the firmware's set-up of this board's PHY (with which USB 3 ran
+	// at boot) differs, the firmware's values: the TX lanes, the USB serdes,
+	// PCS misc, PCS (but its controls) and PCS USB; not the RX blocks, whose
+	// differing registers are status
+	if (fFirmwarePhy != NULL) {
+		static const struct { uint32 start, end; } kBlocks[] = {
+			{0x0400, 0x0600}, {0x0a00, 0x0c00}, {0x1000, 0x1800}};
+		int copied = 0;
+		for (const auto& block : kBlocks) {
+			for (uint32 offset = block.start; offset < block.end; offset += 4) {
+				if (offset == kPhyUsbPcs + 0x00 || offset == kPhyUsbPcs + 0x14
+					|| offset == kPhyUsbPcs + 0x40 || offset == kPhyUsbPcs + 0x44)
+					continue;
+				uint32 theirs = fFirmwarePhy[offset / 4] & 0xff;
+				if ((rd(fPhy, offset) & 0xff) != theirs) {
+					wr(fPhy, offset, theirs);
+					copied++;
+				}
+			}
+		}
+		INFO("%s: %d USB 3 PHY registers set as the firmware had them\n",
+			fConnector.name, copied);
+	}
 	spin(20);
 	// SW_RESET off, SERDES_START | PCS_START, then PHYSTATUS (bit 6) clear
 	wr(fPhy + kPhyUsbPcs, 0x00, rd(fPhy + kPhyUsbPcs, 0x00) & ~1u);
@@ -797,6 +832,21 @@ UsbcDisplayPort::_Train(uint32* _lanes)
 	status_t status = fPort->ReadDpcd(0x000, caps, sizeof(caps));
 	if (status != B_OK)
 		return status;
+	// a DisplayPort to HDMI converter (a downstream port of type HDMI,
+	// DPCD 0x080) set to HDMI output, not DVI
+	// (DP_PROTOCOL_CONVERTER_CONTROL_0's HDMI_DVI_OUTPUT_CONFIG, as i915
+	// sets it)
+	if ((caps[5] & 1) != 0) {
+		uint8 port;
+		if (fPort->ReadDpcd(0x080, &port, 1) == B_OK && (port & 7) == 3) {
+			uint8 control;
+			if (fPort->ReadDpcd(0x3050, &control, 1) == B_OK
+				&& (control & 1) == 0) {
+				control |= 1;
+				fPort->WriteDpcd(0x3050, &control, 1);
+			}
+		}
+	}
 	// the sink (or branch device) in D0 (msm_dp_link_psm_config(),
 	// DP_SET_POWER)
 	uint8 power;
@@ -1030,6 +1080,28 @@ UsbcDisplayPort::ReadEdid(uint8* edid, uint32* _length)
 }
 
 
+/*!	Lab: what a branch device (a DisplayPort to HDMI converter) says of
+	itself: DPCD 0x005 (downstream port present), 0x007, the downstream
+	ports' capabilities (0x080), its OUI, name and versions (0x500), its
+	protocol converter controls (0x3050). */
+void
+UsbcDisplayPort::_DumpBranch()
+{
+	static const struct { uint32 address, length; } kRanges[] = {
+		{0x000, 16}, {0x080, 16}, {0x500, 12}, {0x3050, 4}};
+	for (const auto& range : kRanges) {
+		uint8 data[16] = {};
+		status_t status = fPort->ReadDpcd(range.address, data, range.length);
+		char line[64];
+		size_t length = 0;
+		for (uint32 i = 0; i < range.length; i++)
+			length += snprintf(line + length, sizeof(line) - length, " %02x", data[i]);
+		INFO("%s: DPCD %#06" B_PRIx32 ":%s%s\n", fConnector.name, range.address,
+			status == B_OK ? line : " -", status == B_OK ? "" : " (no answer)");
+	}
+}
+
+
 void
 UsbcDisplayPort::Attention()
 {
@@ -1119,6 +1191,7 @@ UsbcDisplayPort::_Link(const display_timing& timing, bool wideBus)
 			delete_area(oursArea);
 	}
 	_DumpAgainstHdmi();
+	_DumpBranch();
 	void* settings = load_driver_settings("qcom_display");
 	bool testPattern = get_driver_boolean_parameter(settings, "usbc_tpg",
 		false, true);
