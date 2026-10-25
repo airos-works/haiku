@@ -1764,6 +1764,12 @@ qcom_adsp_init_driver(device_node* node, void** _cookie)
 		return status;
 	}
 
+	// No crash dump mode after a crash: the board's TCSR download mode
+	// cookie (the device tree's qcom,dload-mode = <&tcsr 0x13000>) cleared
+	// as Linux' qcom_scm does at probe
+	if (qcom_scm_clear_download_mode(0x1fc0000 + 0x13000) != B_OK)
+		ERROR("cannot clear the download mode\n");
+
 	sBootThread = spawn_kernel_thread(boot_thread, "qcom adsp start",
 		B_NORMAL_PRIORITY, NULL);
 	if (sBootThread >= 0)

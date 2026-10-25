@@ -12,6 +12,7 @@
 #include "audioreach.h"
 #include "codec.h"
 #include "dsp.h"
+#include "qcom_smmu.h"
 
 
 namespace qcom_audio {
@@ -29,6 +30,7 @@ struct AudioDevice {
 	Dsp				dsp;
 	Codec			codec;
 	Playback		playback;
+	QcomSmmuDomain	smmu;			// what the DSP reaches of ours
 	thread_id		startThread;
 	bool			ready;
 	bool			startDone;		// the start thread is through

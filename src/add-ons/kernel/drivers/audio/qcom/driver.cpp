@@ -59,53 +59,21 @@ data_hook(void* cookie, const qcom_gpr_packet* packet)
 }
 
 
-/*!	The apps SMMU faults streams it has no mapping for (sCR0.USFCFG); the
-	DSP reaches the buffers it is given as stream 0xc01 (the device tree's
-	q6apm "dais" node). It gets a stream mapping to the context bank the
-	firmware left untranslated (SCTLR.M 0, as the SD controller's stream),
-	so it sees physical addresses.
+/*!	The DSP reaches the buffers it is given as stream 0xc01 (the device
+	tree's q6apm "dais" node): a context bank of its own that maps only
+	them, at their own addresses. (Through the firmware's untranslated bank
+	the board hung once the DSP read them.)
 */
 static status_t
-map_dsp_stream()
+map_dsp_stream(AudioDevice* device)
 {
-	static const uint32 kStream = 0xc01;
-	volatile uint32* smmu;
-	area_id area = map_physical_memory("qcom audio apps smmu", 0x15000000,
-		0x1000, B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY,
-		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&smmu);
-	if (area < 0)
-		return area;
-	uint32 groups = smmu[0x20 / 4] & 0xff;
-	int32 free = -1;
-	int32 sdIndex = -1;
-	status_t status = B_OK;
-	for (uint32 i = 0; i < groups; i++) {
-		uint32 smr = smmu[(0x800 + 4 * i) / 4];
-		if ((smr & (1u << 31)) == 0) {
-			if (free < 0)
-				free = i;
-			continue;
-		}
-		if ((smr & 0x7fff) == kStream) {
-			TRACE("stream %#" B_PRIx32 " already mapped (S2CR %#" B_PRIx32
-				")\n", kStream, smmu[(0xc00 + 4 * i) / 4]);
-			delete_area(area);
-			return B_OK;
-		}
-		if ((smr & 0x7fff) == 0x4e0)
-			sdIndex = i;
+	static const uint32 kStreams[][2] = {{0xc01, 0}};
+	status_t status = device->smmu.Attach("qcom_audio", kStreams, 1);
+	if (status == B_OK) {
+		status = device->smmu.Map(device->buffersPhysical,
+			device->buffersPhysical,
+			ROUNDUP(kBufferCount * kBufferSize, B_PAGE_SIZE), false);
 	}
-	if (free < 0 || sdIndex < 0) {
-		status = B_ERROR;
-	} else {
-		smmu[(0xc00 + 4 * free) / 4] = smmu[(0xc00 + 4 * sdIndex) / 4];
-		smmu[(0x800 + 4 * free) / 4] = 1u << 31 | kStream;
-		memory_full_barrier();
-		TRACE("stream %#" B_PRIx32 " mapped as SMR %" B_PRId32 ": %#" B_PRIx32
-			", S2CR %#" B_PRIx32 "\n", kStream, free,
-			smmu[(0x800 + 4 * free) / 4], smmu[(0xc00 + 4 * free) / 4]);
-	}
-	delete_area(area);
 	return status;
 }
 
@@ -180,46 +148,17 @@ test_tone(AudioDevice* device)
 		return;
 	}
 	if (oneBuffer) {
-		// lab: what the SMMU makes of the DSP's reads: the global fault
-		// status, context bank 2's (at page NUMPAGENDXB: 128 pages of 4 KiB
-		// from IDR1)
-		volatile uint32* smmu;
-		area_id area = map_physical_memory("qcom audio smmu faults",
-			0x15000000, 0x1000, B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY,
-			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&smmu);
-		volatile uint32* gr1;
-		area_id gr1Area = map_physical_memory("qcom audio smmu gr1",
-			0x15001000, 0x1000, B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY,
-			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&gr1);
-		volatile uint32* cb2;
-		area_id cbArea = map_physical_memory("qcom audio smmu cb2",
-			0x15000000 + 0x80000 + 2 * 0x1000, 0x1000,
-			B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY,
-			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&cb2);
-		if (area < 0 || gr1Area < 0 || cbArea < 0)
-			return;
-		TRACE("smmu: sGFSR %#" B_PRIx32 ", CBAR2 %#" B_PRIx32 " CBA2R2 %#"
-			B_PRIx32 ", CB2 SCTLR %#" B_PRIx32 " TCR %#" B_PRIx32 " FSR %#"
-			B_PRIx32 "\n", smmu[0x48 / 4], gr1[0x8 / 4], gr1[0x808 / 4],
-			cb2[0], cb2[0x30 / 4], cb2[0x58 / 4]);
-		snooze(10000);
+		// lab: what the SMMU makes of the DSP's reads
 		device->playback.Write(device->buffersPhysical, kBufferSize, 0);
 		for (int i = 0; i < 300; i++) {
-			uint32 gfsr = smmu[0x48 / 4];
-			uint32 fsr = cb2[0x58 / 4] & ~0x600u;	// not FORMAT
-			if (gfsr != 0 || fsr != 0 || device->doneCount > 0 || i == 299) {
-				TRACE("smmu after %d ms: sGFSR %#" B_PRIx32 " sGFSYNR1 %#"
-					B_PRIx32 ", CB2 FSR %#" B_PRIx32 " FAR %#" B_PRIx32 "%08"
-					B_PRIx32 " FSYNR0 %#" B_PRIx32 ", done %" B_PRId32 "\n", i,
-					gfsr, smmu[0x54 / 4], fsr, cb2[0x64 / 4], cb2[0x60 / 4],
-					cb2[0x68 / 4], device->doneCount);
+			if (device->smmu.Faults("one buffer") != 0
+				|| device->doneCount > 0 || i == 299) {
+				TRACE("one buffer after %d ms: %" B_PRId32 " done\n", i,
+					device->doneCount);
 				break;
 			}
 			spin(1000);
 		}
-		delete_area(gr1Area);
-		delete_area(cbArea);
-		delete_area(area);
 		snooze(500000);
 		device->playback.Stop();
 		TRACE("test tone: stopped, %" B_PRId32 " done\n", device->doneCount);
@@ -236,6 +175,7 @@ test_tone(AudioDevice* device)
 				!= B_OK) {
 			TRACE("test tone: no buffer done for 0.5 s (%" B_PRId32 " done)\n",
 				device->doneCount);
+			device->smmu.Faults("test tone");
 			break;
 		}
 		device->playback.Write(device->buffersPhysical
@@ -289,9 +229,9 @@ start_up(AudioDevice* device)
 		TRACE("codec: %s\n", strerror(status));
 		return status;
 	}
-	status = map_dsp_stream();
+	status = allocate_buffers(device);
 	if (status == B_OK)
-		status = allocate_buffers(device);
+		status = map_dsp_stream(device);
 	if (status == B_OK)
 		status = device->playback.Open(48000, 2, 16);
 	if (status == B_OK) {
@@ -392,6 +332,7 @@ qcom_audio_uninit_driver(void* cookie)
 	device->playback.Close();
 	device->codec.PowerDown();
 	device->dsp.Uninit();
+	device->smmu.Detach();
 	if (device->bufferArea >= 0)
 		delete_area(device->bufferArea);
 	delete_sem(device->doneSem);
