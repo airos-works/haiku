@@ -265,12 +265,18 @@ BMediaRecorder::Start(bool force)
 	// start node here
 	status_t err = B_OK;
 
-	if ((fOutputNode.kind & B_TIME_SOURCE) != 0)
+	// A producer that is its own time source (a sound card's node) is
+	// started as both: its clock, and the node itself, which only delivers
+	// buffers once started (the system mixer starts a sound card's node
+	// only while it plays, and stops it again)
+	if ((fOutputNode.kind & B_TIME_SOURCE) != 0) {
 		err = BMediaRoster::CurrentRoster()->StartTimeSource(
 			fOutputNode, BTimeSource::RealTime());
-	else
+	}
+	if (err == B_OK) {
 		err = BMediaRoster::CurrentRoster()->StartNode(
 			fOutputNode, fNode->TimeSource()->Now());
+	}
 
 	// then un-mute it
 	if (err == B_OK) {
