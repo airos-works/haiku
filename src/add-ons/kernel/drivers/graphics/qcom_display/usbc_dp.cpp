@@ -770,7 +770,13 @@ UsbcDisplayPort::_EnableMainlink(uint32 lanes)
 		| 0x40						// enhanced framing
 		| 0x04 | 0x02 | 0x01;		// progressive, static Mvid, sync clock
 	wr(fController, DP_CONFIGURATION_CTRL, config);
-	wr(fController, DP_LANE_MAPPING, 0 | 1u << 2 | 2u << 4 | 3u << 6);
+	// logical lane n onto physical lane (map >> 2n) & 3, one to one (lab:
+	// "usbc_lane_map 0xe1" swaps lanes 0 and 1)
+	void* settings = load_driver_settings("qcom_display");
+	uint32 laneMap = strtoul(get_driver_parameter(settings, "usbc_lane_map",
+		"0xe4", "0xe4"), NULL, 0) & 0xff;
+	unload_driver_settings(settings);
+	wr(fController, DP_LANE_MAPPING, laneMap);
 	uint32 control = rd(fController, DP_MAINLINK_CTRL) & ~3u;
 	wr(fController, DP_MAINLINK_CTRL, control);
 	wr(fController, DP_MAINLINK_CTRL, control | 2);			// reset
