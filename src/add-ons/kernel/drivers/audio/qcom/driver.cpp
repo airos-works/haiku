@@ -140,7 +140,8 @@ test_tone(AudioDevice* device)
 	bool startDevice = !get_driver_boolean_parameter(settings,
 		"stream_only", false, true);
 	unload_driver_settings(settings);
-	TRACE("test tone: starting the graph%s\n", startOnly ? " (no buffers)" : "");
+	TRACE("test tone: starting the graph%s at %" B_PRId64 " ms\n",
+		startOnly ? " (no buffers)" : "", system_time() / 1000);
 	device->smmu.Faults("before the graph");
 	// the RX macro takes the codec DMA's samples before the graph runs, as
 	// DAPM powers its path before the trigger in Linux
@@ -264,6 +265,29 @@ test_tone(AudioDevice* device)
 static status_t start_up(AudioDevice* device);
 
 
+/*!	Lab ("watch_dsp"): the DSP's SMP2P state every 5 ms for a minute,
+	changes logged with its crash reason, to see which step crashes it.
+*/
+static status_t
+watch_dsp(void* cookie)
+{
+	AudioDevice* device = (AudioDevice*)cookie;
+	uint32 last = 0xffffffff;
+	for (int i = 0; i < 12000; i++) {
+		char reason[96];
+		uint32 state = device->dsp.State(reason, sizeof(reason));
+		if (state != last) {
+			TRACE("watch: DSP state %#" B_PRIx32 " at %" B_PRId64 " ms%s%s\n",
+				state, system_time() / 1000, (state & 1) != 0 ? ": " : "",
+				(state & 1) != 0 ? reason : "");
+			last = state;
+		}
+		snooze(5000);
+	}
+	return B_OK;
+}
+
+
 static status_t
 start_thread(void* cookie)
 {
@@ -287,6 +311,13 @@ start_up(AudioDevice* device)
 	if (!enabled)
 		return B_OK;
 	status_t status = device->dsp.WaitReady(60000000);
+	enableSettings = load_driver_settings("qcom_audio");
+	if (get_driver_boolean_parameter(enableSettings, "watch_dsp", false,
+			true)) {
+		resume_thread(spawn_kernel_thread(watch_dsp, "qcom audio watch",
+			B_URGENT_DISPLAY_PRIORITY, device));
+	}
+	unload_driver_settings(enableSettings);
 	if (status != B_OK) {
 		TRACE("the audio DSP did not come up\n");
 		return status;
