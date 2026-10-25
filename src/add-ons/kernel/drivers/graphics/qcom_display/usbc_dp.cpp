@@ -10,6 +10,7 @@
 
 #include <new>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <KernelExport.h>
@@ -876,10 +877,16 @@ UsbcDisplayPort::_Train(uint32* _lanes)
 		tps3 ? ", TPS3" : "");
 	*_lanes = lanes;
 
+	// lab ("usbc_max_rate 270"): no rate above that many MHz
+	void* settings = load_driver_settings("qcom_display");
+	uint32 maxRate = strtoul(get_driver_parameter(settings, "usbc_max_rate",
+		"810", "810"), NULL, 10);
+	unload_driver_settings(settings);
+
 	// the sink's highest rate first, lower ones when that does not train
 	status = B_NOT_SUPPORTED;
 	for (int32 i = B_COUNT_OF(kRates) - 1; i >= 0; i--) {
-		if (kRates[i].dpcd > caps[1])
+		if (kRates[i].dpcd > caps[1] || kRates[i].rate > maxRate)
 			continue;
 		// HBR3 needs TPS3 at least; TPS4 is not used
 		if (kRates[i].rate == 810 && !tps3)

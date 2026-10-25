@@ -33,6 +33,9 @@ public:
 			status_t			Map(uint64 address, phys_addr_t physical,
 									size_t size, bool cached);
 			void				Unmap(uint64 address, size_t size);
+			//! Lab: the pages' access flags cleared, so the device's first
+			//! access to each faults (its FSR and FAR say which it touched).
+			void				ClearAccessFlags(uint64 address, size_t size);
 
 			//! Its fault status; with \a when, logged if there is a fault.
 			uint32				Faults(const char* when = NULL);

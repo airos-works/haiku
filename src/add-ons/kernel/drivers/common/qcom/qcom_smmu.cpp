@@ -114,6 +114,19 @@ QcomSmmuDomain::Attach(const char* name, const uint32 (*streams)[2],
 
 	for (uint32 s = 0; s < streamCount; s++) {
 		uint32 smr = kSmrValid | streams[s][1] << 16 | streams[s][0];
+		// another valid entry that matches the stream too: the SMMU's
+		// behaviour is then undefined (a stream match conflict)
+		for (uint32 i = 0; i < groups; i++) {
+			uint32 value = _Read(kSmmuSmr + 4 * i);
+			if ((value & kSmrValid) == 0 || value == smr)
+				continue;
+			uint32 mask = (value >> 16 | streams[s][1]) & 0x7fff;
+			if (((value ^ streams[s][0]) & ~mask & 0x7fff) == 0) {
+				dprintf("%s: stream %#" B_PRIx32 " also matches entry %" B_PRIu32
+					" (%#" B_PRIx32 ", S2CR %#" B_PRIx32 ")\n", fName,
+					streams[s][0], i, value, _Read(kSmmuS2cr + 4 * i));
+			}
+		}
 		int32 entry = -1;
 		for (uint32 i = 0; i < groups; i++) {
 			uint32 value = _Read(kSmmuSmr + 4 * i);
@@ -205,11 +218,33 @@ QcomSmmuDomain::Unmap(uint64 address, size_t size)
 }
 
 
+void
+QcomSmmuDomain::ClearAccessFlags(uint64 address, size_t size)
+{
+	for (size_t offset = 0; offset < size; offset += B_PAGE_SIZE) {
+		uint64* level3 = _Level3(address + offset, false);
+		if (level3 != NULL)
+			level3[((address + offset) >> 12) & 511] &= ~(1ull << 10);
+	}
+	memory_full_barrier();
+	_FlushTlb();
+}
+
+
 uint32
 QcomSmmuDomain::Faults(const char* when)
 {
 	if (fRegisters == NULL || fBank < 0)
 		return 0;
+	// a global fault: a stream no entry matches, say (sGFSR, sGFSYNR0-1)
+	uint32 global = _Read(0x48);
+	if (global != 0 && when != NULL) {
+		dprintf("%s: %s: SMMU global fault, GFSR %#" B_PRIx32 " GFSYNR0 %#"
+			B_PRIx32 " stream %#" B_PRIx32 " GFAR %#" B_PRIx32 "%08" B_PRIx32
+			"\n", fName, when, global, _Read(0x50), _Read(0x54) & 0xffff,
+			_Read(0x44), _Read(0x40));
+		_Write(0x48, global);
+	}
 	uint32 cb = fContexts + fBank * fPageSize;
 	uint32 status = _Read(cb + 0x58) & ~0x600u;		// not FORMAT
 	if (status != 0 && when != NULL) {

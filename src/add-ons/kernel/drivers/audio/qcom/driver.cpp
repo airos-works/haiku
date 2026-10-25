@@ -131,6 +131,7 @@ test_tone(AudioDevice* device)
 		"stream_only", false, true);
 	unload_driver_settings(settings);
 	TRACE("test tone: starting the graph%s\n", startOnly ? " (no buffers)" : "");
+	device->smmu.Faults("before the graph");
 	// the RX macro takes the codec DMA's samples before the graph runs, as
 	// DAPM powers its path before the trigger in Linux
 	device->codec.EnableHeadphonePath(48000);
@@ -148,6 +149,17 @@ test_tone(AudioDevice* device)
 		return;
 	}
 	if (oneBuffer) {
+		// lab ("access_probe"): does the DSP read the buffer through our
+		// context bank at all? Its first read then faults there.
+		void* probeSettings = load_driver_settings("qcom_audio");
+		bool accessProbe = get_driver_boolean_parameter(probeSettings,
+			"access_probe", false, true);
+		unload_driver_settings(probeSettings);
+		if (accessProbe) {
+			device->smmu.ClearAccessFlags(device->buffersPhysical,
+				ROUNDUP(kBufferCount * kBufferSize, B_PAGE_SIZE));
+			TRACE("one buffer: the buffers' access flags cleared\n");
+		}
 		// lab: what the SMMU makes of the DSP's reads: our bank, and the
 		// firmware's bank 4 (stream 0x1000/0x402, the DSP's own, as it
 		// seems), its SCTLR (stall on fault?) and FSR
