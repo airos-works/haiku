@@ -316,9 +316,10 @@ Playback::SetVolume(uint16 gain)
 status_t
 Playback::Write(phys_addr_t address, uint32 size, uint32 token)
 {
-	// apm_data_cmd_wr_sh_mem_ep_data_buffer_v2: no time stamp, no metadata
+	// apm_data_cmd_wr_sh_mem_ep_data_buffer_v2: no time stamp (flags
+	// 0xff00, as Linux sends them), no metadata
 	uint32 payload[11] = { (uint32)address, (uint32)((uint64)address >> 32),
-		fMemoryHandle, size, 0, 0, 0, 0, 0, 0, 0 };
+		fMemoryHandle, size, 0, 0, 0xff00, 0, 0, 0, 0 };
 	return fDsp.SendData(kWriteEndpointInstance, kWriteBuffer, token,
 		payload, sizeof(payload));
 }
