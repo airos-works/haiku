@@ -77,6 +77,7 @@ private:
 			void				_SetPixelClock();
 			status_t			_InitPort();
 			void				_DumpAgainstHdmi();
+			void				_DumpBranch();
 			void				_TestPattern(const display_timing& timing);
 			void				_EnableAux();
 			void				_EnableMainlink(uint32 lanes);

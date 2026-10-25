@@ -9,6 +9,7 @@
 #include "display_port.h"
 
 #include <new>
+#include <stdio.h>
 #include <string.h>
 
 #include <KernelExport.h>
@@ -797,6 +798,21 @@ UsbcDisplayPort::_Train(uint32* _lanes)
 	status_t status = fPort->ReadDpcd(0x000, caps, sizeof(caps));
 	if (status != B_OK)
 		return status;
+	// a DisplayPort to HDMI converter (a downstream port of type HDMI,
+	// DPCD 0x080) set to HDMI output, not DVI
+	// (DP_PROTOCOL_CONVERTER_CONTROL_0's HDMI_DVI_OUTPUT_CONFIG, as i915
+	// sets it)
+	if ((caps[5] & 1) != 0) {
+		uint8 port;
+		if (fPort->ReadDpcd(0x080, &port, 1) == B_OK && (port & 7) == 3) {
+			uint8 control;
+			if (fPort->ReadDpcd(0x3050, &control, 1) == B_OK
+				&& (control & 1) == 0) {
+				control |= 1;
+				fPort->WriteDpcd(0x3050, &control, 1);
+			}
+		}
+	}
 	// the sink (or branch device) in D0 (msm_dp_link_psm_config(),
 	// DP_SET_POWER)
 	uint8 power;
@@ -1030,6 +1046,28 @@ UsbcDisplayPort::ReadEdid(uint8* edid, uint32* _length)
 }
 
 
+/*!	Lab: what a branch device (a DisplayPort to HDMI converter) says of
+	itself: DPCD 0x005 (downstream port present), 0x007, the downstream
+	ports' capabilities (0x080), its OUI, name and versions (0x500), its
+	protocol converter controls (0x3050). */
+void
+UsbcDisplayPort::_DumpBranch()
+{
+	static const struct { uint32 address, length; } kRanges[] = {
+		{0x000, 16}, {0x080, 16}, {0x500, 12}, {0x3050, 4}};
+	for (const auto& range : kRanges) {
+		uint8 data[16] = {};
+		status_t status = fPort->ReadDpcd(range.address, data, range.length);
+		char line[64];
+		size_t length = 0;
+		for (uint32 i = 0; i < range.length; i++)
+			length += snprintf(line + length, sizeof(line) - length, " %02x", data[i]);
+		INFO("%s: DPCD %#06" B_PRIx32 ":%s%s\n", fConnector.name, range.address,
+			status == B_OK ? line : " -", status == B_OK ? "" : " (no answer)");
+	}
+}
+
+
 void
 UsbcDisplayPort::Attention()
 {
@@ -1119,6 +1157,7 @@ UsbcDisplayPort::_Link(const display_timing& timing, bool wideBus)
 			delete_area(oursArea);
 	}
 	_DumpAgainstHdmi();
+	_DumpBranch();
 	void* settings = load_driver_settings("qcom_display");
 	bool testPattern = get_driver_boolean_parameter(settings, "usbc_tpg",
 		false, true);
