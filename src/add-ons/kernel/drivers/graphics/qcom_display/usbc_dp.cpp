@@ -240,6 +240,59 @@ UsbcDisplayPort::_Map(area_id& area, volatile uint8*& base, const char* name,
 }
 
 
+// The combo PHY's USB 3 half, as Linux' sc8280xp_usb43dpphy_cfg sets it
+// up (phy-qcom-qmp-combo.c, v5 offsets): serdes at 0x1000, the lanes' TX
+// at 0x400/0xa00 and RX at 0x600/0xc00 (lane 1, lane 2), PCS at 0x1400
+struct qmp_lane_setting {
+	uint16	offset;
+	uint8	value;
+	uint8	lanes;		// 1: the first lane's block, 2: the second's
+};
+
+// Linux' sc8280xp_usb43dp_serdes_tbl (47)
+static const qmp_lane_setting kUsbSerdes[] = {
+	{0x010, 0x01, 3}, {0x01c, 0x31, 3}, {0x020, 0x01, 3}, {0x024, 0xfd, 3},
+	{0x028, 0x0d, 3}, {0x030, 0xfd, 3}, {0x034, 0x0d, 3}, {0x050, 0x0a, 3},
+	{0x074, 0x02, 3}, {0x078, 0x02, 3}, {0x07c, 0x16, 3}, {0x080, 0x16, 3},
+	{0x084, 0x36, 3}, {0x088, 0x36, 3}, {0x094, 0x1a, 3}, {0x0a4, 0x04, 3},
+	{0x0ac, 0x14, 3}, {0x0b0, 0x34, 3}, {0x0b4, 0x34, 3}, {0x0b8, 0x82, 3},
+	{0x0bc, 0x04, 3}, {0x0c0, 0x01, 3}, {0x0c4, 0x04, 3}, {0x0c8, 0x01, 3},
+	{0x0cc, 0x55, 3}, {0x0d0, 0xd5, 3}, {0x0d4, 0x05, 3}, {0x0d8, 0x55, 3},
+	{0x0dc, 0xd5, 3}, {0x0e0, 0x05, 3}, {0x10c, 0x02, 3}, {0x110, 0xd4, 3},
+	{0x114, 0x00, 3}, {0x118, 0xd4, 3}, {0x11c, 0x00, 3}, {0x158, 0x13, 3},
+	{0x15c, 0x00, 3}, {0x168, 0x0a, 3}, {0x16c, 0x04, 3}, {0x174, 0x60, 3},
+	{0x17c, 0x76, 3}, {0x058, 0xff, 3}, {0x0ec, 0x20, 3}, {0x0f4, 0x20, 3},
+	{0x124, 0x00, 3}, {0x134, 0x01, 3}, {0x184, 0x0a, 3},
+};
+// Linux' sc8280xp_usb43dp_tx_tbl (5)
+static const qmp_lane_setting kUsbTx[] = {
+	{0x078, 0x05, 3}, {0x07c, 0xc2, 3}, {0x080, 0x10, 3}, {0x030, 0x1f, 3},
+	{0x034, 0x0a, 3},
+};
+// Linux' sc8280xp_usb43dp_rx_tbl (34)
+static const qmp_lane_setting kUsbRx[] = {
+	{0x1ec, 0x04, 3}, {0x1f4, 0x0e, 3}, {0x1e8, 0x00, 3}, {0x228, 0xd2, 3},
+	{0x22c, 0xd2, 3}, {0x230, 0xdb, 3}, {0x234, 0x21, 3}, {0x238, 0x3f, 3},
+	{0x23c, 0x80, 3}, {0x240, 0x45, 3}, {0x244, 0x00, 3}, {0x248, 0x6b, 3},
+	{0x24c, 0x63, 3}, {0x250, 0xb6, 3}, {0x254, 0x23, 3}, {0x258, 0x35, 3},
+	{0x25c, 0x30, 3}, {0x260, 0x8e, 3}, {0x264, 0x00, 3}, {0x130, 0x00, 3},
+	{0x138, 0x80, 3}, {0x140, 0x1b, 3}, {0x294, 0x38, 3}, {0x0bc, 0x15, 3},
+	{0x088, 0x0a, 3}, {0x13c, 0x7c, 3}, {0x198, 0x00, 3}, {0x1a0, 0x0d, 3},
+	{0x178, 0x00, 3}, {0x154, 0x45, 3}, {0x1bc, 0x09, 3}, {0x0a4, 0x09, 3},
+	{0x0b4, 0x05, 3}, {0x310, 0x3f, 3},
+};
+// Linux' sc8280xp_usb43dp_pcs_tbl (16)
+static const qmp_lane_setting kUsbPcs[] = {
+	{0x190, 0xe7, 3}, {0x194, 0x03, 3}, {0x0c4, 0xd0, 3}, {0x0c8, 0x07, 3},
+	{0x0cc, 0x20, 3}, {0x0d8, 0x13, 3}, {0x0dc, 0x21, 3}, {0x188, 0xaa, 3},
+	{0x1b0, 0x0a, 3}, {0x1c0, 0x88, 3}, {0x1c4, 0x13, 3}, {0x1d0, 0x0c, 3},
+	{0x1dc, 0x4b, 3}, {0x1ec, 0x10, 3}, {0x018, 0xf8, 3}, {0x03c, 0x07, 3},
+};
+
+static const uint32 kPhyUsbSerdes = 0x1000, kPhyUsbPcs = 0x1400;
+static const uint32 kPhyRxA = 0x0600, kPhyRxB = 0x0c00;
+
+
 /*!	The combo PHY in USB3 + DisplayPort mode at RBR, four lanes, the normal
 	orientation (qmp_combo_com_init(), qmp_v4_dp_aux_init(),
 	qmp_combo_dp_power_on(), qmp_v4_configure_dp_phy()). Its supplies (L9D,
@@ -251,19 +304,25 @@ UsbcDisplayPort::_PowerPhy()
 	volatile uint8* serdes = fPhy + kPhyDpSerdes;
 	volatile uint8* dp = fPhy + kPhyDpPhy;
 
-	// With two lanes USB 3 runs beside DisplayPort on the same PHY: if the
-	// firmware (or the USB side) has the common block up in USB 3 mode, in
-	// our orientation, it is left alone, as Linux' qmp_combo_com_init() runs
-	// once for both halves; resetting it drops the USB 3 link.
+	// Linux' qmp_combo_typec_mux_set(): the PHY reset, its common block in
+	// the new mode and orientation, then (with two DisplayPort lanes) its
+	// USB 3 half set up again, beside DisplayPort
+	// Once set up so after boot, a PHY already in USB 3 + DP mode in our
+	// orientation with its USB 3 PCS up is kept: resetting it again resets
+	// a hub's USB 3 link, the hub, and its DisplayPort to HDMI converter,
+	// which drops HPD, which brings us here again.
+	static bool sUsbSetUp[B_COUNT_OF(kConnectors)];
+	uint32 connector = &fConnector - kConnectors;
 	uint32 gdsc = rd(fGcc, fConnector.gdsc);
-	bool usbRunning = fPhyLanes == 2 && (gdsc & (1u << 31)) != 0
-		&& (rd(com, COM_PHY_MODE_CTRL) & 1) != 0
-		&& (rd(com, COM_SW_RESET) & 1) == 0
-		&& (rd(com, COM_TYPEC_CTRL) & 3) == (1u << 1 | (fReverse ? 1 : 0));
-	if (usbRunning) {
-		INFO("%s: USB 3 runs on the PHY: its common block kept\n",
-			fConnector.name);
-		wr(com, COM_PHY_MODE_CTRL, 3);
+	bool keep = fPhyLanes == 2 && connector < B_COUNT_OF(kConnectors)
+		&& sUsbSetUp[connector] && (gdsc & (1u << 31)) != 0
+		&& rd(com, COM_PHY_MODE_CTRL) == 3
+		&& (rd(com, COM_TYPEC_CTRL) & 3) == (1u << 1 | (fReverse ? 1 : 0))
+		&& (rd(fPhy + kPhyUsbPcs, 0x14) & (1u << 6)) == 0;
+	if (keep) {
+		INFO("%s: the PHY's USB 3 half runs: kept\n", fConnector.name);
+		for (uint32 branch : fConnector.phyBranches)
+			branch_on(fGcc, branch);
 	} else {
 		if ((gdsc & 1) != 0)
 			wr(fGcc, fConnector.gdsc, gdsc & ~1u);
@@ -286,10 +345,16 @@ UsbcDisplayPort::_PowerPhy()
 		// four lanes, USB 3 beside it with two
 		wr(com, COM_TYPEC_CTRL, 1u << 1 | (fReverse ? 1 : 0));
 		wr(com, COM_PHY_MODE_CTRL, fPhyLanes == 4 ? 2 : 3);
-		wr(com, COM_RESET_OVRD_CTRL, rd(com, COM_RESET_OVRD_CTRL) & ~0xfu);
+		wr(com, COM_RESET_OVRD_CTRL, rd(com, COM_RESET_OVRD_CTRL)
+			& ~(fPhyLanes == 4 ? 0x3u : 0xfu));
 		wr(com, COM_SWI_CTRL, rd(com, COM_SWI_CTRL) & ~3u);
 		wr(com, COM_SW_RESET, rd(com, COM_SW_RESET) & ~1u);
+		// the USB 3 PCS powered (SW_PWRDN)
+		wr(fPhy + kPhyUsbPcs, 0x40, rd(fPhy + kPhyUsbPcs, 0x40) | 1);
 	}
+	if (fPhyLanes == 2 && !keep && _PowerUsb() == B_OK
+		&& connector < B_COUNT_OF(kConnectors))
+		sUsbSetUp[connector] = true;
 	for (uint32 branch : fConnector.phyBranches)
 		branch_on(fGcc, branch);
 
@@ -303,6 +368,39 @@ UsbcDisplayPort::_PowerPhy()
 	wr(dp, DP_PHY_AUX_INTERRUPT_MASK, 0x1f);
 
 	return _ConfigureRate(162);
+}
+
+
+/*!	qmp_combo_usb_power_on(): the USB 3 serdes, both lanes' TX and RX, the
+	PCS, out of reset and started; then the xHCI's SuperSpeed port trains
+	its link again (its hub warm resets it if it went inactive). */
+status_t
+UsbcDisplayPort::_PowerUsb()
+{
+	for (const qmp_lane_setting& setting : kUsbSerdes)
+		wr(fPhy + kPhyUsbSerdes, setting.offset, setting.value);
+	const uint32 tx[2] = {kPhyTxA, kPhyTxB}, rx[2] = {kPhyRxA, kPhyRxB};
+	for (int lane = 0; lane < 2; lane++) {
+		for (const qmp_lane_setting& setting : kUsbTx) {
+			if ((setting.lanes & (1u << lane)) != 0)
+				wr(fPhy + tx[lane], setting.offset, setting.value);
+		}
+		for (const qmp_lane_setting& setting : kUsbRx) {
+			if ((setting.lanes & (1u << lane)) != 0)
+				wr(fPhy + rx[lane], setting.offset, setting.value);
+		}
+	}
+	for (const qmp_lane_setting& setting : kUsbPcs)
+		wr(fPhy + kPhyUsbPcs, setting.offset, setting.value);
+	spin(20);
+	// SW_RESET off, SERDES_START | PCS_START, then PHYSTATUS (bit 6) clear
+	wr(fPhy + kPhyUsbPcs, 0x00, rd(fPhy + kPhyUsbPcs, 0x00) & ~1u);
+	wr(fPhy + kPhyUsbPcs, 0x44, rd(fPhy + kPhyUsbPcs, 0x44) | 3);
+	bool ready = wait_bits(fPhy + kPhyUsbPcs, 0x14, 1u << 6, 0);
+	INFO("%s: USB 3 on the PHY beside DisplayPort: %s (PCS status %#" B_PRIx32
+		")\n", fConnector.name, ready ? "ready" : "not ready",
+		rd(fPhy + kPhyUsbPcs, 0x14));
+	return ready ? B_OK : B_TIMED_OUT;
 }
 
 

@@ -476,16 +476,18 @@ Hub::Explore(change_item **changeList)
 		// A SuperSpeed link in SS.Inactive or Compliance (a USB-C port's lanes
 		// moved by its mux, say) recovers only by a warm reset
 		// (hub_port_warm_reset_required())
-		// (three tries; a USB-C port whose lanes all carry DisplayPort stays
-		// inactive), again once the link has left those states
+		// (a USB-C port whose lanes all carry DisplayPort stays inactive)
 		uint16 linkState = fPortStatus[i].status & (0xf << 5);
 		bool stuck = linkState == (0x6 << 5) || linkState == (0xa << 5);
 		if (!stuck)
 			fWarmResets[i] = 0;
 		if ((fPortStatus[i].status & PORT_STATUS_SS_POWER) != 0 && stuck
-			&& fWarmResets[i] < 3 && system_time() >= fNextWarmReset[i]) {
-			fWarmResets[i]++;
-			fNextWarmReset[i] = system_time() + 2000000;
+			&& system_time() >= fNextWarmReset[i]) {
+			// three tries two seconds apart, then one every 20 s (its PHY
+			// may be set up again meanwhile)
+			fWarmResets[i] = min_c(fWarmResets[i] + 1, 3);
+			fNextWarmReset[i] = system_time()
+				+ (fWarmResets[i] < 3 ? 2000000 : 20000000);
 			TRACE_ALWAYS("port %" B_PRId32 ": SuperSpeed link %s, warm reset\n",
 				i, linkState == (0x6 << 5) ? "inactive" : "in compliance mode");
 			DefaultPipe()->SendRequest(USB_REQTYPE_CLASS | USB_REQTYPE_OTHER_OUT,
