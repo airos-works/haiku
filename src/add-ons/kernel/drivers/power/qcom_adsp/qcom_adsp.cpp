@@ -1171,6 +1171,145 @@ altmode_request(uint32 command, uint32 argument)
 }
 
 
+// #pragma mark - QRTR
+
+
+/*	QRTR, the IPC router, over the ADSP's "IPCRTR" channel (Linux' net/qrtr
+	and its name service, ns.c): the ADSP says hello, announces its
+	services (NEW_SERVER) and looks up the ones it wants (NEW_LOOKUP); the
+	audio protection domain's service registry (servreg) runs over it. For
+	now: the hello answered, the rest logged. */
+
+enum {
+	kQrtrData = 1, kQrtrHello = 2, kQrtrBye = 3, kQrtrNewServer = 4,
+	kQrtrDelServer = 5, kQrtrDelClient = 6, kQrtrResumeTx = 7,
+	kQrtrExit = 8, kQrtrPing = 9, kQrtrNewLookup = 10, kQrtrDelLookup = 11,
+};
+
+static const uint32 kQrtrPortControl = 0xfffffffe;
+static const uint32 kQrtrNodeApps = 1;
+
+struct qrtr_header {			// qrtr_hdr_v1
+	uint32	version;
+	uint32	type;
+	uint32	sourceNode;
+	uint32	sourcePort;
+	uint32	confirmRx;
+	uint32	size;
+	uint32	destinationNode;
+	uint32	destinationPort;
+};
+
+struct qrtr_control {			// qrtr_ctrl_pkt
+	uint32	command;
+	uint32	service;			// or node (DEL_CLIENT)
+	uint32	instance;			// or port
+	uint32	node;
+	uint32	port;
+};
+
+static glink_channel* sQrtr;
+static uint32 sQrtrRemoteNode;
+static bool sQrtrHelloPending;
+
+
+static status_t
+qrtr_send(uint32 type, uint32 sourcePort, uint32 destinationNode,
+	uint32 destinationPort, const void* payload, uint32 size)
+{
+	uint8 packet[sizeof(qrtr_header) + 64];
+	if (sQrtr == NULL || size > 64)
+		return B_BAD_VALUE;
+	qrtr_header header = { 1, type, kQrtrNodeApps, sourcePort, 0, size,
+		destinationNode, destinationPort };
+	memcpy(packet, &header, sizeof(header));
+	memcpy(packet + sizeof(header), payload, size);
+	return glink_write(sQrtr, packet, (sizeof(header) + size + 3) & ~3u);
+}
+
+
+//!	The hello, once the ADSP has given room for it.
+static void
+qrtr_tick()
+{
+	if (!sQrtrHelloPending)
+		return;
+	qrtr_control control = { kQrtrHello, 0, 0, 0, 0 };
+	if (qrtr_send(kQrtrHello, kQrtrPortControl, sQrtrRemoteNode,
+			kQrtrPortControl, &control, sizeof(control)) == B_OK) {
+		sQrtrHelloPending = false;
+		TRACE("qrtr: hello sent to node %" B_PRIu32 "\n", sQrtrRemoteNode);
+	}
+}
+
+
+static void
+qrtr_receive(glink_channel* channel, const uint8* data, uint32 length)
+{
+	qrtr_header header;
+	if (length < sizeof(header))
+		return;
+	memcpy(&header, data, sizeof(header));
+	const uint8* payload = data + sizeof(header);
+	uint32 size = min_c(header.size, length - (uint32)sizeof(header));
+	if (header.version != 1) {
+		TRACE("qrtr: version %" B_PRIu32 " packet, %" B_PRIu32 " bytes\n",
+			header.version, length);
+		return;
+	}
+	qrtr_control control = {};
+	memcpy(&control, payload, min_c(size, (uint32)sizeof(control)));
+	switch (header.type) {
+		case kQrtrHello:
+			sQrtrRemoteNode = header.sourceNode;
+			TRACE("qrtr: hello from node %" B_PRIu32 "\n", header.sourceNode);
+			sQrtrHelloPending = true;
+			qrtr_tick();
+			break;
+		case kQrtrNewServer:
+		case kQrtrDelServer:
+			TRACE("qrtr: %s service %#" B_PRIx32 " instance %#" B_PRIx32
+				" at %" B_PRIu32 ":%#" B_PRIx32 "\n",
+				header.type == kQrtrNewServer ? "new" : "gone", control.service,
+				control.instance, control.node, control.port);
+			break;
+		case kQrtrNewLookup:
+		case kQrtrDelLookup:
+			TRACE("qrtr: node %" B_PRIu32 " port %#" B_PRIx32 " %s service %#"
+				B_PRIx32 " instance %#" B_PRIx32 "\n", header.sourceNode,
+				header.sourcePort,
+				header.type == kQrtrNewLookup ? "looks up" : "drops", control.service,
+				control.instance);
+			break;
+		default:
+		{
+			char hex[3 * 24 + 1] = "";
+			for (uint32 i = 0; i < size && i < 24; i++) {
+				snprintf(hex + 3 * i, sizeof(hex) - 3 * i, " %02x",
+					payload[i]);
+			}
+			TRACE("qrtr: type %" B_PRIu32 " %" B_PRIu32 ":%#" B_PRIx32 " -> %"
+				B_PRIu32 ":%#" B_PRIx32 ", %" B_PRIu32 " bytes%s%s\n",
+				header.type, header.sourceNode, header.sourcePort,
+				header.destinationNode, header.destinationPort, size,
+				header.confirmRx ? " (confirm)" : "", hex);
+			break;
+		}
+	}
+}
+
+
+//!	Lab: what the board's vendor channel says.
+static void
+log_receive(glink_channel* channel, const uint8* data, uint32 length)
+{
+	char hex[3 * 32 + 1] = "";
+	for (uint32 i = 0; i < length && i < 32; i++)
+		snprintf(hex + 3 * i, sizeof(hex) - 3 * i, " %02x", data[i]);
+	TRACE("glink: %s: %" B_PRIu32 " bytes:%s\n", channel->name, length, hex);
+}
+
+
 static void
 pmic_glink_receive(glink_channel* channel, const uint8* data, uint32 length)
 {
@@ -1688,6 +1827,12 @@ boot_thread(void*)
 	sGpr = glink_add_channel("adsp_apps");
 	sGpr->wanted = true;
 	sGpr->hook = gpr_receive;
+	sQrtr = glink_add_channel("IPCRTR");
+	sQrtr->wanted = true;
+	sQrtr->hook = qrtr_receive;
+	glink_channel* vendor = glink_add_channel("RADXA_SVC_ADSP_APPS");
+	vendor->wanted = true;
+	vendor->hook = log_receive;
 	sGlinkSem = create_sem(0, "qcom adsp glink");
 	if (sGlinkSem >= 0)
 		ipcc_interrupt_start();
@@ -1716,6 +1861,7 @@ boot_thread(void*)
 		glink_poll();
 		pmic_glink_tick();
 		gpr_tick();
+		qrtr_tick();
 		simulation_tick();
 		recursive_lock_unlock(&sGlinkLock);
 		// woken by the doorbell; now and then anyway, for the requests
