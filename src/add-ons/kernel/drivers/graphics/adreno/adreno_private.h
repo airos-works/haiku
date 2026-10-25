@@ -91,6 +91,7 @@ status_t	adreno_wait_fence(uint32 fence, bigtime_t deadline);
 bool		adreno_gpu_lost();
 uint64		adreno_timestamp();
 uint32		adreno_faults();
+	// how often the GPU was lost (and reset) since the bring-up
 
 uint32		adreno_pkt7(uint32 opcode, uint32 count);
 

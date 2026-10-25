@@ -1650,6 +1650,9 @@ static int32 sFaults;
 // a fault the GPU does not come back from by itself: its work fails (Turnip
 // reports the device lost) until gpu_recover() has reset it
 static int32 sGpuLost;
+// how often it was lost: for Turnip, which takes a change of MSM_PARAM_FAULTS
+// (or of a queue's faults) as its device lost
+static int32 sLosses;
 
 // the first fault's state, dumped by a thread (the interrupt handler cannot
 // map memory)
@@ -1777,6 +1780,7 @@ gpu_interrupt(void*)
 	}
 	if ((status & (INT_CP_HW_ERROR | INT_RBBM_HANG_DETECT)) != 0
 		&& atomic_get_and_set(&sGpuLost, 1) == 0) {
+		atomic_add(&sLosses, 1);
 		// halt the CP and stop hearing about it; waiters fail
 		gpu_write(REG_A6XX_CP_SQE_CNTL, 3);
 		gpu_write(RBBM_INT_0_MASK, INT_CP_CACHE_FLUSH_TS);
@@ -2232,7 +2236,7 @@ adreno_timestamp()
 uint32
 adreno_faults()
 {
-	return (uint32)sFaults;
+	return (uint32)atomic_get(&sLosses);
 }
 
 

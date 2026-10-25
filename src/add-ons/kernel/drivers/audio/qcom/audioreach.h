@@ -32,7 +32,10 @@ struct SubGraph;
 */
 class AudioPath {
 public:
-			enum Direction { kPlayback, kCapture, kDisplayPort };
+			// kDisplayPort: the HDMI bridge's DisplayPort controller (2);
+			// kUsbcDisplayPort0/1: the USB-C connectors' (0, 1)
+			enum Direction { kPlayback, kCapture, kDisplayPort,
+				kUsbcDisplayPort0, kUsbcDisplayPort1 };
 
 								AudioPath(Dsp& dsp, Direction direction);
 								~AudioPath();

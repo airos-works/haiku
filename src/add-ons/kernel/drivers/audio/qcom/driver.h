@@ -40,14 +40,17 @@ struct AudioDevice;
 
 
 /*!	A playback output, one multi_audio device each: the headphones (with
-	the headset input) or HDMI (the DSP's DISPLAY_PORT_RX into the board's
-	HDMI bridge). Its graph, its buffers (one physically contiguous area,
-	mapped for the DSP) and the stream's state.
+	the headset input), HDMI (the DSP's DISPLAY_PORT_RX into the board's
+	HDMI bridge) or a USB-C connector's DisplayPort. Its graph, its buffers
+	(one physically contiguous area, mapped for the DSP) and the stream's
+	state.
 */
 struct Output {
 	AudioDevice*	device;
 	AudioPath		path;
 	const char*		name;
+	const char*		vendor;
+	uint32			dpController;	// QCOM_DP_AUDIO_*, or kNoDisplayPort
 	uint32			token;			// its buffers': token | index
 	uint64			dspOffset;		// its buffers' above the device's base
 	bool			open;			// the graph open, the buffers mapped
@@ -68,11 +71,14 @@ struct Output {
 	bigtime_t		playedTime;
 
 	Output(Dsp& dsp, AudioPath::Direction direction, const char* name,
-			uint32 token, uint64 dspOffset)
+			const char* vendor, uint32 dpController, uint32 token,
+			uint64 dspOffset)
 		:
 		device(NULL),
 		path(dsp, direction),
 		name(name),
+		vendor(vendor),
+		dpController(dpController),
 		token(token),
 		dspOffset(dspOffset),
 		open(false),
@@ -92,9 +98,12 @@ struct Output {
 	}
 };
 
-static const uint32 kHeadphoneToken = 0;
-static const uint32 kHdmiToken = 0x100;
-static const uint64 kHdmiDspOffset = 0x20000;
+static const uint32 kNoDisplayPort = ~0u;
+// an output's buffers' tokens: its index << 8 | the buffer's; their place
+// for the DSP: its index * kOutputDspStride above the headphones' (the
+// capture buffers sit at kRecordDspOffset)
+static const uint32 kOutputCount = 4;
+static const uint64 kOutputDspStride = 0x10000;
 
 
 struct AudioDevice {
@@ -103,6 +112,9 @@ struct AudioDevice {
 	Codec			codec;
 	Output			headphones;
 	Output			hdmi;
+	Output			usbc0;			// DP-1
+	Output			usbc1;			// DP-2
+	Output*			outputs[kOutputCount];
 	AudioPath		capture;
 	QcomSmmuDomain	smmu;			// what the DSP reaches of ours
 	thread_id		startThread;
@@ -131,13 +143,25 @@ struct AudioDevice {
 
 	AudioDevice()
 		:
-		headphones(dsp, AudioPath::kPlayback, "headphones", kHeadphoneToken,
-			0),
-		hdmi(dsp, AudioPath::kDisplayPort, "HDMI", kHdmiToken,
-			kHdmiDspOffset),
+		headphones(dsp, AudioPath::kPlayback, "Headphones",
+			"Qualcomm SC8280XP / WCD9385", kNoDisplayPort, 0 << 8, 0),
+		hdmi(dsp, AudioPath::kDisplayPort, "HDMI",
+			"Qualcomm SC8280XP / CH7218A", QCOM_DP_AUDIO_HDMI, 1 << 8,
+			2 * kOutputDspStride),
+		usbc0(dsp, AudioPath::kUsbcDisplayPort0, "USB-C DisplayPort 1",
+			"Qualcomm SC8280XP", QCOM_DP_AUDIO_USBC_0, 2 << 8,
+			3 * kOutputDspStride),
+		usbc1(dsp, AudioPath::kUsbcDisplayPort1, "USB-C DisplayPort 2",
+			"Qualcomm SC8280XP", QCOM_DP_AUDIO_USBC_1, 3 << 8,
+			4 * kOutputDspStride),
 		capture(dsp, AudioPath::kCapture)
 	{
-		headphones.device = hdmi.device = this;
+		outputs[0] = &headphones;
+		outputs[1] = &hdmi;
+		outputs[2] = &usbc0;
+		outputs[3] = &usbc1;
+		for (Output* output : outputs)
+			output->device = this;
 	}
 };
 

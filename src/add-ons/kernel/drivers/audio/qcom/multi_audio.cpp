@@ -43,8 +43,8 @@ static const multi_channel_info kOutputChannels[] = {
 	{3, B_MULTI_OUTPUT_BUS, B_CHANNEL_RIGHT | B_CHANNEL_STEREO_BUS,
 		B_CHANNEL_MINI_JACK_STEREO},
 };
-// HDMI's two
-static const multi_channel_info kHdmiChannels[] = {
+// a DisplayPort's (HDMI's, USB-C's) two
+static const multi_channel_info kDisplayChannels[] = {
 	{0, B_MULTI_OUTPUT_CHANNEL, B_CHANNEL_LEFT | B_CHANNEL_STEREO_BUS, 0},
 	{1, B_MULTI_OUTPUT_CHANNEL, B_CHANNEL_RIGHT | B_CHANNEL_STEREO_BUS, 0},
 	{2, B_MULTI_OUTPUT_BUS, B_CHANNEL_LEFT | B_CHANNEL_STEREO_BUS, 0},
@@ -55,18 +55,16 @@ static const multi_channel_info kHdmiChannels[] = {
 static status_t
 get_description(Output* output, multi_description* userData)
 {
-	bool hdmi = output == &output->device->hdmi;
-	bool input = !hdmi && output->device->captureOpen;
+	bool display = output->dpController != kNoDisplayPort;
+	bool input = !display && output->device->captureOpen;
 	multi_description description;
 	if (user_memcpy(&description, userData, sizeof(description)) != B_OK)
 		return B_BAD_ADDRESS;
 	description.interface_version = B_CURRENT_INTERFACE_VERSION;
 	description.interface_minimum = B_CURRENT_INTERFACE_VERSION;
 	strlcpy(description.friendly_name,
-		hdmi ? "HDMI" : input ? "Headset" : "Headphones",
-		sizeof(description.friendly_name));
-	strlcpy(description.vendor_info,
-		hdmi ? "Qualcomm SC8280XP / CH7218A" : "Qualcomm SC8280XP / WCD9385",
+		input ? "Headset" : output->name, sizeof(description.friendly_name));
+	strlcpy(description.vendor_info, output->vendor,
 		sizeof(description.vendor_info));
 	description.output_channel_count = 2;
 	description.input_channel_count = input ? 2 : 0;
@@ -88,8 +86,8 @@ get_description(Output* output, multi_description* userData)
 	if (user_memcpy(userData, &description, sizeof(description)) != B_OK)
 		return B_BAD_ADDRESS;
 	const multi_channel_info* channels
-		= hdmi ? kHdmiChannels : input ? kChannels : kOutputChannels;
-	size_t size = hdmi ? sizeof(kHdmiChannels)
+		= display ? kDisplayChannels : input ? kChannels : kOutputChannels;
+	size_t size = display ? sizeof(kDisplayChannels)
 		: input ? sizeof(kChannels) : sizeof(kOutputChannels);
 	if (description.request_channel_count
 			>= (int32)(size / sizeof(multi_channel_info))
@@ -205,7 +203,7 @@ get_buffers(Output* output, multi_buffer_list* userData)
 }
 
 
-/*!	The output's path up (the headphones' RX macro and codec, HDMI's
+/*!	The output's path up (the headphones' RX macro and codec, a
 	DisplayPort audio), the graph started, and both buffers (silent) handed
 	to the DSP; the headset input with the headphones.
 */

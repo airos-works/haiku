@@ -176,6 +176,45 @@ static const Module kHdmiDeviceModules[] = {
 static const SubGraph kHdmiDevice = { 0x4014, 2, 1, 1, 0x4014, 3, 0x2000, 1,
 	2, kHdmiDeviceModules, B_COUNT_OF(kHdmiDeviceModules) };
 
+/*	The USB-C connectors: MultiMedia2's and MultiMedia3's streams into
+	DISPLAY_PORT_RX_0 and _1 (DP-1, DP-2), as Linux' traces of
+	`speaker-test -D hw:0,1` and `hw:0,2` on this board have them. */
+static const Module kUsbc0StreamModules[] = {
+	{ kWriteEndpoint, 0x6010, 0, 1, 0x6011, 0, 0, 0, 0, 0 },
+	{ kPcmDecoder, 0x6011, 1, 1, 0x6012, 1, 0, 0, 0, 0 },
+	{ kPcmConverter, 0x6012, 1, 1, 0x6013, 3, 0, 0, 0, 0 },
+	{ kVolume, 0x6013, 1, 1, 0x6014, 0, 0, 0, 0, 0 },
+	{ kMfc, 0x6014, 1, 1, 0x6015, 0, 0, 0, 0, 0 },
+	{ kLogger, 0x6015, 1, 1, 0, 0, 0x19af, 0, 0, 0 },
+};
+static const SubGraph kUsbc0Stream = { 0x4002, 2, 2, 1, 0x4002, 2, 0x2000, 1,
+	2, kUsbc0StreamModules, B_COUNT_OF(kUsbc0StreamModules) };
+
+static const Module kUsbc0DeviceModules[] = {
+	{ kLogger, 0x6120, 1, 1, 0x6121, 0, 0x19ab, 0, 0, 0 },
+	{ kDisplayPortSink, 0x6121, 1, 0, 0, 0, 0, 0, 0, 1 },
+};
+static const SubGraph kUsbc0Device = { 0x4012, 2, 1, 1, 0x4012, 3, 0x2000, 1,
+	2, kUsbc0DeviceModules, B_COUNT_OF(kUsbc0DeviceModules) };
+
+static const Module kUsbc1StreamModules[] = {
+	{ kWriteEndpoint, 0x6020, 0, 1, 0x6021, 0, 0, 0, 0, 0 },
+	{ kPcmDecoder, 0x6021, 1, 1, 0x6022, 1, 0, 0, 0, 0 },
+	{ kPcmConverter, 0x6022, 1, 1, 0x6023, 3, 0, 0, 0, 0 },
+	{ kVolume, 0x6023, 1, 1, 0x6024, 0, 0, 0, 0, 0 },
+	{ kMfc, 0x6024, 1, 1, 0x6025, 0, 0, 0, 0, 0 },
+	{ kLogger, 0x6025, 1, 1, 0, 0, 0x19af, 0, 0, 0 },
+};
+static const SubGraph kUsbc1Stream = { 0x4003, 2, 2, 1, 0x4003, 2, 0x2000, 1,
+	2, kUsbc1StreamModules, B_COUNT_OF(kUsbc1StreamModules) };
+
+static const Module kUsbc1DeviceModules[] = {
+	{ kLogger, 0x6130, 1, 1, 0x6131, 0, 0x19ab, 0, 0, 0 },
+	{ kDisplayPortSink, 0x6131, 1, 0, 0, 0, 0, 0, 1, 1 },
+};
+static const SubGraph kUsbc1Device = { 0x4013, 2, 1, 1, 0x4013, 3, 0x2000, 1,
+	2, kUsbc1DeviceModules, B_COUNT_OF(kUsbc1DeviceModules) };
+
 
 /*!	A path: the device's and the stream's sub-graphs, the routing mixer's
 	connection between them (in the stream's graph for playback, the
@@ -201,6 +240,10 @@ static const PathDescription kPaths[] = {
 	// display port: the stream's logger into the device's; the stream
 	// started first, as Linux does it there
 	{ &kHdmiDevice, &kHdmiStream, 0x6035, 0x6140, false, 0x6030, 0x6033,
+		true },
+	{ &kUsbc0Device, &kUsbc0Stream, 0x6015, 0x6120, false, 0x6010, 0x6013,
+		true },
+	{ &kUsbc1Device, &kUsbc1Stream, 0x6025, 0x6130, false, 0x6020, 0x6023,
 		true },
 };
 
@@ -304,7 +347,7 @@ AudioPath::Open(uint32 sampleRate, uint32 channels, uint32 bitsPerSample)
 	TRACE("AudioReach %s graph open: %" B_PRIu32 " Hz, %" B_PRIu32
 		" channels, %" B_PRIu32 " bit\n",
 		fDirection == kCapture ? "capture"
-			: fDirection == kDisplayPort ? "display port" : "playback",
+			: fDirection >= kDisplayPort ? "display port" : "playback",
 		fSampleRate,
 		fChannels, fBits);
 	return B_OK;
