@@ -539,6 +539,9 @@ resume_bus(void* bus_cookie)
 {
 	pch_i2c_sim_info* bus = (pch_i2c_sim_info*)bus_cookie;
 	MutexLocker locker(bus->lock);
+	// (a controller the firmware left off reads all ones: nothing to do)
+	if (read32(bus->registers + PCH_IC_COMP_VERSION) == 0xffffffff)
+		return B_OK;
 	if (read32(bus->registers + PCH_IC_CON) != bus->masterConfig) {
 		TRACE_ALWAYS("lost its configuration, programming it again\n");
 		program_controller(bus);
