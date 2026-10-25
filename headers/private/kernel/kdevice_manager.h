@@ -34,7 +34,9 @@ status_t device_manager_add_power_hook_etc(device_manager_power_hook hook,
 void device_manager_set_suspend_verbose(bool verbose);
 void device_manager_suspend_trace(const char* format, ...);
 void device_manager_clear_suspend_trace(void);
+void device_manager_set_suspend_trace_hook(void (*hook)(void));
 size_t device_manager_get_suspend_trace(char* buffer, size_t size);
+bool device_manager_light_sleep(void);
 status_t device_manager_remove_power_hook(device_manager_power_hook hook,
 	void* cookie);
 enum {

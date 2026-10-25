@@ -22,6 +22,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <algorithm>
+
 #include <ACPI.h>
 #include <cpu.h>
 #include <debug.h>
@@ -255,14 +257,172 @@ save_trace_to_memory()
 }
 
 
+// How far the last sleep got, in the RTC's battery backed CMOS (the upper
+// 128 bytes, which the firmware leaves alone here): the number of trace
+// lines, of idle rounds, the phase, and the start of the last trace line.
+// Unlike the trace page, it survives holding the power button.
+static const uint8 kCMOSProgressText = 0xc0;
+static const size_t kCMOSProgressTextSize = 48;
+static const uint8 kCMOSProgress = 0xf8;
+static const uint8 kCMOSProgressMagic = 0x54;
+static int32 sProgressLines;
+static int32 sProgressRound;
+static int32 sProgressPhase;
+static char sProgressText[kCMOSProgressTextSize];
+static int32 sProgressWriting;
+static int32 sProgressTextHeld;
+
+
+static void
+cmos_write(uint8 index, uint8 value)
+{
+	out8(index, 0x72);
+	out8(value, 0x73);
+}
+
+
+static uint8
+cmos_read(uint8 index)
+{
+	out8(index, 0x72);
+	return in8(0x73);
+}
+
+
+static void
+write_progress(bool withText)
+{
+	if (atomic_test_and_set(&sProgressWriting, 1, 0) != 0)
+		return;
+
+	uint16 lines = (uint16)atomic_get(&sProgressLines);
+	uint16 round = (uint16)atomic_get(&sProgressRound);
+	uint8 bytes[7] = { kCMOSProgressMagic, (uint8)lines, (uint8)(lines >> 8),
+		(uint8)round, (uint8)(round >> 8),
+		(uint8)atomic_get(&sProgressPhase), 0xa5 };
+	for (int i = 0; i < 6; i++)
+		bytes[6] ^= bytes[i];
+
+	cpu_status state = disable_interrupts();
+	if (withText) {
+		for (size_t i = 0; i < kCMOSProgressTextSize; i++)
+			cmos_write(kCMOSProgressText + i, (uint8)sProgressText[i]);
+	}
+	for (int i = 0; i < 7; i++)
+		cmos_write(kCMOSProgress + i, bytes[i]);
+	restore_interrupts(state);
+	atomic_set(&sProgressWriting, 0);
+}
+
+
+/*!	Starts counting the trace lines and idle rounds of a sleep in CMOS. */
+void
+x86_suspend_start_progress()
+{
+	atomic_set(&sProgressLines, 0);
+	atomic_set(&sProgressRound, 0);
+	atomic_set(&sProgressPhase, X86_SUSPEND_PROGRESS_SLEEPING);
+	atomic_set(&sProgressTextHeld, 0);
+	memset(sProgressText, 0, sizeof(sProgressText));
+	write_progress(true);
+}
+
+
+/*!	Keeps the last line in CMOS as it is: the lines that follow only explain
+	it. */
+void
+x86_suspend_hold_progress_text()
+{
+	atomic_set(&sProgressTextHeld, 1);
+}
+
+
+/*!	Notes an idle round in CMOS (the trace only has the first ones). */
+void
+x86_suspend_note_round(uint32 round)
+{
+	atomic_set(&sProgressRound, (int32)round);
+	write_progress(false);
+}
+
+
+/*!	Notes how far the sleep (or the time after it) got. Safe in a timer. */
+void
+x86_suspend_note_phase(uint32 phase)
+{
+	atomic_set(&sProgressPhase, (int32)phase);
+	write_progress(false);
+}
+
+
+static void
+print_saved_progress()
+{
+	uint8 bytes[7];
+	char text[kCMOSProgressTextSize + 1];
+	cpu_status state = disable_interrupts();
+	for (int i = 0; i < 7; i++)
+		bytes[i] = cmos_read(kCMOSProgress + i);
+	for (size_t i = 0; i < kCMOSProgressTextSize; i++)
+		text[i] = (char)cmos_read(kCMOSProgressText + i);
+	restore_interrupts(state);
+	text[kCMOSProgressTextSize] = '\0';
+
+	uint8 check = 0xa5;
+	for (int i = 0; i < 6; i++)
+		check ^= bytes[i];
+	if (bytes[0] != kCMOSProgressMagic || bytes[6] != check)
+		return;
+
+	static const char* const kPhases[] = { "?", "in the sleep",
+		"back from the sleep", "a minute after the sleep" };
+	uint8 phase = bytes[5] < B_COUNT_OF(kPhases) ? bytes[5] : 0;
+	for (size_t i = 0; i < kCMOSProgressTextSize && text[i] != '\0'; i++) {
+		if (text[i] < ' ' || text[i] > '~')
+			text[i] = '.';
+	}
+	INFO("progress of the last sleep (CMOS): %s, %u trace lines, round %u, "
+		"last line \"%s\"\n", kPhases[phase], bytes[1] | (bytes[2] << 8),
+		bytes[3] | (bytes[4] << 8), text);
+	state = disable_interrupts();
+	cmos_write(kCMOSProgress, 0);
+	restore_interrupts(state);
+}
+
+
 /*!	Keeps the end of the suspend trace (what happened last) in a page that a
 	warm reboot leaves alone; the next boot prints it. Safe in an interrupt
 	handler. */
 void
 x86_suspend_save_trace()
 {
+	atomic_add(&sProgressLines, 1);
+
+	// (an interrupt handler's line may come in meanwhile: the next line
+	// saves it)
+	static int32 sSaving;
+	if (atomic_test_and_set(&sSaving, 1, 0) != 0) {
+		write_progress(false);
+		return;
+	}
+
 	static char trace[16384];
 	size_t length = device_manager_get_suspend_trace(trace, sizeof(trace));
+
+	// the last line, for the CMOS
+	size_t lineEnd = atomic_get(&sProgressTextHeld) != 0 ? 0 : length;
+	while (lineEnd > 0 && trace[lineEnd - 1] == '\n')
+		lineEnd--;
+	size_t lineStart = lineEnd;
+	while (lineStart > 0 && trace[lineStart - 1] != '\n')
+		lineStart--;
+	bool withText = lineEnd > lineStart;
+	if (withText) {
+		memset(sProgressText, 0, sizeof(sProgressText));
+		memcpy(sProgressText, trace + lineStart,
+			std::min(lineEnd - lineStart, sizeof(sProgressText)));
+	}
+	write_progress(withText);
 	size_t room = B_PAGE_SIZE - 9;
 	size_t start = length > room ? length - room : 0;
 
@@ -271,6 +431,7 @@ x86_suspend_save_trace()
 	memcpy(text, trace + start, length - start);
 	page[0] = kTraceMagic;
 	page[1] = (uint32)(length - start);
+	atomic_set(&sSaving, 0);
 }
 
 
@@ -288,7 +449,19 @@ print_saved_trace()
 
 	char* text = (char*)(page + 2);
 	text[length] = '\0';
-	dprintf("suspend: trace of the last resume:\n%s", text);
+	// line by line, as dprintf() only takes so much at once
+	dprintf("suspend: trace of the last resume:\n");
+	char* line = text;
+	while (*line != '\0') {
+		char* end = strchr(line, '\n');
+		if (end != NULL)
+			*end = '\0';
+		if (*line != '\0')
+			dprintf("suspend:   %s\n", line);
+		if (end == NULL)
+			break;
+		line = end + 1;
+	}
 }
 
 
@@ -937,6 +1110,7 @@ x86_suspend_init(void)
 	STATIC_ASSERT(offsetof(x86_suspend_context, gdtr) == 128);
 
 	print_saved_trace();
+	print_saved_progress();
 
 	uint8 marker = read_resume_marker();
 	if (marker != 0) {

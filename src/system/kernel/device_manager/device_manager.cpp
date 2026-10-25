@@ -2491,6 +2491,8 @@ static bool sSuspendVerbose;
 static char sSuspendTrace[16384];
 static size_t sSuspendTraceLength;
 static spinlock sSuspendTraceLock = B_SPINLOCK_INITIALIZER;
+static void (*sSuspendTraceHook)(void);
+	// called after each line, to keep a copy that survives a reset
 
 
 void
@@ -2511,6 +2513,18 @@ device_manager_suspend_trace(const char* format, ...)
 	}
 	sSuspendTrace[sSuspendTraceLength++] = '\n';
 	sSuspendTrace[sSuspendTraceLength] = '\0';
+	locker.Unlock();
+
+	void (*hook)(void) = sSuspendTraceHook;
+	if (hook != NULL)
+		hook();
+}
+
+
+void
+device_manager_set_suspend_trace_hook(void (*hook)(void))
+{
+	sSuspendTraceHook = hook;
 }
 
 
@@ -2724,10 +2738,25 @@ device_manager_remove_power_hook(device_manager_power_hook hook, void* cookie)
 /*!	Calls the registered power hooks and the suspend hook of all initialized
 	drivers, children first.
 */
+static bool sLightSleep;
+	// while the devices are suspended for a light sleep
+
+
+/*!	Tells a driver suspending its device whether the system sleeps lightly
+	(a deep sleep follows when it lasts) or deeply (the SoC's deepest state,
+	in which what the driver keeps up keeps the whole SoC up). */
+bool
+device_manager_light_sleep()
+{
+	return sLightSleep;
+}
+
+
 status_t
 device_manager_suspend(int32 state, uint32 flags)
 {
 	RecursiveLocker _(sLock);
+	sLightSleep = (flags & DEVICE_MANAGER_LIGHT_SLEEP) != 0;
 
 	// A driver that does not come back from a suspend can be left out:
 	// "skip_power_hooks <name> ..." in the "suspend" kernel settings.
@@ -2786,6 +2815,7 @@ device_manager_resume(uint32 flags)
 	RecursiveLocker _(sLock);
 	if ((flags & DEVICE_MANAGER_SKIP_DEVICE_TREE) == 0)
 		resume_nodes();
+	sLightSleep = false;
 
 	PowerHookList::Iterator iterator = sPowerHooks.GetIterator();
 	while (power_hook* entry = iterator.Next()) {

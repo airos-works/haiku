@@ -30,13 +30,16 @@
 
 #include <algorithm>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <ACPI.h>
+#include <ByteOrder.h>
 #include <PCI.h>
 
 #include <cpu.h>
 #include <debug.h>
+#include <elf.h>
 #include <driver_settings.h>
 #include <interrupts.h>
 #include <kdevice_manager.h>
@@ -47,6 +50,7 @@
 #include <thread.h>
 #include <timer.h>
 #include <arch/cpu.h>
+#include <arch/debug.h>
 #include <arch/timer.h>
 #include <util/AutoLock.h>
 #include <vm/vm.h>
@@ -153,6 +157,8 @@ struct usb4_nhi {
 	char	path[128];
 	uint32	config[16];
 	bool	off;
+	volatile uint8* registers;
+		// BAR 0, for ring 0 (the control channel to its host router)
 };
 
 
@@ -734,10 +740,11 @@ acpi_address(const char* path, uint64* _address)
 }
 
 
-/*!	Finds the NHI's ACPI device: the child (by _ADR) of the root port
+/*!	Finds a PCI function's ACPI device: the child (by _ADR) of the root port
 	whose secondary bus it is on. */
 static bool
-usb4_find_path(pci_module_info* pci, usb4_nhi& nhi)
+pci_acpi_path(pci_module_info* pci, uint8 bus, uint8 deviceNumber,
+	uint8 functionNumber, char* path, size_t size)
 {
 	char root[128];
 	if (sACPI->get_device("PNP0A08", 0, root, sizeof(root)) != B_OK)
@@ -755,7 +762,7 @@ usb4_find_path(pci_module_info* pci, usb4_nhi& nhi)
 		if ((pci->read_pci_config(0, device, function, PCI_header_type, 1)
 					& PCI_header_type_mask) != PCI_header_type_PCI_to_PCI_bridge
 			|| pci->read_pci_config(0, device, function, PCI_secondary_bus, 1)
-				!= nhi.bus) {
+				!= bus) {
 			continue;
 		}
 
@@ -764,13 +771,21 @@ usb4_find_path(pci_module_info* pci, usb4_nhi& nhi)
 		while (sACPI->get_next_entry(ACPI_TYPE_DEVICE, bridge, child,
 				sizeof(child), &counter) == B_OK) {
 			if (acpi_address(child, &address) == B_OK
-				&& address == (((uint64)nhi.device << 16) | nhi.function)) {
-				strlcpy(nhi.path, child, sizeof(nhi.path));
+				&& address == (((uint64)deviceNumber << 16) | functionNumber)) {
+				strlcpy(path, child, size);
 				return true;
 			}
 		}
 	}
 	return false;
+}
+
+
+static bool
+usb4_find_path(pci_module_info* pci, usb4_nhi& nhi)
+{
+	return pci_acpi_path(pci, nhi.bus, nhi.device, nhi.function, nhi.path,
+		sizeof(nhi.path));
 }
 
 
@@ -803,6 +818,270 @@ usb4_probe(pci_module_info* pci)
 			nhi.function, nhi.path);
 		sNHICount++;
 	}
+}
+
+
+/*!	The host router's sleep, as Linux' connection manager asks for it
+	before the USB4 domain goes down (tb_switch_suspend(): ROUTER_CS_5.SLP,
+	then ROUTER_CS_6.SLPR): through ring 0 of the host interface, the
+	control channel, polled. Without it, the SoC does not come back from
+	S0i3 with the domain off.
+*/
+#define USB4_RING_TX			0x00000
+#define USB4_RING_RX			0x08000
+#define USB4_RING_TX_OPTIONS	0x19800
+#define USB4_RING_RX_OPTIONS	0x29800
+#define USB4_RING_ENABLE		(1u << 31)
+#define USB4_RING_RAW			(1u << 30)
+#define USB4_DESC_COMPLETED		0x2
+#define USB4_DESC_POSTED		0x4
+#define USB4_DESC_INTERRUPT		0x8
+#define USB4_RING_SIZE			8
+#define USB4_FRAME_SIZE			0x100
+#define USB4_TX_DESCS			0x0000
+#define USB4_RX_DESCS			0x0100
+#define USB4_TX_FRAME			0x1000
+#define USB4_RX_FRAMES			0x2000
+#define USB4_PACKET_READ		1
+#define USB4_PACKET_WRITE		2
+#define USB4_PACKET_ERROR		3
+#define USB4_CS_SPACE_ROUTER	2
+
+static area_id sUSB4RingArea = -1;
+static uint8* sUSB4Ring;
+static phys_addr_t sUSB4RingPhysical;
+static uint32 sUSB4TXHead;
+static uint32 sUSB4RXTail;
+
+
+static uint32
+crc32c(const uint8* data, size_t length)
+{
+	uint32 crc = ~0u;
+	for (size_t i = 0; i < length; i++) {
+		crc ^= data[i];
+		for (int k = 0; k < 8; k++)
+			crc = (crc & 1) != 0 ? 0x82f63b78 ^ (crc >> 1) : crc >> 1;
+	}
+	return ~crc;
+}
+
+
+static inline void
+usb4_write(usb4_nhi& nhi, uint32 offset, uint32 value)
+{
+	*(volatile uint32*)(nhi.registers + offset) = value;
+}
+
+
+static void
+usb4_stop_ring(usb4_nhi& nhi)
+{
+	usb4_write(nhi, USB4_RING_TX_OPTIONS, 0);
+	usb4_write(nhi, USB4_RING_RX_OPTIONS, 0);
+	for (uint32 i = 0; i < 16; i += 4) {
+		usb4_write(nhi, USB4_RING_TX + i, 0);
+		usb4_write(nhi, USB4_RING_RX + i, 0);
+	}
+}
+
+
+static bool
+usb4_start_ring(usb4_nhi& nhi)
+{
+	if (sUSB4RingArea < 0) {
+		sUSB4RingArea = create_area("usb4 ring 0", (void**)&sUSB4Ring,
+			B_ANY_KERNEL_ADDRESS, 0x4000, B_32_BIT_CONTIGUOUS,
+			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
+		if (sUSB4RingArea < 0)
+			return false;
+		physical_entry entry;
+		get_memory_map(sUSB4Ring, 0x4000, &entry, 1);
+		sUSB4RingPhysical = entry.address;
+	}
+	if (nhi.registers == NULL) {
+		uint64 bar = nhi.config[4] & ~(uint64)0xf;
+		if ((nhi.config[4] & 0x6) == 0x4)
+			bar |= (uint64)nhi.config[5] << 32;
+		void* address;
+		if (map_physical_memory("usb4 host interface", bar, 0x40000,
+				B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
+				&address) < 0) {
+			return false;
+		}
+		nhi.registers = (volatile uint8*)address;
+	}
+
+	usb4_stop_ring(nhi);
+	memset(sUSB4Ring, 0, 0x4000);
+
+	uint64 tx = sUSB4RingPhysical + USB4_TX_DESCS;
+	usb4_write(nhi, USB4_RING_TX, (uint32)tx);
+	usb4_write(nhi, USB4_RING_TX + 4, (uint32)(tx >> 32));
+	usb4_write(nhi, USB4_RING_TX + 12, USB4_RING_SIZE);
+	usb4_write(nhi, USB4_RING_TX_OPTIONS + 4, 0);
+	usb4_write(nhi, USB4_RING_TX_OPTIONS, USB4_RING_ENABLE | USB4_RING_RAW);
+
+	uint64 rx = sUSB4RingPhysical + USB4_RX_DESCS;
+	usb4_write(nhi, USB4_RING_RX, (uint32)rx);
+	usb4_write(nhi, USB4_RING_RX + 4, (uint32)(rx >> 32));
+	usb4_write(nhi, USB4_RING_RX + 12, (USB4_FRAME_SIZE << 16)
+		| USB4_RING_SIZE);
+	usb4_write(nhi, USB4_RING_RX_OPTIONS + 4, 0xffffffff);
+	usb4_write(nhi, USB4_RING_RX_OPTIONS, USB4_RING_ENABLE | USB4_RING_RAW);
+
+	// all receive descriptors but one posted
+	for (uint32 i = 0; i < USB4_RING_SIZE - 1; i++) {
+		volatile uint32* desc = (uint32*)(sUSB4Ring + USB4_RX_DESCS + i * 16);
+		uint64 frame = sUSB4RingPhysical + USB4_RX_FRAMES
+			+ i * USB4_FRAME_SIZE;
+		desc[0] = (uint32)frame;
+		desc[1] = (uint32)(frame >> 32);
+		desc[2] = (USB4_DESC_POSTED | USB4_DESC_INTERRUPT) << 20;
+		desc[3] = 0;
+	}
+	memory_full_barrier();
+	usb4_write(nhi, USB4_RING_RX + 8, USB4_RING_SIZE - 1);
+	sUSB4TXHead = 0;
+	sUSB4RXTail = 0;
+	return true;
+}
+
+
+/*!	Sends one control packet of \a count words and waits for the reply of
+	the same type; returns the number of words in \a reply, or -1. */
+static int
+usb4_transact(usb4_nhi& nhi, uint32 type, const uint32* words, uint32 count,
+	uint32* reply, uint32 maxReply)
+{
+	uint32* frame = (uint32*)(sUSB4Ring + USB4_TX_FRAME);
+	for (uint32 i = 0; i < count; i++)
+		frame[i] = B_HOST_TO_BENDIAN_INT32(words[i]);
+	frame[count] = B_HOST_TO_BENDIAN_INT32(crc32c((uint8*)frame, count * 4));
+
+	volatile uint32* desc = (uint32*)(sUSB4Ring + USB4_TX_DESCS
+		+ sUSB4TXHead * 16);
+	uint64 physical = sUSB4RingPhysical + USB4_TX_FRAME;
+	desc[0] = (uint32)physical;
+	desc[1] = (uint32)(physical >> 32);
+	desc[3] = 0;
+	desc[2] = (count * 4 + 4) | (type << 12) | (type << 16)
+		| ((USB4_DESC_POSTED | USB4_DESC_INTERRUPT) << 20);
+	memory_full_barrier();
+	sUSB4TXHead = (sUSB4TXHead + 1) % USB4_RING_SIZE;
+	usb4_write(nhi, USB4_RING_TX + 8, sUSB4TXHead << 16);
+
+	bigtime_t end = system_time() + 500000;
+	while (((desc[2] >> 20) & USB4_DESC_COMPLETED) == 0) {
+		if (system_time() > end)
+			return -1;
+		spin(10);
+	}
+
+	while (system_time() < end) {
+		volatile uint32* received = (uint32*)(sUSB4Ring + USB4_RX_DESCS
+			+ sUSB4RXTail * 16);
+		uint32 flags = received[2];
+		if (((flags >> 20) & USB4_DESC_COMPLETED) == 0) {
+			spin(10);
+			continue;
+		}
+		uint32 size = flags & 0xfff;
+		uint32 eof = (flags >> 12) & 0xf;
+		uint32* data = (uint32*)(sUSB4Ring + USB4_RX_FRAMES
+			+ sUSB4RXTail * USB4_FRAME_SIZE);
+
+		// the descriptor goes back to the ring
+		uint32 slot = sUSB4RXTail;
+		sUSB4RXTail = (sUSB4RXTail + 1) % USB4_RING_SIZE;
+		uint32 posted = (slot + USB4_RING_SIZE - 1) % USB4_RING_SIZE;
+		volatile uint32* back = (uint32*)(sUSB4Ring + USB4_RX_DESCS
+			+ posted * 16);
+		uint64 framePhysical = sUSB4RingPhysical + USB4_RX_FRAMES
+			+ posted * USB4_FRAME_SIZE;
+		back[0] = (uint32)framePhysical;
+		back[1] = (uint32)(framePhysical >> 32);
+		back[2] = (USB4_DESC_POSTED | USB4_DESC_INTERRUPT) << 20;
+		memory_full_barrier();
+		usb4_write(nhi, USB4_RING_RX + 8, slot);
+
+		if (size == 0)
+			size = 4096;
+		if (size < 8 || size > USB4_FRAME_SIZE
+			|| B_BENDIAN_TO_HOST_INT32(data[size / 4 - 1])
+				!= crc32c((uint8*)data, size - 4)) {
+			continue;
+		}
+		if (eof == USB4_PACKET_ERROR)
+			return -1;
+		if (eof != type)
+			continue;
+		uint32 n = (size - 4) / 4;
+		for (uint32 i = 0; i < n && i < maxReply; i++)
+			reply[i] = B_BENDIAN_TO_HOST_INT32(data[i]);
+		return n;
+	}
+	return -1;
+}
+
+
+static uint32
+usb4_address(uint32 offset, uint32 length, uint32 port, uint32 space)
+{
+	return (offset & 0x1fff) | ((length & 0x3f) << 13) | ((port & 0x3f) << 19)
+		| ((space & 3) << 25);
+}
+
+
+static bool
+usb4_router_read(usb4_nhi& nhi, uint32 offset, uint32* value)
+{
+	// (the host router: route 0)
+	uint32 request[3] = { 0, 0,
+		usb4_address(offset, 1, 0, USB4_CS_SPACE_ROUTER) };
+	uint32 reply[8];
+	if (usb4_transact(nhi, USB4_PACKET_READ, request, 3, reply, 8) < 4)
+		return false;
+	*value = reply[3];
+	return true;
+}
+
+
+static bool
+usb4_router_write(usb4_nhi& nhi, uint32 offset, uint32 value)
+{
+	uint32 request[4] = { 0, 0,
+		usb4_address(offset, 1, 0, USB4_CS_SPACE_ROUTER), value };
+	uint32 reply[8];
+	return usb4_transact(nhi, USB4_PACKET_WRITE, request, 4, reply, 8) >= 3;
+}
+
+
+static void
+usb4_router_sleep(usb4_nhi& nhi)
+{
+	if (!usb4_start_ring(nhi)) {
+		INFO("USB4 %s: no control channel\n", nhi.path);
+		return;
+	}
+	uint32 cs5 = 0;
+	uint32 cs6 = 0;
+	bool ready = false;
+	if (usb4_router_read(nhi, 5, &cs5)
+		&& usb4_router_write(nhi, 5, cs5 | 1)) {
+		bigtime_t end = system_time() + 500000;
+		while (system_time() < end) {
+			if (usb4_router_read(nhi, 6, &cs6) && (cs6 & 1) != 0) {
+				ready = true;
+				break;
+			}
+			snooze(10000);
+		}
+	}
+	usb4_stop_ring(nhi);
+	INFO("USB4 %s: host router %s (ROUTER_CS_5 %#" B_PRIx32 ", CS_6 %#"
+		B_PRIx32 ")\n", nhi.path, ready ? "asleep" : "did not sleep", cs5,
+		cs6);
 }
 
 
@@ -851,6 +1130,7 @@ usb4_power_off()
 			nhi.config[j] = pci->read_pci_config(nhi.bus, nhi.device,
 				nhi.function, j * 4, 4);
 		}
+		usb4_router_sleep(nhi);
 		uint16 control = pci->read_pci_config(nhi.bus, nhi.device,
 			nhi.function, nhi.pm_capability + PCI_pm_status, 2);
 		// with PME on, as Linux leaves it (the routers' wakes come that way)
@@ -937,23 +1217,334 @@ usb4_power_on()
 }
 
 
+//	#pragma mark - storage
+
+
+/*!	A disk its driver left in D3hot for the sleep (nvme_disk "s2idle_d3")
+	goes to D3cold, as on Linux: its power resources for D3hot (_PR3) are
+	turned off. Not for the power: in S0i3 the platform holds the disk in
+	reset either way, and only the resources' _ON lets it out again (on the
+	Framework 13, \_SB.PCI0.GPP8.P0NV._ON gives back the link and lifts
+	PERST#), which its driver then finds in D0, to be reset.
+*/
+#define STORAGE_MAX_RESOURCES	4
+
+struct storage_power {
+	uint8	bus;
+	uint8	device;
+	uint8	function;
+	int32	count;
+	char	resources[STORAGE_MAX_RESOURCES][128];
+};
+
+static storage_power sStorage[2];
+static int32 sStorageCount;
+
+
+static void
+storage_power_off()
+{
+	sStorageCount = 0;
+	pci_module_info* pci;
+	if (get_module(B_PCI_MODULE_NAME, (module_info**)&pci) != B_OK)
+		return;
+
+	pci_info info;
+	for (int32 i = 0; pci->get_nth_pci_info(i, &info) == B_OK
+			&& sStorageCount < (int32)B_COUNT_OF(sStorage); i++) {
+		if (info.class_base != PCI_mass_storage
+			|| info.class_sub != PCI_nvm) {
+			continue;
+		}
+		uint8 pm;
+		if (pci->find_pci_capability(info.bus, info.device, info.function,
+				PCI_cap_id_pm, &pm) != B_OK
+			|| (pci->read_pci_config(info.bus, info.device, info.function,
+				pm + PCI_pm_status, 2) & PCI_pm_mask) != PCI_pm_state_d3) {
+			continue;
+		}
+		char path[128];
+		if (!pci_acpi_path(pci, info.bus, info.device, info.function, path,
+				sizeof(path))) {
+			continue;
+		}
+
+		char method[160];
+		snprintf(method, sizeof(method), "%s._PR3", path);
+		acpi_data result = { ACPI_ALLOCATE_BUFFER, NULL };
+		if (sACPI->evaluate_method(NULL, method, NULL, &result) != B_OK)
+			continue;
+		storage_power& storage = sStorage[sStorageCount];
+		storage.bus = info.bus;
+		storage.device = info.device;
+		storage.function = info.function;
+		storage.count = 0;
+		acpi_object_type* object = (acpi_object_type*)result.pointer;
+		if (object != NULL && object->object_type == ACPI_TYPE_PACKAGE) {
+			for (uint32 j = 0; j < object->package.count
+					&& storage.count < STORAGE_MAX_RESOURCES; j++) {
+				acpi_object_type* element = &object->package.objects[j];
+				if (element->object_type != ACPI_TYPE_LOCAL_REFERENCE
+					|| sACPI->get_name(element->reference.handle, 0,
+						storage.resources[storage.count], 128) != B_OK) {
+					continue;
+				}
+				storage.count++;
+			}
+		}
+		free(result.pointer);
+
+		for (int32 j = 0; j < storage.count; j++) {
+			snprintf(method, sizeof(method), "%s._OFF",
+				storage.resources[j]);
+			INFO("storage %02x:%02x.%x (%s): %s: %s\n", info.bus,
+				info.device, info.function, path, method,
+				strerror(sACPI->evaluate_method(NULL, method, NULL, NULL)));
+		}
+		if (storage.count > 0)
+			sStorageCount++;
+	}
+	put_module(B_PCI_MODULE_NAME);
+}
+
+
+static void
+storage_power_on()
+{
+	if (sStorageCount == 0)
+		return;
+	pci_module_info* pci;
+	if (get_module(B_PCI_MODULE_NAME, (module_info**)&pci) != B_OK)
+		return;
+
+	for (int32 i = sStorageCount - 1; i >= 0; i--) {
+		storage_power& storage = sStorage[i];
+		for (int32 j = storage.count - 1; j >= 0; j--) {
+			char method[160];
+			snprintf(method, sizeof(method), "%s._ON", storage.resources[j]);
+			status_t status = sACPI->evaluate_method(NULL, method, NULL,
+				NULL);
+			INFO("storage %02x:%02x.%x: %s: %s\n", storage.bus,
+				storage.device, storage.function, method, strerror(status));
+		}
+
+		// until it answers again (Linux waits for a second, too)
+		bigtime_t start = system_time();
+		uint32 id;
+		do {
+			id = pci->read_pci_config(storage.bus, storage.device,
+				storage.function, PCI_vendor_id, 4);
+			if (id != 0xffffffff)
+				break;
+			snooze(10000);
+		} while (system_time() - start < 1000000);
+		INFO("storage %02x:%02x.%x back: id %#" B_PRIx32 " after %"
+			B_PRIdBIGTIME " ms\n", storage.bus, storage.device,
+			storage.function, id, (system_time() - start) / 1000);
+		// as Linux after a D3cold (d3cold_delay): the function may still
+		// be setting itself up, and lose what is written to it before
+		snooze(100000);
+	}
+	sStorageCount = 0;
+	put_module(B_PCI_MODULE_NAME);
+}
+
+
 //	#pragma mark - the sleep
 
 
 /*!	A suspend or resume that does not finish (a driver that never comes
 	back) leaves nothing to look at: the machine reboots instead, warm, so
 	that the next boot prints the end of the suspend trace. */
+/*!	The FCH's watchdog timer resets the machine when the sleep or the way
+	out hangs for good (the CPU stops, so the timer below cannot run): with
+	every step of the suspend trace kept in a page that a reset leaves
+	alone, the next boot prints where it stopped. Opt-in, "hw_watchdog
+	<seconds>" in the "suspend" kernel settings; the idle loop kicks it on
+	every wake-up (the RTC alarm looks at the lid every kLidPollSeconds),
+	and restarts it, as an S0i3 stops it.
+	As Linux' sp5100_tco for an EFCH with MMIO.
+*/
+#define AMD_FCH_ACPI_MMIO			0xfed80000
+#define AMD_FCH_PM_DECODE_EN		0x300
+#define AMD_FCH_PM_WDT_TIMER_EN		0x80
+#define AMD_FCH_WDT_CONTROL			0xb00
+#define AMD_FCH_WDT_COUNT			0xb04
+#define AMD_FCH_WDT_RUN				0x01
+#define AMD_FCH_WDT_FIRED			0x02
+#define AMD_FCH_WDT_POWER_OFF		0x04
+#define AMD_FCH_WDT_DISABLED		0x08
+#define AMD_FCH_WDT_TRIGGER			0x80
+
+static volatile uint8* sFCHWatchdog;
+static uint32 sFCHWatchdogSeconds;
+
+
+static bool
+suspend_progress_wanted()
+{
+	void* settings = load_driver_settings("suspend");
+	bool wanted = get_driver_boolean_parameter(settings, "suspend_progress",
+		false, true);
+	unload_driver_settings(settings);
+	return wanted;
+}
+
+
+static uint32
+fch_watchdog_wanted()
+{
+	void* settings = load_driver_settings("suspend");
+	const char* value = get_driver_parameter(settings, "hw_watchdog", NULL,
+		NULL);
+	uint32 seconds = value != NULL ? strtoul(value, NULL, 10) : 0;
+	unload_driver_settings(settings);
+	return seconds;
+}
+
+
+/*!	Restarts the watchdog after an S0i3, which stops it: decoding, the
+	count and the run bit again, quietly. */
+static void
+fch_watchdog_refresh()
+{
+	if (sFCHWatchdog == NULL || sFCHWatchdogSeconds == 0)
+		return;
+	sFCHWatchdog[AMD_FCH_PM_DECODE_EN] |= AMD_FCH_PM_WDT_TIMER_EN;
+	volatile uint32* control = (volatile uint32*)(sFCHWatchdog
+		+ AMD_FCH_WDT_CONTROL);
+	*(volatile uint32*)(sFCHWatchdog + AMD_FCH_WDT_COUNT)
+		= sFCHWatchdogSeconds;
+	uint32 value = (*control & ~(AMD_FCH_WDT_FIRED | AMD_FCH_WDT_POWER_OFF
+		| AMD_FCH_WDT_DISABLED)) | AMD_FCH_WDT_RUN;
+	*control = value;
+	*control = value | AMD_FCH_WDT_TRIGGER;
+}
+
+
+/*!	Resets the machine now, through the watchdog: a warm reset that leaves
+	the suspend trace page alone, and works when a reboot does not. */
+static void
+fch_watchdog_reset_now()
+{
+	if (sFCHWatchdog == NULL)
+		return;
+	sFCHWatchdogSeconds = 1;
+	fch_watchdog_refresh();
+	for (int i = 0; i < 3000; i++)
+		spin(1000);
+}
+
+
+static void
+fch_watchdog_arm(uint32 seconds)
+{
+	if (seconds == 0 || gCPU[0].arch.vendor != VENDOR_AMD)
+		return;
+	if (sFCHWatchdog == NULL) {
+		void* address;
+		if (map_physical_memory("amd fch watchdog", AMD_FCH_ACPI_MMIO,
+				B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+				B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address) < 0) {
+			return;
+		}
+		sFCHWatchdog = (volatile uint8*)address;
+	}
+
+	// decoding the watchdog's registers starts its timer, too
+	volatile uint8* decode = sFCHWatchdog + AMD_FCH_PM_DECODE_EN;
+	*decode |= AMD_FCH_PM_WDT_TIMER_EN;
+	volatile uint32* control = (volatile uint32*)(sFCHWatchdog
+		+ AMD_FCH_WDT_CONTROL);
+	uint32 value = *control;
+	if ((value & AMD_FCH_WDT_DISABLED) != 0) {
+		INFO("FCH watchdog disabled (control %#" B_PRIx32 ")\n", value);
+		return;
+	}
+	if ((value & AMD_FCH_WDT_FIRED) != 0)
+		INFO("FCH watchdog fired last time\n");
+
+	*(volatile uint32*)(sFCHWatchdog + AMD_FCH_WDT_COUNT) = seconds;
+	value = (value & ~(AMD_FCH_WDT_FIRED | AMD_FCH_WDT_POWER_OFF))
+		| AMD_FCH_WDT_RUN;
+	*control = value;
+	// (the trigger has to be a write of its own)
+	*control = value | AMD_FCH_WDT_TRIGGER;
+	sFCHWatchdogSeconds = seconds;
+	INFO("FCH watchdog armed: reset after %" B_PRIu32 " s\n", seconds);
+}
+
+
+static void
+fch_watchdog_disarm()
+{
+	if (sFCHWatchdog == NULL || sFCHWatchdogSeconds == 0)
+		return;
+	volatile uint32* control = (volatile uint32*)(sFCHWatchdog
+		+ AMD_FCH_WDT_CONTROL);
+	*control &= ~(AMD_FCH_WDT_RUN | AMD_FCH_WDT_FIRED);
+	sFCHWatchdogSeconds = 0;
+}
+
+
+static const bigtime_t kAfterWakeWatchdogTime = 60000000;
+static timer sAfterWakeWatchdog;
+
+
+/*!	The FCH watchdog stays armed for a minute after the sleep, as some of
+	the hangs come only once everything is back; this ends it. */
+static int32
+after_wake_watchdog(timer*)
+{
+	fch_watchdog_disarm();
+	x86_suspend_note_phase(X86_SUSPEND_PROGRESS_AFTER);
+	return B_HANDLED_INTERRUPT;
+}
+
+
 static const bigtime_t kResumeWatchdogTimeout = 90000000;
 static timer sResumeWatchdog;
 static const char* sWatchdogPhase;
 
 
+static Thread* sSleepThread;
+
+
+static void
+trace_symbol(const char* what, addr_t address)
+{
+	const char* symbol = NULL;
+	const char* image = NULL;
+	addr_t base = 0;
+	bool exact;
+	if (elf_debug_lookup_symbol_address(address, &base, &symbol, &image,
+			&exact) == B_OK && symbol != NULL) {
+		device_manager_suspend_trace("%s %#" B_PRIxADDR " = %s:%s+%#"
+			B_PRIxADDR, what, address, image != NULL ? image : "?", symbol,
+			address - base);
+	} else
+		device_manager_suspend_trace("%s %#" B_PRIxADDR, what, address);
+}
+
+
 static int32
 resume_watchdog(timer* /*timer*/)
 {
+	// where it is stuck: the CPU it spins on, or what the thread waits for
+	// (these lines leave the last one before them in the CMOS)
+	x86_suspend_hold_progress_text();
+	trace_symbol("stuck: interrupted at",
+		(addr_t)arch_debug_get_interrupt_pc(NULL));
+	Thread* thread = sSleepThread;
+	if (thread != NULL) {
+		device_manager_suspend_trace("stuck: sleep thread state %d, wait type "
+			"%d", thread->state, thread->wait.type);
+		trace_symbol("stuck: waits on", (addr_t)thread->wait.object);
+	}
 	device_manager_suspend_trace("the %s did not finish in %" B_PRIdBIGTIME
-		" s: rebooting", sWatchdogPhase, kResumeWatchdogTimeout / 1000000);
+		" s: resetting", sWatchdogPhase, kResumeWatchdogTimeout / 1000000);
 	x86_suspend_save_trace();
+	fch_watchdog_reset_now();
 	arch_cpu_shutdown(true);
 	return B_HANDLED_INTERRUPT;
 }
@@ -1001,6 +1592,17 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 	device_manager_clear_suspend_trace();
 	INFO("entering s2idle, flags %#" B_PRIx32 ", timeout %" B_PRIu32 " ms\n",
 		flags, args->timeout_ms);
+	cancel_timer(&sAfterWakeWatchdog);
+	uint32 watchdogSeconds = fch_watchdog_wanted();
+	// the trace in CMOS too ("suspend_progress true", or with the watchdog)
+	bool progress = watchdogSeconds != 0 || suspend_progress_wanted();
+	if (progress) {
+		x86_suspend_start_progress();
+		device_manager_set_suspend_trace_hook(&x86_suspend_save_trace);
+		x86_suspend_save_trace();
+	}
+	if (watchdogSeconds != 0)
+		fch_watchdog_arm(watchdogSeconds);
 
 	// (the syslog daemon gets to write that first: a sleep that never ends
 	// leaves it behind)
@@ -1023,6 +1625,7 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 		thread_yield();
 	Thread* thread = thread_get_current_thread();
 	thread_pin_to_current_cpu(thread);
+	sSleepThread = thread;
 
 	// the deepest C-states for the idle CPUs
 	int32 oldMode = _user_get_scheduler_mode();
@@ -1047,6 +1650,8 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 		device_manager_suspend(ACPI_POWER_STATE_ON, deviceFlags);
 	if (usb4Off)
 		usb4_power_off();
+	if ((flags & (X86_SUSPEND_SKIP_DEVICES | X86_SUSPEND_LIGHT_SLEEP)) == 0)
+		storage_power_off();
 
 	// as Linux's acpi_s2idle_prepare_late() and amd_pmc_s2idle_prepare()
 	if (sLPS0Path[0] != '\0') {
@@ -1056,8 +1661,10 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 		lps0_microsoft(LPS0_MS_STANDBY_ENTRY);
 		lps0_microsoft(LPS0_MS_ENTRY);
 	}
+	device_manager_suspend_trace("LPS0 entry calls done");
 	pmc_start_log();
 	status_t hintStatus = pmc_send(AMD_PMC_MSG_OS_HINT, 1);
+	device_manager_suspend_trace("OS hint: %s", strerror(hintStatus));
 	uint64 entryBefore = fch_time(AMD_FCH_S0I3_ENTRY);
 
 	install_io_interrupt_handler(sSCI, &sci_wake, NULL, 0);
@@ -1092,6 +1699,13 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 	// one timer interrupt at the end of the timeout. (The kernel's own timers
 	// would wake the CPU hundreds of times a second.)
 	cancel_timer(&sResumeWatchdog);
+	// without a look at the lid or an alarm, nothing kicks it in the sleep
+	bool watchdogInSleep = sFCHWatchdogSeconds != 0
+		&& (pollLid || alarmSeconds != 0) && rtcAlarm;
+	if (sFCHWatchdogSeconds != 0 && !watchdogInSleep)
+		fch_watchdog_disarm();
+	device_manager_suspend_trace("idling (alarm %" B_PRIu32 " s)",
+		armedSeconds);
 	bigtime_t start = system_time();
 	bigtime_t deadline = args->timeout_ms != 0
 			&& (!rtcAlarm || (flags & X86_SUSPEND_RTC_WAKE_ONLY) == 0)
@@ -1128,6 +1742,11 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 			}
 			cpu_idle();
 			rounds++;
+			fch_watchdog_refresh();
+			if (progress)
+				x86_suspend_note_round(rounds);
+			if (rounds <= 64)
+				device_manager_suspend_trace("round %" B_PRIu32, rounds);
 			if (fanFirst >= 0) {
 				fanLast = ec_fan_rpm();
 				fanMax = std::max(fanMax, fanLast);
@@ -1176,6 +1795,21 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 	sWatchdogPhase = "resume";
 	add_timer(&sResumeWatchdog, &resume_watchdog, kResumeWatchdogTimeout,
 		B_ONE_SHOT_RELATIVE_TIMER);
+	device_manager_suspend_trace("awake after %" B_PRIdBIGTIME " ms",
+		slept / 1000);
+	if (watchdogSeconds != 0) {
+		// (after an S0i3, the watchdog stands still)
+		if (sFCHWatchdog != NULL) {
+			device_manager_suspend_trace("FCH watchdog after the sleep: "
+				"control %#" B_PRIx32 ", decode %#x",
+				*(volatile uint32*)(sFCHWatchdog + AMD_FCH_WDT_CONTROL),
+				sFCHWatchdog[AMD_FCH_PM_DECODE_EN]);
+		}
+		if (watchdogInSleep)
+			fch_watchdog_refresh();
+		else
+			fch_watchdog_arm(watchdogSeconds);
+	}
 
 	set_thread_priority(thread->id, oldPriority);
 	if (rtcAlarm) {
@@ -1200,12 +1834,23 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 		lps0_amd(LPS0_AMD_SCREEN_ON);
 	}
 
+	device_manager_suspend_trace("LPS0 exit calls done");
+
 	if (usb4Off)
 		usb4_power_on();
+	storage_power_on();
 	if ((flags & X86_SUSPEND_SKIP_DEVICES) == 0)
 		device_manager_resume(deviceFlags);
 
 	cancel_timer(&sResumeWatchdog);
+	if (watchdogSeconds != 0)
+		fch_watchdog_arm(watchdogSeconds);
+	else
+		fch_watchdog_disarm();
+	if (progress) {
+		add_timer(&sAfterWakeWatchdog, &after_wake_watchdog,
+			kAfterWakeWatchdogTime, B_ONE_SHOT_RELATIVE_TIMER);
+	}
 	scheduler_set_operation_mode((scheduler_mode)oldMode);
 
 	thread_unpin_from_current_cpu(thread);
@@ -1238,6 +1883,10 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 		INFO("fan in the sleep: %" B_PRId32 " rpm at the start, at most %"
 			B_PRId32 ", %" B_PRId32 " at the end (%" B_PRIu32 " looks)\n",
 			fanFirst, fanMax, fanLast, fanSamples);
+	}
+	if (progress) {
+		x86_suspend_note_phase(X86_SUSPEND_PROGRESS_BACK);
+		device_manager_set_suspend_trace_hook(NULL);
 	}
 	return B_OK;
 }
