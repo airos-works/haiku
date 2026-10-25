@@ -1212,6 +1212,15 @@ static glink_channel* sQrtr;
 static uint32 sQrtrRemoteNode;
 static bool sQrtrHelloPending;
 
+// the audio protection domain's service registry notifier (servreg, QMI
+// service 0x42), as Linux' PDR client (soc/qcom/pdr_interface.c) uses it
+static const uint32 kServregNotifierService = 0x42;
+static const uint32 kQrtrPortServreg = 0x4000;		// our client port
+static const char* kAudioPd = "msm/adsp/audio_pd";
+static uint32 sServregNode, sServregPort;
+static bool sServregRegisterPending;
+static uint16 sQmiTransaction;
+
 
 static status_t
 qrtr_send(uint32 type, uint32 sourcePort, uint32 destinationNode,
@@ -1228,10 +1237,58 @@ qrtr_send(uint32 type, uint32 sourcePort, uint32 destinationNode,
 }
 
 
-//!	The hello, once the ADSP has given room for it.
+/*!	A QMI request to the servreg notifier: the header (request, transaction,
+	message, length), then TLV \a 0x01: \a value (one byte), unless
+	\a withByte is false, and TLV \a stringType: the service path; for
+	SERVREG_SET_ACK, TLV 0x01 the path, 0x02 the transaction (2 bytes).
+*/
+static status_t
+servreg_send(uint16 message, bool withByte, uint8 value, uint8 stringType,
+	bool withTransaction, uint32 transaction)
+{
+	uint8 packet[64];
+	uint32 length = 7;
+	uint32 pathLength = strlen(kAudioPd);
+	if (withByte) {
+		packet[length++] = 0x01;
+		packet[length++] = 1;
+		packet[length++] = 0;
+		packet[length++] = value;
+	}
+	packet[length++] = stringType;
+	packet[length++] = pathLength & 0xff;
+	packet[length++] = pathLength >> 8;
+	memcpy(packet + length, kAudioPd, pathLength);
+	length += pathLength;
+	if (withTransaction) {
+		uint16 ackId = transaction;
+		packet[length++] = 0x02;
+		packet[length++] = 2;
+		packet[length++] = 0;
+		memcpy(packet + length, &ackId, 2);
+		length += 2;
+	}
+	uint16 id = ++sQmiTransaction;
+	packet[0] = 0;					// request
+	memcpy(packet + 1, &id, 2);
+	memcpy(packet + 3, &message, 2);
+	uint16 payload = length - 7;
+	memcpy(packet + 5, &payload, 2);
+	return qrtr_send(kQrtrData, kQrtrPortServreg, sServregNode, sServregPort,
+		packet, length);
+}
+
+
+//!	The hello, once the ADSP has given room for it; then the listener.
 static void
 qrtr_tick()
 {
+	if (sServregRegisterPending && !sQrtrHelloPending
+		&& servreg_send(0x20, true, 1, 0x02, false, 0) == B_OK) {
+		// SERVREG_REGISTER_LISTENER: enable, the audio PD's path
+		sServregRegisterPending = false;
+		TRACE("servreg: listening to %s\n", kAudioPd);
+	}
 	if (!sQrtrHelloPending)
 		return;
 	qrtr_control control = { kQrtrHello, 0, 0, 0, 0 };
@@ -1267,6 +1324,12 @@ qrtr_receive(glink_channel* channel, const uint8* data, uint32 length)
 			qrtr_tick();
 			break;
 		case kQrtrNewServer:
+			if (control.service == kServregNotifierService) {
+				sServregNode = control.node;
+				sServregPort = control.port;
+				sServregRegisterPending = true;
+			}
+			// fall through
 		case kQrtrDelServer:
 			TRACE("qrtr: %s service %#" B_PRIx32 " instance %#" B_PRIx32
 				" at %" B_PRIu32 ":%#" B_PRIx32 "\n",
@@ -1281,6 +1344,36 @@ qrtr_receive(glink_channel* channel, const uint8* data, uint32 length)
 				header.type == kQrtrNewLookup ? "looks up" : "drops", control.service,
 				control.instance);
 			break;
+		case kQrtrData:
+			if (header.destinationPort == kQrtrPortServreg && size >= 7) {
+				// QMI: type, transaction, message, length, TLVs
+				uint16 message, transaction;
+				memcpy(&transaction, payload + 1, 2);
+				memcpy(&message, payload + 3, 2);
+				char hex[3 * 40 + 1] = "";
+				for (uint32 i = 7; i < size && i < 47; i++) {
+					snprintf(hex + 3 * (i - 7), sizeof(hex) - 3 * (i - 7),
+						" %02x", payload[i]);
+				}
+				TRACE("servreg: %s %#x:%s\n", payload[0] == 2 ? "response"
+					: payload[0] == 4 ? "indication" : "message", message, hex);
+				// SERVREG_STATE_UPDATED: TLV 0x01 state, 0x02 path, 0x03
+				// the transaction to acknowledge (SERVREG_SET_ACK)
+				if (payload[0] == 4 && message == 0x22) {
+					uint32 ackId = 0;
+					for (uint32 i = 7; i + 3 <= size;) {
+						uint8 type = payload[i];
+						uint16 tlvLength;
+						memcpy(&tlvLength, payload + i + 1, 2);
+						if (type == 0x03 && tlvLength >= 2)
+							memcpy(&ackId, payload + i + 3, min_c(tlvLength, 4));
+						i += 3 + tlvLength;
+					}
+					servreg_send(0x23, false, 0, 0x01, true, ackId);
+				}
+				break;
+			}
+			// fall through
 		default:
 		{
 			char hex[3 * 24 + 1] = "";
