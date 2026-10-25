@@ -1102,7 +1102,12 @@ void
 UsbcDisplayPort::_DumpBranch()
 {
 	static const struct { uint32 address, length; } kRanges[] = {
-		{0x000, 16}, {0x080, 16}, {0x500, 12}, {0x3050, 4}};
+		{0x000, 16}, {0x080, 16}, {0x200, 16}, {0x500, 16}, {0x510, 16},
+		{0x600, 1}, {0x2002, 14},
+		// the protocol converter's capabilities, controls and HDMI link
+		// status (DisplayPort 1.4/2.0 PCON registers)
+		{0x3000, 16}, {0x3010, 16}, {0x3020, 16}, {0x3030, 16},
+		{0x3040, 16}, {0x3050, 16}, {0x3060, 16}};
 	for (const auto& range : kRanges) {
 		uint8 data[16] = {};
 		status_t status = fPort->ReadDpcd(range.address, data, range.length);
