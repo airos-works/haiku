@@ -21,6 +21,7 @@
 
 #include <ByteOrder.h>
 #include <driver_settings.h>
+#include <kdevice_manager.h>
 #include <util/AutoLock.h>
 
 #include "xhci.h"
@@ -1168,7 +1169,9 @@ XHCI::_SuspendToIdle()
 			portsKeptUp = true;
 			continue;
 		}
-		if (keepAwake[i]) {
+		// (in a deep sleep, the SoC comes first: a port kept up would keep
+		// it out of its deepest state)
+		if (keepAwake[i] && device_manager_light_sleep()) {
 			TRACE_ALWAYS("port %" B_PRIu8 " is kept awake by its driver\n",
 				i);
 			portsKeptUp = true;
