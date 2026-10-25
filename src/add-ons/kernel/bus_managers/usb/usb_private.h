@@ -697,6 +697,8 @@ private:
 		uint8							fEnumerationFailures[
 											USB_MAX_PORT_COUNT];
 		bigtime_t						fNextEnumeration[USB_MAX_PORT_COUNT];
+		bigtime_t						fNextWarmReset[USB_MAX_PORT_COUNT];
+		uint8							fWarmResets[USB_MAX_PORT_COUNT];
 };
 
 

@@ -148,17 +148,37 @@ test_tone(AudioDevice* device)
 		return;
 	}
 	if (oneBuffer) {
-		// lab: what the SMMU makes of the DSP's reads
+		// lab: what the SMMU makes of the DSP's reads: our bank, and the
+		// firmware's bank 4 (stream 0x1000/0x402, the DSP's own, as it
+		// seems), its SCTLR (stall on fault?) and FSR
+		volatile uint32* cb4;
+		area_id cb4Area = map_physical_memory("qcom audio smmu cb4",
+			0x15000000 + 0x80000 + 4 * 0x1000, 0x1000,
+			B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY,
+			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&cb4);
+		if (cb4Area >= 0) {
+			TRACE("bank 4 before: SCTLR %#" B_PRIx32 " FSR %#" B_PRIx32
+				" FAR %#" B_PRIx32 "%08" B_PRIx32 "\n", cb4[0], cb4[0x58 / 4],
+				cb4[0x64 / 4], cb4[0x60 / 4]);
+		}
 		device->playback.Write(device->buffersPhysical, kBufferSize, 0);
 		for (int i = 0; i < 300; i++) {
-			if (device->smmu.Faults("one buffer") != 0
+			uint32 bank4 = cb4Area >= 0 ? cb4[0x58 / 4] & ~0x600u : 0;
+			if (device->smmu.Faults("one buffer") != 0 || bank4 != 0
 				|| device->doneCount > 0 || i == 299) {
-				TRACE("one buffer after %d ms: %" B_PRId32 " done\n", i,
-					device->doneCount);
+				TRACE("one buffer after %d ms: %" B_PRId32 " done; bank 4 FSR %#"
+					B_PRIx32 " FAR %#" B_PRIx32 "%08" B_PRIx32 " FSYNR0 %#"
+					B_PRIx32 "\n", i, device->doneCount,
+					cb4Area >= 0 ? cb4[0x58 / 4] : 0,
+					cb4Area >= 0 ? cb4[0x64 / 4] : 0,
+					cb4Area >= 0 ? cb4[0x60 / 4] : 0,
+					cb4Area >= 0 ? cb4[0x68 / 4] : 0);
 				break;
 			}
 			spin(1000);
 		}
+		if (cb4Area >= 0)
+			delete_area(cb4Area);
 		snooze(500000);
 		device->playback.Stop();
 		TRACE("test tone: stopped, %" B_PRId32 " done\n", device->doneCount);

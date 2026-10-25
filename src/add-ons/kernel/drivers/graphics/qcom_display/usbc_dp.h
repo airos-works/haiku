@@ -69,6 +69,7 @@ private:
 									const char* name, phys_addr_t address,
 									size_t size);
 			status_t			_PowerPhy();
+			status_t			_PowerUsb();
 			status_t			_ConfigureRate(uint32 rate);
 			status_t			_SetPhyLevels(uint32 swing,
 									uint32 preEmphasis);

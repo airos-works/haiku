@@ -39,6 +39,8 @@ Hub::Hub(Object *parent, int8 hubAddress, uint8 hubPort,
 	memset(fPlatformResets, 0, sizeof(fPlatformResets));
 	memset(fEnumerationFailures, 0, sizeof(fEnumerationFailures));
 	memset(fNextEnumeration, 0, sizeof(fNextEnumeration));
+	memset(fNextWarmReset, 0, sizeof(fNextWarmReset));
+	memset(fWarmResets, 0, sizeof(fWarmResets));
 	for (int32 i = 0; i < USB_MAX_PORT_COUNT; i++)
 		fChildren[i] = NULL;
 
@@ -469,6 +471,28 @@ Hub::Explore(change_item **changeList)
 			DefaultPipe()->SendRequest(USB_REQTYPE_CLASS | USB_REQTYPE_OTHER_OUT,
 				USB_REQUEST_CLEAR_FEATURE, C_PORT_LINK_STATE, i + 1,
 				0, NULL, 0, NULL);
+		}
+
+		// A SuperSpeed link in SS.Inactive or Compliance (a USB-C port's lanes
+		// moved by its mux, say) recovers only by a warm reset
+		// (hub_port_warm_reset_required())
+		// (a USB-C port whose lanes all carry DisplayPort stays inactive)
+		uint16 linkState = fPortStatus[i].status & (0xf << 5);
+		bool stuck = linkState == (0x6 << 5) || linkState == (0xa << 5);
+		if (!stuck)
+			fWarmResets[i] = 0;
+		if ((fPortStatus[i].status & PORT_STATUS_SS_POWER) != 0 && stuck
+			&& system_time() >= fNextWarmReset[i]) {
+			// three tries two seconds apart, then one every 20 s (its PHY
+			// may be set up again meanwhile)
+			fWarmResets[i] = min_c(fWarmResets[i] + 1, 3);
+			fNextWarmReset[i] = system_time()
+				+ (fWarmResets[i] < 3 ? 2000000 : 20000000);
+			TRACE_ALWAYS("port %" B_PRId32 ": SuperSpeed link %s, warm reset\n",
+				i, linkState == (0x6 << 5) ? "inactive" : "in compliance mode");
+			DefaultPipe()->SendRequest(USB_REQTYPE_CLASS | USB_REQTYPE_OTHER_OUT,
+				USB_REQUEST_SET_FEATURE, PORT_BH_PORT_RESET, i + 1, 0, NULL, 0,
+				NULL);
 		}
 
 		if (fPortStatus[i].change & PORT_CHANGE_BH_PORT_RESET) {
