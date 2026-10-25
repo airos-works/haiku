@@ -195,6 +195,8 @@ enum {
 	kIpccDisable = 0x18, kIpccClear = 0x1c,
 };
 static const uint32 kIpccGlinkAdsp = 3u << 16 | 0;
+// its SMP2P doorbell (IPCC_MPROC_SIGNAL_SMP2P): its state changed
+static const uint32 kIpccSmp2pAdsp = 3u << 16 | 2;
 static uint32 sIpccVector;
 static bool sIpccHandler;
 static sem_id sGlinkSem = -1;
@@ -210,7 +212,7 @@ ipcc_interrupt(void*)
 			break;
 		sIpcc.Write(kIpccClear, id);
 		handled = true;
-		wake |= id == kIpccGlinkAdsp;
+		wake |= id == kIpccGlinkAdsp || id == kIpccSmp2pAdsp;
 	}
 	if (wake && sGlinkSem >= 0) {
 		release_sem_etc(sGlinkSem, 1, B_DO_NOT_RESCHEDULE);
@@ -238,6 +240,7 @@ ipcc_interrupt_start()
 		return;
 	sIpccHandler = true;
 	sIpcc.Write(kIpccEnable, kIpccGlinkAdsp);
+	sIpcc.Write(kIpccEnable, kIpccSmp2pAdsp);
 }
 
 
@@ -247,6 +250,7 @@ ipcc_interrupt_stop()
 	if (!sIpccHandler)
 		return;
 	sIpcc.Write(kIpccDisable, kIpccGlinkAdsp);
+	sIpcc.Write(kIpccDisable, kIpccSmp2pAdsp);
 	remove_io_interrupt_handler(sIpccVector, ipcc_interrupt, NULL);
 	sIpccHandler = false;
 }
@@ -1483,6 +1487,9 @@ gpr_module_send(uint32 sourcePort, uint32 destinationPort, uint32 opcode,
 }
 
 
+static uint32 dsp_state(char* reason, size_t reasonSize);
+
+
 static status_t
 gpr_std_ops(int32 op, ...)
 {
@@ -1495,7 +1502,8 @@ static qcom_gpr_module_info sGprModule = {
 	gpr_module_ready,
 	gpr_module_register_port,
 	gpr_module_unregister_port,
-	gpr_module_send
+	gpr_module_send,
+	dsp_state
 };
 
 
@@ -1554,6 +1562,27 @@ log_crash_reason()
 	for (uint32 i = 0; i < size && i < sizeof(text) - 1; i++)
 		text[i] = reason[i];
 	ERROR("crash reason: %s\n", text);
+}
+
+
+//!	The ADSP's SMP2P state, and (with \a reason) its crash reason.
+static uint32
+dsp_state(char* reason, size_t reasonSize)
+{
+	uint32 state = 0;
+	if (!smp2p_entry(443, "slave-kernel", &state))
+		return 0;
+	if (reason != NULL && reasonSize > 0) {
+		reason[0] = '\0';
+		uint32 size = 0;
+		volatile uint8* text = smem_item(kHostGlobal, kHostGlobal, 423, &size);
+		for (uint32 i = 0; text != NULL && i < size && i < reasonSize - 1;
+				i++) {
+			reason[i] = text[i];
+			reason[i + 1] = '\0';
+		}
+	}
+	return state;
 }
 
 
@@ -1667,7 +1696,22 @@ boot_thread(void*)
 		ERROR("glink: cannot start\n");
 		return B_OK;
 	}
+	bool crashed = false;
 	while (!sQuit) {
+		// the DSP crashed: said once, with its reason
+		// the DSP crashed: said once, with its reason, and shut down, as
+		// Linux' remoteproc does. (The boot firmware stops the whole SoC
+		// within half a second of the crash anyway, and resets it into its
+		// crash dump mode: neither the cookie nor the secure call keeps it
+		// from that on this board.)
+		if (!crashed && (dsp_state(NULL, 0) & kStateFatal) != 0) {
+			crashed = true;
+			sAudioReady = false;
+			ERROR("the DSP crashed\n");
+			log_crash_reason();
+			status_t status = qcom_pas_shutdown(kAdspPasId);
+			ERROR("the DSP shut down: %s\n", strerror(status));
+		}
 		recursive_lock_lock(&sGlinkLock);
 		glink_poll();
 		pmic_glink_tick();

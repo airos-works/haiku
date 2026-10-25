@@ -37,6 +37,8 @@ public:
 			void				Uninit();
 
 			status_t			WaitReady(bigtime_t timeout);
+			//! Its SMP2P state (bit 0: it crashed), its crash reason.
+			uint32				State(char* reason, size_t reasonSize);
 
 			//! The status the DSP answered with, or an error of ours; with
 			//! \a responseOpcode, that answer's payload (\a response).
@@ -47,8 +49,18 @@ public:
 									uint32* _responseSize = NULL,
 									bigtime_t timeout = 1000000);
 			//! As Command(), with the APM command header (no shared memory)
-			//! in front of the payload.
+			//! in front of the payload; \a fromDataPort: sent from the
+			//! port the data goes from (the shared memory endpoint's own
+			//! commands, and the shared memory map, whose handle the DSP
+			//! keeps for the port that mapped it).
 			status_t			ApmCommand(uint32 destination, uint32 opcode,
+									const void* payload, uint32 size,
+									uint32 responseOpcode = 0,
+									void* response = NULL,
+									uint32* _responseSize = NULL,
+									bool fromDataPort = false);
+			//! Command() from the data port.
+			status_t			DataCommand(uint32 destination, uint32 opcode,
 									const void* payload, uint32 size,
 									uint32 responseOpcode = 0,
 									void* response = NULL,
@@ -66,6 +78,14 @@ public:
 private:
 	static	void				_CommandHook(void* cookie,
 									const qcom_gpr_packet* packet);
+	static	void				_DataHook(void* cookie,
+									const qcom_gpr_packet* packet);
+			bool				_Complete(const qcom_gpr_packet* packet);
+			status_t			_Command(uint32 sourcePort,
+									uint32 destination, uint32 opcode,
+									const void* payload, uint32 size,
+									uint32 responseOpcode, void* response,
+									uint32* _responseSize, bigtime_t timeout);
 			status_t			_Send(uint32 sourcePort, uint32 destination,
 									uint32 opcode, uint32 token,
 									const void* payload, uint32 size);
@@ -74,6 +94,8 @@ private:
 	static const uint32			kDataPort = 0x10000002;
 
 			qcom_gpr_module_info* fGpr;
+			DataHook			fDataHook;
+			void*				fDataCookie;
 			mutex				fLock;
 			sem_id				fDone;
 			spinlock			fStateLock;

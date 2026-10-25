@@ -41,6 +41,7 @@ struct AudioDevice {
 	area_id			bufferArea;
 	uint8*			buffers;
 	phys_addr_t		buffersPhysical;
+	uint64			buffersDsp;		// their address for the DSP
 	sem_id			doneSem;
 	int32			doneCount;
 

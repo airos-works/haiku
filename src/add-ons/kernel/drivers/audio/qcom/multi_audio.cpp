@@ -175,7 +175,7 @@ start(AudioDevice* device)
 	restore_interrupts(state);
 	for (uint32 index = 0; index < kBufferCount; index++) {
 		clean_buffer(device, index);
-		device->playback.Write(device->buffersPhysical + index * kBufferSize,
+		device->playback.Write(device->buffersDsp + index * kBufferSize,
 			kBufferSize, index);
 	}
 	device->running = true;
@@ -212,7 +212,7 @@ buffer_exchange(AudioDevice* device, multi_buffer_info* userInfo)
 			return status;
 		if (device->toRefill >= 0) {
 			clean_buffer(device, device->toRefill);
-			device->playback.Write(device->buffersPhysical
+			device->playback.Write(device->buffersDsp
 				+ device->toRefill * kBufferSize, kBufferSize,
 				device->toRefill);
 			device->toRefill = -1;

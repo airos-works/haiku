@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include <KernelExport.h>
+#include <driver_settings.h>
 
 #include "dsp.h"
 
@@ -175,6 +176,8 @@ Playback::Playback(Dsp& dsp)
 	fSampleRate(48000),
 	fChannels(2),
 	fBits(16),
+	fSkipLoggers(false),
+	fSkipVolume(false),
 	fMemoryHandle(0),
 	fFrontOpen(false),
 	fBackOpen(false),
@@ -195,6 +198,13 @@ Playback::Open(uint32 sampleRate, uint32 channels, uint32 bitsPerSample)
 	fSampleRate = sampleRate;
 	fChannels = channels;
 	fBits = bitsPerSample;
+	// lab: leave the loggers, the volume as they are
+	void* settings = load_driver_settings("qcom_audio");
+	fSkipLoggers = get_driver_boolean_parameter(settings, "skip_loggers", false,
+		true);
+	fSkipVolume = get_driver_boolean_parameter(settings, "skip_volume", false,
+		true);
+	unload_driver_settings(settings);
 
 	status_t status = _OpenGraph(kDevice, false);
 	if (status != B_OK)
@@ -209,7 +219,7 @@ Playback::Open(uint32 sampleRate, uint32 channels, uint32 bitsPerSample)
 	status = _SetFormats(kDevice);
 	if (status == B_OK)
 		status = _SetFormats(kStream);
-	if (status == B_OK)
+	if (status == B_OK && !fSkipVolume)
 		status = SetVolume(0x2000);		// VOL_CTRL_DEFAULT_GAIN: unity
 	if (status != B_OK) {
 		Close();
@@ -227,7 +237,7 @@ Playback::Close()
 	Stop();
 	if (fMemoryHandle != 0) {
 		uint32 handle = fMemoryHandle;
-		fDsp.Command(kApmPort, kUnmapMemory, &handle, sizeof(handle));
+		fDsp.DataCommand(kApmPort, kUnmapMemory, &handle, sizeof(handle));
 		fMemoryHandle = 0;
 	}
 	if (fFrontOpen)
@@ -248,7 +258,9 @@ Playback::MapMemory(phys_addr_t address, size_t size)
 		(uint32)((size + 4095) & ~(size_t)4095) };
 	uint32 handle = 0;
 	uint32 handleSize = sizeof(handle);
-	status_t status = fDsp.Command(kApmPort, kMapMemory, payload,
+	// from the port the buffers go from: the DSP keeps the handle for it
+	// (as Linux sends both from the graph's port)
+	status_t status = fDsp.DataCommand(kApmPort, kMapMemory, payload,
 		sizeof(payload), kMapMemoryResponse, &handle, &handleSize);
 	if (status == B_OK && (handleSize < 4 || handle == 0))
 		status = B_ERROR;
@@ -497,6 +509,8 @@ Playback::_SetFormats(const SubGraph& subGraph)
 				break;
 			case kLogger:
 			{
+				if (fSkipLoggers)
+					continue;
 				Payload enable;
 				uint32 at = enable.BeginParameter(module.instance,
 					kParamModuleEnable);
@@ -547,7 +561,8 @@ Playback::_SetFormats(const SubGraph& subGraph)
 		if (!payload.Valid())
 			return B_BUFFER_OVERFLOW;
 		status_t status = fDsp.ApmCommand(destination, kSetConfig,
-			payload.Data(), payload.Size());
+			payload.Data(), payload.Size(), 0, NULL, NULL,
+			module.id == kWriteEndpoint);
 		if (status != B_OK) {
 			TRACE("module %#" B_PRIx32 ": media format: %s\n", module.instance,
 				strerror(status));

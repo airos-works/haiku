@@ -58,6 +58,8 @@ private:
 			uint32				fSampleRate;
 			uint32				fChannels;
 			uint32				fBits;
+			bool				fSkipLoggers;
+			bool				fSkipVolume;
 			uint32				fMemoryHandle;
 			bool				fFrontOpen;
 			bool				fBackOpen;
