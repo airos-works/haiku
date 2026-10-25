@@ -205,7 +205,7 @@ UsbcDisplayPort::UsbcDisplayPort(uint32 connector)
 	fLayerExt(0x40 + 4 * fConnector.mixer),
 	fGccArea(-1), fGcc(NULL), fDispccArea(-1), fDispcc(NULL), fPhyArea(-1),
 	fPhy(NULL), fControllerArea(-1), fController(NULL), fPort(NULL),
-	fMdssArea(-1), fMdss(NULL), fRate(0), fWideBus(false),
+	fMdssArea(-1), fMdss(NULL), fRate(0), fWideBus(false), fFirmwarePhy(NULL),
 	fReverse(false), fPhyLanes(4), fLanes(4), fTrained(false), fRetrainings(0), fPowered(false), fRunning(false)
 {
 }
@@ -325,6 +325,16 @@ UsbcDisplayPort::_PowerPhy()
 		for (uint32 branch : fConnector.phyBranches)
 			branch_on(fGcc, branch);
 	} else {
+		// the firmware's USB 3 set-up of this PHY (common block, lanes, USB
+		// serdes, PCS), for _PowerUsb()
+		static uint32 sFirmware[0x1800 / 4];
+		static bool sHaveFirmware = false;
+		if (fPhyLanes == 2 && !sHaveFirmware && (gdsc & (1u << 31)) != 0) {
+			for (uint32 offset = 0; offset < 0x1800; offset += 4)
+				sFirmware[offset / 4] = rd(fPhy, offset);
+			sHaveFirmware = true;
+		}
+		fFirmwarePhy = sHaveFirmware ? sFirmware : NULL;
 		if ((gdsc & 1) != 0)
 			wr(fGcc, fConnector.gdsc, gdsc & ~1u);
 		if (!wait_bits(fGcc, fConnector.gdsc, 1u << 31, 1u << 31)) {
@@ -356,6 +366,7 @@ UsbcDisplayPort::_PowerPhy()
 	if (fPhyLanes == 2 && !keep && _PowerUsb() == B_OK
 		&& connector < B_COUNT_OF(kConnectors))
 		sUsbSetUp[connector] = true;
+	fFirmwarePhy = NULL;
 	for (uint32 branch : fConnector.phyBranches)
 		branch_on(fGcc, branch);
 
@@ -393,6 +404,29 @@ UsbcDisplayPort::_PowerUsb()
 	}
 	for (const qmp_lane_setting& setting : kUsbPcs)
 		wr(fPhy + kPhyUsbPcs, setting.offset, setting.value);
+	// Where the firmware's set-up of this board's PHY (with which USB 3 ran
+	// at boot) differs, the firmware's values: the TX lanes, the USB serdes,
+	// PCS misc, PCS (but its controls) and PCS USB; not the RX blocks, whose
+	// differing registers are status
+	if (fFirmwarePhy != NULL) {
+		static const struct { uint32 start, end; } kBlocks[] = {
+			{0x0400, 0x0600}, {0x0a00, 0x0c00}, {0x1000, 0x1800}};
+		int copied = 0;
+		for (const auto& block : kBlocks) {
+			for (uint32 offset = block.start; offset < block.end; offset += 4) {
+				if (offset == kPhyUsbPcs + 0x00 || offset == kPhyUsbPcs + 0x14
+					|| offset == kPhyUsbPcs + 0x40 || offset == kPhyUsbPcs + 0x44)
+					continue;
+				uint32 theirs = fFirmwarePhy[offset / 4] & 0xff;
+				if ((rd(fPhy, offset) & 0xff) != theirs) {
+					wr(fPhy, offset, theirs);
+					copied++;
+				}
+			}
+		}
+		INFO("%s: %d USB 3 PHY registers set as the firmware had them\n",
+			fConnector.name, copied);
+	}
 	spin(20);
 	// SW_RESET off, SERDES_START | PCS_START, then PHYSTATUS (bit 6) clear
 	wr(fPhy + kPhyUsbPcs, 0x00, rd(fPhy + kPhyUsbPcs, 0x00) & ~1u);

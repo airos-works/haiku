@@ -110,6 +110,7 @@ private:
 			uint32				fRate;			// MHz, the PHY's link rate
 			display_timing		fTiming;		// the stream's, for a retraining
 			bool				fWideBus;
+			const uint32*		fFirmwarePhy;	// lab: its set-up as found
 			bool				fReverse;		// the plug's orientation
 			uint32				fPhyLanes;		// DisplayPort's lanes: 2 or 4
 			uint32				fLanes;			// the trained link's
