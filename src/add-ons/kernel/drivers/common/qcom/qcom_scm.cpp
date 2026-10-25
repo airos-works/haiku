@@ -125,6 +125,40 @@ qcom_scm_call(uint32 service, uint32 command, uint32 argumentInfo, uint64 a0,
 }
 
 
+int64
+qcom_scm_call_atomic(uint32 service, uint32 command, uint32 argumentInfo,
+	uint64 a0, uint64 a1, uint64* result)
+{
+	scm_arguments arguments = {};
+	arguments.function = 1ull << 31 | 1ull << 30 | 2ull << 24 | service << 8
+		| command;
+	arguments.info = argumentInfo;
+	arguments.a0 = a0;
+	arguments.a1 = a1;
+	call_single_cpu_sync(0, scm_smc, &arguments);
+	if (result != NULL)
+		*result = arguments.r1;
+	return (int64)arguments.r0;
+}
+
+
+status_t
+qcom_scm_clear_download_mode(phys_addr_t address)
+{
+	// QCOM_SCM_IO_READ, QCOM_SCM_IO_WRITE
+	uint64 value = 0;
+	if (qcom_scm_call_atomic(QCOM_SCM_SVC_IO, 1, QCOM_SCM_ARGS(1), address, 0,
+			&value) != 0)
+		return B_ERROR;
+	if (((uint32)value & (3u << 4)) == 0)
+		return B_OK;
+	dprintf("qcom_scm: download mode was set (%#" B_PRIx32 "), cleared\n",
+		(uint32)value);
+	return qcom_scm_call_atomic(QCOM_SCM_SVC_IO, 2, QCOM_SCM_ARGS(2), address,
+		(uint32)value & ~(3u << 4)) == 0 ? B_OK : B_ERROR;
+}
+
+
 status_t
 qcom_pas_load(const char* name, uint32 pasId, const uint8* image, size_t size,
 	phys_addr_t regionBase, size_t regionSize)

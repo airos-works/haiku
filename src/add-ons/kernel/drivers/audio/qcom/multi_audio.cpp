@@ -222,8 +222,10 @@ buffer_exchange(AudioDevice* device, multi_buffer_info* userInfo)
 	status_t status = acquire_sem_etc(device->doneSem, 1,
 		B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT, 500000);
 	if (status != B_OK) {
-		if (status == B_TIMED_OUT)
+		if (status == B_TIMED_OUT) {
 			TRACE("the DSP played no buffer for 0.5 s\n");
+			device->smmu.Faults("buffer exchange");
+		}
 		return status;
 	}
 	cpu_status state = disable_interrupts();

@@ -13,7 +13,7 @@ if $(TARGET_ARCH) = arm64 {
 	# the SC8280XP's SD slot, its votes through RPMh
 	UseLibraryHeaders [ FDirName libfdt ] ;
 	SubDirSysHdrs $(HAIKU_TOP) src add-ons kernel drivers common qcom ;
-	qcomSources = sdhci_qcom.cpp qcom_rpmh.cpp fdt.c fdt_ro.c ;
+	qcomSources = sdhci_qcom.cpp qcom_rpmh.cpp qcom_smmu.cpp fdt.c fdt_ro.c ;
 }
 
 KernelAddon sdhci :
@@ -25,7 +25,7 @@ KernelAddon sdhci :
 	$(qcomSources)
 ;
 
-SEARCH on [ FGristFiles qcom_rpmh.cpp ]
+SEARCH on [ FGristFiles qcom_rpmh.cpp qcom_smmu.cpp ]
 	= [ FDirName $(HAIKU_TOP) src add-ons kernel drivers common qcom ] ;
 SEARCH on [ FGristFiles fdt.c fdt_ro.c ]
 	= [ FDirName $(HAIKU_TOP) src libs libfdt ] ;

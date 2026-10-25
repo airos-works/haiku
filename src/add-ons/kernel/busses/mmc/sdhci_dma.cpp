@@ -44,8 +44,11 @@ sdhci_clean_dma_alias(phys_addr_t address, size_t size)
 
 
 status_t
-sdhci_allocate_dma(area_id* area, void** buffer, phys_addr_t* address)
+sdhci_allocate_dma(area_id* area, void** buffer, phys_addr_t* address,
+	size_t size)
 {
+	// the payload, or (with \a size) a page for its ADMA2 descriptors
+	const size_t kSdhciDmaSize = size != 0 ? size : ::kSdhciDmaSize;
 #if defined(__aarch64__)
 	virtual_address_restrictions virtualRestrictions = {};
 	physical_address_restrictions physicalRestrictions = {};
@@ -53,7 +56,8 @@ sdhci_allocate_dma(area_id* area, void** buffer, phys_addr_t* address)
 	physicalRestrictions.alignment = kSdhciDmaSize;
 	physicalRestrictions.boundary = kSdhciDmaSize;
 	void* memory;
-	area_id id = create_area_etc(B_SYSTEM_TEAM, "SDHCI DMA payload", kSdhciDmaSize,
+	area_id id = create_area_etc(B_SYSTEM_TEAM, size != 0
+			? "SDHCI ADMA descriptors" : "SDHCI DMA payload", kSdhciDmaSize,
 		B_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, 0, 0,
 		&virtualRestrictions, &physicalRestrictions, &memory);
 	if (id < B_OK)

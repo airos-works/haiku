@@ -31,7 +31,8 @@ Hub::Hub(Object *parent, int8 hubAddress, uint8 hubPort,
 			depth, controllerCookie),
 		fInterruptPipe(NULL),
 		fPortCount(0),
-		fPowerOnToPowerGood(0)
+		fPowerOnToPowerGood(0),
+		fUnansweredExplores(0)
 {
 	TRACE("creating hub\n");
 
@@ -256,10 +257,20 @@ Hub::DisablePort(uint8 index)
 void
 Hub::Explore(change_item **changeList)
 {
+	// A hub that answers no port status request (its link lost, say a
+	// SuperSpeed hub whose lanes went to DisplayPort) is asked only every
+	// 16th round after 8 rounds without an answer, not flooding its bus.
+	static const uint32 kQuietAfter = 8;
+	if (fUnansweredExplores >= kQuietAfter
+		&& (++fUnansweredExplores - kQuietAfter) % 16 != 0) {
+		return;
+	}
+	bool answered = false;
 	for (int32 i = 0; i < fPortCount; i++) {
 		status_t result = UpdatePortStatus(i);
 		if (result < B_OK)
 			continue;
+		answered = true;
 
 #ifdef TRACE_USB
 		if (fPortStatus[i].change) {
@@ -475,6 +486,15 @@ Hub::Explore(change_item **changeList)
 			continue;
 
 		((Hub *)fChildren[i])->Explore(changeList);
+	}
+
+	if (answered) {
+		if (fUnansweredExplores >= kQuietAfter)
+			TRACE_ALWAYS("the hub answers again\n");
+		fUnansweredExplores = 0;
+	} else if (fUnansweredExplores < kQuietAfter
+		&& ++fUnansweredExplores == kQuietAfter) {
+		TRACE_ALWAYS("the hub does not answer: asking it less often\n");
 	}
 }
 

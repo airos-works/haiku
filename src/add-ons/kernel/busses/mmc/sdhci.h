@@ -31,6 +31,12 @@ struct sdhci_platform_info {
 	// cached linear-map alias is cleaned before each transfer, or a stale
 	// line of it answers the controller instead of memory.
 	bool dma_coherent;
+	// Called once the private DMA payload exists (an IOMMU mapping for it).
+	status_t (*dma_allocated)(void* cookie, phys_addr_t address, size_t size);
+	// The controller does DMA through ADMA2 only (the SC8280XP's runs its
+	// ADMA engine whatever DMA mode is selected): the payload is handed to
+	// it in a 32-bit ADMA2 descriptor table.
+	bool adma_only;
 };
 
 
@@ -77,6 +83,9 @@ class SdhciBus {
 			area_id				fDMAArea;
 			void*				fDMABuffer;
 			phys_addr_t			fDMAAddress;
+			area_id				fAdmaArea;		// its ADMA2 descriptors
+			uint32*				fAdmaTable;
+			phys_addr_t			fAdmaAddress;
 			bool				fDMAQuarantined;
 			bool				fReportedHighCpuRead;
 			bool				fReportedHighCpuWrite;
@@ -84,7 +93,8 @@ class SdhciBus {
 
 
 const size_t kSdhciDmaSize = 512 * 1024;
-status_t sdhci_allocate_dma(area_id* area, void** buffer, phys_addr_t* address);
+status_t sdhci_allocate_dma(area_id* area, void** buffer, phys_addr_t* address,
+	size_t size = 0);
 void sdhci_clean_dma_alias(phys_addr_t address, size_t size);
 
 

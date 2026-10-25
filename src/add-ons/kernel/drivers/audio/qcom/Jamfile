@@ -2,6 +2,7 @@ SubDir HAIKU_TOP src add-ons kernel drivers audio qcom ;
 
 UsePrivateKernelHeaders ;
 UsePrivateHeaders audio drivers ;
+UseHeaders [ FDirName $(HAIKU_TOP) src add-ons kernel drivers common qcom ] ;
 
 KernelAddon qcom_audio :
 	audioreach.cpp
@@ -9,4 +10,8 @@ KernelAddon qcom_audio :
 	driver.cpp
 	dsp.cpp
 	multi_audio.cpp
+	qcom_smmu.cpp
 ;
+
+SEARCH on [ FGristFiles qcom_smmu.cpp ]
+	= [ FDirName $(HAIKU_TOP) src add-ons kernel drivers common qcom ] ;

@@ -15,14 +15,17 @@
 	 - the power interrupt ("pwr_irq"): the controller waits for each bus
 	   power and I/O level change it makes to be acknowledged.
 	The controller's own card detect is not wired: the slot's switch is GPIO
-	131, closed to ground without a card (schematic page 38), and a thread
+	131, low with a card in (seen with a card; schematic page 38), and a thread
 	polls it and drives the SDHCI card detect test level, so the generic
-	insertion path runs. Its DMA goes through the apps SMMU's context bank
-	2, which the firmware leaves untranslated (SCTLR.M 0), and the bus is
-	cache coherent ("dma-coherent").
+	insertion path runs. Its DMA is ADMA2 only (it runs its ADMA engine
+	whatever DMA mode is selected) and goes through the apps SMMU: in a
+	context bank of its own that maps only the DMA payload and its
+	descriptors (through the firmware's untranslated bank 2 its accesses to
+	address 0, ADMA without a table, hung the board), and the bus is cache
+	coherent ("dma-coherent").
 
 	Settings (the "sdhci" driver settings file): qcom_sd false turns it off,
-	qcom_cd_active_low true reads the switch the other way round. */
+	qcom_cd_active_low false reads the switch the other way round. */
 
 
 #include "sdhci.h"
@@ -37,6 +40,7 @@
 #include <libfdt.h>
 
 #include "qcom_rpmh.h"
+#include "qcom_smmu.h"
 
 
 #define SDHCI_QCOM_DRIVER "busses/mmc/sdhci/qcom/driver_v1"
@@ -99,6 +103,8 @@ struct QcomMmc {
 	area_id			tlmmArea;
 	volatile uint8*	tlmm;
 	qcom_rpmh		rpmh;
+	QcomSmmuDomain	smmu;			// its DMA's address space
+	bool			smmuAttached;
 	bool			powerHandler;
 	thread_id		thread;
 	volatile bool	quit;
@@ -169,13 +175,13 @@ static bool
 qcom_settings(bool& readOnly, bool& cdActiveLow)
 {
 	readOnly = false;
-	cdActiveLow = false;
+	cdActiveLow = true;
 	void* handle = load_driver_settings("sdhci");
 	if (handle == NULL)
 		return true;
 	bool enabled = get_driver_boolean_parameter(handle, "qcom_sd", true, true);
 	cdActiveLow = get_driver_boolean_parameter(handle, "qcom_cd_active_low",
-		false, true);
+		true, true);
 	unload_driver_settings(handle);
 	return enabled;
 }
@@ -247,6 +253,29 @@ core_clock_kilohertz(QcomMmc* info)
 }
 
 
+/*!	The controller's stream (0x4e0, the device tree's iommus) in a context
+	bank of its own that maps only the DMA payload, at its own address: the
+	firmware's bank 2 passes everything through untranslated, and a stray
+	access through it is suspected of hanging the board. */
+static status_t
+map_qcom_dma(void* cookie, phys_addr_t address, size_t size)
+{
+	QcomMmc* info = (QcomMmc*)cookie;
+	static const uint32 kStreams[][2] = {{0x4e0, 0}};
+	status_t status = B_OK;
+	if (!info->smmuAttached) {
+		status = info->smmu.Attach("sdhci qcom", kStreams, 1);
+		info->smmuAttached = status == B_OK;
+	}
+	if (status == B_OK)
+		status = info->smmu.Map(address, address, size, true);
+	if (status != B_OK)
+		dprintf("sdhci qcom: SDC2: no SMMU mapping for its DMA: %s\n",
+			strerror(status));
+	return status;
+}
+
+
 static status_t
 set_qcom_clock(void* cookie, uint32 requested, uint32* baseClock)
 {
@@ -286,6 +315,8 @@ card_detect_thread(void* cookie)
 			| (present ? kCardDetectTest : 1u << 7);
 		if (value != wanted)
 			*hostControl = wanted;
+		// a DMA access its context bank refused is logged
+		info->smmu.Faults("SDC2");
 		snooze(250000);
 	}
 	return B_OK;
@@ -549,7 +580,7 @@ init_bus_qcom(device_node* node, void** cookie)
 	}
 
 	sdhci_platform_info platform = {set_qcom_clock, info, info->readOnly,
-		false, 0, 0, true};
+		false, 0, 0, true, map_qcom_dma, true};
 	SdhciBus* bus = new(std::nothrow) SdhciBus((registers*)mapping,
 		info->hcInterrupt, false, &platform);
 	if (bus == NULL || bus->InitCheck() != B_OK) {

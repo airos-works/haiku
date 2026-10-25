@@ -88,6 +88,8 @@ static const uint32 kTransGo = 1u << 9;
 static const uint32 kTransNoSendAddress = 1u << 10;
 static const uint32 kTransNoSendStop = 1u << 11;
 
+static const uint32 kPixelInterface = 0x1000;	// MMSS_DP_* of "p0"
+
 // link
 enum {
 	REG_DP_STATE_CTRL			= kLink + 0x004,
@@ -98,6 +100,7 @@ enum {
 	REG_DP_START_HOR_VER_FROM_SYNC = kLink + 0x020,
 	REG_DP_HSYNC_VSYNC_WIDTH_POLARITY = kLink + 0x024,
 	REG_DP_ACTIVE_HOR_VER		= kLink + 0x028,
+	REG_DP_MISC1_MISC0			= kLink + 0x02c,
 	REG_DP_VALID_BOUNDARY		= kLink + 0x030,
 	REG_DP_VALID_BOUNDARY_2		= kLink + 0x034,
 	REG_DP_MAINLINK_READY		= kLink + 0x040,
@@ -201,7 +204,8 @@ DisplayPort::Init()
 		|| !branch_on(kControllers[fIndex].linkClock)) {
 		return B_DEVICE_NOT_FOUND;
 	}
-	fArea = map_physical_memory("qcom dp", kControllers[fIndex].base, 0x1000,
+	// with the pixel interface ("p0", at 0x1000)
+	fArea = map_physical_memory("qcom dp", kControllers[fIndex].base, 0x2000,
 		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
 		(void**)&fBase);
 	if (fArea < 0)
@@ -376,6 +380,18 @@ DisplayPort::SetStream(const display_timing& timing, bool wideBus)
 		| (timing.h_sync_end - timing.h_sync_start));
 	_Write(REG_DP_ACTIVE_HOR_VER,
 		(uint32)timing.v_display << 16 | timing.h_display);
+	// MISC0 (msm_dp_ctrl_configure_source_params()): 8 bits a component,
+	// the synchronous clock, the colorimetry as it is; the pixel
+	// interface's data bus widened for two pixels a clock
+	// (msm_dp_panel_timing_cfg(); the firmware sets both on its output)
+	uint32 misc = _Read(REG_DP_MISC1_MISC0) & ~(7u << 5);
+	_Write(REG_DP_MISC1_MISC0, misc | 1u << 5 | 1);
+	// no DSC: its DTO off (msm_dp_panel_clear_dsc_dto(); after a reset
+	// the USB-C controllers have it at 2)
+	_Write(kPixelInterface + 0x7c, 0);
+	uint32 intfConfig = _Read(kPixelInterface + 0x14);
+	_Write(kPixelInterface + 0x14,
+		wideBus ? intfConfig | 1u << 4 : intfConfig & ~(1u << 4));
 
 	// Mvid/Nvid, as msm_dp_ctrl_config_msa()
 	uint32 divider = linkRate == 810 ? 6 : linkRate == 540 ? 4 : 2;

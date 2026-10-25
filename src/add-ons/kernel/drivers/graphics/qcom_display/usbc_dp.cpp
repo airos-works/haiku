@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include <KernelExport.h>
+#include <driver_settings.h>
 #include <arch/atomic.h>
 
 
@@ -148,7 +149,8 @@ enum {
 	LM_OUT_SIZE = 0x04,
 
 	INTF_TIMING_ENGINE_EN = 0x000, INTF_FRAME_LINE_COUNT_EN = 0x0a8,
-	INTF_FRAME_COUNT = 0x0ac,
+	INTF_FRAME_COUNT = 0x0ac, INTF_PANEL_FORMAT = 0x090,
+	INTF_PROG_FETCH_START = 0x170, INTF_MUX = 0x25c,
 };
 static const uint32 kFlushCtl = 1u << 17, kFlushIntf = 1u << 31;
 // the HDMI path's timing registers, which INTF_0 takes
@@ -202,7 +204,8 @@ UsbcDisplayPort::UsbcDisplayPort(uint32 connector)
 	fLayerExt(0x40 + 4 * fConnector.mixer),
 	fGccArea(-1), fGcc(NULL), fDispccArea(-1), fDispcc(NULL), fPhyArea(-1),
 	fPhy(NULL), fControllerArea(-1), fController(NULL), fPort(NULL),
-	fMdssArea(-1), fMdss(NULL), fRate(0), fPowered(false), fRunning(false)
+	fMdssArea(-1), fMdss(NULL), fRate(0), fWideBus(false),
+	fReverse(false), fPhyLanes(4), fLanes(4), fTrained(false), fRetrainings(0), fPowered(false), fRunning(false)
 {
 }
 
@@ -210,6 +213,12 @@ UsbcDisplayPort::UsbcDisplayPort(uint32 connector)
 UsbcDisplayPort::~UsbcDisplayPort()
 {
 	Stop();
+	// the DP half of the PHY powered down, as qmp_combo_dp_power_off() does
+	// (the USB 3 half beside it is left alone)
+	if (fPhy != NULL && fPowered) {
+		wr(fController, 0x400, 0);			// DP_MAINLINK_CTRL: off
+		wr(fPhy + kPhyDpPhy, DP_PHY_PD_CTL, 0x02);
+	}
 	delete fPort;
 	area_id areas[] = {fGccArea, fDispccArea, fPhyArea, fControllerArea,
 		fMdssArea};
@@ -238,33 +247,51 @@ UsbcDisplayPort::_Map(area_id& area, volatile uint8*& base, const char* name,
 status_t
 UsbcDisplayPort::_PowerPhy()
 {
-	uint32 gdsc = rd(fGcc, fConnector.gdsc);
-	if ((gdsc & 1) != 0)
-		wr(fGcc, fConnector.gdsc, gdsc & ~1u);
-	if (!wait_bits(fGcc, fConnector.gdsc, 1u << 31, 1u << 31)) {
-		ERROR("%s: its PHY's GDSC does not come on\n", fConnector.name);
-		return B_ERROR;
-	}
-	for (uint32 branch : fConnector.phyBranches)
-		branch_on(fGcc, branch);
-	for (uint32 reset : fConnector.phyResets)
-		wr(fGcc, reset, rd(fGcc, reset) | 1);
-	spin(200);
-	for (uint32 reset : fConnector.phyResets)
-		wr(fGcc, reset, rd(fGcc, reset) & ~1u);
-	spin(200);
-
 	volatile uint8* com = fPhy + kPhyCom;
 	volatile uint8* serdes = fPhy + kPhyDpSerdes;
 	volatile uint8* dp = fPhy + kPhyDpPhy;
 
-	wr(com, COM_POWER_DOWN_CTRL, rd(com, COM_POWER_DOWN_CTRL) | 1);
-	wr(com, COM_RESET_OVRD_CTRL, rd(com, COM_RESET_OVRD_CTRL) | 0xf);
-	wr(com, COM_TYPEC_CTRL, 1u << 1);		// software port select, normal
-	wr(com, COM_PHY_MODE_CTRL, 3);			// USB3 + DP
-	wr(com, COM_RESET_OVRD_CTRL, rd(com, COM_RESET_OVRD_CTRL) & ~0xfu);
-	wr(com, COM_SWI_CTRL, rd(com, COM_SWI_CTRL) & ~3u);
-	wr(com, COM_SW_RESET, rd(com, COM_SW_RESET) & ~1u);
+	// With two lanes USB 3 runs beside DisplayPort on the same PHY: if the
+	// firmware (or the USB side) has the common block up in USB 3 mode, in
+	// our orientation, it is left alone, as Linux' qmp_combo_com_init() runs
+	// once for both halves; resetting it drops the USB 3 link.
+	uint32 gdsc = rd(fGcc, fConnector.gdsc);
+	bool usbRunning = fPhyLanes == 2 && (gdsc & (1u << 31)) != 0
+		&& (rd(com, COM_PHY_MODE_CTRL) & 1) != 0
+		&& (rd(com, COM_SW_RESET) & 1) == 0
+		&& (rd(com, COM_TYPEC_CTRL) & 3) == (1u << 1 | (fReverse ? 1 : 0));
+	if (usbRunning) {
+		INFO("%s: USB 3 runs on the PHY: its common block kept\n",
+			fConnector.name);
+		wr(com, COM_PHY_MODE_CTRL, 3);
+	} else {
+		if ((gdsc & 1) != 0)
+			wr(fGcc, fConnector.gdsc, gdsc & ~1u);
+		if (!wait_bits(fGcc, fConnector.gdsc, 1u << 31, 1u << 31)) {
+			ERROR("%s: its PHY's GDSC does not come on\n", fConnector.name);
+			return B_ERROR;
+		}
+		for (uint32 branch : fConnector.phyBranches)
+			branch_on(fGcc, branch);
+		for (uint32 reset : fConnector.phyResets)
+			wr(fGcc, reset, rd(fGcc, reset) | 1);
+		spin(200);
+		for (uint32 reset : fConnector.phyResets)
+			wr(fGcc, reset, rd(fGcc, reset) & ~1u);
+		spin(200);
+
+		wr(com, COM_POWER_DOWN_CTRL, rd(com, COM_POWER_DOWN_CTRL) | 1);
+		wr(com, COM_RESET_OVRD_CTRL, rd(com, COM_RESET_OVRD_CTRL) | 0xf);
+		// software port select, the orientation; DisplayPort only with
+		// four lanes, USB 3 beside it with two
+		wr(com, COM_TYPEC_CTRL, 1u << 1 | (fReverse ? 1 : 0));
+		wr(com, COM_PHY_MODE_CTRL, fPhyLanes == 4 ? 2 : 3);
+		wr(com, COM_RESET_OVRD_CTRL, rd(com, COM_RESET_OVRD_CTRL) & ~0xfu);
+		wr(com, COM_SWI_CTRL, rd(com, COM_SWI_CTRL) & ~3u);
+		wr(com, COM_SW_RESET, rd(com, COM_SW_RESET) & ~1u);
+	}
+	for (uint32 branch : fConnector.phyBranches)
+		branch_on(fGcc, branch);
 
 	// the AUX block
 	wr(dp, DP_PHY_PD_CTL, 0x01 | 0x02 | 0x04 | 0x20 | 0x40);
@@ -309,9 +336,16 @@ UsbcDisplayPort::_ConfigureRate(uint32 rate)
 	}
 	_SetPhyLevels(0, 0);
 
+	// qmp_combo_configure_dp_mode(): the lanes in use powered (lanes 0/1
+	// for the reverse orientation, 2/3 for the normal one, all four)
 	wr(dp, DP_PHY_CFG_1, 0x0f);
-	wr(dp, DP_PHY_PD_CTL, 0x01 | 0x04 | 0x20 | 0x40 | 0x08 | 0x10);
-	wr(dp, DP_PHY_MODE, 0x5c);
+	uint32 powerDown = 0x01 | 0x04 | 0x20 | 0x40;
+	if (fPhyLanes == 4 || fReverse)
+		powerDown |= 0x08;
+	if (fPhyLanes == 4 || !fReverse)
+		powerDown |= 0x10;
+	wr(dp, DP_PHY_PD_CTL, powerDown);
+	wr(dp, DP_PHY_MODE, fReverse ? 0x4c : 0x5c);
 	wr(dp, DP_PHY_AUX_CFG0 + 4, 0x13);
 	wr(dp, DP_PHY_AUX_CFG0 + 8, 0xa4);
 	wr(dp, DP_PHY_TX0_TX1_LANE_CTL, 0x05);
@@ -332,9 +366,16 @@ UsbcDisplayPort::_ConfigureRate(uint32 rate)
 	wr(dp, DP_PHY_CFG, 0x19);
 	if (!wait_bits(dp, DP_PHY_STATUS, 3, 3))
 		return B_ERROR;
-	for (volatile uint8* lane : tx) {
-		wr(lane, TX_HIGHZ_DRVR_EN, 0x10);
-		wr(lane, TX_TRANSCEIVER_BIAS, 0x3f);
+	// qmp_v4_configure_dp_phy(): the TX blocks' drivers and biases for the
+	// lanes in use
+	uint32 bias[2] = {0x3f, 0x3f};
+	if (fPhyLanes == 2) {
+		bias[0] = fReverse ? 0x3f : 0x15;
+		bias[1] = fReverse ? 0x15 : 0x3f;
+	}
+	for (int i = 0; i < 2; i++) {
+		wr(tx[i], TX_HIGHZ_DRVR_EN, 0x10);
+		wr(tx[i], TX_TRANSCEIVER_BIAS, bias[i]);
 	}
 	wr(dp, DP_PHY_CFG, 0x18);
 	snooze(2000);
@@ -366,15 +407,7 @@ UsbcDisplayPort::_Clocks()
 	wr(fDispcc, fConnector.auxRcg, rd(fDispcc, fConnector.auxRcg) | 1);
 	wait_bits(fDispcc, fConnector.auxRcg, 1, 0);
 
-	const uint32 m = 11, n = 120, d = n;
-	wr(fDispcc, fConnector.pixelRcg + 8, m);
-	wr(fDispcc, fConnector.pixelRcg + 0xc, ~(n - m) & 0xffff);
-	wr(fDispcc, fConnector.pixelRcg + 0x10, ~d & 0xffff);
-	// dual edge
-	wr(fDispcc, fConnector.pixelRcg + 4,
-		fConnector.pixelSource << 8 | 2u << 12);
-	wr(fDispcc, fConnector.pixelRcg, rd(fDispcc, fConnector.pixelRcg) | 1);
-	wait_bits(fDispcc, fConnector.pixelRcg, 1, 0);
+	_SetPixelClock();
 
 	if (!branch_on(fDispcc, fConnector.linkBranch)
 		|| !branch_on(fDispcc, fConnector.auxBranch)
@@ -391,6 +424,24 @@ UsbcDisplayPort::_Clocks()
 }
 
 
+/*!	The pixel clock at 74.25 MHz from the PHY's VCO divider clock, which
+	runs at 810 MHz at RBR and at 1350 MHz at HBR to HBR3
+	(qmp_v4_configure_dp_clocks()): M/N 11/120 or 11/200. */
+void
+UsbcDisplayPort::_SetPixelClock()
+{
+	const uint32 m = 11, n = fRate == 162 ? 120 : 200, d = n;
+	wr(fDispcc, fConnector.pixelRcg + 8, m);
+	wr(fDispcc, fConnector.pixelRcg + 0xc, ~(n - m) & 0xffff);
+	wr(fDispcc, fConnector.pixelRcg + 0x10, ~d & 0xffff);
+	// dual edge
+	wr(fDispcc, fConnector.pixelRcg + 4,
+		fConnector.pixelSource << 8 | 2u << 12);
+	wr(fDispcc, fConnector.pixelRcg, rd(fDispcc, fConnector.pixelRcg) | 1);
+	wait_bits(fDispcc, fConnector.pixelRcg, 1, 0);
+}
+
+
 //!	The controller's AUX channel (msm_dp_aux): reset, limits, enabled.
 void
 UsbcDisplayPort::_EnableAux()
@@ -402,6 +453,14 @@ UsbcDisplayPort::_EnableAux()
 	wr(fController, 0x200 + 0x3c, 0xffff);		// timeout count
 	wr(fController, 0x200 + 0x40, 0xffff);		// limits
 	wr(fController, auxControl, rd(fController, auxControl) | 1);
+}
+
+
+void
+UsbcDisplayPort::SetPortMode(bool reverse, uint32 lanes)
+{
+	fReverse = reverse;
+	fPhyLanes = lanes == 2 ? 2 : 4;
 }
 
 
@@ -427,8 +486,8 @@ UsbcDisplayPort::PowerUp()
 	if (status != B_OK)
 		return status;
 
-	// the SBU mux on, the normal orientation (gpio-sbu-mux: enable active
-	// low; select set for the reverse one)
+	// the SBU mux on (gpio-sbu-mux: enable active low), select set for the
+	// reverse orientation
 	const uint32 kPins[] = {fConnector.sbuEnablePin, fConnector.sbuSelectPin};
 	for (uint32 pin : kPins) {
 		volatile uint8* tlmm;
@@ -436,7 +495,8 @@ UsbcDisplayPort::PowerUp()
 		if (_Map(area, tlmm, "qcom usbc sbu", kTlmmBase + pin * 0x1000,
 				B_PAGE_SIZE) != B_OK)
 			return B_NO_MEMORY;
-		wr(tlmm, 4, 0);				// low
+		bool high = pin == fConnector.sbuSelectPin && fReverse;
+		wr(tlmm, 4, high ? 2 : 0);
 		wr(tlmm, 0, 1u << 9);		// GPIO, output, 2 mA
 		delete_area(area);
 	}
@@ -446,9 +506,16 @@ UsbcDisplayPort::PowerUp()
 		status = _Clocks();
 	if (status != B_OK)
 		return status;
+	// the controller from a clean state (msm_dp_ctrl_reset()): a sink that
+	// comes back after its HPD dropped does not train on what the last
+	// link left behind
+	wr(fController, 0x010, rd(fController, 0x010) | 1);
+	snooze(1000);
+	wr(fController, 0x010, rd(fController, 0x010) & ~1u);
 	_EnableAux();
 	fPowered = true;
-	INFO("%s: PHY at RBR, clocks and AUX on\n", fConnector.name);
+	INFO("%s: PHY at RBR (%" B_PRIu32 " lanes, %s orientation), clocks and "
+		"AUX on\n", fConnector.name, fPhyLanes, fReverse ? "reverse" : "normal");
 	return B_OK;
 }
 
@@ -498,6 +565,20 @@ UsbcDisplayPort::Start(phys_addr_t address, uint32 bytesPerRow, uint32 width,
 	for (uint32 offset : kIntfTiming)
 		wr(fMdss, fConnector.interface + offset, rd(fMdss, kIntf6 + offset));
 	wr(fMdss, fConnector.interface + INTF_FRAME_LINE_COUNT_EN, 3);
+	// the panel format and programmable fetch as the HDMI path's, and the
+	// INTF fed by our mixer's ping-pong block (LM_n -> PINGPONG_n;
+	// dpu_hw_intf_bind_pingpong_blk()): after a reset INTF_MUX says none,
+	// and the timing engine runs frames without pixels
+	wr(fMdss, fConnector.interface + INTF_PANEL_FORMAT,
+		rd(fMdss, kIntf6 + INTF_PANEL_FORMAT));
+	wr(fMdss, fConnector.interface + INTF_PROG_FETCH_START,
+		rd(fMdss, kIntf6 + INTF_PROG_FETCH_START));
+	// two the firmware sets that Linux does not name (0x08c 0x11, 0x1c4
+	// 0xa00 on its output)
+	wr(fMdss, fConnector.interface + 0x08c, rd(fMdss, kIntf6 + 0x08c));
+	wr(fMdss, fConnector.interface + 0x1c4, rd(fMdss, kIntf6 + 0x1c4));
+	wr(fMdss, fConnector.interface + INTF_MUX,
+		(rd(fMdss, kIntf6 + INTF_MUX) & ~0xfu) | fConnector.mixer);
 
 	status_t status = SetScanout(address, bytesPerRow, width, height);
 	if (status != B_OK)
@@ -618,7 +699,15 @@ UsbcDisplayPort::_Train(uint32* _lanes)
 	status_t status = fPort->ReadDpcd(0x000, caps, sizeof(caps));
 	if (status != B_OK)
 		return status;
-	uint32 lanes = caps[2] & 0x1f;
+	// the sink (or branch device) in D0 (msm_dp_link_psm_config(),
+	// DP_SET_POWER)
+	uint8 power;
+	if (fPort->ReadDpcd(0x600, &power, 1) == B_OK && (power & 7) != 1) {
+		power = (power & ~7u) | 1;
+		fPort->WriteDpcd(0x600, &power, 1);
+		snooze(1000);
+	}
+	uint32 lanes = min_c(caps[2] & 0x1fu, fPhyLanes);
 	if (lanes != 1 && lanes != 2 && lanes != 4)
 		return B_BAD_DATA;
 	bool enhanced = (caps[2] & 0x80) != 0, tps3 = (caps[2] & 0x40) != 0;
@@ -727,20 +816,166 @@ UsbcDisplayPort::_TrainAt(uint32 rate, uint32 lanes, bool enhanced, bool tps3,
 /*!	The link and the stream: trained with the sink if one answers; if not,
 	the controller's training patterns checked, and the stream started on
 	an untrained link (where it goes nowhere), so that path is known too. */
+/*!	Lab ("usbc_tpg true"): the controller's own test pattern, checkered
+	rectangles (msm_dp_panel_tpg_enable()): on the screen, the link and its
+	main stream attributes are right, whatever the DPU sends. */
+void
+UsbcDisplayPort::_TestPattern(const display_timing& timing)
+{
+	volatile uint8* p0;
+	area_id area = map_physical_memory("qcom usbc dp tpg",
+		fConnector.controllerBase + 0x1000, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&p0);
+	if (area < 0)
+		return;
+	uint32 hPeriod = timing.h_total, vPeriod = timing.v_total;
+	uint32 vStart = (timing.v_total - timing.v_sync_start) * hPeriod
+		+ timing.h_total - timing.h_sync_start;
+	uint32 vEnd = (vPeriod - (timing.v_sync_start - timing.v_display))
+		* hPeriod - 1 - (timing.h_sync_start - timing.h_display);
+	uint32 hStartX = timing.h_total - timing.h_sync_start;
+	uint32 hEndX = hPeriod - (timing.h_sync_start - timing.h_display) - 1;
+	wr(p0, 0x18, hPeriod << 16 | (timing.h_sync_end - timing.h_sync_start));
+	wr(p0, 0x1c, vPeriod * hPeriod);
+	wr(p0, 0x24, (timing.v_sync_end - timing.v_sync_start) * hPeriod);
+	wr(p0, 0x20, 0);
+	wr(p0, 0x28, 0);
+	wr(p0, 0x4c, hEndX << 16 | hStartX);
+	wr(p0, 0x50, 0);
+	wr(p0, 0x2c, vStart);
+	wr(p0, 0x34, vEnd);
+	static const uint32 kZeroed[] = {0x30, 0x38, 0x3c, 0x40, 0x44, 0x48, 0x58};
+	for (uint32 offset : kZeroed)
+		wr(p0, offset, 0);
+	wr(p0, 0x60, 0x100);		// checkered rectangles
+	wr(p0, 0x64, 1 | 4);		// 8 bits, RGB
+	wr(p0, 0x00, 1);			// BIST
+	wr(p0, 0x10, 1);			// its timing engine
+	INFO("%s: test pattern on\n", fConnector.name);
+	delete_area(area);
+}
+
+
+/*!	Lab: the controller's link and pixel interface registers next to the
+	HDMI output's (DP2, which the firmware set up and which works), the
+	ones that differ. */
+void
+UsbcDisplayPort::_DumpAgainstHdmi()
+{
+	volatile uint8* ours;
+	volatile uint8* hdmi;
+	area_id oursArea = map_physical_memory("qcom usbc dp dump",
+		fConnector.controllerBase, 0x2000, B_ANY_KERNEL_ADDRESS,
+		B_KERNEL_READ_AREA, (void**)&ours);
+	area_id hdmiArea = map_physical_memory("qcom hdmi dp dump", 0xae9a000,
+		0x2000, B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA, (void**)&hdmi);
+	if (oursArea >= 0 && hdmiArea >= 0) {
+		static const struct { uint32 start, end; } kRanges[] = {
+			{0x400, 0x5fc}, {0x1000, 0x10fc}};
+		for (const auto& range : kRanges) {
+			for (uint32 offset = range.start; offset <= range.end;
+					offset += 4) {
+				uint32 a = rd(ours, offset), b = rd(hdmi, offset);
+				if (a != b) {
+					INFO("%s: %#05" B_PRIx32 ": %#010" B_PRIx32 " (HDMI %#010"
+						B_PRIx32 ")\n", fConnector.name, offset, a, b);
+				}
+			}
+		}
+	}
+	if (oursArea >= 0)
+		delete_area(oursArea);
+	if (hdmiArea >= 0)
+		delete_area(hdmiArea);
+	// our INTF against the HDMI output's (INTF_6)
+	if (fMdss != NULL) {
+		for (uint32 offset = 0; offset < 0x280; offset += 4) {
+			uint32 a = rd(fMdss, fConnector.interface + offset);
+			uint32 b = rd(fMdss, kMdp + 0x3a000 + offset);
+			if (a != b) {
+				INFO("%s: INTF +%#05" B_PRIx32 ": %#010" B_PRIx32 " (INTF_6 %#010"
+					B_PRIx32 ")\n", fConnector.name, offset, a, b);
+			}
+		}
+	}
+}
+
+
+status_t
+UsbcDisplayPort::_InitPort()
+{
+	if (fPort != NULL)
+		return B_OK;
+	fPort = new(std::nothrow) DisplayPort(fConnector.controller);
+	if (fPort == NULL || fPort->Init() != B_OK) {
+		ERROR("%s: no AUX channel\n", fConnector.name);
+		delete fPort;
+		fPort = NULL;
+		return B_ERROR;
+	}
+	return B_OK;
+}
+
+
+/*!	The sink's EDID over I2C over AUX (for a DisplayPort to HDMI converter,
+	its monitor's): for app_server, and some converters do not drive their
+	output for a source that never reads it. */
+status_t
+UsbcDisplayPort::ReadEdid(uint8* edid, uint32* _length)
+{
+	if (!fPowered)
+		return B_NO_INIT;
+	status_t status = _InitPort();
+	if (status != B_OK)
+		return status;
+	return fPort->ReadEdid(edid, _length);
+}
+
+
+void
+UsbcDisplayPort::Attention()
+{
+	if (fPort == NULL || !fRunning)
+		return;
+	// DPCD 0x200: sink count, the device service IRQ vector, lane 0/1 and
+	// 2/3 status, alignment, sink status
+	uint8 status[6];
+	if (fPort->ReadDpcd(0x200, status, sizeof(status)) != B_OK) {
+		INFO("%s: attention, but no AUX answer\n", fConnector.name);
+		return;
+	}
+	if (status[1] != 0)
+		fPort->WriteDpcd(0x201, &status[1], 1);
+	// each lane in use: clock recovery, equalization, symbol lock
+	bool locked = (status[4] & 1) != 0;
+	for (uint32 i = 0; i < fLanes; i++) {
+		if (((status[2 + i / 2] >> (4 * (i % 2))) & 7) != 7)
+			locked = false;
+	}
+	locked = locked && fTrained;
+	INFO("%s: attention: sink count %#x, IRQ %#x, lanes %#x %#x, align %#x, "
+		"sink %#x: %s\n", fConnector.name, status[0], status[1], status[2],
+		status[3], status[4], status[5],
+		locked ? "link fine" : "training again");
+	if (!locked && fRetrainings < 3) {
+		fRetrainings++;
+		_Link(fTiming, fWideBus);
+	}
+}
+
+
 void
 UsbcDisplayPort::_Link(const display_timing& timing, bool wideBus)
 {
-	if (fPort == NULL) {
-		fPort = new(std::nothrow) DisplayPort(fConnector.controller);
-		if (fPort == NULL || fPort->Init() != B_OK) {
-			ERROR("%s: no AUX channel\n", fConnector.name);
-			delete fPort;
-			fPort = NULL;
-			return;
-		}
-	}
-	uint32 lanes = 4;
+	fTiming = timing;
+	fWideBus = wideBus;
+	if (_InitPort() != B_OK)
+		return;
+	uint32 lanes = fPhyLanes;
 	status_t status = _Train(&lanes);
+	fTrained = status == B_OK;
+	if (fTrained)
+		fRetrainings = 0;
 	if (status != B_OK) {
 		INFO("%s: link not trained (%s)\n", fConnector.name, strerror(status));
 		// what can be known without a sink: the PLL at each rate
@@ -750,8 +985,8 @@ UsbcDisplayPort::_Link(const display_timing& timing, bool wideBus)
 				_ConfigureRate(kRates[i].rate) == B_OK ? "locked" : "no lock");
 		}
 		_ConfigureRate(162);
-		_EnableMainlink(4);
-		lanes = 4;
+		_EnableMainlink(fPhyLanes);
+		lanes = fPhyLanes;
 		for (uint32 pattern = 1; pattern <= 3; pattern++) {
 			INFO("%s: training pattern %" B_PRIu32 ": %s\n", fConnector.name,
 				pattern,
@@ -759,10 +994,45 @@ UsbcDisplayPort::_Link(const display_timing& timing, bool wideBus)
 		}
 		wr(fController, DP_STATE_CTRL, 0);
 	}
+	fLanes = lanes;
+	_SetPixelClock();
 	fPort->SetLinkRate(fRate);
 	status = fPort->SetStream(timing, wideBus);
 	if (status == B_OK)
 		status = fPort->StartStream();
+	// lab: the registers the firmware sets on its output (DP2) that Linux
+	// does not name or leaves at their reset values, copied
+	{
+		volatile uint8* hdmi;
+		area_id hdmiArea = map_physical_memory("qcom hdmi dp copy", 0xae9a000,
+			0x2000, B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA, (void**)&hdmi);
+		volatile uint8* ours;
+		area_id oursArea = map_physical_memory("qcom usbc dp copy",
+			fConnector.controllerBase, 0x2000, B_ANY_KERNEL_ADDRESS,
+			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&ours);
+		if (hdmiArea >= 0 && oursArea >= 0) {
+			static const uint32 kCopied[] = {0x450, 0x454, 0x580, 0x1084};
+			for (uint32 offset : kCopied)
+				wr(ours, offset, rd(hdmi, offset));
+		}
+		if (hdmiArea >= 0)
+			delete_area(hdmiArea);
+		if (oursArea >= 0)
+			delete_area(oursArea);
+	}
+	_DumpAgainstHdmi();
+	void* settings = load_driver_settings("qcom_display");
+	bool testPattern = get_driver_boolean_parameter(settings, "usbc_tpg",
+		false, true);
+	unload_driver_settings(settings);
+	if (testPattern)
+		_TestPattern(timing);
+	uint8 sinkStatus[6] = {};
+	snooze(200000);
+	fPort->ReadDpcd(0x200, sinkStatus, sizeof(sinkStatus));
+	INFO("%s: 200 ms later: sink count %#x, lanes %#x, align %#x, sink "
+		"status %#x\n", fConnector.name, sinkStatus[0], sinkStatus[2],
+		sinkStatus[4], sinkStatus[5]);
 	INFO("%s: stream on %" B_PRIu32 " lanes at %" B_PRIu32 " MHz: %s "
 		"(mainlink ready %#" B_PRIx32 ")\n", fConnector.name, lanes, fRate,
 		strerror(status),

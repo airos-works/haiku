@@ -1132,16 +1132,17 @@ struct usbc_write_request {
 	uint32	reserved;
 };
 
+// USBC_NOTIFY_IND (pmic_glink_altmode_sc8280xp_notify()): the SVID is in
+// the opcode's top half
 struct usbc_notify {
 	pmic_glink_header header;
-	uint8	pinAssignmentHpd;	// pin assignment 5:0, HPD 6, HPD IRQ 7
-	uint8	reserved1[7];
 	uint8	port;
 	uint8	orientation;
 	uint8	mux;
-	uint8	reserved2;
-	uint16	vid;
-	uint16	svid;
+	uint8	reserved1[5];
+	uint8	pinAssignmentHpd;	// DPAM (A = 1) 5:0, HPD 6, HPD IRQ 7
+	uint8	reserved2[7];
+	uint32	reserved3;
 } _PACKED;
 
 static glink_channel* sPmicGlink;
@@ -1762,6 +1763,12 @@ qcom_adsp_init_driver(device_node* node, void** _cookie)
 		unmap_all();
 		return status;
 	}
+
+	// No crash dump mode after a crash: the board's TCSR download mode
+	// cookie (the device tree's qcom,dload-mode = <&tcsr 0x13000>) cleared
+	// as Linux' qcom_scm does at probe
+	if (qcom_scm_clear_download_mode(0x1fc0000 + 0x13000) != B_OK)
+		ERROR("cannot clear the download mode\n");
 
 	sBootThread = spawn_kernel_thread(boot_thread, "qcom adsp start",
 		B_NORMAL_PRIORITY, NULL);
