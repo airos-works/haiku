@@ -213,6 +213,12 @@ UsbcDisplayPort::UsbcDisplayPort(uint32 connector)
 UsbcDisplayPort::~UsbcDisplayPort()
 {
 	Stop();
+	// the DP half of the PHY powered down, as qmp_combo_dp_power_off() does
+	// (the USB 3 half beside it is left alone)
+	if (fPhy != NULL && fPowered) {
+		wr(fController, 0x400, 0);			// DP_MAINLINK_CTRL: off
+		wr(fPhy + kPhyDpPhy, DP_PHY_PD_CTL, 0x02);
+	}
 	delete fPort;
 	area_id areas[] = {fGccArea, fDispccArea, fPhyArea, fControllerArea,
 		fMdssArea};
@@ -500,6 +506,12 @@ UsbcDisplayPort::PowerUp()
 		status = _Clocks();
 	if (status != B_OK)
 		return status;
+	// the controller from a clean state (msm_dp_ctrl_reset()): a sink that
+	// comes back after its HPD dropped does not train on what the last
+	// link left behind
+	wr(fController, 0x010, rd(fController, 0x010) | 1);
+	snooze(1000);
+	wr(fController, 0x010, rd(fController, 0x010) & ~1u);
 	_EnableAux();
 	fPowered = true;
 	INFO("%s: PHY at RBR (%" B_PRIu32 " lanes, %s orientation), clocks and "
