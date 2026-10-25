@@ -528,7 +528,10 @@ DisplayPort::StartAudio(uint32 channels)
 		return B_NO_INIT;
 	if (channels == 0 || channels > 8)
 		return B_BAD_VALUE;
-	if (!HotPlug() || LinkRate() == 0)
+	// a link the driver trained knows its rate (a USB-C sink's hot plug
+	// comes through pmic_glink, not this controller's HPD); otherwise the
+	// sink must be there
+	if (LinkRate() == 0)
 		return B_DEV_NOT_READY;
 	fAudioChannels = channels;
 	_SetUpAudio();

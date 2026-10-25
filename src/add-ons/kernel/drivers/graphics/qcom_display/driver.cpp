@@ -1241,10 +1241,27 @@ display_register_child_devices(void* cookie)
 // #pragma mark - DisplayPort audio
 
 
+/*!	The DisplayPort controller \a controller is: the HDMI bridge's, or a
+	USB-C connector's while it shows a trained link (DP-1 is controller 0,
+	DP-2 controller 1). NULL when it has no link.
+*/
+static qcom::DisplayPort*
+audio_port(display_info* info, uint32 controller)
+{
+	if (controller == QCOM_DP_AUDIO_HDMI)
+		return info->dpu != NULL ? info->port : NULL;
+	if (controller >= kUsbcConnectors || info->usbc[controller] == NULL
+		|| !info->usbcRunning[controller]
+		|| !info->usbc[controller]->Trained())
+		return NULL;
+	return info->usbc[controller]->Port();
+}
+
+
 /*!	The audio DSP's DISPLAY_PORT_RX module feeds controller \a controller:
-	its audio engine on, if a sink is there on a trained link. Only the HDMI
-	bridge's controller so far: a USB-C hub's converter is kept in its DVI
-	output (dp_sink.h), which carries no audio.
+	its audio engine on, if a sink is there on a trained link. A USB-C hub's
+	converter to HDMI is kept in its DVI output (dp_sink.h), which carries no
+	audio: a DisplayPort monitor does.
 */
 static status_t
 dp_audio_start(uint32 controller, uint32 channels)
@@ -1253,12 +1270,11 @@ dp_audio_start(uint32 controller, uint32 channels)
 	display_info* info = sAudioDisplay;
 	if (info == NULL)
 		return B_NO_INIT;
-	if (controller != QCOM_DP_AUDIO_HDMI)
-		return B_NOT_SUPPORTED;
 	MutexLocker locker(info->lock);
-	if (info->port == NULL || info->dpu == NULL)
+	qcom::DisplayPort* port = audio_port(info, controller);
+	if (port == NULL)
 		return B_DEV_NOT_READY;
-	return info->port->StartAudio(channels);
+	return port->StartAudio(channels);
 }
 
 
@@ -1267,11 +1283,14 @@ dp_audio_stop(uint32 controller)
 {
 	MutexLocker audioLocker(sAudioLock);
 	display_info* info = sAudioDisplay;
-	if (info == NULL || controller != QCOM_DP_AUDIO_HDMI)
+	if (info == NULL)
 		return;
 	MutexLocker locker(info->lock);
-	if (info->port != NULL)
-		info->port->StopAudio();
+	qcom::DisplayPort* port = controller == QCOM_DP_AUDIO_HDMI ? info->port
+		: controller < kUsbcConnectors && info->usbc[controller] != NULL
+			? info->usbc[controller]->Port() : NULL;
+	if (port != NULL)
+		port->StopAudio();
 }
 
 

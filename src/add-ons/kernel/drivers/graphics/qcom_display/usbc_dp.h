@@ -62,6 +62,8 @@ public:
 			//! cleared, the link trained again if it lost it.
 			void				Attention();
 			bool				Trained() const { return fTrained; }
+			//! Its controller's AUX, stream and audio.
+			DisplayPort*		Port() const { return fPort; }
 			status_t			ReadEdid(uint8* edid, uint32* _length);
 
 private:

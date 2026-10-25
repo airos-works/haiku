@@ -7,13 +7,15 @@
 	card node ("qcom,sc8280xp-sndcard"), played through the audio DSP's
 	AudioReach graphs (the board's topology, linux-firmware's
 	SC8280XP-Radxa-Dragon-Q8B-tplg.bin) to the WCD9385's headphone output.
-	The DSP is run by qcom_adsp; its packets go through qcom_gpr. A second
-	device plays to HDMI: the DSP's DISPLAY_PORT_RX into the DisplayPort
-	controller of the board's HDMI bridge, whose audio engine qcom_display
-	turns on.
+	The DSP is run by qcom_adsp; its packets go through qcom_gpr. More
+	devices play to HDMI and the USB-C connectors' DisplayPort: the DSP's
+	DISPLAY_PORT_RX into the DisplayPort controller (the board's HDMI
+	bridge's, or a USB-C connector's), whose audio engine qcom_display turns
+	on.
 */
 
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -33,8 +35,8 @@
 
 #define QCOM_AUDIO_DRIVER_NAME "drivers/audio/hmulti/qcom_audio/driver_v1"
 #define QCOM_AUDIO_DEVICE_NAME "drivers/audio/hmulti/qcom_audio/device_v1"
-#define QCOM_AUDIO_DEVICE_PATH "audio/hmulti/qcom/1"
-#define QCOM_AUDIO_HDMI_DEVICE_PATH "audio/hmulti/qcom/2"
+// audio/hmulti/qcom/<n>: output n - 1 (the headphones, HDMI, DP-1, DP-2)
+#define QCOM_AUDIO_DEVICE_PATH "audio/hmulti/qcom/"
 
 
 using namespace qcom_audio;
@@ -48,8 +50,7 @@ data_hook(void* cookie, const qcom_gpr_packet* packet)
 {
 	AudioDevice* device = (AudioDevice*)cookie;
 	if (packet->opcode == AudioPath::kWriteDone) {
-		Output* output = (packet->token & kHdmiToken) != 0
-			? &device->hdmi : &device->headphones;
+		Output* output = device->outputs[(packet->token >> 8) % kOutputCount];
 		cpu_status state = disable_interrupts();
 		acquire_spinlock(&device->streamLock);
 		output->lastPlayed = (packet->token & 0xff) % kBufferCount;
@@ -271,17 +272,17 @@ qcom_audio::clean_buffer(Output* output, uint32 index)
 /*!	What an output needs beside its graph: the headphones the RX macro's
 	path (it takes the codec DMA's samples before the graph runs, as DAPM
 	powers it before the trigger in Linux) and the codec's ports and
-	amplifiers; HDMI the DisplayPort controller's audio engine, which the
-	display driver turns on when the bridge has a link.
+	amplifiers; a DisplayPort output its controller's audio engine, which
+	the display driver turns on when the output has a link.
 */
 status_t
 qcom_audio::output_power_up(Output* output)
 {
 	AudioDevice* device = output->device;
-	if (output == &device->hdmi) {
+	if (output->dpController != kNoDisplayPort) {
 		if (device->dpAudio == NULL)
 			return B_DEV_NOT_READY;
-		return device->dpAudio->start(QCOM_DP_AUDIO_HDMI, 2);
+		return device->dpAudio->start(output->dpController, 2);
 	}
 	device->codec.EnableHeadphonePath(48000);
 	return device->codec.EnableHeadphones(kHeadphoneGain);
@@ -292,9 +293,9 @@ void
 qcom_audio::output_power_down(Output* output)
 {
 	AudioDevice* device = output->device;
-	if (output == &device->hdmi) {
+	if (output->dpController != kNoDisplayPort) {
 		if (device->dpAudio != NULL)
-			device->dpAudio->stop(QCOM_DP_AUDIO_HDMI);
+			device->dpAudio->stop(output->dpController);
 		return;
 	}
 	device->codec.DisableHeadphones();
@@ -532,15 +533,16 @@ start_up(AudioDevice* device)
 		return status;
 	}
 
-	// HDMI: the display driver turns the DisplayPort's audio on
+	// HDMI and USB-C: the display driver turns the DisplayPort's audio on
 	if (get_module(QCOM_DP_AUDIO_MODULE_NAME,
 			(module_info**)&device->dpAudio) != B_OK) {
 		device->dpAudio = NULL;
 	}
-	if (device->dpAudio != NULL && !recordOnly) {
-		status = open_output(&device->hdmi, true);
+	for (uint32 i = 1; device->dpAudio != NULL && !recordOnly
+			&& i < kOutputCount; i++) {
+		status = open_output(device->outputs[i], true);
 		if (status != B_OK)
-			TRACE("HDMI: %s\n", strerror(status));
+			TRACE("%s: %s\n", device->outputs[i]->name, strerror(status));
 	}
 	device->ready = true;
 
@@ -611,8 +613,8 @@ qcom_audio_init_driver(device_node* node, void** _cookie)
 	device->dpAudio = NULL;
 	B_INITIALIZE_SPINLOCK(&device->streamLock);
 	mutex_init(&device->lock, "qcom audio");
-	device->headphones.doneSem = create_sem(0, "qcom audio buffer done");
-	device->hdmi.doneSem = create_sem(0, "qcom audio HDMI buffer done");
+	for (Output* output : device->outputs)
+		output->doneSem = create_sem(0, "qcom audio buffer done");
 	device->recordArea = -1;
 	device->recordBuffers = NULL;
 	device->recordSem = create_sem(0, "qcom audio buffer filled");
@@ -648,15 +650,14 @@ qcom_audio_uninit_driver(void* cookie)
 		wait_for_thread(device->startThread, &result);
 	}
 	device->capture.Close();
-	device->hdmi.path.Close();
-	device->headphones.path.Close();
+	for (Output* output : device->outputs)
+		output->path.Close();
 	if (device->dpAudio != NULL)
 		put_module(QCOM_DP_AUDIO_MODULE_NAME);
 	device->codec.PowerDown();
 	device->dsp.Uninit();
 	device->smmu.Detach();
-	Output* outputs[] = { &device->headphones, &device->hdmi };
-	for (Output* output : outputs) {
+	for (Output* output : device->outputs) {
 		if (output->bufferArea >= 0)
 			delete_area(output->bufferArea);
 		delete_sem(output->doneSem);
@@ -673,11 +674,13 @@ static status_t
 qcom_audio_register_child_devices(void* cookie)
 {
 	AudioDevice* device = (AudioDevice*)cookie;
-	status_t status = sDeviceManager->publish_device(device->node,
-		QCOM_AUDIO_DEVICE_PATH, QCOM_AUDIO_DEVICE_NAME);
-	if (status == B_OK) {
-		status = sDeviceManager->publish_device(device->node,
-			QCOM_AUDIO_HDMI_DEVICE_PATH, QCOM_AUDIO_DEVICE_NAME);
+	status_t status = B_OK;
+	for (uint32 i = 0; status == B_OK && i < kOutputCount; i++) {
+		char path[64];
+		snprintf(path, sizeof(path), QCOM_AUDIO_DEVICE_PATH "%" B_PRIu32,
+			i + 1);
+		status = sDeviceManager->publish_device(device->node, path,
+			QCOM_AUDIO_DEVICE_NAME);
 	}
 	return status;
 }
@@ -700,7 +703,8 @@ qcom_audio_uninit_device(void*)
 }
 
 
-//!	The output a published device is: the headphones (1) or HDMI (2).
+//!	The output a published device is: the headphones (1), HDMI (2), DP-1 (3)
+//!	or DP-2 (4).
 static status_t
 qcom_audio_open(void* deviceCookie, const char* path, int, void** _cookie)
 {
@@ -711,9 +715,13 @@ qcom_audio_open(void* deviceCookie, const char* path, int, void** _cookie)
 			return B_DEV_NOT_READY;
 		snooze(100000);
 	}
-	Output* output = path != NULL
-			&& strcmp(path, QCOM_AUDIO_HDMI_DEVICE_PATH) == 0
-		? &device->hdmi : &device->headphones;
+	uint32 index = 0;
+	size_t prefix = strlen(QCOM_AUDIO_DEVICE_PATH);
+	if (path != NULL && strncmp(path, QCOM_AUDIO_DEVICE_PATH, prefix) == 0)
+		index = strtoul(path + prefix, NULL, 10) - 1;
+	if (index >= kOutputCount)
+		return B_ENTRY_NOT_FOUND;
+	Output* output = device->outputs[index];
 	if (!output->open)
 		return B_DEV_NOT_READY;
 	if (atomic_add(&output->openCount, 1) != 0) {
