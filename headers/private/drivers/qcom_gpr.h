@@ -41,6 +41,9 @@ struct qcom_gpr_module_info {
 	status_t	(*send)(uint32 sourcePort, uint32 destinationPort,
 					uint32 opcode, uint32 token, const void* payload,
 					uint32 payloadSize);
+	//! the DSP's SMP2P state (bit 0: it crashed); with \a reason, its
+	//! crash reason, if it left one
+	uint32		(*dsp_state)(char* reason, size_t reasonSize);
 };
 
 

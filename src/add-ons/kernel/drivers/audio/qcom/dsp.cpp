@@ -31,6 +31,8 @@ static const uint32 kPrmAudioClock = 0x0800102c;	// PARAM_ID_RSC_AUDIO_HW_CLK
 Dsp::Dsp()
 	:
 	fGpr(NULL),
+	fDataHook(NULL),
+	fDataCookie(NULL),
 	fDone(-1),
 	fStateLock(B_SPINLOCK_INITIALIZER),
 	fToken(0),
@@ -65,7 +67,9 @@ Dsp::Init(DataHook dataHook, void* cookie)
 		return fDone;
 	status = fGpr->register_port(kCommandPort, _CommandHook, this);
 	if (status == B_OK) {
-		status = fGpr->register_port(kDataPort, dataHook, cookie);
+		fDataHook = dataHook;
+		fDataCookie = cookie;
+		status = fGpr->register_port(kDataPort, _DataHook, this);
 		if (status != B_OK)
 			fGpr->unregister_port(kCommandPort);
 	}
@@ -93,6 +97,13 @@ Dsp::Uninit()
 }
 
 
+uint32
+Dsp::State(char* reason, size_t reasonSize)
+{
+	return fGpr != NULL ? fGpr->dsp_state(reason, reasonSize) : 0;
+}
+
+
 status_t
 Dsp::WaitReady(bigtime_t timeout)
 {
@@ -110,6 +121,26 @@ Dsp::WaitReady(bigtime_t timeout)
 status_t
 Dsp::Command(uint32 destination, uint32 opcode, const void* payload,
 	uint32 size, uint32 responseOpcode, void* response,
+	uint32* _responseSize, bigtime_t timeout)
+{
+	return _Command(kCommandPort, destination, opcode, payload, size,
+		responseOpcode, response, _responseSize, timeout);
+}
+
+
+status_t
+Dsp::DataCommand(uint32 destination, uint32 opcode, const void* payload,
+	uint32 size, uint32 responseOpcode, void* response,
+	uint32* _responseSize)
+{
+	return _Command(kDataPort, destination, opcode, payload, size,
+		responseOpcode, response, _responseSize, 1000000);
+}
+
+
+status_t
+Dsp::_Command(uint32 sourcePort, uint32 destination, uint32 opcode,
+	const void* payload, uint32 size, uint32 responseOpcode, void* response,
 	uint32* _responseSize, bigtime_t timeout)
 {
 	if (fGpr == NULL)
@@ -130,7 +161,7 @@ Dsp::Command(uint32 destination, uint32 opcode, const void* payload,
 	while (acquire_sem_etc(fDone, 1, B_RELATIVE_TIMEOUT, 0) == B_OK)
 		;
 
-	status_t status = _Send(kCommandPort, destination, opcode, token, payload,
+	status_t status = _Send(sourcePort, destination, opcode, token, payload,
 		size);
 	if (status == B_OK)
 		status = acquire_sem_etc(fDone, 1, B_RELATIVE_TIMEOUT, timeout);
@@ -158,7 +189,7 @@ Dsp::Command(uint32 destination, uint32 opcode, const void* payload,
 status_t
 Dsp::ApmCommand(uint32 destination, uint32 opcode, const void* payload,
 	uint32 size, uint32 responseOpcode, void* response,
-	uint32* _responseSize)
+	uint32* _responseSize, bool fromDataPort)
 {
 	uint8* packet = (uint8*)malloc(16 + size);
 	if (packet == NULL)
@@ -167,8 +198,9 @@ Dsp::ApmCommand(uint32 destination, uint32 opcode, const void* payload,
 	uint32 header[4] = { 0, 0, 0, size };
 	memcpy(packet, header, sizeof(header));
 	memcpy(packet + 16, payload, size);
-	status_t status = Command(destination, opcode, packet, 16 + size,
-		responseOpcode, response, _responseSize);
+	status_t status = _Command(fromDataPort ? kDataPort : kCommandPort,
+		destination, opcode, packet, 16 + size, responseOpcode, response,
+		_responseSize, 1000000);
 	free(packet);
 	return status;
 }
@@ -220,6 +252,49 @@ Dsp::SetClock(uint32 clock, uint32 rate)
 }
 
 
+//!	Whether \a packet answers the pending command (which it then completes).
+bool
+Dsp::_Complete(const qcom_gpr_packet* packet)
+{
+	const uint32* words = (const uint32*)packet->payload;
+	uint32 count = packet->payload_size / 4;
+
+	cpu_status state = disable_interrupts();
+	acquire_spinlock(&fStateLock);
+	bool done = false;
+	if (fPending && packet->token == fToken) {
+		if (packet->opcode == kGprBasicResult && count >= 2
+			&& words[0] == fOpcode) {
+			fStatus = words[1] == 0 ? B_OK : (status_t)words[1];
+			done = true;
+		} else if (fResponseOpcode != 0 && packet->opcode == fResponseOpcode) {
+			fResponseSize = min_c(packet->payload_size, sizeof(fResponse));
+			memcpy(fResponse, packet->payload, fResponseSize);
+			fStatus = B_OK;
+			done = true;
+		}
+		if (done)
+			fPending = false;
+	}
+	release_spinlock(&fStateLock);
+	restore_interrupts(state);
+
+	if (done)
+		release_sem_etc(fDone, 1, B_DO_NOT_RESCHEDULE);
+	return done;
+}
+
+
+//!	The data port's packets: answers to commands sent from it, then data.
+/*static*/ void
+Dsp::_DataHook(void* cookie, const qcom_gpr_packet* packet)
+{
+	Dsp* dsp = (Dsp*)cookie;
+	if (!dsp->_Complete(packet) && dsp->fDataHook != NULL)
+		dsp->fDataHook(dsp->fDataCookie, packet);
+}
+
+
 /*static*/ void
 Dsp::_CommandHook(void* cookie, const qcom_gpr_packet* packet)
 {
@@ -227,31 +302,7 @@ Dsp::_CommandHook(void* cookie, const qcom_gpr_packet* packet)
 	const uint32* words = (const uint32*)packet->payload;
 	uint32 count = packet->payload_size / 4;
 
-	cpu_status state = disable_interrupts();
-	acquire_spinlock(&dsp->fStateLock);
-	bool done = false;
-	if (dsp->fPending && packet->token == dsp->fToken) {
-		if (packet->opcode == kGprBasicResult && count >= 2
-			&& words[0] == dsp->fOpcode) {
-			dsp->fStatus = words[1] == 0 ? B_OK : (status_t)words[1];
-			done = true;
-		} else if (dsp->fResponseOpcode != 0
-			&& packet->opcode == dsp->fResponseOpcode) {
-			dsp->fResponseSize = min_c(packet->payload_size,
-				sizeof(dsp->fResponse));
-			memcpy(dsp->fResponse, packet->payload, dsp->fResponseSize);
-			dsp->fStatus = B_OK;
-			done = true;
-		}
-		if (done)
-			dsp->fPending = false;
-	}
-	release_spinlock(&dsp->fStateLock);
-	restore_interrupts(state);
-
-	if (done)
-		release_sem_etc(dsp->fDone, 1, B_DO_NOT_RESCHEDULE);
-	else {
+	if (!dsp->_Complete(packet)) {
 		TRACE("unexpected answer %#" B_PRIx32 " (token %" B_PRIu32 ", %"
 			B_PRIu32 " bytes, first %#" B_PRIx32 " %#" B_PRIx32 ")\n",
 			packet->opcode, packet->token, packet->payload_size,

@@ -19,6 +19,7 @@
 #include <KernelExport.h>
 #include <device_manager.h>
 #include <kernel.h>
+#include <smp.h>
 #include <driver_settings.h>
 #include <util/AutoLock.h>
 
@@ -61,19 +62,28 @@ data_hook(void* cookie, const qcom_gpr_packet* packet)
 
 /*!	The DSP reaches the buffers it is given as stream 0xc01 (the device
 	tree's q6apm "dais" node): a context bank of its own that maps only
-	them, at their own addresses. (Through the firmware's untranslated bank
-	the board hung once the DSP read them.)
+	them. They are given to it at an I/O address at the top of the low
+	4 GiB, where Linux' IOMMU allocator puts them (lab: "dsp_iova" sets
+	another; 0 for their physical address).
 */
 static status_t
 map_dsp_stream(AudioDevice* device)
 {
+	void* settings = load_driver_settings("qcom_audio");
+	device->buffersDsp = strtoull(get_driver_parameter(settings, "dsp_iova",
+		"0xfff00000", "0xfff00000"), NULL, 0);
+	unload_driver_settings(settings);
+	if (device->buffersDsp == 0)
+		device->buffersDsp = device->buffersPhysical;
 	static const uint32 kStreams[][2] = {{0xc01, 0}};
 	status_t status = device->smmu.Attach("qcom_audio", kStreams, 1);
 	if (status == B_OK) {
-		status = device->smmu.Map(device->buffersPhysical,
+		status = device->smmu.Map(device->buffersDsp,
 			device->buffersPhysical,
 			ROUNDUP(kBufferCount * kBufferSize, B_PAGE_SIZE), false);
 	}
+	TRACE("the DSP's buffers at %#" B_PRIx64 " (physical %#" B_PRIxPHYSADDR
+		")\n", device->buffersDsp, device->buffersPhysical);
 	return status;
 }
 
@@ -131,6 +141,7 @@ test_tone(AudioDevice* device)
 		"stream_only", false, true);
 	unload_driver_settings(settings);
 	TRACE("test tone: starting the graph%s\n", startOnly ? " (no buffers)" : "");
+	device->smmu.Faults("before the graph");
 	// the RX macro takes the codec DMA's samples before the graph runs, as
 	// DAPM powers its path before the trigger in Linux
 	device->codec.EnableHeadphonePath(48000);
@@ -148,6 +159,17 @@ test_tone(AudioDevice* device)
 		return;
 	}
 	if (oneBuffer) {
+		// lab ("access_probe"): does the DSP read the buffer through our
+		// context bank at all? Its first read then faults there.
+		void* probeSettings = load_driver_settings("qcom_audio");
+		bool accessProbe = get_driver_boolean_parameter(probeSettings,
+			"access_probe", false, true);
+		unload_driver_settings(probeSettings);
+		if (accessProbe) {
+			device->smmu.ClearAccessFlags(device->buffersDsp,
+				ROUNDUP(kBufferCount * kBufferSize, B_PAGE_SIZE));
+			TRACE("one buffer: the buffers' access flags cleared\n");
+		}
 		// lab: what the SMMU makes of the DSP's reads: our bank, and the
 		// firmware's bank 4 (stream 0x1000/0x402, the DSP's own, as it
 		// seems), its SCTLR (stall on fault?) and FSR
@@ -161,8 +183,18 @@ test_tone(AudioDevice* device)
 				" FAR %#" B_PRIx32 "%08" B_PRIx32 "\n", cb4[0], cb4[0x58 / 4],
 				cb4[0x64 / 4], cb4[0x60 / 4]);
 		}
-		device->playback.Write(device->buffersPhysical, kBufferSize, 0);
+		device->playback.Write(device->buffersDsp, kBufferSize, 0);
+		uint32 loopState = device->dsp.State(NULL, 0);
+		TRACE("one buffer: DSP state %#" B_PRIx32 " before\n", loopState);
 		for (int i = 0; i < 300; i++) {
+			uint32 nowState = device->dsp.State(NULL, 0);
+			if (nowState != loopState) {
+				char reason[96];
+				device->dsp.State(reason, sizeof(reason));
+				TRACE("one buffer: DSP state %#" B_PRIx32 " after %d ms: %s\n",
+					nowState, i, reason);
+				loopState = nowState;
+			}
 			uint32 bank4 = cb4Area >= 0 ? cb4[0x58 / 4] & ~0x600u : 0;
 			if (device->smmu.Faults("one buffer") != 0 || bank4 != 0
 				|| device->doneCount > 0 || i == 299) {
@@ -179,7 +211,22 @@ test_tone(AudioDevice* device)
 		}
 		if (cb4Area >= 0)
 			delete_area(cb4Area);
-		snooze(500000);
+		// lab: is the system still alive once the DSP has the buffer? A
+		// heartbeat that touches nothing of the LPASS
+		uint32 lastState = device->dsp.State(NULL, 0);
+		for (int i = 0; i < 1000; i++) {
+			snooze(10000);
+			char reason[96];
+			uint32 state = device->dsp.State(reason, sizeof(reason));
+			if (state != lastState || i % 10 == 0) {
+				TRACE("one buffer: alive %d on CPU %" B_PRId32 ", %" B_PRId32
+					" done, DSP state %#" B_PRIx32 "%s%s\n", i,
+					smp_get_current_cpu(), device->doneCount, state,
+					(state & 1) != 0 ? ", crashed: " : "",
+					(state & 1) != 0 ? reason : "");
+				lastState = state;
+			}
+		}
 		device->playback.Stop();
 		TRACE("test tone: stopped, %" B_PRId32 " done\n", device->doneCount);
 		return;
@@ -187,7 +234,7 @@ test_tone(AudioDevice* device)
 	bigtime_t start = system_time();
 	int32 written = 0;
 	for (; written < (int32)kBufferCount; written++) {
-		device->playback.Write(device->buffersPhysical
+		device->playback.Write(device->buffersDsp
 			+ (written % kBufferCount) * kBufferSize, kBufferSize, written);
 	}
 	while (system_time() - start < 2000000) {
@@ -198,7 +245,7 @@ test_tone(AudioDevice* device)
 			device->smmu.Faults("test tone");
 			break;
 		}
-		device->playback.Write(device->buffersPhysical
+		device->playback.Write(device->buffersDsp
 			+ (written % kBufferCount) * kBufferSize, kBufferSize, written);
 		written++;
 	}
@@ -255,7 +302,7 @@ start_up(AudioDevice* device)
 	if (status == B_OK)
 		status = device->playback.Open(48000, 2, 16);
 	if (status == B_OK) {
-		status = device->playback.MapMemory(device->buffersPhysical,
+		status = device->playback.MapMemory(device->buffersDsp,
 			kBufferCount * kBufferSize);
 	}
 	if (status != B_OK) {
