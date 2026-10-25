@@ -8,6 +8,8 @@
 
 #include "display_port.h"
 
+#include <dp_sink.h>
+
 #include <new>
 #include <stdio.h>
 #include <stdlib.h>
@@ -846,27 +848,17 @@ UsbcDisplayPort::_Train(uint32* _lanes)
 	status_t status = fPort->ReadDpcd(0x000, caps, sizeof(caps));
 	if (status != B_OK)
 		return status;
-	// a DisplayPort to HDMI converter (a downstream port of type HDMI,
-	// DPCD 0x080) set to HDMI output, not DVI
-	// (DP_PROTOCOL_CONVERTER_CONTROL_0's HDMI_DVI_OUTPUT_CONFIG, as i915
-	// sets it)
-	if ((caps[5] & 1) != 0) {
-		uint8 port;
-		if (fPort->ReadDpcd(0x080, &port, 1) == B_OK && (port & 7) == 3) {
-			uint8 control;
-			if (fPort->ReadDpcd(0x3050, &control, 1) == B_OK
-				&& (control & 1) == 0) {
-				control |= 1;
-				fPort->WriteDpcd(0x3050, &control, 1);
-			}
-		}
-	}
-	// the sink (or branch device) in D0 (msm_dp_link_psm_config(),
-	// DP_SET_POWER)
-	uint8 power;
-	if (fPort->ReadDpcd(0x600, &power, 1) == B_OK && (power & 7) != 1) {
-		power = (power & ~7u) | 1;
-		fPort->WriteDpcd(0x600, &power, 1);
+	// the sink, or the converter in front of it, powered and in a mode we
+	// can feed (dp_sink.h)
+	if (dp_prepare_sink(
+			[this](uint32 address) {
+				uint8 value;
+				return fPort->ReadDpcd(address, &value, 1) == B_OK
+					? (int)value : -1;
+			},
+			[this](uint32 address, uint8 value) {
+				return fPort->WriteDpcd(address, &value, 1) == B_OK;
+			})) {
 		snooze(1000);
 	}
 	uint32 lanes = min_c(caps[2] & 0x1fu, fPhyLanes);

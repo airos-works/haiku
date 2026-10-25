@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include <KernelExport.h>
+#include <dp_sink.h>
 #include <util/kernel_cpp.h>
 
 #include "cadence_dp_phy.h"
@@ -817,6 +818,19 @@ DisplayPipe::_TrainLink(uint32 rate)
 {
 	uint8 swing[4] = {};
 	uint8 preEmphasis[4] = {};
+
+	// the sink, or the converter in front of it, powered and in a mode we
+	// can feed (dp_sink.h)
+	if (dp_prepare_sink(
+			[this](uint32 address) {
+				uint8 value;
+				return _DpcdRead(address, &value, 1) == B_OK ? (int)value : -1;
+			},
+			[this](uint32 address, uint8 value) {
+				return _DpcdWrite(address, &value, 1) == B_OK;
+			})) {
+		snooze(1000);
+	}
 
 	_Write(kDp + DP_SCRAMBLING_DISABLE, 1);
 	status_t status = _PhyConfigure(rate);

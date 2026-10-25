@@ -11,6 +11,7 @@
 #include "displayport.h"
 
 #include <Debug.h>
+#include <dp_sink.h>
 
 #include "accelerant_protos.h"
 #include "atombios-obsolete.h"
@@ -840,9 +841,18 @@ dp_link_train(uint8 crtcID)
 
 	// *** DisplayPort link training initialization
 
-	// Power up the DP sink
-	if (dp->revision >= DP_DPCD_REV_11)
-		dpcd_reg_write(connectorIndex, DP_SET_POWER, DP_SET_POWER_D0);
+	// Power up the DP sink, and a converter in front of it in a mode we can
+	// feed (dp_sink.h)
+	if (dp_prepare_sink(
+			[connectorIndex](uint32 address) {
+				return (int)dpcd_reg_read(connectorIndex, address);
+			},
+			[connectorIndex](uint32 address, uint8 value) {
+				dpcd_reg_write(connectorIndex, address, value);
+				return true;
+			})) {
+		snooze(1000);
+	}
 
 	// Possibly enable downspread on the sink
 	if ((dpcd_reg_read(connectorIndex, DP_MAX_DOWNSPREAD) & 0x1) != 0) {
