@@ -47,9 +47,9 @@ status_t
 sdhci_allocate_dma(area_id* area, void** buffer, phys_addr_t* address,
 	size_t size)
 {
+#if defined(__aarch64__)
 	// the payload, or (with \a size) a page for its ADMA2 descriptors
 	const size_t kSdhciDmaSize = size != 0 ? size : ::kSdhciDmaSize;
-#if defined(__aarch64__)
 	virtual_address_restrictions virtualRestrictions = {};
 	physical_address_restrictions physicalRestrictions = {};
 	physicalRestrictions.high_address = UINT64_C(0x100000000);
