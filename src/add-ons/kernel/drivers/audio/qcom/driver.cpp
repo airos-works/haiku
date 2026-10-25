@@ -64,6 +64,10 @@ data_hook(void* cookie, const qcom_gpr_packet* packet)
 		acquire_spinlock(&device->streamLock);
 		device->lastRecorded = packet->token % kRecordBufferCount;
 		device->lastRecordedSize = size;
+		if (size != 0) {
+			device->framesRecorded += kRecordBufferFrames;
+			device->recordedTime = system_time();
+		}
 		release_spinlock(&device->streamLock);
 		restore_interrupts(state);
 		atomic_add(&device->recordDoneCount, 1);
@@ -488,10 +492,10 @@ start_up(AudioDevice* device)
 	bool record = get_driver_boolean_parameter(settings, "record_test", false,
 		true);
 	unload_driver_settings(settings);
-	if (record) {
-		status = open_capture(device);
+	// the headset input, for multi_audio and the lab test
+	status = open_capture(device);
+	if (status != B_OK)
 		TRACE("capture: %s\n", strerror(status));
-	}
 	if (tone)
 		test_tone(device);
 	if (record && device->captureOpen)
@@ -559,6 +563,10 @@ qcom_audio_init_driver(device_node* node, void** _cookie)
 	device->lastRecorded = -1;
 	device->lastRecordedSize = 0;
 	device->captureOpen = false;
+	device->capturing = false;
+	device->recordToRefill = -1;
+	device->framesRecorded = 0;
+	device->recordedTime = 0;
 	status_t status = device->dsp.Init(data_hook, device);
 	if (status != B_OK) {
 		TRACE("no GPR (qcom_adsp): %s\n", strerror(status));
