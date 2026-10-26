@@ -506,14 +506,22 @@ Job::Run()
 status_t
 Job::Execute()
 {
-	status_t status = B_OK;
-	if (!IsRunning() || !IsService())
-		status = Launch();
-	else
+	if (!IsRunning() || !IsService()) {
+		status_t status = Launch();
+		if (status != B_OK) {
+			debug_printf("Launching %s failed: %s\n", Title().String(),
+				strerror(status));
+		}
+	} else
 		debug_printf("Ignore launching %s\n", Name());
 
 	fLaunching = false;
-	return status;
+
+	// A job that could not be launched keeps that in its launch status. The
+	// job queue must not see it fail: it would abort and delete the jobs that
+	// depend on it, but they belong to the LaunchDaemon, and a target depends
+	// on all of its jobs.
+	return B_OK;
 }
 
 
