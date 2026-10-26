@@ -41,6 +41,12 @@ SetConfigVar DEBUG : HAIKU_TOP src system boot loader : 1 : global ;
 AppendToConfigVar DEFINES : HAIKU_TOP src kits : RUN_WITHOUT_REGISTRAR
 	: global ;
 
+# Tune all code (userland, kernel and boot loaders) for the Raspberry Pi 4's
+# Cortex-A72, for an image that only runs there. See SetCPUProfile in
+# ArchitectureRules for the profiles and what they change. Use an object
+# directory of its own: objects built with other flags are not rebuilt.
+SetCPUProfile arm64 : rpi4 ;
+
 # Set the debug level for file src/bin/gdb/gdb/haiku-nat.c (note, that
 # the object file must be specified) to 1. It is worth mentioning, that the
 # executable the object file is linked into (gdb), will still be placed in

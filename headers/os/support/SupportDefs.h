@@ -275,7 +275,9 @@ atomic_get_and_set(int32* value, int32 newValue)
 static __inline__ int32
 atomic_test_and_set(int32* value, int32 newValue, int32 testAgainst)
 {
-	__atomic_compare_exchange_n(value, &testAgainst, newValue, 1,
+	/* strong: a weak exchange may fail spuriously (a store-exclusive can
+	   fail for no reason) and still return testAgainst, as if it had set */
+	__atomic_compare_exchange_n(value, &testAgainst, newValue, 0,
 		__ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
 	return testAgainst;
 }
@@ -326,7 +328,9 @@ atomic_get_and_set64(int64* value, int64 newValue)
 static __inline__ int64
 atomic_test_and_set64(int64* value, int64 newValue, int64 testAgainst)
 {
-	__atomic_compare_exchange_n(value, &testAgainst, newValue, 1,
+	/* strong: a weak exchange may fail spuriously (a store-exclusive can
+	   fail for no reason) and still return testAgainst, as if it had set */
+	__atomic_compare_exchange_n(value, &testAgainst, newValue, 0,
 		__ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
 	return testAgainst;
 }

@@ -208,6 +208,46 @@ rule ArchitectureSetup architecture
 }
 
 
+rule SetCPUProfile architecture : profile
+{
+	# SetCPUProfile <architecture> : <profile> ;
+	#
+	# Tunes the code generation of userland, kernel and boot loaders for one
+	# CPU, for images that only run on that CPU. Call it from UserBuildConfig;
+	# by then the TARGET_* copies of the flags exist, so both sets are changed.
+	# The instruction set floor (-march) stays the same.
+	#
+	# Profiles:
+	#	rpi4: Cortex-A72 (Raspberry Pi 4). Schedules for the A72 and inlines
+	#		atomics: the A72 has no LSE, and Haiku's libgcc never selects the
+	#		LSE path of its outlined helpers, so they are a call per atomic
+	#		operation for nothing.
+
+	local flags ;
+	switch $(HAIKU_CPU_$(architecture)):$(profile) {
+		case arm64:rpi4 : flags = -mtune=cortex-a72 -mno-outline-atomics ;
+		case * :
+			Exit "SetCPUProfile: no profile" $(profile) "for"
+				$(HAIKU_CPU_$(architecture)) ;
+	}
+
+	local prefix ;
+	for prefix in HAIKU TARGET {
+		$(prefix)_CCFLAGS_$(architecture) += $(flags) ;
+		$(prefix)_C++FLAGS_$(architecture) += $(flags) ;
+		$(prefix)_LINKFLAGS_$(architecture) += $(flags) ;
+
+		if $(architecture) = $(HAIKU_PACKAGING_ARCHS[1]) {
+			$(prefix)_KERNEL_CCFLAGS += $(flags) ;
+			$(prefix)_KERNEL_C++FLAGS += $(flags) ;
+			$(prefix)_BOOT_CCFLAGS += $(flags) ;
+			$(prefix)_BOOT_C++FLAGS += $(flags) ;
+		}
+	}
+	HAIKU_CPU_PROFILE_$(architecture) = $(profile) ;
+}
+
+
 rule KernelArchitectureSetup architecture
 {
 	# KernelArchitectureSetup <architecture> ;
