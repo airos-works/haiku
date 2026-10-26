@@ -21,6 +21,7 @@
 #include <fs_volume.h>
 #include <OS.h>
 
+#include <AutoDeleter.h>
 #include <airos_boot_control.h>
 #include <boot/kernel_args.h>
 #include <directories.h>
@@ -499,11 +500,19 @@ struct KernelBootControlReader {
 	// whether the system package an activation file names is there
 	bool HasSystemPackage(const char* activationFile, const char* stateName)
 	{
-		char buffer[4096];
+		struct stat st;
+		if (stat(activationFile, &st) != 0 || st.st_size <= 0
+			|| st.st_size > 1024 * 1024) {
+			return false;
+		}
+		char* buffer = (char*)malloc(st.st_size + 1);
+		if (buffer == NULL)
+			return false;
+		MemoryDeleter bufferDeleter(buffer);
 		int fd = _kern_open(-1, activationFile, O_RDONLY, 0);
 		if (fd < 0)
 			return false;
-		ssize_t length = _kern_read(fd, 0, buffer, sizeof(buffer) - 1);
+		ssize_t length = _kern_read(fd, 0, buffer, st.st_size);
 		_kern_close(fd);
 		if (length <= 0)
 			return false;

@@ -1299,11 +1299,15 @@ Updater::Confirm(BString& _report)
 		trial.attempts);
 	_report.SetToFormat("The update %s works.", trial.release.String());
 
-	// what a confirmed release brings along
+	// What a confirmed release brings along: its EFI loader, unless this was
+	// a return to an older version (a trial named after its state). A newer
+	// loader starts older states; an older one may not know newer ones.
 	BString report;
-	UpdateEfiLoader(report);
-	if (!report.IsEmpty())
-		_report << "\n" << report;
+	if (!trial.release.StartsWith("state_")) {
+		UpdateEfiLoader(report);
+		if (!report.IsEmpty())
+			_report << "\n" << report;
+	}
 
 	Settings settings;
 	settings.Load();
