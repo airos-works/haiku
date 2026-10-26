@@ -145,6 +145,7 @@ AppGroupView::MouseDown(BPoint point)
 	if (BRect(fCloseRect).InsetBySelf(-5, -5).Contains(point)) {
 		int32 children = fInfo.size();
 		for (int32 i = 0; i < children; i++) {
+			fInfo[i]->SetClosedByUser();
 			fInfo[i]->RemoveSelf();
 			delete fInfo[i];
 		}

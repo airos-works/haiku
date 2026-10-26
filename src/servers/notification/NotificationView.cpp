@@ -84,7 +84,8 @@ NotificationView::NotificationView(BNotification* notification, bigtime_t timeou
 	fCloseClicked(false),
 	fPreviewModeOn(false),
 	fButtons(NULL),
-	fReplaced(false)
+	fReplaced(false),
+	fClosedByUser(false)
 {
 	if (request != NULL) {
 		request->FindMessenger("_reply:target", &fReplyTarget);
@@ -151,8 +152,12 @@ NotificationView::NotificationView(BNotification* notification, bigtime_t timeou
 
 NotificationView::~NotificationView()
 {
-	if (!fReplaced && !fClosedMessage.IsEmpty())
-		_Reply(fClosedMessage);
+	if (!fReplaced && !fClosedMessage.IsEmpty()) {
+		// "by_user": clicked or dismissed, not timed out
+		BMessage closed(fClosedMessage);
+		closed.SetBool("by_user", fClosedByUser);
+		_Reply(closed);
+	}
 
 	delete fRunner;
 	delete fBitmap;
@@ -193,6 +198,7 @@ NotificationView::MessageReceived(BMessage* msg)
 		{
 			if (!fActivatedMessage.IsEmpty())
 				_Reply(fActivatedMessage, msg->GetInt32("button", 0));
+			fClosedByUser = true;
 
 			BMessage remove(kRemoveView);
 			remove.AddPointer("view", this);
@@ -429,6 +435,7 @@ NotificationView::MouseDown(BPoint point)
 			}
 
 			// Remove the info view after a click
+			fClosedByUser = true;
 			BMessage remove_msg(kRemoveView);
 			remove_msg.AddPointer("view", this);
 
