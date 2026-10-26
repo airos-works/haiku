@@ -173,6 +173,25 @@ rule AirosCISymlink directoryTokens : linkTarget : name
 }
 
 
+# AirosRemoveImageFile <image directory> : <name>
+# Leaves a file the image definitions added out of the image.
+rule AirosRemoveImageFile directoryTokens : name
+{
+	local grist = [ on $(HAIKU_IMAGE_CONTAINER_NAME)
+		return $(HAIKU_CONTAINER_GRIST) ] ;
+	local directory = [ FDirName $(directoryTokens) ] ;
+	directory = $(directory:G=$(grist)) ;
+	local kept ;
+	local destTarget ;
+	for destTarget in [ on $(directory) return $(TARGETS_TO_INSTALL) ] {
+		if $(destTarget:G=) != $(name) {
+			kept += $(destTarget) ;
+		}
+	}
+	TARGETS_TO_INSTALL on $(directory) = $(kept) ;
+}
+
+
 # AirosMoveToPayload <package>
 # Moves every file the image would install in system/non-packaged into the
 # payload package, under data/airos/non-packaged, and links to it from the
@@ -419,6 +438,13 @@ rule UserBuildConfigRulePreImage
 
 		AddPackageFilesToHaikuImage system packages : $(payload) $(release)
 			: nameFromMetaInfo ;
+
+		# System Updater installs the system packages. Haiku's own
+		# repository would offer upstream Haiku's in their place (its haiku
+		# package has the higher revision) to SoftwareUpdater and pkgman;
+		# HaikuPorts stays for HaikuDepot.
+		AirosRemoveImageFile system settings package-repositories : Haiku ;
+		AirosRemoveImageFile system cache package-repositories : Haiku ;
 	}
 
 }
