@@ -203,7 +203,7 @@ each USB port, the serial console, and a Bluetooth device to pair with.
 | Ethernet | I211 up with DHCP | verified: ipro1000 link 1000BASE-T, DHCP lease, HTTP upload and SSH |
 | USB | every port at its full speed | verified on every USB 3 port of the four controllers in use, with real devices: a USB 3 SSD reads 281-308 MB/s and writes 312-349 MB/s at SuperSpeed on a CPU rear port, a chipset front port and the ASM2142's USB-A port (43 MB/s before), data verified each time; a RTL8153 gigabit adapter links at SuperSpeed on the ASM2142's USB-C port and carries 815 Mbit/s (81 before); USB 2 flash drives read their 30-36 MB/s on every controller. Disks and network adapters plugged in while the system runs now attach. The Thunderbolt card is out of scope for now (its controller halts on its first DMA, under the BIOS too; its wiring is in doubt). The chipset's controller takes 3-4 ms per control transfer to a USB 2 device (one stage per frame, the controller's own pacing as far as can be told), which slows enumeration and the Bluetooth firmware load but not data |
 | Audio | ALC1220 analog output, HDMI audio | verified both: two outputs, each clocking its stream at the hardware's own rate (48322 and 48321 frames a second against the 48000 asked for). The graphics card's codec needed a change to Haiku's hda driver, which discarded any codec whose converters are all digital. The monitor reports it takes stereo. What nobody here can check is whether a speaker makes a sound |
-| Graphics | GTX 1070/1080 Ti accelerated 2D/3D, 3-4 monitors | 3D verified: Vulkan on the GPU (1.4 TFLOP/s compute, 57 Gpixel/s fill) and OpenGL 4.5 through it, with frames copied straight into the screen's own frame buffer in video memory rather than sent through the host - a lit sphere at 1600x900 goes from 209 to 970 frames a second. Vertical sync works (locks to 60.0) now that the accelerant hands out a retrace semaphore. Any program gets the GPU, with nothing set in its environment. Three heads driving one spanning desktop is verified, but with the third and second forced rather than plugged in. 2D is not accelerated at all: it runs four to eight times slower than drawing in memory, which is still far more than a desktop needs at one monitor |
+| Graphics | GTX 1070/1080 Ti accelerated 2D/3D, 3-4 monitors | 3D verified: Vulkan on the GPU (1.4 TFLOP/s compute, 57 Gpixel/s fill) and OpenGL 4.5 through it, with frames copied straight into the screen's own frame buffer in video memory rather than sent through the host - a lit sphere at 1600x900 goes from 209 to 970 frames a second. Vertical sync works (locks to 60.0) now that the accelerant hands out a retrace semaphore. Any program gets the GPU, with nothing set in its environment. Three heads driving one spanning desktop is verified, but with the third and second forced rather than plugged in. 2D is accelerated on the card's 2D engine (2026-10-27): the accelerant's 2D hooks (fills, inverts, spans, screen to screen, transparent and scaled blits) for BWindowScreen programs, and app_server's copies to the screen, made by the engine from memory it reads over the bus - a 4K copy takes 2.9 ms on the engine against 7.1 ms of CPU, and the flush spends a tenth of the CPU it did. Drawing itself stays the processor's (app_server draws anti-aliased into memory), so drawing throughput barely moves |
 | Displays | two 4K monitors usable at arm's length: per-monitor scaling, arrangement, mirroring, per-monitor maximize, hot plug | verified on the two Dell P2415Q (DisplayPort): each monitor is a region of one frame buffer that the display engine scales up to the panel, at 100 to 250 percent in steps of 25, chosen per monitor. app_server arranges the monitors (side by side, stacked, swapped, one off, or one mirroring another), remembers the arrangement per monitor identity, keeps the mouse off the parts of the desktop no monitor shows, moves windows along with their monitor, and maximizes a window to the monitor most of it is on (the classic whole-desktop maximize is a setting). Two 24-inch 4K monitors come up at 200 percent, a 3840x1080 desktop drawn at full density with no settings at all; text is sharp in the frame buffer itself. Monitors at different scales share the largest density the engine can show: with the 1080p KVM at 100 percent beside them the 4K monitors stay one to one and the 1080p one is shrunk. The Screen preferences show the monitors as they stand and let them be dragged into place, identified by number on each screen, and read out from their EDID. Monitors coming and going are noticed two ways, but nobody was at the machine to plug one, so that path is untested. Frame buffer and VESA hardware gets the same scaling done in software, untested here |
 | Bluetooth | TP-Link Archer TX55E, working adapter and discovery | verified: the adapter answers as `90:74:ae:33:d7:cb` "MTK MT7922 #1" and an inquiry finds devices nearby, from a cold boot with nothing done by hand. The radio is a MediaTek MT7922 on USB, which runs a bootloader rather than a Bluetooth controller until it is given firmware - it takes the HCI Reset every stack opens with and never answers. The driver now hands it that firmware at open. Three further faults were in the way: `h2generic` took its event endpoint from the last interface that had one, which on this radio is MediaTek's audio interface, so it listened where no reply is ever sent; it stood isochronous transfers on the SCO endpoints at open, which nothing wants until there is a call; and the server never answered a request for a command the controller refuses outright, which hung the first program to ask for an adapter. Remote name lookup still fails, so discovered devices show an address and no name. Pairing and audio profiles are untried |
 | Wi-Fi | TP-Link Archer TX55E | verified: `mt7922wifi` joins WPA2-PSK/CCMP networks and carries traffic. Joining works from the Wi-Fi preferences (the password prompt, Remember this network, Known networks, Disconnect) and the WiFiStatus Deskbar applet lists networks with signal and lock, and shows the one joined. A saved network is joined again by net_server by itself once the card is up (it starts wpa_supplicant). DHCP configures the interface; with the wired card down the machine resolves names, fetches https pages and moves 50 MB each way (1.9 MB/s up, 2.5 MB/s down). Legacy 802.11a/g rates only for now (no HT/VHT/HE), chosen by the firmware's rate control. The driver is the Linux mt7921 layout in FreeBSD net80211 shape: firmware-offloaded scanning, the firmware's own channel management (remain-on-channel), software CCMP through net80211. It attaches at boot like any other driver and is part of the regular x86_64 image; the driver settings (`mt7922wifi`) can keep it out of the boot (`attach_at_boot false`, or `attach_at_boot_until <time>` for trying boot attachment where only the power switch reaches the machine) and turn on its diagnostics (`debug true`) |
@@ -1249,6 +1249,45 @@ each USB port, the serial console, and a Bluetooth device to pair with.
     looking at it, so an add-on that returns NULL leaves the program with no
     renderer instead of passing it to the next one. Fixing that in libGL would
     let this add-on simply stand aside when there is no GPU.
+- 2026-10-27: 2D acceleration on the GTX 1070's 2D engine (branch
+  `nvidia-2d`, README in `src/add-ons/accelerants/nvidia_rm`). The accelerant
+  has a graphics channel of its own with `FERMI_TWOD_A` on it and implements
+  the engine and 2D hooks with it; a BWindowScreen clone now draws on
+  app_server's frame buffer instead of grabbing NVKMS and applying a layout of
+  its own. app_server no longer has a use for those hooks (upstream dropped
+  them in 2024: they break double buffering), so it gets what does help it:
+  new hooks for memory the engine reads (`B_CREATE_FRAME_BUFFER_SOURCE`,
+  `B_COPY_TO_FRAME_BUFFER`), where the vertical blank flush keeps its two
+  shadows, and the engine copies them to the screen.
+  Measured, all without a monitor (the Dells were off; `force_edid HDMI-0`
+  drove a phantom 1920x1080):
+      engine, 4K surfaces: fill 0.47 ms (71 GB/s), copy from system memory
+        2.9 ms (11.3 GB/s) against 7.1 ms for the CPU's memcpy (4.7 GB/s),
+        64x64 copy and wait 7 us
+      every operation byte-exact against the CPU (nv2dtest), every hook too,
+        through a clone on its own surface and on app_server's live screen
+        (nvclone2dtest, --attach)
+      app_server, flush threads' CPU over 20 s, device copies against CPU
+        copies (no_device_copy, same boot): full-window redraws 185 ms
+        against 2905, window moves 182 against 1671; at 1366x768 after a
+        live mode change 130 against 1111. Frame and move rates unchanged,
+        0 behind the scan in the minute reports, longest flush 2.9 ms
+      the frame buffer (nvscanout --dump) equals app_server's screenshot but
+        for the Deskbar CPU meter, at 1920x1080 and after the mode change
+      drawtest against 2026-10-19 numbers: whole-window fills 1344 a second
+        with device copies, 1287 with CPU copies; small rectangles 427
+        against 347; scrolls and text unchanged. Drawing is the processor's
+        and lands in memory; what the engine takes off it is the copy
+  Not covered: two real monitors (two flush targets share the engine, each
+  copy waits under its lock), suspend (a lost engine falls back to the CPU
+  for good after one 2 s wait), Maxwell and Volta+ cards (Volta+ get no
+  engine and copy with the CPU as before).
+  Found on the way, not fixed: the kernel driver panics ("freeing io
+  interrupt vector 99 that is still asigned to a cpu", NvHaikuDevice::Stop
+  from nvKmsClose) when one team's NVKMS close shuts the card down while
+  another team's open is bringing it up; the opener then spins in
+  RmInitAdapter until a power cycle. Only tests that open and close the card
+  hit it - app_server never closes it.
 - 2026-09-19: measured what 2D drawing costs, since the accelerant offers no 2D
   hooks at all and every pixel app_server draws crosses the bus. The same
   drawing into an off-screen bitmap, against a window on the screen
