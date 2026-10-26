@@ -2,6 +2,10 @@ SubDir HAIKU_TOP src tests kits media ;
 
 AddSubDirSupportedPlatforms libbe_test ;
 
+SimpleTest media_track_times_test :
+	media_track_times_test.cpp
+	: media be ;
+
 SimpleTest VideoDecoder :
 	VideoDecoder.cpp
 	: media be ;
