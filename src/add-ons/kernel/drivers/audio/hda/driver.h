@@ -282,6 +282,9 @@ struct hda_audio_group {
 	hda_association		associations[MAX_ASSOCIATIONS];
 
 	hda_multi*		multi;
+
+	int32			force_stop_count;
+		// buffer_exchange() gives up waiting once this changes
 };
 
 /*!	This structure describes a single codec module in the

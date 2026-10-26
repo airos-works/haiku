@@ -56,6 +56,8 @@ public:
 
 			//! Replaced by a notification with the same ID: not closed.
 			void				SetReplaced()	{ fReplaced = true; }
+			//! The user dismissed it (rather than it timing out).
+			void				SetClosedByUser()	{ fClosedByUser = true; }
 
 private:
 			void				_CalculateSize();
@@ -93,6 +95,7 @@ private:
 			BMessage			fClosedMessage;
 			BView*				fButtons;
 			bool				fReplaced;
+			bool				fClosedByUser;
 };
 
 #endif	// _NOTIFICATION_VIEW_H

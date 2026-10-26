@@ -2462,6 +2462,54 @@ vm_area_put_locked_cache(VMCache* cache)
 }
 
 
+/*!	Maps \a area, a clone or a copy of the device memory area \a sourceArea,
+	to the same physical memory, with its memory type. Device memory has no
+	pages that a fault could map later. Both address spaces must be locked.
+*/
+static void
+map_device_area_like(VMArea* sourceArea, VMArea* area, uint32 protection)
+{
+	uint32 memoryType = sourceArea->MemoryType();
+
+	VMTranslationMap* map = sourceArea->address_space->TranslationMap();
+	map->Lock();
+
+	phys_addr_t physicalAddress;
+	uint32 oldProtection;
+	map->Query(sourceArea->Base(), &physicalAddress, &oldProtection);
+
+	map->Unlock();
+
+	VMAddressSpace* addressSpace = area->address_space;
+	map = addressSpace->TranslationMap();
+	size_t reservePages = map->MaxPagesNeededToMap(area->Base(),
+		area->Base() + (area->Size() - 1));
+
+	vm_page_reservation reservation;
+	vm_page_reserve_pages(&reservation, reservePages,
+		addressSpace == VMAddressSpace::Kernel()
+			? VM_PRIORITY_SYSTEM : VM_PRIORITY_USER);
+	map->Lock();
+
+	for (addr_t offset = 0; offset < area->Size(); offset += B_PAGE_SIZE) {
+		map->Map(area->Base() + offset, physicalAddress + offset,
+			protection, area->MemoryType(), &reservation);
+	}
+
+	map->Unlock();
+	vm_page_unreserve_pages(&reservation);
+
+	if (memoryType != 0) {
+		status_t status = arch_vm_set_memory_type(area, physicalAddress,
+			memoryType, NULL);
+
+		// Resetting the same memory type on the same physical memory
+		// should always succeed.
+		ASSERT_ALWAYS(status == B_OK);
+	}
+}
+
+
 area_id
 vm_clone_area(team_id team, const char* name, void** address,
 	uint32 addressSpec, uint32 protection, uint32 mapping, area_id sourceID,
@@ -2573,45 +2621,7 @@ vm_clone_area(team_id team, const char* name, void** address,
 		// we need to map in everything at this point
 		if (sourceArea->cache_type == CACHE_TYPE_DEVICE) {
 			// we don't have actual pages to map but a physical area
-			uint32 memoryType = sourceArea->MemoryType();
-
-			VMTranslationMap* map
-				= sourceArea->address_space->TranslationMap();
-			map->Lock();
-
-			phys_addr_t physicalAddress;
-			uint32 oldProtection;
-			map->Query(sourceArea->Base(), &physicalAddress, &oldProtection);
-
-			map->Unlock();
-
-			map = targetAddressSpace->TranslationMap();
-			size_t reservePages = map->MaxPagesNeededToMap(newArea->Base(),
-				newArea->Base() + (newArea->Size() - 1));
-
-			vm_page_reservation reservation;
-			vm_page_reserve_pages(&reservation, reservePages,
-				targetAddressSpace == VMAddressSpace::Kernel()
-					? VM_PRIORITY_SYSTEM : VM_PRIORITY_USER);
-			map->Lock();
-
-			for (addr_t offset = 0; offset < newArea->Size();
-					offset += B_PAGE_SIZE) {
-				map->Map(newArea->Base() + offset, physicalAddress + offset,
-					protection, newArea->MemoryType(), &reservation);
-			}
-
-			map->Unlock();
-			vm_page_unreserve_pages(&reservation);
-
-			if (memoryType != 0) {
-				status = arch_vm_set_memory_type(newArea, physicalAddress,
-					memoryType, NULL);
-
-				// Resetting the same memory type on the same physical memory
-				// should always succeed.
-				ASSERT_ALWAYS(status == B_OK);
-			}
+			map_device_area_like(sourceArea, newArea, protection);
 		} else {
 			VMTranslationMap* map = targetAddressSpace->TranslationMap();
 			size_t reservePages = map->MaxPagesNeededToMap(
@@ -3112,6 +3122,14 @@ vm_copy_area(team_id team, const char* name, void** _address,
 		// The new area uses the old area's cache, but vm_map_cache()
 		// hasn't acquired a ref. So we have to do that now.
 		cache->AcquireRefLocked();
+
+		if (source->cache_type == CACHE_TYPE_DEVICE) {
+			// A device memory mapping (a frame buffer a direct window maps,
+			// say) has no pages a fault could map: map it all now, as
+			// vm_clone_area() does, or the child crashes when it touches it.
+			target->cache_type = CACHE_TYPE_DEVICE;
+			map_device_area_like(source, target, target->protection);
+		}
 	}
 
 	// If the source area is writable, we need to move it one layer up as well.
