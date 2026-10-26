@@ -103,6 +103,17 @@ draws.
   system draws it in color, Mail leaves emoji to the system fonts.
 - **Kiri**: Scintilla and its terminal draw with `DrawString()`.
 
+## Fontconfig
+
+Programs that find fonts with fontconfig (WebKit in Mail and Summit, Qt)
+only see the color font when fontconfig's cache knows it. fontconfig keeps a
+directory's cache while the directory's time is unchanged, and packagefs gave
+a directory the time it has in one of its packages, so a font package
+installed after the cache was made stayed invisible (Mail's reader drew
+emoji in black and white). Since branch `packagefs-dir-mtime` a packagefs
+directory has the latest time of its packages and of their package files.
+`fc-cache -f` rebuilds a stale cache on a system without it.
+
 ## Testing
 
 Off the machine, the glyph code builds on Linux against the host FreeType:
