@@ -259,19 +259,57 @@ do_sync_handler(iframe * frame)
 #endif
 
 	InterruptScope scope(frame);
-	debug_exception_type exceptionType;
-	uint32 signalNumber;
-	int32 signalCode;
-	uint64 signalAddress = 0;
+
+	// Any exception not handled below is an instruction this thread may not
+	// execute: an undefined one (EXCP_UNKNOWN), say one of a newer
+	// architecture version that programs probe for with a SIGILL handler.
+	debug_exception_type exceptionType = B_INVALID_OPCODE_EXCEPTION;
+	uint32 signalNumber = SIGILL;
+	int32 signalCode = ILL_ILLOPC;
+	uint64 signalAddress = frame->elr;
 
 	bool isUser = (frame->spsr & PSR_M_MASK) == PSR_M_EL0t;
 	bool isExec = false;
 	switch (ESR_ELx_EXCEPTION(frame->esr)) {
+		case EXCP_MSR:
+			// a system register EL0 may not access
+			signalCode = ILL_PRVREG;
+			break;
 		case EXCP_PC_ALIGN:
 			exceptionType = B_ALIGNMENT_EXCEPTION;
 			signalNumber = SIGBUS;
 			signalCode = BUS_ADRALN;
-			signalAddress = frame->elr;
+			break;
+		case EXCP_SP_ALIGN:
+			exceptionType = B_ALIGNMENT_EXCEPTION;
+			signalNumber = SIGBUS;
+			signalCode = BUS_ADRALN;
+			signalAddress = frame->sp;
+			break;
+		case EXCP_TRAP_FP:
+		{
+			exceptionType = B_FLOATING_POINT_EXCEPTION;
+			signalNumber = SIGFPE;
+			signalCode = 0;
+			const uint64 iss = frame->esr;
+			if ((iss & (1 << 0)) != 0)
+				signalCode = FPE_FLTINV;
+			else if ((iss & (1 << 1)) != 0)
+				signalCode = FPE_FLTDIV;
+			else if ((iss & (1 << 2)) != 0)
+				signalCode = FPE_FLTOVF;
+			else if ((iss & (1 << 3)) != 0)
+				signalCode = FPE_FLTUND;
+			else if ((iss & (1 << 4)) != 0)
+				signalCode = FPE_FLTRES;
+			break;
+		}
+		case EXCP_BRK:
+			if (isUser) {
+				enable_interrupts();
+				user_debug_breakpoint_hit(false);
+				return;
+			}
 			break;
 		case EXCP_INSN_ABORT_L:
 		case EXCP_INSN_ABORT:
@@ -316,8 +354,16 @@ do_sync_handler(iframe * frame)
 				break;
 			}
 
-			if (!known)
+			if (!known) {
+				// alignment faults and the like
+				exceptionType = (frame->esr & ISS_DATA_DFSC_MASK) == 0x21
+					? B_ALIGNMENT_EXCEPTION : B_SEGMENT_VIOLATION;
+				signalNumber = SIGBUS;
+				signalCode = exceptionType == B_ALIGNMENT_EXCEPTION
+					? BUS_ADRALN : BUS_OBJERR;
+				signalAddress = frame->far;
 				break;
+			}
 
 			if (debug_debugger_running()) {
 				Thread* thread = thread_get_current_thread();
