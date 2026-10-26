@@ -699,11 +699,16 @@ StreamBase::GetNextChunk(const void** chunkBuffer,
 #endif
 		mediaHeader->user_data_type = AVPACKET_USER_DATA_TYPE;
 		avpacket_user_data* data = (avpacket_user_data*)mediaHeader->user_data;
-		data->pts = fPacket.pts;
-		data->dts = fPacket.dts;
+		// In microseconds like start_time, not in the stream's time base: the
+		// decoder gives its frames the time of the packet they came from.
+		data->pts = fPacket.pts != AV_NOPTS_VALUE
+			? _ConvertFromStreamTimeBase(fPacket.pts) : AV_NOPTS_VALUE;
+		data->dts = fPacket.dts != AV_NOPTS_VALUE
+			? _ConvertFromStreamTimeBase(fPacket.dts) : AV_NOPTS_VALUE;
 		data->stream_index = fPacket.stream_index;
 		data->flags = fPacket.flags;
-		data->duration = fPacket.duration;
+		data->duration = av_rescale_q(fPacket.duration, fStream->time_base,
+			AVRational{1, 1000000});
 		data->pos = fPacket.pos;
 
 		mediaHeader->type = fFormat.type;
