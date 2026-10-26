@@ -64,6 +64,15 @@ changed since the release before it in the feed (Haiku commits, package
 versions, application commits). System Updater checks each download's size
 and SHA-256 and reads its package info before using it.
 
+CI builds some packages again for every image although their sources did not
+change (the Office and Media apps after each Haiku commit, Vision's Deskbar
+repack): same file name, same contents, other file times, another SHA-256.
+`release-feed.py` compares each such package with the release before it,
+entry by entry and attribute by attribute without the times, and lists the
+earlier SHA-256s as `equivalent`; System Updater keeps an installed copy whose
+SHA-256 is among them. Between two CI builds of 26 October this cut an
+update from 24 packages (468 MiB) to 13 (249 MiB).
+
 ## On the machine
 
 System Updater keeps its state on the system volume, in
@@ -214,6 +223,24 @@ branch's CI scripts from the last CI build's inputs:
   needs the Pi's firmware, which QEMU does not run: not yet tested on a Pi.
 - **Cubie A7S**: the image and its release build; not booted.
 
+From CI to CI (2026-10-26), images and feed from the `air/OS images`
+workflow: the x86_64 image of one build installed with the Installer; System
+Updater (the copy in that image) found the next build, showed its changes,
+downloaded it and restarted; the trial was confirmed after one start and
+the EFI loader on the ESP replaced (the old one kept as
+`BOOTX64-previous.EFI`). *Restart into This Version* started the older
+build once with its own kernel; the new loader's menu named both builds;
+*Go Back* made the older one current again (its first start met the stall
+below, the second confirmed it); an update from a feed with `equivalent`
+packages then kept their installed copies. The arm64 image of a CI build
+installed and found its feed.
+
 Known: about one start in fifteen in QEMU (and one smoke test in forty on
 CI) stops before the desktop, also without System Updater; an update that
-meets it twice in a row falls back and can be tried again.
+meets it twice in a row falls back and can be tried again. When it happens,
+neither net_server nor app_server has started (no network or graphics driver
+loads after the package daemon's volume check), every CPU idles in
+`halt_idle`, and an NMI does not reach the kernel debugger: some server
+everything waits for (the registrar?) is stuck. It is older than System
+Updater; only the launch file's single `requires` (first-login) goes through
+the launch_daemon change of this branch, and that is in the user session.

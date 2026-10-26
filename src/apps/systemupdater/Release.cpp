@@ -200,6 +200,11 @@ Release::SetTo(const BMessage& object)
 			package->size = (off_t)json::Number(entry, "size", -1);
 			package->optional = false;
 			entry.FindBool("optional", &package->optional);
+			BMessage equivalent;
+			if (json::Object(entry, "equivalent", equivalent)) {
+				for (int32 j = 0; j < json::Count(equivalent); j++)
+					package->equivalent.Add(json::StringAt(equivalent, j));
+			}
 			if (package->name.IsEmpty() || package->file.IsEmpty()
 				|| package->file.FindFirst('/') >= 0) {
 				delete package;
