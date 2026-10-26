@@ -146,7 +146,8 @@ Release::Release()
 	:
 	fPackages(20),
 	fPayloadLinks(20),
-	fBootFiles(4)
+	fBootFiles(4),
+	fBootstrap(false)
 {
 }
 
@@ -161,6 +162,8 @@ Release::SetTo(const BMessage& object)
 	fBuilt = json::String(object, "built");
 	fVersion = json::String(object, "version", VersionForId(fId));
 	fFeed = json::String(object, "feed");
+	fBootstrap = false;
+	object.FindBool("bootstrap", &fBootstrap);
 
 	BMessage haiku;
 	if (json::Object(object, "haiku", haiku)) {
@@ -180,6 +183,8 @@ Release::SetTo(const BMessage& object)
 			package->sha256 = json::String(entry, "sha256");
 			package->url = json::String(entry, "url");
 			package->size = (off_t)json::Number(entry, "size", -1);
+			package->optional = false;
+			entry.FindBool("optional", &package->optional);
 			if (package->name.IsEmpty() || package->file.IsEmpty()
 				|| package->file.FindFirst('/') >= 0) {
 				delete package;

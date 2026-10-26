@@ -247,7 +247,7 @@ command_update(Updater& updater, const char* id, bool apply)
 	}
 
 	UpdatePlan plan;
-	if (updater.PlanUpdate(release, state, plan, error) != B_OK) {
+	if (updater.PlanUpdate(release, state, plan, error, &feed) != B_OK) {
 		fprintf(stderr, "Cannot plan the update: %s\n", error.String());
 		return 1;
 	}

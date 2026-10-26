@@ -518,7 +518,8 @@ Updater::_SaveReleaseRecord(const Release& release)
 			<< ", \"version\": " << json::Quote(package->version)
 			<< ", \"file\": " << json::Quote(package->file)
 			<< ", \"sha256\": " << json::Quote(package->sha256)
-			<< ", \"size\": " << package->size << "}"
+			<< ", \"size\": " << package->size
+			<< (package->optional ? ", \"optional\": true" : "") << "}"
 			<< (i + 1 < release.Packages().CountItems() ? ",\n" : "\n");
 	}
 	text << " ],\n \"payload\": {\"links\": [\n";
@@ -563,7 +564,7 @@ Updater::CheckPreconditions(const SystemState& state, BString& _error) const
 
 status_t
 Updater::PlanUpdate(const Release& release, const SystemState& state,
-	UpdatePlan& _plan, BString& _error)
+	UpdatePlan& _plan, BString& _error, const Feed* feed)
 {
 	_plan.release = release;
 	_plan.goBackState.Truncate(0);
@@ -579,12 +580,27 @@ Updater::PlanUpdate(const Release& release, const SystemState& state,
 		return B_ERROR;
 	}
 
-	// what the installed release had, to remove what the new one drops
+	// What the installed release had, to remove what the new one drops. A
+	// record made from the installed packages (a system installed from an
+	// image) cannot tell the release's packages from the user's: then the
+	// feed's description of that release is asked for, and without it
+	// nothing is dropped.
 	Release installed;
 	BStringList previousNames;
 	if (LoadInstalledRelease(installed) == B_OK) {
 		Release record;
-		if (_LoadReleaseRecord(installed.Id(), record) == B_OK) {
+		bool haveRecord = _LoadReleaseRecord(installed.Id(), record) == B_OK
+			&& !record.IsBootstrap();
+		const FeedBuild* build = feed != NULL
+			? feed->FindBuild(installed.Id()) : NULL;
+		if (!haveRecord && build != NULL) {
+			BString error;
+			if (FetchRelease(*build, record, error) == B_OK) {
+				_SaveReleaseRecord(record);
+				haveRecord = true;
+			}
+		}
+		if (haveRecord) {
 			for (int32 i = 0; const ReleasePackage* package
 					= record.Packages().ItemAt(i); i++) {
 				previousNames.Add(package->name);
@@ -592,10 +608,16 @@ Updater::PlanUpdate(const Release& release, const SystemState& state,
 		}
 	}
 
+	BStringList installedNames;
+	for (int32 i = 0; i < latest->packages.CountStrings(); i++)
+		installedNames.Add(PackageNameOf(latest->packages.StringAt(i)));
+
 	BStringList releaseNames;
 	BStringList releaseFiles;
 	for (int32 i = 0; const ReleasePackage* package
 			= release.Packages().ItemAt(i); i++) {
+		if (package->optional && !installedNames.HasString(package->name))
+			continue;
 		releaseNames.Add(package->name);
 		releaseFiles.Add(package->file);
 	}
@@ -604,6 +626,8 @@ Updater::PlanUpdate(const Release& release, const SystemState& state,
 	int32 count = release.Packages().CountItems();
 	for (int32 i = 0; i < count; i++) {
 		const ReleasePackage* package = release.Packages().ItemAt(i);
+		if (package->optional && !installedNames.HasString(package->name))
+			continue;
 		_Status("Comparing %s (%" B_PRId32 " of %" B_PRId32 ")…",
 			package->file.String(), i + 1, count);
 		_Progress((float)i / count);

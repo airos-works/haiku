@@ -204,7 +204,7 @@ UpdateWorker::_Install(const char* id)
 	if (result == B_OK)
 		result = fUpdater.CheckPreconditions(state, error);
 	if (result == B_OK)
-		result = fUpdater.PlanUpdate(release, state, plan, error);
+		result = fUpdater.PlanUpdate(release, state, plan, error, &fFeed);
 	if (result == B_OK)
 		result = fUpdater.Download(plan, error);
 	if (result == B_OK)

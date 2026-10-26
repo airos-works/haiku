@@ -84,7 +84,10 @@ public:
 	// installing
 			status_t			PlanUpdate(const Release& release,
 									const SystemState& state,
-									UpdatePlan& _plan, BString& _error);
+									UpdatePlan& _plan, BString& _error,
+									const Feed* feed = NULL);
+									// the feed offers the record of the
+									// installed release if there is none
 			status_t			PlanGoBack(const InstalledVersion& version,
 									const SystemState& state,
 									UpdatePlan& _plan, BString& _error);

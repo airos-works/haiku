@@ -40,6 +40,7 @@ private:
 									// what runs, from the disk
 			void				_ShowState();
 			void				_SetBusy(bool busy, const char* text = NULL);
+			void				_SetVisible(BView* view, bool visible);
 			void				_StartCheck();
 			void				_Restart();
 			void				_SelectVersion();

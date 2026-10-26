@@ -467,25 +467,10 @@ UpdaterWindow::_ShowState()
 	fMainButton->SetLabel(main);
 	fSecondaryButton->SetLabel(secondary);
 
-	if (showMain == fMainButton->IsHidden()) {
-		if (showMain)
-			fMainButton->Show();
-		else
-			fMainButton->Hide();
-	}
-	if (showSecondary == fSecondaryButton->IsHidden()) {
-		if (showSecondary)
-			fSecondaryButton->Show();
-		else
-			fSecondaryButton->Hide();
-	}
-	bool cancellable = fMode == kModeInstalling || fMode == kModeChecking;
-	if (cancellable == fCancelButton->IsHidden()) {
-		if (cancellable)
-			fCancelButton->Show();
-		else
-			fCancelButton->Hide();
-	}
+	_SetVisible(fMainButton, showMain);
+	_SetVisible(fSecondaryButton, showSecondary);
+	_SetVisible(fCancelButton, fMode == kModeInstalling
+		|| fMode == kModeChecking);
 	fMainButton->SetEnabled(!fBusy);
 	fSecondaryButton->SetEnabled(!fBusy);
 	fCheckButton->SetEnabled(!fBusy && fState.RunningLatest()
@@ -500,13 +485,23 @@ void
 UpdaterWindow::_SetBusy(bool busy, const char* text)
 {
 	fBusy = busy;
-	if (busy) {
+	if (busy)
 		fProgressBar->Reset(text);
-		if (fProgressBar->IsHidden())
-			fProgressBar->Show();
-	} else if (!fProgressBar->IsHidden())
-		fProgressBar->Hide();
+	_SetVisible(fProgressBar, busy);
 	_ShowState();
+}
+
+
+/*!	Shows or hides \a view, looking at its own state only: before the window
+	is shown, IsHidden() says every view is hidden.
+*/
+void
+UpdaterWindow::_SetVisible(BView* view, bool visible)
+{
+	if (visible && view->IsHidden(view))
+		view->Show();
+	else if (!visible && !view->IsHidden(view))
+		view->Hide();
 }
 
 

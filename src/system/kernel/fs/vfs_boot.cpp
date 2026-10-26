@@ -596,7 +596,6 @@ write_airos_boot_file(const KPath& directory, const char* name,
 		return;
 	}
 	_kern_write(fd, -1, content, strlen(content));
-	_kern_fsync(fd, false);
 	_kern_close(fd);
 }
 
@@ -666,6 +665,12 @@ record_airos_boot(const KMessage& bootVolume, const char*& _state,
 		dprintf("airos boot: counted a start of the update on trial\n");
 	} else
 		dprintf("airos boot: %s start of \"%s\"\n", mode, state);
+
+	// The boot loader reads the file system without replaying its journal,
+	// and the start may end in a hang any moment now: write the changes and
+	// the metadata they need to their places on the disk. (BFS's fsync()
+	// writes a file's data only.)
+	_kern_sync();
 }
 
 

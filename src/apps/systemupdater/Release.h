@@ -37,6 +37,8 @@ struct ReleasePackage {
 	BString		sha256;
 	BString		url;
 	off_t		size;
+	bool		optional;
+		// one the Installer offers (_packages_): updated where installed
 };
 
 
@@ -99,6 +101,9 @@ public:
 			const BObjectList<BootFile, true>& BootFiles() const
 									{ return fBootFiles; }
 			const BMessage&		Changes() const { return fChanges; }
+			bool				IsBootstrap() const { return fBootstrap; }
+									// a record made from what was
+									// installed, not from the feed
 			const BMessage&		Object() const { return fObject; }
 
 	static	BString				TitleForVersion(const char* version);
@@ -120,6 +125,7 @@ private:
 			BObjectList<PayloadLink, true> fPayloadLinks;
 			BObjectList<BootFile, true> fBootFiles;
 			BMessage			fChanges;
+			bool				fBootstrap;
 };
 
 
