@@ -658,6 +658,15 @@ HWInterface::_CopyShadowToFront(BRegion& region, int32 which)
 		return;
 	}
 
+	// the device copies faster than the scan goes down the screen, and
+	// without the CPU; done when it returns
+	RenderingBuffer* frontBuffer = FrontBuffer();
+	if (frontBuffer != NULL && frontBuffer->Width() == shadow->Width()
+		&& frontBuffer->Height() == shadow->Height()
+		&& _CopyShadowByDevice(shadow, region)) {
+		return;
+	}
+
 	// in bands of rows across all the rects, so that the copy goes down
 	// the screen as the scan does: rects side by side would otherwise be
 	// copied one after the other, the later ones behind the scan
@@ -1035,6 +1044,24 @@ HWInterface::_StopFlushing()
 }
 
 
+/*!	The flush's shadows go, before the device that may own their memory
+	does. After _StopFlushing().
+*/
+void
+HWInterface::_ReleaseFlushShadows()
+{
+	for (int32 i = 0; i < 2; i++)
+		fFlushShadow[i].Unset();
+}
+
+
+RenderingBuffer*
+HWInterface::_CreateFlushShadow(uint32 width, uint32 height)
+{
+	return new(std::nothrow) MallocBuffer(width, height);
+}
+
+
 /*!	Tells the targets what their outputs show now: after a mode or layout
 	change. Write locked (or not locked yet, when starting).
 */
@@ -1071,8 +1098,8 @@ HWInterface::_UpdateFlushTargets()
 			&& fFlushShadow[i]->Height() == backBuffer->Height())
 			continue;
 		fFlushShadow[i].Unset();
-		MallocBuffer* shadow = new(std::nothrow) MallocBuffer(
-			backBuffer->Width(), backBuffer->Height());
+		RenderingBuffer* shadow = _CreateFlushShadow(backBuffer->Width(),
+			backBuffer->Height());
 		if (shadow != NULL && shadow->InitCheck() == B_OK) {
 			// the back buffer as it is, so that nothing stale is copied
 			memcpy(shadow->Bits(), backBuffer->Bits(),
@@ -1533,7 +1560,7 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank, int32 which)
 		area += (int64)(r.right - r.left + 1) * (r.bottom - r.top + 1);
 	}
 	int32 bands = 1;
-	if (area > kBandArea) {
+	if (area > kBandArea && !_DeviceCopiesShadows()) {
 		if (target.workers == NULL)
 			_StartFlushWorkers(target);
 		if (target.workerCount > 0) {

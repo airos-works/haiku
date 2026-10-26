@@ -90,6 +90,13 @@ enum {
 	B_GET_DISPLAY_OUTPUT_RETRACE_SEMAPHORE,	/* optional */
 	B_GET_DISPLAY_OUTPUT_SCAN_LINE,		/* optional */
 
+	/* copies to the frame buffer made by the device: a source is memory the
+	   device reads, which the caller draws into and then has copied to the
+	   same place on the screen without the CPU touching the frame buffer */
+	B_CREATE_FRAME_BUFFER_SOURCE = 0x700,	/* optional */
+	B_DELETE_FRAME_BUFFER_SOURCE,		/* optional */
+	B_COPY_TO_FRAME_BUFFER,				/* optional */
+
 	/* 3D acceleration */
 	B_ACCELERANT_PRIVATE_START = (int)0x80000000
 };
@@ -345,6 +352,16 @@ typedef struct {
 } sync_token;
 
 
+typedef struct {
+	uint32	id;							/* the accelerant's name for it */
+	void*	bits;						/* in the caller's address space */
+	uint32	bytes_per_row;
+	uint16	width;
+	uint16	height;
+	color_space	space;
+} frame_buffer_source;
+
+
 /* Masks for color info */
 /* B_CMAP8    - 0x000000ff */
 /* B_RGB15/16 - 0x0000ffff */
@@ -445,6 +462,16 @@ typedef void (*screen_to_screen_scaled_filtered_blit)(engine_token* et,
 
 typedef void (*fill_span)(engine_token* et, uint32 color, uint16* list,
 	uint32 count);
+
+typedef status_t (*create_frame_buffer_source)(uint16 width, uint16 height,
+	color_space space, frame_buffer_source* source);
+typedef void (*delete_frame_buffer_source)(uint32 id);
+/* Copies the rectangles (inclusive, in frame buffer coordinates) from the
+   source to the same place in the frame buffer, and returns once they are
+   there. Anything but B_OK: nothing may have been copied, the caller copies
+   them itself. */
+typedef status_t (*copy_to_frame_buffer)(uint32 id,
+	const fill_rect_params* list, uint32 count);
 /*
 	The uint16* list points to a list of tripples:
 		list[N+0]  Y co-ordinate of span

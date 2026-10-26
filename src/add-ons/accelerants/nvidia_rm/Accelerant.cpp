@@ -6,6 +6,7 @@
 #include <sys/select.h>
 #include <atomic>
 #include <algorithm>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -20,6 +21,7 @@
 
 #include "NvUtils.h"
 #include "NvKmsBitmap.h"
+#include "NvEngine2D.h"
 #include "nv-haiku.h"
 
 extern "C" {
@@ -181,6 +183,28 @@ private:
 	NvKmsBitmap fCheckedFramebuffer;	// allocated to check the layout with,
 										// shown when its mode is set
 
+	// A clone - another team's accelerant, BWindowScreen's - sets no modes
+	// and owns no display: it only draws on the screen app_server shows,
+	// whose frame buffer it duplicates from app_server's resman client.
+	bool fIsClone = false;
+	nv_haiku_scanout_info fCloneScanout {};
+	NvRmObject fCloneFramebuffer;
+	NvRmMemoryMapping fCloneMapping;
+
+	// The 2D engine and what it works on: the frame buffer, placed in its
+	// address space, and the sources app_server draws into and has copied
+	// to the screen. Declared after the frame buffers, so gone before them.
+	std::unique_ptr<NvEngine2D> fEngine;
+	NvEngine2D::Buffer fEngineTarget;
+	NvHandle fEngineTargetMemory = 0;
+	struct Source {
+		uint32 id;
+		NvEngine2D::Buffer buffer;
+		NvEngine2D::Surface surface;
+	};
+	std::vector<Source> fSources;
+	uint32 fNextSourceID = 1;
+
 	NvKmsBitmap fCursor, fNewCursor;
 	struct {
 		int32 x;
@@ -230,6 +254,13 @@ private:
 	std::atomic<bigtime_t> fRecheckAt {0};
 
 	NvAccelerant(int devFd);
+	NvAccelerant(int devFd, const nv_haiku_scanout_info &scanout);
+
+	void StartEngine();
+	void RetargetEngine(NvHandle memory, uint64 size, uint32 width,
+		uint32 height, uint32 bytesPerRow, color_space colorSpace);
+	void UpdateEngineTarget();
+	void UpdateCloneTarget();
 
 	void ApplyMode(const display_mode &mode, NvKmsBitmap &framebuffer);
 	void FillLayoutRequest(const std::vector<Output> &outputs, NvKmsBitmap &framebuffer,
@@ -292,6 +323,23 @@ public:
 	~NvAccelerant();
 
 	static NvAccelerant *Instance() {return sInstance;}
+	bool IsClone() const {return fIsClone;}
+	bool HasEngine() const {return fEngine && !fEngine->IsLost();}
+
+	uint32 EngineCount();
+	status_t AcquireEngine(uint32 capabilities, uint32 maxWait, sync_token *st,
+		engine_token **et);
+	status_t ReleaseEngine(engine_token *et, sync_token *st);
+	void WaitEngineIdle();
+	status_t GetSyncToken(engine_token *et, sync_token *st);
+	status_t SyncToToken(sync_token *st);
+	NvEngine2D &Engine() {return *fEngine;}
+
+	status_t CreateFrameBufferSource(uint16 width, uint16 height,
+		color_space space, frame_buffer_source *source);
+	void DeleteFrameBufferSource(uint32 id);
+	status_t CopyToFrameBuffer(uint32 id, const fill_rect_params *list,
+		uint32 count);
 
 	static void Init(int fd);
 	static void Clone(void* data);
@@ -362,6 +410,15 @@ static bool IsForcedConnected(const char *name)
 {
 	char value[128];
 	return ReadSetting("force_connected", name, value, sizeof(value));
+}
+
+// "acceleration 2d off" leaves the 2D engine alone: no hooks, and app_server
+// copies to the screen with the CPU.
+static bool AccelerationDisabled()
+{
+	char value[128];
+	return ReadSetting("acceleration", "2d", value, sizeof(value))
+		&& strcmp(value, "off") == 0;
 }
 
 // NVKMS names a connector with a monitor on it after the monitor, "DELL
@@ -435,6 +492,9 @@ NvAccelerant::NvAccelerant(int devFd):
 	ApplyDefaultLayout();
 	ReadModeList();
 
+	StartEngine();
+	UpdateEngineTarget();
+
 	fDisplayRestoredSem = create_sem(0, "nvidia_rm display restored");
 	fResumeThread = spawn_thread(ResumeThreadEntry, "nvidia_rm resume",
 		B_DISPLAY_PRIORITY, this);
@@ -446,6 +506,16 @@ NvAccelerant::NvAccelerant(int devFd):
 
 NvAccelerant::~NvAccelerant()
 {
+	// nothing may still be reading the sources or writing the frame buffer
+	// when they go
+	if (fEngine) {
+		std::lock_guard<std::recursive_mutex> lock(fEngine->Lock());
+		fEngine->WaitIdle();
+		fSources.clear();
+		fEngineTarget = NvEngine2D::Buffer();
+	}
+	fEngine.reset();
+
 	StopHotplugThread();
 
 	if (fResumeThread >= 0) {
@@ -856,7 +926,257 @@ void NvAccelerant::Clone(void* data)
 	FileDesc devFd(open((char*)data, O_RDWR | O_CLOEXEC));
 	CheckErrno(devFd.Get());
 
-	sInstance = new NvAccelerant(devFd.Get());
+	// Without a published frame buffer there is no app_server to clone.
+	nv_haiku_scanout_info scanout {};
+	CheckErrno(ioctl(devFd.Get(), NV_HAIKU_BASE + NV_HAIKU_GET_SCANOUT, &scanout,
+		sizeof(scanout)));
+
+	sInstance = new NvAccelerant(devFd.Get(), scanout);
+}
+
+NvAccelerant::NvAccelerant(int devFd, const nv_haiku_scanout_info &scanout):
+	fDevFd(dup(devFd)),
+	fRmDev(fRm, 0),
+	fKmsDev(fKms, 0),
+	fIsClone(true)
+{
+	StartEngine();
+	UpdateCloneTarget();
+}
+
+
+// #pragma mark - the 2D engine
+
+
+void NvAccelerant::StartEngine()
+{
+	if (AccelerationDisabled()) {
+		debug_printf("nvidia_rm: 2D acceleration switched off in the settings\n");
+		return;
+	}
+	try {
+		fEngine = std::make_unique<NvEngine2D>(fRm, fRmDev);
+		debug_printf("nvidia_rm: 2D engine ready\n");
+	} catch (const std::system_error &ex) {
+		debug_printf("[!] nvidia_rm: no 2D acceleration: %s\n", ex.what());
+		fEngine.reset();
+	}
+}
+
+// Points the engine at the frame buffer, whenever that is a new one. The old
+// one stays until the next mode set, so its mapping can go first.
+void NvAccelerant::RetargetEngine(NvHandle memory, uint64 size, uint32 width,
+	uint32 height, uint32 bytesPerRow, color_space colorSpace)
+{
+	if (!fEngine)
+		return;
+	std::lock_guard<std::recursive_mutex> lock(fEngine->Lock());
+	if (memory == fEngineTargetMemory)
+		return;
+	fEngine->WaitIdle();
+	fEngine->SetTarget(NvEngine2D::Surface());
+	fEngineTarget = NvEngine2D::Buffer();
+	fEngineTargetMemory = 0;
+	if (memory == 0)
+		return;
+	try {
+		fEngineTarget = fEngine->Import(memory, size);
+	} catch (const std::system_error &ex) {
+		debug_printf("[!] nvidia_rm: the 2D engine cannot reach the frame "
+			"buffer: %s\n", ex.what());
+		return;
+	}
+	NvEngine2D::Surface surface;
+	surface.gpuAddress = fEngineTarget.GpuAddress();
+	surface.width = width;
+	surface.height = height;
+	surface.bytesPerRow = bytesPerRow;
+	surface.colorSpace = colorSpace;
+	fEngine->SetTarget(surface);
+	fEngineTargetMemory = memory;
+}
+
+void NvAccelerant::UpdateEngineTarget()
+{
+	if (!fFramebuffer.IsSet()) {
+		RetargetEngine(0, 0, 0, 0, 0, B_NO_COLOR_SPACE);
+		return;
+	}
+	RetargetEngine(fFramebuffer.Memory().Get(),
+		(uint64)fFramebuffer.BytesPerRow() * fFramebuffer.Height(),
+		fFramebuffer.Width(), fFramebuffer.Height(), fFramebuffer.BytesPerRow(),
+		fFramebuffer.ColorSpace());
+}
+
+// A clone follows app_server's frame buffer, which is a new one after every
+// mode set.
+void NvAccelerant::UpdateCloneTarget()
+{
+	nv_haiku_scanout_info scanout {};
+	if (ioctl(fDevFd.Get(), NV_HAIKU_BASE + NV_HAIKU_GET_SCANOUT, &scanout,
+			sizeof(scanout)) < 0) {
+		scanout = nv_haiku_scanout_info {};
+	}
+	if (scanout.client == fCloneScanout.client
+		&& scanout.memory == fCloneScanout.memory && fCloneFramebuffer.Get() != 0)
+		return;
+
+	RetargetEngine(0, 0, 0, 0, 0, B_NO_COLOR_SPACE);
+	fCloneMapping = NvRmMemoryMapping();
+	fCloneFramebuffer = NvRmObject();
+	fCloneScanout = nv_haiku_scanout_info {};
+	if (scanout.memory == 0)
+		return;
+	try {
+		fCloneFramebuffer = NvRmObject(fRm, fRm.DupObject(fRmDev.Device().Get(),
+			scanout.client, scanout.memory));
+	} catch (const std::system_error &ex) {
+		debug_printf("[!] nvidia_rm: the clone cannot reach the frame buffer: %s\n",
+			ex.what());
+		return;
+	}
+	fCloneScanout = scanout;
+	RetargetEngine(fCloneFramebuffer.Get(), scanout.size, scanout.width,
+		scanout.height, scanout.bytes_per_row, (color_space)scanout.color_space);
+}
+
+uint32 NvAccelerant::EngineCount()
+{
+	return fEngine ? 1 : 0;
+}
+
+static engine_token sEngineToken = {1, B_2D_ACCELERATION, NULL};
+
+// The engine is held from here to ReleaseEngine(), by one thread; the
+// operations in between are queued and handed to the GPU on release.
+status_t NvAccelerant::AcquireEngine(uint32 capabilities, uint32 maxWait,
+	sync_token *st, engine_token **et)
+{
+	if (!fEngine || (capabilities & ~B_2D_ACCELERATION) != 0)
+		return B_ERROR;
+	fEngine->Lock().lock();
+	if (fIsClone)
+		UpdateCloneTarget();
+	if (fEngine->IsLost() || !fEngine->Target().IsSet()) {
+		fEngine->Lock().unlock();
+		return B_ERROR;
+	}
+	if (st != NULL && st->engine_id == sEngineToken.engine_id)
+		fEngine->Wait((uint32)st->counter);
+	*et = &sEngineToken;
+	return B_OK;
+}
+
+status_t NvAccelerant::ReleaseEngine(engine_token *et, sync_token *st)
+{
+	if (!fEngine || et != &sEngineToken)
+		return B_BAD_VALUE;
+	uint32 sequence = fEngine->Submit();
+	if (st != NULL) {
+		st->engine_id = sEngineToken.engine_id;
+		st->counter = sequence;
+	}
+	fEngine->Lock().unlock();
+	return B_OK;
+}
+
+void NvAccelerant::WaitEngineIdle()
+{
+	if (!fEngine)
+		return;
+	std::lock_guard<std::recursive_mutex> lock(fEngine->Lock());
+	fEngine->WaitIdle();
+}
+
+status_t NvAccelerant::GetSyncToken(engine_token *et, sync_token *st)
+{
+	if (!fEngine || st == NULL)
+		return B_BAD_VALUE;
+	std::lock_guard<std::recursive_mutex> lock(fEngine->Lock());
+	st->engine_id = sEngineToken.engine_id;
+	st->counter = fEngine->Submit();
+	return B_OK;
+}
+
+status_t NvAccelerant::SyncToToken(sync_token *st)
+{
+	if (!fEngine || st == NULL)
+		return B_BAD_VALUE;
+	if (st->engine_id != sEngineToken.engine_id)
+		return B_OK;
+	std::lock_guard<std::recursive_mutex> lock(fEngine->Lock());
+	return fEngine->Wait((uint32)st->counter) ? B_OK : B_ERROR;
+}
+
+// Memory in the system the engine reads over the bus, cached for the CPU:
+// app_server keeps what it has drawn there and has it copied to the screen.
+status_t NvAccelerant::CreateFrameBufferSource(uint16 width, uint16 height,
+	color_space space, frame_buffer_source *source)
+{
+	if (!fEngine || fEngine->IsLost())
+		return B_UNSUPPORTED;
+	if (space != B_RGB32 && space != B_RGBA32)
+		return B_BAD_VALUE;
+	std::lock_guard<std::recursive_mutex> lock(fEngine->Lock());
+	uint32 bytesPerRow = ((uint32)width * 4 + 255) & ~255u;
+	Source entry;
+	entry.id = fNextSourceID++;
+	entry.buffer = fEngine->Allocate((NvU64)bytesPerRow * height, true);
+	entry.surface.gpuAddress = entry.buffer.GpuAddress();
+	entry.surface.width = width;
+	entry.surface.height = height;
+	entry.surface.bytesPerRow = bytesPerRow;
+	entry.surface.colorSpace = space;
+	source->id = entry.id;
+	source->bits = entry.buffer.Address();
+	source->bytes_per_row = bytesPerRow;
+	source->width = width;
+	source->height = height;
+	source->space = space;
+	fSources.push_back(std::move(entry));
+	return B_OK;
+}
+
+void NvAccelerant::DeleteFrameBufferSource(uint32 id)
+{
+	if (!fEngine)
+		return;
+	std::lock_guard<std::recursive_mutex> lock(fEngine->Lock());
+	for (auto it = fSources.begin(); it != fSources.end(); it++) {
+		if (it->id == id) {
+			fEngine->WaitIdle();
+			fSources.erase(it);
+			return;
+		}
+	}
+}
+
+status_t NvAccelerant::CopyToFrameBuffer(uint32 id, const fill_rect_params *list,
+	uint32 count)
+{
+	if (!fEngine)
+		return B_UNSUPPORTED;
+	std::lock_guard<std::recursive_mutex> lock(fEngine->Lock());
+	if (fEngine->IsLost() || !fEngine->Target().IsSet())
+		return B_ERROR;
+	const Source *source = nullptr;
+	for (const auto &entry: fSources) {
+		if (entry.id == id)
+			source = &entry;
+	}
+	if (source == nullptr)
+		return B_BAD_VALUE;
+
+	clipping_rect rects[64];
+	while (count > 0) {
+		uint32 chunk = std::min<uint32>(count, B_COUNT_OF(rects));
+		for (uint32 i = 0; i < chunk; i++)
+			rects[i] = {list[i].left, list[i].top, list[i].right, list[i].bottom};
+		fEngine->Copy(source->surface, fEngine->Target(), rects, chunk);
+		list += chunk;
+		count -= chunk;
+	}
+	return fEngine->Wait(fEngine->Submit()) ? B_OK : B_ERROR;
 }
 
 void NvAccelerant::Uninit()
@@ -1105,6 +1425,7 @@ void NvAccelerant::SetDisplayMode(display_mode* modeToSet)
 	fFramebuffer = std::move(newFramebuffer);
 
 	PublishScanout();
+	UpdateEngineTarget();
 
 	RefreshVblankReports();
 
@@ -1270,6 +1591,7 @@ void NvAccelerant::SetLayoutMode(const display_mode &mode)
 	fFramebuffer = std::move(newFramebuffer);
 
 	PublishScanout();
+	UpdateEngineTarget();
 
 	RefreshVblankReports();
 
@@ -2044,6 +2366,24 @@ void NvAccelerant::GetFrameBufferConfig(frame_buffer_config* frameBuffer)
 {
 	debug_printf("NvAccelerant::GetFrameBufferConfig\n");
 
+	if (fIsClone) {
+		if (fEngine) {
+			std::lock_guard<std::recursive_mutex> lock(fEngine->Lock());
+			UpdateCloneTarget();
+		} else
+			UpdateCloneTarget();
+		if (fCloneFramebuffer.Get() == 0)
+			RaiseErrno(ENOENT);
+		if (!fCloneMapping.IsSet()) {
+			fCloneMapping = fRmDev.MapMemory(fCloneFramebuffer.Get(), false, 0,
+				(fCloneScanout.size + B_PAGE_SIZE - 1) & ~(uint64)(B_PAGE_SIZE - 1), 0);
+		}
+		frameBuffer->frame_buffer = fCloneMapping.Address();
+		frameBuffer->frame_buffer_dma = nullptr;
+		frameBuffer->bytes_per_row = fCloneScanout.bytes_per_row;
+		return;
+	}
+
 	if (!fFramebuffer.IsSet()) {
 		RaiseErrno(ENOENT);
 	}
@@ -2447,8 +2787,47 @@ void NvAccelerant::SetCursorBitmap(uint16 width, uint16 height, uint16 hotX, uin
 
 
 
+// What a clone answers to: it draws, it does not set modes.
+static bool CloneOffers(uint32 feature)
+{
+	switch (feature) {
+		case B_ACCELERANT_CLONE_INFO_SIZE:
+		case B_GET_ACCELERANT_CLONE_INFO:
+		case B_CLONE_ACCELERANT:
+		case B_UNINIT_ACCELERANT:
+		case B_GET_ACCELERANT_DEVICE_INFO:
+		case B_GET_FRAME_BUFFER_CONFIG:
+			return true;
+		default:
+			return (feature >= B_ACCELERANT_ENGINE_COUNT
+					&& feature <= B_SCREEN_TO_SCREEN_SCALED_FILTERED_BLIT)
+				|| (feature >= B_CREATE_FRAME_BUFFER_SOURCE
+					&& feature <= B_COPY_TO_FRAME_BUFFER);
+	}
+}
+
+// The engine's hooks are only handed out while there is an engine.
+static bool EngineOffers(uint32 feature)
+{
+	NvAccelerant *instance = NvAccelerant::Instance();
+	if (feature >= B_SCREEN_TO_SCREEN_BLIT
+		&& feature <= B_SCREEN_TO_SCREEN_SCALED_FILTERED_BLIT)
+		return instance != nullptr && instance->HasEngine();
+	if (feature >= B_CREATE_FRAME_BUFFER_SOURCE
+		&& feature <= B_COPY_TO_FRAME_BUFFER)
+		return instance != nullptr && instance->HasEngine();
+	return true;
+}
+
+
 _EXPORT void *get_accelerant_hook(uint32 feature, void *data)
 {
+	NvAccelerant *instance = NvAccelerant::Instance();
+	if (instance != nullptr && instance->IsClone() && !CloneOffers(feature))
+		return nullptr;
+	if (!EngineOffers(feature))
+		return nullptr;
+
 	switch (feature) {
 		case B_INIT_ACCELERANT: {
 			init_accelerant fn = [](int fd) {
@@ -2770,6 +3149,144 @@ _EXPORT void *get_accelerant_hook(uint32 feature, void *data)
 				try {
 					NvAccelerant::Instance()->SetCursorBitmap(width, height, hotX, hotY, colorSpace, bytesPerRow, bitmapData);
 					return B_OK;
+				} catch (const std::system_error &ex) {
+					debug_printf("[!] nvidia_rm: %s\n", ex.what());
+					return ToErrorCode(ex);
+				}
+			};
+			return (void*)fn;
+		}
+
+		case B_ACCELERANT_ENGINE_COUNT: {
+			accelerant_engine_count fn = []() -> uint32 {
+				return NvAccelerant::Instance()->EngineCount();
+			};
+			return (void*)fn;
+		}
+		case B_ACQUIRE_ENGINE: {
+			acquire_engine fn = [](uint32 capabilities, uint32 maxWait,
+					sync_token* st, engine_token** et) -> status_t {
+				try {
+					return NvAccelerant::Instance()->AcquireEngine(capabilities,
+						maxWait, st, et);
+				} catch (const std::system_error &ex) {
+					debug_printf("[!] nvidia_rm: %s\n", ex.what());
+					return ToErrorCode(ex);
+				}
+			};
+			return (void*)fn;
+		}
+		case B_RELEASE_ENGINE: {
+			release_engine fn = [](engine_token* et, sync_token* st) -> status_t {
+				return NvAccelerant::Instance()->ReleaseEngine(et, st);
+			};
+			return (void*)fn;
+		}
+		case B_WAIT_ENGINE_IDLE: {
+			wait_engine_idle fn = []() {
+				NvAccelerant::Instance()->WaitEngineIdle();
+			};
+			return (void*)fn;
+		}
+		case B_GET_SYNC_TOKEN: {
+			get_sync_token fn = [](engine_token* et, sync_token* st) -> status_t {
+				return NvAccelerant::Instance()->GetSyncToken(et, st);
+			};
+			return (void*)fn;
+		}
+		case B_SYNC_TO_TOKEN: {
+			sync_to_token fn = [](sync_token* st) -> status_t {
+				return NvAccelerant::Instance()->SyncToToken(st);
+			};
+			return (void*)fn;
+		}
+
+		// The operations are queued while the engine is held and go to the
+		// GPU when it is released.
+		case B_SCREEN_TO_SCREEN_BLIT: {
+			screen_to_screen_blit fn = [](engine_token* et, blit_params* list,
+					uint32 count) {
+				NvEngine2D &engine = NvAccelerant::Instance()->Engine();
+				std::lock_guard<std::recursive_mutex> lock(engine.Lock());
+				engine.Blit(list, count);
+			};
+			return (void*)fn;
+		}
+		case B_FILL_RECTANGLE: {
+			fill_rectangle fn = [](engine_token* et, uint32 color,
+					fill_rect_params* list, uint32 count) {
+				NvEngine2D &engine = NvAccelerant::Instance()->Engine();
+				std::lock_guard<std::recursive_mutex> lock(engine.Lock());
+				engine.FillRectangles(color, list, count);
+			};
+			return (void*)fn;
+		}
+		case B_INVERT_RECTANGLE: {
+			invert_rectangle fn = [](engine_token* et, fill_rect_params* list,
+					uint32 count) {
+				NvEngine2D &engine = NvAccelerant::Instance()->Engine();
+				std::lock_guard<std::recursive_mutex> lock(engine.Lock());
+				engine.InvertRectangles(list, count);
+			};
+			return (void*)fn;
+		}
+		case B_FILL_SPAN: {
+			fill_span fn = [](engine_token* et, uint32 color, uint16* list,
+					uint32 count) {
+				NvEngine2D &engine = NvAccelerant::Instance()->Engine();
+				std::lock_guard<std::recursive_mutex> lock(engine.Lock());
+				engine.FillSpans(color, list, count);
+			};
+			return (void*)fn;
+		}
+		case B_SCREEN_TO_SCREEN_TRANSPARENT_BLIT: {
+			screen_to_screen_transparent_blit fn = [](engine_token* et,
+					uint32 transparentColor, blit_params* list, uint32 count) {
+				NvEngine2D &engine = NvAccelerant::Instance()->Engine();
+				std::lock_guard<std::recursive_mutex> lock(engine.Lock());
+				engine.TransparentBlit(transparentColor, list, count);
+			};
+			return (void*)fn;
+		}
+		case B_SCREEN_TO_SCREEN_SCALED_FILTERED_BLIT: {
+			screen_to_screen_scaled_filtered_blit fn = [](engine_token* et,
+					scaled_blit_params* list, uint32 count) {
+				NvEngine2D &engine = NvAccelerant::Instance()->Engine();
+				std::lock_guard<std::recursive_mutex> lock(engine.Lock());
+				engine.ScaledFilteredBlit(list, count);
+			};
+			return (void*)fn;
+		}
+
+		case B_CREATE_FRAME_BUFFER_SOURCE: {
+			create_frame_buffer_source fn = [](uint16 width, uint16 height,
+					color_space space, frame_buffer_source* source) -> status_t {
+				try {
+					return NvAccelerant::Instance()->CreateFrameBufferSource(width,
+						height, space, source);
+				} catch (const std::system_error &ex) {
+					debug_printf("[!] nvidia_rm: %s\n", ex.what());
+					return ToErrorCode(ex);
+				}
+			};
+			return (void*)fn;
+		}
+		case B_DELETE_FRAME_BUFFER_SOURCE: {
+			delete_frame_buffer_source fn = [](uint32 id) {
+				try {
+					NvAccelerant::Instance()->DeleteFrameBufferSource(id);
+				} catch (const std::system_error &ex) {
+					debug_printf("[!] nvidia_rm: %s\n", ex.what());
+				}
+			};
+			return (void*)fn;
+		}
+		case B_COPY_TO_FRAME_BUFFER: {
+			copy_to_frame_buffer fn = [](uint32 id, const fill_rect_params* list,
+					uint32 count) -> status_t {
+				try {
+					return NvAccelerant::Instance()->CopyToFrameBuffer(id, list,
+						count);
 				} catch (const std::system_error &ex) {
 					debug_printf("[!] nvidia_rm: %s\n", ex.what());
 					return ToErrorCode(ex);
