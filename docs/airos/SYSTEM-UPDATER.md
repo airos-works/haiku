@@ -192,8 +192,15 @@ loader cannot read BFS. So on the Pi:
 A release image has no Haiku package repository (upstream Haiku's `haiku`
 package would replace air/OS's) and no Deskbar entry for SoftwareUpdater,
 which would swap the release's own builds for HaikuPorts' versions.
-HaikuDepot keeps HaikuPorts for adding software; a package of the release
-that it updates is put back to the release's build by the next update.
+HaikuDepot keeps HaikuPorts for adding software. A package of the release
+that it updates follows the release again with the next update, unless the
+installed one is newer than the release's: a user's newer package stays
+(Electron apps built on a newer Aurora keep working). On a system that no
+release installed yet (converted in place, `SystemUpdater --update` on a
+development install) every package newer than the release's stays, except
+the system's own (`haiku*`, `airos_*`). `SystemUpdater --versions-to-keep N`
+sets how many older versions an update leaves (default 2), for example to
+keep a development install's old states for a while.
 
 ## Tested
 

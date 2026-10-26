@@ -44,7 +44,9 @@ static const char* const kUsage =
 	"                        what the desktop runs at each start: confirm a\n"
 	"                        new update, report a fallback\n"
 	"  --confirm             confirm the update on trial now\n"
-	"  --prune [<n>]         keep only <n> older versions (default 2)\n";
+	"  --prune [<n>]         keep only <n> older versions (default 2)\n"
+	"  --versions-to-keep <n>\n"
+	"                        how many older versions an update keeps\n";
 
 
 namespace {
@@ -491,6 +493,17 @@ run_command_line(int argc, char** argv)
 		status_t error = updater.Prune(keep < 1 ? 1 : keep, report);
 		printf("%s\n", report.IsEmpty() ? "Nothing to remove."
 			: report.String());
+		return error == B_OK ? 0 : 1;
+	}
+
+	if (strcmp(command, "--versions-to-keep") == 0 && argument != NULL
+		&& atoi(argument) >= 1) {
+		Settings settings;
+		settings.Load();
+		settings.versionsToKeep = atoi(argument);
+		status_t error = settings.Save();
+		printf("An update keeps %" B_PRId32 " older version(s).\n",
+			settings.versionsToKeep);
 		return error == B_OK ? 0 : 1;
 	}
 
