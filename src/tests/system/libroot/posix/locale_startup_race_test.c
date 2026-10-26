@@ -24,6 +24,10 @@
 #define kScanners		3
 #define kConverters		4
 
+// 14 November 2023: the same year in every time zone, even on a machine
+// whose clock still says 1970.
+static const time_t kTime = 1700000000;
+
 
 static volatile bool sStart = false;
 static volatile bool sDone = false;
@@ -59,9 +63,8 @@ converter(void* unused)
 	while (!__atomic_load_n(&sStart, __ATOMIC_ACQUIRE))
 		;
 
-	time_t now = time(NULL);
 	struct tm converted;
-	if (localtime_r(&now, &converted) == NULL || converted.tm_year < 120)
+	if (localtime_r(&kTime, &converted) == NULL || converted.tm_year != 123)
 		__atomic_add_fetch(&sFailures, 1, __ATOMIC_SEQ_CST);
 
 	return NULL;
@@ -88,9 +91,8 @@ run_cold()
 	while (__atomic_load_n(&sScans, __ATOMIC_SEQ_CST) < 1000)
 		;
 
-	time_t now = time(NULL);
 	struct tm converted;
-	if (localtime_r(&now, &converted) == NULL)
+	if (localtime_r(&kTime, &converted) == NULL)
 		__atomic_add_fetch(&sFailures, 1, __ATOMIC_SEQ_CST);
 
 	__atomic_store_n(&sDone, true, __ATOMIC_RELEASE);
