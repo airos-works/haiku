@@ -175,6 +175,16 @@ Mesa's V3D and V3DV with the same flags and rebuilds the Pi's objects when
 the profile changes, because jam does not rebuild objects for changed flags.
 Revert with `RPI4_CPU_PROFILE = none ;` (lab) or by removing the call (CI).
 
+The first CI image built this way (release 20261026-0532-hrev60207-1963,
+run 40271955455) was checked the same day: the build log shows the forced
+rebuild of the Pi's objects; its kernel has 4 helper calls (the generic
+arm64 kernel 1194) and its `haiku.hpkg` inline exclusive loops instead of
+helper calls; its Mesa files are byte-identical to the tuned V3D/V3DV builds.
+Written fresh to the lab card, it booted to the desktop (`uname -v`
+hrev60207+1963, 4 Cortex-A72 at 1800 MHz), and the 3000-file test took
+5847 ms (median of 3), in line with the tuned lab images, not the generic
+ones.
+
 Lab procedure without the HA plug (it powers the Dragon since 24 October):
 `evidence/cpu-tuning-native-20261026/pi-flash.sh <image>` attaches the
 recovery disk on the NanoKVM (now 192.168.1.30), restarts air/OS from telnet,
