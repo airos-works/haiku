@@ -13,7 +13,11 @@
  * another driver, and with a monitor or a force_edid setting), and checks
  * the same on the real frame buffer.
  *
- * usage: nvclone2dtest [--init] <accelerant>
+ * With --attach it clones the accelerant app_server runs, as a BWindowScreen
+ * program would, tests on the top left 1280x720 of the real screen and puts
+ * those pixels back afterwards.
+ *
+ * usage: nvclone2dtest [--init | --attach] <accelerant>
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -81,8 +85,9 @@ static void Check(const char *what, const std::vector<uint32> &expected,
 int main(int argc, char **argv)
 {
 	bool init = argc == 3 && strcmp(argv[1], "--init") == 0;
-	if (argc != 2 && !init) {
-		fprintf(stderr, "usage: nvclone2dtest [--init] <accelerant>\n");
+	bool attach = argc == 3 && strcmp(argv[1], "--attach") == 0;
+	if (argc != 2 && !init && !attach) {
+		fprintf(stderr, "usage: nvclone2dtest [--init | --attach] <accelerant>\n");
 		return 2;
 	}
 	const char *accelerantPath = argv[argc - 1];
@@ -94,9 +99,13 @@ int main(int argc, char **argv)
 	}
 	nv_haiku_scanout_info published {};
 	if (ioctl(deviceFd, NV_HAIKU_BASE + NV_HAIKU_GET_SCANOUT, &published,
-			sizeof(published)) == 0 && published.memory != 0) {
+			sizeof(published)) == 0 && published.memory != 0 && !attach) {
 		fprintf(stderr, "a frame buffer is published (app_server is on this "
 			"card); not replacing it\n");
+		return 2;
+	}
+	if (attach && published.memory == 0) {
+		fprintf(stderr, "no frame buffer published: is app_server on this card?\n");
 		return 2;
 	}
 
@@ -121,7 +130,7 @@ int main(int argc, char **argv)
 		uint32 bytesPerRow = 0;
 		NvRmObject memory;
 		NvRmMemoryMapping mapping;
-		if (!init) {
+		if (!init && !attach) {
 			// the "screen": video memory, allocated and shared the way the
 			// accelerant does its frame buffers
 			bytesPerRow = (kWidth * 4 + 255) & ~255u;
@@ -168,6 +177,17 @@ int main(int argc, char **argv)
 			printf("%s init: %s\n", status == B_OK ? "ok  " : "FAIL", strerror(status));
 			if (status != B_OK)
 				return 1;
+			// as app_server does: the first mode listed is the layout's
+			uint32 count = ((accelerant_mode_count)hook(B_ACCELERANT_MODE_COUNT,
+				NULL))();
+			std::vector<display_mode> modes(count);
+			if (count == 0
+				|| ((get_mode_list)hook(B_GET_MODE_LIST, NULL))(modes.data()) != B_OK
+				|| ((set_display_mode)hook(B_SET_DISPLAY_MODE, NULL))(&modes[0])
+					!= B_OK) {
+				printf("FAIL setting the first listed mode\n");
+				return 1;
+			}
 			display_mode mode {};
 			((get_display_mode)hook(B_GET_DISPLAY_MODE, NULL))(&mode);
 			kWidth = std::min<uint32>(mode.virtual_width, 1920);
@@ -222,9 +242,19 @@ int main(int argc, char **argv)
 		// the clone's view of the screen is the same memory
 		frame_buffer_config config {};
 		fbConfig(&config);
-		if (init) {
+		std::vector<uint32> saved;
+		if (init || attach) {
 			bits = (uint32*)config.frame_buffer;
 			bytesPerRow = config.bytes_per_row;
+			if (attach) {
+				kWidth = std::min<uint32>(published.width, kWidth);
+				kHeight = std::min<uint32>(published.height, kHeight);
+				saved.resize((size_t)kWidth * kHeight);
+				for (uint32 y = 0; y < kHeight; y++) {
+					memcpy(&saved[(size_t)y * kWidth],
+						(uint8*)bits + (size_t)y * bytesPerRow, kWidth * 4);
+				}
+			}
 		} else {
 			bits[5] = 0x12345678;
 			bool same = config.frame_buffer != NULL
@@ -352,6 +382,13 @@ int main(int argc, char **argv)
 				strerror(status));
 			Check("what the copy left on the screen", expected, bits, stride);
 			deleteSource(source.id);
+		}
+
+		if (attach) {
+			for (uint32 y = 0; y < kHeight; y++) {
+				memcpy((uint8*)bits + (size_t)y * bytesPerRow,
+					&saved[(size_t)y * kWidth], kWidth * 4);
+			}
 		}
 
 		auto uninit = (uninit_accelerant)hook(B_UNINIT_ACCELERANT, NULL);
