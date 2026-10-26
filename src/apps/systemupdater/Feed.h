@@ -41,6 +41,9 @@ public:
 			bool				IsCancelled() const;
 			void				Reset()
 									{ fCancelled = 0; }
+			time_t				ServerTime() const
+									{ return fServerTime; }
+									// from the last answer's Date header
 
 private:
 			status_t			_Fetch(const BString& url, BDataIO* output,
@@ -53,6 +56,7 @@ private:
 
 			int32				fCancelled;
 			void*				fRequest;
+			time_t				fServerTime;
 				// the running BUrlRequest
 };
 

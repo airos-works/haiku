@@ -1,0 +1,5 @@
+# The loader and boot archive of the air/OS version that starts. System
+# Updater rewrites this file to name another installed version's pair, in
+# airos/<version>/ (docs/airos/SYSTEM-UPDATER.md).
+kernel=airos-loader.img
+initramfs airos-boot.tgz followkernel

@@ -29,6 +29,11 @@ namespace json {
 }
 
 
+// Seconds since 1970 of a UTC date (month 1..12), without timegm().
+time_t	utc_time(int year, int month, int day, int hour, int minute,
+			int second);
+
+
 // A package of a release, as update.json lists it.
 struct ReleasePackage {
 	BString		name;

@@ -8,6 +8,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include <DataIO.h>
 #include <File.h>
@@ -85,8 +86,35 @@ private:
 Fetcher::Fetcher()
 	:
 	fCancelled(0),
-	fRequest(NULL)
+	fRequest(NULL),
+	fServerTime(0)
 {
+}
+
+
+/*!	An HTTP date, "Mon, 26 Oct 2026 03:04:05 GMT", or 0.
+*/
+static time_t
+parse_http_date(const char* text)
+{
+	static const char* const kMonths[] = { "Jan", "Feb", "Mar", "Apr", "May",
+		"Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+	char weekday[8], month[8];
+	struct tm tm = {};
+	if (text == NULL || sscanf(text, "%7[^,], %d %7s %d %d:%d:%d", weekday,
+			&tm.tm_mday, month, &tm.tm_year, &tm.tm_hour, &tm.tm_min,
+			&tm.tm_sec) != 7) {
+		return 0;
+	}
+	tm.tm_mon = -1;
+	for (int i = 0; i < 12; i++) {
+		if (strcmp(month, kMonths[i]) == 0)
+			tm.tm_mon = i;
+	}
+	if (tm.tm_mon < 0)
+		return 0;
+	return utc_time(tm.tm_year, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
+		tm.tm_min, tm.tm_sec);
 }
 
 
@@ -233,8 +261,13 @@ Fetcher::_Fetch(const BString& url, BDataIO* output, off_t rangeStart,
 	uint16 code = 0;
 	const BHttpResult* result = dynamic_cast<const BHttpResult*>(
 		&request->Result());
-	if (result != NULL)
+	if (result != NULL) {
 		code = result->StatusCode();
+		time_t serverTime = parse_http_date(
+			result->Headers().HeaderValue("Date"));
+		if (serverTime > 0)
+			fServerTime = serverTime;
+	}
 	delete request;
 
 	if (IsCancelled()) {

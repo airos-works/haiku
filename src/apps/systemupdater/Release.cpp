@@ -139,6 +139,21 @@ json::Quote(const char* text)
 }
 
 
+time_t
+utc_time(int year, int month, int day, int hour, int minute, int second)
+{
+	// days since 1970-01-01 of a proleptic Gregorian date
+	year -= month <= 2;
+	int era = (year >= 0 ? year : year - 399) / 400;
+	int yearOfEra = year - era * 400;
+	int dayOfYear = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+	int dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100
+		+ dayOfYear;
+	int64 days = (int64)era * 146097 + dayOfEra - 719468;
+	return (time_t)(days * 86400 + hour * 3600 + minute * 60 + second);
+}
+
+
 // #pragma mark - Release
 
 

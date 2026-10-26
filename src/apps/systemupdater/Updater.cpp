@@ -383,6 +383,8 @@ Updater::Check(Feed& _feed, BString& _error)
 	BString url = FeedURL();
 	_Status("Asking %s…", url.String());
 	status_t error = _feed.Fetch(url, fFetcher, _error);
+	if (error == B_OK)
+		_CheckClock();
 	if (error == B_OK) {
 		BString when;
 		when << time_stamp() << "\n";
@@ -567,9 +569,55 @@ Updater::_SaveReleaseRecord(const Release& release)
 }
 
 
+/*!	The time the installed release was built, or 0.
+*/
+static time_t
+installed_build_time(const Release& release)
+{
+	struct tm tm = {};
+	if (sscanf(release.Built().String(), "%d-%d-%dT%d:%d:%d", &tm.tm_year,
+			&tm.tm_mon, &tm.tm_mday, &tm.tm_hour, &tm.tm_min, &tm.tm_sec) != 6)
+		return 0;
+	return utc_time(tm.tm_year, tm.tm_mon, tm.tm_mday, tm.tm_hour, tm.tm_min,
+		tm.tm_sec);
+}
+
+
+/*!	Package states are named after the time and the boot loader orders them
+	by name, so they need a clock that is about right. Boards without a
+	battery-backed clock (the Pi, the Cubie) start in 1970 until they reach a
+	time server: a clock before the installed release's own build is
+	certainly wrong, and the build server's is better.
+*/
+void
+Updater::_CheckClock()
+{
+	Release installed;
+	time_t built = LoadInstalledRelease(installed) == B_OK
+		? installed_build_time(installed) : 0;
+	time_t server = fFetcher.ServerTime();
+	time_t now = time(NULL);
+	if (built > 0 && now < built && server > now + 3600) {
+		set_real_time_clock(server);
+		Log("the clock was before this release was built; set it from the "
+			"build server's");
+	}
+}
+
+
 status_t
 Updater::CheckPreconditions(const SystemState& state, BString& _error) const
 {
+	Release installed;
+	time_t built = LoadInstalledRelease(installed) == B_OK
+		? installed_build_time(installed) : 0;
+	if (built > 0 && time(NULL) < built) {
+		_error = "The clock is wrong: it is earlier than when this version "
+			"of air/OS was made. Set the date and time in the Time "
+			"preferences first, since air/OS names its versions by time.";
+		return B_BAD_VALUE;
+	}
+
 	if (!state.RunningLatest()) {
 		_error = "air/OS is running an older version. Restart into the "
 			"current version, or go back to this one, first.";
