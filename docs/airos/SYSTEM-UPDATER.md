@@ -242,7 +242,10 @@ build once with its own kernel; the new loader's menu named both builds;
 below, the second confirmed it); an update from a feed with `equivalent`
 packages then kept their installed copies. The arm64 image of a CI build
 installed and was updated to the next CI build the same way (trial
-confirmed, `BOOTAA64.EFI` replaced).
+confirmed, `BOOTAA64.EFI` replaced). Two more CI builds later the x86_64
+machine, now with a System Updater that reads `equivalent`, went to the next
+build with 11 packages (153 MiB) instead of the whole set, and the
+confirmation pruned it to the current version and two older releases.
 
 Known: about one start in fifteen in QEMU (and one smoke test in forty on
 CI) stops before the desktop, also without System Updater; an update that
