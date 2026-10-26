@@ -7,6 +7,7 @@
 #include "UnpackingDirectory.h"
 
 #include "ClassCache.h"
+#include "Package.h"
 #include "DebugSupport.h"
 #include "EmptyAttributeDirectoryCookie.h"
 #include "UnpackingAttributeCookie.h"
@@ -78,13 +79,33 @@ UnpackingDirectory::GroupID() const
 }
 
 
+static inline bool
+is_later(const timespec& time, const timespec& other)
+{
+	return time.tv_sec > other.tv_sec
+		|| (time.tv_sec == other.tv_sec && time.tv_nsec > other.tv_nsec);
+}
+
+
+/*!	The latest time of the directory in the packages that have it, and of
+	those packages' files: a package that is put in place later changes the
+	directory's contents, so caches that go by its time (fontconfig's font
+	caches, for example) see its new entries.
+*/
 timespec
 UnpackingDirectory::ModifiedTime() const
 {
-	if (PackageDirectory* packageDirectory = fPackageDirectories.Head())
-		return packageDirectory->ModifiedTime();
-
 	timespec time = { 0, 0 };
+	PackageDirectoryList::ConstIterator it = fPackageDirectories.GetIterator();
+	while (PackageDirectory* packageDirectory = it.Next()) {
+		timespec directoryTime = packageDirectory->ModifiedTime();
+		if (is_later(directoryTime, time))
+			time = directoryTime;
+
+		BReference<Package> package = packageDirectory->GetPackage();
+		if (package.IsSet() && is_later(package->FileModifiedTime(), time))
+			time = package->FileModifiedTime();
+	}
 	return time;
 }
 
