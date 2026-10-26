@@ -226,6 +226,24 @@ Updater::PackageNameOf(const char* fileName)
 
 
 /*static*/ BString
+Updater::VersionOf(const char* fileName)
+{
+	// "<name>-<version>-<revision>-<architecture>.hpkg" -> "<version>-<revision>"
+	BString version(fileName);
+	if (!version.EndsWith(".hpkg"))
+		return BString();
+	version.Truncate(version.Length() - 5);
+	int32 first = version.FindFirst('-');
+	int32 last = version.FindLast('-');
+	if (first < 0 || last <= first)
+		return BString();
+	version.Truncate(last);
+	version.Remove(0, first + 1);
+	return version;
+}
+
+
+/*static*/ BString
 Updater::FormatSize(off_t size)
 {
 	BString text;
@@ -672,6 +690,7 @@ Updater::PlanUpdate(const Release& release, const SystemState& state,
 	// nothing is dropped.
 	Release installed;
 	BStringList previousNames;
+	BStringList previousVersions;
 	if (LoadInstalledRelease(installed) == B_OK) {
 		Release record;
 		bool haveRecord = _LoadReleaseRecord(installed.Id(), record) == B_OK
@@ -689,6 +708,7 @@ Updater::PlanUpdate(const Release& release, const SystemState& state,
 			for (int32 i = 0; const ReleasePackage* package
 					= record.Packages().ItemAt(i); i++) {
 				previousNames.Add(package->name);
+				previousVersions.Add(package->version);
 			}
 		}
 	}
@@ -718,14 +738,54 @@ Updater::PlanUpdate(const Release& release, const SystemState& state,
 		}
 	}
 
+	// A package of the user's own that is newer than the release's stays,
+	// rather than going back to an older version that what the user built on
+	// it may not work with (Electron apps on a newer Aurora): one updated from
+	// HaikuDepot, or any of a system no release installed (converted in
+	// place). What the installed release brought follows the release, and so
+	// do the system's own packages.
+	BStringList userNewer;
+	for (int32 i = 0; i < latest->packages.CountStrings(); i++) {
+		const BString& file = latest->packages.StringAt(i);
+		BString name = PackageNameOf(file);
+		if (name.StartsWith("haiku") || name.StartsWith("airos_")
+			|| name == "makefile_engine") {
+			continue;
+		}
+		BString installedVersion = VersionOf(file);
+		BPackageVersion version;
+		if (installedVersion.IsEmpty() || version.SetTo(installedVersion) != B_OK)
+			continue;
+		int32 previous = previousNames.IndexOf(name);
+		if (previous >= 0
+			&& previousVersions.StringAt(previous) == installedVersion) {
+			continue;
+		}
+		bool newer = false;
+		for (int32 j = 0; const ReleasePackage* package
+				= release.Packages().ItemAt(j); j++) {
+			BPackageVersion releaseVersion;
+			if (package->name != name || skippedFiles.HasString(package->file)
+				|| releaseVersion.SetTo(package->version) != B_OK) {
+				continue;
+			}
+			newer = version.Compare(releaseVersion) > 0;
+			break;
+		}
+		if (newer)
+			userNewer.Add(name);
+	}
+
 	BStringList releaseNames;
 	BStringList releaseFiles;
 	for (int32 i = 0; const ReleasePackage* package
 			= release.Packages().ItemAt(i); i++) {
 		if (package->optional && !installedNames.HasString(package->name))
 			continue;
-		if (skippedFiles.HasString(package->file))
+		if (skippedFiles.HasString(package->file)
+			|| userNewer.HasString(package->name)) {
 			continue;
+		}
 		releaseNames.Add(package->name);
 		releaseFiles.Add(package->file);
 	}
@@ -735,7 +795,8 @@ Updater::PlanUpdate(const Release& release, const SystemState& state,
 	for (int32 i = 0; i < count; i++) {
 		const ReleasePackage* package = release.Packages().ItemAt(i);
 		if ((package->optional && !installedNames.HasString(package->name))
-			|| skippedFiles.HasString(package->file)) {
+			|| skippedFiles.HasString(package->file)
+			|| userNewer.HasString(package->name)) {
 			continue;
 		}
 		_Status("Comparing %s (%" B_PRId32 " of %" B_PRId32 ")…",
@@ -775,7 +836,9 @@ Updater::PlanUpdate(const Release& release, const SystemState& state,
 		if (releaseFiles.HasString(file))
 			continue;
 		BString name = PackageNameOf(file);
-		if (releaseNames.HasString(name) || previousNames.HasString(name))
+		if (userNewer.HasString(name))
+			_plan.kept.Add(file);
+		else if (releaseNames.HasString(name) || previousNames.HasString(name))
 			_plan.deactivate.Add(file);
 		else
 			_plan.kept.Add(file);

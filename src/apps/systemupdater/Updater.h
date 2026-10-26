@@ -122,6 +122,7 @@ public:
 									UpdaterListener* listener = NULL,
 									int32* cancelled = NULL);
 	static	BString				PackageNameOf(const char* fileName);
+	static	BString				VersionOf(const char* fileName);
 	static	BString				FormatSize(off_t size);
 
 private:
