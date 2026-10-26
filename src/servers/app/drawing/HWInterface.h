@@ -221,6 +221,18 @@ protected:
 			status_t			_AddFlushTarget(uint32 outputID,
 									const char* name);
 			void				_AbandonFlushing();
+			void				_ReleaseFlushShadows();
+
+	// The flush's shadows can be memory the graphics device reads, which it
+	// then copies to the screen itself; the CPU only draws. Without that,
+	// shadows are ordinary memory and the CPU copies.
+	virtual	RenderingBuffer*	_CreateFlushShadow(uint32 width,
+									uint32 height);
+	virtual	bool				_DeviceCopiesShadows() const
+									{ return false; }
+	virtual	bool				_CopyShadowByDevice(RenderingBuffer* shadow,
+									const BRegion& region)
+									{ return false; }
 
 private:
 			struct FlushWorker;
@@ -389,6 +401,9 @@ private:
 				bool			used;
 			};
 			ShadowWrite			fShadowWrites[32];
+			volatile bool		fDeviceCopyOff;
+									// the no_device_copy file: the CPU
+									// copies from the device's shadows
 };
 
 #endif // HW_INTERFACE_H

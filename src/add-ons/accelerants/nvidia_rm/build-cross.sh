@@ -47,7 +47,7 @@ FLAGS=(-O2 -fpic -nostdinc -D_DEFAULT_SOURCE -DNV_PLATFORM_MAX_IOCTL_SIZE=16384
 OBJDIR=$WORK/accelerant-obj
 mkdir -p "$OBJDIR" "$OUT/add-ons/accelerants"
 pids=()
-for f in Accelerant NvUtils NvKmsBitmap sdk/ErrorUtils sdk/NvRmApi sdk/NvRmDevice \
+for f in Accelerant NvUtils NvKmsBitmap NvEngine2D sdk/ErrorUtils sdk/NvRmApi sdk/NvRmDevice \
 		sdk/NvKmsApi sdk/NvKmsDevice sdk/NvKmsSurface; do
 	$TOOLS-g++ -std=c++20 "${FLAGS[@]}" -c "$SRC/$f.cpp" \
 		-o "$OBJDIR/$(basename $f).o" & pids+=($!)
@@ -162,3 +162,41 @@ $TOOLS-g++ -nostdlib -o "$OUT/bin/nvlayoutcheck" \
 	"$GCCLIB/crtend.o" "$OBJ/system/glue/arch/x86_64/crtn.o" \
 	-Wl,--no-undefined -Wl,-rpath-link,"$BUILD"
 echo "built nvlayoutcheck into $OUT/bin"
+
+# Diagnostic tool: checks the 2D engine against the CPU and times it (see
+# TwoDTest.cpp).
+TOOLDIR=$OBJDIR/nv2dtest
+mkdir -p "$TOOLDIR"
+for f in TwoDTest NvEngine2D sdk/ErrorUtils sdk/NvRmApi sdk/NvRmDevice; do
+	$TOOLS-g++ -std=c++20 "${FLAGS[@]}" -c "$SRC/$f.cpp" -o "$TOOLDIR/$(basename $f).o"
+done
+$TOOLS-gcc "${FLAGS[@]}" -c "$OGKM/src/common/shared/nvstatus/nvstatus.c" \
+	-o "$TOOLDIR/nvstatus.o"
+$TOOLS-g++ -nostdlib -o "$OUT/bin/nv2dtest" \
+	"$OBJ/system/glue/arch/x86_64/crti.o" "$GCCLIB/crtbegin.o" \
+	"$OBJ/system/glue/start_dyn.o" "$OBJ/system/glue/init_term_dyn.o" \
+	"$TOOLDIR"/*.o \
+	"$OBJ/system/libroot/libroot.so" "$GCC_SYSLIBS_RUNTIME/lib/libstdc++.so" \
+	"$GCC_SYSLIBS_RUNTIME/lib/libgcc_s.so" "$GCCLIB/libgcc.a" \
+	"$GCCLIB/crtend.o" "$OBJ/system/glue/arch/x86_64/crtn.o" \
+	-Wl,--no-undefined -Wl,-rpath-link,"$BUILD"
+echo "built nv2dtest into $OUT/bin"
+
+# Diagnostic tool: the accelerant's 2D hooks through a clone, as a
+# BWindowScreen program uses them (see CloneTwoDTest.cpp).
+TOOLDIR=$OBJDIR/nvclone2dtest
+mkdir -p "$TOOLDIR"
+for f in CloneTwoDTest NvUtils sdk/ErrorUtils sdk/NvRmApi sdk/NvRmDevice sdk/NvKmsApi sdk/NvKmsDevice sdk/NvKmsSurface; do
+	$TOOLS-g++ -std=c++20 "${FLAGS[@]}" -c "$SRC/$f.cpp" -o "$TOOLDIR/$(basename $f).o"
+done
+$TOOLS-gcc "${FLAGS[@]}" -c "$OGKM/src/common/shared/nvstatus/nvstatus.c" \
+	-o "$TOOLDIR/nvstatus.o"
+$TOOLS-g++ -nostdlib -o "$OUT/bin/nvclone2dtest" \
+	"$OBJ/system/glue/arch/x86_64/crti.o" "$GCCLIB/crtbegin.o" \
+	"$OBJ/system/glue/start_dyn.o" "$OBJ/system/glue/init_term_dyn.o" \
+	"$TOOLDIR"/*.o \
+	"$OBJ/system/libroot/libroot.so" "$GCC_SYSLIBS_RUNTIME/lib/libstdc++.so" \
+	"$GCC_SYSLIBS_RUNTIME/lib/libgcc_s.so" "$GCCLIB/libgcc.a" \
+	"$GCCLIB/crtend.o" "$OBJ/system/glue/arch/x86_64/crtn.o" \
+	-Wl,--no-undefined -Wl,-rpath-link,"$BUILD"
+echo "built nvclone2dtest into $OUT/bin"

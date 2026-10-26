@@ -61,9 +61,11 @@ NvU32 NvRmDevice::GpuId() const
 }
 
 
-NvRmMemoryMapping NvRmDevice::MapMemory(NvHandle hMemory, bool isSystemMemory, NvU64 offset, NvU64 length, NvU32 flags)
+NvRmMemoryMapping NvRmDevice::MapMemory(NvHandle hMemory, bool isSystemMemory, NvU64 offset, NvU64 length, NvU32 flags, NvHandle hParent)
 {
 	NvRmApi &rm = *fDevice.Rm();
+	if (hParent == 0)
+		hParent = fDevice.Get();
 
 	void *pLinearAddress {};
 
@@ -77,7 +79,7 @@ NvRmMemoryMapping NvRmDevice::MapMemory(NvHandle hMemory, bool isSystemMemory, N
 	}
 	assert(memFd.IsSet());
 
-	rm.MapMemory(fDevice.Get(), hMemory, offset, length, pLinearAddress, flags, memFd.Get());
+	rm.MapMemory(hParent, hMemory, offset, length, pLinearAddress, flags, memFd.Get());
 
 #ifdef __HAIKU__
 	nv_haiku_map_params mapParams {
@@ -92,11 +94,11 @@ NvRmMemoryMapping NvRmDevice::MapMemory(NvHandle hMemory, bool isSystemMemory, N
 	// where RM put it, which pLinearAddress tells us.
 	void *address = (uint8*)mapParams.address
 		+ ((addr_t)pLinearAddress & (B_PAGE_SIZE - 1));
-	return NvRmMemoryMapping(rm, fDevice.Get(), hMemory, pLinearAddress, flags, address, length, ret);
+	return NvRmMemoryMapping(rm, hParent, hMemory, pLinearAddress, flags, address, length, ret);
 #else
 	void *address = (void*)mmap(0, length, PROT_READ|PROT_WRITE, MAP_SHARED, memFd.Get(), 0);
 	assert(address != MAP_FAILED); // TODO: call rm.UnmapMemory on fail
-	return NvRmMemoryMapping(rm, fDevice.Get(), hMemory, pLinearAddress, flags, address, length);
+	return NvRmMemoryMapping(rm, hParent, hMemory, pLinearAddress, flags, address, length);
 #endif
 }
 

@@ -155,6 +155,10 @@ AccelerantHWInterface::AccelerantHWInterface()
 	fAccGetDisplayOutputScanLine(NULL),
 	fDisplayChangePort(-1),
 	fDisplayChangeThread(-1),
+	fAccCreateFrameBufferSource(NULL),
+	fAccDeleteFrameBufferSource(NULL),
+	fAccCopyToFrameBuffer(NULL),
+	fDeviceCopyFailed(false),
 
 	fModeCount(0),
 	fModeList(NULL),
@@ -457,6 +461,21 @@ AccelerantHWInterface::_SetupDefaultHooks()
 	fAccGetDisplayOutputScanLine
 		= (get_display_output_scan_line)fAccelerantHook(
 			B_GET_DISPLAY_OUTPUT_SCAN_LINE, NULL);
+	// copies to the screen by the device
+	fAccCreateFrameBufferSource = (create_frame_buffer_source)fAccelerantHook(
+		B_CREATE_FRAME_BUFFER_SOURCE, NULL);
+	fAccDeleteFrameBufferSource = (delete_frame_buffer_source)fAccelerantHook(
+		B_DELETE_FRAME_BUFFER_SOURCE, NULL);
+	fAccCopyToFrameBuffer = (copy_to_frame_buffer)fAccelerantHook(
+		B_COPY_TO_FRAME_BUFFER, NULL);
+	if (fAccCreateFrameBufferSource == NULL
+		|| fAccDeleteFrameBufferSource == NULL
+		|| fAccCopyToFrameBuffer == NULL) {
+		fAccCreateFrameBufferSource = NULL;
+		fAccDeleteFrameBufferSource = NULL;
+		fAccCopyToFrameBuffer = NULL;
+	}
+
 	if (fAccGetDisplayOutputCount == NULL || fAccGetDisplayOutputs == NULL
 		|| fAccSetDisplayLayout == NULL) {
 		fAccGetDisplayOutputCount = NULL;
@@ -557,6 +576,8 @@ status_t
 AccelerantHWInterface::Shutdown()
 {
 	_StopFlushing();
+	// their memory may be the accelerant's
+	_ReleaseFlushShadows();
 
 	if (fDisplayChangeThread >= 0) {
 		if (fAccSetDisplayChangePort != NULL)
@@ -1796,6 +1817,108 @@ AccelerantHWInterface::MoveCursorTo(float x, float y)
 
 		fCursorHookLock.Unlock();
 	}
+}
+
+
+// #pragma mark - copies by the device
+
+
+/*!	A shadow of the back buffer in memory the graphics device reads: what
+	is drawn there, the device copies to the screen (_CopyShadowByDevice()).
+*/
+class DeviceSourceBuffer : public RenderingBuffer {
+public:
+	DeviceSourceBuffer(const frame_buffer_source& source,
+			delete_frame_buffer_source deleteSource)
+		:
+		fSource(source),
+		fDelete(deleteSource)
+	{
+	}
+
+	virtual ~DeviceSourceBuffer()
+	{
+		fDelete(fSource.id);
+	}
+
+	virtual	status_t InitCheck() const { return B_OK; }
+	virtual	color_space ColorSpace() const { return B_RGBA32; }
+	virtual	void* Bits() const { return fSource.bits; }
+	virtual	uint32 BytesPerRow() const { return fSource.bytes_per_row; }
+	virtual	uint32 Width() const { return fSource.width; }
+	virtual	uint32 Height() const { return fSource.height; }
+
+	uint32 ID() const { return fSource.id; }
+
+private:
+	frame_buffer_source fSource;
+	delete_frame_buffer_source fDelete;
+};
+
+
+RenderingBuffer*
+AccelerantHWInterface::_CreateFlushShadow(uint32 width, uint32 height)
+{
+	if (fAccCreateFrameBufferSource != NULL && !fDeviceCopyFailed
+		&& width <= 65535 && height <= 65535) {
+		frame_buffer_source source = {};
+		if (fAccCreateFrameBufferSource(width, height, B_RGBA32, &source)
+				== B_OK) {
+			DeviceSourceBuffer* buffer = new(std::nothrow)
+				DeviceSourceBuffer(source, fAccDeleteFrameBufferSource);
+			if (buffer != NULL)
+				return buffer;
+			fAccDeleteFrameBufferSource(source.id);
+		} else {
+			syslog(LOG_WARNING, "app_server: the graphics device cannot read "
+				"the back buffer's shadow, the CPU copies to the screen\n");
+		}
+	}
+	return HWInterface::_CreateFlushShadow(width, height);
+}
+
+
+bool
+AccelerantHWInterface::_DeviceCopiesShadows() const
+{
+	return fAccCopyToFrameBuffer != NULL && !fDeviceCopyFailed;
+}
+
+
+bool
+AccelerantHWInterface::_CopyShadowByDevice(RenderingBuffer* shadow,
+	const BRegion& region)
+{
+	if (fAccCopyToFrameBuffer == NULL || fDeviceCopyFailed)
+		return false;
+	DeviceSourceBuffer* source = dynamic_cast<DeviceSourceBuffer*>(shadow);
+	if (source == NULL)
+		return false;
+
+	// the region's rects, as the hook takes them
+	fill_rect_params rects[64];
+	int32 count = region.CountRects();
+	for (int32 i = 0; i < count; ) {
+		uint32 chunk = 0;
+		for (; chunk < B_COUNT_OF(rects) && i < count; chunk++, i++) {
+			clipping_rect r = region.RectAtInt(i);
+			rects[chunk].left = r.left;
+			rects[chunk].top = r.top;
+			rects[chunk].right = r.right;
+			rects[chunk].bottom = r.bottom;
+		}
+		if (fAccCopyToFrameBuffer(source->ID(), rects, chunk) != B_OK) {
+			// the device is gone for good: the CPU copies from now on, from
+			// these shadows still (they are ordinary memory to the CPU)
+			if (!fDeviceCopyFailed) {
+				syslog(LOG_ERR, "app_server: the graphics device failed to "
+					"copy to the screen, the CPU copies from now on\n");
+			}
+			fDeviceCopyFailed = true;
+			return false;
+		}
+	}
+	return true;
 }
 
 

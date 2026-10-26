@@ -56,7 +56,9 @@ public:
 	NvU32 DevFsIndex() const;
 	NvU32 GpuId() const;
 
-	NvRmMemoryMapping MapMemory(NvHandle hMemory, bool isSystemMemory, NvU64 offset, NvU64 length, NvU32 flags);
+	// hParent is the device unless given: a channel's USERD, for one, is
+	// mapped through the subdevice.
+	NvRmMemoryMapping MapMemory(NvHandle hMemory, bool isSystemMemory, NvU64 offset, NvU64 length, NvU32 flags, NvHandle hParent = 0);
 	FileDesc ExportObjectToFd(NvHandle hParent, NvHandle hObject);
 	NvRmObject ImportObjectFromFd(NvHandle hParent, int fd);
 };

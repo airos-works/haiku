@@ -110,6 +110,12 @@ protected:
 
 	virtual	void				_DrawCursor(IntRect area) const;
 
+	virtual	RenderingBuffer*	_CreateFlushShadow(uint32 width,
+									uint32 height);
+	virtual	bool				_DeviceCopiesShadows() const;
+	virtual	bool				_CopyShadowByDevice(RenderingBuffer* shadow,
+									const BRegion& region);
+
 private:
 			int					_OpenGraphicsDevice(int deviceNumber);
 			bool				_RecursiveScan(const char* directory, int deviceNumber,
@@ -205,6 +211,12 @@ private:
 								fAccGetDisplayOutputScanLine;
 			port_id				fDisplayChangePort;
 			thread_id			fDisplayChangeThread;
+
+			// copies to the screen made by the device
+			create_frame_buffer_source fAccCreateFrameBufferSource;
+			delete_frame_buffer_source fAccDeleteFrameBufferSource;
+			copy_to_frame_buffer fAccCopyToFrameBuffer;
+			bool				fDeviceCopyFailed;
 
 			frame_buffer_config	fFrameBufferConfig;
 			int					fModeCount;
