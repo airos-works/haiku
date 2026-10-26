@@ -247,12 +247,11 @@ machine, now with a System Updater that reads `equivalent`, went to the next
 build with 11 packages (153 MiB) instead of the whole set, and the
 confirmation pruned it to the current version and two older releases.
 
-Known: about one start in fifteen in QEMU (and one smoke test in forty on
-CI) stops before the desktop, also without System Updater; an update that
-meets it twice in a row falls back and can be tried again. When it happens,
-neither net_server nor app_server has started (no network or graphics driver
-loads after the package daemon's volume check), every CPU idles in
-`halt_idle`, and an NMI does not reach the kernel debugger: some server
-everything waits for (the registrar?) is stuck. It is older than System
-Updater; only the launch file's single `requires` (first-login) goes through
-the launch_daemon change of this branch, and that is in the user session.
+Fixed (2026-10-26): about one start in ten in QEMU (and one CI smoke test in
+forty) stopped before the desktop, also without System Updater: a kernel
+deadlock in the network notifications module (net_server unloading it under
+the module lock while mount_server's first `start_watching_network()` call,
+inside the module's syscall, needed that lock). A test kernel with a boot
+watchdog caught it in KDL; with the module kept loaded, 40 starts in a row
+reached the desktop. An update that met it used a second start; that
+safety net stays for whatever else may stop a start.

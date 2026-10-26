@@ -146,12 +146,9 @@ notifications_std_ops(int32 op, ...)
 		case B_MODULE_UNINIT:
 			TRACE("uninit\n");
 
+			// Only at shutdown: the module is B_KEEP_LOADED (see below).
 			unregister_generic_syscall(NET_NOTIFICATIONS_SYSCALLS, 1);
 
-			// TODO: due to the way the locking in the notification
-			// manager works, there's a potential race condition here
-			// where someone attempts to add a listener right as
-			// we're uninitializing. Needs to be looked at/resolved.
 			sNotificationService.Unregister();
 
 			// we need to release the reference that was acquired
@@ -166,10 +163,18 @@ notifications_std_ops(int32 op, ...)
 }
 
 
+// air/OS: kept loaded. Unloading it ran unregister_generic_syscall(), which
+// waits for the callers inside the syscall, under the kernel's module lock
+// (put_module() of the stack module, when its last socket is closed). A
+// caller inside net_notifications_control() adding the first listener needs
+// that lock too (FirstAdded() calls get_module()): a deadlock early in the
+// boot, when net_server closes the socket it probes the address families
+// with while mount_server starts watching the network. Nothing past that
+// point started (no app_server), about one start in ten.
 net_notifications_module_info sNotificationsModule = {
 	{
 		NET_NOTIFICATIONS_MODULE_NAME,
-		0,
+		B_KEEP_LOADED,
 		notifications_std_ops
 	},
 
