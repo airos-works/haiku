@@ -46,6 +46,7 @@ public:
 									// from the last answer's Date header
 
 private:
+			void				_Pause(int32 attempt);
 			status_t			_Fetch(const BString& url, BDataIO* output,
 									off_t rangeStart, off_t outputSize,
 									BString& _error,

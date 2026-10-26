@@ -219,8 +219,16 @@ branch's CI scripts from the last CI build's inputs:
 - **arm64** (UEFI, TCG): install, update, trial start and confirmation; the
   clock set from the build server on a machine that believed it was 1970.
 - **Raspberry Pi 4** (QEMU raspi4b): the kernel, not the loader, counted a
-  trial start and started the fallback state. `airos-boot.txt` switching
-  needs the Pi's firmware, which QEMU does not run: not yet tested on a Pi.
+  trial start and started the fallback state.
+- **Raspberry Pi 4** (the board, 2026-10-26): the CI image of one build
+  flashed, updated by its own System Updater to the next build: the
+  firmware loaded `airos/20261026.0439/airos-loader.img` and its boot archive
+  as `airos-boot.txt` named them, and the trial was confirmed. *Restart into*
+  the older version started the image's own pair at the top of the FAT
+  partition (kernel hrev60207+1942) for that one start, and the boot check
+  pointed `airos-boot.txt` back at the current version. The first download
+  attempt stopped half-way ("Interrupted system call"); such failures are
+  now tried again, resuming the file.
 - **Cubie A7S**: the image and its release build; not booted.
 
 From CI to CI (2026-10-26), images and feed from the `air/OS images`
@@ -233,7 +241,8 @@ build once with its own kernel; the new loader's menu named both builds;
 *Go Back* made the older one current again (its first start met the stall
 below, the second confirmed it); an update from a feed with `equivalent`
 packages then kept their installed copies. The arm64 image of a CI build
-installed and found its feed.
+installed and was updated to the next CI build the same way (trial
+confirmed, `BOOTAA64.EFI` replaced).
 
 Known: about one start in fifteen in QEMU (and one smoke test in forty on
 CI) stops before the desktop, also without System Updater; an update that

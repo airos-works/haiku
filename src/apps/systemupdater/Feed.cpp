@@ -28,6 +28,32 @@ using namespace BPrivate::Network;
 
 // a transfer that has not moved for this long is given up
 static const bigtime_t kStallTimeout = 60000000;
+// how often a transfer that failed on the way is tried in all
+static const int32 kAttempts = 5;
+
+
+/*!	Whether trying again may help: anything but what the server answered
+	(HTTP 4xx), a bad address and cancelling. A transfer can also fail
+	half-way with a reset connection or an interrupted read (seen on the
+	Raspberry Pi: "Interrupted system call").
+*/
+static bool
+is_transient(status_t error)
+{
+	switch (error) {
+		case B_OK:
+		case B_CANCELED:
+		case B_ERROR:
+		case B_ENTRY_NOT_FOUND:
+		case B_BAD_VALUE:
+		case B_NOT_SUPPORTED:
+		case B_RESULT_NOT_REPRESENTABLE:
+		case B_BAD_DATA:
+			return false;
+		default:
+			return true;
+	}
+}
 
 
 DownloadListener::~DownloadListener()
@@ -145,7 +171,16 @@ Fetcher::FetchText(const BString& url, BString& _text, BString& _error,
 	size_t maxSize)
 {
 	BMallocIO output;
-	status_t error = _Fetch(url, &output, 0, -1, _error, NULL);
+	status_t error;
+	for (int32 attempt = 0; attempt < kAttempts; attempt++) {
+		if (attempt > 0)
+			_Pause(attempt);
+		output.SetSize(0);
+		output.Seek(0, SEEK_SET);
+		error = _Fetch(url, &output, 0, -1, _error, NULL);
+		if (!is_transient(error) || IsCancelled())
+			break;
+	}
 	if (error != B_OK)
 		return error;
 	if (output.BufferLength() > maxSize) {
@@ -168,7 +203,9 @@ Fetcher::FetchFile(const BString& url, const char* path, off_t expectedSize,
 		return error;
 	}
 
-	for (int attempt = 0; attempt < 5; attempt++) {
+	for (int32 attempt = 0; attempt < kAttempts; attempt++) {
+		if (attempt > 0)
+			_Pause(attempt);
 		off_t size = 0;
 		file.GetSize(&size);
 		if (expectedSize >= 0 && size > expectedSize) {
@@ -192,16 +229,28 @@ Fetcher::FetchFile(const BString& url, const char* path, off_t expectedSize,
 			}
 			return B_OK;
 		}
-		if (IsCancelled() || error == B_RESULT_NOT_REPRESENTABLE) {
-			// cancelled, or the server refused the range: start over next time
-			if (error == B_RESULT_NOT_REPRESENTABLE)
-				file.SetSize(0);
+		if (IsCancelled())
 			break;
+		if (error == B_RESULT_NOT_REPRESENTABLE) {
+			// the server refused the range: start over
+			file.SetSize(0);
+			continue;
 		}
-		if (error != B_IO_ERROR && error != B_DEV_TIMEOUT)
+		if (!is_transient(error))
 			break;
 	}
 	return error;
+}
+
+
+/*!	A second or more before the next attempt, unless cancelled.
+*/
+void
+Fetcher::_Pause(int32 attempt)
+{
+	bigtime_t until = system_time() + attempt * 1000000LL;
+	while (!IsCancelled() && system_time() < until)
+		snooze(100000);
 }
 
 
@@ -278,7 +327,9 @@ Fetcher::_Fetch(const BString& url, BDataIO* output, off_t rangeStart,
 		_error.SetToFormat("%s: no data for a minute", url.String());
 		return B_DEV_TIMEOUT;
 	}
-	if (error != B_OK) {
+	// An error answer stops the request (SetStopOnError()), which then
+	// reports itself interrupted: the answer is what counts.
+	if (error != B_OK && (http == NULL || code < 300)) {
 		_error.SetToFormat("%s: %s", url.String(), strerror(error));
 		return error == B_ERROR ? B_IO_ERROR : error;
 	}
