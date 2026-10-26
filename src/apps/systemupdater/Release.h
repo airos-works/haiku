@@ -9,6 +9,7 @@
 #include <Message.h>
 #include <ObjectList.h>
 #include <String.h>
+#include <StringList.h>
 
 
 // Accessors for what BJson makes of JSON: objects are messages, arrays are
@@ -44,6 +45,9 @@ struct ReleasePackage {
 	off_t		size;
 	bool		optional;
 		// one the Installer offers (_packages_): updated where installed
+	BStringList	equivalent;
+		// the SHA-256 of earlier builds of this file that differ only in
+		// their file times: an installed one stays
 };
 
 

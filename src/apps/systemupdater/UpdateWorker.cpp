@@ -185,6 +185,9 @@ UpdateWorker::_Check()
 				== B_OK) {
 			size = plan.downloadBytes;
 			packages = plan.activate.CountItems();
+		} else if (newer > 0) {
+			fUpdater.Log("could not work out what %s would download: %s",
+				latest->id.String(), planError.String());
 		}
 		reply.AddInt64("size", size);
 		reply.AddInt32("packages", packages);

@@ -549,7 +549,16 @@ Updater::_SaveReleaseRecord(const Release& release)
 			<< ", \"file\": " << json::Quote(package->file)
 			<< ", \"sha256\": " << json::Quote(package->sha256)
 			<< ", \"size\": " << package->size
-			<< (package->optional ? ", \"optional\": true" : "") << "}"
+			<< (package->optional ? ", \"optional\": true" : "");
+		if (!package->equivalent.IsEmpty()) {
+			text << ", \"equivalent\": [";
+			for (int32 j = 0; j < package->equivalent.CountStrings(); j++) {
+				text << (j > 0 ? ", " : "")
+					<< json::Quote(package->equivalent.StringAt(j));
+			}
+			text << "]";
+		}
+		text << "}"
 			<< (i + 1 < release.Packages().CountItems() ? ",\n" : "\n");
 	}
 	text << " ],\n \"payload\": {\"links\": [\n";
@@ -740,7 +749,8 @@ Updater::PlanUpdate(const Release& release, const SystemState& state,
 		if (latest->packages.HasString(package->file)) {
 			BString sha;
 			if (_InstalledSha256(package->file, sha) == B_OK
-				&& sha == package->sha256) {
+				&& (sha == package->sha256
+					|| package->equivalent.HasString(sha))) {
 				continue;
 			}
 			// the same file name with other contents: replace it
