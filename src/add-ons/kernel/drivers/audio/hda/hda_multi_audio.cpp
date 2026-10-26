@@ -1189,11 +1189,18 @@ buffer_exchange(hda_audio_group* audioGroup, multi_buffer_info* data)
 		timeout = std::max(timeout, 4 * (bigtime_t)playbackStream->buffer_length
 			* 1000000 / playbackStream->sample_rate);
 	}
+	int32 forceStopCount = atomic_get(&audioGroup->force_stop_count);
 	while (true) {
 		err = acquire_sem_etc(audioGroup->codec->controller->buffer_ready_sem,
 			1, B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT, timeout);
 		if (err != B_TIMED_OUT)
 			break;
+		if (atomic_get(&audioGroup->force_stop_count) != forceStopCount) {
+			// The streams were stopped, no buffer will come: let the caller
+			// go, it is most likely waiting to stop as well.
+			err = B_INTERRUPTED;
+			break;
+		}
 		hda_recover_lost_interrupt(audioGroup->codec->controller);
 	}
 	if (err != B_OK) {
@@ -1247,6 +1254,8 @@ buffer_exchange(hda_audio_group* audioGroup, multi_buffer_info* data)
 static status_t
 buffer_force_stop(hda_audio_group* audioGroup)
 {
+	atomic_add(&audioGroup->force_stop_count, 1);
+
 	if (audioGroup->playback_stream != NULL) {
 		hda_stream_stop(audioGroup->codec->controller,
 			audioGroup->playback_stream);

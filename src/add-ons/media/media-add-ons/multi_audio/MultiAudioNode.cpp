@@ -2069,7 +2069,14 @@ MultiAudioNode::_StopOutputThread()
 	if (fThread < 0)
 		return B_OK;
 
-	wait_for_thread(fThread, NULL);
+	// The thread may be waiting in the driver for a buffer that doesn't
+	// come (a stalled or unplugged device): stopping the device lets it go.
+	status_t status = wait_for_thread_etc(fThread, B_RELATIVE_TIMEOUT,
+		500000, NULL);
+	if (status == B_TIMED_OUT) {
+		fDevice->ForceStop();
+		wait_for_thread(fThread, NULL);
+	}
 	fThread = -1;
 
 	fDevice->ForceStop();
