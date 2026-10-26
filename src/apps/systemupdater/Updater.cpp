@@ -33,6 +33,7 @@
 #include <fs_info.h>
 #include <package/CommitTransactionResult.h>
 #include <package/PackageInfo.h>
+#include <package/PackageVersion.h>
 
 #include <AutoDeleter.h>
 #include <SHA256.h>
@@ -687,11 +688,34 @@ Updater::PlanUpdate(const Release& release, const SystemState& state,
 	for (int32 i = 0; i < latest->packages.CountStrings(); i++)
 		installedNames.Add(PackageNameOf(latest->packages.StringAt(i)));
 
+	// A release may carry two files of one package (an image's own build of
+	// a library beside the one a dependency brought in); only one of them can
+	// be active, the highest version.
+	BStringList skippedFiles;
+	for (int32 i = 0; const ReleasePackage* package
+			= release.Packages().ItemAt(i); i++) {
+		for (int32 j = 0; const ReleasePackage* other
+				= release.Packages().ItemAt(j); j++) {
+			if (other == package || other->name != package->name)
+				continue;
+			BPackageVersion version, otherVersion;
+			if (version.SetTo(package->version) == B_OK
+				&& otherVersion.SetTo(other->version) == B_OK
+				&& (version.Compare(otherVersion) < 0
+					|| (version.Compare(otherVersion) == 0 && j < i))) {
+				skippedFiles.Add(package->file);
+				break;
+			}
+		}
+	}
+
 	BStringList releaseNames;
 	BStringList releaseFiles;
 	for (int32 i = 0; const ReleasePackage* package
 			= release.Packages().ItemAt(i); i++) {
 		if (package->optional && !installedNames.HasString(package->name))
+			continue;
+		if (skippedFiles.HasString(package->file))
 			continue;
 		releaseNames.Add(package->name);
 		releaseFiles.Add(package->file);
@@ -701,8 +725,10 @@ Updater::PlanUpdate(const Release& release, const SystemState& state,
 	int32 count = release.Packages().CountItems();
 	for (int32 i = 0; i < count; i++) {
 		const ReleasePackage* package = release.Packages().ItemAt(i);
-		if (package->optional && !installedNames.HasString(package->name))
+		if ((package->optional && !installedNames.HasString(package->name))
+			|| skippedFiles.HasString(package->file)) {
 			continue;
+		}
 		_Status("Comparing %s (%" B_PRId32 " of %" B_PRId32 ")…",
 			package->file.String(), i + 1, count);
 		_Progress((float)i / count);

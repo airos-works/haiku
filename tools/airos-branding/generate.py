@@ -77,6 +77,10 @@ def vector_icons():
 		[9, 10, 11], 15.0, 48.0, 12.0).data()
 	out['system-folder'] = icons.overlay(base('haiku-system-folder.hvif'),
 		[8, 9, 10], 15.0, 48.0, 12.0).data()
+	# SoftwareUpdater's package with the mark: System Updater, which updates
+	# air/OS itself
+	out['system-updater'] = icons.overlay(base('haiku-software-updater.hvif'),
+		[], 45.0, 45.0, 15.0).data()
 	out['badge'] = icons.badge_icon().data()
 	out['partition'] = icons.badge_icon(32.0, 33.0, 24.0).data()
 	out['deskbar'] = icons.deskbar_logo().data()
@@ -96,6 +100,8 @@ def install_vector_icons(v):
 		set_rdef(rel, r'resource\(1, "airos_logo"\)', v['logo'])
 		set_rdef(rel, r'resource\(2, "airos_logo_dark"\)', v['logo-dark'])
 	set_rdef('src/apps/haikudepot/HaikuDepot.rdef', r'resource\(560, "native"\)', v['badge'])
+	set_rdef('src/apps/systemupdater/SystemUpdater.rdef', r'resource vector_icon',
+		v['system-updater'])
 
 	header = path('src/apps/drivesetup/icons.h')
 	text = open(header).read()

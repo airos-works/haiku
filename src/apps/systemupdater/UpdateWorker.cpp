@@ -169,8 +169,25 @@ UpdateWorker::_Check()
 	if (latest != NULL) {
 		reply.AddString("id", latest->id);
 		reply.AddString("title", Release::TitleForVersion(latest->version));
-		reply.AddInt64("size", latest->size);
 		reply.AddString("revision", latest->haikuRevision);
+
+		// what installing it would download: only what changed
+		off_t size = latest->size;
+		int32 packages = -1;
+		Release release;
+		SystemState state;
+		UpdatePlan plan;
+		BString planError;
+		if (newer > 0 && fUpdater.FetchRelease(*latest, release, planError)
+				== B_OK
+			&& state.Load() == B_OK
+			&& fUpdater.PlanUpdate(release, state, plan, planError, &fFeed)
+				== B_OK) {
+			size = plan.downloadBytes;
+			packages = plan.activate.CountItems();
+		}
+		reply.AddInt64("size", size);
+		reply.AddInt32("packages", packages);
 	}
 	reply.AddString("changes", changes);
 	fTarget.SendMessage(&reply);

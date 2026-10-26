@@ -622,7 +622,13 @@ UpdaterWindow::MessageReceived(BMessage* message)
 				fAvailableTitle = message->GetString("title", "");
 				BString changes = message->GetString("changes", "");
 				int64 size = message->GetInt64("size", -1);
-				if (size > 0) {
+				int32 packages = message->GetInt32("packages", -1);
+				if (packages >= 0) {
+					changes.Prepend(BString().SetToFormat(
+						"Download: %s (%" B_PRId32 " package%s)\n\n",
+						Updater::FormatSize(size).String(), packages,
+						packages == 1 ? "" : "s"));
+				} else if (size > 0) {
 					changes.Prepend(BString().SetToFormat(
 						"Download: up to %s\n\n",
 						Updater::FormatSize(size).String()));
