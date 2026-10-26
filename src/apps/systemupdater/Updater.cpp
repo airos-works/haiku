@@ -1127,10 +1127,15 @@ Updater::BootCheck(BString& _report, bool waitForDesktop)
 
 	if (trial.exists) {
 		if (waitForDesktop) {
-			// the desktop must come up and stay
+			// The desktop must come up (Tracker and Deskbar, within five
+			// minutes) and stay up for half a minute.
 			bigtime_t start = system_time();
-			while (system_time() - start < kConfirmDelay)
+			while (!(be_roster->IsRunning("application/x-vnd.Be-TRAK")
+					&& be_roster->IsRunning("application/x-vnd.Be-TSKB"))
+				&& system_time() - start < 300000000) {
 				snooze(1000000);
+			}
+			snooze(kConfirmDelay);
 			if (!be_roster->IsRunning("application/x-vnd.Be-TRAK")
 				|| !be_roster->IsRunning("application/x-vnd.Be-TSKB")) {
 				_report = "The desktop is not up; the update is not confirmed.";

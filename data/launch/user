@@ -38,11 +38,11 @@ target desktop {
 
 	# air/OS: confirms an update once the desktop has run for a while, reports
 	# a start that fell back to an older version, and looks for a new release
-	# (System Updater, docs/airos/SYSTEM-UPDATER.md)
+	# (System Updater, docs/airos/SYSTEM-UPDATER.md). It waits for Tracker and
+	# Deskbar itself.
 	job x-vnd.airos-SystemUpdater-boot-check {
 		launch /boot/system/apps/SystemUpdater --boot-check
 		no_safemode
-		requires x-vnd.Be-TSKB
 	}
 
 	job check-daylight-saving-time {

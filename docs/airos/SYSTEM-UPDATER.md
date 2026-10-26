@@ -118,3 +118,37 @@ directories to find its packages).
 | arm64 UEFI (ROCK 5, Dragon) | `EFI/BOOT/BOOTAA64.EFI` | loader menu, System Updater | |
 | Cubie A7S | `EFI/BOOT/BOOTAA64.EFI` started by U-Boot | loader menu, System Updater | U-Boot and boot chain are not updated |
 | Raspberry Pi 4 | firmware starts `airos-loader.img` + `airos-boot.tgz` from FAT | System Updater | the kernel comes from the FAT partition; each version keeps its own loader and boot archive there (see below) |
+
+### The Raspberry Pi
+
+The Pi's firmware loads `airos-loader.img` and `airos-boot.tgz` (the kernel
+and the modules that mount the system volume) from the FAT partition, and its
+loader cannot read BFS. So on the Pi:
+
+- the kernel makes the boot loader's choice (`airos_choose_boot_state()` in
+  `vfs_boot.cpp`) when the loader did not, from the same files;
+- System Updater keeps each installed version's loader and boot archive in
+  `airos/<version>/` on the FAT partition (the image's own pair stays at the
+  top), and writes `airos-boot.txt`, which `config.txt` includes, so that the
+  firmware loads the kernel of the version that starts next. An older
+  `config.txt` that names the files itself is changed to include
+  `airos-boot.txt` (the original is kept as `config-before-system-updater.txt`);
+- an update's boot files go onto the FAT partition before its packages are
+  committed, and are selected after;
+- after a fallback the kernel that started is the update's: the fallback
+  version runs on it until the next restart, which System Updater has
+  already pointed at the fallback's own kernel.
+
+## Building releases
+
+`jmgasper/airos-ci` makes a release of every image build:
+
+1. `images/release-inputs.py` writes the release file, the package infos of
+   `airos_release` and `airos_payload` and `files.jam` (every file of CI's
+   trees), which `images/build-image.sh` passes to jam.
+2. After the image, `images/release-feed.py extract` copies its packages out
+   with `bfs_shell` into the image directory's `release/`.
+3. After the smoke test, `images/release-feed.py publish TARGET IMAGE_DIR`
+   adds it to `updates/<target>/` with what changed since the release before
+   it: the Haiku commits (`git log`), the packages whose versions changed and
+   the commits of the pinned applications.

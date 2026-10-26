@@ -30,6 +30,7 @@
 #include <airos_boot_control.h>
 
 #include "Constants.h"
+#include "PiBoot.h"
 #include "Release.h"
 #include "UpdateWorker.h"
 #include "Updater.h"
@@ -245,11 +246,19 @@ UpdaterWindow::_CreateVersionsTab()
 	fVersionInfoView->SetViewUIColor(B_PANEL_BACKGROUND_COLOR);
 	fVersionInfoView->SetLowUIColor(B_PANEL_BACKGROUND_COLOR);
 	fVersionInfoView->SetWordWrap(true);
-	fVersionInfoView->SetText("air/OS keeps the current version and the "
-		"versions before it, so you can go back if something stops "
-		"working. You can also pick one while the computer starts: hold "
-		"down Shift or Space to open the boot menu, then choose "
-		"\"Select boot volume/state\".");
+	if (PiBoot::IsPi()) {
+		fVersionInfoView->SetText("air/OS keeps the current version and the "
+			"versions before it, so you can go back if something stops "
+			"working. The Raspberry Pi starts the version chosen here; if an "
+			"update does not start, it goes back to the version before by "
+			"itself.");
+	} else {
+		fVersionInfoView->SetText("air/OS keeps the current version and the "
+			"versions before it, so you can go back if something stops "
+			"working. You can also pick one while the computer starts: hold "
+			"down Shift or Space to open the boot menu, then choose "
+			"\"Select boot volume/state\".");
+	}
 	fVersionInfoView->SetExplicitMinSize(BSize(B_SIZE_UNSET,
 		be_plain_font->Size() * 4));
 
