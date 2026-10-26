@@ -33,7 +33,9 @@ public:
 								~DefaultManager();
 
 			status_t 			LoadState();
-			status_t			SaveState(NodeManager *node_manager);
+			status_t			SaveState();
+			status_t			RememberDefault(NodeManager *node_manager,
+									node_type type);
 
 			status_t			Set(media_node_id nodeid,
 									const char *input_name, int32 input_id,
@@ -51,9 +53,13 @@ private:
 			static int32		rescan_thread(void *arg);
 			void				_RescanThread();
 
-			void				_FindPhysical(volatile media_node_id *id,
+			void				_ChoosePhysical(volatile media_node_id *id,
+									volatile bool *standIn,
 									uint32 default_type, bool isInput,
-									media_type type);
+									bool isVideo);
+			bool				_FindPhysical(volatile media_node_id *id,
+									uint32 default_type, bool isInput,
+									media_type type, bool savedOnly);
 			void				_FindAudioMixer();
 			void				_FindTimeSource();
 
@@ -71,10 +77,19 @@ private:
 			volatile int32 		fPhysicalAudioOutInputID;
 			char fPhysicalAudioOutInputName[B_MEDIA_NAME_LENGTH];
 
+			// whether the default of a type only stands in for the saved
+			// one, which is not there (yet)
+			volatile bool		fVideoOutStandIn;
+			volatile bool		fVideoInStandIn;
+			volatile bool		fAudioOutStandIn;
+			volatile bool		fAudioInStandIn;
+
 			media_output 		fMixerToPhysicalAudioOut;
 			media_input 		fPhysicalAudioOutFromMixer;
 
 			BList				fMsgList;
+				// the saved defaults: those the user chose
+			BLocker				fSettingsLock;
 
 			uint32				fBeginHeader[3];
 			uint32				fEndHeader[3];

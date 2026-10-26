@@ -118,7 +118,8 @@ NodeManager::SetDefaultNode(node_type type, const media_node* node,
 
 	if (status == B_OK && (type == VIDEO_INPUT || type == VIDEO_OUTPUT
 			|| type == AUDIO_OUTPUT || type == AUDIO_INPUT)) {
-		fDefaultManager->SaveState(this);
+		fDefaultManager->RememberDefault(this, type);
+		fDefaultManager->SaveState();
 		Dump();
 	}
 	return status;
@@ -1228,7 +1229,7 @@ status_t
 NodeManager::SaveState()
 {
 	BAutolock _(this);
-	return fDefaultManager->SaveState(this);
+	return fDefaultManager->SaveState();
 }
 
 
