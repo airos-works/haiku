@@ -180,6 +180,12 @@ loader cannot read BFS. So on the Pi:
    it: the Haiku commits (`git log`), the packages whose versions changed and
    the commits of the pinned applications.
 
+A release image has no Haiku package repository (upstream Haiku's `haiku`
+package would replace air/OS's) and no Deskbar entry for SoftwareUpdater,
+which would swap the release's own builds for HaikuPorts' versions.
+HaikuDepot keeps HaikuPorts for adding software; a package of the release
+that it updates is put back to the release's build by the next update.
+
 ## Tested
 
 In QEMU on the build server (2026-10-26), with releases built by this
