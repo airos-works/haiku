@@ -6327,6 +6327,155 @@ _user_sync_memory(void* _address, size_t size, uint32 flags)
 }
 
 
+enum dont_need_action {
+	DONT_NEED_KEEP,
+	DONT_NEED_DISCARD,
+	DONT_NEED_ZERO
+};
+
+
+/*!	Decides how MADV_DONTNEED treats \a area. The caches of the area's chain
+	must be locked.
+*/
+static dont_need_action
+dont_need_action_for(VMArea* area)
+{
+	// Shared memory keeps its data, and so does memory whose cache other
+	// areas use as well.
+	if ((area->protection & B_SHARED_AREA) != 0
+		|| !is_area_only_cache_user(area)) {
+		return DONT_NEED_KEEP;
+	}
+
+	bool anonymousBelow = false;
+	bool fileBelow = false;
+	for (VMCache* source = area->cache->source; source != NULL;
+			source = source->source) {
+		if (source->type == CACHE_TYPE_RAM)
+			anonymousBelow = true;
+		else
+			fileBelow = true;
+	}
+
+	// Without an anonymous cache below, dropping the area's pages shows zeros
+	// or the file's content.
+	if (!anonymousBelow)
+		return DONT_NEED_DISCARD;
+
+	// A forked child still shares older pages below. Anonymous memory has
+	// to read as zeros; a private file mapping keeps its data.
+	return fileBelow ? DONT_NEED_KEEP : DONT_NEED_ZERO;
+}
+
+
+/*!	Implements MADV_DONTNEED as other systems do: private anonymous memory
+	reads as zeros afterwards, private file mappings read the file again, and
+	shared memory keeps its data. Where an area alone uses its cache and no
+	anonymous cache lies below it, the pages are freed. Anonymous memory still
+	shared with a forked child cannot drop its pages without showing the older
+	ones below, so the pages present there are zeroed instead.
+*/
+static status_t
+dont_need_address_range(addr_t address, addr_t size)
+{
+	addr_t zeroStart = 0;
+	addr_t zeroEnd = 0;
+
+	{
+		AddressSpaceWriteLocker locker;
+		do {
+			status_t status = locker.SetTo(team_get_current_team_id());
+			if (status != B_OK)
+				return status;
+		} while (wait_if_address_range_is_wired(locker.AddressSpace(),
+				address, size, &locker));
+
+		for (VMAddressSpace::AreaRangeIterator it
+				= locker.AddressSpace()->GetAreaRangeIterator(address, size);
+				VMArea* area = it.Next();) {
+			dont_need_action action;
+			for (int32 attempt = 0; attempt < 2; attempt++) {
+				VMCache* cache = vm_area_get_locked_cache(area);
+				VMCacheChainLocker cacheChainLocker(cache);
+				cacheChainLocker.LockAllSourceCaches();
+
+				action = dont_need_action_for(area);
+
+				// Unlocking merges a source cache whose other consumers are
+				// gone (a forked child that has exited) into its last one,
+				// so look again: the pages may be freed after all.
+				cacheChainLocker.Unlock(cache);
+				cache->ReleaseRefAndUnlock();
+
+				if (action != DONT_NEED_ZERO)
+					break;
+			}
+
+			if (action == DONT_NEED_DISCARD) {
+				status_t error = discard_area_range(area, address, size);
+				if (error != B_OK)
+					return error;
+			} else if (action == DONT_NEED_ZERO) {
+				addr_t areaAddress = address;
+				addr_t areaSize = size;
+				addr_t offset;
+				if (!intersect_area(area, areaAddress, areaSize, offset))
+					continue;
+
+				if (zeroEnd == 0)
+					zeroStart = areaAddress;
+				zeroEnd = areaAddress + areaSize;
+			}
+		}
+	}
+
+	// Zero the pages present in a chain shared with a forked child. The write
+	// copies a shared page into the area's own cache.
+	for (addr_t pageAddress = zeroStart; pageAddress < zeroEnd;
+			pageAddress += B_PAGE_SIZE) {
+		{
+			AddressSpaceReadLocker locker;
+			status_t status = locker.SetTo(team_get_current_team_id());
+			if (status != B_OK)
+				return status;
+
+			VMArea* area = locker.AddressSpace()->LookupArea(pageAddress);
+			if (area == NULL)
+				continue;
+
+			VMCache* cache = vm_area_get_locked_cache(area);
+			VMCacheChainLocker cacheChainLocker(cache);
+			cacheChainLocker.LockAllSourceCaches();
+
+			bool present = false;
+			if (dont_need_action_for(area) != DONT_NEED_KEEP) {
+				const off_t cacheOffset = pageAddress - area->Base()
+					+ area->cache_offset;
+				for (VMCache* chainCache = cache; chainCache != NULL;
+						chainCache = chainCache->source) {
+					if (chainCache->LookupPage(cacheOffset) != NULL
+						|| chainCache->StoreHasPage(cacheOffset)) {
+						present = true;
+						break;
+					}
+				}
+			}
+
+			cacheChainLocker.Unlock(cache);
+			cache->ReleaseRefAndUnlock();
+
+			if (!present)
+				continue;
+		}
+
+		// This fails for a read-only area, which then keeps its data.
+		user_memset((void*)pageAddress, 0, B_PAGE_SIZE);
+	}
+
+	return B_OK;
+}
+
+
 status_t
 _user_memory_advice(void* _address, size_t size, uint32 advice)
 {
@@ -6345,9 +6494,11 @@ _user_memory_advice(void* _address, size_t size, uint32 advice)
 		case MADV_SEQUENTIAL:
 		case MADV_RANDOM:
 		case MADV_WILLNEED:
-		case MADV_DONTNEED:
 			// TODO: Implement!
 			break;
+
+		case MADV_DONTNEED:
+			return dont_need_address_range(address, size);
 
 		case MADV_FREE:
 		{
