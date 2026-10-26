@@ -270,6 +270,13 @@ void
 JobQueue::_RemoveDependantJobsOf(BJob* job)
 {
 	while (BJob* dependantJob = job->DependantJobAt(0)) {
+		if (fQueuedJobs->find(dependantJob) == fQueuedJobs->end()) {
+			// Not ours: it was never queued (like a launch_daemon target that
+			// depends on its jobs), so it must not be aborted or deleted.
+			dependantJob->RemoveDependency(job);
+			continue;
+		}
+
 		try {
 			fQueuedJobs->erase(dependantJob);
 		} catch (...) {
