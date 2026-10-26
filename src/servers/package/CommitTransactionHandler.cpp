@@ -829,6 +829,62 @@ CommitTransactionHandler::_AddUser(Package* package, const BUser& user)
 }
 
 
+/*!	Packages refer to their own files through ".self", which exists only in
+	packagefs. Writable files are copied out of it, so a symbolic link among
+	them pointing into ".self" (fontconfig's conf.d links, for one) would point
+	nowhere: point such links at the installation location instead, where the
+	package's files appear.
+*/
+static void
+fix_package_relative_symlinks(BDirectory& directory, const BString& rootPath)
+{
+	directory.Rewind();
+
+	entry_ref ref;
+	while (directory.GetNextRef(&ref) == B_OK) {
+		BEntry entry(&ref);
+		struct stat st;
+		if (entry.GetStat(&st) != B_OK)
+			continue;
+
+		if (S_ISDIR(st.st_mode)) {
+			BDirectory subDirectory(&entry);
+			if (subDirectory.InitCheck() == B_OK)
+				fix_package_relative_symlinks(subDirectory, rootPath);
+			continue;
+		}
+
+		if (!S_ISLNK(st.st_mode))
+			continue;
+
+		char target[B_PATH_NAME_LENGTH];
+		ssize_t length = BSymLink(&entry).ReadLink(target, sizeof(target) - 1);
+		if (length < 0)
+			continue;
+		target[length] = '\0';
+
+		const char* packagePath = target;
+		while (strncmp(packagePath, "../", 3) == 0)
+			packagePath += 3;
+		if (strncmp(packagePath, ".self/", 6) != 0)
+			continue;
+
+		BString newTarget(rootPath);
+		newTarget << '/' << (packagePath + 6);
+
+		BDirectory parent;
+		if (entry.GetParent(&parent) != B_OK || entry.Remove() != B_OK)
+			continue;
+		if (parent.CreateSymLink(ref.name, newTarget, NULL) != B_OK) {
+			ERROR("failed to point writable symlink \"%s\" at \"%s\"\n",
+				ref.name, newTarget.String());
+		}
+	}
+
+	directory.Rewind();
+}
+
+
 void
 CommitTransactionHandler::_AddGlobalWritableFiles(Package* package)
 {
@@ -879,6 +935,7 @@ CommitTransactionHandler::_AddGlobalWritableFiles(Package* package)
 	BDirectory extractedFilesDirectory;
 	_ExtractPackageContent(package, contentPaths,
 		fWritableFilesDirectory, extractedFilesDirectory);
+	fix_package_relative_symlinks(extractedFilesDirectory, fVolume->Path());
 
 	for (int32 i = 0; const BGlobalWritableFileInfo* file = files.ItemAt(i);
 		i++) {

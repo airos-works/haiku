@@ -198,6 +198,18 @@ extractFile()
 			;;
 	esac
 
+	# Packages refer to their own files through ".self", which exists only in
+	# packagefs: point such symbolic links among files copied out of a package
+	# (writable settings, say fontconfig's conf.d) at the installation location.
+	if [ "${targetExtractedDir%%/*}" = system ]; then
+		find "$extractDir" -type l | while read link; do
+			packagePath=$(readlink "$link" | sed -n 's,^\(\.\./\)*\.self/,,p')
+			if [ -n "$packagePath" ]; then
+				ln -sfn "/boot/system/$packagePath" "$link"
+			fi
+		done
+	fi
+
 	if [ -f $extractDir/.OptionalPackageDescription ]; then
 		cat $extractDir/.OptionalPackageDescription >> $copyrightsFile
 		echo >> $copyrightsFile
