@@ -361,6 +361,7 @@ SYSTEM_ADD_ONS_DRIVERS_NET = [ FFilterByBuildFeatures
 	}@ # x86,x86_64,riscv64,arm64
 
 	etherpci
+	tc956x@arm64
 	usb_davicom
 	usb_rndis
 	wb840
@@ -375,6 +376,7 @@ SYSTEM_ADD_ONS_DRIVERS_POWER = [ FFilterByBuildFeatures
 		amd_thermal
 		pch_thermal
 	}@ # x86,x86_64
+	qcom_adsp@arm64
 	sunxi_regulator@arm64
 	sunxi_thermal@arm64
 ] ;

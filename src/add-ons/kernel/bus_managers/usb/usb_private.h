@@ -690,11 +690,15 @@ private:
 
 		usb_port_status					fInterruptStatus[USB_MAX_PORT_COUNT];
 		usb_port_status					fPortStatus[USB_MAX_PORT_COUNT];
+		// explore rounds in a row in which no port answered
+		uint32							fUnansweredExplores;
 		Device *						fChildren[USB_MAX_PORT_COUNT];
 		uint8							fPlatformResets[USB_MAX_PORT_COUNT];
 		uint8							fEnumerationFailures[
 											USB_MAX_PORT_COUNT];
 		bigtime_t						fNextEnumeration[USB_MAX_PORT_COUNT];
+		bigtime_t						fNextWarmReset[USB_MAX_PORT_COUNT];
+		uint8							fWarmResets[USB_MAX_PORT_COUNT];
 };
 
 

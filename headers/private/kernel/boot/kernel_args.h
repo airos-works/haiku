@@ -34,6 +34,8 @@
 #define BOOT_VOLUME_BOOTED_FROM_IMAGE	"booted from image"
 #define BOOT_VOLUME_PACKAGED			"packaged"
 #define BOOT_VOLUME_PACKAGES_STATE		"packages state"
+#define BOOT_VOLUME_AIROS_BOOT			"airos boot"
+	// how the loader chose the state: AIROS_BOOT_MODE_* (airos_boot_control.h)
 #define BOOT_VOLUME_PARTITION_OFFSET	"partition offset"
 #define BOOT_VOLUME_DISK_IDENTIFIER		"disk identifier"
 

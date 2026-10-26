@@ -356,6 +356,13 @@ static void nvme_qpair_submit_tracker(struct nvme_qpair *qpair,
 
 	qpair->tr[tr->cid].active = true;
 	nvme_qpair_copy_command(&qpair->cmd[qpair->sq_tail], &req->cmd);
+#if defined(NVME_HAIKU_NONCOHERENT_DMA)
+	if (!qpair->sq_in_cmb) {
+		nvme_dma_clean_alias(qpair->cmd_bus_addr
+			+ qpair->sq_tail * sizeof(struct nvme_cmd),
+			sizeof(struct nvme_cmd));
+	}
+#endif
 
 	if (++qpair->sq_tail == qpair->entries)
 		qpair->sq_tail = 0;
@@ -567,7 +574,11 @@ static int nvme_qpair_build_dma_request(struct nvme_qpair *qpair,
 		req->cmd.dptr.prp.prp2 = tr->prp_sgl_bus_addr;
 		for (uint32_t page = 1; page < pages; page++)
 			tr->u.prp[page - 1] = address + page * PAGE_SIZE;
+		nvme_dma_clean_alias(tr->prp_sgl_bus_addr,
+			(pages - 1) * sizeof(uint64_t));
 	}
+	if (operation == NVME_DMA_FROM_HOST)
+		nvme_dma_clean_alias(address, req->payload_size);
 	return 0;
 }
 #endif
@@ -1231,9 +1242,33 @@ unsigned int nvme_qpair_poll(struct nvme_qpair *qpair,
 		if (tr->active) {
 			nvme_qpair_complete_tracker(qpair, tr, cpl, true);
 		} else {
+#ifdef __HAIKU__
+			// Seen now and then on the Dragon Q8B's first reads at boot.
+			// As Linux does, report the entry and go on: at worst the
+			// command it should have completed times out, where a panic
+			// stops the boot.
+			nvme_crit("qpair %u: completion at %u (phase %u) for command %u,"
+				" which is not outstanding: sqid %u sqhd %u status %#x"
+				" cdw0 %#x\n", qpair->id, qpair->cq_head, qpair->phase,
+				cpl->cid, cpl->sqid, cpl->sqhd,
+				((volatile uint16_t*)cpl)[7], cpl->cdw0);
+			// the submission entry the controller just took, and the
+			// host's tail: a zeroed entry means it fetched one the host
+			// had not written yet
+			if (!qpair->sq_in_cmb && cpl->sqhd < qpair->entries) {
+				uint16_t slot = (cpl->sqhd + qpair->entries - 1)
+					% qpair->entries;
+				volatile uint32_t* entry
+					= (volatile uint32_t*)&qpair->cmd[slot];
+				nvme_crit("qpair %u: entry %u: %08x %08x %08x %08x, "
+					"tail %u\n", qpair->id, slot, entry[0], entry[1],
+					entry[10], entry[12], qpair->sq_tail);
+			}
+#else
 			nvme_info("cpl does not map to outstanding cmd\n");
 			nvme_qpair_print_completion(qpair, cpl);
 			nvme_panic("received completion for unknown cmd\n");
+#endif
 		}
 
 		if (++qpair->cq_head == qpair->entries) {

@@ -169,6 +169,8 @@ backend_name(encoder_backend backend)
 			return "VA-API";
 		case kBackendNVENC:
 			return "NVENC";
+		case kBackendIris:
+			return "Iris";
 		case kBackendSoftware:
 		default:
 			return "CPU";

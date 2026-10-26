@@ -75,14 +75,14 @@ auReader::Sniff(int32 *streamCount)
 	}
 
 	int64 filesize = Source()->Seek(0, SEEK_END);
-	if (filesize < sizeof(struct snd_header)) {
+	if (filesize < (int64)sizeof(struct snd_header)) {
 		TRACE("auReader::Sniff: File too small\n");
 		return B_ERROR;
 	}
 	
 	struct snd_header header;
 
-	if (sizeof(header) != Source()->ReadAt(0, &header, sizeof(header))) {
+	if ((ssize_t)sizeof(header) != Source()->ReadAt(0, &header, sizeof(header))) {
 		TRACE("auReader::Sniff: header reading failed\n");
 		return B_ERROR;
 	}

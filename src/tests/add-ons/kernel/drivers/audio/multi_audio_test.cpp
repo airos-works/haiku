@@ -370,6 +370,10 @@ do_play(int argc, char** argv)
 	uint32 exchanged = 0;
 	int32 cycle = -1;
 	uint32 x = 0;
+	// the record buffers the driver handed back meanwhile, and their peaks
+	int32 recordCycle = -1;
+	uint32 recorded = 0;
+	int32 recordPeak[MAX_CHANNELS] = {};
 	while (true) {
 		if (system_time() - startTime > 1000000LL)
 			break;
@@ -389,6 +393,31 @@ do_play(int argc, char** argv)
 			continue;
 
 		cycle = bufferInfo.playback_buffer_cycle;
+
+		if (bufferInfo.record_buffer_cycle >= 0
+			&& bufferInfo.record_buffer_cycle
+				< bufferList.return_record_buffers
+			&& (bufferInfo.record_buffer_cycle != recordCycle
+				|| bufferList.return_record_buffers == 1)) {
+			recordCycle = bufferInfo.record_buffer_cycle;
+			recorded++;
+			if (formatInfo.input.format == B_FMT_16BIT) {
+				for (int32 channel = 0;
+						channel < bufferList.return_record_channels
+							&& channel < MAX_CHANNELS; channel++) {
+					const buffer_desc& desc
+						= bufferList.record_buffers[recordCycle][channel];
+					for (uint32 frame = 0;
+							frame < bufferList.return_record_buffer_size;
+							frame++) {
+						int32 value = abs(*(int16*)(desc.base
+							+ frame * desc.stride));
+						if (value > recordPeak[channel])
+							recordPeak[channel] = value;
+					}
+				}
+			}
+		}
 
 		size_t stride = bufferList.playback_buffers[cycle][0].stride;
 		for (int32 channel = 0; channel < bufferList.return_playback_channels;
@@ -410,6 +439,14 @@ do_play(int argc, char** argv)
 
 	printf("%ld buffers exchanged while playing (%lu frames played (%lld)).\n",
 		exchanged, x, bufferInfo.played_frames_count);
+	if (bufferList.return_record_buffers > 0) {
+		printf("%lu buffers recorded meanwhile (%lld frames recorded); peaks:",
+			recorded, bufferInfo.recorded_frames_count);
+		for (int32 channel = 0; channel < bufferList.return_record_channels
+				&& channel < MAX_CHANNELS; channel++)
+			printf(" %ld", recordPeak[channel]);
+		printf("\n");
+	}
 
 	// clear buffers
 

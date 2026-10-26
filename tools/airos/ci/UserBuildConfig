@@ -56,8 +56,30 @@
 #                           system/non-packaged/amdgpu, which the boot script
 #                           links into system/non-packaged where amdgpu_drm
 #                           drives a GPU
+#   AIROS_CI_ADRENO         (arm64) the Dragon Q8B's GPU user land: a tree
+#                           copied to system/non-packaged/adreno (Turnip,
+#                           zink's EGL vendor library, libvulkan.so.1), which
+#                           the boot script links into system/non-packaged
+#                           where the adreno driver publishes the GPU; its
+#                           firmware comes with AIROS_CI_FIRMWARE
+#   AIROS_CI_FILES          a jam file CI generates that names each file of
+#                           the trees above (AirosCIFile, AirosCISymlink); used
+#                           instead of the AIROS_CI_LIBS ... AIROS_CI_ADRENO
+#                           rules when set
 #   AIROS_CI_IMAGE_SIZE     image size in MiB (optional)
 #   HAIKU_RPI_FIRMWARE_DIR  (Pi) the Raspberry Pi boot firmware files
+#
+# A release image, which System Updater can update (docs/airos/SYSTEM-UPDATER.md),
+# also has:
+#   AIROS_CI_RELEASE_VERSION
+#                           the release's version, its build time (20261026.0915)
+#   AIROS_CI_RELEASE_DIR    a directory with "release" (the release file) and the
+#                           package infos "airos_release" and "airos_payload"
+# Its image then carries the airos_release package, and everything it would
+# put into system/non-packaged goes into the airos_payload package instead,
+# under data/airos/non-packaged, with a symlink in system/non-packaged for each
+# file: the files belong to the package state like the rest of the system, so
+# an older state started from the boot loader brings its own back.
 #
 # Unlike the lab configurations (tools/rock5-itx, tools/rpi4) this adds no
 # remote shell, password, keys, probes or diagnostics.
@@ -135,32 +157,134 @@ rule AirosCIFiles directoryTokens : sourceDir : grist : pattern
 	AddFilesToHaikuImage $(directoryTokens) : $(files) ;
 }
 
+# AirosCIFile <image directory> : <source file> : <name>
+# AirosCISymlink <image directory> : <link target> : <name>
+# One file of CI's trees, as AIROS_CI_FILES lists them.
+rule AirosCIFile directoryTokens : source : name
+{
+	local file = $(name:G=airos-ci-file!$(directoryTokens:J=!)) ;
+	SEARCH on $(file) = $(source:D) ;
+	AddFilesToHaikuImage $(directoryTokens) : $(file) ;
+}
+
+rule AirosCISymlink directoryTokens : linkTarget : name
+{
+	AddSymlinkToHaikuImage $(directoryTokens) : $(linkTarget) : $(name) ;
+}
+
+
+# AirosRemoveImageFile <image directory> : <name>
+# Leaves a file the image definitions added out of the image.
+rule AirosRemoveImageFile directoryTokens : name
+{
+	local grist = [ on $(HAIKU_IMAGE_CONTAINER_NAME)
+		return $(HAIKU_CONTAINER_GRIST) ] ;
+	local directory = [ FDirName $(directoryTokens) ] ;
+	directory = $(directory:G=$(grist)) ;
+	local kept ;
+	local destTarget ;
+	for destTarget in [ on $(directory) return $(TARGETS_TO_INSTALL) ] {
+		if $(destTarget:G=) != $(name) {
+			kept += $(destTarget) ;
+		}
+	}
+	TARGETS_TO_INSTALL on $(directory) = $(kept) ;
+}
+
+
+# AirosMoveToPayload <package>
+# Moves every file the image would install in system/non-packaged into the
+# payload package, under data/airos/non-packaged, and links to it from the
+# image (System Updater, docs/airos/SYSTEM-UPDATER.md). Symlinks stay as they
+# are and go into the package too.
+rule AirosMoveToPayload package
+{
+	local image = $(HAIKU_IMAGE_CONTAINER_NAME) ;
+	local root = /boot/system/data/airos/non-packaged ;
+	local directory ;
+	for directory in [ on $(image) return $(HAIKU_INSTALL_DIRECTORIES) ] {
+		local tokens = [ on $(directory) return $(DIRECTORY_TOKENS) ] ;
+		if $(tokens[1]) != system || $(tokens[2]) != non-packaged {
+			continue ;
+		}
+		if [ on $(directory) return $(DIRECTORIES_TO_INSTALL) ] {
+			Exit "AirosMoveToPayload: a directory copied into"
+				[ FDirName $(tokens) ] "- name its files (AIROS_CI_FILES)" ;
+		}
+
+		local relative = $(tokens[3-]) ;
+		local prefix = $(root) ;
+		if $(relative) {
+			prefix = $(root)/$(relative:J=/) ;
+		}
+
+		local links = [ on $(directory) return $(SYMLINKS_TO_INSTALL) ] ;
+		local link ;
+		for link in $(links) {
+			AddSymlinkToContainer $(package) : data airos non-packaged
+				$(relative) : [ on $(link) return $(SYMLINK_TARGET) ]
+				: $(link:G=:D=) ;
+		}
+
+		local destTarget ;
+		for destTarget in [ on $(directory) return $(TARGETS_TO_INSTALL) ] {
+			local target = [ on $(destTarget) return $(TARGET) ] ;
+			local name = $(destTarget:G=) ;
+			AddFilesToContainer $(package) : data airos non-packaged $(relative)
+				: $(target) : $(name) ;
+			AddSymlinkToContainer $(image) : $(tokens) : $(prefix)/$(name)
+				: $(name) ;
+		}
+		TARGETS_TO_INSTALL on $(directory) = ;
+	}
+}
+
+
 rule UserBuildConfigRulePreImage
 {
+	# The build calls this before the image and again before the CD
+	# (build/jam/images/HaikuCD), with the same container: add everything
+	# once. Moving files into the payload twice would also put the image's
+	# links over the payload's files.
+	if $(AIROS_CI_PRE_IMAGE_DONE) {
+		return ;
+	}
+	AIROS_CI_PRE_IMAGE_DONE = 1 ;
+
 	local tree = [ FDirName $(HAIKU_TOP) tools airos ci ] ;
 
 	# Everything CI built for this image.
 	AirosCIFiles system packages : $(AIROS_CI_PACKAGES) : airos-ci-pkg : *.hpkg ;
-	AirosCIFiles system non-packaged lib : $(AIROS_CI_LIBS) : airos-ci-lib : *.so* ;
-	AirosCIFiles system non-packaged add-ons opengl egl_vendor.d : $(AIROS_CI_EGL)
-		: airos-ci-egl : *.json ;
-	AirosCIFiles system non-packaged demos : $(AIROS_CI_DEMOS) : airos-ci-demo : * ;
-	# Add-ons outside packages (x86_64: nvidia_rm, its accelerant, NVDEC), so
-	# the boot menu's "Disable user add-ons" turns them off.
-	if $(AIROS_CI_ADDONS) {
-		CopyDirectoryToHaikuImage system non-packaged : $(AIROS_CI_ADDONS)
-			: add-ons ;
-	}
-	if $(AIROS_CI_FIRMWARE) {
-		CopyDirectoryToHaikuImage system non-packaged data : $(AIROS_CI_FIRMWARE)
-			: firmware ;
-	}
-	# x86_64: libdrm, libva, libglvnd and Mesa (radeonsi, RADV, VA-API) and the
-	# amduvd decoder for amdgpu_drm, kept apart: the boot script links them
-	# into place only where amdgpu_drm drives a GPU.
-	if $(AIROS_CI_AMDGPU) {
-		CopyDirectoryToHaikuImage system non-packaged : $(AIROS_CI_AMDGPU)
-			: amdgpu ;
+	if $(AIROS_CI_FILES) {
+		include $(AIROS_CI_FILES) ;
+	} else {
+		AirosCIFiles system non-packaged lib : $(AIROS_CI_LIBS) : airos-ci-lib : *.so* ;
+		AirosCIFiles system non-packaged add-ons opengl egl_vendor.d : $(AIROS_CI_EGL)
+			: airos-ci-egl : *.json ;
+		AirosCIFiles system non-packaged demos : $(AIROS_CI_DEMOS) : airos-ci-demo : * ;
+		# Add-ons outside packages (x86_64: nvidia_rm, its accelerant, NVDEC), so
+		# the boot menu's "Disable user add-ons" turns them off.
+		if $(AIROS_CI_ADDONS) {
+			CopyDirectoryToHaikuImage system non-packaged : $(AIROS_CI_ADDONS)
+				: add-ons ;
+		}
+		if $(AIROS_CI_FIRMWARE) {
+			CopyDirectoryToHaikuImage system non-packaged data : $(AIROS_CI_FIRMWARE)
+				: firmware ;
+		}
+		# x86_64: libdrm, libva, libglvnd and Mesa (radeonsi, RADV, VA-API) and the
+		# amduvd decoder for amdgpu_drm, kept apart: the boot script links them
+		# into place only where amdgpu_drm drives a GPU.
+		if $(AIROS_CI_AMDGPU) {
+			CopyDirectoryToHaikuImage system non-packaged : $(AIROS_CI_AMDGPU)
+				: amdgpu ;
+		}
+		# arm64: the same for the Dragon Q8B's Adreno, beside the ROCK 5's
+		# Panfrost stack, which every other machine keeps.
+		if $(AIROS_CI_ADRENO) {
+			CopyDirectoryToHaikuImage system non-packaged : $(AIROS_CI_ADRENO)
+				: adreno ;
+		}
 	}
 
 	# Join remembered Wi-Fi networks at start (x86_64 and ROCK 5; the Pi and
@@ -191,6 +315,12 @@ rule UserBuildConfigRulePreImage
 		fonts = <airos-ci-font>$(fonts:BS) ;
 		SEARCH on $(fonts) = $(AIROS_CI_FONTS) ;
 		AddPackageFilesToHaikuImage system packages : $(fonts) ;
+		# Fontconfig's system configuration, which x86_64 gets from the
+		# fontconfig package: Summit includes it in the configuration it
+		# generates.
+		local fontconfig = <airos-ci-fontconfig>fonts.conf ;
+		SEARCH on $(fontconfig) = [ FDirName $(tree) fonts ] ;
+		AddFilesToHaikuImage system settings fonts : $(fontconfig) ;
 		# FreeType 2.14.3 rather than the repository's bootstrap 2.6.3; the
 		# build system does the rest when the packages are named.
 		if ! [ Glob $(HAIKU_ARM64_FREETYPE_PACKAGES_DIR)
@@ -240,6 +370,8 @@ rule UserBuildConfigRulePreImage
 		AddNewDriversToHaikuImage audio hmulti : rk3588_audio ;
 		AddFilesToHaikuImage system non-packaged add-ons accelerants
 			: rk3588_display.accelerant ;
+		# The Dragon Q8B's GPU (only where the device tree has an Adreno 690).
+		AddDriversToHaikuImage graphics : adreno ;
 		# The Bluetooth LE command line tool.
 		AddFilesToHaikuImage system non-packaged bin : bt_le ;
 	}
@@ -282,4 +414,37 @@ rule UserBuildConfigRulePreImage
 		AddFilesToHaikuImage home config settings boot : $(bootscript)
 			$(timeSync) ;
 	}
+
+	# A release image: its identity, and its files outside packages in a
+	# package of their own (see the top of this file).
+	if $(AIROS_CI_RELEASE_VERSION) {
+		if ! $(AIROS_CI_RELEASE_DIR) {
+			Exit "AIROS_CI_RELEASE_VERSION needs AIROS_CI_RELEASE_DIR" ;
+		}
+		SEARCH on <package-info-source>airos_release
+			<package-info-source>airos_payload = $(AIROS_CI_RELEASE_DIR) ;
+
+		local payload = airos_payload.hpkg ;
+		HaikuPackage $(payload) ;
+		AirosMoveToPayload $(payload) ;
+		BuildHaikuPackage $(payload) : airos_payload ;
+
+		local release = airos_release.hpkg ;
+		HaikuPackage $(release) ;
+		local releaseFile = <airos-release>release ;
+		SEARCH on $(releaseFile) = $(AIROS_CI_RELEASE_DIR) ;
+		AddFilesToPackage data airos : $(releaseFile) ;
+		BuildHaikuPackage $(release) : airos_release ;
+
+		AddPackageFilesToHaikuImage system packages : $(payload) $(release)
+			: nameFromMetaInfo ;
+
+		# System Updater installs the system packages. Haiku's own
+		# repository would offer upstream Haiku's in their place (its haiku
+		# package has the higher revision) to SoftwareUpdater and pkgman;
+		# HaikuPorts stays for HaikuDepot.
+		AirosRemoveImageFile system settings package-repositories : Haiku ;
+		AirosRemoveImageFile system cache package-repositories : Haiku ;
+	}
+
 }

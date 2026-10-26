@@ -106,6 +106,7 @@ enum encoder_backend {
 	kBackendSoftware = 0,
 	kBackendVAAPI,			// AMD (and other VA-API drivers)
 	kBackendNVENC,			// NVIDIA
+	kBackendIris,			// the Qualcomm SC8280XP's video codec
 
 	kBackendCount
 };

@@ -7,7 +7,12 @@
 	(BMediaFile, as MediaPlayer does) and says which decoder did it, how fast
 	and at what processor cost.
 
-	media_probe [-n pictures] [-f 422|rgb32|nv12|i420] file */
+	media_probe [-n pictures] [-f 422|rgb32|nv12|i420] [-o out.yuv]
+		[-s seconds] file
+
+	-o writes I420 pictures (-f i420) without their rows' padding, as
+	"ffmpeg -pix_fmt yuv420p" does, to compare with another decoder; -s
+	seeks there (to the key picture before it) after 30 pictures. */
 
 
 #include <stdio.h>
@@ -38,9 +43,17 @@ main(int argc, char** argv)
 {
 	int64 wanted = 300;
 	color_space space = B_YCbCr422;
+	const char* outPath = NULL;
+	bigtime_t seekTo = -1;
 	int option;
-	while ((option = getopt(argc, argv, "n:f:")) != -1) {
+	while ((option = getopt(argc, argv, "n:f:o:s:")) != -1) {
 		switch (option) {
+			case 'o':
+				outPath = optarg;
+				break;
+			case 's':
+				seekTo = (bigtime_t)(atof(optarg) * 1000000);
+				break;
 			case 'n':
 				wanted = atoll(optarg);
 				break;
@@ -56,13 +69,13 @@ main(int argc, char** argv)
 				break;
 			default:
 				fprintf(stderr, "usage: %s [-n pictures] "
-					"[-f 422|rgb32|nv12|i420] file\n", argv[0]);
+					"[-f 422|rgb32|nv12|i420] [-o out.yuv] [-s seconds] file\n", argv[0]);
 				return 1;
 		}
 	}
 	if (optind >= argc) {
 		fprintf(stderr, "usage: %s [-n pictures] [-f 422|rgb32|nv12|i420] "
-			"file\n", argv[0]);
+			"[-o out.yuv] [-s seconds] file\n", argv[0]);
 		return 1;
 	}
 
@@ -110,6 +123,22 @@ main(int argc, char** argv)
 		size_t size = (size_t)decoded.u.raw_video.display.bytes_per_row
 			* height * 2;
 		uint8* buffer = (uint8*)malloc(size);
+		FILE* out = NULL;
+		if (outPath != NULL && space == (color_space)0x49343230)
+			out = fopen(outPath, "wb");
+		if (seekTo >= 0) {
+			// a seek in the middle of decoding, as players do
+			for (int i = 0; i < 30; i++) {
+				int64 count = 0;
+				media_header header;
+				if (track->ReadFrames(buffer, &count, &header) != B_OK)
+					break;
+			}
+			bigtime_t time = seekTo;
+			status = track->SeekToTime(&time, B_MEDIA_SEEK_CLOSEST_BACKWARD);
+			printf("seek to %.3f s: %s, at %.3f s\n", seekTo / 1000000.0,
+				strerror(status), time / 1000000.0);
+		}
 		bigtime_t start = system_time();
 		bigtime_t cpuStart = team_cpu_time();
 		int64 pictures = 0;
@@ -119,6 +148,22 @@ main(int argc, char** argv)
 			status = track->ReadFrames(buffer, &count, &header);
 			if (status != B_OK)
 				break;
+			if (seekTo >= 0 && pictures < 3) {
+				printf("picture %" B_PRId64 " at %.6f s\n", pictures,
+					header.start_time / 1000000.0);
+			}
+			if (out != NULL && count > 0) {
+				uint32 stride = header.u.raw_video.bytes_per_row;
+				uint32 lines = header.u.raw_video.display_line_count;
+				uint32 columns = header.u.raw_video.display_line_width;
+				for (uint32 y = 0; y < lines; y++)
+					fwrite(buffer + (size_t)y * stride, 1, columns, out);
+				const uint8* chroma = buffer + (size_t)stride * lines;
+				for (uint32 y = 0; y < (lines + 1) / 2 * 2; y++) {
+					fwrite(chroma + (size_t)y * (stride / 2), 1,
+						(columns + 1) / 2, out);
+				}
+			}
 			pictures += count;
 		}
 		bigtime_t elapsed = system_time() - start;
@@ -129,6 +174,8 @@ main(int argc, char** argv)
 			cpu / 1000000.0, 100.0 * cpu / elapsed,
 			status != B_OK ? ", ended: " : "",
 			status != B_OK ? strerror(status) : "");
+		if (out != NULL)
+			fclose(out);
 		free(buffer);
 		file.ReleaseTrack(track);
 		return 0;

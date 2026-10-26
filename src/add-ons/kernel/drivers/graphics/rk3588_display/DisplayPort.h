@@ -9,6 +9,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include <dp_sink.h>
+
 #include "DisplayModeSet.h"
 #include "DisplayCursor.h"
 
@@ -659,11 +661,21 @@ uint32_t
 DpTrainLink(Hardware& hardware, DpProbeRequest& request)
 {
 	request.phase = kDpPhaseTrain;
-	uint8_t powerUp = 1;
-	uint32_t result = DpWriteDpcd(hardware, request, 0x600, &powerUp, 1);
-	if (result != kDpOK)
-		return result;
-	DpPause(hardware, 1000);
+	// the sink, or the converter in front of it, powered and in a mode we
+	// can feed (dp_sink.h)
+	if (dp_prepare_sink(
+			[&](uint32_t address) {
+				uint8_t value;
+				return DpAuxTransfer(hardware, request, kAuxNativeRead, address,
+					&value, 1) == kDpOK ? (int)value : -1;
+			},
+			[&](uint32_t address, uint8_t value) {
+				return DpWriteDpcd(hardware, request, address, &value, 1)
+					== kDpOK;
+			})) {
+		DpPause(hardware, 1000);
+	}
+	uint32_t result = kDpOK;
 	uint32_t rate = request.dpcd[1];
 	if (rate != 0x06 && rate != 0x0a && rate != 0x14 && rate != 0x1e)
 		rate = 0x0a;

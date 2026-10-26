@@ -364,7 +364,22 @@ MMCBus::_WorkerThread(void* cookie)
 	// out
 	snooze(30000);
 
+	// the published card's address: a scan request while it still answers
+	// (a second insertion event, say) leaves it alone; the scan's CMD0 would
+	// throw it back to the idle state, its address lost
+	uint16_t activeRca = 0;
+	int identifyRetries = 0;
 	while (bus->fStatus != B_SHUTTING_DOWN) {
+		if (activeRca != 0) {
+			uint32_t cardStatus;
+			if (bus->ExecuteCommand(0, SEND_STATUS, ((uint32)activeRca) << 16,
+					&cardStatus) == B_OK) {
+				TRACE("the card at RCA %x is still there\n", activeRca);
+				bus->_AcquireScanSemaphore();
+				continue;
+			}
+			activeRca = 0;
+		}
 		TRACE("Scanning the bus\n");
 
 		// Use the low speed clock and 1bit bus width for scanning
@@ -484,6 +499,7 @@ MMCBus::_WorkerThread(void* cookie)
 		uint16_t year;
 		uint16_t rca = 0;
 		bool cardFound = false;
+		status_t cidStatus = B_OK;
 		// This being an if statement as opposed to a while statement restricts
 		// it to one device per bus.
 		if ((cardType == CARD_TYPE_MMC) || (cardType == CARD_TYPE_MMC_EXTENDED_CAPACITY)) {
@@ -506,30 +522,38 @@ MMCBus::_WorkerThread(void* cookie)
 					cardFound = true;
 				}
 			}
-		} else if (bus->ExecuteCommand(0, ALL_SEND_CID, 0, cid) == B_OK) {
+		} else if ((cidStatus = bus->ExecuteCommand(0, ALL_SEND_CID, 0, cid))
+				== B_OK || cidStatus == B_IO_ERROR) {
+			// A CRC error on CMD2's long answer (seen on the Dragon Q8B's
+			// slot, now and then) means the card sent its CID and went on to
+			// the identification state, where it only takes CMD3: the CID is
+			// read again with CMD10 once it has its address.
+			if (cidStatus != B_OK)
+				ERROR("CMD2's answer was garbled, asking for the address\n");
 			status = bus->ExecuteCommand(0, SD_SEND_RELATIVE_ADDR, 0, &response);
 
 			TRACE("RCA: %x Status: %x\n", response >> 16, response & 0xFFFF);
 
+			// The card has an RCA and entered the data phase: our job is
+			// over, mmc_disk takes it. If not, it is tried again (below):
+			// one card a bus.
+			rca = response >> 16;
 			if (status != B_OK || (response & 0xFF00) != 0x500) {
 				TRACE("Card did not enter data state\n");
-				// This probably means there are no more cards to scan on the
-				// bus, so exit the loop.
-				break;
+			} else if (cidStatus != B_OK
+				&& bus->ExecuteCommand(0, SEND_CID, ((uint32)rca) << 16, cid)
+					!= B_OK) {
+				ERROR("CMD10 failed too\n");
+			} else {
+				SDCid sdCid(cid);
+				vendor = sdCid.VendorID();
+				sdCid.ProductName(name);
+				serial = sdCid.ProductSerial();
+				revision = sdCid.ProductRevision();
+				month = sdCid.ManufactureMonth();
+				year = sdCid.ManufactureYear();
+				cardFound = true;
 			}
-
-			// The card now has an RCA and it entered the data phase, which
-			// means our initializing job is over, we can pass it on to the
-			// mmc_disk driver.
-			rca = response >> 16;
-			SDCid sdCid(cid);
-			vendor = sdCid.VendorID();
-			sdCid.ProductName(name);
-			serial = sdCid.ProductSerial();
-			revision = sdCid.ProductRevision();
-			month = sdCid.ManufactureMonth();
-			year = sdCid.ManufactureYear();
-			cardFound = true;
 		}
 
 		uint32_t sectorCount = 0;
@@ -622,8 +646,10 @@ MMCBus::_WorkerThread(void* cookie)
 			};
 
 			// publish child device for the card
-			gDeviceManager->register_node(bus->fNode, MMC_BUS_MODULE_NAME,
-				attrs, NULL, NULL);
+			if (gDeviceManager->register_node(bus->fNode, MMC_BUS_MODULE_NAME,
+					attrs, NULL, NULL) == B_OK) {
+				activeRca = rca;
+			}
 		}
 
 		// TODO if there is a single card active, check if it supports CMD6
@@ -633,6 +659,20 @@ MMCBus::_WorkerThread(void* cookie)
 		// FIXME we also need to unpublish devices that are gone. Probably need
 		// to "ping" all RCAs somehow? Or is there an interrupt we can look for
 		// to detect added/removed cards?
+
+		// An SD card that answered ACMD41 but was not identified (a garbled
+		// or missing CMD2/CMD3 answer, now and then on the Dragon Q8B's
+		// slot): start again from the idle state a few times, before the
+		// scan goes on to MMC negotiation
+		if (!cardFound && cardType == CARD_TYPE_SD && identifyRetries < 3) {
+			identifyRetries++;
+			ERROR("SD card not identified, again from CMD0 (%d)\n",
+				identifyRetries);
+			bus->ExecuteCommand(0, GO_IDLE_STATE, 0, NULL);
+			snooze(30000);
+			continue;
+		}
+		identifyRetries = 0;
 
 		// Wait for the next scan request
 		// The thread will spend most of its time waiting here

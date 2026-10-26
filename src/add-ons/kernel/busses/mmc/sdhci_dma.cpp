@@ -8,6 +8,7 @@
 #include <arch/atomic.h>
 #include <vm/vm.h>
 #if defined(__aarch64__)
+#include <arch/arm64/arch_kernel.h>
 #include <arch/arm64/cache_line_size.h>
 
 static void
@@ -25,17 +26,38 @@ evict_allocation(void* memory, size_t size)
 #endif
 
 
-status_t
-sdhci_allocate_dma(area_id* area, void** buffer, phys_addr_t* address)
+void
+sdhci_clean_dma_alias(phys_addr_t address, size_t size)
 {
 #if defined(__aarch64__)
+	// as the NVMe driver's nvme_dma_clean_alias()
+	uint64 ctr;
+	asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+	size_t lineSize = arm64_data_cache_line_size(ctr);
+	addr_t start = (KERNEL_PMAP_BASE + address) & ~(addr_t)(lineSize - 1);
+	addr_t end = KERNEL_PMAP_BASE + address + size;
+	for (addr_t p = start; p < end; p += lineSize)
+		asm volatile("dc civac, %0" :: "r"(p) : "memory");
+	memory_full_barrier();
+#endif
+}
+
+
+status_t
+sdhci_allocate_dma(area_id* area, void** buffer, phys_addr_t* address,
+	size_t size)
+{
+#if defined(__aarch64__)
+	// the payload, or (with \a size) a page for its ADMA2 descriptors
+	const size_t kSdhciDmaSize = size != 0 ? size : ::kSdhciDmaSize;
 	virtual_address_restrictions virtualRestrictions = {};
 	physical_address_restrictions physicalRestrictions = {};
 	physicalRestrictions.high_address = UINT64_C(0x100000000);
 	physicalRestrictions.alignment = kSdhciDmaSize;
 	physicalRestrictions.boundary = kSdhciDmaSize;
 	void* memory;
-	area_id id = create_area_etc(B_SYSTEM_TEAM, "SDHCI DMA payload", kSdhciDmaSize,
+	area_id id = create_area_etc(B_SYSTEM_TEAM, size != 0
+			? "SDHCI ADMA descriptors" : "SDHCI DMA payload", kSdhciDmaSize,
 		B_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, 0, 0,
 		&virtualRestrictions, &physicalRestrictions, &memory);
 	if (id < B_OK)

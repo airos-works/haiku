@@ -119,6 +119,7 @@ private:
 private:
 			status_t			_Load(const PackageSettings& settings);
 			bool				_InitVersionedName();
+			int					_OpenMovedFile();
 
 private:
 			mutex				fLock;

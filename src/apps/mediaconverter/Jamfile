@@ -2,10 +2,11 @@ SubDir HAIKU_TOP src apps mediaconverter ;
 
 # MediaConverter: the air/OS converter. The engine (engine/) is FFmpeg for
 # reading, decoding, filtering and writing, with the encoders of
-# VideoEncoder: the GPUs' through VA-API (AMD) and NVENC (NVIDIA), and on the
+# VideoEncoder: the GPUs' through VA-API (AMD) and NVENC (NVIDIA), the
+# Qualcomm SC8280XP's Iris codec (qcom_video's IrisEncoder), and on the
 # CPU x264, x265 and SVT-AV1 (opened at run time) and FFmpeg's own.
 
-UsePrivateHeaders interface shared media ;
+UsePrivateHeaders drivers interface shared media ;
 UsePrivateSystemHeaders ;
 SubDirHdrs [ FDirName $(SUBDIR) engine ] ;
 SubDirSysHdrs [ FDirName $(SUBDIR) thirdparty ] ;
@@ -16,12 +17,19 @@ SEARCH_SOURCE += [ FDirName $(SUBDIR) engine ] ;
 SEARCH_SOURCE += [ FDirName $(SUBDIR) app ] ;
 SEARCH_SOURCE += [ FDirName $(SUBDIR) app airtime ] ;
 SEARCH_SOURCE += [ FDirName $(SUBDIR) cli ] ;
+# the qcom_video add-on's encoder, for the Qualcomm SC8280XP's video codec
+SubDirHdrs $(HAIKU_TOP) src add-ons media plugins qcom_video ;
+SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src add-ons media plugins qcom_video ] ;
 
 local engineSources =
 	BitWriter.cpp
 	DiscSource.cpp
+	IrisDevice.cpp
+	IrisEncoder.cpp
+	IrisSession.cpp
 	Formats.cpp
 	HardwareCaps.cpp
+	IrisVideoEncoder.cpp
 	LavcVideoEncoder.cpp
 	MediaProbe.cpp
 	NvencEncoder.cpp

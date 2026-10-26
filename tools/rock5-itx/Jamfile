@@ -16,6 +16,7 @@ SimpleTest rock5_mali_client_probe : mali_client_probe.cpp ;
 SimpleTest rock5_mali_vm_probe : mali_vm_probe.cpp ;
 SimpleTest rock5_mali_queue_probe : mali_queue_probe.cpp ;
 UseHeaders [ FDirName $(HAIKU_TOP) src add-ons kernel drivers graphics rk3588_display ] ;
+UsePrivateHeaders [ FDirName graphics common ] ;
 SimpleTest rock5_display_probe : display_probe.cpp ;
 SEARCH on [ FGristFiles CsfFirmware.cpp ]
 	= [ FDirName $(HAIKU_TOP) src add-ons kernel drivers graphics mali_csf ] ;

@@ -26,6 +26,8 @@ class DisplayResourcesTest(unittest.TestCase):
                 'g++', '-pthread', '-std=c++17', '-Wall', '-Wextra', '-Werror', '-g',
                 '-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-no-pie',
                 '-I', str(source), '-I', str(root),
+                '-I', str(directory.parents[1] / 'headers' / 'private' / 'graphics'
+                    / 'common'),
                 str(directory / 'test_display_resources.cpp'), '-o', str(binary),
             ], capture_output=True, text=True)
             self.assertEqual(built.returncode, 0, built.stdout + built.stderr)

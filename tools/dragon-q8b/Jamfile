@@ -1,0 +1,49 @@
+SubDir HAIKU_TOP tools dragon-q8b ;
+
+# Lab tools for the Radxa Dragon Q8B, built only by a UserBuildConfig that
+# includes this directory.
+UsePrivateHeaders graphics ;
+
+Application adreno_test :
+	adreno_test.cpp
+;
+
+UsePrivateHeaders interface drivers ;
+
+Application iris_test :
+	iris_test.cpp
+;
+
+SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src add-ons media plugins qcom_video ] ;
+
+SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) tools cubie-a7s ] ;
+
+SimpleTest media_probe : media_probe.cpp : be media [ TargetLibsupc++ ] ;
+
+Application iris_encode :
+	iris_encode.cpp
+	IrisDecoder.cpp
+	IrisDevice.cpp
+	IrisEncoder.cpp
+	IrisSession.cpp
+	: be [ TargetLibsupc++ ] [ TargetLibstdc++ ]
+;
+
+Application iris_decode :
+	iris_decode.cpp
+	IrisDecoder.cpp
+	IrisDevice.cpp
+	IrisSession.cpp
+	: be [ TargetLibsupc++ ] [ TargetLibstdc++ ]
+;
+
+Application display_layout :
+	display_layout.cpp
+	: be [ TargetLibsupc++ ]
+;
+
+UsePrivateKernelHeaders ;
+
+KernelAddon qcom_probe :
+	qcom_probe.cpp
+;

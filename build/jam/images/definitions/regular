@@ -52,6 +52,7 @@ SYSTEM_APPS += [ FFilterByBuildFeatures
 	SerialConnect
 	SoftwareUpdater
 	SoundRecorder
+	SystemUpdater
 ] ;
 
 # air/OS: ActivityMonitor and MediaPlayer stay in the image without a menu
@@ -253,10 +254,11 @@ SYSTEM_ADD_ONS_MEDIA_PLUGINS += [ FFilterByBuildFeatures
 	ape_reader@x86
 	ffmpeg@ffmpeg,!arm64
 	http_streamer
+	00_qcom_video@arm64
 	raw_decoder
 	rpi_hevc@arm64
 	rpi_mmal@arm64
-	sunxi_cedar@arm64
+	00_sunxi_cedar@arm64
 ] ;
 
 SYSTEM_ADD_ONS_PRINT += [ FFilterByBuildFeatures

@@ -31,13 +31,16 @@ Hub::Hub(Object *parent, int8 hubAddress, uint8 hubPort,
 			depth, controllerCookie),
 		fInterruptPipe(NULL),
 		fPortCount(0),
-		fPowerOnToPowerGood(0)
+		fPowerOnToPowerGood(0),
+		fUnansweredExplores(0)
 {
 	TRACE("creating hub\n");
 
 	memset(fPlatformResets, 0, sizeof(fPlatformResets));
 	memset(fEnumerationFailures, 0, sizeof(fEnumerationFailures));
 	memset(fNextEnumeration, 0, sizeof(fNextEnumeration));
+	memset(fNextWarmReset, 0, sizeof(fNextWarmReset));
+	memset(fWarmResets, 0, sizeof(fWarmResets));
 	for (int32 i = 0; i < USB_MAX_PORT_COUNT; i++)
 		fChildren[i] = NULL;
 
@@ -256,10 +259,20 @@ Hub::DisablePort(uint8 index)
 void
 Hub::Explore(change_item **changeList)
 {
+	// A hub that answers no port status request (its link lost, say a
+	// SuperSpeed hub whose lanes went to DisplayPort) is asked only every
+	// 16th round after 8 rounds without an answer, not flooding its bus.
+	static const uint32 kQuietAfter = 8;
+	if (fUnansweredExplores >= kQuietAfter
+		&& (++fUnansweredExplores - kQuietAfter) % 16 != 0) {
+		return;
+	}
+	bool answered = false;
 	for (int32 i = 0; i < fPortCount; i++) {
 		status_t result = UpdatePortStatus(i);
 		if (result < B_OK)
 			continue;
+		answered = true;
 
 #ifdef TRACE_USB
 		if (fPortStatus[i].change) {
@@ -274,6 +287,18 @@ Hub::Explore(change_item **changeList)
 		// An empty port forgets the failures of the device it had.
 		if ((fPortStatus[i].status & PORT_STATUS_CONNECTION) == 0)
 			fEnumerationFailures[i] = 0;
+
+		// A warm reset leaves the device on the port in its default state,
+		// without its address: it is enumerated again (as after Linux'
+		// hub_port_reset()).
+		if ((fPortStatus[i].change & PORT_CHANGE_BH_PORT_RESET) != 0
+			&& (fPortStatus[i].status & PORT_STATUS_CONNECTION) != 0
+			&& fChildren[i] != NULL) {
+			TRACE_ALWAYS("port %" B_PRId32 ": enumerating the device again "
+				"after its warm reset\n", i);
+			fChildren[i]->Changed(changeList, false);
+			fChildren[i] = NULL;
+		}
 
 		if ((fPortStatus[i].change & PORT_STATUS_CONNECTION)
 				|| ((fPortStatus[i].status & PORT_STATUS_CONNECTION)
@@ -460,6 +485,28 @@ Hub::Explore(change_item **changeList)
 				0, NULL, 0, NULL);
 		}
 
+		// A SuperSpeed link in SS.Inactive or Compliance (a USB-C port's lanes
+		// moved by its mux, say) recovers only by a warm reset
+		// (hub_port_warm_reset_required())
+		// (a USB-C port whose lanes all carry DisplayPort stays inactive)
+		uint16 linkState = fPortStatus[i].status & (0xf << 5);
+		bool stuck = linkState == (0x6 << 5) || linkState == (0xa << 5);
+		if (!stuck)
+			fWarmResets[i] = 0;
+		if ((fPortStatus[i].status & PORT_STATUS_SS_POWER) != 0 && stuck
+			&& system_time() >= fNextWarmReset[i]) {
+			// three tries two seconds apart, then one every 20 s (its PHY
+			// may be set up again meanwhile)
+			fWarmResets[i] = min_c(fWarmResets[i] + 1, 3);
+			fNextWarmReset[i] = system_time()
+				+ (fWarmResets[i] < 3 ? 2000000 : 20000000);
+			TRACE_ALWAYS("port %" B_PRId32 ": SuperSpeed link %s, warm reset\n",
+				i, linkState == (0x6 << 5) ? "inactive" : "in compliance mode");
+			DefaultPipe()->SendRequest(USB_REQTYPE_CLASS | USB_REQTYPE_OTHER_OUT,
+				USB_REQUEST_SET_FEATURE, PORT_BH_PORT_RESET, i + 1, 0, NULL, 0,
+				NULL);
+		}
+
 		if (fPortStatus[i].change & PORT_CHANGE_BH_PORT_RESET) {
 			TRACE_ALWAYS("port %" B_PRId32 " was warm reset\n", i);
 			DefaultPipe()->SendRequest(USB_REQTYPE_CLASS | USB_REQTYPE_OTHER_OUT,
@@ -475,6 +522,15 @@ Hub::Explore(change_item **changeList)
 			continue;
 
 		((Hub *)fChildren[i])->Explore(changeList);
+	}
+
+	if (answered) {
+		if (fUnansweredExplores >= kQuietAfter)
+			TRACE_ALWAYS("the hub answers again\n");
+		fUnansweredExplores = 0;
+	} else if (fUnansweredExplores < kQuietAfter
+		&& ++fUnansweredExplores == kQuietAfter) {
+		TRACE_ALWAYS("the hub does not answer: asking it less often\n");
 	}
 }
 

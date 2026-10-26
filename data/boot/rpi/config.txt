@@ -9,12 +9,14 @@ enable_gic=1
 arm_boost=1
 
 # The loader has no Linux image header, so say where it is linked.
-kernel=airos-loader.img
 kernel_address=0x80000
 
-# The kernel and the modules that mount the boot volume, loaded right behind
-# the loader. The loader finds it through /chosen in the device tree.
-initramfs airos-boot.tgz followkernel
+# The loader (kernel=) and the boot archive: the kernel and the modules that
+# mount the boot volume, loaded right behind the loader, which finds it
+# through /chosen in the device tree. airos-boot.txt names the pair of the
+# version that starts: the image's own here, another version's in
+# airos/<version>/ once System Updater has installed one.
+include airos-boot.txt
 
 # Serial console on GPIO 14/15 (PL011, 115200 8N1). Bluetooth gets the mini
 # UART (GPIO 30 to 33).

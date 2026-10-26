@@ -17,6 +17,7 @@
 #include <StorageDefs.h>
 
 #include <AutoDeleter.h>
+#include <airos_boot_control.h>
 
 #include <boot/platform.h>
 #include <boot/partitions.h>
@@ -466,7 +467,8 @@ BootVolume::BootVolume()
 	fRootDirectory(NULL),
 	fSystemDirectory(NULL),
 	fPackageVolumeInfo(NULL),
-	fPackageVolumeState(NULL)
+	fPackageVolumeState(NULL),
+	fAirosBootMode(NULL)
 {
 }
 
@@ -511,6 +513,8 @@ BootVolume::Unset()
 		fPackageVolumeInfo = NULL;
 		fPackageVolumeState = NULL;
 	}
+
+	fAirosBootMode = NULL;
 }
 
 
@@ -558,8 +562,19 @@ BootVolume::_SetTo(Directory* rootDirectory,
 		fPackageVolumeInfo->AcquireReference();
 	}
 
+	if (packageVolumeState != NULL)
+		fAirosBootMode = AIROS_BOOT_MODE_MANUAL;
+	else
+		packageVolumeState = _ChooseAirosState();
+
 	fPackageVolumeState = packageVolumeState != NULL
 		? packageVolumeState : fPackageVolumeInfo->States().Head();
+	if (!fPackageVolumeState->IsBootable()) {
+		dprintf("diag: BootVolume: state \"%s\" has no system package\n",
+			fPackageVolumeState->DisplayName());
+		Unset();
+		return B_ENTRY_NOT_FOUND;
+	}
 
 	// try opening the system package
 	int packageFD = _OpenSystemPackage();
@@ -587,6 +602,57 @@ BootVolume::_SetTo(Directory* rootDirectory,
 	fSystemDirectory = packageRootDirectory;
 
 	return B_OK;
+}
+
+
+/*!	air/OS: the state System Updater asks for (airos_boot_control.h): a state
+	to start once, the fallback of an update that did not start, or the
+	newest old state when the latest one cannot start. Returns NULL for the
+	latest state.
+*/
+PackageVolumeState*
+BootVolume::_ChooseAirosState()
+{
+	struct Reader {
+		PackageVolumeInfo* info;
+
+		ssize_t ReadFile(const char* name, char* buffer, size_t size)
+		{
+			return info->ReadBootControlFile(name, buffer, size);
+		}
+
+		bool StateExists(const char* name)
+		{
+			info->LoadOldStates();
+			PackageVolumeState* state = info->FindState(name);
+			return state != NULL && state->IsBootable();
+		}
+
+		bool LatestBootable()
+		{
+			return info->States().Head()->IsBootable();
+		}
+
+		const char* NewestOldState()
+		{
+			info->LoadOldStates();
+			PackageVolumeState* state = info->NewestBootableOldState();
+			return state != NULL ? state->Name() : NULL;
+		}
+	} reader = { fPackageVolumeInfo };
+
+	char stateName[B_FILE_NAME_LENGTH];
+	airos_boot_mode mode = airos_choose_boot_state(reader, stateName,
+		sizeof(stateName));
+	fAirosBootMode = airos_boot_mode_name(mode);
+	if (mode == AIROS_BOOT_DEFAULT)
+		return NULL;
+
+	PackageVolumeState* state = stateName[0] != '\0'
+		? fPackageVolumeInfo->FindState(stateName) : NULL;
+	dprintf("airos boot: %s start of %s\n", fAirosBootMode,
+		state != NULL ? state->DisplayName() : "the latest state");
+	return state;
 }
 
 
@@ -672,6 +738,10 @@ register_boot_file_system(BootVolume& bootVolume)
 		PackageVolumeState* state = bootVolume.GetPackageVolumeState();
 		if (state->Name() != NULL)
 			gBootParams.AddString(BOOT_VOLUME_PACKAGES_STATE, state->Name());
+		if (bootVolume.AirosBootMode() != NULL) {
+			gBootParams.AddString(BOOT_VOLUME_AIROS_BOOT,
+				bootVolume.AirosBootMode());
+		}
 	}
 
 	Node *device = get_node_from(partition->FD());

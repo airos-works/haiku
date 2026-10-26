@@ -11,6 +11,7 @@
 #include <PCI.h>
 
 #if defined(__aarch64__)
+#include <arch/arm64/arch_kernel.h>
 #include <arch/arm64/cache_line_size.h>
 #include <driver_settings.h>
 #endif
@@ -144,6 +145,22 @@ nvme_mem_vtophys(void* vaddr)
 
 	return entry.address;
 }
+
+
+#if defined(NVME_HAIKU_NONCOHERENT_DMA)
+void
+nvme_dma_clean_alias(uint64_t physical, size_t size)
+{
+	uint64 ctr;
+	asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+	const size_t lineSize = arm64_data_cache_line_size(ctr);
+	addr_t start = (KERNEL_PMAP_BASE + physical) & ~(addr_t)(lineSize - 1);
+	addr_t end = KERNEL_PMAP_BASE + physical + size;
+	for (addr_t p = start; p < end; p += lineSize)
+		asm volatile("dc civac, %0" :: "r"(p) : "memory");
+	memory_full_barrier();
+}
+#endif
 
 
 #if defined(NVME_HAIKU_NONCOHERENT_DMA)

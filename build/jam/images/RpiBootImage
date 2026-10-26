@@ -126,6 +126,7 @@ rule BuildRpiSDImage image : loader : archive : textFiles
 }
 
 # out : mbrtool fatshell os_image loader archive config.txt cmdline.txt
+#	airos-boot.txt
 actions BuildRpiSDImage1
 {
 	$(RM) $(1)
@@ -161,6 +162,7 @@ actions BuildRpiSDImage1
 	echo "cp --ignore-attributes :$(2[5]) myfs/airos-boot.tgz" | $FATFS $(1)
 	echo "cp --ignore-attributes :$(2[6]) myfs/config.txt" | $FATFS $(1)
 	echo "cp --ignore-attributes :$(2[7]) myfs/cmdline.txt" | $FATFS $(1)
+	echo "cp --ignore-attributes :$(2[8]) myfs/airos-boot.txt" | $FATFS $(1)
 
 	for file in "$firmware"/*.elf "$firmware"/*.dat "$firmware"/*.dtb \
 			"$firmware"/LICENCE.broadcom ; do
@@ -181,7 +183,8 @@ actions BuildRpiSDImage1
 }
 
 if $(TARGET_ARCH) = arm64 {
-	local rpiTextFiles = <rpi-boot>config.txt <rpi-boot>cmdline.txt ;
+	local rpiTextFiles = <rpi-boot>config.txt <rpi-boot>cmdline.txt
+		<rpi-boot>airos-boot.txt ;
 	SEARCH on $(rpiTextFiles) = [ FDirName $(HAIKU_TOP) data boot rpi ] ;
 
 	MakeLocate $(HAIKU_RPI_IMAGE_NAME) : $(HAIKU_OUTPUT_DIR) ;

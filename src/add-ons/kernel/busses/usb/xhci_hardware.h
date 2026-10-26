@@ -171,7 +171,7 @@
 #define PS_CAS					(1 << 24)
 #define PS_WCE					(1 << 25)
 #define PS_WDE					(1 << 26)
-#define PS_WPR					(1 << 30)
+#define PS_WPR					(1u << 31)	// warm port reset (xHCI 5.4.8)
 
 #define PS_CLEAR				0x80FF00F7U
 

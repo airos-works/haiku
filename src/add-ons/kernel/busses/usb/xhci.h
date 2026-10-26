@@ -360,6 +360,9 @@ private:
 			uint8				fPortCount;
 			uint8				fSlotCount;
 			usb_speed			fPortSpeeds[XHCI_MAX_PORTS];
+			// a warm reset change that does not clear (a USB-C port whose
+			// lanes all carry DisplayPort: no clock for its USB 3 side)
+			bool				fStuckWarmResetChange[XHCI_MAX_PORTS];
 
 			// Scratchpad
 			uint32				fScratchpadCount;

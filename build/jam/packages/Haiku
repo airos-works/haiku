@@ -145,6 +145,7 @@ AddNewDriversToPackage graphics :
 	rpi_display@arm64
 	rpi_dsi@arm64
 	powervr@arm64
+	qcom_display@arm64
 	sunxi_display@arm64
 	v3d@arm64
 	virtio_gpu
@@ -170,6 +171,7 @@ AddNewDriversToPackage display :
 #	display_adapter@x86
 	;
 AddNewDriversToPackage audio hmulti :
+	qcom_audio@arm64
 #	virtio_sound
 	;
 AddNewDriversToPackage hyperv :
@@ -212,8 +214,16 @@ if $(TARGET_ARCH) = arm64 {
 	AddNewDriversToPackage misc :
 		sunxi_ve
 		;
-	# the SoC temperature from the firmware, in the thermal drivers' format
+	# the SC8280XP's video codec (Dragon Q8B) for the qcom_video add-on
+	AddDriversToPackage video :
+		qcom_iris
+		;
+	# the SoC temperature, in the thermal drivers' format: from the Pi's
+	# firmware, from the Qualcomm SoCs' TSENS (Dragon Q8B); the Qualcomm
+	# PMICs' power key, as acpi_button's power button
 	AddDriversToPackage power :
+		<driver>qcom_pwrkey
+		<driver>qcom_thermal
 		<driver>rpi_thermal
 		;
 }
@@ -432,6 +442,8 @@ if $(TARGET_ARCH) = arm64 {
 	AddFilesToPackage add-ons accelerants : rpi_display.accelerant ;
 	# the Allwinner A733's display outputs (Radxa Cubie A7S)
 	AddFilesToPackage add-ons accelerants : sunxi_display.accelerant ;
+	# the Qualcomm SC8280XP's display outputs (Radxa Dragon Q8B)
+	AddFilesToPackage add-ons accelerants : qcom_display.accelerant ;
 }
 AddFilesToPackage add-ons locale catalogs :
 	$(SYSTEM_ADD_ONS_LOCALE_CATALOGS) ;
@@ -544,6 +556,11 @@ AddDirectoryToPackage data deskbar menu Applications
 for linkTarget in $(DESKBAR_APPLICATIONS) {
 	AddSymlinkToPackage data deskbar menu Applications
 		: ../../../../apps/$(linkTarget) : $(linkTarget) ;
+}
+# air/OS: System Updater, named as people say it
+if SystemUpdater in $(SYSTEM_APPS) {
+	AddSymlinkToPackage data deskbar menu Applications
+		: ../../../../apps/SystemUpdater : "System Updater" ;
 }
 
 # Office and Media applications supply their links in their own packages.

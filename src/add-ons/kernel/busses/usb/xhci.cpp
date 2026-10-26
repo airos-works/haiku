@@ -642,6 +642,7 @@ XHCI::XHCI(pci_info *info, 	pci_device_module_info* pci, pci_device* device, Sta
 	fInterruptInstalled = true;
 
 	memset(fPortSpeeds, 0, sizeof(fPortSpeeds));
+	memset(fStuckWarmResetChange, 0, sizeof(fStuckWarmResetChange));
 	memset((void*)fDevices, 0, sizeof(fDevices));
 
 	fInitOK = true;
@@ -3340,7 +3341,9 @@ XHCI::GetPortStatus(uint8 index, usb_port_status* status)
 	if (fPortSpeeds[index] >= USB_SPEED_SUPERSPEED) {
 		if (portStatus & PS_PLC)
 			status->change |= PORT_CHANGE_LINK_STATE;
-		if (portStatus & PS_WRC)
+		if ((portStatus & PS_WRC) == 0)
+			fStuckWarmResetChange[index] = false;
+		else if (!fStuckWarmResetChange[index])
 			status->change |= PORT_CHANGE_BH_PORT_RESET;
 	}
 
@@ -3377,6 +3380,28 @@ XHCI::SetPortFeature(uint8 index, uint16 feature)
 		case PORT_RESET:
 			WriteOpReg(portRegister, portStatus | PS_PR);
 			break;
+		case PORT_BH_PORT_RESET:
+			// a warm reset, SuperSpeed ports only
+			if (fPortSpeeds[index] < USB_SPEED_SUPERSPEED
+				&& (portStatus & PS_PLS_MASK) != PS_XDEV_INACTIVE
+				&& (portStatus & PS_PLS_MASK) != PS_XDEV_COMP_MODE)
+				return B_BAD_VALUE;
+		{
+			uint32 before = ReadOpReg(portRegister);
+			WriteOpReg(portRegister, portStatus | PS_WPR);
+			uint32 after = before;
+			for (int i = 0; i < 20; i++) {
+				snooze(10000);
+				after = ReadOpReg(portRegister);
+				if ((after & (PS_WRC | PS_PRC)) != 0)
+					break;
+			}
+			TRACE_ALWAYS("port %u warm reset: PORTSC %#" B_PRIx32 " -> %#"
+				B_PRIx32 " (link state %" B_PRIu32 ", connected %d)\n", index,
+				before, after, (after & PS_PLS_MASK) >> 5,
+				(after & PS_CCS) != 0);
+			break;
+		}
 		case PORT_POWER:
 			WriteOpReg(portRegister, portStatus | PS_PP);
 			break;
@@ -3443,6 +3468,12 @@ XHCI::ClearPortFeature(uint8 index, uint16 feature)
 			break;
 		case C_PORT_BH_PORT_RESET:
 			WriteOpReg(portRegister, portStatus | PS_WRC);
+			if ((ReadOpReg(portRegister) & PS_WRC) != 0
+				&& !fStuckWarmResetChange[index]) {
+				TRACE_ALWAYS("port %u: its warm reset change does not clear, "
+					"not reporting it\n", index);
+				fStuckWarmResetChange[index] = true;
+			}
 			break;
 		case C_PORT_LINK_STATE:
 			WriteOpReg(portRegister, portStatus | PS_PLC);

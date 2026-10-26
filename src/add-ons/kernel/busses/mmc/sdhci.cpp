@@ -68,6 +68,9 @@ SdhciBus::SdhciBus(struct registers* registers, uint32_t irq, bool poll,
 	fDMAArea(-1),
 	fDMABuffer(NULL),
 	fDMAAddress(0),
+	fAdmaArea(-1),
+	fAdmaTable(NULL),
+	fAdmaAddress(0),
 	fDMAQuarantined(false),
 	fReportedHighCpuRead(false),
 	fReportedHighCpuWrite(false)
@@ -158,6 +161,24 @@ SdhciBus::SdhciBus(struct registers* registers, uint32_t irq, bool poll,
 	fStatus = sdhci_allocate_dma(&fDMAArea, &fDMABuffer, &fDMAAddress);
 	if (fStatus != B_OK)
 		return;
+	if (platform != NULL && platform->adma_only) {
+		void* table;
+		fStatus = sdhci_allocate_dma(&fAdmaArea, &table, &fAdmaAddress,
+			B_PAGE_SIZE);
+		if (fStatus != B_OK)
+			return;
+		fAdmaTable = (uint32*)table;
+	}
+	if (platform != NULL && platform->dma_allocated != NULL) {
+		fStatus = platform->dma_allocated(platform->cookie, fDMAAddress,
+			kSdhciDmaSize);
+		if (fStatus == B_OK && fAdmaTable != NULL) {
+			fStatus = platform->dma_allocated(platform->cookie, fAdmaAddress,
+				B_PAGE_SIZE);
+		}
+		if (fStatus != B_OK)
+			return;
+	}
 #endif
 
 	// Finally, configure some useful interrupts
@@ -196,6 +217,8 @@ SdhciBus::~SdhciBus()
 
 	if (fInterruptInstalled)
 		remove_io_interrupt_handler(fIrq, sdhci_generic_interrupt, this);
+	if (fAdmaArea >= B_OK)
+		delete_area(fAdmaArea);
 	if (fDMAArea >= B_OK) {
 		if (!fDMAQuarantined || fRegisters->software_reset.ResetAll())
 			delete_area(fDMAArea);
@@ -303,6 +326,7 @@ SdhciBus::ExecuteCommand(uint8_t command, uint32_t argument, uint32_t* response)
 			break;
 		case ALL_SEND_CID:
 		case SEND_CSD:
+		case SEND_CID:
 			replyType = Command::kR2Type;
 			break;
 		case MMC_SEND_OP_COND:
@@ -382,6 +406,15 @@ SdhciBus::ExecuteCommand(uint8_t command, uint32_t argument, uint32_t* response)
 
 	status_t status = WaitForCompletion(SDHCI_INT_CMD_CMP, 1000000);
 	if (status != B_OK) {
+		if ((atomic_get(&fCommandResult) & SDHCI_INT_ADMA_ERROR) != 0) {
+			ERROR("DMA error: host control %#x, 2 %#x, SDMA address %#"
+				B_PRIx32 ", ADMA address %#" B_PRIx64 ", ADMA error %#x, "
+				"version %#x\n", fRegisters->host_control.Bits(),
+				fRegisters->host_control_2, fRegisters->system_address,
+				fRegisters->adma_system_address,
+				fRegisters->adma_error_status,
+				*(volatile uint16_t*)((volatile uint8_t*)fRegisters + 0xfe));
+		}
 		ERROR("Command %u failed: %s (status %#x)\n", command,
 			strerror(status), (uint32_t)atomic_get(&fCommandResult));
 		RecoverError();
@@ -573,9 +606,31 @@ SdhciBus::DoIO(uint8_t command, IOOperation* operation, bool offsetAsSectors)
 			} else
 				memset(fDMABuffer, 0, size);
 			memory_full_barrier();
+			if (fPlatform.dma_coherent)
+				sdhci_clean_dma_alias(fDMAAddress, size);
 		}
-		fRegisters->host_control.SetDMAMode(HostControl::kSdma);
-		fRegisters->system_address = fDMABuffer != NULL ? fDMAAddress : vecs[i].base;
+		if (fAdmaTable != NULL && fDMABuffer != NULL) {
+			// 32-bit ADMA2: attribute (valid, end, transfer), a length of up
+			// to 64 KiB (0: 64 KiB), the address
+			uint32 descriptor = 0;
+			for (generic_size_t done = 0; done < size; done += 65536) {
+				uint32 length = std::min((generic_size_t)65536, size - done);
+				uint32 attribute = 0x21 | (done + length >= size ? 0x02 : 0);
+				fAdmaTable[2 * descriptor] = attribute
+					| (length == 65536 ? 0 : length) << 16;
+				fAdmaTable[2 * descriptor + 1] = fDMAAddress + done;
+				descriptor++;
+			}
+			memory_full_barrier();
+			if (fPlatform.dma_coherent)
+				sdhci_clean_dma_alias(fAdmaAddress, 8 * descriptor);
+			fRegisters->host_control.SetDMAMode(HostControl::kAdma32);
+			fRegisters->adma_system_address = fAdmaAddress;
+		} else {
+			fRegisters->host_control.SetDMAMode(HostControl::kSdma);
+			fRegisters->system_address = fDMABuffer != NULL
+				? fDMAAddress : vecs[i].base;
+		}
 		fRegisters->block_size.ConfigureTransfer(blockSize, BlockSize::kDmaBoundary512K);
 		fRegisters->block_count = size / blockSize;
 		uint32_t response = 0;
@@ -1103,5 +1158,9 @@ module_info* modules[] = {
 	(module_info* )&gSDHCIACPIDeviceModule,
 	(module_info* )&gSDHCIFDTDriverModule,
 	(module_info* )&gSDHCIFDTDeviceModule,
+#if defined(__aarch64__)
+	(module_info* )&gSDHCIQcomDriverModule,
+	(module_info* )&gSDHCIQcomDeviceModule,
+#endif
 	NULL
 };
