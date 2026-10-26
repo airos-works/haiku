@@ -958,6 +958,31 @@ Journal::_FlushLog(bool canWait, bool flushBlocks, bool alreadyLocked)
 }
 
 
+/*!	Writes the current log entry to disk if the given block was changed in
+	it, which makes that change durable: the entry ends with flushing the
+	drive's own cache. The changed blocks themselves are written later;
+	replaying the log recovers them after a crash.
+*/
+status_t
+Journal::FlushLogIfChanged(off_t blockNumber)
+{
+	status_t status = recursive_lock_lock(&fLock);
+	if (status != B_OK)
+		return status;
+
+	if (recursive_lock_get_recursion(&fLock) == 1 && fUnwrittenTransactions != 0
+		&& cache_has_block_in_transaction(fVolume->BlockCache(), fTransactionID,
+			blockNumber)) {
+		status = _WriteTransactionToLog();
+		if (status < B_OK)
+			FATAL(("writing current log entry failed: %s\n", strerror(status)));
+	}
+
+	recursive_lock_unlock(&fLock);
+	return status;
+}
+
+
 /*!	Flushes the current log entry to disk, and also writes back all dirty
 	blocks for this volume (completing all open transactions).
 */

@@ -6528,6 +6528,15 @@ common_sync(int fd, bool dataOnly, bool kernel)
 	else
 		status = B_UNSUPPORTED;
 
+	// What the file system wrote may still be in the drive's own cache, where
+	// a power cut loses it. (Not done when the VFS writes back a vnode it
+	// frees, which also uses the fsync hook.)
+	struct fs_mount* mount = vnode->mount;
+	if (status == B_OK && mount->partition != NULL
+		&& mount->partition->Device() != NULL) {
+		ioctl(mount->partition->Device()->FD(), B_FLUSH_DRIVE_CACHE);
+	}
+
 	return status;
 }
 

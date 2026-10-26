@@ -35,6 +35,7 @@ public:
 			size_t			CurrentTransactionSize() const;
 			bool			CurrentTransactionTooLarge() const;
 
+			status_t		FlushLogIfChanged(off_t blockNumber);
 			status_t		FlushLogAndBlocks();
 			status_t		FlushLogAndLockJournal();
 
