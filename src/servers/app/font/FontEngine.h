@@ -60,8 +60,14 @@ enum glyph_data_type {
 	glyph_data_mono		= 1,
 	glyph_data_gray8	= 2,
 	glyph_data_outline	= 3,
-	glyph_data_subpix   = 4
+	glyph_data_subpix   = 4,
+	glyph_data_color	= 5
+		// RGBA pixels, not premultiplied, of the bounds' size
 };
+
+
+class ColorGlyphRenderer;
+class OpenTypeLigatures;
 
 
 class FontEngine {
@@ -101,6 +107,17 @@ class FontEngine {
 			uint32				GlyphIndexForGlyphCode(uint32 glyphCode) const;
 			bool				PrepareGlyph(uint32 glyphIndex);
 
+			// Color fonts (bitmaps, 'COLR' layers or paints) draw their
+			// glyphs as glyph_data_color.
+			bool				HasColorGlyphs() const
+									{ return fColorGlyphs; }
+			// Maps an emoji sequence (without variation selectors) to the
+			// glyph of the longest prefix of it that the font joins into
+			// one glyph; usedCodes returns the length of that prefix.
+			bool				ShapeSequence(const uint32* codes,
+									int32 count, uint32& glyphIndex,
+									int32& usedCodes);
+
 			uint32				DataSize() const
 									{ return fDataSize; }
 			glyph_data_type		DataType() const
@@ -131,6 +148,12 @@ class FontEngine {
 								FontEngine(const FontEngine&);
 			const FontEngine&	operator=(const FontEngine&);
 
+			bool				_PrepareColorGlyph(uint32 glyphIndex);
+			bool				_SetColorBitmap(const uint8* pixels,
+									int32 width, int32 height,
+									int32 stride, bool bgra, double scale,
+									int32 left, int32 top);
+
 			int					fLastError;
 			bool				fLibraryInitialized;
 			FT_Library			fLibrary;	// handle to library
@@ -139,6 +162,15 @@ class FontEngine {
 			glyph_rendering		fGlyphRendering;
 			bool				fHinting;
 			bool				fDeviceScaled;
+			double				fPixelSize;
+
+			bool				fColorGlyphs;
+			double				fBitmapScale;
+				// from the selected bitmap strike to the size
+			ColorGlyphRenderer*	fColorRenderer;
+			OpenTypeLigatures*	fLigatures;
+			bool				fLigaturesLoaded;
+			uint8*				fColorData;
 
 			// members needed to generate individual glyphs according
 			// to glyph rendering type

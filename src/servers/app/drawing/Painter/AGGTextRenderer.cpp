@@ -12,7 +12,11 @@
 #include <agg_conv_stroke.h>
 #include <agg_conv_transform.h>
 #include <agg_path_storage.h>
+#include <agg_pixfmt_rgba.h>
 #include <agg_scanline_boolean_algebra.h>
+#include <agg_span_allocator.h>
+#include <agg_span_image_filter_rgba.h>
+#include <agg_span_interpolator_linear.h>
 #include <agg_trans_affine.h>
 
 #include <math.h>
@@ -27,12 +31,14 @@
 #include "IntRect.h"
 
 
-AGGTextRenderer::AGGTextRenderer(renderer_subpix_type& subpixRenderer,
+AGGTextRenderer::AGGTextRenderer(renderer_base& baseRenderer,
+		renderer_subpix_type& subpixRenderer,
 		renderer_type& solidRenderer, renderer_bin_type& binRenderer,
 		scanline_unpacked_type& scanline,
 		scanline_unpacked_subpix_type& subpixScanline,
 		rasterizer_subpix_type& subpixRasterizer,
 		scanline_unpacked_masked_type*& maskedScanline,
+		agg::clipped_alpha_mask*& alphaMask,
 		agg::trans_affine& viewTransformation)
 	:
 	fPathAdaptor(),
@@ -44,6 +50,7 @@ AGGTextRenderer::AGGTextRenderer(renderer_subpix_type& subpixRenderer,
 	fCurves(fPathAdaptor),
 	fContour(fCurves),
 
+	fBaseRenderer(baseRenderer),
 	fSolidRenderer(solidRenderer),
 	fBinRenderer(binRenderer),
 	fSubpixRenderer(subpixRenderer),
@@ -51,11 +58,14 @@ AGGTextRenderer::AGGTextRenderer(renderer_subpix_type& subpixRenderer,
 	fSubpixScanline(subpixScanline),
 	fSubpixRasterizer(subpixRasterizer),
 	fMaskedScanline(maskedScanline),
+	fAlphaMask(alphaMask),
 
 	fRasterizer(),
 
 	fHinted(true),
 	fAntialias(true),
+	fColorGlyphAlpha(255),
+	fColorGlyphShapes(false),
 	fEmbeddedTransformation(),
 	fViewTransformation(viewTransformation)
 {
@@ -82,6 +92,10 @@ AGGTextRenderer::SetFont(const ServerFont& font)
 		-font.Rotation() * M_PI / 180.0);
 
 	fContour.width(font.FalseBoldWidth() * 2.0);
+
+	// Halos, outlines and shadows of text: see B_COLOR_GLYPHS_AS_SHAPES
+	fColorGlyphShapes = font.FalseBoldWidth() != 0.0
+		|| (font.Flags() & B_COLOR_GLYPHS_AS_SHAPES) != 0;
 }
 
 
@@ -209,6 +223,14 @@ public:
 
 		// track bounding box
 		fBounds = fBounds | glyphBounds;
+
+		if (glyph->data_type == glyph_data_color) {
+			if (!fDryRun) {
+				fRenderer._DrawColorGlyph(glyph, x, y, fTransform,
+					fClippingFrame);
+			}
+			return true;
+		}
 
 		// render the glyph if this is not a dry run
 		if (!fDryRun) {
@@ -367,6 +389,200 @@ private:
 	FontCacheEntry::TransformedContourOutline& fTransformedContour;
 	AGGTextRenderer&	fRenderer;
 };
+
+
+//! Lets AGG's span generators draw through _BlendColorSpan()
+struct AGGTextRenderer::ColorSpanRenderer {
+	typedef agg::rgba8 color_type;
+
+	ColorSpanRenderer(AGGTextRenderer& renderer)
+		:
+		fRenderer(renderer)
+	{
+	}
+
+	void prepare() {}
+
+	void blend_color_hspan(int x, int y, unsigned length,
+		const color_type* colors, const uint8* covers, uint8 cover)
+	{
+		fRenderer._BlendColorSpan(x, y, length, colors, covers, cover);
+	}
+
+	AGGTextRenderer& fRenderer;
+};
+
+
+/*!	Draws the pixels of a color glyph. They have their own alpha, which
+	becomes the coverage; the drawing mode applies fColorGlyphAlpha.
+*/
+void
+AGGTextRenderer::_BlendColorSpan(int x, int y, unsigned length,
+	const agg::rgba8* colors, const uint8* covers, uint8 cover)
+{
+	static const unsigned kChunk = 256;
+	agg::rgba8 spanColors[kChunk];
+	uint8 spanCovers[kChunk];
+
+	while (length > 0) {
+		unsigned count = length < kChunk ? length : kChunk;
+		bool visible = false;
+		for (unsigned i = 0; i < count; i++) {
+			uint32 alpha = colors[i].a * (covers != NULL ? covers[i] : cover);
+			spanCovers[i] = (alpha + 127) / 255;
+			spanColors[i] = agg::rgba8(colors[i].r, colors[i].g, colors[i].b,
+				fColorGlyphAlpha);
+			visible |= spanCovers[i] != 0;
+		}
+		if (visible && fMaskedScanline != NULL && fAlphaMask != NULL)
+			fAlphaMask->combine_hspan(x, y, spanCovers, count);
+		if (visible && fColorGlyphShapes) {
+			fBaseRenderer.blend_solid_hspan(x, y, count,
+				fSolidRenderer.color(), spanCovers);
+		} else if (visible)
+			fBaseRenderer.blend_color_hspan(x, y, count, spanColors, spanCovers, 0);
+
+		x += count;
+		colors += count;
+		if (covers != NULL)
+			covers += count;
+		length -= count;
+	}
+}
+
+
+void
+AGGTextRenderer::_DrawColorGlyph(const GlyphCache* glyph, double x, double y,
+	const Transformable& transform, const IntRect& clippingFrame)
+{
+	const agg::rect_i& bounds = glyph->bounds;
+	int32 width = bounds.x2 - bounds.x1 + 1;
+	int32 height = bounds.y2 - bounds.y1 + 1;
+	if (width <= 0 || height <= 0
+		|| glyph->data_size < uint32(width * height * 4)) {
+		return;
+	}
+	const agg::rgba8* pixels = (const agg::rgba8*)glyph->data;
+
+	if (transform.IsTranslationOnly()) {
+		BPoint origin(x, y);
+		transform.Transform(&origin);
+		int32 left = (int32)floor(origin.x + 0.5) + bounds.x1;
+		int32 top = (int32)floor(origin.y + 0.5) + bounds.y1;
+
+		if (fColorGlyphShapes && fFont.FalseBoldWidth() != 0.0) {
+			_DrawColorGlyphShape(glyph, left, top, clippingFrame);
+			return;
+		}
+
+		IntRect glyphFrame(left, top, left + width - 1, top + height - 1);
+		if (!clippingFrame.Intersects(glyphFrame))
+			return;
+		for (int32 row = 0; row < height; row++)
+			_BlendColorSpan(left, top + row, width, pixels + row * width, NULL,
+				255);
+		return;
+	}
+
+	// Rotated, sheared or scaled: sample the glyph through the transform
+	typedef agg::pixfmt_rgba32 glyph_pixfmt;
+	typedef agg::span_interpolator_linear<> interpolator_type;
+	typedef agg::span_image_filter_rgba_bilinear_clip<glyph_pixfmt,
+		interpolator_type> span_generator_type;
+
+	agg::rendering_buffer buffer(glyph->data, width, height, width * 4);
+	glyph_pixfmt glyphPixels(buffer);
+
+	agg::trans_affine glyphToView = agg::trans_affine_translation(
+		x + bounds.x1, y + bounds.y1);
+	glyphToView *= transform;
+	agg::trans_affine viewToGlyph = glyphToView;
+	viewToGlyph.invert();
+
+	interpolator_type interpolator(viewToGlyph);
+	span_generator_type generator(glyphPixels, agg::rgba8(0, 0, 0, 0),
+		interpolator);
+	agg::span_allocator<agg::rgba8> allocator;
+
+	agg::path_storage rectangle;
+	rectangle.move_to(0, 0);
+	rectangle.line_to(width, 0);
+	rectangle.line_to(width, height);
+	rectangle.line_to(0, height);
+	rectangle.close_polygon();
+	agg::conv_transform<agg::path_storage> transformed(rectangle,
+		glyphToView);
+
+	agg::rasterizer_scanline_aa<> rasterizer;
+	rasterizer.clip_box(clippingFrame.left, clippingFrame.top,
+		clippingFrame.right + 1, clippingFrame.bottom + 1);
+	rasterizer.add_path(transformed);
+
+	agg::scanline_u8 scanline;
+	ColorSpanRenderer spanRenderer(*this);
+	agg::render_scanlines_aa(rasterizer, scanline, spanRenderer, allocator,
+		generator);
+}
+
+
+/*!	Draws the shape of a color glyph grown by the false bold width, as the
+	outlines of text are.
+*/
+void
+AGGTextRenderer::_DrawColorGlyphShape(const GlyphCache* glyph, int32 left,
+	int32 top, const IntRect& clippingFrame)
+{
+	const agg::rect_i& bounds = glyph->bounds;
+	int32 width = bounds.x2 - bounds.x1 + 1;
+	int32 height = bounds.y2 - bounds.y1 + 1;
+	int32 radius = (int32)ceilf(fabsf(fFont.FalseBoldWidth()));
+	if (radius > 8)
+		radius = 8;
+
+	int32 grownWidth = width + 2 * radius;
+	int32 grownHeight = height + 2 * radius;
+	IntRect frame(left - radius, top - radius, left - radius + grownWidth - 1,
+		top - radius + grownHeight - 1);
+	if (!clippingFrame.Intersects(frame))
+		return;
+
+	uint8* alpha = (uint8*)calloc((size_t)grownWidth * grownHeight, 1);
+	agg::rgba8* row = (agg::rgba8*)malloc(sizeof(agg::rgba8) * grownWidth);
+	if (alpha == NULL || row == NULL) {
+		free(alpha);
+		free(row);
+		return;
+	}
+
+	// the largest alpha within the radius of each pixel
+	const agg::rgba8* pixels = (const agg::rgba8*)glyph->data;
+	for (int32 y = 0; y < height; y++) {
+		for (int32 x = 0; x < width; x++) {
+			uint8 value = pixels[y * width + x].a;
+			if (value == 0)
+				continue;
+			for (int32 dy = -radius; dy <= radius; dy++) {
+				uint8* target = alpha + (y + radius + dy) * grownWidth
+					+ x + radius;
+				for (int32 dx = -radius; dx <= radius; dx++) {
+					if (dx * dx + dy * dy <= radius * radius
+						&& target[dx] < value) {
+						target[dx] = value;
+					}
+				}
+			}
+		}
+	}
+
+	for (int32 y = 0; y < grownHeight; y++) {
+		for (int32 x = 0; x < grownWidth; x++)
+			row[x] = agg::rgba8(0, 0, 0, alpha[y * grownWidth + x]);
+		_BlendColorSpan(frame.left, frame.top + y, grownWidth, row, NULL, 255);
+	}
+
+	free(alpha);
+	free(row);
+}
 
 
 BRect

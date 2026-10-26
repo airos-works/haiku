@@ -223,9 +223,9 @@ Painter::Painter()
 	fMiterLimit(B_DEFAULT_MITER_LIMIT),
 
 	fPatternHandler(),
-	fTextRenderer(fSubpixRenderer, fRenderer, fRendererBin, fUnpackedScanline,
-		fSubpixUnpackedScanline, fSubpixRasterizer, fMaskedUnpackedScanline,
-		fTextTransform),
+	fTextRenderer(fBaseRenderer, fSubpixRenderer, fRenderer, fRendererBin,
+		fUnpackedScanline, fSubpixUnpackedScanline, fSubpixRasterizer,
+		fMaskedUnpackedScanline, fClippedAlphaMask, fTextTransform),
 	fInternal(fPatternHandler)
 {
 	fPixelFormat.SetDrawingMode(fDrawingMode, fAlphaSrcMode, fAlphaFncMode);
@@ -1660,6 +1660,12 @@ Painter::DrawString(const char* utf8String, uint32 length, BPoint baseLine,
 
 	SolidPatternGuard _(this);
 
+	// Color glyphs: the high color's alpha is the opacity of pixel alpha;
+	// the constant alpha modes apply it themselves.
+	fTextRenderer.SetColorGlyphAlpha(fDrawingMode == B_OP_ALPHA
+		&& fAlphaSrcMode == B_PIXEL_ALPHA ? fPatternHandler.HighColor().alpha
+		: 255);
+
 	bounds = fTextRenderer.RenderString(utf8String, length,
 		baseLine, fClippingRegion->Frame(), false, NULL, delta,
 		cacheReference);
@@ -1680,6 +1686,12 @@ Painter::DrawString(const char* utf8String, uint32 length,
 	BRect bounds;
 
 	SolidPatternGuard _(this);
+
+	// Color glyphs: the high color's alpha is the opacity of pixel alpha;
+	// the constant alpha modes apply it themselves.
+	fTextRenderer.SetColorGlyphAlpha(fDrawingMode == B_OP_ALPHA
+		&& fAlphaSrcMode == B_PIXEL_ALPHA ? fPatternHandler.HighColor().alpha
+		: 255);
 
 	if (fIdentityViewTransform && fDeviceScale != 1) {
 		int32 count = UTF8CountChars(utf8String, length);

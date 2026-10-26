@@ -15,6 +15,7 @@
 
 #include <Autolock.h>
 #include <Debug.h>
+#include <EmojiTables.h>
 #include <Font.h>
 #include <Locker.h>
 
@@ -30,6 +31,8 @@ namespace BPrivate {
 
 const static uint32 kTableCount = 128;
 const static uint32 kInvalidCode = 0xFFFFFFFF;
+const static int32 kMaxClusterChars = 16;
+const static size_t kMaxClusterWidths = 1024;
 WidthBuffer* gWidthBuffer = NULL;
 	// initialized in InterfaceDefs.cpp
 
@@ -52,6 +55,18 @@ struct hashed_escapement {
 	\param charLen the length of the character to examine.
 	\return The code for the given character,
 */
+/*!	Whether a character can be a part of an emoji sequence, which the font
+	draws as one glyph.
+*/
+static inline bool
+IsEmojiPart(uint32 code)
+{
+	return emoji_can_start_cluster(code) || code == kZeroWidthJoiner
+		|| code == kVariationSelectorEmoji || code == kVariationSelectorText
+		|| code == kCombiningKeycap || emoji_is_tag(code);
+}
+
+
 static inline uint32
 CharToCode(const char* text, const int32 charLen)
 {
@@ -123,6 +138,52 @@ WidthBuffer::StringWidth(const char* inText, int32 fromOffset, int32 length,
 		// Some magic, to uniquely identify this character
 		const uint32 value = CharToCode(sourceText, charLen);
 
+		const char* codeText = sourceText;
+		uint32 code = (charLen > 1 || (*sourceText >= '#' && *sourceText <= '9'))
+			? UTF8ToCharCode(&codeText) : 0;
+		bool emojiPart = code != 0 && IsEmojiPart(code);
+		if (emojiPart && emoji_is_keycap_base(code)) {
+			// a digit is only an emoji when a keycap follows
+			emojiPart = length > 1 && ((uint8)sourceText[1] == 0xef
+				|| (uint8)sourceText[1] == 0xe2);
+		}
+		if (emojiPart) {
+			// Measure an emoji sequence as a whole, and the parts of one on
+			// their own, so that the characters measured together below
+			// cannot join into one by chance.
+			uint32 codes[kMaxClusterChars];
+			int32 ends[kMaxClusterChars];
+			int32 count = 0;
+			const char* next = sourceText;
+			while (count < kMaxClusterChars && next - sourceText < length) {
+				int32 nextLength = UTF8NextCharLen(next,
+					length - (next - sourceText));
+				if (nextLength <= 0)
+					break;
+				const char* decoded = next;
+				codes[count] = UTF8ToCharCode(&decoded);
+				next += nextLength;
+				ends[count++] = next - sourceText;
+			}
+			int32 cluster = emoji_cluster_length(codes, count);
+			if (cluster > 1) {
+				charLen = ends[cluster - 1];
+				stringWidth += ClusterWidth(sourceText, charLen, index,
+					inStyle);
+				continue;
+			}
+
+			float escapement;
+			if (!GetEscapement(value, index, &escapement)) {
+				char single[5] = {};
+				memcpy(single, sourceText, charLen);
+				escapement = HashEscapements(single, 1, charLen, index,
+					inStyle);
+			}
+			stringWidth += escapement;
+			continue;
+		}
+
 		float escapement;
 		if (GetEscapement(value, index, &escapement)) {
 			// Well, we've got a match for this character
@@ -164,6 +225,23 @@ WidthBuffer::StringWidth(const char* inText, int32 fromOffset, int32 length,
 	\param inStyle The font.
 	\return The space (in pixels) required to draw the given string.
 */
+float
+WidthBuffer::ClusterWidth(const char* text, int32 length, int32 tableIndex,
+	const BFont* font)
+{
+	std::pair<int32, std::string> key(tableIndex, std::string(text, length));
+	ClusterWidthMap::const_iterator found = fClusterWidths.find(key);
+	if (found != fClusterWidths.end())
+		return found->second;
+
+	float width = font->StringWidth(text, length) / font->Size();
+	if (fClusterWidths.size() >= kMaxClusterWidths)
+		fClusterWidths.clear();
+	fClusterWidths[key] = width;
+	return width;
+}
+
+
 float
 WidthBuffer::StringWidth(TextGapBuffer &inBuffer, int32 fromOffset,
 	int32 length, const BFont* inStyle)

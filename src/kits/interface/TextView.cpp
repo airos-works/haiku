@@ -52,6 +52,7 @@
 #include <SystemCatalog.h>
 #include <Window.h>
 
+#include <EmojiTables.h>
 #include <binary_compatibility/Interface.h>
 
 #include "InlineInput.h"
@@ -59,6 +60,7 @@
 #include "StyleBuffer.h"
 #include "TextGapBuffer.h"
 #include "UndoBuffer.h"
+#include "utf8_functions.h"
 #include "WidthBuffer.h"
 
 
@@ -5602,13 +5604,45 @@ BTextView::_CharClassification(int32 offset) const
 int32
 BTextView::_NextInitialByte(int32 offset) const
 {
-	if (offset >= fText->Length())
+	const int32 length = fText->Length();
+	if (offset >= length)
 		return offset;
 
-	for (++offset; (ByteAt(offset) & 0xC0) == 0x80; ++offset)
-		;
+	int32 next = offset + 1;
+	while ((ByteAt(next) & 0xC0) == 0x80)
+		next++;
 
-	return offset;
+	// An emoji sequence is drawn as one glyph, and is one character to the
+	// caret, to selections and to deleting.
+	uint8 first = ByteAt(offset);
+	bool keycap = (first >= '0' && first <= '9') || first == '#'
+		|| first == '*';
+	if (first < 0xc2 && !keycap)
+		return next;
+	if (keycap && (uint8)ByteAt(next) != 0xef && (uint8)ByteAt(next) != 0xe2)
+		return next;
+
+	static const int32 kMaxCluster = 16;
+	uint32 codes[kMaxCluster];
+	int32 ends[kMaxCluster];
+	int32 count = 0;
+	int32 position = offset;
+	while (count < kMaxCluster && position < length) {
+		char character[5] = {};
+		int32 end = position + 1;
+		while (end < length && (ByteAt(end) & 0xC0) == 0x80
+			&& end - position < 4) {
+			end++;
+		}
+		for (int32 i = position; i < end; i++)
+			character[i - position] = ByteAt(i);
+		const char* text = character;
+		codes[count] = UTF8ToCharCode(&text);
+		ends[count++] = end;
+		position = end;
+	}
+
+	return ends[emoji_cluster_length(codes, count) - 1];
 }
 
 
@@ -5625,13 +5659,49 @@ BTextView::_PreviousInitialByte(int32 offset) const
 		return 0;
 
 	int32 count = 6;
+	int32 previous = offset;
 
-	for (--offset; offset > 0 && count; --offset, --count) {
-		if ((ByteAt(offset) & 0xC0) != 0x80)
+	for (--previous; previous > 0 && count; --previous, --count) {
+		if ((ByteAt(previous) & 0xC0) != 0x80)
 			break;
 	}
+	if (!count)
+		return 0;
 
-	return count ? offset : 0;
+	// Emoji sequences are single characters (see _NextInitialByte()): go
+	// back over what can be a part of one, then forward from there.
+	uint8 last = ByteAt(previous);
+	if (last < 0xc2 && !(last >= '0' && last <= '9') && last != '#'
+		&& last != '*') {
+		return previous;
+	}
+
+	int32 start = previous;
+	for (int32 characters = 0; start > 0 && characters < 32; characters++) {
+		int32 before = start - 1;
+		while (before > 0 && (ByteAt(before) & 0xC0) == 0x80)
+			before--;
+
+		char character[5] = {};
+		for (int32 i = before; i < start && i - before < 4; i++)
+			character[i - before] = ByteAt(i);
+		const char* text = character;
+		uint32 code = UTF8ToCharCode(&text);
+		if (!emoji_can_start_cluster(code) && code != kZeroWidthJoiner
+			&& code != kVariationSelectorEmoji
+			&& code != kVariationSelectorText && code != kCombiningKeycap
+			&& !emoji_is_tag(code)) {
+			break;
+		}
+		start = before;
+	}
+
+	while (true) {
+		int32 next = _NextInitialByte(start);
+		if (next >= offset || next <= start)
+			return start;
+		start = next;
+	}
 }
 
 

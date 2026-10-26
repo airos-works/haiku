@@ -31,12 +31,18 @@
 #include FT_OUTLINE_H
 #include FT_LCD_FILTER_H
 
+#include <math.h>
+#include <new>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include <agg_bitset_iterator.h>
 #include <agg_renderer_scanline.h>
 
+#include "ColorGlyphRenderer.h"
 #include "GlobalSubpixelSettings.h"
+#include "OpenTypeLigatures.h"
 
 
 static const bool kFlipY = true;
@@ -431,6 +437,14 @@ FontEngine::FontEngine()
 	fGlyphRendering(glyph_ren_native_gray8),
 	fHinting(true),
 	fDeviceScaled(false),
+	fPixelSize(0),
+
+	fColorGlyphs(false),
+	fBitmapScale(1.0),
+	fColorRenderer(NULL),
+	fLigatures(NULL),
+	fLigaturesLoaded(false),
+	fColorData(NULL),
 
 	fDataSize(0),
 	fDataType(glyph_data_invalid),
@@ -459,6 +473,9 @@ FontEngine::FontEngine()
 
 FontEngine::~FontEngine()
 {
+	delete fColorRenderer;
+	delete fLigatures;
+	free(fColorData);
 	FT_Done_Face(fFace);
 
 	if (fLibraryInitialized)
@@ -486,6 +503,9 @@ FontEngine::GlyphIndexForGlyphCode(uint32 glyphCode) const
 bool
 FontEngine::PrepareGlyph(uint32 glyphIndex)
 {
+	if (fColorGlyphs && _PrepareColorGlyph(glyphIndex))
+		return true;
+
 	FT_Int32 loadFlags = fHinting ? FT_LOAD_DEFAULT : FT_LOAD_NO_HINTING;
 	if (fDeviceScaled) {
 		// Only the vertical metrics (baseline, x-height, stems of horizontal
@@ -622,6 +642,10 @@ FontEngine::WriteGlyphTo(uint8* data) const
 				fPath.serialize(data);
 				break;
 
+			case glyph_data_color:
+				memcpy(data, fColorData, fDataSize);
+				break;
+
 			case glyph_data_invalid:
 			default:
 				break;
@@ -662,8 +686,15 @@ FontEngine::Init(const char* fontFilePath, unsigned faceIndex, double size,
 		return false;
 
 	fHinting = hinting;
+	fPixelSize = size;
 
 	fLastError = 0;
+
+	delete fColorRenderer;
+	fColorRenderer = NULL;
+	delete fLigatures;
+	fLigatures = NULL;
+	fLigaturesLoaded = false;
 
 	FT_Done_Face(fFace);
 	if (fontFileBuffer && fontFileBufferSize) {
@@ -698,7 +729,26 @@ FontEngine::Init(const char* fontFilePath, unsigned faceIndex, double size,
 			break;
 	}
 
-	if (fDeviceScaled && FT_IS_SCALABLE(fFace)) {
+	fColorGlyphs = FT_HAS_COLOR(fFace);
+	fBitmapScale = 1.0;
+
+	if (fColorGlyphs && !FT_IS_SCALABLE(fFace) && fFace->num_fixed_sizes > 0) {
+		// Color bitmap fonts (CBDT, sbix) have strikes of a few sizes: use
+		// the smallest one that is not smaller than the size, and scale it.
+		int best = 0;
+		for (int i = 1; i < fFace->num_fixed_sizes; i++) {
+			FT_Pos ppem = fFace->available_sizes[i].y_ppem;
+			FT_Pos bestPpem = fFace->available_sizes[best].y_ppem;
+			if ((bestPpem < size * 64 && ppem > bestPpem)
+				|| (ppem >= size * 64 && ppem < bestPpem)) {
+				best = i;
+			}
+		}
+		FT_Select_Size(fFace, best);
+		FT_Pos ppem = fFace->available_sizes[best].y_ppem;
+		if (ppem > 0)
+			fBitmapScale = size * 64.0 / ppem;
+	} else if (fDeviceScaled && FT_IS_SCALABLE(fFace)) {
 		// A logical size times the scale is rarely a whole number of
 		// pixels; rounding it would make the glyphs narrower or wider than
 		// their measured advances.
@@ -719,3 +769,232 @@ FontEngine::Init(const char* fontFilePath, unsigned faceIndex, double size,
 	return fLastError == 0;
 }
 
+
+
+// #pragma mark - color glyphs
+
+
+bool
+FontEngine::ShapeSequence(const uint32* codes, int32 count,
+	uint32& glyphIndex, int32& usedCodes)
+{
+	static const int32 kMaxSequence = 32;
+	if (fFace == NULL || count <= 0)
+		return false;
+	if (count > kMaxSequence)
+		count = kMaxSequence;
+
+	uint32 glyphs[kMaxSequence];
+	int32 mapped = 0;
+	while (mapped < count) {
+		glyphs[mapped] = FT_Get_Char_Index(fFace, codes[mapped]);
+		if (glyphs[mapped] == 0)
+			break;
+		mapped++;
+	}
+	if (mapped == 0)
+		return false;
+
+	glyphIndex = glyphs[0];
+	usedCodes = 1;
+	if (mapped == 1)
+		return true;
+
+	if (!fLigaturesLoaded) {
+		fLigaturesLoaded = true;
+		fLigatures = new(std::nothrow) OpenTypeLigatures;
+		if (fLigatures != NULL && !fLigatures->Init(fFace)) {
+			delete fLigatures;
+			fLigatures = NULL;
+		}
+	}
+	if (fLigatures == NULL || !fLigatures->HasLigatures())
+		return true;
+
+	// the longest prefix that becomes one glyph
+	for (int32 length = mapped; length > 1; length--) {
+		uint32 shaped[kMaxSequence];
+		memcpy(shaped, glyphs, sizeof(uint32) * length);
+		if (fLigatures->Apply(shaped, length) == 1) {
+			glyphIndex = shaped[0];
+			usedCodes = length;
+			return true;
+		}
+	}
+	return true;
+}
+
+
+bool
+FontEngine::_PrepareColorGlyph(uint32 glyphIndex)
+{
+	if (ColorGlyphRenderer::HasPaint(fFace, glyphIndex)) {
+		// 'COLR' version 1: the metrics of the (unhinted) base glyph, then
+		// its paint graph
+		if (FT_Load_Glyph(fFace, glyphIndex, FT_LOAD_NO_HINTING
+				| FT_LOAD_NO_BITMAP) != 0) {
+			return false;
+		}
+		FT_GlyphSlot slot = fFace->glyph;
+		double advance = slot->linearHoriAdvance / 65536.0;
+
+		if (fColorRenderer == NULL)
+			fColorRenderer = new(std::nothrow) ColorGlyphRenderer(fFace);
+		ColorGlyphBitmap bitmap;
+		if (fColorRenderer == NULL
+			|| !fColorRenderer->Render(glyphIndex, bitmap)) {
+			return false;
+		}
+
+		fAdvanceX = advance;
+		fAdvanceY = 0;
+		fInsetLeft = bitmap.left;
+		fInsetRight = bitmap.left + bitmap.width - advance;
+		if (!_SetColorBitmap(bitmap.data, bitmap.width, bitmap.height,
+				bitmap.width * 4, false, 1.0, bitmap.left, bitmap.top)) {
+			return false;
+		}
+	} else {
+		// Bitmaps (CBDT, sbix) come as BGRA from loading them, 'COLR'
+		// version 0 layers from rendering them.
+		if (FT_Load_Glyph(fFace, glyphIndex, FT_LOAD_COLOR) != 0)
+			return false;
+		FT_GlyphSlot slot = fFace->glyph;
+		if (slot->format != FT_GLYPH_FORMAT_BITMAP
+			&& FT_Render_Glyph(slot, FT_RENDER_MODE_NORMAL) != 0) {
+			return false;
+		}
+		const FT_Bitmap& bitmap = slot->bitmap;
+		if (bitmap.pixel_mode != FT_PIXEL_MODE_BGRA)
+			return false;
+
+		double scale = slot->format == FT_GLYPH_FORMAT_BITMAP
+			&& !FT_IS_SCALABLE(fFace) ? fBitmapScale : 1.0;
+		fAdvanceX = int26p6_to_dbl(slot->advance.x) * scale;
+		fAdvanceY = 0;
+		fInsetLeft = int26p6_to_dbl(slot->metrics.horiBearingX) * scale;
+		fInsetRight = int26p6_to_dbl(slot->metrics.horiBearingX
+			+ slot->metrics.width - slot->metrics.horiAdvance) * scale;
+		if (!_SetColorBitmap(bitmap.buffer, bitmap.width, bitmap.rows,
+				bitmap.pitch, true, scale, slot->bitmap_left,
+				-slot->bitmap_top)) {
+			return false;
+		}
+	}
+
+	fPreciseAdvanceX = fPixelSize > 0 ? fAdvanceX / fPixelSize : 0;
+	fPreciseAdvanceY = 0;
+	return true;
+}
+
+
+/*!	Stores a premultiplied BGRA or RGBA image, scaled by \a scale, as the
+	glyph's RGBA pixels that are not premultiplied. \a left and \a top
+	place the unscaled image relative to the pen, with y going down.
+*/
+bool
+FontEngine::_SetColorBitmap(const uint8* pixels, int32 width, int32 height,
+	int32 stride, bool bgra, double scale, int32 left, int32 top)
+{
+	if (pixels == NULL || width <= 0 || height <= 0 || scale <= 0)
+		return false;
+
+	int32 targetLeft = (int32)floor(left * scale + 0.5);
+	int32 targetTop = (int32)floor(top * scale + 0.5);
+	int32 targetWidth = (int32)ceil(width * scale - 0.01);
+	int32 targetHeight = (int32)ceil(height * scale - 0.01);
+	if (targetWidth < 1)
+		targetWidth = 1;
+	if (targetHeight < 1)
+		targetHeight = 1;
+	if (targetWidth > 4096 || targetHeight > 4096)
+		return false;
+
+	free(fColorData);
+	fDataSize = targetWidth * targetHeight * 4;
+	fColorData = (uint8*)malloc(fDataSize);
+	if (fColorData == NULL) {
+		fDataSize = 0;
+		return false;
+	}
+
+	int red = bgra ? 2 : 0;
+	int blue = bgra ? 0 : 2;
+	// the source pixels each target pixel covers, in both directions
+	double sx = double(width) / targetWidth;
+	double sy = double(height) / targetHeight;
+
+	uint8* target = fColorData;
+	for (int32 y = 0; y < targetHeight; y++) {
+		double y0 = y * sy;
+		double y1 = y0 + sy;
+		for (int32 x = 0; x < targetWidth; x++) {
+			double x0 = x * sx;
+			double x1 = x0 + sx;
+			double sum[4] = { 0, 0, 0, 0 };
+			double area = 0;
+
+			if (sx <= 1 && sy <= 1) {
+				// enlarging: bilinear between the nearest source pixels
+				double fx = (x + 0.5) * sx - 0.5;
+				double fy = (y + 0.5) * sy - 0.5;
+				int32 ix = (int32)floor(fx);
+				int32 iy = (int32)floor(fy);
+				fx -= ix;
+				fy -= iy;
+				for (int32 j = 0; j < 2; j++) {
+					int32 row = iy + j < 0 ? 0
+						: (iy + j >= height ? height - 1 : iy + j);
+					for (int32 i = 0; i < 2; i++) {
+						int32 column = ix + i < 0 ? 0
+							: (ix + i >= width ? width - 1 : ix + i);
+						double weight = (i ? fx : 1 - fx) * (j ? fy : 1 - fy);
+						const uint8* p = pixels + row * stride + column * 4;
+						for (int k = 0; k < 4; k++)
+							sum[k] += p[k] * weight;
+						area += weight;
+					}
+				}
+			} else {
+				// shrinking: the average of the source area
+				for (int32 row = (int32)y0; row < height && row < y1; row++) {
+					double h = fmin(y1, row + 1) - fmax(y0, row);
+					if (h <= 0)
+						continue;
+					for (int32 column = (int32)x0; column < width
+							&& column < x1; column++) {
+						double w = fmin(x1, column + 1) - fmax(x0, column);
+						if (w <= 0)
+							continue;
+						const uint8* p = pixels + row * stride + column * 4;
+						for (int k = 0; k < 4; k++)
+							sum[k] += p[k] * w * h;
+						area += w * h;
+					}
+				}
+			}
+
+			double alpha = area > 0 ? sum[3] / area : 0;
+			if (alpha < 0.5) {
+				target[0] = target[1] = target[2] = target[3] = 0;
+			} else {
+				// not premultiplied any longer
+				target[0] = (uint8)fmin(255, sum[red] / area * 255 / alpha
+					+ 0.5);
+				target[1] = (uint8)fmin(255, sum[1] / area * 255 / alpha
+					+ 0.5);
+				target[2] = (uint8)fmin(255, sum[blue] / area * 255 / alpha
+					+ 0.5);
+				target[3] = (uint8)fmin(255, alpha + 0.5);
+			}
+			target += 4;
+		}
+	}
+
+	fBounds.x1 = targetLeft;
+	fBounds.y1 = targetTop;
+	fBounds.x2 = targetLeft + targetWidth - 1;
+	fBounds.y2 = targetTop + targetHeight - 1;
+	fDataType = glyph_data_color;
+	return true;
+}

@@ -9,6 +9,9 @@
 #include <Locker.h>
 #include <TextView.h>
 
+#include <map>
+#include <string>
+
 #include "TextViewSupportBuffer.h"
 
 
@@ -50,11 +53,19 @@ private:
 			float				HashEscapements(const char* chars,
 									int32 numChars, int32 numBytes,
 									int32 tableIndex, const BFont* font);
+			float				ClusterWidth(const char* text,
+									int32 length, int32 tableIndex,
+									const BFont* font);
 
 	static	uint32				Hash(uint32);
 
 private:
 			BLocker				fLock;
+
+			// Emoji sequences are drawn as one glyph: their widths are not
+			// the sum of their characters' widths.
+	typedef std::map<std::pair<int32, std::string>, float> ClusterWidthMap;
+			ClusterWidthMap		fClusterWidths;
 };
 
 

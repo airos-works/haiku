@@ -27,6 +27,8 @@ local decorator_src =
 
 UseHeaders [ FDirName $(HAIKU_TOP) src servers app font ] ;
 local font_src =
+	ColorGlyphRenderer.cpp
+	EmojiTables.cpp
 	FontCache.cpp
 	FontCacheEntry.cpp
 	FontEngine.cpp
@@ -35,6 +37,7 @@ local font_src =
 	FontStyle.cpp
 	GlobalFontManager.cpp
 	AppFontManager.cpp
+	OpenTypeLigatures.cpp
 	;
 
 UseBuildFeatureHeaders freetype ;
@@ -125,6 +128,8 @@ Application app_server :
 
 SEARCH on [ FGristFiles $(decorator_src) ] = [ FDirName $(HAIKU_TOP) src servers app decorator ] ;
 SEARCH on [ FGristFiles $(font_src) ] = [ FDirName $(HAIKU_TOP) src servers app font ] ;
+SEARCH on [ FGristFiles EmojiTables.cpp ]
+	= [ FDirName $(HAIKU_TOP) src kits shared ] ;
 
 
 SubInclude HAIKU_TOP src servers app drawing ;

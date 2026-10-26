@@ -2275,9 +2275,16 @@ BeControlLook::DrawLabel(BView* view, const char* label, const rgb_color& base,
 				font.SetFalseBoldWidth(0.0);
 				view->SetFont(&font, B_FONT_FALSE_BOLD_WIDTH);
 
+				// the shadow of emoji is their shape, not a copy of them
+				font.SetFlags(font.Flags() | B_COLOR_GLYPHS_AS_SHAPES);
+				view->SetFont(&font, B_FONT_FLAGS);
+
 				glowColor.alpha = 200;
 				view->SetHighColor(glowColor);
 				view->DrawString(label, BPoint(where.x + 1, where.y + 1));
+
+				font.SetFlags(font.Flags() & ~B_COLOR_GLYPHS_AS_SHAPES);
+				view->SetFont(&font, B_FONT_FLAGS);
 			}
 		}
 	}
