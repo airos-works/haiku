@@ -197,6 +197,9 @@ private:
 		status_t			_PopulateStat();
 		status_t			_PopulateDirents();
 		status_t			_PopulateAttributeDirents();
+		status_t			_ReadIntoRequest(void *superCookie, off_t position,
+								size_t &length, IORequest *ioRequest,
+								off_t requestOffset);
 		status_t			_CreateCommon(const char *name, int type, int perms,
 								ino_t *newInodeNumber, OverlayInode **node,
 								bool attribute, type_code attributeType, bool exclusive = false);
@@ -720,22 +723,13 @@ OverlayInode::Read(void *_cookie, off_t position, void *buffer, size_t *length,
 					&fSuperVnode, superCookie, position, &vector, 1,
 					&readLength);
 			} else if (ioRequest != NULL) {
-				IORequest *subRequest;
-				result = ioRequest->CreateSubRequest(position, position,
-					readLength, subRequest);
-				if (result != B_OK)
-					return result;
-
-				bool wereSuppressed = ioRequest->SuppressChildNotifications();
-				ioRequest->SetSuppressChildNotifications(true);
-				result = fSuperVnode.ops->io(SuperVolume(), &fSuperVnode,
-					superCookie, subRequest);
-				if (result != B_OK)
-					return result;
-
-				result = subRequest->Wait(0, 0);
-				readLength = subRequest->TransferredBytes();
-				ioRequest->SetSuppressChildNotifications(wereSuppressed);
+				// Not with a sub-request: one wakes its waiters before it
+				// tells its parent that it is done, so the request could be
+				// finished with a child still pending (the "fPendingChildren
+				// == 0" assertion), and then be notified again by that child.
+				result = _ReadIntoRequest(superCookie, position, readLength,
+					ioRequest, ioRequest->Offset()
+						+ ((addr_t)pointer - (addr_t)buffer));
 			} else if (fIsAttribute) {
 				result = fSuperVnode.ops->read_attr(SuperVolume(), &fSuperVnode,
 					superCookie, position, pointer, &readLength);
@@ -792,6 +786,57 @@ OverlayInode::Read(void *_cookie, off_t position, void *buffer, size_t *length,
 	}
 
 	return B_OK;
+}
+
+
+/*!	Reads \a length bytes of the original file at \a position into
+	\a ioRequest at \a requestOffset; \a length returns how many there were.
+	The original file is read with I/O requests of our own (the file cache
+	would lead back here), not with sub-requests of \a ioRequest.
+*/
+status_t
+OverlayInode::_ReadIntoRequest(void *superCookie, off_t position,
+	size_t &length, IORequest *ioRequest, off_t requestOffset)
+{
+	static const size_t kChunkSize = 64 * 1024;
+	size_t bufferSize = MIN(length, kChunkSize);
+	uint8 *chunk = (uint8 *)malloc(bufferSize);
+	if (chunk == NULL)
+		return B_NO_MEMORY;
+
+	status_t result = B_OK;
+	size_t done = 0;
+	while (done < length) {
+		size_t chunkLength = MIN(length - done, bufferSize);
+		generic_io_vec vector;
+		vector.base = (generic_addr_t)chunk;
+		vector.length = chunkLength;
+
+		IORequest request;
+		result = request.Init(position + done, &vector, 1, chunkLength, false,
+			0);
+		if (result != B_OK)
+			break;
+		result = fSuperVnode.ops->io(SuperVolume(), &fSuperVnode, superCookie,
+			&request);
+		if (result == B_OK)
+			result = request.Wait(0, 0);
+		size_t readLength = request.TransferredBytes();
+		if (result != B_OK || readLength == 0)
+			break;
+
+		result = ioRequest->CopyData(chunk, requestOffset + done, readLength);
+		if (result != B_OK)
+			break;
+
+		done += readLength;
+		if (readLength < chunkLength)
+			break;
+	}
+
+	free(chunk);
+	length = done;
+	return result;
 }
 
 
