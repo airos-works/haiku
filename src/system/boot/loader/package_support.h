@@ -30,6 +30,14 @@ public:
 			const char*			SystemPackage() const
 									{ return fSystemPackage; }
 			status_t			SetSystemPackage(const char* package);
+			bool				IsBootable() const
+									{ return fSystemPackage != NULL; }
+
+			const char*			ReleaseVersion() const
+									{ return fReleaseVersion; }
+			status_t			SetReleasePackage(const char* package);
+									// air/OS: the state's airos_release
+									// package, which names its release
 
 			void				GetPackagePath(const char* name, char* path,
 									size_t pathSize);
@@ -38,9 +46,13 @@ public:
 									const PackageVolumeState* b);
 
 private:
+			void				_UpdateReleaseDisplayName();
+
+private:
 			char*				fName;
 			char*				fDisplayName;
 			char*				fSystemPackage;
+			char*				fReleaseVersion;
 };
 
 typedef DoublyLinkedList<PackageVolumeState> PackageVolumeStateList;
@@ -62,6 +74,12 @@ public:
 			const StateList&	States() const
 									{ return fStates; }
 
+			// air/OS System Updater (airos_boot_control.h)
+			PackageVolumeState*	FindState(const char* name) const;
+			PackageVolumeState*	NewestBootableOldState() const;
+			ssize_t				ReadBootControlFile(const char* name,
+									char* buffer, size_t bufferSize);
+
 private:
 			PackageVolumeState*	_AddState(const char* stateName);
 			status_t			_InitState(Directory* packagesDirectory,
@@ -69,11 +87,13 @@ private:
 			status_t			_ParseActivatedPackagesFile(
 									Directory* packagesDirectory,
 									PackageVolumeState* state,
-									char* packageName, size_t packageNameSize);
+									char* packageName, size_t packageNameSize,
+									char* releaseName, size_t releaseNameSize);
 
 private:
 			StateList			fStates;
 			DIR*				fPackagesDir;
+			bool				fOldStatesLoaded;
 };
 
 

@@ -15,10 +15,12 @@
 #include <string.h>
 #include <strings.h>
 
+#include <fcntl.h>
 #include <fs_info.h>
 #include <fs_volume.h>
 #include <OS.h>
 
+#include <airos_boot_control.h>
 #include <boot/kernel_args.h>
 #include <directories.h>
 #include <disk_device_manager/KDiskDevice.h>
@@ -461,6 +463,79 @@ get_boot_partitions(KMessage& bootVolume, PartitionStack& partitions)
 }
 
 
+static void
+write_airos_boot_file(const KPath& directory, const char* name,
+	const char* content, bool append)
+{
+	KPath path(directory);
+	if (path.Append(name) != B_OK)
+		return;
+
+	int fd = _kern_open(-1, path.Path(),
+		O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC), 0644);
+	if (fd < 0) {
+		dprintf("airos boot: cannot write %s: %s\n", name, strerror(fd));
+		return;
+	}
+	_kern_write(fd, -1, content, strlen(content));
+	_kern_fsync(fd, false);
+	_kern_close(fd);
+}
+
+
+/*!	Records a start the boot loader chose for System Updater (see
+	airos_boot_control.h): a start requested once is consumed, a start of an
+	update on trial is counted, and "last-boot" says how this start was
+	chosen. Done as soon as the boot volume is mounted, so that a start that
+	ends in a panic or a hang later on counts too.
+*/
+static void
+record_airos_boot(const KMessage& bootVolume)
+{
+	if (gReadOnlyBootDevice)
+		return;
+
+	KPath directory(kSystemPackagesDirectory);
+	if (directory.InitCheck() != B_OK
+		|| directory.Append(AIROS_BOOT_CONTROL_DIRECTORY) != B_OK) {
+		return;
+	}
+	struct stat st;
+	if (stat(directory.Path(), &st) != 0)
+		return;
+
+	const char* mode = bootVolume.GetString(BOOT_VOLUME_AIROS_BOOT, NULL);
+	if (mode == NULL) {
+		// an ordinary start of the latest state
+		KPath path(directory);
+		if (path.Append(AIROS_BOOT_LAST_FILE) == B_OK)
+			_kern_unlink(-1, path.Path());
+		return;
+	}
+
+	const char* state = bootVolume.GetString(BOOT_VOLUME_PACKAGES_STATE, "");
+	char line[B_FILE_NAME_LENGTH + 32];
+	snprintf(line, sizeof(line), "%s %s\n", mode, state);
+	write_airos_boot_file(directory, AIROS_BOOT_LAST_FILE, line, false);
+
+	if (strcmp(mode, AIROS_BOOT_MODE_NEXT) == 0) {
+		KPath from(directory), to(directory);
+		if (from.Append(AIROS_BOOT_NEXT_FILE) != B_OK
+			|| to.Append(AIROS_BOOT_NEXT_DONE_FILE) != B_OK) {
+			return;
+		}
+		status_t error = _kern_rename(-1, from.Path(), -1, to.Path());
+		dprintf("airos boot: started \"%s\" once as requested: %s\n", state,
+			strerror(error));
+	} else if (strcmp(mode, AIROS_BOOT_MODE_TRIAL) == 0) {
+		write_airos_boot_file(directory, AIROS_BOOT_TRIAL_ATTEMPTS_FILE,
+			"start\n", true);
+		dprintf("airos boot: counted a start of the update on trial\n");
+	} else
+		dprintf("airos boot: %s start of \"%s\"\n", mode, state);
+}
+
+
 //	#pragma mark -
 
 
@@ -582,6 +657,8 @@ vfs_mount_boot_file_system(kernel_args* args)
 
 		_kern_create_symlink(-1, path, "/boot", 0777);
 	}
+
+	record_airos_boot(bootVolume);
 
 	// If we're booting off a packaged system, mount packagefs.
 	struct stat st;

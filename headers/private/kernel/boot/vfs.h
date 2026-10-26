@@ -143,11 +143,16 @@ public:
 									{ return fPackageVolumeInfo; }
 			PackageVolumeState*	GetPackageVolumeState() const
 									{ return fPackageVolumeState; }
+			const char*			AirosBootMode() const
+									{ return fAirosBootMode; }
+									// how the state was chosen for System
+									// Updater, AIROS_BOOT_MODE_* or NULL
 
 private:
 			status_t			_SetTo(Directory* rootDirectory,
 									PackageVolumeInfo* packageVolumeInfo,
 									PackageVolumeState* packageVolumeState);
+			PackageVolumeState*	_ChooseAirosState();
 			int					_OpenSystemPackage();
 
 private:
@@ -158,6 +163,7 @@ private:
 				// directory of the mounted packagefs
 			PackageVolumeInfo*	fPackageVolumeInfo;
 			PackageVolumeState*	fPackageVolumeState;
+			const char*			fAirosBootMode;
 };
 
 

@@ -52,6 +52,7 @@ SYSTEM_APPS += [ FFilterByBuildFeatures
 	SerialConnect
 	SoftwareUpdater
 	SoundRecorder
+	SystemUpdater
 ] ;
 
 # air/OS: ActivityMonitor and MediaPlayer stay in the image without a menu
@@ -65,6 +66,7 @@ DESKBAR_APPLICATIONS += [ FFilterByBuildFeatures
 	People
 	SoftwareUpdater
 	SoundRecorder
+	SystemUpdater
 ] ;
 
 # air/OS: on x86_64 and arm64, Mail (jmgasper/mail, the airos_mail package
