@@ -190,7 +190,13 @@ madvise(void* address, size_t length, int advice)
 int
 posix_madvise(void* address, size_t length, int advice)
 {
-	return madvise(address, length, advice);
+	// POSIX_MADV_DONTNEED shares its value with MADV_DONTNEED, but unlike
+	// that one it must not change the memory's contents.
+	if (advice == POSIX_MADV_DONTNEED)
+		advice = POSIX_MADV_NORMAL;
+
+	// posix_madvise() returns the error instead of setting errno.
+	return _kern_memory_advice(address, length, advice);
 }
 
 
