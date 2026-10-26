@@ -1,0 +1,6 @@
+SubDir HAIKU_TOP src tests kits game direct_window_fork_test ;
+
+SimpleTest direct_window_fork_test
+	: direct_window_fork_test.cpp
+	: game be root
+;
