@@ -1533,6 +1533,7 @@ Volume::_LoadPackage(PackagesDirectory* packagesDirectory, const char* name,
 	if (package == NULL)
 		RETURN_ERROR(B_NO_MEMORY);
 	BReference<Package> packageReference(package, true);
+	package->SetFileModifiedTime(st.st_mtim);
 
 	status_t error = package->Init(name);
 	if (error != B_OK)

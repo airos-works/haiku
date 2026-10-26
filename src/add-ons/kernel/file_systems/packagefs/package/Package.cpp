@@ -530,7 +530,8 @@ Package::Package(::Volume* volume, PackagesDirectory* directory, dev_t deviceID,
 	fOpenCount(0),
 	fHeapReader(NULL),
 	fNodeID(nodeID),
-	fDeviceID(deviceID)
+	fDeviceID(deviceID),
+	fFileModifiedTime()
 {
 	mutex_init(&fLock, "packagefs package");
 

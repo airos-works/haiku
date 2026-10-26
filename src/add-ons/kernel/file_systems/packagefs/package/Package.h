@@ -59,6 +59,12 @@ public:
 									{ return fDeviceID; }
 			ino_t				NodeID() const
 									{ return fNodeID; }
+
+			// When the package file was last changed (put in place).
+			void				SetFileModifiedTime(const timespec& time)
+									{ fFileModifiedTime = time; }
+			const timespec&		FileModifiedTime() const
+									{ return fFileModifiedTime; }
 			PackagesDirectory*	Directory() const
 									{ return fPackagesDirectory; }
 
@@ -139,6 +145,7 @@ private:
 			Package*			fFileNameHashTableNext;
 			ino_t				fNodeID;
 			dev_t				fDeviceID;
+			timespec			fFileModifiedTime;
 			PackageNodeList		fNodes;
 			ResolvableList		fResolvables;
 			DependencyList		fDependencies;
