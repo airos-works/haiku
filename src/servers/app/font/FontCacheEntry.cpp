@@ -126,6 +126,94 @@ private:
 };
 
 
+class FontCacheEntry::SequenceCachePool {
+	struct SequenceHashTableDefinition {
+		struct Key {
+			const uint32*	codes;
+			int32			count;
+		};
+		typedef Key				KeyType;
+		typedef	EmojiSequence	ValueType;
+
+		static size_t HashCodes(const uint32* codes, int32 count)
+		{
+			size_t hash = count;
+			for (int32 i = 0; i < count; i++)
+				hash = hash * 31 + codes[i];
+			return hash;
+		}
+
+		size_t HashKey(const Key& key) const
+		{
+			return HashCodes(key.codes, key.count);
+		}
+
+		size_t Hash(EmojiSequence* value) const
+		{
+			return HashCodes(value->codes, value->count);
+		}
+
+		bool Compare(const Key& key, EmojiSequence* value) const
+		{
+			return value->count == key.count && memcmp(value->codes,
+				key.codes, sizeof(uint32) * key.count) == 0;
+		}
+
+		EmojiSequence*& GetLink(EmojiSequence* value) const
+		{
+			return value->hash_link;
+		}
+	};
+	typedef SequenceHashTableDefinition::Key Key;
+
+public:
+	~SequenceCachePool()
+	{
+		EmojiSequence* sequence = fTable.Clear(true);
+		while (sequence != NULL) {
+			EmojiSequence* next = sequence->hash_link;
+			delete sequence;
+			sequence = next;
+		}
+	}
+
+	status_t Init()
+	{
+		return fTable.Init();
+	}
+
+	const EmojiSequence* Find(const uint32* codes, int32 count) const
+	{
+		Key key = { codes, count };
+		return fTable.Lookup(key);
+	}
+
+	const EmojiSequence* Add(const uint32* codes, int32 count,
+		uint32 glyphKey, int32 usedCodes)
+	{
+		if (count <= 0 || count > EmojiSequence::kMaxCodes)
+			return NULL;
+		Key key = { codes, count };
+		EmojiSequence* sequence = fTable.Lookup(key);
+		if (sequence != NULL)
+			return sequence;
+
+		sequence = new(std::nothrow) EmojiSequence;
+		if (sequence == NULL)
+			return NULL;
+		memcpy(sequence->codes, codes, sizeof(uint32) * count);
+		sequence->count = count;
+		sequence->glyph_key = glyphKey;
+		sequence->used_codes = usedCodes;
+		fTable.Insert(sequence);
+		return sequence;
+	}
+
+private:
+	BOpenHashTable<SequenceHashTableDefinition> fTable;
+};
+
+
 // #pragma mark -
 
 
@@ -133,6 +221,7 @@ FontCacheEntry::FontCacheEntry()
 	:
 	MultiLocker("FontCacheEntry lock"),
 	fGlyphCache(new(std::nothrow) GlyphCachePool()),
+	fSequenceCache(new(std::nothrow) SequenceCachePool()),
 	fEngine(),
 	fLastUsedTime(LONGLONG_MIN),
 	fUseCounter(0)
@@ -149,7 +238,7 @@ FontCacheEntry::~FontCacheEntry()
 bool
 FontCacheEntry::Init(const ServerFont& font, bool forceVector)
 {
-	if (!fGlyphCache.IsSet())
+	if (!fGlyphCache.IsSet() || !fSequenceCache.IsSet())
 		return false;
 
 	fFontStyle.SetTo(font.GetStyle());
@@ -175,7 +264,7 @@ FontCacheEntry::Init(const ServerFont& font, bool forceVector)
 		return false;
 	}
 
-	if (fGlyphCache->Init() != B_OK) {
+	if (fGlyphCache->Init() != B_OK || fSequenceCache->Init() != B_OK) {
 		fprintf(stderr, "FontCacheEntry::Init() - failed to allocate "
 			"GlyphCache table for font file %s\n", font.Path());
 		return false;
@@ -348,6 +437,52 @@ FontCacheEntry::CreateGlyph(uint32 glyphCode, FontCacheEntry* fallbackEntry)
 	}
 
 	return glyph;
+}
+
+
+const GlyphCache*
+FontCacheEntry::CreateColorGlyph(uint32 glyphIndex,
+	FontCacheEntry* sourceEntry)
+{
+	// NOTE: Both this and the source FontCacheEntry are expected to be
+	// write-locked!
+
+	uint32 key = kColorGlyphKey | glyphIndex;
+	const GlyphCache* glyph = fGlyphCache->FindGlyph(key);
+	if (glyph != NULL)
+		return glyph;
+
+	FontEngine* engine = sourceEntry != NULL ? &sourceEntry->fEngine
+		: &fEngine;
+	if (!engine->PrepareGlyph(glyphIndex))
+		return NULL;
+
+	glyph = fGlyphCache->CacheGlyph(key,
+		engine->DataSize(), engine->DataType(), engine->Bounds(),
+		engine->AdvanceX(), engine->AdvanceY(),
+		engine->PreciseAdvanceX(), engine->PreciseAdvanceY(),
+		engine->InsetLeft(), engine->InsetRight());
+	if (glyph != NULL)
+		engine->WriteGlyphTo(glyph->data);
+
+	return glyph;
+}
+
+
+const EmojiSequence*
+FontCacheEntry::CachedSequence(const uint32* codes, int32 count) const
+{
+	// Only requires a read lock.
+	return fSequenceCache->Find(codes, count);
+}
+
+
+const EmojiSequence*
+FontCacheEntry::CacheSequence(const uint32* codes, int32 count,
+	uint32 glyphKey, int32 usedCodes)
+{
+	// Requires the write lock.
+	return fSequenceCache->Add(codes, count, glyphKey, usedCodes);
 }
 
 

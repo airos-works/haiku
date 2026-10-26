@@ -19,10 +19,12 @@
 
 
 class FontCacheReference;
+class IntRect;
 
 class AGGTextRenderer {
 public:
 								AGGTextRenderer(
+									renderer_base& baseRenderer,
 									renderer_subpix_type& subpixRenderer,
 									renderer_type& solidRenderer,
 									renderer_bin_type& binRenderer,
@@ -32,6 +34,7 @@ public:
 									rasterizer_subpix_type& subpixRasterizer,
 									scanline_unpacked_masked_type*&
 										maskedScanline,
+									agg::clipped_alpha_mask*& alphaMask,
 									agg::trans_affine& viewTransformation);
 	virtual						~AGGTextRenderer();
 
@@ -46,6 +49,11 @@ public:
 			void				SetAntialiasing(bool antialiasing);
 			bool				Antialiasing() const
 									{ return fAntialias; }
+
+			// The opacity of color glyphs (emoji), whose pixels have their
+			// own colors; the drawing mode applies it.
+			void				SetColorGlyphAlpha(uint8 alpha)
+									{ fColorGlyphAlpha = alpha; }
 
 			BRect				RenderString(const char* utf8String,
 									uint32 length, const BPoint& baseLine,
@@ -64,6 +72,19 @@ private:
 
 	class StringRenderer;
 	friend class StringRenderer;
+	struct ColorSpanRenderer;
+	friend struct ColorSpanRenderer;
+
+			void				_DrawColorGlyph(const GlyphCache* glyph,
+									double x, double y,
+									const Transformable& transform,
+									const IntRect& clippingFrame);
+			void				_DrawColorGlyphShape(const GlyphCache* glyph,
+									int32 left, int32 top,
+									const IntRect& clippingFrame);
+			void				_BlendColorSpan(int x, int y, unsigned length,
+									const agg::rgba8* colors,
+									const uint8* covers, uint8 cover);
 
 	// Pipeline to process the vectors glyph paths (curves + contour)
 	FontCacheEntry::GlyphPathAdapter	fPathAdaptor;
@@ -75,6 +96,7 @@ private:
 	FontCacheEntry::CurveConverter		fCurves;
 	FontCacheEntry::ContourConverter	fContour;
 
+	renderer_base&				fBaseRenderer;
 	renderer_type&				fSolidRenderer;
 	renderer_bin_type&			fBinRenderer;
 	renderer_subpix_type&		fSubpixRenderer;
@@ -82,6 +104,7 @@ private:
 	scanline_unpacked_subpix_type& fSubpixScanline;
 	rasterizer_subpix_type&		fSubpixRasterizer;
 	scanline_unpacked_masked_type*& fMaskedScanline;
+	agg::clipped_alpha_mask*&	fAlphaMask;
 
 	rasterizer_type				fRasterizer;
 		// NOTE: the object has it's own rasterizer object
@@ -92,6 +115,8 @@ private:
 	bool						fHinted;
 									// is glyph hinting active?
 	bool						fAntialias;
+	uint8						fColorGlyphAlpha;
+	bool						fColorGlyphShapes;
 	Transformable				fEmbeddedTransformation;
 									// rotated or sheared font?
 	agg::trans_affine&			fViewTransformation;

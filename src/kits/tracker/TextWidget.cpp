@@ -740,10 +740,17 @@ BTextWidget::Draw(BRect eraseRect, BRect textRect, BPoseView* view, BView* drawV
 			font.SetFalseBoldWidth(0.0);
 			drawView->SetFont(&font, B_FONT_FALSE_BOLD_WIDTH);
 
+			// the shadow of emoji is their shape, not a copy of them
+			font.SetFlags(font.Flags() | B_COLOR_GLYPHS_AS_SHAPES);
+			drawView->SetFont(&font, B_FONT_FLAGS);
+
 			outlineColor.alpha = 200;
 			drawView->SetHighColor(outlineColor);
 
 			drawView->DrawString(fittingText, location + BPoint(1, 1));
+
+			font.SetFlags(font.Flags() & ~B_COLOR_GLYPHS_AS_SHAPES);
+			drawView->SetFont(&font, B_FONT_FLAGS);
 		}
 
 		drawView->SetHighColor(textColor);

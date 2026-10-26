@@ -37,7 +37,11 @@ enum font_direction {
 // font flags
 enum {
 	B_DISABLE_ANTIALIASING	= 0x00000001,
-	B_FORCE_ANTIALIASING	= 0x00000002
+	B_FORCE_ANTIALIASING	= 0x00000002,
+	B_COLOR_GLYPHS_AS_SHAPES = 0x00000004
+		// Color glyphs (emoji) are drawn in the high color, in the shape of
+		// their pixels, for the shadows and outlines of text. So are they
+		// when the font has a false bold width.
 };
 
 

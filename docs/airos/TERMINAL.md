@@ -80,8 +80,9 @@ and emoji tables. When the window is resized, lines that wrapped are wrapped
 again to the new width, in the history too, and the cursor and images stay
 with their text.
 
-**Emoji in color.** app_server draws glyphs in grey levels only, so
-Terminal draws emoji itself with FreeType from a color font: Noto Color
+**Emoji in color.** Terminal draws emoji itself, to fit them into its
+cells (app_server draws them in color for other programs, see
+[COLOR-EMOJI.md](COLOR-EMOJI.md)), with FreeType from a color font: Noto Color
 Emoji (HaikuPorts' `noto_emoji_color`, in air/OS images), or any font file
 named `*ColorEmoji*` or `*Twemoji*` in the font directories;
 `TERMINAL_EMOJI_FONT` names a file. A cluster asking for emoji presentation

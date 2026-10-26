@@ -82,6 +82,23 @@ struct GlyphCache {
 	GlyphCache*		hash_link;
 };
 
+//! Glyph cache keys of glyphs from a color font, by their glyph index.
+static const uint32 kColorGlyphKey = 0x80000000;
+
+//! An emoji sequence and the glyph a color font joined (part of) it into.
+struct EmojiSequence {
+	static const int32 kMaxCodes = 16;
+
+	uint32			codes[kMaxCodes];
+	int32			count;
+	uint32			glyph_key;
+		// 0 when the color font has no glyph for the sequence
+	int32			used_codes;
+		// the length of the prefix the glyph is for
+
+	EmojiSequence*	hash_link;
+};
+
 class FontCache;
 
 class FontCacheEntry : public MultiLocker, public BReferenceable {
@@ -115,6 +132,25 @@ class FontCacheEntry : public MultiLocker, public BReferenceable {
 									FontCacheEntry* fallbackEntry = NULL);
 			bool				CanCreateGlyph(uint32 glyphCode);
 
+			bool				HasColorGlyphs() const
+									{ return fEngine.HasColorGlyphs(); }
+			// Needs a write lock; see FontEngine::ShapeSequence().
+			bool				ShapeSequence(const uint32* codes,
+									int32 count, uint32& glyphIndex,
+									int32& usedCodes)
+									{ return fEngine.ShapeSequence(codes,
+										count, glyphIndex, usedCodes); }
+			// Caches the glyph of sourceEntry's font (or of this one) with
+			// that glyph index, under kColorGlyphKey | glyphIndex.
+			const GlyphCache*	CreateColorGlyph(uint32 glyphIndex,
+									FontCacheEntry* sourceEntry);
+
+			const EmojiSequence* CachedSequence(const uint32* codes,
+									int32 count) const;
+			const EmojiSequence* CacheSequence(const uint32* codes,
+									int32 count, uint32 glyphKey,
+									int32 usedCodes);
+
 			void				InitAdaptors(const GlyphCache* glyph,
 									double x, double y,
 									GlyphMonoAdapter& monoAdapter,
@@ -144,9 +180,12 @@ class FontCacheEntry : public MultiLocker, public BReferenceable {
 									bool forceVector);
 
 			class GlyphCachePool;
+			class SequenceCachePool;
 
 			ObjectDeleter<GlyphCachePool>
 								fGlyphCache;
+			ObjectDeleter<SequenceCachePool>
+								fSequenceCache;
 			// FreeType's memory face borrows the style's font data. Retain it
 			// until after fEngine is destroyed, including after its app exits.
 			BReference<FontStyle>
