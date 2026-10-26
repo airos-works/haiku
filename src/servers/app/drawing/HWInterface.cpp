@@ -77,7 +77,8 @@ HWInterface::HWInterface()
 	fFlushKnobThread(-1),
 	fFlushWanted(false),
 	fShadowCurrent(0),
-	fShadowReaders(0)
+	fShadowReaders(0),
+	fDeviceCopyOff(false)
 {
 	for (int32 i = 0; i < 32; i++)
 		fShadowWrites[i].used = false;
@@ -661,7 +662,8 @@ HWInterface::_CopyShadowToFront(BRegion& region, int32 which)
 	// the device copies faster than the scan goes down the screen, and
 	// without the CPU; done when it returns
 	RenderingBuffer* frontBuffer = FrontBuffer();
-	if (frontBuffer != NULL && frontBuffer->Width() == shadow->Width()
+	if (!fDeviceCopyOff && frontBuffer != NULL
+		&& frontBuffer->Width() == shadow->Width()
 		&& frontBuffer->Height() == shadow->Height()
 		&& _CopyShadowByDevice(shadow, region)) {
 		return;
@@ -928,13 +930,24 @@ HWInterface::_FlushKnobThread()
 	BPath settings;
 	if (find_directory(B_USER_SETTINGS_DIRECTORY, &settings) != B_OK)
 		return;
+	BPath deviceCopy(settings);
 	settings.Append("app_server/no_vblank_flush");
+	deviceCopy.Append("app_server/no_device_copy");
 	while (!fQuitFlush) {
 		bool off = BEntry(settings.Path()).Exists();
 		if (off == fFlushWanted) {
 			debug_printf("app_server: vertical blank flush: %s (%s)\n",
 				off ? "off" : "on", settings.Path());
 			_SetFlushing(!off);
+		}
+		// the CPU copies again from the device's shadows while it exists
+		bool cpu = BEntry(deviceCopy.Path()).Exists();
+		if (cpu != fDeviceCopyOff) {
+			if (_DeviceCopiesShadows() || cpu) {
+				debug_printf("app_server: vertical blank flush: copies by "
+					"the %s (%s)\n", cpu ? "CPU" : "device", deviceCopy.Path());
+			}
+			fDeviceCopyOff = cpu;
 		}
 		snooze(500000);
 	}
@@ -1560,7 +1573,7 @@ HWInterface::_FlushPending(FlushTarget& target, bigtime_t blank, int32 which)
 		area += (int64)(r.right - r.left + 1) * (r.bottom - r.top + 1);
 	}
 	int32 bands = 1;
-	if (area > kBandArea && !_DeviceCopiesShadows()) {
+	if (area > kBandArea && (fDeviceCopyOff || !_DeviceCopiesShadows())) {
 		if (target.workers == NULL)
 			_StartFlushWorkers(target);
 		if (target.workerCount > 0) {

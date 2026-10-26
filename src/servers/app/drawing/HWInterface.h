@@ -401,6 +401,9 @@ private:
 				bool			used;
 			};
 			ShadowWrite			fShadowWrites[32];
+			volatile bool		fDeviceCopyOff;
+									// the no_device_copy file: the CPU
+									// copies from the device's shadows
 };
 
 #endif // HW_INTERFACE_H
