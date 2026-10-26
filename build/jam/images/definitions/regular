@@ -77,6 +77,14 @@ if $(TARGET_ARCH) = x86_64 || $(TARGET_ARCH) = arm64 {
 	DESKBAR_APPLICATIONS = [ FFilter $(DESKBAR_APPLICATIONS) : Mail ] ;
 }
 
+# air/OS: a release image (tools/airos/ci/UserBuildConfig) is updated as a
+# whole by System Updater. SoftwareUpdater would put HaikuPorts' packages in
+# place of the release's own builds, so it keeps no menu entry there.
+if $(AIROS_CI_RELEASE_VERSION) {
+	DESKBAR_APPLICATIONS = [ FFilter $(DESKBAR_APPLICATIONS)
+		: SoftwareUpdater ] ;
+}
+
 DESKBAR_UTILITIES +=
 	CodyCam
 	Magnify
