@@ -355,9 +355,24 @@ command_boot_check(Updater& updater, bool wait)
 	SystemState state;
 	if (error == B_OK && settings.checkAutomatically && state.Load() == B_OK
 		&& state.RunningLatest() && !state.RestartPending()) {
+		// Wi-Fi may join a while after the desktop is up: try for two minutes
 		Feed feed;
 		BString checkError;
-		if (updater.Check(feed, checkError) == B_OK && feed.Latest() != NULL
+		status_t checkResult = B_ERROR;
+		for (int attempt = 0; attempt < 7; attempt++) {
+			if (attempt > 0)
+				snooze(20000000);
+			checkResult = updater.Check(feed, checkError);
+			if (checkResult == B_OK || checkResult == B_ENTRY_NOT_FOUND
+				|| checkResult == B_NOT_SUPPORTED
+				|| checkResult == B_MISMATCHED_VALUES) {
+				break;
+			}
+		}
+		if (checkResult != B_OK)
+			Updater::Log("could not check for a new release: %s",
+				checkError.String());
+		if (checkResult == B_OK && feed.Latest() != NULL
 			&& updater.IsNewer(*feed.Latest())) {
 			BString text;
 			text.SetToFormat("%s is available. Open System Updater to see what "
