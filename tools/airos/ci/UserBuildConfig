@@ -127,6 +127,11 @@ switch $(HAIKU_BUILD_PROFILE) {
 		HAIKU_IMAGE_SIZE = $(AIROS_CI_IMAGE_SIZE:E=3584) ;
 		HAIKU_BFS_GROWABLE = 1 ;
 		HAIKU_RPI_IMAGE_NAME = airos-rpi4.img ;
+		# This image only runs on the Pi 4: all code is tuned for its
+		# Cortex-A72, with inline atomics (docs/rpi4/CPU-TUNING.md). The Pi
+		# builds in a build directory of its own; objects keep the flags
+		# they were compiled with, so a changed profile needs a clean build.
+		SetCPUProfile arm64 : rpi4 ;
 	}
 	case airos-cubie : {
 		AIROS_CUBIE = 1 ;

@@ -16,3 +16,10 @@ for probe in gl texture readback window cache_growth glview glview_present; do
         "$TOOLS/${probe}_probe.cpp" -L"$BASE/glvnd-install/boot/system/lib" \
         "${libraries[@]}" -o "$ROOT/probes/rpi4_${probe}_probe"
 done
+
+# The driver's CPU cost (compile, draw calls, texture uploads), for comparing
+# Mesa builds with different code generation.
+"$CXX" --sysroot="$BASE/sysroot" -std=c++17 -O2 \
+    -I"$BASE/sysroot/boot/system/develop/headers/os/opengl" \
+    "$TOOLS/cpu_bench.cpp" -L"$BASE/glvnd-install/boot/system/lib" \
+    -lEGL -lGLESv2 -lbe -o "$ROOT/probes/rpi4_mesa_cpu_bench"
