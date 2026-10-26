@@ -10,7 +10,12 @@
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
-#include FT_COLOR_H
+
+// FreeType reads 'COLR' version 1 since 2.13
+#if FREETYPE_MAJOR > 2 || (FREETYPE_MAJOR == 2 && FREETYPE_MINOR >= 13)
+#	define COLOR_GLYPH_RENDERER_COLR_V1 1
+#	include FT_COLOR_H
+#endif
 
 #include <agg_path_storage.h>
 #include <agg_trans_affine.h>
@@ -51,6 +56,9 @@ public:
 									ColorGlyphBitmap& bitmap);
 
 private:
+			FT_Face				fFace;
+
+#ifdef COLOR_GLYPH_RENDERER_COLR_V1
 	struct Canvas;
 	struct Clip;
 	struct ColorLine;
@@ -85,8 +93,6 @@ private:
 			void				_Color(const FT_ColorIndex& color,
 									double rgba[4]) const;
 
-private:
-			FT_Face				fFace;
 			FT_Color*			fPalette;
 			uint16				fPaletteSize;
 			double				fScale;
@@ -103,6 +109,7 @@ private:
 			Clip*				fClip;
 			agg::path_storage	fPath;
 				// the outline of the current glyph clip, in font units
+#endif
 };
 
 

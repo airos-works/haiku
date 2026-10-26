@@ -18,33 +18,6 @@
 #include <agg_scanline_u.h>
 
 
-static const int32 kMaxDepth = 64;
-static const int32 kMaxOperations = 50000;
-	// a malformed or hostile font cannot keep the server busy for long
-static const int32 kMaxCanvasSize = 1024;
-static const int32 kMaxCompositeDepth = 8;
-	// each composite needs two more canvases
-static const int32 kColorLineSize = 256;
-
-
-static inline double
-fixed_to_double(FT_Fixed value)
-{
-	return value / 65536.0;
-}
-
-
-static inline uint8
-to_byte(double value)
-{
-	if (value <= 0)
-		return 0;
-	if (value >= 1)
-		return 255;
-	return uint8(value * 255 + 0.5);
-}
-
-
 // #pragma mark - ColorGlyphBitmap
 
 
@@ -73,6 +46,36 @@ ColorGlyphBitmap::Allocate(int32 newWidth, int32 newHeight)
 	height = newHeight;
 	data = (uint8*)calloc((size_t)width * height, 4);
 	return data != NULL;
+}
+
+
+#ifdef COLOR_GLYPH_RENDERER_COLR_V1
+
+
+static const int32 kMaxDepth = 64;
+static const int32 kMaxOperations = 50000;
+	// a malformed or hostile font cannot keep the server busy for long
+static const int32 kMaxCanvasSize = 1024;
+static const int32 kMaxCompositeDepth = 8;
+	// each composite needs two more canvases
+static const int32 kColorLineSize = 256;
+
+
+static inline double
+fixed_to_double(FT_Fixed value)
+{
+	return value / 65536.0;
+}
+
+
+static inline uint8
+to_byte(double value)
+{
+	if (value <= 0)
+		return 0;
+	if (value >= 1)
+		return 255;
+	return uint8(value * 255 + 0.5);
 }
 
 
@@ -1163,3 +1166,35 @@ ColorGlyphRenderer::_FillSweep(const FT_PaintSweepGradient& paint)
 		return;
 	_FillGradient(line, gradient);
 }
+
+
+#else	// !COLOR_GLYPH_RENDERER_COLR_V1
+
+
+ColorGlyphRenderer::ColorGlyphRenderer(FT_Face face)
+	:
+	fFace(face)
+{
+}
+
+
+ColorGlyphRenderer::~ColorGlyphRenderer()
+{
+}
+
+
+/*static*/ bool
+ColorGlyphRenderer::HasPaint(FT_Face face, uint32 glyphIndex)
+{
+	return false;
+}
+
+
+bool
+ColorGlyphRenderer::Render(uint32 glyphIndex, ColorGlyphBitmap& bitmap)
+{
+	return false;
+}
+
+
+#endif	// COLOR_GLYPH_RENDERER_COLR_V1
