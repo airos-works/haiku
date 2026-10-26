@@ -1274,7 +1274,7 @@ each USB port, the serial console, and a Bluetooth device to pair with.
         0 behind the scan in the minute reports, longest flush 2.9 ms
       the frame buffer (nvscanout --dump) equals app_server's screenshot but
         for the Deskbar CPU meter, at 1920x1080 and after the mode change
-      drawtest against 2026-10-19 numbers: whole-window fills 1344 a second
+      drawtest, same boot: whole-window fills 1344 a second
         with device copies, 1287 with CPU copies; small rectangles 427
         against 347; scrolls and text unchanged. Drawing is the processor's
         and lands in memory; what the engine takes off it is the copy
