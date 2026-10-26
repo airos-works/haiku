@@ -52,6 +52,7 @@ SYSTEM_APPS += [ FFilterByBuildFeatures
 	SerialConnect
 	SoftwareUpdater
 	SoundRecorder
+	SystemUpdater
 ] ;
 
 # air/OS: ActivityMonitor and MediaPlayer stay in the image without a menu

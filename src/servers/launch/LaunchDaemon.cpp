@@ -1842,6 +1842,9 @@ LaunchDaemon::_LaunchJob(Job* job, uint32 options)
 		if (pending != NULL && _LaunchJob(pending, 0)) {
 			// Remove the job from the pending list once its in the launch
 			// queue, so that is not being launched again next time.
+			// (air/OS: it was never removed, so only the first of several
+			// jobs waiting for the same requirement was ever launched.)
+			job->Pending().Remove(index);
 			index--;
 			count--;
 		}

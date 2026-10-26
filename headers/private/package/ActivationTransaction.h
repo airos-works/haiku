@@ -55,6 +55,13 @@ public:
 			bool				FirstBootProcessing() const;
 			void				SetFirstBootProcessing(bool processingIsOn);
 
+			bool				DeferActivation() const;
+			void				SetDeferActivation(bool defer);
+									// air/OS: move the packages and write the
+									// activation file, but leave the running
+									// system alone until the next boot, as
+									// for an update of the system package
+
 	virtual	status_t			Archive(BMessage* archive,
 									bool deep = true) const;
 	static	BArchivable*		Instantiate(BMessage* archive);
@@ -70,6 +77,7 @@ private:
 			BStringList			fPackagesToActivate;
 			BStringList			fPackagesToDeactivate;
 			bool				fFirstBootProcessing;
+			bool				fDeferActivation;
 };
 
 

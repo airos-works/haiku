@@ -25,7 +25,8 @@ BActivationTransaction::BActivationTransaction()
 	fTransactionDirectoryName(),
 	fPackagesToActivate(),
 	fPackagesToDeactivate(),
-	fFirstBootProcessing(false)
+	fFirstBootProcessing(false),
+	fDeferActivation(false)
 {
 }
 
@@ -38,7 +39,8 @@ BActivationTransaction::BActivationTransaction(BMessage* archive,
 	fTransactionDirectoryName(),
 	fPackagesToActivate(),
 	fPackagesToDeactivate(),
-	fFirstBootProcessing(false)
+	fFirstBootProcessing(false),
+	fDeferActivation(false)
 {
 	status_t error;
 	int32 location;
@@ -46,6 +48,8 @@ BActivationTransaction::BActivationTransaction(BMessage* archive,
 	if (archive->FindBool("first boot processing", &fFirstBootProcessing)
 			!= B_OK)
 		fFirstBootProcessing = false; // Field is optional for compatibility.
+	if (archive->FindBool("defer activation", &fDeferActivation) != B_OK)
+		fDeferActivation = false; // optional too
 
 	if ((error = archive->FindInt32("location", &location)) == B_OK
 		&& (error = archive->FindInt64("change count", &fChangeCount)) == B_OK
@@ -99,6 +103,7 @@ BActivationTransaction::SetTo(BPackageInstallationLocation location,
 	fPackagesToActivate.MakeEmpty();
 	fPackagesToDeactivate.MakeEmpty();
 	fFirstBootProcessing = false;
+	fDeferActivation = false;
 
 	return B_OK;
 }
@@ -205,6 +210,20 @@ BActivationTransaction::SetFirstBootProcessing(bool processingIsOn)
 }
 
 
+bool
+BActivationTransaction::DeferActivation() const
+{
+	return fDeferActivation;
+}
+
+
+void
+BActivationTransaction::SetDeferActivation(bool defer)
+{
+	fDeferActivation = defer;
+}
+
+
 status_t
 BActivationTransaction::Archive(BMessage* archive, bool deep) const
 {
@@ -221,7 +240,9 @@ BActivationTransaction::Archive(BMessage* archive, bool deep) const
 		|| (error = archive->AddStrings("deactivate", fPackagesToDeactivate))
 			!= B_OK
 		|| (error = archive->AddBool("first boot processing",
-			fFirstBootProcessing)) != B_OK) {
+			fFirstBootProcessing)) != B_OK
+		|| (error = archive->AddBool("defer activation",
+			fDeferActivation)) != B_OK) {
 		return error;
 	}
 

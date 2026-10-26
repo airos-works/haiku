@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include <AutoDeleter.h>
+#include <airos_boot_control.h>
 #include <boot/vfs.h>
 #include <package/PackagesDirectoryDefs.h>
 
@@ -41,6 +42,37 @@ is_system_package(const char* name)
 }
 
 
+static inline bool
+is_release_package(const char* name)
+{
+	// air/OS: "airos_release-<version>-<revision>-<arch>.hpkg"
+	return strncmp(name, "airos_release-", 14) == 0;
+}
+
+
+/*!	Copies the version part of a package file name ("<name>-<version>-...")
+	into \a version.
+*/
+static void
+get_package_file_version(const char* path, char* version, size_t versionSize)
+{
+	const char* name = strrchr(path, '/');
+	name = name != NULL ? name + 1 : path;
+	const char* start = strchr(name, '-');
+	if (start == NULL) {
+		version[0] = '\0';
+		return;
+	}
+	start++;
+	const char* end = strchr(start, '-');
+	size_t length = end != NULL ? (size_t)(end - start) : strlen(start);
+	if (length >= versionSize)
+		length = versionSize - 1;
+	memcpy(version, start, length);
+	version[length] = '\0';
+}
+
+
 // #pragma mark - PackageVolumeState
 
 
@@ -48,7 +80,8 @@ PackageVolumeState::PackageVolumeState()
 	:
 	fName(NULL),
 	fDisplayName(NULL),
-	fSystemPackage(NULL)
+	fSystemPackage(NULL),
+	fReleaseVersion(NULL)
 {
 }
 
@@ -98,12 +131,17 @@ PackageVolumeState::Unset()
 
 	free(fSystemPackage);
 	fSystemPackage = NULL;
+
+	free(fReleaseVersion);
+	fReleaseVersion = NULL;
 }
 
 
 const char*
 PackageVolumeState::DisplayName() const
 {
+	if (fDisplayName == NULL)
+		return fName == NULL ? "Latest state (cannot start)" : fName;
 	return fDisplayName;
 }
 
@@ -142,7 +180,80 @@ PackageVolumeState::SetSystemPackage(const char* package)
 		}
 	}
 
+	_UpdateReleaseDisplayName();
 	return B_OK;
+}
+
+
+status_t
+PackageVolumeState::SetReleasePackage(const char* package)
+{
+	char version[B_FILE_NAME_LENGTH];
+	get_package_file_version(package, version, sizeof(version));
+	if (version[0] == '\0')
+		return B_BAD_VALUE;
+
+	free(fReleaseVersion);
+	fReleaseVersion = strdup(version);
+	if (fReleaseVersion == NULL)
+		return B_NO_MEMORY;
+
+	_UpdateReleaseDisplayName();
+	return B_OK;
+}
+
+
+/*!	air/OS: names a state after its release, "air/OS 2026-10-26 09:15
+	(hrev60207+1930)", once both its release and its system package are known.
+*/
+void
+PackageVolumeState::_UpdateReleaseDisplayName()
+{
+	if (fReleaseVersion == NULL || fSystemPackage == NULL)
+		return;
+
+	// the release version is the build time, "20261026.0915"
+	char when[32];
+	const char* version = fReleaseVersion;
+	if (strlen(version) == 13 && version[8] == '.') {
+		snprintf(when, sizeof(when), "%.4s-%.2s-%.2s %.2s:%.2s", version,
+			version + 4, version + 6, version + 9, version + 11);
+	} else
+		strlcpy(when, version, sizeof(when));
+
+	// the Haiku revision from the system package's version,
+	// "r1~beta5_hrev60207_1930"
+	char systemVersion[B_FILE_NAME_LENGTH];
+	get_package_file_version(fSystemPackage, systemVersion,
+		sizeof(systemVersion));
+	// (the boot loader's libc has no strstr())
+	char* revision = NULL;
+	for (char* c = systemVersion; *c != '\0'; c++) {
+		if (strncmp(c, "hrev", 4) == 0) {
+			revision = c;
+			break;
+		}
+	}
+	if (revision != NULL) {
+		for (char* c = revision; *c != '\0'; c++) {
+			if (*c == '_')
+				*c = '+';
+		}
+	}
+
+	char displayName[B_FILE_NAME_LENGTH];
+	snprintf(displayName, sizeof(displayName), "air/OS %s (%s%s%s)", when,
+		fName == NULL ? "latest" : "",
+		fName == NULL && revision != NULL ? ", " : "",
+		revision != NULL ? revision : "");
+	if (fName != NULL && revision == NULL)
+		snprintf(displayName, sizeof(displayName), "air/OS %s", when);
+
+	char* newDisplayName = strdup(displayName);
+	if (newDisplayName == NULL)
+		return;
+	free(fDisplayName);
+	fDisplayName = newDisplayName;
 }
 
 
@@ -180,7 +291,8 @@ PackageVolumeInfo::PackageVolumeInfo()
 	:
 	BReferenceable(),
 	fStates(),
-	fPackagesDir(NULL)
+	fPackagesDir(NULL),
+	fOldStatesLoaded(false)
 {
 }
 
@@ -222,7 +334,15 @@ PackageVolumeInfo::SetTo(Directory* baseDirectory, const char* packagesPath)
 	if (error != B_OK) {
 		TRACE("PackageVolumeInfo::SetTo(): failed to init current state: "
 			"%s\n", strerror(error));
-		return error;
+
+		// air/OS: a package transaction that was cut short can leave the
+		// latest state without its system package, while the old state it
+		// made is complete. Keep the volume if an old state can start.
+		LoadOldStates();
+		if (NewestBootableOldState() == NULL)
+			return error;
+		dprintf("PackageVolumeInfo::SetTo(): the latest state cannot start, "
+			"old states can\n");
 	}
 
 	return B_OK;
@@ -236,6 +356,10 @@ PackageVolumeInfo::LoadOldStates()
 		TRACE("PackageVolumeInfo::LoadOldStates(): package directory is NULL");
 		return B_ERROR;
 	}
+
+	if (fOldStatesLoaded)
+		return B_OK;
+	fOldStatesLoaded = true;
 
 	Directory* packagesDirectory = directory_from(fPackagesDir);
 	packagesDirectory->Acquire();
@@ -307,9 +431,15 @@ PackageVolumeInfo::_InitState(Directory* packagesDirectory, DIR* dir,
 	if (!packagePath.IsSet())
 		return B_NO_MEMORY;
 
+	char releasePackageName[B_FILE_NAME_LENGTH];
+	releasePackageName[0] = '\0';
 	status_t error = _ParseActivatedPackagesFile(packagesDirectory, state,
-		systemPackageName.Get(), B_FILE_NAME_LENGTH);
+		systemPackageName.Get(), B_FILE_NAME_LENGTH, releasePackageName,
+		sizeof(releasePackageName));
 	if (error == B_OK) {
+		if (releasePackageName[0] != '\0')
+			state->SetReleasePackage(releasePackageName);
+
 		// check, if package exists
 		for (PackageVolumeState* otherState = state; otherState != NULL;
 				otherState = fStates.GetPrevious(otherState)) {
@@ -348,9 +478,59 @@ PackageVolumeInfo::_InitState(Directory* packagesDirectory, DIR* dir,
 }
 
 
+PackageVolumeState*
+PackageVolumeInfo::FindState(const char* name) const
+{
+	for (PackageVolumeStateList::ConstIterator it = fStates.GetIterator();
+			PackageVolumeState* state = it.Next();) {
+		if (state->Name() != NULL && strcmp(state->Name(), name) == 0)
+			return state;
+	}
+	return NULL;
+}
+
+
+PackageVolumeState*
+PackageVolumeInfo::NewestBootableOldState() const
+{
+	// the list is sorted newest first, the latest state at its head
+	for (PackageVolumeStateList::ConstIterator it = fStates.GetIterator();
+			PackageVolumeState* state = it.Next();) {
+		if (state->Name() != NULL && state->IsBootable())
+			return state;
+	}
+	return NULL;
+}
+
+
+/*!	Reads a file of System Updater's boot control directory
+	(airos_boot_control.h). Returns its length, or an error when there is none.
+*/
+ssize_t
+PackageVolumeInfo::ReadBootControlFile(const char* name, char* buffer,
+	size_t bufferSize)
+{
+	if (fPackagesDir == NULL)
+		return B_NO_INIT;
+
+	char path[B_PATH_NAME_LENGTH];
+	snprintf(path, sizeof(path), "%s/%s", AIROS_BOOT_CONTROL_DIRECTORY, name);
+	FileDescriptorCloser fd(open_from(directory_from(fPackagesDir), path,
+		O_RDONLY));
+	if (!fd.IsSet())
+		return fd.Get();
+
+	ssize_t length = read(fd.Get(), buffer, bufferSize);
+	if (length >= 0 && (size_t)length < bufferSize)
+		buffer[length] = '\0';
+	return length;
+}
+
+
 status_t
 PackageVolumeInfo::_ParseActivatedPackagesFile(Directory* packagesDirectory,
-	PackageVolumeState* state, char* packageName, size_t packageNameSize)
+	PackageVolumeState* state, char* packageName, size_t packageNameSize,
+	char* releaseName, size_t releaseNameSize)
 {
 	// open the activated-packages file
 	static const size_t kBufferSize = 3 * B_FILE_NAME_LENGTH + 2;
@@ -370,13 +550,27 @@ PackageVolumeInfo::_ParseActivatedPackagesFile(Directory* packagesDirectory,
 	if (!S_ISREG(st.st_mode))
 		return B_ENTRY_NOT_FOUND;
 
-	// read the file until we find the system package line
+	// Read the file for the system package line and (air/OS) the release
+	// package line.
+	status_t result = B_ENTRY_NOT_FOUND;
+	releaseName[0] = '\0';
 	size_t remainingBytes = 0;
 	for (;;) {
 		ssize_t bytesRead = read(fd.Get(), path.Get() + remainingBytes,
 			kBufferSize - remainingBytes - 1);
-		if (bytesRead <= 0)
-			return B_ENTRY_NOT_FOUND;
+		if (bytesRead <= 0) {
+			// the last line may lack its line feed
+			if (remainingBytes > 0) {
+				path[remainingBytes] = '\0';
+				char* line = path.Get();
+				if (result != B_OK && is_system_package(line)) {
+					result = strlcpy(packageName, line, packageNameSize)
+							< packageNameSize ? B_OK : B_NAME_TOO_LONG;
+				} else if (is_release_package(line))
+					strlcpy(releaseName, line, releaseNameSize);
+			}
+			return result;
+		}
 
 		remainingBytes += bytesRead;
 		path[remainingBytes] = '\0';
@@ -384,12 +578,16 @@ PackageVolumeInfo::_ParseActivatedPackagesFile(Directory* packagesDirectory,
 		char* line = path.Get();
 		while (char* lineEnd = strchr(line, '\n')) {
 			*lineEnd = '\0';
-			if (is_system_package(line)) {
-				status_t result = strlcpy(packageName, line, packageNameSize)
-						< packageNameSize
-					?  B_OK : B_NAME_TOO_LONG;
-				return result;
-			}
+			if (result != B_OK && is_system_package(line)) {
+				result = strlcpy(packageName, line, packageNameSize)
+						< packageNameSize ? B_OK : B_NAME_TOO_LONG;
+				if (result != B_OK)
+					return result;
+			} else if (is_release_package(line))
+				strlcpy(releaseName, line, releaseNameSize);
+
+			if (result == B_OK && releaseName[0] != '\0')
+				return B_OK;
 
 			line = lineEnd + 1;
 		}
@@ -403,5 +601,5 @@ PackageVolumeInfo::_ParseActivatedPackagesFile(Directory* packagesDirectory,
 			remainingBytes = 0;
 	}
 
-	return B_ENTRY_NOT_FOUND;
+	return result;
 }

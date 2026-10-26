@@ -207,6 +207,12 @@ CommitTransactionHandler::HandleRequest(
 
 	fFirstBootProcessing = transaction.FirstBootProcessing();
 
+	// A deferred transaction (air/OS System Updater) changes the packages
+	// directory and the activation file only; packagefs picks the new state up
+	// at the next boot, as after an update of the system package.
+	if (transaction.DeferActivation() && !fFirstBootProcessing)
+		fVolumeStateIsActive = false;
+
 	// collect the packages to deactivate
 	_GetPackagesToDeactivate(transaction);
 

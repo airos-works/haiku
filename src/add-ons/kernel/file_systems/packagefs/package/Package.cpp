@@ -6,6 +6,7 @@
 
 #include "Package.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -18,7 +19,9 @@
 #include <package/hpkg/PackageEntryAttribute.h>
 
 #include <AutoDeleter.h>
+#include <AutoDeleterPosix.h>
 #include <FdIO.h>
+#include <package/PackagesDirectoryDefs.h>
 #include <package/hpkg/PackageFileHeapReader.h>
 #include <package/hpkg/PackageReaderImpl.h>
 #include <util/AutoLock.h>
@@ -651,9 +654,13 @@ Package::Open()
 	fFD = openat(fPackagesDirectory->DirectoryFD(), fFileName,
 		O_RDONLY | O_NOCACHE);
 	if (fFD < 0) {
-		ERROR("Failed to open package file \"%s\": %s\n", fFileName.Data(),
-			strerror(errno));
-		return errno;
+		status_t error = errno;
+		fFD = _OpenMovedFile();
+		if (fFD < 0) {
+			ERROR("Failed to open package file \"%s\": %s\n",
+				fFileName.Data(), strerror(error));
+			return error;
+		}
 	}
 
 	// stat it to verify that it's still the same file
@@ -667,9 +674,11 @@ Package::Open()
 	}
 
 	if (st.st_dev != fDeviceID || st.st_ino != fNodeID) {
+		// another file of the same name took its place
 		close(fFD);
-		fFD = -1;
-		RETURN_ERROR(B_ENTRY_NOT_FOUND);
+		fFD = _OpenMovedFile();
+		if (fFD < 0)
+			RETURN_ERROR(B_ENTRY_NOT_FOUND);
 	}
 
 	fOpenCount = 1;
@@ -678,6 +687,54 @@ Package::Open()
 		fHeapReader->UpdateFD(fFD);
 
 	return fFD;
+}
+
+
+/*!	A deferred package transaction (an update of the system package, or a
+	System Updater transaction) moves the files of the packages it deactivates
+	from the packages directory into the new old state directory in
+	"administrative", while they stay active until the next boot. Find such a
+	file there by its node, so that the running system can go on reading it.
+	Returns a file descriptor or an error code.
+*/
+int
+Package::_OpenMovedFile()
+{
+	int adminFD = openat(fPackagesDirectory->DirectoryFD(),
+		PACKAGES_DIRECTORY_ADMIN_DIRECTORY, O_RDONLY | O_DIRECTORY);
+	if (adminFD < 0)
+		return B_ENTRY_NOT_FOUND;
+
+	DirCloser dir(fdopendir(adminFD));
+	if (!dir.IsSet()) {
+		close(adminFD);
+		return B_ENTRY_NOT_FOUND;
+	}
+
+	while (dirent* entry = readdir(dir.Get())) {
+		if (strncmp(entry->d_name, "state_", 6) != 0)
+			continue;
+
+		FileDescriptorCloser stateFD(openat(adminFD, entry->d_name,
+			O_RDONLY | O_DIRECTORY));
+		if (!stateFD.IsSet())
+			continue;
+
+		int fd = openat(stateFD.Get(), fFileName, O_RDONLY | O_NOCACHE);
+		if (fd < 0)
+			continue;
+
+		struct stat st;
+		if (fstat(fd, &st) == 0 && st.st_dev == fDeviceID
+			&& st.st_ino == fNodeID) {
+			INFORM("package file \"%s\" found in old state \"%s\"\n",
+				fFileName.Data(), entry->d_name);
+			return fd;
+		}
+		close(fd);
+	}
+
+	return B_ENTRY_NOT_FOUND;
 }
 
 

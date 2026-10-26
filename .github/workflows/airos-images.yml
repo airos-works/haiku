@@ -5,7 +5,9 @@
 #   rpi4    airos-rpi4.img     Raspberry Pi 4 SD card (Balena Etcher), boots directly
 #   cubie   airos-cubie.img    Radxa Cubie A7S SD card with U-Boot and UEFI
 # Each image is smoke-tested (Pi: SD layout) and published on the build server
-# and as a public, immutable GitHub prerelease. They are rebuilt nightly
+# and as a public, immutable GitHub prerelease; its packages go into the
+# target's System Updater feed (http://192.168.1.200/updates/<target>/,
+# docs/airos/SYSTEM-UPDATER.md). They are rebuilt nightly
 # too, to pick up new builds of the applications and Summit.
 name: air/OS images
 
@@ -58,6 +60,10 @@ jobs:
       - name: Smoke test
         if: steps.selected.outputs.build
         run: '"$RUNNER_TEMP/airos-ci/images/smoke-test.sh" "${{ matrix.target }}" "${{ steps.build.outputs.IMAGE_DIR }}"'
+
+      - name: Publish the release to System Updater's feed
+        if: steps.selected.outputs.build
+        run: 'python3 "$RUNNER_TEMP/airos-ci/images/release-feed.py" publish "${{ matrix.target }}" "${{ steps.build.outputs.IMAGE_DIR }}"'
 
       - name: Publish verified image to GitHub Releases
         if: steps.selected.outputs.build

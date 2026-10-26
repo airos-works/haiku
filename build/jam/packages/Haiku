@@ -557,6 +557,11 @@ for linkTarget in $(DESKBAR_APPLICATIONS) {
 	AddSymlinkToPackage data deskbar menu Applications
 		: ../../../../apps/$(linkTarget) : $(linkTarget) ;
 }
+# air/OS: System Updater, named as people say it
+if SystemUpdater in $(SYSTEM_APPS) {
+	AddSymlinkToPackage data deskbar menu Applications
+		: ../../../../apps/SystemUpdater : "System Updater" ;
+}
 
 # Office and Media applications supply their links in their own packages.
 AddDirectoryToPackage data deskbar menu Office : deskbar-office.rdef ;
