@@ -1,9 +1,11 @@
 # Raspberry Pi 4 CPU tuning
 
 Work of 24 October 2026, following the ARM64 profiles proposed in
-[SYSTEM-PERFORMANCE.md](../airos/SYSTEM-PERFORMANCE.md). The Pi was not
-connected to the lab that day, so nothing here is a native measurement.
-Evidence: `/mnt/HaikuWork/rpi4/evidence/cpu-tuning-20261024`.
+[SYSTEM-PERFORMANCE.md](../airos/SYSTEM-PERFORMANCE.md), measured on the Pi on
+26 October (see [Native measurement](#native-measurement-26-october-2026)).
+Every Pi image, the lab's and CI's, is built with the profile.
+Evidence: `/mnt/HaikuWork/rpi4/evidence/cpu-tuning-20261024` and
+`cpu-tuning-native-20261026`.
 
 ## The profile
 
@@ -111,15 +113,72 @@ today, where both are the same.
 - `boot_delay` is not described by the current documentation; measure
   before changing.
 
-## Native measurement, when the Pi is back
+## Native measurement, 26 October 2026
 
-1. Flash or install `build-tune-base`, then `build-tune-a72`, alternating
-   (ABBA), same packages and firmware.
-2. `rpi4_atomic_bench` (lab image, `tools/rpi4/atomic_bench.cpp`) built in
-   each directory: uncontended `atomic_add`, `atomic_test_and_set`,
-   `std::atomic`, mutexes, a semaphore round trip and four-thread contention.
-3. The existing workloads in [PERFORMANCE.md](PERFORMANCE.md): app launch
-   (`rpi4_app_bench`), drawing, memory, VM, the browser DOM fixture and
-   boot markers.
-4. Keep the profile only if nothing regresses; `RPI4_CPU_PROFILE = none`
-   and `RPI4_MESA_CPU_FLAGS=` undo it.
+Three images from the same source (master 7ae85ccb57 plus this branch), the
+same packages and firmware, written in turn to the lab Pi's SD card (Pi 4B
+rev 1.5, 4 GB, 1.8 GHz with `arm_boost`): generic code, the `rpi4` profile,
+and the profile with `-O3`. Each pass is a fresh boot, one minute of idle,
+then the benchmark set; generic and tuned passes alternated (ABBA). Probe
+binaries other than `rpi4_atomic_bench` were one build for all images, so
+only the system under them differed. Passes: generic 3, `rpi4` 4, `-O3` 2.
+Values are medians of the passes; lower is better.
+
+| Workload | Generic | `rpi4` | `rpi4` + `-O3` |
+| --- | ---: | ---: | ---: |
+| `atomic_add()`, ns | 15.57 | 15.02 (-3.6%) | 15.02 (-3.6%) |
+| `atomic_test_and_set()`, ns | 9.45 | 8.90 (-5.9%) | 8.90 (-5.9%) |
+| `std::atomic` compare-exchange, ns | 23.35 | 22.79 (-2.4%) | 22.79 (-2.4%) |
+| `atomic_add()`, 4 threads, one variable, ns | 51.5 | 47.2 (-8.4%) | 51.8 (+0.5%) |
+| uncontended `pthread_mutex_lock/unlock`, ns | 56.19 | 57.82 (+2.9%) | 62.82 (+11.8%) |
+| semaphore release/acquire round trip, ns | 1769 | 1755 (-0.8%) | 1757 (-0.7%) |
+| 3000 small files: create, ms | 6444 | 5986 (-7.1%) | 6287 (-2.4%) |
+| 3000 small files: remove, ms | 2441 | 2424 (-0.7%) | 2425 (-0.7%) |
+| 64 MB area delete (resident / demand), us | 20742 / 35990 | 19755 / 34419 (-4.8 / -4.4%) | 19670 / 34569 |
+| app_server drawing, 8 cases, ms | | -2.1% to +1.3% | -2.7% to +0.7% |
+| StyledEdit launch to window, ms | 99.7 | 95.9 (-3.9%) | 95.2 (-4.6%) |
+| AboutSystem / Terminal / Appearance launch | | -0.5 / -0.2 / -0.3% | -3.2 / -2.5 / -2.3% |
+| 512 MiB TCP receive (Ethernet), ms | 5936 | 5903 (-0.6%) | 6540 (+10.2%) |
+| Kernel / libroot / libbe text size | | +0.8 / +0.3 / +0.7% | +12.4 / +8.9 / +3.2% |
+
+Run-to-run noise: drawing about 2%, TCP about 15% between single runs
+(three per pass), the file test about 10%. Atomic and mutex timings repeat
+to within 0.1%: the uncontended mutex really is 1.6 ns slower tuned, although
+the tuned lock path is the generic one with the libgcc call replaced by an
+inline exclusive load/store loop; layout is the likely cause. The contended
+four-thread mutex numbers scatter by 2x between passes and are not
+used. Mesa (`rpi4_mesa_cpu_bench`, generic and tuned `libEGL_mesa.so.0` from
+identical source swapped on one boot, 8 alternating pairs): shader compile
+-1.0% (every pair), draw calls unchanged (GPU bound), texture upload +1.0%
+(within its noise; the first 4 pairs gave -1%).
+
+Decisions:
+
+- **`rpi4` profile at `-O2`: adopted** for the kernel, loaders, userland and
+  Mesa of every Pi image. Small, consistent gains (atomics, file system,
+  VM, launch), nothing outside noise slower except the 1.6 ns mutex case.
+- **`-O3`: rejected.** One to three percent in drawing and launches does not
+  pay for a 12% larger kernel, the slower mutex, losing the file-system
+  gain, and the TCP result. It also breaks the build: GCC 13 at `-O3`
+  reports 65 `maybe-uninitialized`, 2 `nonnull` and 3 `stringop-overflow`
+  warnings that `-Werror` turns into errors (pci, bfs, elf, signal, ...);
+  the experiment had to demote them.
+- Not worth more experiments without a new idea: the remaining CPU cost of
+  these workloads is in hand-written assembly (memory copies), the GPU, the
+  SD card and prebuilt packages (FFmpeg, WebKit, libstdc++), not in code
+  generation.
+
+The images reached the desktop on every boot (9 boots, three images).
+`tools/rpi4/UserBuildConfig` (lab) and `tools/airos/ci/UserBuildConfig`
+(`@airos-rpi4`, CI) both call `SetCPUProfile arm64 : rpi4`; airos-ci builds
+Mesa's V3D and V3DV with the same flags and rebuilds the Pi's objects when
+the profile changes, because jam does not rebuild objects for changed flags.
+Revert with `RPI4_CPU_PROFILE = none ;` (lab) or by removing the call (CI).
+
+Lab procedure without the HA plug (it powers the Dragon since 24 October):
+`evidence/cpu-tuning-native-20261026/pi-flash.sh <image>` attaches the
+recovery disk on the NanoKVM (now 192.168.1.30), restarts air/OS from telnet,
+writes and reads back the card from Alpine, releases the disk inside Alpine
+(else the gadget answers "Resource busy"), detaches it and reboots into the
+card. `pi-bench.sh`, `pi-mesa-ab.sh` and `summarize.py` there repeat the
+measurement.
