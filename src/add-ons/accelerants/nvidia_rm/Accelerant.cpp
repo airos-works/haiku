@@ -152,6 +152,8 @@ private:
 		char name[NVKMS_DPY_NAME_SIZE];
 		bool connected;
 		bool forced;				// see IsForcedConnected()
+		std::vector<uint8> forcedEdid;	// a force_edid file's, asked for
+									// at every query
 		bool enabled;
 		bool displayPort;
 		NvKmsMode preferredMode;
@@ -383,7 +385,7 @@ NvAccelerant *NvAccelerant::sInstance {};
 // The settings file, ~/config/settings/nvidia_rm_accelerant, is a testing
 // aid. It can force a connector on ("force_connected DP-0", using the EDID of
 // the first connected monitor, so that layouts can be tried without the
-// monitors), and it can shape the layout the card comes up with before
+// monitors; "force_edid HDMI-0 <file>" with no monitor at all), and it can shape the layout the card comes up with before
 // app_server has said anything ("scale DP-2 150", "position DP-4 2560 0").
 // app_server's own layout, once it applies one, replaces all of that.
 static bool ReadSetting(const char *key, const char *connector, char *value, size_t valueSize)
@@ -410,6 +412,30 @@ static bool IsForcedConnected(const char *name)
 {
 	char value[128];
 	return ReadSetting("force_connected", name, value, sizeof(value));
+}
+
+// "force_edid HDMI-0 <file>" forces a connector on with the EDID in the file,
+// monitor or not: a test rig without monitors. Only a connector that needs no
+// link training (HDMI, DVI) shows anything that way.
+static bool ReadForcedEdid(const char *name, std::vector<uint8> &edid)
+{
+	char path[128];
+	if (!ReadSetting("force_edid", name, path, sizeof(path)))
+		return false;
+	FILE *file = fopen(path, "rb");
+	if (file == NULL) {
+		debug_printf("nvidia_rm: force_edid %s: cannot open %s\n", name, path);
+		return false;
+	}
+	edid.resize(NVKMS_EDID_BUFFER_SIZE);
+	size_t size = fread(edid.data(), 1, edid.size(), file);
+	fclose(file);
+	if (size < 128 || size % 128 != 0) {
+		debug_printf("nvidia_rm: force_edid %s: %s is no EDID\n", name, path);
+		return false;
+	}
+	edid.resize(size);
+	return true;
 }
 
 // "acceleration 2d off" leaves the 2D engine alone: no hooks, and app_server
@@ -617,6 +643,14 @@ bool NvAccelerant::QueryOutput(Output &output, NvKmsQueryDpyDynamicDataReply *dy
 	params.request.deviceHandle = fKmsDev.Get();
 	params.request.dispHandle = fDisp;
 	params.request.dpyId = output.dpyId;
+	if (!output.forcedEdid.empty()) {
+		// NVKMS forgets an override at the next plain query
+		params.request.forceConnected = true;
+		params.request.overrideEdid = true;
+		params.request.edid.bufferSize = output.forcedEdid.size();
+		memcpy(params.request.edid.buffer, output.forcedEdid.data(),
+			output.forcedEdid.size());
+	}
 	CheckErrno(fKms.Control(NVKMS_IOCTL_QUERY_DPY_DYNAMIC_DATA, &params, sizeof(params)));
 
 	ConnectorName(params.reply.name, output.name, sizeof(output.name));
@@ -668,21 +702,32 @@ void NvAccelerant::FindOutputs()
 			connected ? " (connected" : "", connected ? dynamic.name : "",
 			connected ? ")" : "");
 
-		if (!connected && haveFirstConnected && IsForcedConnected(output.name)) {
+		std::vector<uint8> edidFile;
+		bool forceFromFile = !connected && ReadForcedEdid(output.name, edidFile);
+		if (!connected && ((haveFirstConnected && IsForcedConnected(output.name))
+				|| forceFromFile)) {
 			NvKmsQueryDpyDynamicDataParams forceParams {};
 			forceParams.request.deviceHandle = fKmsDev.Get();
 			forceParams.request.dispHandle = fDisp;
 			forceParams.request.dpyId = dpyId;
 			forceParams.request.forceConnected = true;
 			forceParams.request.overrideEdid = true;
-			forceParams.request.edid.bufferSize = firstConnected.edid.bufferSize;
-			memcpy(forceParams.request.edid.buffer, firstConnected.edid.buffer,
-				sizeof(forceParams.request.edid.buffer));
+			if (forceFromFile) {
+				forceParams.request.edid.bufferSize = edidFile.size();
+				memcpy(forceParams.request.edid.buffer, edidFile.data(),
+					edidFile.size());
+			} else {
+				forceParams.request.edid.bufferSize = firstConnected.edid.bufferSize;
+				memcpy(forceParams.request.edid.buffer, firstConnected.edid.buffer,
+					sizeof(forceParams.request.edid.buffer));
+			}
 			CheckErrno(fKms.Control(NVKMS_IOCTL_QUERY_DPY_DYNAMIC_DATA, &forceParams, sizeof(forceParams)));
 			debug_printf("nvidia_rm: forcing %s connected: %d\n", output.name,
 				forceParams.reply.connected);
 			if (forceParams.reply.connected) {
-				connected = QueryOutput(output);
+				if (forceFromFile)
+					output.forcedEdid = edidFile;
+				connected = QueryOutput(output, &dynamic);
 				output.forced = true;
 			}
 		}

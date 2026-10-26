@@ -8,7 +8,12 @@
  * blits, sync tokens, and copies from a frame buffer source. The surface is
  * unpublished at the end.
  *
- * usage: nvclone2dtest <accelerant>
+ * With --init it stands in for app_server instead: it initializes the
+ * accelerant itself, which sets a mode (so only while app_server is on
+ * another driver, and with a monitor or a force_edid setting), and checks
+ * the same on the real frame buffer.
+ *
+ * usage: nvclone2dtest [--init] <accelerant>
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +32,8 @@
 #include <NvRmApi.h>
 #include <NvRmDevice.h>
 
+#include "NvUtils.h"
+
 extern "C" {
 #include "nvos.h"
 #include "class/cl0040.h"
@@ -36,7 +43,7 @@ extern "C" {
 }
 
 
-static const uint32 kWidth = 1280, kHeight = 720;
+static uint32 kWidth = 1280, kHeight = 720;
 static int sFailures = 0;
 
 
@@ -73,10 +80,12 @@ static void Check(const char *what, const std::vector<uint32> &expected,
 
 int main(int argc, char **argv)
 {
-	if (argc != 2) {
-		fprintf(stderr, "usage: nvclone2dtest <accelerant>\n");
+	bool init = argc == 3 && strcmp(argv[1], "--init") == 0;
+	if (argc != 2 && !init) {
+		fprintf(stderr, "usage: nvclone2dtest [--init] <accelerant>\n");
 		return 2;
 	}
+	const char *accelerantPath = argv[argc - 1];
 
 	int deviceFd = open("/dev/graphics/nvidia0", O_RDWR | O_CLOEXEC);
 	if (deviceFd < 0) {
@@ -91,76 +100,96 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
+	struct Unpublish {
+		int fd;
+		bool armed;
+		~Unpublish()
+		{
+			if (!armed)
+				return;
+			nv_haiku_scanout_info none {};
+			ioctl(fd, NV_HAIKU_BASE + NV_HAIKU_PUBLISH_SCANOUT, &none,
+				sizeof(none));
+		}
+	} unpublish {deviceFd, false};
+
 	try {
 		NvRmApi rm;
 		NvRmDevice rmDev(rm, 0);
 
-		// the "screen": video memory, pitch linear, shared like app_server's
-		uint32 bytesPerRow = (kWidth * 4 + 255) & ~255u;
-		uint32 stride = bytesPerRow / 4;
-		uint64 size = ((uint64)bytesPerRow * kHeight + B_PAGE_SIZE - 1)
-			& ~(uint64)(B_PAGE_SIZE - 1);
-		NV_MEMORY_ALLOCATION_PARAMS params {};
-		params.owner = rm.Client().Get();
-		params.type = NVOS32_TYPE_IMAGE;
-		params.size = size;
-		params.attr = DRF_DEF(OS32, _ATTR, _LOCATION, _VIDMEM)
-			| DRF_DEF(OS32, _ATTR, _FORMAT, _PITCH);
-		params.flags = NVOS32_ALLOC_FLAGS_PERSISTENT_VIDMEM;
-		NvRmObject memory = rmDev.Device().Alloc(NV01_MEMORY_LOCAL_USER, &params);
-		NV0000_CTRL_CLIENT_SHARE_OBJECT_PARAMS share {};
-		share.hObject = memory.Get();
-		share.sharePolicy.type = RS_SHARE_TYPE_ALL;
-		RS_ACCESS_MASK_ADD(&share.sharePolicy.accessMask, RS_ACCESS_DUP_OBJECT);
-		rm.Client().Control(NV0000_CTRL_CMD_CLIENT_SHARE_OBJECT, &share,
-			sizeof(share));
-		NvRmMemoryMapping mapping = rmDev.MapMemory(memory.Get(), false, 0, size, 0);
-		uint32 *bits = (uint32*)mapping.Address();
+		uint32 *bits = NULL;
+		uint32 bytesPerRow = 0;
+		NvRmObject memory;
+		NvRmMemoryMapping mapping;
+		if (!init) {
+			// the "screen": video memory, allocated and shared the way the
+			// accelerant does its frame buffers
+			bytesPerRow = (kWidth * 4 + 255) & ~255u;
+			uint64 size = ((uint64)bytesPerRow * kHeight + B_PAGE_SIZE - 1)
+				& ~(uint64)(B_PAGE_SIZE - 1);
+			NvU8 compressible = 0;
+			nvKmsKapiAllocateVideoMemory(rmDev, memory, NvKmsSurfaceMemoryLayoutPitch,
+				size, NVKMS_KAPI_ALLOCATION_TYPE_SCANOUT, &compressible);
+			NV0000_CTRL_CLIENT_SHARE_OBJECT_PARAMS share {};
+			share.hObject = memory.Get();
+			share.sharePolicy.type = RS_SHARE_TYPE_ALL;
+			RS_ACCESS_MASK_ADD(&share.sharePolicy.accessMask, RS_ACCESS_DUP_OBJECT);
+			rm.Client().Control(NV0000_CTRL_CMD_CLIENT_SHARE_OBJECT, &share,
+				sizeof(share));
+			mapping = rmDev.MapMemory(memory.Get(), false, 0, size, 0);
+			bits = (uint32*)mapping.Address();
 
-		nv_haiku_scanout_info info {};
-		info.client = rm.Client().Get();
-		info.memory = memory.Get();
-		info.width = kWidth;
-		info.height = kHeight;
-		info.bytes_per_row = bytesPerRow;
-		info.color_space = B_RGB32;
-		info.size = size;
-		CheckErrno(ioctl(deviceFd, NV_HAIKU_BASE + NV_HAIKU_PUBLISH_SCANOUT, &info,
-			sizeof(info)));
+			nv_haiku_scanout_info info {};
+			info.client = rm.Client().Get();
+			info.memory = memory.Get();
+			info.width = kWidth;
+			info.height = kHeight;
+			info.bytes_per_row = bytesPerRow;
+			info.color_space = B_RGB32;
+			info.size = size;
+			CheckErrno(ioctl(deviceFd, NV_HAIKU_BASE + NV_HAIKU_PUBLISH_SCANOUT,
+				&info, sizeof(info)));
+			unpublish.armed = true;
+		}
 
-		struct Unpublish {
-			int fd;
-			~Unpublish()
-			{
-				nv_haiku_scanout_info none {};
-				ioctl(fd, NV_HAIKU_BASE + NV_HAIKU_PUBLISH_SCANOUT, &none,
-					sizeof(none));
-			}
-		} unpublish {deviceFd};
-
-		image_id image = load_add_on(argv[1]);
+		image_id image = load_add_on(accelerantPath);
 		if (image < 0) {
-			fprintf(stderr, "loading %s: %s\n", argv[1], strerror(image));
+			fprintf(stderr, "loading %s: %s\n", accelerantPath, strerror(image));
 			return 2;
 		}
 		GetAccelerantHook hook;
 		CheckErrno(get_image_symbol(image, B_ACCELERANT_ENTRY_POINT,
 			B_SYMBOL_TYPE_ANY, (void**)&hook) == B_OK ? 0 : -1);
 
-		clone_accelerant cloneHook = (clone_accelerant)hook(B_CLONE_ACCELERANT, NULL);
-		char cloneInfo[] = "/dev/graphics/nvidia0";
-		status_t status = cloneHook(cloneInfo);
-		printf("%s clone: %s\n", status == B_OK ? "ok  " : "FAIL", strerror(status));
-		if (status != B_OK)
-			return 1;
+		status_t status;
+		if (init) {
+			init_accelerant initHook = (init_accelerant)hook(B_INIT_ACCELERANT, NULL);
+			status = initHook(deviceFd);
+			printf("%s init: %s\n", status == B_OK ? "ok  " : "FAIL", strerror(status));
+			if (status != B_OK)
+				return 1;
+			display_mode mode {};
+			((get_display_mode)hook(B_GET_DISPLAY_MODE, NULL))(&mode);
+			kWidth = std::min<uint32>(mode.virtual_width, 1920);
+			kHeight = std::min<uint32>(mode.virtual_height, 1080);
+			printf("     mode %ux%u, checking %" B_PRIu32 "x%" B_PRIu32 "\n",
+				mode.virtual_width, mode.virtual_height, kWidth, kHeight);
+		} else {
+			clone_accelerant cloneHook = (clone_accelerant)hook(B_CLONE_ACCELERANT, NULL);
+			char cloneInfo[] = "/dev/graphics/nvidia0";
+			status = cloneHook(cloneInfo);
+			printf("%s clone: %s\n", status == B_OK ? "ok  " : "FAIL", strerror(status));
+			if (status != B_OK)
+				return 1;
 
-		// a clone sets no modes
-		bool modeHooks = hook(B_SET_DISPLAY_MODE, NULL) != NULL
-			|| hook(B_SET_DISPLAY_LAYOUT, NULL) != NULL
-			|| hook(B_MOVE_CURSOR, NULL) != NULL;
-		printf("%s the clone offers no mode or cursor hooks\n",
-			modeHooks ? "FAIL" : "ok  ");
-		sFailures += modeHooks;
+			// a clone sets no modes
+			bool modeHooks = hook(B_SET_DISPLAY_MODE, NULL) != NULL
+				|| hook(B_SET_DISPLAY_LAYOUT, NULL) != NULL
+				|| hook(B_MOVE_CURSOR, NULL) != NULL;
+			printf("%s the clone offers no mode or cursor hooks\n",
+				modeHooks ? "FAIL" : "ok  ");
+			sFailures += modeHooks;
+		}
 
 		auto engineCount = (accelerant_engine_count)hook(B_ACCELERANT_ENGINE_COUNT, NULL);
 		auto acquire = (acquire_engine)hook(B_ACQUIRE_ENGINE, NULL);
@@ -193,13 +222,19 @@ int main(int argc, char **argv)
 		// the clone's view of the screen is the same memory
 		frame_buffer_config config {};
 		fbConfig(&config);
-		bits[5] = 0x12345678;
-		bool same = config.frame_buffer != NULL
-			&& config.bytes_per_row == bytesPerRow
-			&& ((volatile uint32*)config.frame_buffer)[5] == 0x12345678;
-		printf("%s the clone's frame buffer is the published one\n",
-			same ? "ok  " : "FAIL");
-		sFailures += !same;
+		if (init) {
+			bits = (uint32*)config.frame_buffer;
+			bytesPerRow = config.bytes_per_row;
+		} else {
+			bits[5] = 0x12345678;
+			bool same = config.frame_buffer != NULL
+				&& config.bytes_per_row == bytesPerRow
+				&& ((volatile uint32*)config.frame_buffer)[5] == 0x12345678;
+			printf("%s the clone's frame buffer is the published one\n",
+				same ? "ok  " : "FAIL");
+			sFailures += !same;
+		}
+		uint32 stride = bytesPerRow / 4;
 
 		std::vector<uint32> expected((size_t)kWidth * kHeight);
 		auto reset = [&]() {

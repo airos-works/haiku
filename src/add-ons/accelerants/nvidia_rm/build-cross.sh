@@ -186,7 +186,7 @@ echo "built nv2dtest into $OUT/bin"
 # BWindowScreen program uses them (see CloneTwoDTest.cpp).
 TOOLDIR=$OBJDIR/nvclone2dtest
 mkdir -p "$TOOLDIR"
-for f in CloneTwoDTest sdk/ErrorUtils sdk/NvRmApi sdk/NvRmDevice; do
+for f in CloneTwoDTest NvUtils sdk/ErrorUtils sdk/NvRmApi sdk/NvRmDevice sdk/NvKmsApi sdk/NvKmsDevice sdk/NvKmsSurface; do
 	$TOOLS-g++ -std=c++20 "${FLAGS[@]}" -c "$SRC/$f.cpp" -o "$TOOLDIR/$(basename $f).o"
 done
 $TOOLS-gcc "${FLAGS[@]}" -c "$OGKM/src/common/shared/nvstatus/nvstatus.c" \
