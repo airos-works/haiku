@@ -61,13 +61,14 @@ public:
 	{
 		printf("%s\n", text);
 		fflush(stdout);
-		fLastPercent = -1;
 	}
 
 	virtual void UpdaterProgress(float fraction)
 	{
+		// every tenth, not after each status line of a long list
 		int percent = fraction < 0 ? -1 : (int)(fraction * 100);
-		if (percent >= 0 && percent / 10 != fLastPercent / 10) {
+		if (percent >= 0 && (fLastPercent < 0
+				|| percent / 10 != fLastPercent / 10)) {
 			printf("  %d%%\n", percent);
 			fflush(stdout);
 		}
