@@ -139,6 +139,7 @@ private:
 			void				_Status(const char* format, ...);
 			void				_Progress(float fraction);
 			status_t			_RemoveDirectory(const char* path);
+			bool				_WaitForDesktop();
 
 private:
 			UpdaterListener*	fListener;

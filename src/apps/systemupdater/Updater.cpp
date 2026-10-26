@@ -1150,22 +1150,11 @@ Updater::BootCheck(BString& _report, bool waitForDesktop)
 	}
 
 	if (trial.exists) {
-		if (waitForDesktop) {
-			// The desktop must come up (Tracker and Deskbar, within five
-			// minutes) and stay up for half a minute.
-			bigtime_t start = system_time();
-			while (!(be_roster->IsRunning("application/x-vnd.Be-TRAK")
-					&& be_roster->IsRunning("application/x-vnd.Be-TSKB"))
-				&& system_time() - start < 300000000) {
-				snooze(1000000);
-			}
-			snooze(kConfirmDelay);
-			if (!be_roster->IsRunning("application/x-vnd.Be-TRAK")
-				|| !be_roster->IsRunning("application/x-vnd.Be-TSKB")) {
-				_report = "The desktop is not up; the update is not confirmed.";
-				Log("%s", _report.String());
-				return B_ERROR;
-			}
+		if (waitForDesktop && !_WaitForDesktop()) {
+			_report = "The desktop did not come up and stay; the update is not "
+				"confirmed.";
+			Log("%s", _report.String());
+			return B_ERROR;
 		}
 		error = Confirm(_report);
 		if (error != B_OK)
@@ -1204,6 +1193,33 @@ Updater::BootCheck(BString& _report, bool waitForDesktop)
 	BString report;
 	SyncBootFiles(report);
 	return B_OK;
+}
+
+
+/*!	Whether the desktop is up: Tracker and Deskbar running, the same teams
+	for kConfirmDelay without a break. Gives up after ten minutes.
+*/
+bool
+Updater::_WaitForDesktop()
+{
+	const bigtime_t deadline = system_time() + 600000000;
+	team_id tracker = -1, deskbar = -1;
+	bigtime_t since = -1;
+	while (system_time() < deadline) {
+		team_id currentTracker = be_roster->TeamFor("application/x-vnd.Be-TRAK");
+		team_id currentDeskbar = be_roster->TeamFor("application/x-vnd.Be-TSKB");
+		if (currentTracker < 0 || currentDeskbar < 0
+			|| currentTracker != tracker || currentDeskbar != deskbar) {
+			// not up yet, or started again: the half minute starts over
+			tracker = currentTracker;
+			deskbar = currentDeskbar;
+			since = currentTracker >= 0 && currentDeskbar >= 0
+				? system_time() : -1;
+		} else if (since >= 0 && system_time() - since >= kConfirmDelay)
+			return true;
+		snooze(1000000);
+	}
+	return false;
 }
 
 
