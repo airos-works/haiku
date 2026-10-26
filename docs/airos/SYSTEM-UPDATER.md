@@ -7,7 +7,26 @@ installed version stays bootable until two newer ones have proven
 themselves, from the boot loader and from System Updater. A version that
 does not start is replaced by the one before it without help.
 
-Status: work in progress on branch `system-updater`.
+## Using it
+
+- **System Updater** (Deskbar › Applications) checks when it opens. *Install
+  and Restart* downloads the release, checks every file, installs it for the
+  next start and restarts. Nothing changes in the running system.
+- After the restart the update is *on trial*: once the desktop has stayed up
+  for half a minute it is confirmed. If it does not get there twice (a hang,
+  a panic, no desktop), the next start is the version before it, and System
+  Updater offers to try again or to remove the update.
+- *Versions* lists what is installed: *Restart into This Version* starts one
+  for a single start, *Go Back to This Version* makes it the current one.
+  The boot loader's *Select boot volume/state* menu (hold Shift or Space
+  while the computer starts) offers the same versions by name.
+- Each start the desktop runs a boot check (`SystemUpdater --boot-check`),
+  which also looks for a new release and says so in a notification.
+- The command line does everything the window does: `SystemUpdater --status`,
+  `--check`, `--plan`, `--update`, `--restart-into <state>`, `--go-back
+  <state>`, `--retry`, `--remove-failed`, `--confirm`, `--prune`.
+- The update server is `http://192.168.1.200/updates/<target>/`, named by
+  the installed release; *Versions* › *Update server* overrides it.
 
 ## What an update is
 
@@ -92,6 +111,14 @@ System Updater keeps its state on the system volume, in
   package is missing; the loader then starts the newest old state, which is
   the system as it was before the update.
 
+### The clock
+
+Package states are named after the time they were made and ordered by
+name, so the clock has to be about right. Boards without a battery-backed
+clock start in 1970 until they reach a time server: when the clock is
+earlier than the installed release's own build, System Updater sets it from
+the build server's `Date` header, and installs nothing until it is right.
+
 ### Older versions
 
 The boot loader's *Select boot volume/state* menu names each state by its
@@ -152,3 +179,35 @@ loader cannot read BFS. So on the Pi:
    adds it to `updates/<target>/` with what changed since the release before
    it: the Haiku commits (`git log`), the packages whose versions changed and
    the commits of the pinned applications.
+
+## Tested
+
+In QEMU on the build server (2026-10-26), with releases built by this
+branch's CI scripts from the last CI build's inputs:
+
+- **x86_64** (OVMF, KVM): installed with the Installer onto a blank disk
+  (payload links in place, the NVIDIA modeset driver loaded through its
+  link); update A → B: 10 packages replaced, among them the optional
+  `haiku_devel`, the developer tools kept; the running system kept reading
+  packages the deferred commit had moved (packagefs found them in the new
+  state); trial start, confirmed after one start, the EFI loader updated, the
+  oldest version pruned.
+- A release whose desktop never comes up: two counted starts, then the loader
+  started the version before it by itself; System Updater said so and
+  *Remove the Update* made that version current again.
+- The boot loader menu names every version by its release; starting an older
+  one from it, *Restart into This Version* (one start, with that version's own
+  kernel), *Go Back to This Version*.
+- A package commit cut short (simulated on the disk image): the loader
+  started the newest old state, System Updater offered *Repair*, which made
+  the system start normally again.
+- **arm64** (UEFI, TCG): install, update, trial start and confirmation; the
+  clock set from the build server on a machine that believed it was 1970.
+- **Raspberry Pi 4** (QEMU raspi4b): the kernel, not the loader, counted a
+  trial start and started the fallback state. `airos-boot.txt` switching
+  needs the Pi's firmware, which QEMU does not run: not yet tested on a Pi.
+- **Cubie A7S**: the image and its release build; not booted.
+
+Known: about one start in fifteen in QEMU (and one smoke test in forty on
+CI) stops before the desktop, also without System Updater; an update that
+meets it twice in a row falls back and can be tried again.
