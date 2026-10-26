@@ -350,11 +350,23 @@ UpdaterWindow::_Refresh()
 	BString next = SystemState::NextBoot();
 	for (int32 i = 0; const InstalledVersion* version = fState.VersionAt(i);
 			i++) {
+		// one entry per release: its newest state (package changes of its
+		// own, like an application from HaikuDepot, make more of them)
+		bool shown = false;
+		for (int32 j = 0; j < i; j++) {
+			if (fState.VersionAt(j)->SameRelease(*version))
+				shown = true;
+		}
+		if (shown && !version->running)
+			continue;
+
 		BString detail;
 		if (version->latest)
 			detail << "Current version";
 		else
-			detail << "Installed until " << version->StateTitle();
+			detail << "Installed " << version->StateTitle();
+		if (SystemState::IsFailedRelease(version->releaseVersion))
+			detail << " · did not start";
 		BString revision = version->Revision();
 		if (!revision.IsEmpty())
 			detail << " · " << revision;
@@ -521,7 +533,8 @@ void
 UpdaterWindow::_Restart()
 {
 	_SaveSettings();
-	BRoster::Private().ShutDown(true, true, false);
+	// the user has just asked for it: no second question
+	BRoster::Private().ShutDown(true, false, false);
 }
 
 

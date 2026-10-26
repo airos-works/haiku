@@ -470,6 +470,32 @@ SystemState::ReadLastBoot()
 }
 
 
+/*static*/ bool
+SystemState::IsFailedRelease(const char* version)
+{
+	if (version == NULL || version[0] == '\0')
+		return false;
+	BString text;
+	if (read_text_file(kFailedFile, text) != B_OK)
+		return false;
+	BStringList lines;
+	text.Split("\n", true, lines);
+	return lines.HasString(version);
+}
+
+
+/*static*/ status_t
+SystemState::AddFailedRelease(const char* version)
+{
+	if (version == NULL || version[0] == '\0' || IsFailedRelease(version))
+		return B_OK;
+	BString text;
+	read_text_file(kFailedFile, text);
+	text << version << "\n";
+	return WriteFileAtomically(kFailedFile, text);
+}
+
+
 /*static*/ status_t
 SystemState::WriteFileAtomically(const char* path, const BString& content)
 {

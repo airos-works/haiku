@@ -129,6 +129,9 @@ private:
 									BString& _sha256);
 			status_t			_LoadReleaseRecord(const char* id,
 									Release& _release) const;
+			status_t			_LoadReleaseRecordForVersion(
+									const BString& version,
+									Release& _release) const;
 			status_t			_SaveReleaseRecord(const Release& release);
 			void				_AddRunningPayloadLinks(const char* path,
 									const char* relative, BString& _json,

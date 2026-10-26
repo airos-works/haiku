@@ -100,6 +100,8 @@ public:
 	static	BString				NextBoot();
 	static	bool				HasNextBoot();
 	static	LastBoot			ReadLastBoot();
+	static	bool				IsFailedRelease(const char* version);
+	static	status_t			AddFailedRelease(const char* version);
 
 	static	status_t			WriteFileAtomically(const char* path,
 									const BString& content);

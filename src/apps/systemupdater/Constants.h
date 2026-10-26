@@ -23,6 +23,8 @@
 #define kDownloadsDirectory		kStateDirectory "/downloads"
 #define kLogFile				kStateDirectory "/log"
 #define kCheckFile				kStateDirectory "/last-check"
+#define kFailedFile				kStateDirectory "/failed"
+	// the versions of releases that did not start, one per line
 
 // what the airos_release and airos_payload packages install
 #define kReleaseFile			"/boot/system/data/airos/release"

@@ -493,6 +493,33 @@ Updater::_LoadReleaseRecord(const char* id, Release& _release) const
 }
 
 
+/*!	The record of the release whose airos_release package has \a version.
+*/
+status_t
+Updater::_LoadReleaseRecordForVersion(const BString& version,
+	Release& _release) const
+{
+	if (version.IsEmpty())
+		return B_BAD_VALUE;
+	status_t error = B_ENTRY_NOT_FOUND;
+	if (DIR* dir = opendir(kReleasesDirectory)) {
+		while (dirent* entry = readdir(dir)) {
+			BString name(entry->d_name);
+			if (!name.EndsWith(".json"))
+				continue;
+			name.Truncate(name.Length() - 5);
+			if (Release::VersionForId(name) == version
+				&& _LoadReleaseRecord(name, _release) == B_OK) {
+				error = B_OK;
+				break;
+			}
+		}
+		closedir(dir);
+	}
+	return error;
+}
+
+
 status_t
 Updater::_SaveReleaseRecord(const Release& release)
 {
@@ -698,24 +725,7 @@ Updater::PlanGoBack(const InstalledVersion& version, const SystemState& state,
 
 	// what is known of that release: its record, else its package list
 	Release record;
-	BString id;
-	bool haveRecord = false;
-	if (DIR* dir = opendir(kReleasesDirectory)) {
-		while (dirent* entry = readdir(dir)) {
-			BString name(entry->d_name);
-			if (!name.EndsWith(".json"))
-				continue;
-			name.Truncate(name.Length() - 5);
-			if (Release::VersionForId(name) == version.releaseVersion
-				&& !version.releaseVersion.IsEmpty()
-				&& _LoadReleaseRecord(name, record) == B_OK) {
-				haveRecord = true;
-				break;
-			}
-		}
-		closedir(dir);
-	}
-	if (haveRecord)
+	if (_LoadReleaseRecordForVersion(version.releaseVersion, record) == B_OK)
 		_plan.release = record;
 	else
 		_plan.release = Release();
@@ -724,16 +734,15 @@ Updater::PlanGoBack(const InstalledVersion& version, const SystemState& state,
 	for (int32 i = 0; i < version.packages.CountStrings(); i++)
 		targetNames.Add(PackageNameOf(version.packages.StringAt(i)));
 
-	// the latest release's own packages, which may go
+	// The latest state's release's own packages, which may go. That is not
+	// the release that runs when going back from an older state.
 	BStringList latestReleaseNames;
-	Release installed;
-	if (LoadInstalledRelease(installed) == B_OK) {
-		Release latestRecord;
-		if (_LoadReleaseRecord(installed.Id(), latestRecord) == B_OK) {
-			for (int32 i = 0; const ReleasePackage* package
-					= latestRecord.Packages().ItemAt(i); i++) {
-				latestReleaseNames.Add(package->name);
-			}
+	Release latestRecord;
+	if (_LoadReleaseRecordForVersion(latest->releaseVersion, latestRecord)
+			== B_OK) {
+		for (int32 i = 0; const ReleasePackage* package
+				= latestRecord.Packages().ItemAt(i); i++) {
+			latestReleaseNames.Add(package->name);
 		}
 	}
 
@@ -1272,6 +1281,11 @@ Updater::RemoveFailedUpdate(BString& _error)
 	const InstalledVersion* running = state.Running();
 	UpdatePlan plan;
 	error = PlanGoBack(*running, state, plan, _error);
+	// the latest state is a failed update when this start fell back to it
+	BString failedVersion = state.Latest()->releaseVersion;
+	LastBoot lastBoot = SystemState::ReadLastBoot();
+	bool lastBootWasFallback = lastBoot.mode == AIROS_BOOT_MODE_FALLBACK
+		|| lastBoot.mode == AIROS_BOOT_MODE_RECOVERY;
 	if (error != B_OK)
 		return error;
 
@@ -1322,6 +1336,8 @@ Updater::RemoveFailedUpdate(BString& _error)
 	}
 	Log("removed the update that did not start; it is kept in %s",
 		result.OldStateDirectory().String());
+	if (lastBootWasFallback)
+		SystemState::AddFailedRelease(failedVersion);
 	BString report;
 	SyncBootFiles(report);
 	return B_OK;
@@ -1348,8 +1364,10 @@ Updater::Prune(int32 keep, BString& _report)
 	int32 cut = -1;
 	for (int32 i = 1; const InstalledVersion* version = state.VersionAt(i);
 			i++) {
-		if (version->SameRelease(*latest))
+		if (version->SameRelease(*latest)
+			|| SystemState::IsFailedRelease(version->releaseVersion)) {
 			continue;
+		}
 		BString key = !version->releaseVersion.IsEmpty()
 			? version->releaseVersion : version->systemPackage;
 		if (!releases.HasString(key)) {
