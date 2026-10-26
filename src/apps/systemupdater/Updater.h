@@ -51,6 +51,8 @@ struct UpdatePlan {
 		// packages of the user's own that stay
 	off_t		downloadBytes;
 	off_t		copyBytes;
+	BStringList	bootSources;
+		// the downloaded boot files (Raspberry Pi), as release.BootFiles()
 
 				UpdatePlan();
 	bool		IsEmpty() const
@@ -101,8 +103,15 @@ public:
 			status_t			RemoveFailedUpdate(BString& _error);
 			status_t			Prune(int32 keep, BString& _report);
 			status_t			UpdateEfiLoader(BString& _report);
+			status_t			SyncBootFiles(BString& _report);
+									// Raspberry Pi: the kernel of the state
+									// that starts next
+			BString				NextBootState(const SystemState& state)
+									const;
 			status_t			ApplyPayloadLinks(const Release& release,
-									bool runningSystem, BString& _report);
+									const Release* previous,
+									BString& _report);
+									// links the files new in the release
 
 	static	void				Log(const char* format, ...);
 	static	status_t			ComputeSha256(const char* path,
@@ -118,6 +127,9 @@ private:
 			status_t			_LoadReleaseRecord(const char* id,
 									Release& _release) const;
 			status_t			_SaveReleaseRecord(const Release& release);
+			void				_AddRunningPayloadLinks(const char* path,
+									const char* relative, BString& _json,
+									int32& _count);
 			status_t			_VerifyPackage(const char* path,
 									const ReleasePackage& expected,
 									BString& _error);

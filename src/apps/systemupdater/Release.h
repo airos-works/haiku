@@ -40,6 +40,16 @@ struct ReleasePackage {
 };
 
 
+// A file the release needs outside the system volume: the Raspberry Pi's
+// loader and boot archive, which its firmware loads from the FAT partition.
+struct BootFile {
+	BString		name;
+	BString		sha256;
+	BString		url;
+	off_t		size;
+};
+
+
 // An entry of system/non-packaged that links into the airos_payload package
 // (kPayloadDirectory): a file or directory symlinked there, or a symlink of
 // the payload itself recreated as it is.
@@ -86,6 +96,8 @@ public:
 			const ReleasePackage* FindPackage(const char* name) const;
 			const BObjectList<PayloadLink, true>& PayloadLinks() const
 									{ return fPayloadLinks; }
+			const BObjectList<BootFile, true>& BootFiles() const
+									{ return fBootFiles; }
 			const BMessage&		Changes() const { return fChanges; }
 			const BMessage&		Object() const { return fObject; }
 
@@ -106,6 +118,7 @@ private:
 			BString				fFeed;
 			BObjectList<ReleasePackage, true> fPackages;
 			BObjectList<PayloadLink, true> fPayloadLinks;
+			BObjectList<BootFile, true> fBootFiles;
 			BMessage			fChanges;
 };
 

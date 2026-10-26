@@ -422,12 +422,18 @@ run_command_line(int argc, char** argv)
 		}
 		Updater::Log("asked to start %s once",
 			version->latest ? "the latest state" : version->state.String());
+		BString report;
+		updater.SyncBootFiles(report);
 		printf("%s starts once at the next restart.\n",
 			version->Title().String());
 		return 0;
 	}
-	if (strcmp(command, "--cancel-restart-into") == 0)
-		return SystemState::CancelNextBoot() == B_OK ? 0 : 1;
+	if (strcmp(command, "--cancel-restart-into") == 0) {
+		status_t error = SystemState::CancelNextBoot();
+		BString report;
+		updater.SyncBootFiles(report);
+		return error == B_OK ? 0 : 1;
+	}
 	if (strcmp(command, "--go-back") == 0 && argument != NULL)
 		return command_go_back(updater, argument);
 	if (strcmp(command, "--retry") == 0) {
@@ -438,6 +444,8 @@ run_command_line(int argc, char** argv)
 		}
 		SystemState::ResetTrialAttempts();
 		Updater::Log("asked to try %s again", trial.release.String());
+		BString report;
+		updater.SyncBootFiles(report);
 		printf("%s gets %" B_PRId32 " more starts.\n", trial.release.String(),
 			trial.allowed);
 		return 0;

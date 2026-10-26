@@ -9,6 +9,7 @@ SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src system libroot posix crypt ] ;
 Application SystemUpdater :
 	CommandLine.cpp
 	Feed.cpp
+	PiBoot.cpp
 	Release.cpp
 	Settings.cpp
 	SystemState.cpp

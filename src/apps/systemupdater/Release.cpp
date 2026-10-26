@@ -145,7 +145,8 @@ json::Quote(const char* text)
 Release::Release()
 	:
 	fPackages(20),
-	fPayloadLinks(20)
+	fPayloadLinks(20),
+	fBootFiles(4)
 {
 }
 
@@ -205,6 +206,25 @@ Release::SetTo(const BMessage& object)
 				return B_BAD_DATA;
 			}
 			fPayloadLinks.AddItem(link);
+		}
+	}
+
+	fBootFiles.MakeEmpty();
+	BMessage bootFiles;
+	if (json::Object(object, "boot_files", bootFiles)) {
+		BMessage entry;
+		for (int32 i = 0; json::At(bootFiles, i, entry); i++) {
+			BootFile* file = new BootFile;
+			file->name = json::String(entry, "name");
+			file->sha256 = json::String(entry, "sha256");
+			file->url = json::String(entry, "url");
+			file->size = (off_t)json::Number(entry, "size", -1);
+			if (file->name.IsEmpty() || file->name.FindFirst('/') >= 0
+				|| file->sha256.Length() != 64) {
+				delete file;
+				return B_BAD_DATA;
+			}
+			fBootFiles.AddItem(file);
 		}
 	}
 

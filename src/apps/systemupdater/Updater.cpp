@@ -41,6 +41,7 @@
 #include <package/DaemonClient.h>
 
 #include "Constants.h"
+#include "PiBoot.h"
 #include "Settings.h"
 
 
@@ -465,6 +466,20 @@ Updater::FetchRelease(const FeedBuild& build, Release& _release,
 		}
 		resolved.ReplaceMessage("packages", &packages);
 	}
+	BMessage bootFiles;
+	if (json::Object(resolved, "boot_files", bootFiles)) {
+		BMessage entry;
+		for (int32 i = 0; json::At(bootFiles, i, entry); i++) {
+			BString url = Feed::Resolve(build.manifest,
+				json::String(entry, "url"));
+			entry.RemoveName("url");
+			entry.AddString("url", url);
+			BString name;
+			name << i;
+			bootFiles.ReplaceMessage(name, &entry);
+		}
+		resolved.ReplaceMessage("boot_files", &bootFiles);
+	}
 	return _release.SetTo(resolved);
 }
 
@@ -885,6 +900,35 @@ Updater::Download(UpdatePlan& plan, BString& _error)
 		progress.done += package->size;
 	}
 
+	// the Raspberry Pi's loader and boot archive for the FAT partition
+	plan.bootSources.MakeEmpty();
+	if (plan.goBackState.IsEmpty() && PiBoot::IsPi()) {
+		if (plan.release.BootFiles().IsEmpty()) {
+			_error = "the release has no boot files for the Raspberry Pi";
+			return B_BAD_DATA;
+		}
+		for (int32 i = 0; const BootFile* file
+				= plan.release.BootFiles().ItemAt(i); i++) {
+			BString path(kDownloadsDirectory);
+			path << '/' << file->sha256 << '-' << file->name;
+			_Status("Downloading %s…", file->name.String());
+			error = fFetcher.FetchFile(file->url, path, file->size, _error,
+				NULL);
+			BString sha;
+			if (error == B_OK)
+				error = ComputeSha256(path, sha);
+			if (error == B_OK && sha != file->sha256) {
+				unlink(path);
+				_error.SetToFormat("%s does not have the checksum the release "
+					"names", file->name.String());
+				error = B_BAD_DATA;
+			}
+			if (error != B_OK)
+				return error;
+			plan.bootSources.Add(path);
+		}
+	}
+
 	_Progress(-1);
 	return B_OK;
 }
@@ -959,6 +1003,21 @@ Updater::Apply(UpdatePlan& plan, BString& _error)
 		transaction.AddPackageToDeactivate(plan.deactivate.StringAt(i));
 	transaction.SetDeferActivation(true);
 
+	// Raspberry Pi: the release's kernel on the FAT partition, before any
+	// package changes (it is not used until selected below)
+	if (!plan.bootSources.IsEmpty()) {
+		PiBoot boot;
+		error = boot.Mount(_error);
+		if (error == B_OK) {
+			error = boot.Install(plan.release.Version(),
+				plan.release.BootFiles(), plan.bootSources, _error);
+		}
+		if (error != B_OK) {
+			restore();
+			return error;
+		}
+	}
+
 	// The trial goes in before the commit: if the commit is cut short, the
 	// boot loader returns to the state the commit made ("newest").
 	BString releaseId = plan.goBackState.IsEmpty() ? plan.release.Id()
@@ -995,11 +1054,17 @@ Updater::Apply(UpdatePlan& plan, BString& _error)
 	_RemoveDirectory(transactionPath.Path());
 
 	if (plan.goBackState.IsEmpty()) {
+		Release installed, previous;
+		bool havePrevious = LoadInstalledRelease(installed) == B_OK
+			&& _LoadReleaseRecord(installed.Id(), previous) == B_OK;
 		_SaveReleaseRecord(plan.release);
 		BString report;
-		ApplyPayloadLinks(plan.release, true, report);
+		ApplyPayloadLinks(plan.release, havePrevious ? &previous : NULL,
+			report);
 	}
 
+	BString report;
+	SyncBootFiles(report);
 	_Status("Restart to finish.");
 	return B_OK;
 }
@@ -1055,6 +1120,8 @@ Updater::BootCheck(BString& _report, bool waitForDesktop)
 			_report.SetToFormat("Running the older version %s.",
 				state.RunningState().String());
 		}
+		BString report;
+		SyncBootFiles(report);
 		return B_OK;
 	}
 
@@ -1092,7 +1159,10 @@ Updater::BootCheck(BString& _report, bool waitForDesktop)
 					<< json::Quote(PackageNameOf(file)) << ", \"file\": "
 					<< json::Quote(file) << "}";
 			}
-			text << "]}\n";
+			text << "], \"payload\": {\"links\": [";
+			int32 count = 0;
+			_AddRunningPayloadLinks(kPayloadDirectory, "", text, count);
+			text << "]}}\n";
 			SystemState::EnsureDirectory(kReleasesDirectory);
 			BString path(kReleasesDirectory);
 			path << '/' << installed.Id() << ".json";
@@ -1102,6 +1172,8 @@ Updater::BootCheck(BString& _report, bool waitForDesktop)
 		}
 	}
 
+	BString report;
+	SyncBootFiles(report);
 	return B_OK;
 }
 
@@ -1124,17 +1196,6 @@ Updater::Confirm(BString& _report)
 	UpdateEfiLoader(report);
 	if (!report.IsEmpty())
 		_report << "\n" << report;
-
-	Release installed;
-	if (LoadInstalledRelease(installed) == B_OK) {
-		Release record;
-		if (_LoadReleaseRecord(installed.Id(), record) == B_OK) {
-			report.Truncate(0);
-			ApplyPayloadLinks(record, false, report);
-			if (!report.IsEmpty())
-				_report << "\n" << report;
-		}
-	}
 
 	Settings settings;
 	settings.Load();
@@ -1216,6 +1277,8 @@ Updater::RemoveFailedUpdate(BString& _error)
 	}
 	Log("removed the update that did not start; it is kept in %s",
 		result.OldStateDirectory().String());
+	BString report;
+	SyncBootFiles(report);
 	return B_OK;
 }
 
@@ -1273,7 +1336,108 @@ Updater::Prune(int32 keep, BString& _report)
 		_report.SetToFormat("Removed %" B_PRId32 " old version state(s).",
 			removed);
 	}
+
+	if (PiBoot::IsPi()) {
+		SystemState remaining;
+		BStringList keep;
+		if (remaining.Load() == B_OK) {
+			for (int32 i = 0; const InstalledVersion* version
+					= remaining.VersionAt(i); i++) {
+				keep.Add(version->releaseVersion);
+			}
+			PiBoot boot;
+			BString error;
+			if (boot.Mount(error) == B_OK)
+				boot.Prune(keep);
+		}
+	}
 	return B_OK;
+}
+
+
+// #pragma mark - what starts next
+
+
+/*!	The state the boot loader starts next, as it decides
+	(airos_choose_boot_state()): empty for the latest one.
+*/
+BString
+Updater::NextBootState(const SystemState& state) const
+{
+	struct Reader {
+		const SystemState& state;
+
+		ssize_t ReadFile(const char* name, char* buffer, size_t size)
+		{
+			BString path(kStateDirectory);
+			path << '/' << name;
+			BFile file(path, B_READ_ONLY);
+			if (file.InitCheck() != B_OK)
+				return file.InitCheck();
+			ssize_t length = file.Read(buffer, size);
+			if (length >= 0 && (size_t)length < size)
+				buffer[length] = '\0';
+			return length;
+		}
+
+		bool StateExists(const char* name)
+		{
+			const InstalledVersion* version = state.FindState(name);
+			return version != NULL && !version->latest && version->bootable;
+		}
+
+		bool LatestBootable()
+		{
+			return state.Latest() != NULL && state.Latest()->bootable;
+		}
+
+		const char* NewestOldState()
+		{
+			const InstalledVersion* version = state.NewestOldState();
+			return version != NULL ? version->state.String() : NULL;
+		}
+	} reader = { state };
+
+	char name[B_FILE_NAME_LENGTH];
+	airos_choose_boot_state(reader, name, sizeof(name));
+	return name;
+}
+
+
+/*!	On the Raspberry Pi the kernel comes from the FAT partition, not from the
+	package state: name the loader and boot archive of the version that
+	starts next in airos-boot.txt. Elsewhere there is nothing to do.
+*/
+status_t
+Updater::SyncBootFiles(BString& _report)
+{
+	if (!PiBoot::IsPi())
+		return B_OK;
+
+	SystemState state;
+	status_t error = state.Load();
+	if (error != B_OK)
+		return error;
+	BString next = NextBootState(state);
+	const InstalledVersion* version = state.FindState(next);
+	if (version == NULL)
+		return B_ENTRY_NOT_FOUND;
+
+	PiBoot boot;
+	BString message;
+	error = boot.Mount(message);
+	if (error != B_OK) {
+		Log("cannot reach the boot partition: %s", message.String());
+		return error;
+	}
+	// a version installed by an update has its own pair, the image's own
+	// version the one at the top
+	const char* wanted = boot.HasVersion(version->releaseVersion)
+		? version->releaseVersion.String() : NULL;
+	error = boot.Select(wanted, message);
+	if (error != B_OK)
+		Log("cannot select the boot files: %s", message.String());
+	return error;
 }
 
 
@@ -1406,14 +1570,86 @@ Updater::UpdateEfiLoader(BString& _report)
 // #pragma mark - payload links
 
 
+/*!	The links of the running airos_payload package, as a JSON list, for the
+	record of a release installed from an image.
+*/
+void
+Updater::_AddRunningPayloadLinks(const char* path, const char* relative,
+	BString& _json, int32& _count)
+{
+	DIR* dir = opendir(path);
+	if (dir == NULL)
+		return;
+	while (dirent* entry = readdir(dir)) {
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+			continue;
+		BString child(path), childRelative(relative);
+		child << '/' << entry->d_name;
+		if (!childRelative.IsEmpty())
+			childRelative << '/';
+		childRelative << entry->d_name;
+
+		struct stat st;
+		if (lstat(child, &st) != 0)
+			continue;
+		if (S_ISDIR(st.st_mode)) {
+			_AddRunningPayloadLinks(child, childRelative, _json, _count);
+			continue;
+		}
+		_json << (_count++ > 0 ? ", " : "") << "{\"path\": "
+			<< json::Quote(childRelative);
+		if (S_ISLNK(st.st_mode)) {
+			char target[B_PATH_NAME_LENGTH];
+			ssize_t length = readlink(child, target, sizeof(target) - 1);
+			target[length > 0 ? length : 0] = '\0';
+			_json << ", \"type\": \"symlink\", \"target\": "
+				<< json::Quote(target);
+		} else
+			_json << ", \"type\": \"file\"";
+		_json << "}";
+	}
+	closedir(dir);
+}
+
+
+/*!	Creates the system/non-packaged links of the files \a release adds to the
+	payload. Links that the previous release had are left as they are: the
+	system may have removed or renamed one on purpose (the Dragon's boot script
+	sets the Panfrost EGL vendor aside), and a real file in a link's place is
+	the user's own build, which wins.
+	A new kernel driver's link dangles until the restart (the running payload
+	does not have the file), so the kernel's driver watcher cannot load it
+	while the system runs.
+*/
 status_t
-Updater::ApplyPayloadLinks(const Release& release, bool runningSystem,
+Updater::ApplyPayloadLinks(const Release& release, const Release* previous,
 	BString& _report)
 {
+	BStringList known;
+	if (previous != NULL) {
+		for (int32 i = 0; const PayloadLink* link
+				= previous->PayloadLinks().ItemAt(i); i++) {
+			known.Add(link->path);
+		}
+	} else {
+		// without a record of the previous release, only what is missing
+		// from the running payload too is new
+		for (int32 i = 0; const PayloadLink* link
+				= release.PayloadLinks().ItemAt(i); i++) {
+			BString running(kPayloadDirectory);
+			running << '/' << link->path;
+			if (file_exists(running))
+				known.Add(link->path);
+		}
+	}
+
 	int32 created = 0;
-	int32 skipped = 0;
+	int32 kept = 0;
 	for (int32 i = 0; const PayloadLink* link = release.PayloadLinks().ItemAt(i);
 			i++) {
+		if (known.HasString(link->path))
+			continue;
+
 		BString path(kNonPackagedDirectory);
 		path << '/' << link->path;
 		BString target;
@@ -1424,21 +1660,17 @@ Updater::ApplyPayloadLinks(const Release& release, bool runningSystem,
 
 		struct stat st;
 		if (lstat(path, &st) == 0) {
-			if (!S_ISLNK(st.st_mode)) {
-				// a real file of the user's (a lab build): it wins
-				skipped++;
-			}
+			if (!S_ISLNK(st.st_mode))
+				kept++;
 			continue;
 		}
 
-		// A new kernel driver must not appear while the system runs: the
-		// kernel would load it at once. If the running payload already has
-		// it, leave the link to the next start's check.
-		if (runningSystem && link->path.StartsWith("add-ons/kernel/")) {
-			BString runningTarget = link->type == "symlink" ? BString()
-				: target;
-			if (!runningTarget.IsEmpty() && file_exists(runningTarget))
-				continue;
+		// never make a driver appear that the running system has
+		BString running(kPayloadDirectory);
+		running << '/' << link->path;
+		if (link->path.StartsWith("add-ons/kernel/") && file_exists(running)
+			&& link->type != "symlink") {
+			continue;
 		}
 
 		BPath parent(path);
@@ -1450,9 +1682,9 @@ Updater::ApplyPayloadLinks(const Release& release, bool runningSystem,
 			Log("cannot link %s: %s", path.String(), strerror(errno));
 	}
 
-	if (created > 0 || skipped > 0) {
+	if (created > 0 || kept > 0) {
 		Log("payload links: %" B_PRId32 " created, %" B_PRId32 " real files "
-			"kept", created, skipped);
+			"kept", created, kept);
 		_report.SetToFormat("%" B_PRId32 " new system files linked.", created);
 	}
 	return B_OK;

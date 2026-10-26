@@ -655,16 +655,24 @@ UpdaterWindow::MessageReceived(BMessage* message)
 					_Restart();
 					break;
 				case kModeFailed:
+				{
 					SystemState::ResetTrialAttempts();
 					SystemState::CancelNextBoot();
 					Updater::Log("asked to try %s again",
 						fTrial.release.String());
+					BString report;
+					Updater().SyncBootFiles(report);
 					_Restart();
 					break;
+				}
 				case kModeOlderVersion:
+				{
 					SystemState::CancelNextBoot();
+					BString report;
+					Updater().SyncBootFiles(report);
 					_Restart();
 					break;
+				}
 				default:
 					break;
 			}
@@ -725,6 +733,8 @@ UpdaterWindow::MessageReceived(BMessage* message)
 			}
 			Updater::Log("asked to start %s once", version->latest
 				? "the latest state" : version->state.String());
+			BString report;
+			Updater().SyncBootFiles(report);
 			_Restart();
 			break;
 		}

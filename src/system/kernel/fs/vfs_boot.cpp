@@ -15,6 +15,7 @@
 #include <string.h>
 #include <strings.h>
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <fs_info.h>
 #include <fs_volume.h>
@@ -463,6 +464,123 @@ get_boot_partitions(KMessage& bootVolume, PartitionStack& partitions)
 }
 
 
+/*!	The boot control files and package states of the system volume, for
+	airos_choose_boot_state() where the boot loader could not read the boot
+	volume (the Raspberry Pi's loader only has the boot archive).
+*/
+struct KernelBootControlReader {
+	KPath	directory;
+	char	newest[B_FILE_NAME_LENGTH];
+
+	KernelBootControlReader()
+		:
+		directory(kSystemPackagesDirectory)
+	{
+		newest[0] = '\0';
+	}
+
+	ssize_t ReadFile(const char* name, char* buffer, size_t size)
+	{
+		KPath path(directory);
+		if (path.Append(AIROS_BOOT_CONTROL_DIRECTORY) != B_OK
+			|| path.Append(name) != B_OK) {
+			return B_NO_MEMORY;
+		}
+		int fd = _kern_open(-1, path.Path(), O_RDONLY, 0);
+		if (fd < 0)
+			return fd;
+		ssize_t length = _kern_read(fd, 0, buffer, size);
+		_kern_close(fd);
+		if (length >= 0 && (size_t)length < size)
+			buffer[length] = '\0';
+		return length;
+	}
+
+	// whether the system package an activation file names is there
+	bool HasSystemPackage(const char* activationFile, const char* stateName)
+	{
+		char buffer[4096];
+		int fd = _kern_open(-1, activationFile, O_RDONLY, 0);
+		if (fd < 0)
+			return false;
+		ssize_t length = _kern_read(fd, 0, buffer, sizeof(buffer) - 1);
+		_kern_close(fd);
+		if (length <= 0)
+			return false;
+		buffer[length] = '\0';
+
+		char* line = buffer;
+		while (line != NULL && *line != '\0') {
+			char* end = strchr(line, '\n');
+			if (end != NULL)
+				*end = '\0';
+			if (strncmp(line, "haiku-", 6) == 0
+				|| strcmp(line, "haiku.hpkg") == 0) {
+				// in the state's own directory, or in the packages directory
+				struct stat st;
+				KPath path(directory);
+				if (stateName != NULL) {
+					path.Append("administrative");
+					path.Append(stateName);
+				}
+				path.Append(line);
+				if (stat(path.Path(), &st) == 0)
+					return true;
+				KPath latest(directory);
+				latest.Append(line);
+				return stat(latest.Path(), &st) == 0;
+			}
+			line = end != NULL ? end + 1 : NULL;
+		}
+		return false;
+	}
+
+	bool StateExists(const char* name)
+	{
+		if (strncmp(name, "state_", 6) != 0 || strchr(name, '/') != NULL)
+			return false;
+		KPath path(directory);
+		if (path.Append("administrative") != B_OK || path.Append(name) != B_OK
+			|| path.Append("activated-packages") != B_OK) {
+			return false;
+		}
+		return HasSystemPackage(path.Path(), name);
+	}
+
+	bool LatestBootable()
+	{
+		KPath path(directory);
+		if (path.Append("administrative/activated-packages") != B_OK)
+			return true;
+		struct stat st;
+		if (stat(path.Path(), &st) != 0)
+			return true;
+				// without an activation file packagefs takes every package
+		return HasSystemPackage(path.Path(), NULL);
+	}
+
+	const char* NewestOldState()
+	{
+		KPath path(directory);
+		if (path.Append("administrative") != B_OK)
+			return NULL;
+		DIR* dir = opendir(path.Path());
+		if (dir == NULL)
+			return NULL;
+		newest[0] = '\0';
+		while (dirent* entry = readdir(dir)) {
+			if (strncmp(entry->d_name, "state_", 6) == 0
+				&& strcmp(entry->d_name, newest) > 0
+				&& StateExists(entry->d_name)) {
+				strlcpy(newest, entry->d_name, sizeof(newest));
+			}
+		}
+		closedir(dir);
+		return newest[0] != '\0' ? newest : NULL;
+	}
+};
+
+
 static void
 write_airos_boot_file(const KPath& directory, const char* name,
 	const char* content, bool append)
@@ -488,9 +606,13 @@ write_airos_boot_file(const KPath& directory, const char* name,
 	update on trial is counted, and "last-boot" says how this start was
 	chosen. Done as soon as the boot volume is mounted, so that a start that
 	ends in a panic or a hang later on counts too.
+	Where the loader did not choose (it could not read the boot volume), the
+	kernel does; \a _state is then set to the state to start, if not the
+	latest one.
 */
 static void
-record_airos_boot(const KMessage& bootVolume)
+record_airos_boot(const KMessage& bootVolume, const char*& _state,
+	char* stateBuffer, size_t stateBufferSize)
 {
 	if (gReadOnlyBootDevice)
 		return;
@@ -505,6 +627,17 @@ record_airos_boot(const KMessage& bootVolume)
 		return;
 
 	const char* mode = bootVolume.GetString(BOOT_VOLUME_AIROS_BOOT, NULL);
+	if (mode == NULL && _state == NULL
+		&& !bootVolume.GetBool(BOOT_VOLUME_PACKAGED, false)
+		&& bootVolume.GetBool(BOOT_VOLUME_BOOTED_FROM_IMAGE, false)) {
+		KernelBootControlReader reader;
+		airos_boot_mode choice = airos_choose_boot_state(reader, stateBuffer,
+			stateBufferSize);
+		mode = airos_boot_mode_name(choice);
+		if (stateBuffer[0] != '\0')
+			_state = stateBuffer;
+	}
+
 	if (mode == NULL) {
 		// an ordinary start of the latest state
 		KPath path(directory);
@@ -513,7 +646,7 @@ record_airos_boot(const KMessage& bootVolume)
 		return;
 	}
 
-	const char* state = bootVolume.GetString(BOOT_VOLUME_PACKAGES_STATE, "");
+	const char* state = _state != NULL ? _state : "";
 	char line[B_FILE_NAME_LENGTH + 32];
 	snprintf(line, sizeof(line), "%s %s\n", mode, state);
 	write_airos_boot_file(directory, AIROS_BOOT_LAST_FILE, line, false);
@@ -658,7 +791,12 @@ vfs_mount_boot_file_system(kernel_args* args)
 		_kern_create_symlink(-1, path, "/boot", 0777);
 	}
 
-	record_airos_boot(bootVolume);
+	// the state System Updater asked for (airos_boot_control.h)
+	const char* stateName = bootVolume.GetString(BOOT_VOLUME_PACKAGES_STATE,
+		NULL);
+	char chosenState[B_FILE_NAME_LENGTH];
+	chosenState[0] = '\0';
+	record_airos_boot(bootVolume, stateName, chosenState, sizeof(chosenState));
 
 	// If we're booting off a packaged system, mount packagefs.
 	struct stat st;
@@ -670,8 +808,7 @@ vfs_mount_boot_file_system(kernel_args* args)
 		char arguments[256];
 		strlcpy(arguments, "packages /boot/system/packages; type system",
 			sizeof(arguments));
-		if (const char* stateName
-				= bootVolume.GetString(BOOT_VOLUME_PACKAGES_STATE, NULL)) {
+		if (stateName != NULL) {
 			strlcat(arguments, "; state ", sizeof(arguments));
 			strlcat(arguments, stateName, sizeof(arguments));
 		}
