@@ -1372,14 +1372,37 @@ has_permission_to_signal(Team* team)
 }
 
 
+/*!	Whether an ICI to make a CPU's running thread notice its signals is still
+	on its way to that CPU. */
+static int32 sSignalICIPending[SMP_MAX_CPUS];
+
+
+static void
+signal_ici_arrived(void*, int cpu)
+{
+	// A signal sent from now on needs another ICI; one sent before is seen
+	// when this CPU returns to its thread. (A full barrier, so neither side
+	// misses the other.)
+	atomic_get_and_set(&sSignalICIPending[cpu], 0);
+}
+
+
 /*!	Interrupts a thread (even a running one) for signal delivery.
 */
 static void
 signal_interrupt_thread(Thread* thread, bool kill)
 {
 	if (thread->state == B_THREAD_RUNNING) {
-		// Send a dummy ICI to interrupt the running thread
-		call_single_cpu(thread->cpu->cpu_num, NULL, NULL);
+		// Send an ICI to interrupt the running thread, unless it runs here
+		// (it checks for signals on its way back to userland) or one is still
+		// on its way: the caller has interrupts disabled, and a flood of
+		// signals would otherwise use up the ICI messages, with every CPU
+		// waiting for one and none able to process theirs.
+		int32 cpu = thread->cpu->cpu_num;
+		if (cpu != smp_get_current_cpu()
+			&& atomic_get_and_set(&sSignalICIPending[cpu], 1) == 0) {
+			call_single_cpu(cpu, &signal_ici_arrived, NULL);
+		}
 	} else {
 		// Interrupt waiting thread (if it is waiting interruptibly)
 		thread_interrupt(thread, kill);
