@@ -161,14 +161,21 @@ build server (`.github/workflows/airos-images.yml`, scripts in
 tested and published as a GitHub prerelease (`image-<target>-*`) and on
 [airos.works](https://airos.works/):
 
-| Image | For | Write it with |
-| --- | --- | --- |
-| `airos-x86_64.iso` | PCs, EFI and BIOS (USB stick or CD) | `dd`, not balenaEtcher |
-| `airos-arm64.iso` | UEFI ARM64 machines: ROCK 5 ITX, Dragon Q8B | `dd` |
-| `airos-rpi4.img` | Raspberry Pi 4 SD card, boots directly | balenaEtcher or `dd` |
-| `airos-cubie.img` | Radxa Cubie A7S SD card (Radxa boot chain, air/OS U-Boot) | balenaEtcher or `dd` |
+| Image | For |
+| --- | --- |
+| `airos-x86_64.iso` | PCs, EFI and BIOS (USB stick or CD) |
+| `airos-arm64.iso` | UEFI ARM64 machines: ROCK 5 ITX, Dragon Q8B |
+| `airos-rpi4.img` | Raspberry Pi 4 SD card, boots directly |
+| `airos-cubie.img` | Radxa Cubie A7S SD card (Radxa boot chain, air/OS U-Boot) |
 
 The ISOs boot to the desktop and the Installer.
+
+Write every image raw to the whole USB stick or SD card: `dd` on Linux and
+macOS, Rufus in DD Image mode on Windows. Don't use balenaEtcher: 2.1.4
+silently dropped 2 MB from the x86-64 ISO while writing a USB stick, which
+then stopped at "No boot volume found"; the same file via `dd` booted.
+[Writing an image](https://airos.works/downloads/write/) has the commands
+and how to check the written copy against the build manifest.
 
 Building air/OS
 ---------------
