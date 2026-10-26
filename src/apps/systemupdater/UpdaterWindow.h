@@ -64,6 +64,8 @@ private:
 			BStringView*		fTitleView;
 			BTextView*			fSummaryView;
 			BTextView*			fChangesView;
+			BView*				fChangesLabel;
+			BView*				fChangesScroll;
 			BStatusBar*			fProgressBar;
 			BButton*			fCheckButton;
 			BButton*			fCancelButton;

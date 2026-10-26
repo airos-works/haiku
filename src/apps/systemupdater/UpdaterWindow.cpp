@@ -197,6 +197,8 @@ UpdaterWindow::_CreateUpdatesTab()
 		fChangesView, 0, false, true);
 	changesScroll->SetExplicitMinSize(BSize(B_SIZE_UNSET,
 		be_plain_font->Size() * 12));
+	fChangesScroll = changesScroll;
+	fChangesLabel = new BStringView("changes label", "What's new:");
 
 	fProgressBar = new BStatusBar("progress");
 	fProgressBar->SetMaxValue(1.0);
@@ -216,8 +218,9 @@ UpdaterWindow::_CreateUpdatesTab()
 		.SetInsets(B_USE_WINDOW_SPACING)
 		.Add(fTitleView)
 		.Add(fSummaryView)
-		.Add(new BStringView("changes label", "What's new:"))
+		.Add(fChangesLabel)
 		.Add(changesScroll, 1.0)
+		.AddGlue(0)
 		.Add(fProgressBar)
 		.AddGroup(B_HORIZONTAL)
 			.Add(fCheckButton)
@@ -331,7 +334,13 @@ UpdaterWindow::_Refresh()
 	fLastBoot = SystemState::ReadLastBoot();
 
 	if (!fState.RunningLatest()) {
-		if (fLastBoot.mode == AIROS_BOOT_MODE_FALLBACK
+		const InstalledVersion* running = fState.Running();
+		const InstalledVersion* latest = fState.Latest();
+		if (!fTrial.exists && running != NULL && latest != NULL
+			&& latest->bootable && latest->SameRelease(*running)) {
+			// the running version was made the current one again
+			fMode = kModeRestart;
+		} else if (fLastBoot.mode == AIROS_BOOT_MODE_FALLBACK
 			|| fLastBoot.mode == AIROS_BOOT_MODE_RECOVERY) {
 			fMode = kModeFailed;
 		} else
@@ -437,10 +446,16 @@ UpdaterWindow::_ShowState()
 				"computer restarts.";
 			break;
 		case kModeRestart:
-			title = "Restart to finish the update";
-			summary << "The new version is installed and starts with the "
-				"next restart. If it does not start, air/OS goes back to "
-				"the version you run now by itself.";
+			if (!fState.RunningLatest()) {
+				title = "Restart to finish";
+				summary << "This version is the current one again from the "
+					"next restart.";
+			} else {
+				title = "Restart to finish the update";
+				summary << "The new version is installed and starts with the "
+					"next restart. If it does not start, air/OS goes back to "
+					"the version you run now by itself.";
+			}
 			main = "Restart Now";
 			showMain = true;
 			break;
@@ -491,6 +506,10 @@ UpdaterWindow::_ShowState()
 	fMainButton->SetLabel(main);
 	fSecondaryButton->SetLabel(secondary);
 
+	bool showChanges = fMode == kModeIdle || fMode == kModeChecking
+		|| fMode == kModeAvailable || fMode == kModeInstalling;
+	_SetVisible(fChangesLabel, showChanges);
+	_SetVisible(fChangesScroll, showChanges);
 	_SetVisible(fMainButton, showMain);
 	_SetVisible(fSecondaryButton, showSecondary);
 	_SetVisible(fCancelButton, fMode == kModeInstalling
