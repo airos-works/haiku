@@ -446,6 +446,18 @@ UpdaterWindow::_ShowState()
 			break;
 		case kModeFailed:
 			title = "The update did not start";
+			if (fState.Latest() != NULL && !fState.Latest()->bootable) {
+				// a package transaction cut short: repair, then update again
+				summary << "Installing the update was cut short, so air/OS "
+					"started the version before it";
+				if (runningVersion != NULL)
+					summary << ", " << runningVersion->Title();
+				summary << ". Repair makes this version the current one "
+					"again; then the update can be installed once more.";
+				main = "Repair";
+				showMain = true;
+				break;
+			}
 			if (fLastBoot.mode == AIROS_BOOT_MODE_RECOVERY) {
 				summary << "Installing the update was cut short, so air/OS "
 					"started the version before it, ";
@@ -673,6 +685,11 @@ UpdaterWindow::MessageReceived(BMessage* message)
 					break;
 				case kModeFailed:
 				{
+					if (fState.Latest() != NULL && !fState.Latest()->bootable) {
+						_SetBusy(true, "Repairing…");
+						fWorker->PostMessage(kMsgRemoveFailed);
+						break;
+					}
 					SystemState::ResetTrialAttempts();
 					SystemState::CancelNextBoot();
 					Updater::Log("asked to try %s again",

@@ -760,7 +760,7 @@ Updater::PlanGoBack(const InstalledVersion& version, const SystemState& state,
 			continue;
 			// the same file is installed now
 
-		if (latest->packages.HasString(file))
+		if (latest->packages.HasString(file) && file_exists(inPackages))
 			_plan.deactivate.Add(file);
 
 		PlannedPackage* planned = new PlannedPackage;
@@ -783,6 +783,12 @@ Updater::PlanGoBack(const InstalledVersion& version, const SystemState& state,
 			|| _plan.deactivate.HasString(file)) {
 			continue;
 		}
+		// After a package transaction that was cut short, the activation file
+		// may name packages that were already moved away.
+		BString path(kPackagesDirectory);
+		path << '/' << file;
+		if (!file_exists(path))
+			continue;
 		BString name = PackageNameOf(file);
 		if (targetNames.HasString(name) || latestReleaseNames.HasString(name))
 			_plan.deactivate.Add(file);
@@ -1281,11 +1287,17 @@ Updater::RemoveFailedUpdate(BString& _error)
 	const InstalledVersion* running = state.Running();
 	UpdatePlan plan;
 	error = PlanGoBack(*running, state, plan, _error);
-	// the latest state is a failed update when this start fell back to it
-	BString failedVersion = state.Latest()->releaseVersion;
+	// The update on trial did not start when this start fell back from it
+	// (and it was installed: a transaction cut short leaves no release that
+	// failed).
+	TrialInfo failedTrial;
+	SystemState::ReadTrial(failedTrial);
 	LastBoot lastBoot = SystemState::ReadLastBoot();
-	bool lastBootWasFallback = lastBoot.mode == AIROS_BOOT_MODE_FALLBACK
-		|| lastBoot.mode == AIROS_BOOT_MODE_RECOVERY;
+	BString failedVersion = Release::VersionForId(failedTrial.release);
+	bool lastBootWasFallback = failedTrial.exists
+		&& lastBoot.mode == AIROS_BOOT_MODE_FALLBACK
+		&& state.Latest()->bootable
+		&& state.Latest()->releaseVersion == failedVersion;
 	if (error != B_OK)
 		return error;
 
