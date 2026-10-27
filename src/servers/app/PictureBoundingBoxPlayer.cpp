@@ -96,6 +96,18 @@ public:
 	void IncludeRect(BRect& rect)
 	{
 		_AffineTransformRect(rect);
+
+		// What the clipping hides makes the box (and a layer's bitmap) no
+		// larger. Clipping is only followed without an affine transform;
+		// otherwise the box stays larger than needed, which is safe.
+		BRegion clipping;
+		if (fDrawState->CombinedTransform().IsIdentity()
+			&& fDrawState->GetCombinedClippingRegion(&clipping)) {
+			rect = rect & clipping.Frame();
+			if (!rect.IsValid())
+				return;
+		}
+
 		*fBoundingBox = (*fBoundingBox) | rect;
 	}
 
@@ -495,9 +507,15 @@ BoundingBoxCallbacks::SetClippingRects(size_t numRects, const clipping_rect rect
 {
 	TRACE_BB("%p clipping rects (%ld rects)\n", fState, numRects);
 
-	// TODO
-	(void)rects;
-	(void)numRects;
+	if (numRects == 0) {
+		fState->GetDrawState()->SetClippingRegion(NULL);
+		return;
+	}
+
+	BRegion region;
+	for (size_t i = 0; i < numRects; i++)
+		region.Include(rects[i]);
+	fState->GetDrawState()->SetClippingRegion(&region);
 }
 
 
@@ -880,7 +898,11 @@ BoundingBoxCallbacks::DrawShapeGradient(const BShape& shape, BGradient& gradient
 void
 BoundingBoxCallbacks::ClipToRect(const BRect& rect, bool inverse)
 {
-	// TODO
+	// Only a plain rectangle; with an affine transform DrawState would
+	// make an alpha mask, and an inverse clip hardly shrinks the box.
+	DrawState* drawState = fState->GetDrawState();
+	if (!inverse && drawState->CombinedTransform().IsIdentity())
+		drawState->ClipToRect(rect, false);
 }
 
 
