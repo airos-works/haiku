@@ -143,36 +143,47 @@ _exit_stack_unlock()
 }
 
 
+/*!	Calls and removes the hooks \a predicate selects, newest first. The lock
+	is not held while a hook runs: a hook can wait for another thread that
+	registers a hook of its own meanwhile (a library being opened while the
+	program exits: its static constructors call __cxa_atexit()), which would
+	otherwise deadlock. A hook is taken off the stack before it is called,
+	so no other thread calls it as well.
+*/
 template<typename Predicate>
 static void
 call_exit_hooks(const Predicate& predicate)
 {
-	_exit_stack_lock();
+	while (true) {
+		_exit_stack_lock();
 
-	AtExitInfo* previousInfo = NULL;
-	AtExitInfo* info = sAtExitInfoStack.Head();
-	while (info != NULL) {
-		AtExitInfo* nextInfo = sAtExitInfoStack.GetNext(info);
-
-		if (predicate(info)) {
-			// remove info from stack
-			sAtExitInfoStack.Remove(previousInfo, info);
-
-			// call the hook
-			info->hook(info->data);
-
-			// return the info to the block
-			if (info->block->IsEmpty())
-				sAtExitInfoBlocks.Add(info->block);
-
-			info->block->FreeInfo(info);
-		} else
+		AtExitInfo* previousInfo = NULL;
+		AtExitInfo* info = sAtExitInfoStack.Head();
+		while (info != NULL && !predicate(info)) {
 			previousInfo = info;
+			info = sAtExitInfoStack.GetNext(info);
+		}
+		if (info == NULL) {
+			_exit_stack_unlock();
+			return;
+		}
 
-		info = nextInfo;
+		// remove info from stack
+		sAtExitInfoStack.Remove(previousInfo, info);
+
+		_exit_stack_unlock();
+
+		// call the hook
+		info->hook(info->data);
+
+		// return the info to the block
+		_exit_stack_lock();
+		if (info->block->IsEmpty())
+			sAtExitInfoBlocks.Add(info->block);
+
+		info->block->FreeInfo(info);
+		_exit_stack_unlock();
 	}
-
-	_exit_stack_unlock();
 }
 
 
@@ -248,21 +259,25 @@ extern "C" void
 __cxa_finalize(void* dsoHandle)
 {
 	if (dsoHandle == NULL) {
-		// call all hooks
-		_exit_stack_lock();
+		// call all hooks (not under the lock, see call_exit_hooks())
+		while (true) {
+			_exit_stack_lock();
+			AtExitInfo* info = sAtExitInfoStack.RemoveHead();
+			_exit_stack_unlock();
+			if (info == NULL)
+				break;
 
-		while (AtExitInfo* info = sAtExitInfoStack.RemoveHead()) {
 			// call the hook
 			info->hook(info->data);
 
 			// return the info to the block
+			_exit_stack_lock();
 			if (info->block->IsEmpty())
 				sAtExitInfoBlocks.Add(info->block);
 
 			info->block->FreeInfo(info);
+			_exit_stack_unlock();
 		}
-
-		_exit_stack_unlock();
 	} else {
 		// call all hooks for the respective DSO
 		call_exit_hooks(DSOPredicate(dsoHandle));
@@ -310,6 +325,10 @@ atexit(void (*func)(void))
 void
 exit(int status)
 {
+	// no library is loaded or unloaded by another thread from now on
+	if (__gRuntimeLoader->prepare_for_exit != NULL)
+		__gRuntimeLoader->prepare_for_exit();
+
 	// unwind the exit stack, calling the registered functions
 	__cxa_finalize(NULL);
 
