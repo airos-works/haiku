@@ -98,6 +98,7 @@ enum SD_COMMANDS {
 	SELECT_DESELECT_CARD = 7,
 	SD_SEND_IF_COND = 8,
 	MMC_SEND_EXT_CSD = 8,
+	SD_SWITCH_FUNCTION = 6, // with a data phase, unlike MMC_SWITCH
 	SEND_CSD = 9,
 	SEND_CID = 10,
 	SD_STOP_TRANSMISSION = 12,
@@ -168,6 +169,10 @@ typedef struct mmc_bus_interface {
 	void (*set_card_type)(void* controller, card_type type);
 	status_t (*read_extended_csd)(void* controller, uint8_t data[512]);
 		// Read the selected MMC card's 512-byte EXT_CSD data phase.
+	status_t (*switch_sd_function)(void* controller, uint32_t argument,
+		uint8_t data[64]);
+		// SD CMD6 (SWITCH_FUNC) to the selected card, with its 64-byte status
+		// data phase. Optional: without it, SD cards stay at default speed.
 } mmc_bus_interface;
 
 
@@ -198,6 +203,8 @@ const char* const kMmcEnableCacheAttribute = "mmc/enable_cache";
 const char* const kMmcReadOnlyAttribute = "mmc/read_only";
 const char* const kMmcNonRemovableAttribute = "mmc/non_removable";
 const char* const kMmcMaxBusWidthAttribute = "mmc/max_bus_width";
+const char* const kMmcSdHighSpeedAttribute = "mmc/sd_high_speed";
+	// set to 1 by a host whose SD high speed mode (50 MHz) was verified
 const char* const kMmcBusWidthAttribute = "mmc/bus_width";
 
 

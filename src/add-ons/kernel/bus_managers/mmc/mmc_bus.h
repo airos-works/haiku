@@ -148,6 +148,8 @@ public:
 
 				status_t		SetClock(int frequency);
 				status_t		ReadExtendedCsd(uint16_t rca, uint8_t data[512]);
+				status_t		SwitchSdFunction(uint16_t rca, uint32_t argument,
+									uint8_t data[64]);
 				void			SetBusWidth(int width);
 				void			SetCardType(card_type type);
 

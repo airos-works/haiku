@@ -168,6 +168,18 @@ MMCBus::ReadExtendedCsd(uint16_t rca, uint8_t data[512])
 }
 
 
+status_t
+MMCBus::SwitchSdFunction(uint16_t rca, uint32_t argument, uint8_t data[64])
+{
+	if (fController->switch_sd_function == NULL)
+		return B_NOT_SUPPORTED;
+	status_t status = _ActivateDevice(rca);
+	if (status != B_OK)
+		return status;
+	return fController->switch_sd_function(fCookie, argument, data);
+}
+
+
 void
 MMCBus::SetBusWidth(int width)
 {
@@ -239,6 +251,43 @@ verify_mmc_extended_csd(const uint8_t extended[512],
 		|| (extended[33] & 1) != (reference[33] & 1))
 		return B_BAD_DATA;
 	return B_OK;
+}
+
+
+/*!	SD cards from spec 1.10 on switch to high speed, 50 MHz instead of 25,
+	with CMD6: function 1 of function group 1. The check (mode 0) says
+	whether the card has it, the switch (mode 1) answers with what the card
+	selected. The status block is then read again at 50 MHz to check the
+	data path; if that fails, card and host go back to the default speed.
+*/
+static status_t
+configure_sd_high_speed(MMCBus* bus, uint16_t rca)
+{
+	uint8_t status[64];
+	status_t result = bus->SwitchSdFunction(rca, 0x00fffff1, status);
+	if (result != B_OK)
+		return result;
+	// group 1 support bits 415:400: bytes 12 and 13, function 1 = bit 401
+	if ((status[13] & 0x02) == 0)
+		return B_NOT_SUPPORTED;
+	result = bus->SwitchSdFunction(rca, 0x80fffff1, status);
+	if (result != B_OK)
+		return result;
+	// group 1 selection bits 379:376: the low nibble of byte 16
+	if ((status[16] & 0x0f) != 1)
+		return B_NOT_SUPPORTED;
+
+	result = bus->SetClock(50000);
+	if (result == B_OK) {
+		result = bus->SwitchSdFunction(rca, 0x00fffff1, status);
+		if (result == B_OK && (status[16] & 0x0f) != 1)
+			result = B_BAD_DATA;
+	}
+	if (result != B_OK) {
+		bus->SetClock(25000);
+		bus->SwitchSdFunction(rca, 0x80fffff0, status);
+	}
+	return result;
 }
 
 
@@ -584,6 +633,22 @@ MMCBus::_WorkerThread(void* cookie)
 			bus->_TerminateBus();
 			bus->ReleaseBus();
 			return clockStatus;
+		}
+
+		if (cardFound && (cardType == CARD_TYPE_SD
+				|| cardType == CARD_TYPE_SDHC)) {
+			uint8_t highSpeed = 0;
+			gDeviceManager->get_attr_uint8(bus->fNode, kMmcSdHighSpeedAttribute,
+				&highSpeed, true);
+			if (highSpeed != 0) {
+				status = configure_sd_high_speed(bus, rca);
+				if (status == B_OK)
+					TRACE_ALWAYS("SD card in high speed mode, 50 MHz\n");
+				else {
+					TRACE_ALWAYS("SD card stays at 25 MHz: %s\n",
+						strerror(status));
+				}
+			}
 		}
 
 		uint8_t busWidth = 4;
