@@ -23,7 +23,10 @@
 #                           airos_* libraries, rock5_ffmpeg, firmware packages,
 #                           and (x86_64) HaikuPorts packages the build system's
 #                           repository list lacks, and qt6_base with air/OS's
-#                           Haiku platform plugin
+#                           Haiku platform plugin; (arm64) CI's builds of
+#                           base packages the bootstrap repository has
+#                           (icu74, ncurses6), which the image gets instead,
+#                           and the zstd package
 #   AIROS_CI_SYSTEM_PACKAGES
 #                           (x86_64) names of packages from the build system's
 #                           HaikuPorts list that CI's packages need (Qt's
@@ -68,6 +71,16 @@
 #                           rules when set
 #   AIROS_CI_IMAGE_SIZE     image size in MiB (optional)
 #   HAIKU_RPI_FIRMWARE_DIR  (Pi) the Raspberry Pi boot firmware files
+#
+# arm64 builds also get, from the environment (every jam run in the build
+# directory needs them, not only the image's):
+#   HAIKU_ARM64_ZSTD_PACKAGES_DIR
+#                           CI's zstd, zstd_devel and zstd_source: the zstd
+#                           build feature, so packagefs, the boot loader and
+#                           the package kit read zstd packages
+#   HAIKU_PACKAGE_DEFAULT_COMPRESSION = zlib
+#                           while the packages the build makes stay zlib, for
+#                           the arm64 systems that cannot read zstd yet
 #
 # A release image, which System Updater can update (docs/airos/SYSTEM-UPDATER.md),
 # also has:
@@ -140,20 +153,41 @@ switch $(HAIKU_BUILD_PROFILE) {
 	}
 }
 
+# arm64: the bootstrap repository's packages CI has builds of in
+# AIROS_CI_PACKAGES stay out of the image (icu74 and ncurses6, which link
+# libgcc_s rather than a private copy of the unwinder; a C++ exception that
+# passed through the bootstrap ones ended the program). CI's own go in as
+# packages (AIROS_CI_BASE_PACKAGES, UserBuildConfigRulePreImage), and so does
+# zstd, which haiku requires with the zstd build feature: dependency
+# resolution sees those, not the files of AIROS_CI_PACKAGES.
+if $(AIROS_ROCK5) || $(AIROS_RPI4) || $(AIROS_CUBIE) {
+	local package ;
+	for package in [ Glob $(AIROS_CI_PACKAGES) : *.hpkg ] {
+		local name = [ Match "^([^-]+)-" : $(package:BS) ] ;
+		if [ IsPackageAvailable $(name) ] {
+			SuppressHaikuImagePackages $(name) ;
+			AIROS_CI_BASE_PACKAGES += $(package:BS) ;
+		} else if $(name) = zstd {
+			AIROS_CI_BASE_PACKAGES += $(package:BS) ;
+		}
+	}
+}
+
 # The ROCK 5 ITX's drivers and Bluetooth tools (bt_le, the AX210 loader).
 if $(AIROS_ROCK5) {
 	DeferredSubInclude HAIKU_TOP tools rock5-itx ;
 }
 
 # AirosCIFiles <image directory> : <source directory> : <grist> : <pattern>
-rule AirosCIFiles directoryTokens : sourceDir : grist : pattern
+#	: [ <names to leave out> ]
+rule AirosCIFiles directoryTokens : sourceDir : grist : pattern : exclude
 {
 	if ! $(sourceDir) {
 		return ;
 	}
 	local files = [ Glob $(sourceDir) : $(pattern) ] ;
 	# The glob of * also returns . and ..
-	files = [ FFilter $(files:BS) : . .. ] ;
+	files = [ FFilter $(files:BS) : . .. $(exclude) ] ;
 	if ! $(files) {
 		return ;
 	}
@@ -258,8 +292,15 @@ rule UserBuildConfigRulePreImage
 
 	local tree = [ FDirName $(HAIKU_TOP) tools airos ci ] ;
 
-	# Everything CI built for this image.
-	AirosCIFiles system packages : $(AIROS_CI_PACKAGES) : airos-ci-pkg : *.hpkg ;
+	# Everything CI built for this image; (arm64) its builds of repository
+	# packages and zstd as packages (above), the rest as files.
+	if $(AIROS_CI_BASE_PACKAGES) {
+		local basePackages = <airos-ci-base>$(AIROS_CI_BASE_PACKAGES) ;
+		SEARCH on $(basePackages) = $(AIROS_CI_PACKAGES) ;
+		AddPackageFilesToHaikuImage system packages : $(basePackages) ;
+	}
+	AirosCIFiles system packages : $(AIROS_CI_PACKAGES) : airos-ci-pkg : *.hpkg
+		: $(AIROS_CI_BASE_PACKAGES) ;
 	if $(AIROS_CI_FILES) {
 		include $(AIROS_CI_FILES) ;
 	} else {

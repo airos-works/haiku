@@ -155,6 +155,13 @@ AddHaikuImageSystemPackages WonderBrush ;
 # AddFilesToHaikuImage system packages.
 SuppressHaikuImagePackages vision ;
 
+# Keep the packages the build makes zlib-compressed although the zstd build
+# feature is enabled (the package tool's default is then zstd), so that
+# systems without zstd support can still read them. The setting has to be the
+# same for every build in the build directory (jam does not recompile objects
+# whose flags changed), so it is best passed in the environment.
+HAIKU_PACKAGE_DEFAULT_COMPRESSION = zlib ;
+
 # Specify scripts that shall be run when populating the image/installation
 # directory. The "early" script is run before anything has been copied onto
 # the image/into the installation directory. The "late" script is run after
