@@ -39,6 +39,11 @@
 #                           packages: build/jam/BuildFeatures compiles Haiku
 #                           against them and the top Jamfile puts freetype in
 #                           the image instead of the bootstrap FreeType 2.6.3
+#   HAIKU_ARM64_OPENSSL_PACKAGE
+#                           (arm64) air/OS's airos_openssl package: the SSL
+#                           build feature, libbnetapi's HTTPS (System Updater,
+#                           pkgman, HaikuDepot); it goes in the image with
+#                           AIROS_CI_BASE_PACKAGES
 #   HAIKU_ARM64_LIBPNG_PACKAGES_DIR
 #                           (arm64) air/OS's libpng16 and libpng16_devel: the
 #                           libpng build feature (the PNG translator), and
@@ -167,7 +172,9 @@ if $(AIROS_ROCK5) || $(AIROS_RPI4) || $(AIROS_CUBIE) {
 		if [ IsPackageAvailable $(name) ] {
 			SuppressHaikuImagePackages $(name) ;
 			AIROS_CI_BASE_PACKAGES += $(package:BS) ;
-		} else if $(name) = zstd {
+		} else if $(name) = zstd || $(name) = airos_openssl {
+			# haiku requires these with the zstd and (arm64) openssl build
+			# features
 			AIROS_CI_BASE_PACKAGES += $(package:BS) ;
 		}
 	}

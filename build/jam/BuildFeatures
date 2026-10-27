@@ -68,7 +68,29 @@ if [ IsHaikuImagePackageAdded openssl3 ] || $(HAIKU_BUILD_TYPE) = regular {
 }
 
 if $(HAIKU_BUILD_FEATURE_SSL) {
-	if [ IsPackageAvailable openssl3_devel ] {
+	if $(HAIKU_ARM64_OPENSSL_PACKAGE) && $(TARGET_PACKAGING_ARCH) = arm64 {
+		# The arm64 repository has no openssl3_devel: air/OS CI's OpenSSL
+		# (airos-ci deps/recipes/openssl.sh), one airos_openssl package with
+		# the libraries and the headers. CI puts that package in the image
+		# (tools/airos/ci/UserBuildConfig), where it provides the lib:libssl
+		# and lib:libcrypto haiku then requires. Without it, arm64 machines
+		# cannot download anything over HTTPS.
+		local package = $(HAIKU_ARM64_OPENSSL_PACKAGE) ;
+		if ! [ Glob $(package:D) : $(package:BS) ] {
+			Exit "HAIKU_ARM64_OPENSSL_PACKAGE: no $(package)" ;
+		}
+		local directory = [ FDirName $(HAIKU_OPTIONAL_BUILD_PACKAGES_DIR)
+			airos-$(package:B) ] ;
+		SetBuildFeatureAttribute openssl : libraries
+			: [ ExtractArchive $(directory)
+				: lib/libcrypto.so.3 lib/libssl.so.3
+				: $(package) : extracted-arm64-openssl ] : base ;
+		SetBuildFeatureAttribute openssl : headers
+			: [ ExtractArchive $(directory) : develop/headers
+				: $(package) : extracted-arm64-openssl ] : base ;
+		SetBuildFeatureAttribute openssl : base:directory : $(directory) ;
+		EnableBuildFeatures openssl ;
+	} else if [ IsPackageAvailable openssl3_devel ] {
 		ExtractBuildFeatureArchives openssl :
 			file: base openssl3
 				runtime: lib

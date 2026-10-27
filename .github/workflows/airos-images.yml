@@ -7,8 +7,10 @@
 # Each image is smoke-tested (Pi: SD layout) and published on the build server
 # and as a public, immutable GitHub prerelease; its packages go into the
 # target's System Updater feed (http://192.168.1.200/updates/<target>/,
-# docs/airos/SYSTEM-UPDATER.md). They are rebuilt nightly
-# too, to pick up new builds of the applications and Summit.
+# docs/airos/SYSTEM-UPDATER.md), which is mirrored to GitHub Releases
+# (updates-<target>, update-<target>-<id>): machines update from there. They
+# are rebuilt nightly too, to pick up new builds of the applications and
+# Summit.
 name: air/OS images
 
 on:
@@ -70,6 +72,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: 'python3 "$RUNNER_TEMP/airos-ci/images/publish-github.py" "${{ matrix.target }}" "${{ steps.build.outputs.IMAGE_DIR }}"'
+
+      - name: Publish System Updater's feed to GitHub Releases
+        if: steps.selected.outputs.build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: 'python3 "$RUNNER_TEMP/airos-ci/images/publish-feed-github.py" "${{ matrix.target }}"'
 
       - name: Summary
         if: always() && steps.build.outputs.IMAGE_DIR
