@@ -248,6 +248,13 @@ Registrar::_MessageReceived(BMessage *message)
 			_HandleShutDown(message);
 			break;
 		}
+		case B_REG_QUIT_USER_APPS:
+		{
+			PRINT("B_REG_QUIT_USER_APPS\n");
+
+			_HandleShutDown(message);
+			break;
+		}
 		case B_REG_IS_SHUT_DOWN_IN_PROGRESS:
 		{
 			PRINT("B_REG_IS_SHUT_DOWN_IN_PROGRESS\n");

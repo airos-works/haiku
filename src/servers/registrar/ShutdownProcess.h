@@ -13,6 +13,7 @@
 #include <HashSet.h>
 #include <Locker.h>
 #include <Looper.h>
+#include <String.h>
 
 #include "AppInfoList.h"
 #include "EventMaskWatcher.h"
@@ -118,6 +119,10 @@ private:
 			status_t			fShutdownError;
 			bool				fHasGUI;
 			bool				fReboot;
+			bool				fQuitAppsOnly;
+				// B_REG_QUIT_USER_APPS: the user apps but the sender's
+			team_id				fRequestTeam;
+			BString				fAbortingApp;
 			bool				fRequestReplySent;
 			ShutdownWindow*		fWindow;
 };
