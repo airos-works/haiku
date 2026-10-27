@@ -9,7 +9,8 @@
 	scales whatever region of the frame buffer the driver gives it to that
 	mode. So an output's "resolution" and its scale are both the size of its
 	region; app_server arranges the regions through the display layout hooks.
-	There is no acceleration and no hardware cursor. */
+	There is no acceleration; the cursor is a plane the firmware composites
+	over the frame buffer. */
 
 
 #include <errno.h>
@@ -34,6 +35,10 @@ struct accelerant_info {
 	area_id					frame_buffer_area;
 	void*					frame_buffer;
 	uint32					generation;
+
+	// the hardware cursor's buffer, NULL where the driver has none
+	area_id					cursor_area;
+	void*					cursor_buffer;
 
 	// the layout app_server asked for, until its mode is set
 	bool					pending;
@@ -184,6 +189,7 @@ init_common(int device, bool isClone)
 	gInfo->device = device;
 	gInfo->is_clone = isClone;
 	gInfo->frame_buffer_area = -1;
+	gInfo->cursor_area = -1;
 
 	area_id sharedArea;
 	status_t status = B_OK;
@@ -218,6 +224,8 @@ uninit_common()
 		rpi_set_display_change_port(-1, 0);
 	if (gInfo->frame_buffer_area >= 0)
 		delete_area(gInfo->frame_buffer_area);
+	if (gInfo->cursor_area >= 0)
+		delete_area(gInfo->cursor_area);
 	delete_area(gInfo->shared_area);
 	if (gInfo->is_clone)
 		close(gInfo->device);
@@ -339,6 +347,73 @@ rpi_accelerant_retrace_semaphore()
 		return -1;
 	}
 	return semaphore;
+}
+
+
+//	#pragma mark - cursor
+
+
+static status_t
+map_cursor_buffer()
+{
+	if (gInfo->cursor_area >= 0)
+		return B_OK;
+	area_info info;
+	if (ioctl(gInfo->device, RPI_DISPLAY_CLONE_CURSOR_BUFFER, &info,
+			sizeof(info)) != 0) {
+		return errno != 0 ? errno : B_ERROR;
+	}
+	gInfo->cursor_area = info.area;
+	gInfo->cursor_buffer = info.address;
+	return B_OK;
+}
+
+
+/*!	The firmware composites the cursor as a plane of its own over the frame
+	buffer, so the pointer never meets the pixels it points at: no software
+	cursor's backup and restore over what a direct window drew there.
+	Returns B_UNSUPPORTED where the bitmap cannot ride a plane; the
+	app_server then draws the cursor itself.
+*/
+static status_t
+rpi_set_cursor_bitmap(uint16 width, uint16 height, uint16 hotX, uint16 hotY,
+	color_space colorSpace, uint16 bytesPerRow, const uint8* bitmapData)
+{
+	if (colorSpace != B_RGBA32 || width == 0 || width > RPI_DISPLAY_CURSOR_MAX
+		|| height == 0 || height > RPI_DISPLAY_CURSOR_MAX)
+		return B_UNSUPPORTED;
+
+	status_t status = map_cursor_buffer();
+	if (status != B_OK)
+		return B_UNSUPPORTED;
+
+	uint8* buffer = (uint8*)gInfo->cursor_buffer;
+	uint32 bufferRow = RPI_DISPLAY_CURSOR_MAX * 4;
+	memset(buffer, 0, bufferRow * RPI_DISPLAY_CURSOR_MAX);
+	for (uint16 y = 0; y < height; y++)
+		memcpy(buffer + y * bufferRow, bitmapData + y * bytesPerRow, width * 4);
+
+	rpi_display_cursor cursor = {width, height, (int16)hotX, (int16)hotY};
+	if (ioctl(gInfo->device, RPI_DISPLAY_DEFINE_CURSOR, &cursor,
+			sizeof(cursor)) != 0) {
+		return errno != 0 ? errno : B_ERROR;
+	}
+	return B_OK;
+}
+
+
+static void
+rpi_move_cursor(uint16 x, uint16 y)
+{
+	rpi_display_cursor_position position = {x, y};
+	ioctl(gInfo->device, RPI_DISPLAY_MOVE_CURSOR, &position, sizeof(position));
+}
+
+
+static void
+rpi_show_cursor(bool visible)
+{
+	ioctl(gInfo->device, RPI_DISPLAY_SHOW_CURSOR, &visible, sizeof(visible));
 }
 
 
@@ -693,6 +768,13 @@ get_accelerant_hook(uint32 feature, void* data)
 			return (void*)rpi_get_accelerant_device_info;
 		case B_ACCELERANT_RETRACE_SEMAPHORE:
 			return (void*)rpi_accelerant_retrace_semaphore;
+
+		case B_SET_CURSOR_BITMAP:
+			return (void*)rpi_set_cursor_bitmap;
+		case B_MOVE_CURSOR:
+			return (void*)rpi_move_cursor;
+		case B_SHOW_CURSOR:
+			return (void*)rpi_show_cursor;
 
 		case B_ACCELERANT_MODE_COUNT:
 			return (void*)rpi_accelerant_mode_count;
