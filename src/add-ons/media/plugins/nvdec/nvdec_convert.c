@@ -146,6 +146,24 @@ nvdecFrameToP010(const NvdecFrame *frame, uint8_t *out, size_t outPitch,
 	}
 }
 
+void
+nvdecFrameToNV12(const NvdecFrame *frame, uint8_t *out, size_t outPitch,
+	int fromLine, int toLine)
+{
+	const int width = frame->width;
+	const int left = frame->cropLeft;
+	const int top = frame->cropTop;
+	uint8_t *chromaOut = out + outPitch * (size_t)frame->height;
+	for (int y = fromLine; y < toLine; y++) {
+		gatherLine(frame, frame->luma, left, top + y, width,
+			out + (size_t)y * outPitch);
+		if ((y & 1) == 0) {
+			gatherLine(frame, frame->chroma, left, (top + y) / 2, width,
+				chromaOut + (size_t)(y / 2) * outPitch);
+		}
+	}
+}
+
 /* ------------------------------------------------------------- in bands */
 
 typedef struct {
@@ -153,7 +171,7 @@ typedef struct {
 	uint8_t			*out;
 	size_t			outPitch;
 	NvdecColorRange		range;
-	int			kind;		/* 0 YCbCr422, 1 RGB32, 2 P010 */
+	int			kind;		/* 0 YCbCr422, 1 RGB32, 2 P010, 3 NV12 */
 	int			bands;
 	int32			next;
 	/* The helpers and the caller each hold a reference; the last one out
@@ -188,6 +206,8 @@ convertBands(Work *work)
 				from, to, work->range);
 		} else if (work->kind == 2) {
 			nvdecFrameToP010(work->frame, work->out, work->outPitch, from, to);
+		} else if (work->kind == 3) {
+			nvdecFrameToNV12(work->frame, work->out, work->outPitch, from, to);
 		} else {
 			nvdecFrameToYCbCr422(work->frame, work->out, work->outPitch, from, to);
 		}
@@ -272,4 +292,10 @@ void
 nvdecFrameToP010Threaded(const NvdecFrame *frame, uint8_t *out, size_t outPitch)
 {
 	convertThreaded(frame, out, outPitch, NVDEC_RANGE_BT601, 2);
+}
+
+void
+nvdecFrameToNV12Threaded(const NvdecFrame *frame, uint8_t *out, size_t outPitch)
+{
+	convertThreaded(frame, out, outPitch, NVDEC_RANGE_BT601, 3);
 }

@@ -49,11 +49,19 @@ void nvdecFrameToYCbCr422(const NvdecFrame *frame, uint8_t *out, size_t outPitch
 void nvdecFrameToP010(const NvdecFrame *frame, uint8_t *out, size_t outPitch,
 	int fromLine, int toLine);
 
+/* The same lines as NV12: a plane of eight-bit luma samples, then one of Cb
+ * and Cr samples in pairs, half as many lines, both `outPitch` bytes a line.
+ * What the engine wrote, rearranged; ten-bit pictures keep their top eight
+ * bits. */
+void nvdecFrameToNV12(const NvdecFrame *frame, uint8_t *out, size_t outPitch,
+	int fromLine, int toLine);
+
 /* Convert a whole picture, using as many threads as the machine has. */
 void nvdecFrameToRGB32Threaded(const NvdecFrame *frame, uint8_t *out, size_t outPitch,
 	NvdecColorRange range);
 void nvdecFrameToYCbCr422Threaded(const NvdecFrame *frame, uint8_t *out, size_t outPitch);
 void nvdecFrameToP010Threaded(const NvdecFrame *frame, uint8_t *out, size_t outPitch);
+void nvdecFrameToNV12Threaded(const NvdecFrame *frame, uint8_t *out, size_t outPitch);
 
 #ifdef __cplusplus
 }

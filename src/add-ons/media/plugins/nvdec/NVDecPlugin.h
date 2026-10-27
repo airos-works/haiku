@@ -9,7 +9,8 @@
  * would then not play at all: a program that wants it - one that falls back
  * to software on its own - instantiates the decoder and sets it up with an
  * H.265 format. Main and Main 10 are decoded. Ten-bit pictures can be had as
- * they are, as NVDEC_COLOR_SPACE_P010.
+ * they are, as NVDEC_COLOR_SPACE_P010. Any picture can be had as
+ * NVDEC_COLOR_SPACE_NV12, without a conversion.
  */
 #ifndef NVDEC_PLUGIN_H
 #define NVDEC_PLUGIN_H
@@ -26,6 +27,12 @@ extern "C" {
  * the top bits, then one of Cb and Cr in pairs with half as many lines, both
  * bytes_per_row bytes a line. Only given to a caller that asks for it. */
 #define NVDEC_COLOR_SPACE_P010	((color_space)0x50303130)	/* 'P010' */
+
+/* Not one of Haiku's either: NV12, a plane of eight-bit luma samples, then
+ * one of Cb and Cr in pairs with half as many lines, both bytes_per_row bytes
+ * a line - what a graphics card takes as a video texture. H.264 and H.265;
+ * ten-bit pictures keep their top eight bits. */
+#define NVDEC_COLOR_SPACE_NV12	((color_space)0x4e563132)	/* 'NV12' */
 
 
 class NVDecDecoder : public Decoder {

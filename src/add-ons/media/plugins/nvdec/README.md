@@ -27,6 +27,12 @@ as sixteen-bit samples with the value in the top bits; a caller can have them
 as they are by asking for the colour space `'P010'` (`NVDEC_COLOR_SPACE_P010`
 in `NVDecPlugin.h`), or as eight-bit YCbCr422 or RGB32 like H.264.
 
+Both can also be had as NV12, by asking for the colour space `'NV12'`
+(`NVDEC_COLOR_SPACE_NV12`): the luma plane, then Cb and Cr in pairs on half as
+many lines, both `bytes_per_row` (the width) a line - what the engine writes,
+untiled, with no colour conversion, and what a graphics card takes as a video
+texture. Ten-bit pictures keep their top eight bits.
+
 Haiku picks one decoder for a format, by add-on directory, so this add-on takes
 H.264 away from libavcodec wherever it is installed and `/dev/nvidiactl`
 exists (on a machine without nvidia_rm or an NVIDIA card it offers nothing, so

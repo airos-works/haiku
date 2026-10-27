@@ -3,7 +3,8 @@
  * Reads an Annex B file, hands the decoder one picture at a time, and writes
  * the pictures in the order they should be shown, as I420 - which is what
  * ffmpeg writes with -pix_fmt yuv420p, so the two can be compared byte for
- * byte.
+ * byte. With NVDEC_NV12 set in the environment, as NV12 (-pix_fmt nv12)
+ * through the media add-on's conversion.
  *
  * Usage: nvdecstream <stream.h264> [out.yuv] [frame limit]
  */
@@ -13,6 +14,7 @@
 
 #include <OS.h>
 
+#include "nvdec_convert.h"
 #include "nvdec_h264.h"
 
 static uint8_t *gPlane;
@@ -23,6 +25,18 @@ writeFrame(FILE *out, const NvdecFrame *frame)
 {
 	if (out == NULL)
 		return;
+	if (getenv("NVDEC_NV12") != NULL) {
+		/* What the media add-on gives a caller that asks for 'NV12': ffmpeg
+		 * writes the same with -pix_fmt nv12. */
+		size_t size = (size_t)frame->width * frame->height * 3 / 2;
+		if (gPlaneSize < size) {
+			gPlane = realloc(gPlane, size);
+			gPlaneSize = size;
+		}
+		nvdecFrameToNV12Threaded(frame, gPlane, frame->width);
+		fwrite(gPlane, 1, size, out);
+		return;
+	}
 	size_t needed = (size_t)frame->codedWidth * frame->codedHeight;
 	if (gPlaneSize < needed) {
 		gPlane = realloc(gPlane, needed);
