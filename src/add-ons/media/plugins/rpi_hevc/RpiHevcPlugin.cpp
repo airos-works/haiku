@@ -18,6 +18,12 @@
 	- 'P010' (ten bit streams, and only that for them): as NV12 with
 	  sixteen bit samples, the value in the upper ten bits.
 
+	A caller that asks for 'P010' or 'I420' pictures exactly half as wide and
+	high (display.line_width and line_count) gets them so, when the width and
+	height are multiples of four: each sample the mean of a 2x2 block, made
+	in the pass that copies the picture anyway. A 4K film on a 1080p screen
+	needs no more, and the caller then scales a quarter of the samples.
+
 	A negative time_to_decode in Decode()'s media_decode_info is, negated,
 	the time before which the caller will drop the pictures anyway (it is
 	seeking); those are returned with their time but not copied. */
@@ -75,6 +81,8 @@ private:
 			bool				fInputEnded;
 
 			color_space			fOutputSpace;
+			bool				fHalf;
+				// half as wide and high, as the caller asked
 			bool				fHavePicture;
 			HevcDecoder::Picture fPicture;
 			uint32				fWidth;
@@ -88,6 +96,7 @@ RpiHevcDecoder::RpiHevcDecoder()
 	fParameterSetsSent(false),
 	fInputEnded(false),
 	fOutputSpace(kColorSpaceI420),
+	fHalf(false),
 	fHavePicture(false),
 	fWidth(0),
 	fHeight(0)
@@ -188,7 +197,7 @@ RpiHevcDecoder::Setup(media_format* format, const void* info, size_t infoSize)
 uint32
 RpiHevcDecoder::_Stride(const HevcDecoder::Picture& picture) const
 {
-	uint32 samples = (picture.width + 15) & ~15u;
+	uint32 samples = (fWidth + 15) & ~15u;
 	return picture.bitDepth > 8 ? 2 * samples : samples;
 }
 
@@ -214,8 +223,13 @@ RpiHevcDecoder::NegotiateOutputFormat(media_format* format)
 	if ((fPicture.bitDepth > 8) != (space == kColorSpaceP010))
 		return B_MEDIA_BAD_FORMAT;
 	fOutputSpace = space;
-	fWidth = fPicture.width;
-	fHeight = fPicture.height;
+	const media_video_display_info& asked = format->u.raw_video.display;
+	fHalf = (space == kColorSpaceP010 || space == kColorSpaceI420)
+		&& fPicture.width % 4 == 0 && fPicture.height % 4 == 0
+		&& asked.line_width == fPicture.width / 2
+		&& asked.line_count == fPicture.height / 2;
+	fWidth = fHalf ? fPicture.width / 2 : fPicture.width;
+	fHeight = fHalf ? fPicture.height / 2 : fPicture.height;
 
 	media_raw_video_format raw = fInputFormat.u.encoded_video.output;
 	raw.interlace = 1;
@@ -361,7 +375,8 @@ RpiHevcDecoder::Decode(void* buffer, int64* frameCount, media_header* header,
 	}
 	fHavePicture = false;
 
-	if (fPicture.width != fWidth || fPicture.height != fHeight
+	if (fPicture.width != (fHalf ? fWidth * 2 : fWidth)
+		|| fPicture.height != (fHalf ? fHeight * 2 : fHeight)
 		|| (fPicture.bitDepth > 8) != (fOutputSpace == kColorSpaceP010)) {
 		// the stream changed its pictures; nothing here renegotiates
 		fDecoder.ReleasePicture(fPicture);
@@ -376,7 +391,7 @@ RpiHevcDecoder::Decode(void* buffer, int64* frameCount, media_header* header,
 		&& fPicture.pts < -info->time_to_decode;
 	if (!skip) {
 		fDecoder.CopyPlanes(fPicture, (uint8*)buffer, stride,
-			fOutputSpace == kColorSpaceNV12);
+			fOutputSpace == kColorSpaceNV12, fHalf);
 	}
 
 	memset(header, 0, sizeof(*header));

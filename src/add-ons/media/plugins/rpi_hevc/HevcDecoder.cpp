@@ -938,7 +938,7 @@ HevcDecoder::ReleasePicture(const Picture& picture)
 
 void
 HevcDecoder::CopyPlanes(const Picture& picture, uint8* target, uint32 stride,
-	bool interleaved)
+	bool interleaved, bool half)
 {
 	if (picture.frame < 0 || (size_t)picture.frame >= fFrames.size())
 		return;
@@ -953,6 +953,18 @@ HevcDecoder::CopyPlanes(const Picture& picture, uint8* target, uint32 stride,
 	sand.top = geometry.cropTop;
 	sand.width = geometry.shownWidth;
 	sand.height = geometry.shownHeight;
+
+	if (half) {
+		uint32 rows = geometry.shownHeight / 2;
+		uint8* chroma = target + (size_t)stride * rows;
+		if (geometry.bitDepth > 8)
+			sand30_to_p010_half(sand, target, stride, chroma, stride);
+		else {
+			sand8_to_i420_half(sand, target, stride, chroma,
+				chroma + (size_t)(stride / 2) * (rows / 2), stride / 2);
+		}
+		return;
+	}
 
 	uint8* chroma = target + (size_t)stride * geometry.shownHeight;
 	uint32 chromaRows = (geometry.shownHeight + 1) / 2;

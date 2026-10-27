@@ -40,4 +40,12 @@ void sand8_to_nv12(const SandPicture& picture, uint8_t* luma,
 void sand30_to_p010(const SandPicture& picture, uint8_t* luma,
 	uint32_t lumaStride, uint8_t* chroma, uint32_t chromaStride);
 
+/*!	As sand8_to_i420() and sand30_to_p010(), half as wide and high: each
+	sample the mean of a 2x2 block. The width and height must be multiples
+	of four. */
+void sand8_to_i420_half(const SandPicture& picture, uint8_t* luma,
+	uint32_t lumaStride, uint8_t* cb, uint8_t* cr, uint32_t chromaStride);
+void sand30_to_p010_half(const SandPicture& picture, uint8_t* luma,
+	uint32_t lumaStride, uint8_t* chroma, uint32_t chromaStride);
+
 #endif	// SAND_CONVERT_H
