@@ -336,6 +336,18 @@ command_boot_check(Updater& updater, bool wait)
 	if (!report.IsEmpty())
 		printf("%s\n", report.String());
 
+	// an update that could not be installed before this start: the window
+	// says why
+	BString failedTitle, failedError;
+	if (SystemState::ReadFailedInstall(failedTitle, failedError)) {
+		status_t launched = be_roster->Launch(kAppSignature);
+		if (launched != B_OK && launched != B_ALREADY_RUNNING) {
+			notify("air/OS update not installed", BString().SetToFormat(
+				"%s could not be installed. Open System Updater to try "
+				"again.", failedTitle.String()));
+		}
+	}
+
 	LastBoot lastBoot = SystemState::ReadLastBoot();
 	if (lastBoot.mode == AIROS_BOOT_MODE_FALLBACK) {
 		notify("air/OS update did not start",

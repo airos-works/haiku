@@ -20,7 +20,9 @@ class BStatusBar;
 class BStringView;
 class BTabView;
 class BTextControl;
+class BMessageRunner;
 class BTextView;
+class InstallWindow;
 class UpdateWorker;
 
 
@@ -43,6 +45,9 @@ private:
 			void				_SetVisible(BView* view, bool visible);
 			void				_StartCheck();
 			void				_Restart();
+			void				_StartInstall();
+			void				_InstallFinished(BMessage* message);
+			void				_ShowFailedInstall();
 			void				_SelectVersion();
 			const InstalledVersion* _SelectedVersion() const;
 			void				_SaveSettings();
@@ -52,6 +57,7 @@ private:
 		kModeIdle,
 		kModeChecking,
 		kModeAvailable,
+		kModeClosingApps,
 		kModeInstalling,
 		kModeRestart,
 		kModeFailed,
@@ -81,6 +87,9 @@ private:
 			BTextControl*		fFeedControl;
 
 			UpdateWorker*		fWorker;
+			InstallWindow*		fInstallWindow;
+			BMessageRunner*		fRestartRunner;
+			bool				fRestarting;
 			SystemState			fState;
 			TrialInfo			fTrial;
 			LastBoot			fLastBoot;

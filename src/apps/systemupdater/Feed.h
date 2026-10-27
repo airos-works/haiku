@@ -37,6 +37,10 @@ public:
 									DownloadListener* listener = NULL);
 									// resumes a partial file
 
+			time_t				FetchServerTime(const BString& url);
+									// over plain HTTP, from the Date of
+									// the host's answer; 0 if none
+
 			void				Cancel();
 			bool				IsCancelled() const;
 			void				Reset()

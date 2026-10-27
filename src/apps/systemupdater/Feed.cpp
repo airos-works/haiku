@@ -243,6 +243,60 @@ Fetcher::FetchFile(const BString& url, const char* path, off_t expectedSize,
 }
 
 
+/*!	The time of the server of \a url, from the Date header of what its host
+	answers over plain HTTP (github.com redirects to HTTPS, with a Date).
+	For a clock that is too far off to check the server's certificate: the
+	time is no more trusted than before, the downloads are still checked
+	against the feed's SHA-256s.
+*/
+time_t
+Fetcher::FetchServerTime(const BString& url)
+{
+	BUrl address(url.String(), true);
+	if (!address.IsValid() || !address.HasHost())
+		return 0;
+	BUrl plain;
+	plain.SetProtocol("http");
+	plain.SetHost(address.Host());
+	plain.SetPath("/");
+
+	BMallocIO output;
+	BUrlRequest* request = BUrlProtocolRoster::MakeRequest(plain, &output);
+	BHttpRequest* http = dynamic_cast<BHttpRequest*>(request);
+	if (http == NULL) {
+		delete request;
+		return 0;
+	}
+	http->SetMethod(B_HTTP_HEAD);
+	http->SetFollowLocation(false);
+	http->SetDiscardData(true);
+
+	time_t serverTime = 0;
+	fRequest = request;
+	thread_id thread = request->Run();
+	if (thread >= 0) {
+		// a few seconds at most
+		bigtime_t until = system_time() + 10000000;
+		while (wait_for_thread_etc(thread, B_RELATIVE_TIMEOUT, 500000, NULL)
+				== B_TIMED_OUT) {
+			if (IsCancelled() || system_time() > until)
+				request->Stop();
+		}
+		const BHttpResult* result = dynamic_cast<const BHttpResult*>(
+			&request->Result());
+		if (result != NULL) {
+			serverTime = parse_http_date(
+				result->Headers().HeaderValue("Date"));
+		}
+	}
+	fRequest = NULL;
+	delete request;
+	if (serverTime > 0)
+		fServerTime = serverTime;
+	return serverTime;
+}
+
+
 /*!	A second or more before the next attempt, unless cancelled.
 */
 void

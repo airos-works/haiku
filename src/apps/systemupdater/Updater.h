@@ -96,6 +96,9 @@ public:
 			status_t			Download(UpdatePlan& plan, BString& _error);
 			status_t			Apply(UpdatePlan& plan, BString& _error);
 			void				Cancel();
+			bool				IsCancelled() const
+									{ return atomic_get(
+										(int32*)&fCancelled) != 0; }
 			void				Reset();
 									// after a cancelled operation
 
@@ -145,6 +148,7 @@ private:
 			status_t			_RemoveDirectory(const char* path);
 			bool				_WaitForDesktop();
 			void				_CheckClock();
+			void				_CheckClockForSecureFeed(const BString& url);
 
 private:
 			UpdaterListener*	fListener;

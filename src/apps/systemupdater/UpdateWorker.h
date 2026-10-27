@@ -21,6 +21,8 @@ enum {
 	kMsgGoBack				= 'gobk',
 		// "state"
 	kMsgRemoveFailed		= 'rmfl',
+	kMsgCloseApps			= 'clap',
+		// the user's applications quit, as in a shutdown
 
 	// from the worker
 	kMsgStatus				= 'stat',
@@ -29,7 +31,11 @@ enum {
 		// "error", or "available", "id", "title", "size", "changes",
 		// "count" (newer releases), "checked" (when the feed answered)
 	kMsgInstallDone			= 'indn',
-		// "error", "title"
+		// "error", "title", "cancelled"
+	kMsgInstallCommitting	= 'incm',
+		// everything is downloaded: the install goes on to the end
+	kMsgCloseAppsDone		= 'cadn',
+		// "error" (status_t), "app" (the one that would not quit)
 	kMsgGoBackDone			= 'gbdn',
 		// "error", "title"
 	kMsgRemoveFailedDone	= 'rfdn'
@@ -59,6 +65,7 @@ private:
 			void				_Install(const char* id);
 			void				_GoBack(const char* state);
 			void				_RemoveFailed();
+			void				_CloseApps();
 
 private:
 			BMessenger			fTarget;
