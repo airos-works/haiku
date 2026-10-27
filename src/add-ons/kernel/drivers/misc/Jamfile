@@ -40,6 +40,13 @@ if $(TARGET_ARCH) = arm64 {
 		rpi_gpio.cpp
 		;
 
+	# the Radxa Cubie A7S's pin headers for programs (AirPins), with
+	# rpi_gpio's interface (a device manager driver: it attaches to the
+	# A733's PIO node at boot)
+	KernelAddon sunxi_gpio :
+		sunxi_gpio.cpp
+		;
+
 	# the Allwinner A733's video decoder for the sunxi_cedar media add-on (a
 	# device manager driver: it attaches to its device tree node at boot)
 	KernelAddon sunxi_ve :

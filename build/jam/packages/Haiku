@@ -202,7 +202,8 @@ if $(TARGET_ARCH) = arm64 {
 	# the Raspberry Pi's firmware services: sound output, and the message
 	# channel itself for the H.264 decoder add-on; the SoC's HEVC decoder
 	# block for the HEVC one; the GPIO pins of the 40-pin header for AirPins;
-	# the Allwinner A733's video decoder for the sunxi_cedar add-on
+	# the Allwinner A733's video decoder for the sunxi_cedar add-on; the
+	# Radxa Cubie A7S's pin headers for AirPins
 	AddDriversToPackage audio hmulti :
 		bcm2835_audio
 		;
@@ -212,6 +213,7 @@ if $(TARGET_ARCH) = arm64 {
 		<driver>rpi_gpio
 		;
 	AddNewDriversToPackage misc :
+		sunxi_gpio
 		sunxi_ve
 		;
 	# the SC8280XP's video codec (Dragon Q8B) for the qcom_video add-on

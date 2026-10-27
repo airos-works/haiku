@@ -624,6 +624,7 @@ gpio_control(void* cookie, uint32 op, void* buffer, size_t length)
 			info.claimable = HEADER_PINS;
 			info.board_revision = sBoardRevision;
 			info.board_serial = sBoardSerial;
+			info.board = RPI_GPIO_BOARD_RPI4;
 			if (sInterruptInstalled)
 				info.flags |= RPI_GPIO_INFO_EDGE_INTERRUPTS;
 			return user_memcpy(buffer, &info, sizeof(info));
