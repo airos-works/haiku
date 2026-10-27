@@ -16,6 +16,7 @@
 #endif
 
 #include <pthread.h>
+#include <unistd.h>
 
 #include <Certificate.h>
 #include <FindDirectory.h>
@@ -320,6 +321,19 @@ BSecureSocket::Private::_CreateContext()
 
 	// Setup certificate verification
 	SSL_CTX_set_default_verify_file(sContext);
+
+	// HaikuPorts' OpenSSL names Haiku's CA bundle as its default file. One
+	// built without that patch (air/OS CI's arm64 OpenSSL) looks for its own
+	// cert.pem, which is not there, and would trust no certificate at all:
+	// then the bundle is loaded by name.
+	if (access(X509_get_default_cert_file(), R_OK) != 0) {
+		BPath bundle;
+		if (find_directory(B_SYSTEM_DATA_DIRECTORY, &bundle) == B_OK
+			&& bundle.Append("ssl/CARootCertificates.pem") == B_OK) {
+			SSL_CTX_load_verify_locations(sContext, bundle.Path(), NULL);
+		}
+		ERR_clear_error();
+	}
 
 	// Setup certificate callback
 	// OpenSSL defaults to SSL_VERIFY_NONE, which will trust any certificate
