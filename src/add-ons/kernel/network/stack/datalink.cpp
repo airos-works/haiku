@@ -400,11 +400,15 @@ datalink_send_routed_data(struct net_route* route, net_buffer* buffer)
 		return status;
 	}
 
-	if ((route->flags & RTF_GATEWAY) != 0) {
+	if ((route->flags & RTF_GATEWAY) != 0
+		&& (buffer->msg_flags & (MSG_MCAST | MSG_BCAST)) == 0) {
 		TRACE("  gateway route\n");
 
 		// This route involves a gateway, we need to use the gateway address
-		// instead of the destination address:
+		// instead of the destination address. Not for a multicast or
+		// broadcast datagram, which only the default route may have matched:
+		// it goes on the link of the route's interface as it is (else ARP
+		// would derive the multicast hardware address from the gateway's).
 		if (route->gateway == NULL)
 			return B_MISMATCHED_VALUES;
 		memcpy(buffer->destination, route->gateway, route->gateway->sa_len);
