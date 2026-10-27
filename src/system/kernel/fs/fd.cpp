@@ -27,6 +27,7 @@
 #include <slab/Slab.h>
 #include <util/AutoLock.h>
 #include <util/iovec_support.h>
+#include <util/ThreadAutoLock.h>
 #include <vfs.h>
 #include <wait_for_objects.h>
 
@@ -523,7 +524,15 @@ dup_foreign_fd(team_id fromTeam, int fd, bool kernel)
 		return B_BAD_TEAM_ID;
 	BReference<Team> teamReference(team, true);
 
+	// gone already when the team is being deleted
+	TeamLocker teamLocker(team);
 	io_context* fromContext = team->io_context;
+	if (fromContext == NULL)
+		return B_BAD_TEAM_ID;
+	vfs_get_io_context(fromContext);
+	teamLocker.Unlock();
+	CObjectDeleter<io_context, void, vfs_put_io_context> contextPutter(
+		fromContext);
 
 	// get the file descriptor
 	file_descriptor* descriptor = get_fd(fromContext, fd);

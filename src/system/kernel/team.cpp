@@ -2024,13 +2024,17 @@ exec_team(const char* path, char**& _flatArgs, size_t flatArgsSize,
 
 	user_debug_prepare_for_exec();
 
+	// The files closed on exec go first, while the areas are still there:
+	// a driver that locked some of the team's memory for a device (a GPU's
+	// import of host memory) unlocks it when its file is closed, and wired
+	// areas must not be deleted.
+	vfs_exec_io_context(team->io_context);
 	delete_team_user_data(team);
 	vm_delete_areas(team->address_space, false);
 	xsi_sem_undo(team);
 	delete_owned_ports(team);
 	sem_delete_owned_sems(team);
 	remove_images(team);
-	vfs_exec_io_context(team->io_context);
 	delete_user_mutex_context(team->user_mutex_context);
 	team->user_mutex_context = NULL;
 	delete_realtime_sem_context(team->realtime_sem_context);
@@ -3348,6 +3352,14 @@ team_delete_team(Team* team, port_id debuggerPort)
 		}
 	}
 
+	// The team's files are closed now, while its address space is still
+	// there: a driver that locked some of the team's memory for a device (a
+	// GPU's import of host memory) unlocks it when its file is closed, and
+	// the address space's areas must not go while they are wired. Before,
+	// the files were closed only when the Team object went, after that.
+	io_context* ioContext = team->io_context;
+	team->io_context = NULL;
+
 	// get team exit information
 	status_t exitStatus = -1;
 	int signal = -1;
@@ -3362,6 +3374,9 @@ team_delete_team(Team* team, port_id debuggerPort)
 	}
 
 	teamLocker.Unlock();
+
+	if (ioContext != NULL)
+		vfs_put_io_context(ioContext);
 
 	sNotificationService.Notify(TEAM_REMOVED, team);
 
@@ -4543,8 +4558,11 @@ _user_get_extended_team_info(team_id teamID, uint32 flags, void* buffer,
 			teamClone.effective_uid = team->effective_uid;
 			teamClone.effective_gid = team->effective_gid;
 
-			// also fetch a reference to the I/O context
+			// also fetch a reference to the I/O context (gone once the team
+			// is being deleted)
 			ioContext = team->io_context;
+			if (ioContext == NULL)
+				return B_BAD_TEAM_ID;
 			vfs_get_io_context(ioContext);
 		}
 		CObjectDeleter<io_context, void, vfs_put_io_context>

@@ -54,6 +54,8 @@ static image_t** sPreloadedAddons = NULL;
 static uint32 sPreloadedAddonCount = 0;
 
 static recursive_lock sLock = RECURSIVE_LOCK_INITIALIZER(kLockName);
+static thread_id sTerminatingThread = -1;
+	// the thread running the program's terminators (exit()), once it does
 
 
 static const char *
@@ -538,6 +540,26 @@ preload_addons()
 //	#pragma mark - libroot.so exported functions
 
 
+/*!	Called with sLock held at the start of a dlopen() or dlclose(). Once
+	exit() runs the program's terminators, another thread's dlopen() would run
+	constructors that use libraries already terminated, and its dlclose()
+	terminators of its own: such a thread waits for the team to end instead.
+	The exiting thread itself (a terminator that closes an add-on) goes on.
+*/
+static void
+wait_if_program_terminating(RecursiveLocker& locker)
+{
+	if (sTerminatingThread < 0 || sTerminatingThread == find_thread(NULL))
+		return;
+
+	locker.Unlock();
+	while (true) {
+		_kern_snooze_etc(B_INFINITE_TIMEOUT, B_SYSTEM_TIMEBASE,
+			B_RELATIVE_TIMEOUT, NULL);
+	}
+}
+
+
 image_id
 load_program(char const *path, void **_entry)
 {
@@ -649,7 +671,8 @@ load_library(char const *path, uint32 flags, bool addOn, void* caller,
 
 	KTRACE("rld: load_library(\"%s\", %#" B_PRIx32 ", %d)", path, flags, addOn);
 
-	RecursiveLocker _(sLock);
+	RecursiveLocker locker(sLock);
+	wait_if_program_terminating(locker);
 		// for now, just do stupid simple global locking
 
 	// have we already loaded this library?
@@ -749,7 +772,8 @@ unload_library(void* handle, image_id imageID, bool addOn)
 	if (handle == RLD_GLOBAL_SCOPE)
 		return B_OK;
 
-	RecursiveLocker _(sLock);
+	RecursiveLocker locker(sLock);
+	wait_if_program_terminating(locker);
 		// for now, just do stupid simple global locking
 
 	if (gInvalidImageIDs) {
@@ -1184,19 +1208,53 @@ elf64_verify_header(void *header, size_t length)
 #endif	// _COMPAT_MODE
 
 
+/*!	The first thing exit() does, before the static destructors and atexit()
+	hooks run: a dlopen() or dlclose() under way in another thread ends first
+	(it holds sLock throughout), and other threads' later ones wait for the
+	team to end (wait_if_program_terminating()), so that no library is
+	loaded, initialized or unloaded while the program tears itself down.
+*/
+void
+prepare_for_exit(void)
+{
+	RecursiveLocker _(sLock);
+	if (sTerminatingThread < 0)
+		sTerminatingThread = find_thread(NULL);
+}
+
+
 void
 terminate_program(void)
 {
 	image_t **termList;
 	ssize_t count, i;
 
-	count = get_sorted_image_list(NULL, &termList, RFLAG_TERMINATED);
-	if (count < B_OK)
-		return;
+	{
+		// Another thread may be loading or unloading an image right now
+		// (exit() while a library is being opened): the list is sorted while
+		// no image is half loaded, as the dependencies of one being loaded
+		// are not all set yet. The terminators run without the lock, as
+		// they did; each image in the list gets a reference, so that another
+		// thread's dlclose() cannot unload it while (or before) its
+		// terminators run, and from now on other threads' dlopen() and
+		// dlclose() wait for the team to end (wait_if_program_terminating()).
+		// The team ends right after, the references are never put.
+		RecursiveLocker _(sLock);
 
-	if (gInvalidImageIDs) {
-		// After fork, we lazily rebuild the image IDs of all loaded images
-		update_image_ids();
+		count = get_sorted_image_list(NULL, &termList, RFLAG_TERMINATED);
+		if (count < B_OK)
+			return;
+
+		for (i = 0; i < count; i++)
+			atomic_add(&termList[i]->ref_count, 1);
+
+		if (sTerminatingThread < 0)
+			sTerminatingThread = find_thread(NULL);
+
+		if (gInvalidImageIDs) {
+			// After fork, we lazily rebuild the image IDs of all loaded images
+			update_image_ids();
+		}
 	}
 
 	TRACE(("%ld: terminate dependencies\n", find_thread(NULL)));

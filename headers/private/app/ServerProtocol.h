@@ -380,6 +380,9 @@ enum {
 	// The lines of a frame's rings, see ViewFrameLineArrayInfo
 	AS_STROKE_FRAME_LINEARRAY,
 
+	// The scan timing of the output showing a part of the screen
+	AS_GET_SCAN_TIMING,
+
 	AS_LAST_CODE
 };
 

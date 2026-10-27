@@ -71,6 +71,7 @@ status_t get_executable_architecture(const char* path,
 	const char** _architecture);
 
 void terminate_program(void);
+void prepare_for_exit(void);
 image_id load_program(char const* path, void** entry);
 image_id load_library(char const* path, uint32 flags, bool addOn,
 	void* caller, void** _handle);

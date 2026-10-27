@@ -9,6 +9,7 @@
 #include <Accelerant.h>
 #include <GraphicsDefs.h>
 #include <Rect.h>
+#include <Region.h>
 #include <OS.h>
 
 
@@ -18,6 +19,27 @@ class BWindow;
 namespace BPrivate {
 	class BPrivateScreen;
 }
+
+
+// BScreen::GetScanTiming(): where a display output is in its refresh
+enum {
+	B_SCAN_TIMING_FROM_HARDWARE	= 0x01,
+		// scan_start is when the scan began, as the hardware tells
+	B_SCAN_TIMING_FROM_BLANK	= 0x02
+		// scan_start is when the blank interrupt was seen: a little late,
+		// and on some GPUs the interrupt comes after the scan began
+};
+
+typedef struct display_scan_timing {
+	uint32			output_id;		// 0: the outputs share one blank
+	uint32			flags;			// neither: scan_start unknown (0)
+	BRect			frame;			// the output, in screen coordinates
+	clipping_rect	device_frame;	// and in frame buffer pixels
+	bigtime_t		scan_start;		// system_time() of a frame's start
+	bigtime_t		period;			// the next ones every period
+	uint32			generation;		// changes with the layout and modes
+	uint32			_reserved[7];
+} display_scan_timing;
 
 
 class BScreen {
@@ -87,6 +109,9 @@ public:
 
 			status_t			GetBrightness(float* brightness);
 			status_t			SetBrightness(float brightness);
+
+			status_t			GetScanTiming(BRect frame,
+									display_scan_timing* timing);
 
 private:
 	// Forbidden and deprecated methods

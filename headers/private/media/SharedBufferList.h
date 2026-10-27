@@ -63,6 +63,7 @@ private:
 	enum { kMaxBuffers = 2047 };
 
 			status_t					_Init();
+			void						_RemoveStaleEntries();
 			void 						_RequestBufferInOtherGroups(
 											sem_id groupReclaimSem,
 											media_buffer_id id);

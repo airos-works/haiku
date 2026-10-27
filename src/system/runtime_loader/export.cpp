@@ -84,7 +84,8 @@ struct rld_export gRuntimeLoader = {
 	NULL,	// commpage_address
 	0,		// ABI version
 	0,		// API version
-	NULL	// tls_generation
+	NULL,	// tls_generation
+	prepare_for_exit
 };
 
 rld_export* __gRuntimeLoader = &gRuntimeLoader;

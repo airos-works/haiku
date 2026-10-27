@@ -16,6 +16,7 @@
 #include <Locker.h>
 #include <OS.h>
 #include <Region.h>
+#include <Screen.h>
 
 #include <video_overlay.h>
 
@@ -206,6 +207,10 @@ public:
 			void				WaitForPendingFlush(bigtime_t timeout);
 									// until what was queued so far is on
 									// the screen (not locked)
+			status_t			GetScanTiming(BRect screenFrame,
+									display_scan_timing& timing);
+									// for the output that shows most of
+									// screenFrame (not locked)
 
 
 protected:
@@ -376,6 +381,7 @@ private:
 			FlushTarget*		fFlushTargets;
 			int32				fFlushTargetCount;
 			bool				fFlushPerOutput;
+			uint32				fFlushGeneration;
 									// the outputs' targets are in use
 			sem_id				fFlushDoneSem;
 			volatile bool		fQuitFlush;
