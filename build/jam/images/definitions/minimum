@@ -8,6 +8,7 @@ SYSTEM_BIN = [ FFilterByBuildFeatures
 	beep
 	bfsinfo
 	bt_firmware
+	bt_a2dp
 	bt_le
 	catattr
 	checkfs
@@ -61,6 +62,7 @@ SYSTEM_BIN = [ FFilterByBuildFeatures
 	login
 	lsindex
 	makebootable
+	mediakey
 	message
 	mimeset
 	mkfs
@@ -180,9 +182,11 @@ SYSTEM_PREFERENCES = [ FFilterByBuildFeatures
 	Input
 	Keymap
 	Locale
+	MCP
 	Network
 	WiFi
 	Notifications
+	Power@x86,x86_64
 	Screen
 	Shortcuts
 	Time
@@ -208,6 +212,7 @@ rule HaikuImageGetSystemLibs
 			libdebugger.so@primary
 			libdevice.so
 			libgnu.so
+			libmedia.so
 			libnetwork.so
 			libpackage.so
 			libtextencoding.so
@@ -235,9 +240,11 @@ SYSTEM_SERVERS = [ FFilterByBuildFeatures
 	input_server
 	keystore_server
 	launch_daemon
+	mcp_server
 	mount_server
 	net_server
 	notification_server
+	osd_server
 	package_daemon
 	power_daemon
 	registrar
@@ -297,6 +304,7 @@ SYSTEM_ADD_ONS_PRINT = ;
 SYSTEM_ADD_ONS_PRINT_TRANSPORT = ;
 
 SYSTEM_ADD_ONS_SCREENSAVERS = ;
+SYSTEM_ADD_ONS_QUICK_LOOK = ;
 
 SYSTEM_ADD_ONS_DRIVERS_AUDIO = ;
 
@@ -354,11 +362,15 @@ SYSTEM_ADD_ONS_DRIVERS_NET = [ FFilterByBuildFeatures
 
 SYSTEM_ADD_ONS_DRIVERS_POWER = [ FFilterByBuildFeatures
 	x86,x86_64 @{
+		acpi_ac
 		acpi_button
+		acpi_lid
 		acpi_thermal
 		amd_thermal
 		pch_thermal
 	}@ # x86,x86_64
+	sunxi_regulator@arm64
+	sunxi_thermal@arm64
 ] ;
 
 SYSTEM_ADD_ONS_DRIVERS_SENSOR = [ FFilterByBuildFeatures

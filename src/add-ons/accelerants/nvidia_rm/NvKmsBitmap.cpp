@@ -13,7 +13,8 @@ static inline size_t AlignUp(size_t val, size_t align)
 
 
 NvKmsBitmap::NvKmsBitmap(NvRmDevice &rmDev, NvKmsDevice &kmsDev, uint32 width, uint32 height,
-	color_space colorSpace, bool systemMemory):
+	color_space colorSpace, bool systemMemory, bool mapped):
+	fRmDev(&rmDev),
 	fWidth(width),
 	fHeight(height),
 	fBytesPerRow(AlignUp(4*width, 256)),
@@ -62,5 +63,21 @@ NvKmsBitmap::NvKmsBitmap(NvRmDevice &rmDev, NvKmsDevice &kmsDev, uint32 width, u
 	CheckErrno(kms.Control(NVKMS_IOCTL_REGISTER_SURFACE, &params, sizeof(params)));
 	fSurface = NvKmsSurface(kmsDev, params.reply.surfaceHandle);
 
-	fMapping = rmDev.MapMemory(fMemory.Get(), systemMemory, 0, AlignUp(size, B_PAGE_SIZE), 0);
+	if (mapped)
+		Map();
+}
+
+
+void NvKmsBitmap::Map()
+{
+	if (fMapping.IsSet() || fRmDev == nullptr)
+		return;
+	fMapping = fRmDev->MapMemory(fMemory.Get(), fSystemMemory, 0,
+		AlignUp(fBytesPerRow * fHeight, B_PAGE_SIZE), 0);
+}
+
+
+void NvKmsBitmap::Unmap()
+{
+	fMapping = NvRmMemoryMapping();
 }

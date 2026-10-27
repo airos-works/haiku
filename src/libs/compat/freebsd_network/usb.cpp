@@ -132,7 +132,7 @@ get_usb_device_attach_arg(struct freebsd_usb_device* device, struct usb_attach_a
 	uaa->info.bDeviceProtocol = device_desc->device_protocol;
 
 	const usb_configuration_info* config = sUSB->get_configuration(device->haiku_usb_device);
-	if (device_desc == NULL)
+	if (config == NULL)
 		return B_BAD_VALUE;
 
 	// TODO: represent more than just interface[0], but how?

@@ -38,6 +38,8 @@ All rights reserved.
 
 #include <Server.h>
 
+#include <memory>
+
 #include "BarSettings.h"
 
 
@@ -94,6 +96,7 @@ class BFile;
 class BList;
 class PreferencesWindow;
 class TBarView;
+class WindowIcons;
 class TBarWindow;
 
 
@@ -164,6 +167,9 @@ public:
 			BBitmap*				FetchTeamIcon(team_id team, int32 size);
 			BBitmap*				FetchWindowIcon(bool local = true,
 										bool minimized = false);
+			// The icon the application gave the window, or NULL (see
+			// WindowIcons.h); any thread.
+			std::shared_ptr<BBitmap>	ApplicationWindowIcon(int32 serverToken);
 
 private:
 			void					AddTeam(team_id team, uint32 flags,
@@ -192,6 +198,7 @@ private:
 			desk_settings			fDefaultSettings;
 			clock_settings			fClockSettings;
 			PreferencesWindow*		fPreferencesWindow;
+			WindowIcons*			fWindowIcons;
 
 	static	BLocker					sSubscriberLock;
 	static	BList					sBarTeamInfoList;

@@ -8,6 +8,7 @@ SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src kits bluetooth ] ;
 
 Application BluetoothStatus :
 	BluetoothStatus.cpp
+	AudioSinkSetting.cpp
 	LEBondStore.cpp
 	LEDeviceStatus.cpp
 	: be [ TargetLibstdc++ ] localestub

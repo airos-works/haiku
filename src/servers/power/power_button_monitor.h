@@ -13,9 +13,12 @@
 #include "power_monitor.h"
 
 
+class PowerPolicy;
+
+
 class PowerButtonMonitor : public PowerMonitor {
 public:
-								PowerButtonMonitor();
+								PowerButtonMonitor(PowerPolicy* policy);
 	virtual	 					~PowerButtonMonitor();
 
 	virtual void				HandleEvent(int fd);
@@ -24,6 +27,7 @@ public:
 								FDs() const { return fFDs; }
 private:
 			std::set<int>		fFDs;
+			PowerPolicy*		fPolicy;
 };
 
 

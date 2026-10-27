@@ -8,6 +8,7 @@
 #include <stdio.h>
 
 #include "ehci.h"
+#include "usb_fdt.h"
 
 
 extern device_manager_info* gDeviceManager;
@@ -38,6 +39,69 @@ property_has_string(fdt_device_module_info* fdt, fdt_device* device,
 		data = end + 1;
 	}
 	return false;
+}
+
+
+/*!	Allwinner A733 (sun60i): U-Boot gates the clocks of the USB hosts, puts
+	them and their PHYs in reset and powers the PHYs down when it hands
+	over, so a host is brought up here the way Linux's CCU and sun4i-usb-phy
+	(D1 variant) drivers do it: PHY clock and reset, host bus gates and
+	resets, the PHY out of SIDDQ (power down), and the AHB burst and ULPI
+	bypass bits of the "passby" register. The PHY's PMU registers are the
+	page above the EHCI ones.
+*/
+static status_t
+sun60i_ehci_power_up(phys_addr_t base)
+{
+	uint32 port;
+	if (base == 0x4101000)
+		port = 0;
+	else if (base == 0x4200000)
+		port = 1;
+	else
+		return B_NOT_SUPPORTED;
+
+	// CCU (U-Boot's clk_a733.c, the BSP's ccu-sun60iw2.c): 0x1300 + 8 * port
+	// holds the PHY clock (bit 31) and reset (bit 30), 0x1304 + 8 * port the
+	// OHCI and EHCI bus gates (bits 0 and 4) and resets (bits 16 and 20).
+	void* ccu;
+	area_id ccuArea = map_physical_memory("a733 ccu usb", 0x02003000,
+		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &ccu);
+	if (ccuArea < 0)
+		return ccuArea;
+	volatile uint32* phyClock = (volatile uint32*)((uint8*)ccu + 0x300
+		+ 8 * port);
+	volatile uint32* busClock = phyClock + 1;
+	*phyClock |= 1u << 31;
+	*phyClock |= 1u << 30;
+	*busClock |= (1u << 0) | (1u << 4);
+	*busClock |= (1u << 16) | (1u << 20);
+	memory_full_barrier();
+	uint32 phyValue = *phyClock;
+	uint32 busValue = *busClock;
+	delete_area(ccuArea);
+	spin(10);
+
+	void* registers;
+	area_id area = map_physical_memory("a733 usb pmu", base, B_PAGE_SIZE,
+		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
+		&registers);
+	if (area < 0)
+		return area;
+	volatile uint32* passby = (volatile uint32*)((uint8*)registers + 0x800);
+	volatile uint32* hciPhyControl = passby + 4;
+	*hciPhyControl &= ~(1u << 3);
+		// SIDDQ
+	*passby |= (1u << 10) | (1u << 9) | (1u << 8) | (1u << 0);
+		// ICHR8, INCR4 bursts, INCRX alignment, ULPI bypass
+	memory_full_barrier();
+	dprintf("ehci: A733 USB%" B_PRIu32 " up: CCU %#" B_PRIx32 " %#" B_PRIx32
+		", passby %#" B_PRIx32 ", PHY control %#" B_PRIx32 "\n", port,
+		phyValue, busValue, *passby, *hciPhyControl);
+	delete_area(area);
+	spin(100);
+	return B_OK;
 }
 
 
@@ -94,6 +158,8 @@ init_fdt(device_node* node, void** cookie)
 		return status;
 	}
 	const char* name = fdt->get_name(device);
+	bool sun60i = property_has_string(fdt, device, "compatible",
+		"allwinner,sun60i-a733-ehci");
 	ehci_platform_info platform = {};
 	uint64 base, size, irq;
 	device_node* interruptController = NULL;
@@ -160,10 +226,10 @@ init_fdt(device_node* node, void** cookie)
 			&& !property_has_string(ancestorFDT, ancestor, "status", "ok")) {
 			supported = false;
 		}
-		if (current != parent && ancestorFDT->get_name(ancestor)[0] != 0) {
-			ranges = ancestorFDT->get_prop(ancestor, "ranges", &length);
-			if (ranges == NULL || length != 0)
-				supported = false;
+		if (current != parent && ancestorFDT->get_name(ancestor)[0] != 0
+			&& !usb_fdt_ranges_are_identity(gDeviceManager, current,
+				ancestorFDT, ancestor)) {
+			supported = false;
 		}
 		device_node* next = gDeviceManager->get_parent_node(current);
 		gDeviceManager->put_node(current);
@@ -172,6 +238,11 @@ init_fdt(device_node* node, void** cookie)
 	if (!supported) {
 		dprintf("ehci: unsupported FDT resources for %s\n", name);
 		return B_NOT_SUPPORTED;
+	}
+	if (sun60i) {
+		status = sun60i_ehci_power_up(base);
+		if (status != B_OK)
+			return status;
 	}
 	platform.register_base = base;
 	platform.register_size = size;
@@ -183,8 +254,10 @@ init_fdt(device_node* node, void** cookie)
 	info->platform = platform;
 	*cookie = info;
 	dprintf("ehci: FDT %s, registers %#" B_PRIx64 ", IRQ %" B_PRIu64
-		", DMA %s; retaining firmware PHY/clock configuration\n",
-		name, base, irq, platform.dma_coherent ? "coherent" : "noncoherent");
+		", DMA %s; %s\n", name, base, irq,
+		platform.dma_coherent ? "coherent" : "noncoherent",
+		sun60i ? "PHY and clocks set up"
+			: "retaining firmware PHY/clock configuration");
 	return B_OK;
 }
 

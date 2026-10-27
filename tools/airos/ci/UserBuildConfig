@@ -11,6 +11,11 @@
 #              arm64 machines with UEFI firmware)
 #   Pi 4       jam -q @airos-rpi4 airos-rpi-image         -> airos-rpi4.img
 #              SD card image (FAT boot partition + BFS) that boots directly
+#   Cubie A7S  jam -q @airos-cubie                        -> haiku-airos-cubie.image
+#              then tools/cubie-a7s/build-sd-image.sh haiku-airos-cubie.image
+#              airos-cubie.img: SD card image (Radxa's boot chain, the air/OS
+#              U-Boot, ESP, BFS); building that U-Boot needs an
+#              aarch64-linux-gnu cross compiler (tools/cubie-a7s/u-boot)
 #
 # The build directory's UserBuildConfig sets these and then includes this file:
 #   AIROS_CI_PACKAGES       directory of packages for system/packages: the
@@ -18,6 +23,23 @@
 #                           airos_* libraries, rock5_ffmpeg, firmware packages,
 #                           and (x86_64) HaikuPorts packages the build system's
 #                           repository list lacks
+#   AIROS_CI_FONTS          (arm64) HaikuPorts' noto and noto_sans_cjk_jp
+#                           packages, added as system packages in place of
+#                           the arm64 repository's bootstrap noto
+#   HAIKU_ARM64_FREETYPE_PACKAGES_DIR
+#                           (arm64) air/OS's freetype and freetype_devel
+#                           packages: build/jam/BuildFeatures compiles Haiku
+#                           against them and the top Jamfile puts freetype in
+#                           the image instead of the bootstrap FreeType 2.6.3
+#   HAIKU_ARM64_LIBPNG_PACKAGES_DIR
+#                           (arm64) air/OS's libpng16 and libpng16_devel: the
+#                           libpng build feature (the PNG translator), and
+#                           libpng16 in the image for it and for FreeType
+#   HAIKU_MUPDF_PACKAGES_DIR
+#                           HaikuPorts' mupdf and mupdf_devel for the
+#                           architecture: the mupdf build feature (Quick
+#                           Look's PDFPreview add-on); mupdf and jbig2dec go
+#                           in the image through AIROS_CI_PACKAGES
 #   AIROS_CI_LIBS           libraries for system/non-packaged/lib (GL stack)
 #   AIROS_CI_EGL            EGL vendor files for .../add-ons/opengl/egl_vendor.d
 #   AIROS_CI_DEMOS          demos for system/non-packaged/demos (GLTeapot)
@@ -25,6 +47,10 @@
 #   AIROS_CI_FLUIDLITE      (arm64) a prefix with FluidLite for the MIDI kit,
 #                           read by build/jam/BuildFeatures
 #   AIROS_CI_FIRMWARE       a tree copied to system/non-packaged/data/firmware
+#   AIROS_CI_AMDGPU         (x86_64) the AMD GPU user land: a tree copied to
+#                           system/non-packaged/amdgpu, which the boot script
+#                           links into system/non-packaged where amdgpu_drm
+#                           drives a GPU
 #   AIROS_CI_IMAGE_SIZE     image size in MiB (optional)
 #   HAIKU_RPI_FIRMWARE_DIR  (Pi) the Raspberry Pi boot firmware files
 #
@@ -37,10 +63,12 @@ HAIKU_IMAGE_HOST_NAME ?= airos ;
 DefineBuildProfile nightly-airos-x86_64 : anyboot-image : "airos-x86_64.iso" ;
 DefineBuildProfile airos-arm64 : anyboot-image : "airos-arm64.iso" ;
 DefineBuildProfile airos-rpi4 : image : "haiku-airos-rpi4.image" ;
+DefineBuildProfile airos-cubie : image : "haiku-airos-cubie.image" ;
 
 AIROS_X86_64 = ;
 AIROS_ROCK5 = ;
 AIROS_RPI4 = ;
+AIROS_CUBIE = ;
 switch $(HAIKU_BUILD_PROFILE) {
 	case nightly-airos-x86_64 : {
 		AIROS_X86_64 = 1 ;
@@ -61,6 +89,11 @@ switch $(HAIKU_BUILD_PROFILE) {
 		HAIKU_IMAGE_SIZE = $(AIROS_CI_IMAGE_SIZE:E=3584) ;
 		HAIKU_BFS_GROWABLE = 1 ;
 		HAIKU_RPI_IMAGE_NAME = airos-rpi4.img ;
+	}
+	case airos-cubie : {
+		AIROS_CUBIE = 1 ;
+		HAIKU_IMAGE_SIZE = $(AIROS_CI_IMAGE_SIZE:E=3584) ;
+		HAIKU_BFS_GROWABLE = 1 ;
 	}
 }
 
@@ -106,21 +139,61 @@ rule UserBuildConfigRulePreImage
 		CopyDirectoryToHaikuImage system non-packaged data : $(AIROS_CI_FIRMWARE)
 			: firmware ;
 	}
+	# x86_64: libdrm, libva, libglvnd and Mesa (radeonsi, RADV, VA-API) and the
+	# amduvd decoder for amdgpu_drm, kept apart: the boot script links them
+	# into place only where amdgpu_drm drives a GPU.
+	if $(AIROS_CI_AMDGPU) {
+		CopyDirectoryToHaikuImage system non-packaged : $(AIROS_CI_AMDGPU)
+			: amdgpu ;
+	}
 
-	# Join remembered Wi-Fi networks at start (x86_64 and ROCK 5; the Pi has
-	# its own script that also sets the clock).
+	# Join remembered Wi-Fi networks at start (x86_64 and ROCK 5; the Pi and
+	# the Cubie have their own scripts that also set the clock).
 	if $(AIROS_X86_64) || $(AIROS_ROCK5) {
 		local bootscript = <airos-ci>UserBootscript ;
 		SEARCH on $(bootscript) = [ FDirName $(tree) boot ] ;
 		AddFilesToHaikuImage home config settings boot : $(bootscript) ;
 	}
 
-	if $(AIROS_ROCK5) || $(AIROS_RPI4) {
+	if $(AIROS_ROCK5) || $(AIROS_RPI4) || $(AIROS_CUBIE) {
 		# CI stages this architecture-neutral package with zlib, since the
 		# arm64 release package readers may not support the repository's zstd.
 		if ! [ Glob $(AIROS_CI_PACKAGES) : ca_root_certificates-*-any.hpkg ] {
 			Exit "The arm64 image requires the ca_root_certificates package." ;
 		}
+		# The system fonts: the arm64 repository's bootstrap noto has no Noto
+		# Sans Mono, app_server's default fixed font, which then falls back to
+		# a proportional serif. Added as system packages (not files), they
+		# satisfy the haiku package's noto requirement when jam resolves the
+		# image's dependencies, so the bootstrap noto stays out.
+		local fonts = [ Glob $(AIROS_CI_FONTS) : noto-*-any.hpkg
+			noto_sans_cjk_jp-*-any.hpkg ] ;
+		if ! $(fonts[2]) {
+			Exit "The arm64 image requires the noto and noto_sans_cjk_jp"
+				"packages (AIROS_CI_FONTS)." ;
+		}
+		fonts = <airos-ci-font>$(fonts:BS) ;
+		SEARCH on $(fonts) = $(AIROS_CI_FONTS) ;
+		AddPackageFilesToHaikuImage system packages : $(fonts) ;
+		# FreeType 2.14.3 rather than the repository's bootstrap 2.6.3; the
+		# build system does the rest when the packages are named.
+		if ! [ Glob $(HAIKU_ARM64_FREETYPE_PACKAGES_DIR)
+				: freetype-*-arm64.hpkg ] {
+			Exit "The arm64 image requires air/OS's freetype packages"
+				"(HAIKU_ARM64_FREETYPE_PACKAGES_DIR)." ;
+		}
+		# libpng, which the arm64 repository does not have: BuildFeatures
+		# builds the PNG translator with libpng16_devel, and the translator and
+		# FreeType need libpng16 in the image.
+		local libpng = [ Glob $(HAIKU_ARM64_LIBPNG_PACKAGES_DIR)
+			: libpng16-*-arm64.hpkg ] ;
+		if ! $(libpng) {
+			Exit "The arm64 image requires air/OS's libpng16 packages"
+				"(HAIKU_ARM64_LIBPNG_PACKAGES_DIR)." ;
+		}
+		libpng = <airos-ci-libpng>$(libpng:BS) ;
+		SEARCH on $(libpng) = $(HAIKU_ARM64_LIBPNG_PACKAGES_DIR) ;
+		AddPackageFilesToHaikuImage system packages : $(libpng) ;
 		# Keep the legacy arm64 engine's CA path pointing at the packaged
 		# trust store used by curl and current engines.
 		AddSymlinkToHaikuImage system non-packaged data ssl
@@ -172,5 +245,25 @@ rule UserBuildConfigRulePreImage
 			<airos-rpi4>rpi-time-sync ;
 		SEARCH on $(bootscript) = $(rpi) ;
 		AddFilesToHaikuImage home config settings boot : $(bootscript) ;
+	}
+
+	if $(AIROS_CUBIE) {
+		local rpi = [ FDirName $(HAIKU_TOP) data boot rpi ] ;
+		# Package entries the Cubie must not see either (the ROCK 5's MPP
+		# decoder), and an installed system's locale: straight to the desktop.
+		local packageSettings = <airos-cubie>packages ;
+		SEARCH on $(packageSettings) = $(rpi) ;
+		AddFilesToHaikuImage system settings : $(packageSettings) ;
+		local localeSettings = "<airos-cubie>Locale settings"
+			<airos-cubie>RTC_time_settings ;
+		SEARCH on $(localeSettings) = $(rpi) ;
+		AddFilesToHaikuImage home config settings : $(localeSettings) ;
+		# NTP (the board has no battery-backed clock) and Wi-Fi autojoin
+		local bootscript = <airos-cubie>UserBootscript ;
+		SEARCH on $(bootscript) = [ FDirName $(HAIKU_TOP) data boot cubie-a7s ] ;
+		local timeSync = <airos-cubie>rpi-time-sync ;
+		SEARCH on $(timeSync) = $(rpi) ;
+		AddFilesToHaikuImage home config settings boot : $(bootscript)
+			$(timeSync) ;
 	}
 }

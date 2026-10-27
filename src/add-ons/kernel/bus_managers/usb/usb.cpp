@@ -518,6 +518,35 @@ usb_ioctl(uint32 opcode, void *buffer, size_t bufferSize)
 			return device->BuildDeviceName((char *)buffer, &index,
 				bufferSize, NULL);
 		}
+
+		case B_USB_KEEP_AWAKE: {
+			if (buffer == NULL || bufferSize != sizeof(usb_keep_awake_args))
+				return B_BAD_VALUE;
+			usb_keep_awake_args *args = (usb_keep_awake_args *)buffer;
+			BReference<Object> object(gUSBStack->GetObject(args->device),
+				true);
+			if (!object.IsSet() || (object->Type() & USB_OBJECT_DEVICE) == 0)
+				return B_BAD_VALUE;
+			Device *device = (Device *)object.Get();
+			return device->GetBusManager()->SetKeepAwake(device,
+				args->keep_awake);
+		}
+
+		case B_USB_GET_DEVICE_SPEED: {
+			if (buffer == NULL || bufferSize != sizeof(usb_device_speed_args))
+				return B_BAD_VALUE;
+			usb_device_speed_args *args = (usb_device_speed_args *)buffer;
+			BReference<Object> object(gUSBStack->GetObject(args->device),
+				true);
+			if (!object.IsSet() || (object->Type() & USB_OBJECT_DEVICE) == 0)
+				return B_BAD_VALUE;
+			static_assert((int)B_USB_DEVICE_SPEED_HIGH == (int)USB_SPEED_HIGHSPEED
+				&& (int)B_USB_DEVICE_SPEED_SUPER_PLUS
+					== (int)USB_SPEED_SUPERSPEEDPLUS,
+				"usb_speed and B_USB_DEVICE_SPEED_* differ");
+			args->speed = ((Device *)object.Get())->Speed();
+			return B_OK;
+		}
 	}
 
 	return B_DEV_INVALID_IOCTL;

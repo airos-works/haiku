@@ -1,0 +1,142 @@
+From 303a1776e3c7484484e5d4c3023ab236bdd8cb47 Mon Sep 17 00:00:00 2001
+From: air/OS <jmgasper@gmail.com>
+Date: Sat, 10 Oct 2026 09:19:40 +1100
+Subject: [PATCH] sunxi: U-Boot proper chainloaded by the vendor U-Boot
+ (air/OS)
+
+SUNXI_CHAINLOAD builds U-Boot proper with an arm64 Image header, so that
+Radxa's BSP U-Boot 2018 can start it with booti, and takes the DRAM size
+from the memory nodes of the device tree the earlier boot loader passes,
+as there is no SPL header. The Cubie A7S device tree reserves the BSP
+TF-A (BL31) at 0x48000000 in that configuration.
+---
+ .../arm/dts/sun60i-a733-cubie-a7s-u-boot.dtsi | 19 +++++++
+ arch/arm/mach-sunxi/Kconfig                   | 15 ++++++
+ board/sunxi/board.c                           | 54 +++++++++++++++++--
+ 3 files changed, 85 insertions(+), 3 deletions(-)
+ create mode 100644 arch/arm/dts/sun60i-a733-cubie-a7s-u-boot.dtsi
+
+diff --git a/arch/arm/dts/sun60i-a733-cubie-a7s-u-boot.dtsi b/arch/arm/dts/sun60i-a733-cubie-a7s-u-boot.dtsi
+new file mode 100644
+index 00000000..48b58eba
+--- /dev/null
++++ b/arch/arm/dts/sun60i-a733-cubie-a7s-u-boot.dtsi
+@@ -0,0 +1,19 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++
++#include "sunxi-u-boot.dtsi"
++
++#ifdef CONFIG_SUNXI_CHAINLOAD
++/ {
++	reserved-memory {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		/* the TF-A (BL31) of the vendor boot chain */
++		bl31@48000000 {
++			reg = <0x0 0x48000000 0x0 0x1000000>;
++			no-map;
++		};
++	};
++};
++#endif
+diff --git a/arch/arm/mach-sunxi/Kconfig b/arch/arm/mach-sunxi/Kconfig
+index d090c1fa..d9330b17 100644
+--- a/arch/arm/mach-sunxi/Kconfig
++++ b/arch/arm/mach-sunxi/Kconfig
+@@ -1,5 +1,20 @@
+ if ARCH_SUNXI
+ 
++config SUNXI_CHAINLOAD
++	bool "U-Boot proper started by an earlier U-Boot through booti"
++	depends on ARM64
++	select LINUX_KERNEL_IMAGE_HEADER
++	select SAVE_PREV_BL_FDT_ADDR
++	help
++	  Build U-Boot proper as an arm64 kernel Image, so that the boot
++	  loader of a vendor boot chain can start it like Linux. The DRAM
++	  size then comes from the memory node of the device tree that the
++	  earlier boot loader passes, as there is no SPL header to take it
++	  from. Load it at CONFIG_TEXT_BASE.
++
++config LNX_KRNL_IMG_TEXT_OFFSET_BASE
++	default TEXT_BASE if SUNXI_CHAINLOAD
++
+ config IDENT_STRING
+ 	default " Allwinner Technology"
+ 
+diff --git a/board/sunxi/board.c b/board/sunxi/board.c
+index ac99bf71..77a31d96 100644
+--- a/board/sunxi/board.c
++++ b/board/sunxi/board.c
+@@ -273,15 +273,63 @@ static const char *get_spl_dt_name(void)
+ 	return NULL;
+ }
+ 
++#if CONFIG_IS_ENABLED(SUNXI_CHAINLOAD)
++bool is_addr_accessible(phys_addr_t addr);
++
++/*
++ * The size of the DRAM in the memory nodes of the device tree that the
++ * earlier boot loader passed in x0, or 0.
++ */
++static phys_size_t chainload_ram_size(void)
++{
++	const void *fdt = (const void *)(uintptr_t)get_prev_bl_fdt_addr();
++	phys_size_t total = 0;
++	int node, address_cells, size_cells;
++
++	if (!fdt || !is_addr_accessible((phys_addr_t)(uintptr_t)fdt)
++	    || fdt_check_header(fdt) != 0)
++		return 0;
++
++	address_cells = fdt_address_cells(fdt, 0);
++	size_cells = fdt_size_cells(fdt, 0);
++	for (node = fdt_node_offset_by_prop_value(fdt, -1, "device_type",
++			"memory", sizeof("memory")); node >= 0;
++		node = fdt_node_offset_by_prop_value(fdt, node, "device_type",
++			"memory", sizeof("memory"))) {
++		const fdt32_t *reg;
++		int length, i;
++
++		reg = fdt_getprop(fdt, node, "reg", &length);
++		if (!reg)
++			continue;
++		length /= sizeof(fdt32_t);
++		for (i = 0; i + address_cells + size_cells <= length;
++				i += address_cells + size_cells) {
++			total += fdt_read_number(reg + i + address_cells,
++				size_cells);
++		}
++	}
++
++	return total;
++}
++#else
++static phys_size_t chainload_ram_size(void)
++{
++	return 0;
++}
++#endif
++
+ int dram_init(void)
+ {
+ 	struct boot_file_head *spl = get_spl_header(SPL_DRAM_HEADER_VERSION);
+ 
+-	if (spl == INVALID_SPL_HEADER)
++	if (spl != INVALID_SPL_HEADER)
++		gd->ram_size = (phys_addr_t)spl->dram_size << 20;
++	else
++		gd->ram_size = chainload_ram_size();
++	if (gd->ram_size == 0)
+ 		gd->ram_size = get_ram_size((long *)PHYS_SDRAM_0,
+ 					    PHYS_SDRAM_0_SIZE);
+-	else
+-		gd->ram_size = (phys_addr_t)spl->dram_size << 20;
+ 
+ 	if (gd->ram_size > CONFIG_SUNXI_DRAM_MAX_SIZE)
+ 		gd->ram_size = CONFIG_SUNXI_DRAM_MAX_SIZE;
+-- 
+2.43.0
+

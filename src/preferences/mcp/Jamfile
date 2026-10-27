@@ -1,0 +1,10 @@
+SubDir HAIKU_TOP src preferences mcp ;
+
+UsePrivateHeaders shared ;
+
+Application MCP : MCP.cpp
+	: be localestub [ TargetLibstdc++ ]
+	: MCP.rdef
+;
+
+DoCatalogs MCP : x-vnd.Haiku-MCP : MCP.cpp ;

@@ -1,0 +1,66 @@
+SubDir HAIKU_TOP tools cubie-a7s ;
+
+UsePrivateHeaders [ FDirName graphics sunxi_display ] ;
+UsePrivateHeaders [ FDirName graphics powervr ] ;
+
+# lab programs for the Radxa Cubie A7S port
+SimpleTest cubie_reg : reg.cpp ;
+# hub-class port requests through a hub (hub port power, status)
+SimpleTest hubport : hubport.cpp : be device ;
+SimpleTest pvrinfo : pvrinfo.cpp ;
+# app_server's copy of the screen against the screen (direct presents)
+SimpleTest screencheck : screencheck.cpp ;
+
+# a multi_audio (hmulti) driver driven directly: a tone out, the input's
+# level, the sample rates the device really runs at (USB sound cards)
+UsePrivateHeaders audio ;
+SimpleTest cubie_audio_test : audio_test.cpp ;
+
+# the powervr driver's DRM interface without Mesa: its pvr_drm.h, with the
+# few Linux headers it needs from pvr_uapi/
+ObjectSysHdrs [ FGristFiles pvrtest$(SUFOBJ) ] :
+	[ FDirName $(SUBDIR) pvr_uapi ]
+	[ FDirName $(HAIKU_TOP) src add-ons kernel drivers graphics powervr
+		upstream ] ;
+SimpleTest pvrtest : pvrtest.cpp ;
+
+# the Pi lab's file fetch: a file from a TCP port of the lab host
+# (tools/rpi4/push.py serves it)
+SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) tools rpi4 ] ;
+SimpleTest cubie_fetch : fetch.cpp : network ;
+# and the other direction, for the Wi-Fi upload tests
+SimpleTest cubie_send : send.cpp : network ;
+
+# the sunxi_cedar media add-on's decoder on its own, for the video engine's
+# tests: per-picture hashes against FFmpeg's (evidence/video/proto/vectors)
+UsePrivateHeaders drivers shared ;
+SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src add-ons media plugins
+	sunxi_cedar ] ;
+SubDirHdrs [ FDirName $(HAIKU_TOP) src add-ons media plugins sunxi_cedar ] ;
+SimpleTest cedar_decode :
+	cedar_decode.cpp
+	bits.c
+	h264_parse.c
+	hevc_parse.c
+	CedarDecoder.cpp
+	CedarEngine.cpp
+	VeDevice.cpp
+	: be shared [ TargetLibstdc++ ] [ TargetLibsupc++ ]
+;
+
+# a file's first video track through the Media Kit, as MediaPlayer decodes it
+SimpleTest media_probe : media_probe.cpp : be media [ TargetLibsupc++ ] ;
+
+# how busy the processors and some teams are, for the decoders' cost
+SimpleTest cpu_usage : cpu_usage.cpp ;
+
+# a fixed integer workload on N threads, for the cost of thermal throttling
+SimpleTest cubie_cpubench : cpubench.cpp ;
+
+# the AIC8800 Wi-Fi/Bluetooth module's firmware loader from userland, with
+# the driver's loader core
+local aicHost = [ FDirName $(HAIKU_TOP) src add-ons kernel drivers network
+	wlan aic8800wifi host ] ;
+SEARCH_SOURCE += $(aicHost) ;
+SubDirHdrs $(aicHost) ;
+SimpleTest aicload : aicload.cpp aic_loader.c : libdevice.so ;

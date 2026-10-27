@@ -1,0 +1,19 @@
+SubDir HAIKU_TOP src add-ons media plugins sunxi_cedar ;
+
+UsePrivateHeaders drivers media shared ;
+
+local architectureObject ;
+for architectureObject in [ MultiArchSubDirSetup ] {
+	on $(architectureObject) {
+		Addon [ MultiArchDefaultGristFiles sunxi_cedar ] :
+			bits.c
+			h264_parse.c
+			hevc_parse.c
+			CedarDecoder.cpp
+			CedarEngine.cpp
+			CedarPlugin.cpp
+			VeDevice.cpp
+			: be media [ TargetLibsupc++ ] [ TargetLibstdc++ ]
+		;
+	}
+}

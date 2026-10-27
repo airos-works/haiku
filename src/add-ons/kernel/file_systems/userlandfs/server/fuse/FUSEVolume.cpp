@@ -443,15 +443,16 @@ struct FUSEVolume::LockIterator {
 			// node is locked -- we need to unlock the volume and wait for
 			// the lock
 			volume->fLock.Unlock();
-			status_t error = volume->fLockManager.GenericLock(
+			// GenericLock() returns whether it got the lock, not a status
+			bool locked = volume->fLockManager.GenericLock(
 				nextNode == firstNode && writeLock, nextNode);
 			volume->fLock.Lock();
 
 			*_volumeUnlocked = false;
 
-			if (error != B_OK) {
+			if (!locked) {
 				volume->_PutNode(nextNode);
-				return error;
+				return B_ERROR;
 			}
 		}
 

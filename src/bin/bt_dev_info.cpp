@@ -14,7 +14,19 @@ static void
 DumpInfo(LocalDevice* device)
 {
 	printf("[LocalDevice] %s\t%s\n", (device->GetFriendlyName()).String(),
-		bdaddrUtils::ToString(device->GetBluetoothAddress()));
+		bdaddrUtils::ToString(device->GetBluetoothAddress()).String());
+
+	// what the controller said about itself when the server opened it
+	static const char* const kProperties[] = {
+		"hci_version", "hci_revision", "lmp_version", "lmp_subversion",
+		"manufacturer", "acl_mtu", "acl_max_pkt"
+	};
+	for (size_t i = 0; i < sizeof(kProperties) / sizeof(kProperties[0]); i++) {
+		uint32 value;
+		if (device->GetProperty(kProperties[i], &value) == B_OK)
+			printf("\t%s: %" B_PRIu32 " (%#" B_PRIx32 ")\n", kProperties[i],
+				value, value);
+	}
 
 	BString classString;
 	DeviceClass cod = device->GetDeviceClass();
@@ -53,7 +65,7 @@ main(int argc, char *argv[])
 		// show all devices
 		LocalDevice* ld = NULL;
 
-		printf("Listing %ld Bluetooth Local Devices ...\n",
+		printf("Listing %" B_PRIu32 " Bluetooth Local Devices ...\n",
 			LocalDevice::GetLocalDeviceCount());
 		for (uint32 index = 0 ; index < LocalDevice::GetLocalDeviceCount() ; index++) {
 

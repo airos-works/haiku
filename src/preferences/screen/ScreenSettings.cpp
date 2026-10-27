@@ -11,12 +11,25 @@
 
 #include "ScreenSettings.h"
 
+#include <math.h>
+
 #include <File.h>
 #include <FindDirectory.h>
 #include <Path.h>
 
 
 static const char* kSettingsFileName = "Screen_data";
+
+
+/*!	Whether a coordinate read from the file can be part of a window's
+	position: a damaged file (data that never reached the disk before a
+	reboot) gave 7.2e22, and the window could not be moved back from there.
+*/
+static bool
+is_position(float coordinate)
+{
+	return isfinite(coordinate) && fabsf(coordinate) < 100000;
+}
 
 
 ScreenSettings::ScreenSettings()
@@ -34,13 +47,17 @@ ScreenSettings::ScreenSettings()
 			BRect frame;
 			if (size >= (off_t)sizeof(BRect)
 				&& file.Read(&frame, sizeof(BRect)) == sizeof(BRect)
-				&& frame.IsValid()) {
+				&& frame.IsValid() && is_position(frame.left)
+				&& is_position(frame.top) && is_position(frame.right)
+				&& is_position(frame.bottom)) {
 				// the complete frame, as written by newer versions
 				fWindowFrame = frame;
 				return;
 			}
 			file.Seek(0, SEEK_SET);
-			file.Read(&offset, sizeof(BPoint));
+			if (file.Read(&offset, sizeof(BPoint)) != sizeof(BPoint)
+				|| !is_position(offset.x) || !is_position(offset.y))
+				offset = BPoint();
 		}
 	}
 

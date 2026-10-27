@@ -1,0 +1,519 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+// Copyright (C) 2025 Arm Ltd.
+
+/dts-v1/;
+
+#include "sun60i-a733.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	model = "Radxa A7S";
+	compatible = "radxa,cubie-a7s", "allwinner,sun60i-a733";
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	reg_vcc5v: vcc5v {
+		/* board wide 5V supply from the USB-C connector */
+		compatible = "regulator-fixed";
+		regulator-name = "vcc-5v";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		regulator-always-on;
+	};
+
+	reg_usb_vbus: vbus {
+		compatible = "regulator-fixed";
+		regulator-name = "usb-vbus";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		vin-supply = <&reg_vcc5v>;
+		gpio = <&r_pio 0 2 GPIO_ACTIVE_HIGH>;	/* PL2 */
+		enable-active-high;
+	};
+
+	reg_usb_host_en: usb-host-en {
+		compatible = "regulator-fixed";
+		regulator-name = "usb-host-en";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		vin-supply = <&reg_vcc5v>;
+		gpio = <&r_pio 1 5 GPIO_ACTIVE_HIGH>;	/* PM5 */
+		enable-active-high;
+		regulator-always-on;
+		regulator-boot-on;
+	};
+};
+
+&uart0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart0_pb_pins>;
+	status = "okay";
+};
+
+&mmc0 {
+	bootph-all;
+	bus-width = <4>;
+	status = "okay";
+};
+
+&mmc2 {
+	bootph-all;
+	bus-width = <8>;
+	cap-mmc-hw-reset;
+	mmc-ddr-1_8v;
+	mmc-hs200-1_8v;
+	non-removable;
+	vmmc-supply = <&reg_cldo5>;
+	vqmmc-supply = <&reg_swout2>;
+	status = "okay";
+};
+
+&usb_otg {
+	dr_mode = "peripheral";
+	status = "okay";
+};
+
+&usbphy {
+	usb0_vbus-supply = <&reg_vcc5v>;
+	usb1_vbus-supply = <&reg_usb_vbus>;
+	status = "okay";
+};
+
+&ehci0 {
+	status = "okay";
+};
+
+&ohci0 {
+	status = "okay";
+};
+
+&ehci1 {
+	status = "okay";
+};
+
+&usb3 {
+	status = "okay";
+};
+
+&ohci1 {
+	status = "okay";
+};
+
+&gmac0 {
+	phy-mode = "rgmii-id";
+	phy-handle = <&ext_rgmii1_phy>;
+	phy-supply = <&reg_swout1>;
+
+	tx-internal-delay-ps = <1200>;
+	rx-internal-delay-ps = <1000>;
+
+	status = "okay";
+};
+
+&mdio0 {
+	ext_rgmii1_phy: ethernet-phy@1 {
+		compatible = "ethernet-phy-ieee802.3-c22";
+		reg = <1>;
+		reset-gpios = <&pio 7 16 GPIO_ACTIVE_LOW>; /* PH16 */
+		reset-assert-us = <10000>;
+		reset-deassert-us = <150000>;
+	};
+};
+
+&i2c0 {
+	status = "okay";
+	eeprom: eeprom@50 {
+		compatible = "atmel,24c16a", "i2c-eeprom";
+		reg = <0x50>;
+	};
+};
+
+&r_i2c0 {
+	status = "okay";
+
+	axp318w: pmic@36 {
+		compatible = "x-powers,axp318w";
+		reg = <0x36>;
+		#interrupt-cells = <1>;
+		interrupt-controller;
+		interrupt-parent = <&nmi_intc>;
+		interrupts = <0 IRQ_TYPE_LEVEL_LOW>;
+		status = "okay";
+
+		vin1-supply = <&reg_vcc5v>;
+		vin2-supply = <&reg_vcc5v>;
+		vin3-supply = <&reg_vcc5v>;
+
+		regulators {
+			reg_dcdc1: dcdc1 {
+				regulator-always-on;
+				regulator-min-microvolt = <1000000>;
+				regulator-max-microvolt = <3400000>;
+				regulator-name = "vdd-3v3";
+			};
+
+			reg_swout1: swout1 {
+				regulator-always-on;
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+				regulator-name = "vdd-swout1";
+			};
+
+			reg_swout2: swout2 {
+				regulator-always-on;
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+				regulator-name = "vdd-swout2";
+			};
+
+			aldo1 {
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-name = "vcc-mipi-dsi";
+			};
+
+			reg_bldo1: bldo1 {
+				regulator-always-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-name = "vcc-pe";
+			};
+
+			reg_bldo2: bldo2 {
+				regulator-always-on;
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-name = "vcc-pd";
+			};
+
+			/* Supplies the SYSFB */
+			reg_dcdc2_323: dcdc2 {
+				regulator-always-on;
+				regulator-min-microvolt = <800000>;
+				regulator-max-microvolt = <800000>;
+				regulator-name = "vdd-sys";
+			};
+
+			/* Supplies the "big" cluster (2 GHz cores); the range of
+			   the BSP's operating points (air/OS) */
+			reg_dcdc3_323: dcdc3 {
+				regulator-always-on;
+				regulator-min-microvolt = <800000>;
+				regulator-max-microvolt = <1050000>;
+				regulator-name = "vdd-cpub";
+			};
+
+			/* DCDC4 is polyphased with DCDC1 */
+
+			/* Supplies the "small" cluster (1.8 GHz cores) and the DSU;
+			   the range of the BSP's operating points (air/OS) */
+			reg_dcdc5_323: dcdc5 {
+				regulator-always-on;
+				regulator-min-microvolt = <800000>;
+				regulator-max-microvolt = <1050000>;
+				regulator-name = "vdd-cpul";
+			};
+
+			reg_cldo1: cldo1 {
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-name = "vcc-pm";
+			};
+
+			reg_cldo2: cldo2 {
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-name = "vcc-hdmi";
+			};
+
+			reg_cldo3: cldo3 {
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-name = "vcc-dram";
+			};
+
+			reg_cldo4: cldo4 {
+				/* not connected */
+			};
+
+			reg_cldo5: cldo5 {
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-name = "vcc-pc";
+			};
+		};
+	};
+};
+
+&spi0  {
+	status = "okay";
+
+	flash@0 {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <20000000>;
+	};
+};
+
+&ufs {
+	bootph-all;
+	status = "okay";
+};
+
+&serdes {
+	status = "okay";
+	combophy0: combo-phy0@6c01000 {
+		lane_invert = <0 0 0 0>;
+		lane_remap = <2 3 0 1>;
+	};
+};
+
+&pcie_rc {
+	status = "okay";
+	pcie1v8-supply = <&reg_bldo1>;
+	pcie3v3-supply = <&reg_dcdc1>;
+};
+
+/* air/OS additions */
+
+/ {
+	aliases {
+		ethernet0 = &gmac0;
+		mmc0 = &mmc0;
+		mmc1 = &mmc2;
+	};
+
+	/* The AIC8800 Wi-Fi/Bluetooth module (USB, behind the CH334F hub):
+	   power and chip enable, always on as in Radxa's BSP device tree. */
+	reg_wifi_power: regulator-wifi-power {
+		compatible = "regulator-fixed";
+		regulator-name = "wifi-power-en";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&r_pio 1 0 GPIO_ACTIVE_HIGH>;	/* PM0 */
+		enable-active-high;
+		regulator-always-on;
+	};
+
+	reg_wifi_chip: regulator-wifi-chip {
+		compatible = "regulator-fixed";
+		regulator-name = "wifi-chip-en";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		gpio = <&r_pio 1 1 GPIO_ACTIVE_HIGH>;	/* PM1 */
+		enable-active-high;
+		regulator-always-on;
+		vin-supply = <&reg_wifi_power>;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/* the TF-A (BL31) of Radxa's boot chains, where its own Linux
+		   device tree puts it */
+		bl31@48000000 {
+			reg = <0x0 0x48000000 0x0 0x1000000>;
+			no-map;
+		};
+	};
+};
+
+/ {
+	soc {
+		/* PowerVR BXM-4-64 MC1 (BVNC 36.56.104.183), as Radxa's BSP device
+		   tree describes it; the powervr driver handles its clocks and power
+		   domains (CCU 0xb20/0xb24, PCK-600 domains 5 and 6) itself. */
+		gpu: gpu@1800000 {
+			compatible = "allwinner,sun60i-a733-gpu", "img,img-bxm-4-64",
+				"img,img-rogue";
+			reg = <0x01800000 0x90000>;
+			interrupts = <GIC_SPI 63 IRQ_TYPE_LEVEL_HIGH>;
+			status = "okay";
+		};
+
+		/* Display engine 3.5 with its TCONs and the DisplayPort transmitter;
+		   the sunxi_display driver drives the whole chain. The interrupt is
+		   TCON-TV1's (vertical blank), the TCON the DisplayPort output is
+		   fed from. */
+		display-engine@5000000 {
+			compatible = "allwinner,sun60i-a733-display-engine";
+			reg = <0x05000000 0x400000>;
+			interrupts = <GIC_SPI 58 IRQ_TYPE_LEVEL_HIGH>;
+			status = "okay";
+		};
+
+		/* The video decoder (Cedar VE: H.264, H.265, VP9), its 8 KiB as the
+		   A733 user manual's memory map gives them; Radxa's BSP tree spans
+		   0x3000 and so the encoder's page as well. The sunxi_ve driver
+		   handles its clock, reset, power domain 2 and IOMMU bypass itself
+		   (CCU 0xa88/0xa8c, PCK-600 domain 2, IOMMU1 masters 0 and 1). */
+		video-codec@1c0e000 {
+			compatible = "allwinner,sun60i-a733-video-engine";
+			reg = <0x01c0e000 0x2000>;
+			interrupts = <GIC_SPI 49 IRQ_TYPE_LEVEL_HIGH>;
+			status = "okay";
+		};
+	};
+};
+
+/* The cores' top speeds, as Radxa's BSP runs them (cpufreq: 1794 MHz for the
+   Cortex-A55s, 2002 MHz for the Cortex-A76s); About and sysinfo show them.
+   Each cluster's PLL, operating points (sun60i-a733-opp-26m.dtsi) and rail,
+   for the sunxi_thermal driver's frequency scaling. */
+&cpu0 {
+	clock-frequency = <1794000000>;
+	clocks = <&cpupll 1>;
+	operating-points-v2 = <&cpul_opp>;
+	cpu-supply = <&reg_dcdc5_323>;
+};
+&cpu1 {
+	clock-frequency = <1794000000>;
+	clocks = <&cpupll 1>;
+	operating-points-v2 = <&cpul_opp>;
+	cpu-supply = <&reg_dcdc5_323>;
+};
+&cpu2 {
+	clock-frequency = <1794000000>;
+	clocks = <&cpupll 1>;
+	operating-points-v2 = <&cpul_opp>;
+	cpu-supply = <&reg_dcdc5_323>;
+};
+&cpu3 {
+	clock-frequency = <1794000000>;
+	clocks = <&cpupll 1>;
+	operating-points-v2 = <&cpul_opp>;
+	cpu-supply = <&reg_dcdc5_323>;
+};
+&cpu4 {
+	clock-frequency = <1794000000>;
+	clocks = <&cpupll 1>;
+	operating-points-v2 = <&cpul_opp>;
+	cpu-supply = <&reg_dcdc5_323>;
+};
+&cpu5 {
+	clock-frequency = <1794000000>;
+	clocks = <&cpupll 1>;
+	operating-points-v2 = <&cpul_opp>;
+	cpu-supply = <&reg_dcdc5_323>;
+};
+&cpu6 {
+	clock-frequency = <2002000000>;
+	clocks = <&cpupll 2>;
+	operating-points-v2 = <&cpub_opp>;
+	cpu-supply = <&reg_dcdc3_323>;
+};
+&cpu7 {
+	clock-frequency = <2002000000>;
+	clocks = <&cpupll 2>;
+	operating-points-v2 = <&cpub_opp>;
+	cpu-supply = <&reg_dcdc3_323>;
+};
+/* the U-Boot tree calls the two big cores Cortex-A55s too */
+&cpu6 { compatible = "arm,cortex-a76"; };
+&cpu7 { compatible = "arm,cortex-a76"; };
+
+#include "sun60i-a733-opp-26m.dtsi"
+
+/* Thermal management (sunxi_thermal): the thermal sensor controller with
+   its factory calibration, the CPU PLLs, and the zones of Radxa's BSP
+   device tree with air/OS trips. No fan is fitted: at 80 C the driver
+   brings the cores' top speed down a step at a time (back up below 76 C),
+   at 90 C (the BSP's "hot" passive trips) everything goes to the lowest
+   speed, at 96 C the system shuts down; the BSP's critical 110 C is above
+   the 100 C or so at which the board lost power in the lab. */
+/ {
+	/* the A733's crystal (DCXO): 26 MHz on this board */
+	dcxo: dcxo-clk {
+		#clock-cells = <0>;
+		compatible = "fixed-clock";
+		clock-frequency = <26000000>;
+		clock-output-names = "dcxo";
+	};
+
+	soc {
+		/* the eFuse (SID); cells at offsets into the block, whose
+		   eFuse words start at 0x200 */
+		sid: efuse@3006000 {
+			compatible = "allwinner,sun60i-a733-sid";
+			reg = <0x03006000 0x1000>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			ths_calibration: thermal-sensor-calibration@244 {
+				reg = <0x244 0xc>;
+			};
+
+			cpu_speed_grade: cpu-speed-grade@24c {
+				reg = <0x24c 0x4>;
+			};
+		};
+
+		ths: thermal-sensor@2522000 {
+			compatible = "allwinner,sun60i-a733-ths";
+			reg = <0x02522000 0x500>;
+			nvmem-cells = <&ths_calibration>;
+			nvmem-cell-names = "calibration";
+			#thermal-sensor-cells = <1>;
+		};
+
+		/* the cores' PLLs: 1 the little cluster, 2 the big one, 3 the
+		   DSU (the BSP's numbering) */
+		cpupll: clock-controller@8870000 {
+			compatible = "allwinner,sun60i-a733-cpupll";
+			reg = <0x08870000 0x4000>;
+			clocks = <&dcxo>;
+			#clock-cells = <1>;
+		};
+	};
+
+	/* the DynamIQ Shared Unit, on the little cluster's rail */
+	dsu: dsu {
+		compatible = "allwinner,sun60i-a733-dsu";
+		clocks = <&cpupll 3>;
+		operating-points-v2 = <&dsu_opp>;
+		dsu-supply = <&reg_dcdc5_323>;
+	};
+
+	thermal-zones {
+#define CUBIE_ZONE(zone, sensor_id) \
+		zone##-thermal { \
+			polling-delay-passive = <240>; \
+			polling-delay = <240>; \
+			thermal-sensors = <&ths sensor_id>; \
+			trips { \
+				zone##-alert { \
+					temperature = <80000>; \
+					hysteresis = <4000>; \
+					type = "passive"; \
+				}; \
+				zone##-hot { \
+					temperature = <90000>; \
+					hysteresis = <2000>; \
+					type = "hot"; \
+				}; \
+				zone##-crit { \
+					temperature = <96000>; \
+					hysteresis = <0>; \
+					type = "critical"; \
+				}; \
+			}; \
+		}
+		/* the sensors as the BSP's zones number them */
+		CUBIE_ZONE(cpub, 0);
+		CUBIE_ZONE(ddr, 1);
+		CUBIE_ZONE(npu, 2);
+		CUBIE_ZONE(cpul, 3);
+		CUBIE_ZONE(gpu, 4);
+	};
+};

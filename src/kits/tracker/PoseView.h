@@ -78,6 +78,7 @@ const uint32 kIconMode = 'Ticn';
 const uint32 kListMode = 'Tlst';
 
 const uint32 kCheckTypeahead = 'Tcty';
+const uint32 kQuickLookUpdate = 'Tqlu';
 
 const uint32 kMsgMouseDragged = 'Mdrg';
 const uint32 kMsgMouseLongDown = 'Mold';
@@ -286,6 +287,13 @@ public:
 	virtual bool CanOpenParent();
 
 	virtual void OpenSelection(BPose* clicked_pose = NULL, int32* index = NULL);
+	void QuickLook();
+		// shows the Quick Look panel for the selection, or hides it
+	void HideQuickLook();
+	void QuickLookSelectionChanged();
+		// the panel follows the selection while it is up
+	bool _SpaceIsQuickLook();
+	void _SendQuickLook(uint32 what, bool update = false);
 	void OpenSelectionUsing(BPose* clicked_pose = NULL, int32* index = NULL);
 		// launches the open with window
 	virtual void MoveSelectionTo(Model*, BPoint, BContainerWindow*, BPoint, uint32);
@@ -760,6 +768,8 @@ private:
 	const BPose* fSelectionPivotPose;
 	const BPose* fRealPivotPose;
 	BMessageRunner* fKeyRunner;
+	BMessageRunner* fQuickLookRunner;
+	bool fQuickLookShowing;
 	BMessage* fDragMessage;
 	BStringList* fCachedTypesList;
 

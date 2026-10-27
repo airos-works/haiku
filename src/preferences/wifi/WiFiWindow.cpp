@@ -12,10 +12,12 @@
 #include <Button.h>
 #include <Catalog.h>
 #include <CheckBox.h>
+#include <IconView.h>
 #include <LayoutBuilder.h>
 #include <MenuField.h>
 #include <MenuItem.h>
 #include <PopUpMenu.h>
+#include <Resources.h>
 #include <Roster.h>
 #include <ScrollView.h>
 #include <SeparatorView.h>
@@ -73,6 +75,13 @@ WiFiWindow::WiFiWindow()
 	fRequestedAuthentication(B_NETWORK_AUTHENTICATION_NONE),
 	fRequestedTime(0)
 {
+	IconView* icon = new IconView(B_LARGE_ICON);
+	size_t iconSize;
+	const uint8* iconData = (const uint8*)be_app->AppResources()->LoadResource(
+		B_VECTOR_ICON_TYPE, "BEOS:ICON", &iconSize);
+	if (iconData != NULL)
+		icon->SetIcon(iconData, iconSize);
+
 	fPowerCheck = new BCheckBox("power", B_TRANSLATE("Wi-Fi"),
 		new BMessage(kMsgPower));
 	BFont bold(be_bold_font);
@@ -172,6 +181,7 @@ WiFiWindow::WiFiWindow()
 	BLayoutBuilder::Group<>(this, B_VERTICAL, B_USE_DEFAULT_SPACING)
 		.SetInsets(B_USE_WINDOW_SPACING)
 		.AddGroup(B_HORIZONTAL)
+			.Add(icon)
 			.Add(fPowerCheck)
 			.AddGlue()
 			.Add(fDeviceField)

@@ -15,6 +15,71 @@
 #include "Settings.h"
 
 
+// A buffer is 48 ms at most: this long without one, the transfers stopped.
+static const bigtime_t kBufferExchangeTimeout = 1000000;
+
+
+/*!	The device's product string, as the name of its audio device: "USB Audio"
+	tells a webcam's microphone from a DAC by nothing.
+*/
+static void
+get_product_name(usb_device device, uint8 index, char* name, size_t size)
+{
+	strlcpy(name, "USB Audio", size);
+	if (index == 0)
+		return;
+
+	uint8 buffer[256];
+	size_t length = 0;
+	if (gUSBModule->get_descriptor(device, USB_DESCRIPTOR_STRING, 0, 0, buffer,
+			sizeof(buffer), &length) != B_OK || length < 4) {
+		return;
+	}
+	uint16 language = buffer[2] | buffer[3] << 8;
+	if (gUSBModule->get_descriptor(device, USB_DESCRIPTOR_STRING, index,
+			language, buffer, sizeof(buffer), &length) != B_OK || length < 4) {
+		return;
+	}
+	length = min_c(length, (size_t)buffer[0]);
+
+	// UTF-16 to UTF-8
+	size_t used = 0;
+	for (size_t i = 2; i + 1 < length; i += 2) {
+		uint16 c = buffer[i] | buffer[i + 1] << 8;
+		char utf8[3];
+		size_t bytes;
+		if (c >= 0xd800 && c < 0xe000) {
+			// (a surrogate: not in a device name)
+			utf8[0] = '?';
+			bytes = 1;
+		} else if (c < 0x80) {
+			utf8[0] = c;
+			bytes = 1;
+		} else if (c < 0x800) {
+			utf8[0] = 0xc0 | c >> 6;
+			utf8[1] = 0x80 | (c & 0x3f);
+			bytes = 2;
+		} else {
+			utf8[0] = 0xe0 | c >> 12;
+			utf8[1] = 0x80 | ((c >> 6) & 0x3f);
+			utf8[2] = 0x80 | (c & 0x3f);
+			bytes = 3;
+		}
+		if (c == 0 || used + bytes >= size)
+			break;
+		memcpy(name + used, utf8, bytes);
+		used += bytes;
+	}
+	while (used > 0 && name[used - 1] == ' ')
+		used--;
+	if (used == 0) {
+		strlcpy(name, "USB Audio", size);
+		return;
+	}
+	name[used] = '\0';
+}
+
+
 Device::Device(usb_device device)
 	:
 	fStatus(B_ERROR),
@@ -25,6 +90,8 @@ Device::Device(usb_device device)
 	fAudioControl(this),
 	fBuffersReadySem(-1)
 {
+	strlcpy(fName, "USB Audio", sizeof(fName));
+
 	const usb_device_descriptor* deviceDescriptor
 		= gUSBModule->get_device_descriptor(device);
 
@@ -36,6 +103,7 @@ Device::Device(usb_device device)
 	fVendorID = deviceDescriptor->vendor_id;
 	fProductID = deviceDescriptor->product_id;
 	fUSBVersion = deviceDescriptor->usb_version;
+	get_product_name(device, deviceDescriptor->product, fName, sizeof(fName));
 
 	fBuffersReadySem = create_sem(0, DRIVER_NAME "_buffers_ready");
 	if (fBuffersReadySem < B_OK) {
@@ -169,7 +237,7 @@ Device::Control(uint32 op, void* buffer, size_t length)
 		case B_MULTI_GET_ENABLED_CHANNELS:
 		{
 			multi_channel_enable enable;
-			uint32 enable_bits;
+			uint32 enable_bits = 0;
 			uchar* orig_enable_bits;
 
 			if (user_memcpy(&enable, buffer, sizeof(enable)) != B_OK
@@ -404,6 +472,20 @@ Device::Removed()
 
 	for (int i = 0; i < fStreams.Count(); i++)
 		fStreams[i]->OnRemove();
+
+	// a buffer exchange waiting for buffers that will never come
+	release_sem(fBuffersReadySem);
+}
+
+
+/*!	Before an unplugged device is deleted at its free: devfs disconnects
+	its users when it goes, while one may still write into its buffers.
+*/
+void
+Device::OrphanBuffers()
+{
+	for (int i = 0; i < fStreams.Count(); i++)
+		fStreams[i]->OrphanBuffers();
 }
 
 
@@ -411,47 +493,6 @@ status_t
 Device::SetupDevice(bool deviceReplugged)
 {
 	return B_OK;
-}
-
-
-status_t
-Device::CompareAndReattach(usb_device device)
-{
-	const usb_device_descriptor* deviceDescriptor
-		= gUSBModule->get_device_descriptor(device);
-
-	if (deviceDescriptor == NULL) {
-		TRACE(ERR, "Error of getting USB device descriptor.\n");
-		return B_ERROR;
-	}
-
-	if (deviceDescriptor->vendor_id != fVendorID
-		|| deviceDescriptor->product_id != fProductID)
-		// this certainly isn't the same device
-		return B_BAD_VALUE;
-
-	// this is the same device that was replugged - clear the removed state,
-	// re- setup the endpoints and transfers and open the device if it was
-	// previously opened
-	fDevice = device;
-	fRemoved = false;
-	status_t result = _SetupEndpoints();
-	if (result != B_OK) {
-		fRemoved = true;
-		return result;
-	}
-
-	// we need to setup hardware on device replug
-	result = SetupDevice(true);
-	if (result != B_OK)
-		return result;
-
-	if (fOpen) {
-		fOpen = false;
-		result = Open(fNonBlocking ? O_NONBLOCK : 0);
-	}
-
-	return result;
 }
 
 
@@ -466,7 +507,7 @@ Device::_MultiGetDescription(multi_description* multiDescription)
 	Description.interface_version = B_CURRENT_INTERFACE_VERSION;
 	Description.interface_minimum = B_CURRENT_INTERFACE_VERSION;
 
-	strlcpy(Description.friendly_name, "USB Audio",
+	strlcpy(Description.friendly_name, fName,
 		sizeof(Description.friendly_name));
 
 	strlcpy(Description.vendor_info, "S.Zharski",
@@ -694,17 +735,31 @@ Device::_MultiBufferExchange(multi_buffer_info* multiInfo)
 		return B_BAD_ADDRESS;
 	}
 
+	// An unplugged device fails at once. (The media node holds its buffer
+	// lock while it exchanges: waiting here for buffers that never come
+	// kept the mixer from ever being disconnected from it.)
+	if (fRemoved)
+		return B_DEV_NOT_READY;
+
 	for (int i = 0; i < fStreams.Count(); i++) {
 		if (!fStreams[i]->IsRunning())
 			fStreams[i]->Start();
 	}
 
 	status_t status = acquire_sem_etc(fBuffersReadySem, 1,
-		B_CAN_INTERRUPT, 0);
+		B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT, kBufferExchangeTimeout);
+	if (fRemoved)
+		return B_DEV_NOT_READY;
 	if (status == B_TIMED_OUT) {
-		TRACE(ERR, "Timeout during buffers exchange.\n");
+		// the transfers stopped: start them again with the next exchange
+		TRACE(ERR, "Timeout during buffers exchange: restarting the "
+			"streams.\n");
+		for (int i = 0; i < fStreams.Count(); i++)
+			fStreams[i]->Stop();
 		return status;
 	}
+	if (status != B_OK)
+		return status;
 
 	status = B_ERROR;
 	for (int i = 0; i < fStreams.Count(); i++) {
@@ -827,7 +882,8 @@ Device::_SetupEndpoints()
 	}
 
 	if (fAudioControl.InitCheck() == B_OK && fStreams.Count() > 0) {
-		TRACE(INF, "Found device %#06x:%#06x\n", fVendorID, fProductID);
+		TRACE(ERR, "Found device %#06x:%#06x \"%s\"\n", fVendorID, fProductID,
+			fName);
 
 		status_t status = gUSBModule->set_configuration(fDevice, config);
 		if (status != B_OK)

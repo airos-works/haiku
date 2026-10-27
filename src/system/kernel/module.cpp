@@ -1000,10 +1000,16 @@ nextModuleImage:
 		if (path.Append(dirent->d_name) != B_OK)
 			return B_BUFFER_OVERFLOW;
 
-		// find out if it's a directory or a file
+		// find out if it's a directory or a file; an entry that cannot be
+		// examined, such as a symbolic link to nothing, is skipped instead of
+		// ending the search - otherwise a single stale link in an add-on
+		// directory hides every module after it (USB disks plugged in after
+		// boot were never offered to usb_disk).
 		struct stat stat;
-		if (::stat(path.Path(), &stat) < 0)
-			return errno;
+		if (::stat(path.Path(), &stat) < 0) {
+			TRACE(("skipping %s: %s\n", path.Path(), strerror(errno)));
+			goto nextModuleImage;
+		}
 
 		iterator->current_module_path = strdup(path.Path());
 		if (iterator->current_module_path == NULL)
@@ -1019,8 +1025,11 @@ nextModuleImage:
 			goto nextModuleImage;
 		}
 
-		if (!S_ISREG(stat.st_mode))
-			return B_BAD_TYPE;
+		if (!S_ISREG(stat.st_mode)) {
+			free((char*)iterator->current_module_path);
+			iterator->current_module_path = NULL;
+			goto nextModuleImage;
+		}
 
 		TRACE(("open module at %s\n", path.Path()));
 

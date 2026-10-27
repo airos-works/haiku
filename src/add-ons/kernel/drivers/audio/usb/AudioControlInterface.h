@@ -87,6 +87,7 @@ public:
 	virtual					~_Terminal();
 
 			uint16			TerminalType() { return fTerminalType; }
+			uint8			ClockSourceID() { return fClockSourceId; }
 			bool			IsUSBIO();
 	virtual	const char*		Name();
 	static	const char*		_GetTerminalDescription(uint16 TerminalType);
@@ -224,7 +225,15 @@ public:
 								usb_audiocontrol_header_descriptor* Header);
 	virtual					~ClockSource();
 
+	virtual	const char*		Name() { return "Clock"; }
+			bool			CanSetFrequency()
+								{ return (fControls & 0x03) == 0x03; }
+			bool			CanReadValidity()
+								{ return (fControls & 0x0c) != 0; }
+
 protected:
+			uint8			fAttributes;
+			uint8			fControls;
 };
 
 
@@ -234,7 +243,16 @@ public:
 								usb_audiocontrol_header_descriptor* Header);
 	virtual					~ClockSelector();
 
+	virtual	const char*		Name() { return "Clock Selector"; }
+			uint8			InputPin(size_t index)
+								{ return index < (size_t)fInputPins.Count()
+									? fInputPins[index] : 0; }
+			bool			CanReadSelection()
+								{ return (fControls & 0x03) != 0; }
+
 protected:
+			Vector<uint8>	fInputPins;
+			uint8			fControls;
 };
 
 
@@ -244,7 +262,11 @@ public:
 								usb_audiocontrol_header_descriptor* Header);
 	virtual					~ClockMultiplier();
 
+	virtual	const char*		Name() { return "Clock Multiplier"; }
+			uint8			ClockSourceID() { return fClockSourceID; }
+
 protected:
+			uint8			fClockSourceID;
 };
 
 
@@ -293,6 +315,13 @@ public:
 			status_t		SetMix(multi_mix_value_info* Info);
 			status_t		ListMixControls(multi_mix_control_info* Info);
 
+			// USB Audio 2.0: the sampling rate is the clock's that drives a
+			// terminal
+			ClockSource*	FindClockSource(uint8 clockID);
+			status_t		GetClockRates(uint8 clockID,
+								Vector<uint32>& rates);
+			status_t		SetClockRate(uint8 clockID, uint32 rate);
+
 protected:
 			status_t		InitACHeader(size_t interface,
 								usb_audiocontrol_header_descriptor* Header);
@@ -332,6 +361,13 @@ protected:
 								const char* inputName, const char* name,
 								Vector<multi_mix_control>& Controls);
 			bool			_InitGainLimits(multi_mix_control& Control);
+			uint8			_GetCurRequest()
+								{ return fADCSpecification < 0x200
+									? (uint8)USB_AUDIO_GET_CUR
+									: (uint8)USB_AUDIO_V2_CUR; }
+			status_t		_ClassRequest(bool in, uint8 request,
+								uint16 value, uint8 entity, uint16 length,
+								void* data, size_t* actualLength);
 
 			size_t			fInterface;
 			status_t		fStatus;

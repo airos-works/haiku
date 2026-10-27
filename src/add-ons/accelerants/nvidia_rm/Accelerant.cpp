@@ -135,11 +135,13 @@ private:
 	// app_server draws per logical pixel, also in percent. At renderScale
 	// equal to the scale the region is the monitor's own size and nothing is
 	// scaled at all, which is what keeps text crisp; at a smaller renderScale
-	// the engine enlarges the region. The engine will not shrink one - this
-	// GPU refuses every downscale - so app_server draws at the smallest scale
-	// among the monitors. Outputs can be placed anywhere in the frame buffer
-	// - side by side, stacked, swapped - and the frame buffer is the
-	// smallest rectangle that holds them all.
+	// the engine enlarges the region, at a larger one it shrinks it. Whether
+	// it can shrink depends on the monitor: a 1080p monitor shown a region
+	// drawn at twice its density is fine, a 4K one is beyond what the card
+	// can fetch, so every layout is checked with NVKMS before it is agreed
+	// to, and app_server tries the densest one first. Outputs can be placed
+	// anywhere in the frame buffer - side by side, stacked, swapped - and the
+	// frame buffer is the smallest rectangle that holds them all.
 	struct Output {
 		NVDpyId dpyId;
 		uint32 id;					// what the rest of the system calls it
@@ -176,6 +178,8 @@ private:
 	bool fLayoutApplied = false;		// the layout is what is on screen
 	NvKmsDpyAttributeDpmsValue fDpmsState = NV_KMS_DPY_ATTRIBUTE_DPMS_ON;
 	NvKmsBitmap fOldFramebuffer, fFramebuffer;
+	NvKmsBitmap fCheckedFramebuffer;	// allocated to check the layout with,
+										// shown when its mode is set
 
 	NvKmsBitmap fCursor, fNewCursor;
 	struct {
@@ -228,7 +232,10 @@ private:
 	NvAccelerant(int devFd);
 
 	void ApplyMode(const display_mode &mode, NvKmsBitmap &framebuffer);
+	void FillLayoutRequest(const std::vector<Output> &outputs, NvKmsBitmap &framebuffer,
+		NvKmsSetModeRequest &request);
 	void ApplyLayout(NvKmsBitmap &framebuffer);
+	bool CheckLayout(const std::vector<Output> &outputs, uint32 width, uint32 height);
 	static status_t ResumeThreadEntry(void *arg);
 	void ResumeThread();
 	void RestoreAfterResume();
@@ -1055,6 +1062,7 @@ void NvAccelerant::SetDisplayMode(display_mode* modeToSet)
 		SetLayoutMode(*modeToSet);
 		return;
 	}
+	fCheckedFramebuffer = NvKmsBitmap();
 
 	if (
 		modeToSet->virtual_width != modeToSet->timing.h_display ||
@@ -1083,6 +1091,7 @@ void NvAccelerant::SetDisplayMode(display_mode* modeToSet)
 		}
 	}
 
+	fOldFramebuffer = NvKmsBitmap();
 	NvKmsBitmap newFramebuffer(fRmDev, fKmsDev, modeToSet->virtual_width,
 		modeToSet->virtual_height, (color_space)modeToSet->space);
 
@@ -1103,31 +1112,30 @@ void NvAccelerant::SetDisplayMode(display_mode* modeToSet)
 		SetDpmsMode(B_DPMS_OFF);
 }
 
-// Program every enabled output: its own timings, its region of the frame
-// buffer, and the display engine's scaler between the two when the region is
-// smaller than the monitor.
-void NvAccelerant::ApplyLayout(NvKmsBitmap &framebuffer)
+// The mode set for a layout: every enabled output with its own timings, its
+// region of the frame buffer, and the display engine's scaler between the two
+// when the region and the monitor differ in size.
+void NvAccelerant::FillLayoutRequest(const std::vector<Output> &outputs,
+	NvKmsBitmap &framebuffer, NvKmsSetModeRequest &request)
 {
-	NvKmsSetModeParams params {};
-	params.request.deviceHandle = fKmsDev.Get();
-	params.request.commit = true;
-	params.request.requestedDispsBitMask |= 1U << 0;
+	request.deviceHandle = fKmsDev.Get();
+	request.requestedDispsBitMask |= 1U << 0;
 	// Every head is part of the request; one that gets no display below is
 	// turned off, which is what a monitor that was unplugged or disabled
 	// needs.
-	params.request.disp[0].requestedHeadsBitMask
+	request.disp[0].requestedHeadsBitMask
 		= (1U << std::min<NvU32>(fKmsDev.Info().numHeads, NVKMS_MAX_HEADS_PER_DISP)) - 1;
-	for (const auto &output: fOutputs) {
+	for (const auto &output: outputs) {
 		if (!output.enabled)
 			continue;
 		const NvModeTimings &timings = output.mode.timings;
-		NvKmsSetModeOneHeadRequest &head = params.request.disp[0].head[output.head];
-		params.request.disp[0].requestedHeadsBitMask |= 1U << output.head;
+		NvKmsSetModeOneHeadRequest &head = request.disp[0].head[output.head];
+		request.disp[0].requestedHeadsBitMask |= 1U << output.head;
 		head.dpyIdList = nvAddDpyIdToEmptyDpyIdList(output.dpyId);
 		head.mode = output.mode;
 		head.modeValidationParams.overrides = NVKMS_MODE_VALIDATION_NO_RRX1K_CHECK;
 		// viewPortOut is the whole raster; viewPortSizeIn is how much of the
-		// frame buffer is stretched over it.
+		// frame buffer is scaled to it.
 		head.viewPortOut = {.x = 0, .y = 0, .width = timings.hVisible, .height = timings.vVisible};
 		head.viewPortSizeIn = {.width = output.width, .height = output.height};
 		if (output.mirror) {
@@ -1157,6 +1165,14 @@ void NvAccelerant::ApplyLayout(NvKmsBitmap &framebuffer)
 		layer.sizeOut.val = {.width = framebuffer.Width(), .height = framebuffer.Height()};
 		layer.sizeOut.specified = true;
 	}
+}
+
+// Program the current layout.
+void NvAccelerant::ApplyLayout(NvKmsBitmap &framebuffer)
+{
+	NvKmsSetModeParams params {};
+	FillLayoutRequest(fOutputs, framebuffer, params.request);
+	params.request.commit = true;
 
 	try {
 		CheckErrno(fKms.Control(NVKMS_IOCTL_SET_MODE, &params, sizeof(params)));
@@ -1174,12 +1190,72 @@ void NvAccelerant::ApplyLayout(NvKmsBitmap &framebuffer)
 	}
 }
 
+// Ask NVKMS whether a layout can be shown, without showing it. The frame
+// buffer it is checked with is the one the layout will need, kept for when
+// its mode is set. What the display engine can do depends on more than the
+// scale - shrinking a region onto a 1080p monitor works where shrinking
+// onto a 4K one exceeds what the card can fetch - and only NVKMS knows.
+bool NvAccelerant::CheckLayout(const std::vector<Output> &outputs, uint32 width,
+	uint32 height)
+{
+	// The frame buffer from before the current one has been off screen for
+	// a whole mode set; its video memory can go now.
+	fOldFramebuffer = NvKmsBitmap();
+	fCheckedFramebuffer = NvKmsBitmap();
+	NvKmsBitmap framebuffer(fRmDev, fKmsDev, width, height, B_RGB32, false, false);
+
+	NvKmsSetModeParams params {};
+	FillLayoutRequest(outputs, framebuffer, params.request);
+	params.request.commit = false;
+	if (fKms.Control(NVKMS_IOCTL_SET_MODE, &params, sizeof(params)) < 0) {
+		debug_printf("nvidia_rm: a %" B_PRIu32 "x%" B_PRIu32 " layout is beyond the display "
+			"engine (status %d, disp status %d)\n", width, height, params.reply.status,
+			params.reply.disp[0].status);
+		for (const auto &output: outputs) {
+			if (!output.enabled)
+				continue;
+			debug_printf("nvidia_rm:   %s: %ux%u of the frame buffer onto %ux%u, status %d\n",
+				output.name, output.width, output.height,
+				(unsigned)output.mode.timings.hVisible, (unsigned)output.mode.timings.vVisible,
+				params.reply.disp[0].head[output.head].status);
+		}
+		return false;
+	}
+
+	fCheckedFramebuffer = std::move(framebuffer);
+	return true;
+}
+
 void NvAccelerant::SetLayoutMode(const display_mode &mode)
 {
-	NvKmsBitmap newFramebuffer(fRmDev, fKmsDev, fLayoutMode.timings.hVisible,
-		fLayoutMode.timings.vVisible, (color_space)mode.space);
+	NvKmsBitmap newFramebuffer;
+	if (fCheckedFramebuffer.IsSet()
+		&& fCheckedFramebuffer.Width() == fLayoutMode.timings.hVisible
+		&& fCheckedFramebuffer.Height() == fLayoutMode.timings.vVisible
+		&& fCheckedFramebuffer.ColorSpace() == (color_space)mode.space) {
+		newFramebuffer = std::move(fCheckedFramebuffer);
+	} else {
+		fCheckedFramebuffer = NvKmsBitmap();
+		fOldFramebuffer = NvKmsBitmap();
+		newFramebuffer = NvKmsBitmap(fRmDev, fKmsDev, fLayoutMode.timings.hVisible,
+			fLayoutMode.timings.vVisible, (color_space)mode.space, false, false);
+	}
 
-	ApplyLayout(newFramebuffer);
+	// Only 256 MiB of video memory can be mapped for the CPU at a time, and
+	// two frame buffers of three monitors drawn at 200 percent are 200 MiB:
+	// the new one is mapped in place of the current one, which nothing
+	// draws into while app_server is setting the mode. Should anything fail,
+	// the current one is mapped again and stays on screen; app_server reads
+	// its new address.
+	fFramebuffer.Unmap();
+	try {
+		newFramebuffer.Map();
+		ApplyLayout(newFramebuffer);
+	} catch (...) {
+		newFramebuffer.Unmap();
+		fFramebuffer.Map();
+		throw;
+	}
 
 	fCurrentMode = fLayoutMode;
 	fCurrentHaikuMode = mode;
@@ -1312,11 +1388,8 @@ void NvAccelerant::SetDisplayLayout(const display_output_config* configs, uint32
 			RaiseErrno(EINVAL);
 		}
 		uint16 renderScale = config.render_scale == 0 ? 100 : config.render_scale;
-		if (renderScale < 100 || renderScale > config.scale) {
-			// more pixels than the monitor has would need the engine to
-			// shrink the picture, which it will not
-			debug_printf("nvidia_rm: layout asks for %u%% of pixels on a %u%% output\n",
-				renderScale, config.scale);
+		if (renderScale < 100 || renderScale > 400) {
+			debug_printf("nvidia_rm: layout asks for a render scale of %u%%\n", renderScale);
 			RaiseErrno(EINVAL);
 		}
 		if (!AssignHead(*output, usedHeads))
@@ -1383,6 +1456,26 @@ void NvAccelerant::SetDisplayLayout(const display_output_config* configs, uint32
 		output.width = source->width;
 		output.height = source->height;
 	}
+
+	// Regions are kept at the frame buffer's origin. The display engine
+	// has to agree before the layout replaces the current one.
+	int32 minX = INT32_MAX, minY = INT32_MAX, maxX = INT32_MIN, maxY = INT32_MIN;
+	for (const auto &output: outputs) {
+		if (!output.enabled)
+			continue;
+		minX = std::min(minX, output.x);
+		minY = std::min(minY, output.y);
+		maxX = std::max(maxX, output.x + (int32)output.width);
+		maxY = std::max(maxY, output.y + (int32)output.height);
+	}
+	for (auto &output: outputs) {
+		if (!output.enabled)
+			continue;
+		output.x -= minX;
+		output.y -= minY;
+	}
+	if (!CheckLayout(outputs, maxX - minX, maxY - minY))
+		RaiseErrno(EINVAL);
 
 	fOutputs = outputs;
 	BuildLayoutMode();

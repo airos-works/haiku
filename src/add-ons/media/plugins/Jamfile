@@ -9,5 +9,6 @@ SubInclude HAIKU_TOP src add-ons media plugins raw_decoder ;
 if $(TARGET_ARCH) = arm64 {
 	SubInclude HAIKU_TOP src add-ons media plugins rpi_hevc ;
 	SubInclude HAIKU_TOP src add-ons media plugins rpi_mmal ;
+	SubInclude HAIKU_TOP src add-ons media plugins sunxi_cedar ;
 }
 SubInclude HAIKU_TOP src add-ons media plugins rtsp_streamer ;

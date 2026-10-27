@@ -8,6 +8,7 @@
  */
 
 
+#include <algorithm>
 #include <driver_settings.h>
 
 #include "driver.h"
@@ -129,13 +130,80 @@ get_settings_from_file()
 }
 
 
+/*!	Whether all the audio group's outputs are digital: the audio of a graphics
+	card's HDMI and DisplayPort connectors, which is silent unless a display
+	with speakers is connected.
+*/
+static bool
+is_display_audio(hda_audio_group* audioGroup)
+{
+	bool hasOutput = false;
+	for (uint32 i = 0; i < audioGroup->widget_count; i++) {
+		hda_widget& widget = audioGroup->widgets[i];
+		if (widget.type != WT_AUDIO_OUTPUT)
+			continue;
+		if ((widget.capabilities.audio & AUDIO_CAP_DIGITAL) == 0)
+			return false;
+		hasOutput = true;
+	}
+	return hasOutput;
+}
+
+
+/*!	The codec's maker, to tell the devices of a machine apart by name: a
+	laptop's "Realtek HD Audio" from its graphics card's "AMD HD Audio (HDMI)".
+*/
+static const char*
+codec_vendor_name(uint16 vendorID)
+{
+	switch (vendorID) {
+		case 0x1002:
+			return "AMD";
+		case 0x1013:
+			return "Cirrus Logic";
+		case 0x10de:
+			return "NVIDIA";
+		case 0x10ec:
+			return "Realtek";
+		case 0x1106:
+			return "VIA";
+		case 0x111d:
+			return "IDT";
+		case 0x11d4:
+			return "Analog Devices";
+		case 0x14f1:
+			return "Conexant";
+		case 0x17e8:
+			return "Chrontel";
+		case 0x1aec:
+			return "Wolfson";
+		case 0x8086:
+			return "Intel";
+		case 0x8384:
+			return "SigmaTel";
+		default:
+			return NULL;
+	}
+}
+
+
 static status_t
 get_description(hda_audio_group* audioGroup, multi_description* data)
 {
 	data->interface_version = B_CURRENT_INTERFACE_VERSION;
 	data->interface_minimum = B_CURRENT_INTERFACE_VERSION;
 
-	strcpy(data->friendly_name, "HD Audio");
+	// The media server prefers other outputs to these when the user has not
+	// chosen one: a laptop's speakers, not its graphics card's HDMI. (The
+	// codecs of AMD, NVIDIA and Intel graphics cards are display audio even
+	// where their widgets do not say so.)
+	uint16 vendorID = audioGroup->codec->vendor_id;
+	bool display = is_display_audio(audioGroup)
+		|| vendorID == 0x1002 || vendorID == 0x10de || vendorID == 0x8086;
+	const char* vendor = codec_vendor_name(vendorID);
+	snprintf(data->friendly_name, sizeof(data->friendly_name), "%s%sHD Audio%s",
+		vendor != NULL ? vendor : "", vendor != NULL ? " " : "",
+		display ? " (HDMI)" : "");
 	strcpy(data->vendor_info, "Haiku");
 
 	int32 inChannels = 0;
@@ -1110,8 +1178,24 @@ buffer_exchange(hda_audio_group* audioGroup, multi_buffer_info* data)
 #endif
 
 	/* do playback */
-	err = acquire_sem_etc(audioGroup->codec->controller->buffer_ready_sem,
-		1, B_CAN_INTERRUPT, 0);
+	// A buffer interrupt is due every buffer period. When none arrives in
+	// several periods, look for a stream status the controller left pending
+	// without an interrupt (see hda_recover_lost_interrupt()) rather than
+	// waiting for ever: the time source then stops, and every media node
+	// stalls with it.
+	hda_stream* playbackStream = audioGroup->playback_stream;
+	bigtime_t timeout = 100000;
+	if (playbackStream->sample_rate > 0) {
+		timeout = std::max(timeout, 4 * (bigtime_t)playbackStream->buffer_length
+			* 1000000 / playbackStream->sample_rate);
+	}
+	while (true) {
+		err = acquire_sem_etc(audioGroup->codec->controller->buffer_ready_sem,
+			1, B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT, timeout);
+		if (err != B_TIMED_OUT)
+			break;
+		hda_recover_lost_interrupt(audioGroup->codec->controller);
+	}
 	if (err != B_OK) {
 		ERROR("%s: Error waiting for playback buffer to finish (%s)!\n", __func__,
 			strerror(err));

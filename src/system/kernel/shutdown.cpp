@@ -5,8 +5,65 @@
  */
 
 
+#include <string.h>
+
 #include <kernel.h>
+#include <lock.h>
+#include <shutdown_hooks.h>
 #include <syscalls.h>
+#include <util/AutoLock.h>
+
+
+static const int32 kMaxShutdownHooks = 16;
+
+struct registered_shutdown_hook {
+	shutdown_hook	hook;
+	void*			cookie;
+};
+
+static registered_shutdown_hook sShutdownHooks[kMaxShutdownHooks];
+static int32 sShutdownHookCount;
+static mutex sShutdownHooksLock = MUTEX_INITIALIZER("shutdown hooks");
+
+
+static void
+call_shutdown_hooks(bool reboot)
+{
+	MutexLocker locker(sShutdownHooksLock);
+	for (int32 i = sShutdownHookCount - 1; i >= 0; i--)
+		sShutdownHooks[i].hook(reboot, sShutdownHooks[i].cookie);
+}
+
+
+status_t
+register_shutdown_hook(shutdown_hook hook, void* cookie)
+{
+	MutexLocker locker(sShutdownHooksLock);
+	if (sShutdownHookCount == kMaxShutdownHooks)
+		return B_NO_MEMORY;
+
+	sShutdownHooks[sShutdownHookCount].hook = hook;
+	sShutdownHooks[sShutdownHookCount].cookie = cookie;
+	sShutdownHookCount++;
+	return B_OK;
+}
+
+
+status_t
+unregister_shutdown_hook(shutdown_hook hook, void* cookie)
+{
+	MutexLocker locker(sShutdownHooksLock);
+	for (int32 i = 0; i < sShutdownHookCount; i++) {
+		if (sShutdownHooks[i].hook == hook
+			&& sShutdownHooks[i].cookie == cookie) {
+			memmove(&sShutdownHooks[i], &sShutdownHooks[i + 1],
+				(sShutdownHookCount - i - 1) * sizeof(sShutdownHooks[0]));
+			sShutdownHookCount--;
+			return B_OK;
+		}
+	}
+	return B_ENTRY_NOT_FOUND;
+}
 
 
 status_t
@@ -16,7 +73,13 @@ system_shutdown(bool reboot)
 	team_info info;
 	
 	gKernelShutdown = true;
-	
+
+	// Write back the caches before anything is torn down: ending the teams
+	// runs their drivers' cleanup (GPU contexts, for one), and a machine that
+	// stops there loses what was only cached - files come back with their
+	// new size but the old contents of their blocks.
+	sync();
+
 	// Now shutdown all system services!
 	// TODO: Once we are sure we can shutdown the system on all hardware
 	// checking reboot may not be necessary anymore.
@@ -29,6 +92,10 @@ system_shutdown(bool reboot)
 	}
 	
 	sync();
+
+	// Hardware a reboot leaves as it is (a GPU integrated into the
+	// processor, say) has to be brought to rest by its driver.
+	call_shutdown_hooks(reboot);
 
 	return arch_cpu_shutdown(reboot);
 }

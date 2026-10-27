@@ -15,7 +15,11 @@ Pipe::Pipe(Object *parent)
 		fDataToggle(false),
 		fControllerCookie(NULL)
 {
-	// all other init is to be done in InitCommon()
+	// The SuperSpeed parameters are set (by InitSuperSpeed()) before
+	// InitCommon(), which tells the host controller about the pipe; all
+	// other init is to be done in InitCommon().
+	fMaxBurst = 0;
+	fBytesPerInterval = 0;
 }
 
 
@@ -43,13 +47,14 @@ Pipe::InitCommon(int8 deviceAddress, uint8 endpointAddress, usb_speed speed,
 	fHubAddress = hubAddress;
 	fHubPort = hubPort;
 
-	fMaxBurst = 0;
-	fBytesPerInterval = 0;
-
 	GetBusManager()->NotifyPipeChange(this, USB_CHANGE_CREATED);
 }
 
 
+/*!	Must come before InitCommon(): the host controller sets the endpoint up
+	when it is told about the pipe there, and with a burst of one packet a
+	SuperSpeed bulk endpoint moves a fraction of what it can.
+*/
 void
 Pipe::InitSuperSpeed(uint8 maxBurst, uint16 bytesPerInterval)
 {

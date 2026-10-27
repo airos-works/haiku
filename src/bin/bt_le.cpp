@@ -14,7 +14,12 @@
 #include <Messenger.h>
 #include <OS.h>
 
+#include <bluetooth/DiscoveryAgent.h>
+#include <bluetooth/DiscoveryListener.h>
 #include <bluetooth/LocalDevice.h>
+#include <bluetooth/RemoteDevice.h>
+#include <bluetooth/bdaddrUtils.h>
+#include <bluetooth/DeviceClass.h>
 
 #include <LEAttributeClient.h>
 #include <LEBondStore.h>
@@ -24,6 +29,7 @@
 
 #include <algorithm>
 #include <map>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,6 +50,11 @@ Usage()
 		"       bt_le list\n"
 		"       bt_le forget <address> [public|random]\n"
 		"       bt_le log [0-3]\n"
+		"       bt_le params <min ms> <max ms> [latency] [timeout ms]\n"
+		"       bt_le probe <address> [seconds] [interval ms] [latency] "
+			"[public|random]\n"
+		"       bt_le inquiry [seconds]\n"
+		"       bt_le rssi [handle] [count]\n"
 		"Addresses are written as AA:BB:CC:DD:EE:FF. Pair a device while it\n"
 		"is in pairing mode; the log is %s.\n", LELogFilePath());
 }
@@ -426,6 +437,317 @@ Services(const uint8 peer[6], uint8 type)
 }
 
 
+/*!	Times a stream of notifications from a test peer (tools/cubie-a7s/
+	lepeer.py, a BlueZ peripheral on a Linux host, sends a sequence number
+	and its clock every few milliseconds, more often than any connection
+	interval, so every connection event has something to carry). Arrivals
+	less than half an interval apart came in the same connection event; the
+	gaps between events, in intervals, show the events the link lost. Raw
+	arrivals go to $BT_LE_PROBE_CSV if set.
+*/
+static int
+ProbeNotifications(LEAttributeClient& client, uint16 handle, const char* text,
+	int32 seconds, float intervalMs, int32 latency)
+{
+	struct Arrival {
+		bigtime_t when;
+		uint32 sequence;
+		uint32 stamp;
+	};
+	std::vector<Arrival> arrivals;
+	arrivals.reserve(seconds * 1000);
+	const bigtime_t end = system_time() + seconds * 1000000LL;
+	while (system_time() < end) {
+		uint16 from;
+		std::vector<uint8> value;
+		status_t status = client.ReadNotification(from, value);
+		if (status == B_TIMED_OUT)
+			continue;
+		if (status != B_OK) {
+			fprintf(stderr, "Link lost after %zu notifications: %s\n",
+				arrivals.size(), strerror(status));
+			break;
+		}
+		if (from != handle || value.size() < 8)
+			continue;
+		Arrival arrival;
+		arrival.when = system_time();
+		memcpy(&arrival.sequence, value.data(), 4);
+		memcpy(&arrival.stamp, value.data() + 4, 4);
+		arrival.sequence = B_LENDIAN_TO_HOST_INT32(arrival.sequence);
+		arrival.stamp = B_LENDIAN_TO_HOST_INT32(arrival.stamp);
+		arrivals.push_back(arrival);
+	}
+	if (arrivals.size() < 2) {
+		fprintf(stderr, "No notification stream from %s.\n", text);
+		return 1;
+	}
+
+	const char* csvPath = getenv("BT_LE_PROBE_CSV");
+	if (csvPath != NULL) {
+		FILE* csv = fopen(csvPath, "w");
+		if (csv != NULL) {
+			for (const Arrival& arrival : arrivals) {
+				fprintf(csv, "%" B_PRIdBIGTIME ",%" B_PRIu32 ",%" B_PRIu32
+					"\n", arrival.when, arrival.sequence, arrival.stamp);
+			}
+			fclose(csv);
+		}
+	}
+
+	const float unit = intervalMs > 0 ? intervalMs : 11.25f;
+	const bigtime_t sameEvent = (bigtime_t)(unit * 500);
+	std::vector<bigtime_t> eventGaps;
+	bigtime_t eventStart = arrivals[0].when;
+	bigtime_t previous = arrivals[0].when;
+	uint32 lost = 0;
+	for (size_t i = 1; i < arrivals.size(); i++) {
+		if (arrivals[i].sequence != arrivals[i - 1].sequence + 1)
+			lost += arrivals[i].sequence - arrivals[i - 1].sequence - 1;
+		if (arrivals[i].when - previous > sameEvent) {
+			eventGaps.push_back(arrivals[i].when - eventStart);
+			eventStart = arrivals[i].when;
+		}
+		previous = arrivals[i].when;
+	}
+	// Queueing delay: arrival minus the peer's send time, against the best
+	// seen (the clocks differ by a constant).
+	std::vector<int64> delays;
+	int64 best = INT64_MAX;
+	uint32 base = arrivals[0].stamp;
+	for (const Arrival& arrival : arrivals) {
+		int64 delay = arrival.when - (int64)(uint32)(arrival.stamp - base);
+		delays.push_back(delay);
+		best = std::min(best, delay);
+	}
+	for (int64& delay : delays)
+		delay -= best;
+	std::sort(delays.begin(), delays.end());
+
+	int32 buckets[6] = {};
+	for (bigtime_t gap : eventGaps) {
+		int32 events = (int32)(gap / 1000.0f / unit + 0.5f);
+		buckets[std::max((int32)1, std::min(events, (int32)5))]++;
+	}
+	const size_t gaps = std::max(eventGaps.size(), (size_t)1);
+	const size_t n = delays.size();
+	char summary[640];
+	snprintf(summary, sizeof(summary), "probe %s: %zu notifications (%" B_PRIu32
+		" lost) in %" B_PRId32 " s at %.2f ms latency %" B_PRId32 ": %zu "
+		"connection events with data, gaps of 1/2/3/4/5+ intervals %.1f/%.1f/"
+		"%.1f/%.1f/%.1f%%; delay median %.1f, 90%% %.1f, 99%% %.1f, max %.1f "
+		"ms", text, n, lost, seconds, unit, latency, eventGaps.size() + 1,
+		100.0 * buckets[1] / gaps, 100.0 * buckets[2] / gaps,
+		100.0 * buckets[3] / gaps, 100.0 * buckets[4] / gaps,
+		100.0 * buckets[5] / gaps, delays[n / 2] / 1000.0,
+		delays[n * 9 / 10] / 1000.0, delays[n * 99 / 100] / 1000.0,
+		delays[n - 1] / 1000.0);
+	printf("%s\n", summary);
+	LELog(LE_LOG_INFO, "probe", "%s", summary);
+	return 0;
+}
+
+
+/*!	Measures an LE link without a person: holds a connection to a device
+	that lets anyone read an attribute (most do: the GAP device name), asks
+	for the connection parameters under test and times back-to-back reads.
+	A read takes one connection event to send and usually the next to answer;
+	connection events the controller gives to something else (a Classic
+	inquiry, audio, Wi-Fi) show up as slower reads.
+*/
+static int
+Probe(const uint8 peer[6], uint8 type, int32 seconds, float intervalMs,
+	int32 latency)
+{
+	uint8 local[6];
+	LocalDevice* adapter = GetAdapter(local);
+	if (adapter == NULL)
+		return 1;
+	BMessenger server(BLUETOOTH_SIGNATURE);
+	LinkListener* listener = new LinkListener();
+	listener->Run();
+	BMessenger listenerMessenger(listener);
+	char text[18];
+	LEAddressString(peer, text);
+
+	BMessage request(BT_MSG_LE_CONNECT), reply;
+	request.AddInt32("hci_id", adapter->ID());
+	request.AddMessenger("listener", listenerMessenger);
+	request.AddData("address", B_RAW_TYPE, peer, 6);
+	request.AddUInt8("address_type", type);
+	int32 result = B_ERROR;
+	if (server.SendMessage(&request, &reply, 5000000, 5000000) == B_OK)
+		reply.FindInt32("status", &result);
+	if (result != B_OK) {
+		fprintf(stderr, "Connection request refused: %s\n", strerror(result));
+		return 1;
+	}
+	status_t status = listener->Wait(20000000);
+	if (status != B_OK) {
+		fprintf(stderr, "Not connected to %s: %s\n", text, strerror(status));
+		BMessage cancel(BT_MSG_LE_CONNECT_CANCEL);
+		cancel.AddInt32("hci_id", adapter->ID());
+		cancel.AddMessenger("listener", listenerMessenger);
+		server.SendMessage(&cancel, &reply, 5000000, 5000000);
+		return 1;
+	}
+
+	int exitCode = 1;
+	if (intervalMs > 0) {
+		// Before discovery, which then runs at the new interval too.
+		BMessage update(BT_MSG_LE_UPDATE_CONNECTION);
+		update.AddInt32("hci_id", adapter->ID());
+		uint16 interval = (uint16)(intervalMs / 1.25 + 0.5);
+		update.AddUInt16("interval_min", interval);
+		update.AddUInt16("interval_max", interval);
+		update.AddUInt16("latency", (uint16)latency);
+		update.AddUInt16("timeout", 300);
+		server.SendMessage(&update, &reply, 5000000, 5000000);
+		snooze(500000);
+	}
+	bdaddr_t address;
+	memcpy(address.b, peer, 6);
+	LEAttributeClient client;
+	status = client.Connect(address);
+
+	// Something to read: the device name, else any readable value. A
+	// characteristic that notifies, in a vendor (128-bit) service, is better
+	// still: a test peer sending a stream stands in for a mouse.
+	uint16 handle = 0;
+	uint16 notifyHandle = 0;
+	uint16 notifyEnd = 0;
+	std::vector<LEPrimaryService> services;
+	if (status == B_OK)
+		status = client.DiscoverPrimaryServices(services);
+	for (size_t i = 0; status == B_OK && i < services.size(); i++) {
+		std::vector<LECharacteristic> characteristics;
+		if (client.DiscoverCharacteristics(services[i].startHandle,
+				services[i].endHandle, characteristics) != B_OK)
+			continue;
+		for (const LECharacteristic& characteristic : characteristics) {
+			if (services[i].uuid16 == 0 && notifyHandle == 0
+				&& (characteristic.properties & 0x10) != 0) {
+				notifyHandle = characteristic.valueHandle;
+				notifyEnd = services[i].endHandle;
+			}
+			if ((characteristic.properties & 0x02) == 0)
+				continue;
+			if (handle == 0 || (characteristic.uuid16 == 0x2a00
+					&& notifyHandle == 0))
+				handle = characteristic.valueHandle;
+		}
+	}
+	uint16 configuration = 0;
+	if (notifyHandle != 0
+		&& client.FindClientConfiguration(notifyHandle + 1, notifyEnd,
+			configuration) != B_OK)
+		notifyHandle = 0;
+
+	if (status == B_OK && notifyHandle != 0) {
+		const uint8 enable[2] = { 1, 0 };
+		status = client.WriteAttribute(configuration, enable, 2);
+		if (status == B_OK) {
+			exitCode = ProbeNotifications(client, notifyHandle, text, seconds,
+				intervalMs, latency);
+			const uint8 disable[2] = { 0, 0 };
+			client.WriteAttribute(configuration, disable, 2);
+		} else
+			fprintf(stderr, "Subscribing failed: %s\n", strerror(status));
+	} else if (status != B_OK || handle == 0) {
+		fprintf(stderr, "Nothing to read on %s: %s\n", text,
+			strerror(status != B_OK ? status : B_ENTRY_NOT_FOUND));
+	} else {
+		std::vector<bigtime_t> times;
+		int32 failures = 0;
+		const bigtime_t end = system_time() + seconds * 1000000LL;
+		while (system_time() < end && failures < 5) {
+			std::vector<uint8> value;
+			bigtime_t start = system_time();
+			if (client.ReadAttribute(handle, value) != B_OK) {
+				failures++;
+				continue;
+			}
+			times.push_back(system_time() - start);
+		}
+		if (times.empty())
+			fprintf(stderr, "No read completed.\n");
+		else {
+			std::sort(times.begin(), times.end());
+			size_t n = times.size();
+			bigtime_t total = 0;
+			for (bigtime_t t : times)
+				total += t;
+			const float unit = intervalMs > 0 ? intervalMs : 11.25f;
+			int32 buckets[6] = {};
+			for (bigtime_t t : times) {
+				int32 events = (int32)(t / 1000.0f / unit + 0.5f);
+				buckets[std::min(events, (int32)5)]++;
+			}
+			char summary[512];
+			snprintf(summary, sizeof(summary), "probe %s: %zu reads in %"
+				B_PRId32 " s at %.2f ms latency %" B_PRId32 ": mean %.1f ms, "
+				"median %.1f, 90%% %.1f, 99%% %.1f, max %.1f ms; reads taking "
+				"<=1/2/3/4/5+ intervals: %" B_PRId32 "/%" B_PRId32 "/%" B_PRId32
+				"/%" B_PRId32 "/%" B_PRId32 "", text, n, seconds, unit,
+				latency, total / 1000.0 / n, times[n / 2] / 1000.0,
+				times[n * 9 / 10] / 1000.0, times[n * 99 / 100] / 1000.0,
+				times[n - 1] / 1000.0, buckets[0] + buckets[1], buckets[2],
+				buckets[3], buckets[4], buckets[5]);
+			printf("%s\n", summary);
+			LELog(LE_LOG_INFO, "probe", "%s", summary);
+			exitCode = 0;
+		}
+	}
+
+	client.Disconnect();
+	BMessage disconnect(BT_MSG_LE_DISCONNECT);
+	disconnect.AddInt32("hci_id", adapter->ID());
+	disconnect.AddMessenger("listener", listenerMessenger);
+	server.SendMessage(&disconnect, &reply, 5000000, 5000000);
+	listener->Wait(3000000);
+	if (listener->Lock())
+		listener->Quit();
+	return exitCode;
+}
+
+
+class InquiryListener : public DiscoveryListener {
+public:
+	virtual void DeviceDiscovered(RemoteDevice* device, DeviceClass deviceClass)
+	{
+		// (the listener keeps the device in its list, to recognize the
+		// device's next replies: not ours to delete)
+		BString major;
+		deviceClass.GetMajorDeviceClass(major);
+		printf("%s  class %06" B_PRIx32 " (%s)\n",
+			bdaddrUtils::ToString(device->GetBluetoothAddress()).String(),
+			deviceClass.Record(), major.String());
+	}
+	virtual void InquiryCompleted(int discType) {}
+	virtual void InquiryStarted(status_t status) {}
+};
+
+
+static int
+Inquiry(int32 seconds)
+{
+	uint8 local[6];
+	LocalDevice* adapter = GetAdapter(local);
+	if (adapter == NULL)
+		return 1;
+	DiscoveryAgent* agent = adapter->GetDiscoveryAgent();
+	InquiryListener* listener = new InquiryListener();
+		// (DiscoveryListener runs itself)
+	// in 1.28 s units, as Classic inquiries are
+	int32 length = std::max((int32)1, std::min((int32)(seconds / 1.28f + 0.5f),
+		(int32)48));
+	status_t status = agent->StartInquiry(BT_GIAC, listener, length);
+	printf("inquiry of %.2f s: %s\n", length * 1.28f, strerror(status));
+	snooze((bigtime_t)(length * 1280000LL + 500000));
+	return status == B_OK ? 0 : 1;
+}
+
+
 static int
 List()
 {
@@ -496,6 +818,72 @@ main(int argc, char** argv)
 		printf("level %" B_PRId32 " (0 errors, 1 steps, 2 debug + kernel, "
 			"3 packets)\nlog: %s\n", LELogLevel(), LELogFilePath());
 		return 0;
+	}
+	if (strcmp(command, "rssi") == 0) {
+		// bt_le rssi [handle] [count]: the LE link's unless a handle is
+		// given, twice a second; the values go to the log.
+		uint8 local[6];
+		LocalDevice* adapter = GetAdapter(local);
+		if (adapter == NULL)
+			return 1;
+		int32 count = argc > 3 ? atoi(argv[3]) : 1;
+		status_t status = B_OK;
+		for (int32 i = 0; i < count && status == B_OK; i++) {
+			BMessage request(BT_MSG_READ_RSSI), reply;
+			request.AddInt32("hci_id", adapter->ID());
+			if (argc > 2 && strcmp(argv[2], "le") != 0)
+				request.AddUInt16("handle", (uint16)strtol(argv[2], NULL, 0));
+			status = BMessenger(BLUETOOTH_SIGNATURE).SendMessage(&request,
+				&reply, 5000000, 5000000);
+			if (status == B_OK)
+				status = reply.GetInt32("status", B_ERROR);
+			if (i + 1 < count)
+				snooze(500000);
+		}
+		printf("RSSI requested: %s (the values are in the log)\n",
+			strerror(status));
+		return status == B_OK ? 0 : 1;
+	}
+	if (strcmp(command, "inquiry") == 0)
+		return Inquiry(argc > 2 ? atoi(argv[2]) : 5);
+	if (strcmp(command, "probe") == 0 && argc > 2) {
+		// bt_le probe <address> [seconds] [interval ms] [latency] [type]
+		uint8 address[6];
+		if (!ParseAddress(argv[2], address)) {
+			Usage();
+			return 1;
+		}
+		uint8 type = (address[5] & 0xc0) == 0xc0 ? 1 : 0;
+		if (argc > 6)
+			type = strcmp(argv[6], "public") == 0 ? 0 : 1;
+		return Probe(address, type, argc > 3 ? atoi(argv[3]) : 20,
+			argc > 4 ? atof(argv[4]) : 0, argc > 5 ? atoi(argv[5]) : 0);
+	}
+	if (strcmp(command, "params") == 0 && argc > 3) {
+		// bt_le params <min ms> <max ms> [latency] [timeout ms]: kept on
+		// the link until it closes; latency and timeout stay the link's
+		// unless given.
+		uint8 local[6];
+		LocalDevice* adapter = GetAdapter(local);
+		if (adapter == NULL)
+			return 1;
+		BMessage request(BT_MSG_LE_UPDATE_CONNECTION);
+		request.AddInt32("hci_id", adapter->ID());
+		request.AddUInt16("interval_min", (uint16)(atof(argv[2]) / 1.25 + 0.5));
+		request.AddUInt16("interval_max", (uint16)(atof(argv[3]) / 1.25 + 0.5));
+		if (argc > 4)
+			request.AddUInt16("latency", (uint16)atoi(argv[4]));
+		if (argc > 5)
+			request.AddUInt16("timeout", (uint16)(atoi(argv[5]) / 10));
+		request.AddBool("keep_interval", true);
+		BMessage reply;
+		status_t status = BMessenger(BLUETOOTH_SIGNATURE).SendMessage(&request,
+			&reply, 5000000, 5000000);
+		if (status == B_OK)
+			status = reply.GetInt32("status", B_ERROR);
+		printf("connection update: %s (the result is in the log)\n",
+			strerror(status));
+		return status == B_OK ? 0 : 1;
 	}
 	if ((strcmp(command, "pair") == 0 || strcmp(command, "forget") == 0
 			|| strcmp(command, "services") == 0)

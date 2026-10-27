@@ -38,6 +38,10 @@ Transfer::~Transfer()
 	if (fRequestData)
 		delete fRequestData;
 
+	// and of the isochronous data (IsochronousPipe::QueueIsochronous()
+	// allocates it per transfer; the packet descriptors are the caller's)
+	delete fIsochronousData;
+
 	if (fVector && fVector != &fData)
 		delete[] fVector;
 

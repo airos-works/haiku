@@ -1,0 +1,19 @@
+# powervr driver settings of the Cubie A7S lab images
+# (tools/cubie-a7s/UserBuildConfig puts this in kernel/drivers/powervr).
+#
+# Boot the GPU firmware when the driver starts, prove that it runs
+# (HEALTH_CHECKs, an MMU cache flush, interrupts) and log every step:
+firmware true
+
+# Firmware log groups (ROGUE_FWIF_LOG_TYPE_GROUP_*): 0x2 is "main". The
+# trace is logged after the checks, and with the state when one fails.
+fw_trace_mask 0x2
+fw_trace_lines 64
+
+# Log the register accesses of the start (off unless a settings file says
+# so; air/OS images do not):
+trace_registers true
+
+# Allwinner's SMC/GPU_GLB writes before the start, if the firmware cannot
+# reach memory without them (DESIGN.md R7):
+#vendor_secure_config true

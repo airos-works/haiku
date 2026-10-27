@@ -31,15 +31,29 @@ public:
 		status_t			CompareAndReattach(usb_device device);
 
 private:
+		bool				_HasECMInterfaces(
+								const usb_configuration_info* config) const;
 static	void				_ReadCallback(void *cookie, int32 status,
 								void *data, size_t actualLength);
 static	void				_WriteCallback(void *cookie, int32 status,
 								void *data, size_t actualLength);
+
+		status_t			_StartRing();
+		void				_StopRing();
 static	void				_NotifyCallback(void *cookie, int32 status,
 								void *data, size_t actualLength);
 
 		status_t			_SetupDevice();
 		status_t			_ReadMACAddress(usb_device device, uint8 *buffer);
+
+		// Realtek RTL815x PHY power
+		bool				_HasRealtekPHY() const;
+		status_t			_RealtekRead(uint16 index, uint32 *value);
+		status_t			_RealtekWriteWord(uint16 index, uint16 value);
+		status_t			_RealtekPHYRead(uint16 reg, uint16 *value);
+		status_t			_RealtekPHYWrite(uint16 reg, uint16 value);
+		void				_SetPHYPower(bool on);
+		void				_SetKeepAwake(bool keepAwake);
 
 		// state tracking
 		status_t			fStatus;
@@ -49,6 +63,8 @@ static	void				_NotifyCallback(void *cookie, int32 status,
 		usb_device			fDevice;
 		uint16				fVendorID;
 		uint16				fProductID;
+		bool				fKeepAwake;
+			// the bus keeps the device out of USB suspend
 
 		// interface and device infos
 		uint8				fControlInterfaceIndex;
@@ -61,13 +77,34 @@ static	void				_NotifyCallback(void *cookie, int32 status,
 		usb_pipe			fReadEndpoint;
 		usb_pipe			fWriteEndpoint;
 
-		// data stores for async usb transfers
-		uint32				fActualLengthRead;
-		uint32				fActualLengthWrite;
-		int32				fStatusRead;
-		int32				fStatusWrite;
+		// Each frame is a bulk transfer of its own, so frames are only
+		// received at the rate of the bus if several reads stay queued; with
+		// one read at a time a gigabit adapter managed 81 Mbit/s. Received
+		// frames complete in the order their reads were queued, and are handed
+		// out in that order; a frame is sent without waiting for the one
+		// before it. As many reads are queued as the host controller takes,
+		// up to kRingSlots (the xhci driver takes 15 per endpoint).
+		enum {
+			kRingSlots = 12,
+			kBufferSize = 2048
+		};
+		struct ring_slot {
+			ECMDevice*		device;
+			uint8*			buffer;
+			size_t			length;
+			status_t		status;
+		};
+		ring_slot			fReadSlots[kRingSlots];
+		uint8*				fWriteBuffers[kRingSlots];
+		uint32				fRingSize;
+		uint32				fReadHead;
+		int32				fWriteNext;
 		sem_id				fNotifyReadSem;
+			// counts completed reads
 		sem_id				fNotifyWriteSem;
+			// counts free write buffers
+		uint16				fWriteMaxPacketSize;
+		bool				fRingStarted;
 
 		uint8 *				fNotifyBuffer;
 		uint32				fNotifyBufferLength;

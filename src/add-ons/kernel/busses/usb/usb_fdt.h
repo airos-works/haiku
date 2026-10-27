@@ -6,6 +6,7 @@
 #define USB_FDT_H
 
 
+#include <ByteOrder.h>
 #include <bus/FDT.h>
 #include <KernelExport.h>
 
@@ -86,6 +87,75 @@ usb_fdt_get_device(device_manager_info* manager, device_node* parent,
 		*_fdt = fdt;
 	if (_device != NULL)
 		*_device = device;
+	return true;
+}
+
+
+/*!	Whether the "ranges" of the bus \a device (node \a node) map addresses
+	1:1, which is what get_reg() assumes: empty, or every entry with equal
+	child and parent addresses, as the A733's
+	"ranges = <0x0 0x0 0x0 0x40000000>".
+*/
+static inline bool
+usb_fdt_ranges_are_identity(device_manager_info* manager, device_node* node,
+	fdt_device_module_info* fdt, fdt_device* device)
+{
+	int length;
+	const uint32* ranges = (const uint32*)fdt->get_prop(device, "ranges",
+		&length);
+	if (ranges == NULL)
+		return false;
+	if (length == 0)
+		return true;
+
+	struct Cells {
+		static uint32 Read(fdt_device_module_info* fdt, fdt_device* device,
+			const char* name, uint32 defaultValue)
+		{
+			int length;
+			const uint32* value = (const uint32*)fdt->get_prop(device, name,
+				&length);
+			if (value == NULL || length != 4)
+				return defaultValue;
+			return B_BENDIAN_TO_HOST_INT32(*value);
+		}
+		static uint64 Address(const uint32* cells, uint32 count)
+		{
+			uint64 address = 0;
+			for (uint32 i = 0; i < count; i++)
+				address = (address << 32) | B_BENDIAN_TO_HOST_INT32(cells[i]);
+			return address;
+		}
+	};
+
+	uint32 childCells = Cells::Read(fdt, device, "#address-cells", 2);
+	uint32 sizeCells = Cells::Read(fdt, device, "#size-cells", 1);
+	uint32 parentCells = 2;
+	device_node* parentNode = manager->get_parent_node(node);
+	if (parentNode != NULL) {
+		const char* bus;
+		fdt_device_module_info* parentFDT;
+		fdt_device* parentDevice;
+		if (manager->get_attr_string(parentNode, B_DEVICE_BUS, &bus, false)
+				== B_OK && strcmp(bus, "fdt") == 0
+			&& manager->get_driver(parentNode,
+				(driver_module_info**)&parentFDT, (void**)&parentDevice)
+				== B_OK) {
+			parentCells = Cells::Read(parentFDT, parentDevice,
+				"#address-cells", 2);
+		}
+		manager->put_node(parentNode);
+	}
+
+	uint32 entryCells = childCells + parentCells + sizeCells;
+	if (childCells > 2 || parentCells > 2 || length % (entryCells * 4) != 0)
+		return false;
+	for (int i = 0; i < length / 4; i += entryCells) {
+		if (Cells::Address(ranges + i, childCells)
+				!= Cells::Address(ranges + i + childCells, parentCells)) {
+			return false;
+		}
+	}
 	return true;
 }
 
@@ -173,10 +243,10 @@ usb_fdt_get_resources(device_manager_info* manager, device_node* parent,
 			resources->dma_coherent = true;
 		if (!usb_fdt_is_enabled(ancestorFDT, ancestor))
 			supported = false;
-		if (current != parent && ancestorFDT->get_name(ancestor)[0] != 0) {
-			ranges = ancestorFDT->get_prop(ancestor, "ranges", &length);
-			if (ranges == NULL || length != 0)
-				supported = false;
+		if (current != parent && ancestorFDT->get_name(ancestor)[0] != 0
+			&& !usb_fdt_ranges_are_identity(manager, current, ancestorFDT,
+				ancestor)) {
+			supported = false;
 		}
 		device_node* next = manager->get_parent_node(current);
 		if (owned)

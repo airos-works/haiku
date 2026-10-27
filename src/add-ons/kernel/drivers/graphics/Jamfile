@@ -24,5 +24,7 @@ SubInclude HAIKU_TOP src add-ons kernel drivers graphics virtio ;
 if $(TARGET_ARCH) = arm64 {
 	SubInclude HAIKU_TOP src add-ons kernel drivers graphics rpi_display ;
 	SubInclude HAIKU_TOP src add-ons kernel drivers graphics rpi_dsi ;
+	SubInclude HAIKU_TOP src add-ons kernel drivers graphics powervr ;
+	SubInclude HAIKU_TOP src add-ons kernel drivers graphics sunxi_display ;
 	SubInclude HAIKU_TOP src add-ons kernel drivers graphics v3d ;
 }

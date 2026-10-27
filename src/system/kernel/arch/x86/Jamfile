@@ -35,6 +35,7 @@ if $(TARGET_ARCH) = x86_64 {
 		syscalls.cpp
 		thread.cpp
 
+		arch_s2idle.cpp
 		arch_suspend.cpp
 
 		# paging

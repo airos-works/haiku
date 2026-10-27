@@ -1,6 +1,6 @@
 SubDir HAIKU_TOP src preferences wifi ;
 
-UsePrivateHeaders interface net ;
+UsePrivateHeaders interface net shared ;
 
 UseHeaders [ FDirName $(HAIKU_TOP) src libs compat ] : true ;
 UseHeaders [ FDirName $(HAIKU_TOP) src libs compat freebsd_wlan ] : true ;

@@ -10,6 +10,7 @@
 
 #include "usb_private.h"
 #include "ehci_hardware.h"
+#include "ehci_split_iso.h"
 
 
 struct pci_info;
@@ -37,6 +38,21 @@ typedef struct transfer_data {
 } transfer_data;
 
 
+// A full-speed isochronous endpoint behind a high-speed hub (split
+// transactions through the hub's TT, EHCI 4.12.3): its booked schedule slot
+// and where its next packet goes. Kept as the pipe's controller cookie.
+typedef struct ehci_split_stream {
+	int32						budget_index;	// in fSplitBudget
+	uint32						endpoint;		// siTD dword 1
+	uint32						schedule;		// siTD dword 2 (S-/C-mask)
+	uint16						period;			// frames between packets
+	uint16						phase;			// frame (mod period) of packets
+	uint16						max_packet_size;
+	int32						next_frame;		// -1: nothing queued
+	uint32						queued;			// transfers in the schedule
+} ehci_split_stream;
+
+
 // This structure is used to create a list of
 // descriptors per isochronous transfer
 typedef struct isochronous_transfer_data {
@@ -55,6 +71,14 @@ typedef struct isochronous_transfer_data {
 	size_t						buffer_size;
 	void *						buffer_log;
 	addr_t						buffer_phy;
+
+	// split transfers (siTDs, one per packet) only
+	ehci_sitd **				split_descriptors;
+	uint16 *					packet_lengths;
+	uint32						packet_count;
+	uint32						last_frame;
+	ehci_split_stream *			stream;
+	size_t						actual_length;
 } isochronous_transfer_data;
 
 
@@ -77,6 +101,7 @@ virtual	void						CancelDebugTransfer(Transfer *transfer);
 
 virtual	status_t					SubmitTransfer(Transfer *transfer);
 		status_t					SubmitIsochronous(Transfer *transfer);
+		status_t					SubmitSplitIsochronous(Transfer *transfer);
 
 virtual	status_t					CancelQueuedTransfers(Pipe *pipe, bool force);
 		status_t					CancelQueuedIsochronousTransfers(Pipe *pipe, bool force);
@@ -135,6 +160,23 @@ static	int32						CleanupThread(void *data);
 static int32						FinishIsochronousThread(void *data);
 		void						FinishIsochronousTransfers();
 		isochronous_transfer_data *	FindIsochronousTransfer(ehci_itd *itd);
+
+		// Split isochronous transfers (siTDs)
+		ehci_split_stream *			_SplitStream(Pipe *pipe,
+										status_t *_status);
+		void						_FreeSplitStream(Pipe *pipe);
+		uint32						_CurrentFrame();
+static	int32						FinishSplitIsochronousThread(void *data);
+		void						FinishSplitIsochronousTransfers();
+		void						_RetireSplitFrame(uint32 frame,
+										isochronous_transfer_data **_done);
+		void						_CompleteSplitTransfer(
+										isochronous_transfer_data *transfer);
+		void						_FreeSplitTransfer(
+										isochronous_transfer_data *transfer);
+		status_t					_CopyIsochronousData(Transfer *transfer,
+										size_t offset, void *buffer,
+										size_t length, bool toTransfer);
 		void						LinkITDescriptors(ehci_itd *itd,
 										ehci_itd **last);
 		void						LinkSITDescriptors(ehci_sitd *sitd,
@@ -267,6 +309,16 @@ inline	uint32						ReadCapReg32(uint32 reg);
 		sem_id						fFinishIsochronousTransfersSem;
 		thread_id					fFinishIsochronousThread;
 		mutex						fIsochronousLock;
+
+		// Split isochronous transfers: their own list and finisher, the
+		// next frame the finisher retires, and the booked TT and
+		// high-speed bandwidth of the split streams.
+		isochronous_transfer_data *	fFirstSplitTransfer;
+		isochronous_transfer_data *	fLastSplitTransfer;
+		sem_id						fFinishSplitSem;
+		thread_id					fFinishSplitThread;
+		uint32						fSplitRetireFrame;
+		ehci_split::budget_entry	fSplitBudget[16];
 
 		// Root Hub
 		EHCIRootHub *				fRootHub;

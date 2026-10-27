@@ -67,6 +67,9 @@ cpu_init()
 
 	gKernelArgs.num_cpus = 1;
 		// this will eventually be corrected later on
+
+	boot_arch_cpu_init();
+		// notes the time stamp counter for the kernel's boot time report
 }
 
 

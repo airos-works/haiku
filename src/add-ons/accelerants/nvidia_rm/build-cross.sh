@@ -2,6 +2,7 @@
 # Cross-build nvidia_rm.accelerant for x86_64.
 #
 # usage: build-cross.sh <haiku build dir> <nvidia_rm work dir> <output dir>
+#        (TOOLS=<cross compiler prefix> when the build dir has none of its own)
 #
 # The work dir is the one used by the kernel driver's build-cross.sh; it
 # provides NVIDIA's open-gpu-kernel-modules headers (or OGKM_SRC does, as for
@@ -16,7 +17,7 @@ HAIKU=$(realpath "$SRC/../../../..")
 OGKM=${OGKM_SRC:-$WORK/open-gpu-kernel-modules}
 [ -d "$OGKM/src" ] || { echo "run the nvidia_rm driver build first" >&2; exit 1; }
 
-TOOLS=$BUILD/cross-tools-x86_64/bin/x86_64-unknown-haiku
+TOOLS=${TOOLS:-$BUILD/cross-tools-x86_64/bin/x86_64-unknown-haiku}
 OBJ=$BUILD/objects/haiku/x86_64/release
 GCC_SYSLIBS=$(ls -d "$BUILD"/build_packages/gcc_syslibs_devel-*)
 GCC_SYSLIBS_RUNTIME=$(ls -d "$BUILD"/build_packages/gcc_syslibs-*)
@@ -141,3 +142,23 @@ $TOOLS-g++ -nostdlib -o "$OUT/bin/nvcursortest" \
 	"$GCCLIB/crtend.o" "$OBJ/system/glue/arch/x86_64/crtn.o" \
 	-Wl,--no-undefined -Wl,-rpath-link,"$BUILD"
 echo "built nvcursortest into $OUT/bin"
+
+# Diagnostic tool: asks NVKMS whether a layout is possible without applying it
+# (see LayoutCheck.cpp).
+TOOLDIR=$OBJDIR/nvlayoutcheck
+mkdir -p "$TOOLDIR"
+for f in LayoutCheck NvKmsBitmap NvUtils sdk/ErrorUtils sdk/NvRmApi sdk/NvRmDevice sdk/NvKmsApi sdk/NvKmsDevice sdk/NvKmsSurface; do
+	$TOOLS-g++ -std=c++20 "${FLAGS[@]}" -c "$SRC/$f.cpp" -o "$TOOLDIR/$(basename $f).o"
+done
+$TOOLS-gcc "${FLAGS[@]}" -c "$OGKM/src/common/shared/nvstatus/nvstatus.c" \
+	-o "$TOOLDIR/nvstatus.o"
+$TOOLS-g++ -nostdlib -o "$OUT/bin/nvlayoutcheck" \
+	"$OBJ/system/glue/arch/x86_64/crti.o" "$GCCLIB/crtbegin.o" \
+	"$OBJ/system/glue/start_dyn.o" "$OBJ/system/glue/init_term_dyn.o" \
+	"$TOOLDIR"/*.o \
+	"$OBJ/system/libroot/libroot.so" "$OBJ/kits/libbe.so" \
+	"$GCC_SYSLIBS_RUNTIME/lib/libstdc++.so" \
+	"$GCC_SYSLIBS_RUNTIME/lib/libgcc_s.so" "$GCCLIB/libgcc.a" \
+	"$GCCLIB/crtend.o" "$OBJ/system/glue/arch/x86_64/crtn.o" \
+	-Wl,--no-undefined -Wl,-rpath-link,"$BUILD"
+echo "built nvlayoutcheck into $OUT/bin"

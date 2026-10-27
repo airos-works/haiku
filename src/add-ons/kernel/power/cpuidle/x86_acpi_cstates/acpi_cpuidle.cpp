@@ -21,6 +21,7 @@
 #include <cpuidle.h>
 #include <smp.h>
 #include <thread.h>
+#include <util/AutoLock.h>
 
 #include "x86_mwait.h"
 
@@ -104,7 +105,25 @@ static acpi_cpuidle_driver_info *sAcpiProcessor[SMP_MAX_CPUS];
 static device_manager_info *sDeviceManager;
 static acpi_module_info *sAcpi;
 
+// the deepest state the scheduler mode allows
 static int32 sStateIndex = -1;
+// a state is worth entering when the CPU is expected to stay idle for this
+// many times its exit latency
+static uint32 sResidencyFactor = 4;
+
+// low latency mode leaves out states slower than this to come out of (us)
+#define LOW_LATENCY_MAX_EXIT	100
+
+// how long each CPU stayed idle recently (us), one cache line each
+struct idle_history {
+	bigtime_t	time;
+} __attribute__((aligned(64)));
+static idle_history sIdleTime[SMP_MAX_CPUS];
+
+#ifdef ACPI_CPUIDLE_STATS
+static int32 sStateEntered[MAX_CSTATES];
+static int32 sBusMasterDemoted;
+#endif
 
 
 static status_t
@@ -198,9 +217,10 @@ acpi_cstate_bm_check(void)
 static inline void
 acpi_cstate_ffh_enter(acpi_cstate_info *ci)
 {
+	// The register's address is the MWAIT hint (C1 is 0, C2 0x10, ...).
 	int dummy;
 	x86_monitor(&dummy, 0, 0);
-	x86_mwait((ci->type << 4), MWAIT_INTERRUPTS_BREAK);
+	x86_mwait(ci->address, MWAIT_INTERRUPTS_BREAK);
 }
 
 
@@ -227,112 +247,106 @@ acpi_cstate_enter(acpi_cstate_info *ci)
 static void
 acpi_cstate_set_scheduler_mode(scheduler_mode mode)
 {
-	int maxState;
-	if (mode == SCHEDULER_MODE_POWER_SAVING)
-		maxState = ACPI_STATE_C3;
-	else
-		maxState = ACPI_STATE_C1;
+	bool powerSaving = mode == SCHEDULER_MODE_POWER_SAVING;
 
 	acpi_cpuidle_driver_info *pi = sAcpiProcessor[0];
 	int32 index = -1;
 	for (int i = 0; i < pi->state_count; i++) {
-		if (pi->states[i].type > maxState)
+		if (!powerSaving && i > 0
+			&& pi->states[i].latency > LOW_LATENCY_MAX_EXIT) {
 			break;
+		}
 
 		index = i;
 	}
 
+	sResidencyFactor = powerSaving ? 2 : 4;
 	sStateIndex = index;
 }
 
 
+/*!	Enters the deepest C-state the scheduler mode allows that is worth its
+	exit latency, judging by how long this CPU stayed idle recently (much as
+	x86_cstates and Linux' governors do). Interrupts are disabled meanwhile,
+	as Linux does, so that one that comes in between deciding and entering
+	the state still wakes the CPU: MWAIT is told to treat interrupts as break
+	events, and the I/O port reads of C2 and C3 leave their state on a
+	pending interrupt anyway. Only HLT needs them enabled.
+*/
 static void
 acpi_cstate_idle()
 {
-	Thread* thread = thread_get_current_thread();
-	if (thread->pinned_to_cpu <= 0 || thread->post_interrupt_callback != NULL)
-		panic("invalid thread state");
-
-	acpi_cpuidle_driver_info *pi = sAcpiProcessor[smp_get_current_cpu()];
-	acpi_cstate_info *ci = NULL;
-	int32 stateIndex = -1;
-
-	// If any interrupts occur, we have to back out and start over.
-	struct IdlingState {
-		jmp_buf reset_jump;
-		int32 preparing;
-	} idlingState;
-
-	idlingState.preparing = 1;
-	int result = setjmp(idlingState.reset_jump);
-	if (result != 0) {
-		enable_interrupts();
-		if (ci->type == ACPI_STATE_C3)
-			goto C3_out;
-
-		thread->post_interrupt_callback = NULL;
-		return;
-	}
-
-	thread->post_interrupt_data = &idlingState;
-	thread->post_interrupt_callback = [](void* state) {
-		thread_get_current_thread()->post_interrupt_callback = NULL;
-
-		IdlingState* idlingState = (IdlingState*)state;
-		if (idlingState->preparing == 1) {
-			// No need to longjmp, just unset this value.
-			// (We may be in the middle of calling ACPI or other routines,
-			// so using longjmp may not be safe here anyway.)
-			idlingState->preparing = 0;
-			return;
-		}
-
-		longjmp(idlingState->reset_jump, EINTR);
-	};
-
-	if ((stateIndex = sStateIndex) < 0) {
+	int32 stateIndex = sStateIndex;
+	if (stateIndex < 0) {
 		// No C-state currently set.
-		thread->post_interrupt_callback = NULL;
 		acpi_cstate_halt();
 		return;
 	}
 
-	ci = &pi->states[stateIndex];
-	if (!ci->skip_bm_sts) {
-		// we fall back to C1 if there's bus master activity
-		if (acpi_cstate_bm_check())
-			ci = &pi->states[0];
+	int32 cpu = smp_get_current_cpu();
+	acpi_cpuidle_driver_info *pi = sAcpiProcessor[cpu];
+	bigtime_t expected = sIdleTime[cpu].time;
+	while (stateIndex > 0 && (bigtime_t)pi->states[stateIndex].latency
+			* sResidencyFactor > expected) {
+		stateIndex--;
 	}
-	if (ci->type != ACPI_STATE_C3) {
-		if (atomic_test_and_set(&idlingState.preparing, 0, 1) == 1)
-			acpi_cstate_enter(ci);
 
-		thread->post_interrupt_callback = NULL;
+	acpi_cstate_info *ci = &pi->states[stateIndex];
+	if (ci->method == ACPI_CSTATE_HALT) {
+		bigtime_t start = system_time();
+		acpi_cstate_halt();
+		sIdleTime[cpu].time = (expected + system_time() - start) / 2;
 		return;
 	}
 
-	// set BM_RLD for Bus Master to activity to wake the system from C3
-	// With Newer chipsets BM_RLD is a NOP Since DMA is automatically handled
-	// during C3 State
-	if (pi->flags & ACPI_FLAG_C_BM)
-		sAcpi->write_bit_register(ACPI_BITREG_BUS_MASTER_RLD, 1);
+	InterruptsLocker locker;
 
-	// disable bus master arbitration during C3
-	if (pi->flags & ACPI_FLAG_C_ARB)
-		sAcpi->write_bit_register(ACPI_BITREG_ARB_DISABLE, 1);
+	// With bus master activity, C3 would have to keep the caches coherent:
+	// the deepest state short of it instead, as Linux does
+	if (ci->type == ACPI_STATE_C3 && !ci->skip_bm_sts
+		&& acpi_cstate_bm_check()) {
+		while (stateIndex > 0 && pi->states[stateIndex].type == ACPI_STATE_C3)
+			stateIndex--;
+		ci = &pi->states[stateIndex];
+#ifdef ACPI_CPUIDLE_STATS
+		atomic_add(&sBusMasterDemoted, 1);
+#endif
+		if (ci->method == ACPI_CSTATE_HALT) {
+			locker.Unlock();
+			bigtime_t start = system_time();
+			acpi_cstate_halt();
+			sIdleTime[cpu].time = (expected + system_time() - start) / 2;
+			return;
+		}
+	}
+#ifdef ACPI_CPUIDLE_STATS
+	atomic_add(&sStateEntered[stateIndex], 1);
+#endif
 
-	if (atomic_test_and_set(&idlingState.preparing, 0, 1) == 1)
+	bigtime_t start = system_time();
+	if (ci->type != ACPI_STATE_C3)
+		acpi_cstate_enter(ci);
+	else {
+		// set BM_RLD for Bus Master to activity to wake the system from C3
+		// With Newer chipsets BM_RLD is a NOP Since DMA is automatically
+		// handled during C3 State
+		if (pi->flags & ACPI_FLAG_C_BM)
+			sAcpi->write_bit_register(ACPI_BITREG_BUS_MASTER_RLD, 1);
+
+		// disable bus master arbitration during C3
+		if (pi->flags & ACPI_FLAG_C_ARB)
+			sAcpi->write_bit_register(ACPI_BITREG_ARB_DISABLE, 1);
+
 		acpi_cstate_enter(ci);
 
-C3_out:
-	thread->post_interrupt_callback = NULL;
+		// clear BM_RLD and re-enable the arbiter
+		if (pi->flags & ACPI_FLAG_C_BM)
+			sAcpi->write_bit_register(ACPI_BITREG_BUS_MASTER_RLD, 0);
 
-	// clear BM_RLD and re-enable the arbiter
-	if (pi->flags & ACPI_FLAG_C_BM)
-		sAcpi->write_bit_register(ACPI_BITREG_BUS_MASTER_RLD, 0);
-
-	if (pi->flags & ACPI_FLAG_C_ARB)
-		sAcpi->write_bit_register(ACPI_BITREG_ARB_DISABLE, 0);
+		if (pi->flags & ACPI_FLAG_C_ARB)
+			sAcpi->write_bit_register(ACPI_BITREG_ARB_DISABLE, 0);
+	}
+	sIdleTime[cpu].time = (expected + system_time() - start) / 2;
 }
 
 
@@ -445,6 +459,14 @@ acpi_cstate_quirks(acpi_cpuidle_driver_info *device)
 	// Calculated Model Value: M = (Extended Model << 4) + Model
 	uint32 model = (cpu->arch.extended_model << 4) + cpu->arch.model;
 
+	// AMD Zen and later keep their caches coherent in C3 and do not use
+	// ARB_DIS (as Linux): neither BM_RLD nor ARB_DIS are written.
+	if (cpu->arch.vendor == VENDOR_AMD && cpu->arch.family == 0xf
+		&& cpu->arch.family + cpu->arch.extended_family >= 0x17) {
+		device->flags &= ~(ACPI_FLAG_C_ARB | ACPI_FLAG_C_BM);
+		return;
+	}
+
 	// On all recent Intel platforms, ARB_DIS is not necessary
 	if (cpu->arch.vendor != VENDOR_INTEL)
 		return;
@@ -458,13 +480,13 @@ acpi_cpuidle_setup(acpi_cpuidle_driver_info *device)
 {
 	// _PDC is deprecated in the ACPI 3.0, we will try _OSC firstly
 	// and fall back to _PDC if _OSC fail
+	// (Firmware that does not want to know, like the processor devices of
+	// AMD's Phoenix, has neither: like Linux, go on without.)
 	status_t status = acpi_eval_osc(device);
 	if (status != B_OK)
 		status = acpi_eval_pdc(device);
-	if (status != B_OK) {
+	if (status != B_OK)
 		dprintf("failed to eval _OSC and _PDC\n");
-		return status;
-	}
 
 	acpi_data buffer;
 	buffer.pointer = NULL;
@@ -514,21 +536,30 @@ acpi_cpuidle_setup(acpi_cpuidle_driver_info *device)
 
 
 static status_t
-acpi_processor_init(acpi_cpuidle_driver_info *device)
+acpi_processor_init(acpi_cpuidle_driver_info *device, bool isDevice)
 {
-	// get the CPU index
+	// get the CPU index: a Processor object's ID, or a processor device's
+	// _UID (ACPI0007), both the ACPI processor UID of the MADT
 	acpi_data buffer;
 	buffer.pointer = NULL;
 	buffer.length = ACPI_ALLOCATE_BUFFER;
-	status_t status = device->acpi->evaluate_method(device->acpi_cookie, NULL,
-		NULL, &buffer);
+	status_t status = device->acpi->evaluate_method(device->acpi_cookie,
+		isDevice ? "_UID" : NULL, NULL, &buffer);
 	if (status != B_OK) {
 		dprintf("failed to get processor obj\n");
 		return status;
 	}
 
 	acpi_object_type *tmpObject = (acpi_object_type *)buffer.pointer;
-	const uint32 processor_cpu_id = tmpObject->processor.cpu_id;
+	uint32 processor_cpu_id;
+	if (!isDevice)
+		processor_cpu_id = tmpObject->processor.cpu_id;
+	else if (tmpObject->object_type == ACPI_TYPE_INTEGER)
+		processor_cpu_id = tmpObject->integer.integer;
+	else {
+		free(buffer.pointer);
+		return B_BAD_TYPE;
+	}
 	free(buffer.pointer);
 
 	// Find this processor's CPU index.
@@ -569,6 +600,25 @@ acpi_cpuidle_uninit()
 }
 
 
+static status_t std_ops(int32 op, ...);
+
+
+static cpuidle_module_info sAcpiidleModule = {
+	{
+		ACPI_CPUIDLE_MODULE_NAME,
+		0,
+		std_ops,
+	},
+
+	0.2f,
+
+	acpi_cstate_set_scheduler_mode,
+
+	acpi_cstate_idle,
+	acpi_cstate_wait
+};
+
+
 static status_t
 acpi_cpuidle_init()
 {
@@ -580,15 +630,29 @@ acpi_cpuidle_init()
 	status_t status = B_OK;
 	int32 processors = 0;
 	device_node* processor = NULL;
+	bool isDevice = false;
 	while (true) {
+		// Processor objects first, then processor devices (ACPI0007), which
+		// replace them in newer firmware
 		device_attr acpiAttrs[] = {
 			{ B_DEVICE_BUS, B_STRING_TYPE, { .string = "acpi" }},
 			{ ACPI_DEVICE_TYPE_ITEM, B_UINT32_TYPE, { .ui32 = ACPI_TYPE_PROCESSOR }},
 			{ NULL }
 		};
+		device_attr deviceAttrs[] = {
+			{ B_DEVICE_BUS, B_STRING_TYPE, { .string = "acpi" }},
+			{ ACPI_DEVICE_HID_ITEM, B_STRING_TYPE, { .string = "ACPI0007" }},
+			{ NULL }
+		};
 
-		if (sDeviceManager->find_child_node(root, acpiAttrs, &processor) != B_OK)
-			break;
+		if (sDeviceManager->find_child_node(root,
+				isDevice ? deviceAttrs : acpiAttrs, &processor) != B_OK) {
+			if (isDevice || processors > 0)
+				break;
+			isDevice = true;
+			processor = NULL;
+			continue;
+		}
 
 		acpi_cpuidle_driver_info *device;
 		device = (acpi_cpuidle_driver_info *)calloc(1, sizeof(*device));
@@ -602,7 +666,7 @@ acpi_cpuidle_init()
 		sDeviceManager->get_driver(processor, (driver_module_info **)&device->acpi,
 			(void **)&device->acpi_cookie);
 
-		status = acpi_processor_init(device);
+		status = acpi_processor_init(device, isDevice);
 		if (status != B_OK) {
 			sDeviceManager->put_node(processor);
 			free(device);
@@ -629,6 +693,15 @@ acpi_cpuidle_init()
 	if (status == B_OK) {
 		acpi_cstate_set_scheduler_mode(SCHEDULER_MODE_LOW_LATENCY);
 		dprintf("using x86 ACPI idle\n");
+
+		// AMD's MWAIT only enters C1: deeper states (the cores' CC6) are
+		// only to be had through _CST, so on AMD this module comes before
+		// x86_cstates.
+		acpi_cpuidle_driver_info* pi = sAcpiProcessor[0];
+		if (gCPU[0].arch.vendor == VENDOR_AMD && pi->state_count > 0
+			&& pi->states[pi->state_count - 1].type > ACPI_STATE_C1) {
+			sAcpiidleModule.rank = 0.9f;
+		}
 	}
 
 	if (status != B_OK)
@@ -653,21 +726,6 @@ std_ops(int32 op, ...)
 	return B_ERROR;
 }
 
-
-static cpuidle_module_info sAcpiidleModule = {
-	{
-		ACPI_CPUIDLE_MODULE_NAME,
-		0,
-		std_ops,
-	},
-
-	0.2f,
-
-	acpi_cstate_set_scheduler_mode,
-
-	acpi_cstate_idle,
-	acpi_cstate_wait
-};
 
 
 module_info *modules[] = {

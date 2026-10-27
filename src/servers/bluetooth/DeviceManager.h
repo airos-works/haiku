@@ -13,6 +13,7 @@
 #include <Node.h>
 #include <Looper.h>
 #include <Locker.h>
+#include <StringList.h>
 
 
 class DeviceManager : public BLooper {
@@ -33,8 +34,11 @@ class DeviceManager : public BLooper {
 		status_t RemoveDirectory(node_ref* nref);
 		status_t AddDevice(entry_ref* nref);
 		static status_t _PrepareDevice(void* message);
-		
+
 		BLocker fLock;
+		BStringList fDevices;
+			// handed to the server: the first look and the node monitor
+			// may both see a radio
 };
 
 #endif // _DEVICE_MANAGER_H

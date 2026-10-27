@@ -33,8 +33,8 @@ public:
 
 			void			Removed();
 			bool			IsRemoved() { return fRemoved; };
+			void			OrphanBuffers();
 
-			status_t		CompareAndReattach(usb_device device);
 	virtual	status_t		SetupDevice(bool deviceReplugged);
 
 			usb_device		USBDevice() { return fDevice; }
@@ -62,6 +62,7 @@ private:
 			uint16			fVendorID;
 			uint16			fProductID;
 	const	char*			fDescription;
+			char			fName[32];
 			bool			fNonBlocking;
 
 			AudioControlInterface	fAudioControl;

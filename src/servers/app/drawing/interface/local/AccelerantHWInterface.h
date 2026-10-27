@@ -14,6 +14,8 @@
 #include "HWInterface.h"
 
 #include <AutoDeleter.h>
+#include <Autolock.h>
+#include <Locker.h>
 #include <image.h>
 #include <video_overlay.h>
 
@@ -59,6 +61,10 @@ public:
 									uint32 count, bool switchMode = true);
 
 	virtual sem_id				RetraceSemaphore();
+	virtual	sem_id				OutputRetraceSemaphore(uint32 id);
+	virtual	status_t			OutputScanLine(uint32 id, int32* _line,
+									int32* _lines, bigtime_t* _scanStart,
+									bigtime_t* _period);
 	virtual status_t			WaitForRetrace(
 									bigtime_t timeout = B_INFINITE_TIMEOUT);
 
@@ -158,6 +164,10 @@ private:
 
 			// what the accelerant shows, while it shows the cursor
 			ServerCursorReference	fHardwareCursor;
+			// serializes the cursor hooks among themselves: a move takes no
+			// exclusive lock, which would block the drawing threads and the
+			// vertical blank flush behind every mouse move
+			BLocker				fCursorHookLock;
 
 			// dpms hooks
 			dpms_capabilities	fAccDPMSCapabilities;
@@ -189,6 +199,10 @@ private:
 			get_display_output_modes fAccGetDisplayOutputModes;
 			set_display_layout	fAccSetDisplayLayout;
 			set_display_change_port fAccSetDisplayChangePort;
+			get_display_output_retrace_semaphore
+								fAccGetDisplayOutputRetraceSemaphore;
+			get_display_output_scan_line
+								fAccGetDisplayOutputScanLine;
 			port_id				fDisplayChangePort;
 			thread_id			fDisplayChangeThread;
 

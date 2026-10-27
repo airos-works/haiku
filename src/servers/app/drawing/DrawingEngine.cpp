@@ -11,6 +11,7 @@
 #include "DrawingEngine.h"
 
 #include <Bitmap.h>
+#include <ControlLook.h>
 #include <StackOrHeapArray.h>
 
 #include <stdio.h>
@@ -104,7 +105,8 @@ public:
 	DrawTransaction(DrawingEngine *engine, const BRect &bounds)
 		:
 		fEngine(engine),
-		fOverlaysHidden(false)
+		fOverlaysHidden(false),
+		fWaitForRetrace(false)
 	{
 		fDirty.Set(bounds);
 		fDirty.IntersectWith(fEngine->fPainter->ClippingRegion());
@@ -117,7 +119,8 @@ public:
 	DrawTransaction(DrawingEngine *engine)
 		:
 		fEngine(engine),
-		fOverlaysHidden(false)
+		fOverlaysHidden(false),
+		fWaitForRetrace(false)
 	{
 		fDirty = *fEngine->fPainter->ClippingRegion();
 		if (fDirty.CountRects() == 0)
@@ -129,7 +132,8 @@ public:
 	DrawTransaction(DrawingEngine *engine, const BRegion &region)
 		:
 		fEngine(engine),
-		fOverlaysHidden(false)
+		fOverlaysHidden(false),
+		fWaitForRetrace(false)
 	{
 		// region is already clipped
 		fDirty = region;
@@ -141,10 +145,21 @@ public:
 
 	~DrawTransaction()
 	{
-		if (fEngine->fCopyToFront)
+		if (fEngine->fCopyToFront) {
+			if (fWaitForRetrace && IsDirty())
+				fEngine->fGraphicsCard->WaitForRetraceBeforeCopy();
 			fEngine->fGraphicsCard->InvalidateRegion(fDirty);
+		} else if (fWaitForRetrace)
+			fEngine->fRetraceRequested = true;
 		if (fOverlaysHidden)
 			fEngine->fGraphicsCard->ShowFloatingOverlays();
+	}
+
+	// The drawing goes to the screen at the next vertical blank: now, when
+	// the drawing is copied there, or else when the update it is part of is.
+	void SetWaitForRetrace()
+	{
+		fWaitForRetrace = true;
 	}
 
 	bool IsDirty() const
@@ -171,6 +186,7 @@ public:
 private:
 	DrawingEngine *fEngine;
 	bool fOverlaysHidden;
+	bool fWaitForRetrace;
 	BRegion fDirty;
 };
 
@@ -182,7 +198,8 @@ DrawingEngine::DrawingEngine(HWInterface* interface)
 	:
 	fPainter(new Painter()),
 	fGraphicsCard(NULL),
-	fCopyToFront(true)
+	fCopyToFront(true),
+	fRetraceRequested(false)
 {
 	SetHWInterface(interface);
 }
@@ -290,6 +307,13 @@ DrawingEngine::SetCopyToFrontEnabled(bool enable)
 void
 DrawingEngine::CopyToFront(/*const*/ BRegion& region)
 {
+	// drawing in the region asked for B_WAIT_FOR_RETRACE
+	if (fRetraceRequested) {
+		fRetraceRequested = false;
+		if (region.CountRects() > 0)
+			fGraphicsCard->WaitForRetraceBeforeCopy();
+	}
+
 	if (fPainter->DeviceScale() != 1) {
 		BRegion scaled;
 		_ScaleRegion(region, scaled);
@@ -561,8 +585,6 @@ DrawingEngine::CopyRegion(/*const*/ BRegion* region, int32 xOffset,
 	// NOTE: region is already clipped
 	ASSERT_PARALLEL_LOCKED();
 
-	// pixels move in the buffer, which is finer than the region
-	BRegion scaledRegion;
 	if (fPainter->DeviceScale() != 1) {
 		// A copy is exact only when the translation is an integer number of
 		// device pixels. Rounding each movement accumulates error and changes
@@ -571,12 +593,37 @@ DrawingEngine::CopyRegion(/*const*/ BRegion* region, int32 xOffset,
 		float deviceY = yOffset * fPainter->DeviceScale();
 		if (deviceX != floorf(deviceX) || deviceY != floorf(deviceY))
 			return false;
-		_ScaleRegion(*region, scaledRegion);
-		region = &scaledRegion;
-		xOffset = (int32)deviceX;
-		yOffset = (int32)deviceY;
+		return CopyRegionByDeviceOffset(region, (int32)deviceX,
+			(int32)deviceY);
 	}
+	return _CopyRegion(region, xOffset, yOffset);
+}
 
+
+/*!	Moves the pixels of a logical region by a number of buffer pixels, which
+	is what the caller decided the move is worth at the drawing density.
+	Nothing outside the region scaled to buffer pixels and moved is touched.
+*/
+bool
+DrawingEngine::CopyRegionByDeviceOffset(/*const*/ BRegion* region,
+	int32 deviceX, int32 deviceY)
+{
+	ASSERT_PARALLEL_LOCKED();
+
+	if (fPainter->DeviceScale() == 1)
+		return _CopyRegion(region, deviceX, deviceY);
+
+	// pixels move in the buffer, which is finer than the region
+	BRegion scaledRegion;
+	_ScaleRegion(*region, scaledRegion);
+	return _CopyRegion(&scaledRegion, deviceX, deviceY);
+}
+
+
+bool
+DrawingEngine::_CopyRegion(/*const*/ BRegion* region, int32 xOffset,
+	int32 yOffset)
+{
 	BRect frame = region->Frame();
 	frame = frame | frame.OffsetByCopy(xOffset, yOffset);
 	if (!fGraphicsCard->DrawingBuffer()->Bounds().Contains(frame))
@@ -689,9 +736,25 @@ DrawingEngine::DrawBitmap(ServerBitmap* bitmap, const BRect& bitmapRect,
 {
 	ASSERT_PARALLEL_LOCKED();
 
-	DrawTransaction transaction(this, fPainter->TransformAndClipRect(viewRect));
-	if (transaction.IsDirty())
-		fPainter->DrawBitmap(bitmap, bitmapRect, viewRect, options);
+	BRect clipped = (options & B_DEVICE_PIXEL_BITMAP) != 0
+			&& fPainter->HasIdentityViewTransform()
+		? fPainter->ClipRect(fPainter->DeviceBitmapRect(bitmapRect, viewRect))
+		: fPainter->TransformAndClipRect(viewRect);
+	bool waitForRetrace = (options & B_WAIT_FOR_RETRACE) != 0;
+	if (waitForRetrace && !fGraphicsCard->IsDoubleBuffered()
+		&& clipped.IsValid()) {
+		// drawn straight into the screen: the blank comes first
+		fGraphicsCard->WaitForRetraceBeforeCopy();
+		waitForRetrace = false;
+	}
+
+	DrawTransaction transaction(this, clipped);
+	if (!transaction.IsDirty())
+		return;
+
+	fPainter->DrawBitmap(bitmap, bitmapRect, viewRect, options);
+	if (waitForRetrace)
+		transaction.SetWaitForRetrace();
 }
 
 
@@ -1288,6 +1351,202 @@ DrawingEngine::StrokeLineArray(int32 numLines,
 }
 
 
+namespace {
+
+/*!	The buffer pixels of the logical pixels along one axis of a frame whose
+	rings are drawn with StrokeFrameLineArray(): the rings at either end get
+	the pixels of the band they cover, shared out by
+	distribute_ring_widths(), and every other pixel keeps its usual ones.
+*/
+class FrameAxis {
+public:
+	FrameAxis(int32 low, int32 high, int32 rings, bool hasLow, bool hasHigh,
+		uint32 uniformRings, bool overFill, float scale)
+		:
+		fLow(low),
+		fHigh(high),
+		fRings(rings),
+		fHasLow(hasLow),
+		fHasHigh(hasHigh),
+		fScale(scale)
+	{
+		int32 widths[kMaxRings];
+		fLowEdges[0] = _Edge(low);
+		if (overFill)
+			_Fixed(uniformRings, widths);
+		else {
+			_Distribute(_Edge(low + rings) - fLowEdges[0], uniformRings,
+				widths);
+		}
+		for (int32 i = 0; i < rings; i++)
+			fLowEdges[i + 1] = fLowEdges[i] + widths[i];
+		fHighEdges[0] = _Edge(high + 1);
+		if (!overFill) {
+			_Distribute(fHighEdges[0] - _Edge(high + 1 - rings), uniformRings,
+				widths);
+		}
+		for (int32 i = 0; i < rings; i++)
+			fHighEdges[i + 1] = fHighEdges[i] - widths[i];
+	}
+
+	static const int32 kMaxRings = 8;
+
+	//! The buffer pixels [start, end) of logical pixel \a pixel.
+	void Span(int32 pixel, int32& start, int32& end) const
+	{
+		if (fHasLow && pixel >= fLow && pixel < fLow + fRings) {
+			start = fLowEdges[pixel - fLow];
+			end = fLowEdges[pixel - fLow + 1];
+		} else if (fHasHigh && pixel <= fHigh && pixel > fHigh - fRings) {
+			start = fHighEdges[fHigh - pixel + 1];
+			end = fHighEdges[fHigh - pixel];
+		} else {
+			start = _Edge(pixel);
+			end = _Edge(pixel + 1);
+		}
+	}
+
+private:
+	int32 _Edge(int32 pixel) const
+	{
+		return (int32)floorf(pixel * fScale);
+	}
+
+	/*!	Over a fill nothing needs to meet the inner edge: the rings that keep
+		their width get the scale rounded, the others its whole part.
+	*/
+	void _Fixed(uint32 uniformRings, int32* widths) const
+	{
+		int32 base = max_c(1, (int32)floorf(fScale));
+		int32 rounded = max_c(1, (int32)floorf(fScale + 0.5f));
+		for (int32 i = 0; i < fRings; i++)
+			widths[i] = (uniformRings & (1 << i)) != 0 ? rounded : base;
+	}
+
+	/*!	Every ring gets the whole part of the scale; of the pixels left over,
+		the rings that keep their width get one each first when the scale
+		rounds up, then the others, outermost first.
+	*/
+	void _Distribute(int32 total, uint32 uniformRings, int32* widths) const
+	{
+		int32 base = max_c(1, (int32)floorf(fScale));
+		int32 extra = total - fRings * base;
+		for (int32 i = 0; i < fRings; i++)
+			widths[i] = base;
+		if (floorf(fScale + 0.5f) > base) {
+			for (int32 i = 0; i < fRings && extra > 0; i++) {
+				if ((uniformRings & (1 << i)) != 0) {
+					widths[i]++;
+					extra--;
+				}
+			}
+		}
+		for (int32 i = 0; i < fRings && extra > 0; i++) {
+			if ((uniformRings & (1 << i)) == 0) {
+				widths[i]++;
+				extra--;
+			}
+		}
+		for (int32 i = 0; i < fRings && extra > 0; i++) {
+			widths[i]++;
+			extra--;
+		}
+		for (int32 i = fRings - 1; i >= 0 && extra < 0; i--) {
+			// cannot happen with a scale above 1, but never go negative
+			int32 take = min_c(widths[i] - 1, -extra);
+			widths[i] -= take;
+			extra += take;
+		}
+	}
+
+	int32	fLow;
+	int32	fHigh;
+	int32	fRings;
+	bool	fHasLow;
+	bool	fHasHigh;
+	float	fScale;
+	int32	fLowEdges[kMaxRings + 1];
+	int32	fHighEdges[kMaxRings + 1];
+};
+
+}	// namespace
+
+
+/*!	Draws the lines of a frame's rings (see ViewFrameLineArrayInfo). At a
+	fractional scale one logical pixel is one buffer pixel in some places and
+	two in others, so the same ring would be as thick as one on one side of
+	a control and as two on the other. Here the band the rings cover keeps
+	its edges, so that it still meets what is drawn around and inside it,
+	and its pixels are shared out the same way on every side.
+*/
+void
+DrawingEngine::StrokeFrameLineArray(const ViewFrameLineArrayInfo& info,
+	const ViewLineArrayInfo* lines)
+{
+	ASSERT_PARALLEL_LOCKED();
+
+	float scale = fPainter->DeviceScale();
+	BRect frame = info.frame;
+	int32 rings = info.rings;
+	if (scale == floorf(scale) || !fPainter->HasIdentityViewTransform()
+		|| rings < 1 || rings > FrameAxis::kMaxRings
+		|| frame.Width() + 1 < 2 * rings || frame.Height() + 1 < 2 * rings) {
+		StrokeLineArray(info.lineCount, lines);
+		return;
+	}
+
+	bool overFill = (info.flags & kFrameLinesOverFill) != 0;
+	FrameAxis horizontal((int32)frame.left, (int32)frame.right, rings,
+		(info.borders & BControlLook::B_LEFT_BORDER) != 0,
+		(info.borders & BControlLook::B_RIGHT_BORDER) != 0,
+		info.uniformRings, overFill, scale);
+	FrameAxis vertical((int32)frame.top, (int32)frame.bottom, rings,
+		(info.borders & BControlLook::B_TOP_BORDER) != 0,
+		(info.borders & BControlLook::B_BOTTOM_BORDER) != 0,
+		info.uniformRings, overFill, scale);
+
+	BStackOrHeapArray<BRect, 64> deviceRects(info.lineCount);
+	if (!deviceRects.IsValid())
+		return;
+
+	BRect touched;
+	for (int32 i = 0; i < info.lineCount; i++) {
+		BPoint a = lines[i].startPoint;
+		BPoint b = lines[i].endPoint;
+		if (a.x != b.x && a.y != b.y) {
+			deviceRects[i] = BRect();
+			continue;
+		}
+		int32 left, right, top, bottom, ignore;
+		horizontal.Span((int32)floorf(min_c(a.x, b.x)), left, ignore);
+		horizontal.Span((int32)floorf(max_c(a.x, b.x)), ignore, right);
+		vertical.Span((int32)floorf(min_c(a.y, b.y)), top, ignore);
+		vertical.Span((int32)floorf(max_c(a.y, b.y)), ignore, bottom);
+		deviceRects[i] = BRect(left, top, right - 1, bottom - 1);
+		touched = touched | deviceRects[i];
+	}
+
+	DrawTransaction transaction(this, fPainter->ClipRect(touched));
+	if (!transaction.IsDirty())
+		return;
+
+	rgb_color oldColor = fPainter->HighColor();
+	struct pattern pattern = fPainter->Pattern();
+	for (int32 i = 0; i < info.lineCount; i++) {
+		if (deviceRects[i].IsValid()) {
+			fPainter->FillDeviceRect(deviceRects[i], lines[i].color);
+			continue;
+		}
+		// not along an axis: as it is
+		fPainter->SetHighColor(lines[i].color);
+		fPainter->SetPattern(B_SOLID_HIGH);
+		fPainter->StrokeLine(lines[i].startPoint, lines[i].endPoint);
+	}
+	fPainter->SetHighColor(oldColor);
+	fPainter->SetPattern(pattern);
+}
+
+
 // #pragma mark -
 
 
@@ -1428,6 +1687,13 @@ ServerBitmap*
 DrawingEngine::DumpToBitmap()
 {
 	return NULL;
+}
+
+
+void
+DrawingEngine::WaitForPendingFlush()
+{
+	fGraphicsCard->WaitForPendingFlush(100000);
 }
 
 

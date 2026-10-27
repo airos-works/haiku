@@ -7,6 +7,8 @@
 
 #include "Driver.h"
 
+#include <stdio.h>
+
 #include <AutoLock.h>
 #include <usb/USB_audio.h>
 
@@ -32,20 +34,9 @@ usb_audio_device_added(usb_device device, void** cookie)
 
 	MutexLocker _(gDriverLock);
 
-	// check if this is a replug of an existing device first
-	for (int32 i = 0; i < MAX_DEVICES; i++) {
-		if (gDevices[i] == NULL)
-			continue;
-
-		if (gDevices[i]->CompareAndReattach(device) != B_OK)
-			continue;
-
-		TRACE(INF, "The device is plugged back. Use entry at %ld.\n", i);
-		*cookie = gDevices[i];
-		return B_OK;
-	}
-
-	// no such device yet, create a new one
+	// A device plugged in again is a new one, with a name of its own: one
+	// that was unplugged while it was open stays until its last close (and
+	// setting it up again on top of what it had doubled its streams).
 	Device* audioDevice = new(std::nothrow) Device(device);
 	if (audioDevice == 0)
 		return ENODEV;
@@ -90,7 +81,8 @@ usb_audio_device_removed(void* cookie)
 	for (int32 i = 0; i < MAX_DEVICES; i++) {
 		if (gDevices[i] == device) {
 			if (device->IsOpen()) {
-				// the device will be deleted upon being freed
+				// the device will be deleted upon being freed; it is no
+				// longer published, so that its users let it go
 				device->Removed();
 			} else {
 				gDevices[i] = NULL;
@@ -177,8 +169,16 @@ usb_audio_open(const char* name, uint32 flags, void** cookie)
 
 	*cookie = NULL;
 	status_t status = ENODEV;
-	for (int32 i = 0; i < MAX_DEVICES && gDevices[i] != NULL; i++) {
-		if (strcmp(gDeviceNames[i], name) == 0) {
+	for (int32 i = 0; i < MAX_DEVICES; i++) {
+		// publish_devices() names the device in slot i "usb/<i + 1>";
+		// gDeviceNames[] has no gaps, gDevices[] can have them
+		if (gDevices[i] == NULL || gDevices[i]->IsRemoved())
+			continue;
+
+		char deviceName[64];
+		snprintf(deviceName, sizeof(deviceName), "%s%" B_PRId32,
+			sDeviceBaseName, i + 1);
+		if (strcmp(deviceName, name) == 0) {
 			status = gDevices[i]->Open(flags);
 			*cookie = gDevices[i];
 			break;
@@ -226,7 +226,23 @@ static status_t
 usb_audio_free(void* cookie)
 {
 	Device* device = (Device*)cookie;
-	return device->Free();
+
+	MutexLocker _(gDriverLock);
+	status_t status = device->Free();
+	if (device->IsRemoved()) {
+		// Unplugged while it was open: devfs disconnected its user when it
+		// was no longer published. That user may still hold its buffers.
+		device->OrphanBuffers();
+		for (int32 i = 0; i < MAX_DEVICES; i++) {
+			if (gDevices[i] == device) {
+				gDevices[i] = NULL;
+				break;
+			}
+		}
+		delete device;
+		TRACE(INF, "Unplugged device freed.\n");
+	}
+	return status;
 }
 
 
@@ -242,7 +258,7 @@ publish_devices()
 
 	int32 deviceCount = 0;
 	for (size_t i = 0; i < MAX_DEVICES; i++) {
-		if (gDevices[i] == NULL)
+		if (gDevices[i] == NULL || gDevices[i]->IsRemoved())
 			continue;
 
 		gDeviceNames[deviceCount] = (char*)malloc(strlen(sDeviceBaseName) + 4);

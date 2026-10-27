@@ -1,0 +1,59 @@
+Linux drm/imagination, the files the powervr driver reuses
+
+Source:   https://github.com/torvalds/linux (master)
+Commit:   3857c2fe5449541e24afc5efdb0f81a8a8f9a3a0
+          (2026-10-09, "Merge tag 'pci-v7.3-fixes-4' of
+          git://git.kernel.org/pub/scm/linux/kernel/git/pci/pci")
+Paths:    drivers/gpu/drm/imagination/<file>
+          include/uapi/drm/pvr_drm.h -> uapi/drm/pvr_drm.h
+Fetched:  2026-10-10, raw files from
+          https://raw.githubusercontent.com/torvalds/linux/<commit>/<path>
+Licence:  "GPL-2.0-only OR MIT" (pvr_dump.[ch]: "GPL-2.0 OR MIT"; pvr_drm.h:
+          "(GPL-2.0-only WITH Linux-syscall-note) OR MIT"), used here under
+          the MIT licence. SPDX lines and copyright notices are kept.
+
+Post-6.18 fixes in this tree that the reused files carry:
+  51e39ceeca7e  Improve firmware power off for layout_mars config
+                (pvr_fw_startstop.c: MARS_IDLE instead of the Sidekick/SLC
+                polls; this core has LAYOUT_MARS)
+  62a6f98cda4e  Skip 2nd thread DM association for non META Firmware
+                (pvr_fw_startstop.c)
+and, in pvr_mmu.c and pvr_queue.c (reused since M3) and pvr_power.c (not
+reused):
+  0a8224058a58  Fix page count for page table for map() interface
+  7b824c293a6b  Propagate map failures correctly from pvr_mmu_map_sgl()
+  a55c2a5c8d68  Fix deadlock in soft reset sequence
+
+Files (67 + uapi/drm/pvr_drm.h):
+
+  generated hardware and firmware interface definitions (H)
+    pvr_rogue_cr_defs.h pvr_rogue_cr_defs_client.h pvr_rogue_defs.h
+    pvr_rogue_fwif.h pvr_rogue_fwif_check.h pvr_rogue_fwif_client.h
+    pvr_rogue_fwif_client_check.h pvr_rogue_fwif_common.h
+    pvr_rogue_fwif_dev_info.h pvr_rogue_fwif_resetframework.h
+    pvr_rogue_fwif_sf.h pvr_rogue_fwif_shared.h pvr_rogue_fwif_shared_check.h
+    pvr_rogue_fwif_stream.h pvr_rogue_heap_config.h pvr_rogue_meta.h
+    pvr_rogue_mips.h pvr_rogue_mips_check.h pvr_rogue_mmu_defs.h
+    pvr_rogue_riscv.h pvr_fw_info.h pvr_device_info.h pvr_check.h
+
+  firmware load, start, CCBs, trace, device info, MIPS page table (R)
+    pvr_fw.c pvr_fw.h pvr_fw_mips.c pvr_fw_mips.h pvr_fw_startstop.c
+    pvr_fw_startstop.h pvr_fw_util.c pvr_ccb.c pvr_ccb.h pvr_fw_trace.c
+    pvr_fw_trace.h pvr_device_info.c pvr_vm_mips.c pvr_vm_mips.h
+    pvr_dump.c pvr_dump.h
+
+  the userland interface (M3): ioctls, GPU page tables, contexts and
+  their client CCBs, free lists, HWRT data sets, state streams
+    pvr_drv.c (built through glue/pvr_haiku_drv.c) pvr_mmu.c pvr_context.c
+    pvr_context.h pvr_cccb.c pvr_cccb.h pvr_free_list.c pvr_free_list.h
+    pvr_hwrt.c pvr_hwrt.h pvr_stream.c pvr_stream_defs.c pvr_stream_defs.h
+    pvr_debugfs.h
+
+  job submission (M3): jobs, their queues on the GPU scheduler, sync ops
+    pvr_job.c pvr_job.h pvr_queue.c pvr_queue.h pvr_sync.c pvr_sync.h
+
+  headers of files not reused, for their declarations and structures
+    pvr_device.h pvr_drv.h pvr_fw_meta.h pvr_mmu.h pvr_power.h pvr_stream.h
+    pvr_vm.h
+
+Local changes: see README (two: pvr_fw.c, pvr_mmu.c).

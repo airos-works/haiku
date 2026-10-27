@@ -1,0 +1,6 @@
+SubDir HAIKU_TOP src tests servers mcp ;
+
+SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src servers mcp ] ;
+UseHeaders [ FDirName $(HAIKU_TOP) src servers mcp ] ;
+
+SimpleTest MCPJsonTest : JsonTests.cpp Json.cpp : [ TargetLibstdc++ ] ;

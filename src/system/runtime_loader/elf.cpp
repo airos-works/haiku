@@ -1253,6 +1253,7 @@ status_t
 elf_reinit_after_fork(void)
 {
 	recursive_lock_init(&sLock, kLockName);
+	tls_reinit_after_fork();
 
 	// We also need to update the IDs of our images. We are the child and
 	// and have cloned images with different IDs. Since in most cases (fork()

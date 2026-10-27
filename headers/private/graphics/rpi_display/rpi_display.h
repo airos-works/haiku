@@ -30,7 +30,42 @@ enum {
 	// consistent snapshot of rpi_display_shared_info, including hotplug state
 	RPI_DISPLAY_GET_STATE,
 	// struct rpi_display_change_port; negative port unregisters notifications
-	RPI_DISPLAY_SET_CHANGE_PORT
+	RPI_DISPLAY_SET_CHANGE_PORT,
+	// sem_id: the calling team's semaphore, released at every vertical
+	// blank of the first output shown (B_ACCELERANT_RETRACE_SEMAPHORE)
+	RPI_DISPLAY_GET_RETRACE_SEMAPHORE,
+	// maps the hardware cursor's buffer into the caller's team; area_info
+	RPI_DISPLAY_CLONE_CURSOR_BUFFER,
+	// struct rpi_display_cursor; the caller filled the cursor buffer first
+	RPI_DISPLAY_DEFINE_CURSOR,
+	// struct rpi_display_cursor_position; the hotspot, in frame buffer pixels
+	RPI_DISPLAY_MOVE_CURSOR,
+	// bool; shows or hides the cursor
+	RPI_DISPLAY_SHOW_CURSOR,
+	// struct rpi_display_cursor_config; experiments with the cursor's plane
+	RPI_DISPLAY_CURSOR_CONFIG
+};
+
+// the hardware cursor's buffer is this many pixels a side
+#define RPI_DISPLAY_CURSOR_MAX	64
+
+struct rpi_display_cursor_config {
+	uint8	plane_offset;	// added to the display's plane base
+	int8	layer;
+	uint8	image_type;	// a VC_IMAGE_* value
+	uint8	canvas;			// 1: the plane covers the whole 64x64 buffer
+};
+
+struct rpi_display_cursor {
+	uint16	width;
+	uint16	height;
+	int16	hot_x;
+	int16	hot_y;
+};
+
+struct rpi_display_cursor_position {
+	int32	x;
+	int32	y;
 };
 
 #define RPI_DISPLAY_OUTPUT_CONNECTED	0x1

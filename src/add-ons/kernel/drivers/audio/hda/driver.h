@@ -85,6 +85,8 @@ struct hda_controller {
 
 	hda_stream*		streams[HDA_MAX_STREAMS];
 	sem_id			buffer_ready_sem;
+	spinlock		interrupt_lock;
+	int32			lost_interrupts;
 
 	uint8 Read8(uint32 reg)
 	{
@@ -382,6 +384,7 @@ hda_stream* hda_stream_new(hda_audio_group* audioGroup, int type);
 void hda_stream_delete(hda_stream* stream);
 status_t hda_stream_setup_buffers(hda_audio_group* audioGroup,
 	hda_stream* stream, const char* desc);
+bool hda_recover_lost_interrupt(hda_controller* controller);
 status_t hda_stream_start(hda_controller* controller, hda_stream* stream);
 status_t hda_stream_stop(hda_controller* controller, hda_stream* stream);
 

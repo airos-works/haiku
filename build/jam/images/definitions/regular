@@ -130,6 +130,7 @@ rule HaikuImageGetSystemLibs
 			libnetwork.so
 			libnvmm.so@x86_64
 			libpackage.so
+			libquicklook.so
 			libscreensaver.so
 			libtextencoding.so
 			libtracker.so
@@ -158,6 +159,7 @@ SYSTEM_SERVERS += [ FFilterByBuildFeatures
 	bluetooth_server
 	print_server
 	print_addon_server
+	quick_look_server
 ] ;
 
 # Bluetooth stack + drivers
@@ -174,6 +176,10 @@ SYSTEM_ADD_ONS_DRIVERS_BT_H2 +=
 ;
 
 SYSTEM_ADD_ONS_ACCELERANTS += [ FFilterByBuildFeatures
+	x86_64 @{
+		# AMD GPUs driven by amdgpu_drm (Linux's amdgpu, a separate add-on)
+		amdgpu_kms.accelerant
+	}@ # x86_64
 	x86,x86_64 @{
 		ati.accelerant
 		intel_810.accelerant
@@ -213,6 +219,7 @@ SYSTEM_ADD_ONS_TRANSLATORS += [ FFilterByBuildFeatures
 ] ;
 
 SYSTEM_ADD_ONS_MEDIA += [ FFilterByBuildFeatures
+	bluetooth_audio.media_addon
 	cortex_audioadapter.media_addon
 	cortex_flanger.media_addon
 	cortex_logging_consumer.media_addon
@@ -237,6 +244,7 @@ SYSTEM_ADD_ONS_MEDIA_PLUGINS += [ FFilterByBuildFeatures
 	raw_decoder
 	rpi_hevc@arm64
 	rpi_mmal@arm64
+	sunxi_cedar@arm64
 ] ;
 
 SYSTEM_ADD_ONS_PRINT += [ FFilterByBuildFeatures
@@ -271,6 +279,12 @@ SYSTEM_ADD_ONS_SCREENSAVERS += [ FFilterByBuildFeatures
 	Nebula
 	Shelf
 	Spider
+] ;
+
+SYSTEM_ADD_ONS_QUICK_LOOK = [ FFilterByBuildFeatures
+	ImagePreview
+	PDFPreview@mupdf
+	TextPreview
 ] ;
 
 SYSTEM_ADD_ONS_DRIVERS_AUDIO +=

@@ -292,6 +292,18 @@ RemoteDevice::GetConnectionState()
 	BMessage request(BT_REQ_CONN_STATE);
 	BMessage reply;
 
+	// The server looks the device up per controller.
+	if (fDiscovererLocalDevice != NULL)
+		request.AddInt32("hci_id", fDiscovererLocalDevice->ID());
+	else {
+		BMessage acquire(BT_MSG_ACQUIRE_LOCAL_DEVICE);
+		BMessage acquired;
+		hci_id hid;
+		if (fMessenger->SendMessage(&acquire, &acquired) == B_OK
+			&& acquired.FindInt32("hci_id", &hid) == B_OK)
+			request.AddInt32("hci_id", hid);
+	}
+
 	bdaddr_t bdaddr = GetBluetoothAddress();
 	request.AddData("bdaddr", B_ANY_TYPE, &bdaddr, sizeof(bdaddr_t));
 
@@ -299,7 +311,8 @@ RemoteDevice::GetConnectionState()
 		return RemoteDevice::DISCONNECTED;
 
 	uint8 conn_state;
-	reply.FindUInt8("conn state", &conn_state);
+	if (reply.FindUInt8("conn state", &conn_state) != B_OK)
+		return RemoteDevice::DISCONNECTED;
 	return static_cast<RemoteDevice::ConnectionState>(conn_state);
 }
 

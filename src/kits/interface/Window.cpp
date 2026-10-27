@@ -2598,9 +2598,17 @@ BWindow::MoveOnScreen(uint32 flags)
 	if (((flags & B_MOVE_IF_PARTIALLY_OFFSCREEN) == 0
 			&& !screenFrame.Contains(frame))
 		|| !frame.Intersects(screenFrame)) {
-		// Off and away
-		CenterOnScreen();
-		return;
+		// Off and away: center it, then keep its top left corner visible
+		// below. Not through CenterOnScreen(), which comes back here: a
+		// window app_server cannot move there (one at coordinates beyond its
+		// integers, from a damaged settings file) recursed until the stack
+		// ran out.
+		MoveTo(BLayoutUtils::AlignInFrame(screenFrame, Size(),
+			BAlignment(B_ALIGN_HORIZONTAL_CENTER,
+				B_ALIGN_VERTICAL_CENTER)).LeftTop());
+		frame = Frame();
+		frame.InsetBy(-borderWidth, -borderWidth);
+		frame.top -= tabHeight;
 	}
 
 	// Move such that the upper left corner, and most of the window

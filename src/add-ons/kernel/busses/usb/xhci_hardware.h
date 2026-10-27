@@ -221,6 +221,7 @@
 #define COMP_COMMAND_ABORTED		25
 #define COMP_STOPPED				26
 #define COMP_STOPPED_LENGTH_INVALID	27
+#define COMP_STOPPED_SHORT_PACKET	28
 #define COMP_MAX_EXIT_LATENCY		29
 #define COMP_ISOC_OVERRUN			31
 #define COMP_EVENT_LOST				32
@@ -320,7 +321,9 @@
 // the spec says 1023, however this would cross the page boundary
 #define XHCI_MAX_SCRATCHPADS	256
 #define XHCI_MAX_DEVICES		128
-#define XHCI_MAX_TRANSFERS		8
+#define XHCI_MAX_TRANSFERS		16
+	// per endpoint (one fewer can be queued): a USB network adapter needs a
+	// dozen reads queued, one per frame, to keep up with gigabit Ethernet
 
 
 struct xhci_trb {

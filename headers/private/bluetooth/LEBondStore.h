@@ -42,6 +42,12 @@ status_t SaveLEHIDMouse(const char* directory, const uint8 localAddress[6],
 status_t ListLEHIDMice(const char* directory,
 	std::vector<LEHIDMouseDevice>& devices);
 
+// Where a mouse's discovered HID layout (LEHIDService::Save()) is kept; it
+// goes with the bond.
+status_t LEHIDLayoutPath(const char* directory, const uint8 localAddress[6],
+	const uint8 peerAddress[6], uint8 peerAddressType, char* path,
+	size_t capacity);
+
 struct LEBondedDevice {
 	uint8 localAddress[6];
 	uint8 localAddressType;

@@ -429,6 +429,7 @@ Desktop::Desktop(uid_t userID, const char* targetScreen)
 	fDirectScreenTeam(-1),
 	fCurrentWorkspace(0),
 	fPreviousWorkspace(0),
+	fWindowDrags(0),
 	fAllWindows(kAllWindowList),
 	fSubsetWindows(kSubsetList),
 	fFocusList(kFocusList),
@@ -557,6 +558,8 @@ Desktop::Init()
 			}
 		}
 	}
+
+	_PublishDeviceScale();
 
 	// Restore brightness
 	{
@@ -1613,6 +1616,8 @@ Desktop::MoveWindowBy(Window* window, float x, float y, int32 workspace)
 	if (GetDrawingEngine()->LockParallelAccess()) {
 		bool copied = GetDrawingEngine()->CopyRegion(&copyRegion, (int32)x,
 			(int32)y);
+		if (!copied && fWindowDrags > 0)
+			copied = _CopyWindowApproximately(window, copyRegion, x, y);
 		GetDrawingEngine()->UnlockParallelAccess();
 		if (!copied)
 			copyRegion.MakeEmpty();
@@ -1637,6 +1642,105 @@ Desktop::MoveWindowBy(Window* window, float x, float y, int32 workspace)
 	}
 
 	NotifyWindowMoved(window);
+}
+
+
+/*!	A window dragged on a desktop drawn at a fractional scale mostly moves
+	by a fraction of a buffer pixel: one logical pixel is one and a half at
+	150%. Its pixels can only move by whole ones, so without this it was
+	redrawn for every such step. While the user drags it, its content is
+	moved by the whole number of pixels its frame moves instead, which puts
+	everything inside within a pixel of where it belongs; a band along the
+	edges of what was copied is redrawn, so that the copy meets its
+	surroundings exactly, and EndWindowDrag() redraws the windows moved this
+	way once the drag is over.
+
+	 copyRegion is the region to copy before the move, in logical
+	coordinates; on return it is the part of it that holds valid content.
+*/
+bool
+Desktop::_CopyWindowApproximately(Window* window, BRegion& copyRegion,
+	float x, float y)
+{
+	float scale = GetDrawingEngine()->RenderScale();
+	if (scale == 1 || copyRegion.CountRects() == 0)
+		return false;
+
+	BPoint newLeftTop = window->Frame().LeftTop();
+	BPoint oldLeftTop = newLeftTop - BPoint((int32)x, (int32)y);
+	int32 deviceX = (int32)floorf(newLeftTop.x * scale)
+		- (int32)floorf(oldLeftTop.x * scale);
+	int32 deviceY = (int32)floorf(newLeftTop.y * scale)
+		- (int32)floorf(oldLeftTop.y * scale);
+
+	// The copy is off by up to one buffer pixel from the scaled move: one
+	// logical pixel off the edges keeps it within the window's new area,
+	// and one more is what it surely holds.
+	BRegion source;
+	BRegion valid;
+	for (int32 i = 0; i < copyRegion.CountRects(); i++) {
+		clipping_rect rect = copyRegion.RectAtInt(i);
+		clipping_rect inner = { rect.left + 1, rect.top + 1, rect.right - 1,
+			rect.bottom - 1 };
+		if (inner.left <= inner.right && inner.top <= inner.bottom)
+			source.Include(inner);
+		clipping_rect sure = { rect.left + 2, rect.top + 2, rect.right - 2,
+			rect.bottom - 2 };
+		if (sure.left <= sure.right && sure.top <= sure.bottom)
+			valid.Include(sure);
+	}
+	if (valid.CountRects() == 0
+		|| !GetDrawingEngine()->CopyRegionByDeviceOffset(&source, deviceX,
+			deviceY)) {
+		return false;
+	}
+
+	copyRegion = valid;
+	window->SetContentApproximate(true);
+	return true;
+}
+
+
+/*!	Tells the applications, through the memory they share with us, how
+	many frame buffer pixels a coordinate unit is (BScreen::DeviceScale()).
+*/
+void
+Desktop::_PublishDeviceScale()
+{
+	fServerReadOnlyMemory->device_scale = HWInterface()->RenderScaleFactor();
+}
+
+
+void
+Desktop::BeginWindowDrag()
+{
+	fWindowDrags++;
+}
+
+
+/*!	Redraws the windows whose content was moved approximately during the
+	drag, see _CopyWindowApproximately().
+*/
+void
+Desktop::EndWindowDrag(bool redraw)
+{
+	if (fWindowDrags > 0)
+		fWindowDrags--;
+	if (fWindowDrags > 0 || !redraw)
+		return;
+
+	AutoWriteLocker _(fWindowLock);
+
+	BRegion dirty;
+	for (Window* window = CurrentWindows().FirstWindow(); window != NULL;
+			window = window->NextWindow(fCurrentWorkspace)) {
+		if (!window->IsContentApproximate())
+			continue;
+		window->SetContentApproximate(false);
+		if (window->IsVisible())
+			dirty.Include(&window->VisibleRegion());
+	}
+	MarkDirty(dirty);
 }
 
 
@@ -3766,10 +3870,12 @@ Desktop::_ScreenChanged(Screen* screen)
 	_TriggerWindowRedrawing(dirty, dirty);
 
 	// send B_SCREEN_CHANGED to windows on that screen
+	_PublishDeviceScale();
 	BMessage update(B_SCREEN_CHANGED);
 	update.AddInt64("when", real_time_clock_usecs());
 	update.AddRect("frame", screen->Frame());
 	update.AddInt32("mode", screen->ColorSpace());
+	update.AddFloat("device scale", fServerReadOnlyMemory->device_scale);
 
 	fVirtualScreen.UpdateFrame();
 
@@ -3800,10 +3906,7 @@ Desktop::_ConfigureDisplayLayout(::HWInterface* interface, bool switchMode)
 
 	fDisplays.Configure(*fSettings->DisplaysMessage(), false);
 
-	std::vector<display_output_config> configs;
-	fDisplays.GetConfigs(configs);
-	status = interface->SetDisplayLayout(configs.data(), configs.size(),
-		switchMode);
+	status = _SetDisplayLayout(interface, fDisplays, switchMode);
 	if (status != B_OK) {
 		debug_printf("app_server: arranging the displays failed: %s\n",
 			strerror(status));
@@ -3818,6 +3921,36 @@ Desktop::_ConfigureDisplayLayout(::HWInterface* interface, bool switchMode)
 	// the monitor is back.
 	fDisplays.ReadOutputs(interface);
 	return B_OK;
+}
+
+
+/*!	Hands \a layout to the accelerant, drawn at the densest render scale
+	the hardware agrees to: the largest display scale first, which shrinks
+	the less scaled displays' regions, down to the smallest, which only
+	enlarges. The screen lock must be held for writing.
+*/
+status_t
+Desktop::_SetDisplayLayout(::HWInterface* interface, DisplayLayout& layout,
+	bool switchMode)
+{
+	std::vector<uint16> renderScales;
+	layout.RenderScales(renderScales);
+
+	status_t status = B_ERROR;
+	for (size_t i = 0; i < renderScales.size(); i++) {
+		layout.SetRenderScale(renderScales[i]);
+		std::vector<display_output_config> configs;
+		layout.GetConfigs(configs);
+		status = interface->SetDisplayLayout(configs.data(), configs.size(),
+			switchMode);
+		if (status == B_OK)
+			return B_OK;
+		if (i + 1 < renderScales.size()) {
+			debug_printf("app_server: the displays cannot be drawn at %u%%, "
+				"trying %u%%\n", renderScales[i], renderScales[i + 1]);
+		}
+	}
+	return status;
 }
 
 
@@ -4050,10 +4183,7 @@ Desktop::SetDisplayLayout(const BMessage& request)
 				_StoreDisplayLayout();
 			}
 		} else if (status == B_OK) {
-			std::vector<display_output_config> configs;
-			layout.GetConfigs(configs);
-			status = HWInterface()->SetDisplayLayout(configs.data(),
-				configs.size(), true);
+			status = _SetDisplayLayout(HWInterface(), layout, true);
 			if (status == B_OK) {
 				fDisplays = layout;
 				fDisplays.ReadOutputs(HWInterface());

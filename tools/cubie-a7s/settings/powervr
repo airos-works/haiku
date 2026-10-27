@@ -1,0 +1,9 @@
+# powervr driver settings of the air/OS image for the Cubie A7S
+# (tools/cubie-a7s/UserBuildConfig puts this in kernel/drivers/powervr).
+#
+# Boot the GPU firmware when the driver starts, so that OpenGL (zink) and
+# Vulkan run on the GPU. Without the firmware file, or if it does not
+# start, the GPU stays off and OpenGL runs in software (softpipe).
+firmware true
+
+# "disable true" leaves the GPU off altogether.

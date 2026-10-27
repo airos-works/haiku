@@ -9,10 +9,13 @@
 #include <GradientLinear.h>
 #include <InterfaceDefs.h>
 #include <Rect.h>
+#include <Shape.h>
 #include <View.h>
 
 #include <algorithm>
 #include <math.h>
+
+#include "WiFiIconPaths.h"
 
 
 enum signal_glyph_style {
@@ -77,11 +80,11 @@ DrawWiFiSignalBars(BView* view, BRect frame, int32 bars,
 
 enum tray_glyph_state {
 	TRAY_GLYPH_CONNECTED,
-		// Green bars
+		// Green arcs
 	TRAY_GLYPH_WEAK,
-		// Connected, but no Internet: amber bars
+		// Connected, but no Internet: amber arcs
 	TRAY_GLYPH_CONNECTING,
-		// Amber bars, animated by the caller
+		// Amber arcs, animated by the caller
 	TRAY_GLYPH_DISCONNECTED,
 		// Empty slots only
 	TRAY_GLYPH_OFF,
@@ -91,33 +94,28 @@ enum tray_glyph_state {
 };
 
 
-/*!	Draws the Deskbar tray icon in the style of BeOS/Haiku icons: a staircase
-	of four outlined bars with a gradient face and a highlight. \a bars of
-	them are lit in the color of \a state; the others are empty slots.
+/*! Draws the familiar Wi-Fi dot and three arcs, using the same paths as the
+	application icon. The four signal levels light up from the dot outwards.
 */
 inline void
 DrawWiFiTrayIcon(BView* view, BRect frame, int32 bars, tray_glyph_state state,
 	rgb_color background)
 {
-	const int32 kBars = 4;
-	float pitch = std::max(3.0f,
-		floorf((std::min(frame.Width(), frame.Height() * 1.25f)) / kBars));
-	float totalWidth = pitch * kBars;
-	float left = floorf(frame.left + (frame.Width() - totalWidth) / 2);
-	float bottom = floorf(frame.bottom);
-	float height = frame.Height();
+	float scale = std::min(frame.Width() / 58, frame.Height() / 48);
+	BPoint origin(frame.left + frame.Width() / 2 - 32 * scale,
+		frame.top + frame.Height() / 2 - 33 * scale);
 
 	rgb_color face, highlight, outline;
 	switch (state) {
 		case TRAY_GLYPH_CONNECTED:
 			face = make_color(70, 190, 50);
-			highlight = make_color(170, 240, 120);
+			highlight = make_color(190, 245, 150);
 			outline = make_color(20, 70, 15);
 			break;
 		case TRAY_GLYPH_WEAK:
 		case TRAY_GLYPH_CONNECTING:
 			face = make_color(240, 160, 20);
-			highlight = make_color(255, 225, 110);
+			highlight = make_color(255, 235, 150);
 			outline = make_color(110, 60, 0);
 			break;
 		default:
@@ -125,8 +123,7 @@ DrawWiFiTrayIcon(BView* view, BRect frame, int32 bars, tray_glyph_state state,
 			face = highlight = outline = background;
 			break;
 	}
-	// Empty slots are translucent so they take on whatever is behind the
-	// icon (Deskbar's tray has its own gradient).
+	// Alpha lets the unlit arcs blend with Deskbar's own gradient.
 	bool faded = state == TRAY_GLYPH_OFF || state == TRAY_GLYPH_NO_ADAPTER;
 	bool darkBackground = background.IsDark();
 	rgb_color slotFace = darkBackground ? make_color(255, 255, 255,
@@ -136,49 +133,43 @@ DrawWiFiTrayIcon(BView* view, BRect frame, int32 bars, tray_glyph_state state,
 		: make_color(0, 0, 0, faded ? 60 : 110);
 
 	view->PushState();
-	view->SetDrawingMode(B_OP_COPY);
-	view->SetPenSize(1);
-	// Empty slots first, so that lit neighbors draw their outlines on top.
-	for (int pass = 0; pass < 2; pass++) {
-		for (int32 i = 0; i < kBars; i++) {
-			bool lit = i < bars;
-			if (lit != (pass == 1))
-				continue;
-			float barHeight = std::max(pitch + 1,
-				floorf(height * (i + 1.4f) / (kBars + 0.4f)));
-			float x = left + i * pitch;
-			BRect bar(x, bottom - barHeight, x + pitch, bottom);
-			BRect inner = bar.InsetByCopy(1, 1);
-			if (lit) {
-				if (inner.IsValid()) {
-					BGradientLinear gradient(inner.LeftTop(),
-						inner.LeftBottom());
-					gradient.AddColor(highlight, 0);
-					gradient.AddColor(face, 255);
-					view->FillRect(inner, gradient);
-					view->SetHighColor(mix_color(highlight,
-						make_color(255, 255, 255), 110));
-					view->StrokeLine(inner.LeftTop(), inner.LeftBottom());
-				}
-				view->SetHighColor(outline);
-			} else {
-				view->SetDrawingMode(B_OP_ALPHA);
-				view->SetBlendingMode(B_PIXEL_ALPHA, B_ALPHA_OVERLAY);
-				view->SetHighColor(slotFace);
-				if (inner.IsValid())
-					view->FillRect(inner);
-				view->SetHighColor(slotOutline);
-				view->StrokeRect(bar);
-				view->SetDrawingMode(B_OP_COPY);
-				continue;
+	view->SetDrawingMode(B_OP_ALPHA);
+	view->SetBlendingMode(B_PIXEL_ALPHA, B_ALPHA_OVERLAY);
+	view->SetPenSize(std::max(0.75f, 2 * scale));
+	for (int32 i = 0; i < 4; i++) {
+		const WiFiIconPath& path = kWiFiIconPaths[i];
+		BShape shape;
+		shape.MoveTo(origin + BPoint(path.points[0].x * scale,
+			path.points[0].y * scale));
+		for (int32 j = 1; j < path.count; j += 3) {
+			BPoint points[3];
+			for (int32 k = 0; k < 3; k++) {
+				points[k] = origin + BPoint(path.points[j + k].x * scale,
+					path.points[j + k].y * scale);
 			}
-			view->StrokeRect(bar);
+			shape.BezierTo(points);
+		}
+		shape.Close();
+		if (i < bars) {
+			BRect bounds = shape.Bounds();
+			BGradientLinear gradient(bounds.LeftTop(), bounds.RightBottom());
+			gradient.AddColor(highlight, 0);
+			gradient.AddColor(face, 255);
+			view->SetHighColor(outline);
+			view->StrokeShape(&shape);
+			view->FillShape(&shape, gradient);
+		} else {
+			view->SetHighColor(slotOutline);
+			view->StrokeShape(&shape);
+			view->SetHighColor(slotFace);
+			view->FillShape(&shape);
 		}
 	}
 
 	if (state == TRAY_GLYPH_NO_ADAPTER) {
-		float size = floorf(std::min(frame.Width(), frame.Height()) / 2);
-		BRect cross(frame.left, frame.top, frame.left + size, frame.top + size);
+		float size = floorf(std::min(frame.Width(), frame.Height()) / 3);
+		BRect cross(frame.right - size, frame.bottom - size,
+			frame.right, frame.bottom);
 		view->SetHighColor(200, 32, 32);
 		view->SetPenSize(std::max(1.5f, size / 4));
 		view->StrokeLine(cross.LeftTop(), cross.RightBottom());

@@ -14,6 +14,7 @@
 
 #include "DeviceList.h"
 #include "Driver.h"
+#include "GpioInterrupt.h"
 #include "HIDDevice.h"
 #include "ProtocolHandler.h"
 
@@ -23,6 +24,9 @@
 #include <new>
 #include <stdio.h>
 #include <string.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <unistd.h>
 
 
 
@@ -256,10 +260,45 @@ i2c_hid_free(void *_cookie)
 //	#pragma mark - driver module API
 
 
+#ifdef I2C_HID_LAB_ARM
+static const char* const kLabArmFile = "/var/tmp/i2c_hid.arm";
+
+
+/*!	Lab builds only attach until the time (seconds since the epoch) written
+	in the arm file, so that a driver that brings the machine down does not
+	do so again once the machine has been brought back.
+*/
+static bool
+i2c_hid_armed()
+{
+	int fd = open(kLabArmFile, O_RDONLY);
+	if (fd < 0)
+		return false;
+
+	char buffer[32];
+	ssize_t length = read(fd, buffer, sizeof(buffer) - 1);
+	close(fd);
+	if (length <= 0)
+		return false;
+	buffer[length] = '\0';
+
+	uint32 until = strtoul(buffer, NULL, 10);
+	bool armed = real_time_clock() < until;
+	TRACE_ALWAYS("lab build, %s\n", armed ? "armed" : "not armed");
+	return armed;
+}
+#endif
+
+
 static float
 i2c_hid_support(device_node *parent)
 {
 	CALLED();
+
+#ifdef I2C_HID_LAB_ARM
+	if (!i2c_hid_armed())
+		return 0.0;
+#endif
 
 	// make sure parent is really the I2C bus manager
 	const char *bus = NULL;
@@ -282,13 +321,15 @@ i2c_hid_support(device_node *parent)
 	if (sDeviceManager->get_attr_string(parent, ACPI_DEVICE_HID_ITEM, &name,
 		false) == B_OK && name != NULL && strcmp(name, ACPI_NAME_HID_DEVICE) == 0) {
 		TRACE("i2c_hid_support found an hid i2c device\n");
-		return 0.6;
+		return 0.5;
 	}
 
 	if (sDeviceManager->get_attr_string(parent, ACPI_DEVICE_CID_ITEM, &name,
 		false) == B_OK && name != NULL && strcmp(name, ACPI_NAME_HID_DEVICE) == 0) {
+		// below i2c_elan, which knows the ELAN touchpads that also say
+		// they are HID devices
 		TRACE("i2c_hid_support found a compatible hid i2c device\n");
-		return 0.6;
+		return 0.5;
 	}
 
 	uint16 slaveAddress;
@@ -365,10 +406,29 @@ i2c_hid_init_driver(device_node *node, void **driverCookie)
 		(void **)&device->i2c_cookie);
 	sDeviceManager->put_node(parent);
 
+	// The interrupt line: without it the input register can only be polled,
+	// and many devices answer such reads with whatever they last sent (or
+	// worse), so the device is left alone.
+	GpioInterrupt* interrupt = NULL;
+	acpi_handle handle;
+	status_t status = sDeviceManager->get_attr_uint64(node,
+		ACPI_DEVICE_HANDLE_ITEM, (uint64*)&handle, true);
+	if (status == B_OK)
+		status = GpioInterrupt::Create(gACPI, handle, &interrupt);
+	if (status != B_OK) {
+		TRACE_ALWAYS("no interrupt line this driver can use (%s), not "
+			"attaching\n", strerror(status));
+		free(device);
+		*driverCookie = NULL;
+		return B_NOT_SUPPORTED;
+	}
+
 	mutex_lock(&sDriverLock);
 	HIDDevice *hidDevice
 		= new(std::nothrow) HIDDevice(descriptorAddress, device->i2c,
-			device->i2c_cookie);
+			device->i2c_cookie, interrupt);
+	if (hidDevice == NULL)
+		delete interrupt;
 
 	if (hidDevice != NULL && hidDevice->InitCheck() == B_OK) {
 		device->hidDevice = hidDevice;
@@ -377,7 +437,13 @@ i2c_hid_init_driver(device_node *node, void **driverCookie)
 
 	mutex_unlock(&sDriverLock);
 
-	return device->hidDevice != NULL ? B_OK : B_IO_ERROR;
+	if (device->hidDevice == NULL) {
+		free(device);
+		*driverCookie = NULL;
+		return B_IO_ERROR;
+	}
+
+	return B_OK;
 }
 
 

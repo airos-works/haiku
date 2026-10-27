@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <locks.h>
+
 #include <support/TLS.h>
 
 #include <tls.h>
@@ -74,6 +76,10 @@ private:
 
 TLSBlockTemplates*	TLSBlockTemplates::fInstance;
 
+static const char* const kTemplateLockName = "runtime loader TLS templates";
+static recursive_lock sTemplateLock
+	= RECURSIVE_LOCK_INITIALIZER(kTemplateLockName);
+
 
 void
 TLSBlockTemplate::SetBaseAddress(addr_t baseAddress)
@@ -108,6 +114,7 @@ TLSBlockTemplates::Get()
 unsigned
 TLSBlockTemplates::Register(const TLSBlockTemplate& block)
 {
+	RecursiveLocker _(sTemplateLock);
 	unsigned dso;
 
 	if (!fFreeDSOs.empty()) {
@@ -130,7 +137,8 @@ TLSBlockTemplates::Unregister(unsigned dso)
 	if (dso == unsigned(-1))
 		return;
 
-	fGeneration++;
+	RecursiveLocker _(sTemplateLock);
+	atomic_add(&fGeneration, 1);
 	fFreeDSOs.push_back(dso);
 }
 
@@ -138,6 +146,7 @@ TLSBlockTemplates::Unregister(unsigned dso)
 void
 TLSBlockTemplates::SetBaseAddress(unsigned dso, addr_t baseAddress)
 {
+	RecursiveLocker _(sTemplateLock);
 	if (dso != unsigned(-1))
 		fTemplates[dso].SetBaseAddress(baseAddress);
 }
@@ -147,7 +156,8 @@ unsigned
 TLSBlockTemplates::GetGeneration(unsigned dso) const
 {
 	if (dso == unsigned(-1))
-		return fGeneration;
+		return atomic_get(&fGeneration);
+	RecursiveLocker _(sTemplateLock);
 	return fTemplates[dso].Generation();
 }
 
@@ -155,7 +165,18 @@ TLSBlockTemplates::GetGeneration(unsigned dso) const
 TLSBlock
 TLSBlockTemplates::CreateBlock(unsigned dso)
 {
+	// Register() can grow and free the template vector while another thread
+	// first accesses TLS. Keep the template alive through allocation and copy;
+	// established per-thread blocks do not take this lock.
+	RecursiveLocker _(sTemplateLock);
 	return fTemplates[dso].CreateBlock();
+}
+
+
+void
+tls_reinit_after_fork()
+{
+	recursive_lock_init(&sTemplateLock, kTemplateLockName);
 }
 
 
@@ -198,9 +219,12 @@ TLSBlock::Destroy()
 
 Generation::Generation()
 	:
-	fCounter(0),
+	fCounter(TLSBlockTemplates::Get().GetGeneration(-1)),
 	fSize(0)
 {
+	// A new vector contains only blocks from the current generation. Starting
+	// at zero would discard a freshly initialized block on the next access
+	// if a TLS image had already been unloaded before this thread's first use.
 }
 
 
@@ -293,6 +317,13 @@ DynamicThreadVector::_ResizeVector(unsigned minimumSize)
 		fGeneration = new Generation;
 		if (fGeneration == NULL)
 			return B_NO_MEMORY;
+
+		// A new vector holds no blocks, so none of them can be stale: it is
+		// as current as the templates. Starting at 0 made the thread's next
+		// access destroy the blocks of every DSO registered after the first
+		// unload, including the one just created, and lose what was written
+		// to it in between.
+		fGeneration->SetCounter(TLSBlockTemplates::Get().GetGeneration(-1));
 	}
 
 	*(Generation**)*fVector = fGeneration;

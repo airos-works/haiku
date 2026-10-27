@@ -24,6 +24,12 @@ service x-vnd.Haiku-mount_server {
 	launch /system/servers/mount_server
 }
 
+service x-vnd.Haiku-mcp_server {
+	launch /system/servers/mcp_server
+	no_safemode
+	on initial_volumes_mounted
+}
+
 service x-vnd.Haiku-media_server {
 	launch /system/servers/media_server
 	no_safemode
@@ -58,6 +64,18 @@ service x-vnd.Be-PSRV {
 
 service x-vnd.Haiku-notification_server {
 	launch /system/servers/notification_server
+	no_safemode
+	on_demand
+}
+
+service x-vnd.Haiku-osd_server {
+	launch /system/servers/osd_server
+	no_safemode
+	on_demand
+}
+
+service x-vnd.Haiku-quick_look_server {
+	launch /system/servers/quick_look_server
 	no_safemode
 	on_demand
 }

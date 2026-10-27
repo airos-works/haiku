@@ -1,5 +1,5 @@
 /*
- * Copyright 2003-2006, Haiku. All rights reserved.
+ * Copyright 2003-2026, Haiku. All rights reserved.
  * Distributed under the terms of the MIT License.
  *
  * Authors in chronological order:
@@ -12,61 +12,127 @@
 
 #include <stdio.h>
 
-#include <Catalog.h>
-#include <Locale.h>
-#include <StorageKit.h>
-#include <String.h>
+#include <File.h>
+#include <FindDirectory.h>
+#include <Path.h>
+#include <Screen.h>
+
+#include "MediaWindow.h"
 
 
-Media::Media() 
-	:
-	BApplication("application/x-vnd.Haiku-Media"),
-	fIcons(),
-	fWindow(NULL)
+static const char* kSettingsFile = "Media settings";
+static const char* kOldSettingsFile = "MediaPrefs Settings";
+
+
+static status_t
+settings_path(BPath& path, const char* name)
 {
-	BRect rect(32, 64, 637, 462);
-
-	BPath path;
-	if (find_directory(B_USER_SETTINGS_DIRECTORY, &path) == B_OK) {
-		path.Append(SETTINGS_FILE);
-		BFile file(path.Path(),B_READ_ONLY);
-		if (file.InitCheck()==B_OK) {
-			char buffer[255];
-			ssize_t size = 0;
-			while ((size = file.Read(buffer, 255)) > 0) {
-				int32 i = 0;
-				while (buffer[i] == '#') {
-					while (i < size && buffer[i] != '\n')
-						i++;
-					i++;
-				}
-				int32 a, b, c, d;
-				const char* scanString = " rect = %li,%li,%li,%li";
-				if (sscanf(&buffer[i], scanString, &a, &b, &c, &d) == 4) {
-					if (c - a >= rect.IntegerWidth()) {
-						rect.left = a;
-						rect.right = c;
-					}
-					if (d - b >= rect.IntegerHeight()) {
-						rect.top = b;
-						rect.bottom = d;
-					}
-				}
-			}
-		}
-	}
-
-	MediaListItem::SetIcons(&fIcons);
-	fWindow = new MediaWindow(rect);
+	status_t status = find_directory(B_USER_SETTINGS_DIRECTORY, &path);
+	if (status == B_OK)
+		status = path.Append(name);
+	return status;
 }
 
 
 status_t
-Media::InitCheck()
+load_media_settings(BMessage& settings)
 {
-	if (fWindow)
-		return fWindow->InitCheck();
-	return B_OK;
+	BPath path;
+	status_t status = settings_path(path, kSettingsFile);
+	if (status != B_OK)
+		return status;
+
+	BFile file(path.Path(), B_READ_ONLY);
+	status = file.InitCheck();
+	if (status == B_OK)
+		status = settings.Unflatten(&file);
+	return status;
+}
+
+
+status_t
+save_media_settings(const BMessage& settings)
+{
+	BPath path;
+	status_t status = settings_path(path, kSettingsFile);
+	if (status != B_OK)
+		return status;
+
+	BFile file(path.Path(), B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);
+	status = file.InitCheck();
+	if (status == B_OK)
+		status = settings.Flatten(&file);
+	return status;
+}
+
+
+//! Where the old Media preferences had their window.
+static bool
+old_window_position(BPoint& position)
+{
+	BPath path;
+	if (settings_path(path, kOldSettingsFile) != B_OK)
+		return false;
+
+	FILE* file = fopen(path.Path(), "r");
+	if (file == NULL)
+		return false;
+
+	bool found = false;
+	char line[256];
+	while (fgets(line, sizeof(line), file) != NULL) {
+		int left, top, right, bottom;
+		if (sscanf(line, " rect = %d,%d,%d,%d", &left, &top, &right, &bottom)
+				== 4) {
+			position.Set(left, top);
+			found = true;
+			break;
+		}
+	}
+	fclose(file);
+	return found;
+}
+
+
+Media::Media()
+	:
+	BApplication("application/x-vnd.Haiku-Media"),
+	fWindow(NULL)
+{
+}
+
+
+void
+Media::ReadyToRun()
+{
+	float scale = std::max(1.0f, be_plain_font->Size() / 12.0f);
+	BRect frame(0, 0, ceilf(760 * scale) - 1, ceilf(540 * scale) - 1);
+	frame.OffsetTo(40, 40);
+
+	BMessage settings;
+	const char* page = NULL;
+	BRect savedFrame;
+	if (load_media_settings(settings) == B_OK) {
+		if (settings.FindRect("frame", &savedFrame) == B_OK
+			&& savedFrame.IsValid() && savedFrame.Width() >= 100
+			&& savedFrame.Height() >= 100) {
+			frame = savedFrame;
+		}
+		settings.FindString("page", &page);
+	} else {
+		BPoint position;
+		if (old_window_position(position))
+			frame.OffsetTo(position);
+	}
+
+	// do not open taller or wider than the screen it is on
+	BRect screen = BScreen().Frame();
+	frame.right = std::min(frame.right, frame.left + screen.Width() - 16);
+	frame.bottom = std::min(frame.bottom, frame.top + screen.Height() - 40);
+
+	fWindow = new MediaWindow(frame, page);
+	fWindow->MoveOnScreen(B_MOVE_IF_PARTIALLY_OFFSCREEN);
+	fWindow->Show();
 }
 
 
@@ -77,9 +143,6 @@ int
 main(int, char**)
 {
 	Media app;
-	if (app.InitCheck() == B_OK)
-		app.Run();
-
+	app.Run();
 	return 0;
 }
-

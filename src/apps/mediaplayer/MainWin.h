@@ -62,6 +62,12 @@ public:
 
 			void				GetQuitMessage(BMessage* message);
 
+			// media keys (see <private/shared/MediaKeys.h>); the window
+			// must be locked
+			bool				IsPlaying() const;
+			bool				CanHandleMediaKey(int32 key) const;
+			bool				HandleMediaKey(int32 key);
+
 	virtual	BHandler*			ResolveSpecifier(BMessage* message, int32 index,
 									BMessage* specifier, int32 what,
 									const char* property);

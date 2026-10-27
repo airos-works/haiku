@@ -34,7 +34,9 @@
 #include <Window.h>
 
 #include <bluetooth/bluetooth.h>
+#include <bluetooth/HCI/btHCI.h>
 
+#include <AudioSinkSetting.h>
 #include <LaunchRoster.h>
 #include <LEBondStore.h>
 #include <LEDeviceStatus.h>
@@ -64,6 +66,7 @@ static const uint32 kMsgRefresh = 'btrf';
 static const uint32 kMsgOpenPreferences = 'btop';
 static const uint32 kMsgStartService = 'btss';
 static const uint32 kMsgRemove = 'btrm';
+static const uint32 kMsgAudioOutput = 'btao';
 
 static const bigtime_t kRefreshInterval = 3000000;
 
@@ -87,7 +90,10 @@ struct StatusDevice {
 	bool		lowEnergy;
 	bool		connected;
 	bool		stateKnown;
-		// Whether "connected" is reported (Classic state is not, yet)
+		// Whether "connected" is known (the Bluetooth service may not say)
+	bool		audioOutput;
+		// sound plays through it
+	bool		playsAudio;
 	int32		battery;
 };
 
@@ -378,6 +384,9 @@ private:
 
 	BString _StatusText() const
 	{
+		if (fDevice.audioOutput)
+			return fDevice.connected ? B_TRANSLATE("Sound output")
+				: B_TRANSLATE("Sound output, idle");
 		if (!fDevice.stateKnown)
 			return B_TRANSLATE("Paired");
 		return fDevice.connected ? B_TRANSLATE("Connected")
@@ -526,6 +535,26 @@ public:
 				BDeskbar().RemoveItem(kItemName);
 				break;
 
+			case kMsgAudioOutput:
+			{
+				// The Bluetooth audio output follows this setting: it
+				// connects to the device and takes over the sound, or gives
+				// it back.
+				const void* data;
+				ssize_t size;
+				if (message->GetBool("use", false)
+					&& message->FindData("address", B_RAW_TYPE, &data, &size)
+						== B_OK && size == 6) {
+					bdaddr_t address;
+					memcpy(address.b, data, 6);
+					Bluetooth::SetAudioSink(&address,
+						message->GetString("name", NULL));
+				} else
+					Bluetooth::SetAudioSink(NULL, NULL);
+				_Refresh();
+				break;
+			}
+
 			default:
 				BView::MessageReceived(message);
 		}
@@ -606,6 +635,8 @@ private:
 				: DEVICE_KIND_GENERIC;
 			device.connected = false;
 			device.stateKnown = true;
+			device.audioOutput = false;
+			device.playsAudio = false;
 			device.battery = -1;
 			BString key = AddressText(device.address);
 			auto name = names.find(key);
@@ -625,7 +656,22 @@ private:
 			devices.push_back(device);
 		}
 
-		// Classic pairings, as the Bluetooth service stores them.
+		// Classic pairings, as the Bluetooth service stores them, with their
+		// link state if it answers quickly.
+		bdaddr_t audioSink;
+		BString audioSinkName;
+		bool hasAudioSink = Bluetooth::GetAudioSink(audioSink, audioSinkName)
+			== B_OK;
+		BMessenger server(BLUETOOTH_SIGNATURE);
+		hci_id hid = -1;
+		{
+			BMessage request(BT_MSG_ACQUIRE_LOCAL_DEVICE);
+			BMessage reply;
+			if (!server.IsValid()
+				|| server.SendMessage(&request, &reply, 200000, 200000) != B_OK
+				|| reply.FindInt32("hci_id", &hid) != B_OK)
+				hid = -1;
+		}
 		BPath path;
 		BMessage archive;
 		if (find_directory(B_USER_SETTINGS_DIRECTORY, &path) == B_OK
@@ -647,13 +693,33 @@ private:
 			device.lowEnergy = false;
 			device.connected = false;
 			device.stateKnown = false;
+			device.audioOutput = hasAudioSink
+				&& memcmp(audioSink.b, address, 6) == 0;
 			device.battery = -1;
+			if (hid >= 0) {
+				BMessage request(BT_REQ_CONN_STATE);
+				request.AddInt32("hci_id", hid);
+				request.AddData("bdaddr", B_ANY_TYPE, address, 6);
+				BMessage reply;
+				uint8 state;
+				if (server.SendMessage(&request, &reply, 200000, 200000)
+						== B_OK
+					&& reply.FindUInt8("conn state", &state) == B_OK) {
+					device.stateKnown = true;
+					device.connected = state == 0;
+						// RemoteDevice::CONNECTED
+				}
+			}
 			uint8 deviceClass[3] = {};
 			const void* classData;
 			if (remote.FindData("class_of_device", B_RAW_TYPE, &classData,
 					&size) == B_OK && size == 3)
 				memcpy(deviceClass, classData, 3);
 			device.kind = KindForClass(deviceClass);
+			// Rendering and Audio service bits (Class of Device bits 18 and
+			// 21): it can play sound, whatever its major class.
+			device.playsAudio = device.kind == DEVICE_KIND_AUDIO
+				|| (deviceClass[2] & 0x24) == 0x24;
 			BString key = AddressText(device.address);
 			auto name = names.find(key);
 			const char* storedName;
@@ -748,6 +814,17 @@ private:
 			menu->AddItem(new DeviceMenuItem(device,
 				fIcons->Get(IconNameForKind(device.kind), iconSize),
 				new BMessage(kMsgOpenPreferences)));
+			if (!device.lowEnergy && (device.playsAudio
+					|| device.audioOutput)) {
+				BMessage* choice = new BMessage(kMsgAudioOutput);
+				choice->AddBool("use", !device.audioOutput);
+				choice->AddData("address", B_RAW_TYPE, device.address, 6);
+				choice->AddString("name", device.name);
+				BMenuItem* audio = new BMenuItem(device.audioOutput
+					? B_TRANSLATE("        Stop playing sound here")
+					: B_TRANSLATE("        Play sound here"), choice);
+				menu->AddItem(audio);
+			}
 			if (details) {
 				_AddDetail(menu, B_TRANSLATE("Address"),
 					AddressText(device.address));

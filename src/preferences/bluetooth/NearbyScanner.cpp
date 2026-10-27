@@ -7,11 +7,14 @@
 #include "NearbyScanner.h"
 
 #include <Catalog.h>
+#include <InterfaceDefs.h>
 #include <Looper.h>
 #include <MessageRunner.h>
 #include <Messenger.h>
 
 #include <bluetooth/DiscoveryAgent.h>
+#include <bluetooth/HCI/btHCI_command.h>
+#include <bluetooth/HCI/btHCI_event.h>
 #include <bluetooth/DiscoveryListener.h>
 #include <bluetooth/LocalDevice.h>
 #include <bluetooth/RemoteDevice.h>
@@ -22,6 +25,8 @@
 #include "BluetoothWorkers.h"
 
 #include <string.h>
+
+#include <algorithm>
 
 
 #undef B_TRANSLATION_CONTEXT
@@ -42,15 +47,34 @@ static const uint32 kMsgInquiryDevice = 'iqDv';
 static const uint32 kMsgInquiryDone = 'iqDn';
 static const uint32 kMsgInquiryTimeout = 'iqTo';
 static const uint32 kMsgPausedNotify = 'psNt';
+static const uint32 kMsgInquiryWatch = 'iqWt';
+static const uint32 kMsgInquiryCancelled = 'iqCn';
 
 static const bigtime_t kLEStartTimeout = 10000000;
 static const bigtime_t kLEStopTimeout = 4000000;
 static const bigtime_t kBusyRetryDelay = 3000000;
 static const bigtime_t kErrorRetryDelay = 5000000;
 static const bigtime_t kFirstInquiryDelay = 4000000;
-static const bigtime_t kInquiryInterval = 30000000;
+static const bigtime_t kInquiryInterval = 12000000;
 static const bigtime_t kInquiryTimeout = 25000000;
-static const uint8 kInquiryLength = 8;
+// A Classic inquiry takes most of the radio: on the Cubie A7S a Bluetooth
+// mouse sent 30 reports a second instead of 89 during one (gaps over 30 ms
+// went from 6% to 51%), and a keyboard being set up lost its SDP query to
+// it. So inquiries are short (3.84 s finds a device in pairing mode, which
+// listens every 1.28 s), start only once the mouse and keyboard have been
+// left alone for a moment, and keep away from a Classic device that was
+// just connected.
+static const uint8 kInquiryLength = 3;
+static const bigtime_t kInquiryIdleTime = 2000000;
+static const bigtime_t kInquiryIdleCheck = 1000000;
+// While an inquiry runs: how often to look, and how recent an input event
+// cancels it.
+static const bigtime_t kInquiryWatchInterval = 200000;
+static const bigtime_t kInquiryInputActive = 250000;
+// But someone who keeps using the mouse while waiting for a device to show
+// up still has to find it: after this long without a complete inquiry, the
+// next one starts and runs to its end regardless.
+static const bigtime_t kInquiryMaxWait = 15000000;
 	// in units of 1.28 seconds
 
 enum {
@@ -123,6 +147,9 @@ NearbyScanner::NearbyScanner(ScannerListener* listener)
 	fLEState(LE_IDLE),
 	fLEGeneration(0),
 	fInquiryActive(false),
+	fInquiryNotBefore(0),
+	fLastFullInquiry(0),
+	fInquiryForced(false),
 	fInquiryGeneration(0),
 	fFailures(0),
 	fStatus(STATUS_OFF)
@@ -195,6 +222,13 @@ NearbyScanner::Pause()
 	// LE_REQUESTED and LE_STOPPING finish on their own; the handlers see
 	// fPaused.
 	_NotifyPausedIfIdle();
+}
+
+
+void
+NearbyScanner::HoldInquiry(bigtime_t duration)
+{
+	fInquiryNotBefore = std::max(fInquiryNotBefore, system_time() + duration);
 }
 
 
@@ -354,10 +388,25 @@ NearbyScanner::MessageReceived(BMessage* message)
 			break;
 
 		case kMsgInquiryDue:
-			if (generation == fInquiryGeneration && fEnabled && !fPaused
-				&& !fInquiryActive)
-				_StartInquiry();
+		{
+			if (generation != fInquiryGeneration || !fEnabled || fPaused
+				|| fInquiryActive)
+				break;
+			bigtime_t now = system_time();
+			if (now < fInquiryNotBefore) {
+				_ScheduleInquiry(fInquiryNotBefore - now);
+				break;
+			}
+			// Someone is using the mouse or keyboard: wait until they stop,
+			// unless inquiries have been put off too long.
+			fInquiryForced = now - fLastFullInquiry > kInquiryMaxWait;
+			if (!fInquiryForced && idle_time() < kInquiryIdleTime) {
+				_ScheduleInquiry(kInquiryIdleCheck);
+				break;
+			}
+			_StartInquiry();
 			break;
+		}
 
 		case kMsgInquiryStarted:
 		case kMsgInquiryDevice:
@@ -376,6 +425,7 @@ NearbyScanner::MessageReceived(BMessage* message)
 			} else if (message->what == kMsgInquiryDone) {
 				TRACE("inquiry finished: type %" B_PRId32,
 					message->GetInt32("type", 0));
+				fLastFullInquiry = system_time();
 				_EndInquiry();
 			} else {
 				const uint8* address;
@@ -402,6 +452,26 @@ NearbyScanner::MessageReceived(BMessage* message)
 				TRACE("inquiry timed out");
 				_EndInquiry();
 			}
+			break;
+
+		case kMsgInquiryWatch:
+			if (generation != fInquiryGeneration || !fInquiryActive)
+				break;
+			if (!fInquiryForced && idle_time() < kInquiryInputActive) {
+				// The mouse or keyboard is in use again: give the radio
+				// back. What the inquiry found so far is kept.
+				TRACE("input resumed: cancelling the inquiry");
+				_CancelInquiry();
+				_EndInquiry();
+				break;
+			}
+			_Timer(kMsgInquiryWatch, fInquiryGeneration,
+				kInquiryWatchInterval);
+			break;
+
+		case kMsgInquiryCancelled:
+			TRACE("inquiry cancel: status %" B_PRId32,
+				message->GetInt32("status", B_ERROR));
 			break;
 
 		case kMsgPausedNotify:
@@ -548,6 +618,24 @@ NearbyScanner::_StartInquiry()
 		return;
 	}
 	_Timer(kMsgInquiryTimeout, fInquiryGeneration, kInquiryTimeout);
+	_Timer(kMsgInquiryWatch, fInquiryGeneration, kInquiryWatchInterval);
+}
+
+
+void
+NearbyScanner::_CancelInquiry()
+{
+	// Asynchronous: the scanner never waits for the server. The server
+	// drops the inquiry's pending request when the cancel completes.
+	const uint16 opcode = PACK_OPCODE(OGF_LINK_CONTROL, OCF_INQUIRY_CANCEL);
+	const uint8 command[3] = { (uint8)opcode, (uint8)(opcode >> 8), 0 };
+	BMessage request(BT_MSG_HANDLE_SIMPLE_REQUEST);
+	request.AddInt32("hci_id", _HCIID());
+	request.AddData("raw command", B_ANY_TYPE, command, sizeof(command));
+	request.AddInt16("eventExpected", HCI_EVENT_CMD_COMPLETE);
+	request.AddInt16("opcodeExpected", opcode);
+	BMessage result(kMsgInquiryCancelled);
+	SendServerRequestAsync(request, BMessenger(this), result);
 }
 
 

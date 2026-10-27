@@ -120,6 +120,7 @@ AccelerantHWInterface::AccelerantHWInterface()
 	fAccSetCursorBitmap(NULL),
 	fAccMoveCursor(NULL),
 	fAccShowCursor(NULL),
+	fCursorHookLock("cursor hooks"),
 
 	// dpms hooks
 	fAccDPMSCapabilities(NULL),
@@ -150,6 +151,8 @@ AccelerantHWInterface::AccelerantHWInterface()
 	fAccGetDisplayOutputModes(NULL),
 	fAccSetDisplayLayout(NULL),
 	fAccSetDisplayChangePort(NULL),
+	fAccGetDisplayOutputRetraceSemaphore(NULL),
+	fAccGetDisplayOutputScanLine(NULL),
 	fDisplayChangePort(-1),
 	fDisplayChangeThread(-1),
 
@@ -215,7 +218,12 @@ AccelerantHWInterface::Initialize()
 			// _OpenAccelerant() failed, try to open next graphics card
 		}
 
-		return fCardFD >= 0 ? B_OK : fCardFD;
+		if (fCardFD < 0)
+			return fCardFD;
+
+		// copies to the screen are made at the vertical blanks
+		_StartFlushing();
+		return B_OK;
 	}
 	return ret;
 }
@@ -443,6 +451,12 @@ AccelerantHWInterface::_SetupDefaultHooks()
 		B_SET_DISPLAY_LAYOUT, NULL);
 	fAccSetDisplayChangePort = (set_display_change_port)fAccelerantHook(
 		B_SET_DISPLAY_CHANGE_PORT, NULL);
+	fAccGetDisplayOutputRetraceSemaphore
+		= (get_display_output_retrace_semaphore)fAccelerantHook(
+			B_GET_DISPLAY_OUTPUT_RETRACE_SEMAPHORE, NULL);
+	fAccGetDisplayOutputScanLine
+		= (get_display_output_scan_line)fAccelerantHook(
+			B_GET_DISPLAY_OUTPUT_SCAN_LINE, NULL);
 	if (fAccGetDisplayOutputCount == NULL || fAccGetDisplayOutputs == NULL
 		|| fAccSetDisplayLayout == NULL) {
 		fAccGetDisplayOutputCount = NULL;
@@ -450,6 +464,8 @@ AccelerantHWInterface::_SetupDefaultHooks()
 		fAccGetDisplayOutputModes = NULL;
 		fAccSetDisplayLayout = NULL;
 		fAccSetDisplayChangePort = NULL;
+		fAccGetDisplayOutputRetraceSemaphore = NULL;
+		fAccGetDisplayOutputScanLine = NULL;
 	}
 
 	// Monitors coming and going: the accelerant writes to this port, and the
@@ -540,6 +556,8 @@ AccelerantHWInterface::_UpdateHooksAfterModeChange()
 status_t
 AccelerantHWInterface::Shutdown()
 {
+	_StopFlushing();
+
 	if (fDisplayChangeThread >= 0) {
 		if (fAccSetDisplayChangePort != NULL)
 			fAccSetDisplayChangePort(-1, 0);
@@ -564,6 +582,7 @@ AccelerantHWInterface::Shutdown()
 			uninitAccelerant();
 
 		fAccelerantHook = NULL;
+		fRetraceSemaphore = -1;
 	}
 
 	if (fAccelerantImage >= 0) {
@@ -709,8 +728,12 @@ AccelerantHWInterface::_SetMode(const display_mode& mode, bool force)
 		status = fAccSetDisplayMode(&newMode);
 	if (status != B_OK) {
 		ATRACE(("setting display mode failed\n"));
-		if (!fInitialModeSwitch)
+		if (!fInitialModeSwitch) {
+			// The old mode stays, but the accelerant may have had to map
+			// its frame buffer anew while trying.
+			_UpdateFrameBufferConfig();
 			return status;
+		}
 
 		if (fModeList == NULL) {
 			status = _UpdateModeList();
@@ -771,6 +794,9 @@ AccelerantHWInterface::_SetMode(const display_mode& mode, bool force)
 	status = _UpdateBackBuffer();
 	if (status != B_OK)
 		return status;
+
+	// the outputs may show other parts of it now
+	_UpdateFlushTargets();
 
 	// update color palette configuration if necessary
 	if (fDisplayMode.space == B_CMAP8)
@@ -1085,23 +1111,52 @@ AccelerantHWInterface::GetMonitorInfo(monitor_info* info)
 }
 
 
+/*!	Asked for with the interface read locked (WaitForRetraceBeforeCopy()),
+	so this must not lock it: the accelerant is asked once, and when two
+	threads happen to ask at the same time, both get the same answer.
+*/
 sem_id
 AccelerantHWInterface::RetraceSemaphore()
 {
-	AutoWriteLocker _(this);
-
-	if (fRetraceSemaphore != -1)
-		return fRetraceSemaphore;
+	sem_id semaphore = atomic_get(&fRetraceSemaphore);
+	if (semaphore != -1)
+		return semaphore;
+	if (fAccelerantHook == NULL)
+		return B_UNSUPPORTED;
 
 	accelerant_retrace_semaphore AccelerantRetraceSemaphore =
 		(accelerant_retrace_semaphore)fAccelerantHook(
 			B_ACCELERANT_RETRACE_SEMAPHORE, NULL);
-	if (!AccelerantRetraceSemaphore)
-		fRetraceSemaphore = B_UNSUPPORTED;
-	else
-		fRetraceSemaphore = AccelerantRetraceSemaphore();
+	semaphore = AccelerantRetraceSemaphore != NULL
+		? AccelerantRetraceSemaphore() : B_UNSUPPORTED;
+	if (semaphore < 0) {
+		// also -1, so that an accelerant without one is not asked again
+		semaphore = B_UNSUPPORTED;
+	}
 
-	return fRetraceSemaphore;
+	atomic_test_and_set(&fRetraceSemaphore, semaphore, -1);
+	return atomic_get(&fRetraceSemaphore);
+}
+
+
+sem_id
+AccelerantHWInterface::OutputRetraceSemaphore(uint32 id)
+{
+	if (fAccGetDisplayOutputRetraceSemaphore == NULL)
+		return B_UNSUPPORTED;
+	sem_id semaphore = fAccGetDisplayOutputRetraceSemaphore(id);
+	return semaphore < 0 ? B_UNSUPPORTED : semaphore;
+}
+
+
+status_t
+AccelerantHWInterface::OutputScanLine(uint32 id, int32* _line, int32* _lines,
+	bigtime_t* _scanStart, bigtime_t* _period)
+{
+	if (fAccGetDisplayOutputScanLine == NULL)
+		return B_UNSUPPORTED;
+	return fAccGetDisplayOutputScanLine(id, _line, _lines, _scanStart,
+		_period);
 }
 
 
@@ -1589,6 +1644,7 @@ AccelerantHWInterface::_UpdateHardwareCursor(bool force)
 	ServerCursorReference cursor = CursorAndDragBitmap();
 	if (cursor.Get() == NULL || !LockExclusiveAccess())
 		return;
+	BAutolock hooks(fCursorHookLock);
 
 	// The accelerant makes a surface of every one it gets.
 	if (!force && fHardwareCursorEnabled && fHardwareCursor.Get() == cursor.Get()) {
@@ -1696,13 +1752,17 @@ AccelerantHWInterface::SetCursorVisible(bool visible)
 {
 	HWInterface::SetCursorVisible(visible);
 
-	if (fHardwareCursorEnabled && LockExclusiveAccess()) {
+	// The hooks are serialized among themselves only: the exclusive lock
+	// would make every mouse move wait for the drawing under way and hold
+	// up the vertical blank flush behind it (a waiting writer blocks new
+	// readers), for the sake of two registers.
+	if (fHardwareCursorEnabled && fCursorHookLock.Lock()) {
 		if (fAccShowCursor != NULL)
 				fAccShowCursor(visible);
 		else
 			fHardwareCursorEnabled = false;
 
-		UnlockExclusiveAccess();
+		fCursorHookLock.Unlock();
 	}
 }
 
@@ -1712,7 +1772,7 @@ AccelerantHWInterface::MoveCursorTo(float x, float y)
 {
 	HWInterface::MoveCursorTo(x, y);
 
-	if (fHardwareCursorEnabled && LockExclusiveAccess()) {
+	if (fHardwareCursorEnabled && fCursorHookLock.Lock()) {
 		if (fAccMoveCursor != NULL) {
 			// the hardware cursor lives in the front buffer's pixels
 			fAccMoveCursor((uint16)(x * RenderScaleFactor() * SoftwareScale() / 100),
@@ -1724,7 +1784,7 @@ AccelerantHWInterface::MoveCursorTo(float x, float y)
 				fAccShowCursor(false);
 		}
 
-		UnlockExclusiveAccess();
+		fCursorHookLock.Unlock();
 	}
 }
 

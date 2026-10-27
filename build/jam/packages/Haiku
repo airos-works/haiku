@@ -42,6 +42,7 @@ AddFilesToPackage add-ons kernel busses i2c :
 AddFilesToPackage add-ons kernel busses mmc :
 	bcm2711_emmc2@arm64
 	sdhci
+	sunxi_mmc@arm64
 	;
 AddFilesToPackage add-ons kernel busses pci :
 	<pci>designware@riscv64
@@ -110,6 +111,7 @@ AddFilesToPackage add-ons kernel power cpufreq :
 	intel_pstates@x86,x86_64
 	;
 AddFilesToPackage add-ons kernel power cpuidle :
+	x86_acpi_cstates@x86,x86_64
 	x86_cstates@x86,x86_64
 	;
 
@@ -141,6 +143,8 @@ AddNewDriversToPackage disk virtual :
 AddNewDriversToPackage graphics :
 	rpi_display@arm64
 	rpi_dsi@arm64
+	powervr@arm64
+	sunxi_display@arm64
 	v3d@arm64
 	virtio_gpu
 	;
@@ -150,12 +154,14 @@ AddNewDriversToPackage sensor
 	: $(SYSTEM_ADD_ONS_DRIVERS_SENSOR) ;
 AddNewDriversToPackage network :
 	bcm_genet@arm64
+	dwc_eqos@arm64
 	usb_ecm
 	virtio_net
 	;
 AddNewDriversToPackage input :
 	hyperv_hid@x86,x86_64
 	i2c_elan
+	i2c_hid@x86,x86_64
 	virtio_input
 	;
 AddNewDriversToPackage display :
@@ -191,7 +197,8 @@ if $(TARGET_ARCH) = arm64 {
 if $(TARGET_ARCH) = arm64 {
 	# the Raspberry Pi's firmware services: sound output, and the message
 	# channel itself for the H.264 decoder add-on; the SoC's HEVC decoder
-	# block for the HEVC one; the GPIO pins of the 40-pin header for AirPins
+	# block for the HEVC one; the GPIO pins of the 40-pin header for AirPins;
+	# the Allwinner A733's video decoder for the sunxi_cedar add-on
 	AddDriversToPackage audio hmulti :
 		bcm2835_audio
 		;
@@ -199,6 +206,9 @@ if $(TARGET_ARCH) = arm64 {
 		<driver>vchiq
 		<driver>rpi_hevc
 		<driver>rpi_gpio
+		;
+	AddNewDriversToPackage misc :
+		sunxi_ve
 		;
 	# the SoC temperature from the firmware, in the thermal drivers' format
 	AddDriversToPackage power :
@@ -219,6 +229,7 @@ AddDriversToPackage dvb :
 AddDriversToPackage graphics
 	: $(SYSTEM_ADD_ONS_DRIVERS_GRAPHICS) ;
 AddDriversToPackage input :
+	bluetooth_hid
 	ps2_hid
 	usb_hid
 	wacom
@@ -389,6 +400,7 @@ AddBootModuleSymlinksToPackage
 	silicon_image_3112
 	smbios@x86,x86_64
 	sdhci
+	sunxi_mmc@arm64
 	usb
 	usb_disk
 	<usb>ehci
@@ -410,6 +422,8 @@ AddFilesToPackage add-ons accelerants :
 if $(TARGET_ARCH) = arm64 {
 	# the Raspberry Pi 4's HDMI outputs
 	AddFilesToPackage add-ons accelerants : rpi_display.accelerant ;
+	# the Allwinner A733's display outputs (Radxa Cubie A7S)
+	AddFilesToPackage add-ons accelerants : sunxi_display.accelerant ;
 }
 AddFilesToPackage add-ons locale catalogs :
 	$(SYSTEM_ADD_ONS_LOCALE_CATALOGS) ;
@@ -491,6 +505,7 @@ AddFilesToPackage add-ons kernel network protocols
 	: $(SYSTEM_NETWORK_PROTOCOLS) ;
 
 AddFilesToPackage add-ons Screen\ Savers : $(SYSTEM_ADD_ONS_SCREENSAVERS) ;
+AddFilesToPackage add-ons quick_look : $(SYSTEM_ADD_ONS_QUICK_LOOK) ;
 
 AddFilesToPackage add-ons disk_systems :
 	<disk_system>fat

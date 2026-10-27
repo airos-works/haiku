@@ -31,6 +31,7 @@
 #include <bluetooth/LocalDevice.h>
 #include <bluetooth/RemoteDevice.h>
 
+#include <A2dpSource.h>
 #include <LaunchRoster.h>
 #include <LEBondStore.h>
 #include <LELog.h>
@@ -642,6 +643,7 @@ BluetoothWindow::MessageReceived(BMessage* message)
 						(BHandler*)NULL, 1000000);
 				}
 			} else {
+				_ReleaseAudioSink(device->address);
 				status = SendClassicRequest(BT_REQ_REMOVE_DEVICE, _HCIID(),
 					device->address);
 			}
@@ -1310,8 +1312,23 @@ BluetoothWindow::_DisconnectPaired()
 
 	bool connecting
 		= device->connectionState == Bluetooth::RemoteDevice::CONNECTING;
+	_ReleaseAudioSink(device->address);
 	SendClassicRequest(connecting ? BT_REQ_CANCEL_CONN : BT_REQ_DISCONNECT,
 		_HCIID(), device->address);
+}
+
+
+/*!	A speaker the user disconnects or forgets stops being the sound output;
+	the output goes back to what it was before.
+*/
+void
+BluetoothWindow::_ReleaseAudioSink(const uint8 address[6])
+{
+	bdaddr_t sink;
+	BString name;
+	if (Bluetooth::GetAudioSink(sink, name) == B_OK
+		&& memcmp(sink.b, address, 6) == 0)
+		Bluetooth::SetAudioSink(NULL, NULL);
 }
 
 
@@ -1423,10 +1440,11 @@ BluetoothWindow::_UpdateNearbyItem(NearbyDevice* device)
 		&& fOperationKey == device->key && !fOperationFromPaired;
 	bool twinListed = device->companionOf != 0
 		&& fNearby.find(device->companionOf) != fNearby.end();
+	const bool showAll = fShowUnnamed->Value() == B_CONTROL_ON;
 	bool show = operationDevice
 		|| (fPaired.find(device->key) == fPaired.end() && !twinListed
-			&& (device->HasName() || device->IsHID()
-				|| fShowUnnamed->Value() == B_CONTROL_ON));
+			&& (device->IsSupported() || showAll)
+			&& (device->HasName() || device->IsHID() || showAll));
 
 	if (!show) {
 		if (device->item != NULL)
@@ -1440,7 +1458,9 @@ BluetoothWindow::_UpdateNearbyItem(NearbyDevice* device)
 		detail = _OperationProgressText();
 	else {
 		detail = KindLabel(kind);
-		if (device->InPairingMode())
+		if (!device->IsSupported())
+			detail << " · " << B_TRANSLATE("Not supported");
+		else if (device->InPairingMode())
 			detail << " · " << B_TRANSLATE("Pairing mode");
 		else if (device->UsesLEPairing() && !device->connectable)
 			detail << " · " << B_TRANSLATE("Not accepting connections");
@@ -1903,6 +1923,21 @@ BluetoothWindow::_ClassicConnectFinished(bool success, uint8 status)
 	BString text;
 	if (success) {
 		title = B_TRANSLATE("Connected to %name%");
+		// Speakers and headsets say so in their class; a computer that
+		// plays sound (an A2DP sink) has the Rendering and Audio service
+		// bits (Assigned Numbers, Class of Device, bits 18 and 21).
+		const uint32 renderingAudio = (1 << 18) | (1 << 21);
+		if (fOperationKind == DEVICE_KIND_AUDIO
+			|| (fOperationClass & renderingAudio) == renderingAudio) {
+			// Speakers and headsets take over the sound output; the
+			// Bluetooth audio output connects its stream to them.
+			bdaddr_t address;
+			AddressForKey(fOperationKey, address.b);
+			if (Bluetooth::SetAudioSink(&address, fOperationName.String())
+					== B_OK) {
+				text = B_TRANSLATE("Sound now plays through it.");
+			}
+		}
 	} else {
 		title = B_TRANSLATE("Could not connect to %name%");
 		if (status == 0)
@@ -1929,6 +1964,11 @@ void
 BluetoothWindow::_EndOperation()
 {
 	device_key key = fOperationKey;
+	// A Classic device that just connected still has its service query
+	// and, for a keyboard, its HID channels ahead; an inquiry now would
+	// starve them.
+	if (fOperation == OPERATION_CLASSIC_CONNECT)
+		fScanner->HoldInquiry(30000000);
 	fOperation = OPERATION_NONE;
 	fOperationState = OPERATION_IDLE;
 	fOperationStage = -1;

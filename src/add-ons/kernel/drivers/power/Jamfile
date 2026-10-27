@@ -10,4 +10,6 @@ SubInclude HAIKU_TOP src add-ons kernel drivers power pch_thermal ;
 
 if $(TARGET_ARCH) = arm64 {
 	SubInclude HAIKU_TOP src add-ons kernel drivers power rpi_thermal ;
+	SubInclude HAIKU_TOP src add-ons kernel drivers power sunxi_regulator ;
+	SubInclude HAIKU_TOP src add-ons kernel drivers power sunxi_thermal ;
 }

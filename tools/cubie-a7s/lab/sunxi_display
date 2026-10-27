@@ -1,0 +1,2 @@
+# lab images: cubie_reg may read and write the display registers
+debug_registers true

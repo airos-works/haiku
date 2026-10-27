@@ -170,30 +170,22 @@ typedef struct ehci_itd {
 #define EHCI_ITD_MAXPACKETSIZE_LENGTH	11
 
 
-// Split Transaction Isochronous Transfer Descriptors (siTD, EHCI Spec 3.3)
+// Split Transaction Isochronous Transfer Descriptors (siTD, EHCI Spec 3.3).
+// The fields are little-endian dwords; ehci_split_iso.h builds them.
 typedef struct ehci_sitd {
 	// Hardware Part
 	uint32		next_phy;
-	uint8		port_number;
-	uint8		hub_address;
-	uint8		endpoint;
-	uint8		device_address;
-	uint16		reserved1;
-	uint8		cmask;
-	uint8		smask;
-	uint16		transfer_length;
-	uint8		cprogmask;
-	uint8		status;
-	uint32		buffer_phy[2];
-	uint32		back_phy;
-	uint32		ext_buffer_phy[2];
+	uint32		endpoint;			// endpoint and TT characteristics (3.3.2)
+	uint32		schedule;			// microframe C-mask and S-mask (3.3.3)
+	uint32		transfer;			// IOC, total bytes, C-prog-mask, status
+	uint32		buffer_phy[2];		// page 0 + offset; page 1 + TP + T-count
+	uint32		back_phy;			// back link for wrapped IN complete-splits
+	uint32		ext_buffer_phy[2];	// 64-bit extension (Appendix B)
 
 	// Software Part
 	uint32		this_phy;
 	struct ehci_sitd *next;
 	struct ehci_sitd *prev;
-	size_t		buffer_size;
-	void		*buffer_log;
 } _PACKED ehci_sitd;
 
 // Queue Element Transfer Descriptors (qTD, EHCI Spec 3.5)
@@ -285,14 +277,9 @@ typedef struct {
 #endif
 } itd_entry;
 
-typedef struct {
+typedef union {
 	ehci_sitd	sitd;
-
-#ifdef B_HAIKU_64_BIT
-	uint32		padding[14]; // align on 64
-#else
-	uint32 		padding[2]; // align on 64
-#endif
+	uint8		padding[64];	// keeps the frame list's entries 32-byte aligned
 } sitd_entry;
 
 #define EHCI_INTERRUPT_ENTRIES_COUNT	(7 + 1)		// (log 128 / log 2) + 1

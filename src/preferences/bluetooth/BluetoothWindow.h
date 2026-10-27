@@ -96,6 +96,7 @@ private:
 			PairedDevice*		_SelectedPaired() const;
 			void				_ConnectPaired();
 			void				_DisconnectPaired();
+			void				_ReleaseAudioSink(const uint8 address[6]);
 			void				_RemovePaired();
 			void				_ConnectionEvent(BMessage* message);
 			void				_LearnName(device_key key,

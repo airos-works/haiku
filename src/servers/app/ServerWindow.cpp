@@ -890,6 +890,8 @@ ServerWindow::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 
 			DTRACE(("ServerWindow %s: Message AS_WINDOW_RESIZE %.1f, %.1f\n",
 				Title(), xResizeTo, yResizeTo));
+			xResizeTo = limit_window_coordinate(xResizeTo);
+			yResizeTo = limit_window_coordinate(yResizeTo);
 
 			// comment this code for the time being, as some apps rely
 			// on the programmatically resize behavior during user resize
@@ -917,6 +919,8 @@ ServerWindow::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 
 			DTRACE(("ServerWindow %s: Message AS_WINDOW_MOVE: %.1f, %.1f\n",
 				Title(), xMoveTo, yMoveTo));
+			xMoveTo = limit_window_coordinate(xMoveTo);
+			yMoveTo = limit_window_coordinate(yMoveTo);
 
 			if (fWindow->IsDragging()) {
 				// While the user moves the window, we ignore
@@ -2716,10 +2720,8 @@ ServerWindow::_DispatchViewDrawingMessage(int32 code,
 
 				fCurrentView->PenToScreenTransform().Apply(&info.viewRect);
 
-// TODO: Unbreak...
-//				if ((info.options & B_WAIT_FOR_RETRACE) != 0)
-//					fDesktop->HWInterface()->WaitForRetrace(20000);
-
+				// B_WAIT_FOR_RETRACE: the drawing engine copies the bitmap
+				// to the screen at the next vertical blank
 				drawingEngine->DrawBitmap(bitmap, info.bitmapRect,
 					info.viewRect, info.options);
 			}
@@ -3102,6 +3104,31 @@ ServerWindow::_DispatchViewDrawingMessage(int32 code,
 			transform.Apply(gradient);
 			drawingEngine->FillRegion(region, *gradient);
 			delete gradient;
+			break;
+		}
+		case AS_STROKE_FRAME_LINEARRAY:
+		{
+			ViewFrameLineArrayInfo info;
+			if (link.Read<ViewFrameLineArrayInfo>(&info) != B_OK
+				|| info.lineCount <= 0 || info.lineCount > 1024) {
+				break;
+			}
+
+			BStackOrHeapArray<ViewLineArrayInfo, 64> lineData(info.lineCount);
+			if (!lineData.IsValid()
+				|| link.Read(lineData, info.lineCount
+					* sizeof(ViewLineArrayInfo)) != B_OK) {
+				break;
+			}
+
+			const SimpleTransform transform =
+				fCurrentView->PenToScreenTransform();
+			transform.Apply(&info.frame);
+			for (int32 i = 0; i < info.lineCount; i++) {
+				transform.Apply(&lineData[i].startPoint);
+				transform.Apply(&lineData[i].endPoint);
+			}
+			drawingEngine->StrokeFrameLineArray(info, lineData);
 			break;
 		}
 		case AS_STROKE_LINEARRAY:
@@ -3817,6 +3844,32 @@ ServerWindow::_DispatchPictureMessage(int32 code, BPrivate::LinkReceiver& link)
 				fCurrentView->PenToScreenTransform();
 			transform.Apply(&info.endPoint);
 			fCurrentView->CurrentState()->SetPenLocation(penPos);
+			break;
+		}
+
+		case AS_STROKE_FRAME_LINEARRAY:
+		{
+			// a picture keeps the lines as they are
+			ViewFrameLineArrayInfo info;
+			if (link.Read<ViewFrameLineArrayInfo>(&info) != B_OK
+				|| info.lineCount <= 0 || info.lineCount > 1024) {
+				break;
+			}
+
+			BStackOrHeapArray<ViewLineArrayInfo, 64> lineData(info.lineCount);
+			if (!lineData.IsValid()
+				|| link.Read(lineData, info.lineCount
+					* sizeof(ViewLineArrayInfo)) != B_OK) {
+				break;
+			}
+
+			picture->WritePushState();
+			for (int32 i = 0; i < info.lineCount; i++) {
+				picture->WriteSetHighColor(lineData[i].color);
+				picture->WriteStrokeLine(lineData[i].startPoint,
+					lineData[i].endPoint);
+			}
+			picture->WritePopState();
 			break;
 		}
 

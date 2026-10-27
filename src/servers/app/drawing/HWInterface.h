@@ -136,6 +136,10 @@ public:
 	virtual sem_id				RetraceSemaphore() = 0;
 	virtual status_t			WaitForRetrace(
 									bigtime_t timeout = B_INFINITE_TIMEOUT) = 0;
+			void				WaitForRetraceBeforeCopy();
+									// B_WAIT_FOR_RETRACE: drawing that is
+									// in the back buffer goes to the screen
+									// after this (read locked)
 
 	virtual status_t			SetDPMSMode(uint32 state) = 0;
 	virtual uint32				DPMSMode() = 0;
@@ -187,8 +191,58 @@ public:
 	// while CopyBackToFront() actually performs the operation
 	virtual	status_t			CopyBackToFront(const BRect& frame);
 
+			bool				IsFlushingAtRetrace() const
+									{ return fFlushing; }
+	virtual	sem_id				OutputRetraceSemaphore(uint32 id);
+									// released at that display output's
+									// blanks; B_UNSUPPORTED without
+	virtual	status_t			OutputScanLine(uint32 id, int32* _line,
+									int32* _lines, bigtime_t* _scanStart,
+									bigtime_t* _period);
+									// where that output's scan is now, as
+									// a row of its frame buffer region,
+									// when its frame's scan began and how
+									// long a frame takes
+			void				WaitForPendingFlush(bigtime_t timeout);
+									// until what was queued so far is on
+									// the screen (not locked)
+
+
 protected:
 	virtual	void				_CopyBackToFront(/*const*/ BRegion& region);
+
+	// The copies to the front buffer are gathered, and made once per frame
+	// right after the vertical blank, ahead of the scan, by a flush thread
+	// per display output (one for the whole frame buffer without the
+	// outputs' own blanks).
+			status_t			_StartFlushing();
+			void				_StopFlushing();
+			void				_UpdateFlushTargets();
+			status_t			_AddFlushTarget(uint32 outputID,
+									const char* name);
+			void				_AbandonFlushing();
+
+private:
+			struct FlushWorker;
+			struct FlushTarget;
+			status_t			_CopyAreaToFront(const IntRect& area);
+			bool				_QueueForFlush(const IntRect& area,
+									int32 shadowSlot, int32 shadow);
+	static	status_t			_FlushThreadEntry(void* data);
+			void				_FlushThread(FlushTarget& target);
+			int32				_FlipShadow();
+			void				_FlushPending(FlushTarget& target,
+									bigtime_t blank, int32 which);
+			float				_FlushScanRow(FlushTarget& target,
+									bigtime_t blank);
+			void				_CopyShadowToFront(BRegion& region,
+									int32 shadow);
+	static	status_t			_FlushKnobEntry(void* data);
+			void				_FlushKnobThread();
+			void				_SetFlushing(bool flushing);
+	static	status_t			_FlushWorkerEntry(void* data);
+			void				_StartFlushWorkers(FlushTarget& target);
+			void				_StopFlushWorkers(FlushTarget& target);
 
 public:
 	// TODO: Just a quick and primitive way to get single buffered mode working.
@@ -299,6 +353,42 @@ protected:
 
 private:
 			BList				fListeners;
+
+			int32				fRetraceTimeouts;
+			bigtime_t			fRetraceIgnoredUntil;
+
+			// the vertical blank flush
+			BLocker				fFlushLock;
+									// the targets' pending regions, and
+									// the switch
+			FlushTarget*		fFlushTargets;
+			int32				fFlushTargetCount;
+			bool				fFlushPerOutput;
+									// the outputs' targets are in use
+			sem_id				fFlushDoneSem;
+			volatile bool		fQuitFlush;
+			volatile bool		fFlushing;
+									// copies go through the threads
+			thread_id			fFlushKnobThread;
+			bool				fFlushWanted;
+
+			// What the flush copies from: two shadows of the back buffer.
+			// Drawing ops copy their finished areas into the current one;
+			// at a blank the flush makes the other one current and copies
+			// from the one just left, which no drawing op writes any more
+			// (fFlushLock): a drawing op under way never gets into a frame,
+			// and neither side waits for the other.
+			ObjectDeleter<RenderingBuffer>
+								fFlushShadow[2];
+			int32				fShadowCurrent;
+			int32				fShadowReaders;
+									// targets copying from the other
+			struct ShadowWrite {
+				IntRect			rect;
+				int32			shadow;
+				bool			used;
+			};
+			ShadowWrite			fShadowWrites[32];
 };
 
 #endif // HW_INTERFACE_H

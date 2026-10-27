@@ -18,4 +18,5 @@ KernelAddon sdhci :
 
 if $(TARGET_ARCH) = arm64 {
 	SubInclude HAIKU_TOP src add-ons kernel busses mmc bcm2711_emmc2 ;
+	SubInclude HAIKU_TOP src add-ons kernel busses mmc sunxi_mmc ;
 }

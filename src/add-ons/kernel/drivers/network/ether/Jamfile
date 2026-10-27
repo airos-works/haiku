@@ -41,4 +41,5 @@ HaikuSubInclude rtl8125 ;
 
 if $(TARGET_ARCH) = arm64 {
 	HaikuSubInclude bcm_genet ;
+	HaikuSubInclude dwc_eqos ;
 }

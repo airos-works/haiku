@@ -12,10 +12,58 @@ local developHeadersDir = develop/headers$(secondaryArchSubDir) ;
 local unavailableBuildFeatures ;
 
 
+rule ExtractArm64ImageLibraryBuildFeature feature : package : version : library
+	: headers : packageDirectory
+{
+	# ExtractArm64ImageLibraryBuildFeature <feature> : <package> : <version>
+	#	: <library> [ : <header directories> [ : <package directory> ] ] ;
+	# The arm64 bootstrap repository has no image libraries. The pinned
+	# packages of tools/rpi4/build-image-libs.sh in
+	# HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR (or air/OS CI's builds of the same
+	# packages in <package directory>) stand in for HaikuPorts' <package> and
+	# <package>_devel, the same way as zstd's below. <library> is the file in
+	# lib/ to link against; <header directories> default to develop/headers.
+	headers ?= develop/headers ;
+	packageDirectory ?= $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) ;
+	local base = [ FDirName $(packageDirectory)
+		$(package)-$(version)-arm64.hpkg ] ;
+	local devel = [ FDirName $(packageDirectory)
+		$(package)_devel-$(version)-arm64.hpkg ] ;
+	if ! [ Glob $(packageDirectory) : $(base:BS) ]
+		|| ! [ Glob $(packageDirectory) : $(devel:BS) ] {
+		Exit "Missing arm64 $(package) packages in $(packageDirectory); run"
+			"tools/rpi4/build-image-libs.sh (air/OS CI: deps/recipes)" ;
+	}
+	local directory = [ FDirName $(HAIKU_OPTIONAL_BUILD_PACKAGES_DIR)
+		airos-$(package)-$(version)-arm64 ] ;
+	# Extraction shares the prefix (including .PackageInfo), so serialize it.
+	Depends $(directory:G=$(feature)-devel) : $(directory:G=$(feature)-base) ;
+	SetBuildFeatureAttribute $(feature) : runtime
+		: [ ExtractArchive $(directory:G=$(feature)-base) : lib
+			: $(base) : extracted-arm64-$(feature)-base ] : base ;
+	SetBuildFeatureAttribute $(feature) : library
+		: [ ExtractArchive $(directory:G=$(feature)-base) : lib/$(library)
+			: $(base) : extracted-arm64-$(feature)-base ] : base ;
+	SetBuildFeatureAttribute $(feature) : headers
+		: [ ExtractArchive $(directory:G=$(feature)-devel) : $(headers)
+			: $(devel) : extracted-arm64-$(feature)-devel ] : devel ;
+	SetBuildFeatureAttribute $(feature) : base:directory : $(directory) ;
+	SetBuildFeatureAttribute $(feature) : devel:directory : $(directory) ;
+	EnableBuildFeatures $(feature) ;
+}
+
+
 # SSL
 
 # Automatically enable the SSL feature, when the OpenSSL package is enabled.
-if [ IsHaikuImagePackageAdded openssl3 ] {
+# air/OS: also for every regular build, profile or not. The SSL feature is
+# what gives libbnetapi HTTPS (BSecureSocket), which pkgman, HaikuDepot and
+# SoftwareUpdater download through. Only the release, nightly, minimum and test
+# profiles add openssl3, so a haiku.hpkg built without one (jam -q haiku.hpkg,
+# the lab builds) failed every https:// download with "Operation not
+# supported". openssl3 goes into the image with it, since the haiku package
+# then requires lib:libssl and lib:libcrypto.
+if [ IsHaikuImagePackageAdded openssl3 ] || $(HAIKU_BUILD_TYPE) = regular {
 	HAIKU_BUILD_FEATURE_SSL = 1 ;
 }
 
@@ -33,6 +81,7 @@ if $(HAIKU_BUILD_FEATURE_SSL) {
 			;
 
 		EnableBuildFeatures openssl ;
+		AddHaikuImageSystemPackages openssl3 ;
 	} else {
 		unavailableBuildFeatures += openssl ;
 	}
@@ -267,7 +316,37 @@ if [ IsPackageAvailable libvorbis_devel ] {
 
 
 # Freetype
-if [ IsPackageAvailable freetype_devel ] {
+if $(HAIKU_ARM64_FREETYPE_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = arm64 {
+	# The arm64 repository has only the bootstrap FreeType 2.6.3. air/OS
+	# builds 2.14.3 as HaikuPorts does for x86_64, as freetype and
+	# freetype_devel (airos-ci deps/recipes/freetype.sh); the top Jamfile puts
+	# this freetype package in the image instead of the repository's.
+	local packageDirectory = $(HAIKU_ARM64_FREETYPE_PACKAGES_DIR) ;
+	local base = [ Glob $(packageDirectory) : freetype-*-arm64.hpkg ] ;
+	local devel = [ Glob $(packageDirectory) : freetype_devel-*-arm64.hpkg ] ;
+	if ! $(base) || ! $(devel) || $(base[2]) || $(devel[2]) {
+		Exit "Need one arm64 freetype and one freetype_devel package in"
+			$(packageDirectory) ;
+	}
+	local directory = [ FDirName $(HAIKU_OPTIONAL_BUILD_PACKAGES_DIR)
+		airos-$(base:B) ] ;
+	# Extraction shares the prefix (including .PackageInfo), so serialize it.
+	Depends $(directory:G=freetype-devel) : $(directory:G=freetype-base) ;
+	SetBuildFeatureAttribute freetype : runtime
+		: [ ExtractArchive $(directory:G=freetype-base) : lib
+			: $(base) : extracted-arm64-freetype-base ] : base ;
+	SetBuildFeatureAttribute freetype : library
+		: [ ExtractArchive $(directory:G=freetype-devel)
+			: develop/lib/libfreetype.so
+			: $(devel) : extracted-arm64-freetype-devel ] : devel ;
+	SetBuildFeatureAttribute freetype : headers
+		: [ ExtractArchive $(directory:G=freetype-devel)
+			: develop/headers develop/headers/freetype2
+			: $(devel) : extracted-arm64-freetype-devel ] : devel ;
+	SetBuildFeatureAttribute freetype : base:directory : $(directory) ;
+	SetBuildFeatureAttribute freetype : devel:directory : $(directory) ;
+	EnableBuildFeatures freetype ;
+} else if [ IsPackageAvailable freetype_devel ] {
 	ExtractBuildFeatureArchives freetype :
 		file: base freetype
 			runtime: lib
@@ -376,7 +455,15 @@ if $(HAIKU_SUMMIT_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = x86_64 {
 
 
 # libpng
-if [ IsPackageAvailable libpng16_devel ] {
+if $(HAIKU_ARM64_LIBPNG_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = arm64 {
+	# air/OS CI's libpng16 (airos-ci deps/recipes/libpng.sh), the same build
+	# as the lab's image library.
+	ExtractArm64ImageLibraryBuildFeature libpng : libpng16 : 1.6.44-1
+		: libpng16.so.16.44.0 : : $(HAIKU_ARM64_LIBPNG_PACKAGES_DIR) ;
+} else if $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = arm64 {
+	ExtractArm64ImageLibraryBuildFeature libpng : libpng16 : 1.6.44-1
+		: libpng16.so.16.44.0 ;
+} else if [ IsPackageAvailable libpng16_devel ] {
 	ExtractBuildFeatureArchives libpng :
 		file: base libpng16
 			runtime: lib
@@ -389,6 +476,53 @@ if [ IsPackageAvailable libpng16_devel ] {
 	EnableBuildFeatures libpng ;
 } else {
 	unavailableBuildFeatures += libpng ;
+}
+
+
+# MuPDF (the Quick Look document preview)
+if $(HAIKU_MUPDF_PACKAGES_DIR) {
+	# The build's pinned HaikuPorts snapshot has no mupdf: the packages come
+	# from a directory holding HaikuPorts' mupdf and mupdf_devel for the
+	# architecture (air/OS CI fetches them, images/build-image.sh; locally
+	# haikuports.py fetch --no-deps <arch> mupdf mupdf_devel). The image gets
+	# mupdf and its jbig2dec the same way.
+	local packageDirectory = $(HAIKU_MUPDF_PACKAGES_DIR) ;
+	local base = [ Glob $(packageDirectory) : mupdf-*-$(architecture).hpkg ] ;
+	local devel = [ Glob $(packageDirectory)
+		: mupdf_devel-*-$(architecture).hpkg ] ;
+	if ! $(base) || ! $(devel) || $(base[2]) || $(devel[2]) {
+		Exit "Need one $(architecture) mupdf and one mupdf_devel package in"
+			$(packageDirectory) ;
+	}
+	local directory = [ FDirName $(HAIKU_OPTIONAL_BUILD_PACKAGES_DIR)
+		airos-$(base:B) ] ;
+	# Extraction shares the prefix (including .PackageInfo), so serialize it.
+	Depends $(directory:G=mupdf-devel) : $(directory:G=mupdf-base) ;
+	SetBuildFeatureAttribute mupdf : runtime
+		: [ ExtractArchive $(directory:G=mupdf-base) : lib
+			: $(base) : extracted-$(architecture)-mupdf-base ] : base ;
+	SetBuildFeatureAttribute mupdf : library
+		: [ ExtractArchive $(directory:G=mupdf-base) : lib/libmupdf.so
+			: $(base) : extracted-$(architecture)-mupdf-base ] : base ;
+	SetBuildFeatureAttribute mupdf : headers
+		: [ ExtractArchive $(directory:G=mupdf-devel) : develop/headers
+			: $(devel) : extracted-$(architecture)-mupdf-devel ] : devel ;
+	SetBuildFeatureAttribute mupdf : base:directory : $(directory) ;
+	SetBuildFeatureAttribute mupdf : devel:directory : $(directory) ;
+	EnableBuildFeatures mupdf ;
+} else if [ IsPackageAvailable mupdf_devel ] {
+	ExtractBuildFeatureArchives mupdf :
+		file: base mupdf
+			runtime: lib
+		file: devel mupdf_devel
+			depends: base
+			library: $(developLibDir)/libmupdf.so
+			headers: $(developHeadersDir)
+		;
+
+	EnableBuildFeatures mupdf ;
+} else {
+	unavailableBuildFeatures += mupdf ;
 }
 
 
@@ -427,7 +561,10 @@ if [ IsPackageAvailable jasper_devel ] {
 
 
 # jpeg
-if [ IsPackageAvailable libjpeg_turbo_devel ] {
+if $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = arm64 {
+	ExtractArm64ImageLibraryBuildFeature jpeg : libjpeg_turbo : 3.0.4-1
+		: libjpeg.so.62.4.0 ;
+} else if [ IsPackageAvailable libjpeg_turbo_devel ] {
 	ExtractBuildFeatureArchives jpeg :
 		file: base libjpeg_turbo
 			runtime: lib
@@ -565,7 +702,10 @@ if [ IsPackageAvailable libraw_devel ] {
 
 
 # libwebp
-if [ IsPackageAvailable libwebp_devel ] {
+if $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = arm64 {
+	ExtractArm64ImageLibraryBuildFeature libwebp : libwebp : 1.4.0-1
+		: libwebp.so.7.1.9 : develop/headers develop/headers/webp ;
+} else if [ IsPackageAvailable libwebp_devel ] {
 	if $(HAIKU_PACKAGING_ARCH) = x86 && $(TARGET_PACKAGING_ARCH) = x86_gcc2 {
 		ExtractBuildFeatureArchives libwebp :
 			file: base libwebp

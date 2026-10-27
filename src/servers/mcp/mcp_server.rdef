@@ -1,0 +1,8 @@
+resource app_signature "application/x-vnd.Haiku-mcp_server";
+resource app_flags B_SINGLE_LAUNCH | B_BACKGROUND_APP;
+resource vector_icon { import "mcp.hvif" };
+resource app_version {
+	major = 1, middle = 0, minor = 0, variety = B_APPV_DEVELOPMENT, internal = 0,
+	short_info = "MCP server",
+	long_info = "Native Model Context Protocol service for air/OS"
+};

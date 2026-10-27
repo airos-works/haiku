@@ -130,6 +130,9 @@ struct xhci_device {
 	struct xhci_device_ctx *device_ctx;
 
 	xhci_endpoint endpoints[XHCI_MAX_ENDPOINTS - 1];
+
+	bool keep_awake;
+		// its driver wants its root port kept out of U3 in a suspend to idle
 };
 
 
@@ -145,7 +148,7 @@ public:
 	virtual	const char *		TypeName() const { return "xhci"; }
 
 			status_t			Start();
-			status_t			Suspend();
+			status_t			Suspend(int32 state);
 			status_t			Resume();
 	virtual	status_t			SubmitTransfer(Transfer *transfer);
 			status_t			SubmitControlRequest(Transfer *transfer);
@@ -158,6 +161,8 @@ public:
 
 	virtual	status_t			NotifyPipeChange(Pipe *pipe,
 									usb_change change);
+	virtual	status_t			SetKeepAwake(Device *device, bool keepAwake);
+	virtual	status_t			PlatformResetPort(uint8 index);
 
 	virtual	Device *			AllocateDevice(Hub *parent,
 									int8 hubAddress, uint8 hubPort,
@@ -177,6 +182,10 @@ private:
 			// Controller resets
 			status_t			ControllerReset();
 			status_t			ControllerHalt();
+
+			// Suspend to idle
+			status_t			_SuspendToIdle();
+			status_t			_ResumeFromIdle();
 			void				_SetInterruptModeration();
 
 			// Interrupt functions
@@ -214,9 +223,11 @@ private:
 			void				_FreeDescriptorChunks(xhci_device* device);
 
 			size_t				WriteDescriptor(xhci_td *descriptor,
-									generic_io_vec *vector, size_t vectorCount, bool physical);
+									generic_io_vec *vector, size_t vectorCount, bool physical,
+									const usb_isochronous_data* isochronous = NULL);
 			size_t				ReadDescriptor(xhci_td *descriptor,
-									generic_io_vec *vector, size_t vectorCount, bool physical);
+									generic_io_vec *vector, size_t vectorCount, bool physical,
+									const usb_isochronous_data* isochronous = NULL);
 
 			status_t			_LinkDescriptorForPipe(xhci_td *descriptor,
 									xhci_endpoint *endpoint);
@@ -244,6 +255,9 @@ private:
 									const char* name);
 	inline	void				_DeviceMemoryBarrier();
 	inline	bool				_DirectPhysical(Transfer* transfer) const;
+			generic_size_t		_PhysicalTRBLength(phys_addr_t address,
+									generic_size_t remaining,
+									const xhci_endpoint* endpoint) const;
 			bool				_IsDisabledSuperSpeedPort(uint8 index) const;
 
 			// Commands
@@ -323,6 +337,11 @@ private:
 			phys_addr_t			fErstPhysical;
 			phys_addr_t			fCmdRingPhysical;
 			bool				fPortsDisconnected;
+			bool				fIdleSuspended;
+				// transfers are refused and doorbells held back
+			bool				fIdleHalted;
+				// commands are refused
+			bool				fPortIdleSuspended[XHCI_MAX_PORTS];
 
 			spinlock			fSpinlock;
 

@@ -195,6 +195,8 @@ public:
 
 			void				MoveWindowBy(Window* window, float x, float y,
 									int32 workspace = -1);
+			void				BeginWindowDrag();
+			void				EndWindowDrag(bool redraw = true);
 			void				ResizeWindowBy(Window* window, float x,
 									float y);
 			void				SetWindowOutlinesDelta(Window* window,
@@ -333,6 +335,8 @@ private:
 			void				_ScreenChanged(Screen* screen);
 			status_t			_ConfigureDisplayLayout(
 									::HWInterface* interface, bool switchMode);
+			status_t			_SetDisplayLayout(::HWInterface* interface,
+									DisplayLayout& layout, bool switchMode);
 			void				_UpdateDisplays();
 			void				_StoreDisplayLayout();
 			void				_RememberScreenMode(Screen* screen);
@@ -342,6 +346,9 @@ private:
 									const DisplayLayout& before,
 									const DisplayLayout& after);
 			void				_SetCurrentWorkspaceConfiguration();
+			void				_PublishDeviceScale();
+			bool				_CopyWindowApproximately(Window* window,
+									BRegion& copyRegion, float x, float y);
 			void				_SetWorkspace(int32 index,
 									bool moveFocusWindow = false);
 
@@ -373,6 +380,7 @@ private:
 			team_id				fDirectScreenTeam;
 			int32				fCurrentWorkspace;
 			int32				fPreviousWorkspace;
+			int32				fWindowDrags;
 
 			WindowList			fAllWindows;
 			WindowList			fSubsetWindows;

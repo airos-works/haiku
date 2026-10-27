@@ -1,0 +1,370 @@
+# air/OS for the Radxa Cubie A7S (Allwinner A733, arm64). Include this file
+# from the build directory's UserBuildConfig.
+#
+#	jam -q @minimum-cubie	the small bring-up image (haiku-cubie-minimum.image)
+#	jam -q @cubie-airos		the full air/OS system (haiku-cubie-airos.image)
+#
+# The images are bare BFS volumes: tools/cubie-a7s/build-sd-image.sh makes an
+# SD card image of one (boot loader, ESP, BFS), deploy-haiku.sh puts one on
+# the lab card.
+
+HAIKU_IMAGE_LABEL = airOS ;
+
+# Zstandard for arm64 (built by tools/rpi4/build-zstd.sh): the boot loader,
+# packagefs and the package kit read zstd packages, which the applications'
+# packages are; without it they do not mount.
+HAIKU_ARM64_ZSTD_PACKAGES_DIR ?= /mnt/HaikuWork/rpi4/zstd/packages ;
+
+# libjpeg-turbo, libpng and libwebp for arm64 (built by
+# tools/rpi4/build-image-libs.sh). The JPEG, PNG and WebP translators and the
+# USB webcam's MJPEG are built only with them; the full image ships them.
+HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR ?= /mnt/HaikuWork/rpi4/image-libs/packages ;
+
+# FreeType 2.14.3 and the current Noto fonts, as the air/OS CI images have
+# them: copies of the build server's freetype and freetype_devel (airos-ci
+# deps/recipes/freetype.sh) and of the zlib noto and noto_sans_cjk_jp its
+# images/build-image.sh stages. Without them the images keep the arm64
+# repository's bootstrap FreeType 2.6.3 and Noto, which has no Noto Sans
+# Mono: the fixed font falls back to a proportional serif.
+HAIKU_ARM64_FREETYPE_PACKAGES_DIR ?= /mnt/HaikuWork/airos/arm64-freetype ;
+CUBIE_FONT_PACKAGES_DIR ?= /mnt/HaikuWork/airos/arm64-fonts ;
+if ! [ Glob $(HAIKU_ARM64_FREETYPE_PACKAGES_DIR) : freetype-*-arm64.hpkg ] {
+	Echo "cubie-a7s: no freetype packages in"
+		"$(HAIKU_ARM64_FREETYPE_PACKAGES_DIR), the image has the bootstrap"
+		"FreeType" ;
+	HAIKU_ARM64_FREETYPE_PACKAGES_DIR = ;
+}
+
+if $(HAIKU_BUILD_PROFILE) = minimum-cubie {
+	HAIKU_IMAGE_SIZE = 900 ;
+}
+DefineBuildProfile minimum-cubie : image : "haiku-cubie-minimum.image" ;
+
+# The full air/OS system: the regular image definition (every application,
+# preference and demo) plus the owner's applications, Summit, airTime and the
+# libraries and firmware Haiku has no arm64 packages for; the same inputs as
+# the Pi 4's air/OS image (tools/rpi4/UserBuildConfig).
+CUBIE_AIROS_IMAGE = ;
+if $(HAIKU_BUILD_PROFILE) = cubie-airos {
+	CUBIE_AIROS_IMAGE = 1 ;
+	HAIKU_IMAGE_SIZE = 3584 ;
+	HAIKU_BFS_GROWABLE = 1 ;
+	AddHaikuImageSystemPackages ca_root_certificates ;
+}
+DefineBuildProfile cubie-airos : image : "haiku-cubie-airos.image" ;
+
+# The lab overlay: files that only make sense on the lab's board. It is
+# switched on by the presence of /mnt/HaikuWork/cubie/state/lab-image.
+# Set CUBIE_LAB_IMAGE = 0 before including this file for distributable images.
+CUBIE_LAB_IMAGE ?= auto ;
+if $(CUBIE_LAB_IMAGE) = auto {
+	CUBIE_LAB_IMAGE = ;
+	if [ Glob /mnt/HaikuWork/cubie/state : lab-image ] {
+		CUBIE_LAB_IMAGE = 1 ;
+	}
+}
+
+if $(CUBIE_LAB_IMAGE) = 1 {
+	DeferredSubInclude HAIKU_TOP tools cubie-a7s ;
+}
+
+# The Mesa the images ship (OpenGL through zink on the PowerVR Vulkan
+# driver, softpipe without the GPU, and the GPU's test programs): a pinned
+# release, built from the patches of one commit of tools/cubie-a7s/mesa with
+# its build.sh into /mnt/HaikuWork/cubie/mesa/release/<commit>, whose
+# MANIFEST names the patches and every file's hash. The lab's work in
+# progress goes in with -sCUBIE_MESA_DIR=/mnt/HaikuWork/cubie/mesa/out (or
+# CUBIE_MESA_DIR set before including this file).
+CUBIE_MESA_RELEASE ?= 73af0f93d6 ;
+CUBIE_MESA_DIR ?= /mnt/HaikuWork/cubie/mesa/release/$(CUBIE_MESA_RELEASE) ;
+
+rule UserBuildConfigRulePreImage
+{
+	if $(HAIKU_BUILD_PROFILE) in minimum-cubie cubie-airos {
+		local mesaFiles = MANIFEST libEGL_mesa.so.0 10_mesa.json
+			libvulkan_powervr_mesa.so libvulkan.so.1 ;
+		local found = [ Glob $(CUBIE_MESA_DIR) : $(mesaFiles) ] ;
+		if ! $(found[5]) {
+			Exit "cubie-a7s: no Mesa release in" $(CUBIE_MESA_DIR)
+				"- it needs" $(mesaFiles) "- build the commit's"
+				"tools/cubie-a7s/mesa with CUBIE_MESA_ROOT=<new dir> build.sh"
+				"all and copy its out/ there, or name another with"
+				"-sCUBIE_MESA_DIR=..." ;
+		}
+		Echo "cubie-a7s: Mesa from $(CUBIE_MESA_DIR)" ;
+	}
+
+	# The PowerVR GPU's firmware and its licence (fetch-gpu-firmware.sh; not
+	# in git), for the powervr driver's firmware stage. Left out, with a
+	# note, when they have not been fetched.
+	if $(HAIKU_BUILD_PROFILE) in minimum-cubie cubie-airos {
+		# (-sCUBIE_GPU_FIRMWARE_DIR=... builds an image with other or none)
+		local gpuFirmwareDir = $(CUBIE_GPU_FIRMWARE_DIR) ;
+		gpuFirmwareDir ?= /mnt/HaikuWork/cubie/firmware/powervr ;
+		local gpuFirmwareFiles = rogue_36.56.104.183_v1.fw LICENSE.powervr ;
+		local found = [ Glob $(gpuFirmwareDir) : $(gpuFirmwareFiles) ] ;
+		if $(found[2]) {
+			local gpuFirmware = <cubie-gpu-firmware>$(gpuFirmwareFiles) ;
+			SEARCH on $(gpuFirmware) = $(gpuFirmwareDir) ;
+			AddFilesToHaikuImage system non-packaged data firmware powervr
+				: $(gpuFirmware) ;
+		} else {
+			Echo "cubie-a7s: no PowerVR GPU firmware in $(gpuFirmwareDir),"
+				"the image goes without (fetch-gpu-firmware.sh)" ;
+		}
+	}
+
+	if $(HAIKU_ARM64_ZSTD_PACKAGES_DIR) {
+		local zstdPackage = <cubie-zstd>zstd-1.5.7-1-arm64.hpkg ;
+		SEARCH on $(zstdPackage) = $(HAIKU_ARM64_ZSTD_PACKAGES_DIR) ;
+		AddPackageFilesToHaikuImage system packages : $(zstdPackage) ;
+	}
+
+	# the libraries of the JPEG, PNG and WebP translators
+	if $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) && $(CUBIE_AIROS_IMAGE) {
+		local imageLibraries = <cubie-image-lib>libjpeg_turbo-3.0.4-1-arm64.hpkg
+			<cubie-image-lib>libpng16-1.6.44-1-arm64.hpkg
+			<cubie-image-lib>libwebp-1.4.0-1-arm64.hpkg ;
+		SEARCH on $(imageLibraries) = $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) ;
+		AddPackageFilesToHaikuImage system packages : $(imageLibraries) ;
+	}
+
+	# The AIC8800D80 Wi-Fi/Bluetooth module's firmware, unchanged, with
+	# AICSemi's licence (tools/cubie-a7s/stage-aic8800-firmware.sh). The
+	# aic8800wifi driver loads it; Bluetooth comes up with it.
+	local aicFirmwareDir = $(CUBIE_AIC8800_FIRMWARE) ;
+	if ! $(aicFirmwareDir) {
+		aicFirmwareDir = /mnt/HaikuWork/cubie/firmware/aic8800wifi ;
+	}
+	local aicFirmware = <cubie-aic>fw_patch_table_8800d80_u02.bin
+		<cubie-aic>fw_adid_8800d80_u02.bin <cubie-aic>fw_patch_8800d80_u02.bin
+		<cubie-aic>fw_patch_8800d80_u02_ext0.bin
+		<cubie-aic>fmacfw_8800d80_u02.bin <cubie-aic>fmacfw_8800d80_h_u02.bin
+		<cubie-aic>aic_userconfig_8800d80.txt <cubie-aic>LICENSE.aic
+		<cubie-aic>PROVENANCE ;
+	SEARCH on $(aicFirmware) = $(aicFirmwareDir) ;
+	AddFilesToHaikuImage system non-packaged data firmware aic8800wifi
+		: $(aicFirmware) ;
+	AddDriversToHaikuImage net : aic8800wifi ;
+
+	if $(CUBIE_AIROS_IMAGE) {
+		local extras = /mnt/HaikuWork/rock5-image-extras ;
+
+		# libraries the applications link against (Summit's WebKit needs
+		# libglvnd's EGL and GLES even without a GPU)
+		local libs = <cubie-lib>libEGL.so.1
+			<cubie-lib>libGLESv2.so.2 <cubie-lib>libGLdispatch.so.0
+			<cubie-lib>libOpenGL.so.0 <cubie-lib>libGLU.so.1
+			<cubie-lib>libsqlite3.so.0 <cubie-lib>libtag.so.2
+			<cubie-lib>libpcre2-8.so.0 <cubie-lib>libscintilla.so
+			<cubie-lib>liblexilla.so ;
+		SEARCH on $(libs) = [ FDirName $(extras) lib ] ;
+		AddFilesToHaikuImage system non-packaged lib : $(libs) ;
+
+		# The Pi's pinned GCC runtime with both symbol hashes
+		# (tools/rpi4/build-cxx-runtime.sh) and its BGLView (libGL).
+		local cxxLib = <cubie-cxx>libstdc++.so.6 ;
+		SEARCH on $(cxxLib) = /mnt/HaikuWork/rpi4/cxx-runtime/stage ;
+		AddFilesToHaikuImage system non-packaged lib : $(cxxLib) ;
+		local glViewLib = <cubie-glvnd>libGL.so.1 ;
+		SEARCH on $(glViewLib) = /mnt/HaikuWork/rpi4/glvnd/stage ;
+		AddFilesToHaikuImage system non-packaged lib : $(glViewLib) ;
+
+		# OpenGL: Mesa 26.2.4 (CUBIE_MESA_DIR, above), zink on the PowerVR
+		# Vulkan driver and softpipe without it.
+		local mesaLib = <cubie-mesa>libEGL_mesa.so.0 ;
+		SEARCH on $(mesaLib) = $(CUBIE_MESA_DIR) ;
+		AddFilesToHaikuImage system non-packaged lib : $(mesaLib) ;
+		local vendorFile = <cubie-mesa>10_mesa.json ;
+		SEARCH on $(vendorFile) = $(CUBIE_MESA_DIR) ;
+		AddFilesToHaikuImage system non-packaged add-ons opengl egl_vendor.d
+			: $(vendorFile) ;
+		# The GPU: its firmware stage (the lab's settings log more), and
+		# Mesa's PowerVR Vulkan driver with zink's libvulkan.so.1 (the
+		# driver, without a loader).
+		if $(CUBIE_LAB_IMAGE) != 1 {
+			local gpuSettings = <cubie-settings>powervr ;
+			SEARCH on $(gpuSettings)
+				= [ FDirName $(HAIKU_TOP) tools cubie-a7s settings ] ;
+			AddFilesToHaikuImage home config settings kernel drivers
+				: $(gpuSettings) ;
+		}
+		local vulkanLibs = <cubie-mesa>libvulkan_powervr_mesa.so
+			<cubie-mesa>libvulkan.so.1 ;
+		SEARCH on $(vulkanLibs) = $(CUBIE_MESA_DIR) ;
+		AddFilesToHaikuImage system non-packaged lib : $(vulkanLibs) ;
+
+		local glDemos = <cubie-gl>GLTeapot ;
+		SEARCH on $(glDemos) = [ FDirName $(extras) apps ] ;
+		AddFilesToHaikuImage system non-packaged demos : $(glDemos) ;
+
+		# Wi-Fi and Bluetooth firmware, wpa_supplicant, FFmpeg
+		local packages
+			= <cubie-pkg>intel_wifi_firmwares-2025_02_11-1-any.hpkg
+			<cubie-pkg>ralink_wifi_firmwares-2023_08_04-1-any.hpkg
+			<cubie-pkg>realtek_wifi_firmwares-2019_01_02-1-any.hpkg
+			<cubie-pkg>intel_bluetooth_firmwares-20240318-1-any.hpkg
+			<cubie-pkg>mediatek_bluetooth_firmwares-20240318-1-any.hpkg
+			<cubie-pkg>realtek_bluetooth_firmwares-20240318-1-any.hpkg
+			<cubie-pkg>rock5_glinfo-1.0.0-1-arm64.hpkg
+			<cubie-pkg>rock5_ffmpeg-6.1.6-2-arm64.hpkg
+			<cubie-pkg>wpa_supplicant-2.11.haiku.1-1-arm64.hpkg ;
+		SEARCH on $(packages) = [ FDirName $(extras) packages ] ;
+		AddFilesToHaikuImage system packages : $(packages) ;
+
+		# The current Noto and its CJK fallback (CUBIE_FONT_PACKAGES_DIR), as
+		# system packages, so that the bootstrap noto stays out.
+		local fontPackages = [ Glob $(CUBIE_FONT_PACKAGES_DIR)
+			: noto-*-any.hpkg noto_sans_cjk_jp-*-any.hpkg ] ;
+		if $(fontPackages[2]) {
+			fontPackages = <cubie-font>$(fontPackages:BS) ;
+			SEARCH on $(fontPackages) = $(CUBIE_FONT_PACKAGES_DIR) ;
+			AddPackageFilesToHaikuImage system packages : $(fontPackages) ;
+		} else {
+			Echo "cubie-a7s: no noto packages in $(CUBIE_FONT_PACKAGES_DIR),"
+				"the image has the bootstrap noto" ;
+		}
+
+		# ...without the ROCK 5's hardware decoder in rock5_ffmpeg, which
+		# takes H.264 from FFmpeg and then fails (same file as the Pi's).
+		local packageSettings = <cubie-settings>packages ;
+		SEARCH on $(packageSettings) = [ FDirName $(HAIKU_TOP) data boot rpi ] ;
+		AddFilesToHaikuImage system settings : $(packageSettings) ;
+
+		# The owner's applications and Summit (arm64 packages, staged in
+		# CUBIE_IMAGE_PACKAGES) and airTime.
+		local imagePackageDir = $(CUBIE_IMAGE_PACKAGES) ;
+		if ! $(imagePackageDir) {
+			imagePackageDir = /mnt/HaikuWork/cubie/image-packages ;
+		}
+		local imagePackages = [ Glob $(imagePackageDir) : *.hpkg ] ;
+		imagePackages = <cubie-app-pkg>$(imagePackages:BS) ;
+		SEARCH on $(imagePackages) = $(imagePackageDir) ;
+		AddFilesToHaikuImage system packages : $(imagePackages) ;
+		local airTime = <airtime-pkg>airtime-1.0.0-18-arm64.hpkg ;
+		SEARCH on $(airTime) = /mnt/HaikuWork/apps/airTime/artifacts ;
+		AddFilesToHaikuImage system packages : $(airTime) ;
+
+		# The video engine's add-on before FFmpeg's in the Media Kit's
+		# lookup, so that MediaPlayer and every BMediaFile user decode H.264
+		# and HEVC on the engine. The Media Kit searches the add-on
+		# directories in order (system/non-packaged before system) and in one
+		# directory takes the first add-on registered for a format, which is
+		# FFmpeg's (rock5_ffmpeg's entries come first). The add-on registers
+		# its formats only where the engine is, and hands a stream the engine
+		# does not decode to FFmpeg's decoder itself.
+		AddSymlinkToHaikuImage system non-packaged add-ons media plugins
+			: /boot/system/add-ons/media/plugins/sunxi_cedar : sunxi_cedar ;
+
+		# TLS for curl and Summit
+		local airosLibDir = /mnt/HaikuWork/airos/lib-arm64 ;
+		local airosLibs = [ Glob $(airosLibDir) : *.so* ] ;
+		airosLibs = <airos-lib>$(airosLibs:BS) ;
+		SEARCH on $(airosLibs) = $(airosLibDir) ;
+		AddFilesToHaikuImage system non-packaged lib : $(airosLibs) ;
+		AddSymlinkToHaikuImage system non-packaged data ssl
+			: /boot/system/data/ssl/CARootCertificates.pem
+			: CARootCertificates.pem ;
+
+		# An installed system, not an installer medium: to the desktop.
+		local localeSettings = "<cubie-settings>Locale settings" ;
+		SEARCH on $(localeSettings) = [ FDirName $(HAIKU_TOP) data boot rpi ] ;
+		AddFilesToHaikuImage home config settings : $(localeSettings) ;
+
+		# Time from NTP (no RTC) and Wi-Fi autojoin at start; the bootstrap
+		# ICU's data directory.
+		local bootscript = <cubie-settings>UserBootscript ;
+		SEARCH on $(bootscript) = [ FDirName $(HAIKU_TOP) data boot cubie-a7s ] ;
+		local timeSync = <cubie-settings>rpi-time-sync ;
+		SEARCH on $(timeSync) = [ FDirName $(HAIKU_TOP) data boot rpi ] ;
+		AddFilesToHaikuImage home config settings boot : $(bootscript)
+			$(timeSync) ;
+		local rtcSettings = <cubie-settings>RTC_time_settings ;
+		SEARCH on $(rtcSettings) = [ FDirName $(HAIKU_TOP) data boot rpi ] ;
+		AddFilesToHaikuImage home config settings : $(rtcSettings) ;
+		# The desktop's environment (ICU data, Summit's direct present into
+		# app_server's copy of the screen).
+		local environment = <cubie-settings>UserSetupEnvironment ;
+		SEARCH on $(environment) = [ FDirName $(HAIKU_TOP) tools cubie-a7s ] ;
+		AddFilesToHaikuImage home config settings boot : $(environment) ;
+	}
+
+	if $(CUBIE_LAB_IMAGE) = 1 {
+		# lab tools, and the driver settings that let cubie_reg at the
+		# display registers
+		AddFilesToHaikuImage system non-packaged bin : cubie_reg cubie_fetch
+			cubie_send pvrinfo pvrtest cedar_decode media_probe cpu_usage aicload
+			cubie_audio_test screencheck cubie_cpubench retrace_test ;
+		if $(CUBIE_AIROS_IMAGE) {
+			# a Bluetooth diagnostic the regular image leaves out
+			AddFilesToHaikuImage system non-packaged bin : bt_dev_info ;
+		}
+
+		# The video engine's test streams and FFmpeg's hashes of them
+		# (evidence/video/proto/mkvectors.sh; not in git), for cedar_decode.
+		local cedarVectorDir = /mnt/HaikuWork/cubie/evidence/video/proto/vectors ;
+		local cedarVectors = [ Glob $(cedarVectorDir) : *.264 *.265
+			*.framemd5 ] ;
+		if $(cedarVectors) {
+			cedarVectors = <cedar-vector>$(cedarVectors:BS) ;
+			SEARCH on $(cedarVectors) = $(cedarVectorDir) ;
+			AddFilesToHaikuImage system non-packaged data cedar-vectors
+				: $(cedarVectors) ;
+		}
+
+		# Films for the players' tests (not in git), when the build
+		# directory's UserBuildConfig names a directory of them.
+		if $(CUBIE_LAB_MEDIA) {
+			local labMedia = [ Glob $(CUBIE_LAB_MEDIA) : *.mp4 *.mkv *.webm ] ;
+			labMedia = <cubie-lab-media>$(labMedia:BS) ;
+			SEARCH on $(labMedia) = $(CUBIE_LAB_MEDIA) ;
+			AddFilesToHaikuImage home media : $(labMedia) ;
+		}
+		local labSettings = <cubie-lab>sunxi_display <cubie-lab>aic8800wifi
+			<cubie-lab>sunxi_thermal ;
+		SEARCH on $(labSettings) = [ FDirName $(HAIKU_TOP) tools cubie-a7s lab ] ;
+		AddFilesToHaikuImage home config settings kernel drivers
+			: $(labSettings) ;
+
+		# The powervr driver's settings with the firmware's trace logged;
+		# air/OS images have their own without (settings/powervr).
+		local gpuSettings = <cubie-lab-settings>powervr ;
+		SEARCH on $(gpuSettings) = [ FDirName $(HAIKU_TOP) tools cubie-a7s lab ] ;
+		AddFilesToHaikuImage home config settings kernel drivers
+			: $(gpuSettings) ;
+
+		# The tests of Mesa's PowerVR Vulkan driver from the same Mesa
+		# (CUBIE_MESA_DIR), and the driver for the minimum image (air/OS
+		# images have it anyway).
+		if ! $(CUBIE_AIROS_IMAGE) {
+			local vulkanLibs = <cubie-mesa>libvulkan_powervr_mesa.so
+				<cubie-mesa>libvulkan.so.1 ;
+			SEARCH on $(vulkanLibs) = $(CUBIE_MESA_DIR) ;
+			AddFilesToHaikuImage system non-packaged lib : $(vulkanLibs) ;
+		}
+		local test ;
+		for test in pvr_vkprobe pvr_vkfill pvr_vkfence pvr_vktriangle
+				pvr_vkhang pvr_vkbench pvr_present pvr_copybench pvr_glprobe
+				pvr_glbench pvr_glreset pvr_glpresent pvr_glcomposite pvr_glxfb
+				pvr_glconform tls_generation_check libtls_generation_check.so {
+			# a release from before a test was written lacks it
+			if [ Glob $(CUBIE_MESA_DIR) : $(test) ] {
+				local testFile = <cubie-mesa>$(test) ;
+				SEARCH on $(testFile) = $(CUBIE_MESA_DIR) ;
+				AddFilesToHaikuImage system non-packaged bin : $(testFile) ;
+			}
+		}
+
+		# A telnet login for the lab, with an account whose password hash
+		# lives outside the tree (state/lab-overlay, made once per lab).
+		local overlay = /mnt/HaikuWork/cubie/state/lab-overlay ;
+		if [ Glob $(overlay) : shadow ] {
+			local shadow = <cubie-lab>shadow ;
+			SEARCH on $(shadow) = $(overlay) ;
+			AddFilesToHaikuImage system settings etc : $(shadow) ;
+			local services = <cubie-lab>services ;
+			SEARCH on $(services) = $(overlay) ;
+			AddFilesToHaikuImage system settings network : $(services) ;
+		}
+	}
+}

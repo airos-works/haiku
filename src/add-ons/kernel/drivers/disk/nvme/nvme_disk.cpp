@@ -20,6 +20,7 @@
 
 #include <fs/devfs.h>
 #include <kdevice_manager.h>
+#include <ACPI.h>
 #include <bus/PCI.h>
 #include <vm/vm.h>
 
@@ -125,6 +126,7 @@ typedef struct {
 
 	rw_lock					suspend_lock;
 		// read locked for every command, write locked while suspended
+	bool					suspended;
 
 	ConditionVariable		interrupt;
 	uint32					interrupt_id;
@@ -1295,6 +1297,7 @@ nvme_disk_init_driver(device_node* node, void** cookie)
 	info->node = node;
 
 	info->ctrlr = NULL;
+	info->suspended = false;
 
 	*cookie = info;
 	return B_OK;
@@ -1318,10 +1321,16 @@ nvme_disk_suspend(void* _cookie, int32 state)
 	if (info->ctrlr == NULL)
 		return B_OK;
 
+	// Suspend to idle keeps the controller powered; autonomous power state
+	// transitions already take it to its lowest power state when it idles.
+	if (state == ACPI_POWER_STATE_ON)
+		return B_OK;
+
 	// Wait for pending commands; new ones are blocked until resumed.
 	rw_lock_write_lock(&info->suspend_lock);
 
 	nvme_ctrlr_suspend(info->ctrlr);
+	info->suspended = true;
 	return B_OK;
 }
 
@@ -1330,8 +1339,9 @@ static status_t
 nvme_disk_resume(void* _cookie)
 {
 	nvme_disk_driver_info* info = (nvme_disk_driver_info*)_cookie;
-	if (info->ctrlr == NULL)
+	if (info->ctrlr == NULL || !info->suspended)
 		return B_OK;
+	info->suspended = false;
 
 	status_t status = B_OK;
 	int result = nvme_ctrlr_resume(info->ctrlr);

@@ -19,6 +19,7 @@
 #include "KeyboardProtocolHandler.h"
 #include "MouseProtocolHandler.h"
 #include "TabletProtocolHandler.h"
+#include "TouchpadProtocolHandler.h"
 
 
 ProtocolHandler::ProtocolHandler(HIDDevice *device, const char *basePath,
@@ -96,7 +97,13 @@ ProtocolHandler::AddHandlers(HIDDevice &device, ProtocolHandler *&handlerList,
 		KeyboardProtocolHandler::AddHandlers(device, *collection, handlerList);
 		JoystickProtocolHandler::AddHandlers(device, *collection, handlerList);
 		MouseProtocolHandler::AddHandlers(device, *collection, handlerList);
-		TabletProtocolHandler::AddHandlers(device, *collection, handlerList);
+		// A precision touchpad reports where its fingers are, but is no
+		// absolute pointer.
+		if (!TouchpadProtocolHandler::AddHandlers(device, *collection,
+				handlerList)) {
+			TabletProtocolHandler::AddHandlers(device, *collection,
+				handlerList);
+		}
 	}
 
 	handlerCount = 0;

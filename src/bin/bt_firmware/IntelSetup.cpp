@@ -13,6 +13,7 @@
 #include "BluetoothFirmware.h"
 
 #include <string.h>
+#include <unistd.h>
 
 #include "IntelBluetoothFirmware.h"
 
@@ -44,6 +45,26 @@ ApplyDdc(Controller& controller, const char* name)
 	}
 	LOG("  applied %zu device configuration records\n", records);
 	return true;
+}
+
+
+/*!	What Linux does when a download fails: an Intel Reset back into the
+	bootloader. A bootloader that took part of an image (a download that was
+	interrupted, say) refuses the next one until it has been reset; this way
+	the controller leaves the bus and comes back ready for another try.
+*/
+static void
+ResetToBootloader(Controller& controller)
+{
+	// hard reset, patches enabled, DDC reload, current image, address 0
+	const uint8_t reset[8] = { 0x01, 0x01, 0x01, 0x00, 0, 0, 0, 0 };
+	controller.ClearVendorState();
+	if (controller.Post(kOpcodeIntelReset, reset, sizeof(reset))) {
+		gControllerReset = true;
+		LOG("  reset the controller back into its bootloader\n");
+	}
+	// it holds the USB reset lines for up to 150 ms
+	usleep(150000);
 }
 
 
@@ -82,6 +103,7 @@ DownloadAndBoot(Controller& controller, const char* name, bool tlv,
 	}
 	if (!ok) {
 		ERROR("%s: header rejected\n", name);
+		ResetToBootloader(controller);
 		return false;
 	}
 
@@ -89,6 +111,7 @@ DownloadAndBoot(Controller& controller, const char* name, bool tlv,
 	while (NextSfiFragment(data, firmware.size(), offset, length)) {
 		if (!controller.SecureSend(0x01, data + offset - length, length)) {
 			ERROR("%s: fragment %zu rejected\n", name, fragments);
+			ResetToBootloader(controller);
 			return false;
 		}
 		fragments++;
@@ -98,11 +121,13 @@ DownloadAndBoot(Controller& controller, const char* name, bool tlv,
 	if (!controller.WaitDownloadResult(kDownloadTimeout, result)) {
 		ERROR("%s: no download completion after %zu fragments\n", name,
 			fragments);
+		ResetToBootloader(controller);
 		return false;
 	}
 	if (result != 0) {
 		ERROR("%s: controller rejected the firmware (result %u)\n", name,
 			result);
+		ResetToBootloader(controller);
 		return false;
 	}
 	LOG("  sent %zu fragments, firmware accepted\n", fragments);

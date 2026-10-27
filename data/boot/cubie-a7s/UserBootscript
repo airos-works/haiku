@@ -1,0 +1,12 @@
+#!/bin/sh
+# air/OS on the Radxa Cubie A7S.
+
+# The board has no battery-backed clock: NTP retries and a saved UTC lower
+# bound, with the Pi's script (installed next to this one).
+sh "$(finddir B_USER_SETTINGS_DIRECTORY)/boot/rpi-time-sync" \
+	> /dev/dprintf 2>&1 &
+
+# Join a remembered Wi-Fi network. net_server only does that by itself after
+# a scan someone asked for, and nothing asks for one at start.
+[ -x /boot/system/bin/wifiautojoin ] \
+	&& /boot/system/bin/wifiautojoin > /dev/dprintf 2>&1 &

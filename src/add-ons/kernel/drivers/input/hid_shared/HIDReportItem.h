@@ -24,6 +24,7 @@ public:
 		bool					Array() { return fArray; };
 		bool					Signed() { return fMinimum > fMaximum; };
 		uint32					Minimum() { return fMinimum; }
+		uint32					Maximum() { return fMaximum; }
 
 		uint16					UsagePage();
 		uint16					UsageID();

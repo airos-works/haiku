@@ -719,6 +719,17 @@ dump_cpus(system_info *info)
 	enum cpu_vendor cpuVendor = B_CPU_VENDOR_UNKNOWN;
 	uint32 cpuModel = 0;
 	uint64 frequency = 0;
+
+	// Big.LITTLE systems have cores of more than one model: count each.
+	struct ModelCount {
+		uint32	model;
+		uint64	frequency;
+		int32	count;
+	};
+	ModelCount models[8];
+	int32 modelCount = 0;
+	int32 coreCount = 0;
+
 	for (uint32 i = 0; i < topologyNodeCount; i++) {
 		switch (topology[i].type) {
 			case B_TOPOLOGY_ROOT:
@@ -730,9 +741,23 @@ dump_cpus(system_info *info)
 				break;
 
 			case B_TOPOLOGY_CORE:
+			{
 				cpuModel = topology[i].data.core.model;
 				frequency = topology[i].data.core.default_frequency;
+				coreCount++;
+				int32 j = 0;
+				while (j < modelCount && models[j].model != cpuModel)
+					j++;
+				if (j == modelCount && modelCount < (int32)B_COUNT_OF(models)) {
+					models[j].model = cpuModel;
+					models[j].frequency = frequency;
+					models[j].count = 0;
+					modelCount++;
+				}
+				if (j < modelCount)
+					models[j].count++;
 				break;
+			}
 
 			default:
 				break;
@@ -741,22 +766,42 @@ dump_cpus(system_info *info)
 	delete[] topology;
 
 	const char *vendor = get_cpu_vendor_string(cpuVendor);
-	const char *model = get_cpu_model_string(platform, cpuVendor, cpuModel);
-	char modelString[32];
 
-	if (model == NULL && vendor == NULL)
-		model = "(Unknown)";
-	else if (model == NULL) {
-		model = modelString;
-		snprintf(modelString, 32, "(Unknown %" B_PRIx32 ")", cpuModel);
+	if (modelCount > 1 && coreCount == info->cpu_count) {
+		for (int32 j = 0; j < modelCount; j++) {
+			const char* model = get_cpu_model_string(platform, cpuVendor,
+				models[j].model);
+			char modelString[32];
+			if (model == NULL) {
+				snprintf(modelString, sizeof(modelString), "(Unknown %"
+					B_PRIx32 ")", models[j].model);
+				model = modelString;
+			}
+			printf("%s%" B_PRId32 " %s%s%s, revision %04" B_PRIx32
+				" running at %" B_PRIu64 "MHz", j > 0 ? "\n" : "",
+				models[j].count, vendor ? vendor : "", vendor ? " " : "",
+				model, models[j].model, models[j].frequency / 1000000);
+		}
+		printf("\n\n");
+	} else {
+		const char *model = get_cpu_model_string(platform, cpuVendor,
+			cpuModel);
+		char modelString[32];
+
+		if (model == NULL && vendor == NULL)
+			model = "(Unknown)";
+		else if (model == NULL) {
+			model = modelString;
+			snprintf(modelString, 32, "(Unknown %" B_PRIx32 ")", cpuModel);
+		}
+
+		printf("%" B_PRId32 " %s%s%s, revision %04" B_PRIx32 " running at %"
+			B_PRIu64 "MHz\n\n",
+			info->cpu_count,
+			vendor ? vendor : "", vendor ? " " : "", model,
+			cpuModel,
+			frequency / 1000000);
 	}
-
-	printf("%" B_PRId32 " %s%s%s, revision %04" B_PRIx32 " running at %"
-		B_PRIu64 "MHz\n\n",
-		info->cpu_count,
-		vendor ? vendor : "", vendor ? " " : "", model,
-		cpuModel,
-		frequency / 1000000);
 
 #if defined(__i386__) || defined(__x86_64__)
 	for (uint32 cpu = 0; cpu < info->cpu_count; cpu++)
