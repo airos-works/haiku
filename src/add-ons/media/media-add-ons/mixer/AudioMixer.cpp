@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <new>
 
 #include <Buffer.h>
 #include <Catalog.h>
@@ -91,6 +92,11 @@ const static bigtime_t kMaxLatency = 150000;
 const bigtime_t kMinMixingTime = 3500;
 const bigtime_t kMaxJitter = 1500;
 
+const int32 kMonitorOutputID = 1;
+	// The output (id 0) feeds the sound card, the monitor (id 1) gives
+	// programs a copy of it to record
+const int32 kMonitorBufferCount = 8;
+
 
 AudioMixer::AudioMixer(BMediaAddOn *addOn, bool isSystemMixer)
 	:
@@ -103,6 +109,7 @@ AudioMixer::AudioMixer(BMediaAddOn *addOn, bool isSystemMixer)
 	fCore(new MixerCore(this)),
 	fWeb(NULL),
 	fBufferGroup(NULL),
+	fMonitorBufferGroup(NULL),
 	fDownstreamLatency(1),
 	fInternalLatency(1),
 	fAutoStop(false),
@@ -153,6 +160,7 @@ AudioMixer::~AudioMixer()
 
 	delete fCore;
 	delete fBufferGroup;
+	delete fMonitorBufferGroup;
 
 	DEBUG_ONLY(fCore = 0; fBufferGroup = 0; fWeb = 0);
 }
@@ -604,8 +612,9 @@ AudioMixer::FormatProposal(const media_source &output, media_format *ioFormat)
 
 	TRACE("AudioMixer::FormatProposal\n");
 
-	// we only have one output (id=0, port=ControlPort())
-	if (output.id != 0 || output.port != ControlPort())
+	// we have the output (id=0) and the monitor, both on ControlPort()
+	if ((output.id != 0 && output.id != kMonitorOutputID)
+		|| output.port != ControlPort())
 		return B_MEDIA_BAD_SOURCE;
 
 	// specialize to raw audio format if necessary
@@ -615,6 +624,9 @@ AudioMixer::FormatProposal(const media_source &output, media_format *ioFormat)
 	// we require a raw audio format
 	if (ioFormat->type != B_MEDIA_RAW_AUDIO)
 		return B_MEDIA_BAD_FORMAT;
+
+	if (output.id == kMonitorOutputID)
+		return _SpecializeMonitorFormat(ioFormat);
 
 	return B_OK;
 }
@@ -635,6 +647,10 @@ AudioMixer::FormatChangeRequested(const media_source &source,
 	// remove any wildcards before returning OK.
 
 	TRACE("AudioMixer::FormatChangeRequested\n");
+
+	// the monitor always has the output's format
+	if (source.port == ControlPort() && source.id == kMonitorOutputID)
+		return _SpecializeMonitorFormat(io_format);
 
 	if (fCore->Settings()->RefuseOutputFormatChange()) {
 		TRACE("AudioMixer::FormatChangeRequested: output format change refused\n");
@@ -714,6 +730,10 @@ AudioMixer::FormatChangeRequested(const media_source &source,
 		fCore->SetOutputBufferGroup(fBufferGroup);
 	}
 
+	fCore->Unlock();
+	_UpdateMonitorFormat();
+	return status;
+
 err:
 	fCore->Unlock();
 	return status;
@@ -724,6 +744,27 @@ status_t
 AudioMixer::GetNextOutput(int32 *cookie, media_output *out_output)
 {
 	TRACE("AudioMixer::GetNextOutput\n");
+
+	if (*cookie == kMonitorOutputID) {
+		fCore->Lock();
+		_DropMonitorIfGone();
+		if (fCore->HasMonitor())
+			*out_output = fCore->Monitor();
+		else {
+			out_output->node = Node();
+			out_output->source.port = ControlPort();
+			out_output->source.id = kMonitorOutputID;
+			out_output->destination = media_destination::null;
+			out_output->format.Clear();
+			out_output->format.type = B_MEDIA_RAW_AUDIO;
+			fCore->GetMonitorFormat(&out_output->format);
+			strcpy(out_output->name, "Mixer Monitor");
+		}
+		fCore->Unlock();
+
+		*cookie += 1;
+		return B_OK;
+	}
 
 	if (*cookie != 0)
 		return B_BAD_INDEX;
@@ -762,7 +803,9 @@ AudioMixer::SetBufferGroup(const media_source &for_source,
 {
 	TRACE("AudioMixer::SetBufferGroup\n");
 	// the downstream consumer (soundcard) node asks us to use another
-	// BBufferGroup (might be NULL). We only have one output (id 0)
+	// BBufferGroup (might be NULL).
+	if (for_source.port == ControlPort() && for_source.id == kMonitorOutputID)
+		return _SetMonitorBufferGroup(newGroup);
 	if (for_source.port != ControlPort() || for_source.id != 0)
 		return B_MEDIA_BAD_SOURCE;
 
@@ -802,6 +845,10 @@ void
 AudioMixer::LatencyChanged(const media_source& source,
 	const media_destination& destination, bigtime_t new_latency, uint32 flags)
 {
+	// a recorder's latency does not hold up the output
+	if (source.port == ControlPort() && source.id == kMonitorOutputID)
+		return;
+
 	if (source.port != ControlPort() || source.id != 0) {
 		ERROR("AudioMixer::LatencyChanged: received but has wrong source "
 			"%ld/%ld\n", source.port, source.id);
@@ -854,7 +901,8 @@ AudioMixer::PrepareToConnect(const media_source &what,
 		return B_MEDIA_BAD_SOURCE;
 
 	// is the source valid?
-	if (what.port != ControlPort() || what.id != 0)
+	if (what.port != ControlPort()
+		|| (what.id != 0 && what.id != kMonitorOutputID))
 		return B_MEDIA_BAD_SOURCE;
 
 	// is the format acceptable?
@@ -863,6 +911,9 @@ AudioMixer::PrepareToConnect(const media_source &what,
 		PRINT_FORMAT("AudioMixer::PrepareToConnect: bad format", *format);
 		return B_MEDIA_BAD_FORMAT;
 	}
+
+	if (what.id == kMonitorOutputID)
+		return _PrepareToConnectMonitor(where, format, out_source, out_name);
 
 	fCore->Lock();
 
@@ -949,6 +1000,11 @@ AudioMixer::Connect(status_t error, const media_source &source,
 	const media_destination &dest, const media_format &format, char *io_name)
 {
 	TRACE("AudioMixer::Connect\n");
+
+	if (source.port == ControlPort() && source.id == kMonitorOutputID) {
+		_ConnectMonitor(error, dest, format, io_name);
+		return;
+	}
 
 	fCore->Lock();
 	// are we still connected?
@@ -1057,6 +1113,7 @@ AudioMixer::Connect(status_t error, const media_source &source,
 			BTimedEventQueue::B_HANDLE_BUFFER);
 	}
 
+	_UpdateMonitorFormat();
 	UpdateParameterWeb();
 }
 
@@ -1065,6 +1122,12 @@ void
 AudioMixer::Disconnect(const media_source& what, const media_destination& where)
 {
 	TRACE("AudioMixer::Disconnect\n");
+
+	if (what.port == ControlPort() && what.id == kMonitorOutputID) {
+		_DisconnectMonitor(where);
+		return;
+	}
+
 	fCore->Lock();
 
 	// Make sure that our connection is the one being disconnected
@@ -1108,6 +1171,10 @@ AudioMixer::LateNoticeReceived(const media_source& what, bigtime_t howMuch,
 	// is the only runmode in which we can do anything about this
 	// TODO: quality could be decreased, too
 
+	// the monitor drops buffers instead of holding up the output
+	if (what.port == ControlPort() && what.id == kMonitorOutputID)
+		return;
+
 	ERROR("AudioMixer::LateNoticeReceived, %lld too late at %lld\n", howMuch,
 		performanceTime);
 
@@ -1140,7 +1207,13 @@ void
 AudioMixer::EnableOutput(const media_source& what, bool enabled,
 	int32 */*deprecated*/)
 {
-	// we only have one output
+	if (what.port == ControlPort() && what.id == kMonitorOutputID) {
+		fCore->Lock();
+		fCore->EnableMonitor(enabled);
+		fCore->Unlock();
+		return;
+	}
+
 	if (what.id != 0 || what.port != ControlPort())
 		return;
 
@@ -1312,6 +1385,259 @@ AudioMixer::SendBuffer(BBuffer* buffer, MixerOutput* output)
 {
 	return BBufferProducer::SendBuffer(buffer, output->MediaOutput().source,
 		output->MediaOutput().destination);
+}
+
+
+status_t
+AudioMixer::SendMonitorBuffer(BBuffer* buffer, const media_output& monitor)
+{
+	return BBufferProducer::SendBuffer(buffer, monitor.source,
+		monitor.destination);
+}
+
+
+//	#pragma mark - monitor output
+
+
+/*!	Ends the monitor connection without telling the recorder, which has gone.
+	The core must be locked.
+*/
+void
+AudioMixer::DropMonitor()
+{
+	fCore->RemoveMonitor();
+	delete fMonitorBufferGroup;
+	fMonitorBufferGroup = NULL;
+}
+
+
+/*!	The monitor gives programs what the mixer sends to the sound card, as
+	floats, so that they can record what the computer plays. It exists while
+	the output is connected; buffers stop while nothing plays (the system
+	mixer stops on its own then) and skip what a slow recorder cannot take.
+*/
+/*!	A recorder that quit without disconnecting would keep the monitor for
+	ever: nobody else disconnects it. The core must be locked.
+*/
+void
+AudioMixer::_DropMonitorIfGone()
+{
+	port_info info;
+	if (fCore->HasMonitor()
+		&& get_port_info(fCore->Monitor().destination.port, &info) != B_OK)
+		DropMonitor();
+}
+
+
+status_t
+AudioMixer::_SpecializeMonitorFormat(media_format* format)
+{
+	media_format monitor;
+	fCore->Lock();
+	bool hasOutput = fCore->Output() != NULL;
+	if (hasOutput)
+		fCore->GetMonitorFormat(&monitor);
+	fCore->Unlock();
+
+	if (!hasOutput)
+		return B_MEDIA_NOT_CONNECTED;
+
+	if (format->type == B_MEDIA_UNKNOWN_TYPE)
+		format->type = B_MEDIA_RAW_AUDIO;
+	if (!format_is_compatible(*format, monitor)) {
+		*format = monitor;
+		return B_MEDIA_BAD_FORMAT;
+	}
+
+	format->SpecializeTo(&monitor);
+	return B_OK;
+}
+
+
+status_t
+AudioMixer::_CreateMonitorBufferGroup(BBufferGroup** _group)
+{
+	BBufferGroup* group = new(std::nothrow) BBufferGroup(
+		fCore->Monitor().format.u.raw_audio.buffer_size, kMonitorBufferCount);
+	if (group == NULL)
+		return B_NO_MEMORY;
+
+	status_t status = group->InitCheck();
+	if (status != B_OK) {
+		delete group;
+		return status;
+	}
+
+	*_group = group;
+	return B_OK;
+}
+
+
+status_t
+AudioMixer::_SetMonitorBufferGroup(BBufferGroup* group)
+{
+	fCore->Lock();
+	if (!fCore->HasMonitor()) {
+		fCore->Unlock();
+		return B_MEDIA_NOT_CONNECTED;
+	}
+
+	if (group != fMonitorBufferGroup) {
+		if (group == NULL) {
+			status_t status = _CreateMonitorBufferGroup(&group);
+			if (status != B_OK) {
+				fCore->Unlock();
+				return status;
+			}
+		}
+
+		fCore->SetMonitor(fCore->Monitor(), group);
+		delete fMonitorBufferGroup;
+		fMonitorBufferGroup = group;
+	}
+
+	fCore->Unlock();
+	return B_OK;
+}
+
+
+status_t
+AudioMixer::_PrepareToConnectMonitor(const media_destination& where,
+	media_format* format, media_source* _source, char* _name)
+{
+	status_t status = _SpecializeMonitorFormat(format);
+	if (status != B_OK)
+		return status;
+
+	fCore->Lock();
+	_DropMonitorIfGone();
+	if (fCore->HasMonitor()) {
+		fCore->Unlock();
+		return B_MEDIA_ALREADY_CONNECTED;
+	}
+
+	_source->port = ControlPort();
+	_source->id = kMonitorOutputID;
+	strcpy(_name, "Mixer Monitor");
+
+	media_output monitor;
+	monitor.node = Node();
+	monitor.source = *_source;
+	monitor.destination = where;
+	monitor.format = *format;
+	strcpy(monitor.name, _name);
+
+	// no buffers until Connect()
+	fCore->SetMonitor(monitor, NULL);
+	fCore->Unlock();
+	return B_OK;
+}
+
+
+void
+AudioMixer::_ConnectMonitor(status_t error,
+	const media_destination& destination, const media_format& format,
+	char* _name)
+{
+	fCore->Lock();
+	if (!fCore->HasMonitor()) {
+		fCore->Unlock();
+		ERROR("AudioMixer::Connect: monitor no longer connected\n");
+		return;
+	}
+
+	if (error != B_OK) {
+		DropMonitor();
+		fCore->Unlock();
+		return;
+	}
+
+	if (strlen(_name) == 0)
+		strcpy(_name, "Mixer Monitor");
+
+	// the monitor keeps its name, so that programs can find it
+	media_output& monitor = fCore->Monitor();
+	monitor.destination = destination;
+	monitor.format = format;
+
+	// the consumer may have handed us buffers already
+	BBufferGroup* group = fMonitorBufferGroup;
+	if (group == NULL && _CreateMonitorBufferGroup(&group) != B_OK) {
+		ERROR("AudioMixer::Connect: no monitor buffers\n");
+		group = NULL;
+	}
+	fMonitorBufferGroup = group;
+	fCore->SetMonitor(monitor, group);
+	fCore->Unlock();
+}
+
+
+void
+AudioMixer::_DisconnectMonitor(const media_destination& where)
+{
+	fCore->Lock();
+	if (!fCore->HasMonitor() || fCore->Monitor().destination != where) {
+		ERROR("AudioMixer::Disconnect can't disconnect the monitor (wrong "
+			"connection)\n");
+		fCore->Unlock();
+		return;
+	}
+
+	DropMonitor();
+	fCore->Unlock();
+}
+
+
+/*!	Called when the output got another format: tells the recorder, and
+	gives the monitor buffers of the new size. The mix thread skips the
+	monitor while the formats differ.
+*/
+void
+AudioMixer::_UpdateMonitorFormat()
+{
+	fCore->Lock();
+	if (!fCore->HasMonitor() || fCore->Output() == NULL) {
+		fCore->Unlock();
+		return;
+	}
+
+	media_output monitor = fCore->Monitor();
+	media_format format;
+	fCore->GetMonitorFormat(&format);
+	fCore->Unlock();
+
+	const media_multi_audio_format& current = monitor.format.u.raw_audio;
+	const media_multi_audio_format& wanted = format.u.raw_audio;
+	if (current.frame_rate == wanted.frame_rate
+		&& current.channel_count == wanted.channel_count
+		&& current.buffer_size == wanted.buffer_size
+		&& current.channel_mask == wanted.channel_mask)
+		return;
+
+	status_t status = ChangeFormat(monitor.source, monitor.destination,
+		&format);
+
+	fCore->Lock();
+	if (!fCore->HasMonitor()
+		|| fCore->Monitor().destination != monitor.destination) {
+		fCore->Unlock();
+		return;
+	}
+	if (status != B_OK) {
+		ERROR("AudioMixer: the recorder refused the monitor format: %s\n",
+			strerror(status));
+		fCore->Unlock();
+		return;
+	}
+
+	fCore->Monitor().format = format;
+	BBufferGroup* group;
+	if (_CreateMonitorBufferGroup(&group) != B_OK)
+		group = NULL;
+	fCore->SetMonitor(fCore->Monitor(), group);
+	delete fMonitorBufferGroup;
+	fMonitorBufferGroup = group;
+	fCore->Unlock();
 }
 
 

@@ -84,7 +84,10 @@ MixerCore::MixerCore(AudioMixer *node)
 	fTimeSource(0),
 	fMixThread(-1),
 	fMixThreadWaitSem(-1),
-	fOutputGain(1.0)
+	fOutputGain(1.0),
+	fMonitorGroup(NULL),
+	fHasMonitor(false),
+	fMonitorEnabled(true)
 {
 }
 
@@ -327,6 +330,59 @@ uint32
 MixerCore::OutputChannelCount()
 {
 	return (fOutput) ? fOutput->GetOutputChannelCount() : 0;
+}
+
+
+void
+MixerCore::SetMonitor(const media_output& monitor, BBufferGroup* group)
+{
+	ASSERT_LOCKED();
+	fMonitor = monitor;
+	fMonitorGroup = group;
+	fHasMonitor = true;
+}
+
+
+void
+MixerCore::RemoveMonitor()
+{
+	ASSERT_LOCKED();
+	fMonitorGroup = NULL;
+	fHasMonitor = false;
+	fMonitorEnabled = true;
+}
+
+
+void
+MixerCore::EnableMonitor(bool enabled)
+{
+	ASSERT_LOCKED();
+	fMonitorEnabled = enabled;
+}
+
+
+/*!	The monitor carries the output's frames, channels and channel mask as
+	host endian floats, whatever the output's own sample format is.
+*/
+void
+MixerCore::GetMonitorFormat(media_format* format)
+{
+	ASSERT_LOCKED();
+	if (fOutput == NULL)
+		return;
+
+	const media_multi_audio_format& output
+		= fOutput->MediaOutput().format.u.raw_audio;
+	media_multi_audio_format& monitor = format->u.raw_audio;
+	format->type = B_MEDIA_RAW_AUDIO;
+	monitor = media_multi_audio_format::wildcard;
+	monitor.frame_rate = output.frame_rate;
+	monitor.channel_count = output.channel_count;
+	monitor.format = media_raw_audio_format::B_AUDIO_FLOAT;
+	monitor.byte_order = B_MEDIA_HOST_ENDIAN;
+	monitor.buffer_size = frames_per_buffer(output) * output.channel_count
+		* sizeof(float);
+	monitor.channel_mask = output.channel_mask;
 }
 
 
@@ -592,6 +648,7 @@ MixerCore::_MixThread()
 				ERROR("MixerCore: RequestBuffer failed for buffer %lld\n",
 					bufferIndex);
 			}
+			_SendMonitorBuffer(eventTime, true);
 
 			bufferIndex++;
 			framePos += fMixBufferFrameCount;
@@ -725,6 +782,7 @@ MixerCore::_MixThread()
 			ERROR("MixerCore: RequestBuffer failed for buffer %lld\n",
 				bufferIndex);
 		}
+		_SendMonitorBuffer(eventTime, false);
 
 		// make all lists empty
 		for (int i = 0; i < MAX_CHANNEL_TYPES; i++)
@@ -736,5 +794,62 @@ MixerCore::_MixThread()
 		framePos += fMixBufferFrameCount;
 
 		Unlock();
+	}
+}
+
+
+void
+MixerCore::_SendMonitorBuffer(bigtime_t eventTime, bool silent)
+{
+	ASSERT_LOCKED();
+	if (!fHasMonitor || !fMonitorEnabled || fMonitorGroup == NULL)
+		return;
+
+	// After an output format change, the monitor waits for its own change
+	const media_multi_audio_format& format = fMonitor.format.u.raw_audio;
+	size_t size = fMixBufferChannelCount * fMixBufferFrameCount
+		* sizeof(float);
+	if (format.channel_count != (uint32)fMixBufferChannelCount
+		|| format.buffer_size != size
+		|| (int32)frames_per_buffer(fOutput->MediaOutput().format.u.raw_audio)
+			!= fMixBufferFrameCount) {
+		return;
+	}
+
+	// A recorder that falls behind loses buffers; it must not hold up
+	// the output.
+	BBuffer* buffer = fMonitorGroup->RequestBuffer(size, 0);
+	if (buffer == NULL)
+		return;
+
+	float* data = (float*)buffer->Data();
+	if (silent)
+		memset(data, 0, size);
+	else {
+		for (int channel = 0; channel < fMixBufferChannelCount; channel++) {
+			float gain = fOutputGain * fOutput->GetOutputChannelGain(channel);
+			const float* src = fMixBuffer + channel;
+			float* dst = data + channel;
+			for (int32 i = 0; i < fMixBufferFrameCount; i++) {
+				*dst = *src * gain;
+				src += fMixBufferChannelCount;
+				dst += fMixBufferChannelCount;
+			}
+		}
+	}
+
+	media_header* header = buffer->Header();
+	header->type = B_MEDIA_RAW_AUDIO;
+	header->size_used = size;
+	header->time_source = fTimeSource->ID();
+	header->start_time = eventTime;
+
+	status_t status = fNode->SendMonitorBuffer(buffer, fMonitor);
+	if (status != B_OK) {
+		buffer->Recycle();
+		if (status == B_BAD_PORT_ID) {
+			// the recorder quit without disconnecting
+			fNode->DropMonitor();
+		}
 	}
 }
