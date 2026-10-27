@@ -164,8 +164,9 @@ clock start in 1970 until they reach a time server: when the clock is
 earlier than the installed release's own build, System Updater sets it from
 the feed's `Date` header, and installs nothing until it is right. An HTTPS
 feed cannot answer before that (no certificate is valid in 1970), so for
-one System Updater first asks the feed's host over plain HTTP
-(`http://github.com/` answers with a redirect and a `Date`).
+one System Updater first asks the feed's host (`https://github.com/`) for
+the time, accepting a certificate that is "not yet valid" and nothing
+else; GitHub's plain HTTP answers carry no `Date`.
 
 ### Older versions
 
