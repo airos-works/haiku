@@ -146,6 +146,7 @@ struct display_info {
 	uint8			cursorPlaneOffset;
 	int8			cursorLayer;
 	uint8			cursorImageType;
+	bool			cursorCanvas;
 };
 
 
@@ -574,19 +575,25 @@ update_cursor_plane(display_info* info)
 			double scaleX = (double)destWidth / output.width;
 			double scaleY = (double)destHeight / output.height;
 
+			// fkms declares its cursor planes at the buffer's own pitch
+			// (width == pitch / 4), the rest of the buffer transparent;
+			// tight widths behind the stride read as lines. The canvas
+			// mode follows that; the tight mode follows the cursor size.
+			uint32 planePixels = info->cursorCanvas
+				? RPI_DISPLAY_CURSOR_MAX : info->cursor.width;
+			uint32 planeRows = info->cursorCanvas
+				? RPI_DISPLAY_CURSOR_MAX : info->cursor.height;
+
 			plane.image_type = info->cursorImageType;
 			plane.layer = info->cursorLayer;
-			plane.width = info->cursor.width;
-			plane.height = info->cursor.height;
-			// The compositor fetches in wide bursts: rows must sit at the
-			// buffer's own stride (a comfortable 256 bytes), not tight
-			// behind the cursor's width, or the picture reads as lines.
+			plane.width = planePixels;
+			plane.height = planeRows;
 			plane.pitch = RPI_DISPLAY_CURSOR_MAX * 4;
 			plane.vpitch = 0;
 			plane.src_x = 0;
 			plane.src_y = 0;
-			plane.src_w = info->cursor.width << 16;
-			plane.src_h = info->cursor.height << 16;
+			plane.src_w = planePixels << 16;
+			plane.src_h = planeRows << 16;
 			plane.dst_x = (int16)(destX + (int32)((info->cursorX - output.x)
 				* scaleX - info->cursor.hot_x * scaleX
 				+ (info->cursorX >= output.x ? 0.5 : -0.5)));
@@ -594,9 +601,9 @@ update_cursor_plane(display_info* info)
 				* scaleY - info->cursor.hot_y * scaleY
 				+ (info->cursorY >= output.y ? 0.5 : -0.5)));
 			int32 cursorWidth
-				= (int32)(info->cursor.width * scaleX + 0.5);
+				= (int32)(planePixels * scaleX + 0.5);
 			int32 cursorHeight
-				= (int32)(info->cursor.height * scaleY + 0.5);
+				= (int32)(planeRows * scaleY + 0.5);
 			plane.dst_w = (uint16)(cursorWidth > 1 ? cursorWidth : 1);
 			plane.dst_h = (uint16)(cursorHeight > 1 ? cursorHeight : 1);
 			plane.alpha = 0xff;
@@ -798,6 +805,7 @@ display_init_device(void* _info, void** _cookie)
 	info->cursorPlaneOffset = CURSOR_PLANE_OFFSET;
 	info->cursorLayer = CURSOR_PLANE_LAYER;
 	info->cursorImageType = VC_IMAGE_ARGB8888;
+	info->cursorCanvas = true;
 	// BCM2711 only (the driver's compatible match). The VC5 HDMI_HOTPLUG
 	// register is at offset 0x1a8 of each HDMI block, bit 0 = connected.
 	// These read-only maps do not touch clocks, PHYs or interrupt state;
@@ -1079,6 +1087,7 @@ display_control(void* cookie, uint32 op, void* buffer, size_t length)
 			info->cursorPlaneOffset = config.plane_offset;
 			info->cursorLayer = config.layer;
 			info->cursorImageType = config.image_type;
+			info->cursorCanvas = config.canvas != 0;
 			if (!info->cursorDefined)
 				return B_OK;
 			return update_cursor_plane(info);

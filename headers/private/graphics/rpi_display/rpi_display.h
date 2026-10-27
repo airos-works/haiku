@@ -53,6 +53,7 @@ struct rpi_display_cursor_config {
 	uint8	plane_offset;	// added to the display's plane base
 	int8	layer;
 	uint8	image_type;	// a VC_IMAGE_* value
+	uint8	canvas;			// 1: the plane covers the whole 64x64 buffer
 };
 
 struct rpi_display_cursor {
