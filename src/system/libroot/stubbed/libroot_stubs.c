@@ -1765,6 +1765,7 @@ void get_secondary_architectures() {}
 void get_sem_count() {}
 void get_stack_frame() {}
 void get_system_info() {}
+void getauxval() {}
 void getc() {}
 void getc_unlocked() {}
 void getchar() {}
