@@ -106,11 +106,19 @@ the Dell monitor still needs a physical check.
 - Hotplug mode selection supports progressive EDID detailed timings through
   300 MHz; interlaced modes and CTA modes with no usable DTD/VGA fallback are
   not supported. Only the lab's 1080p timings have native validation.
-- No user-selectable physical timing changes, DPMS or hardware cursor
-  (app_server draws the pointer).
+- No user-selectable physical timing changes or DPMS.
+- Hardware cursor (2026-10-27): the cursor bitmap goes into a small
+  contiguous buffer of its own and the firmware composites it as a plane
+  above the frame buffer (`CURSOR_PLANE_OFFSET`/`CURSOR_PLANES_PER_DISPLAY`
+  in the driver, a layer above the desktop's). The app_server's software
+  cursor — backup, draw and restore into the frame buffer — then never
+  runs, which is what made the pointer flicker and leave stale patches
+  over direct windows such as airTime's video. The cursor's plane, layer
+  and image type can be re-pointed for experiments
+  (`RPI_DISPLAY_CURSOR_CONFIG`).
 - The retrace semaphore (2026-10-12, `docs/airos/RETRACE.md`) follows the
-  HVS frame counter of the channel feeding the first output shown; it has
-  not run on the board yet. To check it (`jam retrace_test`),
+  HVS frame counter of the channel feeding the first output shown. To
+  check it (`jam retrace_test`),
   `retrace_test blanks 5` should report the output's refresh rate with no
   timeouts, and the driver's `rpi display blanks` thread should exist once
   something has waited. The HVS counts a frame when it has composed it, a

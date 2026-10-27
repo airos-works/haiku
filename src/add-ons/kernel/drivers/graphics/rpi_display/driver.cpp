@@ -52,11 +52,17 @@
 #define TAG_SET_DISPLAY_POWER			0x00048019
 #define TAG_SET_PLANE					0x00048015
 
+#define VC_IMAGE_ARGB8888				43
 #define VC_IMAGE_XRGB8888				44
-// plane ids are the firmware's, counted across the displays
+// plane ids are the firmware's, counted across the displays. The main
+// planes use the fork's three-a-display numbering; the cursor rides the
+// fuller scheme Linux's firmware-KMS driver gets (eight a display).
 #define PLANES_PER_DISPLAY				3
+#define CURSOR_PLANES_PER_DISPLAY		8
 #define PLANE_LAYER						1
 	// above the firmware's own frame buffer (the boot console)
+#define CURSOR_PLANE_OFFSET				7
+#define CURSOR_PLANE_LAYER				(PLANE_LAYER + 1)
 
 // The VideoCore sees the ARM's first gigabyte at this bus address.
 #define VC_BUS_OFFSET					0xc0000000
@@ -125,6 +131,22 @@ struct display_info {
 	volatile uint8*	hvs;
 	RetraceSemaphores* retrace;
 	class HvsRetraceFollower* retraceFollower;
+
+	// a hardware cursor, composited by the firmware over the frame buffer;
+	// the position is the hotspot, in frame buffer pixels
+	area_id			cursorArea;
+	uint8*			cursorBuffer;
+	phys_addr_t		cursorBufferAddress;
+	bool			cursorDefined;
+	bool			cursorVisible;
+	int32			cursorX;
+	int32			cursorY;
+	rpi_display_cursor cursor;
+	// what the cursor rides: overridable for experiments
+	uint8			cursorPlaneOffset;
+	int8			cursorLayer;
+	uint8			cursorImageType;
+	bool			cursorCanvas;
 };
 
 
@@ -447,6 +469,160 @@ ensure_buffer(display_info* info, size_t size)
 
 
 static status_t
+ensure_cursor_buffer(display_info* info)
+{
+	if (info->cursorArea >= 0)
+		return B_OK;
+
+	size_t size = ROUNDUP(RPI_DISPLAY_CURSOR_MAX * RPI_DISPLAY_CURSOR_MAX * 4,
+		B_PAGE_SIZE);
+	virtual_address_restrictions virtualRestrictions = {};
+	physical_address_restrictions physicalRestrictions = {};
+	physicalRestrictions.high_address = 1ull << 30;
+	void* address;
+	area_id area = create_area_etc(B_SYSTEM_TEAM, "rpi display cursor",
+		size, B_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, 0, 0,
+		&virtualRestrictions, &physicalRestrictions, &address);
+	if (area < 0)
+		return area;
+
+	physical_entry entry;
+	status_t status = get_memory_map(address, size, &entry, 1);
+	if (status == B_OK) {
+		status = vm_set_area_memory_type(area, entry.address,
+			B_WRITE_COMBINING_MEMORY);
+	}
+	if (status != B_OK) {
+		delete_area(area);
+		return status;
+	}
+	memset(address, 0, size);
+
+	info->cursorArea = area;
+	info->cursorBuffer = (uint8*)address;
+	info->cursorBufferAddress = entry.address;
+	return B_OK;
+}
+
+
+/*!	Where an output's region lands on it: the aspect-kept fit, centered.
+	Shared by the frame buffer's plane and the cursor's, which rides over
+	the same destination.
+*/
+static void
+output_dest(uint32 nativeWidth, uint32 nativeHeight, uint32 width,
+	uint32 height, int32* destX, int32* destY, uint32* destWidth,
+	uint32* destHeight)
+{
+	uint32 w = nativeWidth;
+	uint32 h = (uint64)height * w / width;
+	if (h > nativeHeight) {
+		h = nativeHeight;
+		w = (uint64)width * h / height;
+	}
+	// a pixel of rounding is not worth a border
+	if (nativeWidth - w <= 2)
+		w = nativeWidth;
+	if (nativeHeight - h <= 2)
+		h = nativeHeight;
+	*destX = (nativeWidth - w) / 2;
+	*destY = (nativeHeight - h) / 2;
+	*destWidth = w;
+	*destHeight = h;
+}
+
+
+/*!	Puts the cursor's plane on the output whose region holds the hotspot,
+	updated in place when it already rides there; takes it off the others.
+	A zeroed plane removes it, which is how a hidden cursor is drawn.
+	Caller holds the driver lock.
+*/
+static status_t
+update_cursor_plane(display_info* info)
+{
+	const rpi_display_shared_info& shared = *info->shared;
+	int32 on = -1;
+	if (info->cursorDefined && info->cursorVisible) {
+		for (uint32 i = 0; i < shared.output_count; i++) {
+			const rpi_display_output& output = shared.outputs[i];
+			if ((output.flags & RPI_DISPLAY_OUTPUT_ENABLED) == 0)
+				continue;
+			if (info->cursorX >= output.x
+				&& info->cursorX < output.x + output.width
+				&& info->cursorY >= output.y
+				&& info->cursorY < output.y + output.height) {
+				on = (int32)i;
+				break;
+			}
+		}
+	}
+
+	for (uint32 i = 0; i < shared.output_count; i++) {
+		const rpi_display_output& output = shared.outputs[i];
+		if ((output.flags & RPI_DISPLAY_OUTPUT_ENABLED) == 0
+			|| (output.flags & RPI_DISPLAY_OUTPUT_CONNECTED) == 0)
+			continue;
+
+		firmware_plane plane = {};
+		plane.display = output.id;
+		plane.plane_id = i * CURSOR_PLANES_PER_DISPLAY + info->cursorPlaneOffset;
+		if ((int32)i == on) {
+			int32 destX, destY;
+			uint32 destWidth, destHeight;
+			output_dest(output.native_width, output.native_height,
+				output.width, output.height, &destX, &destY, &destWidth,
+				&destHeight);
+			double scaleX = (double)destWidth / output.width;
+			double scaleY = (double)destHeight / output.height;
+
+			// fkms declares its cursor planes at the buffer's own pitch
+			// (width == pitch / 4), the rest of the buffer transparent;
+			// tight widths behind the stride read as lines. The canvas
+			// mode follows that; the tight mode follows the cursor size.
+			uint32 planePixels = info->cursorCanvas
+				? RPI_DISPLAY_CURSOR_MAX : info->cursor.width;
+			uint32 planeRows = info->cursorCanvas
+				? RPI_DISPLAY_CURSOR_MAX : info->cursor.height;
+
+			plane.image_type = info->cursorImageType;
+			plane.layer = info->cursorLayer;
+			plane.width = planePixels;
+			plane.height = planeRows;
+			plane.pitch = RPI_DISPLAY_CURSOR_MAX * 4;
+			plane.vpitch = 0;
+			plane.src_x = 0;
+			plane.src_y = 0;
+			plane.src_w = planePixels << 16;
+			plane.src_h = planeRows << 16;
+			plane.dst_x = (int16)(destX + (int32)((info->cursorX - output.x)
+				* scaleX - info->cursor.hot_x * scaleX
+				+ (info->cursorX >= output.x ? 0.5 : -0.5)));
+			plane.dst_y = (int16)(destY + (int32)((info->cursorY - output.y)
+				* scaleY - info->cursor.hot_y * scaleY
+				+ (info->cursorY >= output.y ? 0.5 : -0.5)));
+			int32 cursorWidth
+				= (int32)(planePixels * scaleX + 0.5);
+			int32 cursorHeight
+				= (int32)(planeRows * scaleY + 0.5);
+			plane.dst_w = (uint16)(cursorWidth > 1 ? cursorWidth : 1);
+			plane.dst_h = (uint16)(cursorHeight > 1 ? cursorHeight : 1);
+			plane.alpha = 0xff;
+			plane.num_planes = 1;
+			plane.planes[0]
+				= (uint32)info->cursorBufferAddress | VC_BUS_OFFSET;
+		}
+		status_t status = set_plane(plane);
+		if (status != B_OK) {
+			ERROR("the firmware did not take output %" B_PRIu32 "'s cursor "
+				"plane: %s\n", i, strerror(status));
+			return status;
+		}
+	}
+	return B_OK;
+}
+
+
+static status_t
 set_layout(display_info* info, const rpi_display_layout& layout)
 {
 	rpi_display_shared_info& shared = *info->shared;
@@ -491,17 +667,10 @@ set_layout(display_info* info, const rpi_display_layout& layout)
 		}
 
 		// the region as large as it gets on the output with its shape kept
-		uint32 width = output.native_width;
-		uint32 height = (uint64)request.height * width / request.width;
-		if (height > output.native_height) {
-			height = output.native_height;
-			width = (uint64)request.width * height / request.height;
-		}
-		// a pixel of rounding is not worth a border
-		if (output.native_width - width <= 2)
-			width = output.native_width;
-		if (output.native_height - height <= 2)
-			height = output.native_height;
+		int32 destX, destY;
+		uint32 destWidth, destHeight;
+		output_dest(output.native_width, output.native_height, request.width,
+			request.height, &destX, &destY, &destWidth, &destHeight);
 
 		firmware_plane plane = {};
 		plane.display = output.id;
@@ -516,10 +685,10 @@ set_layout(display_info* info, const rpi_display_layout& layout)
 		plane.src_y = request.y << 16;
 		plane.src_w = request.width << 16;
 		plane.src_h = request.height << 16;
-		plane.dst_x = (output.native_width - width) / 2;
-		plane.dst_y = (output.native_height - height) / 2;
-		plane.dst_w = width;
-		plane.dst_h = height;
+		plane.dst_x = (int16)destX;
+		plane.dst_y = (int16)destY;
+		plane.dst_w = (uint16)destWidth;
+		plane.dst_h = (uint16)destHeight;
 		plane.alpha = 0xff;
 		plane.num_planes = 1;
 		plane.planes[0] = (uint32)info->bufferAddress | VC_BUS_OFFSET;
@@ -544,13 +713,16 @@ set_layout(display_info* info, const rpi_display_layout& layout)
 		INFO("output %" B_PRIu32 ": %ux%u at %" B_PRId32 ",%" B_PRId32
 			" of %" B_PRIu32 "x%" B_PRIu32 " shown %" B_PRIu32 "x%" B_PRIu32
 			"%s\n", i, request.width, request.height, request.x, request.y,
-			layout.width, layout.height, width, height,
+			layout.width, layout.height, destWidth, destHeight,
 			(request.flags & RPI_DISPLAY_OUTPUT_MIRROR) != 0 ? ", mirror" : "");
 	}
 
 	shared.width = layout.width;
 	shared.height = layout.height;
 	shared.bytes_per_row = bytesPerRow;
+
+	// the cursor rides over the new planes
+	update_cursor_plane(info);
 
 	// the kernel's console and debugger follow
 	frame_buffer_update((addr_t)info->buffer, layout.width, layout.height, 32,
@@ -565,8 +737,14 @@ release_layout(display_info* info)
 {
 	rpi_display_shared_info& shared = *info->shared;
 	for (uint32 i = 0; i < shared.output_count; i++) {
-		if ((shared.outputs[i].flags & RPI_DISPLAY_OUTPUT_ENABLED) != 0)
+		if ((shared.outputs[i].flags & RPI_DISPLAY_OUTPUT_ENABLED) != 0) {
 			remove_plane(i, shared.outputs[i].id);
+			// the cursor rides its own plane
+			firmware_plane cursor = {};
+			cursor.display = shared.outputs[i].id;
+			cursor.plane_id = i * CURSOR_PLANES_PER_DISPLAY + info->cursorPlaneOffset;
+			set_plane(cursor);
+		}
 		shared.outputs[i].flags &= RPI_DISPLAY_OUTPUT_CONNECTED;
 	}
 
@@ -596,6 +774,7 @@ display_init_device(void* _info, void** _cookie)
 	memset(info->shared, 0, sizeof(rpi_display_shared_info));
 	info->shared->version = RPI_DISPLAY_VERSION;
 	info->bufferArea = -1;
+	info->cursorArea = -1;
 
 	status_t status = read_outputs(info);
 	if (status != B_OK) {
@@ -623,6 +802,10 @@ display_init_device(void* _info, void** _cookie)
 	mutex_init(&info->lock, "rpi display");
 	info->changePort = -1;
 	info->pollThread = -1;
+	info->cursorPlaneOffset = CURSOR_PLANE_OFFSET;
+	info->cursorLayer = CURSOR_PLANE_LAYER;
+	info->cursorImageType = VC_IMAGE_ARGB8888;
+	info->cursorCanvas = true;
 	// BCM2711 only (the driver's compatible match). The VC5 HDMI_HOTPLUG
 	// register is at offset 0x1a8 of each HDMI block, bit 0 = connected.
 	// These read-only maps do not touch clocks, PHYs or interrupt state;
@@ -673,6 +856,8 @@ display_uninit_device(void* cookie)
 	mutex_destroy(&info->lock);
 	if (info->bufferArea >= 0)
 		delete_area(info->bufferArea);
+	if (info->cursorArea >= 0)
+		delete_area(info->cursorArea);
 	delete_area(info->sharedArea);
 }
 
@@ -809,6 +994,103 @@ display_control(void* cookie, uint32 op, void* buffer, size_t length)
 			}
 			locker.Unlock();
 			return user_memcpy(buffer, &semaphore, sizeof(semaphore));
+		}
+
+		case RPI_DISPLAY_CLONE_CURSOR_BUFFER:
+		{
+			MutexLocker locker(info->lock);
+			status_t status = ensure_cursor_buffer(info);
+			if (status != B_OK)
+				return status;
+			void* address = NULL;
+			area_id area = vm_clone_area(team_get_current_team_id(),
+				"rpi display cursor", &address, B_ANY_ADDRESS,
+				B_READ_AREA | B_WRITE_AREA, 0, info->cursorArea, true);
+			if (area < 0)
+				return area;
+
+			area_info areaInfo = {};
+			areaInfo.area = area;
+			areaInfo.address = address;
+			areaInfo.size = RPI_DISPLAY_CURSOR_MAX * RPI_DISPLAY_CURSOR_MAX * 4;
+			status = user_memcpy(buffer, &areaInfo, sizeof(areaInfo));
+			if (status != B_OK)
+				vm_delete_area(team_get_current_team_id(), area, true);
+			return status;
+		}
+
+		case RPI_DISPLAY_DEFINE_CURSOR:
+		{
+			if (length != sizeof(rpi_display_cursor))
+				return B_BAD_VALUE;
+			rpi_display_cursor cursor;
+			status_t status = user_memcpy(&cursor, buffer, sizeof(cursor));
+			if (status != B_OK)
+				return status;
+			if (cursor.width == 0 || cursor.width > RPI_DISPLAY_CURSOR_MAX
+				|| cursor.height == 0
+				|| cursor.height > RPI_DISPLAY_CURSOR_MAX)
+				return B_BAD_VALUE;
+
+			MutexLocker locker(info->lock);
+			status = ensure_cursor_buffer(info);
+			if (status != B_OK)
+				return status;
+			info->cursor = cursor;
+			info->cursorDefined = true;
+			return update_cursor_plane(info);
+		}
+
+		case RPI_DISPLAY_MOVE_CURSOR:
+		{
+			if (length != sizeof(rpi_display_cursor_position))
+				return B_BAD_VALUE;
+			rpi_display_cursor_position position;
+			status_t status = user_memcpy(&position, buffer, sizeof(position));
+			if (status != B_OK)
+				return status;
+
+			MutexLocker locker(info->lock);
+			info->cursorX = position.x;
+			info->cursorY = position.y;
+			if (!info->cursorDefined)
+				return B_OK;
+			return update_cursor_plane(info);
+		}
+
+		case RPI_DISPLAY_SHOW_CURSOR:
+		{
+			if (length != sizeof(bool))
+				return B_BAD_VALUE;
+			bool visible;
+			status_t status = user_memcpy(&visible, buffer, sizeof(visible));
+			if (status != B_OK)
+				return status;
+
+			MutexLocker locker(info->lock);
+			info->cursorVisible = visible;
+			if (!info->cursorDefined)
+				return B_OK;
+			return update_cursor_plane(info);
+		}
+
+		case RPI_DISPLAY_CURSOR_CONFIG:
+		{
+			if (length != sizeof(rpi_display_cursor_config))
+				return B_BAD_VALUE;
+			rpi_display_cursor_config config;
+			status_t status = user_memcpy(&config, buffer, sizeof(config));
+			if (status != B_OK)
+				return status;
+
+			MutexLocker locker(info->lock);
+			info->cursorPlaneOffset = config.plane_offset;
+			info->cursorLayer = config.layer;
+			info->cursorImageType = config.image_type;
+			info->cursorCanvas = config.canvas != 0;
+			if (!info->cursorDefined)
+				return B_OK;
+			return update_cursor_plane(info);
 		}
 
 		case RPI_DISPLAY_CLONE_FRAME_BUFFER:
