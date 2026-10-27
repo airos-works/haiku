@@ -7,3 +7,10 @@ SimpleTest retrace_test :
 	RetraceTest.cpp
 	: be [ TargetLibstdc++ ] [ TargetLibsupc++ ]
 ;
+
+# BScreen::GetScanTiming(): the output under a part of the screen, its frame
+# start and period
+SimpleTest scan_timing_test :
+	ScanTimingTest.cpp
+	: be [ TargetLibstdc++ ] [ TargetLibsupc++ ]
+;

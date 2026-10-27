@@ -71,6 +71,7 @@ HWInterface::HWInterface()
 	fFlushTargets(NULL),
 	fFlushTargetCount(0),
 	fFlushPerOutput(false),
+	fFlushGeneration(0),
 	fFlushDoneSem(-1),
 	fQuitFlush(false),
 	fFlushing(false),
@@ -857,6 +858,101 @@ static const int32 kMaxFlushTargets = 16;
 static const bigtime_t kDefaultFramePeriod = 16667;
 
 
+/*!	The scan timing of the output that shows the most of \a screenFrame
+	(of the whole screen when the outputs share one blank), for programs that
+	write into the frame buffer themselves. From the hardware when it tells;
+	else from the last blank the flush saw, and when that is old, from one
+	waited for here (up to two frames).
+*/
+status_t
+HWInterface::GetScanTiming(BRect screenFrame, display_scan_timing& timing)
+{
+	timing = display_scan_timing();
+
+	float factor = RenderScaleFactor();
+	IntRect area((int32)floorf(screenFrame.left * factor),
+		(int32)floorf(screenFrame.top * factor),
+		(int32)ceilf((screenFrame.right + 1) * factor) - 1,
+		(int32)ceilf((screenFrame.bottom + 1) * factor) - 1);
+
+	if (!fFlushLock.Lock())
+		return B_ERROR;
+	if (fFlushTargets == NULL || fFlushTargetCount == 0) {
+		fFlushLock.Unlock();
+		return B_UNSUPPORTED;
+	}
+	FlushTarget* best = &fFlushTargets[0];
+	if (fFlushPerOutput) {
+		int64 bestOverlap = -1;
+		for (int32 i = 1; i < fFlushTargetCount; i++) {
+			FlushTarget& target = fFlushTargets[i];
+			if (!target.frame.IsValid())
+				continue;
+			IntRect overlap = target.frame & area;
+			int64 size = overlap.IsValid()
+				? int64(overlap.Width() + 1) * (overlap.Height() + 1) : 0;
+			if (size > bestOverlap) {
+				bestOverlap = size;
+				best = &target;
+			}
+		}
+	}
+	uint32 outputID = best->outputID;
+	IntRect frame = best->frame;
+	int32 scanLineKnown = best->scanLineKnown;
+	sem_id semaphore = best->retraceSemaphore;
+	bigtime_t lastBlank = best->lastBlank;
+	bigtime_t period = best->modePeriod > 0 ? best->modePeriod
+		: kDefaultFramePeriod;
+	timing.generation = fFlushGeneration;
+	fFlushLock.Unlock();
+
+	timing.output_id = outputID;
+	timing.device_frame = (clipping_rect)frame;
+	timing.frame = BRect(frame.left / factor, frame.top / factor,
+		(frame.right + 1) / factor - 1, (frame.bottom + 1) / factor - 1);
+	timing.period = period;
+
+	if (outputID != 0 && scanLineKnown != 0) {
+		int32 line, lines;
+		bigtime_t scanStart, scanPeriod;
+		if (OutputScanLine(outputID, &line, &lines, &scanStart, &scanPeriod)
+				== B_OK && scanStart != 0 && scanPeriod > 0) {
+			timing.scan_start = scanStart;
+			timing.period = scanPeriod;
+			timing.flags = B_SCAN_TIMING_FROM_HARDWARE;
+			return B_OK;
+		}
+	}
+
+	bigtime_t now = system_time();
+	if (lastBlank != 0 && now - lastBlank < 1000000) {
+		timing.scan_start = lastBlank;
+		timing.flags = B_SCAN_TIMING_FROM_BLANK;
+		return B_OK;
+	}
+
+	// nothing was flushed lately: see a blank (the semaphore lets every
+	// waiter go, the flush thread's wait is not disturbed)
+	if (semaphore == -1) {
+		semaphore = outputID == 0
+			? RetraceSemaphore() : OutputRetraceSemaphore(outputID);
+	}
+	if (semaphore >= 0) {
+		status_t status;
+		do {
+			status = acquire_sem_etc(semaphore, 1, B_RELATIVE_TIMEOUT,
+				2 * period + 2000);
+		} while (status == B_INTERRUPTED);
+		if (status == B_OK) {
+			timing.scan_start = system_time();
+			timing.flags = B_SCAN_TIMING_FROM_BLANK;
+		}
+	}
+	return B_OK;
+}
+
+
 /*!	How long a frame takes with this timing, in microseconds; 0 when the
 	timing does not say (or says something no display does). */
 static bigtime_t
@@ -1162,6 +1258,7 @@ HWInterface::_UpdateFlushTargets()
 				? "each output at its own blanks" : "the screen at one's");
 		}
 		fFlushPerOutput = perOutput;
+		fFlushGeneration++;
 		fFlushLock.Unlock();
 	}
 	free(outputs);
