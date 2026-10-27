@@ -938,7 +938,7 @@ HevcDecoder::ReleasePicture(const Picture& picture)
 
 void
 HevcDecoder::CopyPlanes(const Picture& picture, uint8* target, uint32 stride,
-	bool interleaved)
+	bool interleaved, bool half)
 {
 	if (picture.frame < 0 || (size_t)picture.frame >= fFrames.size())
 		return;
@@ -954,16 +954,40 @@ HevcDecoder::CopyPlanes(const Picture& picture, uint8* target, uint32 stride,
 	sand.width = geometry.shownWidth;
 	sand.height = geometry.shownHeight;
 
-	uint8* chroma = target + (size_t)stride * geometry.shownHeight;
-	uint32 chromaRows = (geometry.shownHeight + 1) / 2;
-	if (geometry.bitDepth > 8)
-		sand30_to_p010(sand, target, stride, chroma, stride);
-	else if (interleaved)
-		sand8_to_nv12(sand, target, stride, chroma, stride);
-	else {
-		sand8_to_i420(sand, target, stride, chroma,
-			chroma + (size_t)(stride / 2) * chromaRows, stride / 2);
+	uint32 lumaRows = half
+		? (geometry.shownHeight + 1) / 2 : geometry.shownHeight;
+	uint8* chroma = target + (size_t)stride * lumaRows;
+	uint32 chromaRows = (lumaRows + 1) / 2;
+
+	if (!half) {
+		if (geometry.bitDepth > 8)
+			sand30_to_p010(sand, target, stride, chroma, stride);
+		else if (interleaved)
+			sand8_to_nv12(sand, target, stride, chroma, stride);
+		else {
+			sand8_to_i420(sand, target, stride, chroma,
+				chroma + (size_t)(stride / 2) * chromaRows, stride / 2);
+		}
+		return;
 	}
+
+	// twice the row buffers of the widest case, rounded up generously
+	size_t scratchSize = 8 * (size_t)sand.width + 2048;
+	uint8* scratch = new(std::nothrow) uint8[scratchSize];
+	if (scratch == NULL)
+		return;
+	if (geometry.bitDepth > 8)
+		sand30_to_p010_half(sand, target, stride, chroma, stride, scratch,
+			scratchSize);
+	else if (interleaved)
+		sand8_to_nv12_half(sand, target, stride, chroma, stride, scratch,
+			scratchSize);
+	else {
+		sand8_to_i420_half(sand, target, stride, chroma,
+			chroma + (size_t)(stride / 2) * chromaRows, stride / 2, scratch,
+			scratchSize);
+	}
+	delete[] scratch;
 }
 
 

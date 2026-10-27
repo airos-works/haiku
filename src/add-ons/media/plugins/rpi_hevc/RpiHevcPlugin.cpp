@@ -75,10 +75,13 @@ private:
 			bool				fInputEnded;
 
 			color_space			fOutputSpace;
+			bool				fHalfSize;
 			bool				fHavePicture;
 			HevcDecoder::Picture fPicture;
 			uint32				fWidth;
 			uint32				fHeight;
+			uint32				fStreamWidth;
+			uint32				fStreamHeight;
 };
 
 
@@ -88,6 +91,7 @@ RpiHevcDecoder::RpiHevcDecoder()
 	fParameterSetsSent(false),
 	fInputEnded(false),
 	fOutputSpace(kColorSpaceI420),
+		fHalfSize(false),
 	fHavePicture(false),
 	fWidth(0),
 	fHeight(0)
@@ -213,9 +217,27 @@ RpiHevcDecoder::NegotiateOutputFormat(media_format* format)
 	}
 	if ((fPicture.bitDepth > 8) != (space == kColorSpaceP010))
 		return B_MEDIA_BAD_FORMAT;
+
+	// full size, or half for a player whose screen shows the film at no
+	// more than half: a 4K film on a 1080p screen, where the copy out and
+	// the scaling each cost about as much as the decoding did
+	uint32 requestWidth = format->u.raw_video.display.line_width;
+	uint32 requestHeight = format->u.raw_video.display.line_count;
+	fHalfSize = false;
+	if ((requestWidth > 0 || requestHeight > 0)
+		&& (requestWidth != fPicture.width
+			|| requestHeight != fPicture.height)) {
+		if (requestWidth != (fPicture.width + 1) / 2
+			|| requestHeight != (fPicture.height + 1) / 2) {
+			return B_MEDIA_BAD_FORMAT;
+		}
+		fHalfSize = true;
+	}
 	fOutputSpace = space;
-	fWidth = fPicture.width;
-	fHeight = fPicture.height;
+	fWidth = fHalfSize ? (fPicture.width + 1) / 2 : fPicture.width;
+	fHeight = fHalfSize ? (fPicture.height + 1) / 2 : fPicture.height;
+	fStreamWidth = fPicture.width;
+	fStreamHeight = fPicture.height;
 
 	media_raw_video_format raw = fInputFormat.u.encoded_video.output;
 	raw.interlace = 1;
@@ -225,7 +247,13 @@ RpiHevcDecoder::NegotiateOutputFormat(media_format* format)
 	raw.display.format = fOutputSpace;
 	raw.display.line_width = fWidth;
 	raw.display.line_count = fHeight;
-	raw.display.bytes_per_row = _Stride(fPicture);
+	uint32 samples = (fWidth + 15) & ~15u;
+	raw.display.bytes_per_row = _Stride(fPicture) / (fHalfSize ? 2 : 1);
+	if (fHalfSize && samples * (fPicture.bitDepth > 8 ? 2 : 1)
+		> raw.display.bytes_per_row) {
+		// odd widths round up past half of the full size stride
+		raw.display.bytes_per_row = samples * (fPicture.bitDepth > 8 ? 2 : 1);
+	}
 	raw.display.pixel_offset = 0;
 	raw.display.line_offset = 0;
 	raw.display.flags = 0;
@@ -361,7 +389,7 @@ RpiHevcDecoder::Decode(void* buffer, int64* frameCount, media_header* header,
 	}
 	fHavePicture = false;
 
-	if (fPicture.width != fWidth || fPicture.height != fHeight
+	if (fPicture.width != fStreamWidth || fPicture.height != fStreamHeight
 		|| (fPicture.bitDepth > 8) != (fOutputSpace == kColorSpaceP010)) {
 		// the stream changed its pictures; nothing here renegotiates
 		fDecoder.ReleasePicture(fPicture);
@@ -371,12 +399,14 @@ RpiHevcDecoder::Decode(void* buffer, int64* frameCount, media_header* header,
 		return B_MEDIA_BAD_FORMAT;
 	}
 
-	uint32 stride = _Stride(fPicture);
+	uint32 stride = (fWidth + 15) & ~15u;
+	if (fPicture.bitDepth > 8)
+		stride *= 2;
 	bool skip = info != NULL && info->time_to_decode < 0
 		&& fPicture.pts < -info->time_to_decode;
 	if (!skip) {
 		fDecoder.CopyPlanes(fPicture, (uint8*)buffer, stride,
-			fOutputSpace == kColorSpaceNV12);
+			fOutputSpace == kColorSpaceNV12, fHalfSize);
 	}
 
 	memset(header, 0, sizeof(*header));

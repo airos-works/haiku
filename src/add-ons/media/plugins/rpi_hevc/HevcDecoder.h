@@ -72,10 +72,10 @@ public:
 				Cb and Cr planes of half the stride (\a interleaved false)
 				or one of pairs; ten bit as sixteen bit samples (the value
 				times 64), chroma always in pairs. \a stride is in bytes;
-				the chroma follows the last luma row. */
+				the chroma follows the last luma row. \a half asks for half as wide and high, the average of each 2x2 samples. */
 			void				CopyPlanes(const Picture& picture,
 									uint8* target, uint32 stride,
-									bool interleaved);
+									bool interleaved, bool half);
 
 			const char*			Error() const { return fError.String(); }
 			uint32				PicturesDecoded() const { return fDecoded; }
