@@ -488,9 +488,9 @@ BDirectWindow::_DirectDaemon()
 				fConnectionEnable = true;
 
 			if (fBufferDesc->bits == NULL) {
-				// (re-)clone the bits area
-				BPrivate::AppServerLink linkLocker;
-					// protects ServerAllocator
+				// (re-)clone the bits area; not under the application's
+				// app_server link, which another thread may hold waiting
+				// for app_server - which waits for this
 				BPrivate::ServerMemoryAllocator* allocator
 					= BApplication::Private::ServerAllocator();
 				allocator->RemoveArea(fSourceBitsArea);

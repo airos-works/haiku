@@ -7,17 +7,19 @@
  */
 
 
-/*!	Note, this class don't provide any locking whatsoever - you are
-	supposed to have a BPrivate::AppServerLink object around which
-	does the necessary locking.
-	However, this is not enforced in the methods here, you have to
-	take care for yourself!
+/*!	The class locks itself. It used to rely on the caller holding the
+	application's app_server link (BPrivate::AppServerLink), which a
+	BDirectWindow's daemon thread then had to take while app_server waited
+	for it - and while the application thread held the link, waiting for
+	app_server.
 */
 
 
 #include "ServerMemoryAllocator.h"
 
 #include <new>
+
+#include <AutoLocker.h>
 
 #ifndef HAIKU_TARGET_PLATFORM_LIBBE_TEST
 #	include <syscalls.h>
@@ -47,11 +49,13 @@ delete_mapping(const area_mapping& mapping)
 
 ServerMemoryAllocator::ServerMemoryAllocator()
 {
+	mutex_init(&fLock, "server memory allocator");
 }
 
 
 ServerMemoryAllocator::~ServerMemoryAllocator()
 {
+	MutexLocker _(fLock);
 	while (!fAreas.empty()) {
 		std::map<area_id, area_mapping>::iterator it = fAreas.begin();
 		area_mapping& mapping = it->second;
@@ -72,6 +76,7 @@ status_t
 ServerMemoryAllocator::AddArea(area_id serverArea, area_id& _area,
 	uint8*& _base, size_t size, bool readOnly)
 {
+	MutexLocker _(fLock);
 	std::map<area_id, area_mapping>::iterator it = fAreas.find(serverArea);
 	if (it != fAreas.end()) {
 		area_mapping& mapping = it->second;
@@ -137,6 +142,7 @@ ServerMemoryAllocator::AddArea(area_id serverArea, area_id& _area,
 void
 ServerMemoryAllocator::RemoveArea(area_id serverArea)
 {
+	MutexLocker _(fLock);
 	std::map<area_id, area_mapping>::iterator it = fAreas.find(serverArea);
 	if (it != fAreas.end()) {
 		area_mapping& mapping = it->second;

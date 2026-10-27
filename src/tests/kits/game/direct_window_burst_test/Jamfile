@@ -1,0 +1,6 @@
+SubDir HAIKU_TOP src tests kits game direct_window_burst_test ;
+
+SimpleTest direct_window_burst_test
+	: direct_window_burst_test.cpp
+	: game be root
+;
