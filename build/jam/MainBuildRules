@@ -33,14 +33,12 @@ rule AddSharedObjectGlueCode
 			LINKFLAGS on $(1) = [ on $(1) return $(LINKFLAGS) ] -nostdlib
 				-Xlinker --no-undefined ;
 
-			# ARM64's runtime loader can reject missing symbols through a
-			# GNU hash Bloom filter instead of walking the SysV hash chains.
-			# Keep the SysV table too: it supplies the dynamic symbol count
-			# used by the loader's relocation cache and existing tools.
-			if $(TARGET_PACKAGING_ARCH) = arm64 {
-				LINKFLAGS on $(1) = [ on $(1) return $(LINKFLAGS) ]
-					-Wl,--hash-style=both ;
-			}
+			# The runtime loader can reject missing symbols through a GNU hash
+			# Bloom filter instead of walking the SysV hash chains. Keep the
+			# SysV table too: it supplies the dynamic symbol count used by the
+			# loader's relocation cache and existing tools.
+			LINKFLAGS on $(1) = [ on $(1) return $(LINKFLAGS) ]
+				-Wl,--hash-style=both ;
 		}
 	}
 
