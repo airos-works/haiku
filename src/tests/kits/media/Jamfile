@@ -6,6 +6,12 @@ SimpleTest media_track_times_test :
 	media_track_times_test.cpp
 	: media be ;
 
+# buffers of killed teams in the shared buffer list: run "hold 64" several
+# times, kill each with -9, then "check"
+SimpleTest buffer_group_leak_test :
+	buffer_group_leak_test.cpp
+	: media be ;
+
 SimpleTest mixer_monitor_test :
 	mixer_monitor_test.cpp
 	: media be ;
