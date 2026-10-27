@@ -3,7 +3,7 @@
  * Distributed under the terms of the MIT License.
  */
 
-/*!	direct_window_burst_test [windows]: opens BDirectWindows one after the
+/*!	direct_window_burst_test [windows] [slow]: opens BDirectWindows one after the
 	other from the application thread, as a program restoring its windows
 	does, and checks that every one gets connected and keeps its connection.
 
@@ -13,6 +13,9 @@
 	("killed for a problem in DirectConnected()"). It used to take the
 	application's app_server link lock for that, which the application
 	thread holds while it creates the next window.
+
+	With "slow", DirectConnected() takes longer than app_server waits, so
+	app_server gives up on every window; quitting them must still work.
 */
 
 
@@ -22,10 +25,12 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 
 static int32 sConnected;
 static int32 sStarted;
+static bool sSlow;
 
 
 class Window : public BDirectWindow {
@@ -48,7 +53,7 @@ public:
 		if (info->bits != NULL)
 			atomic_add(&sConnected, 1);
 		// some work, as a program drawing into the screen does
-		snooze(2000);
+		snooze(sSlow ? 800000 : 2000);
 	}
 
 	bool fStarted;
@@ -84,7 +89,7 @@ run_test(void*)
 
 	for (int i = 0; i < count && i < 64; i++)
 		windows[i]->PostMessage(B_QUIT_REQUESTED);
-	sResult = started == count ? 0 : 1;
+	sResult = started == count || sSlow ? 0 : 1;
 	printf("%s\n", sResult == 0 ? "PASS" : "FAIL");
 	be_app->PostMessage(B_QUIT_REQUESTED);
 	return B_OK;
@@ -97,6 +102,7 @@ main(int argc, char** argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	BApplication app("application/x-vnd.Haiku-direct-window-burst-test");
 	sCount = argc > 1 ? atoi(argv[1]) : 8;
+	sSlow = argc > 2 && strcmp(argv[2], "slow") == 0;
 
 	if (!BDirectWindow::SupportsWindowMode()) {
 		printf("no direct window support\n");
