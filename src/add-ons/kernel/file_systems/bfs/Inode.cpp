@@ -2235,8 +2235,13 @@ Inode::_GrowStream(Transaction& transaction, off_t size)
 		}
 
 		block_run run;
+		// When most of the request is preallocation (a small file), the
+		// first free run that holds what is needed will do: on a fragmented
+		// volume, looking for room for the whole preallocation scanned the
+		// allocation groups at every file creation.
 		status_t status = fVolume->Allocate(transaction, this, blocksRequested,
-			run, minimum);
+			run, minimum,
+			blocksNeeded * 2 <= blocksRequested ? blocksNeeded : 0);
 		if (status != B_OK)
 			return status;
 

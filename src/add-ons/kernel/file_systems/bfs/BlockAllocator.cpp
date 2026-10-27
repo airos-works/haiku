@@ -904,10 +904,15 @@ BlockAllocator::IsCompletelyOutsideAllowedRange(block_run run) const
 
 	The number of allocated blocks is always a multiple of \a minimum which
 	has to be a power of two value.
+
+	If \a needed is not 0, \a maximum includes a preallocation: the search
+	ends at the first free run of \a needed blocks (or more, up to \a maximum),
+	instead of looking through all groups for one of \a maximum.
 */
 status_t
 BlockAllocator::AllocateBlocks(Transaction& transaction, int32 groupIndex,
-	uint16 start, uint16 maximum, uint16 minimum, block_run& run)
+	uint16 start, uint16 maximum, uint16 minimum, block_run& run,
+	uint16 needed)
 {
 	if (maximum == 0)
 		return B_BAD_VALUE;
@@ -950,6 +955,12 @@ BlockAllocator::AllocateBlocks(Transaction& transaction, int32 groupIndex,
 	int32 bestLength = -1;
 
 	for (int32 i = 0; i < fNumGroups + 1; i++, groupIndex++, start = 0) {
+		// On a fragmented volume, a run large enough for the preallocation
+		// is often in no group, and searching all of them made creating
+		// a small file cost milliseconds.
+		if (needed > 0 && bestLength >= needed)
+			break;
+
 		groupIndex = groupIndex % fNumGroups;
 		AllocationGroup& group = fGroups[groupIndex];
 
@@ -1056,6 +1067,11 @@ BlockAllocator::AllocateBlocks(Transaction& transaction, int32 groupIndex,
 							groupLargestLength = currentLength;
 						}
 						currentLength = 0;
+
+						// A run for what is needed ends the search; the rest
+						// of the preallocation is not worth scanning on
+						if (needed > 0 && bestLength >= needed)
+							break;
 					}
 					if (((int32)group.NumBits() - currentBit)
 							<= groupLargestLength) {
@@ -1077,7 +1093,8 @@ BlockAllocator::AllocateBlocks(Transaction& transaction, int32 groupIndex,
 			T(Block("alloc-out", block, cached.Block(),
 				fVolume->BlockSize(), groupIndex, currentStart));
 
-			if (bestLength >= maximum) {
+			if (bestLength >= maximum
+				|| (needed > 0 && bestLength >= needed)) {
 				canFindGroupLargest = false;
 				break;
 			}
@@ -1168,7 +1185,7 @@ BlockAllocator::AllocateForInode(Transaction& transaction,
 
 status_t
 BlockAllocator::Allocate(Transaction& transaction, Inode* inode,
-	off_t numBlocks, block_run& run, uint16 minimum)
+	off_t numBlocks, block_run& run, uint16 minimum, off_t needed)
 {
 	if (numBlocks <= 0)
 		return B_ERROR;
@@ -1221,7 +1238,11 @@ BlockAllocator::Allocate(Transaction& transaction, Inode* inode,
 		group = inode->BlockRun().AllocationGroup() + 1;
 	}
 
-	return AllocateBlocks(transaction, group, start, numBlocks, minimum, run);
+	if (needed >= numBlocks)
+		needed = 0;
+
+	return AllocateBlocks(transaction, group, start, numBlocks, minimum, run,
+		needed);
 }
 
 
