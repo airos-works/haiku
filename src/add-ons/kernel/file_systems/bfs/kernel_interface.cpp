@@ -861,7 +861,7 @@ bfs_fsync(fs_volume* _volume, fs_vnode* _node, bool dataOnly)
 	Inode* inode = (Inode*)_node->private_node;
 
 	status_t status = inode->Sync();
-	if (status != B_OK || volume->IsReadOnly())
+	if (status != B_OK || dataOnly || volume->IsReadOnly())
 		return status;
 
 	// The data is on its way to the disk, but a change to the inode itself
@@ -869,6 +869,7 @@ bfs_fsync(fs_volume* _volume, fs_vnode* _node, bool dataOnly)
 	// changed) is in the journal's current transaction, which is written only
 	// once the volume has been idle for a while: commit it, so that a crash
 	// cannot leave the old contents, or a file full of zeros, behind.
+	// (dataOnly: fdatasync(), and the VFS writing back a vnode it frees.)
 	return volume->GetJournal(0)->FlushLogIfChanged(inode->BlockNumber());
 }
 
