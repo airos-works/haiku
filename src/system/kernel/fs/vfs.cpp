@@ -8455,8 +8455,15 @@ _kern_get_next_fd_info(team_id teamID, uint32* _cookie, fd_info* info,
 		return B_BAD_TEAM_ID;
 	BReference<Team> teamReference(team, true);
 
-	// now that we have a team reference, its I/O context won't go away
-	const io_context* context = team->io_context;
+	// Now that we have a team reference, its I/O context won't go away; it is
+	// gone already when the team is being deleted.
+	TeamLocker teamLocker(team);
+	io_context* context = team->io_context;
+	if (context == NULL)
+		return B_BAD_TEAM_ID;
+	vfs_get_io_context(context);
+	teamLocker.Unlock();
+	CObjectDeleter<io_context, void, vfs_put_io_context> contextPutter(context);
 	ReadLocker contextLocker(context->lock);
 
 	uint32 slot = *_cookie;
