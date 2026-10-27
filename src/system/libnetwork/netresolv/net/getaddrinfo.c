@@ -76,6 +76,8 @@ __RCSID("$NetBSD: getaddrinfo.c,v 1.119.2.1 2020/11/29 11:25:31 martin Exp $");
 #include <string.h>
 #include <unistd.h>
 #include <ifaddrs.h>
+#include <poll.h>
+#include <OS.h>
 
 #include <syslog.h>
 #include <stdarg.h>
@@ -2281,6 +2283,164 @@ _dns_host_lookup(const char *name, const struct addrinfo *pai)
 	return sentinel.ai_next;
 }
 
+/*
+ * Multicast DNS (RFC 6762) for names in .local, which no unicast DNS server
+ * knows: a one-shot query to 224.0.0.251 port 5353 from an ordinary port,
+ * which responders answer by unicast to that port (section 5.1). Programs
+ * resolve names that others publish this way, as WebRTC peers do with the
+ * random names that hide their addresses.
+ */
+static int
+_is_mdns_name(const char *name)
+{
+	size_t length = strlen(name);
+	if (length > 0 && name[length - 1] == '.')
+		length--;
+	return length > 6 && strncasecmp(name + length - 6, ".local", 6) == 0;
+}
+
+static int
+_mdns_name_matches(const u_char *message, const u_char *end,
+    const u_char *at, const char *name)
+{
+	char found[MAXDNAME];
+	size_t length = strlen(name);
+	if (dn_expand(message, end, at, found, sizeof(found)) < 0)
+		return 0;
+	if (length > 0 && name[length - 1] == '.')
+		length--;
+	return strlen(found) == length && strncasecmp(found, name, length) == 0;
+}
+
+static struct addrinfo *
+_mdns_host_lookup(const char *name, const struct addrinfo *pai)
+{
+	u_char query[MAXDNAME + 32], answer[9000];
+	struct addrinfo sentinel, *cur, ai;
+	const struct afd *afd;
+	int socketFD, length, count = 0;
+
+	/* the header: id 0, no flags, one or two questions */
+	memset(query, 0, 12);
+	int questions = 0;
+	length = 12;
+	for (int type = 0; type < 2; type++) {
+		int qtype = type == 0 ? T_A : T_AAAA;
+		if ((qtype == T_A && pai->ai_family == AF_INET6)
+			|| (qtype == T_AAAA && pai->ai_family == AF_INET))
+			continue;
+		int n = dn_comp(name, query + length, sizeof(query) - length - 4,
+			NULL, NULL);
+		if (n < 0)
+			return NULL;
+		length += n;
+		query[length++] = qtype >> 8;
+		query[length++] = qtype & 0xff;
+		query[length++] = 0;
+		query[length++] = C_IN;
+		questions++;
+	}
+	query[5] = questions;
+
+	socketFD = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	if (socketFD < 0)
+		return NULL;
+	u_char ttl = 255, loop = 1;
+	setsockopt(socketFD, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+	setsockopt(socketFD, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
+
+	struct sockaddr_in group;
+	memset(&group, 0, sizeof(group));
+	group.sin_len = sizeof(group);
+	group.sin_family = AF_INET;
+	group.sin_port = htons(5353);
+	group.sin_addr.s_addr = htonl(0xe00000fb);
+
+	memset(&sentinel, 0, sizeof(sentinel));
+	cur = &sentinel;
+
+	/* RFC 6762 5.1: ask again after a second at most; give up after three */
+	bigtime_t deadline = system_time() + 3000000;
+	bigtime_t nextQuery = 0;
+	while (sentinel.ai_next == NULL) {
+		bigtime_t now = system_time();
+		if (now >= deadline)
+			break;
+		if (now >= nextQuery) {
+			sendto(socketFD, query, length, 0, (struct sockaddr *)&group,
+				sizeof(group));
+			nextQuery = now + 1000000;
+		}
+		bigtime_t wait = (nextQuery < deadline ? nextQuery : deadline) - now;
+		struct pollfd pfd = { socketFD, POLLIN, 0 };
+		if (poll(&pfd, 1, (int)(wait / 1000) + 1) <= 0)
+			continue;
+
+		int n = recv(socketFD, answer, sizeof(answer), 0);
+		if (n < 12)
+			continue;
+		const u_char *end = answer + n;
+		const u_char *cp = answer + 12;
+		int qdcount = (answer[4] << 8) | answer[5];
+		int ancount = (answer[6] << 8) | answer[7];
+		if ((answer[2] & 0x80) == 0)
+			continue;	/* a query, not an answer */
+		int ok = 1;
+		for (int i = 0; i < qdcount && ok; i++) {
+			int skip = dn_skipname(cp, end);
+			if (skip < 0 || cp + skip + 4 > end)
+				ok = 0;
+			else
+				cp += skip + 4;
+		}
+		for (int i = 0; i < ancount && ok; i++) {
+			const u_char *record = cp;
+			int skip = dn_skipname(cp, end);
+			if (skip < 0 || cp + skip + 10 > end) {
+				ok = 0;
+				break;
+			}
+			cp += skip;
+			int type = (cp[0] << 8) | cp[1];
+			int class = ((cp[2] << 8) | cp[3]) & 0x7fff;
+				/* the top bit is the cache flush bit */
+			int dataLength = (cp[8] << 8) | cp[9];
+			cp += 10;
+			if (cp + dataLength > end) {
+				ok = 0;
+				break;
+			}
+			if (class == C_IN && ((type == T_A && dataLength == 4)
+					|| (type == T_AAAA && dataLength == 16))
+				&& _mdns_name_matches(answer, end, record, name)) {
+				ai = *pai;
+				ai.ai_family = type == T_A ? AF_INET : AF_INET6;
+				if (pai->ai_family == AF_UNSPEC
+					|| pai->ai_family == ai.ai_family) {
+					afd = find_afd(ai.ai_family);
+					if (afd != NULL) {
+						cur->ai_next = get_ai(&ai, afd, (const char *)cp);
+						while (cur->ai_next != NULL) {
+							cur = cur->ai_next;
+							count++;
+						}
+					}
+				}
+			}
+			cp += dataLength;
+		}
+	}
+	close(socketFD);
+
+	if (sentinel.ai_next == NULL) {
+		h_errno = HOST_NOT_FOUND;
+		return NULL;
+	}
+	if (pai->ai_flags & AI_CANONNAME)
+		get_canonname(pai, sentinel.ai_next, name);
+	return sentinel.ai_next;
+}
+
 /*ARGSUSED*/
 static int
 _dns_getaddrinfo(void *rv, void *cb_data, va_list ap)
@@ -2323,7 +2483,10 @@ _dns_getaddrinfo(void *rv, void *cb_data, va_list ap)
 #ifdef DNS_DEBUG
 		printf("%s: try HOST lookup\n", __func__);
 #endif
-		ai = _dns_host_lookup(name, pai);
+		if (_is_mdns_name(name))
+			ai = _mdns_host_lookup(name, pai);
+		else
+			ai = _dns_host_lookup(name, pai);
 
 		if (ai == NULL) {
 			switch (h_errno) {
