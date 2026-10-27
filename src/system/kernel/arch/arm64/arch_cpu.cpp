@@ -69,6 +69,92 @@ arch_cpu_preboot_init_percpu(kernel_args *args, int curr_cpu)
 }
 
 
+/*!	The AT_HWCAP and AT_HWCAP2 bits (numbered as on Linux, see <sys/auxv.h>)
+	of the features all CPUs have: a big.LITTLE system can only report what
+	its smallest cores support. User land reads them from the commpage
+	(getauxval()); libgcc picks its atomics by HWCAP_ATOMICS, for one.
+*/
+int64 gARM64HWCaps[2] = { -1, -1 };
+
+
+static void
+arm64_cpu_hwcaps(uint64 caps[2])
+{
+	const uint64 pfr0 = READ_SPECIALREG(ID_AA64PFR0_EL1);
+	const uint64 isar0 = READ_SPECIALREG(ID_AA64ISAR0_EL1);
+	const uint64 isar1 = READ_SPECIALREG(ID_AA64ISAR1_EL1);
+	auto field = [](uint64 reg, int shift) { return (reg >> shift) & 0xf; };
+
+	uint64 hwcap = 0;
+	uint64 hwcap2 = 0;
+
+	// FP and AdvSIMD: 0 present, 1 with half precision, 0xf absent
+	if (field(pfr0, 16) != 0xf)
+		hwcap |= 1UL << 0;
+	if (field(pfr0, 16) == 1)
+		hwcap |= 1UL << 9;
+	if (field(pfr0, 20) != 0xf)
+		hwcap |= 1UL << 1;
+	if (field(pfr0, 20) == 1)
+		hwcap |= 1UL << 10;
+	if (field(pfr0, 48) >= 1)
+		hwcap |= 1UL << 24;		// DIT
+
+	if (field(isar0, 4) >= 1)
+		hwcap |= 1UL << 3;		// AES
+	if (field(isar0, 4) >= 2)
+		hwcap |= 1UL << 4;		// PMULL
+	if (field(isar0, 8) >= 1)
+		hwcap |= 1UL << 5;		// SHA1
+	if (field(isar0, 12) >= 1)
+		hwcap |= 1UL << 6;		// SHA2
+	if (field(isar0, 12) >= 2)
+		hwcap |= 1UL << 21;		// SHA512
+	if (field(isar0, 16) >= 1)
+		hwcap |= 1UL << 7;		// CRC32
+	if (field(isar0, 20) >= 2)
+		hwcap |= 1UL << 8;		// ATOMICS (LSE)
+	if (field(isar0, 28) >= 1)
+		hwcap |= 1UL << 12;		// ASIMDRDM
+	if (field(isar0, 32) >= 1)
+		hwcap |= 1UL << 17;		// SHA3
+	if (field(isar0, 36) >= 1)
+		hwcap |= 1UL << 18;		// SM3
+	if (field(isar0, 40) >= 1)
+		hwcap |= 1UL << 19;		// SM4
+	if (field(isar0, 44) >= 1)
+		hwcap |= 1UL << 20;		// ASIMDDP
+	if (field(isar0, 48) >= 1)
+		hwcap |= 1UL << 23;		// ASIMDFHM
+	if (field(isar0, 52) >= 1)
+		hwcap |= 1UL << 27;		// FLAGM
+	if (field(isar0, 52) >= 2)
+		hwcap2 |= 1UL << 7;		// FLAGM2
+	if (field(isar0, 60) >= 1)
+		hwcap2 |= 1UL << 16;	// RNG
+
+	if (field(isar1, 0) >= 1)
+		hwcap |= 1UL << 16;		// DCPOP
+	if (field(isar1, 0) >= 2)
+		hwcap2 |= 1UL << 0;		// DCPODP
+	if (field(isar1, 12) >= 1)
+		hwcap |= 1UL << 13;		// JSCVT
+	if (field(isar1, 16) >= 1)
+		hwcap |= 1UL << 14;		// FCMA
+	if (field(isar1, 20) >= 1)
+		hwcap |= 1UL << 15;		// LRCPC
+	if (field(isar1, 20) >= 2)
+		hwcap |= 1UL << 26;		// ILRCPC
+	if (field(isar1, 32) >= 1)
+		hwcap2 |= 1UL << 8;		// FRINT
+	if (field(isar1, 36) >= 1)
+		hwcap |= 1UL << 29;		// SB
+
+	caps[0] = hwcap;
+	caps[1] = hwcap2;
+}
+
+
 status_t
 arch_cpu_init_percpu(kernel_args *args, int curr_cpu)
 {
@@ -87,6 +173,11 @@ arch_cpu_init_percpu(kernel_args *args, int curr_cpu)
 
 	gCPU[curr_cpu].arch.mpidr = READ_SPECIALREG(MPIDR_EL1);
 	gCPU[curr_cpu].arch.midr = READ_SPECIALREG(MIDR_EL1);
+
+	uint64 caps[2];
+	arm64_cpu_hwcaps(caps);
+	atomic_and64(&gARM64HWCaps[0], caps[0]);
+	atomic_and64(&gARM64HWCaps[1], caps[1]);
 
 	return 0;
 }

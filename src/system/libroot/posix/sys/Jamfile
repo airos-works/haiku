@@ -10,6 +10,7 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 		UsePrivateSystemHeaders ;
 
 		MergeObject <$(architecture)>posix_sys.o :
+			auxv.cpp
 			chmod.c
 			flock.c
 			ftime.c

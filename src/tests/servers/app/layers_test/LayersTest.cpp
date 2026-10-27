@@ -90,6 +90,11 @@ View::Draw(BRect)
 		p.MapTo(BRect(0, 0, 90, 90), gradient.OffsetByCopy(600, 0));
 		FillPolygon(&p, g[i]);
 		StrokeLine(BPoint(840, i * 100 + 10), BPoint(930, i * 100 + 100), g[i]);
+		// text placed glyph by glyph, as web engines draw it
+		BPoint locations[6];
+		for (int j = 0; j < 6; j++)
+			locations[j] = BPoint(950 + j * 15, i * 100 + 60);
+		DrawString("Glyphs", locations, 6);
 		EndLayer();
 		rect.OffsetBy(0, 100);
 		gradient.OffsetBy(0, 100);
@@ -111,7 +116,7 @@ class Window : public BWindow {
 
 
 Window::Window()
-	: BWindow(BRect(100, 100, 1040, 410), "Layers-Test",
+	: BWindow(BRect(100, 100, 1150, 410), "Layers-Test",
 			B_TITLED_WINDOW, B_ASYNCHRONOUS_CONTROLS)
 {
 	BView *view = new View(Bounds());

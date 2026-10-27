@@ -87,5 +87,12 @@ arch_commpage_init_post_cpus(void)
 	register_commpage_function("arch_user_signal_handler", COMMPAGE_ENTRY_ARM64_SIGNAL_HANDLER,
 		"commpage_signal_handler", (addr_t)&arch_user_signal_handler);
 
+	// Every CPU has added its features by now.
+	extern int64 gARM64HWCaps[2];
+	fill_commpage_entry(COMMPAGE_ENTRY_ARM64_HWCAPS, gARM64HWCaps,
+		sizeof(gARM64HWCaps));
+	dprintf("arm64: HWCAP %#" B_PRIx64 ", HWCAP2 %#" B_PRIx64 "\n",
+		gARM64HWCaps[0], gARM64HWCaps[1]);
+
 	return B_OK;
 }
