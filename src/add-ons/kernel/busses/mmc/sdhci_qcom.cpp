@@ -639,5 +639,6 @@ mmc_bus_interface gSDHCIQcomDeviceModule = {
 	.set_clock = set_clock, .execute_command = execute_command, .do_io = do_io,
 	.set_scan_semaphore = set_scan_semaphore, .set_bus_width = set_bus_width,
 	.terminate_bus = terminate_bus, .set_card_type = set_card_type,
-	.read_extended_csd = read_extended_csd
+	.read_extended_csd = read_extended_csd,
+	.switch_sd_function = switch_sd_function
 };

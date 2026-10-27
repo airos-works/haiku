@@ -61,12 +61,17 @@ class SdhciBus {
 			void				SetCardType(card_type type);
 			void				TerminateBus();
 			status_t			ReadExtendedCsd(uint8_t data[512]);
+			status_t			SwitchSdFunction(uint32_t argument,
+									uint8_t data[64]);
 
 	private:
 			bool				PowerOn();
 			void				PowerOff();
 			void				RecoverError();
 			status_t			WaitForCompletion(uint32_t mask, bigtime_t timeout);
+			status_t			_ReadDataBlock(uint8_t command,
+									uint32_t argument, uint8_t* data,
+									uint32_t length);
 	static	status_t			_WorkerThread(void*);
 
 	private:
@@ -76,6 +81,8 @@ class SdhciBus {
 			bool				fInterruptInstalled;
 			ConditionVariable	fInterruptNotifier;
 			sem_id				fScanSemaphore;
+			bool				fReadingDataBlock;
+				// a command 6 now is SD_SWITCH_FUNCTION, not ACMD6
 			status_t			fStatus;
 			thread_id			fWorkerThread;
 			card_type			fCardType;
@@ -403,10 +410,16 @@ class HostControl {
 			value = (value & ~kDataTransferWidthMask) | width;
 		}
 
+		void SetHighSpeed(bool enable)
+		{
+			value = enable ? value | kHighSpeed : value & ~kHighSpeed;
+		}
+
 		// TODO add other bits for LED control, etc.
 
 		uint8 Bits() { return value; }
 
+		static const uint8_t kHighSpeed = 1 << 2;
 		static const uint8_t kDmaMask = 3 << 3;
 		static const uint8_t kSdma = 0 << 3;
 		static const uint8_t kAdma32 = 2 << 3;
@@ -569,6 +582,8 @@ extern void bus_removed(void* bus_cookie);
 
 status_t set_clock(void* controller, uint32_t kilohertz);
 status_t read_extended_csd(void* controller, uint8_t data[512]);
+status_t switch_sd_function(void* controller, uint32_t argument,
+	uint8_t data[64]);
 status_t execute_command(void* controller, uint8_t command,
 	uint32_t argument, uint32_t* response);
 status_t do_io(void* controller, uint8_t command,

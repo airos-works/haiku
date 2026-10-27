@@ -61,6 +61,7 @@ SdhciBus::SdhciBus(struct registers* registers, uint32_t irq, bool poll,
 	fIrq(irq),
 	fInterruptInstalled(false),
 	fScanSemaphore(-1),
+	fReadingDataBlock(false),
 	fStatus(B_OK),
 	fWorkerThread(-1),
 	fCardType(CARD_TYPE_UNKNOWN),
@@ -336,7 +337,11 @@ SdhciBus::ExecuteCommand(uint8_t command, uint32_t argument, uint32_t* response)
 
 		// Commands defined with different reply types in SD and MMC specifications
 		case SD_SET_BUS_WIDTH: // SD application command. Also MMC_SWITCH, which is not.
-			if (is_mmc_card(fCardType)
+			// and SD_SWITCH_FUNCTION, which has a data phase
+			if (fReadingDataBlock && !is_mmc_card(fCardType)) {
+				replyType = Command::kR1Type | Command::kDataPresent;
+				transferMode = TransferMode::kRead;
+			} else if (is_mmc_card(fCardType)
 				&& mmc_cache_busy_timeout(fCardType, command, argument) == 0)
 				replyType = Command::kR1bType;
 			else
@@ -522,6 +527,10 @@ SdhciBus::SetClock(int kilohertz, bool allowAuto)
 	}
 	if (fRegisters->host_controller_version.specVersion >= 2)
 		fRegisters->host_control_2 &= ~(1 << 15);
+	// above the default 25 MHz the card runs in high speed timing, and the
+	// host samples for it
+	fRegisters->host_control.SetHighSpeed(kilohertz > 25000
+		&& fRegisters->capabilities.HighSpeed());
 	divider = fRegisters->clock_control.SetDivider(divider);
 	fRegisters->clock_control.EnableInternal();
 	bigtime_t deadline = system_time() + 100000;
@@ -685,12 +694,34 @@ SdhciBus::ReadExtendedCsd(uint8_t data[512])
 {
 	if (data == NULL || !is_mmc_card(fCardType))
 		return B_BAD_VALUE;
+	return _ReadDataBlock(MMC_SEND_EXT_CSD, 0, data, 512);
+}
+
+
+status_t
+SdhciBus::SwitchSdFunction(uint32_t argument, uint8_t data[64])
+{
+	if (data == NULL || is_mmc_card(fCardType))
+		return B_BAD_VALUE;
+	return _ReadDataBlock(SD_SWITCH_FUNCTION, argument, data, 64);
+}
+
+
+/*!	A command with a single short data block to read by PIO (EXT_CSD, the SD
+	switch status).
+*/
+status_t
+SdhciBus::_ReadDataBlock(uint8_t command, uint32_t argument, uint8_t* data,
+	uint32_t length)
+{
 	if (fStatus != B_OK)
 		return fStatus;
-	fRegisters->block_size.ConfigureTransfer(512, BlockSize::kDmaBoundary4K);
+	fRegisters->block_size.ConfigureTransfer(length, BlockSize::kDmaBoundary4K);
 	fRegisters->block_count = 1;
 	uint32_t response = 0;
-	status_t status = ExecuteCommand(MMC_SEND_EXT_CSD, 0, &response);
+	fReadingDataBlock = true;
+	status_t status = ExecuteCommand(command, argument, &response);
+	fReadingDataBlock = false;
 	if (status != B_OK)
 		return status;
 	if ((response & kMmcR1ErrorMask) != 0) {
@@ -699,7 +730,7 @@ SdhciBus::ReadExtendedCsd(uint8_t data[512])
 	}
 
 	bigtime_t deadline = system_time() + 1000000;
-	for (unsigned offset = 0; offset < 512; offset += sizeof(uint32_t)) {
+	for (unsigned offset = 0; offset < length; offset += sizeof(uint32_t)) {
 		while ((fRegisters->present_state.Bits() & (1 << 11)) == 0) {
 			if ((atomic_get(&fCommandResult) & SDHCI_INT_ERROR_MASK) != 0) {
 				RecoverError();
@@ -1081,6 +1112,13 @@ status_t
 read_extended_csd(void* controller, uint8_t data[512])
 {
 	return ((SdhciBus*)controller)->ReadExtendedCsd(data);
+}
+
+
+status_t
+switch_sd_function(void* controller, uint32_t argument, uint8_t data[64])
+{
+	return ((SdhciBus*)controller)->SwitchSdFunction(argument, data);
 }
 
 

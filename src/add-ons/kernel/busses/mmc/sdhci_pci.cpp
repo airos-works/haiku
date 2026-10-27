@@ -177,6 +177,8 @@ register_child_devices_pci(void* cookie)
 			{ B_DEVICE_FIXED_CHILD, B_STRING_TYPE,
 				{.string = MMC_BUS_MODULE_NAME} },
 			{ B_DEVICE_BUS, B_STRING_TYPE, {.string = "mmc"} },
+		// standard SDHCI: SD high speed with the capability bit (SetClock)
+		{ kMmcSdHighSpeedAttribute, B_UINT8_TYPE, { .ui8 = 1 }},
 
 			// DMA properties
 			// The high alignment is to force access only to complete sectors
@@ -330,4 +332,5 @@ mmc_bus_interface gSDHCIPCIDeviceModule = {
 	.terminate_bus = terminate_bus,
 	.set_card_type = set_card_type,
 	.read_extended_csd = read_extended_csd,
+	.switch_sd_function = switch_sd_function,
 };
