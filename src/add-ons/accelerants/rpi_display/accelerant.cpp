@@ -394,11 +394,10 @@ rpi_set_cursor_bitmap(uint16 width, uint16 height, uint16 hotX, uint16 hotY,
 		const uint8* src = bitmapData + y * bytesPerRow;
 		uint8* dst = buffer + y * bufferRow;
 		for (uint16 x = 0; x < width; x++, src += 4, dst += 4) {
-			// Haiku keeps its cursors premultiplied with the alpha byte
-			// inverted (0 opaque, 255 clear); the firmware wants straight
-			// alpha with un-premultiplied color, as DRM's ARGB8888 cursors
-			// get it through fkms.
-			uint8 alpha = 255 - src[3];
+			// Haiku keeps its cursors premultiplied, alpha 255 opaque; the
+			// firmware blends straight alpha
+			// (out = rgb * a + background * (1 - a)), so un-premultiply.
+			uint8 alpha = src[3];
 			dst[3] = alpha;
 			if (alpha == 0) {
 				dst[0] = dst[1] = dst[2] = 0;
