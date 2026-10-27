@@ -44,6 +44,8 @@ public:
 			void		SetBaseAddress(unsigned dso, addr_t baseAddress);
 
 			unsigned	GetGeneration(unsigned dso) const;
+			const int32* GenerationAddress() const
+							{ return &fGeneration; }
 
 			TLSBlock	CreateBlock(unsigned dso);
 
