@@ -362,6 +362,26 @@ BScreen::GetBrightness(float* brightness)
 }
 
 
+/*!	Where the display output that shows \a frame (in screen coordinates;
+	the output with the most of it) is in its refresh: its frames begin at
+	scan_start + n * period. A program that writes into the frame buffer
+	itself can time its copies by it to keep them off the scan, on each
+	output at its own blanks. When generation changes, the outputs changed:
+	ask again for a window that moved or a layout or mode that changed.
+	Without a blank to go by, flags are 0 and scan_start 0; period is then
+	the display mode's.
+*/
+status_t
+BScreen::GetScanTiming(BRect frame, display_scan_timing* timing)
+{
+	if (timing == NULL)
+		return B_BAD_VALUE;
+	if (fScreen != NULL)
+		return fScreen->GetScanTiming(frame, timing);
+	return B_ERROR;
+}
+
+
 status_t
 BScreen::SetBrightness(float brightness)
 {

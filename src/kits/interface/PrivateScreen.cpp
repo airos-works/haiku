@@ -612,6 +612,25 @@ BPrivateScreen::GetTimingConstraints(display_timing_constraints *constraints)
 
 
 status_t
+BPrivateScreen::GetScanTiming(BRect frame, display_scan_timing* timing)
+{
+	if (!frame.IsValid())
+		frame = Frame();
+
+	BPrivate::AppServerLink link;
+	link.StartMessage(AS_GET_SCAN_TIMING);
+	link.Attach<int32>(ID());
+	link.Attach<BRect>(frame);
+
+	status_t status = B_ERROR;
+	if (link.FlushWithReply(status) == B_OK && status == B_OK)
+		return link.Read<display_scan_timing>(timing);
+
+	return status;
+}
+
+
+status_t
 BPrivateScreen::SetDPMS(uint32 dpmsState)
 {
 	BPrivate::AppServerLink link;

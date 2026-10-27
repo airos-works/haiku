@@ -64,6 +64,35 @@ Programs that write into the frame buffer themselves (`BDirectWindow`) wait
 with `BScreen::WaitForRetrace()` before they write; airTime does since
 `c6d8c0c` (its branch `retrace-sync`; `AIRTIME_NO_VSYNC` turns it off).
 
+`BScreen::WaitForRetrace()` follows one output only (the driver's main
+one). A program that copies into the screen itself, on any output, asks
+`BScreen::GetScanTiming(frame, &timing)` instead (`<Screen.h>`, air/OS):
+for the output that shows most of `frame` (screen coordinates, e.g. the
+window's frame) it gets
+
+- `output_id` (0 when the outputs share one blank, as on `nvidia_rm`, or
+  the driver has no per-output blanks), `frame` and `device_frame` (that
+  output in screen coordinates and in frame buffer pixels);
+- `scan_start` and `period`: frames begin at `scan_start + n * period`
+  (`system_time()` base). With `B_SCAN_TIMING_FROM_HARDWARE` the start is
+  the hardware's own (`amdgpu_kms`, `B_GET_DISPLAY_OUTPUT_SCAN_LINE`); with
+  `B_SCAN_TIMING_FROM_BLANK` it is when the flush thread (or the call itself,
+  waiting for up to two frames when nothing was flushed for a second) saw
+  the blank interrupt; neither flag: no blanks, `scan_start` is 0 and
+  `period` the mode's;
+- `generation`, which changes when outputs, layout or modes change.
+
+`period` comes from the mode in whole microseconds, so a prediction drifts
+(the X399's 3840x2160 mode is 16667.6 us, the call says 16667, ~70 us a
+second); ask again at least once a second. A call takes 0.02 ms.
+
+To keep a copy off the scan: start it right after `scan_start + n * period`
+for a window near the top of the output, or once the scan has passed the
+window's rows (`device_frame` gives the output's rows), and finish before the
+scan comes back. On the X399 (nvidia_rm, 3840x2160 at 200 %,
+`scan_timing_test retrace 120`), `WaitForRetrace()` woke 133 us after the
+predicted start on average, 293 us at worst.
+
 ## Where the blanks come from
 
 | Display | Driver | Source |

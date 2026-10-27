@@ -14,6 +14,7 @@
 #include <GraphicsDefs.h>
 #include <ObjectList.h>
 #include <Rect.h>
+#include <Screen.h>
 
 
 struct color_map;
@@ -83,6 +84,8 @@ public:
 			uint32				DPMSCapabilites();
 
 			status_t			GetBrightness(float*);
+			status_t			GetScanTiming(BRect frame,
+									display_scan_timing* timing);
 			status_t			SetBrightness(float);
 
 private:

@@ -3397,6 +3397,30 @@ ServerApp::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 			break;
 		}
 
+		case AS_GET_SCAN_TIMING:
+		{
+			STRACE(("ServerApp %s: get scan timing\n", Signature()));
+
+			// Attached data: int32 screen id (not used), BRect frame
+			int32 id;
+			BRect frame;
+			link.Read<int32>(&id);
+			status_t status = link.Read<BRect>(&frame);
+
+			display_scan_timing timing;
+			if (status == B_OK) {
+				status = fDesktop->HWInterface()->GetScanTiming(frame,
+					timing);
+			}
+			if (status == B_OK) {
+				fLink.StartMessage(B_OK);
+				fLink.Attach<display_scan_timing>(timing);
+			} else
+				fLink.StartMessage(status);
+			fLink.Flush();
+			break;
+		}
+
 		case AS_GET_TIMING_CONSTRAINTS:
 		{
 			STRACE(("ServerApp %s: get timing constraints\n", Signature()));
