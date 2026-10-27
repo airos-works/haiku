@@ -554,8 +554,9 @@ UpdaterWindow::_ShowState()
 	fSecondaryButton->SetEnabled(!fBusy);
 	fCheckButton->SetEnabled(!fBusy && fState.RunningLatest()
 		&& fMode != kModeRestart);
-	if (showMain)
-		fMainButton->MakeDefault(true);
+	// Not the default button: Enter in the Versions tab's text field would
+	// close the applications and install, or restart.
+	fMainButton->MakeDefault(false);
 	_SelectVersion();
 }
 
@@ -564,8 +565,10 @@ void
 UpdaterWindow::_SetBusy(bool busy, const char* text)
 {
 	fBusy = busy;
-	if (busy)
-		fProgressBar->Reset(text);
+	if (busy) {
+		fProgressBar->Reset();
+		fProgressBar->SetText(text);
+	}
 	_SetVisible(fProgressBar, busy);
 	_ShowState();
 }

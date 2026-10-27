@@ -47,7 +47,7 @@ InstallWindow::InstallWindow(const char* title, const BMessenger& target)
 
 	fProgressBar = new BStatusBar("progress");
 	fProgressBar->SetMaxValue(1.0);
-	fProgressBar->Reset("Preparing the update…");
+	fProgressBar->SetText("Preparing the update…");
 
 	fCancelButton = new BButton("cancel", "Cancel",
 		new BMessage(kMsgCancelInstall));
@@ -101,8 +101,7 @@ void
 InstallWindow::SetRestarting(const char* text)
 {
 	fCancelButton->SetEnabled(false);
-	fProgressBar->Reset(text);
-	fProgressBar->SetTo(1.0);
+	fProgressBar->SetTo(1.0, text);
 }
 
 

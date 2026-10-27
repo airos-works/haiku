@@ -389,6 +389,14 @@ Fetcher::_Fetch(const BString& url, BDataIO* output, off_t rangeStart,
 	}
 
 	if (http != NULL) {
+		if (code >= 300 && code < 400) {
+			// A redirection is followed (GitHub sends every download on to
+			// its CDN): stopping at one means the transfer broke on the way.
+			// Seen on QEMU: worth another attempt.
+			_error.SetToFormat("%s: the transfer stopped at a redirection "
+				"(HTTP %u, %s)", url.String(), code, strerror(error));
+			return B_IO_ERROR;
+		}
 		if (code == 416) {
 			_error.SetToFormat("%s: the server refused to resume",
 				url.String());
