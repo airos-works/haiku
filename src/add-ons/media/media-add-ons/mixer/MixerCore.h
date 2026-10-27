@@ -79,6 +79,17 @@ public:
 
 			uint32				OutputChannelCount();
 
+	// The monitor output gets a float copy of every buffer sent to the
+	// output, so that programs can record what the computer plays.
+	// The group can be NULL until the connection is complete.
+			void				SetMonitor(const media_output& monitor,
+									BBufferGroup* group);
+			void				RemoveMonitor();
+			bool				HasMonitor() const { return fHasMonitor; }
+			media_output&		Monitor() { return fMonitor; }
+			void				EnableMonitor(bool enabled);
+			void				GetMonitorFormat(media_format* format);
+
 private:
 			void				_StartMixThread();
 			void				_StopMixThread();
@@ -86,6 +97,8 @@ private:
 			void				_UpdateResamplers(
 									const media_multi_audio_format& format);
 			void				_ApplyOutputFormat();
+			void				_SendMonitorBuffer(bigtime_t eventTime,
+									bool silent);
 	static	int32				_MixThreadEntry(void* arg);
 			void				_MixThread();
 
@@ -120,6 +133,11 @@ private:
 			thread_id			fMixThread;
 			sem_id				fMixThreadWaitSem;
 			float				fOutputGain;
+
+			media_output		fMonitor;
+			BBufferGroup*		fMonitorGroup;
+			bool				fHasMonitor;
+			bool				fMonitorEnabled;
 
 	friend class MixerInput;
 		// NOTE: debug only

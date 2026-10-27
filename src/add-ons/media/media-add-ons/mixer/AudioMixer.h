@@ -41,6 +41,9 @@ public:
 
 			status_t			SendBuffer(BBuffer* buffer,
 									MixerOutput* output);
+			status_t			SendMonitorBuffer(BBuffer* buffer,
+									const media_output& monitor);
+			void				DropMonitor();
 
 			float				dB_to_Gain(float db);
 			float				Gain_to_dB(float gain);
@@ -133,10 +136,27 @@ private:
 			void				_AutoStart();
 			void				_AutoStop();
 
+			void				_DropMonitorIfGone();
+			status_t			_SpecializeMonitorFormat(media_format* format);
+			status_t			_CreateMonitorBufferGroup(
+									BBufferGroup** _group);
+			status_t			_SetMonitorBufferGroup(BBufferGroup* group);
+			status_t			_PrepareToConnectMonitor(
+									const media_destination& where,
+									media_format* format, media_source* _source,
+									char* _name);
+			void				_ConnectMonitor(status_t error,
+									const media_destination& destination,
+									const media_format& format, char* _name);
+			void				_DisconnectMonitor(
+									const media_destination& where);
+			void				_UpdateMonitorFormat();
+
 			BMediaAddOn*		fAddOn;
 			MixerCore*			fCore;
 			BParameterWeb*		fWeb;
 			BBufferGroup*		fBufferGroup;
+			BBufferGroup*		fMonitorBufferGroup;
 			bigtime_t			fDownstreamLatency;
 			bigtime_t			fInternalLatency;
 			bool				fAutoStop;

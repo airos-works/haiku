@@ -6,6 +6,10 @@ SimpleTest media_track_times_test :
 	media_track_times_test.cpp
 	: media be ;
 
+SimpleTest mixer_monitor_test :
+	mixer_monitor_test.cpp
+	: media be ;
+
 SimpleTest VideoDecoder :
 	VideoDecoder.cpp
 	: media be ;
