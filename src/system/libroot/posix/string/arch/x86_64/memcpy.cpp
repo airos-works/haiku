@@ -15,6 +15,9 @@
 namespace {
 
 
+static const uintptr_t kPageSize = 4096;
+
+
 // __m128i resolves to a type with an attribute, which can't get into the
 // template signature, resulting in a warning. Nonetheless the code is what we
 // expect, so we silent the warning.
@@ -151,6 +154,18 @@ memcpy(void* destination, const void* source, size_t length)
 		memcpy_sse(to, from, length);
 		return destination;
 	}
+
+	// rep movsb slows down about 14 times when the destination is less than
+	// 16 bytes from the source, modulo the page size (4K aliasing; a
+	// Threadripper 1950X copies at 2.4 instead of 34 GB/s). The SSE loop
+	// keeps its speed there.
+	uintptr_t distance = (reinterpret_cast<uintptr_t>(to)
+		- reinterpret_cast<uintptr_t>(from)) & (kPageSize - 1);
+	if (distance != 0 && (distance < 16 || distance > kPageSize - 16)) {
+		memcpy_sse(to, from, length);
+		return destination;
+	}
+
 	memcpy_repmovs(to, from, length);
 	return destination;
 }
