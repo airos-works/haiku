@@ -67,6 +67,10 @@ struct rld_export {
 		// get_tls_address(). The vector starts with a pointer to its
 		// generation and size (two unsigned), then holds a block pointer
 		// per TLS image ID.
+
+	void (*prepare_for_exit)();
+		// exit() calls it first: dlopen() and dlclose() calls under way end,
+		// and other threads' later ones wait for the team to end.
 };
 
 extern struct rld_export *__gRuntimeLoader;
