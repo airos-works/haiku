@@ -10,6 +10,11 @@ SimpleTest LayersTest :
 	: be [ TargetLibstdc++ ] [ TargetLibsupc++ ]
 ;
 
+SimpleTest layer_clipping_test :
+	layer_clipping_test.cpp
+	: be
+;
+
 if $(TARGET_PLATFORM) = libbe_test {
 	HaikuInstall install-test-apps : $(HAIKU_APP_TEST_DIR) : LayersTest
 		: tests!apps ;
