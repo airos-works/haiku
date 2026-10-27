@@ -42,11 +42,12 @@ public:
 								block_run& run);
 			status_t		Allocate(Transaction& transaction, Inode* inode,
 								off_t numBlocks, block_run& run,
-								uint16 minimum = 1);
+								uint16 minimum = 1, off_t needed = 0);
 
 			status_t		AllocateBlocks(Transaction& transaction,
 								int32 group, uint16 start, uint16 numBlocks,
-								uint16 minimum, block_run& run);
+								uint16 minimum, block_run& run,
+								uint16 needed = 0);
 			status_t		AllocateBlockRun(Transaction& transaction,
 									  block_run run);
 			status_t		AllocateBlocks(Transaction& transaction, off_t start, off_t length);
