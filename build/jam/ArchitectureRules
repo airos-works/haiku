@@ -219,9 +219,9 @@ rule SetCPUProfile architecture : profile
 	#
 	# Profiles:
 	#	rpi4: Cortex-A72 (Raspberry Pi 4). Schedules for the A72 and inlines
-	#		atomics: the A72 has no LSE, and Haiku's libgcc never selects the
-	#		LSE path of its outlined helpers, so they are a call per atomic
-	#		operation for nothing.
+	#		atomics: the A72 has no LSE, so the outlined helpers (which pick
+	#		LSE where the CPU has it, see glue/init_term_dyn.c) are a call per
+	#		atomic operation for nothing.
 
 	local flags ;
 	switch $(HAIKU_CPU_$(architecture)):$(profile) {
