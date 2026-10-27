@@ -8,6 +8,8 @@
 #include <support/TLS.h>
 #include <tls.h>
 
+#include <arch_elf.h>
+
 
 struct tls_index {
 	unsigned long ti_module;
@@ -64,5 +66,19 @@ tls_set(int32 index, void *value)
 void*
 __tls_get_addr(struct tls_index* ti)
 {
+	// The common case without a call into the runtime loader: this thread's
+	// vector is of the current generation and has the image's block.
+	void** vector = (void**)get_tls()[TLS_DYNAMIC_THREAD_VECTOR];
+	const int32* generation = __gRuntimeLoader->tls_generation;
+	if (vector != NULL && generation != NULL) {
+		const unsigned* vectorGeneration = (const unsigned*)vector[0];
+		if (ti->ti_module < vectorGeneration[1]
+			&& vectorGeneration[0] == (unsigned)*generation) {
+			void* block = vector[ti->ti_module + 1];
+			if (block != NULL)
+				return (uint8*)block + TLS_DTV_OFFSET + ti->ti_offset;
+		}
+	}
+
 	return __gRuntimeLoader->get_tls_address(ti->ti_module, ti->ti_offset);
 }

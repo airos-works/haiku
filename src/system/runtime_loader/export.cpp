@@ -82,7 +82,9 @@ struct rld_export gRuntimeLoader = {
 	// the following values will be set later
 	NULL,	// program_args
 	NULL,	// commpage_address
-	0		// ABI version
+	0,		// ABI version
+	0,		// API version
+	NULL	// tls_generation
 };
 
 rld_export* __gRuntimeLoader = &gRuntimeLoader;
@@ -93,6 +95,8 @@ rldexport_init(void)
 {
 	gRuntimeLoader.program_args = gProgramArgs;
 	gRuntimeLoader.commpage_address = __gCommPageAddress;
+	gRuntimeLoader.tls_generation
+		= TLSBlockTemplates::Get().GenerationAddress();
 }
 
 
