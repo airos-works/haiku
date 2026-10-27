@@ -997,8 +997,12 @@ free_vnode(struct vnode* vnode, bool reenter)
 	// if the vnode won't be deleted, in which case the changes
 	// will be discarded
 
-	if (!vnode->IsRemoved() && HAS_FS_CALL(vnode, fsync))
-		FS_CALL(vnode, fsync, false);
+	if (!vnode->IsRemoved() && HAS_FS_CALL(vnode, fsync)) {
+		// only the data needs to go back, this is no request to make it
+		// durable (that would cost a journal commit for every unlink, whose
+		// parent directory is freed here)
+		FS_CALL(vnode, fsync, true);
+	}
 
 	// Note: If this vnode has a cache attached, there will still be two
 	// references to that cache at this point. The last one belongs to the vnode
