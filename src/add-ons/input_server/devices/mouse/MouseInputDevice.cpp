@@ -384,6 +384,7 @@ MouseDevice::_ControlThread()
 
 	while (fActive) {
 		mouse_movement movements;
+		scroll_movement scroll = { 0, 0, B_WHEEL_PHASE_NONE };
 
 #if USE_REGULAR_INTERVAL
 		snooze_until(nextTransferTime, B_SYSTEM_TIMEBASE);
@@ -419,7 +420,7 @@ MouseDevice::_ControlThread()
 
 			if (read.event == MS_READ_TOUCHPAD) {
 				status = fTouchpadMovementMaker.EventToMovement(&read.u.touchpad,
-					&movements, touchpadEventTimeout);
+					&movements, touchpadEventTimeout, &scroll);
 				if (status == B_OK)
 					lastTouchpadMovement = read.u.touchpad;
 			} else if (read.event == MS_READ) {
@@ -486,7 +487,11 @@ MouseDevice::_ControlThread()
 				fTarget.EnqueueMessage(message);
 		}
 
-		if (movements.wheel_ydelta != 0 || movements.wheel_xdelta != 0) {
+		// A touchpad also reports the scrolling between whole wheel steps
+		// (be:wheel_delta_* stay whole steps, which existing programs expect)
+		// and where the gesture is: began, changed, ended.
+		if (movements.wheel_ydelta != 0 || movements.wheel_xdelta != 0
+			|| scroll.phase != B_WHEEL_PHASE_NONE) {
 			BMessage* message = new BMessage(B_MOUSE_WHEEL_CHANGED);
 			if (message == NULL)
 				continue;
@@ -499,7 +504,14 @@ MouseDevice::_ControlThread()
 				&& message->AddInt32("be:device_subtype",
 					fIsTouchpad
 						? B_TOUCHPAD_POINTING_DEVICE
-						: B_MOUSE_POINTING_DEVICE) == B_OK)
+						: B_MOUSE_POINTING_DEVICE) == B_OK
+				&& (scroll.phase == B_WHEEL_PHASE_NONE
+					|| (message->AddFloat("be:wheel_precise_delta_x",
+							scroll.x) == B_OK
+						&& message->AddFloat("be:wheel_precise_delta_y",
+							scroll.y) == B_OK
+						&& message->AddInt32("be:wheel_phase",
+							scroll.phase) == B_OK)))
 				fTarget.EnqueueMessage(message);
 			else
 				delete message;
