@@ -29,10 +29,32 @@
 	A pulse shorter than the interrupt's latency shows up as two events with
 	the same time. An input that changes faster than the driver can report
 	(tens of thousands of edges a second) is sampled instead for a while; the
-	events then carry RPI_GPIO_EVENT_SAMPLED. */
+	events then carry RPI_GPIO_EVENT_SAMPLED.
+
+	Other boards' pin headers have the same interface under another name;
+	rpi_gpio_info.board says which board and so what the pin numbers and
+	function values mean:
+
+	RPI_GPIO_BOARD_RPI4: /dev/misc/rpi_gpio, the BCM2711's GPIO numbers and
+	function select values, as described above. Drivers from before the
+	board field existed left it 0, which is this board.
+
+	RPI_GPIO_BOARD_CUBIE_A7S: /dev/misc/sunxi_gpio (Radxa Cubie A7S,
+	Allwinner A733). Its 30-pin header J11 and 15-pin header J6 carry pins
+	of the A733's PIO and R_PIO ports (PB0, PD14, PL5...). Pin n is pin n of
+	J11 (1 to 30) and pin n - 30 of J6 (31 to 45); the numbers of power and
+	ground pins are never claimable and read as low inputs. function[] holds
+	the A733's pin multiplexer values: 0 input, 1 output, 2 to 13 the
+	peripheral functions, 14 the interrupt input, 15 switched off (the state
+	after reset). Pull values are the same as the Pi's. */
 
 #define RPI_GPIO_DEVICE_PATH	"/dev/misc/rpi_gpio"
+#define SUNXI_GPIO_DEVICE_PATH	"/dev/misc/sunxi_gpio"
 #define RPI_GPIO_API_VERSION	1
+
+// rpi_gpio_info.board
+#define RPI_GPIO_BOARD_RPI4			0
+#define RPI_GPIO_BOARD_CUBIE_A7S	1
 
 #define RPI_GPIO_MAX_PINS		64
 
@@ -65,12 +87,13 @@ enum {
 
 struct rpi_gpio_info {
 	uint32		api_version;		// RPI_GPIO_API_VERSION
-	uint32		pin_count;			// 58
+	uint32		pin_count;			// 58 (Pi 4), 46 (Cubie A7S)
 	uint64		claimable;			// bit n: pin n can be claimed
-	uint32		board_revision;		// the firmware's revision code, or 0
+	uint32		board_revision;		// the Pi firmware's revision code, or 0
 	uint32		flags;
 	uint64		board_serial;		// or 0
-	uint32		_reserved[8];
+	uint32		board;				// RPI_GPIO_BOARD_*
+	uint32		_reserved[7];
 };
 
 struct rpi_gpio_state {

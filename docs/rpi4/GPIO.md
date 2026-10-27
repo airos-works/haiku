@@ -16,6 +16,9 @@ attribution and the user guide).
 - Finds the controller by `brcm,bcm2711-gpio` in the device tree (registers
   at 0xfe200000, bank 0's interrupt GIC SPI 113). On another board it
   publishes nothing.
+- `RPI_GPIO_GET_INFO` says `board` `RPI_GPIO_BOARD_RPI4` (0, also what
+  drivers before the field left there). The Radxa Cubie A7S's `sunxi_gpio`
+  offers the same interface for its headers (`docs/cubie-a7s/GPIO.md`).
 - Everybody may read all 58 pins' function, pull and level
   (`RPI_GPIO_GET_STATE`). The firmware's board revision and serial number come
   with `RPI_GPIO_GET_INFO`.

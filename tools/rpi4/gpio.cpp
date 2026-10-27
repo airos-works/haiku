@@ -3,7 +3,10 @@
  * Distributed under the terms of the MIT License.
  */
 
-/*	Lab tool for /dev/misc/rpi_gpio (<rpi_gpio.h>).
+/*	Lab tool for /dev/misc/rpi_gpio (<rpi_gpio.h>), and for its Radxa Cubie
+	A7S twin /dev/misc/sunxi_gpio (built as cubie_gpio): the first of the
+	two that exists. Pins are the driver's numbers (the Cubie's are header
+	positions, J6 pin n being 30 + n).
 
 	rpi4_gpio info
 	rpi4_gpio state
@@ -13,7 +16,8 @@
 	rpi4_gpio selftest [pin]				needs nothing wired to the pin
 
 	The self test drives the pin through its pull resistors and as an
-	output, so the pin must be free (default GPIO 26, header pin 37). */
+	output, so the pin must be free (default GPIO 26, header pin 37, on the
+	Pi; J11 pin 26, PD14, on the Cubie). */
 
 
 #include <errno.h>
@@ -33,20 +37,50 @@
 static const char* kFunctionNames[] = {
 	"input", "output", "alt5", "alt4", "alt0", "alt1", "alt2", "alt3"
 };
+// the A733's pin multiplexer values
+static const char* kSunxiFunctionNames[] = {
+	"input", "output", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10",
+	"f11", "f12", "f13", "eint", "off"
+};
 static const char* kPullNames[] = { "none", "up", "down", "?" };
 
 static int sFailures;
+static const char* sDevicePath;
+static uint32 sBoard;
 
 
 static int
 open_device()
 {
-	int fd = open(RPI_GPIO_DEVICE_PATH, O_RDWR);
-	if (fd < 0) {
-		fprintf(stderr, "%s: %s\n", RPI_GPIO_DEVICE_PATH, strerror(errno));
-		exit(1);
+	static const char* kPaths[] = {
+		RPI_GPIO_DEVICE_PATH, SUNXI_GPIO_DEVICE_PATH
+	};
+	for (const char* path : kPaths) {
+		if (sDevicePath != NULL && strcmp(path, sDevicePath) != 0)
+			continue;
+		int fd = open(path, O_RDWR);
+		if (fd < 0)
+			continue;
+		if (sDevicePath == NULL) {
+			sDevicePath = path;
+			rpi_gpio_info info;
+			if (ioctl(fd, RPI_GPIO_GET_INFO, &info, sizeof(info)) == 0)
+				sBoard = info.board;
+		}
+		return fd;
 	}
-	return fd;
+	fprintf(stderr, "%s, %s: %s\n", RPI_GPIO_DEVICE_PATH,
+		SUNXI_GPIO_DEVICE_PATH, strerror(errno));
+	exit(1);
+}
+
+
+static const char*
+function_name(uint8 function)
+{
+	if (sBoard == RPI_GPIO_BOARD_CUBIE_A7S)
+		return kSunxiFunctionNames[function & 15];
+	return kFunctionNames[function & 7];
 }
 
 
@@ -171,10 +205,10 @@ do_info()
 		fprintf(stderr, "GET_INFO: %s\n", strerror(errno));
 		return 1;
 	}
-	printf("api %" B_PRIu32 ", %" B_PRIu32 " pins, claimable %#" B_PRIx64
-		", board revision %#" B_PRIx32 ", serial %016" B_PRIx64 ", %s\n",
-		info.api_version, info.pin_count, info.claimable, info.board_revision,
-		info.board_serial,
+	printf("%s: api %" B_PRIu32 ", board %" B_PRIu32 ", %" B_PRIu32 " pins,"
+		" claimable %#" B_PRIx64 ", board revision %#" B_PRIx32 ", serial %016"
+		B_PRIx64 ", %s\n", sDevicePath, info.api_version, info.board,
+		info.pin_count, info.claimable, info.board_revision, info.board_serial,
 		(info.flags & RPI_GPIO_INFO_EDGE_INTERRUPTS) != 0
 			? "edge interrupts" : "sampled inputs");
 	close(fd);
@@ -186,10 +220,14 @@ static int
 do_state()
 {
 	int fd = open_device();
+	rpi_gpio_info info;
+	if (control(fd, RPI_GPIO_GET_INFO, &info) != B_OK)
+		info.pin_count = 58;
 	rpi_gpio_state state = state_of(fd);
-	for (uint32 pin = 0; pin < 58; pin++) {
+	for (uint32 pin = 0; pin < info.pin_count && pin < RPI_GPIO_MAX_PINS;
+			pin++) {
 		printf("GPIO%-2" B_PRIu32 " %-6s pull %-4s level %d%s\n", pin,
-			kFunctionNames[state.function[pin] & 7],
+			function_name(state.function[pin]),
 			kPullNames[state.pull[pin] & 3], (int)((state.levels >> pin) & 1),
 			(state.claimed_elsewhere >> pin) & 1 ? "  (claimed)" : "");
 	}
@@ -271,22 +309,31 @@ do_selftest(int argc, char** argv)
 	rpi_gpio_event events[4096];
 
 	int fd = open_device();
+	bool cubie = sBoard == RPI_GPIO_BOARD_CUBIE_A7S;
 	rpi_gpio_info info;
 	check(control(fd, RPI_GPIO_GET_INFO, &info) == B_OK
-		&& info.api_version == RPI_GPIO_API_VERSION && info.pin_count == 58,
-		"info: api %" B_PRIu32 ", %" B_PRIu32 " pins, revision %#" B_PRIx32,
-		info.api_version, info.pin_count, info.board_revision);
+		&& info.api_version == RPI_GPIO_API_VERSION
+		&& info.pin_count == (cubie ? 46 : 58),
+		"info: %s, api %" B_PRIu32 ", board %" B_PRIu32 ", %" B_PRIu32
+		" pins, revision %#" B_PRIx32, sDevicePath, info.api_version,
+		info.board, info.pin_count, info.board_revision);
 	bool interrupts = (info.flags & RPI_GPIO_INFO_EDGE_INTERRUPTS) != 0;
 	printf("     inputs: %s\n", interrupts ? "edge interrupts" : "sampled");
 
 	rpi_gpio_state before = state_of(fd);
 	check((before.claimed_elsewhere & bit) == 0, "GPIO%" B_PRIu32
-		" is free: %s, pull %s", pin, kFunctionNames[before.function[pin] & 7],
+		" is free: %s, pull %s", pin, function_name(before.function[pin]),
 		kPullNames[before.pull[pin] & 3]);
 
-	// not a header pin
-	check(claim(fd, 30, RPI_GPIO_INPUT, RPI_GPIO_PULL_UP, -1) == B_BAD_VALUE,
-		"GPIO30 (Bluetooth) cannot be claimed");
+	// not a header pin, or the Cubie's serial console
+	check(claim(fd, cubie ? 8 : 30, RPI_GPIO_INPUT, RPI_GPIO_PULL_UP, -1)
+			== B_BAD_VALUE,
+		cubie ? "J11 pin 8 (the serial console) cannot be claimed"
+			: "GPIO30 (Bluetooth) cannot be claimed");
+	if (cubie) {
+		check(claim(fd, 1, RPI_GPIO_INPUT, RPI_GPIO_PULL_UP, -1)
+				== B_BAD_VALUE, "J11 pin 1 (3.3 V) cannot be claimed");
+	}
 
 	// input, pulled up
 	status_t status = claim(fd, pin, RPI_GPIO_INPUT, RPI_GPIO_PULL_UP, -1);
@@ -404,7 +451,7 @@ do_selftest(int argc, char** argv)
 	state = state_of(fd);
 	check(state.function[pin] == before.function[pin]
 		&& state.pull[pin] == before.pull[pin] && (state.claimed & bit) == 0,
-		"released: back to %s, pull %s", kFunctionNames[state.function[pin] & 7],
+		"released: back to %s, pull %s", function_name(state.function[pin]),
 		kPullNames[state.pull[pin] & 3]);
 
 	// closing gives the pin back
