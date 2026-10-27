@@ -12,6 +12,7 @@
 #include <map>
 
 #include <OS.h>
+#include <locks.h>
 
 
 namespace BPrivate {
@@ -39,6 +40,7 @@ public:
 			void				RemoveArea(area_id serverArea);
 
 private:
+			mutex				fLock;
 			std::map<area_id, area_mapping>
 								fAreas;
 };

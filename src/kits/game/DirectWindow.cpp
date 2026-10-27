@@ -488,9 +488,9 @@ BDirectWindow::_DirectDaemon()
 				fConnectionEnable = true;
 
 			if (fBufferDesc->bits == NULL) {
-				// (re-)clone the bits area
-				BPrivate::AppServerLink linkLocker;
-					// protects ServerAllocator
+				// (re-)clone the bits area; not under the application's
+				// app_server link, which another thread may hold waiting
+				// for app_server - which waits for this
 				BPrivate::ServerMemoryAllocator* allocator
 					= BApplication::Private::ServerAllocator();
 				allocator->RemoveArea(fSourceBitsArea);
@@ -635,9 +635,17 @@ BDirectWindow::_DisposeData()
 {
 	// wait until the connection terminates: we can't destroy
 	// the object until the client receives the B_DIRECT_STOP
-	// notification, or bad things will happen
-	while (fConnectionEnable)
+	// notification, or bad things will happen. A connection app_server
+	// gave up on (DirectConnected() took too long) never gets one: it
+	// deleted the semaphores, which ended the daemon thread.
+	bigtime_t giveUp = system_time() + 2000000;
+	while (fConnectionEnable && system_time() < giveUp) {
+		thread_info info;
+		if ((fInitStatus & DW_STATUS_THREAD_STARTED) != 0
+			&& get_thread_info(fDirectDaemonId, &info) != B_OK)
+			break;
 		snooze(50000);
+	}
 
 	_LockDirect();
 
