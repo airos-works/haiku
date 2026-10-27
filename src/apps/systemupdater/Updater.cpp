@@ -28,6 +28,7 @@
 #include <Partition.h>
 #include <Path.h>
 #include <Roster.h>
+#include <Url.h>
 #include <Volume.h>
 #include <VolumeRoster.h>
 #include <fs_info.h>
@@ -401,6 +402,8 @@ Updater::Check(Feed& _feed, BString& _error)
 {
 	BString url = FeedURL();
 	_Status("Asking %s…", url.String());
+	if (url.StartsWith("https://"))
+		_CheckClockForSecureFeed(url);
 	status_t error = _feed.Fetch(url, fFetcher, _error);
 	if (error == B_OK)
 		_CheckClock();
@@ -629,6 +632,31 @@ Updater::_CheckClock()
 		set_real_time_clock(server);
 		Log("the clock was before this release was built; set it from the "
 			"build server's");
+	}
+}
+
+
+/*!	A board without a battery-backed clock starts in 1970, when no
+	certificate is valid yet: before an HTTPS feed can answer, the clock is
+	set from its host's answer (Fetcher::FetchServerTime()).
+*/
+void
+Updater::_CheckClockForSecureFeed(const BString& url)
+{
+	Release installed;
+	time_t built = LoadInstalledRelease(installed) == B_OK
+		? installed_build_time(installed) : 0;
+	time_t now = time(NULL);
+	if (built <= 0 || now >= built)
+		return;
+	time_t server = fFetcher.FetchServerTime(url);
+	if (server > now + 3600) {
+		set_real_time_clock(server);
+		Log("the clock was before this release was built; set it from %s's",
+			BUrl(url.String(), true).Host().String());
+	} else {
+		Log("the clock is before this release was built, and %s did not "
+			"tell the time", BUrl(url.String(), true).Host().String());
 	}
 }
 

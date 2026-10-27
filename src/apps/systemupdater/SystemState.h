@@ -102,6 +102,11 @@ public:
 	static	LastBoot			ReadLastBoot();
 	static	bool				IsFailedRelease(const char* version);
 	static	status_t			AddFailedRelease(const char* version);
+	static	status_t			RecordFailedInstall(const char* title,
+									const char* error);
+	static	bool				ReadFailedInstall(BString& _title,
+									BString& _error);
+	static	void				ClearFailedInstall();
 
 	static	status_t			WriteFileAtomically(const char* path,
 									const BString& content);

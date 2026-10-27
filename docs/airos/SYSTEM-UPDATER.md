@@ -1,8 +1,9 @@
 # System Updater
 
-air/OS keeps itself current from the build server: **System Updater**
-(Deskbar › Applications) finds a newer CI build of the whole system, shows
-what changed, downloads it and installs it at the next restart. Every
+air/OS keeps itself current from CI builds published on GitHub: **System
+Updater** (Deskbar › Applications) finds a newer CI build of the whole
+system, shows what changed, downloads it and installs it at the next
+restart. Every
 installed version stays bootable until two newer ones have proven
 themselves, from the boot loader and from System Updater. A version that
 does not start is replaced by the one before it without help.
@@ -10,8 +11,16 @@ does not start is replaced by the one before it without help.
 ## Using it
 
 - **System Updater** (Deskbar › Applications) checks when it opens. *Install
-  and Restart* downloads the release, checks every file, installs it for the
-  next start and restarts. Nothing changes in the running system.
+  and Reboot* first closes the applications the way a shutdown does: each
+  one may ask to save its work, and one that stays open (the user chose
+  *Cancel* in its save dialog) stops it all, with nothing installed. Then a
+  window in front of everything downloads the release, checks every file,
+  installs it for the next start and restarts. *Cancel* works until the
+  install itself begins. Nothing changes in the running system.
+- If installing fails after the applications were closed (a download that
+  does not come through, a file that does not match), the computer restarts
+  all the same, into the version it ran; System Updater then opens and says
+  what went wrong (`install-failed`, below).
 - After the restart the update is *on trial*: once the desktop has stayed up
   for half a minute it is confirmed. If it does not get there twice (a hang,
   a panic, no desktop), the next start is the version before it, and System
@@ -25,8 +34,11 @@ does not start is replaced by the one before it without help.
 - The command line does everything the window does: `SystemUpdater --status`,
   `--check`, `--plan`, `--update`, `--restart-into <state>`, `--go-back
   <state>`, `--retry`, `--remove-failed`, `--confirm`, `--prune`.
-- The update server is `http://192.168.1.200/updates/<target>/`, named by
-  the installed release; *Versions* › *Update server* overrides it.
+- Updates come from GitHub Releases:
+  `https://github.com/jmgasper/haiku/releases/download/updates-<target>/`,
+  named by the installed release (releases before 28 October 2026 name the
+  build server, `http://192.168.1.200/updates/<target>/`, until their first
+  update). *Versions* › *Updates from* overrides it, for a test feed.
 
 ## What an update is
 
@@ -48,9 +60,10 @@ Each release carries two packages of its own:
 
 ## The feed
 
-The build server publishes each target's releases next to its images:
+The build server keeps each target's releases next to its images:
 `http://192.168.1.200/updates/<target>/` (Haiku cannot resolve
-`airos-build.local`).
+`airos-build.local`), and CI mirrors the newest six to GitHub Releases, where
+machines find them (below).
 
 ```
 index.json                    the releases, newest first, with their changes
@@ -73,6 +86,28 @@ earlier SHA-256s as `equivalent`; System Updater keeps an installed copy whose
 SHA-256 is among them. Between two CI builds of 26 October this cut an
 update from 24 packages (468 MiB) to 13 (249 MiB).
 
+### On GitHub
+
+`airos-ci images/publish-feed-github.py TARGET` (the images workflow's last
+step) mirrors the feed to jmgasper/haiku's Releases, all prereleases:
+
+| Release | Assets |
+|---|---|
+| `updates-<target>` | `index.json`: the feed's index, every address in it absolute |
+| `update-<target>-<release id>` | the release's `update.json` and the packages (and the Pi's boot files) that no earlier mirrored release has |
+
+A package is uploaded once, to the release that brought it; later
+`update.json` files point at that asset. An `equivalent` rebuild is not
+uploaded at all: the mirrored `update.json` lists the copy already on GitHub
+(its SHA-256 and size, the rebuild's SHA-256 among the `equivalent` ones, so
+a machine installed from the image keeps its copy). After the first release
+of a target, a mirror uploads 75–250 MiB. `index.json` is replaced last, once
+everything it names is there; releases it no longer names are deleted once
+no kept release uses their packages. GitHub sends each download from its CDN
+(a redirect to `release-assets.githubusercontent.com`), which resumes a
+transfer cut short. arm64 machines download over HTTPS since CI builds their
+`libbnetapi` with its own OpenSSL (`HAIKU_ARM64_OPENSSL_PACKAGE`).
+
 ## On the machine
 
 System Updater keeps its state on the system volume, in
@@ -83,6 +118,7 @@ System Updater keeps its state on the system volume, in
 | `releases/<id>.json` | System Updater | System Updater | the `update.json` of each installed release: which packages it had, for removing ones a later release drops |
 | `downloads/` | System Updater | System Updater | packages being downloaded; reused when an update is tried again |
 | `next-boot` | System Updater | boot loader | a state to start once ("Restart into this version") |
+| `install-failed` | System Updater | System Updater | an update that could not be installed before the restart it asked for: the release's title and the error, shown (and deleted) when System Updater next opens; the boot check opens it |
 | `trial` | System Updater | boot loader | an installed update that has not started yet: its release and the state to fall back to |
 | `trial-attempts` | kernel | boot loader | one line per start of the release on trial |
 | `log` | System Updater | people | what was done |
@@ -126,7 +162,11 @@ Package states are named after the time they were made and ordered by
 name, so the clock has to be about right. Boards without a battery-backed
 clock start in 1970 until they reach a time server: when the clock is
 earlier than the installed release's own build, System Updater sets it from
-the build server's `Date` header, and installs nothing until it is right.
+the feed's `Date` header, and installs nothing until it is right. An HTTPS
+feed cannot answer before that (no certificate is valid in 1970), so for
+one System Updater first asks the feed's host (`https://github.com/`) for
+the time, accepting a certificate that is "not yet valid" and nothing
+else; GitHub's plain HTTP answers carry no `Date`.
 
 ### Older versions
 
@@ -188,6 +228,8 @@ loader cannot read BFS. So on the Pi:
    adds it to `updates/<target>/` with what changed since the release before
    it: the Haiku commits (`git log`), the packages whose versions changed and
    the commits of the pinned applications.
+4. `images/publish-feed-github.py TARGET` mirrors that feed to GitHub
+   Releases (*On GitHub* above).
 
 A release image has no Haiku package repository (upstream Haiku's `haiku`
 package would replace air/OS's) and no Deskbar entry for SoftwareUpdater,

@@ -47,6 +47,11 @@ enum {
 	B_REG_GET_DISK_DEVICE_MESSENGER			= 'rgdm',
 	B_REG_SHUT_DOWN							= 'rgsh',
 	B_REG_IS_SHUT_DOWN_IN_PROGRESS			= 'rgsi',
+	B_REG_QUIT_USER_APPS					= 'rgqu',
+		// the first phase of a shutdown only: the user's applications quit
+		// (each may ask to save its work, or refuse), the sender keeps
+		// running; replies B_REG_SUCCESS, or B_REG_ERROR with "error"
+		// (B_SHUTDOWN_CANCELLED) and "app", the one that refused
 
 	// roster requests
 	B_REG_ADD_APP							= 'rgaa',

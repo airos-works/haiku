@@ -37,6 +37,11 @@ public:
 									DownloadListener* listener = NULL);
 									// resumes a partial file
 
+			time_t				FetchServerTime(const BString& url);
+									// from the Date of its host's answer,
+									// certificate dates unchecked; 0 if
+									// none
+
 			void				Cancel();
 			bool				IsCancelled() const;
 			void				Reset()

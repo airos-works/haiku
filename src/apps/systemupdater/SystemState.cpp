@@ -484,6 +484,43 @@ SystemState::IsFailedRelease(const char* version)
 }
 
 
+/*!	An update that could not be installed when System Updater had closed the
+	applications for it: the computer restarts all the same, and System
+	Updater says what went wrong after the restart.
+*/
+/*static*/ status_t
+SystemState::RecordFailedInstall(const char* title, const char* error)
+{
+	EnsureDirectory(kStateDirectory);
+	BString text;
+	text << title << "\n" << error << "\n";
+	return WriteFileAtomically(kInstallFailedFile, text);
+}
+
+
+/*static*/ bool
+SystemState::ReadFailedInstall(BString& _title, BString& _error)
+{
+	BString text;
+	if (read_text_file(kInstallFailedFile, text) != B_OK)
+		return false;
+	int32 newline = text.FindFirst('\n');
+	if (newline < 0)
+		newline = text.Length();
+	text.CopyInto(_title, 0, newline);
+	text.CopyInto(_error, newline + 1, text.Length() - newline - 1);
+	_error.Trim();
+	return true;
+}
+
+
+/*static*/ void
+SystemState::ClearFailedInstall()
+{
+	unlink(kInstallFailedFile);
+}
+
+
 /*static*/ status_t
 SystemState::AddFailedRelease(const char* version)
 {

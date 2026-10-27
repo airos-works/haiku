@@ -25,6 +25,9 @@
 #define kCheckFile				kStateDirectory "/last-check"
 #define kFailedFile				kStateDirectory "/failed"
 	// the versions of releases that did not start, one per line
+#define kInstallFailedFile		kStateDirectory "/install-failed"
+	// an update that could not be installed before the restart: the
+	// release's title, then the error; shown after the restart
 
 // what the airos_release and airos_payload packages install
 #define kReleaseFile			"/boot/system/data/airos/release"
@@ -36,8 +39,11 @@
 #define kReleasePackageName		"airos_release"
 #define kPayloadPackageName		"airos_payload"
 
-// where an installation without an airos_release package looks
-#define kDefaultFeedBase		"http://192.168.1.200/updates/"
+// where an installation without an airos_release package looks: the
+// rolling GitHub release updates-<target> of jmgasper/haiku holds the
+// target's index.json (airos-ci images/publish-feed-github.py)
+#define kDefaultFeedBase		"https://github.com/jmgasper/haiku/releases/" \
+									"download/updates-"
 
 // the user's settings
 #define kSettingsFileName		"SystemUpdater"

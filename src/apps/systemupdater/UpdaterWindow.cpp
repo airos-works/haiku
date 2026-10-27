@@ -17,6 +17,7 @@
 #include <File.h>
 #include <LayoutBuilder.h>
 #include <ListView.h>
+#include <MessageRunner.h>
 #include <Roster.h>
 #include <ScrollView.h>
 #include <SeparatorView.h>
@@ -30,6 +31,7 @@
 #include <airos_boot_control.h>
 
 #include "Constants.h"
+#include "InstallWindow.h"
 #include "PiBoot.h"
 #include "Release.h"
 #include "UpdateWorker.h"
@@ -45,8 +47,16 @@ enum {
 	kMsgRestartInto			= 'rint',
 	kMsgGoBackButton		= 'gbtn',
 	kMsgAutomaticChanged	= 'auto',
-	kMsgFeedChanged			= 'feed'
+	kMsgFeedChanged			= 'feed',
+	kMsgShowFailedInstall	= 'sfin',
+	kMsgRestartStalled		= 'rsst'
 };
+
+
+// how long the window with the error of a failed install stays up before
+// the restart, and how long a restart may take to begin
+static const bigtime_t kFailedRestartDelay = 4000000;
+static const bigtime_t kRestartStallDelay = 30000000;
 
 
 // #pragma mark - VersionItem
@@ -124,6 +134,9 @@ UpdaterWindow::UpdaterWindow()
 		B_AUTO_UPDATE_SIZE_LIMITS | B_ASYNCHRONOUS_CONTROLS
 			| B_QUIT_ON_WINDOW_CLOSE),
 	fWorker(NULL),
+	fInstallWindow(NULL),
+	fRestartRunner(NULL),
+	fRestarting(false),
 	fMode(kModeIdle),
 	fBusy(false)
 {
@@ -155,11 +168,17 @@ UpdaterWindow::UpdaterWindow()
 	_Refresh();
 	if (fMode == kModeIdle)
 		_StartCheck();
+
+	// an update that could not be installed before the last restart
+	BString failedTitle, failedError;
+	if (SystemState::ReadFailedInstall(failedTitle, failedError))
+		PostMessage(kMsgShowFailedInstall);
 }
 
 
 UpdaterWindow::~UpdaterWindow()
 {
+	delete fRestartRunner;
 	if (fWorker != NULL) {
 		fWorker->Cancel();
 		fWorker->Lock();
@@ -210,7 +229,7 @@ UpdaterWindow::_CreateUpdatesTab()
 		new BMessage(kMsgCancelButton));
 	fSecondaryButton = new BButton("secondary", "",
 		new BMessage(kMsgSecondaryButton));
-	fMainButton = new BButton("main", "Install Update",
+	fMainButton = new BButton("main", "Install and Reboot",
 		new BMessage(kMsgMainButton));
 
 	BView* view = new BView("Updates", 0);
@@ -277,7 +296,7 @@ UpdaterWindow::_CreateVersionsTab()
 		? B_CONTROL_ON : B_CONTROL_OFF);
 
 	Updater updater;
-	fFeedControl = new BTextControl("feed", "Update server:", "",
+	fFeedControl = new BTextControl("feed", "Updates from:", "",
 		new BMessage(kMsgFeedChanged));
 	fFeedControl->SetText(updater.FeedURL());
 	fFeedControl->SetModificationMessage(NULL);
@@ -303,6 +322,14 @@ UpdaterWindow::_CreateVersionsTab()
 bool
 UpdaterWindow::QuitRequested()
 {
+	if (fRestarting) {
+		_SaveSettings();
+		return true;
+	}
+	if (fMode == kModeClosingApps) {
+		// the registrar's window has the Cancel button for that
+		return false;
+	}
 	if (fMode == kModeInstalling) {
 		BAlert* alert = new BAlert("System Updater",
 			"An update is being downloaded or installed. Stop it?",
@@ -435,15 +462,23 @@ UpdaterWindow::_ShowState()
 		case kModeAvailable:
 			title = "An update is available";
 			summary << fAvailableTitle << " is available. This computer runs "
-				<< running << ".\nThe update installs when the computer "
-				"restarts; the version you run now stays installed.";
-			main = "Install and Restart";
+				<< running << ".\nInstall and Reboot first closes your "
+				"applications, so that each can ask you to save your work, "
+				"then installs the update and restarts the computer. The "
+				"version you run now stays installed.";
+			if (!fLastResult.IsEmpty())
+				summary << "\n" << fLastResult;
+			main = "Install and Reboot";
 			showMain = true;
+			break;
+		case kModeClosingApps:
+			title = "Closing applications…";
+			summary << "Each application may ask you to save your work. If "
+				"one of them stays open, nothing is installed.";
 			break;
 		case kModeInstalling:
 			title = "Installing the update…";
-			summary << "You can keep working. Nothing changes until the "
-				"computer restarts.";
+			summary << "The computer restarts when the update is installed.";
 			break;
 		case kModeRestart:
 			if (!fState.RunningLatest()) {
@@ -507,7 +542,8 @@ UpdaterWindow::_ShowState()
 	fSecondaryButton->SetLabel(secondary);
 
 	bool showChanges = fMode == kModeIdle || fMode == kModeChecking
-		|| fMode == kModeAvailable || fMode == kModeInstalling;
+		|| fMode == kModeAvailable || fMode == kModeClosingApps
+		|| fMode == kModeInstalling;
 	_SetVisible(fChangesLabel, showChanges);
 	_SetVisible(fChangesScroll, showChanges);
 	_SetVisible(fMainButton, showMain);
@@ -518,8 +554,9 @@ UpdaterWindow::_ShowState()
 	fSecondaryButton->SetEnabled(!fBusy);
 	fCheckButton->SetEnabled(!fBusy && fState.RunningLatest()
 		&& fMode != kModeRestart);
-	if (showMain)
-		fMainButton->MakeDefault(true);
+	// Not the default button: Enter in the Versions tab's text field would
+	// close the applications and install, or restart.
+	fMainButton->MakeDefault(false);
 	_SelectVersion();
 }
 
@@ -528,8 +565,10 @@ void
 UpdaterWindow::_SetBusy(bool busy, const char* text)
 {
 	fBusy = busy;
-	if (busy)
-		fProgressBar->Reset(text);
+	if (busy) {
+		fProgressBar->Reset();
+		fProgressBar->SetText(text);
+	}
 	_SetVisible(fProgressBar, busy);
 	_ShowState();
 }
@@ -564,8 +603,115 @@ void
 UpdaterWindow::_Restart()
 {
 	_SaveSettings();
-	// the user has just asked for it: no second question
-	BRoster::Private().ShutDown(true, false, false);
+	fRestarting = true;
+	// the user has just asked for it: no second question (each application
+	// is still asked to quit, and may ask to save its work)
+	status_t error = BRoster::Private().ShutDown(true, false, false);
+	if (error != B_OK) {
+		fRestarting = false;
+		(new BAlert("System Updater", BString().SetToFormat(
+			"The computer cannot restart: %s", strerror(error)), "OK", NULL,
+			NULL, B_WIDTH_AS_USUAL, B_WARNING_ALERT))->Go(NULL);
+		if (fInstallWindow != NULL && fInstallWindow->Lock()) {
+			fInstallWindow->SetRestartStalled();
+			fInstallWindow->Unlock();
+		}
+		return;
+	}
+	if (fInstallWindow != NULL) {
+		// an application that would not quit stops the restart, and nobody
+		// tells us: offer to try again after a while
+		delete fRestartRunner;
+		BMessage stalled(kMsgRestartStalled);
+		fRestartRunner = new BMessageRunner(BMessenger(this), &stalled,
+			kRestartStallDelay, 1);
+	}
+}
+
+
+/*!	The applications are closed: download and install in the window that
+	stays in front, then restart.
+*/
+void
+UpdaterWindow::_StartInstall()
+{
+	fMode = kModeInstalling;
+	_SetBusy(true, "Preparing the update…");
+	if (fInstallWindow == NULL) {
+		fInstallWindow = new InstallWindow(fAvailableTitle,
+			BMessenger(this));
+		fInstallWindow->Show();
+	}
+	Updater::Log("installing %s after closing the applications",
+		fAvailableId.String());
+	BMessage install(kMsgInstall);
+	install.AddString("id", fAvailableId);
+	fWorker->PostMessage(&install);
+}
+
+
+void
+UpdaterWindow::_InstallFinished(BMessage* message)
+{
+	_SetBusy(false);
+	const char* error = message->GetString("error", NULL);
+	if (message->GetBool("cancelled", false)) {
+		// the user stopped it: nothing changed, no restart
+		Updater::Log("install of %s cancelled", fAvailableId.String());
+		if (fInstallWindow != NULL && fInstallWindow->Lock()) {
+			fInstallWindow->Quit();
+			fInstallWindow = NULL;
+		}
+		fMode = kModeAvailable;
+		fLastResult = "The update was stopped; nothing was changed.";
+		_Refresh();
+		return;
+	}
+
+	if (error != NULL) {
+		// the applications are closed already: restart all the same, and
+		// say what happened once the computer is back
+		BString title = message->GetString("title", fAvailableTitle);
+		Updater::Log("could not install %s: %s; restarting as planned",
+			fAvailableId.String(), error);
+		SystemState::RecordFailedInstall(title, error);
+		if (fInstallWindow != NULL && fInstallWindow->Lock()) {
+			fInstallWindow->SetRestarting("The update could not be "
+				"installed. Restarting…");
+			fInstallWindow->Unlock();
+		}
+		delete fRestartRunner;
+		BMessage restart(kMsgRestartNow);
+		fRestartRunner = new BMessageRunner(BMessenger(this), &restart,
+			kFailedRestartDelay, 1);
+		return;
+	}
+
+	_Refresh();
+	if (fInstallWindow != NULL && fInstallWindow->Lock()) {
+		fInstallWindow->SetRestarting("Restarting…");
+		fInstallWindow->Unlock();
+	}
+	_Restart();
+}
+
+
+void
+UpdaterWindow::_ShowFailedInstall()
+{
+	BString title, error;
+	if (!SystemState::ReadFailedInstall(title, error))
+		return;
+	SystemState::ClearFailedInstall();
+
+	BString text;
+	text.SetToFormat("%s could not be installed before the computer "
+		"restarted:\n\n%s\n\nNothing was changed: this computer runs the "
+		"version it ran before. You can try the update again.",
+		title.IsEmpty() ? "The update" : title.String(), error.String());
+	BAlert* alert = new BAlert("System Updater", text, "OK", NULL, NULL,
+		B_WIDTH_AS_USUAL, B_STOP_ALERT);
+	alert->Go(NULL);
 }
 
 
@@ -605,8 +751,82 @@ UpdaterWindow::MessageReceived(BMessage* message)
 				fProgressBar->SetTo(fraction, text);
 			} else
 				fProgressBar->SetText(text);
+			if (fInstallWindow != NULL && fInstallWindow->Lock()) {
+				fInstallWindow->SetStatus(text, fraction);
+				fInstallWindow->Unlock();
+			}
 			break;
 		}
+
+		case kMsgCloseAppsDone:
+		{
+			_SetBusy(false);
+			status_t error = message->GetInt32("error", B_ERROR);
+			if (error == B_OK) {
+				_StartInstall();
+				break;
+			}
+			fMode = kModeAvailable;
+			_ShowState();
+			BString app = message->GetString("app", "");
+			BString text;
+			if (error == B_SHUTDOWN_CANCELLED && app.IsEmpty()) {
+				// the user pressed Cancel
+				Updater::Log("closing the applications was cancelled");
+				break;
+			} else if (error == B_SHUTDOWN_CANCELLED) {
+				Updater::Log("%s did not quit; nothing installed",
+					app.String());
+				text.SetToFormat("\"%s\" did not close, so the update was "
+					"not installed. Save your work there, then try again.",
+					app.String());
+			} else {
+				text.SetToFormat("The applications could not be closed (%s), "
+					"so the update was not installed.", strerror(error));
+			}
+			(new BAlert("System Updater", text, "OK", NULL, NULL,
+				B_WIDTH_AS_USUAL, B_INFO_ALERT))->Go(NULL);
+			break;
+		}
+
+		case kMsgInstallCommitting:
+			if (fInstallWindow != NULL && fInstallWindow->Lock()) {
+				fInstallWindow->SetCommitting();
+				fInstallWindow->Unlock();
+			}
+			break;
+
+		case kMsgCancelInstall:
+			fWorker->Cancel();
+			break;
+
+		case kMsgRestartNow:
+			_Restart();
+			break;
+
+		case kMsgRestartStalled:
+		{
+			bool inProgress = false;
+			if (BRoster::Private().IsShutDownInProgress(&inProgress) == B_OK
+				&& inProgress) {
+				// still asking the applications
+				delete fRestartRunner;
+				BMessage stalled(kMsgRestartStalled);
+				fRestartRunner = new BMessageRunner(BMessenger(this),
+					&stalled, kRestartStallDelay, 1);
+				break;
+			}
+			fRestarting = false;
+			if (fInstallWindow != NULL && fInstallWindow->Lock()) {
+				fInstallWindow->SetRestartStalled();
+				fInstallWindow->Unlock();
+			}
+			break;
+		}
+
+		case kMsgShowFailedInstall:
+			_ShowFailedInstall();
+			break;
 
 		case kMsgCheckDone:
 		{
@@ -643,24 +863,8 @@ UpdaterWindow::MessageReceived(BMessage* message)
 		}
 
 		case kMsgInstallDone:
-		{
-			_SetBusy(false);
-			const char* error = message->GetString("error", NULL);
-			if (error != NULL) {
-				fMode = kModeAvailable;
-				BAlert* alert = new BAlert("System Updater",
-					BString().SetToFormat("The update could not be installed: "
-						"%s\n\nNothing was changed. You can try again.",
-						error),
-					"OK", NULL, NULL, B_WIDTH_AS_USUAL, B_WARNING_ALERT);
-				alert->Go(NULL);
-				_ShowState();
-			} else {
-				_Refresh();
-				_Restart();
-			}
+			_InstallFinished(message);
 			break;
-		}
 
 		case kMsgGoBackDone:
 		case kMsgRemoveFailedDone:
@@ -697,14 +901,13 @@ UpdaterWindow::MessageReceived(BMessage* message)
 		case kMsgMainButton:
 			switch (fMode) {
 				case kModeAvailable:
-				{
-					fMode = kModeInstalling;
-					_SetBusy(true, "Preparing the update…");
-					BMessage install(kMsgInstall);
-					install.AddString("id", fAvailableId);
-					fWorker->PostMessage(&install);
+					// the applications first: each may ask to save its work
+					// or refuse, which stops it all before anything changed
+					fMode = kModeClosingApps;
+					fLastResult.Truncate(0);
+					_SetBusy(true, "Closing applications…");
+					fWorker->PostMessage(kMsgCloseApps);
 					break;
-				}
 				case kModeRestart:
 					_Restart();
 					break;

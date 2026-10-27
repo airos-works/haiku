@@ -8,6 +8,9 @@
 
 #include <OS.h>
 
+#include <RegistrarDefs.h>
+#include <RosterPrivate.h>
+
 #include "Release.h"
 #include "SystemState.h"
 
@@ -45,6 +48,9 @@ UpdateWorker::MessageReceived(BMessage* message)
 			break;
 		case kMsgRemoveFailed:
 			_RemoveFailed();
+			break;
+		case kMsgCloseApps:
+			_CloseApps();
 			break;
 		default:
 			BLooper::MessageReceived(message);
@@ -227,12 +233,16 @@ UpdateWorker::_Install(const char* id)
 		result = fUpdater.PlanUpdate(release, state, plan, error, &fFeed);
 	if (result == B_OK)
 		result = fUpdater.Download(plan, error);
-	if (result == B_OK)
+	if (result == B_OK && !fUpdater.IsCancelled()) {
+		fTarget.SendMessage(kMsgInstallCommitting);
 		result = fUpdater.Apply(plan, error);
+	}
 
 	if (result != B_OK)
 		reply.AddString("error", error.IsEmpty() ? strerror(result) : error);
-	reply.AddString("title", release.Title());
+	reply.AddBool("cancelled", result == B_CANCELED || fUpdater.IsCancelled());
+	reply.AddString("title", release.Title().IsEmpty()
+		? Release::TitleForVersion(build->version) : release.Title());
 	fTarget.SendMessage(&reply);
 }
 
@@ -271,5 +281,28 @@ UpdateWorker::_RemoveFailed()
 	BString error;
 	if (fUpdater.RemoveFailedUpdate(error) != B_OK)
 		reply.AddString("error", error);
+	fTarget.SendMessage(&reply);
+}
+
+
+/*!	Asks the registrar to quit the user's applications the way a shutdown
+	does, but for this one: each may ask to save its work or refuse, which
+	stops it all. Blocks until they are gone or one refused.
+*/
+void
+UpdateWorker::_CloseApps()
+{
+	BMessage request(BPrivate::B_REG_QUIT_USER_APPS);
+	BMessage answer;
+	status_t error = BRoster::Private().SendTo(&request, &answer, false);
+	BMessage reply(kMsgCloseAppsDone);
+	if (error == B_OK && answer.what == B_MESSAGE_NOT_UNDERSTOOD) {
+		// a registrar from before this request
+		error = B_NOT_SUPPORTED;
+	} else if (error == B_OK && answer.what != BPrivate::B_REG_SUCCESS) {
+		error = answer.GetInt32("error", B_ERROR);
+		reply.AddString("app", answer.GetString("app", ""));
+	}
+	reply.AddInt32("error", error);
 	fTarget.SendMessage(&reply);
 }

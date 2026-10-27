@@ -272,8 +272,11 @@ public:
 		return false;
 	}
 
-	status_t Init(BMessenger target)
+	status_t Init(BMessenger target, bool quitAppsOnly)
 	{
+		if (quitAppsOnly)
+			SetTitle(B_TRANSLATE("Closing applications"));
+
 		// kill app button
 		AddButton(B_TRANSLATE("Kill application"));
 		fKillAppButton = ButtonAt(CountButtons() - 1);
@@ -287,7 +290,8 @@ public:
 		fKillAppButton->SetTarget(target);
 
 		// cancel shutdown button
-		AddButton(B_TRANSLATE("Cancel shutdown"));
+		AddButton(quitAppsOnly ? B_TRANSLATE("Cancel")
+			: B_TRANSLATE("Cancel shutdown"));
 		fCancelShutdownButton = ButtonAt(CountButtons() - 1);
 
 		message = new BMessage(MSG_CANCEL_SHUTDOWN);
@@ -658,6 +662,8 @@ ShutdownProcess::ShutdownProcess(TRoster* roster, EventQueue* eventQueue)
 	fShutdownError(B_ERROR),
 	fHasGUI(false),
 	fReboot(false),
+	fQuitAppsOnly(false),
+	fRequestTeam(-1),
 	fRequestReplySent(false),
 	fWindow(NULL)
 {
@@ -768,6 +774,8 @@ ShutdownProcess::Init(BMessage* request)
 
 	if (fRequest->FindBool("reboot", &fReboot) != B_OK)
 		fReboot = false;
+	fQuitAppsOnly = fRequest->what == B_REG_QUIT_USER_APPS;
+	fRequestTeam = fRequest->ReturnAddress().Team();
 
 	resume_thread(fWorker);
 
@@ -946,7 +954,13 @@ void
 ShutdownProcess::_SendReply(status_t error)
 {
 	if (!fRequestReplySent) {
-		SendReply(fRequest, error);
+		if (error != B_OK && !fAbortingApp.IsEmpty()) {
+			BMessage reply(B_REG_ERROR);
+			reply.AddInt32("error", error);
+			reply.AddString("app", fAbortingApp);
+			fRequest->SendReply(&reply);
+		} else
+			SendReply(fRequest, error);
 		fRequestReplySent = true;
 	}
 }
@@ -1008,7 +1022,7 @@ ShutdownProcess::_InitShutdownWindow()
 	if (fHasGUI) {
 		fWindow = new(nothrow) ShutdownWindow;
 		if (fWindow != NULL) {
-			status_t error = fWindow->Init(BMessenger(this));
+			status_t error = fWindow->Init(BMessenger(this), fQuitAppsOnly);
 			if (error != B_OK) {
 				delete fWindow;
 				fWindow = NULL;
@@ -1352,6 +1366,14 @@ ShutdownProcess::_WorkerDoShutdown()
 		return;
 	}
 
+	// closing the applications for the sender, which keeps running
+	if (fQuitAppsOnly) {
+		if (RosterAppInfo* info = fUserApps.InfoFor(fRequestTeam)) {
+			fUserApps.RemoveInfo(info);
+			delete info;
+		}
+	}
+
 	fUserApps.Sort(&inverse_compare_by_registration_time);
 	fSystemApps.Sort(&inverse_compare_by_registration_time);
 
@@ -1382,6 +1404,12 @@ ShutdownProcess::_WorkerDoShutdown()
 	// as its users end), files written but only cached come back with their
 	// size and the old contents of their blocks.
 	sync();
+
+	// B_REG_QUIT_USER_APPS: done, the desktop and the servers stay
+	if (fQuitAppsOnly) {
+		_SetShowShutdownWindow(false);
+		return;
+	}
 
 	// tell TRoster not to accept new applications anymore
 	fRoster->SetShuttingDown(true);
@@ -1869,6 +1897,12 @@ ShutdownProcess::_DisplayAbortingApp(team_id team)
 	if (!foundApp) {
 		PRINT("ShutdownProcess::_DisplayAbortingApp(): Didn't find the app "
 			"that has cancelled the shutdown.\n");
+		return;
+	}
+
+	// The sender of B_REG_QUIT_USER_APPS tells the user itself.
+	if (fQuitAppsOnly) {
+		fAbortingApp = appName;
 		return;
 	}
 
