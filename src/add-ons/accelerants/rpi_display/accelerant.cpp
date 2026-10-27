@@ -388,10 +388,31 @@ rpi_set_cursor_bitmap(uint16 width, uint16 height, uint16 hotX, uint16 hotY,
 		return B_UNSUPPORTED;
 
 	uint8* buffer = (uint8*)gInfo->cursor_buffer;
-	uint32 bufferRow = RPI_DISPLAY_CURSOR_MAX * 4;
+	const uint32 bufferRow = RPI_DISPLAY_CURSOR_MAX * 4;
 	memset(buffer, 0, bufferRow * RPI_DISPLAY_CURSOR_MAX);
-	for (uint16 y = 0; y < height; y++)
-		memcpy(buffer + y * bufferRow, bitmapData + y * bytesPerRow, width * 4);
+	for (uint16 y = 0; y < height; y++) {
+		const uint8* src = bitmapData + y * bytesPerRow;
+		uint8* dst = buffer + y * bufferRow;
+		for (uint16 x = 0; x < width; x++, src += 4, dst += 4) {
+			// Haiku keeps its cursors premultiplied with the alpha byte
+			// inverted (0 opaque, 255 clear); the firmware wants straight
+			// alpha with un-premultiplied color, as DRM's ARGB8888 cursors
+			// get it through fkms.
+			uint8 alpha = 255 - src[3];
+			dst[3] = alpha;
+			if (alpha == 0) {
+				dst[0] = dst[1] = dst[2] = 0;
+			} else if (alpha == 255) {
+				dst[0] = src[0];
+				dst[1] = src[1];
+				dst[2] = src[2];
+			} else {
+				dst[0] = (uint8)((src[0] * 255 + alpha / 2) / alpha);
+				dst[1] = (uint8)((src[1] * 255 + alpha / 2) / alpha);
+				dst[2] = (uint8)((src[2] * 255 + alpha / 2) / alpha);
+			}
+		}
+	}
 
 	rpi_display_cursor cursor = {width, height, (int16)hotX, (int16)hotY};
 	if (ioctl(gInfo->device, RPI_DISPLAY_DEFINE_CURSOR, &cursor,

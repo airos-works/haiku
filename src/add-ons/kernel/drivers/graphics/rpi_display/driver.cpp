@@ -578,7 +578,10 @@ update_cursor_plane(display_info* info)
 			plane.layer = info->cursorLayer;
 			plane.width = info->cursor.width;
 			plane.height = info->cursor.height;
-			plane.pitch = info->cursor.width * 4;
+			// The compositor fetches in wide bursts: rows must sit at the
+			// buffer's own stride (a comfortable 256 bytes), not tight
+			// behind the cursor's width, or the picture reads as lines.
+			plane.pitch = RPI_DISPLAY_CURSOR_MAX * 4;
 			plane.vpitch = 0;
 			plane.src_x = 0;
 			plane.src_y = 0;
