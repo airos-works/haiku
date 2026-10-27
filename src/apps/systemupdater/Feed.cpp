@@ -10,12 +10,16 @@
 #include <string.h>
 #include <time.h>
 
+#include <new>
+
+#include <Certificate.h>
 #include <DataIO.h>
 #include <File.h>
 #include <HttpRequest.h>
 #include <HttpResult.h>
 #include <OS.h>
 #include <Url.h>
+#include <UrlContext.h>
 #include <UrlProtocolListener.h>
 #include <UrlProtocolRoster.h>
 #include <UrlRequest.h>
@@ -243,11 +247,24 @@ Fetcher::FetchFile(const BString& url, const char* path, off_t expectedSize,
 }
 
 
-/*!	The time of the server of \a url, from the Date header of what its host
-	answers over plain HTTP (github.com redirects to HTTPS, with a Date).
-	For a clock that is too far off to check the server's certificate: the
-	time is no more trusted than before, the downloads are still checked
-	against the feed's SHA-256s.
+/*!	Accepts a certificate that is "not yet valid" and nothing else: the
+	clock is known to be wrong while the time is asked for.
+*/
+class TimeProbeListener : public BUrlProtocolListener {
+public:
+	virtual bool CertificateVerificationFailed(BUrlRequest*, BCertificate&,
+		const char* message)
+	{
+		return message != NULL && strstr(message, "not yet valid") != NULL;
+	}
+};
+
+
+/*!	The time of the server of \a url, from the Date header of its host's
+	answer. For a clock too far off to check the server's certificate
+	(boards without a battery start in 1970): the answer comes over HTTPS
+	with the certificate checked in all but its dates. GitHub's plain HTTP
+	redirect has no Date header.
 */
 time_t
 Fetcher::FetchServerTime(const BString& url)
@@ -255,13 +272,21 @@ Fetcher::FetchServerTime(const BString& url)
 	BUrl address(url.String(), true);
 	if (!address.IsValid() || !address.HasHost())
 		return 0;
-	BUrl plain;
-	plain.SetProtocol("http");
-	plain.SetHost(address.Host());
-	plain.SetPath("/");
+	BUrl root;
+	root.SetProtocol(address.Protocol());
+	root.SetHost(address.Host());
+	if (address.HasPort())
+		root.SetPort(address.Port());
+	root.SetPath("/");
 
+	// its own context: the certificate exception stays with this request
+	BReference<BUrlContext> context(new(std::nothrow) BUrlContext, true);
+	if (context.Get() == NULL)
+		return 0;
+	TimeProbeListener listener;
 	BMallocIO output;
-	BUrlRequest* request = BUrlProtocolRoster::MakeRequest(plain, &output);
+	BUrlRequest* request = BUrlProtocolRoster::MakeRequest(root, &output,
+		&listener, context.Get());
 	BHttpRequest* http = dynamic_cast<BHttpRequest*>(request);
 	if (http == NULL) {
 		delete request;
@@ -276,7 +301,7 @@ Fetcher::FetchServerTime(const BString& url)
 	thread_id thread = request->Run();
 	if (thread >= 0) {
 		// a few seconds at most
-		bigtime_t until = system_time() + 10000000;
+		bigtime_t until = system_time() + 15000000;
 		while (wait_for_thread_etc(thread, B_RELATIVE_TIMEOUT, 500000, NULL)
 				== B_TIMED_OUT) {
 			if (IsCancelled() || system_time() > until)

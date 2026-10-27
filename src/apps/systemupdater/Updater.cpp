@@ -638,7 +638,7 @@ Updater::_CheckClock()
 
 /*!	A board without a battery-backed clock starts in 1970, when no
 	certificate is valid yet: before an HTTPS feed can answer, the clock is
-	set from its host's answer over plain HTTP.
+	set from its host's answer (Fetcher::FetchServerTime()).
 */
 void
 Updater::_CheckClockForSecureFeed(const BString& url)
@@ -654,6 +654,9 @@ Updater::_CheckClockForSecureFeed(const BString& url)
 		set_real_time_clock(server);
 		Log("the clock was before this release was built; set it from %s's",
 			BUrl(url.String(), true).Host().String());
+	} else {
+		Log("the clock is before this release was built, and %s did not "
+			"tell the time", BUrl(url.String(), true).Host().String());
 	}
 }
 
