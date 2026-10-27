@@ -33,6 +33,15 @@ enum input_pointing_device_subtype {
 };
 
 
+// "be:wheel_phase" of a B_MOUSE_WHEEL_CHANGED message from a touchpad
+enum input_wheel_phase {
+	B_WHEEL_PHASE_NONE		= 0,
+	B_WHEEL_PHASE_BEGAN		= 1,
+	B_WHEEL_PHASE_CHANGED	= 2,
+	B_WHEEL_PHASE_ENDED		= 3
+};
+
+
 enum input_device_notification {
 	B_INPUT_DEVICE_ADDED	= 0x0001,
 	B_INPUT_DEVICE_STARTED	= 0x0002,

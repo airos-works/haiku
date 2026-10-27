@@ -148,7 +148,11 @@ MovementMaker::GetScrolling(uint32 posX, uint32 posY, bool reverse)
 	_GetRawMovement(posX, posY);
 	_ComputeAcceleration(fSettings.scroll_acceleration);
 
+	precise_x = 0;
+	precise_y = 0;
+
 	if (fSettings.scroll_xstepsize > 0) {
+		precise_x = directionMultiplier * xDelta / fSettings.scroll_xstepsize;
 		scrolling_x += directionMultiplier * xDelta;
 
 		stepsX = make_small(scrolling_x / fSettings.scroll_xstepsize);
@@ -161,6 +165,7 @@ MovementMaker::GetScrolling(uint32 posX, uint32 posY, bool reverse)
 	}
 
 	if (fSettings.scroll_ystepsize > 0) {
+		precise_y = -directionMultiplier * yDelta / fSettings.scroll_ystepsize;
 		scrolling_y += directionMultiplier * yDelta;
 
 		stepsY = make_small(scrolling_y / fSettings.scroll_ystepsize);
@@ -276,6 +281,7 @@ TouchpadMovement::TouchpadMovement()
 
 	fMovementStarted = false;
 	fScrollingStarted = false;
+	fScrollPhaseActive = false;
 	fTapStarted = false;
 	fValidEdgeMotion = false;
 	fDoubleClick = false;
@@ -289,12 +295,18 @@ TouchpadMovement::~TouchpadMovement() {
 
 status_t
 TouchpadMovement::EventToMovement(const touchpad_movement* _event, mouse_movement* movement,
-	bigtime_t& repeatTimeout)
+	bigtime_t& repeatTimeout, scroll_movement* scroll)
 {
 	CALLED();
 
-	if (!movement)
+	if (!movement || !scroll)
 		return B_ERROR;
+
+	scroll->x = 0;
+	scroll->y = 0;
+	scroll->phase = B_WHEEL_PHASE_NONE;
+	precise_x = 0;
+	precise_y = 0;
 
 	TRACE("TM_EVENT: b:0x%" B_PRIx8 " nf:%" B_PRId8 " f:0x%" B_PRIx8
 		" x:%" B_PRIu32 " y:%" B_PRIu32 " p:%" B_PRIu8 " w:%" B_PRIu8 "\n",
@@ -389,6 +401,21 @@ TouchpadMovement::EventToMovement(const touchpad_movement* _event, mouse_movemen
 			_MoveToMovement(event, movement);
 	} else
 		_NoTouchToMovement(event, movement);
+
+	if (fScrollingStarted) {
+		scroll->x = precise_x;
+		scroll->y = precise_y;
+		// fingers resting on the touchpad are no news
+		if (!fScrollPhaseActive)
+			scroll->phase = B_WHEEL_PHASE_BEGAN;
+		else if (precise_x != 0 || precise_y != 0)
+			scroll->phase = B_WHEEL_PHASE_CHANGED;
+		fScrollPhaseActive = true;
+	} else if (fScrollPhaseActive) {
+		// the fingers left the touchpad, or scrolling turned into moving
+		scroll->phase = B_WHEEL_PHASE_ENDED;
+		fScrollPhaseActive = false;
+	}
 
 
 	if (fTapdragStarted || fValidEdgeMotion) {
@@ -738,10 +765,13 @@ TouchpadMovement::_CheckScrollingToMovement(const touchpad_movement *event,
 	movement->wheel_ydelta = make_small(yDelta);
 	movement->wheel_xdelta = make_small(xDelta);
 
-	if (isSideScrollingV && !isSideScrollingH)
+	if (isSideScrollingV && !isSideScrollingH) {
 		movement->wheel_xdelta = 0;
-	else if (isSideScrollingH && !isSideScrollingV)
+		precise_x = 0;
+	} else if (isSideScrollingH && !isSideScrollingV) {
 		movement->wheel_ydelta = 0;
+		precise_y = 0;
+	}
 
 	if (movement->wheel_xdelta != 0 || movement->wheel_ydelta != 0) {
 		fTapStarted = false;

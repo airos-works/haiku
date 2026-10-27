@@ -6,6 +6,7 @@
 #ifndef MOVEMENT_MAKER_H
 #define MOVEMENT_MAKER_H
 
+#include <Input.h>
 #include <OS.h>
 
 #include <keyboard_mouse_driver.h>
@@ -22,6 +23,10 @@ public:
 
 			float				scrolling_x;
 			float				scrolling_y;
+
+			// the last scroll movement in wheel steps, before rounding
+			float				precise_x;
+			float				precise_y;
 	
 protected:
 			void				StartNewMovment();
@@ -63,13 +68,22 @@ enum button_ids
 };
 
 
+// What a touchpad scroll gesture did, for pixel-precise scrolling
+struct scroll_movement {
+	float	x;		// wheel steps, not rounded to whole ones
+	float	y;
+	int32	phase;	// input_wheel_phase; B_WHEEL_PHASE_NONE: not scrolling
+};
+
+
 class TouchpadMovement : public MovementMaker {
 public:
 								TouchpadMovement();
 	virtual						~TouchpadMovement();
 
 			status_t			EventToMovement(const touchpad_movement *event,
-									mouse_movement *movement, bigtime_t &repeatTimeout);
+									mouse_movement *movement, bigtime_t &repeatTimeout,
+									scroll_movement *scroll);
 
 			bigtime_t			click_speed;
 private:
@@ -89,6 +103,7 @@ private:
 
 			bool				fMovementStarted;
 			bool				fScrollingStarted;
+			bool				fScrollPhaseActive;
 			bool				fTapStarted;
 			bigtime_t			fTapTime;
 			int32				fTapDeltaX;
