@@ -110,7 +110,7 @@ static const rgb_color kIdealBeOSBlue = { 0, 0, 200, 255 };
 static const rgb_color kIdealBeOSRed = { 200, 0, 0, 255 };
 static const rgb_color kIdealAirOSBreeze = { 78, 141, 138, 255 };
 
-static const char* kAirOSWebsite = "https://github.com/jmgasper/haiku";
+static const char* kAirOSWebsite = "https://github.com/airos-works/haiku";
 	// the air/OS logo resources are 64 units wide and this tall
 static const float kAirOSLogoHeight = 21.0f;
 static const rgb_color kBlack = { 0, 0, 0, 255 };

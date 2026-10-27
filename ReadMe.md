@@ -59,7 +59,7 @@ What air/OS adds
    feedback and WebGL 2 conformance fixes, an 800 MHz GPU clock.
  * **V3D (Raspberry Pi 4):** the `v3d` driver with Mesa's V3D/V3DV.
  * **AMD Radeon:** `amdgpu_drm`, Linux 6.18's amdgpu, DRM, TTM and Display
-   Core ported to Haiku ([jmgasper/linux-drm](https://github.com/jmgasper/linux-drm)),
+   Core ported to Haiku ([airos-works/linux-drm](https://github.com/airos-works/linux-drm)),
    with the `amdgpu_kms` accelerant, radeonsi (OpenGL/GLES/EGL), RADV
    (Vulkan 1.4), VA-API video decoding (`amdgpu_va`), GPU reset recovery and
    direct scanout.
@@ -157,7 +157,7 @@ Getting air/OS
 --------------
 Every push to `master` and a nightly run build four images on the air/OS
 build server (`.github/workflows/airos-images.yml`, scripts in
-[jmgasper/airos-ci](https://github.com/jmgasper/airos-ci)); each is smoke
+[airos-works/airos-ci](https://github.com/airos-works/airos-ci)); each is smoke
 tested and published as a GitHub prerelease (`image-<target>-*`) and on
 [airos.works](https://airos.works/):
 
@@ -195,12 +195,12 @@ build configurations under `tools/`; include one from the build directory's
 | Pi 4 / Cubie lab images | `tools/rpi4`, `tools/cubie-a7s` | `@minimum-rpi4`, `@minimum-cubie` |
 
 The release configuration expects the packages CI builds (the
-applications, Summit, Mesa and the other libraries from the jmgasper forks,
+applications, Summit, Mesa and the other libraries from the airos-works forks,
 firmware); its header lists the variables that point at them. The lab
 configurations add a remote shell, probes and diagnostics for the hardware
 lab and must not be used for public images. Third-party code (Mesa,
 FFmpeg, MPP, WebKit, linux-drm, firmware …) lives in forks under
-[jmgasper](https://github.com/jmgasper) on an `airos` branch.
+[airos-works](https://github.com/airos-works) on an `airos` branch.
 
 Per-machine build, install and recovery notes:
 [ROCK 5 ITX](docs/rock5-itx/README.md) (cross-toolchain, NVMe/eMMC

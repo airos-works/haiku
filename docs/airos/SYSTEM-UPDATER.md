@@ -35,14 +35,18 @@ does not start is replaced by the one before it without help.
   `--check`, `--plan`, `--update`, `--restart-into <state>`, `--go-back
   <state>`, `--retry`, `--remove-failed`, `--confirm`, `--prune`.
 - Updates come from GitHub Releases:
-  `https://github.com/jmgasper/haiku/releases/download/updates-<target>/`,
+  `https://github.com/airos-works/haiku/releases/download/updates-<target>/`,
   named by the installed release (releases before 28 October 2026 name the
   build server, `http://192.168.1.200/updates/<target>/`, until their first
   update). *Versions* › *Updates from* overrides it, for a test feed.
+  The repositories moved from github.com/jmgasper to the airos-works
+  organization on 28 October 2026; releases made before then name
+  `https://github.com/jmgasper/haiku/...`, which GitHub redirects to the
+  new place (no repository may be created as jmgasper/haiku again).
 
 ## What an update is
 
-A CI image build (`jmgasper/airos-ci`, `images/build-image.sh`) is one
+A CI image build (`airos-works/airos-ci`, `images/build-image.sh`) is one
 *release*: every package in the image's `system/packages` (Haiku, the
 drivers, Summit, the Office and Media apps, Kiri, airTime, Amp, Burrow,
 Clipper, airShot, Proton Mail Bridge and VPN, Mail, the libraries and
@@ -89,7 +93,7 @@ update from 24 packages (468 MiB) to 13 (249 MiB).
 ### On GitHub
 
 `airos-ci images/publish-feed-github.py TARGET` (the images workflow's last
-step) mirrors the feed to jmgasper/haiku's Releases, all prereleases:
+step) mirrors the feed to airos-works/haiku's Releases, all prereleases:
 
 | Release | Assets |
 |---|---|
@@ -217,7 +221,7 @@ loader cannot read BFS. So on the Pi:
 
 ## Building releases
 
-`jmgasper/airos-ci` makes a release of every image build:
+`airos-works/airos-ci` makes a release of every image build:
 
 1. `images/release-inputs.py` writes the release file, the package infos of
    `airos_release` and `airos_payload` and `files.jam` (every file of CI's

@@ -122,7 +122,7 @@ many buffer pixels a coordinate unit is (from the memory app_server shares
 with applications; `B_SCREEN_CHANGED` carries it as `"device scale"`). A
 bitmap drawn with `B_DEVICE_PIXEL_BITMAP` holds buffer pixels and is drawn one
 to one from the buffer pixel the destination's top left corner falls on.
-The Qt platform plugin (jmgasper/qt6-haikuplugins, branch `airos`, packaged
+The Qt platform plugin (airos-works/qt6-haikuplugins, branch `airos`, packaged
 as qt6_base 6.10.3-103) reports the scale as the device pixel ratio, keeps
 its backing store at that density and draws it this way, and uses grey,
 vertically hinted text there. Qt programs such as Telegram were rendered at
@@ -133,7 +133,7 @@ program that does not know the scale draws bitmaps in logical pixels and
 app_server enlarges them. Without a filter the nearest pixel doubles every
 other row and column at fractional scales, so a one pixel line inside the
 bitmap is one or two pixels wide. A `BGLView` (libglvnd's Haiku GL kit,
-jmgasper/libglvnd `airos-1.7.0`) therefore asks for
+airos-works/libglvnd `airos-1.7.0`) therefore asks for
 `B_FILTER_BITMAP_BILINEAR` when the scale is fractional, as macOS and Wayland
 compositors filter surfaces that are not drawn at the panel's density; whole
 scales stay exact. On x86_64 that filter was the per pixel default version
@@ -167,7 +167,7 @@ add no colour. A 400 x 300 bitmap drawn one to one costs 0.40 ms at 175
 percent on the Framework 13. Programs that ask for a filter or a scale of
 their own, vector icons and `B_DEVICE_PIXEL_BITMAP` keep what they had.
 
-**GTK, Firefox and other Wayland programs** (jmgasper/wayland-server,
+**GTK, Firefox and other Wayland programs** (airos-works/wayland-server,
 branch `airos`, on X547's in-process Wayland server). The server reported
 `wl_output` scale 1 and drew every buffer one to one, so GTK and Firefox
 drew at the logical size and app_server enlarged them (pixel doubling even

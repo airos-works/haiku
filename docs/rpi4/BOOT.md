@@ -85,7 +85,7 @@ build leaves the JPEG, PNG and WebP translators out of `haiku_datatranslators`
 (and MJPEG out of the USB webcam add-on): nothing that reads pictures through
 the Translation Kit opens a JPEG or a PNG. `tools/rpi4/build-image-libs.sh`
 cross-builds libjpeg-turbo 3.0.4 (libjpeg 6.2 API), libpng 1.6.44 (from the
-air/OS fork, `jmgasper/libpng` branch `airos-v1.6.44`) and libwebp 1.4.0 into
+air/OS fork, `airos-works/libpng` branch `airos-v1.6.44`) and libwebp 1.4.0 into
 `/mnt/HaikuWork/rpi4/image-libs/packages`, as `libjpeg_turbo`, `libpng16` and
 `libwebp` packages with their `_devel` counterparts, named and providing like
 HaikuPorts'. `HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR` points the `jpeg`, `libpng`

@@ -567,7 +567,7 @@ See [ARM64-PAGE-AGING.md](ARM64-PAGE-AGING.md) and
 
 | Area | Evidence and state |
 | --- | --- |
-| Repository | `jmgasper/haiku`; all work merged into `master` (2026-10-05); upstream base `b42b90f5ec2839f8074400c849ee025b50d0f7f1` (hrev60206, merged 2026-10-05) |
+| Repository | `airos-works/haiku`; all work merged into `master` (2026-10-05); upstream base `b42b90f5ec2839f8074400c849ee025b50d0f7f1` (hrev60206, merged 2026-10-05) |
 | Build tools | Haiku GCC 13.3.0 cross-compiler and binutils built successfully; buildtools `8375c2dbeaf109c520798cb234d57f0895463201` |
 | ARM64 image and QEMU | Current clean 336 MiB `@minimum-mmc` image passes first login at both EL1 and EL2 with 4 virtual CPUs and 2 GiB RAM; a basic Tracker/Deskbar desktop was inspected during phase 0 |
 | ARM64 address-space reuse | The +174 USB image reserves ASID zero for the empty user table and passes 280 live-child private-page checks over four migration rounds on all eight CPUs on each of two boots, deliberate-corruption cleanup and subsequent reuse. All 119 host checks, full two-boot EL1/EL2 QEMU gates, sixteen checked network streams, profiler/storage/desktop checks, normal reboot and automatic recovery with independent Linux readback pass. The host model reproduces the old retained translation; no old native stale read is claimed. See [ARM64-ASID.md](ARM64-ASID.md); the SSD remains +156. |
@@ -599,7 +599,7 @@ status-documentation commits do not change that artifact's recorded revision.
 | QEMU | `/mnt/HaikuWork/artifacts/qemu/20260911T050646Z-2b567d`; first-login marker passed, no kernel panic, desktop screenshot inspected |
 | Hardware | `/mnt/HaikuWork/artifacts/hardware/20260911T050746Z-ae7015`; upload hash matched, nine HDMI frames, recovery returned a different ROOBI boot ID |
 | Complete command log | `/mnt/HaikuWork/artifacts/verified-iteration-final.log`; exit status 0 |
-| CI | [11 control regression tests passed](https://github.com/jmgasper/haiku/actions/runs/34564745899) |
+| CI | [11 control regression tests passed](https://github.com/airos-works/haiku/actions/runs/34564745899) |
 
 At the end of phase 0, the target ran ROOBI with `/data/storage-probe.img`
 selected, and neither SPI nor onboard OS partitions had been rewritten.
@@ -905,7 +905,7 @@ SMP stress stability, or peripheral acceptance.
 | EL2 QEMU | `artifacts/qemu/20260911T110644Z-b339fb`; four CPUs, first login passed, no kernel panic |
 | Native ROCK | `artifacts/hardware/20260911T110842Z-aa232c`; reviewed `result.json`, `trial-serial.log` and `frame-016.jpg` |
 | Local checks | 23 regression checks, Bash syntax and whitespace checks passed; `artifacts/control-checks-kernel-checkpoint.log` |
-| CI | [23 control regression checks passed for this source revision](https://github.com/jmgasper/haiku/actions/runs/34592601056) |
+| CI | [23 control regression checks passed for this source revision](https://github.com/airos-works/haiku/actions/runs/34592601056) |
 
 All evidence paths above are under `/mnt/HaikuWork`. Documentation-only commits
 after this checkpoint do not change the image's recorded source revision.

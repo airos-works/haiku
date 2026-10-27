@@ -111,7 +111,7 @@ It uses stateless JSON responses and returns 405 for the optional SSE stream.
   listener and withheld connection details.
 - JSON regression tests passed on the host and in Haiku x86_64.
 - The x86_64, ARM64 and Pi images built from merge commit `418ca98031`
-  passed the [image CI run](https://github.com/jmgasper/haiku/actions/runs/37872317743).
+  passed the [image CI run](https://github.com/airos-works/haiku/actions/runs/37872317743).
   The x86_64 and ARM64 gates booted QEMU; the Pi gate checked the SD layout and
   boot files, without claiming a native Pi boot.
 - Each CI image's compressed and uncompressed checksums were verified against

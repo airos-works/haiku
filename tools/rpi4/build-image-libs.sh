@@ -8,7 +8,7 @@
 # The packages carry HaikuPorts' names and provides (lib:libjpeg,
 # lib:libpng16, lib:libwebp, ...), so haiku_datatranslators' requirements
 # resolve against them. libpng comes from the air/OS fork
-# (github.com/jmgasper/libpng, branch airos-v1.6.44), the others from their
+# (github.com/airos-works/libpng, branch airos-v1.6.44), the others from their
 # pinned release archives. Packages stay zlib-compressed like zstd's.
 set -euo pipefail
 umask 022
@@ -29,7 +29,7 @@ JPEG_URL=https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/$JPEG_
 PNG_VERSION=1.6.44
 PNG_BRANCH=airos-v$PNG_VERSION
 PNG_COMMIT=f5e92d76973a7a53f517579bc95d61483bf108c0
-PNG_REPOSITORY=https://github.com/jmgasper/libpng.git
+PNG_REPOSITORY=https://github.com/airos-works/libpng.git
 WEBP_VERSION=1.4.0
 WEBP_SHA256=61f873ec69e3be1b99535634340d5bde750b2e4447caa1db9f61be3fd49ab1e5
 WEBP_URL=https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-$WEBP_VERSION.tar.gz

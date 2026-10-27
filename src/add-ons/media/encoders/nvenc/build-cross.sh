@@ -5,7 +5,7 @@
 #        (OGKM_SRC=<open-gpu-kernel-modules checkout>)
 #
 # Like the NVDEC add-on (src/add-ons/media/plugins/nvdec/build-cross.sh):
-# the NVK tree (jmgasper/mesa-nvk) provides the resource manager API
+# the NVK tree (airos-works/mesa-nvk) provides the resource manager API
 # (src/nouveau/vulkan/nvkmd/nvrm) and NVIDIA's class and nvenc_drv.h
 # headers; the RM headers come from NVIDIA's open-gpu-kernel-modules, which
 # NVK expects in nvrm/open-gpu-kernel-modules unless OGKM_SRC names it.

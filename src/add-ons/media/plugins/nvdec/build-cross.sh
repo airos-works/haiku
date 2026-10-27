@@ -4,7 +4,7 @@
 # usage: build-cross.sh <haiku build dir> <NVK tree> <output dir>
 #        (OGKM_SRC=<open-gpu-kernel-modules checkout>)
 #
-# The NVK tree (jmgasper/mesa-nvk, airos-nvk-r2) provides the resource
+# The NVK tree (airos-works/mesa-nvk, airos-nvk-r2) provides the resource
 # manager API (src/nouveau/vulkan/nvkmd/nvrm) and NVIDIA's class headers; the
 # RM headers come from NVIDIA's open-gpu-kernel-modules, which NVK expects in
 # nvrm/open-gpu-kernel-modules unless OGKM_SRC names it (the nvidia_rm

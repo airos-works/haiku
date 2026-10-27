@@ -68,7 +68,7 @@ DESKBAR_APPLICATIONS += [ FFilterByBuildFeatures
 	SoundRecorder
 ] ;
 
-# air/OS: on x86_64 and arm64, Mail (jmgasper/mail, the airos_mail package
+# air/OS: on x86_64 and arm64, Mail (airos-works/mail, the airos_mail package
 # that the image build adds) replaces Haiku's Mail as apps/Mail, with its
 # Deskbar entry. Other architectures keep Haiku's Mail until that package is
 # built for them.

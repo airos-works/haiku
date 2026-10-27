@@ -567,7 +567,7 @@ MailDaemonApplication::SendPendingMessages(BMessage* msg)
 }
 
 
-// air/OS: Mail (jmgasper/mail) replaces Haiku's Mail where it is installed.
+// air/OS: Mail (airos-works/mail) replaces Haiku's Mail where it is installed.
 static const char*
 preferred_mail_application()
 {

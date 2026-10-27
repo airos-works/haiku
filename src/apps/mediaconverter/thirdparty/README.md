@@ -6,7 +6,7 @@ is missing. These are the headers of the versions air/OS ships:
 
 | Directory | Library | Package | Licence |
 | --- | --- | --- | --- |
-| `va/` | libva 2.24.1 (VA-API 1.24.0), from jmgasper/libva | the AMD GPU user land (`system/non-packaged/amdgpu`) | MIT (`va/COPYING`) |
+| `va/` | libva 2.24.1 (VA-API 1.24.0), from airos-works/libva | the AMD GPU user land (`system/non-packaged/amdgpu`) | MIT (`va/COPYING`) |
 | `x264/` | x264 0.164 | HaikuPorts `x264` | GPL-2.0-or-later |
 | `x265/` | x265 3.5 (build 199) | HaikuPorts `x265` | GPL-2.0-or-later |
 | `svt-av1/` | SVT-AV1 3.0.2 | HaikuPorts `svt_av13` | BSD-3-Clause-Clear |

@@ -11,7 +11,7 @@
 
 
 /*!	airTime's ControlBar and Look are used here as airTime has them (from
-	jmgasper/airTime src/ui, a6d464f); this is the one helper of airTime's
+	airos-works/airTime src/ui, a6d464f); this is the one helper of airTime's
 	engine they need, as engine/Tracks.cpp has it. */
 namespace airtime {
 

@@ -1,5 +1,5 @@
 # air/OS release images, built on the self-hosted air/OS build server
-# (jmgasper/airos-ci) from the pushed commit:
+# (airos-works/airos-ci) from the pushed commit:
 #   x86_64  airos-x86_64.iso   USB stick / CD, EFI and BIOS (X399 and other PCs)
 #   arm64   airos-arm64.iso    USB stick, UEFI (ROCK 5 ITX and other arm64 machines)
 #   rpi4    airos-rpi4.img     Raspberry Pi 4 SD card (Balena Etcher), boots directly
@@ -51,7 +51,7 @@ jobs:
         if: steps.selected.outputs.build
         run: |
           rm -rf "$RUNNER_TEMP/airos-ci"
-          git clone -q --depth 1 https://github.com/jmgasper/airos-ci.git "$RUNNER_TEMP/airos-ci"
+          git clone -q --depth 1 https://github.com/airos-works/airos-ci.git "$RUNNER_TEMP/airos-ci"
           git -C "$RUNNER_TEMP/airos-ci" log --oneline -1
 
       - name: Build ${{ matrix.target }}

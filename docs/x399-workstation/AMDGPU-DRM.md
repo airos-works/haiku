@@ -145,7 +145,7 @@ Known limits:
 - Vulkan presents by copying (no dma-buf on Haiku): GPU blit to host memory,
   copy into the window's shared buffer.
 - Host memory imports (`DRM_AMDGPU_GEM_USERPTR`, RADV's
-  `VK_EXT_external_memory_host`, jmgasper/haiku#38) wire the pages for the
+  `VK_EXT_external_memory_host`, airos-works/haiku#38) wire the pages for the
   buffer's whole life instead of following them with HMM: the memory has to
   stay mapped until the buffer is freed. `delete_area()` or `munmap()` of it
   before then waits, uninterruptibly, until the buffer is gone, so a
@@ -171,11 +171,11 @@ Known limits:
 
 | Piece | Source | Installed |
 | --- | --- | --- |
-| kernel driver `amdgpu_drm` | `src/forks/linux-drm`, branch `airos-6.18.52` (https://github.com/jmgasper/linux-drm) | `~/config/non-packaged/add-ons/kernel/drivers/bin/amdgpu_drm`, links in `dev/dri` and `dev/graphics` |
+| kernel driver `amdgpu_drm` | `src/forks/linux-drm`, branch `airos-6.18.52` (https://github.com/airos-works/linux-drm) | `~/config/non-packaged/add-ons/kernel/drivers/bin/amdgpu_drm`, links in `dev/dri` and `dev/graphics` |
 | firmware | linux-firmware `amdgpu/polaris10_*` | `~/config/non-packaged/data/firmware/amdgpu` |
 | accelerant `amdgpu_kms` | this tree, `src/add-ons/accelerants/amdgpu_kms` | haiku.hpkg |
 | VA-API media add-on | this tree, `src/add-ons/media/plugins/amdgpu_va` | `~/config/non-packaged/add-ons/media/plugins/amduvd` |
-| libdrm | `src/forks/libdrm`, `airos-2.4.134` (https://github.com/jmgasper/libdrm) | `/boot/system/non-packaged/lib` |
+| libdrm | `src/forks/libdrm`, `airos-2.4.134` (https://github.com/airos-works/libdrm) | `/boot/system/non-packaged/lib` |
 | libva | `src/forks/libva`, `airos-2.24.1` (local) | `/boot/system/non-packaged/lib` |
 | libglvnd | `src/forks/libglvnd`, `airos-1.7.0` | `/boot/system/non-packaged/lib` |
 | Mesa (radeonsi, RADV, VA) | `src/forks/mesa`, `airos-amdgpu` | `/boot/system/non-packaged/lib`, EGL vendor and Vulkan ICD files in `/boot/system/non-packaged/add-ons/{opengl/egl_vendor.d,vulkan/icd.d}` |
@@ -255,7 +255,7 @@ The driver is Linux's whole amdgpu (GFX 6 to 12, Display Core up to DCN 4.01,
 SMU 14, VCN 5): any AMD GPU or APU Linux 6.18 drives should start, given its
 firmware. Only the WX 5100 has been tried.
 
-The air/OS x86_64 images the build server makes (jmgasper/airos-ci) carry
+The air/OS x86_64 images the build server makes (airos-works/airos-ci) carry
 all of it since 2026-10-13: the `amdgpu_drm` and `amdgpu_firmwares` packages
 in `system/packages`, and the user land and the amduvd add-on, cross-built
 from the same forks, in `system/non-packaged/amdgpu`. The image's boot script

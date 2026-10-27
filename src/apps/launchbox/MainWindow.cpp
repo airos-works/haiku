@@ -601,7 +601,7 @@ MainWindow::_AdjustLocation(BRect frame)
 void
 MainWindow::_AddDefaultButtons()
 {
-	// Mail (air/OS: jmgasper/mail replaces Haiku's Mail where it is installed)
+	// Mail (air/OS: airos-works/mail replaces Haiku's Mail where it is installed)
 	LaunchButton* button = new LaunchButton("launch button", NULL,
 		new BMessage(MSG_LAUNCH));
 	fPadView->AddButton(button);

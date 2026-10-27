@@ -1,6 +1,6 @@
-# air/OS release images, built by the air/OS build server (jmgasper/airos-ci,
+# air/OS release images, built by the air/OS build server (airos-works/airos-ci,
 # images/build-image.sh) from this tree and from inputs CI builds itself (the
-# owner's applications, Summit, the libraries and GL stack from the jmgasper
+# owner's applications, Summit, the libraries and GL stack from the airos-works
 # forks, firmware) - never from a workstation's directories.
 #
 #   x86_64     jam -q @nightly-airos-x86_64               -> airos-x86_64.iso

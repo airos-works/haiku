@@ -46,7 +46,7 @@ does.
 ## Building it
 
 It is not built with the rest of the tree, because it needs NVIDIA's resource
-manager headers, which live in the NVK tree (jmgasper/mesa-nvk, branch
+manager headers, which live in the NVK tree (airos-works/mesa-nvk, branch
 `airos-nvk-r2`). `build-cross.sh` cross-builds it from a Haiku build
 directory and that tree (the air/OS CI does, for the x86_64 image);
 `docs/x399-workstation/tools/build-nvdec-plugin.sh` builds it on the

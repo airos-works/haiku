@@ -40,9 +40,9 @@
 #define kPayloadPackageName		"airos_payload"
 
 // where an installation without an airos_release package looks: the
-// rolling GitHub release updates-<target> of jmgasper/haiku holds the
+// rolling GitHub release updates-<target> of airos-works/haiku holds the
 // target's index.json (airos-ci images/publish-feed-github.py)
-#define kDefaultFeedBase		"https://github.com/jmgasper/haiku/releases/" \
+#define kDefaultFeedBase		"https://github.com/airos-works/haiku/releases/" \
 									"download/updates-"
 
 // the user's settings
