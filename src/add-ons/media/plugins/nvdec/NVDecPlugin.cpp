@@ -242,6 +242,8 @@ NVDecDecoder::NegotiateOutputFormat(media_format* ioDecodedFormat)
 		fColorSpace = B_YCbCr422;
 	else if (wanted == (uint32)NVDEC_COLOR_SPACE_P010 && fHevc)
 		fColorSpace = NVDEC_COLOR_SPACE_P010;
+	else if (wanted == (uint32)NVDEC_COLOR_SPACE_NV12)
+		fColorSpace = NVDEC_COLOR_SPACE_NV12;
 	else
 		fColorSpace = B_RGB32;
 
@@ -249,7 +251,8 @@ NVDecDecoder::NegotiateOutputFormat(media_format* ioDecodedFormat)
 	format.u.raw_video.display.line_width = fWidth;
 	format.u.raw_video.display.line_count = fHeight;
 	format.u.raw_video.last_active = fHeight - 1;
-	fRowBytes = (size_t)fWidth * (fColorSpace == B_RGB32 ? 4 : 2);
+	fRowBytes = (size_t)fWidth * (fColorSpace == B_RGB32 ? 4
+		: fColorSpace == NVDEC_COLOR_SPACE_NV12 ? 1 : 2);
 	format.u.raw_video.display.bytes_per_row = fRowBytes;
 
 	*ioDecodedFormat = format;
@@ -330,6 +333,8 @@ NVDecDecoder::_Deliver(const NvdecFrame& frame, void* buffer,
 		nvdecFrameToYCbCr422Threaded(&frameRef, (uint8*)buffer, fRowBytes);
 	else if (fColorSpace == NVDEC_COLOR_SPACE_P010)
 		nvdecFrameToP010Threaded(&frameRef, (uint8*)buffer, fRowBytes);
+	else if (fColorSpace == NVDEC_COLOR_SPACE_NV12)
+		nvdecFrameToNV12Threaded(&frameRef, (uint8*)buffer, fRowBytes);
 	else
 		nvdecFrameToRGB32Threaded(&frameRef, (uint8*)buffer, fRowBytes, fRange);
 
@@ -348,7 +353,8 @@ NVDecDecoder::_Deliver(const NvdecFrame& frame, void* buffer,
 	mediaHeader->file_pos = 0;
 	mediaHeader->orig_size = 0;
 	mediaHeader->size_used = fRowBytes * fHeight
-		* (fColorSpace == NVDEC_COLOR_SPACE_P010 ? 3 : 2) / 2;
+		* (fColorSpace == NVDEC_COLOR_SPACE_P010
+			|| fColorSpace == NVDEC_COLOR_SPACE_NV12 ? 3 : 2) / 2;
 	mediaHeader->u.raw_video.display_line_width = fWidth;
 	mediaHeader->u.raw_video.display_line_count = fHeight;
 	mediaHeader->u.raw_video.bytes_per_row = fRowBytes;
