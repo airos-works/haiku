@@ -212,7 +212,9 @@ SharedBufferList::AddBuffer(sem_id groupReclaimSem, BBuffer* buffer)
 		return B_BAD_VALUE;
 
 	if (fCount == kMaxBuffers) {
-		return B_MEDIA_TOO_MANY_BUFFERS;
+		_RemoveStaleEntries();
+		if (fCount == kMaxBuffers)
+			return B_MEDIA_TOO_MANY_BUFFERS;
 	}
 
 	fInfos[fCount].id = buffer->ID();
@@ -465,6 +467,34 @@ SharedBufferList::_Init()
 	fCount = 0;
 
 	return B_OK;
+}
+
+
+/*!	Drops the entries of groups whose team is gone - a team that crashed or
+	was killed never deletes its groups, and their entries filled the list
+	until media_server was restarted (no buffer group could be made on the
+	whole system then) - and the holes RemoveBuffer() leaves.
+	Call this one with the list locked!
+*/
+void
+SharedBufferList::_RemoveStaleEntries()
+{
+	int32 removed = 0;
+	for (int32 i = 0; i < fCount; i++) {
+		sem_info info;
+		if (fInfos[i].id != -1
+			&& get_sem_info(fInfos[i].reclaim_sem, &info) == B_OK)
+			continue;
+
+		removed++;
+		fCount--;
+		if (fCount > 0)
+			fInfos[i--] = fInfos[fCount];
+	}
+	if (removed > 0) {
+		ERROR("SharedBufferList: dropped %" B_PRId32 " buffers of groups that "
+			"are gone\n", removed);
+	}
 }
 
 
