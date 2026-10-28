@@ -1,7 +1,8 @@
 SubDir HAIKU_TOP src tests add-ons accelerants amdgpu_kms ;
 
 # The amdgpu_kms accelerant's copies to the screen by the GPU, against a
-# frame buffer of the test's own; see device_copy_test.cpp.
+# frame buffer of the test's own (device_copy_test.cpp) and on the screen
+# (scanout_compare.cpp).
 
 UsePrivateHeaders graphics ;
 UsePrivateHeaders [ FDirName graphics common ] ;
@@ -17,4 +18,10 @@ SimpleTest device_copy_test :
 	device_copy_test.cpp
 	device_copy.cpp
 	kms.cpp
+;
+
+SimpleTest scanout_compare :
+	scanout_compare.cpp
+	kms.cpp
+	: be
 ;
