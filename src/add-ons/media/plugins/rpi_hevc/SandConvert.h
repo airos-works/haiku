@@ -41,8 +41,8 @@ void sand30_to_p010(const SandPicture& picture, uint8_t* luma,
 	uint32_t lumaStride, uint8_t* chroma, uint32_t chromaStride);
 
 /*!	As sand8_to_i420() and sand30_to_p010(), half as wide and high: each
-	sample the mean of a 2x2 block. The width and height must be multiples
-	of four. */
+	sample the mean of a 2x2 block, an odd chroma row the mean of the
+	one above it. The width must be a multiple of four, the height even. */
 void sand8_to_i420_half(const SandPicture& picture, uint8_t* luma,
 	uint32_t lumaStride, uint8_t* cb, uint8_t* cr, uint32_t chromaStride);
 void sand30_to_p010_half(const SandPicture& picture, uint8_t* luma,
