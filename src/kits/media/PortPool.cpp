@@ -50,6 +50,14 @@ PortPool::GetPort()
 	fPool.erase(port);
 
 	ASSERT(port >= 0);
+
+	// A reply that came in after its request gave up would be read as the
+	// answer to the next request using this port.
+	if (port_count(port) != 0) {
+		delete_port(port);
+		return create_port(1, "media reply port");
+	}
+
 	return port;
 }
 
