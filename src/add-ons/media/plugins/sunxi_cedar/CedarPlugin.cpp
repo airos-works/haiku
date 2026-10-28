@@ -34,9 +34,10 @@
 	- B_YCbCr422 or B_RGB32, for MediaPlayer and the other Media Kit users
 	  (ten bit pictures by their eight most significant bits).
 
-	A caller that asks for 'P010' or 'I420' pictures exactly half as wide and
-	high (display.line_width and line_count) gets them so, when the width and
-	height are multiples of four: each sample the mean of a 2x2 block.
+	A caller that asks for 'P010', 'I420' or B_RGB32 pictures exactly half as
+	wide and high (display.line_width and line_count) gets them so, when the
+	width and height are multiples of four: each sample the mean of a 2x2
+	block.
 
 	A negative time_to_decode in Decode()'s media_decode_info is, negated,
 	the time before which the caller will drop the pictures anyway (it is
@@ -634,7 +635,8 @@ SunxiCedarDecoder::NegotiateOutputFormat(media_format* format)
 	// that copies the picture anyway: a 4K film on a 1080p screen needs no
 	// more, and the caller then scales a quarter of the samples.
 	const media_video_display_info& asked = format->u.raw_video.display;
-	fHalf = (space == kColorSpaceP010 || space == kColorSpaceI420)
+	fHalf = (space == kColorSpaceP010 || space == kColorSpaceI420
+			|| space == B_RGB32)
 		&& fPicture.width % 4 == 0 && fPicture.height % 4 == 0
 		&& asked.line_width == fPicture.width / 2
 		&& asked.line_count == fPicture.height / 2;
@@ -908,7 +910,9 @@ SunxiCedarDecoder::Decode(void* buffer, int64* frameCount,
 		&& fPicture.pts < -info->time_to_decode;
 	_StartAhead();
 	if (!skip) {
-		if (fHalf)
+		if (fHalf && fOutputSpace == B_RGB32)
+			fDecoder->CopyHalfPacked(fPicture, (uint8*)buffer, stride);
+		else if (fHalf)
 			fDecoder->CopyHalfPlanes(fPicture, (uint8*)buffer, stride);
 		else if (fOutputSpace == kColorSpaceNV12
 			|| fOutputSpace == kColorSpaceI420

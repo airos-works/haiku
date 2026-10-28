@@ -105,6 +105,11 @@ public:
 			void				CopyPacked(const Picture& picture,
 									uint8* target, uint32 stride,
 									color_space space);
+			/*!	As CopyPacked() as B_RGB32, half as wide and high, each
+				pixel the mean of a 2x2 block. The picture's width and
+				height are multiples of four. */
+			void				CopyHalfPacked(const Picture& picture,
+									uint8* target, uint32 stride);
 			/*!	A ten bit picture's low two bits as the engine left them
 				(for finding out their layout); returns their size. */
 			size_t				CopyTwoBit(const Picture& picture,

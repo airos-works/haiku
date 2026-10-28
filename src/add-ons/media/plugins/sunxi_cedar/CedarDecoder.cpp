@@ -478,9 +478,10 @@ public:
 	int32 Count() const { return (int32)fThreads.size(); }
 
 	// Calls function(first, last) for bands of [0, rows), returns when all
-	// are done.
+	// are done. One picture at a time: the wait below lets go of fLock.
 	void Run(uint32 rows, const std::function<void(uint32, uint32)>& function)
 	{
+		std::lock_guard<std::mutex> picture(fRunLock);
 		std::unique_lock<std::mutex> lock(fLock);
 		fFunction = &function;
 		fRows = rows;
@@ -580,6 +581,7 @@ private:
 	}
 
 	std::vector<std::thread> fThreads;
+	std::mutex fRunLock;
 	std::mutex fLock;
 	std::condition_variable fWake;
 	std::condition_variable fDone;
@@ -755,6 +757,65 @@ pack_rgb32(const uint8* luma, const uint8* chroma, uint8* target,
 }
 
 
+/*!	One row of a 4:2:0 picture at half its width and height as B_RGB32,
+	studio range: each pixel the mean of a 2x2 block of \a top's and
+	\a bottom's luma, with the chroma sample those four share.
+*/
+static void
+pack_half_rgb32(const uint8* top, const uint8* bottom, const uint8* chroma,
+	uint8* target, uint32 width, const int16* matrix)
+{
+	uint32 x = 0;
+#if defined(__ARM_NEON)
+	int16x8_t sixteen = vdupq_n_s16(16);
+	int16x8_t half = vdupq_n_s16(128);
+	uint8x8_t opaque = vdup_n_u8(255);
+	for (; x + 16 <= width && !sNoNeon; x += 16) {
+		uint8x16x2_t t = vld2q_u8(top + 2 * x);
+		uint8x16x2_t b = vld2q_u8(bottom + 2 * x);
+		uint16x8_t sumLow = vaddq_u16(
+			vaddl_u8(vget_low_u8(t.val[0]), vget_low_u8(t.val[1])),
+			vaddl_u8(vget_low_u8(b.val[0]), vget_low_u8(b.val[1])));
+		uint16x8_t sumHigh = vaddq_u16(
+			vaddl_u8(vget_high_u8(t.val[0]), vget_high_u8(t.val[1])),
+			vaddl_u8(vget_high_u8(b.val[0]), vget_high_u8(b.val[1])));
+		uint8x8_t y[2] = { vrshrn_n_u16(sumLow, 2), vrshrn_n_u16(sumHigh, 2) };
+		uint8x16x2_t c = vld2q_u8(chroma + 2 * x);
+		for (int h = 0; h < 2; h++) {
+			int16x8_t cb = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(
+				h == 0 ? vget_low_u8(c.val[0]) : vget_high_u8(c.val[0]))), half);
+			int16x8_t cr = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(
+				h == 0 ? vget_low_u8(c.val[1]) : vget_high_u8(c.val[1]))), half);
+			int16x8_t yy = vmulq_n_s16(vsubq_s16(
+				vreinterpretq_s16_u16(vmovl_u8(y[h])), sixteen), matrix[0]);
+			int16x8_t r = vmulq_n_s16(cr, matrix[1]);
+			int16x8_t g = vaddq_s16(vmulq_n_s16(cb, matrix[2]),
+				vmulq_n_s16(cr, matrix[3]));
+			int16x8_t bl = vmulq_n_s16(cb, matrix[4]);
+			uint8x8x4_t pixels;
+			pixels.val[0] = vqrshrun_n_s16(vqaddq_s16(yy, bl), 6);
+			pixels.val[1] = vqrshrun_n_s16(vqsubq_s16(yy, g), 6);
+			pixels.val[2] = vqrshrun_n_s16(vqaddq_s16(yy, r), 6);
+			pixels.val[3] = opaque;
+			vst4_u8(target + 4 * (x + 8 * h), pixels);
+		}
+	}
+#endif
+	for (; x < width; x++) {
+		int32 sum = top[2 * x] + top[2 * x + 1] + bottom[2 * x]
+			+ bottom[2 * x + 1];
+		int32 y = (((sum + 2) >> 2) - 16) * matrix[0];
+		int32 cb = (int32)chroma[2 * x] - 128;
+		int32 cr = (int32)chroma[2 * x + 1] - 128;
+		target[4 * x + 2] = clamp_sample((y + matrix[1] * cr + 32) >> 6);
+		target[4 * x + 1] = clamp_sample((y - matrix[2] * cb - matrix[3] * cr
+			+ 32) >> 6);
+		target[4 * x] = clamp_sample((y + matrix[4] * cb + 32) >> 6);
+		target[4 * x + 3] = 255;
+	}
+}
+
+
 void
 CedarDecoder::CopyHalfPlanes(const Picture& picture, uint8* target,
 	uint32 stride)
@@ -854,15 +915,58 @@ CedarDecoder::CopyPacked(const Picture& picture, uint8* target, uint32 stride,
 		+ (size_t)frame.cropTop * frame.stride + frame.cropLeft;
 	const uint8* chroma = frame.picture.address + frame.lumaSize
 		+ (size_t)(frame.cropTop / 2) * frame.stride + (frame.cropLeft & ~1u);
-	for (uint32 row = 0; row < frame.height; row++) {
-		const uint8* lumaRow = luma + (size_t)row * frame.stride;
-		const uint8* chromaRow = chroma + (size_t)(row / 2) * frame.stride;
-		uint8* targetRow = target + (size_t)row * stride;
-		if (space == B_YCbCr422)
-			pack_ycbcr422(lumaRow, chromaRow, targetRow, frame.width / 2);
-		else
-			pack_rgb32(lumaRow, chromaRow, targetRow, frame.width, matrix);
-	}
+	auto pack = [&](uint32 first, uint32 last) {
+		for (uint32 row = first; row < last; row++) {
+			const uint8* lumaRow = luma + (size_t)row * frame.stride;
+			const uint8* chromaRow = chroma + (size_t)(row / 2) * frame.stride;
+			uint8* targetRow = target + (size_t)row * stride;
+			if (space == B_YCbCr422)
+				pack_ycbcr422(lumaRow, chromaRow, targetRow, frame.width / 2);
+			else
+				pack_rgb32(lumaRow, chromaRow, targetRow, frame.width, matrix);
+		}
+	};
+	// One core packed a 2160p picture as B_RGB32 in 30-55 ms: Summit kept
+	// up with 18 of YouTube's 60 pictures a second, dropping the rest.
+	MergePool* pool = MergePool::Default();
+	if (pool != NULL && pool->Count() > 0 && frame.width * frame.height
+			>= 1280 * 720)
+		pool->Run(frame.height, pack);
+	else
+		pack(0, frame.height);
+}
+
+
+void
+CedarDecoder::CopyHalfPacked(const Picture& picture, uint8* target,
+	uint32 stride)
+{
+	if (picture.frame < 0 || (size_t)picture.frame >= fFrames.size())
+		return;
+	const CedarFrame& frame = *fFrames[picture.frame];
+	fDevice.SyncForCpu(frame.picture, 0, frame.lumaSize + frame.lumaSize / 2);
+
+	static const int16 kBt601[] = { 75, 102, 25, 52, 129 };
+	static const int16 kBt709[] = { 75, 115, 14, 34, 135 };
+	const int16* matrix = frame.height >= 720 ? kBt709 : kBt601;
+
+	const uint8* luma = frame.picture.address
+		+ (size_t)frame.cropTop * frame.stride + frame.cropLeft;
+	const uint8* chroma = frame.picture.address + frame.lumaSize
+		+ (size_t)(frame.cropTop / 2) * frame.stride + (frame.cropLeft & ~1u);
+	auto pack = [&](uint32 first, uint32 last) {
+		for (uint32 row = first; row < last; row++) {
+			const uint8* topRow = luma + (size_t)(2 * row) * frame.stride;
+			pack_half_rgb32(topRow, topRow + frame.stride,
+				chroma + (size_t)row * frame.stride,
+				target + (size_t)row * stride, frame.width / 2, matrix);
+		}
+	};
+	MergePool* pool = MergePool::Default();
+	if (pool != NULL && pool->Count() > 0)
+		pool->Run(frame.height / 2, pack);
+	else
+		pack(0, frame.height / 2);
 }
 
 
