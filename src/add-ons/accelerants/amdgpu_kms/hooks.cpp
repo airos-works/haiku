@@ -79,6 +79,13 @@ get_accelerant_hook(uint32 feature, void* data)
 			return (void*)amdgpu_move_cursor;
 		case B_SHOW_CURSOR:
 			return (void*)amdgpu_show_cursor;
+
+		case B_CREATE_FRAME_BUFFER_SOURCE:
+			return (void*)amdgpu_create_frame_buffer_source;
+		case B_DELETE_FRAME_BUFFER_SOURCE:
+			return (void*)amdgpu_delete_frame_buffer_source;
+		case B_COPY_TO_FRAME_BUFFER:
+			return (void*)amdgpu_copy_to_frame_buffer;
 	}
 	return NULL;
 }

@@ -99,6 +99,7 @@ struct accelerant_info {
 	bool				hasPending;		// mode is set
 
 	Kms::Buffer			frameBuffer;
+	uint32				frameBufferGeneration;	// counts its replacements
 	uint32				modeBlobs[Kms::kMaxObjects];	// per CRTC index
 	display_mode		mode;
 	bool				modeSet;
@@ -152,6 +153,11 @@ int32 find_output_mode(const Output& output, const display_timing& timing);
 Output* primary_output(void);
 void update_cursor(void);
 
+// copies to the screen by the GPU (device_copy.cpp)
+void uninit_device_copies(void);
+void lock_device_copies(void);
+void unlock_device_copies(void);
+
 
 extern "C" {
 // accelerant.cpp
@@ -201,6 +207,13 @@ status_t amdgpu_set_cursor_bitmap(uint16 width, uint16 height, uint16 hotX,
 	uint16 hotY, color_space space, uint16 bytesPerRow, const uint8* data);
 void amdgpu_move_cursor(uint16 x, uint16 y);
 void amdgpu_show_cursor(bool visible);
+
+// device_copy.cpp
+status_t amdgpu_create_frame_buffer_source(uint16 width, uint16 height,
+	color_space space, frame_buffer_source* source);
+void amdgpu_delete_frame_buffer_source(uint32 id);
+status_t amdgpu_copy_to_frame_buffer(uint32 id, const fill_rect_params* list,
+	uint32 count);
 }
 
 
