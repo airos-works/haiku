@@ -124,6 +124,17 @@ switch $(HAIKU_BUILD_PROFILE) {
 		# (FFmpeg 6), Burrow (OpenSSL 3) and Summit's TLS certificates.
 		AddHaikuImageSystemPackages curl sqlite libpcre2 openssl3 ffmpeg6 git
 			ca_root_certificates ;
+		# CI's curl with HTTP/3 (airos-ci deps/recipes/curl.sh, under the
+		# repository package's name) instead of the repository's, whose
+		# libcurl has none, with the QUIC and HTTP/3 libraries it requires:
+		# as packages, so that the dependency resolution sees them.
+		local curl = [ Glob $(AIROS_CI_PACKAGES) : curl-*-x86_64.hpkg ] ;
+		if $(curl) {
+			local quic = [ Glob $(AIROS_CI_PACKAGES)
+				: airos_ngtcp2-*-x86_64.hpkg airos_nghttp3-*-x86_64.hpkg ] ;
+			SuppressHaikuImagePackages curl ;
+			AIROS_CI_BASE_PACKAGES += $(curl:BS) $(quic:BS) ;
+		}
 		# and what CI's packages need that this list has: Qt's dependencies
 		# (airos-ci deps/build-qt-airos.sh, images/build-image.sh)
 		if $(AIROS_CI_SYSTEM_PACKAGES) {
