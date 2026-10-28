@@ -62,6 +62,12 @@ service x-vnd.Be-PSRV {
 	on_demand
 }
 
+service x-vnd.Haiku-location_server {
+	launch /system/servers/location_server
+	no_safemode
+	on_demand
+}
+
 service x-vnd.Haiku-mdns_server {
 	launch /system/servers/mdns_server
 	no_safemode
