@@ -10,12 +10,14 @@
 	writes memory at the bus addresses the program puts in its registers and
 	SRAM, so every one of them has to lie in the program's own buffers, with
 	room for what the engine does there at the picture size the same writes
-	set. Only the registers of the H.264 and HEVC engines that the sunxi_cedar
-	add-on uses may be written, the engine may only be started by the driver,
+	set. Only the registers of the H.264, HEVC and VP9 decoders that the
+	sunxi_cedar add-on uses may be written, the engine may only be started by the driver,
 	and its scale-down output stays off.
 
 	Header only, so that the add-on's host test can run the same check. */
 
+
+#include <string.h>
 
 #include <sunxi_ve.h>
 
@@ -452,6 +454,248 @@ ve_check_ops(ve_check& check, const sunxi_ve_op* ops, uint32 count,
 		|| !fits(check, bitstream, ((uint64)bitOffset + bitLength + 7) / 8)) {
 		return fail(check, count, "bit stream outside the buffers");
 	}
+	return true;
+}
+
+
+namespace ve_check_private {
+
+
+//	VP9 (SUNXI_VE_RUN_VP9): the HEVC engine's VP9 decoder. Its pictures and
+//	side buffers are named by address registers alone (no SRAM frame list);
+//	the engine takes a picture's line stride from its width, aligned to 64
+//	(LAST_SCALE1 [30:28] = 3, which the check insists on), and works in
+//	64x64 superblocks.
+
+
+enum {
+	kVp9Mode = 0x000,
+	kVp9Counter = 0x008,
+	kVp9ChromaHalf = 0x0c4,
+	kVp9Stride = 0x0c8,
+	kVp9Syntax = 0x504,
+	kVp9Size = 0x508,
+	kVp9LastSize = 0x50c,		// GOLDEN, ALTREF follow
+	kVp9LastScale1 = 0x51c,
+	kVp9Control = 0x530,
+	kVp9Trigger = 0x534,
+	kVp9Bits = 0x540,
+	kVp9BitsOffset = 0x544,
+	kVp9BitsLength = 0x548,
+	kVp9BitsEnd = 0x54c,
+	kVp9Neighbour = 0x560,
+	kVp9Probs = 0x564,
+	kVp9ColMv = 0x578,
+	kVp9AltrefChroma = 0x57c,
+	kVp9TwoBitOffset = 0x584,
+	kVp9TenBit = 0x58c,
+	kVp9CurLuma = 0x590,		// chroma, LAST, GOLDEN, ALTREF luma follow
+	kVp9SramOffset = 0x5e0,
+	kVp9SramData = 0x5e4,
+
+	kVp9Registers = 0x600 / 4,
+	kVp9SramLimit = 0x200,		// dequantisers and loop filter levels
+	kVp9NeighbourSize = 0x1f4000,
+	kVp9ProbsSize = 0x88000
+};
+
+
+static bool
+vp9_writable(uint16 reg)
+{
+	switch (reg) {
+		case 0x000: case 0x008: case 0x0c4: case 0x0c8: case 0x0e8:
+		case 0x0ec:
+			return true;
+	}
+	return (reg >= 0x504 && reg <= 0x56c) || reg == 0x578 || reg == 0x57c
+		|| reg == 0x584 || reg == 0x58c || (reg >= 0x590 && reg <= 0x5a8)
+		|| reg == 0x5e0 || reg == 0x5e4;
+}
+
+
+/*!	Whether a VP9 picture of \a width x \a height lies at \a luma and
+	\a chroma (bus addresses, as the registers have them divided by 256),
+	with its low two bits behind the luma when \a twoBitStride is set.
+*/
+static bool
+vp9_picture_fits(const ve_check& check, uint32 width, uint32 height,
+	uint32 luma, uint32 chroma, uint32 twoBitOffset, uint32 twoBitStride)
+{
+	if (width == 0 || height == 0 || width > 4096 || height > 4096)
+		return false;
+	uint64 lumaSize = (uint64)align(width, 64) * align(height, 64);
+	if (!fits(check, (uint64)luma << 8, lumaSize)
+		|| !fits(check, (uint64)chroma << 8, lumaSize / 2)) {
+		return false;
+	}
+	if (twoBitStride == 0)
+		return true;
+	return twoBitStride >= (width + 3) / 4
+		&& fits(check, ((uint64)luma << 8) + twoBitOffset,
+			(uint64)twoBitStride * align(height, 64) * 3 / 2);
+}
+
+
+}	// namespace ve_check_private
+
+
+/*!	Whether the writes of a VP9 frame may run (SUNXI_VE_RUN_VP9, the HEVC
+	engine's trigger).
+*/
+static bool
+ve_check_vp9_ops(ve_check& check, const sunxi_ve_op* ops, uint32 count)
+{
+	using namespace ve_check_private;
+
+	check.problem = NULL;
+	check.index = 0;
+
+	// the last value of each register, and whether it was written
+	uint32 values[kVp9Registers];
+	bool written[kVp9Registers];
+	memset(written, 0, sizeof(written));
+	uint32 sram = kSramLimit;
+
+	for (uint32 i = 0; i < count; i++) {
+		const sunxi_ve_op& op = ops[i];
+		if (op.type == SUNXI_VE_OP_POLL_CLEAR
+			|| op.type == SUNXI_VE_OP_WRITE_BACK) {
+			if (op.reg != 0x538)
+				return fail(check, i, "polls or clears a register that is no status");
+			continue;
+		}
+		if (op.type != SUNXI_VE_OP_WRITE)
+			return fail(check, i, "unknown op");
+		if (!vp9_writable(op.reg) || (op.reg & 3) != 0)
+			return fail(check, i, "register not writable");
+
+		uint32 value = op.value;
+		switch (op.reg) {
+			case kVp9Mode:
+				if ((value & 0xf) != kModeHevc && (value & 0xf) != kModeNone)
+					return fail(check, i, "another engine");
+				break;
+			case kVp9Counter:
+				if ((value & ~0x80000000u) != 0)
+					return fail(check, i, "decode counter");
+				break;
+			case kVp9Trigger:
+			{
+				uint32 command = value & 0xff;
+				if (command != 1 && command != 3 && command != 7)
+					return fail(check, i, "engine command");
+				break;
+			}
+			case kVp9Control:
+				// interrupts, MCRI cache, DDR consistency
+				if ((value & ~0x80000407u) != 0)
+					return fail(check, i, "engine control");
+				break;
+			case 0x550: case 0x554: case 0x558:
+				if (value != 0)
+					return fail(check, i, "scale-down output");
+				break;
+			case kVp9TenBit:
+				if ((value & ~0xfffu) != 0)
+					return fail(check, i, "ten bit output mode");
+				break;
+			case kVp9SramOffset:
+				sram = value;
+				if (sram >= kVp9SramLimit || (sram & 3) != 0)
+					return fail(check, i, "SRAM offset");
+				break;
+			case kVp9SramData:
+				if (sram >= kVp9SramLimit)
+					return fail(check, i, "SRAM offset");
+				sram += 4;
+				break;
+		}
+		values[op.reg / 4] = value;
+		written[op.reg / 4] = true;
+	}
+
+	#define VALUE(reg) values[(reg) / 4]
+	#define WRITTEN(reg) written[(reg) / 4]
+
+	if (!WRITTEN(kVp9Mode) || (VALUE(kVp9Mode) & 0xf) != kModeHevc)
+		return fail(check, count, "another engine than the one triggered");
+	if (!WRITTEN(kVp9Size) || !WRITTEN(kVp9Stride) || !WRITTEN(kVp9Syntax)
+		|| !WRITTEN(kVp9LastScale1)) {
+		return fail(check, count, "no picture size and layout");
+	}
+	uint32 width = VALUE(kVp9Size) & 0x3fff;
+	uint32 height = (VALUE(kVp9Size) >> 16) & 0x3fff;
+	if (width == 0 || height == 0 || width > 4096 || height > 4096
+		|| (VALUE(kVp9Stride) & 0xffff) != align(width, 64)
+		|| ((VALUE(kVp9LastScale1) >> 28) & 7) != 3) {
+		return fail(check, count, "picture size and layout");
+	}
+	uint32 syntax = VALUE(kVp9Syntax);
+	uint32 depth = (syntax >> 2) & 7;
+	if (depth != 0 && depth != 2)
+		return fail(check, count, "bit depth");
+	uint32 twoBitOffset = 0, twoBitStride = 0;
+	if (depth != 0) {
+		if (!WRITTEN(kVp9TwoBitOffset) || !WRITTEN(kVp9TenBit))
+			return fail(check, count, "no two-bit planes");
+		twoBitOffset = VALUE(kVp9TwoBitOffset) & 0x0fffffff;
+		twoBitStride = VALUE(kVp9TenBit) & 0xfff;
+		if (twoBitStride == 0)
+			return fail(check, count, "no two-bit planes");
+	}
+
+	// the picture the engine writes, and those it reads
+	if (!WRITTEN(kVp9CurLuma) || !WRITTEN(kVp9CurLuma + 4)
+		|| !vp9_picture_fits(check, width, height, VALUE(kVp9CurLuma),
+			VALUE(kVp9CurLuma + 4), twoBitOffset, twoBitStride)) {
+		return fail(check, count, "no output picture");
+	}
+	if ((syntax & 2) != 0) {
+		static const uint16 kChroma[3] = { 0x59c, 0x5a4, kVp9AltrefChroma };
+		for (int i = 0; i < 3; i++) {
+			uint16 size = kVp9LastSize + i * 4;
+			uint16 luma = 0x598 + i * 8;
+			if (!WRITTEN(size) || !WRITTEN(luma) || !WRITTEN(kChroma[i])
+				|| !vp9_picture_fits(check, VALUE(size) & 0x3fff,
+					(VALUE(size) >> 16) & 0x3fff, VALUE(luma),
+					VALUE(kChroma[i]), twoBitOffset, twoBitStride)) {
+				return fail(check, count, "reference picture outside the "
+					"buffers");
+			}
+		}
+	}
+
+	// the side buffers
+	if (!WRITTEN(kVp9Neighbour)
+		|| !fits(check, (uint64)VALUE(kVp9Neighbour) << 8, kVp9NeighbourSize))
+		return fail(check, count, "neighbour information outside the buffers");
+	if (!WRITTEN(kVp9Probs)
+		|| !fits(check, (uint64)VALUE(kVp9Probs) << 8, kVp9ProbsSize))
+		return fail(check, count, "probabilities outside the buffers");
+	if (!WRITTEN(kVp9ColMv) || !fits(check, (uint64)VALUE(kVp9ColMv) << 8,
+			(uint64)(align(width, 64) / 8) * (align(height, 64) / 8) * 16)) {
+		return fail(check, count, "motion vectors outside the buffers");
+	}
+
+	// the stream
+	if (!WRITTEN(kVp9Bits) || !WRITTEN(kVp9BitsEnd)
+		|| !WRITTEN(kVp9BitsOffset) || !WRITTEN(kVp9BitsLength)) {
+		return fail(check, count, "bit stream outside the buffers");
+	}
+	if ((VALUE(kVp9Bits) & 0x0f000000) != 0)
+		return fail(check, count, "bit stream outside the buffers");
+	uint64 bitstream = (uint64)(VALUE(kVp9Bits) & 0x00ffffff) << 8;
+	uint64 bitstreamEnd = (uint64)VALUE(kVp9BitsEnd) << 8;
+	if (bitstreamEnd <= bitstream
+		|| !fits(check, bitstream, bitstreamEnd - bitstream)
+		|| !fits(check, bitstream, ((uint64)VALUE(kVp9BitsOffset)
+			+ VALUE(kVp9BitsLength) + 7) / 8)) {
+		return fail(check, count, "bit stream outside the buffers");
+	}
+
+	#undef VALUE
+	#undef WRITTEN
 	return true;
 }
 

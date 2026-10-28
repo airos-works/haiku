@@ -148,4 +148,92 @@ h264_vld_addr(uint32_t a)
 
 #define CEDAR_VCU_DEC_INT_STA		0x628	/* A733 */
 
+/* VP9: the HEVC engine with registers of its own (Jernej Skrabec's H.616
+   findings, cubie/evidence/video/cedar-register-map.md); its VE_MODE sets
+   bits 30 and 31 and leaves out the 2 MiB write mode */
+#define CEDAR_MODE_VP9_RAMPD		(1u << 31)
+#define CEDAR_MODE_VP9_BIT30		(1u << 30)
+#define CEDAR_DEC_COUNTER		0x008
+#define   CEDAR_DEC_COUNTER_ENABLE	(1u << 31)
+
+#define VP9_HDR_SYN			0x504
+#define   VP9_SYN_TILES			(1u << 0)
+#define   VP9_SYN_INTER			(1u << 1)
+#define   VP9_SYN_DEPTH(d)		(((uint32_t)(d) & 7) << 2)
+#define   VP9_SYN_BIAS_LAST		(1u << 5)
+#define   VP9_SYN_BIAS_GOLDEN		(1u << 6)
+#define   VP9_SYN_BIAS_ALTREF		(1u << 7)
+#define   VP9_SYN_HIGH_PRECISION_MV	(1u << 8)
+#define   VP9_SYN_INTERP(f)		(((uint32_t)(f) & 7) << 9)
+#define   VP9_SYN_LOOP_FILTER		(1u << 12)
+#define   VP9_SYN_SHARPNESS(s)		(((uint32_t)(s) & 7) << 13)
+#define   VP9_SYN_LOSSLESS		(1u << 16)
+#define   VP9_SYN_SEGMENTATION		(1u << 17)
+#define   VP9_SYN_SEG_UPDATE_MAP	(1u << 18)
+#define   VP9_SYN_SEG_TEMPORAL		(1u << 19)
+#define   VP9_SYN_TX_MODE(m)		(((uint32_t)(m) & 7) << 20)
+#define   VP9_SYN_REF_MODE(m)		(((uint32_t)(m) & 3) << 23)
+#define   VP9_SYN_PREV_MVS		(1u << 25)
+#define   VP9_SYN_ENABLE2		(1u << 26)
+#define   VP9_SYN_COUNTS		(1u << 27)
+#define   VP9_SYN_DECODE		(1u << 31)
+#define VP9_PIC_SIZE			0x508	/* width [13:0], height [29:16] */
+#define VP9_LAST_SIZE			0x50c
+#define VP9_GOLDEN_SIZE			0x510
+#define VP9_ALTREF_SIZE			0x514
+#define VP9_LAST_SCALE0			0x518	/* step - 1 [4:0], Q14 factor [20:5] */
+#define VP9_LAST_SCALE1			0x51c	/* the same, and [30:28] */
+#define   VP9_STRIDE_ALIGN_64		(3u << 28)	/* log2(64 / 8) */
+#define VP9_GOLDEN_SCALE0		0x520
+#define VP9_GOLDEN_SCALE1		0x524	/* step - 1 [4:0], factor [31:16] */
+#define VP9_ALTREF_SCALE0		0x528
+#define VP9_ALTREF_SCALE1		0x52c
+#define VP9_FUNC_CTRL			0x530
+#define   VP9_IRQ_MASK			0x7
+#define   VP9_DDR_CONSISTENCY		(1u << 31)
+#define VP9_TRIGGER			0x534
+#define   VP9_TRIG_INIT_SWDEC		7u
+#define   VP9_TRIG_DECODE_FRAME		8u
+#define VP9_STATUS			0x538
+#define VP9_CTB_NUM			0x53c
+#define VP9_BITS_ADDR			0x540
+#define VP9_BITS_OFFSET			0x544
+#define VP9_BITS_LEN			0x548
+#define VP9_BITS_END			0x54c
+#define VP9_SDRT_CTRL			0x550
+#define VP9_SDRT_LUMA			0x554
+#define VP9_SDRT_CHROMA			0x558
+#define VP9_SEG_FEATURES		0x55c
+#define VP9_NEIGHBOR_ADDR		0x560
+#define VP9_PROBS_ADDR			0x564
+#define VP9_TILE_START			0x568
+#define   VP9_TILE_INVALID		(1u << 31)
+#define VP9_TILE_END			0x56c
+#define VP9_COL_MV_ADDR			0x578
+#define VP9_ALTREF_CHROMA		0x57c
+#define VP9_TWO_BIT_OFFSET		0x584
+#define VP9_TEN_BIT_CONFIG		0x58c
+#define VP9_CUR_LUMA			0x590
+#define VP9_CUR_CHROMA			0x594
+#define VP9_LAST_LUMA			0x598
+#define VP9_LAST_CHROMA			0x59c
+#define VP9_GOLDEN_LUMA			0x5a0
+#define VP9_GOLDEN_CHROMA		0x5a4
+#define VP9_ALTREF_LUMA			0x5a8
+#define VP9_SRAM_OFFSET			0x5e0
+#define VP9_SRAM_DATA			0x5e4
+#define   VP9_SRAM_DEQUANT		0x000
+#define   VP9_SRAM_LOOP_FILTER		0x100
+
+/* the probability buffer: further tiles, probabilities, the counts the
+   engine writes back, the segment map */
+#define VP9_PROBS_BUFFER_SIZE		0x88000
+#define VP9_PROBS_TILES			0x0000
+#define VP9_PROBS_TABLE			0x4000
+#define VP9_PROBS_TABLE_SIZE		0xafc
+#define VP9_PROBS_COUNTS		0x4b00
+#define VP9_PROBS_COUNTS_SIZE		0x3398
+#define VP9_PROBS_SEGMENT_MAP		0x8000
+#define VP9_NEIGHBOR_SIZE		0x1f4000
+
 #endif	/* CEDAR_REGISTERS_H */

@@ -836,8 +836,15 @@ run_slice(ve_client* client, sunxi_ve_run& request, const sunxi_ve_op* ops)
 	}
 	clientLocker.Unlock();
 
+	bool vp9 = (request.flags & SUNXI_VE_RUN_VP9) != 0;
+	if (vp9 && !hevc) {
+		clientLocker.Lock();
+		client->busy--;
+		return B_BAD_VALUE;
+	}
 	ve_check check = { ranges, rangeCount, NULL, 0 };
-	if (!ve_check_ops(check, ops, request.count, hevc)) {
+	if (vp9 ? !ve_check_vp9_ops(check, ops, request.count)
+			: !ve_check_ops(check, ops, request.count, hevc)) {
 		ERROR("slice refused: %s (op %" B_PRIu32 ")\n", check.problem,
 			check.index);
 		clientLocker.Lock();

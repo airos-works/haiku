@@ -3,20 +3,27 @@
  * Distributed under the terms of the MIT License.
  */
 
-/*	H.264 and HEVC on the Allwinner A733's video engine (Radxa Cubie A7S),
-	as a decoder add-on of the Media Kit (CedarDecoder does the work).
+/*	H.264, HEVC and VP9 on the Allwinner A733's video engine (Radxa Cubie
+	A7S), as a decoder add-on of the Media Kit (CedarDecoder does the work).
 
 	The Media Kit gives a format to one decoder and never tries another when
 	that one's Setup() fails, so the formats are only registered where the
 	engine is (/dev/misc/sunxi_ve exists), and a stream the engine does not
-	decode (fields, more than eight bits, not 4:2:0, larger than 4096) goes
-	on in software: the decoder then hands everything to one of the FFmpeg
-	add-on's decoders. A stream whose parameter sets only come in band is
+	decode (fields, more than eight bits, not 4:2:0, larger than 4096; VP9
+	profiles 1 and 3 and twelve bits) goes on in software: the decoder then
+	hands everything to one of the FFmpeg add-on's decoders. A stream whose parameter sets only come in band is
 	found out at its first picture; the chunks read until then are given to
 	the FFmpeg decoder again.
 
 	airTime asks for decoder 1, which has no such fallback: it falls back to
 	libavcodec itself, and needs to know that it does.
+
+	VP9 comes as FFmpeg's demuxer (or a WebM reader) hands it out: a chunk
+	is a frame or a superframe, and gives at most one picture (the last one
+	it shows, as libvpx). Profile 0 pictures are eight bit, profile 2 ones
+	ten bit (P010). A VP9 stream whose first frame the engine does not take
+	(or a sunxi_ve driver from before VP9, which refuses the frames) goes to
+	the FFmpeg decoder as the others do.
 
 	Pictures are handed out as
 	- 'I420': line_count rows of luma bytes_per_row apart, then a plane of Cb
@@ -58,10 +65,11 @@
 #include "hevc_parse.h"
 
 
-// AV_CODEC_ID_H264 and AV_CODEC_ID_HEVC of the FFmpeg add-on's format
-// descriptions
+// AV_CODEC_ID_H264, AV_CODEC_ID_HEVC and AV_CODEC_ID_VP9 of the FFmpeg
+// add-on's format descriptions
 static const uint32 kCodecH264 = 27;
 static const uint32 kCodecHEVC = 173;
+static const uint32 kCodecVP9 = 167;
 
 static const color_space kColorSpaceNV12 = (color_space)0x4e563132;	// 'NV12'
 static const color_space kColorSpaceI420 = (color_space)0x49343230;	// 'I420'
@@ -248,6 +256,7 @@ SunxiCedarDecoder::GetCodecInfo(media_codec_info* info)
 	memset(info, 0, sizeof(*info));
 	strlcpy(info->pretty_name, fCodec == kCodecHEVC
 			? "Allwinner Cedar hardware HEVC decoder"
+			: fCodec == kCodecVP9 ? "Allwinner Cedar hardware VP9 decoder"
 			: "Allwinner Cedar hardware H.264 decoder",
 		sizeof(info->pretty_name));
 	strlcpy(info->short_name, "sunxi_cedar", sizeof(info->short_name));
@@ -272,7 +281,7 @@ SunxiCedarDecoder::_SetParameterSets(const uint8* data, size_t size)
 {
 	fParameterSets.clear();
 	fNalLengthSize = 0;
-	if (data == NULL || size < 4)
+	if (data == NULL || size < 4 || fCodec == kCodecVP9)
 		return;
 
 	if (data[0] == 0 && data[1] == 0 && (data[2] == 1
@@ -333,6 +342,10 @@ SunxiCedarDecoder::_EngineDecodes(BString& reason) const
 	size_t size;
 	char error[160];
 	bool decodes = true;
+
+	// VP9 says what it is in its frames
+	if (fCodec == kCodecVP9)
+		return true;
 
 	if (fCodec == kCodecH264) {
 		H264State* state = new(std::nothrow) H264State;
@@ -521,7 +534,8 @@ SunxiCedarDecoder::Setup(media_format* format, const void* info,
 			&description) != B_OK
 		|| description.u.misc.file_format != 'ffmp'
 		|| (description.u.misc.codec != kCodecH264
-			&& description.u.misc.codec != kCodecHEVC)) {
+			&& description.u.misc.codec != kCodecHEVC
+			&& description.u.misc.codec != kCodecVP9)) {
 		return B_NOT_SUPPORTED;
 	}
 
@@ -539,7 +553,8 @@ SunxiCedarDecoder::Setup(media_format* format, const void* info,
 		// (reason says why)
 	} else {
 		fDecoder = new(std::nothrow) CedarDecoder(fCodec == kCodecHEVC
-			? CedarDecoder::HEVC : CedarDecoder::H264);
+			? CedarDecoder::HEVC : fCodec == kCodecVP9 ? CedarDecoder::VP9
+			: CedarDecoder::H264);
 		if (fDecoder == NULL)
 			return B_NO_MEMORY;
 		status_t status = fDecoder->Open(&reason);
@@ -674,6 +689,8 @@ SunxiCedarDecoder::SeekedTo(int64 frame, bigtime_t time)
 status_t
 SunxiCedarDecoder::_PutUnits(const uint8* data, size_t size, int64 time)
 {
+	if (fCodec == kCodecVP9)
+		return fDecoder->PutNal(data, size, time);
 	if (fNalLengthSize != 0) {
 		size_t offset = 0;
 		while (offset + fNalLengthSize <= size) {
@@ -944,7 +961,7 @@ SunxiCedarPlugin::NewDecoder(uint index)
 status_t
 SunxiCedarPlugin::GetSupportedFormats(media_format** _formats, size_t* _count)
 {
-	static media_format sFormats[2];
+	static media_format sFormats[3];
 	*_formats = sFormats;
 	*_count = 0;
 
@@ -956,8 +973,8 @@ SunxiCedarPlugin::GetSupportedFormats(media_format** _formats, size_t* _count)
 	BMediaFormats formats;
 	if (formats.InitCheck() != B_OK)
 		return B_OK;
-	const uint32 kCodecs[] = { kCodecH264, kCodecHEVC };
-	for (size_t i = 0; i < 2; i++) {
+	const uint32 kCodecs[] = { kCodecH264, kCodecHEVC, kCodecVP9 };
+	for (size_t i = 0; i < 3; i++) {
 		media_format_description description;
 		description.family = B_MISC_FORMAT_FAMILY;
 		description.u.misc.file_format = 'ffmp';
@@ -971,7 +988,7 @@ SunxiCedarPlugin::GetSupportedFormats(media_format** _formats, size_t* _count)
 			return B_OK;
 		sFormats[i] = format;
 	}
-	*_count = 2;
+	*_count = 3;
 	return B_OK;
 }
 

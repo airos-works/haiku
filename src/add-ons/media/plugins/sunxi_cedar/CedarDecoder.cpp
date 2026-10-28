@@ -59,6 +59,9 @@ CedarDecoder::CedarDecoder(codec codec)
 	fHevcSlice(NULL),
 	fHevcFirst(NULL),
 	fNoRaslOutput(false),
+	fVp9(NULL),
+	fVp9Frame(NULL),
+	fVp9Counts(NULL),
 	fCurrent(-1),
 	fFirstSlice(false),
 	fSkipping(false),
@@ -69,6 +72,8 @@ CedarDecoder::CedarDecoder(codec codec)
 	fDecoded(0)
 {
 	fParseError[0] = '\0';
+	for (int i = 0; i < VP9_REF_SLOTS; i++)
+		fVp9Slots[i] = -1;
 	// never moved: a picture is copied out while the next one is decoded
 	fFrames.reserve(kMaxFrames);
 }
@@ -113,6 +118,15 @@ CedarDecoder::Open(BString* _error)
 			return B_NO_MEMORY;
 		}
 		h264_init(fH264);
+	} else if (fCodec == VP9) {
+		fVp9 = new(std::nothrow) Vp9State;
+		fVp9Frame = new(std::nothrow) Vp9Frame;
+		fVp9Counts = new(std::nothrow) Vp9Counts;
+		if (fVp9 == NULL || fVp9Frame == NULL || fVp9Counts == NULL) {
+			Close();
+			return B_NO_MEMORY;
+		}
+		vp9_init(fVp9);
 	} else {
 		fHevc = new(std::nothrow) HevcState;
 		fHevcSlice = new(std::nothrow) HevcSlice;
@@ -148,6 +162,12 @@ CedarDecoder::Close()
 	delete fHevc;
 	delete fHevcSlice;
 	delete fHevcFirst;
+	delete fVp9;
+	delete fVp9Frame;
+	delete fVp9Counts;
+	fVp9 = NULL;
+	fVp9Frame = NULL;
+	fVp9Counts = NULL;
 	fH264 = NULL;
 	fH264Slice = fH264First = fH264Previous = NULL;
 	fHevc = NULL;
@@ -165,6 +185,8 @@ CedarDecoder::PutNal(const uint8* nal, size_t size, int64 pts)
 		return B_NO_INIT;
 	if (fCodec == H264)
 		return size >= 1 ? _PutH264(nal, size, pts) : B_OK;
+	if (fCodec == VP9)
+		return _PutVp9(nal, size, pts);
 	return size >= 2 ? _PutHevc(nal, size, pts) : B_OK;
 }
 
@@ -193,7 +215,8 @@ CedarDecoder::Reset()
 	fDevice.EndPicture();
 	fOutput.clear();
 	for (CedarFrame* frame : fFrames) {
-		frame->current = frame->waiting = frame->ready = frame->held = false;
+		frame->current = frame->waiting = false;
+		frame->ready = frame->held = 0;
 		frame->position = -1;
 	}
 	fCurrent = -1;
@@ -212,6 +235,10 @@ CedarDecoder::Reset()
 			fHevc->refs[i].used = 0;
 		fHevc->firstPicture = 1;
 	}
+	if (fVp9 != NULL)
+		vp9_reset(fVp9);
+	for (int i = 0; i < VP9_REF_SLOTS; i++)
+		fVp9Slots[i] = -1;
 	fNoRaslOutput = false;
 }
 
@@ -221,14 +248,15 @@ CedarDecoder::NextPicture(Picture& picture)
 {
 	if (fOutput.empty())
 		return false;
-	int32 index = fOutput.front();
+	OutputEntry entry = fOutput.front();
 	fOutput.pop_front();
+	int32 index = entry.frame;
 
 	CedarFrame& frame = *fFrames[index];
-	frame.ready = false;
-	frame.held = true;
+	frame.ready--;
+	frame.held++;
 	picture.frame = index;
-	picture.pts = frame.pts;
+	picture.pts = entry.pts;
 	picture.poc = frame.poc;
 	picture.width = frame.width;
 	picture.height = frame.height;
@@ -243,7 +271,9 @@ CedarDecoder::ReleasePicture(const Picture& picture)
 {
 	if (picture.frame < 0 || (size_t)picture.frame >= fFrames.size())
 		return;
-	fFrames[picture.frame]->held = false;
+	CedarFrame& frame = *fFrames[picture.frame];
+	if (frame.held > 0)
+		frame.held--;
 }
 
 
@@ -866,6 +896,13 @@ CedarDecoder::_IsReference(int32 index) const
 		}
 		return false;
 	}
+	if (fVp9 != NULL) {
+		for (int i = 0; i < VP9_REF_SLOTS; i++) {
+			if (fVp9Slots[i] == index)
+				return true;
+		}
+		return false;
+	}
 	for (int i = 0; i < HEVC_MAX_DPB; i++) {
 		if (fHevc->refs[i].used != 0 && fHevc->refs[i].frame == index)
 			return true;
@@ -926,9 +963,16 @@ CedarDecoder::_Bump()
 	if (first < 0)
 		return false;
 	fFrames[first]->waiting = false;
-	fFrames[first]->ready = true;
-	fOutput.push_back(first);
+	_Output(first, fFrames[first]->pts);
 	return true;
+}
+
+
+void
+CedarDecoder::_Output(int32 index, int64 pts)
+{
+	fFrames[index]->ready++;
+	fOutput.push_back(OutputEntry{index, pts});
 }
 
 
@@ -999,7 +1043,8 @@ CedarDecoder::_NewFrame(uint32 width, uint32 height, uint32 cropLeft,
 	frame.poc = 0;
 	frame.pts = pts;
 	frame.current = true;
-	frame.waiting = frame.ready = frame.held = false;
+	frame.waiting = false;
+	frame.ready = frame.held = 0;
 	frame.corrupt = false;
 	frame.latency = 0;
 	frame.stride = fEngine.Stride();
@@ -1024,8 +1069,10 @@ CedarDecoder::_FinishPicture()
 	if (fCurrent >= 0) {
 		if (fCodec == H264)
 			_FinishH264Picture();
-		else
+		else if (fCodec == HEVC)
 			_FinishHevcPicture();
+		else
+			fFrames[fCurrent]->current = false;
 		// other programs' slices may come again
 		fDevice.EndPicture();
 	}
@@ -1296,10 +1343,8 @@ CedarDecoder::_FinishH264Picture()
 					first = false;
 			}
 			if (first) {
-				if (!frame.corrupt) {
-					frame.ready = true;
-					fOutput.push_back(fCurrent);
-				}
+				if (!frame.corrupt)
+					_Output(fCurrent, frame.pts);
 				shown = true;
 				break;
 			}
@@ -1550,4 +1595,117 @@ CedarDecoder::_FinishHevcPicture()
 			break;
 		_Bump();
 	}
+}
+
+
+//	#pragma mark - VP9
+
+
+status_t
+CedarDecoder::_PutVp9(const uint8* chunk, size_t size, int64 pts)
+{
+	size_t offsets[VP9_MAX_FRAMES], sizes[VP9_MAX_FRAMES];
+	int count = vp9_split_superframe(chunk, size, offsets, sizes);
+	size_t queued = fOutput.size();
+	status_t status = B_OK;
+	for (int i = 0; i < count && status == B_OK; i++)
+		status = _Vp9Frame(chunk + offsets[i], sizes[i], pts);
+
+	// As libvpx, a chunk shows one picture, the last it decoded to be shown
+	// (a spatial SVC superframe has one of every layer).
+	while (fOutput.size() > queued + 1) {
+		fFrames[fOutput[queued].frame]->ready--;
+		fOutput.erase(fOutput.begin() + queued);
+	}
+	return status;
+}
+
+
+status_t
+CedarDecoder::_Vp9Frame(const uint8* data, size_t size, int64 pts)
+{
+	Vp9Frame& frame = *fVp9Frame;
+	int result = vp9_parse_frame(fVp9, data, size, &frame, fParseError);
+	if (result == -2) {
+		return _Fail(B_NOT_SUPPORTED, "the engine does not do this stream: "
+			"%s", fParseError);
+	}
+	if (result != 0) {
+		// as libvpx: nothing until a key frame (or an intra-only one) sets
+		// the references up again
+		if (!fAwaitRandomAccess) {
+			fprintf(stderr, "sunxi_cedar: VP9 frame %" B_PRIu32 ": %s\n",
+				fDecoded, fParseError);
+		}
+		fAwaitRandomAccess = true;
+		return B_OK;
+	}
+
+	if (frame.showExistingFrame) {
+		int32 index = fVp9Slots[frame.frameToShow];
+		if (!fAwaitRandomAccess && index >= 0 && !fFrames[index]->corrupt)
+			_Output(index, pts);
+		return B_OK;
+	}
+
+	bool intra = frame.frameType == VP9_KEY_FRAME || frame.intraOnly;
+	if (fAwaitRandomAccess && !intra)
+		return B_OK;
+	fAwaitRandomAccess = false;
+
+	if ((uint32)frame.width > kMaxSize || (uint32)frame.height > kMaxSize) {
+		return _Fail(B_NOT_SUPPORTED, "the engine decodes up to %" B_PRIu32
+			"x%" B_PRIu32 ", this is %dx%d", kMaxSize, kMaxSize, frame.width,
+			frame.height);
+	}
+
+	CedarFrame* references[3] = { NULL, NULL, NULL };
+	if (!intra) {
+		for (int i = 0; i < 3; i++) {
+			int32 index = fVp9Slots[frame.refSlot[i]];
+			if (index < 0) {
+				fAwaitRandomAccess = true;
+				return B_OK;
+			}
+			references[i] = fFrames[index];
+		}
+	}
+
+	status_t status = fEngine.ConfigureVp9(frame.width, frame.height,
+		frame.bitDepth);
+	if (status != B_OK)
+		return _Fail(status, "no memory for the engine: %s", strerror(status));
+	status = _NewFrame(frame.width, frame.height, 0, 0, frame.bitDepth, pts);
+	if (status != B_OK)
+		return status;
+	CedarFrame& current = *fFrames[fCurrent];
+	current.poc = (int32)fDecoded;
+
+	status = fEngine.DecodeVp9Frame(frame, current, references, data, size,
+		fVp9Counts);
+	bool decoded = status == B_OK;
+	if (!decoded) {
+		if (status == B_NOT_ALLOWED && fDecoded == 0) {
+			// a driver from before VP9 (or one that refuses this stream)
+			current.current = false;
+			fCurrent = -1;
+			return _Fail(B_NOT_SUPPORTED, "the driver does not run VP9 "
+				"frames: %s", fEngine.LastError());
+		}
+		fprintf(stderr, "sunxi_cedar: VP9 frame %" B_PRIu32 ": %s\n",
+			fDecoded, fEngine.LastError());
+		current.corrupt = true;
+	}
+	vp9_finish_frame(fVp9, &frame, decoded ? fVp9Counts : NULL);
+
+	for (int i = 0; i < VP9_REF_SLOTS; i++) {
+		if ((frame.refreshFrameFlags & (1 << i)) != 0)
+			fVp9Slots[i] = fCurrent;
+	}
+	current.current = false;
+	if (frame.showFrame && !current.corrupt)
+		_Output(fCurrent, pts);
+	fCurrent = -1;
+	fDecoded++;
+	return B_OK;
 }
