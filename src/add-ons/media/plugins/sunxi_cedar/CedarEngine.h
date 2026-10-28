@@ -43,12 +43,13 @@ struct CedarFrame {
 	size_t		twoBitOffset;
 	size_t		twoBitChroma;	// where the chroma rows begin
 	uint32		twoBitStride;
+	size_t		guardOffset;	// (VP9 tests: CEDAR_VP9_GUARD)
 
 	CedarFrame() : position(-1), poc(0), pts(0), current(false),
 		waiting(false), ready(0), held(0), corrupt(false),
 		latency(0), stride(0), lumaSize(0), cropLeft(0), cropTop(0),
 		width(0), height(0), bitDepth(8), twoBitOffset(0), twoBitChroma(0),
-		twoBitStride(0) {}
+		twoBitStride(0), guardOffset(0) {}
 };
 
 
@@ -182,6 +183,7 @@ private:
 			VeBuffer			fVp9Probs;
 			VeBuffer			fVp9Neighbour;
 			VeBuffer			fVp9ColMv;
+			size_t				fVp9ColMvSize;
 			uint32				fVp9TwoBitAlign;
 
 			bool				fDdr128;

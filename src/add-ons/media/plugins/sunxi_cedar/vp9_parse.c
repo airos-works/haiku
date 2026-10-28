@@ -227,6 +227,26 @@ vp9_split_superframe(const uint8_t *data, size_t size,
 
 
 int
+vp9_is_key_frame(const uint8_t *data, size_t size)
+{
+	size_t offsets[VP9_MAX_FRAMES], sizes[VP9_MAX_FRAMES];
+	if (vp9_split_superframe(data, size, offsets, sizes) < 1)
+		return 0;
+	BitReader br;
+	br_init(&br, data + offsets[0], sizes[0]);
+	if (br_u(&br, 2) != 2)
+		return 0;
+	int profile = br_flag(&br);
+	profile |= br_flag(&br) << 1;
+	if (profile == 3)
+		br_u(&br, 1);
+	if (br_flag(&br))		/* show_existing_frame */
+		return 0;
+	return br_flag(&br) == VP9_KEY_FRAME && !br.overrun;
+}
+
+
+int
 vp9_tile_offset(int tile, int mis, int log2Tiles)
 {
 	int sb64s = (mis + 7) >> 3;

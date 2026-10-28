@@ -17,6 +17,50 @@
 // fCodec for VP9 (it runs in the HEVC engine)
 static const int kCodecVp9 = 9;
 
+// CEDAR_VP9_GUARD: KiB of canary behind every VP9 buffer, checked after
+// every frame (to find where the engine writes what it should not)
+static size_t
+vp9_guard()
+{
+	static const size_t sGuard = getenv("CEDAR_VP9_GUARD") != NULL
+		? (size_t)atoi(getenv("CEDAR_VP9_GUARD")) * 1024 : 0;
+	return sGuard;
+}
+
+static const uint8 kCanary = 0x5a;
+
+
+static void
+fill_canary(uint8* from, size_t size)
+{
+	memset(from, kCanary, size);
+}
+
+
+/*!	Reports bytes of a canary that were changed, and fills it again. */
+static void
+check_canary(const char* what, uint8* from, size_t size, uint32 frame)
+{
+	size_t first = size, last = 0, changed = 0;
+	for (size_t i = 0; i < size; i++) {
+		if (from[i] != kCanary) {
+			if (first == size)
+				first = i;
+			last = i;
+			changed++;
+		}
+	}
+	if (changed != 0) {
+		fprintf(stderr, "sunxi_cedar: frame %" B_PRIu32 ": %s canary: %"
+			B_PRIuSIZE " bytes changed, +%#" B_PRIxSIZE " to +%#" B_PRIxSIZE
+			" (first %02x %02x %02x %02x)\n", frame, what, changed, first, last,
+			from[first], first + 1 < size ? from[first + 1] : 0,
+			first + 2 < size ? from[first + 2] : 0,
+			first + 3 < size ? from[first + 3] : 0);
+		fill_canary(from, size);
+	}
+}
+
 
 static inline size_t
 align(size_t value, size_t alignment)
@@ -41,6 +85,7 @@ CedarEngine::CedarEngine(VeDevice& device)
 	fTwoBitStride(0),
 	fTwoBitOffset(0),
 	fTwoBitChromaRow(0),
+	fVp9ColMvSize(0),
 	fVp9TwoBitAlign(8),
 	fDdr128(getenv("CEDAR_DDR128") != NULL),
 	fEntryPointsPlus1(getenv("CEDAR_EP_PLUS1") != NULL)
@@ -153,14 +198,17 @@ CedarEngine::_Configure(uint32 width, uint32 height, size_t mvcolSize,
 				align(width, 64) * 5 * 2);
 		}
 	} else if (codec == kCodecVp9) {
-		status = fDevice.Allocate(fVp9Probs, VP9_PROBS_BUFFER_SIZE);
-		if (status == B_OK)
-			status = fDevice.Allocate(fVp9Neighbour, VP9_NEIGHBOR_SIZE);
+		size_t guard = vp9_guard();
+		fVp9ColMvSize = (size_t)(fStride / 8) * (fAlignedHeight / 8) * 16;
+		status = fDevice.Allocate(fVp9Probs, VP9_PROBS_BUFFER_SIZE + guard);
+		if (status == B_OK) {
+			status = fDevice.Allocate(fVp9Neighbour,
+				VP9_NEIGHBOR_SIZE + guard);
+		}
 		if (status == B_OK) {
 			// the collocated motion vectors, 16 bytes per 8x8 block, of the
 			// frame before (read) and this one (written)
-			status = fDevice.Allocate(fVp9ColMv,
-				(size_t)(fStride / 8) * (fAlignedHeight / 8) * 16);
+			status = fDevice.Allocate(fVp9ColMv, fVp9ColMvSize + guard);
 		}
 		// all of them zeroed, as Linux's dma_alloc_coherent() has them: a
 		// pool buffer holds what its last user left, and a stream's first
@@ -168,8 +216,15 @@ CedarEngine::_Configure(uint32 width, uint32 height, size_t mvcolSize,
 		// then ended with an error now and then
 		if (status == B_OK) {
 			VeBuffer* buffers[3] = { &fVp9Probs, &fVp9Neighbour, &fVp9ColMv };
-			for (VeBuffer* buffer : buffers) {
+			size_t sizes[3] = { VP9_PROBS_BUFFER_SIZE, VP9_NEIGHBOR_SIZE,
+				fVp9ColMvSize };
+			for (int i = 0; i < 3; i++) {
+				VeBuffer* buffer = buffers[i];
 				memset(buffer->address, 0, buffer->size);
+				if (guard != 0) {
+					fill_canary(buffer->address + sizes[i],
+						buffer->size - sizes[i]);
+				}
 				fDevice.SyncForDevice(*buffer, 0, buffer->size);
 			}
 		}
@@ -223,7 +278,13 @@ CedarEngine::ConfigureVp9(uint32 width, uint32 height, uint32 bitDepth)
 status_t
 CedarEngine::AllocateFrame(CedarFrame& frame)
 {
-	status_t status = fDevice.Allocate(frame.picture, fFrameSize);
+	size_t guard = fCodec == kCodecVp9 ? vp9_guard() : 0;
+	status_t status = fDevice.Allocate(frame.picture, fFrameSize + guard);
+	if (status == B_OK && guard != 0) {
+		frame.guardOffset = fFrameSize;
+		fill_canary(frame.picture.address + fFrameSize, guard);
+		fDevice.SyncForDevice(frame.picture, fFrameSize, guard);
+	}
 	if (status == B_OK && fMvcolSize > 0)
 		status = fDevice.Allocate(frame.mvcol, fMvcolSize);
 	if (status != B_OK)
@@ -1193,16 +1254,24 @@ CedarEngine::DecodeVp9Frame(const Vp9Frame& frame, CedarFrame& current,
 	// the probability buffer
 	_Vp9Probabilities(frame);
 	if (frame.refreshProbs) {
-		memset(fVp9Probs.address + VP9_PROBS_COUNTS, 0, VP9_PROBS_COUNTS_SIZE);
+		// The A733 engine adds its counts to what is in memory, and has 0x28
+		// bytes more of them than the H.616 (seen up to +0x33bf): all of it
+		// up to the segment map starts at zero. Left over from the frame
+		// before, they made 1080p and 2160p YouTube streams (four and eight
+		// tile columns) fail from the third frame on, now and then also
+		// vp90-2-08-tile-4x4; the counts the add-on uses end at +0x3398 and
+		// matched libvpx's either way, but for four words now and then.
+		memset(fVp9Probs.address + VP9_PROBS_COUNTS, 0,
+			VP9_PROBS_SEGMENT_MAP - VP9_PROBS_COUNTS);
 		fDevice.SyncForDevice(fVp9Probs, VP9_PROBS_COUNTS,
-			VP9_PROBS_COUNTS_SIZE);
+			VP9_PROBS_SEGMENT_MAP - VP9_PROBS_COUNTS);
 	}
 	if (frame.resetSegmentMap) {
 		// segment IDs are predicted from the map earlier frames left
 		memset(fVp9Probs.address + VP9_PROBS_SEGMENT_MAP, 0,
-			fVp9Probs.size - VP9_PROBS_SEGMENT_MAP);
+			VP9_PROBS_BUFFER_SIZE - VP9_PROBS_SEGMENT_MAP);
 		fDevice.SyncForDevice(fVp9Probs, VP9_PROBS_SEGMENT_MAP,
-			fVp9Probs.size - VP9_PROBS_SEGMENT_MAP);
+			VP9_PROBS_BUFFER_SIZE - VP9_PROBS_SEGMENT_MAP);
 	}
 
 	fDevice.Begin();
@@ -1321,12 +1390,51 @@ CedarEngine::DecodeVp9Frame(const Vp9Frame& frame, CedarFrame& current,
 	fDevice.Write(CEDAR_DEC_COUNTER, 0);
 	fDevice.Write(CEDAR_DEC_COUNTER, CEDAR_DEC_COUNTER_ENABLE);
 	status = _Run(VP9_TRIGGER, VP9_STATUS, "VP9 frame", SUNXI_VE_RUN_VP9);
+	if (vp9_guard() != 0) {
+		static uint32 sFrame = 0;
+		size_t guard = vp9_guard();
+		fDevice.SyncForCpu(fVp9Probs, 0, fVp9Probs.size);
+		fDevice.SyncForCpu(fVp9Neighbour, 0, fVp9Neighbour.size);
+		fDevice.SyncForCpu(fVp9ColMv, 0, fVp9ColMv.size);
+		check_canary("probabilities", fVp9Probs.address
+			+ VP9_PROBS_BUFFER_SIZE, guard, sFrame);
+		check_canary("neighbour", fVp9Neighbour.address + VP9_NEIGHBOR_SIZE,
+			guard, sFrame);
+		check_canary("motion vectors", fVp9ColMv.address + fVp9ColMvSize,
+			guard, sFrame);
+		CedarFrame* pictures[4] = { &current, references[0], references[1],
+			references[2] };
+		const char* names[4] = { "picture", "LAST", "GOLDEN", "ALTREF" };
+		for (int i = 0; i < 4; i++) {
+			CedarFrame* picture = pictures[i];
+			if (picture == NULL || picture->guardOffset == 0)
+				continue;
+			fDevice.SyncForCpu(picture->picture, picture->guardOffset, guard);
+			check_canary(names[i], picture->picture.address
+				+ picture->guardOffset, guard, sFrame);
+			fDevice.SyncForDevice(picture->picture, picture->guardOffset,
+				guard);
+		}
+		fDevice.SyncForDevice(fVp9Probs, VP9_PROBS_BUFFER_SIZE, guard);
+		fDevice.SyncForDevice(fVp9Neighbour, VP9_NEIGHBOR_SIZE, guard);
+		fDevice.SyncForDevice(fVp9ColMv, fVp9ColMvSize, guard);
+		sFrame++;
+	}
 	if (status != B_OK)
 		return status;
 
 	if (counts != NULL && frame.refreshProbs) {
-		fDevice.SyncForCpu(fVp9Probs, VP9_PROBS_COUNTS, VP9_PROBS_COUNTS_SIZE);
+		fDevice.SyncForCpu(fVp9Probs, VP9_PROBS_COUNTS,
+			VP9_PROBS_SEGMENT_MAP - VP9_PROBS_COUNTS);
 		_Vp9Counts(*counts);
+		// CEDAR_VP9_COUNTS: the engine's counts of every frame to a file
+		static FILE* sCounts = getenv("CEDAR_VP9_COUNTS") != NULL
+			? fopen(getenv("CEDAR_VP9_COUNTS"), "wb") : NULL;
+		if (sCounts != NULL) {
+			fwrite(fVp9Probs.address + VP9_PROBS_COUNTS, 1,
+				VP9_PROBS_SEGMENT_MAP - VP9_PROBS_COUNTS, sCounts);
+			fflush(sCounts);
+		}
 	}
 	return B_OK;
 }
