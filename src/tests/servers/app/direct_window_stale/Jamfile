@@ -1,0 +1,8 @@
+SubDir HAIKU_TOP src tests servers app direct_window_stale ;
+
+# BDirectWindow::MarkDrawingBitsStale(): app_server takes what a direct
+# window wrote only into the frame buffer from there when it needs it
+SimpleTest stale_drawing_bits_test :
+	StaleDrawingBitsTest.cpp
+	: be game [ TargetLibstdc++ ] [ TargetLibsupc++ ]
+;

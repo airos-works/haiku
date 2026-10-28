@@ -383,6 +383,10 @@ enum {
 	// The scan timing of the output showing a part of the screen
 	AS_GET_SCAN_TIMING,
 
+	// Parts of the drawing buffer a direct window wrote only into the frame
+	// buffer (BDirectWindow::MarkDrawingBitsStale())
+	AS_DIRECT_WINDOW_MARK_STALE,
+
 	AS_LAST_CODE
 };
 
