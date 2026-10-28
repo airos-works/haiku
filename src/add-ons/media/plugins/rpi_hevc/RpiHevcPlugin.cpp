@@ -225,7 +225,7 @@ RpiHevcDecoder::NegotiateOutputFormat(media_format* format)
 	fOutputSpace = space;
 	const media_video_display_info& asked = format->u.raw_video.display;
 	fHalf = (space == kColorSpaceP010 || space == kColorSpaceI420)
-		&& fPicture.width % 4 == 0 && fPicture.height % 4 == 0
+		&& fPicture.width % 4 == 0 && fPicture.height % 2 == 0
 		&& asked.line_width == fPicture.width / 2
 		&& asked.line_count == fPicture.height / 2;
 	fWidth = fHalf ? fPicture.width / 2 : fPicture.width;

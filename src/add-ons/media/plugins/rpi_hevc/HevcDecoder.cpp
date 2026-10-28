@@ -961,7 +961,7 @@ HevcDecoder::CopyPlanes(const Picture& picture, uint8* target, uint32 stride,
 			sand30_to_p010_half(sand, target, stride, chroma, stride);
 		else {
 			sand8_to_i420_half(sand, target, stride, chroma,
-				chroma + (size_t)(stride / 2) * (rows / 2), stride / 2);
+				chroma + (size_t)(stride / 2) * ((rows + 1) / 2), stride / 2);
 		}
 		return;
 	}

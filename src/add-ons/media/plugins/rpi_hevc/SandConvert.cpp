@@ -322,7 +322,10 @@ halve_pairs16(const uint16_t* top, const uint16_t* bottom, uint32_t count,
 
 /*	Each band of kTileRows rows is first made into plain rows, as the full
 	size conversion makes them (which keeps the columns' reads local), and
-	then halved from there while it is still in the cache. */
+	then halved from there while it is still in the cache. The picture's
+	height is even (the add-on asks half size only then), so the luma has
+	an even number of rows in every band; the chroma may end on an odd
+	row, and that one is halved with itself. */
 
 
 void
@@ -357,6 +360,14 @@ sand8_to_i420_half(const SandPicture& picture, uint8_t* luma,
 			size_t target = (size_t)((row + y) / 2) * chromaStride;
 			halve_pairs8(band.data() + (size_t)y * width,
 				band.data() + (size_t)(y + 1) * width, width / 4,
+				cb + target, cr + target);
+		}
+		if (rows % 2 == 1) {
+			// an odd chroma height: the last row halves with itself
+			uint32_t y = rows - 1;
+			size_t target = (size_t)((row + y) / 2) * chromaStride;
+			halve_pairs8(band.data() + (size_t)y * width,
+				band.data() + (size_t)y * width, width / 4,
 				cb + target, cr + target);
 		}
 	}
@@ -395,6 +406,12 @@ sand30_to_p010_half(const SandPicture& picture, uint8_t* luma,
 		for (uint32_t y = 0; y + 1 < rows; y += 2) {
 			halve_pairs16(rows16 + (size_t)y * width,
 				rows16 + (size_t)(y + 1) * width, width / 4,
+				(uint16_t*)(chroma + (size_t)((row + y) / 2) * chromaStride));
+		}
+		if (rows % 2 == 1) {
+			uint32_t y = rows - 1;
+			halve_pairs16(rows16 + (size_t)y * width,
+				rows16 + (size_t)y * width, width / 4,
 				(uint16_t*)(chroma + (size_t)((row + y) / 2) * chromaStride));
 		}
 	}
