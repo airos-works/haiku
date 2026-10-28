@@ -51,9 +51,11 @@ public:
 			void				Write(uint32 offset, uint32 value);
 			void				PollClear(uint32 offset, uint32 mask);
 			void				WriteBack(uint32 offset);
+			//!	\a flags: SUNXI_VE_RUN_VP9 for a VP9 frame
 			status_t			Run(uint32 triggerRegister,
 									uint32 triggerValue,
-									uint32 statusRegister, uint32& status);
+									uint32 statusRegister, uint32& status,
+									uint32 flags = 0);
 			//!	The slices that follow belong to the same picture: no other
 			//	program's go in between until EndPicture().
 			void				SetInPicture(bool inPicture)

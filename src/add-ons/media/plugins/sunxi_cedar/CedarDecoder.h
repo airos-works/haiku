@@ -17,9 +17,10 @@
 #include "VeDevice.h"
 #include "h264_parse.h"
 #include "hevc_parse.h"
+#include "vp9_parse.h"
 
 
-/*!	H.264 and HEVC on the Allwinner A733's Cedar video engine, through
+/*!	H.264, HEVC and VP9 on the Allwinner A733's Cedar video engine, through
 	/dev/misc/sunxi_ve.
 
 	The engine decodes one slice at a time and makes NV12 pictures; what a
@@ -29,12 +30,18 @@
 	NAL units go in one at a time; a slice is decoded as it arrives, a
 	picture is done when the first slice of the next one arrives, or with
 	EndAccessUnit(). Pictures come out in output order.
+
+	VP9 goes in a chunk (a frame, or a superframe of several) at a time,
+	through PutNal(); its frames are decoded at once and those it shows come
+	out in that order, a frame shown again (show_existing_frame) with the
+	time of the chunk that says so.
 */
 class CedarDecoder {
 public:
 	enum codec {
 		H264,
-		HEVC
+		HEVC,
+		VP9
 	};
 
 	struct Picture {
@@ -124,6 +131,12 @@ private:
 			void				_FinishH264Picture();
 			int32				_FreeH264Position() const;
 
+			status_t			_PutVp9(const uint8* chunk, size_t size,
+									int64 pts);
+			status_t			_Vp9Frame(const uint8* data, size_t size,
+									int64 pts);
+			void				_Output(int32 index, int64 pts);
+
 			status_t			_PutHevc(const uint8* nal, size_t size,
 									int64 pts);
 			status_t			_HevcSlice(const uint8* nal, size_t size,
@@ -160,6 +173,10 @@ private:
 			HevcSlice*			fHevcSlice;
 			HevcSlice*			fHevcFirst;
 			bool				fNoRaslOutput;	// of the last IRAP picture
+			Vp9State*			fVp9;
+			Vp9Frame*			fVp9Frame;
+			Vp9Counts*			fVp9Counts;
+			int32				fVp9Slots[VP9_REF_SLOTS];	// frames
 
 			// pictures
 			std::vector<CedarFrame*> fFrames;
@@ -170,7 +187,11 @@ private:
 			int64				fSkipBefore;
 			uint32				fReorder;		// H.264 output
 			uint32				fDpbSize;
-			std::deque<int32>	fOutput;
+			struct OutputEntry {
+				int32			frame;
+				int64			pts;
+			};
+			std::deque<OutputEntry> fOutput;
 			uint32				fDecoded;
 };
 

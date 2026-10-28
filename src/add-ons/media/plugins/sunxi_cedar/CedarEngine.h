@@ -9,6 +9,7 @@
 #include "VeDevice.h"
 #include "h264_parse.h"
 #include "hevc_parse.h"
+#include "vp9_parse.h"
 
 
 /*!	A picture in the engine's memory and what the decoder keeps of it. */
@@ -21,8 +22,9 @@ struct CedarFrame {
 	int64		pts;
 	bool		current;	// being decoded
 	bool		waiting;	// decoded, not yet in output order
-	bool		ready;		// in output order, not yet taken
-	bool		held;		// with the caller
+	uint8		ready;		// in output order, not yet taken (VP9 may
+							// show a picture again: how many times)
+	uint8		held;		// with the caller (as often)
 	bool		corrupt;
 	uint32		latency;
 
@@ -43,7 +45,7 @@ struct CedarFrame {
 	uint32		twoBitStride;
 
 	CedarFrame() : position(-1), poc(0), pts(0), current(false),
-		waiting(false), ready(false), held(false), corrupt(false),
+		waiting(false), ready(0), held(0), corrupt(false),
 		latency(0), stride(0), lumaSize(0), cropLeft(0), cropTop(0),
 		width(0), height(0), bitDepth(8), twoBitOffset(0), twoBitChroma(0),
 		twoBitStride(0) {}
@@ -65,6 +67,10 @@ public:
 			//	ones when it changed (the pictures are the caller's).
 			status_t			ConfigureH264(const H264Sps& sps);
 			status_t			ConfigureHevc(const HevcSps& sps);
+			//!	VP9 sets it up for every frame: frames and references may
+			//	differ in size.
+			status_t			ConfigureVp9(uint32 width, uint32 height,
+									uint32 bitDepth);
 			void				Unconfigure();
 
 			status_t			AllocateFrame(CedarFrame& frame);
@@ -84,6 +90,16 @@ public:
 									const int list0[16], const int list1[16],
 									const uint8* nal, size_t size);
 
+			/*!	A VP9 frame, its references (LAST, GOLDEN, ALTREF; NULL for
+				intra frames), all of it as the engine needs it. \a counts
+				gets the symbol counts the engine gathered when the frame
+				asks for backward adaptation. */
+			status_t			DecodeVp9Frame(const Vp9Frame& frame,
+									CedarFrame& current,
+									CedarFrame* const references[3],
+									const uint8* data, size_t size,
+									Vp9Counts* counts);
+
 			uint32				CodedWidth() const { return fWidth; }
 			uint32				CodedHeight() const { return fHeight; }
 			uint32				Stride() const { return fStride; }
@@ -98,7 +114,8 @@ public:
 			//	1000x562 Main 10 streams say so).
 			size_t				TwoBitChroma() const
 									{ return fTwoBitOffset
-										+ (size_t)fTwoBitStride * fHeight; }
+										+ (size_t)fTwoBitStride
+											* fTwoBitChromaRow; }
 			bool				Matches(uint32 width, uint32 height,
 									size_t mvcolSize) const;
 
@@ -126,11 +143,17 @@ private:
 			void				_HevcTiles(const HevcState& state,
 									const HevcSlice& slice, int ctbX,
 									int ctbY);
+			void				_Vp9Tiles(const Vp9Frame& frame);
+			void				_Vp9Probabilities(const Vp9Frame& frame);
+			void				_Vp9References(const Vp9Frame& frame,
+									CedarFrame* const references[3]);
+			void				_Vp9Sram(const Vp9Frame& frame);
+			void				_Vp9Counts(Vp9Counts& counts) const;
 			status_t			_Run(uint32 trigger, uint32 status,
-									const char* what);
+									const char* what, uint32 flags = 0);
 
 			VeDevice&			fDevice;
-			int					fCodec;		// 1 H.264, 4 HEVC, 0 none
+			int					fCodec;		// 1 H.264, 4 HEVC, 9 VP9, 0 none
 			uint32				fWidth;		// coded, luma samples
 			uint32				fHeight;
 			uint32				fStride;	// 16-aligned
@@ -144,6 +167,7 @@ private:
 			// bit picture (which holds the eight most significant ones)
 			uint32				fTwoBitStride;
 			size_t				fTwoBitOffset;
+			uint32				fTwoBitChromaRow;
 
 			VeBuffer			fBitstream;
 			// H.264
@@ -154,6 +178,11 @@ private:
 			// HEVC
 			VeBuffer			fHevcNeighbour;
 			VeBuffer			fEntryPoints;
+			// VP9
+			VeBuffer			fVp9Probs;
+			VeBuffer			fVp9Neighbour;
+			VeBuffer			fVp9ColMv;
+			uint32				fVp9TwoBitAlign;
 
 			bool				fDdr128;
 			bool				fEntryPointsPlus1;

@@ -3,17 +3,20 @@
  * Distributed under the terms of the MIT License.
  */
 
-/*	Lab tool: decodes an H.264 or HEVC Annex B stream with the sunxi_cedar
-	add-on's decoder on the Cubie A7S's video engine, and prints an MD5 of
-	every picture in output order, cropped and as yuv420p: the hashes of
-	`ffmpeg -i X -f framemd5 -pix_fmt yuv420p`.
+/*	Lab tool: decodes an H.264 or HEVC Annex B stream, or a VP9 one in an IVF
+	file, with the sunxi_cedar add-on's decoder on the Cubie A7S's video
+	engine, and prints an MD5 of every picture in output order, cropped and
+	as yuv420p: the hashes of `ffmpeg -i X -f framemd5 -pix_fmt yuv420p`.
+	VP9 pictures are hashed as libvpx's test vectors' .md5 files have them:
+	planar, ten bit samples as sixteen bit little endian words (yuv420p10le).
 
 	cedar_decode [-c expected] [-m] [-M] [-n] [-o out.yuv] [-r times]
-		[-2 out] [-p 422|rgb32] [-k pictures] h264|hevc stream
+		[-2 out] [-p 422|rgb32] [-k pictures] h264|hevc|vp9 stream
 
 	-c	compares with the "<picture> <md5>" lines of a file (vecheck's and
 		the vectors' .framemd5; ten bit pictures are hashed as P010, so
-		.p010.framemd5) and says PASS or FAIL
+		.p010.framemd5), or the "<md5>  <name>" lines of libvpx's, and says
+		PASS or FAIL
 	-m	"<picture> <md5>" for every picture
 	-n	no copying out (the engine's speed alone)
 	-o	the pictures as yuv420p to a file
@@ -45,7 +48,8 @@ static void
 usage(const char* name)
 {
 	fprintf(stderr, "usage: %s [-c expected] [-m] [-M] [-n] [-o out.yuv]"
-		" [-r times] [-2 out] [-p 422|rgb32] [-k pictures] h264|hevc stream\n",
+		" [-r times] [-2 out] [-p 422|rgb32] [-k pictures] h264|hevc|vp9"
+		" stream\n",
 		name);
 	exit(1);
 }
@@ -66,6 +70,9 @@ struct Output {
 	size_t		bufferSize;
 	uint32		pictures;
 	uint32		corrupt;
+	bool		planar;		// libvpx's hashes (VP9)
+	uint8*		planes;
+	size_t		planesSize;
 };
 
 
@@ -80,10 +87,18 @@ read_expected(const char* path, Output& output)
 	}
 	char line[256];
 	uint32 allocated = 0;
+	unsigned lineIndex = 0;
 	while (fgets(line, sizeof(line), file) != NULL) {
 		unsigned index;
 		char hex[33];
-		if (line[0] == '#' || sscanf(line, "%u %32s", &index, hex) != 2)
+		if (line[0] == '#')
+			continue;
+		// libvpx's: "<md5>  <file name>", a picture per line
+		size_t length = strspn(line, "0123456789abcdef");
+		if (length == 32 && (line[32] == ' ' || line[32] == '\t')) {
+			index = lineIndex++;
+			strlcpy(hex, line, 33);
+		} else if (sscanf(line, "%u %32s", &index, hex) != 2)
 			continue;
 		if (index >= allocated) {
 			allocated = index + 64;
@@ -151,11 +166,63 @@ take_pictures(CedarDecoder& decoder, Output& output)
 				output.buffer = (uint8*)malloc(size);
 				output.bufferSize = size;
 			}
+			if (output.planar && output.packed == B_NO_COLOR_SPACE) {
+				// an even stride, so that the chroma planes hold (w + 1) / 2
+				uint32 even = (width + 1) & ~1u;
+				stride = tenBit ? even * 2 : even;
+				size = (size_t)stride * height
+					+ (size_t)stride * ((height + 1) / 2);
+				if (size > output.bufferSize) {
+					free(output.buffer);
+					output.buffer = (uint8*)malloc(size);
+					output.bufferSize = size;
+				}
+			}
 			if (output.packed != B_NO_COLOR_SPACE) {
 				decoder.CopyPacked(picture, output.buffer, stride,
 					output.packed);
 			} else
 				decoder.CopyPlanes(picture, output.buffer, stride, tenBit);
+			if (output.planar && output.packed == B_NO_COLOR_SPACE) {
+				// tightly packed planes, as libvpx hashes them
+				uint32 chromaWidth = (width + 1) / 2;
+				uint32 chromaHeight = (height + 1) / 2;
+				uint32 sample = tenBit ? 2 : 1;
+				size_t planar = ((size_t)width * height
+					+ 2 * (size_t)chromaWidth * chromaHeight) * sample;
+				if (planar > output.planesSize) {
+					free(output.planes);
+					output.planes = (uint8*)malloc(planar);
+					output.planesSize = planar;
+				}
+				uint8* to = output.planes;
+				const uint8* chroma = output.buffer + (size_t)stride * height;
+				if (!tenBit) {
+					for (uint32 y = 0; y < height; y++, to += width)
+						memcpy(to, output.buffer + (size_t)y * stride, width);
+					// CopyPlanes() left Cb and Cr planes of half the stride
+					memcpy(to, chroma, 2 * (size_t)chromaWidth * chromaHeight);
+				} else {
+					uint16* out = (uint16*)to;
+					for (uint32 y = 0; y < height; y++) {
+						const uint16* row = (const uint16*)(output.buffer
+							+ (size_t)y * stride);
+						for (uint32 x = 0; x < width; x++)
+							*out++ = row[x] >> 6;
+					}
+					uint16* cr = out + (size_t)chromaWidth * chromaHeight;
+					for (uint32 y = 0; y < chromaHeight; y++) {
+						const uint16* row = (const uint16*)(chroma
+							+ (size_t)y * stride);
+						for (uint32 x = 0; x < chromaWidth; x++) {
+							*out++ = row[2 * x] >> 6;
+							*cr++ = row[2 * x + 1] >> 6;
+						}
+					}
+				}
+				memcpy(output.buffer, output.planes, planar);
+				size = planar;
+			}
 			if (output.file != NULL)
 				fwrite(output.buffer, 1, size, output.file);
 			if (output.wholeMd5)
@@ -252,7 +319,10 @@ main(int argc, char** argv)
 		codec = CedarDecoder::H264;
 	else if (strcmp(argv[optind], "hevc") == 0)
 		codec = CedarDecoder::HEVC;
-	else
+	else if (strcmp(argv[optind], "vp9") == 0) {
+		codec = CedarDecoder::VP9;
+		output.planar = true;
+	} else
 		usage(argv[0]);
 
 	const char* streamPath = argv[optind + 1];
@@ -293,7 +363,36 @@ main(int argc, char** argv)
 		const uint8_t* nal;
 		size_t nalSize;
 		int64 units = 0;
-		while (annexb_next(data, size, &position, &nal, &nalSize)) {
+		if (codec == CedarDecoder::VP9) {
+			// IVF: a 32 byte header, then frames with 12 byte ones
+			if (size < 32 || memcmp(data, "DKIF", 4) != 0) {
+				fprintf(stderr, "cedar_decode: %s is no IVF file\n",
+					streamPath);
+				result = 1;
+				break;
+			}
+			position = data[6] | data[7] << 8;
+			while (position + 12 <= size) {
+				size_t frameSize = data[position] | data[position + 1] << 8
+					| data[position + 2] << 16
+					| (size_t)data[position + 3] << 24;
+				position += 12;
+				if (frameSize > size - position)
+					break;
+				status = decoder.PutNal(data + position, frameSize, units++);
+				position += frameSize;
+				if (status != B_OK) {
+					fprintf(stderr, "cedar_decode: %s\n", decoder.Error());
+					result = 1;
+					break;
+				}
+				take_pictures(decoder, output);
+				if (limit != 0 && output.pictures >= limit)
+					break;
+			}
+		}
+		while (codec != CedarDecoder::VP9
+			&& annexb_next(data, size, &position, &nal, &nalSize)) {
 			status = decoder.PutNal(nal, nalSize, units++);
 			if (status != B_OK) {
 				fprintf(stderr, "cedar_decode: %s\n", decoder.Error());
@@ -346,6 +445,7 @@ main(int argc, char** argv)
 	}
 	free(output.expected);
 	free(output.buffer);
+	free(output.planes);
 	free(data);
 	return result != 0 || output.corrupt != 0 ? 1 : 0;
 }

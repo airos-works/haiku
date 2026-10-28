@@ -47,6 +47,8 @@ SimpleTest cedar_decode :
 	bits.c
 	h264_parse.c
 	hevc_parse.c
+	vp9_parse.c
+	vp9_tables.c
 	CedarDecoder.cpp
 	CedarEngine.cpp
 	VeDevice.cpp

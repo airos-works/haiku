@@ -6,11 +6,16 @@
 
 #include "CedarEngine.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "CedarRegisters.h"
+
+
+// fCodec for VP9 (it runs in the HEVC engine)
+static const int kCodecVp9 = 9;
 
 
 static inline size_t
@@ -35,10 +40,15 @@ CedarEngine::CedarEngine(VeDevice& device)
 	fBitDepth(8),
 	fTwoBitStride(0),
 	fTwoBitOffset(0),
+	fTwoBitChromaRow(0),
+	fVp9TwoBitAlign(8),
 	fDdr128(getenv("CEDAR_DDR128") != NULL),
 	fEntryPointsPlus1(getenv("CEDAR_EP_PLUS1") != NULL)
 {
-
+	// CEDAR_VP9_TWOBIT_ROWS: the luma rows of a ten bit VP9 picture's two-bit
+	// plane, as the alignment of the height (to find out what the engine does)
+	if (const char* value = getenv("CEDAR_VP9_TWOBIT_ROWS"))
+		fVp9TwoBitAlign = atoi(value) > 0 ? atoi(value) : 1;
 	fError[0] = '\0';
 }
 
@@ -59,6 +69,9 @@ CedarEngine::Unconfigure()
 	fDevice.Free(fIntraPrediction);
 	fDevice.Free(fHevcNeighbour);
 	fDevice.Free(fEntryPoints);
+	fDevice.Free(fVp9Probs);
+	fDevice.Free(fVp9Neighbour);
+	fDevice.Free(fVp9ColMv);
 	fCodec = 0;
 	fWidth = fHeight = 0;
 }
@@ -85,12 +98,29 @@ CedarEngine::_Configure(uint32 width, uint32 height, size_t mvcolSize,
 	fHeight = height;
 	fStride = align(width, 16);
 	fAlignedHeight = align(height, 16);
+	if (codec == kCodecVp9) {
+		// The VP9 engine takes the references' line stride from their width,
+		// aligned to what LAST_SCALE1 says (64), and addresses in 1 KiB units;
+		// the luma plane goes on to whole superblocks.
+		fStride = align(width, 64);
+		fAlignedHeight = align(height, 64);
+	}
 	fLumaSize = (size_t)fStride * fAlignedHeight;
 	fChromaSize = fLumaSize / 2;
 	fFrameSize = fLumaSize + fChromaSize;
 	fMvcolSize = mvcolSize;
 	fBitDepth = bitDepth;
-	if (bitDepth > 8) {
+	fTwoBitChromaRow = height;
+	if (bitDepth > 8 && codec == kCodecVp9) {
+		// the two-bit plane right after the chroma rows of the frame, those
+		// rounded up to 8x8 blocks (H.616), at the same offset from the luma
+		// for every picture, the references too
+		fTwoBitStride = align((width + 3) / 4, 32);
+		fTwoBitOffset = fLumaSize + (size_t)fStride * align(height, 8) / 2;
+		fTwoBitChromaRow = align(height, fVp9TwoBitAlign);
+		fFrameSize = align(fTwoBitOffset
+			+ (size_t)fTwoBitStride * fAlignedHeight * 3 / 2, 1024);
+	} else if (bitDepth > 8) {
 		// the low two bits of every sample behind the picture, at a 1 KiB
 		// boundary (the engine's secondary output would make P010 on the
 		// H616, but on the A733 it stops the engine)
@@ -121,6 +151,27 @@ CedarEngine::_Configure(uint32 width, uint32 height, size_t mvcolSize,
 		if (status == B_OK) {
 			status = fDevice.Allocate(fIntraPrediction,
 				align(width, 64) * 5 * 2);
+		}
+	} else if (codec == kCodecVp9) {
+		status = fDevice.Allocate(fVp9Probs, VP9_PROBS_BUFFER_SIZE);
+		if (status == B_OK)
+			status = fDevice.Allocate(fVp9Neighbour, VP9_NEIGHBOR_SIZE);
+		if (status == B_OK) {
+			// the collocated motion vectors, 16 bytes per 8x8 block, of the
+			// frame before (read) and this one (written)
+			status = fDevice.Allocate(fVp9ColMv,
+				(size_t)(fStride / 8) * (fAlignedHeight / 8) * 16);
+		}
+		// all of them zeroed, as Linux's dma_alloc_coherent() has them: a
+		// pool buffer holds what its last user left, and a stream's first
+		// frame with motion vectors from the one before (tile-4x4 frame 2)
+		// then ended with an error now and then
+		if (status == B_OK) {
+			VeBuffer* buffers[3] = { &fVp9Probs, &fVp9Neighbour, &fVp9ColMv };
+			for (VeBuffer* buffer : buffers) {
+				memset(buffer->address, 0, buffer->size);
+				fDevice.SyncForDevice(*buffer, 0, buffer->size);
+			}
 		}
 	} else {
 		// twice Cedrus' 794 KiB, as the BSP does for 10 bit
@@ -163,10 +214,17 @@ CedarEngine::ConfigureHevc(const HevcSps& sps)
 
 
 status_t
+CedarEngine::ConfigureVp9(uint32 width, uint32 height, uint32 bitDepth)
+{
+	return _Configure(width, height, 0, kCodecVp9, bitDepth);
+}
+
+
+status_t
 CedarEngine::AllocateFrame(CedarFrame& frame)
 {
 	status_t status = fDevice.Allocate(frame.picture, fFrameSize);
-	if (status == B_OK)
+	if (status == B_OK && fMvcolSize > 0)
 		status = fDevice.Allocate(frame.mvcol, fMvcolSize);
 	if (status != B_OK)
 		FreeFrame(frame);
@@ -229,11 +287,12 @@ CedarEngine::_SetOutputFormat()
 
 
 status_t
-CedarEngine::_Run(uint32 trigger, uint32 statusRegister, const char* what)
+CedarEngine::_Run(uint32 trigger, uint32 statusRegister, const char* what,
+	uint32 flags)
 {
 	uint32 status = 0;
 	status_t result = fDevice.Run(trigger, 8 /* decode slice */,
-		statusRegister, status);
+		statusRegister, status, flags);
 	if (result != B_OK) {
 		snprintf(fError, sizeof(fError), "%s: %s (status %#" B_PRIx32 ")",
 			what, strerror(result), status);
@@ -822,4 +881,452 @@ CedarEngine::DecodeHevcSlice(const HevcState& state, const HevcSlice& slice,
 	uint32 control = HEVC_IRQ_MASK;
 	fDevice.Write(HEVC_CTRL, control);
 	return _Run(HEVC_TRIGGER, HEVC_STATUS, "HEVC slice");
+}
+
+
+//	#pragma mark - VP9
+
+
+/*!	The tiles after the first (whose bounds go to TILE_START and TILE_END)
+	as a list at the start of the probability buffer: per tile a zero and
+	its bounds in superblocks (as TILE_START and TILE_END, in one 64 bit
+	word), bit 31 for an empty one. The engine finds the tiles' data
+	itself, from the sizes in front of them.
+*/
+void
+CedarEngine::_Vp9Tiles(const Vp9Frame& frame)
+{
+	int rows = 1 << frame.log2TileRows;
+	int columns = 1 << frame.log2TileCols;
+	uint32* list = (uint32*)(fVp9Probs.address + VP9_PROBS_TILES);
+	int entries = 0;
+	for (int r = 0; r < rows; r++) {
+		int rowStart = vp9_tile_offset(r, frame.miRows, frame.log2TileRows);
+		int rowEnd = vp9_tile_offset(r + 1, frame.miRows, frame.log2TileRows);
+		for (int c = 0; c < columns; c++) {
+			int columnStart = vp9_tile_offset(c, frame.miCols,
+				frame.log2TileCols);
+			int columnEnd = vp9_tile_offset(c + 1, frame.miCols,
+				frame.log2TileCols);
+			uint32 start = ((uint32)(columnStart >> 3) & 0x1ff)
+				| ((uint32)(rowStart >> 3) & 0x1ff) << 16;
+			uint32 end = ((uint32)(columnEnd - 1) >> 3 & 0x1ff)
+				| ((uint32)(rowEnd - 1) >> 3 & 0x1ff) << 16;
+			bool empty = columnStart == columnEnd || rowStart == rowEnd;
+			if (r == 0 && c == 0) {
+				fDevice.Write(VP9_TILE_START, empty ? VP9_TILE_INVALID : 0);
+				fDevice.Write(VP9_TILE_END, end);
+				continue;
+			}
+			list[entries * 4 + 0] = 0;
+			list[entries * 4 + 1] = 0;
+			list[entries * 4 + 2] = start | (empty ? VP9_TILE_INVALID : 0);
+			list[entries * 4 + 3] = end;
+			entries++;
+		}
+	}
+	if (entries > 0)
+		fDevice.SyncForDevice(fVp9Probs, VP9_PROBS_TILES, entries * 16);
+}
+
+
+static void
+pack_mv_component(uint8* target, const Vp9MvComponentProbs& mv)
+{
+	target[0x00] = mv.sign;
+	target[0x01] = mv.class0[0];
+	target[0x02] = mv.class0Hp;
+	target[0x03] = mv.hp;
+	memcpy(target + 0x04, mv.class0Fp[0], 3);
+	memcpy(target + 0x08, mv.class0Fp[1], 3);
+	memcpy(target + 0x0c, mv.classes, 10);
+	memcpy(target + 0x1c, mv.bits, 10);
+	memcpy(target + 0x28, mv.fp, 3);
+}
+
+
+/*!	The probabilities the frame is decoded with, packed as the engine reads
+	them (mostly a 32 bit word per context, up to four probabilities in
+	it).
+*/
+void
+CedarEngine::_Vp9Probabilities(const Vp9Frame& frame)
+{
+	const Vp9Probs& p = frame.probs;
+	uint8* table = fVp9Probs.address + VP9_PROBS_TABLE;
+	memset(table, 0, VP9_PROBS_TABLE_SIZE);
+
+	table[0x000] = p.tx8[0][0];
+	table[0x001] = p.tx8[1][0];
+	memcpy(table + 0x004, p.tx16[0], 2);
+	memcpy(table + 0x008, p.tx16[1], 2);
+	memcpy(table + 0x00c, p.tx32[0], 3);
+	memcpy(table + 0x010, p.tx32[1], 3);
+	uint8* coef = table + 0x014;
+	for (int t = 0; t < 4; t++) {
+		for (int i = 0; i < 2; i++) {
+			for (int j = 0; j < 2; j++) {
+				for (int k = 0; k < 6; k++) {
+					for (int l = 0; l < 6; l++) {
+						memcpy(coef, p.coef[t][i][j][k][l], 3);
+						coef += 4;
+					}
+				}
+			}
+		}
+	}
+	memcpy(table + 0x914, p.skip, 3);
+	for (int i = 0; i < 7; i++)
+		memcpy(table + 0x918 + i * 4, p.interMode[i], 3);
+	for (int i = 0; i < 4; i++)
+		memcpy(table + 0x934 + i * 4, p.interp[i], 2);
+	memcpy(table + 0x944, p.intraInter, 4);
+	memcpy(table + 0x948, p.compInter, 5);
+	memcpy(table + 0x950, p.compRef, 5);
+	for (int i = 0; i < 4; i++)
+		memcpy(table + 0x958 + i * 4, p.singleRef[i], 2);
+	memcpy(table + 0x968, p.singleRef[4], 2);
+	for (int i = 0; i < 4; i++)
+		memcpy(table + 0x970 + i * 0x10, p.yMode[i], 9);
+	for (int i = 0; i < 10; i++)
+		memcpy(table + 0x9b0 + i * 0x10, p.uvMode[i], 9);
+	for (int i = 0; i < 16; i++)
+		memcpy(table + 0xa50 + i * 4, p.partition[i], 3);
+	memcpy(table + 0xa90, p.mvJoints, 3);
+	// the columns' component first
+	pack_mv_component(table + 0xa94, p.mv[1]);
+	pack_mv_component(table + 0xac4, p.mv[0]);
+	if (frame.seg.enabled) {
+		memcpy(table + 0xaf0, frame.seg.treeProbs, 7);
+		memcpy(table + 0xaf8, frame.seg.predProbs, 3);
+	}
+	fDevice.SyncForDevice(fVp9Probs, VP9_PROBS_TABLE, VP9_PROBS_TABLE_SIZE);
+}
+
+
+/*!	A reference's scale factors: [4:0] the step in 1/16 samples minus one,
+	[20:5] the ratio of the sizes in Q14 (libvpx's x_scale_fp).
+*/
+static void
+vp9_scale(uint32 reference, uint32 current, uint32& value)
+{
+	uint32 factor = (reference << 14) / current;
+	value = (((factor >> 10) - 1) & 0x1f) | (factor & 0xffff) << 5;
+}
+
+
+void
+CedarEngine::_Vp9References(const Vp9Frame& frame,
+	CedarFrame* const references[3])
+{
+	static const uint32 kSize[3] = { VP9_LAST_SIZE, VP9_GOLDEN_SIZE,
+		VP9_ALTREF_SIZE };
+	static const uint32 kLuma[3] = { VP9_LAST_LUMA, VP9_GOLDEN_LUMA,
+		VP9_ALTREF_LUMA };
+	static const uint32 kChroma[3] = { VP9_LAST_CHROMA, VP9_GOLDEN_CHROMA,
+		VP9_ALTREF_CHROMA };
+
+	for (int i = 0; i < 3; i++) {
+		const CedarFrame& reference = *references[i];
+		fDevice.Write(kSize[i], (reference.width & 0x3fff)
+			| (reference.height & 0x3fff) << 16);
+		uint32 x, y;
+		vp9_scale(reference.width, frame.width, x);
+		vp9_scale(reference.height, frame.height, y);
+		switch (i) {
+			case 0:
+				fDevice.Write(VP9_LAST_SCALE0, x);
+				fDevice.Write(VP9_LAST_SCALE1, y | VP9_STRIDE_ALIGN_64);
+				break;
+			case 1:
+				// the vertical factor in [31:16] here
+				fDevice.Write(VP9_GOLDEN_SCALE0, x);
+				fDevice.Write(VP9_GOLDEN_SCALE1, ((y >> 5) & 0xffff) << 16
+					| (y & 0x1f));
+				break;
+			case 2:
+				fDevice.Write(VP9_ALTREF_SCALE0, x);
+				fDevice.Write(VP9_ALTREF_SCALE1, y);
+				break;
+		}
+		fDevice.Write(kLuma[i], reference.picture.bus >> 8);
+		fDevice.Write(kChroma[i],
+			(reference.picture.bus + (uint32)reference.lumaSize) >> 8);
+	}
+}
+
+
+/*!	The dequantisers and the loop filter levels of the segments. */
+void
+CedarEngine::_Vp9Sram(const Vp9Frame& frame)
+{
+	fDevice.Write(VP9_SRAM_OFFSET, VP9_SRAM_DEQUANT);
+	for (int i = 0; i < VP9_MAX_SEGMENTS; i++) {
+		fDevice.Write(VP9_SRAM_DATA, (uint32)frame.yDequant[i][0]
+			| (uint32)frame.yDequant[i][1] << 16);
+	}
+	for (int i = 0; i < VP9_MAX_SEGMENTS; i++) {
+		fDevice.Write(VP9_SRAM_DATA, (uint32)frame.uvDequant[i][0]
+			| (uint32)frame.uvDequant[i][1] << 16);
+	}
+
+	// intra; last's two modes / golden's two, altref's two (6 bits each)
+	fDevice.Write(VP9_SRAM_OFFSET, VP9_SRAM_LOOP_FILTER);
+	for (int i = 0; i < VP9_MAX_SEGMENTS; i++) {
+		const uint8 (*level)[2] = frame.filterLevels[i];
+		fDevice.Write(VP9_SRAM_DATA, (uint32)(level[VP9_INTRA][0] & 0x3f)
+			| (uint32)(level[VP9_LAST][0] & 0x3f) << 16
+			| (uint32)(level[VP9_LAST][1] & 0x3f) << 24);
+		fDevice.Write(VP9_SRAM_DATA, (uint32)(level[VP9_GOLDEN][0] & 0x3f)
+			| (uint32)(level[VP9_GOLDEN][1] & 0x3f) << 8
+			| (uint32)(level[VP9_ALTREF][0] & 0x3f) << 16
+			| (uint32)(level[VP9_ALTREF][1] & 0x3f) << 24);
+	}
+}
+
+
+/*	The counts the engine writes back, at VP9_PROBS_COUNTS (32 bit words):
+	tx 8x8 [2][2], 16x16 [2][3], 32x32 [2][4]; EOB branches [4][2][2][6][6];
+	coefficients [4][2][2][6][6][4]; skip [3][2]; inter modes [7][4];
+	filters [4][3]; intra/inter [4][2]; compound/single [5][2]; compound
+	references [5][2]; single references [5][2][2]; y modes [4][10]; uv
+	modes [10][10]; partitions [16][4]; joints [4]; then per motion vector
+	component (columns first) sign [2], class0 [2], class0_hp [2], hp [2],
+	classes [11], bits [10][2], class0_fp [2][4], fp [4]. */
+struct Vp9HardwareMvCounts {
+	uint32	sign[2];
+	uint32	class0[2];
+	uint32	class0Hp[2];
+	uint32	hp[2];
+	uint32	classes[11];
+	uint32	bits[10][2];
+	uint32	class0Fp[2][4];
+	uint32	fp[4];
+};
+
+struct Vp9HardwareCounts {
+	uint32	tx8[2][2];
+	uint32	tx16[2][3];
+	uint32	tx32[2][4];
+	uint32	eobBranch[4][2][2][6][6];
+	uint32	coef[4][2][2][6][6][4];
+	uint32	skip[3][2];
+	uint32	interMode[7][4];
+	uint32	interp[4][3];
+	uint32	intraInter[4][2];
+	uint32	compInter[5][2];
+	uint32	compRef[5][2];
+	uint32	singleRef[5][2][2];
+	uint32	yMode[4][10];
+	uint32	uvMode[10][10];
+	uint32	partition[16][4];
+	uint32	mvJoints[4];
+	Vp9HardwareMvCounts mv[2];
+};
+
+static_assert(sizeof(Vp9HardwareCounts) == VP9_PROBS_COUNTS_SIZE,
+	"the engine's counts");
+static_assert(offsetof(Vp9HardwareCounts, coef) == 0x948, "coefficients");
+static_assert(offsetof(Vp9HardwareCounts, mvJoints) == 0x31f0, "joints");
+
+
+void
+CedarEngine::_Vp9Counts(Vp9Counts& counts) const
+{
+	const Vp9HardwareCounts& c = *(const Vp9HardwareCounts*)
+		(fVp9Probs.address + VP9_PROBS_COUNTS);
+	memset(&counts, 0, sizeof(counts));
+	memcpy(counts.tx8, c.tx8, sizeof(c.tx8));
+	memcpy(counts.tx16, c.tx16, sizeof(c.tx16));
+	memcpy(counts.tx32, c.tx32, sizeof(c.tx32));
+	memcpy(counts.eobBranch, c.eobBranch, sizeof(c.eobBranch));
+	memcpy(counts.coef, c.coef, sizeof(c.coef));
+	memcpy(counts.skip, c.skip, sizeof(c.skip));
+	memcpy(counts.interMode, c.interMode, sizeof(c.interMode));
+	memcpy(counts.interp, c.interp, sizeof(c.interp));
+	memcpy(counts.intraInter, c.intraInter, sizeof(c.intraInter));
+	memcpy(counts.compInter, c.compInter, sizeof(c.compInter));
+	memcpy(counts.compRef, c.compRef, sizeof(c.compRef));
+	memcpy(counts.singleRef, c.singleRef, sizeof(c.singleRef));
+	memcpy(counts.yMode, c.yMode, sizeof(c.yMode));
+	memcpy(counts.uvMode, c.uvMode, sizeof(c.uvMode));
+	memcpy(counts.partition, c.partition, sizeof(c.partition));
+	memcpy(counts.mvJoints, c.mvJoints, sizeof(c.mvJoints));
+	for (int i = 0; i < 2; i++) {
+		// Vp9Counts has the rows' component first
+		const Vp9HardwareMvCounts& from = c.mv[1 - i];
+		Vp9MvComponentCounts& to = counts.mv[i];
+		memcpy(to.sign, from.sign, sizeof(to.sign));
+		memcpy(to.class0, from.class0, sizeof(to.class0));
+		memcpy(to.class0Hp, from.class0Hp, sizeof(to.class0Hp));
+		memcpy(to.hp, from.hp, sizeof(to.hp));
+		memcpy(to.classes, from.classes, sizeof(to.classes));
+		memcpy(to.bits, from.bits, sizeof(to.bits));
+		memcpy(to.class0Fp, from.class0Fp, sizeof(to.class0Fp));
+		memcpy(to.fp, from.fp, sizeof(to.fp));
+	}
+}
+
+
+status_t
+CedarEngine::DecodeVp9Frame(const Vp9Frame& frame, CedarFrame& current,
+	CedarFrame* const references[3], const uint8* data, size_t size,
+	Vp9Counts* counts)
+{
+	if (fCodec != kCodecVp9 || !fVp9Probs.IsValid())
+		return B_NO_INIT;
+	bool intra = frame.frameType == VP9_KEY_FRAME || frame.intraOnly;
+	if (!intra) {
+		for (int i = 0; i < 3; i++) {
+			if (references[i] == NULL || !references[i]->picture.IsValid())
+				return B_BAD_VALUE;
+		}
+	}
+	size_t headers = frame.uncompressedHeaderSize + frame.compressedHeaderSize;
+	if (headers >= size)
+		return B_BAD_DATA;
+
+	status_t status = _LoadBitstream(data, size);
+	if (status != B_OK)
+		return status;
+
+	// the probability buffer
+	_Vp9Probabilities(frame);
+	if (frame.refreshProbs) {
+		memset(fVp9Probs.address + VP9_PROBS_COUNTS, 0, VP9_PROBS_COUNTS_SIZE);
+		fDevice.SyncForDevice(fVp9Probs, VP9_PROBS_COUNTS,
+			VP9_PROBS_COUNTS_SIZE);
+	}
+	if (frame.resetSegmentMap) {
+		// segment IDs are predicted from the map earlier frames left
+		memset(fVp9Probs.address + VP9_PROBS_SEGMENT_MAP, 0,
+			fVp9Probs.size - VP9_PROBS_SEGMENT_MAP);
+		fDevice.SyncForDevice(fVp9Probs, VP9_PROBS_SEGMENT_MAP,
+			fVp9Probs.size - VP9_PROBS_SEGMENT_MAP);
+	}
+
+	fDevice.Begin();
+	// CEDAR_VP9_MODE: other bits 16-31 (hex) than the H.616's, to find out
+	// what the A733 needs
+	static const char* sModeBits = getenv("CEDAR_VP9_MODE");
+	uint32 mode = CEDAR_MODE_HEVC | (sModeBits != NULL
+		? (uint32)strtoul(sModeBits, NULL, 16) & 0xffff0000u
+		: CEDAR_MODE_DDR_256 | CEDAR_MODE_VP9_RAMPD | CEDAR_MODE_VP9_BIT30);
+	if (frame.width > 2048)
+		mode |= CEDAR_MODE_WIDTH_OVER_2048;
+	if (frame.width == 4096)
+		mode |= CEDAR_MODE_WIDTH_IS_4096;
+	fDevice.Write(CEDAR_MODE, mode);
+	_SetOutputFormat();
+
+	uint32 syntax = VP9_SYN_DECODE | VP9_SYN_ENABLE2
+		| VP9_SYN_DEPTH(frame.bitDepth - 8)
+		| VP9_SYN_TX_MODE(frame.txMode)
+		| VP9_SYN_REF_MODE(frame.referenceMode);
+	if (frame.log2TileCols != 0 || frame.log2TileRows != 0)
+		syntax |= VP9_SYN_TILES;
+	if (!intra)
+		syntax |= VP9_SYN_INTER;
+	if (frame.signBias[VP9_LAST])
+		syntax |= VP9_SYN_BIAS_LAST;
+	if (frame.signBias[VP9_GOLDEN])
+		syntax |= VP9_SYN_BIAS_GOLDEN;
+	if (frame.signBias[VP9_ALTREF])
+		syntax |= VP9_SYN_BIAS_ALTREF;
+	if (frame.allowHighPrecisionMv)
+		syntax |= VP9_SYN_HIGH_PRECISION_MV;
+	if (frame.frameType != VP9_KEY_FRAME)
+		syntax |= VP9_SYN_INTERP(frame.interpFilter);
+	if (frame.filterLevel != 0) {
+		syntax |= VP9_SYN_LOOP_FILTER
+			| VP9_SYN_SHARPNESS(frame.sharpness);
+	}
+	if (frame.lossless)
+		syntax |= VP9_SYN_LOSSLESS;
+	if (frame.seg.enabled) {
+		syntax |= VP9_SYN_SEGMENTATION;
+		if (frame.seg.updateMap) {
+			syntax |= VP9_SYN_SEG_UPDATE_MAP;
+			if (frame.seg.temporalUpdate)
+				syntax |= VP9_SYN_SEG_TEMPORAL;
+		}
+	}
+	if (frame.usePrevFrameMvs)
+		syntax |= VP9_SYN_PREV_MVS;
+	if (frame.refreshProbs)
+		syntax |= VP9_SYN_COUNTS;
+	fDevice.Write(VP9_HDR_SYN, syntax);
+
+	// the tiles, after the headers; the end at a 1 KiB boundary
+	fDevice.Write(VP9_BITS_OFFSET, (uint32)(headers * 8));
+	fDevice.Write(VP9_BITS_END, (fBitstream.bus + (uint32)fBitstream.size)
+		>> 8);
+	fDevice.Write(VP9_BITS_LEN, (uint32)((size - headers) * 8));
+	fDevice.Write(VP9_BITS_ADDR, ((fBitstream.bus >> 8) & 0x0fffffff)
+		| (1u << 30) | (1u << 29) | (1u << 28));
+
+	fDevice.Write(VP9_PIC_SIZE, ((uint32)frame.width & 0x3fff)
+		| ((uint32)frame.height & 0x3fff) << 16);
+	if (intra)
+		fDevice.Write(VP9_LAST_SCALE1, VP9_STRIDE_ALIGN_64);
+	else
+		_Vp9References(frame, references);
+
+	fDevice.Write(VP9_CUR_LUMA, current.picture.bus >> 8);
+	fDevice.Write(VP9_CUR_CHROMA,
+		(current.picture.bus + (uint32)current.lumaSize) >> 8);
+	fDevice.Write(VP9_SDRT_CTRL, 0);
+	fDevice.Write(VP9_SDRT_LUMA, 0);
+	fDevice.Write(VP9_SDRT_CHROMA, 0);
+	if (frame.bitDepth > 8) {
+		fDevice.Write(VP9_TWO_BIT_OFFSET, (uint32)fTwoBitOffset & 0x0fffffff);
+		fDevice.Write(VP9_TEN_BIT_CONFIG, fTwoBitStride & 0x7ff);
+	}
+
+	fDevice.Write(VP9_NEIGHBOR_ADDR, fVp9Neighbour.bus >> 8);
+	fDevice.Write(VP9_PROBS_ADDR, fVp9Probs.bus >> 8);
+	fDevice.Write(VP9_COL_MV_ADDR, fVp9ColMv.bus >> 8);
+
+	uint32 features = 0;
+	if (frame.seg.enabled) {
+		for (int i = 0; i < VP9_MAX_SEGMENTS; i++) {
+			uint8 enabled = frame.seg.featureEnabled[i];
+			if ((enabled & (1 << VP9_SEG_REF_FRAME)) != 0) {
+				features |= 1u << i;
+				features |= ((uint32)frame.seg.featureData[i][VP9_SEG_REF_FRAME]
+					& 3) << (16 + i * 2);
+			}
+			if ((enabled & (1 << VP9_SEG_SKIP)) != 0)
+				features |= 1u << (8 + i);
+		}
+	}
+	fDevice.Write(VP9_SEG_FEATURES, features);
+
+	_Vp9Tiles(frame);
+	_Vp9Sram(frame);
+
+	uint32 control = VP9_IRQ_MASK;
+	// Allwinner's library does so for widths of 129 to 192
+	uint32 alignedWidth = align(frame.width, 16);
+	if (alignedWidth > 128 && alignedWidth <= 192
+		&& align(frame.height, 16) > 64) {
+		control |= VP9_DDR_CONSISTENCY;
+	}
+	fDevice.Write(VP9_FUNC_CTRL, control);
+	fDevice.Write(VP9_CTB_NUM, 0);
+
+	fDevice.Write(VP9_STATUS, 0xffffffff);
+	fDevice.Write(VP9_TRIGGER, VP9_TRIG_INIT_SWDEC);
+	fDevice.Write(VP9_CTB_NUM, 0);
+	fDevice.Write(CEDAR_DEC_COUNTER, 0);
+	fDevice.Write(CEDAR_DEC_COUNTER, CEDAR_DEC_COUNTER_ENABLE);
+	status = _Run(VP9_TRIGGER, VP9_STATUS, "VP9 frame", SUNXI_VE_RUN_VP9);
+	if (status != B_OK)
+		return status;
+
+	if (counts != NULL && frame.refreshProbs) {
+		fDevice.SyncForCpu(fVp9Probs, VP9_PROBS_COUNTS, VP9_PROBS_COUNTS_SIZE);
+		_Vp9Counts(*counts);
+	}
+	return B_OK;
 }

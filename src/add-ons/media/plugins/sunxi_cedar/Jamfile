@@ -12,6 +12,8 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 			bits.c
 			h264_parse.c
 			hevc_parse.c
+			vp9_parse.c
+			vp9_tables.c
 			CedarDecoder.cpp
 			CedarEngine.cpp
 			CedarPlugin.cpp

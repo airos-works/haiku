@@ -149,7 +149,7 @@ VeDevice::EndPicture()
 
 status_t
 VeDevice::Run(uint32 triggerRegister, uint32 triggerValue,
-	uint32 statusRegister, uint32& status)
+	uint32 statusRegister, uint32& status, uint32 flags)
 {
 	sunxi_ve_run request;
 	memset(&request, 0, sizeof(request));
@@ -158,7 +158,7 @@ VeDevice::Run(uint32 triggerRegister, uint32 triggerValue,
 	request.trigger_register = triggerRegister;
 	request.trigger_value = triggerValue;
 	request.status_register = statusRegister;
-	request.flags = fInPicture ? SUNXI_VE_RUN_PICTURE : 0;
+	request.flags = (fInPicture ? SUNXI_VE_RUN_PICTURE : 0) | flags;
 	status_t result = B_OK;
 	if (ioctl(fDevice, SUNXI_VE_RUN, &request, sizeof(request)) != 0)
 		result = errno;

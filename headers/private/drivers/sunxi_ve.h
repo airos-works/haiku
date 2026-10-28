@@ -93,6 +93,9 @@ struct sunxi_ve_op {
 	SUNXI_VE_END_PICTURE (or for a tenth of a second at most), so that the
 	slices of one picture are not interleaved with another program's. */
 #define SUNXI_VE_RUN_PICTURE	1
+/*	A VP9 frame: the HEVC engine's trigger and status, with the registers of
+	its VP9 decoder (a driver from before VP9 refuses it). */
+#define SUNXI_VE_RUN_VP9		2
 
 struct sunxi_ve_run {
 	const sunxi_ve_op* ops;
