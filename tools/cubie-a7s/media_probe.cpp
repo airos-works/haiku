@@ -7,7 +7,7 @@
 	(BMediaFile, as MediaPlayer does) and says which decoder did it, how fast
 	and at what processor cost.
 
-	media_probe [-n pictures] [-f 422|rgb32|nv12|i420] [-o out.yuv]
+	media_probe [-h] [-n pictures] [-f 422|rgb32|nv12|i420] [-o out.yuv]
 		[-s seconds] file
 
 	-o writes I420 pictures (-f i420) without their rows' padding, as
@@ -45,9 +45,13 @@ main(int argc, char** argv)
 	color_space space = B_YCbCr422;
 	const char* outPath = NULL;
 	bigtime_t seekTo = -1;
+	bool half = false;
 	int option;
-	while ((option = getopt(argc, argv, "n:f:o:s:")) != -1) {
+	while ((option = getopt(argc, argv, "hn:f:o:s:")) != -1) {
 		switch (option) {
+			case 'h':
+				half = true;
+				break;
 			case 'o':
 				outPath = optarg;
 				break;
@@ -69,7 +73,8 @@ main(int argc, char** argv)
 				break;
 			default:
 				fprintf(stderr, "usage: %s [-n pictures] "
-					"[-f 422|rgb32|nv12|i420] [-o out.yuv] [-s seconds] file\n", argv[0]);
+					"[-f 422|rgb32|nv12|i420] [-o out.yuv] [-s seconds] [-h] file\n",
+					argv[0]);
 				return 1;
 		}
 	}
@@ -106,16 +111,20 @@ main(int argc, char** argv)
 		decoded.type = B_MEDIA_RAW_VIDEO;
 		decoded.u.raw_video = media_raw_video_format::wildcard;
 		decoded.u.raw_video.display.format = space;
-		decoded.u.raw_video.display.line_width = width;
-		decoded.u.raw_video.display.line_count = height;
+		// -h: half as wide and high, as players ask for a 4K film on a
+		// 1080p screen
+		decoded.u.raw_video.display.line_width = half ? width / 2 : width;
+		decoded.u.raw_video.display.line_count = half ? height / 2 : height;
 		status_t status = track->DecodedFormat(&decoded);
 		media_codec_info info;
 		memset(&info, 0, sizeof(info));
 		track->GetCodecInfo(&info);
 		printf("track %" B_PRId32 ": %" B_PRIu32 "x%" B_PRIu32 ", decoder "
-			"\"%s\" (%s), output %#x, %" B_PRIu32 " bytes a row: %s\n", i,
-			width, height, info.pretty_name, info.short_name,
-			decoded.u.raw_video.display.format,
+			"\"%s\" (%s), output %#x %" B_PRIu32 "x%" B_PRIu32 ", %" B_PRIu32
+			" bytes a row: %s\n", i, width, height, info.pretty_name,
+			info.short_name, decoded.u.raw_video.display.format,
+			decoded.u.raw_video.display.line_width,
+			decoded.u.raw_video.display.line_count,
 			decoded.u.raw_video.display.bytes_per_row, strerror(status));
 		if (status != B_OK)
 			return 1;
@@ -124,7 +133,8 @@ main(int argc, char** argv)
 			* height * 2;
 		uint8* buffer = (uint8*)malloc(size);
 		FILE* out = NULL;
-		if (outPath != NULL && space == (color_space)0x49343230)
+		if (outPath != NULL && (space == (color_space)0x49343230
+				|| space == B_RGB32))
 			out = fopen(outPath, "wb");
 		if (seekTo >= 0) {
 			// a seek in the middle of decoding, as players do
@@ -156,6 +166,14 @@ main(int argc, char** argv)
 				uint32 stride = header.u.raw_video.bytes_per_row;
 				uint32 lines = header.u.raw_video.display_line_count;
 				uint32 columns = header.u.raw_video.display_line_width;
+				if (space == B_RGB32) {
+					// the last picture alone (B, G, R, A)
+					fseek(out, 0, SEEK_SET);
+					for (uint32 y = 0; y < lines; y++)
+						fwrite(buffer + (size_t)y * stride, 4, columns, out);
+					pictures += count;
+					continue;
+				}
 				for (uint32 y = 0; y < lines; y++)
 					fwrite(buffer + (size_t)y * stride, 1, columns, out);
 				const uint8* chroma = buffer + (size_t)stride * lines;
