@@ -162,9 +162,16 @@ CedarEngine::_Configure(uint32 width, uint32 height, size_t mvcolSize,
 			status = fDevice.Allocate(fVp9ColMv,
 				(size_t)(fStride / 8) * (fAlignedHeight / 8) * 16);
 		}
+		// all of them zeroed, as Linux's dma_alloc_coherent() has them: a
+		// pool buffer holds what its last user left, and a stream's first
+		// frame with motion vectors from the one before (tile-4x4 frame 2)
+		// then ended with an error now and then
 		if (status == B_OK) {
-			memset(fVp9Probs.address, 0, fVp9Probs.size);
-			fDevice.SyncForDevice(fVp9Probs, 0, fVp9Probs.size);
+			VeBuffer* buffers[3] = { &fVp9Probs, &fVp9Neighbour, &fVp9ColMv };
+			for (VeBuffer* buffer : buffers) {
+				memset(buffer->address, 0, buffer->size);
+				fDevice.SyncForDevice(*buffer, 0, buffer->size);
+			}
 		}
 	} else {
 		// twice Cedrus' 794 KiB, as the BSP does for 10 bit
