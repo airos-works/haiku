@@ -16,6 +16,7 @@ SimpleTest durable_write : durable_write.cpp ;
 SimpleTest illegal_instruction_test : illegal_instruction_test.cpp ;
 
 SimpleTest signal_fpu_test : signal_fpu_test.cpp ;
+SimpleTest signal_suspend_resume_test : signal_suspend_resume_test.cpp ;
 
 SimpleTest hello_avx : hello_avx.c ;
 local avxSource = [ FGristFiles hello_avx.c ] ;
