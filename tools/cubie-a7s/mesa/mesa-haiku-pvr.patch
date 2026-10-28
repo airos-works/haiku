@@ -2126,7 +2126,37 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
        if (result != VK_SUCCESS)
           return result;
     }
-@@ -4897,6 +4932,12 @@
+@@ -3432,15 +3467,22 @@
+ 
+    info->enable_bg_tag = !!hw_render->color_init_count;
+ 
+-   /* If we're not using index list for all clears/loads then we need to run
+-    * the background object on empty tiles.
++   /* The background object has to run on empty tiles for the clears it
++    * makes (those not made with index lists). A tile no primitive touched
++    * that is only loaded is the same in memory without it, as on the later
++    * renders of a pass: loading every tile of a framebuffer object drawn
++    * into in a small part (Summit's compositing on Haiku) cost about 2.4 ns
++    * a pixel of it. Multiview keeps the empty tiles, as there.
+     */
+-   if (hw_render->color_init_count &&
+-       index_list_clear_mask != ((1u << hw_render->color_init_count) - 1u)) {
+-      info->process_empty_tiles = true;
+-   } else {
+-      info->process_empty_tiles = false;
++   info->process_empty_tiles = false;
++   for (uint32_t i = 0; i < hw_render->color_init_count; i++) {
++      if (hw_render->color_init[i].op == VK_ATTACHMENT_LOAD_OP_CLEAR &&
++          !(index_list_clear_mask & BITFIELD_BIT(i))) {
++         info->process_empty_tiles = true;
++      }
+    }
++   if (hw_render->color_init_count && hw_render->multiview_enabled)
++      info->process_empty_tiles = true;
+ 
+    if (hw_render->ds_attach_idx != VK_ATTACHMENT_UNUSED) {
+       uint32_t ds_index_list = 0;
+@@ -4897,6 +4939,12 @@
        goto exit_teardown_render;
     }
  
@@ -2139,7 +2169,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
     result = pvr_resolve_unemitted_resolve_attachments(cmd_buffer,
                                                        &state->render_pass_info);
     if (result != VK_SUCCESS) {
-@@ -5494,9 +5535,16 @@
+@@ -5494,9 +5542,16 @@
  static VkResult pvr_cmd_upload_push_consts(struct pvr_cmd_buffer *cmd_buffer,
                                             enum pvr_stage_allocation stage);
  
@@ -2157,7 +2187,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
     const struct pvr_stage_allocation_descriptor_state *descriptor_state,
     const pvr_dev_addr_t *const num_worgroups_buff_addr,
     uint32_t *const descriptor_data_offset_out)
-@@ -5505,8 +5553,6 @@
+@@ -5505,8 +5560,6 @@
     const struct pvr_device *device = cmd_buffer->device;
     const struct pvr_physical_device *pdevice = device->pdevice;
     const struct pvr_device_info *dev_info = &pdevice->dev_info;
@@ -2166,7 +2196,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
     struct pvr_suballoc_bo *pvr_bo;
     const uint8_t *entries;
     uint32_t *dword_buffer;
-@@ -5529,27 +5575,6 @@
+@@ -5529,27 +5582,6 @@
  
     entries = (uint8_t *)pds_info->entries;
  
@@ -2194,7 +2224,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
     for (uint32_t i = 0; i < pds_info->entry_count; i++) {
        const struct pvr_const_map_entry *const entry_header =
           (struct pvr_const_map_entry *)entries;
-@@ -5621,6 +5646,87 @@
+@@ -5621,6 +5653,87 @@
              break;
           }
  
@@ -2282,7 +2312,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
           case PVR_BUFFER_TYPE_PUSH_CONSTS: {
              struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
  
-@@ -6029,14 +6135,59 @@
+@@ -6029,14 +6142,59 @@
     return VK_SUCCESS;
  }
  
@@ -2345,7 +2375,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
     const uint32_t const_shared_regs = pipeline->cs_data.common.shareds;
     struct pvr_compute_kernel_info info;
  
-@@ -6076,7 +6227,7 @@
+@@ -6076,7 +6234,7 @@
        uint32_t pds_data_size_in_dwords =
           pipeline->descriptor_state.pds_info.data_size_in_dwords;
  
@@ -2354,7 +2384,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
        info.pds_data_size =
           DIV_ROUND_UP(PVR_DW_TO_BYTES(pds_data_size_in_dwords),
                        ROGUE_CDMCTRL_KERNEL0_PDS_DATA_SIZE_UNIT_SIZE);
-@@ -6102,6 +6253,17 @@
+@@ -6102,6 +6260,17 @@
     pvr_compute_generate_control_stream(csb, sub_cmd, &info);
  }
  
@@ -2372,7 +2402,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
  void pvr_arch_compute_update_shared_private(
     struct pvr_cmd_buffer *cmd_buffer,
     struct pvr_sub_cmd_compute *const sub_cmd,
-@@ -6246,16 +6408,15 @@
+@@ -6246,16 +6415,15 @@
  static void pvr_compute_update_kernel(
     struct pvr_cmd_buffer *cmd_buffer,
     struct pvr_sub_cmd_compute *const sub_cmd,
@@ -2390,7 +2420,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
     const pco_data *const cs_data = &pipeline->cs_data;
     const struct pvr_pds_info *program_info = &pipeline->pds_cs_program_info;
     bool uses_wg_id = pipeline->base_workgroup_data_patching_offset != ~0u;
-@@ -6440,11 +6601,547 @@
+@@ -6440,11 +6608,547 @@
     pvr_compute_update_shared(cmd_buffer, sub_cmd);
     pvr_compute_update_kernel(cmd_buffer,
                               sub_cmd,
@@ -2938,7 +2968,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
  void PVR_PER_ARCH(CmdDispatchBase)(VkCommandBuffer commandBuffer,
                                     uint32_t baseGroupX,
                                     uint32_t baseGroupY,
-@@ -8128,7 +8825,7 @@
+@@ -8128,7 +8832,7 @@
     /* FIXME: Assume all state is dirty for the moment. */
     struct pvr_device_info *const dev_info =
        &cmd_buffer->device->pdevice->dev_info;
@@ -2947,7 +2977,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
        pvr_get_max_user_vertex_output_components(dev_info);
     struct ROGUE_VDMCTRL_VDM_STATE0 header = { pvr_cmd_header(
        VDMCTRL_VDM_STATE0) };
-@@ -8145,6 +8842,17 @@
+@@ -8145,6 +8849,17 @@
  
     /* CAM Calculations and HW state take vertex size aligned to DWORDS. */
     assert(vs_data->vs.vtxouts <= max_user_vertex_output_components);
@@ -2965,7 +2995,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
  
     pvr_arch_calculate_vertex_cam_size(dev_info,
                                        vs_data->vs.vtxouts,
-@@ -8795,6 +9503,15 @@
+@@ -8795,6 +9510,15 @@
                             0U,
                             0U,
                             0U);
@@ -2981,7 +3011,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
  }
  
  void PVR_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
-@@ -8836,6 +9553,15 @@
+@@ -8836,6 +9560,15 @@
                             0U,
                             0U,
                             0U);
@@ -2997,7 +3027,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
  }
  
  void PVR_PER_ARCH(CmdDrawIndexedIndirect)(VkCommandBuffer commandBuffer,
-@@ -8935,6 +9661,10 @@
+@@ -8935,6 +9668,10 @@
     if (result != VK_SUCCESS)
        return;
  
@@ -3008,7 +3038,7 @@ diff -ruN a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulka
     result = pvr_resolve_unemitted_resolve_attachments(cmd_buffer,
                                                        &state->render_pass_info);
     if (result != VK_SUCCESS)
-@@ -9951,6 +10681,10 @@
+@@ -9951,6 +10688,10 @@
     if (result != VK_SUCCESS)
        pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
  
@@ -6833,6 +6863,17 @@ diff -ruN a/src/imagination/vulkan/pvr_xfb.h b/src/imagination/vulkan/pvr_xfb.h
 +                            uint32_t vertex_count);
 +
 +#endif /* PVR_XFB_H */
+diff -ruN a/src/imagination/vulkan/winsys/powervr/pvr_drm.c b/src/imagination/vulkan/winsys/powervr/pvr_drm.c
+--- a/src/imagination/vulkan/winsys/powervr/pvr_drm.c
++++ b/src/imagination/vulkan/winsys/powervr/pvr_drm.c
+@@ -398,6 +398,7 @@
+    .buffer_destroy = pvr_drm_winsys_buffer_destroy,
+    .buffer_get_fd = pvr_drm_winsys_buffer_get_fd,
+    .buffer_map = pvr_drm_winsys_buffer_map,
++   .buffer_import_scanout = pvr_drm_winsys_buffer_import_scanout,
+    .buffer_unmap = pvr_drm_winsys_buffer_unmap,
+    .heap_alloc = pvr_drm_winsys_heap_alloc,
+    .heap_free = pvr_drm_winsys_heap_free,
 diff -ruN a/src/imagination/vulkan/winsys/powervr/pvr_drm_bo.c b/src/imagination/vulkan/winsys/powervr/pvr_drm_bo.c
 --- a/src/imagination/vulkan/winsys/powervr/pvr_drm_bo.c
 +++ b/src/imagination/vulkan/winsys/powervr/pvr_drm_bo.c
@@ -7279,17 +7320,6 @@ diff -ruN a/src/imagination/vulkan/winsys/powervr/pvr_drm_bo.h b/src/imagination
  VkResult pvr_drm_winsys_buffer_unmap(struct pvr_winsys_bo *bo, bool reserve);
  
  VkResult pvr_drm_heap_alloc_carveout(struct pvr_winsys_heap *const heap,
-diff -ruN a/src/imagination/vulkan/winsys/powervr/pvr_drm.c b/src/imagination/vulkan/winsys/powervr/pvr_drm.c
---- a/src/imagination/vulkan/winsys/powervr/pvr_drm.c
-+++ b/src/imagination/vulkan/winsys/powervr/pvr_drm.c
-@@ -398,6 +398,7 @@
-    .buffer_destroy = pvr_drm_winsys_buffer_destroy,
-    .buffer_get_fd = pvr_drm_winsys_buffer_get_fd,
-    .buffer_map = pvr_drm_winsys_buffer_map,
-+   .buffer_import_scanout = pvr_drm_winsys_buffer_import_scanout,
-    .buffer_unmap = pvr_drm_winsys_buffer_unmap,
-    .heap_alloc = pvr_drm_winsys_heap_alloc,
-    .heap_free = pvr_drm_winsys_heap_free,
 diff -ruN a/src/imagination/vulkan/winsys/powervr/pvr_drm_job_common.h b/src/imagination/vulkan/winsys/powervr/pvr_drm_job_common.h
 --- a/src/imagination/vulkan/winsys/powervr/pvr_drm_job_common.h
 +++ b/src/imagination/vulkan/winsys/powervr/pvr_drm_job_common.h

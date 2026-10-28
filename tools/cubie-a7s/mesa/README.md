@@ -19,7 +19,7 @@ that directory on the include path and does not copy it. The design is
 | `host` | Builds `mesa_clc`, `vtn_bindgen2` and `pco_clc` natively at the same Mesa version. Serialized NIR and USC code must match the driver's version. The build uses the host's LLVM 18, with clang-cpp, LLVMSPIRVLib and SPIRV-Tools from `toolchains/mesa-native-deps` (read only). It does not touch `toolchains/mesa-host`, which holds the 25.3.6 tools. |
 | `configure`, `driver` | Cross-builds only `-Dvulkan-drivers=imagination`: no GL, EGL, LLVM, shader cache or WSI. It uses the ROCK 5's pinned sysroot and cross file (`artifacts/mali-system-opengl-build/20260918T125722Z`), as the Pi 4 build does. Debug paths are relative to the root, so every root builds the same bytes. Meson reads machine files only at setup, so when they change the build directory is wiped. |
 | `tests` | Builds the test programs against the driver. Linking also checks that every symbol the driver needs exists in the sysroot. |
-| `gl` | Builds the EGL vendor library with zink and softpipe in `build-gl/`, the `libvulkan.so.1` shim and the GL test programs (`pvr_glprobe`, `pvr_glbench`, `pvr_glreset`, `pvr_glpresent`, `pvr_glcomposite`, `pvr_glxfb`, `pvr_glconform`). |
+| `gl` | Builds the EGL vendor library with zink and softpipe in `build-gl/`, the `libvulkan.so.1` shim and the GL test programs (`pvr_glprobe`, `pvr_glbench`, `pvr_glreset`, `pvr_glpresent`, `pvr_glcomposite`, `pvr_gldamage`, `pvr_glxfb`, `pvr_glconform`). |
 | `all` | Runs everything above and fills `out/`. |
 
 Everything lives under `/mnt/HaikuWork/cubie/mesa` (`CUBIE_MESA_ROOT`):
@@ -30,7 +30,7 @@ Everything lives under `/mnt/HaikuWork/cubie/mesa` (`CUBIE_MESA_ROOT`):
 - `libvulkan_powervr_mesa.so` and `powervr_mesa_icd.aarch64.json` (for a loader later);
 - `pvr_vkprobe`, `pvr_vkfill`, `pvr_vkfence`, `pvr_vktriangle`, `pvr_vkhang`, `pvr_vkbench`, `pvr_present`, `pvr_copybench`;
 - `tls_generation_check` and `libtls_generation_check.so` (keep them in the same directory);
-- `libEGL_mesa.so.0`, `10_mesa.json` (its libglvnd vendor file), `libvulkan.so.1`, `pvr_glprobe`, `pvr_glbench`, `pvr_glreset`, `pvr_glpresent` and `pvr_glcomposite`;
+- `libEGL_mesa.so.0`, `10_mesa.json` (its libglvnd vendor file), `libvulkan.so.1`, `pvr_glprobe`, `pvr_glbench`, `pvr_glreset`, `pvr_glpresent`, `pvr_glcomposite` and `pvr_gldamage`;
 - `MANIFEST`, with the input hashes.
 
 On the image, the libraries go to `/boot/system/non-packaged/lib`, `10_mesa.json` to `.../non-packaged/add-ons/opengl/egl_vendor.d`, and the programs to `.../non-packaged/bin`.
@@ -229,6 +229,15 @@ Under the shim, `PCO_DEBUG_PRINT=fs,stats` prints each fragment shader with its 
 | `webkit-aa` | 23, 435, 19 | 6, 580, 29 | 0, 147, 13 |
 
 The merged counts are the loads on the path a shader takes when its loads are in bounds; the fallback, normally skipped, holds the rest, and adds to the groups. None of the shaders spill.
+
+### Frames drawn into a small part: `pvr_gldamage`
+
+`pvr_gldamage [width height frames]` draws frames into a 256x256 part of a framebuffer object that is loaded and stored, as Summit's compositor draws its damage, then frames into all of it, and checks every texel. The driver once ran the background object, which loads the attachment, on every tile of the object for a render that only loads its colour attachments, at about 2.4 ns a texel: a 256x256 frame into a 1920x1080 object took as long as one into all of it. Tiles no primitive touched are now skipped unless an attachment is cleared (`pvr_arch_cmd_buffer.c`, as for the later renders of a pass), which leaves them as they were in memory. Cubie A7S, 1920x1080, 120 frames:
+
+| | 256x256 part | all of it |
+|---|---|---|
+| before | 6.55 ms | 6.52 ms |
+| after | 2.33 ms | 5.41 ms |
 
 ## OpenGL
 

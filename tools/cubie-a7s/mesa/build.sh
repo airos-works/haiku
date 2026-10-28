@@ -57,7 +57,7 @@ PATCHES=(mesa-haiku-pvr.patch mesa-haiku-gl.patch)
 TESTS=(pvr_vkprobe pvr_vkfill pvr_vkfence pvr_vktriangle pvr_vkhang
 	pvr_vkbench pvr_present pvr_copybench)
 # OpenGL ES programs (through libglvnd's libEGL/libGLESv2)
-GL_TESTS=(pvr_glprobe pvr_glbench pvr_glreset pvr_glpresent pvr_glcomposite
+GL_TESTS=(pvr_glprobe pvr_glbench pvr_glreset pvr_glpresent pvr_glcomposite pvr_gldamage
 	pvr_glxfb pvr_glconform)
 # the runtime loader's thread-local storage for dlopen()ed libraries: a
 # program and the library it loads, built from one file
