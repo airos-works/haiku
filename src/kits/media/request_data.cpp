@@ -30,7 +30,8 @@ request_data::request_data()
 
 request_data::~request_data()
 {
-	gPortPool->PutPort(reply_port);
+	if (reply_port >= 0)
+		gPortPool->PutPort(reply_port);
 }
 
 

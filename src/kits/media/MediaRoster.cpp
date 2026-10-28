@@ -1705,18 +1705,22 @@ BMediaRoster::GetLiveNodes(live_node_info* liveNodes, int32* _totalCount,
 	}
 
 	const live_node_info* info;
+	int32 count = reply.count;
 	if (reply.area >= 0)
 		info = (live_node_info*)reply.address;
-	else
+	else {
 		info = reply.live_info;
+		count = min_c(count, (int32)MAX_LIVE_INFO);
+	}
+	count = max_c(0, min_c(count, *_totalCount));
 
-	for (int32 i = 0; i < reply.count; i++)
+	for (int32 i = 0; i < count; i++)
 		liveNodes[i] = info[i];
 
 	if (reply.area >= 0)
 		delete_area(reply.area);
 
-	*_totalCount = reply.count;
+	*_totalCount = count;
 	return B_OK;
 }
 

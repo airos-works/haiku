@@ -217,6 +217,11 @@ QueryPort(port_id requestPort, int32 msgCode, request_data* request,
 	if (status < B_OK) {
 		ERROR("QueryPort: read_port failed, msgcode 0x%" B_PRIx32 ", port %"
 			B_PRId32 ": %s\n", msgCode, request->reply_port, strerror(status));
+
+		// The reply may still arrive; it must not be read as the answer to
+		// a later request that gets this port from the pool.
+		delete_port(request->reply_port);
+		request->reply_port = create_port(1, "media reply port");
 	}
 
 	return status < B_OK ? status : reply->result;
