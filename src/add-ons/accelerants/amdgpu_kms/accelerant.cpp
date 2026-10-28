@@ -240,6 +240,7 @@ amdgpu_uninit_accelerant(void)
 		close(gInfo->device);
 	} else {
 		// the display shows what it showed; app_server is going away
+		uninit_device_copies();
 		Kms::DestroyBuffer(gInfo->device, gInfo->cursor);
 		if (gInfo->sharedArea >= 0)
 			delete_area(gInfo->sharedArea);

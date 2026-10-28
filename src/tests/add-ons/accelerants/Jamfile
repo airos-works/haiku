@@ -1,4 +1,5 @@
 SubDir HAIKU_TOP src tests add-ons accelerants ;
 
+SubInclude HAIKU_TOP src tests add-ons accelerants amdgpu_kms ;
 SubInclude HAIKU_TOP src tests add-ons accelerants fake_outputs ;
 SubInclude HAIKU_TOP src tests add-ons accelerants intel_extreme ;

@@ -1,0 +1,20 @@
+SubDir HAIKU_TOP src tests add-ons accelerants amdgpu_kms ;
+
+# The amdgpu_kms accelerant's copies to the screen by the GPU, against a
+# frame buffer of the test's own; see device_copy_test.cpp.
+
+UsePrivateHeaders graphics ;
+UsePrivateHeaders [ FDirName graphics common ] ;
+UsePrivateHeaders [ FDirName graphics amdgpu_drm ] ;
+UsePrivateHeaders shared ;
+
+local accelerantDir = [ FDirName $(HAIKU_TOP) src add-ons accelerants
+	amdgpu_kms ] ;
+SEARCH_SOURCE += $(accelerantDir) ;
+SubDirHdrs $(accelerantDir) ;
+
+SimpleTest device_copy_test :
+	device_copy_test.cpp
+	device_copy.cpp
+	kms.cpp
+;

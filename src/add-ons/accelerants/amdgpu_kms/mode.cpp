@@ -506,8 +506,12 @@ apply_layout(Layout& layout, bool testOnly)
 		if (published != B_OK)
 			TRACE("frame buffer not offered to renderers: %s\n",
 				strerror(published));
+		// no copy by the GPU runs into the old one meanwhile
+		lock_device_copies();
 		Kms::DestroyBuffer(fd, gInfo->frameBuffer);
 		gInfo->frameBuffer = buffer;
+		gInfo->frameBufferGeneration++;
+		unlock_device_copies();
 	}
 	for (uint32 c = 0; c < Kms::kMaxObjects; c++) {
 		Kms::DestroyBlob(fd, gInfo->modeBlobs[c]);
