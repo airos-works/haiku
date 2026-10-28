@@ -1,5 +1,6 @@
 # powervr driver settings of the air/OS image for the Cubie A7S
-# (tools/cubie-a7s/UserBuildConfig puts this in kernel/drivers/powervr).
+# (tools/cubie-a7s/UserBuildConfig and, for the CI images,
+# tools/airos/ci/UserBuildConfig put this in kernel/drivers/powervr).
 #
 # Boot the GPU firmware when the driver starts, so that OpenGL (zink) and
 # Vulkan run on the GPU. Without the firmware file, or if it does not

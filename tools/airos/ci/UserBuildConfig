@@ -477,6 +477,14 @@ rule UserBuildConfigRulePreImage
 		SEARCH on $(timeSync) = $(rpi) ;
 		AddFilesToHaikuImage home config settings boot : $(bootscript)
 			$(timeSync) ;
+		# The GPU: the image has its firmware (AIROS_CI_FIRMWARE), which the
+		# powervr driver only starts when its settings say so; without them
+		# OpenGL, Summit's too, runs in software.
+		local gpuSettings = <airos-cubie>powervr ;
+		SEARCH on $(gpuSettings)
+			= [ FDirName $(HAIKU_TOP) tools cubie-a7s settings ] ;
+		AddFilesToHaikuImage home config settings kernel drivers
+			: $(gpuSettings) ;
 	}
 
 	# A release image: its identity, and its files outside packages in a
