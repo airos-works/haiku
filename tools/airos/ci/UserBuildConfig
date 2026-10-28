@@ -118,16 +118,12 @@ switch $(HAIKU_BUILD_PROFILE) {
 	case nightly-airos-x86_64 : {
 		AIROS_X86_64 = 1 ;
 		HAIKU_IMAGE_SIZE = $(AIROS_CI_IMAGE_SIZE:E=3072) ;
-		# What the x86_64 applications require that the HaikuPorts repository
-		# list of the build system has (the rest arrive as package files):
-		# Amp (curl, SQLite), Kiri (git, PCRE2), airTime
-		# (FFmpeg 6), Burrow (OpenSSL 3) and Summit's TLS certificates.
-		AddHaikuImageSystemPackages curl sqlite libpcre2 openssl3 ffmpeg6 git
-			ca_root_certificates ;
 		# CI's curl with HTTP/3 (airos-ci deps/recipes/curl.sh, under the
 		# repository package's name) instead of the repository's, whose
 		# libcurl has none, with the QUIC and HTTP/3 libraries it requires:
-		# as packages, so that the dependency resolution sees them.
+		# as packages, so that the dependency resolution sees them. This
+		# comes first: AddHaikuImageSystemPackages adds the repository's
+		# package at once, so suppressing it later leaves both in the image.
 		local curl = [ Glob $(AIROS_CI_PACKAGES) : curl-*-x86_64.hpkg ] ;
 		if $(curl) {
 			local quic = [ Glob $(AIROS_CI_PACKAGES)
@@ -135,6 +131,12 @@ switch $(HAIKU_BUILD_PROFILE) {
 			SuppressHaikuImagePackages curl ;
 			AIROS_CI_BASE_PACKAGES += $(curl:BS) $(quic:BS) ;
 		}
+		# What the x86_64 applications require that the HaikuPorts repository
+		# list of the build system has (the rest arrive as package files):
+		# Amp (curl, SQLite), Kiri (git, PCRE2), airTime
+		# (FFmpeg 6), Burrow (OpenSSL 3) and Summit's TLS certificates.
+		AddHaikuImageSystemPackages curl sqlite libpcre2 openssl3 ffmpeg6 git
+			ca_root_certificates ;
 		# and what CI's packages need that this list has: Qt's dependencies
 		# (airos-ci deps/build-qt-airos.sh, images/build-image.sh)
 		if $(AIROS_CI_SYSTEM_PACKAGES) {
