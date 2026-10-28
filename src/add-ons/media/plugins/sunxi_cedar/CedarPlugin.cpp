@@ -25,6 +25,14 @@
 	(or a sunxi_ve driver from before VP9, which refuses the frames) goes to
 	the FFmpeg decoder as the others do.
 
+	When the engine fails later in a stream (a frame times out, or three in
+	a row end with an error), the engine is not asked again: with the
+	fallback, and pictures as B_RGB32 or B_YCbCr422 at their size (which the
+	FFmpeg decoder makes too), the FFmpeg decoder takes over from the last
+	VP9 key frame on (the chunks since are kept) and the pictures already
+	shown are dropped; otherwise Decode() returns B_ERROR from then on, for
+	the caller to decode the stream itself.
+
 	Pictures are handed out as
 	- 'I420': line_count rows of luma bytes_per_row apart, then a plane of Cb
 	  and one of Cr, half as many rows of half the length, or
@@ -64,6 +72,7 @@
 #include "CedarDecoder.h"
 #include "h264_parse.h"
 #include "hevc_parse.h"
+#include "vp9_parse.h"
 
 
 // AV_CODEC_ID_H264, AV_CODEC_ID_HEVC and AV_CODEC_ID_VP9 of the FFmpeg
@@ -140,6 +149,9 @@ private:
 									size_t size);
 			bool				_EngineDecodes(BString& reason) const;
 			status_t			_StartSoftware(const char* reason);
+			status_t			_EngineFailed(void* buffer, int64* frameCount,
+									media_header* header,
+									media_decode_info* info);
 			uint32				_Stride() const;
 
 			const bool			fFallback;
@@ -186,6 +198,15 @@ private:
 			bool				fReleasePending;
 			CedarDecoder::Picture fPendingRelease;
 
+			// VP9 with the fallback: the chunks since the last key frame, for
+			// the FFmpeg decoder should the engine fail later on
+			bool				fKeepGroup;
+			size_t				fGroupSize;
+			bool				fEngineGone;	// Decode() returns B_ERROR
+			bool				fHaveShown;
+			bigtime_t			fLastShown;		// skipped by the software
+			media_format		fOutputFormat;	// as negotiated
+
 			// the software decoder, when the engine does not do the stream
 			image_id			fSoftwareImage;
 			MediaPlugin*		fSoftwarePlugin;
@@ -220,6 +241,11 @@ SunxiCedarDecoder::SunxiCedarDecoder(bool fallback)
 	fAheadDrain(false),
 	fAheadStatus(B_OK),
 	fReleasePending(false),
+	fKeepGroup(false),
+	fGroupSize(0),
+	fEngineGone(false),
+	fHaveShown(false),
+	fLastShown(0),
 	fSoftwareImage(-1),
 	fSoftwarePlugin(NULL),
 	fSoftware(NULL)
@@ -512,6 +538,27 @@ SunxiCedarDecoder::_ReadChunk(const void** chunk, size_t* size,
 	media_header* header)
 {
 	status_t status = GetNextChunk(chunk, size, header);
+	if (status == B_OK && fKeepGroup && !fRecording) {
+		// the VP9 group of pictures so far, from its key frame
+		static const size_t kMaxGroup = 96 * 1024 * 1024;
+		if (vp9_is_key_frame((const uint8*)*chunk, *size)) {
+			fRecorded.clear();
+			fGroupSize = 0;
+		}
+		if (fGroupSize + *size <= kMaxGroup) {
+			Chunk recorded;
+			recorded.data.assign((const uint8*)*chunk,
+				(const uint8*)*chunk + *size);
+			recorded.header = *header;
+			fRecorded.push_back(recorded);
+			fGroupSize += *size;
+		} else {
+			// too long ago to catch up: from the next key frame on
+			fRecorded.clear();
+			fGroupSize = kMaxGroup + 1;
+		}
+		return status;
+	}
 	if (status == B_OK && fRecording) {
 		Chunk recorded;
 		recorded.data.assign((const uint8*)*chunk,
@@ -613,8 +660,11 @@ SunxiCedarDecoder::NegotiateOutputFormat(media_format* format)
 		fHavePicture = true;
 	}
 	// what the software decoder would need again is not needed any more
+	// (but for VP9, see _ReadChunk())
 	fRecording = false;
-	fRecorded.clear();
+	fKeepGroup = fFallback && fCodec == kCodecVP9;
+	if (!fKeepGroup)
+		fRecorded.clear();
 
 	// (MediaPlayer leaves the format's type unset and only names the colour
 	// space)
@@ -660,6 +710,7 @@ SunxiCedarDecoder::NegotiateOutputFormat(media_format* format)
 	format->require_flags = 0;
 	format->deny_flags = B_MEDIA_MAUI_UNDEFINED_FLAGS;
 	format->u.raw_video = raw;
+	fOutputFormat = *format;
 	return B_OK;
 }
 
@@ -681,6 +732,8 @@ SunxiCedarDecoder::SeekedTo(int64 frame, bigtime_t time)
 	fInputEnded = false;
 	fParameterSetsSent = false;
 	fRecorded.clear();
+	fGroupSize = 0;
+	fHaveShown = false;
 	return B_OK;
 }
 
@@ -786,7 +839,8 @@ SunxiCedarDecoder::_Feed(const void* chunk, size_t size,
 		status = fDecoder->EndAccessUnit();
 	if (status != B_OK) {
 		fprintf(stderr, "sunxi_cedar: %s\n", fDecoder->Error());
-		return status == B_NOT_SUPPORTED ? status : B_ERROR;
+		return status == B_NOT_SUPPORTED || status == B_IO_ERROR
+			? status : B_ERROR;
 	}
 	return B_OK;
 }
@@ -873,8 +927,19 @@ status_t
 SunxiCedarDecoder::Decode(void* buffer, int64* frameCount,
 	media_header* header, media_decode_info* info)
 {
-	if (fSoftware != NULL)
-		return fSoftware->Decode(buffer, frameCount, header, info);
+	if (fSoftware != NULL) {
+		while (true) {
+			status_t status = fSoftware->Decode(buffer, frameCount, header,
+				info);
+			// after the engine failed: what it showed already is not wanted
+			if (status != B_OK || !fHaveShown
+				|| header->start_time > fLastShown) {
+				return status;
+			}
+		}
+	}
+	if (fEngineGone)
+		return B_ERROR;
 	if (fDecoder == NULL)
 		return B_NO_INIT;
 	if (buffer == NULL || frameCount == NULL || header == NULL)
@@ -883,6 +948,8 @@ SunxiCedarDecoder::Decode(void* buffer, int64* frameCount,
 	status_t aheadStatus = _JoinAhead();
 	if (aheadStatus != B_OK) {
 		fAheadStatus = B_OK;
+		if (aheadStatus == B_IO_ERROR)
+			return _EngineFailed(buffer, frameCount, header, info);
 		return aheadStatus;
 	}
 
@@ -891,6 +958,8 @@ SunxiCedarDecoder::Decode(void* buffer, int64* frameCount,
 
 	if (!fHavePicture) {
 		status_t status = _NextPicture(fPicture);
+		if (status == B_IO_ERROR)
+			return _EngineFailed(buffer, frameCount, header, info);
 		if (status != B_OK)
 			return status;
 	}
@@ -940,7 +1009,45 @@ SunxiCedarDecoder::Decode(void* buffer, int64* frameCount,
 	// once the access unit decoded meanwhile is done (_JoinAhead())
 	fPendingRelease = fPicture;
 	fReleasePending = true;
+	fHaveShown = true;
+	fLastShown = fPicture.pts;
 	return B_OK;
+}
+
+
+/*!	The engine gave up on the stream in the middle (CedarDecoder's
+	B_IO_ERROR): the FFmpeg decoder goes on where it can make the same
+	pictures, else the caller has to.
+*/
+status_t
+SunxiCedarDecoder::_EngineFailed(void* buffer, int64* frameCount,
+	media_header* header, media_decode_info* info)
+{
+	BString reason = fDecoder->Error();
+	bool sameOutput = (fOutputSpace == B_RGB32
+			|| fOutputSpace == B_YCbCr422) && !fHalf;
+	if (fFallback && fKeepGroup && sameOutput
+		&& fGroupSize <= 96 * 1024 * 1024 && !fRecorded.empty()) {
+		fKeepGroup = false;
+		media_format format = fOutputFormat;
+		if (_StartSoftware(reason.String()) == B_OK
+			&& fSoftware->NegotiateOutputFormat(&format) == B_OK
+			&& format.u.raw_video.display.format
+				== fOutputFormat.u.raw_video.display.format
+			&& format.u.raw_video.display.bytes_per_row
+				== fOutputFormat.u.raw_video.display.bytes_per_row) {
+			return Decode(buffer, frameCount, header, info);
+		}
+		// the FFmpeg decoder does not do it as negotiated
+		delete fSoftware;
+		fSoftware = NULL;
+	}
+	fprintf(stderr, "sunxi_cedar: %s; no more pictures\n", reason.String());
+	fEngineGone = true;
+	if (fDecoder != NULL && fHavePicture)
+		fDecoder->ReleasePicture(fPicture);
+	fHavePicture = false;
+	return B_ERROR;
 }
 
 

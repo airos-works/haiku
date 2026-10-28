@@ -115,6 +115,11 @@ public:
 			size_t				CopyTwoBit(const Picture& picture,
 									uint8* target, size_t size);
 
+			/*!	The engine failed on the stream (VP9: a frame timed out, or
+				three in a row ended with an error): PutNal() now returns
+				B_IO_ERROR and leaves the engine alone. */
+			bool				EngineFailed() const { return fEngineFailed; }
+
 			const char*			Error() const { return fError.String(); }
 			uint32				PicturesDecoded() const { return fDecoded; }
 			uint32				SlicesDecoded() const
@@ -182,6 +187,8 @@ private:
 			Vp9Frame*			fVp9Frame;
 			Vp9Counts*			fVp9Counts;
 			int32				fVp9Slots[VP9_REF_SLOTS];	// frames
+			uint32				fFailedInARow;
+			bool				fEngineFailed;
 
 			// pictures
 			std::vector<CedarFrame*> fFrames;

@@ -264,6 +264,9 @@ void vp9_finish_frame(Vp9State *state, Vp9Frame *frame,
 void vp9_adapt_probs(Vp9Probs *probs, const Vp9Probs *pre,
 	const Vp9Counts *counts, const Vp9Frame *frame);
 
+/* Whether a chunk (its first frame) is a key frame. */
+int vp9_is_key_frame(const uint8_t *data, size_t size);
+
 /* The first column (row) of 8x8 blocks of a tile. */
 int vp9_tile_offset(int tile, int mis, int log2Tiles);
 

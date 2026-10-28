@@ -62,6 +62,8 @@ CedarDecoder::CedarDecoder(codec codec)
 	fVp9(NULL),
 	fVp9Frame(NULL),
 	fVp9Counts(NULL),
+	fFailedInARow(0),
+	fEngineFailed(false),
 	fCurrent(-1),
 	fFirstSlice(false),
 	fSkipping(false),
@@ -185,6 +187,8 @@ CedarDecoder::PutNal(const uint8* nal, size_t size, int64 pts)
 		return B_NO_INIT;
 	if (fCodec == H264)
 		return size >= 1 ? _PutH264(nal, size, pts) : B_OK;
+	if (fEngineFailed)
+		return B_IO_ERROR;
 	if (fCodec == VP9)
 		return _PutVp9(nal, size, pts);
 	return size >= 2 ? _PutHevc(nal, size, pts) : B_OK;
@@ -1785,8 +1789,15 @@ CedarDecoder::_Vp9Frame(const uint8* data, size_t size, int64 pts)
 	CedarFrame& current = *fFrames[fCurrent];
 	current.poc = (int32)fDecoded;
 
-	status = fEngine.DecodeVp9Frame(frame, current, references, data, size,
-		fVp9Counts);
+	// CEDAR_VP9_FAIL_AFTER: the frames after that many time out (to test
+	// what comes of an engine that fails)
+	static const char* sFailAfter = getenv("CEDAR_VP9_FAIL_AFTER");
+	if (sFailAfter != NULL && fDecoded >= (uint32)atoi(sFailAfter))
+		status = B_TIMED_OUT;
+	else {
+		status = fEngine.DecodeVp9Frame(frame, current, references, data,
+			size, fVp9Counts);
+	}
 	bool decoded = status == B_OK;
 	if (!decoded) {
 		if (status == B_NOT_ALLOWED && fDecoded == 0) {
@@ -1799,7 +1810,17 @@ CedarDecoder::_Vp9Frame(const uint8* data, size_t size, int64 pts)
 		fprintf(stderr, "sunxi_cedar: VP9 frame %" B_PRIu32 ": %s\n",
 			fDecoded, fEngine.LastError());
 		current.corrupt = true;
-	}
+		// what follows refers to it: a stream the engine does not get right
+		// goes elsewhere rather than to more errors and timeouts
+		if (status == B_TIMED_OUT || ++fFailedInARow >= 3) {
+			fEngineFailed = true;
+			current.current = false;
+			fCurrent = -1;
+			return _Fail(B_IO_ERROR, "the engine fails on this stream: %s",
+				fEngine.LastError());
+		}
+	} else
+		fFailedInARow = 0;
 	vp9_finish_frame(fVp9, &frame, decoded ? fVp9Counts : NULL);
 
 	for (int i = 0; i < VP9_REF_SLOTS; i++) {
