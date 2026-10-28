@@ -370,54 +370,63 @@
 /* The cores' top speeds, as Radxa's BSP runs them (cpufreq: 1794 MHz for the
    Cortex-A55s, 2002 MHz for the Cortex-A76s); About and sysinfo show them.
    Each cluster's PLL, operating points (sun60i-a733-opp-26m.dtsi) and rail,
-   for the sunxi_thermal driver's frequency scaling. */
+   for the sunxi_thermal driver's frequency scaling; the BSP's capacities,
+   for the scheduler. */
 &cpu0 {
 	clock-frequency = <1794000000>;
 	clocks = <&cpupll 1>;
 	operating-points-v2 = <&cpul_opp>;
 	cpu-supply = <&reg_dcdc5_323>;
+	capacity-dmips-mhz = <430>;
 };
 &cpu1 {
 	clock-frequency = <1794000000>;
 	clocks = <&cpupll 1>;
 	operating-points-v2 = <&cpul_opp>;
 	cpu-supply = <&reg_dcdc5_323>;
+	capacity-dmips-mhz = <430>;
 };
 &cpu2 {
 	clock-frequency = <1794000000>;
 	clocks = <&cpupll 1>;
 	operating-points-v2 = <&cpul_opp>;
 	cpu-supply = <&reg_dcdc5_323>;
+	capacity-dmips-mhz = <430>;
 };
 &cpu3 {
 	clock-frequency = <1794000000>;
 	clocks = <&cpupll 1>;
 	operating-points-v2 = <&cpul_opp>;
 	cpu-supply = <&reg_dcdc5_323>;
+	capacity-dmips-mhz = <430>;
 };
 &cpu4 {
 	clock-frequency = <1794000000>;
 	clocks = <&cpupll 1>;
 	operating-points-v2 = <&cpul_opp>;
 	cpu-supply = <&reg_dcdc5_323>;
+	capacity-dmips-mhz = <430>;
 };
 &cpu5 {
 	clock-frequency = <1794000000>;
 	clocks = <&cpupll 1>;
 	operating-points-v2 = <&cpul_opp>;
 	cpu-supply = <&reg_dcdc5_323>;
+	capacity-dmips-mhz = <430>;
 };
 &cpu6 {
 	clock-frequency = <2002000000>;
 	clocks = <&cpupll 2>;
 	operating-points-v2 = <&cpub_opp>;
 	cpu-supply = <&reg_dcdc3_323>;
+	capacity-dmips-mhz = <1024>;
 };
 &cpu7 {
 	clock-frequency = <2002000000>;
 	clocks = <&cpupll 2>;
 	operating-points-v2 = <&cpub_opp>;
 	cpu-supply = <&reg_dcdc3_323>;
+	capacity-dmips-mhz = <1024>;
 };
 /* the U-Boot tree calls the two big cores Cortex-A55s too */
 &cpu6 { compatible = "arm,cortex-a76"; };

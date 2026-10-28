@@ -12,6 +12,7 @@ extern "C" {
 
 
 #include <arch/cpu.h>
+#include <arch/arm64/arch_cpu_type.h>
 #include <arch/arm64/cache_line_size.h>
 #include <boot/kernel_args.h>
 #include <commpage.h>
@@ -20,6 +21,10 @@ extern "C" {
 
 
 extern "C" void _exception_vectors(void);
+
+extern void* gFDT;
+int arm64_fdt_cpu_node(const void* fdt, uint64 mpidr);
+uint64 arm64_fdt_cpu_frequency(const void* fdt, int node);
 
 
 static const uint32 kPsciVersion = 0x84000000;
@@ -155,6 +160,102 @@ arm64_cpu_hwcaps(uint64 caps[2])
 }
 
 
+/*!	Work per clock of a core design, against 1024 for the big out-of-order
+	cores of its time (the scale of the device tree's capacity-dmips-mhz),
+	for device trees without that property; 0 when the design is unknown.
+	Rough classes only: a table that cannot tell cores apart is no worse
+	than knowing nothing, the device tree's own figures win.
+*/
+static uint32
+arm64_core_capacity(uint64 midr)
+{
+	uint32 part = CPU_PART(midr);
+	switch (CPU_IMPL(midr)) {
+		case CPU_IMPL_ARM:
+			switch (part) {
+				case CPU_PART_CORTEX_A34:
+				case CPU_PART_CORTEX_A35:
+				case CPU_PART_CORTEX_A53:
+				case CPU_PART_CORTEX_A55:
+				case CPU_PART_CORTEX_A510:
+				case CPU_PART_CORTEX_A520:
+				case CPU_PART_C1_NANO:
+					return 400;
+				case CPU_PART_CORTEX_A57:
+				case CPU_PART_CORTEX_A72:
+				case CPU_PART_CORTEX_A73:
+					return 650;
+				case CPU_PART_CORTEX_X1:
+				case CPU_PART_CORTEX_X1C:
+				case CPU_PART_CORTEX_X2:
+				case CPU_PART_CORTEX_X3:
+				case CPU_PART_CORTEX_X4:
+				case CPU_PART_CORTEX_X925:
+				case CPU_PART_C1_ULTRA:
+				case CPU_PART_C1_PREMIUM:
+				case CPU_PART_NEOVERSE_V1:
+				case CPU_PART_NEOVERSE_V2:
+				case CPU_PART_NEOVERSE_V3:
+				case CPU_PART_NEOVERSE_V3AE:
+					return 1300;
+				default:
+					return 1024;
+			}
+		case CPU_IMPL_QUALCOMM:
+			return part == CPU_PART_KRYO400_SILVER ? 400
+				: part == CPU_PART_KRYO400_GOLD ? 1024 : 0;
+		case CPU_IMPL_APPLE:
+			switch (part) {
+				case CPU_PART_M1_ICESTORM:
+				case CPU_PART_M1_ICESTORM_PRO:
+				case CPU_PART_M1_ICESTORM_MAX:
+				case CPU_PART_M2_BLIZZARD:
+				case CPU_PART_M2_BLIZZARD_PRO:
+					return 500;
+				case CPU_PART_M1_FIRESTORM:
+				case CPU_PART_M1_FIRESTORM_PRO:
+				case CPU_PART_M1_FIRESTORM_MAX:
+				case CPU_PART_M2_AVALANCHE:
+					return 1300;
+				default:
+					return 0;
+			}
+		default:
+			return 0;
+	}
+}
+
+
+/*!	The CPU's capacity for the scheduler: the device tree's
+	capacity-dmips-mhz (or the core design's class) times its top frequency
+	when the device tree has one.
+*/
+static uint32
+arm64_cpu_capacity(uint64 mpidr, uint64 midr)
+{
+	int node = -1;
+	if (gFDT != NULL && fdt_check_header(gFDT) == 0)
+		node = arm64_fdt_cpu_node(gFDT, mpidr);
+
+	uint32 perClock = 0;
+	if (node >= 0) {
+		int length;
+		const fdt32_t* dmips = (const fdt32_t*)fdt_getprop(gFDT, node,
+			"capacity-dmips-mhz", &length);
+		if (dmips != NULL && length == 4)
+			perClock = fdt32_to_cpu(*dmips);
+	}
+	if (perClock == 0)
+		perClock = arm64_core_capacity(midr);
+	if (perClock == 0)
+		return 0;
+
+	uint64 frequency = node >= 0 ? arm64_fdt_cpu_frequency(gFDT, node) : 0;
+	uint32 megahertz = frequency != 0 ? frequency / 1000000 : 1000;
+	return perClock * megahertz;
+}
+
+
 status_t
 arch_cpu_init_percpu(kernel_args *args, int curr_cpu)
 {
@@ -173,6 +274,8 @@ arch_cpu_init_percpu(kernel_args *args, int curr_cpu)
 
 	gCPU[curr_cpu].arch.mpidr = READ_SPECIALREG(MPIDR_EL1);
 	gCPU[curr_cpu].arch.midr = READ_SPECIALREG(MIDR_EL1);
+	gCPU[curr_cpu].capacity = arm64_cpu_capacity(gCPU[curr_cpu].arch.mpidr,
+		gCPU[curr_cpu].arch.midr);
 
 	uint64 caps[2];
 	arm64_cpu_hwcaps(caps);

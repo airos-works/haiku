@@ -51,6 +51,10 @@ has_cache_expired(const ThreadData* threadData)
 static CoreEntry*
 find_idle_core(const ThreadData* threadData)
 {
+	// Cores of several speeds: the fastest idle one.
+	if (gHeterogeneousCores)
+		return FastestIdleCore(threadData, 0);
+
 	// wake new package
 	PackageEntry* package = gIdlePackageList.Last();
 	if (package == NULL) {
@@ -112,6 +116,13 @@ rebalance(const ThreadData* threadData)
 
 	CoreEntry* core = threadData->Core();
 	ASSERT(core != NULL);
+
+	// A faster core has nothing to do: there the thread runs now.
+	if (gHeterogeneousCores && core->Capacity() < gMaxCoreCapacity) {
+		CoreEntry* faster = FastestIdleCore(threadData, core->Capacity());
+		if (faster != NULL)
+			return faster;
+	}
 
 	// The thread's core has something to run already and another has not:
 	// there the thread runs now.
