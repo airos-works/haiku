@@ -21,8 +21,8 @@ extern void* gFDT;
 static uint64 sCPUFrequency[SMP_MAX_CPUS];
 
 
-static int
-CPUNodeForMpidr(const void* fdt, uint64 mpidr)
+int
+arm64_fdt_cpu_node(const void* fdt, uint64 mpidr)
 {
 	int cpus = fdt_path_offset(fdt, "/cpus");
 	if (cpus < 0)
@@ -57,8 +57,8 @@ CPUNodeForMpidr(const void* fdt, uint64 mpidr)
 }
 
 
-static uint64
-CPUFrequency(const void* fdt, int node)
+uint64
+arm64_fdt_cpu_frequency(const void* fdt, int node)
 {
 	if (node < 0)
 		return 0;
@@ -182,8 +182,8 @@ arch_system_info_init(struct kernel_args *args)
 
 	if (gFDT != NULL && fdt_check_header(gFDT) == 0) {
 		for (uint32 i = 0; i < args->num_cpus && i < SMP_MAX_CPUS; i++) {
-			sCPUFrequency[i] = CPUFrequency(gFDT,
-				CPUNodeForMpidr(gFDT, gCPU[i].arch.mpidr));
+			sCPUFrequency[i] = arm64_fdt_cpu_frequency(gFDT,
+				arm64_fdt_cpu_node(gFDT, gCPU[i].arch.mpidr));
 		}
 	}
 

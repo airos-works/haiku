@@ -134,6 +134,11 @@ public:
 											{ return fCPUCount; }
 	inline				const CPUSet&	CPUMask() const
 											{ return fCPUSet; }
+	// how fast the core is, against gMaxCoreCapacity
+	inline				uint32			Capacity() const
+											{ return fCapacity; }
+	inline				void			SetCapacity(uint32 capacity)
+											{ fCapacity = capacity; }
 
 	inline				void			LockCPUHeap();
 	inline				void			UnlockCPUHeap();
@@ -184,6 +189,7 @@ private:
 
 						int32			fCoreID;
 						PackageEntry*	fPackage;
+						uint32			fCapacity;
 
 						int32			fCPUCount;
 						CPUSet			fCPUSet;
@@ -261,6 +267,13 @@ extern CoreLoadHeap gCoreLoadHeap;
 extern CoreLoadHeap gCoreHighLoadHeap;
 extern rw_spinlock gCoreHeapsLock;
 extern int32 gCoreCount;
+
+// Cores of more than one speed (big.LITTLE, hybrid x86): the fastest have
+// gMaxCoreCapacity.
+extern bool gHeterogeneousCores;
+extern uint32 gMaxCoreCapacity;
+
+CoreEntry* FastestIdleCore(const ThreadData* thread, uint32 fasterThan);
 
 extern PackageEntry* gPackageEntries;
 extern IdlePackageList gIdlePackageList;

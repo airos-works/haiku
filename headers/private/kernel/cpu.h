@@ -88,6 +88,13 @@ typedef struct CACHE_LINE_ALIGN cpu_ent {
 
 	// arch-specific stuff
 	arch_cpu_info 	arch;
+
+	// How fast this CPU is at its top speed, against the others: any unit,
+	// the same for all of them, larger is faster; 0 when the architecture
+	// cannot tell. Set by arch_cpu_init_percpu() before the scheduler starts,
+	// which prefers the faster ones (big.LITTLE, hybrid x86). Last, so that
+	// modules built without it still find the fields before it.
+	uint32			capacity;
 } cpu_ent;
 
 

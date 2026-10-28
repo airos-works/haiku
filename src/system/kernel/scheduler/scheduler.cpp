@@ -407,6 +407,17 @@ reschedule(int32 nextState)
 			fetchedOldThreadMask = true;
 		}
 		bool oldThreadShouldMigrate = useOldThreadMask && !oldThreadMask.GetBit(thisCPU);
+		// A thread that used up its quantum on a slower core moves to a
+		// faster one that has nothing to do: a thread that never waits
+		// would otherwise stay wherever it started (it is placed only when
+		// it wakes up). Saving power keeps threads packed instead.
+		if (!oldThreadShouldMigrate && putOldThreadAtBack
+			&& gHeterogeneousCores && gCurrentMode == &gSchedulerLowLatencyMode
+			&& oldThread->pinned_to_cpu == 0
+			&& core->Capacity() < gMaxCoreCapacity
+			&& FastestIdleCore(oldThreadData, core->Capacity()) != NULL) {
+			oldThreadShouldMigrate = true;
+		}
 		if (oldThreadShouldMigrate)
 			enqueueOldThread = false;
 
@@ -727,6 +738,30 @@ init()
 		gCPUEntries[i].Init(i, core);
 
 		core->AddCPU(&gCPUEntries[i]);
+		core->SetCapacity(std::max(core->Capacity(), gCPU[i].capacity));
+	}
+
+	// The cores' speeds, the fastest at gMaxCoreCapacity; a core whose
+	// speed the architecture does not know counts as one of the fastest.
+	gMaxCoreCapacity = 0;
+	for (int32 i = 0; i < coreCount; i++)
+		gMaxCoreCapacity = std::max(gMaxCoreCapacity, gCoreEntries[i].Capacity());
+	gHeterogeneousCores = false;
+	for (int32 i = 0; i < coreCount; i++) {
+		CoreEntry* core = &gCoreEntries[i];
+		if (core->Capacity() == 0)
+			core->SetCapacity(gMaxCoreCapacity);
+		if (core->Capacity() != gMaxCoreCapacity)
+			gHeterogeneousCores = true;
+	}
+	if (gHeterogeneousCores) {
+		dprintf("scheduler_init: cores of several speeds:");
+		for (int32 i = 0; i < coreCount; i++) {
+			dprintf(" %" B_PRIu32,
+				(uint32)((uint64)gCoreEntries[i].Capacity() * 100
+					/ gMaxCoreCapacity));
+		}
+		dprintf(" %% of the fastest\n");
 	}
 
 	packageEntriesDeleter.Detach();

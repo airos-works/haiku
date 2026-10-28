@@ -24,10 +24,44 @@ CoreLoadHeap gCoreHighLoadHeap;
 rw_spinlock gCoreHeapsLock = B_RW_SPINLOCK_INITIALIZER;
 int32 gCoreCount;
 
+bool gHeterogeneousCores;
+uint32 gMaxCoreCapacity;
+
 PackageEntry* gPackageEntries;
 IdlePackageList gIdlePackageList;
 rw_spinlock gIdlePackageLock = B_RW_SPINLOCK_INITIALIZER;
 int32 gPackageCount;
+
+
+/*!	The fastest core with nothing to run and nothing on its way that the
+	thread may use and that is faster than \a fasterThan; NULL when there is
+	none. The cores' states change under it: good enough for a choice the
+	next reschedule can correct.
+*/
+CoreEntry*
+FastestIdleCore(const ThreadData* thread, uint32 fasterThan)
+{
+	SCHEDULER_ENTER_FUNCTION();
+
+	CPUSet mask = thread->GetCPUMask();
+	const bool useMask = !mask.IsEmpty();
+
+	CoreEntry* fastest = NULL;
+	for (int32 i = 0; i < gCoreCount; i++) {
+		CoreEntry* core = &gCoreEntries[i];
+		if (core->Capacity() <= fasterThan || core->CPUCount() == 0
+			|| core->ThreadCount() != 0
+			|| (fastest != NULL && core->Capacity() <= fastest->Capacity())) {
+			continue;
+		}
+		if (useMask && !core->CPUMask().Matches(mask))
+			continue;
+		fastest = core;
+		if (core->Capacity() == gMaxCoreCapacity)
+			break;
+	}
+	return fastest;
+}
 
 
 }	// namespace Scheduler
@@ -401,6 +435,7 @@ CPUPriorityHeap::Dump()
 
 CoreEntry::CoreEntry()
 	:
+	fCapacity(0),
 	fCPUCount(0),
 	fIdleCPUCount(0),
 	fThreadCount(0),

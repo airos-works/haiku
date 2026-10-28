@@ -1359,6 +1359,14 @@ detect_cpu(int currentCPU, bool full = true)
 		detect_amd_patch_level(cpu);
 
 	cpu->arch.hybrid_type = get_hybrid_cpu_type();
+	// Efficiency cores do about 60 % of a performance core's work at the
+	// same load (the scheduler prefers the faster ones).
+	if (cpu->arch.hybrid_type == 0x40)
+		cpu->capacity = 1024;
+	else if (cpu->arch.hybrid_type == 0x20)
+		cpu->capacity = 600;
+	else
+		cpu->capacity = 0;
 
 #if DUMP_FEATURE_STRING
 	dump_feature_string(currentCPU, cpu);
