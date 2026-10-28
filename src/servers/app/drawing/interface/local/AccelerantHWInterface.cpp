@@ -704,6 +704,7 @@ AccelerantHWInterface::_SetFallbackMode(display_mode& newMode) const
 status_t
 AccelerantHWInterface::SetMode(const display_mode& mode)
 {
+	ForgetStale();
 	status_t status = _SetMode(mode, false);
 	// A mode set may leave the display engine without the cursor.
 	_UpdateHardwareCursor(true);
