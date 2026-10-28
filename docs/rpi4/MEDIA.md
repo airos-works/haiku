@@ -5,9 +5,9 @@ the 90-frame H.264 reference in both input modes. SAND conversion now works
 in cache-sized row groups. The final airTime samples show 1080p HEVC at
 30 FPS without drops, 4K8 at 30 FPS over 20.4 seconds, and H.264 at 29.6 FPS
 with nine drops over 20.3 seconds. Raw 4K10 plane making stays below real
-time at full size (38 ms), so the add-on now also makes half size pictures
+time at full size (36 ms), so the add-on now also makes half size pictures
 (a 2x2 box) when the player asks for exactly that: a 4K film on a 1080p
-screen plays in real time in airTime this way, 31 ms a picture.
+screen plays in real time in airTime this way, 26 ms a picture.
 See [PERFORMANCE.md](PERFORMANCE.md) for exact fixtures, intervals and
 endurance results. Physical audio remains unverified, and repeated HEVC
 allocations can fail under memory fragmentation despite free RAM.
@@ -171,7 +171,7 @@ ten bits). The streams are x265's, made from `multi.mkv`
 | intra only; P only; B pictures; wavefront; 1080p with and without wavefront; 1080p ten bit; four slices; weighted prediction; scaling lists; coding tree blocks of 16 and 32; six references with a B pyramid; open GOP (leading pictures); 4K eight and ten bit; odd sizes (1000x562, eight and ten bit; 176x144); wavefront with slices, ten bit; no SAO, no deblocking; constrained intra prediction with transform skip; lossless; CU lossless with rectangular and asymmetric partitions; no temporal motion vectors (25 streams) | every picture byte for byte, all 25 |
 | speed, pictures not written: 1080p | 115 per second with the planes made (3.4 ms a picture for that), 70 for ten bit (8.5 ms) |
 | speed: 4K | 28 per second, 16 for ten bit: making the planes is most of it (16 and 38 ms) |
-| speed: 4K ten bit at half size, asked for exactly that | 31 ms a picture, right next to full size's 25 ms; a quarter of the pixels for the player's scaler and tone mapper |
+| speed: 4K ten bit at half size, asked for exactly that | 26 ms a picture, under the full size's 36 ms; a quarter of the pixels for the player's scaler and tone mapper |
 | two decoders at once (1080p eight and ten bit) | both exact |
 | six decoders killed in mid-picture, then one more | exact; no buffer left behind |
 | a stream cut off, a stream with 30 KB zeroed | ends without the missing or damaged pictures; "phase 1 failed", "refers to ..., which is missing" with `RPI_HEVC_TRACE=1` |
