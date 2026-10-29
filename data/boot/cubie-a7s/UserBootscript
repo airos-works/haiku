@@ -1,6 +1,14 @@
 #!/bin/sh
 # air/OS on the Radxa Cubie A7S.
 
+# First-boot setup (the Pi's): use the whole SD card, then the time zone.
+# It remembers completed and declined setup in user settings, and offers a
+# system on another partition layout (an eMMC installation) only the time
+# zone.
+if [ -x /boot/system/apps/RPiInstaller ]; then
+	/boot/system/apps/RPiInstaller --first-boot > /dev/dprintf 2>&1 &
+fi
+
 # The board has no battery-backed clock: NTP retries and a saved UTC lower
 # bound, with the Pi's script (installed next to this one).
 sh "$(finddir B_USER_SETTINGS_DIRECTORY)/boot/rpi-time-sync" \

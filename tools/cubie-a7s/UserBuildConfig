@@ -238,6 +238,14 @@ rule UserBuildConfigRulePreImage
 			imagePackageDir = /mnt/HaikuWork/cubie/image-packages ;
 		}
 		local imagePackages = [ Glob $(imagePackageDir) : *.hpkg ] ;
+		# The first-boot setup (whole SD card, time zone), which the boot
+		# script starts. Lab images, on the lab card's own layout, need not
+		# have it.
+		if $(CUBIE_LAB_IMAGE) != 1
+				&& ! [ Glob $(imagePackageDir) : rpi_installer-*.hpkg ] {
+			Exit "cubie-airos requires rpi_installer; build apps/rpi-installer"
+				"first" ;
+		}
 		imagePackages = <cubie-app-pkg>$(imagePackages:BS) ;
 		SEARCH on $(imagePackages) = $(imagePackageDir) ;
 		AddFilesToHaikuImage system packages : $(imagePackages) ;

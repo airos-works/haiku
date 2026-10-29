@@ -6,7 +6,16 @@ desktop start, `data/boot/rpi/UserBootscript` launches it with `--first-boot`.
 It offers to use the entire SD card for air/OS. Keeping the current size is
 a persistent choice. Either storage choice proceeds to **Step 2: Time zone**;
 closing an unfinished step or choosing Later leaves it available next boot.
-Applications → Raspberry Pi Setup can revisit the choice.
+Applications → First-Boot Setup (named Raspberry Pi Setup before version
+1.2) can revisit the choice.
+
+Since version 1.2 the Radxa Cubie A7S images (`airos-cubie` in CI and the
+non-lab `cubie-airos` profile) carry the same package, and
+`data/boot/cubie-a7s/UserBootscript` starts it the same way. See
+[the Cubie section](#radxa-cubie-a7s-gpt-layout) below. A system on a layout
+the app does not know (for example an installation on the Cubie's eMMC)
+shows the reason and offers **Skip this step**, which records the storage
+step as declined and continues to the time zone.
 
 The app identifies the partition mounted at `/boot`, validates the specific
 MBR FAT32 + BFS image layout and its growable BFS superblock, and displays
@@ -47,6 +56,52 @@ this reserved layout so it cannot reclaim the metadata reservation.
 The MMC driver implements the flush completion barrier for SD cards by
 waiting for CMD13 to report READY_FOR_DATA in transfer state. MMC cards with
 an enabled cache also perform their existing explicit cache flush.
+
+## Radxa Cubie A7S (GPT layout)
+
+The Cubie's SD image (`tools/cubie-a7s/build-sd-image.sh`) is GPT: the BSP
+boot chain in the first 16 MiB (boot0 at sector 256, the boot package at
+12 MiB), an EFI system partition at sector 32768, then the BFS volume, with
+sgdisk's 128-entry partition arrays at both ends of the image. Its BFS uses
+the same growable format (`HAIKU_BFS_GROWABLE` in both the CI and the
+`cubie-airos` profiles), so only the partition table work differs.
+
+The app accepts exactly that layout: a protective MBR, a valid primary
+header and array (both CRCs), the ESP type at sector 32768, the BFS type as
+the second entry at the mounted `/boot` offset, no other entries, and the
+backup header directly after the backup array. On consent it saves LBA 0-33,
+writes the new backup array and header to the card's last 33 sectors, then
+replaces LBA 0-33 in one write: the protective MBR's size, the BFS entry's
+end (the card's last usable sector, rounded down to 4 KiB), and the
+primary header's alternate LBA, last usable LBA and CRCs. Each write is
+flushed and read back. The boot chain and ESP are not touched. Until the
+primary table is replaced it still names the image's original backup, which
+stays intact, so an interruption leaves a consistent table. Haiku's GPT
+module reads the primary header and follows its alternate LBA, as it does
+for an image flashed to a larger card.
+
+`make check-gpt` in the app builds that layout with sgdisk around a real
+growable BFS volume and expands sparse copies as 32 GiB, 128 GB, odd-sized
+128 GiB and 2 TiB cards. `sgdisk -v` finds no problems; the extracted
+partition mounts grown to the new size with the original file intact and a
+clean `checkfs -c`; planning again changes nothing; extra partitions, wrong
+types, damaged CRCs and an ordinary BFS volume are refused.
+
+Native validation (2026-10-29) used a copy of the CI image
+`20261029-0202-hrev60207-2106-gf8eac33d0a` with the 1.2 package and this
+boot script added, as a 64 GiB NVMe disk on QEMU's `virt` machine (AAVMF
+boots the image's own `EFI/BOOT/BOOTAA64.EFI`). The first desktop showed
+step 1 with 3.50 → 63.92 GiB; expansion left `sgdisk -v` clean with the BFS
+entry ending at sector 134217687; Australia/Hobart applied at once; after
+Restart now, BFS logged "Reserved-space growth to 68635570176 bytes" and
+setup did not return. Opened from Applications → First-Boot Setup it
+reported the card fully used. Offline afterwards: `checkfs -c` clean,
+`decision` = `expanded 68635570176`, the saved 17408-byte table equal to
+the image's LBA 0-33, and sectors 34-163839 (boot chain and ESP)
+unchanged. A card with an extra GPT entry showed the reason and **Skip this
+step**, which led to the time zone. Evidence:
+`/mnt/HaikuWork/artifacts/rpi-installer/cubie-qemu/`. A physical Cubie card
+has not been expanded yet.
 
 ## Building a distributable image
 

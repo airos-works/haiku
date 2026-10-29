@@ -9,7 +9,8 @@
 #   APP         any of: airshot clipper burrow kiri lcdmonitor amp turbochook natter
 #               airtop summit_webkit summit airpins rpi_installer
 #               (default: all of them but airpins and rpi_installer; these
-#               Raspberry Pi utilities are built only when named)
+#               board utilities (Raspberry Pi, Cubie A7S) are built only
+#               when named)
 #
 # Environment overrides (all optional):
 #   JOBS=8                       parallel compile jobs
@@ -471,7 +472,7 @@ build_airtop() {
 	finish_package airtop apps/AirTop
 }
 
-# --- Raspberry Pi first-boot setup (Pi images only) --------------------------
+# --- First-boot setup (Raspberry Pi and Cubie A7S SD card images) ------------
 build_rpi_installer() {
 	note RPiInstaller
 	snapshot rpi-installer rpi_installer
@@ -481,7 +482,7 @@ build_rpi_installer() {
 	stage_begin
 	install_binary "$BUILDDIR/RPiInstaller" "$BUILDDIR/RPiInstaller.rsrc" apps/RPiInstaller
 	docs rpi_installer README.md LICENSE
-	deskbar_link apps/RPiInstaller "Raspberry Pi Setup"
+	deskbar_link apps/RPiInstaller "First-Boot Setup"
 	retarget_package_info "$SRC/resources/RPiInstaller.PackageInfo" "$STAGE/.PackageInfo"
 	add_attributes "$BUILDDIR/RPiInstaller.rsrc" apps/RPiInstaller
 	finish_package rpi_installer apps/RPiInstaller

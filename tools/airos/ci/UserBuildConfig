@@ -462,6 +462,11 @@ rule UserBuildConfigRulePreImage
 	}
 
 	if $(AIROS_CUBIE) {
+		# The first-boot setup (SD card size, time zone), which the boot
+		# script starts.
+		if ! [ Glob $(AIROS_CI_PACKAGES) : rpi_installer-*.hpkg ] {
+			Exit "The Cubie image requires the rpi_installer package." ;
+		}
 		local rpi = [ FDirName $(HAIKU_TOP) data boot rpi ] ;
 		# Package entries the Cubie must not see either (the ROCK 5's MPP
 		# decoder), and an installed system's locale: straight to the desktop.
