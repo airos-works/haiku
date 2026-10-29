@@ -80,6 +80,22 @@ struct {
 	{ NULL, NULL, NULL, NULL }
 };
 
+// Product names of memory card readers that don't say which cards they take,
+// like Realtek's "SD/MMC" or Apple's "SD Card Reader"
+static const char *kCardReaderNames[] = {
+	"SD/MMC",
+	"MMC/SD",
+	"SD Card",
+	"SDHC",
+	"SDXC",
+	"MicroSD",
+	"Card Reader",
+	"CardReader",
+	"Card-Reader",
+	"Multi-Card",
+	NULL
+};
+
 
 //
 //#pragma mark - Forward Declarations
@@ -680,9 +696,20 @@ usb_disk_request_sense(device_lun *lun, err_act *_action)
 		scsi_get_sense_key_info(parameter.sense_key, &label, &action, &status);
 	}
 
+	if (parameter.additional_sense_code == SCSI_ASC_MEDIUM_NOT_PRESENT
+		&& !lun->card_slot && !lun->ejected) {
+		// USB sticks always have their medium unless we ejected it, so a unit
+		// that can be empty is a memory card slot, even when it calls itself
+		// a "USB DISK".
+		lun->card_slot = true;
+		TRACE_ALWAYS("lun %" B_PRIu8 " reports no medium, it is a card slot\n",
+			lun->logical_unit_number);
+	}
+
 	if (status == B_DEV_MEDIA_CHANGED) {
 		lun->media_changed = true;
 		lun->media_present = true;
+		lun->ejected = false;
 	} else if (parameter.sense_key == SCSI_SENSE_KEY_UNIT_ATTENTION
 		&& status != B_DEV_NO_MEDIA) {
 		lun->media_present = true;
@@ -1204,6 +1231,8 @@ usb_disk_attach(device_node *node, usb_device newDevice, void **cookie)
 		lun->should_sync = false;
 		lun->media_present = true;
 		lun->media_changed = true;
+		lun->card_slot = false;
+		lun->ejected = false;
 		lun->io_scheduler = NULL;
 
 		memset(lun->vendor_name, 0, sizeof(lun->vendor_name));
@@ -1580,6 +1609,50 @@ handle_media_change(device_lun *lun, MutexLocker& locker)
 }
 
 
+static void
+usb_disk_get_icon(device_lun *lun, device_icon **_icon, const char **_name)
+{
+	device_icon *icon = &kKeyIconData;
+	const char *name = "devices/drive-removable-media-usb";
+
+	if (lun->device->is_ufi) {
+		// UFI is specific for floppy drives
+		icon = &kFloppyIconData;
+		name = "devices/drive-floppy-usb";
+	} else if (lun->device_type == B_CD || lun->device_type == B_OPTICAL) {
+		icon = &kCDIconData;
+		name = "devices/drive-optical";
+	} else {
+		char vendor[sizeof(lun->vendor_name) + 1];
+		char product[sizeof(lun->product_name) + 1];
+		snprintf(vendor, sizeof(vendor), "%.8s", lun->vendor_name);
+		snprintf(product, sizeof(product), "%.16s", lun->product_name);
+
+		bool cardSlot = lun->card_slot;
+		for (int i = 0; kCardReaderNames[i] != NULL && !cardSlot; i++)
+			cardSlot = strcasestr(product, kCardReaderNames[i]) != NULL;
+		if (cardSlot) {
+			icon = &kSDIconData;
+			name = "devices/drive-removable-media-flash";
+		}
+
+		for (int i = 0; kIconMatches[i].icon; i++) {
+			if (kIconMatches[i].vendor != NULL
+				&& strstr(vendor, kIconMatches[i].vendor) == NULL)
+				continue;
+			if (kIconMatches[i].product != NULL
+				&& strstr(product, kIconMatches[i].product) == NULL)
+				continue;
+			icon = kIconMatches[i].icon;
+			name = kIconMatches[i].name;
+		}
+	}
+
+	*_icon = icon;
+	*_name = name;
+}
+
+
 static status_t
 usb_disk_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
 {
@@ -1680,8 +1753,11 @@ usb_disk_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
 			commandBlock[1] = lun->logical_unit_number << 5;
 			commandBlock[4] = 2;
 
-			return usb_disk_operation(lun, commandBlock, 6, NULL, NULL,
+			result = usb_disk_operation(lun, commandBlock, 6, NULL, NULL,
 				false);
+			if (result == B_OK)
+				lun->ejected = true;
+			return result;
 		}
 
 		case B_LOAD_MEDIA:
@@ -1697,8 +1773,11 @@ usb_disk_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
 			commandBlock[1] = lun->logical_unit_number << 5;
 			commandBlock[4] = 3;
 
-			return usb_disk_operation(lun, commandBlock, 6, NULL, NULL,
+			result = usb_disk_operation(lun, commandBlock, 6, NULL, NULL,
 				false);
+			if (result == B_OK)
+				lun->ejected = false;
+			return result;
 		}
 
 		case B_GET_ICON:
@@ -1708,78 +1787,21 @@ usb_disk_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
 
 		case B_GET_ICON_NAME:
 		{
-			const char *iconName = "devices/drive-removable-media-usb";
-			char vendor[sizeof(lun->vendor_name)+1];
-			char product[sizeof(lun->product_name)+1];
-
-			if (device->is_ufi) {
-				iconName = "devices/drive-floppy-usb";
-			}
-
-			switch (lun->device_type) {
-				case B_CD:
-				case B_OPTICAL:
-					iconName = "devices/drive-optical";
-					break;
-				case B_TAPE:	// TODO
-				default:
-					snprintf(vendor, sizeof(vendor), "%.8s",
-						lun->vendor_name);
-					snprintf(product, sizeof(product), "%.16s",
-						lun->product_name);
-					for (int i = 0; kIconMatches[i].icon; i++) {
-						if (kIconMatches[i].vendor != NULL
-							&& strstr(vendor, kIconMatches[i].vendor) == NULL)
-							continue;
-						if (kIconMatches[i].product != NULL
-							&& strstr(product, kIconMatches[i].product) == NULL)
-							continue;
-						iconName = kIconMatches[i].name;
-					}
-					break;
-			}
+			device_icon *icon;
+			const char *iconName;
+			usb_disk_get_icon(lun, &icon, &iconName);
 			return user_strlcpy((char *)buffer, iconName,
 				B_FILE_NAME_LENGTH);
 		}
 
 		case B_GET_VECTOR_ICON:
 		{
-			device_icon *icon = &kKeyIconData;
-			char vendor[sizeof(lun->vendor_name)+1];
-			char product[sizeof(lun->product_name)+1];
-
 			if (length != sizeof(device_icon))
 				return B_BAD_VALUE;
 
-			if (device->is_ufi) {
-				// UFI is specific for floppy drives
-				icon = &kFloppyIconData;
-			} else {
-				switch (lun->device_type) {
-					case B_CD:
-					case B_OPTICAL:
-						icon = &kCDIconData;
-						break;
-					case B_TAPE:	// TODO
-					default:
-						snprintf(vendor, sizeof(vendor), "%.8s",
-								lun->vendor_name);
-						snprintf(product, sizeof(product), "%.16s",
-								lun->product_name);
-						for (int i = 0; kIconMatches[i].icon; i++) {
-							if (kIconMatches[i].vendor != NULL
-									&& strstr(vendor,
-										kIconMatches[i].vendor) == NULL)
-								continue;
-							if (kIconMatches[i].product != NULL
-									&& strstr(product,
-										kIconMatches[i].product) == NULL)
-								continue;
-							icon = kIconMatches[i].icon;
-						}
-						break;
-				}
-			}
+			device_icon *icon;
+			const char *iconName;
+			usb_disk_get_icon(lun, &icon, &iconName);
 
 			device_icon iconData;
 			if (user_memcpy(&iconData, buffer, sizeof(device_icon)) != B_OK)
