@@ -164,6 +164,7 @@ TDeskbarMenu::_OrderStandardFolders(int32 firstIndex)
 		"Applications",
 		"Office",
 		"Media",
+		"Developer",
 		"Utilities",
 		"Demos",
 		"Desktop applets",

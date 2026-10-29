@@ -1,10 +1,11 @@
 # Deskbar menu
 
-The Deskbar menu of an air/OS install has seven folders, in this order:
-Applications, Office, Media, Utilities, Demos, Desktop applets and
-Preferences. Media came on 2026-10-19, after the 2026-10-18 Office
-integration (following `airos-deskbar-menu` and `deskbar-utilities-root` on
-2026-10-17). Turbo Chook left the images on 2026-10-19.
+The Deskbar menu of an air/OS install has eight folders, in this order:
+Applications, Office, Media, Developer, Utilities, Demos, Desktop applets and
+Preferences. Developer came on 2026-10-29, Media on 2026-10-19, after the
+2026-10-18 Office integration (following `airos-deskbar-menu` and
+`deskbar-utilities-root` on 2026-10-17). Turbo Chook left the images on
+2026-10-19.
 
 ![The Deskbar menu and its Media folder](deskbar-menu.png)
 
@@ -13,6 +14,7 @@ integration (following `airos-deskbar-menu` and `deskbar-utilities-root` on
 | Applications | airShot, airTime, Amp, Burrow, DeskCalc, HaikuDepot, Icon-O-Matic, Installer, Kiri, Mail, MediaConverter, MidiPlayer, Pe, People, SoftwareUpdater, SoundRecorder, StyledEdit, Summit, Terminal |
 | Office | Clipper, WordCraft, GridCraft, DeckCraft, PdfCraft |
 | Media | PhotoCraft, LightCraft |
+| Developer | Code - OSS, Docker Desktop, GitHub Desktop, pgAdmin 4 |
 | Utilities | CharacterMap, CodyCam, Debugger, Devices, DiskProbe, DiskUsage, DriveSetup, Expander, Magnify, PoorMan, SerialConnect, Vision |
 | Demos | Chart, Clock, Cortex, FontDemo, GLTeapot, Mandelbrot, OverlayImage, Pairs, PatchBay, Playground, Pulse, Sudoku |
 | Desktop applets | AutoRaise, BluetoothStatus, LaunchBox, NetworkStatus, PowerStatus, ProcessController, WiFiStatus, Workspaces |
@@ -40,7 +42,9 @@ The menu is the merge of the `data/deskbar/menu` directories listed in
   Summit): each package's own
   `data/deskbar/menu/Applications/<name>` link. Clipper and the four Craft
   applications supply `data/deskbar/menu/Office/<name>` links, PhotoCraft and
-  LightCraft `data/deskbar/menu/Media/<name>` links. The new Terminal and
+  LightCraft `data/deskbar/menu/Media/<name>` links, and Code - OSS, Docker
+  Desktop, GitHub Desktop and pgAdmin 4 `data/deskbar/menu/Developer/<name>`
+  links. The new Terminal and
   MediaConverter replace the in-tree apps under the same names, so their
   entries stay as they are.
 - Pe: HaikuPorts' package (the nightly profile adds it), as it is.
@@ -51,13 +55,14 @@ The menu is the merge of the `data/deskbar/menu` directories listed in
   Vision out when CI staged one (`SuppressHaikuImagePackages`, a rule this
   branch added to `build/jam/ImageRules`).
 
-Office and Media have their localized names in
-`src/data/directory_attrs/deskbar-office.rdef` and `deskbar-media.rdef` and
+Office, Media and Developer have their localized names in
+`src/data/directory_attrs/deskbar-office.rdef`, `deskbar-media.rdef` and
+`deskbar-developer.rdef` and
 share the same catalog and ordering mechanism. Utilities' localized name is `src/data/directory_attrs/deskbar-utilities.rdef`
 with its catalog entry in `src/apps/deskbar/LocalizedFolders.h`. The menu
 itself would sort its folders by name, which puts Utilities last;
 `TDeskbarMenu::_OrderStandardFolders()` (`src/apps/deskbar/DeskbarMenu.cpp`)
-puts the seven standard folders first in their own order, by entry name, and
+puts the eight standard folders first in their own order, by entry name, and
 anything else (a folder a user adds to `~/config/settings/deskbar/menu`)
 follows them, sorted as before.
 
