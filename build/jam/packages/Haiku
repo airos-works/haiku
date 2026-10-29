@@ -565,9 +565,11 @@ if SystemUpdater in $(SYSTEM_APPS) {
 		: ../../../../apps/SystemUpdater : "System Updater" ;
 }
 
-# Office and Media applications supply their links in their own packages.
+# Office, Media and Developer applications supply their links in their own
+# packages.
 AddDirectoryToPackage data deskbar menu Office : deskbar-office.rdef ;
 AddDirectoryToPackage data deskbar menu Media : deskbar-media.rdef ;
+AddDirectoryToPackage data deskbar menu Developer : deskbar-developer.rdef ;
 
 # "Utilities" links
 if $(DESKBAR_UTILITIES) {
