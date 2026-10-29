@@ -487,6 +487,11 @@ rule UserBuildConfigRulePreImage
 			= [ FDirName $(HAIKU_TOP) tools cubie-a7s settings ] ;
 		AddFilesToHaikuImage home config settings kernel drivers
 			: $(gpuSettings) ;
+		# The AIC8800D80 Wi-Fi/Bluetooth module: its driver loads the
+		# firmware the image has (AIROS_CI_FIRMWARE), and Bluetooth comes
+		# up with it. tools/cubie-a7s/UserBuildConfig added it for the lab
+		# images; CI's images had the firmware but no driver.
+		AddDriversToHaikuImage net : aic8800wifi ;
 	}
 
 	# A release image: its identity, and its files outside packages in a
