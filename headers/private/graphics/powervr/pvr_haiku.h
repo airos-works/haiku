@@ -153,7 +153,8 @@ struct pvr_haiku_stage {
 	uint32	job_timeout_ms;			// in (JOB_TIMEOUT), out: a job queue
 									// with no job finishing that long has
 									// the GPU reset; 0 in: the default
-	uint32	reserved32;
+	uint32	core_count;				// GPU cores (ROGUE_CR_MULTICORE_SYSTEM),
+									// 0 from drivers before it was reported
 	uint64	reserved[2];
 };
 

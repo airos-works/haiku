@@ -23,6 +23,8 @@
 
 // Rogue control registers (pvr_rogue_cr_defs.h)
 #define ROGUE_CR_CORE_ID			0x0018
+#define ROGUE_CR_MULTICORE_SYSTEM	0xF308
+	// GPU_COUNT in bits 3:0
 
 // A level-triggered line that stays up without a MIPS wrapper event would
 // take the CPU forever: after this many in a row the line is switched off.
@@ -45,6 +47,7 @@ PvrDevice::PvrDevice(uint64 registerBase, uint64 registerSize,
 	fStage(PVR_HAIKU_STAGE_OFF),
 	fBvnc(0),
 	fCoreId(0),
+	fCoreCount(1),
 	fCoreClock(0),
 	fCoreMegahertz(800),
 	fDevice(NULL),
@@ -161,10 +164,16 @@ PvrDevice::Init()
 
 	fBvnc = pvr_haiku_identify(fDevice);
 	fCoreId = *(volatile uint32*)(fRegisters + ROGUE_CR_CORE_ID);
+	// cores of a multicore GPU; 0 where there is no such register
+	fCoreCount = *(volatile uint32*)(fRegisters + ROGUE_CR_MULTICORE_SYSTEM)
+		& 0xf;
+	if (fCoreCount == 0)
+		fCoreCount = 1;
 	TRACE("BVNC %u.%u.%u.%u (%#" B_PRIx64 "), core ID %#" B_PRIx32
-		", %" B_PRIu32 " MHz\n", (unsigned)(fBvnc >> 48),
+		", %" B_PRIu32 " core(s), %" B_PRIu32 " MHz\n", (unsigned)(fBvnc >> 48),
 		(unsigned)((fBvnc >> 32) & 0xffff), (unsigned)((fBvnc >> 16) & 0xffff),
-		(unsigned)(fBvnc & 0xffff), fBvnc, fCoreId, fCoreClock / 1000000);
+		(unsigned)(fBvnc & 0xffff), fBvnc, fCoreId, fCoreCount,
+		fCoreClock / 1000000);
 	if (fBvnc == 0)
 		return B_OK;
 	fStage = PVR_HAIKU_STAGE_IDENTIFIED;
@@ -362,6 +371,7 @@ PvrDevice::Stage(pvr_haiku_stage& stage)
 	stage.command = command;
 	stage.stage = fStage;
 	stage.core_id = fCoreId;
+	stage.core_count = fCoreCount;
 	stage.bvnc = fBvnc;
 	stage.core_clock = fCoreClock;
 	stage.firmware_status = B_NO_INIT;

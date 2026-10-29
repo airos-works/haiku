@@ -19,7 +19,7 @@ that directory on the include path and does not copy it. The design is
 | `host` | Builds `mesa_clc`, `vtn_bindgen2` and `pco_clc` natively at the same Mesa version. Serialized NIR and USC code must match the driver's version. The build uses the host's LLVM 18, with clang-cpp, LLVMSPIRVLib and SPIRV-Tools from `toolchains/mesa-native-deps` (read only). It does not touch `toolchains/mesa-host`, which holds the 25.3.6 tools. |
 | `configure`, `driver` | Cross-builds only `-Dvulkan-drivers=imagination`: no GL, EGL, LLVM, shader cache or WSI. It uses the ROCK 5's pinned sysroot and cross file (`artifacts/mali-system-opengl-build/20260918T125722Z`), as the Pi 4 build does. Debug paths are relative to the root, so every root builds the same bytes. Meson reads machine files only at setup, so when they change the build directory is wiped. |
 | `tests` | Builds the test programs against the driver. Linking also checks that every symbol the driver needs exists in the sysroot. |
-| `gl` | Builds the EGL vendor library with zink and softpipe in `build-gl/`, the `libvulkan.so.1` shim and the GL test programs (`pvr_glprobe`, `pvr_glbench`, `pvr_glreset`, `pvr_glpresent`, `pvr_glcomposite`, `pvr_gldamage`, `pvr_glxfb`, `pvr_glconform`). |
+| `gl` | Builds the EGL vendor library with zink and softpipe in `build-gl/`, the `libvulkan.so.1` shim and the GL test programs (`pvr_glprobe`, `pvr_glbench`, `pvr_glreset`, `pvr_glpresent`, `pvr_glcomposite`, `pvr_gldamage`, `pvr_glupload`, `pvr_glxfb`, `pvr_glconform`). |
 | `all` | Runs everything above and fills `out/`. |
 
 Everything lives under `/mnt/HaikuWork/cubie/mesa` (`CUBIE_MESA_ROOT`):
@@ -30,7 +30,7 @@ Everything lives under `/mnt/HaikuWork/cubie/mesa` (`CUBIE_MESA_ROOT`):
 - `libvulkan_powervr_mesa.so` and `powervr_mesa_icd.aarch64.json` (for a loader later);
 - `pvr_vkprobe`, `pvr_vkfill`, `pvr_vkfence`, `pvr_vktriangle`, `pvr_vkhang`, `pvr_vkbench`, `pvr_present`, `pvr_copybench`;
 - `tls_generation_check` and `libtls_generation_check.so` (keep them in the same directory);
-- `libEGL_mesa.so.0`, `10_mesa.json` (its libglvnd vendor file), `libvulkan.so.1`, `pvr_glprobe`, `pvr_glbench`, `pvr_glreset`, `pvr_glpresent`, `pvr_glcomposite` and `pvr_gldamage`;
+- `libEGL_mesa.so.0`, `10_mesa.json` (its libglvnd vendor file), `libvulkan.so.1`, `pvr_glprobe`, `pvr_glbench`, `pvr_glreset`, `pvr_glpresent`, `pvr_glcomposite`, `pvr_gldamage` and `pvr_glupload`;
 - `MANIFEST`, with the input hashes.
 
 On the image, the libraries go to `/boot/system/non-packaged/lib`, `10_mesa.json` to `.../non-packaged/add-ons/opengl/egl_vendor.d`, and the programs to `.../non-packaged/bin`.

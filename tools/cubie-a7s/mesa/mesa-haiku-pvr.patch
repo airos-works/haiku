@@ -6866,7 +6866,43 @@ diff -ruN a/src/imagination/vulkan/pvr_xfb.h b/src/imagination/vulkan/pvr_xfb.h
 diff -ruN a/src/imagination/vulkan/winsys/powervr/pvr_drm.c b/src/imagination/vulkan/winsys/powervr/pvr_drm.c
 --- a/src/imagination/vulkan/winsys/powervr/pvr_drm.c
 +++ b/src/imagination/vulkan/winsys/powervr/pvr_drm.c
-@@ -398,6 +398,7 @@
+@@ -26,6 +26,9 @@
+ #include <stdint.h>
+ #include <vulkan/vulkan.h>
+ #include <xf86drm.h>
++#ifdef __HAIKU__
++#include <unistd.h>
++#endif
+ 
+ #include "drm-uapi/pvr_drm.h"
+ #include "pvr_device_info.h"
+@@ -339,10 +342,24 @@
+       goto err_out;
+    }
+ 
++   runtime_info->core_count = 1;
++#ifdef __HAIKU__
++   /* Haiku's powervr driver reads it from the GPU (pvr_haiku.h); 0 from
++    * drivers before it did.
++    */
++   struct pvr_haiku_stage stage = {
++      .version = PVR_HAIKU_ABI_VERSION,
++      .command = PVR_HAIKU_STAGE_QUERY,
++   };
++   if (ioctl(drm_ws->base.render_fd, PVR_HAIKU_OP(PVR_HAIKU_NR_STAGE), &stage,
++             sizeof(stage)) == 0 &&
++       stage.core_count > 0) {
++      runtime_info->core_count = stage.core_count;
++   } else
++#endif
+    /* TODO: When kernel support is added, fetch the actual core count. */
+    if (PVR_HAS_FEATURE(dev_info, gpu_multicore_support))
+       pvr_finishme("Core count fetching is unimplemented. Setting 1 for now.");
+-   runtime_info->core_count = 1;
+ 
+    result = pvr_drm_get_gpu_info(drm_ws, &gpu_info);
+    if (result != VK_SUCCESS)
+@@ -398,6 +415,7 @@
     .buffer_destroy = pvr_drm_winsys_buffer_destroy,
     .buffer_get_fd = pvr_drm_winsys_buffer_get_fd,
     .buffer_map = pvr_drm_winsys_buffer_map,

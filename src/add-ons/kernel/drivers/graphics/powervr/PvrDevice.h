@@ -54,6 +54,7 @@ private:
 			uint32				fStage;
 			uint64				fBvnc;
 			uint32				fCoreId;
+			uint32				fCoreCount;
 			uint32				fCoreClock;
 			uint32				fCoreMegahertz;
 			struct pvr_device*	fDevice;
