@@ -18,9 +18,9 @@ only M4A, MP3, FLAC, Ogg, Opus and WAV.
 
 | Video | On the GPU | On the CPU |
 | --- | --- | --- |
-| H.264 | AMD VCE/VCN (VA-API), NVIDIA NVENC (Maxwell and later) | x264 |
+| H.264 | AMD VCE/VCN (VA-API), NVIDIA NVENC (Maxwell and later), Allwinner A733 (Cubie A7S) | x264 |
 | H.264 10-bit | – | x264 |
-| H.265 | AMD Polaris and later (VA-API), NVIDIA NVENC (second Maxwell and later; the add-on does not manage P pictures yet, so the self-test sends it to the CPU) | x265 |
+| H.265 | AMD Polaris and later (VA-API), NVIDIA NVENC (second Maxwell and later; the add-on does not manage P pictures yet, so the self-test sends it to the CPU), Allwinner A733 (Cubie A7S) | x265 |
 | H.265 10-bit | AMD VCN 2 and later, NVIDIA Pascal and later (as H.265) | x265 |
 | H.265 12-bit | – | x265 |
 | AV1, AV1 10-bit | AMD VCN 4 (RDNA 3, Phoenix and later), NVIDIA Ada Lovelace and later | SVT-AV1 |
@@ -164,6 +164,9 @@ src/apps/mediaconverter/engine/    the engine (libmediaconverter_engine.a)
   VideoEncoder       the encoder interface: frames in, packets out
   VaapiEncoder       H.264 and H.265 on VA-API (AMD), BitWriter for headers
   NvencEncoder       NVIDIA through the nvenc add-on (nvenc_api.h)
+  CedarVideoEncoder  the Allwinner A733's video engine (Cubie A7S) through
+                     sunxi_venc's CedarEncoder and the sunxi_ve driver, with
+                     a self-test per codec (docs/airos/SUNXI_VENC.md)
   SoftwareEncoders   x264, x265, SVT-AV1, opened with dlopen()
   LavcVideoEncoder   FFmpeg's own and libvpx/libtheora
   HardwareCaps       the GPUs: device manager PCI walk, VA-API queries,

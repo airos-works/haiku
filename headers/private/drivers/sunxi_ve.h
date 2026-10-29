@@ -41,7 +41,8 @@ enum {
 	SUNXI_VE_FREE,
 	SUNXI_VE_SYNC,
 	SUNXI_VE_RUN,
-	SUNXI_VE_END_PICTURE	// no argument: see SUNXI_VE_RUN_PICTURE
+	SUNXI_VE_END_PICTURE,	// no argument: see SUNXI_VE_RUN_PICTURE
+	SUNXI_VE_ENCODE			// struct sunxi_ve_encode
 };
 
 struct sunxi_ve_info {
@@ -106,6 +107,100 @@ struct sunxi_ve_run {
 	uint32	flags;
 	uint32	status;			// out
 	uint32	engine_time;	// out: microseconds from trigger to interrupt
+};
+
+
+/*	The video encoder: an engine of its own (0x01c10000, PCK-600 domain 3,
+	its own clocks, reset and interrupt), reached through the same device
+	and the same buffers. It encodes H.264 (High, CABAC) and H.265 (Main)
+	pictures from NV12, one slice a picture; the program writes the
+	parameter sets and the slice headers, the engine the slice data.
+
+	SUNXI_VE_ENCODE is one picture: the driver turns the encoder's input
+	stage and encoder on, runs the writes (registers of the input stage at
+	0xa00, of the encoder at 0xb00 and of its extension at 0xc00; only
+	writes), puts header[] through the encoder's bit writer (the start code
+	and emulation prevention bytes must be in it: the bit writer adds
+	none), starts the encoder and waits for it. It returns the encoder's
+	status (bit 0: done; bit 1: the bit stream buffer was full, bit 2: the
+	picture took too long; the driver then resets the encoder) and the
+	number of bits the picture's slice takes in the bit stream buffer from
+	its start, header included.
+
+	Every address the encoder reads or writes must be set by each picture's
+	writes (the encoder keeps what an earlier picture set) and lie in the
+	program's buffers, with room for the picture size the writes set. The
+	engine takes bus addresses: the encoder's buffers in units of 256
+	bytes (address >> 8), the input planes in bytes.
+
+	The driver powers the encoder at the first picture and until the device
+	is closed. Another program's picture resets the encoder first. */
+#define SUNXI_VE_ENCODER_WINDOW		0x1000
+#define SUNXI_VE_MAX_HEADER			256
+
+enum {
+	SUNXI_VE_ENCODE_H264 = 0,
+	SUNXI_VE_ENCODE_HEVC = 1
+};
+
+#define SUNXI_VE_ENCODE_DONE		0x1
+#define SUNXI_VE_ENCODE_FULL		0x2		// the bit stream buffer
+#define SUNXI_VE_ENCODE_OVERTIME	0x4
+
+/*	The buffers an encoder picture's addresses point to, in bytes, for a
+	picture size (what Allwinner's own encoder allocates, with room to
+	spare): the driver refuses smaller ones. The reference pictures are
+	the encoder's own (compressed) format. */
+struct sunxi_ve_encoder_sizes {
+	uint32	luma;			// each reference picture's (0xba0, 0xbb0)
+	uint32	chroma;			// (0xba4, 0xbb4)
+	uint32	subsampled;		// (0xbb8, 0xbbc)
+	uint32	mb_info;		// H.264: 0xb60; H.265: 0xb60 and 0xb64 each
+	uint32	block_info;		// H.265: 0xba8
+	uint32	colocated;		// H.265: 0xb3c
+	uint32	statistics;		// H.264: 0xa9c
+	uint32	row_table;		// 0xb9c
+	uint32	lines;			// 0xbc0 and 0xbc4 each
+};
+
+static inline void
+sunxi_ve_get_encoder_sizes(uint32 codec, uint32 width, uint32 height,
+	struct sunxi_ve_encoder_sizes* sizes)
+{
+	uint32 width64 = (width + 63) & ~63u;
+	uint32 height16 = (height + 15) & ~15u;
+	uint32 height64 = (height + 63) & ~63u;
+	uint32 ctbHeight = (height + 31) / 32;
+	if (codec == SUNXI_VE_ENCODE_HEVC) {
+		sizes->luma = width64 * (height16 + 64);
+		sizes->chroma = width64 * height64 / 2;
+		sizes->mb_info = (512 + width64) * (ctbHeight + 1);
+		sizes->block_info = width64 / 16 * (height64 / 16) * 8;
+		sizes->colocated = width64 / 32 * (height64 / 32) * 24;
+		sizes->statistics = 0;
+	} else {
+		sizes->luma = width64 * (((height16 + 32) + 63) & ~63u);
+		sizes->chroma = sizes->luma / 2;
+		sizes->mb_info = width64 / 16 * (height16 / 16) * 8;
+		sizes->block_info = 0;
+		sizes->colocated = 0;
+		sizes->statistics = width64 * height64 / 32;
+	}
+	sizes->subsampled = width64 * height64 / 8;
+	sizes->row_table = 512 + (height16 / 16 + 2) * 12;
+	sizes->lines = width64 * 8;
+}
+
+struct sunxi_ve_encode {
+	const sunxi_ve_op* ops;		// SUNXI_VE_OP_WRITE only
+	uint32	count;
+	uint32	codec;				// SUNXI_VE_ENCODE_*
+	const uint8* header;		// the slice's NAL header and slice header
+	uint32	header_size;		// bytes, at most SUNXI_VE_MAX_HEADER
+	uint32	status;				// out
+	uint32	bits;				// out: the slice's size
+	uint32	engine_time;		// out: microseconds
+	uint32	reserved[4];
 };
 
 

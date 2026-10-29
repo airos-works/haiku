@@ -171,6 +171,8 @@ backend_name(encoder_backend backend)
 			return "NVENC";
 		case kBackendIris:
 			return "Iris";
+		case kBackendCedar:
+			return "Cedar";
 		case kBackendSoftware:
 		default:
 			return "CPU";

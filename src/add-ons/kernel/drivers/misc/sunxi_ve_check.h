@@ -700,4 +700,224 @@ ve_check_vp9_ops(ve_check& check, const sunxi_ve_op* ops, uint32 count)
 }
 
 
+namespace ve_check_private {
+
+
+// the encoder's registers (offsets in its window) that hold addresses or
+// the picture's geometry
+enum {
+	kEncInputSize		= 0xa00,	// [26:16] width / 8, [10:0] height / 8
+	kEncInputStride		= 0xa04,	// [26:16] luma stride / 16
+	kEncInputControl	= 0xa08,	// [31:27] input format, 0: NV12
+	kEncInputChromaStride = 0xa14,	// [11:0] chroma stride / 16
+	kEncInputLuma		= 0xa78,	// bytes
+	kEncInputChroma		= 0xa7c,
+	kEncInputChroma2	= 0xa80,
+	kEncStatistics		= 0xa9c,	// the input stage's, H.264
+	kEncColocated		= 0xb3c,	// H.265 P pictures (0: none)
+	kEncMbInfo			= 0xb60,	// the rest are >> 8
+	kEncMvOut			= 0xb64,	// H.265
+	kEncBitstream		= 0xb80,
+	kEncBitstreamEnd	= 0xb84,
+	kEncBitstreamOffset	= 0xb88,	// bits
+	kEncBitstreamLimit	= 0xb8c,	// bits
+	kEncRowTable		= 0xb9c,
+	kEncRefLuma			= 0xba0,
+	kEncRefChroma		= 0xba4,
+	kEncBlockInfo		= 0xba8,	// H.265
+	kEncRecLuma			= 0xbb0,
+	kEncRecChroma		= 0xbb4,
+	kEncRefSubsampled	= 0xbb8,
+	kEncRecSubsampled	= 0xbbc,
+	kEncLines0			= 0xbc0,
+	kEncLines1			= 0xbc4,
+
+	kEncRegisters		= 0x1000 / 4
+};
+
+
+/*!	What a program may write: the input stage's, the encoder's and its
+	extension's registers that the encoder program uses, not the trigger,
+	the status or the bit writer (the driver's), nor the top.
+*/
+static bool
+encoder_writable(uint16 reg)
+{
+	if (reg >= 0xc00 && reg <= 0xc84)
+		return true;		// the extension's coding tables
+	switch (reg) {
+		case 0xa00: case 0xa04: case 0xa08: case 0xa14: case 0xa2c:
+		case 0xa70: case 0xa74: case 0xa78: case 0xa7c: case 0xa80:
+		case 0xa84: case 0xa88: case 0xa90: case 0xa94: case 0xa98:
+		case 0xa9c:
+		case 0xb04: case 0xb08: case 0xb0c: case 0xb10: case 0xb14:
+		case 0xb24: case 0xb28: case 0xb2c: case 0xb30: case 0xb34:
+		case 0xb38: case 0xb3c: case 0xb40: case 0xb44: case 0xb48:
+		case 0xb4c: case 0xb60: case 0xb64: case 0xb68: case 0xb6c:
+		case 0xb70: case 0xb74: case 0xb80: case 0xb84: case 0xb88:
+		case 0xb8c: case 0xb94: case 0xb98: case 0xb9c: case 0xba0:
+		case 0xba4: case 0xba8: case 0xbb0: case 0xbb4: case 0xbb8:
+		case 0xbbc: case 0xbc0: case 0xbc4: case 0xbcc: case 0xbd0:
+		case 0xbd4: case 0xbd8: case 0xbdc: case 0xbe8: case 0xbec:
+		case 0xbf0: case 0xbf4: case 0xbf8: case 0xbfc:
+		case 0xcc4: case 0xce4: case 0xce8: case 0xcec: case 0xcf0:
+		case 0xcf4: case 0xcf8: case 0xcfc:
+			return true;
+	}
+	return false;
+}
+
+
+/*!	Registers that may only be written 0 (addresses of things the encoder
+	program does not use: overlays, the input's other planes, ...).
+*/
+static bool
+encoder_zero_only(uint16 reg)
+{
+	switch (reg) {
+		case 0xa70: case 0xa74: case 0xa84: case 0xa88: case 0xbf8:
+		case 0xbfc:
+			return true;
+	}
+	return false;
+}
+
+
+}	// namespace ve_check_private
+
+
+/*!	Whether an encoder picture's writes may run (SUNXI_VE_ENCODE).
+	\a lab: the driver settings allow any register of the input stage, the
+	encoder and its extension, unchecked (for finding out how the A733's
+	encoder works; never on a user's system).
+
+	A picture must set every address the encoder reads or writes (the
+	values left from an earlier picture could be buffers freed since), each
+	in the program's buffers with room for the picture size it sets. The
+	sizes are what Allwinner's own encoder allocates for a picture size,
+	with room to spare.
+*/
+static bool
+ve_check_encode_ops(ve_check& check, const sunxi_ve_op* ops, uint32 count,
+	uint32 codec, bool lab)
+{
+	using namespace ve_check_private;
+
+	check.problem = NULL;
+	check.index = 0;
+
+	uint32 values[kEncRegisters];
+	bool written[kEncRegisters];
+	memset(written, 0, sizeof(written));
+
+	for (uint32 i = 0; i < count; i++) {
+		const sunxi_ve_op& op = ops[i];
+		if (op.type != SUNXI_VE_OP_WRITE)
+			return fail(check, i, "not a write");
+		if ((op.reg & 3) != 0 || op.reg < 0xa00 || op.reg >= 0xd00)
+			return fail(check, i, "register not writable");
+		if (!lab && !encoder_writable(op.reg))
+			return fail(check, i, "register not writable");
+		if (!lab && encoder_zero_only(op.reg) && op.value != 0)
+			return fail(check, i, "register not writable");
+		values[op.reg / 4] = op.value;
+		written[op.reg / 4] = true;
+	}
+	if (codec != SUNXI_VE_ENCODE_H264 && codec != SUNXI_VE_ENCODE_HEVC)
+		return fail(check, count, "codec");
+	if (lab)
+		return true;
+
+	#define VALUE(reg) values[(reg) / 4]
+	#define WRITTEN(reg) written[(reg) / 4]
+
+	bool hevc = codec == SUNXI_VE_ENCODE_HEVC;
+	static const uint16 kNeeded[] = { kEncInputSize, kEncInputStride,
+		kEncInputControl, kEncInputChromaStride, kEncInputLuma,
+		kEncInputChroma, kEncInputChroma2, kEncMbInfo, kEncBitstream,
+		kEncBitstreamEnd, kEncBitstreamOffset, kEncBitstreamLimit,
+		kEncRowTable, kEncRefLuma, kEncRefChroma, kEncRecLuma, kEncRecChroma,
+		kEncRefSubsampled, kEncRecSubsampled, kEncLines0, kEncLines1 };
+	for (size_t i = 0; i < sizeof(kNeeded) / sizeof(kNeeded[0]); i++) {
+		if (!WRITTEN(kNeeded[i]))
+			return fail(check, count, "the picture leaves an address unset");
+	}
+	if (hevc ? (!WRITTEN(kEncMvOut) || !WRITTEN(kEncBlockInfo)
+			|| !WRITTEN(kEncColocated))
+		: !WRITTEN(kEncStatistics)) {
+		return fail(check, count, "the picture leaves an address unset");
+	}
+
+	// NV12 only
+	if ((VALUE(kEncInputControl) >> 27) != 0)
+		return fail(check, count, "input format");
+
+	uint32 width = ((VALUE(kEncInputSize) >> 16) & 0x7ff) * 8;
+	uint32 height = (VALUE(kEncInputSize) & 0x7ff) * 8;
+	uint32 stride = ((VALUE(kEncInputStride) >> 16) & 0x7ff) * 16;
+	uint32 chromaStride = (VALUE(kEncInputChromaStride) & 0xfff) * 16;
+	if (width < 16 || height < 16 || width > 4096 || height > 4096
+		|| stride < width || chromaStride < width
+		|| (VALUE(kEncInputStride) & 0xffff) != 0) {
+		return fail(check, count, "picture size");
+	}
+
+	sunxi_ve_encoder_sizes sizes;
+	sunxi_ve_get_encoder_sizes(codec, width, height, &sizes);
+	uint64 height16 = align(height, 16);
+
+	if (!fits(check, VALUE(kEncInputLuma), (uint64)stride * height16)
+		|| !fits(check, VALUE(kEncInputChroma),
+			(uint64)chromaStride * height16 / 2)
+		|| !fits(check, VALUE(kEncInputChroma2),
+			(uint64)chromaStride * height16 / 4)) {
+		return fail(check, count, "input picture outside the buffers");
+	}
+
+	if (!fits(check, (uint64)VALUE(kEncRefLuma) << 8, sizes.luma)
+		|| !fits(check, (uint64)VALUE(kEncRefChroma) << 8, sizes.chroma)
+		|| !fits(check, (uint64)VALUE(kEncRecLuma) << 8, sizes.luma)
+		|| !fits(check, (uint64)VALUE(kEncRecChroma) << 8, sizes.chroma)
+		|| !fits(check, (uint64)VALUE(kEncRefSubsampled) << 8,
+			sizes.subsampled)
+		|| !fits(check, (uint64)VALUE(kEncRecSubsampled) << 8,
+			sizes.subsampled)) {
+		return fail(check, count, "reference picture outside the buffers");
+	}
+
+	if (!fits(check, (uint64)VALUE(kEncRowTable) << 8, sizes.row_table)
+		|| !fits(check, (uint64)VALUE(kEncLines0) << 8, sizes.lines)
+		|| !fits(check, (uint64)VALUE(kEncLines1) << 8, sizes.lines)
+		|| !fits(check, (uint64)VALUE(kEncMbInfo) << 8, sizes.mb_info))
+		return fail(check, count, "encoder data outside the buffers");
+	if (hevc) {
+		if (!fits(check, (uint64)VALUE(kEncMvOut) << 8, sizes.mb_info)
+			|| !fits(check, (uint64)VALUE(kEncBlockInfo) << 8,
+				sizes.block_info)
+			|| (VALUE(kEncColocated) != 0
+				&& !fits(check, (uint64)VALUE(kEncColocated) << 8,
+					sizes.colocated))) {
+			return fail(check, count, "encoder data outside the buffers");
+		}
+	} else if (!fits(check, VALUE(kEncStatistics), sizes.statistics))
+		return fail(check, count, "encoder data outside the buffers");
+
+	// the bit stream: [start, end] in units of 256 bytes, in one buffer,
+	// the limit (bits) within it
+	uint64 bitstream = (uint64)VALUE(kEncBitstream) << 8;
+	uint64 bitstreamEnd = ((uint64)VALUE(kEncBitstreamEnd) << 8) + 256;
+	const ve_range* range = range_of(check, bitstream);
+	if (range == NULL || bitstreamEnd <= bitstream
+		|| bitstreamEnd > range->end
+		|| VALUE(kEncBitstreamLimit) > (bitstreamEnd - bitstream) * 8
+		|| VALUE(kEncBitstreamOffset) >= VALUE(kEncBitstreamLimit)) {
+		return fail(check, count, "bit stream outside the buffers");
+	}
+
+	#undef VALUE
+	#undef WRITTEN
+	return true;
+}
+
+
 #endif	// SUNXI_VE_CHECK_H

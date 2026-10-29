@@ -18,6 +18,7 @@
 #include <generic_syscall_defs.h>
 #include <syscalls.h>
 
+#include "CedarVideoEncoder.h"
 #include "IrisVideoEncoder.h"
 #include "NvencEncoder.h"
 #include "VaapiEncoder.h"
@@ -59,6 +60,13 @@ iris_encoder_implements(video_codec codec)
 }
 
 
+bool
+cedar_encoder_implements(video_codec codec)
+{
+	return CedarVideoEncoder::Implements(codec);
+}
+
+
 // #pragma mark - GpuDevice
 
 
@@ -86,6 +94,8 @@ GpuDevice::CanEncode(video_codec codec, int width, int height) const
 	if (backend == kBackendNVENC && !nvenc_encoder_implements(codec))
 		return false;
 	if (backend == kBackendIris && !iris_encoder_implements(codec))
+		return false;
+	if (backend == kBackendCedar && !cedar_encoder_implements(codec))
 		return false;
 	return (format->maxWidth == 0 || width <= format->maxWidth)
 		&& (format->maxHeight == 0 || height <= format->maxHeight);
@@ -666,6 +676,33 @@ HardwareInventory::_ProbeIris()
 }
 
 
+/*!	The Radxa Cubie A7S's SoC: its video engine's encoder, through the
+	sunxi_ve driver. */
+void
+HardwareInventory::_ProbeCedar()
+{
+	if (!CedarVideoEncoder::IsAvailable())
+		return;
+	GpuDevice device;
+	device.id = "cedar:/dev/misc/sunxi_ve";
+	device.name = "Allwinner A733";
+	device.vendor = kVendorOther;
+	device.vendorID = 0;
+	device.deviceID = 0;
+	device.generation = "sun60iw2";
+	device.engine = "Cedar video engine";
+	device.backend = kBackendCedar;
+	device.devicePath = "/dev/misc/sunxi_ve";
+	device.ready = true;
+	device.encode.push_back(GpuEncodeFormat{ kVideoH264, 4096, 4096, false });
+	device.encode.push_back(GpuEncodeFormat{ kVideoH265, 4096, 4096, false });
+	device.decode.push_back("H.264");
+	device.decode.push_back("H.265");
+	device.decode.push_back("VP9");
+	fDevices.push_back(device);
+}
+
+
 void
 HardwareInventory::Probe()
 {
@@ -674,6 +711,7 @@ HardwareInventory::Probe()
 	_ProbeVaapi();
 	_ProbePci();
 	_ProbeIris();
+	_ProbeCedar();
 	// A test hook: an NVIDIA card with this PCI device ID, to try the NVENC
 	// paths with the stand-in add-on (nvenc/test/fake_nvenc.cpp).
 	if (const char* fake = getenv("MEDIACONVERTER_FAKE_NVIDIA"))
@@ -782,6 +820,8 @@ HardwareInventory::CreateEncoder(const GpuDevice& device)
 			return new(std::nothrow) NvencEncoder(device.name.String());
 		case kBackendIris:
 			return new(std::nothrow) IrisVideoEncoder(device.name.String());
+		case kBackendCedar:
+			return new(std::nothrow) CedarVideoEncoder(device.name.String());
 		default:
 			return NULL;
 	}

@@ -14,6 +14,7 @@
 #include "Formats.h"
 #include "HardwareCaps.h"
 #include "MediaProbe.h"
+#include "CedarVideoEncoder.h"
 #include "NvencEncoder.h"
 #include "OutputSettings.h"
 #include "Presets.h"
@@ -117,12 +118,18 @@ print_hardware()
 		// NVIDIA formats count once a test picture has come back
 		if (device.backend == kBackendNVENC && device.ready)
 			NvencEncoder::SelfTestAll();
+		// the A733's encoder counts once its test pictures have come back
+		if (device.backend == kBackendCedar && device.ready)
+			CedarVideoEncoder::SelfTestAll();
 		for (size_t f = 0; f < device.encode.size(); f++) {
 			const GpuEncodeFormat& format = device.encode[f];
 			BString test;
 			bool works;
-			if (device.backend == kBackendNVENC
-				&& NvencEncoder::Tested(format.codec, &works, &test)) {
+			if ((device.backend == kBackendNVENC
+					&& NvencEncoder::Tested(format.codec, &works, &test))
+				|| (device.backend == kBackendCedar
+					&& CedarVideoEncoder::Tested(format.codec, &works,
+						&test))) {
 				BString result = works ? BString(" (tested)")
 					: BString(" (") << test << ")";
 				test = result;

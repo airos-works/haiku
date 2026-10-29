@@ -30,7 +30,22 @@
 	pool, mapped as an area of its own for the program to clone; only when
 	the pool is full does a buffer get contiguous memory of its own. The
 	driver settings file "sunxi_ve" sets the pool's size ("pool_size 128",
-	MiB; 0: no pool). */
+	MiB; 0: no pool).
+
+	The encoder is an engine of its own at 0x01c10000 (the BSP's second
+	device, "allwinner,sunxi-cedar-ve2", which our device tree leaves out):
+	PCK-600 domain 3, its reset and gates next to the decoder's in the CCU,
+	IOMMU0's master 3, GIC SPI 48. The driver powers it, as the BSP does,
+	at the first encoder picture (SUNXI_VE_ENCODE), so that a decoder-only
+	session never touches it, and turns its clocks off with the decoder's
+	when the device is closed. Of its 4 KiB window only the top (0x800),
+	the input stage (0xa00), the encoder (0xb00) and its extension (0xc00)
+	are ever touched: reading the whole window hangs the SoC. For the lab,
+	the setting "encoder_lab true" lets a program write any register of the
+	last three, unchecked.
+
+	How the encoder is programmed (from Allwinner's own library at work)
+	is in docs/airos/SUNXI_VENC.md. */
 
 
 #include <Drivers.h>
@@ -81,14 +96,24 @@ static const phys_addr_t kRCcu			= 0x07010000;
 static const phys_addr_t kPpuVeDecoder	= 0x07062000;	// PCK-600 domain 2
 static const phys_addr_t kIommu1		= 0x03910000;
 static const phys_addr_t kSystemControl	= 0x03000000;
+// the encoder ("ve2@1c10000" in the BSP's device tree, which ours leaves
+// out): its window, PCK-600 domain 3, IOMMU0 (master 3) and interrupt
+static const phys_addr_t kVeEncoder		= 0x01c10000;
+static const phys_addr_t kPpuVeEncoder	= 0x07063000;
+static const phys_addr_t kIommu0		= 0x03900000;
+static const uint32 kEncoderInterrupt	= 80;	// GIC SPI 48
 
 enum {
+	CCU_IOMMU0				= 0x058c,	// b0-2 gates, b16 reset deassert
 	CCU_IOMMU1				= 0x05b4,	// b0-2 gates, b16 reset deassert
-	CCU_AHB_GATES			= 0x05c0,	// b0 VE decoder; keyed
-	CCU_MBUS_GATES			= 0x05e0,	// b1 IOMMU1, b14 VE decoder; keyed
-	CCU_MBUS_CLOCKS			= 0x05e4,	// b18 VE decoder; keyed
+	CCU_AHB_GATES			= 0x05c0,	// b0 VE decoder, b1 encoder; keyed
+	CCU_MBUS_GATES			= 0x05e0,	// b0 IOMMU0, b1 IOMMU1, b12 VE
+										// encoder, b14 VE decoder; keyed
+	CCU_MBUS_CLOCKS			= 0x05e4,	// b1 VE encoder, b18 decoder; keyed
+	CCU_VE_ENCODER_CLOCK	= 0x0a80,	// b31 gate, [26:24] parent, [4:0] M-1
 	CCU_VE_DECODER_CLOCK	= 0x0a88,	// b31 gate, [26:24] parent, [4:0] M-1
-	CCU_VE_BUS				= 0x0a8c,	// b2 decoder gate, b18 decoder reset
+	CCU_VE_BUS				= 0x0a8c,	// b0 encoder gate, b2 decoder gate,
+										// b16 encoder reset, b18 decoder reset
 
 	R_CCU_PPU				= 0x01ac,	// b0 the PCK-600's bus clock
 
@@ -98,6 +123,8 @@ enum {
 
 	IOMMU_BYPASS_VE_DEC0	= 0x404,	// IOMMU1 masters 0 and 1 (6 and 7
 	IOMMU_BYPASS_VE_DEC1	= 0x604,	// of the IOMMU as a whole)
+	IOMMU_ENABLE			= 0x014,
+	IOMMU_BYPASS_VE_ENC		= 0xa04,	// IOMMU0's master 3
 
 	SYSTEM_SRAM_MAP			= 0x0000,	// b0 clear: SRAM C to the engine
 	SYSTEM_SRAM_BOOT		= 0x0004	// b24 clear: the same
@@ -107,7 +134,7 @@ static const uint32 kAhbKey = 0x010000ff;
 static const uint32 kMbusGateKey = 0x41055800;
 static const uint32 kMbusClockKey = 0x00040302;
 
-// gate, pll-peri0-600m, divided by 1
+// gate, pll-peri0-600m, divided by 1 (index 3 for both engines' clocks)
 static const uint32 kVeClock600MHz = 0x83000000;
 
 // the engine's own registers
@@ -131,6 +158,39 @@ enum {
 
 	STATUS_DONE_ERROR_REQUEST = 0x7
 };
+
+// the encoder's registers (offsets in its own window)
+enum {
+	ENC_TOP_MODE		= 0x800,	// b6 input stage, b7 encoder
+	ENC_TOP_RESET		= 0x804,	// b0 and b4 pulsed after reset
+	ENC_IP				= 0x8e4,
+	ENCPP_CONTROL		= 0xa08,	// b0 interrupt enable
+	ENCPP_STATUS		= 0xa10,
+	ENC_PICTURE			= 0xb04,	// b31: the bit writer adds no
+									// emulation prevention bytes
+	ENC_CONTROL			= 0xb14,	// [2:0] interrupt enables
+	ENC_TRIGGER			= 0xb18,	// [17:16] 3 = H.265; 8 starts, n << 8
+									// | 1 writes n bits of ENC_BITS
+	ENC_STATUS			= 0xb1c,	// [3:0] done, full, overtime (W1C);
+									// b9 the bit writer is ready
+	ENC_BITS			= 0xb20,
+	ENC_LENGTH			= 0xb90,	// bits in the bit stream buffer
+
+	// the top's mode: the encoder's blocks only answer while their bits
+	// are set (0x5555aaaa otherwise), as Allwinner's encoder turns them on
+	ENC_MODE_IDLE		= 0x00130000,
+	ENC_MODE_INPUT		= 0x00130040,
+	ENC_MODE_ENCODER	= 0x001300c0,
+	ENC_MODE_INPUT_OFF	= 0x00130080,
+
+	ENC_TRIGGER_HEVC	= 0x30000,
+	ENC_START			= 8,
+	ENC_STATUS_END		= 0xf,
+	ENC_STATUS_BITS_READY = 0x200
+};
+
+#define ENCODE_TIMEOUT		1000000LL
+#define BIT_WRITER_TIMEOUT	10000LL
 
 
 struct ve_buffer {
@@ -171,6 +231,10 @@ static mapping sRCcu = { -1, NULL };
 static mapping sPpu = { -1, NULL };
 static mapping sIommu = { -1, NULL };
 static mapping sSystem = { -1, NULL };
+static mapping sEncoder = { -1, NULL };
+static mapping sEncoderPpu = { -1, NULL };
+static mapping sIommu0 = { -1, NULL };
+static bool sEncoderInterruptInstalled;
 static phys_addr_t sVePhysical;
 static uint32 sInterrupt;
 static bool sInterruptInstalled;
@@ -188,6 +252,14 @@ static ve_client* sHolder;			// in the middle of a picture
 static bigtime_t sHoldUntil;
 static bool sIdentified;
 static uint32 sDecoderIp, sEncoderIp, sVersion;
+
+static mutex sEncoderLock = MUTEX_INITIALIZER("sunxi_ve encoder");
+	// one picture at a time; the CCU registers it shares with the decoder
+	// are written under sEngineLock
+static sem_id sEncoderDoneSem = -1;
+static volatile bool sEncoderPowered;	// with sPowerLock, as sPowered
+static ve_client* sEncoderLastClient;
+static bool sEncoderIdentified;
 
 static mutex sPoolLock = MUTEX_INITIALIZER("sunxi_ve pool");
 static uint32 sPoolSize = DEFAULT_POOL_SIZE;	// MiB
@@ -301,28 +373,28 @@ set_powered(bool powered)
 
 
 static status_t
-power_domain_on()
+power_domain_on(const mapping& ppu)
 {
 	set_bits(sRCcu, R_CCU_PPU, 1);
-	if ((read32(sPpu, PPU_STATUS) & 0xf) == PPU_ON)
+	if ((read32(ppu, PPU_STATUS) & 0xf) == PPU_ON)
 		return B_OK;
 
 	// Allwinner's PPU set-up (pck600_domains.c): device control and logic
 	// power switch delays, then the policy
-	write32(sPpu, 0x170, 0x001f1f1f);
-	write32(sPpu, 0x174, 0x00001f1f);
-	write32(sPpu, 0xc00, 0x08080808);
-	write32(sPpu, 0xc04, 0x00000808);
-	write32(sPpu, 0xc10, 0x00000008);
-	if ((read32(sPpu, PPU_POLICY) & 0xf) == PPU_ON) {
+	write32(ppu, 0x170, 0x001f1f1f);
+	write32(ppu, 0x174, 0x00001f1f);
+	write32(ppu, 0xc00, 0x08080808);
+	write32(ppu, 0xc04, 0x00000808);
+	write32(ppu, 0xc10, 0x00000008);
+	if ((read32(ppu, PPU_POLICY) & 0xf) == PPU_ON) {
 		// a policy that says on while the domain is off: ask again
-		clear_bits(sPpu, PPU_POLICY, 0xf);
+		clear_bits(ppu, PPU_POLICY, 0xf);
 		spin(10);
 	}
-	write32(sPpu, PPU_POLICY, (read32(sPpu, PPU_POLICY) & ~0xfu) | PPU_ON);
+	write32(ppu, PPU_POLICY, (read32(ppu, PPU_POLICY) & ~0xfu) | PPU_ON);
 
 	bigtime_t deadline = system_time() + 10000;
-	while ((read32(sPpu, PPU_STATUS) & 0xf) != PPU_ON) {
+	while ((read32(ppu, PPU_STATUS) & 0xf) != PPU_ON) {
 		if (system_time() > deadline)
 			return B_TIMED_OUT;
 		spin(10);
@@ -354,11 +426,11 @@ clocks_on()
 static status_t
 power_up()
 {
-	status_t status = power_domain_on();
+	status_t status = power_domain_on(sPpu);
 	if (status != B_OK) {
 		// the GPU core's domain only came up with its clock running
 		clocks_on();
-		status = power_domain_on();
+		status = power_domain_on(sPpu);
 	}
 	if (status != B_OK) {
 		ERROR("power domain 2 does not come up: policy %#" B_PRIx32
@@ -442,6 +514,186 @@ reset_engine()
 }
 
 
+//	#pragma mark - encoder power
+
+
+static inline uint32
+enc_read(uint32 offset)
+{
+	return read32(sEncoder, offset);
+}
+
+
+static inline void
+enc_write(uint32 offset, uint32 value)
+{
+	write32(sEncoder, offset, value);
+}
+
+
+static void
+set_encoder_powered(bool powered)
+{
+	cpu_status state = disable_interrupts();
+	acquire_spinlock(&sPowerLock);
+	sEncoderPowered = powered;
+	release_spinlock(&sPowerLock);
+	restore_interrupts(state);
+}
+
+
+/*!	The one test for "the encoder's registers may be touched". */
+static bool
+encoder_clocked()
+{
+	uint32 bus = read32(sCcu, CCU_VE_BUS);
+	return (read32(sCcu, CCU_VE_ENCODER_CLOCK) & (1u << 31)) != 0
+		&& (bus & (1u << 0)) != 0 && (bus & (1u << 16)) != 0;
+}
+
+
+static void
+encoder_top_reset_pulse()
+{
+	enc_write(ENC_TOP_RESET, enc_read(ENC_TOP_RESET) | 0x11);
+	enc_write(ENC_TOP_RESET, enc_read(ENC_TOP_RESET) & ~0x11u);
+}
+
+
+/*!	The encoder's reset, then its gates and clock, in the order of the BSP's
+	enable_cedar_hw_clk() (cedar_ve.c) with the encoder's clocks of
+	ccu-sun60iw2.c: "ve-enc-ahb-gate" 0x5c0 b1, "ve-mbus-gate" 0x5e0 b12,
+	"ve-mclk" 0x5e4 b1, "ve-enc0-bus" 0xa8c b0, "ve-enc0" 0xa80. Called with
+	sEngineLock.
+*/
+static void
+encoder_clocks_on()
+{
+	set_bits(sCcu, CCU_VE_BUS, 1u << 16);
+	set_keyed_gate(CCU_AHB_GATES, kAhbKey, 1u << 1);
+	set_keyed_gate(CCU_MBUS_GATES, kMbusGateKey, 1u << 12);
+	set_keyed_gate(CCU_MBUS_CLOCKS, kMbusClockKey, 1u << 1);
+	set_bits(sCcu, CCU_VE_BUS, 1u << 0);
+	write32(sCcu, CCU_VE_ENCODER_CLOCK, kVeClock600MHz);
+}
+
+
+static bool
+encoder_setting(const char* name)
+{
+	void* handle = load_driver_settings("sunxi_ve");
+	if (handle == NULL)
+		return false;
+	bool value = get_driver_boolean_parameter(handle, name, false, true);
+	unload_driver_settings(handle);
+	return value;
+}
+
+
+/*!	The encoder's DMA goes through IOMMU0 (master 3, "VE_ENC"), whose other
+	masters are USB, CSI and ISP. Nothing in air/OS turns its translation on
+	(0x14 reads 0 on the Cubie: every master passes); if something has,
+	only the encoder's master is switched to bypass. If IOMMU0 is held in
+	reset, it is left so.
+*/
+static void
+encoder_iommu_bypass()
+{
+	uint32 iommu = read32(sCcu, CCU_IOMMU0);
+	if ((iommu & 0x00010007) != 0x00010007) {
+		dprintf("sunxi_ve: IOMMU0 off (%#" B_PRIx32 "), left so\n", iommu);
+		return;
+	}
+	if (read32(sIommu0, IOMMU_ENABLE) != 0)
+		write32(sIommu0, IOMMU_BYPASS_VE_ENC, 1);
+}
+
+
+/*!	Called with sEncoderLock. */
+static status_t
+encoder_power_up()
+{
+	if (sEncoderPowered && encoder_clocked())
+		return B_OK;
+
+	MutexLocker engineLocker(sEngineLock);
+	status_t status = power_domain_on(sEncoderPpu);
+	if (status != B_OK) {
+		encoder_clocks_on();
+		status = power_domain_on(sEncoderPpu);
+	}
+	if (status != B_OK) {
+		ERROR("power domain 3 does not come up: policy %#" B_PRIx32
+			", status %#" B_PRIx32 "\n", read32(sEncoderPpu, PPU_POLICY),
+			read32(sEncoderPpu, PPU_STATUS));
+		return status;
+	}
+	encoder_clocks_on();
+	encoder_iommu_bypass();
+
+	// the BSP's set_sys_cfg_by_self(), for both of its devices
+	clear_bits(sSystem, SYSTEM_SRAM_MAP, 1);
+	clear_bits(sSystem, SYSTEM_SRAM_BOOT, 1u << 24);
+
+	spin(10);
+	if (!encoder_clocked()) {
+		ERROR("the encoder's clock or reset did not come up (clock %#"
+			B_PRIx32 ", bus %#" B_PRIx32 "): not touching it\n",
+			read32(sCcu, CCU_VE_ENCODER_CLOCK), read32(sCcu, CCU_VE_BUS));
+		return B_ERROR;
+	}
+	engineLocker.Unlock();
+
+	encoder_top_reset_pulse();
+	enc_write(ENC_TOP_MODE, ENC_MODE_IDLE);
+	if (!sEncoderIdentified) {
+		dprintf("sunxi_ve: encoder IP %#" B_PRIx32 ", top %#" B_PRIx32
+			" %#" B_PRIx32 ", IOMMU0 %#" B_PRIx32 "\n", enc_read(ENC_IP),
+			enc_read(ENC_TOP_MODE), enc_read(ENC_TOP_RESET),
+			read32(sCcu, CCU_IOMMU0));
+		sEncoderIdentified = true;
+	}
+	set_encoder_powered(true);
+	return B_OK;
+}
+
+
+/*!	Called with sEngineLock. */
+static void
+encoder_power_down()
+{
+	if (sEncoder.address == NULL || !sEncoderPowered)
+		return;
+	enc_write(ENC_TOP_MODE, ENC_MODE_IDLE);
+	set_encoder_powered(false);
+	clear_bits(sCcu, CCU_VE_ENCODER_CLOCK, 1u << 31);
+	clear_bits(sCcu, CCU_VE_BUS, 1u << 0);
+	clear_bits(sCcu, CCU_VE_BUS, 1u << 16);
+}
+
+
+/*!	After a picture that did not end, and before another program's.
+	Called with sEncoderLock.
+*/
+static void
+encoder_reset()
+{
+	set_encoder_powered(false);
+	MutexLocker engineLocker(sEngineLock);
+	clear_bits(sCcu, CCU_VE_BUS, 1u << 16);
+	spin(10);
+	set_bits(sCcu, CCU_VE_BUS, 1u << 16);
+	spin(10);
+	bool clocked = encoder_clocked();
+	engineLocker.Unlock();
+	if (!clocked)
+		return;
+	encoder_top_reset_pulse();
+	enc_write(ENC_TOP_MODE, ENC_MODE_IDLE);
+	set_encoder_powered(true);
+}
+
+
 //	#pragma mark - interrupt
 
 
@@ -484,6 +736,47 @@ ve_interrupt(void* data)
 {
 	acquire_spinlock(&sPowerLock);
 	int32 result = handle_interrupt();
+	release_spinlock(&sPowerLock);
+	return result;
+}
+
+
+/*!	The encoder's line, as the BSP's ve_irq_work() reads it for its second
+	device: the top's b7 says the H.264 encoder, b6 the input stage.
+*/
+static int32
+handle_encoder_interrupt()
+{
+	if (!sEncoderPowered)
+		return B_UNHANDLED_INTERRUPT;
+
+	uint32 mode = enc_read(ENC_TOP_MODE);
+	if ((mode & (1u << 7)) != 0) {
+		uint32 enabled = enc_read(ENC_CONTROL);
+		if ((enc_read(ENC_STATUS) & ENC_STATUS_END) == 0
+			|| (enabled & 0xf) == 0) {
+			return B_UNHANDLED_INTERRUPT;
+		}
+		// level triggered: mask it, the picture's caller clears the status
+		enc_write(ENC_CONTROL, enabled & ~0xfu);
+	} else if ((mode & (1u << 6)) != 0) {
+		uint32 enabled = enc_read(ENCPP_CONTROL);
+		if ((enc_read(ENCPP_STATUS) & 1) == 0 || (enabled & 1) == 0)
+			return B_UNHANDLED_INTERRUPT;
+		enc_write(ENCPP_CONTROL, enabled & ~1u);
+	} else
+		return B_UNHANDLED_INTERRUPT;
+
+	release_sem_etc(sEncoderDoneSem, 1, B_DO_NOT_RESCHEDULE);
+	return B_INVOKE_SCHEDULER;
+}
+
+
+static int32
+ve_encoder_interrupt(void* data)
+{
+	acquire_spinlock(&sPowerLock);
+	int32 result = handle_encoder_interrupt();
 	release_spinlock(&sPowerLock);
 	return result;
 }
@@ -932,6 +1225,151 @@ run_slice(ve_client* client, sunxi_ve_run& request, const sunxi_ve_op* ops)
 }
 
 
+//	#pragma mark - encoder pictures
+
+
+/*!	Puts the slice header through the encoder's bit writer, 8 bits a time.
+	Called with sEncoderLock.
+*/
+static status_t
+put_header(const uint8* header, uint32 size, uint32 mode, uint32 picture)
+{
+	enc_write(ENC_PICTURE, picture | (1u << 31));
+	enc_write(ENC_TRIGGER, mode);
+	for (uint32 i = 0; i < size; i++) {
+		enc_write(ENC_BITS, header[i]);
+		enc_write(ENC_TRIGGER, mode | (8 << 8) | 1);
+		bigtime_t deadline = system_time() + BIT_WRITER_TIMEOUT;
+		while ((enc_read(ENC_STATUS) & ENC_STATUS_BITS_READY) == 0) {
+			if (system_time() > deadline) {
+				ERROR("the bit writer stays busy: status %#" B_PRIx32 "\n",
+					enc_read(ENC_STATUS));
+				return B_TIMED_OUT;
+			}
+		}
+	}
+	enc_write(ENC_PICTURE, picture);
+	return B_OK;
+}
+
+
+static status_t
+run_encode(ve_client* client, sunxi_ve_encode& request,
+	const sunxi_ve_op* ops, const uint8* header)
+{
+	if (sEncoder.address == NULL)
+		return B_DEVICE_NOT_FOUND;
+
+	ve_range ranges[SUNXI_VE_MAX_BUFFERS];
+	uint32 rangeCount = 0;
+	MutexLocker clientLocker(client->lock);
+	client->busy++;
+	for (uint32 i = 0; i < SUNXI_VE_MAX_BUFFERS; i++) {
+		const ve_buffer& buffer = client->buffers[i];
+		if (buffer.area < 0)
+			continue;
+		ranges[rangeCount].start = (uint32)(buffer.physical - sAddressOffset);
+		ranges[rangeCount].end = ranges[rangeCount].start + (uint32)buffer.size;
+		rangeCount++;
+	}
+	clientLocker.Unlock();
+
+	ve_check check = { ranges, rangeCount, NULL, 0 };
+	bool lab = encoder_setting("encoder_lab");
+	if (!ve_check_encode_ops(check, ops, request.count, request.codec, lab)) {
+		ERROR("encoder picture refused: %s (op %" B_PRIu32 ")\n",
+			check.problem, check.index);
+		clientLocker.Lock();
+		client->busy--;
+		return B_NOT_ALLOWED;
+	}
+
+	MutexLocker locker(sEncoderLock);
+	status_t status = encoder_power_up();
+	if (status == B_OK && !sEncoderInterruptInstalled) {
+		// only now: nothing raises the line before the encoder runs
+		if (install_io_interrupt_handler(kEncoderInterrupt,
+				ve_encoder_interrupt, NULL, 0) == B_OK) {
+			sEncoderInterruptInstalled = true;
+		} else
+			ERROR("no encoder interrupt: polling\n");
+	}
+	if (status == B_OK && sEncoderLastClient != NULL
+		&& sEncoderLastClient != client) {
+		encoder_reset();
+	}
+	if (status == B_OK && (!sEncoderPowered || !encoder_clocked()))
+		status = B_NOT_ALLOWED;
+	sEncoderLastClient = client;
+
+	while (acquire_sem_etc(sEncoderDoneSem, 1, B_RELATIVE_TIMEOUT, 0)
+			== B_OK) {
+	}
+
+	uint32 mode = request.codec == SUNXI_VE_ENCODE_HEVC
+		? ENC_TRIGGER_HEVC : 0;
+	uint32 picture = 0;
+	request.status = 0;
+	request.bits = 0;
+	request.engine_time = 0;
+	if (status == B_OK) {
+		// the input stage and the encoder on, as Allwinner's encoder does
+		// before each picture
+		enc_write(ENC_TOP_MODE, ENC_MODE_IDLE);
+		enc_write(ENC_TOP_MODE, ENC_MODE_INPUT);
+		enc_write(ENC_TOP_MODE, ENC_MODE_ENCODER);
+		// the codec first: the bit writer is not ready for H.265 right
+		// after it changes
+		enc_write(ENC_TRIGGER, mode);
+		enc_write(ENC_STATUS, enc_read(ENC_STATUS));
+		for (uint32 i = 0; i < request.count; i++) {
+			enc_write(ops[i].reg, ops[i].value);
+			if (ops[i].reg == ENC_PICTURE)
+				picture = ops[i].value;
+		}
+		status = put_header(header, request.header_size, mode, picture);
+	}
+
+	if (status == B_OK) {
+		bigtime_t start = system_time();
+		bigtime_t deadline = start + ENCODE_TIMEOUT;
+		enc_write(ENC_CONTROL, 0x7);
+		enc_write(ENC_TRIGGER, mode | ENC_START);
+		// the interrupt, or the status when there is none
+		while (true) {
+			if (acquire_sem_etc(sEncoderDoneSem, 1, B_RELATIVE_TIMEOUT, 1000)
+					== B_OK
+				|| (enc_read(ENC_STATUS) & ENC_STATUS_END) != 0) {
+				break;
+			}
+			if (system_time() > deadline) {
+				status = B_TIMED_OUT;
+				break;
+			}
+		}
+		request.engine_time = (uint32)(system_time() - start);
+		request.status = enc_read(ENC_STATUS) & ENC_STATUS_END;
+		request.bits = enc_read(ENC_LENGTH);
+		enc_write(ENC_STATUS, enc_read(ENC_STATUS));
+	}
+	if (sEncoderPowered) {
+		enc_write(ENC_TOP_MODE, ENC_MODE_INPUT_OFF);
+		enc_write(ENC_TOP_MODE, ENC_MODE_IDLE);
+	}
+	if (status == B_TIMED_OUT
+		|| (status == B_OK && request.status != SUNXI_VE_ENCODE_DONE)) {
+		ERROR("encoder picture did not end: status %#" B_PRIx32 ", resetting "
+			"the encoder\n", request.status);
+		encoder_reset();
+	}
+	locker.Unlock();
+
+	clientLocker.Lock();
+	client->busy--;
+	return status;
+}
+
+
 //	#pragma mark - device
 
 
@@ -963,6 +1401,9 @@ static void
 unmap_blocks()
 {
 	unmap_block(sVe);
+	unmap_block(sEncoder);
+	unmap_block(sEncoderPpu);
+	unmap_block(sIommu0);
 	unmap_block(sSystem);
 	unmap_block(sIommu);
 	unmap_block(sPpu);
@@ -971,6 +1412,9 @@ unmap_blocks()
 	if (sDoneSem >= 0)
 		delete_sem(sDoneSem);
 	sDoneSem = -1;
+	if (sEncoderDoneSem >= 0)
+		delete_sem(sEncoderDoneSem);
+	sEncoderDoneSem = -1;
 }
 
 
@@ -1084,6 +1528,10 @@ ve_free(void* cookie)
 	if (sLastClient == client)
 		sLastClient = NULL;
 	mutex_unlock(&sEngineLock);
+	mutex_lock(&sEncoderLock);
+	if (sEncoderLastClient == client)
+		sEncoderLastClient = NULL;
+	mutex_unlock(&sEncoderLock);
 
 	for (uint32 i = 0; i < SUNXI_VE_MAX_BUFFERS; i++)
 		free_buffer(client->buffers[i]);
@@ -1092,9 +1540,12 @@ ve_free(void* cookie)
 
 	MutexLocker locker(sOpenLock);
 	if (--sOpenCount == 0) {
+		MutexLocker encoderLocker(sEncoderLock);
 		MutexLocker engineLocker(sEngineLock);
 		power_down();
+		encoder_power_down();
 		engineLocker.Unlock();
+		encoderLocker.Unlock();
 
 		MutexLocker poolLocker(sPoolLock);
 		if (sPoolArea >= 0) {
@@ -1176,6 +1627,40 @@ ve_control(void* cookie, uint32 op, void* buffer, size_t length)
 			if (sHolder == client)
 				sHolder = NULL;
 			return B_OK;
+		}
+
+		case SUNXI_VE_ENCODE:
+		{
+			sunxi_ve_encode request;
+			if (!IS_USER_ADDRESS(buffer)
+				|| user_memcpy(&request, buffer, sizeof(request)) != B_OK) {
+				return B_BAD_ADDRESS;
+			}
+			// an empty picture asks whether there is an encoder
+			if (request.count == 0 && request.header_size == 0)
+				return sEncoder.address != NULL ? B_OK : B_DEVICE_NOT_FOUND;
+			if (request.count > SUNXI_VE_MAX_OPS
+				|| request.header_size > SUNXI_VE_MAX_HEADER
+				|| !IS_USER_ADDRESS(request.ops)
+				|| !IS_USER_ADDRESS(request.header))
+				return B_BAD_VALUE;
+			size_t size = request.count * sizeof(sunxi_ve_op);
+			sunxi_ve_op* ops = (sunxi_ve_op*)malloc(size + 1);
+			uint8 header[SUNXI_VE_MAX_HEADER];
+			if (ops == NULL)
+				return B_NO_MEMORY;
+			status_t status = user_memcpy(ops, request.ops, size);
+			if (status == B_OK && request.header_size > 0) {
+				status = user_memcpy(header, request.header,
+					request.header_size);
+			}
+			if (status == B_OK)
+				status = run_encode(client, request, ops, header);
+			free(ops);
+			if (status != B_OK && status != B_TIMED_OUT)
+				return status;
+			status_t copied = user_memcpy(buffer, &request, sizeof(request));
+			return status != B_OK ? status : copied;
 		}
 
 		case SUNXI_VE_RUN:
@@ -1291,6 +1776,20 @@ ve_init_driver(device_node* node, void** _cookie)
 		return B_NO_MEMORY;
 	}
 
+	// the encoder: optional, the decoder works without it
+	sEncoderDoneSem = create_sem(0, "sunxi_ve picture encoded");
+	if (sEncoderDoneSem < 0
+		|| map_block(sEncoderPpu, "sunxi_ve encoder ppu", kPpuVeEncoder,
+			B_PAGE_SIZE) != B_OK
+		|| map_block(sIommu0, "sunxi_ve iommu0", kIommu0, B_PAGE_SIZE) != B_OK
+		|| map_block(sEncoder, "sunxi_ve encoder registers", kVeEncoder,
+			SUNXI_VE_ENCODER_WINDOW) != B_OK) {
+		ERROR("no encoder\n");
+		unmap_block(sEncoder);
+		unmap_block(sEncoderPpu);
+		unmap_block(sIommu0);
+	}
+
 	status = install_io_interrupt_handler(sInterrupt, ve_interrupt, NULL, 0);
 	if (status != B_OK) {
 		ERROR("interrupt %" B_PRIu32 ": %s\n", sInterrupt, strerror(status));
@@ -1323,6 +1822,11 @@ ve_uninit_driver(void* cookie)
 	if (sInterruptInstalled)
 		remove_io_interrupt_handler(sInterrupt, ve_interrupt, NULL);
 	sInterruptInstalled = false;
+	if (sEncoderInterruptInstalled) {
+		remove_io_interrupt_handler(kEncoderInterrupt, ve_encoder_interrupt,
+			NULL);
+	}
+	sEncoderInterruptInstalled = false;
 	pool_uninit();
 	unmap_blocks();
 }
