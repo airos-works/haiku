@@ -86,6 +86,8 @@ struct device_lun_s {
 	uint8		device_type;
 	bool		removable;
 	bool		write_protected;
+	bool		card_slot;
+	bool		ejected;
 
 	char		vendor_name[8];
 	char		product_name[16];
