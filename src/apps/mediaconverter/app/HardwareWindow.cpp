@@ -22,6 +22,7 @@
 #include "HardwareCaps.h"
 #include "LavcVideoEncoder.h"
 #include "Messages.h"
+#include "CedarVideoEncoder.h"
 #include "NvencEncoder.h"
 #include "SoftwareEncoders.h"
 
@@ -127,10 +128,14 @@ HardwareWindow::_Fill()
 			else {
 				// NVIDIA formats count once a test picture has come back
 				bool works = false;
-				bool tested = device.backend == kBackendNVENC
-					&& NvencEncoder::Tested(codec, &works);
+				bool tested = (device.backend == kBackendNVENC
+						&& NvencEncoder::Tested(codec, &works))
+					|| (device.backend == kBackendCedar
+						&& CedarVideoEncoder::Tested(codec, &works));
+				bool needsTest = device.backend == kBackendNVENC
+					|| device.backend == kBackendCedar;
 				if (device.CanEncode(codec, 16, 16)) {
-					text = device.backend == kBackendNVENC && !tested
+					text = needsTest && !tested
 						? B_TRANSLATE("✓ (not tested yet) ") : "✓ ";
 				} else if (!device.ready)
 					text = B_TRANSLATE("(no driver) ");

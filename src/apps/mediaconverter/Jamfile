@@ -3,7 +3,8 @@ SubDir HAIKU_TOP src apps mediaconverter ;
 # MediaConverter: the air/OS converter. The engine (engine/) is FFmpeg for
 # reading, decoding, filtering and writing, with the encoders of
 # VideoEncoder: the GPUs' through VA-API (AMD) and NVENC (NVIDIA), the
-# Qualcomm SC8280XP's Iris codec (qcom_video's IrisEncoder), and on the
+# Qualcomm SC8280XP's Iris codec (qcom_video's IrisEncoder), the Allwinner
+# A733's video encoder (sunxi_venc's CedarEncoder), and on the
 # CPU x264, x265 and SVT-AV1 (opened at run time) and FFmpeg's own.
 
 UsePrivateHeaders drivers interface shared media ;
@@ -20,9 +21,14 @@ SEARCH_SOURCE += [ FDirName $(SUBDIR) cli ] ;
 # the qcom_video add-on's encoder, for the Qualcomm SC8280XP's video codec
 SubDirHdrs $(HAIKU_TOP) src add-ons media plugins qcom_video ;
 SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src add-ons media plugins qcom_video ] ;
+# the sunxi_venc encoder, for the Allwinner A733's video encoder
+SubDirHdrs $(HAIKU_TOP) src add-ons media encoders sunxi_venc ;
+SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src add-ons media encoders sunxi_venc ] ;
 
 local engineSources =
 	BitWriter.cpp
+	CedarEncoder.cpp
+	CedarVideoEncoder.cpp
 	DiscSource.cpp
 	IrisDevice.cpp
 	IrisEncoder.cpp

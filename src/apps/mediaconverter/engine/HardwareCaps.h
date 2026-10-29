@@ -87,6 +87,7 @@ private:
 
 			void				_ProbeVaapi();
 			void				_ProbeIris();
+			void				_ProbeCedar();
 			void				_ProbePci();
 			void				_AddTableDevice(uint16 vendor, uint16 device);
 
@@ -101,6 +102,7 @@ private:
 bool	vaapi_encoder_implements(video_codec codec);
 bool	nvenc_encoder_implements(video_codec codec);
 bool	iris_encoder_implements(video_codec codec);
+bool	cedar_encoder_implements(video_codec codec);
 
 
 #endif	// HARDWARE_CAPS_H
