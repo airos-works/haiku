@@ -759,6 +759,18 @@ QcomIrisDecoder::_NextPicture(IrisDecoder::Picture& picture)
 				return status;
 			_MakeAccessUnit((const uint8*)chunk, size);
 			fUnitTime = header.start_time;
+			if (const char* dump = getenv("IRIS_DUMP")) {
+				// (lab: what goes to the codec, as IVF frames)
+				FILE* file = fopen(dump, "ab");
+				if (file != NULL) {
+					uint32 length = fUnit.size();
+					uint64 time = fUnitTime;
+					fwrite(&length, 4, 1, file);
+					fwrite(&time, 8, 1, file);
+					fwrite(fUnit.data(), 1, fUnit.size(), file);
+					fclose(file);
+				}
+			}
 			fUnitPending = true;
 		}
 
