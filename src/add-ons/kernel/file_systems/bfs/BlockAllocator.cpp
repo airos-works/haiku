@@ -907,7 +907,8 @@ BlockAllocator::IsCompletelyOutsideAllowedRange(block_run run) const
 
 	If \a needed is not 0, \a maximum includes a preallocation: the search
 	ends at the first free run of \a needed blocks (or more, up to \a maximum),
-	instead of looking through all groups for one of \a maximum.
+	instead of looking through all groups for one of \a maximum. Like the
+	allocation, \a needed counts in multiples of \a minimum.
 */
 status_t
 BlockAllocator::AllocateBlocks(Transaction& transaction, int32 groupIndex,
@@ -918,6 +919,14 @@ BlockAllocator::AllocateBlocks(Transaction& transaction, int32 groupIndex,
 		return B_BAD_VALUE;
 	if (fAllowedEndBlock > fVolume->NumBlocks())
 		return B_BAD_VALUE;
+
+	// A run shorter than minimum cannot be used (the double indirect range
+	// takes multiples of its base length): stopping at one for what is needed
+	// failed the write with B_DEVICE_FULL on a volume with room to spare.
+	if (needed > 0 && minimum > 1)
+		needed = round_up((uint32)needed, (uint32)minimum);
+	if (needed >= maximum)
+		needed = 0;
 
 	FUNCTION_START(("group = %" B_PRId32 ", start = %" B_PRIu16
 		", maximum = %" B_PRIu16 ", minimum = %" B_PRIu16 "\n",

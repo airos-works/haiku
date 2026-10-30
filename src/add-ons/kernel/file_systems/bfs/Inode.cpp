@@ -2235,13 +2235,17 @@ Inode::_GrowStream(Transaction& transaction, off_t size)
 		}
 
 		block_run run;
-		// When most of the request is preallocation (a small file), the
+		// When most of the request is preallocation for a small file, the
 		// first free run that holds what is needed will do: on a fragmented
 		// volume, looking for room for the whole preallocation scanned the
-		// allocation groups at every file creation.
+		// allocation groups at every file creation. A larger file keeps
+		// looking: written in small steps, it would otherwise be cut into
+		// thousands of short runs.
+		bool smallFile = size < 1 * 1024 * 1024;
 		status_t status = fVolume->Allocate(transaction, this, blocksRequested,
 			run, minimum,
-			blocksNeeded * 2 <= blocksRequested ? blocksNeeded : 0);
+			smallFile && blocksNeeded * 2 <= blocksRequested
+				? blocksNeeded : 0);
 		if (status != B_OK)
 			return status;
 
