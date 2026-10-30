@@ -269,6 +269,10 @@ status_t
 IrisSession::_SetInternal(uint32 type, IrisDevice::Buffer& buffer,
 	size_t size)
 {
+	// (what a codec does not use)
+	if (size == 0)
+		return B_OK;
+
 	status_t status = fDevice.Allocate(size, buffer);
 	if (status != B_OK) {
 		return _Fail(status, "no memory for a %zu byte codec buffer: %s",
