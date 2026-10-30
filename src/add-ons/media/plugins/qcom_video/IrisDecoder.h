@@ -116,6 +116,11 @@ public:
 			void				CopyPacked(const Picture& picture,
 									uint8* target, uint32 stride,
 									color_space space) const;
+			/*!	Failed because the stream's pictures changed (a broadcast going
+				from frames to fields): a new session takes it on from the
+				last key frame. */
+			bool				NeedsNewSession() const
+									{ return fNewSession; }
 			bool				EndOfStreamSent() const
 									{ return fEndOfStream; }
 
@@ -169,6 +174,7 @@ private:
 			uint32				fHintWidth;		// the container's
 			uint32				fHintHeight;
 			bool				fInterlaced;
+			bool				fNewSession;
 
 			IrisDevice::Buffer	fPersist;
 			IrisDevice::Buffer	fBin;
