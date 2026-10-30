@@ -12,11 +12,15 @@ name=$1; shift
 $SSH "mkdir -p $REMOTE"
 scp -F $X399/ssh/config -q $HAIKU/docs/x399-workstation/tests/$name.c \
 	$HAIKU/$PLUGIN/* ws-haiku:$REMOTE/
+# VP9's parser is sunxi_cedar's.
+scp -F $X399/ssh/config -q $HAIKU/src/add-ons/media/plugins/sunxi_cedar/{vp9_parse,vp9_tables,bits}.[ch] \
+	ws-haiku:$REMOTE/
 $SSH "cd $REMOTE \
 	&& NVRM=/boot/home/build/src/mesa-nvk/src/nouveau/vulkan/nvkmd/nvrm \
 	&& O=\$NVRM/open-gpu-kernel-modules \
 	&& gcc -O2 -g -o $name $name.c nvdec_engine.c nvdec_h264.c h264_parse.c \
-		nvdec_hevc.c hevc_parse.c nvdec_convert.c \
+		nvdec_hevc.c hevc_parse.c nvdec_vp9.c nvdec_vp9_tables.c vp9_parse.c \
+		vp9_tables.c bits.c nvdec_convert.c \
 		\$NVRM/nvRmApi.c \
 		-I. -I\$NVRM \
 		-I\$O/src/common/sdk/nvidia/inc \

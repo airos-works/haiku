@@ -1,16 +1,21 @@
-/* H.264 and H.265 on the graphics card.
+/* H.264, H.265 and VP9 on the graphics card.
  *
  * Haiku picks one decoder for a format, by add-on directory, so this one takes
  * H.264 away from libavcodec wherever it is installed. It decodes what the
  * card's engine can - eight bit 4:2:0, progressive - and refuses the rest
  * rather than producing a wrong picture.
  *
- * H.265 is not offered to the media kit, because a stream this cannot decode
- * would then not play at all: a program that wants it - one that falls back
- * to software on its own - instantiates the decoder and sets it up with an
- * H.265 format. Main and Main 10 are decoded. Ten-bit pictures can be had as
- * they are, as NVDEC_COLOR_SPACE_P010. Any picture can be had as
- * NVDEC_COLOR_SPACE_NV12, without a conversion.
+ * H.265 and VP9 are not offered to the media kit, because a stream this
+ * cannot decode would then not play at all: a program that wants them - one
+ * that falls back to software on its own - instantiates the decoder and sets
+ * it up with an H.265 or VP9 format. H.265 Main and Main 10 and VP9 profile 0
+ * are decoded (VP9 profile 2 not on the GP104, see nvdec_vp9.h). Ten-bit
+ * pictures can be had as they are, as NVDEC_COLOR_SPACE_P010. Any picture can
+ * be had as NVDEC_COLOR_SPACE_NV12, without a conversion.
+ *
+ * NewDecoder() knows indexes 0 to 2 (H.264, H.265, VP9 - any of them takes
+ * any of the codecs) and returns NULL for the rest, so that a program can
+ * tell an add-on that decodes VP9 from one before it: index 2 is VP9's.
  */
 #ifndef NVDEC_PLUGIN_H
 #define NVDEC_PLUGIN_H
@@ -21,6 +26,7 @@ extern "C" {
 #include "nvdec_convert.h"
 #include "nvdec_h264.h"
 #include "nvdec_hevc.h"
+#include "nvdec_vp9.h"
 }
 
 /* Not one of Haiku's: a plane of sixteen-bit luma samples with the value in
@@ -30,7 +36,7 @@ extern "C" {
 
 /* Not one of Haiku's either: NV12, a plane of eight-bit luma samples, then
  * one of Cb and Cr in pairs with half as many lines, both bytes_per_row bytes
- * a line - what a graphics card takes as a video texture. H.264 and H.265;
+ * a line - what a graphics card takes as a video texture. Every codec;
  * ten-bit pictures keep their top eight bits. */
 #define NVDEC_COLOR_SPACE_NV12	((color_space)0x4e563132)	/* 'NV12' */
 
@@ -65,8 +71,10 @@ private:
 
 			NvdecEngine*		fEngine;
 			bool				fHevc;
+			bool				fVp9;
 			NvdecH264*			fDecoder;
 			NvdecHevc*			fHevcDecoder;
+			NvdecVp9*			fVp9Decoder;
 			char				fReason[256];
 
 			/* A chunk from an MPEG-4 file is a run of length-prefixed units

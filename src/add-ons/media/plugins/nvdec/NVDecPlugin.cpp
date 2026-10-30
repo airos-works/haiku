@@ -13,6 +13,10 @@
  * with it, so this is how a format is recognised without linking to it. */
 #define CODEC_ID_H264	27
 #define CODEC_ID_HEVC	173
+#define CODEC_ID_VP9	167
+
+/* The decoders NewDecoder() has: H.264, H.265 and VP9 (see NVDecPlugin.h). */
+#define DECODER_COUNT	3
 
 #define ACCESS_UNIT_START	(1 << 20)
 
@@ -26,8 +30,10 @@ NVDecDecoder::NVDecDecoder()
 	:
 	fEngine(NULL),
 	fHevc(false),
+	fVp9(false),
 	fDecoder(NULL),
 	fHevcDecoder(NULL),
+	fVp9Decoder(NULL),
 	fLengthSize(0),
 	fAccessUnit(NULL),
 	fAccessUnitSize(0),
@@ -54,6 +60,8 @@ NVDecDecoder::~NVDecDecoder()
 		nvdecH264Destroy(fDecoder);
 	if (fHevcDecoder != NULL)
 		nvdecHevcDestroy(fHevcDecoder);
+	if (fVp9Decoder != NULL)
+		nvdecVp9Destroy(fVp9Decoder);
 	if (fEngine != NULL)
 		nvdecClose(fEngine);
 	free(fAccessUnit);
@@ -64,6 +72,12 @@ NVDecDecoder::~NVDecDecoder()
 void
 NVDecDecoder::GetCodecInfo(media_codec_info* info)
 {
+	if (fVp9) {
+		strlcpy(info->short_name, "nvdec vp9", sizeof(info->short_name));
+		strlcpy(info->pretty_name, "VP9 on the graphics card (NVDEC)",
+			sizeof(info->pretty_name));
+		return;
+	}
 	if (fHevc) {
 		strlcpy(info->short_name, "nvdec hevc", sizeof(info->short_name));
 		strlcpy(info->pretty_name, "H.265 on the graphics card (NVDEC)",
@@ -85,7 +99,9 @@ NVDecDecoder::GetCodecInfo(media_codec_info* info)
 status_t
 NVDecDecoder::_ReadParameterSets(const uint8* data, size_t size)
 {
-	if (size == 0)
+	/* A VP9 stream's codec private data, if any (a vpcC record), says
+	 * nothing the frames do not. */
+	if (size == 0 || fVp9)
 		return B_OK;
 
 	if (fHevc) {
@@ -186,6 +202,8 @@ NVDecDecoder::Setup(media_format* ioEncodedFormat, const void* infoBuffer,
 	}
 	if (description.u.misc.codec == CODEC_ID_HEVC)
 		fHevc = true;
+	else if (description.u.misc.codec == CODEC_ID_VP9)
+		fVp9 = true;
 	else if (description.u.misc.codec != CODEC_ID_H264)
 		return B_ERROR;
 
@@ -195,11 +213,13 @@ NVDecDecoder::Setup(media_format* ioEncodedFormat, const void* infoBuffer,
 		fprintf(stderr, "nvdec: the card's decoder is not available: %s\n", fReason);
 		return B_ERROR;
 	}
-	if (fHevc)
+	if (fVp9)
+		fVp9Decoder = nvdecVp9Create(fEngine, fReason, sizeof(fReason));
+	else if (fHevc)
 		fHevcDecoder = nvdecHevcCreate(fEngine, fReason, sizeof(fReason));
 	else
 		fDecoder = nvdecH264Create(fEngine, fReason, sizeof(fReason));
-	if (fDecoder == NULL && fHevcDecoder == NULL) {
+	if (fDecoder == NULL && fHevcDecoder == NULL && fVp9Decoder == NULL) {
 		nvdecClose(fEngine);
 		fEngine = NULL;
 		return B_NO_MEMORY;
@@ -240,7 +260,7 @@ NVDecDecoder::NegotiateOutputFormat(media_format* ioDecodedFormat)
 	uint32 wanted = ioDecodedFormat->u.raw_video.display.format;
 	if (wanted == B_YCbCr422)
 		fColorSpace = B_YCbCr422;
-	else if (wanted == (uint32)NVDEC_COLOR_SPACE_P010 && fHevc)
+	else if (wanted == (uint32)NVDEC_COLOR_SPACE_P010 && (fHevc || fVp9))
 		fColorSpace = NVDEC_COLOR_SPACE_P010;
 	else if (wanted == (uint32)NVDEC_COLOR_SPACE_NV12)
 		fColorSpace = NVDEC_COLOR_SPACE_NV12;
@@ -267,6 +287,8 @@ NVDecDecoder::SeekedTo(int64 frame, bigtime_t time)
 		nvdecH264Reset(fDecoder);
 	if (fHevcDecoder != NULL)
 		nvdecHevcReset(fHevcDecoder);
+	if (fVp9Decoder != NULL)
+		nvdecVp9Reset(fVp9Decoder);
 	fAccessUnitUsed = 0;
 	fSentParameterSets = false;
 	fFrameNumber = frame;
@@ -370,7 +392,8 @@ bool
 NVDecDecoder::_DecodeUnit(const uint8* data, size_t size, bigtime_t time)
 {
 	bigtime_t at = system_time();
-	bool result = fHevc ? nvdecHevcDecode(fHevcDecoder, data, size, time)
+	bool result = fVp9 ? nvdecVp9Decode(fVp9Decoder, data, size, time)
+		: fHevc ? nvdecHevcDecode(fHevcDecoder, data, size, time)
 		: nvdecH264Decode(fDecoder, data, size, time);
 	sEngineTime += system_time() - at;
 	sTimedUnits++;
@@ -381,6 +404,8 @@ NVDecDecoder::_DecodeUnit(const uint8* data, size_t size, bigtime_t time)
 bool
 NVDecDecoder::_NextFrame(NvdecFrame* frame)
 {
+	if (fVp9)
+		return nvdecVp9NextFrame(fVp9Decoder, frame);
 	if (fHevc)
 		return nvdecHevcNextFrame(fHevcDecoder, frame);
 	return nvdecH264NextFrame(fDecoder, frame);
@@ -390,7 +415,9 @@ NVDecDecoder::_NextFrame(NvdecFrame* frame)
 void
 NVDecDecoder::_ReleaseFrame(const NvdecFrame& frame)
 {
-	if (fHevc)
+	if (fVp9)
+		nvdecVp9ReleaseFrame(fVp9Decoder, &frame);
+	else if (fHevc)
 		nvdecHevcReleaseFrame(fHevcDecoder, &frame);
 	else
 		nvdecH264ReleaseFrame(fDecoder, &frame);
@@ -400,7 +427,9 @@ NVDecDecoder::_ReleaseFrame(const NvdecFrame& frame)
 void
 NVDecDecoder::_DrainAll()
 {
-	if (fHevc)
+	if (fVp9)
+		nvdecVp9DrainAll(fVp9Decoder);
+	else if (fHevc)
 		nvdecHevcDrainAll(fHevcDecoder);
 	else
 		nvdecH264DrainAll(fDecoder);
@@ -410,6 +439,8 @@ NVDecDecoder::_DrainAll()
 const char*
 NVDecDecoder::_LastError()
 {
+	if (fVp9)
+		return nvdecVp9LastError(fVp9Decoder);
 	if (fHevc)
 		return nvdecHevcLastError(fHevcDecoder);
 	return nvdecH264LastError(fDecoder);
@@ -420,7 +451,7 @@ status_t
 NVDecDecoder::Decode(void* buffer, int64* frameCount, media_header* mediaHeader,
 	media_decode_info* info)
 {
-	if (fDecoder == NULL && fHevcDecoder == NULL)
+	if (fDecoder == NULL && fHevcDecoder == NULL && fVp9Decoder == NULL)
 		return B_NO_INIT;
 
 	if (!fSentParameterSets && fParameterSetsSize > 0) {
@@ -472,6 +503,11 @@ NVDecDecoder::Decode(void* buffer, int64* frameCount, media_header* mediaHeader,
 			continue;
 		if (!_DecodeUnit(fAccessUnit, fAccessUnitUsed, chunkHeader.start_time)) {
 			fprintf(stderr, "nvdec: %s\n", _LastError());
+			/* A VP9 stream the engine does not decode (profile 1 or 3,
+			 * twelve bits, larger than it goes) will not get better: the
+			 * caller should go elsewhere with it. */
+			if (fVp9 && nvdecVp9Refused(fVp9Decoder))
+				return B_NOT_SUPPORTED;
 			/* One bad picture should not end the film. */
 			continue;
 		}
@@ -482,6 +518,10 @@ NVDecDecoder::Decode(void* buffer, int64* frameCount, media_header* mediaHeader,
 Decoder*
 NVDecPlugin::NewDecoder(uint index)
 {
+	/* Programs that load the add-on by name ask for the decoder of a codec
+	 * by its index, and take a NULL as "this add-on has none". */
+	if (index >= DECODER_COUNT)
+		return NULL;
 	return new(std::nothrow) NVDecDecoder();
 }
 

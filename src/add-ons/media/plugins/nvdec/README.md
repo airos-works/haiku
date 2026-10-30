@@ -1,10 +1,10 @@
 # The graphics card's video decoder, as a media add-on
 
 The GeForce cards this fork runs on have a video engine - NVDEC - that decodes
-H.264 and H.265 without the processor doing any of the arithmetic. This add-on
-offers H.264 to Haiku's media kit, so that any program that plays video gets
-it: the file is opened as usual, and the pictures come back from the card.
-H.265 is there for programs that ask for it (see below).
+H.264, H.265 and VP9 without the processor doing any of the arithmetic. This
+add-on offers H.264 to Haiku's media kit, so that any program that plays video
+gets it: the file is opened as usual, and the pictures come back from the card.
+H.265 and VP9 are there for programs that ask for them (see below).
 
 | | |
 | --- | --- |
@@ -13,6 +13,8 @@ H.265 is there for programs that ask for it (see below).
 | `nvdec_h264.c` | The bookkeeping the engine does not do - which pictures are still needed as references, what order they are shown in, which surface each one is in. |
 | `hevc_parse.c` | The same for H.265: parameter sets, and slice headers as far as the reference picture sets, whose length in bits the engine is told so it can step over them. |
 | `nvdec_hevc.c` | H.265's reference picture sets, picture order and output ("bumping") process, and the picture setup. |
+| `nvdec_vp9.c` | VP9: the eight reference slots, the engine's probability table and symbol counts, the segment map and motion vector buffers, and the frame setup. The headers, the probabilities and their adaptation are sunxi_cedar's parser (`../sunxi_cedar/vp9_parse.c`), which this shares. |
+| `nvdec_vp9_tables.c` | VP9's key frame probabilities, from libvpx (BSD licence). |
 | `nvdec_convert.c` | Out of the card's arrangement and into pixels, in bands, across as many processors as there are. |
 | `NVDecPlugin.cpp` | The media kit's side of it. |
 
@@ -33,21 +35,38 @@ many lines, both `bytes_per_row` (the width) a line - what the engine writes,
 untiled, with no colour conversion, and what a graphics card takes as a video
 texture. Ten-bit pictures keep their top eight bits.
 
+VP9 profile 0 - eight-bit 4:2:0 - from 65x65 up to 4096x2304 on Pascal. The
+engine reads the tile data; the uncompressed and compressed headers are parsed
+here, the probabilities the engine decodes with are written for it, and after
+each frame its symbol counts are read back for the backward adaptation, as
+libvpx does it. Superframes are split; a chunk shows at most one frame, the
+last one shown (as libvpx: a spatial SVC superframe shows its top layer).
+The GTX 1070's GP104 does not decode ten-bit VP9 (profile 2): asked to, it
+keeps eight bits of every sample, so such streams are refused at their first
+frame, as are profiles 1 and 3 and frames 64 pixels or less wide or tall (the
+engine reports error 3 for those, and never finishes the inter frames of one 8
+or 10 pixels across). `NVDEC_VP9_TEN_BIT=1` lets ten-bit streams through for
+a chip said to decode them (GP102, GP107, Turing); that is not measured.
+
 Haiku picks one decoder for a format, by add-on directory, so this add-on takes
 H.264 away from libavcodec wherever it is installed and `/dev/nvidiactl`
 exists (on a machine without nvidia_rm or an NVIDIA card it offers nothing, so
 the air/OS x86_64 image can carry it everywhere). A stream it refuses will
 not fall back: it will not play. That is the reason for refusing narrowly and
-loudly rather than trying - and the reason H.265 is not offered to the media
-kit at all: a program that wants it instantiates the decoder itself, sets it
-up with an H.265 format, and keeps libavcodec for what it refuses. airTime
-does.
+loudly rather than trying - and the reason H.265 and VP9 are not offered to
+the media kit at all: a program that wants them instantiates the decoder
+itself, sets it up with an H.265 or VP9 format, and keeps libavcodec for what
+it refuses. airTime and Summit do. `NewDecoder()` makes decoders for indexes 0
+to 2 - H.264, H.265, VP9; any of them takes any of the three codecs - and
+returns NULL for the rest, so that a program can tell this add-on from one
+before VP9, which made a decoder for every index.
 
 ## Building it
 
 It is not built with the rest of the tree, because it needs NVIDIA's resource
 manager headers, which live in the NVK tree (airos-works/mesa-nvk, branch
-`airos-nvk-r2`). `build-cross.sh` cross-builds it from a Haiku build
+`airos-nvk-r2`), and it compiles three of sunxi_cedar's files (VP9's parser,
+its tables and the bit reader). `build-cross.sh` cross-builds it from a Haiku build
 directory and that tree (the air/OS CI does, for the x86_64 image);
 `docs/x399-workstation/tools/build-nvdec-plugin.sh` builds it on the
 workstation and installs it into the user's non-packaged add-ons.
@@ -69,6 +88,20 @@ no deblocking or SAO, six references, a cropped 1080p - and 240 pictures of a
 (`tests/nvdechevcstream.c`). A 4K ten-bit picture takes 8 ms in the engine and
 6 ms to copy out as P010: the film plays at its 24 pictures a second with time
 to spare.
+
+For VP9, 35 of libvpx's test vectors - sizes from 155x115 to 1920x1080 and
+odd ones, resizing with scaled references, intra-only frames,
+show_existing_frame, superframes, spatial SVC, tiles of 1 to 4 columns and
+rows, frame-parallel streams, segmentation with temporal maps, loop filter
+deltas, delta-q, lossless, bilinear filtering - and 2,340 frames of five YouTube streams (itags 248,
+271, 303, 308 and 315, 818p24 to 2160p60) decode byte for byte as
+libavcodec does (`tests/nvdecvp9stream.c` against `tests/nvdecvp9ref.py`),
+save one pixel off by one in each of the last five frames of the 66x66
+vector. Through the add-on's NV12 output, 300 pictures each of a 1080p60 and
+an 818p24 YouTube stream match libavcodec's NV12 MD5s. The engine takes 2.4
+ms for a 1080p60 frame and 7.9 ms for a 2160p60 one. The filter type is the
+one thing not as nvdec_drv.h suggests: the engine wants it as the header
+codes it (smooth 0, regular 1), not in libvpx's order.
 
 Two things about H.265 are not as the header that describes the engine says:
 the maximum transform skip size is sent as its log2, not log2 minus two, and

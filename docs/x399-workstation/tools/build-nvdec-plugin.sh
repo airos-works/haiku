@@ -21,6 +21,9 @@ INSTALL="mkdir -p $TARGET && cp nvdec $TARGET/.nvdec.new && mv $TARGET/.nvdec.ne
 
 $SSH "mkdir -p $REMOTE"
 scp -F $X399/ssh/config -q $HAIKU/$PLUGIN/* ws-haiku:$REMOTE/
+# VP9's parser is sunxi_cedar's.
+scp -F $X399/ssh/config -q $HAIKU/src/add-ons/media/plugins/sunxi_cedar/{vp9_parse,vp9_tables,bits}.[ch] \
+	ws-haiku:$REMOTE/
 $SSH "cd $REMOTE \
 	&& NVRM=/boot/home/build/src/mesa-nvk/src/nouveau/vulkan/nvkmd/nvrm \
 	&& O=\$NVRM/open-gpu-kernel-modules \
@@ -32,12 +35,13 @@ $SSH "cd $REMOTE \
 		-I/boot/home/build/src/mesa-nvk/src/nouveau/headers/nvidia \
 		-I/boot/system/develop/headers/private/media\" \
 	&& for f in nvdec_engine nvdec_h264 h264_parse nvdec_hevc hevc_parse \
-			nvdec_convert; do \
+			nvdec_vp9 nvdec_vp9_tables vp9_parse vp9_tables bits nvdec_convert; do \
 		gcc -O2 -g -fPIC -c -o \$f.o \$f.c \$INC || exit 1; \
 	done \
 	&& gcc -O2 -g -fPIC -c -o nvRmApi.o \$NVRM/nvRmApi.c \$INC \
 	&& g++ -O2 -g -fPIC -c -o NVDecPlugin.o NVDecPlugin.cpp \$INC \
 	&& g++ -shared -o nvdec NVDecPlugin.o nvdec_engine.o nvdec_h264.o \
-		h264_parse.o nvdec_hevc.o hevc_parse.o nvdec_convert.o nvRmApi.o \
+		h264_parse.o nvdec_hevc.o hevc_parse.o nvdec_vp9.o nvdec_vp9_tables.o \
+		vp9_parse.o vp9_tables.o bits.o nvdec_convert.o nvRmApi.o \
 		-lbe -lmedia \
 	&& $INSTALL"

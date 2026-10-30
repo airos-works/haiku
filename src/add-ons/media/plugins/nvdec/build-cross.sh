@@ -17,6 +17,8 @@ NVK=$(realpath "$2")
 OUT=$(realpath -m "$3")
 SRC=$(dirname "$(realpath "$0")")
 HAIKU=$(realpath "$SRC/../../../../..")
+# VP9's headers are read by sunxi_cedar's parser, which this shares.
+CEDAR=$(realpath "$SRC/../sunxi_cedar")
 NVRM=$NVK/src/nouveau/vulkan/nvkmd/nvrm
 [ -f "$NVRM/nvRmApi.c" ] || { echo "no nvRmApi.c in $NVRM" >&2; exit 1; }
 O=$(realpath "${OGKM_SRC:-$NVRM/open-gpu-kernel-modules}")
@@ -28,7 +30,7 @@ GCC_SYSLIBS=$(ls -d "$BUILD"/build_packages/gcc_syslibs_devel-*)
 GCC_SYSLIBS_RUNTIME=$(ls -d "$BUILD"/build_packages/gcc_syslibs-*)
 GCCLIB=$(dirname "$($TOOLS-gcc -print-libgcc-file-name)")
 
-INCLUDES=(-I"$SRC" -I"$NVRM" -I"$O/src/common/sdk/nvidia/inc"
+INCLUDES=(-I"$SRC" -I"$CEDAR" -I"$NVRM" -I"$O/src/common/sdk/nvidia/inc"
 	-I"$O/src/nvidia/arch/nvalloc/common/inc" -I"$O/src/nvidia/arch/nvalloc/unix/include"
 	-I"$O/src/nvidia/inc/kernel" -I"$NVK/src/nouveau/headers/nvidia"
 	-I"$GCC_SYSLIBS/develop/headers/c++"
@@ -46,8 +48,12 @@ FLAGS=(-O2 -g -fPIC -nostdinc -D_DEFAULT_SOURCE "${INCLUDES[@]}")
 OBJDIR=$OUT/.obj-nvdec
 mkdir -p "$OBJDIR" "$OUT/add-ons/media/plugins"
 pids=()
-for f in nvdec_engine nvdec_h264 h264_parse nvdec_hevc hevc_parse nvdec_convert; do
+for f in nvdec_engine nvdec_h264 h264_parse nvdec_hevc hevc_parse nvdec_vp9 \
+		nvdec_vp9_tables nvdec_convert; do
 	$TOOLS-gcc "${FLAGS[@]}" -c "$SRC/$f.c" -o "$OBJDIR/$f.o" & pids+=($!)
+done
+for f in vp9_parse vp9_tables bits; do
+	$TOOLS-gcc "${FLAGS[@]}" -c "$CEDAR/$f.c" -o "$OBJDIR/cedar_$f.o" & pids+=($!)
 done
 $TOOLS-gcc "${FLAGS[@]}" -c "$NVRM/nvRmApi.c" -o "$OBJDIR/nvRmApi.o" & pids+=($!)
 $TOOLS-g++ "${FLAGS[@]}" -c "$SRC/NVDecPlugin.cpp" -o "$OBJDIR/NVDecPlugin.o" & pids+=($!)
