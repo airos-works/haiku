@@ -37,6 +37,13 @@ Application iris_decode :
 	: be [ TargetLibsupc++ ] [ TargetLibstdc++ ]
 ;
 
+UsePrivateHeaders media ;
+
+Application plugin_decode :
+	plugin_decode.cpp
+	: be media [ TargetLibsupc++ ] [ TargetLibstdc++ ]
+;
+
 Application display_layout :
 	display_layout.cpp
 	: be [ TargetLibsupc++ ]

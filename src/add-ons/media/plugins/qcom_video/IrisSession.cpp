@@ -123,6 +123,14 @@ IrisSession::_Send(const uint32* packet)
 			fprintf(stderr, " %#" B_PRIx32, packet[i]);
 		fprintf(stderr, "\n");
 	}
+	static const bool sTraceAll = getenv("IRIS_TRACE_ALL") != NULL;
+	if (sTraceAll) {
+		// (lab: every packet, to compare runs)
+		fprintf(stderr, "iris> %" B_PRId64 ":", system_time());
+		for (uint32 i = 0; i < packet[0] / 4 && i < 24; i++)
+			fprintf(stderr, " %" B_PRIx32, i == 2 ? 0 : packet[i]);
+		fprintf(stderr, "\n");
+	}
 	status_t status = fDevice.Send(packet);
 	if (status != B_OK)
 		return _Fail(status, "cannot send to the firmware: %s",
@@ -231,6 +239,13 @@ IrisSession::_Pump(bigtime_t timeout)
 		return B_TIMED_OUT;
 	if (status != B_OK)
 		return status;
+	static const bool sTraceAll = getenv("IRIS_TRACE_ALL") != NULL;
+	if (sTraceAll) {
+		fprintf(stderr, "iris< %" B_PRId64 ":", system_time());
+		for (uint32 i = 0; i < size / 4 && i < 24; i++)
+			fprintf(stderr, " %" B_PRIx32, i == 2 ? 0 : message[i]);
+		fprintf(stderr, "\n");
+	}
 	return _Handle(message, size);
 }
 
