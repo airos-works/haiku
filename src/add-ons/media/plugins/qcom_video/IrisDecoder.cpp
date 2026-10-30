@@ -46,6 +46,8 @@ static const uint32 kInputBuffers = 4;
 // beyond the firmware's minimum: what the caller holds and what waits
 // to be taken
 static const uint32 kExtraOutputs = 4;
+// the widest fields the firmware copies out linearly (see _HandleEvent())
+static const uint32 kMaxFieldWidth = 1440;
 
 
 #define ALIGN(x, a)			((((x) + (a) - 1) / (a)) * (a))
@@ -287,8 +289,7 @@ static uint32
 ubwc_size(uint32 width, uint32 height, bool interlaced = false)
 {
 	// Fields are two of those, each with its own meta data (Qualcomm's
-	// msm_media_info.h), somewhat more than a frame of the same size; a
-	// reference too small for them took the SoC down.
+	// msm_media_info.h), somewhat more than a frame of the same size.
 	if (interlaced)
 		return 2 * ubwc_size(width, (height + 1) / 2) + 64 * 1024;
 
@@ -1127,12 +1128,16 @@ IrisDecoder::_HandleEvent(const uint32* packet, size_t size)
 		return _Fail(B_NOT_SUPPORTED,
 			"mixed or nine bit pictures are not supported");
 	}
-	// The firmware stopped answering (a system error, for good) when it
-	// went on with fields, even with references of the size Qualcomm gives
-	// fields; IRIS_INTERLACED lets the lab try again.
-	if (progressive == 0 && getenv("IRIS_INTERLACED") == NULL) {
+	// Fields decode, but the post processor's linear copies of fields more
+	// than 1440 wide assert in the firmware (vfw_h264_hw_if.c:1193, with
+	// any work mode, route or buffer size; 1600 failed, and 1920 decodes
+	// only into the UBWC references): those go on in software. Refused
+	// here, before the firmware goes on, the codec stays up.
+	if (progressive == 0 && width > kMaxFieldWidth) {
 		fFailed = true;
-		return _Fail(B_NOT_SUPPORTED, "interlaced pictures are not supported");
+		return _Fail(B_NOT_SUPPORTED,
+			"interlaced pictures wider than %" B_PRIu32 " are not supported",
+			kMaxFieldWidth);
 	}
 	if (width == 0 || height == 0) {
 		fFailed = true;
@@ -1154,6 +1159,13 @@ IrisDecoder::_HandleEvent(const uint32* packet, size_t size)
 		fEventCrop[0] = fEventCrop[1] = 0;
 		fEventCrop[2] = width;
 		fEventCrop[3] = height;
+	}
+	// Of fields, the firmware crops what is cropped from each field only
+	// once (728 of 736 rows for 720i, 1084 of 1088 for 1080i).
+	if (progressive == 0 && fEventCrop[1] + fEventCrop[3] < height) {
+		uint32 bottom = height - fEventCrop[1] - fEventCrop[3];
+		if (bottom * 2 <= height - fEventCrop[1])
+			fEventCrop[3] = height - fEventCrop[1] - bottom * 2;
 	}
 	fEventMinCount = minCount != 0 ? minCount : 4;
 	// VP9 asks for 64 (850 MB of references at 4K); its eight reference
@@ -1337,8 +1349,11 @@ IrisDecoder::_StartOutput()
 		status = _SetProperty(HFI_PROPERTY_PARAM_WORK_MODE,
 			small || fInterlaced || fCodec == MPEG2 ? 1 : 2);
 	}
-	if (status == B_OK)
-		status = _SetProperty(HFI_PROPERTY_PARAM_WORK_ROUTE, kVppPipes);
+	if (status == B_OK) {
+		// fields and MPEG-2 on one pipe (Qualcomm's msm_vidc for IRIS2)
+		status = _SetProperty(HFI_PROPERTY_PARAM_WORK_ROUTE,
+			fInterlaced || fCodec == MPEG2 ? 1 : kVppPipes);
+	}
 	if (status == B_OK) {
 		uint32 packet[3] = { 12, HFI_CMD_SESSION_CONTINUE, fSession };
 		status = _Send(packet);
