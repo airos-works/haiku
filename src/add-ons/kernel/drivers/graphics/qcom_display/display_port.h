@@ -30,6 +30,14 @@ public:
 				// B_DEVICE_NOT_FOUND: its clocks are off
 
 			bool				HotPlug();
+			uint32				HotPlugStatus();
+				// REG_DP_DP_HPD_INT_STATUS: the HPD state, latched events
+			status_t			SinkCount(uint8& count);
+				// DPCD SINK_COUNT: what a branch device (the board's HDMI
+				// bridge) has downstream
+			status_t			ProbeDdc();
+				// one byte of an EDID on the sink's DDC: B_OK when a
+				// monitor answers
 			status_t			ReadDpcd(uint32 address, uint8* buffer,
 									size_t size);
 			status_t			WriteDpcd(uint32 address, const uint8* buffer,

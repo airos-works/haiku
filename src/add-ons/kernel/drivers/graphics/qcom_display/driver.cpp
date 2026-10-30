@@ -86,6 +86,10 @@ struct display_info {
 	bool			usbcRunning[kUsbcConnectors];
 	bool			usbcForced[kUsbcConnectors];
 	qcom_usbc_ports_module_info* usbcPorts;
+	// a monitor behind the HDMI bridge (hdmi_sink_present()); the bridge
+	// itself is always there
+	bool			hdmiPresent;
+	uint32			hdmiProbe;		// the last probe's signals, for the log
 	thread_id		hotPlugThread;
 	volatile bool	quit;
 
@@ -206,6 +210,8 @@ static status_t connect_usbc(display_info* info, uint32 connector,
 	const qcom_usbc_port* port = NULL);
 static status_t power_usbc(display_info* info, uint32 connector,
 	const qcom_usbc_port* port);
+static bool hdmi_sink_present(display_info* info);
+static bool update_hdmi_output(display_info* info);
 
 
 static void
@@ -237,7 +243,8 @@ init_outputs(display_info* info)
 				stream.pixel_clock = timing.pixel_clock;
 				timing = stream;
 			}
-			if (info->port->HotPlug()) {
+			info->hdmiPresent = hdmi_sink_present(info);
+			if (info->hdmiPresent) {
 				uint32 length = 0;
 				status_t status = info->port->ReadEdid(output.edid, &length);
 				if (status == B_OK)
@@ -261,8 +268,8 @@ init_outputs(display_info* info)
 			output.native_width, output.native_height, timing.pixel_clock,
 			timing.h_sync_start, timing.h_sync_end, timing.h_total,
 			timing.v_sync_start, timing.v_sync_end, timing.v_total,
-			info->port != NULL && info->port->HotPlug()
-				? "hot plug" : "no hot plug", output.edid_length);
+			info->hdmiPresent ? "a monitor" : "no monitor",
+			output.edid_length);
 		if (output.edid_length >= 128) {
 			// the monitor's name, from the descriptors
 			for (uint32 d = 54; d + 18 <= 126; d += 18) {
@@ -292,8 +299,10 @@ init_outputs(display_info* info)
 	// reports a DisplayPort sink on them (hot_plug_thread()): they show the
 	// HDMI output's mode, trained to the sink if one answers. The lab's
 	// "usbc_dp0 forced" ("usbc_dp1 ...") has one connected from the start.
-	if (info->dpu == NULL || info->dpu->Interface() != 6)
+	if (info->dpu == NULL || info->dpu->Interface() != 6) {
+		info->hdmiPresent = true;
 		return;
+	}
 	static const uint32 kIds[] = {QCOM_DISPLAY_OUTPUT_DP0,
 		QCOM_DISPLAY_OUTPUT_DP1};
 	for (uint32 connector = 0; connector < kUsbcConnectors; connector++) {
@@ -311,6 +320,107 @@ init_outputs(display_info* info)
 		}
 	}
 	shared.output_count = 1 + kUsbcConnectors;
+	update_hdmi_output(info);
+}
+
+
+/*!	Whether a monitor is behind the board's HDMI bridge. The CH7218A is
+	there whether or not a monitor is plugged in, so its HPD alone does not
+	tell: it also has to count a sink downstream (DPCD SINK_COUNT), and the
+	monitor's EDID has to answer on its DDC. Each probe's signals go to the
+	log when they change. Caller holds the lock, or nobody else runs yet.
+*/
+static bool
+hdmi_sink_present(display_info* info)
+{
+	if (info->port == NULL)
+		return true;
+	uint32 hpd = info->port->HotPlugStatus();
+	bool hotPlug = (hpd & 0x40000000) != 0;
+	uint8 sinkCount = 0;
+	status_t sinkStatus = hotPlug ? info->port->SinkCount(sinkCount)
+		: B_DEV_NOT_READY;
+	status_t ddc = hotPlug && sinkStatus == B_OK && sinkCount > 0
+		? info->port->ProbeDdc() : B_DEV_NOT_READY;
+	bool present = hotPlug && sinkStatus == B_OK && sinkCount > 0
+		&& ddc == B_OK;
+
+	uint32 probe = (hpd & 0xe000000f) ^ (sinkStatus == B_OK ? sinkCount << 8
+		: 0xff00) ^ (ddc == B_OK ? 0x10000 : 0);
+	if (probe != info->hdmiProbe || info->hdmiProbe == 0) {
+		info->hdmiProbe = probe;
+		INFO("HDMI-1: bridge HPD %#" B_PRIx32 ", sink count %u (%s), DDC %s: "
+			"%s\n", hpd, sinkCount, strerror(sinkStatus), strerror(ddc),
+			present ? "a monitor" : "no monitor");
+	}
+	return present;
+}
+
+
+/*!	Output 0 is connected while a monitor is behind the HDMI bridge; while
+	no output has one, it stands in for a display (headless) so that the
+	desktop always has one. Returns whether that changed. Caller holds the
+	lock, or nobody else runs yet.
+*/
+static bool
+update_hdmi_output(display_info* info)
+{
+	qcom_display_shared_info& shared = *info->shared;
+	qcom_display_output& output = shared.outputs[0];
+	bool other = false;
+	for (uint32 i = 1; i < shared.output_count; i++) {
+		if ((shared.outputs[i].flags & QCOM_DISPLAY_OUTPUT_CONNECTED) != 0)
+			other = true;
+	}
+	uint32 flags = info->hdmiPresent ? QCOM_DISPLAY_OUTPUT_CONNECTED
+		: !other ? QCOM_DISPLAY_OUTPUT_CONNECTED | QCOM_DISPLAY_OUTPUT_VIRTUAL
+		: 0;
+	uint32 old = output.flags
+		& (QCOM_DISPLAY_OUTPUT_CONNECTED | QCOM_DISPLAY_OUTPUT_VIRTUAL);
+	if (flags == old)
+		return false;
+
+	// app_server lays the outputs out again
+	output.flags = flags;
+	if (!info->hdmiPresent)
+		output.edid_length = 0;
+	if (info->dpu != NULL && (flags & QCOM_DISPLAY_OUTPUT_VIRTUAL) == 0)
+		output.timing = to_shared(info->dpu->Timing());
+	INFO("HDMI-1: %s\n", info->hdmiPresent ? "a monitor"
+		: !other ? "no monitor anywhere: standing in for one (headless)"
+		: "no monitor");
+	return true;
+}
+
+
+/*!	A monitor plugged into the HDMI port, or unplugged: its EDID read, the
+	outputs' state for app_server. Caller holds the lock. */
+static bool
+check_hdmi(display_info* info)
+{
+	bool present = hdmi_sink_present(info);
+	if (present == info->hdmiPresent)
+		return false;
+	// once more, so that a glitch does not count
+	snooze(100000);
+	if (hdmi_sink_present(info) != present)
+		return false;
+
+	info->hdmiPresent = present;
+	qcom_display_output& output = info->shared->outputs[0];
+	if (present) {
+		uint32 length = 0;
+		status_t status = info->port->ReadEdid(output.edid, &length);
+		output.edid_length = status == B_OK ? length : 0;
+		uint8 link[3] = {};
+		info->port->ReadDpcd(0x202, link, sizeof(link));
+		INFO("HDMI-1: monitor plugged in, EDID %s (%" B_PRIu32 " bytes); "
+			"link lanes %#x %#x, align %#x\n", strerror(status),
+			output.edid_length, link[0], link[1], link[2]);
+	} else
+		INFO("HDMI-1: monitor unplugged\n");
+	update_hdmi_output(info);
+	return true;
 }
 
 
@@ -324,6 +434,7 @@ connect_usbc(display_info* info, uint32 connector,
 	if (status != B_OK)
 		return status;
 	info->shared->outputs[1 + connector].flags |= QCOM_DISPLAY_OUTPUT_CONNECTED;
+	update_hdmi_output(info);
 	return B_OK;
 }
 
@@ -362,6 +473,7 @@ disconnect_usbc(display_info* info, uint32 connector)
 	// a new sink gets the PHY and link set up from the start
 	delete info->usbc[connector];
 	info->usbc[connector] = NULL;
+	update_hdmi_output(info);
 }
 
 
@@ -408,9 +520,16 @@ hot_plug_thread(void* data)
 {
 	display_info* info = (display_info*)data;
 	uint32 generations[kUsbcConnectors] = {};
-	while (!info->quit) {
+	for (uint32 round = 0; !info->quit; round++) {
 		snooze(300000);
-		for (uint32 connector = 0; connector < kUsbcConnectors; connector++) {
+		if (info->port != NULL && (round & 1) == 0) {
+			MutexLocker locker(info->lock);
+			if (check_hdmi(info))
+				notify_change(info);
+		}
+		for (uint32 connector = 0;
+				info->usbcPorts != NULL && connector < kUsbcConnectors;
+				connector++) {
 			qcom_usbc_port port;
 			if (info->usbcPorts->get_port(connector, &port) != B_OK
 				|| port.generation == generations[connector])
@@ -924,11 +1043,15 @@ display_init_device(void* _info, void** _cookie)
 	info->changePort = -1;
 	init_retrace(info);
 
-	// the USB-C ports' reports, from the ADSP's driver
+	// the USB-C ports' reports, from the ADSP's driver, and the HDMI
+	// bridge's sink
 	info->hotPlugThread = -1;
 	if (info->shared->output_count > 1
 		&& get_module(QCOM_USBC_PORTS_MODULE_NAME,
-			(module_info**)&info->usbcPorts) == B_OK) {
+			(module_info**)&info->usbcPorts) != B_OK) {
+		info->usbcPorts = NULL;
+	}
+	if (info->usbcPorts != NULL || info->port != NULL) {
 		info->hotPlugThread = spawn_kernel_thread(hot_plug_thread,
 			"qcom display hot plug", B_LOW_PRIORITY, info);
 		if (info->hotPlugThread >= 0)

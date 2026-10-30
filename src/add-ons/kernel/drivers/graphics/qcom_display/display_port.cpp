@@ -135,6 +135,7 @@ static const uint32 kDpcdLinkBandwidthSet = 0x100;
 static const uint32 kNvidFixed = 0x8000;	// DP_LINK_CONSTANT_N_VALUE
 
 static const uint32 kEdidAddress = 0x50;
+static const uint32 kDpcdSinkCount = 0x200;
 
 
 static bool
@@ -604,6 +605,40 @@ DisplayPort::HotPlug()
 {
 	return fBase != NULL
 		&& (_Read(REG_DP_DP_HPD_INT_STATUS) & kHotPlugConnected) != 0;
+}
+
+
+uint32
+DisplayPort::HotPlugStatus()
+{
+	return fBase != NULL ? _Read(REG_DP_DP_HPD_INT_STATUS) : 0;
+}
+
+
+status_t
+DisplayPort::SinkCount(uint8& count)
+{
+	uint8 value;
+	status_t status = ReadDpcd(kDpcdSinkCount, &value, 1);
+	if (status != B_OK)
+		return status;
+	// bits 7 and 5:0; bit 6 is CP_READY
+	count = (value & 0x3f) | ((value & 0x80) >> 1);
+	return B_OK;
+}
+
+
+status_t
+DisplayPort::ProbeDdc()
+{
+	uint8 data = 0;
+	status_t status = _Transfer(false, false, kEdidAddress, &data, 1, false);
+	if (status == B_OK)
+		status = _Transfer(false, true, kEdidAddress, &data, 1, true);
+	if (status != B_OK)
+		return status;
+	// an EDID's header starts with 0
+	return data == 0 ? B_OK : B_BAD_DATA;
 }
 
 
