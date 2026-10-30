@@ -27,6 +27,11 @@
 #define HFI_PROPERTY_CONFIG_VDEC_ENTROPY	0x1204004
 #define HFI_INDEX_EXTRADATA_INPUT_CROP		0x0700000e
 
+#define HFI_COLOR_FORMAT_P010				0x4003
+#define HFI_COLOR_FORMAT_YUV420_TP10_UBWC	0xc002
+#define HFI_BITDEPTH_8						0
+#define HFI_BITDEPTH_10						2
+
 
 
 #define HFI_EVENT_DATA_SEQUENCE_CHANGED_SUFFICIENT_BUF_RESOURCES 0x1000001
@@ -214,6 +219,34 @@ nv12_size(uint32 width, uint32 height)
 }
 
 
+//!	The P010 copies: as NV12's, with samples of two bytes (venus' helpers.c).
+static uint32
+p010_size(uint32 width, uint32 height)
+{
+	uint32 stride = ALIGN(width * 2, 128);
+	return ALIGN(stride * ALIGN(height, 32)
+		+ stride * ALIGN((height + 1) >> 1, 16), 4096);
+}
+
+
+//!	Ten bit references: three samples in four bytes (TP10 UBWC, venus').
+static uint32
+tp10_ubwc_size(uint32 width, uint32 height)
+{
+	uint32 stride = ALIGN(width * 4 / 3, 256);
+	uint32 yPlane = ALIGN(stride * ALIGN(height, 16), 4096);
+	uint32 uvPlane = ALIGN(stride * ALIGN((height + 1) >> 1, 16), 4096);
+	uint32 yMeta = ALIGN(ALIGN(DIV_ROUND_UP(width, 48), 64)
+		* ALIGN(DIV_ROUND_UP(height, 4), 16), 4096);
+	uint32 uvMeta = ALIGN(ALIGN(DIV_ROUND_UP((width + 1) >> 1, 24), 64)
+		* ALIGN(DIV_ROUND_UP((height + 1) >> 1, 4), 16), 4096);
+	uint32 extradata = 16 * 1024 + 8 * 1024;
+	if (extradata < stride * 48)
+		extradata = stride * 48;
+	return ALIGN(yPlane + uvPlane + yMeta + uvMeta + extradata, 4096);
+}
+
+
 //!	The references: luma meta data and samples, then chroma's (UBWC).
 static uint32
 ubwc_size(uint32 width, uint32 height)
@@ -259,6 +292,7 @@ IrisDecoder::IrisDecoder(codec codec)
 	fCropWidth(0),
 	fCropHeight(0),
 	fMinCount(4),
+	fTenBit(false),
 	fOutputStride(0),
 	fOutputRows(0),
 	fOutputSize(0),
@@ -268,6 +302,7 @@ IrisDecoder::IrisDecoder(codec codec)
 	fEventWidth(0),
 	fEventHeight(0),
 	fEventMinCount(0),
+	fEventTenBit(false),
 	fLastAnswer(0),
 	fLastAnswerError(0),
 	fEndOfStream(false),
@@ -294,6 +329,7 @@ IrisDecoder::Open(uint32 width, uint32 height, BString* _error)
 	fCropWidth = width != 0 ? width : fWidth;
 	fCropHeight = height != 0 ? height : fHeight;
 	fMinCount = 4;
+	fTenBit = false;
 
 	status_t status = _OpenSession(HFI_SESSION_TYPE_DEC,
 		fCodec == HEVC ? HFI_VIDEO_CODEC_HEVC : HFI_VIDEO_CODEC_H264);
@@ -526,6 +562,7 @@ IrisDecoder::NextPicture(Picture& picture, bigtime_t timeout)
 	picture.stride = fOutputStride;
 	picture.lumaRows = fOutputRows;
 	picture.data = (const uint8*)output.buffer.address;
+	picture.tenBit = fTenBit;
 	return B_OK;
 }
 
@@ -546,28 +583,59 @@ IrisDecoder::ReleasePicture(const Picture& picture)
 }
 
 
-void
-IrisDecoder::CopyPlanes(const Picture& picture, uint8* target, uint32 stride,
-	bool interleaved) const
+/*!	A sample as eight bits: P010's sixteen bit samples have the ten in the
+	top, so that is their high byte. */
+static inline uint8
+sample8(const uint8* row, uint32 x)
+{
+	return row[x];
+}
+
+
+static inline uint8
+sample8(const uint16* row, uint32 x)
+{
+	return (uint8)(row[x] >> 8);
+}
+
+
+template<typename Sample>
+static void
+copy_planes(const IrisDecoder::Picture& picture, uint8* target, uint32 stride,
+	bool interleaved)
 {
 	const uint8* luma = picture.data + (size_t)picture.cropTop * picture.stride
-		+ picture.cropLeft;
+		+ picture.cropLeft * sizeof(Sample);
 	for (uint32 y = 0; y < picture.height; y++) {
-		memcpy(target + (size_t)y * stride, luma + (size_t)y * picture.stride,
-			picture.width);
+		const Sample* source
+			= (const Sample*)(luma + (size_t)y * picture.stride);
+		uint8* row = target + (size_t)y * stride;
+		if (sizeof(Sample) == 1)
+			memcpy(row, source, picture.width);
+		else {
+			for (uint32 x = 0; x < picture.width; x++)
+				row[x] = sample8(source, x);
+		}
 	}
 
 	const uint8* chroma = picture.data
 		+ (size_t)picture.lumaRows * picture.stride
 		+ (size_t)(picture.cropTop / 2) * picture.stride
-		+ (picture.cropLeft & ~1u);
+		+ (picture.cropLeft & ~1u) * sizeof(Sample);
 	uint8* targetChroma = target + (size_t)picture.height * stride;
 	uint32 chromaWidth = (picture.width + 1) / 2;
 	uint32 chromaHeight = (picture.height + 1) / 2;
 	if (interleaved) {
 		for (uint32 y = 0; y < chromaHeight; y++) {
-			memcpy(targetChroma + (size_t)y * stride,
-				chroma + (size_t)y * picture.stride, chromaWidth * 2);
+			const Sample* source
+				= (const Sample*)(chroma + (size_t)y * picture.stride);
+			uint8* row = targetChroma + (size_t)y * stride;
+			if (sizeof(Sample) == 1)
+				memcpy(row, source, chromaWidth * 2);
+			else {
+				for (uint32 x = 0; x < chromaWidth * 2; x++)
+					row[x] = sample8(source, x);
+			}
 		}
 		return;
 	}
@@ -576,12 +644,73 @@ IrisDecoder::CopyPlanes(const Picture& picture, uint8* target, uint32 stride,
 	uint8* cb = targetChroma;
 	uint8* cr = targetChroma + (size_t)chromaHeight * chromaStride;
 	for (uint32 y = 0; y < chromaHeight; y++) {
-		const uint8* source = chroma + (size_t)y * picture.stride;
+		const Sample* source
+			= (const Sample*)(chroma + (size_t)y * picture.stride);
 		uint8* cbRow = cb + (size_t)y * chromaStride;
 		uint8* crRow = cr + (size_t)y * chromaStride;
 		for (uint32 x = 0; x < chromaWidth; x++) {
-			cbRow[x] = source[2 * x];
-			crRow[x] = source[2 * x + 1];
+			cbRow[x] = sample8(source, 2 * x);
+			crRow[x] = sample8(source, 2 * x + 1);
+		}
+	}
+}
+
+
+void
+IrisDecoder::CopyPlanes(const Picture& picture, uint8* target, uint32 stride,
+	bool interleaved) const
+{
+	if (picture.tenBit)
+		copy_planes<uint16>(picture, target, stride, interleaved);
+	else
+		copy_planes<uint8>(picture, target, stride, interleaved);
+}
+
+
+template<typename Sample>
+static void
+copy_half_planes(const IrisDecoder::Picture& picture, uint8* target,
+	uint32 stride)
+{
+	// the sum of four samples, as eight bits
+	const uint32 shift = sizeof(Sample) == 1 ? 2 : 10;
+	const uint32 round = 1u << (shift - 1);
+
+	uint32 width = picture.width / 2;
+	uint32 height = picture.height / 2;
+	const uint8* luma = picture.data + (size_t)picture.cropTop * picture.stride
+		+ picture.cropLeft * sizeof(Sample);
+	for (uint32 y = 0; y < height; y++) {
+		const Sample* top
+			= (const Sample*)(luma + (size_t)(2 * y) * picture.stride);
+		const Sample* bottom
+			= (const Sample*)((const uint8*)top + picture.stride);
+		uint8* row = target + (size_t)y * stride;
+		for (uint32 x = 0; x < width; x++) {
+			row[x] = (uint8)(((uint32)top[2 * x] + top[2 * x + 1]
+				+ bottom[2 * x] + bottom[2 * x + 1] + round) >> shift);
+		}
+	}
+
+	const uint8* chroma = picture.data
+		+ (size_t)picture.lumaRows * picture.stride
+		+ (size_t)(picture.cropTop / 2) * picture.stride
+		+ (picture.cropLeft & ~1u) * sizeof(Sample);
+	uint32 chromaStride = stride / 2;
+	uint8* cb = target + (size_t)height * stride;
+	uint8* cr = cb + (size_t)(height / 2) * chromaStride;
+	for (uint32 y = 0; y < height / 2; y++) {
+		const Sample* top
+			= (const Sample*)(chroma + (size_t)(2 * y) * picture.stride);
+		const Sample* bottom
+			= (const Sample*)((const uint8*)top + picture.stride);
+		uint8* cbRow = cb + (size_t)y * chromaStride;
+		uint8* crRow = cr + (size_t)y * chromaStride;
+		for (uint32 x = 0; x < width / 2; x++) {
+			cbRow[x] = (uint8)(((uint32)top[4 * x] + top[4 * x + 2]
+				+ bottom[4 * x] + bottom[4 * x + 2] + round) >> shift);
+			crRow[x] = (uint8)(((uint32)top[4 * x + 1] + top[4 * x + 3]
+				+ bottom[4 * x + 1] + bottom[4 * x + 3] + round) >> shift);
 		}
 	}
 }
@@ -591,37 +720,69 @@ void
 IrisDecoder::CopyHalfPlanes(const Picture& picture, uint8* target,
 	uint32 stride) const
 {
-	uint32 width = picture.width / 2;
-	uint32 height = picture.height / 2;
-	const uint8* luma = picture.data + (size_t)picture.cropTop * picture.stride
-		+ picture.cropLeft;
-	for (uint32 y = 0; y < height; y++) {
-		const uint8* top = luma + (size_t)(2 * y) * picture.stride;
-		const uint8* bottom = top + picture.stride;
-		uint8* row = target + (size_t)y * stride;
-		for (uint32 x = 0; x < width; x++) {
-			row[x] = (uint8)(((uint32)top[2 * x] + top[2 * x + 1]
-				+ bottom[2 * x] + bottom[2 * x + 1] + 2) >> 2);
-		}
-	}
+	if (picture.tenBit)
+		copy_half_planes<uint16>(picture, target, stride);
+	else
+		copy_half_planes<uint8>(picture, target, stride);
+}
 
+
+void
+IrisDecoder::CopyP010(const Picture& picture, uint8* target, uint32 stride,
+	bool half) const
+{
+	if (!picture.tenBit)
+		return;
+
+	const uint8* luma = picture.data + (size_t)picture.cropTop * picture.stride
+		+ picture.cropLeft * 2;
 	const uint8* chroma = picture.data
 		+ (size_t)picture.lumaRows * picture.stride
 		+ (size_t)(picture.cropTop / 2) * picture.stride
-		+ (picture.cropLeft & ~1u);
-	uint32 chromaStride = stride / 2;
-	uint8* cb = target + (size_t)height * stride;
-	uint8* cr = cb + (size_t)(height / 2) * chromaStride;
+		+ (picture.cropLeft & ~1u) * 2;
+
+	if (!half) {
+		for (uint32 y = 0; y < picture.height; y++) {
+			memcpy(target + (size_t)y * stride,
+				luma + (size_t)y * picture.stride, picture.width * 2);
+		}
+		uint8* targetChroma = target + (size_t)picture.height * stride;
+		uint32 chromaHeight = (picture.height + 1) / 2;
+		uint32 chromaBytes = ((picture.width + 1) / 2) * 4;
+		for (uint32 y = 0; y < chromaHeight; y++) {
+			memcpy(targetChroma + (size_t)y * stride,
+				chroma + (size_t)y * picture.stride, chromaBytes);
+		}
+		return;
+	}
+
+	uint32 width = picture.width / 2;
+	uint32 height = picture.height / 2;
+	for (uint32 y = 0; y < height; y++) {
+		const uint16* top
+			= (const uint16*)(luma + (size_t)(2 * y) * picture.stride);
+		const uint16* bottom
+			= (const uint16*)((const uint8*)top + picture.stride);
+		uint16* row = (uint16*)(target + (size_t)y * stride);
+		for (uint32 x = 0; x < width; x++) {
+			row[x] = (uint16)(((uint32)top[2 * x] + top[2 * x + 1]
+				+ bottom[2 * x] + bottom[2 * x + 1] + 2) >> 2);
+		}
+	}
+	uint8* targetChroma = target + (size_t)height * stride;
 	for (uint32 y = 0; y < height / 2; y++) {
-		const uint8* top = chroma + (size_t)(2 * y) * picture.stride;
-		const uint8* bottom = top + picture.stride;
-		uint8* cbRow = cb + (size_t)y * chromaStride;
-		uint8* crRow = cr + (size_t)y * chromaStride;
+		const uint16* top
+			= (const uint16*)(chroma + (size_t)(2 * y) * picture.stride);
+		const uint16* bottom
+			= (const uint16*)((const uint8*)top + picture.stride);
+		uint16* row = (uint16*)(targetChroma + (size_t)y * stride);
 		for (uint32 x = 0; x < width / 2; x++) {
-			cbRow[x] = (uint8)(((uint32)top[4 * x] + top[4 * x + 2]
+			// Cb and Cr of a 2x2 block of pairs
+			row[2 * x] = (uint16)(((uint32)top[4 * x] + top[4 * x + 2]
 				+ bottom[4 * x] + bottom[4 * x + 2] + 2) >> 2);
-			crRow[x] = (uint8)(((uint32)top[4 * x + 1] + top[4 * x + 3]
-				+ bottom[4 * x + 1] + bottom[4 * x + 3] + 2) >> 2);
+			row[2 * x + 1] = (uint16)(((uint32)top[4 * x + 1]
+				+ top[4 * x + 3] + bottom[4 * x + 1] + bottom[4 * x + 3]
+				+ 2) >> 2);
 		}
 	}
 }
@@ -634,9 +795,10 @@ clamp_sample(int32 value)
 }
 
 
-void
-IrisDecoder::CopyPacked(const Picture& picture, uint8* target, uint32 stride,
-	color_space space) const
+template<typename Sample>
+static void
+copy_packed(const IrisDecoder::Picture& picture, uint8* target, uint32 stride,
+	color_space space)
 {
 	// luma scale (255/219), then Cr to R, Cb to G, Cr to G, Cb to B with
 	// studio range chroma (255/224), all in 1/64 (as sunxi_cedar)
@@ -645,28 +807,30 @@ IrisDecoder::CopyPacked(const Picture& picture, uint8* target, uint32 stride,
 	const int16* matrix = picture.height >= 720 ? kBt709 : kBt601;
 
 	const uint8* luma = picture.data + (size_t)picture.cropTop * picture.stride
-		+ picture.cropLeft;
+		+ picture.cropLeft * sizeof(Sample);
 	const uint8* chroma = picture.data
 		+ (size_t)picture.lumaRows * picture.stride
 		+ (size_t)(picture.cropTop / 2) * picture.stride
-		+ (picture.cropLeft & ~1u);
+		+ (picture.cropLeft & ~1u) * sizeof(Sample);
 	for (uint32 y = 0; y < picture.height; y++) {
-		const uint8* lumaRow = luma + (size_t)y * picture.stride;
-		const uint8* chromaRow = chroma + (size_t)(y / 2) * picture.stride;
+		const Sample* lumaRow
+			= (const Sample*)(luma + (size_t)y * picture.stride);
+		const Sample* chromaRow
+			= (const Sample*)(chroma + (size_t)(y / 2) * picture.stride);
 		uint8* row = target + (size_t)y * stride;
 		if (space == B_YCbCr422) {
 			for (uint32 x = 0; x < picture.width / 2; x++) {
-				row[4 * x] = lumaRow[2 * x];
-				row[4 * x + 1] = chromaRow[2 * x];
-				row[4 * x + 2] = lumaRow[2 * x + 1];
-				row[4 * x + 3] = chromaRow[2 * x + 1];
+				row[4 * x] = sample8(lumaRow, 2 * x);
+				row[4 * x + 1] = sample8(chromaRow, 2 * x);
+				row[4 * x + 2] = sample8(lumaRow, 2 * x + 1);
+				row[4 * x + 3] = sample8(chromaRow, 2 * x + 1);
 			}
 			continue;
 		}
 		for (uint32 x = 0; x < picture.width; x++) {
-			int32 value = ((int32)lumaRow[x] - 16) * matrix[0];
-			int32 cb = (int32)chromaRow[x & ~1u] - 128;
-			int32 cr = (int32)chromaRow[(x & ~1u) + 1] - 128;
+			int32 value = ((int32)sample8(lumaRow, x) - 16) * matrix[0];
+			int32 cb = (int32)sample8(chromaRow, x & ~1u) - 128;
+			int32 cr = (int32)sample8(chromaRow, (x & ~1u) + 1) - 128;
 			row[4 * x + 2] = clamp_sample((value + matrix[1] * cr + 32) >> 6);
 			row[4 * x + 1] = clamp_sample((value - matrix[2] * cb
 				- matrix[3] * cr + 32) >> 6);
@@ -674,6 +838,17 @@ IrisDecoder::CopyPacked(const Picture& picture, uint8* target, uint32 stride,
 			row[4 * x + 3] = 255;
 		}
 	}
+}
+
+
+void
+IrisDecoder::CopyPacked(const Picture& picture, uint8* target, uint32 stride,
+	color_space space) const
+{
+	if (picture.tenBit)
+		copy_packed<uint16>(picture, target, stride, space);
+	else
+		copy_packed<uint8>(picture, target, stride, space);
 }
 
 
@@ -846,10 +1021,14 @@ IrisDecoder::_HandleEvent(const uint32* packet, size_t size)
 		record += 4 + length;
 	}
 
-	if (bitDepth != 0 || progressive == 0) {
+	// luma's depth in the low half, chroma's in the high one
+	if (bitDepth == (HFI_BITDEPTH_10 << 16 | HFI_BITDEPTH_10))
+		bitDepth = HFI_BITDEPTH_10;
+	if ((bitDepth != HFI_BITDEPTH_8 && bitDepth != HFI_BITDEPTH_10)
+		|| progressive == 0) {
 		fFailed = true;
 		return _Fail(B_NOT_SUPPORTED, "%s pictures are not supported",
-			bitDepth != 0 ? "ten bit" : "interlaced");
+			progressive == 0 ? "interlaced" : "mixed or nine bit");
 	}
 	if (width == 0 || height == 0) {
 		fFailed = true;
@@ -866,6 +1045,7 @@ IrisDecoder::_HandleEvent(const uint32* packet, size_t size)
 		fEventCrop[3] = height;
 	}
 	fEventMinCount = minCount != 0 ? minCount : 4;
+	fEventTenBit = bitDepth == HFI_BITDEPTH_10;
 	fSequenceChanged = true;
 	return B_OK;
 }
@@ -899,11 +1079,13 @@ IrisDecoder::_ConfigurePorts(bool input)
 		status = _SetProperty(HFI_PROPERTY_CONFIG_VIDEOCORES_USAGE, 1);
 	if (status == B_OK) {
 		status = _SetProperty(HFI_PROPERTY_PARAM_UNCOMPRESSED_FORMAT_SELECT,
-			HFI_BUFFER_OUTPUT, HFI_COLOR_FORMAT_NV12_UBWC);
+			HFI_BUFFER_OUTPUT, fTenBit ? HFI_COLOR_FORMAT_YUV420_TP10_UBWC
+				: HFI_COLOR_FORMAT_NV12_UBWC);
 	}
 	if (status == B_OK) {
 		status = _SetProperty(HFI_PROPERTY_PARAM_UNCOMPRESSED_FORMAT_SELECT,
-			HFI_BUFFER_OUTPUT2, HFI_COLOR_FORMAT_NV12);
+			HFI_BUFFER_OUTPUT2,
+			fTenBit ? HFI_COLOR_FORMAT_P010 : HFI_COLOR_FORMAT_NV12);
 	}
 	if (status == B_OK) {
 		status = _SetProperty(
@@ -940,11 +1122,13 @@ IrisDecoder::_ConfigurePorts(bool input)
 	}
 	if (status == B_OK) {
 		status = _SetProperty(HFI_PROPERTY_PARAM_BUFFER_SIZE_ACTUAL,
-			HFI_BUFFER_OUTPUT, ubwc_size(outputWidth, outputHeight));
+			HFI_BUFFER_OUTPUT, fTenBit ? tp10_ubwc_size(outputWidth, outputHeight)
+				: ubwc_size(outputWidth, outputHeight));
 	}
 	if (status == B_OK) {
 		status = _SetProperty(HFI_PROPERTY_PARAM_BUFFER_SIZE_ACTUAL,
-			HFI_BUFFER_OUTPUT2, nv12_size(outputWidth, outputHeight));
+			HFI_BUFFER_OUTPUT2, fTenBit ? p010_size(outputWidth, outputHeight)
+				: nv12_size(outputWidth, outputHeight));
 	}
 	if (status == B_OK && input) {
 		uint32 mbs = DIV_ROUND_UP(fHeight, 16) * DIV_ROUND_UP(fWidth, 16);
@@ -974,7 +1158,7 @@ IrisDecoder::_StartOutput()
 	if (fOutputStarted) {
 		// the same geometry again (a new sequence header): go on
 		if (width == fWidth && height == fHeight
-			&& fEventMinCount <= fMinCount) {
+			&& fEventMinCount <= fMinCount && fEventTenBit == fTenBit) {
 			uint32 packet[3] = { 12, HFI_CMD_SESSION_CONTINUE, fSession };
 			return _Send(packet);
 		}
@@ -990,13 +1174,16 @@ IrisDecoder::_StartOutput()
 	fCropWidth = fEventCrop[2];
 	fCropHeight = fEventCrop[3];
 	fMinCount = fEventMinCount;
+	fTenBit = fEventTenBit;
 
 	uint32 outputWidth = ALIGN(width, 128);
 	uint32 outputHeight = ALIGN(height, 32);
-	fOutputStride = outputWidth;
+	fOutputStride = fTenBit ? ALIGN(outputWidth * 2, 128) : outputWidth;
 	fOutputRows = outputHeight;
-	fOutputSize = nv12_size(outputWidth, outputHeight);
-	fReferenceSize = ubwc_size(outputWidth, outputHeight);
+	fOutputSize = fTenBit ? p010_size(outputWidth, outputHeight)
+		: nv12_size(outputWidth, outputHeight);
+	fReferenceSize = fTenBit ? tp10_ubwc_size(outputWidth, outputHeight)
+		: ubwc_size(outputWidth, outputHeight);
 
 	status_t status = _ConfigurePorts(false);
 

@@ -25,6 +25,10 @@
 	writes a linear NV12 copy of each picture to be shown into buffers of
 	ours ("split mode", the only one Linux uses on this hardware).
 
+	Ten bit streams (HEVC Main 10) are decoded into TP10 UBWC references
+	and copied out as P010, as Linux' venus driver has it: luma, then Cb
+	and Cr in pairs, each sample sixteen bits with the ten in the top.
+
 	Not thread safe; one thread feeds it and takes its pictures.
 */
 class IrisDecoder : public IrisSession {
@@ -44,6 +48,7 @@ public:
 		uint32		stride;		// of both planes, in bytes
 		uint32		lumaRows;	// the chroma plane follows them
 		const uint8* data;		// luma, then Cb and Cr in pairs
+		bool		tenBit;		// samples of sixteen bits (P010)
 		bool		corrupt;
 	};
 
@@ -80,7 +85,8 @@ public:
 			/*!	The picture's visible part as planes: luma, then either Cb
 				and Cr planes of half the stride (\a interleaved false, I420)
 				or one plane of pairs (NV12). \a stride is in bytes; the
-				chroma follows the last luma row. */
+				chroma follows the last luma row. Ten bit pictures lose
+				their two lowest bits. */
 			void				CopyPlanes(const Picture& picture,
 									uint8* target, uint32 stride,
 									bool interleaved) const;
@@ -89,6 +95,13 @@ public:
 				multiples of four. */
 			void				CopyHalfPlanes(const Picture& picture,
 									uint8* target, uint32 stride) const;
+			/*!	A ten bit picture's visible part as P010: luma, then one plane
+				of Cb and Cr pairs after the last luma row, \a stride bytes a
+				row. \a half: half as wide and high, each sample the mean of
+				a 2x2 block (width and height multiples of four). */
+			void				CopyP010(const Picture& picture,
+									uint8* target, uint32 stride,
+									bool half) const;
 			/*!	The picture as B_YCbCr422 (Y0 Cb Y1 Cr) or B_RGB32 (BT.601
 				below 720 rows, else BT.709; studio range). */
 			void				CopyPacked(const Picture& picture,
@@ -136,6 +149,7 @@ private:
 			uint32				fCropHeight;
 			uint32				fMinCount;	// the firmware's minimum of
 											// reference and output buffers
+			bool				fTenBit;
 
 			IrisDevice::Buffer	fPersist;
 			IrisDevice::Buffer	fBin;
@@ -158,6 +172,7 @@ private:
 			uint32				fEventHeight;
 			uint32				fEventCrop[4];
 			uint32				fEventMinCount;
+			bool				fEventTenBit;
 			uint32				fLastAnswer;
 			uint32				fLastAnswerError;
 			bool				fEndOfStream;	// sent

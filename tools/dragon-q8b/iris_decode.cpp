@@ -11,7 +11,9 @@
 	iris_decode [--hevc] [--hashes] [--size WxH] stream
 		[reference.yuv | reference.hashes] [out.yuv]
 
-	--hashes prints each picture's FNV-1a hash (of the I420 picture). */
+	--hashes prints each picture's FNV-1a hash (of the I420 picture). Ten bit
+	pictures are compared and written as P010 without padding (as
+	"-pix_fmt p010le"). */
 
 
 #include <math.h>
@@ -220,8 +222,14 @@ main(int argc, char** argv)
 		if (firstPicture == 0)
 			firstPicture = system_time();
 		size_t frameSize = (size_t)picture.width * picture.height * 3 / 2;
-		frame.resize(frameSize);
-		decoder.CopyPlanes(picture, frame.data(), picture.width, false);
+		if (picture.tenBit) {
+			frameSize *= 2;
+			frame.resize(frameSize);
+			decoder.CopyP010(picture, frame.data(), picture.width * 2, false);
+		} else {
+			frame.resize(frameSize);
+			decoder.CopyPlanes(picture, frame.data(), picture.width, false);
+		}
 		if (out != NULL)
 			fwrite(frame.data(), 1, frameSize, out);
 		if (sHashes) {
@@ -250,6 +258,7 @@ main(int argc, char** argv)
 				double error = 0;
 				size_t differ = 0;
 				for (size_t i = 0; i < frameSize; i++) {
+					// (a P010 picture: the high bytes and low ones apart)
 					int d = (int)expected[i] - frame[i];
 					error += d * d;
 					if (d != 0)

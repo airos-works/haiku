@@ -8,7 +8,8 @@
 
 	As sunxi_cedar: the formats are only registered where the codec is
 	(/dev/video/qcom_iris/0 exists), and a stream it does not decode (fields,
-	more than eight bits, not 4:2:0, larger than 4096x2304), or one the
+	more than eight bits for H.264 or ten for HEVC, not 4:2:0, larger than
+	4096x2304), or one the
 	firmware has no room for next to others, goes on in software: the decoder then hands
 	everything to one of the FFmpeg add-on's decoders. What the firmware
 	only finds out at the first picture sends the chunks read until then to
@@ -19,6 +20,8 @@
 
 	Pictures are handed out as 'I420', 'NV12', B_YCbCr422 or B_RGB32 (see
 	sunxi_cedar); 'I420' half as wide and high when asked for exactly that.
+	Ten bit pictures (HEVC Main 10) also as 'P010', with their depth, and
+	that too at half the size.
 	A negative time_to_decode in Decode()'s media_decode_info is, negated,
 	the time before which the caller will drop the pictures anyway; those
 	are returned with their time but not copied. */
@@ -51,6 +54,7 @@ static const uint32 kCodecHEVC = 173;
 
 static const color_space kColorSpaceNV12 = (color_space)0x4e563132;	// 'NV12'
 static const color_space kColorSpaceI420 = (color_space)0x49343230;	// 'I420'
+static const color_space kColorSpaceP010 = (color_space)0x50303130;	// 'P010'
 
 static const uint32 kMaxWidth = 4096;
 static const uint32 kMaxHeight = 2304;
@@ -367,9 +371,11 @@ QcomIrisDecoder::_CodecDecodes(BString& reason) const
 			const HevcSps& sps = state->sps[i];
 			if (!sps.valid)
 				continue;
-			if (sps.chromaFormatIdc != 1 || sps.bitDepthLuma != 8
-				|| sps.bitDepthChroma != 8) {
-				reason = "the codec decodes HEVC Main (eight bit 4:2:0) only";
+			if (sps.chromaFormatIdc != 1
+				|| (sps.bitDepthLuma != 8 && sps.bitDepthLuma != 10)
+				|| sps.bitDepthChroma != sps.bitDepthLuma) {
+				reason = "the codec decodes HEVC Main and Main 10 (4:2:0) "
+					"only";
 				decodes = false;
 			} else if ((uint32)sps.width > kMaxWidth
 				|| (uint32)sps.height > kMaxHeight) {
@@ -532,6 +538,8 @@ QcomIrisDecoder::_Stride() const
 		return (fWidth * 2 + 3) & ~3u;
 	if (fOutputSpace == B_RGB32)
 		return fWidth * 4;
+	if (fOutputSpace == kColorSpaceP010)
+		return (fWidth * 2 + 15) & ~15u;
 	return (fWidth + 15) & ~15u;
 }
 
@@ -566,13 +574,15 @@ QcomIrisDecoder::NegotiateOutputFormat(media_format* format)
 	// (MediaPlayer leaves the format's type unset and only names the colour
 	// space)
 	color_space space = format->u.raw_video.display.format;
+	if (space == kColorSpaceP010 && !fPicture.tenBit)
+		space = kColorSpaceI420;
 	if (space != kColorSpaceNV12 && space != kColorSpaceI420
-		&& space != B_YCbCr422) {
+		&& space != B_YCbCr422 && space != kColorSpaceP010) {
 		space = B_RGB32;
 	}
 	fOutputSpace = space;
 	const media_video_display_info& asked = format->u.raw_video.display;
-	fHalf = space == kColorSpaceI420
+	fHalf = (space == kColorSpaceI420 || space == kColorSpaceP010)
 		&& fPicture.width % 4 == 0 && fPicture.height % 4 == 0
 		&& asked.line_width == fPicture.width / 2
 		&& asked.line_count == fPicture.height / 2;
@@ -751,7 +761,9 @@ QcomIrisDecoder::Decode(void* buffer, int64* frameCount,
 	bool skip = info != NULL && info->time_to_decode < 0
 		&& fPicture.pts < -info->time_to_decode;
 	if (!skip) {
-		if (fHalf)
+		if (fOutputSpace == kColorSpaceP010)
+			fDecoder->CopyP010(fPicture, (uint8*)buffer, stride, fHalf);
+		else if (fHalf)
 			fDecoder->CopyHalfPlanes(fPicture, (uint8*)buffer, stride);
 		else if (fOutputSpace == kColorSpaceNV12
 			|| fOutputSpace == kColorSpaceI420) {
@@ -766,6 +778,7 @@ QcomIrisDecoder::Decode(void* buffer, int64* frameCount,
 	header->start_time = fPicture.pts;
 	header->size_used = fOutputSpace == kColorSpaceNV12
 			|| fOutputSpace == kColorSpaceI420
+			|| fOutputSpace == kColorSpaceP010
 		? (size_t)stride * (fHeight + (fHeight + 1) / 2)
 		: (size_t)stride * fHeight;
 	header->u.raw_video.display_line_width = fWidth;
