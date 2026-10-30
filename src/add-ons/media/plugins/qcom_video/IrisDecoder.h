@@ -26,10 +26,9 @@
 	writes a linear NV12 copy of each picture to be shown into buffers of
 	ours ("split mode", the only one Linux uses on this hardware).
 
-	Interlaced streams (H.264 fields) would come out as frames of two woven
-	fields, decoded in the codec's single stage mode as venus decodes them;
-	so far the firmware dies on them, and they are refused (see
-	_HandleEvent()).
+	Interlaced streams (H.264 fields) come out as frames of two woven fields,
+	decoded in the single stage mode on one pipe, as Qualcomm's msm_vidc has
+	it; up to 1440 wide only (see _HandleEvent()).
 
 	Ten bit streams (HEVC Main 10) are decoded into TP10 UBWC references
 	and copied out as P010, as Linux' venus driver has it: luma, then Cb
