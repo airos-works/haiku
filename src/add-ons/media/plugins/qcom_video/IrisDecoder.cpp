@@ -27,6 +27,9 @@
 #define HFI_PROPERTY_CONFIG_VDEC_ENTROPY	0x1204004
 #define HFI_INDEX_EXTRADATA_INPUT_CROP		0x0700000e
 
+#define HFI_PROPERTY_PARAM_VDEC_OUTPUT_ORDER 0x1203005
+#define HFI_OUTPUT_ORDER_DISPLAY			0x1000001
+
 #define HFI_COLOR_FORMAT_P010				0x4003
 #define HFI_COLOR_FORMAT_YUV420_TP10_UBWC	0xc002
 #define HFI_BITDEPTH_8						0
@@ -46,8 +49,8 @@ static const uint32 kInputBuffers = 4;
 // beyond the firmware's minimum: what the caller holds and what waits
 // to be taken
 static const uint32 kExtraOutputs = 4;
-// the widest fields the firmware copies out linearly (see _HandleEvent())
-static const uint32 kMaxFieldWidth = 1440;
+// the widest fields the codec decodes (Qualcomm's INTERLACE_WIDTH_MAX)
+static const uint32 kMaxFieldWidth = 1920;
 
 
 #define ALIGN(x, a)			((((x) + (a) - 1) / (a)) * (a))
@@ -62,7 +65,6 @@ static const uint32 kMaxFieldWidth = 1440;
 
 static const uint32 kDmaAlignment = 256;
 static const uint32 kVppPipes = 4;
-static const uint32 kComvBuffers = 64;
 static const uint32 kHwPictureBuffers = 32;
 
 
@@ -359,6 +361,8 @@ IrisDecoder::IrisDecoder(codec codec)
 	fCropHeight(0),
 	fMinCount(4),
 	fTenBit(false),
+	fHintWidth(0),
+	fHintHeight(0),
 	fInterlaced(false),
 	fOutputStride(0),
 	fOutputRows(0),
@@ -396,8 +400,9 @@ IrisDecoder::Open(uint32 width, uint32 height, BString* _error)
 	// the output side. Opened at the stream's own size, it said
 	// "sufficient" and VP9 went on decoding while its scratch buffers were
 	// replaced: it stopped for good after a few pictures, now and then.
-	(void)width;
-	(void)height;
+	// (the container's size is only a hint for the crop, see _HandleEvent())
+	fHintWidth = width;
+	fHintHeight = height;
 	uint32 alignment = fCodec == HEVC ? 32 : 16;
 	static const uint32 kSessionCodecs[] = { HFI_VIDEO_CODEC_H264,
 		HFI_VIDEO_CODEC_HEVC, HFI_VIDEO_CODEC_VP9, HFI_VIDEO_CODEC_MPEG2 };
@@ -1132,11 +1137,9 @@ IrisDecoder::_HandleEvent(const uint32* packet, size_t size)
 		return _Fail(B_NOT_SUPPORTED,
 			"mixed or nine bit pictures are not supported");
 	}
-	// Fields decode, but the post processor's linear copies of fields more
-	// than 1440 wide assert in the firmware (vfw_h264_hw_if.c:1193, with
-	// any work mode, route or buffer size; 1600 failed, and 1920 decodes
-	// only into the UBWC references): those go on in software. Refused
-	// here, before the firmware goes on, the codec stays up.
+	// Fields up to 1920 wide (Qualcomm's limit; their copies need rows of
+	// 256 bytes, see _StrideAlignment()). Refused here, before the firmware
+	// goes on, wider ones leave the codec up.
 	if (progressive == 0 && width > kMaxFieldWidth) {
 		fFailed = true;
 		return _Fail(B_NOT_SUPPORTED,
@@ -1157,9 +1160,19 @@ IrisDecoder::_HandleEvent(const uint32* packet, size_t size)
 		fEventCrop[2] = width;
 		fEventCrop[3] = height;
 	}
+	// MPEG-2 comes without a crop: the container's size, when the coded one
+	// is no more than a macroblock larger
+	if (fCodec == MPEG2 && fEventCrop[2] == width && fEventCrop[3] == height
+		&& fHintWidth != 0 && fHintHeight != 0 && fHintWidth <= width
+		&& fHintHeight <= height && width - fHintWidth < 16
+		&& height - fHintHeight < 16) {
+		fEventCrop[2] = fHintWidth;
+		fEventCrop[3] = fHintHeight;
+	}
 	// Of fields, the firmware crops what is cropped from each field only
 	// once (728 of 736 rows for 720i, 1084 of 1088 for 1080i).
-	if (progressive == 0 && fEventCrop[1] + fEventCrop[3] < height) {
+	if (progressive == 0 && fCodec == H264
+		&& fEventCrop[1] + fEventCrop[3] < height) {
 		uint32 bottom = height - fEventCrop[1] - fEventCrop[3];
 		if (bottom * 2 <= height - fEventCrop[1])
 			fEventCrop[3] = height - fEventCrop[1] - bottom * 2;
@@ -1199,12 +1212,19 @@ IrisDecoder::_ConfigurePorts(bool input)
 {
 	uint32 outputWidth = ALIGN(fWidth, 128);
 	uint32 outputHeight = ALIGN(fHeight, 32);
-	uint32 constraints[10] = { HFI_BUFFER_OUTPUT2, 2, 128, 8192, 32, 256,
-		128, 8192, 16, 256 };
+	uint32 strideAlign = _StrideAlignment();
+	uint32 constraints[10] = { HFI_BUFFER_OUTPUT2, 2, strideAlign, 8192, 32,
+		256, strideAlign, 8192, 16, 256 };
 
 	status_t status = B_OK;
 	if (input)
 		status = _SetProperty(HFI_PROPERTY_CONFIG_VIDEOCORES_USAGE, 1);
+	if (status == B_OK && input) {
+		// in display order (Qualcomm's msm_vidc says so; fields otherwise
+		// came out in decode order)
+		status = _SetProperty(HFI_PROPERTY_PARAM_VDEC_OUTPUT_ORDER,
+			HFI_OUTPUT_ORDER_DISPLAY);
+	}
 	if (status == B_OK) {
 		status = _SetProperty(HFI_PROPERTY_PARAM_UNCOMPRESSED_FORMAT_SELECT,
 			HFI_BUFFER_OUTPUT, fTenBit ? HFI_COLOR_FORMAT_YUV420_TP10_UBWC
@@ -1258,7 +1278,7 @@ IrisDecoder::_ConfigurePorts(bool input)
 	if (status == B_OK) {
 		status = _SetProperty(HFI_PROPERTY_PARAM_BUFFER_SIZE_ACTUAL,
 			HFI_BUFFER_OUTPUT2, fTenBit ? p010_size(outputWidth, outputHeight)
-				: nv12_size(outputWidth, outputHeight));
+				: nv12_size(ALIGN(outputWidth, strideAlign), outputHeight));
 	}
 	if (status == B_OK && input) {
 		uint32 mbs = DIV_ROUND_UP(fHeight, 16) * DIV_ROUND_UP(fWidth, 16);
@@ -1311,10 +1331,11 @@ IrisDecoder::_StartOutput()
 
 	uint32 outputWidth = ALIGN(width, 128);
 	uint32 outputHeight = ALIGN(height, 32);
-	fOutputStride = fTenBit ? ALIGN(outputWidth * 2, 128) : outputWidth;
+	fOutputStride = fTenBit ? ALIGN(outputWidth * 2, 128)
+		: ALIGN(outputWidth, _StrideAlignment());
 	fOutputRows = outputHeight;
 	fOutputSize = fTenBit ? p010_size(outputWidth, outputHeight)
-		: nv12_size(outputWidth, outputHeight);
+		: nv12_size(fOutputStride, outputHeight);
 	fReferenceSize = fTenBit ? tp10_ubwc_size(outputWidth, outputHeight)
 		: ubwc_size(outputWidth, outputHeight, fInterlaced);
 
@@ -1379,6 +1400,31 @@ IrisDecoder::_StartOutput()
 	}
 	fOutputStarted = true;
 	return B_OK;
+}
+
+
+/*!	The copies' row alignment: copies of fields need rows of a multiple of
+	256 bytes. With 128 the firmware asserted for fields of 1600 and more
+	(vfw_h264_hw_if.c:1193), and MPEG-2's bottom fields lost the chroma of
+	the last 128 pixel tile at 1920; with 256 both are byte exact (MPEG-2
+	but for the IDCT rounding it may choose).
+*/
+uint32
+IrisDecoder::_StrideAlignment() const
+{
+	return fInterlaced ? 256 : 128;
+}
+
+
+/*!	Co-located motion vectors for how many pictures: 64, as Linux' iris
+	(VIDEO_MAX_FRAME). The firmware refuses less (HFI_ERR_SESSION_
+	INSUFFICIENT_RESOURCES for a SCRATCH_1 sized for its minimum), though
+	64 take 470 MB of the codec's address space for 4K HEVC.
+*/
+uint32
+IrisDecoder::_ComvBuffers() const
+{
+	return 64;
 }
 
 
@@ -1472,7 +1518,7 @@ size_t
 IrisDecoder::_Scratch1Size(uint32 width, uint32 height) const
 {
 	if (fCodec == HEVC) {
-		return comv_hevc(width, height, kComvBuffers)
+		return comv_hevc(width, height, _ComvBuffers())
 			+ non_comv_hevc(width, height) + line_hevc(width, height);
 	}
 	if (fCodec == VP9 || fCodec == MPEG2) {
@@ -1484,7 +1530,7 @@ IrisDecoder::_Scratch1Size(uint32 width, uint32 height) const
 			+ ALIGN(qp, kDmaAlignment) + vpss_line_size(width, height) + 4096
 			+ 1024 * 1024;
 	}
-	return comv_h264(width, height, kComvBuffers)
+	return comv_h264(width, height, _ComvBuffers())
 		+ non_comv_h264(width, height) + line_h264(width, height);
 }
 
