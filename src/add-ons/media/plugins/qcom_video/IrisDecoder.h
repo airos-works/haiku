@@ -26,9 +26,9 @@
 	writes a linear NV12 copy of each picture to be shown into buffers of
 	ours ("split mode", the only one Linux uses on this hardware).
 
-	Interlaced streams (H.264 fields) come out as frames of two woven fields,
-	decoded in the single stage mode on one pipe, as Qualcomm's msm_vidc has
-	it; up to 1440 wide only (see _HandleEvent()).
+	Interlaced streams (H.264 and MPEG-2 fields) come out as frames of two
+	woven fields, decoded in the single stage mode on one pipe, as Qualcomm's
+	msm_vidc has it, into copies with rows of 256 bytes; up to 1920 wide.
 
 	Ten bit streams (HEVC Main 10) are decoded into TP10 UBWC references
 	and copied out as P010, as Linux' venus driver has it: luma, then Cb
@@ -144,6 +144,8 @@ private:
 			status_t			_QueueOutput(int32 index);
 			void				_ReturnDropped();
 			uint32				_OutputCount() const;
+			uint32				_StrideAlignment() const;
+			uint32				_ComvBuffers() const;
 			status_t			_QueueReference(int32 index);
 			void				_FreeOutputs();
 
@@ -164,6 +166,8 @@ private:
 			uint32				fMinCount;	// the firmware's minimum of
 											// reference and output buffers
 			bool				fTenBit;
+			uint32				fHintWidth;		// the container's
+			uint32				fHintHeight;
 			bool				fInterlaced;
 
 			IrisDevice::Buffer	fPersist;

@@ -9,7 +9,7 @@
 
 	As sunxi_cedar: the formats are only registered where the codec is
 	(/dev/video/qcom_iris/0 exists), and a stream it does not decode (fields
-	wider than 1440, more than eight bits for H.264 or ten for HEVC, not
+	wider than 1920, more than eight bits for H.264 or ten for HEVC, not
 	4:2:0, larger than 4096x2304), or one the
 	firmware has no room for next to others, goes on in software: the decoder then hands
 	everything to one of the FFmpeg add-on's decoders. What the firmware
@@ -73,7 +73,7 @@ static const color_space kColorSpaceP010 = (color_space)0x50303130;	// 'P010'
 static const uint32 kMaxWidth = 4096;
 static const uint32 kMaxHeight = 2304;
 // (see IrisDecoder::_HandleEvent())
-static const uint32 kMaxFieldWidth = 1440;
+static const uint32 kMaxFieldWidth = 1920;
 
 // NewDecoder()'s index for a decoder without the software fallback
 static const uint kCodecOnly = 1;
@@ -359,7 +359,7 @@ QcomIrisDecoder::_CodecDecodes(BString& reason) const
 					decodes = false;
 				} else if (!sps.frameMbsOnly
 					&& (uint32)sps.widthMbs * 16 > kMaxFieldWidth) {
-					reason = "the codec decodes fields up to 1440 wide";
+					reason = "the codec decodes fields up to 1920 wide";
 					decodes = false;
 				} else if (sps.profileIdc == 88
 					&& (sps.constraintFlags & 0xc0) == 0) {
