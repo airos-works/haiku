@@ -2114,6 +2114,47 @@ fDesktop->LockSingleWindow();
 			fLink.Flush();
 			break;
 		}
+		case AS_VIEW_SET_VIEW_BITMAP_PLACEMENTS:
+		{
+			DTRACE(("ServerWindow %s: Message "
+				"AS_VIEW_SET_VIEW_BITMAP_PLACEMENTS: View: %s\n", Title(),
+				fCurrentView->Name()));
+
+			int32 bitmapToken, options, count;
+			BRect srcRect;
+
+			link.Read<int32>(&bitmapToken);
+			link.Read<BRect>(&srcRect);
+			link.Read<int32>(&options);
+			status_t status = link.Read<int32>(&count);
+			if (status == B_OK && (count < 1 || count > 64))
+				status = B_BAD_VALUE;
+
+			BRect destinations[64];
+			BRect clips[64];
+			for (int32 i = 0; status == B_OK && i < count; i++) {
+				link.Read<BRect>(&destinations[i]);
+				status = link.Read<BRect>(&clips[i]);
+			}
+
+			if (status == B_OK) {
+				BReference<ServerBitmap> bitmap(
+					fServerApp->GetBitmap(bitmapToken), true);
+				if (bitmap != NULL) {
+					fCurrentView->SetViewBitmapPlacements(bitmap, srcRect,
+						destinations, clips, count,
+						options & ~AS_REQUEST_COLOR_KEY);
+
+					BRegion dirty((BRect)fCurrentView->Bounds());
+					fWindow->InvalidateView(fCurrentView, dirty);
+				} else
+					status = B_BAD_VALUE;
+			}
+
+			fLink.StartMessage(status);
+			fLink.Flush();
+			break;
+		}
 		case AS_VIEW_PRINT_ALIASING:
 		{
 			DTRACE(("ServerWindow %s: Message AS_VIEW_PRINT_ALIASING: "

@@ -387,6 +387,10 @@ enum {
 	// buffer (BDirectWindow::MarkDrawingBitsStale())
 	AS_DIRECT_WINDOW_MARK_STALE,
 
+	// One view bitmap drawn at several places, each within its own clipping
+	// rectangle: the desktop background shown on every monitor
+	AS_VIEW_SET_VIEW_BITMAP_PLACEMENTS,
+
 	AS_LAST_CODE
 };
 

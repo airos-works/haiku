@@ -511,8 +511,31 @@ View::SetViewBitmap(ServerBitmap* bitmap, IntRect sourceRect,
 	fBitmapDestination = destRect;
 	fBitmapResizingMode = resizingMode;
 	fBitmapOptions = options;
+	fBitmapPlacements.clear();
 
 	_UpdateOverlayView();
+}
+
+
+/*!	Shows \a bitmap at each of the \a destinations, drawn only within the
+	clipping rectangle that goes with it; whatever none of them covers gets
+	the view color. The placements stay where they are when the view is
+	resized. Overlay bitmaps cannot be shown more than once.
+*/
+void
+View::SetViewBitmapPlacements(ServerBitmap* bitmap, IntRect sourceRect,
+	const BRect* destinations, const BRect* clips, int32 count,
+	int32 options)
+{
+	SetViewBitmap(bitmap, sourceRect,
+		count > 0 ? IntRect(destinations[0]) : IntRect(), B_FOLLOW_NONE,
+		options);
+
+	if (bitmap == NULL || bitmap->Overlay() != NULL)
+		return;
+
+	for (int32 i = 0; i < count; i++)
+		fBitmapPlacements.push_back({destinations[i], clips[i]});
 }
 
 
@@ -1044,6 +1067,96 @@ View::BlendAllLayers()
 }
 
 
+/*!	Draws the view bitmap at \a destination, in view coordinates, into
+	\a redraw, and takes what it covered out of \a redraw.
+*/
+void
+View::_DrawViewBitmap(DrawingEngine* drawingEngine, BRegion* redraw,
+	BRect destination)
+{
+	// TODO: support other options!
+	BRect rect = destination;
+	PenToScreenTransform().Apply(&rect);
+
+	align_rect_to_pixels(&rect);
+
+	if (fBitmapOptions & B_TILE_BITMAP_Y) {
+		// move rect up as much as needed
+		while (rect.top > redraw->Frame().top)
+			rect.OffsetBy(0.0, -(rect.Height() + 1));
+	}
+	if (fBitmapOptions & B_TILE_BITMAP_X) {
+		// move rect left as much as needed
+		while (rect.left > redraw->Frame().left)
+			rect.OffsetBy(-(rect.Width() + 1), 0.0);
+	}
+
+// XXX: locking removed because the Window keeps the engine locked
+// because it keeps track of syncing right now
+
+	// lock the drawing engine for as long as we need the clipping
+	// to be valid
+	if (rect.IsValid()/* && drawingEngine->Lock()*/) {
+		drawingEngine->ConstrainClippingRegion(redraw);
+
+		drawing_mode oldMode;
+		drawingEngine->SetDrawingMode(B_OP_COPY, oldMode);
+
+		if (fBitmapOptions & B_TILE_BITMAP) {
+			// tile across entire view
+
+			float start = rect.left;
+			while (rect.top < redraw->Frame().bottom) {
+				while (rect.left < redraw->Frame().right) {
+					drawingEngine->DrawBitmap(fViewBitmap,
+						fBitmapSource, rect, fBitmapOptions);
+					rect.OffsetBy(rect.Width() + 1, 0.0);
+				}
+				rect.OffsetBy(start - rect.left, rect.Height() + 1);
+			}
+			// nothing left to be drawn
+			redraw->MakeEmpty();
+		} else if (fBitmapOptions & B_TILE_BITMAP_X) {
+			// tile in x direction
+
+			while (rect.left < redraw->Frame().right) {
+				drawingEngine->DrawBitmap(fViewBitmap, fBitmapSource,
+					rect, fBitmapOptions);
+				rect.OffsetBy(rect.Width() + 1, 0.0);
+			}
+			// remove horizontal stripe from clipping
+			rect.left = redraw->Frame().left;
+			rect.right = redraw->Frame().right;
+			redraw->Exclude(rect);
+		} else if (fBitmapOptions & B_TILE_BITMAP_Y) {
+			// tile in y direction
+
+			while (rect.top < redraw->Frame().bottom) {
+				drawingEngine->DrawBitmap(fViewBitmap, fBitmapSource,
+					rect, fBitmapOptions);
+				rect.OffsetBy(0.0, rect.Height() + 1);
+			}
+			// remove vertical stripe from clipping
+			rect.top = redraw->Frame().top;
+			rect.bottom = redraw->Frame().bottom;
+			redraw->Exclude(rect);
+		} else {
+			// no tiling at all
+
+			drawingEngine->DrawBitmap(fViewBitmap, fBitmapSource,
+				rect, fBitmapOptions);
+			redraw->Exclude(rect);
+		}
+
+		drawingEngine->SetDrawingMode(oldMode);
+
+		// NOTE: It is ok not to reset the clipping, that
+		// would only waste time
+//		drawingEngine->Unlock();
+	}
+}
+
+
 void
 View::Draw(DrawingEngine* drawingEngine, const BRegion* effectiveClipping,
 	const BRegion* windowContentClipping, bool deep)
@@ -1074,88 +1187,27 @@ View::Draw(DrawingEngine* drawingEngine, const BRegion* effectiveClipping,
 		Overlay* overlayCookie = _Overlay();
 
 		if (fViewBitmap != NULL && overlayCookie == NULL) {
-			// draw view bitmap
-			// TODO: support other options!
-			BRect rect = fBitmapDestination;
-			PenToScreenTransform().Apply(&rect);
+			if (fBitmapPlacements.empty())
+				_DrawViewBitmap(drawingEngine, redraw, fBitmapDestination);
 
-			align_rect_to_pixels(&rect);
+			for (size_t i = 0; i < fBitmapPlacements.size(); i++) {
+				const BitmapPlacement& placement = fBitmapPlacements[i];
+				BRect clip = placement.clip;
+				PenToScreenTransform().Apply(&clip);
 
-			if (fBitmapOptions & B_TILE_BITMAP_Y) {
-				// move rect up as much as needed
-				while (rect.top > redraw->Frame().top)
-					rect.OffsetBy(0.0, -(rect.Height() + 1));
-			}
-			if (fBitmapOptions & B_TILE_BITMAP_X) {
-				// move rect left as much as needed
-				while (rect.left > redraw->Frame().left)
-					rect.OffsetBy(-(rect.Width() + 1), 0.0);
-			}
-
-// XXX: locking removed because the Window keeps the engine locked
-// because it keeps track of syncing right now
-
-			// lock the drawing engine for as long as we need the clipping
-			// to be valid
-			if (rect.IsValid()/* && drawingEngine->Lock()*/) {
-				drawingEngine->ConstrainClippingRegion(redraw);
-
-				drawing_mode oldMode;
-				drawingEngine->SetDrawingMode(B_OP_COPY, oldMode);
-
-				if (fBitmapOptions & B_TILE_BITMAP) {
-					// tile across entire view
-
-					float start = rect.left;
-					while (rect.top < redraw->Frame().bottom) {
-						while (rect.left < redraw->Frame().right) {
-							drawingEngine->DrawBitmap(fViewBitmap,
-								fBitmapSource, rect, fBitmapOptions);
-							rect.OffsetBy(rect.Width() + 1, 0.0);
-						}
-						rect.OffsetBy(start - rect.left, rect.Height() + 1);
-					}
-					// nothing left to be drawn
-					redraw->MakeEmpty();
-				} else if (fBitmapOptions & B_TILE_BITMAP_X) {
-					// tile in x direction
-
-					while (rect.left < redraw->Frame().right) {
-						drawingEngine->DrawBitmap(fViewBitmap, fBitmapSource,
-							rect, fBitmapOptions);
-						rect.OffsetBy(rect.Width() + 1, 0.0);
-					}
-					// remove horizontal stripe from clipping
-					rect.left = redraw->Frame().left;
-					rect.right = redraw->Frame().right;
-					redraw->Exclude(rect);
-				} else if (fBitmapOptions & B_TILE_BITMAP_Y) {
-					// tile in y direction
-
-					while (rect.top < redraw->Frame().bottom) {
-						drawingEngine->DrawBitmap(fViewBitmap, fBitmapSource,
-							rect, fBitmapOptions);
-						rect.OffsetBy(0.0, rect.Height() + 1);
-					}
-					// remove vertical stripe from clipping
-					rect.top = redraw->Frame().top;
-					rect.bottom = redraw->Frame().bottom;
-					redraw->Exclude(rect);
-				} else {
-					// no tiling at all
-
-					drawingEngine->DrawBitmap(fViewBitmap, fBitmapSource,
-						rect, fBitmapOptions);
-					redraw->Exclude(rect);
+				BRegion* part = fWindow->GetRegion(*redraw);
+				BRegion clipRegion(clip);
+				part->IntersectWith(&clipRegion);
+				if (part->CountRects() > 0) {
+					BRegion* drawn = fWindow->GetRegion(*part);
+					_DrawViewBitmap(drawingEngine, part,
+						placement.destination);
+					drawn->Exclude(part);
+					redraw->Exclude(drawn);
+					fWindow->RecycleRegion(drawn);
 				}
-
-				drawingEngine->SetDrawingMode(oldMode);
-
-				// NOTE: It is ok not to reset the clipping, that
-				// would only waste time
-//				drawingEngine->Unlock();
+				fWindow->RecycleRegion(part);
 			}
-
 		}
 
 		if (fViewColor != B_TRANSPARENT_COLOR) {

@@ -115,6 +115,11 @@ private:
 
 	void Add(BackgroundImageInfo*);
 
+	BRect Destination(const BackgroundImageInfo* info, BRect host,
+		BView* view, uint32& options, uint32& followFlags);
+		// where the bitmap goes to show on host, a monitor's frame on the
+		// desktop
+
 	float BRectRatio(BRect rect);
 	float BRectHorizontalOverlap(BRect hostRect, BRect resizedRect);
 	float BRectVerticalOverlap(BRect hostRect, BRect resizedRect);
