@@ -44,6 +44,11 @@ All rights reserved.
 
 #include <fs_attr.h>
 
+#include <InterfacePrivate.h>
+#include <ViewPrivate.h>
+
+#include <vector>
+
 #include "BackgroundImage.h"
 
 #include "Background.h"
@@ -184,6 +189,31 @@ BackgroundImage::Show(BView* view, int32 workspace)
 }
 
 
+/*!	The frames of the monitors showing the desktop, each its own part of
+	it; empty when the layout is unknown.
+*/
+static void
+get_display_frames(std::vector<BRect>& frames)
+{
+	BMessage layout;
+	if (BPrivate::get_display_layout(layout) != B_OK)
+		return;
+
+	BMessage display;
+	for (int32 index = 0;
+			layout.FindMessage("display", index, &display) == B_OK;
+			index++) {
+		BRect frame;
+		if (!display.GetBool("enabled", false)
+			|| display.GetInt32("mirror", -1) >= 0
+			|| display.FindRect("frame", &frame) != B_OK
+			|| !frame.IsValid())
+			continue;
+		frames.push_back(frame);
+	}
+}
+
+
 void
 BackgroundImage::Show(BackgroundImageInfo* info, BView* view)
 {
@@ -197,36 +227,77 @@ BackgroundImage::Show(BackgroundImageInfo* info, BView* view)
 		fShowingBitmap = info;
 		return;
 	}
-	BRect viewBounds(view->Bounds());
 	BRect bitmapBounds(info->fBitmap->Bounds());
-	BRect destinationBitmapBounds(bitmapBounds);
 
 	uint32 options = 0;
 	uint32 followFlags = B_FOLLOW_TOP | B_FOLLOW_LEFT;
+
+	if (fIsDesktop) {
+		// with more than one monitor, each shows the whole picture
+		std::vector<BRect> displays;
+		get_display_frames(displays);
+		if (displays.size() > 1) {
+			std::vector<BRect> destinations;
+			for (size_t i = 0; i < displays.size(); i++) {
+				destinations.push_back(Destination(info, displays[i], view,
+					options, followFlags));
+			}
+
+			if (BView::Private(view).SetViewBitmapPlacements(info->fBitmap,
+					bitmapBounds, destinations.data(), displays.data(),
+					(int32)displays.size(), options) == B_OK) {
+				view->Invalidate();
+				fShowingBitmap = info;
+				return;
+			}
+			options = 0;
+			followFlags = B_FOLLOW_TOP | B_FOLLOW_LEFT;
+		}
+	}
+
+	BRect destinationBitmapBounds = Destination(info, view->Bounds(), view,
+		options, followFlags);
+
+	// switch to the bitmap and force a redraw
+	view->SetViewBitmap(info->fBitmap, bitmapBounds, destinationBitmapBounds,
+		followFlags, options);
+	view->Invalidate();
+	fShowingBitmap = info;
+}
+
+
+BRect
+BackgroundImage::Destination(const BackgroundImageInfo* info, BRect host,
+	BView* view, uint32& options, uint32& followFlags)
+{
+	BPoseView* poseView = dynamic_cast<BPoseView*>(view);
+	BRect hostBounds(host.OffsetToCopy(B_ORIGIN));
+	BRect bitmapBounds(info->fBitmap->Bounds());
+	BRect destinationBitmapBounds(bitmapBounds);
 
 	// figure out the display mode and the destination bounds for the bitmap
 	switch (info->fMode) {
 		case kCentered:
 			if (fIsDesktop) {
 				destinationBitmapBounds.OffsetBy(
-					(viewBounds.Width() - bitmapBounds.Width()) / 2,
-					(viewBounds.Height() - bitmapBounds.Height()) / 2);
+					(hostBounds.Width() - bitmapBounds.Width()) / 2,
+					(hostBounds.Height() - bitmapBounds.Height()) / 2);
 				break;
 			}
 			// else fall thru
 		case kScaledToFit:
 			if (fIsDesktop) {
 				if (BRectRatio(destinationBitmapBounds)
-						>= BRectRatio(viewBounds)) {
-					float overlap = BRectHorizontalOverlap(viewBounds,
+						>= BRectRatio(hostBounds)) {
+					float overlap = BRectHorizontalOverlap(hostBounds,
 						destinationBitmapBounds);
 					destinationBitmapBounds.Set(-overlap, 0,
-						viewBounds.Width() + overlap, viewBounds.Height());
+						hostBounds.Width() + overlap, hostBounds.Height());
 				} else {
-					float overlap = BRectVerticalOverlap(viewBounds,
+					float overlap = BRectVerticalOverlap(hostBounds,
 						destinationBitmapBounds);
 					destinationBitmapBounds.Set(0, -overlap,
-						viewBounds.Width(), viewBounds.Height() + overlap);
+						hostBounds.Width(), hostBounds.Height() + overlap);
 				}
 				followFlags = B_FOLLOW_ALL;
 				options |= B_FILTER_BITMAP_BILINEAR;
@@ -243,8 +314,8 @@ BackgroundImage::Show(BackgroundImageInfo* info, BView* view)
 		case kTiled:
 			if (fIsDesktop) {
 				destinationBitmapBounds.OffsetBy(
-					(viewBounds.Width() - bitmapBounds.Width()) / 2,
-					(viewBounds.Height() - bitmapBounds.Height()) / 2);
+					(hostBounds.Width() - bitmapBounds.Width()) / 2,
+					(hostBounds.Height() - bitmapBounds.Height()) / 2);
 			} else if (poseView != NULL) {
 				// tile from top left of window even if scrolled over
 				destinationBitmapBounds.OffsetTo(poseView->Extent().LeftTop());
@@ -253,11 +324,11 @@ BackgroundImage::Show(BackgroundImageInfo* info, BView* view)
 			break;
 	}
 
-	// switch to the bitmap and force a redraw
-	view->SetViewBitmap(info->fBitmap, bitmapBounds, destinationBitmapBounds,
-		followFlags, options);
-	view->Invalidate();
-	fShowingBitmap = info;
+	// on the desktop, the host is the part of the screen a monitor shows
+	if (fIsDesktop)
+		destinationBitmapBounds.OffsetBy(host.LeftTop());
+
+	return destinationBitmapBounds;
 }
 
 
@@ -365,23 +436,11 @@ BackgroundImage::ScreenChanged(BRect, color_space)
 	if (!fIsDesktop || fShowingBitmap == NULL || fShowingBitmap->fBitmap == NULL)
 		return;
 
-	if (fShowingBitmap->fMode == kCentered) {
-		BRect viewBounds(fView->Bounds());
-		BRect bitmapBounds(fShowingBitmap->fBitmap->Bounds());
-		BRect destinationBitmapBounds(bitmapBounds);
-		destinationBitmapBounds.OffsetBy(
-			(viewBounds.Width() - bitmapBounds.Width()) / 2,
-			(viewBounds.Height() - bitmapBounds.Height()) / 2);
-
-		fView->SetViewBitmap(fShowingBitmap->fBitmap, bitmapBounds,
-			destinationBitmapBounds, B_FOLLOW_NONE, 0);
-		fView->Invalidate();
-	} else if (fShowingBitmap->fMode == kScaledToFit) {
-		// The picture was fitted to the old screen and only follows the
-		// view's size from there; a screen of another shape (a monitor
-		// added, or mirroring another) would stretch it.
-		Show(fShowingBitmap, fView);
-	}
+	// The picture was placed for the old screen, on each of its monitors,
+	// and a centered or fitted one would only follow the view's size from
+	// there: a screen of another shape (a monitor added, moved, or
+	// mirroring another) needs it placed anew.
+	Show(fShowingBitmap, fView);
 }
 
 

@@ -27,6 +27,8 @@
 #include <Referenceable.h>
 #include <String.h>
 
+#include <vector>
+
 class BList;
 class BMessage;
 
@@ -149,6 +151,11 @@ public:
 			void			SetViewBitmap(ServerBitmap* bitmap,
 								IntRect sourceRect, IntRect destRect,
 								int32 resizingMode, int32 options);
+			void			SetViewBitmapPlacements(ServerBitmap* bitmap,
+								IntRect sourceRect,
+								const BRect* destinations,
+								const BRect* clips, int32 count,
+								int32 options);
 
 			void			PushState();
 			void			PopState();
@@ -234,6 +241,8 @@ protected:
 								bool deep);
 			Overlay*		_Overlay() const;
 			void			_UpdateOverlayView() const;
+			void			_DrawViewBitmap(DrawingEngine* drawingEngine,
+								BRegion* redraw, BRect destination);
 
 			BString			fName;
 			int32			fToken;
@@ -251,6 +260,15 @@ protected:
 			IntRect			fBitmapDestination;
 			int32			fBitmapResizingMode;
 			int32			fBitmapOptions;
+
+			// The view bitmap drawn at each destination, within its clipping
+			// rectangle; when there are none, at fBitmapDestination only
+			struct BitmapPlacement {
+				BRect		destination;
+				BRect		clip;
+			};
+			std::vector<BitmapPlacement>
+							fBitmapPlacements;
 
 			uint32			fResizeMode;
 			uint32			fFlags;

@@ -7291,6 +7291,33 @@ BView::Private::StrokeFrameLineArray(BRect frame, int32 rings, uint32 borders,
 }
 
 
+status_t
+BView::Private::SetViewBitmapPlacements(const BBitmap* bitmap, BRect source,
+	const BRect* destinations, const BRect* clips, int32 count,
+	uint32 options)
+{
+	if (bitmap == NULL || count < 1 || count > 64)
+		return B_BAD_VALUE;
+	if (!fView->_CheckOwnerLockAndSwitchCurrent())
+		return B_ERROR;
+
+	fView->fOwner->fLink->StartMessage(AS_VIEW_SET_VIEW_BITMAP_PLACEMENTS);
+	fView->fOwner->fLink->Attach<int32>(bitmap->_ServerToken());
+	fView->fOwner->fLink->Attach<BRect>(source);
+	fView->fOwner->fLink->Attach<int32>(options);
+	fView->fOwner->fLink->Attach<int32>(count);
+	for (int32 i = 0; i < count; i++) {
+		fView->fOwner->fLink->Attach<BRect>(destinations[i]);
+		fView->fOwner->fLink->Attach<BRect>(clips[i]);
+	}
+
+	status_t status = B_ERROR;
+	fView->fOwner->fLink->FlushWithReply(status);
+
+	return status;
+}
+
+
 bool
 BView::Private::WillLayout()
 {

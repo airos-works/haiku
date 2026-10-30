@@ -90,6 +90,15 @@ public:
 									const ViewLineArrayInfo* lines,
 									int32 count);
 
+			// Shows the view bitmap at each of the destinations, drawn only
+			// within the clipping rectangle that goes with it (in view
+			// coordinates); the view color fills what none of them covers.
+			// Defined in View.cpp
+			status_t			SetViewBitmapPlacements(const BBitmap* bitmap,
+									BRect source, const BRect* destinations,
+									const BRect* clips, int32 count,
+									uint32 options);
+
 private:
 			BView* fView;
 };
