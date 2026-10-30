@@ -21,6 +21,7 @@
 #include <Roster.h>
 #include <ScrollView.h>
 #include <SeparatorView.h>
+#include <SpaceLayoutItem.h>
 #include <StatusBar.h>
 #include <StringView.h>
 #include <TabView.h>
@@ -222,6 +223,8 @@ UpdaterWindow::_CreateUpdatesTab()
 	fProgressBar = new BStatusBar("progress");
 	fProgressBar->SetMaxValue(1.0);
 	fProgressBar->Hide();
+	// takes the room of the changes while they are hidden
+	fChangesGlue = BSpaceLayoutItem::CreateGlue();
 
 	fCheckButton = new BButton("check", "Check Again",
 		new BMessage(kMsgCheckButton));
@@ -236,10 +239,10 @@ UpdaterWindow::_CreateUpdatesTab()
 	BLayoutBuilder::Group<>(view, B_VERTICAL)
 		.SetInsets(B_USE_WINDOW_SPACING)
 		.Add(fTitleView)
-		.Add(fSummaryView)
+		.Add(fSummaryView, 0)
 		.Add(fChangesLabel)
 		.Add(changesScroll, 1.0)
-		.AddGlue(0)
+		.Add(fChangesGlue, 0)
 		.Add(fProgressBar)
 		.AddGroup(B_HORIZONTAL)
 			.Add(fCheckButton)
@@ -541,11 +544,18 @@ UpdaterWindow::_ShowState()
 	fMainButton->SetLabel(main);
 	fSecondaryButton->SetLabel(secondary);
 
-	bool showChanges = fMode == kModeIdle || fMode == kModeChecking
-		|| fMode == kModeAvailable || fMode == kModeClosingApps
-		|| fMode == kModeInstalling;
+	// Blank until a check has finished, which can take a minute: show the
+	// box only with something in it.
+	bool showChanges = (fMode == kModeIdle || fMode == kModeAvailable
+			|| fMode == kModeClosingApps || fMode == kModeInstalling)
+		&& fChangesView->TextLength() > 0;
 	_SetVisible(fChangesLabel, showChanges);
 	_SetVisible(fChangesScroll, showChanges);
+	BGroupLayout* layout = dynamic_cast<BGroupLayout*>(fChangesGlue->Layout());
+	if (layout != NULL) {
+		layout->SetItemWeight(layout->IndexOfItem(fChangesGlue),
+			showChanges ? 0 : 1);
+	}
 	_SetVisible(fMainButton, showMain);
 	_SetVisible(fSecondaryButton, showSecondary);
 	_SetVisible(fCancelButton, fMode == kModeInstalling
@@ -566,7 +576,9 @@ UpdaterWindow::_SetBusy(bool busy, const char* text)
 {
 	fBusy = busy;
 	if (busy) {
+		// Reset() also sets the maximum back to 100
 		fProgressBar->Reset();
+		fProgressBar->SetMaxValue(1.0);
 		fProgressBar->SetText(text);
 	}
 	_SetVisible(fProgressBar, busy);

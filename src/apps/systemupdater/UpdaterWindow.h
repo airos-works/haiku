@@ -15,6 +15,7 @@
 
 class BButton;
 class BCheckBox;
+class BLayoutItem;
 class BListView;
 class BStatusBar;
 class BStringView;
@@ -73,6 +74,7 @@ private:
 			BView*				fChangesLabel;
 			BView*				fChangesScroll;
 			BStatusBar*			fProgressBar;
+			BLayoutItem*		fChangesGlue;
 			BButton*			fCheckButton;
 			BButton*			fCancelButton;
 			BButton*			fSecondaryButton;
