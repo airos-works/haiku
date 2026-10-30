@@ -495,6 +495,7 @@ IrisDecoder::Close()
 	fReady.clear();
 	fReadyPts.clear();
 	fReadyCorrupt.clear();
+	fDropped.clear();
 }
 
 
@@ -594,6 +595,7 @@ IrisDecoder::Flush()
 	}
 	fReadyPts.clear();
 	fReadyCorrupt.clear();
+	fDropped.clear();
 	fEndOfStream = false;
 	fEnded = false;
 	if (!fOutputStarted)
@@ -634,6 +636,7 @@ IrisDecoder::NextPicture(Picture& picture, bigtime_t timeout)
 	Output& output = fOutputs[index];
 	output.ready = false;
 	output.held = true;
+	_ReturnDropped();
 	picture.buffer = index;
 	picture.pts = fReadyPts.front();
 	picture.corrupt = fReadyCorrupt.front();
@@ -663,10 +666,11 @@ IrisDecoder::ReleasePicture(const Picture& picture)
 	if (!output.held)
 		return;
 	output.held = false;
-	if (!fFailed && !fEnded && fOutputStarted
-		&& output.buffer.size == fOutputSize) {
-		_QueueOutput(picture.buffer);
-	}
+	if (fFailed || fEnded || !fOutputStarted
+		|| output.buffer.size != fOutputSize)
+		return;
+
+	_QueueOutput(picture.buffer);
 }
 
 
@@ -999,9 +1003,9 @@ IrisDecoder::_Handle(const uint32* packet, size_t size)
 				if (filled != 0 && (flags & HFI_BUFFERFLAG_DROP_FRAME) != 0
 					&& (flags & HFI_BUFFERFLAG_EOS) == 0) {
 					// not to be shown (VP9's hidden frames, the parts of a
-					// superframe before the last), as venus has it
-					if (fOutputStarted && !fFailed)
-						_QueueOutput(tag);
+					// superframe before the last), as venus has it: back to
+					// the firmware with the next picture taken
+					fDropped.push_back(tag);
 				} else if (filled != 0) {
 					output.ready = true;
 					fReady.push_back(tag);
@@ -1143,13 +1147,6 @@ IrisDecoder::_HandleEvent(const uint32* packet, size_t size)
 		fFailed = true;
 		return _Fail(B_ERROR, "a sequence event without a picture size");
 	}
-	// Larger VP9 kept references without end: with 12 the firmware stopped
-	// after one 4K picture, with 24 after four, and then answered nothing
-	// any more (asked for 64, 850 MB). 1080p decodes with 12.
-	if (fCodec == VP9 && (width > 1920 || height > 1088)) {
-		fFailed = true;
-		return _Fail(B_NOT_SUPPORTED, "VP9 larger than 1080p is not supported");
-	}
 
 	fEventWidth = width;
 	fEventHeight = height;
@@ -1168,8 +1165,9 @@ IrisDecoder::_HandleEvent(const uint32* packet, size_t size)
 			fEventCrop[3] = height - fEventCrop[1] - bottom * 2;
 	}
 	fEventMinCount = minCount != 0 ? minCount : 4;
-	// VP9 asks for 64 (850 MB of references at 4K); its eight reference
-	// slots and the picture being decoded need a few more than eight
+	// VP9 asks for 64 (850 MB of references at 4K; venus forces 11 "due to
+	// a firmware bug"): its eight reference slots and the picture being
+	// decoded need a few more than eight
 	if (fCodec == VP9 && maxDpbCount != 0 && fEventMinCount > maxDpbCount + 4)
 		fEventMinCount = maxDpbCount + 4;
 
@@ -1231,8 +1229,10 @@ IrisDecoder::_ConfigurePorts(bool input)
 			HFI_BUFFER_OUTPUT, 64, 64);
 	}
 	if (status == B_OK) {
+		// all that will be queued (venus says as many): VP9 asserted on its
+		// buffer list (vbuffer.c:657) with more queued than said
 		status = _SetProperty(HFI_PROPERTY_PARAM_BUFFER_COUNT_ACTUAL,
-			HFI_BUFFER_OUTPUT2, fMinCount, fMinCount);
+			HFI_BUFFER_OUTPUT2, _OutputCount(), _OutputCount());
 	}
 	if (status == B_OK) {
 		status = _SetProperty(HFI_PROPERTY_PARAM_VDEC_MULTI_STREAM,
@@ -1362,7 +1362,7 @@ IrisDecoder::_StartOutput()
 	for (size_t i = 0; status == B_OK && i < fReferences.size(); i++)
 		status = _QueueReference(i);
 
-	for (uint32 i = 0; status == B_OK && i < fMinCount + kExtraOutputs; i++) {
+	for (uint32 i = 0; status == B_OK && i < _OutputCount(); i++) {
 		Output output = {};
 		status = fDevice.Allocate(fOutputSize, output.buffer);
 		if (status != B_OK) {
@@ -1379,6 +1379,27 @@ IrisDecoder::_StartOutput()
 	}
 	fOutputStarted = true;
 	return B_OK;
+}
+
+
+//!	The pictures' buffers: the firmware's minimum and ours.
+uint32
+IrisDecoder::_OutputCount() const
+{
+	return fMinCount + kExtraOutputs;
+}
+
+
+void
+IrisDecoder::_ReturnDropped()
+{
+	for (size_t i = 0; i < fDropped.size(); i++) {
+		Output& output = fOutputs[fDropped[i]];
+		if (fOutputStarted && !fFailed && !output.queued && !output.ready
+			&& !output.held)
+			_QueueOutput(fDropped[i]);
+	}
+	fDropped.clear();
 }
 
 

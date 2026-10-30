@@ -3,9 +3,9 @@
  * Distributed under the terms of the MIT License.
  */
 
-/*	H.264 and HEVC on the SC8280XP's video codec (Radxa Dragon Q8B), as a
-	decoder add-on of the Media Kit (IrisDecoder does the work); VP9 and
-	MPEG-2 for the lab (see experimental_codecs()).
+/*	H.264, HEVC and VP9 on the SC8280XP's video codec (Radxa Dragon Q8B), as
+	a decoder add-on of the Media Kit (IrisDecoder does the work); MPEG-2 for
+	the lab (see experimental_codecs()).
 
 	As sunxi_cedar: the formats are only registered where the codec is
 	(/dev/video/qcom_iris/0 exists), and a stream it does not decode (fields
@@ -55,13 +55,10 @@ static const uint32 kCodecVP9 = 167;
 static const uint32 kCodecHEVC = 173;
 
 
-/*!	VP9 and MPEG-2 only for the lab (IRIS_EXPERIMENTAL in the environment):
-	VP9 decodes byte exact in iris_decode, yet through the Media Kit the
-	firmware stopped answering after the same few pictures of a 1080p film
-	every time (the same commands as iris_decode's), and above 1080p it
-	keeps references without end; every MPEG-2 film tried was interlaced,
-	which the firmware dies on. A stalled firmware takes the codec down
-	until the next boot.
+/*!	MPEG-2 only for the lab (IRIS_EXPERIMENTAL in the environment): every
+	MPEG-2 film on hand is interlaced and too wide for the codec's copies of
+	fields (see IrisDecoder::_HandleEvent()); a progressive one was never
+	decoded. A stalled firmware takes the codec down until the next boot.
 */
 static bool
 experimental_codecs()
@@ -542,8 +539,8 @@ QcomIrisDecoder::Setup(media_format* format, const void* info,
 		|| description.u.misc.file_format != 'ffmp'
 		|| (description.u.misc.codec != kCodecH264
 			&& description.u.misc.codec != kCodecHEVC
-			&& ((description.u.misc.codec != kCodecVP9
-					&& description.u.misc.codec != kCodecMPEG2)
+			&& description.u.misc.codec != kCodecVP9
+			&& (description.u.misc.codec != kCodecMPEG2
 				|| !experimental_codecs()))) {
 		return B_NOT_SUPPORTED;
 	}
@@ -561,9 +558,6 @@ QcomIrisDecoder::Setup(media_format* format, const void* info,
 	else if (fCodec == kCodecMPEG2
 		&& (display.line_width > 1920 || display.line_count > 1920))
 		reason = "the codec decodes MPEG-2 up to 1920x1920";
-	else if (fCodec == kCodecVP9
-		&& (display.line_width > 1920 || display.line_count > 1088))
-		reason = "the codec decodes VP9 up to 1920x1088 (see IrisDecoder)";
 	else if (!_CodecDecodes(reason)) {
 		// (reason says why)
 	} else if (_OpenDecoder(reason) == B_OK) {
@@ -888,7 +882,7 @@ QcomIrisPlugin::GetSupportedFormats(media_format** _formats, size_t* _count)
 		return B_OK;
 	const uint32 kCodecs[] = { kCodecH264, kCodecHEVC, kCodecVP9,
 		kCodecMPEG2 };
-	size_t count = experimental_codecs() ? 4 : 2;
+	size_t count = experimental_codecs() ? 4 : 3;
 	for (size_t i = 0; i < count; i++) {
 		media_format_description description;
 		description.family = B_MISC_FORMAT_FAMILY;
