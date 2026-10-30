@@ -38,6 +38,8 @@
 
 static const char* kDebuggerSignature = "application/x-vnd.Haiku-Debugger";
 static const int32 MSG_DEBUG_THIS_TEAM = 'dbtt';
+static const bigtime_t kGUIServersTimeout = 30000000;
+	// how long a crash early in the boot waits for the desktop
 
 
 //#define TRACE_DEBUG_SERVER
@@ -232,6 +234,7 @@ private:
 	static const char *_LastPathComponent(const char *path);
 	static team_id _FindTeam(const char *name);
 	static bool _AreGUIServersAlive();
+	static void _WaitForGUIServers(bigtime_t timeout);
 
 private:
 	DebugMessageList		fMessages;
@@ -864,6 +867,9 @@ TeamDebugHandler::_HandleMessage(DebugMessage *message)
 	}
 
 	// ask the user whether to debug or kill the team
+	if (!_IsGUIServer() && debugAction == kActionPromptUser && USE_GUI)
+		_WaitForGUIServers(kGUIServersTimeout);
+
 	if (_IsGUIServer()) {
 		// App server, input server, or registrar. We always debug those.
 		// if not specifically overridden.
@@ -1188,7 +1194,21 @@ bool
 TeamDebugHandler::_AreGUIServersAlive()
 {
 	return _FindTeam("app_server") >= 0 && _FindTeam("input_server") >= 0
-		&& _FindTeam("registrar");
+		&& _FindTeam("registrar") >= 0;
+}
+
+
+/*!	A team that crashes early in the boot, before the desktop is up, would
+	otherwise get the command line debugger in consoled, which takes the
+	keyboard from input_server and draws over the desktop once that comes up:
+	the computer looks unusable. Waits a while for the GUI servers instead.
+*/
+/*static*/ void
+TeamDebugHandler::_WaitForGUIServers(bigtime_t timeout)
+{
+	bigtime_t until = system_time() + timeout;
+	while (!_AreGUIServersAlive() && system_time() < until)
+		snooze(250000);
 }
 
 
