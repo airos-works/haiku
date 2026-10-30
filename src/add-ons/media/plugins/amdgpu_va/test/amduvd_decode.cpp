@@ -9,12 +9,17 @@
 	"ffmpeg -i file -f framemd5 -pix_fmt nv12|yuv420p|p010le|bgra -", which
 	hashes the same layouts (bgra: RGB32).
 
-	amduvd_decode add-on file nv12|i420|p010|rgb32 [pictures] */
+	amduvd_decode add-on file nv12|i420|p010|rgb32 [pictures] [bench|times]
+
+	"bench" prints no hashes but the pictures decoded a second and the
+	processor time taken; "times" prints each picture's start_time, which
+	must be the presentation times of the stream in order. */
 
 
 #include <Application.h>
 #include <DecoderPlugin.h>
 #include <MediaFormats.h>
+#include <OS.h>
 #include <image.h>
 
 #include <stdio.h>
@@ -98,7 +103,12 @@ main(int argc, char** argv)
 	if (stream < 0)
 		return 1;
 	AVCodecParameters* parameters = context->streams[stream]->codecpar;
-	int decoderIndex = parameters->codec_id == AV_CODEC_ID_HEVC ? 1 : 0;
+	int decoderIndex = parameters->codec_id == AV_CODEC_ID_HEVC ? 1
+		: parameters->codec_id == AV_CODEC_ID_VP9 ? 2
+		: parameters->codec_id == AV_CODEC_ID_AV1 ? 3 : 0;
+	const char* mode = argc > 5 ? argv[5] : "";
+	bool bench = strcmp(mode, "bench") == 0;
+	bool times = strcmp(mode, "times") == 0;
 
 	image_id image = load_add_on(argv[1]);
 	MediaPlugin* (*instantiate)() = NULL;
@@ -165,6 +175,9 @@ main(int argc, char** argv)
 	std::vector<uint8_t> picture(bytes);
 
 	int pictures = 0;
+	bigtime_t started = system_time();
+	team_usage_info usageBefore;
+	get_team_usage_info(B_CURRENT_TEAM, B_TEAM_USAGE_SELF, &usageBefore);
 	while (pictures < limit) {
 		int64 count = 0;
 		media_header header;
@@ -177,6 +190,14 @@ main(int argc, char** argv)
 			fprintf(stderr, "decoding failed: %s\n", strerror(status));
 			return 1;
 		}
+		if (bench) {
+			pictures++;
+			continue;
+		}
+		if (times) {
+			printf("%d %lld\n", pictures++, (long long)header.start_time);
+			continue;
+		}
 		uint8_t digest[16];
 		av_md5_sum(digest, picture.data(), bytes);
 		printf("%d %s ", pictures++, argv[3]);
@@ -184,7 +205,16 @@ main(int argc, char** argv)
 			printf("%02x", digest[i]);
 		printf("\n");
 	}
-	fprintf(stderr, "%d picture(s), %dx%d\n", pictures, width, height);
+	bigtime_t elapsed = system_time() - started;
+	team_usage_info usage;
+	get_team_usage_info(B_CURRENT_TEAM, B_TEAM_USAGE_SELF, &usage);
+	media_codec_info codecInfo;
+	decoder->GetCodecInfo(&codecInfo);
+	fprintf(stderr, "%d picture(s), %dx%d, %s: %.1f pictures/s, %.2f cores\n",
+		pictures, width, height, codecInfo.short_name,
+		pictures * 1e6 / (elapsed ? elapsed : 1),
+		(usage.user_time + usage.kernel_time - usageBefore.user_time
+			- usageBefore.kernel_time) / (double)(elapsed ? elapsed : 1));
 	delete decoder;
 	return 0;
 }

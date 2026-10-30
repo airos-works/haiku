@@ -207,7 +207,10 @@ Package haiku_datatranslators {
 ```
 
 The VA-API add-on is installed under the same name, `amduvd`, as airTime and
-Summit load AMD decoders by that name (decoder 0 H.264, 1 HEVC).
+Summit load AMD decoders by that name (decoder 0 H.264, 1 HEVC, 2 VP9,
+3 AV1). VP9 needs VCN 1 or later and AV1 VCN 3 or later: on the WX 5100
+(UVD 6) those two fail in Setup() or at the first picture, and the
+programs decode them in software.
 
 ## Building and installing
 

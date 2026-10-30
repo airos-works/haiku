@@ -3,17 +3,21 @@
  * Distributed under the terms of the MIT License.
  */
 
-/*	H.264 and HEVC decoding on AMD GPUs: libavcodec parses the streams and
-	orders the pictures, VA-API (Mesa's radeonsi driver on amdgpu_drm, the
-	GPU's UVD/VCN) decodes them. Decoded pictures are read into one VA image
-	kept for the stream, as NV12 or P010, and converted to what the caller
-	negotiated with the conversions of H264Output and HevcOutput. (A new
-	image for every picture, as av_hwframe_transfer_data() makes, costs more
-	than the copy: its memory is new each time.)
+/*	H.264, HEVC, VP9 and AV1 decoding on AMD GPUs: libavcodec parses the
+	streams and orders the pictures, VA-API (Mesa's radeonsi driver on
+	amdgpu_drm, the GPU's UVD/VCN) decodes them. Decoded pictures are read
+	into one VA image kept for the stream, as NV12 or P010, and converted to
+	what the caller negotiated with the conversions of H264Output and
+	HevcOutput. (A new image for every picture, as av_hwframe_transfer_data()
+	makes, costs more than the copy: its memory is new each time.)
 
 	It is installed as "amduvd": airTime and Summit load decoders by name,
-	NewDecoder(0) for H.264 and NewDecoder(1) for HEVC, and keep their
-	software decoders for what this one refuses. libavcodec is linked in
+	NewDecoder(0) for H.264, NewDecoder(1) for HEVC, NewDecoder(2) for VP9
+	(profiles 0 and 2) and NewDecoder(3) for AV1 (Main), and keep their
+	software decoders for what this one refuses. Whether the GPU decodes a
+	codec at all is the driver's to say: VCN 1 and later decode VP9, VCN 3
+	and later AV1; on older GPUs (the WX 5100's UVD 6) Setup() or the first
+	picture fails and the caller decodes in software. libavcodec is linked in
 	statically, so that it does not clash with the system's (without VA-API)
 	that the applications load themselves. */
 
@@ -50,8 +54,31 @@ static const color_space kNV12 = (color_space)0x4e563132;
 static const color_space kI420 = (color_space)0x49343230;
 static const color_space kP010 = (color_space)0x50303130;
 
+// libavcodec's codec numbers (AV_CODEC_ID_*), as the media kit's 'ffmp'
+// family names formats
 static const int kCodecH264 = 27;
 static const int kCodecHevc = 173;
+static const int kCodecVP9 = 167;
+static const int kCodecAV1 = 226;
+
+enum VaCodec { kH264 = 0, kHevc = 1, kVP9 = 2, kAV1 = 3 };
+
+static const struct {
+	int			mediaCodec;
+	AVCodecID	codecID;
+	const char*	shortName;
+	const char*	prettyName;
+	bool		tenBit;
+} kCodecs[] = {
+	{ kCodecH264, AV_CODEC_ID_H264, "amduvd h264",
+		"AMD H.264 hardware decoder (VA-API)", false },
+	{ kCodecHevc, AV_CODEC_ID_HEVC, "amduvd hevc",
+		"AMD HEVC hardware decoder (VA-API)", true },
+	{ kCodecVP9, AV_CODEC_ID_VP9, "amduvd vp9",
+		"AMD VP9 hardware decoder (VA-API)", true },
+	{ kCodecAV1, AV_CODEC_ID_AV1, "amduvd av1",
+		"AMD AV1 hardware decoder (VA-API)", true },
+};
 
 
 /*!	The render node of the first AMD GPU, "" if there is none. */
@@ -98,7 +125,7 @@ choose_vaapi(AVCodecContext*, const enum AVPixelFormat* formats)
 
 class VaDecoder : public Decoder {
 public:
-								VaDecoder(bool hevc);
+								VaDecoder(VaCodec codec);
 	virtual						~VaDecoder();
 
 	virtual	void				GetCodecInfo(media_codec_info* info);
@@ -119,9 +146,11 @@ private:
 									int height);
 			bool				_CopyPlanes(const uint8* data, bool p010,
 									uint8* output);
+			void				_NarrowPlanes(const uint8* data,
+									uint8* output);
 			bool				_Convert(const AVFrame* frame, uint8* output);
 
-			bool				fHevc;
+			VaCodec				fCodec;
 			status_t			fStatus;
 			media_format		fInput;
 			int					fWidth;
@@ -143,9 +172,9 @@ private:
 };
 
 
-VaDecoder::VaDecoder(bool hevc)
+VaDecoder::VaDecoder(VaCodec codec)
 	:
-	fHevc(hevc),
+	fCodec(codec),
 	fStatus(B_NO_INIT),
 	fWidth(0),
 	fHeight(0),
@@ -200,11 +229,10 @@ void
 VaDecoder::GetCodecInfo(media_codec_info* info)
 {
 	memset(info, 0, sizeof(*info));
-	strlcpy(info->short_name, fHevc ? "amduvd hevc" : "amduvd h264",
+	strlcpy(info->short_name, kCodecs[fCodec].shortName,
 		sizeof(info->short_name));
-	strlcpy(info->pretty_name, fHevc
-		? "AMD HEVC hardware decoder (VA-API)"
-		: "AMD H.264 hardware decoder (VA-API)", sizeof(info->pretty_name));
+	strlcpy(info->pretty_name, kCodecs[fCodec].prettyName,
+		sizeof(info->pretty_name));
 }
 
 
@@ -249,8 +277,7 @@ VaDecoder::Setup(media_format* input, const void* info, size_t size)
 	if (BMediaFormats().GetCodeFor(*input, B_MISC_FORMAT_FAMILY, &description)
 			!= B_OK
 		|| description.u.misc.file_format != 'ffmp'
-		|| description.u.misc.codec
-			!= (uint32)(fHevc ? kCodecHevc : kCodecH264))
+		|| description.u.misc.codec != (uint32)kCodecs[fCodec].mediaCodec)
 		return B_NOT_SUPPORTED;
 	const media_video_display_info& display
 		= input->u.encoded_video.output.display;
@@ -265,8 +292,7 @@ VaDecoder::Setup(media_format* input, const void* info, size_t size)
 	fDisplay = ((AVVAAPIDeviceContext*)
 		((AVHWDeviceContext*)fDevice->data)->hwctx)->display;
 
-	const AVCodec* codec = avcodec_find_decoder(fHevc ? AV_CODEC_ID_HEVC
-		: AV_CODEC_ID_H264);
+	const AVCodec* codec = avcodec_find_decoder(kCodecs[fCodec].codecID);
 	fContext = codec != NULL ? avcodec_alloc_context3(codec) : NULL;
 	fPacket = av_packet_alloc();
 	fFrame = av_frame_alloc();
@@ -315,7 +341,7 @@ VaDecoder::NegotiateOutputFormat(media_format* output)
 	} else if (space == kI420) {
 		format = HevcOutput::I420;
 		bytesPerPixel = 1;
-	} else if (space == kP010 && fHevc) {
+	} else if (space == kP010 && kCodecs[fCodec].tenBit) {
 		format = HevcOutput::P010;
 		bytesPerPixel = 2;
 	} else if (space == B_YCbCr422) {
@@ -408,6 +434,51 @@ split_chroma_row(const uint8* source, uint8* u, uint8* v, uint32 pairs)
 }
 
 
+/*!	Rounds a row of ten-bit samples, in the top bits of 16-bit words (P010),
+	to the nearest eight-bit codes, as HevcOutput does (it clamps 1023 to
+	255). */
+static void
+narrow_row(const uint8* source, uint8* target, uint32 count)
+{
+	uint32 i = 0;
+#if defined(__x86_64__)
+	const __m128i two = _mm_set1_epi16(2);
+	for (; i + 16 <= count; i += 16) {
+		__m128i a = _mm_loadu_si128((const __m128i*)(source + 2 * i));
+		__m128i b = _mm_loadu_si128((const __m128i*)(source + 2 * i + 16));
+		a = _mm_srli_epi16(_mm_add_epi16(_mm_srli_epi16(a, 6), two), 2);
+		b = _mm_srli_epi16(_mm_add_epi16(_mm_srli_epi16(b, 6), two), 2);
+		_mm_storeu_si128((__m128i*)(target + i), _mm_packus_epi16(a, b));
+	}
+#endif
+	for (; i < count; i++) {
+		uint32 sample = (((source[2 * i] | source[2 * i + 1] << 8) >> 6) + 2)
+			>> 2;
+		target[i] = sample > 255 ? 255 : sample;
+	}
+}
+
+
+/*!	A ten-bit picture as eight-bit NV12, straight from the VA image: what
+	a caller that cannot take P010 (Summit's compositor) asks for. Through
+	HevcOutput's per-sample conversion, a 2160p picture took 30 ms. */
+void
+VaDecoder::_NarrowPlanes(const uint8* data, uint8* output)
+{
+	const uint8* luma = data + fImage.offsets[0];
+	const uint8* chroma = data + fImage.offsets[1];
+	for (int y = 0; y < fHeight; y++) {
+		narrow_row(luma + (size_t)y * fImage.pitches[0],
+			output + (size_t)y * fWidth, fWidth);
+	}
+	uint8* planes = output + (size_t)fWidth * fHeight;
+	for (int y = 0; y < fHeight / 2; y++) {
+		narrow_row(chroma + (size_t)y * fImage.pitches[1],
+			planes + (size_t)y * fWidth, fWidth);
+	}
+}
+
+
 /*!	The outputs that only rearrange the samples (NV12, I420, P010 of a P010
 	picture) are written straight from the VA image, without the copy the
 	conversions take their input in. */
@@ -417,7 +488,13 @@ VaDecoder::_CopyPlanes(const uint8* data, bool p010, uint8* output)
 	if (fFormat != HevcOutput::NV12 && fFormat != HevcOutput::I420
 		&& !(fFormat == HevcOutput::P010 && p010))
 		return false;
-	if (fFormat == HevcOutput::I420 && p010)
+	if (p010 && fFormat == HevcOutput::NV12) {
+		_NarrowPlanes(data, output);
+		return true;
+	}
+	// A ten-bit picture asked for as I420 is rounded by HevcOutput: copied
+	// here, its two-byte samples would fill twice the caller's buffer.
+	if (p010 != (fFormat == HevcOutput::P010))
 		return false;
 	uint32 sampleBytes = p010 ? 2 : 1;
 	uint32 rowBytes = fWidth * sampleBytes;
@@ -667,11 +744,9 @@ class AmdgpuVaPlugin : public DecoderPlugin {
 public:
 	virtual Decoder* NewDecoder(uint index)
 	{
-		if (index == 0)
-			return new(std::nothrow) VaDecoder(false);
-		if (index == 1)
-			return new(std::nothrow) VaDecoder(true);
-		return NULL;
+		if (index > kAV1)
+			return NULL;
+		return new(std::nothrow) VaDecoder((VaCodec)index);
 	}
 
 	virtual status_t GetSupportedFormats(media_format** formats, size_t* count)
