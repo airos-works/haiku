@@ -76,6 +76,7 @@ public:
 									bool activeOnly);
 			void				InitialVerify(Volume* nextVolume,
 									Volume* nextNextVolume);
+			bool				HasReadPackages();
 			void				HandleGetLocationInfoRequest(BMessage* message);
 			void				HandleCommitTransactionRequest(
 									BMessage* message);

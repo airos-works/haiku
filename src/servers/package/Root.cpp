@@ -120,6 +120,27 @@ private:
 };
 
 
+// #pragma mark - GetLocationInfoJob
+
+
+struct Root::GetLocationInfoJob : public AbstractVolumeJob {
+	GetLocationInfoJob(Volume* volume, BMessage* message)
+		:
+		AbstractVolumeJob(volume),
+		fMessage(message)
+	{
+	}
+
+	virtual void Do()
+	{
+		fVolume->HandleGetLocationInfoRequest(fMessage.Get());
+	}
+
+private:
+	ObjectDeleter<BMessage>	fMessage;
+};
+
+
 // #pragma mark - VolumeJobFilter
 
 
@@ -321,8 +342,24 @@ Root::HandleRequest(BMessage* message)
 
 	switch (message->what) {
 		case B_MESSAGE_GET_INSTALLATION_LOCATION_INFO:
-			volume->HandleGetLocationInfoRequest(message);
+		{
+			if (volume->HasReadPackages()) {
+				volume->HandleGetLocationInfoRequest(message);
+				break;
+			}
+
+			// Right after the start the job thread is still reading the
+			// volume's packages: answer once it has (the jobs run in order).
+			GetLocationInfoJob* job = new(std::nothrow) GetLocationInfoJob(
+				volume, message);
+			if (job == NULL)
+				return;
+
+			messageDeleter.Detach();
+
+			_QueueJob(job);
 			break;
+		}
 
 		case B_MESSAGE_COMMIT_TRANSACTION:
 		{

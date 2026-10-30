@@ -514,10 +514,26 @@ INFORM("Volume::InitialVerify(%p, %p)\n", nextVolume, nextNextVolume);
 }
 
 
+/*!	Whether the job thread has read the packages directory and the active
+	packages (InitPackages()). Called by the application thread.
+*/
+bool
+Volume::HasReadPackages()
+{
+	AutoLocker<BLocker> locker(fLock);
+	return fActiveState != NULL;
+}
+
+
 void
 Volume::HandleGetLocationInfoRequest(BMessage* message)
 {
 	AutoLocker<BLocker> locker(fLock);
+
+	// Without the active state (reading the packages failed) there is nothing
+	// to tell; the requester gets B_NO_REPLY.
+	if (fActiveState == NULL)
+		return;
 
 	// If the cached reply message is up-to-date, just send it.
 	int64 changeCount;
@@ -1186,6 +1202,7 @@ Volume::_GetActivePackages(int fd)
 	// check whether that matches the expected state
 	if (_CheckActivePackagesMatchLatestState(request)) {
 		INFORM("The latest volume state is also the currently active one\n");
+		AutoLocker<BLocker> locker(fLock);
 		fActiveState = fLatestState;
 		return B_OK;
 	}
@@ -1219,6 +1236,7 @@ Volume::_GetActivePackages(int fd)
 	_DumpState(state);
 #endif
 
+	AutoLocker<BLocker> locker(fLock);
 	fActiveState = stateDeleter.Detach();
 	return B_OK;
 }

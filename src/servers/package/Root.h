@@ -62,6 +62,7 @@ private:
 			struct VolumeJob;
 			struct ProcessNodeMonitorEventsJob;
 			struct CommitTransactionJob;
+			struct GetLocationInfoJob;
 			struct VolumeJobFilter;
 
 			friend struct CommitTransactionJob;
