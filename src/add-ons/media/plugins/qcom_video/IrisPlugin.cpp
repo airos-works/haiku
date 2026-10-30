@@ -3,9 +3,8 @@
  * Distributed under the terms of the MIT License.
  */
 
-/*	H.264, HEVC and VP9 on the SC8280XP's video codec (Radxa Dragon Q8B), as
-	a decoder add-on of the Media Kit (IrisDecoder does the work); MPEG-2 for
-	the lab (see experimental_codecs()).
+/*	H.264, HEVC, VP9 and MPEG-2 on the SC8280XP's video codec (Radxa Dragon
+	Q8B), as a decoder add-on of the Media Kit (IrisDecoder does the work).
 
 	As sunxi_cedar: the formats are only registered where the codec is
 	(/dev/video/qcom_iris/0 exists), and a stream it does not decode (fields
@@ -54,17 +53,6 @@ static const uint32 kCodecH264 = 27;
 static const uint32 kCodecVP9 = 167;
 static const uint32 kCodecHEVC = 173;
 
-
-/*!	MPEG-2 only for the lab (IRIS_EXPERIMENTAL in the environment): every
-	MPEG-2 film on hand is interlaced and too wide for the codec's copies of
-	fields (see IrisDecoder::_HandleEvent()); a progressive one was never
-	decoded. A stalled firmware takes the codec down until the next boot.
-*/
-static bool
-experimental_codecs()
-{
-	return getenv("IRIS_EXPERIMENTAL") != NULL;
-}
 
 static const color_space kColorSpaceNV12 = (color_space)0x4e563132;	// 'NV12'
 static const color_space kColorSpaceI420 = (color_space)0x49343230;	// 'I420'
@@ -540,8 +528,7 @@ QcomIrisDecoder::Setup(media_format* format, const void* info,
 		|| (description.u.misc.codec != kCodecH264
 			&& description.u.misc.codec != kCodecHEVC
 			&& description.u.misc.codec != kCodecVP9
-			&& (description.u.misc.codec != kCodecMPEG2
-				|| !experimental_codecs()))) {
+			&& description.u.misc.codec != kCodecMPEG2)) {
 		return B_NOT_SUPPORTED;
 	}
 
@@ -882,7 +869,7 @@ QcomIrisPlugin::GetSupportedFormats(media_format** _formats, size_t* _count)
 		return B_OK;
 	const uint32 kCodecs[] = { kCodecH264, kCodecHEVC, kCodecVP9,
 		kCodecMPEG2 };
-	size_t count = experimental_codecs() ? 4 : 3;
+	size_t count = 4;
 	for (size_t i = 0; i < count; i++) {
 		media_format_description description;
 		description.family = B_MISC_FORMAT_FAMILY;
