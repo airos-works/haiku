@@ -685,6 +685,34 @@ context_report(const char* when)
 }
 
 
+/*!	What the firmware says about a system error: the event, its failure
+	reason (the SFR after the queues, as Linux prints it) and the codec's
+	SMMU context bank, which shows a fault that caused it.
+*/
+static void
+firmware_error_report(const uint32* packet, size_t size)
+{
+	INFO("firmware event %#" B_PRIx32 " %#" B_PRIx32 " %#" B_PRIx32 "\n",
+		size > 12 ? packet[3] : 0, size > 16 ? packet[4] : 0,
+		size > 20 ? packet[5] : 0);
+	context_report("system error");
+	if (sQueues == NULL)
+		return;
+	size_t queueBytes = ROUNDUP(sizeof(hfi_queue_table_header)
+		+ IFACEQ_QUEUE_SIZE * IFACEQ_NUMQ, B_PAGE_SIZE);
+	char reason[256];
+	const char* sfr = (const char*)sQueues + queueBytes + 4;
+	size_t length = 0;
+	while (length < sizeof(reason) - 1 && sfr[length] != '\0') {
+		reason[length] = sfr[length] >= ' ' && sfr[length] < 127
+			? sfr[length] : '.';
+		length++;
+	}
+	reason[length] = '\0';
+	INFO("firmware failure reason: \"%s\"\n", reason);
+}
+
+
 /*!	The apps SMMU faults streams it has no match for, and the firmware left
 	the codec's without one: free stream match entries for them, passing
 	them through (the firmware and the buffers are addressed physically).
@@ -1372,9 +1400,13 @@ next_message(IrisOpen* reader, uint32* packet, uint32 size, uint32* _size)
 			if (session != 0) {
 				INFO("message %#" B_PRIx32 " of no open's session %#" B_PRIx32
 					"\n", packet[1], session);
+				if (packet[1] == HFI_MSG_EVENT_NOTIFY)
+					firmware_error_report(packet, received);
 				continue;
 			}
 			// the firmware's own (a system error): for everyone
+			if (packet[1] == HFI_MSG_EVENT_NOTIFY)
+				firmware_error_report(packet, received);
 			for (IrisOpen* open = sOpens; open != NULL; open = open->next) {
 				if (open != reader)
 					open_queue_message(open, packet, received);
