@@ -1412,6 +1412,9 @@ IrisDecoder::_FreeOutputs()
 size_t
 IrisDecoder::_BinSize(uint32 width, uint32 height) const
 {
+	// fields are decoded in one stage, without (venus' *_scratch_size())
+	if (fInterlaced)
+		return 0;
 	if (fCodec == HEVC)
 		return bin_size(ALIGN(width, 16), ALIGN(height, 16), 2, 2);
 	if (fCodec == VP9) {
