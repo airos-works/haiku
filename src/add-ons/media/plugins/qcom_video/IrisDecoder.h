@@ -16,14 +16,20 @@
 #include "IrisSession.h"
 
 
-/*!	H.264 and HEVC on the SC8280XP's video codec (Iris, HFI generation 1),
-	through the qcom_iris driver.
+/*!	H.264, HEVC, VP9 and MPEG-2 on the SC8280XP's video codec (Iris, HFI
+	generation 1), through the qcom_iris driver.
 
 	The firmware parses the stream itself: access units (Annex B, with start
-	codes, all slices of one picture) go in, NV12 pictures come out in
+	codes, all slices of one picture; a VP9 frame or superframe as a
+	container holds it; an MPEG-2 picture with its headers) go in, NV12 pictures come out in
 	display order. It decodes into reference pictures of its own (UBWC) and
 	writes a linear NV12 copy of each picture to be shown into buffers of
 	ours ("split mode", the only one Linux uses on this hardware).
+
+	Interlaced streams (H.264 fields) would come out as frames of two woven
+	fields, decoded in the codec's single stage mode as venus decodes them;
+	so far the firmware dies on them, and they are refused (see
+	_HandleEvent()).
 
 	Ten bit streams (HEVC Main 10) are decoded into TP10 UBWC references
 	and copied out as P010, as Linux' venus driver has it: luma, then Cb
@@ -35,7 +41,9 @@ class IrisDecoder : public IrisSession {
 public:
 	enum codec {
 		H264,
-		HEVC
+		HEVC,
+		VP9,
+		MPEG2
 	};
 
 	struct Picture {
@@ -49,6 +57,7 @@ public:
 		uint32		lumaRows;	// the chroma plane follows them
 		const uint8* data;		// luma, then Cb and Cr in pairs
 		bool		tenBit;		// samples of sixteen bits (P010)
+		bool		interlaced;	// two fields, woven
 		bool		corrupt;
 	};
 
@@ -57,7 +66,8 @@ public:
 
 			/*!	\a width and \a height are what the stream is expected to
 				be, when known (the container's); the firmware's sequence
-				event says what it is. */
+				event says what it is. The session starts small anyway (see
+				there). */
 			status_t			Open(uint32 width = 0, uint32 height = 0,
 									BString* _error = NULL);
 			void				Close();
@@ -113,6 +123,9 @@ public:
 			uint32				PicturesDecoded() const { return fDecoded; }
 			uint32				Width() const { return fWidth; }
 			uint32				Height() const { return fHeight; }
+			//!	Whether the stream has fields (known from its first
+			//	picture on).
+			bool				Interlaced() const { return fInterlaced; }
 
 private:
 			struct Output {
@@ -150,6 +163,7 @@ private:
 			uint32				fMinCount;	// the firmware's minimum of
 											// reference and output buffers
 			bool				fTenBit;
+			bool				fInterlaced;
 
 			IrisDevice::Buffer	fPersist;
 			IrisDevice::Buffer	fBin;
@@ -173,6 +187,7 @@ private:
 			uint32				fEventCrop[4];
 			uint32				fEventMinCount;
 			bool				fEventTenBit;
+			bool				fEventInterlaced;
 			uint32				fLastAnswer;
 			uint32				fLastAnswerError;
 			bool				fEndOfStream;	// sent

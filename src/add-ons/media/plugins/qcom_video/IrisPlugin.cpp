@@ -4,7 +4,8 @@
  */
 
 /*	H.264 and HEVC on the SC8280XP's video codec (Radxa Dragon Q8B), as a
-	decoder add-on of the Media Kit (IrisDecoder does the work).
+	decoder add-on of the Media Kit (IrisDecoder does the work); VP9 and
+	MPEG-2 for the lab (see experimental_codecs()).
 
 	As sunxi_cedar: the formats are only registered where the codec is
 	(/dev/video/qcom_iris/0 exists), and a stream it does not decode (fields,
@@ -47,10 +48,26 @@
 #include "hevc_parse.h"
 
 
-// AV_CODEC_ID_H264 and AV_CODEC_ID_HEVC of the FFmpeg add-on's format
-// descriptions
+// AV_CODEC_IDs of the FFmpeg add-on's format descriptions
+static const uint32 kCodecMPEG2 = 2;
 static const uint32 kCodecH264 = 27;
+static const uint32 kCodecVP9 = 167;
 static const uint32 kCodecHEVC = 173;
+
+
+/*!	VP9 and MPEG-2 only for the lab (IRIS_EXPERIMENTAL in the environment):
+	VP9 decodes byte exact in iris_decode, yet through the Media Kit the
+	firmware stopped answering after the same few pictures of a 1080p film
+	every time (the same commands as iris_decode's), and above 1080p it
+	keeps references without end; every MPEG-2 film tried was interlaced,
+	which the firmware dies on. A stalled firmware takes the codec down
+	until the next boot.
+*/
+static bool
+experimental_codecs()
+{
+	return getenv("IRIS_EXPERIMENTAL") != NULL;
+}
 
 static const color_space kColorSpaceNV12 = (color_space)0x4e563132;	// 'NV12'
 static const color_space kColorSpaceI420 = (color_space)0x49343230;	// 'I420'
@@ -210,10 +227,15 @@ QcomIrisDecoder::GetCodecInfo(media_codec_info* info)
 		return;
 	}
 	memset(info, 0, sizeof(*info));
-	strlcpy(info->pretty_name, fCodec == kCodecHEVC
-			? "Qualcomm Iris hardware HEVC decoder"
-			: "Qualcomm Iris hardware H.264 decoder",
-		sizeof(info->pretty_name));
+	const char* name = "H.264";
+	if (fCodec == kCodecHEVC)
+		name = "HEVC";
+	else if (fCodec == kCodecVP9)
+		name = "VP9";
+	else if (fCodec == kCodecMPEG2)
+		name = "MPEG-2";
+	snprintf(info->pretty_name, sizeof(info->pretty_name),
+		"Qualcomm Iris hardware %s decoder", name);
 	strlcpy(info->short_name, "qcom_video", sizeof(info->short_name));
 }
 
@@ -236,7 +258,8 @@ QcomIrisDecoder::_SetParameterSets(const uint8* data, size_t size)
 {
 	fParameterSets.clear();
 	fNalLengthSize = 0;
-	if (data == NULL || size < 4)
+	// (VP9's "vpcC" is no part of the stream)
+	if (data == NULL || size < 4 || fCodec == kCodecVP9)
 		return;
 
 	if (data[0] == 0 && data[1] == 0 && (data[2] == 1
@@ -244,6 +267,8 @@ QcomIrisDecoder::_SetParameterSets(const uint8* data, size_t size)
 		fParameterSets.assign(data, data + size);
 		return;
 	}
+	if (fCodec == kCodecMPEG2)
+		return;
 
 	if (fCodec == kCodecH264) {
 		if (size < 7 || data[0] != 1)
@@ -298,6 +323,11 @@ QcomIrisDecoder::_CodecDecodes(BString& reason) const
 	size_t size;
 	char error[160];
 	bool decodes = true;
+
+	// (the firmware tells at the first picture: VP9's profiles 1 and 3,
+	// MPEG-2's fields)
+	if (fCodec == kCodecVP9 || fCodec == kCodecMPEG2)
+		return true;
 
 	if (fCodec == kCodecH264) {
 		H264State* state = new(std::nothrow) H264State;
@@ -474,8 +504,14 @@ QcomIrisDecoder::_ReadChunk(const void** chunk, size_t* size,
 status_t
 QcomIrisDecoder::_OpenDecoder(BString& reason)
 {
-	fDecoder = new(std::nothrow) IrisDecoder(fCodec == kCodecHEVC
-		? IrisDecoder::HEVC : IrisDecoder::H264);
+	IrisDecoder::codec codec = IrisDecoder::H264;
+	if (fCodec == kCodecHEVC)
+		codec = IrisDecoder::HEVC;
+	else if (fCodec == kCodecVP9)
+		codec = IrisDecoder::VP9;
+	else if (fCodec == kCodecMPEG2)
+		codec = IrisDecoder::MPEG2;
+	fDecoder = new(std::nothrow) IrisDecoder(codec);
 	if (fDecoder == NULL)
 		return B_NO_MEMORY;
 	const media_video_display_info& display
@@ -502,7 +538,10 @@ QcomIrisDecoder::Setup(media_format* format, const void* info,
 			&description) != B_OK
 		|| description.u.misc.file_format != 'ffmp'
 		|| (description.u.misc.codec != kCodecH264
-			&& description.u.misc.codec != kCodecHEVC)) {
+			&& description.u.misc.codec != kCodecHEVC
+			&& ((description.u.misc.codec != kCodecVP9
+					&& description.u.misc.codec != kCodecMPEG2)
+				|| !experimental_codecs()))) {
 		return B_NOT_SUPPORTED;
 	}
 
@@ -516,6 +555,12 @@ QcomIrisDecoder::Setup(media_format* format, const void* info,
 	BString reason;
 	if (display.line_width > kMaxWidth || display.line_count > kMaxHeight)
 		reason = "the codec decodes up to 4096x2304";
+	else if (fCodec == kCodecMPEG2
+		&& (display.line_width > 1920 || display.line_count > 1920))
+		reason = "the codec decodes MPEG-2 up to 1920x1920";
+	else if (fCodec == kCodecVP9
+		&& (display.line_width > 1920 || display.line_count > 1088))
+		reason = "the codec decodes VP9 up to 1920x1088 (see IrisDecoder)";
 	else if (!_CodecDecodes(reason)) {
 		// (reason says why)
 	} else if (_OpenDecoder(reason) == B_OK) {
@@ -661,6 +706,7 @@ QcomIrisDecoder::_MakeAccessUnit(const uint8* data, size_t size)
 		fUnit = fParameterSets;
 	fParameterSetsSent = true;
 
+	// (VP9 frames and MPEG-2 pictures go as they are)
 	if (fNalLengthSize == 0) {
 		fUnit.insert(fUnit.end(), data, data + size);
 		return;
@@ -813,7 +859,7 @@ QcomIrisPlugin::NewDecoder(uint index)
 status_t
 QcomIrisPlugin::GetSupportedFormats(media_format** _formats, size_t* _count)
 {
-	static media_format sFormats[2];
+	static media_format sFormats[4];
 	*_formats = sFormats;
 	*_count = 0;
 
@@ -825,8 +871,10 @@ QcomIrisPlugin::GetSupportedFormats(media_format** _formats, size_t* _count)
 	BMediaFormats formats;
 	if (formats.InitCheck() != B_OK)
 		return B_OK;
-	const uint32 kCodecs[] = { kCodecH264, kCodecHEVC };
-	for (size_t i = 0; i < 2; i++) {
+	const uint32 kCodecs[] = { kCodecH264, kCodecHEVC, kCodecVP9,
+		kCodecMPEG2 };
+	size_t count = experimental_codecs() ? 4 : 2;
+	for (size_t i = 0; i < count; i++) {
 		media_format_description description;
 		description.family = B_MISC_FORMAT_FAMILY;
 		description.u.misc.file_format = 'ffmp';
@@ -840,7 +888,7 @@ QcomIrisPlugin::GetSupportedFormats(media_format** _formats, size_t* _count)
 			return B_OK;
 		sFormats[i] = format;
 	}
-	*_count = 2;
+	*_count = count;
 	return B_OK;
 }
 

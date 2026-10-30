@@ -8,9 +8,13 @@
 	with a reference (I420, as "ffmpeg -pix_fmt yuv420p" writes it) and
 	optionally written out the same way.
 
-	iris_decode [--hevc] [--hashes] [--size WxH] stream
+	iris_decode [--hevc] [--hashes] [--aud] [--size WxH] stream
 		[reference.yuv | reference.hashes] [out.yuv]
 
+	An IVF file (as "ffmpeg -c copy x.ivf" writes it; fourcc VP90, or MPG2
+	for MPEG-2 pictures) goes to the codec frame by frame.
+	--aud splits the stream only at access unit delimiters (the two fields
+	of a frame then go in together, as from a container).
 	--hashes prints each picture's FNV-1a hash (of the I420 picture). Ten bit
 	pictures are compared and written as P010 without padding (as
 	"-pix_fmt p010le"). */
@@ -29,7 +33,12 @@
 
 
 static bool sHevc;
+static IrisDecoder::codec sCodec = IrisDecoder::H264;
 static bool sHashes;
+static bool sDelimited;
+static int64 sPtsStep = 1000;
+static bool sLazy;
+static bigtime_t sGap;
 
 
 //!	FNV-1a, to compare pictures with a decode elsewhere.
@@ -99,6 +108,10 @@ begins_access_unit(const uint8* nal, size_t size, bool* _vcl)
 	if (size < 2)
 		return false;
 	int type = nal[0] & 0x1f;
+	if (sDelimited) {
+		*_vcl = true;
+		return type == 9;
+	}
 	*_vcl = type >= 1 && type <= 5;
 	if (*_vcl)
 		return (nal[1] & 0x80) != 0;	// first_mb_in_slice 0
@@ -145,6 +158,15 @@ main(int argc, char** argv)
 			sHevc = true;
 		else if (strcmp(argv[argument], "--hashes") == 0)
 			sHashes = true;
+		else if (strcmp(argv[argument], "--aud") == 0)
+			sDelimited = true;
+		else if (strcmp(argv[argument], "--lazy") == 0)
+			sLazy = true;
+		else if (strcmp(argv[argument], "--gap") == 0 && argument + 1 < argc)
+			sGap = atoll(argv[++argument]) * 1000;
+		else if (strcmp(argv[argument], "--pts-step") == 0
+			&& argument + 1 < argc)
+			sPtsStep = atoll(argv[++argument]);
 		else if (strcmp(argv[argument], "--size") == 0
 			&& argument + 1 < argc) {
 			sscanf(argv[++argument], "%" B_SCNu32 "x%" B_SCNu32, &width,
@@ -194,11 +216,30 @@ main(int argc, char** argv)
 	FILE* out = outPath != NULL ? fopen(outPath, "wb") : NULL;
 
 	std::vector<std::pair<size_t, size_t> > units;
-	split_access_units(stream, units);
+	if (stream.size() >= 32 && memcmp(stream.data(), "DKIF", 4) == 0) {
+		sCodec = memcmp(&stream[8], "MPG2", 4) == 0
+			? IrisDecoder::MPEG2 : IrisDecoder::VP9;
+		size_t offset = stream[6] | (stream[7] << 8);
+		while (offset + 12 <= stream.size()) {
+			size_t size = stream[offset] | (stream[offset + 1] << 8)
+				| (stream[offset + 2] << 16)
+				| ((size_t)stream[offset + 3] << 24);
+			offset += 12;
+			if (offset + size > stream.size())
+				break;
+			units.push_back(std::make_pair(offset, size));
+			offset += size;
+		}
+	} else {
+		if (sHevc)
+			sCodec = IrisDecoder::HEVC;
+		split_access_units(stream, units);
+	}
+	static const char* const kNames[] = { "H.264", "HEVC", "VP9", "MPEG-2" };
 	printf("%s: %zu bytes, %zu access units (%s)\n", streamPath,
-		stream.size(), units.size(), sHevc ? "HEVC" : "H.264");
+		stream.size(), units.size(), kNames[sCodec]);
 
-	IrisDecoder decoder(sHevc ? IrisDecoder::HEVC : IrisDecoder::H264);
+	IrisDecoder decoder(sCodec);
 	BString error;
 	bigtime_t start = system_time();
 	if (decoder.Open(width, height, &error) != B_OK) {
@@ -285,10 +326,37 @@ main(int argc, char** argv)
 	};
 
 	bigtime_t feedStart = system_time();
-	for (size_t i = 0; i < units.size() && status == B_OK; i++) {
+	if (sLazy) {
+		// as the media add-on paces it: a picture is taken (and copied,
+		// 3 ms) before the next access unit goes in, one at a time
+		size_t next = 0;
+		while (status == B_OK && next < units.size()) {
+			status_t taken = take(0);
+			if (taken == B_OK) {
+				snooze(3000);
+				continue;
+			}
+			status = decoder.PutAccessUnit(&stream[units[next].first],
+				units[next].second, next * sPtsStep, 2000000);
+			if (status == B_OK) {
+				next++;
+				// the codec idles, as when a file comes over the network
+				if (sGap > 0)
+					snooze(sGap);
+			}
+			else if (status == B_WOULD_BLOCK) {
+				status = take(0) == B_OK ? B_OK : B_TIMED_OUT;
+				if (status != B_OK)
+					printf("access unit %zu: the firmware takes no input\n",
+						next);
+			}
+		}
+	}
+	for (size_t i = sLazy ? units.size() : 0; i < units.size() && status == B_OK;
+			i++) {
 		while (true) {
 			status = decoder.PutAccessUnit(&stream[units[i].first],
-				units[i].second, i * 1000, 2000000);
+				units[i].second, i * sPtsStep, 2000000);
 			if (status != B_WOULD_BLOCK)
 				break;
 			status_t taken = take(0);

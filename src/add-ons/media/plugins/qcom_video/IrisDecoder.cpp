@@ -119,6 +119,41 @@ non_comv_h264(uint32 width, uint32 height)
 }
 
 
+//!	VP9 and MPEG-2's line buffers (venus' hfi_plat_bufs_v6.c).
+static uint32
+vpx_left_control(uint32 height)
+{
+	uint32 size = ((height + 15) >> 4) * 64;
+	if (size < ((height + 31) >> 5) * 64)
+		size = ((height + 31) >> 5) * 64;
+	if (size < ((height + 63) >> 6) * 64)
+		size = ((height + 63) >> 6) * 64;
+	return size;
+}
+
+
+static uint32
+vpx_lines(uint32 width, uint32 height, bool vp9)
+{
+	uint32 alignedWidth = ALIGN(ALIGN(width, 16), 64);
+	uint32 seLeftControl = ((height + 15) >> 4) * 16;
+	uint32 vspTop = vp9 ? (alignedWidth >> 6) * 64 * 8 + 256
+		: (ALIGN(width, 16) >> 4) * 64 / 2 + 256;
+	uint32 peTopData = vp9 ? (alignedWidth >> 6) * 176
+		: (ALIGN(width, 16) >> 4) * 64;
+	uint32 feTopData = vp9 ? (alignedWidth + 8) * 10 * 2
+		: (ALIGN(width, 16) + 8) * 10 * 2;
+	return ALIGN(vpx_left_control(height), kDmaAlignment) * kVppPipes
+		+ ALIGN(seLeftControl, kDmaAlignment) * kVppPipes
+		+ ALIGN(vspTop, kDmaAlignment)
+		+ ALIGN((ALIGN(width, 64) + 8) * 10 * 2, kDmaAlignment)
+		+ 2 * ALIGN(ALIGN((ALIGN(height, 16) / 2) * 64, 32), kDmaAlignment)
+		+ ALIGN(((width + 15) >> 4) * 64, kDmaAlignment)
+		+ ALIGN(peTopData, kDmaAlignment)
+		+ ALIGN(feTopData, kDmaAlignment);
+}
+
+
 static uint32
 lcu_count(uint32 width, uint32 height)
 {
@@ -249,8 +284,14 @@ tp10_ubwc_size(uint32 width, uint32 height)
 
 //!	The references: luma meta data and samples, then chroma's (UBWC).
 static uint32
-ubwc_size(uint32 width, uint32 height)
+ubwc_size(uint32 width, uint32 height, bool interlaced = false)
 {
+	// Fields are two of those, each with its own meta data (Qualcomm's
+	// msm_media_info.h), somewhat more than a frame of the same size; a
+	// reference too small for them took the SoC down.
+	if (interlaced)
+		return 2 * ubwc_size(width, (height + 1) / 2) + 64 * 1024;
+
 	uint32 yMetaStride = ALIGN(DIV_ROUND_UP(width, 32), 64);
 	uint32 yMeta = ALIGN(yMetaStride * ALIGN(DIV_ROUND_UP(height, 8), 16),
 		4096);
@@ -259,23 +300,47 @@ ubwc_size(uint32 width, uint32 height)
 	uint32 uvMeta = ALIGN(uvMetaStride
 		* ALIGN(DIV_ROUND_UP(height / 2, 8), 16), 4096);
 	uint32 uvPlane = ALIGN(ALIGN(width, 128) * ALIGN(height / 2, 32), 4096);
-	return ALIGN(yMeta + yPlane + uvMeta + uvPlane, 4096);
+	// and the firmware's extra data behind them (venus' helpers.c; 4K VP9
+	// hung the firmware after the first picture without it)
+	uint32 extradata = 16 * 1024;
+	if (extradata < ALIGN(width, 128) * 48)
+		extradata = ALIGN(width, 128) * 48;
+	return ALIGN(yMeta + yPlane + uvMeta + uvPlane + extradata, 4096);
 }
 
 
-//!	A bitstream buffer: half a 4K picture's samples, up to 4K.
+//!	A bitstream buffer: half a 4K picture's samples (VP9: all), up to 4K.
 static uint32
-input_size(uint32 width, uint32 height)
+input_size(uint32 width, uint32 height, bool vp9)
 {
 	uint32 mbs = DIV_ROUND_UP(height, 16) * DIV_ROUND_UP(width, 16);
 	uint32 mbs4k = DIV_ROUND_UP(4096, 16) * DIV_ROUND_UP(2304, 16);
 	uint32 base = mbs4k;
-	uint32 divisor = 2;
+	uint32 divisor = vp9 ? 1 : 2;
 	if (mbs > mbs4k) {
 		divisor = 4;
 		base = 138240;
 	}
 	return ALIGN(base * 256 * 3 / 2 / divisor, 4096);
+}
+
+
+/*!	Writes the lines of \a size bytes at \a address back to memory (to the
+	point of coherency), for the codec to read.
+*/
+static void
+clean_cache(const void* address, size_t size)
+{
+#if defined(__aarch64__)
+	const size_t kLine = 64;
+	uintptr_t line = (uintptr_t)address & ~(uintptr_t)(kLine - 1);
+	for (uintptr_t end = (uintptr_t)address + size; line < end; line += kLine)
+		__asm__ __volatile__("dc cvac, %0" : : "r"(line) : "memory");
+	__asm__ __volatile__("dsb sy" : : : "memory");
+#else
+	(void)address;
+	(void)size;
+#endif
 }
 
 
@@ -293,6 +358,7 @@ IrisDecoder::IrisDecoder(codec codec)
 	fCropHeight(0),
 	fMinCount(4),
 	fTenBit(false),
+	fInterlaced(false),
 	fOutputStride(0),
 	fOutputRows(0),
 	fOutputSize(0),
@@ -303,6 +369,7 @@ IrisDecoder::IrisDecoder(codec codec)
 	fEventHeight(0),
 	fEventMinCount(0),
 	fEventTenBit(false),
+	fEventInterlaced(false),
 	fLastAnswer(0),
 	fLastAnswerError(0),
 	fEndOfStream(false),
@@ -322,17 +389,27 @@ IrisDecoder::~IrisDecoder()
 status_t
 IrisDecoder::Open(uint32 width, uint32 height, BString* _error)
 {
-	// what Linux assumes before the stream says otherwise
+	// What Linux assumes before the stream says otherwise, whatever the
+	// container says: then the stream's sequence event always finds too
+	// little room ("insufficient resources") and the firmware waits for
+	// the output side. Opened at the stream's own size, it said
+	// "sufficient" and VP9 went on decoding while its scratch buffers were
+	// replaced: it stopped for good after a few pictures, now and then.
+	(void)width;
+	(void)height;
 	uint32 alignment = fCodec == HEVC ? 32 : 16;
-	fWidth = ALIGN(width != 0 ? width : 320, alignment);
-	fHeight = ALIGN(height != 0 ? height : 240, alignment);
-	fCropWidth = width != 0 ? width : fWidth;
-	fCropHeight = height != 0 ? height : fHeight;
+	static const uint32 kSessionCodecs[] = { HFI_VIDEO_CODEC_H264,
+		HFI_VIDEO_CODEC_HEVC, HFI_VIDEO_CODEC_VP9, HFI_VIDEO_CODEC_MPEG2 };
+	fWidth = ALIGN(320, alignment);
+	fHeight = ALIGN(240, alignment);
+	fCropWidth = fWidth;
+	fCropHeight = fHeight;
 	fMinCount = 4;
 	fTenBit = false;
+	fInterlaced = false;
 
 	status_t status = _OpenSession(HFI_SESSION_TYPE_DEC,
-		fCodec == HEVC ? HFI_VIDEO_CODEC_HEVC : HFI_VIDEO_CODEC_H264);
+		kSessionCodecs[fCodec]);
 	if (status != B_OK) {
 		if (_error != NULL)
 			*_error = fError;
@@ -363,7 +440,8 @@ IrisDecoder::Open(uint32 width, uint32 height, BString* _error)
 
 	for (uint32 i = 0; status == B_OK && i < kInputBuffers; i++) {
 		IrisDevice::Buffer buffer;
-		status = fDevice.Allocate(input_size(fWidth, fHeight), buffer);
+		status = fDevice.Allocate(input_size(fWidth, fHeight, fCodec == VP9),
+			buffer);
 		if (status == B_OK) {
 			fInputs.push_back(buffer);
 			fInputQueued.push_back(false);
@@ -460,6 +538,13 @@ IrisDecoder::PutAccessUnit(const uint8* data, size_t size, int64 pts,
 	if (size > buffer.size)
 		return _Fail(B_BAD_VALUE, "an access unit of %zu bytes", size);
 	memcpy(buffer.address, data, size);
+	// The buffers are mapped write-back as the codec is said to be
+	// coherent, yet through the Media Kit VP9 stopped for good after the
+	// same few pictures every time, where a lab tool with a larger working
+	// set (that evicts the lines) never did.
+	clean_cache(buffer.address, size);
+	TRACE("input %" B_PRId32 ": %zu bytes, pts %" B_PRId64 ", %02x%02x..%02x\n",
+		index, size, pts, data[0], size > 1 ? data[1] : 0, data[size - 1]);
 
 	uint32 packet[15] = { 60, HFI_CMD_SESSION_EMPTY_BUFFER, fSession,
 		(uint32)((uint64)pts >> 32), (uint32)pts, 0, 0, 0, 0,
@@ -563,6 +648,7 @@ IrisDecoder::NextPicture(Picture& picture, bigtime_t timeout)
 	picture.lumaRows = fOutputRows;
 	picture.data = (const uint8*)output.buffer.address;
 	picture.tenBit = fTenBit;
+	picture.interlaced = fInterlaced;
 	return B_OK;
 }
 
@@ -909,12 +995,18 @@ IrisDecoder::_Handle(const uint32* packet, size_t size)
 			} else if (tag < fOutputs.size()) {
 				Output& output = fOutputs[tag];
 				output.queued = false;
-				if (filled != 0) {
+				if (filled != 0 && (flags & HFI_BUFFERFLAG_DROP_FRAME) != 0
+					&& (flags & HFI_BUFFERFLAG_EOS) == 0) {
+					// not to be shown (VP9's hidden frames, the parts of a
+					// superframe before the last), as venus has it
+					if (fOutputStarted && !fFailed)
+						_QueueOutput(tag);
+				} else if (filled != 0) {
 					output.ready = true;
 					fReady.push_back(tag);
 					fReadyPts.push_back(pts);
-					fReadyCorrupt.push_back((flags & (HFI_BUFFERFLAG_DATACORRUPT
-						| HFI_BUFFERFLAG_DROP_FRAME)) != 0 || error != 0);
+					fReadyCorrupt.push_back(
+						(flags & HFI_BUFFERFLAG_DATACORRUPT) != 0 || error != 0);
 					fDecoded++;
 				}
 			}
@@ -957,6 +1049,7 @@ IrisDecoder::_HandleEvent(const uint32* packet, size_t size)
 	uint32 width = 0, height = 0, bitDepth = 0, progressive = 1;
 	uint32 crop[4] = {};
 	uint32 minCount = 0;
+	uint32 maxDpbCount = 0;
 	const uint8* record = (const uint8*)(packet + 6);
 	const uint8* end = (const uint8*)packet + size;
 	for (uint32 i = 0; i < data2 && record + 4 <= end; i++) {
@@ -1005,7 +1098,12 @@ IrisDecoder::_HandleEvent(const uint32* packet, size_t size)
 				progressive = data[0];
 				break;
 			case HFI_PROPERTY_CONFIG_BUFFER_REQUIREMENTS:
+				minCount = data[4];
+				break;
 			case HFI_PROPERTY_PARAM_VDEC_DPB_COUNTS:
+				// max_dpb_count, max_ref_frames, max_dec_buffering,
+				// max_reorder_frames, fw_min_count
+				maxDpbCount = data[0];
 				minCount = data[4];
 				break;
 			case HFI_INDEX_EXTRADATA_INPUT_CROP:
@@ -1024,15 +1122,28 @@ IrisDecoder::_HandleEvent(const uint32* packet, size_t size)
 	// luma's depth in the low half, chroma's in the high one
 	if (bitDepth == (HFI_BITDEPTH_10 << 16 | HFI_BITDEPTH_10))
 		bitDepth = HFI_BITDEPTH_10;
-	if ((bitDepth != HFI_BITDEPTH_8 && bitDepth != HFI_BITDEPTH_10)
-		|| progressive == 0) {
+	if (bitDepth != HFI_BITDEPTH_8 && bitDepth != HFI_BITDEPTH_10) {
 		fFailed = true;
-		return _Fail(B_NOT_SUPPORTED, "%s pictures are not supported",
-			progressive == 0 ? "interlaced" : "mixed or nine bit");
+		return _Fail(B_NOT_SUPPORTED,
+			"mixed or nine bit pictures are not supported");
+	}
+	// The firmware stopped answering (a system error, for good) when it
+	// went on with fields, even with references of the size Qualcomm gives
+	// fields; IRIS_INTERLACED lets the lab try again.
+	if (progressive == 0 && getenv("IRIS_INTERLACED") == NULL) {
+		fFailed = true;
+		return _Fail(B_NOT_SUPPORTED, "interlaced pictures are not supported");
 	}
 	if (width == 0 || height == 0) {
 		fFailed = true;
 		return _Fail(B_ERROR, "a sequence event without a picture size");
+	}
+	// Larger VP9 kept references without end: with 12 the firmware stopped
+	// after one 4K picture, with 24 after four, and then answered nothing
+	// any more (asked for 64, 850 MB). 1080p decodes with 12.
+	if (fCodec == VP9 && (width > 1920 || height > 1088)) {
+		fFailed = true;
+		return _Fail(B_NOT_SUPPORTED, "VP9 larger than 1080p is not supported");
 	}
 
 	fEventWidth = width;
@@ -1045,7 +1156,14 @@ IrisDecoder::_HandleEvent(const uint32* packet, size_t size)
 		fEventCrop[3] = height;
 	}
 	fEventMinCount = minCount != 0 ? minCount : 4;
+	// VP9 asks for 64 (850 MB of references at 4K); its eight reference
+	// slots and the picture being decoded need a few more than eight
+	if (fCodec == VP9 && maxDpbCount != 0 && fEventMinCount > maxDpbCount + 4)
+		fEventMinCount = maxDpbCount + 4;
+
 	fEventTenBit = bitDepth == HFI_BITDEPTH_10;
+	// (HFI_INTERLACE_FRAME_PROGRESSIVE, or 0: fields may come)
+	fEventInterlaced = progressive == 0;
 	fSequenceChanged = true;
 	return B_OK;
 }
@@ -1123,7 +1241,7 @@ IrisDecoder::_ConfigurePorts(bool input)
 	if (status == B_OK) {
 		status = _SetProperty(HFI_PROPERTY_PARAM_BUFFER_SIZE_ACTUAL,
 			HFI_BUFFER_OUTPUT, fTenBit ? tp10_ubwc_size(outputWidth, outputHeight)
-				: ubwc_size(outputWidth, outputHeight));
+				: ubwc_size(outputWidth, outputHeight, fInterlaced));
 	}
 	if (status == B_OK) {
 		status = _SetProperty(HFI_PROPERTY_PARAM_BUFFER_SIZE_ACTUAL,
@@ -1133,7 +1251,8 @@ IrisDecoder::_ConfigurePorts(bool input)
 	if (status == B_OK && input) {
 		uint32 mbs = DIV_ROUND_UP(fHeight, 16) * DIV_ROUND_UP(fWidth, 16);
 		bool small = mbs < 3600 && fWidth < 1280 && fHeight < 1280;
-		status = _SetProperty(HFI_PROPERTY_PARAM_WORK_MODE, small ? 1 : 2);
+		status = _SetProperty(HFI_PROPERTY_PARAM_WORK_MODE,
+			small || fCodec == MPEG2 ? 1 : 2);
 		if (status == B_OK)
 			status = _SetProperty(HFI_PROPERTY_PARAM_WORK_ROUTE, kVppPipes);
 	}
@@ -1158,7 +1277,8 @@ IrisDecoder::_StartOutput()
 	if (fOutputStarted) {
 		// the same geometry again (a new sequence header): go on
 		if (width == fWidth && height == fHeight
-			&& fEventMinCount <= fMinCount && fEventTenBit == fTenBit) {
+			&& fEventMinCount <= fMinCount && fEventTenBit == fTenBit
+			&& fEventInterlaced == fInterlaced) {
 			uint32 packet[3] = { 12, HFI_CMD_SESSION_CONTINUE, fSession };
 			return _Send(packet);
 		}
@@ -1175,6 +1295,7 @@ IrisDecoder::_StartOutput()
 	fCropHeight = fEventCrop[3];
 	fMinCount = fEventMinCount;
 	fTenBit = fEventTenBit;
+	fInterlaced = fEventInterlaced;
 
 	uint32 outputWidth = ALIGN(width, 128);
 	uint32 outputHeight = ALIGN(height, 32);
@@ -1183,7 +1304,7 @@ IrisDecoder::_StartOutput()
 	fOutputSize = fTenBit ? p010_size(outputWidth, outputHeight)
 		: nv12_size(outputWidth, outputHeight);
 	fReferenceSize = fTenBit ? tp10_ubwc_size(outputWidth, outputHeight)
-		: ubwc_size(outputWidth, outputHeight);
+		: ubwc_size(outputWidth, outputHeight, fInterlaced);
 
 	status_t status = _ConfigurePorts(false);
 
@@ -1210,9 +1331,11 @@ IrisDecoder::_StartOutput()
 			_Scratch1Size(width, height));
 	}
 	if (status == B_OK) {
+		// fields only in the single stage mode (venus' helpers.c)
 		uint32 mbs = DIV_ROUND_UP(height, 16) * DIV_ROUND_UP(width, 16);
 		bool small = mbs < 3600 && width < 1280 && height < 1280;
-		status = _SetProperty(HFI_PROPERTY_PARAM_WORK_MODE, small ? 1 : 2);
+		status = _SetProperty(HFI_PROPERTY_PARAM_WORK_MODE,
+			small || fInterlaced || fCodec == MPEG2 ? 1 : 2);
 	}
 	if (status == B_OK)
 		status = _SetProperty(HFI_PROPERTY_PARAM_WORK_ROUTE, kVppPipes);
@@ -1254,6 +1377,7 @@ IrisDecoder::_QueueOutput(int32 index)
 	status_t status = _Send(packet);
 	if (status == B_OK)
 		output.queued = true;
+	TRACE("output %" B_PRId32 " queued\n", index);
 	return status;
 }
 
@@ -1290,6 +1414,17 @@ IrisDecoder::_BinSize(uint32 width, uint32 height) const
 {
 	if (fCodec == HEVC)
 		return bin_size(ALIGN(width, 16), ALIGN(height, 16), 2, 2);
+	if (fCodec == VP9) {
+		// venus' vpxd_scratch_size(): two pictures' worth, the header
+		// budget half of one and the residue's one and a half
+		const uint32 threshold = 1280 * 736;
+		uint32 yuv = ALIGN(width, 16) * ALIGN(height, 16) * 3 / 2;
+		if (yuv < threshold * 3 / 2)
+			yuv = threshold * 3 / 2;
+		return ALIGN(yuv * 2 / 2 + yuv * 2 * 3 / 2, kDmaAlignment);
+	}
+	if (fCodec == MPEG2)
+		return 0;
 	return bin_size(ALIGN(width, 16), ALIGN(height, 16), 1, 3);
 }
 
@@ -1301,6 +1436,15 @@ IrisDecoder::_Scratch1Size(uint32 width, uint32 height) const
 		return comv_hevc(width, height, kComvBuffers)
 			+ non_comv_hevc(width, height) + line_hevc(width, height);
 	}
+	if (fCodec == VP9 || fCodec == MPEG2) {
+		// (VP9's motion vectors are in the persistent buffer.) Iris'
+		// sizes add a QP line (without it 4K VP9 hung the firmware after
+		// the first picture); the MiB is room to spare.
+		uint32 qp = DIV_ROUND_UP(width, 64) * DIV_ROUND_UP(height, 64) * 128;
+		return vpx_lines(width, height, fCodec == VP9)
+			+ ALIGN(qp, kDmaAlignment) + vpss_line_size(width, height) + 4096
+			+ 1024 * 1024;
+	}
 	return comv_h264(width, height, kComvBuffers)
 		+ non_comv_h264(width, height) + line_h264(width, height);
 }
@@ -1309,6 +1453,19 @@ IrisDecoder::_Scratch1Size(uint32 width, uint32 height) const
 size_t
 IrisDecoder::_PersistSize() const
 {
+	if (fCodec == VP9) {
+		// probability tables, motion vectors for 8K, the superframe
+		// index, headers, tile offsets, HDR10 histograms
+		const uint32 comv = ((8192 + 63) >> 6) * ((4320 + 63) >> 6) * 8 * 8
+			* 2 * 8;
+		return ALIGN(36 * 3840, kDmaAlignment) + ALIGN(comv, kDmaAlignment)
+			+ ALIGN(34, kDmaAlignment) + ALIGN(3 * 128, kDmaAlignment)
+			+ ALIGN(32 * ALIGN(32 * 4 * 4, 32), kDmaAlignment) + 4096;
+	}
+	if (fCodec == MPEG2) {
+		// the quantisation matrices and a QP dump
+		return ALIGN(4 * 128 + 256 + 115200, kDmaAlignment);
+	}
 	if (fCodec == HEVC) {
 		const uint32 tiles = 128 * 32 + 1;
 		return ALIGN((1u << 10) * (80 + 20) + 48 * 3072 + tiles * 4
