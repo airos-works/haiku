@@ -37,22 +37,18 @@ double fmod(double x, double y)
 		uy.i |= 1ULL << 52;
 	}
 
-	/* x mod y */
-	for (; ex > ey; ex--) {
-		i = uxi - uy.i;
-		if (i >> 63 == 0) {
-			if (i == 0)
-				return 0*x;
-			uxi = i;
-		}
-		uxi <<= 1;
+	/* x mod y: the remainder of the mantissas as integers, the exponent
+	   difference shifted in up to 11 bits at a time (uxi < 2^53, so
+	   uxi << 11 still fits); a bit at a time costs a mispredicted branch
+	   per bit of a large quotient */
+	uxi %= uy.i;
+	while (ex > ey && uxi != 0) {
+		int n = ex - ey < 11 ? ex - ey : 11;
+		uxi = (uxi << n) % uy.i;
+		ex -= n;
 	}
-	i = uxi - uy.i;
-	if (i >> 63 == 0) {
-		if (i == 0)
-			return 0*x;
-		uxi = i;
-	}
+	if (uxi == 0)
+		return 0*x;
 	for (; uxi>>52 == 0; uxi <<= 1, ex--);
 
 	/* scale result */
