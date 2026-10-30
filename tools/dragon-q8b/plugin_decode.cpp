@@ -131,6 +131,16 @@ main(int argc, char** argv)
 		}
 	}
 
+	// HOG_MB: that much memory in use first, so the codec's buffers come
+	// from elsewhere in physical memory
+	if (getenv("HOG_MB") != NULL) {
+		size_t size = (size_t)atoi(getenv("HOG_MB")) << 20;
+		uint8* hog = (uint8*)malloc(size);
+		for (size_t i = 0; hog != NULL && i < size; i += 4096)
+			hog[i] = 1;
+		printf("holding %zu MB\n", size >> 20);
+	}
+
 	image_id image = load_add_on(argv[1]);
 	MediaPlugin* (*instantiate)() = NULL;
 	if (image < 0 || get_image_symbol(image, "instantiate_plugin",

@@ -142,6 +142,8 @@ private:
 			status_t			_ConfigurePorts(bool input);
 			status_t			_StartOutput();
 			status_t			_QueueOutput(int32 index);
+			void				_ReturnDropped();
+			uint32				_OutputCount() const;
 			status_t			_QueueReference(int32 index);
 			void				_FreeOutputs();
 
@@ -195,6 +197,9 @@ private:
 			std::deque<int32>	fReady;
 			std::deque<int64>	fReadyPts;
 			std::deque<bool>	fReadyCorrupt;
+			// dropped pictures' buffers, back to the firmware with the next
+			// picture taken
+			std::vector<int32>	fDropped;
 			uint32				fDecoded;
 };
 
