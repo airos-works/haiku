@@ -114,6 +114,8 @@ private:
 
 			status_t			_OpenDecoder(BString& reason);
 			status_t			_NextPicture(IrisDecoder::Picture& picture);
+			status_t			_NewSession();
+			int32				_FrameMbsOnly() const;
 			status_t			_ReadChunk(const void** chunk, size_t* size,
 									media_header* header);
 			void				_MakeAccessUnit(const uint8* data,
@@ -151,6 +153,26 @@ private:
 			uint32				fHeight;
 			bool				fHalf;
 
+			// H.264 and MPEG-2: the chunks since the last key frame, for a
+			// new session when the pictures change (broadcasts going from
+			// frames to fields and back, on key frames); the chunks it has
+			// yet to get again, and the last picture handed out
+			std::deque<Chunk>	fSinceKey;
+			bool				fSinceKeyValid;
+			bool				fRestartedAtKey;	// once per key frame
+			std::deque<Chunk>	fReplay;
+			Chunk				fReplayChunk;
+			// H.264 broadcasts switch between frames and fields (a new
+			// sequence parameter set on a key frame), which the firmware
+			// does not follow within a session: the session ends, and a new
+			// one starts with that access unit
+			int32				fSessionFrameMbsOnly;	// -1: not known
+			int32				fUnitFrameMbsOnly;
+			bool				fDraining;
+			bool				fHaveShown;
+			int64				fLastShown;
+			bool				fSkipShown;
+
 			// chunks kept until the first picture, for the software
 			// decoder, and those it has yet to get
 			bool				fRecording;
@@ -187,6 +209,14 @@ QcomIrisDecoder::QcomIrisDecoder(bool fallback)
 	fWidth(0),
 	fHeight(0),
 	fHalf(false),
+	fSinceKeyValid(false),
+	fRestartedAtKey(false),
+	fSessionFrameMbsOnly(-1),
+	fUnitFrameMbsOnly(-1),
+	fDraining(false),
+	fHaveShown(false),
+	fLastShown(0),
+	fSkipShown(false),
 	fRecording(false),
 	fSoftwareImage(-1),
 	fSoftwarePlugin(NULL),
@@ -478,6 +508,24 @@ QcomIrisDecoder::_ReadChunk(const void** chunk, size_t* size,
 	media_header* header)
 {
 	status_t status = GetNextChunk(chunk, size, header);
+	if (status == B_OK && (fCodec == kCodecH264 || fCodec == kCodecMPEG2)) {
+		if ((header->u.encoded_video.field_flags & B_MEDIA_KEY_FRAME) != 0) {
+			fSinceKey.clear();
+			fSinceKeyValid = true;
+			fRestartedAtKey = false;
+		}
+		// (a key frame now and then only: up to ten seconds or so)
+		if (fSinceKey.size() >= 600) {
+			fSinceKey.clear();
+			fSinceKeyValid = false;
+		}
+		if (fSinceKeyValid) {
+			Chunk kept;
+			kept.data.assign((const uint8*)*chunk, (const uint8*)*chunk + *size);
+			kept.header = *header;
+			fSinceKey.push_back(kept);
+		}
+	}
 	if (status == B_OK && fRecording) {
 		Chunk recorded;
 		recorded.data.assign((const uint8*)*chunk,
@@ -654,6 +702,13 @@ QcomIrisDecoder::SeekedTo(int64 frame, bigtime_t time)
 	fInputEnded = false;
 	fParameterSetsSent = false;
 	fRecorded.clear();
+	fSinceKey.clear();
+	fSinceKeyValid = false;
+	fReplay.clear();
+	fSkipShown = false;
+	fHaveShown = false;
+	fDraining = false;
+	fSessionFrameMbsOnly = -1;
 
 	// a session that saw the end of the stream does not go on: a new one
 	if (fDecoder->EndOfStreamSent() || fDecoder->Flush() != B_OK) {
@@ -712,10 +767,44 @@ status_t
 QcomIrisDecoder::_NextPicture(IrisDecoder::Picture& picture)
 {
 	while (true) {
+		if (fDraining) {
+			// the old session's last pictures, then the new session
+			status_t status = fDecoder->NextPicture(picture, kPictureTimeout);
+			if (status == B_OK)
+				return B_OK;
+			fDraining = false;
+			if (status != B_LAST_BUFFER_ERROR) {
+				fprintf(stderr, "qcom_iris: %s\n", fDecoder->Error());
+				return B_ERROR;
+			}
+			delete fDecoder;
+			fDecoder = NULL;
+			BString reason;
+			status = _OpenDecoder(reason);
+			if (status != B_OK) {
+				fprintf(stderr, "qcom_iris: %s\n", reason.String());
+				return status;
+			}
+			// the container's parameter sets first, the unit's own after
+			fUnit.insert(fUnit.begin(), fParameterSets.begin(),
+				fParameterSets.end());
+			fSessionFrameMbsOnly = -1;
+			continue;
+		}
+
 		status_t status = fDecoder->NextPicture(picture, 0);
+		if (status == B_OK && fSkipShown && picture.pts <= fLastShown) {
+			// shown before the new session
+			fDecoder->ReleasePicture(picture);
+			continue;
+		}
+		if (status == B_OK)
+			fSkipShown = false;
 		if (status == B_OK || status == B_LAST_BUFFER_ERROR)
 			return status;
 		if (status != B_WOULD_BLOCK) {
+			if (fDecoder->NeedsNewSession() && _NewSession() == B_OK)
+				continue;
 			fprintf(stderr, "qcom_iris: %s\n", fDecoder->Error());
 			return B_ERROR;
 		}
@@ -730,7 +819,15 @@ QcomIrisDecoder::_NextPicture(IrisDecoder::Picture& picture)
 			const void* chunk;
 			size_t size;
 			media_header header;
-			status = _ReadChunk(&chunk, &size, &header);
+			if (!fReplay.empty()) {
+				fReplayChunk = fReplay.front();
+				fReplay.pop_front();
+				chunk = fReplayChunk.data.data();
+				size = fReplayChunk.data.size();
+				header = fReplayChunk.header;
+				status = B_OK;
+			} else
+				status = _ReadChunk(&chunk, &size, &header);
 			if (status == B_LAST_BUFFER_ERROR) {
 				fInputEnded = true;
 				fDecoder->EndOfStream();
@@ -740,6 +837,7 @@ QcomIrisDecoder::_NextPicture(IrisDecoder::Picture& picture)
 				return status;
 			_MakeAccessUnit((const uint8*)chunk, size);
 			fUnitTime = header.start_time;
+			fUnitFrameMbsOnly = _FrameMbsOnly();
 			if (const char* dump = getenv("IRIS_DUMP")) {
 				// (lab: what goes to the codec, as IVF frames)
 				FILE* file = fopen(dump, "ab");
@@ -755,12 +853,24 @@ QcomIrisDecoder::_NextPicture(IrisDecoder::Picture& picture)
 			fUnitPending = true;
 		}
 
+		if (fUnitFrameMbsOnly >= 0 && fSessionFrameMbsOnly >= 0
+			&& fUnitFrameMbsOnly != fSessionFrameMbsOnly) {
+			fDecoder->EndOfStream();
+			fDraining = true;
+			continue;
+		}
+
 		// no room for it: the pictures go first
 		status = fDecoder->PutAccessUnit(fUnit.data(), fUnit.size(),
 			fUnitTime, kPictureTimeout);
-		if (status == B_OK)
+		if (status == B_OK) {
 			fUnitPending = false;
+			if (fUnitFrameMbsOnly >= 0)
+				fSessionFrameMbsOnly = fUnitFrameMbsOnly;
+		}
 		else if (status != B_WOULD_BLOCK) {
+			if (fDecoder->NeedsNewSession() && _NewSession() == B_OK)
+				continue;
 			fprintf(stderr, "qcom_iris: %s\n", fDecoder->Error());
 			return status == B_NOT_SUPPORTED ? status : B_ERROR;
 		} else if (fDecoder->NextPicture(picture, 0) == B_OK)
@@ -770,6 +880,71 @@ QcomIrisDecoder::_NextPicture(IrisDecoder::Picture& picture)
 			return B_ERROR;
 		}
 	}
+}
+
+
+/*!	The frame_mbs_only_flag of the last sequence parameter set in the
+	access unit to go in (fUnit), -1 without one (or not H.264).
+*/
+int32
+QcomIrisDecoder::_FrameMbsOnly() const
+{
+	if (fCodec != kCodecH264)
+		return -1;
+	int32 result = -1;
+	size_t position = 0;
+	const uint8_t* nal;
+	size_t size;
+	char error[160];
+	while (annexb_next(fUnit.data(), fUnit.size(), &position, &nal, &size)) {
+		if (size < 1 || (nal[0] & 0x1f) != 7)
+			continue;
+		H264State* state = new(std::nothrow) H264State;
+		if (state == NULL)
+			break;
+		h264_init(state);
+		Rbsp rbsp;
+		if (rbsp_from_nal(&rbsp, nal, size) == 0) {
+			BitReader reader;
+			br_init(&reader, rbsp.data, rbsp.size);
+			if (h264_parse_sps(state, &reader, error) == 0) {
+				for (int i = 0; i < 32; i++) {
+					if (state->sps[i].valid)
+						result = state->sps[i].frameMbsOnly ? 1 : 0;
+				}
+			}
+			rbsp_free(&rbsp);
+		}
+		delete state;
+	}
+	return result;
+}
+
+
+/*!	The stream's pictures changed (a broadcast going from frames to fields
+	or back, on a key frame): a new session, which gets the chunks since
+	the last key frame again; the pictures handed out before are skipped.
+*/
+status_t
+QcomIrisDecoder::_NewSession()
+{
+	if (!fSinceKeyValid || fSinceKey.empty() || fRestartedAtKey)
+		return B_NOT_SUPPORTED;
+	fRestartedAtKey = true;
+	delete fDecoder;
+	fDecoder = NULL;
+	BString reason;
+	status_t status = _OpenDecoder(reason);
+	if (status != B_OK) {
+		fprintf(stderr, "qcom_iris: no new session: %s\n", reason.String());
+		return status;
+	}
+	fReplay = fSinceKey;
+	fUnitPending = false;
+	fInputEnded = false;
+	fParameterSetsSent = false;
+	fSkipShown = fHaveShown;
+	return B_OK;
 }
 
 
@@ -818,6 +993,8 @@ QcomIrisDecoder::Decode(void* buffer, int64* frameCount,
 	memset(header, 0, sizeof(*header));
 	header->type = B_MEDIA_RAW_VIDEO;
 	header->start_time = fPicture.pts;
+	fHaveShown = true;
+	fLastShown = fPicture.pts;
 	header->size_used = fOutputSpace == kColorSpaceNV12
 			|| fOutputSpace == kColorSpaceI420
 			|| fOutputSpace == kColorSpaceP010
@@ -827,6 +1004,10 @@ QcomIrisDecoder::Decode(void* buffer, int64* frameCount,
 	header->u.raw_video.display_line_count = fHeight;
 	header->u.raw_video.bytes_per_row = stride;
 	header->u.raw_video.line_count = fHeight;
+	// air/OS: a picture of two woven fields says so with a field_sequence
+	// of 2 (airTime then deinterlaces it)
+	if (fPicture.interlaced)
+		header->u.raw_video.field_sequence = 2;
 	*frameCount = 1;
 
 	fDecoder->ReleasePicture(fPicture);

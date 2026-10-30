@@ -364,6 +364,7 @@ IrisDecoder::IrisDecoder(codec codec)
 	fHintWidth(0),
 	fHintHeight(0),
 	fInterlaced(false),
+	fNewSession(false),
 	fOutputStride(0),
 	fOutputRows(0),
 	fOutputSize(0),
@@ -1314,9 +1315,11 @@ IrisDecoder::_StartOutput()
 			uint32 packet[3] = { 12, HFI_CMD_SESSION_CONTINUE, fSession };
 			return _Send(packet);
 		}
+		// (reconfiguring the output side, as venus does, took the SoC down)
 		fFailed = true;
+		fNewSession = true;
 		return _Fail(B_NOT_SUPPORTED,
-			"the picture size changes within the stream");
+			"the pictures change within the stream");
 	}
 
 	fWidth = width;
