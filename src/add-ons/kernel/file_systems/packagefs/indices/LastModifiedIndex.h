@@ -19,6 +19,9 @@ public:
 
 	virtual	int32				CountEntries() const;
 
+			void				ModifiedTimeChanged(Node* node,
+									const OldNodeAttributes& oldAttributes);
+
 private:
 	virtual	void				NodeAdded(Node* node);
 	virtual	void				NodeRemoved(Node* node);

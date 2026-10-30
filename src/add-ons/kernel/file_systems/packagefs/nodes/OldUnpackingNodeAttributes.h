@@ -16,6 +16,9 @@ class OldUnpackingNodeAttributes : public OldNodeAttributes {
 public:
 								OldUnpackingNodeAttributes(
 									PackageNode* packageNode);
+								OldUnpackingNodeAttributes(
+									PackageNode* packageNode,
+									const timespec& modifiedTime);
 
 	virtual	timespec			ModifiedTime() const;
 	virtual	off_t				FileSize() const;
@@ -24,6 +27,8 @@ public:
 
 private:
 			PackageNode*		fPackageNode;
+			timespec			fModifiedTime;
+			bool				fHasModifiedTime;
 };
 
 

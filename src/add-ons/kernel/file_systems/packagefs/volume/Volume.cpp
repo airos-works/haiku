@@ -173,6 +173,7 @@ Volume::Volume(fs_volume* fsVolume)
 	fPackagesDirectories(),
 	fPackagesDirectoriesByNodeRef(),
 	fPackageSettings(),
+	fLastModifiedIndex(NULL),
 	fNextNodeID(kRootDirectoryID + 1)
 {
 	rw_lock_init(&fLock, "packagefs volume");
@@ -195,6 +196,7 @@ Volume::~Volume()
 	_RemoveAllPackages();
 
 	// delete all indices
+	fLastModifiedIndex = NULL;
 	Index* index = fIndices.Clear(true);
 	while (index != NULL) {
 		Index* next = index->IndexHashLink();
@@ -294,6 +296,7 @@ Volume::Mount(const char* parameterString)
 		}
 
 		fIndices.Insert(index);
+		fLastModifiedIndex = index;
 	}
 
 	// create a BEOS:APP_SIG index
@@ -1193,6 +1196,7 @@ Volume::_AddPackageNode(Directory* directory, PackageNode* packageNode,
 	UnpackingNode* unpackingNode;
 	Node* node = directory->FindChild(packageNode->Name());
 	PackageNode* oldPackageNode = NULL;
+	timespec oldModifiedTime = {};
 
 	if (node != NULL) {
 		unpackingNode = dynamic_cast<UnpackingNode*>(node);
@@ -1201,6 +1205,7 @@ Volume::_AddPackageNode(Directory* directory, PackageNode* packageNode,
 			return B_OK;
 		}
 		oldPackageNode = unpackingNode->GetPackageNode();
+		oldModifiedTime = node->ModifiedTime();
 	} else {
 		status_t error = _CreateUnpackingNode(packageNode->Mode(), directory,
 			packageNode->Name(), unpackingNode);
@@ -1278,7 +1283,11 @@ Volume::_AddPackageNode(Directory* directory, PackageNode* packageNode,
 		_NotifyNodeAdded(node);
 	} else if (packageNode == unpackingNode->GetPackageNode()) {
 		_NotifyNodeChanged(node, kAllStatFields,
-			OldUnpackingNodeAttributes(oldPackageNode));
+			OldUnpackingNodeAttributes(oldPackageNode, oldModifiedTime));
+	} else {
+		// A directory's time is the latest of its packages': another
+		// package's directory can change it without becoming the head.
+		_NotifyModifiedTimeChanged(node, oldModifiedTime);
 	}
 
 	if (notify) {
@@ -1318,6 +1327,7 @@ Volume::_RemovePackageNode(Directory* directory, PackageNode* packageNode,
 		directoryNodeWriteLocker.SetTo(directory, false, true);
 
 	PackageNode* headPackageNode = unpackingNode->GetPackageNode();
+	timespec oldModifiedTime = node->ModifiedTime();
 	bool nodeRemoved = false;
 	Node* newNode = NULL;
 
@@ -1342,7 +1352,7 @@ Volume::_RemovePackageNode(Directory* directory, PackageNode* packageNode,
 		if (S_ISDIR(packageNode->Mode())) {
 			unpackingNode->RemovePackageNode(packageNode, ID());
 			_NotifyNodeChanged(node, kAllStatFields,
-				OldUnpackingNodeAttributes(headPackageNode));
+				OldUnpackingNodeAttributes(headPackageNode, oldModifiedTime));
 		} else {
 			// create a new node and transfer the package nodes to it
 			UnpackingNode* newUnpackingNode;
@@ -1377,8 +1387,10 @@ Volume::_RemovePackageNode(Directory* directory, PackageNode* packageNode,
 		}
 	} else {
 		// The package node to remove is not the head of the node. This change
-		// doesn't have any visible effect.
+		// doesn't have any visible effect, but a directory's time, which is
+		// the latest of its packages', may go back.
 		unpackingNode->RemovePackageNode(packageNode, ID());
+		_NotifyModifiedTimeChanged(node, oldModifiedTime);
 	}
 
 	if (!notify)
@@ -2037,4 +2049,27 @@ Volume::_NotifyNodeChanged(Node* node, uint32 statFields,
 
 		key = NULL;
 	}
+}
+
+
+/*!	Moves \a node in the last modified index after its time changed with
+	nothing else, which only happens to a directory: its time is the latest of
+	its packages' (UnpackingDirectory::ModifiedTime()). Left at its old place
+	the node could not be found anymore, so removing it left a dangling entry,
+	and a later package activation crashed in the index's tree.
+	The other indices must not see this as a change: the attribute index frees
+	the old attribute values it is given, which would be the current ones.
+*/
+void
+Volume::_NotifyModifiedTimeChanged(Node* node, const timespec& oldTime)
+{
+	if (fLastModifiedIndex == NULL)
+		return;
+
+	timespec newTime = node->ModifiedTime();
+	if (newTime.tv_sec == oldTime.tv_sec && newTime.tv_nsec == oldTime.tv_nsec)
+		return;
+
+	fLastModifiedIndex->ModifiedTimeChanged(node,
+		OldUnpackingNodeAttributes(NULL, oldTime));
 }

@@ -27,6 +27,7 @@
 
 
 class Directory;
+class LastModifiedIndex;
 class PackageFSRoot;
 class PackagesDirectory;
 class UnpackingNode;
@@ -179,6 +180,8 @@ private:
 			void				_NotifyNodeChanged(Node* node,
 									uint32 statFields,
 									const OldNodeAttributes& oldAttributes);
+			void				_NotifyModifiedTimeChanged(Node* node,
+									const timespec& oldTime);
 
 private:
 	mutable	rw_lock				fLock;
@@ -201,6 +204,7 @@ private:
 			PackageFileNameHashTable fPackages;
 			QueryList			fQueries;
 			IndexHashTable		fIndices;
+			LastModifiedIndex*	fLastModifiedIndex;
 
 			ino_t				fNextNodeID;
 };

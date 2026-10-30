@@ -12,7 +12,22 @@
 OldUnpackingNodeAttributes::OldUnpackingNodeAttributes(
 	PackageNode* packageNode)
 	:
-	fPackageNode(packageNode)
+	fPackageNode(packageNode),
+	fModifiedTime(),
+	fHasModifiedTime(false)
+{
+}
+
+
+/*!	For a directory, whose time is not its head package node's but the
+	latest of all its packages (UnpackingDirectory::ModifiedTime()).
+*/
+OldUnpackingNodeAttributes::OldUnpackingNodeAttributes(
+	PackageNode* packageNode, const timespec& modifiedTime)
+	:
+	fPackageNode(packageNode),
+	fModifiedTime(modifiedTime),
+	fHasModifiedTime(true)
 {
 }
 
@@ -20,6 +35,9 @@ OldUnpackingNodeAttributes::OldUnpackingNodeAttributes(
 timespec
 OldUnpackingNodeAttributes::ModifiedTime() const
 {
+	if (fHasModifiedTime)
+		return fModifiedTime;
+
 	if (fPackageNode != NULL)
 		return fPackageNode->ModifiedTime();
 

@@ -8,6 +8,7 @@
 
 #include <new>
 
+#include <NodeMonitor.h>
 #include <TypeConstants.h>
 
 #include <util/SinglyLinkedList.h>
@@ -178,6 +179,17 @@ int32
 LastModifiedIndex::CountEntries() const
 {
 	return fNodes->CountItems();
+}
+
+
+/*!	For a node whose time changed while nothing else did, which the other
+	indices must not hear about (see Volume::_NotifyModifiedTimeChanged()).
+*/
+void
+LastModifiedIndex::ModifiedTimeChanged(Node* node,
+	const OldNodeAttributes& oldAttributes)
+{
+	NodeChanged(node, B_STAT_MODIFICATION_TIME, oldAttributes);
 }
 
 
