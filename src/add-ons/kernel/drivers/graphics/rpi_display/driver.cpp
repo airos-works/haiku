@@ -47,6 +47,7 @@
 #define TAG_FB_GET_PHYSICAL_SIZE		0x00040003
 #define TAG_FB_GET_NUM_DISPLAYS			0x00040013
 #define TAG_FB_GET_DISPLAY_ID			0x00040016
+#define TAG_GET_DISPLAY_CFG				0x00040018
 #define TAG_FB_SET_DISPLAY_NUM			0x00048013
 #define TAG_SET_TIMING					0x00048017
 #define TAG_SET_DISPLAY_POWER			0x00048019
@@ -152,6 +153,10 @@ struct display_info {
 
 static device_manager_info* sDeviceManager;
 static rpi_firmware_module_info* sFirmware;
+// the highest pixel clock (kHz) each HDMI output can send, from the firmware
+static uint32 sMaxPixelClock[RPI_DISPLAY_MAX_OUTPUTS] = {
+	RPI_DEFAULT_MAX_PIXEL_CLOCK, RPI_DEFAULT_MAX_PIXEL_CLOCK
+};
 
 
 //	#pragma mark - firmware
@@ -199,7 +204,34 @@ read_edid(rpi_display_output& output)
 }
 
 
-/*! The firmware's boot-time modes, mapped to stable physical connectors. */
+/*!	The pixel clocks the firmware drives the HDMI outputs up to, in Hz
+	(more than 300 MHz with hdmi_enable_4kp60, on HDMI0 only).
+*/
+static void
+read_pixel_clock_limits()
+{
+	uint32 limits[RPI_DISPLAY_MAX_OUTPUTS] = {};
+	if (sFirmware->property(TAG_GET_DISPLAY_CFG, limits, sizeof(limits))
+			!= B_OK) {
+		return;
+	}
+	for (uint32 i = 0; i < RPI_DISPLAY_MAX_OUTPUTS; i++) {
+		if (limits[i] >= 25000000)
+			sMaxPixelClock[i] = limits[i] / 1000;
+	}
+	INFO("pixel clocks up to %" B_PRIu32 " and %" B_PRIu32 " kHz\n",
+		sMaxPixelClock[0], sMaxPixelClock[1]);
+}
+
+
+static status_t connect_output(rpi_display_output& output);
+
+
+/*!	The outputs, mapped to stable physical connectors, each set to the mode
+	its monitor prefers. The firmware's own boot mode is no use: what it
+	reports is the size of its frame buffer, which it scales to the mode (a
+	4K monitor gave 1920x1280).
+*/
 static status_t
 read_outputs(display_info* info)
 {
@@ -207,6 +239,7 @@ read_outputs(display_info* info)
 	shared.output_count = RPI_DISPLAY_MAX_OUTPUTS;
 	shared.outputs[0].id = 2;
 	shared.outputs[1].id = 7;
+	read_pixel_clock_limits();
 	uint32 count = 0;
 	status_t status = sFirmware->property(TAG_FB_GET_NUM_DISPLAYS, &count,
 		sizeof(count));
@@ -232,6 +265,8 @@ read_outputs(display_info* info)
 		output.native_width = size[0];
 		output.native_height = size[1];
 		read_edid(output);
+		// Without an EDID timing the firmware's guess stands.
+		connect_output(output);
 		found = true;
 		INFO("HDMI%" B_PRIu32 ": display id %" B_PRIu32 ", %ux%u, %"
 			B_PRIu32 " bytes of EDID\n", index, output.id,
@@ -250,8 +285,10 @@ connect_output(rpi_display_output& output)
 	connected.id = output.id;
 	read_edid(connected);
 	firmware_timing timing;
-	if (!preferred_edid_timing(connected.edid, connected.edid_length, timing))
+	if (!preferred_edid_timing(connected.edid, connected.edid_length, timing,
+			sMaxPixelClock[output.id == 2 ? 0 : 1])) {
 		return B_DEV_NOT_READY;
+	}
 	timing.display = output.id;
 	status_t status = sFirmware->property(TAG_SET_TIMING, &timing,
 		sizeof(timing));
@@ -265,6 +302,9 @@ connect_output(rpi_display_output& output)
 	connected.native_height = timing.vdisplay;
 	connected.flags = RPI_DISPLAY_OUTPUT_CONNECTED;
 	output = connected;
+	INFO("display %" B_PRIu32 ": %ux%u at %u Hz (%" B_PRIu32 " kHz, code %u)\n",
+		output.id, timing.hdisplay, timing.vdisplay, timing.vrefresh,
+		timing.clock, timing.video_id_code);
 	return B_OK;
 }
 

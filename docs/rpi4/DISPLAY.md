@@ -57,8 +57,19 @@ requires two matching samples, and retries an unavailable EDID after two seconds
 The registers are read-only maps at `0xfef008a8` and `0xfef058a8`: the HDMI bases
 from Linux's `bcm2711.dtsi`, plus the VC5 register offset `0x1a8`, bit 0.
 
-On connection, checksum-validated EDID supplies a progressive detailed timing
-(up to 300 MHz); an explicitly advertised VGA mode is the fallback. The driver
+At start-up and on connection, checksum-validated EDID picks the mode
+(`edid_timing.h`, tests in `tools/rpi4/test-edid-timing.py`): the preferred
+detailed timing when the Pi can send it, otherwise the fastest timing of the
+same size (detailed timings or the CTA codes 4, 16, 31, 93 to 97), otherwise
+the largest; an explicitly advertised VGA mode is the last resort. Limits:
+the firmware's per-output pixel clock (`GET_DISPLAY_CFG`, `0x00040018`, Hz;
+300 MHz when it does not answer), even horizontal timings, at most 85 Hz, as
+in Linux's firmware KMS. The boot mode is never trusted: the size the firmware
+reports (`GET_PHYSICAL_SIZE`) is its frame buffer's, which it scales to the
+mode. A Dell P2415Q (4K, preferring 594 MHz 60 Hz) gave 1920x1280 there, and
+the desktop filled only the top-left 1920x1280 of the 3840x2160 picture until
+2026-10-31; now it gets 3840x2160 at 30 Hz (60 Hz would need
+`hdmi_enable_4kp60=1`). The driver
 uses `SET_TIMING` (`0x00048017`) and `SET_DISPLAY_POWER` (`0x00048019`) with the
 firmware display ID. The ABI follows Raspberry Pi Linux's
 [`vc4_firmware_kms.c`](https://github.com/raspberrypi/linux/blob/rpi-5.15.y/drivers/gpu/drm/vc4/vc4_firmware_kms.c).
@@ -103,9 +114,10 @@ the Dell monitor still needs a physical check.
 
 ## Open
 
-- Hotplug mode selection supports progressive EDID detailed timings through
-  300 MHz; interlaced modes and CTA modes with no usable DTD/VGA fallback are
-  not supported. Only the lab's 1080p timings have native validation.
+- Mode selection supports progressive EDID detailed timings and a few CTA
+  codes; interlaced modes, standard timings and other CTA codes are not
+  supported. Natively validated: the lab's 1080p monitors; the P2415Q 4K by
+  driver state (2026-10-31: 3840x2160 buffer, plane and mode, app_server at 200 %).
 - No user-selectable physical timing changes or DPMS.
 - Hardware cursor (2026-10-27): the cursor bitmap goes into a small
   contiguous buffer of its own and the firmware composites it as a plane
