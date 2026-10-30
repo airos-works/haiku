@@ -3164,6 +3164,13 @@ TermView::AttachedToWindow()
 
 	_LoadRenderer();
 	_SetPointerShape(fPointerShape.String());
+
+	// A frame request the reader thread queued while the view was being
+	// detached (switching tabs) was dropped: BLooper drops messages for
+	// handlers it no longer has. Left set, fFramePending would keep the
+	// reader from asking for frames again, and the tab would only redraw
+	// when its cursor blinks.
+	fFramePending = false;
 	_InvalidateAll();
 }
 
