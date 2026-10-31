@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <new>
 
+#include <AutoDeleter.h>
 #include <KernelExport.h>
 #include <bus/FDT.h>
 #include <device_manager.h>
@@ -46,6 +47,8 @@
 #include <util/AutoLock.h>
 #include <util/ThreadAutoLock.h>
 #include <vm/vm.h>
+#include <vm/VMAddressSpace.h>
+#include <vm/VMArea.h>
 
 #include <graphics/v3d/v3d_drm.h>
 #include <graphics/v3d/v3d_haiku.h>
@@ -100,6 +103,12 @@ struct v3d_bo {
 	bool		cacheable;
 	bool		cpuOwned;
 	bool		cpuDirty;
+	size_t		dirtyStart;	// what the CPU may have written, while cpuDirty
+	size_t		dirtyEnd;
+	bool		imported;	// pages of a team, wired at "address" there
+	bool		importCached;
+		// imported memory the CPU caches: maintenance only when asked for
+	team_id		team;		// whose they are
 };
 
 struct v3d_job {
@@ -314,23 +323,70 @@ make_uncached(area_id area, void* address, size_t size)
 // allocation. All clones retain the same Normal-WB memory type. Maintenance
 // by VA reaches the PoC across the Cortex-A72 cluster; DSB completes it
 // before either processor is allowed to use the buffer.
+// With the thread pinned to its CPU and lineSize read there; the caller
+// completes the maintenance with a barrier.
 static void
-sync_buffer_cache(v3d_bo* buffer, bool forCPU)
+sync_cache_lines(addr_t start, addr_t end, size_t lineSize,
+	bool invalidateOnly)
 {
-	ThreadCPUPinner pinner(thread_get_current_thread());
-	const size_t lineSize = arm64_current_data_cache_line_size();
-	// The caller holds the device lock and a reference to this allocation.
-	// Cache-maintenance assembly clobbers memory, so retain these invariant
-	// bounds instead of reloading the BO metadata for every cache line.
-	const addr_t start = (addr_t)buffer->address;
-	const addr_t end = start + buffer->size;
-	for (addr_t line = start; line < end; line += lineSize) {
-		if (forCPU)
+	// Cache-maintenance assembly clobbers memory, so the bounds are kept in
+	// locals instead of being reloaded from the buffer for every line.
+	for (addr_t line = ROUNDDOWN(start, lineSize); line < end;
+			line += lineSize) {
+		if (invalidateOnly)
 			arm64_invalidate_data_cache_line_poc(line);
 		else
 			arm64_clean_invalidate_data_cache_line_poc(line);
 	}
+}
+
+
+static void
+sync_cache_range(v3d_bo* buffer, size_t from, size_t to, bool invalidateOnly)
+{
+	// The caller holds a reference to this allocation.
+	ThreadCPUPinner pinner(thread_get_current_thread());
+	const size_t lineSize = arm64_current_data_cache_line_size();
+	const addr_t base = (addr_t)buffer->address;
+	sync_cache_lines(base + from, base + std::min(to, buffer->size), lineSize,
+		invalidateOnly);
 	memory_full_barrier();
+}
+
+
+static void
+sync_buffer_cache(v3d_bo* buffer, bool forCPU)
+{
+	sync_cache_range(buffer, 0, buffer->size, forCPU);
+}
+
+
+/*!	Before a job: writes back what the CPU wrote into a cacheable buffer
+	during its interval. Device locked.
+*/
+static void
+clean_dirty_range(v3d_bo* buffer)
+{
+	if (!buffer->cpuDirty)
+		return;
+	if (buffer->dirtyEnd > buffer->dirtyStart)
+		sync_cache_range(buffer, buffer->dirtyStart, buffer->dirtyEnd, false);
+	buffer->cpuDirty = false;
+	buffer->dirtyStart = buffer->dirtyEnd = 0;
+}
+
+
+static void
+mark_dirty(v3d_bo* buffer, size_t from, size_t to)
+{
+	if (!buffer->cpuDirty || buffer->dirtyEnd <= buffer->dirtyStart) {
+		buffer->dirtyStart = from;
+		buffer->dirtyEnd = to;
+	} else {
+		buffer->dirtyStart = std::min(buffer->dirtyStart, from);
+		buffer->dirtyEnd = std::max(buffer->dirtyEnd, to);
+	}
+	buffer->cpuDirty = true;
 }
 
 
@@ -386,6 +442,61 @@ mmu_enable(v3d_info* info)
 }
 
 
+/*!	First fit for \a pageCount pages in the GPU's address space; page 0
+	stays unmapped. Returns the first page and where the buffer goes in the
+	device's list. Device locked.
+*/
+static status_t
+find_address_range(v3d_info* info, uint32 pageCount, uint32& _page,
+	v3d_bo**& _link)
+{
+	uint32 page = 1;
+	v3d_bo** link = &info->buffers;
+	while (*link != NULL && (*link)->page - page < pageCount) {
+		page = (*link)->page + (*link)->pageCount;
+		link = &(*link)->next;
+	}
+	if (page + pageCount > V3D_PAGE_COUNT)
+		return B_NO_MEMORY;
+
+	_page = page;
+	_link = link;
+	return B_OK;
+}
+
+
+/*!	The page table entries of \a buffer, run by run of the physical memory
+	at its address (in the kernel, or for an import in the calling team).
+	Device locked.
+*/
+static status_t
+map_buffer_pages(v3d_info* info, v3d_bo* buffer)
+{
+	uint32 page = buffer->page;
+	size_t offset = 0;
+	while (offset < buffer->size) {
+		physical_entry entry;
+		status_t status = get_memory_map(buffer->address + offset,
+			buffer->size - offset, &entry, 1);
+		if ((status != B_OK && status != B_BUFFER_OVERFLOW)
+			|| entry.size == 0) {
+			for (uint32 i = buffer->page; i < page; i++)
+				info->pageTable[i] = 0;
+			return B_ERROR;
+		}
+
+		entry.size = std::min((size_t)entry.size, buffer->size - offset);
+		for (size_t i = 0; i < entry.size; i += B_PAGE_SIZE) {
+			info->pageTable[page++] = V3D_PTE_VALID | V3D_PTE_WRITEABLE
+				| (uint32)((entry.address + i) >> V3D_PAGE_SHIFT);
+		}
+		offset += entry.size;
+	}
+	memory_full_barrier();
+	return B_OK;
+}
+
+
 /*!	Creates a buffer with its range of GPU address space and its page table
 	entries. Called with the device locked. The buffer starts with one
 	reference.
@@ -407,20 +518,16 @@ create_buffer(v3d_info* info, size_t size, v3d_bo*& _buffer,
 	buffer->references = 1;
 	buffer->cacheable = cacheable;
 	buffer->cpuOwned = cacheable;
-	buffer->cpuDirty = cacheable;
+	if (cacheable)
+		mark_dirty(buffer, 0, size);
 
-	// first fit in the address space; page 0 stays unmapped
-	uint32 page = 1;
-	v3d_bo** link = &info->buffers;
-	while (*link != NULL && (*link)->page - page < buffer->pageCount) {
-		page = (*link)->page + (*link)->pageCount;
-		link = &(*link)->next;
-	}
-	if (page + buffer->pageCount > V3D_PAGE_COUNT) {
+	v3d_bo** link;
+	status_t status = find_address_range(info, buffer->pageCount,
+		buffer->page, link);
+	if (status != B_OK) {
 		free(buffer);
-		return B_NO_MEMORY;
+		return status;
 	}
-	buffer->page = page;
 
 	virtual_address_restrictions virtualRestrictions = {};
 	physical_address_restrictions physicalRestrictions = {};
@@ -429,38 +536,113 @@ create_buffer(v3d_info* info, size_t size, v3d_bo*& _buffer,
 		&virtualRestrictions, &physicalRestrictions,
 		(void**)&buffer->address);
 	if (buffer->area < 0) {
-		status_t status = buffer->area;
+		status = buffer->area;
 		free(buffer);
 		return status;
 	}
 
-	// the page table entries, run by run of the physical memory
-	size_t offset = 0;
-	while (offset < size) {
-		physical_entry entry;
-		status_t status = get_memory_map(buffer->address + offset,
-			size - offset, &entry, 1);
-		if ((status != B_OK && status != B_BUFFER_OVERFLOW)
-			|| entry.size == 0) {
-			delete_area(buffer->area);
-			free(buffer);
-			return B_ERROR;
-		}
-
-		for (size_t i = 0; i < entry.size; i += B_PAGE_SIZE) {
-			info->pageTable[page++] = V3D_PTE_VALID | V3D_PTE_WRITEABLE
-				| (uint32)((entry.address + i) >> V3D_PAGE_SHIFT);
-		}
-		offset += entry.size;
-	}
-	memory_full_barrier();
-
-	status_t status = cacheable ? B_OK
-		: make_uncached(buffer->area, buffer->address, size);
+	status = map_buffer_pages(info, buffer);
+	if (status == B_OK && !cacheable)
+		status = make_uncached(buffer->area, buffer->address, size);
 	if (status != B_OK) {
 		for (uint32 i = 0; i < buffer->pageCount; i++)
 			info->pageTable[buffer->page + i] = 0;
 		delete_area(buffer->area);
+		free(buffer);
+		return status;
+	}
+
+	if (mmu_flush(info) != B_OK)
+		ERROR("MMU flush timed out\n");
+
+	buffer->next = *link;
+	*link = buffer;
+
+	_buffer = buffer;
+	return B_OK;
+}
+
+
+/*!	A buffer of the pages at \a address in \a team, the calling one (see
+	V3D_HAIKU_IMPORT_BO): the range is wired there, as for any transfer
+	into user memory, until the buffer is freed. The team must keep the
+	range mapped until then: deleting a wired area waits for it to be
+	unwired. Called without the device lock; takes it.
+
+	The pages are not cloned into the kernel: such a clone maps a wired
+	source's pages without mapping objects, and wiring it for writing then
+	does copy-on-write on them (a KDL in VMTranslationMap::PageUnmapped()).
+*/
+static status_t
+import_buffer(v3d_info* info, team_id team, addr_t address, size_t size,
+	v3d_bo*& _buffer)
+{
+	size = ROUNDUP(size, B_PAGE_SIZE);
+	if (size == 0 || size > V3D_MAX_BO_SIZE
+		|| (address & (B_PAGE_SIZE - 1)) != 0 || !IS_USER_ADDRESS(address)
+		|| !IS_USER_ADDRESS(address + size - 1)
+		|| team != team_get_current_team_id()) {
+		return B_BAD_VALUE;
+	}
+
+	// one area of the team holds the range, writable by it; anything but
+	// the default (write-back) memory type is not cached by the CPU
+	bool cached;
+	{
+		VMAddressSpace* space = VMAddressSpace::GetCurrent();
+		if (space == NULL)
+			return B_BAD_TEAM_ID;
+		space->ReadLock();
+		VMArea* area = space->LookupArea(address);
+		bool valid = area != NULL && address + size <= area->Base() + area->Size()
+			&& (area->protection & B_WRITE_AREA) != 0;
+		cached = valid && area->MemoryType() == 0;
+		space->ReadUnlock();
+		space->Put();
+		if (!valid)
+			return B_BAD_ADDRESS;
+	}
+
+	v3d_bo* buffer = (v3d_bo*)calloc(1, sizeof(v3d_bo));
+	if (buffer == NULL)
+		return B_NO_MEMORY;
+	buffer->size = size;
+	buffer->pageCount = size >> V3D_PAGE_SHIFT;
+	buffer->references = 1;
+	buffer->imported = true;
+	buffer->importCached = cached;
+	buffer->team = team;
+	buffer->area = -1;
+	buffer->address = (uint8*)address;
+
+	status_t status = lock_memory_etc(team, buffer->address, size,
+		B_READ_DEVICE);
+	if (status != B_OK) {
+		free(buffer);
+		return status;
+	}
+
+	// lock_memory() leaves a contiguous or fully locked area (a clone of
+	// rpi_display's frame buffer) as it is, wired by nature but with pages
+	// mapped only once touched, and get_memory_map() panics on a page that
+	// is not mapped.
+	for (size_t offset = 0; offset < size && status == B_OK;
+			offset += B_PAGE_SIZE) {
+		uint8 byte;
+		status = user_memcpy(&byte, buffer->address + offset, 1);
+	}
+
+	MutexLocker locker(info->lock);
+	v3d_bo** link = NULL;
+	if (status == B_OK) {
+		status = find_address_range(info, buffer->pageCount, buffer->page,
+			link);
+	}
+	if (status == B_OK)
+		status = map_buffer_pages(info, buffer);
+	if (status != B_OK) {
+		locker.Unlock();
+		unlock_memory_etc(team, buffer->address, size, B_READ_DEVICE);
 		free(buffer);
 		return status;
 	}
@@ -497,7 +679,13 @@ put_buffer(v3d_info* info, v3d_bo* buffer)
 	if (mmu_flush(info) != B_OK)
 		ERROR("MMU flush timed out\n");
 
-	delete_area(buffer->area);
+	if (buffer->imported) {
+		// Fails harmlessly once the team's address space is gone, and with
+		// it the wiring.
+		unlock_memory_etc(buffer->team, buffer->address, buffer->size,
+			B_READ_DEVICE);
+	} else
+		delete_area(buffer->area);
 	free(buffer);
 }
 
@@ -508,6 +696,33 @@ lookup_buffer(v3d_file* file, uint32 handle)
 	if (handle == 0 || handle > file->bufferCount)
 		return NULL;
 	return file->buffers[handle - 1];
+}
+
+
+/*!	A free handle for \a buffer, growing the table as needed. Device
+	locked.
+*/
+static status_t
+add_handle(v3d_file* file, v3d_bo* buffer, uint32& _handle)
+{
+	uint32 index = 0;
+	while (index < file->bufferCount && file->buffers[index] != NULL)
+		index++;
+	if (index == file->bufferCount) {
+		uint32 count = std::max(file->bufferCount * 2, (uint32)64);
+		v3d_bo** table = (v3d_bo**)realloc(file->buffers,
+			count * sizeof(v3d_bo*));
+		if (table == NULL)
+			return B_NO_MEMORY;
+		memset(table + file->bufferCount, 0,
+			(count - file->bufferCount) * sizeof(v3d_bo*));
+		file->buffers = table;
+		file->bufferCount = count;
+	}
+
+	file->buffers[index] = buffer;
+	_handle = index + 1;
+	return B_OK;
 }
 
 
@@ -708,9 +923,11 @@ dump_gpu_memory(v3d_info* info, uint32 address)
 		uint32 from = offset >= 32 ? offset - 32 : 0;
 		uint32 to = std::min((size_t)offset + 32, bo->size);
 		dprintf("v3d: %#" B_PRIx32 " is at offset %#" B_PRIx32 " of the %"
-			B_PRIuSIZE " byte buffer at %#" B_PRIx32 ":", address, offset,
-			bo->size, bo->page << V3D_PAGE_SHIFT);
-		for (uint32 i = from; i < to; i++) {
+			B_PRIuSIZE " byte %sbuffer at %#" B_PRIx32 ":", address, offset,
+			bo->size, bo->imported ? "imported " : "",
+			bo->page << V3D_PAGE_SHIFT);
+		// an import's pages are mapped in its team only
+		for (uint32 i = from; i < to && !bo->imported; i++) {
 			dprintf("%s%02x", i == offset ? " [" : " ", bo->address[i]);
 			if (i == offset)
 				dprintf("]");
@@ -793,6 +1010,8 @@ run_cl(v3d_info* info, v3d_job* job, v3d_bo*& overflow)
 		for (uint32 i = 0; i < job->boCount; i++) {
 			// which of the job's buffers the core got to write
 			v3d_bo* bo = job->bos[i];
+			if (bo->imported)
+				continue;
 			uint32 used = 0;
 			for (uint32 k = 0; k < bo->pageCount; k++) {
 				const uint32* words = (const uint32*)(bo->address
@@ -1024,10 +1243,7 @@ submit_job(v3d_file* file, v3d_job* job, const uint32* handles, uint32 count,
 	for (uint32 i = 0; i < job->boCount; i++) {
 		v3d_bo* bo = job->bos[i];
 		if (bo->cacheable) {
-			if (bo->cpuDirty) {
-				sync_buffer_cache(bo, false);
-				bo->cpuDirty = false;
-			}
+			clean_dirty_range(bo);
 			bo->cpuOwned = false;
 		}
 		bo->lastJob = job->seqno;
@@ -1344,6 +1560,9 @@ get_param(v3d_info* info, drm_v3d_get_param& request)
 		case V3D_HAIKU_PARAM_CACHEABLE_BO:
 			request.value = 2;
 			break;
+		case V3D_HAIKU_PARAM_IMPORT_BO:
+			request.value = 1;
+			break;
 		case DRM_V3D_PARAM_SUPPORTS_PERFMON:
 		case DRM_V3D_PARAM_SUPPORTS_CPU_QUEUE:
 		case DRM_V3D_PARAM_MAX_PERF_COUNTERS:
@@ -1390,34 +1609,52 @@ v3d_control(void* cookie, uint32 op, void* buffer, size_t length)
 
 			MutexLocker locker(info->lock);
 
-			// a free handle, growing the table as needed
-			uint32 index = 0;
-			while (index < file->bufferCount && file->buffers[index] != NULL)
-				index++;
-			if (index == file->bufferCount) {
-				uint32 count = std::max(file->bufferCount * 2, (uint32)64);
-				v3d_bo** table = (v3d_bo**)realloc(file->buffers,
-					count * sizeof(v3d_bo*));
-				if (table == NULL)
-					return B_NO_MEMORY;
-				memset(table + file->bufferCount, 0,
-					(count - file->bufferCount) * sizeof(v3d_bo*));
-				file->buffers = table;
-				file->bufferCount = count;
-			}
-
 			v3d_bo* bo;
 			status = create_buffer(info, request.size, bo,
 				(request.flags & V3D_HAIKU_BO_CACHEABLE) != 0);
 			if (status != B_OK)
 				return status;
-			file->buffers[index] = bo;
+			status = add_handle(file, bo, request.handle);
+			if (status != B_OK) {
+				put_buffer(info, bo);
+				return status;
+			}
 
-			request.handle = index + 1;
 			request.offset = bo->page << V3D_PAGE_SHIFT;
 			status = user_memcpy(buffer, &request, sizeof(request));
 			if (status != B_OK) {
-				file->buffers[index] = NULL;
+				file->buffers[request.handle - 1] = NULL;
+				put_buffer(info, bo);
+			}
+			return status;
+		}
+
+		case V3D_HAIKU_IMPORT_BO:
+		{
+			v3d_haiku_import_bo request;
+			status_t status = copy_in(request, buffer, length);
+			if (status != B_OK)
+				return status;
+
+			v3d_bo* bo;
+			status = import_buffer(info, file->team, request.address,
+				request.size, bo);
+			if (status != B_OK)
+				return status;
+
+			MutexLocker locker(info->lock);
+			status = add_handle(file, bo, request.handle);
+			if (status != B_OK) {
+				put_buffer(info, bo);
+				return status;
+			}
+
+			request.flags = bo->importCached ? V3D_HAIKU_IMPORT_CACHED : 0;
+			request.offset = bo->page << V3D_PAGE_SHIFT;
+			request.pad = 0;
+			status = user_memcpy(buffer, &request, sizeof(request));
+			if (status != B_OK) {
+				file->buffers[request.handle - 1] = NULL;
 				put_buffer(info, bo);
 			}
 			return status;
@@ -1432,7 +1669,7 @@ v3d_control(void* cookie, uint32 op, void* buffer, size_t length)
 
 			MutexLocker locker(info->lock);
 			v3d_bo* bo = lookup_buffer(file, request.handle);
-			if (bo == NULL)
+			if (bo == NULL || bo->imported)
 				return B_BAD_VALUE;
 			area_id source = bo->area;
 			locker.Unlock();
@@ -1496,8 +1733,11 @@ v3d_control(void* cookie, uint32 op, void* buffer, size_t length)
 
 			MutexLocker locker(info->lock);
 			v3d_bo* bo = lookup_buffer(file, request.handle);
-			if (bo == NULL || !bo->cacheable)
+			if (bo == NULL || (!bo->cacheable && !bo->importCached))
 				return B_BAD_VALUE;
+			// an import's lines are maintained at its addresses in its team
+			if (bo->imported && bo->team != team_get_current_team_id())
+				return B_NOT_ALLOWED;
 			// Closing the handle while the wait drops the lock must not free
 			// the backing area. Recheck submissions after every unlocked wait.
 			bo->references++;
@@ -1509,14 +1749,115 @@ v3d_control(void* cookie, uint32 op, void* buffer, size_t length)
 				if (status != B_OK)
 					break;
 			}
-			if (status == B_OK && !bo->cpuOwned) {
+			if (status == B_OK && bo->importCached) {
+				// someone else's memory: whatever its owner wrote stays
+				sync_buffer_cache(bo, false);
+			} else if (status == B_OK && !bo->cpuOwned) {
 				// Never invalidate twice in one CPU interval: the first caller
 				// may already have written data that the next job will need.
-				sync_buffer_cache(bo, true);
+				// Neither may the ranges a CPU_PREPARE_RANGES gave out for
+				// writing be invalidated.
+				sync_buffer_cache(bo, !bo->cpuDirty);
 				bo->cpuOwned = true;
 			}
-			if (status == B_OK && (request.pad & V3D_HAIKU_CPU_READ_ONLY) == 0)
-				bo->cpuDirty = true;
+			if (status == B_OK && bo->cacheable
+				&& (request.pad & V3D_HAIKU_CPU_READ_ONLY) == 0) {
+				mark_dirty(bo, 0, bo->size);
+			}
+			put_buffer(info, bo);
+			return status;
+		}
+
+		case V3D_HAIKU_CPU_PREPARE_RANGES:
+		{
+			v3d_haiku_cpu_ranges request;
+			status_t status = copy_in(request, buffer, length);
+			if (status != B_OK)
+				return status;
+			if ((request.flags & ~(V3D_HAIKU_CPU_READ_ONLY
+					| V3D_HAIKU_RANGES_NO_WAIT)) != 0
+				|| request.count == 0 || request.count > V3D_HAIKU_MAX_RANGES) {
+				return B_BAD_VALUE;
+			}
+			const bool noWait = (request.flags & V3D_HAIKU_RANGES_NO_WAIT) != 0;
+
+			v3d_haiku_range* ranges = (v3d_haiku_range*)malloc(
+				request.count * sizeof(v3d_haiku_range));
+			if (ranges == NULL)
+				return B_NO_MEMORY;
+			MemoryDeleter rangesDeleter(ranges);
+			if (!IS_USER_ADDRESS(request.ranges)
+				|| user_memcpy(ranges, (void*)(addr_t)request.ranges,
+					request.count * sizeof(v3d_haiku_range)) != B_OK) {
+				return B_BAD_ADDRESS;
+			}
+
+			MutexLocker locker(info->lock);
+			v3d_bo* bo = lookup_buffer(file, request.handle);
+			if (bo == NULL || (noWait && !bo->imported))
+				return B_BAD_VALUE;
+			if (bo->imported && bo->team != team_get_current_team_id())
+				return B_NOT_ALLOWED;
+
+			// the bytes the ranges cover, checked against the buffer
+			uint64 first = UINT64_MAX, end = 0;
+			for (uint32 i = 0; i < request.count; i++) {
+				v3d_haiku_range& range = ranges[i];
+				uint64 rows = std::max(range.rows, (uint32)1);
+				uint64 last = range.offset + (rows - 1) * range.stride
+					+ range.bytes;
+				if (range.bytes == 0 || range.offset >= bo->size
+					|| (rows > 1 && range.stride < range.bytes)
+					|| last > bo->size)
+					return B_BAD_VALUE;
+				first = std::min(first, range.offset);
+				end = std::max(end, last);
+			}
+
+			bo->references++;
+			while (!noWait && bo->lastJob > info->completed) {
+				uint64 seqno = bo->lastJob;
+				locker.Unlock();
+				status = wait_for_job(info, seqno, -1);
+				locker.Lock();
+				if (status != B_OK)
+					break;
+			}
+
+			// Lines are cleaned and invalidated: a second prepare in the same
+			// interval then loses nothing the CPU wrote after the first.
+			bool maintain = bo->importCached
+				|| (bo->cacheable && !bo->cpuOwned);
+			if (status == B_OK && bo->cacheable
+				&& (request.flags & V3D_HAIKU_CPU_READ_ONLY) == 0) {
+				mark_dirty(bo, first, end);
+			}
+			if (status == B_OK && maintain) {
+				// Unlocked: the reference keeps the buffer, and jobs and
+				// other prepares need not wait for this.
+				locker.Unlock();
+				ThreadCPUPinner pinner(thread_get_current_thread());
+				const size_t lineSize = arm64_current_data_cache_line_size();
+				const addr_t base = (addr_t)bo->address;
+				for (uint32 i = 0; i < request.count; i++) {
+					const v3d_haiku_range& range = ranges[i];
+					uint32 rows = std::max(range.rows, (uint32)1);
+					addr_t start = base + range.offset;
+					if (rows == 1 || range.stride == range.bytes) {
+						sync_cache_lines(start,
+							start + (size_t)rows * range.bytes, lineSize, false);
+						continue;
+					}
+					for (uint32 row = 0; row < rows; row++) {
+						addr_t from = start + (size_t)row * range.stride;
+						sync_cache_lines(from, from + range.bytes, lineSize,
+							false);
+					}
+				}
+				memory_full_barrier();
+				pinner.Unlock();
+				locker.Lock();
+			}
 			put_buffer(info, bo);
 			return status;
 		}
