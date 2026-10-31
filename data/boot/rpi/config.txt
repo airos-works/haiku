@@ -36,6 +36,9 @@ max_framebuffers=2
 hdmi_force_hotplug:0=1
 hdmi_force_hotplug:1=1
 disable_splash=1
+# HDMI0 up to 600 MHz: 4K monitors at 60 Hz (the firmware then runs its
+# core clock faster). Without it both outputs stop at 300 MHz, 4K at 30 Hz.
+hdmi_enable_4kp60=1
 
 # cmdline.txt takes the loader's options, each a word of its own:
 #   airos.debug   the loader's and the kernel's debug output on the screen
