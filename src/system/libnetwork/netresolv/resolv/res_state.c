@@ -52,6 +52,13 @@ __RCSID("$NetBSD: res_state.c,v 1.6 2008/04/28 20:23:02 martin Exp $");
 
 #include <pthread.h>
 
+#ifdef __HAIKU__
+#include <string.h>
+#include <sys/stat.h>
+
+#include <FindDirectory.h>
+#endif
+
 struct __res_state _nres
 # if defined(__BIND_RES_TEXT)
 	= { .retrans = RES_TIMEOUT, }	/*%< Motorola, et al. */
@@ -65,6 +72,11 @@ struct _res_st {
 	struct __res_state	st_res;
 
 	SLIST_ENTRY(_res_st)	st_list;
+#ifdef __HAIKU__
+	/* resolv.conf as this state last read it */
+	struct timespec		st_conf_time;
+	ino_t			st_conf_inode;
+#endif
 };
 
 static pthread_mutex_t res_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -87,6 +99,46 @@ res_state_debug(const char *msg, void *p)
 #define res_state_debug(a, b)
 #endif
 
+
+#ifdef __HAIKU__
+/*
+ * The states are kept for the life of the process, and res_check() (the
+ * kqueue on resolv.conf) is not built here: without this, a program kept the
+ * name servers it saw first. A VPN that connects (or goes away), DHCP from
+ * another network: every later lookup still asked the old servers, and a
+ * server that is gone costs the full timeout (5 s) on each one.
+ */
+static pthread_once_t res_conf_path_once = PTHREAD_ONCE_INIT;
+static char res_conf_path[PATH_MAX];
+
+static void
+res_conf_path_init(void)
+{
+	if (find_directory(B_SYSTEM_SETTINGS_DIRECTORY, -1, false, res_conf_path,
+			sizeof(res_conf_path)) == B_OK)
+		strlcat(res_conf_path, "/network/resolv.conf", sizeof(res_conf_path));
+	else
+		res_conf_path[0] = '\0';
+}
+
+/* Whether resolv.conf changed since the state last read it; notes the new one. */
+static int
+res_conf_changed(struct _res_st *st)
+{
+	struct stat info;
+
+	pthread_once(&res_conf_path_once, res_conf_path_init);
+	if (res_conf_path[0] == '\0' || stat(res_conf_path, &info) != 0)
+		memset(&info, 0, sizeof(info));
+	if (info.st_mtim.tv_sec == st->st_conf_time.tv_sec
+		&& info.st_mtim.tv_nsec == st->st_conf_time.tv_nsec
+		&& info.st_ino == st->st_conf_inode)
+		return 0;
+	st->st_conf_time = info.st_mtim;
+	st->st_conf_inode = info.st_ino;
+	return 1;
+}
+#endif
 
 res_state
 __res_get_state(void)
@@ -111,7 +163,12 @@ __res_get_state(void)
 		res->options = 0;
 		res_state_debug("alloc new", res);
 	}
+#ifdef __HAIKU__
+	/* As res_check() does: res_ninit() of a set up state destroys it first. */
+	if (res_conf_changed(st) || (res->options & RES_INIT) == 0) {
+#else
 	if ((res->options & RES_INIT) == 0) {
+#endif
 		if (res_ninit(res) == -1) {
 			h_errno = NETDB_INTERNAL;
 			free(st);
