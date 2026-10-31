@@ -118,6 +118,7 @@ struct ioapic {
 static int32 sIOAPICPhys = 0;
 static ioapic* sIOAPICs = NULL;
 static int32 sSourceOverrides[ISA_INTERRUPT_COUNT];
+static bool sHasSourceOverride[ISA_INTERRUPT_COUNT];
 
 
 // #pragma mark - I/O APIC
@@ -583,6 +584,8 @@ acpi_configure_source_overrides(acpi_table_madt* madt)
 					sSourceOverrides[info->SourceIrq] = info->GlobalIrq;
 				}
 
+				sHasSourceOverride[info->SourceIrq] = true;
+
 				// configure non-standard polarity/trigger modes
 				auto [mode, polarity] = acpi_madt_convert_inti_flags(info->IntiFlags);
 				ioapic_configure_io_interrupt(info->GlobalIrq, mode, polarity);
@@ -865,6 +868,97 @@ ioapic_resume()
 }
 
 
+static bool
+ioapic_is_amd_zen()
+{
+	const arch_cpu_info& cpu = gCPU[0].arch;
+	if (cpu.vendor != VENDOR_AMD && cpu.vendor != VENDOR_HYGON)
+		return false;
+
+	return cpu.family + cpu.extended_family >= 0x17;
+}
+
+
+/*!	The PS/2 controller's interrupts (ISA IRQ 1 and 12) default to edge
+	triggered, active high, unless the MADT overrides them. AMD Zen machines
+	from the Ryzen 6000 series on may instead wire the keyboard interrupt
+	active low and say so only in the PS/2 devices' _CRS (the Framework 13
+	with a Ryzen AI 300 has IRQ (Edge, ActiveLow, Shared) {1} in KBC0). With
+	the pin left active high no keyboard interrupt is ever seen: the keyboard
+	reset times out and the PS/2 keyboard is not found. Like Linux, take the
+	trigger mode and polarity from _CRS on Zen when the MADT has no override.
+*/
+static void
+ioapic_configure_ps2_interrupts(acpi_module_info* acpi)
+{
+	if (!ioapic_is_amd_zen())
+		return;
+
+	static const char* const kPS2DeviceIDs[] = {
+		"PNP0303", "PNP030B", "PNP0F03", "PNP0F13"
+	};
+
+	for (size_t id = 0; id < B_COUNT_OF(kPS2DeviceIDs); id++) {
+		for (uint32 index = 0; ; index++) {
+			char path[256];
+			if (acpi->get_device(kPS2DeviceIDs[id], index, path, sizeof(path))
+					!= B_OK) {
+				break;
+			}
+
+			acpi_handle handle;
+			if (acpi->get_handle(NULL, path, &handle) != B_OK)
+				continue;
+
+			acpi_data buffer;
+			buffer.pointer = NULL;
+			buffer.length = ACPI_ALLOCATE_BUFFER;
+			if (acpi->get_current_resources(handle, &buffer) != B_OK) {
+				free(buffer.pointer);
+				continue;
+			}
+
+			acpi_resource* resource = (acpi_resource*)buffer.pointer;
+			while (resource->Type != ACPI_RESOURCE_TYPE_END_TAG
+				&& resource->Length != 0) {
+				if (resource->Type == ACPI_RESOURCE_TYPE_IRQ) {
+					const acpi_resource_irq& irq = resource->Data.Irq;
+					for (uint8 i = 0; i < irq.InterruptCount; i++) {
+						uint8 isaIRQ = irq.Interrupts[i];
+						if ((isaIRQ != 1 && isaIRQ != 12)
+							|| sHasSourceOverride[isaIRQ]) {
+							continue;
+						}
+
+						interrupt_trigger_mode mode = irq.Triggering == 0
+							? B_LEVEL_TRIGGERED : B_EDGE_TRIGGERED;
+						interrupt_trigger_polarity polarity
+							= irq.Polarity == 0
+								? B_HIGH_ACTIVE_POLARITY
+								: B_LOW_ACTIVE_POLARITY;
+						if (mode == B_EDGE_TRIGGERED
+							&& polarity == B_HIGH_ACTIVE_POLARITY) {
+							continue;
+						}
+
+						dprintf("ioapic: %s (%s) irq %u: %s triggered, active "
+							"%s per _CRS\n", path, kPS2DeviceIDs[id], isaIRQ,
+							mode == B_LEVEL_TRIGGERED ? "level" : "edge",
+							polarity == B_LOW_ACTIVE_POLARITY ? "low" : "high");
+						ioapic_configure_io_interrupt(isaIRQ, mode, polarity);
+					}
+				}
+
+				resource = (acpi_resource*)((uint8*)resource
+					+ resource->Length);
+			}
+
+			free(buffer.pointer);
+		}
+	}
+}
+
+
 void
 ioapic_routing_init()
 {
@@ -883,6 +977,8 @@ ioapic_routing_init()
 	}
 	BPrivate::CObjectDeleter<const char, status_t, put_module>
 		acpiModulePutter(B_ACPI_MODULE_NAME);
+
+	ioapic_configure_ps2_interrupts(acpiModule);
 
 	IRQRoutingTable table;
 	status = prepare_irq_routing(acpiModule, table, &ioapic_is_interrupt_available);
