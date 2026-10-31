@@ -55,7 +55,15 @@
 #                           in the image through AIROS_CI_PACKAGES
 #   AIROS_CI_LIBS           libraries for system/non-packaged/lib (GL stack)
 #   AIROS_CI_EGL            EGL vendor files for .../add-ons/opengl/egl_vendor.d
-#   AIROS_CI_DEMOS          demos for system/non-packaged/demos (GLTeapot)
+#   AIROS_CI_DEMOS          demos for system/non-packaged/demos (an older
+#                           CI's GLTeapot)
+#   AIROS_CI_SYSTEM_DEMOS   (release images) demos the payload package puts in
+#                           system/demos, each linked from Deskbar's Demos
+#                           folder as the haiku package links its own (arm64:
+#                           GLTeapot, which Haiku builds only with its mesa
+#                           build feature)
+#   AIROS_CI_SYSTEM_APPS    (release images) applications the payload package
+#                           puts in system/apps (arm64: GLInfo)
 #   AIROS_CI_ADDONS         an add-ons tree for system/non-packaged/add-ons
 #   AIROS_CI_FLUIDLITE      (arm64) a prefix with FluidLite for the MIDI kit,
 #                           read by build/jam/BuildFeatures
@@ -214,6 +222,29 @@ rule AirosCIFiles directoryTokens : sourceDir : grist : pattern : exclude
 	files = <$(grist)>$(files) ;
 	SEARCH on $(files) = $(sourceDir) ;
 	AddFilesToHaikuImage $(directoryTokens) : $(files) ;
+}
+
+# AirosCIPackageFiles <package> : <directory> : <source directory> : <grist>
+#	: [ <Deskbar folder> ]
+# Adds every file of the source directory to the package's directory, each
+# linked from that folder of Deskbar's menu when one is given.
+rule AirosCIPackageFiles package : directoryTokens : sourceDir : grist : folder
+{
+	if ! $(sourceDir) {
+		return ;
+	}
+	local files = [ Glob $(sourceDir) : * ] ;
+	files = [ FFilter $(files:BS) : . .. ] ;
+	local file ;
+	for file in $(files) {
+		local target = $(file:G=$(grist)) ;
+		SEARCH on $(target) = $(sourceDir) ;
+		AddFilesToContainer $(package) : $(directoryTokens) : $(target) ;
+		if $(folder) {
+			AddSymlinkToContainer $(package) : data deskbar menu $(folder)
+				: ../../../../$(directoryTokens:J=/)/$(file) : $(file) ;
+		}
+	}
 }
 
 # AirosCIFile <image directory> : <source file> : <name>
@@ -501,6 +532,11 @@ rule UserBuildConfigRulePreImage
 
 	# A release image: its identity, and its files outside packages in a
 	# package of their own (see the top of this file).
+	if ! $(AIROS_CI_RELEASE_VERSION)
+		&& ( $(AIROS_CI_SYSTEM_DEMOS) || $(AIROS_CI_SYSTEM_APPS) ) {
+		Exit "AIROS_CI_SYSTEM_DEMOS and AIROS_CI_SYSTEM_APPS need a release"
+			"image (AIROS_CI_RELEASE_VERSION)" ;
+	}
 	if $(AIROS_CI_RELEASE_VERSION) {
 		if ! $(AIROS_CI_RELEASE_DIR) {
 			Exit "AIROS_CI_RELEASE_VERSION needs AIROS_CI_RELEASE_DIR" ;
@@ -511,6 +547,13 @@ rule UserBuildConfigRulePreImage
 		local payload = airos_payload.hpkg ;
 		HaikuPackage $(payload) ;
 		AirosMoveToPayload $(payload) ;
+		# CI's GL demo and application where the haiku package has them on
+		# x86_64 (packagefs merges them into system/demos and system/apps),
+		# so they come with each release like the rest of the system.
+		AirosCIPackageFiles $(payload) : demos : $(AIROS_CI_SYSTEM_DEMOS)
+			: airos-ci-system-demo : Demos ;
+		AirosCIPackageFiles $(payload) : apps : $(AIROS_CI_SYSTEM_APPS)
+			: airos-ci-system-app ;
 		BuildHaikuPackage $(payload) : airos_payload ;
 
 		local release = airos_release.hpkg ;
