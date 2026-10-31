@@ -1,0 +1,21 @@
+diff -ruN a/src/freedreno/ir3/ir3_compiler.c b/src/freedreno/ir3/ir3_compiler.c
+--- a/src/freedreno/ir3/ir3_compiler.c
++++ b/src/freedreno/ir3/ir3_compiler.c
+@@ -201,6 +201,17 @@
+ __debug_init(void)
+ {
+    ir3_shader_debug = debug_get_option_ir3_shader_debug();
++#ifdef __HAIKU__
++   /* (air/OS) A preamble runs before each draw that changes its uniforms:
++    * WebGL Aquarium's 15000 draws a frame (each with new uniforms, through
++    * zink) kept the Dragon Q8B's Adreno 690 busy at 35 frames/s, 44 without
++    * preambles; a GLES loop of 15000 draws with a 400-byte uniform block
++    * went from 2.45 to 1.65 us a draw. Draw-heavy OpenGL (browsers, the
++    * desktop) is the common case here; IR3_PREAMBLE=1 restores them.
++    */
++   if (!debug_get_bool_option("IR3_PREAMBLE", false))
++      ir3_shader_debug |= IR3_DBG_NOPREAMBLE;
++#endif
+    ir3_shader_override_path =
+       __normal_user() ? debug_get_option_ir3_shader_override_path() : NULL;
+ 
