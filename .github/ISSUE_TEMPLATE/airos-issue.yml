@@ -1,0 +1,88 @@
+name: "Report a problem with airOS"
+description: "Something in the operating system does not work as expected."
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a problem with airOS. A short, specific report is the most useful: what you did, what happened and what you expected.
+
+        This tracker covers the operating system itself: starting up, drivers and hardware, the desktop, and the system apps and preferences. Apps with their own tracker are listed on [airos.works/report](https://airos.works/report/).
+
+        Please [search the existing issues](https://github.com/airos-works/haiku/issues?q=is%3Aissue) first, and leave out passwords, keys and personal details, including in logs and screenshots.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A brief description of the problem. Include the steps that lead to it, what you expected and what happened instead.
+      placeholder: |
+        1. Open …
+        2. Click …
+
+        Expected: …
+        Instead: …
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of the system?
+      options:
+        - "Installing or starting up"
+        - "Graphics and displays"
+        - "Wi-Fi and networking"
+        - "Bluetooth"
+        - "Sound, video and media"
+        - "USB, keyboard, mouse and touchpad"
+        - "Disks, file systems and network shares"
+        - "Desktop: Tracker, Deskbar and windows"
+        - "System apps and preferences"
+        - "System updates"
+        - "Something else"
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Hardware platform
+      description: The kind of machine you saw the problem on.
+      options:
+        - "x86-64 desktop PC"
+        - "x86-64 laptop"
+        - "Framework Laptop 13"
+        - "Radxa ROCK 5 ITX"
+        - "Radxa Dragon Q8B"
+        - "Raspberry Pi 4"
+        - "Radxa Cubie A7S"
+        - "Other ARM64 machine (UEFI)"
+        - "Virtual machine (QEMU, VirtualBox, VMware, …)"
+        - "Other"
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware and airOS details
+      description: |
+        The machine or board model, processor, graphics, memory and any devices involved (a USB adapter, a display, a Wi-Fi card). For a driver problem, the matching lines from `listdev` (PCI) or `listusb` (USB) in Terminal help.
+
+        Which airOS you are running: paste the output of `cat /boot/system/data/airos/release`, or the name of the image you installed from.
+      placeholder: |
+        Machine: …
+        Processor and graphics: …
+        Memory: …
+        airOS release: …
+    validations:
+      required: true
+  - type: textarea
+    id: files
+    attributes:
+      label: Crash reports, logs and screenshots
+      description: |
+        Drag files into this box to attach them, or paste short logs as text. Useful files:
+
+        - **Crash report**: when an app crashes, choose **Save report** in the dialog that appears. The `.report` file is saved on your Desktop.
+        - **System log**: `/var/log/syslog`, especially for hardware, driver and start-up problems. Attach it soon after the problem happens.
+        - **Screenshots or a short screen recording**: press Print Screen, or use AirShot.
+      placeholder: Drag and drop files here.
+    validations:
+      required: false
