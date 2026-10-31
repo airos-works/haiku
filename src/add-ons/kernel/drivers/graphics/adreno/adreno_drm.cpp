@@ -609,7 +609,18 @@ gem_info(File* file, drm_msm_gem_info* args)
 				}
 				return EINVAL;
 			}
-			return buffer_map(buffer, args->value) == B_OK ? B_OK : EINVAL;
+			{
+				status_t status = buffer_map(buffer, args->value);
+				if (status != B_OK) {
+					static int32 sReported;
+					if (atomic_add(&sReported, 1) < 8) {
+						ERROR("SET_IOVA %#" B_PRIx64 "+%#" B_PRIxSIZE ": %s\n",
+							args->value, buffer->size, strerror(status));
+					}
+					return status == B_NO_MEMORY ? ENOMEM : EINVAL;
+				}
+				return B_OK;
+			}
 		case MSM_INFO_GET_FLAGS:
 			args->value = buffer->flags;
 			return B_OK;

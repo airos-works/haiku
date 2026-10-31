@@ -305,73 +305,63 @@ power_up_cx()
 
 /*!	A stage 1 address space of up to 512 GiB (a level 1 table, level 2 and
 	3 tables as needed), walked coherently by the SMMU.
+	A table that has tables below it is allocated with a second page that
+	holds their kernel addresses. Tables stay until the space goes: GPU
+	buffers come and go at the same few addresses of a team's window.
 */
 class AddressSpace {
 public:
 	status_t Init()
 	{
-		fLevel1 = AllocateTable(fLevel1Physical);
+		mutex_init(&fLock, "adreno address space");
+		fLevel1 = AllocateTable(fLevel1Physical, true);
 		return fLevel1 != NULL ? B_OK : B_NO_MEMORY;
 	}
 
 	phys_addr_t Root() const { return fLevel1Physical; }
 
-	/*!	\a privileged pages are for privileged accesses only, which may then
-		execute them (a page writable without privileges never is).
+	/*!	Maps every page of a locked kernel area at \a address; nothing of it
+		on failure. \a privileged pages are for privileged accesses only,
+		which may then execute them (a page writable without privileges
+		never is).
 	*/
-	status_t Map(uint64 address, phys_addr_t physical, uint32 attribute,
-		bool privileged)
-	{
-		uint64* level2 = NextTable(fLevel1, (address >> 30) & 511);
-		if (level2 == NULL)
-			return B_NO_MEMORY;
-		uint64* level3 = NextTable(level2, (address >> 21) & 511);
-		if (level3 == NULL)
-			return B_NO_MEMORY;
-		level3[(address >> 12) & 511] = (physical & PTE_ADDRESS_MASK)
-			| PTE_VALID | PTE_PAGE | PTE_AF | PTE_SH_INNER
-			| (privileged ? 0 : PTE_AP_RW_ANY) | PTE_ATTR_INDEX(attribute);
-		return B_OK;
-	}
-
-	/*!	Maps every page of a locked kernel area at \a address. */
 	status_t MapArea(void* virtualAddress, size_t size, uint64 address,
 		uint32 attribute, bool privileged)
 	{
-		for (size_t offset = 0; offset < size; offset += B_PAGE_SIZE) {
+		MutexLocker locker(fLock);
+		status_t status = B_OK;
+		size_t offset = 0;
+		for (; offset < size; offset += B_PAGE_SIZE) {
 			physical_entry entry;
-			status_t status = get_memory_map((uint8*)virtualAddress + offset,
+			status = get_memory_map((uint8*)virtualAddress + offset,
 				B_PAGE_SIZE, &entry, 1);
+			if (status == B_OK) {
+				status = Map(address + offset, entry.address, attribute,
+					privileged);
+			}
 			if (status != B_OK)
-				return status;
-			status = Map(address + offset, entry.address, attribute,
-				privileged);
-			if (status != B_OK)
-				return status;
+				break;
 		}
+		if (status != B_OK)
+			UnmapLocked(address, offset);
 		memory_full_barrier();
-		return B_OK;
+		return status;
 	}
 
 	void Unmap(uint64 address, size_t size)
 	{
-		for (uint64 page = address; page < address + size;
-				page += B_PAGE_SIZE) {
-			uint64* level2 = FindTable(fLevel1, (page >> 30) & 511);
-			uint64* level3 = level2 != NULL
-				? FindTable(level2, (page >> 21) & 511) : NULL;
-			if (level3 != NULL)
-				level3[(page >> 12) & 511] = 0;
-		}
+		MutexLocker locker(fLock);
+		UnmapLocked(address, size);
 		memory_full_barrier();
 	}
 
-	/*!	The physical address \a address maps to, for the fault dump. */
+	/*!	The physical address \a address maps to, for the fault dump. Takes
+		no lock: tables are never freed, and are linked in only once
+		complete.
+	*/
 	bool Translate(uint64 address, phys_addr_t& physical)
 	{
-		uint64* level2 = FindTable(fLevel1, (address >> 30) & 511);
-		uint64* level3 = level2 != NULL
-			? FindTable(level2, (address >> 21) & 511) : NULL;
+		uint64* level3 = FindLevel3(address);
 		if (level3 == NULL)
 			return false;
 		uint64 entry = level3[(address >> 12) & 511];
@@ -382,61 +372,81 @@ public:
 	}
 
 private:
-	uint64* FindTable(uint64* table, uint32 index)
+	status_t Map(uint64 address, phys_addr_t physical, uint32 attribute,
+		bool privileged)
 	{
-		if ((table[index] & PTE_VALID) == 0)
-			return NULL;
-		phys_addr_t physical = table[index] & PTE_ADDRESS_MASK;
-		for (size_t i = 0; i < fTableCount; i++) {
-			if (fTablePhysical[i] == physical)
-				return fTables[i];
-		}
-		return NULL;
+		uint64* level2 = NextTable(fLevel1, (address >> 30) & 511, true);
+		if (level2 == NULL)
+			return B_NO_MEMORY;
+		uint64* level3 = NextTable(level2, (address >> 21) & 511, false);
+		if (level3 == NULL)
+			return B_NO_MEMORY;
+		level3[(address >> 12) & 511] = (physical & PTE_ADDRESS_MASK)
+			| PTE_VALID | PTE_PAGE | PTE_AF | PTE_SH_INNER
+			| (privileged ? 0 : PTE_AP_RW_ANY) | PTE_ATTR_INDEX(attribute);
+		return B_OK;
 	}
 
-	uint64* AllocateTable(phys_addr_t& physical)
+	void UnmapLocked(uint64 address, size_t size)
 	{
+		for (uint64 page = address; page < address + size;
+				page += B_PAGE_SIZE) {
+			uint64* level3 = FindLevel3(page);
+			if (level3 != NULL)
+				level3[(page >> 12) & 511] = 0;
+		}
+	}
+
+	static uint64** Children(uint64* table)
+	{
+		return (uint64**)((uint8*)table + B_PAGE_SIZE);
+	}
+
+	uint64* FindLevel3(uint64 address)
+	{
+		uint64* level2 = Children(fLevel1)[(address >> 30) & 511];
+		return level2 != NULL ? Children(level2)[(address >> 21) & 511] : NULL;
+	}
+
+	/*!	One page for the table, another for the kernel addresses of the
+		tables below it if it has \a children. */
+	uint64* AllocateTable(phys_addr_t& physical, bool children)
+	{
+		size_t size = children ? 2 * B_PAGE_SIZE : B_PAGE_SIZE;
 		void* table;
 		area_id area = create_area("adreno page table", &table,
-			B_ANY_KERNEL_ADDRESS, B_PAGE_SIZE, B_CONTIGUOUS,
+			B_ANY_KERNEL_ADDRESS, size, B_CONTIGUOUS,
 			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
 		if (area < 0)
 			return NULL;
-		memset(table, 0, B_PAGE_SIZE);
+		memset(table, 0, size);
 		physical_entry entry;
 		get_memory_map(table, B_PAGE_SIZE, &entry, 1);
 		physical = entry.address;
 		return (uint64*)table;
 	}
 
-	uint64* NextTable(uint64* table, uint32 index)
+	/*!	The table below \a table's entry \a index, made if there is none.
+		\a children: whether it has tables below it in turn. */
+	uint64* NextTable(uint64* table, uint32 index, bool children)
 	{
-		if ((table[index] & PTE_VALID) == 0) {
-			if (fTableCount == B_COUNT_OF(fTables))
-				return NULL;
-			phys_addr_t physical;
-			uint64* next = AllocateTable(physical);
-			if (next == NULL)
-				return NULL;
-			memory_full_barrier();
-			table[index] = physical | PTE_VALID | PTE_TABLE;
-			fTables[fTableCount] = next;
-			fTablePhysical[fTableCount++] = physical;
+		uint64* next = Children(table)[index];
+		if (next != NULL)
 			return next;
-		}
-		phys_addr_t physical = table[index] & PTE_ADDRESS_MASK;
-		for (size_t i = 0; i < fTableCount; i++) {
-			if (fTablePhysical[i] == physical)
-				return fTables[i];
-		}
-		return NULL;
+		phys_addr_t physical;
+		next = AllocateTable(physical, children);
+		if (next == NULL)
+			return NULL;
+		// the walker may see the entry at once, Translate() the address
+		memory_full_barrier();
+		Children(table)[index] = next;
+		table[index] = physical | PTE_VALID | PTE_TABLE;
+		return next;
 	}
 
+	mutex		fLock;
 	uint64*		fLevel1 = NULL;
 	phys_addr_t	fLevel1Physical = 0;
-	uint64*		fTables[1024];
-	phys_addr_t	fTablePhysical[1024];
-	size_t		fTableCount = 0;
 };
 
 
