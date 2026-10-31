@@ -106,6 +106,9 @@ private:
 									AddOnInfo& info);
 			void				_DestroyInstantiatedFlavors(AddOnInfo& info);
 			void				_DestroyInstantiatedFlavor(media_node& node);
+			void				_RecordRequestedNode(media_addon_id addOnID,
+									const media_node& node);
+			void				_PruneReleasedNodes(AddOnInfo& info);
 
 			void				_ScanAddOnFlavors(BMediaAddOn* addOn);
 
@@ -328,8 +331,14 @@ MediaAddonServer::QuitRequested()
 	CALLED();
 
 	InfoMap::iterator iterator = fInfoMap.begin();
-	for (iterator = fInfoMap.begin(); iterator != fInfoMap.end(); iterator++)
-		_DestroyInstantiatedFlavors(iterator->second);
+	{
+		// the control thread records the nodes it makes on request
+		BAutolock _(fInstantiateLock);
+		for (iterator = fInfoMap.begin(); iterator != fInfoMap.end();
+				iterator++) {
+			_DestroyInstantiatedFlavors(iterator->second);
+		}
+	}
 
 	// the System timesource should be removed before we quit the roster
 	if (fSystemTimeSource != NULL &&
@@ -390,10 +399,27 @@ MediaAddonServer::_HandleMessage(int32 code, const void* data, size_t size)
 						data);
 			add_on_server_instantiate_dormant_node_reply reply;
 
+			// A node made for another team lives here and runs the add-on's
+			// code, so it is recorded like the nodes of the physical inputs
+			// and outputs: it must be released before the add-on is put.
+			// A request from this team comes from
+			// _UpdatePhysicalInputsAndOutputs() for a global flavor; that
+			// caller records the node, and waits for this reply with
+			// fInstantiateLock held.
+			const bool record = request->creator_team != Team();
+			if (record)
+				fInstantiateLock.Lock();
+
 			status_t status
 				= MediaRosterEx(fMediaRoster)->InstantiateDormantNode(
 					request->add_on_id, request->flavor_id,
 					request->creator_team, &reply.node);
+			if (record) {
+				if (status == B_OK)
+					_RecordRequestedNode(request->add_on_id, reply.node);
+				fInstantiateLock.Unlock();
+			}
+
 			request->SendReply(status, &reply, sizeof(reply));
 			break;
 		}
@@ -585,6 +611,7 @@ MediaAddonServer::_AddOnAdded(const char* path, ino_t fileNode)
 		fFileMap.insert(std::make_pair(fileNode, id));
 
 		AddOnInfo info = {};
+		BAutolock _(fInstantiateLock);
 		fInfoMap.insert(std::make_pair(id, info));
 	} catch (std::bad_alloc& exception) {
 		fFileMap.erase(fileNode);
@@ -736,6 +763,45 @@ MediaAddonServer::_DestroyInstantiatedFlavor(media_node& node)
 }
 
 
+/*!	Adds a node that the control thread made on another team's request to
+	its add-on's active flavors, so that it is released at quit and when the
+	add-on goes away, and so that no second node is made for its flavor.
+	The caller holds fInstantiateLock.
+*/
+void
+MediaAddonServer::_RecordRequestedNode(media_addon_id addOnID,
+	const media_node& node)
+{
+	InfoMap::iterator found = fInfoMap.find(addOnID);
+	if (found == fInfoMap.end())
+		return;
+
+	_PruneReleasedNodes(found->second);
+	found->second.active_flavors.push_back(node);
+}
+
+
+/*!	Drops the nodes that do not exist anymore from \a info's active flavors:
+	a node made on request is deleted once its creator releases it. Left in
+	the list, it would keep the add-on loaded. All these nodes live in this
+	team, and a node's control port is deleted with it.
+	The caller holds fInstantiateLock.
+*/
+void
+MediaAddonServer::_PruneReleasedNodes(AddOnInfo& info)
+{
+	NodeVector::iterator iterator = info.active_flavors.begin();
+	while (iterator != info.active_flavors.end()) {
+		port_info portInfo;
+		if (get_port_info(iterator->port, &portInfo) != B_OK
+			|| portInfo.team != Team()) {
+			iterator = info.active_flavors.erase(iterator);
+		} else
+			iterator++;
+	}
+}
+
+
 void
 MediaAddonServer::_PutAddonIfPossible(AddOnInfo& info)
 {
@@ -792,6 +858,8 @@ void
 MediaAddonServer::_UpdatePhysicalInputsAndOutputs(AddOnInfo& info)
 {
 	CALLED();
+	_PruneReleasedNodes(info);
+
 	if (info.addon == NULL)
 		return;
 
@@ -926,6 +994,8 @@ MediaAddonServer::_AddOnRemoved(ino_t fileNode)
 			"add-on %" B_PRId32 "\n", id);
 		oldFlavorCount = 1000;
 	} else {
+		// the control thread records the nodes it makes on request
+		BAutolock _(fInstantiateLock);
 		AddOnInfo& info = foundInfo->second;
 		oldFlavorCount = info.flavor_count;
 
