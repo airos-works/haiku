@@ -68,8 +68,10 @@ in Linux's firmware KMS. The boot mode is never trusted: the size the firmware
 reports (`GET_PHYSICAL_SIZE`) is its frame buffer's, which it scales to the
 mode. A Dell P2415Q (4K, preferring 594 MHz 60 Hz) gave 1920x1280 there, and
 the desktop filled only the top-left 1920x1280 of the 3840x2160 picture until
-2026-10-31; now it gets 3840x2160 at 30 Hz (60 Hz would need
-`hdmi_enable_4kp60=1`). The driver
+2026-10-31; now it gets 3840x2160 at 60 Hz. The image's `config.txt` sets
+`hdmi_enable_4kp60=1`: the firmware then reports 600 MHz for HDMI0 but only
+162 MHz for HDMI1 (1080p60 still fits, 1440p60 not); without it both report
+300 MHz and the P2415Q runs at 30 Hz. The driver
 uses `SET_TIMING` (`0x00048017`) and `SET_DISPLAY_POWER` (`0x00048019`) with the
 firmware display ID. The ABI follows Raspberry Pi Linux's
 [`vc4_firmware_kms.c`](https://github.com/raspberrypi/linux/blob/rpi-5.15.y/drivers/gpu/drm/vc4/vc4_firmware_kms.c).
@@ -116,8 +118,11 @@ the Dell monitor still needs a physical check.
 
 - Mode selection supports progressive EDID detailed timings and a few CTA
   codes; interlaced modes, standard timings and other CTA codes are not
-  supported. Natively validated: the lab's 1080p monitors; the P2415Q 4K by
-  driver state (2026-10-31: 3840x2160 buffer, plane and mode, app_server at 200 %).
+  supported. Natively validated: the lab's 1080p monitors; the P2415Q at
+  3840x2160, 30 and 60 Hz (2026-10-31, owner: sharp, whole screen; app_server
+  chose 200 %).
+- The accelerant's display timings are made up (always 60 Hz): `screenmode`
+  and Screen do not show the real refresh rate; the driver's syslog line does.
 - No user-selectable physical timing changes or DPMS.
 - Hardware cursor (2026-10-27): the cursor bitmap goes into a small
   contiguous buffer of its own and the firmware composites it as a plane
