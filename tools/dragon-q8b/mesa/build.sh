@@ -33,10 +33,12 @@ BUILD=$ROOT/build
 BUILD_GL=$ROOT/build-gl
 OUT=$ROOT/out
 # in order, relative to this directory: Turnip, the Cubie's OpenGL patch,
-# what OpenGL needs to find this GPU, then glthread for EGL contexts
-# (mesa_glthread=true)
+# what OpenGL needs to find this GPU, glthread for EGL contexts
+# (mesa_glthread=true|main), then Turnip's autotuner profiling SYSMEM
+# against GMEM
 PATCHES=(mesa-haiku-turnip.patch ../../cubie-a7s/mesa/mesa-haiku-gl.patch
-	mesa-haiku-turnip-gl.patch mesa-haiku-glthread.patch)
+	mesa-haiku-turnip-gl.patch mesa-haiku-glthread.patch
+	mesa-haiku-turnip-autotune.patch)
 TESTS=(tu_vkprobe tu_vkfill)
 # the Cubie's OpenGL ES checks, device neutral (through libglvnd's
 # libEGL/libGLESv2)

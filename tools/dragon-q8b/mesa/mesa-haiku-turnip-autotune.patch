@@ -1,0 +1,20 @@
+--- a/src/freedreno/vulkan/tu_autotune.cc
++++ b/src/freedreno/vulkan/tu_autotune.cc
+@@ -273,7 +273,17 @@
+    static std::once_flag once;
+    static config_t at_config;
+    std::call_once(once, [&] {
++#ifdef __HAIKU__
++      /* (air/OS) The bandwidth estimate puts a render pass of many small
++       * draws in GMEM, which replays every draw for each bin: WebGL Aquarium's
++       * 15000 fish drew at half the frame rate of SYSMEM on the Dragon Q8B's
++       * Adreno 690 (an OpenGL loop of 15000 draws: 36 against 60 frames/s).
++       * Profiling times both modes and keeps the faster one; small passes
++       * come out the same. TU_AUTOTUNE_ALGO still chooses. */
++      algorithm algo = algorithm::PROFILED;
++#else
+       algorithm algo = algorithm::DEFAULT;
++#endif
+       const char *algo_str = os_get_option("TU_AUTOTUNE_ALGO");
+       std::string_view algo_strv;
+ 
