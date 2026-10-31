@@ -105,9 +105,10 @@ struct v3d_bo {
 	bool		cpuDirty;
 	size_t		dirtyStart;	// what the CPU may have written, while cpuDirty
 	size_t		dirtyEnd;
-	bool		imported;	// area is the driver's clone of someone's memory
+	bool		imported;	// pages of a team, wired at "address" there
 	bool		importCached;
 		// imported memory the CPU caches: maintenance only when asked for
+	team_id		team;		// whose they are
 };
 
 struct v3d_job {
@@ -465,7 +466,8 @@ find_address_range(v3d_info* info, uint32 pageCount, uint32& _page,
 
 
 /*!	The page table entries of \a buffer, run by run of the physical memory
-	at its kernel address. Device locked.
+	at its address (in the kernel, or for an import in the calling team).
+	Device locked.
 */
 static status_t
 map_buffer_pages(v3d_info* info, v3d_bo* buffer)
@@ -561,10 +563,15 @@ create_buffer(v3d_info* info, size_t size, v3d_bo*& _buffer,
 }
 
 
-/*!	A buffer of the pages at \a address in \a team (see V3D_HAIKU_IMPORT_BO):
-	the area there is cloned into the kernel and the clone's range wired, so
-	the pages stay whatever the team does with its own mapping. Called
-	without the device lock; takes it.
+/*!	A buffer of the pages at \a address in \a team, the calling one (see
+	V3D_HAIKU_IMPORT_BO): the range is wired there, as for any transfer
+	into user memory, until the buffer is freed. The team must keep the
+	range mapped until then: deleting a wired area waits for it to be
+	unwired. Called without the device lock; takes it.
+
+	The pages are not cloned into the kernel: such a clone maps a wired
+	source's pages without mapping objects, and wiring it for writing then
+	does copy-on-write on them (a KDL in VMTranslationMap::PageUnmapped()).
 */
 static status_t
 import_buffer(v3d_info* info, team_id team, addr_t address, size_t size,
@@ -573,19 +580,28 @@ import_buffer(v3d_info* info, team_id team, addr_t address, size_t size,
 	size = ROUNDUP(size, B_PAGE_SIZE);
 	if (size == 0 || size > V3D_MAX_BO_SIZE
 		|| (address & (B_PAGE_SIZE - 1)) != 0 || !IS_USER_ADDRESS(address)
-		|| !IS_USER_ADDRESS(address + size - 1)) {
+		|| !IS_USER_ADDRESS(address + size - 1)
+		|| team != team_get_current_team_id()) {
 		return B_BAD_VALUE;
 	}
 
-	// the area holding the range, in the calling team
-	area_id source = area_for((void*)address);
-	area_info sourceInfo;
-	if (source < 0 || get_area_info(source, &sourceInfo) != B_OK
-		|| sourceInfo.team != team)
-		return B_BAD_ADDRESS;
-	addr_t sourceBase = (addr_t)sourceInfo.address;
-	if (address + size > sourceBase + sourceInfo.size)
-		return B_BAD_ADDRESS;
+	// one area of the team holds the range, writable by it; anything but
+	// the default (write-back) memory type is not cached by the CPU
+	bool cached;
+	{
+		VMAddressSpace* space = VMAddressSpace::GetCurrent();
+		if (space == NULL)
+			return B_BAD_TEAM_ID;
+		space->ReadLock();
+		VMArea* area = space->LookupArea(address);
+		bool valid = area != NULL && address + size <= area->Base() + area->Size()
+			&& (area->protection & B_WRITE_AREA) != 0;
+		cached = valid && area->MemoryType() == 0;
+		space->ReadUnlock();
+		space->Put();
+		if (!valid)
+			return B_BAD_ADDRESS;
+	}
 
 	v3d_bo* buffer = (v3d_bo*)calloc(1, sizeof(v3d_bo));
 	if (buffer == NULL)
@@ -594,42 +610,39 @@ import_buffer(v3d_info* info, team_id team, addr_t address, size_t size,
 	buffer->pageCount = size >> V3D_PAGE_SHIFT;
 	buffer->references = 1;
 	buffer->imported = true;
+	buffer->importCached = cached;
+	buffer->team = team;
+	buffer->area = -1;
+	buffer->address = (uint8*)address;
 
-	void* base = NULL;
-	buffer->area = vm_clone_area(B_SYSTEM_TEAM, "v3d imported buffer", &base,
-		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
-		REGION_NO_PRIVATE_MAP, source, true);
-	if (buffer->area < 0) {
-		status_t status = buffer->area;
+	status_t status = lock_memory_etc(team, buffer->address, size,
+		B_READ_DEVICE);
+	if (status != B_OK) {
 		free(buffer);
 		return status;
 	}
-	buffer->address = (uint8*)base + (address - sourceBase);
 
-	// The clone has the source's memory type; anything but the default
-	// (write-back) is not cached by the CPU.
-	VMAddressSpace* kernelSpace = VMAddressSpace::Kernel();
-	kernelSpace->ReadLock();
-	VMArea* area = kernelSpace->LookupArea((addr_t)base);
-	buffer->importCached = area != NULL && area->MemoryType() == 0;
-	kernelSpace->ReadUnlock();
-
-	status_t status = lock_memory(buffer->address, size, B_READ_DEVICE);
-	if (status != B_OK) {
-		delete_area(buffer->area);
-		free(buffer);
-		return status;
+	// lock_memory() leaves a contiguous or fully locked area (a clone of
+	// rpi_display's frame buffer) as it is, wired by nature but with pages
+	// mapped only once touched, and get_memory_map() panics on a page that
+	// is not mapped.
+	for (size_t offset = 0; offset < size && status == B_OK;
+			offset += B_PAGE_SIZE) {
+		uint8 byte;
+		status = user_memcpy(&byte, buffer->address + offset, 1);
 	}
 
 	MutexLocker locker(info->lock);
-	v3d_bo** link;
-	status = find_address_range(info, buffer->pageCount, buffer->page, link);
+	v3d_bo** link = NULL;
+	if (status == B_OK) {
+		status = find_address_range(info, buffer->pageCount, buffer->page,
+			link);
+	}
 	if (status == B_OK)
 		status = map_buffer_pages(info, buffer);
 	if (status != B_OK) {
 		locker.Unlock();
-		unlock_memory(buffer->address, size, B_READ_DEVICE);
-		delete_area(buffer->area);
+		unlock_memory_etc(team, buffer->address, size, B_READ_DEVICE);
 		free(buffer);
 		return status;
 	}
@@ -666,9 +679,13 @@ put_buffer(v3d_info* info, v3d_bo* buffer)
 	if (mmu_flush(info) != B_OK)
 		ERROR("MMU flush timed out\n");
 
-	if (buffer->imported)
-		unlock_memory(buffer->address, buffer->size, B_READ_DEVICE);
-	delete_area(buffer->area);
+	if (buffer->imported) {
+		// Fails harmlessly once the team's address space is gone, and with
+		// it the wiring.
+		unlock_memory_etc(buffer->team, buffer->address, buffer->size,
+			B_READ_DEVICE);
+	} else
+		delete_area(buffer->area);
 	free(buffer);
 }
 
@@ -906,9 +923,11 @@ dump_gpu_memory(v3d_info* info, uint32 address)
 		uint32 from = offset >= 32 ? offset - 32 : 0;
 		uint32 to = std::min((size_t)offset + 32, bo->size);
 		dprintf("v3d: %#" B_PRIx32 " is at offset %#" B_PRIx32 " of the %"
-			B_PRIuSIZE " byte buffer at %#" B_PRIx32 ":", address, offset,
-			bo->size, bo->page << V3D_PAGE_SHIFT);
-		for (uint32 i = from; i < to; i++) {
+			B_PRIuSIZE " byte %sbuffer at %#" B_PRIx32 ":", address, offset,
+			bo->size, bo->imported ? "imported " : "",
+			bo->page << V3D_PAGE_SHIFT);
+		// an import's pages are mapped in its team only
+		for (uint32 i = from; i < to && !bo->imported; i++) {
 			dprintf("%s%02x", i == offset ? " [" : " ", bo->address[i]);
 			if (i == offset)
 				dprintf("]");
@@ -991,6 +1010,8 @@ run_cl(v3d_info* info, v3d_job* job, v3d_bo*& overflow)
 		for (uint32 i = 0; i < job->boCount; i++) {
 			// which of the job's buffers the core got to write
 			v3d_bo* bo = job->bos[i];
+			if (bo->imported)
+				continue;
 			uint32 used = 0;
 			for (uint32 k = 0; k < bo->pageCount; k++) {
 				const uint32* words = (const uint32*)(bo->address
@@ -1714,6 +1735,9 @@ v3d_control(void* cookie, uint32 op, void* buffer, size_t length)
 			v3d_bo* bo = lookup_buffer(file, request.handle);
 			if (bo == NULL || (!bo->cacheable && !bo->importCached))
 				return B_BAD_VALUE;
+			// an import's lines are maintained at its addresses in its team
+			if (bo->imported && bo->team != team_get_current_team_id())
+				return B_NOT_ALLOWED;
 			// Closing the handle while the wait drops the lock must not free
 			// the backing area. Recheck submissions after every unlocked wait.
 			bo->references++;
@@ -1772,6 +1796,8 @@ v3d_control(void* cookie, uint32 op, void* buffer, size_t length)
 			v3d_bo* bo = lookup_buffer(file, request.handle);
 			if (bo == NULL || (noWait && !bo->imported))
 				return B_BAD_VALUE;
+			if (bo->imported && bo->team != team_get_current_team_id())
+				return B_NOT_ALLOWED;
 
 			// the bytes the ranges cover, checked against the buffer
 			uint64 first = UINT64_MAX, end = 0;

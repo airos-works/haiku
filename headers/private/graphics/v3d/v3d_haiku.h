@@ -88,11 +88,12 @@ enum {
 #define V3D_HAIKU_PARAM_IMPORT_BO	0x10001
 
 /*	V3D_HAIKU_IMPORT_BO: pages of the calling team as a buffer object. The
-	driver holds them (wired, through a mapping of its own) until the handle
-	is closed and the last job using it is done, so the caller may unmap its
-	own mapping at any time; the GPU then still writes the pages, which no
-	one else gets until then. The buffer cannot be mapped with MMAP_BO: the
-	caller has it mapped already.
+	driver wires the range in the team, as for a transfer into user memory,
+	until the handle is closed and the last job using it is done. The team
+	must keep the range mapped until then: deleting a wired area waits until
+	it is unwired. Clone another team's memory (app_server's copy of the
+	screen, the display driver's frame buffer) and import the clone. The
+	buffer cannot be mapped with MMAP_BO: the caller has it mapped already.
 
 	Memory the CPU caches (an ordinary area, app_server's copy of the screen)
 	gets no cache maintenance of its own: the caller asks for it, for the
