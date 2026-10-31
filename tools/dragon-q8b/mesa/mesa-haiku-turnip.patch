@@ -101,7 +101,7 @@ diff -ruN a/include/vk_haiku_scanout.h b/include/vk_haiku_scanout.h
 diff -ruN a/include/xf86drm.h b/include/xf86drm.h
 --- a/include/xf86drm.h
 +++ b/include/xf86drm.h
-@@ -0,0 +1,576 @@
+@@ -0,0 +1,578 @@
 +/*
 + * Copyright 2026, air/OS. All rights reserved.
 + * SPDX-License-Identifier: MIT
@@ -229,7 +229,9 @@ diff -ruN a/include/xf86drm.h b/include/xf86drm.h
 +                  (size_t)size);
 +   } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
 +
-+   return ret == 0 ? 0 : -errno;
++   /* -1, not libdrm's -errno: that is positive on Haiku, and Turnip's
++    * "ret < 0" checks (MSM_INFO_SET_IOVA among them) never saw a failure */
++   return ret == 0 ? 0 : -1;
 +}
 +
 +static inline int
@@ -797,7 +799,20 @@ diff -ruN a/src/freedreno/vulkan/tu_knl_drm_msm.cc b/src/freedreno/vulkan/tu_knl
  
  #include "util/hash_table.h"
  #include "util/libsync.h"
-@@ -1033,6 +1037,17 @@
+@@ -463,7 +467,12 @@
+ 
+    ret = drmCommandWrite(dev->fd, DRM_MSM_WAIT_FENCE, &req, sizeof(req));
+    if (ret) {
++#ifdef __HAIKU__
++      /* drmCommand*() return -1 there, with errno set */
++      if (errno == ETIMEDOUT) {
++#else
+       if (ret == -ETIMEDOUT) {
++#endif
+          return VK_TIMEOUT;
+       } else {
+          mesa_loge("tu_wait_fence failed! %d (%s)", ret, strerror(errno));
+@@ -1033,6 +1042,17 @@
  static VkResult
  msm_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
  {
@@ -815,7 +830,7 @@ diff -ruN a/src/freedreno/vulkan/tu_knl_drm_msm.cc b/src/freedreno/vulkan/tu_knl
     uint64_t offset = tu_gem_info(dev, bo->gem_handle, MSM_INFO_GET_OFFSET);
     if (!offset)
        return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-@@ -1136,7 +1151,11 @@
+@@ -1136,7 +1156,11 @@
  
     if (bo->map) {
        TU_RMV(bo_unmap, dev, bo);
