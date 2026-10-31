@@ -11,7 +11,9 @@
 	     team, written by the CPU first, so its cache lines are dirty), with
 	     rectangles at odd places and sizes, one partly outside the image:
 	     every pixel inside is the pattern's, B, G, R, A, every pixel
-	     outside still the sentinel;
+	     outside still the sentinel; with a row length of 4004 bytes (all
+	     copied by the compute shader) and of 4096 (tile buffer blits plus
+	     compute strips around them);
 	  2. into a 64x48 rectangle of the real frame buffer (rpi_display's),
 	     whose 4 pixel border must not change;
 	and then timed: a whole width x height frame into the stand-in.
@@ -135,15 +137,13 @@ inside(const std::vector<int32>& rects, int x, int y, int originX, int originY,
 
 
 static int
-check_back(void)
+check_back(uint32 bytesPerRow)
 {
 	const int imageWidth = 301, imageHeight = 203;
 	GLuint framebuffer = make_framebuffer(imageWidth, imageHeight);
 	(void)framebuffer;
 
 	const int width = 1000, height = 600;
-	const uint32 bytesPerRow = 4004;
-		// not a whole number of cache lines
 	size_t size = (bytesPerRow * height + B_PAGE_SIZE - 1) & ~(B_PAGE_SIZE - 1);
 	void* bits;
 	area_id area = create_area("v3d_present_check back", &bits, B_ANY_ADDRESS,
@@ -176,7 +176,8 @@ check_back(void)
 	int32 before = sCompleted;
 	int result = sPresent(framebuffer, &present);
 	sWaitIdle();
-	printf("back: present %d, completed %d\n", result,
+	printf("back (%" B_PRIu32 " bytes a row): present %d, completed %d\n",
+		bytesPerRow, result,
 		(int)(sCompleted - before));
 	if (result != 0)
 		return 1;
@@ -398,7 +399,10 @@ main(int argc, char** argv)
 		return 1;
 	}
 
-	int failed = check_back();
+	// 4004: not a whole number of cache lines, the compute shader copies
+	// everything; 4096: the interiors go through the tile buffer
+	int failed = check_back(4004);
+	failed |= check_back(4096);
 	failed |= check_front();
 	failed |= time_back(width, height);
 	printf("%s\n", failed ? "FAILED" : "passed");
