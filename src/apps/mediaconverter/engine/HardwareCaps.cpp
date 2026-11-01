@@ -733,6 +733,9 @@ HardwareInventory::_ProbeRockchip()
 	device.decode.push_back("H.264");
 	device.decode.push_back("H.265");
 	device.decode.push_back("AV1");
+	device.decode.push_back("VP9");
+	device.decode.push_back("MPEG-2");
+	device.decode.push_back("MPEG-4");
 	fDevices.push_back(device);
 }
 
