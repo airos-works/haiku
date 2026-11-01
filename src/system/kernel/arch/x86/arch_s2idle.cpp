@@ -729,8 +729,8 @@ s0i3_settle(uint64* _lastEntry)
 	PMC log): what Linux does in its place is to put the host interfaces
 	into D3 in the sleep, and their _PS3 asks the firmware (ALIB function
 	0x14) to power the USB4 domain down. Only in a deep sleep, and on by
-	default ("usb4_power_off false" in the "suspend" kernel settings turns it
-	off): it runs after the drivers' suspend hooks and is undone before their
+	default where the PMC is known ("usb4_power_off false" in the "suspend"
+	kernel settings turns it off, "true" on elsewhere): it runs after the drivers' suspend hooks and is undone before their
 	resume hooks, so the USB3 controllers sleep before their domain goes and
 	come back after it.
 */
@@ -1108,15 +1108,27 @@ alib_response(pci_module_info* pci)
 }
 
 
+/*!	The deep sleep's platform steps ("usb4_power_off", "storage_power_off"
+	in the "suspend" kernel settings) are there to let the SoC reach S0i3,
+	which takes the PMC's OS hint: by default they run where the PMC is
+	known (and where they were tried out), elsewhere only when asked for.
+*/
+static bool
+deep_step_wanted(const char* name)
+{
+	void* settings = load_driver_settings("suspend");
+	bool wanted = get_driver_boolean_parameter(settings, name, sPMC != NULL,
+		true);
+	unload_driver_settings(settings);
+	return wanted;
+}
+
+
 static bool
 usb4_power_off_wanted()
 {
-	void* settings = load_driver_settings("suspend");
-	// (on by default: only AMD's host interfaces are probed)
-	bool wanted = get_driver_boolean_parameter(settings, "usb4_power_off",
-		true, true);
-	unload_driver_settings(settings);
-	return wanted;
+	// (only AMD's host interfaces are probed)
+	return deep_step_wanted("usb4_power_off");
 }
 
 
@@ -1654,9 +1666,11 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 	if ((flags & X86_SUSPEND_LIGHT_SLEEP) != 0)
 		deviceFlags |= DEVICE_MANAGER_LIGHT_SLEEP;
 	// (read before the disks may sleep)
-	bool usb4Off = (flags & (X86_SUSPEND_SKIP_DEVICES
-			| X86_SUSPEND_LIGHT_SLEEP)) == 0
-		&& gCPU[0].arch.vendor == VENDOR_AMD && usb4_power_off_wanted();
+	bool deepSteps = (flags & (X86_SUSPEND_SKIP_DEVICES
+		| X86_SUSPEND_LIGHT_SLEEP)) == 0;
+	bool usb4Off = deepSteps && gCPU[0].arch.vendor == VENDOR_AMD
+		&& usb4_power_off_wanted();
+	bool storageOff = deepSteps && deep_step_wanted("storage_power_off");
 
 	sWatchdogPhase = "suspend";
 	add_timer(&sResumeWatchdog, &resume_watchdog, kResumeWatchdogTimeout,
@@ -1665,7 +1679,7 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 		device_manager_suspend(ACPI_POWER_STATE_ON, deviceFlags);
 	if (usb4Off)
 		usb4_power_off();
-	if ((flags & (X86_SUSPEND_SKIP_DEVICES | X86_SUSPEND_LIGHT_SLEEP)) == 0)
+	if (storageOff)
 		storage_power_off();
 
 	// as Linux's acpi_s2idle_prepare_late() and amd_pmc_s2idle_prepare()
