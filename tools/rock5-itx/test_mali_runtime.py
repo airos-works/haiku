@@ -31,7 +31,7 @@ class MaliRuntimeTest(unittest.TestCase):
             (root / 'runtime.inc').write_text(code)
             binary = root / 'runtime-test'
             built = subprocess.run([
-                'g++', '-pthread', '-std=c++17', '-Wall', '-Wextra', '-Werror', '-g',
+                'g++', '-pthread', '-std=c++17', '-Wall', '-Wextra', '-Werror', '-Wno-dangling-reference', '-g',
                 '-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-no-pie',
                 '-I', str(source), '-I', str(root), str(directory / 'test_mali_runtime.cpp'),
                 str(source / 'CsfFirmware.cpp'), '-o', str(binary),

@@ -204,7 +204,7 @@ static void DriveRuntime(Runtime* runtime, FirmwareRunInfo& info, FirmwareRecove
 	sHardwareCycles++;
 	if (sFailBoot) { info.flags |= kFirmwareNeedsRecovery; return; }
 	runtime->Ready({}, FixtureProperties(sHardwareCycles));
-	QueueProgress progress[8]{};
+	QueueProgress progress[kMaxRuntimeQueues]{};
 	for (;;) {
 		QueueWork work{}; runtime->Next(work);
 		if (work.type == kQueueWorkStop) break;
@@ -575,8 +575,8 @@ int main()
 	sFailCopy = 0;
 	assert(Create(client, handle, true, recovery) == B_OK);
 	unsigned cycles = sHardwareCycles;
-	uint32 handles[8]; handles[0] = handle;
-	for (unsigned i = 1; i < 8; i++) assert(Create(client, handles[i], false, recovery) == B_OK);
+	uint32 handles[kMaxRuntimeQueues]; handles[0] = handle;
+	for (unsigned i = 1; i < kMaxRuntimeQueues; i++) assert(Create(client, handles[i], false, recovery) == B_OK);
 	uint32 excess = 0;
 	assert(Create(client, excess, false, recovery) == B_NO_MEMORY && excess == 0);
 	assert(Create(client, excess, true, recovery) == B_BAD_VALUE && sHardwareCycles == cycles);
@@ -590,10 +590,10 @@ int main()
 	sCopies = 0; sFailCopy = 2;
 	assert(Call(client, kSubmitQueue, bad, recovery) == B_BAD_ADDRESS);
 	sFailCopy = 0;
-	assert(Info(client, handle).submitted == 0 && client.generation->references == 9);
+	assert(Info(client, handle).submitted == 0 && client.generation->references == kMaxRuntimeQueues + 1);
 	bad.streamAddress += 4096;
 	assert(Call(client, kSubmitQueue, bad, recovery) == B_BAD_VALUE);
-	for (unsigned i = 1; i < 8; i++) Destroy(client, handles[i]);
+	for (unsigned i = 1; i < kMaxRuntimeQueues; i++) Destroy(client, handles[i]);
 	assert(client.generation->references == 2);
 
 	sHoldJob = true; unsigned before = sEnteredJob;

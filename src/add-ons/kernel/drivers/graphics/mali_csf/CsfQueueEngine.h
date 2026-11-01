@@ -26,6 +26,17 @@ struct QueueWork {
 	void* cookie;
 };
 
+// Where the hardware worker's time goes: selecting a queue (suspending the
+// group's previous one and resuming this one), running its job, idle.
+struct QueueEngineStats {
+	uint64_t jobs;
+	uint64_t switches;
+	int64_t selectMicros;
+	int64_t submitMicros;
+	int64_t firstMicros;
+	int64_t lastMicros;
+};
+
 struct QueueProgress {
 	uint64_t generation;
 	uint64_t completed;
@@ -58,6 +69,7 @@ public:
 	uint32_t HeapGrowths() const { return fHeapGrowths; }
 	uint32_t HeapDeclines() const { return fHeapDeclines; }
 	uint32_t SuspendBytes() const { return fInterface.suspendBytes; }
+	const QueueEngineStats& Stats() const { return fStats; }
 	uint32_t ProtectedBytes() const { return fInterface.protectedBytes; }
 
 	template<typename IO>
@@ -121,7 +133,19 @@ public:
 				fError = kQueueEngineInterface;
 				return false;
 			}
-			if (!Select(io, work) || !Submit(io, work)) return false;
+			bool switching = fActive != int(work.slot)
+				|| fStates[work.slot].progress.generation != work.generation;
+			int64_t selectStart = io.Now();
+			if (!Select(io, work)) return false;
+			int64_t submitStart = io.Now();
+			if (!Submit(io, work)) return false;
+			int64_t submitEnd = io.Now();
+			if (fStats.jobs == 0) fStats.firstMicros = selectStart;
+			fStats.lastMicros = submitEnd;
+			fStats.jobs++;
+			fStats.switches += switching ? 1 : 0;
+			fStats.selectMicros += submitStart - selectStart;
+			fStats.submitMicros += submitEnd - submitStart;
 			fFeed.Complete(work, fStates[work.slot].progress);
 		}
 	}
@@ -399,6 +423,7 @@ private:
 	uint32_t fStreamFault = 0, fStreamFatal = 0;
 	uint64_t fFaultAddress = 0;
 	uint32_t fHeapEvents = 0, fHeapGrowths = 0, fHeapDeclines = 0;
+	QueueEngineStats fStats = {};
 };
 
 } // namespace MaliCSF

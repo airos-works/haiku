@@ -176,6 +176,17 @@ public:
 		queue.current = NULL;
 		queue.pending--;
 		changed.NotifyAll();
+		if (engine != NULL && engine->Stats().jobs % 5000 == 0)
+			LogStats(engine->Stats());
+	}
+	static void LogStats(const QueueEngineStats& stats)
+	{
+		int64_t span = stats.lastMicros - stats.firstMicros;
+		dprintf("mali_csf: %" B_PRIu64 " jobs, %" B_PRIu64 " queue switches;"
+			" selecting %" B_PRId64 " us, running %" B_PRId64 " us of %" B_PRId64
+			" us (%" B_PRId64 "%% busy)\n", stats.jobs, stats.switches,
+			stats.selectMicros, stats.submitMicros, span,
+			span > 0 ? (stats.selectMicros + stats.submitMicros) * 100 / span : 0);
 	}
 	void Destroyed(unsigned slot)
 	{
@@ -217,9 +228,13 @@ public:
 		Runtime* runtime = (Runtime*)data;
 		status_t status = runtime->hardware.Init(runtime->resources);
 		QueueEngine<Runtime> engine(*runtime);
+		runtime->engine = &engine;
 		FirmwareRecovery recovery(StopAdmission, runtime);
 		if (status == B_OK)
 			CycleFirmware(runtime->hardware, runtime->memory, runtime->firmware, engine, &recovery);
+		runtime->engine = NULL;
+		if (engine.Stats().jobs > 0)
+			LogStats(engine.Stats());
 		bool retained = (runtime->firmware.flags & kFirmwareNeedsRecovery) != 0
 			|| (engine.Mapped() && !recovery.recovered);
 		if (status == B_OK && (retained || !runtime->ready || engine.Error() != 0
@@ -282,6 +297,7 @@ public:
 	}
 
 	ResourceInfo resources;
+	QueueEngine<Runtime>* engine = NULL;	// while the worker runs
 	FirmwareHardware hardware;
 	FirmwareImage image;
 	FirmwareMemory memory;
