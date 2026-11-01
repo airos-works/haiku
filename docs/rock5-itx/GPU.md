@@ -1343,3 +1343,34 @@ Evidence under `/mnt/HaikuWork`:
 - `artifacts/interactive/20260915T100655Z-f7f3f2` for UART, transcripts and frames.
 - `artifacts/emmc-file-readback/20260915T101457Z-0ecfe9` and
   `artifacts/emmc-read-reference/20260915T101545Z-76e740` for independent Linux checks.
+
+## Limits a web browser fits in (2026-11-01)
+
+On the CI installation of 2026-11-01 every WebGL page failed in Summit: the
+web process asserted in `panfrost_ptr_map` (no staging texture), then
+`GL_OUT_OF_MEMORY` and "could not create a WebGL context". Three bounds
+refused without saying so:
+
+- the driver's client limits (128 buffers and 256 MiB a client, 512 MiB in
+  all, 256 mappings and 1 GiB a VM): now 4096 buffers of up to 512 MiB, 2 GiB
+  a client, 4 GiB in all, 4096 mappings and 8 GiB a VM;
+- eight queues in the whole system, one per GL context: now 24. The runtime
+  already switches queues through CSG0/AS1; the bound was the firmware window
+  their 1 MiB suspend buffers must fit, so the protected suspend buffers
+  moved to 0x05a00000 (a static_assert keeps the regions in the window);
+- Mesa's Haiku kmod kept its own VA map of 256 mappings a process and 8
+  groups a device (airos-works/mesa rock5-mappings: 4096 and 24, with
+  static_asserts against the haiku-abi headers).
+
+The driver now logs, once per kind, which bound refused a request, and the
+first 64 failed requests by number. The WebGL Aquarium (webglsamples.org) in
+a 1776x883 Summit view, frames per second from Summit's graphics tool (the
+page's own counter agreed without the MCP inspector):
+
+| Fish | 1000 | 5000 | 10000 | 15000 | 20000 | 25000 | 30000 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| fps | 56 | 24 | 12.4 | 8.4 | 6.4 | 5.0 | 4.4 |
+
+The web process's main thread is one full core (about 8 us a fish, WebKit,
+ANGLE and Mesa's front end); Mesa's glthread cannot help, Panfrost does not
+claim `map_unsynchronized_thread_safe`.

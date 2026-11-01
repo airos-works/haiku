@@ -15,18 +15,37 @@
 using namespace MaliCSF;
 
 static mutex sClientLock = MUTEX_INITIALIZER("Mali CSF clients");
-static const uint32 kMaxClients = 64;
-static const uint64 kMaxGlobalBufferBytes = UINT64_C(512) << 20;
+static const uint32 kMaxClients = 256;
+static const uint64 kMaxGlobalBufferBytes = UINT64_C(4) << 30;
 static uint32 sClients, sBuffers, sNextHandle = 1;
 static uint64 sBufferBytes;
-static const uint32 kMaxGlobalVms = 64;
-static const uint32 kMaxGlobalGenerations = 512;
-static const uint32 kMaxGlobalTablePages = 4096;
+static const uint32 kMaxGlobalVms = 256;
+static const uint32 kMaxGlobalGenerations = 4096;
+static const uint32 kMaxGlobalTablePages = 65536;
 static uint32 sVms, sGenerations, sTablePages, sAccounts;
 static const uint32 kMaxGlobalHeaps = 256;
 static const uint64 kMaxGlobalHeapBytes = UINT64_C(512) << 20;
 static uint32 sHeaps, sHeapChunks, sHeapTablePages, sHeapGenerations;
 static uint64 sHeapBytes;
+// Mesa reports a refused allocation only as GL_OUT_OF_MEMORY, which does not
+// tell a full quota from a full machine. Name the bound, once per kind.
+enum {
+	kRefusedClients, kRefusedBufferCount, kRefusedClientBytes, kRefusedGlobalBytes,
+	kRefusedVms, kRefusedMappings, kRefusedMappedBytes, kRefusedGenerations,
+	kRefusedTablePages
+};
+static uint32 sRefusalsLogged;
+
+static void
+LogRefusal(uint32 kind, const char* what, uint64 used, uint64 limit)
+{
+	if ((sRefusalsLogged & (1u << kind)) != 0)
+		return;
+	sRefusalsLogged |= 1u << kind;
+	dprintf("mali_csf: refused: %s (%llu in use, limit %llu)\n", what,
+		(unsigned long long)used, (unsigned long long)limit);
+}
+
 static const uint64 kHeapPageAttributes = (UINT64_C(3) << 53) | 0x747;
 	// GPU cached, outer/inner shareable, read/write, NX; CPU initialization is NC.
 
@@ -390,6 +409,13 @@ CreateGeneration(const ClientMapping* mappings, uint32 count, uint64 limit,
 	unsigned pages = GpuPageTable::CountPages(regions, count, limit);
 	if (pages == 0 || sGenerations == kMaxGlobalGenerations
 		|| pages + unsigned(hasHeaps) > kMaxGlobalTablePages - sTablePages) {
+		if (pages != 0 && sGenerations == kMaxGlobalGenerations) {
+			LogRefusal(kRefusedGenerations, "VM generations", sGenerations,
+				kMaxGlobalGenerations);
+		} else if (pages != 0) {
+			LogRefusal(kRefusedTablePages, "GPU page-table pages", sTablePages,
+				kMaxGlobalTablePages);
+		}
 		free(regions);
 		return pages == 0 ? B_BAD_VALUE : B_NO_MEMORY;
 	}
@@ -469,6 +495,7 @@ MaliCSF::OpenClient(bool writable, void** cookie)
 	}
 	MutexLocker locker(sClientLock);
 	if (sClients == kMaxClients) {
+		LogRefusal(kRefusedClients, "clients", sClients, kMaxClients);
 		free(client->account);
 		free(client);
 		return B_BUSY;
@@ -566,6 +593,16 @@ CreateBuffer(Client* client, BufferCreate& request)
 	if (client->account->buffers == kMaxClientBuffers || sNextHandle == 0
 		|| bytes > kMaxClientBufferBytes - client->account->bytes
 		|| bytes > kMaxGlobalBufferBytes - sBufferBytes) {
+		if (client->account->buffers == kMaxClientBuffers) {
+			LogRefusal(kRefusedBufferCount, "buffers of one client",
+				client->account->buffers, kMaxClientBuffers);
+		} else if (bytes > kMaxClientBufferBytes - client->account->bytes) {
+			LogRefusal(kRefusedClientBytes, "buffer bytes of one client",
+				client->account->bytes, kMaxClientBufferBytes);
+		} else if (sNextHandle != 0) {
+			LogRefusal(kRefusedGlobalBytes, "buffer bytes of all clients", sBufferBytes,
+				kMaxGlobalBufferBytes);
+		}
 		return B_NO_MEMORY;
 	}
 	ClientBuffer* buffer = (ClientBuffer*)calloc(1, sizeof(ClientBuffer));
@@ -609,8 +646,11 @@ CreateVm(Client* client, VmCreate& request)
 		|| limit > kVmUserLimit) {
 		return B_BAD_VALUE;
 	}
-	if (client->vms == kMaxClientVms || sVms == kMaxGlobalVms || sNextHandle == 0)
+	if (client->vms == kMaxClientVms || sVms == kMaxGlobalVms || sNextHandle == 0) {
+		LogRefusal(kRefusedVms, "VMs", client->vms == kMaxClientVms ? client->vms : sVms,
+			client->vms == kMaxClientVms ? kMaxClientVms : kMaxGlobalVms);
 		return B_NO_MEMORY;
+	}
 	ClientVm* vm = (ClientVm*)calloc(1, sizeof(ClientVm));
 	if (vm == NULL)
 		return B_NO_MEMORY;
@@ -684,8 +724,11 @@ ApplyVmOperation(Client* client, uint64 limit, const VmOperation& operation,
 	uint64 mappedBytes = 0;
 	for (uint32 i = 0; i < count; i++) {
 		ClientMapping map = output[i];
-		if (map.bytes > kMaxVmMappedBytes - mappedBytes)
+		if (map.bytes > kMaxVmMappedBytes - mappedBytes) {
+			LogRefusal(kRefusedMappedBytes, "bytes mapped into one VM", mappedBytes,
+				kMaxVmMappedBytes);
 			return B_NO_MEMORY;
+		}
 		mappedBytes += map.bytes;
 		if (merged != 0 && output[merged - 1].buffer == map.buffer
 			&& output[merged - 1].flags == map.flags
@@ -697,7 +740,11 @@ ApplyVmOperation(Client* client, uint64 limit, const VmOperation& operation,
 		}
 	}
 	count = merged;
-	return count <= kMaxVmMappings ? B_OK : B_NO_MEMORY;
+	if (count > kMaxVmMappings) {
+		LogRefusal(kRefusedMappings, "mappings of one VM", count, kMaxVmMappings);
+		return B_NO_MEMORY;
+	}
+	return B_OK;
 }
 
 static status_t

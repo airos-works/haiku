@@ -9,8 +9,12 @@ namespace MaliCSF {
 
 static const uint32_t kRuntimeInterfaceAddress = 0x04010000;
 static const uint32_t kRuntimeSuspendAddress = 0x04100000;
-static const uint32_t kRuntimeProtectedAddress = 0x05000000;
 static const uint32_t kRuntimeSuspendBytes = 1024 * 1024;
+static const uint32_t kRuntimeProtectedAddress = 0x05a00000;
+static_assert(kRuntimeInterfaceAddress + kMaxRuntimeQueues * 8192 <= kRuntimeSuspendAddress
+	&& kRuntimeSuspendAddress + kMaxRuntimeQueues * kRuntimeSuspendBytes <= kRuntimeProtectedAddress
+	&& kRuntimeProtectedAddress + uint64_t(kMaxRuntimeQueues) * kRuntimeSuspendBytes <= 0x08000000,
+	"runtime queue memory must fit the firmware's shared window");
 static const uint64_t kPrivateRingAddress = UINT64_C(1) << 47;
 static const uint64_t kPrivateCompletionAddress = kPrivateRingAddress + 65536;
 

@@ -185,6 +185,9 @@ static const uint32_t kMppClientRkvdec = 9;
 static const uint32_t kMppClientAv1 = 4;
 static const uint32_t kRkvdec0HardwareId = 0x53813f05;
 static const uint32_t kAv1HardwareId = 0x80019000;
+// RKVENC (VEPU580), H.264 and H.265 encoding; MPP's HWID_VEPU58X.
+static const uint32_t kMppClientRkvenc = 16;
+static const uint32_t kRkvencHardwareId = 0x50603312;
 static const uint32_t kAv1BuildId = 0x00001f8e;
 
 struct MppValidationStats {

@@ -277,9 +277,9 @@ struct QueueModel : FirmwareModel {
 		if ((request == 1 || request == 3) && !groupRunning) {
 			assert(userMapped && ReadInterface64(csi, 16) == (UINT64_C(1) << 47) && csi[6] == 65536);
 			active = (ReadInterface64(csi, 48) - 0x4010000) / 8192;
-			assert(active < 8 && ReadInterface64(csi, 56) == 0x4011000 + active * 8192);
+			assert(active < kMaxRuntimeQueues && ReadInterface64(csi, 56) == 0x4011000 + active * 8192);
 			assert(cgi[20] == 1 && ReadInterface64(cgi, 64) == 0x4100000 + active * 1048576);
-			assert(ReadInterface64(cgi, 72) == 0x5000000 + active * 1048576);
+			assert(ReadInterface64(cgi, 72) == kRuntimeProtectedAddress + active * 1048576);
 			if (request == 1) {
 				if (queueFault == QueueStartTimeout) return;
 				assert(!saved.count(active)); registers = {}; starts++;

@@ -41,7 +41,7 @@ int main()
 		UINT64_C(0x831927dc00050005), UINT64_C(0x732853fe00000001),
 		UINT64_C(0xca61420f416732fa), UINT64_C(0xf18b53da92d510cf),
 		0x01050000, 0x8372561e, 0x3874516e, 0x1832085f, 8, 8, 96, 8,
-		4, 24000000, 8, 64, UINT64_C(0x800000000000)
+		4, 24000000, kMaxRuntimeQueues, 64, UINT64_C(0x800000000000)
 	};
 	auto result = CaptureGpuProperties(io, interface, queue, 24000000);
 	assert(memcmp(&result, &expected, sizeof(expected)) == 0);
