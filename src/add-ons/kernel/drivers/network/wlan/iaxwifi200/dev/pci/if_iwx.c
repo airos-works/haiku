@@ -502,6 +502,8 @@ void	iwx_watchdog(struct ifnet *);
 int	iwx_ioctl(struct ifnet *, u_long, caddr_t);
 const char *iwx_desc_lookup(uint32_t);
 void	iwx_nic_error(struct iwx_softc *);
+void	iwx_hw_error(struct iwx_softc *, uint32_t, uint32_t);
+int	iwx_hw_error_may_restart(struct iwx_softc *);
 void	iwx_dump_driver_status(struct iwx_softc *);
 void	iwx_nic_umac_error(struct iwx_softc *);
 int	iwx_detect_duplicate(struct iwx_softc *, struct mbuf *,
@@ -10312,7 +10314,7 @@ iwx_stop(struct ifnet *ifp)
 	sc->sc_flags &= ~IWX_FLAG_BINDING_ACTIVE;
 	sc->sc_flags &= ~IWX_FLAG_STA_ACTIVE;
 	sc->sc_flags &= ~IWX_FLAG_TE_ACTIVE;
-	sc->sc_flags &= ~IWX_FLAG_HW_ERR;
+	sc->sc_flags &= ~(IWX_FLAG_HW_ERR | IWX_FLAG_HW_ERR_RESTART);
 	sc->sc_flags &= ~IWX_FLAG_SHUTDOWN;
 	sc->sc_flags &= ~IWX_FLAG_TXFLUSH;
 
@@ -10672,6 +10674,59 @@ iwx_nic_error(struct iwx_softc *sc)
 
 	if (sc->sc_uc.uc_umac_error_event_table)
 		iwx_nic_umac_error(sc);
+}
+
+/*
+ * A hardware error interrupt. Upstream OpenBSD stops the device for good,
+ * which leaves Wi-Fi dead until the interface is taken down and up again.
+ * Linux iwlwifi restarts the firmware instead; do the same from
+ * iwx_init_task(), and log the device state first so that the cause can be
+ * looked into.
+ */
+void
+iwx_hw_error(struct iwx_softc *sc, uint32_t causes, uint32_t fh_causes)
+{
+	printf("%s: hardware error: causes 0x%08x fh 0x%08x, hw rev 0x%08x, "
+	    "gp cntrl 0x%08x, reset 0x%08x\n", DEVNAME(sc), causes, fh_causes,
+	    IWX_READ(sc, IWX_CSR_HW_REV), IWX_READ(sc, IWX_CSR_GP_CNTRL),
+	    IWX_READ(sc, IWX_CSR_RESET));
+
+	if ((sc->sc_flags & IWX_FLAG_SHUTDOWN) == 0) {
+		sc->sc_flags |= IWX_FLAG_HW_ERR | IWX_FLAG_HW_ERR_RESTART;
+		task_add(systq, &sc->init_task);
+	}
+}
+
+#define IWX_HW_ERR_MAX_RESTARTS	3
+#define IWX_HW_ERR_WINDOW	300	/* seconds */
+
+/*
+ * Limit restarts so that a device which has fallen off the bus, or fails
+ * again as soon as it comes up, is not reset in a loop.
+ */
+int
+iwx_hw_error_may_restart(struct iwx_softc *sc)
+{
+	time_t now = getuptime();
+
+	if (sc->sc_hw_err_restarts == 0
+	    || now - sc->sc_hw_err_window >= IWX_HW_ERR_WINDOW) {
+		sc->sc_hw_err_window = now;
+		sc->sc_hw_err_restarts = 0;
+	}
+
+	if (sc->sc_hw_err_restarts >= IWX_HW_ERR_MAX_RESTARTS) {
+		printf("%s: %d hardware errors within %d seconds, stopping "
+		    "device (take the interface down and up to retry)\n",
+		    DEVNAME(sc), sc->sc_hw_err_restarts + 1, IWX_HW_ERR_WINDOW);
+		return 0;
+	}
+
+	sc->sc_hw_err_restarts++;
+	printf("%s: restarting device after hardware error (%d of %d "
+	    "allowed within %d seconds)\n", DEVNAME(sc),
+	    sc->sc_hw_err_restarts, IWX_HW_ERR_MAX_RESTARTS, IWX_HW_ERR_WINDOW);
+	return 1;
 }
 
 void
@@ -11277,11 +11332,7 @@ iwx_intr(void *arg)
 
 	if (r1 & IWX_CSR_INT_BIT_HW_ERR) {
 		handled |= IWX_CSR_INT_BIT_HW_ERR;
-		printf("%s: hardware error, stopping device \n", DEVNAME(sc));
-		if ((sc->sc_flags & IWX_FLAG_SHUTDOWN) == 0) {
-			sc->sc_flags |= IWX_FLAG_HW_ERR;
-			task_add(systq, &sc->init_task);
-		}
+		iwx_hw_error(sc, r1, r2);
 		rv = 1;
 		goto out;
 	}
@@ -11374,11 +11425,7 @@ iwx_intr_msix(void *arg)
 	}
 
 	if (inta_hw & IWX_MSIX_HW_INT_CAUSES_REG_HW_ERR) {
-		printf("%s: hardware error, stopping device \n", DEVNAME(sc));
-		if ((sc->sc_flags & IWX_FLAG_SHUTDOWN) == 0) {
-			sc->sc_flags |= IWX_FLAG_HW_ERR;
-			task_add(systq, &sc->init_task);
-		}
+		iwx_hw_error(sc, inta_hw, inta_fh);
 		return 1;
 	}
 
@@ -12509,6 +12556,7 @@ iwx_init_task(void *arg1)
 	int s = splnet();
 	int generation = sc->sc_generation;
 	int fatal = (sc->sc_flags & (IWX_FLAG_HW_ERR | IWX_FLAG_RFKILL));
+	int err;
 
 	rw_enter_write(&sc->ioctl_rwl);
 	if (generation != sc->sc_generation) {
@@ -12517,13 +12565,31 @@ iwx_init_task(void *arg1)
 		return;
 	}
 
+	/*
+	 * A hardware error interrupt restarts the device unless restarts
+	 * keep failing. A critical temperature stop (IWX_FLAG_HW_ERR alone)
+	 * and rfkill stay fatal.
+	 */
+	if ((sc->sc_flags & IWX_FLAG_HW_ERR_RESTART)
+	    && (sc->sc_flags & IWX_FLAG_RFKILL) == 0
+	    && (ifp->if_flags & IFF_RUNNING)) {
+		/* The firmware error log is lost once the device is reset. */
+		iwx_nic_error(sc);
+		if (iwx_hw_error_may_restart(sc))
+			fatal = 0;
+	}
+
 	if (ifp->if_flags & IFF_RUNNING)
 		iwx_stop(ifp);
 	else
-		sc->sc_flags &= ~IWX_FLAG_HW_ERR;
+		sc->sc_flags &= ~(IWX_FLAG_HW_ERR | IWX_FLAG_HW_ERR_RESTART);
 
-	if (!fatal && (ifp->if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP)
-		iwx_init(ifp);
+	if (!fatal && (ifp->if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP) {
+		err = iwx_init(ifp);
+		if (err)
+			printf("%s: could not restart device (error %d)\n",
+			    DEVNAME(sc), err);
+	}
 
 	rw_exit(&sc->ioctl_rwl);
 	splx(s);
