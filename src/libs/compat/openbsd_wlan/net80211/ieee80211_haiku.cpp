@@ -17,6 +17,7 @@ extern "C" {
 #include <sys/endian.h>
 #include <sys/errno.h>
 #include <sys/task.h>
+#include <sys/timeout.h>
 
 #include <net/if.h>
 #include <net/if_dl.h>
@@ -50,6 +51,29 @@ extern "C" {
 
 
 static net_notifications_module_info* sNotificationModule;
+
+// OpenBSD's if_slowtimo(): each interface's if_timer counts down once a
+// second, and its if_watchdog runs when it reaches zero. The drivers rely on
+// it for their transmit timeouts, and net80211 (ieee80211_watchdog()) for its
+// management timer, which gives up an authentication or association that
+// gets no answer and scans again.
+static struct timeout sWatchdogs[MAX_DEVICES];
+static bool sWatchdogStopped[MAX_DEVICES];
+
+
+static void
+wlan_watchdog(void* arg)
+{
+	int i = (int)(addr_t)arg;
+	struct ifnet* ifp = gDevices[i];
+
+	// (called with Giant held, as OpenBSD calls it with the kernel lock)
+	if (sWatchdogStopped[i] || ifp == NULL)
+		return;
+	if (ifp->if_watchdog != NULL && ifp->if_timer > 0 && --ifp->if_timer == 0)
+		ifp->if_watchdog(ifp);
+	timeout_add_sec(&sWatchdogs[i], 1);
+}
 
 
 static struct ifnet*
@@ -106,6 +130,10 @@ start_wlan(device_t device)
 
 	if_initname(ifp, device_get_name(device), i);
 
+	sWatchdogStopped[i] = false;
+	timeout_set(&sWatchdogs[i], wlan_watchdog, (void*)(addr_t)i);
+	timeout_add_sec(&sWatchdogs[i], 1);
+
 	TRACE("%s: wlan started.\n", __func__);
 	return B_OK;
 }
@@ -119,7 +147,10 @@ stop_wlan(device_t device)
 	if (ifp == NULL)
 		return B_BAD_VALUE;
 
-	struct ieee80211com* ic = (ieee80211com*)ifp;
+	mtx_lock(&Giant);
+	sWatchdogStopped[i] = true;
+	mtx_unlock(&Giant);
+	callout_drain(&sWatchdogs[i].c);
 
 	return B_OK;
 }
