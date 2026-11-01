@@ -166,6 +166,22 @@ public:
 			fBsf->time_base_in = AVRational{1, 1000000};
 			if (av_bsf_init(fBsf) < 0)
 				return B_ERROR;
+			// The filter is only asked for the codec data's parameter sets
+			// in Annex B: it puts them in front of the first IRAP picture
+			// of every key packet, after any the packet has itself, and an
+			// encoder's own that differ from the container's lost (x265 in
+			// Matroska: a PPS of its own, every picture after the first
+			// broken). They go in front of the first packet, and the first
+			// after a seek, instead, as a decoder takes the codec data
+			// before the stream; the packets' NAL units are converted here.
+			fNalLengthSize = _NalLengthSize(static_cast<const uint8_t*>(info),
+				infoSize);
+			if (fNalLengthSize > 0 && fBsf->par_out->extradata_size > 0) {
+				fHeaders.assign(fBsf->par_out->extradata,
+					fBsf->par_out->extradata + fBsf->par_out->extradata_size);
+			}
+			fHeadersDue = !fHeaders.empty();
+			av_bsf_free(&fBsf);
 		}
 
 		return _CreateContext();
@@ -231,8 +247,6 @@ public:
 			if (_CreateContext() != B_OK)
 				return B_ERROR;
 		}
-		if (fBsf != NULL)
-			av_bsf_flush(fBsf);
 		fHeadersDue = !fHeaders.empty();
 		fPending.clear();
 		fHasPending = false;
@@ -323,40 +337,59 @@ private:
 		return B_OK;
 	}
 
-	status_t _PreparePacket(const void* chunk, size_t size, bigtime_t startTime,
+	/*!	How long the length in front of each NAL unit of a packet is, from
+		H.264's avcC or HEVC's hvcC codec data; 0 when the stream is Annex B
+		already (start codes), as FFmpeg's filters tell the two apart. */
+	size_t _NalLengthSize(const uint8_t* data, size_t size) const
+	{
+		if (data == NULL || size < 4)
+			return 0;
+		if ((data[0] == 0 && data[1] == 0 && data[2] == 1)
+			|| (data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1)) {
+			return 0;
+		}
+		if (fCoding == MPP_VIDEO_CodingAVC)
+			return size >= 7 && data[0] == 1 ? (data[4] & 3) + 1 : 0;
+		return size >= 23 ? (data[21] & 3) + 1 : 0;
+	}
+
+	status_t _PreparePacket(const void* chunk, size_t size,
 		std::vector<uint8_t>& bytes)
 	{
-		if (fBsf == NULL) {
-			if (fCoding == MPP_VIDEO_CodingAV1)
-				bytes.assign({0x12, 0x00});
+		if (fNalLengthSize > 0) {
 			if (fHeadersDue) {
 				bytes.assign(fHeaders.begin(), fHeaders.end());
 				fHeadersDue = false;
 			}
+			static const uint8_t kStartCode[4] = {0, 0, 0, 1};
 			const uint8_t* source = static_cast<const uint8_t*>(chunk);
-			bytes.insert(bytes.end(), source, source + size);
+			size_t left = size;
+			while (left > 0) {
+				if (left < fNalLengthSize)
+					return B_BAD_DATA;
+				size_t length = 0;
+				for (size_t i = 0; i < fNalLengthSize; i++)
+					length = length << 8 | source[i];
+				source += fNalLengthSize;
+				left -= fNalLengthSize;
+				if (length > left)
+					return B_BAD_DATA;
+				bytes.insert(bytes.end(), kStartCode, kStartCode + 4);
+				bytes.insert(bytes.end(), source, source + length);
+				source += length;
+				left -= length;
+			}
 			return B_OK;
 		}
-		AVPacket* input = av_packet_alloc();
-		AVPacket* output = av_packet_alloc();
-		if (input == NULL || output == NULL) {
-			av_packet_free(&input);
-			av_packet_free(&output);
-			return B_NO_MEMORY;
+		if (fCoding == MPP_VIDEO_CodingAV1)
+			bytes.assign({0x12, 0x00});
+		if (fHeadersDue) {
+			bytes.assign(fHeaders.begin(), fHeaders.end());
+			fHeadersDue = false;
 		}
-		status_t status = B_ERROR;
-		if (av_new_packet(input, size) == 0) {
-			memcpy(input->data, chunk, size);
-			input->pts = input->dts = startTime;
-			if (av_bsf_send_packet(fBsf, input) == 0
-				&& av_bsf_receive_packet(fBsf, output) == 0) {
-				bytes.assign(output->data, output->data + output->size);
-				status = B_OK;
-			}
-		}
-		av_packet_free(&input);
-		av_packet_free(&output);
-		return status;
+		const uint8_t* source = static_cast<const uint8_t*>(chunk);
+		bytes.insert(bytes.end(), source, source + size);
+		return B_OK;
 	}
 
 	/*!	Hands a prepared packet to MPP. B_WOULD_BLOCK means its input queue
@@ -398,7 +431,7 @@ private:
 	{
 		std::vector<uint8_t> bytes;
 		if (size > 0) {
-			status_t status = _PreparePacket(chunk, size, startTime, bytes);
+			status_t status = _PreparePacket(chunk, size, bytes);
 			if (status != B_OK)
 				return status;
 		}
@@ -747,6 +780,7 @@ private:
 	MppApi* fApi = NULL;
 	MppBufferGroup fFrameGroup = NULL;
 	AVBSFContext* fBsf = NULL;
+	size_t fNalLengthSize = 0;	// 0: Annex B as it comes
 	std::vector<uint8_t> fHeaders;	// MPEG-1/2/4 sequence or VOL header
 	bool fHeadersDue = false;
 	SwsContext* fSws = NULL;
