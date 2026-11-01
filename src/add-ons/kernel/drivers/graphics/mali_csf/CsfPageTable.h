@@ -4,6 +4,7 @@
 
 #include "CsfVm.h"
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 namespace MaliCSF {
@@ -78,6 +79,11 @@ public:
 		}
 		return tables;
 	}
+	static int ComparePhysical(const void* a, const void* b)
+	{
+		uint64_t x = *(const uint64_t*)a, y = *(const uint64_t*)b;
+		return x < y ? -1 : x > y ? 1 : 0;
+	}
 	static bool Build(void* data, size_t bytes, const uint64_t* physicalPages,
 		unsigned tablePages, const PageTableRegion* regions, unsigned count, uint64_t limit)
 	{
@@ -85,12 +91,26 @@ public:
 		if (required == 0 || data == NULL || (uintptr_t(data) & 4095) != 0
 			|| physicalPages == NULL || tablePages != required || bytes != required * 4096)
 			return false;
+		// No page may hold two tables. A sorted copy checks that in n log n:
+		// pairwise comparison took milliseconds once a VM maps a few GiB.
+		uint64_t* sorted = (uint64_t*)malloc(required * sizeof(uint64_t));
+		if (sorted == NULL)
+			return false;
 		for (unsigned i = 0; i < required; i++) {
-			if (!ValidPhysical(physicalPages[i]))
+			if (!ValidPhysical(physicalPages[i])) {
+				free(sorted);
 				return false;
-			for (unsigned j = 0; j < i; j++)
-				if (physicalPages[i] == physicalPages[j]) return false;
+			}
+			sorted[i] = physicalPages[i];
 		}
+		qsort(sorted, required, sizeof(uint64_t), ComparePhysical);
+		for (unsigned i = 1; i < required; i++) {
+			if (sorted[i] == sorted[i - 1]) {
+				free(sorted);
+				return false;
+			}
+		}
+		free(sorted);
 		memset(data, 0, bytes);
 		uint64_t* tables[4] = {(uint64_t*)data, NULL, NULL, NULL};
 		uint64_t prefixes[3] = {UINT64_MAX, UINT64_MAX, UINT64_MAX};

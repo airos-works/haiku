@@ -12,6 +12,7 @@
 #include <util/AutoLock.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include "CsfReset.h"
@@ -623,10 +624,26 @@ module_dependency module_dependencies[] = {
 	{}
 };
 
+// An application sees a refused request only as a failed allocation or a lost
+// context. Keep the first few refusals in the syslog, with the request named.
+static int32 sControlFailuresLogged;
+
+static status_t
+ControlLogged(void* cookie, uint32 op, void* buffer, size_t length)
+{
+	status_t status = Control(cookie, op, buffer, length);
+	if (status != B_OK && status != B_TIMED_OUT && status != B_WOULD_BLOCK
+		&& status != B_INTERRUPTED && atomic_add(&sControlFailuresLogged, 1) < 64) {
+		dprintf("mali_csf: request 0x%" B_PRIx32 " (%" B_PRIuSIZE " bytes) failed: %s\n",
+			op, length, strerror(status));
+	}
+	return status;
+}
+
 static device_module_info sDevice = {
 	{DEVICE_NAME, 0, NULL},
 	InitDevice, UninitDevice, NULL,
-	Open, Close, Free, Read, Write, NULL, Control, NULL, NULL
+	Open, Close, Free, Read, Write, NULL, ControlLogged, NULL, NULL
 };
 
 static driver_module_info sDriver = {

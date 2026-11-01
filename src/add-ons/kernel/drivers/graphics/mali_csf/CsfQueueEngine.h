@@ -57,6 +57,8 @@ public:
 	uint32_t HeapEvents() const { return fHeapEvents; }
 	uint32_t HeapGrowths() const { return fHeapGrowths; }
 	uint32_t HeapDeclines() const { return fHeapDeclines; }
+	uint32_t SuspendBytes() const { return fInterface.suspendBytes; }
+	uint32_t ProtectedBytes() const { return fInterface.protectedBytes; }
 
 	template<typename IO>
 	bool Run(IO& io, FirmwareMemory& memory, FirmwareRunInfo& firmware)

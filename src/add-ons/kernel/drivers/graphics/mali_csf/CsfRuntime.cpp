@@ -229,8 +229,9 @@ public:
 			status, engine.Error(), runtime->firmware.result, runtime->firmware.cleanupResult,
 			runtime->firmware.flags, engine.StreamFault(), engine.StreamFatal(),
 			engine.FaultAddress(), retained);
-		dprintf("mali_csf: heap events=%u grown=%u declined=%u\n",
-			engine.HeapEvents(), engine.HeapGrowths(), engine.HeapDeclines());
+		dprintf("mali_csf: heap events=%u grown=%u declined=%u; group suspend %u bytes,"
+			" protected %u\n", engine.HeapEvents(), engine.HeapGrowths(),
+			engine.HeapDeclines(), engine.SuspendBytes(), engine.ProtectedBytes());
 		if (recovery.attempted) {
 			dprintf("mali_csf: recovery result=%u reset=%u/%u flags=%#x irq=%u/%#x/%#x"
 				" quiescent=%u restored=%u recovered=%u job=%#x mmu=%#x\n",

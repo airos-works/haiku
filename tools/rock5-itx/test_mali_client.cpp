@@ -166,6 +166,7 @@ static void* ClientCalloc(size_t count, size_t bytes)
 {
 	return ++sHeapCalls == sFailHeap ? NULL : calloc(count, bytes);
 }
+static void dprintf(const char*, ...) {}
 #define malloc ClientMalloc
 #define calloc ClientCalloc
 #include "client.inc"
@@ -293,7 +294,7 @@ int main()
 	assert(Call(c, kCreateBuffer, bad) == B_NO_MEMORY);
 	FreeClient(a); FreeClient(b); FreeClient(c); Empty();
 	std::vector<void*> clients;
-	for (unsigned i = 0; i < 64; i++) {
+	for (unsigned i = 0; i < kMaxClients; i++) {
 		assert(OpenClient(false, &a) == B_OK); clients.push_back(a);
 	}
 	assert(OpenClient(false, &a) == B_BUSY);

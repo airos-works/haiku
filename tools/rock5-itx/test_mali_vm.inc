@@ -288,28 +288,30 @@ static void CheckVms()
 	assert(OpenClient(true, &a) == B_OK);
 	vm = NewVm(a); buffer = Create(a, 4096);
 	std::vector<VmOperation> sparse;
-	for (unsigned i = 0; i < 256; i++) {
+	for (unsigned i = 0; i < kMaxVmMappings; i++) {
 		sparse.push_back({kVmMapOperation, kVmNoExecute, uint64(i) * 8192,
 			4096, buffer.handle, 0, 0});
 		if (sparse.size() == 64) { assert(Bind(a, vm.handle, sparse) == B_OK); sparse.clear(); }
 	}
-	assert(VmDetails(a, vm.handle).mappings == 256);
-	assert(Bind(a, vm.handle, {{kVmMapOperation, kVmNoExecute, 256 * 8192,
+	assert(VmDetails(a, vm.handle).mappings == kMaxVmMappings);
+	assert(Bind(a, vm.handle, {{kVmMapOperation, kVmNoExecute, uint64(kMaxVmMappings) * 8192,
 		4096, buffer.handle, 0, 0}}) == B_NO_MEMORY);
-	assert(VmDetails(a, vm.handle).mappings == 256);
+	assert(VmDetails(a, vm.handle).mappings == kMaxVmMappings);
 	assert(Bind(a, vm.handle, {{kVmUnmapOperation, 0, 0, kVmUserLimit, 0, 0, 0}}) == B_OK);
 	for (unsigned i = 0; i < 64; i++)
 		sparse.push_back({kVmMapOperation, kVmNoExecute, uint64(i) << 30,
 			4096, buffer.handle, 0, 0});
 	assert(Bind(a, vm.handle, sparse) == B_OK && sTablePages == 130);
 	std::vector<ClientVmLease> tableLeases;
-	for (unsigned i = 0; i < 31; i++) {
+	// Generations of 130 table pages that fit the global budget.
+	const unsigned fit = kMaxGlobalTablePages / 130;
+	for (unsigned i = 0; i < fit; i++) {
 		ClientVmLease lease{}; assert(AcquireClientVm(a, vm.handle, 0, lease) == B_OK);
 		tableLeases.push_back(lease);
 		status_t result = Bind(a, vm.handle, sparse);
-		assert(result == (i < 30 ? B_OK : B_NO_MEMORY));
+		assert(result == (i < fit - 1 ? B_OK : B_NO_MEMORY));
 	}
-	assert(sTablePages == 4030 && sGenerations == 31);
+	assert(sTablePages == fit * 130 && sGenerations == fit);
 	for (auto& lease : tableLeases) ReleaseClientVm(lease);
 	assert(Bind(a, vm.handle, sparse) == B_OK && sTablePages == 130);
 	FreeClient(a); Empty();
