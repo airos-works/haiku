@@ -180,3 +180,46 @@ resumed at 24 pictures a second with no buffer left behind; scanning at 8x
 and -16x showed 9-10 key frames a second. 1080p H.264 (Blu-ray x264),
 3840x1600 eight-bit SDR HEVC, 1080p ten-bit SDR HEVC and a 3832x1596 Dolby
 Vision/HDR10 MP4 all played on RKVDEC at 24 pictures a second.
+
+## Encoding, VP9 and interlaced H.264 (2026-11-01)
+
+On the CI installation (hrev60207+2161) of 2026-11-01, measured on the board
+with the rk3588_vpu driver, 00_rockchip_mpp add-on and MediaConverter of
+haiku master after d0c9e5322f.
+
+### RKVENC encoding
+
+`rk3588_vpu` serves MPP's RKVENC client (16) on core 0 of the VEPU580:
+VENC0 power (Linux 6.18.52 pm-domains.c bits under VCODEC), the firmware's
+ungated RKVENC0 clocks checked, register words only in the blocks MPP's
+VEPU580 H.264/H.265 HALs write, every address register a buffer of the
+team, the block's IOMMU in bypass, jobs polled to completion with the BSP
+driver's sequence (`mpp_rkvenc2.c`) and its safe reset after an error. The
+gate is `encode_profile rock5-itx-edk2-v1.1-rkvenc0-h264-h265`; without the
+line, the qualified decode profile admits it too (installations keep the
+settings file they were made with).
+
+| Test (MPP's own `mpi_enc_test`, airos-works/mpp 4ad48e27) | Result |
+| --- | --- |
+| 1280x720 H.264 High, 60 pictures | 2.0 ms a picture, luma PSNR 46.4 dB average |
+| 1280x720 H.265 Main, 60 pictures | 2.0 ms, 54.9 dB |
+| 3840x2160 H.264, 10 pictures | 16 ms, 52.1 dB |
+| 3840x2160 H.265, 10 pictures | 17 ms, 57.8 dB |
+
+MediaConverter's `MppVideoEncoder` (backend "RKVENC") encodes H.264 High and
+H.265 Main through MPP, opened at run time. 30 s of a 1080p H.264 episode to
+H.265 took 4.98 s (151 pictures a second, 44.5 dB against the source); 20 s
+of a 3840x1600 HEVC film 17.5 s, against 312 s with x265. Software decoding
+of the source is now the limit at 4K. Ten bits stay on the CPU (the VEPU580
+encodes eight).
+
+### VP9 and fields
+
+RKVDEC's VP9 (MPP's vdpu34x VP9 HAL, decode mode 2) is admitted by the
+driver and taken by the add-on: 60 of 60 pictures of a 1080p YouTube VP9 clip
+byte-identical to libavcodec. MPP gives H.264 PAFF/MBAFF pictures as two
+woven fields, byte-identical to libavcodec for every picture libavcodec
+outputs; the add-on marks them `field_sequence` 2 and airTime 1.0.0-33
+deinterlaces them (1080i broadcasts at 50/60 pictures a second, none
+dropped). The add-on now registers its formats only where
+`/dev/video/rk3588_vpu/0` exists.
