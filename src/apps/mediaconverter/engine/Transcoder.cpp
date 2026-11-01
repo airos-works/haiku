@@ -1492,10 +1492,15 @@ Transcoder::_SetUpSubtitles(BString& error)
 		if (!container_takes_subtitle(settings.container,
 				in->codecpar->codec_id, &convertTo)) {
 			BString note;
-			note.SetToFormat("%s subtitles cannot go into %s and are left "
-				"out (burn them in, or choose Matroska).",
-				avcodec_get_name(in->codecpar->codec_id),
-				container_info(settings.container).name);
+			if (in->codecpar->codec_id == AV_CODEC_ID_NONE) {
+				note = "A subtitle track of a kind FFmpeg does not know is "
+					"left out.";
+			} else {
+				note.SetToFormat("%s subtitles cannot go into %s and are left "
+					"out (burn them in, or choose Matroska).",
+					avcodec_get_name(in->codecpar->codec_id),
+					container_info(settings.container).name);
+			}
 			_Note(note.String());
 			continue;
 		}

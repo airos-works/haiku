@@ -312,6 +312,11 @@ container_takes_subtitle(container_kind kind, AVCodecID codec,
 	AVCodecID* convertTo)
 {
 	*convertTo = AV_CODEC_ID_NONE;
+	// A track FFmpeg does not know (Matroska's S_TEXT/WEBVTT variants and
+	// the like come as AV_CODEC_ID_NONE) cannot be written anywhere: the
+	// muxer refuses the whole file ("Subtitle codec 0 is not supported").
+	if (codec == AV_CODEC_ID_NONE)
+		return false;
 	bool text = is_text_subtitle(codec);
 
 	switch (kind) {
