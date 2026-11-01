@@ -26,6 +26,7 @@
 */
 
 
+#include <arch/x86/apic.h>
 #include <arch/x86/arch_suspend.h>
 
 #include <algorithm>
@@ -487,6 +488,18 @@ ec_fan_rpm()
 	if (in8(0xe20) != 'E' || in8(0xe21) != 'C')
 		return -1;
 	return in16(0xe10);
+}
+
+
+/*!	The Chrome EC's battery: the remaining capacity (mAh) at 0xe48, the
+	flags (AC 0x1, charging 0x8) at 0xe4c. -1 elsewhere. */
+static int32
+ec_battery_capacity(uint8* _flags)
+{
+	if (in8(0xe20) != 'E' || in8(0xe21) != 'C')
+		return -1;
+	*_flags = in8(0xe4c);
+	return in32(0xe48);
 }
 
 
@@ -1723,6 +1736,16 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 	int32 fanMax = fanFirst;
 	int32 fanLast = fanFirst;
 	uint32 fanSamples = 0;
+	uint8 batteryFlagsFirst = 0;
+	int32 batteryFirst = ec_battery_capacity(&batteryFlagsFirst);
+	// how often the CPU woke up between two looks at the lid, and since
+	// when it does that a lot (each wake-up ends an S0i3)
+	uint32 lookRounds = 0;
+	uint32 mostLookRounds = 0;
+	uint32 busyLooks = 0;
+	bigtime_t firstBusyLook = 0;
+	uint32 timerRounds = 0;
+	bigtime_t ignoredAt[4] = {};
 	atomic_set(&sActive, 1);
 	uint32 rounds = 0;
 	uint32 ignoredWakeups = 0;
@@ -1741,9 +1764,19 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 					break;
 				}
 				arch_timer_set_hardware_timer(deadline - now);
+			} else {
+				// An interrupt in the sleep may have had the kernel program
+				// the timer for its own timers again (as when it cancels the
+				// first one): then the scheduler's quantum timer comes due,
+				// and each one sets the next, every few ms, all night.
+				InterruptsLocker _;
+				if (apic_available() && apic_lvt_current_timer_count() != 0)
+					timerRounds++;
+				arch_timer_clear_hardware_timer();
 			}
 			cpu_idle();
 			rounds++;
+			lookRounds++;
 			fch_watchdog_refresh();
 			if (progress)
 				x86_suspend_note_round(rounds);
@@ -1765,6 +1798,10 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 				}
 			}
 			lidPolls++;
+			mostLookRounds = std::max(mostLookRounds, lookRounds);
+			if (lookRounds > 10 && busyLooks++ == 0)
+				firstBusyLook = system_time() - start;
+			lookRounds = 0;
 			if (pollLid && lid_is_open()) {
 				atomic_set(&sWakeReason, X86_S2IDLE_WAKE_SCI);
 				INFO("the lid is open (the alarm's look)\n");
@@ -1781,6 +1818,8 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 			break;
 		}
 
+		if (ignoredWakeups < B_COUNT_OF(ignoredAt))
+			ignoredAt[ignoredWakeups] = system_time() - start;
 		ignoredWakeups++;
 		s0i3_settle(&lastEntry);
 		atomic_set(&sWakeReason, 0);
@@ -1885,6 +1924,30 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 		INFO("fan in the sleep: %" B_PRId32 " rpm at the start, at most %"
 			B_PRId32 ", %" B_PRId32 " at the end (%" B_PRIu32 " looks)\n",
 			fanFirst, fanMax, fanLast, fanSamples);
+	}
+	if (lidPolls != 0 || timerRounds != 0) {
+		INFO("wake-ups between two looks: at most %" B_PRIu32 ", more than 10 "
+			"in %" B_PRIu32 " looks (the first after %" B_PRIdBIGTIME " s); "
+			"the timer was set again in %" B_PRIu32 " rounds\n", mostLookRounds,
+			busyLooks, firstBusyLook / 1000000, timerRounds);
+	}
+	if (ignoredWakeups != 0) {
+		char times[64];
+		size_t length = 0;
+		times[0] = '\0';
+		for (uint32 i = 0; i < std::min(ignoredWakeups,
+				(uint32)B_COUNT_OF(ignoredAt)); i++) {
+			length += snprintf(times + length, sizeof(times) - length,
+				" %" B_PRIdBIGTIME, ignoredAt[i] / 1000000);
+		}
+		INFO("SCIs slept through after (s):%s\n", times);
+	}
+	uint8 batteryFlagsLast = 0;
+	int32 batteryLast = ec_battery_capacity(&batteryFlagsLast);
+	if (batteryFirst >= 0) {
+		INFO("battery: %" B_PRId32 " mAh (flags %#x) at the start, %" B_PRId32
+			" mAh (flags %#x) at the end\n", batteryFirst, batteryFlagsFirst,
+			batteryLast, batteryFlagsLast);
 	}
 	if (progress) {
 		x86_suspend_note_phase(X86_SUSPEND_PROGRESS_BACK);
