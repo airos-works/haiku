@@ -85,14 +85,17 @@ rule UserBuildConfigRulePreImage
 		AddFilesToHaikuImage home config non-packaged bin
 			: rock5_ahci_probe rock5_mmc_probe ;
 	}
-	# Intel is the QEMU DMA fixture. Native RTL8125 trials additionally require
-	# the explicit onboard firmware profile and legacy_interrupts setting.
+	# ipro1000 (the QEMU DMA fixture) and rtl8125 are in the haiku package on
+	# arm64 since the FreeBSD compat layer builds there. Never add second,
+	# non-packaged copies: the kernel ranks both paths alike, swaps to the
+	# packaged one when it shows up and reloads the running driver, which
+	# panicked first boot on the ROCK 5 (list_remove_item in
+	# _fbsd_uninit_drivers). Native RTL8125 trials additionally require the
+	# explicit onboard firmware profile and legacy_interrupts setting.
 	# The regular image definition packages iaxwifi200 and the other Wi-Fi
 	# drivers for arm64; the minimum-based lab image only gets the AX210's.
-	if $(ROCK5_FULL_IMAGE) {
-		AddDriversToHaikuImage net : ipro1000 rtl8125 ;
-	} else {
-		AddDriversToHaikuImage net : ipro1000 rtl8125 iaxwifi200 ;
+	if ! $(ROCK5_FULL_IMAGE) {
+		AddDriversToHaikuImage net : iaxwifi200 ;
 	}
 	AddNewDriversToHaikuImage graphics : mali_csf rk3588_display ;
 	AddNewDriversToHaikuImage video : rk3588_vpu ;

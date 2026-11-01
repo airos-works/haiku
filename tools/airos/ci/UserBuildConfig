@@ -461,7 +461,9 @@ rule UserBuildConfigRulePreImage
 		SEARCH on $(profiles) = [ FDirName $(rock5) image-settings ] ;
 		AddFilesToHaikuImage home config settings kernel drivers : $(profiles) ;
 
-		AddDriversToHaikuImage net : ipro1000 rtl8125 ;
+		# ipro1000 and rtl8125 come from the haiku package. A second,
+		# non-packaged copy made the kernel reload the running rtl8125 on
+		# first boot and panic (tools/rock5-itx/UserBuildConfig).
 		AddNewDriversToHaikuImage graphics : mali_csf rk3588_display ;
 		AddNewDriversToHaikuImage video : rk3588_vpu ;
 		AddNewDriversToHaikuImage audio hmulti : rk3588_audio ;
