@@ -137,6 +137,46 @@ find_route(struct net_domain* _domain, const net_route* description)
 }
 
 
+/*!	Returns whether \a a should be preferred over \a b as the default route.
+	Routes over a device with link come first, then the one whose interface
+	has the lower metric (the service order set by the net_server), then the
+	faster link. Equal routes keep their order in the table.
+*/
+static bool
+is_better_default_route(net_route_private* a, net_route_private* b)
+{
+	net_interface* interfaceA = a->interface_address->interface;
+	net_interface* interfaceB = b->interface_address->interface;
+
+	bool linkA = (interfaceA->device->flags & IFF_LINK) != 0;
+	bool linkB = (interfaceB->device->flags & IFF_LINK) != 0;
+	if (linkA != linkB)
+		return linkA;
+
+	if (interfaceA->metric != interfaceB->metric)
+		return interfaceA->metric < interfaceB->metric;
+
+	return interfaceA->device->link_speed > interfaceB->device->link_speed;
+}
+
+
+static bool
+route_matches_address(net_domain_private* domain, net_route_private* route,
+	const sockaddr* address)
+{
+	if (route->mask) {
+		sockaddr_storage maskedAddress;
+		domain->address_module->mask_address(address, route->mask,
+			(sockaddr*)&maskedAddress);
+		return domain->address_module->equal_addresses(
+			(sockaddr*)&maskedAddress, route->destination);
+	}
+
+	return domain->address_module->equal_addresses(address,
+		route->destination);
+}
+
+
 static net_route_private*
 find_route(net_domain* _domain, const sockaddr* address)
 {
@@ -150,21 +190,35 @@ find_route(net_domain* _domain, const sockaddr* address)
 	TRACE("test address %s for routes...\n",
 		AddressString(domain, address).Data());
 
-	// TODO: alternate equal default routes
-
 	while (iterator.HasNext()) {
 		net_route_private* route = iterator.Next();
 
-		if (route->mask) {
-			sockaddr maskedAddress;
-			domain->address_module->mask_address(address, route->mask,
-				&maskedAddress);
-			if (!domain->address_module->equal_addresses(&maskedAddress,
-					route->destination))
-				continue;
-		} else if (!domain->address_module->equal_addresses(address,
-				route->destination))
+		if (!route_matches_address(domain, route, address))
 			continue;
+
+		if ((route->flags & RTF_DEFAULT) != 0) {
+			// The default routes are the least specific ones, and come last.
+			// Choose between them by link, metric and speed instead of the
+			// order they happened to be added in.
+			net_route_private* best = route;
+			while (iterator.HasNext()) {
+				net_route_private* other = iterator.Next();
+				if ((other->flags & RTF_DEFAULT) == 0
+					|| !route_matches_address(domain, other, address))
+					continue;
+				if (is_better_default_route(other, best))
+					best = other;
+			}
+
+			if ((best->interface_address->interface->device->flags & IFF_LINK)
+					== 0 && candidate != NULL) {
+				// a more specific route without link was found earlier
+				return candidate;
+			}
+
+			TRACE("  found default route: flags %lx\n", best->flags);
+			return best;
+		}
 
 		// neglect routes that point to devices that have no link
 		if ((route->interface_address->interface->device->flags & IFF_LINK)

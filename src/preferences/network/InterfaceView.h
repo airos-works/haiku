@@ -1,5 +1,5 @@
 /*
- * Copyright 2004-2015 Haiku, Inc. All rights reserved.
+ * Copyright 2004-2026 Haiku, Inc. All rights reserved.
  * Distributed under the terms of the MIT License.
  *
  * Authors:
@@ -13,12 +13,16 @@
 
 #include <GroupView.h>
 #include <NetworkInterface.h>
+#include <String.h>
 
 
 class BButton;
 class BMenuField;
 class BMessage;
 class BStringView;
+class StatusField;
+class ThroughputView;
+struct WiFiLinkDetails;
 
 
 class InterfaceView : public BGroupView {
@@ -33,25 +37,66 @@ public:
 	virtual	void				Pulse();
 
 private:
+			struct Row {
+				BStringView*	label;
+				BStringView*	value;
+			};
+
 			status_t			_Update(bool updateWirelessNetworks = true);
-			void				_EnableFields(bool enabled);
+			void				_UpdateStatus();
+			void				_UpdateAddresses();
+			void				_UpdateLink(const WiFiLinkDetails* wireless);
+			void				_UpdateWireless(
+									const WiFiLinkDetails* wireless);
+			void				_UpdateWirelessMenu(bool isWireless);
+			void				_UpdateStats();
+
+			Row					_AddRow(const char* name,
+									const char* label);
+			void				_SetRow(const Row& row, const BString& value,
+									bool visible = true);
+
+	static	bool				_IsPrimaryInterface(
+									const BNetworkAddress& address);
+	static	BString				_FormatLinkSpeed(uint64 bitsPerSecond);
+	static	BString				_DNSServers(BString& searchDomain);
 
 private:
 			BNetworkInterface	fInterface;
 			int					fPulseCount;
 
-			BStringView*		fStatusField;
-			BStringView*		fMacAddressField;
-			BStringView*		fLinkSpeedField;
-			BStringView*		fLinkTxField;
-			BStringView*		fLinkRxField;
-
+			StatusField*		fStatusField;
 			BMenuField*			fNetworkMenuField;
+
+			Row					fAddressRow;
+			Row					fIPv6Row;
+			Row					fRouteRow;
+			Row					fDNSRow;
+			Row					fSearchDomainRow;
+
+			Row					fLinkSpeedRow;
+			Row					fMacAddressRow;
+			Row					fMTURow;
+
+			Row					fSecurityRow;
+			Row					fBSSIDRow;
+			Row					fChannelRow;
+			Row					fRSSIRow;
+			Row					fTxRateRow;
+			Row					fPhyModeRow;
+
+			Row					fSentRow;
+			Row					fReceivedRow;
+
+			ThroughputView*		fThroughputView;
 
 			BButton*			fToggleButton;
 			BButton*			fRenegotiateButton;
+
+			BString				fDNSServers;
+			BString				fSearchDomain;
+			int					fDNSAge;
 };
 
 
-#endif // INTERFACE_HARDWARE_VIEW_H
-
+#endif // INTERFACE_VIEW_H

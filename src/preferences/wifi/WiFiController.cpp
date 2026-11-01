@@ -316,6 +316,105 @@ FrequencyForBSSID(BNetworkDevice& device, const BNetworkAddress& bssid)
 }
 
 
+/*!	Fills in what the radio reports about the link with \a bssid: the PHY
+	mode, the channel and the last transmit rate.
+*/
+static void
+ReadRadioDetails(BNetworkInterface& interface, BNetworkDevice& device,
+	const BNetworkAddress& bssid, WiFiLinkDetails& link)
+{
+	const char* phy = PhyModeName(interface.Media());
+	if (phy != NULL)
+		link.phyMode = phy;
+	link.frequency = FrequencyForBSSID(device, bssid);
+	link.channel = ChannelForFrequency(link.frequency);
+	ReadTxRate(device, link);
+}
+
+
+status_t
+GetWiFiLinkDetails(const char* deviceName, WiFiLinkDetails& link,
+	BString& networkName)
+{
+	link = WiFiLinkDetails();
+	networkName = "";
+
+	BNetworkInterface interface(deviceName);
+	BNetworkDevice device(deviceName);
+	if (!device.IsWireless())
+		return B_BAD_TYPE;
+	if ((interface.Flags() & IFF_UP) == 0 || !device.HasLink())
+		return B_NOT_ALLOWED;
+
+	BNetworkAddress bssid;
+	uint32 cookie = 0;
+	if (device.GetNextAssociatedNetwork(cookie, bssid) != B_OK)
+		return B_ENTRY_NOT_FOUND;
+
+	wireless_network* networks = NULL;
+	uint32 count = 0;
+	if (device.GetNetworks(networks, count) != B_OK) {
+		networks = NULL;
+		count = 0;
+	}
+
+	const wireless_network* associated = NULL;
+	for (uint32 i = 0; i < count; i++) {
+		if (networks[i].address == bssid && networks[i].name[0] != '\0') {
+			associated = &networks[i];
+			break;
+		}
+	}
+
+	if (associated != NULL) {
+		networkName.SetTo(associated->name, sizeof(associated->name));
+		link.dBm = WirelessSignalDBm(*associated);
+
+		// The associated access point's own record may lack its RSN
+		// details; another one of the same network knows how it is secured.
+		const wireless_network* secured = associated;
+		for (uint32 i = 0; i < count; i++) {
+			if (strncmp(networks[i].name, associated->name,
+					sizeof(networks[i].name)) == 0
+				&& networks[i].authentication_mode
+					> secured->authentication_mode) {
+				secured = &networks[i];
+			}
+		}
+		link.security = SecurityName(*secured);
+	} else {
+		char ssid[IEEE80211_NWID_LEN + 1];
+		memset(ssid, 0, sizeof(ssid));
+		struct ieee80211req request;
+		memset(&request, 0, sizeof(request));
+		request.i_type = IEEE80211_IOC_SSID;
+		request.i_data = ssid;
+		request.i_len = IEEE80211_NWID_LEN;
+		if (device.Control(SIOCG80211, &request) == B_OK
+			&& request.i_len > 0) {
+			networkName.SetTo(ssid,
+				std::min((int)request.i_len, IEEE80211_NWID_LEN));
+		}
+	}
+	delete[] networks;
+
+	int32 index = interface.FindFirstAddress(AF_INET);
+	BNetworkInterfaceAddress address;
+	if (index >= 0 && interface.GetAddressAt(index, address) == B_OK
+		&& !address.Address().IsEmpty()
+		&& !address.Address().IsWildcard()) {
+		link.address = address.Address().ToString();
+		BNetworkAddress gateway;
+		if (interface.GetDefaultGateway(AF_INET, gateway) == B_OK)
+			link.router = gateway.ToString();
+	}
+
+	link.bssid = bssid.ToString();
+	ReadRadioDetails(interface, device, bssid, link);
+	return B_OK;
+}
+
+
 // #pragma mark - WiFiState
 
 
@@ -739,12 +838,7 @@ WiFiController::_Update(bool scanCompleted)
 		state.link.bssid = bssid.ToString();
 		state.link.security = associatedSecurity;
 		state.link.dBm = associatedDBm;
-		const char* phy = PhyModeName(interface.Media());
-		if (phy != NULL)
-			state.link.phyMode = phy;
-		state.link.frequency = FrequencyForBSSID(device, bssid);
-		state.link.channel = ChannelForFrequency(state.link.frequency);
-		ReadTxRate(device, state.link);
+		ReadRadioDetails(interface, device, bssid, state.link);
 	} else if (!associatedName.IsEmpty()) {
 		state.state = WIFI_STATE_CONNECTING;
 		state.current = associatedName;

@@ -74,6 +74,8 @@ public:
 			uint32				MTU() const;
 			int32				Media() const;
 			uint32				Metric() const;
+			uint64				LinkSpeed() const;
+									// in bit/s, 0 if unknown
 			uint32				Type() const;
 			status_t			GetStats(ifreq_stats& stats);
 			bool				HasLink() const;

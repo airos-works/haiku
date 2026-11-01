@@ -3,8 +3,13 @@ SubDir HAIKU_TOP src preferences network ;
 UsePublicHeaders [ FDirName add-ons network_settings ] ;
 UsePrivateHeaders net shared storage ;
 
+UseHeaders [ FDirName $(HAIKU_TOP) src libs compat ] : true ;
+UseHeaders [ FDirName $(HAIKU_TOP) src libs compat freebsd_wlan ] : true ;
+
 SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src apps networkstatus ]
-	[ FDirName $(HAIKU_TOP) src bin network ifconfig ] ;
+	[ FDirName $(HAIKU_TOP) src bin network ifconfig ]
+	[ FDirName $(HAIKU_TOP) src preferences wifi ] ;
+SubDirHdrs $(HAIKU_TOP) src preferences wifi ;
 
 Application Network :
 	Network.cpp
@@ -13,6 +18,11 @@ Application Network :
 	NetworkSettingsAddOn.cpp
 	InterfaceListItem.cpp
 	InterfaceView.cpp
+	ServiceOrderWindow.cpp
+	ThroughputView.cpp
+
+	# The Wi-Fi link details, shared with the WiFi preferences
+	WiFiController.cpp
 
 	# Common functionality for add-ons
 	IPAddressControl.cpp
@@ -25,7 +35,7 @@ Application Network :
 	WirelessNetworkMenuItem.cpp
 
 	: <src!bin!network!ifconfig>MediaTypes.o
-	be bnetapi shared [ TargetLibstdc++ ] localestub
+	be bnetapi network shared [ TargetLibstdc++ ] localestub
 	: Network.rdef InterfaceIcons.rdef
 ;
 
@@ -35,6 +45,9 @@ DoCatalogs Network :
 	InterfaceListItem.cpp
 	InterfaceView.cpp
 	Network.cpp
+	ServiceOrderWindow.cpp
+	ThroughputView.cpp
+	WiFiController.cpp
 	NetworkWindow.cpp
 	NetworkProfile.cpp
 	NetworkSettingsAddOn.cpp

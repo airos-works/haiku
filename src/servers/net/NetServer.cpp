@@ -47,6 +47,7 @@
 
 #include "AutoconfigLooper.h"
 #include "Services.h"
+#include "../../shared/net/ServiceOrder.h"
 
 extern "C" {
 #	include <freebsd_network/compat/sys/cdefs.h>
@@ -91,6 +92,8 @@ private:
 			void				_ConfigureIPv6LinkLocal(const char* name);
 
 			void				_BringUpInterfaces();
+			void				_ApplyServiceOrder();
+			status_t			_SetServiceOrder(const BMessage& message);
 			void				_StartServices();
 			status_t			_HandleDeviceMonitor(BMessage* message);
 
@@ -283,6 +286,16 @@ NetServer::MessageReceived(BMessage* message)
 
 			BMessage reply(B_REPLY);
 			reply.AddInt32("status", result);
+			message->SendReply(&reply);
+			break;
+		}
+
+		case kMsgSetServiceOrder:
+		{
+			status_t status = _SetServiceOrder(*message);
+
+			BMessage reply(B_REPLY);
+			reply.AddInt32("status", status);
 			message->SendReply(&reply);
 			break;
 		}
@@ -572,6 +585,7 @@ NetServer::_ConfigureInterface(BMessage& message)
 		fDeviceMap[name] = looper;
 	}
 
+	_ApplyServiceOrder();
 	return B_OK;
 }
 
@@ -815,6 +829,84 @@ NetServer::_BringUpInterfaces()
 	// There is no driver configured - see if there is one and try to use it
 	_ConfigureDevices("/dev/net", devicesAlreadyConfigured,
 		missingDevice.HasString("device") ? &missingDevice : NULL);
+
+	_ApplyServiceOrder();
+}
+
+
+/*!	Gives every interface the metric of its place in the service order, so
+	that the stack sends the traffic over the most preferred connected one.
+	Interfaces whose settings set a metric explicitly keep that one.
+*/
+void
+NetServer::_ApplyServiceOrder()
+{
+	using namespace BPrivate::ServiceOrder;
+
+	std::vector<Service> services;
+	BNetworkRoster& roster = BNetworkRoster::Default();
+	BNetworkInterface interface;
+	uint32 cookie = 0;
+	while (roster.GetNextInterface(&cookie, interface) == B_OK) {
+		if ((interface.Flags() & IFF_LOOPBACK) != 0)
+			continue;
+
+		Service service;
+		service.name = interface.Name();
+		service.kind = KindOf(interface.Name());
+		services.push_back(service);
+	}
+
+	BStringList order;
+	Read(order);
+	Resolve(order, services);
+
+	for (size_t i = 0; i < services.size(); i++) {
+		const Service& service = services[i];
+		if (!service.present)
+			continue;
+
+		BMessage settings;
+		if (fSettings.GetInterface(service.name.String(), settings) == B_OK
+			&& settings.HasInt32("metric"))
+			continue;
+
+		BNetworkInterface target(service.name.String());
+		if (target.Metric() == service.metric)
+			continue;
+
+		status_t status = target.SetMetric(service.metric);
+		if (status != B_OK) {
+			fprintf(stderr, "%s: Setting metric of %s failed: %s\n", Name(),
+				service.name.String(), strerror(status));
+		} else {
+			syslog(LOG_INFO, "%s: service order: %s metric %" B_PRIu32 "\n",
+				Name(), service.name.String(), service.metric);
+		}
+	}
+}
+
+
+status_t
+NetServer::_SetServiceOrder(const BMessage& message)
+{
+	BStringList order;
+	const char* name;
+	for (int32 index = 0; message.FindString("service", index, &name) == B_OK;
+			index++) {
+		if (name[0] != '\0' && !order.HasString(name))
+			order.Add(name);
+	}
+
+	status_t status = BPrivate::ServiceOrder::Write(order);
+	if (status != B_OK) {
+		fprintf(stderr, "%s: Saving the service order failed: %s\n", Name(),
+			strerror(status));
+		return status;
+	}
+
+	_ApplyServiceOrder();
+	return B_OK;
 }
 
 

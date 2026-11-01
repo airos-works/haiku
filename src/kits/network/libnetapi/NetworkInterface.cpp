@@ -276,6 +276,20 @@ BNetworkInterface::Metric() const
 }
 
 
+/*!	Returns the speed of the link in bit/s as the driver reports it, or 0 if
+	the driver does not know it.
+*/
+uint64
+BNetworkInterface::LinkSpeed() const
+{
+	ifreq request;
+	if (do_request(AF_INET, request, Name(), SIOCGIFLINKSPEED) != B_OK)
+		return 0;
+
+	return request.ifr_link_speed;
+}
+
+
 uint32
 BNetworkInterface::Type() const
 {

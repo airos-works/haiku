@@ -22,6 +22,8 @@
 #define kMsgLeaveNetwork			'LVnw'
 #define kMsgAutoJoinNetwork			'AJnw'
 #define kMsgIsServiceRunning		'IRsv'
+#define kMsgSetServiceOrder			'SOsv'
+	// string "service": interface names, most preferred first
 
 
 #endif	// _NET_SERVER_H

@@ -112,6 +112,15 @@ struct WiFiLinkDetails {
 };
 
 
+/*!	Reads the association of the wireless \a device directly from the driver,
+	without a WiFiController: for views that only show it, like the Network
+	preferences. Returns B_OK and fills in \a link and \a networkName while
+	the device is associated and has link.
+*/
+status_t GetWiFiLinkDetails(const char* device, WiFiLinkDetails& link,
+	BString& networkName);
+
+
 struct WiFiState {
 								WiFiState();
 

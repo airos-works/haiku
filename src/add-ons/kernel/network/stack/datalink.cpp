@@ -84,6 +84,7 @@ option_to_string(int32 option)
 		CODE(SIOCSIFMTU)		/* set interface MTU */
 		CODE(SIOCSIFMEDIA)		/* set net media */
 		CODE(SIOCGIFMEDIA)		/* get net media */
+		CODE(SIOCGIFLINKSPEED)	/* get link speed */
 
 		CODE(SIOCGRTSIZE)		/* get route table size */
 		CODE(SIOCGRTTABLE)		/* get route table */
@@ -959,6 +960,16 @@ interface_protocol_control(net_datalink_protocol* _protocol, int32 option,
 
 			return status;
 		}
+		case SIOCGIFLINKSPEED:
+		{
+			// get link speed in bit/s
+			struct ifreq request;
+			request.ifr_link_speed = interface->device->link_speed;
+
+			return user_memcpy(&((struct ifreq*)argument)->ifr_link_speed,
+				&request.ifr_link_speed, sizeof(request.ifr_link_speed));
+		}
+
 		case SIOCGIFMEDIA:
 		{
 			// get media

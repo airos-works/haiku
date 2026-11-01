@@ -329,15 +329,15 @@ const char*
 InterfaceListItem::_StateText() const
 {
 	if (fDisabled)
-		return B_TRANSLATE("disabled");
+		return B_TRANSLATE("Disabled");
 
 	if (!fInterface.HasLink()) {
 		switch (fType) {
 			case B_NETWORK_INTERFACE_TYPE_VPN:
 			case B_NETWORK_INTERFACE_TYPE_DIAL_UP:
-				return B_TRANSLATE("disconnected");
+				return B_TRANSLATE("Disconnected");
 			default:
-				return B_TRANSLATE("no link");
+				return B_TRANSLATE("No link");
 		}
 	}
 
@@ -349,5 +349,5 @@ InterfaceListItem::_StateText() const
 //		interfaceState = "connecting" B_UTF8_ELLIPSIS;
 //		stateIcon = fIconPending;
 
-	return B_TRANSLATE("connected");
+	return B_TRANSLATE("Connected");
 }

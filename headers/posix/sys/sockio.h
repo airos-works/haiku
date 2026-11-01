@@ -74,6 +74,7 @@
 #define B_SOCKET_SET_ALIAS		8947	/* set interface alias, ifaliasreq */
 #define B_SOCKET_GET_ALIAS		8948	/* get interface alias, ifaliasreq */
 #define B_SOCKET_COUNT_ALIASES	8949	/* count interface aliases */
+#define SIOCGIFLINKSPEED		8950	/* get link speed, ifr_link_speed */
 
 #define SIOCEND					9000	/* SIOCEND >= highest SIOC* */
 

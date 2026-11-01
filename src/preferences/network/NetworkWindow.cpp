@@ -46,6 +46,7 @@
 #include "InterfaceListItem.h"
 #include "InterfaceView.h"
 #include "ServiceListItem.h"
+#include "ServiceOrderWindow.h"
 
 
 const char* kNetworkStatusSignature = "application/x-vnd.Haiku-NetworkStatus";
@@ -56,6 +57,10 @@ static const uint32 kMsgProfileNew = 'newp';
 static const uint32 kMsgRevert = 'rvrt';
 static const uint32 kMsgToggleReplicant = 'trep';
 static const uint32 kMsgItemSelected = 'ItSl';
+static const uint32 kMsgEditServiceOrder = 'eSvO';
+
+// The rank of each interface in the service order, for sorting the list
+static std::map<BString, int32> sServiceRanks;
 
 BMessenger gNetworkWindow;
 
@@ -131,6 +136,12 @@ NetworkWindow::NetworkWindow()
 		0, false, true);
 	scrollView->SetExplicitMaxSize(BSize(B_SIZE_UNSET, B_SIZE_UNLIMITED));
 
+	fServiceOrderButton = new BButton("service order",
+		B_TRANSLATE("Service order" B_UTF8_ELLIPSIS),
+		new BMessage(kMsgEditServiceOrder));
+	fServiceOrderButton->SetToolTip(B_TRANSLATE("Choose which connection "
+		"carries the traffic when more than one is connected"));
+
 	fAddOnShellView = new BView("add-on shell", 0,
 		new BGroupLayout(B_VERTICAL));
 	fAddOnShellView->SetViewUIColor(B_PANEL_BACKGROUND_COLOR);
@@ -149,7 +160,13 @@ NetworkWindow::NetworkWindow()
 		.End()
 #endif
 		.AddGroup(B_HORIZONTAL, B_USE_DEFAULT_SPACING)
-			.Add(scrollView)
+			.AddGroup(B_VERTICAL, B_USE_SMALL_SPACING, 0.0f)
+				.Add(scrollView)
+				.AddGroup(B_HORIZONTAL, 0)
+					.Add(fServiceOrderButton)
+					.AddGlue()
+				.End()
+			.End()
 			.Add(fAddOnShellView)
 		.End()
 
@@ -236,6 +253,18 @@ NetworkWindow::MessageReceived(BMessage* message)
 				iterator->second->Revert();
 			break;
 		}
+
+		case kMsgEditServiceOrder:
+		{
+			ServiceOrderWindow* window = new ServiceOrderWindow(this,
+				BMessenger(this));
+			window->Show();
+			break;
+		}
+
+		case kMsgServiceOrderChanged:
+			_SortByServiceOrder();
+			break;
 
 		case kMsgToggleReplicant:
 		{
@@ -455,8 +484,31 @@ NetworkWindow::_ScanAddOns()
 		_SortItemsUnder(fOtherItem);
 	}
 
+	_SortByServiceOrder();
+}
+
+
+/*!	Puts the interfaces in the list in service order, like the network
+	settings of macOS do.
+*/
+void
+NetworkWindow::_SortByServiceOrder()
+{
+	BStringList order;
+	ServiceOrderWindow::GetServiceOrder(order);
+	sServiceRanks.clear();
+	for (int32 i = 0; i < order.CountStrings(); i++)
+		sServiceRanks[order.StringAt(i)] = i;
+
+	BListItem* selected = fListView->FullListItemAt(
+		fListView->FullListCurrentSelection());
+
 	fListView->SortItemsUnder(NULL, true,
 		NetworkWindow::_CompareTopLevelListItems);
+
+	if (selected != NULL)
+		fListView->Select(fListView->IndexOf(selected));
+	fListView->Invalidate();
 }
 
 
@@ -649,6 +701,17 @@ NetworkWindow::_CompareTopLevelListItems(const BListItem* a, const BListItem* b)
 			= dynamic_cast<const InterfaceListItem*>(a)) {
 		if (const InterfaceListItem* itemB
 				= dynamic_cast<const InterfaceListItem*>(b)) {
+			std::map<BString, int32>::const_iterator rankA
+				= sServiceRanks.find(itemA->Name());
+			std::map<BString, int32>::const_iterator rankB
+				= sServiceRanks.find(itemB->Name());
+			if (rankA != sServiceRanks.end() && rankB != sServiceRanks.end()
+				&& rankA->second != rankB->second)
+				return rankA->second < rankB->second ? -1 : 1;
+			if (rankA != sServiceRanks.end() && rankB == sServiceRanks.end())
+				return -1;
+			if (rankA == sServiceRanks.end() && rankB != sServiceRanks.end())
+				return 1;
 			return strcasecmp(itemA->Name(), itemB->Name());
 		}
 		return -1;

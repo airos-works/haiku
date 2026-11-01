@@ -48,6 +48,7 @@ struct ifreq {
 		int			ifr_reqcap;
 		int			ifr_count;
 		uint8_t*	ifr_data;
+		uint64_t	ifr_link_speed;	/* in bit/s, 0 if unknown */
 	};
 };
 

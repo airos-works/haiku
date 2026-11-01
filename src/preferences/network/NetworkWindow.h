@@ -56,6 +56,7 @@ private:
 			void				_BroadcastConfigurationUpdate(
 									const BMessage& message);
 			void				_UpdateRevertButton();
+			void				_SortByServiceOrder();
 
 			bool				_IsReplicantInstalled();
 			void				_ShowReplicant(bool show);
@@ -87,6 +88,7 @@ private:
 			BView*				fAddOnShellView;
 
 			BButton*			fRevertButton;
+			BButton*			fServiceOrderButton;
 };
 
 
