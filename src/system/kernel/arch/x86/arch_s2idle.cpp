@@ -385,6 +385,17 @@ pmc_probe()
 	if (gCPU[0].arch.vendor != VENDOR_AMD)
 		return;
 
+	// ("amd_pmc false" in the "suspend" kernel settings: sleep without it,
+	// so without S0i3)
+	void* settings = load_driver_settings("suspend");
+	bool wanted = get_driver_boolean_parameter(settings, "amd_pmc", true,
+		true);
+	unload_driver_settings(settings);
+	if (!wanted) {
+		INFO("AMD PMC left alone (\"amd_pmc false\")\n");
+		return;
+	}
+
 	pci_module_info* pci;
 	if (get_module(B_PCI_MODULE_NAME, (module_info**)&pci) != B_OK)
 		return;
