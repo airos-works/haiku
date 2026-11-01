@@ -41,6 +41,10 @@ struct x86_suspend_s2idle_args {
 	uint32	s0i3_entered;
 	uint32	pmc_idle_mask;
 		// AMD: which IP blocks were still busy
+	uint32	s0i3_blockers;
+		// AMD: the IP blocks that kept the SoC out of S0i3, as the power
+		// management firmware logged it (bit 0 display, 2 GFX, 5 VCN, 9 and
+		// 10 the USB 3 controllers, ...)
 };
 
 // wake_reason
@@ -76,8 +80,22 @@ enum {
 	X86_SUSPEND_VERBOSE					= 0x04,
 		// log every step and pause afterwards, so that the log is written
 		// before a step that hangs
+	X86_SUSPEND_LIGHT_SLEEP				= 0x100,
+		// s2idle: leaves out the power hooks only for a deep sleep (the
+		// graphics)
+	X86_SUSPEND_IGNORE_LID				= 0x200,
+		// s2idle, for testing: sleeps on through SCIs as with the lid
+		// closed
+	X86_SUSPEND_RTC_WAKE_ONLY			= 0x80,
+		// s2idle, for testing: only the RTC alarm ends the timeout (no local
+		// APIC deadline, which stops in S0i3 anyway)
 };
 
+
+// x86_suspend_note_phase()
+#define X86_SUSPEND_PROGRESS_SLEEPING	1
+#define X86_SUSPEND_PROGRESS_BACK		2
+#define X86_SUSPEND_PROGRESS_AFTER		3
 
 #ifdef __cplusplus
 extern "C" {
@@ -87,6 +105,11 @@ status_t x86_suspend_init(void);
 status_t x86_suspend_restart_cpu(int32 cpu);
 status_t x86_suspend_enter_s3(const struct x86_suspend_s3_args* args);
 status_t x86_suspend_enter_s2idle(struct x86_suspend_s2idle_args* args);
+void x86_suspend_save_trace(void);
+void x86_suspend_start_progress(void);
+void x86_suspend_note_round(uint32 round);
+void x86_suspend_note_phase(uint32 phase);
+void x86_suspend_hold_progress_text(void);
 
 #ifdef __cplusplus
 }

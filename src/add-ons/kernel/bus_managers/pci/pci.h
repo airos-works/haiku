@@ -69,6 +69,8 @@ struct PCIDev {
 
 	// state saved while suspended
 	bool				config_saved;
+	bool				suspended = false;
+		// by its driver, see PCI::SuspendDevice()
 	uint32				saved_config[64];
 	uint32				saved_msix_table[32 * 4];
 };
@@ -172,6 +174,11 @@ public:
 
 			void			SaveConfiguration();
 			void			RestoreConfiguration();
+			void			SaveConfigurationForIdle();
+			void			RestoreLostConfiguration();
+
+			status_t		SuspendDevice(PCIDev *device, uint8 state);
+			status_t		ResumeDevice(PCIDev *device);
 
 			status_t		UpdateInterruptLine(uint8 domain, uint8 bus,
 								uint8 device, uint8 function,
@@ -216,7 +223,11 @@ private:
 			void			_AssignBARs(PCIBus *bus);
 			void			_RefreshDeviceInfo(PCIBus *bus);
 			void			_SaveConfiguration(PCIBus *bus);
+			void			_SaveDeviceConfiguration(PCIDev *device);
 			void			_RestoreConfiguration(PCIBus *bus);
+			void			_SaveConfigurationForIdle(PCIBus *bus);
+			void			_RestoreLostConfiguration(PCIBus *bus);
+			bool			_ConfigurationLost(PCIDev *device);
 			void			_RestoreDeviceConfiguration(PCIDev *device);
 
 			uint64			_BarSize(uint64 bits);

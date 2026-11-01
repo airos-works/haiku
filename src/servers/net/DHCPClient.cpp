@@ -490,7 +490,8 @@ DHCPClient::DHCPClient(BMessenger target, const char* device)
 	fRequestTime(0),
 	fRenewalTime(0),
 	fRebindingTime(0),
-	fLeaseTime(0)
+	fLeaseTime(0),
+	fKeepLease(false)
 {
 	fTransactionID = (uint32)system_time() ^ rand();
 
@@ -538,7 +539,9 @@ DHCPClient::~DHCPClient()
 
 	delete fRunner;
 
-	if (fStatus != B_OK)
+	// (without a link it could not be sent anyway, and the address is
+	// asked for again once the link is back: a sleep or a roam keeps it)
+	if (fStatus != B_OK || fKeepLease)
 		return;
 
 	int socket = ::socket(AF_INET, SOCK_DGRAM, 0);

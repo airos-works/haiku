@@ -6,6 +6,8 @@
 
 #include <kdevice_manager.h>
 
+#include <driver_settings.h>
+
 #include <syscalls.h>
 
 #include <stdarg.h>
@@ -2486,9 +2488,11 @@ static bool sSuspendVerbose;
 
 // A short trace of the last suspend and resume. Kept in memory, because a
 // machine that resumed badly often cannot write its log to disk any more.
-static char sSuspendTrace[4096];
+static char sSuspendTrace[16384];
 static size_t sSuspendTraceLength;
 static spinlock sSuspendTraceLock = B_SPINLOCK_INITIALIZER;
+static void (*sSuspendTraceHook)(void);
+	// called after each line, to keep a copy that survives a reset
 
 
 void
@@ -2509,6 +2513,18 @@ device_manager_suspend_trace(const char* format, ...)
 	}
 	sSuspendTrace[sSuspendTraceLength++] = '\n';
 	sSuspendTrace[sSuspendTraceLength] = '\0';
+	locker.Unlock();
+
+	void (*hook)(void) = sSuspendTraceHook;
+	if (hook != NULL)
+		hook();
+}
+
+
+void
+device_manager_set_suspend_trace_hook(void (*hook)(void))
+{
+	sSuspendTraceHook = hook;
 }
 
 
@@ -2656,6 +2672,9 @@ struct power_hook : DoublyLinkedListLinkImpl<power_hook> {
 	device_manager_power_hook	hook;
 	void*						cookie;
 	const char*					name;
+	uint32						flags;
+	bool						skipped;
+		// by the "suspend" settings or a light sleep, this time
 };
 
 typedef DoublyLinkedList<power_hook> PowerHookList;
@@ -2670,6 +2689,18 @@ status_t
 device_manager_add_power_hook(device_manager_power_hook hook, void* cookie,
 	const char* name)
 {
+	return device_manager_add_power_hook_etc(hook, cookie, name, 0);
+}
+
+
+/*!	As device_manager_add_power_hook(); with
+	DEVICE_MANAGER_POWER_HOOK_DEEP_SLEEP the hook is left out of a light
+	sleep.
+*/
+status_t
+device_manager_add_power_hook_etc(device_manager_power_hook hook,
+	void* cookie, const char* name, uint32 flags)
+{
 	power_hook* entry = new(std::nothrow) power_hook;
 	if (entry == NULL)
 		return B_NO_MEMORY;
@@ -2677,6 +2708,8 @@ device_manager_add_power_hook(device_manager_power_hook hook, void* cookie,
 	entry->hook = hook;
 	entry->cookie = cookie;
 	entry->name = name != NULL ? name : "?";
+	entry->flags = flags;
+	entry->skipped = false;
 
 	RecursiveLocker _(sLock);
 	sPowerHooks.Add(entry);
@@ -2705,15 +2738,57 @@ device_manager_remove_power_hook(device_manager_power_hook hook, void* cookie)
 /*!	Calls the registered power hooks and the suspend hook of all initialized
 	drivers, children first.
 */
+static bool sLightSleep;
+	// while the devices are suspended for a light sleep
+
+
+/*!	Tells a driver suspending its device whether the system sleeps lightly
+	(a deep sleep follows when it lasts) or deeply (the SoC's deepest state,
+	in which what the driver keeps up keeps the whole SoC up). */
+bool
+device_manager_light_sleep()
+{
+	return sLightSleep;
+}
+
+
 status_t
 device_manager_suspend(int32 state, uint32 flags)
 {
 	RecursiveLocker _(sLock);
+	sLightSleep = (flags & DEVICE_MANAGER_LIGHT_SLEEP) != 0;
+
+	// A driver that does not come back from a suspend can be left out:
+	// "skip_power_hooks <name> ..." in the "suspend" kernel settings.
+	void* settings = (flags & DEVICE_MANAGER_SKIP_POWER_HOOKS) == 0
+		? load_driver_settings("suspend") : NULL;
+	const driver_settings* skipSettings = get_driver_settings(settings);
 
 	PowerHookList::ReverseIterator iterator = sPowerHooks.GetReverseIterator();
 	while (power_hook* entry = iterator.Next()) {
+		entry->skipped = false;
 		if ((flags & DEVICE_MANAGER_SKIP_POWER_HOOKS) != 0)
 			break;
+
+		for (int32 i = 0; skipSettings != NULL && i < skipSettings->parameter_count;
+				i++) {
+			const driver_parameter& parameter = skipSettings->parameters[i];
+			if (strcmp(parameter.name, "skip_power_hooks") != 0)
+				continue;
+			for (int32 j = 0; j < parameter.value_count; j++) {
+				if (strcmp(parameter.values[j], entry->name) == 0)
+					entry->skipped = true;
+			}
+		}
+		if ((flags & DEVICE_MANAGER_LIGHT_SLEEP) != 0
+			&& (entry->flags & DEVICE_MANAGER_POWER_HOOK_DEEP_SLEEP) != 0) {
+			entry->skipped = true;
+		}
+		if (entry->skipped) {
+			device_manager_suspend_trace("suspend hook %s: skipped",
+				entry->name);
+			continue;
+		}
 		suspend_step("device_manager: calling suspend hook %s\n",
 			entry->name);
 		status_t status = entry->hook(entry->cookie, false, state);
@@ -2722,6 +2797,8 @@ device_manager_suspend(int32 state, uint32 flags)
 		dprintf("device_manager: suspend hook %s: %s\n", entry->name,
 			strerror(status));
 	}
+
+	unload_driver_settings(settings);
 
 	if ((flags & DEVICE_MANAGER_SKIP_DEVICE_TREE) == 0)
 		suspend_nodes(state);
@@ -2738,11 +2815,14 @@ device_manager_resume(uint32 flags)
 	RecursiveLocker _(sLock);
 	if ((flags & DEVICE_MANAGER_SKIP_DEVICE_TREE) == 0)
 		resume_nodes();
+	sLightSleep = false;
 
 	PowerHookList::Iterator iterator = sPowerHooks.GetIterator();
 	while (power_hook* entry = iterator.Next()) {
 		if ((flags & DEVICE_MANAGER_SKIP_POWER_HOOKS) != 0)
 			break;
+		if (entry->skipped)
+			continue;
 		suspend_step("device_manager: calling resume hook %s\n", entry->name);
 		status_t status = entry->hook(entry->cookie, true, 0);
 		device_manager_suspend_trace("resume hook %s: %s", entry->name,

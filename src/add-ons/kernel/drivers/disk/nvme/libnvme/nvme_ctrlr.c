@@ -408,10 +408,16 @@ static inline int nvme_ctrlr_ready(struct nvme_ctrlr *ctrlr)
 /*
  * Set a controller state.
  */
+/* the kernel's suspend trace (kdevice_manager.h): a reset on resume that
+ * hangs leaves its last step behind */
+extern void device_manager_suspend_trace(const char* format, ...);
+
 static void nvme_ctrlr_set_state(struct nvme_ctrlr *ctrlr,
 				 enum nvme_ctrlr_state state,
 				 uint64_t timeout_in_ms)
 {
+	if (ctrlr->resetting)
+		device_manager_suspend_trace("nvme: state %d", state);
 	ctrlr->state = state;
 	if (timeout_in_ms == NVME_TIMEOUT_INFINITE)
 		ctrlr->state_timeout_ms = NVME_TIMEOUT_INFINITE;
@@ -892,14 +898,14 @@ static int nvme_ctrlr_unmap_bars(struct nvme_ctrlr *ctrlr)
  */
 static void nvme_ctrlr_fail(struct nvme_ctrlr *ctrlr)
 {
-	unsigned int i;
+	struct nvme_qpair *qpair;
 
 	ctrlr->failed = true;
 
 	nvme_qpair_fail(&ctrlr->adminq);
-	if (ctrlr->ioq)
-		for (i = 0; i < ctrlr->io_queues; i++)
-			nvme_qpair_fail(&ctrlr->ioq[i]);
+	/* (only the queue pairs in use were constructed) */
+	TAILQ_FOREACH(qpair, &ctrlr->active_io_qpairs, tailq)
+		nvme_qpair_fail(qpair);
 }
 
 /*
@@ -1007,6 +1013,8 @@ static int nvme_ctrlr_init(struct nvme_ctrlr *ctrlr)
 			if (ctrlr->quirks & NVME_QUIRK_DELAY_AFTER_RDY)
 				nvme_msleep(2000);
 
+			if (ctrlr->resetting)
+				device_manager_suspend_trace("nvme: starting");
 			ret = nvme_ctrlr_start(ctrlr);
 			if (ret)
 				nvme_err("Start controller failed\n");
@@ -1041,7 +1049,6 @@ static int nvme_ctrlr_init(struct nvme_ctrlr *ctrlr)
 static int nvme_ctrlr_reset(struct nvme_ctrlr *ctrlr)
 {
 	struct nvme_qpair *qpair;
-	unsigned int i;
 
 	if (ctrlr->resetting || ctrlr->failed)
 		/*
@@ -1054,9 +1061,14 @@ static int nvme_ctrlr_reset(struct nvme_ctrlr *ctrlr)
 	ctrlr->resetting = true;
 
 	/* Disable all queues before disabling the controller hardware. */
+	device_manager_suspend_trace("nvme: reset: CC %#x CSTS %#x",
+		nvme_reg_mmio_read_4(ctrlr, cc.raw),
+		nvme_reg_mmio_read_4(ctrlr, csts.raw));
 	nvme_qpair_disable(&ctrlr->adminq);
-	for (i = 0; i < ctrlr->io_queues; i++)
-		nvme_qpair_disable(&ctrlr->ioq[i]);
+	/* (only the queue pairs in use were constructed) */
+	TAILQ_FOREACH(qpair, &ctrlr->active_io_qpairs, tailq)
+		nvme_qpair_disable(qpair);
+	device_manager_suspend_trace("nvme: queues disabled");
 
 	/* Set the state back to INIT to cause a full hardware reset. */
 	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_INIT,
@@ -1072,6 +1084,7 @@ static int nvme_ctrlr_reset(struct nvme_ctrlr *ctrlr)
 
 	/* Reinitialize qpairs */
 	TAILQ_FOREACH(qpair, &ctrlr->active_io_qpairs, tailq) {
+		device_manager_suspend_trace("nvme: queue pair %u", qpair->id);
 		if (nvme_ctrlr_create_qpair(ctrlr, qpair) != 0)
 			nvme_ctrlr_fail(ctrlr);
 	}

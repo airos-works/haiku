@@ -40,6 +40,7 @@ public:
 	virtual						~DHCPClient();
 
 	virtual	status_t			Start();
+	virtual	void				KeepLease() { fKeepLease = true; }
 
 	virtual	void				MessageReceived(BMessage* message);
 
@@ -79,6 +80,7 @@ private:
 			bigtime_t			fRenewalTime;
 			bigtime_t			fRebindingTime;
 			bigtime_t			fLeaseTime;
+			bool				fKeepLease;
 			status_t			fStatus;
 };
 

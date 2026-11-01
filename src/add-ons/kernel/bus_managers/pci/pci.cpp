@@ -7,10 +7,12 @@
 
 
 #include <debug.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <algorithm>
 #include <KernelExport.h>
+#include <kdevice_manager.h>
 #include <util/kernel_cpp.h>
 #include <util/AutoLock.h>
 
@@ -3055,34 +3057,112 @@ PCI::RestoreConfiguration()
 }
 
 
+/*!	Suspend to idle keeps the devices powered, unless the SoC reaches its
+	deepest state (S0i3, on AMD): then some lose their configuration (their
+	BARs, the command register, a bridge's bus numbers), as Linux restores it
+	on every resume. It is saved for all of them, and written back only to
+	those that lost it: writing it under a running device would disturb it.
+	Functions their drivers suspended themselves are left to them.
+*/
+void
+PCI::SaveConfigurationForIdle()
+{
+	for (uint8 i = 0; i < fDomainCount; i++) {
+		if (fDomainData[i].bus != NULL)
+			_SaveConfigurationForIdle(fDomainData[i].bus);
+	}
+}
+
+
+void
+PCI::RestoreLostConfiguration()
+{
+	for (uint8 i = 0; i < fDomainCount; i++) {
+		if (fDomainData[i].bus != NULL)
+			_RestoreLostConfiguration(fDomainData[i].bus);
+	}
+}
+
+
+/*!	Suspends a single function for its driver, while the system suspends
+	to idle: its configuration is saved, and it enters \a state. A function
+	that lacks "No_Soft_Reset" resets itself on the way back to D0, and is
+	given its configuration back by ResumeDevice().
+*/
+status_t
+PCI::SuspendDevice(PCIDev *device, uint8 state)
+{
+	uint8 capability;
+	if (FindCapability(device, PCI_cap_id_pm, &capability) != B_OK)
+		return B_NOT_SUPPORTED;
+
+	_SaveDeviceConfiguration(device);
+	if (!device->config_saved)
+		return B_ERROR;
+
+	// From here on, ResumeDevice() brings it back, whatever state it is in.
+	device->suspended = true;
+	SetPowerstate(device, state);
+
+	// The function may take 10 ms to get there (PCI PM 1.2 § 5.6.1), and
+	// does not necessarily report the new state before.
+	snooze(10000);
+	if (GetPowerstate(device) != state) {
+		ResumeDevice(device);
+		return B_ERROR;
+	}
+	return B_OK;
+}
+
+
+status_t
+PCI::ResumeDevice(PCIDev *device)
+{
+	if (!device->suspended)
+		return B_OK;
+
+	device->suspended = false;
+	_RestoreDeviceConfiguration(device);
+	return (ReadConfig(device, PCI_vendor_id, 2) & 0xffff) != 0xffff
+		? B_OK : B_ERROR;
+}
+
+
+void
+PCI::_SaveDeviceConfiguration(PCIDev *device)
+{
+	for (uint16 i = 0; i < B_COUNT_OF(device->saved_config); i++)
+		device->saved_config[i] = ReadConfig(device, i * 4, 4);
+	device->config_saved = (device->saved_config[0] & 0xffff) != 0xffff;
+
+	msix_info *msix = &device->msix;
+	if (msix->configured_count > 0 && msix->table_address != 0) {
+		uint32 count = std::min(msix->configured_count, (uint32)32) * 4;
+		volatile uint32 *table = (uint32 *)msix->table_address;
+		for (uint32 i = 0; i < count; i++)
+			device->saved_msix_table[i] = table[i];
+	}
+
+	// Stop the device from asserting PME while the system sleeps: Haiku
+	// does not support waking from devices, and a device that keeps
+	// signalling wake-ups (a network card that was left in wake on LAN
+	// mode, for instance) wakes the machine again right away.
+	uint8 capability = saved_capability(device, PCI_cap_id_pm);
+	if (capability != 0) {
+		uint16 control = ReadConfig(device, capability + PCI_pm_status, 2);
+		if ((control & PCI_pm_status_pme_enable) != 0) {
+			WriteConfig(device, capability + PCI_pm_status, 2,
+				control & ~PCI_pm_status_pme_enable);
+		}
+	}
+}
+
+
 void
 PCI::_SaveConfiguration(PCIBus *bus)
 {
 	for (PCIDev *device = bus->child; device != NULL; device = device->next) {
-		for (uint16 i = 0; i < B_COUNT_OF(device->saved_config); i++)
-			device->saved_config[i] = ReadConfig(device, i * 4, 4);
-		device->config_saved = (device->saved_config[0] & 0xffff) != 0xffff;
-
-		msix_info *msix = &device->msix;
-		if (msix->configured_count > 0 && msix->table_address != 0) {
-			uint32 count = std::min(msix->configured_count, (uint32)32) * 4;
-			volatile uint32 *table = (uint32 *)msix->table_address;
-			for (uint32 i = 0; i < count; i++)
-				device->saved_msix_table[i] = table[i];
-		}
-
-		// Stop the device from asserting PME while the system sleeps: Haiku
-		// does not support waking from devices, and a device that keeps
-		// signalling wake-ups (a network card that was left in wake on LAN
-		// mode, for instance) wakes the machine again right away.
-		uint8 capability = saved_capability(device, PCI_cap_id_pm);
-		if (capability != 0) {
-			uint16 control = ReadConfig(device, capability + PCI_pm_status, 2);
-			if ((control & PCI_pm_status_pme_enable) != 0) {
-				WriteConfig(device, capability + PCI_pm_status, 2,
-					control & ~PCI_pm_status_pme_enable);
-			}
-		}
+		_SaveDeviceConfiguration(device);
 
 		if (device->child != NULL)
 			_SaveConfiguration(device->child);
@@ -3099,6 +3179,72 @@ PCI::_RestoreConfiguration(PCIBus *bus)
 
 		if (device->child != NULL)
 			_RestoreConfiguration(device->child);
+	}
+}
+
+
+void
+PCI::_SaveConfigurationForIdle(PCIBus *bus)
+{
+	for (PCIDev *device = bus->child; device != NULL; device = device->next) {
+		if (!device->suspended)
+			_SaveDeviceConfiguration(device);
+
+		if (device->child != NULL)
+			_SaveConfigurationForIdle(device->child);
+	}
+}
+
+
+bool
+PCI::_ConfigurationLost(PCIDev *device)
+{
+	uint16 decode = PCI_command_io | PCI_command_memory | PCI_command_master;
+	if ((ReadConfig(device, PCI_command, 2) & decode)
+			!= (saved_config16(device, PCI_command) & decode)) {
+		return true;
+	}
+
+	switch (saved_config8(device, PCI_header_type) & PCI_header_type_mask) {
+		case PCI_header_type_generic:
+			return ReadConfig(device, PCI_base_registers, 4)
+				!= saved_config32(device, PCI_base_registers);
+		case PCI_header_type_PCI_to_PCI_bridge:
+			return ReadConfig(device, PCI_primary_bus, 4)
+				!= saved_config32(device, PCI_primary_bus);
+	}
+	return false;
+}
+
+
+void
+PCI::_RestoreLostConfiguration(PCIBus *bus)
+{
+	for (PCIDev *device = bus->child; device != NULL; device = device->next) {
+		if (device->config_saved && !device->suspended
+			&& _ConfigurationLost(device)) {
+			// (only displays and network controllers are written back
+			// yet: to learn what else loses it without touching the disks)
+			uint8 classBase = saved_config8(device, PCI_class_base);
+			bool restore = classBase == PCI_display || classBase == PCI_network;
+			char text[160];
+			snprintf(text, sizeof(text), "pci: %02x:%02x.%x lost its "
+				"configuration (command %#" B_PRIx32 ", was %#" B_PRIx16
+				", bar0 %#" B_PRIx32 ", was %#" B_PRIx32 ")%s", device->bus,
+				device->device, device->function,
+				ReadConfig(device, PCI_command, 2),
+				saved_config16(device, PCI_command),
+				ReadConfig(device, PCI_base_registers, 4),
+				saved_config32(device, PCI_base_registers),
+				restore ? ", restoring it" : "");
+			dprintf("%s\n", text);
+			device_manager_suspend_trace("%s", text);
+			if (restore)
+				_RestoreDeviceConfiguration(device);
+		}
+
+		if (device->child != NULL)
+			_RestoreLostConfiguration(device->child);
 	}
 }
 
@@ -3224,6 +3370,12 @@ PCI::_RestoreDeviceConfiguration(PCIDev *device)
 			volatile uint32 *table = (uint32 *)msix->table_address;
 			for (uint32 i = 0; i < count; i++)
 				table[i] = device->saved_msix_table[i];
+			device_manager_suspend_trace("pci: %02x:%02x.%x MSI-X: %" B_PRIu32
+				" vectors back, the first %#" B_PRIx32 "/%#" B_PRIx32
+				" (saved %#" B_PRIx32 "/%#" B_PRIx32 ")", device->bus,
+				device->device, device->function, count / 4, table[0],
+				table[2], device->saved_msix_table[0],
+				device->saved_msix_table[2]);
 		}
 		WriteConfig(device, msixCapability + PCI_msix_control, 2, msixControl);
 	}

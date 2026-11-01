@@ -757,7 +757,8 @@ ECMDevice::_NotifyCallback(void *cookie, int32 status, void *data,
 	is powered down while the interface is down. A PHY that was powered down
 	needs the data interface reset that Open() does before frames flow again.
 	Suspended (U3), the adapter powers the PHY up again on its own, whatever
-	its wake-on-LAN settings say: the bus keeps it awake meanwhile.
+	its wake-on-LAN settings say: the bus keeps it awake meanwhile, in a light
+	sleep (in a deep one, the SoC's deepest state comes first).
 */
 bool
 ECMDevice::_HasRealtekPHY() const

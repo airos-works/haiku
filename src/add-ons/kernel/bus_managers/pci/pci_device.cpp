@@ -154,5 +154,11 @@ pci_device_module_info gPCIDeviceModule = {
 	},
 	.enable_msix = [](pci_device *device) {
 		return gPCI->EnableMSIX(device->device);
+	},
+	.suspend_device = [](pci_device *device, uint8 state) {
+		return gPCI->SuspendDevice(device->device, state);
+	},
+	.resume_device = [](pci_device *device) {
+		return gPCI->ResumeDevice(device->device);
 	}
 };

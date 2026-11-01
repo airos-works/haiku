@@ -23,6 +23,7 @@
 #include <kdevice_manager.h>
 #include <ACPI.h>
 #include <bus/PCI.h>
+#include <driver_settings.h>
 #include <vm/vm.h>
 
 #include "IORequest.h"
@@ -128,6 +129,20 @@ typedef struct {
 	rw_lock					suspend_lock;
 		// read locked for every command, write locked while suspended
 	bool					suspended;
+
+	pci_device_module_info*	pci;
+	pci_device*				pci_device_cookie;
+	bool					idle_d3;
+		// "s2idle_d3" in the nvme_disk driver settings (the default with
+		// AMD's processors): D3 in a suspend to idle, as the platform's low
+		// power constraints ask
+	bool					in_idle_d3;
+	volatile uint32*		msix_table;
+	area_id					msix_area;
+	uint32					msix_saved[4];
+		// the first MSI-X vector (the only one in use): some controllers
+		// clear their table on a reset (CC.EN), which Linux does not notice
+		// as it sets up its vectors again after every reset
 
 	ConditionVariable		interrupt;
 	uint32					interrupt_id;
@@ -267,6 +282,18 @@ nvme_disk_configure_features(nvme_disk_driver_info* info)
 }
 
 
+/*!	D3 in a suspend to idle is the default with AMD's processors, as Linux
+	has it there (acpi_storage_d3(): their platforms ask for it, and their
+	S0i3 takes the disk's power): "s2idle_d3 false" turns it off. */
+static bool
+idle_d3_default()
+{
+	cpuid_info cpuid;
+	return get_cpuid(&cpuid, 0, 0) == B_OK
+		&& memcmp(cpuid.eax_0.vendor_id, "AuthenticAMD", 12) == 0;
+}
+
+
 static status_t
 nvme_disk_init_device(void* _info, void** _cookie)
 {
@@ -281,6 +308,15 @@ nvme_disk_init_device(void* _info, void** _cookie)
 		(void**)&pcidev);
 	pci->get_pci_info(pcidev, &info->info);
 	sDeviceManager->put_node(parent);
+	info->pci = pci;
+	info->pci_device_cookie = pcidev;
+	info->in_idle_d3 = false;
+	info->msix_table = NULL;
+	info->msix_area = -1;
+	void* settings = load_driver_settings("nvme_disk");
+	info->idle_d3 = get_driver_boolean_parameter(settings, "s2idle_d3",
+		idle_d3_default(), true);
+	unload_driver_settings(settings);
 
 	// construct the libnvme pci_device struct
 	pci_device* device = new pci_device;
@@ -487,6 +523,8 @@ nvme_disk_uninit_device(void* _cookie)
 
 	rw_lock_destroy(&info->rounded_write_lock);
 	rw_lock_destroy(&info->suspend_lock);
+	if (info->msix_area >= 0)
+		delete_area(info->msix_area);
 
 	nvme_ns_close(info->ns);
 	nvme_ctrlr_close(info->ctrlr);
@@ -1321,6 +1359,69 @@ nvme_disk_uninit_driver(void* _cookie)
 }
 
 
+static volatile uint32*
+msix_table(nvme_disk_driver_info* info)
+{
+	if (info->msix_table != NULL)
+		return info->msix_table;
+
+	uint8 capability;
+	if (info->pci->find_pci_capability(info->pci_device_cookie,
+			PCI_cap_id_msix, &capability) != B_OK) {
+		return NULL;
+	}
+	uint32 table = info->pci->read_pci_config(info->pci_device_cookie,
+		capability + PCI_msix_table, 4);
+	uint8 bar = table & PCI_msix_bir_mask;
+	pci_info& pciInfo = info->info;
+	uint64 address = pciInfo.u.h0.base_registers[bar];
+	if ((pciInfo.u.h0.base_register_flags[bar] & PCI_address_type)
+			== PCI_address_type_64) {
+		address |= (uint64)pciInfo.u.h0.base_registers[bar + 1] << 32;
+	}
+	address += table & PCI_msix_offset_mask;
+
+	void* mapped;
+	info->msix_area = map_physical_memory("nvme msi-x table",
+		address & ~(B_PAGE_SIZE - 1), B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &mapped);
+	if (info->msix_area < 0)
+		return NULL;
+	info->msix_table = (volatile uint32*)((addr_t)mapped
+		+ (address & (B_PAGE_SIZE - 1)));
+	return info->msix_table;
+}
+
+
+static void
+save_msix_vector(nvme_disk_driver_info* info)
+{
+	volatile uint32* table = msix_table(info);
+	if (table == NULL)
+		return;
+	for (int i = 0; i < 4; i++)
+		info->msix_saved[i] = table[i];
+}
+
+
+static void
+restore_msix_vector(nvme_disk_driver_info* info)
+{
+	volatile uint32* table = msix_table(info);
+	if (table == NULL || info->msix_saved[0] == 0)
+		return;
+	if (table[0] == info->msix_saved[0] && table[2] == info->msix_saved[2])
+		return;
+	// masked while it is written, as the PCI specification asks
+	table[3] = info->msix_saved[3] | 1;
+	for (int i = 0; i < 3; i++)
+		table[i] = info->msix_saved[i];
+	table[3] = info->msix_saved[3];
+	device_manager_suspend_trace("nvme: MSI-X vector written back "
+		"(%#" B_PRIx32 "/%#" B_PRIx32 ")", table[0], table[2]);
+}
+
+
 static status_t
 nvme_disk_suspend(void* _cookie, int32 state)
 {
@@ -1330,8 +1431,32 @@ nvme_disk_suspend(void* _cookie, int32 state)
 
 	// Suspend to idle keeps the controller powered; autonomous power state
 	// transitions already take it to its lowest power state when it idles.
-	if (state == ACPI_POWER_STATE_ON)
+	// With "s2idle_d3", the function goes to D3hot as well, shut down first
+	// and reset when it is back, as Linux' "simple suspend": in the SoC's
+	// deepest state (S0i3) it loses its power, and its queues with it.
+	if (state == ACPI_POWER_STATE_ON) {
+		// (read again, so that a change applies to the next sleep)
+		void* settings = load_driver_settings("nvme_disk");
+		info->idle_d3 = get_driver_boolean_parameter(settings, "s2idle_d3",
+			idle_d3_default(), true);
+		unload_driver_settings(settings);
+		if (!info->idle_d3 || info->pci->suspend_device == NULL)
+			return B_OK;
+
+		nvme_disk_flush(info);
+		rw_lock_write_lock(&info->suspend_lock);
+		save_msix_vector(info);
+		nvme_ctrlr_suspend(info->ctrlr);
+		status_t status = info->pci->suspend_device(info->pci_device_cookie,
+			PCI_pm_state_d3);
+		if (status != B_OK) {
+			TRACE_ALWAYS("no D3 while suspended to idle: %s\n",
+				strerror(status));
+		} else
+			info->in_idle_d3 = true;
+		info->suspended = true;
 		return B_OK;
+	}
 
 	// Wait for pending commands; new ones are blocked until resumed.
 	rw_lock_write_lock(&info->suspend_lock);
@@ -1346,6 +1471,14 @@ static status_t
 nvme_disk_resume(void* _cookie)
 {
 	nvme_disk_driver_info* info = (nvme_disk_driver_info*)_cookie;
+	if (info->ctrlr != NULL && info->in_idle_d3) {
+		info->in_idle_d3 = false;
+		device_manager_suspend_trace("nvme: to D0");
+		status_t status = info->pci->resume_device(info->pci_device_cookie);
+		device_manager_suspend_trace("nvme: in D0: %s", strerror(status));
+		if (status != B_OK)
+			TRACE_ERROR("back from D3: %s\n", strerror(status));
+	}
 	if (info->ctrlr == NULL || !info->suspended)
 		return B_OK;
 	info->suspended = false;
@@ -1356,8 +1489,10 @@ nvme_disk_resume(void* _cookie)
 	if (result != 0) {
 		TRACE_ERROR("resuming the controller failed!\n");
 		status = B_IO_ERROR;
-	} else
+	} else {
+		restore_msix_vector(info);
 		nvme_disk_configure_features(info);
+	}
 
 	rw_lock_write_unlock(&info->suspend_lock);
 	return status;
