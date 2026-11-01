@@ -1374,3 +1374,19 @@ page's own counter agreed without the MCP inspector):
 The web process's main thread is one full core (about 8 us a fish, WebKit,
 ANGLE and Mesa's front end); Mesa's glthread cannot help, Panfrost does not
 claim `map_unsynchronized_thread_safe`.
+
+### Performance round (2026-11-01, later)
+
+| Change | Where | Aquarium (1776x883) |
+| --- | --- | --- |
+| Before (limits fixed) | | 15k 8.4, 30k 4.4 fps |
+| glthread for Panfrost (thread-safe unsynchronized maps, Haiku EGL hook) | airos-works/mesa rock5-perf | 15k 16.6-18.2, 30k 8.6-10.4 fps |
+| Disk shader cache (+ zlib) | mesa + rock5-itx/mesa/sources.json | load time; `~/.cache/mesa_shader_cache` |
+| GPU at 351 MHz while running (was 175.5) | mali_csf FullClockOperation | GPU worker 81% -> 48% busy; Aquarium now main-thread bound |
+
+Measured and not changed: keeping cached BOs' CPU mappings (no gain in an
+A/B); VM bind cost (one bind in three seconds at steady state); 702 MHz
+(group suspends time out); 64 KiB suspend slots (the same). Queue
+switching costs about 1.1 ms (2% of the time at 30k fish). A direct
+present like the Pi's (haiku#49) and an asynchronous runtime remain open;
+neither limits the Aquarium now: Summit's main thread does (summit#139).

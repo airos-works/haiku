@@ -9,6 +9,10 @@ namespace MaliCSF {
 
 static const uint32_t kRuntimeInterfaceAddress = 0x04010000;
 static const uint32_t kRuntimeSuspendAddress = 0x04100000;
+// The G610's firmware says a group's suspend buffer takes 25,600 bytes
+// (normal and protected), but with 64 KiB slots a group suspend timed out
+// after some 5000 jobs (engine error 5); with 1 MiB, 60,000 and more ran.
+// QueueEngine::Run() refuses firmware that asks for more than this.
 static const uint32_t kRuntimeSuspendBytes = 1024 * 1024;
 static const uint32_t kRuntimeProtectedAddress = 0x05a00000;
 static_assert(kRuntimeInterfaceAddress + kMaxRuntimeQueues * 8192 <= kRuntimeSuspendAddress

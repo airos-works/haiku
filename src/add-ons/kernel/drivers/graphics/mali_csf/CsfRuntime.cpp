@@ -66,6 +66,58 @@ DeleteJob(QueueJob* job)
 }
 
 class Runtime;
+
+
+/*!	Runs the queue engine with the GPU at half of SPLL, 351 MHz. The bounded
+	power cycle (CsfPower.h) powers the domain at a quarter of it, the
+	precaution of bring-up; that stays as it was qualified, and this raises
+	the divider only once firmware is up and lowers it again before the
+	firmware is torn down and the domain powered off. The WebGL Aquarium had
+	the hardware worker busy 81% of the time at 175 MHz.
+
+	Not 702 MHz: there, after a few hundred to two thousand jobs, a group
+	suspend timed out every time (engine error 5), though EDK2 is said to set
+	vdd_gpu_s0 to 750 mV, where Linux's rk3588-opp.dtsi runs 800 MHz; the
+	supply is not measured. Linux runs 300-600 MHz at its lowest, 675 mV.
+	Only SPLL with the PVTPLL path off is raised (the state EDK2 leaves). */
+static const uint32_t kRunClockDivider = 2;
+
+template<typename Engine>
+class FullClockOperation {
+public:
+	explicit FullClockOperation(Engine& engine) : fEngine(engine) {}
+	uint32_t CompletedAddressSpaces() const { return fEngine.CompletedAddressSpaces(); }
+	template<typename IO> bool Run(IO& io, FirmwareMemory& memory, FirmwareRunInfo& info)
+	{
+		uint32_t select = io.ReadClock(kClockSelectOffsets[0]);
+		if ((select & 0x40e0) == 0x80 && (select & 31) == 3) {
+			io.WriteClock(kClockSelectOffsets[0], 0x001f0000 | (kRunClockDivider - 1));
+			fRaised = (io.ReadClock(kClockSelectOffsets[0]) & 31) == kRunClockDivider - 1;
+			static bool sLogged = false;
+			if (!sLogged) {
+				sLogged = true;
+				dprintf("mali_csf: GPU clock %s %u MHz while running (selector"
+					" %#x)\n", fRaised ? "at" : "NOT raised to",
+					(unsigned)(702 / kRunClockDivider),
+					(unsigned)io.ReadClock(kClockSelectOffsets[0]));
+			}
+		}
+		return fEngine.Run(io, memory, info);
+	}
+	template<typename IO> bool BeforeStop(IO& io) { return fEngine.BeforeStop(io); }
+	template<typename IO> bool Cleanup(IO& io, bool stopped)
+	{
+		if (fRaised) {
+			io.WriteClock(kClockSelectOffsets[0], 0x001f0003);
+			fRaised = false;
+		}
+		return fEngine.Cleanup(io, stopped);
+	}
+
+private:
+	Engine& fEngine;
+	bool fRaised = false;
+};
 static Runtime* sRuntime;
 static void PutRuntime(Runtime* runtime);
 
@@ -176,6 +228,17 @@ public:
 		queue.current = NULL;
 		queue.pending--;
 		changed.NotifyAll();
+		if (engine != NULL && engine->Stats().jobs % 5000 == 0)
+			LogStats(engine->Stats());
+	}
+	static void LogStats(const QueueEngineStats& stats)
+	{
+		int64_t span = stats.lastMicros - stats.firstMicros;
+		dprintf("mali_csf: %" B_PRIu64 " jobs, %" B_PRIu64 " queue switches;"
+			" selecting %" B_PRId64 " us, running %" B_PRId64 " us of %" B_PRId64
+			" us (%" B_PRId64 "%% busy)\n", stats.jobs, stats.switches,
+			stats.selectMicros, stats.submitMicros, span,
+			span > 0 ? (stats.selectMicros + stats.submitMicros) * 100 / span : 0);
 	}
 	void Destroyed(unsigned slot)
 	{
@@ -217,9 +280,17 @@ public:
 		Runtime* runtime = (Runtime*)data;
 		status_t status = runtime->hardware.Init(runtime->resources);
 		QueueEngine<Runtime> engine(*runtime);
+		runtime->engine = &engine;
 		FirmwareRecovery recovery(StopAdmission, runtime);
 		if (status == B_OK)
-			CycleFirmware(runtime->hardware, runtime->memory, runtime->firmware, engine, &recovery);
+		{
+			FullClockOperation<QueueEngine<Runtime>> operation(engine);
+			CycleFirmware(runtime->hardware, runtime->memory, runtime->firmware, operation,
+				&recovery);
+		}
+		runtime->engine = NULL;
+		if (engine.Stats().jobs > 0)
+			LogStats(engine.Stats());
 		bool retained = (runtime->firmware.flags & kFirmwareNeedsRecovery) != 0
 			|| (engine.Mapped() && !recovery.recovered);
 		if (status == B_OK && (retained || !runtime->ready || engine.Error() != 0
@@ -282,6 +353,7 @@ public:
 	}
 
 	ResourceInfo resources;
+	QueueEngine<Runtime>* engine = NULL;	// while the worker runs
 	FirmwareHardware hardware;
 	FirmwareImage image;
 	FirmwareMemory memory;
