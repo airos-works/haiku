@@ -123,11 +123,27 @@ public:
 				// Profiles 0 and 2 on RKVDEC; MPP's parser splits superframes.
 				fCoding = MPP_VIDEO_CodingVP9;
 				break;
+			// On VDPU2 (VPU121). MPP's parsers split the pictures out of a
+			// packet themselves (packed B-frames of DivX/XviD AVIs too); the
+			// sequence or VOL header in the container's codec data goes in
+			// front of the first packet and the first after a seek.
+			case AV_CODEC_ID_MPEG1VIDEO:
+			case AV_CODEC_ID_MPEG2VIDEO:
+				fCoding = MPP_VIDEO_CodingMPEG2;
+				break;
+			case AV_CODEC_ID_MPEG4:
+				fCoding = MPP_VIDEO_CodingMPEG4;
+				break;
 			default:
 				return B_NOT_SUPPORTED;
 		}
 		fCodecId = (AVCodecID)description.u.misc.codec;
 		fInputFormat = *format;
+		if ((fCoding == MPP_VIDEO_CodingMPEG2 || fCoding == MPP_VIDEO_CodingMPEG4)
+			&& info != NULL && infoSize > 0) {
+			fHeaders.assign((const uint8_t*)info, (const uint8_t*)info + infoSize);
+		}
+		fHeadersDue = !fHeaders.empty();
 		fprintf(stderr, "RockchipMppDecoder: codec=%d extra=%zu\n",
 			(int)fCodecId, infoSize);
 
@@ -217,6 +233,7 @@ public:
 		}
 		if (fBsf != NULL)
 			av_bsf_flush(fBsf);
+		fHeadersDue = !fHeaders.empty();
 		fPending.clear();
 		fHasPending = false;
 		fEndOfInput = false;
@@ -312,6 +329,10 @@ private:
 		if (fBsf == NULL) {
 			if (fCoding == MPP_VIDEO_CodingAV1)
 				bytes.assign({0x12, 0x00});
+			if (fHeadersDue) {
+				bytes.assign(fHeaders.begin(), fHeaders.end());
+				fHeadersDue = false;
+			}
 			const uint8_t* source = static_cast<const uint8_t*>(chunk);
 			bytes.insert(bytes.end(), source, source + size);
 			return B_OK;
@@ -726,6 +747,8 @@ private:
 	MppApi* fApi = NULL;
 	MppBufferGroup fFrameGroup = NULL;
 	AVBSFContext* fBsf = NULL;
+	std::vector<uint8_t> fHeaders;	// MPEG-1/2/4 sequence or VOL header
+	bool fHeadersDue = false;
 	SwsContext* fSws = NULL;
 	MppFrame fHeldFrame = NULL;
 	std::vector<uint8_t> fNarrow;
@@ -757,7 +780,7 @@ public:
 
 	status_t GetSupportedFormats(media_format** formats, size_t* count) override
 	{
-		static media_format supported[4];
+		static media_format supported[7];
 		static size_t supportedCount = 0;
 		static bool initialized = false;
 		if (!initialized) {
@@ -772,9 +795,10 @@ public:
 				return B_OK;
 			}
 			const AVCodecID codecs[] = {AV_CODEC_ID_H264, AV_CODEC_ID_HEVC,
-				AV_CODEC_ID_AV1, AV_CODEC_ID_VP9};
+				AV_CODEC_ID_AV1, AV_CODEC_ID_VP9, AV_CODEC_ID_MPEG1VIDEO,
+				AV_CODEC_ID_MPEG2VIDEO, AV_CODEC_ID_MPEG4};
 			BMediaFormats registry;
-			for (size_t index = 0; index < 4; index++) {
+			for (size_t index = 0; index < B_COUNT_OF(codecs); index++) {
 				media_format_description description = {};
 				description.family = B_MISC_FORMAT_FAMILY;
 				description.u.misc.file_format = 'ffmp';
@@ -786,7 +810,7 @@ public:
 					return B_ERROR;
 				supported[index] = format;
 			}
-			supportedCount = 4;
+			supportedCount = B_COUNT_OF(codecs);
 			initialized = true;
 		}
 		*formats = supported;

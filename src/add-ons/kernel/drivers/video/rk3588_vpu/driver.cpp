@@ -43,6 +43,7 @@ struct Controller {
 	bool decodeEnabled;
 	bool av1DecodeEnabled;
 	bool encodeEnabled;
+	bool vdpu2DecodeEnabled;
 	MppValidationStats mppStats;
 
 	// Decoding sessions. Cycling the domains around every job cost tens of
@@ -70,6 +71,9 @@ struct Controller {
 	int32_t encodeClients;
 	area_id rkvenc0Area;
 	void* rkvenc0Registers;
+	area_id vdpu2Area;
+	void* vdpu2Registers;
+	bool vdpu2Decodes;		// a VDPU2 job ran in the current VDPU session
 	uint32_t encodeJobs;
 	bigtime_t encodeTime;
 	bigtime_t slowestEncode;
@@ -601,6 +605,150 @@ ValidateMppJob(OpenHandle* opened, const MppServiceRequest* userRequests)
 		trial.lastStatus == B_OK ? "enabled" : "disabled");
 	return trial.lastStatus;
 }
+
+// #pragma mark - VDPU2 (VPU121) jobs
+
+
+// The Hantro decoder bank at 0xfdb50400 (Linux rk3588-base.dtsi vpu121 and
+// hantro's rk3568 variant, dec_offset 0x400), its IOMMU at 0xfdb50800.
+// MPP's vdpu2 HALs write and read the 159 words whole; BSP mpp_vdpu2.c.
+static const uint64_t kVdpu2Base = 0xfdb50000;
+static const uint32_t kVdpu2Registers = 159;
+static const uint32_t kVdpu2SystemControl = 53;	// low four bits: format
+static const uint32_t kVdpu2Interrupt = 55;
+static const uint32_t kVdpu2Enable = 57;
+static const uint32_t kVdpu2SoftReset = 58;
+static const uint32_t kVdpu2Stream = 64;
+static const uint32_t kVdpu2InterruptRaw = 1u << 0;
+// timeout, stream error, ASO error, buffer empty, bus error
+static const uint32_t kVdpu2Errors = (1u << 13) | (1u << 12) | (1u << 8)
+	| (1u << 6) | (1u << 5);
+
+
+/*!	The formats admitted, and their address registers (BSP mpp_vdpu2.c's
+	trans_tbl_default): MPEG-4 (1), H.263 (2), MPEG-2 (5), MPEG-1 (6). */
+static bool
+IsVdpu2Format(uint32_t format)
+{
+	return format == 1 || format == 2 || format == 5 || format == 6;
+}
+
+
+static bool
+IsVdpu2AddressRegister(uint32_t index)
+{
+	return index == 61 || index == 62 || index == 63 || index == 64
+		|| index == 131 || index == 134 || index == 135 || index == 148;
+}
+
+
+/*!	The processor writes the quantiser/slice table (61) and the stream (64)
+	and reads the picture decoded (63); references (131, 134, 135, 148) and
+	direct-mode motion vectors (62) pass only between jobs. */
+static bool
+IsSharedVdpu2Register(uint32_t index)
+{
+	return index == 61 || index == 63 || index == 64;
+}
+
+
+/*!	MPP_IOC_CFG_V1 requests for VDPU2 into the handle's job (MppPendingJob,
+	whose readAddress/readBytes take the one read-back). With sHardwareLock
+	held. */
+static status_t
+ValidateVdpu2Job(OpenHandle* opened, const MppServiceRequest* userRequests)
+{
+	MppPendingJob job = {};
+	struct OffsetEntry { uint32_t index; uint32_t offset; } offsets[64] = {};
+	uint32_t offsetCount = 0;
+	uint32_t writes = 0, reads = 0;
+	bool last = false;
+	for (uint32_t index = 0; index < 16 && !last; index++) {
+		MppServiceRequest request;
+		status_t status = user_memcpy(&request, userRequests + index,
+			sizeof(request));
+		if (status != B_OK)
+			return status;
+		if ((request.flags & ~(uint32_t)0x17) != 0
+			|| request.dataAddress == 0 || request.bytes == 0
+			|| (request.bytes & 3) != 0 || (request.offset & 3) != 0)
+			return B_BAD_VALUE;
+		uint32_t first = request.offset / 4;
+		uint32_t words = request.bytes / 4;
+		bool inside = first < kVdpu2Registers
+			&& words <= kVdpu2Registers - first;
+		switch (request.command) {
+			case 0x200:
+				if (!inside)
+					return B_BAD_VALUE;
+				status = user_memcpy(&job.registers[first],
+					(const void*)(addr_t)request.dataAddress, request.bytes);
+				if (status != B_OK)
+					return status;
+				for (uint32_t word = first; word < first + words; word++)
+					job.written[word / 32] |= 1u << (word % 32);
+				writes++;
+				break;
+			case 0x201:
+				if (!inside || first != 0 || reads != 0)
+					return B_BAD_VALUE;
+				job.readAddress = request.dataAddress;
+				job.readBytes = request.bytes;
+				reads++;
+				break;
+			case 0x202:
+				if (request.offset != 0 || request.bytes > sizeof(offsets))
+					return B_BAD_VALUE;
+				offsetCount = request.bytes / sizeof(OffsetEntry);
+				status = user_memcpy(offsets,
+					(const void*)(addr_t)request.dataAddress, request.bytes);
+				if (status != B_OK)
+					return status;
+				break;
+			case 0x203:
+				if (request.offset != 0 || request.bytes > 32 * 8)
+					return B_BAD_VALUE;
+				break;
+			default:
+				return B_NOT_SUPPORTED;
+		}
+		last = (request.flags & 2) != 0;
+	}
+	if (!last || writes == 0 || reads != 1
+		|| (job.written[kVdpu2Enable / 32] & (1u << (kVdpu2Enable % 32))) == 0
+		|| !IsVdpu2Format(job.registers[kVdpu2SystemControl] & 0xf))
+		return B_BAD_VALUE;
+
+	DmaBuffer* targets[kVdpu2Registers] = {};
+	for (uint32_t index = 0; index < kVdpu2Registers; index++) {
+		if (!IsVdpu2AddressRegister(index)
+			|| (job.written[index / 32] & (1u << (index % 32))) == 0
+			|| job.registers[index] == 0)
+			continue;
+		DmaBuffer* allocation = FindTeamBuffer(opened->owner,
+			job.registers[index]);
+		if (allocation == NULL || allocation->physical > UINT32_MAX
+			|| allocation->bytes > UINT32_MAX - allocation->physical)
+			return B_ENTRY_NOT_FOUND;
+		job.registers[index] = (uint32_t)allocation->physical;
+		targets[index] = allocation;
+		RememberJobBuffer(job, allocation, IsSharedVdpu2Register(index));
+	}
+	for (uint32_t index = 0; index < offsetCount; index++) {
+		uint32_t target = offsets[index].index;
+		if (target >= kVdpu2Registers || targets[target] == NULL)
+			return B_BAD_VALUE;
+		DmaBuffer* allocation = targets[target];
+		if (job.registers[target] + (uint64_t)offsets[index].offset
+				>= allocation->physical + allocation->bytes)
+			return B_BAD_VALUE;
+		job.registers[target] += offsets[index].offset;
+	}
+	job.valid = true;
+	opened->mppJob = job;
+	return B_OK;
+}
+
 
 static const size_t kMaximumBufferBytes = 32 * 1024 * 1024;
 // MPP keeps up to 35 pictures for an H.264 stream: 146 MiB at 1080p.
@@ -1672,6 +1820,77 @@ public:
 		return B_OK;
 	}
 
+	/*!	One VDPU2 picture, as BSP mpp_vdpu2.c vdpu_run()/vdpu_irq()/
+		vdpu_finish() do it, polled: the IOMMU in bypass, the enable word
+		last with the start bit, the raw interrupt bit awaited. MPP reads the
+		interrupt status back for word 55 and the stream length consumed,
+		shifted by ten, for word 64. A picture the decoder finished with
+		error bits still completes (MPP judges it); the block is reset. */
+	status_t RunVdpu2Job(const MppPendingJob& job, void* mapped)
+	{
+		if (!job.valid || mapped == NULL || job.readBytes == 0
+			|| job.readBytes > kVdpu2Registers * 4)
+			return B_BAD_VALUE;
+		Snapshot state = SnapshotNow();
+		if ((state.repairStatus & kVdpuRepair) == 0
+			|| (state.powerStatus & kVdpuGate) != 0
+			|| (state.idleStatus & kVdpuIdle) != 0
+			|| (ReadClock(0x8b0) & 0x300) != 0)	// ACLK_VPU, HCLK_VPU
+			return B_NOT_ALLOWED;
+		volatile uint32_t* registers
+			= (volatile uint32_t*)((uint8_t*)mapped + 0x400);
+		const volatile uint32_t* iommu
+			= (const volatile uint32_t*)((uint8_t*)mapped + 0x800);
+		memory_read_barrier();
+		if (iommu[0] != 0 || (iommu[1] & 1) != 0)
+			return B_NOT_ALLOWED;
+		for (uint32_t index = 0; index < kVdpu2Registers; index++) {
+			if (index == kVdpu2Enable
+				|| (job.written[index / 32] & (1u << (index % 32))) == 0)
+				continue;
+			registers[index] = job.registers[index];
+		}
+		memory_write_barrier();
+		registers[kVdpu2Enable] = job.registers[kVdpu2Enable] | 1;
+		memory_write_barrier();
+		uint32_t status = 0;
+		bigtime_t deadline = system_time() + 500000;
+		do {
+			memory_read_barrier();
+			status = registers[kVdpu2Interrupt];
+			if ((status & kVdpu2InterruptRaw) != 0)
+				break;
+			snooze(50);
+		} while (system_time() < deadline);
+		uint32_t readback[kVdpu2Registers];
+		for (uint32_t index = 0; index < job.readBytes / 4; index++)
+			readback[index] = registers[index];
+		readback[kVdpu2Interrupt] = status;
+		uint32_t consumed = registers[kVdpu2Stream]
+			- job.registers[kVdpu2Stream];
+		if (job.readBytes / 4 > kVdpu2Stream)
+			readback[kVdpu2Stream] = consumed << 10;
+		registers[kVdpu2Interrupt] = 0;
+		registers[kVdpu2Enable] = 1u << 4;	// clock gating, as the BSP does
+		memory_write_barrier();
+		bool finished = (status & kVdpu2InterruptRaw) != 0;
+		if (!finished || (status & kVdpu2Errors) != 0) {
+			registers[kVdpu2Enable] = 0;
+			registers[kVdpu2Interrupt] = 0;
+			registers[kVdpu2SoftReset] = 1;
+			memory_write_barrier();
+			bigtime_t resetDeadline = system_time() + 1000;
+			while (registers[kVdpu2SoftReset] != 0
+				&& system_time() < resetDeadline) {
+			}
+		}
+		status_t result = user_memcpy((void*)(addr_t)job.readAddress,
+			readback, job.readBytes);
+		if (result != B_OK)
+			return result;
+		return finished ? B_OK : B_TIMED_OUT;
+	}
+
 	// Copies the status words MPP asked for, after a job.
 	status_t ReadRkvencResults(const EncoderJob& job, void* mapped,
 		uint32_t interruptStatus)
@@ -1806,6 +2025,47 @@ EnsureDecoderPowered(Controller* controller, bool rkvdec)
 			return area;
 		}
 	}
+	return B_OK;
+}
+
+
+// With sHardwareLock held: VDPU alone (VPU121 is the domain's own block),
+// and VPU121's registers mapped once.
+static status_t
+EnsureVdpu2Powered(Controller* controller)
+{
+	if (controller->hardware == NULL) {
+		PowerHardware* hardware = new(std::nothrow) PowerHardware;
+		if (hardware == NULL)
+			return B_NO_MEMORY;
+		status_t status = hardware->Init(controller->resources);
+		if (status != B_OK) {
+			delete hardware;
+			return status;
+		}
+		controller->hardware = hardware;
+	}
+	if (!controller->vdpuPowered) {
+		if (!PowerOnVdpu(*controller->hardware, controller->vdpuSession)) {
+			PowerOffVdpu(*controller->hardware, controller->vdpuSession);
+			dprintf("rk3588_vpu: VDPU did not power up: %u/%u\n",
+				controller->vdpuSession.result,
+				controller->vdpuSession.restoreResult);
+			return B_ERROR;
+		}
+		controller->vdpuPowered = true;
+	}
+	if (controller->vdpu2Registers == NULL) {
+		controller->vdpu2Area = map_physical_memory("VPU121 registers",
+			kVdpu2Base, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY,
+			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
+			&controller->vdpu2Registers);
+		if (controller->vdpu2Area < B_OK) {
+			controller->vdpu2Registers = NULL;
+			return controller->vdpu2Area;
+		}
+	}
+	controller->vdpu2Decodes = true;
 	return B_OK;
 }
 
@@ -1967,6 +2227,7 @@ InitDriver(device_node* node, void** cookie)
 	controller->rkvdec0Area = -1;
 	controller->av1Area = -1;
 	controller->rkvenc0Area = -1;
+	controller->vdpu2Area = -1;
 	size_t poolMegabytes = 0;
 	device_node* parent = sDeviceManager->get_parent_node(node);
 	bool valid = ReadResources(parent, controller->resources);
@@ -1992,6 +2253,11 @@ InitDriver(device_node* node, void** cookie)
 		// Installations made before the encoder have the decoder's profile
 		// but no encode_profile line (the settings file is copied once):
 		// they encode too, unless the line names something else ("off").
+		// VPU121 (MPEG-1/2/4, H.263) lives in VDPU, the qualified parent of
+		// RKVDEC0; vdpu2_profile "off" keeps it out.
+		profile = get_driver_parameter(settings, "vdpu2_profile", "", "");
+		controller->vdpu2DecodeEnabled = controller->decodeEnabled
+			&& strcmp(profile, "off") != 0;
 		profile = get_driver_parameter(settings, "encode_profile", "", "");
 		controller->encodeEnabled = strcmp(profile,
 			"rock5-itx-edk2-v1.1-rkvenc0-h264-h265") == 0
@@ -2043,6 +2309,8 @@ UninitDriver(void* cookie)
 			delete_area(controller->av1Area);
 		if (controller->rkvenc0Area >= B_OK)
 			delete_area(controller->rkvenc0Area);
+		if (controller->vdpu2Area >= B_OK)
+			delete_area(controller->vdpu2Area);
 	}
 	DeleteDmaPool(controller);
 	free(controller);
@@ -2169,6 +2437,49 @@ Control(void* cookie, uint32 op, void* buffer, size_t length)
 			}
 			return RunEncoderJob(opened);
 		}
+		if (request.command >= 0x200 && request.command <= 0x203
+			&& opened->mppClientType == kMppClientVdpu2) {
+			if (!controller->vdpu2DecodeEnabled || !controller->cycleEnabled)
+				return B_NOT_ALLOWED;
+			MutexLocker locker(sHardwareLock);
+			status = ValidateVdpu2Job(opened, (const MppServiceRequest*)buffer);
+			if (status != B_OK) {
+				static int32 sRefusals = 0;
+				if (atomic_add(&sRefusals, 1) < 8) {
+					dprintf("rk3588_vpu: VDPU2 job refused: %s\n",
+						strerror(status));
+				}
+				return status;
+			}
+			status = EnsureVdpu2Powered(controller);
+			if (status != B_OK) {
+				opened->mppJob.valid = false;
+				return status;
+			}
+			if (!opened->decodes) {
+				opened->decodes = true;
+				controller->decodeClients++;
+			}
+			bigtime_t started = system_time();
+			SyncJobBuffers(opened->mppJob);
+			status = controller->hardware->RunVdpu2Job(opened->mppJob,
+				controller->vdpu2Registers);
+			SyncJobBuffers(opened->mppJob);
+			bigtime_t spent = system_time() - started;
+			opened->mppJob.valid = false;
+			controller->jobs++;
+			controller->jobTime += spent;
+			controller->decodeTime += spent;
+			if (spent > controller->slowestJob)
+				controller->slowestJob = spent;
+			opened->mppCompletionReady = status == B_OK;
+			if (status != B_OK) {
+				dprintf("rk3588_vpu: VDPU2 job failed (%s) after %" B_PRId64
+					" us; powering the decoder down\n", strerror(status), spent);
+				PowerDownDecoder(controller);
+			}
+			return status;
+		}
 		if (request.command >= 0x200 && request.command <= 0x203) {
 			if (opened->mppClientType != kMppClientRkvdec
 				&& opened->mppClientType != kMppClientAv1)
@@ -2235,7 +2546,8 @@ Control(void* cookie, uint32 op, void* buffer, size_t length)
 				return B_BAD_VALUE;
 			const uint32_t supported = (1u << kMppClientRkvdec)
 				| (1u << kMppClientAv1)
-				| (controller->encodeEnabled ? 1u << kMppClientRkvenc : 0);
+				| (controller->encodeEnabled ? 1u << kMppClientRkvenc : 0)
+				| (controller->vdpu2DecodeEnabled ? 1u << kMppClientVdpu2 : 0);
 			return user_memcpy(data, &supported, sizeof(supported));
 		}
 		if (request.bytes != sizeof(uint32_t))
@@ -2244,7 +2556,8 @@ Control(void* cookie, uint32 op, void* buffer, size_t length)
 			|| request.command == kMppDetachBuffer) {
 			if (opened->mppClientType != kMppClientRkvdec
 				&& opened->mppClientType != kMppClientAv1
-				&& opened->mppClientType != kMppClientRkvenc)
+				&& opened->mppClientType != kMppClientRkvenc
+				&& opened->mppClientType != kMppClientVdpu2)
 				return B_NOT_ALLOWED;
 			uint32_t handle;
 			status = user_memcpy(&handle, data, sizeof(handle));
@@ -2260,7 +2573,8 @@ Control(void* cookie, uint32 op, void* buffer, size_t length)
 			if (status != B_OK)
 				return status;
 			if (client != kMppClientRkvdec && client != kMppClientAv1
-				&& (client != kMppClientRkvenc || !controller->encodeEnabled))
+				&& (client != kMppClientRkvenc || !controller->encodeEnabled)
+				&& (client != kMppClientVdpu2 || !controller->vdpu2DecodeEnabled))
 				return B_NOT_SUPPORTED;
 			EncoderJob* job = NULL;
 			if (client == kMppClientRkvenc) {
@@ -2280,8 +2594,13 @@ Control(void* cookie, uint32 op, void* buffer, size_t length)
 		if (request.command == kMppQueryId) {
 			if (opened->mppClientType != kMppClientRkvdec
 				&& opened->mppClientType != kMppClientAv1
-				&& opened->mppClientType != kMppClientRkvenc)
+				&& opened->mppClientType != kMppClientRkvenc
+				&& opened->mppClientType != kMppClientVdpu2)
 				return B_NOT_ALLOWED;
+			if (opened->mppClientType == kMppClientVdpu2) {
+				const uint32_t none = 0;
+				return user_memcpy(data, &none, sizeof(none));
+			}
 			const uint32_t id = opened->mppClientType == kMppClientRkvdec
 				? kRkvdec0HardwareId : opened->mppClientType == kMppClientAv1
 				? kAv1HardwareId : kRkvencHardwareId;

@@ -187,6 +187,9 @@ static const uint32_t kRkvdec0HardwareId = 0x53813f05;
 static const uint32_t kAv1HardwareId = 0x80019000;
 // RKVENC (VEPU580), H.264 and H.265 encoding; MPP's HWID_VEPU58X.
 static const uint32_t kMppClientRkvenc = 16;
+// VDPU2 (VPU121, a Hantro decoder) for MPEG-1, MPEG-2, MPEG-4 Part 2 and
+// H.263. It has no identity register MPP reads.
+static const uint32_t kMppClientVdpu2 = 1;
 static const uint32_t kRkvencHardwareId = 0x50603312;
 static const uint32_t kAv1BuildId = 0x00001f8e;
 

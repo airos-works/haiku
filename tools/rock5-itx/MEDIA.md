@@ -223,3 +223,12 @@ outputs; the add-on marks them `field_sequence` 2 and airTime 1.0.0-33
 deinterlaces them (1080i broadcasts at 50/60 pictures a second, none
 dropped). The add-on now registers its formats only where
 `/dev/video/rk3588_vpu/0` exists.
+
+### MPEG-1/2, MPEG-4 Part 2 and H.263 on VPU121
+
+The driver also serves MPP's VDPU2 client: VPU121, the Hantro decoder in the
+VDPU domain (0xfdb50400), for MPEG-1/2 (fields woven), MPEG-4 Part 2 and
+H.263, with the BSP `mpp_vdpu2.c` sequence and address table. Against
+libavcodec: 80 pictures of a 1080i MPEG-2 broadcast at 70.7 dB luma PSNR
+average (IDCT rounding), 80 of an XviD episode at 73.0 dB. MPEG-4 GMC
+(S-VOPs) is refused by MPP and stays in software.
