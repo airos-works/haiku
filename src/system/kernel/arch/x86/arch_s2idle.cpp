@@ -90,18 +90,20 @@ enum {
 	LPS0_MS_TURN_ON_DISPLAY	= 9,
 };
 
-// AMD's PMC (Phoenix and its relatives: the root complex is 1022:14e8), and
-// its mailbox to the power management firmware
+// AMD's PMC, and its mailbox to the power management firmware (Linux'
+// amd_pmc): the SoC is known by its root complex, 1022:<id>
 #define AMD_ROOT_DEVICE_PHOENIX		0x14e8
+#define AMD_ROOT_DEVICE_1AH_M20H	0x1507
+	// Strix Point
+#define AMD_ROOT_DEVICE_1AH_M60H	0x1122
+	// Krackan Point (Ryzen AI 5 340), Strix Halo
 #define AMD_SMN_INDEX				0x60
 #define AMD_SMN_DATA				0x64
 #define AMD_PMC_BASE_LO				0x13b102e8
 #define AMD_PMC_BASE_HI				0x13b102ec
 #define AMD_PMC_BASE_OFFSET			0x10000
-#define AMD_PMC_MESSAGE				0x538
 #define AMD_PMC_ARGUMENT			0x9bc
 #define AMD_PMC_RESPONSE			0x980
-#define AMD_PMC_IDLE_MASK			0xd14
 #define AMD_PMC_MSG_OS_HINT			0x03
 #define AMD_PMC_MSG_LOG_ADDRESS_HI	0x04
 #define AMD_PMC_MSG_LOG_ADDRESS_LO	0x05
@@ -130,11 +132,43 @@ struct amd_pmc_metrics {
 	uint64	time_condition_not_met_total[32];
 } _PACKED;
 
-// the IP blocks the log knows on Phoenix (Linux' soc15_ip_blk)
+// the IP blocks the log knows on Phoenix and family 1Ah (Linux' soc15_ip_blk:
+// Phoenix knows the first 21 of them)
 static const char* const kAMDIPBlocks[] = {
 	"DISPLAY", "CPU", "GFX", "VDD", "ACP", "VCN", "ISP", "NBIO", "DF",
 	"USB3_0", "USB3_1", "LAPIC", "USB3_2", "USB3_3", "USB3_4", "USB4_0",
-	"USB4_1", "MPM", "JPEG", "IPU", "UMSCH"
+	"USB4_1", "MPM", "JPEG", "IPU", "UMSCH", "VPE"
+};
+
+// ... and on family 1Ah model 70h (Linux' soc15_ip_blk_v2)
+static const char* const kAMDIPBlocksV2[] = {
+	"DISPLAY", "CPU", "GFX", "VDD", "VDD_CCX", "ACP", "VCN_0", "VCN_1",
+	"ISP", "NBIO", "DF", "USB3_0", "USB3_1", "LAPIC", "USB3_2", "USB4_RT0",
+	"USB4_RT1", "USB4_0", "USB4_1", "MPM", "JPEG_0", "JPEG_1", "IPU", "UMSCH",
+	"VPE"
+};
+
+struct amd_pmc_variant {
+	uint16				root_device;
+	const char*			name;
+	uint16				message;
+		// the mailbox's message register (argument and response are the
+		// same everywhere)
+	uint16				idle_mask;
+	const char* const*	blocks;
+	uint32				block_count;
+	bool				deep_steps;
+		// the deep sleep's USB4 and disk power-off are known to work here,
+		// and run by default (deep_step_wanted())
+};
+
+static const amd_pmc_variant kAMDPMCVariants[] = {
+	{ AMD_ROOT_DEVICE_PHOENIX, "Phoenix", 0x538, 0xd14, kAMDIPBlocks, 21,
+		true },
+	{ AMD_ROOT_DEVICE_1AH_M20H, "family 1Ah", 0x938, 0xf14, kAMDIPBlocks,
+		B_COUNT_OF(kAMDIPBlocks), false },
+	{ AMD_ROOT_DEVICE_1AH_M60H, "family 1Ah", 0x938, 0xf14, kAMDIPBlocks,
+		B_COUNT_OF(kAMDIPBlocks), false },
 };
 
 // the FCH's S0i3 entry and exit time stamps (48 MHz)
@@ -172,6 +206,9 @@ static uint32 sLPS0MaskMicrosoft;
 static bool sLPS0Probed;
 
 static volatile uint8* sPMC;
+static const amd_pmc_variant* sPMCVariant;
+static const char* const* sPMCBlocks;
+static uint32 sPMCBlockCount;
 static volatile uint8* sFCH;
 static volatile amd_pmc_metrics* sPMCMetrics;
 static uint32 sPMCActiveIPs;
@@ -319,7 +356,7 @@ pmc_send(uint32 message, uint32 argument, uint32* _data = NULL)
 
 	pmc_write(AMD_PMC_RESPONSE, 0);
 	pmc_write(AMD_PMC_ARGUMENT, argument);
-	pmc_write(AMD_PMC_MESSAGE, message);
+	pmc_write(sPMCVariant->message, message);
 
 	status_t status = pmc_wait_response(&response);
 	if (status != B_OK)
@@ -348,13 +385,31 @@ pmc_probe()
 	if (gCPU[0].arch.vendor != VENDOR_AMD)
 		return;
 
+	// ("amd_pmc false" in the "suspend" kernel settings: sleep without it,
+	// so without S0i3)
+	void* settings = load_driver_settings("suspend");
+	bool wanted = get_driver_boolean_parameter(settings, "amd_pmc", true,
+		true);
+	unload_driver_settings(settings);
+	if (!wanted) {
+		INFO("AMD PMC left alone (\"amd_pmc false\")\n");
+		return;
+	}
+
 	pci_module_info* pci;
 	if (get_module(B_PCI_MODULE_NAME, (module_info**)&pci) != B_OK)
 		return;
 
 	uint32 id = pci->read_pci_config(0, 0, 0, PCI_device_id, 2);
+	const amd_pmc_variant* variant = NULL;
+	if (pci->read_pci_config(0, 0, 0, PCI_vendor_id, 2) == 0x1022) {
+		for (uint32 i = 0; i < B_COUNT_OF(kAMDPMCVariants); i++) {
+			if (kAMDPMCVariants[i].root_device == id)
+				variant = &kAMDPMCVariants[i];
+		}
+	}
 	phys_addr_t base = 0;
-	if (id == AMD_ROOT_DEVICE_PHOENIX) {
+	if (variant != NULL) {
 		InterruptsLocker _;
 		pci->write_pci_config(0, 0, 0, AMD_SMN_INDEX, 4, AMD_PMC_BASE_LO);
 		uint32 low = pci->read_pci_config(0, 0, 0, AMD_SMN_DATA, 4);
@@ -377,6 +432,14 @@ pmc_probe()
 		return;
 	}
 	sPMC = (volatile uint8*)address;
+	sPMCVariant = variant;
+	sPMCBlocks = variant->blocks;
+	sPMCBlockCount = variant->block_count;
+	int32 model = (gCPU[0].arch.extended_model << 4) | gCPU[0].arch.model;
+	if (variant->root_device != AMD_ROOT_DEVICE_PHOENIX && model == 0x70) {
+		sPMCBlocks = kAMDIPBlocksV2;
+		sPMCBlockCount = B_COUNT_OF(kAMDIPBlocksV2);
+	}
 
 	// The mailbox holds the last command's response (OK, normally): with
 	// nothing sensible there, this is not the PMC, and must not be written.
@@ -386,6 +449,7 @@ pmc_probe()
 			base, response);
 		delete_area(area_for((void*)sPMC));
 		sPMC = NULL;
+		sPMCVariant = NULL;
 		return;
 	}
 
@@ -394,8 +458,9 @@ pmc_probe()
 		sFCH = (volatile uint8*)address;
 	}
 
-	INFO("AMD PMC at %#" B_PRIxPHYSADDR ", idle mask %#" B_PRIx32 "\n", base,
-		pmc_read(AMD_PMC_IDLE_MASK));
+	INFO("AMD PMC (%s, root complex %#" B_PRIx32 ") at %#" B_PRIxPHYSADDR
+		", idle mask %#" B_PRIx32 "\n", variant->name, id, base,
+		pmc_read(variant->idle_mask));
 
 	// the firmware's log, as Linux' amd_pmc_setup_smu_logging()
 	uint32 low = 0;
@@ -444,7 +509,7 @@ pmc_report_log(bigtime_t slept)
 	size_t length = 0;
 	blockers[0] = '\0';
 	uint32 mask = 0;
-	for (uint32 i = 0; i < B_COUNT_OF(kAMDIPBlocks); i++) {
+	for (uint32 i = 0; i < sPMCBlockCount; i++) {
 		uint64 notMet = metrics.time_condition_not_met_last[i];
 		if ((sPMCActiveIPs & (1u << i)) == 0 || notMet == 0
 			|| notMet > (uint64)slept * 2) {
@@ -454,7 +519,7 @@ pmc_report_log(bigtime_t slept)
 		mask |= 1u << i;
 		if (length < sizeof(blockers)) {
 			length += snprintf(blockers + length, sizeof(blockers) - length,
-				" %s %" B_PRIu64 "%%", kAMDIPBlocks[i],
+				" %s %" B_PRIu64 "%%", sPMCBlocks[i],
 				slept > 0 ? notMet * 100 / slept : 0);
 		}
 	}
@@ -1110,15 +1175,15 @@ alib_response(pci_module_info* pci)
 
 /*!	The deep sleep's platform steps ("usb4_power_off", "storage_power_off"
 	in the "suspend" kernel settings) are there to let the SoC reach S0i3,
-	which takes the PMC's OS hint: by default they run where the PMC is
-	known (and where they were tried out), elsewhere only when asked for.
+	which takes the PMC's OS hint: by default they run where they were tried
+	out (amd_pmc_variant::deep_steps), elsewhere only when asked for.
 */
 static bool
 deep_step_wanted(const char* name)
 {
 	void* settings = load_driver_settings("suspend");
-	bool wanted = get_driver_boolean_parameter(settings, name, sPMC != NULL,
-		true);
+	bool wanted = get_driver_boolean_parameter(settings, name,
+		sPMCVariant != NULL && sPMCVariant->deep_steps, true);
 	unload_driver_settings(settings);
 	return wanted;
 }
@@ -1876,7 +1941,7 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 	status_t exitHintStatus = pmc_send(AMD_PMC_MSG_OS_HINT, 0);
 	uint64 entry = fch_time(AMD_FCH_S0I3_ENTRY);
 	uint64 exit = fch_time(AMD_FCH_S0I3_EXIT);
-	uint32 idleMask = sPMC != NULL ? pmc_read(AMD_PMC_IDLE_MASK) : 0;
+	uint32 idleMask = sPMC != NULL ? pmc_read(sPMCVariant->idle_mask) : 0;
 	uint32 blockers = pmc_report_log(slept);
 
 	// as Linux's amd_pmc_s2idle_restore() and acpi_s2idle_restore_early()
