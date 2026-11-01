@@ -1,0 +1,15 @@
+# Regression tests that airos-ci runs inside every image its smoke test boots
+# in QEMU (airos-ci images/build-image.sh builds them with the image,
+# images/smoke-test.sh copies them in and runs them at boot through
+# ~/config/settings/boot/UserBootscript, with their output on the serial log).
+#
+# One jam target per line: a test program (SimpleTest) that prints what it
+# checked and exits with 0 when everything passed. A test must end by itself
+# within a minute, also when the bug it guards against is back: give every
+# wait a deadline.
+
+# _kern_block_thread() and signals: an interrupted user wait spun forever
+# (hung Deskbar menu, kernel fix bcd3806fd1)
+user_block_thread_test
+# the same through libroot's rw_lock (BLooperList's lock)
+rw_lock_signal_test

@@ -18,6 +18,11 @@ SimpleTest illegal_instruction_test : illegal_instruction_test.cpp ;
 SimpleTest signal_fpu_test : signal_fpu_test.cpp ;
 SimpleTest signal_suspend_resume_test : signal_suspend_resume_test.cpp ;
 
+# user_thread.h, syscalls.h: the userland wait (_kern_block_thread()) and
+# signals; airos-ci runs it in every image it boots (tools/airos/ci/guest-tests)
+UsePrivateHeaders libroot system ;
+SimpleTest user_block_thread_test : user_block_thread_test.cpp ;
+
 SimpleTest hello_avx : hello_avx.c ;
 local avxSource = [ FGristFiles hello_avx.c ] ;
 local avxObject = $(avxSource:S=$(SUFOBJ)) ;
