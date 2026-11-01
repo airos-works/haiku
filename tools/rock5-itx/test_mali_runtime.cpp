@@ -176,6 +176,9 @@ bool MaliCSF::ClientVmRange(const ClientVmLease& lease, uint64 address, uint64 b
 static std::atomic<bool> sFailHardware{false};
 struct FirmwareHardware {
 	explicit FirmwareHardware(bool commands) { assert(commands); }
+	// FullClockOperation raises the GPU divider only from SPLL/4: not here.
+	uint32 ReadClock(uint32) { return 0; }
+	void WriteClock(uint32, uint32) { assert(false); }
 	status_t Init(const ResourceInfo&) { return sFailHardware ? B_IO_ERROR : B_OK; }
 };
 class Runtime;
