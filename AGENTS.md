@@ -13,11 +13,28 @@ work upstream or represent it as upstream-approved.
   `airos-release` or a short topic branch started from `master`; X399
   workstation work goes straight to topic branches (the `x399-workstation`
   branch was retired on 2026-10-19 and `/mnt/HaikuWork/x399/haiku` is a
-  detached checkout of `master` kept for its `docs/x399-workstation` tools). Merge each active branch into `master` at least every day or two
-  (`git merge --no-ff <branch>` there, then push), and delete topic branches
-  once they are merged. Upstream Haiku is the `upstream` remote; merge it into
-  `master` deliberately, not as a side effect. Pin source/toolchain revisions
-  in build manifests.
+  detached checkout of `master` kept for its `docs/x399-workstation` tools).
+  Upstream Haiku is the `upstream` remote; merge it into `master`
+  deliberately, not as a side effect. Pin source/toolchain revisions in build
+  manifests.
+- **Land fixes on `master` as soon as they are ready; don't wait to be asked.**
+  The owner does not always remember to say "merge it", and finished work left
+  on a branch or in unpushed local commits ships to nobody. When a fix or
+  feature is done and verified (it builds for the affected arches; tested on
+  hardware or QEMU where that applies), merge it into `master`
+  (`git merge --no-ff <branch>`, or fast-forward/rebase a small one), build-check
+  the merge, push, and delete the topic branch. Board integration branches such
+  as `cubie-a7s` take the work first, then go on to `master` the same way.
+  For third-party forks the integration branch is their `airos` branch; push it
+  and bump the pin that consumes it. Long-lived branches still merge into
+  `master` at least every day or two.
+- Keep a change off `master` only when the owner says to, or when it is
+  unverified, experimental or known to regress something. Then say so plainly
+  in the final report: the branch name, what is on it and what it still needs.
+- At the start of a session, check for stranded work in the checkout you use
+  (`git status`, `git log origin/master..HEAD`, `git worktree list`) and report
+  any. At the end, report where each fix landed: the pushed `master` commit,
+  or the branch it is on and why.
 - Read `docs/rock5-itx/README.md`, `STATUS.md` and `ROADMAP.md` in that directory
   before hardware work. Update status with actual evidence, not assumptions.
 - The dedicated ROCK and NanoKVM may be deployed to, restarted and configured
