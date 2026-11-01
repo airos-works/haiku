@@ -85,10 +85,17 @@ Hub::Hub(Object *parent, int8 hubAddress, uint8 hubPort,
 			return;
 		}
 
-		if (hubSsDescriptor.num_ports > 16) {
+		// An external SuperSpeed hub has at most 15 ports, but an xHCI root
+		// hub (depth 0) reports every port of the controller through this
+		// descriptor: USB 2 and USB 3 ports together, 22 on an AMD X399
+		// chipset. Clamping those to 16 left the devices on the upper ports
+		// unseen (the board's internal USB 2 header, with the Bluetooth
+		// radio, is on port 20).
+		const uint8 maxPorts = depth == 0 ? USB_MAX_PORT_COUNT : 16;
+		if (hubSsDescriptor.num_ports > maxPorts) {
 			TRACE_ALWAYS("hub supports more ports than we do (%d vs. %d)\n",
-				hubSsDescriptor.num_ports, 16);
-			hubSsDescriptor.num_ports = 16;
+				hubSsDescriptor.num_ports, maxPorts);
+			hubSsDescriptor.num_ports = maxPorts;
 		}
 		fPortCount = hubSsDescriptor.num_ports;
 		fPowerOnToPowerGood = hubSsDescriptor.power_on_to_power_good;
