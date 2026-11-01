@@ -650,12 +650,14 @@ XHCI::XHCI(pci_info *info, 	pci_device_module_info* pci, pci_device* device, Sta
 	memset((void*)fDevices, 0, sizeof(fDevices));
 
 	// "idle_d3 true" for every controller, or "idle_d3 c1:00.4 ..." for
-	// those
-	void* settings = load_driver_settings("xhci");
+	// those; PCI ones only (FDT controllers have no PCI info and no D3)
+	void* settings = fPCIInfo != NULL ? load_driver_settings("xhci") : NULL;
 	const driver_settings* parsed = get_driver_settings(settings);
-	char location[16];
-	snprintf(location, sizeof(location), "%02x:%02x.%x", fPCIInfo->bus,
-		fPCIInfo->device, fPCIInfo->function);
+	char location[16] = "";
+	if (fPCIInfo != NULL) {
+		snprintf(location, sizeof(location), "%02x:%02x.%x", fPCIInfo->bus,
+			fPCIInfo->device, fPCIInfo->function);
+	}
 	for (int32 i = 0; parsed != NULL && i < parsed->parameter_count; i++) {
 		const driver_parameter& parameter = parsed->parameters[i];
 		if (strcmp(parameter.name, "idle_d3") != 0)
@@ -1229,7 +1231,7 @@ XHCI::_SuspendToIdle()
 status_t
 XHCI::_PowerDown()
 {
-	if (fPci->suspend_device == NULL)
+	if (fPci == NULL || fPci->suspend_device == NULL)
 		return B_NOT_SUPPORTED;
 	if (!fIdleD3Allowed)
 		return B_NOT_ALLOWED;
