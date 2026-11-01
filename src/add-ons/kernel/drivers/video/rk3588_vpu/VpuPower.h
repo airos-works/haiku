@@ -20,6 +20,13 @@ static const uint32_t kAv1Gate = 1u << 12;
 static const uint32_t kAv1Repair = 1u << 11;
 static const uint32_t kAv1Idle = 1u << 9;
 static const uint32_t kAv1Memory = 1u << 20;
+// VENC0 (RKVENC core 0), a child of VCODEC. Linux 6.18.52 pm-domains.c:
+// power bit 6, memory status 14, repair status 5, idle request/ack 4.
+static const uint32_t kVenc0Gate = 1u << 6;
+static const uint32_t kVenc0Repair = 1u << 5;
+static const uint32_t kVenc0Idle = 1u << 4;
+static const uint32_t kVenc0Memory = 1u << 14;
+static const uint32_t kVcodecGate = 1u << 2;
 
 // PMU hiword write-mask format. Sources: RK3588 TRM v1.0 Part 1 and
 // Linux 6.18.52 drivers/pmdomain/rockchip/pm-domains.c.
@@ -398,6 +405,99 @@ void
 CycleAv1Power(Hardware& hardware, PowerCycle& output)
 {
 	CycleAv1Power(hardware, output, [] {});
+}
+
+inline bool
+InitialVenc0StateMatches(const Snapshot& state)
+{
+	return state.version == kSnapshotVersion && state.flags == 1
+		&& (state.powerGate & kVenc0Gate) != 0
+		&& (state.powerStatus & kVenc0Gate) != 0
+		&& (state.repairStatus & kVenc0Repair) == 0
+		&& (state.memoryStatus & kVenc0Memory) != 0
+		&& (state.idleRequest & kVenc0Idle) == 0
+		&& (state.idleAck & kVenc0Idle) != 0
+		&& (state.idleStatus & kVenc0Idle) != 0
+		// VCODEC, the parent, is left on by the firmware (no repair bit).
+		&& (state.powerGate & kVcodecGate) == 0
+		&& (state.powerStatus & kVcodecGate) == 0;
+}
+
+inline bool
+RestoredVenc0StateMatches(const Snapshot& before, const Snapshot& after)
+{
+	return (after.powerGate & kVenc0Gate) == (before.powerGate & kVenc0Gate)
+		&& (after.powerStatus & kVenc0Gate) == (before.powerStatus & kVenc0Gate)
+		&& (after.repairStatus & kVenc0Repair)
+			== (before.repairStatus & kVenc0Repair)
+		&& (after.memoryStatus & kVenc0Memory)
+			== (before.memoryStatus & kVenc0Memory)
+		&& (after.idleRequest & kVenc0Idle) == (before.idleRequest & kVenc0Idle)
+		&& (after.idleAck & kVenc0Idle) == (before.idleAck & kVenc0Idle)
+		&& (after.idleStatus & kVenc0Idle) == (before.idleStatus & kVenc0Idle);
+}
+
+// The same halves as RKVDEC0's for VENC0. The firmware leaves its clocks
+// (CRU gate 47) ungated and out of reset; the driver checks that first.
+template<class Hardware>
+bool
+PowerOnVenc0(Hardware& hardware, PowerCycle& result)
+{
+	result = PowerCycle();
+	result.version = kPowerCycleVersion;
+	result.result = kPowerInvalidState;
+	result.restoreResult = kPowerOK;
+	result.before = hardware.SnapshotNow();
+	if (!InitialVenc0StateMatches(result.before)) {
+		result.after = result.before;
+		return false;
+	}
+
+	hardware.WritePower(kPowerGateOffset, kVenc0Gate << 16);
+	result.flags |= 1;
+	if (!hardware.WaitDomainPower(kVenc0Repair, kVenc0Gate, true)) {
+		result.result = kPowerOnTimeout;
+		return false;
+	}
+	if (!hardware.WaitDomainMemory(kVenc0Memory, true)) {
+		result.result = kPowerMemoryTimeout;
+		return false;
+	}
+	hardware.WritePower(kIdleRequestOffset, kVenc0Idle << 16);
+	result.flags |= 2;
+	if (!hardware.WaitIdle(kVenc0Idle, false)) {
+		result.result = kPowerIdleTimeout;
+		return false;
+	}
+	result.powered = hardware.SnapshotNow();
+	result.flags |= 4;
+	result.result = kPowerOK;
+	return true;
+}
+
+
+template<class Hardware>
+void
+PowerOffVenc0(Hardware& hardware, PowerCycle& result)
+{
+	if ((result.flags & 1) == 0)
+		return;
+	if (hardware.PowerIsOn(kVenc0Repair)) {
+		hardware.WritePower(kIdleRequestOffset, (kVenc0Idle << 16) | kVenc0Idle);
+		if (!hardware.WaitIdle(kVenc0Idle, true))
+			result.restoreResult = kPowerIdleTimeout;
+	}
+	hardware.WritePower(kPowerGateOffset, (kVenc0Gate << 16) | kVenc0Gate);
+	if (!hardware.WaitDomainPower(kVenc0Repair, kVenc0Gate, false))
+		result.restoreResult = kPowerOffTimeout;
+	if (!hardware.WaitDomainMemory(kVenc0Memory, false))
+		result.restoreResult = kPowerMemoryTimeout;
+	hardware.WritePower(kIdleRequestOffset, kVenc0Idle << 16);
+	result.after = hardware.SnapshotNow();
+	if (result.restoreResult == kPowerOK
+		&& !RestoredVenc0StateMatches(result.before, result.after)) {
+		result.restoreResult = kPowerRestoreMismatch;
+	}
 }
 
 } // namespace RK3588Vpu

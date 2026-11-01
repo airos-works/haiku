@@ -42,6 +42,7 @@ struct Controller {
 	bool av1CycleEnabled;
 	bool decodeEnabled;
 	bool av1DecodeEnabled;
+	bool encodeEnabled;
 	MppValidationStats mppStats;
 
 	// Decoding sessions. Cycling the domains around every job cost tens of
@@ -62,6 +63,16 @@ struct Controller {
 	void* av1Registers;
 	uint32_t jobs;
 	bigtime_t jobTime;
+	// Encoding sessions on RKVENC core 0, the same way: VENC0 comes up with
+	// the first job and goes down with the last client that encoded.
+	PowerCycle venc0Session;
+	bool venc0Powered;
+	int32_t encodeClients;
+	area_id rkvenc0Area;
+	void* rkvenc0Registers;
+	uint32_t encodeJobs;
+	bigtime_t encodeTime;
+	bigtime_t slowestEncode;
 	bigtime_t decodeTime;	// in the decoder, without cache maintenance
 	bigtime_t slowestJob;
 
@@ -101,6 +112,8 @@ struct OpenHandle {
 	struct DmaBuffer* buffers;
 	MppPendingJob mppJob;
 	bool decodes;
+	struct EncoderJob* encoderJob;	// for an RKVENC client
+	bool encodes;
 };
 
 struct DmaBuffer {
@@ -115,6 +128,216 @@ struct DmaBuffer {
 };
 
 static DmaBuffer* FindTeamBuffer(team_id owner, uint32_t handle);
+
+
+// #pragma mark - RKVENC (VEPU580) jobs
+
+
+// The register words MPP's VEPU580 H.264 and H.265 HALs write, by block:
+// control, frame, rate control table, parameters (H.265 weights), RDO and
+// scaling, OSD. The sizes are MPP's structures, the bases its
+// VEPU580_*_OFFSET; Rockchip's BSP mpp_rkvenc2.c has the same classes.
+struct EncoderRange { uint16_t first, end; };
+static const EncoderRange kEncoderWrites[] = {
+	{0, 24}, {160, 254}, {1024, 1081}, {1472, 1846}, {2048, 2855}, {3072, 3360}
+};
+// What it reads back: the interrupt status and the status block.
+static const EncoderRange kEncoderReads[] = {{11, 12}, {4096, 4276}};
+static const uint32_t kEncoderRegisters = 3360;
+static const uint32_t kEncoderReadEnd = 4276;
+static const uint32_t kEncoderStartRegister = 4;			// 0x0010, enc_strt
+static const uint32_t kEncoderClearRegister = 5;			// 0x0014
+static const uint32_t kEncoderInterruptMask = 9;			// 0x0024
+static const uint32_t kEncoderInterruptClear = 10;		// 0x0028
+static const uint32_t kEncoderInterruptStatus = 11;		// 0x002c
+static const uint32_t kEncoderWatchdog = 14;				// 0x0038
+static const uint32_t kEncoderDualCore = 193;			// 0x0304, dchs
+static const uint32_t kEncoderDone = 1u << 0;
+static const uint32_t kEncoderSafeClearDone = 1u << 2;
+// bitstream overflow, response timeout, bus errors, watchdog
+static const uint32_t kEncoderErrors = 0x1f0;
+static const uint64_t kRkvenc0Base = 0xfdbd0000;
+static const size_t kRkvenc0Bytes = 0x10000;		// its IOMMU is at +0xf000
+
+struct EncoderJob {
+	uint32_t registers[kEncoderRegisters];
+	uint32_t written[(kEncoderRegisters + 31) / 32];
+	struct {
+		uint64_t address;
+		uint32_t first;
+		uint32_t count;
+	} reads[4];
+	uint32_t readCount;
+	DmaBuffer* buffers[40];
+	bool shared[40];
+	uint32_t bufferCount;
+	bool valid;
+};
+
+
+/*!	Whether a VEPU580 register holds a buffer (BSP mpp_rkvenc2.c's
+	translation tables: frame registers 160-183, OSD 3092-3099). */
+static bool
+IsEncoderAddressRegister(uint32_t index)
+{
+	return (index >= 160 && index <= 183) || (index >= 3092 && index <= 3099);
+}
+
+
+/*!	Whether the processor shares that buffer: the source picture it wrote,
+	the bitstream (top, bottom, read and start) and motion information it
+	reads, the ROI maps it wrote. Reconstructed and reference pictures,
+	their motion vectors, downscaled copies and loop filter rows pass only
+	between jobs. */
+static bool
+IsSharedEncoderRegister(uint32_t index)
+{
+	return (index >= 160 && index <= 162) || (index >= 171 && index <= 175)
+		|| (index >= 178 && index <= 181) || index >= 3092;
+}
+
+
+static bool
+InEncoderRanges(const EncoderRange* ranges, size_t count, uint32_t first,
+	uint32_t words)
+{
+	for (size_t i = 0; i < count; i++) {
+		if (first >= ranges[i].first && words <= ranges[i].end - first)
+			return true;
+	}
+	return false;
+}
+
+
+static void
+RememberEncoderBuffer(EncoderJob& job, DmaBuffer* buffer, bool shared)
+{
+	for (uint32_t index = 0; index < job.bufferCount; index++) {
+		if (job.buffers[index] == buffer) {
+			job.shared[index] |= shared;
+			return;
+		}
+	}
+	if (job.bufferCount < sizeof(job.buffers) / sizeof(job.buffers[0])) {
+		job.shared[job.bufferCount] = shared;
+		job.buffers[job.bufferCount++] = buffer;
+	}
+}
+
+
+/*!	Reads the requests of one MPP_IOC_CFG_V1 batch for RKVENC into the
+	handle's job: register words only inside the blocks above, every non-zero
+	address register a buffer of this team (translated to its physical
+	address, plus MPP's offsets), the read-backs inside the readable words.
+	With sHardwareLock held. */
+static status_t
+ValidateEncoderJob(OpenHandle* opened, const MppServiceRequest* userRequests)
+{
+	EncoderJob& job = *opened->encoderJob;
+	job.valid = false;
+	job.readCount = 0;
+	job.bufferCount = 0;
+	memset(job.written, 0, sizeof(job.written));
+	struct OffsetEntry { uint32_t index; uint32_t offset; } offsets[64];
+	uint32_t offsetCount = 0;
+	uint32_t writes = 0;
+	bool last = false;
+	for (uint32_t index = 0; index < 16 && !last; index++) {
+		MppServiceRequest request;
+		status_t status = user_memcpy(&request, userRequests + index,
+			sizeof(request));
+		if (status != B_OK)
+			return status;
+		if ((request.flags & ~(uint32_t)0x17) != 0
+			|| request.dataAddress == 0 || request.bytes == 0
+			|| (request.bytes & 3) != 0 || (request.offset & 3) != 0)
+			return B_BAD_VALUE;
+		uint32_t first = request.offset / 4;
+		uint32_t words = request.bytes / 4;
+		switch (request.command) {
+			case 0x200: // register write
+				if (!InEncoderRanges(kEncoderWrites, B_COUNT_OF(kEncoderWrites),
+						first, words))
+					return B_BAD_VALUE;
+				status = user_memcpy(&job.registers[first],
+					(const void*)(addr_t)request.dataAddress, request.bytes);
+				if (status != B_OK)
+					return status;
+				for (uint32_t word = first; word < first + words; word++)
+					job.written[word / 32] |= 1u << (word % 32);
+				writes++;
+				break;
+			case 0x201: // register read-back
+				if (!InEncoderRanges(kEncoderReads, B_COUNT_OF(kEncoderReads),
+						first, words) || job.readCount == B_COUNT_OF(job.reads))
+					return B_BAD_VALUE;
+				job.reads[job.readCount].address = request.dataAddress;
+				job.reads[job.readCount].first = first;
+				job.reads[job.readCount].count = words;
+				job.readCount++;
+				break;
+			case 0x202: // handle offset table
+				if (request.offset != 0 || request.bytes > sizeof(offsets))
+					return B_BAD_VALUE;
+				offsetCount = request.bytes / sizeof(OffsetEntry);
+				status = user_memcpy(offsets,
+					(const void*)(addr_t)request.dataAddress, request.bytes);
+				if (status != B_OK)
+					return status;
+				break;
+			case 0x203: // row caches in SRAM: not used, they stay in DRAM
+				if (request.offset != 0 || request.bytes > 32 * 8)
+					return B_BAD_VALUE;
+				break;
+			default:
+				return B_NOT_SUPPORTED;
+		}
+		last = (request.flags & 2) != 0;
+	}
+	if (!last || writes == 0 || job.readCount == 0
+		|| (job.written[0] & (1u << kEncoderStartRegister)) == 0)
+		return B_BAD_VALUE;
+
+	// Each address register's buffer, frame registers 160-183 then OSD.
+	DmaBuffer* targets[32] = {};
+	for (uint32_t index = 0; index < kEncoderRegisters; index++) {
+		if (!IsEncoderAddressRegister(index)
+			|| (job.written[index / 32] & (1u << (index % 32))) == 0)
+			continue;
+		uint32_t handle = job.registers[index];
+		if (handle == 0)
+			continue;
+		DmaBuffer* allocation = FindTeamBuffer(opened->owner, handle);
+		if (allocation == NULL || allocation->physical > UINT32_MAX
+			|| allocation->bytes > UINT32_MAX - allocation->physical)
+			return B_ENTRY_NOT_FOUND;
+		job.registers[index] = (uint32_t)allocation->physical;
+		targets[index <= 183 ? index - 160 : 24 + index - 3092] = allocation;
+		RememberEncoderBuffer(job, allocation, IsSharedEncoderRegister(index));
+	}
+	for (uint32_t index = 0; index < offsetCount; index++) {
+		uint32_t target = offsets[index].index;
+		if (!IsEncoderAddressRegister(target))
+			return B_BAD_VALUE;
+		DmaBuffer* allocation
+			= targets[target <= 183 ? target - 160 : 24 + target - 3092];
+		if (allocation == NULL)
+			return B_BAD_VALUE;
+		// The bitstream top (172) may name the end of its buffer: MPP's H.265
+		// HAL gives the size there, its H.264 HAL the size less one.
+		uint64_t limit = allocation->physical + allocation->bytes
+			+ (target == 172 ? 1 : 0);
+		if (job.registers[target] + (uint64_t)offsets[index].offset >= limit) {
+			dprintf("rk3588_vpu: encode offset %#" B_PRIx32 " for register %"
+				B_PRIu32 " is outside its buffer of %zu bytes\n",
+				offsets[index].offset, target, allocation->bytes);
+			return B_BAD_VALUE;
+		}
+		job.registers[target] += offsets[index].offset;
+	}
+	job.valid = true;
+	return B_OK;
+}
 
 
 static void
@@ -1318,6 +1541,159 @@ public:
 		return (status & terminal) != 0 ? B_OK : B_TIMED_OUT;
 	}
 
+	bool WaitDomainPower(uint32_t repairMask, uint32_t gateMask, bool on)
+	{
+		bigtime_t deadline = system_time() + 10000;
+		do {
+			memory_read_barrier();
+			bool repaired = (ReadRegister(fPower, 0x290) & repairMask) != 0;
+			bool gateOff = (ReadRegister(fPower, 0x180) & gateMask) != 0;
+			if (repaired == on && gateOff != on)
+				return true;
+		} while (system_time() < deadline);
+		return false;
+	}
+
+	bool WaitDomainMemory(uint32_t mask, bool on)
+	{
+		bigtime_t deadline = system_time() + 10000;
+		do {
+			memory_read_barrier();
+			bool off = (ReadRegister(fPower, 0x1f8) & mask) != 0;
+			if (off != on)
+				return true;
+		} while (system_time() < deadline);
+		return false;
+	}
+
+	uint32_t ReadClock(uint32_t offset)
+	{
+		memory_read_barrier();
+		return ReadRegister(fClock, offset);
+	}
+
+	// RKVENC0's clocks as the firmware leaves them: hclk/aclk root, hclk,
+	// aclk and core (CRU gate 47 bits 0, 1, 4, 5, 6) ungated, and its BIU,
+	// AHB, AXI and core resets (soft reset 47 bits 2-6) released.
+	bool Rkvenc0ClocksReady()
+	{
+		return (ReadClock(0x8bc) & 0x73) == 0 && (ReadClock(0xabc) & 0x7c) == 0;
+	}
+
+	bool Venc0Ready()
+	{
+		Snapshot state = SnapshotNow();
+		return (state.repairStatus & kVenc0Repair) != 0
+			&& (state.powerStatus & (kVenc0Gate | kVcodecGate)) == 0
+			&& (state.idleStatus & kVenc0Idle) == 0
+			&& (state.memoryStatus & kVenc0Memory) == 0;
+	}
+
+	// BSP mpp_rkvenc2.c rkvenc_soft_reset(): stop the block cleanly.
+	void ResetRkvenc(volatile uint32_t* registers)
+	{
+		registers[kEncoderInterruptMask] = 0x3ff;
+		registers[kEncoderClearRegister] = 1;
+		memory_write_barrier();
+		bigtime_t deadline = system_time() + 1000;
+		while ((registers[kEncoderInterruptStatus] & kEncoderSafeClearDone) == 0
+			&& system_time() < deadline) {
+		}
+		registers[kEncoderClearRegister] = 3;
+		memory_write_barrier();
+		spin(5);
+		registers[kEncoderClearRegister] = 0;
+		registers[kEncoderInterruptClear] = 0xffffffff;
+		registers[kEncoderInterruptStatus] = 0;
+		memory_write_barrier();
+	}
+
+	/*!	One VEPU580 frame on core 0, as rkvenc_run()/rkvenc_irq() in the BSP
+		driver do it, polled: the IOMMU must be in bypass (physical
+		addresses), the start word goes last, the interrupt status is what
+		MPP reads back for word 11. The dual-core handshake is turned off:
+		with one core and one job at a time, a reference is complete before
+		the next picture starts. */
+	status_t RunRkvencJob(const EncoderJob& job, void* mapped,
+		uint32_t& interruptStatus)
+	{
+		interruptStatus = 0;
+		if (!job.valid || mapped == NULL)
+			return B_BAD_VALUE;
+		if (!Venc0Ready() || !Rkvenc0ClocksReady())
+			return B_NOT_ALLOWED;
+		volatile uint32_t* registers = (volatile uint32_t*)mapped;
+		const volatile uint32_t* iommu
+			= (const volatile uint32_t*)((uint8_t*)mapped + 0xf000);
+		memory_read_barrier();
+		if (iommu[0] != 0 || (iommu[1] & 1) != 0)
+			return B_NOT_ALLOWED;
+
+		registers[kEncoderClearRegister] = 2;	// force clear
+		memory_write_barrier();
+		spin(5);
+		registers[kEncoderClearRegister] = 0;
+		registers[0x5300 / 4] = 2;		// clear the hardware counters
+		for (uint32_t index = 0; index < kEncoderRegisters; index++) {
+			if (index == kEncoderStartRegister
+				|| (job.written[index / 32] & (1u << (index % 32))) == 0)
+				continue;
+			uint32_t value = job.registers[index];
+			if (index == kEncoderDualCore)
+				value &= ~(uint32_t)0x30;	// dchs_txe, dchs_rxe
+			registers[index] = value;
+		}
+		// Watchdog: about half a second of core clock (bits 0-23, in units
+		// of 1024 cycles at up to 800 MHz); the poll below gives up at one.
+		uint32_t watchdog = registers[kEncoderWatchdog] & 0xff000000;
+		registers[kEncoderWatchdog] = watchdog | 0x60000;
+		memory_write_barrier();
+		registers[kEncoderStartRegister] = job.registers[kEncoderStartRegister];
+		memory_write_barrier();
+
+		uint32_t status = 0;
+		bigtime_t deadline = system_time() + 1000000;
+		do {
+			memory_read_barrier();
+			status = registers[kEncoderInterruptStatus];
+			if ((status & (kEncoderDone | kEncoderErrors)) != 0)
+				break;
+			snooze(50);
+		} while (system_time() < deadline);
+		interruptStatus = status;
+		registers[kEncoderInterruptClear] = status;
+		memory_write_barrier();
+		if ((status & kEncoderErrors) != 0 || (status & kEncoderDone) == 0) {
+			ResetRkvenc(registers);
+			return (status & kEncoderDone) == 0 && (status & kEncoderErrors) == 0
+				? B_TIMED_OUT : B_IO_ERROR;
+		}
+		return B_OK;
+	}
+
+	// Copies the status words MPP asked for, after a job.
+	status_t ReadRkvencResults(const EncoderJob& job, void* mapped,
+		uint32_t interruptStatus)
+	{
+		const volatile uint32_t* registers = (const volatile uint32_t*)mapped;
+		for (uint32_t i = 0; i < job.readCount; i++) {
+			uint32_t words[180];
+			uint32_t count = job.reads[i].count;
+			if (count > B_COUNT_OF(words))
+				return B_BAD_VALUE;
+			for (uint32_t w = 0; w < count; w++) {
+				uint32_t index = job.reads[i].first + w;
+				words[w] = index == kEncoderInterruptStatus
+					? interruptStatus : registers[index];
+			}
+			status_t status = user_memcpy((void*)(addr_t)job.reads[i].address,
+				words, count * 4);
+			if (status != B_OK)
+				return status;
+		}
+		return B_OK;
+	}
+
 private:
 	ResourceInfo fResources = {};
 	AreaDeleter fClockArea;
@@ -1433,6 +1809,129 @@ EnsureDecoderPowered(Controller* controller, bool rkvdec)
 }
 
 
+// #pragma mark - encoding sessions
+
+
+// With sHardwareLock held.
+static void
+PowerDownEncoder(Controller* controller)
+{
+	if (controller->hardware == NULL || !controller->venc0Powered)
+		return;
+	PowerOffVenc0(*controller->hardware, controller->venc0Session);
+	controller->venc0Powered = false;
+	dprintf("rk3588_vpu: encoder powered down after %" B_PRIu32 " jobs,"
+		" %" B_PRId64 " us a job, slowest %" B_PRId64 " us; restore %u\n",
+		controller->encodeJobs, controller->encodeJobs > 0
+			? controller->encodeTime / controller->encodeJobs : 0,
+		controller->slowestEncode, controller->venc0Session.restoreResult);
+	controller->encodeJobs = 0;
+	controller->encodeTime = 0;
+	controller->slowestEncode = 0;
+}
+
+
+// With sHardwareLock held: brings VENC0 up if it is not, after checking the
+// clocks the firmware left, and maps RKVENC0's registers once.
+static status_t
+EnsureEncoderPowered(Controller* controller)
+{
+	if (controller->hardware == NULL) {
+		PowerHardware* hardware = new(std::nothrow) PowerHardware;
+		if (hardware == NULL)
+			return B_NO_MEMORY;
+		status_t status = hardware->Init(controller->resources);
+		if (status != B_OK) {
+			delete hardware;
+			return status;
+		}
+		controller->hardware = hardware;
+	}
+	PowerHardware& hardware = *controller->hardware;
+	if (!controller->venc0Powered) {
+		if (!hardware.Rkvenc0ClocksReady()) {
+			dprintf("rk3588_vpu: RKVENC0 clocks gated or in reset"
+				" (gate %#" B_PRIx32 ", reset %#" B_PRIx32 "); not encoding\n",
+				hardware.ReadClock(0x8bc), hardware.ReadClock(0xabc));
+			return B_NOT_SUPPORTED;
+		}
+		if (!PowerOnVenc0(hardware, controller->venc0Session)) {
+			PowerOffVenc0(hardware, controller->venc0Session);
+			dprintf("rk3588_vpu: VENC0 did not power up: %u/%u\n",
+				controller->venc0Session.result,
+				controller->venc0Session.restoreResult);
+			return B_ERROR;
+		}
+		controller->venc0Powered = true;
+	}
+	if (controller->rkvenc0Registers == NULL) {
+		controller->rkvenc0Area = map_physical_memory("RKVENC0 registers",
+			kRkvenc0Base, kRkvenc0Bytes, B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY,
+			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
+			&controller->rkvenc0Registers);
+		if (controller->rkvenc0Area < B_OK) {
+			controller->rkvenc0Registers = NULL;
+			return controller->rkvenc0Area;
+		}
+		memory_read_barrier();
+		dprintf("rk3588_vpu: RKVENC0 version %#" B_PRIx32 ", IOMMU dte %#"
+			B_PRIx32 " status %#" B_PRIx32 "\n",
+			((volatile uint32_t*)controller->rkvenc0Registers)[0],
+			((volatile uint32_t*)controller->rkvenc0Registers)[0xf000 / 4],
+			((volatile uint32_t*)controller->rkvenc0Registers)[0xf004 / 4]);
+	}
+	return B_OK;
+}
+
+
+// With sHardwareLock held: one validated RKVENC job, start to finish.
+static status_t
+RunEncoderJob(OpenHandle* opened)
+{
+	Controller* controller = opened->controller;
+	EncoderJob& job = *opened->encoderJob;
+	status_t status = EnsureEncoderPowered(controller);
+	if (status != B_OK) {
+		job.valid = false;
+		return status;
+	}
+	if (!opened->encodes) {
+		opened->encodes = true;
+		controller->encodeClients++;
+	}
+	bigtime_t started = system_time();
+	for (uint32_t i = 0; i < job.bufferCount; i++) {
+		if (job.shared[i])
+			SyncBufferForDevice(job.buffers[i]);
+	}
+	uint32_t interruptStatus = 0;
+	status = controller->hardware->RunRkvencJob(job,
+		controller->rkvenc0Registers, interruptStatus);
+	for (uint32_t i = 0; i < job.bufferCount; i++) {
+		if (job.shared[i])
+			SyncBufferForDevice(job.buffers[i]);
+	}
+	if (status == B_OK) {
+		status = controller->hardware->ReadRkvencResults(job,
+			controller->rkvenc0Registers, interruptStatus);
+	}
+	bigtime_t spent = system_time() - started;
+	job.valid = false;
+	controller->encodeJobs++;
+	controller->encodeTime += spent;
+	if (spent > controller->slowestEncode)
+		controller->slowestEncode = spent;
+	opened->mppCompletionReady = status == B_OK;
+	if (status != B_OK) {
+		dprintf("rk3588_vpu: encode job failed (%s, interrupt status %#"
+			B_PRIx32 ") after %" B_PRId64 " us; powering the encoder down\n",
+			strerror(status), interruptStatus, spent);
+		PowerDownEncoder(controller);
+	}
+	return status;
+}
+
+
 static float
 SupportsDevice(device_node* parent)
 {
@@ -1466,6 +1965,7 @@ InitDriver(device_node* node, void** cookie)
 	controller->poolArea = -1;
 	controller->rkvdec0Area = -1;
 	controller->av1Area = -1;
+	controller->rkvenc0Area = -1;
 	size_t poolMegabytes = 0;
 	device_node* parent = sDeviceManager->get_parent_node(node);
 	bool valid = ReadResources(parent, controller->resources);
@@ -1488,7 +1988,11 @@ InitDriver(device_node* node, void** cookie)
 		profile = get_driver_parameter(settings, "av1_decode_profile", "", "");
 		controller->av1DecodeEnabled = strcmp(profile,
 			"rock5-itx-edk2-v1.1-vpu981-av1") == 0;
-		if (controller->decodeEnabled || controller->av1DecodeEnabled) {
+		profile = get_driver_parameter(settings, "encode_profile", "", "");
+		controller->encodeEnabled = strcmp(profile,
+			"rock5-itx-edk2-v1.1-rkvenc0-h264-h265") == 0;
+		if (controller->decodeEnabled || controller->av1DecodeEnabled
+			|| controller->encodeEnabled) {
 			const char* pool = get_driver_parameter(settings, "dma_pool_mb",
 				NULL, NULL);
 			poolMegabytes = pool != NULL ? strtoul(pool, NULL, 10)
@@ -1507,12 +2011,13 @@ InitDriver(device_node* node, void** cookie)
 	CreateDmaPool(controller, poolMegabytes);
 	dprintf("rk3588_vpu: validated VDPU and IOMMU resources;"
 		" VDPU power cycle %s, RKVDEC0 power cycle %s, AV1 power cycle %s,"
-		" RKVDEC decode %s, AV1 decode %s\n",
+		" RKVDEC decode %s, AV1 decode %s, RKVENC encode %s\n",
 		controller->cycleEnabled ? "enabled" : "disabled",
 		controller->rkvdec0CycleEnabled ? "enabled" : "disabled",
 		controller->av1CycleEnabled ? "enabled" : "disabled",
 		controller->decodeEnabled ? "enabled" : "disabled",
-		controller->av1DecodeEnabled ? "enabled" : "disabled");
+		controller->av1DecodeEnabled ? "enabled" : "disabled",
+		controller->encodeEnabled ? "enabled" : "disabled");
 	*cookie = controller;
 	return B_OK;
 }
@@ -1524,12 +2029,15 @@ UninitDriver(void* cookie)
 	{
 		MutexLocker locker(sHardwareLock);
 		PowerDownDecoder(controller);
+		PowerDownEncoder(controller);
 		delete controller->hardware;
 		controller->hardware = NULL;
 		if (controller->rkvdec0Area >= B_OK)
 			delete_area(controller->rkvdec0Area);
 		if (controller->av1Area >= B_OK)
 			delete_area(controller->av1Area);
+		if (controller->rkvenc0Area >= B_OK)
+			delete_area(controller->rkvenc0Area);
 	}
 	DeleteDmaPool(controller);
 	free(controller);
@@ -1553,9 +2061,10 @@ Open(void* cookie, const char*, int mode, void** handle)
 		return B_NOT_ALLOWED;
 	if (access == O_RDWR && ((!controller->cycleEnabled
 			&& !controller->rkvdec0CycleEnabled && !controller->av1CycleEnabled
-			&& !controller->decodeEnabled && !controller->av1DecodeEnabled)
+			&& !controller->decodeEnabled && !controller->av1DecodeEnabled
+			&& !controller->encodeEnabled)
 			|| (geteuid() != 0 && !controller->decodeEnabled
-				&& !controller->av1DecodeEnabled)))
+				&& !controller->av1DecodeEnabled && !controller->encodeEnabled)))
 		return B_NOT_ALLOWED;
 	OpenHandle* opened = (OpenHandle*)calloc(1, sizeof(OpenHandle));
 	if (opened == NULL)
@@ -1589,6 +2098,9 @@ Free(void* cookie)
 	}
 	if (opened->decodes && --opened->controller->decodeClients == 0)
 		PowerDownDecoder(opened->controller);
+	if (opened->encodes && --opened->controller->encodeClients == 0)
+		PowerDownEncoder(opened->controller);
+	free(opened->encoderJob);
 	while (opened->buffers != NULL) {
 		DmaBuffer* buffer = opened->buffers;
 		opened->buffers = buffer->next;
@@ -1635,6 +2147,22 @@ Control(void* cookie, uint32 op, void* buffer, size_t length)
 				return B_WOULD_BLOCK;
 			opened->mppCompletionReady = false;
 			return B_OK;
+		}
+		if (request.command >= 0x200 && request.command <= 0x203
+			&& opened->mppClientType == kMppClientRkvenc) {
+			if (!controller->encodeEnabled || opened->encoderJob == NULL)
+				return B_NOT_ALLOWED;
+			MutexLocker locker(sHardwareLock);
+			status = ValidateEncoderJob(opened, (const MppServiceRequest*)buffer);
+			if (status != B_OK) {
+				static int32 sRefusals = 0;
+				if (atomic_add(&sRefusals, 1) < 8) {
+					dprintf("rk3588_vpu: encode job refused: %s\n",
+						strerror(status));
+				}
+				return status;
+			}
+			return RunEncoderJob(opened);
 		}
 		if (request.command >= 0x200 && request.command <= 0x203) {
 			if (opened->mppClientType != kMppClientRkvdec
@@ -1701,7 +2229,8 @@ Control(void* cookie, uint32 op, void* buffer, size_t length)
 			if (request.bytes != 0)
 				return B_BAD_VALUE;
 			const uint32_t supported = (1u << kMppClientRkvdec)
-				| (1u << kMppClientAv1);
+				| (1u << kMppClientAv1)
+				| (controller->encodeEnabled ? 1u << kMppClientRkvenc : 0);
 			return user_memcpy(data, &supported, sizeof(supported));
 		}
 		if (request.bytes != sizeof(uint32_t))
@@ -1709,7 +2238,8 @@ Control(void* cookie, uint32 op, void* buffer, size_t length)
 		if (request.command == kMppAttachBuffer
 			|| request.command == kMppDetachBuffer) {
 			if (opened->mppClientType != kMppClientRkvdec
-				&& opened->mppClientType != kMppClientAv1)
+				&& opened->mppClientType != kMppClientAv1
+				&& opened->mppClientType != kMppClientRkvenc)
 				return B_NOT_ALLOWED;
 			uint32_t handle;
 			status = user_memcpy(&handle, data, sizeof(handle));
@@ -1724,18 +2254,32 @@ Control(void* cookie, uint32 op, void* buffer, size_t length)
 			status = user_memcpy(&client, data, sizeof(client));
 			if (status != B_OK)
 				return status;
-			if (client != kMppClientRkvdec && client != kMppClientAv1)
+			if (client != kMppClientRkvdec && client != kMppClientAv1
+				&& (client != kMppClientRkvenc || !controller->encodeEnabled))
 				return B_NOT_SUPPORTED;
+			EncoderJob* job = NULL;
+			if (client == kMppClientRkvenc) {
+				job = (EncoderJob*)calloc(1, sizeof(EncoderJob));
+				if (job == NULL)
+					return B_NO_MEMORY;
+			}
 			MutexLocker locker(sHardwareLock);
+			if (opened->mppClientType != UINT32_MAX) {
+				free(job);
+				return B_BUSY;
+			}
 			opened->mppClientType = client;
+			opened->encoderJob = job;
 			return B_OK;
 		}
 		if (request.command == kMppQueryId) {
 			if (opened->mppClientType != kMppClientRkvdec
-				&& opened->mppClientType != kMppClientAv1)
+				&& opened->mppClientType != kMppClientAv1
+				&& opened->mppClientType != kMppClientRkvenc)
 				return B_NOT_ALLOWED;
 			const uint32_t id = opened->mppClientType == kMppClientRkvdec
-				? kRkvdec0HardwareId : kAv1HardwareId;
+				? kRkvdec0HardwareId : opened->mppClientType == kMppClientAv1
+				? kAv1HardwareId : kRkvencHardwareId;
 			return user_memcpy(data, &id, sizeof(id));
 		}
 		return B_NOT_SUPPORTED;
