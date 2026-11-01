@@ -569,6 +569,13 @@ private:
 			header.size_used += rowBytes * ((fHeight + 1) / 2);
 		header.file_pos = -1;
 		header.u.raw_video.field_gamma = 1.0f;
+		// A picture of two woven fields (H.264 PAFF/MBAFF): marked as the
+		// other air/OS add-ons mark it, so that a player deinterlaces from
+		// the first one, where a broadcast switches to fields mid-stream.
+		if ((mpp_frame_get_mode(frame) & MPP_FRAME_FLAG_PAIRED_FIELD)
+				== MPP_FRAME_FLAG_PAIRED_FIELD) {
+			header.u.raw_video.field_sequence = 2;
+		}
 		header.u.raw_video.display_line_width = fWidth;
 		header.u.raw_video.display_line_count = fHeight;
 		header.u.raw_video.bytes_per_row = rowBytes;
