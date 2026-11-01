@@ -4,7 +4,8 @@ SubDir HAIKU_TOP src apps mediaconverter ;
 # reading, decoding, filtering and writing, with the encoders of
 # VideoEncoder: the GPUs' through VA-API (AMD) and NVENC (NVIDIA), the
 # Qualcomm SC8280XP's Iris codec (qcom_video's IrisEncoder), the Allwinner
-# A733's video encoder (sunxi_venc's CedarEncoder), and on the
+# A733's video encoder (sunxi_venc's CedarEncoder), the RK3588's encoder
+# (Rockchip MPP, opened at run time), and on the
 # CPU x264, x265 and SVT-AV1 (opened at run time) and FFmpeg's own.
 
 UsePrivateHeaders drivers interface shared media ;
@@ -38,6 +39,7 @@ local engineSources =
 	IrisVideoEncoder.cpp
 	LavcVideoEncoder.cpp
 	MediaProbe.cpp
+	MppVideoEncoder.cpp
 	NvencEncoder.cpp
 	OutputSettings.cpp
 	Presets.cpp

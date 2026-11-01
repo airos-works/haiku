@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <drivers/device_manager.h>
 #include <device_manager_defs.h>
@@ -20,6 +21,7 @@
 
 #include "CedarVideoEncoder.h"
 #include "IrisVideoEncoder.h"
+#include "MppVideoEncoder.h"
 #include "NvencEncoder.h"
 #include "VaapiEncoder.h"
 #include "VaapiLibrary.h"
@@ -96,6 +98,8 @@ GpuDevice::CanEncode(video_codec codec, int width, int height) const
 	if (backend == kBackendIris && !iris_encoder_implements(codec))
 		return false;
 	if (backend == kBackendCedar && !cedar_encoder_implements(codec))
+		return false;
+	if (backend == kBackendRockchip && !MppVideoEncoder::Implements(codec))
 		return false;
 	return (format->maxWidth == 0 || width <= format->maxWidth)
 		&& (format->maxHeight == 0 || height <= format->maxHeight);
@@ -703,6 +707,36 @@ HardwareInventory::_ProbeCedar()
 }
 
 
+/*!	The Radxa ROCK 5 ITX's SoC: the RK3588's encoder (RKVENC core 0, VEPU580)
+	through Rockchip MPP and the rk3588_vpu driver; its decoders play in
+	airTime and the Media Kit through the 00_rockchip_mpp add-on. */
+void
+HardwareInventory::_ProbeRockchip()
+{
+	if (access("/dev/video/rk3588_vpu/0", F_OK) != 0)
+		return;
+	GpuDevice device;
+	device.id = "rkvenc:/dev/video/rk3588_vpu/0";
+	device.name = "Rockchip RK3588";
+	device.vendor = kVendorOther;
+	device.vendorID = 0;
+	device.deviceID = 0;
+	device.generation = "RK3588";
+	device.engine = "RKVENC (VEPU580)";
+	device.backend = kBackendRockchip;
+	device.devicePath = "/dev/video/rk3588_vpu/0";
+	BString why;
+	device.ready = MppVideoEncoder::IsAvailable(&why);
+	device.status = why;
+	device.encode.push_back(GpuEncodeFormat{ kVideoH264, 8192, 8192, false });
+	device.encode.push_back(GpuEncodeFormat{ kVideoH265, 8192, 8192, false });
+	device.decode.push_back("H.264");
+	device.decode.push_back("H.265");
+	device.decode.push_back("AV1");
+	fDevices.push_back(device);
+}
+
+
 void
 HardwareInventory::Probe()
 {
@@ -712,6 +746,7 @@ HardwareInventory::Probe()
 	_ProbePci();
 	_ProbeIris();
 	_ProbeCedar();
+	_ProbeRockchip();
 	// A test hook: an NVIDIA card with this PCI device ID, to try the NVENC
 	// paths with the stand-in add-on (nvenc/test/fake_nvenc.cpp).
 	if (const char* fake = getenv("MEDIACONVERTER_FAKE_NVIDIA"))
@@ -822,6 +857,8 @@ HardwareInventory::CreateEncoder(const GpuDevice& device)
 			return new(std::nothrow) IrisVideoEncoder(device.name.String());
 		case kBackendCedar:
 			return new(std::nothrow) CedarVideoEncoder(device.name.String());
+		case kBackendRockchip:
+			return new(std::nothrow) MppVideoEncoder(device.name.String());
 		default:
 			return NULL;
 	}

@@ -173,6 +173,8 @@ backend_name(encoder_backend backend)
 			return "Iris";
 		case kBackendCedar:
 			return "Cedar";
+		case kBackendRockchip:
+			return "RKVENC";
 		case kBackendSoftware:
 		default:
 			return "CPU";

@@ -108,6 +108,7 @@ enum encoder_backend {
 	kBackendNVENC,			// NVIDIA
 	kBackendIris,			// the Qualcomm SC8280XP's video codec
 	kBackendCedar,			// the Allwinner A733's video encoder
+	kBackendRockchip,		// the RK3588's RKVENC, through Rockchip MPP
 
 	kBackendCount
 };

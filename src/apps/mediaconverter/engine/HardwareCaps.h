@@ -88,6 +88,7 @@ private:
 			void				_ProbeVaapi();
 			void				_ProbeIris();
 			void				_ProbeCedar();
+			void				_ProbeRockchip();
 			void				_ProbePci();
 			void				_AddTableDevice(uint16 vendor, uint16 device);
 
