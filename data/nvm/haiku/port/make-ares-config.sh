@@ -20,6 +20,14 @@ cmake -S "c-ares-$V" -B build -DCARES_STATIC=ON -DCARES_SHARED=OFF -DCARES_BUILD
 	-DCMAKE_POLICY_VERSION_MINIMUM=3.5 > cmake.log 2>&1 || { tail -20 cmake.log; exit 1; }
 CONFIG=$(find build -name ares_config.h | head -1)
 [ -n "$CONFIG" ] || { echo "no ares_config.h from c-ares $V"; exit 1; }
+# c-ares before 1.18 finds the argument types of recv, recvfrom and send on
+# Haiku but leaves HAVE_RECV, HAVE_RECVFROM and HAVE_SEND undefined (its
+# check does not link libnetwork); setup_once.h then stops the build.
+for f in RECV RECVFROM SEND; do
+	if grep -q "^#define ${f}_TYPE_ARG1 " "$CONFIG"; then
+		sed -i "s|^/\* #undef HAVE_${f} \*/\$|#define HAVE_${f} 1|" "$CONFIG"
+	fi
+done
 cp "$CONFIG" "$OUT/ares_config-$V.h"
 cd /
 rm -rf "$WORK"

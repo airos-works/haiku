@@ -141,6 +141,21 @@ if _major < 20:
                              m.group(2), m.group(1))),
          "gcc 13 headers", "'-include', 'cstdint'")
 
+# V8 8.4 to 8.6 (Node 14, 15) ask is_subtype<T, U> about types that are only
+# forward-declared there; its std::is_convertible<T, Object> is instantiated
+# even when U is not MaybeObject, and gcc 13 rejects that for an incomplete
+# T. std::conditional only instantiates it for MaybeObject (same result).
+if _major < 16:
+    edit("deps/v8/src/codegen/tnode.h",
+         lambda s: once(s, "      std::is_base_of<U, T>::value || (std::is_same<U, MaybeObject>::value &&\n"
+                           "                                       std::is_convertible<T, Object>::value);\n",
+                        "      std::is_base_of<U, T>::value ||\n"
+                        "      std::conditional<std::is_same<U, MaybeObject>::value,\n"
+                        "                       std::is_convertible<T, Object>,\n"
+                        "                       std::false_type>::type::value;\n"),
+         "is_subtype for incomplete types", "std::conditional<std::is_same<U, MaybeObject>::value",
+         optional=True)
+
 
 # Node 12 to 19 bundle jinja2/markupsafe releases that import the container
 # ABCs from collections, which Python 3.10 no longer allows.
@@ -198,6 +213,229 @@ UV_HAIKU = """        [ 'OS=="haiku"', {
 edit("deps/uv/uv.gyp",
      lambda s: resub(s, r"(\n)(        \[ 'OS==\"freebsd\" or OS==\"dragonflybsd\"', \{\n)", r"\1" + UV_HAIKU.replace("\\", "\\\\") + r"\2"),
      "libuv haiku sources", 'src/unix/haiku.c')
+
+
+# libuv before 1.29 (Node 11 bundles 1.27) has no Haiku support. Add libuv's
+# own src/unix/haiku.c (from 1.34, as Node 10.24 bundles it, with the
+# uv_free_cpu_info that 1.27 leaves to each platform and without
+# uv_get_constrained_memory, which 1.27 does not have) and the Haiku cases
+# libuv 1.34 has in the files 1.27 shares with it.
+UV_HAIKU_C = r'''/* Copyright libuv project contributors. All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
+
+#include "uv.h"
+#include "internal.h"
+
+#include <FindDirectory.h> /* find_path() */
+#include <OS.h>
+
+
+void uv_loadavg(double avg[3]) {
+  avg[0] = 0;
+  avg[1] = 0;
+  avg[2] = 0;
+}
+
+
+int uv_exepath(char* buffer, size_t* size) {
+  char abspath[B_PATH_NAME_LENGTH];
+  status_t status;
+  ssize_t abspath_len;
+
+  if (buffer == NULL || size == NULL || *size == 0)
+    return UV_EINVAL;
+
+  status = find_path(B_APP_IMAGE_SYMBOL, B_FIND_PATH_IMAGE_PATH, NULL, abspath,
+                     sizeof(abspath));
+  if (status != B_OK)
+    return UV__ERR(status);
+
+  abspath_len = uv__strscpy(buffer, abspath, *size);
+  *size -= 1;
+  if (abspath_len >= 0 && *size > (size_t)abspath_len)
+    *size = (size_t)abspath_len;
+
+  return 0;
+}
+
+
+uint64_t uv_get_free_memory(void) {
+  status_t status;
+  system_info sinfo;
+
+  status = get_system_info(&sinfo);
+  if (status != B_OK)
+    return 0;
+
+  return (sinfo.max_pages - sinfo.used_pages) * B_PAGE_SIZE;
+}
+
+
+uint64_t uv_get_total_memory(void) {
+  status_t status;
+  system_info sinfo;
+
+  status = get_system_info(&sinfo);
+  if (status != B_OK)
+    return 0;
+
+  return sinfo.max_pages * B_PAGE_SIZE;
+}
+
+
+
+int uv_resident_set_memory(size_t* rss) {
+  area_info area;
+  ssize_t cookie;
+  status_t status;
+  thread_info thread;
+
+  status = get_thread_info(find_thread(NULL), &thread);
+  if (status != B_OK)
+    return UV__ERR(status);
+
+  cookie = 0;
+  *rss = 0;
+  while (get_next_area_info(thread.team, &cookie, &area) == B_OK)
+    *rss += area.ram_size;
+
+  return 0;
+}
+
+
+int uv_uptime(double* uptime) {
+  /* system_time() returns time since booting in microseconds */
+  *uptime = (double)system_time() / 1000000;
+  return 0;
+}
+
+
+int uv_cpu_info(uv_cpu_info_t** cpu_infos, int* count) {
+  cpu_topology_node_info* topology_infos;
+  int i;
+  status_t status;
+  system_info system;
+  uint32_t topology_count;
+  uint64_t cpuspeed;
+  uv_cpu_info_t* cpu_info;
+
+  if (cpu_infos == NULL || count == NULL)
+    return UV_EINVAL;
+
+  status = get_cpu_topology_info(NULL, &topology_count);
+  if (status != B_OK)
+    return UV__ERR(status);
+
+  topology_infos = uv__malloc(topology_count * sizeof(*topology_infos));
+  if (topology_infos == NULL)
+    return UV_ENOMEM;
+
+  status = get_cpu_topology_info(topology_infos, &topology_count);
+  if (status != B_OK) {
+    uv__free(topology_infos);
+    return UV__ERR(status);
+  }
+
+  cpuspeed = 0;
+  for (i = 0; i < (int)topology_count; i++) {
+    if (topology_infos[i].type == B_TOPOLOGY_CORE) {
+      cpuspeed = topology_infos[i].data.core.default_frequency;
+      break;
+    }
+  }
+
+  uv__free(topology_infos);
+
+  status = get_system_info(&system);
+  if (status != B_OK)
+    return UV__ERR(status);
+
+  *cpu_infos = uv__calloc(system.cpu_count, sizeof(**cpu_infos));
+  if (*cpu_infos == NULL)
+    return UV_ENOMEM;
+
+  /* CPU time and model are not exposed by Haiku. */
+  cpu_info = *cpu_infos;
+  for (i = 0; i < (int)system.cpu_count; i++) {
+    cpu_info->model = uv__strdup("unknown");
+    cpu_info->speed = (int)(cpuspeed / 1000000);
+    cpu_info++;
+  }
+  *count = system.cpu_count;
+
+  return 0;
+}
+
+
+void uv_free_cpu_info(uv_cpu_info_t* cpu_infos, int count) {
+  int i;
+
+  for (i = 0; i < count; i++)
+    uv__free(cpu_infos[i].model);
+
+  uv__free(cpu_infos);
+}
+'''
+
+if not os.path.exists(path("deps/uv/src/unix/haiku.c")):
+    full = path("deps/uv/src/unix/haiku.c")
+    backup(full)
+    open(full, "w", encoding="utf-8").write(UV_HAIKU_C)
+
+    edit("deps/uv/include/uv/unix.h",
+         lambda s: once(s, '#elif defined(__GNU__)\n# include "uv/posix.h"\n',
+                        '#elif defined(__GNU__)\n# include "uv/posix.h"\n'
+                        '#elif defined(__HAIKU__)\n# include "uv/posix.h"\n'),
+         "libuv 1.27: Haiku uses uv/posix.h", "__HAIKU__")
+
+    def uv_core(s):
+        # No FIOCLEX (uv__cloexec_fcntl is used) and a struct rusage with
+        # only the times.
+        s = once(s, "#if !defined(__CYGWIN__) && !defined(__MSYS__)\nint uv__cloexec_ioctl(",
+                 "#if !defined(__CYGWIN__) && !defined(__MSYS__) && !defined(__HAIKU__)\nint uv__cloexec_ioctl(")
+        return once(s, "#if !defined(__MVS__)\n  rusage->ru_maxrss",
+                    "#if !defined(__MVS__) && !defined(__HAIKU__)\n  rusage->ru_maxrss")
+    edit("deps/uv/src/unix/core.c", uv_core, "libuv 1.27: Haiku cloexec, rusage", "__HAIKU__")
+
+    edit("deps/uv/src/unix/process.c",
+         lambda s: once(s, "    if (n == SIGKILL || n == SIGSTOP)\n      continue;  /* Can't be changed. */\n",
+                        "    if (n == SIGKILL || n == SIGSTOP)\n      continue;  /* Can't be changed. */\n\n"
+                        "#if defined(__HAIKU__)\n    if (n == SIGKILLTHR)\n      continue;  /* Can't be changed. */\n#endif\n"),
+         "libuv 1.27: Haiku SIGKILLTHR", "__HAIKU__")
+
+    def uv_ifaddrs(s):
+        s = once(s, "\nstatic int uv__ifaddr_exclude(",
+                 "\n#if defined(__HAIKU__)\n#define IFF_RUNNING IFF_LINK\n#endif\n\nstatic int uv__ifaddr_exclude(")
+        return once(s, "#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__DragonFly__)\n  /*\n   * On BSD getifaddrs",
+                    "#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__DragonFly__) || \\\n"
+                    "    defined(__HAIKU__)\n  /*\n   * On BSD getifaddrs")
+    edit("deps/uv/src/unix/bsd-ifaddrs.c", uv_ifaddrs, "libuv 1.27: Haiku interface addresses", "__HAIKU__")
+
+    def uv_fs(s):
+        # futimens() and utimensat() exist on Haiku.
+        s = once(s, "#if defined(__linux__)                                                        \\\n    || defined(_AIX71)\n",
+                 "#if defined(__linux__)                                                        \\\n    || defined(_AIX71)                                                         \\\n    || defined(__HAIKU__)\n")
+        return once(s, "    || defined(_AIX71)                                                         \\\n    || defined(__sun)\n",
+                    "    || defined(_AIX71)                                                         \\\n    || defined(__sun)                                                          \\\n    || defined(__HAIKU__)\n")
+    edit("deps/uv/src/unix/fs.c", uv_fs, "libuv 1.27: Haiku futimens, utimensat", "__HAIKU__")
 
 CARES_HAIKU = """        [ 'OS=="haiku"', {
           'include_dirs': [ 'config/haiku' ],
@@ -389,6 +627,11 @@ def sampler(s):
               "  state->sp = reinterpret_cast<void*>(mcontext.rsp);\n"
               "  state->fp = reinterpret_cast<void*>(mcontext.rbp);\n"
               "#endif  // V8_HOST_ARCH_*\\1")
+    # V8 6.x and 7.x (Node 10, 11) hash pthread_t as an integer; on Haiku it
+    # is a pointer, as on the BSDs.
+    if "uint32_t ThreadHash(pthread_t thread_id)" in s:
+        s = resub(s, r"(uint32_t ThreadHash\(pthread_t thread_id\) \{\n#if V8_OS_BSD)\n",
+                  r"\1 || V8_OS_HAIKU\n")
     return s
 
 

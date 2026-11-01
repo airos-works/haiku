@@ -206,13 +206,13 @@
 #define HAVE_PF_INET6
 
 /* Define to 1 if you have the recv function. */
-/* #undef HAVE_RECV */
+#define HAVE_RECV 1
 
 /* Define to 1 if you have the recvfrom function. */
-/* #undef HAVE_RECVFROM */
+#define HAVE_RECVFROM 1
 
 /* Define to 1 if you have the send function. */
-/* #undef HAVE_SEND */
+#define HAVE_SEND 1
 
 /* Define to 1 if you have the setsockopt function. */
 /* #undef HAVE_SETSOCKOPT */
