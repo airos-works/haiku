@@ -3,3 +3,4 @@ rkvdec0_profile rock5-itx-edk2-v1.1-rkvdec0-power
 av1_profile rock5-itx-edk2-v1.1-av1-power
 decode_profile rock5-itx-edk2-v1.1-rkvdec0-h264-h265
 av1_decode_profile rock5-itx-edk2-v1.1-vpu981-av1
+encode_profile rock5-itx-edk2-v1.1-rkvenc0-h264-h265

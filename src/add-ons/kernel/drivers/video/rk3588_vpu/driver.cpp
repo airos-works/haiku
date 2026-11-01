@@ -1988,9 +1988,13 @@ InitDriver(device_node* node, void** cookie)
 		profile = get_driver_parameter(settings, "av1_decode_profile", "", "");
 		controller->av1DecodeEnabled = strcmp(profile,
 			"rock5-itx-edk2-v1.1-vpu981-av1") == 0;
+		// Installations made before the encoder have the decoder's profile
+		// but no encode_profile line (the settings file is copied once):
+		// they encode too, unless the line names something else ("off").
 		profile = get_driver_parameter(settings, "encode_profile", "", "");
 		controller->encodeEnabled = strcmp(profile,
-			"rock5-itx-edk2-v1.1-rkvenc0-h264-h265") == 0;
+			"rock5-itx-edk2-v1.1-rkvenc0-h264-h265") == 0
+			|| (profile[0] == '\0' && controller->decodeEnabled);
 		if (controller->decodeEnabled || controller->av1DecodeEnabled
 			|| controller->encodeEnabled) {
 			const char* pool = get_driver_parameter(settings, "dma_pool_mb",
