@@ -36,6 +36,7 @@ ECMDevice::ECMDevice(usb_device device)
 		fNotifyBufferLength(0),
 		fLinkStateChangeSem(-1),
 		fHasConnection(false),
+		fConnectionNotified(false),
 		fDownstreamSpeed(0),
 		fUpstreamSpeed(0)
 {
@@ -402,7 +403,9 @@ ECMDevice::Control(uint32 op, void *buffer, size_t length)
 		}
 
 		default:
-			TRACE_ALWAYS("unsupported ioctl %" B_PRIu32 "\n", op);
+			// The stack asks every driver for statistics (SIOCGIFSTATS) and
+			// more; not knowing them is not worth a syslog line each time.
+			TRACE("unsupported ioctl %" B_PRIu32 "\n", op);
 	}
 
 	return B_DEV_INVALID_IOCTL;
@@ -700,6 +703,7 @@ ECMDevice::_NotifyCallback(void *cookie, int32 status, void *data,
 			case CDC_NOTIFY_NETWORK_CONNECTION:
 				TRACE("connection state change to %d\n", notification->value);
 				device->fHasConnection = notification->value > 0;
+				device->fConnectionNotified = true;
 				linkStateChange = true;
 				break;
 
@@ -716,7 +720,13 @@ ECMDevice::_NotifyCallback(void *cookie, int32 status, void *data,
 				speed = (cdc_connection_speed *)&notification->data[0];
 				device->fUpstreamSpeed = speed->upstream_speed;
 				device->fDownstreamSpeed = speed->downstream_speed;
-				device->fHasConnection = true;
+				// The link state comes from NetworkConnection. Devices send
+				// a speed change while the cable is unplugged too (Realtek
+				// RTL8153 in monitor docks), which made such a port look
+				// connected. Only a device that never reports its
+				// connection gets its link from a speed change.
+				if (!device->fConnectionNotified)
+					device->fHasConnection = speed->downstream_speed > 0;
 				TRACE("connection speed change to %" B_PRId32 "/%" B_PRId32 "\n",
 					speed->downstream_speed, speed->upstream_speed);
 				linkStateChange = true;
