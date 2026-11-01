@@ -1936,8 +1936,14 @@ nvm_ls_remote_index_tab() {
   fi
 
   nvm_is_zsh && setopt local_options shwordsplit
+  local INDEX_URL
+  INDEX_URL="${MIRROR}/index.tab"
+  if [ "${MIRROR}" = "${NVM_HAIKU_MIRROR_DEFAULT}" ]; then
+    # GitHub release downloads need a tag: the index is the "index" release's.
+    INDEX_URL="${MIRROR}/index/index.tab"
+  fi
   local VERSION_LIST
-  VERSION_LIST="$(nvm_download -L -s "${MIRROR}/index.tab" -o - \
+  VERSION_LIST="$(nvm_download -L -s "${INDEX_URL}" -o - \
     | command sed "
         1d;
         s/^/${PREFIX}/;
@@ -2469,9 +2475,10 @@ nvm_is_merged_node_version() {
 # Haiku: nodejs.org publishes no Haiku binaries. On Haiku the version index,
 # the binaries and their SHASUMS256.txt come from $NVM_HAIKU_MIRROR, a
 # directory in the nodejs.org dist layout (https://... or file:///path);
-# source tarballs still come from $NVM_NODEJS_ORG_MIRROR.
-# PLACEHOLDER: the public location of the Haiku binaries is not decided yet.
-NVM_HAIKU_MIRROR_DEFAULT='https://haiku-node-mirror.invalid/dist'
+# source tarballs still come from $NVM_NODEJS_ORG_MIRROR. The default is
+# air/OS's mirror on GitHub: one release per Node.js version, tagged like the
+# version's directory (v26.13.0), and the index in the release tagged "index".
+NVM_HAIKU_MIRROR_DEFAULT='https://github.com/airos-works/node-haiku/releases/download'
 
 # args: flavor, type, [kind: binary or source]
 nvm_get_mirror() {
@@ -2644,8 +2651,8 @@ nvm_install_binary() {
   fi
 
 
-  if [ "_${NVM_OS}" = '_haiku' ] && [ -z "${NVM_HAIKU_MIRROR-}" ]; then
-    nvm_err 'No Haiku binary mirror is configured: set NVM_HAIKU_MIRROR to one (https://... or file:///path).'
+  if [ "_${NVM_OS}" = '_haiku' ]; then
+    nvm_err "There is no Haiku binary of ${VERSION} on $(nvm_get_mirror node std binary)."
   fi
 
   # Read nosource from arguments
@@ -3012,10 +3019,10 @@ nvm_install_source() {
       make="gmake${MAKE_SHELL_OVERRIDE-}"
     ;;
   esac
-  local NVM_HAIKU_PATCH
+  local NVM_HAIKU_PORT
   if [ "${NVM_OS}" = 'haiku' ]; then
-    nvm_haiku_check_build_prerequisites || return 1
-    NVM_HAIKU_PATCH="$(nvm_haiku_patch "${VERSION}")" || return 1
+    nvm_haiku_check_build_prerequisites "${VERSION}" || return 1
+    NVM_HAIKU_PORT="$(nvm_haiku_port_script)" || return 1
     ADDITIONAL_PARAMETERS="--dest-os=haiku --dest-cpu=x64 ${ADDITIONAL_PARAMETERS}"
   fi
   if nvm_has "clang++" && nvm_has "clang" && nvm_version_greater_than_or_equal_to "$(nvm_clang_version)" 3.5; then
@@ -3047,7 +3054,7 @@ nvm_install_source() {
     nvm_extract_tarball "${NVM_OS}" "${VERSION}" "${TARBALL}" "${TMPDIR}" && \
     VERSION_PATH="$(nvm_version_path "${PREFIXED_VERSION}")" && \
     nvm_cd "${TMPDIR}" && \
-    nvm_haiku_apply_patch "${NVM_HAIKU_PATCH-}" && \
+    nvm_haiku_port "${NVM_HAIKU_PORT-}" "${VERSION}" && \
     nvm_echo '$>'./configure --prefix="${VERSION_PATH}" $ADDITIONAL_PARAMETERS'<' && \
     ./configure --prefix="${VERSION_PATH}" $ADDITIONAL_PARAMETERS && \
     $make -j "${NVM_MAKE_JOBS}" ${MAKE_CXX-} && \
@@ -3060,54 +3067,76 @@ nvm_install_source() {
   fi
 }
 
-# Haiku: the Node.js patch for a major version, e.g. haiku/patches/node-v24.patch
-# next to nvm.sh (or in $NVM_HAIKU_PATCH_DIR).
-nvm_haiku_patch() {
-  local MAJOR
-  MAJOR="$(nvm_echo "${1-}" | command sed 's/^v//; s/\..*//')"
+# Haiku: port-haiku.py ports a Node.js source tree to Haiku, one script for
+# every release nvm can build (10.x and later); it lives in haiku/port next to
+# nvm.sh (or in $NVM_HAIKU_PORT_DIR).
+nvm_haiku_port_script() {
   local DIR
   # In bash, BASH_SOURCE (element 0) names the file that defined this function.
   # shellcheck disable=SC2128,SC3028
-  for DIR in "${NVM_HAIKU_PATCH_DIR-}" "$(dirname "${BASH_SOURCE:-.}")/haiku/patches" \
-    "${NVM_DIR}/haiku/patches" /boot/system/data/nvm/haiku/patches; do
-    if [ -n "${DIR}" ] && [ -f "${DIR}/node-v${MAJOR}.patch" ]; then
-      nvm_echo "${DIR}/node-v${MAJOR}.patch"
+  for DIR in "${NVM_HAIKU_PORT_DIR-}" "$(dirname "${BASH_SOURCE:-.}")/haiku/port" \
+    "${NVM_DIR}/haiku/port" /boot/system/data/nvm/haiku/port; do
+    if [ -n "${DIR}" ] && [ -f "${DIR}/port-haiku.py" ]; then
+      nvm_echo "${DIR}/port-haiku.py"
       return 0
     fi
   done
-  nvm_err "There is no Haiku patch for Node.js ${MAJOR}.x (node-v${MAJOR}.patch), so ${1-} cannot be built on Haiku."
+  nvm_err 'The Haiku port of Node.js (haiku/port/port-haiku.py) is missing; reinstall the nvm package.'
   return 1
 }
 
-nvm_haiku_apply_patch() {
+nvm_haiku_python3() {
+  local PY
+  for PY in python3 python3.15 python3.14 python3.13 python3.12 python3.11 python3.10 python3.9; do
+    if nvm_has "${PY}"; then
+      nvm_echo "${PY}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# args: port script, version
+nvm_haiku_port() {
   if [ -z "${1-}" ]; then
     return 0
   fi
-  nvm_echo "Applying the Haiku patch $(nvm_sanitize_path "${1}")"
-  command patch -p1 --forward --batch --silent < "${1}" && return 0
-  nvm_err "The Haiku patch does not apply to this version; the patch was made for the release named in its first line:"
-  nvm_err "$(command head -n 1 "${1}")"
+  nvm_echo "Porting ${2-} to Haiku with $(nvm_sanitize_path "${1}")"
+  "$(nvm_haiku_python3)" "${1}" . && return 0
+  nvm_err "The Haiku port does not cover ${2-} yet (see the MANUAL lines above)."
   return 1
 }
 
+# args: version
 nvm_haiku_check_build_prerequisites() {
+  local MAJOR
+  MAJOR="$(nvm_echo "${1-}" | command sed 's/^v//; s/\..*//')"
+  if [ "${MAJOR}" -lt 10 ] 2>/dev/null; then
+    nvm_err "Node.js ${1-} cannot be built on Haiku: the Haiku port covers Node.js 10 and later."
+    return 1
+  fi
   local MISSING
   MISSING=''
   nvm_has gcc && nvm_has g++ && nvm_has as || MISSING="${MISSING} gcc binutils"
   nvm_has make || MISSING="${MISSING} make"
-  nvm_has patch || MISSING="${MISSING} patch"
-  local PY
-  for PY in python3 python3.14 python3.13 python3.12 python3.11 python3.10 python3.9; do
-    if nvm_has "${PY}"; then
-      PY=found
-      break
-    fi
-  done
-  [ "${PY}" = found ] || MISSING="${MISSING} python3.10"
+  nvm_haiku_python3 >/dev/null || MISSING="${MISSING} python3.10"
   [ -f /boot/system/develop/headers/os/BeBuild.h ] || MISSING="${MISSING} haiku_devel"
   if [ -n "${MISSING}" ]; then
     nvm_err "Building Node.js from source on Haiku needs build tools that are not installed:${MISSING}"
     nvm_err "Install them with: pkgman install${MISSING}"
+    return 1
+  fi
+  # The build systems of Node.js 10 and 11 run on Python 2 only, which
+  # HaikuPorts no longer has; those of 12 to 19 import distutils, which
+  # Python 3.12 dropped.
+  if [ "${MAJOR}" -le 11 ] && ! nvm_has python2.7 && ! nvm_has python2; then
+    nvm_err "Building Node.js ${MAJOR}.x needs Python 2.7, which HaikuPorts no longer packages."
+    nvm_err "The Haiku mirror has a binary of the last ${MAJOR}.x release: nvm install ${MAJOR}"
+    return 1
+  fi
+  if [ "${MAJOR}" -ge 12 ] && [ "${MAJOR}" -le 19 ] && ! nvm_has python3.11 && ! nvm_has python3.10; then
+    nvm_err "Building Node.js ${MAJOR}.x needs Python 3.10 or 3.11 (it uses distutils, which later Pythons lack)."
+    nvm_err "Install it with: pkgman install python3.10"
     return 1
   fi
 }

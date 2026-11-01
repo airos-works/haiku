@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Apply the Haiku port edits to an extracted Node.js source tree.
+"""Port an extracted Node.js source tree to Haiku (x86_64).
 
 usage: port-haiku.py <node-source-dir> [ares_config.h]
 
-This is how the per-major patches in nvm/haiku/patches were produced: run it
-on a pristine node-vX.Y.Z tree (with PORT_HAIKU_ORIG=<dir> it keeps the
-originals, so `diff -u` of the touched files gives the patch; or use git),
-fix whatever it reports as MANUAL by hand, build and test. Every edit is
-anchored on the upstream source and skipped when its marker shows it is
-already there; an anchor that is missing is reported instead of guessed.
-Edits that only exist in some majors are marked optional.
+nvm runs this on the source tree of every release it builds on Haiku, and
+tools/nodejs-haiku/build-node.sh does for the binaries on the Haiku mirror.
+Every edit is anchored on the upstream source and skipped when its marker
+shows it is already there; an anchor that is missing is reported as MANUAL
+(exit status 1) instead of guessed. Edits that only exist in some majors are
+marked optional, so one script covers Node.js 10 to 26 and the later
+releases of each major.
 
-The optional ares_config.h is c-ares' own configure result on Haiku (cmake
-on the bundled deps/cares), which becomes deps/cares/config/haiku/.
+c-ares' own configure result on Haiku becomes deps/cares/config/haiku/
+ares_config.h: the given file, or the one in ares/ next to this script that
+matches the bundled c-ares (see make-ares-config.sh). With
+PORT_HAIKU_ORIG=<dir> the original of every changed file is kept there.
 """
 import os, re, shutil, sys
 
@@ -79,9 +81,30 @@ def resub(s, pattern, repl, flags=0):
 
 # --- build system -----------------------------------------------------------
 
+_ver = open(path("src/node_version.h")).read()
+_major = int(re.search(r"#define NODE_MAJOR_VERSION (\d+)", _ver).group(1))
+
 edit("configure.py",
      lambda s: resub(s, r"(valid_os = \((?:[^)]*?))\)", r"\1, 'haiku')", re.S),
      "valid_os += haiku", "'haiku')")
+
+
+
+# Node 12 to 13 and 15: configure only accepts the Pythons of its day, the
+# newest of which HaikuPorts no longer has; their build runs on 3.10 and 3.11
+# (3.12 dropped distutils, which they import). 10 and 11 need Python 2.7.
+def configure_python(s):
+    s = once(s, "_=[ 'exec' '/bin/sh' '-c' '''\n",
+             "_=[ 'exec' '/bin/sh' '-c' '''\n"
+             "command -v python3.11 >/dev/null && exec python3.11 \"$0\" \"$@\"\n"
+             "command -v python3.10 >/dev/null && exec python3.10 \"$0\" \"$@\"\n")
+    if "acceptable_pythons = ((" in s:
+        return once(s, "acceptable_pythons = ((", "acceptable_pythons = ((3, 11), (3, 10), (")
+    return once(s, "if sys.version_info[:2] != (2, 7):", "if sys.version_info[:2] not in ((2, 7), (3, 10), (3, 11)):")
+
+
+edit("configure", configure_python, "Python 3.10 and 3.11", "python3.10",
+     optional=_major < 12)
 
 edit("tools/gyp/pylib/gyp/common.py",
      lambda s: resub(s, r"(def GetFlavor(?:ByPlatform)?\((?:params)?\):.*?)(\n\n([ \t]+)return [\"']linux[\"'])",
@@ -103,6 +126,36 @@ def common_gypi(s):
 
 
 edit("common.gypi", common_gypi, "POSIX OS lists", ' haiku"')
+
+# Node 19 and older predate gcc 13, whose C++ library headers no longer pull
+# in <cstdint>, <utility> and friends: V8 and Node then miss declarations
+# (std::exchange, uint8_t ...). Pre-include them, as gcc 12 effectively did.
+GCC13_INCLUDES = ["cstdint", "cstddef", "cstring", "climits", "limits", "utility",
+                  "memory", "string", "stdexcept", "algorithm"]
+if _major < 20:
+    edit("common.gypi",
+         lambda s: resub(s, r"(\n(\s+)\[ 'OS in \"linux freebsd openbsd solaris aix[^\"]*haiku\"', \{\n\s+'cflags': \[ '-pthread' \])",
+                         lambda m: "\n%s[ 'OS==\"haiku\"', {\n%s  'cflags_cc': [ %s ],\n%s}],%s" % (
+                             m.group(2), m.group(2),
+                             ", ".join("'-include', '%s'" % h for h in GCC13_INCLUDES),
+                             m.group(2), m.group(1))),
+         "gcc 13 headers", "'-include', 'cstdint'")
+
+
+# Node 12 to 19 bundle jinja2/markupsafe releases that import the container
+# ABCs from collections, which Python 3.10 no longer allows.
+if 12 <= _major < 20:
+    for top in ("deps/v8/third_party", "tools"):
+        for dirpath, dirs, files in os.walk(path(top)):
+            if os.path.basename(dirpath) not in ("jinja2", "markupsafe"):
+                continue
+            for f in files:
+                if f.endswith(".py"):
+                    rel = os.path.relpath(os.path.join(dirpath, f), root)
+                    edit(rel, lambda s: re.sub(
+                        r"^(\s*)from collections import ((?:Mutable)?(?:Mapping|Set|Sequence)(?:, (?:Mutable)?(?:Mapping|Set|Sequence))*)$",
+                        r"\1from collections.abc import \2", s, flags=re.M),
+                         "collections.abc", "from collections.abc import", optional=True)
 
 
 def node_gypi(s):
@@ -158,12 +211,39 @@ edit("deps/cares/cares.gyp",
      lambda s: resub(s, r"(        \[ 'OS==\"openbsd\"', \{\n          'include_dirs': \[ 'config/openbsd' \],\n.*?\n        \}\],\n)",
                      lambda m: m.group(1) + CARES_HAIKU, re.S),
      "c-ares haiku config", 'config/haiku')
-if len(sys.argv) > 2:
+
+
+def ares_config():
+    """The c-ares configure result for the bundled c-ares, from ares/ next to
+    this script (ares_config-X.Y.Z.h, made by make-ares-config.sh). A c-ares
+    release without one takes the nearest older one of the same minor
+    version, then the nearest older one at all: c-ares' configure checks
+    hardly change between releases (1.34.5 to 1.34.9 give the same file)."""
+    s = open(path("deps/cares/include/ares_version.h")).read()
+    want = tuple(int(n) for n in re.search(r'ARES_VERSION_STR\s+"(\d+)\.(\d+)\.(\d+)', s).groups())
+    have = {}
+    adir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ares")
+    for f in os.listdir(adir):
+        m = re.match(r"ares_config-(\d+)\.(\d+)\.(\d+)\.h$", f)
+        if m:
+            have[tuple(int(n) for n in m.groups())] = os.path.join(adir, f)
+    older = sorted(v for v in have if v <= want)
+    same_minor = [v for v in older if v[:2] == want[:2]]
+    pick = (same_minor or older or [None])[-1]
+    if pick is None:
+        manual.append("deps/cares/config/haiku/ares_config.h: no config for c-ares %d.%d.%d,"
+                      " run make-ares-config.sh on Haiku" % want)
+        return None
+    if pick != want:
+        print("note: c-ares %d.%d.%d uses the configure result of %d.%d.%d" % (want + pick))
+    return have[pick]
+
+
+config = sys.argv[2] if len(sys.argv) > 2 else ares_config()
+if config:
     os.makedirs(path("deps/cares/config/haiku"), exist_ok=True)
     backup(path("deps/cares/config/haiku/ares_config.h"))
-    shutil.copy(sys.argv[2], path("deps/cares/config/haiku/ares_config.h"))
-elif not os.path.exists(path("deps/cares/config/haiku/ares_config.h")):
-    manual.append("deps/cares/config/haiku/ares_config.h: generate it with cmake on Haiku")
+    shutil.copy(config, path("deps/cares/config/haiku/ares_config.h"))
 
 OPENSSL_HAIKU = """    }, 'OS=="haiku"', {
       'cflags': ['-Wno-missing-field-initializers',],
@@ -242,7 +322,8 @@ def node_report(s):
     return s
 
 
-edit("src/node_report.cc", node_report, "Haiku lacks RLIMIT_MEMLOCK/RSS/NPROC", '__HAIKU__')
+edit("src/node_report.cc", node_report, "Haiku lacks RLIMIT_MEMLOCK/RSS/NPROC", '__HAIKU__',
+     optional=not os.path.exists(path("src/node_report.cc")))
 
 
 # ICU (bundled, full): Haiku has no /etc/localtime and TZ is normally unset;
@@ -273,8 +354,12 @@ edit("deps/icu-small/source/common/putil.cpp", icu_putil, "Haiku default time zo
 
 def v8config(s):
     s = resub(s, r"(//  V8_OS_FREEBSD +- FreeBSD\n)", r"\1//  V8_OS_HAIKU         - Haiku\n")
-    s = resub(s, r"(# define V8_OS_STRING \"freebsd\"\n\n)",
-              r'\1#elif defined(__HAIKU__)\n# define V8_OS_HAIKU 1\n# define V8_OS_POSIX 1\n# define V8_OS_STRING "haiku"\n\n')
+    if "V8_OS_STRING" in s:
+        s = resub(s, r"(# define V8_OS_STRING \"freebsd\"\n\n)",
+                  r'\1#elif defined(__HAIKU__)\n# define V8_OS_HAIKU 1\n# define V8_OS_POSIX 1\n# define V8_OS_STRING "haiku"\n\n')
+    else:  # V8 8 and older
+        s = resub(s, r"(# define V8_OS_FREEBSD 1\n# define V8_OS_POSIX 1\n)",
+                  r"\1#elif defined(__HAIKU__)\n# define V8_OS_HAIKU 1\n# define V8_OS_POSIX 1\n")
     return s
 
 
@@ -284,9 +369,11 @@ edit("deps/v8/include/v8config.h", v8config, "V8_OS_HAIKU", 'V8_OS_HAIKU')
 def platform_posix(s):
     s = resub(s, r"(#if !defined\(_AIX\) && !defined\(V8_OS_FUCHSIA\)[^\n]*)(\n#include <sys/syscall.h>)",
               r"\1 && !defined(__HAIKU__)\2")
-    # Haiku has its own Stack::ObtainCurrentThreadStackStart / GetStackStart.
-    s = resub(s, r"(\n#if !defined\(V8_OS_FREEBSD\) && !defined\(V8_OS_(?:DARWIN|MACOSX)\) && !defined\(_AIX\) && \\\n\s+!defined\(V8_OS_SOLARIS\))",
-              r"\1 && !defined(V8_OS_HAIKU)")
+    # Haiku has its own Stack::ObtainCurrentThreadStackStart / GetStackStart
+    # (V8 8.4 and later; before, V8 had no such function).
+    if "GetStackStart" in s:
+        s = resub(s, r"(\n#if !defined\(V8_OS_FREEBSD\) && !defined\(V8_OS_(?:DARWIN|MACOSX)\) && !defined\(_AIX\) && \\\n\s+!defined\(V8_OS_SOLARIS\))",
+                  r"\1 && !defined(V8_OS_HAIKU)")
     return s
 
 
@@ -295,7 +382,7 @@ edit("deps/v8/src/base/platform/platform-posix.cc", platform_posix, "no sys/sysc
 
 def sampler(s):
     s = resub(s, r"(#if !V8_OS_QNX && !V8_OS_AIX[^\n]*)(\n#include <sys/syscall.h>)", r"\1 && !V8_OS_HAIKU\2")
-    s = resub(s, r"#elif !V8_OS_OPENBSD\n#include <ucontext.h>", "#elif !V8_OS_OPENBSD && !V8_OS_HAIKU\n#include <ucontext.h>")
+    s = resub(s, r"(#elif[^\n]*!V8_OS_OPENBSD)\n#include <ucontext.h>", r"\1 && !V8_OS_HAIKU\n#include <ucontext.h>")
     s = resub(s, r"(\n#elif V8_OS_NETBSD\n#if V8_HOST_ARCH_IA32\n)",
               "\n#elif V8_OS_HAIKU\n#if V8_HOST_ARCH_X64\n"
               "  state->pc = reinterpret_cast<void*>(mcontext.rip);\n"
@@ -324,15 +411,36 @@ edit("deps/v8/src/trap-handler/trap-handler.h",
                      r"#if defined(V8_OS_AIX) || defined(V8_OS_HAIKU)\n\1"),
      "__thread for g_thread_in_wasm_code", 'V8_OS_HAIKU', optional=True)
 
+# Node 10 and 11 build V8 with its own gyp files (deps/v8/gypfiles).
+v8_own_gyp = not os.path.exists(path("tools/v8_gypfiles"))
+
 edit("tools/v8_gypfiles/features.gypi",
      lambda s: resub(s, r"(\n(\s+)\['OS==\"android\"', \{ # GYP reverts OS to linux)",
                      r"""\n\2['OS == "haiku"', {\n\2  'is_haiku': 1,\n\2}, {\n\2  'is_haiku': 0,\n\2}],\1"""),
-     "is_haiku", 'is_haiku')
+     "is_haiku", 'is_haiku', optional=v8_own_gyp)
 
 edit("tools/v8_gypfiles/v8.gyp",
-     lambda s: resub(s, r"(\n(\s+)\['OS == \"mac\" or \(_toolset==\"host\" and host_os==\"mac\"\)', \{\n\s+'sources': \[\n\s+'<\(V8_ROOT\)/src/base/debug/stack_trace_posix.cc',)",
+     lambda s: resub(s, r"(\n(\s+)\['OS == \"mac\" or (?:\(_toolset==\"host\" and host_os==\"mac\"\)|OS == \"ios\")', \{\n\s+'sources': \[\n\s+'<\(V8_ROOT\)/src/base/debug/stack_trace_posix.cc',)",
                      r"\n\2['is_haiku', {\n\2  'sources': [\n\2    '<(V8_ROOT)/src/base/debug/stack_trace_posix.cc',\n\2    '<(V8_ROOT)/src/base/platform/platform-haiku.cc',\n\2  ]\n\2}],\1"),
-     "platform-haiku.cc", 'platform-haiku.cc')
+     "platform-haiku.cc", 'platform-haiku.cc', optional=v8_own_gyp)
+
+V8_LIBBASE_HAIKU = """        ['OS=="haiku"', {
+            'sources': [
+              '../src/base/debug/stack_trace_posix.cc',
+              '../src/base/platform/platform-haiku.cc',
+              '../src/base/platform/platform-posix.h',
+              '../src/base/platform/platform-posix.cc',
+              '../src/base/platform/platform-posix-time.h',
+              '../src/base/platform/platform-posix-time.cc',
+            ],
+          }
+        ],
+"""
+if v8_own_gyp:
+    edit("deps/v8/gypfiles/v8.gyp",
+         lambda s: resub(s, r"(\n)(        \['OS==\"freebsd\"', \{\n            'link_settings': \{)",
+                         lambda m: m.group(1) + V8_LIBBASE_HAIKU + m.group(2)),
+         "platform-haiku.cc", 'platform-haiku.cc')
 
 # abseil (V8 12 and later): a thread ID for Haiku, whose pthread_t is a pointer.
 def absl_sysinfo(s):
@@ -363,15 +471,13 @@ edit("deps/crates/crates.gyp",
 # only includes <arpa/inet.h>/<netinet/in.h> on Linux; without them htonl()
 # and friends (macros on Haiku) end up as undefined functions. Only needed,
 # and only tested, where the QUIC deps are actually built (21 of our majors).
-_ver = open(path("src/node_version.h")).read()
-_major = int(re.search(r"#define NODE_MAJOR_VERSION (\d+)", _ver).group(1))
 if _major == 21:
     edit("deps/ngtcp2/ngtcp2.gyp",
          lambda s: s.replace("['OS==\"linux\" or OS==\"android\"', {\n          'defines': [\n            'HAVE_ARPA_INET_H',",
                              "['OS==\"linux\" or OS==\"android\" or OS==\"haiku\"', {\n          'defines': [\n            'HAVE_ARPA_INET_H',"),
          "QUIC deps need arpa/inet.h", "haiku")
 
-# One platform-haiku.cc serves V8 9.4 to 14.6; it sits next to this script.
+# One platform-haiku.cc serves V8 6.8 to 14.6; it sits next to this script.
 backup(path("deps/v8/src/base/platform/platform-haiku.cc"))
 shutil.copy(os.path.join(os.path.dirname(os.path.abspath(__file__)), "platform-haiku.cc"),
             path("deps/v8/src/base/platform/platform-haiku.cc"))
@@ -379,3 +485,4 @@ shutil.copy(os.path.join(os.path.dirname(os.path.abspath(__file__)), "platform-h
 for m in manual:
     print("MANUAL:", m)
 print("done, %d manual items" % len(manual))
+sys.exit(1 if manual else 0)

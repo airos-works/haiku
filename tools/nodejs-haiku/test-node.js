@@ -1,4 +1,4 @@
-// Smoke test for a Node.js build on Haiku. Works on Node 16 and later.
+// Smoke test for a Node.js build on Haiku. Works on Node 10 and later.
 // Prints one line per check and exits non-zero if any failed.
 'use strict';
 const assert = require('assert');
@@ -10,7 +10,7 @@ const crypto = require('crypto');
 const zlib = require('zlib');
 const https = require('https');
 const dns = require('dns');
-const { Worker } = require('worker_threads');
+const major = Number(process.versions.node.split('.')[0]);
 
 const results = [];
 async function check(name, fn) {
@@ -48,7 +48,8 @@ function httpsGet(url) {
     fs.renameSync(f, f + '.2');
     assert.deepStrictEqual(fs.readdirSync(dir), ['a.txt.2']);
     const watcher = typeof fs.watch === 'function';
-    fs.rmSync ? fs.rmSync(dir, { recursive: true }) : fs.rmdirSync(dir, { recursive: true });
+    fs.unlinkSync(f + '.2');
+    fs.rmdirSync(dir);
     return `ok (tmpdir ${os.tmpdir()}, fs.watch present: ${watcher})`;
   });
   await check('child_process', async () => {
@@ -70,8 +71,8 @@ function httpsGet(url) {
     d.setAuthTag(c.getAuthTag());
     assert.strictEqual(Buffer.concat([d.update(enc), d.final()]).toString(), 'secret');
     const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
-    const sig = crypto.sign('sha256', Buffer.from('x'), privateKey);
-    assert(crypto.verify('sha256', Buffer.from('x'), publicKey, sig));
+    const sig = crypto.createSign('sha256').update('x').sign(privateKey);
+    assert(crypto.createVerify('sha256').update('x').verify(publicKey, sig));
     return `sha256 ok, aes-256-gcm ok, ecdsa ok`;
   });
   await check('tls-https', async () => {
@@ -96,10 +97,16 @@ function httpsGet(url) {
     const data = Buffer.from('haiku '.repeat(1000));
     assert(zlib.gunzipSync(zlib.gzipSync(data)).equals(data));
     assert(zlib.inflateRawSync(zlib.deflateRawSync(data)).equals(data));
+    if (!zlib.brotliCompressSync) return `gzip ${zlib.gzipSync(data).length} bytes, no brotli in this version`;
     assert(zlib.brotliDecompressSync(zlib.brotliCompressSync(data)).equals(data));
     return `gzip ${zlib.gzipSync(data).length} bytes, brotli ${zlib.brotliCompressSync(data).length} bytes`;
   });
   await check('intl', () => {
+    // Node.js 10 to 12 bundle "small ICU" (English only), like nodejs.org's own builds.
+    if (process.config.variables.icu_small) {
+      assert.strictEqual((1234567.891).toLocaleString('en-US'), '1,234,567.891');
+      return `small ICU ${process.versions.icu}: en-US 1,234,567.891; tz ${Intl.DateTimeFormat().resolvedOptions().timeZone}`;
+    }
     assert.strictEqual((1234567.891).toLocaleString('de-DE'), '1.234.567,891');
     const d = new Date(Date.UTC(2026, 8, 26, 12, 0, 0));
     const ja = new Intl.DateTimeFormat('ja-JP', { dateStyle: 'full', timeZone: 'Asia/Tokyo' }).format(d);
@@ -111,6 +118,15 @@ function httpsGet(url) {
     return `de-DE 1.234.567,891; ja-JP ${ja}; fr-FR ${fr}; tz ${Intl.DateTimeFormat().resolvedOptions().timeZone}`;
   });
   await check('worker_threads', async () => {
+    if (major < 11) {
+      // Node 10 has worker_threads behind --experimental-worker.
+      const r = cp.spawnSync(process.execPath, ['--experimental-worker', '-e',
+        "const { Worker } = require('worker_threads'); const w = new Worker(\"require('worker_threads').parentPort.postMessage(42)\", { eval: true }); w.on('message', (m) => { process.stdout.write(String(m)); w.terminate(); });"],
+        { encoding: 'utf8' });
+      assert.strictEqual(r.stdout, '42', r.stderr);
+      return 'worker round trip ok (--experimental-worker)';
+    }
+    const { Worker } = require('worker_threads');
     const w = new Worker("const { parentPort } = require('worker_threads'); parentPort.on('message', (m) => parentPort.postMessage(m * 2));", { eval: true });
     const v = await new Promise((resolve, reject) => {
       w.on('message', resolve); w.on('error', reject); w.postMessage(21);

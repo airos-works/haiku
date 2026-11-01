@@ -3,8 +3,9 @@
 #
 #   build-node.sh <source-dir> [out-dir]
 #
-# <source-dir> is an extracted node-vX.Y.Z tree with the Haiku patch for its
-# major already applied (nvm/haiku/patches/node-vNN.patch). Everything is
+# <source-dir> is an extracted node-vX.Y.Z tree already ported with
+# data/nvm/haiku/port/port-haiku.py (Node.js 10 and 11 need python2.7 on
+# PATH, 12 to 19 python3.10 or 3.11). Everything is
 # bundled (OpenSSL, ICU, libuv, c-ares, nghttp2, brotli, zlib), so the result
 # only needs libroot, libbsd, libnetwork and gcc_syslibs at run time.
 # Produces <out-dir>/node-vX.Y.Z-haiku-x64.tar.{gz,xz} in the nodejs.org layout.

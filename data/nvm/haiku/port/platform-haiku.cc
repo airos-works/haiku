@@ -5,7 +5,7 @@
 // Platform-specific code for Haiku goes here. For the POSIX-compatible
 // parts, the implementation is in platform-posix.cc.
 //
-// One file for the V8 versions of Node.js 16 to 26 (V8 9.4 to 14.6); the
+// One file for the V8 versions of Node.js 10 to 26 (V8 6.8 to 14.6); the
 // few entry points whose names or signatures changed are picked by version.
 
 #include <OS.h>
@@ -36,7 +36,11 @@
 #include "src/base/platform/platform-posix.h"
 #include "src/base/platform/platform.h"
 
-#if V8_MAJOR_VERSION > 12 || (V8_MAJOR_VERSION == 12 && V8_MINOR_VERSION >= 9)
+#define HAIKU_V8_AT_LEAST(major, minor) \
+  (V8_MAJOR_VERSION > (major) ||            \
+   (V8_MAJOR_VERSION == (major) && V8_MINOR_VERSION >= (minor)))
+
+#if HAIKU_V8_AT_LEAST(12, 9)
 #include <optional>
 #endif
 
@@ -61,9 +65,11 @@ std::vector<OS::SharedLibraryAddress> OS::GetSharedLibraryAddresses() {
 
 void OS::SignalCodeMovingGC() {}
 
+#if HAIKU_V8_AT_LEAST(7, 8)
 void OS::AdjustSchedulingParams() {}
+#endif
 
-#if V8_MAJOR_VERSION > 12 || (V8_MAJOR_VERSION == 12 && V8_MINOR_VERSION >= 9)
+#if HAIKU_V8_AT_LEAST(12, 9)
 std::optional<OS::MemoryRange> OS::GetFirstFreeMemoryRangeWithin(
     OS::Address boundary_start, OS::Address boundary_end, size_t minimum_size,
     size_t alignment) {
@@ -78,15 +84,19 @@ std::vector<OS::MemoryRange> OS::GetFreeMemoryRangesWithin(
 #endif
 
 // The stack grows down: its start is the top, stack_end in Haiku's terms.
+#if HAIKU_V8_AT_LEAST(8, 4)
 #if V8_MAJOR_VERSION >= 11
 Stack::StackSlot Stack::ObtainCurrentThreadStackStart() {
-#else
+#elif V8_MAJOR_VERSION >= 9
 Stack::StackSlot Stack::GetStackStart() {
+#else
+void* Stack::GetStackStart() {
 #endif
   thread_info info;
   if (get_thread_info(find_thread(nullptr), &info) != B_OK) return nullptr;
   return info.stack_end;
 }
+#endif
 
 }  // namespace base
 }  // namespace v8
