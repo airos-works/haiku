@@ -119,6 +119,10 @@ public:
 			case AV_CODEC_ID_AV1:
 				fCoding = MPP_VIDEO_CodingAV1;
 				break;
+			case AV_CODEC_ID_VP9:
+				// Profiles 0 and 2 on RKVDEC; MPP's parser splits superframes.
+				fCoding = MPP_VIDEO_CodingVP9;
+				break;
 			default:
 				return B_NOT_SUPPORTED;
 		}
@@ -746,13 +750,24 @@ public:
 
 	status_t GetSupportedFormats(media_format** formats, size_t* count) override
 	{
-		static media_format supported[3];
+		static media_format supported[4];
+		static size_t supportedCount = 0;
 		static bool initialized = false;
 		if (!initialized) {
+			// Only where the RK3588's decoders are: the Media Kit gives a
+			// format to the first add-on that claims it and does not try
+			// another when that one fails, and the package that carries
+			// this add-on is installed on other arm64 boards too.
+			if (access("/dev/video/rk3588_vpu/0", F_OK) != 0) {
+				initialized = true;
+				*formats = supported;
+				*count = 0;
+				return B_OK;
+			}
 			const AVCodecID codecs[] = {AV_CODEC_ID_H264, AV_CODEC_ID_HEVC,
-				AV_CODEC_ID_AV1};
+				AV_CODEC_ID_AV1, AV_CODEC_ID_VP9};
 			BMediaFormats registry;
-			for (size_t index = 0; index < 3; index++) {
+			for (size_t index = 0; index < 4; index++) {
 				media_format_description description = {};
 				description.family = B_MISC_FORMAT_FAMILY;
 				description.u.misc.file_format = 'ffmp';
@@ -764,10 +779,11 @@ public:
 					return B_ERROR;
 				supported[index] = format;
 			}
+			supportedCount = 4;
 			initialized = true;
 		}
 		*formats = supported;
-		*count = 3;
+		*count = supportedCount;
 		return B_OK;
 	}
 };

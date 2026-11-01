@@ -565,8 +565,9 @@ ValidateMppJob(OpenHandle* opened, const MppServiceRequest* userRequests)
 	}
 	uint32_t decodeMode = UINT32_MAX;
 	if (opened->mppClientType == kMppClientRkvdec) {
+		// 0 HEVC, 1 H.264, 2 VP9 (MPP's vdpu34x VP9 HAL on the RK3588)
 		decodeMode = job.registers[9] & 0x3ff;
-		if ((job.registers[10] & 1) == 0 || decodeMode > 1)
+		if ((job.registers[10] & 1) == 0 || decodeMode > 2)
 			return B_BAD_VALUE;
 	} else if ((job.registers[1] & 1) == 0
 		|| (job.registers[1] & 0xffffff00) != 0
