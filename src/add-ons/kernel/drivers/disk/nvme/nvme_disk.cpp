@@ -288,9 +288,13 @@ nvme_disk_configure_features(nvme_disk_driver_info* info)
 static bool
 idle_d3_default()
 {
+#if defined(__i386__) || defined(__x86_64__)
 	cpuid_info cpuid;
 	return get_cpuid(&cpuid, 0, 0) == B_OK
 		&& memcmp(cpuid.eax_0.vendor_id, "AuthenticAMD", 12) == 0;
+#else
+	return false;
+#endif
 }
 
 
