@@ -16,6 +16,8 @@
 #include <NetworkInterface.h>
 #include <NetworkSettingsAddOn.h>
 
+#include "InterfaceStatus.h"
+
 
 enum BNetworkInterfaceType {
 	B_NETWORK_INTERFACE_TYPE_WIFI = 'wifi',
@@ -67,8 +69,7 @@ private:
 
 			BString				fDeviceName;
 			bool				fDisabled;
-			bool				fHasLink;
-			bool				fConnecting;
+			interface_status	fStatus;
 			BString				fSubtitle;
 };
 

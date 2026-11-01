@@ -40,8 +40,7 @@ InterfaceListItem::InterfaceListItem(const char* name,
 	fFirstLineOffset(0),
 	fLineOffset(0),
 	fDisabled(false),
-	fHasLink(false),
-	fConnecting(false)
+	fStatus(INTERFACE_STATUS_NO_LINK)
 {
 	fInterface.SetTo(name);
 	_Init();
@@ -281,9 +280,8 @@ InterfaceListItem::_UpdateState()
 	fDeviceName = Name();
 	fDeviceName.RemoveFirst("/dev/net/");
 
-	fDisabled = (fInterface.Flags() & IFF_UP) == 0;
-	fHasLink = fInterface.HasLink();
-	fConnecting = (fInterface.Flags() & IFF_CONFIGURING) != 0;
+	fStatus = GetInterfaceStatus(fInterface);
+	fDisabled = fStatus == INTERFACE_STATUS_DISABLED;
 
 	switch (fType) {
 		case B_NETWORK_INTERFACE_TYPE_WIFI:
@@ -309,45 +307,30 @@ InterfaceListItem::_UpdateState()
 BBitmap*
 InterfaceListItem::_StateIcon() const
 {
-	if (fDisabled)
-		return fIconOffline;
-	if (!fHasLink)
-		return fIconOffline;
-	// TODO!
-//	} else if ((fSettings->IPAddr(AF_INET).IsEmpty()
-//		&& fSettings->IPAddr(AF_INET6).IsEmpty())
-//		&& (fSettings->AutoConfigure(AF_INET)
-//		|| fSettings->AutoConfigure(AF_INET6))) {
-//		interfaceState = "connecting" B_UTF8_ELLIPSIS;
-//		stateIcon = fIconPending;
-
-	return fIconOnline;
+	switch (fStatus) {
+		case INTERFACE_STATUS_CONNECTED:
+			return fIconOnline;
+		case INTERFACE_STATUS_CONFIGURING:
+		case INTERFACE_STATUS_NO_ADDRESS:
+			return fIconPending != NULL ? fIconPending : fIconOffline;
+		default:
+			return fIconOffline;
+	}
 }
 
 
 const char*
 InterfaceListItem::_StateText() const
 {
-	if (fDisabled)
-		return B_TRANSLATE("Disabled");
-
-	if (!fInterface.HasLink()) {
+	if (fStatus == INTERFACE_STATUS_NO_LINK) {
 		switch (fType) {
 			case B_NETWORK_INTERFACE_TYPE_VPN:
 			case B_NETWORK_INTERFACE_TYPE_DIAL_UP:
 				return B_TRANSLATE("Disconnected");
 			default:
-				return B_TRANSLATE("No link");
+				break;
 		}
 	}
 
-	// TODO!
-//	} else if ((fSettings->IPAddr(AF_INET).IsEmpty()
-//		&& fSettings->IPAddr(AF_INET6).IsEmpty())
-//		&& (fSettings->AutoConfigure(AF_INET)
-//		|| fSettings->AutoConfigure(AF_INET6))) {
-//		interfaceState = "connecting" B_UTF8_ELLIPSIS;
-//		stateIcon = fIconPending;
-
-	return B_TRANSLATE("Connected");
+	return InterfaceStatusText(fStatus);
 }

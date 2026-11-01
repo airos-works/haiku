@@ -39,6 +39,7 @@
 #include <StringView.h>
 #include <Window.h>
 
+#include "InterfaceStatus.h"
 #include "MediaTypes.h"
 #include "ThroughputView.h"
 #include "WiFiController.h"
@@ -349,24 +350,9 @@ InterfaceView::_Update(bool updateWirelessNetworks)
 void
 InterfaceView::_UpdateStatus()
 {
-	static const rgb_color kGreen = make_color(52, 199, 89);
-	static const rgb_color kYellow = make_color(255, 204, 0);
-	static const rgb_color kRed = make_color(255, 69, 58);
-	static const rgb_color kGray = make_color(150, 150, 150);
-
-	uint32 flags = fInterface.Flags();
-
-	if ((flags & IFF_UP) == 0 && (flags & IFF_CONFIGURING) == 0)
-		fStatusField->SetStatus(B_TRANSLATE("Disabled"), kGray);
-	else if ((flags & IFF_LINK) == 0)
-		fStatusField->SetStatus(B_TRANSLATE("No link"), kRed);
-	else if ((flags & IFF_CONFIGURING) != 0) {
-		fStatusField->SetStatus(B_TRANSLATE("Configuring" B_UTF8_ELLIPSIS),
-			kYellow);
-	} else if ((flags & IFF_UP) != 0)
-		fStatusField->SetStatus(B_TRANSLATE("Connected"), kGreen);
-	else
-		fStatusField->SetStatus(B_TRANSLATE("Unknown"), kGray);
+	interface_status status = GetInterfaceStatus(fInterface);
+	fStatusField->SetStatus(InterfaceStatusText(status),
+		InterfaceStatusColor(status));
 }
 
 
