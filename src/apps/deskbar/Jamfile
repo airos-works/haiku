@@ -28,6 +28,7 @@ Application Deskbar :
 	DeskbarUtils.cpp
 	ExpandoMenuBar.cpp
 	InlineScrollView.cpp
+	LocationMenuItem.cpp
 	PreferencesWindow.cpp
 	ScreenCornerSelector.cpp
 	ShowHideMenuItem.cpp
@@ -52,6 +53,7 @@ DoCatalogs Deskbar :
 	BarWindow.cpp
 	DeskbarMenu.cpp
 	LocalizedFolders.h
+	LocationMenuItem.cpp
 	PreferencesWindow.cpp
 	StatusView.cpp
 	TimeView.cpp

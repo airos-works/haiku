@@ -41,6 +41,10 @@ All rights reserved.
 #define kTrackerSuites "suite/x-vnd.Be-TRAK"
 #define kDeskbarSignature "application/x-vnd.Be-TSKB"
 
+#define kTrackerOpenOnMainDisplay "tracker:open on main display"
+	// bool in a B_REFS_RECEIVED to Tracker: a folder window it opens for
+	// the refs goes onto the main display (the Deskbar's places do this)
+
 namespace BPrivate {
 
 #ifdef _IMPEXP_TRACKER

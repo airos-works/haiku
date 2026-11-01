@@ -44,6 +44,7 @@ All rights reserved.
 #include <Entry.h>
 #include <FindDirectory.h>
 #include <GridView.h>
+#include <InterfacePrivate.h>
 #include <GroupLayout.h>
 #include <Keymap.h>
 #include <Locale.h>
@@ -832,6 +833,9 @@ BContainerWindow::Init(const BMessage* message)
 
 	CheckScreenIntersect();
 
+	if ((fOpenFlags & kOnMainDisplay) != 0)
+		_MoveOntoMainDisplay();
+
 	if (fBackgroundImage != NULL && !PoseView()->IsDesktopView() && !isListMode)
 		fBackgroundImage->Show(PoseView(), current_workspace());
 
@@ -1112,6 +1116,80 @@ BContainerWindow::ViewModeChanged(uint32 oldMode, uint32 newMode)
 		fBackgroundImage->Remove();
 	else if (oldMode == kListMode)
 		fBackgroundImage->Show(PoseView(), current_workspace());
+}
+
+
+/*!	Puts the window, border and tab included, onto the main display unless it
+	is already there: where it sits on its own display, as far as that fits,
+	smaller if it is larger than the main display.
+*/
+void
+BContainerWindow::_MoveOntoMainDisplay()
+{
+	if (PoseView()->IsDesktopView())
+		return;
+
+	BMessage layout;
+	if (BPrivate::get_display_layout(layout) != B_OK)
+		return;
+
+	BRect mainFrame;
+	bool found = false;
+	BMessage display;
+	for (int32 index = 0;
+			layout.FindMessage("display", index, &display) == B_OK;
+			index++) {
+		BRect displayFrame;
+		if (!display.GetBool("enabled", false)
+			|| display.GetInt32("mirror", -1) >= 0
+			|| display.FindRect("frame", &displayFrame) != B_OK
+			|| !displayFrame.IsValid()) {
+			continue;
+		}
+
+		bool primary = display.GetBool("primary", false);
+		if (!found || primary) {
+			mainFrame = displayFrame;
+			found = true;
+		}
+		if (primary)
+			break;
+	}
+	if (!found)
+		return;
+
+	BRect frame(Frame());
+	BRect decoratorFrame(DecoratorFrame());
+	if (!decoratorFrame.IsValid() || !decoratorFrame.Contains(frame))
+		decoratorFrame = frame;
+
+	// where the content frame may go for the decorator to fit
+	BRect usable(mainFrame);
+	usable.left += frame.left - decoratorFrame.left;
+	usable.top += frame.top - decoratorFrame.top;
+	usable.right -= decoratorFrame.right - frame.right;
+	usable.bottom -= decoratorFrame.bottom - frame.bottom;
+	if (!usable.IsValid() || usable.Contains(frame))
+		return;
+
+	BPoint position(frame.LeftTop());
+	BRect sourceFrame;
+	if (BPrivate::get_display_frame(frame, false, sourceFrame) == B_OK
+		&& sourceFrame.IsValid() && sourceFrame != mainFrame) {
+		position = mainFrame.LeftTop()
+			+ (frame.LeftTop() - sourceFrame.LeftTop());
+	}
+
+	float width = std::min(frame.Width(), usable.Width());
+	float height = std::min(frame.Height(), usable.Height());
+	position.x = std::max(usable.left,
+		std::min(position.x, usable.right - width));
+	position.y = std::max(usable.top,
+		std::min(position.y, usable.bottom - height));
+
+	MoveTo(position);
+	if (width != frame.Width() || height != frame.Height())
+		ResizeTo(width, height);
 }
 
 

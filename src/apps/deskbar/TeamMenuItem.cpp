@@ -408,15 +408,18 @@ TTeamMenuItem::ToggleExpandState(bool resizeWindow)
 				TExpandoMenuBar* parent = static_cast<TExpandoMenuBar*>(Menu());
 				int myindex = parent->IndexOf(this) + 1;
 
-				TWindowMenuItem* windowItem = NULL;
+				// The window items come first; what follows them (the
+				// separator, Tracker's places, hide, show, close) stays.
 				int32 childIndex = 0;
-				int32 totalChildren = sub->CountItems() - 4;
-					// hide, show, close, separator.
-				for (; childIndex < totalChildren; childIndex++) {
-					windowItem = static_cast<TWindowMenuItem*>
-						(sub->RemoveItem((int32)0));
+				while (true) {
+					TWindowMenuItem* windowItem
+						= dynamic_cast<TWindowMenuItem*>(sub->ItemAt(0));
+					if (windowItem == NULL || windowItem->ID() < 0)
+						break;
+					sub->RemoveItem((int32)0);
 					parent->AddItem(windowItem, myindex + childIndex);
 					windowItem->SetExpanded(true);
+					childIndex++;
 				}
 				sub->SetExpanded(true, myindex + childIndex);
 

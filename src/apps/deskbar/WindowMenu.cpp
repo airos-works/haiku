@@ -42,6 +42,7 @@ All rights reserved.
 
 #include "BarApp.h"
 #include "BarView.h"
+#include "LocationMenuItem.h"
 #include "ShowHideMenuItem.h"
 #include "TeamMenu.h"
 #include "TeamMenuItem.h"
@@ -174,6 +175,7 @@ TWindowMenu::AttachedToWindow()
 	}
 
 	int32 itemCount = CountItems() + parentMenuItems;
+	bool isTracker = fApplicationSignature.ICompare(kTrackerSignature) == 0;
 	if (itemCount < 1) {
 		TWindowMenuItem* noWindowsItem
 			= new TWindowMenuItem(B_TRANSLATE("No windows"), -1, false, false);
@@ -181,9 +183,15 @@ TWindowMenu::AttachedToWindow()
 		noWindowsItem->SetEnabled(false);
 		AddItem(noWindowsItem);
 
+		if (isTracker && !dragging) {
+			// the places the desktop shows, to open a window for
+			AddSeparatorItem();
+			TLocationMenuItem::AddLocations(this);
+		}
+
 		// Add a 'Quit application' item if no windows are open
 		// unless the application is Tracker
-		if (fApplicationSignature.ICompare(kTrackerSignature) != 0) {
+		if (!isTracker) {
 			AddSeparatorItem();
 			AddItem(new TShowHideMenuItem(B_TRANSLATE("Quit application"),
 				fTeam, B_QUIT_REQUESTED));
@@ -208,6 +216,12 @@ TWindowMenu::AttachedToWindow()
 
 			if (!parentMenuItems)
 				AddSeparatorItem();
+
+			if (isTracker) {
+				// the places the desktop shows, to open a window for
+				TLocationMenuItem::AddLocations(this);
+				AddSeparatorItem();
+			}
 
 			AddItem(hide);
 			AddItem(show);

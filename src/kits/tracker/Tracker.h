@@ -220,7 +220,8 @@ private:
 	status_t OpenRef(const entry_ref*, const node_ref* nodeToClose = NULL,
 			const node_ref* nodeToSelect = NULL,
 			OpenSelector selector = kOpen,
-			const BMessage* messageToBundle = NULL);
+			const BMessage* messageToBundle = NULL,
+			uint32 openFlags = 0);
 
 	MimeTypeList*			fMimeTypeList;
 	WindowList				fWindowList;

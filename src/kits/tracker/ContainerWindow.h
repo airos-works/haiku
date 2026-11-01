@@ -78,7 +78,10 @@ enum {
 	kRestoreWorkspace	= 0x1,
 	kIsHidden			= 0x2,
 		// set when opening a window during initial Tracker start
-	kRestoreDecor		= 0x4
+	kRestoreDecor		= 0x4,
+	kOnMainDisplay		= 0x8
+		// a new window goes onto the main display, see
+		// kTrackerOpenOnMainDisplay
 };
 
 
@@ -363,6 +366,7 @@ private:
 	void _AddFolderIcon();
 	void _PassMessageToAddOn(BMessage*);
 	void _NewTemplateSubmenu(entry_ref);
+	void _MoveOntoMainDisplay();
 };
 
 

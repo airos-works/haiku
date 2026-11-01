@@ -860,7 +860,7 @@ TTracker::LaunchAndCloseParentIfOK(const entry_ref* launchThis,
 status_t
 TTracker::OpenRef(const entry_ref* ref, const node_ref* nodeToClose,
 	const node_ref* nodeToSelect, OpenSelector selector,
-	const BMessage* messageToBundle)
+	const BMessage* messageToBundle, uint32 openFlags)
 {
 	Model* model = NULL;
 	BEntry entry(ref, true);
@@ -910,7 +910,8 @@ TTracker::OpenRef(const entry_ref* ref, const node_ref* nodeToClose,
 
 	if (openAsContainer || selector == kRunOpenWithWindow) {
 		// special case opening plain folders, queries or using open with
-		OpenContainerWindow(model, NULL, selector, kRestoreDecor);
+		OpenContainerWindow(model, NULL, selector,
+			kRestoreDecor | (openFlags & kOnMainDisplay));
 			// window adopts model
 		if (nodeToClose)
 			CloseParentWaitingForChildSoon(ref, nodeToClose);
@@ -1036,6 +1037,10 @@ TTracker::RefsReceived(BMessage* message)
 				}
 			}
 
+			uint32 openFlags = 0;
+			if (message->GetBool(kTrackerOpenOnMainDisplay, false))
+				openFlags |= kOnMainDisplay;
+
 			for (int32 index = 0; index < count; index++) {
 				entry_ref ref;
 				message->FindRef("refs", index, &ref);
@@ -1050,7 +1055,7 @@ TTracker::RefsReceived(BMessage* message)
 					(const void**)&nodeToSelect, &numBytes);
 
 				OpenRef(&ref, nodeToClose, nodeToSelect, selector,
-					bundleThis);
+					bundleThis, openFlags);
 			}
 
 			break;
