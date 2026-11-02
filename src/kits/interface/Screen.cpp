@@ -10,6 +10,8 @@
 
 #include <Screen.h>
 
+#include <pthread.h>
+
 #include <Window.h>
 
 #include <ApplicationPrivate.h>
@@ -123,6 +125,74 @@ BScreen::WaitForRetrace(bigtime_t timeout)
 		return fScreen->WaitForRetrace(timeout);
 
 	return B_ERROR;
+}
+
+
+/*!	Waits for the next frame of the display output that shows \a frame (in
+	screen coordinates; the output with the most of it, as GetScanTiming()
+	picks it), and returns when its scan begins. WaitForRetrace() waits for
+	the main output's blank, which on a desktop of several monitors is not
+	the refresh of the one a window is on.
+	Without scan timing for that output (no blanks), this is
+	WaitForRetrace(). B_WOULD_BLOCK for a \a timeout of 0 and B_TIMED_OUT
+	for one that ends before the frame begins, as for a semaphore.
+*/
+status_t
+BScreen::WaitForOutputRetrace(BRect frame, bigtime_t timeout)
+{
+	// The last answer is used for half a second: asking app_server takes a
+	// round trip, and on a quiet desktop app_server first waits for a blank
+	// itself (up to two frames), more than a short timeout allows. A
+	// prediction drifts by some 70 us a second (the period is in whole
+	// microseconds).
+	static pthread_mutex_t sLock = PTHREAD_MUTEX_INITIALIZER;
+	static display_scan_timing sTiming;
+	static BRect sFrame;
+	static int32 sScreen = -1;
+	static bigtime_t sAsked = 0;
+	const bigtime_t kKeepTiming = 500000;
+
+	display_scan_timing timing;
+	bool known = false;
+	pthread_mutex_lock(&sLock);
+	if (sScreen == ID().id && sFrame == frame
+		&& system_time() - sAsked < kKeepTiming) {
+		timing = sTiming;
+		known = true;
+	}
+	pthread_mutex_unlock(&sLock);
+
+	if (!known) {
+		if (GetScanTiming(frame, &timing) != B_OK)
+			return WaitForRetrace(timeout);
+		pthread_mutex_lock(&sLock);
+		sTiming = timing;
+		sFrame = frame;
+		sScreen = ID().id;
+		sAsked = system_time();
+		pthread_mutex_unlock(&sLock);
+	}
+
+	if (timing.period <= 0 || (timing.flags & (B_SCAN_TIMING_FROM_HARDWARE
+			| B_SCAN_TIMING_FROM_BLANK)) == 0) {
+		return WaitForRetrace(timeout);
+	}
+
+	bigtime_t now = system_time();
+	bigtime_t next = timing.scan_start;
+	if (next <= now)
+		next += ((now - next) / timing.period + 1) * timing.period;
+
+	if (timeout != B_INFINITE_TIMEOUT && next - now > timeout) {
+		if (timeout <= 0)
+			return B_WOULD_BLOCK;
+		snooze(timeout);
+		return B_TIMED_OUT;
+	}
+
+	while (snooze_until(next, B_SYSTEM_TIMEBASE) == B_INTERRUPTED)
+		;
+	return B_OK;
 }
 
 

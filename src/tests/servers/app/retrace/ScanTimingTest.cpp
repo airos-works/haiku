@@ -3,6 +3,10 @@
 //   scan_timing_test phase N    N calls 500 ms apart: phase drift and call time
 //   scan_timing_test stale      calls after 2 s of a quiet desktop
 //   scan_timing_test retrace N  N WaitForRetrace() wakes against the prediction
+//   scan_timing_test output N [x y w h]
+//                               N WaitForOutputRetrace() wakes for that part
+//                               of the screen (default: its right half), with
+//                               the frame starts of that output and timeouts
 #include <Application.h>
 #include <Screen.h>
 #include <OS.h>
@@ -137,6 +141,61 @@ main(int argc, char** argv)
 		}
 		printf("WaitForRetrace wake vs predicted start: mean %+.1f us, "
 			"worst %+.1f us over %d\n", sum / n, worst, n);
+		return 0;
+	}
+	if (strcmp(mode, "output") == 0) {
+		BRect r(f.left + f.Width() / 2, f.top, f.right, f.bottom);
+		if (argc > 6) {
+			r.left = atof(argv[3]);
+			r.top = atof(argv[4]);
+			r.right = r.left + atof(argv[5]) - 1;
+			r.bottom = r.top + atof(argv[6]) - 1;
+		}
+		double worst = 0, sum = 0;
+		int n = 0;
+		for (int i = 0; i < count; i++) {
+			// the prediction is asked anew: it drifts some 70 us a second
+			if (get(screen, r, t, &took) != B_OK)
+				return 1;
+			if (i == 0)
+				print("output", t, took);
+			// start anywhere in the frame
+			snooze(rand() % (t.period > 0 ? t.period : 16667));
+			status_t status = screen.WaitForOutputRetrace(r, 100000);
+			bigtime_t woke = system_time();
+			if (status != B_OK) {
+				printf("WaitForOutputRetrace: %s\n", strerror(status));
+				return 1;
+			}
+			if ((t.flags & (B_SCAN_TIMING_FROM_HARDWARE
+					| B_SCAN_TIMING_FROM_BLANK)) == 0) {
+				n++;
+				continue;
+			}
+			double d = phase(woke, t.scan_start, t.period);
+			sum += d;
+			n++;
+			if (fabs(d) > fabs(worst))
+				worst = d;
+		}
+		printf("WaitForOutputRetrace wake vs that output's frame start: mean "
+			"%+.1f us, worst %+.1f us over %d\n", sum / n, worst, n);
+
+		// a timeout shorter than the wait, and none at all
+		bigtime_t t0 = system_time();
+		status_t status = screen.WaitForOutputRetrace(r, 0);
+		printf("timeout 0: %s (%.2f ms)\n", strerror(status),
+			(system_time() - t0) / 1000.0);
+		get(screen, r, t, &took);
+		if (t.period > 0 && (t.flags & (B_SCAN_TIMING_FROM_HARDWARE
+				| B_SCAN_TIMING_FROM_BLANK)) != 0) {
+			// right after a frame start the next is a period away
+			screen.WaitForOutputRetrace(r);
+			t0 = system_time();
+			status = screen.WaitForOutputRetrace(r, t.period / 4);
+			printf("timeout of a quarter period: %s after %.2f ms\n",
+				strerror(status), (system_time() - t0) / 1000.0);
+		}
 		return 0;
 	}
 	return 1;
