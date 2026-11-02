@@ -1,6 +1,6 @@
-Host hvm
+Host nvm
     HostName 127.0.0.1
-    Port 2223
+    Port 47722
     User user
     IdentityFile /mnt/HaikuWork/x399/ssh/workstation_ed25519
     IdentitiesOnly yes
