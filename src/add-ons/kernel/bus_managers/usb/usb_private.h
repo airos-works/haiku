@@ -659,6 +659,9 @@ virtual	status_t						GetDescriptor(uint8 descriptorType,
 
 		Device *						ChildAt(uint8 index) const
 											{ return fChildren[index]; }
+		uint8							PortOf(const Device* child) const;
+		uint8							EnumeratingPort() const
+											{ return fEnumeratingPort; }
 
 		status_t						UpdatePortStatus(uint8 index);
 		status_t						ResetPort(uint8 index);
@@ -700,6 +703,8 @@ private:
 		bigtime_t						fNextEnumeration[USB_MAX_PORT_COUNT];
 		bigtime_t						fNextWarmReset[USB_MAX_PORT_COUNT];
 		uint8							fWarmResets[USB_MAX_PORT_COUNT];
+		// the port (1-based) whose device AllocateDevice() is setting up
+		uint8							fEnumeratingPort;
 };
 
 

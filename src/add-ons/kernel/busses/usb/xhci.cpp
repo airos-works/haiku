@@ -2590,7 +2590,13 @@ XHCI::AllocateDevice(Hub* parent, int8 hubAddress, uint8 hubPort, usb_speed spee
 	_WriteContext(&device->input_ctx->input.dropFlags, 0);
 	_WriteContext(&device->input_ctx->input.addFlags, 3);
 
-	uint8 rhPort = hubPort;
+	// The route string holds the downstream port of every hub tier below the
+	// root hub, the first tier in the lowest nibble. hubPort and the hubs'
+	// HubPort() name the port of the transaction translator, which below a
+	// full speed hub is the port of a hub further up (or of the root hub),
+	// not the device's own; so the ports come from the hubs themselves.
+	uint8 rhPort = parent->EnumeratingPort() != 0
+		? parent->EnumeratingPort() : hubPort;
 	uint32 route = 0;
 	for (Device* hubDevice = parent; hubDevice != RootObject();
 			hubDevice = (Device*)hubDevice->Parent()) {
@@ -2602,7 +2608,11 @@ XHCI::AllocateDevice(Hub* parent, int8 hubAddress, uint8 hubPort, usb_speed spee
 		route = route << 4;
 		route |= rhPort;
 
-		rhPort = hubDevice->HubPort();
+		Object* upper = hubDevice->Parent();
+		uint8 port = 0;
+		if ((upper->Type() & USB_OBJECT_HUB) != 0)
+			port = static_cast<Hub*>(upper)->PortOf(hubDevice);
+		rhPort = port != 0 ? port : hubDevice->HubPort();
 	}
 
 	uint32 dwslot0 = SLOT_0_NUM_ENTRIES(1) | SLOT_0_ROUTE(route);
