@@ -15,6 +15,7 @@
 #include <MessageRunner.h>
 #include <NetworkDevice.h>
 #include <NetworkInterface.h>
+#include <NetworkRoute.h>
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -658,19 +659,91 @@ DHCPClient::_Negotiate()
 		return status;
 	}
 
+	return _SendConfiguration();
+}
+
+
+/*!	Hands the lease to the net_server: interface address, mask, broadcast
+	and default route, then the resolver configuration.
+*/
+status_t
+DHCPClient::_SendConfiguration()
+{
 	// configure interface
 	BMessage reply;
-	status = Target().SendMessage(&fConfiguration, &reply);
+	status_t status = Target().SendMessage(&fConfiguration, &reply);
 	if (status == B_OK)
 		status = reply.FindInt32("status", &fStatus);
 
 	// configure resolver
 	reply.MakeEmpty();
+	fResolverConfiguration.RemoveName("device");
 	fResolverConfiguration.AddString("device", Device());
 	status = Target().SendMessage(&fResolverConfiguration, &reply);
 	if (status == B_OK)
 		status = reply.FindInt32("status", &fStatus);
 	return status;
+}
+
+
+/*!	Called by the looper whenever the interface may have lost what the lease
+	configured (it went down and up, its link came back without a down
+	notification) and periodically. Taking an interface down deletes all of
+	its routes, and only the lease puts the default route back: without this
+	the interface stays reachable on the local network, but every other
+	destination silently goes out over another interface, or nowhere.
+*/
+void
+DHCPClient::CheckConfiguration()
+{
+	if (fStatus != B_OK || fNegotiateThread != -1 || fAssignedAddress == 0)
+		return;
+
+	BMessage address;
+	if (fConfiguration.FindMessage("address", &address) != B_OK)
+		return;
+
+	BNetworkInterface interface(Device());
+	if (!interface.Exists() || (interface.Flags() & IFF_UP) == 0)
+		return;
+
+	bool hasAddress = false;
+	int32 count = interface.CountAddresses();
+	for (int32 i = 0; i < count && !hasAddress; i++) {
+		BNetworkInterfaceAddress interfaceAddress;
+		if (interface.GetAddressAt(i, interfaceAddress) != B_OK)
+			continue;
+		const sockaddr& local = interfaceAddress.Address().SockAddr();
+		if (local.sa_family == AF_INET
+			&& ((const sockaddr_in&)local).sin_addr.s_addr
+				== fAssignedAddress)
+			hasAddress = true;
+	}
+
+	if (!hasAddress) {
+		syslog(LOG_NOTICE, "%s: leased address %s is gone, configuring the "
+			"interface again\n", Device(),
+			_AddressToString(fAssignedAddress).String());
+		_SendConfiguration();
+		return;
+	}
+
+	const char* gateway = address.GetString("gateway", NULL);
+	if (gateway == NULL)
+		return;
+
+	BNetworkRoute route;
+	if (BNetworkRoute::GetDefaultRoute(AF_INET, Device(), route)
+			!= B_ENTRY_NOT_FOUND)
+		return;
+
+	BNetworkAddress gatewayAddress;
+	if (gatewayAddress.SetTo(AF_INET, gateway) != B_OK)
+		return;
+
+	status_t status = interface.AddDefaultRoute(gatewayAddress);
+	syslog(LOG_NOTICE, "%s: default route via %s was missing, added it "
+		"again: %s\n", Device(), gateway, strerror(status));
 }
 
 
@@ -707,12 +780,24 @@ DHCPClient::_GotMessage(dhcp_state& state, dhcp_message* message)
 		case RENEWING:
 		case REQUESTING:
 			if (message->Type() == DHCP_ACK) {
-				// TODO: we might want to configure the stuff, don't we?
+				// The ACK is authoritative: configure from it. A client that
+				// starts in INIT-REBOOT (the link came back, the lease was
+				// kept) never saw an OFFER, so this is the only place its
+				// configuration (and with it the default route) comes from.
+				if (message->your_address != 0)
+					fAssignedAddress = message->your_address;
+
 				BMessage address;
+				address.AddString("family", "inet");
+				address.AddString("address",
+					_AddressToString(fAssignedAddress));
 				fResolverConfiguration.MakeEmpty();
 				_ParseOptions(*message, address, fResolverConfiguration);
-					// TODO: currently, only lease time and DNS is updated this
-					// way
+
+				fConfiguration.MakeEmpty();
+				fConfiguration.AddString("device", Device());
+				fConfiguration.AddBool("auto_configured", true);
+				fConfiguration.AddMessage("address", &address);
 
 				// our address request has been acknowledged
 				state = BOUND;

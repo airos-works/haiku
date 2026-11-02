@@ -207,7 +207,12 @@ ethernet_up(net_device *_device)
 		device->frame_size = ETHER_MAX_FRAME_SIZE;
 #endif
 
-	if (update_link_state(device, false) == B_OK) {
+	// Report the link state found at open: taking the interface down and up
+	// closes and reopens the device, and the link usually comes back a
+	// moment later. Without a "link down" here, the net_server sees only a
+	// "link up" while it thinks the link never went, and does not restore
+	// the address configuration (and default route) the down removed.
+	if (update_link_state(device, true) == B_OK) {
 		// device supports retrieval of the link state
 
 		// Set the change notification semaphore; doesn't matter

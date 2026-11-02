@@ -41,6 +41,7 @@ public:
 
 	virtual	status_t			Start();
 	virtual	void				KeepLease() { fKeepLease = true; }
+	virtual	void				CheckConfiguration();
 
 	virtual	void				MessageReceived(BMessage* message);
 
@@ -61,6 +62,7 @@ private:
 			bool				_TimeoutShift(int socket, dhcp_state& state,
 									socket_timeout& timeout);
 			void				_RestartLease(bigtime_t lease);
+			status_t			_SendConfiguration();
 
 	static	BString				_AddressToString(const uint8* data);
 	static 	BString				_AddressToString(in_addr_t address);
