@@ -15,3 +15,11 @@ Addon amdgpu_kms.accelerant :
 	mode.cpp
 	: libaccelerantscommon.a
 ;
+
+# checks and times the copies by the GPU beside app_server (not in the image)
+Application amdcopytest :
+	copy_test.cpp
+	device_copy.cpp
+	kms.cpp
+	: [ TargetLibstdc++ ]
+;

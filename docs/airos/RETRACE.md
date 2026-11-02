@@ -265,6 +265,30 @@ flush thread (and any window about to draw) wait for the slowest drawing
 under way. The move and show hooks are now serialized by a mutex of their
 own; setting the cursor shape keeps the exclusive lock.
 
+### Framework 13, 2026-11-03 (shadows the GPU fills)
+
+The CPU used to copy every drawn area from the back buffer into the
+flush's shadow, as much again as the drawing itself for bitmaps. With
+`B_CREATE_FRAME_BUFFER_SHADOW` and `B_COPY_FRAME_BUFFER_SOURCE` (master
+43172b3276 for nvidia_rm; since this date in `amdgpu_kms`) the back buffer
+is a buffer the GPU reads and the GPU's copy engine fills the shadows. On
+`amdgpu_kms` the engine is SDMA; the shadows are in video memory on a
+discrete card and in system memory on an APU, whose video memory is a
+carve-out of the same RAM: SDMA copied at 18 GB/s either way on the
+Ryzen AI 5 340's 840M (`amdcopytest`), so there they leave the 512 MB
+carve-out alone and the CPU still copies small updates (under 64K
+pixels) itself, where the engine's round trip (about 50 us) takes longer.
+
+At 9935x2160 over three displays at 175%, 12 s profiles of app_server
+under the same loads (a big Tracker window hidden and shown, moved, a
+scrolling Terminal) went from 24, 24 and 52 % of the window threads'
+time in the copy to the shadow to 7, 8 and 14 %, mostly the submissions'
+ioctls; the Terminal's window thread from 4.5 to 2.6 s of CPU. The
+longest flush went from 10.1 to 4.9 ms. `nvflushcheck` (it now clones
+`amdgpu_kms` too, and takes fractional scales) read the frame buffer
+right in 27 of 27 steps, after a display sleep, and with
+`no_device_copy`.
+
 ### GTX 1070 on the X399, 2026-10-19 (the flush at every fourth blank)
 
 The owner found window drags choppy with the GTX 1070 back in the X399

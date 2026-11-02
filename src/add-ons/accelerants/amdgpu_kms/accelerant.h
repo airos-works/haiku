@@ -157,6 +157,9 @@ void update_cursor(void);
 void uninit_device_copies(void);
 void lock_device_copies(void);
 void unlock_device_copies(void);
+// for tests: AMDGPU_GEM_DOMAIN_VRAM or _GTT
+uint32 device_copy_set_shadow_domain(uint32 domain);
+uint32 device_copy_source_domain(uint32 id);
 
 
 extern "C" {
@@ -214,6 +217,10 @@ status_t amdgpu_create_frame_buffer_source(uint16 width, uint16 height,
 void amdgpu_delete_frame_buffer_source(uint32 id);
 status_t amdgpu_copy_to_frame_buffer(uint32 id, const fill_rect_params* list,
 	uint32 count);
+status_t amdgpu_create_frame_buffer_shadow(uint16 width, uint16 height,
+	color_space space, frame_buffer_source* shadow);
+status_t amdgpu_copy_frame_buffer_source(uint32 from, uint32 to,
+	const fill_rect_params* list, uint32 count);
 }
 
 

@@ -5,17 +5,23 @@
  * there to the screen (the vertical blank flush, its shadows, the 2D engine).
  *
  * A window shows a grid of cells, each one solid colour that depends on the
- * cell and on a pattern number; whole logical pixels are whole device ones
- * at an integer scale, so the screen must hold exactly those colours. The
+ * cell and on a pattern number; a cell's inside is whole device pixels at
+ * any scale (a cell's first and last device column and row are left out,
+ * where a fractional scale may blend), so the screen must hold exactly
+ * those colours there. The window is on the display at the desktop's
+ * origin, and all displays are taken to have the same scale. The
  * check redraws the window with new patterns (one at a time, and in bursts
  * without waiting, of which the last must win), moves it, and compares the
  * frame buffer with the expected picture after each step.
  *
  * usage: nvflushcheck <accelerant> [rounds]
+ *
+ * nvidia_rm clones from its device's path; amdgpu_kms from the area of its
+ * shared info in app_server's team.
  */
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include <algorithm>
 #include <vector>
@@ -82,7 +88,7 @@ struct Screen {
 	const uint8* bits;
 	uint32 bytesPerRow;
 	uint32 width, height;
-	int32 scale;
+	double scale;	// in quarters
 };
 
 
@@ -93,23 +99,28 @@ static void Check(const char* what, const Screen& screen, BPoint origin,
 {
 	int32 wrongCells = 0, firstColumn = -1, firstRow = -1;
 	uint32 want = 0, got = 0;
-	int32 cellPixels = kCell * screen.scale;
 	for (int32 row = 0; row < kRows; row++) {
 		for (int32 column = 0; column < kColumns; column++) {
 			rgb_color c = CellColor(pattern, column, row);
 			uint32 expected = ((uint32)c.red << 16) | ((uint32)c.green << 8)
 				| c.blue;
-			int32 left = ((int32)origin.x + column * kCell) * screen.scale;
-			int32 top = ((int32)origin.y + row * kCell) * screen.scale;
+			int32 left = (int32)((origin.x + column * kCell) * screen.scale
+				+ 0.5) + 1;
+			int32 top = (int32)((origin.y + row * kCell) * screen.scale
+				+ 0.5) + 1;
+			int32 right = (int32)((origin.x + (column + 1) * kCell)
+				* screen.scale + 0.5) - 1;
+			int32 bottom = (int32)((origin.y + (row + 1) * kCell)
+				* screen.scale + 0.5) - 1;
 			bool wrong = false;
 			// a few rows of each cell: reading video memory is slow
-			for (int32 y = top; y < top + cellPixels && !wrong;
-					y += cellPixels / 4) {
+			for (int32 y = top; y < bottom && !wrong;
+					y += std::max<int32>(1, (bottom - top) / 4)) {
 				if (y < 0 || y >= (int32)screen.height)
 					continue;
 				const uint32* line = (const uint32*)(screen.bits
 					+ (size_t)y * screen.bytesPerRow);
-				for (int32 x = left; x < left + cellPixels; x++) {
+				for (int32 x = left; x < right; x++) {
 					if (x < 0 || x >= (int32)screen.width)
 						continue;
 					if ((line[x] & 0xffffff) != expected) {
@@ -160,7 +171,29 @@ int main(int argc, char** argv)
 		fprintf(stderr, "no accelerant entry point\n");
 		return 2;
 	}
-	char cloneInfo[] = "/dev/graphics/nvidia0";
+	char devicePath[] = "/dev/graphics/nvidia0";
+	void* cloneInfo = devicePath;
+	area_id sharedInfo = -1;
+	if (strstr(argv[1], "amdgpu_kms") != NULL) {
+		team_id appServer = -1;
+		int32 cookie = 0;
+		team_info team;
+		while (get_next_team_info(&cookie, &team) == B_OK) {
+			if (strstr(team.args, "app_server") != NULL)
+				appServer = team.team;
+		}
+		ssize_t areaCookie = 0;
+		area_info area;
+		while (get_next_area_info(appServer, &areaCookie, &area) == B_OK) {
+			if (strcmp(area.name, "amdgpu_kms shared info") == 0)
+				sharedInfo = area.area;
+		}
+		if (sharedInfo < 0) {
+			fprintf(stderr, "no amdgpu_kms shared info in app_server\n");
+			return 2;
+		}
+		cloneInfo = &sharedInfo;
+	}
 	status_t status = ((clone_accelerant)hook(B_CLONE_ACCELERANT, NULL))(
 		cloneInfo);
 	if (status != B_OK) {
@@ -176,15 +209,14 @@ int main(int argc, char** argv)
 	screen.bits = (const uint8*)config.frame_buffer;
 	screen.bytesPerRow = config.bytes_per_row;
 	screen.width = config.bytes_per_row / 4;
-	screen.scale = 1;
 	display_mode mode = {};
 	bscreen.GetMode(&mode);
 	screen.width = mode.virtual_width;
 	screen.height = mode.virtual_height;
-	screen.scale = std::max<int32>(1,
-		(int32)(mode.virtual_width / (frame.Width() + 1) + 0.5));
+	screen.scale = std::max(1.0,
+		(int32)(mode.virtual_width * 4.0 / (frame.Width() + 1) + 0.5) / 4.0);
 	printf("     frame buffer %" B_PRIu32 "x%" B_PRIu32 ", desktop %gx%g, "
-		"scale %" B_PRId32 "\n", screen.width, screen.height,
+		"scale %g\n", screen.width, screen.height,
 		frame.Width() + 1, frame.Height() + 1, screen.scale);
 	if (screen.bits == NULL) {
 		printf("FAIL no frame buffer in the clone\n");

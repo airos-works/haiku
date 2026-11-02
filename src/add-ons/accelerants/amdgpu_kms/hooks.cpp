@@ -86,6 +86,10 @@ get_accelerant_hook(uint32 feature, void* data)
 			return (void*)amdgpu_delete_frame_buffer_source;
 		case B_COPY_TO_FRAME_BUFFER:
 			return (void*)amdgpu_copy_to_frame_buffer;
+		case B_CREATE_FRAME_BUFFER_SHADOW:
+			return (void*)amdgpu_create_frame_buffer_shadow;
+		case B_COPY_FRAME_BUFFER_SOURCE:
+			return (void*)amdgpu_copy_frame_buffer_source;
 	}
 	return NULL;
 }

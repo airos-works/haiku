@@ -6,11 +6,13 @@
 
 #include "accelerant.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <Drivers.h>
@@ -20,6 +22,42 @@
 
 
 accelerant_info* gInfo;
+
+
+/*!	The path of the device \a device is open on, for clones, which open it
+	again: amdgpu_drm does not answer B_GET_PATH_FOR_DEVICE, so it is looked
+	up among the graphics devices by its node. */
+static void
+get_device_path(int device, char* path, size_t size)
+{
+	if (ioctl(device, B_GET_PATH_FOR_DEVICE, path, size) == 0
+		&& path[0] != '\0')
+		return;
+	path[0] = '\0';
+
+	struct stat deviceStat;
+	if (fstat(device, &deviceStat) != 0)
+		return;
+	const char* kDirectory = "/dev/graphics";
+	DIR* directory = opendir(kDirectory);
+	if (directory == NULL)
+		return;
+	while (dirent* entry = readdir(directory)) {
+		if (entry->d_name[0] == '.')
+			continue;
+		char candidate[B_PATH_NAME_LENGTH];
+		snprintf(candidate, sizeof(candidate), "%s/%s", kDirectory,
+			entry->d_name);
+		struct stat candidateStat;
+		if (stat(candidate, &candidateStat) == 0
+			&& candidateStat.st_dev == deviceStat.st_dev
+			&& candidateStat.st_ino == deviceStat.st_ino) {
+			strlcpy(path, candidate, size);
+			break;
+		}
+	}
+	closedir(directory);
+}
 
 
 static status_t
@@ -165,9 +203,9 @@ amdgpu_init_accelerant(int device)
 	memset(shared, 0, sizeof(SharedInfo));
 	shared->frameBufferArea = -1;
 	// for clones, which open the device again
-	if (ioctl(device, B_GET_PATH_FOR_DEVICE, shared->devicePath,
-			sizeof(shared->devicePath)) != 0)
-		shared->devicePath[0] = '\0';
+	get_device_path(device, shared->devicePath, sizeof(shared->devicePath));
+	if (shared->devicePath[0] == '\0')
+		TRACE("the device's path was not found: no clones\n");
 
 	create_mode_list();
 	TRACE("%" B_PRIu32 " output(s), %" B_PRIu32 " CRTC(s), %" B_PRIu32
