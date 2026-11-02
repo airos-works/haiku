@@ -213,6 +213,50 @@ Hub::UpdatePortStatus(uint8 index)
 status_t
 Hub::ResetPort(uint8 index)
 {
+	// A hub may disable a port again right after its reset (the enable
+	// change set; seen with a low speed keyboard behind a Genesys hub). Such
+	// a port gets another reset, like in Linux' hub_port_reset(), and a port
+	// that stays disabled is not addressed: a VL805 (Raspberry Pi 4) that ran
+	// an Address Device for a device behind a disabled port fails every later
+	// one for a low or full speed device with a Context State error, until
+	// the next boot. Root hubs are left out: an EHCI port stays disabled after
+	// the reset of a full speed device on purpose, as that one goes to a
+	// companion controller.
+	static const int32 kResetTries = 5;
+	status_t result = B_ERROR;
+	for (int32 try_ = 0; try_ < kResetTries; try_++) {
+		result = _ResetPortOnce(index);
+		if (result != B_OK || GetBusManager()->GetRootHub() == this)
+			return result;
+
+		result = UpdatePortStatus(index);
+		if (result != B_OK)
+			return result;
+
+		if ((fPortStatus[index].status & PORT_STATUS_CONNECTION) == 0
+			|| (fPortStatus[index].status & PORT_STATUS_ENABLE) != 0)
+			return B_OK;
+
+		TRACE("port %d: not enabled after the reset (%#x, %#x), resetting it "
+			"again\n", index, fPortStatus[index].status,
+			fPortStatus[index].change);
+		if ((fPortStatus[index].change & PORT_STATUS_ENABLE) != 0) {
+			DefaultPipe()->SendRequest(USB_REQTYPE_CLASS
+				| USB_REQTYPE_OTHER_OUT, USB_REQUEST_CLEAR_FEATURE,
+				C_PORT_ENABLE, index + 1, 0, NULL, 0, NULL);
+		}
+		snooze(USB_DELAY_PORT_RESET_LONG);
+	}
+
+	TRACE_ERROR("port %d stays disabled after %" B_PRId32 " resets\n", index,
+		kResetTries);
+	return B_DEV_NOT_READY;
+}
+
+
+status_t
+Hub::_ResetPortOnce(uint8 index)
+{
 	status_t result = DefaultPipe()->SendRequest(USB_REQTYPE_CLASS | USB_REQTYPE_OTHER_OUT,
 		USB_REQUEST_SET_FEATURE, PORT_RESET, index + 1, 0, NULL, 0, NULL);
 
@@ -476,6 +520,32 @@ Hub::Explore(change_item **changeList)
 			DefaultPipe()->SendRequest(USB_REQTYPE_CLASS | USB_REQTYPE_OTHER_OUT,
 				USB_REQUEST_CLEAR_FEATURE, C_PORT_OVER_CURRENT, i + 1,
 				0, NULL, 0, NULL);
+
+			// At an over-current a hub switches the port's power off (all of
+			// them with ganged power switching, like the VIA hub of a
+			// Raspberry Pi 4), an xHCI root port clears PP. The port stays
+			// dead until software powers it again, and what was on it lost
+			// its address. Once the over-current is gone, power the port
+			// again after a pause, like Linux' port_event() does; what comes
+			// back is enumerated as a new device.
+			if ((fPortStatus[i].status & PORT_STATUS_OVER_CURRENT) == 0
+				&& (fPortStatus[i].status
+					& (PORT_STATUS_POWER | PORT_STATUS_SS_POWER)) == 0) {
+				if (fChildren[i] != NULL) {
+					TRACE_ALWAYS("port %" B_PRId32 ": the device lost its "
+						"power\n", i);
+					fChildren[i]->Changed(changeList, false);
+					fChildren[i] = NULL;
+				}
+				snooze(100000);
+				status_t status = DefaultPipe()->SendRequest(
+					USB_REQTYPE_CLASS | USB_REQTYPE_OTHER_OUT,
+					USB_REQUEST_SET_FEATURE, PORT_POWER, i + 1, 0, NULL, 0,
+					NULL);
+				snooze(fPowerOnToPowerGood * 2000);
+				TRACE_ALWAYS("port %" B_PRId32 ": powered again after the "
+					"over-current: %s\n", i, strerror(status));
+			}
 		}
 
 		if (fPortStatus[i].change & PORT_STATUS_RESET) {
