@@ -1,4 +1,4 @@
 # Captured Rock 5 ITX EDK2 v1.1 segment-zero PCIe requester at 01:00.0.
 # The kernel checks the exact firmware DT and ITS1 resource before enabling.
 firmware_profile rock5-itx-edk2-v1.1-dt-its-nvme
-trace true
+trace false

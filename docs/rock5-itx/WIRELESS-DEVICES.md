@@ -112,6 +112,7 @@ adapters** work in any USB port.
 | Family | Driver | Card type | Standard | Firmware package |
 |---|---|---|---|---|
 | Intel AX210 | `iaxwifi200` | M.2 | Wi-Fi 6E, HE association verified | intel_wifi_firmwares |
+| Intel BE200 (`8086:272b`) | `iaxwifi200` (Bz family) | M.2 | Wi-Fi 7 card, used as 802.11a/b/g/n/ac; association verified | intel_wifi7_firmwares |
 | Intel AX200 (incl. Killer AX1650) | `iaxwifi200` | M.2 | Wi-Fi 6 | intel_wifi_firmwares |
 | Intel AX201, AX211, AX411 (incl. Killer AX1650i/1675i/1690i) | `iaxwifi200` | CNVi | Wi-Fi 6/6E | intel_wifi_firmwares |
 | Intel 9260, and 9461/9462/9560 M.2 modules (Thunder Peak, `8086:2526`) | `idualwifi7260` | M.2 | 802.11ac | intel_wifi_firmwares |
@@ -130,6 +131,40 @@ adapters** work in any USB port.
 | ZyDAS ZD1211, ZD1211B | `zydwifi1211` | USB | 802.11b/g | none needed |
 
 623 PCI and USB IDs in total; Appendix A lists every one.
+
+### Intel BE200 (2026-11-02)
+
+The BE200 (`8086:272b`, Gl MAC with the Fm radio) is the first Bz-family
+card `iaxwifi200` drives. What the Bz family changed, taken from Linux
+iwlwifi: the MAC access request, "init done" and software reset moved into
+`CSR_GP_CNTRL` (bits 21, 6 and 31, with bus-master disable in 28/29), the
+ROM is started with `CSR_GP_CNTRL` bit 7 after writing `CSR_FUNC_SCRATCH`
+instead of `UREG_CPU_INIT_RUN`, the RX free-buffer write pointer goes
+through `HBUS_TARG_WRPTR`, the MAC address straps sit at CSR 0x30, and the
+driver leaves the LTR alone.
+
+Firmware: `iwx-gl-c0-fm-c0-83` with its PNVM, from linux-firmware
+20240312, in the `intel_wifi7_firmwares` package. API 83 is the newest
+image that still takes this driver's pre-MLD commands (Linux 6.18 wants
+100 or later and the MLD API). That image has 67 runtime sections (the
+driver allowed 60), sections the driver did not know (types 65 and 0x444,
+now skipped as Linux does), a fragmented PNVM (whose segment count the
+driver never reset on stop: the second start dereferenced unallocated
+segments) and version 8 of the MCC (regulatory) response.
+
+The firmware no longer answers the legacy MAC_CONTEXT_CMD, so the Bz family
+uses the driver's MLD command path (MAC_CONFIG/LINK_CONFIG/STA_CONFIG, so
+far enabled only for Ma devices), and it associates with HT/VHT: this
+fork's HE station set-up uses STA_HE_CTXT_CMD, which that firmware does not
+answer either.
+
+On the ROCK 5 the card sits on the M.2 E-key slot (PCIe segment 2); the
+firmware profile admits it next to the AX210 (it sets the multi-function
+bit of its header type). Verified there: the card attaches, loads the
+firmware, reads its address, scans (without antennas, signal 2 to 8) and
+joins Gaspers (WPA2-PSK/CCMP) at 802.11ac with a DHCP address.
+Its Bluetooth half (`8087:0036`, `ibt-0291-0291`) loads its firmware with
+`bt_firmware` as before.
 
 ## Bluetooth support
 
@@ -154,8 +189,8 @@ recognised by vendor and Bluetooth class.
 
 ## Not supported, and why
 
-- **Intel BE200/BE201/BE202 Wi-Fi (Wi-Fi 7)**: `iaxwifi200` has no BZ
-  device family. Their Bluetooth half is covered.
+- **Intel BE201/BE202 Wi-Fi (Wi-Fi 7 CNVi)**: Intel-only modules; the
+  discrete BE200 is supported (see "Intel BE200" below).
 - **Realtek RTL8821CE, RTL8822BE/CE, RTL8852AE/BE/CE Wi-Fi**: need rtw88 or
   rtw89, which Haiku does not have.
 - **MediaTek MT7921/MT7922/MT7925 Wi-Fi**: needs mt76. The x399 branch's

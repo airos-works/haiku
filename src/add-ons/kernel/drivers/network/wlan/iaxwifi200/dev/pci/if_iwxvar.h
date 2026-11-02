@@ -123,7 +123,11 @@ struct iwx_tx_radiotap_header {
 	 (1 << IEEE80211_RADIOTAP_RATE) |				\
 	 (1 << IEEE80211_RADIOTAP_CHANNEL))
 
-#define IWX_UCODE_SECT_MAX 60
+/*
+ * Sections of one image, LMAC, UMAC and paging together (each of those up
+ * to IWX_MAX_DRAM_ENTRY). The BE200's image has 67 runtime sections.
+ */
+#define IWX_UCODE_SECT_MAX 128
 
 /*
  * fw_status is used to determine if we've already parsed the firmware file
@@ -494,6 +498,12 @@ struct iwx_device_cfg {
 #define IWX_MA_B_GF4_A_FW	"iwx-ma-b0-gf4-a0-83"
 #define IWX_MA_B_GF4_A_PNVM	"iwx-ma-b0-gf4-a0.pnvm"
 #define IWX_MA_A_FM_A_FW	"iwx-ma-a0-fm-a0-83"
+/*
+ * BE200: Gl MAC with the Fm radio. API 83 is the newest firmware that still
+ * speaks the pre-MLD command set this driver uses (Linux 6.18 wants >= 100).
+ */
+#define IWX_GL_C_FM_C_FW	"iwx-gl-c0-fm-c0-83"
+#define IWX_GL_C_FM_C_PNVM	"iwx-gl-c0-fm-c0.pnvm"
 #define IWX_MA_A_FM_A_PNVM	"iwx-ma-a0-fm-a0.pnvm"
 
 const struct iwx_device_cfg iwx_9560_quz_a0_jf_b0_cfg = {
@@ -721,6 +731,7 @@ struct iwx_softc {
 	int sc_device_family;
 #define IWX_DEVICE_FAMILY_22000	1
 #define IWX_DEVICE_FAMILY_AX210	2
+#define IWX_DEVICE_FAMILY_BZ	3	/* BE200 and later (Wi-Fi 7) */
 	uint32_t sc_sku_id[3];
 	uint32_t mac_addr_from_csr;
 

@@ -667,6 +667,14 @@ iwx_init_fw_sec(struct iwx_softc *sc, const struct iwx_fw_sects *fws,
 	/* add 2 due to separators */
 	dram->paging_cnt = iwx_get_num_sections(fws,
 	    dram->lmac_cnt + dram->umac_cnt + 2);
+	if (dram->lmac_cnt > IWX_MAX_DRAM_ENTRY ||
+	    dram->umac_cnt > IWX_MAX_DRAM_ENTRY ||
+	    dram->paging_cnt > IWX_MAX_DRAM_ENTRY) {
+		printf("%s: firmware has too many sections (%d/%d/%d)\n",
+		    DEVNAME(sc), dram->lmac_cnt, dram->umac_cnt,
+		    dram->paging_cnt);
+		return EINVAL;
+	}
 
 	dram->fw = mallocarray(dram->umac_cnt + dram->lmac_cnt,
 	    sizeof(*dram->fw), M_DEVBUF,  M_ZERO | M_NOWAIT);
@@ -897,6 +905,39 @@ monitor:
 	return 0;
 }
 
+/* Reset the whole device (Bz moved the reset bit into GP_CNTRL). */
+static void
+iwx_sw_reset(struct iwx_softc *sc)
+{
+	if (sc->sc_device_family >= IWX_DEVICE_FAMILY_BZ) {
+		IWX_SETBITS(sc, IWX_CSR_GP_CNTRL,
+		    IWX_CSR_GP_CNTRL_REG_FLAG_SW_RESET);
+		DELAY(10000);
+	} else {
+		IWX_SETBITS(sc, IWX_CSR_RESET, IWX_CSR_RESET_REG_FLAG_SW_RESET);
+		DELAY(5000);
+	}
+}
+
+/* Tell the device how far the RX free buffer ring is filled. */
+static void
+iwx_write_rx_wptr(struct iwx_softc *sc, uint32_t index)
+{
+	if (sc->sc_device_family >= IWX_DEVICE_FAMILY_BZ)
+		IWX_WRITE(sc, IWX_HBUS_TARG_WRPTR,
+		    index | IWX_HBUS_TARG_WRPTR_RX_Q(0));
+	else
+		IWX_WRITE(sc, IWX_RFH_Q0_FRBDCB_WIDX_TRG, index);
+}
+
+static uint32_t
+iwx_mac_access_req(struct iwx_softc *sc)
+{
+	return sc->sc_device_family >= IWX_DEVICE_FAMILY_BZ
+	    ? IWX_CSR_GP_CNTRL_REG_FLAG_BZ_MAC_ACCESS_REQ
+	    : IWX_CSR_GP_CNTRL_REG_FLAG_MAC_ACCESS_REQ;
+}
+
 void
 iwx_set_ltr(struct iwx_softc *sc)
 {
@@ -917,7 +958,9 @@ iwx_set_ltr(struct iwx_softc *sc)
 	 * initialize the LTR to ~250 usec (see ltr_val above).
 	 * The firmware initializes this again later (to a smaller value).
 	 */
-	if (!sc->sc_integrated) {
+	if (sc->sc_device_family >= IWX_DEVICE_FAMILY_BZ) {
+		/* Linux leaves the LTR alone on these devices. */
+	} else if (!sc->sc_integrated) {
 		IWX_WRITE(sc, IWX_CSR_LTR_LONG_VAL_AD, ltr_val);
 	} else if (sc->sc_integrated &&
 		   sc->sc_device_family == IWX_DEVICE_FAMILY_22000) {
@@ -1099,7 +1142,14 @@ iwx_ctxt_info_gen3_init(struct iwx_softc *sc, const struct iwx_fw_sects *fws)
 		return EBUSY;
 	}
 	iwx_set_ltr(sc);
-	iwx_write_umac_prph(sc, IWX_UREG_CPU_INIT_RUN, 1);
+	if (sc->sc_device_family >= IWX_DEVICE_FAMILY_BZ) {
+		/* Bz starts the ROM through GP_CNTRL, not UREG_CPU_INIT_RUN. */
+		IWX_WRITE(sc, IWX_CSR_FUNC_SCRATCH,
+		    IWX_CSR_FUNC_SCRATCH_INIT_VALUE);
+		IWX_SETBITS(sc, IWX_CSR_GP_CNTRL,
+		    IWX_CSR_GP_CNTRL_REG_FLAG_ROM_START);
+	} else
+		iwx_write_umac_prph(sc, IWX_UREG_CPU_INIT_RUN, 1);
 	iwx_nic_unlock(sc);
 
 	/* Context info will be released upon alive or failure to get one */
@@ -1601,9 +1651,19 @@ iwx_read_firmware(struct iwx_softc *sc)
 		case 0x100000c:
 			break;
 
+		/* undocumented TLV found in iwx-gl-c0-fm-c0-83 image (BE200) */
+		case 0x444:
+			break;
+
 		default:
-			err = EINVAL;
-			goto parse_out;
+			/*
+			 * As Linux does: newer images carry sections this driver
+			 * does not know (the BE200's has types 65 and 0x444);
+			 * skip them rather than refuse the whole image.
+			 */
+			printf("%s: ignoring firmware section type %d (%zu bytes)\n",
+			    DEVNAME(sc), tlv_type, (size_t)tlv_len);
+			break;
 		}
 
 		/*
@@ -1770,12 +1830,18 @@ iwx_nic_lock(struct iwx_softc *sc)
 		return 1; /* already locked */
 	}
 
-	IWX_SETBITS(sc, IWX_CSR_GP_CNTRL,
-	    IWX_CSR_GP_CNTRL_REG_FLAG_MAC_ACCESS_REQ);
+	IWX_SETBITS(sc, IWX_CSR_GP_CNTRL, iwx_mac_access_req(sc));
 
 	DELAY(2);
 
-	if (iwx_poll_bit(sc, IWX_CSR_GP_CNTRL,
+	if (sc->sc_device_family >= IWX_DEVICE_FAMILY_BZ) {
+		if (iwx_poll_bit(sc, IWX_CSR_GP_CNTRL,
+		    IWX_CSR_GP_CNTRL_REG_FLAG_MAC_STATUS,
+		    IWX_CSR_GP_CNTRL_REG_FLAG_MAC_STATUS, 150000)) {
+			sc->sc_nic_locks++;
+			return 1;
+		}
+	} else if (iwx_poll_bit(sc, IWX_CSR_GP_CNTRL,
 	    IWX_CSR_GP_CNTRL_REG_VAL_MAC_ACCESS_EN,
 	    IWX_CSR_GP_CNTRL_REG_FLAG_MAC_CLOCK_READY
 	     | IWX_CSR_GP_CNTRL_REG_FLAG_GOING_TO_SLEEP, 150000)) {
@@ -1800,7 +1866,7 @@ iwx_nic_unlock(struct iwx_softc *sc)
 	if (sc->sc_nic_locks > 0) {
 		if (--sc->sc_nic_locks == 0)
 			IWX_CLRBITS(sc, IWX_CSR_GP_CNTRL,
-			    IWX_CSR_GP_CNTRL_REG_FLAG_MAC_ACCESS_REQ);
+			    iwx_mac_access_req(sc));
 	} else
 		printf("%s: NIC already unlocked\n", DEVNAME(sc));
 }
@@ -2449,16 +2515,22 @@ iwx_apm_init(struct iwx_softc *sc)
 	 * Set "initialization complete" bit to move adapter from
 	 * D0U* --> D0A* (powered-up active) state.
 	 */
-	IWX_SETBITS(sc, IWX_CSR_GP_CNTRL, IWX_CSR_GP_CNTRL_REG_FLAG_INIT_DONE);
+	uint32_t ready = IWX_CSR_GP_CNTRL_REG_FLAG_MAC_CLOCK_READY;
+	if (sc->sc_device_family >= IWX_DEVICE_FAMILY_BZ) {
+		IWX_SETBITS(sc, IWX_CSR_GP_CNTRL,
+		    IWX_CSR_GP_CNTRL_REG_FLAG_BZ_MAC_ACCESS_REQ |
+		    IWX_CSR_GP_CNTRL_REG_FLAG_MAC_INIT);
+		ready = IWX_CSR_GP_CNTRL_REG_FLAG_MAC_STATUS;
+	} else
+		IWX_SETBITS(sc, IWX_CSR_GP_CNTRL,
+		    IWX_CSR_GP_CNTRL_REG_FLAG_INIT_DONE);
 
 	/*
 	 * Wait for clock stabilization; once stabilized, access to
 	 * device-internal resources is supported, e.g. iwx_write_prph()
 	 * and accesses to uCode SRAM.
 	 */
-	if (!iwx_poll_bit(sc, IWX_CSR_GP_CNTRL,
-	    IWX_CSR_GP_CNTRL_REG_FLAG_MAC_CLOCK_READY,
-	    IWX_CSR_GP_CNTRL_REG_FLAG_MAC_CLOCK_READY, 25000)) {
+	if (!iwx_poll_bit(sc, IWX_CSR_GP_CNTRL, ready, ready, 25000)) {
 		printf("%s: timeout waiting for clock stabilization\n",
 		    DEVNAME(sc));
 		err = ETIMEDOUT;
@@ -2484,19 +2556,31 @@ iwx_apm_stop(struct iwx_softc *sc)
 	DELAY(5000);
 
 	/* stop device's busmaster DMA activity */
-	IWX_SETBITS(sc, IWX_CSR_RESET, IWX_CSR_RESET_REG_FLAG_STOP_MASTER);
-
-	if (!iwx_poll_bit(sc, IWX_CSR_RESET,
-	    IWX_CSR_RESET_REG_FLAG_MASTER_DISABLED,
-	    IWX_CSR_RESET_REG_FLAG_MASTER_DISABLED, 100))
-		printf("%s: timeout waiting for master\n", DEVNAME(sc));
+	if (sc->sc_device_family >= IWX_DEVICE_FAMILY_BZ) {
+		IWX_SETBITS(sc, IWX_CSR_GP_CNTRL,
+		    IWX_CSR_GP_CNTRL_REG_FLAG_BUS_MASTER_DISABLE_REQ);
+		if (!iwx_poll_bit(sc, IWX_CSR_GP_CNTRL,
+		    IWX_CSR_GP_CNTRL_REG_FLAG_BUS_MASTER_DISABLE_STATUS,
+		    IWX_CSR_GP_CNTRL_REG_FLAG_BUS_MASTER_DISABLE_STATUS, 100))
+			printf("%s: timeout waiting for master\n", DEVNAME(sc));
+		DELAY(10000);
+	} else {
+		IWX_SETBITS(sc, IWX_CSR_RESET,
+		    IWX_CSR_RESET_REG_FLAG_STOP_MASTER);
+		if (!iwx_poll_bit(sc, IWX_CSR_RESET,
+		    IWX_CSR_RESET_REG_FLAG_MASTER_DISABLED,
+		    IWX_CSR_RESET_REG_FLAG_MASTER_DISABLED, 100))
+			printf("%s: timeout waiting for master\n", DEVNAME(sc));
+	}
 
 	/*
 	 * Clear "initialization complete" bit to move adapter from
 	 * D0A* (powered-up Active) --> D0U* (Uninitialized) state.
 	 */
 	IWX_CLRBITS(sc, IWX_CSR_GP_CNTRL,
-	    IWX_CSR_GP_CNTRL_REG_FLAG_INIT_DONE);
+	    sc->sc_device_family >= IWX_DEVICE_FAMILY_BZ
+	    ? IWX_CSR_GP_CNTRL_REG_FLAG_MAC_INIT
+	    : IWX_CSR_GP_CNTRL_REG_FLAG_INIT_DONE);
 }
 
 void
@@ -2595,6 +2679,8 @@ iwx_conf_msix_hw(struct iwx_softc *sc, int stopped)
 	    IWX_MSIX_HW_INT_CAUSES_REG_RF_KILL |
 	    IWX_MSIX_HW_INT_CAUSES_REG_PERIODIC |
 	    IWX_MSIX_HW_INT_CAUSES_REG_SW_ERR |
+	    (sc->sc_device_family >= IWX_DEVICE_FAMILY_BZ ?
+	    IWX_MSIX_HW_INT_CAUSES_REG_SW_ERR_V2 : 0) |
 	    IWX_MSIX_HW_INT_CAUSES_REG_SCD |
 	    IWX_MSIX_HW_INT_CAUSES_REG_FH_TX |
 	    IWX_MSIX_HW_INT_CAUSES_REG_HW_ERR |
@@ -2637,8 +2723,7 @@ iwx_start_hw(struct iwx_softc *sc)
 	}
 
 	/* Reset the entire device */
-	IWX_SETBITS(sc, IWX_CSR_RESET, IWX_CSR_RESET_REG_FLAG_SW_RESET);
-	DELAY(5000);
+	iwx_sw_reset(sc);
 
 	if (sc->sc_device_family == IWX_DEVICE_FAMILY_22000 &&
 	    sc->sc_integrated) {
@@ -2696,8 +2781,7 @@ iwx_stop_device(struct iwx_softc *sc)
 	}
 
 	/* Make sure (redundant) we've released our request to stay awake */
-	IWX_CLRBITS(sc, IWX_CSR_GP_CNTRL,
-	    IWX_CSR_GP_CNTRL_REG_FLAG_MAC_ACCESS_REQ);
+	IWX_CLRBITS(sc, IWX_CSR_GP_CNTRL, iwx_mac_access_req(sc));
 	if (sc->sc_nic_locks > 0)
 		printf("%s: %d active NIC locks forcefully cleared\n",
 		    DEVNAME(sc), sc->sc_nic_locks);
@@ -2707,8 +2791,7 @@ iwx_stop_device(struct iwx_softc *sc)
 	iwx_apm_stop(sc);
 
 	/* Reset the on-board processor. */
-	IWX_SETBITS(sc, IWX_CSR_RESET, IWX_CSR_RESET_REG_FLAG_SW_RESET);
-	DELAY(5000);
+	iwx_sw_reset(sc);
 
 	/*
 	 * Upon stop, the IVAR table gets erased, so msi-x won't
@@ -2735,6 +2818,13 @@ iwx_stop_device(struct iwx_softc *sc)
 	iwx_dma_contig_free(&sc->pnvm_dma);
 	for (i = 0; i < sc->pnvm_segs; i++)
 		iwx_dma_contig_free(&sc->pnvm_seg_dma[i]);
+	/*
+	 * The next start loads the PNVM again; a fragmented one (the BE200's
+	 * firmware has IWX_UCODE_TLV_CAPA_FRAGMENTED_PNVM_IMG) counts its
+	 * segments up from here, past the ones just freed.
+	 */
+	sc->pnvm_segs = 0;
+	sc->pnvm_size = 0;
 }
 
 void
@@ -3136,8 +3226,14 @@ iwx_init_channel_map(struct iwx_softc *sc, uint16_t *channel_profile_v3,
 			if (ch_flags & IWX_NVM_CHANNEL_80MHZ)
 				channel->ic_xflags |= IEEE80211_CHANX_80MHZ;
 		}
+		/*
+		 * HE station set-up here uses STA_HE_CTXT_CMD; the Bz family's
+		 * MLD firmware (BE200) does not answer it, so those cards
+		 * associate with HT/VHT.
+		 */
 		if (IWX_ENABLE_HE_ASSOCIATION && data->sku_cap_11ax_enable &&
-		    data->sku_cap_11n_enable)
+		    data->sku_cap_11n_enable &&
+		    sc->sc_device_family < IWX_DEVICE_FAMILY_BZ)
 			channel->ic_xflags |= IEEE80211_CHANX_HE;
 	}
 }
@@ -4539,10 +4635,12 @@ iwx_run_init_mvm_ucode(struct iwx_softc *sc, int readnvm)
 	/*
 	 * Only enable the MLD API on MA devices for now as the API 77
 	 * firmware on some of the older firmware devices also claims
-	 * support, but doesn't actually work.
+	 * support, but doesn't actually work. The Bz family (BE200) needs
+	 * it: its firmware no longer answers MAC_CONTEXT_CMD.
 	 */
 	if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_MLD_API_SUPPORT) &&
-	    IWX_CSR_HW_REV_TYPE(sc->sc_hw_rev) == IWX_CFG_MAC_TYPE_MA)
+	    (IWX_CSR_HW_REV_TYPE(sc->sc_hw_rev) == IWX_CFG_MAC_TYPE_MA ||
+	    sc->sc_device_family >= IWX_DEVICE_FAMILY_BZ))
 		sc->sc_use_mld_api = 1;
 
 	return 0;
@@ -9863,6 +9961,7 @@ iwx_send_update_mcc_cmd(struct iwx_softc *sc, const char *alpha2)
 	struct iwx_rx_packet *pkt;
 	struct iwx_mcc_update_resp *resp;
 	size_t resp_len;
+	uint8_t resp_ver;
 	int err;
 
 	memset(&mcc_cmd, 0, sizeof(mcc_cmd));
@@ -9887,6 +9986,26 @@ iwx_send_update_mcc_cmd(struct iwx_softc *sc, const char *alpha2)
 	}
 
 	resp_len = iwx_rx_packet_payload_len(pkt);
+
+	resp_ver = iwx_lookup_notif_ver(sc, IWX_LONG_GROUP, IWX_MCC_UPDATE_CMD);
+	if (resp_ver != IWX_FW_CMD_VER_UNKNOWN && resp_ver >= 8) {
+		struct iwx_mcc_update_resp_v8 *resp8 = (void *)pkt->data;
+		uint32_t n_channels;
+
+		if (resp_len < sizeof(*resp8)) {
+			err = EIO;
+			goto out;
+		}
+		n_channels = le32toh(resp8->n_channels);
+		if (resp_len != sizeof(*resp8) +
+		    n_channels * sizeof(resp8->channels[0])) {
+			err = EIO;
+			goto out;
+		}
+		iwx_init_channel_map(sc, NULL, resp8->channels, n_channels);
+		goto out;
+	}
+
 	if (resp_len < sizeof(*resp)) {
 		err = EIO;
 		goto out;
@@ -11248,7 +11367,7 @@ iwx_notif_intr(struct iwx_softc *sc)
 	 * Seems like the hardware gets upset unless we align the write by 8??
 	 */
 	hw = (hw == 0) ? IWX_RX_MQ_RING_COUNT - 1 : hw - 1;
-	IWX_WRITE(sc, IWX_RFH_Q0_FRBDCB_WIDX_TRG, hw & ~7);
+	iwx_write_rx_wptr(sc, hw & ~7);
 }
 
 int
@@ -11307,7 +11426,7 @@ iwx_intr(void *arg)
 		/* Firmware has now configured the RFH. */
 		for (i = 0; i < IWX_RX_MQ_RING_COUNT; i++)
 			iwx_update_rx_desc(sc, &sc->rxq, i);
-		IWX_WRITE(sc, IWX_RFH_Q0_FRBDCB_WIDX_TRG, 8);
+		iwx_write_rx_wptr(sc, 8);
 	}
 
 	handled |= (r1 & (IWX_CSR_INT_BIT_ALIVE /*| IWX_CSR_INT_BIT_SCD*/));
@@ -11435,7 +11554,7 @@ iwx_intr_msix(void *arg)
 		/* Firmware has now configured the RFH. */
 		for (i = 0; i < IWX_RX_MQ_RING_COUNT; i++)
 			iwx_update_rx_desc(sc, &sc->rxq, i);
-		IWX_WRITE(sc, IWX_RFH_Q0_FRBDCB_WIDX_TRG, 8);
+		iwx_write_rx_wptr(sc, 8);
 	}
 
 	/*
@@ -11473,6 +11592,9 @@ static const struct pci_matchid iwx_devices[] = {
 #define	PCI_PRODUCT_INTEL_WL_22500_16	0x54f0		/* Wi-Fi 6 AX211 */
 #define	PCI_PRODUCT_INTEL_WL_22500_17	0x51f1		/* Wi-Fi 6 AX211 */
 #endif
+#ifndef PCI_PRODUCT_INTEL_WL_BE200
+#define	PCI_PRODUCT_INTEL_WL_BE200	0x272b		/* Wi-Fi 7 BE200 */
+#endif
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_WL_22500_1 },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_WL_22500_2 },
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_WL_22500_3 },
@@ -11490,6 +11612,7 @@ static const struct pci_matchid iwx_devices[] = {
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_WL_22500_15,},
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_WL_22500_16,},
 	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_WL_22500_17,},
+	{ PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_WL_BE200,},
 };
 
 #ifdef __FreeBSD_version
@@ -12307,6 +12430,21 @@ iwx_attach(struct device *parent, struct device *self, void *aux)
 		sc->sc_tx_with_siso_diversity = 0;
 		sc->sc_uhb_supported = 1;
 		break;
+	case PCI_PRODUCT_INTEL_WL_BE200:
+		/* Discrete Gl MAC with the Fm radio (Linux iwl_gl_mac_cfg). */
+		if (IWX_CSR_HW_REV_TYPE(sc->sc_hw_rev) != IWX_CFG_MAC_TYPE_GL)
+			printf("%s: BE200 with unexpected MAC type 0x%x\n",
+			    DEVNAME(sc), IWX_CSR_HW_REV_TYPE(sc->sc_hw_rev));
+		sc->sc_fwname = IWX_GL_C_FM_C_FW;
+		sc->sc_pnvm_name = IWX_GL_C_FM_C_PNVM;
+		sc->sc_device_family = IWX_DEVICE_FAMILY_BZ;
+		sc->sc_integrated = 0;
+		sc->sc_ltr_delay = IWX_SOC_FLAGS_LTR_APPLY_DELAY_NONE;
+		sc->sc_low_latency_xtal = 1;
+		sc->sc_xtal_latency = 12000;
+		sc->sc_tx_with_siso_diversity = 0;
+		sc->sc_uhb_supported = 1;
+		break;
 	default:
 		printf("%s: unknown adapter type\n", DEVNAME(sc));
 		goto fail;
@@ -12327,7 +12465,9 @@ iwx_attach(struct device *parent, struct device *self, void *aux)
 		}
 	}
 
-	sc->mac_addr_from_csr = 0x380; /* differs on BZ hw generation */
+	/* MAC address straps/OTP: CSR 0x30 on Bz, 0x380 before. */
+	sc->mac_addr_from_csr =
+	    sc->sc_device_family >= IWX_DEVICE_FAMILY_BZ ? 0x30 : 0x380;
 
 	if (sc->sc_device_family >= IWX_DEVICE_FAMILY_AX210) {
 		sc->sc_umac_prph_offset = 0x300000;

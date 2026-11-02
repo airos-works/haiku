@@ -733,6 +733,37 @@ generated diagnostic image passed QEMU in
 changes. Six real-PTY tests and
 sixteen lab-control tests passed, including recovery after a failed baud change.
 
+## Boot hangs after the 2026-11-02 update, and the Intel BE200
+
+**Stage-4 hang (NVMe probe).** After the System Updater installed
+20261101-2150 (hrev60207+2226) the board stopped on the boot splash with
+four icons lit, about one boot in four or five, the update's own restart
+among them. Every boot stalled 0.2 to 4.8 s between "nvme_disk: using
+MSI-X" and "=> feature apst table set" (`rock5/nvme-stall.sh`). The images
+set `trace true` in `gicv3_its`, and the RK3588 ITS printed from its LPI
+handler on CPU 0; each such print held CPU 0 for up to seconds and the NVMe
+driver's next admin command waited as long. With trace off: 10 of 10 boots,
+NVMe set-up 1 to 2 ms. Fix: the handler only counts, a kernel daemon prints
+(trace stays harmless for installed systems, whose settings an update does
+not replace); with trace on and the fix, NVMe set-up 1 to 2 ms on every boot.
+
+**No network on one boot in 18.** net_server's service launch
+(posix_spawn, which falls back to vfork) hung: the child waited in malloc()
+inside exec for a heap lock another thread held at the fork, and the parent
+for the child, so the DHCP lease was never applied. vfork() now takes the
+heap's locks like fork(); `vfork_malloc_test` hangs on its first round
+without the fix and passes 3 x 400 rounds with it.
+
+**Intel BE200.** See [WIRELESS-DEVICES.md](WIRELESS-DEVICES.md#intel-be200-2026-11-02):
+the card attaches on the E-key slot, loads firmware 83.ec13314b.0 and its
+PNVM, scans (no antennas fitted: signal 2 to 8) and joins Gaspers at
+802.11ac with DHCP (192.168.1.245); Bluetooth (`8087:0036`) loads
+`ibt-0291-0291` and the server brings the controller up, but an LE scan
+without antennas found nothing.
+
+Validation: with `trace true` and both fixes, 10 of 10 warm reboots came up
+on the network with NVMe set-up 1 to 2 ms (`rock5/evidence/loop-20261102-201741`).
+
 ## First native Haiku trials
 
 The first native Haiku image (`184dec46561672f2...`) stopped in

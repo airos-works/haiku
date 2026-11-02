@@ -57,6 +57,7 @@ private:
 		uint32 count = 0;
 		uint32 enabledMask = 0;
 		int32 interruptCounts[Gicv3Its::kEventCount]{};
+		uint32 reportedCounts[Gicv3Its::kEventCount]{};
 		bool ready = false;
 		bool faulted = false;
 		spinlock lock = B_SPINLOCK_INITIALIZER;
@@ -75,6 +76,7 @@ private:
 	void _Quarantine(Instance& instance, const char* reason);
 	Instance* _InstanceForRequester(const msi_requester* requester);
 	Instance* _InstanceForVector(uint32 vector);
+	static void _ReportTrace(void* data, int iteration);
 
 	volatile uint8* fRedistributors = nullptr;
 	Memory fProperties;
@@ -84,6 +86,7 @@ private:
 	uint64 fTarget = 0;
 	phys_addr_t fMinimumTableAddress = 0;
 	bool fTrace = false;
+	int32 fTraceReporter = 0;
 };
 
 #endif
