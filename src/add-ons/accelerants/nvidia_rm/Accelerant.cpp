@@ -205,6 +205,9 @@ private:
 		NvEngine2D::Surface surface;
 	};
 	std::vector<Source> fSources;
+	const Source *FindSource(uint32 id) const;
+	status_t CreateSource(uint16 width, uint16 height, color_space space,
+		bool systemMemory, frame_buffer_source *source);
 	uint32 fNextSourceID = 1;
 
 	NvKmsBitmap fCursor, fNewCursor;
@@ -342,6 +345,10 @@ public:
 	void DeleteFrameBufferSource(uint32 id);
 	status_t CopyToFrameBuffer(uint32 id, const fill_rect_params *list,
 		uint32 count);
+	status_t CreateFrameBufferShadow(uint16 width, uint16 height,
+		color_space space, frame_buffer_source *shadow);
+	status_t CopyFrameBufferSource(uint32 from, uint32 to,
+		const fill_rect_params *list, uint32 count);
 
 	static void Init(int fd);
 	static void Clone(void* data);
@@ -1158,6 +1165,22 @@ status_t NvAccelerant::SyncToToken(sync_token *st)
 status_t NvAccelerant::CreateFrameBufferSource(uint16 width, uint16 height,
 	color_space space, frame_buffer_source *source)
 {
+	return CreateSource(width, height, space, true, source);
+}
+
+// The same in video memory, without a CPU mapping: the engine fills it from
+// a source in about a quarter of the time the CPU would take, and copies it
+// to the screen eight times as fast as from memory in the system (a whole
+// 3840x2160 screen: 0.37 against 2.9 ms on a GTX 1070).
+status_t NvAccelerant::CreateFrameBufferShadow(uint16 width, uint16 height,
+	color_space space, frame_buffer_source *shadow)
+{
+	return CreateSource(width, height, space, false, shadow);
+}
+
+status_t NvAccelerant::CreateSource(uint16 width, uint16 height,
+	color_space space, bool systemMemory, frame_buffer_source *source)
+{
 	if (!fEngine || fEngine->IsLost())
 		return B_UNSUPPORTED;
 	if (space != B_RGB32 && space != B_RGBA32)
@@ -1166,14 +1189,15 @@ status_t NvAccelerant::CreateFrameBufferSource(uint16 width, uint16 height,
 	uint32 bytesPerRow = ((uint32)width * 4 + 255) & ~255u;
 	Source entry;
 	entry.id = fNextSourceID++;
-	entry.buffer = fEngine->Allocate((NvU64)bytesPerRow * height, true);
+	entry.buffer = fEngine->Allocate((NvU64)bytesPerRow * height, systemMemory,
+		systemMemory);
 	entry.surface.gpuAddress = entry.buffer.GpuAddress();
 	entry.surface.width = width;
 	entry.surface.height = height;
 	entry.surface.bytesPerRow = bytesPerRow;
 	entry.surface.colorSpace = space;
 	source->id = entry.id;
-	source->bits = entry.buffer.Address();
+	source->bits = systemMemory ? entry.buffer.Address() : nullptr;
 	source->bytes_per_row = bytesPerRow;
 	source->width = width;
 	source->height = height;
@@ -1204,11 +1228,7 @@ status_t NvAccelerant::CopyToFrameBuffer(uint32 id, const fill_rect_params *list
 	std::lock_guard<std::recursive_mutex> lock(fEngine->Lock());
 	if (fEngine->IsLost() || !fEngine->Target().IsSet())
 		return B_ERROR;
-	const Source *source = nullptr;
-	for (const auto &entry: fSources) {
-		if (entry.id == id)
-			source = &entry;
-	}
+	const Source *source = FindSource(id);
 	if (source == nullptr)
 		return B_BAD_VALUE;
 
@@ -1222,6 +1242,64 @@ status_t NvAccelerant::CopyToFrameBuffer(uint32 id, const fill_rect_params *list
 		count -= chunk;
 	}
 	return fEngine->Wait(fEngine->Submit()) ? B_OK : B_ERROR;
+}
+
+// app_server's back buffer, in memory in the system, to its flush shadow in
+// video memory: the CPU no longer copies what it has drawn.
+status_t NvAccelerant::CopyFrameBufferSource(uint32 from, uint32 to,
+	const fill_rect_params *list, uint32 count)
+{
+	if (!fEngine)
+		return B_UNSUPPORTED;
+	std::unique_lock<std::recursive_mutex> lock(fEngine->Lock());
+	if (fEngine->IsLost())
+		return B_ERROR;
+	const Source *source = FindSource(from);
+	const Source *target = FindSource(to);
+	if (source == nullptr || target == nullptr || source == target
+		|| source->surface.width != target->surface.width
+		|| source->surface.height != target->surface.height)
+		return B_BAD_VALUE;
+
+	clipping_rect rects[64];
+	uint64 pixels = 0;
+	while (count > 0) {
+		uint32 chunk = std::min<uint32>(count, B_COUNT_OF(rects));
+		for (uint32 i = 0; i < chunk; i++) {
+			rects[i] = {list[i].left, list[i].top, list[i].right, list[i].bottom};
+			pixels += (uint64)(list[i].right - list[i].left + 1)
+				* (list[i].bottom - list[i].top + 1);
+		}
+		fEngine->Copy(source->surface, target->surface, rects, chunk);
+		list += chunk;
+		count -= chunk;
+	}
+	uint32 sequence = fEngine->Submit();
+	// Waited for without the engine: app_server's flush copies to the screen
+	// at a blank from another thread, and is behind this copy in the
+	// channel only, not behind this thread's sleep.
+	lock.unlock();
+	// The caller waits on a thread of its own (a window's): the copy from
+	// system memory takes about 1 us per 11 KB, and polling all along for
+	// one took a tenth of that thread's time in system_time() alone.
+	bool spin = true;
+	if (source->buffer.Address() != nullptr) {
+		bigtime_t expected = (bigtime_t)(pixels * 4 / 11000);
+		if (expected > 40) {
+			snooze(expected * 3 / 4);
+			spin = false;
+		}
+	}
+	return fEngine->Wait(sequence, 2000000, spin) ? B_OK : B_ERROR;
+}
+
+const NvAccelerant::Source *NvAccelerant::FindSource(uint32 id) const
+{
+	for (const auto &entry: fSources) {
+		if (entry.id == id)
+			return &entry;
+	}
+	return nullptr;
 }
 
 void NvAccelerant::Uninit()
@@ -2847,7 +2925,7 @@ static bool CloneOffers(uint32 feature)
 			return (feature >= B_ACCELERANT_ENGINE_COUNT
 					&& feature <= B_SCREEN_TO_SCREEN_SCALED_FILTERED_BLIT)
 				|| (feature >= B_CREATE_FRAME_BUFFER_SOURCE
-					&& feature <= B_COPY_TO_FRAME_BUFFER);
+					&& feature <= B_COPY_FRAME_BUFFER_SOURCE);
 	}
 }
 
@@ -2859,7 +2937,7 @@ static bool EngineOffers(uint32 feature)
 		&& feature <= B_SCREEN_TO_SCREEN_SCALED_FILTERED_BLIT)
 		return instance != nullptr && instance->HasEngine();
 	if (feature >= B_CREATE_FRAME_BUFFER_SOURCE
-		&& feature <= B_COPY_TO_FRAME_BUFFER)
+		&& feature <= B_COPY_FRAME_BUFFER_SOURCE)
 		return instance != nullptr && instance->HasEngine();
 	return true;
 }
@@ -3332,6 +3410,32 @@ _EXPORT void *get_accelerant_hook(uint32 feature, void *data)
 				try {
 					return NvAccelerant::Instance()->CopyToFrameBuffer(id, list,
 						count);
+				} catch (const std::system_error &ex) {
+					debug_printf("[!] nvidia_rm: %s\n", ex.what());
+					return ToErrorCode(ex);
+				}
+			};
+			return (void*)fn;
+		}
+		case B_CREATE_FRAME_BUFFER_SHADOW: {
+			create_frame_buffer_shadow fn = [](uint16 width, uint16 height,
+					color_space space, frame_buffer_source* shadow) -> status_t {
+				try {
+					return NvAccelerant::Instance()->CreateFrameBufferShadow(width,
+						height, space, shadow);
+				} catch (const std::system_error &ex) {
+					debug_printf("[!] nvidia_rm: %s\n", ex.what());
+					return ToErrorCode(ex);
+				}
+			};
+			return (void*)fn;
+		}
+		case B_COPY_FRAME_BUFFER_SOURCE: {
+			copy_frame_buffer_source fn = [](uint32 from, uint32 to,
+					const fill_rect_params* list, uint32 count) -> status_t {
+				try {
+					return NvAccelerant::Instance()->CopyFrameBufferSource(from, to,
+						list, count);
 				} catch (const std::system_error &ex) {
 					debug_printf("[!] nvidia_rm: %s\n", ex.what());
 					return ToErrorCode(ex);

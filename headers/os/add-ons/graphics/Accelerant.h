@@ -96,6 +96,11 @@ enum {
 	B_CREATE_FRAME_BUFFER_SOURCE = 0x700,	/* optional */
 	B_DELETE_FRAME_BUFFER_SOURCE,		/* optional */
 	B_COPY_TO_FRAME_BUFFER,				/* optional */
+	/* a shadow is a source in the device's own memory, which the CPU does
+	   not reach: the device fills it from a source and copies it to the
+	   screen, both faster than from memory in the system */
+	B_CREATE_FRAME_BUFFER_SHADOW,		/* optional */
+	B_COPY_FRAME_BUFFER_SOURCE,			/* optional */
 
 	/* 3D acceleration */
 	B_ACCELERANT_PRIVATE_START = (int)0x80000000
@@ -472,6 +477,17 @@ typedef void (*delete_frame_buffer_source)(uint32 id);
    there. Anything but B_OK: nothing may have been copied, the caller copies
    them itself. */
 typedef status_t (*copy_to_frame_buffer)(uint32 id,
+	const fill_rect_params* list, uint32 count);
+/* A source in the device's own memory, which the CPU cannot reach (bits is
+   NULL): what is in it comes from other sources (copy_frame_buffer_source)
+   and goes to the screen with copy_to_frame_buffer; deleted like a source.
+   Only offered together with copy_frame_buffer_source. */
+typedef status_t (*create_frame_buffer_shadow)(uint16 width, uint16 height,
+	color_space space, frame_buffer_source* shadow);
+/* Copies the rectangles (inclusive) from one source or shadow to the same
+   place in another of the same size, and returns once they are there.
+   Anything but B_OK: nothing may have been copied. */
+typedef status_t (*copy_frame_buffer_source)(uint32 from, uint32 to,
 	const fill_rect_params* list, uint32 count);
 /*
 	The uint16* list points to a list of tripples:

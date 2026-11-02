@@ -435,7 +435,7 @@ bool NvEngine2D::CheckLost()
 }
 
 
-bool NvEngine2D::Wait(uint32 sequence, bigtime_t timeout)
+bool NvEngine2D::Wait(uint32 sequence, bigtime_t timeout, bool spin)
 {
 	if (fLost)
 		return false;
@@ -453,7 +453,7 @@ bool NvEngine2D::Wait(uint32 sequence, bigtime_t timeout)
 			fLost = true;
 			return false;
 		}
-		if (waited > 50)
+		if (waited > 50 || !spin)
 			snooze(waited > 1000 ? 200 : 20);
 	}
 	return true;

@@ -115,6 +115,9 @@ protected:
 	virtual	bool				_DeviceCopiesShadows() const;
 	virtual	bool				_CopyShadowByDevice(RenderingBuffer* shadow,
 									const BRegion& region);
+	virtual	bool				_CopyBackToShadowByDevice(
+									RenderingBuffer* shadow,
+									const IntRect& area);
 
 private:
 			int					_OpenGraphicsDevice(int deviceNumber);
@@ -122,6 +125,9 @@ private:
 									int& count, char* _path);
 			status_t			_OpenAccelerant(int device);
 			status_t			_SetupDefaultHooks();
+			RenderingBuffer*	_CreateDeviceBackBuffer(uint32 width,
+									uint32 height);
+			void				_DeviceCopyFailed(const char* what);
 			void				_UpdateHooksAfterModeChange();
 			status_t			_UpdateModeList();
 			status_t			_UpdateFrameBufferConfig();
@@ -216,6 +222,8 @@ private:
 			create_frame_buffer_source fAccCreateFrameBufferSource;
 			delete_frame_buffer_source fAccDeleteFrameBufferSource;
 			copy_to_frame_buffer fAccCopyToFrameBuffer;
+			create_frame_buffer_shadow fAccCreateFrameBufferShadow;
+			copy_frame_buffer_source fAccCopyFrameBufferSource;
 			bool				fDeviceCopyFailed;
 
 			frame_buffer_config	fFrameBufferConfig;

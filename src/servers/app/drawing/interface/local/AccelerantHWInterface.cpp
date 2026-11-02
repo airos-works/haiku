@@ -93,6 +93,43 @@ use_fail_safe_video_mode()
 }
 
 
+/*!	Memory the graphics device reads or writes, from its frame buffer source
+	hooks: a source in memory in the system (the back buffer, or the flush's
+	shadows of it), which the CPU draws into and reads at heap speed; or a
+	shadow in the device's own memory, which the CPU cannot reach (Bits() is
+	NULL): the device copies the back buffer into it and from it to the
+	screen.
+*/
+class DeviceSourceBuffer : public RenderingBuffer {
+public:
+	DeviceSourceBuffer(const frame_buffer_source& source,
+			delete_frame_buffer_source deleteSource)
+		:
+		fSource(source),
+		fDelete(deleteSource)
+	{
+	}
+
+	virtual ~DeviceSourceBuffer()
+	{
+		fDelete(fSource.id);
+	}
+
+	virtual	status_t InitCheck() const { return B_OK; }
+	virtual	color_space ColorSpace() const { return B_RGBA32; }
+	virtual	void* Bits() const { return fSource.bits; }
+	virtual	uint32 BytesPerRow() const { return fSource.bytes_per_row; }
+	virtual	uint32 Width() const { return fSource.width; }
+	virtual	uint32 Height() const { return fSource.height; }
+
+	uint32 ID() const { return fSource.id; }
+
+private:
+	frame_buffer_source fSource;
+	delete_frame_buffer_source fDelete;
+};
+
+
 //	#pragma mark - AccelerantHWInterface
 
 
@@ -158,6 +195,8 @@ AccelerantHWInterface::AccelerantHWInterface()
 	fAccCreateFrameBufferSource(NULL),
 	fAccDeleteFrameBufferSource(NULL),
 	fAccCopyToFrameBuffer(NULL),
+	fAccCreateFrameBufferShadow(NULL),
+	fAccCopyFrameBufferSource(NULL),
 	fDeviceCopyFailed(false),
 
 	fModeCount(0),
@@ -468,12 +507,23 @@ AccelerantHWInterface::_SetupDefaultHooks()
 		B_DELETE_FRAME_BUFFER_SOURCE, NULL);
 	fAccCopyToFrameBuffer = (copy_to_frame_buffer)fAccelerantHook(
 		B_COPY_TO_FRAME_BUFFER, NULL);
+	// shadows in the device's own memory, filled from the back buffer
+	fAccCreateFrameBufferShadow = (create_frame_buffer_shadow)fAccelerantHook(
+		B_CREATE_FRAME_BUFFER_SHADOW, NULL);
+	fAccCopyFrameBufferSource = (copy_frame_buffer_source)fAccelerantHook(
+		B_COPY_FRAME_BUFFER_SOURCE, NULL);
 	if (fAccCreateFrameBufferSource == NULL
 		|| fAccDeleteFrameBufferSource == NULL
 		|| fAccCopyToFrameBuffer == NULL) {
 		fAccCreateFrameBufferSource = NULL;
 		fAccDeleteFrameBufferSource = NULL;
 		fAccCopyToFrameBuffer = NULL;
+	}
+	if (fAccCreateFrameBufferSource == NULL
+		|| fAccCreateFrameBufferShadow == NULL
+		|| fAccCopyFrameBufferSource == NULL) {
+		fAccCreateFrameBufferShadow = NULL;
+		fAccCopyFrameBufferSource = NULL;
 	}
 
 	if (fAccGetDisplayOutputCount == NULL || fAccGetDisplayOutputs == NULL
@@ -576,8 +626,10 @@ status_t
 AccelerantHWInterface::Shutdown()
 {
 	_StopFlushing();
-	// their memory may be the accelerant's
+	// their memory may be the accelerant's, as the back buffer's may be
 	_ReleaseFlushShadows();
+	if (dynamic_cast<DeviceSourceBuffer*>(fBackBuffer.Get()) != NULL)
+		fBackBuffer.Unset();
 
 	if (fDisplayChangeThread >= 0) {
 		if (fAccSetDisplayChangePort != NULL)
@@ -1300,7 +1352,10 @@ AccelerantHWInterface::_UpdateBackBuffer()
 		return B_OK;
 
 	fBackBuffer.Unset();
-	fBackBuffer.SetTo(new(nothrow) MallocBuffer(width, height));
+	RenderingBuffer* buffer = _CreateDeviceBackBuffer(width, height);
+	if (buffer == NULL)
+		buffer = new(nothrow) MallocBuffer(width, height);
+	fBackBuffer.SetTo(buffer);
 
 	status_t status = fBackBuffer.IsSet()
 		? fBackBuffer->InitCheck() : B_NO_MEMORY;
@@ -1824,42 +1879,65 @@ AccelerantHWInterface::MoveCursorTo(float x, float y)
 // #pragma mark - copies by the device
 
 
-/*!	A shadow of the back buffer in memory the graphics device reads: what
-	is drawn there, the device copies to the screen (_CopyShadowByDevice()).
+/*!	With shadows in the device's own memory, the back buffer is a source in
+	memory in the system: the device copies what is drawn there into the
+	shadow, where the CPU used to (_CopyBackToShadowByDevice()). The CPU
+	draws into it as fast as into the heap. Only while the back buffer is
+	the frame buffer's size: the device copies without scaling.
 */
-class DeviceSourceBuffer : public RenderingBuffer {
-public:
-	DeviceSourceBuffer(const frame_buffer_source& source,
-			delete_frame_buffer_source deleteSource)
-		:
-		fSource(source),
-		fDelete(deleteSource)
-	{
+RenderingBuffer*
+AccelerantHWInterface::_CreateDeviceBackBuffer(uint32 width, uint32 height)
+{
+	if (fAccCopyFrameBufferSource == NULL || fDeviceCopyFailed
+		|| !fFrontBuffer.IsSet() || width > 65535 || height > 65535
+		|| fFrontBuffer->Width() != width || fFrontBuffer->Height() != height)
+		return NULL;
+	switch (fFrontBuffer->ColorSpace()) {
+		case B_RGB32:
+		case B_RGBA32:
+			break;
+		default:
+			return NULL;
 	}
 
-	virtual ~DeviceSourceBuffer()
-	{
-		fDelete(fSource.id);
-	}
-
-	virtual	status_t InitCheck() const { return B_OK; }
-	virtual	color_space ColorSpace() const { return B_RGBA32; }
-	virtual	void* Bits() const { return fSource.bits; }
-	virtual	uint32 BytesPerRow() const { return fSource.bytes_per_row; }
-	virtual	uint32 Width() const { return fSource.width; }
-	virtual	uint32 Height() const { return fSource.height; }
-
-	uint32 ID() const { return fSource.id; }
-
-private:
-	frame_buffer_source fSource;
-	delete_frame_buffer_source fDelete;
-};
+	frame_buffer_source source = {};
+	if (fAccCreateFrameBufferSource(width, height, B_RGBA32, &source) != B_OK)
+		return NULL;
+	DeviceSourceBuffer* buffer = new(std::nothrow)
+		DeviceSourceBuffer(source, fAccDeleteFrameBufferSource);
+	if (buffer == NULL)
+		fAccDeleteFrameBufferSource(source.id);
+	return buffer;
+}
 
 
 RenderingBuffer*
 AccelerantHWInterface::_CreateFlushShadow(uint32 width, uint32 height)
 {
+	// in the device's memory, when the device reads the back buffer
+	DeviceSourceBuffer* back
+		= dynamic_cast<DeviceSourceBuffer*>(fBackBuffer.Get());
+	if (back != NULL && fAccCreateFrameBufferShadow != NULL
+		&& !fDeviceCopyFailed && back->Width() == width
+		&& back->Height() == height) {
+		frame_buffer_source shadow = {};
+		if (fAccCreateFrameBufferShadow(width, height, B_RGBA32, &shadow)
+				== B_OK) {
+			DeviceSourceBuffer* buffer = new(std::nothrow)
+				DeviceSourceBuffer(shadow, fAccDeleteFrameBufferSource);
+			if (buffer != NULL) {
+				debug_printf("app_server: vertical blank flush: a %" B_PRIu32
+					"x%" B_PRIu32 " shadow in the graphics device's memory, "
+					"filled by the device\n", width, height);
+				return buffer;
+			}
+			fAccDeleteFrameBufferSource(shadow.id);
+		} else {
+			syslog(LOG_WARNING, "app_server: no room for the back buffer's "
+				"shadow in the graphics device, it is kept in the system\n");
+		}
+	}
+
 	if (fAccCreateFrameBufferSource != NULL && !fDeviceCopyFailed
 		&& width <= 65535 && height <= 65535) {
 		frame_buffer_source source = {};
@@ -1910,16 +1988,68 @@ AccelerantHWInterface::_CopyShadowByDevice(RenderingBuffer* shadow,
 		}
 		if (fAccCopyToFrameBuffer(source->ID(), rects, chunk) != B_OK) {
 			// the device is gone for good: the CPU copies from now on, from
-			// these shadows still (they are ordinary memory to the CPU)
-			if (!fDeviceCopyFailed) {
-				syslog(LOG_ERR, "app_server: the graphics device failed to "
-					"copy to the screen, the CPU copies from now on\n");
-			}
-			fDeviceCopyFailed = true;
+			// shadows in memory in the system still (they are ordinary
+			// memory to the CPU), else from the back buffer
+			_DeviceCopyFailed("copy to the screen");
 			return false;
 		}
 	}
 	return true;
+}
+
+
+/*!	What was drawn in \a area of the back buffer, copied into a shadow in
+	the device's memory by the device. In bands of about 2 MB, each one
+	copy the accelerant waits for: the flush's copies to the screen at a
+	blank go between them rather than after the whole area.
+*/
+bool
+AccelerantHWInterface::_CopyBackToShadowByDevice(RenderingBuffer* shadow,
+	const IntRect& area)
+{
+	if (fAccCopyFrameBufferSource == NULL || fDeviceCopyFailed)
+		return false;
+	DeviceSourceBuffer* to = dynamic_cast<DeviceSourceBuffer*>(shadow);
+	DeviceSourceBuffer* from
+		= dynamic_cast<DeviceSourceBuffer*>(fBackBuffer.Get());
+	if (to == NULL || from == NULL || to->Width() != from->Width()
+		|| to->Height() != from->Height()) {
+		// a back buffer in the heap beside the device's shadows (out of
+		// memory for one in the system): the flush copies from it
+		_DeviceCopyFailed("read the back buffer");
+		return false;
+	}
+
+	const int32 kBandPixels = 512 * 1024;
+	int32 width = area.right - area.left + 1;
+	int32 bandRows = max_c(16, kBandPixels / max_c(width, 1));
+	for (int32 top = area.top; top <= area.bottom; top += bandRows) {
+		fill_rect_params rect;
+		rect.left = area.left;
+		rect.top = top;
+		rect.right = area.right;
+		rect.bottom = min_c(top + bandRows - 1, area.bottom);
+		if (fAccCopyFrameBufferSource(from->ID(), to->ID(), &rect, 1)
+				!= B_OK) {
+			_DeviceCopyFailed("copy the back buffer");
+			return false;
+		}
+	}
+	return true;
+}
+
+
+/*!	The device's copies failed (it is lost, as the accelerant counts it):
+	from now on the CPU copies, and the flush copies from the back buffer
+	where its shadows are in the device. */
+void
+AccelerantHWInterface::_DeviceCopyFailed(const char* what)
+{
+	if (!fDeviceCopyFailed) {
+		syslog(LOG_ERR, "app_server: the graphics device failed to %s, the "
+			"CPU copies from now on\n", what);
+	}
+	fDeviceCopyFailed = true;
 }
 
 

@@ -12,6 +12,8 @@
  * usage: nv2dtest [width height [timings]]
  *   timings skips the checks (reading video memory back is slow).
  */
+#include <algorithm>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -174,6 +176,10 @@ int main(int argc, char **argv)
 		NvEngine2D::Buffer system = engine.Allocate((NvU64)bytesPerRow * sHeight, true);
 		NvEngine2D::Surface back = surface;
 		back.gpuAddress = system.GpuAddress();
+		// a second one, as app_server's flush shadow beside its back buffer
+		NvEngine2D::Buffer system2 = engine.Allocate((NvU64)bytesPerRow * sHeight, true);
+		NvEngine2D::Surface shadow = surface;
+		shadow.gpuAddress = system2.GpuAddress();
 		if (timingsOnly)
 			goto timings;
 	{
@@ -309,6 +315,35 @@ int main(int argc, char **argv)
 		for (uint32 x = 0; x < 100; x++)
 			expected.At(x, 0) = 0xdeadbeef;
 		check("copy sees the CPU's latest writes");
+
+		// system memory to system memory, as app_server's back buffer to
+		// its flush shadow; then the CPU writes part of the shadow and the
+		// engine copies it to the screen: both writers' pixels must be there
+		Upload(source, system.Address());
+		memset(system2.Address(), 0, (size_t)bytesPerRow * sHeight);
+		engine.Copy(back, shadow, rects, 3);
+		if (!engine.Wait(engine.Submit())) {
+			printf("FAIL copy to system memory: the engine did not finish\n");
+			sFailures++;
+		}
+		Picture shadowExpected(sWidth, sHeight, stride);
+		std::fill(shadowExpected.pixels.begin(), shadowExpected.pixels.end(), 0);
+		for (auto &r: rects)
+			for (int32 y = r.top; y <= std::min<int32>(r.bottom, sHeight - 1); y++)
+				for (int32 x = r.left; x <= std::min<int32>(r.right, sWidth - 1); x++)
+					shadowExpected.At(x, y) = source.At(x, y);
+		Download(actual, system2.Address());
+		Compare("copy system -> system memory", shadowExpected, actual);
+
+		reset();
+		for (uint32 x = 200; x < 300; x++)
+			((uint32*)system2.Address())[300 * stride + x] = 0xcafef00d;
+		clipping_rect mixed = {200, 300, 999, 799};
+		engine.Copy(shadow, surface, &mixed, 1);
+		for (int32 y = mixed.top; y <= mixed.bottom; y++)
+			for (int32 x = mixed.left; x <= mixed.right; x++)
+				expected.At(x, y) = y == 300 && x < 300 ? 0xcafef00d : source.At(x, y);
+		check("engine and CPU writes to one shadow, copied to the screen");
 	}
 
 timings:
@@ -335,6 +370,43 @@ timings:
 		time("GPU blit half screen, video memory", [&]() {engine.Blit(&half, 1);});
 		clipping_rect all2 = {0, 0, (int32)sWidth - 1, (int32)sHeight - 1};
 		time("GPU copy system -> video memory", [&]() {engine.Copy(back, surface, &all2, 1);});
+		{
+			// a shadow in video memory: the back buffer copied there, then
+			// from there to the screen at the blank
+			NvEngine2D::Buffer video2 = engine.Allocate((NvU64)bytesPerRow * sHeight, false, false);
+			NvEngine2D::Surface videoShadow = surface;
+			videoShadow.gpuAddress = video2.GpuAddress();
+			time("GPU copy video -> other video memory", [&]() {engine.Copy(videoShadow, surface, &all2, 1);});
+			clipping_rect band = {0, 0, (int32)sWidth - 1, 127};
+			time("GPU copy system -> video, 128 rows", [&]() {engine.Copy(back, videoShadow, &band, 1);});
+			clipping_rect small = {100, 100, 163, 163};
+			int rounds = 200;
+			bigtime_t begin = system_time();
+			for (int i = 0; i < rounds; i++) {
+				engine.Copy(back, videoShadow, &small, 1);
+				engine.Copy(videoShadow, surface, &small, 1);
+				engine.Wait(engine.Submit());
+			}
+			printf("  %-40s %8.1f us\n", "round trip, 64x64 sys->video->video",
+				(double)(system_time() - begin) / rounds);
+		}
+		time("GPU copy system -> system memory", [&]() {engine.Copy(back, shadow, &all2, 1);});
+		{
+			clipping_rect band = {0, 0, (int32)sWidth - 1, 127};
+			time("GPU copy system -> system, 128 rows", [&]() {engine.Copy(back, shadow, &band, 1);});
+		}
+		{
+			bigtime_t begin = system_time();
+			int rounds = 5;
+			for (int i = 0; i < rounds; i++) {
+				for (uint32 y = 0; y < sHeight; y++)
+					memcpy((uint8*)system2.Address() + (size_t)y * bytesPerRow,
+						(uint8*)system.Address() + (size_t)y * bytesPerRow, sWidth * 4);
+			}
+			double us = (double)(system_time() - begin) / rounds;
+			printf("  %-40s %8.0f us  %6.1f GB/s\n", "CPU memcpy system -> system memory",
+				us, megabytes / us * 1e3);
+		}
 		{
 			bigtime_t begin = system_time();
 			int rounds = 5;
