@@ -215,7 +215,10 @@ area sampled; GTK programs and Firefox draw at 2x through the server above.
   their stroked indicator.
 - Scrolling by an odd number of logical pixels at 150 percent (most steps at
   125 and 175) still redraws the view instead of copying it; with glyphs from
-  the cache that is cheap for text, less so for large images.
+  the cache that is cheap for text, less so for large images. Until the
+  program has redrawn it, the view shows its content moved by the nearest
+  whole number of buffer pixels, and the redraw reaches the screen in one
+  piece (it used to flash the background first, haiku#57).
 - OpenGL views and other programs that draw logical-size bitmaps are still
   enlarged (GL filtered, other bitmaps area sampled: even, but with the
   detail of the logical size). Programs can use `BScreen::DeviceScale()` and
