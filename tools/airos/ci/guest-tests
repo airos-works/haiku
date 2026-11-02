@@ -16,3 +16,6 @@ rw_lock_signal_test
 # a device behind a full speed hub (QEMU usb-hub) enumerates: xHCI built its
 # route string from the transaction translator's port
 usb_hub_child_test
+# pipe() with a full FD table waited forever for a reader instead of failing
+# with EMFILE; a failed FIFO open left its writer count behind (haiku#59)
+pipe_fd_table_full_test

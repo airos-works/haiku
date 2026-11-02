@@ -23,6 +23,10 @@ SimpleTest signal_suspend_resume_test : signal_suspend_resume_test.cpp ;
 UsePrivateHeaders libroot system ;
 SimpleTest user_block_thread_test : user_block_thread_test.cpp ;
 
+# pipe() with a full FD table hung instead of failing with EMFILE
+# (airos-works/haiku#59); in tools/airos/ci/guest-tests too
+SimpleTest pipe_fd_table_full_test : pipe_fd_table_full_test.cpp ;
+
 SimpleTest hello_avx : hello_avx.c ;
 local avxSource = [ FGristFiles hello_avx.c ] ;
 local avxObject = $(avxSource:S=$(SUFOBJ)) ;
