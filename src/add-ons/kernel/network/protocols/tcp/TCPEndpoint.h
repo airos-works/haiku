@@ -67,6 +67,9 @@ public:
 			status_t	ErrorReceived(net_error error, net_error_data* errorData,
 							net_buffer* data);
 
+			void		AbortIfLocalAddressRemoved();
+			void		KeepAliveChanged();
+
 			void		Dump() const;
 
 private:
@@ -75,6 +78,11 @@ private:
 			void		_UpdateTimeWait();
 			void		_Close();
 			void		_CancelConnectionTimers();
+			void		_UpdateKeepAliveTimer();
+			void		_KeepAlive();
+			status_t	_SendKeepAlive();
+			bool		_IsWaitingForPeer() const;
+			void		_Drop(status_t error, const char* reason);
 
 			tcp_segment_header _PrepareSendSegment();
 			bool		_ShouldSendSegment(tcp_segment_header& segment,
@@ -123,6 +131,7 @@ private:
 	static	void		_PersistTimer(net_timer* timer, void* _endpoint);
 	static	void		_DelayedAcknowledgeTimer(net_timer* timer,
 							void* _endpoint);
+	static	void		_KeepAliveTimer(net_timer* timer, void* _endpoint);
 
 	static	status_t	_WaitForCondition(ConditionVariable& condition,
 							MutexLocker& locker, bigtime_t timeout);
@@ -182,6 +191,17 @@ private:
 	tcp_sequence	fRoundTripStartSequence;
 	bigtime_t		fRetransmitTimeout;
 	uint32			fRetransmitInitialCount;
+	bigtime_t		fRetransmitStart;
+		// when the peer stopped acknowledging data (0: it does)
+	bigtime_t		fUserTimeout;
+		// TCP_USER_TIMEOUT, 0 for TCP_MAX_RETRANSMIT_DURATION
+
+	// keepalive
+	bigtime_t		fLastReceiveTime;
+	bigtime_t		fKeepAliveIdle;
+	bigtime_t		fKeepAliveInterval;
+	uint32			fKeepAliveCount;
+	uint32			fKeepAliveProbes;
 
 	uint32			fReceivedTimestamp;
 
@@ -199,6 +219,7 @@ private:
 	net_timer		fPersistTimer;
 	net_timer		fDelayedAcknowledgeTimer;
 	net_timer		fTimeWaitTimer;
+	net_timer		fKeepAliveTimer;
 };
 
 #endif	// TCP_ENDPOINT_H

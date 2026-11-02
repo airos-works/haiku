@@ -11,6 +11,7 @@
 #include "EndpointManager.h"
 
 #include <new>
+#include <stdlib.h>
 #include <unistd.h>
 
 #include <KernelExport.h>
@@ -543,6 +544,47 @@ EndpointManager::Unbind(TCPEndpoint* endpoint)
 	(*endpoint->LocalAddress())->sa_len = 0;
 
 	return B_OK;
+}
+
+
+/*!	Aborts the connections whose local address is no longer assigned to an
+	interface (see TCPEndpoint::AbortIfLocalAddressRemoved()).
+	Endpoints are locked before the manager in other paths, so they are
+	collected (with a reference) first and checked without fLock held.
+*/
+void
+EndpointManager::AbortConnectionsWithoutLocalAddress()
+{
+	ReadLocker locker(fLock);
+
+	size_t count = fConnectionHash.CountElements();
+	if (count == 0)
+		return;
+
+	TCPEndpoint** endpoints
+		= (TCPEndpoint**)malloc(count * sizeof(TCPEndpoint*));
+	if (endpoints == NULL) {
+		dprintf("tcp: no memory to check %" B_PRIuSIZE " connections for "
+			"removed local addresses\n", count);
+		return;
+	}
+
+	size_t found = 0;
+	ConnectionTable::Iterator iterator = fConnectionHash.GetIterator();
+	while (found < count && iterator.HasNext()) {
+		TCPEndpoint* endpoint = iterator.Next();
+		if (gSocketModule->acquire_socket(endpoint->socket))
+			endpoints[found++] = endpoint;
+	}
+
+	locker.Unlock();
+
+	for (size_t i = 0; i < found; i++) {
+		endpoints[i]->AbortIfLocalAddressRemoved();
+		gSocketModule->release_socket(endpoints[i]->socket);
+	}
+
+	free(endpoints);
 }
 
 
