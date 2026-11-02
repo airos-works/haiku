@@ -517,6 +517,8 @@ struct iwx_context_info_gen3 {
 #define IWX_CSR_GPIO_IN             (0x018) /* read external chip pins */
 #define IWX_CSR_RESET               (0x020) /* busmaster enable, NMI, etc*/
 #define IWX_CSR_GP_CNTRL            (0x024)
+#define IWX_CSR_FUNC_SCRATCH        (0x02c)	/* Bz: power-off marker */
+#define IWX_CSR_FUNC_SCRATCH_INIT_VALUE	0x01010101
 
 /* 2nd byte of IWX_CSR_INT_COALESCING, not accessible via iwl_write32()! */
 #define IWX_CSR_INT_PERIODIC_REG	(0x005)
@@ -724,6 +726,14 @@ struct iwx_rx_completion_desc {
 #define IWX_CSR_GP_CNTRL_REG_FLAG_INIT_DONE              (0x00000004)
 #define IWX_CSR_GP_CNTRL_REG_FLAG_MAC_ACCESS_REQ         (0x00000008)
 #define IWX_CSR_GP_CNTRL_REG_FLAG_GOING_TO_SLEEP         (0x00000010)
+/* Bz family (BE200 and later): the MAC is driven through these bits. */
+#define IWX_CSR_GP_CNTRL_REG_FLAG_MAC_INIT               (0x00000040)
+#define IWX_CSR_GP_CNTRL_REG_FLAG_ROM_START              (0x00000080)
+#define IWX_CSR_GP_CNTRL_REG_FLAG_MAC_STATUS             (0x00100000)
+#define IWX_CSR_GP_CNTRL_REG_FLAG_BZ_MAC_ACCESS_REQ      (0x00200000)
+#define IWX_CSR_GP_CNTRL_REG_FLAG_BUS_MASTER_DISABLE_STATUS (0x10000000)
+#define IWX_CSR_GP_CNTRL_REG_FLAG_BUS_MASTER_DISABLE_REQ (0x20000000)
+#define IWX_CSR_GP_CNTRL_REG_FLAG_SW_RESET               (0x80000000)
 
 #define IWX_CSR_GP_CNTRL_REG_VAL_MAC_ACCESS_EN           (0x00000001)
 
@@ -1078,6 +1088,9 @@ struct iwx_rx_completion_desc {
  * 11-8:  queue selector
  */
 #define IWX_HBUS_TARG_WRPTR         (IWX_HBUS_BASE+0x060)
+/* Bz family: RX queue write pointers go through HBUS_TARG_WRPTR. */
+#define IWX_HBUS_TARG_WRPTR_Q_SHIFT	16
+#define IWX_HBUS_TARG_WRPTR_RX_Q(q)	(((q) + 512) << IWX_HBUS_TARG_WRPTR_Q_SHIFT)
 
 /**********************************************************
  * CSR values
@@ -8266,6 +8279,20 @@ struct iwx_mcc_update_resp {
 	uint32_t n_channels;
 	uint32_t channels[0];
 } __packed; /* LAR_UPDATE_MCC_CMD_RESP_S_VER_4 */
+
+/* Version 8 (the BE200's firmware): the capabilities grew to 32 bits. */
+struct iwx_mcc_update_resp_v8 {
+	uint32_t status;
+	uint16_t mcc;
+	uint8_t padding[2];
+	uint32_t cap;
+	uint16_t time;
+	uint16_t geo_info;
+	uint8_t source_id;
+	uint8_t reserved[3];
+	uint32_t n_channels;
+	uint32_t channels[0];
+} __packed; /* LAR_UPDATE_MCC_CMD_RESP_S_VER_8 */
 
 /**
  * struct iwx_mcc_chub_notif - chub notifies of mcc change
