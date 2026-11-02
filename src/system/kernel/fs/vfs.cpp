@@ -2101,13 +2101,13 @@ get_dir_path_and_leaf(char* path, char* filename)
 		if (strlcpy(filename, path, B_FILE_NAME_LENGTH) >= B_FILE_NAME_LENGTH)
 			return B_NAME_TOO_LONG;
 
-		strcpy(path, ".");
+		strcpy(path, "./");
 	} else {
 		last++;
 		if (last[0] == '\0') {
 			// special case: the path ends in one or more '/' - remove them
 			while (*--last == '/' && last != path);
-			last[1] = '\0';
+			last[2] = '\0';
 
 			// pathnames that end with one or more trailing slash characters
 			// must refer to directory paths
@@ -2120,7 +2120,8 @@ get_dir_path_and_leaf(char* path, char* filename)
 			return B_NAME_TOO_LONG;
 
 		last[0] = '.';
-		last[1] = '\0';
+		last[1] = '/';
+		last[2] = '\0';
 	}
 	return B_OK;
 }
@@ -5316,6 +5317,7 @@ vfs_setrlimit(int resource, const struct rlimit* rlp)
 		case RLIMIT_NOFILE:
 			/* TODO: check getuid() */
 			if (rlp->rlim_max != RLIM_SAVED_MAX
+				&& rlp->rlim_max != UINT32_MAX
 				&& rlp->rlim_max != MAX_FD_TABLE_SIZE)
 				return B_NOT_ALLOWED;
 
@@ -5325,6 +5327,7 @@ vfs_setrlimit(int resource, const struct rlimit* rlp)
 		case RLIMIT_NOVMON:
 			/* TODO: check getuid() */
 			if (rlp->rlim_max != RLIM_SAVED_MAX
+				&& rlp->rlim_max != UINT32_MAX
 				&& rlp->rlim_max != MAX_NODE_MONITORS)
 				return B_NOT_ALLOWED;
 
@@ -9010,6 +9013,9 @@ _user_mount(const char* userPath, const char* userDevice,
 	const char* userFileSystem, uint32 flags, const char* userArgs,
 	size_t argsLength)
 {
+	if (geteuid() != 0)
+		return B_NOT_ALLOWED;
+
 	char fileSystem[B_FILE_NAME_LENGTH];
 	KPath path, device;
 	char* args = NULL;
@@ -9078,6 +9084,9 @@ _user_mount(const char* userPath, const char* userDevice,
 status_t
 _user_unmount(const char* userPath, uint32 flags)
 {
+	if (geteuid() != 0)
+		return B_NOT_ALLOWED;
+
 	if (!IS_USER_ADDRESS(userPath))
 		return B_BAD_ADDRESS;
 
