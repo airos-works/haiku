@@ -513,8 +513,13 @@ InitDriver(device_node* node, void** cookie)
 		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&controller->config[1]));
 	if (controller->endpointArea.Get() < B_OK)
 		return controller->endpointArea.Get();
-	if (!EndpointIdMatches(*(volatile uint32*)controller->config[1], *port))
+	uint32 endpointId = *(volatile uint32*)controller->config[1];
+	if (!EndpointIdMatches(endpointId, *port)) {
+		dprintf("rk3588_pcie: segment %u endpoint %04" B_PRIx32 ":%04" B_PRIx32
+			" is not in the firmware profile\n", port->segment,
+			endpointId & 0xffff, endpointId >> 16);
 		return B_NOT_SUPPORTED;
+	}
 	ReadSnapshot(controller->config[1], snapshot);
 	if (!EndpointMatches(snapshot, memoryBase, memorySize, *port)) {
 		dprintf("rk3588_pcie: segment %u firmware endpoint configuration "
