@@ -168,6 +168,13 @@ signature, so anything that can send a BMessage can be a player:
   USB keyboard (`usb-kbd`) has no media keys, so the VM must run without it
   (or the PS/2 keyboard must have the input focus) for that test.
 
+- Trying a new server build on a running system: kill the old server and
+  start the new one from a *new* file. The Deskbar has the server's
+  executable loaded as the replicant's add-on; overwriting that file in
+  place corrupts the Deskbar's mapped code and crashes it. (A restarted
+  server removes the old replicant and adds its own with the next player
+  update.)
+
 ## Not done yet
 
 - Embedded cover art (ID3 APIC, MP4 `covr`) in MediaPlayer: the FFmpeg
