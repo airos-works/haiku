@@ -141,6 +141,17 @@ if _major < 20:
                              m.group(2), m.group(1))),
          "gcc 13 headers", "'-include', 'cstdint'")
 
+# V8 6.8 and 7.0 (Node 10, 11) were written for clang and still use raw,
+# tagged HeapObject* (V8 7.6 replaced them): built by gcc 13 at -O3 with
+# strict aliasing, mksnapshot crashed in Heap::CompactFixedArraysOfWeakCells /
+# CompactWeakArrayLists. -fno-strict-aliasing is what makes it work (verified
+# on 11); null-check deletion and lifetime DSE are off as for such code.
+if _major < 12:
+    edit("common.gypi",
+         lambda s: once(s, "'cflags_cc': [ '-include', 'cstdint'",
+                        "'cflags_cc': [ '-fno-strict-aliasing', '-fno-delete-null-pointer-checks', '-fno-lifetime-dse', '-include', 'cstdint'"),
+         "V8 6.x/7.0 under gcc 13", "-fno-lifetime-dse")
+
 # V8 8.4 to 8.6 (Node 14, 15) ask is_subtype<T, U> about types that are only
 # forward-declared there; its std::is_convertible<T, Object> is instantiated
 # even when U is not MaybeObject, and gcc 13 rejects that for an incomplete
