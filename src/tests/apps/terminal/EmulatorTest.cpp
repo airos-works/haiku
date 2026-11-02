@@ -901,6 +901,23 @@ TestMouse()
 	CHECK(!d.terminal.EncodeMouse(MOUSE_PRESS, MOUSE_BUTTON_LEFT, 0, 3, 3,
 		0, 0, output));
 
+	// alternate scroll (1007): off by default as in xterm, the user's
+	// default after a reset
+	Fixture a;
+	CHECK(!a.terminal.IsAlternateScroll());
+	a.Feed("\x1b[?1007h\x1b[?1007$p");
+	CHECK(a.terminal.IsAlternateScroll());
+	CHECK_EQUAL(a.Reply(), "\x1b[?1007;1$y");
+	a.Feed("\x1b" "c");
+	CHECK(!a.terminal.IsAlternateScroll());
+	a.terminal.SetDefaultAlternateScroll(true);
+	CHECK(a.terminal.IsAlternateScroll());
+	a.Feed("\x1b[?1007l\x1b[?1007$p");
+	CHECK(!a.terminal.IsAlternateScroll());
+	CHECK_EQUAL(a.Reply(), "\x1b[?1007;2$y");
+	a.Feed("\x1b" "c\x1b[?1007$p");
+	CHECK_EQUAL(a.Reply(), "\x1b[?1007;1$y");
+
 	// paste
 	Fixture p;
 	output.clear();

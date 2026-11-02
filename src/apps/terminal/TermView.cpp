@@ -560,6 +560,8 @@ TermView::_InitObject(const ShellParameters& shellParameters)
 	if (error != B_OK)
 		return error;
 	fTerminal->SetListener(this);
+	fTerminal->SetDefaultAlternateScroll(PrefHandler::Default() == NULL
+		|| PrefHandler::Default()->getBool(PREF_ALTERNATE_SCROLL));
 
 	// TODO: Make the special word chars user-settable!
 	fCharClassifier = new(std::nothrow) DefaultCharClassifier(
@@ -4164,10 +4166,11 @@ TermView::MessageReceived(BMessage *message)
 				break;
 			}
 
-			if (alternate && deltaY != 0
-				&& (alternateScroll || true)) {
+			if (alternate && alternateScroll && deltaY != 0) {
 				// On the alternate screen there is no history: emulate
-				// scrolling with the cursor keys.
+				// scrolling with the cursor keys (DECSET 1007, on unless
+				// the program or the "Alternate screen scroll" setting
+				// turned it off).
 				// scroll pagewise, if one of Option, Command, or Control is
 				// pressed
 				int32 steps;

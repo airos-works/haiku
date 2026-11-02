@@ -513,6 +513,9 @@ public:
 
 			void				SetDefaultCursorShape(int32 shape,
 									bool blinking);
+			//! Whether the wheel scrolls with the cursor keys on the
+			//! alternate screen (DECSET 1007) after a reset.
+			void				SetDefaultAlternateScroll(bool enabled);
 			void				SetColorScheme(bool dark);
 			void				SetFocused(bool focused);
 
@@ -796,6 +799,7 @@ private:
 			bool				fCursorBlinkSet;
 			int32				fDefaultCursorShape;
 			bool				fDefaultCursorBlinking;
+			bool				fDefaultAlternateScroll;
 
 			// margins
 			int32				fTop;
