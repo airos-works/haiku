@@ -96,9 +96,9 @@ enum {
 	B_CREATE_FRAME_BUFFER_SOURCE = 0x700,	/* optional */
 	B_DELETE_FRAME_BUFFER_SOURCE,		/* optional */
 	B_COPY_TO_FRAME_BUFFER,				/* optional */
-	/* a shadow is a source in the device's own memory, which the CPU does
-	   not reach: the device fills it from a source and copies it to the
-	   screen, both faster than from memory in the system */
+	/* a shadow is a source only the device reaches, normally in its own
+	   memory: the device fills it from a source and copies it to the
+	   screen, so that the CPU does not copy what was drawn a second time */
 	B_CREATE_FRAME_BUFFER_SHADOW,		/* optional */
 	B_COPY_FRAME_BUFFER_SOURCE,			/* optional */
 
@@ -478,8 +478,9 @@ typedef void (*delete_frame_buffer_source)(uint32 id);
    them itself. */
 typedef status_t (*copy_to_frame_buffer)(uint32 id,
 	const fill_rect_params* list, uint32 count);
-/* A source in the device's own memory, which the CPU cannot reach (bits is
-   NULL): what is in it comes from other sources (copy_frame_buffer_source)
+/* A source only the device reaches (bits is NULL), in its own memory (or in
+   the system's, where that is as fast, as on an integrated GPU): what is in
+   it comes from other sources (copy_frame_buffer_source)
    and goes to the screen with copy_to_frame_buffer; deleted like a source.
    Only offered together with copy_frame_buffer_source. */
 typedef status_t (*create_frame_buffer_shadow)(uint16 width, uint16 height,

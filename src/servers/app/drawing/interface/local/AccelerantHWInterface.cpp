@@ -1927,7 +1927,7 @@ AccelerantHWInterface::_CreateFlushShadow(uint32 width, uint32 height)
 				DeviceSourceBuffer(shadow, fAccDeleteFrameBufferSource);
 			if (buffer != NULL) {
 				debug_printf("app_server: vertical blank flush: a %" B_PRIu32
-					"x%" B_PRIu32 " shadow in the graphics device's memory, "
+					"x%" B_PRIu32 " shadow only the graphics device reaches, "
 					"filled by the device\n", width, height);
 				return buffer;
 			}
