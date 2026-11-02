@@ -89,6 +89,13 @@ no deblocking or SAO, six references, a cropped 1080p - and 240 pictures of a
 6 ms to copy out as P010: the film plays at its 24 pictures a second with time
 to spare.
 
+Decoding that starts at a CRA picture - after a seek into an open GOP, in a
+new decoder or after `SeekedTo()` - or that follows an end of sequence leaves
+out the CRA picture's leading RASL pictures, which refer to pictures from
+before it (H.265 8.1.3), as libavcodec does: the first picture out is the CRA
+picture. Started at each CRA picture of four x265 streams, the pictures match
+libavcodec's decode of the same cut byte for byte.
+
 For VP9, 35 of libvpx's test vectors - sizes from 155x115 to 1920x1080 and
 odd ones, resizing with scaled references, intra-only frames,
 show_existing_frame, superframes, spatial SVC, tiles of 1 to 4 columns and
