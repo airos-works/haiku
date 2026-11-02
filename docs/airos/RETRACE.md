@@ -93,6 +93,26 @@ scan comes back. On the X399 (nvidia_rm, 3840x2160 at 200 %,
 `scan_timing_test retrace 120`), `WaitForRetrace()` woke 133 us after the
 predicted start on average, 293 us at worst.
 
+To simply wait for the next frame of the output a window is on,
+`BScreen::WaitForOutputRetrace(frame, timeout)` (haiku#39) does the above:
+it sleeps until that output's next `scan_start + n * period` (an answer is
+kept for half a second, so a call costs no round trip and a short timeout
+holds even when app_server would first have to wait for a blank), and falls
+back to `WaitForRetrace()` where there is no timing. `B_WOULD_BLOCK` for a
+timeout of 0, `B_TIMED_OUT` when the frame begins after the timeout.
+`scan_timing_test output N [x y w h]` measures it, 2026-11-02:
+
+| Machine, output | wake vs that output's frame start |
+| --- | --- |
+| X399, GTX 1070, one output (blank interrupt) | +12 / −40 us mean, worst 208 us (`WaitForRetrace()`: +108 us, worst 225 us) |
+| Framework 13 (AI 340), DP-3 on the right (hardware scan start) | +3.4 us mean, worst +23 us |
+| same desktop, `WaitForRetrace()` (main output's blanks) | −5197 us from DP-3's frame start |
+| Framework 13, eDP panel | −429 us mean, worst −885 us |
+
+The eDP panel's blank times jump by up to a millisecond between queries
+(panel self refresh, probably), so any prediction from them is that far off;
+the external monitors' are exact.
+
 ## Where the blanks come from
 
 | Display | Driver | Source |

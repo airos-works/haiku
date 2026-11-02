@@ -17,6 +17,7 @@ Addon smbfs :
 	libsmb2.a
 	[ MultiArchDefaultGristFiles libposix_error_mapper.a ]
 	libuserlandfs_fuse.so
+	be
 	$(TARGET_NETWORK_LIBS)
 	[ TargetLibstdc++ ]
 ;
