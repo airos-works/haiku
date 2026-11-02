@@ -687,7 +687,11 @@ smbfs_ftruncate(const char* path, off_t size, struct fuse_file_info* info)
 				request);
 		});
 
-	forget(server_path(path));
+	// the file may have no name anymore, see main()
+	pthread_mutex_lock(&sHandlesLock);
+	const std::string filePath = handle->path;
+	pthread_mutex_unlock(&sHandlesLock);
+	forget(filePath);
 	return status;
 }
 
@@ -891,7 +895,11 @@ smbfs_write(const char* path, const char* buffer, size_t size, off_t offset,
 			return total;
 		});
 
-	sStatCache.Remove(server_path(path));
+	// the file may have no name anymore, see main()
+	pthread_mutex_lock(&sHandlesLock);
+	const std::string filePath = handle->path;
+	pthread_mutex_unlock(&sHandlesLock);
+	sStatCache.Remove(filePath);
 	return status;
 }
 
@@ -1357,6 +1365,11 @@ main(int argc, char** argv)
 	operations.init = smbfs_init;
 	operations.destroy = smbfs_destroy;
 	operations.ioctl = smbfs_ioctl;
+
+	// What is done with a file that is open goes by its handle, and that
+	// works on after the file has been deleted. Its release has to come, or
+	// the server keeps the file, deleted or not, for as long as it runs.
+	operations.flag_nullpath_ok = 1;
 
 	char* fuseArguments[] = { argv[0], NULL };
 	return fuse_main(1, fuseArguments, &operations, NULL);

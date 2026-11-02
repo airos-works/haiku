@@ -199,6 +199,7 @@ private:
 									char* path, size_t& pathLen);
 			status_t			_BuildPath(FUSENode* node, char* path,
 									size_t& pathLen);
+			bool				_IsUnlinked(FUSENode* node);
 
 	static	int					_AddReadDirEntryLowLevel(void* buffer, char* buf, size_t bufsize,
 									const char* name, const struct stat* st, off_t offset);

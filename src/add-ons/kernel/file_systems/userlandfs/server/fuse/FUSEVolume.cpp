@@ -425,6 +425,8 @@ struct FUSEVolume::LockIterator {
 	FUSENode*	nextNode;
 	FUSENode*	stopBeforeNode;
 	bool		writeLock;
+	bool		changed;
+		// the hierarchy changed while waiting for a lock
 
 	LockIterator(FUSEVolume* volume, FUSENode* node, bool writeLock,
 		FUSENode* stopBeforeNode)
@@ -434,7 +436,8 @@ struct FUSEVolume::LockIterator {
 		lastLockedNode(NULL),
 		nextNode(node),
 		stopBeforeNode(stopBeforeNode),
-		writeLock(writeLock)
+		writeLock(writeLock),
+		changed(false)
 	{
 	}
 
@@ -454,17 +457,29 @@ struct FUSEVolume::LockIterator {
 		this->nextNode = node;
 		this->stopBeforeNode = stopBeforeNode;
 		this->writeLock = writeLock;
+		this->changed = false;
 	}
 
+	/*!	Locks the next node of the chain. When that meant waiting, the volume
+		was unlocked in between and \a _volumeUnlocked says so: the caller has
+		to check whether it is still locking the right nodes. If the node
+		locked last is no longer a child of the one waited for (it has been
+		unlinked or moved meanwhile), that one is let go again and \c changed
+		is set; what is locked until then still is a chain, and Unlock()
+		follows it.
+	*/
 	status_t LockNext(bool* _done, bool* _volumeUnlocked)
 	{
+		*_volumeUnlocked = false;
+		if (nextNode == NULL)
+			return B_ENTRY_NOT_FOUND;
+
 		// increment the ref count first
 		nextNode->refCount++;
 
 		if (volume->fLockManager.TryGenericLock(
 				nextNode == firstNode && writeLock, nextNode)) {
 			// got the lock
-			*_volumeUnlocked = false;
 		} else {
 			// node is locked -- we need to unlock the volume and wait for
 			// the lock
@@ -474,11 +489,22 @@ struct FUSEVolume::LockIterator {
 				nextNode == firstNode && writeLock, nextNode);
 			volume->fLock.Lock();
 
-			*_volumeUnlocked = false;
+			*_volumeUnlocked = true;
 
 			if (!locked) {
 				volume->_PutNode(nextNode);
 				return B_ERROR;
+			}
+
+			// Unlocking goes from child to parent as they are by then, so a
+			// node that is not the parent anymore would stay locked for good.
+			if (lastLockedNode != NULL && lastLockedNode->Parent() != nextNode) {
+				volume->fLockManager.GenericUnlock(
+					nextNode == firstNode && writeLock, nextNode);
+				volume->_PutNode(nextNode);
+				changed = true;
+				*_done = false;
+				return B_OK;
 			}
 		}
 
@@ -1101,7 +1127,8 @@ FUSEVolume::DoIO(void* _node, void* _cookie, const IORequestInfo& requestInfo)
 	size_t bytes = 0;
 	if (error == B_OK) {
 		bytes = requestInfo.length;
-		error = _InternalIO(node, cookie, path, requestInfo.offset,
+		error = _InternalIO(node, cookie,
+			cookie == &alternativeCookie ? path : NULL, requestInfo.offset,
 			buffer, bytes, requestInfo.isWrite);
 	}
 
@@ -1886,12 +1913,13 @@ FUSEVolume::Close(void* _node, void* _cookie)
 
 	RWLockableReadLocker cookieLocker(this, cookie);
 
-	// lock the directory
+	// lock the directory -- a file that has been unlinked while open has
+	// none, and nothing can get to it by name anymore
 	NodeReadLocker nodeLocker(this, node, true);
-	if (nodeLocker.Status() != B_OK)
+	if (nodeLocker.Status() != B_OK && !_IsUnlinked(node))
 		RETURN_ERROR(nodeLocker.Status());
 
-	int fuseError;
+	int fuseError = 0;
 
 	if (fOps != NULL) {
 		fuseError = fuse_ll_flush(fOps, node->id, cookie);
@@ -1902,13 +1930,19 @@ FUSEVolume::Close(void* _node, void* _cookie)
 		char path[B_PATH_NAME_LENGTH];
 		size_t pathLen;
 		status_t error = _BuildPath(node, path, pathLen);
-		if (error != B_OK)
-			RETURN_ERROR(error);
+		bool flush = true;
+		if (error != B_OK) {
+			if (!_IsUnlinked(node))
+				RETURN_ERROR(error);
+			// only a file system that goes by the cookie can flush it
+			flush = fFS->ops.flag_nullpath_ok;
+		}
 
 		locker.Unlock();
 
 		// flush the file
-		fuseError = fuse_fs_flush(fFS, path, cookie);
+		if (flush)
+			fuseError = fuse_fs_flush(fFS, error == B_OK ? path : NULL, cookie);
 	}
 	if (fuseError != 0)
 		return fuseError;
@@ -1932,9 +1966,10 @@ FUSEVolume::FreeCookie(void* _node, void* _cookie)
 
 	// no need to lock the cookie here, as no-one else uses it anymore
 
-	// lock the directory
+	// lock the directory -- a file that has been unlinked while open has
+	// none, and nothing can get to it by name anymore
 	NodeReadLocker nodeLocker(this, node, true);
-	if (nodeLocker.Status() != B_OK)
+	if (nodeLocker.Status() != B_OK && !_IsUnlinked(node))
 		RETURN_ERROR(nodeLocker.Status());
 
 	ObjectDeleter<FileCookie> cookieDeleter(cookie);
@@ -1949,13 +1984,16 @@ FUSEVolume::FreeCookie(void* _node, void* _cookie)
 		char path[B_PATH_NAME_LENGTH];
 		size_t pathLen;
 		status_t error = _BuildPath(node, path, pathLen);
-		if (error != B_OK)
+		if (error != B_OK && !_IsUnlinked(node))
 			RETURN_ERROR(error);
 
 		locker.Unlock();
 
-		// release the file
-		fuseError = fuse_fs_release(fFS, path, cookie);
+		// Release the file, also when it has no name anymore: whatever the
+		// file system holds open for it is let go only here. A network file
+		// system's server keeps a file it was asked to delete for as long
+		// as that is open. As in libfuse, the path is NULL then.
+		fuseError = fuse_fs_release(fFS, error == B_OK ? path : NULL, cookie);
 	}
 
 	if (fuseError != 0)
@@ -1974,9 +2012,10 @@ FUSEVolume::Read(void* _node, void* _cookie, off_t pos, void* buffer,
 
 	RWLockableReadLocker cookieLocker(this, cookie);
 
-	// lock the directory
+	// lock the directory -- a file that has been unlinked while open has
+	// none, and nothing can get to it by name anymore
 	NodeReadLocker nodeLocker(this, node, true);
-	if (nodeLocker.Status() != B_OK)
+	if (nodeLocker.Status() != B_OK && !_IsUnlinked(node))
 		RETURN_ERROR(nodeLocker.Status());
 
 	*_bytesRead = bufferSize;
@@ -2006,9 +2045,10 @@ FUSEVolume::Write(void* _node, void* _cookie, off_t pos, const void* buffer,
 
 	*_bytesWritten = 0;
 
-	// lock the directory
+	// lock the directory -- a file that has been unlinked while open has
+	// none, and nothing can get to it by name anymore
 	NodeReadLocker nodeLocker(this, node, true);
-	if (nodeLocker.Status() != B_OK)
+	if (nodeLocker.Status() != B_OK && !_IsUnlinked(node))
 		RETURN_ERROR(nodeLocker.Status());
 
 	*_bytesWritten = bufferSize;
@@ -2962,10 +3002,15 @@ FUSEVolume::_LockNodeChain(FUSENode* node, bool lockParent, bool writeLock)
 
 		if (volumeUnlocked) {
 			// check whether we're still locking the right node
-			if (lockParent && originalNode->Parent() != node) {
-				// We don't -- unlock everything and try again.
-				node = originalNode->Parent();
+			if (iterator.changed
+				|| (lockParent && originalNode->Parent() != node)) {
+				// We don't -- unlock everything and try again. A node that
+				// has been unlinked meanwhile has no parent to lock anymore.
+				node = lockParent ? originalNode->Parent() : originalNode;
+				if (node == NULL)
+					RETURN_ERROR(B_ENTRY_NOT_FOUND);
 				iterator.SetTo(this, node, writeLock, NULL);
+				done = false;
 			}
 		}
 	} while (!done);
@@ -3101,7 +3146,8 @@ FUSEVolume::_LockNodeChainsInternal(FUSENode* node1, bool lockParent1,
 
 			if (volumeUnlocked) {
 				// check whether we're still locking the right nodes
-				if ((lockParent1 && originalNode1->Parent() != node1)
+				if (iterator.changed
+					|| (lockParent1 && originalNode1->Parent() != node1)
 					|| (lockParent2 && originalNode2->Parent() != node2)) {
 					// We don't -- unlock everything and retry.
 					*_retry = true;
@@ -3142,7 +3188,8 @@ FUSEVolume::_LockNodeChainsInternal(FUSENode* node1, bool lockParent1,
 
 		if (volumeUnlocked) {
 			// check whether we're still locking the right nodes
-			if ((lockParent1 && originalNode1->Parent() != node1)
+			if (iterator.changed
+				|| (lockParent1 && originalNode1->Parent() != node1)
 				|| (lockParent2 && originalNode2->Parent() != node2)) {
 				// We don't -- unlock everything and retry.
 				*_retry = true;
@@ -3324,6 +3371,17 @@ FUSEVolume::_BuildPath(FUSENode* node, char* path, size_t& pathLen)
 		RETURN_ERROR(B_ENTRY_NOT_FOUND);
 
 	return _BuildPath(entry->parent, entry->name, path, pathLen);
+}
+
+
+/*!	Whether \a node is a file that has been unlinked while it was open, and
+	so has neither a name nor a parent anymore.
+*/
+bool
+FUSEVolume::_IsUnlinked(FUSENode* node)
+{
+	AutoLocker<Locker> locker(fLock);
+	return node != fRootNode && node->entries.IsEmpty();
 }
 
 
@@ -3656,14 +3714,16 @@ FUSEVolume::_InternalIO(FUSENode* node, FileCookie* cookie, const char* path,
 		if (path == NULL) {
 			AutoLocker<Locker> locker(fLock);
 
+			// A file that has been unlinked while open has no path, and only
+			// a file system that goes by the cookie can do without.
 			size_t pathLen;
 			status_t error = _BuildPath(node, pathBuf, pathLen);
-			if (error != B_OK)
+			if (error == B_OK)
+				path = pathBuf;
+			else if (!_IsUnlinked(node) || !fFS->ops.flag_nullpath_ok)
 				RETURN_ERROR(error);
 
 			locker.Unlock();
-
-			path = pathBuf;
 		}
 
 		if (write)
