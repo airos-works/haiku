@@ -194,6 +194,24 @@ operator==(tcp_sequence a, tcp_sequence b)
 // New value for timeout in case of lost SYN (RFC 6298)
 #define TCP_SYN_RETRANSMIT_TIMEOUT 		1000000		// 1 sec
 
+// How long a synchronized connection keeps retransmitting data the peer does
+// not acknowledge before it is dropped with ETIMEDOUT (R2 of RFC 1122
+// 4.2.3.5, which asks for at least 100 seconds). 15 minutes matches Linux
+// (tcp_retries2 = 15 gives 924.6 s with a 200 ms minimum RTO) and the BSDs
+// (TCP_MAXRXTSHIFT = 12 with a 64 s cap gives 9 to 15 minutes). Sockets can
+// choose their own value with TCP_USER_TIMEOUT.
+#define TCP_MAX_RETRANSMIT_DURATION		(15 * 60 * 1000000LL)	// 15 mins
+
+// Keepalive defaults (RFC 1122 4.2.3.6), changed per socket with
+// TCP_KEEPIDLE, TCP_KEEPINTVL and TCP_KEEPCNT
+#define TCP_KEEPALIVE_IDLE				(2 * 60 * 60 * 1000000LL)	// 2 hours
+#define TCP_KEEPALIVE_INTERVAL			75000000LL	// 75 secs
+#define TCP_KEEPALIVE_PROBES			9
+// Upper limits for the keepalive options (as Linux)
+#define TCP_MAX_KEEPALIVE_IDLE			32767		// secs
+#define TCP_MAX_KEEPALIVE_INTERVAL		32767		// secs
+#define TCP_MAX_KEEPALIVE_PROBES		127
+
 struct tcp_sack {
 	uint32 left_edge;
 	uint32 right_edge;

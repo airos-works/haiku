@@ -79,5 +79,14 @@ struct tcphdr {
 	/* don't use TH_PUSH */
 #define TCP_NOOPT				0x08
 	/* don't use any TCP options */
+#define TCP_USER_TIMEOUT		0x12
+	/* unsigned int: milliseconds transmitted data may stay unacknowledged
+	   before the connection is dropped (0: system default) */
+#define TCP_KEEPIDLE			0x100
+	/* int: seconds of idle time before keepalive probes are sent */
+#define TCP_KEEPINTVL			0x200
+	/* int: seconds between keepalive probes */
+#define TCP_KEEPCNT				0x400
+	/* int: unanswered keepalive probes before the connection is dropped */
 
 #endif	/* NETINET_TCP_H */

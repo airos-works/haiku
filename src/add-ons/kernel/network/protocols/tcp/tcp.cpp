@@ -52,6 +52,10 @@ net_stack_module_info *gStackModule;
 static EndpointManager* sEndpointManagers[AF_MAX];
 static rw_lock sEndpointManagersLock;
 
+static net_address_listener sAddressListener;
+static net_timer sAddressCheckTimer;
+static bool sAddressListenerAdded;
+
 
 // The TCP header length is at most 60 bytes (0xf * 4).
 static const int kMaxOptionSize = 60 - sizeof(tcp_header);
@@ -592,8 +596,12 @@ tcp_setsockopt(net_protocol* _protocol, int level, int option,
 	} else if (level == IPPROTO_TCP)
 		return protocol->SetOption(option, _value, length);
 
-	return protocol->next->module->setsockopt(protocol->next, level, option,
-		_value, length);
+	status_t status = protocol->next->module->setsockopt(protocol->next, level,
+		option, _value, length);
+	if (status == B_OK && level == SOL_SOCKET && option == SO_KEEPALIVE)
+		protocol->KeepAliveChanged();
+
+	return status;
 }
 
 
@@ -809,6 +817,39 @@ tcp_error_reply(net_protocol* protocol, net_buffer* cause, net_error error,
 }
 
 
+//	#pragma mark - local address removal
+
+
+/*!	Runs in the timer thread, without interface locks held: aborts the
+	connections whose local address no interface has anymore.
+*/
+static void
+tcp_check_local_addresses(net_timer* timer, void* data)
+{
+	EndpointManager* managers[AF_MAX];
+
+	ReadLocker locker(sEndpointManagersLock);
+	memcpy(managers, sEndpointManagers, sizeof(managers));
+	locker.Unlock();
+		// endpoint managers are only deleted when the module is unloaded,
+		// after this timer has been cancelled
+
+	for (int i = 0; i < AF_MAX; i++) {
+		if (managers[i] != NULL)
+			managers[i]->AbortConnectionsWithoutLocalAddress();
+	}
+}
+
+
+/*!	Called by the stack with interface locks held: only schedule the check. */
+static void
+tcp_address_removed(net_address_listener* listener, net_domain* domain,
+	const sockaddr* address)
+{
+	gStackModule->set_timer(&sAddressCheckTimer, 0);
+}
+
+
 //	#pragma mark -
 
 
@@ -856,6 +897,13 @@ tcp_init()
 	if (status < B_OK)
 		return status;
 
+	gStackModule->init_timer(&sAddressCheckTimer, tcp_check_local_addresses,
+		NULL);
+	sAddressListener.address_removed = tcp_address_removed;
+	if (gStackModule->add_address_listener != NULL
+		&& gStackModule->add_address_listener(&sAddressListener) == B_OK)
+		sAddressListenerAdded = true;
+
 	add_debugger_command("tcp_endpoints", dump_endpoints,
 		"lists all open TCP endpoints");
 	add_debugger_command("tcp_endpoint", dump_endpoint,
@@ -870,6 +918,13 @@ tcp_uninit()
 {
 	remove_debugger_command("tcp_endpoint", dump_endpoint);
 	remove_debugger_command("tcp_endpoints", dump_endpoints);
+
+	if (sAddressListenerAdded) {
+		gStackModule->remove_address_listener(&sAddressListener);
+		sAddressListenerAdded = false;
+	}
+	gStackModule->cancel_timer(&sAddressCheckTimer);
+	gStackModule->wait_for_timer(&sAddressCheckTimer);
 
 	rw_lock_destroy(&sEndpointManagersLock);
 

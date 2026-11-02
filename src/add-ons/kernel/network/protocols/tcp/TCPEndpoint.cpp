@@ -444,6 +444,13 @@ TCPEndpoint::TCPEndpoint(net_socket* socket)
 	fRoundTripStartSequence(0),
 	fRetransmitTimeout(TCP_SYN_RETRANSMIT_TIMEOUT),
 	fRetransmitInitialCount(0),
+	fRetransmitStart(0),
+	fUserTimeout(0),
+	fLastReceiveTime(0),
+	fKeepAliveIdle(TCP_KEEPALIVE_IDLE),
+	fKeepAliveInterval(TCP_KEEPALIVE_INTERVAL),
+	fKeepAliveCount(TCP_KEEPALIVE_PROBES),
+	fKeepAliveProbes(0),
 	fReceivedTimestamp(0),
 	fCongestionWindow(0),
 	fSlowStartThreshold(0),
@@ -463,6 +470,8 @@ TCPEndpoint::TCPEndpoint(net_socket* socket)
 	gStackModule->init_timer(&fDelayedAcknowledgeTimer,
 		TCPEndpoint::_DelayedAcknowledgeTimer, this);
 	gStackModule->init_timer(&fTimeWaitTimer, TCPEndpoint::_TimeWaitTimer,
+		this);
+	gStackModule->init_timer(&fKeepAliveTimer, TCPEndpoint::_KeepAliveTimer,
 		this);
 
 	T(APICall(this, "constructor"));
@@ -489,6 +498,7 @@ TCPEndpoint::~TCPEndpoint()
 	gStackModule->wait_for_timer(&fPersistTimer);
 	gStackModule->wait_for_timer(&fDelayedAcknowledgeTimer);
 	gStackModule->wait_for_timer(&fTimeWaitTimer);
+	gStackModule->wait_for_timer(&fKeepAliveTimer);
 
 	mutex_destroy(&fLock);
 
@@ -818,8 +828,12 @@ TCPEndpoint::SendData(net_buffer *buffer)
 	if ((flags & ~(MSG_DONTWAIT | MSG_OOB | MSG_EOF)) != 0)
 		return EOPNOTSUPP;
 
-	if (fState == CLOSED)
+	if (fState == CLOSED) {
+		// report why the connection ended (reset, timed out, aborted)
+		if (socket->error != B_OK)
+			return socket->error;
 		return ENOTCONN;
+	}
 	if (fState == LISTEN)
 		return EDESTADDRREQ;
 	if (!is_writable(fState) && !is_establishing(fState))
@@ -848,8 +862,11 @@ TCPEndpoint::SendData(net_buffer *buffer)
 				return posix_error(status);
 			}
 
-			if (!is_writable(fState) && !is_establishing(fState))
+			if (!is_writable(fState) && !is_establishing(fState)) {
+				if (fState == CLOSED && socket->error != B_OK)
+					return socket->error;
 				return EPIPE;
+			}
 		}
 
 		size_t size = fSendQueue.Free();
@@ -975,6 +992,16 @@ TCPEndpoint::ReadData(size_t numBytes, uint32 flags, net_buffer** _buffer)
 	// TODO: add support for urgent data (MSG_OOB)
 
 	while (true) {
+		if (fState == CLOSED) {
+			// The connection was reset, timed out or aborted while we were
+			// waiting: hand out what is left, then the reason.
+			if (fReceiveQueue.Available() > 0)
+				break;
+			if (socket->error != B_OK)
+				return socket->error;
+			return ENOTCONN;
+		}
+
 		if (fState == CLOSING || fState == WAIT_FOR_FINISH_ACKNOWLEDGE
 			|| fState == TIME_WAIT) {
 			// ``Connection closing''.
@@ -1097,6 +1124,22 @@ TCPEndpoint::GetOption(int option, void* _value, int* _length)
 			*value = fReceiveMaxSegmentSize;
 			return B_OK;
 
+		case TCP_USER_TIMEOUT:
+			*value = fUserTimeout / 1000;
+			return B_OK;
+
+		case TCP_KEEPIDLE:
+			*value = fKeepAliveIdle / 1000000;
+			return B_OK;
+
+		case TCP_KEEPINTVL:
+			*value = fKeepAliveInterval / 1000000;
+			return B_OK;
+
+		case TCP_KEEPCNT:
+			*value = fKeepAliveCount;
+			return B_OK;
+
 		default:
 			return B_BAD_VALUE;
 	}
@@ -1106,21 +1149,50 @@ TCPEndpoint::GetOption(int option, void* _value, int* _length)
 status_t
 TCPEndpoint::SetOption(int option, const void* _value, int length)
 {
-	if (option != TCP_NODELAY)
-		return B_BAD_VALUE;
-
 	if (length != sizeof(int))
 		return B_BAD_VALUE;
 
-	const int* value = (const int*)_value;
+	const int value = *(const int*)_value;
 
 	MutexLocker _(fLock);
-	if (*value)
-		fOptions |= TCP_NODELAY;
-	else
-		fOptions &= ~TCP_NODELAY;
 
-	return B_OK;
+	switch (option) {
+		case TCP_NODELAY:
+			if (value)
+				fOptions |= TCP_NODELAY;
+			else
+				fOptions &= ~TCP_NODELAY;
+			return B_OK;
+
+		case TCP_USER_TIMEOUT:
+			if (value < 0)
+				return B_BAD_VALUE;
+			fUserTimeout = value * 1000LL;
+			return B_OK;
+
+		case TCP_KEEPIDLE:
+			if (value < 1 || value > TCP_MAX_KEEPALIVE_IDLE)
+				return B_BAD_VALUE;
+			fKeepAliveIdle = value * 1000000LL;
+			_UpdateKeepAliveTimer();
+			return B_OK;
+
+		case TCP_KEEPINTVL:
+			if (value < 1 || value > TCP_MAX_KEEPALIVE_INTERVAL)
+				return B_BAD_VALUE;
+			fKeepAliveInterval = value * 1000000LL;
+			_UpdateKeepAliveTimer();
+			return B_OK;
+
+		case TCP_KEEPCNT:
+			if (value < 1 || value > TCP_MAX_KEEPALIVE_PROBES)
+				return B_BAD_VALUE;
+			fKeepAliveCount = value;
+			return B_OK;
+
+		default:
+			return B_BAD_VALUE;
+	}
 }
 
 
@@ -1199,6 +1271,170 @@ TCPEndpoint::_CancelConnectionTimers()
 	T(TimerSet(this, "persist", -1));
 	gStackModule->cancel_timer(&fDelayedAcknowledgeTimer);
 	T(TimerSet(this, "delayed ack", -1));
+	gStackModule->cancel_timer(&fKeepAliveTimer);
+	T(TimerSet(this, "keepalive", -1));
+}
+
+
+/*!	Drops a synchronized connection the peer no longer answers, or that lost
+	its local address: no reset can reach the peer. Readers, writers and
+	select()/poll() waiters see \a error.
+*/
+void
+TCPEndpoint::_Drop(status_t error, const char* reason)
+{
+	dprintf("tcp: dropping connection %s -> %s (%s): %s\n",
+		PrintAddress(*LocalAddress()), PrintAddress(*PeerAddress()),
+		name_for_state(fState), reason);
+
+	_HandleReset(error);
+}
+
+
+/*!	Returns whether the peer owes us an acknowledgement: data or a FIN is
+	unacknowledged, or data its window allows could not be sent (a local
+	error). A zero window (persist state) is not counted.
+*/
+bool
+TCPEndpoint::_IsWaitingForPeer() const
+{
+	if (fSendUnacknowledged < fSendMax)
+		return true;
+
+	return fSendWindow > 0
+		&& (fSendQueue.Used() > 0 || state_needs_finish(fState));
+}
+
+
+/*!	Called when the local address of this connection might have been removed
+	from its interface. If no interface has it anymore, the connection can
+	never send or receive again: abort it at once instead of letting it
+	retransmit until it times out.
+	The caller must hold a reference to the socket.
+*/
+void
+TCPEndpoint::AbortIfLocalAddressRemoved()
+{
+	MutexLocker locker(fLock);
+
+	switch (fState) {
+		case SYNCHRONIZE_SENT:
+		case SYNCHRONIZE_RECEIVED:
+		case ESTABLISHED:
+		case FINISH_RECEIVED:
+		case WAIT_FOR_FINISH_ACKNOWLEDGE:
+		case FINISH_SENT:
+		case FINISH_ACKNOWLEDGED:
+		case CLOSING:
+			break;
+
+		default:
+			return;
+	}
+
+	if (LocalAddress().IsEmpty(false)
+		|| gDatalinkModule->is_local_address(Domain(), *LocalAddress(), NULL,
+			NULL)) {
+		return;
+	}
+
+	_Drop(ECONNABORTED, "local address removed");
+}
+
+
+/*!	SO_KEEPALIVE was set or cleared. */
+void
+TCPEndpoint::KeepAliveChanged()
+{
+	MutexLocker locker(fLock);
+	_UpdateKeepAliveTimer();
+}
+
+
+void
+TCPEndpoint::_UpdateKeepAliveTimer()
+{
+	if ((socket->options & SO_KEEPALIVE) == 0
+		|| (fState != ESTABLISHED && fState != FINISH_RECEIVED)) {
+		gStackModule->cancel_timer(&fKeepAliveTimer);
+		return;
+	}
+
+	bigtime_t delay = fKeepAliveIdle;
+	if (fKeepAliveProbes > 0)
+		delay = fKeepAliveInterval;
+	else if (fLastReceiveTime != 0)
+		delay -= system_time() - fLastReceiveTime;
+	if (delay < 0)
+		delay = 0;
+
+	gStackModule->set_timer(&fKeepAliveTimer, delay);
+	T(TimerSet(this, "keepalive", delay));
+}
+
+
+/*!	The keepalive timer: probes a connection that has been idle for
+	fKeepAliveIdle every fKeepAliveInterval, and drops it after
+	fKeepAliveCount unanswered probes (RFC 1122 4.2.3.6).
+*/
+void
+TCPEndpoint::_KeepAlive()
+{
+	if ((socket->options & SO_KEEPALIVE) == 0
+		|| (fState != ESTABLISHED && fState != FINISH_RECEIVED))
+		return;
+
+	bigtime_t delay = fKeepAliveIdle;
+
+	if (fSendQueue.Used() > 0) {
+		// The retransmit or persist timer is watching the peer already
+		// (as Linux, which doesn't probe with data in flight either).
+		fKeepAliveProbes = 0;
+	} else {
+		const bigtime_t idle = system_time() - fLastReceiveTime;
+		if (idle >= fKeepAliveIdle) {
+			if ((fUserTimeout > 0 && fKeepAliveProbes > 0
+					&& idle >= fUserTimeout)
+				|| (fUserTimeout == 0 && fKeepAliveProbes >= fKeepAliveCount)) {
+				_Drop(ETIMEDOUT, "keepalive probes unanswered");
+				return;
+			}
+
+			_SendKeepAlive();
+			fKeepAliveProbes++;
+			delay = fKeepAliveInterval;
+		} else
+			delay = fKeepAliveIdle - idle;
+	}
+
+	gStackModule->set_timer(&fKeepAliveTimer, delay);
+	T(TimerSet(this, "keepalive", delay));
+}
+
+
+/*!	Sends a keepalive probe: an empty segment one below SND.UNA, which is
+	outside the peer's window, so that it must answer with an ACK (RFC 1122
+	4.2.3.6, RFC 9293 3.10.7.4).
+*/
+status_t
+TCPEndpoint::_SendKeepAlive()
+{
+	if (fRoute == NULL)
+		return B_ERROR;
+
+	tcp_segment_header segment = _PrepareSendSegment();
+
+	net_buffer* buffer = gBufferModule->create(256);
+	if (buffer == NULL)
+		return B_NO_MEMORY;
+
+	const tcp_sequence sendNext = fSendNext;
+	fSendNext = fSendUnacknowledged.Number() - 1;
+
+	status_t status = _PrepareAndSend(segment, buffer, true);
+
+	fSendNext = sendNext;
+	return status;
 }
 
 
@@ -1243,6 +1479,10 @@ TCPEndpoint::_MarkEstablished()
 {
 	fState = ESTABLISHED;
 	T(State(this));
+
+	fLastReceiveTime = system_time();
+	fKeepAliveProbes = 0;
+	_UpdateKeepAliveTimer();
 
 	gSocketModule->set_connected(socket);
 	if (gSocketModule->has_parent(socket))
@@ -1578,6 +1818,10 @@ TCPEndpoint::_Spawn(TCPEndpoint* parent, tcp_segment_header& segment,
 	}
 
 	fOptions = parent->fOptions;
+	fUserTimeout = parent->fUserTimeout;
+	fKeepAliveIdle = parent->fKeepAliveIdle;
+	fKeepAliveInterval = parent->fKeepAliveInterval;
+	fKeepAliveCount = parent->fKeepAliveCount;
 	fAcceptSemaphore = parent->fAcceptSemaphore;
 
 	_PrepareReceivePath(segment);
@@ -2023,6 +2267,10 @@ TCPEndpoint::SegmentReceived(tcp_segment_header& segment, net_buffer* buffer)
 		(uint32)segment.advertised_window << fSendWindowShift, buffer));
 	int32 segmentAction = DROP;
 
+	// the peer is still there (keepalive)
+	fLastReceiveTime = system_time();
+	fKeepAliveProbes = 0;
+
 	switch (fState) {
 		case LISTEN:
 			segmentAction = _ListenReceive(segment, buffer);
@@ -2440,8 +2688,17 @@ TCPEndpoint::_SendQueued(bool force)
 		sendWindow -= buffer->size;
 
 		status = _PrepareAndSend(segment, buffer, retransmit);
-		if (status != B_OK)
+		if (status != B_OK) {
+			// Sending failed locally (no route, interface down, no buffers).
+			// Let the retransmit timer try again later, so that queued data
+			// still leaves once the path is back, and the connection still
+			// times out if it never is.
+			if (!gStackModule->is_timer_active(&fRetransmitTimer)) {
+				gStackModule->set_timer(&fRetransmitTimer, fRetransmitTimeout);
+				T(TimerSet(this, "retransmit", fRetransmitTimeout));
+			}
 			return status;
+		}
 
 		if (shouldStartRetransmitTimer) {
 			TRACE("starting initial retransmit timer of: %" B_PRIdBIGTIME,
@@ -2535,6 +2792,8 @@ TCPEndpoint::_Acknowledged(tcp_segment_header& segment)
 		uint32 bytesAcknowledged = segment.acknowledge - fSendUnacknowledged.Number();
 		fPreviousHighestAcknowledge = fSendUnacknowledged;
 		fSendUnacknowledged = segment.acknowledge;
+		fRetransmitStart = 0;
+			// the peer makes progress, restart the give-up clock
 		uint32 flightSize = (fSendMax - fSendUnacknowledged).Number();
 		int32 expectedSamples = flightSize / (fSendMaxSegmentSize << 1);
 
@@ -2613,6 +2872,37 @@ TCPEndpoint::_Retransmit()
 {
 	TRACE("Retransmit()");
 
+	// Synchronized states give up once the peer has not acknowledged
+	// anything for the user timeout (RFC 1122 4.2.3.5 R2, RFC 5482). The
+	// SYN_SENT state is limited by the connect timeout instead.
+	bigtime_t giveUpIn = -1;
+	if (fState >= ESTABLISHED && fState != TIME_WAIT) {
+		if (!_IsWaitingForPeer())
+			fRetransmitStart = 0;
+		else {
+			const bigtime_t now = system_time();
+			if (fRetransmitStart == 0) {
+				// the timer was started when the oldest unacknowledged data
+				// was sent (or last acknowledged)
+				fRetransmitStart = now - fRetransmitTimeout;
+			}
+
+			// A peer that closed its window only has to show that it is
+			// still there (as Linux does).
+			bigtime_t since = fRetransmitStart;
+			if (fSendWindow == 0 && fLastReceiveTime > since)
+				since = fLastReceiveTime;
+
+			const bigtime_t limit = fUserTimeout > 0
+				? fUserTimeout : TCP_MAX_RETRANSMIT_DURATION;
+			giveUpIn = since + limit - now;
+			if (giveUpIn <= 0) {
+				_Drop(ETIMEDOUT, "peer stopped acknowledging data");
+				return;
+			}
+		}
+	}
+
 	if (fState < ESTABLISHED && fRetransmitInitialCount < 4) {
 		fRetransmitTimeout = TCP_SYN_RETRANSMIT_TIMEOUT;
 		fCongestionWindow = fSendMaxSegmentSize;
@@ -2632,6 +2922,12 @@ TCPEndpoint::_Retransmit()
 		gStackModule->set_timer(&fRetransmitTimer, fRetransmitTimeout);
 	} else
 		_SendQueued();
+
+	if (giveUpIn >= 0 && giveUpIn < fRetransmitTimeout
+		&& gStackModule->is_timer_active(&fRetransmitTimer)) {
+		// don't overshoot the user timeout by up to a backed off RTO
+		gStackModule->set_timer(&fRetransmitTimer, giveUpIn);
+	}
 
 	fRecover = fSendNext.Number() - 1;
 	if ((fFlags & FLAG_RECOVERY) != 0)
@@ -2689,11 +2985,18 @@ TCPEndpoint::_RetransmitTimer(net_timer* timer, void* _endpoint)
 	TCPEndpoint* endpoint = (TCPEndpoint*)_endpoint;
 	T(TimerTriggered(endpoint, "retransmit"));
 
-	MutexLocker locker(endpoint->fLock);
-	if (!locker.IsLocked() || gStackModule->is_timer_active(timer))
+	// Giving up can abort the socket (a connection not accepted yet), which
+	// may drop the last reference otherwise. If there is none left, the
+	// endpoint is being deleted.
+	if (!gSocketModule->acquire_socket(endpoint->socket))
 		return;
 
-	endpoint->_Retransmit();
+	MutexLocker locker(endpoint->fLock);
+	if (locker.IsLocked() && !gStackModule->is_timer_active(timer))
+		endpoint->_Retransmit();
+
+	locker.Unlock();
+	gSocketModule->release_socket(endpoint->socket);
 }
 
 
@@ -2730,6 +3033,25 @@ TCPEndpoint::_DelayedAcknowledgeTimer(net_timer* timer, void* _endpoint)
 		return;
 
 	endpoint->_SendAcknowledge();
+}
+
+
+/*static*/ void
+TCPEndpoint::_KeepAliveTimer(net_timer* timer, void* _endpoint)
+{
+	TCPEndpoint* endpoint = (TCPEndpoint*)_endpoint;
+	T(TimerTriggered(endpoint, "keepalive"));
+
+	// see _RetransmitTimer()
+	if (!gSocketModule->acquire_socket(endpoint->socket))
+		return;
+
+	MutexLocker locker(endpoint->fLock);
+	if (locker.IsLocked() && !gStackModule->is_timer_active(timer))
+		endpoint->_KeepAlive();
+
+	locker.Unlock();
+	gSocketModule->release_socket(endpoint->socket);
 }
 
 
@@ -2822,6 +3144,11 @@ TCPEndpoint::Dump() const
 	kprintf("  smoothed round trip time: %" B_PRId32 " (deviation %" B_PRId32 ")\n",
 		fSmoothedRoundTripTime, fRoundTripVariation);
 	kprintf("  retransmit timeout: %" B_PRId64 "\n", fRetransmitTimeout);
+	kprintf("  retransmitting since: %" B_PRId64 " (user timeout %" B_PRId64
+		")\n", fRetransmitStart, fUserTimeout);
+	kprintf("  last receive: %" B_PRId64 ", keepalive %" B_PRId64 "/%" B_PRId64
+		"/%" B_PRIu32 ", probes sent %" B_PRIu32 "\n", fLastReceiveTime,
+		fKeepAliveIdle, fKeepAliveInterval, fKeepAliveCount, fKeepAliveProbes);
 	kprintf("  congestion window: %" B_PRIu32 "\n", fCongestionWindow);
 	kprintf("  slow start threshold: %" B_PRIu32 "\n", fSlowStartThreshold);
 }
