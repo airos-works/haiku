@@ -451,6 +451,8 @@ private:
 
 			// mouse
 			int32				fMouseButtons;
+			int32				fReportedMouseButtons;
+				// pressed buttons the program was told about
 			int32				fModifiers;
 			TermPoint			fPrevPos;
 			BClipboard*			fMouseClipboard;

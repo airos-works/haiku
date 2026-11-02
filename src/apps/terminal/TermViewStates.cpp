@@ -309,8 +309,13 @@ TermView::DefaultState::MouseDown(BPoint where, int32 buttons, int32 modifiers)
 	// with mouse reporting the program gets the clicks, unless shift is
 	// held to select text
 	if (fView->_ReportsMouse() && (modifiers & B_SHIFT_KEY) == 0) {
-		fView->_SendMouseEvent(MOUSE_PRESS, mouse_button(buttons), where,
+		// the button that went down, not one that was held already
+		int32 pressed = buttons & ~fView->fMouseButtons;
+		if (pressed == 0)
+			pressed = buttons;
+		fView->_SendMouseEvent(MOUSE_PRESS, mouse_button(pressed), where,
 			modifiers);
+		fView->fReportedMouseButtons |= pressed;
 		fView->fPrevPos = fView->_ConvertToTerminal(where);
 		return;
 	}
@@ -373,9 +378,12 @@ TermView::DefaultState::MouseUp(BPoint where, int32 buttons)
 			fView->fDragAndDrop->MouseUp();
 	}
 
-	if (fView->_ReportsMouse()) {
-		// the button that went up
-		int32 released = fView->fMouseButtons & ~buttons;
+	// the button that went up, if its press was reported: not one that
+	// pasted or selected with shift held
+	int32 released = fView->fMouseButtons & ~buttons
+		& fView->fReportedMouseButtons;
+	fView->fReportedMouseButtons &= buttons;
+	if (released != 0 && fView->_ReportsMouse()) {
 		fView->_SendMouseEvent(MOUSE_RELEASE, mouse_button(released), where,
 			modifiers());
 	}

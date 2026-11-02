@@ -544,6 +544,7 @@ TermView::_InitObject(const ShellParameters& shellParameters)
 	fUseOptionAsMetaKey = false;
 	fPressedModifierKeys = 0;
 	fMouseButtons = 0;
+	fReportedMouseButtons = 0;
 	fModifiers = 0;
 	fMouseClipboard = be_clipboard;
 	fNotificationCounter = 0;
@@ -3140,6 +3141,7 @@ void
 TermView::AttachedToWindow()
 {
 	fMouseButtons = 0;
+	fReportedMouseButtons = 0;
 
 	_UpdateModifiers();
 
