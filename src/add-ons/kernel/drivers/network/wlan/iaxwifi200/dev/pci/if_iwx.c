@@ -3226,8 +3226,14 @@ iwx_init_channel_map(struct iwx_softc *sc, uint16_t *channel_profile_v3,
 			if (ch_flags & IWX_NVM_CHANNEL_80MHZ)
 				channel->ic_xflags |= IEEE80211_CHANX_80MHZ;
 		}
+		/*
+		 * HE station set-up here uses STA_HE_CTXT_CMD; the Bz family's
+		 * MLD firmware (BE200) does not answer it, so those cards
+		 * associate with HT/VHT.
+		 */
 		if (IWX_ENABLE_HE_ASSOCIATION && data->sku_cap_11ax_enable &&
-		    data->sku_cap_11n_enable)
+		    data->sku_cap_11n_enable &&
+		    sc->sc_device_family < IWX_DEVICE_FAMILY_BZ)
 			channel->ic_xflags |= IEEE80211_CHANX_HE;
 	}
 }
@@ -4629,10 +4635,12 @@ iwx_run_init_mvm_ucode(struct iwx_softc *sc, int readnvm)
 	/*
 	 * Only enable the MLD API on MA devices for now as the API 77
 	 * firmware on some of the older firmware devices also claims
-	 * support, but doesn't actually work.
+	 * support, but doesn't actually work. The Bz family (BE200) needs
+	 * it: its firmware no longer answers MAC_CONTEXT_CMD.
 	 */
 	if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_MLD_API_SUPPORT) &&
-	    IWX_CSR_HW_REV_TYPE(sc->sc_hw_rev) == IWX_CFG_MAC_TYPE_MA)
+	    (IWX_CSR_HW_REV_TYPE(sc->sc_hw_rev) == IWX_CFG_MAC_TYPE_MA ||
+	    sc->sc_device_family >= IWX_DEVICE_FAMILY_BZ))
 		sc->sc_use_mld_api = 1;
 
 	return 0;

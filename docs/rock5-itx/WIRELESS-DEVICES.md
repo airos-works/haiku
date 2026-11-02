@@ -112,7 +112,7 @@ adapters** work in any USB port.
 | Family | Driver | Card type | Standard | Firmware package |
 |---|---|---|---|---|
 | Intel AX210 | `iaxwifi200` | M.2 | Wi-Fi 6E, HE association verified | intel_wifi_firmwares |
-| Intel BE200 (`8086:272b`) | `iaxwifi200` (Bz family) | M.2 | Wi-Fi 7 card, used as 802.11a/b/g/n/ac | intel_wifi7_firmwares |
+| Intel BE200 (`8086:272b`) | `iaxwifi200` (Bz family) | M.2 | Wi-Fi 7 card, used as 802.11a/b/g/n/ac; association verified | intel_wifi7_firmwares |
 | Intel AX200 (incl. Killer AX1650) | `iaxwifi200` | M.2 | Wi-Fi 6 | intel_wifi_firmwares |
 | Intel AX201, AX211, AX411 (incl. Killer AX1650i/1675i/1690i) | `iaxwifi200` | CNVi | Wi-Fi 6/6E | intel_wifi_firmwares |
 | Intel 9260, and 9461/9462/9560 M.2 modules (Thunder Peak, `8086:2526`) | `idualwifi7260` | M.2 | 802.11ac | intel_wifi_firmwares |
@@ -152,10 +152,17 @@ now skipped as Linux does), a fragmented PNVM (whose segment count the
 driver never reset on stop: the second start dereferenced unallocated
 segments) and version 8 of the MCC (regulatory) response.
 
+The firmware no longer answers the legacy MAC_CONTEXT_CMD, so the Bz family
+uses the driver's MLD command path (MAC_CONFIG/LINK_CONFIG/STA_CONFIG, so
+far enabled only for Ma devices), and it associates with HT/VHT: this
+fork's HE station set-up uses STA_HE_CTXT_CMD, which that firmware does not
+answer either.
+
 On the ROCK 5 the card sits on the M.2 E-key slot (PCIe segment 2); the
 firmware profile admits it next to the AX210 (it sets the multi-function
 bit of its header type). Verified there: the card attaches, loads the
-firmware, reads its address and scans (without antennas, signal 2 to 8).
+firmware, reads its address, scans (without antennas, signal 2 to 8) and
+joins Gaspers (WPA2-PSK/CCMP) at 802.11ac with a DHCP address.
 Its Bluetooth half (`8087:0036`, `ibt-0291-0291`) loads its firmware with
 `bt_firmware` as before.
 
