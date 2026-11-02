@@ -80,6 +80,12 @@ service x-vnd.Haiku-notification_server {
 	on_demand
 }
 
+service x-vnd.Haiku-media_controls_server {
+	launch /system/servers/media_controls_server
+	no_safemode
+	on_demand
+}
+
 service x-vnd.Haiku-osd_server {
 	launch /system/servers/osd_server
 	no_safemode

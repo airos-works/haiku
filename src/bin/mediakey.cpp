@@ -6,11 +6,16 @@
 
 /*!	mediakey: sends a keyboard's media key (play/pause, next, previous,
 	stop) to the application that should act on it. The Shortcuts
-	preferences bind the consumer-page key codes to it. See
-	<private/shared/MediaKeys.h> for the protocol.
+	preferences bind the consumer-page key codes to it.
+
+	The key goes to the active player of the media_controls_server (see
+	<private/media_controls/MediaControls.h>) when there is one that takes
+	it; else to an application that answers the older query protocol of
+	<private/shared/MediaKeys.h>.
 */
 
 
+#include <MediaControls.h>
 #include <MediaKeys.h>
 
 #include <stdio.h>
@@ -43,11 +48,123 @@ usage(const char* program)
 {
 	fprintf(stderr, "usage: %s [-v] play-pause | play | pause | stop | next "
 		"| previous\n"
-		"Sends the key to the application that is playing, else to the "
-		"active application,\nelse to the media application started last.\n"
+		"       %s [-v] seek <seconds>\n"
+		"       %s status\n"
+		"Sends the key to the active player of the system media controls; "
+		"without one,\nto the application that is playing, else to the "
+		"active application, else to\nthe media application started last.\n"
+		"status lists the players of the media controls, the active one "
+		"first.\n"
 		"  -v  say which applications answered and which one got the "
-		"key\n", program);
+		"key\n", program, program, program);
 	exit(1);
+}
+
+
+static int32
+media_key_action(int32 key)
+{
+	switch (key) {
+		case B_MEDIA_KEY_PLAY_PAUSE:
+			return B_MEDIA_ACTION_TOGGLE;
+		case B_MEDIA_KEY_PLAY:
+			return B_MEDIA_ACTION_PLAY;
+		case B_MEDIA_KEY_PAUSE:
+			return B_MEDIA_ACTION_PAUSE;
+		case B_MEDIA_KEY_STOP:
+			return B_MEDIA_ACTION_STOP;
+		case B_MEDIA_KEY_NEXT:
+			return B_MEDIA_ACTION_NEXT;
+		case B_MEDIA_KEY_PREVIOUS:
+			return B_MEDIA_ACTION_PREVIOUS;
+	}
+	return -1;
+}
+
+
+static BString
+format_time(bigtime_t time)
+{
+	BString text;
+	int64 seconds = time / 1000000;
+	text.SetToFormat("%" B_PRId64 ":%02" B_PRId64, seconds / 60, seconds % 60);
+	return text;
+}
+
+
+static int
+print_status()
+{
+	BMessage state;
+	if (get_media_controls_state(&state) != B_OK) {
+		printf("no players (the media controls server is not running)\n");
+		return 0;
+	}
+
+	BMessage player;
+	if (state.FindMessage("player", &player) != B_OK) {
+		printf("no players\n");
+		return 0;
+	}
+
+	for (int32 i = 0; state.FindMessage("player", i, &player) == B_OK; i++) {
+		media_session_state playbackState = (media_session_state)
+			player.GetInt32("state", B_MEDIA_SESSION_STOPPED);
+		bigtime_t position = player.GetInt64("position", -1);
+		if (position >= 0 && playbackState == B_MEDIA_SESSION_PLAYING) {
+			position += (bigtime_t)((system_time()
+				- player.GetInt64("position_time", system_time()))
+				* player.GetFloat("rate", 1.0f));
+		}
+
+		printf("%s%s (%s, team %" B_PRId32 ", session %" B_PRIx64 "): %s",
+			i == 0 ? "* " : "  ", player.GetString("name", "?"),
+			player.GetString("signature", "?"), player.GetInt32("team", -1),
+			player.GetInt64("session", -1),
+			media_session_state_name(playbackState));
+		if (position >= 0) {
+			printf(" %s", format_time(position).String());
+			bigtime_t duration = player.GetInt64("duration", 0);
+			if (duration > 0)
+				printf("/%s", format_time(duration).String());
+		}
+		printf("\n    title \"%s\", artist \"%s\", album \"%s\"%s\n",
+			player.GetString("title", ""), player.GetString("artist", ""),
+			player.GetString("album", ""),
+			player.HasMessage("artwork") ? ", artwork" : "");
+
+		uint32 actions = player.GetUInt32("actions", 0);
+		printf("    actions:");
+		for (int32 action = 0; action < B_MEDIA_ACTION_COUNT; action++) {
+			if ((actions & B_MEDIA_ACTION_FLAG(action)) != 0)
+				printf(" %s", media_session_action_name(action));
+		}
+		printf("\n");
+	}
+	return 0;
+}
+
+
+/*!	Gives the key to the system media controls' active player. Returns
+	whether one took it.
+*/
+static bool
+send_to_media_controls(int32 action, bigtime_t position = -1)
+{
+	bool handled = false;
+	status_t status = send_media_controls_action(action, &handled, -1,
+		position);
+	if (sVerbose) {
+		if (status == B_NAME_NOT_FOUND)
+			printf("media controls: not running\n");
+		else if (status != B_OK)
+			printf("media controls: %s\n", strerror(status));
+		else {
+			printf("media controls: %s %s\n", media_session_action_name(action),
+				handled ? "handled" : "not taken");
+		}
+	}
+	return status == B_OK && handled;
 }
 
 
@@ -75,6 +192,18 @@ main(int argc, char** argv)
 		sVerbose = true;
 		argi++;
 	}
+	if (argi == argc - 1 && strcmp(argv[argi], "status") == 0) {
+		BApplication app("application/x-vnd.Haiku-mediakey");
+		return print_status();
+	}
+	if (argi == argc - 2 && strcmp(argv[argi], "seek") == 0) {
+		BApplication app("application/x-vnd.Haiku-mediakey");
+		double seconds = atof(argv[argi + 1]);
+		if (seconds < 0)
+			usage(argv[0]);
+		return send_to_media_controls(B_MEDIA_ACTION_SEEK,
+			(bigtime_t)(seconds * 1000000)) ? 0 : 1;
+	}
 	if (argi != argc - 1)
 		usage(argv[0]);
 
@@ -86,6 +215,10 @@ main(int argc, char** argv)
 
 	// Replies need a looper of our own.
 	BApplication app("application/x-vnd.Haiku-mediakey");
+
+	// Players registered with the media controls come first.
+	if (send_to_media_controls(media_key_action(key)))
+		return 0;
 
 	app_info activeInfo;
 	team_id activeTeam = -1;

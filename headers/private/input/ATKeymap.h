@@ -179,7 +179,7 @@ const static uint32 kATKeycodeMap[] = {
 	0x00,   // UNMAPPED
 	HID_CONSUMER(MUTE), // media: Volume mute	160
 	HID_CONSUMER(AL_CALCULATOR),   // media: Calculator
-	HID_CONSUMER(PLAY), // media: Play
+	HID_CONSUMER(PLAY_PAUSE), // media: Play/Pause (E0 22)
 	0x00,   // UNMAPPED
 	HID_CONSUMER(STOP), // media: Stop
 	0x00,   // UNMAPPED

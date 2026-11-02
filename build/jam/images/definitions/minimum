@@ -247,6 +247,7 @@ SYSTEM_SERVERS = [ FFilterByBuildFeatures
 	launch_daemon
 	location_server
 	mcp_server
+	media_controls_server
 	mdns_server
 	mount_server
 	net_server

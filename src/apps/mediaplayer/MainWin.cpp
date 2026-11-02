@@ -20,6 +20,7 @@
 #include <Alert.h>
 #include <Application.h>
 #include <Autolock.h>
+#include <Bitmap.h>
 #include <Catalog.h>
 #include <Debug.h>
 #include <Directory.h>
@@ -40,6 +41,7 @@
 #include <Roster.h>
 #include <Screen.h>
 #include <String.h>
+#include <TranslationUtils.h>
 #include <TypeConstants.h>
 #include <View.h>
 
@@ -52,6 +54,7 @@
 #include "PeakView.h"
 #include "PlaylistItem.h"
 #include "PlaylistObserver.h"
+#include "PlaybackState.h"
 #include "PlaylistWindow.h"
 #include "Settings.h"
 
@@ -278,7 +281,9 @@ MainWin::MainWin(bool isFirstWindow, BMessage* message)
 
 	fGlobalSettingsListener(this),
 	fInitialSeekPosition(0),
-	fAllowWinding(true)
+	fAllowWinding(true),
+	fSessionPosition(-1),
+	fSessionPositionTime(0)
 {
 	// Handle window position and size depending on whether this is the
 	// first window or not. Use the window size from the window that was
@@ -381,6 +386,8 @@ MainWin::MainWin(bool isFirstWindow, BMessage* message)
 MainWin::~MainWin()
 {
 //	printf("MainWin::~MainWin\n");
+
+	fMediaSession.Unregister();
 
 	BMediaRoster* roster = BMediaRoster::CurrentRoster();
 	roster->StopWatching(BMessenger(this, this), B_MEDIA_SERVER_STARTED);
@@ -533,6 +540,10 @@ MainWin::MessageReceived(BMessage* msg)
 {
 //	msg->PrintToStream();
 	switch (msg->what) {
+		case kMsgMediaSessionAction:
+			_HandleMediaSessionAction(msg);
+			break;
+
 		case B_EXECUTE_PROPERTY:
 		case B_GET_PROPERTY:
 		case B_SET_PROPERTY:
@@ -848,6 +859,7 @@ MainWin::MessageReceived(BMessage* msg)
 				&& msg->FindInt32("index", &index) == B_OK) {
 				_AddPlaylistItem(item, index);
 			}
+			_UpdateMediaSessionActions();
 			break;
 		}
 		case MSG_PLAYLIST_ITEM_REMOVED:
@@ -855,6 +867,7 @@ MainWin::MessageReceived(BMessage* msg)
 			int32 index;
 			if (msg->FindInt32("index", &index) == B_OK)
 				_RemovePlaylistItem(index);
+			_UpdateMediaSessionActions();
 			break;
 		}
 		case MSG_PLAYLIST_CURRENT_ITEM_CHANGED:
@@ -978,6 +991,7 @@ MainWin::MessageReceived(BMessage* msg)
 			uint32 state;
 			if (msg->FindInt32("state", (int32*)&state) == B_OK)
 				fControls->SetPlaybackState(state);
+			_UpdateMediaSessionPlayback();
 			break;
 		}
 		case MSG_CONTROLLER_POSITION_CHANGED:
@@ -988,9 +1002,20 @@ MainWin::MessageReceived(BMessage* msg)
 					fController->TimeDuration());
 				fAllowWinding = true;
 			}
+			// The media controls extrapolate the position: they only need
+			// to hear about jumps.
+			if (fMediaSession.IsRegistered() && fSessionPosition >= 0
+				&& fMediaSession.PlaybackState() == B_MEDIA_SESSION_PLAYING) {
+				bigtime_t expected = fSessionPosition + system_time()
+					- fSessionPositionTime;
+				bigtime_t drift = fController->TimePosition() - expected;
+				if (drift > 1500000 || drift < -1500000)
+					_UpdateMediaSessionPlayback();
+			}
 			break;
 		}
 		case MSG_CONTROLLER_SEEK_HANDLED:
+			_UpdateMediaSessionPlayback();
 			break;
 
 		case MSG_CONTROLLER_VOLUME_CHANGED:
@@ -1564,6 +1589,211 @@ MainWin::HandleMediaKey(int32 key)
 }
 
 
+// #pragma mark - system media controls
+
+
+static BBitmap*
+find_artwork(const entry_ref& ref)
+{
+	// a picture of the album next to the file, as many players keep it
+	static const char* kNames[] = { "cover", "folder", "front", "albumart",
+		"album" };
+	static const char* kExtensions[] = { "jpg", "jpeg", "png", "webp" };
+
+	BEntry entry(&ref);
+	BEntry parentEntry;
+	if (entry.GetParent(&parentEntry) != B_OK)
+		return NULL;
+	BDirectory directory(&parentEntry);
+	if (directory.InitCheck() != B_OK)
+		return NULL;
+
+	BEntry candidate;
+	char name[B_FILE_NAME_LENGTH];
+	while (directory.GetNextEntry(&candidate) == B_OK) {
+		if (candidate.GetName(name) != B_OK)
+			continue;
+		char* dot = strrchr(name, '.');
+		if (dot == NULL)
+			continue;
+		bool known = false;
+		for (size_t i = 0; i < B_COUNT_OF(kExtensions) && !known; i++)
+			known = strcasecmp(dot + 1, kExtensions[i]) == 0;
+		if (!known)
+			continue;
+		*dot = '\0';
+		for (size_t i = 0; i < B_COUNT_OF(kNames); i++) {
+			if (strcasecmp(name, kNames[i]) != 0)
+				continue;
+			entry_ref artworkRef;
+			if (candidate.GetRef(&artworkRef) == B_OK)
+				return BTranslationUtils::GetBitmap(&artworkRef);
+		}
+	}
+	return NULL;
+}
+
+
+static BString
+read_string_attribute(const BNode& node, const char* name)
+{
+	BString value;
+	if (node.ReadAttrString(name, &value) != B_OK)
+		value.Truncate(0);
+	return value;
+}
+
+
+/*!	Shows the file that was just opened in the system media controls:
+	title, artist and album from the file's tags or attributes, and the
+	album's picture when there is one next to the file.
+*/
+void
+MainWin::_UpdateMediaSession()
+{
+	if (!fHasFile)
+		return;
+
+	BString title;
+	BString artist;
+	BString album;
+
+	BMessage metaData;
+	{
+		BAutolock _(fController);
+		if (fController->GetMetaData(&metaData) == B_OK) {
+			title = metaData.GetString("title", "");
+			artist = metaData.GetString("artist", "");
+			album = metaData.GetString("album", "");
+		}
+	}
+
+	BBitmap* artwork = NULL;
+	BString name;
+	{
+		BAutolock _(fPlaylist);
+		const PlaylistItem* item = fController->Item();
+		if (item != NULL)
+			name = item->Name();
+		const FilePlaylistItem* fileItem
+			= dynamic_cast<const FilePlaylistItem*>(item);
+		if (fileItem != NULL) {
+			BNode node(&fileItem->Ref());
+			if (title.IsEmpty())
+				title = read_string_attribute(node, "Audio:Title");
+			if (title.IsEmpty())
+				title = read_string_attribute(node, "Media:Title");
+			if (artist.IsEmpty())
+				artist = read_string_attribute(node, "Audio:Artist");
+			if (album.IsEmpty())
+				album = read_string_attribute(node, "Audio:Album");
+			if (!fHasVideo)
+				artwork = find_artwork(fileItem->Ref());
+		}
+	}
+	if (title.IsEmpty())
+		title = name;
+
+	fMediaSession.SetMetadata(title.String(), artist.String(), album.String(),
+		artwork);
+	delete artwork;
+
+	if (!fMediaSession.IsRegistered()) {
+		_UpdateMediaSessionActions();
+		_UpdateMediaSessionPlayback();
+		fMediaSession.Register(this);
+	} else
+		_UpdateMediaSessionActions();
+}
+
+
+void
+MainWin::_UpdateMediaSessionPlayback()
+{
+	if (!fHasFile)
+		return;
+
+	media_session_state state;
+	bigtime_t position;
+	bigtime_t duration;
+	{
+		BAutolock _(fController);
+		switch (fController->PlaybackState()) {
+			case PLAYBACK_STATE_PLAYING:
+				state = B_MEDIA_SESSION_PLAYING;
+				break;
+			case PLAYBACK_STATE_PAUSED:
+				state = B_MEDIA_SESSION_PAUSED;
+				break;
+			default:
+				state = B_MEDIA_SESSION_STOPPED;
+				break;
+		}
+		position = fController->TimePosition();
+		duration = fController->TimeDuration();
+	}
+
+	fSessionPosition = position;
+	fSessionPositionTime = system_time();
+	fMediaSession.SetPlaybackState(state, position, duration);
+}
+
+
+void
+MainWin::_UpdateMediaSessionActions()
+{
+	uint32 actions = 0;
+	if (fHasFile) {
+		actions = B_MEDIA_DEFAULT_ACTIONS
+			| B_MEDIA_ACTION_FLAG(B_MEDIA_ACTION_SEEK);
+		if (CanHandleMediaKey(B_MEDIA_KEY_NEXT)) {
+			actions |= B_MEDIA_ACTION_FLAG(B_MEDIA_ACTION_NEXT)
+				| B_MEDIA_ACTION_FLAG(B_MEDIA_ACTION_PREVIOUS);
+		}
+	}
+	fMediaSession.SetSupportedActions(actions);
+}
+
+
+void
+MainWin::_HandleMediaSessionAction(BMessage* message)
+{
+	media_session_action action;
+	bigtime_t position;
+	if (fMediaSession.ParseAction(message, &action, &position) != B_OK)
+		return;
+
+	switch (action) {
+		case B_MEDIA_ACTION_PLAY:
+			HandleMediaKey(B_MEDIA_KEY_PLAY);
+			break;
+		case B_MEDIA_ACTION_PAUSE:
+			HandleMediaKey(B_MEDIA_KEY_PAUSE);
+			break;
+		case B_MEDIA_ACTION_TOGGLE:
+			HandleMediaKey(B_MEDIA_KEY_PLAY_PAUSE);
+			break;
+		case B_MEDIA_ACTION_STOP:
+			HandleMediaKey(B_MEDIA_KEY_STOP);
+			break;
+		case B_MEDIA_ACTION_NEXT:
+			HandleMediaKey(B_MEDIA_KEY_NEXT);
+			break;
+		case B_MEDIA_ACTION_PREVIOUS:
+			HandleMediaKey(B_MEDIA_KEY_PREVIOUS);
+			break;
+		case B_MEDIA_ACTION_SEEK:
+			if (fHasFile && position >= 0) {
+				fController->SetTimePosition(position);
+				_UpdateMediaSessionPlayback();
+			}
+			break;
+		default:
+			break;
+	}
+}
+
+
 void
 MainWin::GetQuitMessage(BMessage* message)
 {
@@ -1699,6 +1929,7 @@ MainWin::_PlaylistItemOpened(const PlaylistItemRef& item, status_t result)
 		fHasVideo = false;
 		fHasAudio = false;
 		SetTitle(kApplicationName);
+		fMediaSession.Unregister();
 	} else {
 		fHasFile = true;
 		fHasVideo = fController->VideoTrackCount() != 0;
@@ -1717,8 +1948,10 @@ MainWin::_PlaylistItemOpened(const PlaylistItemRef& item, status_t result)
 	}
 	_SetupWindow();
 
-	if (result == B_OK)
+	if (result == B_OK) {
 		_UpdatePlaylistItemFile();
+		_UpdateMediaSession();
+	}
 }
 
 
