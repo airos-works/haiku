@@ -15,6 +15,8 @@
 #include <Button.h>
 #include <Slider.h>
 
+#include <MediaSession.h>
+
 #include "Controller.h"
 #include "ControllerView.h"
 #include "InfoWin.h"
@@ -132,6 +134,12 @@ private:
 
 			void				_AdoptGlobalSettings();
 
+			// system media controls (Deskbar, media keys)
+			void				_UpdateMediaSession();
+			void				_UpdateMediaSessionPlayback();
+			void				_UpdateMediaSessionActions();
+			void				_HandleMediaSessionAction(BMessage* message);
+
 private:
 			bigtime_t			fCreationTime;
 
@@ -196,6 +204,10 @@ private:
 			bool				fScaleFullscreenControls;
 			bigtime_t			fInitialSeekPosition;
 			bool				fAllowWinding;
+
+			MediaSession		fMediaSession;
+			bigtime_t			fSessionPosition;
+			bigtime_t			fSessionPositionTime;
 
 	static	int					sNoVideoWidth;
 };
