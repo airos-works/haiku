@@ -137,13 +137,20 @@ SyslogQuery(const JsonValue& args)
 		files.Push("since mark");
 		boot = "all";
 	} else {
-		std::string old;
-		if (ReadFileToString(kOldSyslogPath, old))
-			files.Push(kOldSyslogPath);
+		// every old file there is, oldest first (syslog.4 ... syslog.1;
+		// air/OS keeps four), then the current one
+		for (int i = 9; i >= 1; i--) {
+			std::string path = std::string(kSyslogPath) + "." + std::to_string(i);
+			std::string old;
+			if (ReadFileToString(path.c_str(), old)) {
+				files.Push(path);
+				text += old;
+			}
+		}
 		std::string current;
 		if (ReadFileToString(kSyslogPath, current))
 			files.Push(kSyslogPath);
-		text = old + current;
+		text += current;
 	}
 
 	std::vector<std::string> lines = SplitLines(text);
@@ -240,9 +247,10 @@ SyslogQuery(const JsonValue& args)
 		result.Set("truncated_by_max_bytes", true);
 	if (!note.empty())
 		result.Set("note", note);
-	result.Set("hint", "Haiku syslog lines carry no timestamps; order within a "
-		"boot is write order, not time. Use the mark with since_mark to read "
-		"only what was logged after this call.");
+	result.Set("hint", "air/OS syslog lines start with the local time they were "
+		"written (kernel lines: when the syslog daemon got them), unless "
+		"syslog_time_stamps is off in the kernel settings. Use the mark with "
+		"since_mark to read only what was logged after this call.");
 	return ToolResult::Json(result);
 }
 
@@ -283,8 +291,8 @@ void
 RegisterSyslogTools(McpServer& server)
 {
 	server.AddTool("syslog_query",
-		"Read the system log (/var/log/syslog and syslog.1) on the device. Selects "
-		"one boot (default the current one: Haiku logs carry no timestamps and the "
+		"Read the system log (/var/log/syslog and its rotated syslog.N files) on "
+		"the device. Selects one boot (default the current one: the "
 		"file persists across warm reboots, so filtering by boot matters), filters "
 		"lines by a regular expression with optional context, and returns the "
 		"tail. Every call also returns a mark; pass it later as since_mark to get "

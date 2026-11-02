@@ -137,11 +137,18 @@ send_syslog_message(syslog_context *context, int priority, const char *text,
 	if ((context->mask & LOG_MASK(SYSLOG_PRIORITY(priority))) == 0)
 		return;
 
+	// Each use of the arguments needs its own copy: formatting consumes a
+	// va_list, and using it again crashed (mcp_server, in strlen(), when the
+	// syslog daemon had gone and LOG_CONS printed the message after
+	// vsnprintf() had used the arguments).
 	port_id port = get_system_logger_port();
 	if ((options & LOG_PERROR) != 0
 		|| ((options & LOG_CONS) != 0 && port < B_OK)) {
 		// if asked for, print out the (simplified) message on stderr
-		message_to_console(context, text, args);
+		va_list copy;
+		va_copy(copy, args);
+		message_to_console(context, text, copy);
+		va_end(copy);
 	}
 	if (port < B_OK) {
 		// apparently, there is no syslog daemon running;
@@ -161,8 +168,11 @@ send_syslog_message(syslog_context *context, int priority, const char *text,
 	message.priority = priority;
 	strcpy(message.ident, context->ident);
 
+	va_list copy;
+	va_copy(copy, args);
 	int length = vsnprintf(message.message, sizeof(buffer)
-		- sizeof(syslog_message), text, args);
+		- sizeof(syslog_message), text, copy);
+	va_end(copy);
 	if (message.message + length - buffer < (int32)sizeof(buffer)) {
 		if (length == 0 || message.message[length - 1] != '\n')
 			message.message[length++] = '\n';
@@ -170,17 +180,33 @@ send_syslog_message(syslog_context *context, int priority, const char *text,
 		buffer[length - 1] = '\n';
 
 	status_t status;
-	do {
-		// make sure the message gets send (if there is a valid port)
-		status = write_port(port, SYSLOG_MESSAGE, &message,
-			sizeof(syslog_message) + length);
-	} while (status == B_INTERRUPTED);
+	for (int attempt = 0; attempt < 2; attempt++) {
+		do {
+			// make sure the message gets send (if there is a valid port)
+			status = write_port(port, SYSLOG_MESSAGE, &message,
+				sizeof(syslog_message) + length);
+		} while (status == B_INTERRUPTED);
+
+		if (status != B_BAD_PORT_ID)
+			break;
+
+		// The syslog daemon was restarted: the port we knew is gone. Ask
+		// for the new one once, or everything this team logs from now on
+		// would be lost.
+		sSystemLoggerPort = -1;
+		port = get_system_logger_port();
+		if (port < B_OK)
+			break;
+	}
 
 	if (status < B_OK && (options & LOG_CONS) != 0
 		&& (options & LOG_PERROR) == 0) {
 		// LOG_CONS redirects all output to the console in case contacting
 		// the syslog daemon failed
-		message_to_console(context, text, args);
+		va_list consoleCopy;
+		va_copy(consoleCopy, args);
+		message_to_console(context, text, consoleCopy);
+		va_end(consoleCopy);
 	}
 }
 

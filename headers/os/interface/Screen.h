@@ -60,6 +60,10 @@ public:
 
 			status_t			WaitForRetrace();
 			status_t			WaitForRetrace(bigtime_t timeout);
+			status_t			WaitForOutputRetrace(BRect frame,
+									bigtime_t timeout = B_INFINITE_TIMEOUT);
+									// the next frame of the output that
+									// shows frame (a window's, say)
 
 			uint8				IndexForColor(rgb_color color);
 			uint8				IndexForColor(uint8 red, uint8 green,

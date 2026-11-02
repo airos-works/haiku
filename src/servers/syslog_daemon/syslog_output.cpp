@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <FindDirectory.h>
@@ -33,9 +34,13 @@ static int sLog = -1;
 static char sLastMessage[1024];
 static thread_id sLastThread;
 static int32 sRepeatCount;
-static size_t sLogMaxSize = 524288;	// 512kB
-static int32 sMaxHistory = 1;
-static bool sLogTimeStamps = false;
+// air/OS: a log that is to tell what happened before a hang or a reboot needs
+// the time of each line and more than one old file (haiku#40): time stamps
+// are on unless the kernel settings say otherwise, and four files of 1 MB are
+// kept besides the current one.
+static size_t sLogMaxSize = 1048576;	// 1 MB
+static int32 sMaxHistory = 4;
+static bool sLogTimeStamps = true;
 
 
 /*!	Creates the log file if not yet existing, or renames the old
@@ -133,10 +138,13 @@ syslog_output(syslog_message &message)
 	int32 headerLength;
 	int32 pos = 0;
 
-	if (sLogTimeStamps && message.when > 0) {
-		// parse & nicely print the time stamp from the message
+	if (sLogTimeStamps) {
+		// parse & nicely print the time stamp from the message; the
+		// kernel's messages have none (-1): they are stamped when they
+		// arrive, which is within the kernel's batching of them
+		time_t stamp = message.when > 0 ? message.when : time(NULL);
 		struct tm when;
-		localtime_r(&message.when, &when);
+		localtime_r(&stamp, &when);
 		pos = strftime(header, sizeof(header), "%Y-%m-%d %H:%M:%S ", &when);
 	}
 
@@ -226,8 +234,9 @@ init_syslog_output(SyslogDaemon *daemon)
 	handle = load_driver_settings("kernel");
 	if (handle != NULL) {
 		sLogTimeStamps = get_driver_boolean_parameter(handle,
-			"syslog_time_stamps", false, false);
-		const char *param = get_driver_parameter(handle, "syslog_max_history", "1", "1");
+			"syslog_time_stamps", sLogTimeStamps, true);
+		const char *param = get_driver_parameter(handle, "syslog_max_history",
+			"4", "4");
 		sMaxHistory = strtol(param, NULL, 0);
 		if (sMaxHistory < 0)
 			sMaxHistory = 0;

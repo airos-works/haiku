@@ -30,12 +30,15 @@
 #include <syslog.h>
 
 #include <algorithm>
+#include <map>
 #include <set>
 #include <string>
 
 #include <fuse.h>
 
+#include <ctype.h>
 #include <fs_info.h>
+#include <MimeType.h>
 #include <OS.h>
 
 #include <smb2/smb2.h>
@@ -1005,20 +1008,95 @@ smbfs_fsync(const char* path, int dataOnly, struct fuse_file_info* info)
 }
 
 
+/*!	The MIME type of a regular file at \a path, by the extension of its name
+	alone, or an empty string when there is none to tell. The share cannot
+	store attributes, and since the volume says it knows MIME types, Tracker
+	takes what BEOS:TYPE says and does not read each file over the network to
+	sniff it. The registrar's answers are kept per extension.
+*/
+static std::string
+mime_type_for(const char* path)
+{
+	const char* name = strrchr(path, '/');
+	name = name != NULL ? name + 1 : path;
+	const char* dot = strrchr(name, '.');
+	if (dot == NULL || dot == name || dot[1] == '\0')
+		return std::string();
+
+	struct stat st;
+	if (stat_path(server_path(path), &st) != 0 || !S_ISREG(st.st_mode))
+		return std::string();
+
+	std::string extension(dot + 1);
+	std::transform(extension.begin(), extension.end(), extension.begin(),
+		[](unsigned char c) { return (char)tolower(c); });
+
+	static pthread_mutex_t sLock = PTHREAD_MUTEX_INITIALIZER;
+	static std::map<std::string, std::string> sTypes;
+
+	pthread_mutex_lock(&sLock);
+	std::map<std::string, std::string>::const_iterator found
+		= sTypes.find(extension);
+	if (found != sTypes.end()) {
+		std::string type = found->second;
+		pthread_mutex_unlock(&sLock);
+		return type;
+	}
+	pthread_mutex_unlock(&sLock);
+
+	BMimeType guessed;
+	std::string fileName = "file." + extension;
+	if (BMimeType::GuessMimeType(fileName.c_str(), &guessed) != B_OK) {
+		// the registrar may not be there yet: don't remember that
+		return std::string();
+	}
+
+	std::string type;
+	if (guessed.Type() != NULL && strcmp(guessed.Type(), B_FILE_MIME_TYPE) != 0)
+		type = guessed.Type();
+
+	pthread_mutex_lock(&sLock);
+	sTypes[extension] = type;
+	pthread_mutex_unlock(&sLock);
+	return type;
+}
+
+
 static int
 smbfs_getxattr(const char* path, const char* name, char* value, size_t size)
 {
-	// There are none. Being asked is what makes the FUSE layer find the MIME
-	// type in the file's name, so that Tracker does not read each file to
-	// tell what it is.
-	return B_ENTRY_NOT_FOUND;
+	// The only attribute is the MIME type, from the file's name.
+	if (strcmp(name, "BEOS:TYPE") != 0)
+		return B_ENTRY_NOT_FOUND;
+
+	std::string type = mime_type_for(path);
+	if (type.empty())
+		return B_ENTRY_NOT_FOUND;
+
+	// with its terminating null, as BEOS:TYPE is stored elsewhere
+	size_t length = type.length() + 1;
+	if (value == NULL || size == 0)
+		return (int)length;
+	if (size < length)
+		return B_BUFFER_OVERFLOW;
+	memcpy(value, type.c_str(), length);
+	return (int)length;
 }
 
 
 static int
 smbfs_listxattr(const char* path, char* list, size_t size)
 {
-	return 0;
+	static const char kTypeAttribute[] = "BEOS:TYPE";
+	if (mime_type_for(path).empty())
+		return 0;
+
+	if (list == NULL || size == 0)
+		return (int)sizeof(kTypeAttribute);
+	if (size < sizeof(kTypeAttribute))
+		return B_BUFFER_OVERFLOW;
+	memcpy(list, kTypeAttribute, sizeof(kTypeAttribute));
+	return (int)sizeof(kTypeAttribute);
 }
 
 

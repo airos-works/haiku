@@ -215,6 +215,8 @@ public:
 	static	int					Dump(int argc, char** argv);
 
 private:
+			void				_UndoOpen(int openMode);
+
 			timespec			fCreationTime;
 			timespec			fModificationTime;
 
@@ -803,8 +805,10 @@ Inode::Open(int openMode)
 
 	bool shouldWait = false;
 	if ((openMode & O_ACCMODE) == O_WRONLY && fReaderCount == 0) {
-		if ((openMode & O_NONBLOCK) != 0)
+		if ((openMode & O_NONBLOCK) != 0) {
+			_UndoOpen(openMode);
 			return ENXIO;
+		}
 		shouldWait = true;
 	}
 	if ((openMode & O_ACCMODE) == O_RDONLY && fWriterCount == 0
@@ -817,9 +821,11 @@ Inode::Open(int openMode)
 		fActiveCondition.Add(&waitEntry);
 		locker.Unlock();
 		status_t status = waitEntry.Wait(B_CAN_INTERRUPT);
-		if (status != B_OK)
-			return status;
 		locker.Lock();
+		if (status != B_OK) {
+			_UndoOpen(openMode);
+			return status;
+		}
 	}
 
 	if (fReaderCount > 0 && fWriterCount > 0) {
@@ -833,6 +839,29 @@ Inode::Open(int openMode)
 		fActiveCondition.NotifyAll();
 	}
 	return B_OK;
+}
+
+
+/*!	Takes back the reader/writer counts a failed Open() added, as Close()
+	does for an open that succeeded. The change lock must be held.
+*/
+void
+Inode::_UndoOpen(int openMode)
+{
+	if ((openMode & O_ACCMODE) == O_WRONLY || (openMode & O_ACCMODE) == O_RDWR) {
+		if (--fWriterCount == 0 && fActive)
+			NotifyEndClosed(true);
+	}
+
+	if ((openMode & O_ACCMODE) == O_RDONLY || (openMode & O_ACCMODE) == O_RDWR) {
+		if (--fReaderCount == 0 && fActive)
+			NotifyEndClosed(false);
+	}
+
+	if (fReaderCount == 0 && fWriterCount == 0) {
+		fActive = false;
+		fBuffer.DeleteBuffer();
+	}
 }
 
 
