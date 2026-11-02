@@ -59,7 +59,9 @@ HIDDevice::HIDDevice(const uint8* descriptor, size_t descriptorLength,
 	fOutput(NULL),
 	fOutputHead(0),
 	fOutputCount(0),
-	fDropped(0)
+	fDropped(0),
+	fVendorID(0),
+	fProductID(0)
 {
 	strlcpy(fName, name, sizeof(fName));
 	mutex_init(&fLock, "bluetooth hid device");

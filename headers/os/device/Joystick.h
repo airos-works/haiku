@@ -77,6 +77,28 @@ public:
 			status_t		GetButtonNameAt(int32 index,
 								BString* outName);
 
+			status_t		GetDeviceIDs(uint16* outVendorID,
+								uint16* outProductID);
+								// Haiku extension. The USB or Bluetooth
+								// vendor and product IDs of the open device,
+								// 0 where the transport has none.
+
+			bool			HasRumble();
+			bool			HasTriggerRumble();
+			status_t		SetRumble(uint16 strongMagnitude,
+								uint16 weakMagnitude, bigtime_t duration,
+								uint16 leftTriggerMagnitude = 0,
+								uint16 rightTriggerMagnitude = 0);
+								// Haiku extension. Runs the force feedback
+								// motors of an open game pad: the magnitudes
+								// go from 0 (off) to 65535 (full), strong is
+								// the low frequency (left) motor, weak the
+								// high frequency (right) one; the trigger
+								// motors exist where HasTriggerRumble() says
+								// so. Replaces the running effect; a duration
+								// of 0 stops it, B_INFINITE_TIMEOUT keeps it
+								// up until the next call or Close().
+
 			status_t		GetControllerModule(BString* outName);
 			status_t		GetControllerName(BString* outName);
 

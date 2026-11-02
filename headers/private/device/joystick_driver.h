@@ -101,7 +101,9 @@ typedef struct _variable_joystick {
 enum {	/* flags for joystick module info */
 	js_flag_force_feedback = 0x1,
 	js_flag_force_feedback_directional = 0x2,
-	js_flag_variable_size_reads = 0x4
+	js_flag_variable_size_reads = 0x4,
+	js_flag_trigger_rumble = 0x8
+		/* set by the driver: B_JOYSTICK_SET_RUMBLE drives trigger motors */
 };
 
 typedef struct _joystick_module_info {
@@ -146,8 +148,33 @@ enum { /* Joystick driver ioctl() opcodes */
     B_JOYSTICK_SET_MAX_LATENCY,             /* arg -> ptr to long long */
     B_JOYSTICK_SET_DEVICE_MODULE,			/* arg -> ptr to joystick_module; also enters enhanced mode */
     B_JOYSTICK_GET_DEVICE_MODULE,           /* arg -> ptr to joystick_module */
-	B_JOYSTICK_SET_RAW_MODE					/* arg -> ptr to bool (true or false) */
+	B_JOYSTICK_SET_RAW_MODE,				/* arg -> ptr to bool (true or false) */
+	B_JOYSTICK_SET_RUMBLE,					/* arg -> ptr to joystick_rumble */
+	B_JOYSTICK_GET_DEVICE_INFO				/* arg -> ptr to joystick_device_info */
 };
+
+/* Who made the device, for applications that map controls per model (the
+   web Gamepad API's "standard" mapping). 0 when the transport doesn't tell. */
+typedef struct _joystick_device_info {
+	uint16		vendor_id;
+	uint16		product_id;
+	uint32		_reserved[7];
+} joystick_device_info;
+
+/* Rumble (dual motor force feedback), as the web Gamepad API's
+   "dual-rumble" and "trigger-rumble" effects need it. Drivers that support it
+   set js_flag_force_feedback (and js_flag_trigger_rumble for trigger motors)
+   in the module info they return. The magnitudes are 0 (off) to 65535 (full
+   strength). A new call replaces the running effect; a duration of 0, or all
+   magnitudes 0, stops it; B_INFINITE_TIMEOUT keeps it running until the next
+   call or until the device is closed. */
+typedef struct _joystick_rumble {
+	uint16		strong_magnitude;		/* low frequency (left, heavy) motor */
+	uint16		weak_magnitude;			/* high frequency (right, light) motor */
+	uint16		left_trigger_magnitude;	/* trigger motors (Xbox One/Series), */
+	uint16		right_trigger_magnitude;	/* ignored by pads without them */
+	bigtime_t	duration;				/* in microseconds */
+} joystick_rumble;
 
 /* Speed compensation is not generally necessary, because the joystick */
 /* driver is measuring using real time, not just # cycles. "0" means the */

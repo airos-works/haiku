@@ -41,6 +41,14 @@ public:
 			status_t				MaybeScheduleTransfer(HIDReport* report);
 			status_t				SendReport(HIDReport* report);
 			HIDParser&				Parser() { return fParser; }
+
+	// Vendor and product, rumble for the joystick protocol handler: none on
+	// this transport.
+			uint16				VendorID() const { return 0; }
+			uint16				ProductID() const { return 0; }
+			uint32				RumbleFlags() const { return 0; }
+			status_t			SetRumble(uint16, uint16, uint16, uint16)
+									{ return B_NOT_SUPPORTED; }
 			ProtocolHandler*		ProtocolHandlerAt(uint32 index) const;
 
 private:

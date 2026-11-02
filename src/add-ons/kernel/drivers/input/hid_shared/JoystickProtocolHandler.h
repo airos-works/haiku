@@ -42,6 +42,10 @@ private:
 	static	int32					_UpdateThread(void *data);
 			status_t				_Update();
 
+			status_t				_SetRumble(const joystick_rumble &rumble);
+			void					_StopRumble();
+	static	status_t				_RumbleThread(void *data);
+
 			HIDReport &				fReport;
 
 			uint32					fAxisCount;
@@ -58,6 +62,13 @@ private:
 			uint32					fOpenCount;
 			mutex					fUpdateLock;
 			thread_id				fUpdateThread;
+
+			mutex					fRumbleLock;
+			sem_id					fRumbleSem;
+			thread_id				fRumbleThread;
+			bigtime_t				fRumbleEnd;
+				// when to stop the motors, B_INFINITE_TIMEOUT for never
+			bool					fRumbling;
 };
 
 #endif // USB_JOYSTICK_PROTOCOL_HANDLER_H
