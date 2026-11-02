@@ -160,8 +160,10 @@ The newest release of every major, 2026-11-02. "Port" builds were made with
 the 16, 18, 20, 21 and 23 binaries are the 2026-09-27 builds from the
 earlier per-major patches (the same edits; port-haiku.py made those
 patches), which are already the last releases of their majors. Verified on
-the X399 (air/OS hrev60207+2114) with `verify-major.sh` through nvm from a
-copy of the mirror: all PASS; `verify-nvm-features.sh`: all PASS.
+the X399 (air/OS hrev60207+2114) with `verify-major.sh` through nvm, first
+from a copy of the mirror and then, once published (2026-11-03), from the
+GitHub mirror with nvm's defaults and a fresh NVM_DIR: all 17 PASS;
+`verify-nvm-features.sh`: all PASS.
 
 | Major | Version | V8 | npm | OpenSSL | Built by |
 |---|---|---|---|---|---|
