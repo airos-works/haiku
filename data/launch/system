@@ -80,6 +80,14 @@ service x-vnd.Haiku-notification_server {
 	on_demand
 }
 
+# air/OS: started when an assistive technology (the screen reader) subscribes;
+# it quits again once the last one has left (docs/airos/ACCESSIBILITY.md)
+service x-vnd.Haiku-accessibility_server {
+	launch /system/servers/accessibility_server
+	no_safemode
+	on_demand
+}
+
 service x-vnd.Haiku-osd_server {
 	launch /system/servers/osd_server
 	no_safemode
