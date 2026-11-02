@@ -13,3 +13,6 @@
 user_block_thread_test
 # the same through libroot's rw_lock (BLooperList's lock)
 rw_lock_signal_test
+# a device behind a full speed hub (QEMU usb-hub) enumerates: xHCI built its
+# route string from the transaction translator's port
+usb_hub_child_test
