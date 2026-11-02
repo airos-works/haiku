@@ -15,6 +15,7 @@
 #include <netinet6/in6.h>
 
 class AutoconfigClient;
+class BMessageRunner;
 
 class AutoconfigLooper : public BLooper {
 public:
@@ -32,10 +33,12 @@ private:
 			void				_ConfigureIPv4Failed();
 			void				_ReadyToRun();
 			void				_NetworkMonitorNotification(BMessage* message);
+			void				_CheckConfiguration();
 
 			BMessenger			fTarget;
 			BString				fDevice;
 			AutoconfigClient*	fCurrentClient;
+			BMessageRunner*		fCheckRunner;
 			int32				fLastMediaStatus;
 			bool				fJoiningNetwork;
 };

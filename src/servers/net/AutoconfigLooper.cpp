@@ -18,6 +18,7 @@
 #include <sys/socket.h>
 #include <sys/sockio.h>
 
+#include <MessageRunner.h>
 #include <NetworkInterface.h>
 #include <NetworkNotifications.h>
 
@@ -26,6 +27,10 @@
 
 
 static const uint32 kMsgReadyToRun = 'rdyr';
+static const uint32 kMsgCheckConfiguration = 'ckcf';
+
+static const bigtime_t kCheckConfigurationInterval = 10000000LL;
+	// how often the lease's address and default route are verified
 
 
 AutoconfigLooper::AutoconfigLooper(BMessenger target, const char* device)
@@ -33,6 +38,7 @@ AutoconfigLooper::AutoconfigLooper(BMessenger target, const char* device)
 	fTarget(target),
 	fDevice(device),
 	fCurrentClient(NULL),
+	fCheckRunner(NULL),
 	fLastMediaStatus(0),
 	fJoiningNetwork(false)
 {
@@ -43,6 +49,7 @@ AutoconfigLooper::AutoconfigLooper(BMessenger target, const char* device)
 
 AutoconfigLooper::~AutoconfigLooper()
 {
+	delete fCheckRunner;
 	_RemoveClient();
 }
 
@@ -133,8 +140,12 @@ AutoconfigLooper::_ConfigureIPv4Failed()
 void
 AutoconfigLooper::_ReadyToRun()
 {
-	start_watching_network(
-		B_WATCH_NETWORK_LINK_CHANGES | B_WATCH_NETWORK_WLAN_CHANGES, this);
+	start_watching_network(B_WATCH_NETWORK_INTERFACE_CHANGES
+		| B_WATCH_NETWORK_LINK_CHANGES | B_WATCH_NETWORK_WLAN_CHANGES, this);
+
+	BMessage check(kMsgCheckConfiguration);
+	fCheckRunner = new BMessageRunner(this, &check,
+		kCheckConfigurationInterval);
 
 	BNetworkInterface interface(fDevice.String());
 	if (interface.HasLink()) {
@@ -167,20 +178,48 @@ AutoconfigLooper::_NetworkMonitorNotification(BMessage* message)
 		// Note that the wpa_supplicant does the same workaround as we do here
 		// to build an interface name, so that has to be changed as well when
 		// this is fixed.
-		device.Prepend("/dev/");
+		// Interfaces of devices in /dev use the full path as their name.
+		if (!device.StartsWith("/"))
+			device.Prepend("/dev/");
 	}
 
 	if (device != fDevice || message->FindInt32("opcode", &opcode) != B_OK)
 		return;
 
 	switch (opcode) {
+		case B_NETWORK_INTERFACE_CHANGED:
+		{
+			int32 oldFlags;
+			int32 newFlags;
+			if (message->FindInt32("old flags", &oldFlags) != B_OK
+				|| message->FindInt32("new flags", &newFlags) != B_OK
+				|| (oldFlags & IFF_UP) != 0 || (newFlags & IFF_UP) == 0)
+				break;
+
+			// The interface was taken down and up again (ifconfig, the
+			// Network preferences, a device reopened): that deleted all of
+			// its routes, including the lease's default route.
+			if (fCurrentClient != NULL)
+				_CheckConfiguration();
+			else if ((fLastMediaStatus & IFM_ACTIVE) != 0
+				&& BNetworkInterface(fDevice.String()).HasLink())
+				_ConfigureIPv4();
+			break;
+		}
+
 		case B_NETWORK_DEVICE_LINK_CHANGED:
 		{
 			int32 media;
 			if (message->FindInt32("media", &media) != B_OK)
 				break;
 
-			if ((fLastMediaStatus & IFM_ACTIVE) == 0 && (media & IFM_ACTIVE) != 0) {
+			if ((fLastMediaStatus & IFM_ACTIVE) != 0
+				&& (media & IFM_ACTIVE) != 0) {
+				// Still (or again, without us seeing it go) linked: make
+				// sure the lease is still in place.
+				_CheckConfiguration();
+			} else if ((fLastMediaStatus & IFM_ACTIVE) == 0
+				&& (media & IFM_ACTIVE) != 0) {
 				// Reconfigure the interface when we have a link again
 				_ConfigureIPv4();
 				//_ConfigureIPv6();	// TODO: router advertisement and dhcpv6
@@ -219,6 +258,14 @@ AutoconfigLooper::_NetworkMonitorNotification(BMessage* message)
 
 
 void
+AutoconfigLooper::_CheckConfiguration()
+{
+	if (fCurrentClient != NULL)
+		fCurrentClient->CheckConfiguration();
+}
+
+
+void
 AutoconfigLooper::MessageReceived(BMessage* message)
 {
 	switch (message->what) {
@@ -228,6 +275,10 @@ AutoconfigLooper::MessageReceived(BMessage* message)
 
 		case kMsgAutoConfigureFailed:
 			_ConfigureIPv4Failed();
+			break;
+
+		case kMsgCheckConfiguration:
+			_CheckConfiguration();
 			break;
 
 		case B_NETWORK_MONITOR:

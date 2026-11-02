@@ -23,6 +23,10 @@ public:
 	virtual	status_t			Start();
 	virtual	void				KeepLease() {}
 									// the link went: the address stays ours
+	virtual	void				CheckConfiguration() {}
+									// makes sure the interface still has
+									// what the lease configured (address,
+									// default route) and restores it if not
 
 			const BMessenger&	Target() const { return fTarget; }
 			const char*			Device() const { return fDevice.String(); }
