@@ -33,6 +33,21 @@
 static const uint32 kMaxNodeTreeDepth = 1024;
 
 
+/*!	Turns what a FUSE file system's getxattr()/listxattr() returned into a
+	size or an error. Errors are negative status codes, but a file system
+	written for Linux returns -errno, which is positive with Haiku's negative
+	error numbers: no attribute is anywhere near a gigabyte, so such a value
+	is taken as a negated error.
+*/
+static int
+fuse_xattr_result(int result)
+{
+	if (result > (1 << 30))
+		return -result;
+	return result;
+}
+
+
 struct FUSEVolume::DirEntryCache {
 	DirEntryCache()
 		:
@@ -315,7 +330,9 @@ public:
 
 	status_t Allocate(size_t size)
 	{
-		fValue = (char*)malloc(size);
+		// one byte more, always null, so that Read() can treat the value as
+		// a string, also when it is empty or not terminated
+		fValue = (char*)calloc(1, size + 1);
 		if (fValue == NULL) {
 			fSize = 0;
 			return B_NO_MEMORY;
@@ -327,20 +344,29 @@ public:
 	void Read(void* buffer, size_t bufferSize, off_t pos,
 		size_t* bytesRead) const
 	{
-		if (pos < 0 || (uint64)pos > SIZE_MAX || (size_t)pos > fSize - 1) {
+		if (pos < 0 || (uint64)pos >= fSize) {
 			*bytesRead = 0;
 			return;
 		}
 		size_t copySize = fSize - pos;
 		if (copySize > bufferSize)
 			copySize = bufferSize;
-		strlcpy((char*)buffer, &fValue[pos], bufferSize);
+		// not strlcpy(): a raw attribute may contain null bytes
+		memcpy(buffer, &fValue[pos], copySize);
 		*bytesRead = copySize;
 	}
 
 	char* Buffer()
 	{
 		return fValue;
+	}
+
+	void SetSize(size_t size)
+	{
+		if (size < fSize) {
+			fSize = size;
+			fValue[size] = '\0';
+		}
 	}
 
 	size_t Size() const
@@ -2425,6 +2451,7 @@ FUSEVolume::ReadAttrDir(void* _node, void* _cookie, void* buffer,
 		else
 			listSize = fuse_fs_listxattr(fFS, path, NULL, 0);
 
+		listSize = fuse_xattr_result(listSize);
 		if (listSize < 0)
 			RETURN_ERROR(listSize);
 
@@ -2441,6 +2468,7 @@ FUSEVolume::ReadAttrDir(void* _node, void* _cookie, void* buffer,
 					listSize);
 			} else
 				bytesRead = fuse_fs_listxattr(fFS, path, cookie->AttributesBuffer(), listSize);
+			bytesRead = fuse_xattr_result(bytesRead);
 			if (bytesRead < 0)
 				RETURN_ERROR(bytesRead);
 
@@ -2522,6 +2550,12 @@ FUSEVolume::OpenAttr(void* _node, const char* name, int openMode,
 		attrSize = fuse_fs_getxattr(fFS, path, name, NULL, 0);
 	}
 
+	// A failed size query (no such attribute, for example) is the answer:
+	// allocating it as a size failed with B_NO_MEMORY instead.
+	attrSize = fuse_xattr_result(attrSize);
+	if (attrSize < 0)
+		return attrSize;
+
 	AttrCookie* cookie = new(std::nothrow)AttrCookie(name);
 	if (cookie == NULL)
 		RETURN_ERROR(B_NO_MEMORY);
@@ -2537,9 +2571,14 @@ FUSEVolume::OpenAttr(void* _node, const char* name, int openMode,
 	else
 		bytesRead = fuse_fs_getxattr(fFS, path, name, cookie->Buffer(), attrSize);
 
+	bytesRead = fuse_xattr_result(bytesRead);
 	if (bytesRead < 0) {
 		delete cookie;
 		return bytesRead;
+	}
+	if (bytesRead < attrSize) {
+		// the value got shorter in between
+		cookie->SetSize(bytesRead);
 	}
 
 	*_cookie = cookie;
