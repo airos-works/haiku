@@ -34,8 +34,10 @@ target desktop {
 
 	# air/OS: the screen reader, when "autostart true" is set in
 	# ~/config/settings/ScreenReader (docs/airos/ACCESSIBILITY.md);
-	# Option+Command+S turns it on and off at any time
-	job x-vnd.Haiku-ScreenReader {
+	# Option+Command+S turns it on and off at any time. Not named after the
+	# signature: while its condition is unmet, a job with the app's name
+	# would hold every BMessenger(signature) lookup forever.
+	job screen-reader-autostart {
 		launch /system/apps/ScreenReader
 		if setting ~/config/settings/ScreenReader autostart true
 		on initial_volumes_mounted

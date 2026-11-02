@@ -27,6 +27,7 @@
 #include <Window.h>
 
 #include <binary_compatibility/Interface.h>
+#include <AccessibilityPrivate.h>
 
 
 #define USE_OFF_SCREEN_VIEW 0
@@ -1503,6 +1504,8 @@ BSlider::MaxUpdateTextWidth()
 {
 	// very simplistic implementation that assumes the string will be widest
 	// at the maximum value
+	BPrivate::AccessibilityMuter muter;
+		// the value only changes to measure the text
 	int32 value = Value();
 	SetValueNoUpdate(fMaxValue);
 	float width = StringWidth(UpdateText());

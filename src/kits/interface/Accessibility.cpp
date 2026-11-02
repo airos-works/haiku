@@ -76,6 +76,7 @@ namespace BPrivate {
 
 bool gAccessibilityEnabled = false;
 bool gAccessibilityViewData = false;
+__thread int32 gAccessibilityMuted = 0;
 
 }	// namespace BPrivate
 
@@ -1233,6 +1234,9 @@ has_focus(BView* view)
 static void
 send_event(BMessage& event)
 {
+	if (BPrivate::gAccessibilityMuted > 0)
+		return;
+
 	BMessenger server;
 	{
 		BAutolock locker(sRegistryLock);
@@ -1680,6 +1684,10 @@ accessibility_menu_item_selected(BMenu* menu, BMenuItem* item)
 {
 	if (menu == NULL || item == NULL || menu->Window() == NULL)
 		return;
+	if (dynamic_cast<BMenuField*>(menu->Parent()) != NULL) {
+		// the menu bar inside a BMenuField: the field already is the focus
+		return;
+	}
 
 	int32 index = menu->IndexOf(item);
 	if (index < 0)

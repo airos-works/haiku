@@ -87,10 +87,14 @@ AccessibilityKeysFilter::Filter(BMessage* message, BList* _list)
 			return B_DISPATCH_MESSAGE;
 	}
 
-	if (!be_roster->IsRunning(B_SCREEN_READER_SIGNATURE))
+	// Only ask the registrar: BMessenger(signature) would also ask the
+	// launch_daemon, which never answers while a job of that name waits for
+	// its condition, and this thread delivers all input.
+	app_info info;
+	if (be_roster->GetAppInfo(B_SCREEN_READER_SIGNATURE, &info) != B_OK)
 		return B_DISPATCH_MESSAGE;
 
-	BMessenger reader(B_SCREEN_READER_SIGNATURE);
+	BMessenger reader(NULL, info.team);
 	BMessage request(command);
 	reader.SendMessage(&request, (BHandler*)NULL, 0);
 	return B_SKIP_MESSAGE;
@@ -100,8 +104,9 @@ AccessibilityKeysFilter::Filter(BMessage* message, BList* _list)
 /*static*/ status_t
 AccessibilityKeysFilter::_Toggle(void*)
 {
-	if (be_roster->IsRunning(B_SCREEN_READER_SIGNATURE)) {
-		BMessenger reader(B_SCREEN_READER_SIGNATURE);
+	app_info info;
+	if (be_roster->GetAppInfo(B_SCREEN_READER_SIGNATURE, &info) == B_OK) {
+		BMessenger reader(NULL, info.team);
 		reader.SendMessage(B_QUIT_REQUESTED);
 	} else
 		be_roster->Launch(B_SCREEN_READER_SIGNATURE);

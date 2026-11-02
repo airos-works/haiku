@@ -32,6 +32,18 @@ extern bool gAccessibilityEnabled;
 	// the accessibility_server has a client; events are wanted
 extern bool gAccessibilityViewData;
 	// some view has a registered ID, custom name or attached tree
+extern __thread int32 gAccessibilityMuted;
+	// events of this thread are not sent (see AccessibilityMuter)
+
+
+/*!	Mutes the events of the calling thread while it exists, for code that
+	changes a value only temporarily (BSlider::MaxUpdateTextWidth()).
+*/
+class AccessibilityMuter {
+public:
+	AccessibilityMuter() { gAccessibilityMuted++; }
+	~AccessibilityMuter() { gAccessibilityMuted--; }
+};
 
 
 // app kit

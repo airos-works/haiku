@@ -307,6 +307,21 @@ Start the screen reader with Option+Command+S, move with Tab in
 `AccessibilityTestApp` or a preferences window, and compare the captions or
 `grep 'ScreenReader: say' /var/log/syslog` with what has the focus.
 
+## Traps
+
+- Never look up the screen reader or the speech server with
+  `BMessenger(signature)` from a thread that must not block: it asks the
+  launch_daemon first, and the launch_daemon holds the request forever while
+  a *job* of that name waits for an unmet condition. That is why the
+  autostart job is called `screen-reader-autostart`, why `accessibility_keys`
+  asks only the registrar (`GetAppInfo()` + `BMessenger(NULL, team)`), and
+  why the speech_server is only looked up that way when launch_daemon
+  reports an enabled *service* for it. (Found when the input_server's event
+  thread hung on the first review key.)
+- `BSlider::MaxUpdateTextWidth()` sets the value to the maximum to measure
+  the text; it mutes events with `BPrivate::AccessibilityMuter`. Other code
+  that changes a value only temporarily needs the same.
+
 ## Missing in this version
 
 - Braille output, a full review cursor (moving through the tree or the text
@@ -315,6 +330,10 @@ Start the screen reader with Option+Command+S, move with Tab in
   speech (role names are English), a preferences panel (settings file and
   keys only).
 - Web content until Summit implements its side (above).
+- List items that are not `BStringItem`s have no text (Network's interface
+  list reads "tree, 1 of 9", its items "Item 2, tree item, 2 of 9"); such
+  lists need a `BAccessible` or a text-providing item class. Unnamed views
+  (Network's list, a bare menu bar) have no name.
 - `BColumnListView` rows, `BOutlineListView` subtrees of collapsed items,
   closed submenus, Tracker's file views and Deskbar replicants are not
   described; custom-drawn views without `BAccessible` are "unknown".

@@ -100,6 +100,7 @@ private:
 			int64				fWindowID;
 			BString				fWindowTitle;
 			int64				fFocusID;
+			bigtime_t			fStartTime;
 			bigtime_t			fWindowTime;
 			bigtime_t			fFocusTime;
 			bigtime_t			fTextTime;
@@ -120,6 +121,7 @@ ScreenReader::ScreenReader()
 	fTeam(-1),
 	fWindowID(0),
 	fFocusID(0),
+	fStartTime(0),
 	fWindowTime(0),
 	fFocusTime(0),
 	fTextTime(0),
@@ -139,6 +141,7 @@ void
 ScreenReader::ReadyToRun()
 {
 	_LoadSettings();
+	fStartTime = system_time();
 
 	fSpeech = new SpeechOutput(fEngine.String(), fRate);
 	syslog(LOG_INFO, "ScreenReader: speech engine: %s",
@@ -468,7 +471,8 @@ ScreenReader::_HandleEvent(BMessage* event)
 				text << ". " << _Describe(node);
 			} else
 				fFocusID = 0;
-			_Say(text, true);
+			// don't cut off "Screen reader on"
+			_Say(text, now - fStartTime > 1500000);
 			break;
 		}
 
@@ -478,9 +482,9 @@ ScreenReader::_HandleEvent(BMessage* event)
 				break;
 			int64 id = node.GetInt64(B_ACCESSIBLE_FIELD_ID, 0);
 			bool menu = event->GetBool("menu", false);
-			if (team == fTeam && id == fFocusID && !menu
-				&& now - fWindowTime < kSettleTime) {
-				// already said with the window
+			if (team == fTeam && id == fFocusID && !menu) {
+				// already said (with the window, or a part of the same
+				// control took the focus)
 				break;
 			}
 			if (!menu && hasWindow && team == fTeam) {

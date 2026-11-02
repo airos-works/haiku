@@ -14,7 +14,9 @@
 
 #include <Autolock.h>
 #include <Message.h>
+#include <LaunchRoster.h>
 #include <Path.h>
+#include <Roster.h>
 
 #include <AccessibilityProtocol.h>
 
@@ -145,8 +147,19 @@ SpeechOutput::_Detect(const char* engine)
 	}
 
 	if (wanted.IsEmpty() || wanted == "auto" || wanted == "speech_server") {
-		BMessenger server(B_SPEECH_SERVER_SIGNATURE);
-			// launch_daemon starts it if it is an on-demand service
+		// Ask the launch_daemon only for a service: BMessenger(signature)
+		// waits forever for a plain job that is not launched.
+		BMessenger server;
+		app_info info;
+		BMessage job;
+		if (be_roster->GetAppInfo(B_SPEECH_SERVER_SIGNATURE, &info) == B_OK)
+			server = BMessenger(NULL, info.team);
+		else if (BLaunchRoster().GetJobInfo("x-vnd.Haiku-speech_server", job)
+				== B_OK && job.GetBool("service", false)
+				&& job.GetBool("enabled", false)) {
+			server = BMessenger(B_SPEECH_SERVER_SIGNATURE);
+				// launch_daemon starts the on-demand service
+		}
 		if (server.IsValid()) {
 			fServer = server;
 			fEngine = kEngineServer;
