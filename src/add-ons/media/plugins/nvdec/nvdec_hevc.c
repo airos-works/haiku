@@ -727,8 +727,21 @@ clipDiff(int value)
 	return (int8_t)(value < -128 ? -128 : (value > 127 ? 127 : value));
 }
 
-bool
-nvdecHevcDecode(NvdecHevc *decoder, const uint8_t *data, size_t size, int64_t time)
+static void
+traceSkipped(const HevcSlice *slice, const char *why)
+{
+	if (getenv("NVDEC_TRACE") == NULL)
+		return;
+	fprintf(stderr, "  -: nal %2d poc lsb %4d not decoded: %s\n", slice->nalType,
+		slice->pocLsb, why);
+}
+
+/* Decodes the picture of one access unit. An end of sequence unit after the
+ * picture's slices ends the sequence after it, so it is only reported in
+ * *endOfSequence: the picture before it is still decoded and shown. */
+static bool
+decodeAccessUnit(NvdecHevc *decoder, const uint8_t *data, size_t size,
+	int64_t time, bool *endOfSequence)
 {
 	Nal *nals = decoder->nals;
 	size_t nalCount = findNals(data, size, nals, MAX_SLICES);
@@ -757,7 +770,13 @@ nvdecHevcDecode(NvdecHevc *decoder, const uint8_t *data, size_t size, int64_t ti
 					decoder->sets->pps[pps.id] = pps;
 			}
 		} else if (type == HEVC_NAL_EOS || type == HEVC_NAL_EOB) {
-			decoder->firstPicture = true;
+			/* After this, the next picture starts a coded video sequence
+			 * (7.4.3.6): a CRA picture after it is handled as one that
+			 * begins the decoding (8.1.3), its RASL pictures left out. */
+			if (haveSlice)
+				*endOfSequence = true;
+			else
+				decoder->firstPicture = true;
 		} else if (hevcIsVcl(type) && type <= HEVC_NAL_CRA
 			&& (type <= 9 || type >= 16)) {
 			/* The first slice segment says what the picture is; a
@@ -799,33 +818,54 @@ nvdecHevcDecode(NvdecHevc *decoder, const uint8_t *data, size_t size, int64_t ti
 			sps->width, sps->height);
 
 	bool irap = hevcIsIrap(slice.nalType);
-	bool noRaslOutput = irap && (hevcIsIdr(slice.nalType)
-		|| hevcIsBla(slice.nalType) || decoder->firstPicture);
 	if (decoder->firstPicture && !irap) {
 		/* Nothing to refer to until the stream gives a starting point. */
+		traceSkipped(&slice, "before the first random access point");
 		return true;
 	}
-	if (irap)
-		decoder->skipRasl = noRaslOutput;
-	if (hevcIsRasl(slice.nalType) && decoder->skipRasl)
+	if (hevcIsRasl(slice.nalType) && decoder->skipRasl) {
+		/* A leading picture of the IRAP picture decoding began at (8.1.3):
+		 * it refers to pictures from before that, which this decoder never
+		 * had. Neither decoded nor shown, as libavcodec does it. */
+		traceSkipped(&slice, "RASL of the starting picture");
 		return true;
+	}
 
+	/* This starts over - the pictures gone, firstPicture set - when the
+	 * parameters of the sequence change, so whether this picture begins
+	 * the decoding is only known after it. */
 	if (!prepareForSequence(decoder, sps))
 		return false;
+	if (decoder->firstPicture && !irap) {
+		traceSkipped(&slice, "a new sequence without a random access point");
+		return true;
+	}
+	/* NoRaslOutputFlag, 8.1.3: a CRA picture that begins the decoding, or
+	 * follows an end of sequence, or begins a sequence with new parameters
+	 * (HandleCraAsBlaFlag, as for a splice), is treated like a BLA picture.
+	 * Its RASL pictures are left out until the next IRAP picture, after
+	 * which those of a CRA picture in the middle of a sequence are shown. */
+	bool noRaslOutput = irap && (hevcIsIdr(slice.nalType)
+		|| hevcIsBla(slice.nalType) || decoder->firstPicture);
+	if (irap)
+		decoder->skipRasl = noRaslOutput;
 
 	int poc = pictureOrderCount(decoder, sps, &slice, noRaslOutput);
 	if (irap && noRaslOutput) {
 		/* A new coded video sequence: what is still to be shown from the
-		 * last one goes first, unless the stream says to drop it. */
+		 * last one goes first, unless the stream says to drop it. A CRA
+		 * picture here always does (C.5.2.2, and libavcodec): one after an
+		 * end of sequence drops what was not yet chosen to be shown before
+		 * it. After a seek or at the start there is nothing to drop. */
+		bool dropPrior = slice.noOutputOfPriorPics
+			|| slice.nalType == HEVC_NAL_CRA;
 		decoder->sequence++;
 		for (int i = 0; i < MAX_SURFACES; i++) {
 			Picture *picture = &decoder->dpb[i];
 			picture->shortTerm = false;
 			picture->longTerm = false;
-			if (slice.noOutputOfPriorPics && !decoder->firstPicture
-				&& !picture->bumped) {
+			if (dropPrior && !picture->bumped)
 				picture->neededForOutput = false;
-			}
 		}
 		while (bumpOne(decoder))
 			;
@@ -1181,4 +1221,15 @@ nvdecHevcDecode(NvdecHevc *decoder, const uint8_t *data, size_t size, int64_t ti
 			status->error_status, decoder->pictureCount - 1);
 	}
 	return true;
+}
+
+
+bool
+nvdecHevcDecode(NvdecHevc *decoder, const uint8_t *data, size_t size, int64_t time)
+{
+	bool endOfSequence = false;
+	bool result = decodeAccessUnit(decoder, data, size, time, &endOfSequence);
+	if (endOfSequence)
+		decoder->firstPicture = true;
+	return result;
 }
