@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <vector>
 
@@ -110,7 +111,11 @@ public:
 	uint32 LastSubmitted() const {return fSequence;}
 	bool IsDone(uint32 sequence) const;
 	// False when the work did not finish in time (the engine is lost then).
-	bool Wait(uint32 sequence, bigtime_t timeout = 2000000);
+	// spin: polls without sleeping at first, for work that is over in a few
+	// microseconds; without, sleeps between looks (long copies). Unlike the
+	// rest, it may be called without the lock (it reads the semaphore and
+	// the error notifier only), so that others submit meanwhile.
+	bool Wait(uint32 sequence, bigtime_t timeout = 2000000, bool spin = true);
 	bool WaitIdle() {return Wait(Submit());}
 
 	// Serializes callers; every public operation above expects it held.
@@ -152,7 +157,7 @@ private:
 	uint32 fGpPut = 0;
 	uint32 fSequence = 0;
 	uint32 fOperation = ~0u;
-	bool fLost = false;
+	std::atomic<bool> fLost = false;
 	const char *fStep = nullptr;
 
 	Surface fTarget;

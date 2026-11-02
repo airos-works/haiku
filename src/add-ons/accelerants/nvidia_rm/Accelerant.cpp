@@ -1251,7 +1251,7 @@ status_t NvAccelerant::CopyFrameBufferSource(uint32 from, uint32 to,
 {
 	if (!fEngine)
 		return B_UNSUPPORTED;
-	std::lock_guard<std::recursive_mutex> lock(fEngine->Lock());
+	std::unique_lock<std::recursive_mutex> lock(fEngine->Lock());
 	if (fEngine->IsLost())
 		return B_ERROR;
 	const Source *source = FindSource(from);
@@ -1262,15 +1262,35 @@ status_t NvAccelerant::CopyFrameBufferSource(uint32 from, uint32 to,
 		return B_BAD_VALUE;
 
 	clipping_rect rects[64];
+	uint64 pixels = 0;
 	while (count > 0) {
 		uint32 chunk = std::min<uint32>(count, B_COUNT_OF(rects));
-		for (uint32 i = 0; i < chunk; i++)
+		for (uint32 i = 0; i < chunk; i++) {
 			rects[i] = {list[i].left, list[i].top, list[i].right, list[i].bottom};
+			pixels += (uint64)(list[i].right - list[i].left + 1)
+				* (list[i].bottom - list[i].top + 1);
+		}
 		fEngine->Copy(source->surface, target->surface, rects, chunk);
 		list += chunk;
 		count -= chunk;
 	}
-	return fEngine->Wait(fEngine->Submit()) ? B_OK : B_ERROR;
+	uint32 sequence = fEngine->Submit();
+	// Waited for without the engine: app_server's flush copies to the screen
+	// at a blank from another thread, and is behind this copy in the
+	// channel only, not behind this thread's sleep.
+	lock.unlock();
+	// The caller waits on a thread of its own (a window's): the copy from
+	// system memory takes about 1 us per 11 KB, and polling all along for
+	// one took a tenth of that thread's time in system_time() alone.
+	bool spin = true;
+	if (source->buffer.Address() != nullptr) {
+		bigtime_t expected = (bigtime_t)(pixels * 4 / 11000);
+		if (expected > 40) {
+			snooze(expected * 3 / 4);
+			spin = false;
+		}
+	}
+	return fEngine->Wait(sequence, 2000000, spin) ? B_OK : B_ERROR;
 }
 
 const NvAccelerant::Source *NvAccelerant::FindSource(uint32 id) const

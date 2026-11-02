@@ -200,3 +200,23 @@ $TOOLS-g++ -nostdlib -o "$OUT/bin/nvclone2dtest" \
 	"$GCCLIB/crtend.o" "$OBJ/system/glue/arch/x86_64/crtn.o" \
 	-Wl,--no-undefined -Wl,-rpath-link,"$BUILD"
 echo "built nvclone2dtest into $OUT/bin"
+
+# Diagnostic tool: reads the frame buffer through a clone and checks that
+# what app_server draws reaches the screen (see FlushCheck.cpp). A GUI
+# program: its signature resource goes in with the host's rc and xres.
+TOOLDIR=$OBJDIR/nvflushcheck
+HOSTTOOLS=$BUILD/objects/linux/x86_64/release/tools
+mkdir -p "$TOOLDIR"
+$TOOLS-g++ -std=c++20 "${FLAGS[@]}" -c "$SRC/FlushCheck.cpp" -o "$TOOLDIR/FlushCheck.o"
+$TOOLS-g++ -nostdlib -o "$OUT/bin/nvflushcheck" \
+	"$OBJ/system/glue/arch/x86_64/crti.o" "$GCCLIB/crtbegin.o" \
+	"$OBJ/system/glue/start_dyn.o" "$OBJ/system/glue/init_term_dyn.o" \
+	"$TOOLDIR"/FlushCheck.o \
+	"$OBJ/system/libroot/libroot.so" "$OBJ/kits/libbe.so" \
+	"$GCC_SYSLIBS_RUNTIME/lib/libstdc++.so" \
+	"$GCC_SYSLIBS_RUNTIME/lib/libgcc_s.so" "$GCCLIB/libgcc.a" \
+	"$GCCLIB/crtend.o" "$OBJ/system/glue/arch/x86_64/crtn.o" \
+	-Wl,--no-undefined -Wl,-rpath-link,"$BUILD"
+"$HOSTTOOLS/rc/rc" -o "$TOOLDIR/FlushCheck.rsrc" "$SRC/FlushCheck.rdef"
+"$HOSTTOOLS/xres" -o "$OUT/bin/nvflushcheck" "$TOOLDIR/FlushCheck.rsrc"
+echo "built nvflushcheck into $OUT/bin"
