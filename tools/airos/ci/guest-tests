@@ -19,3 +19,6 @@ usb_hub_child_test
 # pipe() with a full FD table waited forever for a reader instead of failing
 # with EMFILE; a failed FIFO open left its writer count behind (haiku#59)
 pipe_fd_table_full_test
+# vfork() + exec while other threads allocate: a child forked while another
+# thread held a heap lock never got it (net_server's service launch hung)
+vfork_malloc_test
