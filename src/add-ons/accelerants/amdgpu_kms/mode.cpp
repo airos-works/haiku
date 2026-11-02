@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
 
 #include <edid.h>
 
@@ -498,14 +499,21 @@ apply_layout(Layout& layout, bool testOnly)
 	}
 
 	// it is on screen
+	// Renderers that copy their frames straight into the screen (Summit)
+	// take it from the driver. It is offered again with every layout, also
+	// when the buffer stayed the same, so that one refused offer does not
+	// leave them without it until the next resize (haiku#43); a refusal is
+	// worth a line in the syslog, as nothing else shows it. An older driver
+	// does not know the call (B_DEV_INVALID_IOCTL / ENOTTY).
+	status_t published = Kms::PublishScanout(fd, buffer, DRM_FORMAT_XRGB8888);
+	if (published != B_OK && published != B_DEV_INVALID_IOCTL
+		&& published != ENOTTY) {
+		syslog(LOG_WARNING, "amdgpu_kms: the %" B_PRIu32 "x%" B_PRIu32
+			" frame buffer (pitch %" B_PRIu32 ") was not offered to renderers:"
+			" %s\n", buffer.width, buffer.height, buffer.pitch,
+			strerror(published));
+	}
 	if (!reused) {
-		// Renderers that copy their frames straight into the screen (Summit)
-		// take it from the driver; an older driver does not offer that.
-		status_t published = Kms::PublishScanout(fd, buffer,
-			DRM_FORMAT_XRGB8888);
-		if (published != B_OK)
-			TRACE("frame buffer not offered to renderers: %s\n",
-				strerror(published));
 		// no copy by the GPU runs into the old one meanwhile
 		lock_device_copies();
 		Kms::DestroyBuffer(fd, gInfo->frameBuffer);
