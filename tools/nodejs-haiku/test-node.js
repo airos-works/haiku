@@ -70,7 +70,12 @@ function httpsGet(url) {
     const d = crypto.createDecipheriv('aes-256-gcm', key, iv);
     d.setAuthTag(c.getAuthTag());
     assert.strictEqual(Buffer.concat([d.update(enc), d.final()]).toString(), 'secret');
-    const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+    // PEM encodings: Node 10 has no KeyObject (11.6) and needs them.
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', {
+      namedCurve: 'P-256',
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+    });
     const sig = crypto.createSign('sha256').update('x').sign(privateKey);
     assert(crypto.createVerify('sha256').update('x').verify(publicKey, sig));
     return `sha256 ok, aes-256-gcm ok, ecdsa ok`;
