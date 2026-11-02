@@ -37,7 +37,7 @@ RWLockManager::ReadLock(RWLockable* lockable)
 {
 	AutoLocker<RWLockManager> locker(this);
 
-	if (lockable->fWaiters.IsEmpty()) {
+	if (_CanReadLock(lockable)) {
 		lockable->fReaderCount++;
 		return true;
 	}
@@ -51,7 +51,7 @@ RWLockManager::TryReadLock(RWLockable* lockable)
 {
 	AutoLocker<RWLockManager> locker(this);
 
-	if (lockable->fWaiters.IsEmpty()) {
+	if (_CanReadLock(lockable)) {
 		lockable->fReaderCount++;
 		return true;
 	}
@@ -65,7 +65,7 @@ RWLockManager::ReadLockWithTimeout(RWLockable* lockable, bigtime_t timeout)
 {
 	AutoLocker<RWLockManager> locker(this);
 
-	if (lockable->fWaiters.IsEmpty()) {
+	if (_CanReadLock(lockable)) {
 		lockable->fReaderCount++;
 		return B_OK;
 	}
@@ -101,7 +101,7 @@ RWLockManager::WriteLock(RWLockable* lockable)
 		return true;
 	}
 
-	if (lockable->fReaderCount == 0 && lockable->fWaiters.IsEmpty()) {
+	if (_CanWriteLock(lockable)) {
 		lockable->fOwnerCount = 1;
 		lockable->fOwner = find_thread(NULL);
 		return true;
@@ -123,8 +123,8 @@ RWLockManager::TryWriteLock(RWLockable* lockable)
 		return true;
 	}
 
-	if (lockable->fReaderCount == 0 && lockable->fWaiters.IsEmpty()) {
-		lockable->fOwnerCount++;
+	if (_CanWriteLock(lockable)) {
+		lockable->fOwnerCount = 1;
 		lockable->fOwner = thread;
 		return true;
 	}
@@ -145,8 +145,8 @@ RWLockManager::WriteLockWithTimeout(RWLockable* lockable, bigtime_t timeout)
 		return B_OK;
 	}
 
-	if (lockable->fReaderCount == 0 && lockable->fWaiters.IsEmpty()) {
-		lockable->fOwnerCount++;
+	if (_CanWriteLock(lockable)) {
+		lockable->fOwnerCount = 1;
 		lockable->fOwner = thread;
 		return B_OK;
 	}
@@ -170,6 +170,34 @@ RWLockManager::WriteUnlock(RWLockable* lockable)
 		lockable->fOwner = -1;
 		_Unblock(lockable);
 	}
+}
+
+
+/*!	Whether a read lock can be had right away: nobody else has the write lock
+	and nobody is waiting for it. Readers did not use to look at the owner,
+	and so got in while somebody was writing. The thread that has the write
+	lock may also read.
+*/
+bool
+RWLockManager::_CanReadLock(RWLockable* lockable) const
+{
+	if (lockable->fOwner >= 0)
+		return lockable->fOwner == find_thread(NULL);
+	return lockable->fWaiters.IsEmpty();
+}
+
+
+/*!	Whether the write lock can be had right away: nobody has it or reads,
+	and nobody is waiting. Writers did not use to look at the owner either,
+	and so took the lock from one another; the first to unlock then was not
+	the owner anymore and ended in the debugger. A thread that has the write
+	lock already is let in by the callers before.
+*/
+bool
+RWLockManager::_CanWriteLock(RWLockable* lockable) const
+{
+	return lockable->fOwner < 0 && lockable->fReaderCount == 0
+		&& lockable->fWaiters.IsEmpty();
 }
 
 

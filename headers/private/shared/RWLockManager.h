@@ -78,6 +78,8 @@ public:
 	inline	void				GenericUnlock(bool write, RWLockable* lockable);
 
 private:
+			bool				_CanReadLock(RWLockable* lockable) const;
+			bool				_CanWriteLock(RWLockable* lockable) const;
 			status_t			_Wait(RWLockable* lockable, bool writer,
 									bigtime_t timeout);
 			void				_Unblock(RWLockable* lockable);
