@@ -36,6 +36,7 @@ ECMDevice::ECMDevice(usb_device device)
 		fNotifyBufferLength(0),
 		fLinkStateChangeSem(-1),
 		fHasConnection(false),
+		fConnectionNotified(false),
 		fDownstreamSpeed(0),
 		fUpstreamSpeed(0)
 {
@@ -189,6 +190,19 @@ ECMDevice::Open()
 
 	// update again
 	config = gUSBModule->get_configuration(fDevice);
+
+	// Setting an alternate interface replaces the pipes of that interface:
+	// the notification endpoint found in _SetupDevice() is gone now. Queueing
+	// on the stale handle failed, so notifications never arrived and every
+	// device got the hardcoded connection at 10 Mb/s below, cable or not.
+	usb_interface_info *control
+		= config->interface[fControlInterfaceIndex].active;
+	if (control->endpoint_count == 0) {
+		TRACE_ALWAYS("the control interface has no notification endpoint\n");
+		return B_ERROR;
+	}
+	fNotifyEndpoint = control->endpoint[0].handle;
+
 	usb_interface_info *interface = config->interface[fDataInterfaceIndex].active;
 	if (interface->endpoint_count < 2) {
 		TRACE_ALWAYS("setting the data alternate interface failed\n");
@@ -223,6 +237,7 @@ ECMDevice::Open()
 	if (gUSBModule->queue_interrupt(fNotifyEndpoint, fNotifyBuffer,
 		fNotifyBufferLength, _NotifyCallback, this) != B_OK) {
 		// we cannot use notifications - hardcode to active connection
+		TRACE_ALWAYS("cannot queue notifications, assuming a connection\n");
 		fHasConnection = true;
 		fDownstreamSpeed = 1000 * 1000 * 10; // 10Mbps
 		fUpstreamSpeed = 1000 * 1000 * 10; // 10Mbps
@@ -402,7 +417,9 @@ ECMDevice::Control(uint32 op, void *buffer, size_t length)
 		}
 
 		default:
-			TRACE_ALWAYS("unsupported ioctl %" B_PRIu32 "\n", op);
+			// The stack asks every driver for statistics (SIOCGIFSTATS) and
+			// more; not knowing them is not worth a syslog line each time.
+			TRACE("unsupported ioctl %" B_PRIu32 "\n", op);
 	}
 
 	return B_DEV_INVALID_IOCTL;
@@ -698,10 +715,14 @@ ECMDevice::_NotifyCallback(void *cookie, int32 status, void *data,
 
 		switch (notification->notification_code) {
 			case CDC_NOTIFY_NETWORK_CONNECTION:
+			{
 				TRACE("connection state change to %d\n", notification->value);
-				device->fHasConnection = notification->value > 0;
-				linkStateChange = true;
+				bool hasConnection = notification->value > 0;
+				linkStateChange = hasConnection != device->fHasConnection;
+				device->fHasConnection = hasConnection;
+				device->fConnectionNotified = true;
 				break;
+			}
 
 			case CDC_NOTIFY_CONNECTION_SPEED_CHANGE:
 			{
@@ -714,12 +735,21 @@ ECMDevice::_NotifyCallback(void *cookie, int32 status, void *data,
 
 				cdc_connection_speed *speed;
 				speed = (cdc_connection_speed *)&notification->data[0];
+				linkStateChange
+					= speed->upstream_speed != device->fUpstreamSpeed
+						|| speed->downstream_speed != device->fDownstreamSpeed;
 				device->fUpstreamSpeed = speed->upstream_speed;
 				device->fDownstreamSpeed = speed->downstream_speed;
-				device->fHasConnection = true;
-				TRACE("connection speed change to %" B_PRId32 "/%" B_PRId32 "\n",
+				// The link state comes from NetworkConnection; only a device
+				// that never reports its connection gets it from the speed.
+				if (!device->fConnectionNotified) {
+					bool hasConnection = speed->downstream_speed > 0;
+					if (hasConnection != device->fHasConnection)
+						linkStateChange = true;
+					device->fHasConnection = hasConnection;
+				}
+				TRACE("connection speed change to %" B_PRIu32 "/%" B_PRIu32 "\n",
 					speed->downstream_speed, speed->upstream_speed);
-				linkStateChange = true;
 				break;
 			}
 
@@ -729,6 +759,8 @@ ECMDevice::_NotifyCallback(void *cookie, int32 status, void *data,
 				break;
 		}
 
+		// Realtek adapters repeat both notifications about twice a second:
+		// only a change is worth waking the stack's link checker for.
 		if (linkStateChange && device->fLinkStateChangeSem >= B_OK)
 			release_sem_etc(device->fLinkStateChangeSem, 1, B_DO_NOT_RESCHEDULE);
 	}

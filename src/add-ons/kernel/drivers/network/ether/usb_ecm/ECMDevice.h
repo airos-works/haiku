@@ -113,6 +113,8 @@ static	void				_NotifyCallback(void *cookie, int32 status,
 		sem_id				fLinkStateChangeSem;
 		uint8				fMACAddress[6];
 		bool				fHasConnection;
+		bool				fConnectionNotified;
+			// the device reports its link with NetworkConnection
 		uint32				fDownstreamSpeed;
 		uint32				fUpstreamSpeed;
 };
