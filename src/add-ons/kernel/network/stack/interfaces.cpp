@@ -84,6 +84,8 @@ static InterfaceList sInterfaces;
 static mutex sHashLock;
 static AddressTable sAddressTable;
 static uint32 sInterfaceIndex;
+static mutex sAddressListenerLock;
+static struct list sAddressListeners;
 
 
 #if 0
@@ -641,6 +643,27 @@ Interface::RemoveAddress(InterfaceAddress* address)
 }
 
 
+/*!	Tells the registered address listeners that \a address of \a domain is
+	no longer assigned to an interface. The listeners must not block, so this
+	can be called with interface locks held, but not with
+	sAddressListenerLock.
+*/
+static void
+notify_address_removed(net_domain* domain, const sockaddr* address)
+{
+	if (domain == NULL || address == NULL)
+		return;
+
+	MutexLocker locker(sAddressListenerLock);
+
+	net_address_listener* listener = NULL;
+	while ((listener = (net_address_listener*)list_get_next_item(
+			&sAddressListeners, listener)) != NULL) {
+		listener->address_removed(listener, domain, address);
+	}
+}
+
+
 bool
 Interface::GetNextAddress(InterfaceAddress** _address)
 {
@@ -727,6 +750,9 @@ Interface::RemoveAddresses()
 		if (address->LocalIsDefined()) {
 			MutexLocker hashLocker(sHashLock);
 			sAddressTable.Remove(address);
+			hashLocker.Unlock();
+
+			notify_address_removed(address->domain, address->local);
 		}
 		address->ReleaseReference();
 
@@ -1365,9 +1391,31 @@ update_interface_address(InterfaceAddress* interfaceAddress, int32 option,
 
 		invalidate_routes(interfaceAddress);
 
+		bool hadLocal = interfaceAddress->LocalIsDefined();
 		interface->RemoveAddress(interfaceAddress);
+		if (hadLocal) {
+			notify_address_removed(interfaceAddress->domain,
+				interfaceAddress->local);
+		}
 		interfaceAddress->ReleaseReference();
 		return B_OK;
+	}
+
+	// Replacing the local address removes the previous one: remember it to
+	// tell the address listeners (oldAddress may point to the storage that
+	// is overwritten below).
+	sockaddr_storage removedLocal;
+	bool localRemoved = false;
+	if (option == SIOCSIFADDR && interfaceAddress->LocalIsDefined()) {
+		net_address_module_info* addressModule
+			= interfaceAddress->domain->address_module;
+		const sockaddr* oldLocal = interfaceAddress->local;
+		if (newAddress == NULL
+			|| !addressModule->equal_addresses(oldLocal, newAddress)) {
+			memcpy(&removedLocal, oldLocal,
+				min_c(oldLocal->sa_len, sizeof(removedLocal)));
+			localRemoved = true;
+		}
 	}
 
 	if (interfaceAddress->LocalIsDefined())
@@ -1409,7 +1457,34 @@ update_interface_address(InterfaceAddress* interfaceAddress, int32 option,
 
 	if (interfaceAddress->LocalIsDefined())
 		sAddressTable.Insert(interfaceAddress);
+
+	locker.Unlock();
+
+	if (localRemoved && status == B_OK) {
+		notify_address_removed(interfaceAddress->domain,
+			(sockaddr*)&removedLocal);
+	}
 	return status;
+}
+
+
+status_t
+add_address_listener(net_address_listener* listener)
+{
+	if (listener == NULL || listener->address_removed == NULL)
+		return B_BAD_VALUE;
+
+	MutexLocker locker(sAddressListenerLock);
+	list_add_item(&sAddressListeners, listener);
+	return B_OK;
+}
+
+
+void
+remove_address_listener(net_address_listener* listener)
+{
+	MutexLocker locker(sAddressListenerLock);
+	list_remove_item(&sAddressListeners, listener);
 }
 
 
@@ -1668,6 +1743,8 @@ init_interfaces()
 {
 	recursive_lock_init(&sLock, "net interfaces");
 	mutex_init(&sHashLock, "net local addresses");
+	mutex_init(&sAddressListenerLock, "net address listeners");
+	list_init(&sAddressListeners);
 
 	new (&sInterfaces) InterfaceList;
 	new (&sAddressTable) AddressTable;
@@ -1699,5 +1776,6 @@ uninit_interfaces()
 
 	recursive_lock_destroy(&sLock);
 	mutex_destroy(&sHashLock);
+	mutex_destroy(&sAddressListenerLock);
 	return B_OK;
 }

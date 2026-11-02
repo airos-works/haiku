@@ -66,6 +66,21 @@ typedef struct net_device_monitor {
 	void (*event)(struct net_device_monitor* monitor, int32 event);
 } net_device_monitor;
 
+/*!	Protocols that keep state tied to a local address (TCP connections) can
+	register a listener to learn when an address stops being assigned to an
+	interface. address_removed() is called after the address has been removed,
+	possibly with interface locks held: it must not block, and must not take
+	protocol or endpoint locks; defer the actual work (for example to a
+	net_timer).
+*/
+typedef struct net_address_listener {
+	struct list_link link;
+		// used by the stack
+
+	void (*address_removed)(struct net_address_listener* listener,
+		net_domain* domain, const struct sockaddr* address);
+} net_address_listener;
+
 typedef struct ancillary_data_header {
 	int		level;
 	int		type;
@@ -185,6 +200,10 @@ struct net_stack_module_info {
 					void* previousData, ancillary_data_header* _header);
 	status_t	(*clone_ancillary_data)(const ancillary_data_container* from,
 					ancillary_data_container* to);
+
+	// interface address listeners
+	status_t	(*add_address_listener)(net_address_listener* listener);
+	void		(*remove_address_listener)(net_address_listener* listener);
 };
 
 

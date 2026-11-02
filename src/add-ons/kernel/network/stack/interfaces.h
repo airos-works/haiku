@@ -189,6 +189,8 @@ void interface_removed_device_interface(net_device_interface* deviceInterface);
 
 status_t add_interface_address(Interface* interface, net_domain_private* domain,
 	const ifaliasreq& request);
+status_t add_address_listener(net_address_listener* listener);
+void remove_address_listener(net_address_listener* listener);
 status_t update_interface_address(InterfaceAddress* interfaceAddress,
 	int32 option, const sockaddr* oldAddress, const sockaddr* newAddress);
 

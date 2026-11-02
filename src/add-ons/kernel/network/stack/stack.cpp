@@ -990,7 +990,10 @@ net_stack_module_info gNetStackModule = {
 	remove_ancillary_data,
 	move_ancillary_data,
 	next_ancillary_data,
-	clone_ancillary_data
+	clone_ancillary_data,
+
+	add_address_listener,
+	remove_address_listener
 };
 
 module_info* modules[] = {
