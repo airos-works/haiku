@@ -877,15 +877,26 @@ amdgpu_set_dpms_mode(uint32 dpmsMode)
 		return B_NOT_ALLOWED;
 	uint32 active = dpmsMode == B_DPMS_ON ? 1 : 0;
 	Kms::AtomicRequest request;
+	uint32 crtcs = 0;
 	for (uint32 i = 0; i < gInfo->outputCount; i++) {
 		const Output& output = gInfo->outputs[i];
 		if (output.enabled && output.crtcIndex >= 0) {
 			request.Add(gInfo->resources.crtcs[output.crtcIndex],
 				gInfo->crtcActive, active);
+			crtcs++;
 		}
 	}
+	// Both ends of a switch go to the syslog (time stamped): displays that
+	// would not wake (haiku#40) leave a request without its result there
+	// when the commit never comes back.
+	debug_printf("amdgpu_kms: displays %s (%" B_PRIu32 " CRTCs)...\n",
+		active ? "on" : "off", crtcs);
+	bigtime_t started = system_time();
 	status_t status = request.Commit(gInfo->device,
 		DRM_MODE_ATOMIC_ALLOW_MODESET);
+	debug_printf("amdgpu_kms: displays %s: %s in %.1f ms\n",
+		active ? "on" : "off", status == B_OK ? "done" : strerror(status),
+		(system_time() - started) / 1000.0);
 	if (status == B_OK) {
 		gInfo->dpmsMode = dpmsMode;
 		if (active) {
