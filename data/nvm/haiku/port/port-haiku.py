@@ -608,8 +608,9 @@ def platform_posix(s):
     s = resub(s, r"(#if !defined\(_AIX\) && !defined\(V8_OS_FUCHSIA\)[^\n]*)(\n#include <sys/syscall.h>)",
               r"\1 && !defined(__HAIKU__)\2")
     # Haiku has its own Stack::ObtainCurrentThreadStackStart / GetStackStart
-    # (V8 8.4 and later; before, V8 had no such function).
-    if "GetStackStart" in s:
+    # (V8 8.4 and later; before, V8 had no such function; V8 14.1, Node 25,
+    # has only the first name).
+    if "GetStackStart" in s or "ObtainCurrentThreadStackStart" in s:
         s = resub(s, r"(\n#if !defined\(V8_OS_FREEBSD\) && !defined\(V8_OS_(?:DARWIN|MACOSX)\) && !defined\(_AIX\) && \\\n\s+!defined\(V8_OS_SOLARIS\))",
                   r"\1 && !defined(V8_OS_HAIKU)")
     return s
