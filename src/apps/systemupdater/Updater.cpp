@@ -1346,6 +1346,19 @@ Updater::BootCheck(BString& _report, bool waitForDesktop)
 			Log("%s", _report.String());
 			return B_ERROR;
 		}
+		BString driver;
+		if (_DriverStartFailed(driver)) {
+			// The driver keeps itself off after a start that brought the
+			// machine down, and the desktop then comes up on the frame
+			// buffer driver, often showing nothing: not a start to confirm.
+			// The next start falls back, and the kernel lets the driver try
+			// again with the previous version (vfs_boot.cpp).
+			_report.SetToFormat("%s did not start with the update (it brought "
+				"an earlier start down); the update is not confirmed.",
+				driver.String());
+			Log("%s", _report.String());
+			return B_ERROR;
+		}
 		error = Confirm(_report);
 		if (error != B_OK)
 			return error;
@@ -1389,6 +1402,53 @@ Updater::BootCheck(BString& _report, bool waitForDesktop)
 /*!	Whether the desktop is up: Tracker and Deskbar running, the same teams
 	for kConfirmDelay without a break. Gives up after ten minutes.
 */
+/*!	Whether a kernel driver's start marker (\c <driver>.starting in the
+	drivers' settings, see amdgpu_drm) was left by a start of the update on
+	trial: made after the update was installed, and before this boot (a
+	driver starting right now has a marker of its own, which it deletes once
+	it runs stably).
+*/
+bool
+Updater::_DriverStartFailed(BString& _driver)
+{
+	struct stat trialStat;
+	if (stat(kStateDirectory "/" AIROS_BOOT_TRIAL_FILE, &trialStat) != 0)
+		return false;
+	BPath path;
+	if (find_directory(B_USER_SETTINGS_DIRECTORY, &path) != B_OK
+		|| path.Append("kernel/drivers") != B_OK) {
+		return false;
+	}
+	DIR* dir = opendir(path.Path());
+	if (dir == NULL)
+		return false;
+
+	const time_t bootTime = real_time_clock() - system_time() / 1000000;
+	static const char kSuffix[] = ".starting";
+	const size_t suffixLength = sizeof(kSuffix) - 1;
+	bool failed = false;
+	while (dirent* entry = readdir(dir)) {
+		size_t length = strlen(entry->d_name);
+		if (length <= suffixLength
+			|| strcmp(entry->d_name + length - suffixLength, kSuffix) != 0) {
+			continue;
+		}
+		BString file(path.Path());
+		file << '/' << entry->d_name;
+		struct stat st;
+		if (stat(file, &st) != 0 || st.st_mtime < trialStat.st_mtime
+			|| st.st_mtime + 5 >= bootTime) {
+			continue;
+		}
+		_driver.SetTo(entry->d_name, length - suffixLength);
+		failed = true;
+		break;
+	}
+	closedir(dir);
+	return failed;
+}
+
+
 bool
 Updater::_WaitForDesktop()
 {

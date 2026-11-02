@@ -147,6 +147,7 @@ private:
 			void				_Progress(float fraction);
 			status_t			_RemoveDirectory(const char* path);
 			bool				_WaitForDesktop();
+			bool				_DriverStartFailed(BString& _driver);
 			void				_CheckClock();
 			void				_CheckClockForSecureFeed(const BString& url);
 

@@ -609,6 +609,42 @@ write_airos_boot_file(const KPath& directory, const char* name,
 }
 
 
+/*!	Lets kernel drivers start again that keep themselves off after a start
+	that brought the machine down (amdgpu_drm's "<driver>.starting" marker in
+	the drivers' settings). Done when a version other than the latest one is
+	started by choice or as the fallback of an update that did not start:
+	the marker was most likely left by that update, and the version started
+	now, which ran before, would otherwise come up without its graphics
+	driver, and on some machines without a picture.
+*/
+static void
+clear_driver_start_markers()
+{
+	static const char* kDriverSettings
+		= "/boot/home/config/settings/kernel/drivers";
+	static const char kSuffix[] = ".starting";
+	const size_t suffixLength = sizeof(kSuffix) - 1;
+
+	DIR* dir = opendir(kDriverSettings);
+	if (dir == NULL)
+		return;
+	while (dirent* entry = readdir(dir)) {
+		size_t length = strlen(entry->d_name);
+		if (length <= suffixLength
+			|| strcmp(entry->d_name + length - suffixLength, kSuffix) != 0) {
+			continue;
+		}
+		KPath path(kDriverSettings);
+		if (path.Append(entry->d_name) != B_OK)
+			continue;
+		status_t error = _kern_unlink(-1, path.Path());
+		dprintf("airos boot: let the driver start again (%s removed: %s)\n",
+			entry->d_name, strerror(error));
+	}
+	closedir(dir);
+}
+
+
 /*!	Records a start the boot loader chose for System Updater (see
 	airos_boot_control.h): a start requested once is consumed, a start of an
 	update on trial is counted, and "last-boot" says how this start was
@@ -674,6 +710,9 @@ record_airos_boot(const KMessage& bootVolume, const char*& _state,
 		dprintf("airos boot: counted a start of the update on trial\n");
 	} else
 		dprintf("airos boot: %s start of \"%s\"\n", mode, state);
+
+	if (state[0] != '\0' && strcmp(mode, AIROS_BOOT_MODE_TRIAL) != 0)
+		clear_driver_start_markers();
 
 	// The boot loader reads the file system without replaying its journal,
 	// and the start may end in a hang any moment now: write the changes and
