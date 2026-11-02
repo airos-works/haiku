@@ -49,6 +49,8 @@
 #include <RosterPrivate.h>
 #include <ServerMemoryAllocator.h>
 #include <ServerProtocol.h>
+#include <AccessibilityPrivate.h>
+#include <AccessibilityProtocol.h>
 
 
 using namespace BPrivate;
@@ -316,6 +318,9 @@ BApplication::~BApplication()
 
 	// tell all loopers(usually windows) to quit. Also, wait for them.
 	_QuitAllWindows(true);
+
+	if (BPrivate::gAccessibilityEnabled)
+		BPrivate::accessibility_disable();
 
 	// quit registered loopers
 	for (int32 i = 0; i < sOnQuitLooperList.CountItems(); i++) {
@@ -1031,6 +1036,14 @@ BApplication::DispatchMessage(BMessage* message, BHandler* handler)
 	switch (message->what) {
 		case B_ARGV_RECEIVED:
 			_ArgvReceived(message);
+			break;
+
+		case B_ACCESSIBILITY_ENABLE:
+			BPrivate::accessibility_enable(message);
+			break;
+
+		case B_ACCESSIBILITY_DISABLE:
+			BPrivate::accessibility_disable();
 			break;
 
 		case B_REFS_RECEIVED:

@@ -25,6 +25,7 @@
 #include <Window.h>
 
 #include <binary_compatibility/Interface.h>
+#include <AccessibilityPrivate.h>
 
 
 struct track_data {
@@ -1271,6 +1272,8 @@ BListView::Select(int32 index, bool extend)
 	if (_Select(index, extend)) {
 		SelectionChanged();
 		InvokeNotify(fSelectMessage, B_CONTROL_MODIFIED);
+		if (ACCESSIBILITY_ENABLED())
+			BPrivate::accessibility_item_selected(this, index);
 	}
 }
 
@@ -1281,6 +1284,8 @@ BListView::Select(int32 start, int32 finish, bool extend)
 	if (_Select(start, finish, extend)) {
 		SelectionChanged();
 		InvokeNotify(fSelectMessage, B_CONTROL_MODIFIED);
+		if (ACCESSIBILITY_ENABLED())
+			BPrivate::accessibility_item_selected(this, finish);
 	}
 }
 

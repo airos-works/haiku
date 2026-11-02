@@ -201,6 +201,7 @@ SEARCH on [ FGristFiles
 		Slider.cpp Control.cpp
 	] = [ FDirName $(HAIKU_TOP) src kits interface ] ;
 
+SubInclude HAIKU_TOP src tests kits interface accessibility ;
 SubInclude HAIKU_TOP src tests kits interface bprintjob ;
 SubInclude HAIKU_TOP src tests kits interface bfont ;
 SubInclude HAIKU_TOP src tests kits interface bshelf ;

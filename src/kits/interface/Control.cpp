@@ -20,6 +20,7 @@
 
 #include <binary_compatibility/Interface.h>
 #include <Icon.h>
+#include <AccessibilityPrivate.h>
 
 
 static property_info sPropertyList[] = {
@@ -312,6 +313,9 @@ BControl::SetLabel(const char* label)
 
 	InvalidateLayout();
 	Invalidate();
+
+	if (ACCESSIBILITY_ENABLED())
+		BPrivate::accessibility_notify(this, B_ACCESSIBLE_EVENT_NAME_CHANGED);
 }
 
 
@@ -330,12 +334,20 @@ BControl::SetValue(int32 value)
 
 	fValue = value;
 	Invalidate();
+
+	if (ACCESSIBILITY_ENABLED())
+		BPrivate::accessibility_notify(this, B_ACCESSIBLE_EVENT_VALUE_CHANGED);
 }
 
 
 void
 BControl::SetValueNoUpdate(int32 value)
 {
+	if (ACCESSIBILITY_ENABLED() && value != fValue) {
+		fValue = value;
+		BPrivate::accessibility_notify(this, B_ACCESSIBLE_EVENT_VALUE_CHANGED);
+		return;
+	}
 	fValue = value;
 }
 
@@ -367,6 +379,9 @@ BControl::SetEnabled(bool enabled)
 		Invalidate(Bounds());
 		Flush();
 	}
+
+	if (ACCESSIBILITY_ENABLED())
+		BPrivate::accessibility_notify(this, B_ACCESSIBLE_EVENT_STATE_CHANGED);
 }
 
 

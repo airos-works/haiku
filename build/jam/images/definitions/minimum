@@ -146,6 +146,7 @@ SYSTEM_APPS = [ FFilterByBuildFeatures
 	NetworkStatus
 	WiFiStatus
 	ProcessController
+	ScreenReader
 	ShowImage
 	StyledEdit
 	Terminal
@@ -239,6 +240,7 @@ rule HaikuImageGetPrivateSystemLibs
 
 
 SYSTEM_SERVERS = [ FFilterByBuildFeatures
+	accessibility_server
 	app_server
 	debug_server
 	dns_resolver_server

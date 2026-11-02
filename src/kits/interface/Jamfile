@@ -38,6 +38,7 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 
 		MergeObject <libbe!$(architecture)>interface_kit.o :
 			AboutWindow.cpp
+			Accessibility.cpp
 			AbstractLayout.cpp
 			AbstractLayoutItem.cpp
 			AbstractSpinner.cpp

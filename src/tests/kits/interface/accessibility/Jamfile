@@ -1,0 +1,21 @@
+SubDir HAIKU_TOP src tests kits interface accessibility ;
+
+UsePrivateHeaders interface ;
+
+Application AccessibilityTestApp :
+	AccessibilityTestApp.cpp
+	: be [ TargetLibstdc++ ]
+	: AccessibilityTestApp.rdef
+;
+
+Application accessibility_tree_test :
+	accessibility_tree_test.cpp
+	: be [ TargetLibstdc++ ]
+	: accessibility_tree_test.rdef
+;
+
+Application fake_speech_server :
+	fake_speech_server.cpp
+	: be [ TargetLibstdc++ ]
+	: fake_speech_server.rdef
+;

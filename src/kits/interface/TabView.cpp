@@ -33,6 +33,7 @@
 
 #include <binary_compatibility/Support.h>
 #include <private/libroot/libroot_private.h>
+#include <AccessibilityPrivate.h>
 
 
 static property_info sPropertyList[] = {
@@ -862,6 +863,9 @@ BTabView::Select(int32 index)
 	}
 
 	SetFocusTab(index, true);
+
+	if (ACCESSIBILITY_ENABLED())
+		BPrivate::accessibility_item_selected(this, index);
 }
 
 

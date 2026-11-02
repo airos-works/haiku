@@ -54,6 +54,7 @@
 #include <binary_compatibility/Interface.h>
 #include <binary_compatibility/Support.h>
 #include <MessagePrivate.h>
+#include <AccessibilityPrivate.h>
 #include <MessageUtils.h>
 #include <PortLink.h>
 #include <ServerProtocol.h>
@@ -750,6 +751,9 @@ BView::AllArchived(BMessage* into) const
 BView::~BView()
 {
 	STRACE(("BView(%s)::~BView()\n", this->Name()));
+
+	if (BPrivate::gAccessibilityViewData)
+		BPrivate::accessibility_view_deleted(this);
 
 	if (fOwner != NULL) {
 		debugger("Trying to delete a view that belongs to a window. "
