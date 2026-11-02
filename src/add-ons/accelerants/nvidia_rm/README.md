@@ -36,6 +36,25 @@ What uses it:
   heap speed), copied by the engine to the same place on the screen.
   app_server's vertical blank flush keeps its two shadows of the back buffer
   there and hands its rects to the engine instead of copying with the CPU.
+- `B_CREATE_FRAME_BUFFER_SHADOW` / `B_COPY_FRAME_BUFFER_SOURCE`: a shadow in
+  video memory (no CPU mapping) and copies from one source to another. With
+  them app_server's back buffer is itself a source in system memory, and the
+  engine copies what is drawn there into the flush's shadows in video memory
+  (in bands of about 2 MB) and from them to the screen at the blank: the CPU
+  copies nothing. Profiled on the X399 (4K at 200%), the CPU copy of the back
+  buffer into the shadows was a third to half of app_server's drawing
+  threads' time.
+
+Copy rates on the GTX 1070 (`nv2dtest 3840 2160 timings`, 3840x2160):
+
+| copy | engine | CPU |
+|---|---|---|
+| system -> video memory | 2.9 ms | 7.1 ms |
+| video -> other video memory | 0.37 ms | - |
+| system -> system memory | 21 ms | 5.1 ms |
+
+System memory has 4 KiB GPU pages (big ones are refused), and the engine
+writing it is slow: sources the engine writes into belong in video memory.
 
 Engine quirks found on the GTX 1070 (GP104):
 

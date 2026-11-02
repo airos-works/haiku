@@ -246,6 +246,13 @@ protected:
 	virtual	bool				_CopyShadowByDevice(RenderingBuffer* shadow,
 									const BRegion& region)
 									{ return false; }
+	// A shadow the CPU cannot reach (Bits() is NULL) is in the device's own
+	// memory: the device copies what was drawn into it as well. When it
+	// cannot, the flush copies from the back buffer from then on.
+	virtual	bool				_CopyBackToShadowByDevice(
+									RenderingBuffer* shadow,
+									const IntRect& area)
+									{ return false; }
 
 private:
 			struct FlushWorker;

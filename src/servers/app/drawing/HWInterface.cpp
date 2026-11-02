@@ -664,7 +664,12 @@ HWInterface::CopyBackToFront(const BRect& frame)
 			}
 			fFlushLock.Unlock();
 		}
-		if (shadow != NULL && slot >= 0) {
+		if (shadow != NULL && slot >= 0 && shadow->Bits() == NULL) {
+			// a shadow in the device's memory: the device copies, the CPU
+			// is free (or, when it cannot, the flush copies from the back
+			// buffer from now on)
+			_CopyBackToShadowByDevice(shadow, area);
+		} else if (shadow != NULL && slot >= 0) {
 			uint32 srcBPR = backBuffer->BytesPerRow();
 			uint32 dstBPR = shadow->BytesPerRow();
 			uint8* src = (uint8*)backBuffer->Bits() + area.top * srcBPR
@@ -748,6 +753,13 @@ HWInterface::_CopyShadowToFront(BRegion& region, int32 which)
 		&& frontBuffer->Width() == shadow->Width()
 		&& frontBuffer->Height() == shadow->Height()
 		&& _CopyShadowByDevice(shadow, region)) {
+		return;
+	}
+
+	if (shadow->Bits() == NULL) {
+		// the CPU cannot read a shadow in the device's memory (device
+		// copies switched off, or failed): the back buffer as it is now
+		_CopyBackToFront(region);
 		return;
 	}
 
@@ -1292,9 +1304,18 @@ HWInterface::_UpdateFlushTargets()
 			backBuffer->Height());
 		if (shadow != NULL && shadow->InitCheck() == B_OK) {
 			// the back buffer as it is, so that nothing stale is copied
-			memcpy(shadow->Bits(), backBuffer->Bits(),
-				min_c(shadow->BitsLength(), backBuffer->BitsLength()));
-			fFlushShadow[i].SetTo(shadow);
+			bool filled = true;
+			if (shadow->Bits() != NULL) {
+				memcpy(shadow->Bits(), backBuffer->Bits(),
+					min_c(shadow->BitsLength(), backBuffer->BitsLength()));
+			} else {
+				filled = _CopyBackToShadowByDevice(shadow,
+					IntRect(backBuffer->Bounds()));
+			}
+			if (filled)
+				fFlushShadow[i].SetTo(shadow);
+			else
+				delete shadow;
 		} else
 			delete shadow;
 	}
