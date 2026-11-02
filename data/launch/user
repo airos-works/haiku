@@ -32,6 +32,17 @@ target desktop {
 		no_safemode
 	}
 
+	# air/OS: the screen reader, when "autostart true" is set in
+	# ~/config/settings/ScreenReader (docs/airos/ACCESSIBILITY.md);
+	# Option+Command+S turns it on and off at any time
+	job x-vnd.Haiku-ScreenReader {
+		launch /system/apps/ScreenReader
+		if setting ~/config/settings/ScreenReader autostart true
+		on initial_volumes_mounted
+		legacy
+		no_safemode
+	}
+
 	job user-bootscript {
 		launch /bin/sh ~/config/settings/boot/UserBootscript
 	}
