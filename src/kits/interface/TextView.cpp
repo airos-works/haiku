@@ -54,6 +54,7 @@
 
 #include <EmojiTables.h>
 #include <binary_compatibility/Interface.h>
+#include <AccessibilityPrivate.h>
 
 #include "InlineInput.h"
 #include "LineBuffer.h"
@@ -1568,6 +1569,9 @@ BTextView::Select(int32 startOffset, int32 endOffset)
 		fSelStart = startOffset;
 		fSelEnd = endOffset;
 	}
+
+	if (ACCESSIBILITY_ENABLED())
+		BPrivate::accessibility_caret_moved(this);
 }
 
 
@@ -3086,6 +3090,9 @@ BTextView::InsertText(const char* text, int32 length, int32 offset,
 		// apply null-style to inserted text
 		_ApplyStyleRange(offset, offset + length);
 	}
+
+	if (ACCESSIBILITY_ENABLED())
+		BPrivate::accessibility_text_inserted(this, text, length, offset);
 }
 
 
@@ -3106,6 +3113,9 @@ BTextView::DeleteText(int32 fromOffset, int32 toOffset)
 
 	if (fromOffset >= toOffset)
 		return;
+
+	if (ACCESSIBILITY_ENABLED())
+		BPrivate::accessibility_text_deleted(this, fromOffset, toOffset);
 
 	// set nullStyle to style at beginning of range
 	fStyles->InvalidateNullStyle();

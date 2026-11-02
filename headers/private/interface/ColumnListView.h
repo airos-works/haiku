@@ -56,6 +56,7 @@ class BScrollBar;
 
 namespace BPrivate {
 
+class ColumnListViewAccessible;
 class OutlineView;
 class TitleView;
 class BRowContainer;
@@ -399,6 +400,8 @@ protected:
 	virtual	void				DoLayout();
 
 private:
+	friend class BPrivate::ColumnListViewAccessible;
+
 			void				_Init();
 			void				_UpdateColors();
 			void				_GetChildViewRects(const BRect& bounds,
@@ -420,6 +423,7 @@ private:
 			float				fLatchWidth;
 			border_style		fBorderStyle;
 			bool				fShowingHorizontalScrollBar;
+			BPrivate::ColumnListViewAccessible* fAccessible;
 };
 
 #endif // _COLUMN_LIST_VIEW_H

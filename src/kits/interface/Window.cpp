@@ -51,6 +51,7 @@
 #include <ToolTipWindow.h>
 #include <UnicodeChar.h>
 #include <WindowPrivate.h>
+#include <AccessibilityPrivate.h>
 
 #include <binary_compatibility/Interface.h>
 #include <InterfacePrivate.h>
@@ -1149,6 +1150,9 @@ FrameMoved(origin);
 				// call hook function 'WindowActivated(bool)' for all
 				// views attached to this window.
 				fTopView->_Activate(active);
+
+				if (ACCESSIBILITY_ENABLED())
+					BPrivate::accessibility_window_activated(this, active);
 
 				// we notify the input server if we are gaining or losing focus
 				// from a view which has the B_INPUT_METHOD_AWARE on a window
@@ -3286,6 +3290,9 @@ BWindow::_SetFocus(BView* focusView, bool notifyInputServer)
 
 	fFocus = focusView;
 	SetPreferredHandler(focusView);
+
+	if (ACCESSIBILITY_ENABLED())
+		BPrivate::accessibility_focus_changed(this, focusView);
 }
 
 

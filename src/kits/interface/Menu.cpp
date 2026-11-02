@@ -48,6 +48,7 @@
 #include <MenuPrivate.h>
 #include <MenuWindow.h>
 #include <ServerProtocol.h>
+#include <AccessibilityPrivate.h>
 
 #include "utf8_functions.h"
 
@@ -3097,6 +3098,9 @@ BMenu::_SelectItem(BMenuItem* item, bool showSubmenu, bool selectFirstItem, bool
 		fSelected = item;
 		if (fSelected != NULL)
 			fSelected->Select(true);
+
+		if (ACCESSIBILITY_ENABLED() && fSelected != NULL)
+			BPrivate::accessibility_menu_item_selected(this, fSelected);
 	}
 
 	if (fSelected != NULL && showSubmenu) {

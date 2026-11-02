@@ -48,6 +48,7 @@ All rights reserved.
 #include <typeinfo>
 
 #include <algorithm>
+#include <new>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -68,6 +69,9 @@ All rights reserved.
 #include <Window.h>
 
 #include <ObjectListPrivate.h>
+#include <AccessibilityPrivate.h>
+#include <Accessible.h>
+#include <ColumnTypes.h>
 
 #include "ObjectList.h"
 
@@ -415,6 +419,87 @@ private:
 			int32				fCurrentListDepth;
 			bool				fOpenBranchesOnly;
 };
+
+
+/*!	The accessible node of a column list view (haiku#54): a table whose value
+	is the focused row. Rows are not exposed as children yet.
+*/
+class ColumnListViewAccessible : public BAccessible {
+public:
+	ColumnListViewAccessible(BColumnListView* view)
+		:
+		fView(view)
+	{
+	}
+
+	virtual accessible_role Role() const
+	{
+		return B_ACCESSIBLE_ROLE_TABLE;
+	}
+
+	virtual BString Value() const
+	{
+		BRow* row = fView->FocusRow();
+		if (row == NULL)
+			row = fView->CurrentSelection();
+		if (row == NULL)
+			return BString();
+
+		BString text;
+		for (int32 i = 0; i < fView->CountColumns(); i++) {
+			BColumn* column = fView->ColumnAt(i);
+			if (column == NULL || !column->IsVisible())
+				continue;
+			BStringField* field = dynamic_cast<BStringField*>(
+				row->GetField(column->LogicalFieldNum()));
+			if (field == NULL || field->String() == NULL
+				|| field->String()[0] == '\0') {
+				continue;
+			}
+			if (!text.IsEmpty())
+				text << ", ";
+			text << field->String();
+		}
+		return text;
+	}
+
+	virtual uint64 States() const
+	{
+		uint64 states = B_ACCESSIBLE_STATE_FOCUSABLE;
+		if (fView->fOutlineView->IsFocus())
+			states |= B_ACCESSIBLE_STATE_FOCUSED;
+		if (fView->SelectionMode() == B_MULTIPLE_SELECTION_LIST)
+			states |= B_ACCESSIBLE_STATE_MULTI_SELECTABLE;
+		return states;
+	}
+
+	virtual BRect Frame() const
+	{
+		return fView->ConvertToScreen(fView->Bounds());
+	}
+
+	virtual uint32 Actions() const
+	{
+		return B_ACCESSIBLE_ACTION_FOCUS;
+	}
+
+	virtual status_t PerformAction(accessible_action action)
+	{
+		if (action != B_ACCESSIBLE_ACTION_FOCUS)
+			return B_NOT_SUPPORTED;
+		fView->MakeFocus(true);
+		return B_OK;
+	}
+
+	virtual void AddProperties(BMessage& node) const
+	{
+		node.AddInt32("row_count", fView->CountRows());
+	}
+
+private:
+	BColumnListView* fView;
+};
+
 
 }	// namespace BPrivate
 
@@ -895,6 +980,9 @@ BColumnListView::BColumnListView(const char* name, uint32 flags,
 
 BColumnListView::~BColumnListView()
 {
+	BAccessible::Detach(this);
+	delete fAccessible;
+
 	while (BColumn* column = (BColumn*)fColumns.RemoveItem((int32)0))
 		delete column;
 }
@@ -2242,6 +2330,10 @@ BColumnListView::DoLayout()
 void
 BColumnListView::_Init()
 {
+	fAccessible = new(std::nothrow) BPrivate::ColumnListViewAccessible(this);
+	if (fAccessible != NULL)
+		BAccessible::Attach(this, fAccessible);
+
 	SetViewColor(B_TRANSPARENT_32_BIT);
 
 	BRect bounds(Bounds());
@@ -4288,6 +4380,11 @@ OutlineView::ChangeFocusRow(bool up, bool updateSelection,
 
 	if (newRow && updateSelection)
 		fMasterView->SelectionChanged();
+
+	if (newRow != NULL && ACCESSIBILITY_ENABLED()) {
+		BPrivate::accessibility_notify(fMasterView,
+			B_ACCESSIBLE_EVENT_VALUE_CHANGED);
+	}
 }
 
 
@@ -5148,6 +5245,11 @@ OutlineView::SetFocusRow(BRow* row, bool Select)
 
 		fFocusRowRect.right = 10000;
 		fMasterView->SelectionChanged();
+
+		if (ACCESSIBILITY_ENABLED()) {
+			BPrivate::accessibility_notify(fMasterView,
+				B_ACCESSIBLE_EVENT_VALUE_CHANGED);
+		}
 	}
 }
 
