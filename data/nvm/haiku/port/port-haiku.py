@@ -461,6 +461,19 @@ edit("deps/cares/cares.gyp",
                      lambda m: m.group(1) + CARES_HAIKU, re.S),
      "c-ares haiku config", 'config/haiku')
 
+# nghttp2 in Node 10 and 11 is built without its config.h on POSIX, so
+# nghttp2_net.h does not include <arpa/inet.h>: htonl() and friends became
+# implicit calls, which link on glibc (where they are also functions) but not
+# on Haiku (macros only).
+if _major < 12:
+    edit("deps/nghttp2/nghttp2.gyp",
+         lambda s: once(s, "        ['debug_nghttp2 == 1', {\n",
+                        "        ['OS==\"haiku\"', {\n"
+                        "          'defines': [ 'HAVE_ARPA_INET_H', 'HAVE_NETINET_IN_H' ],\n"
+                        "        }],\n"
+                        "        ['debug_nghttp2 == 1', {\n"),
+         "nghttp2 arpa/inet.h on Haiku", "HAVE_ARPA_INET_H")
+
 # c-ares before 1.18 (Node 10, 11, 13, 15) predates its Haiku port and reads
 # /etc/resolv.conf, which Haiku does not have: dns.resolve*() then asked
 # 127.0.0.1. Add 1.18's Haiku paths (1.18 and later have them, in src/lib).
