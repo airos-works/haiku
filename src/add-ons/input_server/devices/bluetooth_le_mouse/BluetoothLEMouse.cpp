@@ -5,6 +5,10 @@
  * Connects bonded Bluetooth Low Energy mice (HID over GATT) and feeds their
  * reports to the input server, using the same speed, acceleration, button
  * map and click speed settings as wired mice.
+ *
+ * Game pads (an Xbox Series controller over Bluetooth LE, say) are bonded and
+ * connected the same way; their reports go to the bluetooth_hid driver,
+ * which publishes them as /dev/joystick devices for BJoystick.
  */
 
 #include <LEAttributeClient.h>
@@ -23,15 +27,19 @@
 #include <OS.h>
 #include <bluetooth/LocalDevice.h>
 #include <bluetooth/bdaddrUtils.h>
+#include <bluetooth_hid.h>
 #include <driver_settings.h>
 
 #include <algorithm>
 #include <atomic>
+#include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 
@@ -281,9 +289,9 @@ private:
 				sizeof(layoutPath)) == B_OK;
 		Bluetooth::LEHIDService service;
 		Bluetooth::LEHIDMouseDecoder decoder;
+		bool gamepad = false;
 		bool saved = canSave && service.Load(layoutPath) == B_OK
-			&& decoder.Init(service.ReportMap().data(),
-				service.ReportMap().size()) == B_OK;
+			&& _InitDecoder(service, decoder, gamepad) == B_OK;
 		if (saved) {
 			// Check before writing: after a firmware update the saved
 			// handles could belong to something else.
@@ -311,8 +319,7 @@ private:
 					strerror(status));
 				return;
 			}
-			status = decoder.Init(service.ReportMap().data(),
-				service.ReportMap().size());
+			status = _InitDecoder(service, decoder, gamepad);
 			if (status == B_OK)
 				status = service.EnableInputReports(client);
 			if (status != B_OK) {
@@ -347,6 +354,11 @@ private:
 			battery < 0 ? ")" : "%");
 		_Publish(mouse, true, battery);
 		bigtime_t lastBatteryRead = system_time();
+
+		// A game pad's reports go to a bluetooth_hid device, which lives as
+		// long as this file descriptor.
+		int gamepadDevice = gamepad
+			? _CreateGamepad(mouse, service, text) : -1;
 
 		fButtons = 0;
 		fHistoryX = fHistoryY = 0;
@@ -410,11 +422,18 @@ private:
 				Bluetooth::LELogHex(LE_LOG_DEBUG, "mouse", "input report",
 					value.data(), value.size());
 			}
+			if (gamepadDevice >= 0
+				&& !decoder.SupportsReport(report->reportID)) {
+				_WriteGamepadReport(gamepadDevice, report->reportID, value);
+				continue;
+			}
 			Bluetooth::LEMouseReport movement;
 			if (decoder.Decode(report->reportID, value.data(), value.size(),
 					movement) == B_OK)
 				_Emit(movement);
 		}
+		if (gamepadDevice >= 0)
+			close(gamepadDevice);
 		LOG(LE_LOG_INFO, "mouse %s disconnected after %" B_PRIu32
 			" reports: %s", text, reports, strerror(status));
 		_Publish(mouse, false, battery);
@@ -423,6 +442,60 @@ private:
 		if (fButtons != 0) {
 			Bluetooth::LEMouseReport released = {};
 			_Emit(released);
+		}
+	}
+
+	// The mouse decoder for the report map; a game pad needs none.
+	status_t _InitDecoder(const Bluetooth::LEHIDService& service,
+		Bluetooth::LEHIDMouseDecoder& decoder, bool& gamepad)
+	{
+		const uint8* map = service.ReportMap().data();
+		const size_t length = service.ReportMap().size();
+		gamepad = Bluetooth::LEHIDReportMapHasGamepad(map, length);
+		status_t status = decoder.Init(map, length);
+		return gamepad ? B_OK : status;
+	}
+
+	int _CreateGamepad(const Bluetooth::LEHIDMouseDevice& device,
+		const Bluetooth::LEHIDService& service, const char* text)
+	{
+		int fd = open(BLUETOOTH_HID_CONTROL_PATH, O_RDWR | O_CLOEXEC);
+		if (fd < 0) {
+			LOG(LE_LOG_ERROR, "game pad %s: cannot open %s: %s", text,
+				BLUETOOTH_HID_CONTROL_PATH, strerror(errno));
+			return -1;
+		}
+		bluetooth_hid_create create;
+		memset(&create, 0, sizeof(create));
+		create.version = BLUETOOTH_HID_VERSION;
+		memcpy(create.address, device.peerAddress, sizeof(create.address));
+		create.descriptor_length = service.ReportMap().size();
+		create.descriptor = service.ReportMap().data();
+		strlcpy(create.name, "Bluetooth LE game pad", sizeof(create.name));
+		if (ioctl(fd, BLUETOOTH_HID_CREATE, &create, sizeof(create)) != 0) {
+			LOG(LE_LOG_ERROR, "game pad %s: the HID driver refused it: %s",
+				text, strerror(errno));
+			close(fd);
+			return -1;
+		}
+		LOG(LE_LOG_INFO, "game pad %s: published as a joystick device", text);
+		return fd;
+	}
+
+	void _WriteGamepadReport(int fd, uint8 reportID,
+		const std::vector<uint8>& value)
+	{
+		// bluetooth_hid takes the report ID first when there is one; over
+		// GATT it comes from the Report Reference, not the value.
+		uint8 buffer[1 + BLUETOOTH_HID_MAX_REPORT];
+		size_t offset = reportID != 0 ? 1 : 0;
+		if (value.empty() || value.size() + offset > sizeof(buffer))
+			return;
+		buffer[0] = reportID;
+		memcpy(buffer + offset, value.data(), value.size());
+		if (write(fd, buffer, value.size() + offset) < 0) {
+			LOG(LE_LOG_DEBUG, "game pad report %u not taken: %s", reportID,
+				strerror(errno));
 		}
 	}
 

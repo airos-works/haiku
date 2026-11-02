@@ -665,10 +665,15 @@ ProbeHIDMouse(LEPairingResult& result, const uint8 localAddress[6],
 	}
 	LOG(LE_LOG_INFO, "HID service: %zu-byte report map, %zu input report(s)",
 		service.ReportMap().size(), service.InputReports().size());
+	// Game pads (an Xbox Series controller, say) are registered like mice:
+	// the input server add-on that connects them hands their reports to the
+	// bluetooth_hid driver, which publishes a joystick device.
+	const bool gamepad = LEHIDReportMapHasGamepad(service.ReportMap().data(),
+		service.ReportMap().size());
 	LEHIDMouseDecoder decoder;
 	result.hidStatus = decoder.Init(service.ReportMap().data(),
 		service.ReportMap().size());
-	if (result.hidStatus != B_OK) {
+	if (result.hidStatus != B_OK && !gamepad) {
 		SetDetail(result, "Paired, but the HID report map could not be "
 			"parsed (%s).", strerror(result.hidStatus));
 		return;
@@ -680,9 +685,12 @@ ProbeHIDMouse(LEPairingResult& result, const uint8 localAddress[6],
 			report.valueHandle, mouse ? "pointer" : "not a pointer report");
 		hasMouseInput |= mouse;
 	}
-	if (!hasMouseInput) {
+	if (gamepad)
+		LOG(LE_LOG_INFO, "the report map has a game pad");
+	if (!hasMouseInput && !gamepad) {
 		result.hidStatus = B_ENTRY_NOT_FOUND;
-		SetDetail(result, "Paired, but the device has no mouse input report.");
+		SetDetail(result, "Paired, but the device has no mouse or game pad "
+			"input report.");
 		return;
 	}
 	char directory[1024];
