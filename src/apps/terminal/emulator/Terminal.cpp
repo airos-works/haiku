@@ -99,6 +99,7 @@ Terminal::Terminal()
 	fCursorBlinkSet(false),
 	fDefaultCursorShape(CURSOR_SHAPE_BLOCK),
 	fDefaultCursorBlinking(true),
+	fDefaultAlternateScroll(false),
 	fTop(0),
 	fBottom(0),
 	fLeft(0),
@@ -323,6 +324,14 @@ Terminal::SetDefaultCursorShape(int32 shape, bool blinking)
 	fDefaultCursorShape = shape;
 	fDefaultCursorBlinking = blinking;
 	_Changed();
+}
+
+
+void
+Terminal::SetDefaultAlternateScroll(bool enabled)
+{
+	fDefaultAlternateScroll = enabled;
+	fModes.alternateScroll = enabled;
 }
 
 
@@ -2164,6 +2173,7 @@ Terminal::FullReset()
 	fModes.autoWrap = true;
 	fModes.autoRepeat = true;
 	fModes.cursorVisible = true;
+	fModes.alternateScroll = fDefaultAlternateScroll;
 	fSavedModes.clear();
 	_SoftReset();
 	_ClearExtraCursors();

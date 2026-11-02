@@ -785,6 +785,21 @@ Terminal::_ModeState(int32 mode, bool privateMode) const
 				return 3;
 			case 20:
 				return STATE(fModes.lineFeedNewLine);
+			case 1:		// GATM
+			case 3:		// CRM
+			case 5:		// SRTM
+			case 7:		// VEM
+			case 10:	// HEM
+			case 11:	// PUM
+			case 13:	// FEAM
+			case 14:	// FETM
+			case 15:	// MATM
+			case 16:	// TTM
+			case 17:	// SATM
+			case 18:	// TSM
+			case 19:	// EBM
+				// the other ECMA-48 modes, never supported (as xterm)
+				return 4;
 		}
 		return 0;
 	}

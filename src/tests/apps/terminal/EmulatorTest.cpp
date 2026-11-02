@@ -452,6 +452,134 @@ TestStyles()
 }
 
 
+/*!	The behaviours upstream Haiku fixed in its old engine (56aa6be220,
+	7a2f8e3bcf, f299640075): line feed/new line mode, autowrap, reverse
+	screen, background color erase, mode reports and aixterm colors.
+*/
+static void
+TestUpstreamVT()
+{
+	// LNM: line feed also returns the carriage, Enter sends CR LF
+	Fixture l(10, 3);
+	l.Feed("ab\ncd");
+	CHECK(l.Cell(1, 2).character == 'c');
+	l.Feed("\x1b[20h\x1b[20$p");
+	CHECK_EQUAL(l.Reply(), "\x1b[20;1$y");
+	l.Feed("\nef");
+	CHECK(l.Cell(2, 0).character == 'e');
+	TermKeyEvent enter = { KEY_ENTER, 0, 0, 0, 1, "\r" };
+	std::string output;
+	l.terminal.EncodeKey(enter, output);
+	CHECK_EQUAL(output, "\r\n");
+	l.Feed("\x1b[20l\x1b[20$p");
+	CHECK_EQUAL(l.Reply(), "\x1b[20;2$y");
+	output.clear();
+	l.terminal.EncodeKey(enter, output);
+	CHECK_EQUAL(output, "\r");
+
+	// ANSI mode reports: IRM, SRM permanently set, the other ECMA-48
+	// modes permanently reset, unknown ones not recognized (as xterm)
+	l.Feed("\x1b[4h\x1b[4$p\x1b[4l\x1b[12$p\x1b[1$p\x1b[19$p\x1b[99$p");
+	CHECK_EQUAL(l.Reply(), "\x1b[4;1$y\x1b[12;3$y\x1b[1;4$y\x1b[19;4$y"
+		"\x1b[99;0$y");
+
+	// DECAWM: off, the last column is overwritten; the cursor stays on
+	// the right-most column, and on again a pending wrap is taken
+	Fixture w(10, 3);
+	w.Feed("\x1b[?7l\x1b[?7$p");
+	CHECK_EQUAL(w.Reply(), "\x1b[?7;2$y");
+	w.Feed("0123456789abc");
+	CHECK_EQUAL(w.Row(0), "012345678c");
+	CHECK(w.Cursor() == TermPoint(9, 0));
+	CHECK_EQUAL(w.Row(1), "");
+	w.Feed("\x1b[?7h\x1b[?7$p\r\n0123456789");
+	CHECK_EQUAL(w.Reply(), "\x1b[?7;1$y");
+	CHECK(w.Cursor() == TermPoint(9, 1));
+	w.Feed("X");
+	CHECK_EQUAL(w.Row(1), "0123456789");
+	CHECK_EQUAL(w.Row(2), "X");
+	// vttest's wrap around test: the cursor at the margin, CR LF follows
+	Fixture v(10, 3);
+	v.Feed("0123456789\r\nx");
+	CHECK_EQUAL(v.Row(1), "x");
+	// a wide character at the margin without autowrap stays on the line
+	Fixture n(5, 2);
+	n.Feed("\x1b[?7labcd\xe6\xbc\xa2");
+	CHECK_EQUAL(n.Row(1), "");
+	CHECK(n.Cursor().y == 0);
+
+	// DECSCNM: reverse screen, reported, colors redrawn
+	Fixture r;
+	uint32 colors = r.terminal.ColorsGeneration();
+	r.Feed("\x1b[?5h\x1b[?5$p");
+	CHECK(r.terminal.IsReverseVideo());
+	CHECK(r.terminal.ColorsGeneration() != colors);
+	CHECK_EQUAL(r.Reply(), "\x1b[?5;1$y");
+	r.Feed("\x1b[?5l\x1b[?5$p");
+	CHECK(!r.terminal.IsReverseVideo());
+	CHECK_EQUAL(r.Reply(), "\x1b[?5;2$y");
+
+	// BCE: every erase fills whole cells with the current background,
+	// and the erased cells are no text
+	Fixture b(10, 4);
+	b.Feed("aaaaaaaaaa\r\nbbbbbbbbbb\r\ncccccccccc\r\ndddddddddd");
+	b.Feed("\x1b[44m\x1b[2;5H\x1b[K");	// EL to the end
+	for (int32 x = 4; x < 10; x++)
+		CHECK(b.Cell(1, x).style.background == palette_color(4));
+	CHECK(b.Cell(1, 3).style.background == kDefaultColor);
+	CHECK_EQUAL(b.Row(1), "bbbb");
+	b.Feed("\x1b[45m\x1b[1K");	// EL to the start
+	CHECK(b.Cell(1, 0).style.background == palette_color(5));
+	CHECK(b.Cell(1, 4).style.background == palette_color(5));
+	CHECK_EQUAL(b.Row(1), "");
+	b.Feed("\x1b[1;3H\x1b[41m\x1b[2X");	// ECH
+	CHECK(b.Cell(0, 3).style.background == palette_color(1));
+	CHECK_EQUAL(b.Row(0), "aa  aaaaaa");
+	b.Feed("\x1b[42m\x1b[3P");	// DCH: the freed cells at the end
+	CHECK(b.Cell(0, 9).style.background == palette_color(2));
+	CHECK(b.Cell(0, 7).style.background == palette_color(2));
+	b.Feed("\x1b[43m\x1b[2@");	// ICH
+	CHECK(b.Cell(0, 2).style.background == palette_color(3));
+	b.Feed("\x1b[3;1H\x1b[46m\x1b[J");	// ED below
+	for (int32 x = 0; x < 10; x++) {
+		CHECK(b.Cell(2, x).style.background == palette_color(6));
+		CHECK(b.Cell(3, x).style.background == palette_color(6));
+	}
+	CHECK_EQUAL(b.Row(3), "");
+	b.Feed("\x1b[47m\x1b[L");	// IL
+	CHECK(b.Cell(2, 9).style.background == palette_color(7));
+	b.Feed("\x1b[4;1H\x1b[0;101m\n");	// scrolled in at the bottom
+	CHECK(b.Cell(3, 0).style.background == palette_color(9));
+	CHECK(b.Cell(3, 9).style.background == palette_color(9));
+	b.Feed("\x1b[0m\x1b[2J");	// the default background again
+	CHECK(b.Cell(0, 0).style.background == kDefaultColor);
+	// copied text leaves out the erased cells, even inside a line
+	Fixture t(10, 2);
+	t.Feed("\x1b[44mab\x1b[K\x1b[5Gc");
+	std::string text;
+	t.terminal.GetText(TermPoint(0, 0), TermPoint(0, 1), text);
+	CHECK_EQUAL(text, "ab  c\n");
+	CHECK(t.terminal.LineLength(0) == 5);
+
+	// aixterm colors are palette entries 8 to 15, like 38;5;8..15
+	Fixture c;
+	c.Feed("\x1b[90mA\x1b[97mB\x1b[100mC\x1b[107mD\x1b[38;5;9mE\x1b[91mF");
+	CHECK(c.Cell(0, 0).style.foreground == palette_color(8));
+	CHECK(c.Cell(0, 1).style.foreground == palette_color(15));
+	CHECK(c.Cell(0, 2).style.background == palette_color(8));
+	CHECK(c.Cell(0, 3).style.background == palette_color(15));
+	CHECK(c.Cell(0, 4).style.foreground == c.Cell(0, 5).style.foreground);
+	CHECK(c.terminal.ResolveColor(c.Cell(0, 5).style.foreground, true)
+		== 0x090909);
+	// blink is not bold; hidden keeps its background
+	c.Feed("\x1b[0;5mG\x1b[0;8;44mH");
+	CHECK((c.Cell(0, 6).style.flags & CELL_BOLD) == 0);
+	CHECK((c.Cell(0, 6).style.flags & CELL_BLINK) != 0);
+	CHECK((c.Cell(0, 7).style.flags & CELL_INVISIBLE) != 0);
+	CHECK(c.Cell(0, 7).style.background == palette_color(4));
+}
+
+
 static void
 TestScreens()
 {
@@ -695,6 +823,100 @@ TestMouse()
 	f.terminal.EncodeMouse(MOUSE_LEAVE, MOUSE_BUTTON_NONE, 0, 4, 5, 123, 45,
 		output);
 	CHECK_EQUAL(output, "\x1b[<288;124;46M");
+
+	// X10 (9): presses only, without modifiers
+	Fixture x(80, 24);
+	x.Feed("\x1b[?9h\x1b[?9$p");
+	CHECK_EQUAL(x.Reply(), "\x1b[?9;1$y");
+	output.clear();
+	x.terminal.EncodeMouse(MOUSE_PRESS, MOUSE_BUTTON_RIGHT,
+		KEY_MODIFIER_SHIFT, 0, 0, 0, 0, output);
+	CHECK_EQUAL(output, "\x1b[M\"!!");
+	output.clear();
+	CHECK(!x.terminal.EncodeMouse(MOUSE_RELEASE, MOUSE_BUTTON_RIGHT, 0, 0, 0,
+		0, 0, output));
+	CHECK(!x.terminal.EncodeMouse(MOUSE_MOTION, MOUSE_BUTTON_RIGHT, 0, 1, 0,
+		0, 0, output));
+
+	// normal (1000): buttons, modifiers, release as 3, no motion; middle
+	// is button 1, right button 2
+	Fixture m(300, 24);
+	m.Feed("\x1b[?1000h\x1b[?1000$p\x1b[?1002$p\x1b[?1003$p");
+	CHECK_EQUAL(m.Reply(), "\x1b[?1000;1$y\x1b[?1002;2$y\x1b[?1003;2$y");
+	output.clear();
+	m.terminal.EncodeMouse(MOUSE_PRESS, MOUSE_BUTTON_MIDDLE,
+		KEY_MODIFIER_SHIFT | KEY_MODIFIER_ALT | KEY_MODIFIER_CONTROL, 0, 0,
+		0, 0, output);
+	CHECK_EQUAL(output, std::string("\x1b[M") + (char)(32 + 1 + 4 + 8 + 16)
+		+ "!!");
+	output.clear();
+	m.terminal.EncodeMouse(MOUSE_PRESS, MOUSE_BUTTON_WHEEL_DOWN, 0, 0, 0, 0,
+		0, output);
+	CHECK_EQUAL(output, "\x1b[Ma!!");
+	// beyond what bytes can carry: nothing
+	output.clear();
+	CHECK(!m.terminal.EncodeMouse(MOUSE_PRESS, MOUSE_BUTTON_LEFT, 0, 250, 0,
+		0, 0, output));
+	// UTF-8 coordinates (1005)
+	m.Feed("\x1b[?1005h\x1b[?1005$p\x1b[?1006$p");
+	CHECK_EQUAL(m.Reply(), "\x1b[?1005;1$y\x1b[?1006;2$y");
+	m.terminal.EncodeMouse(MOUSE_PRESS, MOUSE_BUTTON_LEFT, 0, 250, 3, 0, 0,
+		output);
+	// column 251 + 32 = 283 = U+011B
+	CHECK_EQUAL(output, "\x1b[M \xc4\x9b$");
+	output.clear();
+	// urxvt (1015)
+	m.Feed("\x1b[?1015h");
+	m.terminal.EncodeMouse(MOUSE_RELEASE, MOUSE_BUTTON_LEFT, 0, 250, 3, 0, 0,
+		output);
+	CHECK_EQUAL(output, "\x1b[35;251;4M");
+	output.clear();
+	// SGR (1006) tells which button went up; resetting another encoding
+	// keeps it
+	m.Feed("\x1b[?1006h\x1b[?1005l\x1b[?1006$p");
+	CHECK_EQUAL(m.Reply(), "\x1b[?1006;1$y");
+	m.terminal.EncodeMouse(MOUSE_RELEASE, MOUSE_BUTTON_RIGHT, 0, 250, 3, 0,
+		0, output);
+	CHECK_EQUAL(output, "\x1b[<2;251;4m");
+	output.clear();
+	m.Feed("\x1b[?1006l");
+	CHECK(m.terminal.MouseEncoding() == MOUSE_ENCODING_DEFAULT);
+
+	// button events (1002): motion only with a button down
+	Fixture d(80, 24);
+	d.Feed("\x1b[?1002h\x1b[?1006h");
+	CHECK(!d.terminal.EncodeMouse(MOUSE_MOTION, MOUSE_BUTTON_NONE, 0, 3, 3,
+		0, 0, output));
+	d.terminal.EncodeMouse(MOUSE_MOTION, MOUSE_BUTTON_RIGHT, 0, 3, 3, 0, 0,
+		output);
+	CHECK_EQUAL(output, "\x1b[<34;4;4M");
+	output.clear();
+	// any events (1003): motion without buttons too
+	d.Feed("\x1b[?1003h");
+	d.terminal.EncodeMouse(MOUSE_MOTION, MOUSE_BUTTON_NONE, 0, 3, 3, 0, 0,
+		output);
+	CHECK_EQUAL(output, "\x1b[<35;4;4M");
+	output.clear();
+	d.Feed("\x1b[?1003l");
+	CHECK(!d.terminal.EncodeMouse(MOUSE_PRESS, MOUSE_BUTTON_LEFT, 0, 3, 3,
+		0, 0, output));
+
+	// alternate scroll (1007): off by default as in xterm, the user's
+	// default after a reset
+	Fixture a;
+	CHECK(!a.terminal.IsAlternateScroll());
+	a.Feed("\x1b[?1007h\x1b[?1007$p");
+	CHECK(a.terminal.IsAlternateScroll());
+	CHECK_EQUAL(a.Reply(), "\x1b[?1007;1$y");
+	a.Feed("\x1b" "c");
+	CHECK(!a.terminal.IsAlternateScroll());
+	a.terminal.SetDefaultAlternateScroll(true);
+	CHECK(a.terminal.IsAlternateScroll());
+	a.Feed("\x1b[?1007l\x1b[?1007$p");
+	CHECK(!a.terminal.IsAlternateScroll());
+	CHECK_EQUAL(a.Reply(), "\x1b[?1007;2$y");
+	a.Feed("\x1b" "c\x1b[?1007$p");
+	CHECK_EQUAL(a.Reply(), "\x1b[?1007;1$y");
 
 	// paste
 	Fixture p;
@@ -1205,6 +1427,7 @@ main()
 	TestEditing();
 	TestCursorAndRegions();
 	TestStyles();
+	TestUpstreamVT();
 	TestScreens();
 	TestReplies();
 	TestKeyboardProtocol();

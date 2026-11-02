@@ -61,8 +61,10 @@ underlines (`Smulx`, `Setulc`) and true color (`RGB`, `Tc`).
   of X11 and kitty.
 - **Mouse:** X10, normal, button and any-motion tracking; default, UTF-8, SGR,
   urxvt and SGR pixel encodings; focus events (mode 1004); alternate scroll
-  (mode 1007). Holding Shift selects text even when a program reports the
-  mouse.
+  (mode 1007: the wheel sends cursor keys on the alternate screen; on unless
+  a program turns it off or `~/config/settings/Terminal/Default` says
+  `"Alternate screen scroll" , "false"`). Holding Shift selects text even
+  when a program reports the mouse.
 - **Modes:** bracketed paste (2004), synchronized output (2026: drawing waits
   until the program is done, at most a second), in-band resize reports
   (2048), dark/light color scheme reports (2031, `CSI ? 996 n`), grapheme
