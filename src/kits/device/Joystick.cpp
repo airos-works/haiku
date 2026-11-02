@@ -8,6 +8,7 @@
 #include <Joystick.h>
 #include <JoystickTweaker.h>
 
+#include <errno.h>
 #include <new>
 #include <stdio.h>
 #include <sys/ioctl.h>
@@ -264,6 +265,67 @@ BJoystick::Update()
 			button2 = true;
 		}
 	}
+
+	return B_OK;
+}
+
+
+status_t
+BJoystick::GetDeviceIDs(uint16* outVendorID, uint16* outProductID)
+{
+	CALLED();
+	if (fFD < 0)
+		return B_NO_INIT;
+	if (outVendorID == NULL || outProductID == NULL)
+		return B_BAD_VALUE;
+
+	joystick_device_info info;
+	if (ioctl(fFD, B_JOYSTICK_GET_DEVICE_INFO, &info, sizeof(info)) != 0)
+		return errno;
+
+	*outVendorID = info.vendor_id;
+	*outProductID = info.product_id;
+	return B_OK;
+}
+
+
+bool
+BJoystick::HasRumble()
+{
+	CALLED();
+	return fJoystickInfo != NULL && fFD >= 0
+		&& (fJoystickInfo->module_info.flags & js_flag_force_feedback) != 0;
+}
+
+
+bool
+BJoystick::HasTriggerRumble()
+{
+	CALLED();
+	return HasRumble()
+		&& (fJoystickInfo->module_info.flags & js_flag_trigger_rumble) != 0;
+}
+
+
+status_t
+BJoystick::SetRumble(uint16 strongMagnitude, uint16 weakMagnitude,
+	bigtime_t duration, uint16 leftTriggerMagnitude,
+	uint16 rightTriggerMagnitude)
+{
+	CALLED();
+	if (fJoystickInfo == NULL || fFD < 0)
+		return B_NO_INIT;
+	if (!HasRumble())
+		return B_NOT_SUPPORTED;
+
+	joystick_rumble rumble;
+	rumble.strong_magnitude = strongMagnitude;
+	rumble.weak_magnitude = weakMagnitude;
+	rumble.left_trigger_magnitude = leftTriggerMagnitude;
+	rumble.right_trigger_magnitude = rightTriggerMagnitude;
+	rumble.duration = duration < 0 ? 0 : duration;
+	if (ioctl(fFD, B_JOYSTICK_SET_RUMBLE, &rumble, sizeof(rumble)) != 0)
+		return errno;
 
 	return B_OK;
 }

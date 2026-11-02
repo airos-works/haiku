@@ -35,9 +35,14 @@ JoystickProtocolHandler::JoystickProtocolHandler(HIDReport &report)
 	fMaxButton(0),
 	fButtons(NULL),
 	fOpenCount(0),
-	fUpdateThread(-1)
+	fUpdateThread(-1),
+	fRumbleSem(-1),
+	fRumbleThread(-1),
+	fRumbleEnd(B_INFINITE_TIMEOUT),
+	fRumbling(false)
 {
 	mutex_init(&fUpdateLock, "joystick update lock");
+	mutex_init(&fRumbleLock, "joystick rumble lock");
 	memset(&fJoystickModuleInfo, 0, sizeof(joystick_module_info));
 	memset(&fCurrentValues, 0, sizeof(variable_joystick));
 
@@ -108,7 +113,9 @@ JoystickProtocolHandler::JoystickProtocolHandler(HIDReport &report)
 	}
 
 
-	fCurrentValues.initialize(fAxisCount, fHatCount, fMaxButton);
+	// Reads before the first report must not return heap garbage.
+	if (fCurrentValues.initialize(fAxisCount, fHatCount, fMaxButton) == B_OK)
+		memset(fCurrentValues.data, 0, fCurrentValues.data_size);
 
 	TRACE("joystick device with %" B_PRIu32 " buttons, %" B_PRIu32
 		" axes and %" B_PRIu32 " hats\n",
@@ -119,6 +126,13 @@ JoystickProtocolHandler::JoystickProtocolHandler(HIDReport &report)
 
 JoystickProtocolHandler::~JoystickProtocolHandler()
 {
+	if (fRumbleSem >= 0) {
+		delete_sem(fRumbleSem);
+		status_t result;
+		wait_for_thread(fRumbleThread, &result);
+	}
+	mutex_destroy(&fRumbleLock);
+
 	free(fCurrentValues.data);
 	free(fAxis);
 	free(fHats);
@@ -218,12 +232,19 @@ JoystickProtocolHandler::Open(uint32 flags, uint32 *cookie)
 status_t
 JoystickProtocolHandler::Close(uint32 *cookie)
 {
+	bool lastClose = false;
 	status_t result = mutex_lock(&fUpdateLock);
 	if (result == B_OK) {
-		if (--fOpenCount == 0)
+		if (--fOpenCount == 0) {
 			fUpdateThread = -1;
+			lastClose = true;
+		}
 		mutex_unlock(&fUpdateLock);
 	}
+
+	// Don't let the motors run on after the application is gone.
+	if (lastClose)
+		_StopRumble();
 
 	return ProtocolHandler::Close(cookie);
 }
@@ -285,6 +306,7 @@ JoystickProtocolHandler::Control(uint32 *cookie, uint32 op, void *buffer,
 			if (!IS_USER_ADDRESS(buffer)
 				|| user_memcpy(&fJoystickModuleInfo, buffer,
 					sizeof(joystick_module_info)) != B_OK) {
+				mutex_unlock(&fUpdateLock);
 				return B_BAD_ADDRESS;
 			}
 
@@ -294,7 +316,10 @@ JoystickProtocolHandler::Control(uint32 *cookie, uint32 op, void *buffer,
 				// We revert to a structure that we can support using only
 				// the data available in an extended_joystick structure.
 				free(fCurrentValues.data);
-				fCurrentValues.initialize_to_extended_joystick();
+				if (fCurrentValues.initialize_to_extended_joystick() == B_OK) {
+					memset(fCurrentValues.data, 0,
+						fCurrentValues.data_size);
+				}
 				if (fAxisCount > MAX_AXES)
 					fAxisCount = MAX_AXES;
 				if (fHatCount > MAX_HATS)
@@ -312,6 +337,9 @@ JoystickProtocolHandler::Control(uint32 *cookie, uint32 op, void *buffer,
 			fJoystickModuleInfo.num_hats = fHatCount;
 			fJoystickModuleInfo.num_sticks = 1;
 			fJoystickModuleInfo.config_size = 0;
+			fJoystickModuleInfo.flags &= ~(js_flag_force_feedback
+				| js_flag_force_feedback_directional | js_flag_trigger_rumble);
+			fJoystickModuleInfo.flags |= fReport.Device()->RumbleFlags();
 			mutex_unlock(&fUpdateLock);
 			return B_OK;
 		}
@@ -326,9 +354,138 @@ JoystickProtocolHandler::Control(uint32 *cookie, uint32 op, void *buffer,
 				return B_BAD_ADDRESS;
 			}
 			return B_OK;
+
+		case B_JOYSTICK_GET_DEVICE_INFO:
+		{
+			if (length < sizeof(joystick_device_info))
+				return B_BAD_VALUE;
+
+			joystick_device_info info;
+			memset(&info, 0, sizeof(info));
+			info.vendor_id = fReport.Device()->VendorID();
+			info.product_id = fReport.Device()->ProductID();
+			if (!IS_USER_ADDRESS(buffer)
+				|| user_memcpy(buffer, &info, sizeof(info)) != B_OK) {
+				return B_BAD_ADDRESS;
+			}
+			return B_OK;
+		}
+
+		case B_JOYSTICK_SET_RUMBLE:
+		{
+			joystick_rumble rumble;
+			if (length < sizeof(joystick_rumble))
+				return B_BAD_VALUE;
+			if (!IS_USER_ADDRESS(buffer)
+				|| user_memcpy(&rumble, buffer, sizeof(rumble)) != B_OK) {
+				return B_BAD_ADDRESS;
+			}
+
+			return _SetRumble(rumble);
+		}
 	}
 
 	return B_ERROR;
+}
+
+
+status_t
+JoystickProtocolHandler::_SetRumble(const joystick_rumble &rumble)
+{
+	uint32 flags = fReport.Device()->RumbleFlags();
+	if ((flags & js_flag_force_feedback) == 0)
+		return B_NOT_SUPPORTED;
+
+	bool triggers = (flags & js_flag_trigger_rumble) != 0;
+	bool stop = rumble.duration <= 0
+		|| (rumble.strong_magnitude == 0 && rumble.weak_magnitude == 0
+			&& (!triggers || (rumble.left_trigger_magnitude == 0
+				&& rumble.right_trigger_magnitude == 0)));
+
+	MutexLocker locker(fRumbleLock);
+	if (stop) {
+		fRumbleEnd = B_INFINITE_TIMEOUT;
+		fRumbling = false;
+		return fReport.Device()->SetRumble(0, 0, 0, 0);
+	}
+
+	if (rumble.duration != B_INFINITE_TIMEOUT && fRumbleSem < 0) {
+		// The first timed effect: start the thread that ends them.
+		fRumbleSem = create_sem(0, "joystick rumble");
+		if (fRumbleSem < 0)
+			return fRumbleSem;
+
+		fRumbleThread = spawn_kernel_thread(_RumbleThread, "joystick rumble",
+			B_NORMAL_PRIORITY, this);
+		if (fRumbleThread < 0) {
+			delete_sem(fRumbleSem);
+			fRumbleSem = -1;
+			return fRumbleThread;
+		}
+		resume_thread(fRumbleThread);
+	}
+
+	status_t result = fReport.Device()->SetRumble(rumble.strong_magnitude,
+		rumble.weak_magnitude, triggers ? rumble.left_trigger_magnitude : 0,
+		triggers ? rumble.right_trigger_magnitude : 0);
+	if (result != B_OK)
+		return result;
+
+	fRumbling = true;
+	fRumbleEnd = rumble.duration == B_INFINITE_TIMEOUT
+		? B_INFINITE_TIMEOUT : system_time() + rumble.duration;
+	if (fRumbleSem >= 0)
+		release_sem_etc(fRumbleSem, 1, B_DO_NOT_RESCHEDULE);
+	return B_OK;
+}
+
+
+void
+JoystickProtocolHandler::_StopRumble()
+{
+	MutexLocker locker(fRumbleLock);
+	if (!fRumbling)
+		return;
+
+	fRumbling = false;
+	fRumbleEnd = B_INFINITE_TIMEOUT;
+	fReport.Device()->SetRumble(0, 0, 0, 0);
+}
+
+
+status_t
+JoystickProtocolHandler::_RumbleThread(void *data)
+{
+	JoystickProtocolHandler *handler = (JoystickProtocolHandler *)data;
+	while (true) {
+		mutex_lock(&handler->fRumbleLock);
+		bigtime_t end = handler->fRumbleEnd;
+		mutex_unlock(&handler->fRumbleLock);
+
+		status_t result;
+		if (end == B_INFINITE_TIMEOUT)
+			result = acquire_sem(handler->fRumbleSem);
+		else {
+			result = acquire_sem_etc(handler->fRumbleSem, 1,
+				B_ABSOLUTE_TIMEOUT, end);
+		}
+
+		if (result == B_BAD_SEM_ID)
+			break;
+		if (result != B_TIMED_OUT)
+			continue;
+				// a new effect: look at its end
+
+		MutexLocker locker(handler->fRumbleLock);
+		if (handler->fRumbling && handler->fRumbleEnd != B_INFINITE_TIMEOUT
+			&& system_time() >= handler->fRumbleEnd) {
+			handler->fRumbling = false;
+			handler->fRumbleEnd = B_INFINITE_TIMEOUT;
+			handler->fReport.Device()->SetRumble(0, 0, 0, 0);
+		}
+	}
+
+	return B_OK;
 }
 
 

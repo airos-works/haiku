@@ -5,6 +5,7 @@
 
 #include <LEHIDMouseDecoder.h>
 
+#include "HIDCollection.h"
 #include "HIDParser.h"
 #include "HIDReport.h"
 #include "HIDReportItem.h"
@@ -23,6 +24,9 @@ static const uint16 kYAxis = 0x31;
 static const uint16 kWheel = 0x38;
 static const uint16 kPan = 0x0238;
 static const uint16 kMaximumButtons = 8;
+static const uint16 kJoystick = 0x04;
+static const uint16 kGamePad = 0x05;
+static const uint16 kMultiAxisController = 0x08;
 
 
 LEHIDMouseDecoder::LEHIDMouseDecoder()
@@ -135,6 +139,32 @@ LEHIDMouseDecoder::Decode(uint8 reportID, const uint8* value,
 	}
 	report->SetReport(B_NO_INIT, NULL, 0);
 	return B_OK;
+}
+
+
+
+bool
+LEHIDReportMapHasGamepad(const uint8* reportMap, size_t length)
+{
+	if (reportMap == NULL || length == 0 || length > 4096)
+		return false;
+	HIDParser parser(NULL);
+	if (parser.ParseReportDescriptor(reportMap, length) != B_OK)
+		return false;
+	HIDCollection* root = parser.RootCollection();
+	if (root == NULL)
+		return false;
+	uint32 count = root->CountChildrenFlat(COLLECTION_APPLICATION);
+	for (uint32 i = 0; i < count; i++) {
+		HIDCollection* collection
+			= root->ChildAtFlat(COLLECTION_APPLICATION, i);
+		if (collection != NULL && collection->UsagePage() == kGenericDesktop
+			&& (collection->UsageID() == kJoystick
+				|| collection->UsageID() == kGamePad
+				|| collection->UsageID() == kMultiAxisController))
+			return true;
+	}
+	return false;
 }
 
 } // namespace Bluetooth

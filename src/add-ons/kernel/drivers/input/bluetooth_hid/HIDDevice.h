@@ -53,6 +53,20 @@ public:
 			status_t			SendReport(HIDReport* report);
 
 			HIDParser&			Parser() { return fParser; }
+
+	// Rumble for the joystick protocol handler: not over Bluetooth yet. The
+	// pads that have it want vendor output reports (the DualShock 4 one also
+	// switches it to an input report the descriptor doesn't describe).
+			uint32				RumbleFlags() const { return 0; }
+
+	// From the device's PnP information, 0 when it has none
+			void				SetIDs(uint16 vendor, uint16 product)
+									{ fVendorID = vendor;
+									  fProductID = product; }
+			uint16				VendorID() const { return fVendorID; }
+			uint16				ProductID() const { return fProductID; }
+			status_t			SetRumble(uint16, uint16, uint16, uint16)
+									{ return B_NOT_SUPPORTED; }
 			ProtocolHandler*	ProtocolHandlerAt(uint32 index) const;
 
 	// From the Bluetooth server
@@ -93,6 +107,9 @@ private:
 			ConditionVariable	fQueueSpace;
 
 			uint32				fDropped;
+
+			uint16				fVendorID;
+			uint16				fProductID;
 };
 
 

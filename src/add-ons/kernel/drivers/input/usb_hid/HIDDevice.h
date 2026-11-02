@@ -41,6 +41,37 @@ public:
 
 			status_t			SendReport(HIDReport *report);
 
+	// For quirky devices: who they are and a way to talk to them besides
+	// HID reports.
+			uint16				VendorID() const { return fVendorID; }
+			uint16				ProductID() const { return fProductID; }
+			usb_device			USBDevice() const { return fDevice; }
+			size_t				InterfaceIndex() const
+									{ return fInterfaceIndex; }
+			uint8				NextOutputSequence()
+									{ return (uint8)atomic_add(
+										&fOutputSequence, 1); }
+
+			status_t			QueueOutput(const void *data, size_t length);
+									// on the interrupt out endpoint, without
+									// waiting: may be called from transfer
+									// callbacks
+			status_t			SendOutputReport(const void *data,
+									size_t length);
+									// an output report, report ID first: on
+									// the interrupt out endpoint when there
+									// is one, else with SET_REPORT
+			void				Restart();
+									// run the quirk's start function again
+									// (at most every two seconds)
+
+	// Rumble (force feedback), for the joystick protocol handler
+			uint32				RumbleFlags() const;
+									// js_flag_force_feedback,
+									// js_flag_trigger_rumble
+			status_t			SetRumble(uint16 strong, uint16 weak,
+									uint16 leftTrigger, uint16 rightTrigger);
+
 			HIDParser &			Parser() { return fParser; }
 			ProtocolHandler *	ProtocolHandlerAt(uint32 index) const;
 
@@ -54,17 +85,29 @@ private:
 	static	void				_UnstallCallback(void *cookie,
 									status_t status, void *data,
 									size_t actualLength);
+	static	void				_OutputCallback(void *cookie,
+									status_t status, void *data,
+									size_t actualLength);
+			void				_Start();
 
 private:
 			status_t			fStatus;
 			usb_device			fDevice;
 			usb_pipe			fInterruptPipe;
+			usb_pipe			fOutputPipe;
 			size_t				fInterfaceIndex;
+			int32				fQuirkyIndex;
+			uint16				fVendorID;
+			uint16				fProductID;
 			uint8				fEndpointAddress;
 
 			int32				fTransferScheduled;
 			size_t				fTransferBufferSize;
 			uint8 *				fTransferBuffer;
+			uint8 *				fReportBuffer;
+				// what a quirk's translate function makes of the transfer
+			int32				fOutputSequence;
+			bigtime_t			fLastStart;
 
 			int32				fParentCookie;
 			int32				fOpenCount;

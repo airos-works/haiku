@@ -128,7 +128,9 @@ usb_hid_device_added(usb_device device, void **cookie)
 						!= quirky.device_subclass)
 				|| (quirky.device_protocol != 0
 					&& interface->descr->interface_protocol
-						!= quirky.device_protocol)) {
+						!= quirky.device_protocol)
+				|| ((quirky.flags & QUIRK_FIRST_INTERFACE_ONLY) != 0
+					&& interface->descr->interface_number != 0)) {
 				continue;
 			}
 

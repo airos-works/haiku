@@ -1,0 +1,8 @@
+SubDir HAIKU_TOP src tests kits bluetooth le_gamepad_map_test ;
+
+UsePrivateHeaders bluetooth ;
+
+SimpleTest le_gamepad_map_test :
+	le_gamepad_map_test.cpp
+	: libbluetooth.so
+;

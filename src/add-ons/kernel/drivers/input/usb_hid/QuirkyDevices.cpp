@@ -1,11 +1,14 @@
 /*
  * Copyright 2011 Michael Lotz <mmlr@mlotz.ch>
+ * Copyright 2026, Haiku, Inc. All rights reserved.
  * Distributed under the terms of the MIT license.
  */
 
 
 #include "QuirkyDevices.h"
 
+#include "GamepadProtocols.h"
+#include "HIDDevice.h"
 #include "HIDWriter.h"
 
 #include <string.h>
@@ -205,43 +208,108 @@ elecom_build_descriptor(HIDWriter &writer)
 }
 
 
+// #pragma mark - Xbox 360
+
+
 static status_t
-xbox360_build_descriptor(HIDWriter &writer)
+xbox360_translate_report(HIDDevice &device, const uint8 *data, size_t length,
+	uint8 *report, size_t *reportLength)
 {
-	writer.BeginCollection(COLLECTION_APPLICATION,
-		B_HID_USAGE_PAGE_GENERIC_DESKTOP, B_HID_UID_GD_JOYSTICK);
+	if (!xbox360_translate(data, length, report))
+		return B_BUSY;
 
-	main_item_data_converter converter;
-	converter.flat_data = 0; // defaults
-	converter.main_data.array_variable = 1;
-	converter.main_data.no_preferred = 1;
+	*reportLength = XBOX360_REPORT_SIZE;
+	return B_OK;
+}
 
-	// unknown / padding / byte count
-	writer.DefineInputPadding(2, 8);
 
-	// dpad / buttons
-	writer.DefineInputData(11, 1, converter.main_data, 0, 1,
-		B_HID_USAGE_PAGE_BUTTON, 1);
-	writer.DefineInputPadding(1, 1);
-	writer.DefineInputData(4, 1, converter.main_data, 0, 1,
-		B_HID_USAGE_PAGE_BUTTON, 12);
+static status_t
+xbox360_rumble(HIDDevice &device, uint16 strong, uint16 weak, uint16, uint16)
+{
+	uint8 packet[8];
+	size_t length = xbox360_build_rumble(strong, weak, packet);
+	return device.QueueOutput(packet, length);
+}
 
-	// triggers
-	writer.DefineInputData(1, 8, converter.main_data, 0, 255,
-		B_HID_USAGE_PAGE_GENERIC_DESKTOP, B_HID_UID_GD_Z);
-	writer.DefineInputData(1, 8, converter.main_data, 0, 255,
-		B_HID_USAGE_PAGE_GENERIC_DESKTOP, B_HID_UID_GD_RZ);
 
-	// sticks
-	writer.DefineInputData(2, 16, converter.main_data, -32768, 32767,
-		B_HID_USAGE_PAGE_GENERIC_DESKTOP, B_HID_UID_GD_X);
-	writer.DefineInputData(2, 16, converter.main_data, -32768, 32767,
-		B_HID_USAGE_PAGE_GENERIC_DESKTOP, B_HID_UID_GD_X);
+// #pragma mark - Xbox One / Series (GIP)
 
-	// unknown / padding
-	writer.DefineInputPadding(6, 8);
 
-	return writer.EndCollection();
+static status_t
+gip_start(HIDDevice &device)
+{
+	uint8 packet[GIP_MAX_PACKET];
+	for (uint32 i = 0;; i++) {
+		size_t length = gip_init_packet(device.VendorID(), device.ProductID(),
+			i, packet);
+		if (length == 0)
+			break;
+
+		packet[2] = device.NextOutputSequence();
+		status_t result = device.QueueOutput(packet, length);
+		if (result != B_OK)
+			return result;
+	}
+
+	return B_OK;
+}
+
+
+static status_t
+gip_translate_report(HIDDevice &device, const uint8 *data, size_t length,
+	uint8 *report, size_t *reportLength)
+{
+	gip_translation result;
+	gip_translate(device.VendorID(), device.ProductID(), data, length, report,
+		result);
+
+	if (result.ack_length > 0)
+		device.QueueOutput(result.ack, result.ack_length);
+	if (result.announced) {
+		TRACE_ALWAYS("Xbox controller %04x:%04x announced itself, "
+			"initializing it\n", device.VendorID(), device.ProductID());
+		device.Restart();
+	}
+
+	if (!result.deliver)
+		return B_BUSY;
+
+	*reportLength = GIP_REPORT_SIZE;
+	return B_OK;
+}
+
+
+static status_t
+gip_rumble(HIDDevice &device, uint16 strong, uint16 weak, uint16 leftTrigger,
+	uint16 rightTrigger)
+{
+	uint8 packet[13];
+	size_t length = gip_build_rumble(device.NextOutputSequence(), strong,
+		weak, leftTrigger, rightTrigger, packet);
+	return device.QueueOutput(packet, length);
+}
+
+
+// #pragma mark - Sony
+
+
+static status_t
+dualshock4_rumble(HIDDevice &device, uint16 strong, uint16 weak, uint16,
+	uint16)
+{
+	uint8 report[DUALSHOCK4_OUTPUT_SIZE];
+	size_t length = dualshock4_build_rumble(strong, weak, report);
+	return device.SendOutputReport(report, length);
+}
+
+
+static status_t
+dualsense_rumble(HIDDevice &device, uint16 strong, uint16 weak, uint16,
+	uint16)
+{
+	uint8 report[DUALSENSE_OUTPUT_SIZE];
+	size_t length = dualsense_build_rumble(strong, weak, report);
+	return device.SendOutputReport(report, length);
 }
 
 
@@ -253,23 +321,63 @@ usb_hid_quirky_device gQuirkyDevices[] = {
 		// and pressure sensitive buttons, so we constrcut a new report
 		// descriptor that includes those extra items.
 		0x054c, 0x0268, USB_INTERFACE_CLASS_HID, 0, 0,
-		sixaxis_init, sixaxis_build_descriptor
+		sixaxis_init, sixaxis_build_descriptor,
+		NULL, NULL, NULL, 0
 	},
 
 	{
 		// Elecom trackball which has 6 buttons, and includes them in the report, but not in the
 		// report descriptor. Construct a report descriptor including all 6 buttons.
 		0x056e, 0x00fd, USB_INTERFACE_CLASS_HID, 0, 0,
-		NULL, elecom_build_descriptor
+		NULL, elecom_build_descriptor,
+		NULL, NULL, NULL, 0
 	},
 
 	{
 		// XBOX 360 controllers aren't really HID (marked vendor specific).
 		// They therefore don't provide a HID/report descriptor either. The
 		// input stream is HID-like enough though. We therefore claim support
-		// and build a report descriptor of our own.
+		// and build a report descriptor of our own; the translation drops
+		// the status messages and flips the Y axes to grow downwards.
 		0, 0, 0xff /* vendor specific */, 0x5d /* XBOX controller */, 0x01,
-		NULL, xbox360_build_descriptor
+		NULL, xbox360_build_descriptor,
+		NULL, xbox360_translate_report, xbox360_rumble, 0
+	},
+
+	{
+		// Xbox One and Xbox Series controllers, and the third-party ones
+		// built like them (PowerA, PDP, Hori, Razer...), speak GIP on a
+		// vendor specific interface: woken up with a power-on packet, they
+		// send input packets that we translate into reports of a descriptor
+		// of our own. Interface 0 carries the input; the others are audio
+		// and security.
+		0, 0, 0xff /* vendor specific */, 0x47 /* GIP */, 0xd0,
+		NULL, gip_build_descriptor,
+		gip_start, gip_translate_report, gip_rumble,
+		QUIRK_FIRST_INTERFACE_ONLY | QUIRK_TRIGGER_RUMBLE
+	},
+
+	// Sony DualShock 4 and DualSense pads are HID devices; the quirk only
+	// adds their rumble output reports.
+	{
+		0x054c, 0x05c4, USB_INTERFACE_CLASS_HID, 0, 0,	// DualShock 4
+		NULL, NULL, NULL, NULL, dualshock4_rumble, 0
+	},
+	{
+		0x054c, 0x09cc, USB_INTERFACE_CLASS_HID, 0, 0,	// DualShock 4 (2nd)
+		NULL, NULL, NULL, NULL, dualshock4_rumble, 0
+	},
+	{
+		0x054c, 0x0ba0, USB_INTERFACE_CLASS_HID, 0, 0,	// DS4 USB adapter
+		NULL, NULL, NULL, NULL, dualshock4_rumble, 0
+	},
+	{
+		0x054c, 0x0ce6, USB_INTERFACE_CLASS_HID, 0, 0,	// DualSense
+		NULL, NULL, NULL, NULL, dualsense_rumble, 0
+	},
+	{
+		0x054c, 0x0df2, USB_INTERFACE_CLASS_HID, 0, 0,	// DualSense Edge
+		NULL, NULL, NULL, NULL, dualsense_rumble, 0
 	}
 };
 

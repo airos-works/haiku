@@ -39,6 +39,12 @@ private:
 	HIDParser* fParser;
 };
 
+
+// Whether a report map has a joystick or game pad (a Generic Desktop Joystick,
+// Game Pad or Multi-axis Controller application collection). Such devices go
+// to the bluetooth_hid driver, which publishes them under /dev/joystick.
+bool LEHIDReportMapHasGamepad(const uint8* reportMap, size_t length);
+
 } // namespace Bluetooth
 
 #endif

@@ -144,6 +144,7 @@ create_device(control_cookie* cookie, void* buffer, size_t length)
 		delete device;
 		return status;
 	}
+	device->SetIDs(create.vendor_id, create.product_id);
 
 	// Publish every part under the first free number, as usb_hid does:
 	// "keyboard/bluetooth/0" may be free while "1" is taken.

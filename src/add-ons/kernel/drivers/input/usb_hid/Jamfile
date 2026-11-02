@@ -20,6 +20,7 @@ KernelAddon usb_hid :
 	HIDReportItem.cpp
 	HIDWriter.cpp
 
+	GamepadProtocols.cpp
 	QuirkyDevices.cpp
 
 	ProtocolHandler.cpp

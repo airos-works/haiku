@@ -14,6 +14,7 @@
 #include "ProtocolHandler.h"
 #include "QuirkyDevices.h"
 
+#include <joystick_driver.h>
 #include <usb/USB_hid.h>
 
 #include <stdlib.h>
@@ -28,11 +29,18 @@ HIDDevice::HIDDevice(usb_device device, const usb_configuration_info *config,
 	:	fStatus(B_NO_INIT),
 		fDevice(device),
 		fInterruptPipe(0),
+		fOutputPipe(0),
 		fInterfaceIndex(interfaceIndex),
+		fQuirkyIndex(quirkyIndex),
+		fVendorID(0),
+		fProductID(0),
 		fEndpointAddress(0),
 		fTransferScheduled(0),
 		fTransferBufferSize(0),
 		fTransferBuffer(NULL),
+		fReportBuffer(NULL),
+		fOutputSequence(0),
+		fLastStart(0),
 		fParentCookie(-1),
 		fOpenCount(0),
 		fOpenReferences(0),
@@ -46,6 +54,8 @@ HIDDevice::HIDDevice(usb_device device, const usb_configuration_info *config,
 
 	const usb_device_descriptor *deviceDescriptor
 		= gUSBModule->get_device_descriptor(device);
+	fVendorID = deviceDescriptor->vendor_id;
+	fProductID = deviceDescriptor->product_id;
 
 	HIDWriter descriptorWriter;
 	bool hasFixedDescriptor = false;
@@ -166,17 +176,24 @@ HIDDevice::HIDDevice(usb_device device, const usb_configuration_info *config,
 		fParser.ReportAt(HID_REPORT_TYPE_ANY, i)->PrintToStream();
 #endif
 
-	// find the interrupt in pipe
+	// find the interrupt in pipe, and the interrupt out one if any
+	size_t maxPacketSize = 0;
 	usb_interface_info *interface = config->interface[interfaceIndex].active;
 	for (size_t i = 0; i < interface->endpoint_count; i++) {
 		usb_endpoint_descriptor *descriptor = interface->endpoint[i].descr;
-		if ((descriptor->endpoint_address & USB_ENDPOINT_ADDR_DIR_IN)
-			&& (descriptor->attributes & USB_ENDPOINT_ATTR_MASK)
-				== USB_ENDPOINT_ATTR_INTERRUPT) {
-			fEndpointAddress = descriptor->endpoint_address;
-			fInterruptPipe = interface->endpoint[i].handle;
-			break;
+		if ((descriptor->attributes & USB_ENDPOINT_ATTR_MASK)
+				!= USB_ENDPOINT_ATTR_INTERRUPT) {
+			continue;
 		}
+
+		if ((descriptor->endpoint_address & USB_ENDPOINT_ADDR_DIR_IN) != 0) {
+			if (fInterruptPipe == 0) {
+				fEndpointAddress = descriptor->endpoint_address;
+				fInterruptPipe = interface->endpoint[i].handle;
+				maxPacketSize = descriptor->max_packet_size & 0x7ff;
+			}
+		} else if (fOutputPipe == 0)
+			fOutputPipe = interface->endpoint[i].handle;
 	}
 
 	if (fInterruptPipe == 0) {
@@ -188,6 +205,23 @@ HIDDevice::HIDDevice(usb_device device, const usb_configuration_info *config,
 	if (fTransferBufferSize == 0) {
 		TRACE_ALWAYS("report claims a report size of 0\n");
 		return;
+	}
+
+	if (quirkyIndex >= 0
+		&& gQuirkyDevices[quirkyIndex].translate_function != NULL) {
+		// The device sends something else than the reports of the built
+		// descriptor, of any length up to a packet: receive whole packets
+		// and keep the translated report apart.
+		fReportBuffer = (uint8 *)calloc(1, fTransferBufferSize + 3);
+		if (fReportBuffer == NULL) {
+			fStatus = B_NO_MEMORY;
+			return;
+		}
+
+		if (fTransferBufferSize < maxPacketSize)
+			fTransferBufferSize = maxPacketSize;
+		if (fTransferBufferSize < 64)
+			fTransferBufferSize = 64;
 	}
 
 	// We pad the allocation size so that we can always read 32 bits at a time
@@ -215,6 +249,8 @@ HIDDevice::HIDDevice(usb_device device, const usb_configuration_info *config,
 	ProtocolHandler::AddHandlers(*this, fProtocolHandlerList,
 		fProtocolHandlerCount);
 	fStatus = B_OK;
+
+	_Start();
 }
 
 
@@ -228,6 +264,7 @@ HIDDevice::~HIDDevice()
 	}
 
 	free(fTransferBuffer);
+	free(fReportBuffer);
 }
 
 
@@ -241,7 +278,11 @@ HIDDevice::SetParentCookie(int32 cookie)
 status_t
 HIDDevice::Open(ProtocolHandler *handler, uint32 flags)
 {
-	atomic_add(&fOpenCount, 1);
+	if (atomic_add(&fOpenCount, 1) == 0 && !fRemoved) {
+		// Pads that need waking up get it again: they may have been
+		// replugged into a hub that kept power, or restarted.
+		_Start();
+	}
 	atomic_add(&fOpenReferences, 1);
 	return B_OK;
 }
@@ -311,6 +352,92 @@ HIDDevice::SendReport(HIDReport *report)
 }
 
 
+status_t
+HIDDevice::QueueOutput(const void *data, size_t length)
+{
+	if (fRemoved)
+		return ENODEV;
+	if (fOutputPipe == 0)
+		return B_NOT_SUPPORTED;
+
+	// The transfer outlives the caller's buffer; the callback frees the copy
+	// and never touches the device, which may be gone by then.
+	void *buffer = malloc(length);
+	if (buffer == NULL)
+		return B_NO_MEMORY;
+
+	memcpy(buffer, data, length);
+	status_t result = gUSBModule->queue_interrupt(fOutputPipe, buffer, length,
+		_OutputCallback, buffer);
+	if (result != B_OK) {
+		free(buffer);
+		TRACE_ALWAYS("failed to queue an output transfer: %s\n",
+			strerror(result));
+	}
+
+	return result;
+}
+
+
+status_t
+HIDDevice::SendOutputReport(const void *data, size_t length)
+{
+	if (fRemoved)
+		return ENODEV;
+	if (length == 0)
+		return B_BAD_VALUE;
+	if (fOutputPipe != 0)
+		return QueueOutput(data, length);
+
+	size_t actualLength;
+	return gUSBModule->send_request(fDevice,
+		USB_REQTYPE_INTERFACE_OUT | USB_REQTYPE_CLASS,
+		B_USB_REQUEST_HID_SET_REPORT, 0x200 | ((const uint8 *)data)[0],
+		fInterfaceIndex, length, (void *)data, &actualLength);
+}
+
+
+void
+HIDDevice::Restart()
+{
+	if (system_time() - fLastStart < 2000000)
+		return;
+
+	_Start();
+}
+
+
+uint32
+HIDDevice::RumbleFlags() const
+{
+	if (fQuirkyIndex < 0
+		|| gQuirkyDevices[fQuirkyIndex].rumble_function == NULL) {
+		return 0;
+	}
+
+	uint32 flags = js_flag_force_feedback;
+	if ((gQuirkyDevices[fQuirkyIndex].flags & QUIRK_TRIGGER_RUMBLE) != 0)
+		flags |= js_flag_trigger_rumble;
+	return flags;
+}
+
+
+status_t
+HIDDevice::SetRumble(uint16 strong, uint16 weak, uint16 leftTrigger,
+	uint16 rightTrigger)
+{
+	if (fRemoved)
+		return ENODEV;
+	if (fQuirkyIndex < 0
+		|| gQuirkyDevices[fQuirkyIndex].rumble_function == NULL) {
+		return B_NOT_SUPPORTED;
+	}
+
+	return gQuirkyDevices[fQuirkyIndex].rumble_function(*this, strong, weak,
+		leftTrigger, rightTrigger);
+}
+
+
 ProtocolHandler *
 HIDDevice::ProtocolHandlerAt(uint32 index) const
 {
@@ -356,5 +483,47 @@ HIDDevice::_TransferCallback(void *cookie, status_t status, void *data,
 	}
 
 	atomic_set(&device->fTransferScheduled, 0);
+
+	quirky_translate_function translate = device->fQuirkyIndex >= 0
+		? gQuirkyDevices[device->fQuirkyIndex].translate_function : NULL;
+	if (translate != NULL && status == B_OK) {
+		size_t reportLength = 0;
+		if (translate(*device, device->fTransferBuffer, actualLength,
+				device->fReportBuffer, &reportLength) == B_OK) {
+			device->fParser.SetReport(B_OK, device->fReportBuffer,
+				reportLength);
+		} else {
+			// Nothing for the parser (a status message, say): the waiting
+			// handlers schedule the next transfer.
+			device->fParser.SetReport(B_BUSY, NULL, 0);
+		}
+		return;
+	}
+
 	device->fParser.SetReport(status, device->fTransferBuffer, actualLength);
+}
+
+
+void
+HIDDevice::_OutputCallback(void *cookie, status_t status, void *data,
+	size_t actualLength)
+{
+	if (status != B_OK && status != B_CANCELED)
+		TRACE("output transfer failed: %s\n", strerror(status));
+	free(cookie);
+}
+
+
+void
+HIDDevice::_Start()
+{
+	if (fQuirkyIndex < 0
+		|| gQuirkyDevices[fQuirkyIndex].start_function == NULL) {
+		return;
+	}
+
+	fLastStart = system_time();
+	status_t result = gQuirkyDevices[fQuirkyIndex].start_function(*this);
+	if (result != B_OK)
+		TRACE_ALWAYS("starting the device failed: %s\n", strerror(result));
 }
