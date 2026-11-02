@@ -450,6 +450,17 @@ edit("deps/cares/cares.gyp",
                      lambda m: m.group(1) + CARES_HAIKU, re.S),
      "c-ares haiku config", 'config/haiku')
 
+# c-ares before 1.18 (Node 10, 11, 13, 15) predates its Haiku port and reads
+# /etc/resolv.conf, which Haiku does not have: dns.resolve*() then asked
+# 127.0.0.1. Add 1.18's Haiku paths (1.18 and later have them, in src/lib).
+edit("deps/cares/src/ares_private.h",
+     lambda s: once(s, '#else\n\n#define PATH_RESOLV_CONF        "/etc/resolv.conf"\n',
+                    '#elif defined(__HAIKU__)\n\n'
+                    '#define PATH_RESOLV_CONF "/system/settings/network/resolv.conf"\n'
+                    '#define PATH_HOSTS              "/system/settings/network/hosts"\n\n'
+                    '#else\n\n#define PATH_RESOLV_CONF        "/etc/resolv.conf"\n'),
+     "c-ares Haiku resolv.conf and hosts paths", "__HAIKU__", optional=True)
+
 
 def ares_config():
     """The c-ares configure result for the bundled c-ares, from ares/ next to
