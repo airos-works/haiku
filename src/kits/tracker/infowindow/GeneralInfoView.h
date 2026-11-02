@@ -88,6 +88,7 @@ private:
 	void CheckAndSetSize();
 	void OpenLinkSource();
 	void OpenLinkTarget();
+	void _PreferredAppNotStored(const char* signature);
 
 	BString fPathStr;
 	BString fLinkToStr;

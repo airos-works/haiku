@@ -37,6 +37,7 @@ All rights reserved.
 
 #include <algorithm>
 
+#include <Alert.h>
 #include <Application.h>
 #include <Catalog.h>
 #include <ControlLook.h>
@@ -641,6 +642,57 @@ GeneralInfoView::MouseMoved(BPoint where, uint32, const BMessage* dragMessage)
 }
 
 
+/*!	The file's volume would not keep \a signature as the application to open
+	the file with. Offers to make it the one for every file of the type, and
+	marks in the menu what is in effect afterwards.
+*/
+void
+GeneralInfoView::_PreferredAppNotStored(const char* signature)
+{
+	BMimeType type(fModel->MimeType());
+	if (signature != NULL && type.IsValid() && type.IsInstalled()) {
+		BString appName(signature);
+		entry_ref appRef;
+		if (be_roster->FindApp(signature, &appRef) == B_OK)
+			appName = B_TRANSLATE_SYSTEM_NAME(appRef.name);
+
+		char description[B_MIME_TYPE_LENGTH];
+		BString typeName(type.Type());
+		if (type.GetShortDescription(description) == B_OK
+			&& description[0] != '\0') {
+			typeName = description;
+		}
+
+		BString text(B_TRANSLATE("This volume cannot remember an application "
+			"for a single file.\n\nOpen all files of the type \"%type%\" with "
+			"%app% instead?"));
+		text.ReplaceFirst("%type%", typeName);
+		text.ReplaceFirst("%app%", appName);
+		BString useForAll(B_TRANSLATE("Open all with %app%"));
+		useForAll.ReplaceFirst("%app%", appName);
+
+		BAlert* alert = new BAlert(B_TRANSLATE("Opens with"), text,
+			B_TRANSLATE("Cancel"), useForAll, NULL, B_WIDTH_AS_USUAL,
+			B_INFO_ALERT);
+		alert->SetShortcut(0, B_ESCAPE);
+		if (alert->Go() == 1 && type.SetPreferredApp(signature) != B_OK) {
+			BAlert* failed = new BAlert(B_TRANSLATE("Opens with"),
+				B_TRANSLATE("The application for the file type could not be "
+					"changed."), B_TRANSLATE("OK"), NULL, NULL,
+				B_WIDTH_AS_USUAL, B_STOP_ALERT);
+			failed->SetFlags(failed->Flags() | B_CLOSE_ON_ESCAPE);
+			failed->Go();
+		}
+	}
+
+	// The file itself still has no application of its own.
+	if (fPreferredAppMenu != NULL) {
+		if (BMenuItem* item = fPreferredAppMenu->Menu()->ItemAt(0))
+			item->SetMarked(true);
+	}
+}
+
+
 void
 GeneralInfoView::OpenLinkSource()
 {
@@ -781,8 +833,16 @@ GeneralInfoView::MessageReceived(BMessage* message)
 			if (message->FindString("signature", &newSignature) != B_OK)
 				newSignature = NULL;
 
-			fModel->SetPreferredAppSignature(newSignature);
-			nodeInfo.SetPreferredApp(newSignature);
+			if (nodeInfo.SetPreferredApp(newSignature) == B_OK) {
+				fModel->SetPreferredAppSignature(newSignature);
+				break;
+			}
+
+			// The file cannot keep it: its volume stores no attributes (an
+			// SMB share, for one). What can be had is the application for
+			// all files of the type, so offer that instead of quietly
+			// forgetting the choice.
+			_PreferredAppNotStored(newSignature);
 			break;
 		}
 
