@@ -662,6 +662,7 @@ virtual	status_t						GetDescriptor(uint8 descriptorType,
 
 		status_t						UpdatePortStatus(uint8 index);
 		status_t						ResetPort(uint8 index);
+		status_t						_ResetPortOnce(uint8 index);
 		status_t						DisablePort(uint8 index);
 
 		void							Explore(change_item **changeList);
