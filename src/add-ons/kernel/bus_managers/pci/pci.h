@@ -253,6 +253,7 @@ private:
 			PCIDev *		_FindDevice(PCIBus *current, uint8 domain,
 								uint8 bus, uint8 device, uint8 function);
 
+			uint16			_CommandForMSI(PCIDev* device);
 			void			_HtMSIMap(PCIDev *device, uint64 address);
 			status_t		_AllocateMSIVectors(PCIDev* device, uint32 count,
 								uint32* startVector, uint64* address, uint32* data);

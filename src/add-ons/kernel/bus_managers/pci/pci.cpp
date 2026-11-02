@@ -2530,6 +2530,27 @@ PCI::UnconfigureMSI(PCIDev *device)
 }
 
 
+/*!	The command register for enabling MSI or MSI-X, with bus mastering on:
+	an MSI is a memory write by the device, which it can't do without.
+	Upstream asserted that the driver had enabled it already, which panicked
+	(KDEBUG images) for amdgpu_drm, whose Linux code enables MSI first
+	(airos-works/haiku: 2026-11-02 Framework 13 boot panic). It is enabled
+	here instead, the parent bridges with it (WriteConfig()).
+*/
+uint16
+PCI::_CommandForMSI(PCIDev* device)
+{
+	uint16 command = ReadConfig(device, PCI_command, 2);
+	if ((command & PCI_command_master) == 0) {
+		dprintf("PCI: %u:%u:%u: bus mastering enabled for MSI\n",
+			device->bus, device->device, device->function);
+		command |= PCI_command_master;
+		WriteConfig(device, PCI_command, 2, command);
+	}
+	return command;
+}
+
+
 status_t
 PCI::EnableMSI(PCIDev *device)
 {
@@ -2543,11 +2564,8 @@ PCI::EnableMSI(PCIDev *device)
 	if (info->configured_count == 0)
 		return B_NO_INIT;
 
-	// ensure bus-mastering has already been enabled
-	const uint16 command = ReadConfig(device, PCI_command, 2);
-	ASSERT((command & PCI_command_master) != 0);
-
-	// ensure the pinned interrupt is disabled
+	// ensure the pinned interrupt is disabled, and bus mastering enabled
+	const uint16 command = _CommandForMSI(device);
 	WriteConfig(device, PCI_command, 2, command | PCI_command_int_disable);
 
 	// enable msi generation
@@ -2714,11 +2732,8 @@ PCI::EnableMSIX(PCIDev *device)
 	if (info->configured_count == 0)
 		return B_NO_INIT;
 
-	// ensure bus-mastering has already been enabled
-	const uint16 command = ReadConfig(device, PCI_command, 2);
-	ASSERT((command & PCI_command_master) != 0);
-
-	// ensure the pinned interrupt is disabled
+	// ensure the pinned interrupt is disabled, and bus mastering enabled
+	const uint16 command = _CommandForMSI(device);
 	WriteConfig(device, PCI_command, 2, command | PCI_command_int_disable);
 
 	// enable msi-x generation
