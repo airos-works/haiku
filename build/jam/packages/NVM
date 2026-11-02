@@ -1,6 +1,7 @@
 # nvm, the Node Version Manager, taught Haiku (data/nvm, tools/nodejs-haiku).
-# Architecture-neutral: shell scripts, the Haiku patches for each Node.js
-# major it can build from source, and the login-shell hook that /etc/profile
+# Architecture-neutral: shell scripts, the Haiku port of Node.js it applies to
+# the releases it builds from source (port-haiku.py, V8's platform file and
+# c-ares' configure results), and the login-shell hook that /etc/profile
 # picks up from data/profile.d.
 
 local nvmPackage = nvm.hpkg ;
@@ -13,8 +14,13 @@ local nvmFiles = <nvm>nvm.sh <nvm>nvm-exec <nvm>bash_completion
 SEARCH on $(nvmFiles) = $(nvmDir) ;
 AddFilesToPackage data nvm : $(nvmFiles) ;
 
-local nvmPatches = [ Glob $(nvmDir)/haiku/patches : node-v*.patch ] ;
-AddFilesToPackage data nvm haiku patches : $(nvmPatches) ;
+local nvmPortDir = [ FDirName $(nvmDir) haiku port ] ;
+local nvmPort = <nvm-port>port-haiku.py <nvm-port>platform-haiku.cc
+	<nvm-port>make-ares-config.sh ;
+SEARCH on $(nvmPort) = $(nvmPortDir) ;
+AddFilesToPackage data nvm haiku port : $(nvmPort) ;
+local nvmAresConfigs = [ Glob $(nvmPortDir)/ares : ares_config-*.h ] ;
+AddFilesToPackage data nvm haiku port ares : $(nvmAresConfigs) ;
 
 local nvmHook = <nvm-profile>nvm.sh ;
 SEARCH on $(nvmHook) = [ FDirName $(nvmDir) haiku profile.d ] ;
