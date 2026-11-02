@@ -15,6 +15,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 #include <Deskbar.h>
 #include <Entry.h>
@@ -34,9 +35,13 @@
 static const bigtime_t kSendTimeout = 100000;
 static const bigtime_t kReplicantRemoveDelay = 1500000;
 
+static const bigtime_t kDeskbarStartDelay = 2000000;
+static const char* kDeskbarSignature = "application/x-vnd.Be-TSKB";
+
 enum {
 	kMsgSyncReplicant	= 'syRp',
-	kMsgRemoveReplicant	= 'rmRp'
+	kMsgRemoveReplicant	= 'rmRp',
+	kMsgDeskbarStarted	= 'dbSt'
 };
 
 
@@ -97,7 +102,8 @@ MediaControlsServer::MediaControlsServer(status_t& error)
 	if (error != B_OK)
 		return;
 
-	be_roster->StartWatching(be_app_messenger, B_REQUEST_QUIT);
+	be_roster->StartWatching(be_app_messenger,
+		B_REQUEST_LAUNCHED | B_REQUEST_QUIT);
 
 	fDeskbarLooper = new DeskbarLooper();
 	fDeskbarLooper->Run();
@@ -199,6 +205,28 @@ MediaControlsServer::MessageReceived(BMessage* message)
 				_TeamQuit(team);
 			break;
 		}
+
+		case B_SOME_APP_LAUNCHED:
+		{
+			// A restarted Deskbar does not have the replicant anymore
+			// (unless it saved it before): add it again once it runs.
+			const char* signature;
+			if (message->FindString("be:signature", &signature) == B_OK
+				&& strcasecmp(signature, kDeskbarSignature) == 0) {
+				BMessage started(kMsgDeskbarStarted);
+				BMessageRunner::StartSending(be_app_messenger, &started,
+					kDeskbarStartDelay, 1);
+			}
+			break;
+		}
+
+		case kMsgDeskbarStarted:
+			if (!fPlayers.IsEmpty() && fDeskbarLooper != NULL) {
+				BMessage sync(kMsgSyncReplicant);
+				sync.AddBool("show", true);
+				fDeskbarLooper->PostMessage(&sync);
+			}
+			break;
 
 		case kMsgRemoveReplicant:
 			delete fRemoveRunner;
@@ -492,8 +520,8 @@ MediaControlsServer::_RemovePlayer(Player* player)
 {
 	if (fPinnedID == player->id)
 		fPinnedID = -1;
-	fPlayers.RemoveItem(player);
-	delete player;
+	fPlayers.RemoveItem(player, true);
+		// (deletes it)
 
 	_StateChanged();
 	_UpdateReplicant();

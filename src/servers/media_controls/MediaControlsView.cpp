@@ -129,8 +129,12 @@ MediaControlsView::DetachedFromWindow()
 			(BHandler*)NULL, 100000);
 	}
 
-	if (fPopup.IsValid())
-		fPopup.SendMessage(B_QUIT_REQUESTED);
+	// The popup's code is in this add-on, which the Deskbar unloads after
+	// removing the replicant: the window must be gone before that.
+	BLooper* popup;
+	if (fPopup.LockTarget() && fPopup.Target(&popup) != NULL)
+		popup->Quit();
+	fPopup = BMessenger();
 
 	BView::DetachedFromWindow();
 }

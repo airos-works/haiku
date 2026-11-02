@@ -401,8 +401,7 @@ NowPlayingWindow::NowPlayingWindow(BRect anchor)
 	BBox* box = new BBox("box");
 	box->SetBorder(B_PLAIN_BORDER);
 
-	BGroupLayout* boxLayout = BLayoutBuilder::Group<>(B_VERTICAL,
-			B_USE_SMALL_SPACING)
+	BLayoutBuilder::Group<>(box, B_VERTICAL, B_USE_SMALL_SPACING)
 		.SetInsets(B_USE_SMALL_SPACING)
 		.AddGroup(B_HORIZONTAL, B_USE_DEFAULT_SPACING)
 			.Add(fArtworkView)
@@ -422,7 +421,6 @@ NowPlayingWindow::NowPlayingWindow(BRect anchor)
 			.Add(fNextButton)
 			.AddGlue()
 		.End();
-	box->SetLayout(boxLayout);
 
 	BLayoutBuilder::Group<>(this, B_VERTICAL, 0)
 		.Add(box);

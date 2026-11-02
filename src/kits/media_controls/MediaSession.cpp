@@ -25,7 +25,8 @@ static const bigtime_t kSendTimeout = 100000;
 static int32 sNextSessionNumber = 1;
 
 
-/*!	Copies \a source into an archive, scaled down to fit kMaxArtworkSize.
+/*!	Copies \a source into an archive as B_RGBA32, scaled down to fit
+	kMaxArtworkSize. A source without an alpha channel comes out opaque.
 */
 static status_t
 archive_artwork(const BBitmap* source, BMessage& archive)
@@ -33,12 +34,6 @@ archive_artwork(const BBitmap* source, BMessage& archive)
 	BRect bounds = source->Bounds();
 	float width = bounds.Width() + 1;
 	float height = bounds.Height() + 1;
-	if (width <= kMaxArtworkSize && height <= kMaxArtworkSize
-		&& (source->ColorSpace() == B_RGBA32 || source->ColorSpace() == B_RGB32)) {
-		BBitmap copy(source);
-		return copy.Archive(&archive);
-	}
-
 	float scale = std::min(kMaxArtworkSize / width, kMaxArtworkSize / height);
 	scale = std::min(scale, 1.0f);
 	BRect scaledBounds(0, 0, std::max(1.0f, roundf(width * scale)) - 1,
@@ -49,12 +44,20 @@ archive_artwork(const BBitmap* source, BMessage& archive)
 	if (status != B_OK)
 		return status;
 
+	bool hasAlpha = source->ColorSpace() == B_RGBA32
+		|| source->ColorSpace() == B_RGBA32_BIG
+		|| source->ColorSpace() == B_RGBA15
+		|| source->ColorSpace() == B_RGBA15_BIG;
+
 	BView* view = new BView(scaledBounds, "scaler", B_FOLLOW_NONE, 0);
 	scaled.AddChild(view);
 	if (scaled.Lock()) {
 		view->SetHighColor(0, 0, 0, 0);
 		view->FillRect(scaledBounds);
-		view->SetDrawingMode(B_OP_ALPHA);
+		if (hasAlpha) {
+			view->SetDrawingMode(B_OP_ALPHA);
+			view->SetBlendingMode(B_PIXEL_ALPHA, B_ALPHA_OVERLAY);
+		}
 		view->DrawBitmap(source, bounds, scaledBounds,
 			B_FILTER_BITMAP_BILINEAR);
 		view->Sync();
@@ -62,6 +65,16 @@ archive_artwork(const BBitmap* source, BMessage& archive)
 		scaled.Unlock();
 	}
 	delete view;
+
+	if (!hasAlpha) {
+		// (the fourth byte of B_RGB32 is undefined)
+		uint8* row = (uint8*)scaled.Bits();
+		for (int32 y = 0; y <= (int32)scaledBounds.bottom; y++) {
+			for (int32 x = 0; x <= (int32)scaledBounds.right; x++)
+				row[x * 4 + 3] = 255;
+			row += scaled.BytesPerRow();
+		}
+	}
 
 	return scaled.Archive(&archive);
 }
