@@ -61,6 +61,7 @@ class BMessage;
 class BTextView;
 class BView;
 class BVolume;
+class BWindow;
 
 namespace BPrivate {
 
@@ -205,6 +206,12 @@ class OffscreenBitmap {
 			// blit this to your view when you are done rendering
 		BView* View() const;
 			// use this to render your image
+
+		static bool MatchesScreenDensity(BWindow* window);
+			// false on a scaled screen: the bitmap has the logical size
+			// there and app_server enlarges it, so its text looks soft
+			// next to the same text drawn into the window; draw into the
+			// window instead
 
 	private:
 		void NewBitmap(BRect frame);
