@@ -29,7 +29,11 @@ whole device pixels, and real pixels for programs that render their own.
 Programs measure at the logical size without hinting. The Painter renders
 the same string with a font that many times larger, hinted vertically only
 (`FT_LOAD_TARGET_LIGHT`) at the exact fractional pixel size, with unhinted
-advances, so the string is as wide as measured. Its glyphs come from the
+advances, so the string is as wide as measured. Both sides use the exact
+size, fractions included, and advances of exactly that size (corrected for
+the 1/64 pixel steps FreeType sets sizes in); measuring used to cut a 13.8
+point font down to 13 pixels, so text drawn at 13.8 times the scale did not
+fit what it measured (haiku#42). Its glyphs come from the
 glyph cache as bitmaps (before, every glyph was rasterized from its outline:
 a text view redraw took 5 to 7 ms in QEMU at 150 to 200 percent, now about
 1 ms). The base line goes on the top edge of the pixel row where filled
