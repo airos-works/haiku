@@ -380,6 +380,10 @@ GICv3Its::AllocateVectorsForDevice(const msi_requester* requester, uint32 count,
 		return B_NOT_SUPPORTED;
 	if (!ValidCount(count))
 		return B_BAD_VALUE;
+	// The trace reporter needs the kernel daemons, which do not run yet when
+	// the interrupt controller is set up; drivers allocate vectors later.
+	if (fTrace && atomic_get_and_set(&fTraceReporter, 1) == 0)
+		register_kernel_daemon(&_ReportTrace, this, 10);
 	InterruptsSpinLocker locker(instance->lock);
 	if (!instance->ready || instance->faulted)
 		return B_NO_INIT;
@@ -464,6 +468,11 @@ GICv3Its::FreeVectors(uint32 count, uint32 startVector)
 }
 
 
+/*!	Counts the interrupts of a vector when tracing is on. Nothing is printed
+	here: debug output from this interrupt handler held up the boot on the
+	ROCK 5 ITX for seconds at a time and sometimes for good (the NVMe probe
+	never went on). The counts are reported from a kernel daemon instead.
+*/
 void
 GICv3Its::TraceInterrupt(uint32 vector)
 {
@@ -472,10 +481,30 @@ GICv3Its::TraceInterrupt(uint32 vector)
 	Instance* instance = _InstanceForVector(vector);
 	if (instance == nullptr || !instance->ready)
 		return;
-	uint32 count = uint32(atomic_add(
-		&instance->interruptCounts[vector - instance->firstLpi], 1)) + 1;
-	if (count != 0 && (count <= 8 || (count & (count - 1)) == 0)) {
-		dprintf("GICv3 ITS: received vector=%u count=%u cpu=%" B_PRId32 "\n",
-			vector, count, smp_get_current_cpu());
+	atomic_add(&instance->interruptCounts[vector - instance->firstLpi], 1);
+}
+
+
+/*static*/ void
+GICv3Its::_ReportTrace(void* data, int /*iteration*/)
+{
+	GICv3Its* self = (GICv3Its*)data;
+	Instance* instances[] = { &self->fNvme, &self->fWifi };
+	for (Instance* instance : instances) {
+		if (!instance->ready)
+			continue;
+		for (uint32 event = 0; event < Gicv3Its::kEventCount; event++) {
+			uint32 count = (uint32)atomic_get(&instance->interruptCounts[event]);
+			uint32 reported = instance->reportedCounts[event];
+			if (count == reported)
+				continue;
+			// the first eight, then every power of two that was passed
+			uint32 next = reported < 8 ? reported + 1 : reported * 2;
+			if (count < next)
+				continue;
+			instance->reportedCounts[event] = count;
+			dprintf("GICv3 ITS: received vector=%" B_PRIu32 " count=%" B_PRIu32
+				"\n", instance->firstLpi + event, count);
+		}
 	}
 }
