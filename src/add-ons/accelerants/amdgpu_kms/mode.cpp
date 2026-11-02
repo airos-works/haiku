@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
 
 #include <edid.h>
 
@@ -498,14 +499,21 @@ apply_layout(Layout& layout, bool testOnly)
 	}
 
 	// it is on screen
+	// Renderers that copy their frames straight into the screen (Summit)
+	// take it from the driver. It is offered again with every layout, also
+	// when the buffer stayed the same, so that one refused offer does not
+	// leave them without it until the next resize (haiku#43); a refusal is
+	// worth a line in the syslog, as nothing else shows it. An older driver
+	// does not know the call (B_DEV_INVALID_IOCTL / ENOTTY).
+	status_t published = Kms::PublishScanout(fd, buffer, DRM_FORMAT_XRGB8888);
+	if (published != B_OK && published != B_DEV_INVALID_IOCTL
+		&& published != ENOTTY) {
+		syslog(LOG_WARNING, "amdgpu_kms: the %" B_PRIu32 "x%" B_PRIu32
+			" frame buffer (pitch %" B_PRIu32 ") was not offered to renderers:"
+			" %s\n", buffer.width, buffer.height, buffer.pitch,
+			strerror(published));
+	}
 	if (!reused) {
-		// Renderers that copy their frames straight into the screen (Summit)
-		// take it from the driver; an older driver does not offer that.
-		status_t published = Kms::PublishScanout(fd, buffer,
-			DRM_FORMAT_XRGB8888);
-		if (published != B_OK)
-			TRACE("frame buffer not offered to renderers: %s\n",
-				strerror(published));
 		// no copy by the GPU runs into the old one meanwhile
 		lock_device_copies();
 		Kms::DestroyBuffer(fd, gInfo->frameBuffer);
@@ -869,15 +877,26 @@ amdgpu_set_dpms_mode(uint32 dpmsMode)
 		return B_NOT_ALLOWED;
 	uint32 active = dpmsMode == B_DPMS_ON ? 1 : 0;
 	Kms::AtomicRequest request;
+	uint32 crtcs = 0;
 	for (uint32 i = 0; i < gInfo->outputCount; i++) {
 		const Output& output = gInfo->outputs[i];
 		if (output.enabled && output.crtcIndex >= 0) {
 			request.Add(gInfo->resources.crtcs[output.crtcIndex],
 				gInfo->crtcActive, active);
+			crtcs++;
 		}
 	}
+	// Both ends of a switch go to the syslog (time stamped): displays that
+	// would not wake (haiku#40) leave a request without its result there
+	// when the commit never comes back.
+	debug_printf("amdgpu_kms: displays %s (%" B_PRIu32 " CRTCs)...\n",
+		active ? "on" : "off", crtcs);
+	bigtime_t started = system_time();
 	status_t status = request.Commit(gInfo->device,
 		DRM_MODE_ATOMIC_ALLOW_MODESET);
+	debug_printf("amdgpu_kms: displays %s: %s in %.1f ms\n",
+		active ? "on" : "off", status == B_OK ? "done" : strerror(status),
+		(system_time() - started) / 1000.0);
 	if (status == B_OK) {
 		gInfo->dpmsMode = dpmsMode;
 		if (active) {
