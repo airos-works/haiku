@@ -29,7 +29,11 @@ whole device pixels, and real pixels for programs that render their own.
 Programs measure at the logical size without hinting. The Painter renders
 the same string with a font that many times larger, hinted vertically only
 (`FT_LOAD_TARGET_LIGHT`) at the exact fractional pixel size, with unhinted
-advances, so the string is as wide as measured. Its glyphs come from the
+advances, so the string is as wide as measured. Both sides use the exact
+size, fractions included, and advances of exactly that size (corrected for
+the 1/64 pixel steps FreeType sets sizes in); measuring used to cut a 13.8
+point font down to 13 pixels, so text drawn at 13.8 times the scale did not
+fit what it measured (haiku#42). Its glyphs come from the
 glyph cache as bitmaps (before, every glyph was rasterized from its outline:
 a text view redraw took 5 to 7 ms in QEMU at 150 to 200 percent, now about
 1 ms). The base line goes on the top edge of the pixel row where filled
@@ -211,7 +215,10 @@ area sampled; GTK programs and Firefox draw at 2x through the server above.
   their stroked indicator.
 - Scrolling by an odd number of logical pixels at 150 percent (most steps at
   125 and 175) still redraws the view instead of copying it; with glyphs from
-  the cache that is cheap for text, less so for large images.
+  the cache that is cheap for text, less so for large images. Until the
+  program has redrawn it, the view shows its content moved by the nearest
+  whole number of buffer pixels, and the redraw reaches the screen in one
+  piece (it used to flash the background first, haiku#57).
 - OpenGL views and other programs that draw logical-size bitmaps are still
   enlarged (GL filtered, other bitmaps area sampled: even, but with the
   detail of the logical size). Programs can use `BScreen::DeviceScale()` and

@@ -148,6 +148,13 @@ class FontEngine {
 								FontEngine(const FontEngine&);
 			const FontEngine&	operator=(const FontEngine&);
 
+			bool				_UnhintedAdvances() const
+									{ return (fDeviceScaled || !fHinting)
+										&& FT_IS_SCALABLE(fFace); }
+			double				_LinearAdvance(FT_Fixed advance) const
+									{ return advance / 65536.0
+										* fLinearScale; }
+
 			bool				_PrepareColorGlyph(uint32 glyphIndex);
 			bool				_SetColorBitmap(const uint8* pixels,
 									int32 width, int32 height,
@@ -167,6 +174,8 @@ class FontEngine {
 			bool				fColorGlyphs;
 			double				fBitmapScale;
 				// from the selected bitmap strike to the size
+			double				fLinearScale;
+				// from linear advances to those of the exact size
 			ColorGlyphRenderer*	fColorRenderer;
 			OpenTypeLigatures*	fLigatures;
 			bool				fLigaturesLoaded;
