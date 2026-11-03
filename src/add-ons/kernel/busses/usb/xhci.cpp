@@ -3850,8 +3850,10 @@ XHCI::HandleTransferComplete(xhci_trb* trb)
 	const uint8 endpointNumber = TRB_3_ENDPOINT_GET(flags),
 		slot = TRB_3_SLOT_GET(flags);
 
-	if (slot > fSlotCount)
+	if (slot > fSlotCount) {
 		TRACE_ERROR("invalid slot\n");
+		return;
+	}
 	if (endpointNumber == 0 || endpointNumber >= XHCI_MAX_ENDPOINTS) {
 		TRACE_ERROR("invalid endpoint\n");
 		return;
