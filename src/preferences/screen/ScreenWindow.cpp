@@ -304,6 +304,14 @@ ScreenWindow::ScreenWindow(ScreenSettings* settings)
 	fMirrorBox->SetToolTip(B_TRANSLATE("Every display shows what the main "
 		"display shows."));
 
+	fOriginalDarkMode = ui_dark_mode();
+	fDarkModeBox = new BCheckBox("dark mode", B_TRANSLATE("Dark mode"),
+		new BMessage(kMsgDarkMode));
+	fDarkModeBox->SetToolTip(B_TRANSLATE("Windows, menus and controls use "
+		"dark colors. Applications and websites that have a dark appearance "
+		"use it."));
+	fDarkModeBox->SetValue(fOriginalDarkMode ? B_CONTROL_ON : B_CONTROL_OFF);
+
 	// The details of the selected display, on the right
 
 	BView* detailsView = _BuildDetailsPanel();
@@ -331,6 +339,7 @@ ScreenWindow::ScreenWindow(ScreenSettings* settings)
 					.End()
 				.Add(fMirrorBox)
 				.Add(fZoomBox)
+				.Add(fDarkModeBox)
 				.End()
 			.Add(new BSeparatorView(B_VERTICAL))
 			.AddGroup(B_VERTICAL, 0, 0.0f)
@@ -1899,7 +1908,8 @@ ScreenWindow::_CheckApplyEnabled()
 	fRevertButton->SetEnabled(revertEnabled
 		|| columns != fOriginalWorkspacesColumns
 		|| rows != fOriginalWorkspacesRows
-		|| brightness != fOriginalBrightness);
+		|| brightness != fOriginalBrightness
+		|| (fDarkModeBox->Value() == B_CONTROL_ON) != fOriginalDarkMode);
 }
 
 
@@ -2088,6 +2098,19 @@ ScreenWindow::MessageReceived(BMessage* message)
 
 		case kMsgZoomToDisplay:
 			BPrivate::set_zoom_to_display(fZoomBox->Value() == B_CONTROL_ON);
+			break;
+
+		case kMsgDarkMode:
+			// takes effect at once, like the other appearance settings
+			set_ui_dark_mode(fDarkModeBox->Value() == B_CONTROL_ON);
+			_CheckApplyEnabled();
+			break;
+
+		case B_COLORS_UPDATED:
+			// the appearance may have been switched elsewhere
+			fDarkModeBox->SetValue(ui_dark_mode() ? B_CONTROL_ON : B_CONTROL_OFF);
+			_CheckApplyEnabled();
+			BWindow::MessageReceived(message);
 			break;
 
 		case kMsgMirrorDisplays:
@@ -2323,6 +2346,12 @@ ScreenWindow::MessageReceived(BMessage* message)
 			if (fOriginalBrightness >= 0) {
 				screen.SetBrightness(fOriginalBrightness);
 				fBrightnessSlider->SetValue(fOriginalBrightness * 255);
+			}
+
+			if ((fDarkModeBox->Value() == B_CONTROL_ON) != fOriginalDarkMode) {
+				set_ui_dark_mode(fOriginalDarkMode);
+				fDarkModeBox->SetValue(fOriginalDarkMode
+					? B_CONTROL_ON : B_CONTROL_OFF);
 			}
 
 			if (!fCurrentLayout.SameArrangement(fOriginalLayout))

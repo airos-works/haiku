@@ -72,6 +72,8 @@ private:
 			BMessage			fPrevColors;
 			BMessage			fDefaultColors;
 			BMessage			fCurrentColors;
+			bool				fDarkMode;
+				// the appearance the colors above belong to
 };
 
 

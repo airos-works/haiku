@@ -131,6 +131,9 @@ public:
 									int32 toOffset);
 			void				RemoveStyles(int32 index, int32 count = 1);
 
+			bool				ReplaceColor(const rgb_color& from,
+									const rgb_color& to);
+
 			int32				Iterate(int32 fromOffset, int32 length,
 									InlineInput* input,
 									const BFont** outFont = NULL,

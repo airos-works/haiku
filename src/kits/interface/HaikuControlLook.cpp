@@ -43,6 +43,25 @@ static const rgb_color kBlack = { 0, 0, 0, 255 };
 static const rgb_color kWhite = { 255, 255, 255, 255 };
 
 
+/*!	tint_color() for the control look. The look's highlights, bevels and
+	fills are lighter tints of a light base color, a few shades short of
+	white. In the dark appearance (a dark panel background) the same tints
+	would turn dark controls into nearly white shapes, so there a lightening
+	tint of a dark color moves a quarter as far; the controls keep their
+	shading, in dark tones. Darkening, and the light appearance, are as
+	tint_color().
+*/
+static rgb_color
+_Tint(rgb_color color, float tint)
+{
+	if (tint < B_NO_TINT && color.IsDark()
+		&& ui_color(B_PANEL_BACKGROUND_COLOR).IsDark()) {
+		tint = B_NO_TINT - (B_NO_TINT - tint) / 4;
+	}
+	return tint_color(color, tint);
+}
+
+
 /*!	The sides of the scroll bar \a view (\a rect being its bounds) that lie
 	on the frame of the BScrollView it belongs to, and that frame's border
 	style: BScrollView puts its scroll bars over the frame's dark ring there
@@ -288,18 +307,18 @@ HaikuControlLook::DrawMenuBarBackground(BView* view, BRect& rect,
 	FrameLines lines(view, rect, bevelBorders);
 	lines.SetOverFill();
 	if ((flags & B_ACTIVATED) != 0) {
-		rgb_color bevelColor1 = tint_color(base, 1.40);
-		rgb_color bevelColor2 = tint_color(base, 1.25);
+		rgb_color bevelColor1 = _Tint(base, 1.40);
+		rgb_color bevelColor2 = _Tint(base, 1.25);
 
 		_DrawFrame(view, rect,
 			bevelColor1, bevelColor1,
 			bevelColor2, bevelColor2,
 			bevelBorders, &lines, true);
 	} else {
-		rgb_color cornerColor = tint_color(base, 0.9);
-		rgb_color bevelColorTop = tint_color(base, 0.5);
-		rgb_color bevelColorLeft = tint_color(base, 0.7);
-		rgb_color bevelColorRightBottom = tint_color(base, 1.08);
+		rgb_color cornerColor = _Tint(base, 0.9);
+		rgb_color bevelColorTop = _Tint(base, 0.5);
+		rgb_color bevelColorLeft = _Tint(base, 0.7);
+		rgb_color bevelColorRightBottom = _Tint(base, 1.08);
 
 		_DrawFrame(view, rect,
 			bevelColorLeft, bevelColorTop,
@@ -399,11 +418,11 @@ HaikuControlLook::DrawMenuBackground(BView* view, BRect& rect,
 	rgb_color bevelShadowColor;
 
 	if ((flags & B_DISABLED) != 0) {
-		bevelLightColor = tint_color(base, 0.80);
-		bevelShadowColor = tint_color(base, 1.07);
+		bevelLightColor = _Tint(base, 0.80);
+		bevelShadowColor = _Tint(base, 1.07);
 	} else {
-		bevelLightColor = tint_color(base, 0.6);
-		bevelShadowColor = tint_color(base, 1.12);
+		bevelLightColor = _Tint(base, 0.6);
+		bevelShadowColor = _Tint(base, 1.12);
 	}
 
 	// draw surface top, and the inner bevel over it: at a fractional scale
@@ -445,8 +464,8 @@ HaikuControlLook::DrawMenuItemBackground(BView* view, BRect& rect,
 		bottomTint = 1.12;
 	}
 
-	rgb_color bevelLightColor = tint_color(selectedColor, topTint);
-	rgb_color bevelShadowColor = tint_color(selectedColor, bottomTint);
+	rgb_color bevelLightColor = _Tint(selectedColor, topTint);
+	rgb_color bevelShadowColor = _Tint(selectedColor, bottomTint);
 
 	// draw surface edges
 	_DrawFrame(view, rect,
@@ -468,13 +487,13 @@ HaikuControlLook::DrawStatusBar(BView* view, BRect& rect, const BRect& updateRec
 	if (!ShouldDraw(view, rect, updateRect))
 		return;
 
-	_DrawOuterResessedFrame(view, rect, tint_color(base, 0.6));
+	_DrawOuterResessedFrame(view, rect, _Tint(base, 0.6));
 
 	// colors
-	rgb_color dark1BorderColor = tint_color(base, 1.3);
-	rgb_color dark2BorderColor = tint_color(base, 1.2);
-	rgb_color dark1FilledBorderColor = tint_color(barColor, 1.20);
-	rgb_color dark2FilledBorderColor = tint_color(barColor, 1.45);
+	rgb_color dark1BorderColor = _Tint(base, 1.3);
+	rgb_color dark2BorderColor = _Tint(base, 1.2);
+	rgb_color dark1FilledBorderColor = _Tint(barColor, 1.20);
+	rgb_color dark2FilledBorderColor = _Tint(barColor, 1.45);
 
 	BRect filledRect(rect);
 	filledRect.right = progressPosition - 1;
@@ -522,7 +541,7 @@ HaikuControlLook::DrawStatusBar(BView* view, BRect& rect, const BRect& updateRec
 		// is part of the frame, so that it keeps its width too
 		rgb_color leftBorder = dark1BorderColor;
 		if (filledSurface)
-			leftBorder = tint_color(base, 0.50);
+			leftBorder = _Tint(base, 0.50);
 		uint32 frameBorders = borders | (leftLine ? B_LEFT_BORDER : 0);
 		FrameLines lines(view, nonfilledRect, frameBorders);
 		lines.SetOverFill();
@@ -549,11 +568,11 @@ HaikuControlLook::DrawCheckBox(BView* view, BRect& rect, const BRect& updateRect
 		_DrawOuterResessedFrame(view, rect, base, flags, B_ALL_BORDERS,
 			lines);
 
-		dark1BorderColor = tint_color(base, 1.15);
-		dark2BorderColor = tint_color(base, 1.15);
+		dark1BorderColor = _Tint(base, 1.15);
+		dark2BorderColor = _Tint(base, 1.15);
 	} else if ((flags & B_CLICKED) != 0) {
-		dark1BorderColor = tint_color(base, 1.50);
-		dark2BorderColor = tint_color(base, 1.48);
+		dark1BorderColor = _Tint(base, 1.50);
+		dark2BorderColor = _Tint(base, 1.48);
 
 		_DrawFrame(view, rect,
 			dark1BorderColor, dark1BorderColor,
@@ -564,8 +583,8 @@ HaikuControlLook::DrawCheckBox(BView* view, BRect& rect, const BRect& updateRect
 		_DrawOuterResessedFrame(view, rect, base, flags, B_ALL_BORDERS,
 			lines);
 
-		dark1BorderColor = tint_color(base, 1.40);
-		dark2BorderColor = tint_color(base, 1.38);
+		dark1BorderColor = _Tint(base, 1.40);
+		dark2BorderColor = _Tint(base, 1.38);
 	}
 
 	if ((flags & B_FOCUSED) != 0) {
@@ -637,17 +656,17 @@ HaikuControlLook::DrawRadioButton(BView* view, BRect& rect, const BRect& updateR
 	rgb_color navigationColor = ui_color(B_KEYBOARD_NAVIGATION_COLOR);
 
 	if ((flags & B_DISABLED) != 0) {
-		borderColor = tint_color(base, 1.15);
+		borderColor = _Tint(base, 1.15);
 		bevelLight = base;
 		bevelShadow = base;
 	} else if ((flags & B_CLICKED) != 0) {
-		borderColor = tint_color(base, 1.50);
+		borderColor = _Tint(base, 1.50);
 		bevelLight = borderColor;
 		bevelShadow = borderColor;
 	} else {
-		borderColor = tint_color(base, 1.45);
-		bevelLight = tint_color(base, 0.55);
-		bevelShadow = tint_color(base, 1.11);
+		borderColor = _Tint(base, 1.45);
+		bevelLight = _Tint(base, 0.55);
+		bevelShadow = _Tint(base, 1.11);
 	}
 
 	if ((flags & B_FOCUSED) != 0) {
@@ -665,7 +684,7 @@ HaikuControlLook::DrawRadioButton(BView* view, BRect& rect, const BRect& updateR
 
 	bevelGradient.MakeEmpty();
 	bevelGradient.AddColor(borderColor, 0);
-	bevelGradient.AddColor(tint_color(borderColor, 0.8), 255);
+	bevelGradient.AddColor(_Tint(borderColor, 0.8), 255);
 	view->FillEllipse(rect, bevelGradient);
 	rect.InsetBy(1, 1);
 
@@ -711,7 +730,7 @@ HaikuControlLook::DrawScrollBarBorder(BView* view, BRect rect,
 	bool isEnabled = (flags & B_DISABLED) == 0;
 	bool isFocused = (flags & B_FOCUSED) != 0;
 
-	view->SetHighColor(tint_color(base, B_DARKEN_2_TINT));
+	view->SetHighColor(_Tint(base, B_DARKEN_2_TINT));
 
 	// stroke a line around the entire scrollbar
 	// take care of border highlighting, scroll target is focus view
@@ -825,12 +844,18 @@ HaikuControlLook::DrawScrollBarButton(BView* view, BRect rect,
 
 	bool isEnabled = (flags & B_DISABLED) == 0;
 
-	rgb_color buttonColor = isEnabled ? base : tint_color(base, B_LIGHTEN_1_TINT);
+	rgb_color buttonColor = isEnabled ? base : _Tint(base, B_LIGHTEN_1_TINT);
 	DrawButtonBackground(view, rect, updateRect, buttonColor, flags,
 		BControlLook::B_ALL_BORDERS, orientation);
 
 	rect.InsetBy(-1, -1);
-	rgb_color textColor = isEnabled ? text : tint_color(text, B_LIGHTEN_1_TINT);
+	rgb_color textColor = text;
+	if (!isEnabled) {
+		// lighter text (the dark appearance) fades toward the button as far
+		// as dark text does by the tint
+		textColor = text.IsDark() ? _Tint(text, B_LIGHTEN_1_TINT)
+			: mix_color(text, buttonColor, 115);
+	}
 	DrawArrowShape(view, rect, updateRect, textColor, direction, flags, 1);
 
 	// revert clipping constraints
@@ -885,9 +910,9 @@ HaikuControlLook::DrawScrollBarBackground(BView* view, BRect& rect,
 		shadowTint = gradient1Tint;
 	}
 
-	rgb_color darkEdge1 = tint_color(base, darkEdge1Tint);
-	rgb_color darkEdge2 = tint_color(base, darkEdge2Tint);
-	rgb_color shadow = tint_color(base, shadowTint);
+	rgb_color darkEdge1 = _Tint(base, darkEdge1Tint);
+	rgb_color darkEdge2 = _Tint(base, darkEdge2Tint);
+	rgb_color shadow = _Tint(base, shadowTint);
 
 	float length = orientation == B_HORIZONTAL ? rect.Width() : rect.Height();
 	if (length >= 3) {
@@ -1004,15 +1029,15 @@ HaikuControlLook::DrawScrollBarThumb(BView* view, BRect& rect,
 
 	rgb_color light, dark, dark1, dark2;
 	if (isEnabled) {
-		light = tint_color(base, B_LIGHTEN_MAX_TINT);
-		dark = tint_color(base, B_DARKEN_3_TINT);
-		dark1 = tint_color(base, B_DARKEN_1_TINT);
-		dark2 = tint_color(base, B_DARKEN_2_TINT);
+		light = _Tint(base, B_LIGHTEN_MAX_TINT);
+		dark = _Tint(base, B_DARKEN_3_TINT);
+		dark1 = _Tint(base, B_DARKEN_1_TINT);
+		dark2 = _Tint(base, B_DARKEN_2_TINT);
 	} else {
-		light = tint_color(base, B_LIGHTEN_MAX_TINT);
-		dark = tint_color(base, B_DARKEN_2_TINT);
-		dark1 = tint_color(base, B_LIGHTEN_2_TINT);
-		dark2 = tint_color(base, B_LIGHTEN_1_TINT);
+		light = _Tint(base, B_LIGHTEN_MAX_TINT);
+		dark = _Tint(base, B_DARKEN_2_TINT);
+		dark1 = _Tint(base, B_LIGHTEN_2_TINT);
+		dark2 = _Tint(base, B_LIGHTEN_1_TINT);
 	}
 
 	// draw thumb over background
@@ -1049,11 +1074,11 @@ HaikuControlLook::DrawScrollBarThumb(BView* view, BRect& rect,
 	// draw knob style
 	if (knobStyle != B_KNOB_NONE) {
 		rgb_color knobLight = isEnabled
-			? tint_color(thumbColor, B_LIGHTEN_MAX_TINT)
-			: tint_color(dark1, bgTint);
+			? _Tint(thumbColor, B_LIGHTEN_MAX_TINT)
+			: _Tint(dark1, bgTint);
 		rgb_color knobDark = isEnabled
-			? tint_color(thumbColor, 1.22)
-			: tint_color(knobLight, B_DARKEN_1_TINT);
+			? _Tint(thumbColor, 1.22)
+			: _Tint(knobLight, B_DARKEN_1_TINT);
 
 		if (knobStyle == B_KNOB_DOTS) {
 			// draw dots on the scroll bar thumb
@@ -1209,7 +1234,7 @@ HaikuControlLook::DrawScrollViewFrame(BView* view, BRect& rect,
 		borders &= ~(B_RIGHT_BORDER | B_BOTTOM_BORDER);
 	}
 
-	rgb_color scrollbarFrameColor = tint_color(base, B_DARKEN_2_TINT);
+	rgb_color scrollbarFrameColor = _Tint(base, B_DARKEN_2_TINT);
 
 	// the frame keeps its width at any scale
 	FrameLines lines(view, rect, borders);
@@ -1341,7 +1366,7 @@ HaikuControlLook::DrawArrowShape(BView* view, BRect& rect,
 	if ((flags & B_DISABLED) != 0)
 		tint = (tint + B_NO_TINT + B_NO_TINT) / 3;
 
-	view->SetHighColor(tint_color(base, tint));
+	view->SetHighColor(_Tint(base, tint));
 
 	float penSize = view->PenSize();
 	drawing_mode mode = view->DrawingMode();
@@ -1360,7 +1385,7 @@ HaikuControlLook::DrawArrowShape(BView* view, BRect& rect,
 rgb_color
 HaikuControlLook::SliderBarColor(const rgb_color& base)
 {
-	return tint_color(ui_color(B_PANEL_BACKGROUND_COLOR), B_DARKEN_1_TINT);
+	return _Tint(ui_color(B_PANEL_BACKGROUND_COLOR), B_DARKEN_1_TINT);
 }
 
 
@@ -1483,8 +1508,8 @@ HaikuControlLook::DrawSliderBar(BView* view, BRect rect, const BRect& updateRect
 	rgb_color edgeShadowColor;
 	rgb_color frameLightColor;
 	rgb_color frameShadowColor;
-	rgb_color fillLightColor = tint_color(fillColor, fillLightTint);
-	rgb_color fillShadowColor = tint_color(fillColor, fillShadowTint);
+	rgb_color fillLightColor = _Tint(fillColor, fillLightTint);
+	rgb_color fillShadowColor = _Tint(fillColor, fillShadowTint);
 
 	drawing_mode oldMode = view->DrawingMode();
 
@@ -1496,10 +1521,10 @@ HaikuControlLook::DrawSliderBar(BView* view, BRect rect, const BRect& updateRect
 
 		view->SetDrawingMode(B_OP_ALPHA);
 	} else {
-		edgeLightColor = tint_color(base, edgeLightTint);
-		edgeShadowColor = tint_color(base, edgeShadowTint);
-		frameLightColor = tint_color(fillColor, frameLightTint);
-		frameShadowColor = tint_color(fillColor, frameShadowTint);
+		edgeLightColor = _Tint(base, edgeLightTint);
+		edgeShadowColor = _Tint(base, edgeShadowTint);
+		frameLightColor = _Tint(fillColor, frameLightTint);
+		frameShadowColor = _Tint(fillColor, frameShadowTint);
 	}
 
 	if (orientation == B_HORIZONTAL) {
@@ -1594,8 +1619,8 @@ HaikuControlLook::DrawSliderThumb(BView* view, BRect& rect, const BRect& updateR
 			frameShadowTint = 1.65;
 		}
 
-		frameLightColor = tint_color(base, frameLightTint);
-		frameShadowColor = tint_color(base, frameShadowTint);
+		frameLightColor = _Tint(base, frameLightTint);
+		frameShadowColor = _Tint(base, frameShadowTint);
 	}
 
 	BRect originalRect(rect);
@@ -1640,11 +1665,11 @@ HaikuControlLook::DrawSliderThumb(BView* view, BRect& rect, const BRect& updateR
 		rect.InsetBy(0, floorf(rect.Height() / 4));
 		rect.left = floorf((rect.left + rect.right) / 2);
 		rect.right = rect.left + 1;
-		shadowColor = tint_color(base, B_DARKEN_2_TINT);
+		shadowColor = _Tint(base, B_DARKEN_2_TINT);
 		shadowColor.alpha = 128;
 		view->SetHighColor(shadowColor);
 		view->StrokeLine(rect.LeftTop(), rect.LeftBottom());
-		rgb_color lightColor = tint_color(base, B_LIGHTEN_2_TINT);
+		rgb_color lightColor = _Tint(base, B_LIGHTEN_2_TINT);
 		lightColor.alpha = 128;
 		view->SetHighColor(lightColor);
 		view->StrokeLine(rect.RightTop(), rect.RightBottom());
@@ -1652,11 +1677,11 @@ HaikuControlLook::DrawSliderThumb(BView* view, BRect& rect, const BRect& updateR
 		rect.InsetBy(floorf(rect.Width() / 4), 0);
 		rect.top = floorf((rect.top + rect.bottom) / 2);
 		rect.bottom = rect.top + 1;
-		shadowColor = tint_color(base, B_DARKEN_2_TINT);
+		shadowColor = _Tint(base, B_DARKEN_2_TINT);
 		shadowColor.alpha = 128;
 		view->SetHighColor(shadowColor);
 		view->StrokeLine(rect.LeftTop(), rect.RightTop());
-		rgb_color lightColor = tint_color(base, B_LIGHTEN_2_TINT);
+		rgb_color lightColor = _Tint(base, B_LIGHTEN_2_TINT);
 		lightColor.alpha = 128;
 		view->SetHighColor(lightColor);
 		view->StrokeLine(rect.LeftBottom(), rect.RightBottom());
@@ -1723,8 +1748,8 @@ HaikuControlLook::DrawSliderTriangle(BView* view, BRect& rect,
 			frameShadowTint = 1.65;
 		}
 
-		frameLightColor = tint_color(base, frameLightTint);
-		frameShadowColor = tint_color(base, frameShadowTint);
+		frameLightColor = _Tint(base, frameLightTint);
+		frameShadowColor = _Tint(base, frameShadowTint);
 	}
 
 	// make room for the shadow
@@ -1808,11 +1833,11 @@ HaikuControlLook::DrawSliderHashMarks(BView* view, BRect& rect,
 	rgb_color darkColor;
 
 	if ((flags & B_DISABLED) != 0) {
-		lightColor = tint_color(base, 0.9);
-		darkColor = tint_color(base, 1.07);
+		lightColor = _Tint(base, 0.9);
+		darkColor = _Tint(base, 1.07);
 	} else {
-		lightColor = tint_color(base, 0.8);
-		darkColor = tint_color(base, 1.14);
+		lightColor = _Tint(base, 0.8);
+		darkColor = _Tint(base, 1.14);
 	}
 
 	int32 hashMarkCount = std::max(count, (int32)2);
@@ -1953,21 +1978,21 @@ HaikuControlLook::DrawActiveTab(BView* view, BRect& rect,
 	if ((flags & B_DISABLED) != 0) {
 		edgeLightColor = base;
 		edgeShadowColor = base;
-		frameLightColor = tint_color(base, 1.25);
-		frameShadowColor = tint_color(base, 1.30);
-		bevelLightColor = tint_color(base, 0.8);
-		bevelShadowColor = tint_color(base, 1.07);
-		fillGradient.AddColor(tint_color(base, 0.85), 0);
+		frameLightColor = _Tint(base, 1.25);
+		frameShadowColor = _Tint(base, 1.30);
+		bevelLightColor = _Tint(base, 0.8);
+		bevelShadowColor = _Tint(base, 1.07);
+		fillGradient.AddColor(_Tint(base, 0.85), 0);
 		fillGradient.AddColor(base, 255);
 	} else {
-		edgeLightColor = tint_color(base, 0.80);
-		edgeShadowColor = tint_color(base, 1.03);
-		frameLightColor = tint_color(base, 1.30);
-		frameShadowColor = tint_color(base, 1.30);
-		bevelLightColor = tint_color(base, 0.6);
-		bevelShadowColor = tint_color(base, 1.07);
-		fillGradient.AddColor(tint_color(base, 0.75), 0);
-		fillGradient.AddColor(tint_color(base, 1.03), 255);
+		edgeLightColor = _Tint(base, 0.80);
+		edgeShadowColor = _Tint(base, 1.03);
+		frameLightColor = _Tint(base, 1.30);
+		frameShadowColor = _Tint(base, 1.30);
+		bevelLightColor = _Tint(base, 0.6);
+		bevelShadowColor = _Tint(base, 1.07);
+		fillGradient.AddColor(_Tint(base, 0.75), 0);
+		fillGradient.AddColor(_Tint(base, 1.03), 255);
 	}
 
 	static const float kRoundCornerRadius = 4.0f;
@@ -2126,31 +2151,31 @@ HaikuControlLook::DrawInactiveTab(BView* view, BRect& rect,
 	if ((flags & B_DISABLED) != 0) {
 		edgeLightColor = base;
 		edgeShadowColor = base;
-		frameLightColor = tint_color(base, 1.25);
-		frameShadowColor = tint_color(base, 1.30);
-		bevelLightColor = tint_color(base, 0.8);
-		bevelShadowColor = tint_color(base, 1.07);
-		fillGradient.AddColor(tint_color(base, 0.85), 0);
+		frameLightColor = _Tint(base, 1.25);
+		frameShadowColor = _Tint(base, 1.30);
+		bevelLightColor = _Tint(base, 0.8);
+		bevelShadowColor = _Tint(base, 1.07);
+		fillGradient.AddColor(_Tint(base, 0.85), 0);
 		fillGradient.AddColor(base, 255);
 	} else {
 		if (base.IsLight()) {
-			edgeLightColor = tint_color(base, 0.80);
-			edgeShadowColor = tint_color(base, 1.03);
-			frameLightColor = tint_color(base, 1.30);
-			frameShadowColor = tint_color(base, 1.30);
-			bevelLightColor = tint_color(base, 1.10);
-			bevelShadowColor = tint_color(base, 1.17);
-			fillGradient.AddColor(tint_color(base, 1.12), 0);
-			fillGradient.AddColor(tint_color(base, 1.08), 255);
+			edgeLightColor = _Tint(base, 0.80);
+			edgeShadowColor = _Tint(base, 1.03);
+			frameLightColor = _Tint(base, 1.30);
+			frameShadowColor = _Tint(base, 1.30);
+			bevelLightColor = _Tint(base, 1.10);
+			bevelShadowColor = _Tint(base, 1.17);
+			fillGradient.AddColor(_Tint(base, 1.12), 0);
+			fillGradient.AddColor(_Tint(base, 1.08), 255);
 		} else {
-			edgeLightColor = tint_color(base, 1.20);
-			edgeShadowColor = tint_color(base, 0.95);
-			frameLightColor = tint_color(base, 1.08);
-			frameShadowColor = tint_color(base, 0.94);
-			bevelLightColor = tint_color(base, 1.04);
-			bevelShadowColor = tint_color(base, 0.92);
-			fillGradient.AddColor(tint_color(base, 0.89), 0);
-			fillGradient.AddColor(tint_color(base, 0.85), 255);
+			edgeLightColor = _Tint(base, 1.20);
+			edgeShadowColor = _Tint(base, 0.95);
+			frameLightColor = _Tint(base, 1.08);
+			frameShadowColor = _Tint(base, 0.94);
+			bevelLightColor = _Tint(base, 1.04);
+			bevelShadowColor = _Tint(base, 0.92);
+			fillGradient.AddColor(_Tint(base, 0.89), 0);
+			fillGradient.AddColor(_Tint(base, 0.85), 255);
 		}
 	}
 	BRect background = rect;
@@ -2234,12 +2259,12 @@ HaikuControlLook::DrawSplitter(BView* view, BRect& rect, const BRect& updateRect
 
 	rgb_color background;
 	if ((flags & (B_CLICKED | B_ACTIVATED)) != 0)
-		background = tint_color(base, B_DARKEN_1_TINT);
+		background = _Tint(base, B_DARKEN_1_TINT);
 	else
 		background = base;
 
-	rgb_color light = tint_color(background, 0.6);
-	rgb_color shadow = tint_color(background, 1.21);
+	rgb_color light = _Tint(background, 0.6);
+	rgb_color shadow = _Tint(background, 1.21);
 
 	// frame
 	if (borders != 0 && rect.Width() > 3 && rect.Height() > 3)
@@ -2347,9 +2372,9 @@ HaikuControlLook::DrawBorder(BView* view, BRect& rect, const BRect& updateRect,
 	if (borderStyle == B_NO_BORDER)
 		return;
 
-	rgb_color scrollbarFrameColor = tint_color(base, B_DARKEN_2_TINT);
+	rgb_color scrollbarFrameColor = _Tint(base, B_DARKEN_2_TINT);
 	if (base.red + base.green + base.blue <= 128 * 3) {
-		scrollbarFrameColor = tint_color(base, B_LIGHTEN_1_TINT);
+		scrollbarFrameColor = _Tint(base, B_LIGHTEN_1_TINT);
 	}
 
 	if ((flags & B_FOCUSED) != 0)
@@ -2394,8 +2419,8 @@ HaikuControlLook::DrawRaisedBorder(BView* view, BRect& rect,
 		lightColor = base;
 		shadowColor = base;
 	} else {
-		lightColor = tint_color(base, 0.85);
-		shadowColor = tint_color(base, 1.07);
+		lightColor = _Tint(base, 0.85);
+		shadowColor = _Tint(base, 1.07);
 	}
 
 	_DrawFrame(view, rect, lightColor, lightColor, shadowColor, shadowColor,
@@ -2423,11 +2448,11 @@ HaikuControlLook::DrawTextControlBorder(BView* view, BRect& rect,
 		if ((flags & B_BLEND_FRAME) != 0)
 			dark1BorderColor = (rgb_color){ 0, 0, 0, 40 };
 		else
-			dark1BorderColor = tint_color(base, 1.15);
+			dark1BorderColor = _Tint(base, 1.15);
 		dark2BorderColor = dark1BorderColor;
 	} else if ((flags & B_CLICKED) != 0) {
-		dark1BorderColor = tint_color(base, 1.50);
-		dark2BorderColor = tint_color(base, 1.49);
+		dark1BorderColor = _Tint(base, 1.50);
+		dark2BorderColor = _Tint(base, 1.49);
 
 		// BCheckBox uses this to indicate the clicked state...
 		if (borders == B_ALL_BORDERS) {
@@ -2449,8 +2474,8 @@ HaikuControlLook::DrawTextControlBorder(BView* view, BRect& rect,
 			dark1BorderColor = (rgb_color){ 0, 0, 0, 102 };
 			dark2BorderColor = (rgb_color){ 0, 0, 0, 97 };
 		} else {
-			dark1BorderColor = tint_color(base, 1.40);
-			dark2BorderColor = tint_color(base, 1.38);
+			dark1BorderColor = _Tint(base, 1.40);
+			dark2BorderColor = _Tint(base, 1.38);
 		}
 	}
 
@@ -2481,9 +2506,9 @@ void
 HaikuControlLook::DrawGroupFrame(BView* view, BRect& rect, const BRect& updateRect,
 	const rgb_color& base, uint32 borders)
 {
-	rgb_color frameColor = tint_color(base, 1.30);
-	rgb_color bevelLight = tint_color(base, 0.8);
-	rgb_color bevelShadow = tint_color(base, 1.03);
+	rgb_color frameColor = _Tint(base, 1.30);
+	rgb_color bevelLight = _Tint(base, 0.8);
+	rgb_color bevelShadow = _Tint(base, 1.03);
 
 	// A box too thin for its rings is a divider (a BBox with a maximum width
 	// or height of one or two pixels): its bevel and frame are drawn as one
@@ -3251,9 +3276,9 @@ HaikuControlLook::_DrawNonFlatButtonBackground(BView* view, BRect& rect,
 	// button corners color
 	rgb_color buttonCornerColor;
 	if ((flags & B_DISABLED) != 0)
-		buttonCornerColor = tint_color(base, 0.84 /* lighten "< 1" */);
+		buttonCornerColor = _Tint(base, 0.84 /* lighten "< 1" */);
 	else
-		buttonCornerColor = tint_color(base, 0.7 /* lighten "< 1" */);
+		buttonCornerColor = _Tint(base, 0.7 /* lighten "< 1" */);
 
 	// surface top gradient
 	BGradientLinear fillGradient;
@@ -3376,7 +3401,7 @@ HaikuControlLook::_DrawNonFlatButtonBackground(BView* view, BRect& rect,
 		// draw the separator
 		rgb_color separatorBaseColor = base;
 		if ((flags & B_ACTIVATED) != 0)
-			separatorBaseColor = tint_color(base, B_DARKEN_1_TINT);
+			separatorBaseColor = _Tint(base, B_DARKEN_1_TINT);
 
 		rgb_color separatorLightColor = _EdgeColor(separatorBaseColor,
 			true, flags);
@@ -3424,9 +3449,9 @@ HaikuControlLook::_DrawPopUpMarker(BView* view, const BRect& rect,
 
 	rgb_color markColor;
 	if ((flags & B_DISABLED) != 0)
-		markColor = tint_color(base, 1.35);
+		markColor = _Tint(base, 1.35);
 	else
-		markColor = tint_color(base, 1.65);
+		markColor = _Tint(base, 1.65);
 
 	view->SetHighColor(markColor);
 	view->FillTriangle(triangle[0], triangle[1], triangle[2]);
@@ -3509,27 +3534,27 @@ HaikuControlLook::_DrawMenuFieldBackgroundInside(BView* view, BRect& rect,
 		indicatorBase = base;
 	else {
 		if ((flags & B_DISABLED) != 0)
-			indicatorBase = tint_color(base, 1.05);
+			indicatorBase = _Tint(base, 1.05);
 		else
-			indicatorBase = tint_color(base, 1.12);
+			indicatorBase = _Tint(base, 1.12);
 	}
 
 	// bevel colors
-	rgb_color cornerColor = tint_color(indicatorBase, 0.85);
-	rgb_color bevelColor1 = tint_color(indicatorBase, 0.3);
-	rgb_color bevelColor2 = tint_color(indicatorBase, 0.5);
-	rgb_color bevelColor3 = tint_color(indicatorBase, 1.03);
+	rgb_color cornerColor = _Tint(indicatorBase, 0.85);
+	rgb_color bevelColor1 = _Tint(indicatorBase, 0.3);
+	rgb_color bevelColor2 = _Tint(indicatorBase, 0.5);
+	rgb_color bevelColor3 = _Tint(indicatorBase, 1.03);
 
 	if ((flags & B_DISABLED) != 0) {
-		cornerColor = tint_color(indicatorBase, 0.8);
-		bevelColor1 = tint_color(indicatorBase, 0.7);
-		bevelColor2 = tint_color(indicatorBase, 0.8);
-		bevelColor3 = tint_color(indicatorBase, 1.01);
+		cornerColor = _Tint(indicatorBase, 0.8);
+		bevelColor1 = _Tint(indicatorBase, 0.7);
+		bevelColor2 = _Tint(indicatorBase, 0.8);
+		bevelColor3 = _Tint(indicatorBase, 1.01);
 	} else {
-		cornerColor = tint_color(indicatorBase, 0.85);
-		bevelColor1 = tint_color(indicatorBase, 0.3);
-		bevelColor2 = tint_color(indicatorBase, 0.5);
-		bevelColor3 = tint_color(indicatorBase, 1.03);
+		cornerColor = _Tint(indicatorBase, 0.85);
+		bevelColor1 = _Tint(indicatorBase, 0.3);
+		bevelColor2 = _Tint(indicatorBase, 0.5);
+		bevelColor3 = _Tint(indicatorBase, 1.03);
 	}
 
 	// surface top gradient
@@ -4120,7 +4145,7 @@ HaikuControlLook::_EdgeColor(const rgb_color& base, bool shadow, uint32 flags)
 				tint = B_NO_TINT;
 		}
 
-		edgeColor = tint_color(base, tint);
+		edgeColor = _Tint(base, tint);
 	}
 
 	return edgeColor;
@@ -4140,18 +4165,18 @@ HaikuControlLook::_FrameLightColor(const rgb_color& base, uint32 flags)
 
 	if ((flags & B_DISABLED) != 0) {
 		// TODO: B_BLEND_FRAME
-		frameLightColor = tint_color(base, 1.145);
+		frameLightColor = _Tint(base, 1.145);
 
 		if ((flags & B_DEFAULT_BUTTON) != 0)
-			frameLightColor = tint_color(frameLightColor, 1.14);
+			frameLightColor = _Tint(frameLightColor, 1.14);
 	} else {
 		if ((flags & B_BLEND_FRAME) != 0)
 			frameLightColor = (rgb_color){ 0, 0, 0, 75 };
 		else
-			frameLightColor = tint_color(base, 1.35);
+			frameLightColor = _Tint(base, 1.35);
 
 		if ((flags & B_DEFAULT_BUTTON) != 0)
-			frameLightColor = tint_color(frameLightColor, 1.35);
+			frameLightColor = _Tint(frameLightColor, 1.35);
 	}
 
 	return frameLightColor;
@@ -4171,25 +4196,25 @@ HaikuControlLook::_FrameShadowColor(const rgb_color& base, uint32 flags)
 
 	if ((flags & B_DISABLED) != 0) {
 		// TODO: B_BLEND_FRAME
-		frameShadowColor = tint_color(base, 1.26);
+		frameShadowColor = _Tint(base, 1.26);
 
 		if ((flags & B_DEFAULT_BUTTON) != 0) {
-			frameShadowColor = tint_color(base, 1.145);
-			frameShadowColor = tint_color(frameShadowColor, 1.12);
+			frameShadowColor = _Tint(base, 1.145);
+			frameShadowColor = _Tint(frameShadowColor, 1.12);
 		}
 	} else {
 		if ((flags & B_DEFAULT_BUTTON) != 0) {
 			if ((flags & B_BLEND_FRAME) != 0)
 				frameShadowColor = (rgb_color){ 0, 0, 0, 75 };
 			else
-				frameShadowColor = tint_color(base, 1.33);
+				frameShadowColor = _Tint(base, 1.33);
 
-			frameShadowColor = tint_color(frameShadowColor, 1.5);
+			frameShadowColor = _Tint(frameShadowColor, 1.5);
 		} else {
 			if ((flags & B_BLEND_FRAME) != 0)
 				frameShadowColor = (rgb_color){ 0, 0, 0, 95 };
 			else
-				frameShadowColor = tint_color(base, 1.485);
+				frameShadowColor = _Tint(base, 1.485);
 		}
 	}
 
@@ -4203,11 +4228,11 @@ HaikuControlLook::_BevelLightColor(const rgb_color& base, uint32 flags)
 	rgb_color bevelLightColor;
 
 	if ((flags & B_ACTIVATED) != 0)
-		bevelLightColor = tint_color(base, 1.17);
+		bevelLightColor = _Tint(base, 1.17);
 	else if ((flags & B_DISABLED) != 0)
-		bevelLightColor = tint_color(base, B_LIGHTEN_1_TINT);
+		bevelLightColor = _Tint(base, B_LIGHTEN_1_TINT);
 	else
-		bevelLightColor = tint_color(base, 0.2);
+		bevelLightColor = _Tint(base, 0.2);
 
 	return bevelLightColor;
 }
@@ -4219,11 +4244,11 @@ HaikuControlLook::_BevelShadowColor(const rgb_color& base, uint32 flags)
 	rgb_color bevelShadowColor;
 
 	if ((flags & B_ACTIVATED) != 0)
-		bevelShadowColor = tint_color(base, 1.17);
+		bevelShadowColor = _Tint(base, 1.17);
 	else if ((flags & B_DISABLED) != 0)
 		bevelShadowColor = base;
 	else
-		bevelShadowColor = tint_color(base, 1.105);
+		bevelShadowColor = _Tint(base, 1.105);
 
 	return bevelShadowColor;
 }
@@ -4257,8 +4282,8 @@ HaikuControlLook::_MakeGradient(BGradientLinear& gradient, const BRect& rect,
 	const rgb_color& base, float topTint, float bottomTint,
 	orientation orientation) const
 {
-	gradient.AddColor(tint_color(base, topTint), 0);
-	gradient.AddColor(tint_color(base, bottomTint), 255);
+	gradient.AddColor(_Tint(base, topTint), 0);
+	gradient.AddColor(_Tint(base, bottomTint), 255);
 	gradient.SetStart(rect.LeftTop());
 	if (orientation == B_HORIZONTAL)
 		gradient.SetEnd(rect.LeftBottom());
@@ -4273,10 +4298,10 @@ HaikuControlLook::_MakeGlossyGradient(BGradientLinear& gradient, const BRect& re
 	float middle2Tint, float bottomTint,
 	orientation orientation) const
 {
-	gradient.AddColor(tint_color(base, topTint), 0);
-	gradient.AddColor(tint_color(base, middle1Tint), 132);
-	gradient.AddColor(tint_color(base, middle2Tint), 136);
-	gradient.AddColor(tint_color(base, bottomTint), 255);
+	gradient.AddColor(_Tint(base, topTint), 0);
+	gradient.AddColor(_Tint(base, middle1Tint), 132);
+	gradient.AddColor(_Tint(base, middle2Tint), 136);
+	gradient.AddColor(_Tint(base, bottomTint), 255);
 	gradient.SetStart(rect.LeftTop());
 	if (orientation == B_HORIZONTAL)
 		gradient.SetEnd(rect.LeftBottom());

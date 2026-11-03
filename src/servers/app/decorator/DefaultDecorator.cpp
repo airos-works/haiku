@@ -206,7 +206,7 @@ DefaultDecorator::GetComponentColors(Component component, uint8 highlight,
 		default:
 			if (tab && tab->buttonFocus) {
 				_colors[0] = tint_color(fFocusFrameColor, B_DARKEN_2_TINT);
-				_colors[1] = tint_color(fFocusFrameColor, B_LIGHTEN_2_TINT);
+				_colors[1] = _Lighten(fFocusFrameColor, B_LIGHTEN_2_TINT);
 				_colors[2] = fFocusFrameColor;
 				_colors[3] = tint_color(fFocusFrameColor,
 					(B_DARKEN_1_TINT + B_NO_TINT) / 2);
@@ -214,7 +214,7 @@ DefaultDecorator::GetComponentColors(Component component, uint8 highlight,
 				_colors[5] = tint_color(fFocusFrameColor, B_DARKEN_3_TINT);
 			} else {
 				_colors[0] = tint_color(fNonFocusFrameColor, B_DARKEN_2_TINT);
-				_colors[1] = tint_color(fNonFocusFrameColor, B_LIGHTEN_2_TINT);
+				_colors[1] = _Lighten(fNonFocusFrameColor, B_LIGHTEN_2_TINT);
 				_colors[2] = fNonFocusFrameColor;
 				_colors[3] = tint_color(fNonFocusFrameColor,
 					(B_DARKEN_1_TINT + B_NO_TINT) / 2);
@@ -805,7 +805,7 @@ DefaultDecorator::_DrawBlendedRect(DrawingEngine* engine, const BRect rect,
 		startColor = tint_color(colors[COLOR_BUTTON], B_DARKEN_1_TINT);
 		endColor = colors[COLOR_BUTTON_LIGHT];
 	} else {
-		startColor = tint_color(colors[COLOR_BUTTON], B_LIGHTEN_MAX_TINT);
+		startColor = _Lighten(colors[COLOR_BUTTON], B_LIGHTEN_MAX_TINT);
 		endColor = colors[COLOR_BUTTON];
 	}
 

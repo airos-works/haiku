@@ -121,6 +121,8 @@ private:
 			BButton*			fBackgroundsButton;
 			BCheckBox*			fZoomBox;
 			BCheckBox*			fMirrorBox;
+			BCheckBox*			fDarkModeBox;
+			bool				fOriginalDarkMode;
 
 			BStringView*		fTitleView;
 			BStringView*		fSubtitleView;

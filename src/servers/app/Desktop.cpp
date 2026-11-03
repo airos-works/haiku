@@ -3065,6 +3065,30 @@ Desktop::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 			break;
 		}
 
+		case AS_SET_DARK_MODE:
+		{
+			bool dark;
+			if (link.Read<bool>(&dark) != B_OK)
+				break;
+
+			// colors still waiting belong to the current palette
+			_FlushPendingColors();
+
+			BMessage colors;
+			bool switched;
+			{
+				LockedDesktopSettings settings(this);
+				switched = settings.SetDarkMode(dark, colors);
+			}
+			if (!switched)
+				break;
+
+			// set the other palette; everyone gets B_COLORS_UPDATED
+			fPendingColors = colors;
+			_FlushPendingColors();
+			break;
+		}
+
 		// ToDo: Remove this again. It is a message sent by the
 		// invalidate_on_exit kernel debugger add-on to trigger a redraw
 		// after exiting a kernel debugger session.
@@ -3137,6 +3161,22 @@ Desktop::_FlushPendingColors()
 
 	bool changed[count];
 	LockedDesktopSettings settings(this);
+
+	// the colors being replaced, for views to recognize them (BTextView's
+	// text in the old text color)
+	BMessage previousColors;
+	{
+		int32 index = 0;
+		char* name = NULL;
+		type_code type;
+		while (fPendingColors.GetInfo(B_RGB_32_BIT_TYPE, index++, &name,
+				&type) == B_OK) {
+			color_which which = which_ui_color(name);
+			if (which != B_NO_COLOR)
+				previousColors.AddColor(name, settings.UIColor(which));
+		}
+	}
+
 	settings.SetUIColors(fPendingColors, &changed[0]);
 
 	int32 index = 0;
@@ -3145,6 +3185,7 @@ Desktop::_FlushPendingColors()
 	rgb_color color;
 	color_which which = B_NO_COLOR;
 	BMessage clientMessage(B_COLORS_UPDATED);
+	BMessage clientPrevious;
 
 	while (fPendingColors.GetInfo(type, index, &name, &type) == B_OK) {
 		which = which_ui_color(name);
@@ -3161,8 +3202,13 @@ Desktop::_FlushPendingColors()
 
 		// Ensure client only gets list of changed colors
 		clientMessage.AddColor(name, color);
+		rgb_color previous;
+		if (previousColors.FindColor(name, &previous) == B_OK)
+			clientPrevious.AddColor(name, previous);
 		++index;
 	}
+	if (!clientPrevious.IsEmpty())
+		clientMessage.AddMessage("be:previous colors", &clientPrevious);
 
 	// Notify client applications
 	BAutolock appListLock(fApplicationsLock);

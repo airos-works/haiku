@@ -32,6 +32,7 @@ enum {
 	kOptionDisplayMode,
 	kOptionZoomToDisplay,
 	kOptionMirror,
+	kOptionDarkMode,
 };
 
 static struct option const kLongOptions[] = {
@@ -53,6 +54,7 @@ static struct option const kLongOptions[] = {
 	{"display-mode", required_argument, 0, kOptionDisplayMode},
 	{"zoom-to-display", required_argument, 0, kOptionZoomToDisplay},
 	{"mirror", required_argument, 0, kOptionMirror},
+	{"dark-mode", required_argument, 0, kOptionDarkMode},
 	{NULL}
 };
 
@@ -220,6 +222,8 @@ print_displays(bool shortOutput)
 		printf("Windows maximize to %s.\n",
 			zoomToDisplay ? "the display they are on" : "the whole desktop");
 	}
+	if (!shortOutput)
+		printf("Dark mode is %s.\n", ui_dark_mode() ? "on" : "off");
 }
 
 
@@ -281,7 +285,9 @@ usage(int status)
 		"\t\t\tof the desktop again\n"
 		"      --zoom-to-display on|off\n"
 		"\t\t\twhether maximizing a window fills only the display it "
-			"is on\n",
+			"is on\n"
+		"      --dark-mode on|off\twindows, menus and controls in dark "
+			"colors\n",
 		kProgramName);
 
 	exit(status);
@@ -311,6 +317,7 @@ main(int argc, char** argv)
 	bool changeDisplay = false;
 	const char* mirrorName = NULL;
 	int zoomToDisplay = -1;
+	int darkMode = -1;
 
 	// TODO: add a possibility to set a virtual screen size in addition to
 	// the display resolution!
@@ -370,6 +377,16 @@ main(int argc, char** argv)
 			case kOptionMirror:
 				mirrorName = optarg;
 				changeDisplay = true;
+				break;
+			case kOptionDarkMode:
+				if (!strcasecmp(optarg, "on") || !strcasecmp(optarg, "yes")
+					|| !strcmp(optarg, "1"))
+					darkMode = 1;
+				else if (!strcasecmp(optarg, "off")
+					|| !strcasecmp(optarg, "no") || !strcmp(optarg, "0"))
+					darkMode = 0;
+				else
+					usage(1);
 				break;
 			case kOptionZoomToDisplay:
 				if (!strcasecmp(optarg, "on") || !strcasecmp(optarg, "yes")
@@ -491,6 +508,8 @@ main(int argc, char** argv)
 
 	if (zoomToDisplay >= 0)
 		BPrivate::set_zoom_to_display(zoomToDisplay == 1);
+	if (darkMode >= 0)
+		set_ui_dark_mode(darkMode == 1);
 
 	if (changeDisplay) {
 		if (displayName == NULL) {
@@ -541,7 +560,8 @@ main(int argc, char** argv)
 		print_displays(shortOutput);
 		return 0;
 	}
-	if (zoomToDisplay >= 0 && !setMode && !listModes && !getBrightness)
+	if ((zoomToDisplay >= 0 || darkMode >= 0) && !setMode && !listModes
+		&& !getBrightness)
 		return 0;
 
 	ScreenMode screenMode(NULL);

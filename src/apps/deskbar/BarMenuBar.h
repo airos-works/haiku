@@ -64,6 +64,7 @@ public:
 	virtual	void			MouseMoved(BPoint where, uint32 code,
 								const BMessage* message);
 	virtual	void			Draw(BRect);
+	virtual	void			MessageReceived(BMessage* message);
 
 			void			DrawBackground(BRect);
 			void			SmartResize(float width = -1.0f,
@@ -82,6 +83,8 @@ public:
 	const	BBitmap*		FetchTeamIcon();
 
 private:
+	static	BBitmap*		_LoadLogo(bool forLightMenu);
+
 			TBarView*		fBarView;
 			TBarMenuTitle*	fDeskbarMenuItem;
 			TBarMenuTitle*	fAppListMenuItem;
@@ -89,6 +92,9 @@ private:
 
 	const	uint8*			fTeamIconData;
 			size_t			fTeamIconSize;
+
+			BBitmap*		fLogo;
+			bool			fLogoForLightMenu;
 };
 
 

@@ -169,6 +169,7 @@ string_for_message_code(uint32 code)
 		// Global function call defs
 		CODE(AS_SET_UI_COLORS);
 		CODE(AS_SET_UI_COLOR);
+		CODE(AS_SET_DARK_MODE);
 		CODE(AS_SET_DECORATOR);
 		CODE(AS_GET_DECORATOR);
 

@@ -136,6 +136,23 @@ ColorsView::MessageReceived(BMessage* message)
 	}
 
 	switch (message->what) {
+		case B_COLORS_UPDATED:
+		{
+			// Switched to the light or dark appearance (Screen preferences):
+			// its own palette, defaults and revert point apply now.
+			if (ui_dark_mode() == fDarkMode)
+				break;
+
+			LoadSettings();
+			_UpdatePreviews(fCurrentColors);
+			rgb_color color = ui_color(fWhich);
+			fPicker->SetValue(color);
+			fColorPreview->SetColor(color);
+			fColorPreview->Invalidate();
+			Window()->PostMessage(kMsgUpdate);
+			break;
+		}
+
 		case UPDATE_COLOR:
 		{
 			// Received from the color fPicker when its color changes
@@ -179,6 +196,9 @@ ColorsView::MessageReceived(BMessage* message)
 void
 ColorsView::LoadSettings()
 {
+	fDarkMode = ui_dark_mode();
+	fDefaultColors.MakeEmpty();
+	fCurrentColors.MakeEmpty();
 	get_default_colors(&fDefaultColors);
 	get_current_colors(&fCurrentColors);
 	fPrevColors = fCurrentColors;

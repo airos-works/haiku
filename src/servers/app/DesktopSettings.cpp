@@ -120,6 +120,9 @@ DesktopSettingsPrivate::_SetDefaults()
 		sizeof(color_map));
 	memcpy((void*)fShared.colors, BPrivate::kDefaultColors,
 		sizeof(rgb_color) * kColorWhichCount);
+	fShared.dark_mode = false;
+	for (int32 i = 0; i < kColorWhichCount; i++)
+		fInactiveColors[i] = B_TRANSPARENT_COLOR;
 
 	gSubpixelAntialiasing = true;
 	gDefaultHintingMode = HINTING_MODE_ON;
@@ -353,6 +356,21 @@ DesktopSettingsPrivate::_Load()
 					fShared.colors[i] = B_TRANSPARENT_COLOR;
 				}
 			}
+
+			// light or dark appearance, and the other one's palette
+			bool darkMode;
+			if (settings.FindBool("dark mode", &darkMode) == B_OK)
+				fShared.dark_mode = darkMode;
+			for (int32 i = 0; i < kColorWhichCount; i++) {
+				char colorName[24];
+				snprintf(colorName, sizeof(colorName), "inactive color%" B_PRId32,
+					(int32)index_to_color_which(i));
+
+				if (settings.FindInt32(colorName, (int32*)&fInactiveColors[i])
+						!= B_OK) {
+					fInactiveColors[i] = B_TRANSPARENT_COLOR;
+				}
+			}
 		}
 	}
 
@@ -522,6 +540,17 @@ DesktopSettingsPrivate::Save(uint32 mask)
 				snprintf(colorName, sizeof(colorName), "color%" B_PRId32,
 					(int32)index_to_color_which(i));
 				settings.AddInt32(colorName, (const int32&)fShared.colors[i]);
+			}
+
+			settings.AddBool("dark mode", fShared.dark_mode);
+			for (int32 i = 0; i < kColorWhichCount; i++) {
+				if (fInactiveColors[i] == B_TRANSPARENT_COLOR)
+					continue;
+
+				char colorName[24];
+				snprintf(colorName, sizeof(colorName), "inactive color%" B_PRId32,
+					(int32)index_to_color_which(i));
+				settings.AddInt32(colorName, (const int32&)fInactiveColors[i]);
 			}
 
 			status = write_settings(path, settings);
@@ -825,6 +854,44 @@ DesktopSettingsPrivate::UIColor(color_which which) const
 }
 
 
+/*!	Switches to the light or the dark appearance. The current palette is kept
+	as the other appearance's, and \a colors gets the palette to switch to:
+	the one last used in that appearance, or its defaults. The desktop color
+	is not part of either. Returns \c false when \a dark is the current
+	appearance already.
+*/
+bool
+DesktopSettingsPrivate::SetDarkMode(bool dark, BMessage& colors)
+{
+	if (fShared.dark_mode == dark)
+		return false;
+
+	for (int32 i = 0; i < kColorWhichCount; i++) {
+		color_which which = index_to_color_which(i);
+		if (which == B_DESKTOP_COLOR || color_which_to_index(which) != i)
+			continue;
+
+		rgb_color color = fInactiveColors[i];
+		if (color == B_TRANSPARENT_COLOR)
+			color = BPrivate::GetSystemColor(which, dark);
+
+		fInactiveColors[i] = fShared.colors[i];
+		colors.AddColor(ui_color_name(which), color);
+	}
+
+	fShared.dark_mode = dark;
+	Save(kAppearanceSettings);
+	return true;
+}
+
+
+bool
+DesktopSettingsPrivate::DarkMode() const
+{
+	return fShared.dark_mode;
+}
+
+
 void
 DesktopSettingsPrivate::SetSubpixelAntialiasing(bool subpix)
 {
@@ -1041,6 +1108,13 @@ DesktopSettings::UIColor(color_which which) const
 
 
 bool
+DesktopSettings::DarkMode() const
+{
+	return fSettings->DarkMode();
+}
+
+
+bool
 DesktopSettings::SubpixelAntialiasing() const
 {
 	return fSettings->SubpixelAntialiasing();
@@ -1180,6 +1254,13 @@ void
 LockedDesktopSettings::SetUIColors(const BMessage& colors, bool* changed)
 {
 	fSettings->SetUIColors(colors, &changed[0]);
+}
+
+
+bool
+LockedDesktopSettings::SetDarkMode(bool dark, BMessage& colors)
+{
+	return fSettings->SetDarkMode(dark, colors);
 }
 
 
