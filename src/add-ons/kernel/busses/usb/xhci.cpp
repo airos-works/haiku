@@ -400,7 +400,10 @@ XHCI::XHCI(pci_info *info, 	pci_device_module_info* pci, pci_device* device, Sta
 		fEventIdx(0),
 		fCmdIdx(0),
 		fEventCcs(1),
-		fCmdCcs(1)
+		fCmdCcs(1),
+		fLastTransferErrorLog(0),
+		fSuppressedTransferErrors(0),
+		fLastTransferErrorCode(COMP_INVALID)
 {
 	B_INITIALIZE_SPINLOCK(&fSpinlock);
 	mutex_init(&fFinishedLock, "XHCI finished transfers");
@@ -3850,8 +3853,10 @@ XHCI::HandleTransferComplete(xhci_trb* trb)
 	const uint8 endpointNumber = TRB_3_ENDPOINT_GET(flags),
 		slot = TRB_3_SLOT_GET(flags);
 
-	if (slot > fSlotCount)
+	if (slot > fSlotCount) {
 		TRACE_ERROR("invalid slot\n");
+		return;
+	}
 	if (endpointNumber == 0 || endpointNumber >= XHCI_MAX_ENDPOINTS) {
 		TRACE_ERROR("invalid endpoint\n");
 		return;
@@ -3912,13 +3917,31 @@ XHCI::HandleTransferComplete(xhci_trb* trb)
 
 	if (completionCode != COMP_SUCCESS && completionCode != COMP_SHORT_PACKET
 			&& completionCode != COMP_STOPPED && completionCode != COMP_STOPPED_LENGTH_INVALID) {
-		TRACE_ALWAYS("transfer error on slot %" B_PRId8 " endpoint %" B_PRId8
-			": %s (remainder %" B_PRId32 ", transferred %" B_PRId32
-			", burst payload %" B_PRIuSIZE ", event flags %#" B_PRIx32
-			", TRB %#" B_PRIx64 ")\n",
-			slot, endpointNumber, xhci_error_string(completionCode), remainder,
-			transferred, (size_t)endpoint->max_burst_payload, flags,
-			B_LENDIAN_TO_HOST_INT64(trb->address));
+		// This runs once per transfer event, and an isochronous endpoint raises
+		// one event per packet, so a single disturbance (an unplug, or a sample
+		// rate change while the ring is live) produces thousands of identical
+		// lines. With serial debug output each one blocks on the UART, which is
+		// enough to livelock the machine. Log a given completion code at most
+		// once per 100 ms, and say how many were folded in.
+		const bigtime_t now = system_time();
+		if (completionCode != fLastTransferErrorCode
+				|| now - fLastTransferErrorLog >= 100000) {
+			if (fSuppressedTransferErrors > 0) {
+				TRACE_ALWAYS("(%" B_PRIu32 " further transfer errors "
+					"suppressed)\n", fSuppressedTransferErrors);
+				fSuppressedTransferErrors = 0;
+			}
+			TRACE_ALWAYS("transfer error on slot %" B_PRId8 " endpoint %"
+				B_PRId8 ": %s (remainder %" B_PRId32 ", transferred %"
+				B_PRId32 ", burst payload %" B_PRIuSIZE ", event flags %#"
+				B_PRIx32 ", TRB %#" B_PRIx64 ")\n",
+				slot, endpointNumber, xhci_error_string(completionCode),
+				remainder, transferred, (size_t)endpoint->max_burst_payload,
+				flags, B_LENDIAN_TO_HOST_INT64(trb->address));
+			fLastTransferErrorLog = now;
+			fLastTransferErrorCode = completionCode;
+		} else
+			fSuppressedTransferErrors++;
 	}
 
 	phys_addr_t source = B_LENDIAN_TO_HOST_INT64(trb->address);
@@ -4413,13 +4436,22 @@ XHCI::FinishTransfers()
 
 			// A control endpoint that halted is reset at once: a device
 			// refuses a request it does not support with a stall, and takes
-			// the next one. (The halt of a bulk or interrupt endpoint is its
-			// driver's to clear.)
+			// the next one.
+			// A bulk or interrupt endpoint that stalled is reset too. Its
+			// driver clears the halt in the device (CLEAR_FEATURE through
+			// the default pipe), but nothing else would reset the endpoint
+			// in the controller, so the next transfer would never run
+			// (XHCI 1.2 § 4.8.3). Both sides restart at sequence number 0,
+			// as with a cancellation. Only a stall: transaction errors also
+			// halt, but an unplug raises them in bursts, and each command to
+			// a slot that is gone costs a timeout on this thread. Those are
+			// left to the next transfer's timeout and cancellation.
 			xhci_endpoint* endpoint
 				= (xhci_endpoint*)transfer->TransferPipe()->ControllerCookie();
-			if (completionCode != COMP_SUCCESS
+			if (endpoint != NULL && completionCode != COMP_SUCCESS
 				&& completionCode != COMP_SHORT_PACKET
-				&& endpoint != NULL && endpoint->id == 0) {
+				&& (endpoint->id == 0 || (completionCode == COMP_STALL
+					&& transfer->IsochronousData() == NULL))) {
 				_RecoverHaltedEndpoint(endpoint, td);
 			}
 
