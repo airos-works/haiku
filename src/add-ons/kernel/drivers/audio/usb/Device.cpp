@@ -103,7 +103,7 @@ Device::Device(usb_device device)
 	fVendorID = deviceDescriptor->vendor_id;
 	fProductID = deviceDescriptor->product_id;
 	fUSBVersion = deviceDescriptor->usb_version;
-	get_product_name(device, deviceDescriptor->product, fName, sizeof(fName));
+
 	fBuffersReadySem = create_sem(0, DRIVER_NAME "_buffers_ready");
 	if (fBuffersReadySem < B_OK) {
 		TRACE(ERR, "Error of creating ready "
@@ -113,6 +113,11 @@ Device::Device(usb_device device)
 
 	if (_SetupEndpoints() != B_OK)
 		return;
+
+	// The driver is offered every USB device; ask for the product string
+	// only once the device has shown it is an audio device, so hubs,
+	// keyboards and the like get no string requests from us.
+	get_product_name(device, deviceDescriptor->product, fName, sizeof(fName));
 
 	// must be set in derived class constructor
 	fStatus = B_OK;
