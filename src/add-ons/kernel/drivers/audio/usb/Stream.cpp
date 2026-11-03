@@ -918,7 +918,6 @@ Stream::SetGlobalFormat(multi_format_info* Format)
 status_t
 Stream::GetBuffers(multi_buffer_list* List)
 {
-// TODO: check the available buffers count!
 	if (fAreaSize == 0)
 		return B_NO_INIT;
 
@@ -947,16 +946,35 @@ Stream::GetBuffers(multi_buffer_list* List)
 
 	TypeIFormatDescriptor* format = static_cast<TypeIFormatDescriptor*>(
 		fAlternates[fActiveAlternate]->Format());
+	size_t channelCount = format->fNumChannels;
+
+	// Fill only what the caller has room for: Buffers holds
+	// request_*_buffers rows of request_*_channels entries, and this stream's
+	// channels start at startChannel in each row. The counts returned stay
+	// the device's own, so a caller that asked for too few can tell.
+	int32 requestBuffers = fIsInput
+		? List->request_record_buffers : List->request_playback_buffers;
+	int32 requestChannels = fIsInput
+		? List->request_record_channels : List->request_playback_channels;
+	size_t rowCount = requestBuffers > 0
+		? min_c((size_t)kSamplesBufferCount, (size_t)requestBuffers) : 0;
+	size_t copyCount = 0;
+	if (startChannel >= 0 && requestChannels > startChannel) {
+		copyCount = min_c(channelCount,
+			(size_t)(requestChannels - startChannel));
+	}
 
 	// [buffer][channel] init buffers
-	for (size_t buffer = 0; buffer < kSamplesBufferCount; buffer++) {
+	for (size_t buffer = 0; buffer < rowCount && copyCount > 0; buffer++) {
 		TRACE(DTA, "%s buffer #%d:\n", fIsInput ? "input" : "output", buffer + 1);
 
-		struct buffer_desc descs[format->fNumChannels];
-		for (size_t channel = startChannel;
-				channel < format->fNumChannels; channel++) {
+		// fBuffers holds this stream's channels only, so the descriptors
+		// and the offset into each frame count from its first channel; the
+		// descriptors go at the stream's first channel in the caller's row.
+		struct buffer_desc descs[channelCount];
+		for (size_t channel = 0; channel < copyCount; channel++) {
 			// init stride to the same for all buffers
-			uint32 stride = format->fSubframeSize * format->fNumChannels;
+			uint32 stride = format->fSubframeSize * channelCount;
 			descs[channel].stride = stride;
 
 			size_t bufferSize = (fSamplesCount / kSamplesBufferCount) * stride;
@@ -964,11 +982,15 @@ Stream::GetBuffers(multi_buffer_list* List)
 			descs[channel].base += buffer * bufferSize;
 			descs[channel].base += channel * format->fSubframeSize;
 
-			TRACE(DTA, "%d:%d: base:%#010x; stride:%#010x\n", buffer, channel,
-				descs[channel].base, descs[channel].stride);
+			TRACE(DTA, "%d:%d: base:%#010x; stride:%#010x\n", buffer,
+				startChannel + channel, descs[channel].base,
+				descs[channel].stride);
 		}
-		if (!IS_USER_ADDRESS(Buffers[buffer])
-				|| user_memcpy(Buffers[buffer], descs, sizeof(descs)) < B_OK) {
+
+		buffer_desc* row = Buffers[buffer] + startChannel;
+		if (!IS_USER_ADDRESS(row)
+				|| user_memcpy(row, descs, sizeof(buffer_desc) * copyCount)
+					< B_OK) {
 			return B_BAD_ADDRESS;
 		}
 	}

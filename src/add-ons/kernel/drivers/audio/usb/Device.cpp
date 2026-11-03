@@ -104,7 +104,6 @@ Device::Device(usb_device device)
 	fProductID = deviceDescriptor->product_id;
 	fUSBVersion = deviceDescriptor->usb_version;
 	get_product_name(device, deviceDescriptor->product, fName, sizeof(fName));
-
 	fBuffersReadySem = create_sem(0, DRIVER_NAME "_buffers_ready");
 	if (fBuffersReadySem < B_OK) {
 		TRACE(ERR, "Error of creating ready "
@@ -304,11 +303,24 @@ Device::Control(uint32 op, void* buffer, size_t length)
 			if (user_memcpy(&info, buffer, sizeof(multi_mix_value_info)) != B_OK)
 				return B_BAD_ADDRESS;
 
+			// item_count comes from the caller: bound it, and keep the
+			// values off the kernel stack.
+			if (info.item_count < 0 || info.item_count > kMaxMixItems)
+				return B_BAD_VALUE;
+			if (info.item_count == 0)
+				return B_OK;
+
 			multi_mix_value* originalValues = info.values;
 			size_t mixValueSize = info.item_count * sizeof(multi_mix_value);
-			multi_mix_value* values = (multi_mix_value*)alloca(mixValueSize);
-			if (user_memcpy(values, info.values, mixValueSize) != B_OK)
+			if (!IS_USER_ADDRESS(originalValues))
 				return B_BAD_ADDRESS;
+			multi_mix_value* values = (multi_mix_value*)malloc(mixValueSize);
+			if (values == NULL)
+				return B_NO_MEMORY;
+			if (user_memcpy(values, originalValues, mixValueSize) != B_OK) {
+				free(values);
+				return B_BAD_ADDRESS;
+			}
 			info.values = values;
 
 			status_t status;
@@ -316,10 +328,12 @@ Device::Control(uint32 op, void* buffer, size_t length)
 				status = _MultiGetMix(&info);
 			else
 				status = _MultiSetMix(&info);
-			if (status != B_OK)
-				return status;
 			// the multi_mix_value_info is not modified
-			return user_memcpy(originalValues, values, mixValueSize);
+			if (status == B_OK
+				&& user_memcpy(originalValues, values, mixValueSize) != B_OK)
+				status = B_BAD_ADDRESS;
+			free(values);
+			return status;
 		}
 
 		case B_MULTI_LIST_MIX_CHANNELS:
@@ -337,6 +351,9 @@ Device::Control(uint32 op, void* buffer, size_t length)
 				!= B_OK) {
 				return B_BAD_ADDRESS;
 			}
+
+			if (info.control_count < 0 || info.control_count > kMaxMixItems)
+				return B_BAD_VALUE;
 
 			original_controls = info.controls;
 			allocSize = sizeof(multi_mix_control) * info.control_count;
@@ -381,8 +398,21 @@ Device::Control(uint32 op, void* buffer, size_t length)
 			buffer_desc **original_playback_descs = list.playback_buffers;
 			buffer_desc **original_record_descs = list.record_buffers;
 
-			buffer_desc *playback_descs[list.request_playback_buffers];
-			buffer_desc *record_descs[list.request_record_buffers];
+			// The row pointer arrays live on the kernel stack and their
+			// sizes come from the caller: bound them. The streams fill
+			// kSamplesBufferCount rows at most.
+			if (list.request_playback_buffers < 0
+				|| list.request_record_buffers < 0)
+				return B_BAD_VALUE;
+			int32 originalPlaybackRequest = list.request_playback_buffers;
+			int32 originalRecordRequest = list.request_record_buffers;
+			list.request_playback_buffers = min_c(
+				list.request_playback_buffers, kMaxRequestBuffers);
+			list.request_record_buffers = min_c(
+				list.request_record_buffers, kMaxRequestBuffers);
+
+			buffer_desc *playback_descs[kMaxRequestBuffers];
+			buffer_desc *record_descs[kMaxRequestBuffers];
 
 			if (!IS_USER_ADDRESS(list.playback_buffers)
 				|| user_memcpy(playback_descs, list.playback_buffers,
@@ -403,14 +433,16 @@ Device::Control(uint32 op, void* buffer, size_t length)
 
 			list.playback_buffers = original_playback_descs;
 			list.record_buffers = original_record_descs;
+			int32 playbackCount = list.request_playback_buffers;
+			int32 recordCount = list.request_record_buffers;
+			list.request_playback_buffers = originalPlaybackRequest;
+			list.request_record_buffers = originalRecordRequest;
 
 			if (user_memcpy(buffer, &list, sizeof(multi_buffer_list)) < B_OK
 				|| user_memcpy(original_playback_descs, playback_descs,
-					sizeof(buffer_desc*) * list.request_playback_buffers)
-					< B_OK
+					sizeof(buffer_desc*) * playbackCount) < B_OK
 				|| user_memcpy(original_record_descs, record_descs,
-					sizeof(buffer_desc*) * list.request_record_buffers)
-					< B_OK) {
+					sizeof(buffer_desc*) * recordCount) < B_OK) {
 				status = B_BAD_ADDRESS;
 			}
 
