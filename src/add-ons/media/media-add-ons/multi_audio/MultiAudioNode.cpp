@@ -37,6 +37,20 @@
 #define PARAMETER_ID_OUTPUT_FREQUENCY	2
 
 
+// Bytes in one device record buffer for a capture output of this format.
+// Each output carries only its own channels, so this must use the output's
+// channel count: sizing it for the whole device (all input channels) made a
+// 2-channel output of a 4-channel device advertise twice the frames it fills,
+// and the unfilled half was delivered as silence.
+static size_t
+record_buffer_bytes(uint32 frames, const media_format& format)
+{
+	return frames * (format.u.raw_audio.format
+			& media_raw_audio_format::B_AUDIO_SIZE_MASK)
+		* format.u.raw_audio.channel_count;
+}
+
+
 // This represents a hardware output.
 class node_input {
 public:
@@ -491,6 +505,15 @@ MultiAudioNode::NodeRegistered()
 			currentOutput->fPreferredFormat.u.raw_audio.channel_count++;
 			currentOutput->fOutput.format = currentOutput->fPreferredFormat;
 		}
+	}
+
+	// Now that each output knows its channel count, size its buffers for it.
+	for (int32 i = 0; node_output* channel = (node_output*)fOutputs.ItemAt(i);
+			i++) {
+		channel->fPreferredFormat.u.raw_audio.buffer_size = record_buffer_bytes(
+			fDevice->BufferList().return_record_buffer_size,
+			channel->fPreferredFormat);
+		channel->fOutput.format = channel->fPreferredFormat;
 	}
 
 	// Set up our parameter web
@@ -1549,7 +1572,7 @@ MultiAudioNode::SetParameterValue(int32 id, bigtime_t performanceTime,
 			media_format newFormat = channel->fOutput.format;
 			newFormat.u.raw_audio.frame_rate = frameRate;
 			newFormat.u.raw_audio.buffer_size
-				= fInputPreferredFormat.u.raw_audio.buffer_size;
+				= channel->fPreferredFormat.u.raw_audio.buffer_size;
 
 			int32 changeTag = 0;
 			status_t error = RequestFormatChange(channel->fOutput.source,
@@ -2124,6 +2147,31 @@ MultiAudioNode::_UpdateTimeSource(multi_buffer_info& info, node_input& input)
 	if (info.played_real_time == 0 || info.played_real_time < fTimeComputer.RealTime())
 		return;
 
+	// Right after a stream (re)start the driver completes its initially
+	// queued buffers in a burst, delivering pairs only microseconds apart
+	// whose frame counts still advance by a whole buffer. Fed to the
+	// TimeComputer, those drive the drift estimate to absurd values, and the
+	// published performance clock races for about a second -- exactly when a
+	// freshly connected mixer computes its first absolute wake-up deadline
+	// from RealTimeFor(). A mixer that does so inside that window parks far in
+	// the future and plays nothing until it is restarted. Real pairs arrive
+	// one buffer period apart; refuse anything closer than half that.
+	//
+	// BufferDuration() is only set by BBufferProducer::Connect(), i.e. when
+	// something consumes this node's record output, so it is usually 0.
+	// Derive the period from the playback geometry that actually clocks us.
+	bigtime_t bufferDuration = BufferDuration();
+	if (bufferDuration <= 0) {
+		const multi_buffer_list& list = fDevice->BufferList();
+		float rate = fOutputPreferredFormat.u.raw_audio.frame_rate;
+		if (rate > 0 && list.return_playback_buffer_size > 0) {
+			bufferDuration = bigtime_t(
+				list.return_playback_buffer_size * 1000000LL / rate);
+		}
+	}
+	if (info.played_real_time - fTimeComputer.RealTime() < bufferDuration / 2)
+		return;
+
 	fTimeComputer.AddTimeStamp(info.played_real_time,
 		info.played_frames_count);
 	PublishTime(fTimeComputer.PerformanceTime(), fTimeComputer.RealTime(),
@@ -2393,12 +2441,13 @@ MultiAudioNode::_SetNodeOutputFrameRate(float frameRate)
 	for (int32 i = 0; node_output* channel = (node_output*)fOutputs.ItemAt(i);
 			i++) {
 		channel->fPreferredFormat.u.raw_audio.frame_rate = frameRate;
-		channel->fPreferredFormat.u.raw_audio.buffer_size
-			= fInputPreferredFormat.u.raw_audio.buffer_size;
+		channel->fPreferredFormat.u.raw_audio.buffer_size = record_buffer_bytes(
+			fDevice->BufferList().return_record_buffer_size,
+			channel->fPreferredFormat);
 
 		channel->fOutput.format.u.raw_audio.frame_rate = frameRate;
 		channel->fOutput.format.u.raw_audio.buffer_size
-			= fInputPreferredFormat.u.raw_audio.buffer_size;
+			= channel->fPreferredFormat.u.raw_audio.buffer_size;
 	}
 
 	// make sure the time base is reset

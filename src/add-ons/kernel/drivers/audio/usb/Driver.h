@@ -21,6 +21,11 @@ const char* const kVersion = "ver.0.0.5";
 const uint32 kSamplesBufferSize = 2048;
 // [sub]buffers count
 const uint32 kSamplesBufferCount = 2;
+// most row pointers B_MULTI_GET_BUFFERS takes from a caller (multi_audio
+// asks for its MAX_BUFFERS, 32)
+const int32 kMaxRequestBuffers = 32;
+// most mix values or controls one mixer ioctl takes from a caller
+const int32 kMaxMixItems = 4096;
 
 
 extern usb_module_info* gUSBModule;

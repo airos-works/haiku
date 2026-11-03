@@ -413,6 +413,11 @@ private:
 			uint8				fEventCcs;
 			uint8				fCmdCcs;
 
+			// Transfer error log rate limiting; guarded by fEventLock.
+			bigtime_t			fLastTransferErrorLog;
+			uint32				fSuppressedTransferErrors;
+			uint8				fLastTransferErrorCode;
+
 			uint32				fExitLatMax;
 };
 

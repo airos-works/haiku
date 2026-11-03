@@ -52,9 +52,14 @@ Object::WaitForIdle()
 	// The host controller can retire an isochronous transfer several frames
 	// after it has been canceled. Two milliseconds is not enough for that path.
 	int32 retries = 5000;
-	while (CountReferences() != 1 && retries--)
+	while (CountReferences() != 1 && retries-- > 0)
 		snooze(100);
-	if (retries <= 0)
+
+	// Test the reference count, not the retry counter. `retries--` is a post
+	// decrement that is skipped entirely when the && short-circuits, so an
+	// object that went idle on the final retry leaves retries at 0 and the
+	// old condition panicked on it despite the wait having succeeded.
+	if (CountReferences() != 1)
 		panic("USB object did not become idle! @! calling -m usb");
 }
 

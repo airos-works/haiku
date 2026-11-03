@@ -172,6 +172,9 @@ compat_send(void *cookie, net_buffer *buffer)
 
 	//if_printf(ifp, "compat_send(%p, [%lu])\n", buffer, length);
 
+	if ((ifp->flags & DEVICE_CLOSED) != 0)
+		return B_INTERRUPTED;
+
 	if (length <= MHLEN) {
 		mb = m_gethdr(0, MT_DATA);
 		if (mb == NULL)
@@ -185,12 +188,11 @@ compat_send(void *cookie, net_buffer *buffer)
 	}
 
 	status_t status = gBufferModule->read(buffer, 0, mtod(mb, void *), length);
-	if (status != B_OK)
+	if (status != B_OK) {
+		m_freem(mb);
 		return status;
+	}
 	mb->m_pkthdr.len = mb->m_len = length;
-
-	if ((ifp->flags & DEVICE_CLOSED) != 0)
-		return B_INTERRUPTED;
 
 	IFF_LOCKGIANT(ifp);
 	int result = ifp->if_output(ifp, mb, NULL, NULL);

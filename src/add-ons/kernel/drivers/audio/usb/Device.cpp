@@ -103,7 +103,6 @@ Device::Device(usb_device device)
 	fVendorID = deviceDescriptor->vendor_id;
 	fProductID = deviceDescriptor->product_id;
 	fUSBVersion = deviceDescriptor->usb_version;
-	get_product_name(device, deviceDescriptor->product, fName, sizeof(fName));
 
 	fBuffersReadySem = create_sem(0, DRIVER_NAME "_buffers_ready");
 	if (fBuffersReadySem < B_OK) {
@@ -114,6 +113,11 @@ Device::Device(usb_device device)
 
 	if (_SetupEndpoints() != B_OK)
 		return;
+
+	// The driver is offered every USB device; ask for the product string
+	// only once the device has shown it is an audio device, so hubs,
+	// keyboards and the like get no string requests from us.
+	get_product_name(device, deviceDescriptor->product, fName, sizeof(fName));
 
 	// must be set in derived class constructor
 	fStatus = B_OK;
@@ -198,29 +202,22 @@ Device::Control(uint32 op, void* buffer, size_t length)
 	switch (op) {
 		case B_MULTI_GET_DESCRIPTION:
 		{
+			// _MultiGetDescription() copies the channel entries straight to
+			// the caller's array, as many as it asked for, so that array
+			// must be in user space.
 			multi_description description;
-			multi_channel_info channels[16];
-			multi_channel_info* originalChannels;
-
 			if (user_memcpy(&description, buffer, sizeof(multi_description))
 					!= B_OK)
 				return B_BAD_ADDRESS;
-
-			originalChannels = description.channels;
-			description.channels = channels;
-			if (description.request_channel_count > 16)
-				description.request_channel_count = 16;
+			if (description.request_channel_count > 0
+					&& !IS_USER_ADDRESS(description.channels))
+				return B_BAD_ADDRESS;
 
 			status_t status = _MultiGetDescription(&description);
 			if (status != B_OK)
 				return status;
 
-			description.channels = originalChannels;
-			if (user_memcpy(buffer, &description, sizeof(multi_description))
-					!= B_OK)
-				return B_BAD_ADDRESS;
-			return user_memcpy(originalChannels, channels,
-				sizeof(multi_channel_info) * description.request_channel_count);
+			return user_memcpy(buffer, &description, sizeof(multi_description));
 		}
 		case B_MULTI_GET_EVENT_INFO:
 			TRACE(ERR, "B_MULTI_GET_EVENT_INFO n/i\n");
@@ -235,58 +232,43 @@ Device::Control(uint32 op, void* buffer, size_t length)
 			return B_ERROR;
 
 		case B_MULTI_GET_ENABLED_CHANNELS:
+		case B_MULTI_SET_ENABLED_CHANNELS:
 		{
 			multi_channel_enable enable;
-			uint32 enable_bits = 0;
-			uchar* orig_enable_bits;
-
 			if (user_memcpy(&enable, buffer, sizeof(enable)) != B_OK
 					|| !IS_USER_ADDRESS(enable.enable_bits)) {
 				return B_BAD_ADDRESS;
 			}
 
-			orig_enable_bits = enable.enable_bits;
-			enable.enable_bits = (uchar*)&enable_bits;
-			status_t status = _MultiGetEnabledChannels(&enable);
-			if (status != B_OK)
-				return status;
+			// The streams set or test one bit per channel, numbered across
+			// all of them, and the caller's array holds a bit for each of
+			// those channels. Bounce through a buffer of that size: a fixed
+			// one is overrun on a device with more channels than it holds.
+			size_t size = _EnableBitsSize();
+			uchar* bits = (uchar*)calloc(1, max_c(size, 1));
+			if (bits == NULL)
+				return B_NO_MEMORY;
 
-			enable.enable_bits = orig_enable_bits;
-			if (user_memcpy(enable.enable_bits, &enable_bits,
-					sizeof(enable_bits)) != B_OK
-				|| user_memcpy(buffer, &enable,
-					sizeof(multi_channel_enable)) != B_OK) {
-				return B_BAD_ADDRESS;
+			uchar* userBits = enable.enable_bits;
+			status_t status = B_OK;
+			if (op == B_MULTI_SET_ENABLED_CHANNELS
+					&& user_memcpy(bits, userBits, size) != B_OK)
+				status = B_BAD_ADDRESS;
+
+			if (status == B_OK) {
+				enable.enable_bits = bits;
+				status = op == B_MULTI_GET_ENABLED_CHANNELS
+					? _MultiGetEnabledChannels(&enable)
+					: _MultiSetEnabledChannels(&enable);
+				enable.enable_bits = userBits;
 			}
 
-			return B_OK;
-		}
-		case B_MULTI_SET_ENABLED_CHANNELS:
-		{
-			multi_channel_enable enable;
-			uint32 enable_bits;
-			uchar* orig_enable_bits;
+			if (status == B_OK && (user_memcpy(userBits, bits, size) != B_OK
+					|| user_memcpy(buffer, &enable, sizeof(enable)) != B_OK))
+				status = B_BAD_ADDRESS;
 
-			if (user_memcpy(&enable, buffer, sizeof(enable)) != B_OK
-				|| !IS_USER_ADDRESS(enable.enable_bits)) {
-				return B_BAD_ADDRESS;
-			}
-
-			orig_enable_bits = enable.enable_bits;
-			enable.enable_bits = (uchar*)&enable_bits;
-			status_t status = _MultiSetEnabledChannels(&enable);
-			if (status != B_OK)
-				return status;
-
-			enable.enable_bits = orig_enable_bits;
-			if (user_memcpy(enable.enable_bits, &enable_bits,
-					sizeof(enable_bits)) < B_OK
-				|| user_memcpy(buffer, &enable, sizeof(multi_channel_enable))
-					< B_OK) {
-				return B_BAD_ADDRESS;
-			}
-
-			return B_OK;
+			free(bits);
+			return status;
 		}
 		case B_MULTI_GET_GLOBAL_FORMAT:
 		{
@@ -326,11 +308,24 @@ Device::Control(uint32 op, void* buffer, size_t length)
 			if (user_memcpy(&info, buffer, sizeof(multi_mix_value_info)) != B_OK)
 				return B_BAD_ADDRESS;
 
+			// item_count comes from the caller: bound it, and keep the
+			// values off the kernel stack.
+			if (info.item_count < 0 || info.item_count > kMaxMixItems)
+				return B_BAD_VALUE;
+			if (info.item_count == 0)
+				return B_OK;
+
 			multi_mix_value* originalValues = info.values;
 			size_t mixValueSize = info.item_count * sizeof(multi_mix_value);
-			multi_mix_value* values = (multi_mix_value*)alloca(mixValueSize);
-			if (user_memcpy(values, info.values, mixValueSize) != B_OK)
+			if (!IS_USER_ADDRESS(originalValues))
 				return B_BAD_ADDRESS;
+			multi_mix_value* values = (multi_mix_value*)malloc(mixValueSize);
+			if (values == NULL)
+				return B_NO_MEMORY;
+			if (user_memcpy(values, originalValues, mixValueSize) != B_OK) {
+				free(values);
+				return B_BAD_ADDRESS;
+			}
 			info.values = values;
 
 			status_t status;
@@ -338,10 +333,12 @@ Device::Control(uint32 op, void* buffer, size_t length)
 				status = _MultiGetMix(&info);
 			else
 				status = _MultiSetMix(&info);
-			if (status != B_OK)
-				return status;
 			// the multi_mix_value_info is not modified
-			return user_memcpy(originalValues, values, mixValueSize);
+			if (status == B_OK
+				&& user_memcpy(originalValues, values, mixValueSize) != B_OK)
+				status = B_BAD_ADDRESS;
+			free(values);
+			return status;
 		}
 
 		case B_MULTI_LIST_MIX_CHANNELS:
@@ -359,6 +356,9 @@ Device::Control(uint32 op, void* buffer, size_t length)
 				!= B_OK) {
 				return B_BAD_ADDRESS;
 			}
+
+			if (info.control_count < 0 || info.control_count > kMaxMixItems)
+				return B_BAD_VALUE;
 
 			original_controls = info.controls;
 			allocSize = sizeof(multi_mix_control) * info.control_count;
@@ -403,8 +403,21 @@ Device::Control(uint32 op, void* buffer, size_t length)
 			buffer_desc **original_playback_descs = list.playback_buffers;
 			buffer_desc **original_record_descs = list.record_buffers;
 
-			buffer_desc *playback_descs[list.request_playback_buffers];
-			buffer_desc *record_descs[list.request_record_buffers];
+			// The row pointer arrays live on the kernel stack and their
+			// sizes come from the caller: bound them. The streams fill
+			// kSamplesBufferCount rows at most.
+			if (list.request_playback_buffers < 0
+				|| list.request_record_buffers < 0)
+				return B_BAD_VALUE;
+			int32 originalPlaybackRequest = list.request_playback_buffers;
+			int32 originalRecordRequest = list.request_record_buffers;
+			list.request_playback_buffers = min_c(
+				list.request_playback_buffers, kMaxRequestBuffers);
+			list.request_record_buffers = min_c(
+				list.request_record_buffers, kMaxRequestBuffers);
+
+			buffer_desc *playback_descs[kMaxRequestBuffers];
+			buffer_desc *record_descs[kMaxRequestBuffers];
 
 			if (!IS_USER_ADDRESS(list.playback_buffers)
 				|| user_memcpy(playback_descs, list.playback_buffers,
@@ -425,14 +438,16 @@ Device::Control(uint32 op, void* buffer, size_t length)
 
 			list.playback_buffers = original_playback_descs;
 			list.record_buffers = original_record_descs;
+			int32 playbackCount = list.request_playback_buffers;
+			int32 recordCount = list.request_record_buffers;
+			list.request_playback_buffers = originalPlaybackRequest;
+			list.request_record_buffers = originalRecordRequest;
 
 			if (user_memcpy(buffer, &list, sizeof(multi_buffer_list)) < B_OK
 				|| user_memcpy(original_playback_descs, playback_descs,
-					sizeof(buffer_desc*) * list.request_playback_buffers)
-					< B_OK
+					sizeof(buffer_desc*) * playbackCount) < B_OK
 				|| user_memcpy(original_record_descs, record_descs,
-					sizeof(buffer_desc*) * list.request_record_buffers)
-					< B_OK) {
+					sizeof(buffer_desc*) * recordCount) < B_OK) {
 				status = B_BAD_ADDRESS;
 			}
 
@@ -556,9 +571,13 @@ Device::_MultiGetDescription(multi_description* multiDescription)
 			sizeof(multi_description)) != B_OK)
 		return B_BAD_ADDRESS;
 
-	if (user_memcpy(multiDescription->channels,
-			&Channels[0], sizeof(multi_channel_info) * min_c(Channels.Count(),
-			Description.request_channel_count)) != B_OK)
+	// Hand out as many entries as the caller has room for. The counts above
+	// still describe every channel, so a caller that asked for too few can
+	// see that and ask again.
+	int32 copyCount = min_c(Channels.Count(),
+		max_c(Description.request_channel_count, 0));
+	if (copyCount > 0 && user_memcpy(Description.channels, &Channels[0],
+			sizeof(multi_channel_info) * copyCount) != B_OK)
 		return B_BAD_ADDRESS;
 
 	return B_OK;
@@ -603,6 +622,23 @@ Device::TraceMultiDescription(multi_description* Description,
 
 	TRACE(API, "request_channel_count:%d\n\n",
 		Description->request_channel_count);
+}
+
+
+// Bytes in a multi_channel_enable bitmap for this device: one bit for each
+// channel of each stream, numbered in stream order, as
+// Stream::GetEnabledChannels() and SetEnabledChannels() count them.
+size_t
+Device::_EnableBitsSize()
+{
+	size_t channels = 0;
+	for (int i = 0; i < fStreams.Count(); i++) {
+		AudioChannelCluster* cluster = fStreams[i]->ChannelCluster();
+		if (cluster != NULL)
+			channels += cluster->ChannelsCount();
+	}
+
+	return (channels + 7) / 8;
 }
 
 

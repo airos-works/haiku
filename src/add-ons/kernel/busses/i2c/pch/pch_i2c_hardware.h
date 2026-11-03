@@ -64,6 +64,8 @@
 #define PCH_IC_TXFLR			0x74
 #define PCH_IC_RXFLR			0x78
 #define PCH_IC_SDA_HOLD			0x7c
+#define PCH_IC_SDA_HOLD_RX_SHIFT	16
+#define PCH_IC_SDA_HOLD_RX_MASK		0x00ff0000
 #define PCH_IC_TX_ABRT_SOURCE	0x80
 #define PCH_IC_DMA_CR			0x88
 #define PCH_IC_DMA_TDLR			0x8c

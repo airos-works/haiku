@@ -436,6 +436,25 @@ usb_midi_added(const usb_device* dev, void** cookie)
 			if (devclass == USB_AUDIO_DEVICE_CLASS
 				&& subclass == USB_AUDIO_INTERFACE_MIDISTREAMING_SUBCLASS)
 				goto got_one;
+
+			/* Some devices (notably Yamaha, cf. ALSA QUIRK_MIDI_YAMAHA)
+			   put standard USB-MIDI class-specific descriptors inside a
+			   vendor-specific interface. Accept any non-audio-class
+			   interface carrying a MIDIStreaming class-specific header
+			   (CS_INTERFACE / MS_HEADER). Audio-class interfaces must be
+			   excluded: a UAC AudioControl/AudioStreaming HEADER descriptor
+			   is also CS_INTERFACE with subtype 0x01, so on composite
+			   audio+MIDI devices the AudioControl interface would
+			   false-match before the real MIDIStreaming interface is
+			   reached (audio-class MIDI was already accepted above). */
+			if (devclass == USB_AUDIO_DEVICE_CLASS)
+				continue;
+			for (uint16 g = 0; g < intf->generic_count; g++) {
+				usb_generic_descriptor* gd = &intf->generic[g]->generic;
+				if (gd->descriptor_type == USB_DESCRIPTOR_CS_INTERFACE
+					&& gd->data[0] == USB_MS_HEADER_DESCRIPTOR)
+					goto got_one;
+			}
 		}
 	}
 
@@ -494,6 +513,29 @@ got_one:
 					midiDevice->outMaxPkt = intf->endpoint[i].descr->max_packet_size;
 			}
 		}
+	}
+
+	/* Yamaha and similar devices declare no CS_ENDPOINT/MS_GENERAL descriptor,
+	   so the loop above leaves both cable counts at zero. Fall back to counting
+	   the CS_INTERFACE MIDI jack descriptors: each MIDI IN jack is an input
+	   cable, each MIDI OUT jack an output cable. Count all jacks regardless of
+	   EMBEDDED/EXTERNAL type -- Yamaha marks them all EXTERNAL. */
+	if (in_cables == 0 && out_cables == 0) {
+		for (uint16 i = 0; i < intf->generic_count; i++) {
+			usb_generic_descriptor* gd = &intf->generic[i]->generic;
+			if (gd->descriptor_type != USB_DESCRIPTOR_CS_INTERFACE)
+				continue;
+			if (gd->data[0] == USB_MS_MIDI_IN_JACK_DESCRIPTOR)
+				in_cables++;
+			else if (gd->data[0] == USB_MS_MIDI_OUT_JACK_DESCRIPTOR)
+				out_cables++;
+		}
+		if (in_cables > 16)
+			in_cables = 16;
+		if (out_cables > 16)
+			out_cables = 16;
+		DPRINTF_INFO((MY_ID "jack-counted cables: in=%d out=%d\n",
+			in_cables, out_cables));
 	}
 
 	midiDevice->timestamp = system_time();	/* This never seems to be used */
@@ -570,13 +612,20 @@ static usb_notify_hooks my_notify_hooks = {
 	usb_midi_removed
 };
 
-#define	SUPPORTED_DEVICES	1
+#define	SUPPORTED_DEVICES	2
 usb_support_descriptor my_supported_devices[SUPPORTED_DEVICES] =
 {
-	{
+	{	/* class-compliant USB-MIDI, any vendor */
 		USB_AUDIO_DEVICE_CLASS,
 		USB_AUDIO_INTERFACE_MIDISTREAMING_SUBCLASS,
 		0, 0, 0
+	},
+	{	/* Yamaha (vendor 0x0499): MIDI is carried in a vendor-specific
+		   interface rather than the standard MIDIStreaming class (cf. ALSA
+		   QUIRK_MIDI_YAMAHA). Matched broadly by vendor; usb_midi_added()
+		   gates on the actual presence of USB-MIDI descriptors, so non-MIDI
+		   Yamaha devices (e.g. pure-audio interfaces) are rejected there. */
+		0, 0, 0, 0x0499, 0
 	},
 };
 

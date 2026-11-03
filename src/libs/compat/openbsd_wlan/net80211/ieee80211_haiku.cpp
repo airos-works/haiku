@@ -365,14 +365,50 @@ wlan_control(void* cookie, uint32 op, void* arg, size_t length)
 			ifr.ifr_data = (uint8_t*)&nwid;
 
 			if (op == SIOCS80211) {
+				if (ireq.i_len > IEEE80211_NWID_LEN)
+					return EINVAL;
 				nwid.i_len = ireq.i_len;
 				if (user_memcpy(nwid.i_nwid, ireq.i_data, ireq.i_len) != B_OK)
 					return B_BAD_ADDRESS;
 			}
 
 			IFF_LOCKGIANT(ifp);
+
+			// Setting the NWID also disables WPA (ieee80211_disable_rsn()).
+			// After a failed association wpa_supplicant sets the same SSID
+			// again without resending the WPA settings, which then left no
+			// usable network until the next "join". Keep them when the SSID
+			// does not change. The driver's ioctl lock keeps other ioctls out
+			// until they are restored, and the scan the reset starts takes
+			// seconds, so the scan never sees them cleared. (Giant alone does
+			// not ensure this: the ioctl path sleeps and drops it.)
+			const bool sameSSID = op == SIOCS80211
+				&& nwid.i_len == ic->ic_des_esslen
+				&& memcmp(nwid.i_nwid, ic->ic_des_essid, nwid.i_len) == 0;
+			const u_int rsnFlags = ic->ic_flags
+				& (IEEE80211_F_PSK | IEEE80211_F_RSNON | IEEE80211_F_MFPR);
+			const u_int rsnProtos = ic->ic_rsnprotos;
+			const u_int rsnAKMs = ic->ic_rsnakms;
+			const enum ieee80211_cipher rsnGroupCipher = ic->ic_rsngroupcipher;
+			const u_int rsnCiphers = ic->ic_rsnciphers;
+			u_int8_t psk[IEEE80211_PMK_LEN];
+			if (sameSSID)
+				memcpy(psk, ic->ic_psk, sizeof(psk));
+
 			status_t status = ifp->if_ioctl(ifp, op == SIOCG80211 ?
 				SIOCG80211NWID : SIOCS80211NWID, (caddr_t)&ifr);
+
+			if (sameSSID && status == B_OK && rsnFlags != 0) {
+				ic->ic_flags |= rsnFlags;
+				ic->ic_rsnprotos = rsnProtos;
+				ic->ic_rsnakms = rsnAKMs;
+				ic->ic_rsngroupcipher = rsnGroupCipher;
+				ic->ic_rsnciphers = rsnCiphers;
+				memcpy(ic->ic_psk, psk, sizeof(psk));
+			}
+			if (sameSSID)
+				explicit_bzero(psk, sizeof(psk));
+
 			ieee80211_state state = ic->ic_state;
 			IFF_UNLOCKGIANT(ifp);
 			if (status != B_OK)
@@ -398,7 +434,7 @@ wlan_control(void* cookie, uint32 op, void* arg, size_t length)
 			if (op != SIOCS80211)
 				return B_BAD_VALUE;
 
-			struct ieee80211req_mlme mlme;
+			struct ieee80211req_mlme mlme = {};
 			if (user_memcpy(&mlme, ireq.i_data, min_c(sizeof(mlme), ireq.i_len)) != B_OK)
 				return B_BAD_ADDRESS;
 
@@ -409,6 +445,27 @@ wlan_control(void* cookie, uint32 op, void* arg, size_t length)
 					struct ieee80211_nwid nwid;
 					ifr.ifr_data = (uint8_t*)&nwid;
 					nwid.i_len = 0;
+
+					// Clearing the SSID only resets the driver, which sends
+					// nothing, so the AP would keep our association and refuse
+					// the next one. Tell it we are leaving first.
+					IFF_LOCKGIANT(ifp);
+					const bool tell = ic->ic_opmode == IEEE80211_M_STA
+						&& ic->ic_state == IEEE80211_S_RUN;
+					if (tell) {
+						IEEE80211_SEND_MGMT(ic, ic->ic_bss,
+							mlme.im_op == IEEE80211_MLME_DEAUTH
+								? IEEE80211_FC0_SUBTYPE_DEAUTH
+								: IEEE80211_FC0_SUBTYPE_DISASSOC,
+							mlme.im_reason != 0 ? mlme.im_reason
+								: mlme.im_op == IEEE80211_MLME_DEAUTH
+									? IEEE80211_REASON_AUTH_LEAVE
+									: IEEE80211_REASON_ASSOC_LEAVE);
+					}
+					IFF_UNLOCKGIANT(ifp);
+					if (tell)
+						snooze(20000);
+							// let it go out before the reset clears the queues
 
 					IFF_LOCKGIANT(ifp);
 					status_t status = ifp->if_ioctl(ifp, SIOCS80211NWID, (caddr_t)&ifr);
@@ -478,9 +535,10 @@ wlan_control(void* cookie, uint32 op, void* arg, size_t length)
 			if (user_memcpy(haiku_join, ireq.i_data, ireq.i_len) != B_OK)
 				return B_BAD_ADDRESS;
 
-			if (haiku_join->i_nwid_len > IEEE80211_NWID_LEN
-				|| haiku_join->i_key_len > IEEE80211_PMK_LEN
-				|| haiku_join->i_key_len > ireq.i_len - sizeof(*haiku_join))
+			// The SSID length comes from the caller and is copied into a
+			// fixed buffer below. The key length is checked only where a key
+			// is used: for open networks wpa_gui-haiku leaves it uninitialized.
+			if (haiku_join->i_nwid_len > IEEE80211_NWID_LEN)
 				return B_BAD_VALUE;
 
 			struct ifreq ifr;
@@ -520,6 +578,11 @@ wlan_control(void* cookie, uint32 op, void* arg, size_t length)
 					if ((haiku_join->i_key_mode & B_KEY_MODE_PSK_SHA256) != 0)
 						wpaparams.i_akms |= IEEE80211_WPA_AKM_SHA256_PSK;
 
+					if (haiku_join->i_key_len > IEEE80211_PMK_LEN
+						|| haiku_join->i_key_len > sizeof(wpapsk.i_psk)
+						|| haiku_join->i_key_len
+							> ireq.i_len - sizeof(*haiku_join))
+						return B_BAD_VALUE;
 					if (haiku_join->i_key_len != 0) {
 						wpapsk.i_enabled = 1;
 						memcpy(wpapsk.i_psk, haiku_join->i_key, haiku_join->i_key_len);
