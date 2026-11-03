@@ -208,21 +208,35 @@ TabDecorator::UpdateColors(DesktopSettings& settings)
 	// Desktop is write locked, so be quick about it.
 	fFocusFrameColor		= settings.UIColor(B_WINDOW_BORDER_COLOR);
 	fFocusTabColor			= settings.UIColor(B_WINDOW_TAB_COLOR);
-	fFocusTabColorLight		= tint_color(fFocusTabColor,
+	fFocusTabColorLight		= _Lighten(fFocusTabColor,
 								(B_LIGHTEN_MAX_TINT + B_LIGHTEN_2_TINT) / 2);
-	fFocusTabColorBevel		= tint_color(fFocusTabColor, B_LIGHTEN_2_TINT);
+	fFocusTabColorBevel		= _Lighten(fFocusTabColor, B_LIGHTEN_2_TINT);
 	fFocusTabColorShadow	= tint_color(fFocusTabColor,
 								(B_DARKEN_1_TINT + B_NO_TINT) / 2);
 	fFocusTextColor			= settings.UIColor(B_WINDOW_TEXT_COLOR);
 
 	fNonFocusFrameColor		= settings.UIColor(B_WINDOW_INACTIVE_BORDER_COLOR);
 	fNonFocusTabColor		= settings.UIColor(B_WINDOW_INACTIVE_TAB_COLOR);
-	fNonFocusTabColorLight	= tint_color(fNonFocusTabColor,
+	fNonFocusTabColorLight	= _Lighten(fNonFocusTabColor,
 								(B_LIGHTEN_MAX_TINT + B_LIGHTEN_2_TINT) / 2);
-	fNonFocusTabColorBevel	= tint_color(fNonFocusTabColor, B_LIGHTEN_2_TINT);
+	fNonFocusTabColorBevel	= _Lighten(fNonFocusTabColor, B_LIGHTEN_2_TINT);
 	fNonFocusTabColorShadow	= tint_color(fNonFocusTabColor,
 								(B_DARKEN_1_TINT + B_NO_TINT) / 2);
 	fNonFocusTextColor = settings.UIColor(B_WINDOW_INACTIVE_TEXT_COLOR);
+}
+
+
+/*!	Lightens \a base like tint_color(). A light color is close to white
+	already, so the light appearance's bevels and highlights are a few shades
+	lighter than the color; on a dark color the same tint would be a glaring
+	line, so there the step is a quarter as large.
+*/
+/*static*/ rgb_color
+TabDecorator::_Lighten(rgb_color base, float tint)
+{
+	if (tint < B_NO_TINT && base.IsDark())
+		tint = B_NO_TINT - (B_NO_TINT - tint) / 4;
+	return tint_color(base, tint);
 }
 
 

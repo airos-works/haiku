@@ -52,6 +52,7 @@ static const uint32 kMsgIdentifyDisplays = 'iden';
 static const uint32 kMsgIdentifyDone = 'idcl';
 static const uint32 kMsgZoomToDisplay = 'zoom';
 static const uint32 kMsgMirrorDisplays = 'mirr';
+static const uint32 kMsgDarkMode = 'dark';
 static const uint32 kMsgReloadLayout = 'rlay';
 
 // Constants

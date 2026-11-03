@@ -76,15 +76,23 @@ StatusView::AttachedToWindow()
 	BScrollBar* scrollBar = fScrollView->ScrollBar(B_HORIZONTAL);
 	MoveTo(0., scrollBar->Frame().top);
 
+	// the parent's color, following it when it is a UI color (switching to
+	// the dark appearance)
 	rgb_color color = B_TRANSPARENT_COLOR;
+	float tint = B_NO_TINT;
+	color_which which = B_NO_COLOR;
 	BView* parent = Parent();
-	if (parent != NULL)
+	if (parent != NULL) {
+		which = parent->ViewUIColor(&tint);
 		color = parent->ViewColor();
+	}
 
-	if (color == B_TRANSPARENT_COLOR)
-		color = ui_color(B_PANEL_BACKGROUND_COLOR);
-
-	SetViewColor(color);
+	if (which != B_NO_COLOR)
+		SetViewUIColor(which, tint);
+	else if (color == B_TRANSPARENT_COLOR)
+		SetViewUIColor(B_PANEL_BACKGROUND_COLOR);
+	else
+		SetViewColor(color);
 
 	ResizeToPreferred();
 }

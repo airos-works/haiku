@@ -103,10 +103,14 @@ get_default_colors(BMessage* message)
 	if (message == NULL)
 		return;
 
+	// the defaults of the current appearance, light or dark
+	const bool dark = ui_dark_mode();
 	for (int32 index = 0; index < kColorWhichCount; ++index) {
 		color_which which = index_to_color_which(index);
+		if (color_which_to_index(which) != index)
+			continue;
 		message->AddColor(ui_color_name(which),
-			BPrivate::kDefaultColors[index]);
+			BPrivate::GetSystemColor(which, dark));
 	}
 }
 
@@ -119,6 +123,8 @@ get_current_colors(BMessage* message)
 
 	for (int32 index = 0; index < kColorWhichCount; ++index) {
 		color_which which = index_to_color_which(index);
+		if (color_which_to_index(which) != index)
+			continue;
 		message->AddColor(ui_color_name(which), ui_color(which));
 	}
 }

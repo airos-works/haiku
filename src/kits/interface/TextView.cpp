@@ -879,6 +879,39 @@ BTextView::MessageReceived(BMessage* message)
 	}
 
 	switch (message->what) {
+		case B_COLORS_UPDATED:
+		{
+			// Text in the system's text colors follows them, as when
+			// switching to the dark appearance; app_server tells the colors
+			// they replace.
+			BMessage previous;
+			if (message->FindMessage("be:previous colors", &previous)
+					== B_OK) {
+				static const color_which kTextColors[] = {
+					B_DOCUMENT_TEXT_COLOR,
+					B_PANEL_TEXT_COLOR,
+					B_CONTROL_TEXT_COLOR,
+					B_LIST_ITEM_TEXT_COLOR,
+					B_TOOL_TIP_TEXT_COLOR
+				};
+				bool replaced = false;
+				for (size_t i = 0; i < B_COUNT_OF(kTextColors); i++) {
+					const char* name = ui_color_name(kTextColors[i]);
+					rgb_color from;
+					rgb_color to;
+					if (previous.FindColor(name, &from) == B_OK
+						&& message->FindColor(name, &to) == B_OK
+						&& from != to) {
+						replaced |= fStyles->ReplaceColor(from, to);
+					}
+				}
+				if (replaced)
+					Invalidate();
+			}
+			BView::MessageReceived(message);
+			break;
+		}
+
 		case B_CUT:
 			if (!IsTypingHidden())
 				Cut(be_clipboard);

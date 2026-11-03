@@ -79,6 +79,18 @@ TBarMenuTitle::SetContentSize(float width, float height)
 
 
 void
+TBarMenuTitle::SetIcon(const BBitmap* icon)
+{
+	if (icon == NULL)
+		return;
+
+	fIcon = icon;
+	if (Menu() != NULL)
+		Menu()->Invalidate(Frame());
+}
+
+
+void
 TBarMenuTitle::GetContentSize(float* width, float* height)
 {
 	*width = fWidth;

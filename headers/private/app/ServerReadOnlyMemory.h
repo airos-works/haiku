@@ -25,6 +25,8 @@ struct server_read_only_memory {
 	rgb_color	colors[kColorWhichCount];
 	float		device_scale;
 		// frame buffer pixels per logical pixel, see BScreen::DeviceScale()
+	bool		dark_mode;
+		// the dark palette is in use, see ui_dark_mode()
 };
 
 

@@ -391,6 +391,10 @@ enum {
 	// rectangle: the desktop background shown on every monitor
 	AS_VIEW_SET_VIEW_BITMAP_PLACEMENTS,
 
+	// Light or dark appearance: switches between the light and the dark
+	// palette of UI colors, see set_ui_dark_mode()
+	AS_SET_DARK_MODE,
+
 	AS_LAST_CODE
 };
 

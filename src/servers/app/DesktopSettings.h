@@ -73,6 +73,7 @@ public:
 			const BMessage*		WorkspacesMessage(int32 index) const;
 
 			rgb_color			UIColor(color_which which) const;
+			bool				DarkMode() const;
 
 			bool				SubpixelAntialiasing() const;
 			uint8				Hinting() const;
@@ -109,6 +110,7 @@ public:
 
 			void				SetUIColors(const BMessage& colors,
 									bool* changed = NULL);
+			bool				SetDarkMode(bool dark, BMessage& colors);
 
 			void				SetSubpixelAntialiasing(bool subpix);
 			void				SetHinting(uint8 hinting);

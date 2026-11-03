@@ -76,6 +76,10 @@ public:
 	virtual void				UpdateColors(DesktopSettings& settings);
 
 protected:
+	static	rgb_color			_Lighten(rgb_color base, float tint);
+									// tint_color() lightening, gentler on
+									// dark colors (the dark appearance)
+
 	virtual	void				_DoLayout();
 	virtual	void				_DoOutlineLayout();
 	virtual	void				_DoTabLayout();

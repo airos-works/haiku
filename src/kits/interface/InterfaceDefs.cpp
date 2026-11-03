@@ -118,47 +118,51 @@ static const rgb_color _kDefaultColors[kColorWhichCount] = {
 const rgb_color* BPrivate::kDefaultColors = &_kDefaultColors[0];
 
 
+// The dark appearance: the light palette's look in dark tones, after the
+// DarkFlat theme (github.com/unarix/haiku_darkstyle). Documents and lists are
+// darker than panels, as they are lighter in the light palette, and the
+// window tab keeps its yellow.
 static const rgb_color _kDefaultColorsDark[kColorWhichCount] = {
-	{43, 43, 43, 255},		// B_PANEL_BACKGROUND_COLOR
-	{28, 28, 28, 255},		// B_MENU_BACKGROUND_COLOR
-	{227, 73, 17, 255},		// B_WINDOW_TAB_COLOR
-	{0, 0, 229, 255},		// B_KEYBOARD_NAVIGATION_COLOR
+	{53, 53, 53, 255},		// B_PANEL_BACKGROUND_COLOR
+	{53, 53, 53, 255},		// B_MENU_BACKGROUND_COLOR
+	{237, 199, 70, 255},	// B_WINDOW_TAB_COLOR
+	{96, 150, 255, 255},	// B_KEYBOARD_NAVIGATION_COLOR
 	{51, 102, 152, 255},	// B_DESKTOP_COLOR
 	{90, 90, 90, 255},		// B_MENU_SELECTED_BACKGROUND_COLOR
-	{255, 255, 255, 255},	// B_MENU_ITEM_TEXT_COLOR
-	{255, 255, 255, 255},	// B_MENU_SELECTED_ITEM_TEXT_COLOR
-	{0, 0, 0, 255},			// B_MENU_SELECTED_BORDER_COLOR
-	{253, 253, 253, 255},	// B_PANEL_TEXT_COLOR
-	{0, 0, 0, 255},			// B_DOCUMENT_BACKGROUND_COLOR
-	{234, 234, 234, 255},	// B_DOCUMENT_TEXT_COLOR
-	{29, 29, 29, 255},		// B_CONTROL_BACKGROUND_COLOR
-	{230, 230, 230, 255},	// B_CONTROL_TEXT_COLOR
-	{195, 195, 195, 255},	// B_CONTROL_BORDER_COLOR
+	{216, 216, 216, 255},	// B_MENU_ITEM_TEXT_COLOR
+	{240, 240, 240, 255},	// B_MENU_SELECTED_ITEM_TEXT_COLOR
+	{30, 30, 30, 255},		// B_MENU_SELECTED_BORDER_COLOR
+	{216, 216, 216, 255},	// B_PANEL_TEXT_COLOR
+	{36, 36, 36, 255},		// B_DOCUMENT_BACKGROUND_COLOR
+	{222, 222, 222, 255},	// B_DOCUMENT_TEXT_COLOR
+	{70, 70, 70, 255},		// B_CONTROL_BACKGROUND_COLOR
+	{222, 222, 222, 255},	// B_CONTROL_TEXT_COLOR
+	{110, 110, 110, 255},	// B_CONTROL_BORDER_COLOR
 	{75, 124, 168, 255},	// B_CONTROL_HIGHLIGHT_COLOR
 	{0, 0, 0, 255},			// B_NAVIGATION_PULSE_COLOR
 	{255, 255, 255, 255},	// B_SHINE_COLOR
 	{0, 0, 0, 255},			// B_SHADOW_COLOR
-	{76, 68, 79, 255},		// B_TOOLTIP_BACKGROUND_COLOR
-	{255, 255, 255, 255},	// B_TOOLTIP_TEXT_COLOR
-	{255, 255, 255, 255},	// B_WINDOW_TEXT_COLOR
-	{203, 32, 9, 255},		// B_WINDOW_INACTIVE_TAB_COLOR
-	{255, 255, 255, 255},	// B_WINDOW_INACTIVE_TEXT_COLOR
-	{227, 73, 17, 255},		// B_WINDOW_BORDER_COLOR
-	{203, 32, 9, 255},		// B_WINDOW_INACTIVE_BORDER_COLOR
-	{27, 82, 140, 255},     // B_CONTROL_MARK_COLOR
-	{0, 0, 0, 255},			// B_LIST_BACKGROUND_COLOR
-	{90, 90, 90, 255},		// B_LIST_SELECTED_BACKGROUND_COLOR
-	{255, 255, 255, 255},	// B_LIST_ITEM_TEXT_COLOR
-	{255, 255, 255, 255},	// B_LIST_SELECTED_ITEM_TEXT_COLOR
-	{39, 39, 39, 255},		// B_SCROLL_BAR_THUMB_COLOR
-	{106, 112, 212, 255},	// B_LINK_TEXT_COLOR
-	{102, 152, 203, 255},	// B_LINK_HOVER_COLOR
-	{145, 112, 155, 255},	// B_LINK_VISITED_COLOR
-	{121, 142, 203, 255},	// B_LINK_ACTIVE_COLOR
+	{70, 67, 52, 255},		// B_TOOLTIP_BACKGROUND_COLOR
+	{230, 230, 230, 255},	// B_TOOLTIP_TEXT_COLOR
+	{30, 30, 30, 255},		// B_WINDOW_TEXT_COLOR
+	{72, 72, 72, 255},		// B_WINDOW_INACTIVE_TAB_COLOR
+	{170, 170, 170, 255},	// B_WINDOW_INACTIVE_TEXT_COLOR
+	{64, 64, 64, 255},		// B_WINDOW_BORDER_COLOR
+	{72, 72, 72, 255},		// B_WINDOW_INACTIVE_BORDER_COLOR
+	{120, 170, 230, 255},	// B_CONTROL_MARK_COLOR
+	{36, 36, 36, 255},		// B_LIST_BACKGROUND_COLOR
+	{80, 80, 80, 255},		// B_LIST_SELECTED_BACKGROUND_COLOR
+	{222, 222, 222, 255},	// B_LIST_ITEM_TEXT_COLOR
+	{240, 240, 240, 255},	// B_LIST_SELECTED_ITEM_TEXT_COLOR
+	{70, 70, 70, 255},		// B_SCROLL_BAR_THUMB_COLOR
+	{110, 160, 255, 255},	// B_LINK_TEXT_COLOR
+	{150, 190, 255, 255},	// B_LINK_HOVER_COLOR
+	{180, 140, 210, 255},	// B_LINK_VISITED_COLOR
+	{140, 170, 240, 255},	// B_LINK_ACTIVE_COLOR
 	{50, 150, 255, 255},	// B_STATUS_BAR_COLOR
 	// 100...
 	{46, 204, 64, 255},		// B_SUCCESS_COLOR
-	{255, 40, 54, 255},		// B_FAILURE_COLOR
+	{255, 65, 54, 255},		// B_FAILURE_COLOR
 	{}
 };
 
@@ -1321,15 +1325,44 @@ ui_color(color_which which)
 		server_read_only_memory* shared
 			= BApplication::Private::ServerReadOnlyMemory();
 		if (shared != NULL) {
-			// check for unset colors
-			if (shared->colors[index] == B_TRANSPARENT_COLOR)
-				shared->colors[index] = _kDefaultColors[index];
+			// unset colors are the defaults of the current appearance
+			if (shared->colors[index] == B_TRANSPARENT_COLOR) {
+				return shared->dark_mode
+					? _kDefaultColorsDark[index] : _kDefaultColors[index];
+			}
 
 			return shared->colors[index];
 		}
 	}
 
 	return _kDefaultColors[index];
+}
+
+
+bool
+ui_dark_mode()
+{
+	if (be_app != NULL) {
+		server_read_only_memory* shared
+			= BApplication::Private::ServerReadOnlyMemory();
+		if (shared != NULL)
+			return shared->dark_mode;
+	}
+
+	return false;
+}
+
+
+void
+set_ui_dark_mode(bool dark)
+{
+	BPrivate::DesktopLink link;
+	if (link.InitCheck() != B_OK)
+		return;
+
+	link.StartMessage(AS_SET_DARK_MODE);
+	link.Attach<bool>(dark);
+	link.Flush();
 }
 
 

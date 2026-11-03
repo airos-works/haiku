@@ -521,6 +521,12 @@ void			set_ui_color(const color_which& which, const rgb_color& color);
 void			set_ui_colors(const BMessage* colors);
 rgb_color		tint_color(rgb_color color, float tint);
 
+// Light or dark appearance (air/OS). Each has its own palette of UI colors;
+// switching makes the other palette current, and applications get
+// B_COLORS_UPDATED as for any change of colors.
+bool			ui_dark_mode();
+void			set_ui_dark_mode(bool dark);
+
 extern "C" status_t _init_interface_kit_();
 	// for convenience, should be removed including the friend declarations
 	// in Menu.h, ...

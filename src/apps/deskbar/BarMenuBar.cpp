@@ -109,7 +109,9 @@ TBarMenuBar::TBarMenuBar(BRect frame, const char* name, TBarView* barView)
 	fAppListMenuItem(NULL),
 	fSeparatorItem(NULL),
 	fTeamIconData(NULL),
-	fTeamIconSize(0)
+	fTeamIconSize(0),
+	fLogo(NULL),
+	fLogoForLightMenu(true)
 {
 	SetItemMargins(0.0f, 0.0f, 0.0f, 0.0f);
 	SetFont(be_bold_font);
@@ -117,33 +119,64 @@ TBarMenuBar::TBarMenuBar(BRect frame, const char* name, TBarView* barView)
 	TDeskbarMenu* beMenu = new TDeskbarMenu(barView);
 	TBarWindow::SetDeskbarMenu(beMenu);
 
-	BBitmap* icon = NULL;
-	size_t dataSize;
-	// The air/OS logo's wordmark is dark; use the light one on a dark menu.
-	const int32 logoID = ui_color(B_MENU_BACKGROUND_COLOR).IsLight()
-		? R_LeafLogoBitmap : R_LeafLogoDarkBitmap;
-	const void* data = AppResSet()->FindResource(B_VECTOR_ICON_TYPE,
-		logoID, &dataSize);
-	if (data != NULL) {
-		// seems valid, scale bitmap according to be_bold_font size
-		float width = std::max(63.f, ceilf(63 * be_bold_font->Size() / 12.f));
-		float height = std::max(22.f, ceilf(22 * be_bold_font->Size() / 12.f));
-		icon = new BBitmap(BRect(0, 0, width - 1, height - 1), B_RGBA32);
-		if (icon->InitCheck() != B_OK
-			|| BIconUtils::GetVectorIcon((const uint8*)data, dataSize, icon)
-					!= B_OK) {
-			delete icon;
-			icon = NULL;
-		}
-	}
+	fLogoForLightMenu = ui_color(B_MENU_BACKGROUND_COLOR).IsLight();
+	fLogo = _LoadLogo(fLogoForLightMenu);
 
-	fDeskbarMenuItem = new TBarMenuTitle(0.0f, 0.0f, icon, beMenu, fBarView);
+	fDeskbarMenuItem = new TBarMenuTitle(0.0f, 0.0f, fLogo, beMenu, fBarView);
 	AddItem(fDeskbarMenuItem);
 }
 
 
 TBarMenuBar::~TBarMenuBar()
 {
+	// the menu item does not own its icon, and does not use it when deleted
+	delete fLogo;
+}
+
+
+/*static*/ BBitmap*
+TBarMenuBar::_LoadLogo(bool forLightMenu)
+{
+	// The air/OS logo's wordmark is dark; use the light one on a dark menu.
+	size_t dataSize;
+	const void* data = AppResSet()->FindResource(B_VECTOR_ICON_TYPE,
+		forLightMenu ? R_LeafLogoBitmap : R_LeafLogoDarkBitmap, &dataSize);
+	if (data == NULL)
+		return NULL;
+
+	// scale bitmap according to be_bold_font size
+	float width = std::max(63.f, ceilf(63 * be_bold_font->Size() / 12.f));
+	float height = std::max(22.f, ceilf(22 * be_bold_font->Size() / 12.f));
+	BBitmap* icon = new BBitmap(BRect(0, 0, width - 1, height - 1), B_RGBA32);
+	if (icon->InitCheck() != B_OK
+		|| BIconUtils::GetVectorIcon((const uint8*)data, dataSize, icon)
+			!= B_OK) {
+		delete icon;
+		return NULL;
+	}
+	return icon;
+}
+
+
+void
+TBarMenuBar::MessageReceived(BMessage* message)
+{
+	if (message->what == B_COLORS_UPDATED) {
+		// switched between the light and the dark appearance: the logo's
+		// wordmark has to stay readable
+		bool forLightMenu = ui_color(B_MENU_BACKGROUND_COLOR).IsLight();
+		if (forLightMenu != fLogoForLightMenu) {
+			BBitmap* logo = _LoadLogo(forLightMenu);
+			if (logo != NULL) {
+				fDeskbarMenuItem->SetIcon(logo);
+				delete fLogo;
+				fLogo = logo;
+				fLogoForLightMenu = forLightMenu;
+			}
+		}
+	}
+
+	BMenuBar::MessageReceived(message);
 }
 
 

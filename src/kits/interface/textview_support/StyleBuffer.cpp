@@ -611,3 +611,27 @@ BTextView::StyleBuffer::ContinuousGetStyle(BFont *outFont, uint32* ioMode,
 			*sameColor = oneColor;
 	}
 }
+
+
+/*!	Gives all text in the color \a from the color \a to; returns whether
+	there was any.
+*/
+bool
+BTextView::StyleBuffer::ReplaceColor(const rgb_color& from, const rgb_color& to)
+{
+	bool replaced = false;
+	for (int32 i = 0; i < fStyleRecord.ItemCount(); i++) {
+		STEStyleRecord* record = fStyleRecord[i];
+		if (record->style.color == from) {
+			record->style.color = to;
+			replaced = true;
+		}
+	}
+
+	if (fNullStyle.color == from) {
+		fNullStyle.color = to;
+		replaced = true;
+	}
+
+	return replaced;
+}

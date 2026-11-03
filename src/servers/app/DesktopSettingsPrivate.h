@@ -14,6 +14,7 @@
 #include "DesktopSettings.h"
 
 #include <Locker.h>
+#include <ServerReadOnlyMemory.h>
 
 #include "ServerFont.h"
 
@@ -89,6 +90,11 @@ public:
 
 			rgb_color			UIColor(color_which which) const;
 
+			bool				SetDarkMode(bool dark, BMessage& colors);
+									// returns the colors of the other
+									// palette, to be set with SetUIColors()
+			bool				DarkMode() const;
+
 			void				SetSubpixelAntialiasing(bool subpix);
 			bool				SubpixelAntialiasing() const;
 			void				SetHinting(uint8 hinting);
@@ -127,6 +133,9 @@ private:
 			int32				fWorkspacesRows;
 			BMessage			fWorkspaceMessages[kMaxWorkspaces];
 			BString				fControlLook;
+			rgb_color			fInactiveColors[kColorWhichCount];
+									// the palette of the other appearance;
+									// B_TRANSPARENT_COLOR for its default
 
 			server_read_only_memory& fShared;
 };
