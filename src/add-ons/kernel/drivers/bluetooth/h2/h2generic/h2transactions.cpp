@@ -65,6 +65,14 @@ event_complete(void* cookie, status_t status, void* data, size_t actual_len)
 		|| (bdev->state & RUNNING) == 0)
 		return; // or not running anymore...
 
+	if (status == B_DEV_STALLED) {
+		// The endpoint is halted in the device, and nothing here clears
+		// that. Resubmitting would only stall again, at once: the
+		// controller resets its side of the endpoint on each stall.
+		ERROR("%s: endpoint stalled, no longer receiving\n", __func__);
+		return;
+	}
+
 	if (status != B_OK || actual_len == 0)
 		goto resubmit;
 
@@ -104,6 +112,14 @@ acl_rx_complete(void* cookie, status_t status, void* data, size_t actual_len)
 	if (status == B_CANCELED || status == B_DEV_CRC_ERROR
 		|| (bdev->state & RUNNING) == 0)
 		return; // or not running anymore...
+
+	if (status == B_DEV_STALLED) {
+		// The endpoint is halted in the device, and nothing here clears
+		// that. Resubmitting would only stall again, at once: the
+		// controller resets its side of the endpoint on each stall.
+		ERROR("%s: endpoint stalled, no longer receiving\n", __func__);
+		return;
+	}
 
 	if (status != B_OK || actual_len == 0)
 		goto resubmit;
