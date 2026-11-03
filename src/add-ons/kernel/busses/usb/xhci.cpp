@@ -4436,13 +4436,22 @@ XHCI::FinishTransfers()
 
 			// A control endpoint that halted is reset at once: a device
 			// refuses a request it does not support with a stall, and takes
-			// the next one. (The halt of a bulk or interrupt endpoint is its
-			// driver's to clear.)
+			// the next one.
+			// A bulk or interrupt endpoint that stalled is reset too. Its
+			// driver clears the halt in the device (CLEAR_FEATURE through
+			// the default pipe), but nothing else would reset the endpoint
+			// in the controller, so the next transfer would never run
+			// (XHCI 1.2 § 4.8.3). Both sides restart at sequence number 0,
+			// as with a cancellation. Only a stall: transaction errors also
+			// halt, but an unplug raises them in bursts, and each command to
+			// a slot that is gone costs a timeout on this thread. Those are
+			// left to the next transfer's timeout and cancellation.
 			xhci_endpoint* endpoint
 				= (xhci_endpoint*)transfer->TransferPipe()->ControllerCookie();
-			if (completionCode != COMP_SUCCESS
+			if (endpoint != NULL && completionCode != COMP_SUCCESS
 				&& completionCode != COMP_SHORT_PACKET
-				&& endpoint != NULL && endpoint->id == 0) {
+				&& (endpoint->id == 0 || (completionCode == COMP_STALL
+					&& transfer->IsochronousData() == NULL))) {
 				_RecoverHaltedEndpoint(endpoint, td);
 			}
 
