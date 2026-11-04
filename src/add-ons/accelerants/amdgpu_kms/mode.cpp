@@ -113,10 +113,29 @@ find_output_mode(const Output& output, const display_timing& timing)
 }
 
 
+/*!	Connectors come and go at run time: DisplayPort MST hubs (in docks and
+	daisy chained monitors) get one for every monitor behind them. */
+static void
+update_connector_list(void)
+{
+	Kms::Resources* resources
+		= (Kms::Resources*)malloc(sizeof(Kms::Resources));
+	if (resources == NULL)
+		return;
+	if (Kms::GetResources(gInfo->device, *resources) == B_OK) {
+		memcpy(gInfo->resources.connectors, resources->connectors,
+			sizeof(resources->connectors));
+		gInfo->resources.connectorCount = resources->connectorCount;
+	}
+	free(resources);
+}
+
+
 status_t
 probe_outputs(void)
 {
 	int fd = gInfo->device;
+	update_connector_list();
 	gInfo->outputCount = 0;
 	for (uint32 i = 0; i < gInfo->resources.connectorCount
 			&& gInfo->outputCount < kMaxOutputs; i++) {
@@ -852,6 +871,22 @@ connected_outputs_changed(void)
 	if (connector == NULL)
 		return true;
 	bool changed = false;
+
+	// an MST hub added or removed connectors
+	Kms::Resources* resources
+		= (Kms::Resources*)malloc(sizeof(Kms::Resources));
+	if (resources != NULL && Kms::GetResources(gInfo->device, *resources)
+			== B_OK) {
+		uint32 count = min_c(resources->connectorCount, kMaxOutputs);
+		if (count != gInfo->outputCount)
+			changed = true;
+		for (uint32 i = 0; i < count && !changed; i++) {
+			if (resources->connectors[i] != gInfo->outputs[i].connector)
+				changed = true;
+		}
+	}
+	free(resources);
+
 	for (uint32 i = 0; i < gInfo->outputCount && !changed; i++) {
 		const Output& output = gInfo->outputs[i];
 		if (Kms::GetConnector(gInfo->device, output.connector, *connector)
