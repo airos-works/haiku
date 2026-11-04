@@ -35,9 +35,17 @@ control through ACPI `_OSC`.
   too, sets up or tears down its tunnels; monitors plugged into a dock come
   and go the same way.
 - **Boot firmware tunnels**: the firmware may have set up tunnels before the
-  system started. The connection manager resets the host router's USB4
-  ports (USB4 version 1 hosts) or the whole host router (version 2) and
-  builds everything again.
+  system started (a dock attached at boot, for example). The connection
+  manager takes them over instead of starting again: it enumerates the
+  routers without making tunnels, finds the firmware's USB3, DisplayPort
+  and PCIe tunnels by following their hop entries, adopts the complete ones
+  and takes down the incomplete ones, and the rescan then adds whatever is
+  missing. The devices behind the firmware's tunnels stay where they are
+  rather than vanishing and coming back all at once, which used to wedge a
+  dock's USB network adapter. The `reset_host` setting restores the old
+  behaviour on USB4 version 1 hosts: reset the host router's USB4 ports and
+  let every device come back as a hot plug. Version 2 host interfaces are
+  still reset when the connection manager starts.
 
 Not done yet: host-to-host (XDomain) networking, the firmware connection
 manager (ICM) of Intel Thunderbolt 3 controllers and of Intel hosts whose
