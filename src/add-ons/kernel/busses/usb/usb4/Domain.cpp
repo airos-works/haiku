@@ -501,7 +501,15 @@ Domain::_HandleHotplug(uint64 route, uint8 number, bool unplug)
 		return;
 
 	if (unplug) {
-		if (adapter->remote != NULL && adapter->IsLane())
+		if (adapter->IsLane() && adapter->dualLink != NULL
+			&& adapter->linkNumber != 0) {
+			// the second lane of a link goes down and up when the lanes
+			// are bonded; only the first lane says the router is gone
+			TRACE("%#" B_PRIx64 ":%u: second lane unplugged, ignored\n",
+				route, number);
+			return;
+		}
+		if (adapter->IsLane() && adapter->HasRemote())
 			_Unplug(adapter);
 		else if (adapter->IsDPIn() || adapter->IsDPOut())
 			_DPResourceUnavailable(adapter, "unplugged");
@@ -510,7 +518,8 @@ Domain::_HandleHotplug(uint64 route, uint8 number, bool unplug)
 		return;
 	}
 
-	if (adapter->remote != NULL)
+	if (adapter->remote != NULL || (adapter->dualLink != NULL
+			&& adapter->linkNumber != 0 && adapter->IsLane()))
 		return;
 	if (number == 0) {
 		TRACE("%#" B_PRIx64 ": xHCI connect request\n", route);

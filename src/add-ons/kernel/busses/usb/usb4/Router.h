@@ -80,6 +80,9 @@ struct Adapter {
 			bool				IsNHI() const
 									{ return type == ADAPTER_NHI; }
 			bool				IsUpstream() const;
+			bool				HasRemote() const;
+				// a router hangs below this adapter (only the first lane
+				// of a link counts)
 
 			status_t			Read(usb4_config_space space, uint16 offset,
 									uint32* buffer, size_t dwords);
@@ -198,6 +201,7 @@ public:
 			status_t			UnlockAdapter(Adapter* adapter);
 			status_t			ResetHost();
 			status_t			ResetPort(Adapter* lane);
+			int32				LinkControllerOffset(Adapter* adapter);
 
 			// router operations
 			status_t			Operation(uint16 opcode, uint32* metadata,
@@ -249,6 +253,7 @@ private:
 			uint16				fCapTMU;
 			uint16				fCapPlugEvents;
 			uint16				fCapLinkController;
+			uint16				fCapTime2;
 			tmu_mode			fTMUMode;
 			bool				fTMUUnidirectional;
 

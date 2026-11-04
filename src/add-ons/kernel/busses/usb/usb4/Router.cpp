@@ -84,6 +84,19 @@ Adapter::IsUpstream() const
 }
 
 
+bool
+Adapter::HasRemote() const
+{
+	if (remote == NULL || IsUpstream())
+		return false;
+	// the second lane of a link leads to the same router (and its remote
+	// is the router's second upstream lane, which points back up)
+	if (dualLink != NULL && linkNumber != 0)
+		return false;
+	return remote->router != router && remote->router->Parent() == router;
+}
+
+
 status_t
 Adapter::Read(usb4_config_space space, uint16 offset, uint32* buffer,
 	size_t dwords)
@@ -281,6 +294,7 @@ Router::Router(Domain* domain, Router* parent, uint64 route)
 	fCapTMU(0),
 	fCapPlugEvents(0),
 	fCapLinkController(0),
+	fCapTime2(0),
 	fTMUMode(TMU_MODE_OFF),
 	fTMUUnidirectional(false),
 	fCreditAllocation(false),
@@ -342,11 +356,12 @@ Router::WaitForBit(uint16 offset, uint32 bit, uint32 value, bigtime_t timeout)
 void
 Router::SetUnplugged()
 {
+	if (fUnplugged)
+		return;
 	fUnplugged = true;
 	for (uint8 i = 1; i <= fMaxAdapter; i++) {
 		Adapter& adapter = fAdapters[i];
-		if (adapter.remote != NULL && !adapter.IsUpstream()
-			&& adapter.remote->router != this)
+		if (adapter.present && adapter.HasRemote())
 			adapter.remote->router->SetUnplugged();
 	}
 }
@@ -502,6 +517,9 @@ Router::Probe()
 	cap = _FindVSECapability(USB4_VSE_CAP_LINK_CONTROLLER);
 	if (cap > 0)
 		fCapLinkController = cap;
+	cap = _FindVSECapability(USB4_VSE_CAP_TIME2);
+	if (cap > 0)
+		fCapTime2 = cap;
 
 	TRACE("%#" B_PRIx64 ": router %04x:%04x, %s, %u adapters, upstream %u\n",
 		fRoute, VendorID(), DeviceID(),
@@ -1022,10 +1040,66 @@ Router::SetConfigurationValid()
 }
 
 
+// Thunderbolt 3 link controller registers
+#define TB_LC_DESC				0x02
+#define TB_LC_PORT_MODE			0x26
+#define TB_LC_PORT_MODE_DPR		(1u << 0)
+#define TB_LC_PORT_ATTR			0x8d
+#define TB_LC_PORT_ATTR_BE		(1u << 12)
+#define TB_LC_SX_CTRL			0x96
+#define TB_LC_SX_CTRL_L1C		(1u << 16)
+#define TB_LC_SX_CTRL_L2C		(1u << 20)
+#define TB_LC_SX_CTRL_UPSTREAM	(1u << 30)
+
+
+//! Where the link controller registers of the adapter's port start.
+int32
+Router::LinkControllerOffset(Adapter* adapter)
+{
+	if (fCapLinkController == 0 || adapter->number == 0)
+		return B_NOT_SUPPORTED;
+	uint32 desc;
+	status_t status = ReadConfig(fCapLinkController + TB_LC_DESC, desc);
+	if (status != B_OK)
+		return status;
+	uint32 start = (desc >> 8) & 0xff;
+	uint32 size = (desc >> 16) & 0xfff;
+	uint32 physical = (adapter->number - 1) / 2;
+	return fCapLinkController + start + physical * size;
+}
+
+
 static status_t
 set_port_configured(Adapter* adapter, bool configured)
 {
-	if (adapter == NULL || adapter->capUSB4 == 0)
+	if (adapter == NULL)
+		return B_OK;
+
+	Router* router = adapter->router;
+	if (adapter->capUSB4 == 0 && !router->IsUSB4()) {
+		// Thunderbolt 3: through the link controller
+		int32 offset = router->LinkControllerOffset(adapter);
+		if (offset < 0)
+			return B_OK;
+		uint32 control;
+		status_t status = router->ReadConfig(offset + TB_LC_SX_CTRL, control);
+		if (status != B_OK)
+			return status;
+		uint32 lane = adapter->number % 2 != 0 ? TB_LC_SX_CTRL_L1C
+			: TB_LC_SX_CTRL_L2C;
+		if (configured) {
+			control |= lane;
+			if (adapter->IsUpstream())
+				control |= TB_LC_SX_CTRL_UPSTREAM;
+		} else {
+			control &= ~lane;
+			if (adapter->IsUpstream())
+				control &= ~TB_LC_SX_CTRL_UPSTREAM;
+		}
+		return router->WriteConfig(offset + TB_LC_SX_CTRL, control);
+	}
+
+	if (adapter->capUSB4 == 0)
 		return B_OK;
 	uint32 value;
 	status_t status = adapter->ReadAdapter(adapter->capUSB4 + PORT_CS_19,
@@ -1148,6 +1222,12 @@ Router::EnableLaneBonding()
 		if (up->ReadAdapter(up->capUSB4 + PORT_CS_18, value) != B_OK
 			|| (value & PORT_CS_18_BE) == 0)
 			return B_OK;
+	} else {
+		int32 offset = LinkControllerOffset(up);
+		uint32 value;
+		if (offset < 0 || ReadConfig(offset + TB_LC_PORT_ATTR, value) != B_OK
+			|| (value & TB_LC_PORT_ATTR_BE) == 0)
+			return B_OK;
 	}
 
 	// Gen 4 links are always bonded
@@ -1239,7 +1319,27 @@ Router::UnconfigureLink()
 status_t
 Router::ResetPort(Adapter* lane)
 {
-	if (lane == NULL || lane->capUSB4 == 0)
+	if (lane == NULL)
+		return B_OK;
+
+	if (lane->capUSB4 == 0 && !fUSB4) {
+		int32 offset = LinkControllerOffset(lane);
+		if (offset < 0)
+			return B_OK;
+		uint32 mode;
+		status_t status = ReadConfig(offset + TB_LC_PORT_MODE, mode);
+		if (status != B_OK)
+			return status;
+		status = WriteConfig(offset + TB_LC_PORT_MODE,
+			mode | TB_LC_PORT_MODE_DPR);
+		if (status != B_OK)
+			return status;
+		snooze(10000);
+		return WriteConfig(offset + TB_LC_PORT_MODE,
+			mode & ~TB_LC_PORT_MODE_DPR);
+	}
+
+	if (lane->capUSB4 == 0)
 		return B_OK;
 
 	uint32 value;
@@ -1362,17 +1462,30 @@ Router::DeallocateDPResource(Adapter* in)
 status_t
 Router::_SetTimeDisruption(bool set)
 {
-	if (fCapTMU == 0)
-		return B_OK;
+	uint16 offset;
+	uint32 bit;
+	if (fUSB4) {
+		if (fCapTMU == 0)
+			return B_OK;
+		offset = fCapTMU + TMU_RTR_CS_0;
+		bit = TMU_RTR_CS_0_TD;
+	} else {
+		// Thunderbolt 3 keeps it in a vendor specific capability
+		if (fCapTime2 == 0)
+			return B_OK;
+		offset = fCapTime2 + 0x1a;
+		bit = 1u << 22;
+	}
+
 	uint32 value;
-	status_t status = ReadConfig(fCapTMU + TMU_RTR_CS_0, value);
+	status_t status = ReadConfig(offset, value);
 	if (status != B_OK)
 		return status;
 	if (set)
-		value |= TMU_RTR_CS_0_TD;
+		value |= bit;
 	else
-		value &= ~TMU_RTR_CS_0_TD;
-	return WriteConfig(fCapTMU + TMU_RTR_CS_0, value);
+		value &= ~bit;
+	return WriteConfig(offset, value);
 }
 
 
