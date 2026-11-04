@@ -184,8 +184,11 @@ driver_module_info gPCILegacyDriverModule = {
 	NULL
 };
 
+extern struct pci_hotplug_module_info gPCIHotplugModule;
+
 module_info *modules[] = {
 	(module_info *)&sOldPCIModule,
+	(module_info *)&gPCIHotplugModule,
 	(module_info *)&sIntxModule,
 	(module_info *)&gPCIRootModule,
 	(module_info *)&gPCIDeviceModule,

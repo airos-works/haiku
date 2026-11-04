@@ -878,7 +878,7 @@ PCI::_GetDomainData(uint8 domain)
 }
 
 
-inline int
+int
 PCI::_NumFunctions(uint8 domain, uint8 bus, uint8 device)
 {
 	uint8 type = ReadConfig(domain, bus, device,

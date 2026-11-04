@@ -767,9 +767,17 @@ ECMDevice::_NotifyCallback(void *cookie, int32 status, void *data,
 
 	if (status != B_OK) {
 		TRACE_ALWAYS("device status error 0x%08" B_PRIx32 "\n", status);
-		if (gUSBModule->clear_feature(device->fNotifyEndpoint,
-			USB_FEATURE_ENDPOINT_HALT) != B_OK)
+		// Only a stall needs clearing; other errors mostly mean the device
+		// is going away, and a control request to it would hold up its
+		// removal.
+		if (status == B_DEV_STALLED && !device->fRemoved
+			&& gUSBModule->clear_feature(device->fNotifyEndpoint,
+				USB_FEATURE_ENDPOINT_HALT) != B_OK)
 			TRACE_ALWAYS("failed to clear halt state in notify hook\n");
+		if (device->fRemoved) {
+			atomic_add(&device->fInsideNotify, -1);
+			return;
+		}
 	}
 
 	// schedule next notification buffer

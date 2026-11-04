@@ -39,37 +39,75 @@ pci_root_register_device(device_node* parent)
 
 
 static void
+pci_register_device(device_node* node, PCIDev* dev)
+{
+	const pci_info& info = dev->info;
+
+	device_attr attrs[] = {
+		// info about device
+		{B_DEVICE_BUS, B_STRING_TYPE, {.string = "pci"}},
+
+		// location on PCI bus
+		{B_PCI_DEVICE_DOMAIN, B_UINT8_TYPE, {.ui8 = dev->domain}},
+		{B_PCI_DEVICE_BUS, B_UINT8_TYPE, {.ui8 = dev->bus}},
+		{B_PCI_DEVICE_DEVICE, B_UINT8_TYPE, {.ui8 = info.device}},
+		{B_PCI_DEVICE_FUNCTION, B_UINT8_TYPE, {.ui8 = info.function}},
+
+		// info about the device
+		{B_DEVICE_VENDOR_ID, B_UINT16_TYPE, {.ui16 = info.vendor_id}},
+		{B_DEVICE_ID, B_UINT16_TYPE, {.ui16 = info.device_id}},
+
+		{B_DEVICE_TYPE, B_UINT16_TYPE, {.ui16 = info.class_base}},
+		{B_DEVICE_SUB_TYPE, B_UINT16_TYPE, {.ui16 = info.class_sub}},
+		{B_DEVICE_INTERFACE, B_UINT16_TYPE, {.ui16 = info.class_api}},
+
+		{B_DEVICE_FLAGS, B_UINT32_TYPE, {.ui32 = B_FIND_CHILD_ON_DEMAND}},
+		{}
+	};
+
+	gDeviceManager->register_node(node, PCI_DEVICE_MODULE_NAME, attrs, NULL, NULL);
+}
+
+
+static void
 pci_root_traverse(device_node* node, PCIBus* bus)
 {
 	for (PCIDev* dev = bus->child; dev != NULL; dev = dev->next) {
-		const pci_info& info = dev->info;
-
-		device_attr attrs[] = {
-			// info about device
-			{B_DEVICE_BUS, B_STRING_TYPE, {.string = "pci"}},
-
-			// location on PCI bus
-			{B_PCI_DEVICE_DOMAIN, B_UINT8_TYPE, {.ui8 = dev->domain}},
-			{B_PCI_DEVICE_BUS, B_UINT8_TYPE, {.ui8 = dev->bus}},
-			{B_PCI_DEVICE_DEVICE, B_UINT8_TYPE, {.ui8 = info.device}},
-			{B_PCI_DEVICE_FUNCTION, B_UINT8_TYPE, {.ui8 = info.function}},
-
-			// info about the device
-			{B_DEVICE_VENDOR_ID, B_UINT16_TYPE, {.ui16 = info.vendor_id}},
-			{B_DEVICE_ID, B_UINT16_TYPE, {.ui16 = info.device_id}},
-
-			{B_DEVICE_TYPE, B_UINT16_TYPE, {.ui16 = info.class_base}},
-			{B_DEVICE_SUB_TYPE, B_UINT16_TYPE, {.ui16 = info.class_sub}},
-			{B_DEVICE_INTERFACE, B_UINT16_TYPE, {.ui16 = info.class_api}},
-
-			{B_DEVICE_FLAGS, B_UINT32_TYPE, {.ui32 = B_FIND_CHILD_ON_DEMAND}},
-			{}
-		};
-
-		gDeviceManager->register_node(node, PCI_DEVICE_MODULE_NAME, attrs, NULL, NULL);
+		pci_register_device(node, dev);
 
 		if (dev->child != NULL)
 			pci_root_traverse(node, dev->child);
+	}
+}
+
+
+void
+pci_register_devices(device_node* root, PCIBus* bus)
+{
+	pci_root_traverse(root, bus);
+}
+
+
+void
+pci_unregister_devices(device_node* root, PCIBus* bus)
+{
+	for (PCIDev* dev = bus->child; dev != NULL; dev = dev->next) {
+		if (dev->child != NULL)
+			pci_unregister_devices(root, dev->child);
+
+		device_attr attrs[] = {
+			{B_DEVICE_BUS, B_STRING_TYPE, {.string = "pci"}},
+			{B_PCI_DEVICE_DOMAIN, B_UINT8_TYPE, {.ui8 = dev->domain}},
+			{B_PCI_DEVICE_BUS, B_UINT8_TYPE, {.ui8 = dev->bus}},
+			{B_PCI_DEVICE_DEVICE, B_UINT8_TYPE, {.ui8 = dev->device}},
+			{B_PCI_DEVICE_FUNCTION, B_UINT8_TYPE, {.ui8 = dev->function}},
+			{}
+		};
+		device_node* node = NULL;
+		if (gDeviceManager->get_next_child_node(root, attrs, &node) == B_OK) {
+			gDeviceManager->unregister_node(node);
+			gDeviceManager->put_node(node);
+		}
 	}
 }
 

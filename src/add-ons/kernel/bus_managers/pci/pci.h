@@ -30,6 +30,7 @@ public:
 	status_t		AllocateResource(uint64 size, uint64 alignment, pci_resource_range& out, uint8 flags);
 	void			FreeResource(pci_resource_range resource);
 	status_t		ReserveResource(uint64 start, uint64 size, pci_resource_range& out);
+	bool			IsEmpty() const { return fResources.Count() == 0; }
 
 private:
 	void			_MergeResourcesAt(int lower, int upper);
@@ -66,6 +67,9 @@ struct PCIDev {
 	uint8				intx_pin = 0;
 
 	pci_resource_range	bar[6];
+	pci_resource_range	window[3];
+		// bridge windows assigned by hot plug: memory, prefetchable, I/O
+	uint64				window_size[3];
 
 	// state saved while suspended
 	bool				config_saved;
@@ -196,7 +200,24 @@ public:
 			status_t		ConfigureMSIX(PCIDev *device, uint32 count, uint32 *startVector);
 			status_t		EnableMSIX(PCIDev *device);
 
+			status_t		RescanHotplug(uint32* added, uint32* removed);
+
 private:
+			bool			_IsHotplugPort(PCIDev* dev, uint8* capability);
+			bool			_IsPortLinkUp(PCIDev* dev, uint8 capability);
+			void			_HotplugNumberBuses(uint8 domain, uint8 bus,
+								uint8& last, uint8 limit);
+			void			_HotplugDiscoverBus(PCIBus* bus);
+			void			_HotplugSizeBus(PCIBus* bus,
+								struct bus_needs& needs);
+			status_t		_HotplugAssignBus(PCIBus* bus);
+			void			_HotplugInitWindows(PCIDev* port);
+			status_t		_HotplugAdd(PCIDev* port);
+			void			_HotplugRelease(PCIBus* bus);
+			void			_HotplugRemove(PCIDev* port);
+			void			_HotplugScan(PCIBus* bus, uint32& added,
+								uint32& removed);
+
 			void			_EnumerateBus(uint8 domain, uint8 bus,
 								uint8 *subordinateBus = NULL);
 
@@ -277,6 +298,9 @@ private:
 };
 
 extern PCI *gPCI;
+
+void pci_register_devices(device_node* root, PCIBus* bus);
+void pci_unregister_devices(device_node* root, PCIBus* bus);
 
 
 
