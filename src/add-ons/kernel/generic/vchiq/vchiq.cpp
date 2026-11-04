@@ -243,6 +243,7 @@ static sem_id sRecycleSem = -1;
 static sem_id sSlotAvailableSem = -1;
 static sem_id sConnectSem = -1;
 
+static mutex sInitLock = MUTEX_INITIALIZER("vchiq init");
 static mutex sSlotLock = MUTEX_INITIALIZER("vchiq slots");
 	// writing messages
 static mutex sRecycleLock = MUTEX_INITIALIZER("vchiq recycle");
@@ -673,9 +674,28 @@ delete_service(vchiq_service* service)
 }
 
 
+static status_t init();
+
+
+/*!	Starts the channel on first use. Not in B_MODULE_INIT: init() asks the
+	device manager for the doorbell's node, and module initialisation runs
+	under the modules lock, which the device manager takes while it probes with
+	its own lock held. bcm2835_audio, loaded on every arm64 board by a scan of
+	/dev/audio, then deadlocked with a concurrent probe: no network, no USB
+	input (ROCK 5, 2026-11-04).
+*/
 static status_t
 vchiq_init_check()
 {
+	MutexLocker _(sInitLock);
+
+	// Once the firmware knows the slots they stay: the module is never
+	// unloaded, and a failed start is not tried again.
+	if (sInitStatus == B_NO_INIT) {
+		sInitStatus = init();
+		if (sInitStatus != B_OK)
+			ERROR("not started: %s\n", strerror(sInitStatus));
+	}
 	return sInitStatus;
 }
 
@@ -1257,14 +1277,7 @@ std_ops(int32 op, ...)
 {
 	switch (op) {
 		case B_MODULE_INIT:
-			// Once the firmware knows the slots they stay: the module is
-			// never unloaded, and a failed start is not tried again.
-			if (sInitStatus == B_NO_INIT) {
-				sInitStatus = init();
-				if (sInitStatus != B_OK) {
-					ERROR("not started: %s\n", strerror(sInitStatus));
-				}
-			}
+			// started by vchiq_init_check(), see there
 			return B_OK;
 
 		case B_MODULE_UNINIT:
