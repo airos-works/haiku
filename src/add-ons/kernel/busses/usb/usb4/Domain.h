@@ -111,6 +111,8 @@ private:
 			status_t			_StartDomain();
 			void				_StopDomain();
 			void				_HandleEvent(DomainEvent* event);
+			void				_SetActivity(const char* activity,
+									uint64 route = 0);
 			void				_HandleHotplug(uint64 route, uint8 number,
 									bool unplug);
 			void				_CheckPendingDP();
@@ -178,6 +180,10 @@ private:
 			volatile bool		fRunning;
 			volatile bool		fStarted;
 			status_t			fStartStatus;
+			const char* volatile fActivity;
+				// what the connection manager thread does right now
+			uint64				fActivityRoute;
+			bigtime_t			fActivitySince;
 };
 
 

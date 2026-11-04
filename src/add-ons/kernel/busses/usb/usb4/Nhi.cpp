@@ -133,6 +133,7 @@ Nhi::Nhi(pci_device_module_info* pci, pci_device* device, const pci_info& info)
 	fRunning(false),
 	fControlRunning(false)
 {
+	memset(&fStats, 0, sizeof(fStats));
 	B_INITIALIZE_SPINLOCK(&fTxLock);
 	B_INITIALIZE_SPINLOCK(&fCurrentLock);
 	mutex_init(&fRequestLock, "usb4 control requests");
@@ -287,6 +288,20 @@ Nhi::Uninit()
 		delete_area(fRegisterArea);
 		fRegisterArea = -1;
 		fRegisters = NULL;
+	}
+}
+
+
+void
+Nhi::GetStatistics(Statistics& stats)
+{
+	stats = fStats;
+	stats.txHead = fTxHead;
+	stats.txTail = fTxTail;
+	stats.rxHead = fRxHead;
+	if (fRegisters != NULL) {
+		stats.txRegister = ReadReg(NHI_TX_RING_BASE + 8);
+		stats.rxRegister = ReadReg(NHI_RX_RING_BASE + 8);
 	}
 }
 
@@ -626,6 +641,7 @@ Nhi::_ProcessRx()
 			length = 4096;
 		uint8 pdf = RING_DESC_EOF(control);
 		uint32* data = (uint32*)(fRxBuffers + slot * CTL_FRAME_SIZE);
+		atomic_add(&fStats.rxFrames, 1);
 
 		if (length >= 8 && length <= CTL_FRAME_SIZE && length % 4 == 0) {
 			uint32 crc = B_BENDIAN_TO_HOST_INT32(data[length / 4 - 1]);
@@ -638,6 +654,7 @@ Nhi::_ProcessRx()
 				&& pdf != USB4_PDF_ICM_RESP) {
 				TRACE_ERROR("RX: checksum mismatch (pdf %u, %" B_PRIuSIZE
 					" bytes), dropped\n", pdf, length);
+				atomic_add(&fStats.rxDropped, 1);
 			} else
 				_HandleFrame(frame, length - 4, pdf);
 		} else {
@@ -680,6 +697,7 @@ Nhi::_HandleFrame(uint32* frame, size_t bytes, uint8 pdf)
 				return;
 			uint8 adapter = USB4_EVENT_PORT(frame[2]);
 			bool unplug = (frame[2] & USB4_EVENT_UNPLUG) != 0;
+			atomic_add(&fStats.events, 1);
 			AckPlug(route, adapter, unplug);
 			if (fDomain != NULL)
 				fDomain->QueueHotplug(route, adapter, unplug);
@@ -692,6 +710,7 @@ Nhi::_HandleFrame(uint32* frame, size_t bytes, uint8 pdf)
 				return;
 			uint8 code = USB4_ERROR_CODE(frame[2]);
 			if (is_notification_error(code)) {
+				atomic_add(&fStats.notifications, 1);
 				switch (code) {
 					case USB4_ERROR_PCIE_WAKE:
 					case USB4_ERROR_DP_CON_CHANGE:
@@ -724,6 +743,7 @@ Nhi::_HandleFrame(uint32* frame, size_t bytes, uint8 pdf)
 	InterruptsSpinLocker locker(fCurrentLock);
 	ControlRequest* request = fCurrentRequest;
 	if (request == NULL || request->done) {
+		atomic_add(&fStats.stray, 1);
 		TRACE("RX: response (pdf %u) from %#" B_PRIx64 " without a request\n",
 			pdf, route);
 		return;
@@ -763,6 +783,7 @@ ControlResult
 Nhi::_Request(ControlRequest& request, bigtime_t timeout)
 {
 	MutexLocker requestLocker(fRequestLock);
+	atomic_add(&fStats.requests, 1);
 
 	ControlResult result = {};
 	for (int attempt = 0; attempt < 4; attempt++) {
@@ -795,6 +816,7 @@ Nhi::_Request(ControlRequest& request, bigtime_t timeout)
 		locker.Unlock();
 
 		if (!done) {
+			atomic_add(&fStats.timeouts, 1);
 			if (status == B_OK)
 				status = B_TIMED_OUT;
 			result.status = status == B_TIMED_OUT ? B_TIMED_OUT : status;
@@ -803,6 +825,8 @@ Nhi::_Request(ControlRequest& request, bigtime_t timeout)
 			snooze(50);
 			continue;
 		}
+		if (request.result.status != B_OK)
+			atomic_add(&fStats.errors, 1);
 		return request.result;
 	}
 

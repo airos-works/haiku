@@ -36,7 +36,10 @@ Domain::Domain(Nhi* nhi, int32 index, uint32 control)
 	fThread(-1),
 	fRunning(false),
 	fStarted(false),
-	fStartStatus(B_OK)
+	fStartStatus(B_OK),
+	fActivity("idle"),
+	fActivityRoute(0),
+	fActivitySince(0)
 {
 	mutex_init(&fLock, "usb4 domain");
 	B_INITIALIZE_SPINLOCK(&fEventLock);
@@ -98,6 +101,17 @@ Domain::Stop()
 }
 
 
+void
+Domain::_SetActivity(const char* activity, uint64 route)
+{
+	fActivity = activity;
+	fActivityRoute = route;
+	fActivitySince = system_time();
+	TRACE_VERBOSE("domain %" B_PRId32 ": %s %#" B_PRIx64 "\n", fIndex,
+		activity, route);
+}
+
+
 /*static*/ status_t
 Domain::_Thread(void* data)
 {
@@ -111,7 +125,9 @@ Domain::_Loop()
 {
 	{
 		MutexLocker locker(fLock);
+		_SetActivity("starting");
 		fStartStatus = _StartDomain();
+		_SetActivity("idle");
 		fStarted = fStartStatus == B_OK;
 		if (!fStarted) {
 			TRACE_ERROR("domain %" B_PRId32 ": start failed: %s\n", fIndex,
@@ -134,14 +150,18 @@ Domain::_Loop()
 
 			if (fStarted) {
 				MutexLocker locker(fLock);
+				_SetActivity("event", event->route);
 				_HandleEvent(event);
+				_SetActivity("idle");
 			}
 			free(event);
 		}
 
 		if (fStarted && fPendingDPCount > 0) {
 			MutexLocker locker(fLock);
+			_SetActivity("checking DisplayPort");
 			_CheckPendingDP();
+			_SetActivity("idle");
 		}
 	}
 
@@ -646,6 +666,7 @@ Domain::_ScanAdapter(Adapter* adapter)
 	if (router == NULL)
 		return;
 
+	_SetActivity("probing router", route);
 	status_t status = router->Probe();
 	if (status == B_OK)
 		status = router->Configure();
@@ -660,6 +681,7 @@ Domain::_ScanAdapter(Adapter* adapter)
 		return;
 	}
 
+	_SetActivity("configuring link", route);
 	status = router->ConfigureLink();
 	if (status != B_OK) {
 		TRACE_ERROR("%#" B_PRIx64 ": link setup failed: %s\n", route,
@@ -674,6 +696,7 @@ Domain::_ScanAdapter(Adapter* adapter)
 		router->LinkWidth() >= LINK_WIDTH_DUAL ? 2 : 1,
 		router->LinkUSB4() ? "USB4" : "Thunderbolt");
 
+	_SetActivity("enabling time sync", route);
 	if (router->EnableTMU() != B_OK)
 		TRACE_ERROR("%#" B_PRIx64 ": time sync failed\n", route);
 
@@ -683,9 +706,11 @@ Domain::_ScanAdapter(Adapter* adapter)
 			strerror(status));
 	}
 
+	_SetActivity("tunneling", route);
 	_TunnelUSB3(router);
 	_TunnelPCIe(router);
 	_AddDPResources(router);
+	_SetActivity("scanning", route);
 	_ScanRouter(router);
 }
 
@@ -1277,12 +1302,39 @@ Domain::Dump(char* buffer, size_t size)
 	PRINT("  tunneling: USB3 %s, DisplayPort %s, PCIe %s\n",
 		MayTunnelUSB3() ? "yes" : "no", MayTunnelDP() ? "yes" : "no",
 		MayTunnelPCIe() ? "yes" : "no");
+	Nhi::Statistics stats;
+	fNhi->GetStatistics(stats);
+	PRINT("  control: %" B_PRId32 " requests, %" B_PRId32 " timeouts, %"
+		B_PRId32 " errors; RX %" B_PRId32 " frames (%" B_PRId32 " dropped, %"
+		B_PRId32 " stray), %" B_PRId32 " plug events, %" B_PRId32
+		" notifications\n", stats.requests, stats.timeouts, stats.errors,
+		stats.rxFrames, stats.rxDropped, stats.stray, stats.events,
+		stats.notifications);
+	PRINT("  rings: TX %" B_PRIu32 "/%" B_PRIu32 " (reg %08" B_PRIx32 "), RX %"
+		B_PRIu32 " (reg %08" B_PRIx32 ")\n", stats.txHead, stats.txTail,
+		stats.txRegister, stats.rxHead, stats.rxRegister);
+	PRINT("  connection manager: %s %#" B_PRIx64 " for %" B_PRId64 " ms\n",
+		fActivity, fActivityRoute,
+		(system_time() - fActivitySince) / 1000);
 	if (!fStarted) {
 		PRINT("  not running: %s\n", strerror(fStartStatus));
 		return length;
 	}
 
-	MutexLocker locker(fLock);
+	if (mutex_lock_with_timeout(&fLock, B_RELATIVE_TIMEOUT, 2000000) != B_OK) {
+		PRINT("  busy, no topology\n");
+		return length;
+	}
+	MutexLocker locker(fLock, true);
+
+	uint32 probe;
+	ControlResult result = fNhi->Read(0, 0, USB4_CFG_ROUTER, 0, &probe, 1,
+		50000);
+	if (result.status != B_OK) {
+		PRINT("  the host router does not answer: %s\n",
+			strerror(result.status));
+		return length;
+	}
 
 	for (int32 i = 0; i < USB4_MAX_ROUTERS; i++) {
 		Router* router = fRouters[i];

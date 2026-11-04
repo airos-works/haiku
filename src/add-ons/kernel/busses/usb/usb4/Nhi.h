@@ -100,6 +100,23 @@ public:
 									{ return fInterruptCount; }
 			const char*			InterruptMode() const;
 
+			struct Statistics {
+				int32	requests;
+				int32	timeouts;
+				int32	errors;
+				int32	rxFrames;
+				int32	rxDropped;
+				int32	events;
+				int32	notifications;
+				int32	stray;
+				uint32	txHead;
+				uint32	txTail;
+				uint32	rxHead;
+				uint32	rxRegister;
+				uint32	txRegister;
+			};
+			void				GetStatistics(Statistics& stats);
+
 private:
 	static	int32				_InterruptHandler(void* data);
 	static	status_t			_RingThread(void* data);
@@ -137,6 +154,7 @@ private:
 			bool				fUseMSIX;
 			bool				fInterruptInstalled;
 			int32				fInterruptCount;
+			Statistics			fStats;
 			sem_id				fRingSem;
 
 			// DMA memory of the control rings
