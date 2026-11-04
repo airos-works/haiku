@@ -13,7 +13,10 @@
 	ROCK 5 ITX.
 
 	Allocating threads run while the main thread vforks and execs /bin/true
-	over and over; every child has to be gone within a few seconds.
+	over and over; every child has to be gone within a few seconds. The rounds
+	stop after kRounds or kTimeBudget, whichever comes first: under QEMU's
+	arm64 emulation 400 rounds took 55 to 65 s, and the smoke test kills a
+	guest test after 60 s. Without the fix the test hung in round 0.
 */
 
 #include <errno.h>
@@ -31,6 +34,7 @@ static const int kAllocatorCount = 32;
 	// enough threads for every heap pool: a thread's pool is its malloc ID
 	// modulo the pool count, and the forking thread's must be busy too
 static const int kRounds = 400;
+static const bigtime_t kTimeBudget = 30000000;
 static const bigtime_t kChildDeadline = 5000000;
 
 static volatile bool sStop = false;
@@ -60,7 +64,11 @@ main()
 		pthread_create(&threads[i], NULL, allocator, NULL);
 
 	int failures = 0;
-	for (int round = 0; round < kRounds && failures == 0; round++) {
+	int rounds = 0;
+	bigtime_t start = system_time();
+	for (int round = 0; round < kRounds && failures == 0
+			&& system_time() - start < kTimeBudget; round++) {
+		rounds++;
 		pid_t child = vfork();
 		if (child == 0) {
 			char* const args[] = { (char*)"true", NULL };
@@ -103,7 +111,8 @@ main()
 		pthread_join(threads[i], NULL);
 
 	if (failures == 0)
-		printf("PASS: %d vfork() + exec rounds with %d allocating threads\n",
-			kRounds, kAllocatorCount);
+		printf("PASS: %d vfork() + exec rounds in %.1f s with %d allocating"
+			" threads\n", rounds, (system_time() - start) / 1e6,
+			kAllocatorCount);
 	return failures == 0 ? 0 : 1;
 }
