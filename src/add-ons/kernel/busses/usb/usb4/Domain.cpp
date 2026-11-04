@@ -29,6 +29,8 @@ Domain::Domain(Nhi* nhi, int32 index, uint32 control)
 	fIndex(index),
 	fControl(control),
 	fPCIeListener(NULL),
+	fResetHost(false),
+	fDiscovering(false),
 	fHost(NULL),
 	fDPResourceCount(0),
 	fPendingDPCount(0),
@@ -208,15 +210,24 @@ Domain::_StartDomain()
 
 	host->EnableTMU();
 
-	// The boot firmware may have tunnels of its own. We cannot know whether
-	// they suit us, so take everything down and let the devices come back
-	// as hot plugs (USB4 version 2 host routers were reset already).
-	if (host->IsUSB4() && host->USB4Version() == 1) {
+	if (fResetHost && host->IsUSB4() && host->USB4Version() == 1) {
+		// take down whatever the boot firmware set up and let the devices
+		// come back as hot plugs (version 2 host routers were reset already)
 		status = host->ResetHost();
 		if (status != B_OK) {
 			TRACE_ERROR("domain %" B_PRId32 ": resetting the host router "
 				"failed: %s\n", fIndex, strerror(status));
 		}
+	} else {
+		// Keep what the boot firmware set up: the devices behind its
+		// tunnels stay where they are instead of vanishing and coming back.
+		// Enumerate without making tunnels, take over the firmware's, and
+		// let the rescan below add what is missing.
+		fDiscovering = true;
+		_SetActivity("discovering");
+		_ScanRouter(host);
+		_DiscoverTunnels(host);
+		fDiscovering = false;
 	}
 
 	_AddDPResources(host);
@@ -747,7 +758,7 @@ Domain::_Unplug(Adapter* adapter)
 void
 Domain::_TunnelUSB3(Router* router)
 {
-	if (!MayTunnelUSB3())
+	if (!MayTunnelUSB3() || fDiscovering)
 		return;
 
 	Adapter* up = router->FindAdapter(ADAPTER_USB3_UP);
@@ -801,7 +812,7 @@ Domain::_TunnelUSB3(Router* router)
 void
 Domain::_TunnelPCIe(Router* router)
 {
-	if (!MayTunnelPCIe())
+	if (!MayTunnelPCIe() || fDiscovering)
 		return;
 
 	Adapter* up = router->FindAdapter(ADAPTER_PCIE_UP);
@@ -963,7 +974,7 @@ Domain::_FindDPOut(Adapter* in)
 void
 Domain::_TunnelDP()
 {
-	if (!MayTunnelDP())
+	if (!MayTunnelDP() || fDiscovering)
 		return;
 
 	for (int32 i = 0; i < fDPResourceCount; i++) {
@@ -1121,6 +1132,42 @@ Domain::_FreeInvalidTunnels()
 			_FreeTunnel(tunnel);
 			it = fTunnels.GetIterator();
 		}
+	}
+}
+
+
+void
+Domain::_DiscoverTunnels(Router* router)
+{
+	for (uint8 i = 1; i <= router->MaxAdapter(); i++) {
+		Adapter* adapter = router->AdapterAt(i);
+		if (!adapter->present || !(adapter->IsDPIn() || adapter->IsPCIeDown()
+				|| adapter->IsUSB3Down()))
+			continue;
+		if (!adapter->IsEnabled())
+			continue;
+
+		Tunnel* tunnel = Tunnel::Discover(this, adapter);
+		if (tunnel == NULL)
+			continue;
+		fTunnels.Add(tunnel);
+
+		if (tunnel->Type() == TUNNEL_DP) {
+			Adapter* ends[2] = { tunnel->Source(), tunnel->Destination() };
+			for (int j = 0; j < 2; j++) {
+				if (ends[j]->dpResource
+					|| fDPResourceCount >= USB4_MAX_DP_RESOURCES)
+					continue;
+				fDPResources[fDPResourceCount++] = ends[j];
+				ends[j]->dpResource = true;
+			}
+		}
+	}
+
+	for (uint8 i = 1; i <= router->MaxAdapter(); i++) {
+		Adapter* adapter = router->AdapterAt(i);
+		if (adapter->present && adapter->HasRemote())
+			_DiscoverTunnels(adapter->remote->router);
 	}
 }
 

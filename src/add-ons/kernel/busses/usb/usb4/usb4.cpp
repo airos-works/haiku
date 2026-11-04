@@ -233,13 +233,14 @@ struct usb4_settings {
 	bool	usb3;
 	bool	dp;
 	bool	pcie;
+	bool	resetHost;
 };
 
 
 static usb4_settings
 read_settings()
 {
-	usb4_settings settings = { false, true, true, true };
+	usb4_settings settings = { false, true, true, true, false };
 
 	void* handle = load_driver_settings("usb4");
 	if (handle == NULL)
@@ -253,6 +254,8 @@ read_settings()
 		settings.dp, true);
 	settings.pcie = get_driver_boolean_parameter(handle, "pcie_tunneling",
 		settings.pcie, true);
+	settings.resetHost = get_driver_boolean_parameter(handle, "reset_host",
+		settings.resetHost, true);
 	const char* debug = get_driver_parameter(handle, "debug", NULL, NULL);
 	if (debug != NULL)
 		gUSB4DebugLevel = strtol(debug, NULL, 0);
@@ -296,6 +299,7 @@ start_domain(usb4_device* device)
 	if (sPCIeRescanner == NULL)
 		sPCIeRescanner = new(std::nothrow) PCIeRescanner;
 	device->domain->SetPCIeListener(sPCIeRescanner);
+	device->domain->SetResetHost(settings.resetHost);
 	return device->domain->Start();
 }
 

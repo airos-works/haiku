@@ -48,6 +48,10 @@ public:
 	static	Path*				Create(Domain* domain, Adapter* source,
 									int32 sourceHop, Adapter* destination,
 									int32 destinationHop, const char* name);
+	static	Path*				Discover(Domain* domain, Adapter* source,
+									int32 sourceHop, Adapter* destination,
+									int32 destinationHop, Adapter** _last,
+									const char* name);
 
 			status_t			Activate();
 			void				Deactivate();
@@ -101,6 +105,8 @@ public:
 	static	Tunnel*				CreateDP(Domain* domain, Adapter* in,
 									Adapter* out, int32 maxUp,
 									int32 maxDown);
+	static	Tunnel*				Discover(Domain* domain, Adapter* source);
+									// a tunnel the boot firmware set up
 
 			status_t			Activate();
 			void				Deactivate();

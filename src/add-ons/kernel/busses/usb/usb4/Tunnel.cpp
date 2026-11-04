@@ -134,6 +134,13 @@ uses_credit_allocation(Adapter* adapter)
 }
 
 
+static status_t usb3_cm_request(Adapter* down, bool request);
+static uint32 usb3_bw_to_mbps(uint32 bw, uint32 scale);
+static status_t dp_enable(Adapter* adapter, bool enable);
+static status_t protocol_enable(Adapter* adapter, tunnel_type type,
+	bool enable);
+
+
 // #pragma mark - Path
 
 
@@ -292,6 +299,105 @@ Path::Create(Domain* domain, Adapter* source, int32 sourceHop,
 		inHop = id;
 	}
 
+	return path;
+}
+
+
+static Adapter*
+follow_path(Adapter* adapter, int32 hop, int32 destinationHop)
+{
+	Adapter* out = NULL;
+	for (int i = 0; adapter != NULL && i < USB4_MAX_PATH_HOPS; i++) {
+		uint32 entry[2];
+		if (adapter->Read(USB4_CFG_HOPS, 2 * hop, entry, 2) != B_OK
+			|| (entry[0] & HOP_0_VALID) == 0)
+			return NULL;
+		out = adapter->router->AdapterAt((entry[0] >> 11) & 0x3f);
+		if (out == NULL)
+			return NULL;
+		hop = HOP_0_NEXT_HOP(entry[0]);
+		adapter = out->remote;
+	}
+	return out != NULL && hop == destinationHop ? out : NULL;
+}
+
+
+/*!	Follows a path the boot firmware activated, starting at \a source and
+	\a sourceHop (if that is negative, the one that ends at \a destination
+	and \a destinationHop is looked for), and reserves its hop IDs.
+*/
+/*static*/ Path*
+Path::Discover(Domain* domain, Adapter* source, int32 sourceHop,
+	Adapter* destination, int32 destinationHop, Adapter** _last,
+	const char* name)
+{
+	if (sourceHop < 0) {
+		if (destination == NULL)
+			return NULL;
+		for (int32 hop = USB4_FIRST_PATH_HOP; hop <= source->maxInHop; hop++) {
+			if (follow_path(source, hop, destinationHop) == destination) {
+				sourceHop = hop;
+				break;
+			}
+		}
+		if (sourceHop < 0)
+			return NULL;
+	}
+
+	Path* path = new(std::nothrow) Path(domain, name);
+	if (path == NULL)
+		return NULL;
+
+	Adapter* adapter = source;
+	int32 hop = sourceHop;
+	Adapter* last = NULL;
+	for (int32 i = 0; adapter != NULL && i < USB4_MAX_PATH_HOPS; i++) {
+		uint32 entry[2];
+		if (adapter->Read(USB4_CFG_HOPS, 2 * hop, entry, 2) != B_OK)
+			break;
+		if ((entry[0] & HOP_0_VALID) == 0)
+			break;
+		Adapter* out = adapter->router->AdapterAt((entry[0] >> 11) & 0x3f);
+		if (out == NULL)
+			break;
+		int32 next = HOP_0_NEXT_HOP(entry[0]);
+
+		PathHop& pathHop = path->fHops[path->fLength];
+		pathHop.in = adapter;
+		pathHop.out = out;
+		pathHop.inHop = adapter->inHops.Reserve(hop) ? hop : -1;
+		pathHop.nextHop = out->outHops.Reserve(next) ? next : -1;
+		pathHop.initialCredits = (entry[0] >> 17) & 0x7f;
+		path->fLength++;
+		if (pathHop.inHop < 0 || pathHop.nextHop < 0) {
+			TRACE_ERROR("%s path: hop %" B_PRId32 " of %#" B_PRIx64 ":%u is "
+				"used twice\n", name, hop, adapter->router->Route(),
+				adapter->number);
+			delete path;
+			return NULL;
+		}
+
+		if (i == 0) {
+			path->priority = (entry[1] >> 8) & 0x7;
+			path->weight = entry[1] & 0xf;
+		}
+
+		last = out;
+		hop = next;
+		adapter = out->remote;
+	}
+
+	if (path->fLength == 0) {
+		delete path;
+		return NULL;
+	}
+
+	path->fActive = true;
+	if (_last != NULL)
+		*_last = last;
+	TRACE("discovered %s path %#" B_PRIx64 ":%u -> %#" B_PRIx64 ":%u (%"
+		B_PRId32 " hops)\n", name, source->router->Route(), source->number,
+		last->router->Route(), last->number, path->fLength);
 	return path;
 }
 
@@ -729,6 +835,119 @@ Tunnel::CreateDP(Domain* domain, Adapter* in, Adapter* out, int32 maxUp,
 	tunnel->fPaths[tunnel->fPathCount++] = path;
 	init_dp_aux_path(path);
 
+	return tunnel;
+}
+
+
+/*static*/ Tunnel*
+Tunnel::Discover(Domain* domain, Adapter* source)
+{
+	if (!source->IsEnabled())
+		return NULL;
+
+	tunnel_type type;
+	if (source->IsDPIn())
+		type = TUNNEL_DP;
+	else if (source->IsPCIeDown())
+		type = TUNNEL_PCIE;
+	else if (source->IsUSB3Down())
+		type = TUNNEL_USB3;
+	else
+		return NULL;
+
+	Tunnel* tunnel = new(std::nothrow) Tunnel(domain, type, source, NULL);
+	if (tunnel == NULL)
+		return NULL;
+
+	bool complete = false;
+	if (type == TUNNEL_DP) {
+		Adapter* out = NULL;
+		Path* video = Path::Discover(domain, source, DP_VIDEO_HOP, NULL, -1,
+			&out, "DP video");
+		if (video != NULL) {
+			tunnel->fPaths[tunnel->fPathCount++] = video;
+			tunnel->fDestination = out;
+			Path* auxOut = Path::Discover(domain, source, DP_AUX_TX_HOP, NULL,
+				-1, NULL, "DP AUX TX");
+			if (auxOut != NULL)
+				tunnel->fPaths[tunnel->fPathCount++] = auxOut;
+			Adapter* back = NULL;
+			Path* auxIn = out != NULL ? Path::Discover(domain, out, -1, source,
+				DP_AUX_RX_HOP, &back, "DP AUX RX") : NULL;
+			if (auxIn != NULL)
+				tunnel->fPaths[tunnel->fPathCount++] = auxIn;
+
+			uint32 cs2 = 0;
+			complete = auxOut != NULL && auxIn != NULL && back == source
+				&& out != NULL && out->IsDPOut() && out->IsEnabled()
+				&& out->ReadAdapter(out->capAdapter + ADP_DP_CS_2, cs2) == B_OK
+				&& (cs2 & ADP_DP_CS_2_HPD) != 0;
+
+			uint32 cap;
+			if (complete && source->ReadAdapter(source->capAdapter
+					+ DP_REMOTE_CAP, cap) == B_OK) {
+				tunnel->fDPRate = dp_cap_rate(cap);
+				tunnel->fDPLanes = dp_cap_lanes(cap);
+			}
+		}
+	} else {
+		int32 hop = type == TUNNEL_PCIE ? PCIE_HOP : USB3_HOP;
+		Adapter* up = NULL;
+		Path* down = Path::Discover(domain, source, hop, NULL, -1, &up,
+			type == TUNNEL_PCIE ? "PCIe down" : "USB3 down");
+		if (down != NULL) {
+			tunnel->fPaths[tunnel->fPathCount++] = down;
+			tunnel->fDestination = up;
+			Adapter* back = NULL;
+			Path* upPath = up != NULL ? Path::Discover(domain, up, -1, source,
+				hop, &back, type == TUNNEL_PCIE ? "PCIe up" : "USB3 up") : NULL;
+			if (upPath != NULL)
+				tunnel->fPaths[tunnel->fPathCount++] = upPath;
+			complete = upPath != NULL && back == source && up != NULL
+				&& (type == TUNNEL_PCIE ? up->IsPCIeUp() : up->IsUSB3Up())
+				&& up->IsEnabled();
+		}
+
+		if (complete && type == TUNNEL_USB3 && source->router->IsHost()) {
+			// what the firmware gave it
+			if (usb3_cm_request(source, true) == B_OK) {
+				uint32 cs2, scale;
+				if (source->ReadAdapter(source->capAdapter + ADP_USB3_CS_2,
+						cs2) == B_OK
+					&& source->ReadAdapter(source->capAdapter + ADP_USB3_CS_3,
+						scale) == B_OK) {
+					scale &= ADP_USB3_CS_3_SCALE_MASK;
+					tunnel->fAllocatedUp = usb3_bw_to_mbps(
+						cs2 & ADP_USB3_CS_2_AUBW_MASK, scale);
+					tunnel->fAllocatedDown = usb3_bw_to_mbps(
+						(cs2 & ADP_USB3_CS_2_ADBW_MASK)
+							>> ADP_USB3_CS_2_ADBW_SHIFT, scale);
+				}
+				usb3_cm_request(source, false);
+			}
+		}
+	}
+
+	tunnel->fActive = true;
+	if (!complete || tunnel->fDestination == NULL) {
+		TRACE_ERROR("incomplete %s tunnel from %#" B_PRIx64 ":%u, taking it "
+			"down\n", tunnel->TypeName(), source->router->Route(),
+			source->number);
+		if (tunnel->fDestination == NULL)
+			tunnel->fDestination = source;
+		delete tunnel;
+		// whatever is left of it
+		if (type == TUNNEL_DP)
+			dp_enable(source, false);
+		else
+			protocol_enable(source, type, false);
+		return NULL;
+	}
+
+	TRACE_ALWAYS("found the firmware's %s tunnel %#" B_PRIx64 ":%u -> %#"
+		B_PRIx64 ":%u\n", tunnel->TypeName(), source->router->Route(),
+		source->number, tunnel->fDestination->router->Route(),
+		tunnel->fDestination->number);
 	return tunnel;
 }
 

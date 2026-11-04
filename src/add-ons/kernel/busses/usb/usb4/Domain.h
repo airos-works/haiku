@@ -76,6 +76,8 @@ public:
 
 			void				SetPCIeListener(PCIeTunnelListener* listener)
 									{ fPCIeListener = listener; }
+			void				SetResetHost(bool reset)
+									{ fResetHost = reset; }
 
 			// configuration access, used by routers and adapters
 			ControlResult		RawRead(uint64 route, uint8 adapter,
@@ -139,6 +141,7 @@ private:
 									Adapter* destination);
 			void				_FreeTunnel(Tunnel* tunnel);
 			void				_FreeInvalidTunnels();
+			void				_DiscoverTunnels(Router* router);
 
 			int32				_CollectLinks(Adapter* source,
 									Adapter* destination, Adapter** links,
@@ -158,6 +161,8 @@ private:
 			int32				fIndex;
 			uint32				fControl;
 			PCIeTunnelListener*	fPCIeListener;
+			bool				fResetHost;
+			bool				fDiscovering;
 
 			mutex				fLock;
 			Router*				fHost;
