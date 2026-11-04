@@ -23,7 +23,9 @@
 	monitor's mode by the display engine where it is not the same size. */
 
 
-static const uint32 kMaxOutputs = 8;
+static const uint32 kMaxOutputs = 16;
+	// eDP, up to four DisplayPort or HDMI PHYs, and four USB4 (DPIA) links
+	// on current AMD APUs; more on desktop GPUs
 
 
 struct Output {
