@@ -10,7 +10,10 @@ work upstream or represent it as upstream-approved.
   Do not change HOME or CODEX_HOME. Use `tools/rock5-itx/env.sh`.
 - `master` is the integration branch and holds all of the fork's work; it is
   checked out in `/mnt/HaikuWork/src/haiku`. Device work goes on `rpi4`,
-  `airos-release` or a short topic branch started from `master`; X399
+  a board integration branch such as `cubie-a7s`, or a short topic branch
+  started from `master` (the `airos-release` branch was retired on
+  2026-11-05: every air/OS image, x86_64, arm64, rpi4 and cubie, is built by
+  CI from `master`); X399
   workstation work goes straight to topic branches (the `x399-workstation`
   branch was retired on 2026-10-19 and `/mnt/HaikuWork/x399/haiku` is a
   detached checkout of `master` kept for its `docs/x399-workstation` tools).

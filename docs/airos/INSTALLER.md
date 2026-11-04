@@ -80,7 +80,8 @@ list was empty and sizes printed without numbers.
 ## What the ISO contains
 
 The full regular image for the ROCK 5 ITX (every in-tree application,
-preference and demo) built from branch `airos-release` with
+preference and demo) built from branch `airos-release` (retired on
+2026-11-05; CI now builds every air/OS image from `master`) with
 `--distro-compatibility compatible`:
 
 - the ROCK 5 drivers (display, Mali GPU, VPU, audio, NVMe, PCIe, eMMC, USB,
