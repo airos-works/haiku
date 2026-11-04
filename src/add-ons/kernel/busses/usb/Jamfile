@@ -34,3 +34,5 @@ KernelAddon <usb>xhci :
 	: libusb.a
 	: xhci.rdef
 	;
+
+SubInclude HAIKU_TOP src add-ons kernel busses usb usb4 ;
