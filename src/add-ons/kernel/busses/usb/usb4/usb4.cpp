@@ -240,7 +240,7 @@ struct usb4_settings {
 static usb4_settings
 read_settings()
 {
-	usb4_settings settings = { false, true, true, true, false };
+	usb4_settings settings = { true, true, true, true, false };
 
 	void* handle = load_driver_settings("usb4");
 	if (handle == NULL)

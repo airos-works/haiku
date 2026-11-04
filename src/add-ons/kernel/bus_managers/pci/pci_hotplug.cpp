@@ -403,7 +403,15 @@ PCI::_HotplugAssignBus(PCIBus* bus)
 			program_bridge_window(this, dev, item.index, &range);
 			PCIResourceWindow& childWindow = io ? dev->child->io_window
 				: dev->child->memory_window;
-			childWindow.FreeResource(range);
+			// keep the prefetchable window apart from the other one, so that
+			// the devices below get the kind of memory they asked for
+			pci_resource_range childRange = range;
+			if (item.index == 1) {
+				childRange.address_type
+					|= PCI_address_prefetchable | PCI_address_type_64;
+			} else if (item.index == 0)
+				childRange.address_type &= ~PCI_address_prefetchable;
+			childWindow.FreeResource(childRange);
 			dprintf("PCI: hot plug: %02x:%02x.%x window %d at %#" B_PRIx64
 				", %#" B_PRIx64 " bytes\n", dev->bus, dev->device,
 				dev->function, item.index, (uint64)range.pci_address,

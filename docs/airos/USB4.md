@@ -64,7 +64,9 @@ and takes commands:
 
 Driver settings (`~/config/settings/kernel/drivers/usb4`):
 
-    auto_start true         # start the connection manager at boot
+    auto_start true         # start the connection manager at boot (default)
+    reset_host false        # reset the host router instead of taking over
+                            # the boot firmware's tunnels
     usb3_tunneling true
     dp_tunneling true
     pcie_tunneling true
