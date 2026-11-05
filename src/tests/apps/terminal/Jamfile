@@ -9,3 +9,9 @@ SimpleTest GLStressTest :
 	GLStressTest.cpp
 	: be [ TargetLibstdc++ ]
 ;
+
+# a stand-in browser that logs the addresses it is asked to open
+SimpleTest URLCatcher :
+	URLCatcher.cpp
+	: be
+;

@@ -165,6 +165,8 @@ static const char* const PREF_ALLOW_BOLD = "Allow bold text";
 static const char* const PREF_USE_OPTION_AS_META =
 	"Use left Option as Meta key";
 static const char* const PREF_WARN_ON_EXIT = "Warn on exit";
+	// a plain click on a link opens it (Alt+click always does)
+static const char* const PREF_OPEN_LINKS_ON_CLICK = "Open links on click";
 static const char* const PREF_CURSOR_STYLE = "Cursor style";
 static const char* const PREF_EMULATE_BOLD = "Emulate bold";
 	// the mouse wheel sends cursor keys on the alternate screen (DECSET

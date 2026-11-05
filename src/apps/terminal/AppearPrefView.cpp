@@ -60,6 +60,12 @@ AppearancePrefView::AppearancePrefView(const char* name,
 		B_TRANSLATE("Confirm exit if active programs exist"),
 			new BMessage(MSG_WARN_ON_EXIT_CHANGED));
 
+	fOpenLinksOnClick = new BCheckBox(
+		B_TRANSLATE("Open links with a click"),
+			new BMessage(MSG_OPEN_LINKS_ON_CLICK_CHANGED));
+	fOpenLinksOnClick->SetToolTip(B_TRANSLATE("Alt+click always opens "
+		"them; a drag still selects."));
+
 	BMenu* fontMenu = _MakeFontMenu(MSG_HALF_FONT_CHANGED,
 		PrefHandler::Default()->getString(PREF_HALF_FONT_FAMILY),
 		PrefHandler::Default()->getString(PREF_HALF_FONT_STYLE));
@@ -116,7 +122,8 @@ AppearancePrefView::AppearancePrefView(const char* name,
 		.Add(fBlinkCursor)
 		.Add(fAllowBold)
 		.Add(fUseOptionAsMetaKey)
-		.Add(fWarnOnExit);
+		.Add(fWarnOnExit)
+		.Add(fOpenLinksOnClick);
 
 	fTabTitle->SetAlignment(B_ALIGN_RIGHT, B_ALIGN_LEFT);
 	fWindowTitle->SetAlignment(B_ALIGN_RIGHT, B_ALIGN_LEFT);
@@ -140,6 +147,7 @@ AppearancePrefView::Revert()
 	fAllowBold->SetValue(pref->getBool(PREF_ALLOW_BOLD));
 	fUseOptionAsMetaKey->SetValue(pref->getBool(PREF_USE_OPTION_AS_META));
 	fWarnOnExit->SetValue(pref->getBool(PREF_WARN_ON_EXIT));
+	fOpenLinksOnClick->SetValue(pref->getBool(PREF_OPEN_LINKS_ON_CLICK));
 
 	_SetEncoding(pref->getString(PREF_TEXT_ENCODING));
 	_SetWindowSize(pref->getInt32(PREF_ROWS), pref->getInt32(PREF_COLS));
@@ -161,6 +169,7 @@ AppearancePrefView::AttachedToWindow()
 	fAllowBold->SetTarget(this);
 	fUseOptionAsMetaKey->SetTarget(this);
 	fWarnOnExit->SetTarget(this);
+	fOpenLinksOnClick->SetTarget(this);
 
 	fFontField->Menu()->SetTargetForItems(this);
 	for (int32 i = 0; i < fFontField->Menu()->CountItems(); i++) {
@@ -264,6 +273,15 @@ AppearancePrefView::MessageReceived(BMessage* msg)
 				!= fWarnOnExit->Value()) {
 					PrefHandler::Default()->setBool(PREF_WARN_ON_EXIT,
 						fWarnOnExit->Value());
+					modified = true;
+			}
+			break;
+
+		case MSG_OPEN_LINKS_ON_CLICK_CHANGED:
+			if (PrefHandler::Default()->getBool(PREF_OPEN_LINKS_ON_CLICK)
+				!= fOpenLinksOnClick->Value()) {
+					PrefHandler::Default()->setBool(PREF_OPEN_LINKS_ON_CLICK,
+						fOpenLinksOnClick->Value());
 					modified = true;
 			}
 			break;

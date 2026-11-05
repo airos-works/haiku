@@ -19,6 +19,7 @@
 #include "Base64.h"
 #include "Terminal.h"
 #include "TerminalGraphics.h"
+#include "TerminalLinks.h"
 
 
 static int sFailures = 0;
@@ -1419,6 +1420,141 @@ TestGraphics()
 }
 
 
+//!	The link at column \a x of row \a y, "" if there is none, else its
+//!	address and where it starts and ends: "uri @x,y-x,y".
+static std::string
+LinkAt(Fixture& f, int32 x, int32 y)
+{
+	TermLinkRange link;
+	if (!FindTerminalLink(f.terminal, TermPoint(x, y), link))
+		return "";
+	char range[64];
+	snprintf(range, sizeof(range), " @%d,%d-%d,%d", (int)link.start.x,
+		(int)link.start.y, (int)link.end.x, (int)link.end.y);
+	return link.uri + range;
+}
+
+
+static void
+TestLinks()
+{
+	// in a line, without the punctuation of the sentence
+	{
+		Fixture f(40, 4);
+		f.Feed("see https://a.org/x?y=1. ok");
+		CHECK_EQUAL(LinkAt(f, 8, 0), "https://a.org/x?y=1 @4,0-23,0");
+		CHECK_EQUAL(LinkAt(f, 23, 0), "");
+		CHECK_EQUAL(LinkAt(f, 1, 0), "");
+		CHECK_EQUAL(LinkAt(f, 4, 1), "");
+	}
+	// brackets: its own kept, those around it not; markdown
+	{
+		Fixture f(60, 4);
+		f.Feed("(see https://e.com/wiki/Foo_(bar)).\r\n"
+			"[docs](https://e.com/d) <https://e.com/a>\r\n"
+			"x:https://e.com/q,https://e.com/r");
+		CHECK_EQUAL(LinkAt(f, 6, 0), "https://e.com/wiki/Foo_(bar) @5,0-33,0");
+		CHECK_EQUAL(LinkAt(f, 10, 1), "https://e.com/d @7,1-22,1");
+		CHECK_EQUAL(LinkAt(f, 26, 1), "https://e.com/a @25,1-40,1");
+		CHECK_EQUAL(LinkAt(f, 3, 2), "https://e.com/q @2,2-17,2");
+		CHECK_EQUAL(LinkAt(f, 20, 2), "https://e.com/r @18,2-33,2");
+	}
+	// wrapped by the terminal
+	{
+		Fixture f(10, 4);
+		f.Feed("> https://e.com/abcdef x");
+		CHECK_EQUAL(LinkAt(f, 3, 1), "https://e.com/abcdef @2,0-2,2");
+		CHECK_EQUAL(LinkAt(f, 0, 2), "https://e.com/abcdef @2,0-2,2");
+	}
+	// broken by the program to the margin, the rest indented (Claude
+	// Code's answers), or not (its sign-in address)
+	{
+		Fixture f(20, 6);
+		f.Feed("* Open https://e.com\r\n"
+			"  /pull/42/files#ab\r\n"
+			"  cdef now.\r\n"
+			"https://e.com/oauth\r\n"
+			"?code=1&state=2");
+		CHECK_EQUAL(LinkAt(f, 2, 2),
+			"https://e.com/pull/42/files#abcdef @7,0-6,2");
+		CHECK_EQUAL(LinkAt(f, 8, 0),
+			"https://e.com/pull/42/files#abcdef @7,0-6,2");
+		CHECK_EQUAL(LinkAt(f, 3, 4),
+			"https://e.com/oauth?code=1&state=2 @0,3-15,4");
+	}
+	// a text field leaves the last column free (Claude Code's prompt)
+	{
+		Fixture f(20, 4);
+		f.Feed("> https://e.com/abc \r\n  defg");
+		CHECK_EQUAL(LinkAt(f, 3, 1), "https://e.com/abcdefg @2,0-6,1");
+	}
+	// codex breaks after "://" and "-", short of the margin
+	{
+		Fixture f(30, 5);
+		f.Feed("* \"Open https://\r\n"
+			"  github.com/pull/1#diff-\r\n"
+			"  0123456789abcdef0123456789 x");
+		CHECK_EQUAL(LinkAt(f, 4, 2),
+			"https://github.com/pull/1#diff-0123456789abcdef0123456789"
+			" @8,0-28,2");
+	}
+	// but a link that ends a line is not continued with the next line's
+	// words, when they would have fitted, or when it reaches no edge
+	{
+		Fixture f(30, 5);
+		f.Feed("see https://e.com/a-\r\n"
+			"  and more\r\n"
+			"see https://e.com/b\r\n"
+			"  0123456789abcdef0123456789");
+		CHECK_EQUAL(LinkAt(f, 6, 0), "https://e.com/a- @4,0-20,0");
+		CHECK_EQUAL(LinkAt(f, 6, 2), "https://e.com/b @4,2-19,2");
+	}
+	// the next line indented further than the link started
+	{
+		Fixture f(20, 4);
+		f.Feed("https://e.com/abcdef\r\n    ghi");
+		CHECK_EQUAL(LinkAt(f, 3, 0), "https://e.com/abcdef @0,0-20,0");
+	}
+	// tmux panes: left of a border and right of it
+	{
+		Fixture f(31, 4);
+		f.Feed("see https://e.co\xe2\x94\x82https://e.org/\r\n"
+			"m/abc           \xe2\x94\x82path/x\r\n"
+			"                \xe2\x94\x82");
+		CHECK_EQUAL(LinkAt(f, 0, 1), "https://e.com/abc @4,0-5,1");
+		CHECK_EQUAL(LinkAt(f, 20, 0), "https://e.org/path/x @17,0-23,1");
+		CHECK_EQUAL(LinkAt(f, 17, 1), "https://e.org/path/x @17,0-23,1");
+	}
+	// wide characters before it
+	{
+		Fixture f(30, 4);
+		f.Feed("\xe6\x97\xa5\xe6\x9c\xac https://e.com/x");
+		CHECK_EQUAL(LinkAt(f, 7, 0), "https://e.com/x @5,0-20,0");
+	}
+	// OSC 8, over the indentation of the next line
+	{
+		Fixture f(20, 4);
+		f.Feed("* \x1b]8;;https://e.com/long\x1b\\some link text"
+			"\x1b]8;;\x1b\\\r\n  \x1b]8;;https://e.com/long\x1b\\more"
+			"\x1b]8;;\x1b\\ after");
+		CHECK_EQUAL(LinkAt(f, 3, 0), "https://e.com/long @2,0-6,1");
+		CHECK_EQUAL(LinkAt(f, 2, 1), "https://e.com/long @2,0-6,1");
+		CHECK_EQUAL(LinkAt(f, 8, 1), "");
+		TermLinkRange link;
+		CHECK(FindTerminalLink(f.terminal, TermPoint(3, 1), link));
+		CHECK(link.segments.size() == 2);
+		CHECK(link.hyperlink != 0);
+	}
+	// mailto, and no scheme, no link
+	{
+		Fixture f(40, 3);
+		f.Feed("mailto:a@b.org www.e.com e.com/x");
+		CHECK_EQUAL(LinkAt(f, 2, 0), "mailto:a@b.org @0,0-14,0");
+		CHECK_EQUAL(LinkAt(f, 17, 0), "");
+	}
+}
+
+
 int
 main()
 {
@@ -1435,6 +1571,7 @@ main()
 	TestOperatingSystemCommands();
 	TestReflow();
 	TestFind();
+	TestLinks();
 	TestGraphics();
 
 	printf("%d checks, %d failed\n", sChecks, sFailures);

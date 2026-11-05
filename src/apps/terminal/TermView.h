@@ -32,6 +32,7 @@
 #include "GlyphCache.h"
 #include "RenderFrame.h"
 #include "Terminal.h"
+#include "TerminalLinks.h"
 
 
 class ActiveProcessInfo;
@@ -188,6 +189,7 @@ private:
 			class SelectState;
 			class HyperLinkState;
 			class HyperLinkMenuState;
+			class LinkClickState;
 
 			friend class State;
 			friend class StandardBaseState;
@@ -195,6 +197,7 @@ private:
 			friend class SelectState;
 			friend class HyperLinkState;
 			friend class HyperLinkMenuState;
+			friend class LinkClickState;
 
 			struct Highlight {
 				TermPoint	start;
@@ -326,7 +329,13 @@ private:
 									BString& text) const;
 			void				_SetLinkHighlight(TermPoint start,
 									TermPoint end);
+			void				_SetLinkHighlight(const TermLinkRange& link);
 			void				_ClearLinkHighlight();
+			bool				_LinkAt(BPoint where, TermLinkRange& _link);
+			bool				_ClicksOpenLinks() const;
+			bool				_IsActivatingClick(bigtime_t when) const;
+			void				_UpdateHoverLink(BPoint where);
+			void				_ClearHoverLink();
 
 			// drag and drop, clipboard
 			void				_SecondaryMouseButtonDropped(BMessage* message);
@@ -439,7 +448,14 @@ private:
 			TermPoint			fInitialSelectionStart;
 			TermPoint			fInitialSelectionEnd;
 			BPoint				fLastClickPoint;
-			Highlight			fLinkHighlight;
+			std::vector<Highlight> fLinkHighlights;
+				// the link under the pointer, one range per row
+			bool				fHoverLink;
+				// the highlight is the link under the pointer, without
+				// a modifier
+			TermPoint			fHoverCell;
+			uint64				fHoverGeneration;
+			bigtime_t			fActivatedTime;
 
 			// keyboard
 			const key_map*		fKeymap;
@@ -473,6 +489,7 @@ private:
 			SelectState*		fSelectState;
 			HyperLinkState*		fHyperLinkState;
 			HyperLinkMenuState*	fHyperLinkMenuState;
+			LinkClickState*		fLinkClickState;
 			State*				fActiveState;
 };
 

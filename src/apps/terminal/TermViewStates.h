@@ -75,6 +75,8 @@ public:
 
 private:
 			bool				_CheckEnterHyperLinkState(int32 modifiers);
+			bool				_CheckLinkClick(BPoint where, int32 buttons,
+									int32 modifiers);
 };
 
 
@@ -82,7 +84,8 @@ class TermView::SelectState : public TermView::StandardBaseState {
 public:
 								SelectState(TermView* view);
 
-			void				Prepare(BPoint where, int32 modifiers);
+			void				Prepare(BPoint where, int32 modifiers,
+									int32 clicks = -1);
 
 	virtual	bool				MessageReceived(BMessage* message);
 
@@ -120,14 +123,8 @@ public:
 private:
 			bool				_GetHyperLinkAt(BPoint where,
 									bool pathPrefixOnly, HyperLink& _link,
-									TermPoint& _start, TermPoint& _end);
-			void				_GetLinkRange(const TermPoint& pos,
-									uint32 link, TermPoint& _start,
-									TermPoint& _end) const;
-			bool				_CellHasLink(const TermPoint& pos,
-									uint32 link) const;
-			void				_ExtendURLOverLineBreaks(TermPoint& _start,
-									TermPoint& _end);
+									TermPoint& _start, TermPoint& _end,
+									TermLinkRange* _range = NULL);
 			bool				_EntryExists(const BString& path,
 									BString& _actualPath) const;
 
@@ -135,13 +132,44 @@ private:
 			void				_UpdateHighlight(BPoint where, int32 modifiers);
 			void				_ActivateHighlight(const TermPoint& start,
 									const TermPoint& end);
+			void				_ActivateHighlight(
+									const TermLinkRange& range);
 			void				_DeactivateHighlight();
 
 private:
-			DefaultCharClassifier fURLCharClassifier;
 			DefaultCharClassifier fPathComponentCharClassifier;
 			BString				fCurrentDirectory;
 			bool				fHighlightActive;
+};
+
+
+/*!	A click on a link: it opens when the button goes up where it went
+	down. Moving away first makes it what it would have been without the
+	link, a selection or a press the program is told about.
+*/
+class TermView::LinkClickState : public TermView::State {
+public:
+								LinkClickState(TermView* view);
+
+			void				Prepare(BPoint where, int32 modifiers,
+									const TermLinkRange& link);
+
+	virtual	void				Exited();
+
+	virtual void				MouseMoved(BPoint where, uint32 transit,
+									const BMessage* message, int32 modifiers);
+	virtual void				MouseUp(BPoint where, int32 buttons);
+
+	virtual	void				WindowActivated(bool active);
+
+private:
+			void				_Abandon();
+
+private:
+			BPoint				fWhere;
+			bigtime_t			fWhen;
+			int32				fModifiers;
+			TermLinkRange		fLink;
 };
 
 

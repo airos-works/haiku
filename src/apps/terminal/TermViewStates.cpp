@@ -17,6 +17,7 @@
 
 #include "TermViewStates.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -58,12 +59,6 @@ static const uint32 kMessageOpenLink = 'OLnk';
 static const uint32 kMessageCopyLink = 'CLnk';
 static const uint32 kMessageCopyAbsolutePath = 'CAbs';
 static const uint32 kMessageMenuClosed = 'MClo';
-
-
-static const char* const kKnownURLProtocols = "http:https:ftp:mailto";
-
-// how many lines a link is followed over, at most
-static const int32 kMaxLinkLines = 64;
 
 
 static int32
@@ -306,6 +301,10 @@ TermView::DefaultState::MouseDown(BPoint where, int32 buttons, int32 modifiers)
 		fView->SetMouseEventMask(B_POINTER_EVENTS, B_NO_POINTER_HISTORY);
 	}
 
+	// a click on a link opens it, even in a program that wants the mouse
+	if (!gesture && _CheckLinkClick(where, buttons, modifiers))
+		return;
+
 	// with mouse reporting the program gets the clicks, unless shift is
 	// held to select text
 	if (fView->_ReportsMouse() && (modifiers & B_SHIFT_KEY) == 0) {
@@ -357,6 +356,11 @@ TermView::DefaultState::MouseMoved(BPoint where, uint32 transit,
 
 	if (_CheckEnterHyperLinkState(modifiers))
 		return;
+
+	if (transit == B_EXITED_VIEW || transit == B_OUTSIDE_VIEW)
+		fView->_ClearHoverLink();
+	else
+		fView->_UpdateHoverLink(where);
 
 	if (transit == B_EXITED_VIEW) {
 		// SGR pixel mouse reporting tells the program
@@ -410,6 +414,37 @@ TermView::DefaultState::_CheckEnterHyperLinkState(int32 modifiers)
 }
 
 
+/*!	A plain click (no modifier) on a link starts opening it. A double click
+	still selects (a word, then a line).
+*/
+bool
+TermView::DefaultState::_CheckLinkClick(BPoint where, int32 buttons,
+	int32 modifiers)
+{
+	if (buttons != B_PRIMARY_MOUSE_BUTTON
+		|| (modifiers & (B_SHIFT_KEY | B_COMMAND_KEY | B_CONTROL_KEY
+			| B_OPTION_KEY | B_MENU_KEY)) != 0
+		|| !fView->_ClicksOpenLinks()) {
+		return false;
+	}
+
+	int32 clicks = 1;
+	BMessage* message = fView->Window()->CurrentMessage();
+	if (message != NULL)
+		message->FindInt32("clicks", &clicks);
+	if (clicks > 1 && fView->_MouseDistanceSinceLastClick(where) <= 8)
+		return false;
+
+	TermLinkRange link;
+	if (!fView->_LinkAt(where, link))
+		return false;
+
+	fView->fLinkClickState->Prepare(where, modifiers, link);
+	fView->_NextState(fView->fLinkClickState);
+	return true;
+}
+
+
 // #pragma mark - SelectState
 
 
@@ -424,10 +459,14 @@ TermView::SelectState::SelectState(TermView* view)
 
 
 void
-TermView::SelectState::Prepare(BPoint where, int32 modifiers)
+TermView::SelectState::Prepare(BPoint where, int32 modifiers, int32 clicks)
 {
-	int32 clicks;
-	fView->Window()->CurrentMessage()->FindInt32("clicks", &clicks);
+	if (clicks < 0) {
+		clicks = 1;
+		BMessage* message = fView->Window()->CurrentMessage();
+		if (message != NULL)
+			message->FindInt32("clicks", &clicks);
+	}
 
 	if (fView->_HasSelection()) {
 		TermPoint inPos = fView->_ConvertToTerminal(where);
@@ -623,7 +662,6 @@ TermView::SelectState::_AutoScrollUpdate()
 TermView::HyperLinkState::HyperLinkState(TermView* view)
 	:
 	State(view),
-	fURLCharClassifier(kURLAdditionalWordCharacters),
 	fPathComponentCharClassifier(
 		BString(kDefaultAdditionalWordCharacters).RemoveFirst("/")),
 	fCurrentDirectory(),
@@ -635,6 +673,8 @@ TermView::HyperLinkState::HyperLinkState(TermView* view)
 void
 TermView::HyperLinkState::Entered()
 {
+	fView->_ClearHoverLink();
+
 	ActiveProcessInfo activeProcessInfo;
 	if (fView->GetActiveProcessInfo(activeProcessInfo))
 		fCurrentDirectory = activeProcessInfo.CurrentDirectory();
@@ -701,53 +741,28 @@ TermView::HyperLinkState::WindowActivated(bool active)
 
 bool
 TermView::HyperLinkState::_GetHyperLinkAt(BPoint where, bool pathPrefixOnly,
-	HyperLink& _link, TermPoint& _start, TermPoint& _end)
+	HyperLink& _link, TermPoint& _start, TermPoint& _end,
+	TermLinkRange* _range)
 {
 	Terminal* terminal = fView->fTerminal;
 	TermPoint pos = fView->_ConvertToTerminal(where);
 
-	// an OSC 8 link
-	terminal->Lock();
-	TerminalCell cell;
-	bool haveCell = terminal->GetCell(pos.y, pos.x, cell);
-	if (haveCell && cell.IsWideTail() && pos.x > 0)
-		haveCell = terminal->GetCell(pos.y, pos.x - 1, cell);
-	if (haveCell && cell.hyperlink != 0) {
-		std::string uri;
-		std::string identifier;
-		bool found = terminal->GetHyperLink(cell.hyperlink, uri, identifier);
-		terminal->Unlock();
-		if (!found)
-			return false;
-		_link = HyperLink(BString(uri.c_str()), cell.hyperlink,
-			BString(identifier.c_str()));
-		_GetLinkRange(pos, cell.hyperlink, _start, _end);
+	// an OSC 8 link or an address, see TerminalLinks.cpp
+	TermLinkRange range;
+	if (fView->_LinkAt(where, range)) {
+		if (range.hyperlink != 0) {
+			_link = HyperLink(BString(range.uri.c_str()), range.hyperlink,
+				BString(range.identifier.c_str()));
+		} else
+			_link = HyperLink(BString(range.uri.c_str()), HyperLink::TYPE_URL);
+		_start = range.start;
+		_end = range.end;
+		if (_range != NULL)
+			*_range = range;
 		return true;
 	}
-	terminal->Unlock();
 
-	// try to get a URL first
 	BString text;
-	if (!fView->_FindWord(pos, &fURLCharClassifier, false, _start, _end))
-		return false;
-
-	_ExtendURLOverLineBreaks(_start, _end);
-
-	text.Truncate(0);
-	fView->_GetText(_start, _end, text);
-	text.RemoveAll("\n");
-	text.Trim();
-
-	// We're only happy, if it has a protocol part which we know.
-	int32 colonIndex = text.FindFirst(':');
-	if (colonIndex >= 0) {
-		BString protocol(text, colonIndex);
-		if (strstr(kKnownURLProtocols, protocol) != NULL) {
-			_link = HyperLink(text, HyperLink::TYPE_URL);
-			return true;
-		}
-	}
-
 	// no obvious URL -- try file name
 	if (!fView->_FindWord(pos, fView->fCharClassifier, false, _start, _end))
 		return false;
@@ -890,110 +905,6 @@ TermView::HyperLinkState::_GetHyperLinkAt(BPoint where, bool pathPrefixOnly,
 }
 
 
-/*!	Returns the range of the cells around \a pos that carry the OSC 8
-	hyperlink \a link. A program that wraps the text of a link itself repeats
-	the link on each line, so the range continues over a line filled to the
-	right margin when the next one starts with the same link.
-*/
-void
-TermView::HyperLinkState::_GetLinkRange(const TermPoint& pos, uint32 link,
-	TermPoint& _start, TermPoint& _end) const
-{
-	int32 width = fView->fColumns;
-	int32 maxCells = width * kMaxLinkLines;
-
-	TermPoint start = pos;
-	for (int32 i = 0; i < maxCells; i++) {
-		TermPoint previous = start;
-		if (--previous.x < 0) {
-			previous.x = width - 1;
-			previous.y--;
-		}
-		if (!_CellHasLink(previous, link))
-			break;
-		start = previous;
-	}
-
-	TermPoint end = pos;
-	for (int32 i = 0; i < maxCells; i++) {
-		TermPoint next = end;
-		if (++next.x >= width) {
-			next.x = 0;
-			next.y++;
-		}
-		if (!_CellHasLink(next, link))
-			break;
-		end = next;
-	}
-
-	_start = start;
-	_end = TermPoint(end.x + 1, end.y);
-}
-
-
-bool
-TermView::HyperLinkState::_CellHasLink(const TermPoint& pos, uint32 link) const
-{
-	Terminal* terminal = fView->fTerminal;
-	terminal->Lock();
-	TerminalCell cell;
-	bool result = terminal->GetCell(pos.y, pos.x, cell)
-		&& cell.hyperlink == link;
-	terminal->Unlock();
-	return result;
-}
-
-
-/*!	Programs that lay out their screen themselves, Claude Code's sign-in for
-	one, break a long address into lines on their own, each filled to the
-	right margin and ended with a hard line break, where the terminal would
-	have wrapped it softly. So an address continues over a full line that
-	it ends, if the next line starts with address characters, and the same
-	backwards.
-*/
-void
-TermView::HyperLinkState::_ExtendURLOverLineBreaks(TermPoint& _start,
-	TermPoint& _end)
-{
-	Terminal* terminal = fView->fTerminal;
-	int32 width = fView->fColumns;
-
-	for (int32 i = 0; i < kMaxLinkLines && _start.x == 0; i++) {
-		int32 row = _start.y - 1;
-		terminal->Lock();
-		bool full = row >= -terminal->HistorySize()
-			&& terminal->LineLength(row) == width;
-		terminal->Unlock();
-		if (!full)
-			break;
-
-		TermPoint start;
-		TermPoint end;
-		if (!fView->_FindWord(TermPoint(width - 1, row), &fURLCharClassifier,
-				false, start, end)
-			|| end != TermPoint(width, row)) {
-			break;
-		}
-		_start = start;
-	}
-
-	for (int32 i = 0; i < kMaxLinkLines && _end.x == width; i++) {
-		int32 row = _end.y + 1;
-		if (row >= fView->fRows)
-			break;
-
-		TermPoint start;
-		TermPoint end;
-		if (!fView->_FindWord(TermPoint(0, row), &fURLCharClassifier, false,
-				start, end)
-			|| start != TermPoint(0, row)) {
-			break;
-		}
-		_end = end;
-	}
-}
-
-
 bool
 TermView::HyperLinkState::_EntryExists(const BString& path,
 	BString& _actualPath) const
@@ -1039,9 +950,13 @@ TermView::HyperLinkState::_UpdateHighlight(BPoint where, int32 modifiers)
 	HyperLink link;
 
 	bool pathPrefixOnly = (modifiers & B_SHIFT_KEY) != 0;
-	if (_GetHyperLinkAt(where, pathPrefixOnly, link, start, end))
-		_ActivateHighlight(start, end);
-	else
+	TermLinkRange range;
+	if (_GetHyperLinkAt(where, pathPrefixOnly, link, start, end, &range)) {
+		if (!range.segments.empty())
+			_ActivateHighlight(range);
+		else
+			_ActivateHighlight(start, end);
+	} else
 		_DeactivateHighlight();
 }
 
@@ -1060,6 +975,18 @@ TermView::HyperLinkState::_ActivateHighlight(const TermPoint& start,
 
 
 void
+TermView::HyperLinkState::_ActivateHighlight(const TermLinkRange& range)
+{
+	fView->_SetLinkHighlight(range);
+	if (!fHighlightActive) {
+		BCursor cursor(B_CURSOR_ID_FOLLOW_LINK);
+		fView->SetViewCursor(&cursor);
+		fHighlightActive = true;
+	}
+}
+
+
+void
 TermView::HyperLinkState::_DeactivateHighlight()
 {
 	if (fHighlightActive) {
@@ -1069,6 +996,101 @@ TermView::HyperLinkState::_DeactivateHighlight()
 			: B_CURSOR_ID_I_BEAM);
 		fView->SetViewCursor(&cursor);
 	}
+}
+
+
+// #pragma mark - LinkClickState
+
+
+TermView::LinkClickState::LinkClickState(TermView* view)
+	:
+	State(view),
+	fWhen(0),
+	fModifiers(0)
+{
+}
+
+
+void
+TermView::LinkClickState::Prepare(BPoint where, int32 modifiers,
+	const TermLinkRange& link)
+{
+	fWhere = where;
+	fWhen = system_time();
+	BMessage* message = fView->Window()->CurrentMessage();
+	if (message != NULL)
+		message->FindInt64("when", &fWhen);
+	fModifiers = modifiers;
+	fLink = link;
+
+	fView->SetMouseEventMask(B_POINTER_EVENTS, B_NO_POINTER_HISTORY);
+	fView->_SetLinkHighlight(link);
+}
+
+
+void
+TermView::LinkClickState::Exited()
+{
+	if (!fView->fHoverLink)
+		fView->_ClearLinkHighlight();
+}
+
+
+void
+TermView::LinkClickState::MouseMoved(BPoint where, uint32 transit,
+	const BMessage* message, int32 modifiers)
+{
+	if (fabs(where.x - fWhere.x) <= 4 && fabs(where.y - fWhere.y) <= 4)
+		return;
+
+	// a drag after all
+	_Abandon();
+	fView->fActiveState->MouseMoved(where, transit, message, modifiers);
+}
+
+
+void
+TermView::LinkClickState::MouseUp(BPoint where, int32 buttons)
+{
+	bool open = !fView->_IsActivatingClick(fWhen);
+	TermLinkRange link = fLink;
+	fView->_NextState(fView->fDefaultState);
+	if (!open)
+		return;
+
+	HyperLink hyperLink = link.hyperlink != 0
+		? HyperLink(BString(link.uri.c_str()), link.hyperlink,
+			BString(link.identifier.c_str()))
+		: HyperLink(BString(link.uri.c_str()), HyperLink::TYPE_URL);
+	hyperLink.Open();
+}
+
+
+void
+TermView::LinkClickState::WindowActivated(bool active)
+{
+	if (!active)
+		fView->_NextState(fView->fDefaultState);
+}
+
+
+/*!	What the press would have been without the link: the program is told
+	about it, or it starts a selection.
+*/
+void
+TermView::LinkClickState::_Abandon()
+{
+	if (fView->_ReportsMouse()) {
+		fView->_NextState(fView->fDefaultState);
+		fView->_SendMouseEvent(MOUSE_PRESS, MOUSE_BUTTON_LEFT, fWhere,
+			fModifiers);
+		fView->fReportedMouseButtons |= B_PRIMARY_MOUSE_BUTTON;
+		fView->fPrevPos = fView->_ConvertToTerminal(fWhere);
+		return;
+	}
+
+	fView->_NextState(fView->fSelectState);
+	fView->fSelectState->Prepare(fWhere, fModifiers, 1);
 }
 
 

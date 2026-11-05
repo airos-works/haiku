@@ -26,6 +26,7 @@ static const uint32 MSG_BLINK_CURSOR_CHANGED			= 'mbcc';
 static const uint32 MSG_ALLOW_BOLD_CHANGED				= 'mabc';
 static const uint32 MSG_USE_OPTION_AS_META_CHANGED		= 'momc';
 static const uint32 MSG_WARN_ON_EXIT_CHANGED			= 'mwec';
+static const uint32 MSG_OPEN_LINKS_ON_CLICK_CHANGED	= 'molc';
 static const uint32 MSG_COLS_CHANGED					= 'mccl';
 static const uint32 MSG_HISTORY_CHANGED					= 'mhst';
 // TODO MSG_ENCODING_CHANGED?
@@ -71,6 +72,7 @@ private:
 			BCheckBox*			fAllowBold;
 			BCheckBox*			fUseOptionAsMetaKey;
 			BCheckBox*			fWarnOnExit;
+			BCheckBox*			fOpenLinksOnClick;
 			BMenuField*			fFontField;
 
 			BMenuField*			fWindowSizeField;
