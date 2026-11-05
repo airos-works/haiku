@@ -70,6 +70,14 @@ public:
 		fLidAction = new BMenuField("lid action",
 			B_TRANSLATE("When the lid is closed:"), lidMenu);
 
+		fExternalAwake = new BCheckBox("external awake",
+			B_TRANSLATE("Keep working on external displays"),
+			new BMessage(kChanged));
+		fExternalAwake->SetToolTip(B_TRANSLATE("With the lid closed while "
+			"an external display is connected, the computer stays awake and "
+			"only its own display turns off. When the external displays go "
+			"away, the lid setting above applies."));
+
 		BPopUpMenu* deepMenu = new BPopUpMenu("deep sleep");
 		for (int32 i = 0; i < (int32)B_COUNT_OF(kDeepSleepMinutes); i++) {
 			int32 minutes = kDeepSleepMinutes[i];
@@ -114,7 +122,8 @@ public:
 			.SetInsets(B_USE_DEFAULT_SPACING, B_USE_BIG_SPACING,
 				B_USE_DEFAULT_SPACING, B_USE_DEFAULT_SPACING)
 			.AddMenuField(fLidAction, 0, 0)
-			.AddMenuField(fDeepSleep, 0, 1);
+			.Add(fExternalAwake, 1, 1)
+			.AddMenuField(fDeepSleep, 0, 2);
 
 		BLayoutBuilder::Group<>(this, B_VERTICAL, B_USE_DEFAULT_SPACING)
 			.SetInsets(B_USE_WINDOW_INSETS)
@@ -143,8 +152,10 @@ private:
 	void _UpdateDeepSleep()
 	{
 		// (only sleeping can get deeper)
-		fDeepSleep->SetEnabled(fLidAction->Menu()->IndexOf(
-			fLidAction->Menu()->FindMarked()) == 0);
+		int32 lid = fLidAction->Menu()->IndexOf(
+			fLidAction->Menu()->FindMarked());
+		fDeepSleep->SetEnabled(lid == 0);
+		fExternalAwake->SetEnabled(lid != 2);
 	}
 
 	static bool _SettingsPath(BPath& path)
@@ -160,6 +171,7 @@ private:
 		bool acSaving = false;
 		int32 brightness = 70;
 		const char* lid = "sleep";
+		bool externalAwake = true;
 		int32 deepSleep = kDefaultDeepSleepMinutes;
 
 		BPath path;
@@ -177,6 +189,10 @@ private:
 			value = get_driver_parameter(handle, "lid_closed", NULL, NULL);
 			if (value != NULL)
 				lid = value;
+			value = get_driver_parameter(handle, "lid_closed_external_display",
+				NULL, NULL);
+			if (value != NULL)
+				externalAwake = strcmp(value, "same") != 0;
 			value = get_driver_parameter(handle, "deep_sleep_minutes", NULL,
 				NULL);
 			if (value != NULL)
@@ -196,6 +212,7 @@ private:
 		BMenuItem* item = fLidAction->Menu()->ItemAt(index);
 		if (item != NULL)
 			item->SetMarked(true);
+		fExternalAwake->SetValue(externalAwake);
 
 		// the nearest choice
 		index = 0;
@@ -244,6 +261,8 @@ private:
 			<< "\npower_saving_on_ac "
 			<< (fACSaving->Value() == B_CONTROL_ON ? "true" : "false")
 			<< "\nlid_closed " << kLidActions[lid]
+			<< "\nlid_closed_external_display "
+			<< (fExternalAwake->Value() == B_CONTROL_ON ? "awake" : "same")
 			<< "\ndeep_sleep_minutes " << deepSleep << "\n";
 
 		BFile file(path.Path(), B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);
@@ -256,6 +275,7 @@ private:
 	BSlider* fBatteryBrightness;
 	BCheckBox* fACSaving;
 	BMenuField* fLidAction;
+	BCheckBox* fExternalAwake;
 	BMenuField* fDeepSleep;
 };
 

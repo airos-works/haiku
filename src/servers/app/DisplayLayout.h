@@ -56,6 +56,11 @@ struct DisplayInfo {
 									// kNotMirrored. A mirror has its
 									// source's frame; its scale fits that
 									// frame to its own mode.
+	bool			lidClosed;		// a built-in panel behind the closed
+									// lid, left out of the desktop like an
+									// unplugged monitor (it is not
+									// connected) while another monitor
+									// shows the desktop
 
 	bool			IsConnected() const
 						{ return (flags & B_DISPLAY_OUTPUT_CONNECTED) != 0; }
@@ -63,6 +68,8 @@ struct DisplayInfo {
 						{ return (flags & B_DISPLAY_OUTPUT_ENABLED) != 0; }
 	bool			IsMirror() const
 						{ return mirrorOf != kNotMirrored; }
+	bool			IsInternal() const
+						{ return (flags & B_DISPLAY_OUTPUT_INTERNAL) != 0; }
 	float			RefreshRate() const;
 	float			NativeRefreshRate() const;
 	float			DPI() const;
@@ -83,6 +90,17 @@ public:
 
 			// what the hardware has
 			status_t			ReadOutputs(HWInterface* interface);
+			void				SetLidClosed(bool closed)
+									{ fLidClosed = closed; }
+			bool				LidClosed() const { return fLidClosed; }
+									// with the lid closed, the next
+									// ReadOutputs() leaves the built-in
+									// panels out while another monitor is
+									// connected (clamshell mode)
+			bool				HasClosedPanel() const;
+			bool				IsRemembered(const BMessage& saved) const;
+									// whether the settings know every
+									// connected display
 			void				SetSingle(BRect frame, uint16 scale,
 									const monitor_info* info,
 									const display_timing* timing = NULL);
@@ -154,6 +172,7 @@ private:
 
 			std::vector<DisplayInfo> fDisplays;
 			uint16				fRenderScaleOverride;
+			bool				fLidClosed;
 };
 
 

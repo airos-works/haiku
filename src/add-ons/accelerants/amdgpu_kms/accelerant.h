@@ -32,6 +32,7 @@ struct Output {
 	uint32				connector;		// DRM connector, also the output's ID
 	char				name[B_DISPLAY_OUTPUT_NAME_LENGTH];
 	bool				connected;
+	bool				internal;		// a laptop's own panel
 	uint32				possibleCrtcs;	// mask of CRTC indices
 	uint32				widthMM;
 	uint32				heightMM;

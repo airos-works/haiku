@@ -32,6 +32,11 @@ public:
 			bool				JustWokeUp();
 				// a power button press right after sleeping woke the machine
 
+			bigtime_t			PollInterval();
+			void				Poll();
+				// while the lid is closed on external displays, the daemon
+				// looks this often whether they are still there
+
 	static	const char*			SettingsPath();
 
 private:
@@ -56,6 +61,10 @@ private:
 
 			void				_ApplyProfile();
 			bool				_InitGUI();
+			void				_TellDisplays(bool lidClosed);
+			bool				_HasExternalDisplay();
+			void				_LidClosed(lid_action action,
+									bool clamshell);
 			sleep_result		_Sleep(bool deep, bigtime_t timeout);
 			bool				_WaitForLidOpen(bigtime_t timeout);
 			void				_TakeDownWiredInterfaces(
@@ -84,6 +93,15 @@ private:
 				// with the lid closed this long, the machine sleeps deeper:
 				// the devices that take longer to come back (wireless, the
 				// GPU) sleep, too; 0 never
+			bool				fClamshell;
+				// with the lid closed while an external display shows the
+				// desktop, the machine stays awake (its own panel is off)
+
+			bool				fInClamshell;
+				// the lid is closed and the machine is awake for the
+				// external displays
+			bool				fSawExternal;
+			bigtime_t			fNoExternalSince;
 
 			float				fACBrightness;
 				// what it was on AC, restored when plugged in again

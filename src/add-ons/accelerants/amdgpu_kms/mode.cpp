@@ -154,6 +154,9 @@ probe_outputs(void)
 		snprintf(output.name, sizeof(output.name), "%s-%" B_PRIu32,
 			Kms::ConnectorTypeName(connector->type), connector->typeId);
 		output.connected = connector->connected && connector->modeCount > 0;
+		output.internal = connector->type == DRM_MODE_CONNECTOR_eDP
+			|| connector->type == DRM_MODE_CONNECTOR_LVDS
+			|| connector->type == DRM_MODE_CONNECTOR_DSI;
 		output.widthMM = connector->widthMM;
 		output.heightMM = connector->heightMM;
 		for (uint32 e = 0; e < connector->encoderCount; e++) {

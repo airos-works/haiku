@@ -20,6 +20,8 @@
 #include <Autolock.h>
 #include <driver_settings.h>
 #include <FindDirectory.h>
+#include <InterfacePrivate.h>
+#include <Message.h>
 #include <NetworkInterface.h>
 #include <NetworkRoster.h>
 #include <Path.h>
@@ -37,6 +39,11 @@ extern "C" status_t _kern_generic_syscall(const char* subsystem,
 
 static const char* kSettingsName = "system/power";
 
+// how long a closed laptop stays awake after its last external display went
+// away (a dock that reconnects drops its monitors for a moment)
+static const bigtime_t kNoExternalGrace = 10000000;
+static const bigtime_t kClamshellPollInterval = 2000000;
+
 
 PowerPolicy::PowerPolicy(BServer* server)
 	:
@@ -52,6 +59,10 @@ PowerPolicy::PowerPolicy(BServer* server)
 	fLidAction(kLidSleep),
 	fSleepCheck(0),
 	fDeepSleepMinutes(30),
+	fClamshell(true),
+	fInClamshell(false),
+	fSawExternal(false),
+	fNoExternalSince(0),
 	fACBrightness(-1),
 	fWokeUp(0)
 {
@@ -74,8 +85,10 @@ PowerPolicy::SettingsPath()
 
 /*!	The settings file has lines like "power_saving_on_battery true",
 	"battery_brightness 70", "lid_closed sleep" (or "display_off",
-	"nothing"), "deep_sleep_minutes 30" and "sleep_check_seconds 0". A
-	changed file applies to the current power source at once.
+	"nothing"), "lid_closed_external_display awake" (or "same": the lid
+	action applies with external displays, too), "deep_sleep_minutes 30"
+	and "sleep_check_seconds 0". A changed file applies to the current power
+	source at once.
 */
 void
 PowerPolicy::LoadSettings()
@@ -104,6 +117,11 @@ PowerPolicy::LoadSettings()
 			else
 				fLidAction = kLidSleep;
 		}
+
+		value = get_driver_parameter(handle, "lid_closed_external_display",
+			NULL, NULL);
+		if (value != NULL)
+			fClamshell = strcmp(value, "same") != 0;
 
 		value = get_driver_parameter(handle, "sleep_check_seconds", NULL,
 			NULL);
@@ -164,6 +182,7 @@ void
 PowerPolicy::SetLidOpen(bool open)
 {
 	lid_action action;
+	bool clamshell;
 	{
 		BAutolock _(fLock);
 		bool firstTime = !fKnowLid;
@@ -172,25 +191,60 @@ PowerPolicy::SetLidOpen(bool open)
 			return;
 		fLidClosed = !open;
 		action = fLidAction;
+		clamshell = fClamshell;
 
 		// Only closing it does something: a machine that starts with its
-		// lid closed (on an external display) stays awake.
+		// lid closed (on an external display) stays awake. (app_server
+		// looks at the lid itself when it starts, and leaves the built-in
+		// panel off.) Should its external displays go away, it sleeps.
 		if (firstTime) {
 			printf("power_daemon: lid closed at start\n");
+			fInClamshell = clamshell && action != kLidNothing;
+			fSawExternal = false;
+			fNoExternalSince = 0;
 			return;
 		}
+		fInClamshell = false;
 	}
 	printf("power_daemon: lid %s\n", open ? "opened" : "closed");
 
-	if (action == kLidNothing || !_InitGUI())
+	if (!_InitGUI())
 		return;
 
-	BScreen screen;
 	if (open) {
-		screen.SetDPMS(B_DPMS_ON);
+		_TellDisplays(false);
+		BScreen().SetDPMS(B_DPMS_ON);
 		return;
 	}
 
+	// app_server turns the built-in panel off when another display shows
+	// the desktop (clamshell mode), whatever the lid action.
+	_TellDisplays(true);
+	if (action == kLidNothing)
+		return;
+
+	_LidClosed(action, clamshell);
+}
+
+
+/*!	The lid was closed: with an external display on (and clamshell mode not
+	turned off), the machine stays awake for it; otherwise the display goes
+	off and, if so set, the machine goes to sleep until the lid is opened.
+*/
+void
+PowerPolicy::_LidClosed(lid_action action, bool clamshell)
+{
+	if (clamshell && _HasExternalDisplay()) {
+		printf("power_daemon: lid closed on an external display, staying "
+			"awake\n");
+		BAutolock _(fLock);
+		fInClamshell = fLidClosed;
+		fSawExternal = true;
+		fNoExternalSince = 0;
+		return;
+	}
+
+	BScreen screen;
 	screen.SetDPMS(B_DPMS_OFF);
 	if (action != kLidSleep)
 		return;
@@ -213,7 +267,7 @@ PowerPolicy::SetLidOpen(bool open)
 	}
 
 	// A power button press wakes the machine, too: sleep again until the
-	// lid is opened.
+	// lid is opened, or until it is on an external display.
 	bool deep = false;
 	while (true) {
 		bigtime_t timeout = 0;
@@ -239,13 +293,83 @@ PowerPolicy::SetLidOpen(bool open)
 				BAutolock _(fLock);
 				fLidClosed = false;
 			}
+			_TellDisplays(false);
 			screen.SetDPMS(B_DPMS_ON);
 			printf("power_daemon: lid opened\n");
+			break;
+		}
+
+		// Woken with the lid closed, say by the power button after a dock
+		// was plugged in: its displays keep the machine awake.
+		if (clamshell && _HasExternalDisplay()) {
+			screen.SetDPMS(B_DPMS_ON);
+			printf("power_daemon: woke up on an external display, staying "
+				"awake\n");
+			BAutolock _(fLock);
+			fInClamshell = fLidClosed;
+			fSawExternal = true;
+			fNoExternalSince = 0;
 			break;
 		}
 	}
 
 	_BringUpInterfaces(interfaces);
+}
+
+
+bigtime_t
+PowerPolicy::PollInterval()
+{
+	BAutolock _(fLock);
+	return fInClamshell ? kClamshellPollInterval : B_INFINITE_TIMEOUT;
+}
+
+
+/*!	While the lid is closed on external displays: once the last of them has
+	been gone for a while (unplugged, or the dock was), the lid action
+	applies as if the lid had been closed just now.
+*/
+void
+PowerPolicy::Poll()
+{
+	lid_action action;
+	{
+		BAutolock _(fLock);
+		if (!fInClamshell || !fLidClosed)
+			return;
+		action = fLidAction;
+	}
+	if (!_InitGUI())
+		return;
+
+	bool external = _HasExternalDisplay();
+	{
+		BAutolock _(fLock);
+		if (!fInClamshell || !fLidClosed)
+			return;
+		if (external) {
+			if (!fSawExternal || fNoExternalSince != 0)
+				printf("power_daemon: on an external display\n");
+			fSawExternal = true;
+			fNoExternalSince = 0;
+			return;
+		}
+		// (started closed and no display seen yet: app_server may still
+		// be coming up, or the lid switch is wrong; nothing to do)
+		if (!fSawExternal)
+			return;
+		if (fNoExternalSince == 0) {
+			printf("power_daemon: no external display with the lid "
+				"closed\n");
+			fNoExternalSince = system_time();
+			return;
+		}
+		if (system_time() - fNoExternalSince < kNoExternalGrace)
+			return;
+		fInClamshell = false;
+	}
+
+	_LidClosed(action, true);
 }
 
 
@@ -272,6 +396,44 @@ bool
 PowerPolicy::_InitGUI()
 {
 	return fServer->InitGUIContext() == B_OK;
+}
+
+
+/*!	Tells app_server whether the lid is closed: it then leaves the built-in
+	panel out of the desktop as long as another display shows it. */
+void
+PowerPolicy::_TellDisplays(bool lidClosed)
+{
+	BMessage request;
+	request.AddBool("lid closed", lidClosed);
+	status_t status = BPrivate::set_display_layout(request);
+	if (status != B_OK) {
+		printf("power_daemon: telling app_server about the lid failed: %s\n",
+			strerror(status));
+	}
+}
+
+
+/*!	Whether a display other than the built-in panel shows the desktop. On
+	hardware that cannot tell its displays apart, there is no telling: no.
+*/
+bool
+PowerPolicy::_HasExternalDisplay()
+{
+	BMessage layout;
+	if (BPrivate::get_display_layout(layout) != B_OK
+		|| !layout.GetBool("has layout", false))
+		return false;
+
+	BMessage display;
+	for (int32 i = 0; layout.FindMessage("display", i, &display) == B_OK;
+			i++) {
+		if (display.GetBool("connected", false)
+			&& display.GetBool("enabled", false)
+			&& !display.GetBool("internal", false))
+			return true;
+	}
+	return false;
 }
 
 

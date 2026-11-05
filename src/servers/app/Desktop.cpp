@@ -22,11 +22,13 @@
 #include "Desktop.h"
 
 #include <algorithm>
+#include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
 #include <vector>
 #include <string.h>
 #include <syslog.h>
+#include <unistd.h>
 
 #include <Debug.h>
 #include <debugger.h>
@@ -69,6 +71,22 @@
 #if TEST_MODE
 #	include "EventStream.h"
 #endif
+
+
+/*!	Whether the laptop's lid is closed right now. power_daemon reports the
+	changes (see SetLidClosed()); this is for the start, so that a laptop
+	booted closed on a dock does not light its panel first. */
+static bool
+lid_is_closed()
+{
+	int fd = open("/dev/power/acpi_lid/0", O_RDONLY);
+	if (fd < 0)
+		return false;
+	uint8 status = 1;
+	bool closed = read(fd, &status, 1) == 1 && status == 0;
+	close(fd);
+	return closed;
+}
 
 
 //#define DEBUG_DESKTOP
@@ -524,6 +542,7 @@ Desktop::Init()
 		if (screen != NULL && screen->HWInterface() != NULL
 			&& screen->HWInterface()->HasDisplayLayout()) {
 			AutoWriteLocker screenLocker(fScreenLock);
+			fDisplays.SetLidClosed(lid_is_closed());
 			_ConfigureDisplayLayout(screen->HWInterface(), false);
 		}
 	}
@@ -3941,7 +3960,6 @@ Desktop::_ScreenChanged(Screen* screen)
 
 // #pragma mark - display layout
 
-
 /*!	Reads the monitors from the hardware, puts each where the settings say
 	(or where a new one goes), and hands the arrangement to the accelerant.
 	The screen lock must be held for writing.
@@ -4394,6 +4412,7 @@ Desktop::GetDisplayLayout(BMessage& layout)
 
 	layout.AddRect("screen frame", fVirtualScreen.Frame());
 	layout.AddBool("has layout", interface->HasDisplayLayout());
+	layout.AddBool("lid closed", fDisplays.LidClosed());
 	layout.AddBool("zoom to display", fSettings->ZoomToDisplay());
 	return B_OK;
 }
@@ -4401,10 +4420,18 @@ Desktop::GetDisplayLayout(BMessage& layout)
 
 /*!	Applies an arrangement a client asks for, see DisplayLayout::ApplyRequest
 	for the message. It is remembered for the monitors involved.
+	A request with a "lid closed" bool instead comes from power_daemon when
+	the lid is closed or opened, see SetLidClosed().
 */
 status_t
 Desktop::SetDisplayLayout(const BMessage& request)
 {
+	bool lidClosed;
+	if (request.FindBool("lid closed", &lidClosed) == B_OK) {
+		SetLidClosed(lidClosed);
+		return B_OK;
+	}
+
 	AutoWriteLocker _(fWindowLock);
 
 	Screen* screen = fVirtualScreen.ScreenAt(0);
@@ -4455,6 +4482,50 @@ Desktop::SetDisplayLayout(const BMessage& request)
 
 	_ResumeDirectFrameBufferAccess();
 	return status;
+}
+
+
+/*!	Clamshell mode: while the lid is closed, the built-in panel is turned off
+	and left out of the desktop as long as another monitor shows it; its
+	windows go to the other monitors and come back when the lid is opened.
+	Without another monitor nothing changes (the machine goes to sleep, or
+	the panel is turned off, as the power settings say).
+*/
+void
+Desktop::SetLidClosed(bool closed)
+{
+	Screen* screen;
+	bool changed;
+	{
+		AutoWriteLocker screenLocker(fScreenLock);
+		if (fDisplays.LidClosed() == closed)
+			return;
+		screen = fVirtualScreen.ScreenAt(0);
+		if (screen == NULL || screen->HWInterface() == NULL
+			|| !screen->HWInterface()->HasDisplayLayout()) {
+			fDisplays.SetLidClosed(closed);
+			return;
+		}
+
+		// Only rearrange when it leaves a panel out, or brings one back.
+		DisplayLayout probe = fDisplays;
+		probe.SetLidClosed(closed);
+		changed = probe.ReadOutputs(screen->HWInterface()) == B_OK
+			&& probe.HasClosedPanel() != fDisplays.HasClosedPanel();
+
+		// The panel comes back to the place it has now when the lid is
+		// opened, also when the arrangement was never saved.
+		if (changed && closed
+			&& !fDisplays.IsRemembered(*fSettings->DisplaysMessage()))
+			_StoreDisplayLayout();
+		fDisplays.SetLidClosed(closed);
+	}
+
+	syslog(LOG_INFO, "app_server: lid %s%s\n", closed ? "closed" : "opened",
+		changed ? (closed ? ", built-in display off" : ", built-in display on")
+			: "");
+	if (changed)
+		ScreenChanged(screen);
 }
 
 

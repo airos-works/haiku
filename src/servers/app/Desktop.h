@@ -135,6 +135,7 @@ public:
 	// the monitors making up the screen
 			status_t			GetDisplayLayout(BMessage& layout);
 			status_t			SetDisplayLayout(const BMessage& request);
+			void				SetLidClosed(bool closed);
 			BRect				DisplayFrameFor(BRect frame, bool forZoom);
 			const DisplayLayout& Displays() const { return fDisplays; }
 									// the screen lock must be held

@@ -49,6 +49,16 @@ strip(BString& string)
 }
 
 
+/*!	Whether a connector is a laptop's own panel, for accelerants that do not
+	say so with B_DISPLAY_OUTPUT_INTERNAL. */
+static bool
+is_internal_connector(const BString& name)
+{
+	return name.StartsWith("eDP") || name.StartsWith("LVDS")
+		|| name.StartsWith("DSI");
+}
+
+
 // #pragma mark - DisplayInfo
 
 
@@ -80,7 +90,8 @@ DisplayInfo::DPI() const
 
 DisplayLayout::DisplayLayout()
 	:
-	fRenderScaleOverride(0)
+	fRenderScaleOverride(0),
+	fLidClosed(false)
 {
 }
 
@@ -140,6 +151,9 @@ DisplayLayout::ReadOutputs(HWInterface* interface)
 		display.hasEDID = false;
 		display.pinned = false;
 		display.mirrorOf = kNotMirrored;
+		display.lidClosed = false;
+		if (is_internal_connector(display.name))
+			display.flags |= B_DISPLAY_OUTPUT_INTERNAL;
 
 		if (output.edid_length >= sizeof(edid1_raw)) {
 			edid1_info edid;
@@ -187,6 +201,27 @@ DisplayLayout::ReadOutputs(HWInterface* interface)
 			}
 		}
 		fDisplays.push_back(display);
+	}
+
+	// Clamshell mode: with the lid closed, a built-in panel is left out like
+	// an unplugged monitor as long as another monitor can show the desktop.
+	// It is driven no more, windows move off it and come back when the lid
+	// is opened, and what the settings remember about it stays as it was.
+	if (fLidClosed) {
+		bool external = false;
+		for (size_t i = 0; i < fDisplays.size(); i++) {
+			external |= fDisplays[i].IsConnected()
+				&& !fDisplays[i].IsInternal();
+		}
+		for (size_t i = 0; external && i < fDisplays.size(); i++) {
+			DisplayInfo& display = fDisplays[i];
+			if (!display.IsConnected() || !display.IsInternal())
+				continue;
+			display.flags &= ~(B_DISPLAY_OUTPUT_CONNECTED
+				| B_DISPLAY_OUTPUT_ENABLED);
+			display.primary = false;
+			display.lidClosed = true;
+		}
 	}
 
 	// A mirror shows the region of the output that starts where its own
@@ -247,6 +282,7 @@ DisplayLayout::SetSingle(BRect frame, uint16 scale, const monitor_info* info,
 	display.hasEDID = info != NULL;
 	display.pinned = false;
 	display.mirrorOf = kNotMirrored;
+	display.lidClosed = false;
 	memset(&display.native, 0, sizeof(display.native));
 	memset(&display.timing, 0, sizeof(display.timing));
 	display.native.h_display = display.timing.h_display
@@ -645,11 +681,17 @@ DisplayLayout::GetConfigs(std::vector<display_output_config>& configs) const
 	uint16 renderScale = RenderScale();
 	for (size_t i = 0; i < fDisplays.size(); i++) {
 		const DisplayInfo& display = fDisplays[i];
-		if (!display.IsConnected())
+		if (!display.IsConnected() && !display.lidClosed)
 			continue;
 		display_output_config config;
 		memset(&config, 0, sizeof(config));
 		config.id = display.id;
+		if (display.lidClosed) {
+			// turned off explicitly: some accelerants leave the outputs a
+			// layout does not mention as they are
+			configs.push_back(config);
+			continue;
+		}
 		config.flags = display.IsEnabled() ? B_DISPLAY_OUTPUT_ENABLED : 0;
 		if (display.IsEnabled() && display.IsMirror())
 			config.flags |= B_DISPLAY_OUTPUT_MIRROR;
@@ -676,17 +718,50 @@ DisplayLayout::Store(BMessage& saved) const
 	saved.MakeEmpty();
 	saved.what = 'asdp';
 
+	// With the built-in panel left out behind a closed lid, the monitors
+	// are arranged without it for the time being: the places and the main
+	// display remembered for the whole arrangement stay, so that the panel
+	// comes back where it was when the lid is opened.
+	bool closedPanel = HasClosedPanel();
+	bool closedPanelWasPrimary = false;
+	BMessage entry;
+	for (int32 i = 0; closedPanel
+			&& previous.FindMessage("display", i, &entry) == B_OK; i++) {
+		for (size_t j = 0; j < fDisplays.size(); j++) {
+			if (fDisplays[j].lidClosed
+				&& fDisplays[j].key == entry.GetString("key", "")
+				&& fDisplays[j].name == entry.GetString("connector", "")
+				&& entry.GetBool("primary", false))
+				closedPanelWasPrimary = true;
+		}
+	}
+
 	for (size_t i = 0; i < fDisplays.size(); i++) {
 		const DisplayInfo& display = fDisplays[i];
 		if (!display.IsConnected())
 			continue;
+		int32 x = (int32)display.frame.left;
+		int32 y = (int32)display.frame.top;
+		bool primary = display.primary;
+		BMessage before;
+		for (int32 j = 0; closedPanel
+				&& previous.FindMessage("display", j, &before) == B_OK; j++) {
+			if (display.key == before.GetString("key", "")
+				&& display.name == before.GetString("connector", "")) {
+				x = before.GetInt32("x", x);
+				y = before.GetInt32("y", y);
+				if (closedPanelWasPrimary)
+					primary = false;
+				break;
+			}
+		}
 		BMessage entry;
 		entry.AddString("key", display.key);
 		entry.AddString("connector", display.name);
 		entry.AddBool("enabled", display.IsEnabled());
-		entry.AddBool("primary", display.primary);
-		entry.AddInt32("x", (int32)display.frame.left);
-		entry.AddInt32("y", (int32)display.frame.top);
+		entry.AddBool("primary", primary);
+		entry.AddInt32("x", x);
+		entry.AddInt32("y", y);
 		entry.AddInt32("scale", display.scale);
 		entry.AddInt32("width", display.timing.h_display);
 		entry.AddInt32("height", display.timing.v_display);
@@ -700,7 +775,6 @@ DisplayLayout::Store(BMessage& saved) const
 		saved.AddMessage("display", &entry);
 	}
 
-	BMessage entry;
 	for (int32 i = 0; previous.FindMessage("display", i, &entry) == B_OK;
 			i++) {
 		const char* key;
@@ -710,14 +784,16 @@ DisplayLayout::Store(BMessage& saved) const
 		if (entry.FindString("connector", &connector) != B_OK)
 			connector = "";
 		bool present = false;
+		bool isClosedPanel = false;
 		for (size_t j = 0; j < fDisplays.size(); j++) {
-			if (fDisplays[j].IsConnected() && fDisplays[j].key == key
-				&& fDisplays[j].name == connector)
-				present = true;
+			if (fDisplays[j].key != key || fDisplays[j].name != connector)
+				continue;
+			present |= fDisplays[j].IsConnected();
+			isClosedPanel |= fDisplays[j].lidClosed;
 		}
 		if (present)
 			continue;
-		if (PrimaryDisplay() != NULL)
+		if (PrimaryDisplay() != NULL && !isClosedPanel)
 			entry.SetBool("primary", false);
 		saved.AddMessage("display", &entry);
 	}
@@ -749,6 +825,8 @@ DisplayLayout::Archive(BMessage& into, HWInterface* interface) const
 		entry.AddInt32("flags", display.flags);
 		entry.AddBool("connected", display.IsConnected());
 		entry.AddBool("enabled", display.IsEnabled());
+		entry.AddBool("internal", display.IsInternal());
+		entry.AddBool("lid closed", display.lidClosed);
 		entry.AddBool("primary", display.primary);
 		entry.AddInt32("mirror", display.IsMirror()
 			? (int32)display.mirrorOf : -1);
@@ -1056,6 +1134,30 @@ DisplayLayout::SavedScale(const BMessage& saved) const
 		&& found.FindInt32("scale", &scale) == B_OK && IsValidScale(scale))
 		return scale;
 	return DefaultScale(display);
+}
+
+
+bool
+DisplayLayout::HasClosedPanel() const
+{
+	for (size_t i = 0; i < fDisplays.size(); i++) {
+		if (fDisplays[i].lidClosed)
+			return true;
+	}
+	return false;
+}
+
+
+bool
+DisplayLayout::IsRemembered(const BMessage& saved) const
+{
+	BMessage found;
+	for (size_t i = 0; i < fDisplays.size(); i++) {
+		if (fDisplays[i].IsConnected()
+			&& _FindSaved(saved, fDisplays[i], found) == NULL)
+			return false;
+	}
+	return true;
 }
 
 
