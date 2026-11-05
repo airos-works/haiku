@@ -56,6 +56,9 @@ public:
 
 			status_t			GetBitmap(BBitmap** bitmap, bool drawCursor,
 									BRect* bounds);
+			status_t			ReadWindowBitmap(int32 windowToken,
+									BBitmap* bitmap, bigtime_t timeout,
+									bool* _drawn);
 			status_t			ReadBitmap(BBitmap* bitmap, bool drawCursor,
 									BRect* bounds);
 

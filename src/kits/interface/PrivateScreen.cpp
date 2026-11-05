@@ -390,6 +390,31 @@ BPrivateScreen::ReadBitmap(BBitmap* bitmap, bool drawCursor, BRect* bounds)
 }
 
 
+status_t
+BPrivateScreen::ReadWindowBitmap(int32 windowToken, BBitmap* bitmap,
+	bigtime_t timeout, bool* _drawn)
+{
+	if (_drawn != NULL)
+		*_drawn = false;
+	if (bitmap == NULL)
+		return B_BAD_VALUE;
+
+	BPrivate::AppServerLink link;
+	link.StartMessage(AS_READ_WINDOW_BITMAP);
+	link.Attach<int32>(windowToken);
+	link.Attach<int32>(bitmap->_ServerToken());
+	link.Attach<bigtime_t>(timeout);
+
+	status_t status = B_ERROR;
+	if (link.FlushWithReply(status) < B_OK)
+		return B_ERROR;
+	bool drawn = false;
+	if (status == B_OK && link.Read<bool>(&drawn) == B_OK && _drawn != NULL)
+		*_drawn = drawn;
+	return status;
+}
+
+
 rgb_color
 BPrivateScreen::DesktopColor(uint32 workspace)
 {

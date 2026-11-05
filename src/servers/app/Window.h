@@ -95,6 +95,7 @@ class ClientLooper;
 class Decorator;
 class Desktop;
 class DrawingEngine;
+class ServerBitmap;
 class EventDispatcher;
 class Screen;
 class WindowBehaviour;
@@ -102,6 +103,24 @@ class WorkspacesView;
 
 // TODO: move this into a proper place
 #define AS_REDRAW 'rdrw'
+
+
+class BitmapHWInterface;
+class UtilityBitmap;
+
+
+// A capture of a window's whole content another thread waits for
+// (Desktop::ReadWindowBitmap()): screen sharing of one window, parts other
+// windows cover included.
+class WindowCaptureRequest : public BReferenceable {
+public:
+								WindowCaptureRequest(ServerBitmap* target);
+	virtual						~WindowCaptureRequest();
+
+			BReference<ServerBitmap> target;
+			sem_id				done;
+			status_t			result;
+};
 
 
 class Window {
@@ -194,7 +213,19 @@ public:
 									{ return fUpdateRequested; }
 
 			DrawingEngine*		GetDrawingEngine() const
-									{ return fDrawingEngine.Get(); }
+									{ return fCaptureSession
+										? fCaptureEngine.Get()
+										: fDrawingEngine.Get(); }
+
+			// Whole-content captures (screen sharing of a covered window):
+			// QueueCapture() with the desktop write lock held, then
+			// StartCapture() in the window thread (AS_CAPTURE_WINDOW_CONTENT)
+			// asks the client for an update of the whole content, which is
+			// drawn into fCaptureBitmap; EndUpdate() hands the content over
+			// and asks the client to draw the visible part on screen again.
+			status_t			QueueCapture(WindowCaptureRequest* request);
+			void				CancelCapture(WindowCaptureRequest* request);
+			void				StartCapture();
 
 			// managing a region pool
 			::RegionPool*		RegionPool()
@@ -368,6 +399,13 @@ public:
 
 			int32				PositionInStack() const;
 			bool				MoveToTopStackLayer();
+
+			// Another application reading the window (screen sharing):
+			// counted, by team, and shown on the tab. Desktop write lock held.
+			void				SetCaptured(bool captured, team_id team);
+			void				ClearCaptures(team_id team);
+			bool				IsCaptured() const
+									{ return fCaptureCount > 0; }
 			bool				MoveToStackPosition(int32 index,
 									bool isMoving);
 protected:
@@ -507,8 +545,23 @@ protected:
 
 private:
 			WindowStack*		_InitWindowStack();
+			void				_UpdateCaptureTab();
 
 			BReference<WindowStack>		fCurrentStack;
+
+			int32				fCaptureCount;
+			team_id				fCaptureTeam;
+
+			void				_FinishCapture(const BRegion& drawn);
+			void				_FreeCaptureEngine();
+			BRegion&			_DrawableContentRegion();
+
+			BReference<WindowCaptureRequest> fCaptureRequest;
+			bool				fCaptureSessionPending;
+			bool				fCaptureSession;
+			BReference<UtilityBitmap> fCaptureBitmap;
+			ObjectDeleter<BitmapHWInterface> fCaptureHWInterface;
+			ObjectDeleter<DrawingEngine> fCaptureEngine;
 };
 
 

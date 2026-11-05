@@ -12,6 +12,9 @@
 #include <SupportDefs.h>
 
 
+class BBitmap;
+
+
 struct window_info {
 	team_id		team;
 	int32		server_token;
@@ -58,6 +61,17 @@ void do_minimize_team(BRect zoomRect, team_id app, bool zoom);
 namespace BPrivate {
 
 status_t get_application_order(int32 workspace, team_id** _apps, int32* _count);
+
+// The content of the window with the server token, as the window draws it,
+// the parts other windows cover included (screen sharing of one window).
+// When other windows cover some of it, the window draws its content into the
+// bitmap (B_RGB32, the size of the window's frame) and *_drawn is true. When
+// none is covered, or the window draws straight into the frame buffer, the
+// bitmap is left alone and *_drawn is false: read the screen instead.
+// B_TIMED_OUT when the window did not draw within the timeout, B_BUSY when
+// it is hidden or minimized or already being captured.
+status_t read_window_bitmap(int32 serverToken, BBitmap* bitmap,
+	bigtime_t timeout, bool* _drawn);
 status_t get_window_order(int32 workspace, int32** _tokens, int32* _count);
 
 }	// namespace BPrivate

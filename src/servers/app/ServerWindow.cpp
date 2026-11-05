@@ -1048,6 +1048,12 @@ ServerWindow::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 			// at the fRedrawRequested member variable in _MessageLooper().
 			break;
 
+		case AS_CAPTURE_WINDOW_CONTENT:
+			// another application waits for the whole content
+			// (Desktop::ReadWindowBitmap())
+			fWindow->StartCapture();
+			break;
+
 		case AS_SYNC:
 			DTRACE(("ServerWindow %s: Message AS_SYNC\n", Title()));
 			// the synchronisation works by the fact that the client

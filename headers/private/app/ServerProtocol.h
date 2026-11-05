@@ -395,6 +395,13 @@ enum {
 	// palette of UI colors, see set_ui_dark_mode()
 	AS_SET_DARK_MODE,
 
+	// A window's content as the window draws it, parts other windows cover
+	// included: screen sharing of a single window (read_window_bitmap())
+	AS_READ_WINDOW_BITMAP,
+	// app_server internal: to a ServerWindow, a capture of its window's
+	// content is waiting (Window::StartCapture())
+	AS_CAPTURE_WINDOW_CONTENT,
+
 	AS_LAST_CODE
 };
 

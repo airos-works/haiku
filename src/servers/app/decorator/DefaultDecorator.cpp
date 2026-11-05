@@ -232,6 +232,32 @@ DefaultDecorator::GetComponentColors(Component component, uint8 highlight,
 			}
 			break;
 	}
+
+	// A window another application is capturing (shared in a video call):
+	// its tab and buttons are green instead of the tab color, active or not,
+	// so everyone can see what is being shared.
+	if (tab != NULL && tab->isCaptured && (component == COMPONENT_TAB
+			|| component == COMPONENT_CLOSE_BUTTON
+			|| component == COMPONENT_ZOOM_BUTTON)) {
+		const rgb_color green = tab->buttonFocus
+			? (rgb_color){ 76, 196, 98, 255 }
+			: (rgb_color){ 140, 210, 150, 255 };
+		if (component == COMPONENT_TAB) {
+			_colors[COLOR_TAB_FRAME_LIGHT] = tint_color(green, B_DARKEN_2_TINT);
+			_colors[COLOR_TAB_FRAME_DARK] = tint_color(green, B_DARKEN_3_TINT);
+			_colors[COLOR_TAB] = green;
+			_colors[COLOR_TAB_LIGHT] = _Lighten(green,
+				(B_LIGHTEN_MAX_TINT + B_LIGHTEN_2_TINT) / 2);
+			_colors[COLOR_TAB_BEVEL] = _Lighten(green, B_LIGHTEN_2_TINT);
+			_colors[COLOR_TAB_SHADOW] = tint_color(green,
+				(B_DARKEN_1_TINT + B_NO_TINT) / 2);
+			_colors[COLOR_TAB_TEXT] = (rgb_color){ 0, 0, 0, 255 };
+		} else {
+			_colors[COLOR_BUTTON] = green;
+			_colors[COLOR_BUTTON_LIGHT] = _Lighten(green,
+				(B_LIGHTEN_MAX_TINT + B_LIGHTEN_2_TINT) / 2);
+		}
+	}
 }
 
 

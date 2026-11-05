@@ -26,6 +26,14 @@ const window_feel kOffscreenWindowFeel = window_feel(1028);
 
 const window_type kWindowScreenWindow = window_type(1026);
 
+/* Private window actions (do_window_action()): another application, such
+   as a browser sharing the window in a video call, shows that it is reading
+   the window's contents. The window's tab is drawn in the capture color
+   until as many stops as starts arrive, or the application quits. */
+
+const int32 kWindowActionCaptureStart = 'wcap';
+const int32 kWindowActionCaptureStop = 'wcp0';
+
 /* Private window flags */
 
 const uint32 kWindowScreenFlag = 0x10000;

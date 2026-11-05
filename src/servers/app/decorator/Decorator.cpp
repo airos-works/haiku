@@ -54,6 +54,7 @@ Decorator::Tab::Tab()
 
 	buttonFocus(false),
 	isHighlighted(false),
+	isCaptured(false),
 
 	minTabSize(0.0f),
 	maxTabSize(0.0f)
@@ -717,6 +718,34 @@ Decorator::SetOutlinesDelta(BPoint delta, BRegion* dirty)
 {
 	_SetOutlinesDelta(delta, dirty);
 	_InvalidateFootprint();
+}
+
+
+bool
+Decorator::SetTabCaptured(int32 tabIndex, bool captured, BRegion* dirty)
+{
+	AutoWriteLocker _(fLocker);
+
+	Decorator::Tab* tab = fTabList.ItemAt(tabIndex);
+	if (tab == NULL)
+		return false;
+	if (tab->isCaptured == captured)
+		return true;
+	tab->isCaptured = captured;
+	// the buttons' bitmaps are kept per tab: drawn again in the new color
+	for (int32 i = 0; i < 4; i++) {
+		tab->closeBitmaps[i] = NULL;
+		tab->minimizeBitmaps[i] = NULL;
+		tab->zoomBitmaps[i] = NULL;
+	}
+
+	if (dirty != NULL) {
+		dirty->Include(tab->tabRect);
+		dirty->Include(tab->closeRect);
+		dirty->Include(tab->zoomRect);
+		dirty->Include(tab->minimizeRect);
+	}
+	return true;
 }
 
 

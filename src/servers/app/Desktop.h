@@ -264,7 +264,12 @@ public:
 
 			void				MinimizeApplication(team_id team);
 			void				BringApplicationToFront(team_id team);
-			void				WindowAction(int32 windowToken, int32 action);
+			void				WindowAction(int32 windowToken, int32 action,
+									team_id requester = -1);
+			void				ClearWindowCaptures(team_id team);
+			status_t			ReadWindowBitmap(int32 windowToken,
+									ServerBitmap* bitmap, bigtime_t timeout,
+									bool& drawn);
 
 			void				WriteWindowList(team_id team,
 									BPrivate::LinkSender& sender);

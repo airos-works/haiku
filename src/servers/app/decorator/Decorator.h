@@ -64,6 +64,8 @@ public:
 		bool				buttonFocus : 1;
 
 		bool				isHighlighted : 1;
+		bool				isCaptured : 1;
+			// another application is reading the window (screen sharing)
 
 		float				minTabSize;
 		float				maxTabSize;
@@ -194,6 +196,11 @@ public:
 	virtual	void				GetSizeLimits(int32* minWidth, int32* minHeight,
 									int32* maxWidth, int32* maxHeight) const;
 	virtual	void				ExtendDirtyRegion(Region region, BRegion& dirty);
+
+			// The tab of a window another application is capturing (screen
+			// sharing) is drawn in the capture color.
+			bool				SetTabCaptured(int32 tab, bool captured,
+									BRegion* dirty);
 
 	virtual	void				Draw(BRect updateRect) = 0;
 	virtual	void				Draw() = 0;

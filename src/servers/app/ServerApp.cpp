@@ -635,6 +635,27 @@ ServerApp::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 			break;
 		}
 
+		case AS_READ_WINDOW_BITMAP:
+		{
+			// screen sharing of one window (read_window_bitmap())
+			int32 windowToken;
+			int32 bitmapToken;
+			bigtime_t timeout = 0;
+			link.Read<int32>(&windowToken);
+			link.Read<int32>(&bitmapToken);
+			link.Read<bigtime_t>(&timeout);
+
+			BReference<ServerBitmap> bitmap(GetBitmap(bitmapToken), true);
+			bool drawn = false;
+			status_t status = fDesktop->ReadWindowBitmap(windowToken,
+				bitmap.Get(), timeout, drawn);
+			fLink.StartMessage(status);
+			if (status == B_OK)
+				fLink.Attach<bool>(drawn);
+			fLink.Flush();
+			break;
+		}
+
 		case AS_WINDOW_ACTION:
 		{
 			int32 token;
@@ -644,7 +665,7 @@ ServerApp::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 			if (link.Read<int32>(&action) != B_OK)
 				break;
 
-			fDesktop->WindowAction(token, action);
+			fDesktop->WindowAction(token, action, ClientTeam());
 			break;
 		}
 

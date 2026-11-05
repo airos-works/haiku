@@ -16,7 +16,11 @@
 
 #include "Window.h"
 
+#include "BitmapHWInterface.h"
+#include "ServerBitmap.h"
+
 #include <math.h>
+#include <algorithm>
 #include <new>
 #include <stdio.h>
 
@@ -121,7 +125,11 @@ Window::Window(const BRect& frame, const char *name,
 	fMinHeight(1),
 	fMaxHeight(32768),
 
-	fWorkspacesViewCount(0)
+	fWorkspacesViewCount(0),
+	fCaptureCount(0),
+	fCaptureTeam(-1),
+	fCaptureSessionPending(false),
+	fCaptureSession(false)
 {
 	_InitWindowStack();
 
@@ -178,6 +186,15 @@ Window::~Window()
 	DetachFromWindowStack(false);
 
 	gDecorManager.CleanupForWindow(this);
+
+	if (fCaptureRequest.IsSet()) {
+		fCaptureRequest->result = B_BAD_VALUE;
+		release_sem(fCaptureRequest->done);
+		fCaptureRequest.Unset();
+	}
+	fCaptureSession = false;
+	fCaptureSessionPending = false;
+	_FreeCaptureEngine();
 }
 
 
@@ -759,7 +776,7 @@ void
 Window::GetEffectiveDrawingRegion(View* view, BRegion& region)
 {
 	if (!fEffectiveDrawingRegionValid) {
-		fEffectiveDrawingRegion = VisibleContentRegion();
+		fEffectiveDrawingRegion = _DrawableContentRegion();
 		if (fUpdateRequested && !fInUpdate) {
 			// We requested an update, but the client has not started it yet,
 			// so it is only allowed to draw outside the pending update sessions
@@ -1968,6 +1985,13 @@ Window::BeginUpdate(BPrivate::PortLink& link)
 	fCurrentUpdateSession = fPendingUpdateSession;
 	fPendingUpdateSession = temp;
 	fPendingUpdateSession->SetUsed(false);
+
+	if (fCaptureSessionPending && fCaptureEngine.IsSet()) {
+		// This update draws the whole content, into fCaptureBitmap.
+		fCaptureSessionPending = false;
+		fCaptureSession = true;
+		ServerWindow()->ResyncDrawState();
+	}
 	// all drawing command from the client
 	// will have the dirty region from the update
 	// session enforced
@@ -1990,7 +2014,7 @@ Window::BeginUpdate(BPrivate::PortLink& link)
 		return;
 	}
 
-	dirty->IntersectWith(&VisibleContentRegion());
+	dirty->IntersectWith(&_DrawableContentRegion());
 
 //if (!fCurrentUpdateSession->IsExpose()) {
 ////sCurrentColor.red = rand() % 255;
@@ -2019,10 +2043,11 @@ Window::BeginUpdate(BPrivate::PortLink& link)
 	// suppress back to front buffer copies in the drawing engine
 	fDrawingEngine->SetCopyToFrontEnabled(false);
 
-	if (fDrawingEngine->LockParallelAccess()) {
-		fTopView->Draw(GetDrawingEngine(), dirty, &fContentRegion, true);
+	DrawingEngine* engine = GetDrawingEngine();
+	if (engine->LockParallelAccess()) {
+		fTopView->Draw(engine, dirty, &fContentRegion, true);
 
-		fDrawingEngine->UnlockParallelAccess();
+		engine->UnlockParallelAccess();
 	} // else the background was cleared already
 
 	fRegionPool.Recycle(dirty);
@@ -2034,18 +2059,29 @@ Window::EndUpdate()
 {
 	// NOTE: see comment in _BeginUpdate()
 
+	BRegion captured;
+	bool finishCapture = false;
 	if (fInUpdate) {
 		// re-enable copy to front
 		fDrawingEngine->SetCopyToFrontEnabled(true);
 
-		BRegion* dirty = fRegionPool.GetRegion(
-			fCurrentUpdateSession->DirtyRegion());
+		if (fCaptureSession) {
+			// The whole content went into fCaptureBitmap, nothing to the
+			// screen.
+			captured = fCurrentUpdateSession->DirtyRegion();
+			fCaptureSession = false;
+			finishCapture = true;
+			ServerWindow()->ResyncDrawState();
+		} else {
+			BRegion* dirty = fRegionPool.GetRegion(
+				fCurrentUpdateSession->DirtyRegion());
 
-		if (dirty) {
-			dirty->IntersectWith(&VisibleContentRegion());
+			if (dirty) {
+				dirty->IntersectWith(&VisibleContentRegion());
 
-			fDrawingEngine->CopyToFront(*dirty);
-			fRegionPool.Recycle(dirty);
+				fDrawingEngine->CopyToFront(*dirty);
+				fRegionPool.Recycle(dirty);
+			}
 		}
 
 		fCurrentUpdateSession->SetUsed(false);
@@ -2059,6 +2095,180 @@ Window::EndUpdate()
 	} else {
 		fUpdateRequested = false;
 	}
+
+	if (finishCapture)
+		_FinishCapture(captured);
+}
+
+
+// #pragma mark - whole-content captures
+
+
+WindowCaptureRequest::WindowCaptureRequest(ServerBitmap* target)
+	:
+	target(target),
+	done(create_sem(0, "window capture")),
+	result(B_TIMED_OUT)
+{
+}
+
+
+WindowCaptureRequest::~WindowCaptureRequest()
+{
+	delete_sem(done);
+}
+
+
+BRegion&
+Window::_DrawableContentRegion()
+{
+	if (fCaptureSession) {
+		if (!fContentRegionValid)
+			_UpdateContentRegion();
+		return fContentRegion;
+	}
+	return VisibleContentRegion();
+}
+
+
+status_t
+Window::QueueCapture(WindowCaptureRequest* request)
+{
+	// desktop write lock held
+	if (fCaptureRequest.IsSet())
+		return B_BUSY;
+	fCaptureRequest.SetTo(request);
+	return B_OK;
+}
+
+
+void
+Window::CancelCapture(WindowCaptureRequest* request)
+{
+	// desktop write lock held: the requester gave up; a capture update
+	// already asked for still ends with the screen redrawn
+	if (fCaptureRequest.Get() == request)
+		fCaptureRequest.Unset();
+}
+
+
+void
+Window::StartCapture()
+{
+	// window thread, desktop read lock held
+	if (!fCaptureRequest.IsSet() || fCaptureSessionPending || fCaptureSession)
+		return;
+
+	if (!IsVisible() || !fUpdatesEnabled) {
+		fCaptureRequest->result = B_BUSY;
+		release_sem(fCaptureRequest->done);
+		fCaptureRequest.Unset();
+		return;
+	}
+
+	// a bitmap as large as the screens, so that the drawing engine draws in
+	// screen coordinates as it does on the screen
+	BRect screen = fDesktop->VirtualScreen().Frame().OffsetToCopy(0, 0);
+	screen.right = std::max(screen.right, fFrame.right);
+	screen.bottom = std::max(screen.bottom, fFrame.bottom);
+	if (!fCaptureBitmap.IsSet() || fCaptureBitmap->Bounds() != screen) {
+		_FreeCaptureEngine();
+		UtilityBitmap* bitmap = new(std::nothrow) UtilityBitmap(screen,
+			B_RGB32, 0);
+		if (bitmap != NULL && bitmap->Bits() != NULL) {
+			fCaptureBitmap.SetTo(bitmap, true);
+			fCaptureHWInterface.SetTo(
+				new(std::nothrow) BitmapHWInterface(bitmap));
+			fCaptureEngine.SetTo(new(std::nothrow) DrawingEngine());
+			if (fCaptureHWInterface.IsSet() && fCaptureEngine.IsSet()
+				&& fCaptureHWInterface->Initialize() == B_OK) {
+				fCaptureEngine->SetHWInterface(fCaptureHWInterface.Get());
+			} else
+				_FreeCaptureEngine();
+		} else
+			delete bitmap;
+	}
+	if (!fCaptureEngine.IsSet()) {
+		fCaptureRequest->result = B_NO_MEMORY;
+		release_sem(fCaptureRequest->done);
+		fCaptureRequest.Unset();
+		return;
+	}
+
+	// the next update draws the whole content (the covered parts included)
+	if (!fContentRegionValid)
+		_UpdateContentRegion();
+	BRegion content(fContentRegion);
+	fCaptureSessionPending = true;
+	_TransferToUpdateSession(&content);
+}
+
+
+void
+Window::_FinishCapture(const BRegion& drawn)
+{
+	if (fCaptureRequest.IsSet()) {
+		ServerBitmap* target = fCaptureRequest->target.Get();
+		status_t result = B_BAD_VALUE;
+		if (target != NULL && fCaptureBitmap.IsSet()
+			&& (target->ColorSpace() == B_RGB32
+				|| target->ColorSpace() == B_RGBA32)) {
+			// the window's content, from the top left of its frame
+			BRect area = fFrame & fCaptureBitmap->Bounds();
+			int32 width = std::min((int32)area.IntegerWidth() + 1,
+				target->Width());
+			int32 height = std::min((int32)area.IntegerHeight() + 1,
+				target->Height());
+			if (area.IsValid() && width > 0 && height > 0) {
+				int32 destX = (int32)(area.left - fFrame.left);
+				int32 destY = (int32)(area.top - fFrame.top);
+				width = std::min(width, target->Width() - destX);
+				height = std::min(height, target->Height() - destY);
+				const uint8* source = fCaptureBitmap->Bits()
+					+ (int32)area.top * fCaptureBitmap->BytesPerRow()
+					+ (int32)area.left * 4;
+				uint8* dest = target->Bits() + destY * target->BytesPerRow()
+					+ destX * 4;
+				for (int32 y = 0; y < height; y++) {
+					memcpy(dest, source, width * 4);
+					source += fCaptureBitmap->BytesPerRow();
+					dest += target->BytesPerRow();
+				}
+				result = B_OK;
+			}
+		}
+		fCaptureRequest->result = result;
+		release_sem(fCaptureRequest->done);
+		fCaptureRequest.Unset();
+	}
+
+	// what was drawn for the capture is not on screen yet: the visible part
+	// is drawn again, on screen, by the client
+	BRegion visible(drawn);
+	visible.IntersectWith(&VisibleContentRegion());
+	if (visible.CountRects() > 0)
+		_TransferToUpdateSession(&visible);
+
+	if (fCaptureCount == 0)
+		_FreeCaptureEngine();
+}
+
+
+void
+Window::_FreeCaptureEngine()
+{
+	if (fCaptureSession || fCaptureSessionPending)
+		return;
+	if (fCaptureEngine.IsSet())
+		fCaptureEngine->SetHWInterface(NULL);
+	if (fCaptureHWInterface.IsSet()) {
+		fCaptureHWInterface->LockExclusiveAccess();
+		fCaptureHWInterface->Shutdown();
+		fCaptureHWInterface->UnlockExclusiveAccess();
+	}
+	fCaptureEngine.Unset();
+	fCaptureHWInterface.Unset();
+	fCaptureBitmap.Unset();
 }
 
 
@@ -2157,6 +2367,46 @@ Window::UpdateSession::SetUsed(bool used)
 	fInUse = used;
 	if (!fInUse)
 		fDirtyRegion.MakeEmpty();
+}
+
+
+void
+Window::SetCaptured(bool captured, team_id team)
+{
+	if (captured) {
+		fCaptureCount++;
+		fCaptureTeam = team;
+	} else if (fCaptureCount > 0)
+		fCaptureCount--;
+	_UpdateCaptureTab();
+	if (fCaptureCount == 0)
+		_FreeCaptureEngine();
+}
+
+
+void
+Window::ClearCaptures(team_id team)
+{
+	if (fCaptureCount == 0 || fCaptureTeam != team)
+		return;
+	fCaptureCount = 0;
+	_UpdateCaptureTab();
+	_FreeCaptureEngine();
+}
+
+
+void
+Window::_UpdateCaptureTab()
+{
+	::Decorator* decorator = Decorator();
+	if (decorator == NULL)
+		return;
+	BRegion dirty;
+	if (decorator->SetTabCaptured(PositionInStack(), fCaptureCount > 0, &dirty)
+		&& dirty.CountRects() > 0) {
+		if (Window* top = TopLayerStackWindow())
+			top->ProcessDirtyRegion(dirty);
+	}
 }
 
 

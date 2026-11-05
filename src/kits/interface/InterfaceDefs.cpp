@@ -37,6 +37,7 @@
 
 #include <ApplicationPrivate.h>
 #include <AppServerLink.h>
+#include <PrivateScreen.h>
 #include <ColorConversion.h>
 #include <DecorInfo.h>
 #include <DefaultColors.h>
@@ -1809,6 +1810,20 @@ get_application_order(int32 workspace, team_id** _applications,
 	link.Read(*_applications, count * sizeof(team_id));
 	*_count = count;
 	return B_OK;
+}
+
+
+status_t
+read_window_bitmap(int32 serverToken, BBitmap* bitmap, bigtime_t timeout,
+	bool* _drawn)
+{
+	BPrivateScreen* screen = BPrivateScreen::Get(B_MAIN_SCREEN_ID.id);
+	if (screen == NULL)
+		return B_ERROR;
+	status_t status = screen->ReadWindowBitmap(serverToken, bitmap, timeout,
+		_drawn);
+	BPrivateScreen::Put(screen);
+	return status;
 }
 
 

@@ -2547,8 +2547,23 @@ Desktop::BringApplicationToFront(team_id team)
 
 
 void
-Desktop::WindowAction(int32 windowToken, int32 action)
+Desktop::WindowAction(int32 windowToken, int32 action, team_id requester)
 {
+	if (action == kWindowActionCaptureStart
+		|| action == kWindowActionCaptureStop) {
+		// Another application shows it is reading the window (screen
+		// sharing): the window's tab turns green while it does.
+		LockAllWindows();
+		::ServerWindow* serverWindow;
+		if (BPrivate::gDefaultTokens.GetToken(windowToken, B_SERVER_TOKEN,
+				(void**)&serverWindow) == B_OK && serverWindow->Window() != NULL) {
+			serverWindow->Window()->SetCaptured(
+				action == kWindowActionCaptureStart, requester);
+		}
+		UnlockAllWindows();
+		return;
+	}
+
 	if (action != B_MINIMIZE_WINDOW && action != B_BRING_TO_FRONT)
 		return;
 
@@ -2571,6 +2586,88 @@ Desktop::WindowAction(int32 windowToken, int32 action)
 		serverWindow->NotifyMinimize(action == B_MINIMIZE_WINDOW);
 	}
 
+	UnlockAllWindows();
+}
+
+
+/*!	The content of a window others cover, drawn by the window into \a bitmap
+	(screen sharing of one window). \a drawn is false when the caller can read
+	the screen: nothing covers the window, or it draws into the frame buffer
+	itself.
+*/
+status_t
+Desktop::ReadWindowBitmap(int32 windowToken, ServerBitmap* bitmap,
+	bigtime_t timeout, bool& drawn)
+{
+	drawn = false;
+	if (bitmap == NULL)
+		return B_BAD_VALUE;
+
+	LockAllWindows();
+	::ServerWindow* serverWindow;
+	Window* window;
+	if (BPrivate::gDefaultTokens.GetToken(windowToken, B_SERVER_TOKEN,
+			(void**)&serverWindow) != B_OK
+		|| (window = serverWindow->Window()) == NULL
+		|| window->IsOffscreenWindow()) {
+		UnlockAllWindows();
+		return B_BAD_VALUE;
+	}
+	if (!window->IsVisible()) {
+		UnlockAllWindows();
+		return B_BUSY;
+	}
+	BRegion covered;
+	window->GetContentRegion(&covered);
+	covered.Exclude(&window->VisibleContentRegion());
+	if (covered.CountRects() == 0 || serverWindow->HasDirectFrameBufferAccess()) {
+		UnlockAllWindows();
+		return B_OK;
+	}
+
+	BReference<WindowCaptureRequest> request(
+		new(std::nothrow) WindowCaptureRequest(bitmap), true);
+	if (!request.IsSet() || request->done < B_OK) {
+		UnlockAllWindows();
+		return B_NO_MEMORY;
+	}
+	status_t status = window->QueueCapture(request.Get());
+	if (status == B_OK
+		&& serverWindow->PostMessage(AS_CAPTURE_WINDOW_CONTENT, 0) != B_OK) {
+		window->CancelCapture(request.Get());
+		status = B_BUSY;
+	}
+	UnlockAllWindows();
+	if (status != B_OK)
+		return status;
+
+	status = acquire_sem_etc(request->done, 1, B_RELATIVE_TIMEOUT,
+		std::min<bigtime_t>(std::max<bigtime_t>(timeout, 0), 2000000));
+	if (status != B_OK) {
+		// the window did not draw in time: give up the request, if the
+		// window is still there
+		LockAllWindows();
+		if (BPrivate::gDefaultTokens.GetToken(windowToken, B_SERVER_TOKEN,
+				(void**)&serverWindow) == B_OK
+			&& (window = serverWindow->Window()) != NULL)
+			window->CancelCapture(request.Get());
+		UnlockAllWindows();
+		return B_TIMED_OUT;
+	}
+	drawn = request->result == B_OK;
+	return request->result;
+}
+
+
+/*!	An application that quit stops capturing the windows it was reading. */
+void
+Desktop::ClearWindowCaptures(team_id team)
+{
+	LockAllWindows();
+	for (Window* window = fAllWindows.FirstWindow(); window != NULL;
+			window = window->NextWindow(kAllWindowList)) {
+		window->ClearCaptures(team);
+	}
 	UnlockAllWindows();
 }
 
@@ -2919,8 +3016,10 @@ Desktop::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 
 			fApplicationsLock.Unlock();
 
-			if (removeApp != NULL)
+			if (removeApp != NULL) {
+				ClearWindowCaptures(removeApp->ClientTeam());
 				removeApp->Quit(fShutdownSemaphore);
+			}
 
 			if (fQuitting && count <= 1) {
 				// wait for the last app to die
