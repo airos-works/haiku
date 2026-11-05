@@ -135,6 +135,8 @@ struct accelerant_info {
 	volatile bool		quitHotplug;
 	volatile bool		changedAsleep;	// hot plug events while DPMS was off
 	volatile bool		outputsChanged;	// monitors came or went: probe
+	volatile uint32		probedGeneration;
+								// the hot plug count before the last probe
 };
 
 
@@ -143,6 +145,7 @@ extern accelerant_info* gInfo;
 
 // outputs and modes (mode.cpp)
 status_t probe_outputs(void);
+uint32 hotplug_generation(void);
 void refresh_outputs(void);
 void stop_hotplug(void);
 void default_layout(Layout& layout);
