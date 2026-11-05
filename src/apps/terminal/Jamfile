@@ -26,6 +26,7 @@ local emulatorSources =
 	TerminalCommands.cpp
 	TerminalGraphics.cpp
 	TerminalHistory.cpp
+	TerminalLinks.cpp
 	TerminalInput.cpp
 	TerminalSequences.cpp
 	UnicodeTables.cpp

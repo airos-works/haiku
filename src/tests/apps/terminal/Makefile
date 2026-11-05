@@ -10,3 +10,7 @@ $(OUT)/emulator_test: $(SOURCES) $(wildcard $(EMULATOR)/*.h)
 
 test: $(OUT)/emulator_test
 	$(OUT)/emulator_test
+
+# runs a program with the emulator answering it, see TermRun.cpp
+$(OUT)/termrun: $(wildcard $(EMULATOR)/*.cpp) TermRun.cpp $(wildcard $(EMULATOR)/*.h)
+	$(CXX) $(CXXFLAGS) -o $@ $(wildcard $(EMULATOR)/*.cpp) TermRun.cpp -lz -lpthread -lutil
