@@ -131,10 +131,23 @@ update_connector_list(void)
 }
 
 
+/*!	How many hot plug events amdgpu_drm has counted. */
+uint32
+hotplug_generation(void)
+{
+	drm_haiku_wait_hotplug wait = {};
+	if (Kms::Ioctl(gInfo->device, DRM_HAIKU_IOCTL_WAIT_HOTPLUG, &wait) != B_OK)
+		return 0;
+	return wait.generation;
+}
+
+
 status_t
 probe_outputs(void)
 {
 	int fd = gInfo->device;
+	// (before looking: an event during the probe is looked at again)
+	gInfo->probedGeneration = hotplug_generation();
 	update_connector_list();
 	gInfo->outputCount = 0;
 	for (uint32 i = 0; i < gInfo->resources.connectorCount

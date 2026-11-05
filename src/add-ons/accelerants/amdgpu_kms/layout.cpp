@@ -261,15 +261,30 @@ static status_t
 hotplug_thread(void*)
 {
 	drm_haiku_wait_hotplug wait = {};
-	// the current count
-	if (Kms::Ioctl(gInfo->device, DRM_HAIKU_IOCTL_WAIT_HOTPLUG, &wait) != B_OK)
-		return B_OK;
+	// Counted from the outputs' probe, not from now: monitors that came up
+	// since (a dock's links trained a moment later, the connectors of its
+	// MST hub) are looked at at once.
+	wait.generation = gInfo->probedGeneration;
+	// Docks bring their monitors up over several seconds after the boot,
+	// not always with an event that comes late enough: for a while, the
+	// monitors are compared without one, too.
+	bigtime_t settleUntil = system_time() + 30000000;
 	while (!gInfo->quitHotplug) {
 		uint32 seen = wait.generation;
 		wait.timeout_ms = 1000;
 		if (Kms::Ioctl(gInfo->device, DRM_HAIKU_IOCTL_WAIT_HOTPLUG, &wait)
 				!= B_OK) {
 			snooze(1000000);
+			continue;
+		}
+		bool settling = system_time() < settleUntil
+			&& wait.generation == seen;
+		if (settling && gInfo->dpmsMode == B_DPMS_ON
+			&& !gInfo->quitHotplug && connected_outputs_changed()) {
+			debug_printf("amdgpu_kms: monitors changed since the start\n");
+			gInfo->outputsChanged = true;
+			write_port_etc(gInfo->changePort, gInfo->changeCode, NULL, 0,
+				B_RELATIVE_TIMEOUT, 0);
 			continue;
 		}
 		if (wait.generation != seen && !gInfo->quitHotplug) {
