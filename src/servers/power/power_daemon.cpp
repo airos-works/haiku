@@ -156,14 +156,22 @@ PowerManagementDaemon::_EventLoop()
 		}
 	}
 	while (!fQuitRequested) {
-		if (wait_for_objects(info, fdCount) < B_OK)
-			continue;
-		// handle events and reset events
-		for (uint32 i = 0; i < fdCount; i++) {
-			if (info[i].events & B_EVENT_READ)
-				descriptorMap[info[i].object]->HandleEvent(info[i].object);
-			else
+		bigtime_t timeout = fPolicy.PollInterval();
+		ssize_t count = timeout == B_INFINITE_TIMEOUT
+			? wait_for_objects(info, fdCount)
+			: wait_for_objects_etc(info, fdCount, B_RELATIVE_TIMEOUT, timeout);
+		if (count > 0) {
+			// handle events and reset events
+			for (uint32 i = 0; i < fdCount; i++) {
+				if (info[i].events & B_EVENT_READ)
+					descriptorMap[info[i].object]->HandleEvent(info[i].object);
+				else
+					info[i].events = B_EVENT_READ;
+			}
+		} else {
+			for (uint32 i = 0; i < fdCount; i++)
 				info[i].events = B_EVENT_READ;
 		}
+		fPolicy.Poll();
 	}
 }

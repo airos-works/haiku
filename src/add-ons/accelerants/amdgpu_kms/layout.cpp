@@ -48,6 +48,8 @@ amdgpu_get_display_outputs(display_output* outputs, uint32* _count)
 			output.flags |= B_DISPLAY_OUTPUT_ENABLED;
 		if (source.mirror)
 			output.flags |= B_DISPLAY_OUTPUT_MIRROR;
+		if (source.internal)
+			output.flags |= B_DISPLAY_OUTPUT_INTERNAL;
 		output.x = source.x;
 		output.y = source.y;
 		output.width = source.width;
