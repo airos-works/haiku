@@ -206,20 +206,69 @@ the environment turns it off.
 
 ## Links
 
-Hold **Alt** and click a link to open it in the default browser, or Alt and
-right-click it for *Open link* and *Copy link location*. Holding Alt over a
-link underlines it and shows the link pointer. (The left Alt key is the
-Command key of a PC keyboard in Haiku's default key layout; with the Keymap
-preference's "Windows/Linux" shortcut layout it is Ctrl instead.)
+**Click a link to open it** in the default browser (Summit). Hovering over
+a link underlines it and shows the link pointer. A drag that starts on a
+link still selects text, a double click still selects the word, and the
+click that brings the window to the front opens nothing. The click opens
+the link even when the program asks for the mouse (Claude Code, codex,
+tmux with `mouse on`): those do nothing with a click on an address, and
+over ssh they could only open it on the other computer. A drag from a link
+goes to the program as usual. *Open links with a click* in the settings
+turns this off.
+
+Hold **Alt** and click to open links and also file names (`path`,
+`path:line`, `path:line:column`, relative to the shell's directory), or Alt
+and right-click for *Open link* and *Copy link location*. (The left Alt key
+is the Command key of a PC keyboard in Haiku's default key layout; with the
+Keymap preference's "Windows/Linux" shortcut layout it is Ctrl instead.)
+
+What counts as a link (`emulator/TerminalLinks.cpp`, with tests):
 
 - **OSC 8 hyperlinks** of any length up to 1 MiB (whole sequences of
-  operating system commands are). The link's range is every cell around
-  the pointer with the same link, across lines filled to the margin, which is
-  how a program repeats a link it has wrapped.
-- **Plain addresses** that a program broke into lines itself continue on the
-  next line when a line is full to the right margin and the next one starts
-  with address characters (`HyperLinkState::_ExtendURLOverLineBreaks()`).
-  Claude Code prints its sign-in address this way.
+  operating system commands are), from the cells around the pointer with
+  the same address, across lines: a program that wraps a link repeats it
+  on each line, after the indentation of its text.
+- **Addresses in the text** that start with `http://`, `https://`,
+  `ftp://`, `ftps://`, `sftp://`, `ssh://`, `file://`, `git://` or
+  `mailto:`, without punctuation that ends the sentence and without
+  closing brackets they did not open (`(see https://e.com/Foo_(bar)).`
+  gives `https://e.com/Foo_(bar)`; markdown's `[text](https://...)` gives
+  the address). A long address is followed over the lines it was broken
+  into:
+  - by the terminal (a soft wrap);
+  - by the program, to the right margin, with the rest indented like the
+    paragraph (Claude Code's answers and its sign-in address; its text
+    fields stop one column short), or short of the margin after `://`,
+    `-`, `=`, `&` and the like when the rest would not have fitted
+    (codex);
+  - by tmux at the border of a pane (`│`), on either side of it; tables
+    drawn with `│` are the same.
+
+  A line that ends with an address is not continued with the next line's
+  words when they would have fitted, or when the next line is indented
+  further than the address started.
+
+### Programs on another computer, and tmux
+
+Over ssh nothing tells the remote program about Terminal (ssh passes on
+`TERM` and, if configured, `LANG`/`LC_*` only), so Claude Code prints
+plain addresses (a markdown link as `text (address)`), which are found
+in the text as above. To get OSC 8 links from it anyway, send
+`FORCE_HYPERLINK=1` (`SetEnv FORCE_HYPERLINK=1` in `~/.ssh/config`, if the
+server's `AcceptEnv` takes it).
+
+**tmux** 3.4 and newer passes OSC 8 links on only to terminals it knows to
+support them, by the name the terminal answers to XTVERSION (iTerm2,
+XTerm, foot, mintty, tmux) or by `terminal-features`; Terminal answers
+`airos-terminal(2.0)`, which tmux does not know. Inside tmux, Claude Code
+(which sees `TERM_PROGRAM=tmux` 3.4) prints OSC 8 links, tmux drops them,
+and a markdown link then shows only its text, without the address. Tell
+tmux, in `~/.tmux.conf` on the machine running it:
+
+    set -as terminal-features ',xterm-256color:hyperlinks'
+
+(new tmux clients pick it up; `tmux kill-server` or a new session for
+running ones). Plain addresses work without it.
 
 `BROWSER` and `FORCE_HYPERLINK` (see the table at the top) are not changed
 when already set, so a profile can override them. Programs that open a web
@@ -229,6 +278,11 @@ Node.js programs using the common `supports-hyperlinks` check only print
 OSC 8 links for terminals they know, hence `FORCE_HYPERLINK`. It also
 applies when such a program's output goes to a pipe or file; set it to `0`
 in the profile if that is unwanted.
+
+`src/tests/apps/terminal/TermRun.cpp` (`make termrun` there) runs a program
+on the build host with Terminal's emulator answering its queries, and
+lists the links it would find: `termrun -s script -- claude` records,
+`termrun -p recording` plays a recording back.
 
 ## Clipboard
 

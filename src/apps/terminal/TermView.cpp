@@ -537,7 +537,10 @@ TermView::_InitObject(const ShellParameters& shellParameters)
 	fHistorySize = 0;
 	fAutoScrollSpeed = 0;
 	fSelection.start = fSelection.end = TermPoint(0, 0);
-	fLinkHighlight.start = fLinkHighlight.end = TermPoint(0, 0);
+	fHoverLink = false;
+	fHoverCell = TermPoint(-1, -1);
+	fHoverGeneration = 0;
+	fActivatedTime = 0;
 	fPrevPos = TermPoint(-1, - 1);
 	fKeymap = NULL;
 	fKeymapChars = NULL;
@@ -552,6 +555,7 @@ TermView::_InitObject(const ShellParameters& shellParameters)
 	fSelectState = new(std::nothrow) SelectState(this);
 	fHyperLinkState = new(std::nothrow) HyperLinkState(this);
 	fHyperLinkMenuState = new(std::nothrow) HyperLinkMenuState(this);
+	fLinkClickState = new(std::nothrow) LinkClickState(this);
 	fActiveState = NULL;
 
 	fTerminal = new(std::nothrow) Terminal;
@@ -598,7 +602,7 @@ TermView::_InitObject(const ShellParameters& shellParameters)
 		return error;
 
 	if (fDefaultState == NULL || fSelectState == NULL || fHyperLinkState == NULL
-		|| fHyperLinkMenuState == NULL) {
+		|| fHyperLinkMenuState == NULL || fLinkClickState == NULL) {
 		return B_NO_MEMORY;
 	}
 
@@ -627,6 +631,7 @@ TermView::~TermView()
 	delete fSelectState;
 	delete fHyperLinkState;
 	delete fHyperLinkMenuState;
+	delete fLinkClickState;
 	delete fFrameRunner;
 	delete fAnimationRunner;
 	delete fAutoScrollRunner;
@@ -2271,7 +2276,8 @@ TermView::_SetPointerShape(const char* shape)
 		}
 	}
 
-	if (fActiveState == fHyperLinkState)
+	if (fActiveState == fHyperLinkState || fActiveState == fLinkClickState
+		|| fHoverLink)
 		return;
 	BCursor cursor(id);
 	SetViewCursor(&cursor);
@@ -2406,10 +2412,29 @@ TermView::_RenderFrame()
 			highlight.underline = false;
 			state.highlights.push_back(highlight);
 		}
-		if (!fLinkHighlight.IsEmpty()) {
+		bool hoverLinkGone = false;
+		if (fHoverLink && fActiveState == fDefaultState
+			&& fTerminal->ContentGeneration() != fHoverGeneration) {
+			// the text under the pointer changed: the link there now
+			fHoverGeneration = fTerminal->ContentGeneration();
+			TermLinkRange link;
+			fLinkHighlights.clear();
+			if (FindTerminalLink(*fTerminal, fHoverCell, link)) {
+				for (size_t i = 0; i < link.segments.size(); i++) {
+					Highlight segment;
+					segment.start = link.segments[i].start;
+					segment.end = link.segments[i].end;
+					fLinkHighlights.push_back(segment);
+				}
+			} else
+				hoverLinkGone = true;
+		}
+		for (size_t i = 0; i < fLinkHighlights.size(); i++) {
+			if (fLinkHighlights[i].IsEmpty())
+				continue;
 			FrameHighlight highlight;
-			highlight.start = fLinkHighlight.start;
-			highlight.end = fLinkHighlight.end;
+			highlight.start = fLinkHighlights[i].start;
+			highlight.end = fLinkHighlights[i].end;
 			highlight.useColors = false;
 			highlight.foreground = highlight.background = 0;
 			highlight.underline = true;
@@ -2424,6 +2449,11 @@ TermView::_RenderFrame()
 		TerminalGraphics* graphics = fTerminal->Graphics();
 		bool animating = graphics != NULL && graphics->HasAnimations();
 		fTerminal->Unlock();
+
+		if (hoverLinkGone) {
+			// no link under the pointer any more: its pointer goes, too
+			_ClearHoverLink();
+		}
 
 		if (historyChanged)
 			_UpdateScrollBarRange();
@@ -3207,6 +3237,10 @@ void
 TermView::WindowActivated(bool active)
 {
 	BView::WindowActivated(active);
+	if (active)
+		fActivatedTime = system_time();
+	else
+		_ClearHoverLink();
 	if (active && IsFocus()) {
 		if (!fActive)
 			_Activate();
@@ -3674,10 +3708,41 @@ TermView::_GetText(TermPoint start, TermPoint end, BString& text) const
 void
 TermView::_SetLinkHighlight(TermPoint start, TermPoint end)
 {
-	if (fLinkHighlight.start == start && fLinkHighlight.end == end)
+	if (start == end) {
+		if (fLinkHighlights.empty())
+			return;
+		fLinkHighlights.clear();
+	} else {
+		if (fLinkHighlights.size() == 1 && fLinkHighlights[0].start == start
+			&& fLinkHighlights[0].end == end)
+			return;
+		Highlight highlight;
+		highlight.start = start;
+		highlight.end = end;
+		fLinkHighlights.assign(1, highlight);
+	}
+	_ScheduleFrame();
+}
+
+
+void
+TermView::_SetLinkHighlight(const TermLinkRange& link)
+{
+	std::vector<Highlight> highlights;
+	for (size_t i = 0; i < link.segments.size(); i++) {
+		Highlight highlight;
+		highlight.start = link.segments[i].start;
+		highlight.end = link.segments[i].end;
+		highlights.push_back(highlight);
+	}
+	bool same = highlights.size() == fLinkHighlights.size();
+	for (size_t i = 0; same && i < highlights.size(); i++) {
+		same = highlights[i].start == fLinkHighlights[i].start
+			&& highlights[i].end == fLinkHighlights[i].end;
+	}
+	if (same)
 		return;
-	fLinkHighlight.start = start;
-	fLinkHighlight.end = end;
+	fLinkHighlights.swap(highlights);
 	_ScheduleFrame();
 }
 
@@ -3686,6 +3751,88 @@ void
 TermView::_ClearLinkHighlight()
 {
 	_SetLinkHighlight(TermPoint(0, 0), TermPoint(0, 0));
+}
+
+
+/*!	The link at \a where: an OSC 8 hyperlink, or an address in the text
+	(see TerminalLinks.cpp).
+*/
+bool
+TermView::_LinkAt(BPoint where, TermLinkRange& _link)
+{
+	TermPoint position = _ConvertToTerminal(where);
+	fTerminal->Lock();
+	bool found = FindTerminalLink(*fTerminal, position, _link);
+	fTerminal->Unlock();
+	return found;
+}
+
+
+bool
+TermView::_ClicksOpenLinks() const
+{
+	return PrefHandler::Default()->getBool(PREF_OPEN_LINKS_ON_CLICK);
+}
+
+
+/*!	Whether the click at \a when is the one that brought the window to the
+	front, which is not to open anything. (The window may hear that it is
+	active just before or just after the click.)
+*/
+bool
+TermView::_IsActivatingClick(bigtime_t when) const
+{
+	bigtime_t difference = when - fActivatedTime;
+	return difference > -300000 && difference < 300000;
+}
+
+
+/*!	Underlines the link under the pointer and shows the link pointer, as a
+	click opens it.
+*/
+void
+TermView::_UpdateHoverLink(BPoint where)
+{
+	if (fMouseButtons != 0 || Window() == NULL || !Window()->IsActive()
+		|| !_ClicksOpenLinks()) {
+		_ClearHoverLink();
+		return;
+	}
+
+	TermPoint cell = _ConvertToTerminal(where);
+	if (cell == fHoverCell)
+		return;
+
+	TermLinkRange link;
+	if (!_LinkAt(where, link)) {
+		_ClearHoverLink();
+		fHoverCell = cell;
+		return;
+	}
+
+	fHoverCell = cell;
+	fTerminal->Lock();
+	fHoverGeneration = fTerminal->ContentGeneration();
+	fTerminal->Unlock();
+	_SetLinkHighlight(link);
+	if (!fHoverLink) {
+		fHoverLink = true;
+		BCursor cursor(B_CURSOR_ID_FOLLOW_LINK);
+		SetViewCursor(&cursor);
+	}
+}
+
+
+void
+TermView::_ClearHoverLink()
+{
+	fHoverCell = TermPoint(-1, -1);
+	if (!fHoverLink)
+		return;
+	fHoverLink = false;
+	if (fActiveState != fHyperLinkState && fActiveState != fLinkClickState)
+		_ClearLinkHighlight();
+	_SetPointerShape(fPointerShape.String());
 }
 
 
