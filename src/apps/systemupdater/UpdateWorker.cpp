@@ -11,6 +11,7 @@
 #include <RegistrarDefs.h>
 #include <RosterPrivate.h>
 
+#include "Desktop.h"
 #include "Release.h"
 #include "SystemState.h"
 
@@ -52,6 +53,9 @@ UpdateWorker::MessageReceived(BMessage* message)
 		case kMsgCloseApps:
 			_CloseApps();
 			break;
+		case kMsgCloseDesktop:
+			_CloseDesktop();
+			break;
 		default:
 			BLooper::MessageReceived(message);
 	}
@@ -88,26 +92,6 @@ UpdateWorker::UpdaterProgress(float fraction)
 UpdateWorker::FormatChanges(const BMessage& changes, const char* title)
 {
 	BString text;
-	text << title << "\n";
-
-	BMessage packages;
-	if (json::Object(changes, "packages", packages)
-		&& json::Count(packages) > 0) {
-		text << "\nUpdated applications and packages:\n";
-		BMessage entry;
-		for (int32 i = 0; json::At(packages, i, entry); i++) {
-			BString from = json::String(entry, "from");
-			BString to = json::String(entry, "to");
-			text << "  • " << json::String(entry, "name");
-			if (from.IsEmpty())
-				text << " " << to << " (new)";
-			else if (to.IsEmpty())
-				text << " (removed)";
-			else
-				text << " " << from << " → " << to;
-			text << "\n";
-		}
-	}
 
 	BMessage apps;
 	if (json::Object(changes, "apps", apps)) {
@@ -129,19 +113,99 @@ UpdateWorker::FormatChanges(const BMessage& changes, const char* title)
 	if (json::Object(changes, "haiku", haiku) && json::Count(haiku) > 0) {
 		text << "\nSystem:\n";
 		BMessage commit;
-		int32 count = json::Count(haiku);
 		for (int32 i = 0; json::At(haiku, i, commit); i++)
 			text << "  • " << json::String(commit, "subject") << "\n";
 		int32 more = (int32)json::Number(changes, "haiku_more", 0);
 		if (more > 0)
 			text << "  … and " << more << " more\n";
-		(void)count;
 	}
 
 	int32 skipped = (int32)json::Number(changes, "skipped", 0);
 	if (skipped > 0)
 		text << "\n(" << skipped << " documentation and build changes)\n";
+
+	// a release that changed packages only has no notes
+	if (!text.IsEmpty())
+		text.Prepend(BString(title) << "\n");
 	return text;
+}
+
+
+/*!	One row per package the plan changes: what is installed now and what
+	the update brings. A package new to this system has no "from", one the
+	update removes no "to".
+*/
+void
+UpdateWorker::_AddPackageRows(const UpdatePlan& plan, BMessage& reply)
+{
+	BStringList removed(plan.deactivate);
+	for (int32 i = 0; const PlannedPackage* package = plan.activate.ItemAt(i);
+			i++) {
+		BString name = Updater::PackageNameOf(package->file);
+		BString from;
+		for (int32 j = 0; j < removed.CountStrings(); j++) {
+			if (Updater::PackageNameOf(removed.StringAt(j)) == name) {
+				from = Updater::VersionOf(removed.StringAt(j));
+				removed.Remove(j);
+				break;
+			}
+		}
+		BMessage row;
+		row.AddString("name", name);
+		row.AddString("from", from);
+		row.AddString("to", Updater::VersionOf(package->file));
+		row.AddInt64("size", package->download ? package->size : -1);
+		reply.AddMessage("package", &row);
+	}
+	for (int32 i = 0; i < removed.CountStrings(); i++) {
+		BMessage row;
+		row.AddString("name", Updater::PackageNameOf(removed.StringAt(i)));
+		row.AddString("from", Updater::VersionOf(removed.StringAt(i)));
+		row.AddString("to", "");
+		row.AddInt64("size", -1);
+		reply.AddMessage("package", &row);
+	}
+}
+
+
+/*!	Without a plan, what the feed says each newer release changed, merged:
+	the oldest "from" and the newest "to" of every package.
+*/
+void
+UpdateWorker::_AddFeedPackageRows(BMessage& reply)
+{
+	BStringList names;
+	BStringList froms;
+	BStringList tos;
+	for (int32 i = 0; const FeedBuild* build = fFeed.BuildAt(i); i++) {
+		if (!fUpdater.IsNewer(*build))
+			break;
+		// newest first: the first "to" seen stays, "from" goes back in time
+		BMessage packages;
+		if (!json::Object(build->changes, "packages", packages))
+			continue;
+		BMessage entry;
+		for (int32 j = 0; json::At(packages, j, entry); j++) {
+			BString name = json::String(entry, "name");
+			int32 index = names.IndexOf(name);
+			if (index < 0) {
+				names.Add(name);
+				froms.Add(json::String(entry, "from"));
+				tos.Add(json::String(entry, "to"));
+			} else
+				froms.Replace(index, json::String(entry, "from"));
+		}
+	}
+	for (int32 i = 0; i < names.CountStrings(); i++) {
+		if (froms.StringAt(i) == tos.StringAt(i))
+			continue;
+		BMessage row;
+		row.AddString("name", names.StringAt(i));
+		row.AddString("from", froms.StringAt(i));
+		row.AddString("to", tos.StringAt(i));
+		row.AddInt64("size", -1);
+		reply.AddMessage("package", &row);
+	}
 }
 
 
@@ -164,10 +228,13 @@ UpdateWorker::_Check()
 		if (!fUpdater.IsNewer(*build))
 			break;
 		newer++;
+		BString notes = FormatChanges(build->changes,
+			Release::TitleForVersion(build->version));
+		if (notes.IsEmpty())
+			continue;
 		if (!changes.IsEmpty())
 			changes << "\n";
-		changes << FormatChanges(build->changes,
-			Release::TitleForVersion(build->version));
+		changes << notes;
 	}
 
 	reply.AddBool("available", latest != NULL && newer > 0);
@@ -191,9 +258,11 @@ UpdateWorker::_Check()
 				== B_OK) {
 			size = plan.downloadBytes;
 			packages = plan.activate.CountItems();
+			_AddPackageRows(plan, reply);
 		} else if (newer > 0) {
 			fUpdater.Log("could not work out what %s would download: %s",
 				latest->id.String(), planError.String());
+			_AddFeedPackageRows(reply);
 		}
 		reply.AddInt64("size", size);
 		reply.AddInt32("packages", packages);
@@ -305,4 +374,15 @@ UpdateWorker::_CloseApps()
 	}
 	reply.AddInt32("error", error);
 	fTarget.SendMessage(&reply);
+}
+
+
+/*!	Deskbar and Tracker quit too, as in a shutdown: what stays on the screen
+	is the install window over the desktop color.
+*/
+void
+UpdateWorker::_CloseDesktop()
+{
+	Desktop::Close();
+	fTarget.SendMessage(kMsgCloseDesktopDone);
 }

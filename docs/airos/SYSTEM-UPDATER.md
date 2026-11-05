@@ -10,13 +10,25 @@ does not start is replaced by the one before it without help.
 
 ## Using it
 
-- **System Updater** (Deskbar › Applications) checks when it opens. *Install
-  and Reboot* first closes the applications the way a shutdown does: each
-  one may ask to save its work, and one that stays open (the user chose
-  *Cancel* in its save dialog) stops it all, with nothing installed. Then a
-  window in front of everything downloads the release, checks every file,
-  installs it for the next start and restarts. *Cancel* works until the
-  install itself begins. Nothing changes in the running system.
+- **System Updater** (Deskbar › Applications) checks when it opens. An
+  update shows its version, what this computer runs, and what installing
+  it downloads (size and package count), then a table of the packages it
+  changes on this computer (current version, new version, download; rows
+  come from the install plan, so they match what *Install and Reboot*
+  does: a package rebuilt under the same version says "rebuilt", one the
+  release drops says "removed"), then the release notes.
+- *Install and Reboot* first closes the applications the way a shutdown
+  does: each one may ask to save its work, and one that stays open (the
+  user chose *Cancel* in its save dialog) stops it all, with nothing
+  installed. Then, as further along in a shutdown, Deskbar and Tracker quit
+  and the System Updater window hides: the screen shows only the install
+  window over the desktop color while it downloads the release, checks
+  every file, installs it for the next start and restarts. launch_daemon
+  starts Deskbar and Tracker again whenever they quit, so their service jobs
+  (`x-vnd.Be-TSKB`, `x-vnd.Be-TRAK`) are disabled first (in memory only: the
+  next start has them as always). *Cancel* works until the install itself
+  begins; it brings Deskbar, Tracker and the window back, as does a restart
+  that does not happen. Nothing changes in the running system.
 - If installing fails after the applications were closed (a download that
   does not come through, a file that does not match), the computer restarts
   all the same, into the version it ran; System Updater then opens and says

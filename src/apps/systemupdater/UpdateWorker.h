@@ -23,19 +23,24 @@ enum {
 	kMsgRemoveFailed		= 'rmfl',
 	kMsgCloseApps			= 'clap',
 		// the user's applications quit, as in a shutdown
+	kMsgCloseDesktop		= 'clds',
+		// then Deskbar and Tracker
 
 	// from the worker
 	kMsgStatus				= 'stat',
 		// "text", "fraction" (< 0: none)
 	kMsgCheckDone			= 'chdn',
-		// "error", or "available", "id", "title", "size", "changes",
-		// "count" (newer releases), "checked" (when the feed answered)
+		// "error", or "available", "id", "title", "revision", "size",
+		// "packages" (count, -1: unknown), "package" (BMessages: "name",
+		// "from", "to" - empty when new or removed - and "size", -1 for
+		// none), "changes" (the release notes), "count" (newer releases)
 	kMsgInstallDone			= 'indn',
 		// "error", "title", "cancelled"
 	kMsgInstallCommitting	= 'incm',
 		// everything is downloaded: the install goes on to the end
 	kMsgCloseAppsDone		= 'cadn',
 		// "error" (status_t), "app" (the one that would not quit)
+	kMsgCloseDesktopDone	= 'cddn',
 	kMsgGoBackDone			= 'gbdn',
 		// "error", "title"
 	kMsgRemoveFailedDone	= 'rfdn'
@@ -56,6 +61,8 @@ public:
 
 	static	BString				FormatChanges(const BMessage& changes,
 									const char* title);
+									// the release notes; the packages are
+									// in the check's "package" rows
 
 private:
 	virtual	void				UpdaterStatus(const char* text);
@@ -66,6 +73,10 @@ private:
 			void				_GoBack(const char* state);
 			void				_RemoveFailed();
 			void				_CloseApps();
+			void				_CloseDesktop();
+			void				_AddPackageRows(const UpdatePlan& plan,
+									BMessage& reply);
+			void				_AddFeedPackageRows(BMessage& reply);
 
 private:
 			BMessenger			fTarget;

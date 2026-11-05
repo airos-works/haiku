@@ -15,6 +15,9 @@
 
 class BButton;
 class BCheckBox;
+class BColumnListView;
+class BGridView;
+class BSplitView;
 class BLayoutItem;
 class BListView;
 class BStatusBar;
@@ -47,6 +50,9 @@ private:
 			void				_StartCheck();
 			void				_Restart();
 			void				_StartInstall();
+			void				_InstallCancelled();
+			void				_ShowAvailable(BMessage* message);
+			void				_ClearAvailable();
 			void				_InstallFinished(BMessage* message);
 			void				_ShowFailedInstall();
 			void				_SelectVersion();
@@ -70,9 +76,17 @@ private:
 			// updates
 			BStringView*		fTitleView;
 			BTextView*			fSummaryView;
-			BTextView*			fChangesView;
-			BView*				fChangesLabel;
-			BView*				fChangesScroll;
+			BGridView*			fDetailsView;
+			BStringView*		fNewVersionView;
+			BStringView*		fRunningVersionView;
+			BStringView*		fDownloadView;
+			BSplitView*			fChangesSplit;
+			BView*				fPackagesGroup;
+			BStringView*		fPackagesLabel;
+			BColumnListView*	fPackagesView;
+			BView*				fNotesGroup;
+			BTextView*			fNotesView;
+			bool				fHaveDetails;
 			BStatusBar*			fProgressBar;
 			BLayoutItem*		fChangesGlue;
 			BButton*			fCheckButton;
@@ -90,6 +104,8 @@ private:
 
 			UpdateWorker*		fWorker;
 			InstallWindow*		fInstallWindow;
+			bool				fDesktopClosed;
+			bool				fInstallCancelRequested;
 			BMessageRunner*		fRestartRunner;
 			bool				fRestarting;
 			SystemState			fState;

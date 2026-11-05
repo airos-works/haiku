@@ -13,8 +13,11 @@
 #include <Application.h>
 #include <Button.h>
 #include <CheckBox.h>
+#include <ColumnListView.h>
+#include <ColumnTypes.h>
 #include <ControlLook.h>
 #include <File.h>
+#include <GridView.h>
 #include <LayoutBuilder.h>
 #include <ListView.h>
 #include <MessageRunner.h>
@@ -22,6 +25,7 @@
 #include <ScrollView.h>
 #include <SeparatorView.h>
 #include <SpaceLayoutItem.h>
+#include <SplitView.h>
 #include <StatusBar.h>
 #include <StringView.h>
 #include <TabView.h>
@@ -32,6 +36,7 @@
 #include <airos_boot_control.h>
 
 #include "Constants.h"
+#include "Desktop.h"
 #include "InstallWindow.h"
 #include "PiBoot.h"
 #include "Release.h"
@@ -58,6 +63,94 @@ enum {
 // the restart, and how long a restart may take to begin
 static const bigtime_t kFailedRestartDelay = 4000000;
 static const bigtime_t kRestartStallDelay = 30000000;
+
+
+// #pragma mark - package table
+
+
+enum {
+	kPackageColumn = 0,
+	kFromColumn,
+	kToColumn,
+	kDownloadColumn
+};
+
+
+// What a package's update downloads; nothing for one that is removed or
+// comes from an older version still on the disk.
+class DownloadField : public BSizeField {
+public:
+	DownloadField(off_t size)
+		:
+		BSizeField(size > 0 ? size : 0),
+		fNone(size <= 0)
+	{
+	}
+
+	bool IsNone() const
+	{
+		return fNone;
+	}
+
+private:
+	bool	fNone;
+};
+
+
+class DownloadColumn : public BSizeColumn {
+public:
+	DownloadColumn(const char* title, float width, float minWidth,
+		float maxWidth)
+		:
+		BSizeColumn(title, width, minWidth, maxWidth, B_ALIGN_RIGHT)
+	{
+	}
+
+	virtual void DrawField(BField* field, BRect rect, BView* parent)
+	{
+		DownloadField* download = dynamic_cast<DownloadField*>(field);
+		if (download != NULL && download->IsNone()) {
+			DrawString("—", parent, rect);
+			return;
+		}
+		BSizeColumn::DrawField(field, rect, parent);
+	}
+};
+
+
+static BString
+short_revision(BString revision)
+{
+	// "hrev60207-1930-gabcdef0123" -> "hrev60207+1930", as Release does
+	int32 dash = revision.FindFirst('-');
+	if (dash > 0) {
+		int32 secondDash = revision.FindFirst('-', dash + 1);
+		if (secondDash > 0)
+			revision.Truncate(secondDash);
+		revision.SetByteAt(dash, '+');
+	}
+	return revision;
+}
+
+
+static BStringView*
+details_label(const char* text)
+{
+	BStringView* label = new BStringView(NULL, text);
+	label->SetAlignment(B_ALIGN_RIGHT);
+	label->SetHighUIColor(B_PANEL_TEXT_COLOR, B_DISABLED_LABEL_TINT);
+	return label;
+}
+
+
+static BStringView*
+details_value()
+{
+	BStringView* value = new BStringView(NULL, "");
+	value->SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, B_SIZE_UNSET));
+	value->SetTruncation(B_TRUNCATE_END);
+	return value;
+}
 
 
 // #pragma mark - VersionItem
@@ -134,8 +227,11 @@ UpdaterWindow::UpdaterWindow()
 	BWindow(BRect(100, 100, 700, 600), "System Updater", B_TITLED_WINDOW,
 		B_AUTO_UPDATE_SIZE_LIMITS | B_ASYNCHRONOUS_CONTROLS
 			| B_QUIT_ON_WINDOW_CLOSE),
+	fHaveDetails(false),
 	fWorker(NULL),
 	fInstallWindow(NULL),
+	fDesktopClosed(false),
+	fInstallCancelRequested(false),
 	fRestartRunner(NULL),
 	fRestarting(false),
 	fMode(kModeIdle),
@@ -160,8 +256,13 @@ UpdaterWindow::UpdaterWindow()
 		MoveTo(fSettings.windowFrame.LeftTop());
 		ResizeTo(fSettings.windowFrame.Width(), fSettings.windowFrame.Height());
 		MoveOnScreen();
-	} else
+	} else {
+		// room for the packages an update changes; the layout's minimum
+		// size wins where that is larger
+		ResizeTo(be_plain_font->StringWidth("M") * 58,
+			be_plain_font->Size() * 52);
 		CenterOnScreen();
+	}
 
 	fWorker = new UpdateWorker(BMessenger(this));
 	fWorker->Run();
@@ -210,15 +311,71 @@ UpdaterWindow::_CreateUpdatesTab()
 	fSummaryView->SetExplicitMinSize(BSize(be_plain_font->StringWidth(
 		"M") * 40, be_plain_font->Size() * 4));
 
-	fChangesView = new BTextView("changes");
-	fChangesView->MakeEditable(false);
-	fChangesView->SetWordWrap(true);
-	BScrollView* changesScroll = new BScrollView("changes scroll",
-		fChangesView, 0, false, true);
-	changesScroll->SetExplicitMinSize(BSize(B_SIZE_UNSET,
+	// the update: its version and what it downloads
+	fNewVersionView = details_value();
+	fRunningVersionView = details_value();
+	fDownloadView = details_value();
+	fDetailsView = new BGridView("details", B_USE_SMALL_SPACING,
+		B_USE_HALF_ITEM_SPACING);
+	BLayoutBuilder::Grid<>(fDetailsView)
+		.Add(details_label("New version:"), 0, 0)
+		.Add(fNewVersionView, 1, 0)
+		.Add(details_label("Running now:"), 0, 1)
+		.Add(fRunningVersionView, 1, 1)
+		.Add(details_label("Download:"), 0, 2)
+		.Add(fDownloadView, 1, 2)
+		.SetColumnWeight(1, 1.0f);
+
+	// the packages it changes
+	float em = be_plain_font->StringWidth("M");
+	fPackagesView = new BColumnListView("packages", 0, B_FANCY_BORDER, false);
+	fPackagesView->SetSelectionMode(B_SINGLE_SELECTION_LIST);
+	fPackagesView->SetSortingEnabled(true);
+	float columnWidths[] = { em * 12, em * 15, em * 15, em * 7 };
+	fPackagesView->AddColumn(new BStringColumn("Package", columnWidths[0],
+		em * 6, em * 40, B_TRUNCATE_END), kPackageColumn);
+	fPackagesView->AddColumn(new BStringColumn("Current version",
+		columnWidths[1], em * 6, em * 40, B_TRUNCATE_MIDDLE), kFromColumn);
+	fPackagesView->AddColumn(new BStringColumn("New version",
+		columnWidths[2], em * 6, em * 40, B_TRUNCATE_MIDDLE), kToColumn);
+	fPackagesView->AddColumn(new DownloadColumn("Download", columnWidths[3],
+		em * 4, em * 12), kDownloadColumn);
+	fPackagesView->SetSortColumn(fPackagesView->ColumnAt(kPackageColumn),
+		false, true);
+	// every column without scrolling, and a good part of the list
+	float tableWidth = be_control_look->DefaultLabelSpacing() * 2
+		+ be_control_look->GetScrollBarWidth(B_VERTICAL);
+	for (size_t i = 0; i < B_COUNT_OF(columnWidths); i++)
+		tableWidth += columnWidths[i] + 1;
+	fPackagesView->SetExplicitMinSize(BSize(tableWidth,
 		be_plain_font->Size() * 12));
-	fChangesScroll = changesScroll;
-	fChangesLabel = new BStringView("changes label", "What's new:");
+	fPackagesLabel = new BStringView("packages label",
+		"Updated applications and packages:");
+
+	fPackagesGroup = new BView("packages group", 0);
+	BLayoutBuilder::Group<>(fPackagesGroup, B_VERTICAL, B_USE_HALF_ITEM_SPACING)
+		.Add(fPackagesLabel)
+		.Add(fPackagesView, 1.0);
+
+	// the release notes
+	fNotesView = new BTextView("notes");
+	fNotesView->MakeEditable(false);
+	fNotesView->SetWordWrap(true);
+	BScrollView* notesScroll = new BScrollView("notes scroll", fNotesView, 0,
+		false, true);
+	notesScroll->SetExplicitMinSize(BSize(B_SIZE_UNSET,
+		be_plain_font->Size() * 5));
+
+	fNotesGroup = new BView("notes group", 0);
+	BLayoutBuilder::Group<>(fNotesGroup, B_VERTICAL, B_USE_HALF_ITEM_SPACING)
+		.Add(new BStringView("notes label", "What's new:"))
+		.Add(notesScroll, 1.0);
+
+	fChangesSplit = new BSplitView(B_VERTICAL, B_USE_SMALL_SPACING);
+	BLayoutBuilder::Split<>(fChangesSplit)
+		.Add(fPackagesGroup, 0.6f)
+		.Add(fNotesGroup, 0.4f);
+	fChangesSplit->SetCollapsible(false);
 
 	fProgressBar = new BStatusBar("progress");
 	fProgressBar->SetMaxValue(1.0);
@@ -240,8 +397,8 @@ UpdaterWindow::_CreateUpdatesTab()
 		.SetInsets(B_USE_WINDOW_SPACING)
 		.Add(fTitleView)
 		.Add(fSummaryView, 0)
-		.Add(fChangesLabel)
-		.Add(changesScroll, 1.0)
+		.Add(fDetailsView)
+		.Add(fChangesSplit, 1.0)
 		.Add(fChangesGlue, 0)
 		.Add(fProgressBar)
 		.AddGroup(B_HORIZONTAL)
@@ -341,6 +498,11 @@ UpdaterWindow::QuitRequested()
 		if (alert->Go() == 0)
 			return false;
 		fWorker->Cancel();
+	}
+	if (fDesktopClosed) {
+		// leaving: Deskbar and Tracker must not stay away
+		Desktop::Restore();
+		fDesktopClosed = false;
 	}
 	_SaveSettings();
 	return true;
@@ -464,11 +626,10 @@ UpdaterWindow::_ShowState()
 			break;
 		case kModeAvailable:
 			title = "An update is available";
-			summary << fAvailableTitle << " is available. This computer runs "
-				<< running << ".\nInstall and Reboot first closes your "
-				"applications, so that each can ask you to save your work, "
-				"then installs the update and restarts the computer. The "
-				"version you run now stays installed.";
+			summary << "Install and Reboot first closes your applications, so "
+				"that each can ask you to save your work, then installs the "
+				"update and restarts the computer. The version you run now "
+				"stays installed.";
 			if (!fLastResult.IsEmpty())
 				summary << "\n" << fLastResult;
 			main = "Install and Reboot";
@@ -544,13 +705,15 @@ UpdaterWindow::_ShowState()
 	fMainButton->SetLabel(main);
 	fSecondaryButton->SetLabel(secondary);
 
-	// Blank until a check has finished, which can take a minute: show the
-	// box only with something in it.
-	bool showChanges = (fMode == kModeIdle || fMode == kModeAvailable
-			|| fMode == kModeClosingApps || fMode == kModeInstalling)
-		&& fChangesView->TextLength() > 0;
-	_SetVisible(fChangesLabel, showChanges);
-	_SetVisible(fChangesScroll, showChanges);
+	// Empty until a check has found an update, which can take a minute:
+	// shown only with something in it.
+	bool showChanges = (fMode == kModeAvailable || fMode == kModeClosingApps
+			|| fMode == kModeInstalling)
+		&& fHaveDetails;
+	if (showChanges)
+		fRunningVersionView->SetText(running);
+	_SetVisible(fDetailsView, showChanges);
+	_SetVisible(fChangesSplit, showChanges);
 	BGroupLayout* layout = dynamic_cast<BGroupLayout*>(fChangesGlue->Layout());
 	if (layout != NULL) {
 		layout->SetItemWeight(layout->IndexOfItem(fChangesGlue),
@@ -568,6 +731,79 @@ UpdaterWindow::_ShowState()
 	// close the applications and install, or restart.
 	fMainButton->MakeDefault(false);
 	_SelectVersion();
+}
+
+
+/*!	What the check found: the release, what it downloads, the packages it
+	changes and its notes.
+*/
+void
+UpdaterWindow::_ShowAvailable(BMessage* message)
+{
+	BString version = fAvailableTitle;
+	BString revision = message->GetString("revision", "");
+	if (!revision.IsEmpty())
+		version << " (" << short_revision(revision) << ")";
+	fNewVersionView->SetText(version);
+
+	int64 size = message->GetInt64("size", -1);
+	int32 packages = message->GetInt32("packages", -1);
+	int32 removed = 0;
+	BMessage row;
+	for (int32 i = 0; message->FindMessage("package", i, &row) == B_OK; i++) {
+		if (row.GetString("to", "")[0] == '\0')
+			removed++;
+	}
+	BString download;
+	if (packages >= 0) {
+		download.SetToFormat("%s · %" B_PRId32 " package%s",
+			Updater::FormatSize(size).String(), packages,
+			packages == 1 ? "" : "s");
+		if (removed > 0)
+			download << BString().SetToFormat(", %" B_PRId32 " removed", removed);
+	} else if (size > 0)
+		download.SetToFormat("up to %s", Updater::FormatSize(size).String());
+	else
+		download = "unknown";
+	fDownloadView->SetText(download);
+
+	fPackagesView->Clear();
+	for (int32 i = 0; message->FindMessage("package", i, &row) == B_OK; i++) {
+		BString from = row.GetString("from", "");
+		BString to = row.GetString("to", "");
+		BRow* item = new BRow();
+		item->SetField(new BStringField(row.GetString("name", "")),
+			kPackageColumn);
+		item->SetField(new BStringField(from.IsEmpty() ? "— (new)" : from),
+			kFromColumn);
+		if (to.IsEmpty())
+			to = "— (removed)";
+		else if (to == from)
+			to << " (rebuilt)";
+		item->SetField(new BStringField(to), kToColumn);
+		item->SetField(new DownloadField(row.GetInt64("size", -1)),
+			kDownloadColumn);
+		fPackagesView->AddRow(item);
+	}
+	bool havePackages = fPackagesView->CountRows() > 0;
+	fChangesSplit->SetItemCollapsed(0, !havePackages);
+
+	BString notes = message->GetString("changes", "");
+	notes.Trim();
+	fNotesView->SetText(notes);
+	fNotesView->ScrollToOffset(0);
+	fChangesSplit->SetItemCollapsed(1, notes.IsEmpty());
+
+	fHaveDetails = havePackages || !notes.IsEmpty();
+}
+
+
+void
+UpdaterWindow::_ClearAvailable()
+{
+	fHaveDetails = false;
+	fPackagesView->Clear();
+	fNotesView->SetText("");
 }
 
 
@@ -621,6 +857,10 @@ UpdaterWindow::_Restart()
 	status_t error = BRoster::Private().ShutDown(true, false, false);
 	if (error != B_OK) {
 		fRestarting = false;
+		if (fDesktopClosed) {
+			Desktop::Restore();
+			fDesktopClosed = false;
+		}
 		(new BAlert("System Updater", BString().SetToFormat(
 			"The computer cannot restart: %s", strerror(error)), "OK", NULL,
 			NULL, B_WIDTH_AS_USUAL, B_WARNING_ALERT))->Go(NULL);
@@ -641,24 +881,51 @@ UpdaterWindow::_Restart()
 }
 
 
-/*!	The applications are closed: download and install in the window that
-	stays in front, then restart.
+/*!	The applications are closed: from here on, as in a shutdown, the screen
+	shows only the install window over the desktop color. Deskbar and
+	Tracker quit next (kMsgCloseDesktopDone), then the update is downloaded
+	and installed, and the computer restarts.
 */
 void
 UpdaterWindow::_StartInstall()
 {
 	fMode = kModeInstalling;
+	fInstallCancelRequested = false;
 	_SetBusy(true, "Preparing the update…");
 	if (fInstallWindow == NULL) {
 		fInstallWindow = new InstallWindow(fAvailableTitle,
 			BMessenger(this));
+		fInstallWindow->SetStatus("Closing the desktop…", -1);
 		fInstallWindow->Show();
 	}
-	Updater::Log("installing %s after closing the applications",
-		fAvailableId.String());
-	BMessage install(kMsgInstall);
-	install.AddString("id", fAvailableId);
-	fWorker->PostMessage(&install);
+	if (!IsHidden())
+		Hide();
+	fDesktopClosed = true;
+	fWorker->PostMessage(kMsgCloseDesktop);
+}
+
+
+/*!	The update did not go ahead and nothing changed: the desktop and this
+	window come back.
+*/
+void
+UpdaterWindow::_InstallCancelled()
+{
+	Updater::Log("install of %s cancelled", fAvailableId.String());
+	if (fInstallWindow != NULL && fInstallWindow->Lock()) {
+		fInstallWindow->Quit();
+		fInstallWindow = NULL;
+	}
+	if (fDesktopClosed) {
+		Desktop::Restore();
+		fDesktopClosed = false;
+	}
+	if (IsHidden())
+		Show();
+	Activate();
+	fMode = kModeAvailable;
+	fLastResult = "The update was stopped; nothing was changed.";
+	_Refresh();
 }
 
 
@@ -669,14 +936,7 @@ UpdaterWindow::_InstallFinished(BMessage* message)
 	const char* error = message->GetString("error", NULL);
 	if (message->GetBool("cancelled", false)) {
 		// the user stopped it: nothing changed, no restart
-		Updater::Log("install of %s cancelled", fAvailableId.String());
-		if (fInstallWindow != NULL && fInstallWindow->Lock()) {
-			fInstallWindow->Quit();
-			fInstallWindow = NULL;
-		}
-		fMode = kModeAvailable;
-		fLastResult = "The update was stopped; nothing was changed.";
-		_Refresh();
+		_InstallCancelled();
 		return;
 	}
 
@@ -808,7 +1068,26 @@ UpdaterWindow::MessageReceived(BMessage* message)
 			}
 			break;
 
+		case kMsgCloseDesktopDone:
+		{
+			if (fInstallCancelRequested) {
+				_InstallCancelled();
+				break;
+			}
+			Updater::Log("installing %s after closing the applications",
+				fAvailableId.String());
+			if (fInstallWindow != NULL && fInstallWindow->Lock()) {
+				fInstallWindow->SetStatus("Preparing the update…", -1);
+				fInstallWindow->Unlock();
+			}
+			BMessage install(kMsgInstall);
+			install.AddString("id", fAvailableId);
+			fWorker->PostMessage(&install);
+			break;
+		}
+
 		case kMsgCancelInstall:
+			fInstallCancelRequested = true;
 			fWorker->Cancel();
 			break;
 
@@ -829,6 +1108,11 @@ UpdaterWindow::MessageReceived(BMessage* message)
 				break;
 			}
 			fRestarting = false;
+			// what stopped it may need the desktop to be dealt with
+			if (fDesktopClosed) {
+				Desktop::Restore();
+				fDesktopClosed = false;
+			}
 			if (fInstallWindow != NULL && fInstallWindow->Lock()) {
 				fInstallWindow->SetRestartStalled();
 				fInstallWindow->Unlock();
@@ -847,28 +1131,15 @@ UpdaterWindow::MessageReceived(BMessage* message)
 			if (error != NULL) {
 				fMode = kModeIdle;
 				fCheckError = error;
-				fChangesView->SetText("");
+				_ClearAvailable();
 			} else if (message->GetBool("available", false)) {
 				fMode = kModeAvailable;
 				fAvailableId = message->GetString("id", "");
 				fAvailableTitle = message->GetString("title", "");
-				BString changes = message->GetString("changes", "");
-				int64 size = message->GetInt64("size", -1);
-				int32 packages = message->GetInt32("packages", -1);
-				if (packages >= 0) {
-					changes.Prepend(BString().SetToFormat(
-						"Download: %s (%" B_PRId32 " package%s)\n\n",
-						Updater::FormatSize(size).String(), packages,
-						packages == 1 ? "" : "s"));
-				} else if (size > 0) {
-					changes.Prepend(BString().SetToFormat(
-						"Download: up to %s\n\n",
-						Updater::FormatSize(size).String()));
-				}
-				fChangesView->SetText(changes);
+				_ShowAvailable(message);
 			} else {
 				fMode = kModeIdle;
-				fChangesView->SetText("No newer release.");
+				_ClearAvailable();
 			}
 			_ShowState();
 			break;

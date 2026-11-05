@@ -8,6 +8,7 @@ SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src system libroot posix crypt ] ;
 
 Application SystemUpdater :
 	CommandLine.cpp
+	Desktop.cpp
 	Feed.cpp
 	InstallWindow.cpp
 	PiBoot.cpp
@@ -22,7 +23,7 @@ Application SystemUpdater :
 	# libroot's SHA-256
 	SHA256.cpp
 
-	: be bnetapi libnetservices.a package shared [ TargetLibsupc++ ]
+	: be bnetapi libcolumnlistview.a libnetservices.a package shared [ TargetLibsupc++ ]
 		[ TargetLibstdc++ ]
 	: SystemUpdater.rdef
 ;
