@@ -33,6 +33,12 @@ enum {
 
 #define SCREEN_BLANKER_SIG "application/x-vnd.Haiku.screenblanker"
 
+// While any team owns a port with this name, the screen saver does not start
+// on its own (as if the user were active); a blank corner still starts it.
+// The port goes away with the team that created it, so a holder that crashes
+// does not keep the screen on.
+#define SCREEN_SAVER_HOLD_PORT_NAME "screen saver hold"
+
 
 class ScreenSaverSettings {
 public:

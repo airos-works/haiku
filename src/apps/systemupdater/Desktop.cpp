@@ -13,6 +13,7 @@
 #include <Roster.h>
 
 #include <LaunchRoster.h>
+#include <ScreenSaverSettings.h>
 
 #include "Updater.h"
 
@@ -37,6 +38,8 @@ const int32 kDesktopAppCount
 const bigtime_t kQuitTimeout = 15000000;
 
 bool sClosed = false;
+port_id sScreenSaverHold = -1;
+	// owned by this team: gone with it should it crash
 
 
 bool
@@ -55,6 +58,14 @@ Desktop::Close()
 	BLaunchRoster launchRoster;
 	status_t result = B_OK;
 	sClosed = true;
+
+	if (sScreenSaverHold < 0) {
+		sScreenSaverHold = create_port(1, SCREEN_SAVER_HOLD_PORT_NAME);
+		if (sScreenSaverHold < 0) {
+			Updater::Log("cannot hold the screen saver off: %s",
+				strerror(sScreenSaverHold));
+		}
+	}
 
 	for (int32 i = 0; i < kDesktopAppCount; i++) {
 		const DesktopApp& app = kDesktopApps[i];
@@ -101,6 +112,11 @@ Desktop::Restore()
 	if (!sClosed)
 		return;
 	sClosed = false;
+
+	if (sScreenSaverHold >= 0) {
+		delete_port(sScreenSaverHold);
+		sScreenSaverHold = -1;
+	}
 
 	BLaunchRoster launchRoster;
 	// Tracker first, as the system starts them

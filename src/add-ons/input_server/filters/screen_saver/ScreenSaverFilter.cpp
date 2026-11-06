@@ -255,8 +255,14 @@ ScreenSaverFilter::CheckTime()
 	BAutolock _(this);
 
 	bigtime_t now = system_time();
-	if (now >= fLastEventTime + fBlankTime)
-		_Invoke();
+	if (now >= fLastEventTime + fBlankTime) {
+		if (find_port(SCREEN_SAVER_HOLD_PORT_NAME) >= 0) {
+			// held off (a system update, for one): counts as activity, so
+			// the full blank time passes after the hold ends
+			fLastEventTime = now;
+		} else
+			_Invoke();
+	}
 
 	// TODO: this doesn't work correctly - since the BMessageRunner is not
 	// restarted, the next check will be too far away

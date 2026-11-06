@@ -12,7 +12,8 @@
 // Deskbar and Tracker, closed for an update as a shutdown closes them, so
 // that the screen shows only the install window over the desktop color.
 // launch_daemon starts both again when they quit; their jobs are disabled
-// while they are closed.
+// while they are closed. The screen saver is held off meanwhile, so that the
+// screen stays on through a long download.
 namespace Desktop {
 
 status_t	Close();

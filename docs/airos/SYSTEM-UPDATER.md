@@ -26,7 +26,11 @@ does not start is replaced by the one before it without help.
   every file, installs it for the next start and restarts. launch_daemon
   starts Deskbar and Tracker again whenever they quit, so their service jobs
   (`x-vnd.Be-TSKB`, `x-vnd.Be-TRAK`) are disabled first (in memory only: the
-  next start has them as always). *Cancel* works until the install itself
+  next start has them as always). The screen saver stays off meanwhile, so
+  a long download does not blank the screen: System Updater owns a port
+  named `screen saver hold`, and the screen saver's input_server filter does
+  not start the blanker while one exists (the port dies with the team, so a
+  crash cannot leave the screen saver off). *Cancel* works until the install itself
   begins; it brings Deskbar, Tracker and the window back, as does a restart
   that does not happen. Nothing changes in the running system.
 - If installing fails after the applications were closed (a download that

@@ -1,7 +1,7 @@
 SubDir HAIKU_TOP src apps systemupdater ;
 
-UsePrivateHeaders app interface kernel libroot netservices package shared storage
-	system ;
+UsePrivateHeaders app interface kernel libroot netservices package screen_saver
+	shared storage system ;
 UsePrivateSystemHeaders ;
 
 SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src system libroot posix crypt ] ;
