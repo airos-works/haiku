@@ -422,8 +422,11 @@ reschedule(int32 nextState)
 			&& oldThread->pinned_to_cpu == 0 && !oldThreadData->IsIdle()) {
 			uint32 minCapacity = UINT32_MAX;
 			if (putOldThreadAtBack) {
+				// sharing a core leaves each thread about half of it: an
+				// idle core three fifths as fast is better (a Zen 5c core
+				// against half a Zen 5)
 				if (core->ThreadCount() > 1)
-					minCapacity = core->Capacity();
+					minCapacity = (uint32)((uint64)core->Capacity() * 3 / 5);
 				else if (gHeterogeneousCores
 					&& core->Capacity() < gMaxCoreCapacity)
 					minCapacity = core->Capacity() + 1;
