@@ -143,22 +143,29 @@ PowerPolicy::LoadSettings()
 void
 PowerPolicy::SetOnAC(bool onAC)
 {
-	BAutolock _(fLock);
+	bool firstTime;
+	int32 batteryBrightness;
+	{
+		BAutolock _(fLock);
 
-	bool changed = !fKnowSource || onAC != fOnAC;
-	bool firstTime = !fKnowSource;
-	fOnAC = onAC;
-	fKnowSource = true;
-	if (!changed)
-		return;
+		bool changed = !fKnowSource || onAC != fOnAC;
+		firstTime = !fKnowSource;
+		fOnAC = onAC;
+		fKnowSource = true;
+		if (!changed)
+			return;
 
-	printf("power_daemon: on %s\n", onAC ? "AC" : "battery");
-	_ApplyProfile();
+		printf("power_daemon: on %s\n", onAC ? "AC" : "battery");
+		_ApplyProfile();
+		batteryBrightness = fBatteryBrightness;
+	}
 
 	// The display is dimmed on battery, and gets its brightness back when
 	// the machine is plugged in again. (Not at start-up: app_server is not
-	// there yet, and the brightness is what the user left it at.)
-	if (firstTime || fBatteryBrightness <= 0 || !_InitGUI())
+	// there yet, and the brightness is what the user left it at.) Without
+	// the lock: _InitGUI() locks the application, whose looper takes the
+	// lock to load changed settings.
+	if (firstTime || batteryBrightness <= 0 || !_InitGUI())
 		return;
 
 	BScreen screen;
@@ -166,9 +173,10 @@ PowerPolicy::SetOnAC(bool onAC)
 	if (screen.GetBrightness(&brightness) != B_OK)
 		return;
 
+	BAutolock _(fLock);
 	if (!onAC) {
 		fACBrightness = brightness;
-		float limit = fBatteryBrightness / 100.f;
+		float limit = batteryBrightness / 100.f;
 		if (brightness > limit)
 			screen.SetBrightness(limit);
 	} else if (fACBrightness >= 0) {
@@ -395,7 +403,13 @@ PowerPolicy::_ApplyProfile()
 bool
 PowerPolicy::_InitGUI()
 {
-	return fServer->InitGUIContext() == B_OK;
+	// From the event loop thread: with the application locked, so that its
+	// looper does not (re)connect to app_server at the same time.
+	if (!fServer->Lock())
+		return false;
+	status_t status = fServer->InitGUIContext();
+	fServer->Unlock();
+	return status == B_OK;
 }
 
 

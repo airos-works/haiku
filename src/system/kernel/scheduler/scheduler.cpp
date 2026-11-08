@@ -407,15 +407,44 @@ reschedule(int32 nextState)
 			fetchedOldThreadMask = true;
 		}
 		bool oldThreadShouldMigrate = useOldThreadMask && !oldThreadMask.GetBit(thisCPU);
-		// A thread that used up its quantum on a slower core moves to a
-		// faster one that has nothing to do: a thread that never waits
-		// would otherwise stay wherever it started (it is placed only when
-		// it wakes up). Saving power keeps threads packed instead.
-		if (!oldThreadShouldMigrate && putOldThreadAtBack
-			&& gHeterogeneousCores && gCurrentMode == &gSchedulerLowLatencyMode
-			&& oldThread->pinned_to_cpu == 0
+		// Low latency: a thread that never waits is placed only when it wakes
+		// up, so it would stay wherever it started. It moves to a core that
+		// has nothing to do
+		// - when it used up its quantum on a slower core (cores of several
+		//   speeds), or on a core whose other processors are busy too (two
+		//   busy threads on the two halves of one core, with whole cores
+		//   idle, did a third less work), and
+		// - when a thread of higher priority took its processor (below): it
+		//   would wait for that one otherwise.
+		// Saving power keeps threads packed instead.
+		if (!oldThreadShouldMigrate && enqueueOldThread
+			&& gCurrentMode == &gSchedulerLowLatencyMode
+			&& oldThread->pinned_to_cpu == 0 && !oldThreadData->IsIdle()) {
+			uint32 minCapacity = UINT32_MAX;
+			if (putOldThreadAtBack) {
+				// sharing a core leaves each thread about half of it: an
+				// idle core three fifths as fast is better (a Zen 5c core
+				// against half a Zen 5)
+				if (core->ThreadCount() > 1)
+					minCapacity = (uint32)((uint64)core->Capacity() * 3 / 5);
+				else if (gHeterogeneousCores
+					&& core->Capacity() < gMaxCoreCapacity)
+					minCapacity = core->Capacity() + 1;
+			}
+			if (minCapacity != UINT32_MAX
+				&& FastestIdleCore(oldThreadData, minCapacity) != NULL) {
+				oldThreadShouldMigrate = true;
+			}
+		}
+		// Saving power, cores of several speeds: a thread that keeps a
+		// slower core nearly busy does not fit there (see power_saving.cpp).
+		if (!oldThreadShouldMigrate && enqueueOldThread && putOldThreadAtBack
+			&& gHeterogeneousCores
+			&& gCurrentMode == &gSchedulerPowerSavingMode
+			&& oldThread->pinned_to_cpu == 0 && !oldThreadData->IsIdle()
 			&& core->Capacity() < gMaxCoreCapacity
-			&& FastestIdleCore(oldThreadData, core->Capacity()) != NULL) {
+			&& oldThreadData->GetLoad() >= kVeryHighLoad
+			&& FastestIdleCore(oldThreadData, core->Capacity() + 1) != NULL) {
 			oldThreadShouldMigrate = true;
 		}
 		if (oldThreadShouldMigrate)
@@ -444,7 +473,15 @@ reschedule(int32 nextState)
 		if (enqueueOldThread) {
 			if (putOldThreadAtBack)
 				enqueue(oldThread, false);
-			else
+			else if (gCurrentMode == &gSchedulerLowLatencyMode
+				&& oldThread->pinned_to_cpu == 0
+				&& FastestIdleCore(oldThreadData, core->Capacity()) != NULL) {
+				// Displaced by a thread of higher priority, with a core as
+				// fast idle. (Not a slower one: a busy thread that a short
+				// wake-up sent to a little core ran there at a third of the
+				// speed until its quantum ended.)
+				enqueue(oldThread, true);
+			} else
 				oldThreadData->PutBack();
 		}
 
@@ -606,6 +643,12 @@ scheduler_set_cpu_enabled(int32 cpuID, bool enabled)
 	else {
 		cpu->UpdatePriority(B_IDLE_PRIORITY);
 
+		// Before its core goes: RemoveCPU() enqueues the threads waiting
+		// there at once, and one whose affinity mask still had this CPU
+		// found no core for it ("core != NULL" failed in choose_core(), as
+		// a laptop went to sleep while a thread was pinned to a CPU).
+		gCPUEnabled.ClearBitAtomic(cpuID);
+
 		ThreadEnqueuer enqueuer;
 		core->RemoveCPU(cpu, enqueuer);
 	}
@@ -613,8 +656,6 @@ scheduler_set_cpu_enabled(int32 cpuID, bool enabled)
 	gCPU[cpuID].disabled = !enabled;
 	if (enabled)
 		gCPUEnabled.SetBitAtomic(cpuID);
-	else
-		gCPUEnabled.ClearBitAtomic(cpuID);
 
 	if (!enabled) {
 		cpu->Stop();

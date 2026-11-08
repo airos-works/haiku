@@ -47,13 +47,36 @@ has_cache_expired(const ThreadData* threadData)
 }
 
 
+/*!	Cores of several speeds: the busiest of the slowest cores that still
+	has room, where small tasks cost the least energy. NULL when there is
+	none.
+*/
+static CoreEntry*
+slow_core_with_room()
+{
+	CoreEntry* chosen = NULL;
+	for (int32 i = 0; i < gCoreCount; i++) {
+		CoreEntry* core = &gCoreEntries[i];
+		if (core->CPUCount() == 0 || core->GetLoad() >= kHighLoad)
+			continue;
+		if (chosen == NULL || core->Capacity() < chosen->Capacity()
+			|| (core->Capacity() == chosen->Capacity()
+				&& core->GetLoad() > chosen->GetLoad())) {
+			chosen = core;
+		}
+	}
+	return chosen;
+}
+
+
 static CoreEntry*
 choose_small_task_core()
 {
 	SCHEDULER_ENTER_FUNCTION();
 
 	ReadSpinLocker coreLocker(gCoreHeapsLock);
-	CoreEntry* core = gCoreLoadHeap.PeekMaximum();
+	CoreEntry* core = gHeterogeneousCores
+		? slow_core_with_room() : gCoreLoadHeap.PeekMaximum();
 	if (core == NULL)
 		return sSmallTaskCore;
 
@@ -138,23 +161,52 @@ rebalance(const ThreadData* threadData)
 
 	CoreEntry* core = threadData->Core();
 
-	int32 coreLoad = core->GetLoad();
+	// What the core's threads ask for, not what it can give them: the load
+	// of a core stops at "all of it", so with six busy threads packed onto
+	// one core each of them wanted more than a third of that, none ever
+	// left, and six threads got the work of one done (Ryzen AI 5 340 on
+	// battery, eleven other processors idle).
+	int32 coreLoad = core->GetRequestedLoad();
 	int32 threadLoad = threadData->GetLoad()
 		/ std::max(core->CPUCount(), (int32)1);
 		// (0 while its last CPU is being disabled)
+	// More than the core can run: then even a thread that is much of its
+	// load leaves it (two busy threads on one core, each half of it, both
+	// stayed while other cores were idle).
+	const bool overloaded = coreLoad > kMaxLoad;
+
+	// Cores of several speeds. A thread that keeps a slower core nearly
+	// busy does not fit there: it goes to a faster idle core, as Linux's
+	// energy aware scheduling moves a "misfit" task. A 3 ms job every frame
+	// took 14.5 ms on a ROCK 5's Cortex-A55 (87 % of it) and never moved.
+	// One that is not a busy thread itself (it waits between bursts) may
+	// also take a faster core from a thread of lower priority: with every
+	// core busy it otherwise missed 52 of 120 frames on a little core.
+	if (gHeterogeneousCores && core->Capacity() < gMaxCoreCapacity
+		&& threadData->GetLoad() >= kVeryHighLoad) {
+		CoreEntry* faster = FastestIdleCore(threadData, core->Capacity() + 1);
+		if (faster == NULL && !threadData->IsPenalized()) {
+			faster = FastestPreemptibleCore(threadData, core->Capacity() + 1,
+				threadData->GetEffectivePriority());
+		}
+		if (faster != NULL)
+			return faster;
+	}
+
 	if (coreLoad > kHighLoad) {
 		if (sSmallTaskCore == core) {
 			sSmallTaskCore = NULL;
 			CoreEntry* smallTaskCore = choose_small_task_core();
 
-			if (threadLoad > coreLoad / 3 || smallTaskCore == NULL
-					|| (useMask && !smallTaskCore->CPUMask().Matches(mask))) {
+			if ((threadLoad > coreLoad / 3 && !overloaded)
+				|| smallTaskCore == NULL || smallTaskCore == core
+				|| (useMask && !smallTaskCore->CPUMask().Matches(mask))) {
 				return core;
 			}
 			return coreLoad > kVeryHighLoad ? smallTaskCore : core;
 		}
 
-		if (threadLoad >= coreLoad / 2)
+		if (threadLoad >= coreLoad / 2 && !overloaded)
 			return core;
 
 		ReadSpinLocker coreLocker(gCoreHeapsLock);
@@ -174,6 +226,11 @@ rebalance(const ThreadData* threadData)
 
 		int32 coreNewLoad = coreLoad - threadLoad;
 		int32 otherNewLoad = other->GetLoad() + threadLoad;
+		if (overloaded) {
+			// moving it makes the two closer
+			return coreNewLoad - other->GetLoad() >= kLoadDifference / 2
+				? other : core;
+		}
 		return coreNewLoad - otherNewLoad >= kLoadDifference / 2 ? other : core;
 	}
 
@@ -183,6 +240,14 @@ rebalance(const ThreadData* threadData)
 	CoreEntry* smallTaskCore = choose_small_task_core();
 	if (smallTaskCore == NULL || (useMask && !smallTaskCore->CPUMask().Matches(mask)))
 		return core;
+	if (smallTaskCore->Capacity() < core->Capacity()) {
+		// To a slower core: what the thread would need there, with room to
+		// spare, or it would only come back as a misfit.
+		int32 loadThere = (int32)((int64)threadLoad * core->Capacity()
+			/ std::max(smallTaskCore->Capacity(), (uint32)1));
+		return smallTaskCore->GetLoad() + loadThere < kLowLoad * 2
+			? smallTaskCore : core;
+	}
 	return smallTaskCore->GetLoad() + threadLoad < kHighLoad
 		? smallTaskCore : core;
 }

@@ -273,7 +273,9 @@ extern int32 gCoreCount;
 extern bool gHeterogeneousCores;
 extern uint32 gMaxCoreCapacity;
 
-CoreEntry* FastestIdleCore(const ThreadData* thread, uint32 fasterThan);
+CoreEntry* FastestIdleCore(const ThreadData* thread, uint32 minCapacity);
+CoreEntry* FastestPreemptibleCore(const ThreadData* thread, uint32 minCapacity,
+	int32 priority);
 
 extern PackageEntry* gPackageEntries;
 extern IdlePackageList gIdlePackageList;

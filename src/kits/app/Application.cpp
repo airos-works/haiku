@@ -1467,6 +1467,13 @@ BApplication::_ConnectToServer()
 void
 BApplication::_ReconnectToServer()
 {
+	// A server that has not set up its GUI context yet (BServer) was never
+	// connected and connects when it needs to. Connecting it here as the
+	// app_server announces itself at boot only raced that (and ended in the
+	// debugger() call below: power_daemon on the Framework 13).
+	if (fServerLink->TargetTeam() < 0)
+		return;
+
 	team_info dummy;
 	if (get_team_info(fServerLink->TargetTeam(), &dummy) == B_OK) {
 		// We're already connected to the correct server.

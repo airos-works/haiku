@@ -111,8 +111,15 @@ static int32 sStateIndex = -1;
 // many times its exit latency
 static uint32 sResidencyFactor = 4;
 
-// low latency mode leaves out states slower than this to come out of (us)
+// Low latency mode enters states slower than this to come out of (us) only
+// on a processor that stayed idle for LOW_LATENCY_DEEP_FACTOR times as long
+// recently: one that wakes up often keeps answering quickly, and an idle one
+// still powers its core down. Leaving those states out altogether kept the
+// idle cores of a Threadripper 1950X in C1, which left no room for Precision
+// Boost: one busy thread ran 14 % slower than in power saving mode.
 #define LOW_LATENCY_MAX_EXIT	100
+#define LOW_LATENCY_DEEP_FACTOR	10
+static bool sLowLatency = true;
 
 // how long each CPU stayed idle recently (us), one cache line each
 struct idle_history {
@@ -250,18 +257,9 @@ acpi_cstate_set_scheduler_mode(scheduler_mode mode)
 	bool powerSaving = mode == SCHEDULER_MODE_POWER_SAVING;
 
 	acpi_cpuidle_driver_info *pi = sAcpiProcessor[0];
-	int32 index = -1;
-	for (int i = 0; i < pi->state_count; i++) {
-		if (!powerSaving && i > 0
-			&& pi->states[i].latency > LOW_LATENCY_MAX_EXIT) {
-			break;
-		}
-
-		index = i;
-	}
-
 	sResidencyFactor = powerSaving ? 2 : 4;
-	sStateIndex = index;
+	sLowLatency = !powerSaving;
+	sStateIndex = pi->state_count - 1;
 }
 
 
@@ -286,8 +284,13 @@ acpi_cstate_idle()
 	int32 cpu = smp_get_current_cpu();
 	acpi_cpuidle_driver_info *pi = sAcpiProcessor[cpu];
 	bigtime_t expected = sIdleTime[cpu].time;
-	while (stateIndex > 0 && (bigtime_t)pi->states[stateIndex].latency
-			* sResidencyFactor > expected) {
+	while (stateIndex > 0) {
+		bigtime_t latency = pi->states[stateIndex].latency;
+		bigtime_t needed = latency * sResidencyFactor;
+		if (sLowLatency && latency > LOW_LATENCY_MAX_EXIT)
+			needed = latency * LOW_LATENCY_DEEP_FACTOR;
+		if (needed <= expected)
+			break;
 		stateIndex--;
 	}
 

@@ -54,6 +54,8 @@ public:
 
 	inline	void		CancelPenalty();
 	inline	bool		ShouldCancelPenalty() const;
+	// it used up its quanta since it last waited for something long enough
+	inline	bool		IsPenalized() const	{ return fPriorityPenalty > 0; }
 
 			bool		ChooseCoreAndCPU(CoreEntry*& targetCore,
 							CPUEntry*& targetCPU);
