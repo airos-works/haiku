@@ -209,16 +209,25 @@ pack_irqs()
 	}
 
 	SpinLocker locker(cpu->irqs_lock);
-	while (cpu->irqs.First() != NULL) {
-		irq_assignment* irq = cpu->irqs.First();
+	irq_assignment* irq = cpu->irqs.First();
+	while (irq != NULL) {
 		locker.Unlock();
 
 		int32 newCPU = smallTaskCore->CPUHeap()->PeekRoot()->ID();
+		if (newCPU == cpu->cpu_num)
+			return;
 
-		if (newCPU != cpu->cpu_num)
-			assign_io_interrupt_to_cpu(irq->irq, newCPU);
+		assign_io_interrupt_to_cpu(irq->irq, newCPU);
 
 		locker.Lock();
+		// An architecture that cannot route the interrupt elsewhere (arm64
+		// so far) leaves it on this processor's list: asking again would
+		// never end. That spun this processor with interrupts disabled as
+		// soon as it went idle in power saving mode, and froze the machine
+		// (ROCK 5, Cubie).
+		if (irq->cpu == cpu->cpu_num)
+			return;
+		irq = cpu->irqs.First();
 	}
 }
 
