@@ -25,7 +25,7 @@ static uint32 sHWPGuaranteed;
 static uint32 sHWPEfficient;
 static uint32 sHWPHighest;
 
-static bool sAvoidBoost = true;
+static bool sSavePower = true;
 
 
 static void set_normal_pstate(void* /* dummy */, int cpu);
@@ -34,7 +34,7 @@ static void set_normal_pstate(void* /* dummy */, int cpu);
 static void
 pstates_set_scheduler_mode(scheduler_mode mode)
 {
-	sAvoidBoost = mode == SCHEDULER_MODE_POWER_SAVING;
+	sSavePower = mode == SCHEDULER_MODE_POWER_SAVING;
 	call_all_cpus(set_normal_pstate, NULL);
 }
 
@@ -74,12 +74,16 @@ set_normal_pstate(void* /* dummy */, int cpu)
 	sHWPGuaranteed = AMD_CPPC_NOMINAL_PERF(cap1);
 	sHWPHighest = AMD_CPPC_HIGHEST_PERF(cap1);
 
+	// The hardware chooses the clock between the efficient and the highest
+	// level, in both modes. Power saving asks it to favour efficiency (EPP,
+	// as Linux's "balance_power"), and no longer forbids boosting: capped at
+	// the guaranteed level, a busy thread on battery ran at 2.0 instead of
+	// up to 4.8 GHz (Ryzen AI 5 340), while an idle or lightly loaded
+	// machine draws the same either way.
 	uint64 request = AMD_CPPC_MIN_PERF(sHWPEfficient);
-	request |= AMD_CPPC_MAX_PERF(sAvoidBoost ? sHWPGuaranteed : sHWPHighest);
-	// (In power saving mode the hardware is asked to favour efficiency, as
-	// Linux's "balance_power": on a laptop's battery that matters.)
+	request |= AMD_CPPC_MAX_PERF(sHWPHighest);
 	request |= AMD_CPPC_EPP_PERF(
-		sAvoidBoost ? AMD_CPPC_EPP_BALANCE_POWERSAVE : AMD_CPPC_EPP_PERFORMANCE);
+		sSavePower ? AMD_CPPC_EPP_BALANCE_POWERSAVE : AMD_CPPC_EPP_PERFORMANCE);
 	x86_write_msr(MSR_AMD_CPPC_REQ, request & 0xffffffff);
 }
 
