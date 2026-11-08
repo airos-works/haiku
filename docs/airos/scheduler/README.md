@@ -105,11 +105,31 @@ X399, Zen 1 P-state scaling (package energy counter), low latency:
 
 So Zen 1 stays at P0 (idle cores sleep in CC6; Precision Boost above P0).
 
+## Master verified (17df11689f, 2026-11-09)
+
+Each machine ran master's own build (`suite.sh` in both modes, then two
+sleep-like CPU off/on cycles with a pinned thread in both modes):
+
+| | X399 | ROCK 5 |
+| --- | --- | --- |
+| low latency: 16 / 4 busy threads | 137 300 | 22 730 |
+| low latency: 3 ms job idle / next to all-but-one cores busy (p50) | 2.98 / 5.48 ms | 2.79 / 2.78 ms |
+| power saving: 3 ms job next to 4 / 16 busy threads (p50) | 3.19 ms | 2.79 ms |
+| wake-up latency p50 (idle) | 7 us | 4 us |
+| CPU off/on cycles | pass | pass |
+
+The laptop's packages are byte-identical to master but for the kernel's
+build date; its last full suite ran on the build before the EPP change, the
+EPP change itself was measured separately (see above).
+
 ## Open
 
 - The ROCK 5 has no DVFS at all: the A76 and A55 clusters stay at the
-  firmware's clocks. Lowering them needs SCMI clock calls to the trusted
-  firmware and the RK8602/RK806 regulators.
+  firmware's clocks (about 2.2 and 1.8 GHz). Lowering them usefully needs
+  SCMI clock calls to the trusted firmware and drivers for the RK8602 (I2C)
+  and RK806 (SPI) regulators; clocks alone save next to nothing, as idle
+  cores are clock-gated anyway. Left open by the owner's decision
+  (2026-11-09) until it can be measured: nothing meters the board's power.
 - arm64 cannot route interrupts to other CPUs (`arch_int_assign_to_cpu()`).
 - 2026-11-08 ~09:00 UTC the Framework 13 panicked ("core != NULL" in
   power_saving.cpp choose_core) going to sleep while schedperf had a thread
