@@ -57,6 +57,15 @@ public:
 	// it used up its quanta since it last waited for something long enough
 	inline	bool		IsPenalized() const	{ return fPriorityPenalty > 0; }
 
+	// Saving power on cores of several speeds: a thread that did not fit a
+	// slower core stays on faster ones until then. Its measured load swings
+	// with the window it was measured over (low right after it slept), and
+	// a periodic job went down to a little core every 200 ms by it.
+	inline	void		KeepOnFasterCores(bigtime_t until) const
+							{ fKeepFasterUntil = until; }
+	inline	bool		ShouldKeepOnFasterCores() const
+							{ return system_time() < fKeepFasterUntil; }
+
 			bool		ChooseCoreAndCPU(CoreEntry*& targetCore,
 							CPUEntry*& targetCPU);
 
@@ -120,6 +129,7 @@ private:
 			int32		fAdditionalPenalty;
 
 	mutable	int32		fEffectivePriority;
+	mutable	bigtime_t	fKeepFasterUntil;
 	mutable	bigtime_t	fBaseQuantum;
 
 			bigtime_t	fTimeUsed;

@@ -446,6 +446,7 @@ reschedule(int32 nextState)
 			&& oldThreadData->GetLoad() >= kVeryHighLoad
 			&& FastestIdleCore(oldThreadData, core->Capacity() + 1) != NULL) {
 			oldThreadShouldMigrate = true;
+			oldThreadData->KeepOnFasterCores(system_time() + 5000000);
 		}
 		if (oldThreadShouldMigrate)
 			enqueueOldThread = false;

@@ -35,6 +35,7 @@ ThreadData::_InitBase()
 	fBaseQuantum = sQuantumLengths[GetEffectivePriority()];
 
 	fTimeUsed = 0;
+	fKeepFasterUntil = 0;
 
 	fMeasureAvailableActiveTime = 0;
 	fLastMeasureAvailableTime = 0;
