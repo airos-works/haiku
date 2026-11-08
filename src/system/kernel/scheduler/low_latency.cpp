@@ -76,7 +76,51 @@ find_idle_core(const ThreadData* threadData)
 		if (core->ThreadCount() == 0)
 			return core;
 	}
-	return NULL;
+
+	// The package lists lag behind (a core leaves them only when it runs
+	// what it was given): ask the cores themselves.
+	return FastestIdleCore(threadData, 0);
+}
+
+
+/*!	A thread that is not using up its quanta (it waits for something
+	between bursts of work: user interface, audio, a server answering) on
+	cores of several speeds: the fastest core where it would run at once ahead
+	of a thread of lower priority, when that is at least half as fast again
+	as the \a capacity it would get otherwise. The thread it takes the core
+	from moves to an idle one (see reschedule()).
+	Busy threads that kept the fast cores otherwise left it a slow one, where
+	a 3 ms job took 14 ms (ROCK 5: Cortex-A76 against Cortex-A55). Between
+	cores that differ less (Zen 5 and Zen 5c: 4 to 3) the move costs the
+	other thread about what it gains, and short wake-ups then kept bouncing
+	busy threads between the two kinds of core.
+*/
+static CoreEntry*
+faster_core_to_preempt(const ThreadData* threadData, uint32 capacity)
+{
+	if (!gHeterogeneousCores
+		|| (uint64)capacity * 3 / 2 >= gMaxCoreCapacity) {
+		return NULL;
+	}
+	if (threadData->IsPenalized())
+		return NULL;
+	return FastestPreemptibleCore(threadData,
+		(uint32)((uint64)capacity * 3 / 2) + 1,
+		threadData->GetEffectivePriority());
+}
+
+
+/*!	Cores of several speeds, none of them idle: the fastest one faster than
+	\a capacity with a processor that has nothing to do (the other half of
+	a core with two threads). Nobody has to make room there.
+*/
+static CoreEntry*
+faster_core_with_idle_cpu(const ThreadData* threadData, uint32 capacity)
+{
+	if (!gHeterogeneousCores || capacity >= gMaxCoreCapacity)
+		return NULL;
+	return FastestPreemptibleCore(threadData, capacity + 1,
+		B_IDLE_PRIORITY + 1);
 }
 
 
@@ -89,6 +133,12 @@ choose_core(const ThreadData* threadData)
 	const bool useMask = !mask.IsEmpty();
 
 	CoreEntry* core = find_idle_core(threadData);
+	CoreEntry* faster = faster_core_to_preempt(threadData,
+		core != NULL ? core->Capacity() : 0);
+	if (faster == NULL && core == NULL)
+		faster = faster_core_with_idle_cpu(threadData, 0);
+	if (faster != NULL)
+		return faster;
 	if (core == NULL) {
 		ReadSpinLocker coreLocker(gCoreHeapsLock);
 		int32 index = 0;
@@ -117,11 +167,41 @@ rebalance(const ThreadData* threadData)
 	CoreEntry* core = threadData->Core();
 	ASSERT(core != NULL);
 
-	// A faster core has nothing to do: there the thread runs now.
-	if (gHeterogeneousCores && core->Capacity() < gMaxCoreCapacity) {
-		CoreEntry* faster = FastestIdleCore(threadData, core->Capacity());
+	// Cores of several speeds: where the thread would run at once without
+	// taking anyone's place - its own core when that has nothing to do, else
+	// the fastest idle one - unless a faster core has nothing to do either,
+	// or runs a thread of lower priority on a much faster core (it took a
+	// 3 ms job of a thread that woke up on its busy big core to an idle
+	// little one, where half of it ran at a third of the speed).
+	if (gHeterogeneousCores) {
+		CoreEntry* free = core->ThreadCount() == 0
+			? core : find_idle_core(threadData);
+		uint32 capacity = free != NULL ? free->Capacity() : 0;
+		CoreEntry* faster = NULL;
+		if (capacity < gMaxCoreCapacity) {
+			faster = FastestIdleCore(threadData, capacity + 1);
+			if (faster == NULL)
+				faster = faster_core_to_preempt(threadData, capacity);
+			if (faster == NULL && free == NULL)
+				faster = faster_core_with_idle_cpu(threadData, 0);
+		}
 		if (faster != NULL)
 			return faster;
+		if (free != NULL) {
+			// Not from a faster core to a slower one only because something
+			// else is there for a moment (a thread that woke up and took the
+			// processor): only when the rest of what that core has to do
+			// keeps it busy on its own. Busy threads otherwise went from big
+			// cores to little ones at every wake-up of another thread, and
+			// four of them on four big cores did 5 % less.
+			if (free->Capacity() < core->Capacity()) {
+				int32 rest = core->GetRequestedLoad() - threadData->GetLoad()
+					/ std::max(core->CPUCount(), (int32)1);
+				if (rest < kHighLoad)
+					return core;
+			}
+			return free;
+		}
 	}
 
 	// The thread's core has something to run already and another has not:

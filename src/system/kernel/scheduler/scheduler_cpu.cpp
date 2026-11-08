@@ -10,6 +10,7 @@
 
 #include <algorithm>
 
+#include "scheduler_locking.h"
 #include "scheduler_thread.h"
 
 
@@ -34,12 +35,12 @@ int32 gPackageCount;
 
 
 /*!	The fastest core with nothing to run and nothing on its way that the
-	thread may use and that is faster than \a fasterThan; NULL when there is
-	none. The cores' states change under it: good enough for a choice the
+	thread may use and that is at least \a minCapacity fast; NULL when there
+	is none. The cores' states change under it: good enough for a choice the
 	next reschedule can correct.
 */
 CoreEntry*
-FastestIdleCore(const ThreadData* thread, uint32 fasterThan)
+FastestIdleCore(const ThreadData* thread, uint32 minCapacity)
 {
 	SCHEDULER_ENTER_FUNCTION();
 
@@ -49,13 +50,52 @@ FastestIdleCore(const ThreadData* thread, uint32 fasterThan)
 	CoreEntry* fastest = NULL;
 	for (int32 i = 0; i < gCoreCount; i++) {
 		CoreEntry* core = &gCoreEntries[i];
-		if (core->Capacity() <= fasterThan || core->CPUCount() == 0
+		if (core->Capacity() < minCapacity || core->CPUCount() == 0
 			|| core->ThreadCount() != 0
 			|| (fastest != NULL && core->Capacity() <= fastest->Capacity())) {
 			continue;
 		}
 		if (useMask && !core->CPUMask().Matches(mask))
 			continue;
+		fastest = core;
+		if (core->Capacity() == gMaxCoreCapacity)
+			break;
+	}
+	return fastest;
+}
+
+
+/*!	The fastest core at least \a minCapacity fast where the thread, with
+	\a priority, would run at once ahead of what one of its processors runs
+	now (cores of several speeds): nothing waits there, and that processor's
+	thread has a lower priority. NULL when there is none.
+*/
+CoreEntry*
+FastestPreemptibleCore(const ThreadData* thread, uint32 minCapacity,
+	int32 priority)
+{
+	SCHEDULER_ENTER_FUNCTION();
+
+	CPUSet mask = thread->GetCPUMask();
+	const bool useMask = !mask.IsEmpty();
+
+	CoreEntry* fastest = NULL;
+	for (int32 i = 0; i < gCoreCount; i++) {
+		CoreEntry* core = &gCoreEntries[i];
+		if (core->Capacity() < minCapacity || core->CPUCount() == 0
+			|| core->ThreadCount() > core->CPUCount()
+			|| (fastest != NULL && core->Capacity() <= fastest->Capacity())) {
+			continue;
+		}
+		if (useMask && !core->CPUMask().Matches(mask))
+			continue;
+
+		CoreCPUHeapLocker _(core);
+		CPUEntry* cpu = core->CPUHeap()->PeekRoot();
+		if (cpu == NULL || CPUPriorityHeap::GetKey(cpu) >= priority
+			|| (useMask && !mask.GetBit(cpu->ID()))) {
+			continue;
+		}
 		fastest = core;
 		if (core->Capacity() == gMaxCoreCapacity)
 			break;
