@@ -26,10 +26,15 @@
 #include <string.h>
 
 extern int _kern_get_cpu(void);
+extern status_t _kern_set_cpu_enabled(int32 cpu, bool enabled);
+extern status_t _kern_generic_syscall(const char* subsystem, uint32 function,
+	void* buffer, size_t bufferSize);
 extern status_t _kern_set_thread_affinity(thread_id id, const void* mask,
 	size_t size);
 
 #define MAX_CPUS 256
+
+static double energy_joules(void);
 #define ADDS_PER_ITER 16
 
 
@@ -485,6 +490,8 @@ burst(double periodMs, double workUs, int frames, int background,
 	snooze(1000000);
 
 	bigtime_t period = (bigtime_t)(periodMs * 1000);
+	energy_joules();
+	bigtime_t burstStart = system_time();
 	bigtime_t next = system_time() + period;
 	int late = 0;
 	int slowPieces = 0, pieces = 0, jobMoves = 0;
@@ -512,6 +519,8 @@ burst(double periodMs, double workUs, int frames, int background,
 		if (next < end)
 			next = end + period;
 	}
+	double joules = energy_joules();
+	double burstSeconds = (system_time() - burstStart) / 1e6;
 	set_thread_priority(find_thread(NULL), B_NORMAL_PRIORITY);
 	if (background > 0)
 		stop_background();
@@ -532,11 +541,13 @@ burst(double periodMs, double workUs, int frames, int background,
 		percentile(durations, frames, 0.95), durations[frames - 1], ideal,
 		first, late);
 	printf("R burst period=%.1f work=%.2f bg=%d prio=%d p50=%.3f p95=%.3f "
-		"max=%.3f first=%.3f first5=%.3f late=%d slow=%.0f%% moves=%d cpus=",
+		"max=%.3f first=%.3f first5=%.3f late=%d slow=%.0f%% moves=%d "
+		"watts=%.2f cpus=",
 		periodMs, ideal,
 		background, (int)priority, percentile(durations, frames, 0.5),
 		percentile(durations, frames, 0.95), durations[frames - 1], first,
-		first5 / 5, late, 100.0 * slowPieces / pieces, jobMoves);
+		first5 / 5, late, 100.0 * slowPieces / pieces, jobMoves,
+		joules >= 0 ? joules / burstSeconds : -1.0);
 	bool comma = false;
 	for (int c = 0; c < count; c++) {
 		if (perCPU[c] == 0)
@@ -604,6 +615,70 @@ wake(int count, int background)
 		percentile(sWakeLatency, count, 0.99), sWakeLatency[count - 1]);
 	delete_sem(sWakeSem);
 	free(sWakeLatency);
+}
+
+
+//	#pragma mark - energy
+
+
+/*!	AMD package energy (amd_pstates' "amd_energy" syscall): joules counted
+	since the last call, summed over the distinct counters (a Threadripper
+	has one per die; each processor reads its own). Negative when there is
+	no such counter.
+*/
+static double
+energy_joules(void)
+{
+	static uint64_t last[MAX_CPUS];
+	static bool haveLast;
+	uint32_t buffer[2 + 2 * MAX_CPUS];
+	if (_kern_generic_syscall("amd_energy", 1, buffer, sizeof(buffer)) != B_OK)
+		return -1;
+	uint32_t unit = buffer[0], count = buffer[1];
+	uint64_t* counters = (uint64_t*)(buffer + 2);
+	double joules = 0;
+	if (haveLast) {
+		// one delta per distinct counter: processors that read the same
+		// counter saw nearly the same value (it ticks every millisecond or
+		// so: within a joule); separate counters differ by much more
+		uint64_t seen[MAX_CPUS];
+		int seenCount = 0;
+		for (uint32_t c = 0; c < count; c++) {
+			uint64_t delta = (counters[c] - last[c]) & 0xffffffff;
+			bool known = false;
+			for (int k = 0; k < seenCount; k++) {
+				if ((counters[c] > seen[k] ? counters[c] - seen[k]
+						: seen[k] - counters[c]) < (1u << unit)) {
+					known = true;
+				}
+			}
+			if (!known) {
+				seen[seenCount++] = counters[c];
+				joules += (double)delta / (1u << unit);
+			}
+		}
+	}
+	memcpy(last, counters, sizeof(uint64_t) * count);
+	haveLast = true;
+	return joules;
+}
+
+
+static void
+energy_dump(void)
+{
+	uint32_t buffer[2 + 2 * MAX_CPUS];
+	status_t status = _kern_generic_syscall("amd_energy", 1, buffer,
+		sizeof(buffer));
+	if (status != B_OK) {
+		printf("no energy counter: %s\n", strerror(status));
+		return;
+	}
+	uint64_t* counters = (uint64_t*)(buffer + 2);
+	printf("unit 1/2^%u J:", buffer[0]);
+	for (uint32_t c = 0; c < buffer[1]; c++)
+		printf(" %llu", (unsigned long long)counters[c]);
+	printf("\n");
 }
 
 
@@ -688,6 +763,44 @@ main(int argc, char** argv)
 			argc > 6 ? atoi(argv[6]) : B_NORMAL_PRIORITY);
 	} else if (strcmp(test, "wake") == 0) {
 		wake(argc > 2 ? atoi(argv[2]) : 2000, argc > 3 ? atoi(argv[3]) : 0);
+	} else if (strcmp(test, "cpuflip") == 0) {
+		// cpuflip <first> <last> <seconds>: disable and enable those CPUs
+		// in turn (what s2idle does), to test the scheduler around it
+		int first = atoi(argv[2]), last = atoi(argv[3]);
+		bigtime_t end = system_time() + (bigtime_t)(atof(argv[4]) * 1e6);
+		int flips = 0;
+		while (system_time() < end) {
+			for (int c = first; c <= last; c++)
+				_kern_set_cpu_enabled(c, false);
+			snooze(3000);
+			for (int c = first; c <= last; c++)
+				_kern_set_cpu_enabled(c, true);
+			snooze(3000);
+			flips++;
+		}
+		printf("R cpuflip %d\n", flips);
+	} else if (strcmp(test, "pstates") == 0) {
+		// pstates on|off: Zen 1 P-state scaling (amd_pstates), to compare
+		uint32_t enable = argc > 2 && strcmp(argv[2], "off") != 0;
+		status_t status = _kern_generic_syscall("amd_energy", 2, &enable,
+			sizeof(enable));
+		printf("R pstates %s %s\n", enable ? "on" : "off", strerror(status));
+	} else if (strcmp(test, "energy") == 0) {
+		energy_dump();
+	} else if (strcmp(test, "power") == 0) {
+		// power <seconds> [busy threads]: average package power
+		double seconds = argc > 2 ? atof(argv[2]) : 10;
+		int threads = argc > 3 ? atoi(argv[3]) : 0;
+		energy_joules();
+		bigtime_t start = system_time();
+		if (threads > 0)
+			place(threads, seconds, 1);
+		else
+			snooze((bigtime_t)(seconds * 1e6));
+		double joules = energy_joules();
+		double elapsed = (system_time() - start) / 1e6;
+		printf("R power threads=%d seconds=%.1f joules=%.1f watts=%.2f\n",
+			threads, elapsed, joules, joules / elapsed);
 	} else if (strcmp(test, "topo") == 0) {
 		topology();
 	} else if (strcmp(test, "mode") == 0) {

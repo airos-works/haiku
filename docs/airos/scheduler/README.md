@@ -5,7 +5,7 @@ three machines (November 2026):
 
 | Machine | CPU | Cores | Clock control |
 | --- | --- | --- | --- |
-| X399 workstation | Threadripper 1950X (Zen 1) | 16 cores, 32 threads | none (no CPPC; P0 always), ACPI C1 + CC6 |
+| X399 workstation | Threadripper 1950X (Zen 1) | 16 cores, 32 threads | amd_pstates Zen 1 P-states (measured: kept at P0), ACPI C1 + CC6 |
 | Framework 13 | Ryzen AI 5 340 (Krackan) | 3 Zen 5 + 3 Zen 5c, 12 threads | amd_pstates (CPPC, hardware chooses) |
 | ROCK 5 ITX | RK3588 | 4 Cortex-A76 + 4 Cortex-A55 | none (firmware clocks: about 2.2 and 1.8 GHz) |
 
@@ -32,6 +32,10 @@ three machines (November 2026):
 - `kswap.sh <kernel> <rev> [path=file ...]`: on the machine, repacks the
   active haiku package with a test kernel (and add-ons) under a new revision
   and installs it with pkgman; the previous state stays in the boot menu.
+- `schedperf power <s> [threads]`, `energy`, `pstates on|off`, `cpuflip a b s`:
+  AMD package energy (amd_pstates' `amd_energy` syscall), Zen 1 P-state
+  scaling switch, and disabling/enabling CPUs as s2idle does.
+- `pstate-ab.sh`: Zen 1 P-state scaling off vs on in one boot.
 - `cputype.c`: CPUID core type of each CPU (pinned; `get_cpuid()` answers for
   the CPU it runs on).
 - `build.sh`: cross-builds them against a configured build dir.
@@ -49,6 +53,9 @@ three machines (November 2026):
 | Power saving froze arm64 (`pack_irqs()` endless loop, interrupts cannot move) | ROCK 5 (stock kernel too) | stop at an interrupt that stays put |
 | Power saving capped AMD at the guaranteed clock (2.0 of 4.8 GHz) | laptop | boost allowed, EPP balance_power |
 | Low latency kept idle Zen 1 cores in C1 (CC6 declared 400 us): no boost headroom | X399 | deep states after long idle periods (10x exit latency) |
+| Power saving on big.LITTLE packed busy threads onto little cores for good | ROCK 5 | slowest cores for small tasks, misfit threads move up, hysteresis down |
+| A thread pinned to a CPU being disabled found no core (assert) | laptop s2idle | clear the CPU's enabled bit before removing it |
+| Zen 1 had no P-state driver | X399 | amd_pstates drives P0-P2; measured not worth it, stays at P0 |
 
 ## Results (mixed work, units per second; higher is better)
 
@@ -82,19 +89,31 @@ ROCK 5 ITX, low latency:
 | 5 threads | 24 560 | 24 600 |
 | 3 ms job next to 4 busy threads, p50 | 14.45 ms (on an A55) | 2.81 ms |
 | same at B_DISPLAY_PRIORITY | 14.46 ms | 2.80 ms |
-| power saving mode | froze the machine | works: 4 threads 11 400 - 15 100 (packed on A55s), 8 threads 30 200 |
+| power saving mode | froze the machine | works |
+| power saving, 4 threads | (froze) | 22 750 |
+| power saving, 3 ms job alone / next to 4 / next to 8 busy threads, p50 | (froze) | 2.8 / 2.8 / 2.8 ms |
+
+X399, Zen 1 P-state scaling (package energy counter), low latency:
+
+| | P0 always | scaling P0-P2 |
+| --- | --- | --- |
+| idle | 32.3 W | 31.9 W |
+| 1 ms job every 16.7 ms | 1.14 ms, 33.1 W | 1.81 ms, 31.8 W |
+| 4 ms job every 16.7 ms | 4.42 ms, 35.3 W | 6.70 ms, 34.2 W |
+| 90 % speed after idle | 1 ms | 10-13 ms |
+| power saving mode, 4 ms job | 4.22 ms, 31.1 W | 6.25 ms, 31.7 W |
+
+So Zen 1 stays at P0 (idle cores sleep in CC6; Precision Boost above P0).
 
 ## Open
 
-- The X399 never lowers its clock: Zen 1 has no CPPC, and there is no driver
-  for its P-states (MSR C001_0062, three states on the 1950X). Idle cores do
-  reach CC6.
 - The ROCK 5 has no DVFS at all: the A76 and A55 clusters stay at the
   firmware's clocks. Lowering them needs SCMI clock calls to the trusted
   firmware and the RK8602/RK806 regulators.
-- Power saving on big.LITTLE packs onto the slow cores and never moves a busy
-  thread up: a 3 ms job takes 14.5 ms there.
 - arm64 cannot route interrupts to other CPUs (`arch_int_assign_to_cpu()`).
-- 2026-11-08 ~09:00 UTC the Framework 13 dropped off the network during
-  `suite.sh` on the test kernel (haiku package -5): a hang or a closed lid,
-  not known. Look at the syslog of that boot before trusting the branch there.
+- 2026-11-08 ~09:00 UTC the Framework 13 panicked ("core != NULL" in
+  power_saving.cpp choose_core) going to sleep while schedperf had a thread
+  pinned to a CPU: fixed (enabled bit cleared before the CPU's core goes),
+  verified with `cpuflip` on the X399; not yet rerun on the laptop.
+- Disabling and enabling CPUs hundreds of times a second in low latency mode
+  hangs the stock kernel too (X399); a sleep-like cycle is fine.
