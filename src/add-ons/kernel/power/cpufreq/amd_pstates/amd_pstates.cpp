@@ -230,15 +230,17 @@ set_normal_pstate(void* /* dummy */, int cpu)
 	sHWPHighest = AMD_CPPC_HIGHEST_PERF(cap1);
 
 	// The hardware chooses the clock between the efficient and the highest
-	// level, in both modes. Power saving asks it to favour efficiency (EPP,
-	// as Linux's "balance_power"), and no longer forbids boosting: capped at
-	// the guaranteed level, a busy thread on battery ran at 2.0 instead of
-	// up to 4.8 GHz (Ryzen AI 5 340), while an idle or lightly loaded
-	// machine draws the same either way.
+	// level, in both modes. Power saving asks it to lean towards efficiency
+	// ("balance_performance", Linux's default when balanced), and no longer
+	// forbids boosting: capped at the guaranteed level, a busy thread on
+	// battery ran at 2.0 instead of up to 4.8 GHz (Ryzen AI 5 340). Against
+	// "balance_power" (0xbf) that drew the same (idle 4.0 W, one busy thread
+	// 5.7 W, a 2 ms job every frame 4.25 W) while the job took 3.5 instead of
+	// 4.3 ms and a thread reached half its speed after 1-2 instead of 13-23 ms.
 	uint64 request = AMD_CPPC_MIN_PERF(sHWPEfficient);
 	request |= AMD_CPPC_MAX_PERF(sHWPHighest);
 	request |= AMD_CPPC_EPP_PERF(
-		sSavePower ? AMD_CPPC_EPP_BALANCE_POWERSAVE : AMD_CPPC_EPP_PERFORMANCE);
+		sSavePower ? AMD_CPPC_EPP_BALANCE_PERFORMANCE : AMD_CPPC_EPP_PERFORMANCE);
 	x86_write_msr(MSR_AMD_CPPC_REQ, request & 0xffffffff);
 }
 
