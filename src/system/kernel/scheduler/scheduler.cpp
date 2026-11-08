@@ -640,6 +640,12 @@ scheduler_set_cpu_enabled(int32 cpuID, bool enabled)
 	else {
 		cpu->UpdatePriority(B_IDLE_PRIORITY);
 
+		// Before its core goes: RemoveCPU() enqueues the threads waiting
+		// there at once, and one whose affinity mask still had this CPU
+		// found no core for it ("core != NULL" failed in choose_core(), as
+		// a laptop went to sleep while a thread was pinned to a CPU).
+		gCPUEnabled.ClearBitAtomic(cpuID);
+
 		ThreadEnqueuer enqueuer;
 		core->RemoveCPU(cpu, enqueuer);
 	}
@@ -647,8 +653,6 @@ scheduler_set_cpu_enabled(int32 cpuID, bool enabled)
 	gCPU[cpuID].disabled = !enabled;
 	if (enabled)
 		gCPUEnabled.SetBitAtomic(cpuID);
-	else
-		gCPUEnabled.ClearBitAtomic(cpuID);
 
 	if (!enabled) {
 		cpu->Stop();
