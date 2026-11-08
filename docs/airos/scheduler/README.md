@@ -114,6 +114,14 @@ So Zen 1 stays at P0 (idle cores sleep in CC6; Precision Boost above P0).
 - 2026-11-08 ~09:00 UTC the Framework 13 panicked ("core != NULL" in
   power_saving.cpp choose_core) going to sleep while schedperf had a thread
   pinned to a CPU: fixed (enabled bit cleared before the CPU's core goes),
-  verified with `cpuflip` on the X399; not yet rerun on the laptop.
+  verified with `cpuflip` on the X399 and on the laptop (sleep-like cycles
+  in both modes, then the whole suite).
+- power_daemon crashed at boots with the lid closed on an external display
+  (stock kernel too): BApplication reconnected a never-connected BServer
+  while its event loop connected it; fixed, two clean boots.
+- Power saving on the laptop: EPP 0x80 (balance_performance) drew the same
+  power as 0xbf and ramps faster; a thread starts on a Zen 5c core and moves
+  to a Zen 5 once its load shows it does not fit (90 % speed after 0.3-0.4 s,
+  50 % after 1-2 ms).
 - Disabling and enabling CPUs hundreds of times a second in low latency mode
   hangs the stock kernel too (X399); a sleep-like cycle is fine.
