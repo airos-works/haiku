@@ -47,13 +47,36 @@ has_cache_expired(const ThreadData* threadData)
 }
 
 
+/*!	Cores of several speeds: the busiest of the slowest cores that still
+	has room, where small tasks cost the least energy. NULL when there is
+	none.
+*/
+static CoreEntry*
+slow_core_with_room()
+{
+	CoreEntry* chosen = NULL;
+	for (int32 i = 0; i < gCoreCount; i++) {
+		CoreEntry* core = &gCoreEntries[i];
+		if (core->CPUCount() == 0 || core->GetLoad() >= kHighLoad)
+			continue;
+		if (chosen == NULL || core->Capacity() < chosen->Capacity()
+			|| (core->Capacity() == chosen->Capacity()
+				&& core->GetLoad() > chosen->GetLoad())) {
+			chosen = core;
+		}
+	}
+	return chosen;
+}
+
+
 static CoreEntry*
 choose_small_task_core()
 {
 	SCHEDULER_ENTER_FUNCTION();
 
 	ReadSpinLocker coreLocker(gCoreHeapsLock);
-	CoreEntry* core = gCoreLoadHeap.PeekMaximum();
+	CoreEntry* core = gHeterogeneousCores
+		? slow_core_with_room() : gCoreLoadHeap.PeekMaximum();
 	if (core == NULL)
 		return sSmallTaskCore;
 
@@ -151,6 +174,25 @@ rebalance(const ThreadData* threadData)
 	// load leaves it (two busy threads on one core, each half of it, both
 	// stayed while other cores were idle).
 	const bool overloaded = coreLoad > kMaxLoad;
+
+	// Cores of several speeds. A thread that keeps a slower core nearly
+	// busy does not fit there: it goes to a faster idle core, as Linux's
+	// energy aware scheduling moves a "misfit" task. A 3 ms job every frame
+	// took 14.5 ms on a ROCK 5's Cortex-A55 (87 % of it) and never moved.
+	// One that is not a busy thread itself (it waits between bursts) may
+	// also take a faster core from a thread of lower priority: with every
+	// core busy it otherwise missed 52 of 120 frames on a little core.
+	if (gHeterogeneousCores && core->Capacity() < gMaxCoreCapacity
+		&& threadData->GetLoad() >= kVeryHighLoad) {
+		CoreEntry* faster = FastestIdleCore(threadData, core->Capacity() + 1);
+		if (faster == NULL && !threadData->IsPenalized()) {
+			faster = FastestPreemptibleCore(threadData, core->Capacity() + 1,
+				threadData->GetEffectivePriority());
+		}
+		if (faster != NULL)
+			return faster;
+	}
+
 	if (coreLoad > kHighLoad) {
 		if (sSmallTaskCore == core) {
 			sSmallTaskCore = NULL;
@@ -198,6 +240,14 @@ rebalance(const ThreadData* threadData)
 	CoreEntry* smallTaskCore = choose_small_task_core();
 	if (smallTaskCore == NULL || (useMask && !smallTaskCore->CPUMask().Matches(mask)))
 		return core;
+	if (smallTaskCore->Capacity() < core->Capacity()) {
+		// To a slower core: what the thread would need there, with room to
+		// spare, or it would only come back as a misfit.
+		int32 loadThere = (int32)((int64)threadLoad * core->Capacity()
+			/ std::max(smallTaskCore->Capacity(), (uint32)1));
+		return smallTaskCore->GetLoad() + loadThere < kLowLoad * 2
+			? smallTaskCore : core;
+	}
 	return smallTaskCore->GetLoad() + threadLoad < kHighLoad
 		? smallTaskCore : core;
 }

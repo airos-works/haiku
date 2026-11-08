@@ -433,6 +433,17 @@ reschedule(int32 nextState)
 				oldThreadShouldMigrate = true;
 			}
 		}
+		// Saving power, cores of several speeds: a thread that keeps a
+		// slower core nearly busy does not fit there (see power_saving.cpp).
+		if (!oldThreadShouldMigrate && enqueueOldThread && putOldThreadAtBack
+			&& gHeterogeneousCores
+			&& gCurrentMode == &gSchedulerPowerSavingMode
+			&& oldThread->pinned_to_cpu == 0 && !oldThreadData->IsIdle()
+			&& core->Capacity() < gMaxCoreCapacity
+			&& oldThreadData->GetLoad() >= kVeryHighLoad
+			&& FastestIdleCore(oldThreadData, core->Capacity() + 1) != NULL) {
+			oldThreadShouldMigrate = true;
+		}
 		if (oldThreadShouldMigrate)
 			enqueueOldThread = false;
 
