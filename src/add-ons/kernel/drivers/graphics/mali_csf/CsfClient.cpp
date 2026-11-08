@@ -67,6 +67,7 @@ struct ClientAccount {
 };
 
 struct ClientBuffer : ClientMemory {
+	bool cached;
 	ClientBuffer* next;
 	uint32 handle;
 	uint32 references;
@@ -132,17 +133,30 @@ struct Client {
 };
 
 static status_t
-MakeClientRamNoncacheable(area_id area, void* address, size_t bytes)
+CleanClientRam(void* address, size_t bytes)
 {
 #if defined(__aarch64__)
-	// The allocator clears through its cached kernel alias. Evict that data
-	// before changing the memory type, and before creating any user aliases.
+	// The allocator clears through its cached kernel alias. Evict that data so
+	// that the GPU, which does not snoop the CPU's caches, reads zeros.
 	uint64 ctr;
 	asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
 	size_t line = arm64_data_cache_line_size(ctr);
 	for (addr_t p = (addr_t)address; p < (addr_t)address + bytes; p += line)
 		asm volatile("dc civac, %0" :: "r"(p) : "memory");
 	memory_full_barrier();
+	return B_OK;
+#else
+	return B_NOT_SUPPORTED;
+#endif
+}
+
+static status_t
+MakeClientRamNoncacheable(area_id area, void* address, size_t bytes)
+{
+#if defined(__aarch64__)
+	// Evict the allocator's data before changing the memory type, and before
+	// creating any user aliases.
+	CleanClientRam(address, bytes);
 	// ARM64 encodes the type in each PTE; physicalBase is unused here. The
 	// backing RAM can be scattered. vm_clone_area preserves this memory type.
 	status_t status = vm_set_area_memory_type(area, 0, B_WRITE_COMBINING_MEMORY);
@@ -171,7 +185,7 @@ DeleteMemory(ClientMemory& memory)
 }
 
 static status_t
-AllocateMemory(const char* name, size_t bytes, ClientMemory& memory)
+AllocateMemory(const char* name, size_t bytes, ClientMemory& memory, bool cached = false)
 {
 	memory.area = -1;
 	memory.bytes = bytes;
@@ -194,8 +208,10 @@ AllocateMemory(const char* name, size_t bytes, ClientMemory& memory)
 		if (status == B_OK)
 			memory.pages[offset / B_PAGE_SIZE] = entry.address;
 	}
-	if (status == B_OK)
-		status = MakeClientRamNoncacheable(memory.area, memory.address, bytes);
+	if (status == B_OK) {
+		status = cached ? CleanClientRam(memory.address, bytes)
+			: MakeClientRamNoncacheable(memory.area, memory.address, bytes);
+	}
 	if (status != B_OK)
 		DeleteMemory(memory);
 	return status;
@@ -585,7 +601,7 @@ FindBuffer(Client* client, uint32 handle)
 static status_t
 CreateBuffer(Client* client, BufferCreate& request)
 {
-	if (request.flags != 0 || request.reserved != 0 || request.reserved2 != 0
+	if ((request.flags & ~kBufferCpuCached) != 0 || request.reserved != 0 || request.reserved2 != 0
 		|| request.handle != 0 || request.bytes == 0 || request.bytes > kMaxBufferBytes) {
 		return B_BAD_VALUE;
 	}
@@ -608,7 +624,10 @@ CreateBuffer(Client* client, BufferCreate& request)
 	ClientBuffer* buffer = (ClientBuffer*)calloc(1, sizeof(ClientBuffer));
 	if (buffer == NULL)
 		return B_NO_MEMORY;
-	status_t status = AllocateMemory("Mali CSF client buffer", bytes, *buffer);
+	const bool cached = (request.flags & kBufferCpuCached) != 0;
+	status_t status = AllocateMemory(cached ? "Mali CSF cached client buffer" : "Mali CSF client buffer",
+		bytes, *buffer, cached);
+	buffer->cached = cached;
 	if (status != B_OK) {
 		free(buffer);
 		return status;
@@ -1056,7 +1075,7 @@ MaliCSF::ControlClient(void* cookie, uint32 op, void* user, size_t length)
 			return B_BAD_VALUE;
 		ClientInfo info = {};
 		info.version = kClientVersion;
-		info.capabilities = client->writable ? kClientCpuBuffers | kClientVmMappings | kClientQueues | kClientSynchronization | kClientHeaps | kClientProperties : 0;
+		info.capabilities = client->writable ? kClientCpuBuffers | kClientVmMappings | kClientQueues | kClientSynchronization | kClientHeaps | kClientProperties | kClientCachedBuffers : 0;
 		info.maxBuffers = kMaxClientBuffers;
 		info.maxBufferBytes = kMaxBufferBytes;
 		info.maxClientBytes = kMaxClientBufferBytes;
@@ -1161,7 +1180,7 @@ MaliCSF::ControlClient(void* cookie, uint32 op, void* user, size_t length)
 		if (buffer == NULL)
 			return B_ENTRY_NOT_FOUND;
 		request.bytes = buffer->bytes;
-		request.flags = kBufferNormalNoncacheable;
+		request.flags = buffer->cached ? kBufferCpuCached : kBufferNormalNoncacheable;
 		return user_memcpy(user, &request, sizeof(request));
 	}
 	BufferMap request;
@@ -1183,7 +1202,7 @@ MaliCSF::ControlClient(void* cookie, uint32 op, void* user, size_t length)
 	request.address = (addr_t)address;
 	request.area = area;
 	request.bytes = buffer->bytes;
-	request.flags = kBufferNormalNoncacheable;
+	request.flags = buffer->cached ? kBufferCpuCached : kBufferNormalNoncacheable;
 	status = user_memcpy(user, &request, sizeof(request));
 	if (status != B_OK)
 		vm_delete_area(client->owner, area, true);
