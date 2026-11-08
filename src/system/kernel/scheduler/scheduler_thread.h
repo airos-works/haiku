@@ -261,9 +261,16 @@ ThreadData::CancelPenalty()
 	SCHEDULER_ENTER_FUNCTION();
 
 	int32 oldPenalty = fPriorityPenalty;
+	int32 oldAdditionalPenalty = fAdditionalPenalty;
 	fPriorityPenalty = 0;
+	// The additional penalty rotates the priorities of busy threads, so that
+	// none of them starves. It grew with every wait as well (GoesAway()), so
+	// a thread that woke up after waiting long enough got a priority anywhere
+	// between 1 and its own, and lost the faster core to a busy thread of
+	// the same priority (big.LITTLE) as often as not.
+	fAdditionalPenalty = 0;
 
-	if (oldPenalty != 0) {
+	if (oldPenalty != 0 || oldAdditionalPenalty != 0) {
 		TRACE("cancelling thread %ld penalty\n", fThread->id);
 		_ComputeEffectivePriority();
 	}
