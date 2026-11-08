@@ -138,23 +138,33 @@ rebalance(const ThreadData* threadData)
 
 	CoreEntry* core = threadData->Core();
 
-	int32 coreLoad = core->GetLoad();
+	// What the core's threads ask for, not what it can give them: the load
+	// of a core stops at "all of it", so with six busy threads packed onto
+	// one core each of them wanted more than a third of that, none ever
+	// left, and six threads got the work of one done (Ryzen AI 5 340 on
+	// battery, eleven other processors idle).
+	int32 coreLoad = core->GetRequestedLoad();
 	int32 threadLoad = threadData->GetLoad()
 		/ std::max(core->CPUCount(), (int32)1);
 		// (0 while its last CPU is being disabled)
+	// More than the core can run: then even a thread that is much of its
+	// load leaves it (two busy threads on one core, each half of it, both
+	// stayed while other cores were idle).
+	const bool overloaded = coreLoad > kMaxLoad;
 	if (coreLoad > kHighLoad) {
 		if (sSmallTaskCore == core) {
 			sSmallTaskCore = NULL;
 			CoreEntry* smallTaskCore = choose_small_task_core();
 
-			if (threadLoad > coreLoad / 3 || smallTaskCore == NULL
-					|| (useMask && !smallTaskCore->CPUMask().Matches(mask))) {
+			if ((threadLoad > coreLoad / 3 && !overloaded)
+				|| smallTaskCore == NULL || smallTaskCore == core
+				|| (useMask && !smallTaskCore->CPUMask().Matches(mask))) {
 				return core;
 			}
 			return coreLoad > kVeryHighLoad ? smallTaskCore : core;
 		}
 
-		if (threadLoad >= coreLoad / 2)
+		if (threadLoad >= coreLoad / 2 && !overloaded)
 			return core;
 
 		ReadSpinLocker coreLocker(gCoreHeapsLock);
@@ -174,6 +184,11 @@ rebalance(const ThreadData* threadData)
 
 		int32 coreNewLoad = coreLoad - threadLoad;
 		int32 otherNewLoad = other->GetLoad() + threadLoad;
+		if (overloaded) {
+			// moving it makes the two closer
+			return coreNewLoad - other->GetLoad() >= kLoadDifference / 2
+				? other : core;
+		}
 		return coreNewLoad - otherNewLoad >= kLoadDifference / 2 ? other : core;
 	}
 
