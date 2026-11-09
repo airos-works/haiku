@@ -64,20 +64,44 @@ input_banks(const Operation& operation)
 }
 
 
+//! Bytes of weights a kernel has, as they are given to the processor.
+static uint32
+bytes_per_kernel(const Operation& operation)
+{
+	return operation.weights_width * operation.weights_height
+		* weights_channels(operation);
+}
+
+
+/*!	Banks all of the weights take. Mesa counts the channels the tensor
+	has; the processor is given whole groups of 16, which is up to twice
+	as much, and computes garbage when it is told it has room for all the
+	weights and has not. */
 static uint32
 weights_banks(const Operation& operation)
 {
-	uint32 bytes = operation.weights_width * operation.weights_height
-		* operation.input_channels;
+	uint64 bytes = bytes_per_kernel(operation);
 	if (!operation.depthwise)
-		bytes *= operation.output_channels;
+		bytes *= round_up(operation.output_channels, 2);
 
-	uint32 entries = divide_up(bytes, CBUF_ENTRY_SIZE);
-	uint32 banks = divide_up(entries, CBUF_ENTRIES_PER_BANK);
+	uint32 banks = (bytes + CBUF_BANK_SIZE - 1) / CBUF_BANK_SIZE;
 
 	// Mesa: "Why do we need an extra bank? The calc above might be wrong
 	// on this HW"
 	return banks + 1;
+}
+
+
+/*!	Banks the weights need at the least: when they do not fit all at
+	once, the processor takes them 32 kernels at a time, and a job whose
+	32 kernels do not fit never ends. */
+static uint32
+kernel_group_banks(const Operation& operation)
+{
+	uint32 kernels = operation.depthwise
+		? 1 : std::min(round_up(operation.output_channels, 2),
+			(uint32)WEIGHT_ATOMIC_SIZE);
+	return divide_up(kernels * bytes_per_kernel(operation), CBUF_BANK_SIZE);
 }
 
 
@@ -193,10 +217,14 @@ split_tasks(Operation& operation)
 		operation.reuse_weights_cbuf = true;
 		availableInputBanks = CBUF_BANKS - weightsBanksRequired;
 	} else {
-		// part of the weights, part of the input
+		// Part of the weights, part of the input: Mesa's five banks for
+		// the weights, or as many as one group of kernels takes.
 		operation.reuse_weights_cbuf = false;
-		availableInputBanks = 7;
-		availableWeightsBanks = CBUF_BANKS - availableInputBanks;
+		availableWeightsBanks = std::max((uint32)5,
+			kernel_group_banks(operation));
+		if (availableWeightsBanks >= CBUF_BANKS)
+			return B_NOT_SUPPORTED;
+		availableInputBanks = CBUF_BANKS - availableWeightsBanks;
 	}
 
 	free(operation.tasks);

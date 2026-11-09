@@ -103,6 +103,18 @@ output_conversion(double scale, uint32* _scale, uint32* _shift)
 }
 
 
+/*!	What the processor makes of a sum with a factor of
+	output_conversion(), before the zero point is added. */
+int64
+converted_output(int64 sum, uint32 scale, uint32 shift)
+{
+	int64 product = sum * (int64)scale;
+	if (shift == 0)
+		return product;
+	return (product + ((int64)1 << (shift - 1))) >> shift;
+}
+
+
 /*!	The factor that brings the other operand of an addition to the scale
 	of the sums. */
 bool
@@ -264,12 +276,22 @@ fill_commands(const Operation& operation, uint32 taskIndex,
 	EMIT(REG_DPU_DATA_CUBE_CHANNEL,
 		DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL(task.output_channels_real - 1)
 		| DPU_DATA_CUBE_CHANNEL_CHANNEL(task.output_channels - 1));
-	// the bias is added to the sums
-	EMIT(REG_DPU_BS_CFG, DPU_BS_CFG_BS_ALU_ALGO(2) | DPU_BS_CFG_BS_ALU_SRC(1)
-		| DPU_BS_CFG_BS_RELU_BYPASS(1) | DPU_BS_CFG_BS_MUL_BYPASS(1));
+	// The first stage of the unit after the sums: the bias is added, and
+	// the result kept above zero and below a limit if there are bounds
+	// (the lower bound was taken off the bias for that, see
+	// fill_biases(), and is added again by the next stage).
+	uint32 biasConfig = DPU_BS_CFG_BS_ALU_ALGO(2) | DPU_BS_CFG_BS_ALU_SRC(1)
+		| DPU_BS_CFG_BS_MUL_BYPASS(1);
+	if (!operation.clamp_low)
+		biasConfig |= DPU_BS_CFG_BS_RELU_BYPASS(1);
+	if (operation.clamp_high)
+		biasConfig |= DPU_BS_CFG_BS_RELUX_EN(1);
+
+	EMIT(REG_DPU_BS_CFG, biasConfig);
 	EMIT(REG_DPU_BS_ALU_CFG, 0);
 	EMIT(REG_DPU_BS_MUL_CFG, 0);
-	EMIT(REG_DPU_BS_RELUX_CMP_VALUE, 0);
+	EMIT(REG_DPU_BS_RELUX_CMP_VALUE, operation.clamp_high
+		? (uint32)(operation.clamp_maximum - operation.clamp_minimum) : 0);
 
 	if (operation.depthwise) {
 		EMIT(REG_DPU_BS_OW_CFG, DPU_BS_OW_CFG_SIZE_E_2(3)
@@ -288,10 +310,17 @@ fill_commands(const Operation& operation, uint32 taskIndex,
 	EMIT(REG_DPU_WDMA_SIZE_1,
 		DPU_WDMA_SIZE_1_HEIGHT_WDMA(task.output_height - 1)
 		| DPU_WDMA_SIZE_1_WIDTH_WDMA(task.output_width - 1));
-	EMIT(REG_DPU_BN_CFG, DPU_BN_CFG_BN_RELU_BYPASS(1)
-		| DPU_BN_CFG_BN_MUL_BYPASS(1) | DPU_BN_CFG_BN_ALU_BYPASS(1)
-		| DPU_BN_CFG_BN_BYPASS(1));
-	EMIT(REG_DPU_BN_ALU_CFG, 0);
+	if (operation.clamp_low && operation.clamp_minimum != 0) {
+		// the second stage adds the lower bound
+		EMIT(REG_DPU_BN_CFG, DPU_BN_CFG_BN_ALU_ALGO(2)
+			| DPU_BN_CFG_BN_RELU_BYPASS(1) | DPU_BN_CFG_BN_MUL_BYPASS(1));
+		EMIT(REG_DPU_BN_ALU_CFG, (uint32)operation.clamp_minimum);
+	} else {
+		EMIT(REG_DPU_BN_CFG, DPU_BN_CFG_BN_RELU_BYPASS(1)
+			| DPU_BN_CFG_BN_MUL_BYPASS(1) | DPU_BN_CFG_BN_ALU_BYPASS(1)
+			| DPU_BN_CFG_BN_BYPASS(1));
+		EMIT(REG_DPU_BN_ALU_CFG, 0);
+	}
 	EMIT(REG_DPU_BN_MUL_CFG, 0);
 	EMIT(REG_DPU_BN_RELUX_CMP_VALUE, 0);
 
@@ -377,8 +406,9 @@ fill_commands(const Operation& operation, uint32 taskIndex,
 	// The addend is read by two of the unit's readers in turns, a slice
 	// of 16 channels each: one starts at the first slice, the other at the
 	// second, and both skip a slice after each one they read.
-	uint32 addendStride = std::max(operation.output_width
-		* operation.output_height, (uint32)12);
+	// (Mesa has at least 12 here, which is wrong for tensors of fewer
+	// pixels as this back end lays them out.)
+	uint32 addendStride = operation.output_width * operation.output_height;
 
 	if (addition) {
 		EMIT(REG_DPU_RDMA_RDMA_ERDMA_CFG,

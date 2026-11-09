@@ -171,6 +171,17 @@ struct Operation {
 	int32		addend_zero_point;
 	float		addend_scale;
 
+	// Bounds for the sums (with the bias) before they become outputs, or
+	// before the addend is added: an activation that is not simply the
+	// range of the output tensor, or the range of the tensor an addition
+	// takes the place of. In units of the sums.
+	int32		activation;
+		// neural_activation of the convolution
+	bool		clamp_low;
+	bool		clamp_high;
+	int32		clamp_minimum;
+	int32		clamp_maximum;
+
 	// offsets in the program's buffer of constants
 	uint32		weights_offset;
 	uint32		weights_size;
@@ -212,6 +223,7 @@ uint32		fill_commands(const Operation& operation, uint32 taskIndex,
 void		link_commands(uint64* commands, uint32 count, uint32 nextAddress,
 				uint32 nextCount);
 bool		output_conversion(double scale, uint32* _scale, uint32* _shift);
+int64		converted_output(int64 sum, uint32 scale, uint32 shift);
 bool		addend_conversion(double scale, uint32* _scale, uint32* _shift);
 
 

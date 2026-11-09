@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
+
 
 // What the registers have room for.
 static const uint32 kMaxInputSize = 2047;
@@ -22,10 +24,6 @@ static const uint32 kMaxPadding = 15;
 // What has been tried on the hardware, see rk3588_npu_backend_test.
 static const uint32 kMaxKernelSize = 7;
 static const uint32 kMaxStride = 2;
-
-// The fewest pixels an addend may have: below, the vendor's driver sets
-// the readers up in a way Mesa could only copy for the sizes it saw.
-static const uint32 kMinAdditionPixels = 12;
 
 
 // #pragma mark - GraphUse
@@ -131,33 +129,98 @@ zero_point_valid(const neural_graph_tensor* tensor)
 }
 
 
-/*!	The processor ends every operation by clamping to what a byte holds
-	and knows no other activation (as this back end uses it). That is the
-	activation asked for when the range of the output tensor ends where
-	the activation's does, which is how quantized networks are made. */
+/*!	The sum that becomes a given output (less the zero point), for a
+	factor of sums to outputs; false if there is none that does so
+	safely, away from where rounding decides. */
 static bool
-activation_is_clamp(neural_activation activation,
-	const neural_graph_tensor* output)
+sum_for_output(int32 output, double factor, int32* _sum)
 {
-	double minimum = output->type == B_NEURAL_UINT8 ? 0 : -128;
-	double maximum = output->type == B_NEURAL_UINT8 ? 255 : 127;
-	double zeroPoint = output->zero_point;
-	double scale = output->scale;
+	uint32 scale;
+	uint32 shift;
+	if (!output_conversion(factor, &scale, &shift))
+		return false;
 
+	double exact = output / factor;
+	if (fabs(exact) > (double)(1 << 30))
+		return false;
+
+	int64 sum = llround(exact);
+	if (fabs(sum * factor - output) > 0.45
+		|| converted_output(sum, scale, shift) != output) {
+		return false;
+	}
+
+	*_sum = (int32)sum;
+	return true;
+}
+
+
+/*!	Works out the bounds the sums of an operation have to be kept within
+	for an activation, \a tensor being what the sums become. The
+	processor ends every operation by clamping to what a byte holds; in
+	quantized networks that often is the activation already, the range of
+	the tensor ending where the activation's does, and then there are no
+	bounds to set. \a always asks for bounds even so: when another tensor
+	is added to the sums, they are not clamped as that tensor would be.
+	Returns false if the processor cannot do the activation. */
+static bool
+plan_clamp(Operation& operation, neural_activation activation,
+	const neural_graph_tensor* tensor, bool always)
+{
+	int32 minimum = tensor->type == B_NEURAL_UINT8 ? 0 : -128;
+	int32 maximum = tensor->type == B_NEURAL_UINT8 ? 255 : 127;
+	int32 zeroPoint = tensor->zero_point;
+	double scale = tensor->scale;
+
+	// as TensorFlow Lite computes them
+	double low = minimum;
+	double high = maximum;
 	switch (activation) {
 		case B_NEURAL_ACTIVATION_NONE:
-			return true;
+			break;
 		case B_NEURAL_ACTIVATION_RELU:
-			return zeroPoint <= minimum;
+			low = std::max(low, (double)zeroPoint);
+			break;
 		case B_NEURAL_ACTIVATION_RELU6:
-			return zeroPoint <= minimum
-				&& zeroPoint + round(6.0 / scale) >= maximum;
+			low = std::max(low, (double)zeroPoint);
+			high = std::min(high, zeroPoint + round(6.0 / scale));
+			break;
 		case B_NEURAL_ACTIVATION_RELU_N1_TO_1:
-			return zeroPoint + round(-1.0 / scale) <= minimum
-				&& zeroPoint + round(1.0 / scale) >= maximum;
+			low = std::max(low, zeroPoint + round(-1.0 / scale));
+			high = std::min(high, zeroPoint + round(1.0 / scale));
+			break;
 		default:
 			return false;
 	}
+	if (low > high)
+		return false;
+
+	operation.clamp_low = always || low > minimum;
+	operation.clamp_high = always || high < maximum;
+	operation.clamp_minimum = 0;
+	operation.clamp_maximum = 0;
+	if (!operation.clamp_low && !operation.clamp_high)
+		return true;
+
+	double factor = (double)operation.input_scale * operation.weights_scale
+		/ scale;
+
+	// An upper bound is a distance from the lower one.
+	if (operation.clamp_high) {
+		operation.clamp_low = true;
+		if (!sum_for_output((int32)high - zeroPoint, factor,
+				&operation.clamp_maximum)) {
+			return false;
+		}
+	}
+	// (the sum for an output of zero is zero)
+	if ((int32)low != zeroPoint && !sum_for_output((int32)low - zeroPoint,
+			factor, &operation.clamp_minimum)) {
+		return false;
+	}
+
+	return !operation.clamp_high
+		|| operation.clamp_maximum >= operation.clamp_minimum;
 }
 
 
@@ -343,7 +406,8 @@ describe_convolution(const BNeuralGraph& graph, int32 index,
 		return B_NOT_SUPPORTED;
 	}
 
-	if (!activation_is_clamp(params->activation, output))
+	operation.activation = params->activation;
+	if (!plan_clamp(operation, params->activation, output, false))
 		return B_NOT_SUPPORTED;
 
 	uint32 scale;
@@ -387,11 +451,8 @@ find_addition_target(const BNeuralGraph& graph, const GraphUse& use,
 	}
 
 	const neural_graph_operator* target = graph.OperatorAt(convolution);
-	if ((target->code != B_NEURAL_OP_CONV_2D
-			&& target->code != B_NEURAL_OP_DEPTHWISE_CONV_2D)
-		|| target->params == NULL
-		|| ((const neural_conv_params*)target->params)->activation
-			!= B_NEURAL_ACTIVATION_NONE) {
+	if (target->code != B_NEURAL_OP_CONV_2D
+		&& target->code != B_NEURAL_OP_DEPTHWISE_CONV_2D) {
 		return B_NOT_SUPPORTED;
 	}
 
@@ -437,16 +498,30 @@ fuse_addition(const BNeuralGraph& graph, int32 index, int32 addendIndex,
 			return B_NOT_SUPPORTED;
 		}
 	}
-	if (operation.output_width * operation.output_height
-			< kMinAdditionPixels) {
+	// A depthwise convolution that is to add as well never finishes (as
+	// this back end sets it up; Mesa has no network that does it).
+	if (operation.depthwise)
 		return B_NOT_SUPPORTED;
-	}
 
+	// The activation of the addition can only be the range of its output,
+	// which is what the processor clamps to at the end.
 	neural_activation activation = op->params != NULL
 		? ((const neural_binary_params*)op->params)->activation
 		: B_NEURAL_ACTIVATION_NONE;
-	if (!activation_is_clamp(activation, output))
+	Operation probe = operation;
+	probe.output_scale = output->scale;
+	if (!plan_clamp(probe, activation, output, false) || probe.clamp_low
+		|| probe.clamp_high) {
 		return B_NOT_SUPPORTED;
+	}
+
+	// The sums are what the convolution's own output would have been:
+	// they stay within that tensor's range and the convolution's
+	// activation.
+	if (!plan_clamp(operation, (neural_activation)operation.activation, sum,
+			true)) {
+		return B_NOT_SUPPORTED;
+	}
 
 	double sumScale = (double)operation.input_scale * operation.weights_scale;
 	uint32 scale;

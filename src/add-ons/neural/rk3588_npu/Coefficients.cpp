@@ -18,6 +18,7 @@
 
 #include "Compiler.h"
 
+#include <stdint.h>
 #include <string.h>
 
 #include <algorithm>
@@ -166,6 +167,14 @@ fill_biases(const Operation& operation, const uint8* weights,
 		int64 correction = (int64)weights_sum(operation, weights, oc)
 			* operation.input_zero_point;
 		int64 bias = (biases != NULL ? biases[oc] : 0) - correction;
-		buffer[oc] = (int32)(bias / ((int64)1 << operation.truncate_bits));
+		bias /= (int64)1 << operation.truncate_bits;
+
+		// Sums that are kept above a lower bound are kept above zero by
+		// the processor, so the bound has to be where zero is.
+		if (operation.clamp_low)
+			bias -= operation.clamp_minimum;
+
+		buffer[oc] = (int32)std::max(std::min(bias, (int64)INT32_MAX),
+			(int64)INT32_MIN);
 	}
 }
