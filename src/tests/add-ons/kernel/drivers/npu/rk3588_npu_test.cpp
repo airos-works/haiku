@@ -174,8 +174,11 @@ init_client(Client& client, uint32 seed)
 	operation.input_scale = 1.0f;
 	operation.weights_scale = 1.0f / 64;
 	operation.output_scale = 1.0f;
+	operation.sum_multiplier = 1;
 
-	if (split_tasks(operation) != B_OK || operation.task_count != 1
+	if (!output_conversion(1.0 / 64, &operation.output_multiplier,
+			&operation.output_shift)
+		|| split_tasks(operation) != B_OK || operation.task_count != 1
 		|| weights_buffer_size(operation) > kBiasOffset - kWeightsOffset) {
 		return false;
 	}

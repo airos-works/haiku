@@ -410,6 +410,7 @@ run_case(const Case& test, const BNeuralDevice& device,
 	int64 total = 0;
 	int32 largest = 0;
 	int64 saturated = 0;
+	int64 signedSum = 0;
 
 	// two inputs: random numbers, and the same again with other numbers
 	for (int32 round = 0; round < 2; round++) {
@@ -439,6 +440,7 @@ run_case(const Case& test, const BNeuralDevice& device,
 			int32 p = isSigned ? (int32)(int8)x[j] : (int32)x[j];
 			int32 q = isSigned ? (int32)(int8)y[j] : (int32)y[j];
 			int32 difference = abs(p - q);
+			signedSum += p - q;
 			if (difference != 0)
 				different++;
 			if (difference > largest)
@@ -459,7 +461,8 @@ run_case(const Case& test, const BNeuralDevice& device,
 		"difference %" B_PRId32, ok ? "ok" : "FAILED", name.String(),
 		different, total, largest);
 	if (sVerbose) {
-		printf(" (%" B_PRId64 " at the ends of the range)", saturated);
+		printf(" (%" B_PRId64 " at the ends of the range, mean %.4f)",
+			saturated, (double)signedSum / total);
 	}
 	printf("\n");
 	return ok;
@@ -805,6 +808,42 @@ check_model(const char* path, const char* inputPath,
 		for (int32 j = 0; j < op->input_count; j++) {
 			if (op->inputs[j] >= 0)
 				consumers[op->inputs[j]]++;
+		}
+	}
+
+	// With -v, the whole model on the processor as well: how far its
+	// tensors are from the CPU's when every operator works on what the
+	// ones before it made. (All tensors come out of this model, so no
+	// addition becomes part of a convolution here.)
+	if (sVerbose) {
+		BNeuralSession deviceSession;
+		status = deviceSession.SetTo(whole.model, device, 0);
+		for (int32 i = 0; status == B_OK && i < whole.input_count; i++) {
+			deviceSession.InputAt(i)->CopyFrom(*wholeSession.InputAt(i));
+		}
+		if (status == B_OK)
+			status = deviceSession.Run();
+		for (int32 i = 0; status == B_OK && i < whole.output_count; i++) {
+			const BTensor* a = deviceSession.OutputAt(i);
+			if (a->Type() != B_NEURAL_UINT8 && a->Type() != B_NEURAL_INT8)
+				continue;
+			const uint8* x = (const uint8*)a->Data();
+			const uint8* y = reference[whole.outputs[i]];
+			bool isSigned = a->Type() == B_NEURAL_INT8;
+			int64 different = 0;
+			int32 largest = 0;
+			for (size_t j = 0; j < a->ByteSize(); j++) {
+				int32 difference = abs(isSigned
+					? (int32)(int8)x[j] - (int32)(int8)y[j]
+					: (int32)x[j] - (int32)y[j]);
+				if (difference != 0)
+					different++;
+				if (difference > largest)
+					largest = difference;
+			}
+			printf("  in the whole model: %-40.40s %" B_PRId64 " of %"
+				B_PRIuSIZE " differ, largest difference %" B_PRId32 "\n",
+				a->Info().Name(), different, a->ByteSize(), largest);
 		}
 	}
 

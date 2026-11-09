@@ -14,8 +14,10 @@
 	The list is Mesa's (rkt_regcmd.c), in its order. What differs:
 
 	- The scales that turn sums into outputs, and addends into sums, are
-	  computed here for any tensors. Mesa has tables for the networks it
-	  was tried with.
+	  computed for any tensors (Mesa has tables for the networks it was
+	  tried with), and the stages between the sums and the outputs, which
+	  Mesa leaves unused, do activations and make the rounding follow the
+	  CPU's; see Support.cpp.
 	- Zero points are those of signed tensors (see Compiler.h), so that
 	  networks of int8 numbers work as well as those of uint8 ones.
 	- Inputs of a single channel, which the processor takes in another
@@ -103,18 +105,17 @@ output_conversion(double scale, uint32* _scale, uint32* _shift)
 }
 
 
-/*!	What the processor makes of a sum with a factor of
-	output_conversion(), before the zero point is added. */
+/*!	What the processor makes of a sum, before the zero point is added
+	(and as long as nothing else is added to it). */
 int64
-converted_output(const Operation& operation, int64 sum, uint32 scale,
-	uint32 shift)
+converted_output(const Operation& operation, int64 sum)
 {
-	int64 product = ((sum << operation.rounding_bits)
-		+ operation.rounding_offset) * (int64)scale;
-	shift += operation.rounding_bits;
-	if (shift == 0)
+	int64 product = (sum * (int64)operation.sum_multiplier
+		+ operation.rounding_offset) * (int64)operation.output_multiplier;
+	if (operation.output_shift == 0)
 		return product;
-	return (product + ((int64)1 << (shift - 1))) >> shift;
+	return (product + ((int64)1 << (operation.output_shift - 1)))
+		>> operation.output_shift;
 }
 
 
@@ -283,11 +284,11 @@ fill_commands(const Operation& operation, uint32 taskIndex,
 	// the result kept above zero and below a limit if there are bounds
 	// (the lower bound was taken off the bias for that, see
 	// fill_biases(), and is added again by the next stage).
-	// It also multiplies by a power of two where the sums are to have
-	// bits after the point, see plan_rounding() in Support.cpp; the limit
-	// is applied to the product.
+	// It also does the first of the two multiplications that make outputs
+	// of sums, see plan_conversion() in Support.cpp; the limit is applied
+	// to the product.
 	uint32 biasConfig = DPU_BS_CFG_BS_ALU_ALGO(2) | DPU_BS_CFG_BS_ALU_SRC(1);
-	if (operation.rounding_bits == 0)
+	if (operation.sum_multiplier == 1)
 		biasConfig |= DPU_BS_CFG_BS_MUL_BYPASS(1);
 	if (!operation.clamp_low)
 		biasConfig |= DPU_BS_CFG_BS_RELU_BYPASS(1);
@@ -296,11 +297,11 @@ fill_commands(const Operation& operation, uint32 taskIndex,
 
 	EMIT(REG_DPU_BS_CFG, biasConfig);
 	EMIT(REG_DPU_BS_ALU_CFG, 0);
-	EMIT(REG_DPU_BS_MUL_CFG, operation.rounding_bits != 0
-		? DPU_BS_MUL_CFG_BS_MUL_OPERAND(1 << operation.rounding_bits) : 0);
+	EMIT(REG_DPU_BS_MUL_CFG, operation.sum_multiplier != 1
+		? DPU_BS_MUL_CFG_BS_MUL_OPERAND(operation.sum_multiplier) : 0);
 	EMIT(REG_DPU_BS_RELUX_CMP_VALUE, operation.clamp_high
 		? (uint32)(operation.clamp_maximum - operation.clamp_minimum)
-			<< operation.rounding_bits
+			* operation.sum_multiplier
 		: 0);
 
 	if (operation.depthwise) {
@@ -325,7 +326,7 @@ fill_commands(const Operation& operation, uint32 taskIndex,
 	int32 stageAddend = operation.rounding_offset;
 	if (operation.clamp_low) {
 		stageAddend += operation.clamp_minimum
-			* ((int32)1 << operation.rounding_bits);
+			* (int32)operation.sum_multiplier;
 	}
 
 	if (stageAddend != 0) {
@@ -340,11 +341,6 @@ fill_commands(const Operation& operation, uint32 taskIndex,
 	}
 	EMIT(REG_DPU_BN_MUL_CFG, 0);
 	EMIT(REG_DPU_BN_RELUX_CMP_VALUE, 0);
-
-	uint32 outputScale = 1;
-	uint32 outputShift = 0;
-	output_conversion(sumScale / operation.output_scale, &outputScale,
-		&outputShift);
 
 	if (addition) {
 		// The other operand is brought to the scale of the sums, less its
@@ -376,9 +372,10 @@ fill_commands(const Operation& operation, uint32 taskIndex,
 	}
 
 	EMIT(REG_DPU_OUT_CVT_OFFSET, (uint32)operation.output_zero_point);
-	EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(outputScale));
-	EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(outputShift
-		+ operation.rounding_bits));
+	EMIT(REG_DPU_OUT_CVT_SCALE,
+		DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(operation.output_multiplier));
+	EMIT(REG_DPU_OUT_CVT_SHIFT,
+		DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(operation.output_shift));
 
 	EMIT(REG_DPU_EW_OP_VALUE_0, 0);
 	EMIT(REG_DPU_EW_OP_VALUE_1, 0);

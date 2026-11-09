@@ -182,11 +182,13 @@ struct Operation {
 	int32		clamp_minimum;
 	int32		clamp_maximum;
 
-	// Rounding as the CPU does it, see plan_rounding(): the sums are
-	// multiplied by two to the power of rounding_bits and rounding_offset
-	// is added to them before they become outputs.
-	uint32		rounding_bits;
+	// How sums become outputs, see plan_conversion(): they are multiplied
+	// by sum_multiplier, rounding_offset is added, the result multiplied
+	// by output_multiplier and shifted right by output_shift bits.
+	uint32		sum_multiplier;
 	int32		rounding_offset;
+	uint32		output_multiplier;
+	uint32		output_shift;
 
 	// offsets in the program's buffer of constants
 	uint32		weights_offset;
@@ -229,8 +231,7 @@ uint32		fill_commands(const Operation& operation, uint32 taskIndex,
 void		link_commands(uint64* commands, uint32 count, uint32 nextAddress,
 				uint32 nextCount);
 bool		output_conversion(double scale, uint32* _scale, uint32* _shift);
-int64		converted_output(const Operation& operation, int64 sum,
-				uint32 scale, uint32 shift);
+int64		converted_output(const Operation& operation, int64 sum);
 bool		addend_conversion(double scale, uint32* _scale, uint32* _shift);
 
 
