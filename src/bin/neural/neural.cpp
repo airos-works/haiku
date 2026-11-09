@@ -7,7 +7,8 @@
 /*!	neural: the Neural Kit from the command line. Lists the devices that
 	run networks, shows what is in a model, runs one (on a picture, a file
 	of raw numbers or noise) and compares what a device computes with what
-	the CPU computes.
+	the CPU computes. "transcribe" turns a recording of speech into text
+	with BSpeechRecognizer.
 */
 
 
@@ -19,13 +20,18 @@
 
 #include <Application.h>
 #include <Bitmap.h>
+#include <Entry.h>
 #include <File.h>
+#include <MediaFile.h>
+#include <MediaTrack.h>
 #include <Message.h>
 #include <NeuralKit.h>
 #include <Path.h>
 #include <String.h>
 #include <StringList.h>
 #include <TranslationUtils.h>
+
+#include <SpeechCore.h>
 
 
 static const char* kUsage =
@@ -34,6 +40,9 @@ static const char* kUsage =
 	"       neural run <model> [options]\n"
 	"       neural compare <model> [options]\n"
 	"       neural bench <model> [options]\n"
+	"       neural transcribe <audio file> [--model <name or directory>]\n"
+	"              [-d <id>] [--cpu] [--language <code>] [--no-timestamps]\n"
+	"              [--interim <seconds>] [--wave]\n"
 	"\n"
 	"devices   lists the devices that can run networks\n"
 	"info      shows the inputs, outputs and operators of a model and how\n"
@@ -42,6 +51,11 @@ static const char* kUsage =
 	"compare   runs the model on a device and on the CPU with the same\n"
 	"          input and compares the outputs\n"
 	"bench     times the model on every device\n"
+	"transcribe  writes down what is said in a recording, with a speech\n"
+	"          model (default: the one that is installed). The file is\n"
+	"          read with the Media Kit; a WAVE file also without it\n"
+	"          (--wave: always). --interim shows, every so many seconds,\n"
+	"          what is heard in audio that is not final yet.\n"
 	"\n"
 	"options:\n"
 	"  -d, --device <id>   the device to use (default: the system's choice)\n"
@@ -662,6 +676,264 @@ bench_model(const Options& options)
 }
 
 
+// #pragma mark - transcribe
+
+
+/*!	Hands the recognizer audio; when ten minutes of it are waiting, the
+	model is given time to catch up. */
+static status_t
+feed(BSpeechRecognizer& recognizer, const void* buffer, size_t size)
+{
+	status_t status;
+	while ((status = recognizer.Feed(buffer, size)) == B_BUSY)
+		snooze(50000);
+	return status;
+}
+
+
+/*!	Decodes the first audio track of a file with the Media Kit and feeds
+	it to the recognizer in the format the decoder gives. An error before
+	the recording was started means "not a file the Media Kit reads". */
+static status_t
+feed_media_file(BSpeechRecognizer& recognizer, const char* path,
+	bool* _started)
+{
+	*_started = false;
+
+	entry_ref ref;
+	status_t status = get_ref_for_path(path, &ref);
+	if (status != B_OK)
+		return status;
+
+	BMediaFile file(&ref);
+	status = file.InitCheck();
+	if (status != B_OK)
+		return status;
+
+	for (int32 i = 0; i < file.CountTracks(); i++) {
+		BMediaTrack* track = file.TrackAt(i);
+		if (track == NULL)
+			continue;
+
+		media_format format;
+		format.Clear();
+		format.type = B_MEDIA_RAW_AUDIO;
+		format.u.raw_audio = media_raw_audio_format::wildcard;
+		if (track->DecodedFormat(&format) != B_OK
+			|| format.type != B_MEDIA_RAW_AUDIO) {
+			file.ReleaseTrack(track);
+			continue;
+		}
+
+		const media_raw_audio_format& raw = format.u.raw_audio;
+		size_t frameSize = (raw.format & media_raw_audio_format
+			::B_AUDIO_SIZE_MASK) * raw.channel_count;
+		void* buffer = malloc(raw.buffer_size > 0 ? raw.buffer_size : 1);
+		if (buffer == NULL || frameSize == 0 || raw.buffer_size < frameSize) {
+			free(buffer);
+			file.ReleaseTrack(track);
+			return B_NO_MEMORY;
+		}
+
+		status = recognizer.Start(&raw);
+		if (status == B_OK) {
+			*_started = true;
+			int64 frames = 0;
+			while (status == B_OK
+				&& track->ReadFrames(buffer, &frames) == B_OK
+				&& frames > 0) {
+				status = feed(recognizer, buffer, frames * frameSize);
+			}
+		}
+		free(buffer);
+		file.ReleaseTrack(track);
+		return status;
+	}
+	return B_MEDIA_NO_HANDLER;
+}
+
+
+//! The same with the kit's own reader of WAVE files.
+static status_t
+feed_wave_file(BSpeechRecognizer& recognizer, const char* path)
+{
+	BPrivate::SpeechSamples samples;
+	status_t status = BPrivate::speech_read_wave_file(path, 16000, samples);
+	if (status != B_OK)
+		return status;
+
+	status = recognizer.Start();
+	if (status == B_OK) {
+		status = feed(recognizer, samples.Samples(),
+			samples.Count() * sizeof(float));
+	}
+	return status;
+}
+
+
+static int
+transcribe(int argc, char** argv)
+{
+	const char* audio = NULL;
+	const char* model = NULL;
+	const char* deviceID = NULL;
+	const char* language = NULL;
+	uint32 flags = 0;
+	bool timestamps = true;
+	bool waveOnly = false;
+	double interim = 0;
+
+	for (int i = 2; i < argc; i++) {
+		const char* arg = argv[i];
+		const char* value = i + 1 < argc ? argv[i + 1] : NULL;
+
+		if (strcmp(arg, "--cpu") == 0)
+			flags |= B_NEURAL_CPU_ONLY;
+		else if (strcmp(arg, "--no-timestamps") == 0)
+			timestamps = false;
+		else if (strcmp(arg, "--wave") == 0)
+			waveOnly = true;
+		else if (arg[0] == '-' && value == NULL) {
+			fprintf(stderr, "neural: %s needs a value\n", arg);
+			return 2;
+		} else if (strcmp(arg, "--model") == 0) {
+			model = value;
+			i++;
+		} else if (strcmp(arg, "-d") == 0 || strcmp(arg, "--device") == 0) {
+			deviceID = value;
+			i++;
+		} else if (strcmp(arg, "--language") == 0) {
+			language = value;
+			i++;
+		} else if (strcmp(arg, "--interim") == 0) {
+			interim = atof(value);
+			i++;
+		} else if (arg[0] == '-') {
+			fprintf(stderr, "neural: unknown option %s\n", arg);
+			return 2;
+		} else if (audio == NULL)
+			audio = arg;
+		else {
+			fprintf(stderr, "neural: one recording at a time\n");
+			return 2;
+		}
+	}
+	if (audio == NULL) {
+		fputs(kUsage, stderr);
+		return 2;
+	}
+
+	bigtime_t start = system_time();
+	BSpeechRecognizer recognizer;
+	status_t status;
+	if (deviceID != NULL) {
+		BNeuralDevice device;
+		status = BNeuralRoster::Default()->FindDevice(deviceID, &device);
+		if (status != B_OK) {
+			fprintf(stderr, "neural: no device \"%s\"\n", deviceID);
+			return 1;
+		}
+		status = recognizer.SetTo(model, device, flags);
+	} else
+		status = recognizer.SetTo(model, flags);
+	if (status != B_OK) {
+		fprintf(stderr, "neural: cannot set up the recognizer: %s (%s)\n",
+			error_name(status), recognizer.ErrorDetails());
+		return 1;
+	}
+
+	if (language != NULL && recognizer.SetLanguage(language) != B_OK) {
+		fprintf(stderr, "neural: the model has no language \"%s\"\n",
+			language);
+		return 1;
+	}
+	recognizer.SetTimestamps(timestamps);
+	printf("model %s on %s, ready in %.2f s\n", recognizer.ModelName(),
+		recognizer.Device().ID(), (system_time() - start) / 1e6);
+
+	// what is not final is shown as it comes, by a looper of its own
+	class InterimPrinter : public BLooper {
+	public:
+		virtual void MessageReceived(BMessage* message)
+		{
+			if (message->what == B_SPEECH_RESULT
+				&& !message->GetBool("speech:final", true)) {
+				printf("~[%7.2f --> %7.2f]  %s\n",
+					message->GetInt64("speech:start", 0) / 1e6,
+					message->GetInt64("speech:end", 0) / 1e6,
+					message->GetString("speech:text", ""));
+				fflush(stdout);
+			}
+		}
+	};
+	InterimPrinter* printer = NULL;
+	if (interim > 0) {
+		printer = new InterimPrinter();
+		printer->Run();
+		recognizer.SetTarget(BMessenger(printer));
+		recognizer.SetInterimInterval((bigtime_t)(interim * 1e6));
+	}
+
+	start = system_time();
+	bool started = false;
+	status = waveOnly ? B_ERROR
+		: feed_media_file(recognizer, audio, &started);
+	if (status != B_OK && !started)
+		status = feed_wave_file(recognizer, audio);
+	if (status == B_OK)
+		status = recognizer.Finish();
+	if (status != B_OK) {
+		fprintf(stderr, "neural: cannot read %s: %s\n", audio,
+			strerror(status));
+		return 1;
+	}
+
+	// the phrases as they become final
+	int32 printed = 0;
+	while (true) {
+		status = recognizer.WaitUntilFinished(100000);
+		for (; printed < recognizer.CountSegments(); printed++) {
+			speech_segment segment;
+			if (recognizer.GetSegment(printed, &segment) != B_OK)
+				break;
+			printf("[%7.2f --> %7.2f]  %s\n", segment.start / 1e6,
+				segment.end / 1e6, segment.text.String());
+			fflush(stdout);
+		}
+		if (status != B_TIMED_OUT)
+			break;
+	}
+	bigtime_t took = system_time() - start;
+
+	if (printer != NULL) {
+		recognizer.SetTarget(BMessenger());
+		printer->Lock();
+		printer->Quit();
+	}
+	if (status != B_OK) {
+		fprintf(stderr, "neural: recognition failed: %s\n",
+			error_name(status));
+		return 1;
+	}
+
+	speech_recognizer_info info;
+	recognizer.GetInfo(&info);
+	double seconds = info.audio_duration / 1e6;
+	printf("%.2f s of audio in %.2f s: %.3f of real time\n", seconds,
+		took / 1e6, seconds > 0 ? took / 1e6 / seconds : 0);
+	if (info.windows > 0) {
+		printf("%d windows: %.3f s each (front end %.3f, encoder %.3f, "
+			"decoder %.3f for %.1f tokens)\n", (int)info.windows,
+			info.processing_time / 1e6 / info.windows,
+			info.front_end_time / 1e6 / info.windows,
+			info.encoder_time / 1e6 / info.windows,
+			info.decoder_time / 1e6 / info.windows,
+			(double)info.tokens / info.windows);
+	}
+	return 0;
+}
+
+
 int
 main(int argc, char** argv)
 {
@@ -675,6 +947,8 @@ main(int argc, char** argv)
 		fputs(kUsage, stdout);
 		return 0;
 	}
+	if (strcmp(command, "transcribe") == 0)
+		return transcribe(argc, argv);
 
 	Options options;
 	memset(&options, 0, sizeof(options));

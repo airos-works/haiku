@@ -12,6 +12,7 @@
 #include <neural/NeuralRoster.h>
 #include <neural/NeuralSession.h>
 #include <neural/NeuralUtils.h>
+#include <neural/SpeechRecognizer.h>
 #include <neural/Tensor.h>
 
 

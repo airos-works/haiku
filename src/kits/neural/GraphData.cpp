@@ -632,7 +632,13 @@ static const struct {
 	{ B_NEURAL_OP_QUANTIZE, "QUANTIZE", 0 },
 	{ B_NEURAL_OP_DEQUANTIZE, "DEQUANTIZE", 0 },
 	{ B_NEURAL_OP_DETECTION_POSTPROCESS, "DETECTION_POSTPROCESS",
-		sizeof(neural_detection_params) }
+		sizeof(neural_detection_params) },
+	{ B_NEURAL_OP_SQUARED_DIFFERENCE, "SQUARED_DIFFERENCE", 0 },
+	{ B_NEURAL_OP_RSQRT, "RSQRT", 0 },
+	{ B_NEURAL_OP_GELU, "GELU", sizeof(neural_gelu_params) },
+	{ B_NEURAL_OP_BATCH_MATMUL, "BATCH_MATMUL",
+		sizeof(neural_batch_matmul_params) },
+	{ B_NEURAL_OP_GATHER, "GATHER", sizeof(neural_gather_params) }
 };
 
 

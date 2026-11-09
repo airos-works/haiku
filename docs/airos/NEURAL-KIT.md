@@ -49,8 +49,10 @@ headers/os/neural/NeuralOperators.h          the operators and their parameters
 headers/os/neural/NeuralRoster.h             BNeuralDevice, BNeuralRoster
 headers/os/neural/NeuralSession.h            BNeuralSession
 headers/os/neural/NeuralUtils.h              BNeuralUtils: bitmaps, labels
+headers/os/neural/SpeechRecognizer.h         BSpeechRecognizer: speech to text
 headers/os/add-ons/neural/NeuralBackend.h    the back-end API
-headers/private/neural/                      the graph, the interpreter, the roster's inside
+headers/private/neural/                      the graph, the interpreter, the roster's inside,
+                                             the speech recognizer's core
 src/kits/neural/                             libneural.so
 src/kits/neural/ops/                         the CPU kernels, one file per family
 src/add-ons/neural/                          the back ends
@@ -151,7 +153,10 @@ A model whose operators the kit does not know does not load
 (`B_NEURAL_UNSUPPORTED_OPERATOR`; `ErrorDetails()` names the operator). The
 operators the kit knows are in `NeuralOperators.h` and under
 [Operators](#operators); shapes are fixed when the model is made (no
-dynamic shapes, no control flow, no state kept between runs yet).
+dynamic shapes, no control flow). A model keeps nothing between runs:
+one that works in steps, like the decoder of a speech model, gets what
+its earlier steps computed as inputs (see
+[Speech recognition](#speech-recognition)).
 
 `BNeuralModelBuilder` makes a model in memory, operator by operator, for
 programs that compute their network and for tests:
@@ -323,12 +328,190 @@ device the reference every back end is checked against (`neural compare`).
 | Activation | `RELU`, `RELU6`, `LEAKY_RELU`, `PRELU`, `LOGISTIC`, `TANH`, `HARD_SWISH`, `SOFTMAX` |
 | Shape | `RESHAPE`, `SQUEEZE`, `CONCATENATION`, `PAD`, `TRANSPOSE`, `STRIDED_SLICE`, `RESIZE_BILINEAR`, `RESIZE_NEAREST` |
 | Types | `QUANTIZE`, `DEQUANTIZE` |
+| Transformers | `BATCH_MATMUL` (products of matrices; the dimensions before the last two broadcast, either input may be taken transposed), `GELU` (exact and the tanh approximation), `GATHER` (slices picked by index along a dimension: embeddings; any element type), `SQUARED_DIFFERENCE`, `RSQRT`; float32 |
 | Detection | `DETECTION_POSTPROCESS` (TensorFlow Lite's `TFLite_Detection_PostProcess`: boxes, classes, scores and count from a single-shot detector's raw output) |
 
 That covers the MobileNet family (V1, V2; classification and SSD
 detection), which is what the first uses need: recognising what a camera
-sees. Recurrent and transformer networks (speech, language) need more
-operators and state between runs; see [Open points](#open-points).
+sees, and the encoder and decoder of a Whisper speech model (layer
+normalisation is `MEAN`, `SQUARED_DIFFERENCE`, `RSQRT` and arithmetic, as
+converters write it). `GATHER` checks indices that come with the input on
+every run: one that is out of range fails the run. Weights stored as
+8 bit integers with floating point activations ("dynamic range"
+quantization) are not supported.
+
+## Speech recognition
+
+`BSpeechRecognizer` turns speech into text on the machine itself, with a
+Whisper model the kit runs. Audio goes in as it is recorded, text comes
+out as messages; nothing the caller does waits for the model.
+
+```cpp
+#include <NeuralKit.h>
+
+BSpeechRecognizer recognizer;
+status_t status = recognizer.SetTo();           // the model that is installed
+recognizer.SetTarget(BMessenger(this));
+recognizer.SetInterimInterval(2000000);         // read unfinished audio too
+
+recognizer.Start(&format);                      // a media_raw_audio_format
+// for every buffer the recording gives, from whatever thread has it:
+recognizer.Feed(buffer, size);
+// when the recording is over:
+recognizer.Finish();
+
+void MyWindow::MessageReceived(BMessage* message)
+{
+	switch (message->what) {
+		case B_SPEECH_RESULT:
+		{
+			const char* text = message->GetString("speech:text", "");
+			if (message->GetBool("speech:final", false))
+				fTranscript << text << " ";     // a phrase that stands
+			else
+				fPending = text;                // replaces the one before
+			break;
+		}
+		case B_SPEECH_FINISHED:
+			// "speech:status"; the recording is done with
+			break;
+	}
+}
+```
+
+or, for a recording that is complete (16000 samples per second, one
+channel, float; or any raw format):
+
+```cpp
+BString text;
+recognizer.Transcribe(samples, count, &text);
+for (int32 i = 0; i < recognizer.CountSegments(); i++) {
+	speech_segment segment;
+	recognizer.GetSegment(i, &segment);         // start, end (µs), text
+}
+```
+
+| Method | Does |
+| --- | --- |
+| `SetTo(model, flags)`, `SetTo(model, device, flags)` | loads a model: a name (`"whisper-tiny.en"`), the path of a model directory, or `NULL` for the first one found; device and flags as for `BNeuralSession` |
+| `FindModel()`, `GetModels()` | the installed models: directories with a `speech.conf` under `neural/models` of the data directories |
+| `GetLanguages()`, `SetLanguage("de")` | for models of many languages; `"en"` to begin with |
+| `SetTimestamps(bool)` | whether the model is asked for the times of its phrases (default: yes) |
+| `SetTarget(messenger, message)` | where results go; with a message of the caller's the fields are added to it, and `"speech:finished"` tells the two kinds apart |
+| `SetInterimInterval(µs)` | how often, at most, audio that is not final yet is read for a result that is not final; 0: never |
+| `Start(format, &token)` | begins a recording in a `media_raw_audio_format` (`NULL`: 16 kHz, mono, float); the token comes back in the messages |
+| `Feed(buffer, size)` | more audio; returns at once (`B_BUSY` when ten minutes are waiting) |
+| `Finish()` | the recording is over: the rest is recognized, then `B_SPEECH_FINISHED` is sent |
+| `Cancel()` | drops the recording; no more results |
+| `WaitUntilFinished(timeout)`, `IsRecognizing()` | for callers that do want to wait |
+| `Transcribe(...)`, `CountSegments()`, `GetSegment()` | a whole recording at once; the phrases of the recording so far |
+| `GetInfo()` | audio recognized, time spent on it (front end, encoder, decoder), windows, tokens |
+
+`B_SPEECH_RESULT` has `"speech:text"`, `"speech:final"` (bool),
+`"speech:start"` and `"speech:end"` (int64: microseconds from the
+beginning of the recording), `"speech:token"` and `"speech:recognizer"`;
+`B_SPEECH_FINISHED` has `"speech:status"`, `"speech:audio"` and
+`"speech:duration"` (microseconds of audio, and of work).
+
+**How it works.** Whisper takes 30 seconds of audio at a time. The
+recognizer's thread makes the log-mel spectrogram of such a window (a
+400-sample Hann window every 160 samples, 80 mel filters), runs the
+encoder on it once and the decoder once per token, picking the likeliest
+token each time under Whisper's rules for what may follow what. The model
+writes time stamps between its phrases: a phrase is **final** when the
+model has seen its end, and the next window begins where the last whole
+phrase ended, so that a phrase cut by the end of a window is heard again
+in full. A recording shorter than a window therefore gives its final
+phrases only at `Finish()`; what is heard meanwhile comes as results that
+are not final, if `SetInterimInterval()` asks for them (each such reading
+costs what a window costs, see below; one result carries the reading of
+everything after the last final phrase and replaces the one before).
+Audio of any raw format of the Media Kit (8, 16, 32 bit, float; up to
+eight channels, any rate, either byte order) is brought to one channel at
+16 kHz with a windowed sinc filter as it is fed.
+
+Deleting a recognizer is safe at any time; it waits for the step the
+model is in (at most an encoder run).
+
+**What is not Whisper's reference implementation:** the loudest value of
+the spectrogram, below which nothing may be quieter by more than 80 dB,
+is taken per window, not over the whole recording; the decoder is not
+given the text before the window; a window is decoded once (greedy, no
+beam search, no second tries at higher temperatures when the text looks
+wrong), so a hard stretch of audio can give repeated or wrong text where
+the reference would try again. A window the model takes for silence
+gives no text.
+
+### Speech models
+
+A speech model is a directory:
+
+| File | Is |
+| --- | --- |
+| `speech.conf` | lines of a key and values: the family (`whisper`), the file names, the sizes of the front end, the numbers of the special tokens, the tokens that are never produced, the languages |
+| `encoder.tflite` | spectrogram `"mel"` [1, 80, 3000] to, for each layer of the decoder, the keys and values its attention to the audio needs (`"cross_k_<n>"`, `"cross_v_<n>"`) |
+| `decoder.tflite` | one token per run: `"token"`, `"position"`, the encoder's outputs, and the keys and values of the steps before (`"self_k_<n>"`, `"self_v_<n>"`) to `"logits"` and this step's keys and values (`"new_k_<n>"`, `"new_v_<n>"`), which the recognizer puts into the inputs at the step's position |
+| `vocabulary.bin` | the byte strings of the text tokens |
+| `mel_filters.bin` | the mel filter bank |
+| `LICENSE` | the licence of the weights |
+
+Both networks have fixed shapes and no control flow; the loop over the
+tokens is the recognizer's (`src/kits/neural/SpeechWhisper.cpp`, which is
+all the kit knows about Whisper; the numbers of a model are in its
+`speech.conf`, and another family of models would be another decoder
+class beside it).
+
+OpenAI publishes Whisper as PyTorch checkpoints (MIT). The pre-converted
+TensorFlow Lite files that could be found run the whole decoding loop
+inside the model (a `WHILE` operator and subgraphs) or put encoder and
+decoder into one file with call operators, and run the decoder over all
+tokens so far for every new one; so the kit's files are made from the
+checkpoint by `tools/airos/neural/whisper_convert.py`, which needs
+neither PyTorch nor TensorFlow, and checks the result against a NumPy
+version of Whisper's equations. `fetch-models.sh <data directory> speech`
+downloads the checkpoint and the vocabulary by their checksums and
+converts them (on a Linux host with Python, numpy, flatbuffers and
+ai-edge-litert; the directory is then copied to the machine):
+
+| Set | Model | Files |
+| --- | --- | --- |
+| `speech` | `neural/models/whisper-tiny.en`: Whisper tiny.en, English, 39 million weights | encoder 37.6 MB, decoder 114.3 MB (float32), vocabulary 0.4 MB |
+| `speech-multilingual` | `neural/models/whisper-tiny`: Whisper tiny, 99 languages | the same sizes |
+
+No model is in the images yet.
+
+### In a browser
+
+Summit's `SpeechRecognition` (`webkitSpeechRecognition`,
+airos-works/summit#159) needs a back end that does this:
+
+1. `start()`: open the microphone with the Media Kit (a consumer node
+   connected to the system's audio input; the kit's private
+   `BMediaRecorder` is such a node) and call `Start(&format)` with the
+   format the input gives. `lang` maps to
+   `SetLanguage()` with a multilingual model (`"de-DE"` to `"de"`);
+   `interimResults` to `SetInterimInterval()` (two to three seconds is a
+   good start on machines like the ROCK 5, where a reading takes one to
+   two and a half).
+2. Every buffer of the recording goes to `Feed()` from the thread that
+   has it; nothing blocks.
+3. `B_SPEECH_RESULT` with `"speech:final"` false becomes a `result` event
+   whose one result has `isFinal` false; with true, a result with
+   `isFinal` true that is added to the list. Whisper gives no confidence;
+   report 1 or leave it at 0.
+4. `stop()`: `Finish()`; the remaining results come, then
+   `B_SPEECH_FINISHED`, which is the `end` event (an error status becomes
+   `error`). `abort()`: `Cancel()`, then `end`.
+5. The recognizer is set up once and kept (a few tenths of a second; the
+   machine's used memory grows by about 425 MB while it works, the 150 MB
+   of mapped model files included); `"speech:token"` tells the results of
+   an aborted recording from those of the next.
+
+What the kit does not do yet and a browser will want: noticing by itself
+that the speaker has stopped (the Web Speech API ends a recognition that
+is not `continuous` at the first pause; see
+[Open points](#open-points)), and permission handling for the microphone,
+which is the browser's.
 
 ## Writing a back end
 
@@ -400,6 +583,11 @@ neural compare model.tflite -d rk3588_npu/0
                                         the device against the CPU on the same input;
                                         --tolerance <steps>, --float-tolerance <fraction>
 neural bench model.tflite               times it on every device
+neural transcribe speech.wav            writes down what is said in a recording (any file the
+                                        Media Kit decodes; a WAVE file also without it), the
+                                        phrases with their times, and how long it took;
+                                        --model <name or directory>, -d <device>, --cpu,
+                                        --language <code>, --no-timestamps, --interim <seconds>
 ```
 
 Without `-i` the input is noise that is the same on every run.
@@ -497,6 +685,17 @@ exactly the operators a bundle covers, and nothing without one.
   test), and per-back-end tests that run single operators on a device and
   the CPU (`rk3588_npu_backend_test`, `vulkan_backend_test`,
   `amdxdna_backend_test`).
+- **Speech:** `host/speech_tests.sh` builds the recognizer's core on the
+  build host and compares it with a reference written with NumPy from
+  Whisper's published algorithm (`speech_reference.py`; the networks run
+  by LiteRT): the audio converter, the tokenizer, spectrograms, encoder
+  and decoder tensor by tensor, the text of recordings, and damaged
+  model directories.
+  `speech_test` (`src/tests/kits/neural`) runs on the machine: the front
+  end against stored reference values, model directories and decoding
+  with a model and networks made up in the test, and, with a model
+  installed, `BSpeechRecognizer` itself (messages, interim results,
+  `Cancel()`, deletion in the middle of its work).
 - **Lookout** (`src/apps/lookout`, in the Demos menu): a picture or the
   camera, with what a detection or classification model finds in it; the
   kit as an application uses it (`RunAsync()` to a window, the roster's
@@ -511,12 +710,12 @@ What was measured, on which machine, on 2026-11-09. "Agrees" means
 ### The CPU device
 
 - **Against LiteRT 2.3** (TensorFlow Lite's reference kernels, on the
-  build host, `src/tests/kits/neural/host/run_tests.sh`): 637 generated
+  build host, `src/tests/kits/neural/host/run_tests.sh`): 726 generated
   single-operator models (every operator and type, three random inputs
   each) and 9 real models (MobileNet V1/V2 quantized and float, SSD
   MobileNet V1, EfficientNet-Lite0 int8 and float, EfficientDet-Lite0
   int8, DeepLab V3 float, BlazeFace float16) agree on every tensor: all
-  integer tensors equal, float within 1e-4. 3297 deliberately damaged
+  integer tensors equal, float within 1e-4. 3737 deliberately damaged
   model files are refused or run without a crash, also under the address
   and undefined-behaviour sanitizers.
 - **On arm64** (ROCK 5 ITX, Haiku): the outputs of the three quantized
@@ -623,6 +822,59 @@ What was measured, on which machine, on 2026-11-09. "Agrees" means
   is installed, and hands a failed run to the CPU with the right result),
   `neural compare`, timing against the CPU, a soak test.
 
+### Speech recognition (Whisper tiny.en)
+
+- **The conversion** (`whisper_convert.py --check`): the encoder's
+  outputs are within 1e-5 (of the largest value) of a NumPy version of
+  Whisper's equations on the checkpoint's weights, the decoder's logits
+  over six steps, token by token against all at once, within 5e-6 with
+  the same best token each time; the mel filter bank computed there
+  differs from the one Whisper ships by 2e-9.
+- **On the build host** (`host/speech_tests.sh`, 54 checks, also under
+  the address and undefined-behaviour sanitizers): the front end's
+  spectrograms are within 1.2e-7 of the NumPy reference; encoder and
+  decoder agree with LiteRT's reference kernels on every tensor within
+  1e-4 on what three recordings put into them (on noise the decoder
+  too; the encoder within 3e-4: noise drives its last layer to values
+  speech never does, where the differences reach 1.2e-4); the audio
+  converter gives tones back within 3e-5 from 8 to 96 kHz, 16 bit to
+  float, one to six channels, and removes what 16 kHz cannot carry; the
+  text and times of three recordings (President Kennedy's "ask not"
+  from whisper.cpp's samples, 11 s; a LibriSpeech utterance, 10 s; both
+  twice in a row, 44 s, two windows) are those of the reference, with
+  and without time stamps, fed at once and in pieces; 600 model
+  directories with a damaged description, vocabulary or filter bank are
+  refused or read without a crash.
+- **On arm64** (ROCK 5 ITX, `neural transcribe`): the same text and times
+  for the three recordings, line for line; also from a 44.1 kHz stereo
+  file through the Media Kit's decoder and through the kit's own WAVE
+  reader. `speech_test` passes (59 checks with the model and a
+  recording). The Media Kit's FLAC decoder gave only 8.7 of an
+  utterance's 10.4 seconds ("audio decode error"), and the text ended
+  there.
+- **Speed** (ROCK 5 ITX; a window of 30 s full of speech, 85 tokens;
+  seconds):
+
+  | `NEURAL_THREADS` | Window | Encoder | Decoder | Of real time |
+  | --- | --- | --- | --- | --- |
+  | 1 | 5.83 | 4.27 | 1.50 | 0.19 |
+  | 4 | 2.15 | 1.06 | 1.07 | 0.07 |
+  | 8 (the default there) | 2.30 | 1.05 | 1.22 | 0.08 |
+
+  The front end takes 0.02 s. A token costs 12.5 to 17.6 ms, most of it
+  the last layer's 80 MB of weights; the 11 s recording takes 1.6 s. The
+  four slow cores add nothing (see [Open points](#open-points)).
+- **Memory:** the machine's used memory grows by about 425 MB while a
+  recording is transcribed, the 150 MB of mapped model files included
+  (1 GB before tensors shared memory).
+- **The multilingual model** (tiny) converts and checks the same way;
+  the kit's text for the two English recordings is the reference's.
+  No recording in another language was tried.
+- **Not verified:** audio from a microphone (only files were fed, at
+  once and in pieces); a model found by name in the data directories
+  (the models were given by their path, nothing was installed on the
+  board); any device but the CPU; x86_64 beyond building.
+
 ### Lookout
 
 On the X399: detections on pictures (SSD MobileNet V1 on the CPU) and the
@@ -637,18 +889,38 @@ device from the menus, drag and drop and the settings round trip.
 
 - **More model formats.** ONNX is the other format models are published
   in; the loader would be a second file next to `TFLiteLoader.cpp`.
-- **Speech and language.** Summit's speech recognition
-  (airos-works/summit#159) needs a Whisper-class model: transformer
-  operators (matrix multiplication, layer normalisation, GELU, gather), a
-  mel spectrogram front end for Media Kit audio, and a decoding loop that
-  keeps state between runs. The session API is ready for it (the decoder is
-  one more model, run repeatedly); the operators are not there yet.
+- **Speech.** What `BSpeechRecognizer` does not do yet:
+  - *Smaller, faster decoding.* Half of the time of a window full of
+    speech goes into the decoder's last layer, 80 MB of weights read per
+    token. Stored as 8 bit integers ("dynamic range" quantization, which
+    the fully connected kernel would have to learn) they would be 20 MB,
+    and the model 45 MB instead of 153.
+  - *The end of speech.* Nothing notices that the speaker has stopped
+    (voice activity detection): the caller says when a recording is over.
+    The model's own "no speech" estimate is only used to drop silent
+    windows.
+  - *Devices.* The CPU runs all of it. A graphics processor would take
+    the encoder's matrix products and fully connected layers; the Vulkan
+    back end has not been tried on these networks (`B_NEURAL_CPU_ONLY`
+    keeps a recognizer off it). NPUs want quantized networks.
+  - *Processors with fast and slow cores.* The thread pool hands the
+    same share of work to every core: on the ROCK 5 eight threads are no
+    faster than four, and slower in the decoder.
+  - *Other languages* work with the multilingual model, which was only
+    tried on English recordings; the language is not detected. Larger
+    models (base, small) convert the same way and were not tried.
+  - *Whisper's second tries* and the text before a window as a prompt
+    (see [Speech recognition](#speech-recognition)).
+  - *A media node* that takes the system's audio input and gives text,
+    so that every program does not open the microphone itself.
 - **Sharing device memory.** Tensors cross the boundary between a device
   program and the CPU by copy. A back end could hand out its own buffers
   for the session's inputs and outputs (`BNeuralProgram` has reserved
   slots for it).
-- **Memory of intermediate tensors** is not reused between operators on
-  the CPU: a session needs the sum of them, not the maximum.
+- **Memory of intermediate tensors** is reused between operators when
+  the CPU runs all of a model (a speech recognizer then takes 0.6 GB less).
+  With a device in the session every tensor still has memory of its own:
+  a session needs the sum of them, not the maximum.
 - **A media node.** A `BBufferConsumer` that runs a model on every video
   frame (a camera's) and sends the results as messages would save every
   camera program the same glue; `BNeuralUtils::SetTensorFromBitmap()` is

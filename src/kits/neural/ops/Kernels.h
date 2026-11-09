@@ -19,6 +19,8 @@ extern const NeuralKernel kLogisticKernel;
 extern const NeuralKernel kTanhKernel;
 extern const NeuralKernel kHardSwishKernel;
 extern const NeuralKernel kLeakyReluKernel;
+extern const NeuralKernel kRsqrtKernel;
+extern const NeuralKernel kGeluKernel;
 extern const NeuralKernel kSoftmaxKernel;
 
 // Arithmetic.cpp
@@ -29,6 +31,7 @@ extern const NeuralKernel kDivKernel;
 extern const NeuralKernel kMaximumKernel;
 extern const NeuralKernel kMinimumKernel;
 extern const NeuralKernel kPreluKernel;
+extern const NeuralKernel kSquaredDifferenceKernel;
 
 // Convolution.cpp
 extern const NeuralKernel kConvKernel;
@@ -38,6 +41,12 @@ extern const NeuralKernel kTransposeConvKernel;
 
 // Detection.cpp
 extern const NeuralKernel kDetectionPostprocessKernel;
+
+// Gather.cpp
+extern const NeuralKernel kGatherKernel;
+
+// MatMul.cpp
+extern const NeuralKernel kBatchMatMulKernel;
 
 // Pooling.cpp
 extern const NeuralKernel kAveragePoolKernel;

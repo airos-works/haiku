@@ -4,7 +4,8 @@
 """Checks the Neural Kit's CPU interpreter against LiteRT (TensorFlow Lite).
 
     compare.py [--host <neural_host>] [--seed N] [--seeds N] [--tolerance T]
-        [--all] [--quiet] [--keep <directory>] model.tflite...
+        [--all] [--quiet] [--keep <directory>] [--inputs <file>]
+        model.tflite...
 
 For each model: random inputs are made, the model is run by LiteRT with its
 reference kernels (no XNNPACK, so that quantized results are the canonical
@@ -13,10 +14,15 @@ must be equal (or within --int-tolerance), float tensors within --tolerance
 (relative to the largest reference value). With --all every tensor of the
 model is compared, in the order the operators make them, which finds the
 first operator that goes wrong. --seeds repeats all of it with as many
-different inputs.
+different inputs. --inputs gives the inputs instead of random ones: the
+raw bytes of the model's inputs one after the other (for running a model
+on what it is meant for: a network many layers deep may be much less
+exact on noise).
 
 A file <model>.json beside a model (make_models.py writes them) may give
-the range of each float input ("inputs": [[low, high], ...]) and say that
+the range of each float input ("inputs": [[low, high], ...]), that of int32
+and int64 inputs ("int_ranges": {"<input number>": [low, high]}: inputs
+that are indices must be in range) and say that
 integer results may be off by some ("int_tolerance"). An output that has
 the same value everywhere tests nothing and counts as a failure, unless
 that file says "allow_constant".
@@ -27,6 +33,7 @@ Needs: pip install numpy ai-edge-litert
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -35,7 +42,7 @@ import numpy as np
 from ai_edge_litert.interpreter import Interpreter, OpResolverType
 
 
-def make_input(detail, rng, limits):
+def make_input(detail, rng, limits, int_limits=None):
     shape = tuple(detail['shape'])
     dtype = detail['dtype']
     if dtype == np.float32:
@@ -47,6 +54,9 @@ def make_input(detail, rng, limits):
         return rng.integers(info.min, info.max, shape, dtype=dtype,
             endpoint=True)
     if dtype in (np.int32, np.int64):
+        if int_limits is not None:
+            return rng.integers(int_limits[0], int_limits[1], shape,
+                dtype=dtype, endpoint=True)
         return rng.integers(-1000, 1000, shape, dtype=dtype)
     raise SystemExit('input type %s not handled' % dtype)
 
@@ -76,6 +86,18 @@ def compare(name, reference, ours, args, settings, report):
 
 
 def run_model(path, args, seed):
+    """Returns True when the kit and the reference agree on the model."""
+    # the tensors of a large model are large: what was written for a run
+    # goes with it, unless it is to be kept
+    directory = args.keep or tempfile.mkdtemp(prefix='neural-compare-')
+    try:
+        return run_model_in(path, args, seed, directory)
+    finally:
+        if not args.keep:
+            shutil.rmtree(directory, ignore_errors=True)
+
+
+def run_model_in(path, args, seed, directory):
     lines = []
 
     def report(line, ok=True):
@@ -114,14 +136,30 @@ def run_model(path, args, seed):
 
     data = []
     limits = settings.get('inputs', [])
+    given = None
+    if args.inputs:
+        with open(args.inputs, 'rb') as file:
+            given = file.read()
     for number, detail in enumerate(inputs):
-        value = make_input(detail, rng,
-            limits[number] if number < len(limits) else (-1.0, 1.0))
+        if given is not None:
+            # the caller's inputs, one after the other
+            size = int(np.prod(detail['shape'])) \
+                * np.dtype(detail['dtype']).itemsize
+            value = np.frombuffer(given[:size], dtype=detail['dtype']) \
+                .reshape(detail['shape'])
+            given = given[size:]
+        else:
+            value = make_input(detail, rng,
+                limits[number] if number < len(limits) else (-1.0, 1.0),
+                settings.get('int_ranges', {}).get(str(number)))
         interpreter.set_tensor(detail['index'], value)
         data.append(value.tobytes())
+    if given:
+        report('  %s does not hold the inputs of this model' % args.inputs,
+            False)
+        return False
     interpreter.invoke()
 
-    directory = args.keep or tempfile.mkdtemp(prefix='neural-compare-')
     os.makedirs(directory, exist_ok=True)
     input_path = os.path.join(directory, 'inputs.bin')
     output_path = os.path.join(directory, 'outputs.bin')
@@ -193,6 +231,7 @@ def main():
     parser.add_argument('--int-tolerance', type=int, default=0)
     parser.add_argument('--all', action='store_true')
     parser.add_argument('--keep')
+    parser.add_argument('--inputs')
     parser.add_argument('models', nargs='+')
     args = parser.parse_args()
 

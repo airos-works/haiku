@@ -68,6 +68,7 @@ class Graph:
         self.operators = []
         self.inputs = []
         self.ranges = []
+        self.int_ranges = {}
         self.int_tolerance = 0
         self.allow_constant = False
 
@@ -94,9 +95,13 @@ class Graph:
         self.tensors.append(tensor)
         return len(self.tensors) - 1
 
-    def input(self, shape, dtype='float32', quant=None, low=-1.0, high=1.0):
-        """A tensor the caller fills in; floats are drawn from low..high."""
+    def input(self, shape, dtype='float32', quant=None, low=-1.0, high=1.0,
+            int_range=None):
+        """A tensor the caller fills in; floats are drawn from low..high,
+        int32 and int64 from int_range (both ends included) if given."""
         index = self._add_tensor(shape, dtype, quant)
+        if int_range is not None:
+            self.int_ranges[str(len(self.inputs))] = list(int_range)
         self.inputs.append(index)
         self.ranges.append([low, high])
         return index
@@ -161,6 +166,7 @@ class Graph:
             file.write(builder.Output())
         with open(path + '.json', 'w') as file:
             json.dump({'inputs': self.ranges,
+                'int_ranges': self.int_ranges,
                 'int_tolerance': self.int_tolerance,
                 'allow_constant': self.allow_constant}, file)
 
@@ -1035,6 +1041,138 @@ def detection_models():
     yield detection_model('detection_float32_fast_more_than_classes',
         'float32', 30, 2, True, False, classes_per_detection=3,
         max_detections=5)
+
+
+# -- what transformers are made of ------------------------------------------
+
+@model
+def squared_difference_models():
+    for label, first, second in BROADCASTS:
+        graph = Graph('squared_difference_float32_' + label)
+        a = graph.input(first, 'float32', None, -2.0, 2.0)
+        b = graph.input(second, 'float32', None, -2.0, 2.0)
+        output = graph.tensor(broadcast_shape(first, second))
+        graph.op(BuiltinOperator.SQUARED_DIFFERENCE, [a, b], [output],
+            options('SquaredDifferenceOptions'))
+        yield graph, [output]
+
+    # against a constant, as layer normalisation has it
+    graph = Graph('squared_difference_float32_constant')
+    a = graph.input((3, 5, 8), 'float32', None, -2.0, 2.0)
+    b = graph.const(graph.rng.uniform(-1, 1, (5, 1)).astype(np.float32))
+    output = graph.tensor((3, 5, 8))
+    graph.op(BuiltinOperator.SQUARED_DIFFERENCE, [a, b], [output],
+        options('SquaredDifferenceOptions'))
+    yield graph, [output]
+
+
+@model
+def transformer_unary_models():
+    yield unary_model('rsqrt_float32', BuiltinOperator.RSQRT, 'float32',
+        (3, 9, 10, 6), low=0.001, high=9.0)
+    yield unary_model('rsqrt_float32_1d', BuiltinOperator.RSQRT, 'float32',
+        (37,), low=1e-6, high=1e-3)
+    for label, approximate in (('', False), ('_approximate', True)):
+        option = options('GeluOptions', approximate=approximate)
+        # the usual range, where the precision counts
+        yield unary_model('gelu_float32' + label, BuiltinOperator.GELU,
+            'float32', (3, 9, 10, 6), option=option, low=-3.0, high=3.0)
+        # past both ends of the kernel's table
+        yield unary_model('gelu_float32_wide' + label, BuiltinOperator.GELU,
+            'float32', (4, 500), option=option, low=-12.0, high=12.0)
+        yield unary_model('gelu_float32_small' + label, BuiltinOperator.GELU,
+            'float32', (129,), option=option, low=-0.01, high=0.01)
+
+
+def matmul_model(name, first, second, adjoint_a=False, adjoint_b=False,
+        constant_second=False):
+    graph = Graph(name)
+    a = graph.input(first, 'float32', None, -1.0, 1.0)
+    if constant_second:
+        b = graph.const(graph.rng.uniform(-1, 1, second).astype(np.float32))
+    else:
+        b = graph.input(second, 'float32', None, -1.0, 1.0)
+    rows = first[-1] if adjoint_a else first[-2]
+    columns = second[-2] if adjoint_b else second[-1]
+    shape = broadcast_shape(first[:-2], second[:-2]) + (rows, columns)
+    output = graph.tensor(shape)
+    graph.op(BuiltinOperator.BATCH_MATMUL, [a, b], [output],
+        options('BatchMatMulOptions', adjX=adjoint_a, adjY=adjoint_b))
+    return graph, [output]
+
+
+@model
+def matmul_models():
+    tag = 'batch_matmul_float32_'
+    yield matmul_model(tag + '2d', (3, 4), (4, 5))
+    yield matmul_model(tag + '3d', (6, 7, 9), (6, 9, 11))
+    yield matmul_model(tag + '4d', (2, 3, 7, 5), (2, 3, 5, 6))
+    # every stretch of the inner loops: sums of 1 to 9 terms, one row and
+    # an odd number of them, one column
+    for inner in range(1, 10):
+        yield matmul_model('%sinner%d' % (tag, inner), (2, 5, inner),
+            (2, inner, 19))
+    yield matmul_model(tag + 'one_row', (4, 1, 13), (4, 13, 33))
+    yield matmul_model(tag + 'one_column', (4, 6, 13), (4, 13, 1))
+    yield matmul_model(tag + 'scalar', (1, 1), (1, 1))
+    # as attention has them: few long rows, many short ones
+    yield matmul_model(tag + 'wide', (3, 8, 16), (3, 16, 150))
+    yield matmul_model(tag + 'tall', (3, 8, 150), (3, 150, 16))
+    # repeated matrices
+    yield matmul_model(tag + 'broadcast_a', (5, 6), (4, 6, 3))
+    yield matmul_model(tag + 'broadcast_b', (2, 3, 4, 6), (6, 5))
+    yield matmul_model(tag + 'broadcast_both', (2, 1, 4, 3), (3, 3, 5))
+    yield matmul_model(tag + 'broadcast_inner', (1, 3, 4, 3), (2, 1, 3, 5))
+    # transposed inputs
+    yield matmul_model(tag + 'adjoint_a', (3, 6, 4), (3, 6, 5),
+        adjoint_a=True)
+    yield matmul_model(tag + 'adjoint_b', (3, 4, 6), (3, 5, 6),
+        adjoint_b=True)
+    yield matmul_model(tag + 'adjoint_both', (2, 2, 6, 4), (2, 5, 6),
+        adjoint_a=True, adjoint_b=True)
+    yield matmul_model(tag + 'constant', (3, 4, 6), (6, 5),
+        constant_second=True)
+    yield matmul_model(tag + 'constant_adjoint', (3, 4, 6), (5, 6),
+        adjoint_b=True, constant_second=True)
+
+
+def gather_model(name, dtype, shape, index_shape, axis, index_type='int32',
+        constant_indices=False):
+    graph = Graph(name)
+    quant = QUANT.get(dtype)
+    input = graph.input(shape, dtype, quant)
+    rank = len(shape)
+    real_axis = axis + rank if axis < 0 else axis
+    size = shape[real_axis]
+    if constant_indices:
+        indices = graph.const(graph.rng.integers(0, size, index_shape,
+            dtype=index_type))
+    else:
+        indices = graph.input(index_shape, index_type,
+            int_range=(0, size - 1))
+    result = tuple(shape[:real_axis]) + tuple(index_shape) \
+        + tuple(shape[real_axis + 1:])
+    output = graph.tensor(result, dtype, quant)
+    graph.op(BuiltinOperator.GATHER, [input, indices], [output],
+        options('GatherOptions', axis=axis, batchDims=0))
+    return graph, [output]
+
+
+@model
+def gather_models():
+    for dtype in ('float32', 'uint8', 'int8', 'int16', 'int32', 'int64'):
+        tag = 'gather_' + dtype
+        # a table of vectors, as words are looked up
+        yield gather_model(tag + '_rows', dtype, (23, 7), (5,), 0)
+        yield gather_model(tag + '_rows_2d', dtype, (23, 7), (2, 3), 0)
+        yield gather_model(tag + '_middle', dtype, (3, 11, 4), (6,), 1)
+        yield gather_model(tag + '_last', dtype, (3, 4, 9), (2, 2), -1)
+        yield gather_model(tag + '_1d', dtype, (31,), (12,), 0)
+        yield gather_model(tag + '_one', dtype, (9, 5), (1,), 0)
+        yield gather_model(tag + '_wide_index', dtype, (9, 5), (4,), 0,
+            index_type='int64')
+        yield gather_model(tag + '_constant', dtype, (9, 5, 2), (3, 2), 1,
+            constant_indices=True)
 
 
 def main():
