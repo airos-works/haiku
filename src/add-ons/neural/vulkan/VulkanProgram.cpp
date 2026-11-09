@@ -34,6 +34,19 @@ copy_to_device(float* target, const float* source, uint32 positions,
 		return;
 	}
 
+	// pictures of red, green and blue: what most networks are given
+	if (channels == 3) {
+		for (uint32 i = 0; i < positions; i++) {
+			target[0] = source[0];
+			target[1] = source[1];
+			target[2] = source[2];
+			target[3] = 0;
+			target += 4;
+			source += 3;
+		}
+		return;
+	}
+
 	uint32 padded = groups * 4;
 	for (uint32 i = 0; i < positions; i++) {
 		uint32 j = 0;
@@ -76,6 +89,7 @@ VulkanProgram::VulkanProgram(VulkanDevice* device)
 	fCommands(NULL),
 	fCommandCount(0),
 	fFence(VK_NULL_HANDLE),
+	fChoices(NULL),
 	fInputs(NULL),
 	fInputCount(0),
 	fOutputs(NULL),
@@ -119,6 +133,7 @@ VulkanProgram::~VulkanProgram()
 
 	free(fSets);
 	free(fCommands);
+	free(fChoices);
 	free(fInputs);
 	free(fOutputs);
 	free(fPhases);
@@ -157,13 +172,21 @@ VulkanProgram::Init(const VulkanPlan& plan)
 		transfer.offset = from.offset;
 	}
 
+	fChoices = (uint8*)calloc(plan.CountSteps(), 1);
+	if (fChoices == NULL)
+		return B_NO_MEMORY;
+
 	status_t status = _CreateBuffers(plan);
 	if (status == B_OK)
 		status = _CreateDescriptors(plan);
 	if (status == B_OK)
-		status = _Record(plan);
+		status = _CreateCommands();
 	if (status == B_OK)
 		status = _UploadConstants(plan);
+	if (status == B_OK)
+		status = _Tune(plan);
+	if (status == B_OK)
+		status = _Record(plan);
 	return status;
 }
 
@@ -423,11 +446,17 @@ VulkanProgram::_RecordStep(VkCommandBuffer commands, const VulkanPlan& plan,
 {
 	const VulkanDeviceFunctions& vk = fDevice->Functions();
 	const PlanStep& step = plan.StepAt(index);
+	const PlanVariant& variant = step.variants[fChoices[index]];
 
 	VkPipeline pipeline;
-	status_t status = fDevice->GetPipeline(step.shader, &pipeline);
+	status_t status = fDevice->GetPipeline(variant.shader, &pipeline);
 	if (status != B_OK)
 		return status;
+
+	PlanWord words[VULKAN_PUSH_CONSTANT_SIZE / 4];
+	memcpy(words, step.words, sizeof(words));
+	words[0].u = variant.total;
+	words[1].u = variant.row_size;
 
 	if (pipeline != bound) {
 		vk.CmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -437,8 +466,9 @@ VulkanProgram::_RecordStep(VkCommandBuffer commands, const VulkanPlan& plan,
 	vk.CmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_COMPUTE,
 		fDevice->PipelineLayout(), 0, 1, &fSets[index], 0, NULL);
 	vk.CmdPushConstants(commands, fDevice->PipelineLayout(),
-		VK_SHADER_STAGE_COMPUTE_BIT, 0, step.word_count * 4, step.words);
-	vk.CmdDispatch(commands, step.groups_x, step.groups_y, 1);
+		VK_SHADER_STAGE_COMPUTE_BIT, 0, step.word_count * 4, words);
+	vk.CmdDispatch(commands, variant.groups[0], variant.groups[1],
+		variant.groups[2]);
 
 	// the next step reads what this one wrote
 	_Barrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -448,20 +478,17 @@ VulkanProgram::_RecordStep(VkCommandBuffer commands, const VulkanPlan& plan,
 }
 
 
-/*!	Records the commands of a run: one buffer with everything, or, to
-	see where the time goes (NEURAL_VULKAN_PROFILE), one for each step,
-	which costs a submission each. */
 status_t
-VulkanProgram::_Record(const VulkanPlan& plan)
+VulkanProgram::_CreateCommands()
 {
 	const VulkanDeviceFunctions& vk = fDevice->Functions();
 	VkDevice device = fDevice->Handle();
-	int32 stepCount = plan.CountSteps();
-	bool profile = has_setting("NEURAL_VULKAN_PROFILE");
 
+	// _Tune() records over and over into one buffer
 	VkCommandPoolCreateInfo poolInfo;
 	memset(&poolInfo, 0, sizeof(poolInfo));
 	poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+	poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 	poolInfo.queueFamilyIndex = fDevice->QueueFamily();
 	VkResult result = vk.CreateCommandPool(device, &poolInfo, NULL,
 		&fCommandPool);
@@ -478,6 +505,109 @@ VulkanProgram::_Record(const VulkanPlan& plan)
 		fFence = VK_NULL_HANDLE;
 		return fDevice->Error(result);
 	}
+
+	return B_OK;
+}
+
+
+/*!	Picks the variant of each step that has a choice: each is run on the
+	device a few times, on whatever is in the tensors, and the one that
+	took the least time stays. NEURAL_VULKAN_VARIANT names one to use
+	instead, for comparing them. */
+status_t
+VulkanProgram::_Tune(const VulkanPlan& plan)
+{
+	const int32 kRuns = 3;
+		// the first one does not count: it may have to wake things up
+
+	const char* forced = getenv("NEURAL_VULKAN_VARIANT");
+	if (forced != NULL) {
+		for (int32 i = 0; i < plan.CountSteps(); i++) {
+			uint32 count = plan.StepAt(i).variant_count;
+			uint32 wanted = atoi(forced);
+			fChoices[i] = wanted < count ? wanted : 0;
+		}
+		return B_OK;
+	}
+
+	const VulkanDeviceFunctions& vk = fDevice->Functions();
+	VkDevice device = fDevice->Handle();
+
+	VkCommandBufferAllocateInfo allocation;
+	memset(&allocation, 0, sizeof(allocation));
+	allocation.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	allocation.commandPool = fCommandPool;
+	allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	allocation.commandBufferCount = 1;
+
+	VkCommandBuffer commands = VK_NULL_HANDLE;
+	VkCommandBufferBeginInfo begin;
+	memset(&begin, 0, sizeof(begin));
+	begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+
+	for (int32 i = 0; i < plan.CountSteps(); i++) {
+		const PlanStep& step = plan.StepAt(i);
+		if (step.variant_count < 2)
+			continue;
+
+		if (commands == VK_NULL_HANDLE) {
+			VkResult result = vk.AllocateCommandBuffers(device, &allocation,
+				&commands);
+			if (result != VK_SUCCESS)
+				return fDevice->Error(result);
+		}
+
+		uint32 best = 0;
+		bigtime_t bestTime = B_INFINITE_TIMEOUT;
+		for (uint32 j = 0; j < step.variant_count; j++) {
+			fChoices[i] = j;
+
+			// beginning it again empties it
+			VkPipeline bound = VK_NULL_HANDLE;
+			VkResult result = vk.BeginCommandBuffer(commands, &begin);
+			if (result != VK_SUCCESS)
+				return fDevice->Error(result);
+			status_t status = _RecordStep(commands, plan, i, bound);
+			if (status != B_OK)
+				return status;
+			result = vk.EndCommandBuffer(commands);
+			if (result != VK_SUCCESS)
+				return fDevice->Error(result);
+
+			for (int32 k = 0; k < kRuns; k++) {
+				bigtime_t start = system_time();
+				status = fDevice->Submit(commands, fFence);
+				if (status == B_OK)
+					status = fDevice->Wait(fFence);
+				if (status != B_OK)
+					return status;
+				vk.ResetFences(device, 1, &fFence);
+
+				bigtime_t time = system_time() - start;
+				if (k > 0 && time < bestTime) {
+					bestTime = time;
+					best = j;
+				}
+			}
+		}
+		fChoices[i] = best;
+	}
+
+	return B_OK;
+}
+
+
+/*!	Records the commands of a run: one buffer with everything, or, to
+	see where the time goes (NEURAL_VULKAN_PROFILE), one for each step,
+	which costs a submission each. */
+status_t
+VulkanProgram::_Record(const VulkanPlan& plan)
+{
+	const VulkanDeviceFunctions& vk = fDevice->Functions();
+	VkDevice device = fDevice->Handle();
+	int32 stepCount = plan.CountSteps();
+	bool profile = has_setting("NEURAL_VULKAN_PROFILE");
+	VkResult result;
 
 	fCommandCount = profile ? stepCount + 2 : 1;
 	fCommands = (VkCommandBuffer*)calloc(fCommandCount,
@@ -523,7 +653,7 @@ VulkanProgram::_Record(const VulkanPlan& plan)
 		} else {
 			const PlanStep& step = plan.StepAt(i - 1);
 			status = _RecordStep(commands, plan, i - 1, bound);
-			fPhases[i].shader = step.shader;
+			fPhases[i].shader = step.variants[fChoices[i - 1]].shader;
 			fPhases[i].op = step.op;
 			fPhases[i].code = plan.Graph().OperatorAt(step.op)->code;
 		}

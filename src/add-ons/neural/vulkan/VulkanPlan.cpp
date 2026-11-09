@@ -252,23 +252,18 @@ PlanConstant::Fill(const BNeuralGraph& graph, float* target) const
 		{
 			// From output, row, column, input to a mat4 per four inputs
 			// and four outputs, in the order of the shader's loops:
-			// output unit (pack groups), row, column, input group, group
-			// of the unit. A column of the matrix is an input channel.
+			// output group, row, column, input group. A column of the
+			// matrix is an input channel.
 			uint32 inGroups = groups_of(inputs);
 			for (uint32 o = 0; o < outputs; o++) {
-				uint32 group = o / 4;
-				size_t unit = group / pack;
+				size_t group = o / 4;
 				for (uint32 ky = 0; ky < kernel_height; ky++) {
 					for (uint32 kx = 0; kx < kernel_width; kx++) {
-						size_t matrix = (((unit * kernel_height + ky)
-								* kernel_width + kx) * inGroups) * pack
-							+ group % pack;
+						size_t matrix = ((group * kernel_height + ky)
+							* kernel_width + kx) * inGroups;
 						float* to = target + matrix * 16 + o % 4;
-						for (uint32 i = 0; i < inputs; i++) {
-							// the next matrix every four inputs
-							to[(size_t)(i / 4) * pack * 16 + (i % 4) * 4]
-								= *source++;
-						}
+						for (uint32 i = 0; i < inputs; i++)
+							to[i * 4] = *source++;
 					}
 				}
 			}
@@ -302,18 +297,11 @@ VulkanPlan::VulkanPlan(const BNeuralGraph& graph, const VulkanLimits& limits)
 	fLimits(limits),
 	fStatus(B_OK),
 	fOperator(-1),
-	fPairs(false),
 	fTensorValues(NULL),
 	fTensorMemory(0),
 	fConstantMemory(0),
 	fTransferMemory(0)
 {
-	// for trying things out: two output groups an invocation, which has
-	// been the slower way where it was measured
-	const char* setting = getenv("NEURAL_VULKAN_CONV8");
-	if (setting != NULL)
-		fPairs = atoi(setting) != 0;
-
 	int32 count = graph.CountTensors();
 	fTensorValues = (int32*)malloc((count > 0 ? count : 1) * sizeof(int32));
 	if (fTensorValues == NULL) {
@@ -530,8 +518,7 @@ VulkanPlan::_AddConstant(const PlanConstant& constant, int32* _index)
 /*!	The bias of a convolution: the tensor (one number per output), or
 	zeros without one. */
 status_t
-VulkanPlan::_AddBias(int32 tensorIndex, uint32 outputs, uint32 pack,
-	int32* _index)
+VulkanPlan::_AddBias(int32 tensorIndex, uint32 outputs, int32* _index)
 {
 	if (tensorIndex >= 0) {
 		const neural_graph_tensor* tensor = _FloatTensor(tensorIndex);
@@ -546,37 +533,46 @@ VulkanPlan::_AddBias(int32 tensorIndex, uint32 outputs, uint32 pack,
 	constant.kind = PLAN_CONSTANT_BIAS;
 	constant.tensor = tensorIndex;
 	constant.outputs = outputs;
-	constant.pack = pack;
-	constant.size = align_up(groups_of(outputs), pack) * 16;
+	constant.size = groups_of(outputs) * 16;
 	return _AddConstant(constant, _index);
 }
 
 
-/*!	Adds a dispatch of \a total invocations: as many workgroups along x
-	as there may be, and rows of them along y for the rest. */
+/*!	A dispatch of \a total invocations numbered in a row: as many
+	workgroups along x as there may be, and rows of them along y for the
+	rest. */
+bool
+VulkanPlan::_SetVariant(PlanVariant& variant, uint32 shader,
+	uint32 total) const
+{
+	if (total == 0 || total > kMaxInvocations)
+		return false;
+
+	uint32 groups = (total + VULKAN_LOCAL_SIZE - 1) / VULKAN_LOCAL_SIZE;
+	variant.shader = shader;
+	variant.groups[0] = groups < fLimits.max_groups[0]
+		? groups : fLimits.max_groups[0];
+	variant.groups[1] = (groups + variant.groups[0] - 1) / variant.groups[0];
+	variant.groups[2] = 1;
+	variant.total = total;
+	variant.row_size = variant.groups[0] * VULKAN_LOCAL_SIZE;
+	return variant.groups[1] <= fLimits.max_groups[1];
+}
+
+
 status_t
 VulkanPlan::_AddStep(uint32 shader, uint32 total, const Params& params,
 	int32 output, int32 input, int32 second, int32 weights, int32 bias)
 {
-	if (total == 0 || total > kMaxInvocations)
-		return kUnsupported;
-
 	PlanStep step;
 	memset(&step, 0, sizeof(step));
-	step.shader = shader;
 	step.op = fOperator;
-
-	uint32 groups = (total + VULKAN_LOCAL_SIZE - 1) / VULKAN_LOCAL_SIZE;
-	step.groups_x = groups < fLimits.max_groups[0]
-		? groups : fLimits.max_groups[0];
-	step.groups_y = (groups + step.groups_x - 1) / step.groups_x;
-	if (step.groups_y > fLimits.max_groups[1])
+	step.variant_count = 1;
+	if (!_SetVariant(step.variants[0], shader, total))
 		return kUnsupported;
 
 	step.word_count = params.Count();
 	memcpy(step.words, params.Words(), sizeof(step.words));
-	step.words[0].u = total;
-	step.words[1].u = step.groups_x * VULKAN_LOCAL_SIZE;
 
 	step.bindings[0].kind = PLAN_BINDING_VALUE;
 	step.bindings[0].index = output;
@@ -595,6 +591,46 @@ VulkanPlan::_AddStep(uint32 shader, uint32 total, const Params& params,
 	}
 
 	return fSteps.Add(step) >= 0 ? B_OK : B_NO_MEMORY;
+}
+
+
+/*!	Another way to do the step added last. One that does not fit the
+	device is no loss: there is the first. */
+status_t
+VulkanPlan::_AddVariant(uint32 shader, uint32 total)
+{
+	PlanStep& step = fSteps[fSteps.Count() - 1];
+	if (step.variant_count < PLAN_MAX_VARIANTS
+		&& _SetVariant(step.variants[step.variant_count], shader, total)) {
+		step.variant_count++;
+	}
+	return B_OK;
+}
+
+
+/*!	The same for a shader whose invocations are laid out as the output
+	is (GRID in common.glsl): \a width by \a height, \a depth deep. */
+status_t
+VulkanPlan::_AddGridVariant(uint32 shader, uint32 width, uint32 height,
+	uint32 depth)
+{
+	const uint32 kGridSize = 8;
+	PlanStep& step = fSteps[fSteps.Count() - 1];
+	PlanVariant variant;
+	variant.shader = shader;
+	variant.groups[0] = (width + kGridSize - 1) / kGridSize;
+	variant.groups[1] = (height + kGridSize - 1) / kGridSize;
+	variant.groups[2] = depth;
+	variant.total = 0;
+	variant.row_size = 0;
+
+	if (step.variant_count < PLAN_MAX_VARIANTS
+		&& variant.groups[0] <= fLimits.max_groups[0]
+		&& variant.groups[1] <= fLimits.max_groups[1]
+		&& variant.groups[2] <= fLimits.max_groups[2]) {
+		step.variants[step.variant_count++] = variant;
+	}
+	return B_OK;
 }
 
 
@@ -716,8 +752,6 @@ VulkanPlan::_Convolution(const neural_graph_operator& op, bool depthwise)
 	uint32 outGroups = groups_of(outChannels);
 	uint32 positions = fValues[outValue].positions;
 	bool pointwise = kernelHeight == 1 && kernelWidth == 1;
-	// two output groups an invocation where there are that many
-	uint32 pack = !depthwise && fPairs && outGroups > 1 ? 2 : 1;
 
 	PlanConstant constant;
 	memset(&constant, 0, sizeof(constant));
@@ -726,26 +760,25 @@ VulkanPlan::_Convolution(const neural_graph_operator& op, bool depthwise)
 	constant.kernel_height = kernelHeight;
 	constant.kernel_width = kernelWidth;
 	constant.inputs = inChannels;
-	constant.pack = pack;
 	uint64 kernel = (uint64)kernelHeight * kernelWidth;
 	if (depthwise) {
 		constant.kind = PLAN_CONSTANT_DEPTHWISE_WEIGHTS;
 		constant.size = outGroups * kernel * 16;
 	} else {
 		constant.kind = PLAN_CONSTANT_CONV_WEIGHTS;
-		constant.size = align_up(outGroups, pack) * kernel * inGroups * 64;
+		constant.size = outGroups * kernel * inGroups * 64;
 	}
 
 	int32 weightsIndex, biasIndex;
 	status = _AddConstant(constant, &weightsIndex);
 	if (status == B_OK)
-		status = _AddBias(biasTensor, outChannels, pack, &biasIndex);
+		status = _AddBias(biasTensor, outChannels, &biasIndex);
 	if (status != B_OK)
 		return status;
 
-	uint32 units = (outGroups + pack - 1) / pack;
-	if ((uint64)units * positions > kMaxInvocations)
+	if ((uint64)outGroups * positions > kMaxInvocations)
 		return kUnsupported;
+	uint32 total = outGroups * positions;
 
 	Params constants;
 	constants.U(positions).I(window.in_width).I(window.in_height)
@@ -755,21 +788,36 @@ VulkanPlan::_Convolution(const neural_graph_operator& op, bool depthwise)
 		.I(params.dilation_height).I(window.pad_left).I(window.pad_top)
 		.F(minimum).F(maximum);
 
-	uint32 shader;
 	if (depthwise) {
 		constants.U(multiplier);
-		shader = multiplier == 1 ? VULKAN_SHADER_DEPTHWISE
-			: VULKAN_SHADER_DEPTHWISE_MULTIPLIER;
-	} else if (pack == 2) {
-		shader = pointwise ? VULKAN_SHADER_CONV8_POINTWISE
-			: VULKAN_SHADER_CONV8;
-	} else {
-		shader = pointwise ? VULKAN_SHADER_CONV_POINTWISE
-			: VULKAN_SHADER_CONV;
+		if (multiplier != 1) {
+			return _AddStep(VULKAN_SHADER_DEPTHWISE_MULTIPLIER, total,
+				constants, outValue, inValue, -1, weightsIndex, biasIndex);
+		}
+
+		status = _AddStep(VULKAN_SHADER_DEPTHWISE, total, constants,
+			outValue, inValue, -1, weightsIndex, biasIndex);
+		if (status == B_OK) {
+			status = _AddGridVariant(VULKAN_SHADER_DEPTHWISE_GRID,
+				window.out_width, window.out_height,
+				window.batches * outGroups);
+		}
+		return status;
 	}
 
-	return _AddStep(shader, units * positions, constants, outValue, inValue,
-		-1, weightsIndex, biasIndex);
+	if (!pointwise) {
+		return _AddStep(VULKAN_SHADER_CONV, total, constants, outValue,
+			inValue, -1, weightsIndex, biasIndex);
+	}
+
+	status = _AddStep(VULKAN_SHADER_CONV_POINTWISE, total, constants,
+		outValue, inValue, -1, weightsIndex, biasIndex);
+	if (status == B_OK && params.stride_width == 1
+		&& params.stride_height == 1 && positions >= 4) {
+		status = _AddVariant(VULKAN_SHADER_CONV_QUAD,
+			outGroups * ((positions + 3) / 4));
+	}
+	return status;
 }
 
 
@@ -825,7 +873,6 @@ VulkanPlan::_FullyConnected(const neural_graph_operator& op)
 
 	uint32 inGroups = groups_of(depth);
 	uint32 outGroups = groups_of(units);
-	uint32 pack = fPairs && outGroups > 1 ? 2 : 1;
 
 	PlanConstant constant;
 	memset(&constant, 0, sizeof(constant));
@@ -835,18 +882,16 @@ VulkanPlan::_FullyConnected(const neural_graph_operator& op)
 	constant.kernel_height = 1;
 	constant.kernel_width = 1;
 	constant.inputs = depth;
-	constant.pack = pack;
-	constant.size = align_up(outGroups, pack) * inGroups * 64;
+	constant.size = (uint64)outGroups * inGroups * 64;
 
 	int32 weightsIndex, biasIndex;
 	status = _AddConstant(constant, &weightsIndex);
 	if (status == B_OK)
-		status = _AddBias(biasTensor, units, pack, &biasIndex);
+		status = _AddBias(biasTensor, units, &biasIndex);
 	if (status != B_OK)
 		return status;
 
-	uint32 invocationUnits = (outGroups + pack - 1) / pack;
-	if ((uint64)invocationUnits * rows > kMaxInvocations)
+	if ((uint64)outGroups * rows > kMaxInvocations)
 		return kUnsupported;
 
 	// a picture of rows x 1 x 1: the batch is what counts the rows
@@ -854,10 +899,13 @@ VulkanPlan::_FullyConnected(const neural_graph_operator& op)
 	constants.U(rows).I(1).I(1).U(inGroups).I(1).I(1).U(outGroups).I(1).I(1)
 		.I(1).I(1).I(1).I(1).I(0).I(0).F(minimum).F(maximum);
 
-	return _AddStep(pack == 2 ? VULKAN_SHADER_CONV8_POINTWISE
-			: VULKAN_SHADER_CONV_POINTWISE,
-		invocationUnits * rows, constants, outValue, inValue, -1,
-		weightsIndex, biasIndex);
+	status = _AddStep(VULKAN_SHADER_CONV_POINTWISE, outGroups * rows,
+		constants, outValue, inValue, -1, weightsIndex, biasIndex);
+	if (status == B_OK && rows >= 4) {
+		status = _AddVariant(VULKAN_SHADER_CONV_QUAD,
+			outGroups * ((rows + 3) / 4));
+	}
+	return status;
 }
 
 

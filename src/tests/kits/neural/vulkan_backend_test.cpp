@@ -29,6 +29,11 @@
 
 	Exits with 0 when everything passed, with 1 otherwise (also when
 	there is no such device, or the CPU cannot run a case).
+
+	The back end has more than one shader for some layers and picks by
+	timing them. To check them all, run the test with
+	NEURAL_VULKAN_VARIANT=0 and with NEURAL_VULKAN_VARIANT=1 in the
+	environment as well: that takes the choice away.
 */
 
 
@@ -1152,23 +1157,25 @@ team_memory()
 }
 
 
+/*!	The same numbers every time, and from numbers of its own: sessions
+	are filled from several threads at once. */
 static void
 fill_inputs(BNeuralSession& session)
 {
-	uint32 saved = sRandom;
-	sRandom = 0x2545f491;
+	uint32 state = 0x2545f491;
 	for (int32 i = 0; i < session.CountInputs(); i++) {
 		BTensor* input = session.InputAt(i);
-		if (input->Type() == B_NEURAL_FLOAT32) {
-			float* values = (float*)input->Data();
-			for (int64 j = 0; j < input->CountElements(); j++)
-				values[j] = random_float();
-		} else {
-			for (int64 j = 0; j < input->CountElements(); j++)
-				input->SetValueAt(j, random_float());
+		for (int64 j = 0; j < input->CountElements(); j++) {
+			state ^= state << 13;
+			state ^= state >> 17;
+			state ^= state << 5;
+			float value = (int32)(state & 0xffff) / 32768.0f - 1.0f;
+			if (input->Type() == B_NEURAL_FLOAT32)
+				((float*)input->Data())[j] = value;
+			else
+				input->SetValueAt(j, value);
 		}
 	}
-	sRandom = saved;
 }
 
 

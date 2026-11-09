@@ -14,6 +14,10 @@
 	same four input channels. Otherwise (MULTIPLIER) output channel c
 	comes from input channel c / multiplier, which is looked up lane by
 	lane.
+
+	GRID: the invocations are laid out as the output is (see
+	common.glsl), which is the faster way for large pictures and the
+	slower one for small ones; a program tries both.
 */
 
 #include "common.glsl"
@@ -49,6 +53,16 @@ layout(std430, binding = 3) readonly buffer Bias { vec4 data[]; } b;
 void
 main()
 {
+#ifdef GRID
+	int x = int(gl_GlobalInvocationID.x);
+	int y = int(gl_GlobalInvocationID.y);
+	if (x >= p.outWidth || y >= p.outHeight)
+		return;
+	uint batch = gl_GlobalInvocationID.z / p.outGroups;
+	uint group = gl_GlobalInvocationID.z - batch * p.outGroups;
+	uint position = (batch * uint(p.outHeight) + uint(y)) * uint(p.outWidth)
+		+ uint(x);
+#else
 	uint index = INVOCATION(p.rowSize);
 	if (index >= p.total)
 		return;
@@ -59,6 +73,7 @@ main()
 	int x = int(position - row * uint(p.outWidth));
 	uint batch = row / uint(p.outHeight);
 	int y = int(row - batch * uint(p.outHeight));
+#endif
 
 #ifdef MULTIPLIER
 	// The lanes past the last output channel have weights of zero; they

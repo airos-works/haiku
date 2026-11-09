@@ -13,8 +13,11 @@
 	group.
 
 	POINTWISE: the kernel is 1 x 1, so there is no window and no edge.
-	OUTPUTS_8: two output groups an invocation, which halves the reads of
-	the input; the weights of the two are interleaved.
+	QUAD: the same without a stride either, four positions an invocation.
+
+	Which of the last two is faster for a layer depends on its size and
+	on the device, in ways that are hard to tell beforehand: a program
+	tries both (see VulkanProgram::_Tune()).
 */
 
 #include "common.glsl"
@@ -54,6 +57,41 @@ main()
 	if (index >= p.total)
 		return;
 
+#ifdef QUAD
+	// The weights are read once for four positions. Input and output
+	// are the same size, so a position is at the same place in both.
+	uint quads = (p.positions + 3u) >> 2u;
+	uint unit = index / quads;
+	uint first = (index - unit * quads) << 2u;
+	uvec4 source = min(first + uvec4(0u, 1u, 2u, 3u),
+		uvec4(p.positions - 1u)) * p.inGroups;
+
+	vec4 sum0 = b.data[unit];
+	vec4 sum1 = sum0;
+	vec4 sum2 = sum0;
+	vec4 sum3 = sum0;
+	uint base = unit * p.inGroups;
+	for (uint i = 0u; i < p.inGroups; i++) {
+		mat4 weights = w.data[base + i];
+		sum0 += weights * a.data[source.x + i];
+		sum1 += weights * a.data[source.y + i];
+		sum2 += weights * a.data[source.z + i];
+		sum3 += weights * a.data[source.w + i];
+	}
+
+	uint to = first * p.outGroups + unit;
+	o.data[to] = clamp(sum0, p.minimum, p.maximum);
+	if (first + 1u < p.positions) {
+		o.data[to + p.outGroups] = clamp(sum1, p.minimum, p.maximum);
+	}
+	if (first + 2u < p.positions) {
+		o.data[to + 2u * p.outGroups] = clamp(sum2, p.minimum, p.maximum);
+	}
+	if (first + 3u < p.positions) {
+		o.data[to + 3u * p.outGroups] = clamp(sum3, p.minimum, p.maximum);
+	}
+#else	// !QUAD
+
 	// neighbours share the weights and differ in the position
 	uint group = index / p.positions;
 	uint position = index - group * p.positions;
@@ -62,26 +100,14 @@ main()
 	uint batch = row / uint(p.outHeight);
 	int y = int(row - batch * uint(p.outHeight));
 
-#ifdef OUTPUTS_8
-	vec4 sum0 = b.data[group * 2u];
-	vec4 sum1 = b.data[group * 2u + 1u];
-	#define ACCUMULATE(weight, value) \
-		sum0 += w.data[2u * (weight)] * (value); \
-		sum1 += w.data[2u * (weight) + 1u] * (value)
-#else
-	vec4 sum0 = b.data[group];
-	#define ACCUMULATE(weight, value) \
-		sum0 += w.data[weight] * (value)
-#endif
+	vec4 sum = b.data[group];
 
 #ifdef POINTWISE
 	uint weight = group * p.inGroups;
 	uint source = ((batch * uint(p.inHeight) + uint(y * p.strideHeight))
 		* uint(p.inWidth) + uint(x * p.strideWidth)) * p.inGroups;
-	for (uint i = 0u; i < p.inGroups; i++) {
-		vec4 value = a.data[source + i];
-		ACCUMULATE(weight + i, value);
-	}
+	for (uint i = 0u; i < p.inGroups; i++)
+		sum += w.data[weight + i] * a.data[source + i];
 #else
 	uint weight = group * uint(p.kernelHeight * p.kernelWidth) * p.inGroups;
 	int top = y * p.strideHeight - p.padTop;
@@ -97,24 +123,16 @@ main()
 			int sx = left + kx * p.dilationWidth;
 			if (sx >= 0 && sx < p.inWidth) {
 				uint source = (line + uint(sx)) * p.inGroups;
-				for (uint i = 0u; i < p.inGroups; i++) {
-					vec4 value = a.data[source + i];
-					ACCUMULATE(weight + i, value);
-				}
+				for (uint i = 0u; i < p.inGroups; i++)
+					sum += w.data[weight + i] * a.data[source + i];
 			}
 			weight += p.inGroups;
 		}
 	}
 #endif
 
-#ifdef OUTPUTS_8
-	uint target = position * p.outGroups + group * 2u;
-	o.data[target] = clamp(sum0, p.minimum, p.maximum);
-	// the last pair of an odd number of groups has one half only
-	if (group * 2u + 1u < p.outGroups)
-		o.data[target + 1u] = clamp(sum1, p.minimum, p.maximum);
-#else
 	o.data[position * p.outGroups + group]
-		= clamp(sum0, p.minimum, p.maximum);
-#endif
+		= clamp(sum, p.minimum, p.maximum);
+
+#endif	// !QUAD
 }

@@ -113,8 +113,6 @@ struct PlanConstant {
 	uint32				kernel_height;
 	uint32				kernel_width;
 	uint32				inputs;
-	//! output groups an invocation makes: 1, or 2 for the CONV8 shaders
-	uint32				pack;
 	//! bytes in the device's layout
 	uint64				size;
 	//! where it is in the memory of the constants
@@ -145,15 +143,29 @@ union PlanWord {
 };
 
 
+//! Ways a step may have to do the same thing.
+#define PLAN_MAX_VARIANTS	2
+
+/*!	A shader and how many workgroups of it do a step. Some steps can be
+	done by more than one, with the same buffers and constants; which is
+	the fastest is for the program to find out on the device. */
+struct PlanVariant {
+	uint32				shader;
+	uint32				groups[3];
+	//! the first two push constants: "total" and "rowSize"
+	uint32				total;
+	uint32				row_size;
+};
+
+
 //! One dispatch of a shader.
 struct PlanStep {
-	uint32				shader;
 	//! the operator of the graph it is (part of)
 	int32				op;
 	//! by binding number: 0 is what the shader writes
 	PlanBinding			bindings[VULKAN_BINDING_COUNT];
-	uint32				groups_x;
-	uint32				groups_y;
+	uint32				variant_count;
+	PlanVariant			variants[PLAN_MAX_VARIANTS];
 	//! the push constants: the Params of the shader
 	uint32				word_count;
 	PlanWord			words[VULKAN_PUSH_CONSTANT_SIZE / 4];
@@ -260,7 +272,12 @@ private:
 			status_t			_AddConstant(const PlanConstant& constant,
 									int32* _index);
 			status_t			_AddBias(int32 tensor, uint32 outputs,
-									uint32 pack, int32* _index);
+									int32* _index);
+			bool				_SetVariant(PlanVariant& variant,
+									uint32 shader, uint32 total) const;
+			status_t			_AddVariant(uint32 shader, uint32 total);
+			status_t			_AddGridVariant(uint32 shader, uint32 width,
+									uint32 height, uint32 depth);
 			status_t			_AddStep(uint32 shader, uint32 total,
 									const Params& params, int32 output,
 									int32 input, int32 second = -1,
@@ -270,7 +287,6 @@ private:
 			VulkanLimits		fLimits;
 			status_t			fStatus;
 			int32				fOperator;
-			bool				fPairs;
 
 			//! per tensor of the graph: its value, or -1
 			int32*				fTensorValues;

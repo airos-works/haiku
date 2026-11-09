@@ -16,6 +16,11 @@
 	inputs to memory the device shares with the CPU, submits the commands
 	(which begin by copying from there and end by copying the results
 	back), waits and copies the outputs out.
+
+	Where a step can be done by more than one shader, the program times
+	them on the device when it is made and keeps the fastest: which one
+	that is depends on the size of the layer and on the device in ways
+	that no rule has been found for.
 */
 class VulkanProgram : public BNeuralProgram {
 public:
@@ -48,6 +53,8 @@ private:
 			status_t			_CreateBuffers(const VulkanPlan& plan);
 			status_t			_UploadConstants(const VulkanPlan& plan);
 			status_t			_CreateDescriptors(const VulkanPlan& plan);
+			status_t			_CreateCommands();
+			status_t			_Tune(const VulkanPlan& plan);
 			status_t			_Record(const VulkanPlan& plan);
 			void				_RecordCopies(VkCommandBuffer commands,
 									const VulkanPlan& plan, bool in);
@@ -77,6 +84,8 @@ private:
 			VkCommandBuffer*	fCommands;
 			int32				fCommandCount;
 			VkFence				fFence;
+			//! per step: which of its variants is used
+			uint8*				fChoices;
 
 			Transfer*			fInputs;
 			int32				fInputCount;

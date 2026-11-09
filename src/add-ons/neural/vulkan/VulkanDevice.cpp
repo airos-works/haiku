@@ -29,10 +29,10 @@ static const struct {
 } kShaders[VULKAN_SHADER_COUNT] = {
 	SHADER(conv),
 	SHADER(conv_pointwise),
-	SHADER(conv8),
-	SHADER(conv8_pointwise),
+	SHADER(conv_quad),
 	SHADER(depthwise),
 	SHADER(depthwise_multiplier),
+	SHADER(depthwise_grid),
 	SHADER(pool_average),
 	SHADER(pool_maximum),
 	SHADER(binary),
@@ -65,7 +65,7 @@ VulkanLimits::SetTo(const VulkanPhysicalDevice& device)
 		max_range = device.max_allocation_size;
 
 	// The shaders count invocations in 32 bits, x and y together.
-	for (int32 i = 0; i < 2; i++) {
+	for (int32 i = 0; i < 3; i++) {
 		max_groups[i] = limits.maxComputeWorkGroupCount[i];
 		if (max_groups[i] > 32768)
 			max_groups[i] = 32768;

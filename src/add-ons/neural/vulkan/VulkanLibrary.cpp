@@ -13,6 +13,54 @@
 
 #include <image.h>
 #include <OS.h>
+#include <PathFinder.h>
+#include <StringList.h>
+#include <unistd.h>
+
+
+static const char* const kLoaderNames[] = {
+	"libvulkan.so.1",
+	"libvulkan.so"
+};
+
+
+/*!	Whether there is a library of that name where libraries are looked
+	for: the lib directories of the system and the user, and what
+	LIBRARY_PATH names. The runtime loader writes a line to the system log
+	for every library it is asked for and does not find, and most
+	machines without a graphics driver have no Vulkan loader: this keeps
+	every team that uses the kit from leaving two lines there. In doubt
+	the answer is yes. */
+static bool
+library_exists(const char* name)
+{
+	// B_ENTRY_NOT_FOUND is the answer "in none of them"
+	BStringList paths;
+	status_t status = BPathFinder::FindPaths(B_FIND_PATH_LIB_DIRECTORY, name,
+		B_FIND_PATH_EXISTING_ONLY, paths);
+	if (status != B_ENTRY_NOT_FOUND
+		&& (status != B_OK || paths.CountStrings() > 0)) {
+		return true;
+	}
+
+	const char* search = getenv("LIBRARY_PATH");
+	if (search == NULL)
+		return false;
+
+	BStringList directories;
+	BString(search).Split(":", true, directories);
+	for (int32 i = 0; i < directories.CountStrings(); i++) {
+		BString path = directories.StringAt(i);
+		// "%A" is the directory of the program, which only the runtime
+		// loader knows for sure
+		if (path.FindFirst('%') >= 0)
+			return true;
+		path << "/" << name;
+		if (access(path.String(), R_OK) == 0)
+			return true;
+	}
+	return false;
+}
 
 
 VulkanLibrary::VulkanLibrary()
@@ -43,9 +91,11 @@ VulkanLibrary::~VulkanLibrary()
 status_t
 VulkanLibrary::Init()
 {
-	fHandle = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-	if (fHandle == NULL)
-		fHandle = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+	for (size_t i = 0; fHandle == NULL
+			&& i < sizeof(kLoaderNames) / sizeof(kLoaderNames[0]); i++) {
+		if (library_exists(kLoaderNames[i]))
+			fHandle = dlopen(kLoaderNames[i], RTLD_NOW | RTLD_LOCAL);
+	}
 	if (fHandle == NULL)
 		return B_ENTRY_NOT_FOUND;
 

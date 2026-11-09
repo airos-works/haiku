@@ -17,10 +17,10 @@ trap 'rm -rf "$WORK"' EXIT
 SHADERS="
 conv conv.comp
 conv_pointwise conv.comp -DPOINTWISE
-conv8 conv.comp -DOUTPUTS_8
-conv8_pointwise conv.comp -DPOINTWISE -DOUTPUTS_8
+conv_quad conv.comp -DQUAD
 depthwise depthwise.comp
 depthwise_multiplier depthwise.comp -DMULTIPLIER
+depthwise_grid depthwise.comp -DGRID
 pool_average pool.comp
 pool_maximum pool.comp -DMAXIMUM
 binary binary.comp

@@ -16,10 +16,10 @@
 enum vulkan_shader {
 	VULKAN_SHADER_CONV = 0,
 	VULKAN_SHADER_CONV_POINTWISE,
-	VULKAN_SHADER_CONV8,
-	VULKAN_SHADER_CONV8_POINTWISE,
+	VULKAN_SHADER_CONV_QUAD,
 	VULKAN_SHADER_DEPTHWISE,
 	VULKAN_SHADER_DEPTHWISE_MULTIPLIER,
+	VULKAN_SHADER_DEPTHWISE_GRID,
 	VULKAN_SHADER_POOL_AVERAGE,
 	VULKAN_SHADER_POOL_MAXIMUM,
 	VULKAN_SHADER_BINARY,
@@ -50,8 +50,8 @@ const char* vulkan_shader_name(uint32 shader);
 struct VulkanLimits {
 	//! bytes one tensor or one set of weights may have
 	uint64				max_range;
-	//! workgroups a dispatch may have along x and y
-	uint32				max_groups[2];
+	//! workgroups a dispatch may have along x, y and z
+	uint32				max_groups[3];
 	//! what offsets of tensors in a buffer are multiples of
 	uint32				alignment;
 

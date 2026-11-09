@@ -17,9 +17,21 @@
 	them than one dimension of a dispatch holds.
 */
 
+#ifdef GRID
+/*	The invocations of the shaders that slide a window over pictures are
+	laid out as the output is: x and y are the place in the picture, z
+	counts the batch and the group of channels. That way no invocation
+	has to divide to find out where it is, which a graphics processor
+	takes long for. */
+#define GRID_SIZE 8
+
+layout(local_size_x = GRID_SIZE, local_size_y = GRID_SIZE,
+	local_size_z = 1) in;
+#else
 #define LOCAL_SIZE 64
 
 layout(local_size_x = LOCAL_SIZE, local_size_y = 1, local_size_z = 1) in;
+#endif
 
 #define INVOCATION(rowSize) \
 	(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * (rowSize))
