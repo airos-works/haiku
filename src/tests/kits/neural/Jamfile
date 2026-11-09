@@ -16,3 +16,10 @@ if $(TARGET_ARCH) = arm64 {
 # Vulkan driver
 SimpleTest vulkan_backend_test : vulkan_backend_test.cpp
 	: be neural [ TargetLibstdc++ ] ;
+
+# the amdxdna back end with a design bundle; with the NPU it compares the
+# NPU and the CPU, without it the back end's claims and the fallback
+if $(TARGET_ARCH) = x86_64 {
+	SimpleTest amdxdna_backend_test : amdxdna_backend_test.cpp
+		: be neural [ TargetLibstdc++ ] ;
+}
