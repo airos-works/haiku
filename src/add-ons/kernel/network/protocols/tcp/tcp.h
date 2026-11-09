@@ -181,7 +181,11 @@ operator==(tcp_sequence a, tcp_sequence b)
 #define TCP_FLAG_CONGESTION_WINDOW_REDUCED		0x80
 
 #define TCP_CONNECTION_TIMEOUT			75000000	// 75 secs
-#define TCP_DELAYED_ACKNOWLEDGE_TIMEOUT	100000		// 100 msecs
+// Linux (TCP_DELACK_MIN) and FreeBSD (TCPTV_DELACK) wait 40 ms. At 100 ms a
+// server that writes a reply's header and body separately with Nagle on (as
+// Python's http.server does) held the body back 100 ms for this ACK: two small
+// scripts of a page each came 100 ms late, and its first paint with them.
+#define TCP_DELAYED_ACKNOWLEDGE_TIMEOUT	40000		// 40 msecs
 #define TCP_DEFAULT_MAX_SEGMENT_SIZE	536
 #define TCP_MAX_WINDOW					65535
 #define TCP_MAX_SEGMENT_LIFETIME		60000000	// 60 secs
