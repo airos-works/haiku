@@ -26,7 +26,9 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 			Arithmetic.cpp
 			Convolution.cpp
 			Detection.cpp
+			Gather.cpp
 			Kernels.cpp
+			MatMul.cpp
 			Pooling.cpp
 			Quantize.cpp
 			Reduce.cpp

@@ -42,7 +42,12 @@ static const NeuralKernel* const kKernels[] = {
 	&kStridedSliceKernel,
 	&kQuantizeKernel,
 	&kDequantizeKernel,
-	&kDetectionPostprocessKernel
+	&kDetectionPostprocessKernel,
+	&kSquaredDifferenceKernel,
+	&kRsqrtKernel,
+	&kGeluKernel,
+	&kBatchMatMulKernel,
+	&kGatherKernel
 };
 
 

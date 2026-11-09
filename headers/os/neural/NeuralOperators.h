@@ -87,6 +87,27 @@ enum neural_operator_code {
 		neural_detection_params. */
 	B_NEURAL_OP_DETECTION_POSTPROCESS,
 
+	// What transformer networks (speech, language) need besides the
+	// above.
+
+	// inputs: a, b (broadcast); no parameters: (a - b) squared
+	B_NEURAL_OP_SQUARED_DIFFERENCE,
+	// inputs: input; no parameters: 1 / square root
+	B_NEURAL_OP_RSQRT,
+	// inputs: input; neural_gelu_params
+	B_NEURAL_OP_GELU,
+	/*!	Products of matrices: the last two dimensions of the inputs are
+		rows and columns ([..., m, k] times [..., k, n] gives [..., m, n]),
+		the dimensions before them say how many matrices there are and
+		broadcast. neural_batch_matmul_params. */
+	B_NEURAL_OP_BATCH_MATMUL,
+	/*!	Picks slices of the input along one dimension. Inputs: input,
+		indices (int32 or int64, any shape). The output has the shape of
+		the input with that dimension replaced by the shape of the
+		indices. An index outside of the dimension fails the run.
+		neural_gather_params. */
+	B_NEURAL_OP_GATHER,
+
 	B_NEURAL_OP_COUNT
 };
 
@@ -180,6 +201,24 @@ struct neural_strided_slice_params {
 	int32				ellipsis_mask;
 	int32				new_axis_mask;
 	int32				shrink_axis_mask;
+};
+
+struct neural_gelu_params {
+	//! the approximation with tanh instead of the error function
+	bool				approximate;
+};
+
+struct neural_batch_matmul_params {
+	//! use the first (second) input's matrices transposed
+	bool				adjoint_a;
+	bool				adjoint_b;
+};
+
+struct neural_gather_params {
+	//! the dimension of the input the indices count along
+	int32				axis;
+	//! leading dimensions input and indices share; only 0 is supported
+	int32				batch_dimensions;
 };
 
 struct neural_detection_params {

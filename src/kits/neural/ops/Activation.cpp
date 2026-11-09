@@ -21,6 +21,8 @@
 
 #include "Kernels.h"
 
+#include <pthread.h>
+
 
 namespace BPrivate {
 
@@ -34,6 +36,8 @@ struct UnaryData {
 	uint8	table[256];
 	//! LEAKY_RELU
 	float	alpha;
+	//! GELU: see gelu_table()
+	const float* shares;
 };
 
 
@@ -121,6 +125,48 @@ struct LeakyRelu {
 	static inline float Apply(float value, const UnaryData& data)
 	{
 		return value > 0 ? value : value * data.alpha;
+	}
+};
+
+
+struct Rsqrt {
+	static const int32 kGrain = 32768;
+
+	static inline float Apply(float value, const UnaryData&)
+	{
+		return 1 / sqrtf(value);
+	}
+};
+
+
+// GELU is x times the share of a normal distribution that lies below x.
+// The share comes from a table with a straight line between neighbours:
+// the error function it is made of costs ten times as much, and a
+// transformer puts millions of numbers through this for every input. With
+// 256 steps to the unit the result is off by less than 1e-6 of x.
+
+static const int32 kGeluSteps = 256;
+//! beyond +-kGeluRange the share is 1 or 0 to all the digits there are
+static const int32 kGeluRange = 8;
+static const int32 kGeluEntries = 2 * kGeluRange * kGeluSteps + 2;
+
+
+struct Gelu {
+	static const int32 kGrain = 16384;
+
+	static inline float Apply(float value, const UnaryData& data)
+	{
+		// (written so that something that is not a number gets a place
+		// in the table too; it stays what it is in the product)
+		float clamped = value > -kGeluRange
+			? (value < kGeluRange ? value : (float)kGeluRange)
+			: (float)-kGeluRange;
+		float position = (clamped + kGeluRange) * kGeluSteps;
+		int32 index = (int32)position;
+		float fraction = position - (float)index;
+		const float* shares = data.shares;
+		return value * (shares[index]
+			+ fraction * (shares[index + 1] - shares[index]));
 	}
 };
 
@@ -298,6 +344,61 @@ prepare_leaky_relu(const NeuralGraphData* graph,
 		if (status != B_OK)
 			return status;
 	}
+	return finish_unary(data, _prepared);
+}
+
+
+// #pragma mark - RSQRT, GELU
+
+
+//! For the functions that are there for floating point numbers only.
+static status_t
+prepare_float_only(const NeuralGraphData* graph,
+	const neural_graph_operator* op, void** _prepared)
+{
+	UnaryData data;
+	status_t status = check_unary(graph, op, &data);
+	if (status != B_OK)
+		return status;
+	if (graph->Tensor(op->inputs[0]).type != B_NEURAL_FLOAT32)
+		return B_NEURAL_UNSUPPORTED_OPERATOR;
+	return finish_unary(data, _prepared);
+}
+
+
+static float sGeluShares[2][kGeluEntries];
+static pthread_once_t sGeluOnce = PTHREAD_ONCE_INIT;
+
+
+static void
+fill_gelu_tables()
+{
+	for (int32 i = 0; i < kGeluEntries; i++) {
+		double x = (double)i / kGeluSteps - kGeluRange;
+		sGeluShares[0][i] = (float)(0.5 * (1 + erf(x * M_SQRT1_2)));
+		// the approximation of Hendrycks and Gimpel
+		sGeluShares[1][i] = (float)(0.5 * (1 + tanh(sqrt(2 / M_PI)
+			* (x + 0.044715 * x * x * x))));
+	}
+}
+
+
+static status_t
+prepare_gelu(const NeuralGraphData* graph, const neural_graph_operator* op,
+	void** _prepared)
+{
+	UnaryData data;
+	status_t status = check_unary(graph, op, &data);
+	if (status != B_OK)
+		return status;
+	if (op->params == NULL
+		|| graph->Tensor(op->inputs[0]).type != B_NEURAL_FLOAT32) {
+		return B_NEURAL_UNSUPPORTED_OPERATOR;
+	}
+
+	pthread_once(&sGeluOnce, &fill_gelu_tables);
+	data.shares = sGeluShares[
+		((const neural_gelu_params*)op->params)->approximate ? 1 : 0];
 	return finish_unary(data, _prepared);
 }
 
@@ -762,6 +863,14 @@ const NeuralKernel kHardSwishKernel = {
 
 const NeuralKernel kLeakyReluKernel = {
 	B_NEURAL_OP_LEAKY_RELU, &prepare_leaky_relu, &run_unary<LeakyRelu>
+};
+
+const NeuralKernel kRsqrtKernel = {
+	B_NEURAL_OP_RSQRT, &prepare_float_only, &run_unary<Rsqrt>
+};
+
+const NeuralKernel kGeluKernel = {
+	B_NEURAL_OP_GELU, &prepare_gelu, &run_unary<Gelu>
 };
 
 const NeuralKernel kSoftmaxKernel = {

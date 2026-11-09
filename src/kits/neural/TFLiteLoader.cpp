@@ -56,6 +56,7 @@ enum {
 	kOpTanh = 28,
 	kOpCustom = 32,
 	kOpPad = 34,
+	kOpGather = 36,
 	kOpTranspose = 39,
 	kOpMean = 40,
 	kOpSub = 41,
@@ -67,10 +68,14 @@ enum {
 	kOpMinimum = 57,
 	kOpPadV2 = 60,
 	kOpTransposeConv = 67,
+	kOpRsqrt = 76,
 	kOpResizeNearestNeighbor = 97,
 	kOpLeakyRelu = 98,
+	kOpSquaredDifference = 99,
 	kOpQuantize = 114,
-	kOpHardSwish = 117
+	kOpHardSwish = 117,
+	kOpBatchMatMul = 126,
+	kOpGelu = 150
 };
 
 // the largest "deprecated" (8 bit) operator code; above it the 32 bit
@@ -819,6 +824,9 @@ Loader::_LoadOperator(uint32 op)
 	neural_resize_params resize;
 	neural_strided_slice_params stridedSlice;
 	neural_detection_params detection;
+	neural_gelu_params gelu;
+	neural_batch_matmul_params matmul;
+	neural_gather_params gather;
 
 	switch (builtin) {
 		case kOpConv2D:
@@ -966,6 +974,38 @@ Loader::_LoadOperator(uint32 op)
 			break;
 		case kOpDequantize:
 			kitCode = B_NEURAL_OP_DEQUANTIZE;
+			break;
+		case kOpSquaredDifference:
+			kitCode = B_NEURAL_OP_SQUARED_DIFFERENCE;
+			break;
+		case kOpRsqrt:
+			kitCode = B_NEURAL_OP_RSQRT;
+			break;
+
+		case kOpGelu:
+			memset(&gelu, 0, sizeof(gelu));
+			gelu.approximate = fReader.Scalar<uint8>(options, 0, 0) != 0;
+			kitCode = B_NEURAL_OP_GELU;
+			params = &gelu;
+			paramsSize = sizeof(gelu);
+			break;
+
+		case kOpBatchMatMul:
+			memset(&matmul, 0, sizeof(matmul));
+			matmul.adjoint_a = fReader.Scalar<uint8>(options, 0, 0) != 0;
+			matmul.adjoint_b = fReader.Scalar<uint8>(options, 1, 0) != 0;
+			kitCode = B_NEURAL_OP_BATCH_MATMUL;
+			params = &matmul;
+			paramsSize = sizeof(matmul);
+			break;
+
+		case kOpGather:
+			memset(&gather, 0, sizeof(gather));
+			gather.axis = fReader.Scalar<int32>(options, 0, 0);
+			gather.batch_dimensions = fReader.Scalar<int32>(options, 1, 0);
+			kitCode = B_NEURAL_OP_GATHER;
+			params = &gather;
+			paramsSize = sizeof(gather);
 			break;
 
 		case kOpLeakyRelu:

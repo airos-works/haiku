@@ -163,6 +163,15 @@ struct FloatDiv {
 };
 
 
+struct FloatSquaredDifference {
+	inline float operator()(float a, float b) const
+	{
+		float difference = a - b;
+		return difference * difference;
+	}
+};
+
+
 template<typename Type>
 struct Larger {
 	inline Type operator()(Type a, Type b) const
@@ -485,6 +494,33 @@ run_div(const NeuralOpContext& context)
 }
 
 
+// #pragma mark - SQUARED_DIFFERENCE
+
+
+static status_t
+prepare_squared_difference(const NeuralGraphData* graph,
+	const neural_graph_operator* op, void** _prepared)
+{
+	BinaryData data;
+	if (!common_checks(graph, op, &data))
+		return B_NEURAL_UNSUPPORTED_OPERATOR;
+
+	// what layer normalisation is made of: floating point only
+	if (graph->Tensor(op->inputs[0]).type != B_NEURAL_FLOAT32)
+		return B_NEURAL_UNSUPPORTED_OPERATOR;
+
+	return finish_prepare(data, _prepared);
+}
+
+
+static status_t
+run_squared_difference(const NeuralOpContext& context)
+{
+	run_binary<float, FloatSquaredDifference>(context, {}, 65536);
+	return B_OK;
+}
+
+
 // #pragma mark - MAXIMUM, MINIMUM
 
 
@@ -673,6 +709,11 @@ const NeuralKernel kMaximumKernel = {
 
 const NeuralKernel kMinimumKernel = {
 	B_NEURAL_OP_MINIMUM, &prepare_compare, &run_compare<false>
+};
+
+const NeuralKernel kSquaredDifferenceKernel = {
+	B_NEURAL_OP_SQUARED_DIFFERENCE, &prepare_squared_difference,
+	&run_squared_difference
 };
 
 const NeuralKernel kPreluKernel = {

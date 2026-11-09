@@ -16,7 +16,9 @@ first operator that goes wrong. --seeds repeats all of it with as many
 different inputs.
 
 A file <model>.json beside a model (make_models.py writes them) may give
-the range of each float input ("inputs": [[low, high], ...]) and say that
+the range of each float input ("inputs": [[low, high], ...]), that of int32
+and int64 inputs ("int_ranges": {"<input number>": [low, high]}: inputs
+that are indices must be in range) and say that
 integer results may be off by some ("int_tolerance"). An output that has
 the same value everywhere tests nothing and counts as a failure, unless
 that file says "allow_constant".
@@ -35,7 +37,7 @@ import numpy as np
 from ai_edge_litert.interpreter import Interpreter, OpResolverType
 
 
-def make_input(detail, rng, limits):
+def make_input(detail, rng, limits, int_limits=None):
     shape = tuple(detail['shape'])
     dtype = detail['dtype']
     if dtype == np.float32:
@@ -47,6 +49,9 @@ def make_input(detail, rng, limits):
         return rng.integers(info.min, info.max, shape, dtype=dtype,
             endpoint=True)
     if dtype in (np.int32, np.int64):
+        if int_limits is not None:
+            return rng.integers(int_limits[0], int_limits[1], shape,
+                dtype=dtype, endpoint=True)
         return rng.integers(-1000, 1000, shape, dtype=dtype)
     raise SystemExit('input type %s not handled' % dtype)
 
@@ -116,7 +121,8 @@ def run_model(path, args, seed):
     limits = settings.get('inputs', [])
     for number, detail in enumerate(inputs):
         value = make_input(detail, rng,
-            limits[number] if number < len(limits) else (-1.0, 1.0))
+            limits[number] if number < len(limits) else (-1.0, 1.0),
+            settings.get('int_ranges', {}).get(str(number)))
         interpreter.set_tensor(detail['index'], value)
         data.append(value.tobytes())
     interpreter.invoke()
