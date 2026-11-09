@@ -500,6 +500,7 @@ burst(double periodMs, double workUs, int frames, int background,
 		bigtime_t start = system_time();
 		// in 32 pieces, noting where each ran
 		int last = _kern_get_cpu();
+		int firstCPU = last;
 		for (int p = 0; p < 32; p++) {
 			work(iterations / 32);
 			int cpu = _kern_get_cpu();
@@ -513,6 +514,10 @@ burst(double periodMs, double workUs, int frames, int background,
 		bigtime_t end = system_time();
 		durations[f] = (end - start) / 1000.0;
 		where[f] = _kern_get_cpu();
+		if (getenv("SCHEDPERF_TRACE") != NULL) {
+			printf("frame %d: %.2f ms, cpu %d -> %d\n", f, durations[f],
+				firstCPU, where[f]);
+		}
 		if (end > next + period)
 			late++;
 		next += period;

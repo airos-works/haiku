@@ -57,6 +57,15 @@ public:
 	// it used up its quanta since it last waited for something long enough
 	inline	bool		IsPenalized() const	{ return fPriorityPenalty > 0; }
 
+	// Saving power on cores of several speeds: a thread that did not fit a
+	// slower core stays on faster ones until then. Its measured load swings
+	// with the window it was measured over (low right after it slept), and
+	// a periodic job went down to a little core every 200 ms by it.
+	inline	void		KeepOnFasterCores(bigtime_t until) const
+							{ fKeepFasterUntil = until; }
+	inline	bool		ShouldKeepOnFasterCores() const
+							{ return system_time() < fKeepFasterUntil; }
+
 			bool		ChooseCoreAndCPU(CoreEntry*& targetCore,
 							CPUEntry*& targetCPU);
 
@@ -120,6 +129,7 @@ private:
 			int32		fAdditionalPenalty;
 
 	mutable	int32		fEffectivePriority;
+	mutable	bigtime_t	fKeepFasterUntil;
 	mutable	bigtime_t	fBaseQuantum;
 
 			bigtime_t	fTimeUsed;
@@ -251,9 +261,16 @@ ThreadData::CancelPenalty()
 	SCHEDULER_ENTER_FUNCTION();
 
 	int32 oldPenalty = fPriorityPenalty;
+	int32 oldAdditionalPenalty = fAdditionalPenalty;
 	fPriorityPenalty = 0;
+	// The additional penalty rotates the priorities of busy threads, so that
+	// none of them starves. It grew with every wait as well (GoesAway()), so
+	// a thread that woke up after waiting long enough got a priority anywhere
+	// between 1 and its own, and lost the faster core to a busy thread of
+	// the same priority (big.LITTLE) as often as not.
+	fAdditionalPenalty = 0;
 
-	if (oldPenalty != 0) {
+	if (oldPenalty != 0 || oldAdditionalPenalty != 0) {
 		TRACE("cancelling thread %ld penalty\n", fThread->id);
 		_ComputeEffectivePriority();
 	}

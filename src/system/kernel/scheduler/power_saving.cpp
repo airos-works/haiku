@@ -18,6 +18,8 @@ using namespace Scheduler;
 
 
 const bigtime_t kCacheExpire = 100000;
+// how long a thread that did not fit a slower core stays on faster ones
+const bigtime_t kKeepFaster = 5000000;
 
 static CoreEntry* sSmallTaskCore;
 
@@ -114,6 +116,13 @@ choose_core(const ThreadData* threadData)
 	CPUSet mask = threadData->GetCPUMask();
 	const bool useMask = !mask.IsEmpty();
 
+	// a thread that did not fit a slower core lately: the fastest idle one
+	if (gHeterogeneousCores && threadData->ShouldKeepOnFasterCores()) {
+		core = FastestIdleCore(threadData, gMaxCoreCapacity);
+		if (core != NULL)
+			return core;
+	}
+
 	// try to pack all threads on one core
 	core = choose_small_task_core();
 	if (core != NULL && (useMask && !core->CPUMask().Matches(mask)))
@@ -189,18 +198,29 @@ rebalance(const ThreadData* threadData)
 			faster = FastestPreemptibleCore(threadData, core->Capacity() + 1,
 				threadData->GetEffectivePriority());
 		}
-		if (faster != NULL)
+		if (faster != NULL) {
+			threadData->KeepOnFasterCores(system_time() + kKeepFaster);
 			return faster;
+		}
 	}
 
 	if (coreLoad > kHighLoad) {
+		// A thread that is not busy itself (it took this faster core from a
+		// busy one, see above) is not pushed to a slower core for the load
+		// the busy one leaves: it came straight back as a misfit, and a 3 ms
+		// job every frame ran on a ROCK 5's little core every sixth time.
+		const bool keepFaster = gHeterogeneousCores
+			&& !threadData->IsPenalized();
+
 		if (sSmallTaskCore == core) {
 			sSmallTaskCore = NULL;
 			CoreEntry* smallTaskCore = choose_small_task_core();
 
 			if ((threadLoad > coreLoad / 3 && !overloaded)
 				|| smallTaskCore == NULL || smallTaskCore == core
-				|| (useMask && !smallTaskCore->CPUMask().Matches(mask))) {
+				|| (useMask && !smallTaskCore->CPUMask().Matches(mask))
+				|| (keepFaster
+					&& smallTaskCore->Capacity() < core->Capacity())) {
 				return core;
 			}
 			return coreLoad > kVeryHighLoad ? smallTaskCore : core;
@@ -224,6 +244,9 @@ rebalance(const ThreadData* threadData)
 		coreLocker.Unlock();
 		ASSERT(other != NULL);
 
+		if (keepFaster && other->Capacity() < core->Capacity())
+			return core;
+
 		int32 coreNewLoad = coreLoad - threadLoad;
 		int32 otherNewLoad = other->GetLoad() + threadLoad;
 		if (overloaded) {
@@ -241,11 +264,21 @@ rebalance(const ThreadData* threadData)
 	if (smallTaskCore == NULL || (useMask && !smallTaskCore->CPUMask().Matches(mask)))
 		return core;
 	if (smallTaskCore->Capacity() < core->Capacity()) {
-		// To a slower core: what the thread would need there, with room to
-		// spare, or it would only come back as a misfit.
+		if (threadData->ShouldKeepOnFasterCores()) {
+			// still doing real work up here: for a while longer
+			if (threadLoad >= kLowLoad / 2) {
+				threadData->KeepOnFasterCores(system_time() + kKeepFaster);
+			}
+			return core;
+		}
+		// To a slower core: what the thread would need there, with much room
+		// to spare (it moved up at 85 %), or it comes back as a misfit. The
+		// capacities understate the difference for much code (a job taking
+		// 2.8 ms on a Cortex-A76 took 14.5 on an A55, not 7.4), and at 40 %
+		// that job went down and up again every few frames.
 		int32 loadThere = (int32)((int64)threadLoad * core->Capacity()
 			/ std::max(smallTaskCore->Capacity(), (uint32)1));
-		return smallTaskCore->GetLoad() + loadThere < kLowLoad * 2
+		return smallTaskCore->GetLoad() + loadThere < kLowLoad
 			? smallTaskCore : core;
 	}
 	return smallTaskCore->GetLoad() + threadLoad < kHighLoad
