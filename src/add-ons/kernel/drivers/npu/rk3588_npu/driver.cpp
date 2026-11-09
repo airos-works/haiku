@@ -37,6 +37,7 @@
 #include <vm/vm.h>
 #include <arch/arm64/cache_poc.h>
 
+#include <algorithm>
 #include <fcntl.h>
 #include <new>
 #include <stdlib.h>
@@ -73,7 +74,11 @@ static const uint32 kCruSoftReset30 = 0xa00 + 30 * 4;
 	// bus interface
 static const uint32 kGate29Bits = (1 << 0) | (1 << 1) | (1 << 4);
 static const uint32 kGate30Bits = (1 << 6) | (1 << 8);
-static const uint32 kReset30Bits = (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9);
+// The core is reset, its bus interfaces are not: resetting those while the
+// core is in the middle of a transfer (a job that hangs) leaves the bus in
+// a state that only a restart of the machine ends -- no job completes any
+// more and the power domain cannot be taken down.
+static const uint32 kReset30Bits = (1 << 6) | (1 << 8);
 
 // GPLL runs at 1188 MHz on every RK3588 board (the firmware and Linux
 // depend on it). A sixth of it is the 200 MHz Linux gives the processor,
@@ -146,11 +151,13 @@ static const uint32 kMmuDirectory = 0x00;
 static const uint32 kMmuStatus = 0x04;
 static const uint32 kMmuCommand = 0x08;
 static const uint32 kMmuFaultAddress = 0x0c;
+static const uint32 kMmuInterruptRawStatus = 0x14;
 static const uint32 kMmuInterruptClear = 0x18;
 static const uint32 kMmuInterruptMask = 0x1c;
 static const uint32 kMmuInterruptStatus = 0x20;
 
 static const uint32 kMmuStatusPaging = 1 << 0;
+static const uint32 kMmuStatusPageFault = 1 << 1;
 static const uint32 kMmuStatusStall = 1 << 2;
 
 static const uint32 kMmuEnablePaging = 0;
@@ -179,6 +186,7 @@ static const uint32 kDeviceSpaceEnd = 0xf0000000;
 static const uint64 kMaxBufferSize = 512 * 1024 * 1024;
 static const uint32 kMaxTasks = 4096;
 static const bigtime_t kDefaultTimeout = 3 * 1000 * 1000;
+static const bigtime_t kFaultPollInterval = 50 * 1000;
 static const bigtime_t kMaxTimeout = 60 * 1000 * 1000;
 
 
@@ -246,6 +254,8 @@ struct Device {
 	bool			powered;
 	bool			active;
 	bool			failed;
+	bool			faulted;
+		// stopped by the IOMMU
 	const rk3588_npu_task* tasks;
 	uint32			taskCount;
 	uint32			nextTask;
@@ -503,6 +513,26 @@ mmu_all(Device* device, uint32 bit)
 }
 
 
+/*!	Whether the IOMMU stopped the core at an address that is not mapped. */
+static bool
+mmu_fault_pending(Device* device, uint32* _address)
+{
+	bool pending = false;
+	for (uint32 i = 0; i < kMmuCount; i++) {
+		if ((read32(device->core, kMmuOffsets[i] + kMmuStatus)
+				& kMmuStatusPageFault) == 0
+			&& read32(device->core, kMmuOffsets[i] + kMmuInterruptRawStatus)
+				== 0) {
+			continue;
+		}
+
+		pending = true;
+		*_address = read32(device->core, kMmuOffsets[i] + kMmuFaultAddress);
+	}
+	return pending;
+}
+
+
 /*!	Has the IOMMU forget what it cached of the tables; the core must be
 	idle. */
 static void
@@ -700,11 +730,26 @@ power_off(Device* device)
 	}
 	device->attached = NULL;
 
-	write_masked(device->pmu, kPmuIdleRequest, kTopIdleBit, true);
-	if (!wait_for_bits(device->pmu, kPmuIdleAck, kTopIdleBit, true, 10000)
-		|| !wait_for_bits(device->pmu, kPmuIdleStatus, kTopIdleBit, true,
-			10000)) {
-		TRACE("the core's bus interface does not go idle\n");
+	// A core that was left in the middle of something does not let go
+	// of the bus; a reset makes it.
+	bool idle = false;
+	for (int32 attempt = 0; !idle && attempt < 2; attempt++) {
+		if (attempt > 0)
+			reset_core(device);
+
+		write_masked(device->pmu, kPmuIdleRequest, kTopIdleBit, true);
+		idle = wait_for_bits(device->pmu, kPmuIdleAck, kTopIdleBit, true,
+				10000)
+			&& wait_for_bits(device->pmu, kPmuIdleStatus, kTopIdleBit, true,
+				10000);
+	}
+	if (!idle) {
+		// Taking the power away under a transfer would be worse than
+		// leaving it on.
+		TRACE("the core's bus interface does not go idle, the core stays "
+			"powered\n");
+		write_masked(device->pmu, kPmuIdleRequest, kTopIdleBit, false);
+		return;
 	}
 
 	write_masked(device->pmu, kPmuPowerGate, kTopPowerBit, true);
@@ -779,6 +824,7 @@ handle_interrupt(void* data)
 			return B_HANDLED_INTERRUPT;
 		device->active = false;
 		device->failed = true;
+		device->faulted = true;
 		device->interruptStatus = status;
 		release_sem_etc(device->done, 1, B_DO_NOT_RESCHEDULE);
 		return B_INVOKE_SCHEDULER;
@@ -907,20 +953,58 @@ submit(Client* client, void* userArgs)
 		device->interruptStatus = 0;
 		device->faultAddress = 0;
 		device->failed = false;
+		device->faulted = false;
 		device->active = true;
 		start_task(device);
 	}
 
-	status = acquire_sem_etc(device->done, 1, B_RELATIVE_TIMEOUT, timeout);
+	// The interrupt handler wakes us when the job is done. A job that
+	// reaches for memory its client does not have is stopped by the
+	// IOMMU, which says so in its registers; its interrupt, though, does
+	// not arrive (on the ROCK 5 ITX at least, whatever the device tree of
+	// Linux says about the line), so the wait looks for itself now and
+	// then. Jobs that are done sooner never get to that.
+	bigtime_t deadline = start + timeout;
+	while (true) {
+		bigtime_t slice = std::min(deadline - system_time(),
+			kFaultPollInterval);
+		if (slice <= 0) {
+			status = B_TIMED_OUT;
+			break;
+		}
+
+		status = acquire_sem_etc(device->done, 1, B_RELATIVE_TIMEOUT, slice);
+		if (status != B_TIMED_OUT)
+			break;
+
+		uint32 address;
+		if (!mmu_fault_pending(device, &address))
+			continue;
+
+		InterruptsSpinLocker locker(device->jobSpin);
+		if (device->active) {
+			device->active = false;
+			device->failed = true;
+			device->faulted = true;
+			device->faultAddress = address;
+			device->interruptStatus = read32(device->core,
+				kPcInterruptRawStatus);
+			write32(device->core, kPcInterruptMask, 0);
+		}
+		status = B_OK;
+		break;
+	}
 	args.duration = system_time() - start;
 
 	bool failed;
+	bool faulted;
 	uint32 faultAddress;
 	{
 		InterruptsSpinLocker locker(device->jobSpin);
 		device->active = false;
 		device->tasks = NULL;
 		failed = device->failed;
+		faulted = device->faulted;
 		faultAddress = device->faultAddress;
 		args.tasks_done = device->tasksDone;
 		args.interrupt_status = device->interruptStatus;
@@ -931,20 +1015,28 @@ submit(Client* client, void* userArgs)
 	}
 
 	if (status != B_OK || failed) {
-		if (faultAddress != 0 || failed) {
+		if (faulted) {
 			TRACE("job of team %" B_PRId32 " failed in task %" B_PRIu32
-				" of %" B_PRIu32 ": interrupt status %#" B_PRIx32
-				", fault at device address %#" B_PRIx32 "\n", client->team,
-				args.tasks_done, args.task_count, args.interrupt_status,
-				faultAddress);
+				" of %" B_PRIu32 ": it reached for device address %#"
+				B_PRIx32 ", where the team has no buffer\n", client->team,
+				args.tasks_done, args.task_count, faultAddress);
 			status = B_BAD_ADDRESS;
+		} else if (failed) {
+			TRACE("job of team %" B_PRId32 " failed in task %" B_PRIu32
+				" of %" B_PRIu32 ": bus error (interrupt status %#" B_PRIx32
+				")\n", client->team, args.tasks_done, args.task_count,
+				args.interrupt_status);
+			status = B_IO_ERROR;
 		} else {
 			TRACE("job of team %" B_PRId32 " timed out in task %" B_PRIu32
-				" of %" B_PRIu32 " (status %#" B_PRIx32 ")\n", client->team,
-				args.tasks_done, args.task_count,
+				" of %" B_PRIu32 " (interrupt status %#" B_PRIx32 ")\n",
+				client->team, args.tasks_done, args.task_count,
 				read32(device->core, kPcInterruptRawStatus));
 			status = B_TIMED_OUT;
 		}
+
+		// The core is stuck where it was stopped; this is what frees it
+		// for the next job.
 		reset_core(device);
 	}
 
