@@ -1,0 +1,33 @@
+
+resource app_signature "application/x-vnd.airos-Lookout";
+
+resource app_name_catalog_entry "x-vnd.airos-Lookout:System name:Lookout";
+
+resource app_version {
+	major  = 1,
+	middle = 0,
+	minor  = 0,
+
+	variety = B_APPV_FINAL,
+	internal = 0,
+
+	short_info = "Lookout",
+	long_info = "Lookout ©2026 air/OS contributors"
+};
+
+resource app_flags B_SINGLE_LAUNCH;
+
+resource file_types message {
+	"types" = "image",
+	"types" = "application/x-tflite"
+};
+
+resource vector_icon {
+	$"6E63696606032E3844036AB7F5035AA94C031C1C1C03FFC10703F6F6F60C0A08"
+	$"282858285C2C5C54585828582454242C0A04282C582C585428540A072854284A"
+	$"333F3D484641584E58540A0436315631565136510A043D383D4A4F4A4F380A04"
+	$"38335433544F384F0A043B363B4C514C51360A0436254C254C3136310A043827"
+	$"4A274A3338330A08443A483A4A3C4A3F48414441423F423C0A04404A42434A43"
+	$"4C4A0A043B2B472B472E3B2E090A000100000A010101000A020102000A050209"
+	$"0A000A03020304000A030107000A04020506000A040108000A03010B00"
+};
