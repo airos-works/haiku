@@ -22,6 +22,7 @@
 #include <File.h>
 #include <Message.h>
 #include <NeuralKit.h>
+#include <Path.h>
 #include <String.h>
 #include <StringList.h>
 #include <TranslationUtils.h>
@@ -274,7 +275,11 @@ fill_inputs(const Options& options, BNeuralSession& session,
 	*_isImage = false;
 
 	if (options.input != NULL) {
-		BBitmap* bitmap = BTranslationUtils::GetBitmap(options.input);
+		// The Translation Kit looks for relative names next to the
+		// program, not where the user is.
+		BPath path(options.input, NULL, true);
+		BBitmap* bitmap = BTranslationUtils::GetBitmap(
+			path.InitCheck() == B_OK ? path.Path() : options.input);
 		BTensor* first = session.InputAt(0);
 		if (bitmap != NULL && first != NULL && is_image_tensor(*first)) {
 			neural_image_options imageOptions;

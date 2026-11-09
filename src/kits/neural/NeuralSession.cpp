@@ -354,13 +354,9 @@ NeuralSessionData::Init(const BNeuralModel& model,
 			while (end < opCount && fOnDevice[end])
 				end++;
 
+			// Whatever keeps the back end from making the program, also
+			// a device that is out of memory, the CPU runs the stretch.
 			status = _CreateProgram(first, end, &programs[first]);
-			if (status == B_NO_MEMORY) {
-				for (int32 i = 0; i < opCount; i++)
-					delete programs[i];
-				free(programs);
-				return status;
-			}
 			if (status != B_OK) {
 				for (int32 i = first; i < end; i++)
 					fOnDevice[i] = false;
