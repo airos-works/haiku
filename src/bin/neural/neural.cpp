@@ -58,7 +58,11 @@ static const char* kUsage =
 	"  -p, --profile       show where each operator ran and how long\n"
 	"  -o, --output <file> write the raw outputs to a file\n"
 	"      --tolerance <n> compare: largest difference accepted in\n"
-	"                      quantized outputs (default 1)\n";
+	"                      quantized outputs, in steps (default 1)\n"
+	"      --float-tolerance <x>\n"
+	"                      compare: largest difference accepted in float\n"
+	"                      outputs, relative to the largest value\n"
+	"                      (default 0.001)\n";
 
 
 struct Options {
@@ -72,6 +76,7 @@ struct Options {
 	int32				runs;
 	int32				top;
 	int32				tolerance;
+	float				floatTolerance;
 	bool				profile;
 };
 
@@ -615,7 +620,7 @@ compare_model(const Options& options)
 				largest = fmaxf(largest, fabsf(x[j] - y[j]));
 				scale = fmaxf(scale, fabsf(y[j]));
 			}
-			bool ok = largest / scale <= 1e-3f;
+			bool ok = largest / scale <= options.floatTolerance;
 			printf("  %-40s largest difference %g (relative %g) %s\n",
 				a->Info().Name(), largest, largest / scale,
 				ok ? "ok" : "DIFFERENT");
@@ -715,6 +720,7 @@ main(int argc, char** argv)
 	options.runs = strcmp(command, "bench") == 0 ? 20 : 1;
 	options.top = 5;
 	options.tolerance = 1;
+	options.floatTolerance = 1e-3f;
 
 	for (int i = 2; i < argc; i++) {
 		const char* arg = argv[i];
@@ -753,6 +759,9 @@ main(int argc, char** argv)
 			i++;
 		} else if (strcmp(arg, "--tolerance") == 0) {
 			options.tolerance = atoi(value);
+			i++;
+		} else if (strcmp(arg, "--float-tolerance") == 0) {
+			options.floatTolerance = atof(value);
 			i++;
 		} else if (strcmp(arg, "--fit") == 0) {
 			if (strcmp(value, "crop") == 0)

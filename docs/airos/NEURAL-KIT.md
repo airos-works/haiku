@@ -383,7 +383,8 @@ neural run model.tflite -i cat.jpg -l labels.txt
                                         detections; -d <device>, --cpu, --no-fallback, -n <runs>,
                                         -p (where each operator ran and how long), -o <file>
 neural compare model.tflite -d rk3588_npu/0
-                                        the device against the CPU on the same input
+                                        the device against the CPU on the same input;
+                                        --tolerance <steps>, --float-tolerance <fraction>
 neural bench model.tflite               times it on every device
 ```
 
@@ -422,6 +423,10 @@ The back end (`rk3588_npu.neural`) is a port of the code generator of
 Mesa's `rocket` driver (MIT): it turns quantized convolutions into register
 command lists, splits layers that do not fit the core's convolution buffer
 into tasks, and converts tensors between the kit's layout and the NPU's.
+Several layer shapes that Mesa's code gets wrong on this hardware (17 to
+31 and 33 to 48 input channels, some depthwise channel counts, large
+kernels on 1024 channels) are corrected, and the activation ranges and the
+scale of fused additions are computed instead of looked up.
 
 Settings: `clock_divider n` in `~/config/settings/kernel/drivers/rk3588_npu`
 (the core's clock is 1188 MHz / n; the default 6 is safe at every supply
@@ -439,13 +444,30 @@ still NVIDIA's resource manager, as for everything else the card does).
 ### AMD XDNA
 
 The NPU of Ryzen AI processors ("XDNA": an array of AI Engine tiles) is
-driven by Linux's `amdxdna` driver, built for air/OS on the same
-compatibility layer as `amdgpu` (repository `linux-drm`, branch
-`airos-xdna`). Haiku has no AMD IOMMU driver, so the port uses the mode
-upstream added for that case: physically contiguous buffers and physical
-addresses. The NPU does not run networks as such: it runs *designs*
-compiled for its array (with the open `mlir-aie` and Peano tool chain on a
-Linux host); the back end maps operators to the designs it has.
+driven by Linux's `amdxdna` driver (the 7.4-rc2 sources), built for air/OS
+on the same compatibility layer as `amdgpu` (repository `linux-drm`,
+branch `airos-xdna`) as an add-on of its own. It publishes
+`/dev/npu/amdxdna/0` and keeps Linux's ioctls (`amdxdna_accel.h`), plus
+the mapping ioctls of the amdgpu port. It touches no hardware until the
+device is opened; the NPU has power from the first open to the last close.
+
+Haiku has no AMD IOMMU driver, so the port uses the mode upstream added
+for that case ("carveout"): buffers are ranges of one physically
+contiguous block (128 MiB by default, `carveout_mb`), and the NPU is
+given physical addresses. That means there is **no isolation**: the
+addresses sit in instruction streams the kernel cannot check, so a client
+could make the NPU read or write any memory. The device can therefore
+only be opened by root; for everyone else the back end's programs fail
+and the CPU runs the model.
+
+The NPU does not run networks as such: it runs *designs* compiled for its
+array, with the open `mlir-aie` and Peano tool chain on a Linux host. The
+back end (`amdxdna.neural`) works from **design bundles**: a directory
+with a design for one stretch of one network, found by a key computed from
+that stretch (`data/neural/amdxdna/<key>/bundle.txt`; see
+`src/add-ons/neural/amdxdna/README` for the format and
+`haiku/tests/xdna/make-bundle.py` in linux-drm for making one). It claims
+exactly the operators a bundle covers, and nothing without one.
 
 ## Testing
 
@@ -461,9 +483,104 @@ Linux host); the back end maps operators to the designs it has.
 
 ## Status
 
-To be filled in with what was measured (see the end of this file's
-history): which models agree on which device, with what tolerance, and how
-fast.
+What was measured, on which machine, on 2026-11-09. "Agrees" means
+`neural compare` against the CPU device on the same input.
+
+### The CPU device
+
+- **Against LiteRT 2.3** (TensorFlow Lite's reference kernels, on the
+  build host, `src/tests/kits/neural/host/run_tests.sh`): 637 generated
+  single-operator models (every operator and type, three random inputs
+  each) and 9 real models (MobileNet V1/V2 quantized and float, SSD
+  MobileNet V1, EfficientNet-Lite0 int8 and float, EfficientDet-Lite0
+  int8, DeepLab V3 float, BlazeFace float16) agree on every tensor: all
+  integer tensors equal, float within 1e-4. 3297 deliberately damaged
+  model files are refused or run without a crash, also under the address
+  and undefined-behaviour sanitizers.
+- **On arm64** (ROCK 5 ITX, Haiku): the outputs of the three quantized
+  MobileNet/SSD models are byte for byte those of the host run that LiteRT
+  confirmed; MobileNet V2 float differs by 5e-7. `neural_kit_test` passes.
+- **Speed** (best of 10 runs, ms):
+
+  | Model | Xeon E5-2650 v4, 1 thread | same, 8 threads | ROCK 5 ITX, 8 cores | X399 (16 threads) |
+  | --- | --- | --- | --- | --- |
+  | mobilenet_v1_1.0_224_quant | 41.5 | 8.7 | 21.9 | |
+  | mobilenet_v2_1.0_224_quant | 34.8 | 8.5 | 19.4 | |
+  | ssd_mobilenet_v1_quant | 57.8 | 14.1 | 35.0 | |
+  | mobilenet_v2_1.0_224 (float) | 49.1 | 12.6 | 28.3 | 29.5 |
+
+  x86_64 uses SSE2 only (no run-time dispatch to AVX2 yet).
+
+### RK3588 NPU (ROCK 5 ITX)
+
+| Model | On the NPU | Against the CPU | CPU ms | NPU ms |
+| --- | --- | --- | --- | --- |
+| mobilenet_v1_1.0_224_quant | 28 of 31 operators, 2 partitions | equal (0 of 1001 outputs differ) | 21.8 | 8.5 |
+| mobilenet_v2_1.0_224_quant | 63 of 65, 2 partitions | 524 of 1001 differ, by at most 3 steps; same top five on a picture | 19.0 | 10.0 |
+| ssd_mobilenet_v1_quant | 47 of 64, 12 partitions | same detections and classes; scores within 0.008, boxes within 0.007 of the picture | 34.3 | 14.7 |
+
+- Each operator alone, fed the CPU's own intermediate tensors, is within
+  one quantized step of the CPU (`rk3588_npu_backend_test --model`). The
+  hardware rounds differently in two places (negative results of layers
+  without an activation; an addition fused into a convolution adds before
+  it rounds), and single steps add up through MobileNet V2's bottlenecks.
+  `neural compare --tolerance 3` (V2) and `--float-tolerance 0.03` (SSD)
+  are what these models need.
+- What the back end takes: `CONV_2D` and `DEPTHWISE_CONV_2D`, uint8 or
+  int8 with one scale per tensor, batch 1, square kernels up to 7, strides
+  1 and 2, no dilation, at least two input channels, depth multiplier 1,
+  activations none/ReLU/ReLU6/ReLU-1..1; `ADD` when it can be fused into
+  the convolution that makes one of its operands. The rest (pooling,
+  softmax, reshapes, the detection post-processing) runs on the CPU.
+- Of MobileNet V1's 8.5 ms, 8.4 are the NPU's; converting tensors between
+  the kit's layout and the NPU's takes 75 µs.
+- Jobs that reach for memory they do not have (unmapped addresses,
+  another client's buffer) fail with `B_BAD_ADDRESS` within 50 ms, the
+  other client's buffer is untouched and the next job runs; clients killed
+  in the middle of a job, two clients at once and 1000 runs in a row
+  behave. The core's IOMMU does not deliver its fault interrupt (cause
+  unknown), so the driver looks at it every 50 ms while a job runs.
+- The clock is left at 198 MHz: the board's NPU supply cannot be read
+  from Haiku (no I2C bus driver there), so higher frequencies were not
+  tried. One core of three is used.
+
+### Vulkan (X399, GTX 1070, NVK)
+
+| Model | On the GPU | Against the CPU | CPU ms | GPU ms |
+| --- | --- | --- | --- | --- |
+| mobilenet_v2_1.0_224 (float) | 66 of 66 operators, 1 partition | agrees (relative difference 2e-6); same top five on a picture | 29.5 | 3.9 |
+| mobilenet_v1_0.25_128 (float) | 31 of 31 | agrees | 5.8 | 0.8 |
+
+- Float32 only: convolutions (also dilated, depthwise with any
+  multiplier), fully connected, pooling, `ADD`/`SUB`/`MUL`, the
+  activations, softmax, reshapes, channel concatenation, `MEAN` over
+  height and width, `PAD`, `RESIZE_BILINEAR`. Quantized models are left to
+  the CPU (or an NPU). `vulkan_backend_test`: 149 single-operator cases
+  pass.
+- 1000 runs with identical results; two sessions and two processes at
+  once; 200 sessions made and deleted without device memory growing; a
+  machine without a Vulkan loader lists the CPU only.
+- Setting a session up takes about 120 ms (pipelines, weights, and timing
+  two shader variants per convolution to keep the faster).
+- Not run on any other Vulkan driver yet (RADV on the Framework 13, Turnip,
+  V3DV, PowerVR): run `vulkan_backend_test` there first.
+
+### AMD XDNA (Framework 13, Ryzen AI 5 340)
+
+**Not run on hardware yet.** The driver (`amdxdna` add-on, linux-drm
+branch `airos-xdna`), its test program `xdna_test`, the back end
+`amdxdna.neural` and two NPU designs with known expected output (a
+pass-through and a 1x1 int8 convolution, built with mlir-aie and Peano)
+exist and build. In a virtual machine, with the driver's test mode
+standing in for the device: the add-on loads next to `amdgpu_drm`,
+buffers are made and freed without leaks, `neural devices` lists
+`amdxdna/0` without starting the NPU, the back end claims the convolution
+exactly when its design bundle is installed, and a session whose command
+the (absent) NPU refuses is finished by the CPU with the right result.
+Firmware load, the mailbox, interrupts and an actual run are untested: the
+first load on the laptop needs someone at the machine (it has no remote
+power control), following `haiku/tests/xdna/FIRST-LOAD.md` in the
+linux-drm repository.
 
 ## Open points
 
