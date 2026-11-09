@@ -1,0 +1,15 @@
+
+resource(0, "BEOS:TYPE") #'MIMS' "application/x-vnd.Be-meta-mime";
+
+resource(1, "META:TYPE") "application/x-tflite";
+
+resource(2, "META:S:DESC") #'MSDC' "TensorFlow Lite model";
+
+resource(3, "META:L:DESC") #'MLDC' "Neural network in TensorFlow Lite format";
+
+resource(4, "META:SNIFF_RULE") "0.60 [4] (\"TFL3\")";
+
+resource(5, "META:EXTENS") message(234) {
+	"extensions" = "tflite",
+	"type" = "application/x-tflite"
+};
