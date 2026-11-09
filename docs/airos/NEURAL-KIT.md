@@ -566,7 +566,7 @@ What was measured, on which machine, on 2026-11-09. "Agrees" means
   from Haiku (no I2C bus driver there), so higher frequencies were not
   tried. One core of three is used.
 
-### Vulkan (X399, GTX 1070, NVK)
+### Vulkan (X399, GTX 1070, NVK; Framework 13, Radeon 840M, RADV)
 
 | Model | On the GPU | Against the CPU | CPU ms | GPU ms |
 | --- | --- | --- | --- | --- |
@@ -584,8 +584,13 @@ What was measured, on which machine, on 2026-11-09. "Agrees" means
   machine without a Vulkan loader lists the CPU only.
 - Setting a session up takes about 120 ms (pipelines, weights, and timing
   two shader variants per convolution to keep the faster).
-- Not run on any other Vulkan driver yet (RADV on the Framework 13, Turnip,
-  V3DV, PowerVR): run `vulkan_backend_test` there first.
+- **RADV** (Framework 13, Radeon 840M of the Ryzen AI 5 340, Mesa 25.3.6):
+  `vulkan_backend_test` passes all 149 cases; MobileNet V2 float runs 66
+  of 66 operators on the GPU, agrees with the CPU (relative difference
+  2e-6, same top classes on a picture) and takes 8.9 ms against 15.1 ms
+  on the twelve CPU threads.
+- Not run on Turnip, V3DV or PowerVR yet: run `vulkan_backend_test` there
+  first.
 
 ### AMD XDNA (Framework 13, Ryzen AI 5 340)
 
