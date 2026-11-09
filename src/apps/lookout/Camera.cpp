@@ -6,6 +6,8 @@
 
 #include "Camera.h"
 
+#include <algorithm>
+#include <math.h>
 #include <new>
 #include <stdio.h>
 #include <string.h>
@@ -318,7 +320,11 @@ Camera::Camera(Engine* engine)
 	fConsumer(NULL),
 	fProducer(media_node::null),
 	fConnected(false),
-	fState(CAMERA_OFF)
+	fState(CAMERA_OFF),
+	fTestPicture(NULL),
+	fTestThread(-1),
+	fTestRunning(0),
+	fTestSource(0)
 {
 	PostMessage(kMsgInit);
 }
@@ -334,6 +340,7 @@ Camera::~Camera()
 
 	fDisplaySlot.Take();
 	fPool->ReleaseReference();
+	delete fTestPicture;
 }
 
 
@@ -341,6 +348,14 @@ void
 Camera::SetTarget(const BMessenger& target)
 {
 	fTarget = target;
+}
+
+
+void
+Camera::SetTestPicture(BBitmap* picture)
+{
+	delete fTestPicture;
+	fTestPicture = picture;
 }
 
 
@@ -463,6 +478,18 @@ Camera::_Apply(bool retry)
 		_Disconnect();
 		if (fState != CAMERA_OFF)
 			_SendState(CAMERA_OFF);
+		return;
+	}
+
+	if (fTestPicture != NULL) {
+		// no camera, but something that behaves like one
+		if (fTestThread >= 0)
+			atomic_set(&fTestSource, source);
+		else if (_StartTest(source) != B_OK) {
+			_SendState(CAMERA_FAILED, strerror(B_NO_MEMORY));
+			return;
+		}
+		_SendState(CAMERA_RUNNING);
 		return;
 	}
 
@@ -642,6 +669,8 @@ Camera::_Connect(const BString& name, int32 source, BString& _error)
 void
 Camera::_Disconnect()
 {
+	_StopTest();
+
 	if (fRoster == NULL)
 		return;
 
@@ -725,7 +754,14 @@ Camera::_SendState(camera_state state, const char* error)
 	message.AddInt32("state", state);
 	if (error != NULL)
 		message.AddString("error", error);
-	if (state == CAMERA_RUNNING) {
+	if (state == CAMERA_RUNNING && fTestPicture != NULL) {
+		BRect bounds = fTestPicture->Bounds();
+		message.AddString("name", "Test source");
+		message.AddInt32("width",
+			std::min((int32)kWidth, bounds.IntegerWidth() + 1));
+		message.AddInt32("height",
+			std::min((int32)kHeight, bounds.IntegerHeight() + 1));
+	} else if (state == CAMERA_RUNNING) {
 		live_node_info info;
 		if (fRoster->GetLiveNodeInfo(fProducer, &info) == B_OK)
 			message.AddString("name", info.name);
@@ -734,6 +770,89 @@ Camera::_SendState(camera_state state, const char* error)
 		message.AddInt32("height", format.display.line_count);
 	}
 	fTarget.SendMessage(&message, (BHandler*)NULL, 1000000);
+}
+
+
+status_t
+Camera::_StartTest(int32 source)
+{
+	atomic_set(&fTestSource, source);
+	atomic_set(&fTestRunning, 1);
+	atomic_set(&fFrames, 0);
+	fTestThread = spawn_thread(&_TestEntry, "test source",
+		B_NORMAL_PRIORITY, this);
+	if (fTestThread < 0) {
+		status_t status = fTestThread;
+		fTestThread = -1;
+		return status;
+	}
+	resume_thread(fTestThread);
+	return B_OK;
+}
+
+
+void
+Camera::_StopTest()
+{
+	if (fTestThread < 0)
+		return;
+
+	atomic_set(&fTestRunning, 0);
+	status_t result;
+	while (wait_for_thread(fTestThread, &result) == B_INTERRUPTED)
+		;
+	fTestThread = -1;
+	fDisplaySlot.Take();
+}
+
+
+/*static*/ status_t
+Camera::_TestEntry(void* data)
+{
+	((Camera*)data)->_TestLoop();
+	return B_OK;
+}
+
+
+/*!	Plays camera: cuts a frame out of the test picture thirty times per
+	second, a little further along each time, and hands it on the way the
+	consumer node hands on a buffer. */
+void
+Camera::_TestLoop()
+{
+	BRect bounds = fTestPicture->Bounds();
+	int32 pictureWidth = bounds.IntegerWidth() + 1;
+	int32 pictureHeight = bounds.IntegerHeight() + 1;
+	int32 width = std::min((int32)kWidth, pictureWidth);
+	int32 height = std::min((int32)kHeight, pictureHeight);
+
+	bigtime_t next = system_time();
+	for (int32 count = 0; atomic_get(&fTestRunning) != 0; count++) {
+		Snapshot* frame = fPool->GetFrame(width, height,
+			atomic_get(&fTestSource));
+		if (frame != NULL) {
+			float time = count / 30.0f;
+			int32 left = (int32)((pictureWidth - width)
+				* (0.5f + 0.5f * sinf(time * 0.6f)));
+			int32 top = (int32)((pictureHeight - height)
+				* (0.5f + 0.5f * cosf(time * 0.43f)));
+
+			const uint8* source = (const uint8*)fTestPicture->Bits()
+				+ top * fTestPicture->BytesPerRow() + left * 4;
+			uint8* target = (uint8*)frame->Bitmap()->Bits();
+			for (int32 y = 0; y < height; y++) {
+				memcpy(target, source, width * 4);
+				source += fTestPicture->BytesPerRow();
+				target += frame->Bitmap()->BytesPerRow();
+			}
+
+			_FrameReceived(frame);
+			frame->ReleaseReference();
+		}
+
+		next += 1000000 / 30;
+		snooze_until(next, B_SYSTEM_TIMEBASE);
+	}
 }
 
 

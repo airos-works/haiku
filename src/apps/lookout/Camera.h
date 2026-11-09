@@ -59,6 +59,11 @@ public:
 
 	//! Who gets the messages above; before Run().
 			void				SetTarget(const BMessenger& target);
+	/*!	For trying the program where there is no camera: the "camera" is
+		then a window that wanders over this picture (B_RGB32, which the
+		camera takes over), thirty frames per second, handed on exactly as
+		a video input's frames are. Before Run(). */
+			void				SetTestPicture(BBitmap* picture);
 
 	// from any thread
 	/*!	Starts the input of that name, or the system's default one for an
@@ -86,6 +91,10 @@ private:
 									BString& _error);
 			status_t			_FindProducer(const BString& name);
 			void				_Disconnect();
+			status_t			_StartTest(int32 source);
+			void				_StopTest();
+	static	status_t			_TestEntry(void* data);
+			void				_TestLoop();
 			bool				_UpdateInputs();
 			void				_SendState(camera_state state,
 									const char* error = NULL);
@@ -118,6 +127,12 @@ private:
 			bool				fConnected;
 			BString				fName;
 			camera_state		fState;
+
+	// the stand-in for a camera
+			BBitmap*			fTestPicture;
+			thread_id			fTestThread;
+			int32				fTestRunning;
+			int32				fTestSource;
 };
 
 
