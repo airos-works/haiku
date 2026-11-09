@@ -21,7 +21,7 @@ enum neural_image_fit {
 	B_NEURAL_FIT_STRETCH = 0,
 	//! scaled to cover the tensor; what sticks out is cut off evenly
 	B_NEURAL_FIT_CROP,
-	//! scaled to fit inside the tensor; the rest is left at zero ("gray")
+	//! scaled to fit inside the tensor; the rest is filled with gray
 	B_NEURAL_FIT_LETTERBOX
 };
 

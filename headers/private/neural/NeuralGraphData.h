@@ -62,6 +62,10 @@ public:
 			status_t			Finish();
 			bool				IsFinished() const { return fFinished; }
 
+	//! A note on what is wrong with the model, for developers.
+			void				SetError(const char* format, ...);
+			const char*			Error() const { return fError; }
+
 	// reading it
 
 			const char*			Name() const { return fName; }
@@ -112,6 +116,7 @@ private:
 			char*				fDescription;
 			char*				fFormat;
 			int32				fFormatVersion;
+			char				fError[160];
 
 			neural_graph_tensor* fTensors;
 			int32				fTensorCount;

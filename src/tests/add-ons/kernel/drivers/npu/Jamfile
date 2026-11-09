@@ -1,0 +1,7 @@
+SubDir HAIKU_TOP src tests add-ons kernel drivers npu ;
+
+SubDirHdrs $(HAIKU_TOP) src add-ons kernel drivers npu rk3588_npu ;
+
+if $(TARGET_ARCH) = arm64 {
+	SimpleTest rk3588_npu_test : rk3588_npu_test.cpp ;
+}

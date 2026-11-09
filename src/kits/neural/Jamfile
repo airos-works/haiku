@@ -1,0 +1,33 @@
+SubDir HAIKU_TOP src kits neural ;
+
+UsePrivateHeaders neural shared storage ;
+
+# The kernels are loops over numbers; they are written for the
+# vectorizer, which -O2 holds back.
+SubDirC++Flags -O3 ;
+
+# one file per family of operators
+local kernelSources = [ GLOB [ FDirName $(SUBDIR) ops ] : *.cpp ] ;
+kernelSources = $(kernelSources:BS) ;
+
+local architectureObject ;
+for architectureObject in [ MultiArchSubDirSetup ] {
+	on $(architectureObject) {
+		SEARCH_SOURCE += [ FDirName $(SUBDIR) ops ] ;
+
+		SharedLibrary [ MultiArchDefaultGristFiles libneural.so ] :
+			GraphData.cpp
+			Interpreter.cpp
+			NeuralModel.cpp
+			NeuralRoster.cpp
+			NeuralSession.cpp
+			NeuralUtils.cpp
+			Tensor.cpp
+			TFLiteLoader.cpp
+
+			$(kernelSources)
+			:
+			be [ TargetLibstdc++ ]
+			;
+	}
+}

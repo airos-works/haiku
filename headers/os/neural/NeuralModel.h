@@ -14,8 +14,12 @@ class BDataIO;
 class BMessage;
 struct entry_ref;
 
+class BNeuralDevice;
+class BNeuralRoster;
+
 namespace BPrivate {
 	class NeuralGraphData;
+	class NeuralSessionData;
 }
 
 
@@ -48,6 +52,10 @@ public:
 			status_t			SetTo(const void* buffer, size_t size);
 			void				Unset();
 			status_t			InitCheck() const;
+	/*!	More about why the model could not be read, for developers:
+		"operator 126 is not supported". Empty when there is nothing to
+		say. */
+			const char*			ErrorDetails() const;
 
 	//! The name the model gives itself, or the name of its file.
 			const char*			Name() const;
@@ -79,13 +87,17 @@ public:
 	static	bool				IsModel(const entry_ref* ref);
 
 private:
-	friend class BNeuralSession;
+	friend class BNeuralDevice;
 	friend class BNeuralModelBuilder;
+	friend class BNeuralRoster;
+	friend class BPrivate::NeuralSessionData;
 
-			status_t			_SetGraph(BPrivate::NeuralGraphData* graph);
+			status_t			_SetTo(void* buffer, size_t size,
+									bool mapped, const char* fileName);
 
 			BPrivate::NeuralGraphData* fGraph;
 			status_t			fStatus;
+			BString				fError;
 			uint32				_reserved[6];
 };
 

@@ -6,6 +6,8 @@
 
 #include <NeuralGraphData.h>
 
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -51,6 +53,7 @@ NeuralGraphData::NeuralGraphData()
 	fBuffers(NULL),
 	fPublic(this)
 {
+	fError[0] = '\0';
 }
 
 
@@ -356,6 +359,16 @@ NeuralGraphData::Finish()
 	if (status == B_OK)
 		fFinished = true;
 	return status;
+}
+
+
+void
+NeuralGraphData::SetError(const char* format, ...)
+{
+	va_list args;
+	va_start(args, format);
+	vsnprintf(fError, sizeof(fError), format, args);
+	va_end(args);
 }
 
 

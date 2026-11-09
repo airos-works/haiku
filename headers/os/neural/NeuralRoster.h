@@ -13,6 +13,10 @@
 class BMessage;
 class BNeuralModel;
 
+namespace BPrivate {
+	class NeuralRosterData;
+}
+
 
 /*!	One processor that can run networks: an NPU, a graphics card, or the
 	CPU. Devices are values: they name a device, and stay valid (but stop
@@ -57,8 +61,7 @@ public:
 									const BNeuralModel& model) const;
 
 private:
-	friend class BNeuralRoster;
-	friend class BNeuralSession;
+	friend class BPrivate::NeuralRosterData;
 
 			BString				fID;
 			BString				fName;

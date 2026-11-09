@@ -1079,6 +1079,8 @@ Loader::_LoadOperator(uint32 op)
 			const char* name = fReader.String(fReader.Offset(code, 1));
 			if (name == NULL
 				|| strcmp(name, "TFLite_Detection_PostProcess") != 0) {
+				fGraph->SetError("custom operator \"%s\" is not supported",
+					name != NULL ? name : "");
 				return B_NEURAL_UNSUPPORTED_OPERATOR;
 			}
 
@@ -1123,11 +1125,16 @@ Loader::_LoadOperator(uint32 op)
 		}
 
 		default:
+			fGraph->SetError("TensorFlow Lite operator %d is not supported",
+				(int)builtin);
 			return B_NEURAL_UNSUPPORTED_OPERATOR;
 	}
 
-	if (status != B_OK)
+	if (status != B_OK) {
+		fGraph->SetError("an option of TensorFlow Lite operator %d is not "
+			"supported", (int)builtin);
 		return status;
+	}
 	if (fReader.IsBad())
 		return B_NEURAL_BAD_MODEL;
 

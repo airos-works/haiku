@@ -1,0 +1,8 @@
+SubDir HAIKU_TOP src add-ons neural ;
+
+# Neural Kit back ends, one per kind of hardware. They are named
+# <name>.neural, <name> being what BNeuralBackend::Name() returns.
+
+if $(TARGET_ARCH) = arm64 {
+	SubInclude HAIKU_TOP src add-ons neural rk3588_npu ;
+}

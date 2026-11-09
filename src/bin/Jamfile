@@ -295,3 +295,4 @@ SubInclude HAIKU_TOP src bin debug ;
 
 # Network command line tools
 SubInclude HAIKU_TOP src bin network ;
+SubInclude HAIKU_TOP src bin neural ;
