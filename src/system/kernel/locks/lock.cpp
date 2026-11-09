@@ -12,11 +12,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <cpu.h>
 #include <debug.h>
 #include <interrupts.h>
 #include <kernel.h>
 #include <listeners.h>
 #include <scheduling_analysis.h>
+#include <smp.h>
 #include <thread.h>
 #include <util/AutoLock.h>
 
@@ -25,6 +27,7 @@ struct mutex_waiter {
 	Thread*			thread;
 	mutex_waiter*	next;		// next in queue
 	mutex_waiter*	last;		// last in queue (valid for the first in queue)
+	bool			competes;	// woken without the mutex, takes it if free
 };
 
 struct rw_lock_waiter {
@@ -1002,6 +1005,38 @@ mutex_switch_from_read_lock(rw_lock* from, mutex* to)
 }
 
 
+/*!	Whether the mutex is free: a hint without its spinlock, exact with it. */
+static inline bool
+mutex_is_free(mutex* lock)
+{
+#if KDEBUG
+	thread_id holder = *(volatile thread_id*)&lock->holder;
+	return holder == 0 || holder == -1;
+#else
+	return (*(volatile uint8*)&lock->flags & MUTEX_FLAG_RELEASED) != 0;
+#endif
+}
+
+
+/*!	Takes the mutex if it is free. The mutex's spinlock must be held. */
+static inline bool
+mutex_take_if_free(mutex* lock)
+{
+#if KDEBUG
+	if (lock->holder == 0 || lock->holder == -1) {
+		lock->holder = thread_get_current_thread_id();
+		return true;
+	}
+#else
+	if ((lock->flags & MUTEX_FLAG_RELEASED) != 0) {
+		lock->flags &= ~MUTEX_FLAG_RELEASED;
+		return true;
+	}
+#endif
+	return false;
+}
+
+
 KDEBUG_STATIC status_t
 _mutex_lock(mutex* lock, void* _locker)
 {
@@ -1011,6 +1046,30 @@ _mutex_lock(mutex* lock, void* _locker)
 			lock);
 	}
 #endif
+
+	// Spin briefly before blocking. A mutex used to be handed to its first
+	// blocked waiter on unlock, and stayed unusable until that thread was
+	// scheduled, so short critical sections contended by several CPUs became a
+	// convoy (the translation map lock in concurrent page faults of one team:
+	// four threads faulting their own areas took 30 times as long as one).
+	// Now an unlock leaves the mutex free and wakes the first waiter, which
+	// competes for it with running threads; a spinning thread mostly gets it
+	// without blocking. Only on SMP, and only from a context that may block.
+	if (_locker == NULL && !gKernelStartup && smp_get_num_cpus() > 1
+		&& are_interrupts_enabled()) {
+		static const bigtime_t kMaxSpinTime = 5;
+		bigtime_t spinStart = 0;
+		for (uint32 i = 0; !mutex_is_free(lock); i++) {
+			if ((i & 63) == 0) {
+				bigtime_t now = system_time();
+				if (spinStart == 0)
+					spinStart = now;
+				else if (now - spinStart > kMaxSpinTime)
+					break;
+			}
+			cpu_pause();
+		}
+	}
 
 	// lock only, if !lockLocked
 	InterruptsSpinLocker* locker
@@ -1025,26 +1084,21 @@ _mutex_lock(mutex* lock, void* _locker)
 	// Might have been released after we decremented the count, but before
 	// we acquired the spinlock.
 #if KDEBUG
-	if (lock->holder == 0 || lock->holder == -1) {
-		lock->holder = thread_get_current_thread_id();
-		return B_OK;
-	} else if (lock->holder == thread_get_current_thread_id()) {
+	if (lock->holder == thread_get_current_thread_id()) {
 		panic("_mutex_lock(): double lock of %p by thread %" B_PRId32, lock,
 			lock->holder);
 	} else if (lock->holder < -1) {
 		panic("_mutex_lock(): using uninitialized lock %p", lock);
 	}
-#else
-	if ((lock->flags & MUTEX_FLAG_RELEASED) != 0) {
-		lock->flags &= ~MUTEX_FLAG_RELEASED;
-		return B_OK;
-	}
 #endif
+	if (mutex_take_if_free(lock))
+		return B_OK;
 
 	// enqueue in waiter list
 	mutex_waiter waiter;
 	waiter.thread = thread_get_current_thread();
 	waiter.next = NULL;
+	waiter.competes = true;
 
 	if (lock->waiters != NULL) {
 		lock->waiters->last->next = &waiter;
@@ -1053,20 +1107,48 @@ _mutex_lock(mutex* lock, void* _locker)
 
 	lock->waiters->last = &waiter;
 
-	// block
-	thread_prepare_to_block(waiter.thread, 0, THREAD_BLOCK_TYPE_MUTEX, lock);
-	locker->Unlock();
+	int32 lostRaces = 0;
+	while (true) {
+		// block
+		thread_prepare_to_block(waiter.thread, 0, THREAD_BLOCK_TYPE_MUTEX,
+			lock);
+		locker->Unlock();
 
-	status_t error = thread_block();
+		status_t error = thread_block();
+		if (error != B_OK) {
+			// This should only happen when the mutex was destroyed.
+			ASSERT(waiter.thread == NULL);
+			return error;
+		}
+
 #if KDEBUG
-	if (error == B_OK) {
-		ASSERT(lock->holder == waiter.thread->id);
-	} else {
-		// This should only happen when the mutex was destroyed.
-		ASSERT(waiter.thread == NULL);
-	}
+		if (!waiter.competes) {
+			// Handed over (after losing too many races, below).
+			ASSERT(lock->holder == waiter.thread->id);
+			return B_OK;
+		}
+#else
+		if (!waiter.competes)
+			return B_OK;
 #endif
-	return error;
+
+		// The unlock dequeued us and left the mutex free; another thread may
+		// have taken it since. Then wait again, first in line, and after a
+		// few lost races be handed the mutex like before, so that a thread
+		// relocking in a loop cannot starve us.
+		locker->Lock();
+		if (mutex_take_if_free(lock)) {
+			locker->Unlock();
+			return B_OK;
+		}
+
+		static const int32 kMaxLostRaces = 3;
+		if (++lostRaces >= kMaxLostRaces)
+			waiter.competes = false;
+		waiter.next = lock->waiters;
+		waiter.last = lock->waiters != NULL ? lock->waiters->last : &waiter;
+		lock->waiters = &waiter;
+	}
 }
 
 
@@ -1091,13 +1173,23 @@ _mutex_unlock(mutex* lock)
 		if (lock->waiters != NULL)
 			lock->waiters->last = waiter->last;
 
+		if (waiter->competes) {
+			// It takes the mutex if nobody else did by the time it runs.
 #if KDEBUG
-		// Already set the holder to the unblocked thread. Besides that this
-		// actually reflects the current situation, setting it to -1 would
-		// cause a race condition, since another locker could think the lock
-		// is not held by anyone.
-		lock->holder = waiter->thread->id;
+			lock->holder = -1;
+#else
+			lock->flags |= MUTEX_FLAG_RELEASED;
 #endif
+		} else {
+#if KDEBUG
+			// Hand it over (mutex_lock_with_timeout()): already set the holder
+			// to the unblocked thread. Besides that this actually reflects the
+			// current situation, setting it to -1 would cause a race
+			// condition, since another locker could think the lock is not
+			// held by anyone.
+			lock->holder = waiter->thread->id;
+#endif
+		}
 
 		// unblock thread
 		thread_unblock(waiter->thread, B_OK);
@@ -1147,6 +1239,8 @@ _mutex_lock_with_timeout(mutex* lock, uint32 timeoutFlags, bigtime_t timeout)
 	mutex_waiter waiter;
 	waiter.thread = thread_get_current_thread();
 	waiter.next = NULL;
+	waiter.competes = false;
+		// handed the mutex: a timed wait does not compete again
 
 	if (lock->waiters != NULL) {
 		lock->waiters->last->next = &waiter;
