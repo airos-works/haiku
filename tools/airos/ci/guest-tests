@@ -22,3 +22,7 @@ pipe_fd_table_full_test
 # vfork() + exec while other threads allocate: a child forked while another
 # thread held a heap lock never got it (net_server's service launch hung)
 vfork_malloc_test
+# the Neural Kit without hardware: tensors, models from the builder, the CPU
+# kernels behind them, a session shared between a device and the CPU, the
+# CPU taking over from a device that fails or goes away
+neural_kit_test
