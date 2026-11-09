@@ -138,6 +138,26 @@ while it works), instead of bouncing with its noisy load measurement.
 
 Throughput unchanged on all three; CPU off/on cycles pass.
 
+## arm64 idle power-down (master dfd3a6529d, 2026-11-09)
+
+The ROCK 5's clocks stay fixed (see below), so its idle cores now power
+down instead: PSCI CPU_SUSPEND with the device tree's power-down state
+(RK3588: 0x10000, `local-timer-stop`), resumed through an identity-mapped
+trampoline. A core powers down only with no timer due on it and after long
+idle periods; CPU 0 (device interrupts) stays in WFI. `schedperf
+idlestats` shows per-CPU counts and time, `schedperf powerdown on|off`
+compares, `cpu_power_down` in the kernel settings switches it at boot (on
+by default only on the RK3588).
+
+| ROCK 5, idle desktop, 60 s | low latency | power saving |
+| --- | --- | --- |
+| time the 7 non-boot cores were powered down | 43 % (the 3 idle A55s: 100 %) | 71 % |
+| wake-up latency median, power-down on / off | 4 / 4 us | 7 / 4 us |
+
+Suite, CPU off/on cycles and a 10 minute soak of mixed load (about 1270
+power-downs, none refused) pass; throughput unchanged. Not measured in
+watts: nothing meters the board.
+
 ## Open
 
 - The ROCK 5 has no DVFS at all: the A76 and A55 clusters stay at the
@@ -146,6 +166,10 @@ Throughput unchanged on all three; CPU off/on cycles pass.
   and RK806 (SPI) regulators; clocks alone save next to nothing, as idle
   cores are clock-gated anyway. Left open by the owner's decision
   (2026-11-09) until it can be measured: nothing meters the board's power.
+  Idle cores do power down now (above).
+- Idle power-down only while no timer is due: a broadcast timer (CPU 0
+  waking the others) would let the big cores, which usually have one,
+  power down too.
 - arm64 cannot route interrupts to other CPUs (`arch_int_assign_to_cpu()`).
 - 2026-11-08 ~09:00 UTC the Framework 13 panicked ("core != NULL" in
   power_saving.cpp choose_core) going to sleep while schedperf had a thread
