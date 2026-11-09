@@ -84,26 +84,7 @@ struct Options {
 static const char*
 error_name(status_t status)
 {
-	switch (status) {
-		case B_NEURAL_BAD_MODEL:
-			return "the file is not a model or is damaged";
-		case B_NEURAL_UNKNOWN_FORMAT:
-			return "unknown model format";
-		case B_NEURAL_UNSUPPORTED_OPERATOR:
-			return "the model has an operator that is not supported";
-		case B_NEURAL_TYPE_MISMATCH:
-			return "wrong tensor type";
-		case B_NEURAL_SHAPE_MISMATCH:
-			return "wrong tensor shape";
-		case B_NEURAL_NO_DEVICE:
-			return "no such device";
-		case B_NEURAL_DEVICE_LOST:
-			return "the device is gone";
-		case B_NEURAL_NOT_ACCELERATED:
-			return "the device cannot run all of the model";
-		default:
-			return strerror(status);
-	}
+	return neural_error_string(status);
 }
 
 
@@ -346,18 +327,6 @@ fill_inputs(const Options& options, BNeuralSession& session,
 }
 
 
-static bool
-is_detection(const BNeuralSession& session)
-{
-	if (session.CountOutputs() != 4)
-		return false;
-	const BTensor* boxes = session.OutputAt(0);
-	return boxes->Rank() == 3 && boxes->DimensionAt(2) == 4
-		&& boxes->Type() == B_NEURAL_FLOAT32
-		&& session.OutputAt(3)->CountElements() == 1;
-}
-
-
 static void
 print_results(const Options& options, const BNeuralSession& session,
 	const neural_image_mapping& mapping, bool isImage)
@@ -369,33 +338,26 @@ print_results(const Options& options, const BNeuralSession& session,
 			options.labels);
 	}
 
-	if (is_detection(session)) {
-		const float* boxes = (const float*)session.OutputAt(0)->Data();
-		const BTensor* classes = session.OutputAt(1);
-		const BTensor* scores = session.OutputAt(2);
-		int32 count = (int32)session.OutputAt(3)->ValueAt(0);
-		if (count > classes->CountElements())
-			count = classes->CountElements();
+	if (BNeuralUtils::IsDetector(session)) {
+		neural_detection detections[256];
+		int32 count = BNeuralUtils::GetDetections(session, detections, 256);
 
 		printf("%" B_PRId32 " detections:\n", count);
 		for (int32 i = 0; i < count; i++) {
-			int32 index = (int32)classes->ValueAt(i);
-			// label files of detection models start with a "???" line for
-			// the background class
-			BString label = labels.StringAt(index + 1);
+			const neural_detection& found = detections[i];
+			BString label = labels.StringAt(found.class_index + 1);
 			if (label.IsEmpty())
-				label.SetToFormat("class %" B_PRId32, index);
+				label.SetToFormat("class %" B_PRId32, found.class_index);
 
-			const float* box = boxes + 4 * i;
-			printf("  %5.1f%% %-20s", scores->ValueAt(i) * 100,
-				label.String());
+			printf("  %5.1f%% %-20s", found.score * 100, label.String());
 			if (isImage) {
-				BRect rect = mapping.ToBitmap(box[1], box[0], box[3], box[2]);
+				BRect rect = mapping.ToBitmap(found.left, found.top,
+					found.right, found.bottom);
 				printf(" at (%.0f, %.0f) - (%.0f, %.0f)\n", rect.left,
 					rect.top, rect.right, rect.bottom);
 			} else {
-				printf(" at (%.3f, %.3f) - (%.3f, %.3f)\n", box[1], box[0],
-					box[3], box[2]);
+				printf(" at (%.3f, %.3f) - (%.3f, %.3f)\n", found.left,
+					found.top, found.right, found.bottom);
 			}
 		}
 		return;

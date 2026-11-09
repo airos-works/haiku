@@ -20,6 +20,8 @@
 #include <Screen.h>
 #include <StringList.h>
 
+#include <neural/NeuralSession.h>
+
 
 neural_image_options::neural_image_options()
 	:
@@ -526,4 +528,56 @@ BNeuralUtils::GetTopValues(const BTensor& tensor, int32 count, int64* indices,
 		memcpy(values, best, found * sizeof(float));
 	free(best);
 	return found;
+}
+
+
+/*static*/ bool
+BNeuralUtils::IsDetector(const BNeuralSession& session)
+{
+	if (session.InitCheck() != B_OK || session.CountOutputs() != 4)
+		return false;
+
+	const BTensor* boxes = session.OutputAt(0);
+	const BTensor* classes = session.OutputAt(1);
+	const BTensor* scores = session.OutputAt(2);
+	const BTensor* count = session.OutputAt(3);
+	return boxes->Type() == B_NEURAL_FLOAT32 && boxes->Rank() == 3
+		&& boxes->DimensionAt(2) == 4
+		&& classes->Type() == B_NEURAL_FLOAT32
+		&& scores->Type() == B_NEURAL_FLOAT32
+		&& classes->CountElements() == boxes->DimensionAt(1)
+		&& scores->CountElements() == boxes->DimensionAt(1)
+		&& count->Type() == B_NEURAL_FLOAT32 && count->CountElements() == 1;
+}
+
+
+/*static*/ int32
+BNeuralUtils::GetDetections(const BNeuralSession& session,
+	neural_detection* detections, int32 maxCount)
+{
+	if (!IsDetector(session))
+		return B_BAD_TYPE;
+	if (detections == NULL || maxCount < 0)
+		return B_BAD_VALUE;
+
+	const float* boxes = (const float*)session.OutputAt(0)->Data();
+	const float* classes = (const float*)session.OutputAt(1)->Data();
+	const float* scores = (const float*)session.OutputAt(2)->Data();
+	float found = *(const float*)session.OutputAt(3)->Data();
+
+	int64 available = session.OutputAt(1)->CountElements();
+	int32 count = found > 0 ? (int32)fminf(found, (float)available) : 0;
+	if (count > maxCount)
+		count = maxCount;
+
+	// boxes are top, left, bottom, right
+	for (int32 i = 0; i < count; i++) {
+		detections[i].top = boxes[i * 4];
+		detections[i].left = boxes[i * 4 + 1];
+		detections[i].bottom = boxes[i * 4 + 2];
+		detections[i].right = boxes[i * 4 + 3];
+		detections[i].class_index = (int32)classes[i];
+		detections[i].score = scores[i];
+	}
+	return count;
 }

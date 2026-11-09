@@ -16,6 +16,7 @@
 
 #include <math.h>
 #include <new>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,6 +50,11 @@ static int32 sRunsUntilLost = -1;
 	// < 0: the device stays
 static int32 sRunsToFail;
 	// runs of a program that fail though the device stays
+static bigtime_t sRunDelay;
+	// how long a run of a program takes at least
+static int32 sRunsInFlight;
+static bool sDeletedInFlight;
+	// a program was deleted while it ran
 static int32 sProgramsMade;
 static int32 sProgramsDeleted;
 
@@ -98,6 +104,8 @@ public:
 	virtual ~TestProgram()
 	{
 		atomic_add(&sProgramsDeleted, 1);
+		if (atomic_get(&sRunsInFlight) > 0)
+			sDeletedInFlight = true;
 		if (fScratch != NULL) {
 			for (int32 i = 0; i < fGraph.CountTensors(); i++)
 				free(fScratch[i]);
@@ -113,6 +121,11 @@ public:
 		if (sRunsToFail > 0) {
 			sRunsToFail--;
 			return B_IO_ERROR;
+		}
+		if (sRunDelay > 0) {
+			atomic_add(&sRunsInFlight, 1);
+			snooze(sRunDelay);
+			atomic_add(&sRunsInFlight, -1);
 		}
 		if (sRunsUntilLost == 0)
 			return B_NEURAL_DEVICE_LOST;
@@ -444,6 +457,20 @@ public:
 
 
 static void
+ignore_signal(int)
+{
+}
+
+
+static status_t
+delete_session(void* data)
+{
+	delete (BNeuralSession*)data;
+	return B_OK;
+}
+
+
+static void
 test_sessions(Receiver* receiver)
 {
 	BNeuralModel model;
@@ -576,6 +603,38 @@ test_sessions(Receiver* receiver)
 			"session: the CPU has taken over for good");
 		sRunsUntilLost = -1;
 		check(run_and_check(session), "session: and stays there");
+	}
+
+	// A session deleted while it runs waits for the run, also when the
+	// wait is interrupted (as it is on the thread of a looper that is
+	// being quit): the network must not run on freed tensors.
+	{
+		struct sigaction action;
+		memset(&action, 0, sizeof(action));
+		action.sa_handler = &ignore_signal;
+		sigaction(SIGUSR1, &action, NULL);
+
+		BNeuralSession* session = new BNeuralSession(model, device);
+		session->InputAt(0)->CopyFrom(kInput, sizeof(kInput));
+		sRunDelay = 300000;
+		bool started = session->RunAsync(BMessenger(receiver)) == B_OK;
+		snooze(50000);
+
+		thread_id deleter = spawn_thread(&delete_session, "deleter",
+			B_NORMAL_PRIORITY, session);
+		resume_thread(deleter);
+		snooze(50000);
+		send_signal(deleter, SIGUSR1);
+		snooze(20000);
+		send_signal(deleter, SIGUSR1);
+
+		status_t result;
+		while (wait_for_thread(deleter, &result) == B_INTERRUPTED)
+			;
+		sRunDelay = 0;
+		check(started && !sDeletedInFlight, "session: deleting waits for "
+			"the run even when the wait is interrupted");
+		acquire_sem_etc(receiver->fDone, 1, B_RELATIVE_TIMEOUT, 5000000);
 	}
 
 	// a device that fails now and then, and one that keeps failing

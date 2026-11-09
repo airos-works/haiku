@@ -250,9 +250,11 @@ void MyWindow::MessageReceived(BMessage* message)
 ```
 
 `RunAsync()` takes a message of the caller's instead of
-`B_NEURAL_RUN_COMPLETED` if wanted (the three `neural:` fields are added to
-it) and returns a token that comes back in `"neural:token"`.
-`WaitForRun(timeout)` waits for such a run.
+`B_NEURAL_RUN_COMPLETED` if wanted (the `neural:` fields are added to it)
+and returns a token that comes back in `"neural:token"`;
+`"neural:session"` is a pointer to the session, for a handler that has
+several. `WaitForRun(timeout)` waits for such a run. Deleting a session
+waits for its run to end: a run cannot be cancelled yet.
 
 `GetRunInfo()` says how the model was split (operators on the device, on the
 CPU, number of device partitions) and how long runs take;
@@ -278,12 +280,24 @@ BRect inBitmap = mapping.ToBitmap(left, top, right, bottom);
 spaces into an image tensor (uint8, int8 or float; one or three channels),
 stretched, cropped or letterboxed; `GetBitmapFromTensor()` goes the other
 way; `GetLabels()` reads the label files models come with;
-`GetTopValues()` picks the best classes.
+`GetTopValues()` picks the best classes of a classifier, and
+`IsDetector()` / `GetDetections()` read what a detector found:
+
+```cpp
+neural_detection found[32];
+int32 count = BNeuralUtils::GetDetections(session, found, 32);
+for (int32 i = 0; i < count; i++) {
+	BRect box = mapping.ToBitmap(found[i].left, found[i].top,
+		found[i].right, found[i].bottom);
+	// labels.StringAt(found[i].class_index + 1), found[i].score
+}
+```
 
 ### Errors
 
 Besides the usual ones (`B_NO_INIT`, `B_BAD_VALUE`, `B_NO_MEMORY`,
-`B_BUSY`, file errors):
+`B_BUSY`, file errors; `neural_error_string()` puts any of them in
+words):
 
 | Error | When |
 | --- | --- |
@@ -478,8 +492,16 @@ exactly the operators a bundle covers, and nothing without one.
 - **`neural compare`** on a machine: a device against the CPU.
 - **`rk3588_npu_test`** (`src/tests/add-ons/kernel/drivers/npu`): the
   driver alone: power, buffers, refused command lists.
-- **`src/tests/kits/neural`:** the kit's own classes, and per-back-end
-  tests that run single operators on a device and the CPU.
+- **`src/tests/kits/neural`:** `neural_kit_test`, the kit's own classes
+  with a back end inside the test (also run by CI in every image's smoke
+  test), and per-back-end tests that run single operators on a device and
+  the CPU (`rk3588_npu_backend_test`, `vulkan_backend_test`,
+  `amdxdna_backend_test`).
+- **Lookout** (`src/apps/lookout`, in the Demos menu): a picture or the
+  camera, with what a detection or classification model finds in it; the
+  kit as an application uses it (`RunAsync()` to a window, the roster's
+  device messages, bitmaps). `tools/airos/neural/fetch-models.sh` fetches
+  the public test models it and the tests use.
 
 ## Status
 

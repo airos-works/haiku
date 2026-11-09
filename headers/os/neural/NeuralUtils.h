@@ -11,6 +11,7 @@
 #include <neural/Tensor.h>
 
 class BBitmap;
+class BNeuralSession;
 class BStringList;
 struct entry_ref;
 
@@ -59,6 +60,23 @@ struct neural_image_mapping {
 };
 
 
+//! One thing a detection model found.
+struct neural_detection {
+	/*!	Where, in fractions of the model's input picture (0 .. 1); see
+		neural_image_mapping::ToBitmap(). */
+	float				left;
+	float				top;
+	float				right;
+	float				bottom;
+	/*!	What: the number of the class. The label files that come with
+		detection models have a line for "nothing" first, so this is the
+		index into the labels less one. */
+	int32				class_index;
+	//! How sure, 0 .. 1.
+	float				score;
+};
+
+
 /*!	Conveniences that tie tensors to the rest of the system. */
 class BNeuralUtils {
 public:
@@ -88,6 +106,18 @@ public:
 									BStringList* labels);
 	static	status_t			GetLabels(const char* path,
 									BStringList* labels);
+
+	/*!	Whether the session's model is a detector: one whose outputs are
+		those of the DETECTION_POSTPROCESS operator (boxes, classes,
+		scores, count). */
+	static	bool				IsDetector(const BNeuralSession& session);
+
+	/*!	What a detector found in its last run, best first. Returns how
+		many were written to \a detections (at most \a maxCount), or
+		B_BAD_TYPE when the model is no detector. */
+	static	int32				GetDetections(const BNeuralSession& session,
+									neural_detection* detections,
+									int32 maxCount);
 
 	/*!	The \a count largest elements of a tensor, best first: their
 		indices and, if wanted, their real values. Returns how many were

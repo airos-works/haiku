@@ -560,6 +560,32 @@ neural_device_kind_name(neural_device_kind kind)
 }
 
 
+const char*
+neural_error_string(status_t error)
+{
+	switch (error) {
+		case B_NEURAL_BAD_MODEL:
+			return "The file is not a model or is damaged";
+		case B_NEURAL_UNKNOWN_FORMAT:
+			return "Unknown model format";
+		case B_NEURAL_UNSUPPORTED_OPERATOR:
+			return "The model has an operator that is not supported";
+		case B_NEURAL_TYPE_MISMATCH:
+			return "Wrong tensor type";
+		case B_NEURAL_SHAPE_MISMATCH:
+			return "Wrong tensor shape";
+		case B_NEURAL_NO_DEVICE:
+			return "No such device";
+		case B_NEURAL_DEVICE_LOST:
+			return "The device is gone";
+		case B_NEURAL_NOT_ACCELERATED:
+			return "The device cannot run all of the model";
+		default:
+			return strerror(error);
+	}
+}
+
+
 static const struct {
 	neural_operator_code	code;
 	const char*				name;

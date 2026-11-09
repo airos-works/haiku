@@ -26,6 +26,9 @@ static const size_t kTensorPadding = 64;
 //! Failed runs in a row after which a device loses its part of a session.
 static const int32 kFailuresUntilLost = 3;
 
+//! How long a completion message waits for room in its target's port.
+static const bigtime_t kCompletionTimeout = 2 * 1000 * 1000;
+
 
 /*!	A model split into stages that run one after the other: stretches of
 	operators the device runs as one program each, and the stretches in
@@ -60,6 +63,7 @@ public:
 									{ return atomic_get(
 										(int32*)&fRunning) != 0; }
 
+			BNeuralSession*		fOwner;
 			BNeuralModel		fModel;
 			BNeuralDevice		fDevice;
 			uint32				fFlags;
@@ -106,6 +110,7 @@ private:
 
 NeuralSessionData::NeuralSessionData()
 	:
+	fOwner(NULL),
 	fFlags(0),
 	fGraph(NULL),
 	fInputs(NULL),
@@ -129,12 +134,22 @@ NeuralSessionData::NeuralSessionData()
 }
 
 
+/*!	Waits for the thread of an asynchronous run to be gone, whatever
+	interrupts the wait: quitting a looper, for one, ends the blocking call
+	its thread is in, and what is freed after this must not be in use. */
+static void
+wait_for_run_thread(thread_id thread)
+{
+	status_t result;
+	while (wait_for_thread(thread, &result) == B_INTERRUPTED)
+		;
+}
+
+
 NeuralSessionData::~NeuralSessionData()
 {
-	if (fThread >= 0) {
-		status_t result;
-		wait_for_thread(fThread, &result);
-	}
+	if (fThread >= 0)
+		wait_for_run_thread(fThread);
 
 	for (int32 i = 0; i < fStageCount; i++) {
 		delete fStages[i].interpreter;
@@ -612,13 +627,17 @@ NeuralSessionData::_AsyncEntry(void* data)
 	BMessenger target(self->fTarget);
 	message.AddInt32("neural:status", status);
 	message.AddInt32("neural:token", self->fToken);
+	message.AddPointer("neural:session", self->fOwner);
 	message.AddInt64("neural:duration",
 		status == B_OK ? self->fInfo.last_duration : 0);
 
 	// The run is over before the target hears of it, so that it may
 	// start the next one right away.
 	atomic_set(&self->fRunning, 0);
-	target.SendMessage(&message, (BHandler*)NULL, 0);
+
+	// A target whose port is full gets some time, not forever: the
+	// session's destructor waits for this thread.
+	target.SendMessage(&message, (BHandler*)NULL, kCompletionTimeout);
 	return status;
 }
 
@@ -632,8 +651,7 @@ NeuralSessionData::RunAsync(const BMessenger& target,
 
 	// the thread of the run before, which is over
 	if (fThread >= 0) {
-		status_t result;
-		wait_for_thread(fThread, &result);
+		wait_for_run_thread(fThread);
 		fThread = -1;
 	}
 
@@ -773,6 +791,7 @@ BNeuralSession::SetTo(const BNeuralModel& model, const BNeuralDevice& device,
 			BPrivate::kNeuralCPUDeviceID, &target);
 	}
 
+	data->fOwner = this;
 	status_t status = data->Init(model, target, flags);
 	if (status != B_OK) {
 		delete data;

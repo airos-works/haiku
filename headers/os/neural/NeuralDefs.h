@@ -85,8 +85,10 @@ enum {
 
 /*!	Sent by BNeuralSession::RunAsync() when the run is over, unless the
 	caller gave a message of its own. Fields added to either one:
-	"neural:status" (int32), "neural:token" (int32), "neural:duration"
-	(int64, microseconds).
+	"neural:status" (int32), "neural:token" (int32), "neural:session"
+	(pointer: the BNeuralSession, to tell several apart; it may be gone by
+	the time the message is read), "neural:duration" (int64,
+	microseconds).
 */
 #define B_NEURAL_RUN_COMPLETED		'NRrc'
 
@@ -125,6 +127,9 @@ size_t		neural_data_type_size(neural_data_type type);
 const char*	neural_data_type_name(neural_data_type type);
 //! "CPU", "GPU", "NPU"
 const char*	neural_device_kind_name(neural_device_kind kind);
+/*!	What an error means, in words, for the kit's own errors
+	(B_NEURAL_...) and, through strerror(), all others. */
+const char*	neural_error_string(status_t error);
 
 #ifdef __cplusplus
 }
