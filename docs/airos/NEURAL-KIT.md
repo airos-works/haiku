@@ -877,13 +877,39 @@ What was measured, on which machine, on 2026-11-09. "Agrees" means
 
 ### Lookout
 
-On the X399: detections on pictures (SSD MobileNet V1 on the CPU) and the
-top classes (MobileNet V1 quantized on the CPU, MobileNet V2 float on
-`vulkan/0` in 4.3 ms) are the ones `neural run` prints for the same
-files; a quantized model on the GPU is reported as running on the CPU; the
-window is laid out properly at 200%. **Not verified:** the camera (no
-camera was attached to any lab machine that day), switching source and
-device from the menus, drag and drop and the settings round trip.
+On the X399 (2026-11-09, GTX 1070, 200% scaling; CPU runs with
+`NEURAL_THREADS=4`):
+
+- **Pictures.** Detections (SSD MobileNet V1 on the CPU) and the top
+  classes (MobileNet V1 quantized on the CPU, MobileNet V2 float on
+  `vulkan/0` in 3.7 ms, 66 of 66 operators on the device) are the ones
+  `neural run` prints for the same files. A quantized model on the GPU is
+  reported as "CPU (… runs none of this model)".
+- **Switching while it runs** (continuous runs, the menus driven by
+  scripting: `hey Lookout DO MenuItem … of Menu Device of MenuBar of
+  Window 0`): model, device (CPU, `vulkan/0`, Automatic) and source, also
+  six switches in a burst; files given on the command line, to the running
+  program by a second launch, as refs through the roster ("Open with") and
+  as a `B_SIMPLE_DATA` message to the window (what a drop delivers; no
+  mouse was moved); "Open picture…" opens its panel. The settings come
+  back after a restart: model, device, source, picture and window frame.
+- **Quitting during a run:** 30 quits in a row with continuous runs on the
+  CPU and the GPU, no crash and no team left; another 60 with a test build
+  that leaves the session to the destructors while the looper is being
+  quit, which crashed about one time in 25 before the kit's waits for the run
+  thread were made to survive `B_INTERRUPTED`.
+- **The camera path without a camera.** No lab machine had a camera that
+  day, so a real video input was **not tested**: Lookout shows "No camera
+  found" and goes back to the picture. `Lookout --test-source <picture>`
+  puts a thread in the place of the consumer node that cuts 640 x 480
+  frames out of a picture thirty times per second and hands them on as the
+  node does. With SSD MobileNet V1 on the CPU for a minute: 30.0 frames
+  and 30.0 runs per second, 16.3 ms per run (18.6 at most), the team's
+  memory the same after 4 and after 64 seconds (157 areas, 122.0 MiB);
+  the thread ends when the source is switched to the picture.
+- **Not verified:** a camera (the Media Kit connection, its release, hot
+  plug), a drop with the mouse, choosing a file in the panels, the entry
+  in the Demos menu (the program was installed non-packaged).
 
 ## Open points
 

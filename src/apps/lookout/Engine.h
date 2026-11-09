@@ -89,8 +89,9 @@ public:
 		going on is waited for). For a looper that runs; Quit() is next. */
 			void				Shutdown();
 
+	/*!	What BNeuralUtils::IsDetector() says of a session, for a model
+		that has none yet: the window picks a model to start with. */
 	static	bool				IsDetectionModel(const BNeuralModel& model);
-	static	const char*			ErrorString(status_t status);
 
 protected:
 	virtual	void				MessageReceived(BMessage* message);

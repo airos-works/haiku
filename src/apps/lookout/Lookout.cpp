@@ -138,6 +138,25 @@ LookoutApp::ArgvReceived(int32 argc, char** argv)
 		} else if (strcmp(arg, "--continuous") == 0 && value != NULL) {
 			command.AddBool("continuous", strcmp(value, "off") != 0);
 			i++;
+		} else if (strcmp(arg, "--test-source") == 0 && value != NULL) {
+			// Not in the usage text: for testing where there is no
+			// camera. The picture stands in for one (Camera.h), from the
+			// start of the program on.
+			BPath path(cwd != NULL && value[0] != '/' ? cwd : value,
+				cwd != NULL && value[0] != '/' ? value : NULL);
+			BBitmap* picture = fStarted
+				? NULL : BTranslationUtils::GetBitmap(path.Path());
+			if (picture != NULL && (picture->ColorSpace() == B_RGB32
+					|| picture->ColorSpace() == B_RGBA32)) {
+				fCamera->SetTestPicture(picture);
+				command.AddString("source", "camera");
+				fSourceGiven = true;
+			} else {
+				delete picture;
+				fprintf(stderr, "Lookout: --test-source needs a picture, "
+					"when the program is started\n");
+			}
+			i++;
 		} else if (arg[0] != '-') {
 			BPath path(cwd != NULL && arg[0] != '/' ? cwd : arg,
 				cwd != NULL && arg[0] != '/' ? arg : NULL);

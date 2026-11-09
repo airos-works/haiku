@@ -30,11 +30,11 @@ enum {
 //! Detections the model is less sure of than this are not shown.
 static const float kMinimumScore = 0.5f;
 static const int32 kTopClasses = 5;
+static const int32 kMaxDetections = 64;
 //! Results of runs on one and the same picture are passed on this often.
 static const bigtime_t kResultInterval = 40000;
 static const bigtime_t kRateSpan = 2000000;
 static const bigtime_t kSendTimeout = 1000000;
-static const bigtime_t kRunWaitSlice = 100000;
 
 
 static bool
@@ -138,9 +138,9 @@ Engine::SetContinuous(bool continuous)
 void
 Engine::Shutdown()
 {
-	// The session is not left to the destructor: that runs while the
-	// thread that quits this looper waits for it, and a thread that is
-	// waited for gets its own waits interrupted (see _DropSession()).
+	// The session is not left to the destructor, which runs while the
+	// thread that quits this looper waits for it: the wait for a run can
+	// take as long as a run, and is better done before anybody waits.
 	BMessage reply;
 	BMessenger(this).SendMessage(kMsgShutdown, &reply);
 }
@@ -162,33 +162,6 @@ Engine::IsDetectionModel(const BNeuralModel& model)
 	}
 	return boxes.Rank() == 3 && boxes.DimensionAt(2) == 4
 		&& boxes.Type() == B_NEURAL_FLOAT32 && count.CountElements() == 1;
-}
-
-
-/*static*/ const char*
-Engine::ErrorString(status_t status)
-{
-	switch (status) {
-		case B_NEURAL_BAD_MODEL:
-			return B_TRANSLATE("The file is not a model or is damaged");
-		case B_NEURAL_UNKNOWN_FORMAT:
-			return B_TRANSLATE("Unknown model format");
-		case B_NEURAL_UNSUPPORTED_OPERATOR:
-			return B_TRANSLATE("The model has an operator that is not "
-				"supported");
-		case B_NEURAL_TYPE_MISMATCH:
-			return B_TRANSLATE("Wrong tensor type");
-		case B_NEURAL_SHAPE_MISMATCH:
-			return B_TRANSLATE("Wrong tensor shape");
-		case B_NEURAL_NO_DEVICE:
-			return B_TRANSLATE("No such device");
-		case B_NEURAL_DEVICE_LOST:
-			return B_TRANSLATE("The device is gone");
-		case B_NEURAL_NOT_ACCELERATED:
-			return B_TRANSLATE("The device cannot run all of the model");
-		default:
-			return strerror(status);
-	}
 }
 
 
@@ -278,7 +251,7 @@ Engine::_Configure(bool force)
 	if (newModel) {
 		status_t status = fModel.SetTo(&ref);
 		if (status != B_OK) {
-			BString error(ErrorString(status));
+			BString error(neural_error_string(status));
 			if (fModel.ErrorDetails()[0] != '\0')
 				error << " (" << fModel.ErrorDetails() << ")";
 			fModel.Unset();
@@ -314,12 +287,13 @@ Engine::_Configure(bool force)
 	}
 	if (status != B_OK) {
 		delete session;
-		_SendState(ENGINE_FAILED, ErrorString(status));
+		_SendState(ENGINE_FAILED, neural_error_string(status));
 		return;
 	}
 
 	fSession = session;
-	fKind = IsDetectionModel(fModel) ? MODEL_DETECTION : MODEL_CLASSIFICATION;
+	fKind = BNeuralUtils::IsDetector(*fSession)
+		? MODEL_DETECTION : MODEL_CLASSIFICATION;
 	_FindLabels(ref);
 	_SendState(ENGINE_READY);
 
@@ -335,16 +309,7 @@ Engine::_Configure(bool force)
 void
 Engine::_DropSession()
 {
-	// The session's destructor waits for the run too, but with a single
-	// wait_for_thread(), and gives up when that is interrupted. It is
-	// when this looper is being quit: BLooper::Quit() waits for this
-	// thread, waiting for a thread resumes it, and resuming a thread ends
-	// what it blocks in with B_INTERRUPTED. The session would then free
-	// its tensors under the run. So the waiting is done here, until the
-	// run says it is over.
-	while (fSession != NULL && fSession->IsRunning())
-		fSession->WaitForRun(kRunWaitSlice);
-
+	// (the session's destructor waits for a run that is under way)
 	delete fSession;
 	fSession = NULL;
 	fRunning = false;
@@ -486,7 +451,7 @@ Engine::_StartRun(Snapshot* frame)
 	}
 	if (status != B_OK) {
 		BString error(B_TRANSLATE("The model could not be run: %error%"));
-		error.ReplaceFirst("%error%", ErrorString(status));
+		error.ReplaceFirst("%error%", neural_error_string(status));
 		_DropSession();
 		_SendState(ENGINE_FAILED, error);
 		return;
@@ -500,9 +465,15 @@ Engine::_StartRun(Snapshot* frame)
 void
 Engine::_RunDone(BMessage* message)
 {
-	// of a session that is no more?
-	if (!fRunning || message->GetInt32("generation", -1) != fGeneration)
+	// Of a session that is no more? The kit says which session a run was
+	// of, but by its address, which the next session may get, and counts
+	// runs per session: the generation is what tells the run of a session
+	// before from the first one of this.
+	if (!fRunning || message->GetInt32("generation", -1) != fGeneration
+		|| message->GetPointer("neural:session", (const void*)NULL)
+			!= fSession) {
 		return;
+	}
 
 	SnapshotReference frame = fRunFrame;
 	fRunFrame.Unset();
@@ -511,7 +482,7 @@ Engine::_RunDone(BMessage* message)
 	status_t status = message->GetInt32("neural:status", B_ERROR);
 	if (status != B_OK) {
 		BString error(B_TRANSLATE("The model could not be run: %error%"));
-		error.ReplaceFirst("%error%", ErrorString(status));
+		error.ReplaceFirst("%error%", neural_error_string(status));
 		_DropSession();
 		_SendState(ENGINE_FAILED, error);
 		return;
@@ -608,35 +579,25 @@ Engine::_SendResult(Snapshot* frame, bigtime_t duration)
 	_AddRunInfo(message);
 
 	if (fKind == MODEL_DETECTION) {
-		const BTensor* boxes = fSession->OutputAt(0);
-		const BTensor* classes = fSession->OutputAt(1);
-		const BTensor* scores = fSession->OutputAt(2);
-		const float* box = (const float*)boxes->Data();
-
-		int64 count = (int64)fSession->OutputAt(3)->ValueAt(0);
-		if (count > classes->CountElements())
-			count = classes->CountElements();
-		if (count > scores->CountElements())
-			count = scores->CountElements();
-		if (count > boxes->DimensionAt(1))
-			count = boxes->DimensionAt(1);
-
-		for (int64 i = 0; i < count; i++, box += 4) {
-			float score = scores->ValueAt(i);
-			if (score < kMinimumScore)
+		// best first, as the kit hands them out; boxes are fractions of
+		// the model's input
+		neural_detection found[kMaxDetections];
+		int32 count = BNeuralUtils::GetDetections(*fSession, found,
+			kMaxDetections);
+		for (int32 i = 0; i < count; i++) {
+			if (found[i].score < kMinimumScore)
 				continue;
 
-			// top, left, bottom, right as fractions of the input
-			int32 index = (int32)classes->ValueAt(i);
+			int32 index = found[i].class_index;
 			BString label = fLabels.StringAt(index + fLabelOffset);
 			if (label.IsEmpty()) {
 				label.SetToFormat(B_TRANSLATE_COMMENT("class %" B_PRId32,
 					"A class the model has no name for"), index);
 			}
-			message.AddRect("box",
-				fMapping.ToBitmap(box[1], box[0], box[3], box[2]));
+			message.AddRect("box", fMapping.ToBitmap(found[i].left,
+				found[i].top, found[i].right, found[i].bottom));
 			message.AddString("label", label);
-			message.AddFloat("score", score);
+			message.AddFloat("score", found[i].score);
 			message.AddInt32("class", index);
 		}
 	} else {
