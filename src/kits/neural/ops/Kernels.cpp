@@ -11,8 +11,38 @@ namespace BPrivate {
 
 
 static const NeuralKernel* const kKernels[] = {
+	&kConvKernel,
+	&kDepthwiseConvKernel,
+	&kFullyConnectedKernel,
+	&kTransposeConvKernel,
+	&kAveragePoolKernel,
+	&kMaxPoolKernel,
+	&kAddKernel,
+	&kSubKernel,
+	&kMulKernel,
+	&kDivKernel,
+	&kMaximumKernel,
+	&kMinimumKernel,
+	&kReluKernel,
+	&kRelu6Kernel,
+	&kLogisticKernel,
+	&kTanhKernel,
+	&kHardSwishKernel,
+	&kLeakyReluKernel,
+	&kPreluKernel,
+	&kSoftmaxKernel,
 	&kReshapeKernel,
-	&kSqueezeKernel
+	&kSqueezeKernel,
+	&kConcatenationKernel,
+	&kPadKernel,
+	&kMeanKernel,
+	&kResizeBilinearKernel,
+	&kResizeNearestKernel,
+	&kTransposeKernel,
+	&kStridedSliceKernel,
+	&kQuantizeKernel,
+	&kDequantizeKernel,
+	&kDetectionPostprocessKernel
 };
 
 

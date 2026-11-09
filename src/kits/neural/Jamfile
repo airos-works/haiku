@@ -6,10 +6,6 @@ UsePrivateHeaders neural shared storage ;
 # vectorizer, which -O2 holds back.
 SubDirC++Flags -O3 ;
 
-# one file per family of operators
-local kernelSources = [ GLOB [ FDirName $(SUBDIR) ops ] : *.cpp ] ;
-kernelSources = $(kernelSources:BS) ;
-
 local architectureObject ;
 for architectureObject in [ MultiArchSubDirSetup ] {
 	on $(architectureObject) {
@@ -25,7 +21,17 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 			Tensor.cpp
 			TFLiteLoader.cpp
 
-			$(kernelSources)
+			# ops: the CPU kernels, one file per family of operators
+			Activation.cpp
+			Arithmetic.cpp
+			Convolution.cpp
+			Detection.cpp
+			Kernels.cpp
+			Pooling.cpp
+			Quantize.cpp
+			Reduce.cpp
+			Resize.cpp
+			Shape.cpp
 			:
 			be [ TargetLibstdc++ ]
 			;

@@ -12,8 +12,14 @@
 			[--repeat <n>] [--profile]
 
 	<inputs> holds the raw bytes of the model's inputs one after the
-	other; the outputs are written the same way. With --dump every tensor
-	that is not a constant is written to <directory>/<index>.bin.
+	other; the outputs are written the same way. "random" instead of a
+	file fills the inputs with arbitrary bytes (the same ones every time):
+	for running models whose results are not looked at. With --dump every
+	tensor that is not a constant is written to <directory>/<index>.bin.
+
+	The exit status is 0 when the model ran, 1 when it could not be loaded
+	or run (which is the right answer for a damaged model), 2 for a wrong
+	command line.
 */
 
 
@@ -63,108 +69,134 @@ read_file(const char* path, void* buffer, size_t size)
 }
 
 
-int
-main(int argc, char** argv)
-{
-	if (argc < 3) {
-		fprintf(stderr, "usage: %s info <model>\n"
-			"       %s run <model> <inputs> <outputs> [--dump <directory>]"
-			" [--repeat <n>] [--profile]\n", argv[0], argv[0]);
-		return 2;
+/*!	What a run allocates, freed whichever way the run ends: tools that
+	look for leaks are then left with those of the kit. */
+struct RunMemory {
+	const NeuralGraphData*	graph;
+	void**					tensors;
+	uint8*					inputs;
+	int32*					order;
+	bigtime_t*				durations;
+
+	RunMemory(const NeuralGraphData* graph)
+		:
+		graph(graph),
+		tensors(NULL),
+		inputs(NULL),
+		order(NULL),
+		durations(NULL)
+	{
 	}
 
-	bool info = strcmp(argv[1], "info") == 0;
-	const char* dumpDirectory = NULL;
-	int repeat = 1;
-	bool profile = false;
-	for (int i = 5; i < argc; i++) {
-		if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc)
-			dumpDirectory = argv[++i];
-		else if (strcmp(argv[i], "--repeat") == 0 && i + 1 < argc)
-			repeat = atoi(argv[++i]);
-		else if (strcmp(argv[i], "--profile") == 0)
-			profile = true;
-	}
-
-	int fd = open(argv[2], O_RDONLY);
-	struct stat stat;
-	if (fd < 0 || fstat(fd, &stat) != 0) {
-		fprintf(stderr, "%s: cannot open\n", argv[2]);
-		return 1;
-	}
-
-	void* file = mmap(NULL, stat.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-	close(fd);
-	if (file == MAP_FAILED) {
-		fprintf(stderr, "%s: cannot map\n", argv[2]);
-		return 1;
-	}
-
-	NeuralGraphData* graph = new NeuralGraphData();
-	graph->AdoptBuffer(file, stat.st_size, true);
-
-	status_t status = neural_load_tflite(file, stat.st_size, graph);
-	if (status != B_OK) {
-		fprintf(stderr, "%s: load failed: %s (%#x)\n", argv[2],
-			status == B_NEURAL_UNSUPPORTED_OPERATOR ? "unsupported operator"
-				: status == B_NEURAL_BAD_MODEL ? "bad model"
-				: status == B_NEURAL_UNKNOWN_FORMAT ? "unknown format"
-				: "error", (unsigned)status);
-		return 1;
-	}
-
-	if (info) {
-		printf("model \"%s\": %d tensors, %d operators, %lld bytes of "
-			"constants\n", graph->Name() != NULL ? graph->Name() : "",
-			(int)graph->CountTensors(), (int)graph->CountOperators(),
-			(long long)graph->ConstantBytes());
-		printf("inputs:\n");
-		for (int32 i = 0; i < graph->CountInputs(); i++)
-			print_tensor(graph, graph->InputAt(i));
-		printf("outputs:\n");
-		for (int32 i = 0; i < graph->CountOutputs(); i++)
-			print_tensor(graph, graph->OutputAt(i));
-		printf("operators:\n");
-		int unsupported = 0;
-		for (int32 i = 0; i < graph->CountOperators(); i++) {
-			const neural_graph_operator& op = graph->Operator(i);
-			bool supported = NeuralInterpreter::Supports(graph, i);
-			if (!supported)
-				unsupported++;
-			printf("  %4d %-22s%s\n", (int)i, neural_operator_name(op.code),
-				supported ? "" : "  NOT SUPPORTED");
+	~RunMemory()
+	{
+		if (tensors != NULL) {
+			for (int32 i = 0; i < graph->CountTensors(); i++) {
+				if (graph->Tensor(i).data == NULL)
+					free(tensors[i]);
+			}
 		}
-		printf("%d of %d operators not supported by the CPU\n", unsupported,
-			(int)graph->CountOperators());
-		graph->ReleaseReference();
-		return unsupported == 0 ? 0 : 3;
+		free(tensors);
+		free(inputs);
+		free(order);
+		free(durations);
+	}
+};
+
+
+static int
+print_info(const NeuralGraphData* graph)
+{
+	printf("model \"%s\": %d tensors, %d operators, %lld bytes of "
+		"constants\n", graph->Name() != NULL ? graph->Name() : "",
+		(int)graph->CountTensors(), (int)graph->CountOperators(),
+		(long long)graph->ConstantBytes());
+	printf("inputs:\n");
+	for (int32 i = 0; i < graph->CountInputs(); i++)
+		print_tensor(graph, graph->InputAt(i));
+	printf("outputs:\n");
+	for (int32 i = 0; i < graph->CountOutputs(); i++)
+		print_tensor(graph, graph->OutputAt(i));
+	printf("operators:\n");
+	int unsupported = 0;
+	for (int32 i = 0; i < graph->CountOperators(); i++) {
+		const neural_graph_operator& op = graph->Operator(i);
+		bool supported = NeuralInterpreter::Supports(graph, i);
+		if (!supported)
+			unsupported++;
+		printf("  %4d %-22s%s\n", (int)i, neural_operator_name(op.code),
+			supported ? "" : "  NOT SUPPORTED");
+	}
+	printf("%d of %d operators not supported by the CPU\n", unsupported,
+		(int)graph->CountOperators());
+	return unsupported == 0 ? 0 : 3;
+}
+
+
+static int
+run_model(const NeuralGraphData* graph, const char* inputPath,
+	const char* outputPath, const char* dumpDirectory, int repeat,
+	bool profile)
+{
+	RunMemory memory(graph);
+
+	// The operators are prepared first: what a kernel refuses needs no
+	// memory.
+	int32 opCount = graph->CountOperators();
+	int32* order = memory.order = (int32*)malloc((opCount + 1)
+		* sizeof(int32));
+	for (int32 i = 0; i < opCount; i++)
+		order[i] = i;
+
+	NeuralInterpreter interpreter(graph);
+	status_t status = interpreter.Prepare(order, opCount);
+	if (status != B_OK) {
+		fprintf(stderr, "prepare failed: %#x\n", (unsigned)status);
+		return 1;
 	}
 
-	if (argc < 5) {
-		fprintf(stderr, "run needs <inputs> and <outputs>\n");
-		return 2;
-	}
-
-	// memory for every tensor
+	// Memory for every tensor, each in a block of its own (and of its
+	// exact size, so that tools that watch memory see every step beyond
+	// it). A model that asks for more than a test could want is turned
+	// down rather than taking the machine's memory.
 	int32 tensorCount = graph->CountTensors();
-	void** tensors = (void**)calloc(tensorCount, sizeof(void*));
+	uint64 total = 0;
+	for (int32 i = 0; i < tensorCount; i++) {
+		if (graph->Tensor(i).data == NULL)
+			total += graph->Tensor(i).size;
+	}
+	if (total > ((uint64)1 << 31)) {
+		fprintf(stderr, "the tensors take %llu bytes: too much for this "
+			"tool\n", (unsigned long long)total);
+		return 1;
+	}
+
+	void** tensors = memory.tensors = (void**)calloc(tensorCount + 1,
+		sizeof(void*));
 	for (int32 i = 0; i < tensorCount; i++) {
 		const neural_graph_tensor& tensor = graph->Tensor(i);
 		if (tensor.data != NULL) {
 			tensors[i] = (void*)tensor.data;
-		} else if (posix_memalign(&tensors[i], 64, tensor.size + 64) != 0) {
+		} else if (posix_memalign(&tensors[i], 64, tensor.size) != 0) {
+			tensors[i] = NULL;
 			fprintf(stderr, "out of memory\n");
 			return 1;
 		} else
-			memset(tensors[i], 0, tensor.size + 64);
+			memset(tensors[i], 0, tensor.size);
 	}
 
 	size_t inputSize = 0;
 	for (int32 i = 0; i < graph->CountInputs(); i++)
 		inputSize += graph->Tensor(graph->InputAt(i)).size;
-	uint8* inputs = (uint8*)malloc(inputSize);
-	if (!read_file(argv[3], inputs, inputSize)) {
-		fprintf(stderr, "%s: cannot read %zu bytes of inputs\n", argv[3],
+	uint8* inputs = memory.inputs = (uint8*)malloc(inputSize + 1);
+	if (strcmp(inputPath, "random") == 0) {
+		uint32 state = 12345;
+		for (size_t i = 0; i < inputSize; i++) {
+			state = state * 1664525 + 1013904223;
+			inputs[i] = state >> 24;
+		}
+	} else if (!read_file(inputPath, inputs, inputSize)) {
+		fprintf(stderr, "%s: cannot read %zu bytes of inputs\n", inputPath,
 			inputSize);
 		return 1;
 	}
@@ -175,19 +207,10 @@ main(int argc, char** argv)
 		offset += tensor.size;
 	}
 
-	int32 opCount = graph->CountOperators();
-	int32* order = (int32*)malloc(opCount * sizeof(int32));
-	for (int32 i = 0; i < opCount; i++)
-		order[i] = i;
-
-	NeuralInterpreter interpreter(graph);
-	status = interpreter.Prepare(order, opCount);
-	if (status != B_OK) {
-		fprintf(stderr, "prepare failed: %#x\n", (unsigned)status);
-		return 1;
-	}
-
-	bigtime_t* durations = (bigtime_t*)calloc(opCount, sizeof(bigtime_t));
+	// the times of the fastest run, and of each operator in it
+	bigtime_t* durations = memory.durations = (bigtime_t*)calloc(
+		2 * (opCount + 1), sizeof(bigtime_t));
+	bigtime_t* bestDurations = durations + opCount + 1;
 	bigtime_t best = -1;
 	for (int i = 0; i < repeat; i++) {
 		bigtime_t start = system_time();
@@ -197,24 +220,36 @@ main(int argc, char** argv)
 			fprintf(stderr, "run failed: %#x\n", (unsigned)status);
 			return 1;
 		}
-		if (best < 0 || duration < best)
+		if (best < 0 || duration < best) {
 			best = duration;
+			memcpy(bestDurations, durations, opCount * sizeof(bigtime_t));
+		}
 	}
 	fprintf(stderr, "run: %lld us (best of %d, %d threads)\n",
 		(long long)best, repeat,
 		(int)NeuralThreadPool::Default()->CountThreads());
 
 	if (profile) {
+		// per operator, then per kind of operator
+		bigtime_t byCode[B_NEURAL_OP_COUNT] = {};
 		for (int32 i = 0; i < opCount; i++) {
 			fprintf(stderr, "  %4d %-22s %8lld us\n", (int)i,
 				neural_operator_name(graph->Operator(i).code),
-				(long long)durations[i]);
+				(long long)bestDurations[i]);
+			byCode[graph->Operator(i).code] += bestDurations[i];
+		}
+		for (int32 code = 0; code < B_NEURAL_OP_COUNT; code++) {
+			if (byCode[code] != 0) {
+				fprintf(stderr, "  all  %-22s %8lld us\n",
+					neural_operator_name((neural_operator_code)code),
+					(long long)byCode[code]);
+			}
 		}
 	}
 
-	FILE* output = fopen(argv[4], "wb");
+	FILE* output = fopen(outputPath, "wb");
 	if (output == NULL) {
-		fprintf(stderr, "%s: cannot write\n", argv[4]);
+		fprintf(stderr, "%s: cannot write\n", outputPath);
 		return 1;
 	}
 	for (int32 i = 0; i < graph->CountOutputs(); i++) {
@@ -240,4 +275,68 @@ main(int argc, char** argv)
 	}
 
 	return 0;
+}
+
+
+int
+main(int argc, char** argv)
+{
+	bool info = argc >= 3 && strcmp(argv[1], "info") == 0;
+	if (argc < 3 || (!info && (strcmp(argv[1], "run") != 0 || argc < 5))) {
+		fprintf(stderr, "usage: %s info <model>\n"
+			"       %s run <model> <inputs> <outputs> [--dump <directory>]"
+			" [--repeat <n>] [--profile]\n", argv[0], argv[0]);
+		return 2;
+	}
+
+	const char* dumpDirectory = NULL;
+	int repeat = 1;
+	bool profile = false;
+	for (int i = 5; i < argc; i++) {
+		if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc)
+			dumpDirectory = argv[++i];
+		else if (strcmp(argv[i], "--repeat") == 0 && i + 1 < argc)
+			repeat = atoi(argv[++i]);
+		else if (strcmp(argv[i], "--profile") == 0)
+			profile = true;
+	}
+
+	int fd = open(argv[2], O_RDONLY);
+	struct stat stat;
+	if (fd < 0 || fstat(fd, &stat) != 0) {
+		fprintf(stderr, "%s: cannot open\n", argv[2]);
+		if (fd >= 0)
+			close(fd);
+		return 1;
+	}
+
+	void* file = mmap(NULL, stat.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	close(fd);
+	if (file == MAP_FAILED) {
+		fprintf(stderr, "%s: cannot map\n", argv[2]);
+		return 1;
+	}
+
+	// the graph unmaps the file when it goes
+	NeuralGraphData* graph = new NeuralGraphData();
+	graph->AdoptBuffer(file, stat.st_size, true);
+
+	int result;
+	status_t status = neural_load_tflite(file, stat.st_size, graph);
+	if (status != B_OK) {
+		fprintf(stderr, "%s: load failed: %s (%#x)\n", argv[2],
+			status == B_NEURAL_UNSUPPORTED_OPERATOR ? "unsupported operator"
+				: status == B_NEURAL_BAD_MODEL ? "bad model"
+				: status == B_NEURAL_UNKNOWN_FORMAT ? "unknown format"
+				: "error", (unsigned)status);
+		result = 1;
+	} else if (info)
+		result = print_info(graph);
+	else {
+		result = run_model(graph, argv[3], argv[4], dumpDirectory, repeat,
+			profile);
+	}
+
+	graph->ReleaseReference();
+	return result;
 }
