@@ -19,7 +19,10 @@ WAVE files at 16 kHz) these are compared:
     (compare.py --all), on noise and on what a recording puts into them;
  5. the text and times the kit's recognizer gives for each recording with
     the reference's (NumPy front end, LiteRT networks, Python decoding),
-    with and without time stamps, and fed in pieces with fed at once.
+    with and without time stamps, and fed in pieces with fed at once;
+ 6. model directories whose description, vocabulary or filter bank is
+    damaged (bytes changed, cut short, numbers replaced): each must be
+    refused or read without a crash.
 
 Exits with 0 when everything agrees.
 
@@ -28,6 +31,9 @@ Needs: pip install numpy ai-edge-litert
 
 import argparse
 import os
+import random
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -224,6 +230,73 @@ def test_text(host, model, model_directory, audio_paths, work):
     return dumps
 
 
+def test_damaged(host, model_directory, work):
+    print('== damaged model directories')
+    names = ('speech.conf', 'vocabulary.bin', 'mel_filters.bin')
+    originals = {}
+    for name in names:
+        with open(os.path.join(model_directory, name), 'rb') as file:
+            originals[name] = file.read()
+
+    directory = os.path.join(work, 'damaged')
+    shutil.rmtree(directory, ignore_errors=True)
+    os.makedirs(directory)
+    rng = random.Random(1)
+    numbers = (b'0', b'-1', b'1', b'7', b'65536', b'2147483647',
+        b'4294967296', b'99999999999999999999', b'x')
+
+    def damage(name, data):
+        kind = rng.randrange(5)
+        if kind == 0:
+            return data[:rng.randrange(len(data))]
+        if kind == 1 and name == 'speech.conf':
+            # another number in place of one of the description's
+            found = list(re.finditer(rb'\d+', data))
+            match = rng.choice(found)
+            return data[:match.start()] + rng.choice(numbers) \
+                + data[match.end():]
+        if kind == 2 and name == 'speech.conf':
+            lines = data.split(b'\n')
+            del lines[rng.randrange(len(lines))]
+            return b'\n'.join(lines)
+        if kind == 3:
+            return data + bytes(rng.randrange(256)
+                for _ in range(rng.randrange(1, 64)))
+        changed = bytearray(data)
+        for _ in range(rng.randrange(1, 8)):
+            changed[rng.randrange(len(changed))] = rng.randrange(256)
+        return bytes(changed)
+
+    ran = refused = 0
+    crashes = []
+    for round in range(600):
+        target = names[0] if round % 2 == 0 else names[1 + round // 2 % 2]
+        for name in names:
+            data = originals[name]
+            if name == target:
+                data = damage(name, data)
+            with open(os.path.join(directory, name), 'wb') as file:
+                file.write(data)
+        # some text tokens, the last one, special ones, ones that are not
+        result = subprocess.run([host, 'text', directory, '0', '11', '220',
+            '50255', '50256', '50363', '51863', '99999', '-3'],
+            capture_output=True)
+        errors = result.stderr.decode('utf-8', 'replace')
+        if result.returncode not in (0, 1) or 'runtime error' in errors \
+                or 'Sanitizer' in errors:
+            crashes.append('%s, round %d: exit %d %s' % (target, round,
+                result.returncode, errors[-300:]))
+        elif result.returncode == 0:
+            ran += 1
+        else:
+            refused += 1
+    for crash in crashes[:5]:
+        print(crash)
+    check(not crashes and refused > 100, '%d damaged directories were '
+        'read, %d refused, %d crashed' % (ran, refused, len(crashes)))
+    shutil.rmtree(directory, ignore_errors=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', required=True)
@@ -247,6 +320,7 @@ def main():
 
     test_converter(host, work)
     test_tokenizer(host, model, args.model)
+    test_damaged(host, args.model, work)
     test_front_end(host, model, args.model, args.audio, work)
     dumps = test_text(host, model, args.model, args.audio, work)
     test_networks(args.host, args.model, dumps, sys.executable)

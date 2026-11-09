@@ -48,9 +48,11 @@ LiteRT and compares them with a plain NumPy implementation of Whisper's
 equations on the checkpoint's weights (needs ai-edge-litert's interpreter).
 
 Where the files come from (as of 2026-11; all MIT, (c) 2022 OpenAI):
-    https://openaipublic.azureedge.net/main/whisper/models/
-        d3dd57d32accea0b295c96e26691aa14d8822fac7d9d27d5dc00b4ca2826dd03/tiny.en.pt
-        65147644a518d12f04e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9/tiny.pt
+    https://openaipublic.azureedge.net/main/whisper/models/<sha256>/<name>
+        tiny.en.pt
+            d3dd57d32accea0b295c96e26691aa14d8822fac7d9d27d5dc00b4ca2826dd03
+        tiny.pt
+            65147644a518d12f04e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9
     https://github.com/openai/whisper  whisper/assets/gpt2.tiktoken (the
         English models), multilingual.tiktoken, mel_filters.npz; LICENSE
 
