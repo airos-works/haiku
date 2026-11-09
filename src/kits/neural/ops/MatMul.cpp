@@ -323,9 +323,11 @@ run_batch_matmul(const NeuralOpContext& context)
 		}
 	}
 
-	// a few dozen microseconds of work are worth a thread
+	// A few hundred microseconds of work are worth a thread: handing
+	// out less costs more than it saves (the products of a decoder's
+	// step are that small, and there are dozens of them per step).
 	int64 rowWork = (int64)data.inner * data.columns + 16;
-	int64 grain = 65536 / rowWork;
+	int64 grain = 1000000 / rowWork;
 	context.pool->Run(data.batches * data.rows, grain < 1 ? 1 : (int32)grain,
 		&matmul_rows, &run);
 	return B_OK;

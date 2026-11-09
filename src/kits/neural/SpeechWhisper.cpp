@@ -94,9 +94,10 @@ private:
 			status_t			_Bind();
 			status_t			_Step(int32 position, int32 token);
 			double				_Probability(int32 token) const;
-			void				_ApplyRules(const int32* text, int32 count,
+			double				_ApplyRules(const int32* text, int32 count,
 									bool timestamps);
-			void				_LogSoftmax();
+			double				_LogSum(int32 first, int32 end,
+									double largest) const;
 			void				_AddSegment(int32 startMs, int32 endMs,
 									int32 first, int32 count);
 			void				_MakeSegments(int32 count,
@@ -122,8 +123,6 @@ private:
 			int32				fSegmentCount;
 	//! the logits of the last step with the rules applied
 			double*				fScores;
-	//! and the logarithms of the probabilities they amount to
-			double*				fChances;
 			char				fError[160];
 };
 
@@ -156,8 +155,7 @@ WhisperDecoder::WhisperDecoder()
 	fTokens(NULL),
 	fSegments(NULL),
 	fSegmentCount(0),
-	fScores(NULL),
-	fChances(NULL)
+	fScores(NULL)
 {
 	fError[0] = '\0';
 }
@@ -170,7 +168,6 @@ WhisperDecoder::~WhisperDecoder()
 	free(fTokens);
 	free(fSegments);
 	free(fScores);
-	free(fChances);
 }
 
 
@@ -205,9 +202,8 @@ WhisperDecoder::Init(const SpeechModel& model, SpeechNetwork* encoder,
 	fSegments = (speech_window_segment*)malloc(info.text_context
 		* sizeof(speech_window_segment));
 	fScores = (double*)malloc(info.vocabulary_size * sizeof(double));
-	fChances = (double*)malloc(info.vocabulary_size * sizeof(double));
 	if (fStates == NULL || fLinks == NULL || fTokens == NULL
-		|| fSegments == NULL || fScores == NULL || fChances == NULL) {
+		|| fSegments == NULL || fScores == NULL) {
 		return B_NO_MEMORY;
 	}
 
@@ -365,27 +361,26 @@ WhisperDecoder::_Probability(int32 token) const
 }
 
 
-//! fChances: the logarithms of the probabilities fScores amount to.
-void
-WhisperDecoder::_LogSoftmax()
+/*!	The logarithm of the sum of e^score over the tokens from \a first
+	to \a end - 1 that are not ruled out, less \a largest (which keeps
+	the numbers in range); -HUGE_VAL when all of them are ruled out. */
+double
+WhisperDecoder::_LogSum(int32 first, int32 end, double largest) const
 {
-	int32 count = fModel->Info().vocabulary_size;
-
-	double largest = fScores[0];
-	for (int32 i = 1; i < count; i++)
-		largest = fScores[i] > largest ? fScores[i] : largest;
 	double sum = 0;
-	for (int32 i = 0; i < count; i++)
-		sum += exp(fScores[i] - largest);
-	double offset = largest + log(sum);
-	for (int32 i = 0; i < count; i++)
-		fChances[i] = fScores[i] - offset;
+	for (int32 i = first; i < end; i++) {
+		if (fScores[i] > -HUGE_VAL)
+			sum += exp(fScores[i] - largest);
+	}
+	return sum > 0 ? log(sum) : -HUGE_VAL;
 }
 
 
 /*!	Rules out, in fScores, what the next token must not be. \a text is
-	what was decoded of the window so far. */
-void
+	what was decoded of the window so far. Returns what has to be taken
+	from a score that is left to get the logarithm of its token's
+	probability among those that are left. */
+double
 WhisperDecoder::_ApplyRules(const int32* text, int32 count, bool timestamps)
 {
 	const SpeechModelInfo& info = fModel->Info();
@@ -405,7 +400,11 @@ WhisperDecoder::_ApplyRules(const int32* text, int32 count, bool timestamps)
 	if (!timestamps) {
 		for (int32 i = firstStamp; i < size; i++)
 			fScores[i] = kNever;
-		return;
+
+		double largest = kNever;
+		for (int32 i = 0; i < firstStamp; i++)
+			largest = fScores[i] > largest ? fScores[i] : largest;
+		return largest + _LogSum(0, firstStamp, largest);
 	}
 
 	fScores[info.token_no_timestamps] = kNever;
@@ -449,27 +448,31 @@ WhisperDecoder::_ApplyRules(const int32* text, int32 count, bool timestamps)
 	}
 
 	// If all time stamps together are likelier than any text token, a
-	// time stamp it is.
-	_LogSoftmax();
+	// time stamp it is. (The probabilities are e^score over the sum of
+	// that for all tokens; the sums over the text tokens and over the
+	// time stamps are made apart, since one of them may be all that is
+	// left.)
 	double largest = kNever;
-	for (int32 i = firstStamp; i < size; i++)
-		largest = fChances[i] > largest ? fChances[i] : largest;
-	double together = kNever;
-	if (largest > kNever) {
-		double sum = 0;
-		for (int32 i = firstStamp; i < size; i++) {
-			if (fChances[i] > kNever)
-				sum += exp(fChances[i] - largest);
-		}
-		together = largest + log(sum);
-	}
+	for (int32 i = 0; i < size; i++)
+		largest = fScores[i] > largest ? fScores[i] : largest;
 	double bestText = kNever;
 	for (int32 i = 0; i < firstStamp; i++)
-		bestText = fChances[i] > bestText ? fChances[i] : bestText;
-	if (together > bestText) {
+		bestText = fScores[i] > bestText ? fScores[i] : bestText;
+
+	double textSum = _LogSum(0, firstStamp, largest);
+	double stampSum = _LogSum(firstStamp, size, largest);
+	if (stampSum > bestText - largest) {
 		for (int32 i = 0; i < firstStamp; i++)
 			fScores[i] = kNever;
+		return largest + stampSum;
 	}
+
+	// log(e^a + e^b)
+	double all = textSum > stampSum ? textSum : stampSum;
+	if (textSum > kNever && stampSum > kNever) {
+		all += log1p(exp((textSum < stampSum ? textSum : stampSum) - all));
+	}
+	return largest + all;
 }
 
 
@@ -615,8 +618,8 @@ WhisperDecoder::DecodeWindow(const float* mel,
 
 		for (int32 j = 0; j < info.vocabulary_size; j++)
 			fScores[j] = logits[j];
-		_ApplyRules(fTokens + begin, count - begin, options.timestamps);
-		_LogSoftmax();
+		double offset = _ApplyRules(fTokens + begin, count - begin,
+			options.timestamps);
 
 		// the likeliest token that is left; the first of equals
 		int32 best = 0;
@@ -624,7 +627,7 @@ WhisperDecoder::DecodeWindow(const float* mel,
 			if (fScores[j] > fScores[best])
 				best = j;
 		}
-		total += fChances[best];
+		total += fScores[best] - offset;
 		steps++;
 
 		if (best == info.token_eot)
