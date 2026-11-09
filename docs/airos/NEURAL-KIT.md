@@ -764,6 +764,21 @@ What was measured, on which machine, on 2026-11-09. "Agrees" means
 - The clock is left at 198 MHz: the board's NPU supply cannot be read
   from Haiku (no I2C bus driver there), so higher frequencies were not
   tried. One core of three is used.
+- **As shipped.** The arm64 release of 2026-11-09 16:53
+  (hrev60207+2552) is the first that carries the kit, the driver and the
+  back end. The ROCK 5, updated to it with System Updater and with nothing
+  of the kit outside the packages, shows `/dev/npu/rk3588/0` after the
+  boot and `rk3588_npu/0` as the default device; the table above repeats
+  (MobileNet V1 equal, 8.5 ms; V2 within 3 steps; SSD within the
+  tolerances), and `neural_kit_test` passes in the image builds' guest
+  tests on x86_64 and arm64.
+- The table's comparisons use `neural compare`'s generated input. On a
+  photograph (Grace Hopper) MobileNet V1 differs in 2 of 1001
+  outputs by one step, with the same top five. SSD MobileNet V1 finds the
+  same nine strongest detections, with scores within 0.012; the tenth,
+  at the 30 % mark, is a different box on the NPU than on the CPU, and
+  detections of nearly equal score can change places, so an element by
+  element comparison of the detection lists reports them as different.
 
 ### Vulkan (X399, GTX 1070, NVK; Framework 13, Radeon 840M, RADV)
 
