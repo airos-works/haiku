@@ -88,6 +88,7 @@ private:
 									BNeuralProgram** _program);
 			status_t			_AllocateTensor(int32 index);
 			status_t			_AllocateOperands(int32 first, int32 end);
+			status_t			_ShareMemory();
 			status_t			_PrepareInterpreter(Stage& stage);
 			status_t			_FallBack(Stage& stage);
 			status_t			_Run();
@@ -98,6 +99,9 @@ private:
 
 			void**				fTensors;
 			bool*				fOwned;
+			//! blocks that several tensors use, one after the other
+			void**				fShared;
+			int32				fSharedCount;
 
 			int32				fRunning;
 			thread_id			fThread;
@@ -125,6 +129,8 @@ NeuralSessionData::NeuralSessionData()
 	fBackendIndex(0),
 	fTensors(NULL),
 	fOwned(NULL),
+	fShared(NULL),
+	fSharedCount(0),
 	fRunning(0),
 	fThread(-1),
 	fAsyncStatus(B_OK),
@@ -166,6 +172,9 @@ NeuralSessionData::~NeuralSessionData()
 				free(fTensors[i]);
 		}
 	}
+	for (int32 i = 0; i < fSharedCount; i++)
+		free(fShared[i]);
+	free(fShared);
 	free(fTensors);
 	free(fOwned);
 	free(fOnDevice);
@@ -212,6 +221,121 @@ NeuralSessionData::_AllocateOperands(int32 first, int32 end)
 		}
 	}
 	return B_OK;
+}
+
+
+/*!	Memory for the tensors between the operators when the CPU runs all
+	of the model, shared: a tensor that is not read any more leaves its
+	block to one that is made later. A network many layers deep then
+	takes the memory of its widest place, not of all its layers together
+	(a speech encoder a tenth). The model's inputs and outputs keep
+	blocks of their own: the caller may leave them filled between runs.
+
+	(With a device in the session the tensors stay apart: a stretch of
+	operators can then move to the CPU at any time, and what a back end
+	keeps in the tensors it was given is its own business.) */
+status_t
+NeuralSessionData::_ShareMemory()
+{
+	int32 opCount = fGraph->CountOperators();
+	int32 tensorCount = fGraph->CountTensors();
+	if (opCount == 0 || tensorCount == 0)
+		return B_OK;
+
+	// per tensor: the last operator that has to do with it, and whether
+	// it may share (-1: not; then: the block it gets)
+	int32* last = (int32*)malloc(tensorCount * sizeof(int32));
+	int32* block = (int32*)malloc(tensorCount * sizeof(int32));
+	// per block: its size, and the last operator that uses what is in it
+	size_t* sizes = (size_t*)calloc(tensorCount, sizeof(size_t));
+	int32* busy = (int32*)malloc(tensorCount * sizeof(int32));
+	if (last == NULL || block == NULL || sizes == NULL || busy == NULL) {
+		free(last);
+		free(block);
+		free(sizes);
+		free(busy);
+		return B_NO_MEMORY;
+	}
+
+	for (int32 i = 0; i < tensorCount; i++) {
+		last[i] = -1;
+		// what an operator makes; not constants, not what is there already
+		block[i] = fGraph->Tensor(i).data == NULL && fTensors[i] == NULL
+			? -2 : -1;
+	}
+	for (int32 i = 0; i < fGraph->CountInputs(); i++)
+		block[fGraph->InputAt(i)] = -1;
+	for (int32 i = 0; i < fGraph->CountOutputs(); i++)
+		block[fGraph->OutputAt(i)] = -1;
+	for (int32 i = 0; i < opCount; i++) {
+		const neural_graph_operator& op = fGraph->Operator(i);
+		for (int32 j = 0; j < op.input_count; j++) {
+			if (op.inputs[j] >= 0)
+				last[op.inputs[j]] = i;
+		}
+		for (int32 j = 0; j < op.output_count; j++)
+			last[op.outputs[j]] = i;
+	}
+
+	// In the order in which the tensors are made, each takes a block
+	// whose tensor is done with: the smallest that is large enough, else
+	// the largest, which grows; a new one when all are in use.
+	int32 blockCount = 0;
+	for (int32 i = 0; i < opCount; i++) {
+		const neural_graph_operator& op = fGraph->Operator(i);
+		for (int32 j = 0; j < op.output_count; j++) {
+			int32 tensor = op.outputs[j];
+			if (block[tensor] != -2)
+				continue;
+
+			size_t size = fGraph->Tensor(tensor).size;
+			int32 best = -1;
+			for (int32 k = 0; k < blockCount; k++) {
+				// (an operator's output never shares with its inputs)
+				if (busy[k] >= i)
+					continue;
+				if (best < 0) {
+					best = k;
+				} else if (sizes[best] >= size) {
+					if (sizes[k] >= size && sizes[k] < sizes[best])
+						best = k;
+				} else if (sizes[k] > sizes[best])
+					best = k;
+			}
+			if (best < 0)
+				best = blockCount++;
+
+			if (sizes[best] < size)
+				sizes[best] = size;
+			busy[best] = last[tensor];
+			block[tensor] = best;
+		}
+	}
+
+	status_t status = B_OK;
+	fShared = (void**)calloc(blockCount > 0 ? blockCount : 1, sizeof(void*));
+	if (fShared == NULL)
+		status = B_NO_MEMORY;
+	for (int32 i = 0; status == B_OK && i < blockCount; i++) {
+		void* memory;
+		if (posix_memalign(&memory, kTensorAlignment,
+				sizes[i] + kTensorPadding) != 0) {
+			status = B_NO_MEMORY;
+			break;
+		}
+		memset(memory, 0, sizes[i] + kTensorPadding);
+		fShared[fSharedCount++] = memory;
+	}
+	for (int32 i = 0; status == B_OK && i < tensorCount; i++) {
+		if (block[i] >= 0)
+			fTensors[i] = fShared[block[i]];
+	}
+
+	free(last);
+	free(block);
+	free(sizes);
+	free(busy);
+	return status;
 }
 
 
@@ -395,6 +519,21 @@ NeuralSessionData::Init(const BNeuralModel& model,
 				free(programs);
 				return B_NEURAL_NOT_ACCELERATED;
 			}
+		}
+	}
+
+	// With no part of the model on the device, the tensors between the
+	// operators share memory; what is left gets its own below.
+	bool onCPU = true;
+	for (int32 i = 0; i < opCount; i++) {
+		if (fOnDevice[i])
+			onCPU = false;
+	}
+	if (onCPU) {
+		status = _ShareMemory();
+		if (status != B_OK) {
+			free(programs);
+			return status;
 		}
 	}
 
