@@ -5,3 +5,8 @@ UsePrivateHeaders neural ;
 # the kit without hardware: tensors, models, sessions, a back end of its own
 SimpleTest neural_kit_test : neural_kit_test.cpp
 	: be neural [ TargetLibstdc++ ] ;
+
+# the vulkan back end against the CPU; needs a graphics processor with a
+# Vulkan driver
+SimpleTest vulkan_backend_test : vulkan_backend_test.cpp
+	: be neural [ TargetLibstdc++ ] ;
