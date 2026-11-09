@@ -16,7 +16,7 @@ Preferences. Developer came on 2026-10-29, Media on 2026-10-19, after the
 | Media | PhotoCraft, LightCraft |
 | Developer | Code - OSS, Docker Desktop, GitHub Desktop, pgAdmin 4 |
 | Utilities | CharacterMap, CodyCam, Debugger, Devices, DiskProbe, DiskUsage, DriveSetup, Expander, Magnify, PoorMan, SerialConnect, Vision |
-| Demos | Chart, Clock, Cortex, FontDemo, GLTeapot, Mandelbrot, OverlayImage, Pairs, PatchBay, Playground, Pulse, Sudoku |
+| Demos | Chart, Clock, Cortex, FontDemo, GLTeapot, Lookout, Mandelbrot, OverlayImage, Pairs, PatchBay, Playground, Pulse, Sudoku |
 | Desktop applets | AutoRaise, BluetoothStatus, LaunchBox, NetworkStatus, PowerStatus, ProcessController, WiFiStatus, Workspaces |
 | Preferences | Appearance, Backgrounds, Bluetooth, DataTranslations, Deskbar, E-mail, FileTypes, Input, Keymap, Locale, MCP, Media, Network, Notifications, Power, Printers, Repositories, Screen, ScreenSaver, Shortcuts, Sounds, Time, Tracker, VirtualMemory, WiFi (and Qt6 Configurator from the qt6_base package) |
 
