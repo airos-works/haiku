@@ -33,7 +33,12 @@ struct neural_run_info {
 	int32				cpu_operators;
 	//! stretches of operators handed to the device at once
 	int32				device_partitions;
-	uint32				_reserved[8];
+	/*!	Runs of a device partition that failed and were done by the CPU
+		instead. A device that fails three times in a row, or says that
+		it is gone, loses its partition to the CPU for good; the counts
+		above then change. */
+	int32				device_failures;
+	uint32				_reserved[7];
 };
 
 

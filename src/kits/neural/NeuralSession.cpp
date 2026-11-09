@@ -23,6 +23,9 @@ namespace BPrivate {
 static const size_t kTensorAlignment = 64;
 static const size_t kTensorPadding = 64;
 
+//! Failed runs in a row after which a device loses its part of a session.
+static const int32 kFailuresUntilLost = 3;
+
 
 /*!	A model split into stages that run one after the other: stretches of
 	operators the device runs as one program each, and the stretches in
@@ -36,7 +39,10 @@ public:
 		int32				count;
 		int32				partition;
 		NeuralInterpreter*	interpreter;
+			// for a device stage: made when the device first fails
 		BNeuralProgram*		program;
+		int32				failures;
+			// runs in a row the device did not manage
 	};
 
 								NeuralSessionData();
@@ -78,6 +84,7 @@ private:
 									BNeuralProgram** _program);
 			status_t			_AllocateTensor(int32 index);
 			status_t			_AllocateOperands(int32 first, int32 end);
+			status_t			_PrepareInterpreter(Stage& stage);
 			status_t			_FallBack(Stage& stage);
 			status_t			_Run();
 	static	status_t			_AsyncEntry(void* data);
@@ -467,12 +474,12 @@ NeuralSessionData::Init(const BNeuralModel& model,
 }
 
 
-/*!	Moves a stage from the device, which is gone, to the CPU. */
+/*!	Gets the CPU ready to run a device stage. */
 status_t
-NeuralSessionData::_FallBack(Stage& stage)
+NeuralSessionData::_PrepareInterpreter(Stage& stage)
 {
-	if ((fFlags & B_NEURAL_NO_FALLBACK) != 0)
-		return B_NEURAL_DEVICE_LOST;
+	if (stage.interpreter != NULL)
+		return B_OK;
 
 	NeuralInterpreter* interpreter = new(std::nothrow) NeuralInterpreter(
 		fGraph);
@@ -490,12 +497,24 @@ NeuralSessionData::_FallBack(Stage& stage)
 
 	if (status != B_OK) {
 		delete interpreter;
-		return status == B_NO_MEMORY ? status : B_NEURAL_DEVICE_LOST;
+		return status;
 	}
+
+	stage.interpreter = interpreter;
+	return B_OK;
+}
+
+
+/*!	Moves a stage from the device, which is gone, to the CPU. */
+status_t
+NeuralSessionData::_FallBack(Stage& stage)
+{
+	status_t status = _PrepareInterpreter(stage);
+	if (status != B_OK)
+		return status == B_NO_MEMORY ? status : B_NEURAL_DEVICE_LOST;
 
 	delete stage.program;
 	stage.program = NULL;
-	stage.interpreter = interpreter;
 	stage.on_device = false;
 	stage.partition = -1;
 	for (int32 i = stage.first; i < stage.first + stage.count; i++) {
@@ -525,6 +544,7 @@ NeuralSessionData::_Run()
 			bigtime_t duration = system_time() - stageStart;
 
 			if (status == B_OK) {
+				stage.failures = 0;
 				deviceTime += duration;
 				if (profile) {
 					for (int32 j = 0; j < stage.count; j++)
@@ -532,10 +552,22 @@ NeuralSessionData::_Run()
 				}
 				continue;
 			}
-			if (status != B_NEURAL_DEVICE_LOST)
-				return status;
 
-			status = _FallBack(stage);
+			// The device did not manage. Its part of this run is done
+			// by the CPU, so that the caller gets its answer; a device
+			// that is gone, or fails again and again, loses the stage
+			// for good.
+			if ((fFlags & B_NEURAL_NO_FALLBACK) != 0) {
+				return status == B_NEURAL_DEVICE_LOST
+					? status : (status_t)B_NEURAL_DEVICE_LOST;
+			}
+
+			fInfo.device_failures++;
+			if (status == B_NEURAL_DEVICE_LOST
+				|| ++stage.failures >= kFailuresUntilLost) {
+				status = _FallBack(stage);
+			} else
+				status = _PrepareInterpreter(stage);
 			if (status != B_OK)
 				return status;
 		}

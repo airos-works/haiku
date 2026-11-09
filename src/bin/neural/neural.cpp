@@ -589,6 +589,17 @@ compare_model(const Options& options)
 		return 1;
 	}
 
+	// What was compared is only the device's work if the device did it.
+	neural_run_info after;
+	device.GetRunInfo(&after);
+	if (after.device_failures > 0
+		|| after.device_operators != info.device_operators) {
+		printf("%s FAILED %" B_PRId32 " time(s) while running; the CPU did "
+			"its part (see the syslog and the back end's messages)\n",
+			device.Device().ID(), after.device_failures);
+		return 4;
+	}
+
 	bool same = true;
 	for (int32 i = 0; i < device.CountOutputs(); i++) {
 		const BTensor* a = device.OutputAt(i);

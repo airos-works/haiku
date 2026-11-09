@@ -141,7 +141,9 @@ public:
 		graph; those of the partition's inputs and outputs point to
 		memory of the tensor's size, in the graph's type and layout. The
 		inputs are filled in, the outputs are to be written. The call
-		returns when the outputs are complete. Return
+		returns when the outputs are complete. On an error the kit runs
+		the stretch on the CPU for this run and comes back the next
+		time (three failed runs in a row end that). Return
 		B_NEURAL_DEVICE_LOST when the device is gone for good: the kit
 		then runs the stretch on the CPU from now on. */
 	virtual	status_t			Run(void* const* tensors) = 0;

@@ -84,8 +84,11 @@ src/tests/kits/neural/                       tests; host/ runs the interpreter o
   the others, has the back end make a *program* for each of its stretches
   and prepares the CPU interpreter for the rest. `Run()` then runs the
   stretches in order. A device that runs nothing of a model is not picked
-  for it; a back end that fails to make a program, or a device that goes
-  away while the session lives, is replaced by the CPU on the spot. So a
+  for it; a back end that fails to make a program is replaced by the CPU
+  for that stretch; a run the device fails is done by the CPU (the caller
+  gets its answer, `neural_run_info::device_failures` counts), and a
+  device that goes away, or fails three runs in a row, loses its stretch
+  to the CPU for good. So a
   session always works, and gives the same answers (bit for bit for
   quantized networks on the CPU; within the tolerances under
   [Status](#status) on devices).
@@ -358,8 +361,10 @@ instantiate_neural_backend(image_id image)
 - `BNeuralProgram::Run(tensors)` gets a table with the memory of the
   partition's inputs and outputs (indexed like the graph's tensors, in the
   graph's types and NHWC layout), computes, and returns when the outputs
-  are written. `B_NEURAL_DEVICE_LOST` hands the stretch to the CPU for
-  good.
+  are written. On an error the kit computes the stretch on the CPU for
+  this run and tries the device again next time (three failures in a row
+  end that); `B_NEURAL_DEVICE_LOST` hands the stretch to the CPU at once
+  and for good.
 - Programs of different sessions run at the same time: a back end is
   thread safe.
 

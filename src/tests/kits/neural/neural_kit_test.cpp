@@ -47,6 +47,8 @@ check(bool ok, const char* what)
 static bool sRefusePrograms;
 static int32 sRunsUntilLost = -1;
 	// < 0: the device stays
+static int32 sRunsToFail;
+	// runs of a program that fail though the device stays
 static int32 sProgramsMade;
 static int32 sProgramsDeleted;
 
@@ -108,6 +110,10 @@ public:
 
 	virtual status_t Run(void* const* tensors)
 	{
+		if (sRunsToFail > 0) {
+			sRunsToFail--;
+			return B_IO_ERROR;
+		}
 		if (sRunsUntilLost == 0)
 			return B_NEURAL_DEVICE_LOST;
 		if (sRunsUntilLost > 0)
@@ -570,6 +576,34 @@ test_sessions(Receiver* receiver)
 			"session: the CPU has taken over for good");
 		sRunsUntilLost = -1;
 		check(run_and_check(session), "session: and stays there");
+	}
+
+	// a device that fails now and then, and one that keeps failing
+	{
+		BNeuralSession session(model, device);
+		sRunsToFail = 2;
+			// both partitions of one run
+		check(run_and_check(session), "session: the right numbers though "
+			"the device failed");
+
+		neural_run_info info;
+		session.GetRunInfo(&info);
+		check(info.device_failures == 2 && info.device_operators == 3
+			&& info.device_partitions == 2,
+			"session: one failure does not cost the device its part");
+		check(run_and_check(session) && session.GetRunInfo(&info) == B_OK
+			&& info.device_failures == 2,
+			"session: the device is used again");
+
+		sRunsToFail = 1000;
+		bool right = true;
+		for (int32 i = 0; i < 4; i++)
+			right &= run_and_check(session);
+		session.GetRunInfo(&info);
+		check(right && info.device_operators == 0
+			&& info.device_partitions == 0,
+			"session: a device that keeps failing loses its part");
+		sRunsToFail = 0;
 	}
 
 	{
