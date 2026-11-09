@@ -604,6 +604,16 @@ first load on the laptop needs someone at the machine (it has no remote
 power control), following `haiku/tests/xdna/FIRST-LOAD.md` in the
 linux-drm repository.
 
+### Lookout
+
+On the X399: detections on pictures (SSD MobileNet V1 on the CPU) and the
+top classes (MobileNet V1 quantized on the CPU, MobileNet V2 float on
+`vulkan/0` in 4.3 ms) are the ones `neural run` prints for the same
+files; a quantized model on the GPU is reported as running on the CPU; the
+window is laid out properly at 200%. **Not verified:** the camera (no
+camera was attached to any lab machine that day), switching source and
+device from the menus, drag and drop and the settings round trip.
+
 ## Open points
 
 - **More model formats.** ONNX is the other format models are published
@@ -625,3 +635,8 @@ linux-drm repository.
   camera program the same glue; `BNeuralUtils::SetTensorFromBitmap()` is
   the piece it would be made of.
 - **The other two cores of the RK3588**, for two jobs at once.
+- **Cancelling a run.** Deleting a session waits for its run to end.
+- **Models in the image.** None is shipped; `fetch-models.sh` fetches the
+  public test models. System tasks will want a package of models.
+- **The Vulkan back end on other drivers**, and int8 networks in shaders
+  for machines whose only accelerator is a GPU.
