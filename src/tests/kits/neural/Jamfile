@@ -1,0 +1,7 @@
+SubDir HAIKU_TOP src tests kits neural ;
+
+UsePrivateHeaders neural ;
+
+# the kit without hardware: tensors, models, sessions, a back end of its own
+SimpleTest neural_kit_test : neural_kit_test.cpp
+	: be neural [ TargetLibstdc++ ] ;

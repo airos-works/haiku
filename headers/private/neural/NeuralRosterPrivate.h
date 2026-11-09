@@ -50,6 +50,11 @@ public:
 
 			status_t			Rescan();
 
+	/*!	Adds a back end that is part of the calling program instead of an
+		add-on (tests do that) and looks for its devices. The roster owns
+		it from then on. */
+			status_t			AddBackend(BNeuralBackend* backend);
+
 			int32				CountDevices();
 			status_t			GetDeviceAt(int32 index,
 									BNeuralDevice* device);

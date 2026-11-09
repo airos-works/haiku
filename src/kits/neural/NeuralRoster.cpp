@@ -256,6 +256,31 @@ NeuralRosterData::_LoadBackend(const char* path)
 }
 
 
+status_t
+NeuralRosterData::AddBackend(BNeuralBackend* backend)
+{
+	if (backend == NULL)
+		return B_BAD_VALUE;
+
+	{
+		BAutolock locker(fLock);
+
+		Backend* entry = new(std::nothrow) Backend;
+		if (entry == NULL || !fBackends.AddItem(entry)) {
+			delete entry;
+			delete backend;
+			return B_NO_MEMORY;
+		}
+
+		entry->name = backend->Name();
+		entry->image = -1;
+		entry->backend = backend;
+	}
+
+	return Rescan();
+}
+
+
 /*!	Asks every back end for its devices. The CPU comes first. */
 void
 NeuralRosterData::_CollectDevices(BObjectList<Device, true>& devices)
