@@ -106,9 +106,12 @@ output_conversion(double scale, uint32* _scale, uint32* _shift)
 /*!	What the processor makes of a sum with a factor of
 	output_conversion(), before the zero point is added. */
 int64
-converted_output(int64 sum, uint32 scale, uint32 shift)
+converted_output(const Operation& operation, int64 sum, uint32 scale,
+	uint32 shift)
 {
-	int64 product = sum * (int64)scale;
+	int64 product = ((sum << operation.rounding_bits)
+		+ operation.rounding_offset) * (int64)scale;
+	shift += operation.rounding_bits;
 	if (shift == 0)
 		return product;
 	return (product + ((int64)1 << (shift - 1))) >> shift;
@@ -280,8 +283,12 @@ fill_commands(const Operation& operation, uint32 taskIndex,
 	// the result kept above zero and below a limit if there are bounds
 	// (the lower bound was taken off the bias for that, see
 	// fill_biases(), and is added again by the next stage).
-	uint32 biasConfig = DPU_BS_CFG_BS_ALU_ALGO(2) | DPU_BS_CFG_BS_ALU_SRC(1)
-		| DPU_BS_CFG_BS_MUL_BYPASS(1);
+	// It also multiplies by a power of two where the sums are to have
+	// bits after the point, see plan_rounding() in Support.cpp; the limit
+	// is applied to the product.
+	uint32 biasConfig = DPU_BS_CFG_BS_ALU_ALGO(2) | DPU_BS_CFG_BS_ALU_SRC(1);
+	if (operation.rounding_bits == 0)
+		biasConfig |= DPU_BS_CFG_BS_MUL_BYPASS(1);
 	if (!operation.clamp_low)
 		biasConfig |= DPU_BS_CFG_BS_RELU_BYPASS(1);
 	if (operation.clamp_high)
@@ -289,9 +296,12 @@ fill_commands(const Operation& operation, uint32 taskIndex,
 
 	EMIT(REG_DPU_BS_CFG, biasConfig);
 	EMIT(REG_DPU_BS_ALU_CFG, 0);
-	EMIT(REG_DPU_BS_MUL_CFG, 0);
+	EMIT(REG_DPU_BS_MUL_CFG, operation.rounding_bits != 0
+		? DPU_BS_MUL_CFG_BS_MUL_OPERAND(1 << operation.rounding_bits) : 0);
 	EMIT(REG_DPU_BS_RELUX_CMP_VALUE, operation.clamp_high
-		? (uint32)(operation.clamp_maximum - operation.clamp_minimum) : 0);
+		? (uint32)(operation.clamp_maximum - operation.clamp_minimum)
+			<< operation.rounding_bits
+		: 0);
 
 	if (operation.depthwise) {
 		EMIT(REG_DPU_BS_OW_CFG, DPU_BS_OW_CFG_SIZE_E_2(3)
@@ -310,11 +320,18 @@ fill_commands(const Operation& operation, uint32 taskIndex,
 	EMIT(REG_DPU_WDMA_SIZE_1,
 		DPU_WDMA_SIZE_1_HEIGHT_WDMA(task.output_height - 1)
 		| DPU_WDMA_SIZE_1_WIDTH_WDMA(task.output_width - 1));
-	if (operation.clamp_low && operation.clamp_minimum != 0) {
-		// the second stage adds the lower bound
+	// The second stage adds the lower bound again, and what makes the
+	// rounding come out as the CPU's.
+	int32 stageAddend = operation.rounding_offset;
+	if (operation.clamp_low) {
+		stageAddend += operation.clamp_minimum
+			* ((int32)1 << operation.rounding_bits);
+	}
+
+	if (stageAddend != 0) {
 		EMIT(REG_DPU_BN_CFG, DPU_BN_CFG_BN_ALU_ALGO(2)
 			| DPU_BN_CFG_BN_RELU_BYPASS(1) | DPU_BN_CFG_BN_MUL_BYPASS(1));
-		EMIT(REG_DPU_BN_ALU_CFG, (uint32)operation.clamp_minimum);
+		EMIT(REG_DPU_BN_ALU_CFG, (uint32)stageAddend);
 	} else {
 		EMIT(REG_DPU_BN_CFG, DPU_BN_CFG_BN_RELU_BYPASS(1)
 			| DPU_BN_CFG_BN_MUL_BYPASS(1) | DPU_BN_CFG_BN_ALU_BYPASS(1)
@@ -360,7 +377,8 @@ fill_commands(const Operation& operation, uint32 taskIndex,
 
 	EMIT(REG_DPU_OUT_CVT_OFFSET, (uint32)operation.output_zero_point);
 	EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(outputScale));
-	EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(outputShift));
+	EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(outputShift
+		+ operation.rounding_bits));
 
 	EMIT(REG_DPU_EW_OP_VALUE_0, 0);
 	EMIT(REG_DPU_EW_OP_VALUE_1, 0);

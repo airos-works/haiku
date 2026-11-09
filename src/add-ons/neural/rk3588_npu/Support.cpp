@@ -133,25 +133,98 @@ zero_point_valid(const neural_graph_tensor* tensor)
 	factor of sums to outputs; false if there is none that does so
 	safely, away from where rounding decides. */
 static bool
-sum_for_output(int32 output, double factor, int32* _sum)
+sum_for_output(const Operation& operation, int32 output, double factor,
+	int32* _sum)
 {
 	uint32 scale;
 	uint32 shift;
 	if (!output_conversion(factor, &scale, &shift))
 		return false;
 
-	double exact = output / factor;
-	if (fabs(exact) > (double)(1 << 30))
+	// what plan_rounding() adds, in outputs
+	double added = operation.rounding_offset * factor
+		/ (1 << operation.rounding_bits);
+
+	double exact = (output - added) / factor;
+	if (fabs(exact) > (double)(1 << 30 >> operation.rounding_bits))
 		return false;
 
 	int64 sum = llround(exact);
-	if (fabs(sum * factor - output) > 0.45
-		|| converted_output(sum, scale, shift) != output) {
+	if (fabs(sum * factor + added - output) > 0.45
+		|| converted_output(operation, sum, scale, shift) != output) {
 		return false;
 	}
 
 	*_sum = (int32)sum;
 	return true;
+}
+
+
+/*!	Makes the processor round as the CPU does, where that is possible
+	and makes a difference.
+
+	The kit's interpreter turns sums into outputs as TensorFlow Lite's
+	reference code does: it multiplies by a factor between a half and one
+	and rounds, then divides by a power of two and rounds again. For a
+	result that is not negative that is the same as adding a little to the
+	exact product before rounding it once: 2^-(n+1) outputs for a division
+	by 2^n. The processor rounds once, so without that little, one in
+	eight of its outputs is one less than the CPU's when n is 1 (depthwise
+	convolutions typically), one in sixteen when it is 2, and so on.
+
+	The little is less than one sum, so the sums get bits after the point
+	first: the stage that adds the bias multiplies them by a power of two,
+	the next stage adds the offset, and the output conversion shifts by
+	that many bits more. This is done only where outputs cannot be below
+	the zero point (below it the CPU's rounding leans the other way), where
+	the sums have room for the bits, and where the effect is worth it. */
+static void
+plan_rounding(Operation& operation, const neural_graph_tensor* output,
+	const neural_graph_tensor* bias, neural_activation activation)
+{
+	operation.rounding_bits = 0;
+	operation.rounding_offset = 0;
+
+	double factor = (double)operation.input_scale * operation.weights_scale
+		/ output->scale;
+	int exponent;
+	double mantissa = frexp(factor, &exponent);
+	int division = -exponent;
+	if (division < 1 || division > 7)
+		return;
+
+	int32 minimum = output->type == B_NEURAL_UINT8 ? 0 : -128;
+	if (output->zero_point != minimum
+		&& activation != B_NEURAL_ACTIVATION_RELU
+		&& activation != B_NEURAL_ACTIVATION_RELU6) {
+		return;
+	}
+
+	// how large a sum can get
+	uint64 bound = (uint64)operation.weights_width * operation.weights_height
+		* (operation.depthwise ? 1 : operation.input_channels) * 255 * 255;
+	if (bias != NULL) {
+		const int32* values = (const int32*)bias->data;
+		int64 largest = 0;
+		for (uint32 i = 0; i < operation.output_channels; i++)
+			largest = std::max(largest, (int64)llabs(values[i]));
+		bound += largest;
+	}
+
+	uint32 scale;
+	uint32 shift;
+	if (!output_conversion(factor, &scale, &shift) || shift >= 31)
+		return;
+
+	uint32 bits = std::min((uint32)8, 31 - shift);
+	while (bits > 0 && (bound << bits) >= ((uint64)1 << 30))
+		bits--;
+	if (bits < 4)
+		return;
+
+	operation.rounding_bits = bits;
+	operation.rounding_offset = (int32)llround((double)(1 << bits)
+		/ (2 * mantissa));
 }
 
 
@@ -208,14 +281,14 @@ plan_clamp(Operation& operation, neural_activation activation,
 	// An upper bound is a distance from the lower one.
 	if (operation.clamp_high) {
 		operation.clamp_low = true;
-		if (!sum_for_output((int32)high - zeroPoint, factor,
+		if (!sum_for_output(operation, (int32)high - zeroPoint, factor,
 				&operation.clamp_maximum)) {
 			return false;
 		}
 	}
 	// (the sum for an output of zero is zero)
-	if ((int32)low != zeroPoint && !sum_for_output((int32)low - zeroPoint,
-			factor, &operation.clamp_minimum)) {
+	if ((int32)low != zeroPoint && !sum_for_output(operation,
+			(int32)low - zeroPoint, factor, &operation.clamp_minimum)) {
 		return false;
 	}
 
@@ -407,6 +480,9 @@ describe_convolution(const BNeuralGraph& graph, int32 index,
 	}
 
 	operation.activation = params->activation;
+	plan_rounding(operation, output,
+		biasIndex >= 0 ? graph.TensorAt(biasIndex) : NULL,
+		params->activation);
 	if (!plan_clamp(operation, params->activation, output, false))
 		return B_NOT_SUPPORTED;
 
@@ -517,7 +593,10 @@ fuse_addition(const BNeuralGraph& graph, int32 index, int32 addendIndex,
 
 	// The sums are what the convolution's own output would have been:
 	// they stay within that tensor's range and the convolution's
-	// activation.
+	// activation. (They may be negative, and what is added to them is not
+	// rounded as the CPU does it anyway: no plan_rounding().)
+	operation.rounding_bits = 0;
+	operation.rounding_offset = 0;
 	if (!plan_clamp(operation, (neural_activation)operation.activation, sum,
 			true)) {
 		return B_NOT_SUPPORTED;

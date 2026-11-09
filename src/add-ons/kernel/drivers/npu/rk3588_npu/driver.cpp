@@ -553,7 +553,8 @@ attach_domain(Device* device, Domain* domain)
 
 	// Commands other than paging on and off are only taken while the
 	// IOMMU is stalled, and it can only be stalled while it translates.
-	if (mmu_all(device, kMmuStatusPaging) && !mmu_all(device, kMmuStatusStall)) {
+	if (mmu_all(device, kMmuStatusPaging)
+		&& !mmu_all(device, kMmuStatusStall)) {
 		mmu_command(device, kMmuEnableStall);
 		if (!mmu_wait(device, kMmuStatusStall, true, 10000)) {
 			TRACE("the IOMMU does not stall (status %#" B_PRIx32 ")\n",
