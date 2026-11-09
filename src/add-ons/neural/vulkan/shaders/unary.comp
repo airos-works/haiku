@@ -1,0 +1,59 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+/*
+ * Copyright 2026, air/OS contributors.
+ * Distributed under the terms of the MIT License.
+ */
+
+//	RELU, RELU6, LOGISTIC, TANH and HARD_SWISH.
+
+#include "common.glsl"
+
+#define OPERATION_RELU			0u
+#define OPERATION_RELU6			1u
+#define OPERATION_LOGISTIC		2u
+#define OPERATION_TANH			3u
+#define OPERATION_HARD_SWISH	4u
+
+layout(push_constant) uniform Params {
+	uint	total;
+	uint	rowSize;
+	uint	groups;
+	uint	channels;
+	uint	operation;
+} p;
+
+layout(std430, binding = 0) writeonly buffer Output { vec4 data[]; } o;
+layout(std430, binding = 1) readonly buffer Input { vec4 data[]; } a;
+
+void
+main()
+{
+	uint index = INVOCATION(p.rowSize);
+	if (index >= p.total)
+		return;
+
+	vec4 x = a.data[index];
+	vec4 result;
+	switch (p.operation) {
+		case OPERATION_RELU:
+			result = max(x, 0.0);
+			break;
+		case OPERATION_RELU6:
+			result = clamp(x, 0.0, 6.0);
+			break;
+		case OPERATION_LOGISTIC:
+			result = 1.0 / (1.0 + exp(-x));
+			break;
+		case OPERATION_TANH:
+			// tanh() of a large number may be computed as inf / inf
+			result = tanh(clamp(x, -20.0, 20.0));
+			break;
+		default:
+			result = x * clamp(x + 3.0, 0.0, 6.0) * (1.0 / 6.0);
+			break;
+	}
+
+	o.data[index] = mask_lanes(result, index % p.groups, p.channels);
+}

@@ -1,0 +1,120 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+/*
+ * Copyright 2026, air/OS contributors.
+ * Distributed under the terms of the MIT License.
+ */
+
+/*	CONV_2D and FULLY_CONNECTED. An invocation makes four output channels
+	of one position. The weights are one mat4 per four input channels (a
+	column per input channel, a row per output channel), in the order the
+	loops read them: output group, kernel row, kernel column, input
+	group.
+
+	POINTWISE: the kernel is 1 x 1, so there is no window and no edge.
+	OUTPUTS_8: two output groups an invocation, which halves the reads of
+	the input; the weights of the two are interleaved.
+*/
+
+#include "common.glsl"
+
+layout(push_constant) uniform Params {
+	uint	total;
+	uint	rowSize;
+	//! batches * output height * output width
+	uint	positions;
+	int		inWidth;
+	int		inHeight;
+	uint	inGroups;
+	int		outWidth;
+	int		outHeight;
+	uint	outGroups;
+	int		kernelWidth;
+	int		kernelHeight;
+	int		strideWidth;
+	int		strideHeight;
+	int		dilationWidth;
+	int		dilationHeight;
+	int		padLeft;
+	int		padTop;
+	float	minimum;
+	float	maximum;
+} p;
+
+layout(std430, binding = 0) writeonly buffer Output { vec4 data[]; } o;
+layout(std430, binding = 1) readonly buffer Input { vec4 data[]; } a;
+layout(std430, binding = 2) readonly buffer Weights { mat4 data[]; } w;
+layout(std430, binding = 3) readonly buffer Bias { vec4 data[]; } b;
+
+void
+main()
+{
+	uint index = INVOCATION(p.rowSize);
+	if (index >= p.total)
+		return;
+
+	// neighbours share the weights and differ in the position
+	uint group = index / p.positions;
+	uint position = index - group * p.positions;
+	uint row = position / uint(p.outWidth);
+	int x = int(position - row * uint(p.outWidth));
+	uint batch = row / uint(p.outHeight);
+	int y = int(row - batch * uint(p.outHeight));
+
+#ifdef OUTPUTS_8
+	vec4 sum0 = b.data[group * 2u];
+	vec4 sum1 = b.data[group * 2u + 1u];
+	#define ACCUMULATE(weight, value) \
+		sum0 += w.data[2u * (weight)] * (value); \
+		sum1 += w.data[2u * (weight) + 1u] * (value)
+#else
+	vec4 sum0 = b.data[group];
+	#define ACCUMULATE(weight, value) \
+		sum0 += w.data[weight] * (value)
+#endif
+
+#ifdef POINTWISE
+	uint weight = group * p.inGroups;
+	uint source = ((batch * uint(p.inHeight) + uint(y * p.strideHeight))
+		* uint(p.inWidth) + uint(x * p.strideWidth)) * p.inGroups;
+	for (uint i = 0u; i < p.inGroups; i++) {
+		vec4 value = a.data[source + i];
+		ACCUMULATE(weight + i, value);
+	}
+#else
+	uint weight = group * uint(p.kernelHeight * p.kernelWidth) * p.inGroups;
+	int top = y * p.strideHeight - p.padTop;
+	int left = x * p.strideWidth - p.padLeft;
+	for (int ky = 0; ky < p.kernelHeight; ky++) {
+		int sy = top + ky * p.dilationHeight;
+		if (sy < 0 || sy >= p.inHeight) {
+			weight += uint(p.kernelWidth) * p.inGroups;
+			continue;
+		}
+		uint line = (batch * uint(p.inHeight) + uint(sy)) * uint(p.inWidth);
+		for (int kx = 0; kx < p.kernelWidth; kx++) {
+			int sx = left + kx * p.dilationWidth;
+			if (sx >= 0 && sx < p.inWidth) {
+				uint source = (line + uint(sx)) * p.inGroups;
+				for (uint i = 0u; i < p.inGroups; i++) {
+					vec4 value = a.data[source + i];
+					ACCUMULATE(weight + i, value);
+				}
+			}
+			weight += p.inGroups;
+		}
+	}
+#endif
+
+#ifdef OUTPUTS_8
+	uint target = position * p.outGroups + group * 2u;
+	o.data[target] = clamp(sum0, p.minimum, p.maximum);
+	// the last pair of an odd number of groups has one half only
+	if (group * 2u + 1u < p.outGroups)
+		o.data[target + 1u] = clamp(sum1, p.minimum, p.maximum);
+#else
+	o.data[position * p.outGroups + group]
+		= clamp(sum0, p.minimum, p.maximum);
+#endif
+}

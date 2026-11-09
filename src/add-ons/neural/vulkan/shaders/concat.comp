@@ -1,0 +1,60 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+/*
+ * Copyright 2026, air/OS contributors.
+ * Distributed under the terms of the MIT License.
+ */
+
+/*	CONCATENATION along the channels: run once per input, in their
+	order. An invocation writes one vec4 of the output that has channels
+	of this input. Where the input does not start at a multiple of four,
+	the vec4 it shares with the one before is read first; the lanes after
+	the input are set to zero, and overwritten by the next one.
+*/
+
+#include "common.glsl"
+
+layout(push_constant) uniform Params {
+	//! positions * spanGroups
+	uint	total;
+	uint	rowSize;
+	uint	outGroups;
+	uint	inGroups;
+	//! the first group of the output with channels of this input
+	uint	firstGroup;
+	uint	spanGroups;
+	//! the channel of the output the input starts at
+	uint	offset;
+	uint	inChannels;
+} p;
+
+layout(std430, binding = 0) buffer Output { vec4 data[]; } o;
+layout(std430, binding = 1) readonly buffer Input { vec4 data[]; } a;
+
+void
+main()
+{
+	uint index = INVOCATION(p.rowSize);
+	if (index >= p.total)
+		return;
+
+	uint position = index / p.spanGroups;
+	uint group = p.firstGroup + (index - position * p.spanGroups);
+	uint target = position * p.outGroups + group;
+	uint source = position * p.inGroups;
+
+	vec4 result = vec4(0.0);
+	if (group * 4u < p.offset)
+		result = o.data[target];
+
+	for (uint lane = 0u; lane < 4u; lane++) {
+		uint channel = group * 4u + lane;
+		if (channel >= p.offset && channel - p.offset < p.inChannels) {
+			channel -= p.offset;
+			result[lane] = a.data[source + (channel >> 2u)][channel & 3u];
+		}
+	}
+
+	o.data[target] = result;
+}
