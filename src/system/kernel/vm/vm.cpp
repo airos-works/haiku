@@ -4205,6 +4205,23 @@ vm_soft_fault(VMAddressSpace* addressSpace, addr_t originalAddress,
 		bool unmapPage = false;
 		bool mapPage = true;
 
+		// A page not mapped yet (the usual case) is mapped under the same
+		// translation map lock as the check below, instead of locking it
+		// again in map_page(): concurrent faults of one team contend for that
+		// lock, and every acquisition can mean waiting for a woken thread to
+		// be scheduled (four threads faulting their own areas took 30 times as
+		// long as one). The mapping object is allocated before, as
+		// map_page() does.
+		bool mappedHere = false;
+		const bool wasMapped = context.page->IsMapped();
+		vm_page_mapping* mapping = NULL;
+		if (area->wiring == B_NO_LOCK) {
+			mapping = allocate_page_mapping(context.page->physical_page_number,
+				CACHE_DONT_WAIT_FOR_MEMORY
+					| (addressSpace == VMAddressSpace::Kernel()
+						? CACHE_DONT_LOCK_KERNEL_SPACE : 0));
+		}
+
 		// check whether there's already a page mapped at the address
 		context.map->Lock();
 
@@ -4227,7 +4244,41 @@ vm_soft_fault(VMAddressSpace* addressSpace, addr_t originalAddress,
 				unmapPage = true;
 		}
 
+		if (mapPage && !unmapPage
+			&& (mapping != NULL || area->wiring != B_NO_LOCK)) {
+			DEBUG_PAGE_ACCESS_CHECK(context.page);
+			context.map->Map(address,
+				context.page->physical_page_number * B_PAGE_SIZE, newProtection,
+				area->MemoryType(), &context.reservation);
+			if (mapping != NULL) {
+				mapping->page = context.page;
+				mapping->area = area;
+				if (!context.page->IsMapped())
+					atomic_add(&gMappedPagesCount, 1);
+				context.page->mappings.Add(mapping);
+				area->mappings.Add(mapping);
+				mapping = NULL;
+			}
+			mappedHere = true;
+		}
+
 		context.map->Unlock();
+
+		if (mapping != NULL) {
+			vm_free_page_mapping(context.page->physical_page_number, mapping,
+				CACHE_DONT_WAIT_FOR_MEMORY
+					| (addressSpace == VMAddressSpace::Kernel()
+						? CACHE_DONT_LOCK_KERNEL_SPACE : 0));
+		}
+		if (mappedHere) {
+			// What map_page() does after mapping.
+			if (area->wiring != B_NO_LOCK)
+				increment_page_wired_count(context.page);
+			if (!wasMapped && (context.page->State() == PAGE_STATE_CACHED
+					|| context.page->State() == PAGE_STATE_INACTIVE)) {
+				vm_page_set_state(context.page, PAGE_STATE_ACTIVE);
+			}
+		}
 
 		if (unmapPage) {
 			// If the page is wired, we can't unmap it. Wait until it is unwired
@@ -4270,7 +4321,7 @@ vm_soft_fault(VMAddressSpace* addressSpace, addr_t originalAddress,
 			DEBUG_PAGE_ACCESS_END(mappedPage);
 		}
 
-		if (mapPage) {
+		if (mapPage && !mappedHere) {
 			if (map_page(area, context.page, address, newProtection,
 					&context.reservation) != B_OK) {
 				// Mapping can only fail, when the page mapping object couldn't
