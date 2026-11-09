@@ -225,13 +225,18 @@ arm64_cpu_idle_init()
 		return;
 	memset(sStats, 0, sizeof(idle_stats) * sCPUCount);
 
-	// "cpu_power_down false" in the kernel settings turns it off
+	// On by default only where it was tried (RK3588: ROCK 5); elsewhere
+	// "cpu_power_down true" in the kernel settings turns it on, and
+	// "cpu_power_down false" off anywhere.
+	bool tried = gFDT != NULL && fdt_check_header(gFDT) == 0
+		&& fdt_node_check_compatible(gFDT, 0, "rockchip,rk3588") == 0;
 	void* settings = load_driver_settings("kernel");
 	bool wanted = get_driver_boolean_parameter(settings, "cpu_power_down",
-		true, true);
+		tried, true);
 	unload_driver_settings(settings);
 	if (!wanted) {
-		dprintf("arm64 idle: power-down off in the kernel settings\n");
+		dprintf("arm64 idle: power-down off (%s)\n",
+			tried ? "kernel settings" : "not tried on this board");
 		return;
 	}
 
