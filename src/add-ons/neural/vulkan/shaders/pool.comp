@@ -1,0 +1,81 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+/*
+ * Copyright 2026, air/OS contributors.
+ * Distributed under the terms of the MIT License.
+ */
+
+/*	AVERAGE_POOL_2D and MAX_POOL_2D (MAXIMUM). Padding does not count:
+	at the edges the average is over the part of the window that is
+	inside the picture.
+*/
+
+#include "common.glsl"
+
+layout(push_constant) uniform Params {
+	uint	total;
+	uint	rowSize;
+	uint	groups;
+	int		inWidth;
+	int		inHeight;
+	int		outWidth;
+	int		outHeight;
+	int		filterWidth;
+	int		filterHeight;
+	int		strideWidth;
+	int		strideHeight;
+	int		padLeft;
+	int		padTop;
+	float	minimum;
+	float	maximum;
+} p;
+
+layout(std430, binding = 0) writeonly buffer Output { vec4 data[]; } o;
+layout(std430, binding = 1) readonly buffer Input { vec4 data[]; } a;
+
+void
+main()
+{
+	uint index = INVOCATION(p.rowSize);
+	if (index >= p.total)
+		return;
+
+	uint position = index / p.groups;
+	uint group = index - position * p.groups;
+	uint row = position / uint(p.outWidth);
+	int x = int(position - row * uint(p.outWidth));
+	uint batch = row / uint(p.outHeight);
+	int y = int(row - batch * uint(p.outHeight));
+
+	int top = y * p.strideHeight - p.padTop;
+	int left = x * p.strideWidth - p.padLeft;
+	int firstY = max(top, 0);
+	int endY = min(top + p.filterHeight, p.inHeight);
+	int firstX = max(left, 0);
+	int endX = min(left + p.filterWidth, p.inWidth);
+
+	vec4 result = vec4(0.0);
+	if (endY > firstY && endX > firstX) {
+#ifdef MAXIMUM
+		result = vec4(-3.402823466e38);
+#endif
+		for (int sy = firstY; sy < endY; sy++) {
+			uint source = ((batch * uint(p.inHeight) + uint(sy))
+				* uint(p.inWidth) + uint(firstX)) * p.groups + group;
+			for (int sx = firstX; sx < endX; sx++) {
+#ifdef MAXIMUM
+				result = max(result, a.data[source]);
+#else
+				result += a.data[source];
+#endif
+				source += p.groups;
+			}
+		}
+#ifndef MAXIMUM
+		result /= float((endY - firstY) * (endX - firstX));
+#endif
+	}
+
+	o.data[index] = clamp(result, p.minimum, p.maximum);
+}

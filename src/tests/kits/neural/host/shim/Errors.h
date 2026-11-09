@@ -1,0 +1,39 @@
+/*
+ * Copyright 2026, air/OS contributors.
+ * Distributed under the terms of the MIT License.
+ */
+#ifndef _HOST_ERRORS_H
+#define _HOST_ERRORS_H
+
+#include <limits.h>
+
+#define B_GENERAL_ERROR_BASE	INT_MIN
+
+enum {
+	B_NO_MEMORY = B_GENERAL_ERROR_BASE,
+	B_IO_ERROR,
+	B_PERMISSION_DENIED,
+	B_BAD_INDEX,
+	B_BAD_TYPE,
+	B_BAD_VALUE,
+	B_MISMATCHED_VALUES,
+	B_NAME_NOT_FOUND,
+	B_NAME_IN_USE,
+	B_TIMED_OUT,
+	B_INTERRUPTED,
+	B_WOULD_BLOCK,
+	B_CANCELED,
+	B_NO_INIT,
+	B_BUSY,
+	B_NOT_ALLOWED,
+	B_BAD_DATA,
+	B_DONT_DO_THAT,
+
+	B_ERROR = -1,
+	B_OK = 0,
+	B_NO_ERROR = 0
+};
+
+#define B_NOT_SUPPORTED			(B_GENERAL_ERROR_BASE + 0x7000 + 38)
+
+#endif	// _HOST_ERRORS_H

@@ -1,0 +1,70 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+/*
+ * Copyright 2026, air/OS contributors.
+ * Distributed under the terms of the MIT License.
+ */
+
+/*	ADD, SUB and MUL. An input is as large as the output, or it is
+	repeated: one whose shape is the end of the output's shape (a value
+	per channel, say) has countX vec4 that are read over and over, and
+	one of a single element (countX is 0) has it in its first lane.
+*/
+
+#include "common.glsl"
+
+#define OPERATION_ADD	0u
+#define OPERATION_SUB	1u
+#define OPERATION_MUL	2u
+
+layout(push_constant) uniform Params {
+	uint	total;
+	uint	rowSize;
+	uint	groups;
+	uint	channels;
+	uint	operation;
+	uint	countA;
+	uint	countB;
+	float	minimum;
+	float	maximum;
+} p;
+
+layout(std430, binding = 0) writeonly buffer Output { vec4 data[]; } o;
+layout(std430, binding = 1) readonly buffer InputA { vec4 data[]; } a;
+layout(std430, binding = 2) readonly buffer InputB { vec4 data[]; } b;
+
+void
+main()
+{
+	uint index = INVOCATION(p.rowSize);
+	if (index >= p.total)
+		return;
+
+	vec4 x;
+	if (p.countA == 0u)
+		x = vec4(a.data[0].x);
+	else if (p.countA == p.total)
+		x = a.data[index];
+	else
+		x = a.data[index % p.countA];
+
+	vec4 y;
+	if (p.countB == 0u)
+		y = vec4(b.data[0].x);
+	else if (p.countB == p.total)
+		y = b.data[index];
+	else
+		y = b.data[index % p.countB];
+
+	vec4 result;
+	if (p.operation == OPERATION_ADD)
+		result = x + y;
+	else if (p.operation == OPERATION_SUB)
+		result = x - y;
+	else
+		result = x * y;
+
+	o.data[index] = mask_lanes(clamp(result, p.minimum, p.maximum),
+		index % p.groups, p.channels);
+}

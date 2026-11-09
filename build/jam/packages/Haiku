@@ -152,6 +152,12 @@ AddNewDriversToPackage graphics :
 	v3d@arm64
 	virtio_gpu
 	;
+# Neural processors. The drivers are loaded when something looks into
+# /dev/npu, which exists because the directory drivers/dev/npu does.
+AddNewDriversToPackage npu :
+	rk3588_npu@arm64
+	;
+AddDirectoryToPackage add-ons kernel drivers dev npu ;
 AddNewDriversToPackage power
 	: $(SYSTEM_ADD_ONS_DRIVERS_POWER) ;
 AddNewDriversToPackage sensor
@@ -531,6 +537,7 @@ AddFilesToPackage add-ons kernel network protocols
 	: $(SYSTEM_NETWORK_PROTOCOLS) ;
 
 AddFilesToPackage add-ons Screen\ Savers : $(SYSTEM_ADD_ONS_SCREENSAVERS) ;
+AddFilesToPackage add-ons neural : $(SYSTEM_ADD_ONS_NEURAL) ;
 AddFilesToPackage add-ons quick_look : $(SYSTEM_ADD_ONS_QUICK_LOOK) ;
 AddFilesToPackage add-ons Terminal : $(SYSTEM_ADD_ONS_TERMINAL) ;
 

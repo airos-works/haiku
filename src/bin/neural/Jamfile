@@ -1,0 +1,6 @@
+SubDir HAIKU_TOP src bin neural ;
+
+Application neural :
+	neural.cpp
+	: be neural translation [ TargetLibstdc++ ]
+;

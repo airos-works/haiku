@@ -1,0 +1,52 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+/*
+ * Copyright 2026, air/OS contributors.
+ * Distributed under the terms of the MIT License.
+ */
+
+//	PAD: a frame of one value around the pictures.
+
+#include "common.glsl"
+
+layout(push_constant) uniform Params {
+	uint	total;
+	uint	rowSize;
+	uint	groups;
+	uint	channels;
+	int		inWidth;
+	int		inHeight;
+	int		outWidth;
+	int		outHeight;
+	int		padLeft;
+	int		padTop;
+	float	value;
+} p;
+
+layout(std430, binding = 0) writeonly buffer Output { vec4 data[]; } o;
+layout(std430, binding = 1) readonly buffer Input { vec4 data[]; } a;
+
+void
+main()
+{
+	uint index = INVOCATION(p.rowSize);
+	if (index >= p.total)
+		return;
+
+	uint position = index / p.groups;
+	uint group = index - position * p.groups;
+	uint row = position / uint(p.outWidth);
+	int x = int(position - row * uint(p.outWidth)) - p.padLeft;
+	uint batch = row / uint(p.outHeight);
+	int y = int(row - batch * uint(p.outHeight)) - p.padTop;
+
+	vec4 result;
+	if (x >= 0 && x < p.inWidth && y >= 0 && y < p.inHeight) {
+		result = a.data[((batch * uint(p.inHeight) + uint(y))
+			* uint(p.inWidth) + uint(x)) * p.groups + group];
+	} else
+		result = mask_lanes(vec4(p.value), group, p.channels);
+
+	o.data[index] = result;
+}

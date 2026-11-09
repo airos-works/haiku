@@ -6,6 +6,7 @@ include [ FDirName $(HAIKU_BUILD_RULES_DIR) images definitions minimum ] ;
 SEARCH on [ FGristFiles userguide quicktour welcome ]
 	= [ FDirName $(HAIKU_TOP) data bin ] ;
 SYSTEM_BIN += userguide quicktour welcome ;
+SYSTEM_BIN += neural ;
 
 SYSTEM_BIN += [ FFilterByBuildFeatures
 	cddb_lookup
@@ -115,6 +116,7 @@ SYSTEM_DEMOS += [ FFilterByBuildFeatures
 	Cortex@expat
 	FontDemo
 	GLTeapot@mesa
+	Lookout
 	Mandelbrot
 	OverlayImage
 	Pairs
@@ -149,6 +151,7 @@ rule HaikuImageGetSystemLibs
 			libmidi.so@fluidlite
 			libmidi2.so
 			libnetwork.so
+			libneural.so
 			libnvmm.so@x86_64
 			libpackage.so
 			libquicklook.so
@@ -301,6 +304,14 @@ SYSTEM_ADD_ONS_SCREENSAVERS += [ FFilterByBuildFeatures
 	Nebula
 	Shelf
 	Spider
+] ;
+
+# Neural Kit back ends; each finds out by itself whether its hardware is
+# there
+SYSTEM_ADD_ONS_NEURAL = [ FFilterByBuildFeatures
+	amdxdna.neural@x86_64
+	rk3588_npu.neural@arm64
+	vulkan.neural
 ] ;
 
 SYSTEM_ADD_ONS_QUICK_LOOK = [ FFilterByBuildFeatures

@@ -1,0 +1,118 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+/*
+ * Copyright 2026, air/OS contributors.
+ * Distributed under the terms of the MIT License.
+ */
+
+/*	DEPTHWISE_CONV_2D. An invocation makes four output channels of one
+	position; the weights are one vec4 per output group and kernel
+	element, in the order the loops read them.
+
+	With a depth multiplier of 1 the four output channels come from the
+	same four input channels. Otherwise (MULTIPLIER) output channel c
+	comes from input channel c / multiplier, which is looked up lane by
+	lane.
+
+	GRID: the invocations are laid out as the output is (see
+	common.glsl), which is the faster way for large pictures and the
+	slower one for small ones; a program tries both.
+*/
+
+#include "common.glsl"
+
+layout(push_constant) uniform Params {
+	uint	total;
+	uint	rowSize;
+	uint	positions;
+	int		inWidth;
+	int		inHeight;
+	uint	inGroups;
+	int		outWidth;
+	int		outHeight;
+	uint	outGroups;
+	int		kernelWidth;
+	int		kernelHeight;
+	int		strideWidth;
+	int		strideHeight;
+	int		dilationWidth;
+	int		dilationHeight;
+	int		padLeft;
+	int		padTop;
+	float	minimum;
+	float	maximum;
+	uint	multiplier;
+} p;
+
+layout(std430, binding = 0) writeonly buffer Output { vec4 data[]; } o;
+layout(std430, binding = 1) readonly buffer Input { vec4 data[]; } a;
+layout(std430, binding = 2) readonly buffer Weights { vec4 data[]; } w;
+layout(std430, binding = 3) readonly buffer Bias { vec4 data[]; } b;
+
+void
+main()
+{
+#ifdef GRID
+	int x = int(gl_GlobalInvocationID.x);
+	int y = int(gl_GlobalInvocationID.y);
+	if (x >= p.outWidth || y >= p.outHeight)
+		return;
+	uint batch = gl_GlobalInvocationID.z / p.outGroups;
+	uint group = gl_GlobalInvocationID.z - batch * p.outGroups;
+	uint position = (batch * uint(p.outHeight) + uint(y)) * uint(p.outWidth)
+		+ uint(x);
+#else
+	uint index = INVOCATION(p.rowSize);
+	if (index >= p.total)
+		return;
+
+	uint group = index / p.positions;
+	uint position = index - group * p.positions;
+	uint row = position / uint(p.outWidth);
+	int x = int(position - row * uint(p.outWidth));
+	uint batch = row / uint(p.outHeight);
+	int y = int(row - batch * uint(p.outHeight));
+#endif
+
+#ifdef MULTIPLIER
+	// The lanes past the last output channel have weights of zero; they
+	// only must not read outside the input.
+	uvec4 channel = min((group * 4u + uvec4(0u, 1u, 2u, 3u)) / p.multiplier,
+		uvec4(p.inGroups * 4u - 1u));
+	uvec4 channelGroup = channel >> 2u;
+	uvec4 lane = channel & 3u;
+#endif
+
+	vec4 sum = b.data[group];
+	uint weight = group * uint(p.kernelHeight * p.kernelWidth);
+	int top = y * p.strideHeight - p.padTop;
+	int left = x * p.strideWidth - p.padLeft;
+	for (int ky = 0; ky < p.kernelHeight; ky++) {
+		int sy = top + ky * p.dilationHeight;
+		if (sy < 0 || sy >= p.inHeight) {
+			weight += uint(p.kernelWidth);
+			continue;
+		}
+		uint line = (batch * uint(p.inHeight) + uint(sy)) * uint(p.inWidth);
+		for (int kx = 0; kx < p.kernelWidth; kx++) {
+			int sx = left + kx * p.dilationWidth;
+			if (sx >= 0 && sx < p.inWidth) {
+				uint source = (line + uint(sx)) * p.inGroups;
+#ifdef MULTIPLIER
+				vec4 value = vec4(a.data[source + channelGroup.x][lane.x],
+					a.data[source + channelGroup.y][lane.y],
+					a.data[source + channelGroup.z][lane.z],
+					a.data[source + channelGroup.w][lane.w]);
+#else
+				vec4 value = a.data[source + group];
+#endif
+				sum += w.data[weight] * value;
+			}
+			weight++;
+		}
+	}
+
+	o.data[position * p.outGroups + group]
+		= clamp(sum, p.minimum, p.maximum);
+}

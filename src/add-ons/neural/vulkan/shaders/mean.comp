@@ -1,0 +1,44 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+/*
+ * Copyright 2026, air/OS contributors.
+ * Distributed under the terms of the MIT License.
+ */
+
+/*	MEAN over height and width. An invocation makes four channels of one
+	picture of the batch.
+*/
+
+#include "common.glsl"
+
+layout(push_constant) uniform Params {
+	//! batches * groups
+	uint	total;
+	uint	rowSize;
+	uint	groups;
+	//! height * width
+	uint	area;
+} p;
+
+layout(std430, binding = 0) writeonly buffer Output { vec4 data[]; } o;
+layout(std430, binding = 1) readonly buffer Input { vec4 data[]; } a;
+
+void
+main()
+{
+	uint index = INVOCATION(p.rowSize);
+	if (index >= p.total)
+		return;
+
+	uint batch = index / p.groups;
+	uint source = batch * p.area * p.groups + (index - batch * p.groups);
+
+	vec4 sum = vec4(0.0);
+	for (uint i = 0u; i < p.area; i++) {
+		sum += a.data[source];
+		source += p.groups;
+	}
+
+	o.data[index] = sum / float(p.area);
+}

@@ -1,0 +1,19 @@
+SubDir HAIKU_TOP src add-ons neural rk3588_npu ;
+
+# the driver's interface
+SubDirHdrs $(HAIKU_TOP) src add-ons kernel drivers npu rk3588_npu ;
+
+# Moving tensors in and out of the processor's layout is a loop over
+# bytes that is worth the vectorizer.
+SubDirC++Flags -O3 ;
+
+Addon rk3588_npu.neural :
+	Backend.cpp
+	Coefficients.cpp
+	Device.cpp
+	Program.cpp
+	Regcmd.cpp
+	Support.cpp
+	Tasks.cpp
+	: be neural [ TargetLibstdc++ ]
+;

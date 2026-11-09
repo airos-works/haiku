@@ -1,0 +1,653 @@
+/*
+ * Copyright 2026, air/OS contributors.
+ * Distributed under the terms of the MIT License.
+ */
+
+
+#include "Support.h"
+
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <algorithm>
+
+
+// What the registers have room for.
+static const uint32 kMaxInputSize = 2047;
+static const uint32 kMaxOutputSize = 8191;
+static const uint32 kMaxChannels = 8191;
+static const uint32 kMaxKernels = 16382;
+static const uint32 kMaxBytesPerKernel = 0x7ffff;
+static const uint32 kMaxPadding = 15;
+
+// What has been tried on the hardware, see rk3588_npu_backend_test.
+static const uint32 kMaxKernelSize = 7;
+static const uint32 kMaxStride = 2;
+
+
+// #pragma mark - GraphUse
+
+
+GraphUse::GraphUse()
+	:
+	fProducers(NULL),
+	fConsumers(NULL),
+	fOutputs(NULL)
+{
+}
+
+
+GraphUse::~GraphUse()
+{
+	free(fProducers);
+	free(fConsumers);
+	free(fOutputs);
+}
+
+
+status_t
+GraphUse::Init(const BNeuralGraph& graph)
+{
+	int32 tensorCount = graph.CountTensors();
+	size_t count = tensorCount > 0 ? tensorCount : 1;
+
+	fProducers = (int32*)malloc(count * sizeof(int32));
+	fConsumers = (int32*)calloc(count, sizeof(int32));
+	fOutputs = (bool*)calloc(count, sizeof(bool));
+	if (fProducers == NULL || fConsumers == NULL || fOutputs == NULL)
+		return B_NO_MEMORY;
+
+	for (int32 i = 0; i < tensorCount; i++)
+		fProducers[i] = -1;
+
+	for (int32 i = 0; i < graph.CountOperators(); i++) {
+		const neural_graph_operator* op = graph.OperatorAt(i);
+		for (int32 j = 0; j < op->output_count; j++) {
+			int32 tensor = op->outputs[j];
+			if (tensor >= 0 && tensor < tensorCount)
+				fProducers[tensor] = i;
+		}
+		for (int32 j = 0; j < op->input_count; j++) {
+			int32 tensor = op->inputs[j];
+			if (tensor >= 0 && tensor < tensorCount)
+				fConsumers[tensor]++;
+		}
+	}
+
+	for (int32 i = 0; i < graph.CountOutputs(); i++) {
+		int32 tensor = graph.OutputAt(i);
+		if (tensor >= 0 && tensor < tensorCount)
+			fOutputs[tensor] = true;
+	}
+
+	return B_OK;
+}
+
+
+// #pragma mark - tensors
+
+
+static inline bool
+is_byte_type(neural_data_type type)
+{
+	return type == B_NEURAL_UINT8 || type == B_NEURAL_INT8;
+}
+
+
+/*!	A tensor of activations the processor can hold: one picture of
+	quantized bytes with one scale. */
+static bool
+is_feature_tensor(const neural_graph_tensor* tensor)
+{
+	if (tensor == NULL || tensor->data != NULL || !is_byte_type(tensor->type)
+		|| !tensor->quantized || tensor->channel_count != 0
+		|| tensor->rank != 4 || tensor->dimensions[0] != 1) {
+		return false;
+	}
+	for (int32 i = 1; i < 4; i++) {
+		if (tensor->dimensions[i] < 1)
+			return false;
+	}
+	return tensor->scale > 0 && isfinite(tensor->scale);
+}
+
+
+//! The zero point of a tensor as the processor stores it.
+static inline int32
+device_zero_point(const neural_graph_tensor* tensor)
+{
+	return tensor->zero_point - (tensor->type == B_NEURAL_UINT8 ? 0x80 : 0);
+}
+
+
+static inline bool
+zero_point_valid(const neural_graph_tensor* tensor)
+{
+	int32 zeroPoint = device_zero_point(tensor);
+	return zeroPoint >= -128 && zeroPoint <= 127;
+}
+
+
+/*!	The sum that becomes a given output (less the zero point), for a
+	factor of sums to outputs; false if there is none that does so
+	safely, away from where rounding decides. */
+static bool
+sum_for_output(const Operation& operation, int32 output, int32* _sum)
+{
+	// the factor of sums to outputs as the processor has it, and what
+	// plan_conversion() has it add, in outputs
+	double unit = ldexp((double)operation.output_multiplier,
+		-(int)operation.output_shift);
+	double factor = operation.sum_multiplier * unit;
+	double added = operation.rounding_offset * unit;
+
+	double exact = (output - added) / factor;
+	if (fabs(exact) > (double)(1 << 30) / operation.sum_multiplier)
+		return false;
+
+	int64 sum = llround(exact);
+	if (fabs(sum * factor + added - output) > 0.45
+		|| converted_output(operation, sum) != output) {
+		return false;
+	}
+
+	*_sum = (int32)sum;
+	return true;
+}
+
+
+/*!	Decides how the processor makes outputs of the sums of an operation:
+	in the end by multiplying with a number of 15 bits and shifting right,
+	which rounds to the nearest output. \a factor is the scale of the sums
+	over that of the tensor they become.
+
+	Before that, the stage that adds the bias can multiply the sums by a
+	small number, which is used for two things when the sums have room:
+
+	- With two numbers to choose, the product is much closer to the factor
+	  than 15 bits get, so fewer outputs fall on the other side of a
+	  rounding than with the CPU's factor of 31 bits.
+
+	- Rounding as the CPU does. The kit's interpreter converts as
+	  TensorFlow Lite's reference code does: it multiplies by a factor
+	  between a half and one and rounds, then divides by a power of two
+	  and rounds again. For a result that is not negative that is the
+	  same as adding a little to the exact product before rounding it
+	  once: 2^-(n+1) outputs for a division by 2^n. Without it, one in
+	  eight of the processor's outputs is one less than the CPU's when n
+	  is 1 (depthwise convolutions typically), one in sixteen when it is
+	  2, and so on. The little is less than one sum, but not less than one
+	  of the multiplied sums, to which the second stage adds it.
+	  \a roundLikeCPU says that the outputs cannot be below the zero point;
+	  below it the CPU's rounding leans the other way, which the processor
+	  cannot follow.
+
+	\a bound is how large a sum can get. */
+static bool
+plan_conversion(Operation& operation, double factor, bool roundLikeCPU,
+	uint64 bound)
+{
+	operation.sum_multiplier = 1;
+	operation.rounding_offset = 0;
+	if (!output_conversion(factor, &operation.output_multiplier,
+			&operation.output_shift)) {
+		return false;
+	}
+
+	uint32 bits = 8;
+	while (bits > 0 && (bound << bits) >= ((uint64)1 << 30))
+		bits--;
+	if (bits < 4)
+		return true;
+
+	int exponent;
+	frexp(factor, &exponent);
+	double offset = roundLikeCPU && exponent <= -1
+		? ldexp(1.0, exponent - 1) : 0;
+
+	// How far off the outputs are, in outputs: by the factor (for a large
+	// output) and by the offset.
+	double best = fabs(ldexp((double)operation.output_multiplier,
+		-(int)operation.output_shift) - factor) / factor * 128 + offset;
+
+	for (uint32 multiplier = (1 << (bits - 1)) + 1;
+			multiplier <= ((uint32)1 << bits); multiplier++) {
+		uint32 scale;
+		uint32 shift;
+		if (!output_conversion(factor / multiplier, &scale, &shift))
+			continue;
+
+		double unit = ldexp((double)scale, -(int)shift);
+		double exactOffset = offset / unit;
+		int64 roundedOffset = llround(exactOffset);
+		double error = fabs(multiplier * unit - factor) / factor * 128
+			+ fabs(roundedOffset - exactOffset) * unit;
+		if (error < best) {
+			best = error;
+			operation.sum_multiplier = multiplier;
+			operation.rounding_offset = (int32)roundedOffset;
+			operation.output_multiplier = scale;
+			operation.output_shift = shift;
+		}
+	}
+
+	return true;
+}
+
+
+/*!	How large the sums of an operation can get, bias included. */
+static uint64
+sum_bound(const Operation& operation, const neural_graph_tensor* bias)
+{
+	uint64 bound = (uint64)operation.weights_width * operation.weights_height
+		* (operation.depthwise ? 1 : operation.input_channels) * 255 * 255;
+	if (bias != NULL) {
+		const int32* values = (const int32*)bias->data;
+		int64 largest = 0;
+		for (uint32 i = 0; i < operation.output_channels; i++)
+			largest = std::max(largest, (int64)llabs(values[i]));
+		bound += largest;
+	}
+	return bound;
+}
+
+
+/*!	Works out the bounds the sums of an operation have to be kept within
+	for an activation, \a tensor being what the sums become. The
+	processor ends every operation by clamping to what a byte holds; in
+	quantized networks that often is the activation already, the range of
+	the tensor ending where the activation's does, and then there are no
+	bounds to set. \a always asks for bounds even so: when another tensor
+	is added to the sums, they are not clamped as that tensor would be.
+	Returns false if the processor cannot do the activation. */
+static bool
+plan_clamp(Operation& operation, neural_activation activation,
+	const neural_graph_tensor* tensor, bool always)
+{
+	int32 minimum = tensor->type == B_NEURAL_UINT8 ? 0 : -128;
+	int32 maximum = tensor->type == B_NEURAL_UINT8 ? 255 : 127;
+	int32 zeroPoint = tensor->zero_point;
+	double scale = tensor->scale;
+
+	// as TensorFlow Lite computes them
+	double low = minimum;
+	double high = maximum;
+	switch (activation) {
+		case B_NEURAL_ACTIVATION_NONE:
+			break;
+		case B_NEURAL_ACTIVATION_RELU:
+			low = std::max(low, (double)zeroPoint);
+			break;
+		case B_NEURAL_ACTIVATION_RELU6:
+			low = std::max(low, (double)zeroPoint);
+			high = std::min(high, zeroPoint + round(6.0 / scale));
+			break;
+		case B_NEURAL_ACTIVATION_RELU_N1_TO_1:
+			low = std::max(low, zeroPoint + round(-1.0 / scale));
+			high = std::min(high, zeroPoint + round(1.0 / scale));
+			break;
+		default:
+			return false;
+	}
+	if (low > high)
+		return false;
+
+	operation.clamp_low = always || low > minimum;
+	operation.clamp_high = always || high < maximum;
+	operation.clamp_minimum = 0;
+	operation.clamp_maximum = 0;
+	if (!operation.clamp_low && !operation.clamp_high)
+		return true;
+
+	// An upper bound is a distance from the lower one.
+	if (operation.clamp_high) {
+		operation.clamp_low = true;
+		if (!sum_for_output(operation, (int32)high - zeroPoint,
+				&operation.clamp_maximum)) {
+			return false;
+		}
+	}
+	// (the sum for an output of zero is zero)
+	if ((int32)low != zeroPoint && !sum_for_output(operation,
+			(int32)low - zeroPoint, &operation.clamp_minimum)) {
+		return false;
+	}
+
+	return !operation.clamp_high
+		|| operation.clamp_maximum >= operation.clamp_minimum;
+}
+
+
+// #pragma mark - operators
+
+
+bool
+tasks_possible(const Operation& operation)
+{
+	Operation copy = operation;
+	copy.tasks = NULL;
+	copy.task_count = 0;
+
+	status_t status = split_tasks(copy);
+	free(copy.tasks);
+	return status == B_OK;
+}
+
+
+status_t
+describe_convolution(const BNeuralGraph& graph, int32 index,
+	Operation& operation)
+{
+	const neural_graph_operator* op = graph.OperatorAt(index);
+	if (op == NULL || (op->code != B_NEURAL_OP_CONV_2D
+			&& op->code != B_NEURAL_OP_DEPTHWISE_CONV_2D)
+		|| op->input_count < 2 || op->output_count != 1
+		|| op->params == NULL) {
+		return B_NOT_SUPPORTED;
+	}
+
+	const neural_conv_params* params = (const neural_conv_params*)op->params;
+	const neural_graph_tensor* input = graph.TensorAt(op->inputs[0]);
+	const neural_graph_tensor* weights = graph.TensorAt(op->inputs[1]);
+	const neural_graph_tensor* output = graph.TensorAt(op->outputs[0]);
+	int32 biasIndex = op->input_count > 2 ? op->inputs[2] : -1;
+
+	if (!is_feature_tensor(input) || !is_feature_tensor(output)
+		|| input->type != output->type || !zero_point_valid(input)
+		|| !zero_point_valid(output)) {
+		return B_NOT_SUPPORTED;
+	}
+
+	// The weights: constant bytes with one scale. Weights with a scale
+	// per channel would need a multiplier per channel after the sums.
+	if (weights == NULL || weights->data == NULL
+		|| !is_byte_type(weights->type) || !weights->quantized
+		|| weights->rank != 4 || !zero_point_valid(weights)) {
+		return B_NOT_SUPPORTED;
+	}
+	float weightsScale = weights->scale;
+	if (weights->channel_count > 0) {
+		if (weights->channel_scales == NULL || weights->zero_point != 0)
+			return B_NOT_SUPPORTED;
+		weightsScale = weights->channel_scales[0];
+		for (int32 i = 1; i < weights->channel_count; i++) {
+			if (weights->channel_scales[i] != weightsScale)
+				return B_NOT_SUPPORTED;
+		}
+	}
+	if (!(weightsScale > 0) || !isfinite(weightsScale))
+		return B_NOT_SUPPORTED;
+
+	memset(&operation, 0, sizeof(operation));
+	operation.add_tensor = -1;
+	operation.addend = -1;
+	operation.input = -1;
+	operation.output = -1;
+
+	operation.depthwise = op->code == B_NEURAL_OP_DEPTHWISE_CONV_2D;
+	operation.padding_same = params->padding == B_NEURAL_PADDING_SAME;
+	operation.stride = params->stride_width;
+
+	operation.input_tensor = op->inputs[0];
+	operation.output_tensor = op->outputs[0];
+	operation.weights_tensor = op->inputs[1];
+	operation.bias_tensor = biasIndex;
+
+	operation.input_height = input->dimensions[1];
+	operation.input_width = input->dimensions[2];
+	operation.input_channels = input->dimensions[3];
+	operation.input_zero_point = device_zero_point(input);
+	operation.input_scale = input->scale;
+
+	operation.output_height = output->dimensions[1];
+	operation.output_width = output->dimensions[2];
+	operation.output_channels = output->dimensions[3];
+	operation.output_zero_point = device_zero_point(output);
+	operation.output_scale = output->scale;
+
+	operation.weights_height = weights->dimensions[1];
+	operation.weights_width = weights->dimensions[2];
+	operation.weights_signed = weights->type == B_NEURAL_INT8;
+	operation.weights_zero_point = device_zero_point(weights);
+	operation.weights_scale = weightsScale;
+
+	if (params->padding != B_NEURAL_PADDING_SAME
+		&& params->padding != B_NEURAL_PADDING_VALID) {
+		return B_NOT_SUPPORTED;
+	}
+	if (params->dilation_width != 1 || params->dilation_height != 1
+		|| params->stride_width != params->stride_height
+		|| operation.stride < 1 || operation.stride > kMaxStride) {
+		return B_NOT_SUPPORTED;
+	}
+	if (operation.weights_width != operation.weights_height
+		|| operation.weights_width < 1
+		|| operation.weights_width > kMaxKernelSize) {
+		return B_NOT_SUPPORTED;
+	}
+
+	// The channels. A single input channel the processor wants in a
+	// layout of its own, which this back end does not make.
+	if (operation.input_channels < 2
+		|| operation.input_channels > kMaxChannels
+		|| operation.output_channels > kMaxChannels) {
+		return B_NOT_SUPPORTED;
+	}
+	if (operation.depthwise) {
+		if (params->depth_multiplier != 1 || weights->dimensions[0] != 1
+			|| (uint32)weights->dimensions[3] != operation.input_channels
+			|| operation.output_channels != operation.input_channels) {
+			return B_NOT_SUPPORTED;
+		}
+	} else {
+		if ((uint32)weights->dimensions[0] != operation.output_channels
+			|| (uint32)weights->dimensions[3] != operation.input_channels
+			|| operation.output_channels > kMaxKernels) {
+			return B_NOT_SUPPORTED;
+		}
+	}
+	if (operation.weights_width * operation.weights_height
+			* round_up(operation.input_channels, FEATURE_ATOMIC_SIZE)
+			> kMaxBytesPerKernel) {
+		return B_NOT_SUPPORTED;
+	}
+
+	// the bias: one number of 32 bits per output channel
+	if (biasIndex >= 0) {
+		const neural_graph_tensor* bias = graph.TensorAt(biasIndex);
+		if (bias == NULL || bias->data == NULL
+			|| bias->type != B_NEURAL_INT32
+			|| bias->size != operation.output_channels * sizeof(int32)) {
+			return B_NOT_SUPPORTED;
+		}
+	}
+
+	// The sizes, and that the output is as large as the padding makes it.
+	if (operation.input_width > kMaxInputSize
+		|| operation.input_height > kMaxInputSize
+		|| operation.output_width > kMaxOutputSize
+		|| operation.output_height > kMaxOutputSize) {
+		return B_NOT_SUPPORTED;
+	}
+	uint32 expectedWidth;
+	uint32 expectedHeight;
+	if (operation.padding_same) {
+		expectedWidth = divide_up(operation.input_width, operation.stride);
+		expectedHeight = divide_up(operation.input_height, operation.stride);
+
+		int32 padding = (int32)((expectedWidth - 1) * operation.stride
+			+ operation.weights_width) - (int32)operation.input_width;
+		int32 paddingHeight = (int32)((expectedHeight - 1) * operation.stride
+			+ operation.weights_height) - (int32)operation.input_height;
+		if (paddingHeight > padding)
+			padding = paddingHeight;
+		if (padding > 0 && ((uint32)(padding + 1) / 2 > kMaxPadding
+				|| (uint32)(padding + 1) / 2 >= operation.weights_width)) {
+			return B_NOT_SUPPORTED;
+		}
+	} else {
+		if (operation.input_width < operation.weights_width
+			|| operation.input_height < operation.weights_height) {
+			return B_NOT_SUPPORTED;
+		}
+		expectedWidth = (operation.input_width - operation.weights_width)
+			/ operation.stride + 1;
+		expectedHeight = (operation.input_height - operation.weights_height)
+			/ operation.stride + 1;
+	}
+	if (operation.output_width != expectedWidth
+		|| operation.output_height != expectedHeight) {
+		return B_NOT_SUPPORTED;
+	}
+
+	// How sums become outputs; the outputs of ReLUs and of tensors that
+	// begin at zero are never below the zero point.
+	int32 minimum = output->type == B_NEURAL_UINT8 ? 0 : -128;
+	bool roundLikeCPU = output->zero_point == minimum
+		|| params->activation == B_NEURAL_ACTIVATION_RELU
+		|| params->activation == B_NEURAL_ACTIVATION_RELU6;
+	operation.activation = params->activation;
+	if (!plan_conversion(operation, (double)operation.input_scale
+				* operation.weights_scale / operation.output_scale,
+			roundLikeCPU, sum_bound(operation,
+				biasIndex >= 0 ? graph.TensorAt(biasIndex) : NULL))
+		|| !plan_clamp(operation, params->activation, output, false)) {
+		return B_NOT_SUPPORTED;
+	}
+
+	if (!tasks_possible(operation))
+		return B_NOT_SUPPORTED;
+
+	return B_OK;
+}
+
+
+status_t
+find_addition_target(const BNeuralGraph& graph, const GraphUse& use,
+	int32 index, const bool* inProgram, int32* _convolution, int32* _addend)
+{
+	const neural_graph_operator* op = graph.OperatorAt(index);
+	if (op == NULL || op->code != B_NEURAL_OP_ADD || op->input_count != 2
+		|| op->output_count != 1) {
+		return B_NOT_SUPPORTED;
+	}
+
+	int32 a = op->inputs[0];
+	int32 b = op->inputs[1];
+	if (a < 0 || b < 0 || a == b)
+		return B_NOT_SUPPORTED;
+
+	// The convolution has to be the later of the two makers: the other
+	// operand must be there when it runs.
+	int32 sum = use.Producer(a) > use.Producer(b) ? a : b;
+	int32 addend = sum == a ? b : a;
+	int32 convolution = use.Producer(sum);
+	if (convolution < 0 || convolution >= index
+		|| use.Producer(addend) >= convolution) {
+		return B_NOT_SUPPORTED;
+	}
+
+	const neural_graph_operator* target = graph.OperatorAt(convolution);
+	if (target->code != B_NEURAL_OP_CONV_2D
+		&& target->code != B_NEURAL_OP_DEPTHWISE_CONV_2D) {
+		return B_NOT_SUPPORTED;
+	}
+
+	// Its output is not made any more, so nobody else may want it ...
+	if (use.CountConsumers(sum) != 1 || use.IsGraphOutput(sum))
+		return B_NOT_SUPPORTED;
+
+	// ... and both have to end up in one program.
+	for (int32 i = convolution; i < index; i++) {
+		if (!inProgram[i])
+			return B_NOT_SUPPORTED;
+	}
+
+	*_convolution = convolution;
+	*_addend = addend;
+	return B_OK;
+}
+
+
+status_t
+fuse_addition(const BNeuralGraph& graph, int32 index, int32 addendIndex,
+	Operation& operation)
+{
+	const neural_graph_operator* op = graph.OperatorAt(index);
+	if (op == NULL || op->code != B_NEURAL_OP_ADD || op->output_count != 1
+		|| operation.add_tensor >= 0) {
+		return B_NOT_SUPPORTED;
+	}
+
+	const neural_graph_tensor* sum = graph.TensorAt(operation.output_tensor);
+	const neural_graph_tensor* addend = graph.TensorAt(addendIndex);
+	const neural_graph_tensor* output = graph.TensorAt(op->outputs[0]);
+
+	if (!is_feature_tensor(addend) || !is_feature_tensor(output)
+		|| addend->type != sum->type || output->type != sum->type
+		|| !zero_point_valid(addend) || !zero_point_valid(output)) {
+		return B_NOT_SUPPORTED;
+	}
+	// no stretching of one operand to the shape of the other
+	for (int32 i = 1; i < 4; i++) {
+		if (addend->dimensions[i] != sum->dimensions[i]
+			|| output->dimensions[i] != sum->dimensions[i]) {
+			return B_NOT_SUPPORTED;
+		}
+	}
+	// A depthwise convolution that is to add as well never finishes (as
+	// this back end sets it up; Mesa has no network that does it).
+	if (operation.depthwise)
+		return B_NOT_SUPPORTED;
+
+	// What the convolution was to make outputs of its own with does not
+	// apply any more. With the addend in between, the sums are converted
+	// in one step.
+	double sumScale = (double)operation.input_scale * operation.weights_scale;
+	Operation probe = operation;
+	if (!plan_conversion(probe, sumScale / sum->scale, false, UINT64_MAX)
+		|| !plan_conversion(operation, sumScale / output->scale, false,
+			UINT64_MAX)) {
+		return B_NOT_SUPPORTED;
+	}
+
+	uint32 scale;
+	uint32 shift;
+	if (!addend_conversion(addend->scale / sumScale, &scale, &shift))
+		return B_NOT_SUPPORTED;
+
+	// The activation of the addition can only be the range of its output,
+	// which is what the processor clamps to at the end.
+	neural_activation activation = op->params != NULL
+		? ((const neural_binary_params*)op->params)->activation
+		: B_NEURAL_ACTIVATION_NONE;
+	Operation outputProbe = operation;
+	if (!plan_clamp(outputProbe, activation, output, false)
+		|| outputProbe.clamp_low || outputProbe.clamp_high) {
+		return B_NOT_SUPPORTED;
+	}
+
+	// The sums are what the convolution's own output would have been:
+	// they stay within that tensor's range and the convolution's
+	// activation. The bounds are those of the conversion that would have
+	// made that tensor.
+	if (!plan_clamp(probe, (neural_activation)operation.activation, sum,
+			true)) {
+		return B_NOT_SUPPORTED;
+	}
+	operation.clamp_low = probe.clamp_low;
+	operation.clamp_high = probe.clamp_high;
+	operation.clamp_minimum = probe.clamp_minimum;
+	operation.clamp_maximum = probe.clamp_maximum;
+
+	operation.add_tensor = addendIndex;
+	operation.addend_zero_point = device_zero_point(addend);
+	operation.addend_scale = addend->scale;
+
+	operation.output_tensor = op->outputs[0];
+	operation.output_zero_point = device_zero_point(output);
+	operation.output_scale = output->scale;
+
+	return B_OK;
+}

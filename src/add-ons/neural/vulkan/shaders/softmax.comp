@@ -1,0 +1,56 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+/*
+ * Copyright 2026, air/OS contributors.
+ * Distributed under the terms of the MIT License.
+ */
+
+/*	SOFTMAX along the channels. An invocation does one position: the
+	largest value first, so that no exponential overflows, then the sum,
+	then the results.
+*/
+
+#include "common.glsl"
+
+layout(push_constant) uniform Params {
+	//! positions
+	uint	total;
+	uint	rowSize;
+	uint	groups;
+	uint	channels;
+	float	beta;
+} p;
+
+layout(std430, binding = 0) writeonly buffer Output { vec4 data[]; } o;
+layout(std430, binding = 1) readonly buffer Input { vec4 data[]; } a;
+
+void
+main()
+{
+	uint index = INVOCATION(p.rowSize);
+	if (index >= p.total)
+		return;
+
+	uint base = index * p.groups;
+	const uvec4 kLanes = uvec4(0u, 1u, 2u, 3u);
+
+	vec4 highest = vec4(-3.402823466e38);
+	for (uint i = 0u; i < p.groups; i++) {
+		highest = max(highest, mix(highest, a.data[base + i],
+			lessThan(i * 4u + kLanes, uvec4(p.channels))));
+	}
+	float top = max(max(highest.x, highest.y), max(highest.z, highest.w));
+
+	vec4 sums = vec4(0.0);
+	for (uint i = 0u; i < p.groups; i++) {
+		sums += mask_lanes(exp((a.data[base + i] - top) * p.beta), i,
+			p.channels);
+	}
+	float scale = 1.0 / (sums.x + sums.y + sums.z + sums.w);
+
+	for (uint i = 0u; i < p.groups; i++) {
+		o.data[base + i] = mask_lanes(
+			exp((a.data[base + i] - top) * p.beta) * scale, i, p.channels);
+	}
+}

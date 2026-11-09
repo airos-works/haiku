@@ -1,0 +1,50 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+/*
+ * Copyright 2026, air/OS contributors.
+ * Distributed under the terms of the MIT License.
+ */
+
+/*	RESHAPE and the like, when the last dimension changes: the same
+	elements in the same order, but padded to four at other places.
+*/
+
+#include "common.glsl"
+
+layout(push_constant) uniform Params {
+	uint	total;
+	uint	rowSize;
+	uint	outGroups;
+	uint	outChannels;
+	uint	inGroups;
+	uint	inChannels;
+} p;
+
+layout(std430, binding = 0) writeonly buffer Output { vec4 data[]; } o;
+layout(std430, binding = 1) readonly buffer Input { vec4 data[]; } a;
+
+void
+main()
+{
+	uint index = INVOCATION(p.rowSize);
+	if (index >= p.total)
+		return;
+
+	uint position = index / p.outGroups;
+	uint group = index - position * p.outGroups;
+
+	vec4 result = vec4(0.0);
+	for (uint lane = 0u; lane < 4u; lane++) {
+		uint channel = group * 4u + lane;
+		if (channel < p.outChannels) {
+			uint element = position * p.outChannels + channel;
+			uint sourcePosition = element / p.inChannels;
+			uint sourceChannel = element - sourcePosition * p.inChannels;
+			result[lane] = a.data[sourcePosition * p.inGroups
+				+ (sourceChannel >> 2u)][sourceChannel & 3u];
+		}
+	}
+
+	o.data[index] = result;
+}

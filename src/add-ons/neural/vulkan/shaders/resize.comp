@@ -1,0 +1,72 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+/*
+ * Copyright 2026, air/OS contributors.
+ * Distributed under the terms of the MIT License.
+ */
+
+/*	RESIZE_BILINEAR. The positions are computed the way the CPU does it
+	(which is the way TensorFlow Lite does it), including the weight
+	below zero at the first position with half pixel centers.
+*/
+
+#include "common.glsl"
+
+layout(push_constant) uniform Params {
+	uint	total;
+	uint	rowSize;
+	uint	groups;
+	int		inWidth;
+	int		inHeight;
+	int		outWidth;
+	int		outHeight;
+	float	scaleX;
+	float	scaleY;
+	//! 0.5 for half pixel centers, else 0
+	float	offset;
+} p;
+
+layout(std430, binding = 0) writeonly buffer Output { vec4 data[]; } o;
+layout(std430, binding = 1) readonly buffer Input { vec4 data[]; } a;
+
+void
+source(int index, float scale, int size, out int lower, out int upper,
+	out float fraction)
+{
+	float position = (float(index) + p.offset) * scale - p.offset;
+	lower = clamp(int(floor(position)), 0, size - 1);
+	upper = clamp(int(ceil(position)), 0, size - 1);
+	fraction = position - float(lower);
+}
+
+void
+main()
+{
+	uint index = INVOCATION(p.rowSize);
+	if (index >= p.total)
+		return;
+
+	uint position = index / p.groups;
+	uint group = index - position * p.groups;
+	uint row = position / uint(p.outWidth);
+	int x = int(position - row * uint(p.outWidth));
+	uint batch = row / uint(p.outHeight);
+	int y = int(row - batch * uint(p.outHeight));
+
+	int x0, x1, y0, y1;
+	float fx, fy;
+	source(x, p.scaleX, p.inWidth, x0, x1, fx);
+	source(y, p.scaleY, p.inHeight, y0, y1, fy);
+
+	uint line0 = (batch * uint(p.inHeight) + uint(y0)) * uint(p.inWidth);
+	uint line1 = (batch * uint(p.inHeight) + uint(y1)) * uint(p.inWidth);
+	vec4 v00 = a.data[(line0 + uint(x0)) * p.groups + group];
+	vec4 v01 = a.data[(line0 + uint(x1)) * p.groups + group];
+	vec4 v10 = a.data[(line1 + uint(x0)) * p.groups + group];
+	vec4 v11 = a.data[(line1 + uint(x1)) * p.groups + group];
+
+	vec4 upper = v00 + (v01 - v00) * fx;
+	vec4 lower = v10 + (v11 - v10) * fx;
+	o.data[index] = upper + (lower - upper) * fy;
+}
