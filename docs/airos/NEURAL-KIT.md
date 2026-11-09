@@ -844,15 +844,22 @@ hand on the laptop; the driver is not in the images yet.
   processor still held dirty lines of the new output buffer (the kernel's
   clearing), and the back end's `clflush` after the command wrote them
   back over the NPU's result; the buffers are flushed before the command
-  now. The 112 ms a command seen before is the default power mode on the
-  pass-through and plain convolution designs (`xdna_test -p 4`, turbo:
-  3.9 ms); the bundle's design takes 0.12 ms in either.
+  now. The 112.5 ms a command seen before is the NPU's power mode: in
+  every mode but turbo the firmware gates the NPU's clocks when idle, and
+  on this driver each command then takes 112.5 ms to be answered whatever
+  it computes (cause not understood; Linux does not take that long). With
+  turbo (no clock gating) the same command takes 0.09 ms. The back end
+  sets turbo when it opens the device (`NEURAL_AMDXDNA_POWER` chooses
+  another mode); the mode is the device's until changed, and the NPU is
+  powered down whenever nobody has it open.
+- The compat layer's fixes were also tried under `amdgpu_drm`, which
+  shares it: the laptop booted on a build of the merged tree with its
+  three 4K displays, Vulkan and the NPU working.
 - `xdna_test`'s `SYNC_BO` on the device heap logs `Failed to flush heap
   0 ret -95` (the Linux driver has no flush for carveout memory; the
   bytes are right); the back end flushes with `clflush` itself.
 - Not done: lid close and open with the NPU in use; a model made of more
-  than one design (there is one bundle, the 1x1 convolution); the driver
-  in the images (needs the compat merge into linux-drm and a CI pin).
+  than one design (there is one bundle, the 1x1 convolution).
 
 ### Speech recognition (Whisper tiny.en)
 

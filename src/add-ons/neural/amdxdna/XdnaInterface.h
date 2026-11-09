@@ -225,6 +225,30 @@ enum {
 	XDNA_QUERY_FIRMWARE_VERSION = 8
 };
 
+struct xdna_set_state {
+	uint32	param;
+	uint32	buffer_size;
+	uint64	buffer;
+};
+
+enum {
+	XDNA_SET_POWER_MODE = 0
+};
+
+// enum amdxdna_power_mode_type
+enum {
+	XDNA_POWER_DEFAULT = 0,		// the firmware's own frequency scaling
+	XDNA_POWER_LOW = 1,
+	XDNA_POWER_MEDIUM = 2,
+	XDNA_POWER_HIGH = 3,
+	XDNA_POWER_TURBO = 4		// highest frequency, no clock gating
+};
+
+struct xdna_set_power_mode {
+	uint8	power_mode;
+	uint8	pad[7];
+};
+
 struct xdna_aie_version {
 	uint32	major;
 	uint32	minor;
@@ -272,6 +296,8 @@ struct xdna_firmware_version {
 	XDNA_IOC(XDNA_IOC_BOTH, 0x46, xdna_exec_cmd)
 #define XDNA_IOCTL_GET_INFO \
 	XDNA_IOC(XDNA_IOC_BOTH, 0x47, xdna_get_info)
+#define XDNA_IOCTL_SET_STATE \
+	XDNA_IOC(XDNA_IOC_BOTH, 0x48, xdna_set_state)
 #define XDNA_IOCTL_WAIT_CMD \
 	XDNA_IOC(XDNA_IOC_WRITE, 0x49, xdna_wait_cmd)
 

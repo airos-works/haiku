@@ -6,9 +6,11 @@
 
 #include "Device.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -72,6 +74,42 @@ Device::Release()
 }
 
 
+/*!	The NPU's power mode is a setting of the device, kept until changed.
+	In every mode but turbo the firmware gates the NPU's clocks when they
+	are idle, and on this driver every command then takes 112.5 ms to be
+	answered, whatever it computes (seen on a Ryzen AI 5 340; not
+	understood yet: with the clocks running a command takes 0.1 ms). So
+	the back end asks for turbo, which the driver only grants while no
+	context exists - hence here, before the first program's; when another
+	client has a context, the mode stays what it is. NEURAL_AMDXDNA_POWER
+	(0 default, 1 low, 2 medium, 3 high, 4 turbo) in the environment
+	chooses another mode, for measurements. The NPU is powered down
+	altogether when nobody has it open. */
+void
+Device::_SetPowerMode()
+{
+	int mode = XDNA_POWER_TURBO;
+	const char* chosen = getenv("NEURAL_AMDXDNA_POWER");
+	if (chosen != NULL && isdigit(chosen[0]))
+		mode = atoi(chosen);
+	if (mode < XDNA_POWER_DEFAULT || mode > XDNA_POWER_TURBO)
+		return;
+
+	xdna_set_power_mode power;
+	memset(&power, 0, sizeof(power));
+	power.power_mode = (uint8)mode;
+	xdna_set_state state;
+	memset(&state, 0, sizeof(state));
+	state.param = XDNA_SET_POWER_MODE;
+	state.buffer_size = sizeof(power);
+	state.buffer = (addr_t)&power;
+	if (ioctl(fFD, XDNA_IOCTL_SET_STATE, &state) != 0 && errno != EBUSY) {
+		syslog(LOG_INFO, "amdxdna.neural: power mode %d not set: %s", mode,
+			strerror(errno));
+	}
+}
+
+
 status_t
 Device::_Open()
 {
@@ -119,6 +157,7 @@ Device::_Open()
 		if (ioctl(fFD, XDNA_IOCTL_GET_INFO, &query) != 0)
 			memset(&fFirmware, 0, sizeof(fFirmware));
 		fKnown = true;
+		_SetPowerMode();
 
 		// the heap, which has to be mapped before anything is put in it
 		status = CreateBuffer(XDNA_BO_DEV_HEAP, XDNA_HEAP_SIZE, fHeap);

@@ -73,6 +73,7 @@ public:
 			void				Flush(const Buffer& buffer);
 
 private:
+			void				_SetPowerMode();
 			status_t			_Open();
 			void				_Close();
 
