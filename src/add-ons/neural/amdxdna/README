@@ -1,0 +1,125 @@
+amdxdna.neural: the Neural Kit's back end for AMD's XDNA NPU
+=============================================================
+
+The NPU of Ryzen AI processors runs designs: configurations of its array of
+AI Engine tiles, compiled on a Linux host with mlir-aie and Peano. It does
+not run a network's operators as such. This back end therefore takes from a
+network exactly the stretches it finds a *design bundle* for, and leaves the
+rest to the CPU.
+
+The device is /dev/npu/amdxdna/0 (the amdxdna driver of the linux-drm
+repository). The back end lists it when the node exists and never opens it
+to find out anything: opening loads firmware and powers the NPU up. It is
+opened when the first program is made and closed when the last is deleted.
+Only root can open it (without an IOMMU driver a client of the NPU reaches
+all of the machine's memory); for everybody else, and whenever anything
+fails, the kit computes on the CPU. A program whose command fails or times
+out reports B_NEURAL_DEVICE_LOST: its stretch is the CPU's for the rest of
+the session.
+
+  NEURAL_AMDXDNA_BUNDLES=<dir>   looked into before the data directories
+  NEURAL_AMDXDNA_DEBUG=1         prints, for every network asked about, its
+                                 graph key and what became of it
+
+
+Where bundles are
+-----------------
+
+    <data directory>/neural/amdxdna/<graph key>/
+
+in the directory NEURAL_AMDXDNA_BUNDLES names, then the data directories in
+the usual order (the user's non-packaged one first). The first directory
+with the network's key that has a bundle.txt decides. When none of the
+places exists, nothing is computed at all.
+
+
+The graph key
+-------------
+
+32 hexadecimal digits: the first 16 bytes of the SHA-256 of the stream
+below. It says what the network is made of, not which weights it has, so it
+is cheap for a model of any size. Integers are 32 bits, little endian;
+"string" is a length and that many bytes.
+
+    "amdxdna-graph-1\n"
+    number of operators
+    for each operator, in the network's order:
+        string: its name, neural_operator_name() ("CONV_2D")
+        number of inputs,  then a tensor number for each (-1: not given)
+        number of outputs, then a tensor number for each
+        size of the parameters that follow, and the parameters: the fields
+            of the operator's structure in NeuralOperators.h in their
+            order; enumerations and integers 32 bits, bool one byte, float
+            its 32 bits; arrays only as far as their count says. A
+            convolution that is not depthwise has depth_multiplier 0.
+    number of tensors the operators use
+    for each of them, in the order of their numbers:
+        type (neural_data_type), rank, the dimensions
+        one byte: quantized
+        if quantized: scale (float), zero point, number of channel scales,
+            and if that is not 0: the channel axis and the scales
+        one byte: constant; if so, its size in bytes as 64 bits
+    number of the network's inputs,  then a tensor number for each
+    number of the network's outputs, then a tensor number for each
+
+Tensor numbers are not the network's own indices: tensors are numbered from
+0 in the order the operators first mention them, each operator's inputs
+before its outputs. So the key does not depend on the order a file or a
+program lists its tensors in, nor on their names. (-2 stands for an input
+or output of the network that no operator uses.) A network with an operator
+whose parameters Bundle.cpp does not know has no key.
+
+
+The weights digest
+------------------
+
+A bundle is for certain weights. 64 hexadecimal digits, the SHA-256 of:
+
+    "amdxdna-weights-1\n"
+    for each operator k = 0, 1, ... of the bundle's stretch,
+    for each of its inputs j that is a constant:
+        k, j, the constant's size in bytes (64 bits), its bytes
+
+It is computed only when a bundle with the network's key was found, and
+remembered per network; when a program is made it is computed again.
+
+
+bundle.txt
+----------
+
+Lines of name=value; lines starting with # and names not known are skipped.
+
+    format=1
+    name=<for messages>
+    graph=<graph key; the directory's name>
+    operators=<first>:<count>      the stretch: operators of the network
+    weights=<weights digest>
+    columns=<n>                    columns of the array the design takes
+    ops_per_cycle=<n>              as in the design's partition (2048)
+    pdi=<file>                     the configuration: a raw PDI
+    insts=<file>                   the instruction sequence (32 bit words)
+    opcode=<n>                     the kernel's first argument (3)
+    insts_size=words|bytes         how the kernel is told the size (words)
+    timeout_ms=<n>                 for one run (5000)
+    buffer=<in|out|const>:<bytes>:op<k>.<in|out><j>:<layout>
+
+One buffer line per buffer of the design, in the order of its kernel's
+arguments (at most five). "op<k>.in<j>" is input j of operator k of the
+stretch, "op<k>.out<j>" its output j. "in" buffers are filled before every
+run and "out" buffers read after it; "const" buffers are filled once, from
+the network's weights. Every tensor that enters or leaves the stretch must
+have a buffer. Layouts:
+
+    nhwc     as the kit has the tensor, byte for byte
+    hcwc8    a picture [1, H, W, C] of bytes, C a multiple of 8, as
+             mlir-aie's kernels take it: [H][C / 8][W][8]
+    oiio8    weights [O, 1, 1, I] of a 1x1 convolution, bytes:
+             [O / 8][I / 8][8 of I][8 of O]
+
+A bundle whose stretch, buffers or layouts do not fit the network, or whose
+weights digest is another, does not apply.
+
+make-bundle.py in the linux-drm repository (haiku/tests/xdna) makes the
+bundle of mlir-aie's conv2d design and says where the design's arithmetic
+and the kit's agree; amdxdna_backend_test (src/tests/kits/neural) checks the
+back end with it.

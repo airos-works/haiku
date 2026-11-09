@@ -308,6 +308,7 @@ SYSTEM_ADD_ONS_SCREENSAVERS += [ FFilterByBuildFeatures
 # Neural Kit back ends; each finds out by itself whether its hardware is
 # there
 SYSTEM_ADD_ONS_NEURAL = [ FFilterByBuildFeatures
+	amdxdna.neural@x86_64
 	rk3588_npu.neural@arm64
 	vulkan.neural
 ] ;

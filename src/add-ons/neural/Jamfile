@@ -7,4 +7,8 @@ if $(TARGET_ARCH) = arm64 {
 	SubInclude HAIKU_TOP src add-ons neural rk3588_npu ;
 }
 
+if $(TARGET_ARCH) = x86_64 {
+	SubInclude HAIKU_TOP src add-ons neural amdxdna ;
+}
+
 SubInclude HAIKU_TOP src add-ons neural vulkan ;
