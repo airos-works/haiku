@@ -25,7 +25,8 @@
 		add       1: an addition follows, 2: with the operands swapped
 		int8      1: int8 tensors, 2: and weights with a scale per channel
 		          (all the same), 3: (all different)
-		act       0 none, 1 ReLU, 2 ReLU6 (the output range is made to fit)
+		act       0 none, 1 ReLU, 2 ReLU6, 3 -1 to 1 (the output range is
+		          made to fit unless ozp is given)
 		izp, wzp, ozp  zero points (default: random)
 		bias      0: no bias
 		seed      for the random numbers
@@ -45,6 +46,11 @@
 	which operators the processor computes differently, however small the
 	difference is at the end of the model. An addition is run together
 	with the convolution it becomes part of.
+
+		rk3588_npu_backend_test --model <file> --repeat <n> [--input <file>]
+
+	runs the whole model n times on the processor with the same input
+	and checks that the outputs are the same every time.
 */
 
 
@@ -174,7 +180,8 @@ case_name(const Case& test)
 			: "int8 per channel",
 		test.add == 1 ? ", addition" : test.add == 2
 			? ", addition (swapped)" : "",
-		test.act == 1 ? ", ReLU" : test.act == 2 ? ", ReLU6" : "",
+		test.act == 1 ? ", ReLU" : test.act == 2 ? ", ReLU6"
+			: test.act == 3 ? ", -1 to 1" : "",
 		test.bias == 0 ? ", no bias" : "",
 		test.refuse != 0 ? " (to be refused)" : "");
 	return name;
@@ -237,12 +244,16 @@ build_model(const Case& test, BNeuralModel& model)
 
 	int32 outputZeroPoint = test.ozp != -1000 ? test.ozp
 		: random_between(minimum + 96, maximum - 96);
-	if (test.act != 0 && test.add == 0) {
-		// A fused activation is a matter of the output range: nothing
-		// below 0, and for ReLU6 nothing above 6.
-		outputZeroPoint = minimum;
-		if (test.act == 2) {
-			outputScale = 6.0f / 255.0f;
+	if (test.act != 0) {
+		// Most networks have the range of the output end where the
+		// activation's does: nothing below 0, and for ReLU6 nothing above
+		// 6. With a zero point given, the range is wider than that and
+		// the activation has to be computed.
+		if (test.ozp == -1000)
+			outputZeroPoint = minimum;
+		if (test.act >= 2) {
+			outputScale = (test.act == 3 ? 4.0f : test.ozp == -1000 ? 6.0f
+				: 10.0f) / 255.0f;
 			weightsScale = (float)(outputScale * 127.0
 				/ (3.0 * deviation * inputScale));
 		}
@@ -316,9 +327,9 @@ build_model(const Case& test, BNeuralModel& model)
 	params.stride_width = params.stride_height = test.s;
 	params.dilation_width = params.dilation_height = 1;
 	params.depth_multiplier = 1;
-	params.activation = test.add != 0 ? B_NEURAL_ACTIVATION_NONE
-		: test.act == 1 ? B_NEURAL_ACTIVATION_RELU
+	params.activation = test.act == 1 ? B_NEURAL_ACTIVATION_RELU
 		: test.act == 2 ? B_NEURAL_ACTIVATION_RELU6
+		: test.act == 3 ? B_NEURAL_ACTIVATION_RELU_N1_TO_1
 		: B_NEURAL_ACTIVATION_NONE;
 
 	int32 inputs[3] = { input, weights, bias };
@@ -463,6 +474,8 @@ static const char* const kCases[] = {
 	"w=7,h=7,ic=320,oc=1280,k=1",
 	"w=1,h=1,ic=1024,oc=1001,k=1",
 	"w=19,h=19,ic=384,oc=273,k=1",
+	"w=75,h=75,ic=48,oc=96,k=1",
+	"w=17,h=17,ic=176,oc=48,k=1",
 	// 3x3, with and without padding, both strides
 	"w=224,h=224,ic=3,oc=32,k=3,s=2",
 	"w=32,h=32,ic=16,oc=32,k=3,s=1",
@@ -470,29 +483,53 @@ static const char* const kCases[] = {
 	"w=32,h=32,ic=16,oc=32,k=3,s=2,same=0",
 	"w=10,h=10,ic=192,oc=384,k=3,s=2",
 	"w=3,h=3,ic=96,oc=192,k=3,s=2",
+	"w=33,h=20,ic=36,oc=20,k=3",
+	// other kernels
+	"w=20,h=20,ic=32,oc=32,k=2,s=2,same=0",
+	"w=20,h=20,ic=32,oc=32,k=5,s=1",
+	"w=224,h=224,ic=3,oc=32,k=7,s=2",
 	// depthwise
 	"w=112,h=112,ic=32,k=3,s=1,dw=1",
 	"w=112,h=112,ic=96,k=3,s=2,dw=1",
 	"w=14,h=14,ic=576,k=3,s=1,dw=1,same=0",
 	"w=7,h=7,ic=1024,k=3,s=1,dw=1",
-	// fused activations
+	"w=150,h=150,ic=48,k=3,s=2,dw=1",
+	"w=20,h=20,ic=24,k=5,dw=1",
+	// inputs and weights that do not fit the convolution buffer at once
+	"w=300,h=300,ic=3,oc=24,k=3,s=2",
+	"w=160,h=160,ic=64,oc=32,k=1",
+	"w=40,h=40,ic=512,oc=512,k=3",
+	"w=10,h=10,ic=1024,oc=512,k=3",
+	"w=100,h=100,ic=17,oc=1000,k=3",
+	// activations: as the range of the output, and computed
 	"w=28,h=28,ic=32,oc=64,k=1,act=1",
 	"w=28,h=28,ic=32,oc=64,k=3,act=2",
+	"w=28,h=28,ic=32,oc=64,k=1,act=1,ozp=100",
+	"w=28,h=28,ic=32,oc=64,k=3,act=2,ozp=60",
+	"w=28,h=28,ic=32,oc=64,k=3,act=3,ozp=128",
+	"w=28,h=28,ic=64,k=3,dw=1,act=2,ozp=60",
 	// without bias
 	"w=28,h=28,ic=32,oc=64,k=3,bias=0",
 	// additions
 	"w=56,h=56,ic=144,oc=24,k=1,add=1",
 	"w=14,h=14,ic=384,oc=64,k=1,add=2",
 	"w=7,h=7,ic=960,oc=160,k=1,add=1",
+	"w=16,h=16,ic=32,oc=64,k=3,s=2,add=1",
+	"w=200,h=200,ic=16,oc=16,k=3,add=1",
+	"w=3,h=3,ic=32,oc=100,k=1,add=1",
+	"w=28,h=28,ic=32,oc=32,k=1,add=1,act=2,ozp=60",
 	// int8
 	"w=16,h=16,ic=16,oc=16,k=1,int8=1",
 	"w=32,h=32,ic=16,oc=32,k=3,s=2,int8=1",
 	"w=28,h=28,ic=64,k=3,dw=1,int8=1",
 	"w=28,h=28,ic=32,oc=64,k=1,int8=2",
 	"w=28,h=28,ic=32,oc=32,k=1,int8=1,add=1",
+	"w=20,h=20,ic=32,oc=32,k=3,int8=1,act=2,ozp=-60",
 	// what the processor cannot do and has to leave to the CPU
 	"w=28,h=28,ic=32,oc=64,k=1,int8=3,refuse=1",
 	"w=28,h=28,ic=1,oc=16,k=3,refuse=1",
+	"w=16,h=16,ic=64,k=3,dw=1,add=1,refuse=1",
+	"w=24,h=24,ic=1000,oc=40,k=5,refuse=1",
 };
 
 
@@ -885,6 +922,70 @@ check_model(const char* path, const char* inputPath,
 }
 
 
+/*!	The same input has to give the same output, however often. */
+static int
+repeat_model(const char* path, const char* inputPath, int32 runs,
+	const BNeuralDevice& device)
+{
+	BNeuralModel model(path);
+	BNeuralSession session(model, device, 0);
+	status_t status = session.InitCheck();
+	if (status == B_OK)
+		status = fill_model_inputs(session, inputPath);
+	if (status != B_OK) {
+		printf("FAILED: %s: %s\n", path, strerror(status));
+		return 1;
+	}
+
+	neural_run_info info;
+	session.GetRunInfo(&info);
+
+	size_t size = 0;
+	for (int32 i = 0; i < session.CountOutputs(); i++)
+		size += session.OutputAt(i)->ByteSize();
+	uint8* first = (uint8*)malloc(size);
+	if (first == NULL)
+		return 1;
+
+	int32 different = 0;
+	bigtime_t start = system_time();
+	for (int32 run = 0; run < runs; run++) {
+		status = session.Run();
+		if (status != B_OK) {
+			printf("FAILED: %s: run %" B_PRId32 ": %s\n", path, run,
+				strerror(status));
+			free(first);
+			return 1;
+		}
+
+		size_t offset = 0;
+		bool same = true;
+		for (int32 i = 0; i < session.CountOutputs(); i++) {
+			const BTensor* output = session.OutputAt(i);
+			if (run == 0)
+				memcpy(first + offset, output->Data(), output->ByteSize());
+			else if (memcmp(first + offset, output->Data(),
+					output->ByteSize()) != 0) {
+				same = false;
+			}
+			offset += output->ByteSize();
+		}
+		if (!same)
+			different++;
+	}
+	bigtime_t duration = system_time() - start;
+	free(first);
+
+	printf("%s: %s: %" B_PRId32 " runs on %s (%" B_PRId32 " of %" B_PRId32
+		" operators on the processor), %.2f ms each, %" B_PRId32
+		" with outputs other than the first run's\n",
+		different == 0 ? "ok" : "FAILED", path, runs, device.ID(),
+		info.device_operators, info.device_operators + info.cpu_operators,
+		duration / 1000.0 / runs, different);
+	return different == 0 ? 0 : 1;
+}
+
+
 int
 main(int argc, char** argv)
 {
@@ -892,6 +993,7 @@ main(int argc, char** argv)
 	int32 specCount = 0;
 	const char* modelPath = NULL;
 	const char* inputPath = NULL;
+	int32 repeat = 0;
 
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-v") == 0)
@@ -905,11 +1007,13 @@ main(int argc, char** argv)
 			modelPath = argv[++i];
 		else if (strcmp(argv[i], "--input") == 0 && i + 1 < argc)
 			inputPath = argv[++i];
+		else if (strcmp(argv[i], "--repeat") == 0 && i + 1 < argc)
+			repeat = atoi(argv[++i]);
 		else {
 			fprintf(stderr, "usage: %s [-v] [--tolerance <n>] "
 				"[--case <spec>]...\n"
 				"       %s [-v] [--tolerance <n>] --model <file> "
-				"[--input <file>]\n", argv[0], argv[0]);
+				"[--repeat <n>] [--input <file>]\n", argv[0], argv[0]);
 			return 2;
 		}
 	}
@@ -935,6 +1039,8 @@ main(int argc, char** argv)
 		return 1;
 	}
 
+	if (modelPath != NULL && repeat > 0)
+		return repeat_model(modelPath, inputPath, repeat, device);
 	if (modelPath != NULL)
 		return check_model(modelPath, inputPath, device, cpu);
 
