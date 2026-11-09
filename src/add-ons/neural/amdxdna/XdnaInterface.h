@@ -53,10 +53,36 @@ struct xdna_drm_version {
 	char*	desc;
 };
 
+/*!	A sync object: what the NPUs of today's processors signal the end of
+	a command on. Each hardware context has one; a command's sequence number
+	is its point on it. The timeout is a time of the monotonic clock
+	(system_time()) in nanoseconds. */
+struct xdna_syncobj_destroy {
+	uint32	handle;
+	uint32	pad;
+};
+
+struct xdna_syncobj_timeline_wait {
+	uint64	handles;			// uint32[count_handles]
+	uint64	points;				// uint64[count_handles]
+	int64	timeout_nsec;
+	uint32	count_handles;
+	uint32	flags;
+	uint32	first_signaled;
+	uint32	pad;
+	uint64	deadline_nsec;
+};
+
+#define XDNA_SYNCOBJ_WAIT_FOR_SUBMIT	(1 << 1)
+
 #define XDNA_IOCTL_VERSION \
 	XDNA_IOC(XDNA_IOC_BOTH, 0x00, xdna_drm_version)
 #define XDNA_IOCTL_GEM_CLOSE \
 	XDNA_IOC(XDNA_IOC_WRITE, 0x09, xdna_gem_close)
+#define XDNA_IOCTL_SYNCOBJ_DESTROY \
+	XDNA_IOC(XDNA_IOC_BOTH, 0xc0, xdna_syncobj_destroy)
+#define XDNA_IOCTL_SYNCOBJ_TIMELINE_WAIT \
+	XDNA_IOC(XDNA_IOC_BOTH, 0xca, xdna_syncobj_timeline_wait)
 
 
 // #pragma mark - Haiku additions (drm_haiku.h)
@@ -180,6 +206,7 @@ struct xdna_exec_cmd {
 	uint64	seq;				// out
 };
 
+//! (EOPNOTSUPP on the NPUs seen so far; see xdna_syncobj_timeline_wait)
 struct xdna_wait_cmd {
 	uint32	hwctx;
 	uint32	timeout;			// ms, 0: for ever
