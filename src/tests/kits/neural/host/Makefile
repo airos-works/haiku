@@ -13,12 +13,17 @@ CXXFLAGS += -std=gnu++17 -Wall -Wextra -Wno-unused-parameter -Wno-multichar \
 	-Ishim -I$(TOP)/headers/os -I$(TOP)/headers/private/neural \
 	-I$(KIT)/ops -pthread
 
-SOURCES := $(KIT)/GraphData.cpp $(KIT)/TFLiteLoader.cpp \
-	$(KIT)/Interpreter.cpp $(wildcard $(KIT)/ops/*.cpp) neural_host.cpp
-OBJECTS := $(patsubst %.cpp,$(OUT)/%.o,$(notdir $(SOURCES)))
+KIT_SOURCES := $(KIT)/GraphData.cpp $(KIT)/TFLiteLoader.cpp \
+	$(KIT)/Interpreter.cpp $(wildcard $(KIT)/ops/*.cpp)
+# the speech recognizer's core: all of it but the class applications use
+SPEECH_SOURCES := $(KIT)/SpeechAudio.cpp $(KIT)/SpeechEngine.cpp \
+	$(KIT)/SpeechModel.cpp $(KIT)/SpeechWhisper.cpp
+KIT_OBJECTS := $(patsubst %.cpp,$(OUT)/%.o,$(notdir $(KIT_SOURCES)))
+SPEECH_OBJECTS := $(patsubst %.cpp,$(OUT)/%.o,$(notdir $(SPEECH_SOURCES)))
+OBJECTS := $(KIT_OBJECTS) $(OUT)/neural_host.o
 VPATH := $(KIT):$(KIT)/ops:.
 
-all: $(OUT)/neural_host
+all: $(OUT)/neural_host $(OUT)/speech_host
 
 $(OUT)/%.o: %.cpp $(wildcard $(KIT)/ops/*.h) \
 		$(wildcard $(TOP)/headers/private/neural/*.h) \
@@ -28,6 +33,9 @@ $(OUT)/%.o: %.cpp $(wildcard $(KIT)/ops/*.h) \
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(OUT)/neural_host: $(OBJECTS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ -lm
+
+$(OUT)/speech_host: $(KIT_OBJECTS) $(SPEECH_OBJECTS) $(OUT)/speech_host.o
 	$(CXX) $(CXXFLAGS) $^ -o $@ -lm
 
 clean:
