@@ -784,6 +784,30 @@ main(int argc, char** argv)
 			flips++;
 		}
 		printf("R cpuflip %d\n", flips);
+	} else if (strcmp(test, "idlestats") == 0) {
+		// arm64: how often each core powered down while idle
+		uint32_t buffer[2 + 6 * MAX_CPUS];
+		status_t status = _kern_generic_syscall("arm64_idle", 1, buffer,
+			sizeof(buffer));
+		if (status != B_OK) {
+			printf("R idlestats none %s\n", strerror(status));
+			return 0;
+		}
+		uint64_t* values = (uint64_t*)(buffer + 2);
+		printf("R idlestats enabled=%u", buffer[1]);
+		for (uint32_t c = 0; c < buffer[0]; c++) {
+			printf(" c%u=%llu/%llu/%llums", c,
+				(unsigned long long)values[c * 3],
+				(unsigned long long)values[c * 3 + 1],
+				(unsigned long long)values[c * 3 + 2] / 1000);
+		}
+		printf("\n");
+	} else if (strcmp(test, "powerdown") == 0) {
+		// powerdown on|off: arm64 idle power-down, to compare
+		uint32_t enable = argc > 2 && strcmp(argv[2], "off") != 0;
+		status_t status = _kern_generic_syscall("arm64_idle", 2, &enable,
+			sizeof(enable));
+		printf("R powerdown %s %s\n", enable ? "on" : "off", strerror(status));
 	} else if (strcmp(test, "pstates") == 0) {
 		// pstates on|off: Zen 1 P-state scaling (amd_pstates), to compare
 		uint32_t enable = argc > 2 && strcmp(argv[2], "off") != 0;
