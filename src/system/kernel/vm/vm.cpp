@@ -4215,7 +4215,10 @@ vm_soft_fault(VMAddressSpace* addressSpace, addr_t originalAddress,
 		bool mappedHere = false;
 		const bool wasMapped = context.page->IsMapped();
 		vm_page_mapping* mapping = NULL;
-		if (area->wiring == B_NO_LOCK) {
+		// Only for a page mapped nowhere yet: a fault on a page already
+		// mapped (a write to one mapped read-only, as after an mprotect()
+		// of JIT code) just changes its protection below.
+		if (area->wiring == B_NO_LOCK && !wasMapped) {
 			mapping = allocate_page_mapping(context.page->physical_page_number,
 				CACHE_DONT_WAIT_FOR_MEMORY
 					| (addressSpace == VMAddressSpace::Kernel()
@@ -4245,7 +4248,7 @@ vm_soft_fault(VMAddressSpace* addressSpace, addr_t originalAddress,
 		}
 
 		if (mapPage && !unmapPage
-			&& (mapping != NULL || area->wiring != B_NO_LOCK)) {
+			&& (mapping != NULL || (area->wiring != B_NO_LOCK && !wasMapped))) {
 			DEBUG_PAGE_ACCESS_CHECK(context.page);
 			context.map->Map(address,
 				context.page->physical_page_number * B_PAGE_SIZE, newProtection,
