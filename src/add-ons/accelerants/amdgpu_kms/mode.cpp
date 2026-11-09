@@ -200,6 +200,71 @@ probe_outputs(void)
 }
 
 
+/*!	The layout app_server asked for (and is about to set as a mode) goes
+	along with a new probe: its outputs are in the order of the connectors
+	as they were, and a dock's MST hub adds and removes connectors. Left as
+	it was, the layout would hand one connector's region to another, or to
+	none (connector 0), and setting it would fail (ENOENT); a monitor of it
+	that is gone or was exchanged makes it one to forget.
+	\a previousCount is the number of outputs before the probe.
+*/
+static void
+remap_pending(uint32 previousCount)
+{
+	if (!gInfo->hasPending)
+		return;
+	Layout* old = (Layout*)malloc(sizeof(Layout));
+	if (old == NULL) {
+		gInfo->hasPending = false;
+		return;
+	}
+	memcpy(old, &gInfo->pending, sizeof(Layout));
+
+	bool valid = true;
+	for (uint32 i = 0; i < gInfo->outputCount; i++) {
+		Output& output = gInfo->pending.outputs[i];
+		output = gInfo->outputs[i];
+		output.enabled = false;
+		output.mirror = false;
+		output.crtcIndex = -1;
+		for (uint32 j = 0; j < previousCount; j++) {
+			const Output& was = old->outputs[j];
+			if (was.connector != output.connector || !was.enabled)
+				continue;
+			if (!output.connected || output.edidLength != was.edidLength
+				|| memcmp(output.edid, was.edid, was.edidLength) != 0) {
+				valid = false;
+				break;
+			}
+			output.enabled = true;
+			output.mirror = was.mirror;
+			output.x = was.x;
+			output.y = was.y;
+			output.width = was.width;
+			output.height = was.height;
+			output.scale = was.scale;
+			output.renderScale = was.renderScale;
+			output.timing = was.timing;
+		}
+	}
+	// a monitor of the layout whose connector went away
+	for (uint32 j = 0; valid && j < previousCount; j++) {
+		if (!old->outputs[j].enabled)
+			continue;
+		bool found = false;
+		for (uint32 i = 0; i < gInfo->outputCount && !found; i++)
+			found = gInfo->outputs[i].connector == old->outputs[j].connector;
+		valid = found;
+	}
+	if (!valid) {
+		debug_printf("amdgpu_kms: the monitors of the layout to set changed,"
+			" forgetting it\n");
+		gInfo->hasPending = false;
+	}
+	free(old);
+}
+
+
 /*!	Probes the outputs again after monitors came or went; what drives the
 	ones still there stays as it is (app_server lays them out anew). */
 void
@@ -232,6 +297,7 @@ refresh_outputs(void)
 				output.crtcIndex = old.crtcIndex;
 			}
 		}
+		remap_pending(previousCount);
 		create_mode_list();
 	}
 	free(previous);

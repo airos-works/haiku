@@ -59,6 +59,7 @@ class ScreenManager : public BLooper {
 			ScreenOwner*			owner;
 			ObjectDeleter<HWInterfaceListener>
 									listener;
+			bool					changedUnowned;
 		};
 
 		void			_ScanDrivers();

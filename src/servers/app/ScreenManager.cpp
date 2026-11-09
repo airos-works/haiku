@@ -35,6 +35,8 @@ using std::nothrow;
 
 ScreenManager* gScreenManager;
 
+static const uint32 kMsgDeliverScreenChanges = 'dscc';
+
 
 class ScreenChangeListener : public HWInterfaceListener {
 public:
@@ -132,6 +134,11 @@ ScreenManager::AcquireScreens(ScreenOwner* owner, int32* wishList,
 		if (item->owner == NULL && list.AddItem(item->screen.Get())) {
 			item->owner = owner;
 			added++;
+			if (item->changedUnowned) {
+				// Its new owner set it up from what was there before the
+				// change; it gets to look again, once it has the screen.
+				PostMessage(kMsgDeliverScreenChanges);
+			}
 		}
 	}
 
@@ -183,8 +190,18 @@ ScreenManager::ScreenChanged(Screen* screen)
 
 	for (int32 i = 0; i < fScreenList.CountItems(); i++) {
 		screen_item* item = fScreenList.ItemAt(i);
-		if (item->screen.Get() == screen && item->owner != NULL)
+		if (item->screen.Get() != screen)
+			continue;
+		if (item->owner != NULL) {
+			item->changedUnowned = false;
 			item->owner->ScreenChanged(screen);
+		} else {
+			// Monitors that come up while app_server starts (a dock's,
+			// behind an MST hub) report themselves before the desktop owns
+			// the screen: kept for the owner, else nothing would ever lay
+			// them out.
+			item->changedUnowned = true;
+		}
 	}
 }
 
@@ -231,6 +248,7 @@ ScreenManager::_AddHWInterface(HWInterface* interface)
 		if (item != NULL) {
 			item->screen.SetTo(screen.Detach());
 			item->owner = NULL;
+			item->changedUnowned = false;
 			item->listener.SetTo(
 				new(nothrow) ScreenChangeListener(*this, item->screen.Get()));
 			if (item->listener.IsSet()
@@ -255,6 +273,14 @@ ScreenManager::MessageReceived(BMessage* message)
 	switch (message->what) {
 		case B_NODE_MONITOR:
 			// TODO: handle notification
+			break;
+
+		case kMsgDeliverScreenChanges:
+			for (int32 i = 0; i < fScreenList.CountItems(); i++) {
+				screen_item* item = fScreenList.ItemAt(i);
+				if (item->changedUnowned && item->owner != NULL)
+					ScreenChanged(item->screen.Get());
+			}
 			break;
 
 		default:
