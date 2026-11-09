@@ -808,34 +808,51 @@ What was measured, on which machine, on 2026-11-09. "Agrees" means
 
 ### AMD XDNA (Framework 13, Ryzen AI 5 340)
 
-**Runs designs on the hardware; not stable yet.** With the driver
-(`amdxdna` add-on, linux-drm branch `airos-xdna`) loaded on the laptop:
+**The kit computes on the NPU** (2026-11-10), with the driver (`amdxdna`
+add-on, linux-drm branch `airos-xdna`) and its launch job installed by
+hand on the laptop; the driver is not in the images yet.
 
 - The NPU starts: firmware 1.1.2.64 loads, the firmware answers (8
   columns by 6 rows of tiles, "NPU Krackan 1"), interrupts work, and the
-  NPU powers down when the device is closed and up again when it is
-  opened.
-- Two designs built with mlir-aie and Peano compute the right bytes
+  NPU powers down five seconds after the device is closed and up again
+  when it is opened. The launch job loads the driver at boot, which takes
+  its 128 MiB of buffer memory (found in 9 ms) and touches nothing else.
+- Three designs built with mlir-aie and Peano compute the right bytes
   through the driver's test program `xdna_test`: a pass-through (4096
-  bytes) and a 1x1 int8 convolution, 32x32x64 to 64 channels (65536 bytes
-  equal to the host reference on five runs in a row, and the same for the
-  kit's design bundle). The NPU rounds exact halves away from zero, as
-  the kit's CPU kernels do.
-- A command takes 112.5 ms whatever the design, which is a fixed delay
-  somewhere and not computing time; not understood yet.
-- **The laptop then hung** (no answer on the network) in about the
-  seventh open/run/close cycle after boot, in the same paths that had
-  passed before; the cause is not known. Until it is, the driver stays on
-  its branch and out of the images.
-- The contiguous block the NPU's buffers need (128 MiB, aligned to
-  64 MiB) could not be had on a machine that had been up for days and was
-  found in 12 ms after a boot. The driver now takes it when it is loaded
-  and a launch job loads it at boot (tried in a virtual machine only).
-- Not done on hardware: the back end `amdxdna.neural` (in a virtual
-  machine with the driver's stand-in device it lists `amdxdna/0` without
-  starting the NPU, claims the convolution exactly when its design bundle
-  is installed, and hands a failed run to the CPU with the right result),
-  `neural compare`, timing against the CPU, a soak test.
+  bytes), a 1x1 int8 convolution of 32x32x64 to 64 channels (65536
+  bytes), and the kit's design bundle of the same convolution. 200 runs
+  of the convolution, 20 open/run/close cycles with the NPU kept
+  powered, 10 with a power down between them and 30 with a power down
+  right after each close all passed; the driver's counts of what it holds
+  stay level over the power cycles (kmalloc 258 to 270 objects over 42).
+- **The hang of 2026-11-09** (the laptop stopped answering in about the
+  seventh open/run/close cycle) was a double free in the compat layer's
+  `kthread_stop()` (fixed with two more compat faults on `airos-xdna`:
+  a spinning interrupt thread, `clflushopt` on processors without it);
+  the fixed driver went through all of the above and a day's use.
+  `amdgpu_drm` on the main linux-drm branch shares the compat layer and
+  the fault until those commits are merged.
+- The back end `amdxdna.neural`: `neural devices` lists `amdxdna/0`
+  without starting the NPU; with the bundle installed the session puts
+  the convolution on the NPU, `amdxdna_backend_test` ends with "the NPU
+  computed: PASS" (the bundle's input and 300 inputs of noise equal to
+  the CPU's output, 50 sessions made and deleted), and `neural compare`
+  agrees in all 65536 outputs. Steady state 0.11 ms a run on the NPU
+  against 0.35 ms on the CPU for this small network; the first command
+  of a fresh context takes 2 ms.
+- Found on the way: the first run of every program returned zeros. The
+  processor still held dirty lines of the new output buffer (the kernel's
+  clearing), and the back end's `clflush` after the command wrote them
+  back over the NPU's result; the buffers are flushed before the command
+  now. The 112 ms a command seen before is the default power mode on the
+  pass-through and plain convolution designs (`xdna_test -p 4`, turbo:
+  3.9 ms); the bundle's design takes 0.12 ms in either.
+- `xdna_test`'s `SYNC_BO` on the device heap logs `Failed to flush heap
+  0 ret -95` (the Linux driver has no flush for carveout memory; the
+  bytes are right); the back end flushes with `clflush` itself.
+- Not done: lid close and open with the NPU in use; a model made of more
+  than one design (there is one bundle, the 1x1 convolution); the driver
+  in the images (needs the compat merge into linux-drm and a CI pin).
 
 ### Speech recognition (Whisper tiny.en)
 
@@ -967,6 +984,13 @@ On the X399 (2026-11-09, GTX 1070, 200% scaling; CPU runs with
   camera program the same glue; `BNeuralUtils::SetTensorFromBitmap()` is
   the piece it would be made of.
 - **The other two cores of the RK3588**, for two jobs at once.
+- **AMD XDNA designs.** The NPU runs compiled designs, one per stretch
+  of a network, built on a Linux host with mlir-aie and Peano
+  (`haiku/tests/xdna/build-designs.sh` in linux-drm); there is one, the
+  1x1 convolution. A real network needs a design for each of its
+  convolution shapes, or a code generator as the RK3588 back end has, and
+  a bundle package. The driver itself waits for the compat layer's fixes
+  to be merged into linux-drm's main branch and a CI pin.
 - **Cancelling a run.** Deleting a session waits for its run to end.
 - **Models in the image.** None is shipped; `fetch-models.sh` fetches the
   public test models. System tasks will want a package of models.

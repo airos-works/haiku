@@ -260,10 +260,16 @@ Program::Run(void* const* tensors)
 	int32 count = fBundle->CountBuffers();
 	for (int32 i = 0; i < count; i++) {
 		const bundle_buffer& buffer = fBundle->BufferAt(i);
-		if (buffer.kind != BUNDLE_BUFFER_INPUT)
+		if (buffer.kind == BUNDLE_BUFFER_INPUT) {
+			xdna_convert_layout(buffer.layout, *fGraph->TensorAt(fTensors[i]),
+				tensors[fTensors[i]], fBuffers[i].data, true);
+		} else if (buffer.kind != BUNDLE_BUFFER_OUTPUT)
 			continue;
-		xdna_convert_layout(buffer.layout, *fGraph->TensorAt(fTensors[i]),
-			tensors[fTensors[i]], fBuffers[i].data, true);
+		// Inputs: into memory for the NPU. Outputs: whatever the processor
+		// still holds of them (the kernel's clearing of a new buffer, the
+		// last result) must not be written back over the NPU's result
+		// when the lines are flushed after the command - seen on the first
+		// run of every program, whose output was all zero.
 		fDevice->Flush(fBuffers[i]);
 	}
 
