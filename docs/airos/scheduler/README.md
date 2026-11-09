@@ -122,6 +122,22 @@ The laptop's packages are byte-identical to master but for the kernel's
 build date; its last full suite ran on the build before the EPP change, the
 EPP change itself was measured separately (see above).
 
+## Interactive threads under load (master e0f9ff15cf, 2026-11-09)
+
+Two more fixes: a woken thread gets its full priority back (the additional
+penalty grew with every wait and was never cleared), and in power saving a
+thread that did not fit a slower core stays on faster ones (5 s, renewed
+while it works), instead of bouncing with its noisy load measurement.
+
+| | before | after |
+| --- | --- | --- |
+| wake-up p99, every core busy: ROCK 5 / laptop / X399 (low latency) | 2 400 / 3 200-4 500 / 5 300 us | 5 / 5 / 4 us |
+| same, power saving: ROCK 5 / laptop | 11 000-20 000 / 8 500-13 100 us | 8 / 5 us |
+| ROCK 5, 3 ms job next to 4 busy threads, p95 (low latency / power saving) | 14.6 / 14.6 ms | 2.80 / 2.82 ms |
+| X399 / laptop, 3 ms job next to all CPUs busy, p95 | 9.3-10.8 / 10.5-11.5 ms | 5.73 / 5.80 ms |
+
+Throughput unchanged on all three; CPU off/on cycles pass.
+
 ## Open
 
 - The ROCK 5 has no DVFS at all: the A76 and A55 clusters stay at the
