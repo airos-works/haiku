@@ -228,6 +228,8 @@ private:
 			status_t			fResult;
 			BList				fSegments;
 			speech_recognizer_info fInfo;
+	//! samples the engine has that are not recognized for good yet
+			int64				fBacklog;
 
 	// used by the recognizer's thread only
 			bool				fQuietNow;
@@ -276,6 +278,7 @@ SpeechRecognizerData::SpeechRecognizerData(BSpeechRecognizer* owner)
 	fActive(false),
 	fActiveToken(0),
 	fResult(B_OK),
+	fBacklog(0),
 	fQuietNow(false),
 	fSamplesTaken(0),
 	fSamplesAtInterim(0),
@@ -460,7 +463,8 @@ SpeechRecognizerData::Feed(const void* buffer, size_t size)
 	Locker locker(fLock);
 	if (!fActive || fFinish)
 		return B_NOT_ALLOWED;
-	if ((int64)fPending.Count()
+	// what waits here, and what the engine has and is not done with
+	if ((int64)fPending.Count() + fBacklog
 			> kMaxPendingSeconds * fModel.Info().sample_rate) {
 		return B_BUSY;
 	}
@@ -617,6 +621,7 @@ SpeechRecognizerData::_BeginRecording()
 	fQuietNow = fQuiet;
 	_ClearSegments();
 	memset(&fInfo, 0, sizeof(fInfo));
+	fBacklog = 0;
 
 	fEngine.Reset();
 	fEngine.SetLanguage(fLanguage);
@@ -735,9 +740,10 @@ void
 SpeechRecognizerData::_UpdateInfo()
 {
 	const speech_engine_info& info = fEngine.Info();
+	double pending = fEngine.PendingSeconds();
+	fBacklog = (int64)(pending * fModel.Info().sample_rate);
 	fInfo.audio_duration = fSamplesTaken * 1000000LL
-		/ fModel.Info().sample_rate
-		- (bigtime_t)(fEngine.PendingSeconds() * 1e6);
+		/ fModel.Info().sample_rate - (bigtime_t)(pending * 1e6);
 	fInfo.processing_time = fProcessingTime;
 	fInfo.front_end_time = info.front_end_time;
 	fInfo.encoder_time = info.encoder_time;

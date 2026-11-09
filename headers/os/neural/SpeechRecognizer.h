@@ -81,8 +81,9 @@ struct speech_recognizer_info {
 	not final.
 
 	A recognizer has a thread of its own, which does the work; its
-	methods may be called from any one thread. Deleting it is safe at any
-	time and waits for the model to finish the step it is in.
+	methods may be called from any thread (the one that records can
+	Feed() while another one sets things and deletes it). Deleting it is
+	safe at any time and waits for the model to finish the step it is in.
 */
 class BSpeechRecognizer {
 public:
