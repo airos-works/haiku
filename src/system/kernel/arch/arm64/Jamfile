@@ -14,6 +14,8 @@ KernelMergeObject kernel_arch_arm64.o :
 	arch_commpage.cpp
 	arch_thread.cpp
 	arch_cpu.cpp
+	arch_cpu_idle.cpp
+	arch_cpu_suspend.S
 	arch_debug_console.cpp
 	arch_debug.cpp
 	arch_user_debugger.cpp

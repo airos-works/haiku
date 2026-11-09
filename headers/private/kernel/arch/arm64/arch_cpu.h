@@ -113,9 +113,11 @@ static inline void arch_cpu_pause(void)
 }
 
 
+void arm64_cpu_idle(void);
+
 static inline void arch_cpu_idle(void)
 {
-	arm64_wfi();
+	arm64_cpu_idle();
 }
 
 

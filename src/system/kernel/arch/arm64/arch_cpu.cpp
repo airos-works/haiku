@@ -407,9 +407,20 @@ arch_cpu_init_post_vm(kernel_args *args)
 }
 
 
+uint32
+arm64_psci_conduit()
+{
+	return sPsciConduit;
+}
+
+
+void arm64_cpu_idle_init();
+
+
 status_t
 arch_cpu_init_post_modules(kernel_args *args)
 {
+	arm64_cpu_idle_init();
 	return B_OK;
 }
 
