@@ -21,6 +21,14 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 			Tensor.cpp
 			TFLiteLoader.cpp
 
+			# speech recognition: the core, which the host tests build
+			# too, and the class applications use
+			SpeechAudio.cpp
+			SpeechEngine.cpp
+			SpeechModel.cpp
+			SpeechWhisper.cpp
+			SpeechRecognizer.cpp
+
 			# ops: the CPU kernels, one file per family of operators
 			Activation.cpp
 			Arithmetic.cpp

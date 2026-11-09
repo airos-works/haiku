@@ -92,6 +92,28 @@ enum {
 */
 #define B_NEURAL_RUN_COMPLETED		'NRrc'
 
+/*!	Sent by a BSpeechRecognizer to its target for what it recognized,
+	unless the caller gave a message of its own. Fields added to either
+	one: "speech:text" (string), "speech:final" (bool), "speech:start"
+	and "speech:end" (int64: microseconds from the beginning of the
+	recording), "speech:token" (int32: what Start() gave for the
+	recording), "speech:recognizer" (pointer: the BSpeechRecognizer; it
+	may be gone by the time the message is read).
+
+	A final result is a phrase that stands. One that is not final is the
+	recognizer's reading, so far, of everything after the last final
+	phrase: it takes the place of the one before it and will be replaced
+	itself.
+*/
+#define B_SPEECH_RESULT				'NRsr'
+
+/*!	Sent after the last result of a recording, when Finish() was called
+	or recognition failed: "speech:status" (int32), "speech:token",
+	"speech:recognizer", "speech:audio" (int64: microseconds of audio
+	recognized), "speech:duration" (int64: microseconds it took).
+*/
+#define B_SPEECH_FINISHED			'NRsf'
+
 
 #define B_NEURAL_ERROR_BASE			(B_GENERAL_ERROR_BASE + 0xb000)
 
