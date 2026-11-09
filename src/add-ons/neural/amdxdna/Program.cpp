@@ -24,6 +24,7 @@ Program::Program(Device* device)
 	fBundle(NULL),
 	fGraph(NULL),
 	fContext(0),
+	fSyncObject(0),
 	fHaveContext(false),
 	fInstructionSize(0),
 	fLost(false),
@@ -44,6 +45,13 @@ Program::~Program()
 			destroy.handle = fContext;
 			destroy.pad = 0;
 			ioctl(fDevice->FD(), XDNA_IOCTL_DESTROY_HWCTX, &destroy);
+			// the driver leaves the context's sync object to its client
+			if (fSyncObject != 0) {
+				xdna_syncobj_destroy syncObject;
+				syncObject.handle = fSyncObject;
+				syncObject.pad = 0;
+				ioctl(fDevice->FD(), XDNA_IOCTL_SYNCOBJ_DESTROY, &syncObject);
+			}
 		}
 		for (int32 i = 0; i < XDNA_MAX_BUFFERS; i++)
 			fDevice->DeleteBuffer(fBuffers[i]);
@@ -179,6 +187,7 @@ Program::Init(const BNeuralGraph& graph, const neural_partition& partition,
 			status = errno;
 		} else {
 			fContext = create.handle;
+			fSyncObject = create.syncobj_handle;
 			fHaveContext = true;
 		}
 	}
@@ -222,16 +231,22 @@ Program::Init(const BNeuralGraph& graph, const neural_partition& partition,
 }
 
 
-/*!	The run failed: the context may be in any state (the driver resets
-	one whose command timed out), and the kit has one way to be told that
-	the CPU has to compute: the stretch is the CPU's from now on. */
+/*!	The run failed. The kit computes it on the CPU and tries the NPU
+	again next time (the driver resets a context whose command got no
+	answer); when the node itself is gone or dead there is no next time. */
 status_t
-Program::_Lost(const char* what, status_t error)
+Program::_Failed(const char* what, status_t error)
 {
-	syslog(LOG_WARNING, "amdxdna.neural: design %s: %s: %s; left to the CPU",
-		fBundle->Name(), what, strerror(error));
-	fLost = true;
-	return B_NEURAL_DEVICE_LOST;
+	bool lost = error == ENODEV || error == ENXIO || error == B_FILE_ERROR
+		|| error == B_DEV_NOT_READY;
+	syslog(LOG_WARNING, "amdxdna.neural: design %s: %s: %s%s",
+		fBundle->Name(), what, strerror(error),
+		lost ? "; the NPU is left alone from now on" : "");
+	if (lost) {
+		fLost = true;
+		return B_NEURAL_DEVICE_LOST;
+	}
+	return error == B_OK ? B_ERROR : error;
 }
 
 
@@ -293,18 +308,25 @@ Program::Run(void* const* tensors)
 
 	bigtime_t start = system_time();
 	if (ioctl(fDevice->FD(), XDNA_IOCTL_EXEC_CMD, &exec) != 0)
-		return _Lost("command not taken", errno);
+		return _Failed("command not taken", errno);
 
-	xdna_wait_cmd wait;
-	wait.hwctx = fContext;
-	wait.timeout = fBundle->Timeout();
-	wait.seq = exec.seq;
-	if (ioctl(fDevice->FD(), XDNA_IOCTL_WAIT_CMD, &wait) != 0)
-		return _Lost("no answer to the command", errno);
+	// The command's end is a point on the context's sync object.
+	uint32 syncObject = fSyncObject;
+	uint64 point = exec.seq;
+	xdna_syncobj_timeline_wait wait;
+	memset(&wait, 0, sizeof(wait));
+	wait.handles = (addr_t)&syncObject;
+	wait.points = (addr_t)&point;
+	wait.timeout_nsec = (system_time() + (bigtime_t)fBundle->Timeout() * 1000)
+		* 1000;
+	wait.count_handles = 1;
+	wait.flags = XDNA_SYNCOBJ_WAIT_FOR_SUBMIT;
+	if (ioctl(fDevice->FD(), XDNA_IOCTL_SYNCOBJ_TIMELINE_WAIT, &wait) != 0)
+		return _Failed("no answer to the command", errno);
 	fLastDeviceTime = system_time() - start;
 
 	if (XDNA_CMD_STATE(command[0]) != XDNA_CMD_STATE_COMPLETED)
-		return _Lost("command failed", B_IO_ERROR);
+		return _Failed("command failed", B_IO_ERROR);
 
 	for (int32 i = 0; i < count; i++) {
 		const bundle_buffer& buffer = fBundle->BufferAt(i);

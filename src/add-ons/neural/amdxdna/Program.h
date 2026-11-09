@@ -33,7 +33,7 @@ public:
 private:
 			status_t			_CheckPartition(
 									const neural_partition& partition) const;
-			status_t			_Lost(const char* what, status_t error);
+			status_t			_Failed(const char* what, status_t error);
 
 			BLocker				fLock;
 			Device*				fDevice;
@@ -42,6 +42,7 @@ private:
 			const BNeuralGraph*	fGraph;
 
 			uint32				fContext;
+			uint32				fSyncObject;
 			bool				fHaveContext;
 			Buffer				fConfiguration;
 			Buffer				fInstructions;

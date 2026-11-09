@@ -13,9 +13,13 @@ to find out anything: opening loads firmware and powers the NPU up. It is
 opened when the first program is made and closed when the last is deleted.
 Only root can open it (without an IOMMU driver a client of the NPU reaches
 all of the machine's memory); for everybody else, and whenever anything
-fails, the kit computes on the CPU. A program whose command fails or times
-out reports B_NEURAL_DEVICE_LOST: its stretch is the CPU's for the rest of
-the session.
+fails, the kit computes on the CPU. A command is waited for on the hardware
+context's sync object (the driver's own wait ioctl is not for these NPUs).
+A run whose command fails or gets no answer in time returns the error: the
+kit computes that run on the CPU and tries the NPU again with the next (three
+failures in a row end that). Only when the node itself says that the device
+is gone (ENODEV) the program reports B_NEURAL_DEVICE_LOST, and its stretch is
+the CPU's for the rest of the session.
 
   NEURAL_AMDXDNA_BUNDLES=<dir>   looked into before the data directories
   NEURAL_AMDXDNA_DEBUG=1         prints, for every network asked about, its

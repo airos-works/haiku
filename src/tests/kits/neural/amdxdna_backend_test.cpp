@@ -40,8 +40,9 @@
 	--no-hardware is for the driver's device without hardware (its
 	"haiku_selftest 2", in a virtual machine): there a program is made as
 	on the NPU - contexts, buffers, weights - and its first command is
-	refused. The test then passes if the session went on on the CPU with
-	the expected output, which on a real NPU is a failure.
+	refused as by a device that is gone. The test then passes if the
+	session went on on the CPU with the expected output, which on a real
+	NPU is a failure (as is any run there that the CPU had to do).
 
 	Exits with 0 when everything it checked held.
 */
@@ -57,7 +58,9 @@
 
 #include <NeuralKit.h>
 #include <Path.h>
+#include <PathFinder.h>
 #include <String.h>
+#include <StringList.h>
 
 
 static const char* kNode = "/dev/npu/amdxdna/0";
@@ -360,8 +363,19 @@ main(int argc, char** argv)
 	int32 without = device.CountSupportedOperators(model);
 	setenv("NEURAL_AMDXDNA_BUNDLES", parent.Path(), 1);
 	int32 with = device.CountSupportedOperators(model);
-	check(without == 0, "no bundle directory with the network's key: "
-		"%" B_PRId32 " operators claimed", without);
+	BStringList installed;
+	BPathFinder::FindPaths(B_FIND_PATH_DATA_DIRECTORY,
+		BString("neural/amdxdna/").Append(BPath(directory).Leaf()),
+		B_FIND_PATH_EXISTING_ONLY, installed);
+	if (installed.IsEmpty()) {
+		check(without == 0, "no bundle directory with the network's key: "
+			"%" B_PRId32 " operators claimed", without);
+	} else {
+		// found without being told where: as it is meant to be
+		check(without == 1, "the bundle is installed (%s): %" B_PRId32
+			" of 1 operators claimed", installed.StringAt(0).String(),
+			without);
+	}
 	check(with == 1, "the bundle is there: %" B_PRId32 " of 1 operators "
 		"claimed", with);
 	{
@@ -414,10 +428,12 @@ main(int argc, char** argv)
 	if (status != B_OK)
 		return 1;
 	session.GetRunInfo(&info);
-	if (onDevice && info.device_operators == 0) {
-		// the program gave up in its first run: the CPU took over
+	if (onDevice && (info.device_operators == 0 || info.device_failures > 0)) {
+		// the program's first run failed: the CPU did it (and, the device
+		// being gone or not, does the next ones or not)
 		printf("a program was made, its command failed, the CPU took "
-			"over%s\n", sNoHardware ? " (as it has to without hardware)" : "");
+			"over%s%s\n", info.device_operators == 0 ? "" : " for this run",
+			sNoHardware ? " (as it has to without hardware)" : "");
 		onDevice = false;
 		if (!sNoHardware)
 			sFailures++;
@@ -456,9 +472,9 @@ main(int argc, char** argv)
 			}
 			session.GetRunInfo(&info);
 			deviceTime += info.last_device_duration;
-			if (info.device_operators != 1) {
-				check(false, "run %" B_PRId32 ": the NPU's program failed",
-					run);
+			if (info.device_operators != 1 || info.device_failures != 0) {
+				check(false, "run %" B_PRId32 ": the NPU's program failed, "
+					"the CPU computed", run);
 				break;
 			}
 			wrong = compare(description, weights, random,

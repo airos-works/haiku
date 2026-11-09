@@ -566,7 +566,7 @@ What was measured, on which machine, on 2026-11-09. "Agrees" means
   from Haiku (no I2C bus driver there), so higher frequencies were not
   tried. One core of three is used.
 
-### Vulkan (X399, GTX 1070, NVK)
+### Vulkan (X399, GTX 1070, NVK; Framework 13, Radeon 840M, RADV)
 
 | Model | On the GPU | Against the CPU | CPU ms | GPU ms |
 | --- | --- | --- | --- | --- |
@@ -584,25 +584,44 @@ What was measured, on which machine, on 2026-11-09. "Agrees" means
   machine without a Vulkan loader lists the CPU only.
 - Setting a session up takes about 120 ms (pipelines, weights, and timing
   two shader variants per convolution to keep the faster).
-- Not run on any other Vulkan driver yet (RADV on the Framework 13, Turnip,
-  V3DV, PowerVR): run `vulkan_backend_test` there first.
+- **RADV** (Framework 13, Radeon 840M of the Ryzen AI 5 340, Mesa 25.3.6):
+  `vulkan_backend_test` passes all 149 cases; MobileNet V2 float runs 66
+  of 66 operators on the GPU, agrees with the CPU (relative difference
+  2e-6, same top classes on a picture) and takes 8.9 ms against 15.1 ms
+  on the twelve CPU threads.
+- Not run on Turnip, V3DV or PowerVR yet: run `vulkan_backend_test` there
+  first.
 
 ### AMD XDNA (Framework 13, Ryzen AI 5 340)
 
-**Not run on hardware yet.** The driver (`amdxdna` add-on, linux-drm
-branch `airos-xdna`), its test program `xdna_test`, the back end
-`amdxdna.neural` and two NPU designs with known expected output (a
-pass-through and a 1x1 int8 convolution, built with mlir-aie and Peano)
-exist and build. In a virtual machine, with the driver's test mode
-standing in for the device: the add-on loads next to `amdgpu_drm`,
-buffers are made and freed without leaks, `neural devices` lists
-`amdxdna/0` without starting the NPU, the back end claims the convolution
-exactly when its design bundle is installed, and a session whose command
-the (absent) NPU refuses is finished by the CPU with the right result.
-Firmware load, the mailbox, interrupts and an actual run are untested: the
-first load on the laptop needs someone at the machine (it has no remote
-power control), following `haiku/tests/xdna/FIRST-LOAD.md` in the
-linux-drm repository.
+**Runs designs on the hardware; not stable yet.** With the driver
+(`amdxdna` add-on, linux-drm branch `airos-xdna`) loaded on the laptop:
+
+- The NPU starts: firmware 1.1.2.64 loads, the firmware answers (8
+  columns by 6 rows of tiles, "NPU Krackan 1"), interrupts work, and the
+  NPU powers down when the device is closed and up again when it is
+  opened.
+- Two designs built with mlir-aie and Peano compute the right bytes
+  through the driver's test program `xdna_test`: a pass-through (4096
+  bytes) and a 1x1 int8 convolution, 32x32x64 to 64 channels (65536 bytes
+  equal to the host reference on five runs in a row, and the same for the
+  kit's design bundle). The NPU rounds exact halves away from zero, as
+  the kit's CPU kernels do.
+- A command takes 112.5 ms whatever the design, which is a fixed delay
+  somewhere and not computing time; not understood yet.
+- **The laptop then hung** (no answer on the network) in about the
+  seventh open/run/close cycle after boot, in the same paths that had
+  passed before; the cause is not known. Until it is, the driver stays on
+  its branch and out of the images.
+- The contiguous block the NPU's buffers need (128 MiB, aligned to
+  64 MiB) could not be had on a machine that had been up for days and was
+  found in 12 ms after a boot. The driver now takes it when it is loaded
+  and a launch job loads it at boot (tried in a virtual machine only).
+- Not done on hardware: the back end `amdxdna.neural` (in a virtual
+  machine with the driver's stand-in device it lists `amdxdna/0` without
+  starting the NPU, claims the convolution exactly when its design bundle
+  is installed, and hands a failed run to the CPU with the right result),
+  `neural compare`, timing against the CPU, a soak test.
 
 ### Lookout
 
