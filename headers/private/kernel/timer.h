@@ -42,6 +42,8 @@ typedef struct timer_info timer_info;
 status_t timer_init(struct kernel_args *);
 void timer_init_post_rtc(void);
 void timer_real_time_clock_changed();
+bool timer_events_pending(void);
+	// whether a timer is due on the current CPU (interrupts disabled)
 int32 timer_interrupt(void);
 
 #ifdef __cplusplus

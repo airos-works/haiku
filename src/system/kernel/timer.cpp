@@ -449,3 +449,14 @@ spin(bigtime_t microseconds)
 	while (system_time() < target)
 		cpu_pause();
 }
+
+
+/*!	Whether any timer is set on the current CPU. Interrupts must be
+	disabled. (A CPU whose timer stops while it is idle must not sleep through
+	one.)
+*/
+bool
+timer_events_pending(void)
+{
+	return sPerCPU[smp_get_current_cpu()].events != NULL;
+}
