@@ -116,6 +116,7 @@ SYSTEM_DEMOS += [ FFilterByBuildFeatures
 	Cortex@expat
 	FontDemo
 	GLTeapot@mesa
+	Lookout
 	Mandelbrot
 	OverlayImage
 	Pairs
