@@ -55,8 +55,10 @@
 #                           jasper, libavif and libicns build features (the
 #                           JPEG, WebP, TIFF, JPEG 2000, AVIF and ICNS
 #                           translators x86_64 has; BuildFeatures
-#                           Arm64CIImageLibraryBuildFeature); the base
-#                           packages go in the image with AIROS_CI_PACKAGES
+#                           Arm64CIImageLibraryBuildFeature); their base
+#                           packages, which CI also puts in
+#                           AIROS_CI_PACKAGES, go in the image as packages
+#                           dependency resolution sees
 #   HAIKU_MUPDF_PACKAGES_DIR
 #                           HaikuPorts' mupdf and mupdf_devel for the
 #                           architecture: the mupdf build feature (Quick
@@ -205,6 +207,12 @@ if $(AIROS_ROCK5) || $(AIROS_RPI4) || $(AIROS_CUBIE) {
 		} else if $(name) = zstd || $(name) = airos_openssl {
 			# haiku requires these with the zstd and (arm64) openssl build
 			# features
+			AIROS_CI_BASE_PACKAGES += $(package:BS) ;
+		} else if $(HAIKU_ARM64_IMAGE_LIBRARIES_DIR)
+				&& [ Glob $(HAIKU_ARM64_IMAGE_LIBRARIES_DIR) : $(package:BS) ] {
+			# and haiku_datatranslators requires the picture libraries
+			# (lib:libjpeg, lib:libicns, ...), which in turn require each
+			# other (libicns: libopenjp2, libavif: libaom and libdav1d)
 			AIROS_CI_BASE_PACKAGES += $(package:BS) ;
 		}
 	}
