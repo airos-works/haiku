@@ -648,7 +648,7 @@ still NVIDIA's resource manager, as for everything else the card does).
 The NPU of Ryzen AI processors ("XDNA": an array of AI Engine tiles) is
 driven by Linux's `amdxdna` driver (the 7.4-rc2 sources), built for air/OS
 on the same compatibility layer as `amdgpu` (repository `linux-drm`,
-branch `airos-xdna`) as an add-on of its own. It publishes
+branch `airos-6.18.52`, `haiku/amdxdna/`) as an add-on of its own. It publishes
 `/dev/npu/amdxdna/0` and keeps Linux's ioctls (`amdxdna_accel.h`), plus
 the mapping ioctls of the amdgpu port. It touches no hardware until the
 device is opened; the NPU has power from the first open to the last close.
@@ -808,9 +808,13 @@ What was measured, on which machine, on 2026-11-09. "Agrees" means
 
 ### AMD XDNA (Framework 13, Ryzen AI 5 340)
 
-**The kit computes on the NPU** (2026-11-10), with the driver (`amdxdna`
-add-on, linux-drm branch `airos-xdna`) and its launch job installed by
-hand on the laptop; the driver is not in the images yet.
+**The kit computes on the NPU** (2026-11-10). The driver (`amdxdna`
+add-on, linux-drm branch `airos-6.18.52`, built by airos-ci's
+`deps/build-amdgpu.sh` next to `amdgpu_drm`) and the firmware
+(`amdnpu_firmwares`, from airos-firmware's `amdnpu/`) are in the x86_64
+images and updates from `20261109-2326-hrev60207-2555` on; the images'
+guest test `neural_kit_test` passes. The verification below was on a copy
+of the same driver installed by hand on the laptop before that.
 
 - The NPU starts: firmware 1.1.2.64 loads, the firmware answers (8
   columns by 6 rows of tiles, "NPU Krackan 1"), interrupts work, and the
@@ -827,11 +831,11 @@ hand on the laptop; the driver is not in the images yet.
   stay level over the power cycles (kmalloc 258 to 270 objects over 42).
 - **The hang of 2026-11-09** (the laptop stopped answering in about the
   seventh open/run/close cycle) was a double free in the compat layer's
-  `kthread_stop()` (fixed with two more compat faults on `airos-xdna`:
-  a spinning interrupt thread, `clflushopt` on processors without it);
-  the fixed driver went through all of the above and a day's use.
-  `amdgpu_drm` on the main linux-drm branch shares the compat layer and
-  the fault until those commits are merged.
+  `kthread_stop()` (fixed with two more compat faults: a spinning
+  interrupt thread, `clflushopt` on processors without it); the fixed
+  driver went through all of the above and a day's use. `amdgpu_drm`
+  shares the compat layer and had the fault until the merge of
+  2026-11-10 (linux-drm `airos-6.18.52` eeb0417).
 - The back end `amdxdna.neural`: `neural devices` lists `amdxdna/0`
   without starting the NPU; with the bundle installed the session puts
   the convolution on the NPU, `amdxdna_backend_test` ends with "the NPU
