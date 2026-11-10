@@ -53,6 +53,32 @@ rule ExtractArm64ImageLibraryBuildFeature feature : package : version : library
 }
 
 
+rule Arm64CIImageLibraryBuildFeature feature : package : library : headers
+{
+	# Arm64CIImageLibraryBuildFeature <feature> : <package> : <library>
+	#	[ : <header directories> ] ;
+	# air/OS CI's arm64 builds of the HaikuPorts library packages <package> and
+	# <package>_devel (airos-ci deps/recipes: the picture libraries of the
+	# translators), whatever their version, in
+	# HAIKU_ARM64_IMAGE_LIBRARIES_DIR, which CI also puts in the image. Enables
+	# <feature> as ExtractArm64ImageLibraryBuildFeature does and returns true;
+	# returns nothing for another architecture or without the packages.
+	# <library> is the file in lib/ to link against (the soname link).
+	if $(TARGET_PACKAGING_ARCH) != arm64 || ! $(HAIKU_ARM64_IMAGE_LIBRARIES_DIR) {
+		return ;
+	}
+	local base = [ Glob $(HAIKU_ARM64_IMAGE_LIBRARIES_DIR)
+		: $(package)-*-arm64.hpkg ] ;
+	local version = [ Match "^$(package)-(.*)-arm64\\.hpkg$" : $(base[1]:BS) ] ;
+	if ! $(version) {
+		return ;
+	}
+	ExtractArm64ImageLibraryBuildFeature $(feature) : $(package) : $(version)
+		: $(library) : $(headers) : $(HAIKU_ARM64_IMAGE_LIBRARIES_DIR) ;
+	return 1 ;
+}
+
+
 # SSL
 
 # Automatically enable the SSL feature, when the OpenSSL package is enabled.
@@ -582,7 +608,8 @@ if $(HAIKU_MUPDF_PACKAGES_DIR) {
 
 
 # libicns
-if [ IsPackageAvailable libicns_devel ] {
+if [ Arm64CIImageLibraryBuildFeature libicns : libicns : libicns.so.1 ] {
+} else if [ IsPackageAvailable libicns_devel ] {
 	ExtractBuildFeatureArchives libicns :
 		file: base libicns
 			runtime: lib
@@ -599,7 +626,8 @@ if [ IsPackageAvailable libicns_devel ] {
 
 
 # Jasper
-if [ IsPackageAvailable jasper_devel ] {
+if [ Arm64CIImageLibraryBuildFeature jasper : jasper : libjasper.so.4 ] {
+} else if [ IsPackageAvailable jasper_devel ] {
 	ExtractBuildFeatureArchives jasper :
 		file: base jasper
 			runtime: lib
@@ -616,7 +644,8 @@ if [ IsPackageAvailable jasper_devel ] {
 
 
 # jpeg
-if $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = arm64 {
+if [ Arm64CIImageLibraryBuildFeature jpeg : libjpeg_turbo : libjpeg.so.62 ] {
+} else if $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = arm64 {
 	ExtractArm64ImageLibraryBuildFeature jpeg : libjpeg_turbo : 3.0.4-1
 		: libjpeg.so.62.4.0 ;
 } else if [ IsPackageAvailable libjpeg_turbo_devel ] {
@@ -689,7 +718,8 @@ if [ IsPackageAvailable qrencode_kdl_devel ] {
 
 
 # tiff
-if [ IsPackageAvailable tiff_devel ] {
+if [ Arm64CIImageLibraryBuildFeature tiff : tiff : libtiff.so.6 ] {
+} else if [ IsPackageAvailable tiff_devel ] {
 	ExtractBuildFeatureArchives tiff :
 		file: base tiff
 			runtime: lib
@@ -757,7 +787,9 @@ if [ IsPackageAvailable libraw_devel ] {
 
 
 # libwebp
-if $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = arm64 {
+if [ Arm64CIImageLibraryBuildFeature libwebp : libwebp : libwebp.so.7
+		: develop/headers develop/headers/webp ] {
+} else if $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = arm64 {
 	ExtractArm64ImageLibraryBuildFeature libwebp : libwebp : 1.4.0-1
 		: libwebp.so.7.1.9 : develop/headers develop/headers/webp ;
 } else if [ IsPackageAvailable libwebp_devel ] {
@@ -788,7 +820,8 @@ if $(HAIKU_ARM64_IMAGE_LIBS_PACKAGES_DIR) && $(TARGET_PACKAGING_ARCH) = arm64 {
 
 
 # libavif
-if [ IsPackageAvailable libavif1.0_devel ] {
+if [ Arm64CIImageLibraryBuildFeature libavif : libavif1.0 : libavif.so.16 ] {
+} else if [ IsPackageAvailable libavif1.0_devel ] {
 	ExtractBuildFeatureArchives libavif :
 		file: base libavif1.0
 			runtime: lib

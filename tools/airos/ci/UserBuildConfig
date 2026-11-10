@@ -48,6 +48,15 @@
 #                           (arm64) air/OS's libpng16 and libpng16_devel: the
 #                           libpng build feature (the PNG translator), and
 #                           libpng16 in the image for it and for FreeType
+#   HAIKU_ARM64_IMAGE_LIBRARIES_DIR
+#                           (arm64) CI's builds of HaikuPorts' libjpeg_turbo,
+#                           libwebp, tiff, jasper, libavif1.0 and libicns with
+#                           their _devel packages: the jpeg, libwebp, tiff,
+#                           jasper, libavif and libicns build features (the
+#                           JPEG, WebP, TIFF, JPEG 2000, AVIF and ICNS
+#                           translators x86_64 has; BuildFeatures
+#                           Arm64CIImageLibraryBuildFeature); the base
+#                           packages go in the image with AIROS_CI_PACKAGES
 #   HAIKU_MUPDF_PACKAGES_DIR
 #                           HaikuPorts' mupdf and mupdf_devel for the
 #                           architecture: the mupdf build feature (Quick
