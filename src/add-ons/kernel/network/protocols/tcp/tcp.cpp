@@ -741,6 +741,15 @@ tcp_receive_data(net_buffer* buffer)
 
 	TCPEndpoint* endpoint = endpointManager->FindConnection(
 		buffer->destination, buffer->source);
+	if (endpoint != NULL && endpoint->State() == TIME_WAIT
+		&& (segment.flags & TCP_FLAG_SYNCHRONIZE) != 0
+		&& endpoint->EndTimeWaitForNewConnection(segment)) {
+		// The old connection is gone (or going); a listening endpoint gets
+		// the SYN.
+		gSocketModule->release_socket(endpoint->socket);
+		endpoint = endpointManager->FindConnection(buffer->destination,
+			buffer->source);
+	}
 	if (endpoint != NULL) {
 		segmentAction = endpoint->SegmentReceived(segment, buffer);
 

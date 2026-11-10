@@ -3268,6 +3268,53 @@ TCPEndpoint::_KeepAliveTimer(net_timer* timer, void* _endpoint)
 }
 
 
+/*!	A SYN arrived for this connection while it is in TIME_WAIT: the peer opens
+	a new connection on the same addresses and ports, as a client making many
+	short connections does once its ephemeral ports wrap around. If the
+	segment clearly belongs to a new incarnation (a newer timestamp, or a
+	sequence number past the old connection's end; RFC 1122 4.2.2.13 and
+	RFC 6191), the TIME_WAIT ends now and true is returned: the caller hands
+	the segment to the listening endpoint. Before, such a SYN was dropped, and
+	the peer's connect() hung for up to the whole 2 MSL (two minutes).
+*/
+bool
+TCPEndpoint::EndTimeWaitForNewConnection(const tcp_segment_header& segment)
+{
+	MutexLocker locker(fLock);
+	if (!locker.IsLocked() || fState != TIME_WAIT
+		|| (fFlags & FLAG_CLOSED) == 0) {
+		return false;
+	}
+	if ((segment.flags & (TCP_FLAG_SYNCHRONIZE | TCP_FLAG_ACKNOWLEDGE
+			| TCP_FLAG_RESET)) != TCP_FLAG_SYNCHRONIZE) {
+		return false;
+	}
+
+	bool newIncarnation;
+	if ((fFlags & FLAG_OPTION_TIMESTAMP) != 0
+		&& (segment.options & TCP_HAS_TIMESTAMPS) != 0) {
+		newIncarnation
+			= (int32)(segment.timestamp_value - fReceivedTimestamp) > 0;
+	} else
+		newIncarnation = tcp_sequence(segment.sequence) > fReceiveNext;
+	if (!newIncarnation)
+		return false;
+
+	// The TIME_WAIT timer holds the last reference of a closed socket; take
+	// it over unless the timer is firing right now.
+	if (!gStackModule->cancel_timer(&fTimeWaitTimer))
+		return false;
+	T(TimerSet(this, "time-wait", -1));
+
+	fState = CLOSED;
+	T(State(this));
+	locker.Unlock();
+
+	gSocketModule->release_socket(socket);
+	return true;
+}
+
+
 /*static*/ void
 TCPEndpoint::_TimeWaitTimer(net_timer* timer, void* _endpoint)
 {

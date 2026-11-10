@@ -57,6 +57,8 @@ public:
 			status_t	SetOption(int option, const void* value, int length);
 
 			tcp_state	State() const { return fState; }
+			bool		EndTimeWaitForNewConnection(
+							const tcp_segment_header& segment);
 			bool		IsBound() const;
 			bool		IsLocal() const;
 
