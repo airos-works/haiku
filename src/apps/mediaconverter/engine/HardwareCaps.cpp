@@ -188,14 +188,15 @@ add_format(GpuDevice& device, video_codec codec, int maxWidth, int maxHeight,
 
 /*!	NVENC by generation, from NVIDIA's video encode support matrix: H.264
 	from the first, H.265 from the second Maxwell, ten-bit H.265 from
-	Pascal, AV1 from Ada Lovelace. */
+	Pascal, AV1 from Ada Lovelace. The nvenc add-on codes I and P pictures
+	only, so no format is listed with B pictures, whatever the engine has. */
 static void
 nvidia_formats(GpuDevice& device, int generation)
 {
 	if (generation <= 0)
 		return;
-	bool bFrames = generation >= 7;
-	add_format(device, kVideoH264, 4096, 4096, true);
+	const bool bFrames = false;
+	add_format(device, kVideoH264, 4096, 4096, bFrames);
 	if (generation >= 5) {
 		int size = generation >= 6 ? 8192 : 4096;
 		add_format(device, kVideoH265, size, size, bFrames);
@@ -203,8 +204,8 @@ nvidia_formats(GpuDevice& device, int generation)
 	if (generation >= 6)
 		add_format(device, kVideoH265_10, 8192, 8192, bFrames);
 	if (generation >= 8) {
-		add_format(device, kVideoAV1, 8192, 8192, true);
-		add_format(device, kVideoAV1_10, 8192, 8192, true);
+		add_format(device, kVideoAV1, 8192, 8192, bFrames);
+		add_format(device, kVideoAV1_10, 8192, 8192, bFrames);
 	}
 }
 

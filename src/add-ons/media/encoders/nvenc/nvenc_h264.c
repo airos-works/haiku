@@ -281,9 +281,11 @@ NvencH264 *
 nvencH264Open(NvencEngine *engine, const nvenc_config *config, char *reason,
 	size_t reasonSize)
 {
-	if (config->width < 32 || config->height < 32 || config->width > 4096
+	/* The engine fails a picture only two macroblocks wide (error 47 on the
+	   GTX 1070); three, 33 pixels and up, work. */
+	if (config->width < 33 || config->height < 32 || config->width > 4096
 		|| config->height > 4096) {
-		set_reason(reason, reasonSize, "NVENC encodes H.264 from 32x32 to 4096x4096.");
+		set_reason(reason, reasonSize, "NVENC encodes H.264 from 33x32 to 4096x4096.");
 		return NULL;
 	}
 	if (config->variant >= kNvencLayoutCount) {

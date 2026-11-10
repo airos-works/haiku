@@ -309,9 +309,11 @@ NvencHevc *
 nvencHevcOpen(NvencEngine *engine, const nvenc_config *config, char *reason,
 	size_t reasonSize)
 {
-	if (config->width < 64 || config->height < 64 || config->width > 8192
+	/* As with H.264, a picture only two coding tree blocks wide fails;
+	   three, 65 pixels and up, work. */
+	if (config->width < 65 || config->height < 64 || config->width > 8192
 		|| config->height > 8192) {
-		set_reason(reason, reasonSize, "NVENC encodes H.265 from 64x64 to 8192x8192.");
+		set_reason(reason, reasonSize, "NVENC encodes H.265 from 65x64 to 8192x8192.");
 		return NULL;
 	}
 	if (config->variant >= kNvencLayoutCount) {

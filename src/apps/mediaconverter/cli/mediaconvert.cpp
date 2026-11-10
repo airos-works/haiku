@@ -366,6 +366,11 @@ compare(const char* source, const char* output)
 		width = a.Width();
 		height = a.Height();
 	}
+	if (width <= 0 || height <= 0) {
+		// an empty output (an encoder that wrote nothing) has no size
+		fprintf(stderr, "%s has no picture size\n", output);
+		return 1;
+	}
 	std::vector<uint8> la, lb;
 	int frames = 0;
 	double sum = 0, minimum = 1000;

@@ -28,7 +28,9 @@ an RTX 3050 (Mesa merge request 45349, which says its tables were taken from
 NVIDIA's library and are not for redistribution; nothing of it is copied here,
 the fields are set by name).
 
-H.264 works: I and P pictures, any size from 32x32 to 4096x4096. A 12 second
+H.264 works: I and P pictures, any size from 33x32 to 4096x4096 (a picture
+only two macroblocks wide, 32 pixels, fails with error 47; H.265 likewise
+needs three coding tree blocks, 65 pixels). A 12 second
 1080p clip converts at 106 pictures/s (3.6 times real time, decoding the
 source included) and comes back at 44.6 dB. H.265 Main and Main 10 encode I
 pictures, but the engine refuses every P picture (see below), so

@@ -331,6 +331,21 @@ Big Buck Bunny clip, luma PSNR against the source with
 | SVT-AV1 preset 8, 720p, 8/10-bit | 46.1 / 46.0 dB |
 | VP9, VP8, MPEG-4, MPEG-2 | 43.8, 44.8, 46.3, 46.4 dB |
 
+On the X399 with a GeForce GTX 1070 (Pascal, NVENC; 2026-11-10, the image's
+add-on), each output decoded with libavcodec and compared with
+`mediaconvert --compare`:
+
+| Test | Result |
+| --- | --- |
+| 12 s 1080p clip, H.264 QP 24 | 44.65 dB, 104 pictures/s including start-up |
+| Big Buck Bunny 1080p, 10:34 (19,036 pictures) | 254 pictures/s (8.5 times real time), 43.8 dB, lowest 36.6 dB |
+| Quality 0 / 50 / 100 (QP 36 / 26 / 16) | 37.8 / 43.5 / 49.4 dB |
+| Average 1000 / 4000 / 12000 kbit/s | 1230 / 4280 / 11500 kbit/s delivered |
+| Sizes 58x32 to 1920x1080 (scaled), 4096x2160 and 4096x4096 (nvenctest) | all decode and match; 32 pixels wide is refused (see the add-on's README) |
+| VP9 1080p59.94, MPEG-2 DVD and Blu-ray, 10-bit H.265 sources | 45.1, 46.4, 47.9 and 45.3 dB |
+| Three and six conversions at once | each output identical to the conversion run alone |
+| The window, preset Fast 1080p | encoded on the GPU, 44.65 dB |
+
 On the Framework 13 (Radeon 760M, Phoenix, VCN 4), the same clip at 720p,
 each output decoded and compared:
 
@@ -378,8 +393,8 @@ MEDIACONVERTER_FAKE_NVIDIA=1b81 ...         pretend there is a GTX 1070 (with th
 
 ## Known limits
 
-- NVENC: H.264 is verified on a GTX 1070 (Pascal) only; other generations
-  run the same code and rely on the self-test. H.265 P pictures are refused
+- NVENC: H.264 is verified on a GTX 1070 (Pascal) only (see Measured);
+  other generations run the same code and rely on the self-test. H.265 P pictures are refused
   by the engine, so H.265 is encoded on the CPU on NVIDIA cards (see above).
   B pictures are not used on NVIDIA.
 - AV1 on Ada and Blackwell is encoded on the CPU: NVENC's AV1 needs the
