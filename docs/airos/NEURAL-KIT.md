@@ -913,10 +913,23 @@ of the same driver installed by hand on the laptop before that.
 - **The multilingual model** (tiny) converts and checks the same way;
   the kit's text for the two English recordings is the reference's.
   No recording in another language was tried.
-- **Not verified:** audio from a microphone (only files were fed, at
-  once and in pieces); a model found by name in the data directories
-  (the models were given by their path, nothing was installed on the
-  board); any device but the CPU; x86_64 beyond building.
+- **On the laptop** (x86_64, 2026-11-10, image hrev60207+2556 with Summit
+  20261110.0219): `neural transcribe` gives the Kennedy recording's text
+  in 0.87 s (11 s of audio), with the model found by name in
+  `~/config/non-packaged/data/neural/models/whisper-tiny.en`. Through
+  Summit, `webkitSpeechRecognition` → `libsummitspeech.so` → the kit
+  (Summit's `tools/test-speech-recognition.py` on the machine, the
+  recording in place of the microphone): interim results every 2 s and
+  both final phrases right.
+- **A real microphone** was tried on the laptop with the built-in
+  microphone and a Logitech C920 and does not work yet, for a reason
+  outside the kit: Summit's capture consumer delivers silence from both
+  (a `BMediaRecorder` on the same nodes hears the speakers at −28 and
+  −14 dBFS at the same moment), so nothing reaches the recognizer
+  (airos-works/summit#204). Summit's WebDriver test cannot show this: an
+  automated page captures from WebKit's mock microphone, a tone.
+- **Not verified:** speech from a microphone (above); any device but the
+  CPU.
 
 ### Lookout
 
@@ -950,9 +963,21 @@ On the X399 (2026-11-09, GTX 1070, 200% scaling; CPU runs with
   and 30.0 runs per second, 16.3 ms per run (18.6 at most), the team's
   memory the same after 4 and after 64 seconds (157 areas, 122.0 MiB);
   the thread ends when the source is switched to the picture.
-- **Not verified:** a camera (the Media Kit connection, its release, hot
-  plug), a drop with the mouse, choosing a file in the panels, the entry
-  in the Demos menu (the program was installed non-packaged).
+- **A real camera** (the laptop, 2026-11-10, packaged Lookout from the
+  Demos menu): the built-in camera and a Logitech C920 on the dock, both
+  640 x 480 through the Media Kit, switched live from the Source menu
+  (the menu lists the cameras by their node names). SSD MobileNet V1 on
+  the CPU at the camera's 30 frames per second, 13 to 15 ms a run,
+  finding the person at the desk, a monitor ("tv"), a cell phone, a
+  bottle and a cup; MobileNet V2 float on `vulkan/0` (RADV, 66 of 66
+  operators) at 30 runs per second, 15 to 17 ms; the NPU choice falls
+  back to the CPU as it should ("AMD XDNA NPU runs none of this model",
+  there is one design bundle). Quit cleanly after a few minutes, no team
+  left, nothing in the syslog. (The built-in camera's rate fell from 30
+  to 16.5 frames per second after some seconds, the C920 stayed at 30;
+  auto-exposure in a dim room, most likely, not measured.)
+- **Not verified:** camera hot plug, a drop with the mouse, choosing a
+  file in the panels.
 
 ## Open points
 
