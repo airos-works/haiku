@@ -1029,8 +1029,23 @@ On the X399 (2026-11-09, GTX 1070, 200% scaling; CPU runs with
   (`haiku/tests/xdna/build-designs.sh` in linux-drm); there is one, the
   1x1 convolution. A real network needs a design for each of its
   convolution shapes, or a code generator as the RK3588 back end has, and
-  a bundle package. The driver itself waits for the compat layer's fixes
-  to be merged into linux-drm's main branch and a CI pin.
+  a bundle package.
+- **The other boards** (deferred by the owner on 2026-11-10; both were
+  powered off that day). *Dragon Q8B* (Snapdragon 8cx Gen 3, SC8280XP):
+  its NPU is a Hexagon DSP reached through Qualcomm's FastRPC and signed
+  DSP firmware, with no open compiler or runtime, so there is no driver
+  route the kit could take today; its Adreno 690 GPU, on the other hand,
+  needs no new driver: the Vulkan back end on Turnip (untried there, see
+  above) would give the board a float device under the same API.
+  *Raspberry Pi 4 with an external NPU*: which NPU is on it is not
+  recorded here; the two usual ones both have an open kernel side and a
+  closed compiler, so each would be a driver under `/dev/npu` plus a
+  back end that feeds precompiled programs, the way the XDNA back end
+  feeds design bundles: a Hailo-8 (PCIe, Linux's `hailo_pci`, firmware
+  and HEF compiler from Hailo) or a Coral Edge TPU (PCIe `apex`/`gasket`
+  or the USB device, closed `edgetpu_compiler`). The Pi's GPU is a
+  VideoCore VI: V3DV exists but its compute path has not been tried with
+  the Vulkan back end either.
 - **Cancelling a run.** Deleting a session waits for its run to end.
 - **Models in the image.** None is shipped; `fetch-models.sh` fetches the
   public test models. System tasks will want a package of models.
