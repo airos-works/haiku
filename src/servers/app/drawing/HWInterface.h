@@ -271,6 +271,7 @@ private:
 									int32 shadow);
 	static	status_t			_FlushKnobEntry(void* data);
 			void				_FlushKnobThread();
+			void				_DumpFlushState();
 			void				_SetFlushing(bool flushing);
 	static	status_t			_FlushWorkerEntry(void* data);
 			void				_StartFlushWorkers(FlushTarget& target);

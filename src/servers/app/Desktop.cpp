@@ -493,6 +493,7 @@ Desktop::Desktop(uid_t userID, const char* targetScreen)
 
 Desktop::~Desktop()
 {
+	gScreenManager->SetOwnerReady(this, false);
 	delete_area(fSharedReadOnlyArea);
 	delete_port(fMessagePort);
 
@@ -687,6 +688,11 @@ Desktop::Init()
 		// this will set the default cursor
 
 	fVirtualScreen.HWInterface()->SetCursorVisible(true);
+
+	// From now on the monitors' changes come in (also the ones that came
+	// while the desktop set itself up, a dock's behind an MST hub): before,
+	// they would have run alongside this setup.
+	gScreenManager->SetOwnerReady(this, true);
 
 	return B_OK;
 }

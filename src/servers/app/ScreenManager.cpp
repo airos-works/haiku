@@ -70,7 +70,8 @@ ScreenChangeListener::ScreenChanged(HWInterface* interface)
 ScreenManager::ScreenManager()
 	:
 	BLooper("screen manager"),
-	fScreenList(4)
+	fScreenList(4),
+	fReadyOwners(2)
 {
 #ifdef HAIKU_TARGET_PLATFORM_LIBBE_TEST
 #	if defined(USE_DIRECT_WINDOW_TEST_MODE)
@@ -134,9 +135,10 @@ ScreenManager::AcquireScreens(ScreenOwner* owner, int32* wishList,
 		if (item->owner == NULL && list.AddItem(item->screen.Get())) {
 			item->owner = owner;
 			added++;
-			if (item->changedUnowned) {
+			if (item->changedUnowned && _IsReady(owner)) {
 				// Its new owner set it up from what was there before the
 				// change; it gets to look again, once it has the screen.
+				// (An owner still starting up gets it when it is ready.)
 				PostMessage(kMsgDeliverScreenChanges);
 			}
 		}
@@ -183,6 +185,31 @@ ScreenManager::ReleaseScreens(ScreenList& list)
 }
 
 
+/*!	An owner gets the changes of its screens from when it is \a ready on:
+	the desktop once it has set itself up. Changes in between are kept and
+	delivered then.
+*/
+void
+ScreenManager::SetOwnerReady(ScreenOwner* owner, bool ready)
+{
+	BAutolock locker(this);
+
+	if (!ready) {
+		fReadyOwners.RemoveItem(owner);
+		return;
+	}
+	if (_IsReady(owner) || !fReadyOwners.AddItem(owner))
+		return;
+	for (int32 i = 0; i < fScreenList.CountItems(); i++) {
+		screen_item* item = fScreenList.ItemAt(i);
+		if (item->owner == owner && item->changedUnowned) {
+			PostMessage(kMsgDeliverScreenChanges);
+			break;
+		}
+	}
+}
+
+
 void
 ScreenManager::ScreenChanged(Screen* screen)
 {
@@ -192,17 +219,28 @@ ScreenManager::ScreenChanged(Screen* screen)
 		screen_item* item = fScreenList.ItemAt(i);
 		if (item->screen.Get() != screen)
 			continue;
-		if (item->owner != NULL) {
+		if (item->owner != NULL && _IsReady(item->owner)) {
 			item->changedUnowned = false;
 			item->owner->ScreenChanged(screen);
 		} else {
 			// Monitors that come up while app_server starts (a dock's,
 			// behind an MST hub) report themselves before the desktop owns
-			// the screen: kept for the owner, else nothing would ever lay
-			// them out.
+			// the screen, or while it is still setting itself up from what
+			// was there before: kept for the owner, else nothing would ever
+			// lay them out. Delivered during the desktop's setup, the change
+			// raced it: the desktop's own setup afterwards left monitors out
+			// of the screen region (nothing drawn there) and the flush half
+			// set up (copies to them that never showed).
 			item->changedUnowned = true;
 		}
 	}
+}
+
+
+bool
+ScreenManager::_IsReady(ScreenOwner* owner) const
+{
+	return fReadyOwners.HasItem(owner);
 }
 
 
@@ -278,7 +316,8 @@ ScreenManager::MessageReceived(BMessage* message)
 		case kMsgDeliverScreenChanges:
 			for (int32 i = 0; i < fScreenList.CountItems(); i++) {
 				screen_item* item = fScreenList.ItemAt(i);
-				if (item->changedUnowned && item->owner != NULL)
+				if (item->changedUnowned && item->owner != NULL
+					&& _IsReady(item->owner))
 					ScreenChanged(item->screen.Get());
 			}
 			break;

@@ -830,6 +830,8 @@ struct HWInterface::FlushTarget {
 	int32			timeouts;
 	bigtime_t		ignoredUntil;
 	bigtime_t		lastBlank;
+	int64			wakes;			// the thread's rounds (for the dump)
+	bigtime_t		lastWake;
 
 	int64			flushes;
 	int64			rects;
@@ -1120,9 +1122,19 @@ HWInterface::_FlushKnobThread()
 	if (find_directory(B_USER_SETTINGS_DIRECTORY, &settings) != B_OK)
 		return;
 	BPath deviceCopy(settings);
+	BPath dump(settings);
 	settings.Append("app_server/no_vblank_flush");
 	deviceCopy.Append("app_server/no_device_copy");
+	dump.Append("app_server/vblank_flush_dump");
 	while (!fQuitFlush) {
+		// for diagnosis: the flush's state goes to the syslog when the file
+		// is created (it is removed again)
+		BEntry dumpEntry(dump.Path());
+		if (dumpEntry.Exists()) {
+			dumpEntry.Remove();
+			_DumpFlushState();
+		}
+
 		bool off = BEntry(settings.Path()).Exists();
 		if (off == fFlushWanted) {
 			debug_printf("app_server: vertical blank flush: %s (%s)\n",
@@ -1140,6 +1152,62 @@ HWInterface::_FlushKnobThread()
 		}
 		snooze(500000);
 	}
+}
+
+
+/*!	The flush's state in the syslog, for diagnosis (see _FlushKnobThread()).
+*/
+void
+HWInterface::_DumpFlushState()
+{
+	if (!fFlushLock.Lock())
+		return;
+	bigtime_t now = system_time();
+	RenderingBuffer* backBuffer = BackBuffer();
+	debug_printf("app_server: flush dump: flushing %d wanted %d per output %d"
+		" shadow current %" B_PRId32 " readers %" B_PRId32 " back %" B_PRIu32
+		"x%" B_PRIu32 "\n", fFlushing, fFlushWanted, fFlushPerOutput,
+		fShadowCurrent, fShadowReaders,
+		backBuffer != NULL ? backBuffer->Width() : 0,
+		backBuffer != NULL ? backBuffer->Height() : 0);
+	for (int32 i = 0; i < 2; i++) {
+		RenderingBuffer* shadow = fFlushShadow[i].Get();
+		debug_printf("app_server: flush dump: shadow %" B_PRId32 ": %" B_PRIu32
+			"x%" B_PRIu32 "%s\n", i, shadow != NULL ? shadow->Width() : 0,
+			shadow != NULL ? shadow->Height() : 0,
+			shadow == NULL ? " (none)"
+				: shadow->Bits() == NULL ? " (device)" : " (memory)");
+	}
+	int32 writes = 0;
+	for (int32 i = 0; i < 32; i++) {
+		if (fShadowWrites[i].used)
+			writes++;
+	}
+	debug_printf("app_server: flush dump: %" B_PRId32 " shadow writes under "
+		"way\n", writes);
+	for (int32 i = 0; i < fFlushTargetCount; i++) {
+		FlushTarget& target = fFlushTargets[i];
+		clipping_rect p0 = target.pending[0].FrameInt();
+		clipping_rect p1 = target.pending[1].FrameInt();
+		debug_printf("app_server: flush dump: %" B_PRId32 " %s (id %" B_PRIu32
+			"): frame %" B_PRId32 ",%" B_PRId32 "-%" B_PRId32 ",%" B_PRId32
+			" sem %" B_PRId32 " scan %" B_PRId32 " pending %" B_PRId32
+			" (%" B_PRId32 ",%" B_PRId32 "-%" B_PRId32 ",%" B_PRId32 ") / %"
+			B_PRId32 " (%" B_PRId32 ",%" B_PRId32 "-%" B_PRId32 ",%" B_PRId32
+			") queued %" B_PRIu32 " flushed %" B_PRIu32 " wakes %" B_PRId64
+			" last %.1f s ago, flushes %" B_PRId64 ", ignored for %.1f s\n",
+			i, target.name, target.outputID, target.frame.left,
+			target.frame.top, target.frame.right, target.frame.bottom,
+			target.retraceSemaphore, target.scanLineKnown,
+			target.pending[0].CountRects(), p0.left, p0.top, p0.right,
+			p0.bottom, target.pending[1].CountRects(), p1.left, p1.top,
+			p1.right, p1.bottom, target.queued, target.flushed, target.wakes,
+			target.lastWake != 0 ? (now - target.lastWake) / 1000000.0 : -1.0,
+			target.flushes,
+			target.ignoredUntil > now
+				? (target.ignoredUntil - now) / 1000000.0 : 0.0);
+	}
+	fFlushLock.Unlock();
 }
 
 
@@ -1181,6 +1249,8 @@ HWInterface::_AddFlushTarget(uint32 outputID, const char* name)
 	target.timeouts = 0;
 	target.ignoredUntil = 0;
 	target.lastBlank = 0;
+	target.wakes = 0;
+	target.lastWake = 0;
 	target.period = kDefaultFramePeriod;
 	target.modePeriod = 0;
 	target.flushes = target.rects = target.late = 0;
@@ -1429,6 +1499,8 @@ HWInterface::_FlushThread(FlushTarget& target)
 		} while (status == B_INTERRUPTED);
 		if (status != B_OK || fQuitFlush)
 			break;
+		target.wakes++;
+		target.lastWake = system_time();
 
 		// the blank
 		bigtime_t blank = 0;

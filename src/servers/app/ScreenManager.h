@@ -48,6 +48,7 @@ class ScreenManager : public BLooper {
 							int32 wishCount, const char* target, bool force,
 							ScreenList& list);
 		void			ReleaseScreens(ScreenList& list);
+		void			SetOwnerReady(ScreenOwner* owner, bool ready);
 
 		void			ScreenChanged(Screen* screen);
 
@@ -60,12 +61,16 @@ class ScreenManager : public BLooper {
 			ObjectDeleter<HWInterfaceListener>
 									listener;
 			bool					changedUnowned;
+				// changed while no owner could take it: an owner that has
+				// not acquired it yet, or is not ready (SetOwnerReady())
 		};
 
 		void			_ScanDrivers();
 		screen_item*	_AddHWInterface(HWInterface* interface);
+		bool			_IsReady(ScreenOwner* owner) const;
 
 		BObjectList<screen_item, true>	fScreenList;
+		BObjectList<ScreenOwner>		fReadyOwners;
 };
 
 extern ScreenManager *gScreenManager;
