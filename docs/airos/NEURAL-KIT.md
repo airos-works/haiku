@@ -921,15 +921,19 @@ of the same driver installed by hand on the laptop before that.
   (Summit's `tools/test-speech-recognition.py` on the machine, the
   recording in place of the microphone): interim results every 2 s and
   both final phrases right.
-- **A real microphone** was tried on the laptop with the built-in
-  microphone and a Logitech C920 and does not work yet, for a reason
-  outside the kit: Summit's capture consumer delivers silence from both
-  (a `BMediaRecorder` on the same nodes hears the speakers at −28 and
-  −14 dBFS at the same moment), so nothing reaches the recognizer
-  (airos-works/summit#204). Summit's WebDriver test cannot show this: an
-  automated page captures from WebKit's mock microphone, a tone.
-- **Not verified:** speech from a microphone (above); any device but the
-  CPU.
+- **A real microphone** (the laptop, 2026-11-10): the Kennedy recording
+  played through the laptop's speakers into a Logitech C920 on the dock,
+  Summit's `webkitSpeechRecognition` listening on it (test page, a test
+  profile): `speech begins`, interim results, the final result "And so my
+  fellow Americans ask not what your country can do for you, ask what
+  you can do for your country." That first failed for a reason outside
+  the kit: `multi_audio` left a sound card's capture output disabled
+  after any `BMediaRecorder` user (the Media preferences' input meter,
+  SoundRecorder), and every later consumer that did not re-enable it got
+  no buffer - fixed on master (f5dd495c90; airos-works/summit#204 has
+  the hunt). Summit's WebDriver test cannot show either: an automated
+  page captures from WebKit's mock microphone, a tone.
+- **Not verified:** any device but the CPU for speech.
 
 ### Lookout
 
