@@ -1018,6 +1018,15 @@ MultiAudioNode::Connect(status_t error, const media_source& source,
 	channel->fOutput.format = format;
 	strlcpy(name, channel->fOutput.name, B_MEDIA_NAME_LENGTH);
 	fActiveOutputs++;
+	// A new connection delivers buffers (B_CONNECT_MUTED is a TODO of the
+	// roster; a consumer that wants it quiet calls SetOutputEnabled(false)).
+	// The flag is the output's, not the connection's: BMediaRecorder::Stop()
+	// leaves it off, and a consumer that connected later without asking for
+	// its output to be enabled (most of them) got no buffer at all - every
+	// capture from a sound card was silent after the Media preferences'
+	// input level meter or SoundRecorder had been used once (2026-11-10,
+	// Framework 13).
+	channel->fOutputEnabled = true;
 
 	// reset our buffer duration, etc. to avoid later calculations
 	bigtime_t duration = channel->fOutput.format.u.raw_audio.buffer_size * 10000
