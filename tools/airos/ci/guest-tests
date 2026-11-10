@@ -26,3 +26,7 @@ vfork_malloc_test
 # kernels behind them, a session shared between a device and the CPU, the
 # CPU taking over from a device that fails or goes away
 neural_kit_test
+# a debugger removed while it profiled running threads (profile following
+# child teams) left their per-CPU profiling timers armed; one fired for the
+# idle thread and panicked in profiling_event() (Framework 13, 2026-11-10)
+profiler_detach_test
