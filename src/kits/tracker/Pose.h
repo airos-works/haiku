@@ -36,6 +36,7 @@ All rights reserved.
 
 
 #include <Region.h>
+#include <StringList.h>
 
 #include "TextWidget.h"
 #include "Model.h"
@@ -99,6 +100,15 @@ public:
 		BPoint poseLoc, BPoseView* view, bool visible);
 	bool UpdateVolumeSpaceBar(BVolume* volume);
 	void UpdateIcon(BPoint poseLoc, BPoseView*);
+	void TagsChanged() { fTagsRead = false; }
+	const BStringList& Tags();
+		// the item's tags, read the first time they are drawn
+
+private:
+	void _DrawTagsAfterName(BRect columnRect, BRect textRect,
+		BPoseView* poseView, BView* drawView, BPoint offset);
+
+public:
 
 	//void UpdateFixedSymlink(BPoint poseLoc, BPoseView*);
 	void UpdateBrokenSymLink(BPoint poseLoc, BPoseView*);
@@ -150,6 +160,8 @@ private:
 	bool fWasAutoPlaced : 1;
 	bool fBrokenSymLink : 1;
 	bool fBackgroundClean : 1;
+	bool fTagsRead : 1;
+	BStringList fTags;
 };
 
 

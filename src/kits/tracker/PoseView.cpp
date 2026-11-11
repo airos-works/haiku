@@ -91,6 +91,7 @@ All rights reserved.
 #include "BatchRenameWindow.h"
 #include "FSUndoRedo.h"
 #include "FolderSizes.h"
+#include "Tags.h"
 #include "FSUtils.h"
 #include "FilePanelPriv.h"
 #include "FunctionObject.h"
@@ -2593,6 +2594,37 @@ BPoseView::MessageReceived(BMessage* message)
 		case kNewFolderWithSelection:
 			NewFolderWithSelection();
 			break;
+
+		case kToggleTag:
+		{
+			// on for all when some do not have it yet, else off for all
+			const char* tag = message->GetString("tag", NULL);
+			if (tag == NULL || CountSelected() == 0)
+				break;
+
+			bool allHave = true;
+			for (int32 index = 0; index < CountSelected(); index++) {
+				if (!fSelectionList->ItemAt(index)->Tags().HasString(tag, true)) {
+					allHave = false;
+					break;
+				}
+			}
+			for (int32 index = 0; index < CountSelected(); index++) {
+				BPose* pose = fSelectionList->ItemAt(index);
+				SetTag(*pose->TargetModel()->EntryRef(), tag, !allHave);
+				pose->TagsChanged();
+			}
+			Invalidate();
+			break;
+		}
+
+		case kFindTagged:
+		{
+			const char* tag = message->GetString("tag", NULL);
+			if (tag != NULL)
+				FindTaggedItems(tag);
+			break;
+		}
 
 		case kCopyPath:
 			CopyPathsToClipboard();
@@ -6611,6 +6643,19 @@ BPoseView::AttributeChanged(const BMessage* message)
 	const char* attrName;
 	if (message->FindString("attr", &attrName) != B_OK)
 		attrName = NULL;
+
+	if (attrName != NULL && strcmp(attrName, kAttrTags) == 0) {
+		// tags are drawn next to the name, not only in a column
+		int32 tagIndex;
+		BPose* pose = CurrentPoseList()->FindPose(&itemNode, &tagIndex);
+		if (pose != NULL) {
+			pose->TagsChanged();
+			if (ViewMode() == kListMode)
+				Invalidate(CalcPoseRectList(pose, tagIndex));
+			else
+				Invalidate(pose->CalcRect(this));
+		}
+	}
 
 	if (message->GetInt32("opcode", 0) == B_STAT_CHANGED && ShowsFolderSizes()) {
 		// what is in a folder changed: work its size out again

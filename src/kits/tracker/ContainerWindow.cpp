@@ -94,6 +94,7 @@ All rights reserved.
 #include "QueryContainerWindow.h"
 #include "SelectionWindow.h"
 #include "Shortcuts.h"
+#include "Tags.h"
 #include "TemplatesMenu.h"
 #include "Thread.h"
 #include "TitleView.h"
@@ -1275,6 +1276,25 @@ BContainerWindow::_UpdateExtraItems(BMenu* menu)
 	item = menu->FindItem(kDeleteImmediately);
 	if (item != NULL)
 		item->SetEnabled(hasSelection && writable);
+
+	item = menu->FindItem(B_TRANSLATE("Tags"));
+	if (item != NULL && item->Submenu() != NULL) {
+		// filled each time for what is selected now
+		BMenu* tagsMenu = item->Submenu();
+		while (BMenuItem* old = tagsMenu->RemoveItem((int32)0))
+			delete old;
+
+		BObjectList<entry_ref, true> refs(10);
+		PoseList* selection = PoseView()->SelectionList();
+		for (int32 index = 0; index < selection->CountItems(); index++) {
+			refs.AddItem(new entry_ref(
+				*selection->ItemAt(index)->TargetModel()->EntryRef()));
+		}
+		BVolume volume(TargetModel()->NodeRef()->device);
+		bool canTag = writable && volume.KnowsAttr();
+		BuildTagsMenu(tagsMenu, canTag ? refs
+			: BObjectList<entry_ref, true>(), PoseView());
+	}
 }
 
 
@@ -2201,6 +2221,8 @@ BContainerWindow::AddFileMenu(BMenu* menu)
 		menu->AddItem(Shortcuts()->PasteItem());
 	}
 	_AddPoseItem(menu, B_TRANSLATE("Copy path"), kCopyPath, 'C', B_OPTION_KEY);
+	if (!TargetModel()->IsRoot() && !TargetModel()->IsTrash())
+		menu->AddItem(new BMenu(B_TRANSLATE("Tags")));
 	menu->AddSeparatorItem();
 
 	if (!TargetModel()->IsRoot() && !TargetModel()->IsTrash()
@@ -3042,6 +3064,7 @@ BContainerWindow::AddPoseContextMenu(BMenu* menu)
 		menu->AddItem(Shortcuts()->PasteItem());
 		_AddPoseItem(menu, B_TRANSLATE("Copy path"), kCopyPath, 'C',
 			B_OPTION_KEY);
+		menu->AddItem(new BMenu(B_TRANSLATE("Tags")));
 		menu->AddSeparatorItem();
 
 		_AddPoseItem(menu, B_TRANSLATE("Compress"), kCompressSelection);
@@ -3800,6 +3823,9 @@ BContainerWindow::NewAttributesMenu(BMenu* menu)
 
 	menu->AddItem(NewAttributeMenuItem(B_TRANSLATE("Permissions"),
 		kAttrStatMode, B_STRING_TYPE, 80, B_ALIGN_LEFT, false, true));
+
+	menu->AddItem(NewAttributeMenuItem(B_TRANSLATE("Tags"), kAttrTags,
+		B_STRING_TYPE, 100, B_ALIGN_LEFT, false, false));
 
 	MarkAttributesMenu(menu);
 }

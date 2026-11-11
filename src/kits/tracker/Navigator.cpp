@@ -97,7 +97,7 @@ ViewModeIcon(uint32 mode)
 	rgb_color color = ui_color(B_CONTROL_TEXT_COLOR);
 	view->SetHighColor(color);
 	view->SetDrawingMode(B_OP_ALPHA);
-	view->SetBlendingMode(B_PIXEL_ALPHA, B_ALPHA_OVERLAY);
+	view->SetBlendingMode(B_PIXEL_ALPHA, B_ALPHA_COMPOSITE);
 
 	float size = rect.Width() + 1;
 	float unit = size / 20;

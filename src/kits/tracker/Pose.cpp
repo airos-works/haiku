@@ -35,6 +35,8 @@ All rights reserved.
 
 #include "Pose.h"
 
+#include <algorithm>
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -48,6 +50,7 @@ All rights reserved.
 #include "FSClipboard.h"
 #include "IconCache.h"
 #include "PoseView.h"
+#include "Tags.h"
 
 
 int32
@@ -84,7 +87,8 @@ BPose::BPose(Model* model, BPoseView* view, uint32 clipboardMode, bool selected)
 	fListModeInited(false),
 	fWasAutoPlaced(false),
 	fBrokenSymLink(false),
-	fBackgroundClean(false)
+	fBackgroundClean(false),
+	fTagsRead(false)
 {
 	CreateWidgets(view);
 
@@ -590,6 +594,9 @@ BPose::Draw(BRect rect, const BRect& updateRect, BPoseView* poseView, BView* dra
 					// draw text
 					DrawTextWidget(columnRect, widgetRect, widget, poseView, drawView, selected,
 						fClipboardMode, offset);
+
+					if (index == 0)
+						_DrawTagsAfterName(columnRect, widgetRect, poseView, drawView, offset);
 				}
 			}
 		}
@@ -600,6 +607,16 @@ BPose::Draw(BRect rect, const BRect& updateRect, BPoseView* poseView, BView* dra
 		iconOrigin += offset;
 
 		DrawIcon(iconOrigin, drawView, poseView->IconSize(), drawIconUnselected);
+
+		if (!Tags().IsEmpty()) {
+			// on the icon's lower right corner
+			float iconSize = poseView->IconSize().Width() + 1;
+			float dotSize = std::max(6.0f, floorf(iconSize / 3.5f));
+			float width = TagDotsWidth(fTags, dotSize);
+			drawView->SetLowColor(poseView->LowColor());
+			DrawTagDots(drawView, iconOrigin.x + iconSize - width,
+				iconOrigin.y + iconSize - dotSize / 2 - 1, fTags, dotSize);
+		}
 
 		BColumn* column = poseView->FirstColumn();
 		BTextWidget* widget = WidgetFor(column, poseView, modelOpener);
@@ -615,6 +632,42 @@ BPose::Draw(BRect rect, const BRect& updateRect, BPoseView* poseView, BView* dra
 
 	if (direct)
 		poseView->PopState();
+}
+
+
+const BStringList&
+BPose::Tags()
+{
+	if (!fTagsRead) {
+		fTagsRead = true;
+		fTags.MakeEmpty();
+		BNode node(fModel->EntryRef());
+		BString value;
+		if (node.InitCheck() == B_OK
+			&& node.ReadAttrString(kAttrTags, &value) == B_OK) {
+			ParseTags(value.String(), fTags);
+		}
+	}
+	return fTags;
+}
+
+
+void
+BPose::_DrawTagsAfterName(BRect columnRect, BRect textRect,
+	BPoseView* poseView, BView* drawView, BPoint offset)
+{
+	if (Tags().IsEmpty())
+		return;
+
+	// right after the name, or over its end when the column is full
+	float dotSize = floorf(textRect.Height() * 0.55f);
+	float width = TagDotsWidth(fTags, dotSize);
+	float spacing = floorf(dotSize * 0.6f);
+	float left = std::min(textRect.right + spacing,
+		columnRect.right - width - spacing);
+	drawView->SetLowColor(poseView->LowColor());
+	DrawTagDots(drawView, left + offset.x,
+		(textRect.top + textRect.bottom) / 2 + offset.y + 1, fTags, dotSize);
 }
 
 
