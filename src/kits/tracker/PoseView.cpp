@@ -274,6 +274,7 @@ BPoseView::BPoseView(Model* model, uint32 viewMode)
 	fSelectionVisible(true),
 	fSelectionRectEnabled(true),
 	fAlwaysAutoPlace(false),
+	fArrangePending(false),
 	fAllowPoseEditing(true),
 	fSelectionChangedHook(false),
 	fOkToMapIcons(false),
@@ -743,6 +744,32 @@ BPoseView::SaveState(AttributeStreamNode* node)
 
 
 void
+BPoseView::ArchiveViewForOtherFolders(BMallocIO* viewState,
+	BMallocIO* columns) const
+{
+	for (int32 index = 0; ; index++) {
+		const BColumn* column = ColumnAt(index);
+		if (column == NULL)
+			break;
+		column->ArchiveToStream(columns);
+	}
+
+	// archive a copy scrolled to the top (archiving marks the view state
+	// as saved, so save the window's own state first)
+	BMessage message;
+	fViewState->ArchiveToMessage(message);
+	BViewState* state = BViewState::InstantiateFromMessage(message);
+	if (state == NULL)
+		return;
+
+	state->SetListOrigin(BPoint(0, 0));
+	state->SetIconOrigin(BPoint(0, 0));
+	state->ArchiveToStream(viewState);
+	delete state;
+}
+
+
+void
 BPoseView::SaveState(BMessage& message) const
 {
 	SaveColumnState(message);
@@ -772,7 +799,7 @@ BPoseView::SavePoseLocations(BRect* frameIfDesktop)
 {
 	PoseInfo poseInfo;
 
-	if (!fSavePoseLocations)
+	if (!fSavePoseLocations || KeepArranged())
 		return;
 
 	ASSERT(Window()->IsLocked());
@@ -2063,6 +2090,13 @@ BPoseView::CreatePoses(Model** models, PoseInfo* poseInfoArray, int32 count,
 
 			case kIconMode:
 			case kMiniIconMode:
+				if (KeepArranged()) {
+					// placed at the end for now, the arrangement that
+					// follows gives it its place in the order
+					poseInfo->fInitedDirectory = -1LL;
+					ScheduleArrange();
+				}
+
 				if (poseInfo->fInitedDirectory == -1LL || fAlwaysAutoPlace) {
 					if (pose->HasLocation())
 						RemoveFromVSList(pose);
@@ -2673,6 +2707,16 @@ BPoseView::MessageReceived(BMessage* message)
 		case kArrangeReverseOrder:
 			SetReverseSort(!fViewState->ReverseSort());
 			Cleanup(true);
+			break;
+
+		case kKeepArranged:
+			SetKeepArranged(!fViewState->KeepArranged());
+			break;
+
+		case kArrangePoses:
+			fArrangePending = false;
+			if (KeepArranged())
+				ArrangePoses();
 			break;
 
 		case kAttributeItem:
@@ -3286,6 +3330,9 @@ BPoseView::SetViewMode(uint32 newMode)
 	SetScrollBarsTo(newOrigin);
 	EnableScrollBars();
 	ContainerWindow()->ViewModeChanged(oldMode, newMode);
+
+	if (KeepArranged())
+		ArrangePoses();
 }
 
 
@@ -3672,6 +3719,76 @@ BPoseView::Cleanup(bool doAll)
 			}
 		}
 	}
+}
+
+
+bool
+BPoseView::KeepArranged() const
+{
+	return ViewMode() != kListMode && !IsDesktopView()
+		&& fViewState->KeepArranged();
+}
+
+
+void
+BPoseView::SetKeepArranged(bool keepArranged)
+{
+	fViewState->SetKeepArranged(keepArranged);
+	if (KeepArranged())
+		ArrangePoses();
+}
+
+
+void
+BPoseView::ScheduleArrange()
+{
+	// arrange once after a burst of changes
+	if (fArrangePending || Window() == NULL)
+		return;
+
+	fArrangePending = true;
+	BMessage message(kArrangePoses);
+	Window()->PostMessage(&message, this);
+}
+
+
+void
+BPoseView::ArrangePoses()
+{
+	// Lay the icons out in sort order from the top left corner, like
+	// Cleanup(true), but keep where the view is scrolled to and what is
+	// selected.
+	if (ViewMode() == kListMode)
+		return;
+
+	SortPoses();
+
+	BRect viewBounds(Bounds());
+	viewBounds.OffsetTo(0, 0);
+	fHintLocation = PinToGrid(fOffset, fGrid, fOffset);
+
+	fVSPoseList->MakeEmpty();
+	int32 poseCount = fPoseList->CountItems();
+	for (int32 index = 0; index < poseCount; index++) {
+		BPose* pose = fPoseList->ItemAt(index);
+		PlacePose(pose, viewBounds);
+		pose->SetAutoPlaced(false);
+		AddToVSList(pose);
+	}
+
+	ClearExtent();
+	RecalcExtent();
+	ResetPosePlacementHint();
+
+	BPoint origin(LeftTop());
+	PinPointToValidRange(origin);
+	UpdateScrollRange();
+	if (origin != LeftTop()) {
+		ScrollTo(origin);
+		SetScrollBarsTo(origin);
+	}
+
+	Invalidate();
 }
 
 
@@ -5258,8 +5375,8 @@ BPoseView::MoveSelectionInto(Model* destFolder, BContainerWindow* srcWindow,
 			return;
 		}
 
-		if (sourceView->ViewMode() == kListMode) {
-			// can't move in list view
+		if (sourceView->ViewMode() == kListMode || sourceView->KeepArranged()) {
+			// can't move in list view, or where items stay arranged
 			return;
 		}
 
@@ -8366,6 +8483,9 @@ BPoseView::DeletePose(const node_ref* itemNode, BPose* pose, int32 index)
 			UpdateScrollRange();
 			ResetPosePlacementHint();
 
+			if (KeepArranged())
+				ScheduleArrange();
+
 			if (ViewMode() == kListMode) {
 				BRect bounds(Bounds());
 				int32 index = (int32)(bounds.bottom / fListElemHeight);
@@ -9745,8 +9865,11 @@ BPoseView::CheckPoseSortOrder(BPose* pose, int32 oldIndex)
 void
 BPoseView::_CheckPoseSortOrder(PoseList* poseList, BPose* pose, int32 oldIndex)
 {
-	if (ViewMode() != kListMode)
+	if (ViewMode() != kListMode) {
+		if (KeepArranged())
+			ScheduleArrange();
 		return;
+	}
 
 	Window()->UpdateIfNeeded();
 
@@ -9820,16 +9943,23 @@ PoseCompareAddWidget(const BPose* p1, const BPose* p2, BPoseView* view)
 		// We either have a non-equal result, or are on the second iteration
 		// for secondary sort. Either way, return.
 		if (result != 0 || count != 0)
-			return result;
+			break;
 
 		// Non-equal result, sort by secondary attribute
 		sort = view->SecondarySort();
 		if (!sort)
-			return result;
+			break;
 
 		column = view->ColumnFor(sort);
 		if (column == NULL)
-			return result;
+			break;
+	}
+
+	if (result == 0) {
+		// items that sort the same come in name order, the same way every
+		// time the folder is opened
+		result = NaturalCompare(p1->TargetModel()->Name(),
+			p2->TargetModel()->Name());
 	}
 
 	return result;

@@ -56,6 +56,7 @@ namespace BPrivate {
 #define kAttrWindowFrame					"_trk/windframe"
 #define kAttrWindowWorkspace				"_trk/windwkspc"
 #define kAttrWindowDecor					"_trk/winddecor"
+#define kAttrUserDefaultView				"_trk/user_default_view"
 
 #define kAttrQueryString					"_trk/qrystr"
 #define kAttrQueryVolume					"_trk/qryvol1"

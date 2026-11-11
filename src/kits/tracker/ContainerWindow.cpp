@@ -49,6 +49,7 @@ All rights reserved.
 #include <Keymap.h>
 #include <Locale.h>
 #include <MenuBar.h>
+#include <MessageRunner.h>
 #include <MenuItem.h>
 #include <NodeMonitor.h>
 #include <Path.h>
@@ -63,6 +64,7 @@ All rights reserved.
 #include <fs_attr.h>
 #include <image.h>
 #include <strings.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 
 #include "Attributes.h"
@@ -75,6 +77,7 @@ All rights reserved.
 #include "DeskWindow.h"
 #include "DraggableContainerIcon.h"
 #include "FSClipboard.h"
+#include "FolderStateStore.h"
 #include "FSUndoRedo.h"
 #include "FSUtils.h"
 #include "FavoritesMenu.h"
@@ -423,7 +426,8 @@ BContainerWindow::BContainerWindow(LockingList<BWindow>* list, uint32 openFlags,
 	fBackgroundImage(NULL),
 	fSavedZoomRect(0, 0, -1, -1),
 	fSaveStateIsEnabled(true),
-	fIsWatchingPath(false)
+	fIsWatchingPath(false),
+	fStateSaveRunner(NULL)
 {
 	InitIconPreloader();
 
@@ -487,6 +491,7 @@ BContainerWindow::~BContainerWindow()
 		tracker->Unlock();
 	}
 
+	delete fStateSaveRunner;
 	delete fTaskLoop;
 	delete fBackgroundImage;
 	delete fShortcuts;
@@ -1005,6 +1010,174 @@ BContainerWindow::SwitchDirectory(const entry_ref* ref)
 
 
 void
+BContainerWindow::DispatchMessage(BMessage* message, BHandler* handler)
+{
+	_inherited::DispatchMessage(message, handler);
+
+	// save a changed view a moment after the change instead of only when
+	// the window closes, so a crash or power loss does not lose it
+	_ScheduleStateSave();
+}
+
+
+void
+BContainerWindow::_ScheduleStateSave()
+{
+	if (fStateSaveRunner != NULL || !SaveStateIsEnabled()
+		|| PoseView() == NULL || PoseView()->IsDesktopView()
+		|| !StateNeedsSaving()) {
+		return;
+	}
+
+	BMessage message(kSaveStateIfNeeded);
+	fStateSaveRunner = new BMessageRunner(BMessenger(this), &message,
+		2000000, 1);
+	if (fStateSaveRunner->InitCheck() != B_OK) {
+		delete fStateSaveRunner;
+		fStateSaveRunner = NULL;
+	}
+}
+
+
+bool
+BContainerWindow::_CanShareView() const
+{
+	Model* model = TargetModel();
+	return model != NULL && model->IsDirectory() && !model->IsRoot()
+		&& !model->IsTrash() && !model->IsVirtualDirectory()
+		&& !model->IsDesktop() && PoseView() != NULL
+		&& !PoseView()->IsDesktopView() && !PoseView()->IsFilePanel();
+}
+
+
+void
+BContainerWindow::_UseViewForNewFolders()
+{
+	if (!_CanShareView())
+		return;
+
+	SaveState(false);
+
+	BNode templateNode;
+	if (!DefaultStateSourceNode(kDefaultFolderTemplate, &templateNode, true))
+		return;
+
+	AttributeStreamFileNode streamNode(&templateNode);
+	SaveWindowState(&streamNode);
+
+	BMallocIO viewState;
+	BMallocIO columns;
+	PoseView()->ArchiveViewForOtherFolders(&viewState, &columns);
+	templateNode.RemoveAttr(kAttrViewStateForeign);
+	templateNode.RemoveAttr(kAttrColumnsForeign);
+	templateNode.WriteAttr(kAttrViewState, B_RAW_TYPE, 0, viewState.Buffer(),
+		viewState.BufferLength());
+	templateNode.WriteAttr(kAttrColumns, B_RAW_TYPE, 0, columns.Buffer(),
+		columns.BufferLength());
+
+	int8 isSet = 1;
+	templateNode.WriteAttr(kAttrUserDefaultView, B_INT8_TYPE, 0, &isSet,
+		sizeof(isSet));
+}
+
+
+struct ApplyViewParams {
+	entry_ref	root;
+	BMallocIO	viewState;
+	BMallocIO	columns;
+	BRect		frame;
+};
+
+
+static status_t
+ApplyViewToSubfoldersThread(void* data)
+{
+	ApplyViewParams* params = (ApplyViewParams*)data;
+
+	const int32 kMaxFolders = 20000;
+	int32 count = 0;
+
+	BEntry rootEntry(&params->root);
+	struct stat rootStat;
+	if (rootEntry.GetStat(&rootStat) != B_OK) {
+		delete params;
+		return B_ERROR;
+	}
+
+	// depth first walk over the folders on the same volume, not following
+	// links
+	BObjectList<BDirectory, true> stack(16);
+	stack.AddItem(new BDirectory(&params->root));
+	while (!stack.IsEmpty() && count < kMaxFolders) {
+		BDirectory* dir = stack.RemoveItemAt(stack.CountItems() - 1);
+		BEntry entry;
+		while (dir->GetNextEntry(&entry, false) == B_OK && count < kMaxFolders) {
+			struct stat st;
+			if (entry.GetStat(&st) != B_OK || !S_ISDIR(st.st_mode)
+				|| st.st_dev != rootStat.st_dev) {
+				continue;
+			}
+
+			entry_ref ref;
+			if (entry.GetRef(&ref) != B_OK)
+				continue;
+
+			WriteFolderViewState(&ref, st.st_dev, params->viewState.Buffer(),
+				params->viewState.BufferLength(), params->columns.Buffer(),
+				params->columns.BufferLength(), &params->frame);
+			count++;
+
+			BDirectory* subDir = new BDirectory(&entry);
+			if (subDir->InitCheck() == B_OK)
+				stack.AddItem(subDir);
+			else
+				delete subDir;
+		}
+		delete dir;
+	}
+
+	delete params;
+	return B_OK;
+}
+
+
+void
+BContainerWindow::_ApplyViewToSubfolders()
+{
+	if (!_CanShareView())
+		return;
+
+	BString text(B_TRANSLATE("Use this view (view mode, sorting and columns) "
+		"in all the folders inside \"%folder%\"?\n\nFolders that have their "
+		"own view now lose it."));
+	text.ReplaceFirst("%folder%", TargetModel()->Name());
+	BAlert* alert = new BAlert(B_TRANSLATE("Apply view"), text.String(),
+		B_TRANSLATE("Cancel"), B_TRANSLATE("Apply"), NULL, B_WIDTH_AS_USUAL,
+		B_WARNING_ALERT);
+	alert->SetShortcut(0, B_ESCAPE);
+	if (alert->Go() != 1)
+		return;
+
+	SaveState(false);
+
+	ApplyViewParams* params = new ApplyViewParams;
+	params->root = *TargetModel()->EntryRef();
+	PoseView()->ArchiveViewForOtherFolders(&params->viewState,
+		&params->columns);
+
+	BRect frame(Frame());
+	const float scalingFactor = be_plain_font->Size() / 12.0f;
+	params->frame.Set(frame.left / scalingFactor, frame.top / scalingFactor,
+		frame.right / scalingFactor, frame.bottom / scalingFactor);
+
+	thread_id thread = spawn_thread(ApplyViewToSubfoldersThread,
+		"apply view to subfolders", B_LOW_PRIORITY, params);
+	if (thread < 0 || resume_thread(thread) != B_OK)
+		delete params;
+}
+
+
+void
 BContainerWindow::UpdateTitle()
 {
 	// set title to full path, if necessary
@@ -1082,6 +1255,12 @@ BContainerWindow::FrameResized(float, float)
 
 		PoseView()->UpdateScrollRange();
 		PoseView()->ResetPosePlacementHint();
+	}
+
+	if (PoseView() != NULL && PoseView()->KeepArranged()
+		&& Bounds().Width() != fPreviousBounds.Width()) {
+		// the rows are as wide as the window
+		PoseView()->ScheduleArrange();
 	}
 
 	fPreviousBounds = Bounds();
@@ -1511,6 +1690,21 @@ BContainerWindow::MessageReceived(BMessage* message)
 			ResizeToFit();
 			break;
 
+		case kSaveStateIfNeeded:
+			delete fStateSaveRunner;
+			fStateSaveRunner = NULL;
+			if (StateNeedsSaving())
+				SaveState(false);
+			break;
+
+		case kUseViewForNewFolders:
+			_UseViewForNewFolders();
+			break;
+
+		case kApplyViewToSubfolders:
+			_ApplyViewToSubfolders();
+			break;
+
 		case kLoadAddOn:
 			LoadAddOn(message);
 			break;
@@ -1878,6 +2072,15 @@ BContainerWindow::AddWindowMenu(BMenu* menu)
 	item->SetTarget(PoseView());
 	menu->AddItem(item);
 	menu->AddSeparatorItem();
+
+	if (_CanShareView()) {
+		menu->AddItem(new BMenuItem(B_TRANSLATE("Use this view for new folders"),
+			new BMessage(kUseViewForNewFolders)));
+		menu->AddItem(new BMenuItem(
+			B_TRANSLATE("Apply this view to subfolders" B_UTF8_ELLIPSIS),
+			new BMessage(kApplyViewToSubfolders)));
+		menu->AddSeparatorItem();
+	}
 
 	menu->AddItem(Shortcuts()->ResizeToFitItem());
 	// "Arrange by >" menu inserted here,
@@ -3584,6 +3787,8 @@ BContainerWindow::NewArrangeByMenu()
 	menu->AddSeparatorItem();
 
 	menu->AddItem(Shortcuts()->ReverseOrderItem());
+	menu->AddItem(new BMenuItem(B_TRANSLATE("Keep arranged"),
+		new BMessage(kKeepArranged)));
 	menu->AddSeparatorItem();
 
 	menu->AddItem(Shortcuts()->CleanupItem());
@@ -3629,6 +3834,8 @@ BContainerWindow::SetupArrangeByMenu(BMenu* parent)
 			item->SetMarked(PoseView()->PrimarySort() == attrHash);
 		else if (item->Message()->what == kArrangeReverseOrder)
 			item->SetMarked(PoseView()->ReverseSort());
+		else if (item->Message()->what == kKeepArranged)
+			item->SetMarked(PoseView()->KeepArranged());
 	}
 
 	Shortcuts()->UpdateArrangeByItem(fArrangeByItem);
@@ -3839,11 +4046,6 @@ BContainerWindow::DefaultStateSourceNode(const char* name, BNode* result,
 void
 BContainerWindow::SetupDefaultState()
 {
-	BNode defaultingNode;
-		// this is where we'll ulitimately get the state from
-	bool gotDefaultingNode = 0;
-	bool shouldStagger = false;
-
 	ASSERT(TargetModel() != NULL);
 
 	PRINT(("folder %s does not have any saved state\n", TargetModel()->Name()));
@@ -3853,6 +4055,22 @@ BContainerWindow::SetupDefaultState()
 	if (opener.StreamNode() == NULL)
 		return;
 
+	if (PoseView()->IsDesktopView()) {
+		// don't copy over the attributes if we are the Desktop
+		return;
+	}
+
+	// The view a user chose with "Use this view for new folders" wins over
+	// the parent's; the parent still gives the window its place.
+	BNode templateNode;
+	attr_info info;
+	bool hasUserDefault = DefaultStateSourceNode(kDefaultFolderTemplate,
+			&templateNode)
+		&& NodeHasSavedState(&templateNode)
+		&& templateNode.GetAttrInfo(kAttrUserDefaultView, &info) == B_OK;
+
+	BNode parentNode;
+	bool hasParentState = false;
 	if (!TargetModel()->IsRoot()) {
 		BDirectory deskDir;
 		FSGetDeskDir(&deskDir);
@@ -3860,41 +4078,48 @@ BContainerWindow::SetupDefaultState()
 		// try copying state from our parent directory, unless it is the
 		// desktop folder
 		BEntry entry(TargetModel()->EntryRef());
-		BNode parent;
-		if (FSGetParentVirtualDirectoryAware(entry, parent) == B_OK
-			&& parent != deskDir) {
-			PRINT(("looking at parent for state\n"));
-			if (NodeHasSavedState(&parent)) {
-				PRINT(("got state from parent\n"));
-				defaultingNode = parent;
-				gotDefaultingNode = true;
-				// when getting state from parent, stagger the window
-				shouldStagger = true;
-			}
+		BEntry parentEntry;
+		if (FSGetParentVirtualDirectoryAware(entry, parentEntry) == B_OK
+			&& BNode(&parentEntry) != deskDir
+			&& GetFolderStateNode(parentEntry, &parentNode) == B_OK
+			&& NodeHasSavedState(&parentNode)) {
+			PRINT(("got state from parent\n"));
+			hasParentState = true;
 		}
 	}
 
-	if (!gotDefaultingNode
+	BNode* frameSource;
+	BNode* viewSource;
+	if (hasUserDefault) {
+		frameSource = hasParentState ? &parentNode : &templateNode;
+		viewSource = &templateNode;
+	} else if (hasParentState) {
+		frameSource = viewSource = &parentNode;
+	} else {
 		// parent didn't have any state, use the template directory from
 		// tracker settings folder for what our state should be
-		// For simplicity we are not picking up the most recent
-		// changes that didn't get committed if home is still open in
-		// a window, that's probably not a problem; would be OK if state
-		// got committed after every change
-		&& !DefaultStateSourceNode(kDefaultFolderTemplate, &defaultingNode,
-			true)) {
-		return;
+		if (!DefaultStateSourceNode(kDefaultFolderTemplate, &templateNode,
+				true)) {
+			return;
+		}
+		frameSource = viewSource = &templateNode;
 	}
 
-	if (PoseView()->IsDesktopView()) {
-		// don't copy over the attributes if we are the Desktop
-		return;
-	}
-
-	// copy over the attributes
-
-	// set up a filter of the attributes we want copied
-	const char* allowAttrs[] = {
+	// copy over attributes that apply; transform them properly, stripping
+	// parts that do not apply, adding a window stagger, etc.
+	const char* frameAttrs[] = {
+		kAttrWindowFrame,
+		kAttrWindowWorkspace,
+		0
+	};
+	const char* viewAttrs[] = {
+		kAttrViewState,
+		kAttrViewStateForeign,
+		kAttrColumns,
+		kAttrColumnsForeign,
+		0
+	};
+	const char* allAttrs[] = {
 		kAttrWindowFrame,
 		kAttrWindowWorkspace,
 		kAttrViewState,
@@ -3904,23 +4129,45 @@ BContainerWindow::SetupDefaultState()
 		0
 	};
 
-	// copy over attributes that apply; transform them properly, stripping
-	// parts that do not apply, adding a window stagger, etc.
-
 	StaggerOneParams params;
-	params.rectFromParent = shouldStagger;
-	SelectiveAttributeTransformer frameOffsetter(kAttrWindowFrame,
-		OffsetFrameOne, &params);
-	SelectiveAttributeTransformer scrollOriginCleaner(kAttrViewState,
-		ClearViewOriginOne, &params);
+	params.rectFromParent = frameSource == &parentNode;
+		// when getting state from parent, stagger the window
 
-	// do it
-	AttributeStreamMemoryNode memoryNode;
-	NamesToAcceptAttrFilter filter(allowAttrs);
-	AttributeStreamFileNode fileNode(&defaultingNode);
+	if (frameSource == viewSource) {
+		SelectiveAttributeTransformer frameOffsetter(kAttrWindowFrame,
+			OffsetFrameOne, &params);
+		SelectiveAttributeTransformer scrollOriginCleaner(kAttrViewState,
+			ClearViewOriginOne, &params);
+		AttributeStreamMemoryNode memoryNode;
+		NamesToAcceptAttrFilter filter(allAttrs);
+		AttributeStreamFileNode fileNode(frameSource);
 
-	*opener.StreamNode() << scrollOriginCleaner << frameOffsetter
-		<< memoryNode << filter << fileNode;
+		*opener.StreamNode() << scrollOriginCleaner << frameOffsetter
+			<< memoryNode << filter << fileNode;
+		return;
+	}
+
+	{
+		SelectiveAttributeTransformer frameOffsetter(kAttrWindowFrame,
+			OffsetFrameOne, &params);
+		AttributeStreamMemoryNode memoryNode;
+		NamesToAcceptAttrFilter filter(frameAttrs);
+		AttributeStreamFileNode fileNode(frameSource);
+
+		*opener.StreamNode() << frameOffsetter << memoryNode << filter
+			<< fileNode;
+	}
+	{
+		AttributeStreamFileNode destination(opener.Node());
+		SelectiveAttributeTransformer scrollOriginCleaner(kAttrViewState,
+			ClearViewOriginOne, &params);
+		AttributeStreamMemoryNode memoryNode;
+		NamesToAcceptAttrFilter filter(viewAttrs);
+		AttributeStreamFileNode fileNode(viewSource);
+
+		destination << scrollOriginCleaner << memoryNode << filter
+			<< fileNode;
+	}
 }
 
 
@@ -4277,8 +4524,13 @@ WindowStateNodeOpener::WindowStateNodeOpener(BContainerWindow* window,
 			fStreamNode = new AttributeStreamFileNode(fNode);
 		}
 	} else if (window->TargetModel() != NULL) {
-		fModelOpener = new ModelNodeLazyOpener(window->TargetModel(),
-			forWriting, false);
+		Model* model = window->TargetModel();
+		if (_SetToStore(model->EntryRef(), model->NodeRef()->device,
+				forWriting)) {
+			return;
+		}
+
+		fModelOpener = new ModelNodeLazyOpener(model, forWriting, false);
 		if (fModelOpener->IsOpen(forWriting)) {
 			fStreamNode = new AttributeStreamFileNode(
 				fModelOpener->TargetModel()->Node());
@@ -4315,6 +4567,16 @@ WindowStateNodeOpener::SetTo(const BEntry* entry, bool forWriting)
 	delete fStreamNode;
 
 	fModelOpener = NULL;
+	fNode = NULL;
+	fStreamNode = NULL;
+
+	entry_ref ref;
+	struct stat st;
+	if (entry->GetRef(&ref) == B_OK && entry->GetStat(&st) == B_OK
+		&& _SetToStore(&ref, st.st_dev, forWriting)) {
+		return;
+	}
+
 	fNode = new BFile(entry, (uint32)(forWriting ? O_RDWR : O_RDONLY));
 	fStreamNode = new AttributeStreamFileNode(fNode);
 }
@@ -4329,11 +4591,39 @@ WindowStateNodeOpener::SetTo(Model* model, bool forWriting)
 
 	fNode = NULL;
 	fStreamNode = NULL;
+	fModelOpener = NULL;
+	if (!model->IsRoot() && _SetToStore(model->EntryRef(),
+			model->NodeRef()->device, forWriting)) {
+		return;
+	}
+
 	fModelOpener = new ModelNodeLazyOpener(model, forWriting, false);
 	if (fModelOpener->IsOpen(forWriting)) {
 		fStreamNode = new AttributeStreamFileNode(
 			fModelOpener->TargetModel()->Node());
 	}
+}
+
+
+bool
+WindowStateNodeOpener::_SetToStore(const entry_ref* ref, dev_t device,
+	bool forWriting)
+{
+	// Folders whose own attributes cannot be written keep their state in
+	// the per-user store. When reading, a folder that has nothing stored yet
+	// still offers whatever state its own attributes carry.
+	if (!FolderStateUsesStore(device))
+		return false;
+
+	BNode* node = new BNode;
+	if (OpenFolderStateStoreNode(ref, forWriting, node) != B_OK) {
+		delete node;
+		return false;
+	}
+
+	fNode = node;
+	fStreamNode = new AttributeStreamFileNode(fNode);
+	return true;
 }
 
 

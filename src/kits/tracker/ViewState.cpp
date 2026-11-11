@@ -72,6 +72,8 @@ const char* kViewStateSecondarySortTypeName = "ViewState:fSecondarySortType";
 const char* kViewStateReverseSortName = "ViewState:fReverseSort";
 const char* kViewStateIconSizeName = "ViewState:fIconSize";
 const char* kViewStateLastIconSizeName = "ViewState:fLastIconSize";
+const char* kViewStateKeepArrangedName = "ViewState:fKeepArranged";
+const char* kViewStateGroupByName = "ViewState:fGroupBy";
 
 
 static const int32 kColumnStateMinArchiveVersion = 21;
@@ -346,6 +348,13 @@ BViewState::BViewState(BMallocIO* stream, bool endianSwap)
 	stream->Read(&fIconSize, sizeof(uint32));
 	stream->Read(&fLastIconSize, sizeof(uint32));
 
+	// added later at the end, where older Trackers do not look: a state
+	// saved without them keeps where its icons were put
+	if (stream->Read(&fKeepArranged, sizeof(bool)) != sizeof(bool))
+		fKeepArranged = false;
+	if (stream->Read(&fGroupBy, sizeof(uint32)) != sizeof(uint32))
+		fGroupBy = 0;
+
 	if (endianSwap) {
 		PRINT(("endian swapping view state\n"));
 		fViewMode = B_SWAP_INT32(fViewMode);
@@ -360,6 +369,7 @@ BViewState::BViewState(BMallocIO* stream, bool endianSwap)
 		fSecondarySortAttr = B_SWAP_INT32(fSecondarySortAttr);
 		fPrimarySortType = B_SWAP_INT32(fPrimarySortType);
 		fSecondarySortType = B_SWAP_INT32(fSecondarySortType);
+		fGroupBy = B_SWAP_INT32(fGroupBy);
 	}
 
 	_StorePreviousState();
@@ -385,6 +395,10 @@ BViewState::BViewState(const BMessage &message)
 	message.FindInt32(kViewStateSecondarySortTypeName,
 		(int32*)&fSecondarySortType);
 	message.FindBool(kViewStateReverseSortName, &fReverseSort);
+	if (message.FindBool(kViewStateKeepArrangedName, &fKeepArranged) != B_OK)
+		fKeepArranged = false;
+	if (message.FindInt32(kViewStateGroupByName, (int32*)&fGroupBy) != B_OK)
+		fGroupBy = 0;
 
 	_StorePreviousState();
 	_Sanitize(this, true);
@@ -456,6 +470,8 @@ BViewState::_Init()
 	fSecondarySortAttr = 0;
 	fSecondarySortType = 0;
 	fReverseSort = false;
+	fKeepArranged = true;
+	fGroupBy = 0;
 }
 
 
@@ -473,6 +489,8 @@ BViewState::_StorePreviousState()
 	fPreviousPrimarySortType = fPrimarySortType;
 	fPreviousSecondarySortType = fSecondarySortType;
 	fPreviousReverseSort = fReverseSort;
+	fPreviousKeepArranged = fKeepArranged;
+	fPreviousGroupBy = fGroupBy;
 }
 
 
@@ -550,6 +568,8 @@ BViewState::_ArchiveToStream(BMallocIO* stream) const
 	stream->Write(&fReverseSort, sizeof(bool));
 	stream->Write(&fIconSize, sizeof(uint32));
 	stream->Write(&fLastIconSize, sizeof(uint32));
+	stream->Write(&fKeepArranged, sizeof(bool));
+	stream->Write(&fGroupBy, sizeof(uint32));
 }
 
 
@@ -575,4 +595,6 @@ BViewState::_ArchiveToMessage(BMessage &message) const
 	message.AddInt32(kViewStateIconSizeName, static_cast<int32>(fIconSize));
 	message.AddInt32(kViewStateLastIconSizeName,
 		static_cast<int32>(fLastIconSize));
+	message.AddBool(kViewStateKeepArrangedName, fKeepArranged);
+	message.AddInt32(kViewStateGroupByName, static_cast<int32>(fGroupBy));
 }

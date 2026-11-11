@@ -124,6 +124,8 @@ public:
 	uint32 PrimarySortType() const;
 	uint32 SecondarySortType() const;
 	bool ReverseSort() const;
+	bool KeepArranged() const;
+	uint32 GroupBy() const;
 
 	void SetViewMode(uint32);
 	void SetLastIconMode(uint32);
@@ -136,6 +138,8 @@ public:
 	void SetPrimarySortType(uint32);
 	void SetSecondarySortType(uint32);
 	void SetReverseSort(bool);
+	void SetKeepArranged(bool);
+	void SetGroupBy(uint32 attrHash);
 
 	bool StateNeedsSaving();
 
@@ -156,6 +160,10 @@ private:
 	uint32 fPrimarySortType;
 	uint32 fSecondarySortType;
 	bool fReverseSort;
+	bool fKeepArranged;
+		// icon views stay sorted, new items do not go where there is room
+	uint32 fGroupBy;
+		// hash of the attribute items are grouped by, 0 for none
 
 	void _Init();
 	void _StorePreviousState();
@@ -171,6 +179,8 @@ private:
 	uint32 fPreviousPrimarySortType;
 	uint32 fPreviousSecondarySortType;
 	bool fPreviousReverseSort;
+	bool fPreviousKeepArranged;
+	uint32 fPreviousGroupBy;
 };
 
 
@@ -409,6 +419,34 @@ BViewState::SetReverseSort(bool on)
 
 
 inline bool
+BViewState::KeepArranged() const
+{
+	return fKeepArranged;
+}
+
+
+inline void
+BViewState::SetKeepArranged(bool on)
+{
+	fKeepArranged = on;
+}
+
+
+inline uint32
+BViewState::GroupBy() const
+{
+	return fGroupBy;
+}
+
+
+inline void
+BViewState::SetGroupBy(uint32 attrHash)
+{
+	fGroupBy = attrHash;
+}
+
+
+inline bool
 BViewState::StateNeedsSaving()
 {
 	return (fPreviousViewMode != fViewMode)
@@ -421,7 +459,9 @@ BViewState::StateNeedsSaving()
 		|| (fPreviousSecondarySortAttr != fSecondarySortAttr)
 		|| (fPreviousPrimarySortType != fPrimarySortType)
 		|| (fPreviousSecondarySortType != fSecondarySortType)
-		|| (fPreviousReverseSort != fReverseSort);
+		|| (fPreviousReverseSort != fReverseSort)
+		|| (fPreviousKeepArranged != fKeepArranged)
+		|| (fPreviousGroupBy != fGroupBy);
 }
 
 } // namespace BPrivate

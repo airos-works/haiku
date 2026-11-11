@@ -95,8 +95,13 @@ const uint32 kCleanupAll = 'Tcla';
 
 const uint32 kArrangeBy = 'ARBY';
 const uint32 kArrangeReverseOrder = 'ARRO';
+const uint32 kKeepArranged = 'ARKA';
+const uint32 kArrangePoses = 'ARPS';
 
 const uint32 kResizeToFit = 'Trtf';
+const uint32 kUseViewForNewFolders = 'Tuvn';
+const uint32 kApplyViewToSubfolders = 'Tavs';
+const uint32 kSaveStateIfNeeded = 'Tssn';
 const uint32 kSelectMatchingEntries = 'Tsme';
 const uint32 kShowSelectionWindow = 'Tssw';
 const uint32 kShowSettingsWindow = 'Tstw';

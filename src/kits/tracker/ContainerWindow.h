@@ -50,6 +50,7 @@ class BGroupLayout;
 class BGroupView;
 class BPopUpMenu;
 class BMenuBar;
+class BMessageRunner;
 
 namespace BPrivate {
 
@@ -125,6 +126,7 @@ public:
 	virtual void MenusBeginning();
 	virtual void MenusEnded();
 	virtual void MessageReceived(BMessage*);
+	virtual void DispatchMessage(BMessage* message, BHandler* handler);
 	virtual void WindowActivated(bool active);
 	virtual void FrameResized(float, float);
 	virtual void FrameMoved(BPoint);
@@ -356,6 +358,7 @@ private:
 
 	bool fSaveStateIsEnabled;
 	bool fIsWatchingPath;
+	BMessageRunner* fStateSaveRunner;
 
 	typedef BWindow _inherited;
 
@@ -363,6 +366,10 @@ private:
 	friend class BackgroundView;
 
 	void _UpdateSelectionMIMEInfo();
+	void _ScheduleStateSave();
+	bool _CanShareView() const;
+	void _UseViewForNewFolders();
+	void _ApplyViewToSubfolders();
 	void _AddFolderIcon();
 	void _PassMessageToAddOn(BMessage*);
 	void _NewTemplateSubmenu(entry_ref);
@@ -388,6 +395,8 @@ public:
 	BNode* Node() const;
 
 private:
+	bool _SetToStore(const entry_ref* ref, dev_t device, bool forWriting);
+
 	ModelNodeLazyOpener* fModelOpener;
 	BNode* fNode;
 	AttributeStreamNode* fStreamNode;

@@ -128,6 +128,11 @@ public:
 	virtual void RestoreColumnState(const BMessage&);
 	virtual void SaveColumnState(BMessage&) const;
 
+	// the view state (scrolled to the top) and columns as attribute data,
+	// to give other folders this view
+	void ArchiveViewForOtherFolders(BMallocIO* viewState,
+		BMallocIO* columns) const;
+
 	bool StateNeedsSaving();
 
 	// switch between mini icon mode, icon mode and list mode
@@ -167,6 +172,12 @@ public:
 	void SetDropEnabled(bool);
 	void SetSelectionRectEnabled(bool);
 	void SetAlwaysAutoPlace(bool);
+
+	// icon views that keep their items in sort order
+	bool KeepArranged() const;
+	void SetKeepArranged(bool keepArranged);
+	void ScheduleArrange();
+	void ArrangePoses();
 	void SetSelectionChangedHook(bool);
 	void SetEnsurePosesVisible(bool);
 	void SetIconMapping(bool);
@@ -840,6 +851,7 @@ private:
 	bool fSelectionVisible : 1;
 	bool fSelectionRectEnabled : 1;
 	bool fAlwaysAutoPlace : 1;
+	bool fArrangePending : 1;
 	bool fAllowPoseEditing : 1;
 	bool fSelectionChangedHook : 1;
 		// get rid of this
