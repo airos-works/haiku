@@ -323,6 +323,7 @@ void	iwx_init_channel_map(struct iwx_softc *, uint16_t *, uint32_t *, int);
 void	iwx_setup_ht_rates(struct iwx_softc *);
 void	iwx_setup_vht_rates(struct iwx_softc *);
 void	iwx_setup_he_rates(struct iwx_softc *);
+void	iwx_haiku_read_settings(struct iwx_softc *);
 int	iwx_mimo_enabled(struct iwx_softc *);
 void	iwx_mac_ctxt_task(void *);
 void	iwx_phy_ctxt_task(void *);
@@ -387,7 +388,11 @@ void	iwx_clear_oactive(struct iwx_softc *, struct iwx_tx_ring *);
 void	iwx_rx_bmiss(struct iwx_softc *, struct iwx_rx_packet *,
 	    struct iwx_rx_data *);
 int	iwx_binding_cmd(struct iwx_softc *, struct iwx_node *, uint32_t);
-uint8_t	iwx_get_vht_ctrl_pos(struct ieee80211com *, struct ieee80211_channel *);
+uint8_t	iwx_get_vht_ctrl_pos(struct ieee80211com *, struct ieee80211_channel *,
+	    uint8_t);
+void	iwx_vht_centers(struct ieee80211_node *, int *, int *);
+void	iwx_chan_width(struct iwx_softc *, struct ieee80211_node *, uint8_t *,
+	    uint8_t *);
 int	iwx_phy_ctxt_cmd_uhb_v3_v4(struct iwx_softc *, struct iwx_phy_ctxt *,
 	    uint8_t, uint8_t, uint32_t, uint8_t, uint8_t, int);
 int	iwx_phy_ctxt_cmd_v3_v4(struct iwx_softc *, struct iwx_phy_ctxt *,
@@ -424,6 +429,7 @@ int	iwx_enable_beacon_filter(struct iwx_softc *, struct iwx_node *);
 int	iwx_disable_beacon_filter(struct iwx_softc *);
 int	iwx_add_sta_cmd(struct iwx_softc *, struct iwx_node *, int);
 int	iwx_mld_add_sta_cmd(struct iwx_softc *, struct iwx_node *, int);
+int	iwx_mld_link_he_params(struct iwx_softc *, struct iwx_node *);
 int	iwx_rm_sta_cmd(struct iwx_softc *, struct iwx_node *);
 int	iwx_mld_rm_sta_cmd(struct iwx_softc *, struct iwx_node *);
 int	iwx_rm_sta(struct iwx_softc *, struct iwx_node *);
@@ -463,7 +469,7 @@ int	iwx_disable_mgmt_queue(struct iwx_softc *);
 int	iwx_rs_rval2idx(uint8_t);
 uint16_t iwx_rs_ht_rates(struct iwx_softc *, struct ieee80211_node *, int);
 uint16_t iwx_rs_vht_rates(struct iwx_softc *, struct ieee80211_node *, int);
-uint16_t iwx_rs_he_rates(struct iwx_softc *, struct ieee80211_node *, int);
+uint16_t iwx_rs_he_rates(struct iwx_softc *, struct ieee80211_node *, int, int);
 int	iwx_rs_init_v3(struct iwx_softc *, struct iwx_node *);
 int	iwx_rs_init_v4(struct iwx_softc *, struct iwx_node *);
 int	iwx_rs_init(struct iwx_softc *, struct iwx_node *);
@@ -3166,6 +3172,7 @@ iwx_init_channel_map(struct iwx_softc *sc, uint16_t *channel_profile_v3,
 	int flags, hw_value;
 	int nchan;
 	const uint8_t *nvm_channels;
+	int uhb_total = 0, uhb_valid = 0;
 
 	if (sc->sc_uhb_supported) {
 		nchan = nitems(iwx_nvm_channels_uhb);
@@ -3181,9 +3188,16 @@ iwx_init_channel_map(struct iwx_softc *sc, uint16_t *channel_profile_v3,
 		else
 			ch_flags = le16_to_cpup(channel_profile_v3 + ch_idx);
 
-		/* net80211 cannot handle 6 GHz channel numbers yet */
-		if (ch_idx >= IWX_NUM_2GHZ_CHANNELS + IWX_NUM_5GHZ_CHANNELS)
-			break;
+		/*
+		 * net80211 cannot handle 6 GHz channel numbers yet; count
+		 * what the regulatory data would allow.
+		 */
+		if (ch_idx >= IWX_NUM_2GHZ_CHANNELS + IWX_NUM_5GHZ_CHANNELS) {
+			uhb_total++;
+			if (ch_flags & IWX_NVM_CHANNEL_VALID)
+				uhb_valid++;
+			continue;
+		}
 
 		is_5ghz = ch_idx >= IWX_NUM_2GHZ_CHANNELS;
 		if (is_5ghz && !data->sku_cap_band_52GHz_enable)
@@ -3225,17 +3239,28 @@ iwx_init_channel_map(struct iwx_softc *sc, uint16_t *channel_profile_v3,
 			channel->ic_flags |= IEEE80211_CHAN_VHT;
 			if (ch_flags & IWX_NVM_CHANNEL_80MHZ)
 				channel->ic_xflags |= IEEE80211_CHANX_80MHZ;
+			if (ch_flags & IWX_NVM_CHANNEL_160MHZ)
+				channel->ic_xflags |= IEEE80211_CHANX_160MHZ;
 		}
-		/*
-		 * HE station set-up here uses STA_HE_CTXT_CMD; the Bz family's
-		 * MLD firmware (BE200) does not answer it, so those cards
-		 * associate with HT/VHT.
-		 */
-		if (IWX_ENABLE_HE_ASSOCIATION && data->sku_cap_11ax_enable &&
-		    data->sku_cap_11n_enable &&
-		    sc->sc_device_family < IWX_DEVICE_FAMILY_BZ)
-			channel->ic_xflags |= IEEE80211_CHANX_HE;
 	}
+
+#ifdef __HAIKU__
+	if (uhb_total != 0 && uhb_valid != sc->sc_uhb_valid_logged) {
+		printf("%s: the regulatory data allows %d of %d 6 GHz "
+		    "channels (not used: no 6 GHz support yet)\n",
+		    DEVNAME(sc), uhb_valid, uhb_total);
+		sc->sc_uhb_valid_logged = uhb_valid;
+	}
+#endif
+
+	/*
+	 * HE station set-up uses STA_HE_CTXT_CMD, or LINK_CONFIG_CMD and
+	 * STA_CONFIG_CMD with MLD firmware (the Bz family's).
+	 * iwx_setup_he_rates() marks the channels HE may be used on.
+	 */
+	sc->sc_he_capable = IWX_ENABLE_HE_ASSOCIATION &&
+	    data->sku_cap_11ax_enable && data->sku_cap_11n_enable;
+	iwx_setup_he_rates(sc);
 }
 
 int
@@ -3304,13 +3329,34 @@ iwx_setup_he_rates(struct iwx_softc *sc)
 	int two_streams = iwx_mimo_enabled(sc) &&
 	    (((rx_ant & IWX_ANT_AB) == IWX_ANT_AB) ||
 	    ((rx_ant & IWX_ANT_BC) == IWX_ANT_BC));
-	int n;
+	int n, he, i;
 
-	/* Conservative STA capabilities: HE 80 MHz, LDPC, and MCS 0-11.
-	 * The local Linux AX210 inventory reports these capabilities. Avoid
-	 * advertising PPE, trigger, or control features the host does not set up. */
+	/*
+	 * HE is offered on every channel of an HE-capable card, unless the
+	 * driver settings switch it off. (This runs at every iwx_init(), so
+	 * switching HE off takes effect when the interface is brought up
+	 * again; net80211 only offers HE at all if it was on at attach.)
+	 */
+	he = sc->sc_he_capable && !sc->sc_he_disabled;
+	for (i = 0; i <= IEEE80211_CHAN_MAX; i++) {
+		struct ieee80211_channel *channel = &ic->ic_channels[i];
+		if (he && channel->ic_freq != 0 &&
+		    (channel->ic_flags & IEEE80211_CHAN_HT) != 0)
+			channel->ic_xflags |= IEEE80211_CHANX_HE;
+		else
+			channel->ic_xflags &= ~IEEE80211_CHANX_HE;
+	}
+
 	memset(ic->ic_he_mac_cap, 0, sizeof(ic->ic_he_mac_cap));
 	memset(ic->ic_he_phy_cap, 0, sizeof(ic->ic_he_phy_cap));
+	ic->ic_he_rxmcs_80 = ic->ic_he_txmcs_80 = 0xffff;
+	ic->ic_he_rxmcs_160 = ic->ic_he_txmcs_160 = 0xffff;
+	if (!he)
+		return;
+
+	/* Conservative STA capabilities: HE up to 160 MHz, LDPC, and MCS 0-11.
+	 * The local Linux AX210 inventory reports these capabilities. Avoid
+	 * advertising PPE, trigger, or control features the host does not set up. */
 	ic->ic_he_mac_cap[0] = 0x01; /* HTC HE */
 	ic->ic_he_phy_cap[0] = IEEE80211_HE_PHYCAP0_CHAN_WIDTH_40_IN_2G |
 	    IEEE80211_HE_PHYCAP0_CHAN_WIDTH_40_80_IN_5G;
@@ -3324,6 +3370,115 @@ iwx_setup_he_rates(struct iwx_softc *sc)
 		ic->ic_he_rxmcs_80 |= IEEE80211_HE_MCS_SS_NOT_SUPP <<
 		    IEEE80211_HE_MCS_FOR_SS_SHIFT(n);
 	ic->ic_he_txmcs_80 = ic->ic_he_rxmcs_80;
+
+	/*
+	 * 160 MHz: the same streams and MCS as at 80 MHz (what Linux
+	 * advertises for these cards), unless the card variant has no
+	 * 160 MHz or the settings limit the width.
+	 */
+	if (!sc->sc_no_160 && sc->sc_max_chan_width >= 160) {
+		ic->ic_he_phy_cap[0] |= IEEE80211_HE_PHYCAP0_CHAN_WIDTH_160_IN_5G;
+		ic->ic_he_rxmcs_160 = ic->ic_he_rxmcs_80;
+		ic->ic_he_txmcs_160 = ic->ic_he_txmcs_80;
+	}
+}
+
+/*
+ * The centre channels of the AP's 80 MHz and 160 MHz channels, from its VHT
+ * operation element; 0 for a width it does not use. A 160 MHz channel is
+ * signalled either as an 80 MHz channel whose second centre is that of the
+ * 160 MHz channel, or (deprecated) as a 160 MHz channel with one centre.
+ */
+void
+iwx_vht_centers(struct ieee80211_node *ni, int *center80, int *center160)
+{
+	int primary = ni->ni_primary_chan;
+	int c0 = ni->ni_vht_chan_center_freq_idx0;
+	int c1 = ni->ni_vht_chan_center_freq_idx1;
+	int offset;
+
+	*center80 = *center160 = 0;
+	switch (ni->ni_vht_chan_width) {
+	case IEEE80211_VHTOP0_CHAN_WIDTH_160:
+		*center160 = c0;
+		*center80 = primary < c0 ? c0 - 8 : c0 + 8;
+		break;
+	case IEEE80211_VHTOP0_CHAN_WIDTH_80:
+	case IEEE80211_VHTOP0_CHAN_WIDTH_8080:
+		*center80 = c0;
+		if (ni->ni_vht_chan_width == IEEE80211_VHTOP0_CHAN_WIDTH_80 &&
+		    (c1 - c0 == 8 || c0 - c1 == 8))
+			*center160 = c1;
+		break;
+	default:
+		return;
+	}
+
+	/* The primary channel has to lie inside both. */
+	offset = primary - *center80;
+	if (offset != -6 && offset != -2 && offset != 2 && offset != 6)
+		*center80 = *center160 = 0;
+	offset = primary - *center160;
+	if (offset < -14 || offset > 14 || ((offset + 14) % 4) != 0)
+		*center160 = 0;
+}
+
+/*
+ * The widest channel to use with the AP: the secondary channel offset for
+ * 40 MHz and the VHT operation width (HT, 80 or 160) for wider channels.
+ * 160 MHz is used for HE associations only.
+ */
+void
+iwx_chan_width(struct iwx_softc *sc, struct ieee80211_node *ni, uint8_t *sco,
+    uint8_t *vht_chan_width)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	int center80, center160;
+
+	*sco = IEEE80211_HTOP0_SCO_SCN;
+	*vht_chan_width = IEEE80211_VHTOP0_CHAN_WIDTH_HT;
+
+	if ((ni->ni_flags & IEEE80211_NODE_HT) == 0 ||
+	    sc->sc_max_chan_width < 40 ||
+	    !IEEE80211_CHAN_40MHZ_ALLOWED(ni->ni_chan) ||
+	    !ieee80211_node_supports_ht_chan40(ni))
+		return;
+	*sco = (ni->ni_htop0 & IEEE80211_HTOP0_SCO_MASK);
+
+	if ((ni->ni_flags & IEEE80211_NODE_VHT) == 0 ||
+	    sc->sc_max_chan_width < 80 ||
+	    !IEEE80211_CHAN_80MHZ_ALLOWED(ni->ni_chan) ||
+	    !ieee80211_node_supports_vht_chan80(ni))
+		return;
+	iwx_vht_centers(ni, &center80, &center160);
+	if (center80 == 0)
+		return;
+	*vht_chan_width = IEEE80211_VHTOP0_CHAN_WIDTH_80;
+
+	if ((ni->ni_flags & IEEE80211_NODE_HE) == 0 || center160 == 0 ||
+	    sc->sc_max_chan_width < 160 ||
+	    !IEEE80211_CHAN_160MHZ_ALLOWED(ni->ni_chan) ||
+	    (ic->ic_he_phy_cap[0] & ni->ni_he_phy_cap[0] &
+	    IEEE80211_HE_PHYCAP0_CHAN_WIDTH_160_IN_5G) == 0)
+		return;
+	*vht_chan_width = IEEE80211_VHTOP0_CHAN_WIDTH_160;
+}
+
+/*
+ * Lab switches in the driver settings file "iaxwifi200"
+ * (~/config/settings/kernel/drivers/iaxwifi200): "he 0" associates with
+ * HT/VHT only, "max_width 20|40|80|160" limits the channel width, and
+ * "mld_api 1" uses the MLD firmware commands on cards that default to the
+ * older ones. They are read each time the interface is brought up.
+ */
+void
+iwx_haiku_read_settings(struct iwx_softc *sc)
+{
+	extern int iwx_haiku_setting(const char *, int);
+
+	sc->sc_he_disabled = iwx_haiku_setting("he", 1) == 0;
+	sc->sc_max_chan_width = iwx_haiku_setting("max_width", 160);
+	sc->sc_mld_api_forced = iwx_haiku_setting("mld_api", 0) != 0;
 }
 
 void
@@ -3727,18 +3882,7 @@ iwx_phy_ctxt_task(void *arg)
 	}
 
 	chains = iwx_mimo_enabled(sc) ? 2 : 1;
-	if ((ni->ni_flags & IEEE80211_NODE_HT) &&
-	    IEEE80211_CHAN_40MHZ_ALLOWED(ni->ni_chan) &&
-	    ieee80211_node_supports_ht_chan40(ni))
-		sco = (ni->ni_htop0 & IEEE80211_HTOP0_SCO_MASK);
-	else
-		sco = IEEE80211_HTOP0_SCO_SCN;
-	if ((ni->ni_flags & IEEE80211_NODE_VHT) &&
-	    IEEE80211_CHAN_80MHZ_ALLOWED(in->in_ni.ni_chan) &&
-	    ieee80211_node_supports_vht_chan80(ni))
-		vht_chan_width = IEEE80211_VHTOP0_CHAN_WIDTH_80;
-	else
-		vht_chan_width = IEEE80211_VHTOP0_CHAN_WIDTH_HT;
+	iwx_chan_width(sc, ni, &sco, &vht_chan_width);
 	if (in->in_phyctxt->sco != sco ||
 	    in->in_phyctxt->vht_chan_width != vht_chan_width) {
 		err = iwx_phy_ctxt_update(sc, in->in_phyctxt,
@@ -4638,9 +4782,11 @@ iwx_run_init_mvm_ucode(struct iwx_softc *sc, int readnvm)
 	 * support, but doesn't actually work. The Bz family (BE200) needs
 	 * it: its firmware no longer answers MAC_CONTEXT_CMD.
 	 */
+	sc->sc_use_mld_api = 0;
 	if (isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_MLD_API_SUPPORT) &&
 	    (IWX_CSR_HW_REV_TYPE(sc->sc_hw_rev) == IWX_CFG_MAC_TYPE_MA ||
-	    sc->sc_device_family >= IWX_DEVICE_FAMILY_BZ))
+	    sc->sc_device_family >= IWX_DEVICE_FAMILY_BZ ||
+	    sc->sc_mld_api_forced))
 		sc->sc_use_mld_api = 1;
 
 	return 0;
@@ -5798,9 +5944,10 @@ iwx_binding_cmd(struct iwx_softc *sc, struct iwx_node *in, uint32_t action)
 }
 
 uint8_t
-iwx_get_vht_ctrl_pos(struct ieee80211com *ic, struct ieee80211_channel *chan)
+iwx_get_vht_ctrl_pos(struct ieee80211com *ic, struct ieee80211_channel *chan,
+    uint8_t vht_chan_width)
 {
-	int center_idx = ic->ic_bss->ni_vht_chan_center_freq_idx0;
+	int center80, center160, center_idx;
 	int primary_idx = ic->ic_bss->ni_primary_chan;
 	/*
 	 * The FW is expected to check the control channel position only
@@ -5809,7 +5956,23 @@ iwx_get_vht_ctrl_pos(struct ieee80211com *ic, struct ieee80211_channel *chan)
 	 */
 	uint8_t pos = IWX_PHY_VHT_CTRL_POS_1_BELOW;
 
+	iwx_vht_centers(ic->ic_bss, &center80, &center160);
+	center_idx = vht_chan_width == IEEE80211_VHTOP0_CHAN_WIDTH_160 ?
+	    center160 : center80;
+
 	switch (primary_idx - center_idx) {
+	case -14:
+		pos = IWX_PHY_VHT_CTRL_POS_4_BELOW;
+		break;
+	case -10:
+		pos = IWX_PHY_VHT_CTRL_POS_3_BELOW;
+		break;
+	case 10:
+		pos = IWX_PHY_VHT_CTRL_POS_3_ABOVE;
+		break;
+	case 14:
+		pos = IWX_PHY_VHT_CTRL_POS_4_ABOVE;
+		break;
 	case -6:
 		pos = IWX_PHY_VHT_CTRL_POS_2_BELOW;
 		break;
@@ -5853,8 +6016,11 @@ iwx_phy_ctxt_cmd_uhb_v3_v4(struct iwx_softc *sc, struct iwx_phy_ctxt *ctxt,
 	cmd.ci.band = IEEE80211_IS_CHAN_2GHZ(chan) ?
 	    IWX_PHY_BAND_24 : IWX_PHY_BAND_5;
 	cmd.ci.channel = htole32(ieee80211_chan2ieee(ic, chan));
-	if (vht_chan_width == IEEE80211_VHTOP0_CHAN_WIDTH_80) {
-		cmd.ci.ctrl_pos = iwx_get_vht_ctrl_pos(ic, chan);
+	if (vht_chan_width == IEEE80211_VHTOP0_CHAN_WIDTH_160) {
+		cmd.ci.ctrl_pos = iwx_get_vht_ctrl_pos(ic, chan, vht_chan_width);
+		cmd.ci.width = IWX_PHY_VHT_CHANNEL_MODE160;
+	} else if (vht_chan_width == IEEE80211_VHTOP0_CHAN_WIDTH_80) {
+		cmd.ci.ctrl_pos = iwx_get_vht_ctrl_pos(ic, chan, vht_chan_width);
 		cmd.ci.width = IWX_PHY_VHT_CHANNEL_MODE80;
 	} else if (chan->ic_flags & IEEE80211_CHAN_40MHZ) {
 		if (sco == IEEE80211_HTOP0_SCO_SCA) {
@@ -5913,8 +6079,11 @@ iwx_phy_ctxt_cmd_v3_v4(struct iwx_softc *sc, struct iwx_phy_ctxt *ctxt,
 	cmd.ci.band = IEEE80211_IS_CHAN_2GHZ(chan) ?
 	    IWX_PHY_BAND_24 : IWX_PHY_BAND_5;
 	cmd.ci.channel = ieee80211_chan2ieee(ic, chan);
-	if (vht_chan_width == IEEE80211_VHTOP0_CHAN_WIDTH_80) {
-		cmd.ci.ctrl_pos = iwx_get_vht_ctrl_pos(ic, chan);
+	if (vht_chan_width == IEEE80211_VHTOP0_CHAN_WIDTH_160) {
+		cmd.ci.ctrl_pos = iwx_get_vht_ctrl_pos(ic, chan, vht_chan_width);
+		cmd.ci.width = IWX_PHY_VHT_CHANNEL_MODE160;
+	} else if (vht_chan_width == IEEE80211_VHTOP0_CHAN_WIDTH_80) {
+		cmd.ci.ctrl_pos = iwx_get_vht_ctrl_pos(ic, chan, vht_chan_width);
 		cmd.ci.width = IWX_PHY_VHT_CHANNEL_MODE80;
 	} else if (chan->ic_flags & IEEE80211_CHAN_40MHZ) {
 		if (sco == IEEE80211_HTOP0_SCO_SCA) {
@@ -6975,17 +7144,26 @@ iwx_add_sta_cmd(struct iwx_softc *sc, struct iwx_node *in, int update)
 		if (in->in_phyctxt &&
 		    (in->in_phyctxt->sco == IEEE80211_HTOP0_SCO_SCA ||
 		    in->in_phyctxt->sco == IEEE80211_HTOP0_SCO_SCB ||
-		    in->in_phyctxt->vht_chan_width ==
-		    IEEE80211_VHTOP0_CHAN_WIDTH_80)) {
+		    in->in_phyctxt->vht_chan_width !=
+		    IEEE80211_VHTOP0_CHAN_WIDTH_HT)) {
 			add_sta_cmd.station_flags |= htole32(
 			    IWX_STA_FLG_FAT_EN_40MHZ);
 		}
 
 		if (in->in_ni.ni_flags & IEEE80211_NODE_VHT) {
+			/*
+			 * The width is one two-bit value (80 MHz is 2, 160 MHz
+			 * is 3), not a set of flags: 40 "or" 80 reads 160.
+			 */
 			if (in->in_phyctxt &&
-			    in->in_phyctxt->vht_chan_width ==
-			    IEEE80211_VHTOP0_CHAN_WIDTH_80) {
+			    in->in_phyctxt->vht_chan_width !=
+			    IEEE80211_VHTOP0_CHAN_WIDTH_HT) {
+				add_sta_cmd.station_flags &= htole32(
+				    ~IWX_STA_FLG_FAT_EN_MSK);
 				add_sta_cmd.station_flags |= htole32(
+				    in->in_phyctxt->vht_chan_width ==
+				    IEEE80211_VHTOP0_CHAN_WIDTH_160 ?
+				    IWX_STA_FLG_FAT_EN_160MHZ :
 				    IWX_STA_FLG_FAT_EN_80MHZ);
 			}
 			aggsize = (in->in_ni.ni_vhtcaps &
@@ -7022,12 +7200,6 @@ iwx_add_sta_cmd(struct iwx_softc *sc, struct iwx_node *in, int update)
 			break;
 		}
 	}
-	if (update && (in->in_ni.ni_flags & IEEE80211_NODE_HE))
-		printf("%s: HE STA flags=0x%x node=0x%x HE rxmcs=0x%x HT ss2=0x%x VHT rxmcs=0x%x AID=%u\n",
-		    DEVNAME(sc), le32toh(add_sta_cmd.station_flags),
-		    in->in_ni.ni_flags, in->in_ni.ni_he_rxmcs_80,
-		    in->in_ni.ni_rxmcs[1], in->in_ni.ni_vht_rxmcs,
-		    le16toh(add_sta_cmd.assoc_id));
 
 	status = IWX_ADD_STA_SUCCESS;
 	err = iwx_send_cmd_pdu_status(sc, IWX_ADD_STA, sizeof(add_sta_cmd),
@@ -7036,6 +7208,90 @@ iwx_add_sta_cmd(struct iwx_softc *sc, struct iwx_node *in, int update)
 		err = EIO;
 
 	return err;
+}
+
+/*
+ * The HE parameters of the AP that the firmware needs, taken from the AP's HE
+ * capabilities and HE operation elements. STA_HE_CTXT_CMD carries them for
+ * firmware with the older commands, LINK_CONFIG_CMD and STA_CONFIG_CMD for
+ * firmware with the MLD commands.
+ */
+struct iwx_he_params {
+	struct iwx_he_pkt_ext_v2 pkt_ext;	/* PPE thresholds */
+	int pkt_ext_set;
+	uint8_t bss_color;
+	int bss_color_disabled;
+	int partial_bss_color;
+	uint8_t htc_trig_based_pkt_ext;
+	uint16_t frame_time_rts_th;
+	uint32_t htc_flags;
+};
+
+static uint8_t
+iwx_he_ppe_value(const uint8_t *ppe, int bit)
+{
+	uint16_t value = ppe[bit / 8];
+	if (bit % 8 > 5)
+		value |= (uint16_t)ppe[bit / 8 + 1] << 8;
+	return (value >> (bit % 8)) & 7;
+}
+
+static void
+iwx_he_params(struct ieee80211_node *ni, struct iwx_he_params *he)
+{
+	uint32_t he_op;
+	int ss, bw, bit;
+
+	memset(he, 0, sizeof(*he));
+	/* Seven is the firmware API's "none" packet extension threshold. */
+	memset(&he->pkt_ext, 7, sizeof(he->pkt_ext));
+	if (ni->ni_he_ppe_len != 0) {
+		const uint8_t *ppe = ni->ni_he_ppe;
+		int nss = (ppe[0] & 7) + 1;
+		uint8_t ru_mask = (ppe[0] >> 3) & 0xf;
+		bit = 7;
+		for (ss = 0; ss < nss; ss++) {
+			for (bw = 0; bw < 4; bw++) {
+				if ((ru_mask & (1 << bw)) == 0)
+					continue;
+				uint8_t high = iwx_he_ppe_value(ppe, bit);
+				bit += 3;
+				uint8_t low = iwx_he_ppe_value(ppe, bit);
+				bit += 3;
+				if (ss < MAX_HE_SUPP_NSS) {
+					he->pkt_ext.pkt_ext_qam_th[ss][bw][0] = low;
+					he->pkt_ext.pkt_ext_qam_th[ss][bw][1] = high;
+				}
+			}
+		}
+		he->pkt_ext_set = 1;
+	} else {
+		uint8_t nominal = (ni->ni_he_phy_cap[9] >> 6) & 3;
+		if (nominal != 3) {
+			for (ss = 0; ss < MAX_HE_SUPP_NSS; ss++) {
+				for (bw = 0; bw < MAX_CHANNEL_BW_INDX_API_D_VER_3;
+				    bw++) {
+					if (nominal == 1)
+						he->pkt_ext.pkt_ext_qam_th[ss][bw][0] = 0;
+					else if (nominal == 2)
+						he->pkt_ext.pkt_ext_qam_th[ss][bw][1] = 0;
+				}
+			}
+			he->pkt_ext_set = 1;
+		}
+	}
+
+	he_op = ni->ni_he_oper_params[0] |
+	    ((uint32_t)ni->ni_he_oper_params[1] << 8) |
+	    ((uint32_t)ni->ni_he_oper_params[2] << 16) |
+	    ((uint32_t)ni->ni_he_oper_params[3] << 24);
+	he->bss_color = (he_op >> 24) & 0x3f;
+	he->htc_trig_based_pkt_ext = he_op & 0x7;
+	he->frame_time_rts_th = (he_op >> 4) & 0x3ff;
+	he->bss_color_disabled = (ni->ni_he_oper_params[3] & 0x80) != 0;
+	he->partial_bss_color = (ni->ni_he_oper_params[3] & 0x40) != 0;
+	if (ni->ni_he_mac_cap[0] & 0x01)
+		he->htc_flags |= 1; /* IWL_HE_HTC_SUPPORT */
 }
 
 void
@@ -7109,13 +7365,53 @@ iwx_mld_modify_link_fill(struct iwx_softc *sc, struct iwx_node *in,
 	cmd->bi = htole32(ni->ni_intval);
 	cmd->dtim_interval = htole32(ni->ni_intval * ni->ni_dtimperiod);
 
-	cmd->modify_mask = htole32(changes);
 	cmd->flags = 0;
 	cmd->flags_mask = 0;
+	if ((changes & IWX_LINK_CONTEXT_MODIFY_HE_PARAMS) != 0 &&
+	    (ni->ni_flags & IEEE80211_NODE_HE) != 0) {
+		struct iwx_he_params he;
+
+		/*
+		 * What Linux sends (iwl_mvm_link_changed()), less what
+		 * net80211 does not parse: UORA, MU EDCA and multiple BSSID.
+		 */
+		iwx_he_params(ni, &he);
+		cmd->htc_trig_based_pkt_ext = he.htc_trig_based_pkt_ext;
+		cmd->frame_time_rts_th = htole16(he.frame_time_rts_th);
+		cmd->bss_color = he.bss_color;
+		if (he.bss_color_disabled) {
+			cmd->flags |= htole32(IWX_LINK_FLG_BSS_COLOR_DIS);
+			cmd->flags_mask |= htole32(IWX_LINK_FLG_BSS_COLOR_DIS);
+		}
+	} else
+		changes &= ~IWX_LINK_CONTEXT_MODIFY_HE_PARAMS;
+
+	cmd->modify_mask = htole32(changes);
 	cmd->spec_link_id = 0;
 	cmd->listen_lmac = 0;
 	cmd->action = IWX_FW_CTXT_ACTION_MODIFY;
 #undef IWX_EXP2
+}
+
+/*
+ * Tells MLD firmware the HE parameters of the AP once associated. Linux sends
+ * them after the MAC context says that the MAC uses HE.
+ */
+int
+iwx_mld_link_he_params(struct iwx_softc *sc, struct iwx_node *in)
+{
+	struct iwx_link_config_cmd link_cmd;
+	int changes = IWX_LINK_CONTEXT_MODIFY_HE_PARAMS
+	    | IWX_LINK_CONTEXT_MODIFY_BSS_COLOR_DISABLE;
+
+	if ((in->in_ni.ni_flags & IEEE80211_NODE_HE) == 0)
+		return 0;
+
+	memset(&link_cmd, 0, sizeof(link_cmd));
+	iwx_mld_modify_link_fill(sc, in, &link_cmd, changes, 1);
+	return iwx_send_cmd_pdu(sc,
+	    IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_LINK_CONFIG_CMD),
+	    0, sizeof(link_cmd), &link_cmd);
 }
 
 int
@@ -7193,11 +7489,27 @@ iwx_mld_add_sta_cmd(struct iwx_softc *sc, struct iwx_node *in, int update)
 			aggsize = (in->in_ni.ni_ampdu_param &
 			    IEEE80211_AMPDU_PARAM_LE);
 		}
+		/* HE extends the A-MPDU length exponent (HE MAC capabilities). */
+		if (update && (in->in_ni.ni_flags & IEEE80211_NODE_HE))
+			aggsize += (in->in_ni.ni_he_mac_cap[3] >> 3) & 3;
 		if (aggsize > max_aggsize)
 			aggsize = max_aggsize;
 
 		sta_cmd.tx_ampdu_spacing = htole32(mpdu_dens);
 		sta_cmd.tx_ampdu_max_size = htole32(aggsize);
+	}
+
+	/* Seven is the firmware API's "none" packet extension threshold. */
+	memset(&sta_cmd.pkt_ext, 7, sizeof(sta_cmd.pkt_ext));
+	if (update && (in->in_ni.ni_flags & IEEE80211_NODE_HE)) {
+		struct iwx_he_params he;
+
+		/* As Linux's iwl_mvm_mld_cfg_sta(); net80211 has no UORA. */
+		iwx_he_params(&in->in_ni, &he);
+		sta_cmd.pkt_ext = he.pkt_ext;
+		sta_cmd.htc_flags = htole32(he.htc_flags);
+		if (in->in_ni.ni_he_mac_cap[2] & 0x08)	/* ACK-enabled A-MPDU */
+			sta_cmd.ack_enabled = htole32(1);
 	}
 
 	if (in->in_ni.ni_flags & IEEE80211_NODE_MFP)
@@ -8005,8 +8317,11 @@ iwx_mld_mac_ctxt_cmd(struct iwx_softc *sc, struct iwx_node *in,
 	IEEE80211_ADDR_COPY(cmd.local_mld_addr, ic->ic_myaddr);
 	cmd.client.assoc_id = htole32(IEEE80211_AID(ni->ni_associd));
 	cmd.client.is_assoc = assoc ? 1 : 0;
-	if (assoc && (ni->ni_flags & IEEE80211_NODE_HE))
+	if (assoc && (ni->ni_flags & IEEE80211_NODE_HE)) {
 		cmd.he_support = htole16(1);
+		/* We do not advertise ACK-enabled aggregation. */
+		cmd.nic_not_ack_enabled = htole32(1);
+	}
 
 	cmd.filter_flags = htole32(IWX_MAC_CFG_FILTER_ACCEPT_GRP);
 	if (ic->ic_opmode == IEEE80211_M_MONITOR) {
@@ -8384,12 +8699,15 @@ iwx_rs_vht_rates(struct iwx_softc *sc, struct ieee80211_node *ni, int num_ss)
 }
 
 uint16_t
-iwx_rs_he_rates(struct iwx_softc *sc, struct ieee80211_node *ni, int num_ss)
+iwx_rs_he_rates(struct iwx_softc *sc, struct ieee80211_node *ni, int num_ss,
+    int chan160)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	int shift = IEEE80211_HE_MCS_FOR_SS_SHIFT(num_ss);
-	int peer = (ni->ni_he_rxmcs_80 >> shift) & 3;
-	int local = (ic->ic_he_txmcs_80 >> shift) & 3;
+	int peer = ((chan160 ? ni->ni_he_rxmcs_160 : ni->ni_he_rxmcs_80)
+	    >> shift) & 3;
+	int local = ((chan160 ? ic->ic_he_txmcs_160 : ic->ic_he_txmcs_80)
+	    >> shift) & 3;
 	int max_mcs;
 
 	if (peer == IEEE80211_HE_MCS_SS_NOT_SUPP ||
@@ -8427,9 +8745,16 @@ iwx_rs_init_v3(struct iwx_softc *sc, struct iwx_node *in)
 		if ((ni->ni_he_phy_cap[1] & sc->sc_ic.ic_he_phy_cap[1] & 0x20) != 0)
 			cfg_cmd.flags |= htole16(IWX_TLC_MNG_CFG_FLAGS_LDPC_MSK);
 		cfg_cmd.ht_rates[IWX_TLC_NSS_1][IWX_TLC_MCS_PER_BW_80] =
-		    htole16(iwx_rs_he_rates(sc, ni, 1));
+		    htole16(iwx_rs_he_rates(sc, ni, 1, 0));
 		cfg_cmd.ht_rates[IWX_TLC_NSS_2][IWX_TLC_MCS_PER_BW_80] =
-		    htole16(iwx_rs_he_rates(sc, ni, 2));
+		    htole16(iwx_rs_he_rates(sc, ni, 2, 0));
+		if (in->in_phyctxt->vht_chan_width ==
+		    IEEE80211_VHTOP0_CHAN_WIDTH_160) {
+			cfg_cmd.ht_rates[IWX_TLC_NSS_1][IWX_TLC_MCS_PER_BW_160]
+			    = htole16(iwx_rs_he_rates(sc, ni, 1, 1));
+			cfg_cmd.ht_rates[IWX_TLC_NSS_2][IWX_TLC_MCS_PER_BW_160]
+			    = htole16(iwx_rs_he_rates(sc, ni, 2, 1));
+		}
 	} else if (ni->ni_flags & IEEE80211_NODE_VHT) {
 		cfg_cmd.mode = IWX_TLC_MNG_MODE_VHT;
 		cfg_cmd.ht_rates[IWX_TLC_NSS_1][IWX_TLC_MCS_PER_BW_80] =
@@ -8448,7 +8773,10 @@ iwx_rs_init_v3(struct iwx_softc *sc, struct iwx_node *in)
 		cfg_cmd.mode = IWX_TLC_MNG_MODE_NON_HT;
 
 	cfg_cmd.sta_id = IWX_STATION_ID;
-	if (in->in_phyctxt->vht_chan_width == IEEE80211_VHTOP0_CHAN_WIDTH_80)
+	if (in->in_phyctxt->vht_chan_width == IEEE80211_VHTOP0_CHAN_WIDTH_160)
+		cfg_cmd.max_ch_width = IWX_TLC_MNG_CH_WIDTH_160MHZ;
+	else if (in->in_phyctxt->vht_chan_width ==
+	    IEEE80211_VHTOP0_CHAN_WIDTH_80)
 		cfg_cmd.max_ch_width = IWX_TLC_MNG_CH_WIDTH_80MHZ;
 	else if (in->in_phyctxt->sco == IEEE80211_HTOP0_SCO_SCA ||
 	    in->in_phyctxt->sco == IEEE80211_HTOP0_SCO_SCB)
@@ -8477,13 +8805,6 @@ iwx_rs_init_v3(struct iwx_softc *sc, struct iwx_node *in)
 	    (ni->ni_flags & IEEE80211_NODE_HE) == 0 &&
 	    ieee80211_node_supports_vht_sgi80(ni))
 		cfg_cmd.sgi_ch_width_supp |= (1 << IWX_TLC_MNG_CH_WIDTH_80MHZ);
-	if (ni->ni_flags & IEEE80211_NODE_HE)
-		printf("%s: HE TLC v3 width=%u sgi=%u flags=0x%x rates=%x/%x mpdu=%u\n",
-		    DEVNAME(sc), cfg_cmd.max_ch_width, cfg_cmd.sgi_ch_width_supp,
-		    le16toh(cfg_cmd.flags),
-		    le16toh(cfg_cmd.ht_rates[0][0]),
-		    le16toh(cfg_cmd.ht_rates[1][0]),
-		    le16toh(cfg_cmd.max_mpdu_len));
 
 	cmd_id = iwx_cmd_id(IWX_TLC_MNG_CONFIG_CMD, IWX_DATA_PATH_GROUP, 0);
 	return iwx_send_cmd_pdu(sc, cmd_id, IWX_CMD_ASYNC, cmd_size, &cfg_cmd);
@@ -8514,9 +8835,16 @@ iwx_rs_init_v4(struct iwx_softc *sc, struct iwx_node *in)
 		if ((ni->ni_he_phy_cap[1] & sc->sc_ic.ic_he_phy_cap[1] & 0x20) != 0)
 			cfg_cmd.flags |= htole16(IWX_TLC_MNG_CFG_FLAGS_LDPC_MSK);
 		cfg_cmd.ht_rates[IWX_TLC_NSS_1][IWX_TLC_MCS_PER_BW_80] =
-		    htole16(iwx_rs_he_rates(sc, ni, 1));
+		    htole16(iwx_rs_he_rates(sc, ni, 1, 0));
 		cfg_cmd.ht_rates[IWX_TLC_NSS_2][IWX_TLC_MCS_PER_BW_80] =
-		    htole16(iwx_rs_he_rates(sc, ni, 2));
+		    htole16(iwx_rs_he_rates(sc, ni, 2, 0));
+		if (in->in_phyctxt->vht_chan_width ==
+		    IEEE80211_VHTOP0_CHAN_WIDTH_160) {
+			cfg_cmd.ht_rates[IWX_TLC_NSS_1][IWX_TLC_MCS_PER_BW_160]
+			    = htole16(iwx_rs_he_rates(sc, ni, 1, 1));
+			cfg_cmd.ht_rates[IWX_TLC_NSS_2][IWX_TLC_MCS_PER_BW_160]
+			    = htole16(iwx_rs_he_rates(sc, ni, 2, 1));
+		}
 	} else if (ni->ni_flags & IEEE80211_NODE_VHT) {
 		cfg_cmd.mode = IWX_TLC_MNG_MODE_VHT;
 		cfg_cmd.ht_rates[IWX_TLC_NSS_1][IWX_TLC_MCS_PER_BW_80] =
@@ -8535,7 +8863,10 @@ iwx_rs_init_v4(struct iwx_softc *sc, struct iwx_node *in)
 		cfg_cmd.mode = IWX_TLC_MNG_MODE_NON_HT;
 
 	cfg_cmd.sta_id = IWX_STATION_ID;
-	if (in->in_phyctxt->vht_chan_width == IEEE80211_VHTOP0_CHAN_WIDTH_80)
+	if (in->in_phyctxt->vht_chan_width == IEEE80211_VHTOP0_CHAN_WIDTH_160)
+		cfg_cmd.max_ch_width = IWX_TLC_MNG_CH_WIDTH_160MHZ;
+	else if (in->in_phyctxt->vht_chan_width ==
+	    IEEE80211_VHTOP0_CHAN_WIDTH_80)
 		cfg_cmd.max_ch_width = IWX_TLC_MNG_CH_WIDTH_80MHZ;
 	else if (in->in_phyctxt->sco == IEEE80211_HTOP0_SCO_SCA ||
 	    in->in_phyctxt->sco == IEEE80211_HTOP0_SCO_SCB)
@@ -8564,13 +8895,6 @@ iwx_rs_init_v4(struct iwx_softc *sc, struct iwx_node *in)
 	    (ni->ni_flags & IEEE80211_NODE_HE) == 0 &&
 	    ieee80211_node_supports_vht_sgi80(ni))
 		cfg_cmd.sgi_ch_width_supp |= (1 << IWX_TLC_MNG_CH_WIDTH_80MHZ);
-	if (ni->ni_flags & IEEE80211_NODE_HE)
-		printf("%s: HE TLC v4 width=%u sgi=%u flags=0x%x rates=%x/%x mpdu=%u\n",
-		    DEVNAME(sc), cfg_cmd.max_ch_width, cfg_cmd.sgi_ch_width_supp,
-		    le16toh(cfg_cmd.flags),
-		    le16toh(cfg_cmd.ht_rates[0][0]),
-		    le16toh(cfg_cmd.ht_rates[1][0]),
-		    le16toh(cfg_cmd.max_mpdu_len));
 
 	cmd_id = iwx_cmd_id(IWX_TLC_MNG_CONFIG_CMD, IWX_DATA_PATH_GROUP, 0);
 	return iwx_send_cmd_pdu(sc, cmd_id, IWX_CMD_ASYNC, cmd_size, &cfg_cmd);
@@ -8689,9 +9013,6 @@ iwx_rs_update(struct iwx_softc *sc, struct iwx_tlc_update_notif *notif)
 			ni->ni_txmcs = rate_n_flags & IWX_RATE_MCS_CODE_MSK;
 			ni->ni_he_ss = ((rate_n_flags & IWX_RATE_MCS_NSS_MSK) >>
 			    IWX_RATE_MCS_NSS_POS) + 1;
-			printf("%s: firmware HE rate MCS %d NSS %d flags 0x%x\n",
-			    DEVNAME(sc), ni->ni_txmcs, ni->ni_he_ss,
-			    rate_n_flags);
 			return;
 		} else if (mod_type == IWX_RATE_MCS_VHT_MSK) {
 			ni->ni_txmcs = (rate_n_flags &
@@ -8985,28 +9306,28 @@ iwx_deauth(struct iwx_softc *sc)
 	return 0;
 }
 
-static uint8_t
-iwx_he_ppe_value(const uint8_t *ppe, int bit)
-{
-	uint16_t value = ppe[bit / 8];
-	if (bit % 8 > 5)
-		value |= (uint16_t)ppe[bit / 8 + 1] << 8;
-	return (value >> (bit % 8)) & 7;
-}
-
 static int
 iwx_cfg_he_sta(struct iwx_softc *sc, struct iwx_node *in)
 {
 	struct ieee80211_node *ni = &in->in_ni;
 	struct iwx_he_sta_context_cmd_v3 cmd3;
 	struct iwx_he_sta_context_cmd_v2 cmd2;
+	struct iwx_he_params he;
 	uint8_t ver;
-	uint32_t flags = 0, htc_flags = 0, he_op;
+	uint32_t flags = 0;
 	uint16_t size;
 	void *cmd;
-	int ss, bw, bit;
+	int ss, bw;
 
 	if ((ni->ni_flags & IEEE80211_NODE_HE) == 0)
+		return 0;
+
+	/*
+	 * Firmware that takes the MLD commands has no HE station context
+	 * command: iwx_mld_link_he_params() and iwx_mld_add_sta_cmd() carry
+	 * the same parameters.
+	 */
+	if (sc->sc_use_mld_api)
 		return 0;
 
 	ver = iwx_lookup_cmd_ver(sc, IWX_DATA_PATH_GROUP,
@@ -9021,61 +9342,23 @@ iwx_cfg_he_sta(struct iwx_softc *sc, struct iwx_node *in)
 		return EOPNOTSUPP;
 	}
 
+	iwx_he_params(ni, &he);
+
 	memset(&cmd3, 0, sizeof(cmd3));
-	/* Seven is the firmware API's "none" packet extension threshold. */
-	memset(&cmd3.pkt_ext, 7, sizeof(cmd3.pkt_ext));
-	if (ni->ni_he_ppe_len != 0) {
-		const uint8_t *ppe = ni->ni_he_ppe;
-		int nss = (ppe[0] & 7) + 1;
-		uint8_t ru_mask = (ppe[0] >> 3) & 0xf;
-		bit = 7;
-		for (ss = 0; ss < nss; ss++) {
-			for (bw = 0; bw < 4; bw++) {
-				if ((ru_mask & (1 << bw)) == 0)
-					continue;
-				uint8_t high = iwx_he_ppe_value(ppe, bit);
-				bit += 3;
-				uint8_t low = iwx_he_ppe_value(ppe, bit);
-				bit += 3;
-				if (ss < MAX_HE_SUPP_NSS) {
-					cmd3.pkt_ext.pkt_ext_qam_th[ss][bw][0] = low;
-					cmd3.pkt_ext.pkt_ext_qam_th[ss][bw][1] = high;
-				}
-			}
-		}
+	cmd3.pkt_ext = he.pkt_ext;
+	if (he.pkt_ext_set)
 		flags |= (1U << 8); /* STA_CTXT_HE_PACKET_EXT */
-	} else {
-		uint8_t nominal = (ni->ni_he_phy_cap[9] >> 6) & 3;
-		if (nominal != 3) {
-			for (ss = 0; ss < MAX_HE_SUPP_NSS; ss++) {
-				for (bw = 0; bw < MAX_CHANNEL_BW_INDX_API_D_VER_3;
-				    bw++) {
-					if (nominal == 1)
-						cmd3.pkt_ext.pkt_ext_qam_th[ss][bw][0] = 0;
-					else if (nominal == 2)
-						cmd3.pkt_ext.pkt_ext_qam_th[ss][bw][1] = 0;
-				}
-			}
-			flags |= (1U << 8);
-		}
-	}
 	cmd3.sta_id = IWX_STATION_ID;
 	cmd3.tid_limit = IWX_MAX_TID_COUNT;
-	he_op = ni->ni_he_oper_params[0] |
-	    ((uint32_t)ni->ni_he_oper_params[1] << 8) |
-	    ((uint32_t)ni->ni_he_oper_params[2] << 16) |
-	    ((uint32_t)ni->ni_he_oper_params[3] << 24);
-	cmd3.bss_color = (he_op >> 24) & 0x3f;
-	cmd3.htc_trig_based_pkt_ext = he_op & 0x7;
-	cmd3.frame_time_rts_th = htole16((he_op >> 4) & 0x3ff);
-	if (ni->ni_he_oper_params[3] & 0x40)
+	cmd3.bss_color = he.bss_color;
+	cmd3.htc_trig_based_pkt_ext = he.htc_trig_based_pkt_ext;
+	cmd3.frame_time_rts_th = htole16(he.frame_time_rts_th);
+	if (he.bss_color_disabled)
 		flags |= (1U << 5); /* STA_CTXT_HE_BSS_COLOR_DIS */
-	if (ni->ni_he_oper_params[3] & 0x80)
+	if (he.partial_bss_color)
 		flags |= (1U << 6); /* STA_CTXT_HE_PARTIAL_BSS_COLOR */
-	if (ni->ni_he_mac_cap[0] & 0x01)
-		htc_flags |= 1; /* IWL_HE_HTC_SUPPORT */
 	cmd3.flags = htole32(flags);
-	cmd3.htc_flags = htole32(htc_flags);
+	cmd3.htc_flags = htole32(he.htc_flags);
 
 	if (ver == 3) {
 		cmd = &cmd3;
@@ -9100,14 +9383,54 @@ iwx_cfg_he_sta(struct iwx_softc *sc, struct iwx_node *in)
 		cmd = &cmd2;
 		size = ver == 1 ? sizeof(cmd2) - 8 : sizeof(cmd2);
 	}
-	printf("%s: configuring HE station context v%u color %u PE %u RTS %u PPE len %u first %u/%u\n",
-	    DEVNAME(sc), ver, cmd3.bss_color, cmd3.htc_trig_based_pkt_ext,
-	    le16toh(cmd3.frame_time_rts_th), ni->ni_he_ppe_len,
-	    cmd3.pkt_ext.pkt_ext_qam_th[0][0][0],
-	    cmd3.pkt_ext.pkt_ext_qam_th[0][0][1]);
 	return iwx_send_cmd_pdu(sc,
 	    IWX_WIDE_ID(IWX_DATA_PATH_GROUP, IWX_STA_HE_CTXT_CMD),
 	    0, size, cmd);
+}
+
+/*
+ * Says once per association what was negotiated: the syslog is the only
+ * place that shows the channel width the AP offers next to the one in use.
+ */
+static void
+iwx_log_association(struct iwx_softc *sc, struct iwx_node *in)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_node *ni = &in->in_ni;
+	const char *mode = "legacy";
+	int width = 20, center80 = 0, center160 = 0;
+
+	if (ni->ni_flags & IEEE80211_NODE_HE)
+		mode = "HE (802.11ax)";
+	else if (ni->ni_flags & IEEE80211_NODE_VHT)
+		mode = "VHT (802.11ac)";
+	else if (ni->ni_flags & IEEE80211_NODE_HT)
+		mode = "HT (802.11n)";
+
+	if (in->in_phyctxt != NULL) {
+		if (in->in_phyctxt->vht_chan_width ==
+		    IEEE80211_VHTOP0_CHAN_WIDTH_160)
+			width = 160;
+		else if (in->in_phyctxt->vht_chan_width ==
+		    IEEE80211_VHTOP0_CHAN_WIDTH_80)
+			width = 80;
+		else if (in->in_phyctxt->sco == IEEE80211_HTOP0_SCO_SCA ||
+		    in->in_phyctxt->sco == IEEE80211_HTOP0_SCO_SCB)
+			width = 40;
+	}
+	if (ni->ni_flags & IEEE80211_NODE_VHT)
+		iwx_vht_centers(ni, &center80, &center160);
+
+	printf("%s: associated on channel %u, %s, %d MHz%s (AP: %s MHz%s)\n",
+	    DEVNAME(sc), ieee80211_chan2ieee(ic, ni->ni_chan), mode, width,
+	    sc->sc_use_mld_api ? ", MLD commands" : "",
+	    center160 != 0 ? "160" : center80 != 0 ? "80"
+	    : (ni->ni_htop0 & IEEE80211_HTOP0_SCO_MASK)
+	    != IEEE80211_HTOP0_SCO_SCN ? "40" : "20",
+	    (ni->ni_flags & IEEE80211_NODE_HECAP) == 0 ? ""
+	    : (ni->ni_he_phy_cap[0]
+	    & IEEE80211_HE_PHYCAP0_CHAN_WIDTH_160_IN_5G) != 0
+	    ? ", HE up to 160 MHz" : ", HE");
 }
 
 int
@@ -9141,17 +9464,7 @@ iwx_run(struct iwx_softc *sc)
 	} else if (ni->ni_flags & IEEE80211_NODE_HT) {
 		uint8_t chains = iwx_mimo_enabled(sc) ? 2 : 1;
 		uint8_t sco, vht_chan_width;
-		if (IEEE80211_CHAN_40MHZ_ALLOWED(in->in_ni.ni_chan) &&
-		    ieee80211_node_supports_ht_chan40(ni))
-			sco = (ni->ni_htop0 & IEEE80211_HTOP0_SCO_MASK);
-		else
-			sco = IEEE80211_HTOP0_SCO_SCN;
-		if ((ni->ni_flags & IEEE80211_NODE_VHT) &&
-		    IEEE80211_CHAN_80MHZ_ALLOWED(in->in_ni.ni_chan) &&
-		    ieee80211_node_supports_vht_chan80(ni))
-			vht_chan_width = IEEE80211_VHTOP0_CHAN_WIDTH_80;
-		else
-			vht_chan_width = IEEE80211_VHTOP0_CHAN_WIDTH_HT;
+		iwx_chan_width(sc, ni, &sco, &vht_chan_width);
 		err = iwx_phy_ctxt_update(sc, in->in_phyctxt,
 		    in->in_phyctxt->channel, chains, chains,
 		    0, sco, vht_chan_width);
@@ -9174,6 +9487,15 @@ iwx_run(struct iwx_softc *sc)
 	if (err) {
 		printf("%s: failed to update MAC\n", DEVNAME(sc));
 		return err;
+	}
+
+	if (sc->sc_use_mld_api) {
+		err = iwx_mld_link_he_params(sc, in);
+		if (err) {
+			printf("%s: could not set the link's HE parameters "
+			    "(error %d)\n", DEVNAME(sc), err);
+			return err;
+		}
 	}
 
 	err = iwx_sf_config(sc, IWX_SF_FULL_ON);
@@ -9236,6 +9558,7 @@ iwx_run(struct iwx_softc *sc)
 		    DEVNAME(sc), err);
 		return err;
 	}
+	iwx_log_association(sc, in);
 
 	return 0;
 }
@@ -10231,8 +10554,7 @@ iwx_init(struct ifnet *ifp)
 		iwx_setup_ht_rates(sc);
 	if (sc->sc_nvm.sku_cap_11ac_enable)
 		iwx_setup_vht_rates(sc);
-	if (IWX_ENABLE_HE_ASSOCIATION && sc->sc_nvm.sku_cap_11ax_enable)
-		iwx_setup_he_rates(sc);
+	iwx_setup_he_rates(sc);
 
 	KASSERT(sc->task_refs.r_refs == 0);
 	refcnt_init(&sc->task_refs);
@@ -12033,6 +12355,10 @@ iwx_preinit(struct iwx_softc *sc)
 	struct ifnet *ifp = IC2IFP(ic);
 	int err;
 
+#ifdef __HAIKU__
+	iwx_haiku_read_settings(sc);
+#endif
+
 	err = iwx_prepare_card_hw(sc);
 	if (err) {
 		printf("%s: could not initialize hardware\n", DEVNAME(sc));
@@ -12077,8 +12403,7 @@ iwx_preinit(struct iwx_softc *sc)
 		iwx_setup_ht_rates(sc);
 	if (sc->sc_nvm.sku_cap_11ac_enable)
 		iwx_setup_vht_rates(sc);
-	if (IWX_ENABLE_HE_ASSOCIATION && sc->sc_nvm.sku_cap_11ax_enable)
-		iwx_setup_he_rates(sc);
+	iwx_setup_he_rates(sc);
 
 	/* not all hardware can do 5GHz band */
 	if (!sc->sc_nvm.sku_cap_band_52GHz_enable)
@@ -12132,6 +12457,9 @@ iwx_find_device_cfg(struct iwx_softc *sc)
 
 	rf_id = IWX_SUBDEVICE_RF_ID(sdev_id);
 	no_160 = IWX_SUBDEVICE_NO_160(sdev_id);
+#ifdef __HAIKU__
+	sc->sc_no_160 = no_160;
+#endif
 	cores = IWX_SUBDEVICE_CORES(sdev_id);
 
 	for (i = nitems(iwx_dev_info_table) - 1; i >= 0; i--) {

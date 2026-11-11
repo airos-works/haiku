@@ -166,6 +166,56 @@ joins Gaspers (WPA2-PSK/CCMP) at 802.11ac with a DHCP address.
 Its Bluetooth half (`8087:0036`, `ibt-0291-0291`) loads its firmware with
 `bt_firmware` as before.
 
+### HE channel width, and HE for the BE200 (2026-11-11, not yet run on hardware)
+
+What the installed driver does was measured on the Framework 13's AX210
+(firmware 77, air/OS hrev60207+2559) against Gaspers on 5 GHz: the HE
+association already runs at 80 MHz (TLC width 2, rates up to HE MCS 11 with two
+streams, about 1 Gbit/s on air). The width of an HE association has always
+followed the AP's HT and VHT operation elements; the "20 MHz" in `STATUS.md`
+described one ROCK 5 association without antennas. TCP throughput to a wired
+machine was 131 Mbit/s down and 163 Mbit/s up with one stream, 217 and
+254 Mbit/s with four (the same test over the laptop's wired port: 580 and
+564 Mbit/s), so the channel width is not what limits it.
+
+The changes below build for x86_64 and arm64 but have **not run on a card**:
+the laptop was in use by its owner and the ROCK 5 was without power.
+
+- **160 MHz for HE.** The driver advertises HE at 160 MHz (unless the card
+  variant has none) and uses it when the AP runs a 160 MHz channel, signalled
+  either way the standard allows, and the regulatory data allows it: PHY
+  context with the control channel position inside the 160 MHz channel, the
+  station's width, and the 160 MHz rates in the TLC configuration. VHT-only
+  associations stay at 80 MHz.
+- **Station width flags.** At 80 MHz the driver set "40 MHz" and "80 MHz"
+  together, which the firmware reads as 160 MHz. It now sends one value.
+- **A deprecated 160 MHz announcement** (width 160 with a single centre) made
+  the driver program an 80 MHz channel with the wrong control channel
+  position. The 80 MHz centre is now derived from the primary channel.
+- **BSS colour flags.** "Partial BSS colour" and "BSS colour disabled" were
+  swapped in the HE station context.
+- **BE200 (Bz family) HE.** With the MLD commands the HE parameters go into
+  `LINK_CONFIG_CMD` (BSS colour, default packet extension, RTS threshold,
+  after the MAC context reports HE) and `STA_CONFIG_CMD` (packet extension
+  thresholds, HTC support, ACK-enabled aggregation, the HE A-MPDU length
+  extension), as Linux's `iwl_mvm_link_changed()` and `iwl_mvm_mld_cfg_sta()`
+  do. HE is no longer withheld from the Bz family. Firmware 83 lists
+  `TLC_MNG_CONFIG_CMD` version 4, which the driver has.
+- **Syslog.** One line per association says what was negotiated and what the
+  AP offers ("associated on channel 157, HE (802.11ax), 80 MHz (AP: 80 MHz,
+  HE)"); the line per rate change, several a second under load, is gone. The
+  driver also says how many 6 GHz channels the regulatory data would allow.
+- **Lab switches** in `~/config/settings/kernel/drivers/iaxwifi200`, read
+  when the interface is brought up: `he 0` (HT/VHT only), `max_width
+  20|40|80|160`, `mld_api 1` (MLD commands on a card that defaults to the
+  older ones).
+
+To test: associate at HE and at VHT (`he 0`) and compare the rate and the
+throughput; on a 160 MHz AP check the association line and the rate; on the
+BE200 expect "HE (802.11ax) ..., MLD commands", DHCP and an HE rate. The
+throughput kit used for the numbers above is in `fw13/tests/wifi-he` of the
+lab workspace.
+
 ## Bluetooth support
 
 | Family | Setup | Card type | Firmware package |
