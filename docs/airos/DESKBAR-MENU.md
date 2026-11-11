@@ -11,7 +11,7 @@ Preferences. Developer came on 2026-10-29, Media on 2026-10-19, after the
 
 | Folder | Entries |
 | --- | --- |
-| Applications | airShot, airTime, Amp, Burrow, DeskCalc, HaikuDepot, Icon-O-Matic, Installer, Kiri, Mail, MediaConverter, MidiPlayer, Pe, People, SoftwareUpdater, SoundRecorder, StyledEdit, Summit, Terminal |
+| Applications | airCal, airShot, airTime, Amp, Burrow, DeskCalc, HaikuDepot, Icon-O-Matic, Installer, Kiri, Mail, MediaConverter, MidiPlayer, Pe, People, SoftwareUpdater, SoundRecorder, StyledEdit, Summit, Terminal |
 | Office | Clipper, WordCraft, GridCraft, DeckCraft, PdfCraft |
 | Media | PhotoCraft, LightCraft |
 | Developer | Code - OSS, Docker Desktop, GitHub Desktop, pgAdmin 4 |
@@ -38,8 +38,8 @@ The menu is the merge of the `data/deskbar/menu` directories listed in
   `build/jam/images/definitions/minimum` and `regular`, turned into links by
   `build/jam/packages/Haiku`. Debugger's entry used to be
   in haiku_devel; it is in the haiku package now, under Utilities.
-- The applications air/OS CI builds (airShot, airTime, Amp, Burrow, Kiri,
-  Summit): each package's own
+- The applications air/OS CI builds (airCal, airShot, airTime, Amp, Burrow,
+  Kiri, Summit): each package's own
   `data/deskbar/menu/Applications/<name>` link. Clipper and the four Craft
   applications supply `data/deskbar/menu/Office/<name>` links, PhotoCraft and
   LightCraft `data/deskbar/menu/Media/<name>` links, and Code - OSS, Docker
