@@ -29,14 +29,18 @@ algorithm 3 to wpa_supplicant (which has SAE and H2E) and takes the PMK back,
 then runs its own four-way handshake with AKM 8. The larger one is SAE in the
 kernel.
 
-**What does the MCC response say about 6 GHz channels? Not known yet.** The
-driver reads the firmware's channel profile for the 59 6 GHz channels
-(`iwx_nvm_channels_uhb`) and throws it away. The branch `wifi-issues` logs the
-count ("the regulatory data allows N of M 6 GHz channels"); it has not run on
-a card. The driver sends no `LARI_CONFIG_CHANGE` and reads no ACPI `_DSM`
+**What does the MCC response say about 6 GHz channels? None are allowed.**
+The firmware's channel profile covers the 59 6 GHz channels
+(`iwx_nvm_channels_uhb`) even for a card the driver's device table does not
+mark as 6 GHz capable, and the driver throws that part away. It now logs the
+count: on the Framework 13's AX210 (firmware 77) the syslog says
+"the regulatory data allows 0 of 59 6 GHz channels", at start and after the
+MCC update. The driver sends no `LARI_CONFIG_CHANGE` and reads no ACPI `_DSM`
 (Linux's "enable 6E" function and the UATS table), so the firmware's defaults
-apply on every machine, PCs included. On FDT boards (ROCK 5) there is no ACPI
-to ask; a driver setting would have to stand in for it.
+apply on every machine, PCs included, and those defaults forbid 6 GHz here.
+Regulatory set-up is therefore a prerequisite too, not a later refinement. On
+FDT boards (ROCK 5) there is no ACPI to ask; a driver setting would have to
+stand in for it.
 
 ## Channel model
 
@@ -75,8 +79,8 @@ same.
 3. PHY context: `iwx_phy_ctxt_cmd_uhb_v3_v4()` exists; it needs the band and
    the width from the HE operation element. The 160 MHz work of the
    `wifi-issues` branch is shared with this.
-4. Regulatory: the log line above first; `LARI_CONFIG_CHANGE` if the defaults
-   turn out to forbid 6 GHz where the owner is.
+4. Regulatory: `LARI_CONFIG_CHANGE` with the ACPI data (or a setting), since
+   the defaults forbid 6 GHz where the owner is.
 
 Test needs: a Wi-Fi 6E or 7 access point, antennas on the ROCK 5, and the
 AX210 (Framework 13) or BE200 (ROCK 5).

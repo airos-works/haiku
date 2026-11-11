@@ -3182,22 +3182,33 @@ iwx_init_channel_map(struct iwx_softc *sc, uint16_t *channel_profile_v3,
 		nvm_channels = iwx_nvm_channels_8000;
 	}
 
+#ifdef __HAIKU__
+	/*
+	 * The firmware may report 6 GHz channels for a card the device table
+	 * does not mark as capable of them (seen on an AX210).
+	 */
+	for (ch_idx = nitems(iwx_nvm_channels_8000);
+	    ch_idx < nitems(iwx_nvm_channels_uhb) && ch_idx < nchan_profile;
+	    ch_idx++) {
+		if (channel_profile_v4)
+			ch_flags = le32_to_cpup(channel_profile_v4 + ch_idx);
+		else
+			ch_flags = le16_to_cpup(channel_profile_v3 + ch_idx);
+		uhb_total++;
+		if (ch_flags & IWX_NVM_CHANNEL_VALID)
+			uhb_valid++;
+	}
+#endif
+
 	for (ch_idx = 0; ch_idx < nchan && ch_idx < nchan_profile; ch_idx++) {
 		if (channel_profile_v4)
 			ch_flags = le32_to_cpup(channel_profile_v4 + ch_idx);
 		else
 			ch_flags = le16_to_cpup(channel_profile_v3 + ch_idx);
 
-		/*
-		 * net80211 cannot handle 6 GHz channel numbers yet; count
-		 * what the regulatory data would allow.
-		 */
-		if (ch_idx >= IWX_NUM_2GHZ_CHANNELS + IWX_NUM_5GHZ_CHANNELS) {
-			uhb_total++;
-			if (ch_flags & IWX_NVM_CHANNEL_VALID)
-				uhb_valid++;
-			continue;
-		}
+		/* net80211 cannot handle 6 GHz channel numbers yet */
+		if (ch_idx >= IWX_NUM_2GHZ_CHANNELS + IWX_NUM_5GHZ_CHANNELS)
+			break;
 
 		is_5ghz = ch_idx >= IWX_NUM_2GHZ_CHANNELS;
 		if (is_5ghz && !data->sku_cap_band_52GHz_enable)
@@ -3245,11 +3256,11 @@ iwx_init_channel_map(struct iwx_softc *sc, uint16_t *channel_profile_v3,
 	}
 
 #ifdef __HAIKU__
-	if (uhb_total != 0 && uhb_valid != sc->sc_uhb_valid_logged) {
+	if (uhb_total != 0 && uhb_valid + 1 != sc->sc_uhb_valid_logged) {
 		printf("%s: the regulatory data allows %d of %d 6 GHz "
 		    "channels (not used: no 6 GHz support yet)\n",
 		    DEVNAME(sc), uhb_valid, uhb_total);
-		sc->sc_uhb_valid_logged = uhb_valid;
+		sc->sc_uhb_valid_logged = uhb_valid + 1;
 	}
 #endif
 
@@ -3470,6 +3481,8 @@ iwx_chan_width(struct iwx_softc *sc, struct ieee80211_node *ni, uint8_t *sco,
  * HT/VHT only, "max_width 20|40|80|160" limits the channel width, and
  * "mld_api 1" uses the MLD firmware commands on cards that default to the
  * older ones. They are read each time the interface is brought up.
+ * "max_width" narrows this side only: the AP is not told and keeps sending at
+ * its own width, so the download rate collapses below the AP's width.
  */
 void
 iwx_haiku_read_settings(struct iwx_softc *sc)
@@ -5550,7 +5563,6 @@ iwx_rx_mpdu_mq(struct iwx_softc *sc, struct mbuf *m, void *pktdata,
 		m_freem(m);
 		return; /* drop */
 	}
-
 	len = le16toh(desc->mpdu_len);
 	if (ic->ic_opmode == IEEE80211_M_MONITOR) {
 		/* Allow control frames in monitor mode. */

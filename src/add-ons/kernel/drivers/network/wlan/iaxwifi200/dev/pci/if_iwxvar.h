@@ -772,7 +772,7 @@ struct iwx_softc {
 	int sc_mld_api_forced;	/* "mld_api 1": MLD commands on any device */
 	int sc_he_capable;	/* NVM and firmware allow HE */
 	int sc_no_160;		/* the device variant has no 160 MHz */
-	int sc_uhb_valid_logged;	/* 6 GHz channel count last logged */
+	int sc_uhb_valid_logged;	/* 6 GHz channel count last logged, plus 1 */
 #endif
 
 	int sc_intmask;
