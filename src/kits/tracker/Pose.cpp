@@ -88,7 +88,9 @@ BPose::BPose(Model* model, BPoseView* view, uint32 clipboardMode, bool selected)
 	fWasAutoPlaced(false),
 	fBrokenSymLink(false),
 	fBackgroundClean(false),
-	fTagsRead(false)
+	fTagsRead(false),
+	fGroupBy(0),
+	fGroupOrder(0)
 {
 	CreateWidgets(view);
 

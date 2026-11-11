@@ -2443,6 +2443,32 @@ BContainerWindow::AddWindowMenu(BMenu* menu)
 		new BMessage(kToggleFolderSizes));
 	item->SetTarget(PoseView());
 	menu->AddItem(item);
+	BMenu* groupMenu = new BMenu(B_TRANSLATE("Group by"));
+	struct {
+		const char*	label;
+		const char*	attr;
+		uint32		type;
+	} groups[] = {
+		{ B_TRANSLATE("None"), NULL, 0 },
+		{ B_TRANSLATE("Kind"), kAttrMIMEType, B_MIME_STRING_TYPE },
+		{ B_TRANSLATE("Name"), kAttrStatName, B_STRING_TYPE },
+		{ B_TRANSLATE("Modified"), kAttrStatModified, B_TIME_TYPE },
+		{ B_TRANSLATE("Created"), kAttrStatCreated, B_TIME_TYPE },
+		{ B_TRANSLATE("Size"), kAttrStatSize, B_OFF_T_TYPE },
+		{ B_TRANSLATE("Tags"), kAttrTags, B_STRING_TYPE }
+	};
+	for (size_t i = 0; i < sizeof(groups) / sizeof(groups[0]); i++) {
+		BMessage* message = new BMessage(kGroupBy);
+		message->AddInt32("attr_hash", groups[i].attr == NULL ? 0
+			: (int32)AttrHashString(groups[i].attr, groups[i].type));
+		BMenuItem* groupItem = new BMenuItem(groups[i].label, message);
+		groupItem->SetTarget(PoseView());
+		groupMenu->AddItem(groupItem);
+		if (i == 0)
+			groupMenu->AddSeparatorItem();
+	}
+	menu->AddItem(groupMenu);
+
 	if (_CanHavePanes()) {
 		item = new BMenuItem(B_TRANSLATE("Show sidebar"),
 			new BMessage(kToggleSidebar), 'S', B_SHIFT_KEY);
@@ -3645,6 +3671,18 @@ BContainerWindow::UpdateWindowMenuOrWindowContextMenu(BMenu* menu, MenuContext c
 	BMenuItem* hiddenItem = menu->FindItem(kToggleHiddenFiles);
 	if (hiddenItem != NULL)
 		hiddenItem->SetMarked(!TrackerSettings().HideDotFiles());
+
+	BMenuItem* groupItem = menu->FindItem(B_TRANSLATE("Group by"));
+	if (groupItem != NULL && groupItem->Submenu() != NULL) {
+		BMenu* groupMenu = groupItem->Submenu();
+		for (int32 i = 0; i < groupMenu->CountItems(); i++) {
+			BMenuItem* item = groupMenu->ItemAt(i);
+			if (item->Message() != NULL) {
+				item->SetMarked((uint32)item->Message()->GetInt32("attr_hash",
+					0) == PoseView()->GroupBy());
+			}
+		}
+	}
 
 	BMenuItem* sidebarItem = menu->FindItem(kToggleSidebar);
 	if (sidebarItem != NULL)

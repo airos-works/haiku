@@ -1005,6 +1005,24 @@ IconCache::Preload(AutoLock<SimpleIconCache>* nodeCacheLocker,
 					entry = GetNodeIcon(&modelOpener, nodeCacheLocker,
 						&resultingOpenCache, model, source, mode,
 						size, &lazyBitmap, entry, permanent);
+					if (entry == NULL) {
+						// no thumbnail (yet, or at this size): the type's
+						// icon rather than the generic one
+						if (resultingOpenCache != NULL)
+							resultingOpenCache->Unlock();
+						modelOpener.OpenNode();
+						resultingOpenCache = sharedCacheLocker;
+						resultingOpenCache->Lock();
+						IconSource typeSource = kUnknownSource;
+						entry = GetIconFromFileTypes(&modelOpener, typeSource,
+							mode, size, &lazyBitmap, 0);
+						if (entry == NULL) {
+							entry = GetGenericIcon(sharedCacheLocker,
+								&resultingOpenCache, model, typeSource, mode,
+								size, &lazyBitmap, entry);
+						}
+						break;
+					}
 					if (entry != NULL) {
 						entry = IconCacheEntry::ResolveIfAlias(&fSharedCache,
 							entry);

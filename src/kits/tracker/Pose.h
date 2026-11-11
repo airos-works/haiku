@@ -100,7 +100,15 @@ public:
 		BPoint poseLoc, BPoseView* view, bool visible);
 	bool UpdateVolumeSpaceBar(BVolume* volume);
 	void UpdateIcon(BPoint poseLoc, BPoseView*);
-	void TagsChanged() { fTagsRead = false; }
+	void TagsChanged() { fTagsRead = false; fGroupBy = 0; }
+
+	// the group the item is shown in, worked out by the pose view
+	bool HasGroup(uint32 groupBy) const { return fGroupBy == groupBy; }
+	void SetGroup(uint32 groupBy, int64 order, const BString& label)
+		{ fGroupBy = groupBy; fGroupOrder = order; fGroupLabel = label; }
+	void InvalidateGroup() { fGroupBy = 0; }
+	int64 GroupOrder() const { return fGroupOrder; }
+	const BString& GroupLabel() const { return fGroupLabel; }
 	const BStringList& Tags();
 		// the item's tags, read the first time they are drawn
 
@@ -162,6 +170,9 @@ private:
 	bool fBackgroundClean : 1;
 	bool fTagsRead : 1;
 	BStringList fTags;
+	uint32 fGroupBy;
+	int64 fGroupOrder;
+	BString fGroupLabel;
 };
 
 

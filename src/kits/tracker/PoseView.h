@@ -53,6 +53,8 @@ All rights reserved.
 
 #include <ColorConversion.h>
 #include <Directory.h>
+
+#include <vector>
 #include <FilePanel.h>
 #include <HashSet.h>
 #include <MessageRunner.h>
@@ -172,6 +174,18 @@ public:
 	void SetDropEnabled(bool);
 	void SetSelectionRectEnabled(bool);
 	void SetAlwaysAutoPlace(bool);
+
+	// items shown in groups by kind, date, size, name or tags
+	uint32 GroupBy() const;
+	void SetGroupBy(uint32 attrHash);
+
+private:
+	void _DrawGroupHeaders(const BRect& updateRect);
+	void _DrawListGroupStart(BPose* pose, float top);
+
+public:
+	int CompareGroups(BPose* first, BPose* second);
+	const BString& GroupLabelOf(BPose* pose);
 
 	// list views that show how big folders are
 	bool ShowsFolderSizes() const;
@@ -879,6 +893,13 @@ private:
 	bool fAlwaysAutoPlace : 1;
 	bool fArrangePending : 1;
 	uint32 fModeBeforeSearch;
+
+	struct GroupHeader {
+		BString	label;
+		float	top;
+	};
+	std::vector<GroupHeader> fGroupHeaders;
+		// where arranged icon views put the group names
 	bool fAllowPoseEditing : 1;
 	bool fSelectionChangedHook : 1;
 		// get rid of this

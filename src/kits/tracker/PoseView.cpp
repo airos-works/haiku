@@ -2791,6 +2791,10 @@ BPoseView::MessageReceived(BMessage* message)
 			SetKeepArranged(!fViewState->KeepArranged());
 			break;
 
+		case kGroupBy:
+			SetGroupBy((uint32)message->GetInt32("attr_hash", 0));
+			break;
+
 		case kToggleFolderSizes:
 			SetShowFolderSizes(!fViewState->ShowFolderSizes());
 			break;
@@ -3836,6 +3840,167 @@ BPoseView::Cleanup(bool doAll)
 }
 
 
+uint32
+BPoseView::GroupBy() const
+{
+	return fViewState->GroupBy();
+}
+
+
+void
+BPoseView::SetGroupBy(uint32 attrHash)
+{
+	if (attrHash == GroupBy())
+		attrHash = 0;
+	fViewState->SetGroupBy(attrHash);
+
+	for (int32 index = 0; index < fPoseList->CountItems(); index++)
+		fPoseList->ItemAt(index)->InvalidateGroup();
+	fGroupHeaders.clear();
+
+	if (ViewMode() == kListMode) {
+		SortPoses();
+		Invalidate();
+	} else if (KeepArranged())
+		ArrangePoses();
+	else
+		Invalidate();
+}
+
+
+static int64
+StartOfDay(time_t when)
+{
+	struct tm moment;
+	localtime_r(&when, &moment);
+	moment.tm_hour = 0;
+	moment.tm_min = 0;
+	moment.tm_sec = 0;
+	return mktime(&moment);
+}
+
+
+const BString&
+BPoseView::GroupLabelOf(BPose* pose)
+{
+	uint32 groupBy = GroupBy();
+	if (pose->HasGroup(groupBy))
+		return pose->GroupLabel();
+
+	Model* model = pose->TargetModel();
+	BString label;
+	int64 order = 1;
+
+	if (groupBy == AttrHashString(kAttrMIMEType, B_MIME_STRING_TYPE)) {
+		if (model->IsDirectory()) {
+			label = B_TRANSLATE("Folders");
+			order = 0;
+		} else {
+			BMimeType type(model->MimeType());
+			char description[B_MIME_TYPE_LENGTH];
+			if (type.GetShortDescription(description) == B_OK)
+				label = description;
+			else
+				label = model->MimeType();
+		}
+	} else if (groupBy == AttrHashString(kAttrStatName, B_STRING_TYPE)) {
+		BString name(model->Name());
+		const unsigned char first = (unsigned char)name[0];
+		if (first >= '0' && first <= '9') {
+			label = "0" B_UTF8_ELLIPSIS "9";
+			order = 0;
+		} else if (first < 0x80 && !isalpha(first)) {
+			label = "#";
+			order = 2;
+		} else {
+			// the first character, as a capital
+			name.CopyCharsInto(label, 0, 1);
+			label.ToUpper();
+		}
+	} else if (groupBy == AttrHashString(kAttrStatModified, B_TIME_TYPE)
+		|| groupBy == AttrHashString(kAttrStatCreated, B_TIME_TYPE)) {
+		// newest first: today, yesterday, the last seven and thirty days,
+		// then by month
+		time_t when = groupBy == AttrHashString(kAttrStatModified, B_TIME_TYPE)
+			? model->StatBuf()->st_mtime : model->StatBuf()->st_crtime;
+		int64 today = StartOfDay(time(NULL));
+		int64 day = 24 * 60 * 60;
+		if (when >= today + day) {
+			label = B_TRANSLATE("In the future");
+			order = INT64_MIN;
+		} else if (when >= today) {
+			label = B_TRANSLATE("Today");
+			order = -today;
+		} else if (when >= today - day) {
+			label = B_TRANSLATE("Yesterday");
+			order = -(today - day);
+		} else if (when >= today - 7 * day) {
+			label = B_TRANSLATE("Previous 7 days");
+			order = -(today - 7 * day);
+		} else if (when >= today - 30 * day) {
+			label = B_TRANSLATE("Previous 30 days");
+			order = -(today - 30 * day);
+		} else {
+			struct tm moment;
+			localtime_r(&when, &moment);
+			char month[64];
+			strftime(month, sizeof(month), "%B %Y", &moment);
+			label = month;
+			moment.tm_mday = 1;
+			moment.tm_hour = moment.tm_min = moment.tm_sec = 0;
+			order = -(int64)mktime(&moment);
+		}
+	} else if (groupBy == AttrHashString(kAttrStatSize, B_OFF_T_TYPE)) {
+		off_t size = model->StatBuf()->st_size;
+		if (model->IsDirectory()) {
+			label = B_TRANSLATE("Folders");
+			order = 0;
+		} else if (size == 0) {
+			label = B_TRANSLATE("Empty");
+			order = 1;
+		} else if (size < 16 * 1024) {
+			label = B_TRANSLATE("Tiny (under 16 KiB)");
+			order = 2;
+		} else if (size < 1024 * 1024) {
+			label = B_TRANSLATE("Small (under 1 MiB)");
+			order = 3;
+		} else if (size < 128 * 1024 * 1024) {
+			label = B_TRANSLATE("Medium (under 128 MiB)");
+			order = 4;
+		} else if (size < 1024LL * 1024 * 1024) {
+			label = B_TRANSLATE("Large (under 1 GiB)");
+			order = 5;
+		} else {
+			label = B_TRANSLATE("Huge (1 GiB or more)");
+			order = 6;
+		}
+	} else if (groupBy == AttrHashString(kAttrTags, B_STRING_TYPE)) {
+		const BStringList& tags = pose->Tags();
+		if (tags.IsEmpty()) {
+			label = B_TRANSLATE("No tags");
+			order = 1;
+		} else {
+			label = tags.StringAt(0);
+			order = 0;
+		}
+	}
+
+	pose->SetGroup(groupBy, order, label);
+	return pose->GroupLabel();
+}
+
+
+int
+BPoseView::CompareGroups(BPose* first, BPose* second)
+{
+	const BString& firstLabel = GroupLabelOf(first);
+	const BString& secondLabel = GroupLabelOf(second);
+	if (first->GroupOrder() != second->GroupOrder())
+		return first->GroupOrder() < second->GroupOrder() ? -1 : 1;
+	return NaturalCompare(firstLabel.String(), secondLabel.String());
+}
+
+
 bool
 BPoseView::ShowsFolderSizes() const
 {
@@ -3898,7 +4063,7 @@ bool
 BPoseView::KeepArranged() const
 {
 	return ViewMode() != kListMode && !IsDesktopView()
-		&& fViewState->KeepArranged();
+		&& (fViewState->KeepArranged() || fViewState->GroupBy() != 0);
 }
 
 
@@ -3940,12 +4105,53 @@ BPoseView::ArrangePoses()
 	fHintLocation = PinToGrid(fOffset, fGrid, fOffset);
 
 	fVSPoseList->MakeEmpty();
+	fGroupHeaders.clear();
 	int32 poseCount = fPoseList->CountItems();
-	for (int32 index = 0; index < poseCount; index++) {
-		BPose* pose = fPoseList->ItemAt(index);
-		PlacePose(pose, viewBounds);
-		pose->SetAutoPlaced(false);
-		AddToVSList(pose);
+	if (GroupBy() != 0) {
+		// each group starts a row under its name
+		font_height fontHeight;
+		be_bold_font->GetHeight(&fontHeight);
+		float headerHeight = ceilf((fontHeight.ascent + fontHeight.descent)
+			* 1.8f);
+		float y = fOffset.y;
+		float x = fOffset.x;
+		bool rowEmpty = true;
+		const BString* currentGroup = NULL;
+		for (int32 index = 0; index < poseCount; index++) {
+			BPose* pose = fPoseList->ItemAt(index);
+			const BString& group = GroupLabelOf(pose);
+			if (currentGroup == NULL || group != *currentGroup) {
+				if (!rowEmpty)
+					y += fGrid.y;
+				GroupHeader header;
+				header.label = group;
+				header.top = std::max(4.0f, y - fOffset.y / 2);
+				fGroupHeaders.push_back(header);
+				y += headerHeight;
+				x = fOffset.x;
+				rowEmpty = true;
+				currentGroup = &group;
+			}
+
+			pose->SetLocation(BPoint(x, y), this);
+			BRect rect(pose->CalcRect(this));
+			if (!rowEmpty && rect.right > viewBounds.right) {
+				x = fOffset.x;
+				y += fGrid.y;
+				pose->SetLocation(BPoint(x, y), this);
+			}
+			x += fGrid.x;
+			rowEmpty = false;
+			pose->SetAutoPlaced(false);
+			AddToVSList(pose);
+		}
+	} else {
+		for (int32 index = 0; index < poseCount; index++) {
+			BPose* pose = fPoseList->ItemAt(index);
+			PlacePose(pose, viewBounds);
+			pose->SetAutoPlaced(false);
+			AddToVSList(pose);
+		}
 	}
 
 	ClearExtent();
@@ -10226,6 +10432,12 @@ BPoseView::DrawViewCommon(const BRect& updateRect)
 			if (updateRect.Intersects(poseRect))
 				pose->Draw(poseRect, updateRect, this, true);
 
+			if (GroupBy() != 0 && (index == 0
+					|| GroupLabelOf(poseList->ItemAt(index - 1))
+						!= GroupLabelOf(pose))) {
+				_DrawListGroupStart(pose, location.y);
+			}
+
 			location.y += fListElemHeight;
 			if (location.y >= updateRect.bottom)
 				break;
@@ -10243,7 +10455,77 @@ BPoseView::DrawViewCommon(const BRect& updateRect)
 			if (pose->Location(this).y > updateRect.bottom)
 				break;
 		}
+
+		if (GroupBy() != 0 && KeepArranged())
+			_DrawGroupHeaders(updateRect);
 	}
+}
+
+
+void
+BPoseView::_DrawGroupHeaders(const BRect& updateRect)
+{
+	// the group names above their rows, with a line to the right
+	font_height fontHeight;
+	be_bold_font->GetHeight(&fontHeight);
+	rgb_color text = ui_color(B_DOCUMENT_TEXT_COLOR);
+	rgb_color dim = tint_color(text, text.IsDark() ? B_LIGHTEN_1_TINT
+		: B_DARKEN_1_TINT);
+	BRect bounds(Bounds());
+
+	PushState();
+	SetFont(be_bold_font);
+	for (size_t i = 0; i < fGroupHeaders.size(); i++) {
+		float top = fGroupHeaders[i].top;
+		float baseline = top + ceilf(fontHeight.ascent);
+		BRect area(bounds.left, top, bounds.right,
+			baseline + fontHeight.descent);
+		if (!area.Intersects(updateRect))
+			continue;
+
+		float left = std::max(fOffset.x / 2, 4.0f);
+		SetHighColor(dim);
+		DrawString(fGroupHeaders[i].label.String(), BPoint(left, baseline));
+		float lineLeft = left + StringWidth(fGroupHeaders[i].label.String())
+			+ std::max(fOffset.x / 2, 8.0f);
+		float lineY = floorf(top + (fontHeight.ascent + fontHeight.descent) / 2);
+		SetHighColor(tint_color(LowColor(), B_DARKEN_2_TINT));
+		StrokeLine(BPoint(lineLeft, lineY), BPoint(bounds.right - left, lineY));
+	}
+	PopState();
+}
+
+
+void
+BPoseView::_DrawListGroupStart(BPose* pose, float top)
+{
+	// a line over the first item of a group, its name at the right where
+	// the columns leave room
+	BRect bounds(Bounds());
+	PushState();
+	SetHighColor(tint_color(LowColor(), B_DARKEN_3_TINT));
+	StrokeLine(BPoint(bounds.left, top), BPoint(bounds.right, top));
+
+	BColumn* last = LastColumn();
+	float columnsRight = last != NULL ? last->Offset() + last->Width()
+		+ fListOffset : 0;
+	const BString& label = GroupLabelOf(pose);
+	BFont font(be_bold_font);
+	font.SetSize(be_plain_font->Size() * 0.85f);
+	SetFont(&font);
+	float width = StringWidth(label.String());
+	float spacing = be_control_look->DefaultLabelSpacing();
+	if (bounds.right - columnsRight > width + 2 * spacing) {
+		font_height fontHeight;
+		font.GetHeight(&fontHeight);
+		rgb_color text = ui_color(B_DOCUMENT_TEXT_COLOR);
+		SetHighColor(tint_color(text, text.IsDark() ? B_LIGHTEN_1_TINT
+			: B_DARKEN_1_TINT));
+		DrawString(label.String(), BPoint(bounds.right - width - spacing,
+			top + ceilf((fListElemHeight + fontHeight.ascent
+				- fontHeight.descent) / 2)));
+	}
+	PopState();
 }
 
 
@@ -10358,6 +10640,9 @@ BPoseView::CheckPoseSortOrder(BPose* pose, int32 oldIndex)
 void
 BPoseView::_CheckPoseSortOrder(PoseList* poseList, BPose* pose, int32 oldIndex)
 {
+	// what changed may have moved it to another group
+	pose->InvalidateGroup();
+
 	if (ViewMode() != kListMode) {
 		if (KeepArranged())
 			ScheduleArrange();
@@ -10401,6 +10686,14 @@ static int
 PoseCompareAddWidget(const BPose* p1, const BPose* p2, BPoseView* view)
 {
 	// pose comparison and lazy text widget adding
+
+	if (view->GroupBy() != 0) {
+		// the groups come first, each in itself sorted
+		int groups = view->CompareGroups(const_cast<BPose*>(p1),
+			const_cast<BPose*>(p2));
+		if (groups != 0)
+			return groups;
+	}
 
 	uint32 sort = view->PrimarySort();
 	BColumn* column = view->ColumnFor(sort);

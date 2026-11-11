@@ -96,6 +96,7 @@ const uint32 kCleanupAll = 'Tcla';
 const uint32 kArrangeBy = 'ARBY';
 const uint32 kArrangeReverseOrder = 'ARRO';
 const uint32 kKeepArranged = 'ARKA';
+const uint32 kGroupBy = 'GRBY';
 const uint32 kToggleFolderSizes = 'Ttfs';
 const uint32 kArrangePoses = 'ARPS';
 

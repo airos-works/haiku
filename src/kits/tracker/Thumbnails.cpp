@@ -444,6 +444,11 @@ GetThumbnailFromAttr(Model* model, BBitmap* icon, BSize size)
 	if (node == NULL)
 		return B_BAD_VALUE;
 
+	// a page or a frame says nothing at mini icon size: the type's icon does
+	if (!IsImageType(model->MimeType()) && size.IntegerWidth() + 1 < 32)
+		return B_NOT_SUPPORTED;
+
+
 	// look for a thumbnail in an attribute
 	time_t modtime;
 	int64_t thumbnailCreated;
