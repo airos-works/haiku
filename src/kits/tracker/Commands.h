@@ -107,7 +107,6 @@ const uint32 kNewFolderWithSelection = 'Tnfs';
 const uint32 kToggleHiddenFiles = 'Ttgh';
 const uint32 kToggleDetailsPane = 'Ttdp';
 const uint32 kToggleSidebar = 'Ttsb';
-const uint32 kSizePanes = 'Tszp';
 const uint32 kOpenInNewTab = 'Tont';
 const uint32 kNextTab = 'Tnxt';
 const uint32 kPreviousTab = 'Tprv';

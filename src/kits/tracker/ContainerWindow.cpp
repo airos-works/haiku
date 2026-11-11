@@ -77,6 +77,7 @@ All rights reserved.
 #include "CountView.h"
 #include "DeskWindow.h"
 #include "DetailsPane.h"
+#include "PaneSplitView.h"
 #include "SidebarView.h"
 #include "TabBarView.h"
 #include "DraggableContainerIcon.h"
@@ -459,7 +460,7 @@ BContainerWindow::BContainerWindow(LockingList<BWindow>* list, uint32 openFlags,
 		fRootLayout->AddView(fMenuContainer);
 
 		// the folder, and the panes beside it
-		fSplitView = new BSplitView(B_HORIZONTAL, 0);
+		fSplitView = new PaneSplitView();
 		fRootLayout->AddView(fSplitView);
 
 		fPoseContainer = new BGridView(0.0, 0.0);
@@ -633,12 +634,16 @@ BContainerWindow::Quit()
 	if (StateNeedsSaving())
 		SaveState();
 
-	if (fDetailsPane != NULL && !fDetailsPane->IsHidden()) {
+	// QuitRequested() hid the window, which hides every view in it: only
+	// the panes' own state says whether they are shown
+	if (fDetailsPane != NULL && !fDetailsPane->IsHidden(fDetailsPane)) {
 		TrackerSettings().SetDetailsPaneWidth(
-			(int32)fDetailsPane->Frame().Width());
+			(int32)fSplitView->PaneWidth(fDetailsPane));
 	}
-	if (fSidebar != NULL && !fSidebar->IsHidden())
-		TrackerSettings().SetSidebarWidth((int32)fSidebar->Frame().Width());
+	if (fSidebar != NULL && !fSidebar->IsHidden(fSidebar)) {
+		TrackerSettings().SetSidebarWidth(
+			(int32)fSplitView->PaneWidth(fSidebar));
+	}
 
 	if (fWindowList != NULL && windowCount == 0)
 		be_app->PostMessage(B_QUIT_REQUESTED);
@@ -1319,59 +1324,22 @@ BContainerWindow::ShowSidebar(bool show)
 		int32 width = TrackerSettings().SidebarWidth();
 		if (width > 50)
 			fSidebar->SetExplicitPreferredSize(BSize(width, B_SIZE_UNSET));
+		fSplitView->SetPaneWidth(fSidebar, width > 50
+			? width : be_plain_font->StringWidth("M") * 13);
 		fSplitView->AddChild(0, fSidebar, 0.0f);
 		fSidebar->SetCurrent(TargetModel()->EntryRef());
-		PostMessage(kSizePanes);
 		return;
 	}
 
 	if (fSidebar == NULL)
 		return;
 
-	if (show && fSidebar->IsHidden()) {
+	if (show && fSidebar->IsHidden())
 		fSidebar->Show();
-		PostMessage(kSizePanes);
-	} else if (!show && !fSidebar->IsHidden()) {
-		TrackerSettings().SetSidebarWidth((int32)fSidebar->Frame().Width());
+	else if (!show && !fSidebar->IsHidden()) {
+		TrackerSettings().SetSidebarWidth(
+			(int32)fSplitView->PaneWidth(fSidebar));
 		fSidebar->Hide();
-		PostMessage(kSizePanes);
-	}
-}
-
-
-void
-BContainerWindow::_SizePanes(bool keepCurrentWidths)
-{
-	// The split view shares the width out by weight: weights that give the
-	// panes their width (the one they had last time, or now when the
-	// window is resized) and the folder the rest.
-	float total = std::max(fSplitView->Bounds().Width(), 300.0f);
-	float unit = be_plain_font->StringWidth("M");
-	float sidebar = 0;
-	float details = 0;
-	if (fSidebar != NULL && !fSidebar->IsHidden()) {
-		int32 saved = TrackerSettings().SidebarWidth();
-		sidebar = keepCurrentWidths ? fSidebar->Frame().Width()
-			: saved > 50 ? saved : unit * 13;
-	}
-	if (fDetailsPane != NULL && !fDetailsPane->IsHidden()) {
-		int32 saved = TrackerSettings().DetailsPaneWidth();
-		details = keepCurrentWidths ? fDetailsPane->Frame().Width()
-			: saved > 50 ? saved : unit * 20;
-	}
-	float folder = std::max(total - sidebar - details, total / 3);
-
-	for (int32 index = 0; index < fSplitView->CountItems(); index++) {
-		// layout order, which is not the order the views were added in
-		BLayoutItem* item = fSplitView->GetLayout()->ItemAt(index);
-		BView* view = item != NULL ? item->View() : NULL;
-		float weight = folder;
-		if (view == fSidebar)
-			weight = sidebar;
-		else if (view == fDetailsPane)
-			weight = details;
-		fSplitView->SetItemWeight(index, std::max(weight, 1.0f) / total,
-			index == fSplitView->CountItems() - 1);
 	}
 }
 
@@ -1387,9 +1355,10 @@ BContainerWindow::ShowDetailsPane(bool show)
 		int32 width = TrackerSettings().DetailsPaneWidth();
 		if (width > 50)
 			fDetailsPane->SetExplicitPreferredSize(BSize(width, B_SIZE_UNSET));
+		fSplitView->SetPaneWidth(fDetailsPane, width > 50
+			? width : be_plain_font->StringWidth("M") * 20);
 		fSplitView->AddChild(fDetailsPane, 0.0f);
 		fDetailsPane->Update(PoseView(), true);
-		PostMessage(kSizePanes);
 		return;
 	}
 
@@ -1399,12 +1368,10 @@ BContainerWindow::ShowDetailsPane(bool show)
 	if (show && fDetailsPane->IsHidden()) {
 		fDetailsPane->Show();
 		fDetailsPane->Update(PoseView(), true);
-		PostMessage(kSizePanes);
 	} else if (!show && !fDetailsPane->IsHidden()) {
 		TrackerSettings().SetDetailsPaneWidth(
-			(int32)fDetailsPane->Frame().Width());
+			(int32)fSplitView->PaneWidth(fDetailsPane));
 		fDetailsPane->Hide();
-		PostMessage(kSizePanes);
 	}
 }
 
@@ -1735,12 +1702,6 @@ BContainerWindow::FrameResized(float, float)
 
 		PoseView()->UpdateScrollRange();
 		PoseView()->ResetPosePlacementHint();
-	}
-
-	if ((fSidebar != NULL || fDetailsPane != NULL)
-		&& Bounds().Width() != fPreviousBounds.Width()) {
-		// the panes keep their width, the folder grows or shrinks
-		_SizePanes(true);
 	}
 
 	if (PoseView() != NULL && PoseView()->KeepArranged()
@@ -2188,11 +2149,6 @@ BContainerWindow::MessageReceived(BMessage* message)
 
 		case kUseViewForNewFolders:
 			_UseViewForNewFolders();
-			break;
-
-		case kSizePanes:
-			if (fSplitView != NULL)
-				_SizePanes();
 			break;
 
 		case kToggleSidebar:

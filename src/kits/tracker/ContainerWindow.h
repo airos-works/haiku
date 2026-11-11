@@ -52,7 +52,6 @@ class BGroupView;
 class BPopUpMenu;
 class BMenuBar;
 class BMessageRunner;
-class BSplitView;
 
 namespace BPrivate {
 
@@ -66,6 +65,7 @@ class Model;
 class ModelNodeLazyOpener;
 class BorderedView;
 class DetailsPane;
+class PaneSplitView;
 class SidebarView;
 class TabBarView;
 class SelectionWindow;
@@ -372,7 +372,7 @@ private:
 	bool fSaveStateIsEnabled;
 	bool fIsWatchingPath;
 	BMessageRunner* fStateSaveRunner;
-	BSplitView* fSplitView;
+	PaneSplitView* fSplitView;
 	DetailsPane* fDetailsPane;
 	SidebarView* fSidebar;
 
@@ -396,7 +396,6 @@ private:
 	void _UpdateUndoItems(BMenu* menu);
 	void _AddNavigatorView();
 	bool _CanHavePanes() const;
-	void _SizePanes(bool keepCurrentWidths = false);
 	bool _CanHaveTabs() const;
 	void _SelectTab(int32 index);
 	void _CloseTab(int32 index);
