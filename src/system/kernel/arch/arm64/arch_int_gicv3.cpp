@@ -8,6 +8,7 @@
 #include "arch_int_gicv3_its.h"
 #include "arch_int_gicv3_its_generic.h"
 
+#include "cpu.h"
 #include "debug.h"
 #include "gicv3_regs.h"
 #include "smp.h"

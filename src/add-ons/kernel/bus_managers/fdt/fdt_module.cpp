@@ -287,6 +287,31 @@ fdt_bus_node_by_phandle(fdt_bus* bus, int phandle)
 //#pragma mark device
 
 
+/*!	The FDT node offset of a device; every device node this module publishes
+	has the "fdt/node" attribute (fdt_register_node()).
+*/
+static uint32
+fdt_device_node(fdt_device* dev)
+{
+	uint32 fdtNode = 0;
+	if (gDeviceManager->get_attr_uint32(dev->node, "fdt/node", &fdtNode, false)
+			< B_OK) {
+		panic("fdt: device node %p without fdt/node", dev->node);
+	}
+	return fdtNode;
+}
+
+
+static fdt_bus*
+fdt_device_bus(fdt_device* dev)
+{
+	fdt_bus* bus = NULL;
+	if (gDeviceManager->get_driver(dev->bus, NULL, (void**)&bus) < B_OK)
+		panic("fdt: device %p without bus driver", dev);
+	return bus;
+}
+
+
 static status_t
 fdt_device_std_ops(int32 op, ...)
 {
@@ -314,10 +339,12 @@ fdt_device_init_driver(device_node* node, void** cookie)
 	// get bus from parent node
 	DeviceNodePutter<&gDeviceManager> parent(
 		gDeviceManager->get_parent_node(node));
-	driver_module_info* parentModule;
-	void* parentDev;
-	ASSERT(gDeviceManager->get_driver(
-		parent.Get(), &parentModule, &parentDev) >= B_OK);
+	driver_module_info* parentModule = NULL;
+	void* parentDev = NULL;
+	if (gDeviceManager->get_driver(parent.Get(), &parentModule, &parentDev)
+			< B_OK) {
+		panic("fdt: parent node without driver");
+	}
 	if (parentModule == (driver_module_info*)&gDeviceModule)
 		dev->bus = ((fdt_device*)parentDev)->bus;
 	else if (parentModule == (driver_module_info*)&gBusModule)
@@ -359,9 +386,7 @@ fdt_device_get_name(fdt_device* dev)
 {
 	ASSERT(dev != NULL);
 
-	uint32 fdtNode;
-	ASSERT(gDeviceManager->get_attr_uint32(
-		dev->node, "fdt/node", &fdtNode, false) >= B_OK);
+	uint32 fdtNode = fdt_device_node(dev);
 
 	return fdt_get_name(gFDT, (int)fdtNode, NULL);
 }
@@ -372,9 +397,7 @@ fdt_device_get_prop(fdt_device* dev, const char* name, int* len)
 {
 	ASSERT(dev != NULL);
 
-	uint32 fdtNode;
-	ASSERT(gDeviceManager->get_attr_uint32(
-		dev->node, "fdt/node", &fdtNode, false) >= B_OK);
+	uint32 fdtNode = fdt_device_node(dev);
 
 	return fdt_getprop(gFDT, (int)fdtNode, name, len);
 }
@@ -490,9 +513,7 @@ fdt_device_get_reg(fdt_device* dev, uint32 ord, uint64* regs, uint64* len)
 {
 	ASSERT(dev != NULL);
 
-	uint32 fdtNode;
-	ASSERT(gDeviceManager->get_attr_uint32(
-		dev->node, "fdt/node", &fdtNode, false) >= B_OK);
+	uint32 fdtNode = fdt_device_node(dev);
 
 	int propLen;
 	const void* prop = fdt_getprop(gFDT, (int)fdtNode, "reg", &propLen);
@@ -579,9 +600,7 @@ fdt_device_get_interrupt(fdt_device* dev, uint32 index,
 	if (interruptController != NULL)
 		*interruptController = NULL;
 
-	uint32 fdtNode;
-	ASSERT(gDeviceManager->get_attr_uint32(
-		dev->node, "fdt/node", &fdtNode, false) >= B_OK);
+	uint32 fdtNode = fdt_device_node(dev);
 
 	int propLen;
 	const uint32 *prop = (uint32*)fdt_getprop(gFDT, (int)fdtNode, "interrupts-extended",
@@ -605,8 +624,7 @@ fdt_device_get_interrupt(fdt_device* dev, uint32 index,
 			*interrupt = interruptNumber;
 
 		if (interruptController != NULL && interruptParent != 0) {
-			fdt_bus* bus;
-			ASSERT(gDeviceManager->get_driver(dev->bus, NULL, (void**)&bus) >= B_OK);
+			fdt_bus* bus = fdt_device_bus(dev);
 			*interruptController = fdt_bus_node_by_phandle(bus, interruptParent);
 		}
 
@@ -619,9 +637,7 @@ fdt_device_get_interrupt(fdt_device* dev, uint32 index,
 	if (interruptController != NULL) {
 		uint32 phandle = fdt32_to_cpu(*(prop + 2 * index));
 
-		fdt_bus* bus;
-		ASSERT(gDeviceManager->get_driver(
-			dev->bus, NULL, (void**)&bus) >= B_OK);
+		fdt_bus* bus = fdt_device_bus(dev);
 
 		*interruptController = fdt_bus_node_by_phandle(bus, phandle);
 	}
@@ -636,9 +652,7 @@ fdt_device_get_interrupt(fdt_device* dev, uint32 index,
 static struct fdt_interrupt_map *
 fdt_device_get_interrupt_map(struct fdt_device* dev)
 {
-	int fdtNode;
-	ASSERT(gDeviceManager->get_attr_uint32(
-		dev->node, "fdt/node", (uint32*)&fdtNode, false) >= B_OK);
+	int fdtNode = (int)fdt_device_node(dev);
 
 	ObjectDeleter<struct fdt_interrupt_map> interrupt_map(new struct fdt_interrupt_map());
 
