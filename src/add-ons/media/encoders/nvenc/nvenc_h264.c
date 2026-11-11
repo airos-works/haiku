@@ -306,7 +306,7 @@ nvencH264Open(NvencEngine *engine, const nvenc_config *config, char *reason,
 		? (double)config->frame_rate_num / config->frame_rate_den : 30;
 	encoder->level = nvencH264Level(config->width, config->height, fps,
 		config->rate_control == NVENC_RC_CONSTQP ? 0 : config->max_bitrate);
-	nvencRateInit(&encoder->rc, config, MIN_QP, MAX_QP, 26);
+	nvencRateInit(&encoder->rc, config, MIN_QP, MAX_QP, 26, 0);
 
 	nvencPictureLayout(&encoder->input, config->width, config->height, 1, 16, 32);
 	nvencPictureLayout(&encoder->reference, config->width, config->height, 1, 16, 32);
@@ -483,90 +483,101 @@ nvencH264Encode(NvencH264 *encoder, const nvenc_picture *picture, NvencQueue *qu
 		if (encoder->count > 0)
 			encoder->idrPicId = (encoder->idrPicId + 1) & 0xffff;
 	}
-	int qp = nvencRateQp(&encoder->rc, idr);
+	int kind = idr ? NVENC_PICTURE_I : NVENC_PICTURE_P;
+	int qp = nvencRateQp(&encoder->rc, kind);
 
 	nvencStorePicture(encoder->inputPicture.data, &encoder->input,
 		&kNvencLayouts[encoder->config.variant], picture);
-	fill_pic_setup(encoder, idr, qp);
-	memset(encoder->status.data, 0, sizeof(nvenc_pic_stat_s));
-
 	int current = encoder->count % 2;
 	int previous = 1 - current;
 	size_t inputChroma = encoder->input.chromaOffset;
 	size_t referenceChroma = encoder->reference.chromaOffset;
 	NvencEngine *engine = encoder->engine;
-	nvencBegin(engine);
-	nvencMethod(engine, NVENC_SET_APPLICATION_ID, NVENC_APPLICATION_H264);
-	/* Without FORCE_OUT_PIC the reconstructed picture is not written, even
-	 * with ref_pic_flag set, and P pictures predict from black. */
-	nvencMethod(engine, NVENC_SET_CONTROL_PARAMS,
-		NVENC_CONTROL_CODEC_H264 | NVENC_CONTROL_FORCE_OUT_PIC | NVENC_CONTROL_RCMODE(0));
-	nvencMethod(engine, NVENC_SET_PICTURE_INDEX, encoder->count + 1);
-	nvencAddress(engine, NVENC_SET_IN_DRV_PIC_SETUP, encoder->picSetup.gpuAddress);
-	nvencAddress(engine, NVENC_SET_IN_CUR_PIC, encoder->inputPicture.gpuAddress);
-	nvencAddress(engine, NVENC_SET_IN_CUR_PIC_CHROMA_U,
-		encoder->inputPicture.gpuAddress + inputChroma);
-	nvencAddress(engine, NVENC_SET_IN_CUR_PIC_CHROMA_V,
-		encoder->inputPicture.gpuAddress + inputChroma);
-	nvencAddress(engine, NVENC_SET_OUT_REF_PIC_LUMA, encoder->recon[current].gpuAddress);
-	nvencAddress(engine, NVENC_SET_OUT_REF_PIC_CHROMA,
-		encoder->recon[current].gpuAddress + referenceChroma);
-	nvencAddress(engine, NVENC_SET_IOHISTORY, encoder->history.gpuAddress);
-	nvencAddress(engine, NVENC_SET_OUT_ENC_STATUS, encoder->status.gpuAddress);
-	nvencAddress(engine, NVENC_SET_OUT_BITSTREAM, encoder->bitstream.gpuAddress);
-	nvencAddress(engine, NVENC_SET_OUT_COLOC_DATA, encoder->coloc[current].gpuAddress);
-	/* the temporal hints of the motion search read the previous picture's */
-	nvencAddress(engine, NVENC_SET_OUT_MEPRED_DATA, encoder->mePred[current].gpuAddress);
-	nvencAddress(engine, NVENC_SET_IN_MEPRED_DATA, encoder->mePred[previous].gpuAddress);
-	if (!idr) {
-		nvencAddress(engine, NVENC_SET_IN_REF_PIC_LUMA(0),
-			encoder->recon[previous].gpuAddress);
-		nvencAddress(engine, NVENC_SET_IN_REF_PIC_CHROMA(0),
-			encoder->recon[previous].gpuAddress + referenceChroma);
-	}
-	nvencMethod(engine, NVENC_EXECUTE, 0);
-	char why[160];
-	int executed = nvencExecute(engine,
-		encoder->config.timeout_ms != 0 ? (int)encoder->config.timeout_ms : 2000, why,
-		sizeof(why));
-	if (executed != 0) {
-		if (getenv("NVENC_DEBUG") != NULL)
-			dump_status("failed", &encoder->status);
-		if (reason != NULL)
-			snprintf(reason, reasonSize, "NVENC: %s", why);
-		return executed;
-	}
-
-	const nvenc_pic_stat_s *stat = encoder->status.data;
-	if (getenv("NVENC_DEBUG") != NULL)
-		dump_status("done", &encoder->status);
-	if (stat->error_status != PICTURE_DONE || stat->ucode_error_status != 0) {
-		if (reason != NULL) {
-			snprintf(reason, reasonSize, "NVENC reported error %u (microcode %#x)",
-				stat->error_status, stat->ucode_error_status);
-		}
-		return NVENC_FAILED;
-	}
-	size_t bytes = (stat->total_bit_count + 7) / 8;
+	size_t bytes;
 	const uint8_t *slice = encoder->bitstream.data;
-	if (bytes < 5 || bytes > encoder->bitstream.size) {
-		if (reason != NULL) {
-			snprintf(reason, reasonSize, "NVENC wrote %zu bytes for a picture", bytes);
+	/* The stream's first picture is encoded again when the QP guessed for it
+	 * turns out far from what the bit rate allows. */
+	for (;;) {
+		fill_pic_setup(encoder, idr, qp);
+		memset(encoder->status.data, 0, sizeof(nvenc_pic_stat_s));
+
+		nvencBegin(engine);
+		nvencMethod(engine, NVENC_SET_APPLICATION_ID, NVENC_APPLICATION_H264);
+		/* Without FORCE_OUT_PIC the reconstructed picture is not written, even
+		 * with ref_pic_flag set, and P pictures predict from black. */
+		nvencMethod(engine, NVENC_SET_CONTROL_PARAMS,
+			NVENC_CONTROL_CODEC_H264 | NVENC_CONTROL_FORCE_OUT_PIC | NVENC_CONTROL_RCMODE(0));
+		nvencMethod(engine, NVENC_SET_PICTURE_INDEX, encoder->count + 1);
+		nvencAddress(engine, NVENC_SET_IN_DRV_PIC_SETUP, encoder->picSetup.gpuAddress);
+		nvencAddress(engine, NVENC_SET_IN_CUR_PIC, encoder->inputPicture.gpuAddress);
+		nvencAddress(engine, NVENC_SET_IN_CUR_PIC_CHROMA_U,
+			encoder->inputPicture.gpuAddress + inputChroma);
+		nvencAddress(engine, NVENC_SET_IN_CUR_PIC_CHROMA_V,
+			encoder->inputPicture.gpuAddress + inputChroma);
+		nvencAddress(engine, NVENC_SET_OUT_REF_PIC_LUMA, encoder->recon[current].gpuAddress);
+		nvencAddress(engine, NVENC_SET_OUT_REF_PIC_CHROMA,
+			encoder->recon[current].gpuAddress + referenceChroma);
+		nvencAddress(engine, NVENC_SET_IOHISTORY, encoder->history.gpuAddress);
+		nvencAddress(engine, NVENC_SET_OUT_ENC_STATUS, encoder->status.gpuAddress);
+		nvencAddress(engine, NVENC_SET_OUT_BITSTREAM, encoder->bitstream.gpuAddress);
+		nvencAddress(engine, NVENC_SET_OUT_COLOC_DATA, encoder->coloc[current].gpuAddress);
+		/* the temporal hints of the motion search read the previous picture's */
+		nvencAddress(engine, NVENC_SET_OUT_MEPRED_DATA, encoder->mePred[current].gpuAddress);
+		nvencAddress(engine, NVENC_SET_IN_MEPRED_DATA, encoder->mePred[previous].gpuAddress);
+		if (!idr) {
+			nvencAddress(engine, NVENC_SET_IN_REF_PIC_LUMA(0),
+				encoder->recon[previous].gpuAddress);
+			nvencAddress(engine, NVENC_SET_IN_REF_PIC_CHROMA(0),
+				encoder->recon[previous].gpuAddress + referenceChroma);
 		}
-		return NVENC_FAILED;
-	}
-	/* The engine writes slice NALs from where it was told to start. */
-	size_t skip = 0;
-	while (skip + 3 < bytes && !(slice[skip] == 0 && slice[skip + 1] == 0
-			&& slice[skip + 2] == 1))
-		skip++;
-	if (skip > 1 || skip + 3 >= bytes || (slice[skip + 3] & 0x1f) == 0) {
-		if (reason != NULL) {
-			snprintf(reason, reasonSize,
-				"NVENC's output is no H.264 slice (%02x %02x %02x %02x %02x)",
-				slice[0], slice[1], slice[2], slice[3], slice[4]);
+		nvencMethod(engine, NVENC_EXECUTE, 0);
+		char why[160];
+		int executed = nvencExecute(engine,
+			encoder->config.timeout_ms != 0 ? (int)encoder->config.timeout_ms : 2000, why,
+			sizeof(why));
+		if (executed != 0) {
+			if (getenv("NVENC_DEBUG") != NULL)
+				dump_status("failed", &encoder->status);
+			if (reason != NULL)
+				snprintf(reason, reasonSize, "NVENC: %s", why);
+			return executed;
 		}
-		return NVENC_FAILED;
+
+		const nvenc_pic_stat_s *stat = encoder->status.data;
+		if (getenv("NVENC_DEBUG") != NULL)
+			dump_status("done", &encoder->status);
+		if (stat->error_status != PICTURE_DONE || stat->ucode_error_status != 0) {
+			if (reason != NULL) {
+				snprintf(reason, reasonSize, "NVENC reported error %u (microcode %#x)",
+					stat->error_status, stat->ucode_error_status);
+			}
+			return NVENC_FAILED;
+		}
+		bytes = (stat->total_bit_count + 7) / 8;
+		if (bytes < 5 || bytes > encoder->bitstream.size) {
+			if (reason != NULL) {
+				snprintf(reason, reasonSize, "NVENC wrote %zu bytes for a picture", bytes);
+			}
+			return NVENC_FAILED;
+		}
+		/* The engine writes slice NALs from where it was told to start. */
+		size_t skip = 0;
+		while (skip + 3 < bytes && !(slice[skip] == 0 && slice[skip + 1] == 0
+				&& slice[skip + 2] == 1))
+			skip++;
+		if (skip > 1 || skip + 3 >= bytes || (slice[skip + 3] & 0x1f) == 0) {
+			if (reason != NULL) {
+				snprintf(reason, reasonSize,
+					"NVENC's output is no H.264 slice (%02x %02x %02x %02x %02x)",
+					slice[0], slice[1], slice[2], slice[3], slice[4]);
+			}
+			return NVENC_FAILED;
+		}
+
+		int again = nvencRateRetry(&encoder->rc, bytes, kind);
+		if (again < 0)
+			break;
+		qp = again;
 	}
 
 	size_t total = (idr ? encoder->headersSize : 0) + bytes;
@@ -588,7 +599,7 @@ nvencH264Encode(NvencH264 *encoder, const nvenc_picture *picture, NvencQueue *qu
 		return NVENC_FAILED;
 	}
 
-	nvencRateUpdate(&encoder->rc, bytes, idr);
+	nvencRateUpdate(&encoder->rc, bytes, kind);
 	encoder->count++;
 	encoder->indexInGop++;
 	encoder->frameNum = (encoder->frameNum + 1) % (1 << LOG2_MAX_FRAME_NUM);

@@ -339,7 +339,7 @@ nvencHevcOpen(NvencEngine *engine, const nvenc_config *config, char *reason,
 	double fps = config->frame_rate_den != 0
 		? (double)config->frame_rate_num / config->frame_rate_den : 30;
 	encoder->level = nvencHevcLevel(config->width, config->height, fps);
-	nvencRateInit(&encoder->rc, config, MIN_QP, MAX_QP, 28);
+	nvencRateInit(&encoder->rc, config, MIN_QP, MAX_QP, 28, 0);
 
 	int bytesPerSample = encoder->bitDepth > 8 ? 2 : 1;
 	nvencPictureLayout(&encoder->input, config->width, config->height, bytesPerSample,
@@ -524,7 +524,7 @@ nvencHevcEncode(NvencHevc *encoder, const nvenc_picture *picture, NvencQueue *qu
 		encoder->indexInGop = 0;
 		encoder->poc = 0;
 	}
-	int qp = nvencRateQp(&encoder->rc, idr);
+	int qp = nvencRateQp(&encoder->rc, idr ? NVENC_PICTURE_I : NVENC_PICTURE_P);
 
 	nvencStorePicture(encoder->inputPicture.data, &encoder->input,
 		&kNvencLayouts[encoder->config.variant], picture);
@@ -628,7 +628,7 @@ nvencHevcEncode(NvencHevc *encoder, const nvenc_picture *picture, NvencQueue *qu
 		return NVENC_FAILED;
 	}
 
-	nvencRateUpdate(&encoder->rc, bytes, idr);
+	nvencRateUpdate(&encoder->rc, bytes, idr ? NVENC_PICTURE_I : NVENC_PICTURE_P);
 	encoder->count++;
 	encoder->indexInGop++;
 	encoder->poc++;
