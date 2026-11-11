@@ -34,6 +34,7 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 			CopyConflicts.cpp
 			ContainerWindow.cpp
 			CountView.cpp
+			DetailsPane.cpp
 			DeskWindow.cpp
 			DesktopPoseView.cpp
 			DraggableContainerIcon.cpp
@@ -130,6 +131,7 @@ DoCatalogs libtracker.so :
 	CopyConflicts.cpp
 	CountView.cpp
 	DeskWindow.cpp
+	DetailsPane.cpp
 	DirMenu.cpp
 	DraggableContainerIcon.cpp
 	FavoritesMenu.cpp

@@ -92,6 +92,15 @@ public:
 	void SetSortFolderNamesFirst(bool);
 	bool HideDotFiles();
 	void SetHideDotFiles(bool hide);
+
+	bool ShowDetailsPane();
+	void SetShowDetailsPane(bool show);
+	int32 DetailsPaneWidth();
+	void SetDetailsPaneWidth(int32 width);
+	bool ShowSidebar();
+	void SetShowSidebar(bool show);
+	int32 SidebarWidth();
+	void SetSidebarWidth(int32 width);
 	bool TypeAheadFiltering();
 	void SetTypeAheadFiltering(bool enabled);
 	bool GenerateImageThumbnails();

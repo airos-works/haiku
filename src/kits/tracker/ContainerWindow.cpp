@@ -44,6 +44,7 @@ All rights reserved.
 #include <Entry.h>
 #include <FindDirectory.h>
 #include <GridView.h>
+#include <SplitView.h>
 #include <InterfacePrivate.h>
 #include <GroupLayout.h>
 #include <Keymap.h>
@@ -75,6 +76,7 @@ All rights reserved.
 #include "Commands.h"
 #include "CountView.h"
 #include "DeskWindow.h"
+#include "DetailsPane.h"
 #include "DraggableContainerIcon.h"
 #include "FSClipboard.h"
 #include "FolderStateStore.h"
@@ -428,7 +430,9 @@ BContainerWindow::BContainerWindow(LockingList<BWindow>* list, uint32 openFlags,
 	fSavedZoomRect(0, 0, -1, -1),
 	fSaveStateIsEnabled(true),
 	fIsWatchingPath(false),
-	fStateSaveRunner(NULL)
+	fStateSaveRunner(NULL),
+	fSplitView(NULL),
+	fDetailsPane(NULL)
 {
 	InitIconPreloader();
 
@@ -448,8 +452,13 @@ BContainerWindow::BContainerWindow(LockingList<BWindow>* list, uint32 openFlags,
 		fMenuContainer = new BGroupView(B_HORIZONTAL, 0);
 		fRootLayout->AddView(fMenuContainer);
 
+		// the folder, and the panes beside it
+		fSplitView = new BSplitView(B_HORIZONTAL, 0);
+		fRootLayout->AddView(fSplitView);
+
 		fPoseContainer = new BGridView(0.0, 0.0);
-		fRootLayout->AddView(fPoseContainer);
+		fSplitView->AddChild(fPoseContainer, 1.0f);
+		fSplitView->SetCollapsible(false);
 
 		fBorderedView = new BorderedView;
 		fPoseContainer->GridLayout()->AddView(fBorderedView, 0, 1);
@@ -610,6 +619,11 @@ BContainerWindow::Quit()
 	if (StateNeedsSaving())
 		SaveState();
 
+	if (fDetailsPane != NULL && !fDetailsPane->IsHidden()) {
+		TrackerSettings().SetDetailsPaneWidth(
+			(int32)fDetailsPane->Frame().Width());
+	}
+
 	if (fWindowList != NULL && windowCount == 0)
 		be_app->PostMessage(B_QUIT_REQUESTED);
 
@@ -635,7 +649,7 @@ BContainerWindow::CreatePoseView(Model* model)
 	TrackerSettings settings;
 	if (settings.SingleWindowBrowse() && model->IsDirectory() && !PoseView()->IsFilePanel()) {
 		fNavigator = new BNavigator(model);
-		fPoseContainer->GridLayout()->AddView(fNavigator, 0, 0, 2);
+		_AddNavigatorView();
 		if (!settings.ShowNavigator())
 			fNavigator->Hide();
 	}
@@ -845,6 +859,9 @@ BContainerWindow::Init(const BMessage* message)
 	if (fBackgroundImage != NULL && !PoseView()->IsDesktopView() && !isListMode)
 		fBackgroundImage->Show(PoseView(), current_workspace());
 
+	if (_CanHavePanes() && TrackerSettings().ShowDetailsPane())
+		ShowDetailsPane(true);
+
 	Show();
 
 	// done showing, turn the B_NO_WORKSPACE_ACTIVATION flag off;
@@ -1034,6 +1051,9 @@ BContainerWindow::DispatchMessage(BMessage* message, BHandler* handler)
 	if (Navigator() != NULL)
 		Navigator()->EndEditingIfUnfocused();
 
+	if (fDetailsPane != NULL && !fDetailsPane->IsHidden() && PoseView() != NULL)
+		fDetailsPane->Update(PoseView());
+
 	// save a changed view a moment after the change instead of only when
 	// the window closes, so a crash or power loss does not lose it
 	_ScheduleStateSave();
@@ -1055,6 +1075,57 @@ BContainerWindow::_ScheduleStateSave()
 	if (fStateSaveRunner->InitCheck() != B_OK) {
 		delete fStateSaveRunner;
 		fStateSaveRunner = NULL;
+	}
+}
+
+
+void
+BContainerWindow::_AddNavigatorView()
+{
+	// across the whole window, above the folder and its panes
+	if (fRootLayout != NULL && fSplitView != NULL)
+		fRootLayout->AddView(fRootLayout->IndexOfView(fSplitView), fNavigator);
+	else
+		fPoseContainer->GridLayout()->AddView(fNavigator, 0, 0, 2);
+}
+
+
+bool
+BContainerWindow::_CanHavePanes() const
+{
+	return fSplitView != NULL && PoseView() != NULL
+		&& !PoseView()->IsDesktopView() && !PoseView()->IsFilePanel()
+		&& ShouldAddMenus() && TargetModel() != NULL
+		&& !TargetModel()->IsQuery();
+}
+
+
+void
+BContainerWindow::ShowDetailsPane(bool show)
+{
+	if (!_CanHavePanes())
+		return;
+
+	if (show && fDetailsPane == NULL) {
+		fDetailsPane = new DetailsPane();
+		int32 width = TrackerSettings().DetailsPaneWidth();
+		if (width > 50)
+			fDetailsPane->SetExplicitPreferredSize(BSize(width, B_SIZE_UNSET));
+		fSplitView->AddChild(fDetailsPane, 0.0f);
+		fDetailsPane->Update(PoseView(), true);
+		return;
+	}
+
+	if (fDetailsPane == NULL)
+		return;
+
+	if (show && fDetailsPane->IsHidden()) {
+		fDetailsPane->Show();
+		fDetailsPane->Update(PoseView(), true);
+	} else if (!show && !fDetailsPane->IsHidden()) {
+		TrackerSettings().SetDetailsPaneWidth(
+			(int32)fDetailsPane->Frame().Width());
+		fDetailsPane->Hide();
 	}
 }
 
@@ -1830,6 +1901,16 @@ BContainerWindow::MessageReceived(BMessage* message)
 			_UseViewForNewFolders();
 			break;
 
+		case kToggleDetailsPane:
+		{
+			bool show = fDetailsPane == NULL || fDetailsPane->IsHidden();
+			ShowDetailsPane(show);
+			TrackerSettings settings;
+			settings.SetShowDetailsPane(show);
+			settings.SaveSettings(false);
+			break;
+		}
+
 		case kToggleHiddenFiles:
 		{
 			TrackerSettings settings;
@@ -2038,7 +2119,7 @@ BContainerWindow::MessageReceived(BMessage* message)
 						if (settings.SingleWindowBrowse() && Navigator() == NULL
 							&& TargetModel()->IsDirectory()) {
 							fNavigator = new BNavigator(TargetModel());
-							fPoseContainer->GridLayout()->AddView(fNavigator, 0, 0, 2);
+							_AddNavigatorView();
 							fNavigator->Hide();
 							SetPathWatchingEnabled(settings.ShowNavigator()
 								|| settings.ShowFullPathInTitleBar());
@@ -2262,6 +2343,12 @@ BContainerWindow::AddWindowMenu(BMenu* menu)
 		new BMessage(kToggleFolderSizes));
 	item->SetTarget(PoseView());
 	menu->AddItem(item);
+	if (_CanHavePanes()) {
+		item = new BMenuItem(B_TRANSLATE("Show details"),
+			new BMessage(kToggleDetailsPane), 'P', B_SHIFT_KEY);
+		item->SetTarget(this);
+		menu->AddItem(item);
+	}
 	menu->AddSeparatorItem();
 
 	if (_CanShareView()) {
@@ -3455,6 +3542,12 @@ BContainerWindow::UpdateWindowMenuOrWindowContextMenu(BMenu* menu, MenuContext c
 	if (hiddenItem != NULL)
 		hiddenItem->SetMarked(!TrackerSettings().HideDotFiles());
 
+	BMenuItem* detailsItem = menu->FindItem(kToggleDetailsPane);
+	if (detailsItem != NULL) {
+		detailsItem->SetMarked(fDetailsPane != NULL
+			&& !fDetailsPane->IsHidden());
+	}
+
 	BMenuItem* folderSizesItem = menu->FindItem(kToggleFolderSizes);
 	if (folderSizesItem != NULL) {
 		folderSizesItem->SetMarked(PoseView()->ShowsFolderSizes());
@@ -4616,7 +4709,7 @@ BContainerWindow::ShowNavigator(bool show)
 
 		if (Navigator() == NULL) {
 			fNavigator = new BNavigator(TargetModel());
-			fPoseContainer->GridLayout()->AddView(fNavigator, 0, 0, 2);
+			_AddNavigatorView();
 		}
 
 		if (Navigator()->IsHidden())

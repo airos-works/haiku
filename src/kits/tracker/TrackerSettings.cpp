@@ -77,6 +77,10 @@ private:
 	BooleanValueSetting* fHideDotFiles;
 	BooleanValueSetting* fTypeAheadFiltering;
 	BooleanValueSetting* fGenerateImageThumbnails;
+	BooleanValueSetting* fShowDetailsPane;
+	ScalarValueSetting* fDetailsPaneWidth;
+	BooleanValueSetting* fShowSidebar;
+	ScalarValueSetting* fSidebarWidth;
 
 	ScalarValueSetting* fRecentApplicationsCount;
 	ScalarValueSetting* fRecentDocumentsCount;
@@ -234,6 +238,11 @@ TTrackerState::LoadSettingsIfNeeded()
 		= new BooleanValueSetting("TypeAheadFiltering", kDefaultTypeAheadFiltering));
 	Add(fGenerateImageThumbnails
 		= new BooleanValueSetting("GenerateImageThumbnails", kDefaultGenerateImageThumbnails));
+
+	Add(fShowDetailsPane = new BooleanValueSetting("ShowDetailsPane", false));
+	Add(fDetailsPaneWidth = new ScalarValueSetting("DetailsPaneWidth", 0, "", ""));
+	Add(fShowSidebar = new BooleanValueSetting("ShowSidebar", true));
+	Add(fSidebarWidth = new ScalarValueSetting("SidebarWidth", 0, "", ""));
 
 	Add(fRecentApplicationsCount
 		= new ScalarValueSetting("RecentApplications", kDefaultRecentApplications, "", ""));
@@ -434,6 +443,62 @@ TrackerSettings::SetSortFolderNamesFirst(bool enabled)
 	gTrackerState.fSortFolderNamesFirst->SetValue(enabled);
 	NameAttributeText::SetSortFolderNamesFirst(enabled);
 	RealNameAttributeText::SetSortFolderNamesFirst(enabled);
+}
+
+
+bool
+TrackerSettings::ShowDetailsPane()
+{
+	return gTrackerState.fShowDetailsPane->Value();
+}
+
+
+void
+TrackerSettings::SetShowDetailsPane(bool show)
+{
+	gTrackerState.fShowDetailsPane->SetValue(show);
+}
+
+
+int32
+TrackerSettings::DetailsPaneWidth()
+{
+	return gTrackerState.fDetailsPaneWidth->Value();
+}
+
+
+void
+TrackerSettings::SetDetailsPaneWidth(int32 width)
+{
+	gTrackerState.fDetailsPaneWidth->ValueChanged(width);
+}
+
+
+bool
+TrackerSettings::ShowSidebar()
+{
+	return gTrackerState.fShowSidebar->Value();
+}
+
+
+void
+TrackerSettings::SetShowSidebar(bool show)
+{
+	gTrackerState.fShowSidebar->SetValue(show);
+}
+
+
+int32
+TrackerSettings::SidebarWidth()
+{
+	return gTrackerState.fSidebarWidth->Value();
+}
+
+
+void
+TrackerSettings::SetSidebarWidth(int32 width)
+{
+	gTrackerState.fSidebarWidth->ValueChanged(width);
 }
 
 

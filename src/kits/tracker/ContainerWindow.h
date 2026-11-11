@@ -51,6 +51,7 @@ class BGroupView;
 class BPopUpMenu;
 class BMenuBar;
 class BMessageRunner;
+class BSplitView;
 
 namespace BPrivate {
 
@@ -63,6 +64,7 @@ class BackgroundImage;
 class Model;
 class ModelNodeLazyOpener;
 class BorderedView;
+class DetailsPane;
 class SelectionWindow;
 class TShortcuts;
 class TemplatesMenu;
@@ -127,6 +129,8 @@ public:
 	virtual void MenusEnded();
 	virtual void MessageReceived(BMessage*);
 	virtual void DispatchMessage(BMessage* message, BHandler* handler);
+
+	void ShowDetailsPane(bool show);
 	virtual void WindowActivated(bool active);
 	virtual void FrameResized(float, float);
 	virtual void FrameMoved(BPoint);
@@ -359,6 +363,8 @@ private:
 	bool fSaveStateIsEnabled;
 	bool fIsWatchingPath;
 	BMessageRunner* fStateSaveRunner;
+	BSplitView* fSplitView;
+	DetailsPane* fDetailsPane;
 
 	typedef BWindow _inherited;
 
@@ -368,6 +374,8 @@ private:
 	void _UpdateSelectionMIMEInfo();
 	void _ScheduleStateSave();
 	void _UpdateUndoItems(BMenu* menu);
+	void _AddNavigatorView();
+	bool _CanHavePanes() const;
 	BMenuItem* _AddPoseItem(BMenu* menu, const char* label, uint32 what,
 		char shortcut = 0, uint32 modifiers = 0);
 	void _AddDeleteImmediatelyItem(BMenu* menu);
