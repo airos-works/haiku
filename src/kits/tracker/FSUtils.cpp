@@ -65,6 +65,7 @@ respective holders. All rights reserved.
 #include <Screen.h>
 #include <String.h>
 #include <StringFormat.h>
+#include <StringForSize.h>
 #include <SymLink.h>
 #include <Volume.h>
 #include <VolumeRoster.h>
@@ -3019,6 +3020,30 @@ empty_trash(void*)
 
 		// don't count trash directory itself
 		totalCount--;
+	}
+
+	if (status == B_OK && totalCount <= 0)
+		return B_OK;
+
+	if (status == B_OK) {
+		// say what is about to go for good
+		char sizeText[128];
+		string_for_size(totalSize, sizeText, sizeof(sizeText));
+
+		static BStringFormat format(B_TRANSLATE_COMMENT(
+			"{0, plural, one{Delete the item in the Trash (%size) for good?}"
+			" other{Delete the # items in the Trash (%size) for good?}}",
+			"%size is like: 12.5 MiB"));
+		BString text;
+		format.Format(text, totalCount);
+		text.ReplaceFirst("%size", sizeText);
+
+		BAlert* alert = new BAlert(B_TRANSLATE("Empty Trash"), text.String(),
+			B_TRANSLATE("Cancel"), B_TRANSLATE("Empty Trash"), NULL,
+			B_WIDTH_AS_USUAL, B_WARNING_ALERT);
+		alert->SetShortcut(0, B_ESCAPE);
+		if (alert->Go() != 1)
+			return B_OK;
 	}
 
 	if (status == B_OK) {

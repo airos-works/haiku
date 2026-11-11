@@ -1211,6 +1211,59 @@ BContainerWindow::_UpdateUndoItems(BMenu* menu)
 }
 
 
+BMenuItem*
+BContainerWindow::_AddPoseItem(BMenu* menu, const char* label, uint32 what,
+	char shortcut, uint32 modifiers)
+{
+	BMenuItem* item = new BMenuItem(label, new BMessage(what), shortcut,
+		modifiers);
+	item->SetTarget(PoseView());
+	menu->AddItem(item);
+	return item;
+}
+
+
+void
+BContainerWindow::_AddDeleteImmediatelyItem(BMenu* menu)
+{
+	// Shift-Delete deletes without the Trash; the key itself is handled by
+	// the pose view, the menu item shows that it exists
+	BMenuItem* item = new BMenuItem(B_TRANSLATE("Delete immediately" B_UTF8_ELLIPSIS),
+		new BMessage(kDeleteImmediately), B_DELETE,
+		B_SHIFT_KEY | B_NO_COMMAND_KEY);
+	item->SetTarget(PoseView());
+	menu->AddItem(item);
+}
+
+
+void
+BContainerWindow::_UpdateExtraItems(BMenu* menu)
+{
+	bool hasSelection = PoseView()->CountSelected() > 0;
+	bool writable = !PoseView()->TargetVolumeIsReadOnly();
+
+	BMenuItem* item = menu->FindItem(kNewFolderWithSelection);
+	if (item != NULL)
+		item->SetEnabled(hasSelection && writable);
+
+	item = menu->FindItem(kCompressSelection);
+	if (item != NULL)
+		item->SetEnabled(hasSelection && writable);
+
+	item = menu->FindItem(kExtractHere);
+	if (item != NULL)
+		item->SetEnabled(PoseView()->SelectionIsExpandable());
+
+	item = menu->FindItem(kOpenInNewWindow);
+	if (item != NULL)
+		item->SetEnabled(PoseView()->SelectionHasDirectory());
+
+	item = menu->FindItem(kDeleteImmediately);
+	if (item != NULL)
+		item->SetEnabled(hasSelection && writable);
+}
+
+
 void
 BContainerWindow::UpdateTitle()
 {
@@ -1735,6 +1788,34 @@ BContainerWindow::MessageReceived(BMessage* message)
 			_UseViewForNewFolders();
 			break;
 
+		case kToggleHiddenFiles:
+		{
+			TrackerSettings settings;
+			bool hide = !settings.HideDotFiles();
+			settings.SetHideDotFiles(hide);
+			settings.SaveSettings(false);
+
+			TTracker* tracker = dynamic_cast<TTracker*>(be_app);
+			if (tracker != NULL) {
+				BMessage notice;
+				notice.AddBool("HideDotFiles", hide);
+				tracker->SendNotices(kHideDotFilesChanged, &notice);
+			}
+			break;
+		}
+
+		case kOpenTerminalHere:
+		{
+			BPath path;
+			TargetModel()->GetPath(&path);
+			if (path.InitCheck() != B_OK)
+				break;
+
+			const char* argv[] = { "-w", path.Path(), NULL };
+			be_roster->Launch("application/x-vnd.Haiku-Terminal", 2, argv);
+			break;
+		}
+
 		case kApplyViewToSubfolders:
 			_ApplyViewToSubfolders();
 			break;
@@ -2049,8 +2130,11 @@ BContainerWindow::AddFileMenu(BMenu* menu)
 	}
 
 	menu->AddItem(Shortcuts()->FindItem());
-	if (ShouldHaveNewFolderItem())
+	if (ShouldHaveNewFolderItem()) {
 		menu->AddItem(Shortcuts()->NewFolderItem());
+		_AddPoseItem(menu, B_TRANSLATE("New folder with selection"),
+			kNewFolderWithSelection, 'N', B_SHIFT_KEY);
+	}
 	menu->AddSeparatorItem();
 
 	menu->AddItem(Shortcuts()->OpenItem());
@@ -2075,6 +2159,7 @@ BContainerWindow::AddFileMenu(BMenu* menu)
 		} else {
 			menu->AddItem(Shortcuts()->DuplicateItem());
 			menu->AddItem(Shortcuts()->MoveToTrashItem());
+			_AddDeleteImmediatelyItem(menu);
 		}
 	}
 
@@ -2093,7 +2178,15 @@ BContainerWindow::AddFileMenu(BMenu* menu)
 		menu->AddItem(Shortcuts()->CopyItem());
 		menu->AddItem(Shortcuts()->PasteItem());
 	}
+	_AddPoseItem(menu, B_TRANSLATE("Copy path"), kCopyPath, 'C', B_OPTION_KEY);
 	menu->AddSeparatorItem();
+
+	if (!TargetModel()->IsRoot() && !TargetModel()->IsTrash()
+		&& !TargetModel()->InTrash()) {
+		_AddPoseItem(menu, B_TRANSLATE("Compress"), kCompressSelection);
+		_AddPoseItem(menu, B_TRANSLATE("Extract here"), kExtractHere);
+		menu->AddSeparatorItem();
+	}
 
 	if (!TargetModel()->IsRoot())
 		menu->AddItem(Shortcuts()->IdentifyItem());
@@ -2109,6 +2202,12 @@ BContainerWindow::AddWindowMenu(BMenu* menu)
 
 	BMenuItem* item = new BMenuItem(B_TRANSLATE("List view"), new BMessage(kListMode), '3');
 	item->SetTarget(PoseView());
+	menu->AddItem(item);
+	menu->AddSeparatorItem();
+
+	item = new BMenuItem(B_TRANSLATE("Show hidden files"),
+		new BMessage(kToggleHiddenFiles), 'H', B_SHIFT_KEY);
+	item->SetTarget(this);
 	menu->AddItem(item);
 	menu->AddSeparatorItem();
 
@@ -2694,8 +2793,12 @@ BContainerWindow::SetupMoveCopyMenus(BMenu* parent, const entry_ref* ref)
 	if (moveToTrashItem == NULL || index == B_ERROR)
 		return;
 
-	// skip past "Move to Trash" and separator
-	index += 2;
+	// skip past "Move to Trash", the items after it and the separator
+	while (index < parent->CountItems()
+		&& dynamic_cast<BSeparatorItem*>(parent->ItemAt(index)) == NULL) {
+		index++;
+	}
+	index++;
 
 	// re-parent items to this menu since they're shared
 	parent->AddItem(fMoveToItem, index++);
@@ -2886,6 +2989,7 @@ void
 BContainerWindow::AddPoseContextMenu(BMenu* menu)
 {
 	menu->AddItem(Shortcuts()->OpenItem());
+	_AddPoseItem(menu, B_TRANSLATE("Open in new window"), kOpenInNewWindow);
 	// "Edit query" and "Open with..." inserted here,
 	// see UpdateMenu(), SetupEditQueryItem() and SetupOpenWithMenu()
 	menu->AddItem(Shortcuts()->QuickLookItem());
@@ -2898,6 +3002,7 @@ BContainerWindow::AddPoseContextMenu(BMenu* menu)
 	} else if (!TargetModel()->InTrash()) {
 		menu->AddItem(Shortcuts()->DuplicateItem());
 		menu->AddItem(Shortcuts()->MoveToTrashItem());
+		_AddDeleteImmediatelyItem(menu);
 	}
 	menu->AddSeparatorItem();
 
@@ -2909,6 +3014,12 @@ BContainerWindow::AddPoseContextMenu(BMenu* menu)
 		menu->AddItem(Shortcuts()->CutItem());
 		menu->AddItem(Shortcuts()->CopyItem());
 		menu->AddItem(Shortcuts()->PasteItem());
+		_AddPoseItem(menu, B_TRANSLATE("Copy path"), kCopyPath, 'C',
+			B_OPTION_KEY);
+		menu->AddSeparatorItem();
+
+		_AddPoseItem(menu, B_TRANSLATE("Compress"), kCompressSelection);
+		_AddPoseItem(menu, B_TRANSLATE("Extract here"), kExtractHere);
 		menu->AddSeparatorItem();
 	}
 
@@ -2948,6 +3059,16 @@ BContainerWindow::AddWindowContextMenu(BMenu* menu)
 
 	if (ShouldHaveNewFolderItem()) {
 		menu->AddItem(Shortcuts()->NewFolderItem());
+		menu->AddSeparatorItem();
+	}
+
+	if (!TargetModel()->IsRoot() && !TargetModel()->IsTrash()
+		&& !TargetModel()->InTrash() && !TargetModel()->IsPrintersDir()) {
+		BMenuItem* item = new BMenuItem(B_TRANSLATE("Open Terminal here"),
+			new BMessage(kOpenTerminalHere));
+		item->SetTarget(this);
+		menu->AddItem(item);
+		_AddPoseItem(menu, B_TRANSLATE("Copy path"), kCopyPath);
 		menu->AddSeparatorItem();
 	}
 
@@ -3245,6 +3366,8 @@ BContainerWindow::UpdateFileMenuOrPoseContextMenu(BMenu* menu, MenuContext conte
 
 	if (ShouldHaveAddOnMenus())
 		BuildAddOnsMenu(menu);
+
+	_UpdateExtraItems(menu);
 }
 
 
@@ -3274,6 +3397,10 @@ BContainerWindow::UpdateWindowContextMenu(BMenu* menu)
 void
 BContainerWindow::UpdateWindowMenuOrWindowContextMenu(BMenu* menu, MenuContext context)
 {
+	BMenuItem* hiddenItem = menu->FindItem(kToggleHiddenFiles);
+	if (hiddenItem != NULL)
+		hiddenItem->SetMarked(!TrackerSettings().HideDotFiles());
+
 	// insert "Arrange by >" menu before "Select ..."
 	SetupArrangeByMenu(menu);
 

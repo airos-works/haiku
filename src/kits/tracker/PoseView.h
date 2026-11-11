@@ -472,6 +472,17 @@ protected:
 		// clean up poses
 	void NewFolder(const BMessage*);
 		// create a new folder, optionally specify a location
+	void NewFolderWithSelection();
+	void CopyPathsToClipboard();
+	void CompressSelection();
+	void ExtractSelectionHere();
+	void OpenSelectionInNewWindow();
+
+public:
+	bool SelectionHasDirectory() const;
+	bool SelectionIsExpandable() const;
+
+protected:
 
 	void NewFileFromTemplate(const BMessage*);
 		// create a new file based on a template, optionally specify

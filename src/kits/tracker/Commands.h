@@ -100,6 +100,14 @@ const uint32 kArrangePoses = 'ARPS';
 
 const uint32 kResizeToFit = 'Trtf';
 const uint32 kUseViewForNewFolders = 'Tuvn';
+const uint32 kCopyPath = 'Tcph';
+const uint32 kNewFolderWithSelection = 'Tnfs';
+const uint32 kToggleHiddenFiles = 'Ttgh';
+const uint32 kOpenInNewWindow = 'Tonw';
+const uint32 kCompressSelection = 'Tcmp';
+const uint32 kExtractHere = 'Texh';
+const uint32 kOpenTerminalHere = 'Toth';
+const uint32 kDeleteImmediately = 'Tdim';
 const uint32 kApplyViewToSubfolders = 'Tavs';
 const uint32 kSaveStateIfNeeded = 'Tssn';
 const uint32 kSelectMatchingEntries = 'Tsme';

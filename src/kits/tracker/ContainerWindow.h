@@ -368,6 +368,10 @@ private:
 	void _UpdateSelectionMIMEInfo();
 	void _ScheduleStateSave();
 	void _UpdateUndoItems(BMenu* menu);
+	BMenuItem* _AddPoseItem(BMenu* menu, const char* label, uint32 what,
+		char shortcut = 0, uint32 modifiers = 0);
+	void _AddDeleteImmediatelyItem(BMenu* menu);
+	void _UpdateExtraItems(BMenu* menu);
 	bool _CanShareView() const;
 	void _UseViewForNewFolders();
 	void _ApplyViewToSubfolders();

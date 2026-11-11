@@ -67,6 +67,9 @@ private:
 			entry_ref			fSourceRef;
 			entry_ref			fDestRef;
 			bool				fSourceChanged;
+			bool				fExpandHere;
+				// asked by Tracker's "Extract here": expand next to the
+				// archive at once and close when done
 			bool				fSourceValid;
 			bool				fDestValid;
 

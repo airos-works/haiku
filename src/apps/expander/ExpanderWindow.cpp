@@ -92,6 +92,7 @@ ExpanderWindow::ExpanderWindow(BRect frame, const entry_ref* ref,
 	fSourcePanel(NULL),
 	fDestPanel(NULL),
 	fSourceChanged(true),
+	fExpandHere(false),
 	fSourceValid(false),
 	fDestValid(false),
 	fListingThread(NULL),
@@ -584,6 +585,8 @@ ExpanderWindow::RefsReceived(BMessage* message)
 	int8 destinationFolder = 0x63;
 	fSettings.FindInt8("destination_folder", &destinationFolder);
 
+	bool expandHere = message->GetBool("airos:expand here", false);
+
 	while (message->FindRef("refs", i++, &ref) == B_OK) {
 		BEntry entry(&ref, true);
 		BPath path(&entry);
@@ -593,7 +596,7 @@ ExpanderWindow::RefsReceived(BMessage* message)
 			fSourceChanged = true;
 			fSourceRef = ref;
 			fSourceText->SetText(path.Path());
-			if (destinationFolder == 0x63) {
+			if (destinationFolder == 0x63 || expandHere) {
 				BPath parent;
 				path.GetParent(&parent);
 				fDestText->SetText(parent.Path());
@@ -618,7 +621,10 @@ ExpanderWindow::RefsReceived(BMessage* message)
 			}
 
 			bool fromApp;
-			if (message->FindBool("fromApp", &fromApp) == B_OK) {
+			if (expandHere && fDestValid) {
+				fExpandHere = true;
+				fExpandButton->Invoke();
+			} else if (message->FindBool("fromApp", &fromApp) == B_OK) {
 				AutoExpand();
 			} else
 				AutoListing();
@@ -892,7 +898,7 @@ ExpanderWindow::CloseWindowOrKeepOpen()
 	bool closeWhenDone = false;
 	fSettings.FindBool("close_when_done", &closeWhenDone);
 
-	if (expandFiles || closeWhenDone)
+	if (expandFiles || closeWhenDone || fExpandHere)
 		PostMessage(B_QUIT_REQUESTED);
 }
 

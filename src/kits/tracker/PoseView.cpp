@@ -51,6 +51,8 @@ All rights reserved.
 #include <Application.h>
 #include <Catalog.h>
 #include <Clipboard.h>
+#include <MimeType.h>
+#include <Roster.h>
 #include <ControlLook.h>
 #include <Debug.h>
 #include <Dragger.h>
@@ -2534,6 +2536,7 @@ BPoseView::MessageReceived(BMessage* message)
 			break;
 
 		case kDeleteSelection:
+		case kDeleteImmediately:
 			DoDelete();
 			break;
 
@@ -2575,6 +2578,26 @@ BPoseView::MessageReceived(BMessage* message)
 
 		case kNewFolder:
 			NewFolder(message);
+			break;
+
+		case kNewFolderWithSelection:
+			NewFolderWithSelection();
+			break;
+
+		case kCopyPath:
+			CopyPathsToClipboard();
+			break;
+
+		case kCompressSelection:
+			CompressSelection();
+			break;
+
+		case kExtractHere:
+			ExtractSelectionHere();
+			break;
+
+		case kOpenInNewWindow:
+			OpenSelectionInNewWindow();
 			break;
 
 		case kUnmountVolume:
@@ -3789,6 +3812,205 @@ BPoseView::ArrangePoses()
 	}
 
 	Invalidate();
+}
+
+
+void
+BPoseView::NewFolderWithSelection()
+{
+	// a new folder holding the selected items, named right away
+	Model* targetModel = TargetModel();
+	if (targetModel == NULL || CountSelected() == 0 || TargetVolumeIsReadOnly()
+		|| targetModel->IsTrash() || targetModel->InTrash()) {
+		return;
+	}
+
+	BObjectList<entry_ref, true>* list
+		= new BObjectList<entry_ref, true>(CountSelected());
+	for (int32 index = 0; index < CountSelected(); index++) {
+		BPose* pose = fSelectionList->ItemAt(index);
+		list->AddItem(new entry_ref(*pose->TargetModel()->EntryRef()));
+	}
+
+	entry_ref ref;
+	node_ref nodeRef;
+	if (FSCreateNewFolderIn(targetModel->NodeRef(), &ref, &nodeRef) != B_OK) {
+		delete list;
+		return;
+	}
+
+	// Same volume and an empty folder: plain renames, done before the name
+	// is edited (the copy loop's status window would end the editing).
+	// They are undone as one move.
+	{
+		BDirectory destination(&ref);
+		MoveCopyUndo undo(list, destination, NULL, kMoveSelectionTo);
+		for (int32 index = 0; index < list->CountItems(); index++) {
+			BEntry entry(list->ItemAt(index));
+			entry.MoveTo(&destination);
+		}
+	}
+	delete list;
+
+	int32 index;
+	BPose* pose = EntryCreated(targetModel->NodeRef(), &nodeRef, ref.name,
+		&index);
+	if (pose == NULL)
+		return;
+
+	UpdateScrollRange();
+	CommitActivePose();
+	SelectPose(pose, index);
+
+	BPoint poseLoc;
+	if (ViewMode() == kListMode)
+		poseLoc = BPoint(0, index * fListElemHeight);
+	else
+		poseLoc = pose->Location(this);
+
+	pose->EditFirstWidget(poseLoc, this);
+}
+
+
+void
+BPoseView::CopyPathsToClipboard()
+{
+	// the paths of the selected items, one per line, or of the folder
+	// itself when nothing is selected
+	BString text;
+	if (CountSelected() == 0) {
+		BPath path;
+		if (TargetModel() != NULL) {
+			TargetModel()->GetPath(&path);
+			text = path.Path();
+		}
+	} else {
+		for (int32 index = 0; index < CountSelected(); index++) {
+			BPath path(fSelectionList->ItemAt(index)->TargetModel()->EntryRef());
+			if (path.InitCheck() != B_OK)
+				continue;
+			if (text.Length() > 0)
+				text << '\n';
+			text << path.Path();
+		}
+	}
+
+	if (text.Length() == 0 || !be_clipboard->Lock())
+		return;
+
+	be_clipboard->Clear();
+	BMessage* data = be_clipboard->Data();
+	if (data != NULL) {
+		data->AddData("text/plain", B_MIME_TYPE, text.String(), text.Length());
+		be_clipboard->Commit();
+	}
+	be_clipboard->Unlock();
+}
+
+
+void
+BPoseView::CompressSelection()
+{
+	if (CountSelected() == 0)
+		return;
+
+	BMessage refs(B_REFS_RECEIVED);
+	for (int32 index = 0; index < CountSelected(); index++) {
+		refs.AddRef("refs",
+			fSelectionList->ItemAt(index)->TargetModel()->EntryRef());
+	}
+
+	be_roster->Launch("application/x-vnd.haiku.zip-o-matic", &refs);
+}
+
+
+static bool
+IsExpandable(const Model* model)
+{
+	// an archive Expander knows how to open
+	if (model == NULL || !model->IsFile())
+		return false;
+
+	BMimeType type(model->MimeType());
+	BMessage apps;
+	if (type.InitCheck() != B_OK || type.GetSupportingApps(&apps) != B_OK)
+		return false;
+
+	const char* signature;
+	for (int32 index = 0; apps.FindString("applications", index, &signature)
+			== B_OK; index++) {
+		if (strcasecmp(signature, "application/x-vnd.Haiku-Expander") == 0)
+			return true;
+	}
+
+	return false;
+}
+
+
+bool
+BPoseView::SelectionIsExpandable() const
+{
+	int32 count = CountSelected();
+	if (count == 0 || TargetVolumeIsReadOnly())
+		return false;
+
+	for (int32 index = 0; index < count; index++) {
+		if (!IsExpandable(fSelectionList->ItemAt(index)->TargetModel()))
+			return false;
+	}
+
+	return true;
+}
+
+
+void
+BPoseView::ExtractSelectionHere()
+{
+	if (!SelectionIsExpandable())
+		return;
+
+	// Expander runs once per archive, expands it next to itself and quits
+	for (int32 index = 0; index < CountSelected(); index++) {
+		BMessage refs(B_REFS_RECEIVED);
+		refs.AddRef("refs",
+			fSelectionList->ItemAt(index)->TargetModel()->EntryRef());
+		refs.AddBool("airos:expand here", true);
+		be_roster->Launch("application/x-vnd.Haiku-Expander", &refs);
+	}
+}
+
+
+bool
+BPoseView::SelectionHasDirectory() const
+{
+	for (int32 index = 0; index < CountSelected(); index++) {
+		Model* model = fSelectionList->ItemAt(index)->TargetModel();
+		Model* resolved = model->ResolveIfLink();
+		if (model->IsDirectory() || (resolved != NULL && resolved->IsDirectory()))
+			return true;
+	}
+
+	return false;
+}
+
+
+void
+BPoseView::OpenSelectionInNewWindow()
+{
+	// folders open in windows of their own, also with single window
+	// navigation
+	BMessage message(B_REFS_RECEIVED);
+	for (int32 index = 0; index < CountSelected(); index++) {
+		Model* model = fSelectionList->ItemAt(index)->TargetModel();
+		Model* resolved = model->ResolveIfLink();
+		if (resolved != NULL && resolved->IsDirectory())
+			message.AddRef("refs", resolved->EntryRef());
+		else if (model->IsDirectory())
+			message.AddRef("refs", model->EntryRef());
+	}
+
+	if (message.HasRef("refs"))
+		be_app->PostMessage(&message);
 }
 
 
