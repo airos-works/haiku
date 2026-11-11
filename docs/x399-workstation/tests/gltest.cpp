@@ -1,7 +1,9 @@
 /* OpenGL test and benchmark for Haiku's BGLView.
  *
  * Prints which renderer the OpenGL kit loaded and what it reports, then draws
- * a rotating lit object for a while and reports the frame rate.
+ * a rotating lit object for a while and reports the frame rate, and the CPU
+ * time the drawing thread and the whole program used per frame (what
+ * presenting costs the program; app_server's share is not in it).
  *
  * The window is a direct window, so that the renderer can put frames into the
  * screen's own frame buffer instead of sending them through the window system.
@@ -101,6 +103,8 @@ public:
 	// tested, for `seconds`, and return the frame rate.
 	// mode 0: clear only, 1: clear plus a triangle, 2: the lit sphere
 	int fMode = 2;
+	// CPU used before the run, for the cost per frame
+	bigtime_t fThreadCpu0 = 0, fTeamCpu0 = 0;
 
 	// Moving the window while the GPU is drawing into the screen: the frame is
 	// copied to where the window was when the clipping was last read, so a
@@ -138,6 +142,14 @@ public:
 
 		bigtime_t start = system_time();
 		bigtime_t end = start + (bigtime_t)(seconds * 1000000);
+		{
+			thread_info ti;
+			get_thread_info(find_thread(NULL), &ti);
+			fThreadCpu0 = ti.user_time + ti.kernel_time;
+			team_usage_info tu;
+			get_team_usage_info(B_CURRENT_TEAM, B_TEAM_USAGE_SELF, &tu);
+			fTeamCpu0 = tu.user_time + tu.kernel_time;
+		}
 		bigtime_t report = start + 1000000;
 		int64 frames = 0;
 		float angle = 0;
@@ -200,6 +212,17 @@ public:
 			}
 		}
 		double elapsed = (system_time() - start) / 1000000.0;
+		{
+			thread_info ti;
+			get_thread_info(find_thread(NULL), &ti);
+			team_usage_info tu;
+			get_team_usage_info(B_CURRENT_TEAM, B_TEAM_USAGE_SELF, &tu);
+			bigtime_t threadCpu = ti.user_time + ti.kernel_time - fThreadCpu0;
+			bigtime_t teamCpu = tu.user_time + tu.kernel_time - fTeamCpu0;
+			printf("CPU: drawing thread %.2f s (%.0f us/frame), whole team %.2f s (%.0f us/frame) over %.1f s\n",
+				threadCpu / 1e6, (double)threadCpu / (frames ? frames : 1), teamCpu / 1e6,
+				(double)teamCpu / (frames ? frames : 1), elapsed);
+		}
 
 		printf("%" B_PRId64 " frames in %.1f s: %.1f fps at %dx%d\n",
 			frames, elapsed, frames / elapsed, kWidth, kHeight);

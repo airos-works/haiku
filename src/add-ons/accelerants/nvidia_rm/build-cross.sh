@@ -201,6 +201,23 @@ $TOOLS-g++ -nostdlib -o "$OUT/bin/nvclone2dtest" \
 	-Wl,--no-undefined -Wl,-rpath-link,"$BUILD"
 echo "built nvclone2dtest into $OUT/bin"
 
+TOOLDIR=$OBJDIR/nvramptest
+mkdir -p "$TOOLDIR"
+for f in RampTest NvEngine2D sdk/ErrorUtils sdk/NvRmApi sdk/NvRmDevice; do
+	$TOOLS-g++ -std=c++20 "${FLAGS[@]}" -c "$SRC/$f.cpp" -o "$TOOLDIR/$(basename $f).o"
+done
+$TOOLS-gcc "${FLAGS[@]}" -c "$OGKM/src/common/shared/nvstatus/nvstatus.c" \
+	-o "$TOOLDIR/nvstatus.o"
+$TOOLS-g++ -nostdlib -o "$OUT/bin/nvramptest" \
+	"$OBJ/system/glue/arch/x86_64/crti.o" "$GCCLIB/crtbegin.o" \
+	"$OBJ/system/glue/start_dyn.o" "$OBJ/system/glue/init_term_dyn.o" \
+	"$TOOLDIR"/*.o \
+	"$OBJ/system/libroot/libroot.so" "$GCC_SYSLIBS_RUNTIME/lib/libstdc++.so" \
+	"$GCC_SYSLIBS_RUNTIME/lib/libgcc_s.so" "$GCCLIB/libgcc.a" \
+	"$GCCLIB/crtend.o" "$OBJ/system/glue/arch/x86_64/crtn.o" \
+	-Wl,--no-undefined -Wl,-rpath-link,"$BUILD"
+echo "built nvramptest into $OUT/bin"
+
 # Diagnostic tool: reads the frame buffer through a clone and checks that
 # what app_server draws reaches the screen (see FlushCheck.cpp). A GUI
 # program: its signature resource goes in with the host's rc and xres.
