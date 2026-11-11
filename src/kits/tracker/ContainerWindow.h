@@ -65,6 +65,7 @@ class Model;
 class ModelNodeLazyOpener;
 class BorderedView;
 class DetailsPane;
+class SidebarView;
 class SelectionWindow;
 class TShortcuts;
 class TemplatesMenu;
@@ -131,6 +132,7 @@ public:
 	virtual void DispatchMessage(BMessage* message, BHandler* handler);
 
 	void ShowDetailsPane(bool show);
+	void ShowSidebar(bool show);
 	virtual void WindowActivated(bool active);
 	virtual void FrameResized(float, float);
 	virtual void FrameMoved(BPoint);
@@ -365,6 +367,7 @@ private:
 	BMessageRunner* fStateSaveRunner;
 	BSplitView* fSplitView;
 	DetailsPane* fDetailsPane;
+	SidebarView* fSidebar;
 
 	typedef BWindow _inherited;
 
@@ -376,6 +379,7 @@ private:
 	void _UpdateUndoItems(BMenu* menu);
 	void _AddNavigatorView();
 	bool _CanHavePanes() const;
+	void _SizePanes(bool keepCurrentWidths = false);
 	BMenuItem* _AddPoseItem(BMenu* menu, const char* label, uint32 what,
 		char shortcut = 0, uint32 modifiers = 0);
 	void _AddDeleteImmediatelyItem(BMenu* menu);
