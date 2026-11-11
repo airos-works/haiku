@@ -2950,9 +2950,17 @@ vm_copy_on_write_area(VMCache* lowerCache,
 		for (VMArea* tempArea = upperCache->areas.First(); tempArea != NULL;
 				tempArea = upperCache->areas.GetNext(tempArea)) {
 			if (tempArea->page_protections != NULL) {
-				// Change the protection of all pages in this area.
+				// Change the protection of all pages in this area. The pages
+				// come in the order of their addresses: runs of adjacent
+				// pages with the same protection are changed in one go, which
+				// is several times faster than page by page (a heap that
+				// commits its memory with mprotect() is such an area, and
+				// this is what fork() spends its time on).
 				VMTranslationMap* map = tempArea->address_space->TranslationMap();
 				map->Lock();
+				addr_t runStart = 0;
+				addr_t runEnd = 0;
+				uint32 runProtection = 0;
 				for (VMCachePagesTree::Iterator it = lowerCache->pages.GetIterator();
 					vm_page* page = it.Next();) {
 					if (!is_page_in_area(tempArea, page))
@@ -2968,7 +2976,23 @@ vm_copy_on_write_area(VMCache* lowerCache,
 					if ((pageProtection & B_READ_AREA) != 0)
 						protection |= B_READ_AREA;
 
-					map->ProtectPage(tempArea, address, protection);
+					if (runEnd > runStart && address == runEnd
+						&& protection == runProtection) {
+						runEnd += B_PAGE_SIZE;
+						continue;
+					}
+
+					if (runEnd > runStart) {
+						map->Protect(runStart, runEnd - 1, runProtection,
+							tempArea->MemoryType());
+					}
+					runStart = address;
+					runEnd = address + B_PAGE_SIZE;
+					runProtection = protection;
+				}
+				if (runEnd > runStart) {
+					map->Protect(runStart, runEnd - 1, runProtection,
+						tempArea->MemoryType());
 				}
 				map->Unlock();
 				continue;
