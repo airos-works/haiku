@@ -41,6 +41,7 @@ All rights reserved.
 #include "Model.h"
 
 
+class BCardLayout;
 class BTextControl;
 class BEntry;
 
@@ -59,8 +60,13 @@ enum NavigationAction
 	kNavigatorCommandForward = 'NVFW',
 	kNavigatorCommandUp = 'NVUP',
 	kNavigatorCommandLocation = 'NVLC',
-	kNavigatorCommandSetFocus = 'NVSF'
+	kNavigatorCommandSetFocus = 'NVSF',
+	kNavigatorCommandHistory = 'NVHI',
+	kNavigatorCommandEndEditing = 'NVEE'
 };
+
+
+class BreadcrumbView;
 
 
 class BNavigator : public BToolBar {
@@ -69,6 +75,10 @@ public:
 	~BNavigator();
 
 	void UpdateLocation(const Model* newmodel, int32 action);
+	void UpdateViewMode(uint32 mode);
+		// marks the view mode button
+	void EndEditingIfUnfocused();
+		// back to the folder buttons once the typed path lost the focus
 
 	BContainerWindow* Window() const;
 
@@ -86,9 +96,17 @@ protected:
 
 	void GoTo();
 
+	void StartEditing();
+	void EndEditing();
+	void ShowHistoryMenu(bool back, BPoint where);
+	void GoHistory(bool back, int32 steps, bool option);
+
 private:
 	BPath fPath;
 	BTextControl* fLocation;
+	BreadcrumbView* fBreadcrumbs;
+	BCardLayout* fLocationCards;
+	bool fEditing;
 
 	BObjectList<BPath, true> fBackHistory;
 	BObjectList<BPath, true> fForwHistory;

@@ -1012,7 +1012,21 @@ BContainerWindow::SwitchDirectory(const entry_ref* ref)
 void
 BContainerWindow::DispatchMessage(BMessage* message, BHandler* handler)
 {
+	if (message->what == B_MOUSE_DOWN && Navigator() != NULL) {
+		// the back and forward buttons of a mouse
+		int32 buttons = message->GetInt32("buttons", 0);
+		if ((buttons & (B_MOUSE_BUTTON(4) | B_MOUSE_BUTTON(5))) != 0) {
+			BMessage navigate((buttons & B_MOUSE_BUTTON(4)) != 0
+				? kNavigatorCommandBackward : kNavigatorCommandForward);
+			PostMessage(&navigate, Navigator());
+			return;
+		}
+	}
+
 	_inherited::DispatchMessage(message, handler);
+
+	if (Navigator() != NULL)
+		Navigator()->EndEditingIfUnfocused();
 
 	// save a changed view a moment after the change instead of only when
 	// the window closes, so a crash or power loss does not lose it
@@ -1375,6 +1389,9 @@ BContainerWindow::WorkspacesChanged(uint32, uint32)
 void
 BContainerWindow::ViewModeChanged(uint32 oldMode, uint32 newMode)
 {
+	if (Navigator() != NULL)
+		Navigator()->UpdateViewMode(newMode);
+
 	if (fBackgroundImage == NULL)
 		return;
 
@@ -4614,6 +4631,10 @@ BContainerWindow::SetSingleWindowBrowseShortcuts(bool enabled)
 			new BMessage(kOpenSelection), PoseView());
 		AddShortcut('L', B_COMMAND_KEY,
 			new BMessage(kNavigatorCommandSetFocus), Navigator());
+		AddShortcut('[', B_COMMAND_KEY,
+			new BMessage(kNavigatorCommandBackward), Navigator());
+		AddShortcut(']', B_COMMAND_KEY,
+			new BMessage(kNavigatorCommandForward), Navigator());
 	} else {
 		RemoveShortcut(B_LEFT_ARROW, B_COMMAND_KEY);
 		RemoveShortcut(B_RIGHT_ARROW, B_COMMAND_KEY);
@@ -4636,6 +4657,8 @@ BContainerWindow::SetSingleWindowBrowseShortcuts(bool enabled)
 			new BMessage(kOpenParentDir), PoseView());
 			// command + option results in closing the parent window
 		RemoveShortcut('L', B_COMMAND_KEY);
+		RemoveShortcut('[', B_COMMAND_KEY);
+		RemoveShortcut(']', B_COMMAND_KEY);
 	}
 }
 
