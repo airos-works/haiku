@@ -25,6 +25,8 @@
 #include <edid.h>
 #include <safemode.h>
 #else
+#undef mutex_lock
+#undef mutex_unlock
 #define mutex_lock(...)
 #define mutex_unlock(...)
 #undef arch_cpu_enable_user_access

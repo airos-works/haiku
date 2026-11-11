@@ -3,9 +3,27 @@
 
 // Master switch:
 // 0: Disables all debug code that hasn't been enabled otherwise.
-// 1: Enables some lightweight debug code.
-// 2: Enables more debug code. Will impact performance.
-#define KDEBUG_LEVEL 2
+// 1: Enables some lightweight debug code. air/OS images are built at this
+//    level, as Haiku's release branches are.
+// 2: Enables more debug code (KDEBUG: assertions, out-of-line mutexes; heap
+//    fills, debug spinlocks, block cache compares, page access checks). Will
+//    seriously impact performance.
+//
+// The kernel and every kernel add-on must be built at the same level: struct
+// mutex, recursive_lock, vm_page and VMCache change their layout with it, and
+// the lock fast paths are inlined into add-ons. <debug.h> makes each kernel
+// object reference kernel_debug_level_<level>, which only a kernel of that
+// level defines, so a mismatched add-on fails to link (--no-undefined) or to
+// load ("unresolved symbol") instead of corrupting locks.
+//
+// For a debug kernel, build in a fresh output directory with
+//	TARGET_KERNEL_DEFINES += KDEBUG_LEVEL=2 ;
+// in its UserBuildConfig (jam does not rebuild objects whose flags alone
+// change), and pass -DKDEBUG_LEVEL=2 to out-of-tree kernel add-ons built
+// against it (linux-drm, nvidia_rm's build-cross.sh).
+#ifndef KDEBUG_LEVEL
+#define KDEBUG_LEVEL 1
+#endif
 
 #define KDEBUG_LEVEL_2	(KDEBUG_LEVEL >= 2)
 #define KDEBUG_LEVEL_1	(KDEBUG_LEVEL >= 1)

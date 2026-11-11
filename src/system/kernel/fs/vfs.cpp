@@ -1066,6 +1066,12 @@ free_vnode(struct vnode* vnode, bool reenter)
 static status_t
 dec_vnode_ref_count(struct vnode* vnode, bool alwaysFree, bool reenter)
 {
+	// The caller owns a reference. Saying so keeps GCC from following
+	// AutoLocker's NULL check into atomic_add() (-Wstringop-overflow on arm64
+	// without KDEBUG).
+	if (vnode == NULL)
+		ASSERT_UNREACHABLE();
+
 	ReadLocker locker(sVnodeLock);
 	AutoLocker<Vnode> nodeLocker(vnode);
 

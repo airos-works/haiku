@@ -546,6 +546,18 @@ VMSAv8TranslationMap::GetMemoryAttr(uint32 attributes, uint32 memoryType, bool i
 	if ((fHwFeature & HW_DIRTY) != 0 && (attr & kAttrSWDBM) != 0)
 		attr |= kAttrDBM;
 
+	// Kernel stacks start out accessed and writable. Exception and interrupt
+	// entry push their frame onto the stack, and a page that first gets
+	// written there faults inside the entry code, which cannot be handled
+	// ("unhandled pagefault" on the stack) on CPUs that leave the access flag
+	// and the dirty state to software, such as the Cortex-A72. With KDEBUG the
+	// stacks of kernel threads used to be filled at creation, which hid this.
+	if (isKernel && (attributes & B_KERNEL_STACK_AREA) != 0
+		&& (attr & kAttrSWDBM) != 0) {
+		attr &= ~kAttrAPReadOnly;
+		attr |= kAttrAF;
+	}
+
 	attr |= kAttrSHInnerShareable; // Inner Shareable
 
 	uint8_t type = MAIR_NORMAL_WB;

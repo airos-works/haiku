@@ -73,6 +73,10 @@ struct debug_strlcpy_parameters {
 };
 
 
+// The kernel's debug level, which every kernel add-on references (debug.h):
+// an add-on compiled at another level does not load.
+const char KDEBUG_LEVEL_MARKER = KDEBUG_LEVEL;
+
 static const char* const kKDLPrompt = "kdebug> ";
 static const char* const kKDLMessageCommandSeparator = "@!";
 	// separates panic() message from command list to execute
