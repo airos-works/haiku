@@ -38,6 +38,7 @@ All rights reserved.
 #include <GroupView.h>
 #include <MimeType.h>
 #include <StringList.h>
+#include <Path.h>
 #include <Window.h>
 
 #include "LockingList.h"
@@ -66,6 +67,7 @@ class ModelNodeLazyOpener;
 class BorderedView;
 class DetailsPane;
 class SidebarView;
+class TabBarView;
 class SelectionWindow;
 class TShortcuts;
 class TemplatesMenu;
@@ -133,6 +135,11 @@ public:
 
 	void ShowDetailsPane(bool show);
 	void ShowSidebar(bool show);
+
+	// tabs: other folders in the same window
+	int32 CountTabs() const { return fTabs.CountItems(); }
+	void GetTabs(BMessage* tabs) const;
+	void OpenInNewTab(const entry_ref& ref, bool select);
 	virtual void WindowActivated(bool active);
 	virtual void FrameResized(float, float);
 	virtual void FrameMoved(BPoint);
@@ -369,6 +376,16 @@ private:
 	DetailsPane* fDetailsPane;
 	SidebarView* fSidebar;
 
+	struct TabInfo {
+		entry_ref ref;
+		BObjectList<BPath, true> back;
+		BObjectList<BPath, true> forward;
+		TabInfo() : back(8), forward(8) {}
+	};
+	BObjectList<TabInfo, true> fTabs;
+	int32 fCurrentTab;
+	TabBarView* fTabBar;
+
 	typedef BWindow _inherited;
 
 	friend int32 show_context_menu(void*);
@@ -380,6 +397,11 @@ private:
 	void _AddNavigatorView();
 	bool _CanHavePanes() const;
 	void _SizePanes(bool keepCurrentWidths = false);
+	bool _CanHaveTabs() const;
+	void _SelectTab(int32 index);
+	void _CloseTab(int32 index);
+	void _UpdateTabBar();
+	void _RestoreTabs(const BMessage* tabs);
 	BMenuItem* _AddPoseItem(BMenu* menu, const char* label, uint32 what,
 		char shortcut = 0, uint32 modifiers = 0);
 	void _AddDeleteImmediatelyItem(BMenu* menu);

@@ -88,6 +88,12 @@ public:
 	void ClearSearch();
 		// a new folder starts unfiltered
 
+	// each tab of a window has its own history
+	void TakeHistory(BObjectList<BPath, true>& back,
+		BObjectList<BPath, true>& forward);
+	void SetHistory(BObjectList<BPath, true>& back,
+		BObjectList<BPath, true>& forward);
+
 	BContainerWindow* Window() const;
 
 protected:

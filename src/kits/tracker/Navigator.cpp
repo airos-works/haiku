@@ -379,6 +379,34 @@ BNavigator::UpdateViewMode(uint32 mode)
 
 
 void
+BNavigator::TakeHistory(BObjectList<BPath, true>& back,
+	BObjectList<BPath, true>& forward)
+{
+	back.MakeEmpty();
+	forward.MakeEmpty();
+	while (!fBackHistory.IsEmpty())
+		back.AddItem(fBackHistory.RemoveItemAt(0));
+	while (!fForwHistory.IsEmpty())
+		forward.AddItem(fForwHistory.RemoveItemAt(0));
+}
+
+
+void
+BNavigator::SetHistory(BObjectList<BPath, true>& back,
+	BObjectList<BPath, true>& forward)
+{
+	fBackHistory.MakeEmpty();
+	fForwHistory.MakeEmpty();
+	while (!back.IsEmpty())
+		fBackHistory.AddItem(back.RemoveItemAt(0));
+	while (!forward.IsEmpty())
+		fForwHistory.AddItem(forward.RemoveItemAt(0));
+	SetActionEnabled(kNavigatorCommandForward, fForwHistory.CountItems() > 0);
+	SetActionEnabled(kNavigatorCommandBackward, fBackHistory.CountItems() > 1);
+}
+
+
+void
 BNavigator::ClearSearch()
 {
 	if (fSearch->Text()[0] == '\0')

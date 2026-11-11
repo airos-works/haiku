@@ -397,6 +397,15 @@ TTracker::QuitRequested()
 							message.AddString("paths", path.Path());
 
 						message.AddInt8(path.Path(), flags);
+
+						if (window->CountTabs() > 1) {
+							// its other tabs come back with it
+							BMessage tabs;
+							window->GetTabs(&tabs);
+							BString name("tabs:");
+							name << path.Path();
+							message.AddMessage(name.String(), &tabs);
+						}
 					}
 				}
 			}
@@ -1559,6 +1568,7 @@ TTracker::_OpenPreviouslyOpenedWindows(const char* pathFilter)
 					restoreStateFromMessage = true;
 				}
 
+				entry_ref windowRef = *model->EntryRef();
 				if (restoreStateFromMessage) {
 					OpenContainerWindow(model, 0, kOpen, kRestoreWorkspace
 						| (flags & kOpenWindowMinimized ? kIsHidden : 0U)
@@ -1567,6 +1577,28 @@ TTracker::_OpenPreviouslyOpenedWindows(const char* pathFilter)
 					OpenContainerWindow(model, 0, kOpen, kRestoreWorkspace
 						| (flags & kOpenWindowMinimized ? kIsHidden : 0U)
 						| kRestoreDecor);
+				}
+
+				BString tabsName("tabs:");
+				tabsName << path;
+				BMessage tabs;
+				if (message.FindMessage(tabsName.String(), &tabs) == B_OK) {
+					// the window just opened: the newest one for the folder
+					// that is not the Desktop
+					AutoLock<WindowList> lock(&fWindowList);
+					for (int32 index = fWindowList.CountItems() - 1;
+							index >= 0; index--) {
+						BContainerWindow* window = dynamic_cast<BContainerWindow*>(
+							fWindowList.ItemAt(index));
+						if (window == NULL || dynamic_cast<BDeskWindow*>(window)
+								!= NULL || window->TargetModel() == NULL
+							|| *window->TargetModel()->EntryRef() != windowRef) {
+							continue;
+						}
+						tabs.what = kRestoreTabs;
+						window->PostMessage(&tabs);
+						break;
+					}
 				}
 			} else
 				delete model;

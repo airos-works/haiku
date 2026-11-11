@@ -78,6 +78,7 @@ All rights reserved.
 #include "DeskWindow.h"
 #include "DetailsPane.h"
 #include "SidebarView.h"
+#include "TabBarView.h"
 #include "DraggableContainerIcon.h"
 #include "FSClipboard.h"
 #include "FolderStateStore.h"
@@ -434,7 +435,10 @@ BContainerWindow::BContainerWindow(LockingList<BWindow>* list, uint32 openFlags,
 	fStateSaveRunner(NULL),
 	fSplitView(NULL),
 	fDetailsPane(NULL),
-	fSidebar(NULL)
+	fSidebar(NULL),
+	fTabs(4),
+	fCurrentTab(0),
+	fTabBar(NULL)
 {
 	InitIconPreloader();
 
@@ -547,6 +551,14 @@ BContainerWindow::Minimize(bool minimize)
 bool
 BContainerWindow::QuitRequested()
 {
+	// Close (Cmd-W) closes the shown tab; the window's close button closes
+	// the window with all of them
+	if (fTabs.CountItems() > 1 && CurrentMessage() != NULL
+		&& CurrentMessage()->HasPointer("source")) {
+		_CloseTab(fCurrentTab);
+		return false;
+	}
+
 	// this is a response to the DeskBar sending us a B_QUIT, when it really
 	// means to say close all your windows. It might be better to have it
 	// send a kCloseAllWindows message and have windowless apps stay running,
@@ -1043,6 +1055,24 @@ BContainerWindow::SwitchDirectory(const entry_ref* ref)
 void
 BContainerWindow::DispatchMessage(BMessage* message, BHandler* handler)
 {
+	if (message->what == B_MOUSE_DOWN && handler == PoseView()
+		&& (message->GetInt32("buttons", 0) & B_TERTIARY_MOUSE_BUTTON) != 0
+		&& _CanHaveTabs()) {
+		// a middle click on a folder opens it in a tab behind
+		BPoint where;
+		int32 index;
+		if (message->FindPoint("be:view_where", &where) == B_OK) {
+			BPose* pose = PoseView()->FindPose(where, &index);
+			if (pose != NULL) {
+				Model* model = pose->TargetModel()->ResolveIfLink();
+				if (model != NULL && model->IsDirectory()) {
+					OpenInNewTab(*model->EntryRef(), false);
+					return;
+				}
+			}
+		}
+	}
+
 	if (message->what == B_MOUSE_DOWN && Navigator() != NULL) {
 		// the back and forward buttons of a mouse
 		int32 buttons = message->GetInt32("buttons", 0);
@@ -1095,6 +1125,176 @@ BContainerWindow::_AddNavigatorView()
 		fRootLayout->AddView(fRootLayout->IndexOfView(fSplitView), fNavigator);
 	else
 		fPoseContainer->GridLayout()->AddView(fNavigator, 0, 0, 2);
+}
+
+
+bool
+BContainerWindow::_CanHaveTabs() const
+{
+	return _CanHavePanes() && Navigator() != NULL;
+}
+
+
+void
+BContainerWindow::OpenInNewTab(const entry_ref& ref, bool select)
+{
+	if (!_CanHaveTabs())
+		return;
+
+	BEntry entry(&ref, true);
+	entry_ref folder;
+	if (!entry.IsDirectory() || entry.GetRef(&folder) != B_OK)
+		return;
+
+	if (fTabs.IsEmpty()) {
+		// the window becomes its first tab
+		TabInfo* first = new TabInfo;
+		first->ref = *TargetModel()->EntryRef();
+		fTabs.AddItem(first);
+		fCurrentTab = 0;
+	}
+
+	TabInfo* tab = new TabInfo;
+	tab->ref = folder;
+	tab->back.AddItem(new BPath(&folder));
+	fTabs.AddItem(tab, fCurrentTab + 1);
+	if (select)
+		_SelectTab(fCurrentTab + 1);
+	else
+		_UpdateTabBar();
+}
+
+
+void
+BContainerWindow::_SelectTab(int32 index)
+{
+	TabInfo* tab = fTabs.ItemAt(index);
+	if (tab == NULL || index == fCurrentTab)
+		return;
+
+	// the history goes with the tab
+	TabInfo* current = fTabs.ItemAt(fCurrentTab);
+	if (current != NULL && Navigator() != NULL)
+		Navigator()->TakeHistory(current->back, current->forward);
+	fCurrentTab = index;
+	if (Navigator() != NULL)
+		Navigator()->SetHistory(tab->back, tab->forward);
+
+	BMessage message(kSwitchDirectory);
+	message.AddRef("refs", &tab->ref);
+	message.AddInt32("action", kActionUpdatePath);
+	PostMessage(&message);
+	_UpdateTabBar();
+}
+
+
+void
+BContainerWindow::_CloseTab(int32 index)
+{
+	if (fTabs.CountItems() <= 1) {
+		PostMessage(B_QUIT_REQUESTED);
+		return;
+	}
+	if (index < 0 || index >= fTabs.CountItems())
+		return;
+
+	if (index != fCurrentTab) {
+		delete fTabs.RemoveItemAt(index);
+		if (index < fCurrentTab)
+			fCurrentTab--;
+		_UpdateTabBar();
+		return;
+	}
+
+	// the shown one: show the next (or the one before) instead
+	int32 next = index < fTabs.CountItems() - 1 ? index + 1 : index - 1;
+	TabInfo* nextTab = fTabs.ItemAt(next);
+	if (Navigator() != NULL)
+		Navigator()->SetHistory(nextTab->back, nextTab->forward);
+	entry_ref ref = nextTab->ref;
+	delete fTabs.RemoveItemAt(index);
+	fCurrentTab = fTabs.IndexOf(nextTab);
+
+	BMessage message(kSwitchDirectory);
+	message.AddRef("refs", &ref);
+	message.AddInt32("action", kActionUpdatePath);
+	PostMessage(&message);
+
+	if (fTabs.CountItems() == 1) {
+		// one left: the window is a plain window again
+		fTabs.MakeEmpty();
+		fCurrentTab = 0;
+	}
+	_UpdateTabBar();
+}
+
+
+void
+BContainerWindow::_UpdateTabBar()
+{
+	if (fTabs.CountItems() <= 1) {
+		if (fTabBar != NULL && !fTabBar->IsHidden())
+			fTabBar->Hide();
+		return;
+	}
+
+	if (fTabBar == NULL) {
+		fTabBar = new TabBarView();
+		fRootLayout->AddView(fRootLayout->IndexOfView(fMenuContainer) + 1,
+			fTabBar);
+	} else if (fTabBar->IsHidden())
+		fTabBar->Show();
+
+	BStringList labels;
+	for (int32 i = 0; i < fTabs.CountItems(); i++) {
+		TabInfo* tab = fTabs.ItemAt(i);
+		labels.Add(i == fCurrentTab ? TargetModel()->Name() : tab->ref.name);
+	}
+	fTabBar->SetTabs(labels, fCurrentTab);
+}
+
+
+void
+BContainerWindow::GetTabs(BMessage* tabs) const
+{
+	for (int32 i = 0; i < fTabs.CountItems(); i++) {
+		BPath path(&fTabs.ItemAt(i)->ref);
+		if (path.InitCheck() == B_OK)
+			tabs->AddString("path", path.Path());
+	}
+	tabs->AddInt32("current", fCurrentTab);
+}
+
+
+void
+BContainerWindow::_RestoreTabs(const BMessage* tabs)
+{
+	// the window shows the tab that was shown; the others come back beside
+	if (!_CanHaveTabs() || !fTabs.IsEmpty())
+		return;
+
+	int32 current = tabs->GetInt32("current", 0);
+	const char* path;
+	for (int32 i = 0; tabs->FindString("path", i, &path) == B_OK; i++) {
+		entry_ref ref;
+		BEntry entry(path);
+		if (i == current)
+			ref = *TargetModel()->EntryRef();
+		else if (!entry.IsDirectory() || entry.GetRef(&ref) != B_OK)
+			continue;
+		TabInfo* tab = new TabInfo;
+		tab->ref = ref;
+		if (i != current)
+			tab->back.AddItem(new BPath(path));
+		fTabs.AddItem(tab);
+		if (i == current)
+			fCurrentTab = fTabs.CountItems() - 1;
+	}
+	if (fTabs.CountItems() <= 1) {
+		fTabs.MakeEmpty();
+		fCurrentTab = 0;
+	}
+	_UpdateTabBar();
 }
 
 
@@ -1425,6 +1625,10 @@ BContainerWindow::_UpdateExtraItems(BMenu* menu)
 		item->SetEnabled(PoseView()->SelectionIsExpandable());
 
 	item = menu->FindItem(kOpenInNewWindow);
+	if (item != NULL)
+		item->SetEnabled(PoseView()->SelectionHasDirectory());
+
+	item = menu->FindItem(kOpenInNewTab);
 	if (item != NULL)
 		item->SetEnabled(PoseView()->SelectionHasDirectory());
 
@@ -2156,9 +2360,74 @@ BContainerWindow::MessageReceived(BMessage* message)
 					int32 action = message->GetInt32("action", kActionSet);
 					Navigator()->UpdateLocation(TargetModel(), action);
 				}
+
+				TabInfo* tab = fTabs.ItemAt(fCurrentTab);
+				if (tab != NULL) {
+					tab->ref = *TargetModel()->EntryRef();
+					_UpdateTabBar();
+				}
 			}
 			break;
 		}
+
+		case kNewTab:
+		{
+			entry_ref ref;
+			if (message->FindRef("refs", &ref) != B_OK) {
+				OpenInNewTab(*TargetModel()->EntryRef(), true);
+				break;
+			}
+			bool background = message->GetBool("background", false);
+			for (int32 i = 0; message->FindRef("refs", i, &ref) == B_OK; i++)
+				OpenInNewTab(ref, !background && i == 0);
+			break;
+		}
+
+		case kSelectTab:
+			_SelectTab(message->GetInt32("index", fCurrentTab));
+			break;
+
+		case kCloseTab:
+			_CloseTab(message->GetInt32("index", fCurrentTab));
+			break;
+
+		case kNextTab:
+		case kPreviousTab:
+			if (fTabs.CountItems() > 1) {
+				int32 count = fTabs.CountItems();
+				int32 delta = message->what == kNextTab ? 1 : count - 1;
+				_SelectTab((fCurrentTab + delta) % count);
+			}
+			break;
+
+		case kTabDrop:
+		{
+			// dropped on a tab: into its folder
+			TabInfo* tab = fTabs.ItemAt(message->GetInt32("index", -1));
+			if (tab == NULL)
+				break;
+			BEntry destination(&tab->ref);
+			struct stat destStat;
+			if (destination.GetStat(&destStat) != B_OK)
+				break;
+			BObjectList<entry_ref, true>* list
+				= new BObjectList<entry_ref, true>(10);
+			bool sameVolume = true;
+			entry_ref ref;
+			for (int32 i = 0; message->FindRef("refs", i, &ref) == B_OK; i++) {
+				list->AddItem(new entry_ref(ref));
+				if (ref.device != destStat.st_dev)
+					sameVolume = false;
+			}
+			FSMoveToFolder(list, new BEntry(destination),
+				sameVolume && (modifiers() & B_OPTION_KEY) == 0
+					? kMoveSelectionTo : kCopySelectionTo, NULL);
+			break;
+		}
+
+		case kRestoreTabs:
+			_RestoreTabs(message);
+			break;
 
 		case B_REFS_RECEIVED:
 		{
@@ -2358,6 +2627,12 @@ BContainerWindow::AddFileMenu(BMenu* menu)
 		findItem->SetShortcut('F', B_SHIFT_KEY);
 	}
 	menu->AddItem(findItem);
+	if (_CanHaveTabs()) {
+		BMenuItem* tabItem = new BMenuItem(B_TRANSLATE("New tab"),
+			new BMessage(kNewTab), 'T');
+		tabItem->SetTarget(this);
+		menu->AddItem(tabItem);
+	}
 	if (ShouldHaveNewFolderItem()) {
 		menu->AddItem(Shortcuts()->NewFolderItem());
 		_AddPoseItem(menu, B_TRANSLATE("New folder with selection"),
@@ -3260,6 +3535,8 @@ BContainerWindow::AddPoseContextMenu(BMenu* menu)
 {
 	menu->AddItem(Shortcuts()->OpenItem());
 	_AddPoseItem(menu, B_TRANSLATE("Open in new window"), kOpenInNewWindow);
+	if (_CanHaveTabs())
+		_AddPoseItem(menu, B_TRANSLATE("Open in new tab"), kOpenInNewTab);
 	// "Edit query" and "Open with..." inserted here,
 	// see UpdateMenu(), SetupEditQueryItem() and SetupOpenWithMenu()
 	menu->AddItem(Shortcuts()->QuickLookItem());
@@ -4908,6 +5185,8 @@ BContainerWindow::SetSingleWindowBrowseShortcuts(bool enabled)
 			new BMessage(kNavigatorCommandSetFocus), Navigator());
 		AddShortcut('F', B_COMMAND_KEY,
 			new BMessage(kNavigatorCommandSearchFocus), Navigator());
+		AddShortcut(B_PAGE_DOWN, B_COMMAND_KEY, new BMessage(kNextTab), this);
+		AddShortcut(B_PAGE_UP, B_COMMAND_KEY, new BMessage(kPreviousTab), this);
 		AddShortcut('[', B_COMMAND_KEY,
 			new BMessage(kNavigatorCommandBackward), Navigator());
 		AddShortcut(']', B_COMMAND_KEY,

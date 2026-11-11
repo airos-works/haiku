@@ -91,6 +91,7 @@ All rights reserved.
 #include "BatchRenameWindow.h"
 #include "FSUndoRedo.h"
 #include "FolderSizes.h"
+#include "TabBarView.h"
 #include "Tags.h"
 #include "FSUtils.h"
 #include "FilePanelPriv.h"
@@ -2641,6 +2642,22 @@ BPoseView::MessageReceived(BMessage* message)
 		case kOpenInNewWindow:
 			OpenSelectionInNewWindow();
 			break;
+
+		case kOpenInNewTab:
+		{
+			// folders open in tabs of this window, behind the shown one
+			BMessage tabs(kNewTab);
+			for (int32 index = 0; index < CountSelected(); index++) {
+				Model* model = fSelectionList->ItemAt(index)->TargetModel()
+					->ResolveIfLink();
+				if (model != NULL && model->IsDirectory())
+					tabs.AddRef("refs", model->EntryRef());
+			}
+			tabs.AddBool("background", true);
+			if (tabs.HasRef("refs") && Window() != NULL)
+				Window()->PostMessage(&tabs);
+			break;
+		}
 
 		case kUnmountVolume:
 			UnmountSelectedVolumes();

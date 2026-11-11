@@ -88,6 +88,7 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 			SlowMenu.cpp
 			StatusWindow.cpp
 			TaskLoop.cpp
+			TabBarView.cpp
 			Tags.cpp
 			TemplatesMenu.cpp
 			Tests.cpp
@@ -159,6 +160,7 @@ DoCatalogs libtracker.so :
 	Shortcuts.cpp
 	SidebarView.cpp
 	StatusWindow.cpp
+	TabBarView.cpp
 	Tags.cpp
 	TemplatesMenu.cpp
 	TextWidget.cpp
