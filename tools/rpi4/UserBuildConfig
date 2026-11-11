@@ -134,11 +134,14 @@ rule UserBuildConfigRulePreImage
 		SEARCH on $(glDemos) = [ FDirName $(extras) apps ] ;
 		AddFilesToHaikuImage system non-packaged demos : $(glDemos) ;
 
-		# The onboard Wi-Fi chip's firmware (CYW43455), from
-		# tools/rpi4/fetch-wifi-firmware.sh
+		# The onboard Wi-Fi chip's firmware (CYW43455; CYW43456 on the
+		# Pi 400), from tools/rpi4/fetch-wifi-firmware.sh
 		local wifiFirmware = <rpi4-wifi>brcmfmac43455-sdio.bin
 			<rpi4-wifi>brcmfmac43455-sdio.clm_blob
-			<rpi4-wifi>brcmfmac43455-sdio.txt ;
+			<rpi4-wifi>brcmfmac43455-sdio.txt
+			<rpi4-wifi>brcmfmac43456-sdio.bin
+			<rpi4-wifi>brcmfmac43456-sdio.clm_blob
+			<rpi4-wifi>brcmfmac43456-sdio.txt ;
 		SEARCH on $(wifiFirmware) = /mnt/HaikuWork/rpi4/wifi/firmware ;
 		AddFilesToHaikuImage system non-packaged data firmware broadcomfmac
 			: $(wifiFirmware) ;

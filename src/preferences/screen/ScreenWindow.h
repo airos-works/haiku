@@ -103,6 +103,8 @@ private:
 			bool				fUndoIsScale;
 									// the last apply changed the scale of
 									// the single display, not its mode
+			bool				fUndoScaleAndMode;
+									// ... or both of them
 			bool				fBootWorkspaceApplied;
 
 			DisplayLayoutState	fCurrentLayout;
