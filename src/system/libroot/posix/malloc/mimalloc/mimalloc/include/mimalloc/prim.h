@@ -149,6 +149,7 @@ bool _mi_prim_thread_is_in_threadpool(void);
         || (defined(__BIONIC__)  && (defined(__x86_64__) || defined(__i386__) || (defined(__arm__) && __ARM_ARCH >= 7) || defined(__aarch64__))) \
         || (defined(__FreeBSD__) && (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__))) \
         || (defined(__OpenBSD__) && (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__))) \
+        || (defined(MI_HAIKU_LIBROOT) && (defined(__x86_64__) || defined(__aarch64__))) \
       ))
 
 static inline void* mi_prim_tls_slot(size_t slot) mi_attr_noexcept {
@@ -234,7 +235,11 @@ static inline void mi_prim_tls_slot_set(size_t slot, void* value) mi_attr_noexce
 
 
 // defined in `init.c`; do not use these directly
+#if defined(MI_HAIKU_LIBROOT)
+#define __mi_theap_main   (*(mi_theap_t**)mi_haiku_tls_slot_address(MI_HAIKU_TLS_SLOT_MAIN))
+#else
 extern mi_decl_hidden mi_decl_thread mi_theap_t* __mi_theap_main;     // theap belonging to the main heap
+#endif
 extern mi_decl_hidden bool _mi_process_is_initialized;                // has mi_process_init been called?
 
 
@@ -370,6 +375,14 @@ static inline mi_theap_t* _mi_theap_cached(void);
   #define MI_TLS_MODEL_FIXED_SLOT_CACHED    109
   // we used before __PTK_FRAMEWORK_OLDGC_KEY9 (89) but that seems used now.
   // see <https://github.com/rweichler/substrate/blob/master/include/pthread_machdep.h>
+#elif defined(MI_HAIKU_LIBROOT)
+  // Haiku's libroot: the kernel gives every thread an array of TLS slots at
+  // the thread pointer, and libroot reserves fixed ones for its allocator
+  // (headers/private/system/tls.h). No ELF TLS is used: its blocks come from
+  // the runtime loader and are freed before the heap's thread exit hook runs.
+  #define MI_TLS_MODEL_FIXED_SLOT           1
+  #define MI_TLS_MODEL_FIXED_SLOT_DEFAULT   MI_HAIKU_TLS_SLOT_DEFAULT
+  #define MI_TLS_MODEL_FIXED_SLOT_CACHED    MI_HAIKU_TLS_SLOT_CACHED
 #elif defined(__OpenBSD__) || defined(__ANDROID__)
   #define MI_TLS_MODEL_DYNAMIC_PTHREADS     1
   // #define MI_TLS_MODEL_DYNAMIC_PTHREADS_DEFAULT_ENTRY_IS_NULL  1

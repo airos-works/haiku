@@ -1,0 +1,29 @@
+SubDir HAIKU_TOP src system libroot posix malloc mimalloc ;
+
+UsePrivateHeaders libroot shared ;
+
+local architectureObject ;
+for architectureObject in [ MultiArchSubDirSetup ] {
+	on $(architectureObject) {
+		local architecture = $(TARGET_PACKAGING_ARCH) ;
+
+		UsePrivateSystemHeaders ;
+		SubDirSysHdrs [ FDirName $(SUBDIR) mimalloc include ] ;
+		SubDirSysHdrs [ FDirName $(SUBDIR) mimalloc src ] ;
+
+		# None of mimalloc's own symbols leave libroot: an application may
+		# bring its own copy along.
+		SubDirCcFlags -fvisibility=hidden -DNDEBUG -DMI_SECURE=0 -O3
+			-fno-builtin-malloc -Wno-unused-function -Wno-array-bounds ;
+
+		MergeObject <$(architecture)>posix_malloc.o :
+			libroot_malloc.c
+			;
+
+		# static.c includes the platform primitives by a path relative to
+		# the including file, which the header scan does not follow.
+		Depends [ FGristFiles libroot_malloc.o ]
+			: [ Glob [ FDirName $(SUBDIR) mimalloc src prim ] : *.c ]
+				[ Glob [ FDirName $(SUBDIR) mimalloc src prim haiku ] : *.c ] ;
+	}
+}

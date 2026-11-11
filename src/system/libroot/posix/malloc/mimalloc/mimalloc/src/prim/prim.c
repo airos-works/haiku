@@ -21,6 +21,9 @@ terms of the MIT license. A copy of the license can be found in the file
 #elif defined(__EMSCRIPTEN__)
 #include "emscripten/prim.c" // emmalloc_*, + pthread support
 
+#elif defined(MI_HAIKU_LIBROOT)
+#include "haiku/prim.c"    // Haiku's libroot (the system allocator)
+
 #else
 #include "unix/prim.c"     // mmap() (Linux, macOSX, BSD, Illumnos, Haiku, DragonFly, etc.)
 

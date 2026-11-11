@@ -1,4 +1,12 @@
 SubDir HAIKU_TOP src system libroot posix malloc ;
 
 HaikuSubInclude debug ;
-HaikuSubInclude openbsd ;
+
+# The allocator of libroot.so. HAIKU_LIBROOT_MALLOC = mimalloc (for example in
+# UserBuildConfig) selects mimalloc instead of the default, the OpenBSD
+# allocator. See mimalloc/README.haiku.
+if $(HAIKU_LIBROOT_MALLOC) = mimalloc {
+	HaikuSubInclude mimalloc ;
+} else {
+	HaikuSubInclude openbsd ;
+}

@@ -27,11 +27,25 @@ typedef struct mi_thread_locals_s {
 
 static mi_thread_locals_t mi_thread_locals_empty = { 0, {NULL} };
 
+#if defined(MI_HAIKU_LIBROOT)
+// a fixed TLS slot that starts out as NULL
+#define mi_thread_locals_slot  (*(mi_thread_locals_t**)mi_haiku_tls_slot_address(MI_HAIKU_TLS_SLOT_LOCALS))
+static inline mi_thread_locals_t* mi_thread_locals_get(void) {
+  mi_thread_locals_t* const tls = mi_thread_locals_slot;
+  return (tls != NULL ? tls : &mi_thread_locals_empty);
+}
+static inline void mi_thread_locals_set(mi_thread_locals_t* tls) {
+  mi_thread_locals_slot = (tls == &mi_thread_locals_empty ? NULL : tls);
+}
+#else
 mi_decl_thread mi_thread_locals_t* mi_thread_locals = &mi_thread_locals_empty;  // always point to a valid `mi_thread_locals_t`
+static inline mi_thread_locals_t* mi_thread_locals_get(void) { return mi_thread_locals; }
+static inline void mi_thread_locals_set(mi_thread_locals_t* tls) { mi_thread_locals = tls; }
+#endif
 
 // dynamically reallocate the thread local slots when needed
 static mi_thread_locals_t* mi_thread_locals_expand(mi_thread_local_t atleast) {
-  mi_thread_locals_t* tls_old = mi_thread_locals;
+  mi_thread_locals_t* tls_old = mi_thread_locals_get();
   const size_t count_old = tls_old->count;
   size_t count;
   if (count_old==0) {
@@ -50,7 +64,7 @@ static mi_thread_locals_t* mi_thread_locals_expand(mi_thread_local_t atleast) {
   mi_thread_locals_t* tls = (mi_thread_locals_t*)mi_rezalloc(tls_old, sizeof(mi_thread_locals_t) + count*sizeof(void*));
   if mi_unlikely(tls==NULL) return NULL;
   tls->count = count;
-  mi_thread_locals = tls;
+  mi_thread_locals_set(tls);
   return tls;
 }
 
@@ -59,7 +73,7 @@ static mi_decl_noinline bool mi_thread_local_set_expand( mi_thread_local_t key, 
   mi_thread_locals_t* tls = mi_thread_locals_expand(key);
   if (tls==NULL) return false;
   mi_assert_internal(key < tls->count);
-  mi_assert_internal(tls == mi_thread_locals);
+  mi_assert_internal(tls == mi_thread_locals_get());
   tls->slots[key] = val;
   return true;
 }
@@ -67,7 +81,7 @@ static mi_decl_noinline bool mi_thread_local_set_expand( mi_thread_local_t key, 
 // set a tls slot; returns `true` if successful.
 // Can return `false` if we could not reallocate the slots array.
 bool _mi_thread_local_set( mi_thread_local_t key, void* val ) {
-  mi_thread_locals_t* tls = mi_thread_locals;
+  mi_thread_locals_t* tls = mi_thread_locals_get();
   mi_assert_internal(tls!=NULL);
   if mi_likely(key < tls->count) {
     tls->slots[key] = val;
@@ -80,7 +94,7 @@ bool _mi_thread_local_set( mi_thread_local_t key, void* val ) {
 
 // get a tls slot value
 void* _mi_thread_local_get( mi_thread_local_t key ) {
-  const mi_thread_locals_t* const tls = mi_thread_locals;
+  const mi_thread_locals_t* const tls = mi_thread_locals_get();
   mi_assert_internal(tls!=NULL);
   if mi_likely(key < tls->count) {
     return tls->slots[key];
@@ -91,10 +105,10 @@ void* _mi_thread_local_get( mi_thread_local_t key ) {
 }
 
 void _mi_thread_locals_thread_done(void) {
-  mi_thread_locals_t* const tls = mi_thread_locals;
+  mi_thread_locals_t* const tls = mi_thread_locals_get();
   if (tls!=NULL && tls->count > 0) {
     mi_free(tls);
-    mi_thread_locals = &mi_thread_locals_empty;
+    mi_thread_locals_set(&mi_thread_locals_empty);
   }
 }
 

@@ -443,7 +443,11 @@ static _Atomic(size_t) warning_count; // = 0;  // when >= max_warning_count stop
 // variables on demand. This is why we use a _mi_preloading test on such
 // platforms. However, C code generator may move the initial thread local address
 // load before the `if` and we therefore split it out in a separate function.
+#if defined(MI_HAIKU_LIBROOT)
+static bool recurse = false;    // no ELF TLS in libroot's allocator; this only guards the message output
+#else
 static mi_decl_thread bool recurse = false;
+#endif
 
 static mi_decl_noinline bool mi_recurse_enter_prim(void) {
   if (recurse) return false;

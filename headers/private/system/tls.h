@@ -22,6 +22,11 @@ enum {
 	TLS_USER_THREAD_SLOT,
 	TLS_DYNAMIC_THREAD_VECTOR,
 	TLS_MALLOC_SLOT,
+	TLS_MALLOC_CACHED_SLOT,
+	TLS_MALLOC_MAIN_SLOT,
+	TLS_MALLOC_LOCALS_SLOT,
+		// the three above are only used by the mimalloc allocator
+		// (HAIKU_LIBROOT_MALLOC = mimalloc)
 	TLS_LOCALE_SLOT,
 
 	// Note: these entries can safely be changed between

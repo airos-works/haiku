@@ -2004,6 +2004,7 @@ static void mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subpro
     size_t max_purge_count = (visit_all ? max_arena : (max_arena/4)+1);
     bool all_visited = true;
     bool any_purged = false;
+    mi_msecs_t pending_expire = 0;  // haiku: the earliest purge that is scheduled but not due yet
     for (size_t _i = 0; _i < max_arena; _i++) {
       size_t i = _i + arena_start;
       if (i >= max_arena) { i -= max_arena; }
@@ -2017,10 +2018,19 @@ static void mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subpro
           }
           max_purge_count--;
         }
+        else {
+          const mi_msecs_t expire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
+          if (expire != 0 && (pending_expire == 0 || expire < pending_expire)) { pending_expire = expire; }
+        }
       }
     }
     if (all_visited && !any_purged) {
-      mi_atomic_storei64_release(&subproc->purge_expire, 0);
+      // haiku: Do not forget the purges that are not due yet. A visit of all
+      // arenas (a thread exits, say) right after a burst of frees used to
+      // clear the global expiration; the arenas kept theirs, so that nothing
+      // set the global one again, and the memory was only returned by a
+      // forced collection.
+      mi_atomic_storei64_release(&subproc->purge_expire, pending_expire);
     }
   }
 }

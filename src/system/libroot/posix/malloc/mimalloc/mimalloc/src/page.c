@@ -998,6 +998,16 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
     }
   }
 
+  #if defined(MI_HAIKU_LIBROOT)
+  // A purge that is due should not wait for the next page to become free or
+  // for the next collection (every 10000 calls of this function): after a
+  // burst of frees a program would keep the memory for as long as it only
+  // allocates a little. This is one load while nothing is scheduled.
+  if mi_unlikely(mi_atomic_loadi64_relaxed(&theap->tld->subproc->purge_expire) != 0) {
+    _mi_arenas_collect(false, false, theap->tld);
+  }
+  #endif
+
   // find (or allocate) a page of the right size
   mi_page_t* page = mi_find_page(theap, size, huge_alignment);
   if mi_unlikely(page == NULL) { // first time out of memory, try to collect and retry the allocation once more
