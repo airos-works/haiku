@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <sys/stat.h>
 
+#include <Autolock.h>
+#include <Bitmap.h>
 #include <Directory.h>
 #include <File.h>
 #include <FindDirectory.h>
@@ -28,7 +30,8 @@ typedef BQuickLookAddOn* (*instantiate_function)(image_id);
 
 AddOnManager::AddOnManager()
 	:
-	fScanned(false)
+	fScanned(false),
+	fLock("quick look add-ons")
 {
 }
 
@@ -43,6 +46,7 @@ BQuickLookPreview*
 AddOnManager::CreatePreview(const entry_ref& ref, BString* mimeType,
 	BString* error)
 {
+	BAutolock locker(fLock);
 	if (!fScanned || _DirectoriesChanged())
 		_Rescan();
 
@@ -76,6 +80,48 @@ AddOnManager::CreatePreview(const entry_ref& ref, BString* mimeType,
 		}
 	}
 	return NULL;
+}
+
+
+status_t
+AddOnManager::CreateThumbnail(const entry_ref& ref, int32 size,
+	BString* mimeType, BBitmap** _bitmap)
+{
+	BAutolock locker(fLock);
+	if (!fScanned || _DirectoriesChanged())
+		_Rescan();
+
+	*mimeType = _TypeOf(ref);
+
+	struct Bid {
+		float			score;
+		BQuickLookAddOn* addOn;
+	};
+	std::vector<Bid> bids;
+	for (size_t i = 0; i < fAddOns.size(); i++) {
+		float score = fAddOns[i].addOn->Supports(ref, mimeType->String());
+		if (score > 0)
+			bids.push_back({score, fAddOns[i].addOn});
+	}
+	std::stable_sort(bids.begin(), bids.end(),
+		[](const Bid& a, const Bid& b) { return a.score > b.score; });
+
+	// the add-ons are not unloaded while the server runs, so they may work
+	// without the lock (the panel would otherwise wait for a thumbnail)
+	locker.Unlock();
+
+	status_t status = B_NOT_SUPPORTED;
+	for (size_t i = 0; i < bids.size(); i++) {
+		BBitmap* bitmap = NULL;
+		status = bids[i].addOn->CreateThumbnail(ref, mimeType->String(), size,
+			&bitmap);
+		if (status == B_OK && bitmap != NULL) {
+			*_bitmap = bitmap;
+			return B_OK;
+		}
+		delete bitmap;
+	}
+	return status == B_OK ? B_ERROR : status;
 }
 
 

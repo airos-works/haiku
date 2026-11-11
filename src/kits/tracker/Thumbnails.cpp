@@ -9,14 +9,17 @@
 #include "Thumbnails.h"
 
 #include <list>
+#include <set>
 #include <fs_attr.h>
 
 #include <Application.h>
 #include <Autolock.h>
 #include <BitmapStream.h>
+#include <Messenger.h>
 #include <Mime.h>
 #include <Node.h>
 #include <NodeInfo.h>
+#include <Roster.h>
 #include <TranslatorFormats.h>
 #include <TranslatorRoster.h>
 #include <TranslationUtils.h>
@@ -26,9 +29,11 @@
 
 #include <AutoDeleter.h>
 #include <JobQueue.h>
+#include <QuickLookDefs.h>
 
 #include "Attributes.h"
 #include "Commands.h"
+#include "FolderSizes.h"
 #include "FSUtils.h"
 #include "TrackerSettings.h"
 
@@ -125,6 +130,7 @@ public:
 			BSize requestedSize, color_space colorSpace)
 		: BJob("GenerateThumbnail"),
 		  fMimeType(model->MimeType()),
+		  fRef(*model->EntryRef()),
 		  fRequestedSize(requestedSize),
 		  fColorSpace(colorSpace)
 	{
@@ -153,6 +159,7 @@ public:
 
 public:
 	const BString fMimeType;
+	const entry_ref fRef;
 	const node_ref fNodeRef;
 	const BSize fRequestedSize;
 	const color_space fColorSpace;
@@ -162,19 +169,104 @@ private:
 };
 
 
+// Types nothing makes a thumbnail of, as the quick_look server said; not
+// asked again until Tracker restarts.
+static std::set<BString> sNoThumbnailTypes;
+static BLocker sNoThumbnailTypesLock("no thumbnail types");
+
+// Files whose thumbnail could not be made: until they change, their type's
+// icon is shown instead of asking again at every redraw.
+static std::set<std::pair<dev_t, ino_t> > sFailedNodes;
+
+
+static bool
+ThumbnailFailedBefore(const node_ref& node)
+{
+	BAutolock locker(sNoThumbnailTypesLock);
+	return sFailedNodes.find(std::make_pair(node.device, node.node))
+		!= sFailedNodes.end();
+}
+
+
+static bool
+IsImageType(const char* type)
+{
+	return type != NULL && BString(type).IStartsWith("image");
+}
+
+
+static BBitmap*
+ThumbnailFromQuickLook(const entry_ref& ref, const char* mimeType, int32 size)
+{
+	// videos, documents and the like: the Quick Look add-ons draw them, in
+	// the quick_look server, so their code never runs in Tracker
+	BMessenger server(B_QUICK_LOOK_SIGNATURE);
+	if (!server.IsValid()) {
+		// started on demand; give it a moment to be there
+		be_roster->Launch(B_QUICK_LOOK_SIGNATURE);
+		for (int32 i = 0; i < 20 && !server.IsValid(); i++) {
+			snooze(100000);
+			server = BMessenger(B_QUICK_LOOK_SIGNATURE);
+		}
+		if (!server.IsValid())
+			return NULL;
+	}
+
+	BMessage request(kMsgQuickLookThumbnail);
+	request.AddRef("ref", &ref);
+	request.AddInt32("size", size);
+	BMessage reply;
+	if (server.SendMessage(&request, &reply, 5000000, 60000000) != B_OK)
+		return NULL;
+
+	BMessage archive;
+	if (reply.FindMessage("bitmap", &archive) == B_OK) {
+		BBitmap* bitmap = new BBitmap(&archive);
+		if (bitmap->InitCheck() == B_OK)
+			return bitmap;
+		delete bitmap;
+		return NULL;
+	}
+
+	if (reply.GetInt32("error", B_ERROR) == B_NOT_SUPPORTED) {
+		BAutolock locker(sNoThumbnailTypesLock);
+		sNoThumbnailTypes.insert(BString(mimeType));
+	}
+	return NULL;
+}
+
+
 status_t
 GenerateThumbnailJob::Execute()
 {
-	BBitmapStream imageStream;
-	status_t status = BTranslatorRoster::Default()->Translate(fFile, NULL, NULL,
-		&imageStream, B_TRANSLATOR_BITMAP, 0, fMimeType);
-	if (status != B_OK)
-		return status;
+	BBitmap* image = NULL;
+	status_t status;
+	bool isImage = IsImageType(fMimeType);
+	if (isImage) {
+		BBitmapStream imageStream;
+		status = BTranslatorRoster::Default()->Translate(fFile, NULL, NULL,
+			&imageStream, B_TRANSLATOR_BITMAP, 0, fMimeType);
+		if (status != B_OK)
+			return status;
 
-	BBitmap* image;
-	status = imageStream.DetachBitmap(&image);
-	if (status != B_OK)
-		return status;
+		status = imageStream.DetachBitmap(&image);
+		if (status != B_OK)
+			return status;
+	} else {
+		image = ThumbnailFromQuickLook(fRef, fMimeType, B_XXL_ICON);
+		if (image == NULL) {
+			{
+				BAutolock locker(sNoThumbnailTypesLock);
+				sFailedNodes.insert(std::make_pair(fNodeRef.device,
+					fNodeRef.node));
+			}
+			// draw the type's icon instead
+			BMessage message(kUpdateThumbnail);
+			if (message.AddNodeRef("noderef", &fNodeRef) == B_OK)
+				be_app->PostMessage(&message);
+			return B_NOT_SUPPORTED;
+		}
+	}
 
 	// we have translated the image file into a BBitmap
 
@@ -200,13 +292,20 @@ GenerateThumbnailJob::Execute()
 
 	// write values to attributes
 	bool thumbnailWritten = false;
-	const int32 width = image->Bounds().IntegerWidth() + 1;
-	const size_t written = fFile->WriteAttr("Media:Width", B_INT32_TYPE,
-		0, &width, sizeof(int32));
-	if (written == sizeof(int32)) {
-		// first attribute succeeded, write the rest
-		const int32 height = image->Bounds().IntegerHeight() + 1;
-		fFile->WriteAttr("Media:Height", B_INT32_TYPE, 0, &height, sizeof(int32));
+	bool canWrite = true;
+	if (isImage) {
+		// the picture's size, for a column; not for a page or a frame
+		const int32 width = image->Bounds().IntegerWidth() + 1;
+		const size_t written = fFile->WriteAttr("Media:Width", B_INT32_TYPE,
+			0, &width, sizeof(int32));
+		canWrite = written == sizeof(int32);
+		if (canWrite) {
+			const int32 height = image->Bounds().IntegerHeight() + 1;
+			fFile->WriteAttr("Media:Height", B_INT32_TYPE, 0, &height,
+				sizeof(int32));
+		}
+	}
+	if (canWrite) {
 
 		// convert image into a 128x128 WebP image and stash it
 		BBitmap thumb(NULL, false);
@@ -390,8 +489,16 @@ GetThumbnailFromAttr(Model* model, BBitmap* icon, BSize size)
 		}
 	}
 
-	if (ShouldGenerateThumbnail(model->MimeType()))
+	if (ShouldGenerateThumbnail(model->MimeType())) {
+		// not over the network: reading a whole video to draw an icon is
+		// slow there
+		if (!IsImageType(model->MimeType())
+			&& (!CanCalculateFolderSizes(model->NodeRef()->device)
+				|| ThumbnailFailedBefore(*model->NodeRef()))) {
+			return B_NOT_SUPPORTED;
+		}
 		return GenerateThumbnail(model, icon->ColorSpace(), size);
+	}
 
 	return B_NOT_SUPPORTED;
 }
@@ -400,10 +507,24 @@ GetThumbnailFromAttr(Model* model, BBitmap* icon, BSize size)
 bool
 ShouldGenerateThumbnail(const char* type)
 {
-	// check generate thumbnail setting,
-	// mime type must be an image (for now)
-	return TrackerSettings().GenerateImageThumbnails()
-		&& type != NULL && BString(type).IStartsWith("image");
+	// images through the translators, everything else through the Quick
+	// Look add-ons unless they said they cannot
+	if (!TrackerSettings().GenerateImageThumbnails() || type == NULL)
+		return false;
+	if (IsImageType(type))
+		return true;
+
+	BString string(type);
+	if (string.Length() == 0 || string == B_FILE_MIME_TYPE
+		|| string.IStartsWith("application/x-vnd.be")
+		|| string.IStartsWith("application/x-vnd.haiku")
+		|| string == "application/x-vnd.Be-elfexecutable") {
+		// executables, folders, queries, people files: their icons say more
+		return false;
+	}
+
+	BAutolock locker(sNoThumbnailTypesLock);
+	return sNoThumbnailTypes.find(string) == sNoThumbnailTypes.end();
 }
 
 

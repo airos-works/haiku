@@ -15,6 +15,7 @@
 */
 
 
+#include <Bitmap.h>
 #include <DirectWindow.h>
 #include <Entry.h>
 #include <String.h>
@@ -90,8 +91,18 @@ public:
 	virtual	BQuickLookPreview*	CreatePreview(const entry_ref& ref,
 									const char* mimeType, BString* error) = 0;
 
+	/*!	A still picture of the entry for Tracker's thumbnails (a video's
+		frame, a document's first page), at most size pixels wide and high,
+		in B_RGBA32 with transparency where there is no picture. The caller
+		owns *_bitmap. It runs on a thread of its own, may take a moment,
+		but should not take seconds. The default says B_NOT_SUPPORTED.
+		(It takes the first reserved slot, so add-ons built before it was
+		added still load; they just make no thumbnails.) */
+	virtual	status_t			CreateThumbnail(const entry_ref& ref,
+									const char* mimeType, int32 size,
+									BBitmap** _bitmap);
+
 private:
-	virtual	void				_ReservedQuickLookAddOn1();
 	virtual	void				_ReservedQuickLookAddOn2();
 	virtual	void				_ReservedQuickLookAddOn3();
 	virtual	void				_ReservedQuickLookAddOn4();

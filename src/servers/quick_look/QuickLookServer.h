@@ -12,6 +12,7 @@
 class AddOnManager;
 class BMessageRunner;
 class PreviewWindow;
+class Thumbnailer;
 
 
 /*!	A BServer rather than a BApplication: only BServer's constructor asks
@@ -36,6 +37,7 @@ private:
 			AddOnManager*		fAddOns;
 			PreviewWindow*		fWindow;
 			BMessageRunner*		fQuitRunner;
+			Thumbnailer*		fThumbnailer;
 };
 
 

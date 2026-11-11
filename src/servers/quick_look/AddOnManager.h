@@ -9,11 +9,13 @@
 #include <vector>
 
 #include <Entry.h>
+#include <Locker.h>
 #include <Path.h>
 #include <String.h>
 #include <image.h>
 
 
+class BBitmap;
 class BQuickLookAddOn;
 class BQuickLookPreview;
 
@@ -33,6 +35,12 @@ public:
 		does, with the type found in *mimeType and the last error. */
 			BQuickLookPreview*	CreatePreview(const entry_ref& ref,
 									BString* mimeType, BString* error);
+
+			/*!	A thumbnail from the best add-on that makes one, or
+				B_NOT_SUPPORTED. Called from the thumbnail thread. */
+			status_t			CreateThumbnail(const entry_ref& ref,
+									int32 size, BString* mimeType,
+									BBitmap** _bitmap);
 
 			int32				CountAddOns() const { return fAddOns.size(); }
 
@@ -56,6 +64,8 @@ private:
 			std::vector<Directory> fDirectories;
 			std::vector<AddOn>	fAddOns;
 			bool				fScanned;
+			BLocker				fLock;
+				// the panel and the thumbnail thread both use the add-ons
 };
 
 

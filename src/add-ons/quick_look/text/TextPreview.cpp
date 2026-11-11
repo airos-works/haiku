@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <Bitmap.h>
 #include <Catalog.h>
 #include <File.h>
 #include <Font.h>
@@ -224,6 +225,70 @@ public:
 				return 0.3f;
 		}
 		return 0;
+	}
+
+	virtual status_t CreateThumbnail(const entry_ref& ref,
+		const char* mimeType, int32 size, BBitmap** _bitmap)
+	{
+		// a page with the first lines on it
+		BFile file(&ref, B_READ_ONLY);
+		if (file.InitCheck() != B_OK)
+			return file.InitCheck();
+
+		char buffer[4096];
+		ssize_t bytes = file.Read(buffer, sizeof(buffer) - 1);
+		if (bytes < 0)
+			return bytes;
+		buffer[bytes] = '\0';
+
+		float pageWidth = floorf(size * 0.78f);
+		BRect bounds(0, 0, pageWidth - 1, size - 1);
+		BBitmap* bitmap = new BBitmap(bounds, B_RGBA32, true);
+		BView* view = new BView(bounds, "page", 0, 0);
+		bitmap->AddChild(view);
+		if (!bitmap->Lock()) {
+			delete bitmap;
+			return B_ERROR;
+		}
+
+		view->SetHighColor(255, 255, 255);
+		view->FillRect(bounds);
+		view->SetHighColor(190, 190, 190);
+		view->StrokeRect(bounds);
+
+		BFont font(be_fixed_font);
+		font.SetSize(std::max(3.0f, size / 16.0f));
+		view->SetFont(&font);
+		font_height height;
+		font.GetHeight(&height);
+		float lineHeight = ceilf(height.ascent + height.descent);
+		float margin = std::max(2.0f, floorf(size / 14.0f));
+		float y = margin + height.ascent;
+
+		view->SetHighColor(60, 60, 60);
+		const char* line = buffer;
+		while (*line != '\0' && y < bounds.bottom - margin) {
+			const char* end = strchr(line, '\n');
+			int32 length = end != NULL ? end - line : strlen(line);
+			BString text(line, std::min(length, (int32)200));
+			text.ReplaceAll("\t", "    ");
+			text.ReplaceAll("\r", "");
+			view->TruncateString(&text, B_TRUNCATE_END,
+				bounds.Width() - 2 * margin);
+			view->DrawString(text.String(), BPoint(margin, y));
+			y += lineHeight;
+			if (end == NULL)
+				break;
+			line = end + 1;
+		}
+
+		view->Sync();
+		bitmap->RemoveChild(view);
+		delete view;
+		bitmap->Unlock();
+
+		*_bitmap = bitmap;
+		return B_OK;
 	}
 
 	virtual BQuickLookPreview* CreatePreview(const entry_ref& ref,

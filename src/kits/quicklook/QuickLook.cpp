@@ -83,7 +83,23 @@ BQuickLookAddOn::~BQuickLookAddOn()
 }
 
 
-void BQuickLookAddOn::_ReservedQuickLookAddOn1() {}
+status_t
+BQuickLookAddOn::CreateThumbnail(const entry_ref& ref, const char* mimeType,
+	int32 size, BBitmap** _bitmap)
+{
+	return B_NOT_SUPPORTED;
+}
+
+
+// Add-ons built before CreateThumbnail() took the first reserved slot point
+// that slot here.
+extern "C" status_t
+_ZN15BQuickLookAddOn24_ReservedQuickLookAddOn1Ev(BQuickLookAddOn* addOn)
+{
+	return B_NOT_SUPPORTED;
+}
+
+
 void BQuickLookAddOn::_ReservedQuickLookAddOn2() {}
 void BQuickLookAddOn::_ReservedQuickLookAddOn3() {}
 void BQuickLookAddOn::_ReservedQuickLookAddOn4() {}

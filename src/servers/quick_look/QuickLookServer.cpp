@@ -17,6 +17,7 @@
 
 #include "AddOnManager.h"
 #include "PreviewWindow.h"
+#include "Thumbnailer.h"
 
 
 static const uint32 kMsgQuitIfIdle = 'quit';
@@ -31,7 +32,8 @@ QuickLookServer::QuickLookServer()
 	BServer(B_QUICK_LOOK_SIGNATURE, true, NULL),
 	fAddOns(new AddOnManager()),
 	fWindow(NULL),
-	fQuitRunner(NULL)
+	fQuitRunner(NULL),
+	fThumbnailer(NULL)
 {
 }
 
@@ -39,6 +41,7 @@ QuickLookServer::QuickLookServer()
 QuickLookServer::~QuickLookServer()
 {
 	delete fQuitRunner;
+	delete fThumbnailer;
 	delete fAddOns;
 }
 
@@ -72,8 +75,18 @@ QuickLookServer::MessageReceived(BMessage* message)
 			_ArmQuitTimer();
 			break;
 
+		case kMsgQuickLookThumbnail:
+			// answered from the thumbnail thread
+			if (fThumbnailer == NULL)
+				fThumbnailer = new Thumbnailer(fAddOns);
+			fThumbnailer->Add(DetachCurrentMessage());
+			_ArmQuitTimer();
+			break;
+
 		case kMsgQuitIfIdle:
-			if (fWindow == NULL || !fWindow->IsShowing())
+			if (fThumbnailer != NULL && fThumbnailer->IsBusy())
+				_ArmQuitTimer();
+			else if (fWindow == NULL || !fWindow->IsShowing())
 				PostMessage(B_QUIT_REQUESTED);
 			break;
 

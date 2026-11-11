@@ -630,6 +630,80 @@ public:
 	{
 		return new DocumentPreview(ref, mimeType);
 	}
+
+	virtual status_t CreateThumbnail(const entry_ref& ref,
+		const char* mimeType, int32 size, BBitmap** _bitmap)
+	{
+		// the first page, as large as fits in size
+		BPath path(&ref);
+		if (path.InitCheck() != B_OK)
+			return B_BAD_VALUE;
+
+		fz_context* context = fz_new_context(NULL, NULL, FZ_STORE_DEFAULT);
+		if (context == NULL)
+			return B_NO_MEMORY;
+
+		status_t status = B_ERROR;
+		fz_document* document = NULL;
+		fz_pixmap* pixmap = NULL;
+		BBitmap* bitmap = NULL;
+		fz_try(context) {
+			fz_register_document_handlers(context);
+			document = fz_open_document(context, path.Path());
+			if (fz_needs_password(context, document))
+				fz_throw(context, FZ_ERROR_GENERIC, "locked");
+			if (fz_is_document_reflowable(context, document))
+				fz_layout_document(context, document, 480, 640, 12);
+
+			fz_page* page = fz_load_page(context, document, 0);
+			fz_rect bounds = fz_bound_page(context, page);
+			fz_drop_page(context, page);
+			float width = bounds.x1 - bounds.x0;
+			float height = bounds.y1 - bounds.y0;
+			if (width <= 0 || height <= 0)
+				fz_throw(context, FZ_ERROR_GENERIC, "empty page");
+			float scale = std::min(size / width, size / height);
+
+			pixmap = fz_new_pixmap_from_page_number(context, document, 0,
+				fz_scale(scale, scale), fz_device_bgr(context), 0);
+			int pixWidth = fz_pixmap_width(context, pixmap);
+			int pixHeight = fz_pixmap_height(context, pixmap);
+			int components = fz_pixmap_components(context, pixmap);
+			int stride = fz_pixmap_stride(context, pixmap);
+			const uint8* samples = fz_pixmap_samples(context, pixmap);
+			if (components != 3)
+				fz_throw(context, FZ_ERROR_GENERIC, "unexpected pixmap");
+
+			bitmap = new BBitmap(BRect(0, 0, pixWidth - 1, pixHeight - 1),
+				B_RGBA32);
+			uint8* bits = (uint8*)bitmap->Bits();
+			int32 bytesPerRow = bitmap->BytesPerRow();
+			for (int y = 0; y < pixHeight; y++) {
+				const uint8* in = samples + y * stride;
+				uint8* out = bits + y * bytesPerRow;
+				for (int x = 0; x < pixWidth; x++) {
+					out[0] = in[0];
+					out[1] = in[1];
+					out[2] = in[2];
+					out[3] = 255;
+					in += 3;
+					out += 4;
+				}
+			}
+			status = B_OK;
+		} fz_always(context) {
+			fz_drop_pixmap(context, pixmap);
+			fz_drop_document(context, document);
+		} fz_catch(context) {
+			delete bitmap;
+			bitmap = NULL;
+			status = B_ERROR;
+		}
+		fz_drop_context(context);
+
+		*_bitmap = bitmap;
+		return status;
+	}
 };
 
 

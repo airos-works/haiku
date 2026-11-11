@@ -923,6 +923,9 @@ BContainerWindow::RestoreStateCommon()
 	if (fUsesLayout)
 		InitLayout();
 
+	if (Navigator() != NULL)
+		Navigator()->UpdateViewMode(PoseView()->ViewMode());
+
 	UpdateBackgroundImage();
 }
 
@@ -972,6 +975,8 @@ BContainerWindow::SwitchDirectory(const entry_ref* ref)
 
 	// Update pose view and set directory type
 	PoseView()->SwitchDir(ref, opener.StreamNode());
+	if (Navigator() != NULL)
+		Navigator()->UpdateViewMode(PoseView()->ViewMode());
 
 	if (wasInTrash ^ (TargetModel()->IsTrash() || TargetModel()->InTrash())
 		|| wasRoot != TargetModel()->IsRoot() || wasVolume != TargetModel()->IsVolume()) {

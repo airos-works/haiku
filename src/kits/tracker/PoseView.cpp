@@ -3438,8 +3438,15 @@ BPoseView::SetViewMode(uint32 newMode)
 	EnableScrollBars();
 	ContainerWindow()->ViewModeChanged(oldMode, newMode);
 
-	if (KeepArranged())
+	if (KeepArranged()) {
+		// laid out again from the top: what was in view moved anyway
 		ArrangePoses();
+		DisableScrollBars();
+		ScrollTo(B_ORIGIN);
+		UpdateScrollRange();
+		SetScrollBarsTo(B_ORIGIN);
+		EnableScrollBars();
+	}
 }
 
 
@@ -3945,8 +3952,11 @@ BPoseView::ArrangePoses()
 	RecalcExtent();
 	ResetPosePlacementHint();
 
+	// the rows start at the left and top: stay where one was within them
 	BPoint origin(LeftTop());
-	PinPointToValidRange(origin);
+	origin.x = 0;
+	origin.y = std::max(0.0f, std::min(origin.y,
+		fExtent.bottom - Bounds().Height()));
 	UpdateScrollRange();
 	if (origin != LeftTop()) {
 		ScrollTo(origin);

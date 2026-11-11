@@ -31,7 +31,13 @@ enum {
 	//! Server to owner: the panel is up for its entries.
 	kMsgQuickLookShown			= 'QLsn',
 	//! Server to owner: the panel was closed (close button, Open, replaced).
-	kMsgQuickLookClosed			= 'QLcl'
+	kMsgQuickLookClosed			= 'QLcl',
+
+	/*!	A thumbnail for "ref" (entry_ref) at most "size" (int32) pixels on
+		a side, made by the add-ons on a thread of their own. The reply has
+		"bitmap" (an archived BBitmap) or "error" (int32): B_NOT_SUPPORTED
+		when nothing makes thumbnails of that type. */
+	kMsgQuickLookThumbnail		= 'QLtn'
 };
 
 
