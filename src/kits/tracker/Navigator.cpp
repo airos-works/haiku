@@ -35,22 +35,33 @@ All rights reserved.
 
 #include "Navigator.h"
 
+#include <algorithm>
+
 #include <Bitmap.h>
 #include <Button.h>
 #include <CardLayout.h>
 #include <Catalog.h>
 #include <ControlLook.h>
 #include <Locale.h>
+#include <Directory.h>
+#include <FindDirectory.h>
+#include <MenuField.h>
 #include <MenuItem.h>
 #include <MessageFilter.h>
+#include <NodeInfo.h>
+#include <Volume.h>
 #include <PopUpMenu.h>
 #include <TextControl.h>
 #include <Window.h>
 
 #include "Bitmaps.h"
 #include "BreadcrumbView.h"
+#include "Attributes.h"
 #include "Commands.h"
+#include "FindPanel.h"
+#include "MimeTypes.h"
 #include "PoseView.h"
+#include "Utilities.h"
 #include "FSUtils.h"
 #include "Tracker.h"
 
@@ -136,6 +147,32 @@ ViewModeIcon(uint32 mode)
 }
 
 
+enum {
+	kSearchThisFolder = 0,
+	kSearchBelow,
+	kSearchAllDisks
+};
+
+
+static filter_result
+SearchKeyFilter(BMessage* message, BHandler** target, BMessageFilter* filter)
+{
+	// Escape clears the search and goes back to the items
+	int32 key;
+	if (message->FindInt32("raw_char", &key) == B_OK && key == B_ESCAPE) {
+		BContainerWindow* window
+			= dynamic_cast<BContainerWindow*>(filter->Looper());
+		if (window != NULL && window->Navigator() != NULL) {
+			BMessage clear(kNavigatorCommandSearchClear);
+			window->PostMessage(&clear, window->Navigator());
+		}
+		return B_SKIP_MESSAGE;
+	}
+
+	return B_DISPATCH_MESSAGE;
+}
+
+
 static filter_result
 LocationKeyFilter(BMessage* message, BHandler** target, BMessageFilter* filter)
 {
@@ -198,6 +235,37 @@ BNavigator::BNavigator(const Model* model)
 	fBreadcrumbs = new BreadcrumbView(this);
 	fLocationCards = NULL;
 	fEditing = false;
+	fSearchScope = kSearchThisFolder;
+
+	fSearch = new BTextControl("search", NULL, "",
+		new BMessage(kNavigatorCommandSearchGo));
+	fSearch->SetModificationMessage(new BMessage(kNavigatorCommandSearch));
+	fSearch->SetToolTip(B_TRANSLATE("Search: typing shows only the items "
+		"that match; Return searches the chosen places"));
+	fSearch->SetExplicitMinSize(BSize(be_plain_font->StringWidth("M") * 9,
+		B_SIZE_UNSET));
+	fSearch->SetExplicitMaxSize(BSize(be_plain_font->StringWidth("M") * 14,
+		B_SIZE_UNSET));
+
+	BPopUpMenu* scopeMenu = new BPopUpMenu("scope");
+	const char* scopes[] = {
+		B_TRANSLATE("This folder"),
+		B_TRANSLATE("This folder and below"),
+		B_TRANSLATE("All disks")
+	};
+	for (int32 i = 0; i < 3; i++) {
+		BMessage* message = new BMessage(kNavigatorCommandSearchScope);
+		message->AddInt32("scope", i);
+		BMenuItem* item = new BMenuItem(scopes[i], message);
+		item->SetMarked(i == kSearchThisFolder);
+		scopeMenu->AddItem(item);
+	}
+	fScopeField = new BMenuField("scope", NULL, scopeMenu);
+	float scopeWidth = 0;
+	for (int32 i = 0; i < 3; i++)
+		scopeWidth = std::max(scopeWidth, be_plain_font->StringWidth(scopes[i]));
+	fScopeField->SetExplicitMaxSize(BSize(scopeWidth
+		+ be_control_look->DefaultLabelSpacing() * 6, B_SIZE_UNSET));
 
 	GroupLayout()->SetInsets(0.0f, 0.0f, B_USE_HALF_ITEM_INSETS, 1.0f);
 		// 1px bottom inset used for border
@@ -270,6 +338,15 @@ BNavigator::AttachedToWindow()
 	SetActionEnabled(kNavigatorCommandBackward, false);
 	SetActionEnabled(kNavigatorCommandForward, false);
 
+	// search
+	AddView(fSearch);
+	AddView(fScopeField);
+	fSearch->SetTarget(this);
+	fScopeField->Menu()->SetTargetForItems(this);
+	BMessageFilter* searchFilter = new BMessageFilter(B_KEY_DOWN,
+		SearchKeyFilter);
+	fSearch->TextView()->AddFilter(searchFilter);
+
 	// the view modes
 	AddSeparator();
 	BHandler* poseView = Window() != NULL ? (BHandler*)Window()->PoseView()
@@ -298,6 +375,115 @@ BNavigator::UpdateViewMode(uint32 mode)
 	SetActionPressed(kIconMode, mode == kIconMode);
 	SetActionPressed(kMiniIconMode, mode == kMiniIconMode);
 	SetActionPressed(kListMode, mode == kListMode);
+}
+
+
+void
+BNavigator::ClearSearch()
+{
+	if (fSearch->Text()[0] == '\0')
+		return;
+
+	fSearch->SetText("");
+	if (Window() != NULL && Window()->PoseView() != NULL)
+		Window()->PoseView()->SetSearchFilter("");
+}
+
+
+static BString
+NamePattern(const char* text)
+{
+	// name contains text, any case: "*[rR][eE][pP][oO][rR][tT]*"
+	BString pattern("*");
+	for (const char* c = text; *c != '\0'; c++) {
+		unsigned char ch = (unsigned char)*c;
+		if (ch < 0x80 && isalpha(ch)) {
+			pattern << '[' << (char)tolower(ch) << (char)toupper(ch) << ']';
+		} else {
+			if (strchr("*?[]\\\"'", ch) != NULL)
+				pattern << '\\';
+			pattern << (char)ch;
+		}
+	}
+	pattern << '*';
+	return pattern;
+}
+
+
+void
+BNavigator::RunSearchQuery()
+{
+	// a live query, the same kind the Find window makes, opened in its own
+	// window
+	BString text(fSearch->Text());
+	text.Trim();
+	if (text.Length() == 0)
+		return;
+
+	BPath queries;
+	if (find_directory(B_USER_DIRECTORY, &queries, true) != B_OK
+		|| queries.Append("queries") != B_OK) {
+		return;
+	}
+	create_directory(queries.Path(), 0755);
+
+	BString name(B_TRANSLATE_COMMENT("Search for %text",
+		"Name of the query file a search makes"));
+	name.ReplaceFirst("%text", text);
+	name.ReplaceAll("/", "-");
+	BPath path(queries);
+	path.Append(name.String());
+
+	BFile file(path.Path(), B_READ_WRITE | B_CREATE_FILE | B_ERASE_FILE);
+	if (file.InitCheck() != B_OK)
+		return;
+
+	BNodeInfo(&file).SetType(B_QUERY_MIMETYPE);
+
+	BString predicate("(name==\"");
+	predicate << NamePattern(text.String()) << "\")";
+	file.WriteAttrString(kAttrQueryString, &predicate);
+
+	if (fSearchScope == kSearchBelow) {
+		// this volume, and only below this folder
+		entry_ref folder;
+		if (get_ref_for_path(fPath.Path(), &folder) == B_OK) {
+			BMessage directories;
+			directories.AddRef("refs", &folder);
+			BString buffer;
+			ssize_t size = directories.FlattenedSize();
+			char* data = buffer.LockBuffer(size);
+			directories.Flatten(data, size);
+			file.WriteAttr("_trk/directories", B_MESSAGE_TYPE, 0, data, size);
+			buffer.UnlockBuffer(0);
+
+			BVolume volume(folder.device);
+			BMessage volumes;
+			EmbedUniqueVolumeInfo(&volumes, &volume);
+			size = volumes.FlattenedSize();
+			data = buffer.LockBuffer(size);
+			volumes.Flatten(data, size);
+			file.WriteAttr(kAttrQueryVolume, B_MESSAGE_TYPE, 0, data, size);
+			buffer.UnlockBuffer(0);
+		}
+	}
+
+	MoreOptionsStruct options;
+	options.temporary = true;
+	file.WriteAttr(kAttrQueryMoreOptions, B_RAW_TYPE, 0, &options,
+		sizeof(options));
+
+	int32 now = (int32)time(NULL);
+	file.WriteAttr(kAttrQueryLastChange, B_INT32_TYPE, 0, &now, sizeof(now));
+	file.Unset();
+
+	entry_ref ref;
+	if (get_ref_for_path(path.Path(), &ref) != B_OK)
+		return;
+
+	BMessage open(B_REFS_RECEIVED);
+	open.AddRef("refs", &ref);
+	be_app->PostMessage(&open);
 }
 
 
@@ -444,6 +630,34 @@ BNavigator::MessageReceived(BMessage* message)
 
 		case kNavigatorCommandEndEditing:
 			EndEditing();
+			break;
+
+		case kNavigatorCommandSearch:
+			// the items of this folder that match, as one types
+			if (Window() != NULL && Window()->PoseView() != NULL)
+				Window()->PoseView()->SetSearchFilter(fSearch->Text());
+			break;
+
+		case kNavigatorCommandSearchGo:
+			if (fSearchScope != kSearchThisFolder)
+				RunSearchQuery();
+			break;
+
+		case kNavigatorCommandSearchFocus:
+			fSearch->MakeFocus();
+			fSearch->TextView()->SelectAll();
+			break;
+
+		case kNavigatorCommandSearchScope:
+			fSearchScope = message->GetInt32("scope", kSearchThisFolder);
+			if (fSearchScope != kSearchThisFolder && fSearch->Text()[0] != '\0')
+				RunSearchQuery();
+			break;
+
+		case kNavigatorCommandSearchClear:
+			ClearSearch();
+			if (Window() != NULL && Window()->PoseView() != NULL)
+				Window()->PoseView()->MakeFocus();
 			break;
 
 		case kNavigatorCommandHistory:
@@ -648,4 +862,8 @@ BNavigator::UpdateLocation(const Model* newmodel, int32 action)
 		fLocation->SetText(fPath.Path());
 
 	fBreadcrumbs->SetPath(fPath);
+
+	// another folder starts without the search of the last one
+	if (action != kActionUpdatePath && fSearch != NULL)
+		fSearch->SetText("");
 }

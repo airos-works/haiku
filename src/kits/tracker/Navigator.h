@@ -42,6 +42,7 @@ All rights reserved.
 
 
 class BCardLayout;
+class BMenuField;
 class BTextControl;
 class BEntry;
 
@@ -62,7 +63,12 @@ enum NavigationAction
 	kNavigatorCommandLocation = 'NVLC',
 	kNavigatorCommandSetFocus = 'NVSF',
 	kNavigatorCommandHistory = 'NVHI',
-	kNavigatorCommandEndEditing = 'NVEE'
+	kNavigatorCommandEndEditing = 'NVEE',
+	kNavigatorCommandSearch = 'NVSE',
+	kNavigatorCommandSearchGo = 'NVSG',
+	kNavigatorCommandSearchFocus = 'NVSN',
+	kNavigatorCommandSearchScope = 'NVSS',
+	kNavigatorCommandSearchClear = 'NVSC'
 };
 
 
@@ -79,6 +85,8 @@ public:
 		// marks the view mode button
 	void EndEditingIfUnfocused();
 		// back to the folder buttons once the typed path lost the focus
+	void ClearSearch();
+		// a new folder starts unfiltered
 
 	BContainerWindow* Window() const;
 
@@ -100,6 +108,7 @@ protected:
 	void EndEditing();
 	void ShowHistoryMenu(bool back, BPoint where);
 	void GoHistory(bool back, int32 steps, bool option);
+	void RunSearchQuery();
 
 private:
 	BPath fPath;
@@ -107,6 +116,9 @@ private:
 	BreadcrumbView* fBreadcrumbs;
 	BCardLayout* fLocationCards;
 	bool fEditing;
+	BTextControl* fSearch;
+	BMenuField* fScopeField;
+	int32 fSearchScope;
 
 	BObjectList<BPath, true> fBackHistory;
 	BObjectList<BPath, true> fForwHistory;

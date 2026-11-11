@@ -483,6 +483,9 @@ protected:
 public:
 	void EditAdjacentPoseName(BPose* pose, bool next);
 		// selects the item after (or before) pose and edits its name
+	void SetSearchFilter(const char* text);
+		// shows only the items matching the words of text (the navigator's
+		// search field); icon views show the matches as a list meanwhile
 
 protected:
 	void CopyPathsToClipboard();
@@ -875,6 +878,7 @@ private:
 	bool fSelectionRectEnabled : 1;
 	bool fAlwaysAutoPlace : 1;
 	bool fArrangePending : 1;
+	uint32 fModeBeforeSearch;
 	bool fAllowPoseEditing : 1;
 	bool fSelectionChangedHook : 1;
 		// get rid of this

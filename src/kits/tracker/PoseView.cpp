@@ -279,6 +279,7 @@ BPoseView::BPoseView(Model* model, uint32 viewMode)
 	fSelectionRectEnabled(true),
 	fAlwaysAutoPlace(false),
 	fArrangePending(false),
+	fModeBeforeSearch(0),
 	fAllowPoseEditing(true),
 	fSelectionChangedHook(false),
 	fOkToMapIcons(false),
@@ -3921,6 +3922,57 @@ BPoseView::ArrangePoses()
 	}
 
 	Invalidate();
+}
+
+
+void
+BPoseView::SetSearchFilter(const char* text)
+{
+	BString search(text);
+	search.Trim();
+
+	// filtering works on lists: an icon view turns into one while searching
+	if (search.Length() > 0 && ViewMode() != kListMode) {
+		fModeBeforeSearch = ViewMode();
+		SetViewMode(kListMode);
+	}
+
+	ClearTypeAheadFiltering();
+
+	if (search.Length() == 0) {
+		UpdateAfterFilterChange();
+		if (fModeBeforeSearch != 0) {
+			uint32 mode = fModeBeforeSearch;
+			fModeBeforeSearch = 0;
+			SetViewMode(mode);
+		}
+		return;
+	}
+
+	// every word has to match, in any column
+	int32 start = 0;
+	bool first = true;
+	while (start < search.Length()) {
+		int32 space = search.FindFirst(' ', start);
+		if (space < 0)
+			space = search.Length();
+		if (space > start) {
+			BString word;
+			search.CopyInto(word, start, space - start);
+			if (first) {
+				*fFilterStrings.LastItem() = word;
+				first = false;
+			} else
+				fFilterStrings.AddItem(new BString(word));
+		}
+		start = space + 1;
+	}
+
+	fCountView->SetFilter(search.String());
+	fLastFilterStringCount = fFilterStrings.CountItems();
+	fLastFilterStringLength = fFilterStrings.LastItem()->CountChars();
+	StartTypeAheadFiltering();
+	UpdateAfterFilterChange();
 }
 
 
@@ -9306,6 +9358,8 @@ BPoseView::SwitchDir(const entry_ref* newDirRef, AttributeStreamNode* node)
 	fModel = model;
 
 	StopWatching();
+	ClearTypeAheadFiltering();
+	fModeBeforeSearch = 0;
 	ClearPoses();
 
 	// Restore state, might fail if the state has never been saved for this node

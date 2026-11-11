@@ -497,6 +497,14 @@ BCountView::AddFilterCharacter(const char* character)
 
 
 void
+BCountView::SetFilter(const char* filter)
+{
+	fFilterString = filter;
+	Invalidate();
+}
+
+
+void
 BCountView::RemoveFilterCharacter()
 {
 	fFilterString.TruncateChars(fFilterString.CountChars() - 1);

@@ -69,6 +69,7 @@ public:
 	bool IsTypingAhead() const;
 
 	void AddFilterCharacter(const char* character);
+	void SetFilter(const char* filter);
 	void RemoveFilterCharacter();
 	void CancelFilter();
 	const char* Filter() const;

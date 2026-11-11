@@ -2146,7 +2146,12 @@ BContainerWindow::AddFileMenu(BMenu* menu)
 		menu->AddItem(new BSeparatorItem());
 	}
 
-	menu->AddItem(Shortcuts()->FindItem());
+	BMenuItem* findItem = Shortcuts()->FindItem();
+	if (Navigator() != NULL) {
+		// Cmd-F goes to the search field, the Find window is Cmd-Shift-F
+		findItem->SetShortcut('F', B_SHIFT_KEY);
+	}
+	menu->AddItem(findItem);
 	if (ShouldHaveNewFolderItem()) {
 		menu->AddItem(Shortcuts()->NewFolderItem());
 		_AddPoseItem(menu, B_TRANSLATE("New folder with selection"),
@@ -4631,6 +4636,8 @@ BContainerWindow::SetSingleWindowBrowseShortcuts(bool enabled)
 			new BMessage(kOpenSelection), PoseView());
 		AddShortcut('L', B_COMMAND_KEY,
 			new BMessage(kNavigatorCommandSetFocus), Navigator());
+		AddShortcut('F', B_COMMAND_KEY,
+			new BMessage(kNavigatorCommandSearchFocus), Navigator());
 		AddShortcut('[', B_COMMAND_KEY,
 			new BMessage(kNavigatorCommandBackward), Navigator());
 		AddShortcut(']', B_COMMAND_KEY,
