@@ -100,6 +100,11 @@ class AttributeUndo : public Undo {
 void RecordRestoreUndo(const BObjectList<entry_ref, true>& restored);
 	// adds an undo item that moves restored items back to the Trash
 
+void RecordBatchRenameUndo(const BObjectList<entry_ref, true>& renamed,
+	const BObjectList<BString, true>& oldNames);
+	// one undo item for items renamed together; renamed are their new refs
+	// adds an undo item that moves restored items back to the Trash
+
 
 static
 inline bool FSIsUndoMoveMode(uint32 moveMode)

@@ -106,8 +106,8 @@ public:
 
 	void Commit(bool saveChanges, BPoint loc, BPoseView*, int32 index);
 	void EditFirstWidget(BPoint poseLoc, BPoseView*);
-	void EditNextWidget(BPoseView*);
-	void EditPreviousWidget(BPoseView*);
+	bool EditNextWidget(BPoseView*);
+	bool EditPreviousWidget(BPoseView*);
 
 	BPoint Location(const BPoseView* poseView) const;
 	bool DelayedEdit() const;
@@ -129,7 +129,7 @@ private:
 	void DrawTextWidget(BRect rect, BRect textRect, BTextWidget*, BPoseView* poseView,
 		BView* drawView, bool selected, uint32 clipboardMode, BPoint offset);
 	static bool _PeriodicUpdateCallback(BPose* pose, void* cookie);
-	void EditPreviousNextWidgetCommon(BPoseView* poseView, bool next);
+	bool EditPreviousNextWidgetCommon(BPoseView* poseView, bool next);
 	void CreateWidgets(BPoseView*);
 
 	BRect _ListIconRect(const BPoseView* poseView, BPoint location) const;

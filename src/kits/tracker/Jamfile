@@ -27,6 +27,7 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 			AttributeStream.cpp
 			AttributesView.cpp
 			AutoMounterSettings.cpp
+			BatchRenameWindow.cpp
 			BackgroundImage.cpp
 			Bitmaps.cpp
 			ContainerWindow.cpp
@@ -120,6 +121,7 @@ DoCatalogs libtracker.so :
 	Tracker.cpp
 	AttributesView.cpp
 	AutoMounterSettings.cpp
+	BatchRenameWindow.cpp
 	ContainerWindow.cpp
 	CountView.cpp
 	DeskWindow.cpp

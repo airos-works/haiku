@@ -48,6 +48,7 @@ All rights reserved.
 #include <StringFormat.h>
 
 #include <fs_attr.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -283,6 +284,24 @@ class UndoItemAttribute : public UndoItem {
 		BString		fLabel;
 		Value		fOld;
 		Value		fNew;
+};
+
+
+class UndoItemBatchRename : public UndoItem {
+	public:
+		UndoItemBatchRename(const BObjectList<entry_ref, true>& renamed,
+			const BObjectList<BString, true>& oldNames);
+
+		virtual status_t Undo();
+		virtual status_t Redo();
+		virtual BString Description() const;
+
+	private:
+		status_t _RenameAll(bool toOld);
+
+		BObjectList<entry_ref, true> fNewRefs;
+			// directory and new name of each item
+		BObjectList<BString, true> fOldNames;
 };
 
 
@@ -931,6 +950,87 @@ UndoItemRestore::Description() const
 	return WithItems(B_TRANSLATE_COMMENT("restore of %items",
 		"Undo menu item: Undo restore of \"name\" from the Trash"),
 		fRestored);
+}
+
+
+//	#pragma mark - UndoItemBatchRename
+
+
+UndoItemBatchRename::UndoItemBatchRename(
+	const BObjectList<entry_ref, true>& renamed,
+	const BObjectList<BString, true>& oldNames)
+	:
+	fNewRefs(renamed),
+	fOldNames(oldNames)
+{
+}
+
+
+status_t
+UndoItemBatchRename::_RenameAll(bool toOld)
+{
+	// through temporary names, as names may move around within the set
+	int32 count = fNewRefs.CountItems();
+	BObjectList<entry_ref, true> temporary(count);
+	for (int32 index = 0; index < count; index++) {
+		entry_ref from = *fNewRefs.ItemAt(index);
+		if (toOld == false)
+			from.set_name(fOldNames.ItemAt(index)->String());
+
+		char tempName[B_FILE_NAME_LENGTH];
+		snprintf(tempName, sizeof(tempName), ".tracker-undo-%" B_PRId32,
+			index);
+		BEntry entry(&from);
+		entry_ref tempRef;
+		if (entry.Rename(tempName) == B_OK && entry.GetRef(&tempRef) == B_OK)
+			temporary.AddItem(new entry_ref(tempRef));
+		else
+			temporary.AddItem(NULL);
+	}
+
+	for (int32 index = 0; index < count; index++) {
+		if (temporary.ItemAt(index) == NULL)
+			continue;
+		BEntry entry(temporary.ItemAt(index));
+		entry.Rename(toOld ? fOldNames.ItemAt(index)->String()
+			: fNewRefs.ItemAt(index)->name);
+	}
+
+	return B_OK;
+}
+
+
+status_t
+UndoItemBatchRename::Undo()
+{
+	return _RenameAll(true);
+}
+
+
+status_t
+UndoItemBatchRename::Redo()
+{
+	return _RenameAll(false);
+}
+
+
+BString
+UndoItemBatchRename::Description() const
+{
+	BString text(B_TRANSLATE_COMMENT("rename of %items",
+		"Undo menu item: Undo rename of 3 items"));
+	BObjectList<entry_ref, true> refs(fNewRefs);
+	text.ReplaceFirst("%items", ItemsText(refs));
+	return text;
+}
+
+
+void
+RecordBatchRenameUndo(const BObjectList<entry_ref, true>& renamed,
+	const BObjectList<BString, true>& oldNames)
+{
+	if (!renamed.IsEmpty())
+		AddUndoItem(new UndoItemBatchRename(renamed, oldNames));
 }
 
 

@@ -324,11 +324,15 @@ TextViewKeyDownFilter(BMessage* message, BHandler**, BMessageFilter* filter)
 	}
 
 	if (key == B_TAB) {
-		if (view->ActivePose()) {
-			if (message->FindInt32("modifiers") & B_SHIFT_KEY)
-				view->ActivePose()->EditPreviousWidget(view);
-			else
-				view->ActivePose()->EditNextWidget(view);
+		BPose* pose = view->ActivePose();
+		if (pose != NULL) {
+			bool previous = (message->FindInt32("modifiers") & B_SHIFT_KEY) != 0;
+			bool started = previous ? pose->EditPreviousWidget(view)
+				: pose->EditNextWidget(view);
+			if (!started) {
+				// past the last editable column: on to the next item's name
+				view->EditAdjacentPoseName(pose, !previous);
+			}
 		}
 
 		return B_SKIP_MESSAGE;

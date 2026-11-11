@@ -393,7 +393,7 @@ BPose::EditFirstWidget(BPoint poseLoc, BPoseView* poseView)
 }
 
 
-void
+bool
 BPose::EditPreviousNextWidgetCommon(BPoseView* poseView, bool next)
 {
 	bool found = false;
@@ -419,23 +419,25 @@ BPose::EditPreviousNextWidgetCommon(BPoseView* poseView, bool next)
 
 		if (found && column->Editable()) {
 			widget->StartEdit(poseView, this, column);
-			break;
+			return true;
 		}
 	}
+
+	return false;
 }
 
 
-void
+bool
 BPose::EditNextWidget(BPoseView* poseView)
 {
-	EditPreviousNextWidgetCommon(poseView, true);
+	return EditPreviousNextWidgetCommon(poseView, true);
 }
 
 
-void
+bool
 BPose::EditPreviousWidget(BPoseView* poseView)
 {
-	EditPreviousNextWidgetCommon(poseView, false);
+	return EditPreviousNextWidgetCommon(poseView, false);
 }
 
 

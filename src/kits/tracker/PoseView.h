@@ -479,6 +479,12 @@ protected:
 	void NewFolder(const BMessage*);
 		// create a new folder, optionally specify a location
 	void NewFolderWithSelection();
+
+public:
+	void EditAdjacentPoseName(BPose* pose, bool next);
+		// selects the item after (or before) pose and edits its name
+
+protected:
 	void CopyPathsToClipboard();
 	void CompressSelection();
 	void ExtractSelectionHere();

@@ -88,6 +88,7 @@ All rights reserved.
 #include "DeskWindow.h"
 #include "DesktopPoseView.h"
 #include "FSClipboard.h"
+#include "BatchRenameWindow.h"
 #include "FSUndoRedo.h"
 #include "FolderSizes.h"
 #include "FSUtils.h"
@@ -2633,6 +2634,19 @@ BPoseView::MessageReceived(BMessage* message)
 			if (pose == NULL)
 				break;
 
+			if (CountSelected() > 1 && ContainerWindow() != NULL
+				&& !TargetVolumeIsReadOnly()) {
+				// several items: the rename window names them all
+				BObjectList<entry_ref, true> refs(CountSelected());
+				for (int32 index = 0; index < CountSelected(); index++) {
+					refs.AddItem(new entry_ref(
+						*fSelectionList->ItemAt(index)->TargetModel()
+							->EntryRef()));
+				}
+				(new BatchRenameWindow(ContainerWindow(), refs))->Show();
+				break;
+			}
+
 			BPoint poseLoc;
 			if (ViewMode() == kListMode)
 				poseLoc = BPoint(0, CurrentPoseList()->IndexOf(pose) * fListElemHeight);
@@ -3907,6 +3921,36 @@ BPoseView::ArrangePoses()
 	}
 
 	Invalidate();
+}
+
+
+void
+BPoseView::EditAdjacentPoseName(BPose* pose, bool next)
+{
+	// the item next to it now: the rename may move it in the sort order
+	PoseList* poseList = CurrentPoseList();
+	int32 index = poseList->IndexOf(pose);
+	BPose* adjacent = index < 0 ? NULL
+		: poseList->ItemAt(index + (next ? 1 : -1));
+
+	CommitActivePose();
+
+	if (adjacent == NULL)
+		return;
+	index = poseList->IndexOf(adjacent);
+	if (index < 0)
+		return;
+
+	ClearSelection();
+	SelectPose(adjacent, index);
+
+	BPoint poseLoc;
+	if (ViewMode() == kListMode)
+		poseLoc = BPoint(0, index * fListElemHeight);
+	else
+		poseLoc = adjacent->Location(this);
+
+	adjacent->EditFirstWidget(poseLoc, this);
 }
 
 
@@ -9760,12 +9804,23 @@ BPoseView::TargetVolumeIsReadOnly() const
 bool
 BPoseView::CanEditName() const
 {
-	if (CountSelected() != 1)
+	int32 count = CountSelected();
+	if (count < 1 || ActivePose() != NULL)
 		return false;
 
-	Model* selected = fSelectionList->FirstItem()->TargetModel();
-	return !ActivePose() && selected != NULL && !selected->IsDesktop()
-		&& !selected->IsRoot() && !selected->IsTrash();
+	// several items are renamed in the rename window
+	if (count > 1 && (SelectedVolumeIsReadOnly() || IsFilePanel()))
+		return false;
+
+	for (int32 index = 0; index < count; index++) {
+		Model* selected = fSelectionList->ItemAt(index)->TargetModel();
+		if (selected == NULL || selected->IsDesktop() || selected->IsRoot()
+			|| selected->IsTrash() || (count > 1 && selected->IsVolume())) {
+			return false;
+		}
+	}
+
+	return true;
 }
 
 

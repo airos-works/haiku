@@ -1109,6 +1109,10 @@ TShortcuts::UpdateEditNameItem(BMenuItem* item)
 	if (fInWindow) {
 		item->SetEnabled(PoseView()->CanEditName());
 		item->SetTarget(PoseView());
+
+		// several selected items are renamed together
+		item->SetLabel(PoseView()->CountSelected() > 1
+			? B_TRANSLATE("Rename" B_UTF8_ELLIPSIS) : EditNameLabel());
 	}
 }
 
