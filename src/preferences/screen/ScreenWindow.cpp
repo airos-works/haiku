@@ -255,6 +255,7 @@ ScreenWindow::ScreenWindow(ScreenSettings* settings)
 	fIsVesa(false),
 	fHasLayout(false),
 	fUndoIsScale(false),
+	fUndoScaleAndMode(false),
 	fBootWorkspaceApplied(false),
 	fSelectedID(-1),
 	fReloadRunner(NULL),
@@ -1921,7 +1922,13 @@ ScreenWindow::_ScaleChanged() const
 {
 	if (fHasLayout || !fCurrentLayout.CanScale())
 		return false;
-	return !fPendingLayout.SameArrangement(fCurrentLayout);
+
+	// Only the scale counts: the pending layout also carries the resolution
+	// picked in the menu, which is set as a screen mode, not with the layout.
+	const display_state* pending = fPendingLayout.DisplayByID(fSelectedID);
+	const display_state* current = fCurrentLayout.DisplayByID(fSelectedID);
+	return pending != NULL && current != NULL
+		&& pending->scale != current->scale;
 }
 
 
@@ -2325,6 +2332,10 @@ ScreenWindow::MessageReceived(BMessage* message)
 			}
 
 			fUndoScreenMode.Revert();
+			if (fUndoScaleAndMode) {
+				// the scale changed with the mode, and goes back with it
+				_ApplyLayoutState(fUndoLayout, false);
+			}
 			_UpdateActiveMode();
 			break;
 
@@ -2383,9 +2394,24 @@ ScreenWindow::MessageReceived(BMessage* message)
 			bool scaleChanged = _ScaleChanged();
 			bool modeChanged = fSelected != fActive;
 			fUndoIsScale = scaleChanged && !modeChanged;
+			fUndoScaleAndMode = scaleChanged && modeChanged;
 			if (scaleChanged) {
+				// The layout takes the new scale only. Applying it reads
+				// the active mode back into the selection, so keep the
+				// mode the user picked for _ApplyMode().
+				screen_mode selected = fSelected;
+				DisplayLayoutState scaled = fCurrentLayout;
+				const display_state* pending
+					= fPendingLayout.DisplayByID(fSelectedID);
+				display_state* display = scaled.DisplayByID(fSelectedID);
+				if (pending != NULL && display != NULL) {
+					display->scale = pending->scale;
+					display->UpdateFrameSize();
+				}
+
 				fUndoLayout = fCurrentLayout;
-				_ApplyLayoutState(fPendingLayout, !modeChanged);
+				_ApplyLayoutState(scaled, !modeChanged);
+				fSelected = selected;
 			}
 			if (modeChanged || !scaleChanged)
 				_ApplyMode();
