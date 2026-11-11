@@ -89,6 +89,7 @@ All rights reserved.
 #include "DesktopPoseView.h"
 #include "FSClipboard.h"
 #include "FSUndoRedo.h"
+#include "FolderSizes.h"
 #include "FSUtils.h"
 #include "FilePanelPriv.h"
 #include "FunctionObject.h"
@@ -1188,6 +1189,11 @@ BPoseView::WindowActivated(bool active)
 
 	if (active && ActivePose() == NULL && !IsFilePanel())
 		MakeFocus();
+
+	// changes deep inside a folder are not reported to it: coming back to
+	// the window is when its sizes are checked again
+	if (active)
+		RequestFolderSizes(10000000);
 }
 
 
@@ -1754,6 +1760,8 @@ BPoseView::AddPosesCompleted()
 	// were "auto" placed to see if they overlap with other icons
 	if (ViewMode() != kListMode)
 		CheckAutoPlacedPoses();
+
+	RequestFolderSizes(30000000);
 
 	UpdateScrollRange();
 	HideBarberPole();
@@ -2735,6 +2743,35 @@ BPoseView::MessageReceived(BMessage* message)
 		case kKeepArranged:
 			SetKeepArranged(!fViewState->KeepArranged());
 			break;
+
+		case kToggleFolderSizes:
+			SetShowFolderSizes(!fViewState->ShowFolderSizes());
+			break;
+
+		case kFolderSizeReady:
+		{
+			node_ref node;
+			node.device = message->GetInt32("device", -1);
+			node.node = message->GetInt64("node", -1);
+
+			int32 index;
+			BPose* pose = CurrentPoseList()->FindPose(&node, &index);
+			if (pose == NULL)
+				break;
+
+			uint32 sizeHash = AttrHashString(kAttrStatSize, B_OFF_T_TYPE);
+			BTextWidget* widget = pose->WidgetFor(sizeHash);
+			BColumn* column = ColumnFor(sizeHash);
+			if (widget != NULL && column != NULL && ViewMode() == kListMode) {
+				widget->CheckAndUpdate(BPoint(0, index * fListElemHeight),
+					column, this, true);
+			}
+			if (PrimarySort() == sizeHash || SecondarySort() == sizeHash)
+				CheckPoseSortOrder(pose, index);
+			if (pose->IsSelected())
+				fCountView->Invalidate();
+			break;
+		}
 
 		case kArrangePoses:
 			fArrangePending = false;
@@ -3741,6 +3778,64 @@ BPoseView::Cleanup(bool doAll)
 					Invalidate(oldBounds);
 			}
 		}
+	}
+}
+
+
+bool
+BPoseView::ShowsFolderSizes() const
+{
+	return ViewMode() == kListMode && !IsDesktopView()
+		&& fViewState->ShowFolderSizes();
+}
+
+
+void
+BPoseView::SetShowFolderSizes(bool show)
+{
+	fViewState->SetShowFolderSizes(show);
+
+	// folders read "…" while worked out and "-" otherwise
+	uint32 sizeHash = AttrHashString(kAttrStatSize, B_OFF_T_TYPE);
+	for (int32 index = 0; index < fPoseList->CountItems(); index++) {
+		BPose* pose = fPoseList->ItemAt(index);
+		if (!pose->TargetModel()->IsDirectory())
+			continue;
+		BTextWidget* widget = pose->WidgetFor(sizeHash);
+		if (widget != NULL)
+			widget->Refit();
+	}
+	Invalidate();
+
+	RequestFolderSizes(30000000);
+}
+
+
+void
+BPoseView::RequestFolderSizes(bigtime_t maxAge)
+{
+	if (!ShowsFolderSizes())
+		return;
+
+	std::map<dev_t, bool> allowed;
+	BMessenger target(this);
+	for (int32 index = 0; index < fPoseList->CountItems(); index++) {
+		Model* model = fPoseList->ItemAt(index)->TargetModel();
+		if (!model->IsDirectory() || model->IsSymLink() || model->IsVolume()
+			|| model->IsVirtualDirectory()) {
+			continue;
+		}
+
+		dev_t device = model->NodeRef()->device;
+		std::map<dev_t, bool>::iterator found = allowed.find(device);
+		if (found == allowed.end())
+			found = allowed.insert(std::make_pair(device,
+				CanCalculateFolderSizes(device))).first;
+		if (!found->second)
+			continue;
+
+		RequestFolderSize(*model->EntryRef(), *model->NodeRef(), target,
+			maxAge);
 	}
 }
 
@@ -6420,6 +6515,18 @@ BPoseView::AttributeChanged(const BMessage* message)
 	const char* attrName;
 	if (message->FindString("attr", &attrName) != B_OK)
 		attrName = NULL;
+
+	if (message->GetInt32("opcode", 0) == B_STAT_CHANGED && ShowsFolderSizes()) {
+		// what is in a folder changed: work its size out again
+		BPose* pose = fPoseList->FindPose(&itemNode);
+		if (pose != NULL && pose->TargetModel()->IsDirectory()
+			&& !pose->TargetModel()->IsSymLink()
+			&& CanCalculateFolderSizes(itemNode.device)) {
+			ForgetFolderSize(itemNode);
+			RequestFolderSize(*pose->TargetModel()->EntryRef(), itemNode,
+				BMessenger(this), 0);
+		}
+	}
 
 	Model* targetModel = TargetModel();
 	if (ContainerWindow()->ShouldHaveDraggableFolderIcon() && targetModel != NULL

@@ -85,6 +85,8 @@ public:
 
 	void SelectAll(BPoseView* view);
 	void CheckAndUpdate(BPoint, const BColumn*, BPoseView*, bool visible);
+	void Refit();
+		// fit the text again next time, it may read differently
 
 	uint32 AttrHash() const;
 	bool IsEditable() const;

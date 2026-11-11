@@ -173,6 +173,12 @@ public:
 	void SetSelectionRectEnabled(bool);
 	void SetAlwaysAutoPlace(bool);
 
+	// list views that show how big folders are
+	bool ShowsFolderSizes() const;
+	void SetShowFolderSizes(bool show);
+	void RequestFolderSizes(bigtime_t maxAge);
+		// sizes known for longer than maxAge are worked out again
+
 	// icon views that keep their items in sort order
 	bool KeepArranged() const;
 	void SetKeepArranged(bool keepArranged);

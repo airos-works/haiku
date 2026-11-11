@@ -45,6 +45,7 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 			FilePanel.cpp
 			FilePanelPriv.cpp
 			FolderStateStore.cpp
+			FolderSizes.cpp
 			FilePermissionsView.cpp
 			FindPanel.cpp
 			GeneralInfoView.cpp

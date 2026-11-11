@@ -61,6 +61,7 @@ All rights reserved.
 
 #include "Attributes.h"
 #include "FSUndoRedo.h"
+#include "FolderSizes.h"
 #include "FSUtils.h"
 #include "Model.h"
 #include "OpenWithWindow.h"
@@ -1015,6 +1016,15 @@ SizeAttributeText::ReadValue()
 		return volume.Capacity();
 	}
 
+	if (fModel->IsDirectory() && !fModel->IsSymLink()) {
+		// known when a window showing folder sizes had it worked out
+		off_t size;
+		if (GetFolderSize(*fModel->NodeRef(), &size)) {
+			fValueIsDefined = true;
+			return size;
+		}
+	}
+
 	if (fModel->IsDirectory() || fModel->IsQuery()
 		|| fModel->IsQueryTemplate() || fModel->IsSymLink()
 		|| fModel->IsVirtualDirectory()) {
@@ -1036,8 +1046,14 @@ SizeAttributeText::FitValue(BString* outString, const BPoseView* poseView)
 
 	fOldWidth = fColumn->Width();
 	if (!fValueIsDefined) {
-		*outString = "-";
-		fTruncatedWidth = poseView->StringWidth("-");
+		// a folder being worked out
+		const char* text = "-";
+		if (fModel->IsDirectory() && !fModel->IsSymLink()
+			&& !fModel->IsVolume() && poseView->ShowsFolderSizes()) {
+			text = B_UTF8_ELLIPSIS;
+		}
+		*outString = text;
+		fTruncatedWidth = poseView->StringWidth(text);
 	} else
 		fTruncatedWidth = TruncFileSize(outString, fValue, poseView, fOldWidth);
 	fDirty = false;

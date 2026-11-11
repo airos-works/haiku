@@ -74,6 +74,7 @@ const char* kViewStateIconSizeName = "ViewState:fIconSize";
 const char* kViewStateLastIconSizeName = "ViewState:fLastIconSize";
 const char* kViewStateKeepArrangedName = "ViewState:fKeepArranged";
 const char* kViewStateGroupByName = "ViewState:fGroupBy";
+const char* kViewStateShowFolderSizesName = "ViewState:fShowFolderSizes";
 
 
 static const int32 kColumnStateMinArchiveVersion = 21;
@@ -354,6 +355,8 @@ BViewState::BViewState(BMallocIO* stream, bool endianSwap)
 		fKeepArranged = false;
 	if (stream->Read(&fGroupBy, sizeof(uint32)) != sizeof(uint32))
 		fGroupBy = 0;
+	if (stream->Read(&fShowFolderSizes, sizeof(bool)) != sizeof(bool))
+		fShowFolderSizes = false;
 
 	if (endianSwap) {
 		PRINT(("endian swapping view state\n"));
@@ -399,6 +402,10 @@ BViewState::BViewState(const BMessage &message)
 		fKeepArranged = false;
 	if (message.FindInt32(kViewStateGroupByName, (int32*)&fGroupBy) != B_OK)
 		fGroupBy = 0;
+	if (message.FindBool(kViewStateShowFolderSizesName, &fShowFolderSizes)
+			!= B_OK) {
+		fShowFolderSizes = false;
+	}
 
 	_StorePreviousState();
 	_Sanitize(this, true);
@@ -472,6 +479,7 @@ BViewState::_Init()
 	fReverseSort = false;
 	fKeepArranged = true;
 	fGroupBy = 0;
+	fShowFolderSizes = false;
 }
 
 
@@ -491,6 +499,7 @@ BViewState::_StorePreviousState()
 	fPreviousReverseSort = fReverseSort;
 	fPreviousKeepArranged = fKeepArranged;
 	fPreviousGroupBy = fGroupBy;
+	fPreviousShowFolderSizes = fShowFolderSizes;
 }
 
 
@@ -570,6 +579,7 @@ BViewState::_ArchiveToStream(BMallocIO* stream) const
 	stream->Write(&fLastIconSize, sizeof(uint32));
 	stream->Write(&fKeepArranged, sizeof(bool));
 	stream->Write(&fGroupBy, sizeof(uint32));
+	stream->Write(&fShowFolderSizes, sizeof(bool));
 }
 
 
@@ -597,4 +607,5 @@ BViewState::_ArchiveToMessage(BMessage &message) const
 		static_cast<int32>(fLastIconSize));
 	message.AddBool(kViewStateKeepArrangedName, fKeepArranged);
 	message.AddInt32(kViewStateGroupByName, static_cast<int32>(fGroupBy));
+	message.AddBool(kViewStateShowFolderSizesName, fShowFolderSizes);
 }

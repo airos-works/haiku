@@ -126,6 +126,7 @@ public:
 	bool ReverseSort() const;
 	bool KeepArranged() const;
 	uint32 GroupBy() const;
+	bool ShowFolderSizes() const;
 
 	void SetViewMode(uint32);
 	void SetLastIconMode(uint32);
@@ -140,6 +141,7 @@ public:
 	void SetReverseSort(bool);
 	void SetKeepArranged(bool);
 	void SetGroupBy(uint32 attrHash);
+	void SetShowFolderSizes(bool);
 
 	bool StateNeedsSaving();
 
@@ -164,6 +166,8 @@ private:
 		// icon views stay sorted, new items do not go where there is room
 	uint32 fGroupBy;
 		// hash of the attribute items are grouped by, 0 for none
+	bool fShowFolderSizes;
+		// list views work out how big the folders in them are
 
 	void _Init();
 	void _StorePreviousState();
@@ -181,6 +185,7 @@ private:
 	bool fPreviousReverseSort;
 	bool fPreviousKeepArranged;
 	uint32 fPreviousGroupBy;
+	bool fPreviousShowFolderSizes;
 };
 
 
@@ -447,6 +452,20 @@ BViewState::SetGroupBy(uint32 attrHash)
 
 
 inline bool
+BViewState::ShowFolderSizes() const
+{
+	return fShowFolderSizes;
+}
+
+
+inline void
+BViewState::SetShowFolderSizes(bool on)
+{
+	fShowFolderSizes = on;
+}
+
+
+inline bool
 BViewState::StateNeedsSaving()
 {
 	return (fPreviousViewMode != fViewMode)
@@ -461,7 +480,8 @@ BViewState::StateNeedsSaving()
 		|| (fPreviousSecondarySortType != fSecondarySortType)
 		|| (fPreviousReverseSort != fReverseSort)
 		|| (fPreviousKeepArranged != fKeepArranged)
-		|| (fPreviousGroupBy != fGroupBy);
+		|| (fPreviousGroupBy != fGroupBy)
+		|| (fPreviousShowFolderSizes != fShowFolderSizes);
 }
 
 } // namespace BPrivate

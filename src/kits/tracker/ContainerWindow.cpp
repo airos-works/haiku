@@ -2209,6 +2209,10 @@ BContainerWindow::AddWindowMenu(BMenu* menu)
 		new BMessage(kToggleHiddenFiles), 'H', B_SHIFT_KEY);
 	item->SetTarget(this);
 	menu->AddItem(item);
+	item = new BMenuItem(B_TRANSLATE("Show folder sizes"),
+		new BMessage(kToggleFolderSizes));
+	item->SetTarget(PoseView());
+	menu->AddItem(item);
 	menu->AddSeparatorItem();
 
 	if (_CanShareView()) {
@@ -3400,6 +3404,12 @@ BContainerWindow::UpdateWindowMenuOrWindowContextMenu(BMenu* menu, MenuContext c
 	BMenuItem* hiddenItem = menu->FindItem(kToggleHiddenFiles);
 	if (hiddenItem != NULL)
 		hiddenItem->SetMarked(!TrackerSettings().HideDotFiles());
+
+	BMenuItem* folderSizesItem = menu->FindItem(kToggleFolderSizes);
+	if (folderSizesItem != NULL) {
+		folderSizesItem->SetMarked(PoseView()->ShowsFolderSizes());
+		folderSizesItem->SetEnabled(PoseView()->ViewMode() == kListMode);
+	}
 
 	// insert "Arrange by >" menu before "Select ..."
 	SetupArrangeByMenu(menu);

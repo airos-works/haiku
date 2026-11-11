@@ -42,11 +42,18 @@ All rights reserved.
 #include <ControlLook.h>
 #include <Locale.h>
 #include <StringFormat.h>
+#include <StringForSize.h>
+#include <Volume.h>
+
+#include <math.h>
+
+#include <algorithm>
 
 #include "AutoLock.h"
 #include "Bitmaps.h"
 #include "ContainerWindow.h"
 #include "DirMenu.h"
+#include "FolderSizes.h"
 #include "PoseView.h"
 #include "Utilities.h"
 
@@ -73,7 +80,8 @@ BCountView::BCountView(BPoseView* view)
 	fLastBarberPoleOffset(5),
 	fStartSpinningAfter(0),
 	fTypeAheadString(""),
-	fFilterString("")
+	fFilterString(""),
+	fLastPreferredWidth(0)
 {
 	GetTrackerResources()->GetBitmapResource(B_MESSAGE_TYPE, R_BarberPoleBitmap, &fBarberPoleMap);
 
@@ -191,8 +199,117 @@ BCountView::CheckCount()
 		invalidate = true;
 	}
 
-	if (invalidate)
+	if (invalidate) {
 		Invalidate();
+
+		// The selection size and free space want room: the window's layout
+		// shares the bottom row by weight, so ask for it as a minimum, within
+		// reason, and let the scroll bar have the rest.
+		float maxWidth = ceilf(280 * be_plain_font->Size() / 12);
+		float width = std::min(PreferredSize().width, maxWidth);
+		if (fabsf(width - fLastPreferredWidth) > 1) {
+			fLastPreferredWidth = width;
+			BSize minSize = ExplicitMinSize();
+			minSize.width = width;
+			SetExplicitMinSize(minSize);
+		}
+	}
+}
+
+
+BString
+BCountView::_ItemsText()
+{
+	BString itemString;
+	if (fLastCount == 0)
+		itemString << B_TRANSLATE("no items");
+	else if (fLastCountSelected == 0) {
+		static BStringFormat itemFormat(B_TRANSLATE_COMMENT(
+			"{0, plural, one{# item} other{# items}}",
+			"Number of selected items: \"1 item\" or \"2 items\""));
+		itemFormat.Format(itemString, fLastCount);
+	} else {
+		static BStringFormat selectedFormat(B_TRANSLATE_COMMENT(
+			"{0, plural, other{#/%total selected}}",
+			"Number of selected items out of a total: \"10/30 selected\""));
+
+		BString lastCountStr;
+		fNumberFormat.Format(lastCountStr, fLastCount);
+
+		selectedFormat.Format(itemString, fLastCountSelected);
+		itemString.ReplaceFirst("%total", lastCountStr);
+	}
+
+	return itemString;
+}
+
+
+BString
+BCountView::_DetailsText()
+{
+	// ", 48.2 MiB" for the selected files (and folders whose size is known),
+	// " · 211 GiB free" for the volume
+	BString details;
+	char sizeText[128];
+
+	int32 selected = fPoseView->CountSelected();
+	if (selected > 0) {
+		off_t total = 0;
+		bool any = false;
+		PoseList* selection = fPoseView->SelectionList();
+		for (int32 index = 0; index < selected; index++) {
+			Model* model = selection->ItemAt(index)->TargetModel();
+			if (model->IsFile() && !model->IsSymLink()) {
+				total += model->StatBuf()->st_size;
+				any = true;
+			} else if (model->IsDirectory() && !model->IsSymLink()) {
+				off_t size;
+				if (GetFolderSize(*model->NodeRef(), &size)) {
+					total += size;
+					any = true;
+				}
+			}
+		}
+		if (any) {
+			string_for_size(total, sizeText, sizeof(sizeText));
+			details << ", " << sizeText;
+		}
+	}
+
+	Model* target = fPoseView->TargetModel();
+	if (target != NULL && !target->IsRoot() && !target->IsQuery()
+		&& !target->IsVirtualDirectory() && !fPoseView->IsDesktopView()) {
+		BVolume volume(target->NodeRef()->device);
+		if (volume.InitCheck() == B_OK && !volume.IsReadOnly()
+			&& volume.Capacity() > 0) {
+			string_for_size(volume.FreeBytes(), sizeText, sizeof(sizeText));
+			BString freeText(B_TRANSLATE_COMMENT("%size free",
+				"Free space on the volume, as in: 211 GiB free"));
+			freeText.ReplaceFirst("%size", sizeText);
+			details << " · " << freeText;
+		}
+	}
+
+	return details;
+}
+
+
+BSize
+BCountView::PreferredSize()
+{
+	BSize size = BView::PreferredSize();
+	if (IsTypingAhead() || IsFiltering() || fLastCount < 0)
+		return size;
+
+	BString text(_ItemsText());
+	text << _DetailsText();
+	float width = StringWidth(text.String())
+		+ be_control_look->ComposeSpacing(B_USE_SMALL_SPACING)
+		+ be_control_look->DefaultItemSpacing();
+	if (width > size.width)
+		size.width = ceilf(width);
+
+	return size;
 }
 
 
@@ -228,26 +345,8 @@ BCountView::Draw(BRect updateRect)
 			itemString.ReplaceFirst("%filter", Filter());
 		} else
 			itemString << lastCountStr << " " << Filter();
-	} else {
-		if (fLastCount == 0)
-			itemString << B_TRANSLATE("no items");
-		else if (fLastCountSelected == 0) {
-			static BStringFormat itemFormat(B_TRANSLATE_COMMENT(
-				"{0, plural, one{# item} other{# items}}",
-				"Number of selected items: \"1 item\" or \"2 items\""));
-			itemFormat.Format(itemString, fLastCount);
-		} else {
-			static BStringFormat selectedFormat(B_TRANSLATE_COMMENT(
-				"{0, plural, other{#/%total selected}}",
-				"Number of selected items out of a total: \"10/30 selected\""));
-
-			BString lastCountStr;
-			fNumberFormat.Format(lastCountStr, fLastCount);
-
-			selectedFormat.Format(itemString, fLastCountSelected);
-			itemString.ReplaceFirst("%total", lastCountStr);
-		}
-	}
+	} else
+		itemString << _ItemsText() << _DetailsText();
 
 	BRect textRect(TextRect());
 

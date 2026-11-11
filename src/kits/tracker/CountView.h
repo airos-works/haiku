@@ -56,6 +56,7 @@ public:
 	virtual void MouseDown(BPoint);
 	virtual void AttachedToWindow();
 	virtual void Pulse();
+	virtual BSize PreferredSize();
 
 	void CheckCount();
 	void StartBarberPole();
@@ -78,6 +79,8 @@ private:
 	BRect BarberPoleOuterRect() const;
 	BRect TextRect() const;
 	void TrySpinningBarberPole();
+	BString _ItemsText();
+	BString _DetailsText();
 
 	int32 fLastCount;
 	int32 fLastCountSelected;
@@ -89,6 +92,7 @@ private:
 	BString fTypeAheadString;
 	BString fFilterString;
 	BNumberFormat fNumberFormat;
+	float fLastPreferredWidth;
 };
 
 } // namespace BPrivate

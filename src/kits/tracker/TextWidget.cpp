@@ -626,6 +626,13 @@ BTextWidget::CheckAndUpdate(BPoint loc, const BColumn* column, BPoseView* view, 
 
 
 void
+BTextWidget::Refit()
+{
+	fText->SetDirty(true);
+}
+
+
+void
 BTextWidget::SelectAll(BPoseView* view)
 {
 	BTextView* text = dynamic_cast<BTextView*>(view->FindView("WidgetTextView"));
