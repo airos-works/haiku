@@ -86,3 +86,9 @@ operation of the engine against the CPU on surfaces of its own and times it;
 surface of its own as the screen while app_server is not on the card);
 `--attach` does the same on app_server's real screen and puts the pixels back;
 `--init` stands in for app_server (only while app_server is on another driver).
+`nvramptest [w h [burst|decay]]` times the engine against the GPU's
+performance state. On the GTX 1070 (2026-11-12) one 4K fill per 16.7 ms
+leaves it in P8, where the fill takes 2.34 ms against 0.47 ms in P0; 120 a
+second still leaves it in P8, 240 a second reaches P0 within 0.25 s and then
+settles in P2, and back at 60 a second it steps down to P8 within 3-8 s.
+`NV2080_CTRL_CMD_PERF_BOOST` (to the maximum) holds P0.
