@@ -3478,7 +3478,8 @@ iwx_chan_width(struct iwx_softc *sc, struct ieee80211_node *ni, uint8_t *sco,
 /*
  * Lab switches in the driver settings file "iaxwifi200"
  * (~/config/settings/kernel/drivers/iaxwifi200): "he 0" associates with
- * HT/VHT only, "max_width 20|40|80|160" limits the channel width, and
+ * HT/VHT only ("he 1" switches HE on for the BE200, where it is off until it
+ * has been tested), "max_width 20|40|80|160" limits the channel width, and
  * "mld_api 1" uses the MLD firmware commands on cards that default to the
  * older ones. They are read each time the interface is brought up.
  * "max_width" narrows this side only: the AP is not told and keeps sending at
@@ -3489,7 +3490,12 @@ iwx_haiku_read_settings(struct iwx_softc *sc)
 {
 	extern int iwx_haiku_setting(const char *, int);
 
-	sc->sc_he_disabled = iwx_haiku_setting("he", 1) == 0;
+	/*
+	 * HE through the MLD commands has not run on a Bz card (the BE200) yet:
+	 * there it stays off unless "he 1" asks for it.
+	 */
+	sc->sc_he_disabled = iwx_haiku_setting("he",
+	    sc->sc_device_family >= IWX_DEVICE_FAMILY_BZ ? 0 : 1) == 0;
 	sc->sc_max_chan_width = iwx_haiku_setting("max_width", 160);
 	sc->sc_mld_api_forced = iwx_haiku_setting("mld_api", 0) != 0;
 }

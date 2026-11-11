@@ -241,8 +241,9 @@ What changed in the driver:
   has. The ROCK 5 with the BE200 had no power. Forcing the MLD commands on
   the AX210 (`mld_api 1`) says nothing about it: firmware 77 asserts
   (0x20100232) at the `LINK_CONFIG_CMD` that every MLD association sends,
-  before any HE parameter, as OpenBSD notes for older cards. If the BE200's
-  firmware rejects the new commands, `he 0` gives the HT/VHT association back.
+  before any HE parameter, as OpenBSD notes for older cards. Until it has
+  run on a BE200, HE stays off on the Bz family by default: `he 1` in the
+  driver settings (and a reboot) switches it on for the test.
 - **Syslog.** One line per association says what was negotiated and what the
   AP offers ("associated on channel 157, HE (802.11ax), 80 MHz (AP: 80 MHz,
   HE)"); the line per rate change, several a second under load, is gone. The
