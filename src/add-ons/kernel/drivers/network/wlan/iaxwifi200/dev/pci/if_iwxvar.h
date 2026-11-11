@@ -765,6 +765,15 @@ struct iwx_softc {
 	int n_cmd_versions;
 	int sc_rate_n_flags_version;
 	int sc_use_mld_api;
+#ifdef __HAIKU__
+	/* driver settings file "iaxwifi200" (lab switches, read at init) */
+	int sc_he_disabled;	/* "he 0": associate with HT/VHT only */
+	int sc_max_chan_width;	/* "max_width 20|40|80|160" */
+	int sc_mld_api_forced;	/* "mld_api 1": MLD commands on any device */
+	int sc_he_capable;	/* NVM and firmware allow HE */
+	int sc_no_160;		/* the device variant has no 160 MHz */
+	int sc_uhb_valid_logged;	/* 6 GHz channel count last logged, plus 1 */
+#endif
 
 	int sc_intmask;
 	int sc_flags;

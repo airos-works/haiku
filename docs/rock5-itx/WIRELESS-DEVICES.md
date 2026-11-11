@@ -166,6 +166,99 @@ joins Gaspers (WPA2-PSK/CCMP) at 802.11ac with a DHCP address.
 Its Bluetooth half (`8087:0036`, `ibt-0291-0291`) loads its firmware with
 `bt_firmware` as before.
 
+### HE channel width, and HE for the BE200 (2026-11-11)
+
+Tested on the Framework 13's AX210 (firmware 77, air/OS hrev60207+2559) against
+Gaspers on 5 GHz, channel 157, an 80 MHz HE access point. TCP to a wired
+machine, in Mbit/s (the same test over the laptop's wired port: 580 down, 564
+up with four streams):
+
+| Driver and setting | Association | 1 stream down / up | 4 streams down / up |
+|---|---|---|---|
+| before this work | HE, 80 MHz, MCS 9 to 11, two streams | 131 / 163 | 217 / 254 |
+| this work, default | HE, 80 MHz | 123 to 134 / 153 to 162 | 202 to 212 / 246 to 252 |
+| `he 0` | VHT, 80 MHz | 4 / 55 | 4 / 57 to 62 |
+| `he 0`, `max_width 40` | VHT, 40 MHz | 4 / 57 | 4 / 57 |
+| `he 0`, `max_width 20` | VHT, 20 MHz | 4 / 51 | 4 / 47 |
+
+The width of an HE association has always followed the AP's HT and VHT
+operation elements; the "20 MHz" in `STATUS.md` described one ROCK 5
+association without antennas. So HE is not slower than VHT here, it is fifty
+times faster:
+
+- **VHT on this access point is broken, and not by the channel width.** With
+  a VHT-only association the AP sends every data frame at 6 Mbit/s legacy
+  OFDM (sampled from the receive descriptors: rate 0xc100), from the first
+  frame on, at any width; the upload is then limited by the TCP ACKs coming
+  back at that rate. The card's own transmit rate is fine (VHT MCS 8 or 9,
+  two streams), block ack sessions are set up in both directions and nothing
+  is dropped on receive. The association request is unremarkable (HT and VHT
+  capabilities as OpenBSD sends them). Ruled out: the station width flags
+  (old and new value), the TLC's maximum MPDU length, a VHT operating mode
+  notification after the handshake, and HE being switched off at run time
+  rather than at boot. With HE capabilities in the same association request
+  the AP starts at HE MCS 0 and climbs to MCS 8 or 9 within a few frames.
+  The cause is open; without a sniffer it cannot be told whether the AP's VHT
+  frames fail at this card or the AP never tries them. This is what a BE200
+  gets on this network as long as it associates without HE.
+- **Why HE delivers a quarter of its air rate.** Not the CPU (the busiest
+  thread uses 13 % of one core) and not the channel width. On upload the
+  firmware's block ack reports show about 600 aggregates a second of 39
+  frames on average (the limit is 64: the block ack window, and the driver
+  sends no A-MSDUs), about 10 % of them retried, 640 Mbit/s while on air,
+  and the card on air for only 45 % of the time. What takes the rest of the
+  channel (the AP's own traffic, a mesh backhaul on the same channel) could
+  not be seen from the card. Longer aggregates (the 256-frame HE block ack
+  window, A-MSDUs on transmit) would raise the card's share; neither exists
+  in this driver.
+
+What changed in the driver:
+
+- **160 MHz for HE.** The driver advertises HE at 160 MHz (unless the card
+  variant has none) and uses it when the AP runs a 160 MHz channel, signalled
+  either way the standard allows, and the regulatory data allows it: PHY
+  context with the control channel position inside the 160 MHz channel, the
+  station's width, and the 160 MHz rates in the TLC configuration. VHT-only
+  associations stay at 80 MHz. **Tested only as far as an 80 MHz AP goes**:
+  the association with the 160 MHz capability advertised works as before; no
+  160 MHz access point was in range.
+- **Station width flags.** At 80 MHz the driver set "40 MHz" and "80 MHz"
+  together, which the firmware reads as 160 MHz. It now sends one value
+  (no measurable difference on the AX210).
+- **A deprecated 160 MHz announcement** (width 160 with a single centre) made
+  the driver program an 80 MHz channel with the wrong control channel
+  position. The 80 MHz centre is now derived from the primary channel
+  (not tested: no such AP).
+- **BSS colour flags.** "Partial BSS colour" and "BSS colour disabled" were
+  swapped in the HE station context.
+- **BE200 (Bz family) HE: written, not run.** With the MLD commands the HE
+  parameters go into `LINK_CONFIG_CMD` (BSS colour, default packet extension,
+  RTS threshold, after the MAC context reports HE) and `STA_CONFIG_CMD`
+  (packet extension thresholds, HTC support, ACK-enabled aggregation, the HE
+  A-MPDU length extension), as Linux's `iwl_mvm_link_changed()` and
+  `iwl_mvm_mld_cfg_sta()` do, and HE is no longer withheld from the Bz
+  family. Firmware 83 lists `TLC_MNG_CONFIG_CMD` version 4, which the driver
+  has. The ROCK 5 with the BE200 had no power. Forcing the MLD commands on
+  the AX210 (`mld_api 1`) says nothing about it: firmware 77 asserts
+  (0x20100232) at the `LINK_CONFIG_CMD` that every MLD association sends,
+  before any HE parameter, as OpenBSD notes for older cards. Until it has
+  run on a BE200, HE stays off on the Bz family by default: `he 1` in the
+  driver settings (and a reboot) switches it on for the test.
+- **Syslog.** One line per association says what was negotiated and what the
+  AP offers ("associated on channel 157, HE (802.11ax), 80 MHz (AP: 80 MHz,
+  HE)"); the line per rate change, several a second under load, is gone. The
+  driver also says how many 6 GHz channels the regulatory data allows: "0 of
+  59" on this laptop (see [6 GHz](WIFI-6GHZ.md)).
+- **Lab switches** in `~/config/settings/kernel/drivers/iaxwifi200`, read
+  when the interface is brought up: `he 0` (HT/VHT only; turning HE back on
+  needs a reboot if it was off at boot), `max_width 20|40|80|160` (narrows
+  the card's side only; the AP is not told, so with HE at `max_width 40` the
+  upload ran at 174 Mbit/s and the download at 20), `mld_api 1` (MLD commands
+  on a card that defaults to the older ones).
+
+The test kit (throughput scripts, the transmit rate probe, the procedure) is
+in `fw13/tests/wifi-he` of the lab workspace.
+
 ## Bluetooth support
 
 | Family | Setup | Card type | Firmware package |

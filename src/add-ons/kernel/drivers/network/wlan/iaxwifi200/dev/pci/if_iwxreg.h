@@ -4721,6 +4721,23 @@ enum iwx_link_ctx_protection_flags {
 }; /* LINK_PROTECT_FLAGS_E_VER_1 */
 
 /**
+ * enum iwx_link_ctx_flags - link context flags
+ * @IWX_LINK_FLG_BSS_COLOR_DIS: BSS color disable, don't use the BSS
+ *	color for RX filter but use MAC header
+ * @IWX_LINK_FLG_MU_EDCA_CW: indicates that there is an element of MU EDCA
+ *	parameter set, i.e. the backoff counters for trig-based ACs
+ * @IWX_LINK_FLG_RU_2MHZ_BLOCK: indicates that 26-tone RU OFDMA transmission
+ *	are not allowed
+ * @IWX_LINK_FLG_NDP_FEEDBACK_ENABLED: mark support for NDP feedback
+ */
+enum iwx_link_ctx_flags {
+	IWX_LINK_FLG_BSS_COLOR_DIS		= (1 << 0),
+	IWX_LINK_FLG_MU_EDCA_CW			= (1 << 1),
+	IWX_LINK_FLG_RU_2MHZ_BLOCK		= (1 << 2),
+	IWX_LINK_FLG_NDP_FEEDBACK_ENABLED	= (1 << 3),
+}; /* LINK_CONTEXT_FLAG_E_VER_1 */
+
+/**
  * struct iwx_link_config_cmd - command structure to configure the LINK context
  *	in MLD API
  * ( LINK_CONFIG_CMD =0x9 )

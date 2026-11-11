@@ -13,8 +13,10 @@ qualified. The [AX210 status](AX210.md) records native Wi-Fi association,
 HE capability scans, Bluetooth firmware loading, Classic inquiry and LE
 advertisement discovery. The AX210 now joins the 5 GHz Gaspers network at
 802.11ax, obtains DHCP, reports a two-stream HE rate, and carries gateway and
-internet traffic with Ethernet down. The current HE rate configuration uses
-20 MHz; wider-channel parity with the 40 MHz Linux reference and other Wi-Fi 6
+internet traffic with Ethernet down. That association ran at 20 MHz; an HE
+association follows the AP's channel width (80 MHz measured on the Framework
+13, see [Wireless devices](WIRELESS-DEVICES.md)). Parity with the 40 MHz Linux
+reference on this board and other Wi-Fi 6
 modes remain open. Bluetooth LE connection initiation and cancellation pass on
 the native AX210. A live MX Master 2S reached an LE connection during pairing,
 but the SMP exchange stalled; encryption, bonding, and mouse input are not yet
