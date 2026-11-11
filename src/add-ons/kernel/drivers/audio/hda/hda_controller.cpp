@@ -757,6 +757,18 @@ init_corb_rirb_pos(hda_controller* controller, uint32 quirks)
 void
 hda_stream_delete(hda_stream* stream)
 {
+	// The interrupt handler must not find it anymore.
+	hda_controller* controller = stream->controller;
+	for (uint32 index = 0; index < HDA_MAX_STREAMS; index++) {
+		if (controller->streams[index] == stream) {
+			cpu_status state = disable_interrupts();
+			acquire_spinlock(&controller->interrupt_lock);
+			controller->streams[index] = NULL;
+			release_spinlock(&controller->interrupt_lock);
+			restore_interrupts(state);
+		}
+	}
+
 	if (stream->buffer_area >= 0)
 		delete_area(stream->buffer_area);
 
@@ -764,6 +776,25 @@ hda_stream_delete(hda_stream* stream)
 		delete_area(stream->buffer_descriptors_area);
 
 	free(stream);
+}
+
+
+/*!	Whether the codec only plays through digital converters, like the display
+	audio codec of a graphics card (hda_audio_group_get_widgets() takes
+	digital converters only when there are no analog ones).
+*/
+static bool
+codec_is_display_audio(hda_codec* codec)
+{
+	hda_audio_group* audioGroup = codec->audio_groups[0];
+	hda_stream* stream = audioGroup->playback_stream;
+	if (stream == NULL || stream->num_io_widgets == 0)
+		return false;
+
+	hda_widget* widget = hda_audio_group_get_widget(audioGroup,
+		stream->io_widgets[0]);
+	return widget != NULL
+		&& (widget->capabilities.audio & AUDIO_CAP_DIGITAL) != 0;
 }
 
 
@@ -803,15 +834,10 @@ hda_stream_new(hda_audio_group* audioGroup, int type)
 	// find I/O and Pin widgets for this stream
 
 	if (hda_audio_group_get_widgets(audioGroup, stream) == B_OK) {
-		switch (type) {
-			case STREAM_PLAYBACK:
-				controller->streams[controller->num_input_streams] = stream;
-				break;
-			case STREAM_RECORD:
-				controller->streams[0] = stream;
-				break;
-		}
-
+		// The controller's stream interrupts are routed once it is known
+		// which codec the device plays through (see hda_hw_init()): with two
+		// codecs on the link, the streams of the last one must not take them
+		// over, or the other one gets no interrupts, which means no sound.
 		return stream;
 	}
 
@@ -1379,12 +1405,39 @@ hda_hw_init(hda_controller* controller)
 		if ((stateStatus & (1 << index)) != 0)
 			hda_codec_new(controller, index);
 	}
-	for (uint32 index = 0; index < HDA_MAX_CODECS; index++) {
-		if (controller->codecs[index]
-			&& controller->codecs[index]->num_audio_groups > 0) {
-			controller->active_codec = controller->codecs[index];
+	// The device plays through one codec. Take the first one with analog
+	// outputs: the display audio codec of Intel graphics shares the link with
+	// the board's own codec up to Ivy Bridge, and it is the board's speakers
+	// and jacks that are expected to play.
+	for (int pass = 0; pass < 2 && controller->active_codec == NULL; pass++) {
+		for (uint32 index = 0; index < HDA_MAX_CODECS; index++) {
+			hda_codec* codec = controller->codecs[index];
+			if (codec == NULL || codec->num_audio_groups == 0)
+				continue;
+			if (pass == 0 && codec_is_display_audio(codec))
+				continue;
+
+			controller->active_codec = codec;
 			break;
 		}
+	}
+
+	// The stream interrupts go to that codec's streams.
+	if (controller->active_codec != NULL) {
+		hda_audio_group* audioGroup = controller->active_codec->audio_groups[0];
+		cpu_status state = disable_interrupts();
+		acquire_spinlock(&controller->interrupt_lock);
+		controller->streams[0] = audioGroup->record_stream;
+		controller->streams[controller->num_input_streams]
+			= audioGroup->playback_stream;
+		release_spinlock(&controller->interrupt_lock);
+		restore_interrupts(state);
+
+		dprintf("hda: playing through codec %u (vendor 0x%04" B_PRIx16
+			", product 0x%04" B_PRIx16 ")\n",
+			(unsigned)controller->active_codec->addr,
+			controller->active_codec->vendor_id,
+			controller->active_codec->product_id);
 	}
 
 	controller->buffer_ready_sem = create_sem(0, "hda_buffer_sem");
