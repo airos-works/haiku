@@ -316,7 +316,8 @@ nvencHevcOpen(NvencEngine *engine, const nvenc_config *config, char *reason,
 		set_reason(reason, reasonSize, "NVENC encodes H.265 from 65x64 to 8192x8192.");
 		return NULL;
 	}
-	if (config->variant >= kNvencLayoutCount) {
+	/* the ways after the first differ for H.264 only */
+	if (config->variant >= 1) {
 		set_reason(reason, reasonSize, "no such picture arrangement");
 		return NULL;
 	}
@@ -500,7 +501,7 @@ fill_pic_setup(NvencHevc *encoder, bool idr, int qp)
 	slice->qp_slice_min = qp;
 	slice->qp_slice_max = qp;
 
-	nvencFillMeControl(base + ME_CONTROL_OFFSET);
+	nvencFillMeControl(base + ME_CONTROL_OFFSET, false);
 	fill_md_control((nvenc_h265_md_control_s *)(base + MD_CONTROL_OFFSET));
 }
 
@@ -529,6 +530,7 @@ nvencHevcEncode(NvencHevc *encoder, const nvenc_picture *picture, NvencQueue *qu
 	nvencStorePicture(encoder->inputPicture.data, &encoder->input,
 		&kNvencLayouts[encoder->config.variant], picture);
 	fill_pic_setup(encoder, idr, qp);
+	nvencDumpSetup(encoder->picSetup.data, PIC_SETUP_SIZE, encoder->count);
 	memset(encoder->status.data, 0, sizeof(nvenc_h265_pic_stat_s));
 
 	int current = encoder->count % 2;

@@ -131,15 +131,21 @@ nvenc_headers(nvenc_session *session, uint8_t *buffer, size_t *size)
 static int
 nvenc_encode(nvenc_session *session, const nvenc_picture *picture)
 {
-	if (picture == NULL) {
-		/* every picture is finished as it is handed over */
-		session->drained = true;
-		return 0;
-	}
 	char reason[256];
-	int status = session->h264 != NULL
-		? nvencH264Encode(session->h264, picture, &session->queue, reason, sizeof(reason))
-		: nvencHevcEncode(session->hevc, picture, &session->queue, reason, sizeof(reason));
+	int status;
+	if (picture == NULL) {
+		/* H.264 pictures may wait to become B pictures; H.265's are
+		 * finished as they are handed over */
+		status = session->h264 != NULL && !session->drained
+			? nvencH264Flush(session->h264, &session->queue, reason, sizeof(reason)) : 0;
+		session->drained = true;
+	} else if (session->h264 != NULL) {
+		status = nvencH264Encode(session->h264, picture, &session->queue, reason,
+			sizeof(reason));
+	} else {
+		status = nvencHevcEncode(session->hevc, picture, &session->queue, reason,
+			sizeof(reason));
+	}
 	if (status != 0) {
 		snprintf(session->description, sizeof(session->description), "%s", reason);
 		fprintf(stderr, "nvenc: %s\n", reason);

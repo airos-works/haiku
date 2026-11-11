@@ -10,6 +10,21 @@
 #include "video/nvenc_drv.h"
 
 void
+nvencDumpSetup(const void *data, size_t size, int picture)
+{
+	const char *directory = getenv("NVENC_DUMP");
+	if (directory == NULL)
+		return;
+	char name[512];
+	snprintf(name, sizeof(name), "%s/ours-%04d.bin", directory, picture);
+	FILE *file = fopen(name, "wb");
+	if (file == NULL)
+		return;
+	fwrite(data, 1, size, file);
+	fclose(file);
+}
+
+void
 nvencBitsInit(NvencBits *bits, uint8_t *data, size_t capacity)
 {
 	bits->data = data;
@@ -85,7 +100,7 @@ nvencAppendNal(uint8_t *out, size_t outSize, size_t at, const uint8_t *header,
  * predictor buffers), the co-located block and zero, each searched with
  * its own pattern of points. */
 void
-nvencFillMeControl(void *control)
+nvencFillMeControl(void *control, bool bPicture)
 {
 	nvenc_h264_me_control_s *me = control;
 	memset(me, 0, sizeof(*me));
@@ -103,6 +118,10 @@ nvencFillMeControl(void *control)
 	me->predsrc.self_temporal_search = 1;
 	me->predsrc.self_temporal_stamp_l0 = 4;
 	me->predsrc.self_temporal_stamp_l1 = 5;
+	/* A B picture's direct and skipped blocks take their vectors from the
+	 * co-located data of the picture after it, which the engine only reads
+	 * with this set (and SET_IN_COLOC_DATA given: P pictures fail with it). */
+	me->predsrc.coloc_enable = bPicture;
 	me->predsrc.coloc_stamp_l0 = 1;
 	me->predsrc.coloc_stamp_l1 = 1;
 	me->predsrc.const_mv_enable = 1;
@@ -146,10 +165,15 @@ nvencFillMeControl(void *control)
 /* The arrangement the engine reads its input in and writes its reference
  * pictures in: the video block linear one NVDEC writes, two groups of eight
  * lines to a block (found on a GTX 1070; NVIDIA's driver configures an RTX
- * 3050 the same way). The interface leaves room for more, which the caller
- * would try in turn. */
+ * 3050 the same way). With it go the parts of H.264 a card may turn out not
+ * to encode right: MediaConverter's test tries the ways in turn and uses
+ * the first that gives its pictures back, so a card that fails B pictures
+ * or the 8x8 transform still encodes without them. */
 const NvencLayout kNvencLayouts[] = {
-	{ false, true, 2, false, "video block linear" },
+	{ false, true, 2, false, true, true, "video block linear" },
+	{ false, true, 2, false, false, true, "video block linear, no B pictures" },
+	{ false, true, 2, false, false, false,
+		"video block linear, no B pictures, Main profile" },
 };
 const uint32_t kNvencLayoutCount = sizeof(kNvencLayouts) / sizeof(kNvencLayouts[0]);
 
@@ -377,8 +401,11 @@ rate_estimate(const NvencRateControl *rc)
 int
 nvencRateQp(NvencRateControl *rc, int kind)
 {
-	if (rc->targetPerPicture <= 0)
-		return rc->usedQp[kind] = clamp_qp(rc, rc->qp);
+	if (rc->targetPerPicture <= 0) {
+		/* constant QP: the one asked for, B pictures two above it */
+		return rc->usedQp[kind] = clamp_qp(rc, rc->qp
+			+ (kind == NVENC_PICTURE_B ? kQpOffset[NVENC_PICTURE_B] : 0));
+	}
 	int total = rc->seen[0] + rc->seen[1] + rc->seen[2];
 	if (total > 0) {
 		double qp = rate_estimate(rc);

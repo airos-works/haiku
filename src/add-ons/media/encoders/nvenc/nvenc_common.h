@@ -16,6 +16,11 @@
 extern "C" {
 #endif
 
+/* With NVENC_DUMP=<directory> in the environment, write a picture's driver
+ * picture setup buffer there (ours-NNNN.bin), to compare with what NVIDIA's
+ * driver sends (test/nvsetupscan.c). */
+void nvencDumpSetup(const void *data, size_t size, int picture);
+
 /* Writing a header. Bits go in most significant first. */
 typedef struct {
 	uint8_t		*data;
@@ -42,6 +47,8 @@ typedef struct {
 	bool		linesInFours;	/* the block linear arrangement */
 	uint8_t		blockHeight;	/* the surface configuration's field */
 	bool		chromaFromBase;	/* chroma address = base + configured offset */
+	bool		bPictures;	/* H.264: B pictures where the preset has them */
+	bool		highProfile;	/* H.264: High profile, the 8x8 transform */
 	const char	*name;
 } NvencLayout;
 
@@ -67,8 +74,8 @@ void nvencStorePicture(uint8_t *out, const NvencPictureLayout *picture,
 	const NvencLayout *layout, const nvenc_picture *source);
 
 /* The motion search control the codecs share (an nvenc_h264_me_control_s,
- * which H.265 uses too). */
-void nvencFillMeControl(void *control);
+ * which H.265 uses too); for a B picture with the co-located hints. */
+void nvencFillMeControl(void *control, bool bPicture);
 
 /* Finished packets, oldest first. */
 typedef struct NvencPacket {
