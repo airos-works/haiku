@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Fetch the firmware of the Raspberry Pi 4's Wi-Fi chip (CYW43455) from
+# Fetch the firmware of the Raspberry Pi 4's Wi-Fi chip (CYW43455) and of the
+# Pi 400's (CYW43456: the same chip ID at revision 9, another firmware) from
 # Raspberry Pi's firmware-nonfree repository, under the names the
 # broadcomfmac driver asks for. Redistributable (Cypress licence), not part
 # of this tree.
@@ -14,8 +15,11 @@ fetch() {
 fetch brcmfmac43455-sdio.bin cypress/cyfmac43455-sdio-standard.bin
 fetch brcmfmac43455-sdio.clm_blob cypress/cyfmac43455-sdio.clm_blob
 fetch brcmfmac43455-sdio.txt brcm/brcmfmac43455-sdio.txt
-(cd "$DIR" && sha256sum brcmfmac43455-sdio.* > SHA256SUMS)
-echo "CYW43455 firmware -> $DIR"
+fetch brcmfmac43456-sdio.bin brcm/brcmfmac43456-sdio.bin
+fetch brcmfmac43456-sdio.clm_blob brcm/brcmfmac43456-sdio.clm_blob
+fetch brcmfmac43456-sdio.txt brcm/brcmfmac43456-sdio.txt
+(cd "$DIR" && sha256sum brcmfmac4345[56]-sdio.* > SHA256SUMS)
+echo "CYW43455 and CYW43456 firmware -> $DIR"
 
 # The Bluetooth half of the chip: its patch file, for the h4bcm driver.
 BT_DIR=${2:-/mnt/HaikuWork/rpi4/bluetooth}

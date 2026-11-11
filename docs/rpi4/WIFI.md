@@ -29,6 +29,13 @@ Firmware: `brcmfmac43455-sdio.bin`, `.clm_blob` and `.txt` in
 (`tools/rpi4/fetch-wifi-firmware.sh`; the `rpi4-airos` profile installs
 them). The driver is in the regular image's driver list for arm64.
 
+The Pi 400 (and some Compute Module 4 boards) carry the CYW43456: the same
+chip ID, 0x4345, at revision 9. The driver asks for `brcmfmac43456-sdio.*`
+there, so the images ship those three files too. Without them the adapter
+shows up but never finds a network (airos-works/haiku#68). Not tested on a
+Pi 400: the lab has none. Its Bluetooth half is a BCM4345C5, for which
+`h4bcm` has no patch file yet (it loads `BCM4345C0.hcd` only).
+
 Joining goes the usual way: `ifconfig <device> join <network> <password>` or
 the Wi-Fi preferences → net_server → wpa_supplicant → the driver; the
 four-way handshake runs in the kernel's OpenBSD net80211.
