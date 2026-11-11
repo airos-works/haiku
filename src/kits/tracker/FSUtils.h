@@ -85,9 +85,10 @@ public:
 			enum OverwriteMode {
 				kSkip,			// do not replace, go to next entry
 				kReplace,		// remove entry before copying new one
-				kMerge			// for folders: leave existing folder, update
+				kMerge,			// for folders: leave existing folder, update
 								// contents leaving nonconflicting items
 								// for files: save original attributes on file
+				kKeepBoth		// copy under a new name, keep the existing one
 			};
 
 	//! Override to always overwrite, never overwrite, let user decide,
@@ -116,6 +117,9 @@ public:
 
 
 //! This is the Tracker copy-specific version of CopyLoopControl.
+class CopyConflicts;
+
+
 class TrackerCopyLoopControl : public CopyLoopControl {
 public:
 								TrackerCopyLoopControl();
@@ -151,10 +155,20 @@ public:
 
 			void				SetSourceList(EntryList* list);
 
+	// What the user chose for each name clash, asked before the copy
+			void				SetConflicts(CopyConflicts* conflicts)
+									{ fConflicts = conflicts; }
+
+	virtual	OverwriteMode		OverwriteOnConflict(const BEntry* srcEntry,
+									const char* destName,
+									const BDirectory* destDir,
+									bool srcIsDir, bool dstIsDir);
+
 private:
 			thread_id			fThread;
 
 			EntryList*			fSourceList;
+			CopyConflicts*		fConflicts;
 };
 
 

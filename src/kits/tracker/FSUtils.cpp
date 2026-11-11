@@ -83,6 +83,7 @@ respective holders. All rights reserved.
 #include "Bitmaps.h"
 #include "Commands.h"
 #include "FindPanel.h"
+#include "CopyConflicts.h"
 #include "FSUndoRedo.h"
 #include "FSUtils.h"
 #include "InfoWindow.h"
@@ -302,7 +303,8 @@ CopyLoopControl::PreserveAttribute(const char*)
 TrackerCopyLoopControl::TrackerCopyLoopControl()
 	:
 	fThread(find_thread(NULL)),
-	fSourceList(NULL)
+	fSourceList(NULL),
+	fConflicts(NULL)
 {
 }
 
@@ -310,7 +312,8 @@ TrackerCopyLoopControl::TrackerCopyLoopControl()
 TrackerCopyLoopControl::TrackerCopyLoopControl(uint32 jobKind)
 	:
 	fThread(find_thread(NULL)),
-	fSourceList(NULL)
+	fSourceList(NULL),
+	fConflicts(NULL)
 {
 	Init(jobKind);
 }
@@ -320,7 +323,8 @@ TrackerCopyLoopControl::TrackerCopyLoopControl(int32 totalItems,
 		off_t totalSize)
 	:
 	fThread(find_thread(NULL)),
-	fSourceList(NULL)
+	fSourceList(NULL),
+	fConflicts(NULL)
 {
 	Init(totalItems, totalSize);
 }
@@ -399,6 +403,28 @@ TrackerCopyLoopControl::CheckUserCanceled()
 	}
 
 	return false;
+}
+
+
+CopyLoopControl::OverwriteMode
+TrackerCopyLoopControl::OverwriteOnConflict(const BEntry* srcEntry,
+	const char* destName, const BDirectory* destDir, bool srcIsDir,
+	bool dstIsDir)
+{
+	if (srcIsDir && dstIsDir)
+		return kMerge;
+
+	int32 decision = fConflicts != NULL && destDir != NULL
+		? fConflicts->DecisionFor(*destDir, destName) : -1;
+	switch (decision) {
+		case kConflictSkip:
+			return kSkip;
+		case kConflictKeepBoth:
+			return kKeepBoth;
+		default:
+			// asked to replace, or not listed (as it always was)
+			return kReplace;
+	}
 }
 
 
@@ -881,7 +907,8 @@ static status_t
 InitCopy(CopyLoopControl* loopControl, uint32 moveMode,
 	BObjectList<entry_ref, true>* srcList, BVolume* dstVol, BDirectory* destDir,
 	entry_ref* destRef, bool preflightNameCheck, bool needSizeCalculation,
-	int32* collisionCount, ConflictCheckResult* preflightResult)
+	int32* collisionCount, ConflictCheckResult* preflightResult,
+	CopyConflicts* conflicts)
 {
 	if (dstVol->IsReadOnly())
 		return B_READ_ONLY_DEVICE;
@@ -950,6 +977,23 @@ InitCopy(CopyLoopControl* loopControl, uint32 moveMode,
 
 		*preflightResult = kPrompt;
 		*collisionCount = 0;
+
+		if (conflicts != NULL && destDir != NULL
+			&& (moveMode == kCopySelectionTo || moveMode == kMoveSelectionTo)) {
+			// every clash, also inside folders that merge, decided at once
+			if (conflicts->Find(srcList, *destDir)) {
+				BEntry destEntry;
+				destDir->GetEntry(&destEntry);
+				char destName[B_FILE_NAME_LENGTH];
+				destEntry.GetName(destName);
+				if (!conflicts->Ask(moveMode == kMoveSelectionTo, destName))
+					return B_ERROR;
+			}
+			// folders that meet folders merge; the files in them were
+			// decided above (or, past the listed ones, replaced)
+			*preflightResult = kReplaceAll;
+			return B_OK;
+		}
 
 		*preflightResult = PreFlightNameCheck(srcList, destDir, collisionCount, moveMode);
 		if (*preflightResult == kCanceled) {
@@ -1098,6 +1142,8 @@ MoveTask(BObjectList<entry_ref, true>* srcList, BEntry* destEntry, BList* pointL
 		undo.Remove();
 
 	TrackerCopyLoopControl loopControl;
+	CopyConflicts conflicts;
+	loopControl.SetConflicts(&conflicts);
 
 	ConflictCheckResult conflictCheckResult = kPrompt;
 	int32 collisionCount = 0;
@@ -1105,7 +1151,8 @@ MoveTask(BObjectList<entry_ref, true>* srcList, BEntry* destEntry, BList* pointL
 	// neat to move all that into TrackerCopyLoopControl
 	status_t result = InitCopy(&loopControl, moveMode, srcList,
 		&volume, destDirToCheck, &destRef, needPreflightNameCheck,
-		needSizeCalculation, &collisionCount, &conflictCheckResult);
+		needSizeCalculation, &collisionCount, &conflictCheckResult,
+		&conflicts);
 
 	loopControl.SetSourceList(srcList);
 
@@ -1175,9 +1222,25 @@ MoveTask(BObjectList<entry_ref, true>* srcList, BEntry* destEntry, BList* pointL
 				continue;
 			}
 
+			// what the user chose for this name, if it clashed
+			int32 decision = conflicts.CountConflicts() > 0
+				? conflicts.DecisionFor(destDir, srcRef->name) : -1;
+			char keepBothName[B_FILE_NAME_LENGTH];
+			const char* newName = NULL;
+			if (decision == kConflictSkip) {
+				loopControl.UpdateStatus(srcRef->name, *srcRef, 1);
+				continue;
+			} else if (decision == kConflictKeepBoth) {
+				strlcpy(keepBothName, srcRef->name, sizeof(keepBothName));
+				MakeKeepBothName(keepBothName, &destDir);
+				newName = keepBothName;
+			}
+
 			// resolve name collisions and hierarchy problems
-			if (CheckName(moveMode, &sourceEntry, &destDir,
-					collisionCount > 1, conflictCheckResult) != B_OK) {
+			ConflictCheckResult decided = kReplaceAll;
+			if (newName == NULL && CheckName(moveMode, &sourceEntry, &destDir,
+					collisionCount > 1,
+					decision >= 0 ? decided : conflictCheckResult) != B_OK) {
 				// we will skip the current item, because we got a conflict
 				// and were asked to or because there was some conflict
 
@@ -1201,7 +1264,8 @@ MoveTask(BObjectList<entry_ref, true>* srcList, BEntry* destEntry, BList* pointL
 			if (pointList != NULL)
 				loc = (BPoint*)pointList->ItemAt(i);
 
-			result = MoveItem(&sourceEntry, &destDir, loc, moveMode, NULL, undo, &loopControl);
+			result = MoveItem(&sourceEntry, &destDir, loc, moveMode, newName, undo,
+				&loopControl);
 			if (result != B_OK)
 				break;
 		}
@@ -1310,6 +1374,11 @@ CopyFile(BEntry* srcFile, StatStruct* srcStat, BDirectory* destDir,
 				// fall through if not a directory
 			case TrackerCopyLoopControl::kMerge:
 				// This flag implies that the attributes should be kept on the file, ignore it.
+				break;
+
+			case TrackerCopyLoopControl::kKeepBoth:
+				MakeKeepBothName(destName, destDir);
+				undo.UpdateEntry(srcFile, destName);
 				break;
 		}
 	}
@@ -1628,6 +1697,7 @@ CopyFolder(BEntry* srcEntry, BDirectory* destDir,
 				}
 			// fall through if directory, do not replace.
 			case TrackerCopyLoopControl::kMerge:
+			case TrackerCopyLoopControl::kKeepBoth:
 				ASSERT(isDirectory);
 				// do not create a new directory, use the current one
 				newDir.SetTo(&existingEntry);
@@ -1723,17 +1793,42 @@ RecursiveMove(BEntry* entry, BDirectory* destDir, CopyLoopControl* loopControl)
 		entry->GetRef(&ref);
 		BDirectory source(&ref);
 		if (source.InitCheck() == B_OK) {
+			// list the folder first: moving entries out of it while reading
+			// it skips some of them
+			BObjectList<entry_ref, true> entries(20);
 			source.Rewind();
-			BEntry current;
-			while (source.GetNextEntry(&current) == B_OK) {
+			entry_ref childRef;
+			while (source.GetNextRef(&childRef) == B_OK)
+				entries.AddItem(new entry_ref(childRef));
+
+			for (int32 index = 0; index < entries.CountItems(); index++) {
+				BEntry current(entries.ItemAt(index));
+				if (current.InitCheck() != B_OK)
+					continue;
 				if (current.IsDirectory()) {
 					RecursiveMove(&current, &subDir, loopControl);
 					current.Remove();
 				} else {
 					name = current.Name();
-					if (loopControl->OverwriteOnConflict(&current, name, &subDir, true, false)
-							!= TrackerCopyLoopControl::kSkip) {
-						MoveError::FailOnError(current.MoveTo(&subDir, NULL, true));
+					switch (loopControl->OverwriteOnConflict(&current, name,
+							&subDir, false, false)) {
+						case TrackerCopyLoopControl::kSkip:
+							break;
+
+						case TrackerCopyLoopControl::kKeepBoth:
+						{
+							char newName[B_FILE_NAME_LENGTH];
+							strlcpy(newName, name, sizeof(newName));
+							MakeKeepBothName(newName, &subDir);
+							MoveError::FailOnError(current.MoveTo(&subDir,
+								newName, false));
+							break;
+						}
+
+						default:
+							MoveError::FailOnError(current.MoveTo(&subDir,
+								NULL, true));
+							break;
 					}
 				}
 			}
