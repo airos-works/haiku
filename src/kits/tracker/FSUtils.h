@@ -184,7 +184,8 @@ _IMPEXP_TRACKER void FSMoveToTrash(BObjectList<entry_ref, true>* srcList,
 
 void FSDeleteRefList(BObjectList<entry_ref, true>*, bool, bool confirm = true);
 void FSDelete(entry_ref*, bool, bool confirm = true);
-void FSRestoreRefList(BObjectList<entry_ref,true >* list, bool async);
+void FSRestoreRefList(BObjectList<entry_ref,true >* list, bool async,
+	bool recordUndo = true);
 
 _IMPEXP_TRACKER status_t FSLaunchItem(const entry_ref* application,
 	const BMessage* refsReceived, bool async, bool openWithOK);

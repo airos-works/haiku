@@ -6745,7 +6745,7 @@ BPoseView::RestoreItemsFromTrash(BObjectList<entry_ref, true>* list, bool select
 	BObjectList<FunctionObject, true>* taskList = new BObjectList<FunctionObject, true>(2);
 
 	// first restoree selection
-	taskList->AddItem(NewFunctionObject(FSRestoreRefList, list, false));
+	taskList->AddItem(NewFunctionObject(FSRestoreRefList, list, false, true));
 
 	if (selectNext && ViewMode() == kListMode) {
 		// next, if in list view mode try selecting the next item after

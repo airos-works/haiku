@@ -124,7 +124,7 @@ static void LowLevelCopy(BEntry*, StatStruct*, BDirectory*, char* destName,
 status_t DuplicateTask(BObjectList<entry_ref, true>* srcList);
 static status_t MoveTask(BObjectList<entry_ref, true>*, BEntry*, BList*, uint32);
 static status_t _DeleteTask(BObjectList<entry_ref, true>*, bool);
-static status_t _RestoreTask(BObjectList<entry_ref, true>*);
+static status_t _RestoreTask(BObjectList<entry_ref, true>*, bool recordUndo);
 status_t CalcItemsAndSize(CopyLoopControl* loopControl,
 	BObjectList<entry_ref, true>* refList, ssize_t blockSize, int32* totalCount,
 	off_t* totalSize);
@@ -580,12 +580,13 @@ FSDeleteRefList(BObjectList<entry_ref, true>* list, bool async, bool confirm)
 
 
 void
-FSRestoreRefList(BObjectList<entry_ref, true>* list, bool async)
+FSRestoreRefList(BObjectList<entry_ref, true>* list, bool async, bool recordUndo)
 {
-	if (async)
-		LaunchInNewThread("RestoreTask", B_NORMAL_PRIORITY, _RestoreTask, list);
-	else
-		_RestoreTask(list);
+	if (async) {
+		LaunchInNewThread("RestoreTask", B_NORMAL_PRIORITY, _RestoreTask, list,
+			recordUndo);
+	} else
+		_RestoreTask(list, recordUndo);
 }
 
 
@@ -3158,9 +3159,10 @@ FSRecursiveCreateFolder(BPath path)
 
 
 status_t
-_RestoreTask(BObjectList<entry_ref, true>* list)
+_RestoreTask(BObjectList<entry_ref, true>* list, bool recordUndo)
 {
 	TrackerCopyLoopControl loopControl(kRestoreFromTrashState);
+	BObjectList<entry_ref, true> restored(10);
 
 	// calculate the sum total of all items that will be restored
 	int32 totalItems = 0;
@@ -3205,6 +3207,10 @@ _RestoreTask(BObjectList<entry_ref, true>* list)
 						BNode node(&entry);
 						if (node.InitCheck() == B_OK)
 							node.RemoveAttr(kAttrOriginalPath);
+
+						entry_ref restoredRef;
+						if (entry.GetRef(&restoredRef) == B_OK)
+							restored.AddItem(new entry_ref(restoredRef));
 					}
 				}
 			}
@@ -3216,6 +3222,9 @@ _RestoreTask(BObjectList<entry_ref, true>* list)
 	}
 
 	delete list;
+
+	if (recordUndo)
+		RecordRestoreUndo(restored);
 
 	return err;
 }

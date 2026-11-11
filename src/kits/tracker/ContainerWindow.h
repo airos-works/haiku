@@ -367,6 +367,7 @@ private:
 
 	void _UpdateSelectionMIMEInfo();
 	void _ScheduleStateSave();
+	void _UpdateUndoItems(BMenu* menu);
 	bool _CanShareView() const;
 	void _UseViewForNewFolders();
 	void _ApplyViewToSubfolders();

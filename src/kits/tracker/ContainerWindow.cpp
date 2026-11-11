@@ -1178,6 +1178,40 @@ BContainerWindow::_ApplyViewToSubfolders()
 
 
 void
+BContainerWindow::_UpdateUndoItems(BMenu* menu)
+{
+	// name what Undo and Redo would do, as in "Undo move of 3 items"
+	BMenuItem* undoItem = menu->FindItem(B_UNDO);
+	if (undoItem != NULL) {
+		BString description;
+		bool canUndo = FSGetUndoDescription(description);
+		BString label(B_TRANSLATE("Undo"));
+		if (canUndo) {
+			label = B_TRANSLATE_COMMENT("Undo %action",
+				"Menu item, %action is like: move of 3 items");
+			label.ReplaceFirst("%action", description);
+		}
+		undoItem->SetLabel(label.String());
+		undoItem->SetEnabled(canUndo);
+	}
+
+	BMenuItem* redoItem = menu->FindItem(B_REDO);
+	if (redoItem != NULL) {
+		BString description;
+		bool canRedo = FSGetRedoDescription(description);
+		BString label(B_TRANSLATE("Redo"));
+		if (canRedo) {
+			label = B_TRANSLATE_COMMENT("Redo %action",
+				"Menu item, %action is like: move of 3 items");
+			label.ReplaceFirst("%action", description);
+		}
+		redoItem->SetLabel(label.String());
+		redoItem->SetEnabled(canRedo);
+	}
+}
+
+
+void
 BContainerWindow::UpdateTitle()
 {
 	// set title to full path, if necessary
@@ -2049,12 +2083,17 @@ BContainerWindow::AddFileMenu(BMenu* menu)
 	// The "Move To", "Copy To", "Create Link" menus are inserted here,
 	// have a look at UpdateMenu() and SetupMoveCopyMenus().
 
+	menu->AddItem(new BMenuItem(B_TRANSLATE("Undo"), new BMessage(B_UNDO),
+		'Z'));
+	menu->AddItem(new BMenuItem(B_TRANSLATE("Redo"), new BMessage(B_REDO),
+		'Z', B_SHIFT_KEY));
+
 	if (!TargetModel()->IsRoot() && !TargetModel()->IsTrash() && !TargetModel()->InTrash()) {
 		menu->AddItem(Shortcuts()->CutItem());
 		menu->AddItem(Shortcuts()->CopyItem());
 		menu->AddItem(Shortcuts()->PasteItem());
-		menu->AddSeparatorItem();
 	}
+	menu->AddSeparatorItem();
 
 	if (!TargetModel()->IsRoot())
 		menu->AddItem(Shortcuts()->IdentifyItem());
@@ -3153,6 +3192,7 @@ void
 BContainerWindow::UpdateFileMenu(BMenu* menu)
 {
 	SetupNewTemplatesMenu(menu, kFileMenuContext);
+	_UpdateUndoItems(menu);
 
 	UpdateFileMenuOrPoseContextMenu(menu, kFileMenuContext);
 }

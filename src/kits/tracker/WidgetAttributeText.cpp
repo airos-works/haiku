@@ -60,6 +60,7 @@ All rights reserved.
 #include <VolumeRoster.h>
 
 #include "Attributes.h"
+#include "FSUndoRedo.h"
 #include "FSUtils.h"
 #include "Model.h"
 #include "OpenWithWindow.h"
@@ -1606,6 +1607,8 @@ GenericAttributeText::CommitEditedTextFlavor(BTextView* textView)
 	const char* columnName = fColumn->AttrName();
 	ssize_t size = 0;
 
+	AttributeUndo undo(*fModel->EntryRef(), columnName, fColumn->Title());
+
 	switch (type) {
 		case B_STRING_TYPE:
 			size = fModel->WriteAttr(columnName, type, 0, textView->Text(),
@@ -1738,6 +1741,8 @@ GenericAttributeText::CommitEditedTextFlavor(BTextView* textView)
 	}
 
 	if (size < 0) {
+		undo.Remove();
+
 		BAlert* alert = new BAlert("",
 			B_TRANSLATE("There was an error writing the attribute."),
 			B_TRANSLATE("Cancel"),

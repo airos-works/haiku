@@ -37,6 +37,7 @@ All rights reserved.
 
 #include <Entry.h>
 #include <ObjectList.h>
+#include <String.h>
 
 
 namespace BPrivate {
@@ -88,6 +89,18 @@ class RenameVolumeUndo : public Undo {
 };
 
 
+class AttributeUndo : public Undo {
+	public:
+		AttributeUndo(const entry_ref& ref, const char* attrName,
+			const char* label);
+			// reads the attribute's value now; construct before writing
+};
+
+
+void RecordRestoreUndo(const BObjectList<entry_ref, true>& restored);
+	// adds an undo item that moves restored items back to the Trash
+
+
 static
 inline bool FSIsUndoMoveMode(uint32 moveMode)
 {
@@ -111,6 +124,8 @@ inline uint32 FSMoveMode(uint32 moveMode)
 
 extern void FSUndo();
 extern void FSRedo();
+extern bool FSGetUndoDescription(BString& description);
+extern bool FSGetRedoDescription(BString& description);
 
 }	// namespace BPrivate
 
