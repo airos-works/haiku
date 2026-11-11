@@ -153,6 +153,12 @@ public:
 			return false;
 		}
 
+		if (_IsDriverStartMarker(path)) {
+			printf("ignoring '%s', a driver start marker of this "
+				"machine.\n", path);
+			return false;
+		}
+
 		if (statInfo.st_dev != fSourceDevice) {
 			// Allow that only for the root of the packagefs mounts, since
 			// those contain directories that shine through from the
@@ -165,6 +171,26 @@ public:
 	}
 
 private:
+	/*!	A kernel driver's start marker ("<driver>.starting" in the drivers'
+		settings, see amdgpu_drm): it is left while the driver starts, and
+		found by the next boot it keeps the driver off. One of the live
+		session must not keep the driver off on the installed system: on some
+		machines (the AMD Framework boards) that looks like a boot that hangs
+		at the splash screen.
+	*/
+	static bool _IsDriverStartMarker(const char* path)
+	{
+		static const char kDirectory[] = "home/config/settings/kernel/drivers/";
+		static const char kSuffix[] = ".starting";
+		const size_t directoryLength = sizeof(kDirectory) - 1;
+		const size_t suffixLength = sizeof(kSuffix) - 1;
+		size_t length = strlen(path);
+		return length > directoryLength + suffixLength
+			&& strncmp(path, kDirectory, directoryLength) == 0
+			&& strchr(path + directoryLength, '/') == NULL
+			&& strcmp(path + length - suffixLength, kSuffix) == 0;
+	}
+
 	typedef std::set<std::string> StringSet;
 
 			StringSet			fIgnorePaths;

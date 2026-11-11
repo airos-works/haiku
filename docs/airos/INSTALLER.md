@@ -71,7 +71,10 @@ so a write-protected USB disk such as the NanoKVM's read-only virtual drive
 used to be mounted writable, and the kernel panicked minutes later when the
 journal could not be written. A writable stick is not changed by booting it
 either. Settings made in the live session (the language chosen at the first
-boot prompt, for one) are copied to the installed system.
+boot prompt, for one) are copied to the installed system. Kernel drivers'
+start markers (`home/config/settings/kernel/drivers/*.starting`, see
+amdgpu_drm) are not: they describe a start in the live session, and on the
+installed system one would keep the driver off.
 
 The first boot prompt and the Installer now get the user environment
 (`data/launch/user`): without it ICU found no data on arm64, so the language
