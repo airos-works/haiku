@@ -16,6 +16,11 @@
 extern "C" {
 #endif
 
+/* With NVENC_DUMP=<directory> in the environment, write a picture's driver
+ * picture setup buffer there (ours-NNNN.bin), to compare with what NVIDIA's
+ * driver sends (test/nvsetupscan.c). */
+void nvencDumpSetup(const void *data, size_t size, int picture);
+
 /* Writing a header. Bits go in most significant first. */
 typedef struct {
 	uint8_t		*data;
@@ -42,6 +47,8 @@ typedef struct {
 	bool		linesInFours;	/* the block linear arrangement */
 	uint8_t		blockHeight;	/* the surface configuration's field */
 	bool		chromaFromBase;	/* chroma address = base + configured offset */
+	bool		bPictures;	/* H.264: B pictures where the preset has them */
+	bool		highProfile;	/* H.264: High profile, the 8x8 transform */
 	const char	*name;
 } NvencLayout;
 
@@ -67,8 +74,8 @@ void nvencStorePicture(uint8_t *out, const NvencPictureLayout *picture,
 	const NvencLayout *layout, const nvenc_picture *source);
 
 /* The motion search control the codecs share (an nvenc_h264_me_control_s,
- * which H.265 uses too). */
-void nvencFillMeControl(void *control);
+ * which H.265 uses too); for a B picture with the co-located hints. */
+void nvencFillMeControl(void *control, bool bPicture);
 
 /* Finished packets, oldest first. */
 typedef struct NvencPacket {
@@ -89,21 +96,40 @@ bool nvencQueuePush(NvencQueue *queue, const uint8_t *data, size_t size,
 NvencPacket *nvencQueuePop(NvencQueue *queue);
 void nvencQueueClear(NvencQueue *queue);
 
-/* A simple rate control for the bit rate modes: the engine is always run at
- * a constant QP, and the QP moves with how far the stream is from its
- * budget. */
+/* The rate control of the bit rate modes. The engine is always run at a
+ * constant QP per picture; the QP comes from what the pictures so far cost
+ * (bits times quantiser step, per kind of picture), the share each kind has
+ * in the stream and how far the stream is from its budget. */
+enum {
+	NVENC_PICTURE_P = 0,
+	NVENC_PICTURE_I,
+	NVENC_PICTURE_B,
+	NVENC_PICTURE_KINDS
+};
+
 typedef struct {
-	double		targetPerPicture;	/* bits */
-	double		fullness;		/* bits over budget, decaying */
-	double		qp;
+	double		targetPerPicture;	/* bits; 0: constant QP */
+	double		bufferBits;		/* how far from the budget doubles the step */
+	double		window;			/* pictures the costs are averaged over */
+	double		qp;			/* of P pictures: the last one chosen */
 	int		minQp, maxQp;
-	bool		constrained;		/* CBR: react harder */
+	int		keyInterval;
+	int		bPictures;		/* between two reference pictures */
+	double		cost[NVENC_PICTURE_KINDS];	/* bits x step, averaged */
+	int		seen[NVENC_PICTURE_KINDS];
+	int		usedQp[NVENC_PICTURE_KINDS];
+	double		totalBits, wantedBits;
+	bool		retried;
 } NvencRateControl;
 
 void nvencRateInit(NvencRateControl *rc, const nvenc_config *config, int minQp,
-	int maxQp, int startQp);
-int nvencRateQp(const NvencRateControl *rc, bool intra);
-void nvencRateUpdate(NvencRateControl *rc, size_t bytes, bool intra);
+	int maxQp, int startQp, int bPictures);
+/* The QP for the next picture of a kind. */
+int nvencRateQp(NvencRateControl *rc, int kind);
+/* After the stream's first picture: the QP to encode it again with when the
+ * guess it was encoded with turned out far off, else -1. */
+int nvencRateRetry(NvencRateControl *rc, size_t bytes, int kind);
+void nvencRateUpdate(NvencRateControl *rc, size_t bytes, int kind);
 
 /* Level tables */
 int nvencH264Level(int width, int height, double fps, uint32_t bitrate);

@@ -3,10 +3,26 @@
 #include "nvenc_common.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "video/nvenc_drv.h"
+
+void
+nvencDumpSetup(const void *data, size_t size, int picture)
+{
+	const char *directory = getenv("NVENC_DUMP");
+	if (directory == NULL)
+		return;
+	char name[512];
+	snprintf(name, sizeof(name), "%s/ours-%04d.bin", directory, picture);
+	FILE *file = fopen(name, "wb");
+	if (file == NULL)
+		return;
+	fwrite(data, 1, size, file);
+	fclose(file);
+}
 
 void
 nvencBitsInit(NvencBits *bits, uint8_t *data, size_t capacity)
@@ -84,7 +100,7 @@ nvencAppendNal(uint8_t *out, size_t outSize, size_t at, const uint8_t *header,
  * predictor buffers), the co-located block and zero, each searched with
  * its own pattern of points. */
 void
-nvencFillMeControl(void *control)
+nvencFillMeControl(void *control, bool bPicture)
 {
 	nvenc_h264_me_control_s *me = control;
 	memset(me, 0, sizeof(*me));
@@ -102,6 +118,10 @@ nvencFillMeControl(void *control)
 	me->predsrc.self_temporal_search = 1;
 	me->predsrc.self_temporal_stamp_l0 = 4;
 	me->predsrc.self_temporal_stamp_l1 = 5;
+	/* A B picture's direct and skipped blocks take their vectors from the
+	 * co-located data of the picture after it, which the engine only reads
+	 * with this set (and SET_IN_COLOC_DATA given: P pictures fail with it). */
+	me->predsrc.coloc_enable = bPicture;
 	me->predsrc.coloc_stamp_l0 = 1;
 	me->predsrc.coloc_stamp_l1 = 1;
 	me->predsrc.const_mv_enable = 1;
@@ -145,10 +165,15 @@ nvencFillMeControl(void *control)
 /* The arrangement the engine reads its input in and writes its reference
  * pictures in: the video block linear one NVDEC writes, two groups of eight
  * lines to a block (found on a GTX 1070; NVIDIA's driver configures an RTX
- * 3050 the same way). The interface leaves room for more, which the caller
- * would try in turn. */
+ * 3050 the same way). With it go the parts of H.264 a card may turn out not
+ * to encode right: MediaConverter's test tries the ways in turn and uses
+ * the first that gives its pictures back, so a card that fails B pictures
+ * or the 8x8 transform still encodes without them. */
 const NvencLayout kNvencLayouts[] = {
-	{ false, true, 2, false, "video block linear" },
+	{ false, true, 2, false, true, true, "video block linear" },
+	{ false, true, 2, false, false, true, "video block linear, no B pictures" },
+	{ false, true, 2, false, false, false,
+		"video block linear, no B pictures, Main profile" },
 };
 const uint32_t kNvencLayoutCount = sizeof(kNvencLayouts) / sizeof(kNvencLayouts[0]);
 
@@ -281,60 +306,164 @@ nvencQueueClear(NvencQueue *queue)
 	}
 }
 
+/* The quantiser step of a QP, as x264 counts it: doubling every six. */
+static double
+qp_to_step(double qp)
+{
+	return 0.85 * pow(2.0, (qp - 12.0) / 6.0);
+}
+
+static double
+step_to_qp(double step)
+{
+	return 12.0 + 6.0 * log2(step / 0.85);
+}
+
+/* I pictures get a finer quantiser than the P pictures around them and B
+ * pictures, which nothing is predicted from, a coarser one. */
+static const int kQpOffset[NVENC_PICTURE_KINDS] = { 0, -3, 2 };
+
 void
 nvencRateInit(NvencRateControl *rc, const nvenc_config *config, int minQp, int maxQp,
-	int startQp)
+	int startQp, int bPictures)
 {
 	memset(rc, 0, sizeof(*rc));
 	double fps = config->frame_rate_den != 0
 		? (double)config->frame_rate_num / config->frame_rate_den : 30.0;
 	if (fps <= 0)
 		fps = 30.0;
-	rc->targetPerPicture = config->bitrate / fps;
 	rc->minQp = minQp;
 	rc->maxQp = maxQp;
-	rc->constrained = config->rate_control == NVENC_RC_CBR;
+	rc->keyInterval = config->key_interval > 0 ? config->key_interval : 250;
+	rc->bPictures = bPictures;
 	if (config->rate_control == NVENC_RC_CONSTQP || config->bitrate == 0) {
 		rc->qp = config->qp;
-		rc->targetPerPicture = 0;
 		return;
 	}
-	/* About QP 26 for a tenth of a bit per pixel, six QP per doubling */
+	rc->targetPerPicture = config->bitrate / fps;
+	/* An average rate may wander half a second's worth from its budget
+	 * before the quantiser step doubles, a constant one a quarter of a
+	 * second's; the costs are averaged over two seconds and one. (On a GTX
+	 * 1070 a 12 second 1080p clip came out as good with these as with four
+	 * times the room, and 1 to 3 % over its rate instead of 5 to 10.) */
+	bool constant = config->rate_control == NVENC_RC_CBR;
+	rc->bufferBits = config->bitrate * (constant ? 0.25 : 0.5);
+	rc->window = fps * (constant ? 1.0 : 2.0);
+
+	/* Until a picture has been encoded: about QP 26 for a tenth of a bit per
+	 * pixel, six QP per doubling */
 	double bitsPerPixel = config->bitrate
 		/ ((double)config->width * config->height * fps);
 	double qp = startQp - 6.0 * log2(bitsPerPixel / 0.1);
 	rc->qp = qp < minQp + 6 ? minQp + 6 : qp > maxQp - 6 ? maxQp - 6 : qp;
 }
 
-int
-nvencRateQp(const NvencRateControl *rc, bool intra)
+static int
+clamp_qp(const NvencRateControl *rc, double qp)
 {
-	int qp = (int)lround(rc->qp) - (intra && rc->targetPerPicture > 0 ? 2 : 0);
-	return qp < rc->minQp ? rc->minQp : qp > rc->maxQp ? rc->maxQp : qp;
+	int rounded = (int)lround(qp);
+	return rounded < rc->minQp ? rc->minQp : rounded > rc->maxQp ? rc->maxQp : rounded;
+}
+
+/* The P picture QP at which the stream meets its budget, from what the
+ * pictures so far cost. */
+static double
+rate_estimate(const NvencRateControl *rc)
+{
+	const double *cost = rc->cost;
+	double p, i, b;
+	if (rc->seen[NVENC_PICTURE_P] > 0)
+		p = cost[NVENC_PICTURE_P];
+	else if (rc->seen[NVENC_PICTURE_B] > 0)
+		p = cost[NVENC_PICTURE_B] * 1.5;
+	else
+		p = cost[NVENC_PICTURE_I] / 6;
+	i = rc->seen[NVENC_PICTURE_I] > 0 ? cost[NVENC_PICTURE_I] : p * 6;
+	b = rc->seen[NVENC_PICTURE_B] > 0 ? cost[NVENC_PICTURE_B] : p / 1.5;
+
+	/* the share of each kind: one I picture per key interval, or as many
+	 * as there were when the caller asked for more */
+	int total = rc->seen[0] + rc->seen[1] + rc->seen[2];
+	double iShare = 1.0 / rc->keyInterval;
+	if (rc->seen[NVENC_PICTURE_I] > 1 && (double)rc->seen[NVENC_PICTURE_I] / total > iShare)
+		iShare = (double)rc->seen[NVENC_PICTURE_I] / total;
+	double bShare = (1 - iShare) * rc->bPictures / (rc->bPictures + 1);
+	double pShare = 1 - iShare - bShare;
+	double perPicture = iShare * i / pow(2.0, kQpOffset[NVENC_PICTURE_I] / 6.0)
+		+ pShare * p + bShare * b / pow(2.0, kQpOffset[NVENC_PICTURE_B] / 6.0);
+
+	/* and six QP for every buffer the stream is from its budget */
+	double overflow = (rc->totalBits - rc->wantedBits) / rc->bufferBits;
+	overflow = overflow < -2.0 ? -2.0 : overflow > 2.0 ? 2.0 : overflow;
+	return step_to_qp(perPicture / rc->targetPerPicture) + 6.0 * overflow;
+}
+
+int
+nvencRateQp(NvencRateControl *rc, int kind)
+{
+	if (rc->targetPerPicture <= 0) {
+		/* constant QP: the one asked for, B pictures two above it */
+		return rc->usedQp[kind] = clamp_qp(rc, rc->qp
+			+ (kind == NVENC_PICTURE_B ? kQpOffset[NVENC_PICTURE_B] : 0));
+	}
+	int total = rc->seen[0] + rc->seen[1] + rc->seen[2];
+	if (total > 0) {
+		double qp = rate_estimate(rc);
+		/* two QP a picture at most */
+		if (qp > rc->qp + 2)
+			qp = rc->qp + 2;
+		if (qp < rc->qp - 2)
+			qp = rc->qp - 2;
+		rc->qp = qp < rc->minQp ? rc->minQp : qp > rc->maxQp ? rc->maxQp : qp;
+	}
+	return rc->usedQp[kind] = clamp_qp(rc, rc->qp + kQpOffset[kind]);
+}
+
+int
+nvencRateRetry(NvencRateControl *rc, size_t bytes, int kind)
+{
+	if (rc->targetPerPicture <= 0 || rc->retried
+		|| rc->seen[0] + rc->seen[1] + rc->seen[2] > 0)
+		return -1;
+	rc->retried = true;
+	NvencRateControl trial = *rc;
+	trial.cost[kind] = bytes * 8.0 * qp_to_step(rc->usedQp[kind]);
+	trial.seen[kind] = 1;
+	int qp = clamp_qp(rc, rate_estimate(&trial) + kQpOffset[kind]);
+	if (abs(qp - rc->usedQp[kind]) < 3)
+		return -1;
+	rc->qp = qp - kQpOffset[kind];
+	return rc->usedQp[kind] = qp;
 }
 
 void
-nvencRateUpdate(NvencRateControl *rc, size_t bytes, bool intra)
+nvencRateUpdate(NvencRateControl *rc, size_t bytes, int kind)
 {
 	if (rc->targetPerPicture <= 0)
 		return;
-	/* A key picture costs about what four others do; it is spread over the
-	 * pictures that follow it rather than answered at once. */
 	double bits = bytes * 8.0;
-	rc->fullness = rc->fullness * (rc->constrained ? 0.9 : 0.97)
-		+ (bits - rc->targetPerPicture * (intra ? 4 : 1));
-	double window = rc->targetPerPicture * (rc->constrained ? 8 : 30);
-	double ratio = (window + rc->fullness) / window;
-	if (ratio < 0.25)
-		ratio = 0.25;
-	double step = 6.0 * log2(ratio) * (rc->constrained ? 0.5 : 0.25);
-	double limit = rc->constrained ? 2.0 : 1.0;
-	step = step < -limit ? -limit : step > limit ? limit : step;
-	rc->qp += step;
-	if (rc->qp < rc->minQp)
-		rc->qp = rc->minQp;
-	if (rc->qp > rc->maxQp)
-		rc->qp = rc->maxQp;
+	rc->totalBits += bits;
+	rc->wantedBits += rc->targetPerPicture;
+	if (getenv("NVENC_RC_DEBUG") != NULL) {
+		fprintf(stderr, "nvenc rc: %c qp %d, %zu bytes, %+.2f pictures from the budget\n",
+			"PIB"[kind], rc->usedQp[kind], bytes,
+			(rc->totalBits - rc->wantedBits) / rc->targetPerPicture);
+	}
+	double cost = bits * qp_to_step(rc->usedQp[kind]);
+	if (rc->seen[kind] == 0)
+		rc->cost[kind] = cost;
+	else {
+		/* a change of scene costs a P picture many times the usual and says
+		 * little about the pictures that follow */
+		if (kind != NVENC_PICTURE_I && cost > 4 * rc->cost[kind])
+			cost = 4 * rc->cost[kind];
+		double window = kind == NVENC_PICTURE_I ? 2 : rc->window;
+		double weight = 1.0 / (rc->seen[kind] + 1);
+		if (weight < 1.0 / window)
+			weight = 1.0 / window;
+		rc->cost[kind] += (cost - rc->cost[kind]) * weight;
+	}
+	rc->seen[kind]++;
 }
 
 int

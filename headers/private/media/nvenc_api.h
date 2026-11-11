@@ -72,7 +72,8 @@ typedef struct {
 	uint32_t	bitrate;			/* bit/s, for VBR and CBR */
 	uint32_t	max_bitrate;
 	uint32_t	key_interval;		/* pictures */
-	uint32_t	preset;				/* 1 fastest .. 7 best */
+	uint32_t	preset;				/* 1 fastest .. 7 best; H.264 has B */
+									/* pictures from 3 on */
 	uint8_t		colour_primaries;	/* ITU-T H.273 codes */
 	uint8_t		transfer;
 	uint8_t		matrix;
@@ -120,7 +121,8 @@ typedef struct {
 	/* The parameter sets (or AV1 sequence header) of the stream. */
 	int			(*headers)(nvenc_session* session, uint8_t* buffer,
 					size_t* size);
-	/* picture == NULL drains the encoder. Returns 0, NVENC_FAILED, or
+	/* picture == NULL drains the encoder, which may hold pictures back
+	 * to reorder them. Returns 0, NVENC_FAILED, or
 	 * NVENC_TIMED_OUT when the engine did not answer at all; describe()
 	 * then says why. */
 	int			(*encode)(nvenc_session* session,
@@ -133,9 +135,9 @@ typedef struct {
 	const char*	(*describe)(nvenc_session* session);
 
 	/* The class headers do not say how each generation wants its input
-	 * pictures laid out, so the add-on knows several ways (variants). The
-	 * caller encodes a test picture with each until one decodes, and uses
-	 * that one from then on. Returns how many there are, and the name of
+	 * pictures laid out or which parts of a format it encodes right, so
+	 * the add-on knows several ways (variants). The caller encodes test
+	 * pictures with each until one decodes, and uses that one from then on. Returns how many there are, and the name of
 	 * one when `name` is not NULL. */
 	uint32_t	(*variants)(uint32_t variant, const char** name);
 } nvenc_api;

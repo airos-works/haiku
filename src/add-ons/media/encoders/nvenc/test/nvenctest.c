@@ -164,7 +164,8 @@ main(int argc, char **argv)
 			fwrite(packet.data, 1, packet.size, out);
 			total += packet.size;
 			if (getenv("NVENCTEST_VERBOSE") != NULL) {
-				printf("packet pts %lld, %zu bytes%s\n", (long long)packet.pts,
+				printf("packet pts %lld dts %lld, %zu bytes%s\n", (long long)packet.pts,
+					(long long)packet.dts,
 					packet.size, packet.key ? ", key" : "");
 			}
 			api->release(session, &packet);

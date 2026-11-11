@@ -285,15 +285,20 @@ add-on yet: on those cards AV1 goes to the CPU, with the warning.
 No open driver drives NVENC, and the header does not say how each generation
 wants its input picture laid out or which of its fields must be set how. What
 the add-on does was found on a GTX 1070 (GP104, class C2B7) in the X399 on
-2026-10-19; the add-on's README lists it. There H.264 works: a 12 second 1080p
-clip converts at 106 pictures/s (3.6 times real time) and comes back at
-44.6 dB. H.265 Main and Main 10 encode I pictures, but the engine refuses P
-pictures, so H.265 goes to the CPU for now.
+2026-10-19; the add-on's README lists it. There H.264 works, High profile
+with I, P and B pictures: a 12 second 1080p clip converts at 103 pictures/s
+(3.4 times real time) and comes back at 44.7 dB. The two fastest speed
+settings leave the B pictures out, which is a quarter faster and costs 0.2
+to 0.4 dB at the same bit rate; nothing else changes NVENC's speed. H.265
+Main and Main 10 encode I pictures, but the engine refuses P pictures, so
+H.265 goes to the CPU for now.
 
 The add-on can know several ways of handing the engine a picture
-(`variants`; it has the one found on the card), and before a card encodes
-anything MediaConverter encodes a small test sequence (an IDR picture and
-five P pictures) each way until one decodes again with libavcodec above 32 dB
+(`variants`; it has the one arrangement found on the card, with B pictures
+and High profile, without B pictures, and with Main profile), and before a
+card encodes anything MediaConverter encodes a small test sequence (six
+pictures, two of them B pictures where the way has them) each way until one
+decodes again with libavcodec above 32 dB
 (`NvencEncoder::SelfTest`, run in the background when the window opens, or
 before the first conversion). A format that fails counts as one the card
 cannot encode: the badge, the hardware window and the CPU warning say so,
@@ -331,19 +336,22 @@ Big Buck Bunny clip, luma PSNR against the source with
 | SVT-AV1 preset 8, 720p, 8/10-bit | 46.1 / 46.0 dB |
 | VP9, VP8, MPEG-4, MPEG-2 | 43.8, 44.8, 46.3, 46.4 dB |
 
-On the X399 with a GeForce GTX 1070 (Pascal, NVENC; 2026-11-10, the image's
-add-on), each output decoded with libavcodec and compared with
-`mediaconvert --compare`:
+On the X399 with a GeForce GTX 1070 (Pascal, NVENC; 2026-11-11, High profile
+with B pictures and the new rate control; bit rates are the video track's),
+each output decoded with libavcodec and compared with `mediaconvert
+--compare`:
 
 | Test | Result |
 | --- | --- |
-| 12 s 1080p clip, H.264 QP 24 | 44.65 dB, 104 pictures/s including start-up |
+| 12 s 1080p clip, H.264 QP 24 | 44.69 dB at 2.43 Mbit/s, 103 pictures/s including start-up (I and P pictures of Main profile before: 44.65 dB at 2.73 Mbit/s) |
 | Big Buck Bunny 1080p, 10:34 (19,036 pictures) | 254 pictures/s (8.5 times real time), 43.8 dB, lowest 36.6 dB |
-| Quality 0 / 50 / 100 (QP 36 / 26 / 16) | 37.8 / 43.5 / 49.4 dB |
-| Average 1000 / 4000 / 12000 kbit/s | 1230 / 4280 / 11500 kbit/s delivered |
-| Sizes 58x32 to 1920x1080 (scaled), 4096x2160 and 4096x4096 (nvenctest) | all decode and match; 32 pixels wide is refused (see the add-on's README) |
+| Quality 0 / 50 / 100 (QP 36 / 26 / 16) | 37.7 / 43.5 / 49.4 dB |
+| Average 1000 / 4000 / 12000 kbit/s, 12 s | 1037 / 4098 / 12185 kbit/s delivered, 40.6 / 47.6 / 51.6 dB (before: 1059 / 4117 / 11322 kbit/s, 39.9 / 46.9 / 50.8 dB) |
+| Average 500 / 2000 / 8000 kbit/s, 90 s | 502 / 2013 / 8034 kbit/s delivered |
+| Speed fastest against balanced, 90 s at 2000 kbit/s | 40.2 dB in 11.0 s (I and P pictures) against 40.9 dB in 13.5 s |
+| Sizes 58x32 to 1920x1080 (scaled), 48x48 to 4096x4096 (nvenctest) | all decode and match; 32 pixels wide is refused (see the add-on's README) |
 | VP9 1080p59.94, MPEG-2 DVD and Blu-ray, 10-bit H.265 sources | 45.1, 46.4, 47.9 and 45.3 dB |
-| Three and six conversions at once | each output identical to the conversion run alone |
+| Six conversions at once | all complete, 38.5 to 40.7 dB |
 | The window, preset Fast 1080p | encoded on the GPU, 44.65 dB |
 
 On the Framework 13 (Radeon 760M, Phoenix, VCN 4), the same clip at 720p,
@@ -396,7 +404,8 @@ MEDIACONVERTER_FAKE_NVIDIA=1b81 ...         pretend there is a GTX 1070 (with th
 - NVENC: H.264 is verified on a GTX 1070 (Pascal) only (see Measured);
   other generations run the same code and rely on the self-test. H.265 P pictures are refused
   by the engine, so H.265 is encoded on the CPU on NVIDIA cards (see above).
-  B pictures are not used on NVIDIA.
+  H.264 has one B picture between reference pictures and one reference
+  picture each way; x264 at its medium setting still gets more out of a bit.
 - AV1 on Ada and Blackwell is encoded on the CPU: NVENC's AV1 needs the
   driver to supply default probability (CDF) tables in a layout nothing
   documents, and to write frame headers from values the engine computes.
