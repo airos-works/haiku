@@ -16,7 +16,7 @@ UsePrivateHeaders [ FDirName kernel util ] ;
 UsePrivateHeaders storage ;
 UseHeaders [ FDirName $(HAIKU_TOP) src system kernel disk_device_manager ] ;
 
-DEFINES += _KERNEL_MODE ;
+DEFINES += _KERNEL_MODE KDEBUG_NO_LEVEL_MARKER ;
 
 StaticLibrary test_disk_device_manager.a :
 #	ddm_userland_interface.cpp

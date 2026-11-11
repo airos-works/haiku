@@ -9,6 +9,7 @@
 
 #include <signal.h>
 #define _KERNEL_MODE
+#define KDEBUG_NO_LEVEL_MARKER
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

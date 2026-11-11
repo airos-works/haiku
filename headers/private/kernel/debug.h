@@ -46,6 +46,31 @@
 #	endif
 #endif
 
+/*	Debug level marker
+	Kernel code compiled at one KDEBUG_LEVEL cannot run in a kernel built at
+	another (kernel_debug_config.h). Every kernel-side object references
+	kernel_debug_level_<KDEBUG_LEVEL>, and the kernel defines only the one for
+	its own level (debug.cpp), so an add-on built at another level fails to
+	link against the kernel or to load into it. Code that is compiled in
+	kernel mode but not for the kernel (tests, emulation layers) defines
+	KDEBUG_NO_LEVEL_MARKER.
+ */
+#if defined(_KERNEL_MODE) && !defined(_BOOT_MODE) \
+	&& !defined(KDEBUG_NO_LEVEL_MARKER)
+#	define __KDEBUG_LEVEL_MARKER_NAME(level)	kernel_debug_level_##level
+#	define _KDEBUG_LEVEL_MARKER_NAME(level)	__KDEBUG_LEVEL_MARKER_NAME(level)
+#	define KDEBUG_LEVEL_MARKER	_KDEBUG_LEVEL_MARKER_NAME(KDEBUG_LEVEL)
+#	ifdef __cplusplus
+extern "C" {
+#	endif
+extern const char KDEBUG_LEVEL_MARKER __attribute__((visibility("default")));
+#	ifdef __cplusplus
+}
+#	endif
+static const char* const __kdebug_level_marker_reference
+	__attribute__((used)) = &KDEBUG_LEVEL_MARKER;
+#endif
+
 #define ASSERT_ALWAYS(x) \
 	do {																	\
 		if (!(x)) {															\

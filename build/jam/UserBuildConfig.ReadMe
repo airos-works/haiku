@@ -47,6 +47,13 @@ AppendToConfigVar DEFINES : HAIKU_TOP src kits : RUN_WITHOUT_REGISTRAR
 # directory of its own: objects built with other flags are not rebuilt.
 SetCPUProfile arm64 : rpi4 ;
 
+# Build a debug kernel: kernel, boot loader and all kernel add-ons at kernel
+# debug level 2 (assertions, out-of-line mutexes, heap fills, debug spinlocks;
+# see build/config_headers/kernel_debug_config.h) instead of the default 1.
+# Use an output directory of its own, since objects built at another level are
+# not rebuilt, and kernel add-ons built at another level do not load.
+TARGET_KERNEL_DEFINES += KDEBUG_LEVEL=2 ;
+
 # Set the debug level for file src/bin/gdb/gdb/haiku-nat.c (note, that
 # the object file must be specified) to 1. It is worth mentioning, that the
 # executable the object file is linked into (gdb), will still be placed in

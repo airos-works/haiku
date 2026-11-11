@@ -84,6 +84,7 @@ FLAGS=(-O2 -fpic -fno-exceptions -fno-rtti -fno-use-cxa-atexit -mno-red-zone
 	-I"$OGKM/src/nvidia-modeset/interface"
 	-I"$OGKM/src/nvidia-modeset/os-interface/include"
 	-I"$OGKM/src/nvidia-modeset/kapi/interface"
+	-I"$HAIKU/build/config_headers"
 	-I"$HAIKU/headers/private" -I"$HAIKU/headers/private/shared"
 	-I"$HAIKU/headers/private/kernel" -I"$HAIKU/headers/private/kernel/arch/x86"
 	-I"$HAIKU/headers/private/kernel/arch/x86/64"
