@@ -34,12 +34,14 @@ failed with "Resource not found", and every refresh with an I/O error
   entry names `https://airos.works/repo/arm64`. The image's cached list is
   still HaikuPorts' build-packages list; HaikuDepot's first start and pkgman's
   `install` refresh it from the new repository.
-- **haiku_devel.** CI's arm64 images (`tools/airos/ci/UserBuildConfig`) have
-  `haiku_devel` installed: x86_64 offers it among the Installer's optional
-  packages, but the Pi and the Cubie start their image as it is. It is a system
-  package of the release, so System Updater keeps it at the `haiku` package's
-  version (it requires exactly that version, which is why it is not in the
-  repository).
+- **haiku_devel and binutils.** CI's arm64 images
+  (`tools/airos/ci/UserBuildConfig`) have `haiku_devel` and `binutils`
+  installed: x86_64 offers them among the Installer's optional packages, but
+  the Pi and the Cubie start their image as it is, and the bootstrap gcc
+  requires neither, so HaikuDepot would install a gcc that cannot assemble,
+  link or find a header. They are system packages of the release, so System
+  Updater keeps `haiku_devel` at the `haiku` package's version (it requires
+  exactly that version, which is why it is not in the repository).
 - **Older installs.** The `airos_release` package of arm64 releases carries
   `boot/post-install/airos_haikuports_arm64.sh`
   (`tools/airos/ci/post-install/`) as a post-install script, which runs after
@@ -50,12 +52,12 @@ failed with "Resource not found", and every refresh with an I/O error
 ## Building programs on an arm64 machine
 
 ```
-pkgman install gcc binutils make
+pkgman install gcc make
 ```
 
-(or the same three in HaikuDepot). The bootstrap gcc requires only `haiku`, so
-HaikuDepot does not add binutils (the assembler and linker) by itself.
-`haiku_devel` is already installed. Not there yet: jam, mkdepend (so no
+(or gcc in HaikuDepot); `haiku_devel` and `binutils` are already installed,
+and a machine that updates from an older release gets them with the update.
+Not there yet: jam, mkdepend (so no
 `makefile_engine`), autotools, pkg-config and perl; the bootstrap packages are
 the only arm64 packages HaikuPorts has.
 

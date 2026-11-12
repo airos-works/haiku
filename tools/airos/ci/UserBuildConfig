@@ -459,15 +459,18 @@ rule UserBuildConfigRulePreImage
 		AddSymlinkToHaikuImage system non-packaged data ssl
 			: /boot/system/data/ssl/CARootCertificates.pem
 			: CARootCertificates.pem ;
-		# The headers and libraries programs are built with: x86_64 offers
-		# haiku_devel among the Installer's optional packages, but the Pi
-		# and the Cubie start their image as it is, so arm64 images have it
-		# installed, and System Updater keeps it at the haiku package's
-		# version. gcc, binutils and make come from the HaikuPorts
-		# repository air/OS serves (src/data/repository_infos/
-		# haikuports_arm64, #118).
+		# The headers and libraries programs are built with, and the
+		# assembler and linker: x86_64 offers haiku_devel and binutils among
+		# the Installer's optional packages, but the Pi and the Cubie start
+		# their image as it is, so arm64 images have them installed, and
+		# System Updater keeps haiku_devel at the haiku package's version.
+		# Then gcc (whose bootstrap package requires neither) works as
+		# HaikuDepot installs it from the HaikuPorts repository air/OS
+		# serves (src/data/repository_infos/haikuports_arm64, #118), as do
+		# make and the rest.
 		AddPackageFilesToHaikuImage system packages : haiku_devel.hpkg
 			: nameFromMetaInfo ;
+		AddHaikuImageSystemPackages binutils ;
 		# The arm64 ICU bootstrap package's data directory.
 		local environment = <airos-ci>UserSetupEnvironment ;
 		SEARCH on $(environment) = [ FDirName $(HAIKU_TOP) tools rock5-itx ] ;
