@@ -10,7 +10,9 @@
 # docs/airos/SYSTEM-UPDATER.md), which is mirrored to GitHub Releases
 # (updates-<target>, update-<target>-<id>): machines update from there. They
 # are rebuilt nightly too, to pick up new builds of the applications and
-# Summit.
+# Summit. The arm64 build also publishes the arm64 package repository
+# (HaikuPorts' build packages; release repo-arm64, served by the website at
+# https://airos.works/repo/arm64).
 name: air/OS images
 
 on:
@@ -78,6 +80,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: 'python3 "$RUNNER_TEMP/airos-ci/images/publish-feed-github.py" "${{ matrix.target }}"'
+
+      - name: Publish the arm64 package repository
+        # HaikuPorts has no arm64 repository: air/OS serves its arm64 build
+        # packages at https://airos.works/repo/arm64 (#118), from the
+        # repo-arm64 release, which the website lays out.
+        if: steps.selected.outputs.build && matrix.target == 'arm64'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: 'python3 "$RUNNER_TEMP/airos-ci/images/package-repo.py" ci arm64 "${{ steps.build.outputs.IMAGE_DIR }}"'
 
       - name: Summary
         if: always() && steps.build.outputs.IMAGE_DIR
