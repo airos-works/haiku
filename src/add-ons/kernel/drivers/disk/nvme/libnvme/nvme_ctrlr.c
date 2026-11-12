@@ -1291,6 +1291,25 @@ int nvme_ctrlr_get_feature(struct nvme_ctrlr *ctrlr,
 	return ret;
 }
 
+#ifdef __HAIKU__
+/*
+ * Spread the I/O completion queues over the interrupt vectors.
+ */
+void nvme_ctrlr_set_io_vectors(struct nvme_ctrlr *ctrlr, unsigned int vectors)
+{
+	ctrlr->io_vectors = vectors;
+}
+
+unsigned int nvme_qpair_vector(struct nvme_qpair *qpair)
+{
+	unsigned int vectors = qpair->ctrlr->io_vectors;
+
+	if (qpair->id == 0 || vectors <= 1)
+		return 0;
+	return ((qpair->id - 1) % (vectors - 1)) + 1;
+}
+#endif
+
 /*
  * Set a controller feature.
  */

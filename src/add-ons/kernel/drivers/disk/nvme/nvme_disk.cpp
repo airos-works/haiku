@@ -18,8 +18,10 @@
 #include <smp.h>
 #include <thread.h>
 #include <util/AutoLock.h>
+#include <util/ThreadAutoLock.h>
 
 #include <fs/devfs.h>
+#include <interrupts.h>
 #include <kdevice_manager.h>
 #include <ACPI.h>
 #include <bus/PCI.h>
@@ -106,7 +108,95 @@ struct RequestOwnerHashDefinition {
 typedef BOpenHashTable<RequestOwnerHashDefinition, false> RequestOwnerHashTable;
 
 
-typedef struct {
+struct nvme_disk_driver_info;
+struct nvme_async_io;
+struct qpair_info;
+
+
+/*!	One NVMe command. Its completion is learned either by the thread that
+	waits for it (synchronous: waiter, completed) or by the transfer it is
+	part of (async), which completes its io_request when its last command
+	has.
+*/
+struct nvme_io_request {
+	status_t status;
+
+	bool write;
+
+	off_t lba_start;
+	size_t lba_count;
+
+	physical_entry* iovecs;
+	int32 iovec_count;
+
+	int32 iovec_i;
+	uint32 iovec_offset;
+
+	qpair_info* qpair;
+	int32 completed;
+	nvme_async_io* async;
+		// NULL: a synchronous command, its waiter polls the queue
+};
+
+
+/*!	A transfer of an io_request without bouncing, as one or more commands
+	that are on their way at once. Allocated with its commands and a copy of
+	the physical vectors behind it.
+*/
+struct nvme_async_io {
+	nvme_disk_driver_info*	info;
+	io_request*				request;
+	off_t					start;
+	generic_size_t			length;
+	int32					pending;
+		// commands not completed, plus one while they are being submitted
+	spinlock				lock;
+	status_t				status;
+	off_t					failed;
+		// where the first failed command starts (INT64_MAX: none failed)
+	bool					write_locked;
+		// holds rounded_write_lock for reading
+	nvme_async_io*			next;
+	int32					command_count;
+	nvme_io_request			commands[];
+};
+
+
+struct interrupt_vector {
+	nvme_disk_driver_info*	info;
+	uint32					entry;
+		// MSI-X table entry; with one vector it serves every queue pair
+	uint32					irq;
+};
+
+
+struct qpair_info {
+	struct nvme_qpair*		qpair;
+	nvme_disk_driver_info*	info;
+	uint32					index;
+	uint32					vector;
+	// The queue's completion thread waits for its interrupt here.
+	ConditionVariable		interrupt;
+	int32					interrupted;
+	int32					interrupt_count;
+	int32					idle;
+	int32					outstanding;
+	int32					async_outstanding;
+		// commands of asynchronous transfers: the completion thread's
+	// Threads waiting for a synchronous command wait here; the interrupt
+	// wakes them, and they complete the queue themselves.
+	ConditionVariable		sync_condition;
+	int32					sync_waiters;
+	bool					polling;
+	thread_id				thread;
+	// transfers whose last command completed, to be reported once the
+	// queue is unlocked
+	spinlock				done_lock;
+	nvme_async_io*			done;
+};
+
+
+struct nvme_disk_driver_info {
 	device_node*			node;
 	pci_info				info;
 
@@ -139,21 +229,32 @@ typedef struct {
 	bool					in_idle_d3;
 	volatile uint32*		msix_table;
 	area_id					msix_area;
-	uint32					msix_saved[4];
-		// the first MSI-X vector (the only one in use): some controllers
-		// clear their table on a reset (CC.EN), which Linux does not notice
-		// as it sets up its vectors again after every reset
+	uint32					msix_saved[(NVME_MAX_QPAIRS + 1) * 4];
+		// the MSI-X vectors in use: some controllers clear their table on
+		// a reset (CC.EN), which Linux does not notice as it sets up its
+		// vectors again after every reset
 
-	ConditionVariable		interrupt;
-	uint32					interrupt_id;
-	int32					polling;
+	interrupt_vector		vectors[NVME_MAX_QPAIRS + 1];
+	uint32					vector_count;
+	uint32					msix_count;
+		// vector 0 is the admin queue's; with more than one, each queue pair
+		// interrupts on one of the others (nvme_qpair_vector())
+	uint32					handled_flags;
+	bool					polling;
+		// no interrupts at all: the completion threads poll
 
-	struct qpair_info {
-		struct nvme_qpair*	qpair;
-	}						qpairs[NVME_MAX_QPAIRS];
+	qpair_info				qpairs[NVME_MAX_QPAIRS];
 	uint32					qpair_count;
-} nvme_disk_driver_info;
-typedef nvme_disk_driver_info::qpair_info qpair_info;
+
+	int32					quit;
+
+	// Nobody completes the queues while they are down (suspended, or being
+	// set up again on resume); "pollers" counts those who do it now.
+	int32					queues_down;
+	int32					pollers;
+
+	int64					bounced;
+};
 
 
 typedef struct {
@@ -199,7 +300,11 @@ nvme_disk_set_capacity(nvme_disk_driver_info* info, uint64 capacity,
 //	#pragma mark - device module API
 
 
-static int32 nvme_interrupt_handler(void* _info);
+static int32 nvme_interrupt_handler(void* _vector);
+static status_t setup_interrupts(nvme_disk_driver_info* info,
+	pci_device_module_info* pci, pci_device* pcidev, uint32 qpairs);
+static status_t start_threads(nvme_disk_driver_info* info);
+static void stop_threads(nvme_disk_driver_info* info);
 
 
 static void
@@ -389,64 +494,7 @@ nvme_disk_init_device(void* _info, void** _cookie)
 		nsstat.sector_size, info->ns->stripe_size);
 	nvme_disk_set_capacity(info, nsstat.sectors, nsstat.sector_size);
 
-#if defined(__aarch64__)
-	// The handler defers completion queue processing to the waiting thread.
-	// An unacknowledged level-triggered INTx can prevent that thread from
-	// running on ARM64. Keep INTx disabled and poll without a working MSI route.
-	uint32 irq = 0;
-#else
-	command = pci->read_pci_config(pcidev, PCI_command, 2);
-	command &= ~PCI_command_int_disable;
-	pci->write_pci_config(pcidev, PCI_command, 2, command);
-	uint32 irq = info->info.u.h0.interrupt_line;
-	if (irq == 0xFF)
-		irq = 0;
-#endif
-
-	if (pci->get_msix_count(pcidev)) {
-		uint32 msixVector = 0;
-		status_t status = pci->configure_msix(pcidev, 1, &msixVector);
-		if (status == B_OK)
-			status = pci->enable_msix(pcidev);
-		if (status == B_OK) {
-			TRACE_ALWAYS("using MSI-X\n");
-			irq = msixVector;
-		} else
-			TRACE_ALWAYS("MSI-X unavailable: %s\n", strerror(status));
-	} else if (pci->get_msi_count(pcidev) >= 1) {
-		uint32 msiVector = 0;
-		status_t status = pci->configure_msi(pcidev, 1, &msiVector);
-		if (status == B_OK)
-			status = pci->enable_msi(pcidev);
-		if (status == B_OK) {
-			TRACE_ALWAYS("using message signaled interrupts\n");
-			irq = msiVector;
-		} else
-			TRACE_ALWAYS("MSI unavailable: %s\n", strerror(status));
-	}
-
-	if (irq == 0) {
-		TRACE_ALWAYS("device PCI:%d:%d:%d has no usable interrupt; using polling\n",
-			info->info.bus, info->info.device, info->info.function);
-		info->polling = 1;
-	} else {
-		info->polling = 0;
-	}
-	info->interrupt.Init(info, "nvme_disk interrupt");
-	info->interrupt_id = 0;
-	if (irq != 0) {
-		status_t status = install_io_interrupt_handler(irq, nvme_interrupt_handler,
-			(void*)info, B_NO_HANDLED_INFO);
-		if (status != B_OK) {
-			nvme_ctrlr_close(info->ctrlr);
-			return status;
-		}
-		info->interrupt_id = irq;
-	}
-
-	nvme_disk_configure_features(info);
-
-	// allocate qpairs
+	// One queue pair per CPU, or as many as evenly divide the CPUs.
 	uint32 try_qpairs = cstat->io_qpairs;
 	try_qpairs = min_c(try_qpairs, NVME_MAX_QPAIRS);
 	if (try_qpairs >= (uint32)smp_get_num_cpus()) {
@@ -456,14 +504,51 @@ nvme_disk_init_device(void* _info, void** _cookie)
 		while ((smp_get_num_cpus() % try_qpairs) != 0)
 			try_qpairs--;
 	}
+
+	// Interrupts: with MSI-X a vector for each queue pair besides the admin
+	// queue's, so that a completion wakes only the thread of its own queue
+	// and arrives on the processor that queue is for.
+	status_t status = setup_interrupts(info, pci, pcidev, try_qpairs);
+	if (status != B_OK) {
+		nvme_ctrlr_close(info->ctrlr);
+		return status;
+	}
+
+	nvme_disk_configure_features(info);
+
+	// allocate qpairs
 	info->qpair_count = 0;
 	for (uint32 i = 0; i < try_qpairs; i++) {
-		info->qpairs[i].qpair = nvme_ioqp_get(info->ctrlr,
+		struct nvme_qpair* qpair = nvme_ioqp_get(info->ctrlr,
 			(enum nvme_qprio)0, 0);
-		if (info->qpairs[i].qpair == NULL)
+		if (qpair == NULL)
 			break;
 
+		qpair_info& qpinfo = info->qpairs[i];
+		qpinfo.qpair = qpair;
+		qpinfo.info = info;
+		qpinfo.index = i;
+		qpinfo.vector = info->vector_count > 1 ? nvme_qpair_vector(qpair) : 0;
+		qpinfo.interrupt.Init(&qpinfo, "nvme_disk queue interrupt");
+		qpinfo.interrupted = 0;
+		qpinfo.interrupt_count = 0;
+		qpinfo.idle = 0;
+		qpinfo.outstanding = 0;
+		qpinfo.async_outstanding = 0;
+		qpinfo.sync_condition.Init(&qpinfo, "nvme_disk command");
+		qpinfo.sync_waiters = 0;
+		qpinfo.polling = info->polling;
+		qpinfo.thread = -1;
+		B_INITIALIZE_SPINLOCK(&qpinfo.done_lock);
+		qpinfo.done = NULL;
 		info->qpair_count++;
+
+		// The queue is used by the processors i, i + count, ...; its
+		// interrupt goes to the first of them.
+		if (qpinfo.vector != 0 && i < (uint32)smp_get_num_cpus()) {
+			InterruptsLocker _;
+			assign_io_interrupt_to_cpu(info->vectors[qpinfo.vector].irq, i);
+		}
 	}
 	if (info->qpair_count == 0) {
 		TRACE_ERROR("failed to allocate qpairs!\n");
@@ -473,6 +558,9 @@ nvme_disk_init_device(void* _info, void** _cookie)
 	if (info->qpair_count != try_qpairs) {
 		TRACE_ALWAYS("warning: did not get expected number of qpairs\n");
 	}
+	TRACE_ALWAYS("%" B_PRIu32 " queue pairs, %" B_PRIu32 " interrupt vectors%s\n",
+		info->qpair_count, info->vector_count,
+		info->polling ? " (polling)" : "");
 
 	// allocate DMA buffers
 	int buffers = info->qpair_count * 2;
@@ -509,6 +597,12 @@ nvme_disk_init_device(void* _info, void** _cookie)
 	rw_lock_init(&info->rounded_write_lock, "nvme rounded writes");
 	rw_lock_init(&info->suspend_lock, "nvme suspend");
 
+	status = start_threads(info);
+	if (status != B_OK) {
+		nvme_ctrlr_close(info->ctrlr);
+		return status;
+	}
+
 	*_cookie = info;
 	return B_OK;
 }
@@ -520,9 +614,12 @@ nvme_disk_uninit_device(void* _cookie)
 	CALLED();
 	nvme_disk_driver_info* info = (nvme_disk_driver_info*)_cookie;
 
-	if (info->interrupt_id != 0) {
-		remove_io_interrupt_handler(info->interrupt_id,
-			nvme_interrupt_handler, (void*)info);
+	stop_threads(info);
+	for (uint32 i = 0; i < info->vector_count; i++) {
+		if (info->vectors[i].irq != 0) {
+			remove_io_interrupt_handler(info->vectors[i].irq,
+				nvme_interrupt_handler, &info->vectors[i]);
+		}
 	}
 
 	rw_lock_destroy(&info->rounded_write_lock);
@@ -580,13 +677,52 @@ nvme_disk_free(void* cookie)
 // #pragma mark - I/O
 
 
+static void ior_reset_sgl(nvme_io_request* request, uint32_t offset);
+static int ior_next_sge(nvme_io_request* request, uint64_t* address,
+	uint32_t* length);
+
+
+// How long a completion thread waits for an interrupt before it looks at
+// its queue anyway, while commands are outstanding: a safety net for lost
+// interrupts. Three completions in a row found that way, without an
+// interrupt, and the queue is polled instead.
+static const bigtime_t kInterruptGrace = 20000;
+// The same, when nothing was outstanding as it went to sleep.
+static const bigtime_t kIdleCheck = 1000000;
+// Polling (no interrupts): the first and the longest wait between looks.
+static const bigtime_t kMinPollDelay = 20;
+static const bigtime_t kMaxPollDelay = 2000;
+// A synchronous waiter looks at its queue after this long without an
+// interrupt, and gives the controller up after kSyncGiveUp without its
+// completion.
+static const bigtime_t kSyncWaitTimeout = 20000;
+static const bigtime_t kSyncGiveUp = 20000000;
+
+
 static int32
-nvme_interrupt_handler(void* _info)
+nvme_interrupt_handler(void* _vector)
 {
-	nvme_disk_driver_info* info = (nvme_disk_driver_info*)_info;
-	info->interrupt.NotifyAll();
-	info->polling = -1;
-	return 0;
+	interrupt_vector* vector = (interrupt_vector*)_vector;
+	nvme_disk_driver_info* info = vector->info;
+	bool woken = false;
+	for (uint32 i = 0; i < info->qpair_count; i++) {
+		qpair_info* qpinfo = &info->qpairs[i];
+		if (info->vector_count > 1 && qpinfo->vector != vector->entry)
+			continue;
+		atomic_set(&qpinfo->interrupted, 1);
+		atomic_add(&qpinfo->interrupt_count, 1);
+		woken = true;
+		// Waiters for synchronous commands complete the queue themselves
+		// (the waiter of a command is woken by its interrupt, not by another
+		// thread); the completion thread is needed for asynchronous ones.
+		if (atomic_get(&qpinfo->sync_waiters) > 0) {
+			qpinfo->sync_condition.NotifyAll();
+			if (atomic_get(&qpinfo->async_outstanding) == 0)
+				continue;
+		}
+		qpinfo->interrupt.NotifyOne();
+	}
+	return woken ? B_INVOKE_SCHEDULER : B_HANDLED_INTERRUPT;
 }
 
 
@@ -597,70 +733,420 @@ get_qpair(nvme_disk_driver_info* info)
 }
 
 
+//! A polling completion thread that sleeps because nothing is outstanding
+//! is woken when something is again.
 static void
-io_finished_callback(status_t* status, const struct nvme_cpl* cpl)
+command_submitted(qpair_info* qpinfo)
 {
-	*status = nvme_cpl_is_error(cpl) ? B_IO_ERROR : B_OK;
-}
-
-
-static void
-await_status(nvme_disk_driver_info* info, struct nvme_qpair* qpair, status_t& status)
-{
-	CALLED();
-
-	ConditionVariableEntry entry;
-	int timeouts = 0;
-	bigtime_t pollingDelay = 1000;
-	while (status == EINPROGRESS) {
-		info->interrupt.Add(&entry);
-
-		nvme_qpair_poll(qpair, 0);
-
-		if (status != EINPROGRESS)
-			return;
-
-		if (info->polling > 0) {
-			entry.Wait(B_RELATIVE_TIMEOUT, pollingDelay);
-			pollingDelay = min_c((bigtime_t)5 * 1000 * 1000, pollingDelay * 2);
-		} else if (entry.Wait(B_RELATIVE_TIMEOUT, 5 * 1000 * 1000) != B_OK) {
-			// This should never happen, as we are woken up on every interrupt
-			// no matter the qpair or transfer within; so if it does occur,
-			// that probably means the controller stalled, or maybe cannot
-			// generate interrupts at all.
-
-			TRACE_ERROR("timed out waiting for interrupt!\n");
-			if (timeouts++ >= 3) {
-				nvme_qpair_fail(qpair);
-				status = B_TIMED_OUT;
-				return;
-			}
-
-			info->polling++;
-			if (info->polling > 0) {
-				TRACE_ALWAYS("switching to polling mode, performance will be affected!\n");
-			}
-		}
-
-		nvme_qpair_poll(qpair, 0);
+	// (with interrupts, the completion's wakes the queue's thread)
+	if (atomic_add(&qpinfo->outstanding, 1) == 0 && qpinfo->polling
+		&& atomic_get(&qpinfo->idle) != 0) {
+		qpinfo->interrupt.NotifyOne();
 	}
 }
 
 
-struct nvme_io_request {
-	status_t status;
+/*!	The last command of a transfer completed (or the transfer could not be
+	submitted further): its locks are released, and it is reported, on
+	whatever thread saw it, without any queue locked. The report may start
+	more I/O.
+*/
+static void
+async_io_done(nvme_async_io* io)
+{
+	nvme_disk_driver_info* info = io->info;
+	if (io->write_locked)
+		rw_lock_read_unlock(&info->rounded_write_lock);
+	rw_lock_read_unlock(&info->suspend_lock);
 
-	bool write;
+	const generic_size_t transferred = io->failed == INT64_MAX
+		? io->length : io->failed - io->start;
+	io->request->SetTransferredBytes(io->status != B_OK, transferred);
+	// notification may delete the request
+	io->request->SetStatusAndNotify(io->status);
+	free(io);
+}
 
-	off_t lba_start;
-	size_t lba_count;
 
-	physical_entry* iovecs;
-	int32 iovec_count;
+//! Called by libnvme with the queue pair's lock held: nothing here may
+//! wait or start I/O.
+static void
+io_finished_callback(nvme_io_request* request, const struct nvme_cpl* cpl)
+{
+	status_t status = nvme_cpl_is_error(cpl) ? B_IO_ERROR : B_OK;
+	qpair_info* qpinfo = request->qpair;
+	atomic_add(&qpinfo->outstanding, -1);
 
-	int32 iovec_i;
-	uint32 iovec_offset;
-};
+	nvme_async_io* io = request->async;
+	if (io != NULL) {
+		atomic_add(&qpinfo->async_outstanding, -1);
+		if (status != B_OK) {
+			const off_t offset = request->lba_start * io->info->block_size;
+			InterruptsSpinLocker locker(io->lock);
+			if (io->status == B_OK)
+				io->status = status;
+			if (offset < io->failed)
+				io->failed = offset;
+		}
+		if (atomic_add(&io->pending, -1) == 1) {
+			InterruptsSpinLocker locker(qpinfo->done_lock);
+			io->next = qpinfo->done;
+			qpinfo->done = io;
+		}
+		return;
+	}
+
+	request->status = status;
+	atomic_set(&request->completed, 1);
+		// the last access: the waiter returns as soon as it sees this
+	if (atomic_get(&qpinfo->sync_waiters) > 0)
+		qpinfo->sync_condition.NotifyAll();
+}
+
+
+/*!	Completes what the controller finished on this queue. Any thread may do
+	this; the queue's completion thread does it on every interrupt.
+*/
+static uint32
+poll_qpair(qpair_info* qpinfo)
+{
+	nvme_disk_driver_info* info = qpinfo->info;
+	atomic_add(&info->pollers, 1);
+	if (atomic_get(&info->queues_down) != 0) {
+		atomic_add(&info->pollers, -1);
+		return 0;
+	}
+	uint32 completions = nvme_qpair_poll(qpinfo->qpair, 0);
+	atomic_add(&info->pollers, -1);
+
+	nvme_async_io* done;
+	{
+		InterruptsSpinLocker locker(qpinfo->done_lock);
+		done = qpinfo->done;
+		qpinfo->done = NULL;
+	}
+	while (done != NULL) {
+		nvme_async_io* next = done->next;
+		async_io_done(done);
+		done = next;
+	}
+	return completions;
+}
+
+
+/*!	Completes what the controller finishes on a queue, and reports finished
+	transfers. It runs on the processor that the queue's interrupt goes to
+	(and whose threads use the queue): an interrupt wakes it, and it wakes
+	the waiter, without involving another processor. (The mask does not
+	keep it from running when that processor is disabled.)
+*/
+static status_t
+completion_thread(void* data)
+{
+	qpair_info* qpinfo = (qpair_info*)data;
+	nvme_disk_driver_info* info = qpinfo->info;
+	bigtime_t pollDelay = kMinPollDelay;
+	int32 withoutInterrupt = 0;
+	int32 lastInterruptCount = 0;
+
+	if (qpinfo->index < (uint32)smp_get_num_cpus()) {
+		CPUSet mask;
+		mask.SetBit(qpinfo->index);
+		Thread* thread = thread_get_current_thread();
+		{
+			ThreadLocker locker(thread);
+			thread->cpumask = mask;
+		}
+		thread_yield();
+	}
+
+	while (atomic_get(&info->quit) == 0) {
+		bool interrupted = atomic_get_and_set(&qpinfo->interrupted, 0) != 0;
+		bool timedOut = false;
+		if (!interrupted) {
+			ConditionVariableEntry entry;
+			qpinfo->interrupt.Add(&entry);
+			interrupted = atomic_get_and_set(&qpinfo->interrupted, 0) != 0;
+			if (!interrupted) {
+				const bool outstanding = atomic_get(&qpinfo->outstanding) > 0;
+				const bool asyncOutstanding
+					= atomic_get(&qpinfo->async_outstanding) > 0;
+				bigtime_t timeout;
+				if (qpinfo->polling) {
+					timeout = pollDelay;
+					if (!outstanding) {
+						atomic_set(&qpinfo->idle, 1);
+						if (atomic_get(&qpinfo->outstanding) == 0)
+							timeout = B_INFINITE_TIMEOUT;
+					}
+				} else {
+					// (Synchronous commands are their waiters' to complete,
+					// commands submitted while it sleeps without any are
+					// looked for after kIdleCheck, should their interrupt
+					// get lost.)
+					timeout = asyncOutstanding ? kInterruptGrace : kIdleCheck;
+				}
+				timedOut = entry.Wait(
+					timeout == B_INFINITE_TIMEOUT ? 0 : B_RELATIVE_TIMEOUT,
+					timeout == B_INFINITE_TIMEOUT ? 0 : timeout) == B_TIMED_OUT;
+				atomic_set(&qpinfo->idle, 0);
+				interrupted = atomic_get_and_set(&qpinfo->interrupted, 0) != 0;
+			}
+		}
+		if (atomic_get(&info->quit) != 0)
+			break;
+
+		const uint32 completions = poll_qpair(qpinfo);
+		if (qpinfo->polling) {
+			pollDelay = completions > 0 ? kMinPollDelay
+				: min_c(pollDelay * 2, kMaxPollDelay);
+		} else if (!timedOut) {
+			// an interrupt
+			withoutInterrupt = 0;
+		} else if (completions > 0) {
+			// Found without being woken: slow commands (whose interrupt is
+			// still to come) look like that too, but then interrupts do
+			// arrive in between.
+			const int32 interruptCount
+				= atomic_get(&qpinfo->interrupt_count);
+			if (interruptCount != lastInterruptCount) {
+				lastInterruptCount = interruptCount;
+				withoutInterrupt = 0;
+			}
+			if (++withoutInterrupt >= 3) {
+				TRACE_ALWAYS("queue %" B_PRIu32 ": completions without "
+					"interrupts, polling it from now on\n", qpinfo->index);
+				qpinfo->polling = true;
+			}
+		}
+	}
+	return B_OK;
+}
+
+
+static status_t
+start_threads(nvme_disk_driver_info* info)
+{
+	info->quit = 0;
+	info->queues_down = 0;
+	info->pollers = 0;
+	info->bounced = 0;
+
+	for (uint32 i = 0; i < info->qpair_count; i++) {
+		char name[B_OS_NAME_LENGTH];
+		snprintf(name, sizeof(name), "nvme_disk queue %" B_PRIu32, i);
+		qpair_info* qpinfo = &info->qpairs[i];
+		qpinfo->thread = spawn_kernel_thread(completion_thread, name,
+			B_URGENT_DISPLAY_PRIORITY + 1, qpinfo);
+		if (qpinfo->thread < 0)
+			return qpinfo->thread;
+		resume_thread(qpinfo->thread);
+	}
+	return B_OK;
+}
+
+
+static void
+stop_threads(nvme_disk_driver_info* info)
+{
+	atomic_set(&info->quit, 1);
+	for (uint32 i = 0; i < info->qpair_count; i++) {
+		qpair_info* qpinfo = &info->qpairs[i];
+		if (qpinfo->thread < 0)
+			continue;
+		qpinfo->interrupt.NotifyAll();
+		wait_for_thread(qpinfo->thread, NULL);
+		qpinfo->thread = -1;
+	}
+}
+
+
+/*!	Interrupt vectors for \a qpairs queue pairs: with MSI-X one for the admin
+	queue and one for each queue pair (or as many as there are), else MSI or
+	the PCI interrupt line shared by all of them, else none (polling).
+*/
+static status_t
+setup_interrupts(nvme_disk_driver_info* info, pci_device_module_info* pci,
+	pci_device* pcidev, uint32 qpairs)
+{
+	info->vector_count = 0;
+	info->msix_count = 0;
+	info->polling = false;
+	info->handled_flags = 0;
+	for (uint32 i = 0; i <= NVME_MAX_QPAIRS; i++) {
+		info->vectors[i].info = info;
+		info->vectors[i].entry = i;
+		info->vectors[i].irq = 0;
+	}
+
+#if defined(__aarch64__)
+	// Completion queue processing is deferred to threads. An unacknowledged
+	// level-triggered INTx can prevent them from running on ARM64. Keep INTx
+	// disabled and poll without a working MSI route.
+	uint32 irq = 0;
+	(void)pci;
+	(void)pcidev;
+#else
+	uint16 command = pci->read_pci_config(pcidev, PCI_command, 2);
+	command &= ~PCI_command_int_disable;
+	pci->write_pci_config(pcidev, PCI_command, 2, command);
+	uint32 irq = info->info.u.h0.interrupt_line;
+	if (irq == 0xFF)
+		irq = 0;
+	// the PCI interrupt line may be shared with other devices
+	uint32 flags = B_NO_HANDLED_INFO;
+
+	uint32 msixCount = pci->get_msix_count(pcidev);
+	if (msixCount > 0) {
+		uint32 count = min_c(msixCount, qpairs + 1);
+		if (count < 2)
+			count = 1;
+		uint32 msixVector = 0;
+		status_t status = pci->configure_msix(pcidev, count, &msixVector);
+		if (status != B_OK && count > 1) {
+			count = 1;
+			status = pci->configure_msix(pcidev, count, &msixVector);
+		}
+		if (status == B_OK)
+			status = pci->enable_msix(pcidev);
+		if (status == B_OK) {
+			TRACE_ALWAYS("using MSI-X, %" B_PRIu32 " vectors\n", count);
+			for (uint32 i = 0; i < count; i++)
+				info->vectors[i].irq = msixVector + i;
+			info->vector_count = count;
+			info->msix_count = count;
+			flags = 0;
+		} else
+			TRACE_ALWAYS("MSI-X unavailable: %s\n", strerror(status));
+	} else if (pci->get_msi_count(pcidev) >= 1) {
+		uint32 msiVector = 0;
+		status_t status = pci->configure_msi(pcidev, 1, &msiVector);
+		if (status == B_OK)
+			status = pci->enable_msi(pcidev);
+		if (status == B_OK) {
+			TRACE_ALWAYS("using message signaled interrupts\n");
+			info->vectors[0].irq = msiVector;
+			info->vector_count = 1;
+			flags = 0;
+		} else
+			TRACE_ALWAYS("MSI unavailable: %s\n", strerror(status));
+	}
+	info->handled_flags = flags;
+#endif
+
+	if (info->vector_count == 0 && irq != 0) {
+		info->vectors[0].irq = irq;
+		info->vector_count = 1;
+	}
+	if (info->vector_count == 0) {
+		TRACE_ALWAYS("device PCI:%d:%d:%d has no usable interrupt; using polling\n",
+			info->info.bus, info->info.device, info->info.function);
+		info->polling = true;
+		nvme_ctrlr_set_io_vectors(info->ctrlr, 1);
+		return B_OK;
+	}
+
+	nvme_ctrlr_set_io_vectors(info->ctrlr, info->vector_count);
+	for (uint32 i = 0; i < info->vector_count; i++) {
+		status_t status = install_io_interrupt_handler(info->vectors[i].irq,
+			nvme_interrupt_handler, &info->vectors[i], info->handled_flags);
+		if (status != B_OK) {
+			while (i-- > 0) {
+				remove_io_interrupt_handler(info->vectors[i].irq,
+					nvme_interrupt_handler, &info->vectors[i]);
+			}
+			return status;
+		}
+	}
+	return B_OK;
+}
+
+
+//! Readies a command for submit_command() and await_command().
+static inline void
+prepare_sync_command(nvme_io_request* request)
+{
+	request->completed = 0;
+	request->async = NULL;
+}
+
+
+/*!	Submits a command, waiting for a free request when the queue has none
+	(never on a completion thread: they do not submit).
+*/
+static int
+submit_command(nvme_disk_driver_info* info, qpair_info* qpinfo,
+	nvme_io_request* request)
+{
+	request->qpair = qpinfo;
+	for (int32 attempt = 0;; attempt++) {
+		if (request->async != NULL)
+			atomic_add(&qpinfo->async_outstanding, 1);
+		command_submitted(qpinfo);
+		int ret;
+		if (request->write) {
+			ret = nvme_ns_writev(info->ns, qpinfo->qpair, request->lba_start,
+				request->lba_count, (nvme_cmd_cb)io_finished_callback, request,
+				0, (nvme_req_reset_sgl_cb)ior_reset_sgl,
+				(nvme_req_next_sge_cb)ior_next_sge);
+		} else {
+			ret = nvme_ns_readv(info->ns, qpinfo->qpair, request->lba_start,
+				request->lba_count, (nvme_cmd_cb)io_finished_callback, request,
+				0, (nvme_req_reset_sgl_cb)ior_reset_sgl,
+				(nvme_req_next_sge_cb)ior_next_sge);
+		}
+		if (ret == 0)
+			return 0;
+		atomic_add(&qpinfo->outstanding, -1);
+		if (request->async != NULL)
+			atomic_add(&qpinfo->async_outstanding, -1);
+		if (ret != ENOMEM || attempt >= 10000)
+			return ret;
+
+		// Every request of the queue is in use: complete some, and try again.
+		poll_qpair(qpinfo);
+		snooze(attempt < 10 ? 10 : 100);
+	}
+}
+
+
+/*!	Waits for a synchronous command: the queue's interrupt wakes this
+	thread, which completes the queue itself, as does whoever else completes
+	it. (Then a completion thread that is busy reporting is no matter, and
+	neither is one that is the waiter.)
+*/
+static void
+await_command(nvme_disk_driver_info* info, qpair_info* qpinfo,
+	nvme_io_request* request)
+{
+	const bigtime_t start = system_time();
+	bool failed = false;
+	atomic_add(&qpinfo->sync_waiters, 1);
+	while (true) {
+		ConditionVariableEntry entry;
+		qpinfo->sync_condition.Add(&entry);
+
+		// done already? (a fast device, or one emulated)
+		poll_qpair(qpinfo);
+		if (atomic_get(&request->completed) != 0)
+			break;
+
+		if (entry.Wait(B_RELATIVE_TIMEOUT, qpinfo->polling
+				? kMaxPollDelay : kSyncWaitTimeout) == B_OK
+			|| qpinfo->polling) {
+			continue;
+		}
+
+		if (!failed && system_time() - start > kSyncGiveUp) {
+			// The controller stalled: fail what it has, which completes
+			// this command too.
+			TRACE_ERROR("timed out waiting for a completion!\n");
+			nvme_qpair_fail(qpinfo->qpair);
+			failed = true;
+		}
+	}
+	atomic_add(&qpinfo->sync_waiters, -1);
+}
 
 
 static void
@@ -699,25 +1185,17 @@ ior_next_sge(nvme_io_request* request, uint64_t* address, uint32_t* length)
 }
 
 
+//! One command, waited for.
 static status_t
 do_nvme_io_request(nvme_disk_driver_info* info, nvme_io_request* request)
 {
 	ReadLocker suspendLocker(info->suspend_lock);
 	request->status = EINPROGRESS;
 
+	prepare_sync_command(request);
+
 	qpair_info* qpinfo = get_qpair(info);
-	int ret = -1;
-	if (request->write) {
-		ret = nvme_ns_writev(info->ns, qpinfo->qpair, request->lba_start,
-			request->lba_count, (nvme_cmd_cb)io_finished_callback, request,
-			0, (nvme_req_reset_sgl_cb)ior_reset_sgl,
-			(nvme_req_next_sge_cb)ior_next_sge);
-	} else {
-		ret = nvme_ns_readv(info->ns, qpinfo->qpair, request->lba_start,
-			request->lba_count, (nvme_cmd_cb)io_finished_callback, request,
-			0, (nvme_req_reset_sgl_cb)ior_reset_sgl,
-			(nvme_req_next_sge_cb)ior_next_sge);
-	}
+	int ret = submit_command(info, qpinfo, request);
 	if (ret != 0) {
 		TRACE_ERROR("attempt to queue %s I/O at LBA %" B_PRIdOFF " of %" B_PRIuSIZE
 			" blocks failed!\n", request->write ? "write" : "read",
@@ -727,7 +1205,7 @@ do_nvme_io_request(nvme_disk_driver_info* info, nvme_io_request* request)
 		return ret;
 	}
 
-	await_status(info, qpinfo->qpair, request->status);
+	await_command(info, qpinfo, request);
 
 	if (request->status != B_OK) {
 		TRACE_ERROR("%s at LBA %" B_PRIdOFF " of %" B_PRIuSIZE
@@ -741,9 +1219,19 @@ do_nvme_io_request(nvme_disk_driver_info* info, nvme_io_request* request)
 
 
 static status_t
-nvme_disk_bounced_io(nvme_disk_handle* handle, io_request* request)
+nvme_disk_bounced_io(nvme_disk_handle* handle, io_request* request,
+	const char* reason)
 {
 	CALLED();
+
+	// Bounced transfers are copied and go one command at a time: say how
+	// often that happens (the first time, then at every power of two).
+	const int64 bounced = atomic_add64(&handle->info->bounced, 1) + 1;
+	if ((bounced & (bounced - 1)) == 0) {
+		TRACE_ALWAYS("%" B_PRId64 " transfers bounced (this one: %" B_PRIdOFF
+			", %" B_PRIuGENADDR " bytes, %s)\n", bounced, request->Offset(),
+			request->Length(), reason);
+	}
 
 	WriteLocker writeLocker;
 	if (request->IsWrite())
@@ -811,8 +1299,171 @@ nvme_disk_bounced_io(nvme_disk_handle* handle, io_request* request)
 }
 
 
+/*!	Copies \a count physical vectors to \a out (if not NULL), cutting those
+	larger than \a maxBytes into pieces that end on page boundaries, so that
+	all but the first piece of a vector start on one. Returns how many
+	vectors that makes.
+*/
+static int32
+split_vectors(const physical_entry* in, int32 count, size_t maxBytes,
+	physical_entry* out)
+{
+	int32 pieces = 0;
+	for (int32 i = 0; i < count; i++) {
+		phys_addr_t address = in[i].address;
+		phys_size_t size = in[i].size;
+		while (size > maxBytes) {
+			phys_size_t piece = ROUNDDOWN(address + maxBytes, B_PAGE_SIZE)
+				- address;
+			if (out != NULL) {
+				out[pieces].address = address;
+				out[pieces].size = piece;
+			}
+			pieces++;
+			address += piece;
+			size -= piece;
+		}
+		if (out != NULL) {
+			out[pieces].address = address;
+			out[pieces].size = size;
+		}
+		pieces++;
+	}
+	return pieces;
+}
+
+
+/*!	Splits a transfer that needs no bouncing into commands and sends them
+	all off at once; the request is completed (by whoever sees it) when the last
+	of them has. Fails only when there is no memory to track it, and then
+	nothing has been sent.
+*/
 static status_t
-do_io(nvme_disk_handle* handle, io_request* request)
+do_async_io(nvme_disk_driver_info* info, io_request* request,
+	const nvme_io_request& transfer, off_t start)
+{
+	const size_t block_size = info->block_size;
+	const uint32 max_io_blocks = info->max_io_blocks;
+	const size_t maxBytes = (size_t)max_io_blocks * block_size;
+
+	// vectors larger than a command, cut at page boundaries
+	const int32 vecCount = split_vectors(transfer.iovecs, transfer.iovec_count,
+		maxBytes, NULL);
+
+	// count the commands, split as the synchronous path splits them
+	int32 commands = 0;
+	{
+		physical_entry piece;
+		int32 pieces = 0;
+		int32 inCommand = 0;
+		uint32 blocks = 0;
+		for (int32 v = 0; v < transfer.iovec_count; v++) {
+			phys_addr_t address = transfer.iovecs[v].address;
+			phys_size_t size = transfer.iovecs[v].size;
+			while (size > 0) {
+				piece.size = size > maxBytes
+					? ROUNDDOWN(address + maxBytes, B_PAGE_SIZE) - address : size;
+				uint32 newBlocks = blocks + piece.size / block_size;
+				if (inCommand == NVME_MAX_SGL_DESCRIPTORS / 2
+					|| (blocks > 0 && newBlocks > max_io_blocks)) {
+					commands++;
+					inCommand = 0;
+					newBlocks = piece.size / block_size;
+				}
+				inCommand++;
+				blocks = newBlocks;
+				pieces++;
+				address += piece.size;
+				size -= piece.size;
+			}
+		}
+		if (inCommand > 0)
+			commands++;
+		ASSERT(pieces == vecCount);
+	}
+
+	const size_t size = sizeof(nvme_async_io)
+		+ commands * sizeof(nvme_io_request)
+		+ vecCount * sizeof(physical_entry);
+	nvme_async_io* io = (nvme_async_io*)malloc(size);
+	if (io == NULL)
+		return B_NO_MEMORY;
+
+	physical_entry* vecs = (physical_entry*)&io->commands[commands];
+	split_vectors(transfer.iovecs, transfer.iovec_count, maxBytes, vecs);
+
+	io->info = info;
+	io->request = request;
+	io->start = start;
+	io->length = request->Length();
+	io->pending = 1;
+	B_INITIALIZE_SPINLOCK(&io->lock);
+	io->status = B_OK;
+	io->failed = INT64_MAX;
+	io->write_locked = transfer.write;
+	io->next = NULL;
+	io->command_count = commands;
+
+	// Held until the last command completes: a bounced write must not
+	// read-modify-write blocks under these, and a suspend must wait for them.
+	if (transfer.write)
+		rw_lock_read_lock(&info->rounded_write_lock);
+	rw_lock_read_lock(&info->suspend_lock);
+
+	qpair_info* qpinfo = get_qpair(info);
+	off_t lba = start / block_size;
+	int32 index = 0;
+	for (int32 c = 0; c < commands; c++) {
+		nvme_io_request* command = &io->commands[c];
+		memset(command, 0, sizeof(nvme_io_request));
+		command->write = transfer.write;
+		command->iovecs = vecs + index;
+		command->iovec_count = min_c(vecCount - index,
+			NVME_MAX_SGL_DESCRIPTORS / 2);
+		command->lba_start = lba;
+		command->lba_count = 0;
+		for (int32 i = 0; i < command->iovec_count; i++) {
+			uint32 newCount = command->lba_count
+				+ command->iovecs[i].size / block_size;
+			if (command->lba_count > 0 && newCount > max_io_blocks) {
+				command->iovec_count = i;
+				break;
+			}
+			command->lba_count = newCount;
+		}
+		command->status = EINPROGRESS;
+		command->async = io;
+
+		atomic_add(&io->pending, 1);
+		int ret = submit_command(info, qpinfo, command);
+		if (ret != 0) {
+			TRACE_ERROR("attempt to queue %s I/O at LBA %" B_PRIdOFF " of %"
+				B_PRIuSIZE " blocks failed!\n", transfer.write ? "write" : "read",
+				command->lba_start, command->lba_count);
+			atomic_add(&io->pending, -1);
+			InterruptsSpinLocker locker(io->lock);
+			io->status = ret < 0 ? ret : B_IO_ERROR;
+			io->failed = min_c(io->failed, lba * (off_t)block_size);
+			break;
+		}
+
+		index += command->iovec_count;
+		lba += command->lba_count;
+	}
+
+	// the submitter's reference
+	if (atomic_add(&io->pending, -1) == 1)
+		async_io_done(io);
+	return B_OK;
+}
+
+
+/*!	\a waited: the caller waits for the request (the read and write hooks):
+	what fits in one command is then done synchronously, which the interrupt
+	completes without waking another thread.
+*/
+static status_t
+do_io(nvme_disk_handle* handle, io_request* request, bool waited)
 {
 	CALLED();
 
@@ -888,19 +1539,30 @@ do_io(nvme_disk_handle* handle, io_request* request)
 	// See if we need to bounce anything other than the first or last vec.
 	const size_t block_size = handle->info->block_size;
 	bool bounceAll = (nvme_request.iovecs == NULL);
+	const char* reason = "too many physical vectors";
 	// A single physically contiguous vector can be much larger than the
-	// controller's maximum transfer. The direct path splits between vectors,
-	// so route such a vector through the bounded DMA translation path.
+	// controller's maximum transfer (a run of cache pages often is). The
+	// asynchronous path cuts it into pieces; the synchronous one, taken
+	// only without memory, splits between vectors and bounces such a
+	// vector through the bounded DMA translation path.
 	const size_t maxIOBytes = (size_t)handle->info->max_io_blocks * block_size;
+	bool tooLarge = false;
 	for (int32 i = 0; !bounceAll && i < nvme_request.iovec_count; i++) {
-		if (nvme_request.iovecs[i].size > maxIOBytes)
-			bounceAll = true;
+		if (nvme_request.iovecs[i].size > maxIOBytes) {
+			tooLarge = true;
+			// (cut at page boundaries, the pieces must be whole blocks)
+			if ((nvme_request.iovecs[i].address % block_size) != 0) {
+				bounceAll = true;
+				reason = "unaligned large vector";
+			}
+		}
 	}
 	for (int32 i = 1; !bounceAll && i < (nvme_request.iovec_count - 1); i++) {
-		if ((nvme_request.iovecs[i].address % B_PAGE_SIZE) != 0)
+		if ((nvme_request.iovecs[i].address % B_PAGE_SIZE) != 0
+			|| (nvme_request.iovecs[i].size % B_PAGE_SIZE) != 0) {
 			bounceAll = true;
-		if ((nvme_request.iovecs[i].size % B_PAGE_SIZE) != 0)
-			bounceAll = true;
+			reason = "unaligned vector";
+		}
 	}
 
 	// See if we need to bounce due to the first or last vecs.
@@ -910,44 +1572,69 @@ do_io(nvme_disk_handle* handle, io_request* request)
 		// respectively, though the start address must always be 32-bit-aligned.
 		physical_entry* entry = &nvme_request.iovecs[0];
 		if (!bounceAll && (((entry->address + entry->size) % B_PAGE_SIZE) != 0
-				|| (entry->address & 0x3) != 0 || (entry->size % block_size) != 0))
+				|| (entry->address & 0x3) != 0 || (entry->size % block_size) != 0)) {
 			bounceAll = true;
+			reason = "unaligned first vector";
+		}
 
 		entry = &nvme_request.iovecs[nvme_request.iovec_count - 1];
 		if (!bounceAll && ((entry->address % B_PAGE_SIZE) != 0
-				|| (entry->size % block_size) != 0))
+				|| (entry->size % block_size) != 0)) {
 			bounceAll = true;
+			reason = "unaligned last vector";
+		}
 	} else {
 		// There is only one vec. Check that it is a multiple of the block size,
 		// and that its address is 32-bit-aligned.
 		physical_entry* entry = &nvme_request.iovecs[0];
-		if (!bounceAll && ((entry->address & 0x3) != 0 || (entry->size % block_size) != 0))
+		if (!bounceAll && ((entry->address & 0x3) != 0 || (entry->size % block_size) != 0)) {
 			bounceAll = true;
+			reason = "unaligned buffer";
+		}
 	}
 
 	// See if we need to bounce due to rounding.
 	const off_t rounded_pos = ROUNDDOWN(request->Offset(), block_size);
 	const phys_size_t rounded_len = ROUNDUP(request->Length() + (request->Offset()
 		- rounded_pos), block_size);
-	if (rounded_pos != request->Offset() || rounded_len != request->Length())
+	if (!bounceAll && (rounded_pos != request->Offset()
+			|| rounded_len != request->Length())) {
 		bounceAll = true;
+		reason = "not whole blocks";
+	}
 
 	if (bounceAll) {
 		// Let the bounced I/O routine take care of everything from here.
-		return nvme_disk_bounced_io(handle, request);
+		return nvme_disk_bounced_io(handle, request, reason);
 	}
 
 	// No bouncing was required.
-	ReadLocker readLocker;
-	if (nvme_request.write)
-		readLocker.SetTo(handle->info->rounded_write_lock, false);
-
 	// Error check before actually doing I/O.
 	if (status != B_OK) {
 		TRACE_ERROR("I/O failed early: %s\n", strerror(status));
 		request->SetStatusAndNotify(status);
 		return status;
 	}
+
+	// (A report on a completion thread may start more I/O, as an iterative
+	// file system request continues: that stays asynchronous, for the thread
+	// must not wait for its own queue. Waiting for I/O there is up to the
+	// read and write hooks, whose waiters complete the queue themselves.)
+	const bool oneCommand = !tooLarge && rounded_len <= maxIOBytes
+		&& nvme_request.iovec_count <= NVME_MAX_SGL_DESCRIPTORS / 2;
+	if (!(waited && oneCommand)
+		&& do_async_io(handle->info, request, nvme_request, rounded_pos)
+			== B_OK) {
+		return B_OK;
+	}
+
+	// One command at a time, waited for (also without memory for the
+	// asynchronous transfer).
+	if (tooLarge)
+		return nvme_disk_bounced_io(handle, request, "vector too large");
+	ReadLocker readLocker;
+	if (nvme_request.write)
+		readLocker.SetTo(handle->info->rounded_write_lock, false);
 
 	const uint32 max_io_blocks = handle->info->max_io_blocks;
 	int32 remaining = nvme_request.iovec_count;
@@ -992,11 +1679,9 @@ do_io(nvme_disk_handle* handle, io_request* request)
 
 
 static status_t
-nvme_disk_io(void* cookie, io_request* request)
+nvme_disk_io_request(nvme_disk_handle* handle, io_request* request,
+	bool waited)
 {
-	CALLED();
-	nvme_disk_handle* handle = (nvme_disk_handle*)cookie;
-
 	MutexLocker requestOwnersLocker(handle->info->request_owners_lock);
 
 	// Use a RequestOwner per-thread to avoid recursion due to
@@ -1021,12 +1706,21 @@ nvme_disk_io(void* cookie, io_request* request)
 		request = owner.requests_queue.RemoveHead();
 		// do_io() completes every request, including errors. Notification may
 		// delete it through the caller's callback before do_io() returns.
-		do_io(handle, request);
+		do_io(handle, request, waited);
+		waited = false;
 	}
 
 	requestOwnersLocker.Lock();
 	handle->info->request_owners.Remove(&owner);
 	return B_OK;
+}
+
+
+static status_t
+nvme_disk_io(void* cookie, io_request* request)
+{
+	CALLED();
+	return nvme_disk_io_request((nvme_disk_handle*)cookie, request, false);
 }
 
 
@@ -1047,7 +1741,9 @@ nvme_disk_read(void* cookie, off_t pos, void* buffer, size_t* length)
 	if (status != B_OK)
 		return status;
 
-	status = nvme_disk_io(handle, &request);
+	status = nvme_disk_io_request(handle, &request, true);
+	if (status == B_OK)
+		status = request.Wait(0, 0);
 	*length = request.TransferredBytes();
 	return status;
 }
@@ -1070,7 +1766,9 @@ nvme_disk_write(void* cookie, off_t pos, const void* buffer, size_t* length)
 	if (status != B_OK)
 		return status;
 
-	status = nvme_disk_io(handle, &request);
+	status = nvme_disk_io_request(handle, &request, true);
+	if (status == B_OK)
+		status = request.Wait(0, 0);
 	*length = request.TransferredBytes();
 	return status;
 }
@@ -1081,16 +1779,23 @@ nvme_disk_flush(nvme_disk_driver_info* info)
 {
 	CALLED();
 	ReadLocker suspendLocker(info->suspend_lock);
-	status_t status = EINPROGRESS;
+
+	nvme_io_request request = {};
+	prepare_sync_command(&request);
+	request.status = EINPROGRESS;
 
 	qpair_info* qpinfo = get_qpair(info);
+	request.qpair = qpinfo;
+	command_submitted(qpinfo);
 	int ret = nvme_ns_flush(info->ns, qpinfo->qpair,
-		(nvme_cmd_cb)io_finished_callback, &status);
-	if (ret != 0)
+		(nvme_cmd_cb)io_finished_callback, &request);
+	if (ret != 0) {
+		atomic_add(&qpinfo->outstanding, -1);
 		return ret;
+	}
 
-	await_status(info, qpinfo->qpair, status);
-	return status;
+	await_command(info, qpinfo, &request);
+	return request.status;
 }
 
 
@@ -1145,14 +1850,20 @@ nvme_disk_trim(nvme_disk_driver_info* info, fs_trim_data* trimData)
 		if (batch.Count() == 0)
 			return B_OK;
 		ReadLocker suspendLocker(info->suspend_lock);
-		status_t status = EINPROGRESS;
+		nvme_io_request request = {};
+		prepare_sync_command(&request);
+		request.status = EINPROGRESS;
 		qpair_info* qpair = get_qpair(info);
+		request.qpair = qpair;
+		command_submitted(qpair);
 		if (nvme_ns_deallocate(info->ns, qpair->qpair, dsmRanges, batch.Count(),
-				(nvme_cmd_cb)io_finished_callback, &status) != 0) {
+				(nvme_cmd_cb)io_finished_callback, &request) != 0) {
+			atomic_add(&qpair->outstanding, -1);
 			return B_IO_ERROR;
 		}
 		// Completion is required before this DMA buffer may be reused or freed.
-		await_status(info, qpair->qpair, status);
+		await_command(info, qpair, &request);
+		status_t status = request.status;
 		if (status == B_OK) {
 			trimData->trimmed_size += batch.Blocks() * info->block_size;
 			batch.Reset();
@@ -1385,9 +2096,12 @@ msix_table(nvme_disk_driver_info* info)
 	}
 	address += table & PCI_msix_offset_mask;
 
+	// all the entries we can use, 16 bytes each
+	size_t size = ROUNDUP((address & (B_PAGE_SIZE - 1))
+		+ (NVME_MAX_QPAIRS + 1) * 16, B_PAGE_SIZE);
 	void* mapped;
 	info->msix_area = map_physical_memory("nvme msi-x table",
-		address & ~(B_PAGE_SIZE - 1), B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+		address & ~(B_PAGE_SIZE - 1), size, B_ANY_KERNEL_ADDRESS,
 		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &mapped);
 	if (info->msix_area < 0)
 		return NULL;
@@ -1403,7 +2117,8 @@ save_msix_vector(nvme_disk_driver_info* info)
 	volatile uint32* table = msix_table(info);
 	if (table == NULL)
 		return;
-	for (int i = 0; i < 4; i++)
+	uint32 entries = max_c(info->msix_count, 1) * 4;
+	for (uint32 i = 0; i < entries; i++)
 		info->msix_saved[i] = table[i];
 }
 
@@ -1412,17 +2127,39 @@ static void
 restore_msix_vector(nvme_disk_driver_info* info)
 {
 	volatile uint32* table = msix_table(info);
-	if (table == NULL || info->msix_saved[0] == 0)
+	if (table == NULL)
 		return;
-	if (table[0] == info->msix_saved[0] && table[2] == info->msix_saved[2])
-		return;
-	// masked while it is written, as the PCI specification asks
-	table[3] = info->msix_saved[3] | 1;
-	for (int i = 0; i < 3; i++)
-		table[i] = info->msix_saved[i];
-	table[3] = info->msix_saved[3];
-	device_manager_suspend_trace("nvme: MSI-X vector written back "
-		"(%#" B_PRIx32 "/%#" B_PRIx32 ")", table[0], table[2]);
+	uint32 count = max_c(info->msix_count, 1);
+	for (uint32 entry = 0; entry < count; entry++) {
+		volatile uint32* vector = table + entry * 4;
+		const uint32* saved = info->msix_saved + entry * 4;
+		if (saved[0] == 0)
+			continue;
+		if (vector[0] == saved[0] && vector[2] == saved[2])
+			continue;
+		// masked while it is written, as the PCI specification asks
+		vector[3] = saved[3] | 1;
+		for (int i = 0; i < 3; i++)
+			vector[i] = saved[i];
+		vector[3] = saved[3];
+		device_manager_suspend_trace("nvme: MSI-X vector %" B_PRIu32
+			" written back (%#" B_PRIx32 "/%#" B_PRIx32 ")", entry, vector[0],
+			vector[2]);
+	}
+}
+
+
+/*!	Takes the queues down before the controller is shut down: with all I/O
+	done (the suspend lock is write locked), the completion threads (which
+	look at their queues on their own) must stay away from them until the
+	controller and its queues are set up again.
+*/
+static void
+take_queues_down(nvme_disk_driver_info* info)
+{
+	atomic_set(&info->queues_down, 1);
+	while (atomic_get(&info->pollers) > 0)
+		snooze(100);
 }
 
 
@@ -1449,6 +2186,7 @@ nvme_disk_suspend(void* _cookie, int32 state)
 
 		nvme_disk_flush(info);
 		rw_lock_write_lock(&info->suspend_lock);
+		take_queues_down(info);
 		save_msix_vector(info);
 		nvme_ctrlr_suspend(info->ctrlr);
 		status_t status = info->pci->suspend_device(info->pci_device_cookie,
@@ -1464,6 +2202,9 @@ nvme_disk_suspend(void* _cookie, int32 state)
 
 	// Wait for pending commands; new ones are blocked until resumed.
 	rw_lock_write_lock(&info->suspend_lock);
+	take_queues_down(info);
+	save_msix_vector(info);
+		// (a device that loses its power comes back with an empty table)
 
 	nvme_ctrlr_suspend(info->ctrlr);
 	info->suspended = true;
@@ -1498,6 +2239,8 @@ nvme_disk_resume(void* _cookie)
 		nvme_disk_configure_features(info);
 	}
 
+	// (also after a failed resume: commands fail then, they do not hang)
+	atomic_set(&info->queues_down, 0);
 	rw_lock_write_unlock(&info->suspend_lock);
 	return status;
 }

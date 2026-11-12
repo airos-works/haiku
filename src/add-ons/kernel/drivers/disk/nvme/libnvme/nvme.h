@@ -618,6 +618,27 @@ extern int nvme_ctrlr_get_feature(struct nvme_ctrlr *ctrlr,
 				  enum nvme_feat feature,
 				  uint32_t cdw11, uint32_t *attributes);
 
+#ifdef __HAIKU__
+/**
+ * @brief Spread the I/O completion queues over interrupt vectors
+ *
+ * @param ctrlr		Controller handle
+ * @param vectors	Interrupt vectors set up for the controller (MSI-X
+ *			entries 0 to vectors - 1)
+ *
+ * Vector 0 stays the admin queue's; I/O queue pair N (N >= 1) interrupts on
+ * vector ((N - 1) % (vectors - 1)) + 1. Applies to queue pairs created after
+ * the call, and to all of them when a reset creates them again.
+ */
+extern void nvme_ctrlr_set_io_vectors(struct nvme_ctrlr *ctrlr,
+				      unsigned int vectors);
+
+/**
+ * @brief Interrupt vector of an I/O queue pair
+ */
+extern unsigned int nvme_qpair_vector(struct nvme_qpair *qpair);
+#endif
+
 /**
  * @brief Set a specific feature of a controller
  *

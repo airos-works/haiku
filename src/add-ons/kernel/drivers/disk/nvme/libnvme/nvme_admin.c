@@ -244,6 +244,7 @@ int nvme_admin_create_ioq(struct nvme_ctrlr *ctrlr,
 		cmd.opc = NVME_OPC_CREATE_IO_CQ;
 #ifdef __HAIKU__ // TODO: Option!
 		cmd.cdw11 = 0x1 | 0x2; /* enable interrupts */
+		cmd.cdw11 |= nvme_qpair_vector(qpair) << 16;
 #else
 		cmd.cdw11 = 0x1;
 #endif

@@ -41,7 +41,28 @@
 #define MAX_IO_VECS			32	// 128 kB
 
 #define BYPASS_IO_SIZE		65536
+
+// cached pages a read copies with one round trip of the cache's lock
+#define COPY_RUN_PAGES		16
 #define LAST_ACCESSES		3
+
+// read-ahead: the first window of a sequential stream, its growth limit,
+// and the most one asynchronous read covers
+#define READ_AHEAD_INITIAL	(128 * 1024)
+#define READ_AHEAD_MAX		(2 * 1024 * 1024)
+#define READ_AHEAD_CHUNK	(1024 * 1024)
+#define READ_AHEAD_STREAMS	4
+
+/*!	A sequential reader of a file. Reading into the latest window (from
+	\c end - \c window on) issues the next one, so that one is in flight
+	while the reader consumes the last.
+*/
+struct read_ahead_stream {
+	off_t			next;		// where the next sequential read starts
+	off_t			end;		// end of what has been read ahead
+	uint32			window;		// size of the latest window, 0 before any
+	uint32			used;		// when the stream was read last
+};
 
 struct file_cache_ref {
 	VMCache			*cache;
@@ -52,6 +73,14 @@ struct file_cache_ref {
 		//	write vs. read)
 	int32			last_access_index;
 	uint16			disabled_count;
+	int32			read_ahead_inline;
+		// read ahead that completed before it was submitted, in a row: the
+		// file system (or device) serves reads synchronously
+	spinlock		read_ahead_lock;
+		// protects the streams: every read looks at them, and the cache's
+		// lock is busy enough
+	uint32			read_ahead_clock;
+	read_ahead_stream read_ahead[READ_AHEAD_STREAMS];
 
 	inline void SetLastAccess(int32 index, off_t access, bool isWrite)
 	{
@@ -77,7 +106,7 @@ public:
 								~PrecacheIO();
 
 			status_t			Prepare(vm_page_reservation* reservation);
-			void				ReadAsync();
+			bool				ReadAsync();
 
 	virtual	void				IOFinished(status_t status,
 									bool partialTransfer,
@@ -93,6 +122,8 @@ private:
 			off_t				fOffset;
 			uint32				fVecCount;
 			generic_size_t		fSize;
+			int32				fReferences;
+				// ReadAsync() and IOFinished() each have one
 };
 
 typedef status_t (*cache_func)(file_cache_ref* ref, off_t offset,
@@ -123,7 +154,8 @@ PrecacheIO::PrecacheIO(file_cache_ref* ref, off_t offset, generic_size_t size)
 	fVecs(NULL),
 	fOffset(offset),
 	fVecCount(0),
-	fSize(size)
+	fSize(size),
+	fReferences(2)
 {
 	fPageCount = (size + B_PAGE_SIZE - 1) / B_PAGE_SIZE;
 	fCache->AcquireRefLocked();
@@ -173,13 +205,21 @@ PrecacheIO::Prepare(vm_page_reservation* reservation)
 }
 
 
-void
+/*!	Starts reading. The object deletes itself when that is done.
+	\return Whether it was done before this returned (the file system or the
+		device read synchronously).
+*/
+bool
 PrecacheIO::ReadAsync()
 {
-	// This object is going to be deleted after the I/O request has been
-	// fulfilled
 	vfs_asynchronous_read_pages(fRef->vnode, NULL, fOffset, fVecs, fVecCount,
 		fSize, B_PHYSICAL_IO_REQUEST, this);
+
+	if (atomic_add(&fReferences, -1) != 1)
+		return false;
+
+	delete this;
+	return true;
 }
 
 
@@ -235,7 +275,9 @@ PrecacheIO::IOFinished(status_t status, bool partialTransfer,
 	}
 
 	fCache->Unlock();
-	delete this;
+
+	if (atomic_add(&fReferences, -1) == 1)
+		delete this;
 }
 
 
@@ -878,6 +920,107 @@ do_cache_io(void* _cacheRef, off_t offset, addr_t buffer,
 			}
 		}
 
+		if (page != NULL && !doWrite && useBuffer) {
+			// A read copies a run of cached pages with one round trip of the
+			// cache's lock: one page at a time, concurrent readers of the
+			// file queue up on the lock, and that costs them more than the
+			// copying.
+			vm_page* run[COPY_RUN_PAGES];
+			size_t runCount = 0;
+			{
+				const size_t maxRun = min_c((size_t)COPY_RUN_PAGES,
+					MAX_IO_VECS - pagesProcessed % MAX_IO_VECS);
+				off_t runOffset = offset;
+				int32 runPageOffset = pageOffset;
+				size_t runLeft = bytesLeft;
+				vm_page* next = page;
+				while (true) {
+					// (the page is not busy: marked busy, it stays ours while
+					// the cache is unlocked)
+					next->busy = true;
+					run[runCount++] = next;
+
+					const size_t bytes = min_c(
+						size_t(B_PAGE_SIZE - runPageOffset), runLeft);
+					if (runLeft <= bytes || runCount == maxRun)
+						break;
+					runLeft -= bytes;
+					runOffset += B_PAGE_SIZE;
+					runPageOffset = 0;
+
+					next = cache->LookupPage(runOffset);
+					if (next == NULL || next->busy)
+						break;
+				}
+			}
+			locker.Unlock();
+
+			const bool userBuffer = IS_USER_ADDRESS(buffer);
+			size_t copied = 0;
+			{
+				addr_t copyBuffer = buffer;
+				size_t copyLeft = bytesLeft;
+				int32 copyPageOffset = pageOffset;
+				for (; copied < runCount; copied++) {
+					const size_t bytes = min_c(
+						size_t(B_PAGE_SIZE - copyPageOffset), copyLeft);
+					status = vm_memcpy_from_physical((void*)copyBuffer,
+						(phys_addr_t)run[copied]->physical_page_number
+							* B_PAGE_SIZE + copyPageOffset, bytes, userBuffer);
+					if (status != B_OK)
+						break;
+					copyBuffer += bytes;
+					copyLeft -= bytes;
+					copyPageOffset = 0;
+				}
+			}
+
+			locker.Lock();
+
+			for (size_t i = 0; i < runCount; i++) {
+				vm_page* runPage = run[i];
+				cache->MarkPageUnbusy(runPage);
+
+				// requeue it, so that the queue roughly remains LRU sorted
+				if (runPage->State() == PAGE_STATE_CACHED
+					|| runPage->State() == PAGE_STATE_MODIFIED) {
+					DEBUG_PAGE_ACCESS_START(runPage);
+					vm_page_requeue(runPage, true, NULL);
+					DEBUG_PAGE_ACCESS_END(runPage);
+				}
+			}
+
+			// what was copied, accounted for as page by page below
+			for (size_t i = 0; i < copied; i++) {
+				const size_t bytes = min_c(size_t(B_PAGE_SIZE - pageOffset),
+					bytesLeft);
+				if (bytesLeft <= bytes)
+					return B_OK;
+				buffer += bytes;
+				bytesLeft -= bytes;
+				pageOffset = 0;
+				offset += B_PAGE_SIZE;
+				pagesProcessed++;
+			}
+			lastBuffer = buffer;
+			lastLeft = bytesLeft;
+			lastOffset = offset;
+			lastPageOffset = pageOffset;
+
+			if (status != B_OK)
+				return partial(status);
+
+			if ((lastOffset + (off_t)lastLeft) > cache->virtual_end) {
+				// Someone else must've shrunk the cache.
+				if (lastOffset > startOffset)
+					*_size = lastOffset - startOffset;
+				else
+					*_size = 0;
+				return B_OK;
+			}
+			continue;
+		}
+
 		size_t bytesInPage = min_c(size_t(B_PAGE_SIZE - pageOffset), bytesLeft);
 
 		TRACE(("lookup page from offset %lld: %p, size = %lu, pageOffset "
@@ -1093,6 +1236,212 @@ file_cache_control(const char* subsystem, uint32 function, void* buffer,
 //	#pragma mark - private kernel API
 
 
+/*!	Reads the pages of the range that are not in the cache yet, without
+	waiting for them. With \a readAhead, it does not wait for free pages
+	either, and gives up when they are short.
+	The caller must hold a reference to the cache, but not its lock.
+*/
+static void
+prefetch_range(file_cache_ref* ref, off_t offset, size_t size, bool readAhead)
+{
+	VMCache* cache = ref->cache;
+	const off_t fileSize = cache->virtual_end;
+	if (size == 0 || offset >= fileSize)
+		return;
+	if ((off_t)(offset + size) > fileSize)
+		size = fileSize - offset;
+
+	// "offset" and "end" are always aligned to B_PAGE_SIZE
+	const off_t end = ROUNDUP(offset + (off_t)size, B_PAGE_SIZE);
+	offset = ROUNDDOWN(offset, B_PAGE_SIZE);
+
+	if (readAhead
+		&& low_resource_state(B_KERNEL_RESOURCE_PAGES) != B_NO_LOW_RESOURCE) {
+		return;
+	}
+
+	cache->Lock();
+
+	// Count the pages that are missing: read ahead mostly finds its window
+	// cached when the file is.
+	const page_num_t firstPage = offset >> PAGE_SHIFT;
+	const page_num_t endPage = end >> PAGE_SHIFT;
+	page_num_t missing = 0;
+	page_num_t expected = firstPage;
+	VMCachePagesTree::Iterator it = cache->pages.GetIterator(firstPage, true,
+		true);
+	while (vm_page* page = it.Next()) {
+		if (page->cache_offset >= endPage)
+			break;
+		missing += page->cache_offset - expected;
+		expected = page->cache_offset + 1;
+	}
+	missing += endPage - expected;
+
+	// Don't do anything if we don't have the resources left, or (when asked
+	// to prefetch) the cache already contains more than 2/3 of its pages.
+	// (Reading ahead may take cached pages, as long as memory is not short.)
+	if (missing == 0
+		|| (!readAhead
+			&& (vm_page_num_unused_pages() < 2 * missing
+				|| (3 * cache->page_count) > (2 * fileSize / B_PAGE_SIZE)))) {
+		cache->Unlock();
+		return;
+	}
+	cache->Unlock();
+
+	vm_page_reservation reservation;
+	if (readAhead) {
+		if (!vm_page_try_reserve_pages(&reservation, missing,
+				VM_PRIORITY_USER)) {
+			return;
+		}
+	} else
+		vm_page_reserve_pages(&reservation, missing, VM_PRIORITY_USER);
+
+	cache->Lock();
+
+	off_t pos = offset;
+	page_num_t reserved = missing;
+	while (pos < end && reserved > 0) {
+		// skip what is in memory already
+		if (cache->LookupPage(pos) != NULL) {
+			pos += B_PAGE_SIZE;
+			continue;
+		}
+
+		// a run of missing pages; read ahead keeps runs at a size that the
+		// reader can start on early
+		const off_t runStart = pos;
+		size_t runSize = 0;
+		size_t maxRun = reserved * B_PAGE_SIZE;
+		if (readAhead)
+			maxRun = min_c(maxRun, (size_t)READ_AHEAD_CHUNK);
+		while (pos < end && runSize < maxRun
+			&& cache->LookupPage(pos) == NULL) {
+			runSize += B_PAGE_SIZE;
+			pos += B_PAGE_SIZE;
+		}
+
+		PrecacheIO* io = new(std::nothrow) PrecacheIO(ref, runStart, runSize);
+		if (io == NULL || io->Prepare(&reservation) != B_OK) {
+			cache->Unlock();
+			delete io;
+			cache->Lock();
+			break;
+		}
+		reserved -= runSize / B_PAGE_SIZE;
+
+		// we must not have the cache locked during I/O
+		cache->Unlock();
+		const bool completedInline = io->ReadAsync();
+		cache->Lock();
+
+		if (readAhead) {
+			if (!completedInline)
+				atomic_set(&ref->read_ahead_inline, 0);
+			else if (atomic_get(&ref->read_ahead_inline) < 2)
+				atomic_add(&ref->read_ahead_inline, 1);
+		}
+	}
+
+	cache->Unlock();
+	vm_page_unreserve_pages(&reservation);
+}
+
+
+static inline uint32
+read_ahead_initial_window(size_t size, uint32 maxWindow)
+{
+	size_t window = ROUNDUP(size, B_PAGE_SIZE);
+	window = window <= READ_AHEAD_INITIAL / 4 ? window * 4 : window * 2;
+	return min_c(max_c(window, (size_t)READ_AHEAD_INITIAL / 8),
+		(size_t)maxWindow);
+}
+
+
+static inline uint32
+read_ahead_next_window(uint32 window, uint32 maxWindow)
+{
+	window = window < maxWindow / 16 ? window * 4 : window * 2;
+	return min_c(window, maxWindow);
+}
+
+
+/*!	Recognizes sequential reads of the file, and reads the data they will
+	want next before they ask for it: a window that grows from what the
+	reader asks for to READ_AHEAD_MAX, always one ahead of the reader.
+	Called after the read itself, which stays a synchronous read where it
+	has to read: quicker for a single read, and for a small file read whole.
+*/
+static void
+read_ahead(file_cache_ref* ref, off_t offset, size_t size)
+{
+	VMCache* cache = ref->cache;
+	const off_t end = offset + size;
+
+	off_t start = 0;
+	off_t length = 0;
+
+	InterruptsSpinLocker locker(ref->read_ahead_lock);
+
+	read_ahead_stream* stream = NULL;
+	read_ahead_stream* oldest = &ref->read_ahead[0];
+	const uint32 now = ++ref->read_ahead_clock;
+	for (int32 i = 0; i < READ_AHEAD_STREAMS; i++) {
+		read_ahead_stream& candidate = ref->read_ahead[i];
+		// the read follows the last one, maybe again starting in its last
+		// page
+		if (candidate.next != 0 && offset <= candidate.next
+			&& offset + B_PAGE_SIZE > candidate.next) {
+			stream = &candidate;
+			break;
+		}
+		if (now - candidate.used > now - oldest->used)
+			oldest = &candidate;
+	}
+
+	if (stream == NULL) {
+		// the least recently used stream makes room
+		stream = oldest;
+		stream->window = 0;
+		stream->end = 0;
+		if (offset != 0) {
+			// Wait for the second read to see whether this is sequential;
+			// reads at the start of the file usually are.
+			stream->next = end;
+			stream->used = now;
+			return;
+		}
+	}
+	stream->used = now;
+
+	// What is read synchronously keeps the reader waiting: less of that.
+	const uint32 maxWindow = atomic_get(&ref->read_ahead_inline) >= 2
+		? READ_AHEAD_INITIAL : READ_AHEAD_MAX;
+
+	if (stream->window == 0) {
+		// the stream begins: the first window follows the read
+		stream->window = read_ahead_initial_window(size, maxWindow);
+		start = ROUNDUP(end, B_PAGE_SIZE);
+		stream->end = start + stream->window;
+		length = stream->window;
+	} else if (end > stream->end - (off_t)stream->window) {
+		// the reader got to the latest window (or past it): the next one
+		stream->window = read_ahead_next_window(stream->window, maxWindow);
+		start = max_c(stream->end, ROUNDUP(end, B_PAGE_SIZE));
+		stream->end = start + stream->window;
+		length = stream->window;
+	}
+	stream->next = end;
+
+	locker.Unlock();
+
+	if (length > 0 && start < cache->virtual_end)
+		prefetch_range(ref, start, length, true);
+}
+
+
 extern "C" void
 cache_prefetch_vnode(struct vnode* vnode, off_t offset, size_t size)
 {
@@ -1108,75 +1457,10 @@ cache_prefetch_vnode(struct vnode* vnode, off_t offset, size_t size)
 	}
 
 	file_cache_ref* ref = ((VMVnodeCache*)cache)->FileCacheRef();
-	off_t fileSize = cache->virtual_end;
+	if (ref != NULL)
+		prefetch_range(ref, offset, size, false);
 
-	if ((off_t)(offset + size) > fileSize)
-		size = fileSize - offset;
-
-	// "offset" and "size" are always aligned to B_PAGE_SIZE,
-	offset = ROUNDDOWN(offset, B_PAGE_SIZE);
-	size = ROUNDUP(size, B_PAGE_SIZE);
-
-	const size_t pagesCount = size / B_PAGE_SIZE;
-
-	// Don't do anything if we don't have the resources left, or the cache
-	// already contains more than 2/3 of its pages
-	if (offset >= fileSize || vm_page_num_unused_pages() < 2 * pagesCount
-		|| (3 * cache->page_count) > (2 * fileSize / B_PAGE_SIZE)) {
-		cache->ReleaseRef();
-		return;
-	}
-
-	size_t bytesToRead = 0;
-	off_t lastOffset = offset;
-
-	vm_page_reservation reservation;
-	vm_page_reserve_pages(&reservation, pagesCount, VM_PRIORITY_USER);
-
-	cache->Lock();
-
-	while (true) {
-		// check if this page is already in memory
-		if (size > 0) {
-			vm_page* page = cache->LookupPage(offset);
-
-			offset += B_PAGE_SIZE;
-			size -= B_PAGE_SIZE;
-
-			if (page == NULL) {
-				bytesToRead += B_PAGE_SIZE;
-				continue;
-			}
-		}
-		if (bytesToRead != 0) {
-			// read the part before the current page (or the end of the request)
-			PrecacheIO* io = new(std::nothrow) PrecacheIO(ref, lastOffset,
-				bytesToRead);
-			if (io == NULL || io->Prepare(&reservation) != B_OK) {
-				cache->Unlock();
-				delete io;
-				cache->Lock();
-				break;
-			}
-
-			// we must not have the cache locked during I/O
-			cache->Unlock();
-			io->ReadAsync();
-			cache->Lock();
-
-			bytesToRead = 0;
-		}
-
-		if (size == 0) {
-			// we have reached the end of the request
-			break;
-		}
-
-		lastOffset = offset;
-	}
-
-	cache->ReleaseRefAndUnlock();
-	vm_page_unreserve_pages(&reservation);
+	cache->ReleaseRef();
 }
 
 
@@ -1293,6 +1577,10 @@ file_cache_create(dev_t mountID, ino_t vnodeID, off_t size)
 	memset(ref->last_access, 0, sizeof(ref->last_access));
 	ref->last_access_index = 0;
 	ref->disabled_count = 0;
+	ref->read_ahead_inline = 0;
+	B_INITIALIZE_SPINLOCK(&ref->read_ahead_lock);
+	ref->read_ahead_clock = 0;
+	memset(ref->read_ahead, 0, sizeof(ref->read_ahead));
 
 	// TODO: delay VMCache creation until data is
 	//	requested/written for the first time? Listing lots of
@@ -1456,7 +1744,11 @@ file_cache_read(void* _cacheRef, off_t offset, void* buffer,
 		return error;
 	}
 
-	return cache_io(ref, offset, (addr_t)buffer, _size, false);
+	status_t status = cache_io(ref, offset, (addr_t)buffer, _size, false);
+	if (status == B_OK && *_size > 0)
+		read_ahead(ref, offset, *_size);
+
+	return status;
 }
 
 

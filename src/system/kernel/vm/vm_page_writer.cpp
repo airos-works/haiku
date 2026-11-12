@@ -95,24 +95,39 @@ class PageWriteWrapper;
 
 class PageWriterRun {
 public:
-	status_t Init(uint32 maxPages);
+	PageWriterRun()
+		:
+		fWrappers(NULL),
+		fTransfers(NULL)
+	{
+	}
+
+	status_t Init(uint32 maxPages, uint32 maxTransfers,
+		uint32 allocationFlags, bool holdsReferences);
 	~PageWriterRun();
 
 	void PrepareNextRun();
-	void AddPage(vm_page* page);
-	uint32 Go();
+	bool AddPage(vm_page* page);
+	uint32 PageCount() const { return fWrapperCount; }
+
+	void Start(uint32 flags);
+	uint32 Finish();
 
 	void PageWritten(PageWriteTransfer* transfer, status_t status,
 		bool partialTransfer, size_t bytesTransferred);
 
 private:
 	uint32				fMaxPages;
+	uint32				fMaxTransfers;
+	bool				fHoldsReferences;
+		// a cache and a store reference for each page, released when done
 	uint32				fWrapperCount;
 	uint32				fTransferCount;
 	int32				fPendingTransfers;
 	PageWriteWrapper*	fWrappers;
 	PageWriteTransfer*	fTransfers;
 	ConditionVariable	fAllFinishedCondition;
+	ConditionVariableEntry fWaitEntry;
 };
 
 
@@ -406,15 +421,19 @@ PageWriteTransfer::IOFinished(status_t status, bool partialTransfer,
 
 
 status_t
-PageWriterRun::Init(uint32 maxPages)
+PageWriterRun::Init(uint32 maxPages, uint32 maxTransfers,
+	uint32 allocationFlags, bool holdsReferences)
 {
 	fMaxPages = maxPages;
+	fMaxTransfers = maxTransfers;
+	fHoldsReferences = holdsReferences;
 	fWrapperCount = 0;
 	fTransferCount = 0;
 	fPendingTransfers = 0;
 
-	fWrappers = new(std::nothrow) PageWriteWrapper[maxPages];
-	fTransfers = new(std::nothrow) PageWriteTransfer[maxPages];
+	fWrappers = new(malloc_flags(allocationFlags)) PageWriteWrapper[maxPages];
+	fTransfers
+		= new(malloc_flags(allocationFlags)) PageWriteTransfer[maxTransfers];
 	if (fWrappers == NULL || fTransfers == NULL)
 		return B_NO_MEMORY;
 
@@ -439,37 +458,53 @@ PageWriterRun::PrepareNextRun()
 
 
 /*!	The page's cache must be locked.
+	\return \c false when the run has no room for the page; then it is left
+		alone.
 */
-void
+bool
 PageWriterRun::AddPage(vm_page* page)
 {
-	fWrappers[fWrapperCount++].SetTo(page);
+	if (fWrapperCount == fMaxPages)
+		return false;
 
 	if (fTransferCount == 0 || !fTransfers[fTransferCount - 1].AddPage(page)) {
+		if (fTransferCount == fMaxTransfers)
+			return false;
 		fTransfers[fTransferCount++].SetTo(this, page,
 			page->Cache()->MaxPagesPerAsyncWrite());
 	}
+
+	fWrappers[fWrapperCount++].SetTo(page);
+	return true;
 }
 
 
-/*!	Writes all pages previously added.
-	\return The number of pages that could not be written or otherwise handled.
+/*!	Schedules the writes of all pages previously added; Finish() waits for
+	them. The same thread has to call both.
 */
-uint32
-PageWriterRun::Go()
+void
+PageWriterRun::Start(uint32 flags)
 {
 	atomic_set(&fPendingTransfers, fTransferCount);
 
 	fAllFinishedCondition.Init(this, "page writer wait for I/O");
-	ConditionVariableEntry waitEntry;
-	fAllFinishedCondition.Add(&waitEntry);
+	fAllFinishedCondition.Add(&fWaitEntry);
 
 	// schedule writes
 	for (uint32 i = 0; i < fTransferCount; i++)
-		fTransfers[i].Schedule(B_VIP_IO_REQUEST);
+		fTransfers[i].Schedule(flags);
+}
 
+
+/*!	Waits for the writes Start() scheduled, and marks the pages depending on
+	the outcome.
+	\return The number of pages that could not be written or otherwise handled.
+*/
+uint32
+PageWriterRun::Finish()
+{
 	// wait until all pages have been written
-	waitEntry.Wait();
+	fWaitEntry.Wait();
 
 	// mark pages depending on whether they could be written or not
 
@@ -489,7 +524,7 @@ PageWriterRun::Go()
 
 	ASSERT(wrapperIndex == fWrapperCount);
 
-	for (uint32 i = 0; i < fTransferCount; i++) {
+	for (uint32 i = 0; fHoldsReferences && i < fTransferCount; i++) {
 		PageWriteTransfer& transfer = fTransfers[i];
 		struct VMCache* cache = transfer.Cache();
 
@@ -555,13 +590,49 @@ ModifiedPageQueue::_PageWriter()
 	bigtime_t pageCollectionTime = 0;
 #endif
 
-	PageWriterRun run;
-	if (run.Init(kNumPages) != B_OK) {
+	// Two runs: one is written while the next is collected and scheduled,
+	// so that the device does not go idle between them.
+	PageWriterRun runs[2];
+	if (runs[0].Init(kNumPages, kNumPages, 0, true) != B_OK
+		|| runs[1].Init(kNumPages, kNumPages, 0, true) != B_OK) {
 		panic("page writer: Failed to init PageWriterRun!");
 		return B_ERROR;
 	}
+	uint32 nextRun = 0;
+
+	PageWriterRun* pendingRun = NULL;
+	uint32 pendingPages = 0;
+	page_num_t pendingPagesSeen = 0;
+	bigtime_t pendingStart = 0;
+	bigtime_t lastFinished = 0;
 
 	page_num_t pagesSinceLastSuccessfulWrite = 0;
+
+	// waits for the run in flight, and does all the cleanup
+	auto finishPendingRun = [&]() {
+		if (pendingRun == NULL)
+			return;
+
+		uint32 failedPages = pendingRun->Finish();
+		pendingRun = NULL;
+
+		if (failedPages == pendingPages)
+			pagesSinceLastSuccessfulWrite += pendingPagesSeen;
+		else
+			pagesSinceLastSuccessfulWrite = 0;
+
+		// (the part of its time it had the device to itself, or shared it
+		// with the next run only)
+		bigtime_t now = system_time();
+		if (failedPages == 0 && pendingPages >= 8) {
+			fLastAveragePageWriteDuration
+				= (now - max_c(pendingStart, lastFinished)) / pendingPages;
+		}
+		lastFinished = now;
+
+		if (!IsOverQuota())
+			sUnderQuotaCondition.NotifyAll();
+	};
 
 	while (fWriterThread >= 0) {
 		// Report what this queue holds now, also when there is nothing to
@@ -573,14 +644,22 @@ ModifiedPageQueue::_PageWriter()
 			sUnderQuotaCondition.NotifyAll();
 
 		if (queue.Count() < kNumPages) {
+			// nothing urgent: complete the writes before sleeping
+			if (pendingRun != NULL) {
+				finishPendingRun();
+				continue;
+			}
+
 			// wait the full amount when no one triggers us
 			if (!fPageWriterCondition.Wait(PAGES_FLUSH_DURATION_LOCAL_QUOTA, true))
 				continue;
 		}
 
 		page_num_t modifiedPages = queue.Count();
-		if (modifiedPages == 0)
+		if (modifiedPages == 0) {
+			finishPendingRun();
 			continue;
+		}
 
 		if (modifiedPages <= pagesSinceLastSuccessfulWrite) {
 			// We ran through the whole queue without being able to write a
@@ -608,6 +687,7 @@ ModifiedPageQueue::_PageWriter()
 		thread_set_io_priority(ioPriority);
 
 		uint32 numPages = 0;
+		PageWriterRun& run = runs[nextRun];
 		run.PrepareNextRun();
 
 		// collect pages to be written
@@ -705,43 +785,40 @@ ModifiedPageQueue::_PageWriter()
 #ifdef TRACE_VM_PAGE_WRITER
 		pageCollectionTime += system_time();
 #endif
-		if (numPages == 0)
+		if (numPages == 0) {
+			finishPendingRun();
 			continue;
+		}
 
-		// write pages to disk and do all the cleanup
+		// write pages to disk, then finish the previous run while these are
+		// written
 		bigtime_t runStart = system_time();
-		uint32 failedPages = run.Go();
+		run.Start(B_VIP_IO_REQUEST);
+		finishPendingRun();
+
+		pendingRun = &run;
+		pendingPages = numPages;
+		pendingPagesSeen = modifiedPages - maxPagesToSee;
+		pendingStart = runStart;
+		nextRun ^= 1;
 
 #ifdef TRACE_VM_PAGE_WRITER
 		// debug output only...
 		writtenPages += numPages;
 		if (writtenPages >= 1024) {
 			bigtime_t now = system_time();
-			bigtime pageWritingTime = now - runStart;
-			TRACE(("page writer: wrote 1024 pages (total: %" B_PRIu64 " ms, "
-				"collect: %" B_PRIu64 " ms, write: %" B_PRIu64 " ms)\n",
-				(now - lastWrittenTime) / 1000,
-				pageCollectionTime / 1000, pageWritingTime / 1000));
+			TRACE(("page writer: scheduled 1024 pages (total: %" B_PRIu64
+				" ms, collect: %" B_PRIu64 " ms)\n",
+				(now - lastWrittenTime) / 1000, pageCollectionTime / 1000));
 			lastWrittenTime = now;
 
 			writtenPages -= 1024;
 			pageCollectionTime = 0;
-			pageWritingTime = 0;
 		}
 #endif
-
-		if (failedPages == numPages)
-			pagesSinceLastSuccessfulWrite += modifiedPages - maxPagesToSee;
-		else
-			pagesSinceLastSuccessfulWrite = 0;
-
-		if (failedPages == 0 && numPages >= 8)
-			fLastAveragePageWriteDuration = (system_time() - runStart) / numPages;
-
-		if (!IsOverQuota())
-			sUnderQuotaCondition.NotifyAll();
 	}
 
+	finishPendingRun();
 	return B_OK;
 }
 
@@ -756,17 +833,12 @@ ModifiedPageQueue::_WriterThreadEntry(void* _this)
 //	#pragma mark - private kernel API
 
 
-/*!	Writes a range of modified pages of a cache to disk.
-	You need to hold the VMCache lock when calling this function.
-	Note that the cache lock is released in this function.
-	\param cache The cache.
-	\param firstPage Offset (in page size units) of the first page in the range.
-	\param endPage End offset (in page size units) of the page range. The page
-		at this offset is not included.
+/*!	vm_page_write_modified_page_range() one transfer at a time, waited for:
+	what it does when it cannot get the memory for more.
 */
-status_t
-vm_page_write_modified_page_range(struct VMCache* cache, uint32 firstPage,
-	uint32 endPage)
+static status_t
+write_modified_page_range_synchronously(struct VMCache* cache,
+	uint32 firstPage, uint32 endPage)
 {
 	static const int32 kMaxPages = 256;
 	int32 maxPages = cache->MaxPagesPerWrite();
@@ -866,6 +938,90 @@ vm_page_write_modified_page_range(struct VMCache* cache, uint32 firstPage,
 		delete[] wrappers;
 	}
 
+	return B_OK;
+}
+
+
+/*!	Writes a range of modified pages of a cache to disk.
+	You need to hold the VMCache lock when calling this function.
+	Note that the cache lock is released in this function.
+	\param cache The cache.
+	\param firstPage Offset (in page size units) of the first page in the range.
+	\param endPage End offset (in page size units) of the page range. The page
+		at this offset is not included.
+*/
+status_t
+vm_page_write_modified_page_range(struct VMCache* cache, uint32 firstPage,
+	uint32 endPage)
+{
+	// Asynchronous writes, in runs: one is written while the next is
+	// collected and scheduled. (The caller's reference to the cache keeps
+	// its store, which may be on its way out: no references of our own.)
+	static const uint32 kMaxPages = 256;
+	static const uint32 kMaxTransfers = 32;
+	const uint32 allocationFlags = HEAP_DONT_WAIT_FOR_MEMORY
+		| HEAP_DONT_LOCK_KERNEL_SPACE;
+
+	PageWriterRun* runs = new(malloc_flags(allocationFlags)) PageWriterRun[2];
+	if (runs == NULL
+		|| runs[0].Init(kMaxPages, kMaxTransfers, allocationFlags, false)
+			!= B_OK
+		|| runs[1].Init(kMaxPages, kMaxTransfers, allocationFlags, false)
+			!= B_OK) {
+		delete[] runs;
+		return write_modified_page_range_synchronously(cache, firstPage,
+			endPage);
+	}
+
+	PageWriterRun* pendingRun = NULL;
+	uint32 nextRun = 0;
+	uint32 position = firstPage;
+	bool atEnd = false;
+	while (!atEnd) {
+		PageWriterRun& run = runs[nextRun];
+		run.PrepareNextRun();
+
+		atEnd = true;
+		VMCachePagesTree::Iterator it
+			= cache->pages.GetIterator(position, true, true);
+		while (vm_page* page = it.Next()) {
+			if (page->cache_offset >= endPage)
+				break;
+
+			if (!page->busy && (page->State() == PAGE_STATE_MODIFIED
+					|| vm_test_map_modification(page))) {
+				DEBUG_PAGE_ACCESS_START(page);
+				const bool added = run.AddPage(page);
+				DEBUG_PAGE_ACCESS_END(page);
+				if (!added) {
+					// the run is full: the next one starts with this page
+					atEnd = false;
+					break;
+				}
+			}
+			position = page->cache_offset + 1;
+		}
+
+		if (run.PageCount() == 0)
+			break;
+
+		cache->Unlock();
+		run.Start(0);
+		if (pendingRun != NULL)
+			pendingRun->Finish();
+		cache->Lock();
+
+		pendingRun = &run;
+		nextRun ^= 1;
+	}
+
+	if (pendingRun != NULL) {
+		cache->Unlock();
+		pendingRun->Finish();
+		cache->Lock();
+	}
+
+	delete[] runs;
 	return B_OK;
 }
 

@@ -490,6 +490,15 @@ struct nvme_ctrlr {
 	 */
 	unsigned int			max_io_queues;
 
+#ifdef __HAIKU__
+	/*
+	 * Interrupt vectors the driver set up (nvme_ctrlr_set_io_vectors()):
+	 * vector 0 is the admin queue's, I/O queue pairs share the others.
+	 * 0 or 1 puts every completion queue on vector 0.
+	 */
+	unsigned int			io_vectors;
+#endif
+
 	/*
 	 * Number of I/O queue pairs enabled
 	 */
