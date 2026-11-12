@@ -16,7 +16,8 @@
  *    5 ms a frame when CPU and GPU overlap, 10 ms when submission is
  *    synchronous;
  *  - what allocating + binding + mapping, and freeing, a buffer costs.
- * VKPERF_UUID_ONLY=1 prints the device and its pipelineCacheUUID and stops.
+ * VKPERF_UUID_ONLY=1 prints the device and its pipelineCacheUUID and stops;
+ * VKPERF_ALLOC_ONLY=1 measures the allocation costs only.
  *
  * Build with the air/OS SDK (no Vulkan SDK needed, only Mesa's headers):
  *   . /data1/airos/sdk/x86_64/env.sh
@@ -90,6 +91,9 @@ static int find_type(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryProperty
 	return -1;
 }
 
+/* time of each step of make_buf()/free_buf(), for alloc_cost() */
+static bigtime_t stepAllocate, stepBind, stepMap, stepUnmap, stepFree;
+
 static int make_buf(struct buf *b, VkDeviceSize size, int type)
 {
 	VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -106,25 +110,35 @@ static int make_buf(struct buf *b, VkDeviceSize size, int type)
 	VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
 	ai.allocationSize = req.size;
 	ai.memoryTypeIndex = type;
+	bigtime_t t0 = system_time();
 	VkResult r = vkAllocateMemory(dev, &ai, NULL, &b->memory);
+	bigtime_t t1 = system_time();
+	stepAllocate += t1 - t0;
 	if (r != VK_SUCCESS) {
 		vkDestroyBuffer(dev, b->buffer, NULL);
 		return -1;
 	}
 	CHECK(vkBindBufferMemory(dev, b->buffer, b->memory, 0));
+	bigtime_t t2 = system_time();
+	stepBind += t2 - t1;
 	b->map = NULL;
 	if (memProps.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
 		CHECK(vkMapMemory(dev, b->memory, 0, VK_WHOLE_SIZE, 0, &b->map));
+	stepMap += system_time() - t2;
 	b->size = size;
 	return 0;
 }
 
 static void free_buf(struct buf *b)
 {
+	bigtime_t t0 = system_time();
 	if (b->map)
 		vkUnmapMemory(dev, b->memory);
+	bigtime_t t1 = system_time();
+	stepUnmap += t1 - t0;
 	vkDestroyBuffer(dev, b->buffer, NULL);
 	vkFreeMemory(dev, b->memory, NULL);
+	stepFree += system_time() - t1;
 }
 
 static void begin(void)
@@ -217,27 +231,60 @@ static void cpu_rw(struct buf *b, const char *what)
 	free(tmp);
 }
 
-static void alloc_cost(int type, VkDeviceSize size, int count, const char *what)
+/*	Makes \a count buffers and then frees them all; with \a touch, the CPU
+	writes every page of each right after mapping it (that time is counted
+	with the allocation); with \a oneByOne, each is freed before the next is
+	made. */
+static void alloc_cost_etc(int type, VkDeviceSize size, int count, const char *what,
+	int touch, int oneByOne)
 {
 	struct buf *bufs = calloc(count, sizeof(*bufs));
-	bigtime_t t0 = system_time();
+	bigtime_t madeTime = 0, freedTime = 0, touched = 0;
 	int made = 0;
+	stepAllocate = stepBind = stepMap = stepUnmap = stepFree = 0;
 	for (int i = 0; i < count; i++) {
+		bigtime_t t0 = system_time();
 		if (make_buf(&bufs[i], size, type) != 0)
 			break;
+		if (touch && bufs[i].map != NULL) {
+			bigtime_t t1 = system_time();
+			for (VkDeviceSize offset = 0; offset < size; offset += 4096)
+				((volatile char *)bufs[i].map)[offset] = 1;
+			touched += system_time() - t1;
+		}
+		madeTime += system_time() - t0;
 		made++;
+		if (oneByOne) {
+			t0 = system_time();
+			free_buf(&bufs[i]);
+			freedTime += system_time() - t0;
+		}
 	}
-	bigtime_t t1 = system_time();
-	for (int i = 0; i < made; i++)
-		free_buf(&bufs[i]);
-	bigtime_t t2 = system_time();
+	if (!oneByOne) {
+		bigtime_t t0 = system_time();
+		for (int i = 0; i < made; i++)
+			free_buf(&bufs[i]);
+		freedTime = system_time() - t0;
+	}
 	if (made == 0) {
 		printf("  allocate %-34s failed\n", what);
 	} else {
-		printf("  allocate+bind+map %-25s %7.1f us each, free %7.1f us each (%d)\n", what,
-			(double)(t1 - t0) / made, (double)(t2 - t1) / made, made);
+		printf("  allocate+bind+map%s %-*s %7.1f us each, free %7.1f us each (%d%s)\n",
+			touch ? "+touch" : "", touch ? 19 : 25, what, (double)madeTime / made,
+			(double)freedTime / made, made, oneByOne ? ", one at a time" : "");
+		printf("      allocate %.1f, bind %.1f, map %.1f", (double)stepAllocate / made,
+			(double)stepBind / made, (double)stepMap / made);
+		if (touch)
+			printf(", touch %.1f", (double)touched / made);
+		printf("; unmap %.1f, free %.1f us\n", (double)stepUnmap / made,
+			(double)stepFree / made);
 	}
 	free(bufs);
+}
+
+static void alloc_cost(int type, VkDeviceSize size, int count, const char *what)
+{
+	alloc_cost_etc(type, size, count, what, 0, 0);
 }
 
 int main(int argc, char **argv)
@@ -349,6 +396,9 @@ int main(int argc, char **argv)
 		| VK_MEMORY_PROPERTY_HOST_CACHED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 	printf("types used: device-local %d, device-local+host-visible %d, host %d, host cached %d\n",
 		local, localVisible, host, hostCached);
+
+	if (getenv("VKPERF_ALLOC_ONLY") != NULL)
+		goto allocation_cost;
 
 	const VkDeviceSize size = 64ull << 20;
 	struct buf bl = {0}, blv = {0}, bh = {0}, bhc = {0};
@@ -471,18 +521,23 @@ int main(int argc, char **argv)
 			(thread_cpu() - cpu0) / 1000.0 / frames);
 	}
 
+	if (haveL) free_buf(&bl);
+	if (haveLV) free_buf(&blv);
+	if (haveH) free_buf(&bh);
+	if (haveHC) free_buf(&bhc);
+	CHECK(vkQueueWaitIdle(queue));
+
+allocation_cost:
 	printf("\nallocation cost\n");
 	if (host >= 0) alloc_cost(host, 64 << 10, 200, "64 KiB host-visible");
 	if (host >= 0) alloc_cost(host, 1 << 20, 100, "1 MiB host-visible");
 	if (local >= 0) alloc_cost(local, 64 << 10, 200, "64 KiB device-local");
 	if (local >= 0) alloc_cost(local, 4 << 20, 100, "4 MiB device-local");
 	if (localVisible >= 0) alloc_cost(localVisible, 1 << 20, 50, "1 MiB dl+hv");
+	if (host >= 0) alloc_cost_etc(host, 1 << 20, 100, "1 MiB host-visible", 1, 0);
+	if (host >= 0) alloc_cost_etc(host, 1 << 20, 100, "1 MiB host-visible", 0, 1);
+	if (host >= 0) alloc_cost_etc(host, 8 << 20, 20, "8 MiB host-visible", 1, 1);
 
-	if (haveL) free_buf(&bl);
-	if (haveLV) free_buf(&blv);
-	if (haveH) free_buf(&bh);
-	if (haveHC) free_buf(&bhc);
-	CHECK(vkQueueWaitIdle(queue));
 	printf("\ndone\n");
 	return 0;
 }

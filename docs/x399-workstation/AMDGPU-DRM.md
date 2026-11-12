@@ -313,7 +313,14 @@ In `src/forks/linux-drm/haiku/tests`, built on the workstation:
 - `drmparam NAME VALUE`: a module parameter of the running driver
   (`DRM_HAIKU_IOCTL_SET_PARAM`); `drmparam debug 0x16` around a refused
   mode set logs amdgpu_dm's reason (and fills the syslog quickly),
-  `drmparam debug 0` stops it
+  `drmparam debug 0` stops it; `drmparam haiku_mm_report 1` logs kernel
+  memory and the page pool once
+- `amdgpu_bo_bench [-s KiB] [-d vram|vramonly|gtt] [-c] [-l] [-v] [-m] [-T]
+  [-k keep] [-t threads] [-p]`: what creating, mapping (`-v` in the GPU's
+  VM, `-m` for the CPU), touching (`-T`) and freeing a buffer costs; `-c`
+  and `-l` ask for RADV's VRAM_CLEARED and VM_ALWAYS_VALID. Builds on the
+  machine with gcc against libdrm_amdgpu, no headers needed. `vkperf`
+  (`VKPERF_ALLOC_ONLY=1`) gives the same through RADV
 - `vaprobe`, `vadecode`: VA-API profiles; per-picture MD5s to compare with
   `ffmpeg -f framemd5` (media and MD5s in `tests/media` on the workstation)
 - `vabench`, `amdgpu_alloc_bench`, `amdgpu_map_bench`: where readback time goes
@@ -359,6 +366,20 @@ add-on print its per-picture costs.
   for the buffer's reservation, which TTM holds while it unmaps, so it runs
   with the cache unlocked and a generation number says whether the buffer
   moved meanwhile.
+- **Haiku has no buddy allocator.** TTM asks for a buffer's pages as 2 MiB
+  runs first, then smaller orders down to single pages; Haiku's run
+  allocator searches its page array with the free page queues locked, so
+  those requests are refused (airos-works/haiku#36), and through Haiku a
+  buffer cost ~0.25 us a page to create and again to free. The compat layer
+  keeps freed allocations of every order up to 2 MiB in a pool instead,
+  zeroed by a worker and stocked with 2 MiB runs it finds without a lock and
+  allocates as an exact window; smaller orders are split off them. It holds
+  a 32nd of RAM at most (256 MiB), gives everything back after 10 s unused
+  or when memory gets scarce; `drmparam haiku_page_pool_mb 0` turns it off.
+  CPU mappings (`DRM_HAIKU_IOCTL_MAP`) map 16 pages up front and the rest on
+  first touch, ~0.27 us a page for Haiku's page table query and entry;
+  `drmparam haiku_map_prefault -1` maps whole buffers again
+  (airos-works/haiku#110).
 - Mesa made a new staging buffer for every `vaGetImage()`, and FFmpeg a new
   image for every picture: on this kernel the allocations cost more than the
   copies (1080p HEVC Main 10 33 -> 9.6 ms a picture once both were kept).
