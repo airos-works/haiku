@@ -1,0 +1,1140 @@
+From 9b0bc4a551d1903b24471f18e7e0b5e6e362289a Mon Sep 17 00:00:00 2001
+From: Justin Gasper <jmgasper@gmail.com>
+Date: Thu, 12 Nov 2026 17:23:55 +1100
+Subject: [PATCH] zink/hgl: present at any desktop scale, and a cheaper bitmap
+ path (haiku#109)
+
+On a desktop drawn at 200 % a direct window was never connected: app_server
+leaves a direct window alone at a scale other than 100 % unless it asked for
+B_DIRECT_DEVICE_PIXELS, and nothing asked. Every frame then went through the
+window system's bitmap, which app_server enlarged on the processor: about
+5.3 ms of app_server per 1600x900 frame, ~95 fps for a program that was
+nearly idle.
+
+- The renderer asks for B_DIRECT_DEVICE_PIXELS on a BDirectWindow when it is
+  attached (HGL_NO_DEVICE_PIXELS=1 opts out). The window system then speaks in
+  frame buffer pixels. BGLView cuts its announcement down to the view with
+  frame buffer and view pixels mixed up, so the renderer reads the original
+  (BGLView::fClipInfo, reached through an explicit instantiation) and places
+  the view itself, rounding as DirectWindowInfo does.
+- zink enlarges the frame on the GPU into an image of the size the view
+  covers (nearest for whole scales, linear otherwise), and copies the visible
+  rectangles into the frame buffer from there. The enlarged image is kept for
+  putting the last frame back.
+- The window system is told that its copy of those rectangles is out of date
+  (BDirectWindow::MarkDrawingBitsStale), at most once a display frame or when
+  the visible parts change, never waiting for the window lock, so moves and
+  screen reads take the pixels from the frame buffer.
+- Putting the last frame back when an idle window is uncovered never
+  happened: the wait after a move refused it, and a success would have kept
+  the placement lock. It now skips that wait, releases the lock, and runs
+  once more 50 ms later from a helper thread, after app_server's own repaint
+  of the exposed area has reached the screen.
+
+Bitmap path (ordinary windows):
+- Each display target has a page-aligned area of its own (BBitmap on a client
+  area). app_server's allocator packed a window's two bitmaps back to back, so
+  unless a frame was a whole number of pages every other one failed the host
+  import's alignment and was read back and copied by the processor.
+- Display targets are destroyed with their resources (they leaked before),
+  after letting go of the GPU's import of their memory, and freed two resizes
+  later in case a window thread is still drawing the old one.
+- DrawBitmapAsync + Flush, waiting only before handing over the next bitmap,
+  so app_server draws one frame while the program renders the next.
+- The screen and colour space are asked once a second instead of in every
+  LockGL and SwapBuffers.
+
+X399, GTX 1070, 3840x2160 at 200 %, gltest mode 2:
+  direct 1600x900   95 -> 520 fps, drawing thread 1.25 -> 0.44 ms/frame,
+                    app_server 5.3 ms -> ~0.03 ms per frame
+  direct 800x600   260 -> (not limited by presenting)
+  ordinary 1600x900 98 -> 134, 800x600 271 -> 382, 1920x1080 76 -> 119 fps
+GLTeapot (view under a menu bar) at the right place; move, resize, hide and
+idle-uncover runs clean; no app_server area growth over a resize soak.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/zink/zink_resource.c      |  11 +
+ src/gallium/drivers/zink/zink_screen.c        | 237 +++++++++++-
+ src/gallium/drivers/zink/zink_screen.h        |  18 +
+ .../targets/haiku-zink/ZinkRenderer.cpp       | 360 ++++++++++++++++--
+ src/gallium/targets/haiku-zink/ZinkRenderer.h |  42 ++
+ src/gallium/targets/haiku-zink/meson.build    |   2 +-
+ src/gallium/winsys/sw/hgl/hgl_sw_winsys.cpp   |  78 +++-
+ src/gallium/winsys/sw/hgl/hgl_sw_winsys.h     |   8 +
+ 8 files changed, 704 insertions(+), 52 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/zink_resource.c b/src/gallium/drivers/zink/zink_resource.c
+index 90020965..ae272c5b 100644
+--- a/src/gallium/drivers/zink/zink_resource.c
++++ b/src/gallium/drivers/zink/zink_resource.c
+@@ -132,6 +132,17 @@ zink_resource_destroy(struct pipe_screen *pscreen,
+ 
+    zink_resource_object_reference(screen, &res->obj, NULL);
+    zink_resource_object_reference(screen, &res->scanout_obj, NULL);
++   if (res->dt != NULL && screen->winsys != NULL) {
++      /* A frame may have been copied into it by the GPU, which then holds the
++       * memory; that has to end before the memory does. */
++      void *map = screen->winsys->displaytarget_map(screen->winsys, res->dt, 0);
++      if (map != NULL) {
++         zink_screen_forget_present_import(screen, map);
++         screen->winsys->displaytarget_unmap(screen->winsys, res->dt);
++      }
++      screen->winsys->displaytarget_destroy(screen->winsys, res->dt);
++      res->dt = NULL;
++   }
+    threaded_resource_deinit(pres);
+    FREE_CL(res);
+ }
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index 7fca2283..383cf16b 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -1225,6 +1225,12 @@ zink_destroy_screen(struct pipe_screen *pscreen)
+       screen->scanout.buffer = VK_NULL_HANDLE;
+       screen->scanout.memory = VK_NULL_HANDLE;
+    }
++   if (screen->scanout.scaled_image != VK_NULL_HANDLE) {
++      VKSCR(DestroyImage)(screen->dev, screen->scanout.scaled_image, NULL);
++      VKSCR(FreeMemory)(screen->dev, screen->scanout.scaled_memory, NULL);
++      screen->scanout.scaled_image = VK_NULL_HANDLE;
++      screen->scanout.scaled_memory = VK_NULL_HANDLE;
++   }
+ #endif
+    for (unsigned i = 0; i < ARRAY_SIZE(screen->present_imports); i++) {
+       if (screen->present_imports[i].buffer != VK_NULL_HANDLE) {
+@@ -1497,6 +1503,24 @@ present_into_host_memory(struct zink_screen *screen, struct zink_context *ctx,
+ }
+ 
+ 
++void
++zink_screen_forget_present_import(struct zink_screen *screen, void *map)
++{
++   /* Every copy into it was waited for when it was presented. */
++   for (unsigned i = 0; i < ARRAY_SIZE(screen->present_imports); i++) {
++      if (screen->present_imports[i].map != map ||
++          screen->present_imports[i].buffer == VK_NULL_HANDLE)
++         continue;
++      VKSCR(DestroyBuffer)(screen->dev, screen->present_imports[i].buffer, NULL);
++      VKSCR(FreeMemory)(screen->dev, screen->present_imports[i].memory, NULL);
++      screen->present_imports[i].buffer = VK_NULL_HANDLE;
++      screen->present_imports[i].memory = VK_NULL_HANDLE;
++      screen->present_imports[i].map = NULL;
++      screen->present_imports[i].size = 0;
++   }
++}
++
++
+ #ifdef __HAIKU__
+ static bool acquire_scanout_locked(struct zink_screen *screen,
+                                    const struct hgl_scanout_target *target);
+@@ -1625,17 +1649,16 @@ acquire_scanout_locked(struct zink_screen *screen,
+ }
+ 
+ // Turn the rectangles the window can be seen through into copies from the
+-// frame into the screen, in screen coordinates and clipped to both.
++// frame into the screen, in screen coordinates and clipped to both. The source
++// is width x height texels: the frame itself, or the frame enlarged to the
++// size it covers on the screen.
+ static unsigned
+-scanout_regions(struct zink_screen *screen, struct zink_resource *res,
+-                struct pipe_resource *pres, unsigned level, unsigned layer,
++scanout_regions(struct zink_screen *screen, VkImageAspectFlags aspect,
++                unsigned blocksize, unsigned width, unsigned height,
++                unsigned level, unsigned layer,
+                 const struct hgl_scanout_target *target,
+                 VkBufferImageCopy *regions)
+ {
+-   const unsigned blocksize = util_format_get_blocksize(pres->format);
+-   const unsigned width = u_minify(pres->width0, level);
+-   const unsigned height = u_minify(pres->height0, level);
+-
+    unsigned count = 0;
+    for (uint32_t i = 0; i < target->num_clips; i++) {
+       /* The clip list is in screen coordinates and includes both edges. */
+@@ -1664,7 +1687,7 @@ scanout_regions(struct zink_screen *screen, struct zink_resource *res,
+          .bufferRowLength = screen->scanout.row_pitch / blocksize,
+          .bufferImageHeight = bottom - top,
+          .imageSubresource = {
+-            .aspectMask = res->aspect,
++            .aspectMask = aspect,
+             .mipLevel = level,
+             .baseArrayLayer = layer,
+             .layerCount = 1,
+@@ -1680,6 +1703,116 @@ scanout_regions(struct zink_screen *screen, struct zink_resource *res,
+    return count;
+ }
+ 
++/* Whether the frame has to be enlarged to the size it covers on the screen. */
++static bool
++target_scales(const struct hgl_scanout_target *target, unsigned width,
++              unsigned height)
++{
++   return target->dest_width != 0 && target->dest_height != 0 &&
++          (target->dest_width != width || target->dest_height != height);
++}
++
++/* An image in video memory of the size the window covers on the screen, for
++ * the enlarged frame; kept from frame to frame, replaced when the size
++ * changes.
++ */
++static bool
++acquire_scaled_image(struct zink_screen *screen, VkFormat format,
++                     uint32_t width, uint32_t height)
++{
++   if (screen->scanout.scaled_image != VK_NULL_HANDLE &&
++       screen->scanout.scaled_width == width &&
++       screen->scanout.scaled_height == height &&
++       screen->scanout.scaled_format == format)
++      return true;
++
++   /* Nothing still uses the old one: every present waits for its copies. */
++   simple_mtx_lock(&screen->scanout.represent_lock);
++   if (screen->scanout.scaled_image != VK_NULL_HANDLE) {
++      VKSCR(DestroyImage)(screen->dev, screen->scanout.scaled_image, NULL);
++      VKSCR(FreeMemory)(screen->dev, screen->scanout.scaled_memory, NULL);
++      screen->scanout.scaled_image = VK_NULL_HANDLE;
++      screen->scanout.scaled_memory = VK_NULL_HANDLE;
++      screen->scanout.scaled_width = 0;
++      screen->scanout.scaled_height = 0;
++   }
++   screen->scanout.last_scaled = false;
++   simple_mtx_unlock(&screen->scanout.represent_lock);
++
++   VkImageCreateInfo ici = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = format,
++      .extent = { width, height, 1 },
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++   };
++   VkImage image;
++   if (VKSCR(CreateImage)(screen->dev, &ici, NULL, &image) != VK_SUCCESS)
++      return false;
++
++   VkMemoryRequirements reqs;
++   VKSCR(GetImageMemoryRequirements)(screen->dev, image, &reqs);
++   uint32_t type = UINT32_MAX;
++   for (uint32_t i = 0; i < screen->info.mem_props.memoryTypeCount; i++) {
++      if ((reqs.memoryTypeBits & (1u << i)) &&
++          (screen->info.mem_props.memoryTypes[i].propertyFlags &
++           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
++         type = i;
++         break;
++      }
++   }
++   VkDeviceMemory memory = VK_NULL_HANDLE;
++   VkMemoryAllocateInfo mai = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = reqs.size,
++      .memoryTypeIndex = type,
++   };
++   if (type == UINT32_MAX ||
++       VKSCR(AllocateMemory)(screen->dev, &mai, NULL, &memory) != VK_SUCCESS ||
++       VKSCR(BindImageMemory)(screen->dev, image, memory, 0) != VK_SUCCESS) {
++      if (memory != VK_NULL_HANDLE)
++         VKSCR(FreeMemory)(screen->dev, memory, NULL);
++      VKSCR(DestroyImage)(screen->dev, image, NULL);
++      return false;
++   }
++
++   screen->scanout.scaled_image = image;
++   screen->scanout.scaled_memory = memory;
++   screen->scanout.scaled_format = format;
++   screen->scanout.scaled_layout = VK_IMAGE_LAYOUT_UNDEFINED;
++   screen->scanout.scaled_width = width;
++   screen->scanout.scaled_height = height;
++   return true;
++}
++
++static void
++scaled_image_barrier(struct zink_screen *screen, VkCommandBuffer cmdbuf,
++                     VkImageLayout layout, VkAccessFlags src_access,
++                     VkAccessFlags dst_access)
++{
++   VkImageMemoryBarrier barrier = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++      .srcAccessMask = src_access,
++      .dstAccessMask = dst_access,
++      .oldLayout = screen->scanout.scaled_layout,
++      .newLayout = layout,
++      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .image = screen->scanout.scaled_image,
++      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
++   };
++   VKSCR(CmdPipelineBarrier)(cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
++                             NULL, 1, &barrier);
++   screen->scanout.scaled_layout = layout;
++}
++
+ // Put the frame on the screen where the window is, copying only the parts of
+ // it the window system says are visible.
+ static bool
+@@ -1698,9 +1831,20 @@ present_into_scanout(struct zink_screen *screen, struct zink_context *ctx,
+    if (!acquire_scanout(screen, target))
+       return false;
+ 
++   const unsigned width = u_minify(pres->width0, level);
++   const unsigned height = u_minify(pres->height0, level);
++   const bool scale = target_scales(target, width, height);
++   if (scale && !acquire_scaled_image(screen, res->format, target->dest_width,
++                                      target->dest_height))
++      return false;
++
+    VkBufferImageCopy regions[HGL_MAX_SCANOUT_CLIPS];
+-   const unsigned count = scanout_regions(screen, res, pres, level, layer,
+-                                          target, regions);
++   const unsigned count = scale
++      ? scanout_regions(screen, VK_IMAGE_ASPECT_COLOR_BIT, blocksize,
++                        target->dest_width, target->dest_height, 0, 0, target,
++                        regions)
++      : scanout_regions(screen, res->aspect, blocksize, width, height, level,
++                        layer, target, regions);
+    if (count == 0)
+       return false;
+ 
+@@ -1709,9 +1853,42 @@ present_into_scanout(struct zink_screen *screen, struct zink_context *ctx,
+    zink_resource_image_barrier(ctx, res, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                VK_ACCESS_TRANSFER_READ_BIT,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT);
+-   VKCTX(CmdCopyImageToBuffer)(batch->state->cmdbuf, res->obj->image,
+-                               res->layout, screen->scanout.buffer,
+-                               count, regions);
++   if (scale) {
++      /* On a desktop drawn at 200 % a window covers twice the frame's width
++       * and height on the screen. The GPU enlarges the frame - as the window
++       * system would have done on the processor - and the visible parts go
++       * into the screen from there. A whole scale doubles pixels; another one
++       * is filtered, so that lines stay even.
++       */
++      VkCommandBuffer cmdbuf = batch->state->cmdbuf;
++      scaled_image_barrier(screen, cmdbuf,
++                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                           VK_ACCESS_TRANSFER_READ_BIT,
++                           VK_ACCESS_TRANSFER_WRITE_BIT);
++      VkImageBlit blit = {
++         .srcSubresource = { res->aspect, level, layer, 1 },
++         .srcOffsets = { { 0, 0, 0 }, { width, height, 1 } },
++         .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++         .dstOffsets = { { 0, 0, 0 },
++                         { target->dest_width, target->dest_height, 1 } },
++      };
++      VKCTX(CmdBlitImage)(cmdbuf, res->obj->image, res->layout,
++                          screen->scanout.scaled_image,
++                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
++                          target->filter ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
++      scaled_image_barrier(screen, cmdbuf,
++                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                           VK_ACCESS_TRANSFER_WRITE_BIT,
++                           VK_ACCESS_TRANSFER_READ_BIT);
++      VKCTX(CmdCopyImageToBuffer)(cmdbuf, screen->scanout.scaled_image,
++                                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                                  screen->scanout.buffer, count, regions);
++   } else {
++      VKCTX(CmdCopyImageToBuffer)(batch->state->cmdbuf, res->obj->image,
++                                  res->layout, screen->scanout.buffer,
++                                  count, regions);
++   }
++   screen->scanout.last_scaled = scale;
+ 
+    /* Wait for it to have happened, not merely to have been sent.
+     *
+@@ -1773,15 +1950,33 @@ zink_represent_into_scanout(struct pipe_screen *pscreen,
+           < ZINK_SCANOUT_IDLE_NS)
+       RETURN_WHY("still drawing");
+ 
+-   /* The application left the image where the present put it; if anything has
+-    * moved it since, its context owns the image and we stay away.
++   /* The last frame, enlarged, is still in the scaled image when it went that
++    * way; otherwise the application left the image where the present put it,
++    * and if anything has moved it since, its context owns the image and we
++    * stay away.
+     */
+-   if (res->layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+-      RETURN_WHY("the image has moved");
+-
++   const unsigned blocksize = util_format_get_blocksize(pres->format);
++   const bool scale = target_scales(&target, pres->width0, pres->height0);
++   VkImage source = res->obj->image;
+    VkBufferImageCopy regions[HGL_MAX_SCANOUT_CLIPS];
+-   const unsigned count = scanout_regions(screen, res, pres, 0, 0, &target,
+-                                          regions);
++   unsigned count;
++   if (scale) {
++      if (!screen->scanout.last_scaled ||
++          screen->scanout.scaled_image == VK_NULL_HANDLE ||
++          screen->scanout.scaled_width != target.dest_width ||
++          screen->scanout.scaled_height != target.dest_height ||
++          screen->scanout.scaled_layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
++         RETURN_WHY("no enlarged frame of this size");
++      source = screen->scanout.scaled_image;
++      count = scanout_regions(screen, VK_IMAGE_ASPECT_COLOR_BIT, blocksize,
++                              target.dest_width, target.dest_height, 0, 0,
++                              &target, regions);
++   } else {
++      if (res->layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
++         RETURN_WHY("the image has moved");
++      count = scanout_regions(screen, res->aspect, blocksize, pres->width0,
++                              pres->height0, 0, 0, &target, regions);
++   }
+    if (count == 0)
+       RETURN_WHY("nothing visible");
+ 
+@@ -1818,7 +2013,7 @@ zink_represent_into_scanout(struct pipe_screen *pscreen,
+    VKSCR(ResetCommandBuffer)(screen->scanout.cmdbuf, 0);
+    if (VKSCR(BeginCommandBuffer)(screen->scanout.cmdbuf, &cbbi) != VK_SUCCESS)
+       goto out;
+-   VKSCR(CmdCopyImageToBuffer)(screen->scanout.cmdbuf, res->obj->image,
++   VKSCR(CmdCopyImageToBuffer)(screen->scanout.cmdbuf, source,
+                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                screen->scanout.buffer, count, regions);
+    if (VKSCR(EndCommandBuffer)(screen->scanout.cmdbuf) != VK_SUCCESS)
+diff --git a/src/gallium/drivers/zink/zink_screen.h b/src/gallium/drivers/zink/zink_screen.h
+index 796f4c1d..8824a91d 100644
+--- a/src/gallium/drivers/zink/zink_screen.h
++++ b/src/gallium/drivers/zink/zink_screen.h
+@@ -212,9 +212,27 @@ struct zink_screen {
+       VkCommandBuffer cmdbuf;
+       VkFence fence;
+       int64_t last_present_ns;
++
++      /* A window on a desktop drawn at a higher density covers more of the
++       * frame buffer than its frame has pixels: the frame is enlarged into
++       * this image by the GPU first, and the visible parts copied from here.
++       * It still holds the last such frame for putting it back.
++       */
++      VkImage scaled_image;
++      VkDeviceMemory scaled_memory;
++      VkFormat scaled_format;
++      VkImageLayout scaled_layout;
++      uint32_t scaled_width;
++      uint32_t scaled_height;
++      bool last_scaled;   /* whether the last present went through it */
+    } scanout;
+ };
+ 
++/* The memory the window system gave us for a frame is going away: let go of
++ * the GPU's hold on it first. */
++void
++zink_screen_forget_present_import(struct zink_screen *screen, void *map);
++
+ 
+ /* update last_finished to account for batch_id wrapping */
+ static inline void
+diff --git a/src/gallium/targets/haiku-zink/ZinkRenderer.cpp b/src/gallium/targets/haiku-zink/ZinkRenderer.cpp
+index 2e6b435d..7f6ce405 100644
+--- a/src/gallium/targets/haiku-zink/ZinkRenderer.cpp
++++ b/src/gallium/targets/haiku-zink/ZinkRenderer.cpp
+@@ -16,8 +16,12 @@
+ #include <interface/DirectWindowPrivate.h>
+ #include <interface/ColorConversion.h>
+ #include <GraphicsDefs.h>
++#include <GLView.h>
+ #include <Screen.h>
++#include <Window.h>
++#include <math.h>
+ #include <stdio.h>
++#include <string.h>
+ #include <sys/time.h>
+ #include <new>
+ 
+@@ -35,6 +39,50 @@
+ extern const char* color_space_name(color_space space);
+ 
+ 
++// BGLView keeps what the window system last said about a direct window, and
++// hands the renderer a copy cut down to the view. On a desktop drawn at a
++// higher density, with B_DIRECT_DEVICE_PIXELS, the window system speaks in
++// frame buffer pixels while the view's frame is in its own, and the cut is
++// made with the two mixed up: a quarter of the view at 200 %, in the wrong
++// place. The renderer reads the original instead, from BGLView's
++// glview_direct_info (GLView.cpp of the same Mesa), and cuts it itself.
++//
++// The member is private; explicit instantiation of a template is allowed to
++// name it, which is how its offset is had without a copy of the layout.
++struct glview_direct_info;
++
++namespace {
++
++struct GLViewDirectInfo {
++	direct_buffer_info* direct_info;
++	bool direct_connected;
++	bool enable_direct_mode;
++};
++
++template<typename Tag, typename Tag::type Member>
++struct PrivateMember {
++	friend typename Tag::type Get(Tag) { return Member; }
++};
++
++struct GLViewClipInfo {
++	typedef glview_direct_info* BGLView::* type;
++	friend type Get(GLViewClipInfo);
++};
++
++template struct PrivateMember<GLViewClipInfo, &BGLView::fClipInfo>;
++
++}	// namespace
++
++
++static direct_buffer_info*
++window_system_info(BGLView* view)
++{
++	const GLViewDirectInfo* info
++		= (const GLViewDirectInfo*)(view->*Get(GLViewClipInfo()));
++	return info != NULL ? info->direct_info : NULL;
++}
++
++
+ extern "C" _EXPORT BGLRenderer*
+ instantiate_gl_renderer(BGLView *view, ulong opts)
+ {
+@@ -149,6 +197,7 @@ ZinkRenderer::ZinkRenderer(BGLView *view, ulong options)
+ 		difftime(end, beg));
+ 
+ 	BRect b = view->Bounds();
++	fScreenID = B_MAIN_SCREEN_ID;
+ 	fColorSpace = BScreen(view->Window()).ColorSpace();
+ 	TRACE("%s: Colorspace:\t%s\n", __func__, color_space_name(fColorSpace));
+ 
+@@ -176,28 +225,93 @@ ZinkRenderer::~ZinkRenderer()
+ {
+ 	CALLED();
+ 
++	if (fRepresentWorker >= 0) {
++		atomic_set(&fRepresentQuit, 1);
++		release_sem(fRepresentSem);
++		status_t result;
++		wait_for_thread(fRepresentWorker, &result);
++	}
++	if (fRepresentSem >= 0)
++		delete_sem(fRepresentSem);
++
+ 	if (fContextObj)
+ 		delete fContextObj;
+ }
+ 
+ 
++// Putting the last frame back right when the window system says the window was
++// uncovered is not enough: the window system then repaints what it exposed
++// itself (the view's colour) and copies that to the screen at the next blank,
++// over the frame. So it is done once more a little later, from this thread, by
++// which time that copy has happened.
++static const bigtime_t kRepresentAgainAfter = 50000;
++
++// Set on a thread while it puts the last frame back (ScanoutTarget then skips
++// the wait after a move).
++static __thread bool sRepresenting;
++
++
++/*static*/ status_t
++ZinkRenderer::_RepresentWorker(void* data)
++{
++	ZinkRenderer* self = (ZinkRenderer*)data;
++	while (acquire_sem(self->fRepresentSem) == B_OK) {
++		if (atomic_get(&self->fRepresentQuit) != 0)
++			break;
++		bigtime_t at;
++		while ((at = atomic_get64(&self->fRepresentAt)) > system_time())
++			snooze_until(at, B_SYSTEM_TIMEBASE);
++		atomic_set(&self->fRepresentPending, 0);
++		if (atomic_get(&self->fRepresentQuit) != 0)
++			break;
++		self->_Represent();
++	}
++	return B_OK;
++}
++
++
++// Puts the last frame back into the screen, when it went there and the
++// application has stopped drawing (zink_represent_into_scanout decides that).
++void
++ZinkRenderer::_Represent()
++{
++	if (!fPresentedIntoScanout)
++		return;
++	sRepresenting = true;
++	fContextObj->Draw(fContextID, BRect());
++	sRepresenting = false;
++	// The present back went through ScanoutTarget, which holds the placement
++	// until told what happened.
++	if (fScanoutTargetHeld && fInfoLocker.LockingThread() == find_thread(NULL)) {
++		const bool markStale = fDevicePixels && fInfo != NULL
++			&& fInfo->drawing_bits_area >= 0;
++		fPresentedClipsChanged = true;
++		ReleaseScanoutTarget();
++		if (markStale)
++			_MarkStale();
++	}
++}
++
++
+ void
+ ZinkRenderer::LockGL()
+ {
+ //	CALLED();
+ 	BGLRenderer::LockGL();
+ 
+-	color_space cs = BScreen(GLView()->Window()).ColorSpace();
++	_UpdateScreen();
+ 
+ 	{
+ 		BAutolock lock(fInfoLocker);
+-		if (fDirectModeEnabled && fInfo != NULL) {
++		// A direct window cut down to the view by BGLView has the view's
++		// size; one in frame buffer pixels has its size on the screen, and
++		// the frame keeps the view's (FrameResized).
++		if (fDirectModeEnabled && fInfo != NULL && !fDevicePixels) {
+ 			fWidth = fInfo->window_bounds.right - fInfo->window_bounds.left;
+ 			fHeight = fInfo->window_bounds.bottom - fInfo->window_bounds.top;
+ 		}
+ 
+ 		fContextObj->Validate(fWidth, fHeight);
+-		fColorSpace = cs;
+ 	}
+ 
+ 	// do not hold fInfoLocker here to avoid deadlock
+@@ -217,6 +331,25 @@ ZinkRenderer::UnlockGL()
+ }
+ 
+ 
++// Which screen the window is on and how it is set up, asked of the window
++// system once a second rather than twice a frame: both were synchronous round
++// trips, in LockGL and SwapBuffers.
++void
++ZinkRenderer::_UpdateScreen()
++{
++	const bigtime_t now = system_time();
++	if (fScreenChecked != 0 && now - fScreenChecked < 1000000)
++		return;
++	fScreenChecked = now;
++
++	BScreen screen(GLView()->Window());
++	if (!screen.IsValid())
++		return;
++	fScreenID = screen.ID();
++	fColorSpace = screen.ColorSpace();
++}
++
++
+ // Where the window is on the screen, so that the renderer can put the frame
+ // there itself. Haiku hands us this in direct mode and keeps it up to date as
+ // the window moves and is covered.
+@@ -273,21 +406,83 @@ ZinkRenderer::ScanoutTarget(struct hgl_scanout_target *target)
+ 	// bitmap instead is slower and has no such trouble, so that is what a
+ 	// moving window gets. Only while it is moving - a window is still almost
+ 	// all of the time.
+-	if (system_time() - fLastPlacementChange < kSettleAfterMove)
++	//
++	// Putting the last frame back after the window system said something
++	// (DirectConnected) is not that: the window system waits for it, and it
++	// happens once.
++	if (!sRepresenting
++		&& system_time() - fLastPlacementChange < kSettleAfterMove)
+ 		return false;
+ 
+-	failed.ok = true;
+-	target->origin_x = fInfo->window_bounds.left;
+-	target->origin_y = fInfo->window_bounds.top;
+ 	target->bits = fInfo->bits;
+ 	target->bytes_per_row = fInfo->bytes_per_row;
+-	target->num_clips = fInfo->clip_list_count;
+-	for (uint32 i = 0; i < fInfo->clip_list_count; i++) {
+-		target->clips[i].left = fInfo->clip_list[i].left;
+-		target->clips[i].top = fInfo->clip_list[i].top;
+-		target->clips[i].right = fInfo->clip_list[i].right;
+-		target->clips[i].bottom = fInfo->clip_list[i].bottom;
++	target->dest_width = 0;
++	target->dest_height = 0;
++	target->filter = false;
++
++	if (!fDevicePixels) {
++		target->origin_x = fInfo->window_bounds.left;
++		target->origin_y = fInfo->window_bounds.top;
++		target->num_clips = fInfo->clip_list_count;
++		for (uint32 i = 0; i < fInfo->clip_list_count; i++) {
++			target->clips[i].left = fInfo->clip_list[i].left;
++			target->clips[i].top = fInfo->clip_list[i].top;
++			target->clips[i].right = fInfo->clip_list[i].right;
++			target->clips[i].bottom = fInfo->clip_list[i].bottom;
++		}
++	} else {
++		// The window system's own words, in frame buffer pixels: the view
++		// covers this much of the screen, the way the window system
++		// enlarges anything drawn in the window (DirectWindowInfo.cpp).
++		const float scale = fInfo->device_scale > 100
++			? fInfo->device_scale / 100.0f : 1.0f;
++		const int32 left = fInfo->window_bounds.left
++			+ (int32)floorf(fViewFrame.left * scale);
++		const int32 top = fInfo->window_bounds.top
++			+ (int32)floorf(fViewFrame.top * scale);
++		const int32 right = fInfo->window_bounds.left
++			+ (int32)floorf((fViewFrame.right + 1) * scale) - 1;
++		const int32 bottom = fInfo->window_bounds.top
++			+ (int32)floorf((fViewFrame.bottom + 1) * scale) - 1;
++		if (right < left || bottom < top)
++			return false;
++		target->origin_x = left;
++		target->origin_y = top;
++		target->dest_width = right - left + 1;
++		target->dest_height = bottom - top + 1;
++		target->filter = (fInfo->device_scale % 100) != 0;
++
++		uint32 count = 0;
++		for (uint32 i = 0; i < fInfo->clip_list_count; i++) {
++			const clipping_rect& clip = fInfo->clip_list[i];
++			const int32 l = max_c(clip.left, left);
++			const int32 t = max_c(clip.top, top);
++			const int32 r = min_c(clip.right, right);
++			const int32 b = min_c(clip.bottom, bottom);
++			if (r < l || b < t)
++				continue;
++			if (count == HGL_MAX_SCANOUT_CLIPS)
++				return false;
++			target->clips[count].left = l;
++			target->clips[count].top = t;
++			target->clips[count].right = r;
++			target->clips[count].bottom = b;
++			count++;
++		}
++		if (count == 0)
++			return false;
++		target->num_clips = count;
++
++		// for the window system, once the frame is there
++		fPresentedClipsChanged = fPresentedClipsChanged
++			|| count != fPresentedClipCount
++			|| memcmp(fPresentedClips, target->clips,
++				sizeof(clipping_rect) * count) != 0;
++		memcpy(fPresentedClips, target->clips, sizeof(clipping_rect) * count);
++		fPresentedClipCount = count;
+ 	}
++
++	failed.ok = true;
+ 	return true;
+ }
+ 
+@@ -295,7 +490,8 @@ ZinkRenderer::ScanoutTarget(struct hgl_scanout_target *target)
+ void
+ ZinkRenderer::ReleaseScanoutTarget()
+ {
+-	if (fScanoutTargetHeld) {
++	if (fScanoutTargetHeld
++		&& fInfoLocker.LockingThread() == find_thread(NULL)) {
+ 		fScanoutTargetHeld = false;
+ 		fInfoLocker.Unlock();
+ 	}
+@@ -308,7 +504,41 @@ ZinkRenderer::PresentedIntoScanout(bool presented)
+ 	fPresentedIntoScanout = presented;
+ 	if (presented)
+ 		fPresentCount++;
++	const bool markStale = presented && fDevicePixels && fInfo != NULL
++		&& fInfo->drawing_bits_area >= 0;
+ 	ReleaseScanoutTarget();
++	if (markStale)
++		_MarkStale();
++}
++
++
++// The window system draws into a copy of the screen of its own and copies
++// that to the frame buffer; the frame went into the frame buffer only. Told
++// so, it takes those pixels from the frame buffer when it moves the window
++// or reads the screen, instead of showing what its copy has there.
++//
++// It is told once a display frame, or at once when the window's visible
++// parts changed. Never wait for the window here: its thread may be waiting
++// for this one (a view's FrameResized locking the GL context, say).
++void
++ZinkRenderer::_MarkStale()
++{
++	const bigtime_t now = system_time();
++	if (!fPresentedClipsChanged && now - fLastStaleMark < 16000)
++		return;
++	if (fDirectWindow == NULL || fDirectWindow->LockWithTimeout(0) != B_OK)
++		return;
++	clipping_rect clips[HGL_MAX_SCANOUT_CLIPS];
++	uint32 count;
++	{
++		BAutolock lock(fInfoLocker);
++		count = fPresentedClipCount;
++		memcpy(clips, fPresentedClips, sizeof(clipping_rect) * count);
++		fPresentedClipsChanged = false;
++	}
++	fDirectWindow->MarkDrawingBitsStale(clips, count);
++	fDirectWindow->Unlock();
++	fLastStaleMark = now;
+ }
+ 
+ 
+@@ -325,7 +555,18 @@ ZinkRenderer::Display(BBitmap *bitmap, BRect *updateRect)
+ 	if (!fDirectModeEnabled) {
+ 		// TODO: avoid timeout
+ 		if (GLView()->LockLooperWithTimeout(1000) == B_OK) {
+-			GLView()->DrawBitmap(bitmap, B_ORIGIN);
++			// The window system copies the bitmap into the screen (enlarged
++			// on a desktop drawn at a higher density) while this thread goes
++			// on to the next frame, instead of the two taking turns. The
++			// renderer has two bitmaps and the next frame goes into the
++			// other one; it is waited for here, before this one is handed
++			// over, so that the next frame is never copied into a bitmap
++			// still being drawn.
++			if (fDrawPending)
++				GLView()->Sync();
++			GLView()->DrawBitmapAsync(bitmap, B_ORIGIN);
++			GLView()->Flush();
++			fDrawPending = true;
+ 			GLView()->UnlockLooper();
+ 		}
+ 	} else {
+@@ -348,8 +589,6 @@ ZinkRenderer::Display(BBitmap *bitmap, BRect *updateRect)
+ void
+ ZinkRenderer::SwapBuffers(bool vsync)
+ {
+-	BScreen screen(GLView()->Window());
+-
+ 	// When the frame goes into the screen itself, wait for the display to
+ 	// finish the frame it is showing before starting to overwrite it. The copy
+ 	// takes about a millisecond for a whole screen and the display takes
+@@ -365,13 +604,13 @@ ZinkRenderer::SwapBuffers(bool vsync)
+ 	const bool wait = fPresentedIntoScanout
+ 		&& (vsync || getenv("HGL_VSYNC") != NULL);
+ 	if (wait)
+-		screen.WaitForRetrace(kRetraceTimeout);
++		BScreen(fScreenID).WaitForRetrace(kRetraceTimeout);
+ 
+ 	fContextObj->SwapBuffers(fContextID);
+ 	fContextObj->Validate(fWidth, fHeight);
+ 
+ 	if (vsync && !wait)
+-		screen.WaitForRetrace(kRetraceTimeout);
++		BScreen(fScreenID).WaitForRetrace(kRetraceTimeout);
+ }
+ 
+ void
+@@ -426,7 +665,7 @@ ZinkRenderer::DirectConnected(direct_buffer_info *info)
+ 				fInfo = (direct_buffer_info *)calloc(1,
+ 					DIRECT_BUFFER_INFO_AREA_SIZE);
+ 			}
+-			memcpy(fInfo, info, DIRECT_BUFFER_INFO_AREA_SIZE);
++			_ReadWindowSystemInfo(info);
+ 			if ((info->buffer_state
+ 					& (B_BUFFER_MOVED | B_BUFFER_RESIZED | B_CLIPPING_MODIFIED))
+ 					!= 0) {
+@@ -462,8 +701,53 @@ ZinkRenderer::DirectConnected(direct_buffer_info *info)
+ 			fPresentCount);
+ 		fPresentCount = 0;
+ 	}
+-	if (repaint)
+-		fContextObj->Draw(fContextID, BRect());
++	if (repaint) {
++		_Represent();
++
++		// and again once the window system's own repaint is on the screen
++		if (fRepresentSem < 0) {
++			fRepresentSem = create_sem(0, "zink represent");
++			if (fRepresentSem >= 0) {
++				fRepresentWorker = spawn_thread(_RepresentWorker,
++					"zink represent", B_DISPLAY_PRIORITY, this);
++				if (fRepresentWorker >= 0)
++					resume_thread(fRepresentWorker);
++			}
++		}
++		if (fRepresentWorker >= 0) {
++			atomic_set64(&fRepresentAt, system_time() + kRepresentAgainAfter);
++			if (atomic_get_and_set(&fRepresentPending, 1) == 0)
++				release_sem_etc(fRepresentSem, 1, B_DO_NOT_RESCHEDULE);
++		}
++	}
++}
++
++
++// What DirectConnected was given, or the window system's original of it
++// when that is in frame buffer pixels (see window_system_info). fInfoLocker
++// is held.
++void
++ZinkRenderer::_ReadWindowSystemInfo(direct_buffer_info* info)
++{
++	const direct_buffer_info* original = window_system_info(GLView());
++	// The same announcement, as far as can be told: BGLView copies it before
++	// it calls the renderer.
++	if (original != NULL && original->device_scale != 0
++		&& original->bits == info->bits
++		&& original->bytes_per_row == info->bytes_per_row
++		&& original->device_scale == info->device_scale
++		&& original->buffer_state == info->buffer_state) {
++		memcpy(fInfo, original, DIRECT_BUFFER_INFO_AREA_SIZE);
++		fDevicePixels = true;
++		return;
++	}
++	memcpy(fInfo, info, DIRECT_BUFFER_INFO_AREA_SIZE);
++	fDevicePixels = false;
++	if (info->device_scale > 100) {
++		// Frame buffer pixels that cannot be placed: nothing goes into the
++		// screen (ScanoutTarget sees no clipping).
++		fInfo->clip_list_count = 0;
++	}
+ }
+ 
+ 
+@@ -472,7 +756,33 @@ ZinkRenderer::FrameResized(float width, float height)
+ {
+ 	TRACE("%s: %f x %f\n", __func__, width, height);
+ 
+-	BAutolock lock(fInfoLocker);
+-	fWidth = (GLuint)width;
+-	fHeight = (GLuint)height;
++	// The window is locked: BGLView calls this from AttachedToWindow and
++	// FrameResized.
++	BView* view = GLView();
++	BRect frame = view->Bounds();
++	for (BView* parent = view; parent != NULL; parent = parent->Parent())
++		parent->ConvertToParent(&frame);
++
++	{
++		BAutolock lock(fInfoLocker);
++		fWidth = (GLuint)width;
++		fHeight = (GLuint)height;
++		fViewFrame = frame;
++	}
++
++	// A direct window on a desktop drawn at a higher density is left
++	// unconnected - nothing would go into the screen - unless it asks for
++	// the frame buffer's own pixels. The frame is then enlarged on the GPU
++	// (zink_screen.c). Asked once, outside fInfoLocker: the window system
++	// connects the window again before SetFlags returns, which comes back
++	// here through DirectConnected on another thread.
++	BDirectWindow* window = dynamic_cast<BDirectWindow*>(view->Window());
++	if (window != NULL && !fAskedForDevicePixels) {
++		fAskedForDevicePixels = true;
++		fDirectWindow = window;
++		if (getenv("HGL_NO_DEVICE_PIXELS") == NULL
++			&& (window->Flags() & B_DIRECT_DEVICE_PIXELS) == 0) {
++			window->SetFlags(window->Flags() | B_DIRECT_DEVICE_PIXELS);
++		}
++	}
+ }
+diff --git a/src/gallium/targets/haiku-zink/ZinkRenderer.h b/src/gallium/targets/haiku-zink/ZinkRenderer.h
+index 2fdd6582..74663a87 100644
+--- a/src/gallium/targets/haiku-zink/ZinkRenderer.h
++++ b/src/gallium/targets/haiku-zink/ZinkRenderer.h
+@@ -14,6 +14,9 @@
+ 
+ #include <kernel/image.h>
+ 
++#include <DirectWindow.h>
++#include <Screen.h>
++
+ #include "GLRenderer.h"
+ #include "GalliumContext.h"
+ 
+@@ -65,6 +68,45 @@ private:
+ 			int32				fPresentCount = 0;
+ 			// when the window last moved or its clipping changed
+ 			bigtime_t			fLastPlacementChange = 0;
++
++			// The window is a BDirectWindow that was asked for
++			// B_DIRECT_DEVICE_PIXELS, and fInfo is what the window system
++			// said, in frame buffer pixels (window_bounds and clip_list are
++			// the whole window's); device_scale says what one view pixel
++			// covers. Then the view's own frame, in its window's
++			// coordinates, places it.
++			BDirectWindow*		fDirectWindow = NULL;
++			bool				fAskedForDevicePixels = false;
++			bool				fDevicePixels = false;
++			BRect				fViewFrame;
++			// The rectangles the last frame went into, for telling the window
++			// system that its own copy of them is out of date.
++			clipping_rect		fPresentedClips[HGL_MAX_SCANOUT_CLIPS];
++			uint32				fPresentedClipCount = 0;
++			bool				fPresentedClipsChanged = false;
++			bigtime_t			fLastStaleMark = 0;
++			// What LockGL and SwapBuffers asked the window system for every
++			// time, kept for a while instead.
++			screen_id			fScreenID;
++			bigtime_t			fScreenChecked = 0;
++			// A bitmap handed to the window system that it may still be
++			// drawing.
++			bool				fDrawPending = false;
++			// The thread that puts the last frame back a second time, a
++			// little after the window system said something.
++			sem_id				fRepresentSem = -1;
++			thread_id			fRepresentWorker = -1;
++			int64				fRepresentAt = 0;
++			int32				fRepresentPending = 0;
++			int32				fRepresentQuit = 0;
++
++	static	status_t			_RepresentWorker(void* data);
++			void				_Represent();
++
++			void				_UpdateScreen();
++			void				_MarkStale();
++			void				_ReadWindowSystemInfo(
++									direct_buffer_info* info);
+ };
+ 
+ #endif	// ZINKRENDERER_H
+diff --git a/src/gallium/targets/haiku-zink/meson.build b/src/gallium/targets/haiku-zink/meson.build
+index cdc63b21..98811963 100644
+--- a/src/gallium/targets/haiku-zink/meson.build
++++ b/src/gallium/targets/haiku-zink/meson.build
+@@ -20,7 +20,7 @@ libzinkpipe = shared_library(
+     libmesa, libglsl, libgallium, libgl
+   ],
+   dependencies : [
+-    driver_zink, driver_swrast, cpp.find_library('be'),
++    driver_zink, driver_swrast, cpp.find_library('be'), cpp.find_library('game'),
+     cpp.find_library('translation'), cpp.find_library('network'),
+     dep_unwind, idep_mesautil, idep_nir, idep_xmlconfig,
+   ],
+diff --git a/src/gallium/winsys/sw/hgl/hgl_sw_winsys.cpp b/src/gallium/winsys/sw/hgl/hgl_sw_winsys.cpp
+index eb21327c..6fa748f3 100644
+--- a/src/gallium/winsys/sw/hgl/hgl_sw_winsys.cpp
++++ b/src/gallium/winsys/sw/hgl/hgl_sw_winsys.cpp
+@@ -42,6 +42,11 @@
+ #include <Bitmap.h>
+ #include <OS.h>
+ 
++#include <new>
++#include <string.h>
++
++#include "c11/threads.h"
++
+ #ifdef DEBUG
+ #   define TRACE(x...) printf("hgl:winsys: " x)
+ #   define CALLED() TRACE("CALLED: %s\n", __PRETTY_FUNCTION__)
+@@ -65,9 +70,21 @@ struct haiku_displaytarget
+ 
+ 	void* data;
+ 	BBitmap* bitmap;
++	// The memory behind the bitmap, when it has an area of its own.
++	area_id area;
+ };
+ 
+ 
++// Display targets are freed a little after the renderer lets go of them. A
++// window's thread may still be showing the last frame of one (a redraw while
++// the application resizes), and it holds no reference the renderer knows of;
++// two resizes later nobody is.
++#define HGL_DEAD_TARGETS 4
++static mtx_t sDeadTargetsLock = _MTX_INITIALIZER_NP;
++static struct haiku_displaytarget* sDeadTargets[HGL_DEAD_TARGETS];
++static int sDeadTargetCount;
++
++
+ // Cast
+ static inline struct haiku_displaytarget*
+ hgl_sw_displaytarget(struct sw_displaytarget* target)
+@@ -128,15 +145,45 @@ hgl_winsys_displaytarget_create(struct sw_winsys* winsys,
+ 	haikuDisplayTarget->stride = align(formatStride, alignment);
+ 	haikuDisplayTarget->size = haikuDisplayTarget->stride * blockSize;
+ 
++	haikuDisplayTarget->area = -1;
+ 	if (textureUsage & PIPE_BIND_DISPLAY_TARGET) {
+ 		haikuDisplayTarget->data = NULL;
++		// Each display target gets an area of its own, so that its pixels
++		// start on a page: a GPU can then be given the memory and copy the
++		// frame into it (zink's present into host memory). The window
++		// system's own allocator packs bitmaps one after another, so all but
++		// the first of a window's two buffers started part way into a page
++		// unless the frame happened to be a whole number of pages, and those
++		// frames were read back and copied by the processor instead.
++		//
+ 		// Ask for the rows to be as long as the stride we report, so that a
+ 		// driver copying into the mapped bitmap with that stride stays inside
+-		// it, and then report what the bitmap actually settled on.
+-		haikuDisplayTarget->bitmap = new BBitmap(
+-			BRect(0, 0, width - 1, height - 1), 0,
+-			haikuDisplayTarget->colorSpace,
+-			haikuDisplayTarget->stride);
++		// it.
++		const BRect bounds(0, 0, width - 1, height - 1);
++		void* address = NULL;
++		area_id area = create_area("hgl display target", &address,
++			B_ANY_ADDRESS,
++			align((size_t)haikuDisplayTarget->size, B_PAGE_SIZE),
++			B_NO_LOCK, B_READ_AREA | B_WRITE_AREA);
++		if (area >= 0) {
++			BBitmap* bitmap = new(std::nothrow) BBitmap(area, 0, bounds, 0,
++				haikuDisplayTarget->colorSpace, haikuDisplayTarget->stride);
++			if (bitmap != NULL && bitmap->InitCheck() == B_OK
++				&& bitmap->BytesPerRow() == (int32)haikuDisplayTarget->stride) {
++				haikuDisplayTarget->bitmap = bitmap;
++				haikuDisplayTarget->area = area;
++			} else {
++				delete bitmap;
++				delete_area(area);
++			}
++		}
++		if (haikuDisplayTarget->bitmap == NULL) {
++			// The window system's own memory, then; then report what the
++			// bitmap actually settled on.
++			haikuDisplayTarget->bitmap = new BBitmap(bounds, 0,
++				haikuDisplayTarget->colorSpace,
++				haikuDisplayTarget->stride);
++		}
+ 		haikuDisplayTarget->stride = haikuDisplayTarget->bitmap->BytesPerRow();
+ 		haikuDisplayTarget->size = haikuDisplayTarget->stride * blockSize;
+ 	} else {
+@@ -163,11 +210,32 @@ hgl_winsys_displaytarget_destroy(struct sw_winsys* winsys,
+ 	if (!haikuDisplayTarget)
+ 		return;
+ 
++	if (haikuDisplayTarget->bitmap != NULL) {
++		// Kept for a while (see sDeadTargets); the oldest one goes now.
++		mtx_lock(&sDeadTargetsLock);
++		struct haiku_displaytarget* oldest = NULL;
++		if (sDeadTargetCount == HGL_DEAD_TARGETS) {
++			oldest = sDeadTargets[0];
++			memmove(&sDeadTargets[0], &sDeadTargets[1],
++				sizeof(sDeadTargets[0]) * (HGL_DEAD_TARGETS - 1));
++			sDeadTargetCount--;
++		}
++		sDeadTargets[sDeadTargetCount++] = haikuDisplayTarget;
++		mtx_unlock(&sDeadTargetsLock);
++		haikuDisplayTarget = oldest;
++		if (haikuDisplayTarget == NULL)
++			return;
++	}
++
+ 	if (haikuDisplayTarget->data != NULL)
+ 		align_free(haikuDisplayTarget->data);
+ 
+ 	if (haikuDisplayTarget->bitmap != NULL)
+ 		delete haikuDisplayTarget->bitmap;
++	// The bitmap does not own an area it was given; the window system keeps
++	// its own clone of it for as long as it still needs the pixels.
++	if (haikuDisplayTarget->area >= 0)
++		delete_area(haikuDisplayTarget->area);
+ 
+ 	FREE(haikuDisplayTarget);
+ }
+diff --git a/src/gallium/winsys/sw/hgl/hgl_sw_winsys.h b/src/gallium/winsys/sw/hgl/hgl_sw_winsys.h
+index d46cc1ae..625cacff 100644
+--- a/src/gallium/winsys/sw/hgl/hgl_sw_winsys.h
++++ b/src/gallium/winsys/sw/hgl/hgl_sw_winsys.h
+@@ -45,6 +45,14 @@ struct hgl_scanout_target {
+ 	// one, and its address is how a renderer holding the old one finds out.
+ 	void *bits;
+ 	uint32_t bytes_per_row;
++	// The size the frame covers on the screen, in frame buffer pixels. On a
++	// desktop drawn at a higher density (a window with B_DIRECT_DEVICE_PIXELS)
++	// that is larger than the frame, which is then enlarged on the way, with
++	// filtering where the scale is not a whole number. 0 means the frame's own
++	// size.
++	uint32_t dest_width;
++	uint32_t dest_height;
++	bool filter;
+ 	uint32_t num_clips;
+ 	struct {
+ 		// screen coordinates, the right and bottom edges included
+-- 
+2.53.0
+

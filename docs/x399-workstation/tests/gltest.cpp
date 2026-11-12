@@ -8,6 +8,7 @@
  * The window is a direct window, so that the renderer can put frames into the
  * screen's own frame buffer instead of sending them through the window system.
  * GLTEST_NO_DIRECT=1 uses an ordinary window instead, for comparison.
+ * GLTEST_VSYNC=1 calls SwapBuffers(true), which waits for the display.
  *
  * To see what switching workspaces does to it, run switchws alongside. Do not
  * have the program switch its own: asking the window system to take your
@@ -116,6 +117,7 @@ public:
 	// Hiding and showing takes the window away from the screen entirely, which
 	// is the other way the window system tells a direct window to stop.
 	bool fHide = getenv("GLTEST_HIDE") != NULL;
+	bool fVSync = getenv("GLTEST_VSYNC") != NULL;
 
 	double Run(double seconds)
 	{
@@ -173,7 +175,7 @@ public:
 					DrawSphere(1.8f, 64, 64);
 				}
 			}
-			SwapBuffers();
+			SwapBuffers(fVSync);
 			UnlockGL();
 			angle += 1.0f;
 			frames++;
@@ -282,8 +284,11 @@ int main(int argc, char **argv)
 	BApplication app("application/x-vnd.x399-gltest");
 
 	BRect frame(left, top, left + kWidth, top + kHeight);
+	// GLTEST_FORCE_DIRECT=1 makes a direct window even where the display
+	// mode does not say B_PARALLEL_ACCESS (amdgpu_kms before haiku#109).
 	const bool direct = getenv("GLTEST_NO_DIRECT") == NULL
-		&& BDirectWindow::SupportsWindowMode();
+		&& (getenv("GLTEST_FORCE_DIRECT") != NULL
+			|| BDirectWindow::SupportsWindowMode());
 	BWindow *window;
 	TestView *view;
 	if (direct) {
