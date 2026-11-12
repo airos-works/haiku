@@ -528,6 +528,91 @@ static void test_gemini_lake()
 	create("\\_SB.TQ", B_NOT_SUPPORTED, "unknown controller");
 }
 
+
+// Real firmware: the ASUS VivoBook E403NA (Apollo Lake N3350, 4 GB, eMMC),
+// from its DSDT (linuxhw/ACPI E403NA/E3A7CFB90011). The touchpad ETPD
+// (ELAN12xx, _CID PNP0C50) on I2C4 has GpioInt (Level, ActiveLow) pin 0x12
+// on \_SB.GPO0, INT3452 _UID 1 ("North"), whose _CRS window is 0x4000 bytes.
+// Its _CRS also calls SWON (0x00C50590, One), which sets the pad's
+// HOSTSW_OWN bit by the firmware's own arithmetic: register 0x80 of the
+// community, bit (0x590 - 0x500) >> 3 = 18 - so the pad's configuration is at
+// 0x590, PADBAR 0x500 with 8 bytes a pad. Only those addresses are set here;
+// a driver that computed others would fail the checks.
+static void test_apollo_lake_e403na()
+{
+	printf("\n=== Apollo Lake, ASUS VivoBook E403NA firmware: GPO0 (INT3452 uid 1) pin 18\n");
+	const uint64 base = 0xd0c70000ull;	// a register file of its own
+	region(base, 0x4000);
+	reg32(base, 0) = 0x00920000;	// below revision 0x94: two registers a pad
+	reg32(base, 0xc) = 0x500;		// PADBAR
+	reg32(base, 0x590) = kRxState;	// pad 18: GPIO input, line high (idle)
+	reg32(base, 0x80) = 1u << 18;	// HOSTSW_OWN, as SWON leaves it
+
+	FakeDevice controller = {};
+	controller.hid = "INT3452";
+	controller.uid = "1";
+	controller.memory.push_back({base, 0x4000});
+	controller.irq = 14;
+	controller.level = true;
+	controller.low = true;
+	sDevices["\\_SB.GPO0"] = controller;
+	sDevices["\\_SB.PCI0.I2C4.ETPD"] = touchpad("\\_SB.GPO0", 0x12);
+
+	GpioInterrupt* interrupt = create("\\_SB.PCI0.I2C4.ETPD", B_OK, "E403NA");
+	if (interrupt == NULL)
+		return;
+	CHECK(interrupt->CanInterrupt(), "host mode seen at 0x80 bit 18");
+	uint32 config = reg32(base, 0x590);
+	CHECK((config & (kRxEvMask | kRxInv)) == kRxInv, "pad at 0x590 set level/low: %08x", config);
+	for (uint32 offset = 0x500; offset < 0x500 + 78 * 8; offset += 4) {
+		if (offset != 0x590)
+			CHECK(reg32(base, offset) == 0, "only the pad at 0x590 written (%#x)", offset);
+	}
+	CHECK(!interrupt->Asserted(), "idle line reads deasserted");
+	reg32(base, 0x590) &= ~kRxState;
+	CHECK(interrupt->Asserted(), "touch reads asserted");
+	interrupt->Wait(1000);
+	CHECK(reg32(base, 0x110) == (1u << 18), "GPI_IE 0x110 bit 18: %08x", reg32(base, 0x110));
+	reg32(base, 0x100) = 1u << 18;	// GPI_IS
+	CHECK(raise_irq(14) == B_INVOKE_SCHEDULER, "interrupt delivered");
+	CHECK(reg32(base, 0x110) == 0, "masked until read");
+	CHECK(interrupt->Wait(1000) == B_OK, "reader woken");
+	delete interrupt;
+}
+
+// Real firmware: the Lenovo IdeaPad 330-15IGM (Gemini Lake), from its DSDT
+// (linuxhw/ACPI 08CD7AA84FAC): \_SB.GPO1 is INT3453 _UID 1, "Northwest"
+// (GPO0 is _UID 2, "North"), 0x4000 bytes; the touchpad TPD0 (ALPS0001,
+// _CID PNP0C50) on I2C7 has GpioInt (Level, ActiveLow) pin 0x12 on GPO1.
+static void test_gemini_lake_ideapad()
+{
+	printf("\n=== Gemini Lake, Lenovo IdeaPad 330-15IGM firmware: GPO1 (INT3453 uid 1) pin 18\n");
+	const uint64 base = 0xd0c60000ull;
+	region(base, 0x4000);
+	reg32(base, 0) = 0x00930000;
+	reg32(base, 0xc) = 0x600;
+	reg32(base, 0x600 + 18 * 8) = kRxState;
+	reg32(base, 0xb0) = 1u << 18;	// GLK HOSTSW_OWN, register 0 (pins 0-31)
+
+	FakeDevice controller = {};
+	controller.hid = "INT3453";
+	controller.uid = "1";
+	controller.memory.push_back({base, 0x4000});
+	controller.irq = 14;
+	controller.level = true;
+	controller.low = true;
+	sDevices["\\_SB.GPO1"] = controller;
+	sDevices["\\_SB.PCI0.I2C7.TPD0"] = touchpad("\\_SB.GPO1", 0x12);
+
+	GpioInterrupt* interrupt = create("\\_SB.PCI0.I2C7.TPD0", B_OK, "IdeaPad 330");
+	if (interrupt == NULL)
+		return;
+	CHECK(interrupt->CanInterrupt(), "host mode");
+	CHECK((reg32(base, 0x600 + 18 * 8) & (kRxEvMask | kRxInv)) == kRxInv, "pad 18 level/low");
+	interrupt->Wait(1000);
+	CHECK(reg32(base, 0x110) == (1u << 18), "GPI_IE bit 18");
+	delete interrupt;
+}
 #endif
 
 int main()
@@ -537,6 +622,8 @@ int main()
 	test_jasper_lake();
 	test_jasper_lake_refusals();
 	test_gemini_lake();
+	test_apollo_lake_e403na();
+	test_gemini_lake_ideapad();
 #endif
 	printf("\n%d failure%s\n", sFailures, sFailures == 1 ? "" : "s");
 	return sFailures != 0;
