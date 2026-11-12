@@ -505,6 +505,11 @@ nvme_disk_init_device(void* _info, void** _cookie)
 			try_qpairs--;
 	}
 
+	// The interrupt handler walks the queue pairs counted here: none until
+	// each is set up, as the admin queue's completions interrupt from now on
+	// (the set feature commands below).
+	info->qpair_count = 0;
+
 	// Interrupts: with MSI-X a vector for each queue pair besides the admin
 	// queue's, so that a completion wakes only the thread of its own queue
 	// and arrives on the processor that queue is for.
@@ -517,7 +522,6 @@ nvme_disk_init_device(void* _info, void** _cookie)
 	nvme_disk_configure_features(info);
 
 	// allocate qpairs
-	info->qpair_count = 0;
 	for (uint32 i = 0; i < try_qpairs; i++) {
 		struct nvme_qpair* qpair = nvme_ioqp_get(info->ctrlr,
 			(enum nvme_qprio)0, 0);
@@ -541,7 +545,9 @@ nvme_disk_init_device(void* _info, void** _cookie)
 		qpinfo.thread = -1;
 		B_INITIALIZE_SPINLOCK(&qpinfo.done_lock);
 		qpinfo.done = NULL;
-		info->qpair_count++;
+		// published once set up (a full barrier): the interrupt handler may
+		// look at it at once
+		atomic_add((int32*)&info->qpair_count, 1);
 
 		// The queue is used by the processors i, i + count, ...; its
 		// interrupt goes to the first of them.
@@ -2049,7 +2055,8 @@ nvme_disk_init_driver(device_node* node, void** cookie)
 		return ret;
 	}
 
-	nvme_disk_driver_info* info = new nvme_disk_driver_info;
+	// zeroed: the interrupt handler runs before all of it is set up
+	nvme_disk_driver_info* info = new(std::nothrow) nvme_disk_driver_info();
 	if (info == NULL)
 		return B_NO_MEMORY;
 
