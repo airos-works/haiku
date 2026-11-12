@@ -72,7 +72,7 @@ HIDDevice::HIDDevice(uint16 descriptorAddress, i2c_device_interface* i2c,
 		fI2C(i2c),
 		fI2CCookie(i2cCookie),
 		fInterrupt(interrupt),
-		fPollPinState(false),
+		fPollPinState(interrupt != NULL && !interrupt->CanInterrupt()),
 		fQueues(NULL),
 		fQueueCount(0),
 		fMaxReportSize(0),
@@ -249,7 +249,9 @@ HIDDevice::HIDDevice(uint16 descriptorAddress, i2c_device_interface* i2c,
 		" handler%s, %s\n", fDescriptor.wVendorID, fDescriptor.wProductID,
 		fQueueCount, fQueueCount == 1 ? "" : "s", fProtocolHandlerCount,
 		fProtocolHandlerCount == 1 ? "" : "s",
-		fInterrupt != NULL ? "interrupt driven" : "polled");
+		fInterrupt == NULL ? "polled"
+			: fPollPinState ? "watching the interrupt pin"
+			: "interrupt driven");
 	fStatus = B_OK;
 }
 
