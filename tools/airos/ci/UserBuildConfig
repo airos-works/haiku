@@ -459,6 +459,15 @@ rule UserBuildConfigRulePreImage
 		AddSymlinkToHaikuImage system non-packaged data ssl
 			: /boot/system/data/ssl/CARootCertificates.pem
 			: CARootCertificates.pem ;
+		# The headers and libraries programs are built with: x86_64 offers
+		# haiku_devel among the Installer's optional packages, but the Pi
+		# and the Cubie start their image as it is, so arm64 images have it
+		# installed, and System Updater keeps it at the haiku package's
+		# version. gcc, binutils and make come from the HaikuPorts
+		# repository air/OS serves (src/data/repository_infos/
+		# haikuports_arm64, #118).
+		AddPackageFilesToHaikuImage system packages : haiku_devel.hpkg
+			: nameFromMetaInfo ;
 		# The arm64 ICU bootstrap package's data directory.
 		local environment = <airos-ci>UserSetupEnvironment ;
 		SEARCH on $(environment) = [ FDirName $(HAIKU_TOP) tools rock5-itx ] ;
@@ -580,6 +589,15 @@ rule UserBuildConfigRulePreImage
 		local releaseFile = <airos-release>release ;
 		SEARCH on $(releaseFile) = $(AIROS_CI_RELEASE_DIR) ;
 		AddFilesToPackage data airos : $(releaseFile) ;
+		# arm64: points an older install's HaikuPorts entry, which names a
+		# repository HaikuPorts no longer has, at the one air/OS serves
+		# (#118). CI's release-inputs.py declares it a post-install script
+		# when this tree has it, so it runs after each update.
+		if $(TARGET_ARCH) = arm64 {
+			local haikuports = <airos-post-install>airos_haikuports_arm64.sh ;
+			SEARCH on $(haikuports) = [ FDirName $(tree) post-install ] ;
+			AddFilesToPackage boot post-install : $(haikuports) ;
+		}
 		BuildHaikuPackage $(release) : airos_release ;
 
 		AddPackageFilesToHaikuImage system packages : $(payload) $(release)

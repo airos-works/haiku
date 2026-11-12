@@ -196,9 +196,16 @@ rule RemotePackageRepository repository : architecture : repositoryUrl
 	}
 
 	# build the repository info file
+	# air/OS: an architecture HaikuPorts has no repository of (arm64) gets
+	# its own template, which names the repository air/OS serves of the
+	# build packages (haikuports_arm64, airos-works/haiku#118).
 	local repositoryInfoTemplate = <repository-info-template>haikuports ;
-	SEARCH on $(repositoryInfoTemplate)
-		= $(HAIKU_TOP)/src/data/repository_infos ;
+	local repositoryInfosDir = $(HAIKU_TOP)/src/data/repository_infos ;
+	if [ Glob $(repositoryInfosDir) : haikuports_$(architecture) ] {
+		repositoryInfoTemplate
+			= <repository-info-template>haikuports_$(architecture) ;
+	}
+	SEARCH on $(repositoryInfoTemplate) = $(repositoryInfosDir) ;
 	PreprocessPackageOrRepositoryInfo $(repositoryInfo)
 		: $(repositoryInfoTemplate) : $(architecture) ;
 
