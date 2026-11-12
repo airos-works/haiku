@@ -42,6 +42,13 @@ EventCommand(uint8_t opcode, uint32_t device, uint32_t event)
 	return {{(uint64_t(device) << 32) | opcode, event, 0, 0}};
 }
 
+// MOVI: the event's LPI goes to another collection, with its pending state.
+inline Command
+MoveInterrupt(uint32_t device, uint32_t event, uint16_t collection)
+{
+	return {{(uint64_t(device) << 32) | 0x01, event, collection, 0}};
+}
+
 inline Command
 InvalidateAll(uint16_t collection)
 {

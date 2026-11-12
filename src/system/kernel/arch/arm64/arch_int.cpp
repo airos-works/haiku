@@ -59,10 +59,28 @@ arch_int_disable_io_interrupt(int32 irq)
 }
 
 
+/*!	Routes a shared interrupt (SPI or LPI) to \a cpu through the interrupt
+	controller and returns the CPU that takes it from now on. The generic
+	code calls this with interrupts disabled. Per-CPU interrupts (SGIs and
+	PPIs: the timers, the inter-processor interrupts) are reserved as local
+	interrupts and never come here.
+*/
 int32
 arch_int_assign_to_cpu(int32 irq, int32 cpu)
 {
-	// Not yet supported.
+	InterruptController *ic = InterruptController::Get();
+	if (ic == NULL)
+		return 0;
+	return ic->AssignToCpu(irq, cpu);
+}
+
+
+static int
+dump_irq_routes(int argc, char** argv)
+{
+	InterruptController *ic = InterruptController::Get();
+	if (ic != NULL)
+		ic->DumpRouting();
 	return 0;
 }
 
@@ -104,6 +122,10 @@ arch_int_init_post_vm(kernel_args *args)
 
 	if (ic == NULL)
 		return B_ERROR;
+
+	add_debugger_command("irq_routes", &dump_irq_routes,
+		"Shows where the interrupt controller sends each shared interrupt, "
+		"and the device interrupts each CPU took");
 
 	return B_OK;
 }

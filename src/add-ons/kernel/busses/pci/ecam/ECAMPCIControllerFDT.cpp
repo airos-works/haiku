@@ -10,6 +10,62 @@
 
 #include <string.h>
 
+extern "C" {
+#include <libfdt.h>
+}
+
+extern void* gFDT;
+
+
+static uint32
+GetCell(const void* data, uint32 index)
+{
+	return B_BENDIAN_TO_HOST_INT32(((const uint32*)data)[index]);
+}
+
+
+/*!	The MSI controller of the host bridge, from its "msi-map" (QEMU's virt
+	machine: <0 &its 0 0x10000>): a GICv3 ITS, whose DeviceID for a function
+	is its-base + RID. Fills three attributes, or none.
+*/
+/*static*/ void
+ECAMPCIControllerFDT::GetMSIAttributes(device_node* fdtNode, device_attr* attrs)
+{
+	fdt_device_module_info* fdtModule;
+	fdt_device* fdtDev;
+	if (gFDT == NULL || gDeviceManager->get_driver(fdtNode,
+			(driver_module_info**)&fdtModule, (void**)&fdtDev) != B_OK) {
+		return;
+	}
+	int length;
+	const void* map = fdtModule->get_prop(fdtDev, "msi-map", &length);
+	if (map == NULL || length != 16 || GetCell(map, 0) != 0
+		|| fdtModule->get_prop(fdtDev, "msi-map-mask", NULL) != NULL) {
+		return;
+	}
+	int its = fdt_node_offset_by_phandle(gFDT, GetCell(map, 1));
+	if (its < 0 || fdt_node_check_compatible(gFDT, its, "arm,gic-v3-its") != 0)
+		return;
+	int regLength;
+	const uint32* reg = (const uint32*)fdt_getprop(gFDT, its, "reg", &regLength);
+	int gic = fdt_parent_offset(gFDT, its);
+	const uint32* cells = gic >= 0
+		? (const uint32*)fdt_getprop(gFDT, gic, "#address-cells", NULL) : NULL;
+	uint32 addressCells = cells != NULL ? fdt32_to_cpu(*cells) : 2;
+	if (reg == NULL || (addressCells != 1 && addressCells != 2)
+		|| regLength < (int)(addressCells * 4)) {
+		return;
+	}
+	uint64 itsBase = addressCells == 2
+		? ((uint64)fdt32_to_cpu(reg[0]) << 32) | fdt32_to_cpu(reg[1])
+		: fdt32_to_cpu(reg[0]);
+	attrs[0] = { B_PCI_MSI_CONTROLLER_ADDRESS, B_UINT64_TYPE, {.ui64 = itsBase} };
+	attrs[1] = { B_PCI_MSI_REQUESTER_BASE, B_UINT32_TYPE, {.ui32 = GetCell(map, 2)} };
+	attrs[2] = { B_PCI_MSI_REQUESTER_COUNT, B_UINT32_TYPE, {.ui32 = GetCell(map, 3)} };
+	dprintf("  MSIs: GICv3 ITS %#" B_PRIx64 ", DeviceID %#" B_PRIx32 " + RID\n",
+		itsBase, GetCell(map, 2));
+}
+
 
 status_t
 ECAMPCIControllerFDT::ReadResourceInfo()

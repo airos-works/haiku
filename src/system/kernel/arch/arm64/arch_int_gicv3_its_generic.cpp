@@ -7,6 +7,7 @@
 
 #include <arch/arm64/arch_cpu.h>
 #include <arch/arm64/cache_line_size.h>
+#include <cpu.h>
 #include <debug.h>
 #include <interrupts.h>
 #include <smp.h>
@@ -103,6 +104,14 @@ GICv3ItsGeneric::_Write64(Controller& controller, size_t offset, uint64 value)
 }
 
 
+static uint32
+affinity_of(uint64 mpidr)
+{
+	// as GICR_TYPER.Affinity_Value: Aff3.Aff2.Aff1.Aff0
+	return (uint32)(((mpidr >> 32) & 0xff) << 24) | (uint32)(mpidr & 0xffffff);
+}
+
+
 status_t
 GICv3ItsGeneric::Init(volatile uint8* redistributors,
 	phys_addr_t redistributorsPhysical, size_t redistributorStride,
@@ -114,29 +123,40 @@ GICv3ItsGeneric::Init(volatile uint8* redistributors,
 		return B_NOT_SUPPORTED;
 	}
 
-	// Find this CPU's Redistributor by its affinity.
-	uint64 mpidr = READ_SPECIALREG(MPIDR_EL1);
-	uint32 affinity = (uint32)(((mpidr >> 32) & 0xff) << 24) | (uint32)(mpidr & 0xffffff);
-	volatile uint8* redistributor = nullptr;
+	// Every Redistributor gets the LPI tables, not only this CPU's: the
+	// other CPUs are not up yet (their affinities are not known), and
+	// AssignToCpu() runs with interrupts disabled, where nothing can be
+	// allocated.
+	uint32 affinity = affinity_of(READ_SPECIALREG(MPIDR_EL1));
+	int32 boot = -1;
+	if (redistributorCount > kMaxRedistributors)
+		redistributorCount = kMaxRedistributors;
 	for (uint32 i = 0; i < redistributorCount; i++) {
 		volatile uint8* frame = redistributors + i * redistributorStride;
 		uint64 type = *(volatile uint64*)(frame + kRedistributorType);
-		if ((uint32)(type >> 32) == affinity) {
-			redistributor = frame;
-			break;
-		}
+		Redistributor& redistributor = fRedistributors[i];
+		redistributor.affinity = (uint32)(type >> 32);
+		redistributor.processorTarget = ((type >> 8) & 0xffff) << 16;
+		redistributor.addressTarget = redistributorsPhysical + i * redistributorStride;
+		fRedistributorCount = i + 1;
+		if (redistributor.affinity == affinity)
+			boot = i;
 		if ((type & (1 << 4)) != 0)
 			break;
 	}
-	if (redistributor == nullptr) {
+	if (boot < 0) {
 		dprintf("GICv3 ITS: no Redistributor for affinity %#" B_PRIx32 "\n", affinity);
 		return B_ERROR;
 	}
-	uint64 redistributorType = *(volatile uint64*)(redistributor + kRedistributorType);
+	fBootCollection = boot;
+
+	volatile uint8* bootFrame = redistributors + boot * redistributorStride;
+	uint64 redistributorType = *(volatile uint64*)(bootFrame + kRedistributorType);
 	uint32 redistributorControl
-		= *(volatile uint32*)(redistributor + kRedistributorControl);
+		= *(volatile uint32*)(bootFrame + kRedistributorControl);
 	dprintf("GICv3 ITS: CPU 0 Redistributor control %#" B_PRIx32 " type %#" B_PRIx64
-		"\n", redistributorControl, redistributorType);
+		", %" B_PRIu32 " Redistributors\n", redistributorControl, redistributorType,
+		fRedistributorCount);
 	if ((redistributorType & 1) == 0)
 		return B_NOT_SUPPORTED;
 	if ((redistributorControl & 1) != 0) {
@@ -145,33 +165,46 @@ GICv3ItsGeneric::Init(volatile uint8* redistributors,
 		return B_BUSY;
 	}
 
-	// LPI configuration (8 KiB for LPIs 8192..16383) and pending tables.
-	status_t status;
-	if ((status = fProperties.Allocate("LPI properties", kTablePage, kTablePage))
-			!= B_OK
-		|| (status = fPending.Allocate("CPU 0 LPI pending", kTablePage, kTablePage))
-			!= B_OK) {
+	// LPI configuration (8 KiB for LPIs 8192..16383), shared by all
+	status_t status = fProperties.Allocate("LPI properties", kTablePage, kTablePage);
+	if (status != B_OK)
 		return status;
-	}
 	memset(fProperties.address, 0xa2, fProperties.size); // priority, RES1, off
 	memory_full_barrier();
 	uint64 properties = fProperties.physical | 0x80 | 13;	// non-cacheable, 14 bits
-	uint64 pending = fPending.physical | 0x80;
-	*(volatile uint64*)(redistributor + kPropertiesBase) = properties;
-	*(volatile uint64*)(redistributor + kPendingBase) = pending;
-	memory_full_barrier();
-	*(volatile uint32*)(redistributor + kRedistributorControl) |= 1;
-	memory_full_barrier();
-	if ((*(volatile uint32*)(redistributor + kRedistributorControl) & 1) == 0) {
-		dprintf("GICv3 ITS: LPIs do not enable\n");
-		return B_ERROR;
-	}
 
-	// The collection targets CPU 0: by its Redistributor's processor number,
-	// or, for an ITS with physical target addresses, the Redistributor's
-	// address.
-	uint64 processorTarget = ((redistributorType >> 8) & 0xffff) << 16;
-	uint64 addressTarget = redistributorsPhysical + (redistributor - redistributors);
+	// the boot CPU's Redistributor first: without it there are no LPIs
+	for (uint32 n = 0; n < fRedistributorCount; n++) {
+		uint32 i = (boot + n) % fRedistributorCount;
+		volatile uint8* frame = redistributors + i * redistributorStride;
+		Redistributor& redistributor = fRedistributors[i];
+		uint64 type = *(volatile uint64*)(frame + kRedistributorType);
+		uint32 control = *(volatile uint32*)(frame + kRedistributorControl);
+		if ((type & 1) == 0 || (control & 1) != 0) {
+			dprintf("GICv3 ITS: Redistributor %" B_PRIu32 " left out (type %#"
+				B_PRIx64 ", control %#" B_PRIx32 ")\n", i, type, control);
+			continue;
+		}
+		status = redistributor.pending.Allocate("LPI pending", kTablePage,
+			kTablePage);
+		if (status != B_OK) {
+			if (i == (uint32)boot)
+				return status;
+			continue;
+		}
+		*(volatile uint64*)(frame + kPropertiesBase) = properties;
+		*(volatile uint64*)(frame + kPendingBase) = redistributor.pending.physical | 0x80;
+		memory_full_barrier();
+		*(volatile uint32*)(frame + kRedistributorControl) |= 1;
+		memory_full_barrier();
+		if ((*(volatile uint32*)(frame + kRedistributorControl) & 1) == 0) {
+			dprintf("GICv3 ITS: LPIs do not enable on Redistributor %" B_PRIu32 "\n", i);
+			if (i == (uint32)boot)
+				return B_ERROR;
+			continue;
+		}
+		redistributor.ready = true;
+	}
 
 	for (uint32 i = 0; i < controllerCount; i++) {
 		Controller& controller = fControllers[fControllerCount];
@@ -181,11 +214,22 @@ GICv3ItsGeneric::Init(volatile uint8* redistributors,
 				"\n", controllers[i], status);
 			continue;
 		}
-		controller.target = (_Read64(controller, kType) & (1 << 19)) != 0
-			? addressTarget : processorTarget;
+		controller.physicalTargets = (_Read64(controller, kType) & (1 << 19)) != 0;
 		InterruptsSpinLocker locker(controller.lock);
-		if (!_Submit(controller, MapCollection(0, controller.target, true))
-			|| !_Submit(controller, InvalidateAll(0))) {
+		// one collection per Redistributor, the boot CPU's first
+		bool mapped = true;
+		uint32 collections = 0;
+		for (uint32 n = 0; n < fRedistributorCount && mapped; n++) {
+			uint16 collection = (boot + n) % fRedistributorCount;
+			if (!fRedistributors[collection].ready)
+				continue;
+			mapped = _Submit(controller, MapCollection(collection,
+					_Target(controller, collection), true), collection)
+				&& _Submit(controller, InvalidateAll(collection), collection);
+			if (mapped)
+				collections++;
+		}
+		if (!mapped || collections == 0) {
 			dprintf("GICv3 ITS: controller %#" B_PRIxPHYSADDR
 				" did not take its collection\n", controllers[i]);
 			continue;
@@ -193,8 +237,9 @@ GICv3ItsGeneric::Init(volatile uint8* redistributors,
 		controller.ready = true;
 		fControllerCount++;
 		dprintf("GICv3 ITS: controller %#" B_PRIxPHYSADDR " ready, %" B_PRIu32
-			" DeviceID bits, ITT entries of %" B_PRIu32 " bytes\n", controllers[i],
-			controller.deviceBits, controller.ittEntrySize);
+			" DeviceID bits, ITT entries of %" B_PRIu32 " bytes, %" B_PRIu32
+			" collections\n", controllers[i], controller.deviceBits,
+			controller.ittEntrySize, collections);
 	}
 	if (fControllerCount == 0)
 		return B_ERROR;
@@ -305,13 +350,56 @@ GICv3ItsGeneric::_WaitReadOffset(Controller& controller, uint32 offset)
 }
 
 
+/*!	The ITS's name for the Redistributor of \a collection. */
+uint64
+GICv3ItsGeneric::_Target(const Controller& controller, uint16 collection) const
+{
+	const Redistributor& redistributor = fRedistributors[collection];
+	return controller.physicalTargets
+		? redistributor.addressTarget : redistributor.processorTarget;
+}
+
+
+/*!	The collection of \a cpu's Redistributor, -1 when it has none (the CPU
+	is not up, or its Redistributor has no LPIs).
+*/
+int32
+GICv3ItsGeneric::_CollectionForCpu(int32 cpu) const
+{
+	if (cpu < 0 || cpu >= smp_get_num_cpus())
+		return -1;
+	uint64 mpidr = gCPU[cpu].arch.mpidr;
+	if (cpu != 0 && (mpidr & CPU_AFF_MASK) == 0)
+		return -1;
+	uint32 affinity = affinity_of(mpidr);
+	for (uint32 i = 0; i < fRedistributorCount; i++) {
+		if (fRedistributors[i].affinity == affinity)
+			return fRedistributors[i].ready ? (int32)i : -1;
+	}
+	return -1;
+}
+
+
+int32
+GICv3ItsGeneric::_CpuForCollection(uint16 collection) const
+{
+	for (int32 cpu = 0; cpu < smp_get_num_cpus(); cpu++) {
+		if (affinity_of(gCPU[cpu].arch.mpidr) == fRedistributors[collection].affinity)
+			return cpu;
+	}
+	return 0;
+}
+
+
 bool
-GICv3ItsGeneric::_Submit(Controller& controller, const Command& command)
+GICv3ItsGeneric::_Submit(Controller& controller, const Command& command,
+	uint16 collection)
 {
 	// Callers hold the controller's lock. Two entries never fill the queue.
+	// The SYNC goes to the Redistributor the command affects.
 	if (!_WaitReadOffset(controller, controller.writeOffset))
 		return false;
-	const Command commands[] = {command, Sync(controller.target)};
+	const Command commands[] = {command, Sync(_Target(controller, collection))};
 	for (const Command& current : commands) {
 		volatile uint64* entry = (volatile uint64*)((uint8*)controller.commands.address
 			+ controller.writeOffset);
@@ -395,14 +483,16 @@ GICv3ItsGeneric::AllocateVectorsForDevice(const msi_requester* requester,
 	memory_full_barrier();
 	uint32 first = _FirstVector(lease);
 	if (!_Submit(*controller, MapDevice(requester->device_id,
-			lease->table.physical, kEventBits, true))) {
+			lease->table.physical, kEventBits, true), fBootCollection)) {
 		return B_ERROR;
 	}
+	// to the boot CPU first: installing the handler moves each to its CPU
 	for (uint32 event = 0; event < count; event++) {
 		if (!_Submit(*controller, MapInterrupt(requester->device_id, event,
-				first + event, 0))) {
+				first + event, fBootCollection), fBootCollection)) {
 			return B_ERROR;
 		}
+		lease->collection[event] = fBootCollection;
 	}
 	lease->controller = controller;
 	lease->device = requester->device_id;
@@ -428,11 +518,13 @@ GICv3ItsGeneric::FreeVectors(uint32 count, uint32 startVector)
 	Controller& controller = *lease->controller;
 	InterruptsSpinLocker locker(controller.lock);
 	for (uint32 event = 0; event < count; event++) {
-		if (!_Submit(controller, EventCommand(0x0f, lease->device, event)))
+		if (!_Submit(controller, EventCommand(0x0f, lease->device, event),
+				lease->collection[event])) {
 			return;
+		}
 	}
 	if (!_Submit(controller, MapDevice(lease->device, lease->table.physical,
-			kEventBits, false))) {
+			kEventBits, false), fBootCollection)) {
 		return;
 	}
 	lease->used = false;
@@ -453,5 +545,60 @@ GICv3ItsGeneric::SetEnabled(uint32 vector, bool enabled)
 	((volatile uint8*)fProperties.address)[vector - kFirstLpi] = enabled ? 0xa3 : 0xa2;
 	memory_full_barrier();
 	// The Redistributor caches the configuration: invalidate it.
-	_Submit(*lease->controller, EventCommand(0x0c, lease->device, event));
+	_Submit(*lease->controller, EventCommand(0x0c, lease->device, event),
+		lease->collection[event]);
+}
+
+
+/*!	Moves an LPI to the collection of \a cpu's Redistributor: MOVI, then a
+	SYNC to the new one (as Linux does). The LPI's pending state moves with
+	it; its configuration is shared, so no INV is needed. Runs with
+	interrupts disabled.
+*/
+int32
+GICv3ItsGeneric::AssignToCpu(uint32 vector, int32 cpu)
+{
+	Lease* lease = _LeaseForVector(vector);
+	if (lease == nullptr)
+		return 0;
+	uint32 event = vector - _FirstVector(lease);
+	if (event >= lease->count)
+		return _CpuForCollection(fBootCollection);
+
+	Controller& controller = *lease->controller;
+	InterruptsSpinLocker locker(controller.lock);
+	uint16 current = lease->collection[event];
+	int32 collection = _CollectionForCpu(cpu);
+	if (collection < 0 || !controller.ready)
+		return _CpuForCollection(current);
+	if (collection == current)
+		return cpu;
+	if (!_Submit(controller, MoveInterrupt(lease->device, event, collection),
+			collection)) {
+		return _CpuForCollection(current);
+	}
+	lease->collection[event] = collection;
+	atomic_add(&fMoves, 1);
+	return cpu;
+}
+
+
+void
+GICv3ItsGeneric::DumpRouting()
+{
+	kprintf("LPIs moved to another collection: %" B_PRId32 "\n", fMoves);
+	for (uint32 i = 0; i < kMaxLeases; i++) {
+		const Lease& lease = fLeases[i];
+		if (!lease.used)
+			continue;
+		for (uint32 event = 0; event < lease.count; event++) {
+			uint32 vector = _FirstVector(&lease) + event;
+			bool enabled = ((volatile uint8*)fProperties.address)[vector - kFirstLpi] & 1;
+			kprintf("LPI %5" B_PRIu32 ": ITS %#" B_PRIxPHYSADDR " DeviceID %#" B_PRIx32
+				" event %2" B_PRIu32 " -> collection %u (cpu%" B_PRId32 ")%s\n", vector,
+				lease.controller->physical, lease.device, event,
+				lease.collection[event], _CpuForCollection(lease.collection[event]),
+				enabled ? "" : ", disabled");
+		}
+	}
 }

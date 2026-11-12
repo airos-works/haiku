@@ -15,15 +15,21 @@ public:
 	virtual bool Contains(uint32 vector) const = 0;
 	virtual void SetEnabled(uint32 vector, bool enabled) = 0;
 	virtual void TraceInterrupt(uint32 vector) {}
+	// Moves an LPI to the collection of \a cpu; returns the CPU it goes to.
+	virtual int32 AssignToCpu(uint32 vector, int32 cpu) { return 0; }
+	virtual void DumpRouting() {}
 };
 
 
 // RK3588 firmware profile: ITS1/NVMe and ITS0/AX210, targeting CPU 0.
+// With "lpi_routing true" in the gicv3_its settings, every Redistributor
+// gets LPIs and a collection (ID = its index) and AssignToCpu() moves LPIs
+// to their CPUs; untried on the ROCK 5, so off by default.
 // Tables and reservations live for the kernel lifetime, including on failure.
 class GICv3Its : public GICv3LpiProvider {
 public:
 	status_t Init(volatile uint8* redistributors, uint32 count, bool trace,
-		bool forceHighTables);
+		bool forceHighTables, bool lpiRouting);
 	status_t AllocateVectors(uint32, uint32&, uint64&, uint32&) override
 		{ return B_NOT_SUPPORTED; }
 	status_t AllocateVectorsForDevice(const msi_requester* requester, uint32 count,
@@ -32,8 +38,12 @@ public:
 	void SetEnabled(uint32 vector, bool enabled) override;
 	void TraceInterrupt(uint32 vector) override;
 	bool Contains(uint32 vector) const override;
+	int32 AssignToCpu(uint32 vector, int32 cpu) override;
+	void DumpRouting() override;
 
 private:
+	static const uint32 kRedistributors = 8;
+
 	struct Memory {
 		area_id area = -1;
 		void* address = nullptr;
@@ -61,13 +71,17 @@ private:
 		bool ready = false;
 		bool faulted = false;
 		spinlock lock = B_SPINLOCK_INITIALIZER;
+		uint16 collection[Gicv3Its::kEventCount] = {};
 	};
 	status_t _PrepareSharedTables();
 	status_t _InitInstance(Instance& instance, uint64 controller, uint32 device,
 		uint32 firstLpi, const char* name);
 	status_t _PrepareInstanceTables(Instance& instance, const char* name);
 	bool _WriteChecked(Instance& instance, size_t offset, uint64 value);
-	bool _Submit(Instance& instance, const Gicv3Its::Command& command);
+	bool _Submit(Instance& instance, const Gicv3Its::Command& command,
+		uint16 collection = 0);
+	int32 _CollectionForCpu(int32 cpu) const;
+	int32 _CpuForCollection(uint16 collection) const;
 	bool _WaitReadOffset(Instance& instance, uint32 offset);
 	uint32 _Read32(const Instance& instance, size_t offset) const;
 	uint64 _Read64(const Instance& instance, size_t offset) const;
@@ -84,6 +98,11 @@ private:
 	Instance fNvme;
 	Instance fWifi;
 	uint64 fTarget = 0;
+	bool fLpiRouting = false;
+	Memory fCpuPending[kRedistributors];
+	uint32 fAffinity[kRedistributors] = {};
+	uint64 fTargets[kRedistributors] = {};
+	bool fCollectionReady[kRedistributors] = {};
 	phys_addr_t fMinimumTableAddress = 0;
 	bool fTrace = false;
 	int32 fTraceReporter = 0;

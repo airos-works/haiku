@@ -32,7 +32,8 @@ public:
 	status_t AllocateVectors(uint32 count, uint32& startVector,
 		uint64& address, uint32& data) override;
 	void FreeVectors(uint32 count, uint32 startVector) override;
-
+	int32 AssignToCpu(int32 irq, int32 cpu) override;
+	void DumpRouting() override;
 
 private:
 	volatile uint8_t *fGicrBase;
@@ -47,6 +48,7 @@ private:
 	Gicv3Mbi::VectorPool fMbiVectors;
 	int32 fMbiInterrupts[Gicv3Mbi::kVectorCount]{};
 	GICv3LpiProvider* fIts = nullptr;
+	spinlock fRoutingLock = B_SPINLOCK_INITIALIZER;
 
 	bool _InitGenericIts(phys_addr_t redistributor);
 
@@ -65,6 +67,7 @@ private:
 	static bool _WaitForMask(volatile uint32_t *reg, uint32_t mask, uint32_t expect);
 
 	void _SetEnable(uint vector, bool enable);
+	int32 _RoutedCpu(int32 irq);
 	void _RedistributorSleep(bool sleep);
 	void _InitMbi(phys_addr_t distributor, phys_addr_t redistributor);
 	void _InitIts(phys_addr_t distributor, phys_addr_t redistributor);

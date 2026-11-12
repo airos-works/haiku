@@ -6,6 +6,7 @@
 #define ARCH_ARM_GICV2_H
 
 #include <SupportDefs.h>
+#include <lock.h>
 
 #include "soc.h"
 
@@ -18,9 +19,16 @@ public:
 	void SendMulticastIci(CPUSet& cpuSet);
 	void SendBroadcastIci();
 	status_t PerCpuInit();
+	int32 AssignToCpu(int32 irq, int32 cpu);
+	void DumpRouting();
 private:
+	uint32 _CurrentCpuInterface();
+
 	volatile uint32_t *fGicdRegs;
 	volatile uint32_t *fGiccRegs;
+	int32 fMaxInt = 0;
+	uint8 fCpuInterface[SMP_MAX_CPUS] = {};
+	spinlock fLock = B_SPINLOCK_INITIALIZER;
 };
 
 #endif /* ARCH_ARM_GICV2_H */

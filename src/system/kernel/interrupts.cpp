@@ -12,6 +12,7 @@
 #include <interrupts.h>
 
 #include <stdio.h>
+#include <algorithm>
 #include <stdlib.h>
 #include <string.h>
 
@@ -19,6 +20,7 @@
 #include <arch/int.h>
 #include <boot/kernel_args.h>
 #include <elf.h>
+#include <kscheduler.h>
 #include <load_tracking.h>
 #include <util/AutoLock.h>
 #include <smp.h>
@@ -404,11 +406,41 @@ restore_interrupts(cpu_status status)
 }
 
 
+/*!	The capacity of the CPUs that new interrupts go to where they are not
+	all alike (big.LITTLE, hybrid x86): the fastest in low latency mode, so
+	that the fastest devices are not served by the slowest cores, the
+	slowest in power saving mode. 0 when they are all alike or the
+	architecture cannot tell.
+*/
+static uint32
+preferred_capacity()
+{
+	uint32 lowest = UINT32_MAX;
+	uint32 highest = 0;
+	for (int32 i = 0; i < smp_get_num_cpus(); i++) {
+		if (gCPU[i].disabled)
+			continue;
+		lowest = std::min(lowest, gCPU[i].capacity);
+		highest = std::max(highest, gCPU[i].capacity);
+	}
+	if (lowest == 0 || lowest >= highest)
+		return 0;
+	return _user_get_scheduler_mode() == SCHEDULER_MODE_POWER_SAVING
+		? lowest : highest;
+}
+
+
+/*!	The next enabled CPU, round robin over the topology so that interrupts
+	are spread over packages and cores first, among the CPUs of the
+	preferred capacity.
+*/
 static
 uint32 assign_cpu(void)
 {
+	uint32 capacity = preferred_capacity();
+	int32 tries = 4 * smp_get_num_cpus();
 	const cpu_topology_node* node;
-	do {
+	while (true) {
 		int32 nextID = atomic_add(&sLastCPU, 1);
 		node = get_cpu_topology();
 
@@ -417,7 +449,12 @@ uint32 assign_cpu(void)
 			node = node->children[nextID % levelSize];
 			nextID /= levelSize;
 		}
-	} while (gCPU[node->id].disabled);
+
+		if (gCPU[node->id].disabled)
+			continue;
+		if (capacity == 0 || gCPU[node->id].capacity == capacity || --tries <= 0)
+			break;
+	}
 
 	return node->id;
 }

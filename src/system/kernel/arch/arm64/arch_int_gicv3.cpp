@@ -72,7 +72,10 @@ GICv3InterruptController::GICv3InterruptController(phys_addr_t gicd_phys_addr,
 
 	uint32_t typer = GICD_TYPER;
 	fMaxInt = static_cast<int32_t>((typer & 0x1f) + 1) * 32;
-	reserve_io_interrupt_vectors(fMaxInt, 0, INTERRUPT_TYPE_IRQ);
+	// SGIs and PPIs (the timers) are banked per CPU: they are not routed
+	reserve_io_interrupt_vectors(32, 0, INTERRUPT_TYPE_LOCAL_IRQ);
+	reserve_io_interrupt_vectors(fMaxInt - 32, 32, INTERRUPT_TYPE_IRQ);
+	LoadRoutingSetting();
 
 	dprintf("GICv3 detected: rev %u, max interrupts %u, TYPER %#x\n", rev, fMaxInt, typer);
 	// disable the distributor
@@ -100,7 +103,8 @@ GICv3InterruptController::GICv3InterruptController(phys_addr_t gicd_phys_addr,
 	// ensure we're running on the cpu gCPU[0] points to
 	ASSERT((READ_SPECIALREG(mpidr_el1) & CPU_AFF_MASK) == (gCPU[0].arch.mpidr & CPU_AFF_MASK));
 
-	// set spi to target cpu 0 and its associated affinity. must do this after ARE enable
+	// set spi to target cpu 0 and its associated affinity. must do this after ARE enable.
+	// AssignToCpu() moves each one when its handler is installed.
 	for (int32_t i = 32; i < fMaxInt; i++)
 		GICD_IROUTER(i) = gCPU[0].arch.mpidr & CPU_AFF_MASK;
 
@@ -134,6 +138,8 @@ GICv3InterruptController::_InitIts(phys_addr_t distributor, phys_addr_t redistri
 	bool trace = get_driver_boolean_parameter(settings, "trace", false, false);
 	bool forceHighTables = get_driver_boolean_parameter(settings,
 		"force_high_tables", false, false);
+	bool lpiRouting = get_driver_boolean_parameter(settings, "lpi_routing",
+		false, true);
 	unload_driver_settings(settings);
 	if (!allowed || GICD_TYPER != 0x7b040f) {
 		dprintf("GICv3 ITS: firmware profile rejected\n");
@@ -142,7 +148,8 @@ GICv3InterruptController::_InitIts(phys_addr_t distributor, phys_addr_t redistri
 	GICv3Its* its = new(std::nothrow) GICv3Its;
 	if (its == nullptr)
 		return;
-	status_t status = its->Init(fGicrBase, fNumCpus, trace, forceHighTables);
+	status_t status = its->Init(fGicrBase, fNumCpus, trace, forceHighTables,
+		lpiRouting);
 	if (status != B_OK) {
 		dprintf("GICv3 ITS: initialization rejected/failed: %" B_PRId32 "\n", status);
 		return;
@@ -153,13 +160,16 @@ GICv3InterruptController::_InitIts(phys_addr_t distributor, phys_addr_t redistri
 
 
 /*!	Sets up the ITSs listed under the GIC's device tree node from scratch, on
-	machines whose firmware leaves LPIs off. Enabled on the SC8280XP so far.
+	machines whose firmware leaves LPIs off. Enabled on the SC8280XP and on
+	QEMU's virt machine (booted with a device tree: -M virt,acpi=off).
 */
 bool
 GICv3InterruptController::_InitGenericIts(phys_addr_t redistributor)
 {
-	if (gFDT == NULL || fdt_node_check_compatible(gFDT, 0, "qcom,sc8280xp") != 0)
+	if (gFDT == NULL || (fdt_node_check_compatible(gFDT, 0, "qcom,sc8280xp") != 0
+			&& fdt_node_check_compatible(gFDT, 0, "linux,dummy-virt") != 0)) {
 		return false;
+	}
 	int gic = fdt_node_offset_by_compatible(gFDT, -1, "arm,gic-v3");
 	if (gic < 0)
 		return false;
@@ -243,7 +253,8 @@ GICv3InterruptController::_InitMbi(phys_addr_t distributor, phys_addr_t redistri
 	}
 	// The GIC's existing reservation owns these hardware vector IDs for the
 	// kernel lifetime. The local pool grants exclusive MSI leases within it.
-	// Leave the established non-secure grouping, priority and CPU 0 routes.
+	// Leave the established non-secure grouping and priority. They are
+	// routed like any other SPI, from CPU 0 to where their handlers go.
 	fMbiEnabled = true;
 	msi_set_interface(this);
 	dprintf("GICv3 MBI: enabled vectors 464..479, address %#" B_PRIx64 ", CPU 0\n",
@@ -339,12 +350,87 @@ GICv3InterruptController::_SetEnable(uint vector, bool enable)
 		// Fuchsia was wrongly masking GICD_CTLR_RWP instead of GICR_CTLR_RWP here
 		_WaitForMask(&GICR_CTLR(cpu_id), GICR_CTLR_RWP, 0);
 	} else {
+		// AssignToCpu() masks an enabled SPI while it moves it
+		InterruptsSpinLocker locker(fRoutingLock);
 		if (enable)
 			GICD_ISENABLER(vector / 32) = mask;
 		else
 			GICD_ICENABLER(vector / 32) = mask;
 		_WaitForMask(&GICD_CTLR, GICD_CTLR_RWP, 0);
 	}
+}
+
+
+/*!	Routes a shared interrupt to \a cpu: an SPI by its GICD_IROUTER (the
+	CPU's affinity, Interrupt_Routing_Mode 0: that CPU only), an LPI by
+	moving it to that CPU's ITS collection. As Linux does, an enabled SPI is
+	masked while its route changes, so that it is not delivered half-way.
+	Returns the CPU the interrupt goes to.
+*/
+int32
+GICv3InterruptController::AssignToCpu(int32 irq, int32 cpu)
+{
+	if (fIts != nullptr && fIts->Contains(irq)) {
+		if (!RoutingEnabled())
+			return 0;
+		return fIts->AssignToCpu(irq, UsableCpu(cpu));
+	}
+	if (irq < 32 || irq >= fMaxInt)
+		return cpu;
+	if (!RoutingEnabled())
+		return 0;
+
+	cpu = UsableCpu(cpu);
+	uint64 affinity = gCPU[cpu].arch.mpidr & CPU_AFF_MASK;
+	if (cpu != 0 && affinity == 0) {
+		// that CPU has not come up (yet)
+		return _RoutedCpu(irq);
+	}
+
+	InterruptsSpinLocker locker(fRoutingLock);
+	if ((GICD_IROUTER(irq) & CPU_AFF_MASK) == affinity)
+		return cpu;
+	uint32 mask = 1u << (irq % 32);
+	bool enabled = (GICD_ISENABLER(irq / 32) & mask) != 0;
+	CountMove(enabled);
+	if (enabled) {
+		GICD_ICENABLER(irq / 32) = mask;
+		_WaitForMask(&GICD_CTLR, GICD_CTLR_RWP, 0);
+	}
+	GICD_IROUTER(irq) = affinity;
+	if (enabled) {
+		GICD_ISENABLER(irq / 32) = mask;
+		_WaitForMask(&GICD_CTLR, GICD_CTLR_RWP, 0);
+	}
+	return cpu;
+}
+
+
+/*!	The CPU an SPI's GICD_IROUTER names, 0 when it is none of ours. */
+int32
+GICv3InterruptController::_RoutedCpu(int32 irq)
+{
+	uint64 route = GICD_IROUTER(irq);
+	for (int32 i = 0; i < smp_get_num_cpus(); i++) {
+		if ((gCPU[i].arch.mpidr & CPU_AFF_MASK) == (route & CPU_AFF_MASK))
+			return i;
+	}
+	return 0;
+}
+
+
+void
+GICv3InterruptController::DumpRouting()
+{
+	DumpDeviceInterrupts();
+	for (int32 irq = 32; irq < fMaxInt; irq++) {
+		if ((GICD_ISENABLER(irq / 32) & (1u << (irq % 32))) == 0)
+			continue;
+		kprintf("SPI %4" B_PRId32 ": IROUTER %#" B_PRIx64 " -> cpu%" B_PRId32 "\n",
+			irq, (uint64)GICD_IROUTER(irq), _RoutedCpu(irq));
+	}
+	if (fIts != nullptr)
+		fIts->DumpRouting();
 }
 
 
@@ -587,6 +673,8 @@ GICv3InterruptController::HandleInterrupt()
 		}
 		if (lpi)
 			fIts->TraceInterrupt(irq);
+		if (irq >= 32)
+			CountDeviceInterrupt();
 		io_interrupt_handler(irq, (mbi || lpi) ? B_EDGE_TRIGGERED : B_LEVEL_TRIGGERED);
 	}
 
