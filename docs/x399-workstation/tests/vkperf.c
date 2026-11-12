@@ -12,6 +12,9 @@
  *  - for long jobs, how long vkQueueSubmit itself takes and how much CPU it
  *    and vkWaitForFences use (a submit that takes as long as the GPU work is
  *    synchronous);
+ *  - frames of ~5 ms CPU work and ~5 ms GPU work with two in flight: about
+ *    5 ms a frame when CPU and GPU overlap, 10 ms when submission is
+ *    synchronous;
  *  - what allocating + binding + mapping, and freeing, a buffer costs.
  * VKPERF_UUID_ONLY=1 prints the device and its pipelineCacheUUID and stops.
  *
@@ -409,6 +412,64 @@ int main(int argc, char **argv)
 		}
 	}
 	if (haveH) gpu_fill(&bh, 8, "host-visible x8");
+
+	printf("\nCPU and GPU overlap: frames of ~5 ms CPU work and ~5 ms GPU work, two in flight\n");
+	if (haveL) {
+		/* GPU work per frame: fills sized to take about 5 ms (VKPERF_FILLS
+		 * fixes the number, for comparing drivers) */
+		begin();
+		for (int k = 0; k < 8; k++) {
+			vkCmdFillBuffer(cmd, bl.buffer, 0, bl.size, k);
+			barrier();
+		}
+		bigtime_t eight = submit_wait(NULL, NULL);
+		int fills = eight > 0 ? (int)((5000 * 8 + eight / 2) / eight) : 1;
+		if (getenv("VKPERF_FILLS") != NULL)
+			fills = atoi(getenv("VKPERF_FILLS"));
+		if (fills < 1)
+			fills = 1;
+		VkCommandBuffer frameCmd[2];
+		VkFence frameFence[2];
+		VkCommandBufferAllocateInfo fai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+		fai.commandPool = pool;
+		fai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+		fai.commandBufferCount = 2;
+		CHECK(vkAllocateCommandBuffers(dev, &fai, frameCmd));
+		VkFenceCreateInfo sfi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+		sfi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+		CHECK(vkCreateFence(dev, &sfi, NULL, &frameFence[0]));
+		CHECK(vkCreateFence(dev, &sfi, NULL, &frameFence[1]));
+		const int frames = 100;
+		bigtime_t start = system_time(), cpu0 = thread_cpu(), waited = 0;
+		for (int f = 0; f < frames; f++) {
+			const int i = f & 1;
+			bigtime_t w0 = system_time();
+			CHECK(vkWaitForFences(dev, 1, &frameFence[i], VK_TRUE, 10000000000ull));
+			waited += system_time() - w0;
+			CHECK(vkResetFences(dev, 1, &frameFence[i]));
+			/* the application's own work for this frame */
+			bigtime_t busy = system_time() + 5000;
+			volatile uint64_t spin = 0;
+			while (system_time() < busy)
+				spin++;
+			CHECK(vkResetCommandBuffer(frameCmd[i], 0));
+			VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+			CHECK(vkBeginCommandBuffer(frameCmd[i], &bi));
+			for (int k = 0; k < fills; k++)
+				vkCmdFillBuffer(frameCmd[i], bl.buffer, 0, bl.size, f + k);
+			CHECK(vkEndCommandBuffer(frameCmd[i]));
+			VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+			si.commandBufferCount = 1;
+			si.pCommandBuffers = &frameCmd[i];
+			CHECK(vkQueueSubmit(queue, 1, &si, frameFence[i]));
+		}
+		CHECK(vkWaitForFences(dev, 2, frameFence, VK_TRUE, 10000000000ull));
+		bigtime_t total = system_time() - start;
+		printf("  %d frames (%d fills of 64 MiB each): %.2f ms per frame, %.1f fps; "
+			"waiting %.2f ms per frame, thread CPU %.2f ms per frame\n", frames, fills,
+			total / 1000.0 / frames, frames * 1e6 / total, waited / 1000.0 / frames,
+			(thread_cpu() - cpu0) / 1000.0 / frames);
+	}
 
 	printf("\nallocation cost\n");
 	if (host >= 0) alloc_cost(host, 64 << 10, 200, "64 KiB host-visible");

@@ -1323,6 +1323,30 @@ each USB port, the serial console, and a Bluetooth device to pair with.
   Left as they were, next in line: the copy of client bitmaps into the back
   buffer (DrawBitmap, most of a Terminal's or a browser's frame), background
   fills (gfxset32, 8 bytes at a time), CopyRegion within the back buffer.
+- 2026-11-12: NVK's submissions no longer wait for the GPU (#107,
+  airos-works/mesa-nvk 8a7dc4b). `vkQueueSubmit` used to return only
+  once the GPU had run what it was given, so the processor and the GPU never
+  worked at the same time: 792 ms of fills took 792 ms inside
+  `vkQueueSubmit`. A submission now ends with its channel's semaphore
+  release and returns; each signal it carries is a point that becomes true
+  when the semaphore reaches the submission's number. A timeline keeps every
+  point, so waiting for an earlier value waits for the submission that makes
+  it - the asynchronous experiment of 2026-11-10 kept only the latest, which
+  made zink wait for the newest submission whenever it reused an old batch,
+  and lost 7 % in MotionMark. Waits still poll, because resman delivers no
+  completion event on this GPU (a `poll()` on the channel's event always
+  runs to its timeout): 20 us of spinning, then sleeps of a thirty-second of
+  the time waited, 10 to 100 us.
+  Measured (`vkperf`, docs/x399-workstation/tests):
+      frames of 5 ms CPU work and 4.7 ms GPU work, two in flight: 9.8-10.7
+        ms a frame before, 5.05 ms after (94-103 -> 198 fps)
+      vkQueueSubmit of 792 ms of GPU work: 792.5 ms -> 0.0 ms; the wait
+        for it uses 15 ms of CPU (2 %)
+      an empty submission and its wait: 6.0 -> 6.8 us
+      MotionMark 1.3.1 in Summit (GPU tiles, 1121x538 at 200%): 609.93 and
+        578.28 before, 612.21 and 620.64 after (the experiment: 619 -> 578);
+        Suits is lower (571, 588 -> 507, 497), the rest level or higher
+  `NVK_NVRM_SYNC_SUBMIT=1` waits in every submission as before.
 - 2026-09-19: measured what 2D drawing costs, since the accelerant offers no 2D
   hooks at all and every pixel app_server draws crosses the bus. The same
   drawing into an off-screen bitmap, against a window on the screen
