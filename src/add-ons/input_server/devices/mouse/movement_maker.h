@@ -47,6 +47,12 @@ private:
 			
 			bool				fMovementMakerStarted;
 
+			// where the scroll gesture's fingers are taken to be, in the
+			// calibrated units, following them with some hysteresis
+			bool				fScrollTrackingStarted;
+			float				fScrollTrackX;
+			float				fScrollTrackY;
+
 protected:
 			uint32				fPreviousX;
 			uint32				fPreviousY;

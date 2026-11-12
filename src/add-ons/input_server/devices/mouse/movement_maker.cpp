@@ -123,6 +123,7 @@ MovementMaker::StartNewMovment()
 		fSettings.scroll_ystepsize = 1;
 
 	fMovementMakerStarted = true;
+	fScrollTrackingStarted = false;
 	scrolling_x = 0;
 	scrolling_y = 0;
 }
@@ -137,6 +138,50 @@ MovementMaker::GetMovement(uint32 posX, uint32 posY)
 }
 
 
+/*!	How far a finger that moves from \a tracked to \a position takes the
+	scroll gesture: the tracked point follows the finger at up to \a margin
+	behind it, so a finger resting on the touchpad (whose reported position
+	flickers by a unit or so) scrolls nothing, while one that moves, however
+	slowly, scrolls as far as it moves.
+*/
+static float
+follow_with_hysteresis(float position, float& tracked, float margin)
+{
+	float distance = position - tracked;
+	if (distance > margin)
+		distance -= margin;
+	else if (distance < -margin)
+		distance += margin;
+	else
+		return 0;
+
+	tracked += distance;
+	return distance;
+}
+
+
+/*!	A scroll movement in the calibrated units turned into the movement units
+	the wheel steps are counted in, above one unit a report a little less than
+	linearly, as _GetRawMovement() does for the pointer. The pointer's whole
+	units are 12 calibrated units, but rounding each report down to them lost
+	about 40 % of a steady scroll; with 20 a scroll of 30 to 80 mm a second
+	goes as far as it did (Framework 13), and slower ones now go at all.
+*/
+static float
+scroll_units(float distance)
+{
+	const float translation = 20.0;
+	const float acceleration = 0.8;
+
+	float units = distance / translation;
+	if (units > 1)
+		units = 1 + (units - 1) * acceleration;
+	else if (units < -1)
+		units = -1 + (units + 1) * acceleration;
+	return units;
+}
+
+
 void
 MovementMaker::GetScrolling(uint32 posX, uint32 posY, bool reverse)
 {
@@ -145,15 +190,41 @@ MovementMaker::GetScrolling(uint32 posX, uint32 posY, bool reverse)
 	int32 stepsX = 0, stepsY = 0;
 	int32 directionMultiplier = reverse ? -1 : 1;
 
-	_GetRawMovement(posX, posY);
-	_ComputeAcceleration(fSettings.scroll_acceleration);
+	// The pointer's movement (_GetRawMovement()) is counted in whole units,
+	// and its running sum starts over at every report without movement: a
+	// finger that moves slower than about a unit a report scrolled nothing
+	// at all, and a faster one in jumps of whole units (a tenth of a wheel
+	// step on the Framework 13), which made slow touchpad scrolling stand
+	// still and then jerk. Scrolling follows the fingers' positions as they
+	// are reported instead, with a little hysteresis for resting fingers.
+	float x = posX * (float)SYN_WIDTH / fAreaWidth;
+	float y = posY * (float)SYN_HEIGHT / fAreaHeight;
+	if (!fScrollTrackingStarted) {
+		fScrollTrackingStarted = true;
+		fScrollTrackX = x;
+		fScrollTrackY = y;
+	}
+
+	// a unit and a half of the touchpad's own
+	float marginX = 1.5f * SYN_WIDTH / fAreaWidth;
+	float marginY = 1.5f * SYN_HEIGHT / fAreaHeight;
+	float unitsX = scroll_units(follow_with_hysteresis(x, fScrollTrackX, marginX));
+	float unitsY = scroll_units(follow_with_hysteresis(y, fScrollTrackY, marginY));
+
+	// the acceleration of _ComputeAcceleration(), without its rounding
+	if (fSettings.scroll_acceleration != 0) {
+		float acceleration = 1 + sqrtf(unitsX * unitsX + unitsY * unitsY)
+			* fSettings.scroll_acceleration / 50.0;
+		unitsX *= acceleration;
+		unitsY *= acceleration;
+	}
 
 	precise_x = 0;
 	precise_y = 0;
 
 	if (fSettings.scroll_xstepsize > 0) {
-		precise_x = directionMultiplier * xDelta / fSettings.scroll_xstepsize;
-		scrolling_x += directionMultiplier * xDelta;
+		precise_x = directionMultiplier * unitsX / fSettings.scroll_xstepsize;
+		scrolling_x += directionMultiplier * unitsX;
 
 		stepsX = make_small(scrolling_x / fSettings.scroll_xstepsize);
 
@@ -165,8 +236,8 @@ MovementMaker::GetScrolling(uint32 posX, uint32 posY, bool reverse)
 	}
 
 	if (fSettings.scroll_ystepsize > 0) {
-		precise_y = -directionMultiplier * yDelta / fSettings.scroll_ystepsize;
-		scrolling_y += directionMultiplier * yDelta;
+		precise_y = -directionMultiplier * unitsY / fSettings.scroll_ystepsize;
+		scrolling_y += directionMultiplier * unitsY;
 
 		stepsY = make_small(scrolling_y / fSettings.scroll_ystepsize);
 

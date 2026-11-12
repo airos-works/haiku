@@ -35,8 +35,24 @@ case B_MOUSE_WHEEL_CHANGED:
 }
 ```
 
+Since 2026-11-12 the scrolling follows the fingers' reported positions
+(airos-works/summit#200). Before, it was counted in the pointer's whole units:
+a report that moved less than a unit was dropped, and the running sum started
+over at every report without movement, so fingers slower than about a unit a
+report (8 mm a second on the Framework 13) scrolled nothing at all and faster
+ones scrolled in jumps of a tenth of a step. Now:
+
+- The precise deltas are the fingers' movement, not rounded, after a
+  hysteresis of a unit and a half of the touchpad's own: fingers resting on
+  it (whose position flickers by a unit) send nothing, a moving finger
+  scrolls as far as it moves, however slowly.
+- The whole steps (`be:wheel_delta_*`) are cut from the same movement, so
+  programs that only read them scroll slowly too.
+- The gain is set so a scroll of 30 to 80 mm a second goes as far as it did.
+  Faster than that it goes a little further (the old rounding lost more there).
+
 `touchpad_scroll_test` (src/tests/add-ons/input_server) feeds scroll gestures
-to the add-on's gesture code and checks the phases and that the precise
-deltas add up to the whole steps. `wheel_log [seconds]` opens a window that
-prints the wheel messages it gets. On the Framework 13's PixArt touchpad a
-step is 15 touchpad units, so precise deltas come in 1/15 steps.
+to the add-on's gesture code and checks the phases, that the precise deltas
+add up to the whole steps, that a slow finger (half a unit a report) scrolls
+as far as a steady one, and that a resting one does not scroll. `wheel_log
+[seconds]` opens a window that prints the wheel messages it gets.
