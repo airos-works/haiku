@@ -41,6 +41,7 @@ public:
 			int				PopulateSackInfo(tcp_sequence sequence, int maxSackCount, tcp_sack* sacks);
 
 			size_t				Used() const { return fNumBytes; }
+			int32				CountBuffers() const { return fList.Count(); }
 	inline	size_t				Free() const;
 			size_t				Size() const { return fMaxBytes; }
 

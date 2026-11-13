@@ -23,6 +23,7 @@
 
 #include <netinet/in.h>
 #include <netinet6/in6.h>
+#include <netinet/ip6.h>
 #include <netinet/icmp6.h>
 #include <net/ethernet.h>
 #include <net/if.h>
@@ -474,7 +475,7 @@ ndp_send_data(net_buffer* buffer)
 */
 status_t
 ndp_update_entry(const in6_addr& protocolAddress, sockaddr_dl* hardwareAddress,
-	uint32 flags, ndp_entry** _entry = NULL)
+	uint32 flags, ndp_entry** _entry = NULL, bool learned = false)
 {
 	ASSERT_LOCKED_MUTEX(&sCacheLock);
 
@@ -490,12 +491,19 @@ ndp_update_entry(const in6_addr& protocolAddress, sockaddr_dl* hardwareAddress,
 			&& memcmp(LLADDR(&entry->hardware_address),
 				LLADDR(hardwareAddress), ETHER_ADDRESS_LENGTH)) {
 			// TODO: also printf the address
-			dprintf("NDP host updated with different hardware address "
-				"%02x:%02x:%02x:%02x:%02x:%02x.\n",
-				hardwareAddress->sdl_data[0], hardwareAddress->sdl_data[1],
-				hardwareAddress->sdl_data[2], hardwareAddress->sdl_data[3],
-				hardwareAddress->sdl_data[4], hardwareAddress->sdl_data[5]);
-			return B_ERROR;
+			// as for ARP: what the network tells us may move a learned entry,
+			// but not one of ours, and not twice within a second
+			// (airos-works/haiku#129)
+			if (!learned
+				|| (entry->flags & (NDP_FLAG_LOCAL | NDP_FLAG_PERMANENT
+					| NDP_FLAG_PUBLISH)) != 0
+				|| system_time() - entry->timestamp < 1000000) {
+				uint8* data = LLADDR(hardwareAddress);
+				dprintf("NDP host updated with different hardware address "
+					"%02x:%02x:%02x:%02x:%02x:%02x, ignored.\n",
+					data[0], data[1], data[2], data[3], data[4], data[5]);
+				return B_ERROR;
+			}
 		}
 
 		entry->hardware_address = *hardwareAddress;
@@ -735,13 +743,21 @@ ndp_receive_solicitation(net_buffer* buffer, bool* reuseBuffer)
 		memcpy(LLADDR(&hardwareAddress), header.link_address,
 			ETHER_ADDRESS_LENGTH);
 
-		ndp_update_entry(source->sin6_addr, &hardwareAddress, 0);
-
 		// check if this request is for us
-
 		ndp_entry* entry = ndp_entry::Lookup(header.target_address);
-		if (entry == NULL
-			|| (entry->flags & (NDP_FLAG_LOCAL | NDP_FLAG_PUBLISH)) == 0) {
+		bool forUs = entry != NULL
+			&& (entry->flags & (NDP_FLAG_LOCAL | NDP_FLAG_PUBLISH)) != 0;
+
+		// update an entry we have, but only add one when the solicitation
+		// is for us (airos-works/haiku#129)
+		if (!IN6_IS_ADDR_UNSPECIFIED(&source->sin6_addr)
+			&& (ndp_entry::Lookup(source->sin6_addr) != NULL || forUs)) {
+			ndp_update_entry(source->sin6_addr, &hardwareAddress, 0, NULL,
+				true);
+		}
+
+		entry = ndp_entry::Lookup(header.target_address);
+		if (!forUs) {
 			// We're not the one to answer this request
 			// TODO: instead of letting the other's request time-out, can we
 			//	reply failure somehow?
@@ -810,7 +826,11 @@ ndp_receive_advertisement(net_buffer* buffer)
 
 	MutexLocker locker(sCacheLock);
 	// TODO: take in account ND_NA_FLAGs
-	ndp_update_entry(header.target_address, &hardwareAddress, 0);
+
+	// unsolicited advertisements for addresses we don't know add nothing
+	if (ndp_entry::Lookup(header.target_address) == NULL)
+		return;
+	ndp_update_entry(header.target_address, &hardwareAddress, 0, NULL, true);
 }
 
 
@@ -835,6 +855,16 @@ ndp_receive_data(net_buffer* buffer)
 	NetBufferHeaderReader<icmp6_hdr> icmp6Header(buffer);
 	if (icmp6Header.Status() < B_OK)
 		return icmp6Header.Status();
+
+	// RFC 4861: neighbor discovery messages must arrive with a hop limit of
+	// 255, which only a host on the same link can send (airos-works/haiku#129)
+	ip6_hdr ipHeader;
+	if (gBufferModule->restore_header(buffer, 0, &ipHeader, sizeof(ip6_hdr))
+			== B_OK && (ipHeader.ip6_vfc & IPV6_VERSION_MASK) == IPV6_VERSION
+		&& ipHeader.ip6_hlim != 255) {
+		gBufferModule->free(buffer);
+		return B_OK;
+	}
 
 	bool reuseBuffer = false;
 

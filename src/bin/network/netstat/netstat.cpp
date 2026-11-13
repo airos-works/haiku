@@ -166,6 +166,8 @@ print_statistics()
 	LINE(stats.tcp_challenge_acks, "challenge ACKs sent (RFC 5961)");
 	LINE(stats.tcp_connections_refused,
 		"connections refused (listen queue full)");
+	LINE(stats.tcp_syn_cookies_sent, "SYN cookies sent");
+	LINE(stats.tcp_syn_cookies_accepted, "connections made from SYN cookies");
 
 	printf("raw:\n");
 	LINE(stats.raw_receive_buffer_errors,

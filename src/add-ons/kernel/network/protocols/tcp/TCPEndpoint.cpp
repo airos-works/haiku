@@ -440,6 +440,73 @@ connection_hash(const sockaddr* local, const sockaddr* peer, uint8 purpose)
 }
 
 
+// SYN cookies (airos-works/haiku#129): when a listener's queue is full, the
+// SYN-ACK's sequence number carries all we need to know later, and nothing
+// is kept. Layout: 5 bits of a 64 s counter, 2 bits for the MSS, 25 bits of
+// a keyed hash of the connection, the peer's sequence number, the counter
+// and the MSS.
+static const uint16 kCookieSegmentSizes[] = { 536, 1220, 1440, 1460 };
+static const bigtime_t kCookiePeriod = 64000000LL;
+
+
+static uint32
+syn_cookie_hash(const sockaddr* local, const sockaddr* peer,
+	uint32 peerSequence, uint32 counter, uint32 sizeIndex)
+{
+	uint8 data[1 + 2 * (16 + 2) + 12];
+	size_t length = 0;
+	data[length++] = 2;
+	length += append_address(data + length, local);
+	length += append_address(data + length, peer);
+	memcpy(data + length, &peerSequence, 4);
+	memcpy(data + length + 4, &counter, 4);
+	memcpy(data + length + 8, &sizeIndex, 4);
+	length += 12;
+
+	return (uint32)net_secret_hash(gTCPSecret, data, length);
+}
+
+
+static uint32
+make_syn_cookie(const sockaddr* local, const sockaddr* peer,
+	uint32 peerSequence, uint16 peerSegmentSize, uint16* _segmentSize)
+{
+	uint32 sizeIndex = 0;
+	for (uint32 i = 0; i < B_COUNT_OF(kCookieSegmentSizes); i++) {
+		if (peerSegmentSize >= kCookieSegmentSizes[i])
+			sizeIndex = i;
+	}
+	*_segmentSize = kCookieSegmentSizes[sizeIndex];
+
+	uint32 counter = (uint32)(system_time() / kCookiePeriod) & 0x1f;
+	return (counter << 27) | (sizeIndex << 25)
+		| (syn_cookie_hash(local, peer, peerSequence, counter, sizeIndex)
+			& 0x1ffffff);
+}
+
+
+/*!	Checks the acknowledgement of a cookie SYN-ACK; on success, returns the
+	MSS the cookie encoded. Cookies are good for up to two counter periods.
+*/
+static bool
+check_syn_cookie(const sockaddr* local, const sockaddr* peer,
+	uint32 peerSequence, uint32 cookie, uint16* _segmentSize)
+{
+	uint32 counter = cookie >> 27;
+	uint32 now = (uint32)(system_time() / kCookiePeriod) & 0x1f;
+	if (((now - counter) & 0x1f) > 1)
+		return false;
+
+	uint32 sizeIndex = (cookie >> 25) & 3;
+	if ((syn_cookie_hash(local, peer, peerSequence, counter, sizeIndex)
+			& 0x1ffffff) != (cookie & 0x1ffffff))
+		return false;
+
+	*_segmentSize = kCookieSegmentSizes[sizeIndex];
+	return true;
+}
+
+
 static inline uint32
 tcp_diff_timestamp(uint32 base)
 {
@@ -1959,6 +2026,74 @@ abort:
 }
 
 
+/*!	Creates the connection for the ACK that answered a SYN cookie, as if the
+	SYN-ACK had come from this endpoint in SYNCHRONIZE_RECEIVED, and lets the
+	ACK complete it.
+*/
+int32
+TCPEndpoint::_SpawnFromCookie(TCPEndpoint* parent, tcp_segment_header& segment,
+	net_buffer* buffer, uint16 maxSegmentSize)
+{
+	MutexLocker locker(fLock);
+
+	(*LocalAddress())->sa_len = 0;
+
+	if (ProtocolSocket::Open() != B_OK)
+		goto abort;
+
+	socket->address.ss_len = 0;
+
+	fState = SYNCHRONIZE_RECEIVED;
+	T(Spawn(parent, this));
+
+	fManager = parent->fManager;
+
+	if (fManager->BindChild(this, buffer->destination) != B_OK)
+		goto abort;
+	if (_PrepareSendPath(buffer->source) != B_OK)
+		goto abort;
+
+	fOptions = parent->fOptions;
+	fUserTimeout = parent->fUserTimeout;
+	fKeepAliveIdle = parent->fKeepAliveIdle;
+	fKeepAliveInterval = parent->fKeepAliveInterval;
+	fKeepAliveCount = parent->fKeepAliveCount;
+	fAcceptSemaphore = parent->fAcceptSemaphore;
+
+	{
+		// the SYN we did not keep: no options but the MSS the cookie held
+		tcp_segment_header synchronize(TCP_FLAG_SYNCHRONIZE);
+		synchronize.sequence = segment.sequence - 1;
+		synchronize.advertised_window = segment.advertised_window;
+		synchronize.max_segment_size = maxSegmentSize;
+		_PrepareReceivePath(synchronize);
+
+		// our SYN-ACK went out with the cookie as its sequence number
+		tcp_sequence initial = segment.acknowledge - 1;
+		fInitialSendSequence = initial;
+		fSendUnacknowledged = initial;
+		fSendUrgentOffset = initial;
+		fRecover = initial.Number();
+		fSendNext = initial + 1;
+		fSendMax = initial + 1;
+		fSendQueue.SetInitialSequence(initial + 1);
+
+		// what that SYN-ACK told the peer
+		fLastAcknowledgeSent = fReceiveNext;
+		fReceiveMaxAdvertised = fReceiveNext + 65535;
+	}
+
+	return _Receive(segment, buffer);
+
+abort:
+	fState = CLOSED;
+	_CancelConnectionTimers();
+	locker.Unlock();
+	gSocketModule->set_aborted(socket);
+	return DROP;
+}
+
+
 int32
 TCPEndpoint::_ListenReceive(tcp_segment_header& segment, net_buffer* buffer)
 {
@@ -1968,8 +2103,24 @@ TCPEndpoint::_ListenReceive(tcp_segment_header& segment, net_buffer* buffer)
 	// but the error behaviour differs
 	if (segment.flags & TCP_FLAG_RESET)
 		return DROP;
-	if (segment.flags & TCP_FLAG_ACKNOWLEDGE)
+	if (segment.flags & TCP_FLAG_ACKNOWLEDGE) {
+		// the answer to a SYN cookie?
+		uint16 segmentSize;
+		if ((segment.flags & TCP_FLAG_SYNCHRONIZE) == 0
+			&& check_syn_cookie(buffer->destination, buffer->source,
+				segment.sequence - 1, segment.acknowledge - 1, &segmentSize)) {
+			net_socket* newSocket;
+			if (gSocketModule->spawn_completed_socket(socket, &newSocket)
+					< B_OK) {
+				NET_STAT_INC(gStackModule, tcp_connections_refused);
+				return DROP;
+			}
+			NET_STAT_INC(gStackModule, tcp_syn_cookies_accepted);
+			return ((TCPEndpoint*)newSocket->first_protocol)->_SpawnFromCookie(
+				this, segment, buffer, segmentSize);
+		}
 		return DROP | RESET;
+	}
 	if ((segment.flags & TCP_FLAG_SYNCHRONIZE) == 0)
 		return DROP;
 
@@ -1978,8 +2129,19 @@ TCPEndpoint::_ListenReceive(tcp_segment_header& segment, net_buffer* buffer)
 	// spawn new endpoint for accept()
 	net_socket* newSocket;
 	if (gSocketModule->spawn_pending_socket(socket, &newSocket) < B_OK) {
+		// The queue is full, possibly of half-open connections a flood of
+		// forged SYNs left behind: answer with a SYN cookie instead of
+		// refusing, so that real clients still get through
+		// (airos-works/haiku#129).
 		T(Error(this, "spawning failed", __LINE__));
-		NET_STAT_INC(gStackModule, tcp_connections_refused);
+		uint16 segmentSize;
+		uint32 cookie = make_syn_cookie(buffer->destination, buffer->source,
+			segment.sequence, segment.max_segment_size, &segmentSize);
+		uint16 ourSize = (uint16)min_c((uint32)segmentSize,
+			(uint32)_MaxSegmentSize(buffer->source));
+		if (fManager->ReplyWithSynCookie(segment, buffer, cookie, ourSize)
+				!= B_OK)
+			NET_STAT_INC(gStackModule, tcp_connections_refused);
 		return DROP;
 	}
 
@@ -2389,10 +2551,22 @@ TCPEndpoint::_Receive(tcp_segment_header& segment, net_buffer* buffer)
 	// the size as we still need it later.
 	const uint32 bufferSize = buffer->size;
 
+	// Out-of-order segments wait in the receive queue, one buffer each. The
+	// queue counts their payload only, so one-byte segments could pin a
+	// 2 KB block per byte of window; their number is limited to what
+	// half-kilobyte segments would need (airos-works/haiku#129). A dropped
+	// segment is sent again by the peer once the gap closes.
+	bool outOfOrderLimit = segment.sequence > fReceiveNext
+		&& fReceiveQueue.CountBuffers()
+			> (int32)(fReceiveQueue.Size() / 512 + 64);
+
 	if ((bufferSize > 0 || (segment.flags & TCP_FLAG_FINISH) != 0)
-		&& _ShouldReceive())
+		&& _ShouldReceive() && !outOfOrderLimit)
 		notify = _AddData(segment, buffer);
-	else {
+	else if (outOfOrderLimit) {
+		action = (action & ~KEEP) | DROP | IMMEDIATE_ACKNOWLEDGE;
+		segment.flags &= ~TCP_FLAG_FINISH;
+	} else {
 		if ((fFlags & FLAG_NO_RECEIVE) != 0)
 			fReceiveNext += buffer->size;
 

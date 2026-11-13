@@ -107,6 +107,9 @@ private:
 							net_buffer* buffer);
 			int32		_ListenReceive(tcp_segment_header& segment,
 							net_buffer* buffer);
+			int32		_SpawnFromCookie(TCPEndpoint* parent,
+							tcp_segment_header& segment, net_buffer* buffer,
+							uint16 maxSegmentSize);
 			int32		_SynchronizeSentReceive(tcp_segment_header& segment,
 							net_buffer* buffer);
 			int32		_SegmentReceived(tcp_segment_header& segment,

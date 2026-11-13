@@ -113,6 +113,12 @@ struct arp_entry {
 #define ARP_STALE_TIMEOUT	30 * 60000000LL		// 30 minutes
 #define ARP_REJECT_TIMEOUT	20000000LL			// 20 seconds
 #define ARP_REQUEST_TIMEOUT	1000000LL			// 1 second
+#define ARP_LOCK_TIME		1000000LL
+	// a learned address does not change again within a second (Linux's
+	// locktime), so that two hosts answering for one address don't flap
+static const uint32 kMaxLearnedEntries = 1024;
+	// entries learned from requests for us stop here; our own resolutions
+	// may still add entries
 
 struct arp_protocol : net_datalink_protocol {
 	sockaddr_dl	hardware_address;
@@ -353,7 +359,7 @@ arp_entry::ScheduleRemoval()
 */
 static status_t
 arp_update_entry(in_addr_t protocolAddress, sockaddr_dl *hardwareAddress,
-	uint32 flags, arp_entry **_entry = NULL)
+	uint32 flags, arp_entry **_entry = NULL, bool learned = false)
 {
 	ASSERT_LOCKED_MUTEX(&sCacheLock);
 	TRACE(("%s(" FMT_IPv4 ", " FMT_MAC ", flags 0x%" B_PRIx32 ")\n", __FUNCTION__,
@@ -366,14 +372,28 @@ arp_update_entry(in_addr_t protocolAddress, sockaddr_dl *hardwareAddress,
 		// specific address - redefining INADDR_ANY is always allowed).
 		// Right now, you have to manually purge the ARP entries (or wait some
 		// time) to let us switch to the new address.
+		//
+		// What the network tells us may change a learned entry, though: the
+		// first host to claim an address kept it before, so a forged reply
+		// held on to the gateway for 30 minutes, and a replaced router could
+		// not be reached for as long (airos-works/haiku#129). Our own and
+		// permanent entries never change that way, and no entry changes
+		// twice within ARP_LOCK_TIME.
 		if (protocolAddress != INADDR_ANY
 			&& entry->hardware_address.sdl_alen != 0
 			&& memcmp(LLADDR(&entry->hardware_address),
 				LLADDR(hardwareAddress), ETHER_ADDRESS_LENGTH)) {
 			uint8* data = LLADDR(hardwareAddress);
-			dprintf("ARP host " FMT_IPv4 " updated with different hardware address " FMT_MAC ".\n",
+			if (!learned
+				|| (entry->flags & (ARP_FLAG_LOCAL | ARP_FLAG_PERMANENT
+					| ARP_FLAG_PUBLISH)) != 0
+				|| system_time() - entry->timestamp < ARP_LOCK_TIME) {
+				dprintf("ARP host " FMT_IPv4 " updated with different hardware address " FMT_MAC ", ignored.\n",
+					PRINTF_IPv4(ntohl(protocolAddress)), PRINTF_MAC(data));
+				return B_ERROR;
+			}
+			dprintf("ARP host " FMT_IPv4 " moved to hardware address " FMT_MAC ".\n",
 				PRINTF_IPv4(ntohl(protocolAddress)), PRINTF_MAC(data));
-			return B_ERROR;
 		}
 
 		entry->hardware_address = *hardwareAddress;
@@ -607,17 +627,23 @@ handle_arp_request(net_buffer *buffer, arp_header &header)
 {
 	MutexLocker locker(sCacheLock);
 
-	if (!sIgnoreReplies) {
+	// check if this request is for us
+	arp_entry *entry = arp_entry::Lookup(header.protocol_target);
+	bool forUs = entry != NULL && entry->protocol != NULL
+		&& (entry->flags & (ARP_FLAG_LOCAL | ARP_FLAG_PUBLISH)) != 0;
+
+	// Remember the address of the sender as we might need it later (RFC 826):
+	// update an entry we have, but only add one when the request is for us.
+	// Anybody's requests used to fill the cache without limit.
+	if (!sIgnoreReplies && header.protocol_sender != INADDR_ANY
+		&& (arp_entry::Lookup(header.protocol_sender) != NULL
+			|| (forUs && sCache->CountElements() < kMaxLearnedEntries))) {
 		arp_update_entry(header.protocol_sender,
-			(sockaddr_dl *)buffer->source, 0);
-			// remember the address of the sender as we might need it later
+			(sockaddr_dl *)buffer->source, 0, NULL, true);
 	}
 
-	// check if this request is for us
-
-	arp_entry *entry = arp_entry::Lookup(header.protocol_target);
-	if (entry == NULL || entry->protocol == NULL
-		|| (entry->flags & (ARP_FLAG_LOCAL | ARP_FLAG_PUBLISH)) == 0) {
+	entry = arp_entry::Lookup(header.protocol_target);
+	if (!forUs) {
 		// We're not the one to answer this request
 		// TODO: instead of letting the other's request time-out, can we reply
 		//	failure somehow?
@@ -658,7 +684,14 @@ handle_arp_reply(net_buffer *buffer, arp_header &header)
 		return;
 
 	MutexLocker locker(sCacheLock);
-	arp_update_entry(header.protocol_sender, (sockaddr_dl *)buffer->source, 0);
+
+	// Only replies for addresses we know (above all, the ones we asked for)
+	// are taken; unsolicited replies for others no longer add entries.
+	if (arp_entry::Lookup(header.protocol_sender) == NULL)
+		return;
+
+	arp_update_entry(header.protocol_sender, (sockaddr_dl *)buffer->source, 0,
+		NULL, true);
 }
 
 

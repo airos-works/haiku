@@ -584,6 +584,40 @@ EndpointManager::AbortConnectionsWithoutLocalAddress()
 }
 
 
+/*!	Answers a SYN with a SYN-ACK whose sequence number is a SYN cookie, and
+	keeps nothing: the listener's queue is full.
+*/
+status_t
+EndpointManager::ReplyWithSynCookie(tcp_segment_header& segment,
+	net_buffer* buffer, uint32 cookie, uint16 maxSegmentSize)
+{
+	net_buffer* reply = gBufferModule->create(512);
+	if (reply == NULL)
+		return B_NO_MEMORY;
+
+	AddressModule()->set_to(reply->source, buffer->destination);
+	AddressModule()->set_to(reply->destination, buffer->source);
+
+	tcp_segment_header outSegment(TCP_FLAG_SYNCHRONIZE | TCP_FLAG_ACKNOWLEDGE);
+	outSegment.sequence = cookie;
+	outSegment.acknowledge = segment.sequence + 1;
+	outSegment.advertised_window = 65535;
+	outSegment.urgent_offset = 0;
+	outSegment.max_segment_size = maxSegmentSize;
+		// no window scaling, timestamps or SACK: the cookie cannot keep them
+
+	status_t status = add_tcp_header(AddressModule(), outSegment, reply);
+	if (status == B_OK)
+		status = Domain()->module->send_data(NULL, reply);
+	if (status == B_OK)
+		NET_STAT_INC(gStackModule, tcp_syn_cookies_sent);
+	else
+		gBufferModule->free(reply);
+
+	return status;
+}
+
+
 status_t
 EndpointManager::ReplyWithReset(tcp_segment_header& segment, net_buffer* buffer)
 {

@@ -86,6 +86,9 @@ public:
 								const sockaddr* address);
 			status_t		Unbind(TCPEndpoint* endpoint);
 
+			status_t		ReplyWithSynCookie(tcp_segment_header& segment,
+								net_buffer* buffer, uint32 cookie,
+								uint16 maxSegmentSize);
 			status_t		ReplyWithReset(tcp_segment_header& segment,
 								net_buffer* buffer);
 

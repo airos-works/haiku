@@ -113,6 +113,12 @@ struct net_socket_module_info {
 	int			(*shutdown)(net_socket* socket, int direction);
 	status_t	(*socketpair)(int family, int type, int protocol,
 					net_socket* _sockets[2]);
+
+	// like spawn_pending_socket(), for a connection that is complete once
+	// spawned (a TCP SYN cookie): only connected children count against the
+	// backlog, not half-open ones
+	status_t	(*spawn_completed_socket)(net_socket* parent,
+					net_socket** _socket);
 };
 
 

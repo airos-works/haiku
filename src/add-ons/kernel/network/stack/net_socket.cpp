@@ -667,8 +667,8 @@ socket_release(net_socket* _socket)
 }
 
 
-status_t
-socket_spawn_pending(net_socket* _parent, net_socket** _socket)
+static status_t
+spawn_child(net_socket* _parent, net_socket** _socket, bool completed)
 {
 	net_socket_private* parent = (net_socket_private*)_parent;
 
@@ -676,11 +676,19 @@ socket_spawn_pending(net_socket* _parent, net_socket** _socket)
 
 	MutexLocker locker(parent->lock);
 
-	// We actually accept more pending connections to compensate for those
-	// that never complete, and also make sure at least a single connection
-	// can always be accepted
-	if (parent->child_count > 3 * parent->max_backlog / 2)
+	if (completed) {
+		// A connection that is complete when spawned only needs room in
+		// the queue of connections waiting for accept(): half-open ones
+		// that may never complete (a SYN flood) must not keep it out.
+		if ((uint32)parent->connected_children.Count()
+				>= max_c(parent->max_backlog, 1))
+			return ENOBUFS;
+	} else if (parent->child_count > 3 * parent->max_backlog / 2) {
+		// We actually accept more pending connections to compensate for
+		// those that never complete, and also make sure at least a single
+		// connection can always be accepted
 		return ENOBUFS;
+	}
 
 	net_socket_private* socket;
 	status_t status = create_socket(parent->family, parent->type,
@@ -704,6 +712,20 @@ socket_spawn_pending(net_socket* _parent, net_socket** _socket)
 
 	*_socket = socket;
 	return B_OK;
+}
+
+
+status_t
+socket_spawn_pending(net_socket* parent, net_socket** _socket)
+{
+	return spawn_child(parent, _socket, false);
+}
+
+
+static status_t
+socket_spawn_completed(net_socket* parent, net_socket** _socket)
+{
+	return spawn_child(parent, _socket, true);
 }
 
 
@@ -1790,5 +1812,7 @@ net_socket_module_info gNetSocketModule = {
 	socket_send,
 	socket_setsockopt,
 	socket_shutdown,
-	socket_socketpair
+	socket_socketpair,
+
+	socket_spawn_completed
 };

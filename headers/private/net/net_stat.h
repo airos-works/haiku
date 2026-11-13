@@ -61,6 +61,8 @@ typedef struct net_protocol_stats {
 	uint64	tcp_challenge_acks;
 	uint64	tcp_connections_refused;
 		// SYNs refused because a listen queue was full
+	uint64	tcp_syn_cookies_sent;
+	uint64	tcp_syn_cookies_accepted;
 
 	// raw and ICMP sockets
 	uint64	raw_receive_buffer_errors;

@@ -54,10 +54,14 @@
 #endif
 
 
-#define MAX_HASH_FRAGMENTS 		64
-	// slots in the fragment packet's hash
 #define FRAGMENT_TIMEOUT		60000000LL
-	// discard fragment after 60 seconds [RFC 2460]
+	// discard a packet 60 seconds after its first fragment [RFC 8200]
+
+// Limits on reassembly, as for IPv4 (airos-works/haiku#129): the oldest
+// packets are thrown away first when one is reached.
+static const uint32 kMaxFragmentPackets = 256;
+static const uint32 kMaxFragmentsPerPacket = 64;
+static const size_t kMaxFragmentMemory = 4 * 1024 * 1024;
 
 
 struct IPv6Header {
@@ -103,7 +107,11 @@ public:
 			const ipv6_packet_key& Key() const { return fKey; }
 			FragmentPacket*&	HashTableLink() { return fNext; }
 
-	static	void				StaleTimer(struct net_timer* timer, void* data);
+			bigtime_t			Expires() const { return fExpires; }
+			size_t				Memory() const { return fMemory; }
+			net_buffer*			FirstFragment() { return fFragments.First(); }
+
+			DoublyLinkedListLink<FragmentPacket> fAgeLink;
 
 private:
 			FragmentPacket*		fNext;
@@ -111,9 +119,15 @@ private:
 			uint32				fIndex;
 			int32				fBytesLeft;
 			FragmentList		fFragments;
-			net_timer			fTimer;
 			bool				fReceivedLastFragment;
+			bigtime_t			fExpires;
+			uint32				fFragmentCount;
+			size_t				fMemory;
 };
+
+typedef DoublyLinkedList<FragmentPacket,
+	DoublyLinkedListMemberGetLink<FragmentPacket, &FragmentPacket::fAgeLink> >
+	FragmentAgeList;
 
 
 struct FragmentHashDefinition {
@@ -223,6 +237,11 @@ static RawSocketList sRawSockets;
 static mutex sRawSocketsLock;
 static mutex sFragmentLock;
 static FragmentTable sFragmentHash;
+static FragmentAgeList sFragmentAge;
+	// oldest first; as all packets live equally long, also in expiry order
+static uint32 sFragmentPacketCount;
+static size_t sFragmentMemory;
+static net_timer sFragmentTimer;
 static int32 sFragmentID;
 static mutex sMulticastGroupsLock;
 
@@ -309,17 +328,16 @@ FragmentPacket::FragmentPacket(const ipv6_packet_key &key)
 	:
 	fKey(key),
 	fBytesLeft(IPV6_MAXPACKET),
-	fReceivedLastFragment(false)
+	fReceivedLastFragment(false),
+	fExpires(system_time() + FRAGMENT_TIMEOUT),
+	fFragmentCount(0),
+	fMemory(0)
 {
-	gStackModule->init_timer(&fTimer, FragmentPacket::StaleTimer, this);
 }
 
 
 FragmentPacket::~FragmentPacket()
 {
-	// cancel the kill timer
-	gStackModule->set_timer(&fTimer, -1);
-
 	// delete all fragments
 	net_buffer* buffer;
 	while ((buffer = fFragments.RemoveHead()) != NULL) {
@@ -332,13 +350,14 @@ status_t
 FragmentPacket::AddFragment(uint16 start, uint16 end, net_buffer* buffer,
 	bool lastFragment)
 {
-	// restart the timer
-	gStackModule->set_timer(&fTimer, FRAGMENT_TIMEOUT);
-
 	if (start >= end) {
 		// invalid fragment
 		return B_BAD_DATA;
 	}
+	if (fFragmentCount >= kMaxFragmentsPerPacket)
+		return B_NO_MEMORY;
+	fFragmentCount++;
+	fMemory += datagram_charge(buffer);
 
 	// Search for a position in the list to insert the fragment
 
@@ -500,23 +519,48 @@ FragmentPacket::Reassemble(net_buffer* to)
 }
 
 
-/*static*/ void
-FragmentPacket::StaleTimer(struct net_timer* timer, void* data)
+/*!	Takes \a packet out of the reassembly tables; sFragmentLock must be
+	held. The caller deletes it.
+*/
+static void
+forget_fragment_packet(FragmentPacket* packet)
 {
-	FragmentPacket* packet = (FragmentPacket*)data;
-	TRACE("Assembling FragmentPacket %p timed out!", packet);
+	sFragmentHash.Remove(packet);
+	sFragmentAge.Remove(packet);
+	sFragmentPacketCount--;
+	sFragmentMemory -= packet->Memory();
+}
+
+
+/*!	Runs when the oldest packet expires: throws away all expired packets and
+	answers each with "reassembly time exceeded", then waits for the next.
+*/
+static void
+fragment_timer(struct net_timer* timer, void* data)
+{
+	FragmentAgeList expired;
 
 	MutexLocker locker(&sFragmentLock);
-	sFragmentHash.Remove(packet);
+	bigtime_t now = system_time();
+	while (FragmentPacket* packet = sFragmentAge.Head()) {
+		if (packet->Expires() > now) {
+			gStackModule->set_timer(&sFragmentTimer, packet->Expires() - now);
+			break;
+		}
+		forget_fragment_packet(packet);
+		expired.Add(packet);
+	}
 	locker.Unlock();
 
-	if (!packet->fFragments.IsEmpty()) {
-		// Send error: fragment reassembly time exceeded
-		sDomain->module->error_reply(NULL, packet->fFragments.First(),
-			B_NET_ERROR_REASSEMBLY_TIME_EXCEEDED, NULL);
+	while (FragmentPacket* packet = expired.RemoveHead()) {
+		TRACE("Assembling FragmentPacket %p timed out!", packet);
+		if (packet->FirstFragment() != NULL) {
+			// Send error: fragment reassembly time exceeded
+			sDomain->module->error_reply(NULL, packet->FirstFragment(),
+				B_NET_ERROR_REASSEMBLY_TIME_EXCEEDED, NULL);
+		}
+		delete packet;
 	}
-
-	delete packet;
 }
 
 
@@ -584,6 +628,13 @@ reassemble_fragments(const IPv6Header &header, net_buffer** _buffer,
 
 	FragmentPacket* packet = sFragmentHash.Lookup(key);
 	if (packet == NULL) {
+		// make room: the oldest packets go first
+		while (sFragmentPacketCount >= kMaxFragmentPackets) {
+			FragmentPacket* oldest = sFragmentAge.Head();
+			forget_fragment_packet(oldest);
+			delete oldest;
+		}
+
 		// New fragment packet
 		packet = new (std::nothrow) FragmentPacket(key);
 		if (packet == NULL)
@@ -595,6 +646,10 @@ reassemble_fragments(const IPv6Header &header, net_buffer** _buffer,
 			delete packet;
 			return status;
 		}
+		sFragmentAge.Add(packet);
+		sFragmentPacketCount++;
+		if (!gStackModule->is_timer_active(&sFragmentTimer))
+			gStackModule->set_timer(&sFragmentTimer, FRAGMENT_TIMEOUT);
 	}
 
 	uint16 start = ntohs(fragmentHeader.ip6f_offlg & IP6F_OFF_MASK);
@@ -608,12 +663,29 @@ reassemble_fragments(const IPv6Header &header, net_buffer** _buffer,
 	if (start != 0)
 		gBufferModule->remove_header(buffer, offset);
 
+	size_t memoryBefore = packet->Memory();
 	status = packet->AddFragment(start, end, buffer, lastFragment);
-	if (status != B_OK)
+	sFragmentMemory += packet->Memory() - memoryBefore;
+	if (status != B_OK) {
+		if (status == B_NO_MEMORY) {
+			// too many fragments: this packet is an attack or hopeless
+			forget_fragment_packet(packet);
+			delete packet;
+		}
 		return status;
+	}
+
+	// keep the memory of all incomplete packets bounded
+	while (sFragmentMemory > kMaxFragmentMemory) {
+		FragmentPacket* oldest = sFragmentAge.Head();
+		if (oldest == packet)
+			break;
+		forget_fragment_packet(oldest);
+		delete oldest;
+	}
 
 	if (packet->IsComplete()) {
-		sFragmentHash.Remove(packet);
+		forget_fragment_packet(packet);
 			// no matter if reassembling succeeds, we won't need this packet
 			// anymore
 
@@ -1749,7 +1821,7 @@ status_t
 init_ipv6()
 {
 	mutex_init(&sRawSocketsLock, "raw sockets");
-	mutex_init(&sFragmentLock, "IPv4 Fragments");
+	mutex_init(&sFragmentLock, "IPv6 Fragments");
 	mutex_init(&sMulticastGroupsLock, "IPv6 multicast groups");
 	mutex_init(&sReceivingProtocolLock, "IPv6 receiving protocols");
 
@@ -1766,6 +1838,10 @@ init_ipv6()
 		goto err2;
 
 	new (&sFragmentHash) FragmentTable();
+	new (&sFragmentAge) FragmentAgeList;
+	sFragmentPacketCount = 0;
+	sFragmentMemory = 0;
+	gStackModule->init_timer(&sFragmentTimer, fragment_timer, NULL);
 	status = sFragmentHash.Init(256);
 	if (status != B_OK)
 		goto err3;
@@ -1813,6 +1889,12 @@ uninit_ipv6()
 			gStackModule->put_domain_receiving_protocol(sDomain, i);
 	}
 
+	gStackModule->cancel_timer(&sFragmentTimer);
+	gStackModule->wait_for_timer(&sFragmentTimer);
+	while (FragmentPacket* packet = sFragmentAge.RemoveHead()) {
+		sFragmentHash.Remove(packet);
+		delete packet;
+	}
 	sFragmentHash.~FragmentTable();
 	delete sMulticastState;
 
