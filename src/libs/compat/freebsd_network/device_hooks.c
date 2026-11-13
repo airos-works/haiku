@@ -188,9 +188,10 @@ compat_send(void *cookie, net_buffer *buffer)
 		return B_INTERRUPTED;
 
 	bool copied = false;
-	if ((buffer->buffer_flags & NET_BUFFER_SEGMENTATION_OFFLOAD) != 0
-		&& length > MJUMPAGESIZE) {
-		// a TCP segment for the device to cut up: up to 64 KB, in a chain
+	if (length > MJUMPAGESIZE) {
+		// a jumbo frame, or a TCP segment for the device to cut up (up to
+		// 64 KB): in a chain, since m_get2() has no clusters this large and
+		// such frames could not be sent at all
 		mb = m_getm2(NULL, length, M_NOWAIT, MT_DATA, M_PKTHDR);
 		if (mb == NULL)
 			return ENOBUFS;
