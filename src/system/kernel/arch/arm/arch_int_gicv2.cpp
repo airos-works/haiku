@@ -9,6 +9,8 @@
 #include <vm/vm.h>
 #include <smp.h>
 #include <KernelExport.h>
+#include <debug.h>
+#include <util/AutoLock.h>
 
 #include "arch_int_gicv2.h"
 #include "gicv2_regs.h"
@@ -49,7 +51,11 @@ GICv2InterruptController::GICv2InterruptController(phys_addr_t gicd_addr, phys_a
 	// how many registers cover all IRQs?
 	uint32 typer = fGicdRegs[GICD_REG_TYPER];
 	uint32 lineRegs = (typer & 0x1f) + 1;
-	reserve_io_interrupt_vectors(32 * lineRegs, 0, INTERRUPT_TYPE_IRQ);
+	fMaxInt = 32 * lineRegs;
+	// SGIs and PPIs (the timers) are banked per CPU: they are not routed
+	reserve_io_interrupt_vectors(32, 0, INTERRUPT_TYPE_LOCAL_IRQ);
+	reserve_io_interrupt_vectors(fMaxInt - 32, 32, INTERRUPT_TYPE_IRQ);
+	LoadRoutingSetting();
 
 	for (uint32 i = 1; i < lineRegs; i++) { // 1 bit per IRQ
 		// mask and clear state before enabling
@@ -57,10 +63,11 @@ GICv2InterruptController::GICv2InterruptController(phys_addr_t gicd_addr, phys_a
 		fGicdRegs[GICD_REG_ICPENDR + i] = 0xffffffff;
 	}
 
-	// route SPIs to the boot CPU
-	// TODO: don't assume boot CPU is CPU 0
+	// route SPIs to the boot CPU: the first ITARGETSR bytes are read-only
+	// and name the CPU interface of the CPU reading them
+	uint32 bootTarget = _CurrentCpuInterface();
 	for (uint32 i = 8; i < lineRegs * 8; i++) // 8 bits per IRQ
-		fGicdRegs[GICD_REG_ITARGETSR + i] = 0x01010101;
+		fGicdRegs[GICD_REG_ITARGETSR + i] = bootTarget * 0x01010101;
 
 	// all SPIs level-sensitive
 	for (uint32 i = 2; i < lineRegs * 2; i++) // 2 bits per IRQ
@@ -74,9 +81,24 @@ GICv2InterruptController::GICv2InterruptController(phys_addr_t gicd_addr, phys_a
 }
 
 
+/*!	The CPU interface of the calling CPU as an ITARGETSR byte. It reads as
+	zero on a uniprocessor GIC, which has only interface 0.
+*/
+uint32
+GICv2InterruptController::_CurrentCpuInterface()
+{
+	uint32 mask = fGicdRegs[GICD_REG_ITARGETSR] & 0xff;
+	return mask != 0 ? mask : 0x01;
+}
+
+
 status_t
 GICv2InterruptController::PerCpuInit()
 {
+	int32 cpu = smp_get_current_cpu();
+	if (cpu >= 0 && cpu < SMP_MAX_CPUS)
+		fCpuInterface[cpu] = _CurrentCpuInterface();
+
 	// configure IRQs 0-31 (SGIs/PPIs) which are banked per CPU interface
 	fGicdRegs[GICD_REG_ICENABLER] = 0xffffffff;
 	fGicdRegs[GICD_REG_ICPENDR] = 0xffffffff;
@@ -102,10 +124,65 @@ GICv2InterruptController::EnableInterrupt(int32 irq)
 	uint32_t ena_val = 1 << (irq % 32);
 	fGicdRegs[ena_reg] = ena_val;
 
+	InterruptsSpinLocker locker(fLock);
 	uint32_t prio_reg = GICD_REG_IPRIORITYR + irq / 4;
 	uint32_t prio_val = fGicdRegs[prio_reg];
 	prio_val |= 0x80 << (irq % 4 * 8);
 	fGicdRegs[prio_reg] = prio_val;
+}
+
+
+/*!	Routes the SPI \a irq to \a cpu by its byte in ITARGETSR. A pending
+	interrupt follows the new target; an active one finishes where it is.
+*/
+int32
+GICv2InterruptController::AssignToCpu(int32 irq, int32 cpu)
+{
+	if (irq < 32 || irq >= fMaxInt)
+		return cpu;
+	if (!RoutingEnabled())
+		return 0;
+	cpu = UsableCpu(cpu);
+	uint32 target = cpu < SMP_MAX_CPUS ? fCpuInterface[cpu] : 0;
+	if (target == 0) {
+		// that CPU has not come up (yet): leave the interrupt where it is
+		uint32 current = (fGicdRegs[GICD_REG_ITARGETSR + irq / 4]
+			>> (irq % 4 * 8)) & 0xff;
+		for (int32 i = 0; i < smp_get_num_cpus(); i++) {
+			if (fCpuInterface[i] != 0 && (current & fCpuInterface[i]) != 0)
+				return i;
+		}
+		return 0;
+	}
+
+	InterruptsSpinLocker locker(fLock);
+	uint32 reg = GICD_REG_ITARGETSR + irq / 4;
+	uint32 shift = irq % 4 * 8;
+	uint32 value = fGicdRegs[reg];
+	if (((value >> shift) & 0xff) != target) {
+		fGicdRegs[reg] = (value & ~(0xffu << shift)) | (target << shift);
+		CountMove((fGicdRegs[GICD_REG_ISENABLER + irq / 32] & (1u << (irq % 32))) != 0);
+	}
+	return cpu;
+}
+
+
+void
+GICv2InterruptController::DumpRouting()
+{
+	DumpDeviceInterrupts();
+	for (int32 irq = 32; irq < fMaxInt; irq++) {
+		if ((fGicdRegs[GICD_REG_ISENABLER + irq / 32] & (1u << (irq % 32))) == 0)
+			continue;
+		uint32 target = (fGicdRegs[GICD_REG_ITARGETSR + irq / 4]
+			>> (irq % 4 * 8)) & 0xff;
+		kprintf("SPI %3" B_PRId32 ": ITARGETSR %#04" B_PRIx32 " ->", irq, target);
+		for (int32 i = 0; i < smp_get_num_cpus(); i++) {
+			if (fCpuInterface[i] != 0 && (target & fCpuInterface[i]) != 0)
+				kprintf(" cpu%" B_PRId32, i);
+		}
+		kprintf("\n");
+	}
 }
 
 
@@ -126,6 +203,8 @@ void GICv2InterruptController::HandleInterrupt()
 	} else if (irqnr == ICI_IRQ) {
 		smp_intercpu_interrupt_handler(smp_get_current_cpu());
 	} else {
+		if (irqnr >= 32)
+			CountDeviceInterrupt();
 		io_interrupt_handler(irqnr, B_LEVEL_TRIGGERED);
 	}
 

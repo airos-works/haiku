@@ -988,10 +988,9 @@ setup_interrupts(nvme_disk_driver_info* info, pci_device_module_info* pci,
 #if defined(__aarch64__)
 	// Completion queue processing is deferred to threads. An unacknowledged
 	// level-triggered INTx can prevent them from running on ARM64. Keep INTx
-	// disabled and poll without a working MSI route.
+	// disabled and poll without a working MSI route. MSI-X and MSI (through
+	// a GICv3 ITS) are used where they work.
 	uint32 irq = 0;
-	(void)pci;
-	(void)pcidev;
 #else
 	uint16 command = pci->read_pci_config(pcidev, PCI_command, 2);
 	command &= ~PCI_command_int_disable;
@@ -999,6 +998,7 @@ setup_interrupts(nvme_disk_driver_info* info, pci_device_module_info* pci,
 	uint32 irq = info->info.u.h0.interrupt_line;
 	if (irq == 0xFF)
 		irq = 0;
+#endif
 	// the PCI interrupt line may be shared with other devices
 	uint32 flags = B_NO_HANDLED_INFO;
 
@@ -1038,7 +1038,6 @@ setup_interrupts(nvme_disk_driver_info* info, pci_device_module_info* pci,
 			TRACE_ALWAYS("MSI unavailable: %s\n", strerror(status));
 	}
 	info->handled_flags = flags;
-#endif
 
 	if (info->vector_count == 0 && irq != 0) {
 		info->vectors[0].irq = irq;

@@ -7,12 +7,16 @@
 
 #include "arch_int_gicv3_its.h"
 
+#include <smp.h>
 
-// A GICv3 ITS set up from scratch, for firmware that leaves LPIs off: the
-// Redistributor of CPU 0 gets the LPI tables, every ITS the device tree
+
+// A GICv3 ITS set up from scratch, for firmware that leaves LPIs off: every
+// Redistributor gets the LPI tables and a collection of its own (the
+// collection ID is the Redistributor's index), every ITS the device tree
 // lists gets its device, collection and command tables, and each requester
-// (PCI function) that asks for MSIs is mapped on demand. All LPIs target
-// CPU 0. Tables and leases live for the kernel lifetime.
+// (PCI function) that asks for MSIs is mapped on demand. New LPIs target
+// the boot CPU; AssignToCpu() moves each to its CPU's collection (MOVI).
+// Tables and leases live for the kernel lifetime.
 class GICv3ItsGeneric : public GICv3LpiProvider {
 public:
 	static const uint32 kMaxControllers = 4;
@@ -29,6 +33,8 @@ public:
 	void FreeVectors(uint32 count, uint32 startVector) override;
 	bool Contains(uint32 vector) const override;
 	void SetEnabled(uint32 vector, bool enabled) override;
+	int32 AssignToCpu(uint32 vector, int32 cpu) override;
+	void DumpRouting() override;
 
 private:
 	struct Memory {
@@ -47,7 +53,7 @@ private:
 		uint32 deviceBits = 0;
 		uint32 ittEntrySize = 0;
 		uint32 writeOffset = 0;
-		uint64 target = 0;
+		bool physicalTargets = false;
 		bool ready = false;
 		spinlock lock = B_SPINLOCK_INITIALIZER;
 	};
@@ -57,11 +63,24 @@ private:
 		Memory table;
 		uint32 count = 0;
 		bool used = false;
+		uint16 collection[Gicv3Its::kEventCount] = {};
+	};
+	struct Redistributor {
+		uint32 affinity = 0;
+		uint64 processorTarget = 0;	// for an ITS with GITS_TYPER.PTA 0
+		uint64 addressTarget = 0;	// and 1
+		Memory pending;
+		bool ready = false;
 	};
 	static const uint32 kMaxLeases = 64;
+	static const uint32 kMaxRedistributors = SMP_MAX_CPUS;
 
 	status_t _InitController(Controller& controller, phys_addr_t physical);
-	bool _Submit(Controller& controller, const Gicv3Its::Command& command);
+	bool _Submit(Controller& controller, const Gicv3Its::Command& command,
+		uint16 collection);
+	uint64 _Target(const Controller& controller, uint16 collection) const;
+	int32 _CollectionForCpu(int32 cpu) const;
+	int32 _CpuForCollection(uint16 collection) const;
 	bool _WaitReadOffset(Controller& controller, uint32 offset);
 	uint64 _Read64(const Controller& controller, size_t offset) const;
 	void _Write64(Controller& controller, size_t offset, uint64 value);
@@ -69,7 +88,10 @@ private:
 	uint32 _FirstVector(const Lease* lease) const;
 
 	Memory fProperties;
-	Memory fPending;
+	Redistributor fRedistributors[kMaxRedistributors];
+	uint32 fRedistributorCount = 0;
+	uint16 fBootCollection = 0;
+	int32 fMoves = 0;
 	Controller fControllers[kMaxControllers];
 	uint32 fControllerCount = 0;
 	Lease fLeases[kMaxLeases];

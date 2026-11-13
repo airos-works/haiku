@@ -56,11 +56,19 @@ ECAMPCIController::SupportsDevice(device_node* parent)
 status_t
 ECAMPCIController::RegisterDevice(device_node* parent)
 {
-	device_attr attrs[] = {
+	device_attr attrs[6] = {
 		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE, {.string = "ECAM PCI Host Controller"} },
 		{ B_DEVICE_FIXED_CHILD, B_STRING_TYPE, {.string = "bus_managers/pci/root/driver_v1"} },
-		{}
 	};
+
+#ifdef ECAM_PCI_WITH_FDT
+	// (the x86 PCI bus module builds this file without the FDT part)
+	const char* bus;
+	if (gDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false) == B_OK
+		&& strcmp(bus, "fdt") == 0) {
+		ECAMPCIControllerFDT::GetMSIAttributes(parent, &attrs[2]);
+	}
+#endif
 
 	return gDeviceManager->register_node(parent, ECAM_PCI_DRIVER_MODULE_NAME, attrs, NULL, NULL);
 }

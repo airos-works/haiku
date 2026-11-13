@@ -13,8 +13,15 @@
 	only while no timer is due on it; interrupts and inter-processor
 	messages still wake it. It also takes a while to enter and leave the
 	state, so a core powers down only when its recent idle periods were long
-	(longer in low latency mode). CPU 0, which takes the device interrupts,
-	stays in WFI.
+	(longer in low latency mode).
+
+	Device interrupts are routed to every CPU (arch_int_assign_to_cpu()).
+	One routed to a powered-down core would wake it through the GIC, as the
+	inter-processor interrupts do, but it would wait for the core to come
+	back first, and that wake-up path has only been tried with SGIs. So a
+	core that takes device interrupts stays in WFI, as CPU 0 always does:
+	in power saving mode the scheduler packs the interrupts onto the core
+	that takes the small tasks, and the others still power down.
 */
 
 
@@ -305,7 +312,9 @@ extern "C" void
 arm64_cpu_idle()
 {
 	int32 cpu = smp_get_current_cpu();
-	if (!sEnabled || cpu == 0) {
+	if (!sEnabled || cpu == 0 || !gCPU[cpu].irqs.IsEmpty()) {
+		// (read without the CPU's irqs_lock: an interrupt routed here just
+		// after this look still wakes the core, a little later)
 		arm64_wfi();
 		return;
 	}

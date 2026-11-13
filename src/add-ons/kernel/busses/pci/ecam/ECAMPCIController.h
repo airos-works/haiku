@@ -159,6 +159,8 @@ class ECAMPCIControllerFDT: public ECAMPCIController {
 public:
 	~ECAMPCIControllerFDT() = default;
 
+	static void GetMSIAttributes(device_node* fdtNode, device_attr* attrs);
+
 	status_t Finalize() final;
 
 protected:

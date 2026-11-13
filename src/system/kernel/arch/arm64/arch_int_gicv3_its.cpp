@@ -8,6 +8,7 @@
 #include <arch/arm64/arch_cpu.h>
 #include <arch/arm64/cache_line_size.h>
 #include <arch/arm64/rk3588_its.h>
+#include <cpu.h>
 #include <debug.h>
 #include <interrupts.h>
 #include <smp.h>
@@ -162,10 +163,11 @@ GICv3Its::_PrepareInstanceTables(Instance& instance, const char* name)
 
 status_t
 GICv3Its::Init(volatile uint8* redistributors, uint32 count, bool trace,
-	bool forceHighTables)
+	bool forceHighTables, bool lpiRouting)
 {
 	fRedistributors = redistributors;
 	fTrace = trace;
+	fLpiRouting = lpiRouting;
 	fMinimumTableAddress = forceHighTables ? UINT64_C(1) << 32 : 0;
 	if (count != 8 || smp_get_current_cpu() != 0)
 		return B_NOT_SUPPORTED;
@@ -180,6 +182,9 @@ GICv3Its::Init(volatile uint8* redistributors, uint32 count, bool trace,
 			return B_BUSY;
 		if (i == 0 && typer != 0x21)
 			return B_NOT_SUPPORTED;
+		// GICR_TYPER: Affinity_Value, Processor_Number (the target, PTA=0)
+		fAffinity[i] = (uint32)(typer >> 32);
+		fTargets[i] = ((typer >> 8) & 0xffff) << 16;
 	}
 	status_t status = _PrepareSharedTables();
 	if (status != B_OK)
@@ -202,6 +207,27 @@ GICv3Its::Init(volatile uint8* redistributors, uint32 count, bool trace,
 	}
 	// PTA=0: use GICR_TYPER.Processor_Number, which is zero for this CPU.
 	fTarget = 0;
+	fCollectionReady[0] = true;
+	for (uint32 i = 1; fLpiRouting && i < count; i++) {
+		// the same configuration table, a pending table of its own
+		volatile uint8* frame = redistributors + i * 0x20000;
+		if (fCpuPending[i].Allocate("LPI pending", kTablePage, kTablePage,
+				fMinimumTableAddress) != B_OK) {
+			continue;
+		}
+		uint64 cpuPending = fCpuPending[i].physical | 0x80;
+		*(volatile uint64*)(frame + 0x70) = property;
+		*(volatile uint64*)(frame + 0x78) = cpuPending;
+		memory_full_barrier();
+		if (*(volatile uint64*)(frame + 0x70) != property
+			|| *(volatile uint64*)(frame + 0x78) != cpuPending) {
+			dprintf("GICv3 ITS: CPU%u Redistributor table readback failed\n", i);
+			continue;
+		}
+		*(volatile uint32*)frame |= 1;
+		memory_full_barrier();
+		fCollectionReady[i] = (*(volatile uint32*)frame & 1) != 0;
+	}
 	status = _InitInstance(fNvme, Rk3588Its::kController, Rk3588Its::kDevice,
 		kFirstLpi, "ITS1/NVMe");
 	if (status != B_OK)
@@ -272,6 +298,15 @@ GICv3Its::_InitInstance(Instance& instance, uint64 controller, uint32 device,
 		_Quarantine(instance, "collection initialization failed");
 		return B_ERROR;
 	}
+	for (uint16 i = 1; i < kRedistributors; i++) {
+		if (!fCollectionReady[i])
+			continue;
+		if (!_Submit(instance, MapCollection(i, fTargets[i], true), i)
+			|| !_Submit(instance, InvalidateAll(i), i)) {
+			_Quarantine(instance, "CPU collection initialization failed");
+			return B_ERROR;
+		}
+	}
 	instance.ready = true;
 	dprintf("GICv3 ITS: enabled %s, CPU 0, LPI %u..%u, DeviceID %#x\n",
 		name, firstLpi, firstLpi + kEventCount - 1, device);
@@ -312,13 +347,14 @@ GICv3Its::_WaitReadOffset(Instance& instance, uint32 offset)
 
 
 bool
-GICv3Its::_Submit(Instance& instance, const Command& command)
+GICv3Its::_Submit(Instance& instance, const Command& command, uint16 collection)
 {
 	// The caller serializes the entire submission/completion under the instance lock, or
 	// runs during single-CPU initialization. Two entries can never fill 64 KiB.
 	if (instance.faulted || !_WaitReadOffset(instance, instance.writeOffset))
 		return false;
-	const Command commands[] = {command, Sync(fTarget)};
+	// the SYNC goes to the Redistributor the command affects
+	const Command commands[] = {command, Sync(fTargets[collection])};
 	for (const Command& current : commands) {
 		volatile uint64* entry = (volatile uint64*)((uint8*)instance.commands.address
 			+ instance.writeOffset);
@@ -400,6 +436,7 @@ GICv3Its::AllocateVectorsForDevice(const msi_requester* requester, uint32 count,
 		if (!_Submit(*instance, MapInterrupt(instance->device, event,
 				instance->firstLpi + event, 0)))
 			return B_ERROR;
+		instance->collection[event] = 0;
 	}
 	instance->count = count;
 	instance->enabledMask = 0;
@@ -427,8 +464,10 @@ GICv3Its::SetEnabled(uint32 vector, bool enabled)
 	properties[vector - kFirstLpi] = enabled ? 0xa3 : 0xa2;
 	memory_full_barrier();
 	// A CPU cache flush alone cannot invalidate the GIC's property cache.
-	if (!_Submit(*instance, EventCommand(0x0c, instance->device, event)))
+	if (!_Submit(*instance, EventCommand(0x0c, instance->device, event),
+			instance->collection[event])) {
 		return;
+	}
 	if (enabled)
 		instance->enabledMask |= mask;
 	else
@@ -456,9 +495,14 @@ GICv3Its::FreeVectors(uint32 count, uint32 startVector)
 	// of all handlers first. CLEAR then DISCARD, each followed by SYNC, removes
 	// pending state and the event translations before the device is unmapped.
 	for (uint32 event = 0; event < count; event++) {
-		if (!_Submit(*instance, EventCommand(0x04, instance->device, event))
-			|| !_Submit(*instance, EventCommand(0x0f, instance->device, event)))
+		uint16 collection = instance->collection[event];
+		if (!_Submit(*instance, EventCommand(0x04, instance->device, event),
+				collection)
+			|| !_Submit(*instance, EventCommand(0x0f, instance->device, event),
+				collection)) {
 			return;
+		}
+		instance->collection[event] = 0;
 	}
 	if (!_Submit(*instance, MapDevice(instance->device,
 			instance->interrupts.physical, 5, false)))
@@ -505,6 +549,86 @@ GICv3Its::_ReportTrace(void* data, int /*iteration*/)
 			instance->reportedCounts[event] = count;
 			dprintf("GICv3 ITS: received vector=%" B_PRIu32 " count=%" B_PRIu32
 				"\n", instance->firstLpi + event, count);
+		}
+	}
+}
+
+
+/*!	The collection of \a cpu's Redistributor, -1 when it has none. */
+int32
+GICv3Its::_CollectionForCpu(int32 cpu) const
+{
+	if (cpu < 0 || cpu >= smp_get_num_cpus())
+		return -1;
+	uint64 mpidr = gCPU[cpu].arch.mpidr;
+	if (cpu != 0 && (mpidr & CPU_AFF_MASK) == 0)
+		return -1;
+	uint32 affinity = (uint32)(((mpidr >> 32) & 0xff) << 24) | (uint32)(mpidr & 0xffffff);
+	for (uint32 i = 0; i < kRedistributors; i++) {
+		if (fAffinity[i] == affinity)
+			return fCollectionReady[i] ? (int32)i : -1;
+	}
+	return -1;
+}
+
+
+int32
+GICv3Its::_CpuForCollection(uint16 collection) const
+{
+	for (int32 cpu = 0; cpu < smp_get_num_cpus(); cpu++) {
+		uint64 mpidr = gCPU[cpu].arch.mpidr;
+		uint32 affinity = (uint32)(((mpidr >> 32) & 0xff) << 24)
+			| (uint32)(mpidr & 0xffffff);
+		if (affinity == fAffinity[collection])
+			return cpu;
+	}
+	return 0;
+}
+
+
+/*!	Moves an LPI to \a cpu's collection (MOVI, then a SYNC to the new
+	Redistributor), with "lpi_routing true" only: otherwise all stay on
+	CPU 0. Runs with interrupts disabled.
+*/
+int32
+GICv3Its::AssignToCpu(uint32 vector, int32 cpu)
+{
+	Instance* instance = _InstanceForVector(vector);
+	if (!fLpiRouting || instance == nullptr)
+		return 0;
+	InterruptsSpinLocker locker(instance->lock);
+	uint32 event = vector - instance->firstLpi;
+	if (!instance->ready || instance->faulted || event >= instance->count)
+		return _CpuForCollection(instance->collection[event]);
+	uint16 current = instance->collection[event];
+	int32 collection = _CollectionForCpu(cpu);
+	if (collection < 0)
+		return _CpuForCollection(current);
+	if (collection == current)
+		return cpu;
+	if (!_Submit(*instance, MoveInterrupt(instance->device, event, collection),
+			collection)) {
+		return _CpuForCollection(current);
+	}
+	instance->collection[event] = collection;
+	return cpu;
+}
+
+
+void
+GICv3Its::DumpRouting()
+{
+	Instance* instances[] = { &fNvme, &fWifi };
+	for (Instance* instance : instances) {
+		if (!instance->ready)
+			continue;
+		for (uint32 event = 0; event < instance->count; event++) {
+			kprintf("LPI %5" B_PRIu32 ": ITS %#" B_PRIx64 " DeviceID %#" B_PRIx32
+				" event %2" B_PRIu32 " -> collection %u (cpu%" B_PRId32 ")%s\n",
+				instance->firstLpi + event, instance->controller, instance->device,
+				event, instance->collection[event],
+				_CpuForCollection(instance->collection[event]),
+				(instance->enabledMask & (1u << event)) != 0 ? "" : ", disabled");
 		}
 	}
 }

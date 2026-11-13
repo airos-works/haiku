@@ -318,11 +318,12 @@ pack_irqs()
 		assign_io_interrupt_to_cpu(irq->irq, newCPU);
 
 		locker.Lock();
-		// An architecture that cannot route the interrupt elsewhere (arm64
-		// so far) leaves it on this processor's list: asking again would
+		// An interrupt that cannot be routed elsewhere (the RK3588 ITS's
+		// LPIs without "lpi_routing", any on an interrupt controller that
+		// cannot route) stays on this processor's list: asking again would
 		// never end. That spun this processor with interrupts disabled as
 		// soon as it went idle in power saving mode, and froze the machine
-		// (ROCK 5, Cubie).
+		// (ROCK 5, Cubie, before arm64 routed interrupts).
 		if (irq->cpu == cpu->cpu_num)
 			return;
 		irq = cpu->irqs.First();
