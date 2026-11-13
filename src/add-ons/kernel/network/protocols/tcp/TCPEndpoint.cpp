@@ -26,6 +26,7 @@
 
 #include <net_buffer.h>
 #include <net_datalink.h>
+#include <net_device.h>
 #include <net_stat.h>
 #include <NetBufferUtilities.h>
 #include <NetSecret.h>
@@ -3009,6 +3010,16 @@ TCPEndpoint::_PrepareAndSend(tcp_segment_header& segment, net_buffer* buffer,
 		fSendQueue.LastSequence()));
 
 	PROBE(buffer, sendWindow);
+
+	// leave the checksum to a device that can compute it
+	if (fRoute != NULL && fRoute->interface_address != NULL
+		&& fRoute->interface_address->interface != NULL
+		&& fRoute->interface_address->interface->device != NULL
+		&& (fRoute->interface_address->interface->device->offload
+			& NET_DEVICE_OFFLOAD_TX_CHECKSUM_IPV4) != 0
+		&& Domain()->family == AF_INET) {
+		buffer->buffer_flags |= NET_BUFFER_L4_CHECKSUM_OFFLOAD;
+	}
 
 	status_t status = add_tcp_header(AddressModule(), segment, buffer);
 	if (status != B_OK) {

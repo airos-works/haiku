@@ -35,7 +35,13 @@ typedef struct net_device {
 	struct net_hardware_address address;
 
 	struct ifreq_stats stats;
+
+	uint32	offload;	// NET_DEVICE_OFFLOAD_*
 } net_device;
+
+// net_device::offload
+#define NET_DEVICE_OFFLOAD_TX_CHECKSUM_IPV4	0x01
+	// computes TCP and UDP checksums over IPv4 when sending
 
 
 struct net_device_module_info {

@@ -439,8 +439,14 @@ add_tcp_header(net_address_module_info* addressModule,
 		"win %u\n", buffer, segment.flags, segment.sequence,
 		segment.acknowledge, segment.urgent_offset, segment.advertised_window));
 
-	*TCPChecksumField(buffer) = Checksum::PseudoHeader(addressModule,
-		gBufferModule, buffer, IPPROTO_TCP);
+	if ((buffer->buffer_flags & NET_BUFFER_L4_CHECKSUM_OFFLOAD) != 0) {
+		// the device sums the segment (airos-works/haiku#124)
+		*TCPChecksumField(buffer) = Checksum::PseudoHeaderSum(addressModule,
+			buffer, IPPROTO_TCP);
+	} else {
+		*TCPChecksumField(buffer) = Checksum::PseudoHeader(addressModule,
+			gBufferModule, buffer, IPPROTO_TCP);
+	}
 	buffer->buffer_flags |= NET_BUFFER_L4_CHECKSUM_VALID;
 
 	return B_OK;

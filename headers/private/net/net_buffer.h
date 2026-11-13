@@ -19,6 +19,9 @@
 enum net_buffer_flags {
 	NET_BUFFER_L3_CHECKSUM_VALID = (1 << 0),
 	NET_BUFFER_L4_CHECKSUM_VALID = (1 << 1),
+	NET_BUFFER_L4_CHECKSUM_OFFLOAD = (1 << 2),
+		// the device computes the TCP/UDP checksum; the field holds the sum
+		// of the pseudo header, as with FreeBSD's CSUM_TCP/CSUM_UDP
 };
 
 

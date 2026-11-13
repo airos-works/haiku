@@ -12,3 +12,8 @@ NO_HAIKU_REENABLE_INTERRUPTS();
 HAIKU_DRIVER_REQUIREMENTS(FBSD_FAST_TASKQUEUE);
 HAIKU_FIRMWARE_VERSION(0);
 NO_HAIKU_FIRMWARE_NAME_MAP();
+
+
+/* rge_encap() turns CSUM_IP/CSUM_TCP/CSUM_UDP into descriptor bits; checked
+ * on an RTL8126 (airos-works/haiku#124) */
+int __haiku_tx_checksum_offload = 1;

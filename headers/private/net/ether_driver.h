@@ -28,7 +28,15 @@ enum {
 
 	ETHER_SEND_NET_BUFFER,					/* send a net_buffer */
 	ETHER_RECEIVE_NET_BUFFER,				/* receive a net_buffer */
+	ETHER_GET_OFFLOAD,
+		/* what the device computes for the stack (uint32 *, ETHER_OFFLOAD_*) */
 };
+
+/* ETHER_GET_OFFLOAD */
+#define ETHER_OFFLOAD_TX_CHECKSUM_IPV4	0x01
+	/* TCP and UDP checksums over IPv4 when sending (net_buffers flagged
+	   NET_BUFFER_L4_CHECKSUM_OFFLOAD, with the pseudo header sum in the
+	   checksum field) */
 
 
 /* ETHER_GETADDR - MAC address */

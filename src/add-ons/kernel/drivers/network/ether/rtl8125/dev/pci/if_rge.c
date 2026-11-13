@@ -385,6 +385,12 @@ rge_attach(struct device *parent, struct device *self, void *aux)
 	ifp->if_start = rge_start;
 	ifp->if_watchdog = rge_watchdog;
 	ifq_set_maxlen(&ifp->if_snd, RGE_TX_LIST_CNT - 1);
+#ifdef __HAIKU__
+	/* rge_encap() turns the checksum requests of an mbuf into descriptor
+	 * bits; tell the stack it may leave IPv4 TCP/UDP checksums to us. */
+	ifp->if_capabilities |= IFCAP_TXCSUM;
+	ifp->if_capenable |= IFCAP_TXCSUM;
+#endif
 #ifndef __FreeBSD_version
 	ifp->if_hardmtu = RGE_JUMBO_MTU;
 

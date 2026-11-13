@@ -76,6 +76,8 @@ public:
 	static uint16 PseudoHeader(net_address_module_info* addressModule,
 		net_buffer_module_info* bufferModule, net_buffer* buffer,
 		uint16 protocol);
+	static uint16 PseudoHeaderSum(net_address_module_info* addressModule,
+		net_buffer* buffer, uint16 protocol);
 
 private:
 	uint32 fSum;
@@ -92,6 +94,22 @@ Checksum::PseudoHeader(net_address_module_info* addressModule,
 	checksum << (uint16)htons(protocol) << (uint16)htons(buffer->size)
 		<< Checksum::BufferHelper(buffer, bufferModule);
 	return checksum;
+}
+
+
+/*!	The sum of the pseudo header alone, not inverted: what a device that
+	computes the checksum of the data expects in the checksum field
+	(NET_BUFFER_L4_CHECKSUM_OFFLOAD).
+*/
+inline uint16
+Checksum::PseudoHeaderSum(net_address_module_info* addressModule,
+	net_buffer* buffer, uint16 protocol)
+{
+	Checksum checksum;
+	addressModule->checksum_address(&checksum, buffer->source);
+	addressModule->checksum_address(&checksum, buffer->destination);
+	checksum << (uint16)htons(protocol) << (uint16)htons(buffer->size);
+	return (uint16)~(uint16)checksum;
 }
 
 

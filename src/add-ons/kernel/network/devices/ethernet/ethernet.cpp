@@ -194,6 +194,18 @@ ethernet_up(net_device *_device)
 			device->supports_net_buffer = true;
 	}
 
+	// what the driver can compute for us (only drivers passing net_buffers
+	// can see the request flags)
+	device->offload = 0;
+	{
+		uint32 offload = 0;
+		if (device->supports_net_buffer
+			&& ioctl(device->fd, ETHER_GET_OFFLOAD, &offload,
+				sizeof(offload)) == 0
+			&& (offload & ETHER_OFFLOAD_TX_CHECKSUM_IPV4) != 0)
+			device->offload |= NET_DEVICE_OFFLOAD_TX_CHECKSUM_IPV4;
+	}
+
 	if (ioctl(device->fd, ETHER_GETFRAMESIZE, &device->frame_size, sizeof(uint32)) < 0) {
 		// this call is obviously optional
 		device->frame_size = ETHER_MAX_FRAME_SIZE;

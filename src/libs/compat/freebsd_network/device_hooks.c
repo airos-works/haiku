@@ -13,6 +13,14 @@
 
 #include <Drivers.h>
 #include <ether_driver.h>
+#include <netinet/in.h>
+
+
+/* A driver's glue opts in to transmit checksum offload by defining this as
+ * non-zero: most drivers' checksum code was never used on Haiku, and some
+ * chips have errata there, so a driver only gets checksum requests once it
+ * was tested with them. */
+extern int __haiku_tx_checksum_offload __attribute__((weak));
 #include <kernel.h>
 #include <net_buffer.h>
 
@@ -194,6 +202,29 @@ compat_send(void *cookie, net_buffer *buffer)
 	}
 	mb->m_pkthdr.len = mb->m_len = length;
 
+	if ((buffer->buffer_flags & NET_BUFFER_L4_CHECKSUM_OFFLOAD) != 0) {
+		// The stack left the TCP/UDP checksum to the device (it only does so
+		// for devices that report it, see ETHER_GET_OFFLOAD); the field holds
+		// the pseudo header sum, as FreeBSD's in_pseudo() leaves it.
+		const uint8* frame = mtod(mb, const uint8*);
+		if (length >= ETHER_HDR_LEN + 20
+			&& frame[12] == 0x08 && frame[13] == 0x00
+			&& (frame[ETHER_HDR_LEN] >> 4) == 4) {
+			uint8 protocol = frame[ETHER_HDR_LEN + 9];
+			// Not CSUM_IP: the IP header checksum is already computed, and
+			// with CSUM_IP some chips (e1000) add to what is there.
+			if (protocol == IPPROTO_TCP) {
+				mb->m_pkthdr.csum_flags = CSUM_TCP;
+				mb->m_pkthdr.csum_data = 16;
+					// offsetof(struct tcphdr, th_sum)
+			} else if (protocol == IPPROTO_UDP) {
+				mb->m_pkthdr.csum_flags = CSUM_UDP;
+				mb->m_pkthdr.csum_data = 6;
+					// offsetof(struct udphdr, uh_sum)
+			}
+		}
+	}
+
 	IFF_LOCKGIANT(ifp);
 	int result = ifp->if_output(ifp, mb, NULL, NULL);
 	IFF_UNLOCKGIANT(ifp);
@@ -333,6 +364,18 @@ compat_control(void *cookie, uint32 op, void *arg, size_t length)
 				return B_BAD_ADDRESS;
 			}
 			return B_OK;
+
+		case ETHER_GET_OFFLOAD:
+		{
+			uint32 offload = 0;
+			if (&__haiku_tx_checksum_offload != NULL
+				&& __haiku_tx_checksum_offload != 0
+				&& (ifp->if_capenable & IFCAP_TXCSUM) != 0)
+				offload |= ETHER_OFFLOAD_TX_CHECKSUM_IPV4;
+			if (length < sizeof(offload))
+				return B_BAD_VALUE;
+			return user_memcpy(arg, &offload, sizeof(offload));
+		}
 
 		case ETHER_SEND_NET_BUFFER:
 			if (arg == NULL || length == 0)
