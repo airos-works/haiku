@@ -550,6 +550,8 @@ TCPEndpoint::TCPEndpoint(net_socket* socket)
 	fDuplicateAcknowledgeCount(0),
 	fPreviousFlightSize(0),
 	fRecover(0),
+	fScoreboardCount(0),
+	fHighRetransmitted(0),
 	fRoute(NULL),
 	fReceiveNext(0),
 	fReceiveMaxAdvertised(0),
@@ -1739,17 +1741,167 @@ TCPEndpoint::_DuplicateAcknowledge(tcp_segment_header &segment)
 			fCongestionWindow = fSlowStartThreshold + 3 * fSendMaxSegmentSize;
 			fSendNext = segment.acknowledge;
 			_SendQueued();
+			fHighRetransmitted = tcp_sequence(segment.acknowledge)
+				+ fSendMaxSegmentSize;
 			TRACE("_DuplicateAcknowledge(): packet sent under fast restransmit on the receipt of 3rd dup ack");
 		}
 	} else if (fDuplicateAcknowledgeCount > 3) {
 		uint32 flightSize = (fSendMax - fSendUnacknowledged).Number();
 		if ((fDuplicateAcknowledgeCount - 3) * fSendMaxSegmentSize <= flightSize)
 			fCongestionWindow += fSendMaxSegmentSize;
+
+		// With SACK, every duplicate ACK in recovery may repair one more hole
+		// instead of waiting a round trip for each (RFC 6675)
+		if ((fFlags & FLAG_RECOVERY) != 0)
+			_RetransmitNextHole();
+
 		if (fSendQueue.Available(fSendMax) != 0) {
 			fSendNext = fSendMax;
 			_SendQueued();
 		}
 	}
+}
+
+
+/*!	Adds the SACK blocks of \a segment to the scoreboard. Blocks outside
+	what is in flight (old ones, D-SACK) are ignored. When the scoreboard is
+	full, the highest ranges go first: the holes near fSendUnacknowledged
+	matter most.
+*/
+void
+TCPEndpoint::_UpdateScoreboard(const tcp_segment_header& segment)
+{
+	if ((fFlags & FLAG_OPTION_SACK_PERMITTED) == 0)
+		return;
+
+	for (int i = 0; i < segment.sackCount; i++) {
+		tcp_sequence left = segment.sacks[i].left_edge;
+		tcp_sequence right = segment.sacks[i].right_edge;
+		if (!(left < right) || fSendMax < right
+			|| right <= fSendUnacknowledged)
+			continue;
+		if (left < fSendUnacknowledged)
+			left = fSendUnacknowledged;
+
+		// merge with every range it overlaps or touches
+		int32 index = 0;
+		while (index < fScoreboardCount
+			&& fScoreboard[index].right < left)
+			index++;
+		int32 end = index;
+		while (end < fScoreboardCount && !(right < fScoreboard[end].left)) {
+			if (fScoreboard[end].left < left)
+				left = fScoreboard[end].left;
+			if (right < fScoreboard[end].right)
+				right = fScoreboard[end].right;
+			end++;
+		}
+
+		int32 removed = end - index;
+		if (removed == 0) {
+			// a new range at index
+			if (fScoreboardCount == kScoreboardSize) {
+				if (index == kScoreboardSize)
+					continue;
+				fScoreboardCount--;
+			}
+			for (int32 j = fScoreboardCount; j > index; j--)
+				fScoreboard[j] = fScoreboard[j - 1];
+			fScoreboardCount++;
+		} else if (removed > 1) {
+			for (int32 j = end; j < fScoreboardCount; j++)
+				fScoreboard[j - removed + 1] = fScoreboard[j];
+			fScoreboardCount -= removed - 1;
+		}
+		fScoreboard[index].left = left;
+		fScoreboard[index].right = right;
+	}
+}
+
+
+/*!	Drops what fSendUnacknowledged passed from the scoreboard. */
+void
+TCPEndpoint::_PruneScoreboard()
+{
+	int32 index = 0;
+	while (index < fScoreboardCount
+		&& fScoreboard[index].right <= fSendUnacknowledged)
+		index++;
+	if (index > 0) {
+		for (int32 j = index; j < fScoreboardCount; j++)
+			fScoreboard[j - index] = fScoreboard[j];
+		fScoreboardCount -= index;
+	}
+	if (fScoreboardCount > 0 && fScoreboard[0].left < fSendUnacknowledged)
+		fScoreboard[0].left = fSendUnacknowledged;
+
+	if (fHighRetransmitted < fSendUnacknowledged)
+		fHighRetransmitted = fSendUnacknowledged;
+}
+
+
+/*!	The next range to retransmit in fast recovery: the first one from
+	fHighRetransmitted on that the peer has not reported, below data it did
+	report (RFC 6675 NextSeg(), rule 1).
+*/
+bool
+TCPEndpoint::_NextHole(tcp_sequence& start, uint32& length) const
+{
+	start = fHighRetransmitted;
+	if (start < fSendUnacknowledged)
+		start = fSendUnacknowledged;
+
+	for (int32 i = 0; i < fScoreboardCount; i++) {
+		if (start < fScoreboard[i].left) {
+			length = (fScoreboard[i].left - start).Number();
+			return true;
+		}
+		if (start < fScoreboard[i].right)
+			start = fScoreboard[i].right;
+	}
+
+	return false;
+}
+
+
+/*!	In fast recovery with SACK, retransmits one segment of the next hole.
+	Returns false when the scoreboard names no hole (or SACK is not in use),
+	so that the caller can fall back to NewReno.
+*/
+bool
+TCPEndpoint::_RetransmitNextHole()
+{
+	tcp_sequence start;
+	uint32 length;
+	if (fScoreboardCount == 0 || !_NextHole(start, length))
+		return false;
+
+	tcp_segment_header segment = _PrepareSendSegment();
+	uint32 optionsLength = tcp_options_length(segment);
+	uint32 segmentMaxSize = fSendMaxSegmentSize > optionsLength
+		? fSendMaxSegmentSize - optionsLength : 0;
+	length = min_c(length, segmentMaxSize);
+	length = min_c(length, (uint32)fSendQueue.Available(start));
+	if (length == 0)
+		return false;
+
+	net_buffer* buffer = gBufferModule->create(256);
+	if (buffer == NULL)
+		return false;
+	if (fSendQueue.Get(buffer, start, length) != B_OK) {
+		gBufferModule->free(buffer);
+		return false;
+	}
+
+	tcp_sequence next = fSendNext;
+	fSendNext = start;
+	status_t status = _PrepareAndSend(segment, buffer, true);
+	fSendNext = next;
+	if (status != B_OK)
+		return false;
+
+	fHighRetransmitted = start + length;
+	return true;
 }
 
 
@@ -2267,6 +2419,8 @@ TCPEndpoint::_Receive(tcp_segment_header& segment, net_buffer* buffer)
 			// this is a pure acknowledge segment - we're on the sending end
 			if (fSendUnacknowledged < segment.acknowledge
 				&& fSendMax >= segment.acknowledge) {
+				if ((segment.options & TCP_HAS_SACK) != 0)
+					_UpdateScoreboard(segment);
 				_Acknowledged(segment);
 				return DROP;
 			}
@@ -2490,6 +2644,9 @@ TCPEndpoint::_Receive(tcp_segment_header& segment, net_buffer* buffer)
 
 		if (fSendMax < segment.acknowledge)
 			return DROP | IMMEDIATE_ACKNOWLEDGE;
+
+		if ((segment.options & TCP_HAS_SACK) != 0)
+			_UpdateScoreboard(segment);
 
 		if (segment.acknowledge == fSendUnacknowledged) {
 			if (buffer->size == 0 && advertisedWindow == previousSendWindow
@@ -3156,6 +3313,15 @@ TCPEndpoint::_SendQueued(bool force)
 			? fSendMaxSegmentSize - optionsLength : 0;
 		uint32 segmentLength = min_c(length, segmentMaxSize);
 
+		if (retransmit && fDuplicateAcknowledgeCount == 0
+			&& segmentLength < segmentMaxSize
+			&& fSendNext + segmentLength < fSendMax) {
+			// After a timeout, slow start resends in full segments: the
+			// window counts the MSS with its options, so what is left of it
+			// would otherwise go out as a runt of a few bytes
+			break;
+		}
+
 		if ((fSendNext + segmentLength) == fSendQueue.LastSequence() && !force) {
 			if (state_needs_finish(fState))
 				segment.flags |= (fFlags & FLAG_USER_CLOSED) != 0 ? TCP_FLAG_RESET : TCP_FLAG_FINISH;
@@ -3212,8 +3378,12 @@ TCPEndpoint::_SendQueued(bool force)
 		segment.flags &= ~(TCP_FLAG_SYNCHRONIZE | TCP_FLAG_RESET
 			| TCP_FLAG_FINISH);
 
-		if (retransmit)
+		if (retransmit && fDuplicateAcknowledgeCount != 0) {
+			// fast retransmit and recovery send one segment at a time;
+			// after a timeout, slow start may send what the window allows
+			// (it sent one segment per ACK before, whatever the window)
 			break;
+		}
 
 		if (segmentLength == 0) {
 			// no room for data in a segment: sending again would only repeat
@@ -3301,6 +3471,7 @@ TCPEndpoint::_Acknowledged(tcp_segment_header& segment)
 		uint32 bytesAcknowledged = segment.acknowledge - fSendUnacknowledged.Number();
 		fPreviousHighestAcknowledge = fSendUnacknowledged;
 		fSendUnacknowledged = segment.acknowledge;
+		_PruneScoreboard();
 		fRetransmitStart = 0;
 			// the peer makes progress, restart the give-up clock
 		uint32 flightSize = (fSendMax - fSendUnacknowledged).Number();
@@ -3323,12 +3494,22 @@ TCPEndpoint::_Acknowledged(tcp_segment_header& segment)
 				fFlags &= ~FLAG_RECOVERY;
 				fDuplicateAcknowledgeCount = 0;
 				fBytesAcknowledgedInAvoidance = 0;
+				fHighRetransmitted = fSendUnacknowledged;
 			} else {
 				// a partial acknowledgement: retransmit the next hole and
-				// deflate the window by what was acknowledged (step 4)
-				fSendNext = fSendUnacknowledged;
-				_SendQueued();
-				fSendNext = fSendMax;
+				// deflate the window by what was acknowledged (step 4). With
+				// SACK, the next hole is the first range not reported and not
+				// yet retransmitted; without, it is the first unacknowledged
+				// segment.
+				if (!_RetransmitNextHole()
+					&& !(fSendUnacknowledged < fHighRetransmitted)) {
+					// the first unacknowledged segment was not resent yet
+					fSendNext = fSendUnacknowledged;
+					_SendQueued();
+					fSendNext = fSendMax;
+					fHighRetransmitted = fSendUnacknowledged
+						+ fSendMaxSegmentSize;
+				}
 
 				fCongestionWindow = bytesAcknowledged < fCongestionWindow
 					? fCongestionWindow - bytesAcknowledged : 0;
@@ -3445,6 +3626,10 @@ TCPEndpoint::_Retransmit()
 		if (fRetransmitTimeout > TCP_MAX_RETRANSMIT_TIMEOUT)
 			fRetransmitTimeout = TCP_MAX_RETRANSMIT_TIMEOUT;
 	}
+
+	// RFC 6675 section 5.1: after a timeout the scoreboard may be wrong
+	fScoreboardCount = 0;
+	fHighRetransmitted = fSendUnacknowledged;
 
 	fSendNext = fSendUnacknowledged;
 	if (fState == SYNCHRONIZE_SENT) {

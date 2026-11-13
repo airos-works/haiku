@@ -133,6 +133,10 @@ private:
 			void		_UpdateRoundTripTime(int32 roundTripTime, int32 expectedSamples);
 			void		_ResetSlowStart();
 			void		_DuplicateAcknowledge(tcp_segment_header& segment);
+			void		_UpdateScoreboard(const tcp_segment_header& segment);
+			void		_PruneScoreboard();
+			bool		_NextHole(tcp_sequence& start, uint32& length) const;
+			bool		_RetransmitNextHole();
 
 	static	void		_TimeWaitTimer(net_timer* timer, void* _endpoint);
 	static	void		_RetransmitTimer(net_timer* timer, void* _endpoint);
@@ -178,6 +182,18 @@ private:
 	uint32			fDuplicateAcknowledgeCount;
 	uint32			fPreviousFlightSize;
 	tcp_sequence	fRecover;
+
+	// SACK scoreboard (RFC 6675): the ranges above fSendUnacknowledged the
+	// peer reported, sorted and disjoint, and the end of what fast recovery
+	// retransmitted so far
+	enum { kScoreboardSize = 16 };
+	struct sack_range {
+		tcp_sequence	left;
+		tcp_sequence	right;
+	};
+	sack_range		fScoreboard[kScoreboardSize];
+	int32			fScoreboardCount;
+	tcp_sequence	fHighRetransmitted;
 		// highest sequence sent when fast recovery began (RFC 6582)
 
 	net_route		*fRoute;
