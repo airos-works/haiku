@@ -18,6 +18,7 @@
 #include <util/Random.h>
 
 #include <NetUtilities.h>
+#include <net_stat.h>
 #include <tracing.h>
 
 #include "TCPEndpoint.h"
@@ -613,6 +614,8 @@ EndpointManager::ReplyWithReset(tcp_segment_header& segment, net_buffer* buffer)
 	status_t status = add_tcp_header(AddressModule(), outSegment, reply);
 	if (status == B_OK)
 		status = Domain()->module->send_data(NULL, reply);
+	if (status == B_OK)
+		NET_STAT_INC(gStackModule, tcp_resets_sent);
 
 	if (status != B_OK)
 		gBufferModule->free(reply);

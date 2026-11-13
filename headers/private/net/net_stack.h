@@ -207,6 +207,9 @@ struct net_stack_module_info {
 	// interface address listeners
 	status_t	(*add_address_listener)(net_address_listener* listener);
 	void		(*remove_address_listener)(net_address_listener* listener);
+
+	// counters of the whole stack (see net_stat.h)
+	struct net_protocol_stats* protocol_stats;
 };
 
 

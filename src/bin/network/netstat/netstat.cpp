@@ -107,9 +107,10 @@ inet_print_address(sockaddr* address)
 void
 usage(int status)
 {
-	printf("Usage: %s [-nh]\n", kProgramName);
+	printf("Usage: %s [-nhs]\n", kProgramName);
 	printf("Options:\n");
 	printf("	-n	don't resolve names\n");
+	printf("	-s	show the statistics of the protocols\n");
 	printf("	-h	this help\n");
 	printf("Filter options:\n");
 	printf("	-4	IPv4\n");
@@ -120,6 +121,58 @@ usage(int status)
 	printf("	-l	listen state\n");
 
 	exit(status);
+}
+
+
+static int
+print_statistics()
+{
+	net_protocol_stats stats;
+	memset(&stats, 0, sizeof(stats));
+	status_t status = _kern_generic_syscall(NET_STAT_SYSCALLS,
+		NET_STAT_GET_PROTOCOL_STATS, &stats, sizeof(stats));
+	if (status != B_OK) {
+		fprintf(stderr, "%s: could not get the statistics: %s\n",
+			kProgramName, strerror(status));
+		return 1;
+	}
+
+#define LINE(value, text) \
+	printf("	%" B_PRIu64 " " text "\n", (uint64)(value))
+
+	printf("ip:\n");
+	LINE(stats.ip_received, "packets received");
+	LINE(stats.ip_header_errors, "with header errors");
+	LINE(stats.ip_no_protocol, "for unknown protocols");
+	LINE(stats.ip_fragments_received, "fragments received");
+	LINE(stats.ip_reassembled, "packets reassembled");
+	LINE(stats.ip_reassembly_dropped, "fragments dropped (timeout or limit)");
+	LINE(stats.ip_sent, "packets sent");
+
+	printf("udp:\n");
+	LINE(stats.udp_received, "datagrams received");
+	LINE(stats.udp_checksum_errors, "with bad checksums");
+	LINE(stats.udp_no_port, "for ports nobody listens on");
+	LINE(stats.udp_receive_buffer_errors,
+		"dropped because the socket's queue was full");
+	LINE(stats.udp_sent, "datagrams sent");
+
+	printf("tcp:\n");
+	LINE(stats.tcp_received, "segments received");
+	LINE(stats.tcp_checksum_errors, "with bad checksums");
+	LINE(stats.tcp_sent, "segments sent");
+	LINE(stats.tcp_retransmitted, "segments retransmitted");
+	LINE(stats.tcp_resets_sent, "resets sent");
+	LINE(stats.tcp_challenge_acks, "challenge ACKs sent (RFC 5961)");
+	LINE(stats.tcp_connections_refused,
+		"connections refused (listen queue full)");
+
+	printf("raw:\n");
+	LINE(stats.raw_receive_buffer_errors,
+		"packets dropped because the socket's queue was full");
+#undef LINE
+
+	return 0;
 }
 
 
@@ -145,12 +198,13 @@ main(int argc, char** argv)
 		{"udp", no_argument, 0, 'u'},
 
 		{"listen", no_argument, 0, 'l'},
+		{"statistics", no_argument, 0, 's'},
 
 		{0, 0, 0, 0}
 	};
 
 	do {
-		opt = getopt_long(argc, argv, "hn46xtul", kLongOptions,
+		opt = getopt_long(argc, argv, "hn46xtuls", kLongOptions,
 			&optionIndex);
 		switch (opt) {
 			case -1:
@@ -182,6 +236,9 @@ main(int argc, char** argv)
 			case 'l':
 				filter |= FILTER_STATE_LISTEN;
 				break;
+
+			case 's':
+				return print_statistics();
 
 			case 'h':
 			default:

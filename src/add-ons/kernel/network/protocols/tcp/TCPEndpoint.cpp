@@ -1979,6 +1979,7 @@ TCPEndpoint::_ListenReceive(tcp_segment_header& segment, net_buffer* buffer)
 	net_socket* newSocket;
 	if (gSocketModule->spawn_pending_socket(socket, &newSocket) < B_OK) {
 		T(Error(this, "spawning failed", __LINE__));
+		NET_STAT_INC(gStackModule, tcp_connections_refused);
 		return DROP;
 	}
 
@@ -2063,6 +2064,7 @@ TCPEndpoint::_ChallengeAcknowledge()
 		return DROP;
 
 	fLastChallengeAcknowledge = now;
+	NET_STAT_INC(gStackModule, tcp_challenge_acks);
 	return DROP | IMMEDIATE_ACKNOWLEDGE;
 }
 
@@ -2690,6 +2692,11 @@ TCPEndpoint::_PrepareAndSend(tcp_segment_header& segment, net_buffer* buffer,
 		size++;
 
 	status = next->module->send_routed_data(next, fRoute, buffer);
+	if (status == B_OK) {
+		NET_STAT_INC(gStackModule, tcp_sent);
+		if (isRetransmit)
+			NET_STAT_INC(gStackModule, tcp_retransmitted);
+	}
 	if (status < B_OK) {
 		gBufferModule->free(buffer);
 		return status;

@@ -692,6 +692,8 @@ tcp_receive_data(net_buffer* buffer)
 {
 	TRACE(("TCP: Received buffer %p\n", buffer));
 
+	NET_STAT_INC(gStackModule, tcp_received);
+
 	if (buffer->interface_address == NULL
 		|| buffer->interface_address->domain == NULL)
 		return B_ERROR;
@@ -710,8 +712,10 @@ tcp_receive_data(net_buffer* buffer)
 		return B_BAD_DATA;
 
 	if ((buffer->buffer_flags & NET_BUFFER_L4_CHECKSUM_VALID) == 0) {
-		if (Checksum::PseudoHeader(addressModule, gBufferModule, buffer, IPPROTO_TCP) != 0)
+		if (Checksum::PseudoHeader(addressModule, gBufferModule, buffer, IPPROTO_TCP) != 0) {
+			NET_STAT_INC(gStackModule, tcp_checksum_errors);
 			return B_BAD_DATA;
+		}
 	}
 
 	addressModule->set_port(buffer->source, header.source_port);

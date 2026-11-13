@@ -151,6 +151,7 @@ protected:
 			sem_id				fNotify;
 			BufferList			fBuffers;
 			size_t				fCurrentBytes;
+			size_t				fChargedBytes;
 	mutable	LockType			fLock;
 };
 
@@ -163,7 +164,7 @@ protected:
 DECL_DATAGRAM_SOCKET(inline)::DatagramSocket(const char* name,
 	net_socket* socket)
 	:
-	ProtocolSocket(socket), fCurrentBytes(0)
+	ProtocolSocket(socket), fCurrentBytes(0), fChargedBytes(0)
 {
 	status_t status = LockingBase::Init(&fLock, name);
 	if (status != B_OK)
@@ -306,14 +307,31 @@ DECL_DATAGRAM_SOCKET(inline status_t)::SocketStatus(bool peek) const
 }
 
 
+/*!	What a queued datagram costs against the receive buffer size: the
+	memory it holds (2048-byte data blocks plus its header), not just its
+	payload. Counting the payload alone let empty datagrams pile up without
+	limit (airos-works/haiku#129).
+*/
+static inline size_t
+datagram_charge(const net_buffer* buffer)
+{
+	size_t blocks = ((size_t)buffer->size + 2047) / 2048;
+	return (blocks > 0 ? blocks : 1) * 2048 + 256;
+}
+
+
 DECL_DATAGRAM_SOCKET(inline status_t)::_Enqueue(net_buffer* buffer)
 {
+	size_t charge = datagram_charge(buffer);
 	if (fSocket->receive.buffer_size > 0
-		&& (fCurrentBytes + buffer->size) > fSocket->receive.buffer_size)
+		&& fChargedBytes + charge > fSocket->receive.buffer_size
+		&& !fBuffers.IsEmpty())
 		return ENOBUFS;
+			// a datagram larger than the buffer can still be received alone
 
 	fBuffers.Add(buffer);
 	fCurrentBytes += buffer->size;
+	fChargedBytes += charge;
 
 	_NotifyOneReader(true);
 
@@ -331,6 +349,7 @@ DECL_DATAGRAM_SOCKET(inline net_buffer*)::_Dequeue(bool peek)
 
 	net_buffer* buffer = fBuffers.RemoveHead();
 	fCurrentBytes -= buffer->size;
+	fChargedBytes -= datagram_charge(buffer);
 
 	return buffer;
 }
@@ -338,10 +357,10 @@ DECL_DATAGRAM_SOCKET(inline net_buffer*)::_Dequeue(bool peek)
 
 DECL_DATAGRAM_SOCKET(inline void)::_Clear()
 {
-	BufferList::Iterator it = fBuffers.GetIterator();
-	while (it.HasNext())
-		ModuleBundle::Buffer()->free(it.Next());
+	while (net_buffer* buffer = fBuffers.RemoveHead())
+		ModuleBundle::Buffer()->free(buffer);
 	fCurrentBytes = 0;
+	fChargedBytes = 0;
 }
 
 

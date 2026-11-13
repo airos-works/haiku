@@ -18,6 +18,7 @@
 #include <net_stack.h>
 #include <NetBufferUtilities.h>
 #include <NetSecret.h>
+#include <net_stat.h>
 #include <ProtocolUtilities.h>
 
 #include <KernelExport.h>
@@ -792,7 +793,8 @@ raw_receive_data(net_buffer* buffer)
 		RawSocket* raw = iterator.Next();
 
 		if (raw->Socket()->protocol == buffer->protocol) {
-			raw->EnqueueClone(buffer);
+			if (raw->EnqueueClone(buffer) == ENOBUFS)
+				NET_STAT_INC(gStackModule, raw_receive_buffer_errors);
 			count++;
 		}
 	}
@@ -1670,7 +1672,10 @@ ipv4_send_routed_data(net_protocol* _protocol, struct net_route* route,
 		return send_fragments(protocol, route, buffer, mtu);
 	}
 
-	return sDatalinkModule->send_routed_data(route, buffer);
+	status_t status = sDatalinkModule->send_routed_data(route, buffer);
+	if (status == B_OK)
+		NET_STAT_INC(gStackModule, ip_sent);
+	return status;
 }
 
 
@@ -1789,6 +1794,8 @@ ipv4_receive_data(net_buffer* buffer)
 {
 	TRACE("ipv4_receive_data(%p [%" B_PRIu32 " bytes])", buffer, buffer->size);
 
+	NET_STAT_INC(gStackModule, ip_received);
+
 	uint16 headerLength = 0;
 	{
 	NetBufferHeaderReader<ipv4_header> bufferHeader(buffer);
@@ -1798,18 +1805,24 @@ ipv4_receive_data(net_buffer* buffer)
 	ipv4_header& header = bufferHeader.Data();
 	TRACE_ONLY(dump_ipv4_header(header));
 
-	if (header.version != IPV4_VERSION)
+	if (header.version != IPV4_VERSION) {
+		NET_STAT_INC(gStackModule, ip_header_errors);
 		return B_BAD_TYPE;
+	}
 
 	uint16 packetLength = header.TotalLength();
 	headerLength = header.HeaderLength();
 	if (packetLength > buffer->size
-		|| headerLength < sizeof(ipv4_header))
+		|| headerLength < sizeof(ipv4_header)) {
+		NET_STAT_INC(gStackModule, ip_header_errors);
 		return B_BAD_DATA;
+	}
 
 	if ((buffer->buffer_flags & NET_BUFFER_L3_CHECKSUM_VALID) == 0) {
-		if (gBufferModule->checksum(buffer, 0, headerLength, true) != 0)
+		if (gBufferModule->checksum(buffer, 0, headerLength, true) != 0) {
+			NET_STAT_INC(gStackModule, ip_header_errors);
 			return B_BAD_DATA;
+		}
 	}
 
 	// lower layers notion of broadcast or multicast have no relevance to us
@@ -1880,6 +1893,7 @@ ipv4_receive_data(net_buffer* buffer)
 		|| (fragmentOffset & IP_FRAGMENT_OFFSET_MASK) != 0) {
 		// this is a fragment
 		TRACE("  ipv4_receive_data(): Found a Fragment!");
+		NET_STAT_INC(gStackModule, ip_fragments_received);
 		status = reassemble_fragments(header, &buffer);
 		TRACE("  ipv4_receive_data():  -> %s", strerror(status));
 		if (status != B_OK)
@@ -1890,6 +1904,7 @@ ipv4_receive_data(net_buffer* buffer)
 			TRACE("  ipv4_receive_data(): Not yet assembled.");
 			return B_OK;
 		}
+		NET_STAT_INC(gStackModule, ip_reassembled);
 	}
 
 	// Since the buffer might have been changed (reassembled fragment)
@@ -1908,6 +1923,7 @@ ipv4_receive_data(net_buffer* buffer)
 	net_protocol_module_info* module = receiving_protocol(buffer->protocol);
 	if (module == NULL) {
 		// no handler for this packet
+		NET_STAT_INC(gStackModule, ip_no_protocol);
 		if (!rawDelivered) {
 			sDomain->module->error_reply(NULL, buffer,
 				B_NET_ERROR_UNREACH_PROTOCOL, NULL);

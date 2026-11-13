@@ -23,6 +23,7 @@
 
 #include <NetBufferUtilities.h>
 #include <NetUtilities.h>
+#include <net_stat.h>
 #include <ProtocolUtilities.h>
 
 #include <algorithm>
@@ -737,6 +738,8 @@ UdpEndpointManager::ReceiveData(net_buffer *buffer)
 {
 	TRACE_EPM("ReceiveData(%p [%" B_PRIu32 " bytes])", buffer, buffer->size);
 
+	NET_STAT_INC(gStackModule, udp_received);
+
 	UdpDomainSupport* domainSupport = _GetDomainSupport(buffer);
 	if (domainSupport == NULL) {
 		// we don't instantiate domain supports in the receiving path, as
@@ -753,6 +756,7 @@ UdpEndpointManager::ReceiveData(net_buffer *buffer)
 	status = domainSupport->DemuxIncomingBuffer(buffer);
 	if (status != B_OK) {
 		TRACE_EPM("  ReceiveData(): no endpoint.");
+		NET_STAT_INC(gStackModule, udp_no_port);
 		// Send port unreachable error
 		domainSupport->Domain()->module->error_reply(NULL, buffer,
 			B_NET_ERROR_UNREACH_PORT, NULL);
@@ -848,6 +852,7 @@ UdpEndpointManager::Deframe(net_buffer* buffer)
 			buffer, IPPROTO_UDP);
 		if (sum != 0) {
 			TRACE_EPM("  Deframe(): bad checksum 0x%hx.", sum);
+			NET_STAT_INC(gStackModule, udp_checksum_errors);
 			return B_BAD_VALUE;
 		}
 	}
@@ -1082,7 +1087,10 @@ UdpEndpoint::SendRoutedData(net_buffer *buffer, net_route *route)
 	*UDPChecksumField(buffer) = calculatedChecksum;
 	buffer->buffer_flags |= NET_BUFFER_L4_CHECKSUM_VALID;
 
-	return next->module->send_routed_data(next, route, buffer);
+	status = next->module->send_routed_data(next, route, buffer);
+	if (status == B_OK)
+		NET_STAT_INC(gStackModule, udp_sent);
+	return status;
 }
 
 
@@ -1151,7 +1159,10 @@ UdpEndpoint::StoreData(net_buffer *buffer)
 {
 	TRACE_EP("StoreData(%p [%" B_PRIu32 " bytes])", buffer, buffer->size);
 
-	return EnqueueClone(buffer);
+	status_t status = EnqueueClone(buffer);
+	if (status == ENOBUFS)
+		NET_STAT_INC(gStackModule, udp_receive_buffer_errors);
+	return status;
 }
 
 
@@ -1171,8 +1182,11 @@ UdpEndpoint::DeliverData(net_buffer *_buffer)
 	}
 
 	status = Enqueue(buffer);
-	if (status < B_OK)
+	if (status < B_OK) {
+		if (status == ENOBUFS)
+			NET_STAT_INC(gStackModule, udp_receive_buffer_errors);
 		gBufferModule->free(buffer);
+	}
 	return status;
 }
 
@@ -1196,6 +1210,13 @@ net_protocol *
 udp_init_protocol(net_socket *socket)
 {
 	socket->protocol = IPPROTO_UDP;
+
+	// The queue is charged with the memory each datagram holds (2304 bytes
+	// for a full-size one), so the stack's general 64 KB default would only
+	// hold 28 datagrams, a third of a millisecond at 1 Gbit/s; with 1 MiB a
+	// reader may fall about 5 ms behind before datagrams are dropped
+	// (airos-works/haiku#126). Linux charges its 208 KiB default the same way.
+	socket->receive.buffer_size = 1024 * 1024;
 
 	UdpEndpoint *endpoint = new (std::nothrow) UdpEndpoint(socket);
 	if (endpoint == NULL || endpoint->InitCheck() < B_OK) {

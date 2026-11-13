@@ -25,6 +25,9 @@
 #include <util/Vector.h>
 
 #include <KernelExport.h>
+#include <generic_syscall.h>
+#include <kernel.h>
+#include <net_stat.h>
 
 #include <net/if_types.h>
 #include <new>
@@ -772,6 +775,10 @@ scan_modules(const char* path)
 }
 
 
+static status_t stats_control(const char* subsystem, uint32 function,
+	void* buffer, size_t bufferSize);
+
+
 status_t
 init_stack()
 {
@@ -861,6 +868,8 @@ init_stack()
 		"network/datalink_protocols/ethernet_frame/v1",
 		NULL);
 
+	register_generic_syscall(NET_STAT_SYSCALLS, stats_control, 1, 0);
+
 	return B_OK;
 
 err8:
@@ -889,6 +898,7 @@ uninit_stack()
 {
 	TRACE(("Unloading network stack\n"));
 
+	unregister_generic_syscall(NET_STAT_SYSCALLS, 1);
 	put_module(NET_SOCKET_MODULE_NAME);
 	uninit_notifications();
 
@@ -936,6 +946,25 @@ stack_std_ops(int32 op, ...)
 		default:
 			return B_ERROR;
 	}
+}
+
+
+static net_protocol_stats sProtocolStats;
+
+
+static status_t
+stats_control(const char* subsystem, uint32 function, void* buffer,
+	size_t bufferSize)
+{
+	if (function != NET_STAT_GET_PROTOCOL_STATS)
+		return B_BAD_VALUE;
+
+	size_t size = min_c(bufferSize, sizeof(net_protocol_stats));
+	if (!IS_USER_ADDRESS(buffer)
+		|| user_memcpy(buffer, &sProtocolStats, size) != B_OK)
+		return B_BAD_ADDRESS;
+
+	return B_OK;
 }
 
 
@@ -1000,7 +1029,9 @@ net_stack_module_info gNetStackModule = {
 	clone_ancillary_data,
 
 	add_address_listener,
-	remove_address_listener
+	remove_address_listener,
+
+	&sProtocolStats
 };
 
 module_info* modules[] = {
