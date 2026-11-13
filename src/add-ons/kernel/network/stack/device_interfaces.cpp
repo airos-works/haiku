@@ -8,6 +8,7 @@
 
 
 #include "device_interfaces.h"
+#include "coalesce.h"
 #include "domains.h"
 #include "interfaces.h"
 #include "stack_private.h"
@@ -113,6 +114,9 @@ device_consumer_thread(void* _interface)
 				continue;
 			break;
 		}
+
+		// merge consecutive segments of each TCP connection
+		coalesce_tcp_segments(&batch);
 
 		RecursiveLocker locker(interface->receive_lock);
 

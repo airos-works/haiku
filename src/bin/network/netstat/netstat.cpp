@@ -168,6 +168,8 @@ print_statistics()
 		"connections refused (listen queue full)");
 	LINE(stats.tcp_syn_cookies_sent, "SYN cookies sent");
 	LINE(stats.tcp_syn_cookies_accepted, "connections made from SYN cookies");
+	LINE(stats.tcp_segments_coalesced,
+		"segments coalesced into the one before them");
 
 	printf("raw:\n");
 	LINE(stats.raw_receive_buffer_errors,

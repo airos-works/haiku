@@ -66,6 +66,10 @@ typedef struct net_protocol_stats {
 
 	// raw and ICMP sockets
 	uint64	raw_receive_buffer_errors;
+
+	// receive coalescing
+	uint64	tcp_segments_coalesced;
+		// segments merged into the one before them
 } net_protocol_stats;
 
 #define NET_STAT_SYSCALLS				"network/stats"

@@ -5,6 +5,7 @@ UsePrivateHeaders net shared ;
 
 KernelAddon stack :
 	ancillary_data.cpp
+	coalesce.cpp
 	datalink.cpp
 	device_interfaces.cpp
 	domains.cpp
