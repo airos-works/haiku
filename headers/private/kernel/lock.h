@@ -28,6 +28,17 @@ typedef struct mutex {
 	int32					count;
 #endif
 	uint8					flags;
+#if !KDEBUG
+	uint8					woken;
+		// waiters woken to compete that have not yet taken the mutex or
+		// queued up again; mutex_destroy() waits for them
+	uint16					holder_cpu;
+		// CPU the holder was running on when it took the lock
+	thread_id				holder;
+		// 0 when not known. Both are hints for contending threads, which
+		// spin instead of sleeping while the holder is running (#96).
+		// They fill what used to be padding on 64 bit.
+#endif
 } mutex;
 
 #define MUTEX_FLAG_CLONE_NAME	0x1
@@ -222,47 +233,6 @@ rw_lock_write_unlock(rw_lock* lock)
 {
 	_rw_lock_write_unlock(lock);
 }
-
-
-#if !KDEBUG
-static inline status_t
-mutex_lock_inline(mutex* lock)
-{
-	if (atomic_add(&lock->count, -1) < 0)
-		return _mutex_lock(lock, NULL);
-	return B_OK;
-}
-#define mutex_lock		mutex_lock_inline
-
-
-static inline status_t
-mutex_trylock_inline(mutex* lock)
-{
-	if (atomic_test_and_set(&lock->count, -1, 0) != 0)
-		return B_WOULD_BLOCK;
-	return B_OK;
-}
-#define mutex_trylock	mutex_trylock_inline
-
-
-static inline status_t
-mutex_lock_with_timeout_inline(mutex* lock, uint32 timeoutFlags, bigtime_t timeout)
-{
-	if (atomic_add(&lock->count, -1) < 0)
-		return _mutex_lock_with_timeout(lock, timeoutFlags, timeout);
-	return B_OK;
-}
-#define mutex_lock_with_timeout	mutex_lock_with_timeout_inline
-
-
-static inline void
-mutex_unlock_inline(mutex* lock)
-{
-	if (atomic_add(&lock->count, 1) < -1)
-		_mutex_unlock(lock);
-}
-#define mutex_unlock	mutex_unlock_inline
-#endif
 
 
 extern void lock_debug_init();

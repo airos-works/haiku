@@ -73,6 +73,31 @@ public:
 									VMArea* area, addr_t address,
 									bool unmapIfUnaccessed,
 									bool& _modified) = 0;
+	virtual	size_t				LargePageSize() const	{ return 0; }
+									// size of the large pages MapLarge()
+									// creates, 0 if it can't (#99)
+	virtual	bool				CanMapLarge(addr_t virtualAddress)
+									{ return false; }
+	virtual	status_t			MapLarge(addr_t virtualAddress,
+									phys_addr_t physicalAddress,
+									uint32 attributes, uint32 memoryType,
+									vm_page_reservation* reservation)
+									{ return B_NOT_SUPPORTED; }
+									// Maps a naturally aligned, physically
+									// contiguous large page with one entry.
+									// The map splits it into ordinary pages
+									// before any other operation touches part
+									// of it; the page that needs is taken
+									// from the reservation now.
+	virtual	bool				TestAndClearAccessed(VMArea* area,
+									addr_t address, bool& _modified);
+									// Ages a mapping: clears its accessed
+									// flag without invalidating TLB entries
+									// and leaves the modified flag set, which
+									// is only reported. A map that implements
+									// it must later invalidate the entry even
+									// if the accessed flag is still clear.
+									// The default is ClearAccessedAndModified().
 
 	virtual	void				Flush() = 0;
 

@@ -237,6 +237,30 @@ private:
 
 
 // The memory reserve an allocation of the certain priority must not touch.
+// Page faults on file data map the pages around the faulting one that are in
+// memory already, and read the missing ones in one request (#98); faults in
+// large anonymous areas fill a window of pages at once (#99). An aligned
+// window of this size, which matches packagefs's 64 KiB blocks.
+static const uint32 kFaultAroundPages = 16;
+// Read-around grows up to this for faults that follow each other.
+static const uint32 kMaxReadAroundPages = 256;
+// Anonymous areas smaller than this get one page per fault.
+static const size_t kMinAnonymousFaultAroundAreaSize = 1024 * 1024;
+
+
+/*!	Whether faults may map or read more than the page they need. Pages
+	mapped speculatively are no longer just cached ones the next reservation
+	can take, so this stops when free + cached memory gets short.
+*/
+static inline bool
+fault_around_allowed()
+{
+	return low_resource_state(B_KERNEL_RESOURCE_PAGES) == B_NO_LOW_RESOURCE
+		&& vm_page_num_free_pages() >= vm_page_num_pages() / 16
+		&& !vm_page_cache_thrashing();
+}
+
+
 static const size_t kMemoryReserveForPriority[] = {
 	VM_MEMORY_RESERVE_USER,		// user
 	VM_MEMORY_RESERVE_SYSTEM,	// system
@@ -248,6 +272,41 @@ static ObjectCache** sPageMappingsObjectCaches;
 static uint32 sPageMappingsMask;
 
 static rw_lock sAreaCacheLock = RW_LOCK_INITIALIZER("area->cache");
+
+// Fast path past sAreaCacheLock for vm_area_get_locked_cache() (#97): a
+// reader counts itself on its CPU's line with interrupts disabled and only
+// tries to lock the cache; a writer, besides write-locking sAreaCacheLock,
+// announces itself and waits until no such reader is left.
+struct CACHE_LINE_ALIGN area_cache_readers {
+	int32	count;
+};
+static area_cache_readers sAreaCacheReaders[SMP_MAX_CPUS];
+static int32 sAreaCacheWriters;
+
+
+static void
+area_cache_write_lock()
+{
+	rw_lock_write_lock(&sAreaCacheLock);
+	atomic_add(&sAreaCacheWriters, 1);
+
+	while (true) {
+		int32 readers = 0;
+		for (int32 i = 0; i < smp_get_num_cpus(); i++)
+			readers += atomic_get(&sAreaCacheReaders[i].count);
+		if (readers == 0)
+			break;
+		cpu_pause();
+	}
+}
+
+
+static void
+area_cache_write_unlock()
+{
+	atomic_add(&sAreaCacheWriters, -1);
+	rw_lock_write_unlock(&sAreaCacheLock);
+}
 
 static rw_spinlock sAvailableMemoryLock = B_RW_SPINLOCK_INITIALIZER;
 static int64 sAvailableMemory;
@@ -458,7 +517,7 @@ static inline void
 increment_page_wired_count(vm_page* page)
 {
 	if (!page->IsMapped())
-		atomic_add(&gMappedPagesCount, 1);
+		vm_page_add_mapped_pages(1);
 	page->IncrementWiredCount();
 }
 
@@ -470,7 +529,7 @@ decrement_page_wired_count(vm_page* page)
 {
 	page->DecrementWiredCount();
 	if (!page->IsMapped())
-		atomic_add(&gMappedPagesCount, -1);
+		vm_page_add_mapped_pages(-1);
 }
 
 
@@ -672,7 +731,7 @@ map_page(VMArea* area, vm_page* page, addr_t address, uint32 protection,
 
 		// insert mapping into lists
 		if (!page->IsMapped())
-			atomic_add(&gMappedPagesCount, 1);
+			vm_page_add_mapped_pages(1);
 
 		page->mappings.Add(mapping);
 		area->mappings.Add(mapping);
@@ -1600,6 +1659,27 @@ vm_create_anonymous_area(team_id team, const char *name, addr_t size,
 			return B_BAD_VALUE;
 	}
 
+	// Large pages need large page aligned addresses (#99).
+	virtual_address_restrictions largePageRestrictions;
+	if ((protection & B_LARGE_PAGES_AREA) != 0) {
+		if (wiring != B_NO_LOCK || canOvercommit || guardSize != 0)
+			protection &= ~B_LARGE_PAGES_AREA;
+		else if (virtualAddressRestrictions->address_specification
+				!= B_EXACT_ADDRESS) {
+			VMAddressSpace* addressSpace = VMAddressSpace::Get(team);
+			size_t largePageSize = addressSpace != NULL
+				? addressSpace->TranslationMap()->LargePageSize() : 0;
+			if (addressSpace != NULL)
+				addressSpace->Put();
+			if (largePageSize != 0 && size >= largePageSize
+				&& virtualAddressRestrictions->alignment < largePageSize) {
+				largePageRestrictions = *virtualAddressRestrictions;
+				largePageRestrictions.alignment = largePageSize;
+				virtualAddressRestrictions = &largePageRestrictions;
+			}
+		}
+	}
+
 	// If low or high physical address restrictions are given, we force
 	// B_CONTIGUOUS wiring, since only then we'll use
 	// vm_page_allocate_page_run() which deals with those restrictions.
@@ -2430,6 +2510,22 @@ vm_map_file(team_id aid, const char* name, void** address, uint32 addressSpec,
 VMCache*
 vm_area_get_locked_cache(VMArea* area)
 {
+	// fast path: no global lock written, unless the cache is contended
+	{
+		InterruptsLocker interruptsLocker;
+		int32* readers = &sAreaCacheReaders[smp_get_current_cpu()].count;
+		atomic_add(readers, 1);
+		if (atomic_get(&sAreaCacheWriters) == 0) {
+			VMCache* cache = *(VMCache* volatile*)&area->cache;
+			if (cache->TryLock()) {
+				cache->AcquireRefLocked();
+				atomic_add(readers, -1);
+				return cache;
+			}
+		}
+		atomic_add(readers, -1);
+	}
+
 	rw_lock_read_lock(&sAreaCacheLock);
 
 	while (true) {
@@ -2689,7 +2785,7 @@ vm_change_cache_of_clones(area_id areaId, struct VMCache* toCache)
 
 		unmap_pages(area, area->Base(), area->Size());
 
-		rw_lock_write_lock(&sAreaCacheLock);
+		area_cache_write_lock();
 
 		// We have to do this manually, because RemoveArea() expects
 		// to be called unlocked, so it can call ReleaseStoreRef().
@@ -2700,7 +2796,7 @@ vm_change_cache_of_clones(area_id areaId, struct VMCache* toCache)
 		toCache->InsertAreaLocked(area);
 		toCache->AcquireRefLocked();
 
-		rw_lock_write_unlock(&sAreaCacheLock);
+		area_cache_write_unlock();
 
 		cache->ReleaseRefLocked();
 		releaseStoreRefs++;
@@ -2888,9 +2984,9 @@ vm_copy_on_write_area(VMCache* lowerCache,
 	}
 
 	// transfer the lower cache areas to the upper cache
-	rw_lock_write_lock(&sAreaCacheLock);
+	area_cache_write_lock();
 	upperCache->TakeAreasFrom(lowerCache);
-	rw_lock_write_unlock(&sAreaCacheLock);
+	area_cache_write_unlock();
 
 	lowerCache->AddConsumer(upperCache);
 
@@ -3452,6 +3548,39 @@ vm_clear_page_mapping_accessed_flags(struct vm_page *page)
 }
 
 
+/*!	Like vm_clear_page_mapping_accessed_flags(), for ageing pages while
+	memory is plentiful: does not invalidate TLB entries for the accessed
+	flags, and leaves the mappings' modified flags set (the page's \c modified
+	flag is still updated). The caller must hold the page's cache lock.
+*/
+int32
+vm_test_and_clear_page_mapping_accessed(struct vm_page *page)
+{
+	int32 count = 0;
+
+	vm_page_mappings::Iterator iterator = page->mappings.GetIterator();
+	while (vm_page_mapping* mapping = iterator.Next()) {
+		VMArea* area = mapping->area;
+		VMTranslationMap* map = area->address_space->TranslationMap();
+
+		bool modified;
+		if (map->TestAndClearAccessed(area, virtual_page_address(area, page),
+				modified)) {
+			count++;
+		}
+
+		page->modified |= modified;
+	}
+
+	if (page->accessed) {
+		count++;
+		page->accessed = false;
+	}
+
+	return count;
+}
+
+
 /*!	Removes all mappings of a page and/or clears the accessed bits of the
 	mappings.
 	The function iterates through the page mappings and removes them until
@@ -3867,6 +3996,7 @@ struct PageFaultContext {
 	VMCacheChainLocker		cacheChainLocker;
 
 	VMTranslationMap*		map;
+	VMArea*					area;
 	VMCache*				topCache;
 	off_t					cacheOffset;
 	vm_page_reservation		reservation;
@@ -3876,20 +4006,27 @@ struct PageFaultContext {
 	vm_page*				page;
 	bool					restart;
 	bool					pageAllocated;
+	vm_page*				extraPages[kFaultAroundPages];
+	off_t					extraOffsets[kFaultAroundPages];
+	uint32					extraCount;
+	vm_page_reservation		extraReservation;
 
 
 	PageFaultContext(VMAddressSpace* addressSpace, bool isWrite)
 		:
 		addressSpaceLocker(addressSpace, true),
 		map(addressSpace->TranslationMap()),
+		area(NULL),
 		isWrite(isWrite)
 	{
+		extraReservation.count = 0;
 	}
 
 	~PageFaultContext()
 	{
 		UnlockAll();
 		vm_page_unreserve_pages(&reservation);
+		vm_page_unreserve_pages(&extraReservation);
 	}
 
 	void Prepare(VMCache* topCache, off_t cacheOffset)
@@ -3899,6 +4036,7 @@ struct PageFaultContext {
 		page = NULL;
 		restart = false;
 		pageAllocated = false;
+		extraCount = 0;
 
 		cacheChainLocker.SetTo(topCache);
 	}
@@ -3910,6 +4048,423 @@ struct PageFaultContext {
 		cacheChainLocker.Unlock(exceptCache);
 	}
 };
+
+
+/*!	Reads the page at \a context.cacheOffset of \a cache from its store,
+	and, for file data, the pages around it that are missing too, in one
+	request (#98). The read-around window is aligned to kFaultAroundPages and
+	grows up to kMaxReadAroundPages while faults follow each other. On return
+	the caches and the address space are unlocked.
+*/
+static status_t
+fault_read_pages(PageFaultContext& context, VMCache* cache)
+{
+	const off_t faultOffset = context.cacheOffset;
+	off_t start = faultOffset;
+	off_t end = faultOffset + B_PAGE_SIZE;
+
+	vm_page_reservation aroundReservation;
+	aroundReservation.count = 0;
+
+	if (cache->type == CACHE_TYPE_VNODE && fault_around_allowed()) {
+		uint32 windowPages = kFaultAroundPages;
+		if (faultOffset == cache->read_around_next
+			&& cache->read_around_pages >= kFaultAroundPages) {
+			windowPages = std::min((uint32)cache->read_around_pages * 2,
+				kMaxReadAroundPages);
+		}
+		const off_t windowSize = (off_t)kFaultAroundPages * B_PAGE_SIZE;
+		off_t windowStart = ROUNDDOWN(faultOffset, windowSize);
+		off_t windowEnd = std::max(windowStart
+				+ (off_t)windowPages * B_PAGE_SIZE,
+			faultOffset + (off_t)B_PAGE_SIZE);
+
+		// the run of missing pages around the faulting one
+		while (start > windowStart && start - B_PAGE_SIZE >= cache->virtual_base
+			&& cache->LookupPage(start - B_PAGE_SIZE) == NULL
+			&& cache->StoreHasPage(start - B_PAGE_SIZE)) {
+			start -= B_PAGE_SIZE;
+		}
+		while (end < windowEnd && cache->LookupPage(end) == NULL
+			&& cache->StoreHasPage(end)) {
+			end += B_PAGE_SIZE;
+		}
+
+		uint32 extra = (end - start) / B_PAGE_SIZE - 1;
+		if (extra > 0 && !vm_page_try_reserve_free_pages(&aroundReservation,
+				extra, VM_PRIORITY_USER)) {
+			start = faultOffset;
+			end = faultOffset + B_PAGE_SIZE;
+		}
+
+		cache->read_around_pages = windowPages;
+		cache->read_around_next = windowEnd;
+	}
+
+	const uint32 count = (end - start) / B_PAGE_SIZE;
+	vm_page* stackPages[kFaultAroundPages];
+	vm_page** pages = stackPages;
+	if (count > kFaultAroundPages) {
+		pages = (vm_page**)malloc_etc(count * sizeof(vm_page*),
+			HEAP_DONT_WAIT_FOR_MEMORY | HEAP_DONT_LOCK_KERNEL_SPACE);
+		if (pages == NULL) {
+			pages = stackPages;
+			start = faultOffset;
+			end = faultOffset + B_PAGE_SIZE;
+		}
+	}
+	const uint32 pageCount = (end - start) / B_PAGE_SIZE;
+	MemoryDeleter pagesDeleter(pages != stackPages ? pages : NULL);
+
+	// insert fresh pages and mark them busy -- we're going to read them in
+	for (uint32 i = 0; i < pageCount; i++) {
+		off_t offset = start + (off_t)i * B_PAGE_SIZE;
+		vm_page_reservation* reservation = offset == faultOffset
+			? &context.reservation : &aroundReservation;
+		pages[i] = vm_page_allocate_page(reservation,
+			(offset == faultOffset ? PAGE_STATE_ACTIVE : PAGE_STATE_CACHED)
+				| VM_PAGE_ALLOC_BUSY);
+		cache->InsertPage(pages[i], offset);
+		DEBUG_PAGE_ACCESS_END(pages[i]);
+	}
+	vm_page_unreserve_pages(&aroundReservation);
+
+	// We need to unlock all caches and the address space while reading
+	// the pages in. Keep a reference to the cache around.
+	cache->AcquireRefLocked();
+	context.UnlockAll();
+
+	// read the pages in, physically contiguous ones as one vector, in as
+	// few requests as the vector array allows
+	status_t status = B_OK;
+	generic_io_vec vecs[kFaultAroundPages];
+	uint32 vecCount = 0;
+	off_t vecsOffset = start;
+	generic_size_t vecsLength = 0;
+	for (uint32 i = 0; i <= pageCount && status == B_OK; i++) {
+		phys_addr_t base = i < pageCount
+			? (phys_addr_t)pages[i]->physical_page_number * B_PAGE_SIZE : 0;
+		if (i < pageCount && vecCount > 0
+			&& vecs[vecCount - 1].base + vecs[vecCount - 1].length == base) {
+			vecs[vecCount - 1].length += B_PAGE_SIZE;
+			vecsLength += B_PAGE_SIZE;
+			continue;
+		}
+		if (vecCount == kFaultAroundPages || (i == pageCount && vecCount > 0)) {
+			generic_size_t bytesRead = vecsLength;
+			status = cache->Read(vecsOffset, vecs, vecCount,
+				B_PHYSICAL_IO_REQUEST, &bytesRead);
+			vecsOffset += vecsLength;
+			vecCount = 0;
+			vecsLength = 0;
+		}
+		if (i < pageCount) {
+			vecs[vecCount].base = base;
+			vecs[vecCount].length = B_PAGE_SIZE;
+			vecCount++;
+			vecsLength += B_PAGE_SIZE;
+		}
+	}
+
+	cache->Lock();
+
+	for (uint32 i = 0; i < pageCount; i++) {
+		vm_page* page = pages[i];
+		DEBUG_PAGE_ACCESS_START(page);
+
+		if (status < B_OK) {
+			// on error remove and free the pages
+			cache->NotifyPageEvents(page, PAGE_EVENT_NOT_BUSY);
+			cache->RemovePage(page);
+			vm_page_free_etc(cache, page, NULL);
+		} else {
+			// mark the page unbusy again
+			cache->MarkPageUnbusy(page);
+			DEBUG_PAGE_ACCESS_END(page);
+		}
+	}
+
+	if (status < B_OK) {
+		dprintf("reading page from cache %p returned: %s!\n",
+			cache, strerror(status));
+	}
+
+	cache->ReleaseRefAndUnlock();
+	return status < B_OK ? status : B_OK;
+}
+
+
+/*!	A fault on a page no cache has, in a large anonymous area: also inserts
+	zeroed pages for the rest of the aligned window around it, to be mapped
+	with it (#99), as long as memory is plentiful. Only the top cache is
+	locked.
+*/
+static void
+fault_allocate_anonymous_pages(PageFaultContext& context)
+{
+	VMCache* cache = context.topCache;
+	VMArea* area = context.area;
+	if (area == NULL || area->wiring != B_NO_LOCK
+		|| area->Size() < kMinAnonymousFaultAroundAreaSize
+		|| !cache->temporary || cache->source != NULL
+		|| cache->CanOvercommit() || cache->GuardSize() != 0
+		|| (cache->type != CACHE_TYPE_RAM)
+		|| area->page_protections != NULL
+		|| low_resource_state(B_KERNEL_RESOURCE_PAGES | B_KERNEL_RESOURCE_MEMORY)
+			!= B_NO_LOW_RESOURCE
+		|| vm_page_num_free_pages() < vm_page_num_pages() / 16) {
+		return;
+	}
+
+	const off_t windowSize = (off_t)kFaultAroundPages * B_PAGE_SIZE;
+	const off_t areaStart = area->cache_offset;
+	const off_t areaEnd = area->cache_offset + (off_t)area->Size();
+	off_t start = std::max(ROUNDDOWN(context.cacheOffset, windowSize),
+		std::max(areaStart, cache->virtual_base));
+	off_t end = std::min(ROUNDDOWN(context.cacheOffset, windowSize) + windowSize,
+		std::min(areaEnd, cache->virtual_end));
+
+	uint32 wanted = 0;
+	for (off_t offset = start; offset < end; offset += B_PAGE_SIZE) {
+		if (offset != context.cacheOffset && cache->LookupPage(offset) == NULL
+			&& !cache->StoreHasPage(offset)) {
+			wanted++;
+		}
+	}
+	vm_page_unreserve_pages(&context.extraReservation);
+	if (wanted == 0 || !vm_page_try_reserve_free_pages(
+			&context.extraReservation, wanted, VM_PRIORITY_USER)) {
+		return;
+	}
+
+	for (off_t offset = start; offset < end; offset += B_PAGE_SIZE) {
+		if (offset == context.cacheOffset || cache->LookupPage(offset) != NULL
+			|| cache->StoreHasPage(offset)) {
+			continue;
+		}
+
+		vm_page* page = vm_page_allocate_page(&context.extraReservation,
+			PAGE_STATE_ACTIVE | VM_PAGE_ALLOC_CLEAR);
+		cache->InsertPage(page, offset);
+		DEBUG_PAGE_ACCESS_END(page);
+		context.extraPages[context.extraCount] = page;
+		context.extraOffsets[context.extraCount] = offset;
+		context.extraCount++;
+	}
+}
+
+
+/*!	After a page fault on file data has been resolved: maps the pages in the
+	aligned window around the faulting address that are in memory already
+	and not mapped, read-only (#98). Their accessed flags stay clear, so that
+	the page daemon does not take them for used. The caches from the top one
+	down to the one of the faulting page are locked.
+*/
+static void
+fault_around(PageFaultContext& context, VMArea* area, addr_t faultAddress)
+{
+	VMCache* pageCache = context.page->Cache();
+	if (pageCache->type != CACHE_TYPE_VNODE || area->wiring != B_NO_LOCK
+		|| !fault_around_allowed()) {
+		return;
+	}
+
+	const addr_t windowSize = (addr_t)kFaultAroundPages * B_PAGE_SIZE;
+	addr_t start = std::max(ROUNDDOWN(faultAddress, windowSize), area->Base());
+	addr_t last = std::min(
+		ROUNDDOWN(faultAddress, windowSize) + (windowSize - B_PAGE_SIZE),
+		area->Base() + (area->Size() - B_PAGE_SIZE));
+		// the last page's address: the window ends with the area
+
+	VMTranslationMap* map = context.map;
+	for (addr_t address = start; ; address += B_PAGE_SIZE) {
+		if (address != faultAddress) {
+			off_t offset = address - area->Base() + area->cache_offset;
+
+			// the page of the topmost cache down to the faulting page's one
+			vm_page* page = NULL;
+			for (VMCache* cache = context.topCache; cache != NULL;
+					cache = cache->source) {
+				page = cache->LookupPage(offset);
+				if (page != NULL || cache == pageCache
+					|| cache->StoreHasPage(offset)) {
+					break;
+				}
+			}
+
+			uint32 protection = get_area_page_protection(area, address)
+				& ~(B_WRITE_AREA | B_KERNEL_WRITE_AREA);
+			if (page != NULL && !page->busy
+				&& (protection & (B_READ_AREA | B_EXECUTE_AREA)) != 0) {
+				map->Lock();
+				phys_addr_t physicalAddress;
+				uint32 flags;
+				if (map->Query(address, &physicalAddress, &flags) != B_OK
+					|| (flags & PAGE_PRESENT) == 0) {
+					DEBUG_PAGE_ACCESS_START(page);
+					status_t status = map_page(area, page, address, protection,
+						&context.reservation);
+					DEBUG_PAGE_ACCESS_END(page);
+					if (status != B_OK) {
+						map->Unlock();
+						return;
+					}
+				}
+				map->Unlock();
+			}
+		}
+
+		if (address >= last)
+			break;
+	}
+}
+
+
+/*!	Maps the pages fault_allocate_anonymous_pages() added. */
+static void
+fault_map_anonymous_pages(PageFaultContext& context, VMArea* area)
+{
+	VMTranslationMap* map = context.map;
+	for (uint32 i = 0; i < context.extraCount; i++) {
+		vm_page* page = context.extraPages[i];
+		addr_t address = area->Base()
+			+ (addr_t)(context.extraOffsets[i] - area->cache_offset);
+
+		map->Lock();
+		phys_addr_t physicalAddress;
+		uint32 flags;
+		status_t status = B_OK;
+		if (map->Query(address, &physicalAddress, &flags) != B_OK
+			|| (flags & PAGE_PRESENT) == 0) {
+			DEBUG_PAGE_ACCESS_START(page);
+			status = map_page(area, page, address,
+				get_area_page_protection(area, address), &context.reservation);
+			DEBUG_PAGE_ACCESS_END(page);
+		}
+		map->Unlock();
+		if (status != B_OK)
+			break;
+	}
+	context.extraCount = 0;
+}
+
+
+/*!	A fault in an area that asked for large pages (B_LARGE_PAGES_AREA): maps
+	the large page around the address with one translation map entry, when
+	the cache has no page of that range yet, a physically contiguous run is
+	free, and memory is plentiful (#99). Only the top cache is locked.
+	Returns \c B_OK when it did.
+*/
+static status_t
+fault_map_large_page(PageFaultContext& context, VMArea* area, addr_t address)
+{
+	VMTranslationMap* map = context.map;
+	const size_t largeSize = map->LargePageSize();
+	if (largeSize == 0)
+		return B_NOT_SUPPORTED;
+
+	const addr_t base = ROUNDDOWN(address, largeSize);
+	if (base < area->Base()
+		|| base + (largeSize - 1) > area->Base() + (area->Size() - 1)) {
+		return B_BAD_VALUE;
+	}
+
+	VMCache* cache = context.topCache;
+	if (area->wiring != B_NO_LOCK || area->page_protections != NULL
+		|| !cache->temporary || cache->source != NULL
+		|| cache->type != CACHE_TYPE_RAM || cache->CanOvercommit()
+		|| cache->GuardSize() != 0
+		|| (area->MemoryType() != 0
+			&& area->MemoryType() != B_WRITE_BACK_MEMORY)) {
+		return B_NOT_SUPPORTED;
+	}
+
+	if (low_resource_state(B_KERNEL_RESOURCE_PAGES | B_KERNEL_RESOURCE_MEMORY)
+			!= B_NO_LOW_RESOURCE
+		|| vm_page_num_free_pages() < vm_page_num_pages() / 8) {
+		return B_NO_MEMORY;
+	}
+
+	// none of the range's pages may exist yet, in memory or swap
+	const page_num_t count = largeSize / B_PAGE_SIZE;
+	const off_t offset = base - area->Base() + area->cache_offset;
+	VMCachePagesTree::Iterator it
+		= cache->pages.GetIterator(offset / B_PAGE_SIZE, true, true);
+	vm_page* existing = it.Next();
+	if (existing != NULL
+		&& existing->cache_offset
+			< (page_num_t)((offset + (off_t)largeSize) / B_PAGE_SIZE)) {
+		return B_BUSY;
+	}
+	for (page_num_t i = 0; i < count; i++) {
+		if (cache->StoreHasPage(offset + (off_t)i * B_PAGE_SIZE))
+			return B_BUSY;
+	}
+
+	map->Lock();
+	bool canMap = map->CanMapLarge(base);
+	map->Unlock();
+	if (!canMap)
+		return B_BUSY;
+
+	// the pages: a free, aligned, zeroed run
+	physical_address_restrictions restrictions = {};
+	restrictions.alignment = largeSize;
+	vm_page* pages = vm_page_allocate_page_run(PAGE_STATE_ACTIVE
+			| VM_PAGE_ALLOC_CLEAR | VM_PAGE_ALLOC_DONT_WAIT, count,
+		&restrictions, VM_PRIORITY_USER);
+	if (pages == NULL)
+		return B_NO_MEMORY;
+
+	// the mapping objects
+	VMAreaMappings mappings;
+	const bool isKernelSpace = area->address_space == VMAddressSpace::Kernel();
+	const uint32 mappingFlags = CACHE_DONT_WAIT_FOR_MEMORY
+		| (isKernelSpace ? CACHE_DONT_LOCK_KERNEL_SPACE : 0);
+	page_num_t mapped = 0;
+	for (; mapped < count; mapped++) {
+		vm_page_mapping* mapping = allocate_page_mapping(
+			pages[mapped].physical_page_number, mappingFlags);
+		if (mapping == NULL)
+			break;
+		// The objects come from per page number caches: keep each with its
+		// page (the queue is LIFO).
+		mapping->page = &pages[mapped];
+		mappings.Add(mapping);
+	}
+
+	map->Lock();
+	status_t status = mapped < count ? B_NO_MEMORY : map->MapLarge(base,
+		(phys_addr_t)pages[0].physical_page_number * B_PAGE_SIZE,
+		get_area_page_protection(area, base), area->MemoryType(),
+		&context.reservation);
+	if (status != B_OK) {
+		map->Unlock();
+		while (vm_page_mapping* mapping = mappings.RemoveHead()) {
+			vm_free_page_mapping(mapping->page->physical_page_number, mapping,
+				mappingFlags);
+		}
+		for (page_num_t i = 0; i < count; i++)
+			vm_page_free_etc(NULL, &pages[i], NULL);
+		return status;
+	}
+
+	while (vm_page_mapping* mapping = mappings.RemoveHead()) {
+		vm_page* page = mapping->page;
+		cache->InsertPage(page,
+			offset + (off_t)(page - pages) * B_PAGE_SIZE);
+
+		mapping->area = area;
+		page->mappings.Add(mapping);
+		area->mappings.Add(mapping);
+		DEBUG_PAGE_ACCESS_END(page);
+	}
+	vm_page_add_mapped_pages(count);
+	map->Unlock();
+
+	cache->IncrementFaultCount();
+	return B_OK;
+}
 
 
 /*!	Gets the page that should be mapped into the area.
@@ -3955,50 +4510,13 @@ fault_get_page(PageFaultContext& context)
 
 		// see if the backing store has it
 		if (cache->StoreHasPage(context.cacheOffset)) {
-			// insert a fresh page and mark it busy -- we're going to read it in
-			page = vm_page_allocate_page(&context.reservation,
-				PAGE_STATE_ACTIVE | VM_PAGE_ALLOC_BUSY);
-			cache->InsertPage(page, context.cacheOffset);
-			DEBUG_PAGE_ACCESS_END(page);
-
-			// We need to unlock all caches and the address space while reading
-			// the page in. Keep a reference to the cache around.
-			cache->AcquireRefLocked();
-			context.UnlockAll();
-
-			// read the page in
-			generic_io_vec vec;
-			vec.base = (phys_addr_t)page->physical_page_number * B_PAGE_SIZE;
-			generic_size_t bytesRead = vec.length = B_PAGE_SIZE;
-
-			status_t status = cache->Read(context.cacheOffset, &vec, 1,
-				B_PHYSICAL_IO_REQUEST, &bytesRead);
-
-			cache->Lock();
-			DEBUG_PAGE_ACCESS_START(page);
-
-			if (status < B_OK) {
-				// on error remove and free the page
-				dprintf("reading page from cache %p returned: %s!\n",
-					cache, strerror(status));
-
-				cache->NotifyPageEvents(page, PAGE_EVENT_NOT_BUSY);
-				cache->RemovePage(page);
-				vm_page_free_etc(cache, page, &context.reservation);
-
-				cache->ReleaseRefAndUnlock();
+			status_t status = fault_read_pages(context, cache);
+			if (status != B_OK)
 				return status;
-			}
-
-			// mark the page unbusy again
-			cache->MarkPageUnbusy(page);
-
-			DEBUG_PAGE_ACCESS_END(page);
 
 			// Since we needed to unlock everything temporarily, the area
 			// situation might have changed. So we need to restart the whole
 			// process.
-			cache->ReleaseRefAndUnlock();
 			context.restart = true;
 			return B_OK;
 		}
@@ -4023,6 +4541,8 @@ fault_get_page(PageFaultContext& context)
 		// insert the new page into our cache
 		cache->InsertPage(page, context.cacheOffset);
 		context.pageAllocated = true;
+
+		fault_allocate_anonymous_pages(context);
 	} else if (page->Cache() != context.topCache && context.isWrite) {
 		// We have a page that has the data we want, but in the wrong cache
 		// object so we need to copy it and stick it into the top cache.
@@ -4164,6 +4684,7 @@ vm_soft_fault(VMAddressSpace* addressSpace, addr_t originalAddress,
 		// page fault now.
 		// At first, the top most cache from the area is investigated.
 
+		context.area = area;
 		context.Prepare(vm_area_get_locked_cache(area),
 			address - area->Base() + area->cache_offset);
 
@@ -4176,6 +4697,12 @@ vm_soft_fault(VMAddressSpace* addressSpace, addr_t originalAddress,
 			status = context.topCache->Fault(addressSpace, context.cacheOffset);
 			if (status != B_BAD_HANDLER)
 				break;
+		}
+
+		if ((area->protection & B_LARGE_PAGES_AREA) != 0 && wirePage == NULL
+			&& fault_map_large_page(context, area, address) == B_OK) {
+			status = B_OK;
+			break;
 		}
 
 		// The top most cache has no fault handler, so let's see if the cache or
@@ -4257,7 +4784,7 @@ vm_soft_fault(VMAddressSpace* addressSpace, addr_t originalAddress,
 				mapping->page = context.page;
 				mapping->area = area;
 				if (!context.page->IsMapped())
-					atomic_add(&gMappedPagesCount, 1);
+					vm_page_add_mapped_pages(1);
 				context.page->mappings.Add(mapping);
 				area->mappings.Add(mapping);
 				mapping = NULL;
@@ -4357,6 +4884,13 @@ vm_soft_fault(VMAddressSpace* addressSpace, addr_t originalAddress,
 			}
 		} else if (context.page->State() == PAGE_STATE_INACTIVE)
 			vm_page_set_state(context.page, PAGE_STATE_ACTIVE);
+
+		if (status == B_OK) {
+			if (context.extraCount > 0)
+				fault_map_anonymous_pages(context, area);
+			else if (!isWrite && wirePage == NULL)
+				fault_around(context, area, address);
+		}
 
 		// also wire the page, if requested
 		if (wirePage != NULL && status == B_OK) {

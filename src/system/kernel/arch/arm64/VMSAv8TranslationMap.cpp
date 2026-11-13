@@ -125,8 +125,10 @@ VMSAv8TranslationMap::VMSAv8TranslationMap(
 	fVaBits(vaBits),
 	fMinBlockLevel(minBlockLevel),
 	fASID(kernel ? 0 : -1),
-	fRefcount(0)
+	fRefcount(0),
+	fLargePageCount(0)
 {
+	fSplitReservation.count = 0;
 	TRACE("+VMSAv8TranslationMap(%p, %d, 0x%" B_PRIxADDR ", %d, %d, %d)\n", this,
 		kernel, pageTable, pageBits, vaBits, minBlockLevel);
 
@@ -142,6 +144,8 @@ VMSAv8TranslationMap::~VMSAv8TranslationMap()
 
 	ASSERT(!fIsKernel);
 	ASSERT(fRefcount == 0);
+
+	vm_page_unreserve_pages(&fSplitReservation);
 
 	{
 		ThreadCPUPinner pinner(thread_get_current_thread());
@@ -394,8 +398,10 @@ VMSAv8TranslationMap::GetOrMakeTable(phys_addr_t ptPa, int level, int index,
 bool
 flush_va_if_accessed(uint64_t pte, addr_t va, int asid)
 {
-	if (!is_pte_accessed(pte))
+	if (!is_pte_accessed(pte)
+		&& ((pte & kPteValidMask) == 0 || (pte & kAttrSWMAYBECACHED) == 0)) {
 		return false;
+	}
 
 	if ((pte & kAttrNG) == 0) {
 		// Flush from all address spaces
@@ -595,6 +601,8 @@ VMSAv8TranslationMap::Map(addr_t va, phys_addr_t pa, uint32 attributes, uint32 m
 	TRACE("VMSAv8TranslationMap::Map(0x%" B_PRIxADDR ", 0x%" B_PRIxADDR
 		", 0x%x, 0x%x)\n", va, pa, attributes, memoryType);
 
+	SplitLargePages(va, va);
+
 	ThreadCPUPinner pinner(thread_get_current_thread());
 
 	ASSERT(ValidateVa(va));
@@ -643,6 +651,7 @@ VMSAv8TranslationMap::Unmap(addr_t start, addr_t end)
 {
 	TRACE("VMSAv8TranslationMap::Unmap(0x%" B_PRIxADDR ", 0x%" B_PRIxADDR
 		")\n", start, end);
+	SplitLargePages(start, end);
 	ThreadCPUPinner pinner(thread_get_current_thread());
 
 	size_t size = end - start + 1;
@@ -674,6 +683,7 @@ VMSAv8TranslationMap::UnmapPage(VMArea* area, addr_t address,
 		updatePageQueue);
 
 	ASSERT(ValidateVa(address));
+	SplitLargePages(address, address);
 	ThreadCPUPinner pinner(thread_get_current_thread());
 	RecursiveLocker locker(fLock);
 
@@ -717,6 +727,7 @@ VMSAv8TranslationMap::UnmapPages(VMArea* area, addr_t address, size_t size,
 
 	ASSERT(ValidateVa(address));
 	VMAreaMappings queue;
+	SplitLargePages(address, address + size - 1);
 	ThreadCPUPinner pinner(thread_get_current_thread());
 	RecursiveLocker locker(fLock);
 
@@ -778,8 +789,7 @@ VMSAv8TranslationMap::Query(addr_t va, phys_addr_t* pa, uint32* flags)
 	ThreadCPUPinner pinner(thread_get_current_thread());
 	ASSERT(ValidateVa(va));
 
-	ProcessRange(fPageTable, fInitialLevel, va, B_PAGE_SIZE, nullptr,
-		[=](uint64_t* ptePtr, uint64_t effectiveVa) {
+	auto query = [=](uint64_t* ptePtr, uint64_t effectiveVa) {
 			uint64_t pte = atomic_get64((int64_t*)ptePtr);
 
 			// Don't set flags for invalid entries
@@ -807,7 +817,20 @@ VMSAv8TranslationMap::Query(addr_t va, phys_addr_t* pa, uint32* flags)
 				if ((pte & kAttrAPUserAccess) != 0)
 					*flags |= B_WRITE_AREA;
 			}
-		});
+		};
+
+	if (atomic_get(&fLargePageCount) > 0) {
+		if (uint64_t* block = BlockEntry(va)) {
+			query(block, va);
+			if (*flags != 0) {
+				*pa = (*pa & ~(phys_addr_t)(LargePageSize() - 1))
+					+ (va & (LargePageSize() - 1));
+				return B_OK;
+			}
+		}
+	}
+
+	ProcessRange(fPageTable, fInitialLevel, va, B_PAGE_SIZE, nullptr, query);
 
 	return B_OK;
 }
@@ -824,6 +847,7 @@ VMSAv8TranslationMap::QueryInterrupt(
 status_t
 VMSAv8TranslationMap::Protect(addr_t start, addr_t end, uint32 attributes, uint32 memoryType)
 {
+	SplitLargePages(start, end);
 	TRACE("VMSAv8TranslationMap::Protect(0x%" B_PRIxADDR ", 0x%"
 		B_PRIxADDR ", 0x%x, 0x%x)\n", start, end, attributes, memoryType);
 
@@ -887,6 +911,7 @@ VMSAv8TranslationMap::Protect(addr_t start, addr_t end, uint32 attributes, uint3
 status_t
 VMSAv8TranslationMap::ClearFlags(addr_t va, uint32 flags)
 {
+	SplitLargePages(va, va);
 	ASSERT(ValidateVa(va));
 
 	bool clearAF = flags & PAGE_ACCESSED;
@@ -913,6 +938,8 @@ VMSAv8TranslationMap::ClearFlags(addr_t va, uint32 flags)
 					}
 				}
 			} else if (clearAF) {
+				// no invalidation: mark the entry as possibly cached first
+				atomic_or64((int64_t*)ptePtr, kAttrSWMAYBECACHED);
 				atomic_and64((int64_t*)ptePtr, ~kAttrAF);
 			} else {
 				while (true) {
@@ -942,6 +969,7 @@ VMSAv8TranslationMap::ClearAccessedAndModified(
 	ASSERT(ValidateVa(address));
 
 	RecursiveLocker locker(fLock);
+	SplitLargePages(address, address);
 	ThreadCPUPinner pinner(thread_get_current_thread());
 
 	uint64_t oldPte = 0;
@@ -954,7 +982,7 @@ VMSAv8TranslationMap::ClearAccessedAndModified(
 				oldPte = atomic_get64((int64_t*)ptePtr);
 				if ((oldPte & kPteValidMask) == 0)
 					return;
-				uint64_t newPte = oldPte & ~kAttrAF;
+				uint64_t newPte = oldPte & ~(kAttrAF | kAttrSWMAYBECACHED);
 				newPte = set_pte_clean(newPte);
 
 				// If the page has been not be accessed, then unmap it.
@@ -977,10 +1005,11 @@ VMSAv8TranslationMap::ClearAccessedAndModified(
 	// Accessed state comes from the PTE. A global flush or a user map whose
 	// ASID was recycled need not return true from FlushVAIfAccessed(), but
 	// their accessed PTE was retained and still needs its mapping record.
-	if (is_pte_accessed(oldPte)) {
-		FlushVAIfAccessed(oldPte, address);
+	// An entry whose AF was cleared before without an invalidation is
+	// flushed as well.
+	FlushVAIfAccessed(oldPte, address);
+	if (is_pte_accessed(oldPte))
 		return true;
-	}
 
 	if (!unmapIfUnaccessed)
 		return false;
@@ -991,6 +1020,242 @@ VMSAv8TranslationMap::ClearAccessedAndModified(
 	return false;
 }
 
+
+
+bool
+VMSAv8TranslationMap::TestAndClearAccessed(VMArea* area, addr_t address,
+	bool& _modified)
+{
+	ASSERT(ValidateVa(address));
+
+	// A stale TLB entry only delays AF being set again, so no invalidation
+	// (and no sAsidLock); the entry is marked as possibly cached, so that
+	// the next change invalidates it. The dirty state stays.
+	ThreadCPUPinner pinner(thread_get_current_thread());
+
+	if (atomic_get(&fLargePageCount) > 0) {
+		// One AF for all pages of a block: its first page clears it, the
+		// others only report it. (An existing mapping can't become a block,
+		// only be split.)
+		if (uint64_t* block = BlockEntry(address)) {
+			uint64_t oldPte = atomic_get64((int64_t*)block);
+			while (address % LargePageSize() == 0
+				&& (oldPte & kPteTypeMask) == kPteTypeL12Block
+				&& (oldPte & kAttrAF) != 0) {
+				uint64_t newPte = (oldPte & ~kAttrAF) | kAttrSWMAYBECACHED;
+				uint64_t previous = (uint64_t)atomic_test_and_set64(
+					(int64_t*)block, newPte, oldPte);
+				if (previous == oldPte)
+					break;
+				oldPte = previous;
+			}
+			if ((oldPte & kPteTypeMask) == kPteTypeL12Block) {
+				_modified = is_pte_dirty(oldPte);
+				return is_pte_accessed(oldPte);
+			}
+		}
+	}
+
+	uint64_t oldPte = 0;
+	ProcessRange(fPageTable, fInitialLevel, address, B_PAGE_SIZE, nullptr,
+		[&oldPte](uint64_t* ptePtr, uint64_t effectiveVa) {
+			while (true) {
+				oldPte = atomic_get64((int64_t*)ptePtr);
+				if ((oldPte & kPteValidMask) == 0 || (oldPte & kAttrAF) == 0)
+					return;
+				uint64_t newPte = (oldPte & ~kAttrAF) | kAttrSWMAYBECACHED;
+				if ((uint64_t)atomic_test_and_set64((int64_t*)ptePtr, newPte,
+						oldPte) == oldPte) {
+					return;
+				}
+			}
+		});
+
+	if ((oldPte & kPteValidMask) == 0) {
+		_modified = false;
+		return false;
+	}
+	_modified = is_pte_dirty(oldPte);
+	return is_pte_accessed(oldPte);
+}
+
+
+size_t
+VMSAv8TranslationMap::LargePageSize() const
+{
+	// level 2 blocks with the 4 KiB granule
+	if (fIsKernel || fPageBits != 12 || fInitialLevel > 2)
+		return 0;
+	return 1UL << (fPageBits + (fPageBits - 3));
+}
+
+
+/*!	The level 2 entry for \a va, creating the tables above it from
+	\a reservation if that is not \c NULL.
+*/
+uint64_t*
+VMSAv8TranslationMap::LargePageEntry(addr_t va, vm_page_reservation* reservation)
+{
+	if (fPageTable == 0)
+		return NULL;
+
+	const int tableBits = fPageBits - 3;
+	const uint64_t tableMask = (1UL << tableBits) - 1;
+	const uint64_t vaMask = (1UL << fVaBits) - 1;
+
+	phys_addr_t table = fPageTable;
+	for (int level = fInitialLevel; level < 2; level++) {
+		int shift = tableBits * (3 - level) + fPageBits;
+		int index = ((va & vaMask) >> shift) & tableMask;
+		uint64_t entry = atomic_get64((int64_t*)(TableFromPa(table) + index));
+		if ((entry & kPteTypeMask) == kPteTypeL12Block)
+			return NULL;
+		table = GetOrMakeTable(table, level, index, reservation);
+		if (table == 0)
+			return NULL;
+	}
+
+	int shift = tableBits + fPageBits;
+	int index = ((va & vaMask) >> shift) & tableMask;
+	return TableFromPa(table) + index;
+}
+
+
+uint64_t*
+VMSAv8TranslationMap::BlockEntry(addr_t va)
+{
+	uint64_t* entry = LargePageEntry(va, NULL);
+	if (entry == NULL
+		|| (atomic_get64((int64_t*)entry) & kPteTypeMask) != kPteTypeL12Block) {
+		return NULL;
+	}
+	return entry;
+}
+
+
+bool
+VMSAv8TranslationMap::CanMapLarge(addr_t va)
+{
+	ASSERT_LOCKED_RECURSIVE(&fLock);
+
+	size_t largeSize = LargePageSize();
+	if (largeSize == 0 || va % largeSize != 0)
+		return false;
+
+	ThreadCPUPinner pinner(thread_get_current_thread());
+	uint64_t* entry = LargePageEntry(va, NULL);
+	return entry == NULL || atomic_get64((int64_t*)entry) == 0;
+}
+
+
+status_t
+VMSAv8TranslationMap::MapLarge(addr_t va, phys_addr_t pa, uint32 attributes,
+	uint32 memoryType, vm_page_reservation* reservation)
+{
+	ASSERT_LOCKED_RECURSIVE(&fLock);
+
+	size_t largeSize = LargePageSize();
+	if (largeSize == 0 || va % largeSize != 0 || pa % largeSize != 0)
+		return B_BAD_VALUE;
+	ASSERT(ValidateVa(va));
+
+	ThreadCPUPinner pinner(thread_get_current_thread());
+
+	if (fPageTable == 0) {
+		vm_page* page = vm_page_allocate_page(reservation,
+			PAGE_STATE_WIRED | VM_PAGE_ALLOC_CLEAR);
+		DEBUG_PAGE_ACCESS_END(page);
+		fPageTable = page->physical_page_number << fPageBits;
+	}
+
+	uint64_t* entry = LargePageEntry(va, reservation);
+	if (entry == NULL)
+		return B_NO_MEMORY;
+	if (atomic_get64((int64_t*)entry) != 0)
+		return B_BUSY;
+	if (reservation->count == 0)
+		return B_NO_MEMORY;
+
+	// keep a page to split it later
+	reservation->count--;
+	fSplitReservation.count++;
+
+	// It is about to be accessed: start with AF set, so that there is no
+	// access flag fault on CPUs that leave it to software.
+	uint64_t attr = GetMemoryAttr(attributes, memoryType, false) | kAttrAF;
+	atomic_set64((int64_t*)entry, pa | attr | kPteTypeL12Block);
+	arm64_dsb(ishst);
+	arm64_isb();
+	if ((attributes & (B_EXECUTE_AREA | B_KERNEL_EXECUTE_AREA)) != 0)
+		arch_cpu_sync_icache((void*)(KERNEL_PMAP_BASE + pa), largeSize);
+
+	atomic_add(&fLargePageCount, 1);
+	return B_OK;
+}
+
+
+/*!	Splits the blocks in the range into level 3 tables, so that the callers
+	can work on page entries.
+*/
+void
+VMSAv8TranslationMap::SplitLargePages(addr_t start, addr_t end)
+{
+	if (atomic_get(&fLargePageCount) == 0)
+		return;
+
+	const size_t largeSize = LargePageSize();
+	RecursiveLocker locker(fLock);
+	ThreadCPUPinner pinner(thread_get_current_thread());
+
+	for (addr_t va = ROUNDDOWN(start, largeSize); va <= end; va += largeSize) {
+		if (uint64_t* entry = BlockEntry(va))
+			SplitLargePage(va, entry);
+		if (va + largeSize < va)
+			break;
+	}
+}
+
+
+void
+VMSAv8TranslationMap::SplitLargePage(addr_t va, uint64_t* entry)
+{
+	// break before make: invalid, invalidated, then the table
+	uint64_t oldPte = atomic_get64((int64_t*)entry);
+	while (true) {
+		uint64_t previous = (uint64_t)atomic_test_and_set64((int64_t*)entry,
+			0, oldPte);
+		if (previous == oldPte)
+			break;
+		oldPte = previous;
+	}
+	arm64_dsb(ishst);
+	{
+		// whatever AF says: the block may be in a TLB
+		InterruptsSpinLocker locker(sAsidLock);
+		flush_va_if_accessed(oldPte | kAttrAF, va, fASID);
+	}
+
+	vm_page* page = vm_page_allocate_page(&fSplitReservation,
+		PAGE_STATE_WIRED | VM_PAGE_ALLOC_CLEAR);
+	DEBUG_PAGE_ACCESS_END(page);
+	phys_addr_t tablePa = page->physical_page_number << fPageBits;
+	uint64_t* table = TableFromPa(tablePa);
+
+	const size_t largeSize = LargePageSize();
+	phys_addr_t base = oldPte & kPteAddrMask & ~(phys_addr_t)(largeSize - 1);
+	uint64_t attr = oldPte & ~(kPteAddrMask | kPteTypeMask);
+	for (uint32 i = 0; i < (1U << (fPageBits - 3)); i++) {
+		table[i] = (base + ((phys_addr_t)i << fPageBits)) | attr
+			| kPteTypeL3Page;
+	}
+
+	arm64_dsb(ishst);
+	atomic_set64((int64_t*)entry, tablePa | kPteTypeL012Table);
+	arm64_dsb(ishst);
+	arm64_isb();
+
+	atomic_add(&fLargePageCount, -1);
+}
 
 void
 VMSAv8TranslationMap::Flush()

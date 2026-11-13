@@ -39,14 +39,18 @@
 X86VMTranslationMap64Bit::X86VMTranslationMap64Bit(bool la57)
 	:
 	fPagingStructures(NULL),
-	fLA57(la57)
+	fLA57(la57),
+	fLargePageCount(0)
 {
+	fSplitReservation.count = 0;
 }
 
 
 X86VMTranslationMap64Bit::~X86VMTranslationMap64Bit()
 {
 	TRACE("X86VMTranslationMap64Bit::~X86VMTranslationMap64Bit()\n");
+
+	vm_page_unreserve_pages(&fSplitReservation);
 
 	if (fPagingStructures == NULL)
 		return;
@@ -91,8 +95,11 @@ X86VMTranslationMap64Bit::~X86VMTranslationMap64Bit()
 				uint64* virtualPageDir = (uint64*)fPageMapper->GetPageTableAt(
 					virtualPDPT[j] & X86_64_PDPTE_ADDRESS_MASK);
 				for (uint32 k = 0; k < 512; k++) {
-					if ((virtualPageDir[k] & X86_64_PDE_PRESENT) == 0)
+					if ((virtualPageDir[k] & X86_64_PDE_PRESENT) == 0
+						|| (virtualPageDir[k] & X86_64_PDE_LARGE_PAGE) != 0) {
+						// a large page belongs to its cache
 						continue;
+					}
 
 					address = virtualPageDir[k] & X86_64_PDE_ADDRESS_MASK;
 					page = vm_lookup_page(address / B_PAGE_SIZE);
@@ -241,6 +248,8 @@ X86VMTranslationMap64Bit::Map(addr_t virtualAddress, phys_addr_t physicalAddress
 		")\n", virtualAddress, physicalAddress);
 	ASSERT_LOCKED_RECURSIVE(&fLock);
 
+	_SplitLargePages(virtualAddress, virtualAddress);
+
 	ThreadCPUPinner pinner(thread_get_current_thread());
 
 	// Look up the page table for the virtual address, allocating new tables
@@ -278,6 +287,8 @@ X86VMTranslationMap64Bit::Unmap(addr_t start, addr_t end)
 	TRACE("X86VMTranslationMap64Bit::Unmap(%#" B_PRIxADDR ", %#" B_PRIxADDR
 		")\n", start, end);
 
+	_SplitLargePages(start, end);
+
 	ThreadCPUPinner pinner(thread_get_current_thread());
 
 	do {
@@ -304,7 +315,7 @@ X86VMTranslationMap64Bit::Unmap(addr_t start, addr_t end)
 				&pageTable[index]);
 			fMapCount--;
 
-			if ((oldEntry & X86_64_PTE_ACCESSED) != 0) {
+			if ((oldEntry & X86_64_PTE_IN_TLB_MASK) != 0) {
 				// Note, that we only need to invalidate the address, if the
 				// accessed flags was set, since only then the entry could have
 				// been in any TLB.
@@ -326,6 +337,8 @@ X86VMTranslationMap64Bit::UnmapPage(VMArea* area, addr_t address,
 
 	TRACE("X86VMTranslationMap64Bit::UnmapPage(%#" B_PRIxADDR ")\n", address);
 
+	_SplitLargePages(address, address);
+
 	ThreadCPUPinner pinner(thread_get_current_thread());
 
 	// Look up the page table for the virtual address.
@@ -346,7 +359,7 @@ X86VMTranslationMap64Bit::UnmapPage(VMArea* area, addr_t address,
 
 	fMapCount--;
 
-	if ((oldEntry & X86_64_PTE_ACCESSED) != 0) {
+	if ((oldEntry & X86_64_PTE_IN_TLB_MASK) != 0) {
 		// Note, that we only need to invalidate the address, if the
 		// accessed flags was set, since only then the entry could have been
 		// in any TLB.
@@ -406,6 +419,7 @@ X86VMTranslationMap64Bit::UnmapPages(VMArea* area, addr_t base, size_t size,
 	VMAreaMappings queue;
 
 	RecursiveLocker locker(fLock);
+	_SplitLargePages(start, end);
 	ThreadCPUPinner pinner(thread_get_current_thread());
 
 	do {
@@ -428,7 +442,7 @@ X86VMTranslationMap64Bit::UnmapPages(VMArea* area, addr_t base, size_t size,
 
 			fMapCount--;
 
-			if ((oldEntry & X86_64_PTE_ACCESSED) != 0) {
+			if ((oldEntry & X86_64_PTE_IN_TLB_MASK) != 0) {
 				// Note, that we only need to invalidate the address, if the
 				// accessed flags was set, since only then the entry could have
 				// been in any TLB.
@@ -553,6 +567,8 @@ X86VMTranslationMap64Bit::Protect(addr_t start, addr_t end, uint32 attributes,
 	} else if ((attributes & B_KERNEL_WRITE_AREA) != 0)
 		newProtectionFlags = X86_64_PTE_WRITABLE;
 
+	_SplitLargePages(start, end);
+
 	ThreadCPUPinner pinner(thread_get_current_thread());
 
 	do {
@@ -592,7 +608,7 @@ X86VMTranslationMap64Bit::Protect(addr_t start, addr_t end, uint32 attributes,
 				entry = oldEntry;
 			}
 
-			if ((oldEntry & X86_64_PTE_ACCESSED) != 0) {
+			if ((oldEntry & X86_64_PTE_IN_TLB_MASK) != 0) {
 				// Note, that we only need to invalidate the address, if the
 				// accessed flag was set, since only then the entry could have
 				// been in any TLB.
@@ -611,6 +627,8 @@ X86VMTranslationMap64Bit::ClearFlags(addr_t address, uint32 flags)
 	TRACE("X86VMTranslationMap64Bit::ClearFlags(%#" B_PRIxADDR ", %#" B_PRIx32
 		")\n", address, flags);
 
+	_SplitLargePages(address, address);
+
 	ThreadCPUPinner pinner(thread_get_current_thread());
 
 	uint64* entry = X86PagingMethod64Bit::PageTableEntryForAddress(
@@ -625,8 +643,11 @@ X86VMTranslationMap64Bit::ClearFlags(addr_t address, uint32 flags)
 	uint64 oldEntry = X86PagingMethod64Bit::ClearTableEntryFlags(entry,
 		flagsToClear);
 
-	if ((oldEntry & flagsToClear) != 0)
+	if ((oldEntry & flagsToClear) != 0
+		|| ((oldEntry & X86_64_PTE_MAY_BE_CACHED) != 0
+			&& (flagsToClear & X86_64_PTE_DIRTY) != 0)) {
 		InvalidatePage(address);
+	}
 
 	return B_OK;
 }
@@ -642,6 +663,7 @@ X86VMTranslationMap64Bit::ClearAccessedAndModified(VMArea* area, addr_t address,
 		")\n", address);
 
 	RecursiveLocker locker(fLock);
+	_SplitLargePages(address, address);
 	ThreadCPUPinner pinner(thread_get_current_thread());
 
 	uint64* entry = X86PagingMethod64Bit::PageTableEntryForAddress(
@@ -663,7 +685,8 @@ X86VMTranslationMap64Bit::ClearAccessedAndModified(VMArea* area, addr_t address,
 			if (oldEntry & X86_64_PTE_ACCESSED) {
 				// page was accessed -- just clear the flags
 				oldEntry = X86PagingMethod64Bit::ClearTableEntryFlags(entry,
-					X86_64_PTE_ACCESSED | X86_64_PTE_DIRTY);
+					X86_64_PTE_ACCESSED | X86_64_PTE_DIRTY
+						| X86_64_PTE_MAY_BE_CACHED);
 				break;
 			}
 
@@ -677,22 +700,23 @@ X86VMTranslationMap64Bit::ClearAccessedAndModified(VMArea* area, addr_t address,
 		}
 	} else {
 		oldEntry = X86PagingMethod64Bit::ClearTableEntryFlags(entry,
-			X86_64_PTE_ACCESSED | X86_64_PTE_DIRTY);
+			X86_64_PTE_ACCESSED | X86_64_PTE_DIRTY | X86_64_PTE_MAY_BE_CACHED);
 	}
 
 	pinner.Unlock();
 
 	_modified = (oldEntry & X86_64_PTE_DIRTY) != 0;
 
-	if ((oldEntry & X86_64_PTE_ACCESSED) != 0) {
+	if ((oldEntry & X86_64_PTE_IN_TLB_MASK) != 0) {
 		// Note, that we only need to invalidate the address, if the
 		// accessed flags was set, since only then the entry could have been
 		// in any TLB.
 		InvalidatePage(address);
 		Flush();
-
-		return true;
 	}
+
+	if ((oldEntry & X86_64_PTE_ACCESSED) != 0)
+		return true;
 
 	if (!unmapIfUnaccessed)
 		return false;
@@ -710,6 +734,215 @@ X86VMTranslationMap64Bit::ClearAccessedAndModified(VMArea* area, addr_t address,
 	return false;
 }
 
+
+
+bool
+X86VMTranslationMap64Bit::TestAndClearAccessed(VMArea* area, addr_t address,
+	bool& _modified)
+{
+	ASSERT(address % B_PAGE_SIZE == 0);
+
+	// A stale TLB entry only delays the accessed flag being set again, so
+	// no invalidation; the next change of the entry does it, since the
+	// entry is marked as possibly cached. The dirty flag stays: clearing it
+	// without an invalidation could lose a write.
+	// No lock: the caller holds the page's cache lock, so the mapping, and
+	// with it the page table, stays; the entry is changed atomically.
+	ThreadCPUPinner pinner(thread_get_current_thread());
+	_modified = false;
+
+	if (atomic_get(&fLargePageCount) > 0) {
+		// A large page has one accessed flag for all its pages: its first
+		// page clears it, the others only report it. (A mapping that exists
+		// can't become large meanwhile, only be split.)
+		uint64* pde = X86PagingMethod64Bit::PageDirectoryEntryForAddress(
+			fPagingStructures->VirtualPMLTop(), address, fIsKernelMap, false,
+			NULL, fPageMapper, fMapCount);
+		uint64 oldEntry = pde != NULL ? *(volatile uint64*)pde : 0;
+		if ((oldEntry & (X86_64_PDE_PRESENT | X86_64_PDE_LARGE_PAGE))
+				== (X86_64_PDE_PRESENT | X86_64_PDE_LARGE_PAGE)) {
+			while (address % k64BitPageTableRange == 0
+				&& (oldEntry & X86_64_PDE_ACCESSED) != 0) {
+				uint64 newEntry = (oldEntry & ~X86_64_PDE_ACCESSED)
+					| X86_64_PTE_MAY_BE_CACHED;
+				uint64 previous = X86PagingMethod64Bit::TestAndSetTableEntry(
+					pde, newEntry, oldEntry);
+				if (previous == oldEntry)
+					break;
+				oldEntry = previous;
+				if ((oldEntry & X86_64_PDE_LARGE_PAGE) == 0)
+					break;
+			}
+			if ((oldEntry & X86_64_PDE_LARGE_PAGE) != 0) {
+				_modified = (oldEntry & X86_64_PDE_DIRTY) != 0;
+				return (oldEntry & X86_64_PDE_ACCESSED) != 0;
+			}
+		}
+	}
+
+	uint64* entry = X86PagingMethod64Bit::PageTableEntryForAddress(
+		fPagingStructures->VirtualPMLTop(), address, fIsKernelMap,
+		false, NULL, fPageMapper, fMapCount);
+	if (entry == NULL)
+		return false;
+
+	uint64 oldEntry;
+	while (true) {
+		oldEntry = *(volatile uint64*)entry;
+		if ((oldEntry & X86_64_PTE_PRESENT) == 0)
+			return false;
+		if ((oldEntry & X86_64_PTE_ACCESSED) == 0)
+			break;
+
+		uint64 newEntry = (oldEntry & ~X86_64_PTE_ACCESSED)
+			| X86_64_PTE_MAY_BE_CACHED;
+		if (X86PagingMethod64Bit::TestAndSetTableEntry(entry, newEntry,
+				oldEntry) == oldEntry) {
+			break;
+		}
+	}
+
+	_modified = (oldEntry & X86_64_PTE_DIRTY) != 0;
+	return (oldEntry & X86_64_PTE_ACCESSED) != 0;
+}
+
+
+size_t
+X86VMTranslationMap64Bit::LargePageSize() const
+{
+	return fIsKernelMap ? 0 : k64BitPageTableRange;
+}
+
+
+bool
+X86VMTranslationMap64Bit::CanMapLarge(addr_t virtualAddress)
+{
+	ASSERT_LOCKED_RECURSIVE(&fLock);
+
+	if (fIsKernelMap || virtualAddress % k64BitPageTableRange != 0)
+		return false;
+
+	ThreadCPUPinner pinner(thread_get_current_thread());
+	uint64* pde = X86PagingMethod64Bit::PageDirectoryEntryForAddress(
+		fPagingStructures->VirtualPMLTop(), virtualAddress, fIsKernelMap,
+		false, NULL, fPageMapper, fMapCount);
+	return pde == NULL || (*pde & X86_64_PDE_PRESENT) == 0;
+}
+
+
+status_t
+X86VMTranslationMap64Bit::MapLarge(addr_t virtualAddress,
+	phys_addr_t physicalAddress, uint32 attributes, uint32 memoryType,
+	vm_page_reservation* reservation)
+{
+	ASSERT_LOCKED_RECURSIVE(&fLock);
+
+	if (fIsKernelMap || virtualAddress % k64BitPageTableRange != 0
+		|| physicalAddress % k64BitPageTableRange != 0) {
+		return B_BAD_VALUE;
+	}
+
+	// the flags of a page table entry, which are those of a large page
+	// directory entry, except for bit 7 (PAT there, large page here)
+	uint64 entry;
+	X86PagingMethod64Bit::PutPageTableEntryInTable(&entry, physicalAddress,
+		attributes, memoryType, false);
+	if ((entry & X86_64_PTE_PAT) != 0)
+		return B_NOT_SUPPORTED;
+
+	ThreadCPUPinner pinner(thread_get_current_thread());
+
+	// the page directory, allocating it (and above) if needed
+	uint64* pde = X86PagingMethod64Bit::PageDirectoryEntryForAddress(
+		fPagingStructures->VirtualPMLTop(), virtualAddress, fIsKernelMap,
+		true, reservation, fPageMapper, fMapCount);
+	if ((*pde & X86_64_PDE_PRESENT) != 0)
+		return B_BUSY;
+	if (reservation->count == 0)
+		return B_NO_MEMORY;
+
+	// keep a page to split it later
+	reservation->count--;
+	fSplitReservation.count++;
+
+	X86PagingMethod64Bit::SetTableEntry(pde, entry | X86_64_PDE_LARGE_PAGE);
+	fMapCount += k64BitTableEntryCount;
+	atomic_add(&fLargePageCount, 1);
+
+	// no invalidation: the entry wasn't present
+	return B_OK;
+}
+
+
+/*!	Splits the large pages in the range into page tables, so that the
+	callers can work on page table entries.
+*/
+void
+X86VMTranslationMap64Bit::_SplitLargePages(addr_t start, addr_t end)
+{
+	if (atomic_get(&fLargePageCount) == 0)
+		return;
+
+	RecursiveLocker locker(fLock);
+	ThreadCPUPinner pinner(thread_get_current_thread());
+
+	for (addr_t address = ROUNDDOWN(start, k64BitPageTableRange);
+			address <= end; address += k64BitPageTableRange) {
+		uint64* pde = X86PagingMethod64Bit::PageDirectoryEntryForAddress(
+			fPagingStructures->VirtualPMLTop(), address, fIsKernelMap, false,
+			NULL, fPageMapper, fMapCount);
+		if (pde != NULL && (*pde & (X86_64_PDE_PRESENT | X86_64_PDE_LARGE_PAGE))
+				== (X86_64_PDE_PRESENT | X86_64_PDE_LARGE_PAGE)) {
+			_SplitLargePage(address, pde);
+		}
+
+		if (address + k64BitPageTableRange < address)
+			break;
+	}
+}
+
+
+void
+X86VMTranslationMap64Bit::_SplitLargePage(addr_t address, uint64* pde)
+{
+	// Make the entry non-present and invalidate it first, so that no CPU
+	// sets the accessed or dirty flag in it while it is copied. Accesses
+	// meanwhile fault and wait for our lock.
+	uint64 oldEntry = *(volatile uint64*)pde;
+	while (true) {
+		uint64 previous = X86PagingMethod64Bit::TestAndSetTableEntry(pde,
+			oldEntry & ~X86_64_PDE_PRESENT, oldEntry);
+		if (previous == oldEntry)
+			break;
+		oldEntry = previous;
+	}
+	InvalidatePage(address);
+	Flush();
+	oldEntry = *(volatile uint64*)pde;
+
+	vm_page* page = vm_page_allocate_page(&fSplitReservation,
+		PAGE_STATE_WIRED | VM_PAGE_ALLOC_CLEAR);
+	DEBUG_PAGE_ACCESS_END(page);
+	phys_addr_t physicalTable
+		= (phys_addr_t)page->physical_page_number * B_PAGE_SIZE;
+
+	uint64* table = (uint64*)fPageMapper->GetPageTableAt(physicalTable);
+	phys_addr_t base = oldEntry & X86_64_PDE_ADDRESS_MASK
+		& ~(phys_addr_t)(k64BitPageTableRange - 1);
+	uint64 flags = X86_64_PTE_PRESENT | (oldEntry
+		& (X86_64_PTE_WRITABLE | X86_64_PTE_USER | X86_64_PTE_WRITE_THROUGH
+			| X86_64_PTE_CACHING_DISABLED | X86_64_PTE_ACCESSED
+			| X86_64_PTE_DIRTY | X86_64_PTE_GLOBAL | X86_64_PTE_MAY_BE_CACHED
+			| X86_64_PTE_NOT_EXECUTABLE));
+	for (uint32 i = 0; i < k64BitTableEntryCount; i++)
+		table[i] = (base + (phys_addr_t)i * B_PAGE_SIZE) | flags;
+
+	X86PagingMethod64Bit::SetTableEntry(pde,
+		(physicalTable & X86_64_PDE_ADDRESS_MASK) | X86_64_PDE_PRESENT
+			| X86_64_PDE_WRITABLE | X86_64_PDE_USER);
+	fMapCount++;
+	atomic_add(&fLargePageCount, -1);
+}
 
 bool
 X86VMTranslationMap64Bit::DebugGetReverseMappingInfo(phys_addr_t physicalAddress,

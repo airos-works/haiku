@@ -819,6 +819,9 @@ mutex_trylock(mutex* lock)
 		lock->holder = find_thread(NULL);
 		return B_OK;
 	}
+#else
+	if (atomic_test_and_set(&lock->count, -1, 0) == 0)
+		return B_OK;
 #endif
 	return B_WOULD_BLOCK;
 }
@@ -831,7 +834,9 @@ mutex_lock(mutex* lock)
 #if KDEBUG
 	return _mutex_lock(lock, NULL);
 #else
-	return mutex_lock_inline(lock);
+	if (atomic_add(&lock->count, -1) < 0)
+		return _mutex_lock(lock, NULL);
+	return B_OK;
 #endif
 }
 
@@ -843,6 +848,7 @@ mutex_unlock(mutex* lock)
 #if KDEBUG
 	_mutex_unlock(lock);
 #else
-	mutex_unlock_inline(lock);
+	if (atomic_add(&lock->count, 1) < -1)
+		_mutex_unlock(lock);
 #endif
 }

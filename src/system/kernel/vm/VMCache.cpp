@@ -642,6 +642,8 @@ VMCache::Init(const char* name, uint32 cacheType, uint32 allocationFlags)
 	page_count = 0;
 	fWiredPagesCount = 0;
 	fFaultCount = 0;
+	read_around_pages = 0;
+	read_around_next = -1;
 	fCopiedPagesCount = 0;
 	type = cacheType;
 	fPageEventWaiters = NULL;

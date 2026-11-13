@@ -213,6 +213,10 @@ public:
 			uint32				page_count;
 			uint32				temporary : 1;
 			uint32				type : 6;
+			uint32				read_around_pages : 9;
+				// size of the last read-around of a page fault (#98)
+			off_t				read_around_next;
+				// a fault here continues that read-around sequentially
 
 #if DEBUG_CACHE_LIST
 			VMCache*			debug_previous;

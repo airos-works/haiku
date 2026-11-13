@@ -15,7 +15,14 @@
 
 struct kernel_args;
 
-extern int32 gMappedPagesCount;
+// Number of pages mapped anywhere, a statistic only: counted per CPU, so
+// that mapping and unmapping does not write one global cache line (#97).
+void vm_page_add_mapped_pages(int32 count);
+int32 vm_page_mapped_pages_count();
+
+// Whether cached pages are freed for new ones so fast that speculative
+// reads would only evict pages before they are used (#98).
+bool vm_page_cache_thrashing();
 
 
 struct vm_page_reservation {
@@ -65,6 +72,10 @@ void vm_page_schedule_write_page_range(struct VMCache *cache,
 void vm_page_unreserve_pages(vm_page_reservation* reservation);
 void vm_page_reserve_pages(vm_page_reservation* reservation, uint32 count,
 	int priority);
+bool vm_page_try_reserve_free_pages(vm_page_reservation* reservation,
+	uint32 count, int priority);
+	// for speculative allocations: only free pages beyond the page daemon's
+	// target, never cached pages freed for it
 bool vm_page_try_reserve_pages(vm_page_reservation* reservation, uint32 count,
 	int priority);
 
