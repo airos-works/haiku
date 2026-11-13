@@ -30,6 +30,7 @@
 
 #include "aarch64.h"
 #include "arch_mmu.h"
+#include "dtb.h"
 
 
 //#define TRACE_MMU
@@ -56,6 +57,12 @@ struct memory_region {
 // main peripherals. Everything else that is not RAM belongs to the VideoCore
 // (the frame buffer is in there).
 static const phys_addr_t kPeripheralBase = 0xfc000000;
+
+// The BCM2712's (Pi 5) peripherals are all above 64 GB: the SoC's own at
+// 0x10_0000_0000, the PCIe windows, and with them the RP1 (UARTs, USB,
+// Ethernet) at 0x1f_0000_0000. Below 4 GB is only RAM there.
+static const phys_addr_t kBCM2712PeripheralBase = 0x1000000000ull;
+static const phys_addr_t kBCM2712PeripheralEnd = 0x2000000000ull;
 
 static const size_t kMaxKernelSize = 0x2000000;		// 32 MB
 static addr_t sNextVirtualAddress = KERNEL_LOAD_BASE + kMaxKernelSize;
@@ -398,7 +405,13 @@ identity_flags(phys_addr_t address, size_t size, bool memoryKnown)
 	MemoryAttributeIndirection mair;
 	const uint64 kBlock = 0x1;
 
-	if (address >= kPeripheralBase && address < 0x100000000ull) {
+	// Before the device tree has been read the SoC is not known: the
+	// BCM2711's window is device memory then. The loader allocates from the
+	// bottom of RAM, so a Pi 5 has no business up there before that.
+	if ((address >= kPeripheralBase && address < 0x100000000ull
+			&& (!memoryKnown || !gBCM2712))
+		|| (address >= kBCM2712PeripheralBase
+			&& address < kBCM2712PeripheralEnd)) {
 		return ARMv8TranslationTableDescriptor::DefaultPeripheralAttribute
 			| mair.MaskOf(MAIR_DEVICE_nGnRnE) | kBlock;
 	}
@@ -413,9 +426,10 @@ identity_flags(phys_addr_t address, size_t size, bool memoryKnown)
 
 
 /*!	The identity map: the low 4 GB in 2 MB blocks, the RAM above that (the
-	8 GB boards have some) in 1 GB blocks. Before the device tree has been
-	read, everything that is not a peripheral is taken to be RAM; afterwards
-	what is not RAM gets mapped uncached.
+	8 and 16 GB boards have some) and the Pi 5's peripherals in 1 GB blocks.
+	Before the device tree has been read, everything that is not a
+	peripheral is taken to be RAM; afterwards what is not RAM gets mapped
+	uncached.
 */
 static void
 build_identity_map(bool memoryKnown)
@@ -427,8 +441,17 @@ build_identity_map(bool memoryKnown)
 	uint64* level1 = sIdentityTables[1];
 	sIdentityTables[0][0] = (uint64)level1 | kTable;
 
-	for (uint64 gigabyte = 0; gigabyte < 16; gigabyte++) {
+	for (uint64 gigabyte = 0; gigabyte < kBCM2712PeripheralEnd / kGigabyte;
+			gigabyte++) {
 		uint64 base = gigabyte * kGigabyte;
+		if (base >= kBCM2712PeripheralBase) {
+			level1[gigabyte] = base | identity_flags(base, kGigabyte, false);
+			continue;
+		}
+		if (gigabyte >= 16) {
+			level1[gigabyte] = 0;
+			continue;
+		}
 		if (gigabyte >= 4) {
 			if (!memoryKnown || is_ram(base, kGigabyte))
 				level1[gigabyte] = base | identity_flags(base, kGigabyte, false);

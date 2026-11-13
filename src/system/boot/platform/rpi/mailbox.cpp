@@ -40,8 +40,9 @@
 #define TAG_SET_PIXEL_ORDER		0x00048006
 #define TAG_SET_VIRTUAL_OFFSET	0x00048009
 
-// The VideoCore sees the ARM's first gigabyte at this bus address.
-#define VC_BUS_OFFSET			0xc0000000
+// The BCM2711's VideoCore sees the ARM's first gigabyte at this bus address.
+// The BCM2712's (Pi 5) uses the ARM's physical addresses.
+#define BCM2711_VC_BUS_OFFSET	0xc0000000
 
 #define MAILBOX_TIMEOUT			1000000
 
@@ -99,7 +100,8 @@ send_message()
 	sMessage[sMessageLength++] = 0;
 	sMessage[0] = sMessageLength * 4;
 
-	uint32 address = (uint32)(addr_t)sMessage | VC_BUS_OFFSET;
+	uint32 address = (uint32)(addr_t)sMessage
+		| (gBCM2712 ? 0 : BCM2711_VC_BUS_OFFSET);
 
 	mmu_flush_data_cache(sMessage, sizeof(sMessage));
 
@@ -202,6 +204,8 @@ mailbox_allocate_frame_buffer(uint32 width, uint32 height,
 		return B_ERROR;
 	}
 
+	// A bus address: the Pi 4's VideoCore puts its alias bits on top. The
+	// Pi 5's buffer is just below 1 GB too (the gap in the memory map).
 	_buffer.base = sMessage[buffer] & 0x3fffffff;
 	_buffer.size = sMessage[buffer + 1];
 	_buffer.width = sMessage[physical];

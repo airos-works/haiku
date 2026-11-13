@@ -6,7 +6,10 @@
 /*	Entry for the Raspberry Pi boot platform. The VideoCore firmware
 	(start4.elf) loads this image like a 64-bit Linux kernel: the built-in
 	armstub jumps here on core 0 in EL2 with the MMU and caches off and the
-	device tree in x0. Cores 1-3 wait on the armstub's spin table. */
+	device tree in x0. Cores 1-3 wait on the armstub's spin table.
+
+	The Pi 5's EEPROM bootloader does the same without start4.elf; its
+	firmware (TF-A) starts cores 1-3 through PSCI instead. */
 
 #include <asm_defs.h>
 
@@ -54,6 +57,11 @@ _start:
 1:
 	ldr		x1, =gStackEnd
 	mov		sp, x1
+
+	// Faults print what happened instead of leaving the board hung.
+	ldr		x1, =rpi_exception_vectors
+	msr		vbar_el1, x1
+	isb
 
 	// FP and SIMD are used by compiler-generated code.
 	mov		x1, #(3 << 20)
@@ -105,6 +113,34 @@ FUNCTION(rpi_secondary_entry):
 	b		2b
 FUNCTION_END(rpi_secondary_entry)
 
+
+/*	Cores started with PSCI CPU_ON (Pi 5) arrive here in EL2 with the MMU
+	off and no stack; x0 is the context ID, the CPU's index.
+	gPsciSecondaryStacks is indexed by it. */
+FUNCTION(rpi_psci_secondary_entry):
+	msr		daifset, #0xf
+	mov		x19, x0
+	mrs		x1, CurrentEL
+	lsr		x1, x1, #2
+	cmp		x1, #2
+	b.ne	1f
+	bl		drop_to_el1
+1:
+	mov		x1, #(3 << 20)
+	msr		cpacr_el1, x1
+	isb
+
+	ldr		x1, =gPsciSecondaryStacks
+	ldr		x1, [x1, x19, lsl #3]
+	mov		sp, x1
+	mov		x0, x19
+	mov		x29, #0
+	mov		x30, #0
+	bl		rpi_psci_secondary_main
+2:	wfe
+	b		2b
+FUNCTION_END(rpi_psci_secondary_entry)
+
 	.ltorg
 
 
@@ -117,6 +153,44 @@ FUNCTION(arch_enter_kernel):
 	mov		x29, #0
 	br		x4
 FUNCTION_END(arch_enter_kernel)
+
+
+/*	The loader's exception vectors: every exception is fatal. The handler
+	gets the vector's number in x0. */
+.macro rpi_vector number
+	.balign 0x80
+	stp		x29, x30, [sp, #-16]!
+	mov		x0, #\number
+	b		rpi_exception
+.endm
+
+	.balign 0x800
+	.globl rpi_exception_vectors
+rpi_exception_vectors:
+	rpi_vector 0
+	rpi_vector 1
+	rpi_vector 2
+	rpi_vector 3
+	rpi_vector 4
+	rpi_vector 5
+	rpi_vector 6
+	rpi_vector 7
+	rpi_vector 8
+	rpi_vector 9
+	rpi_vector 10
+	rpi_vector 11
+	rpi_vector 12
+	rpi_vector 13
+	rpi_vector 14
+	rpi_vector 15
+
+rpi_exception:
+	mrs		x1, esr_el1
+	mrs		x2, elr_el1
+	mrs		x3, far_el1
+	bl		rpi_handle_exception
+1:	wfe
+	b		1b
 
 
 	.section .bss.stack, "aw", %nobits

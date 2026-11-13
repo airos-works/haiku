@@ -43,6 +43,8 @@ void* gFDT = NULL;
 addr_range gBootArchive = {0, 0};
 fdt_cpu gFDTCpus[MAX_FDT_CPUS];
 uint32 gFDTCpuCount = 0;
+bool gBCM2712 = false;
+uint32 gPsciConduit = ARM64_PSCI_NONE;
 
 
 static uint64
@@ -264,6 +266,155 @@ fdt_boot_arguments()
 }
 
 
+/*!	The rate of the fixed clock that is the first of \a node's "clocks", or 0.
+*/
+static uint32
+get_fixed_clock_rate(int node)
+{
+	const uint32* clocks = (const uint32*)fdt_getprop(gFDT, node, "clocks",
+		NULL);
+	if (clocks == NULL)
+		return 0;
+	int clock = fdt_node_offset_by_phandle(gFDT, fdt32_to_cpu(*clocks));
+	if (clock < 0 || fdt_node_check_compatible(gFDT, clock, "fixed-clock") != 0)
+		return 0;
+	const uint32* frequency = (const uint32*)fdt_getprop(gFDT, clock,
+		"clock-frequency", NULL);
+	return frequency != NULL ? fdt32_to_cpu(*frequency) : 0;
+}
+
+
+// The Pi 5's PCIe x4 controller (brcmstb) with the RP1 behind it
+#define BCM2712_PCIE_STATUS				0x4068
+#define BCM2712_PCIE_LINK_UP			0x30	// PHYLINKUP, DL_ACTIVE
+#define BCM2712_PCIE_WIN_PCI_LO(w)		(0x400c + (w) * 8)
+#define BCM2712_PCIE_WIN_PCI_HI(w)		(0x4010 + (w) * 8)
+#define BCM2712_PCIE_WIN_BASE_LIMIT(w)	(0x4070 + (w) * 4)
+#define BCM2712_PCIE_WIN_BASE_HI(w)		(0x4080 + (w) * 8)
+#define BCM2712_PCIE_WIN_LIMIT_HI(w)	(0x4084 + (w) * 8)
+#define BCM2712_PCIE_EXT_CFG_DATA		0x8000
+#define BCM2712_PCIE_EXT_CFG_INDEX		0x9000
+
+static uint64 sRP1Base = 0;
+static uint64 sRP1Bar = 0;
+
+
+static inline uint32
+read_register(uint64 base, uint32 offset)
+{
+	return *(volatile uint32*)(base + offset);
+}
+
+
+/*!	The firmware puts the RP1 where it likes when it leaves the PCIe link up
+	for the operating system ("pciex4_reset=0"): at 0x1c_0000_0000, where
+	the device tree's "ranges" say 0x1f_0000_0000. Find out from the
+	controller's outbound windows and the RP1's BAR 1 (its peripherals) where
+	it really is, and correct the RP1's "ranges" in the tree, which the
+	kernel gets too.
+*/
+static void
+fixup_rp1()
+{
+	int pcie = -1;
+	while ((pcie = fdt_node_offset_by_compatible(gFDT, pcie,
+			"brcm,bcm2712-pcie")) >= 0) {
+		int rp1 = fdt_subnode_offset(gFDT, pcie, "rp1");
+		addr_range controller;
+		if (rp1 < 0 || !fdt_get_reg(pcie, 0, controller))
+			continue;
+		uint64 regs = controller.start;
+		if ((read_register(regs, BCM2712_PCIE_STATUS) & BCM2712_PCIE_LINK_UP)
+				!= BCM2712_PCIE_LINK_UP) {
+			continue;
+		}
+
+		// bus 1, device 0, function 0: the RP1
+		*(volatile uint32*)(regs + BCM2712_PCIE_EXT_CFG_INDEX) = 1 << 20;
+		uint32 low = read_register(regs, BCM2712_PCIE_EXT_CFG_DATA + 0x14);
+		uint64 bar = low & ~(uint64)0xf;
+		if ((low & 0x6) == 0x4) {
+			bar |= (uint64)read_register(regs, BCM2712_PCIE_EXT_CFG_DATA + 0x18)
+				<< 32;
+		}
+		sRP1Bar = bar;
+
+		uint64 cpu = 0;
+		for (uint32 window = 0; window < 4; window++) {
+			uint64 pciBase = read_register(regs, BCM2712_PCIE_WIN_PCI_LO(window))
+				| (uint64)read_register(regs, BCM2712_PCIE_WIN_PCI_HI(window))
+					<< 32;
+			uint32 baseLimit = read_register(regs,
+				BCM2712_PCIE_WIN_BASE_LIMIT(window));
+			uint64 baseMB = ((baseLimit >> 4) & 0xfff)
+				| (uint64)(read_register(regs, BCM2712_PCIE_WIN_BASE_HI(window))
+					& 0xff) << 12;
+			uint64 limitMB = (baseLimit >> 20)
+				| (uint64)(read_register(regs,
+					BCM2712_PCIE_WIN_LIMIT_HI(window)) & 0xff) << 12;
+			if (baseMB == 0 || limitMB < baseMB)
+				continue;
+			uint64 size = (limitMB - baseMB + 1) << 20;
+			if (bar >= pciBase && bar - pciBase < size) {
+				cpu = (baseMB << 20) + (bar - pciBase);
+				break;
+			}
+		}
+		if (cpu == 0)
+			continue;
+		sRP1Base = cpu;
+
+		// The PCI address that the controller's "ranges" turn into that CPU
+		// address; the RP1's "ranges" are <child (2), PCI (3), size (2)>.
+		int length;
+		const uint32* ranges = (const uint32*)fdt_getprop(gFDT, pcie, "ranges",
+			&length);
+		const uint32* end = ranges != NULL ? ranges + length / 4 : NULL;
+		while (ranges != NULL && ranges + 7 <= end) {
+			uint32 flags = fdt32_to_cpu(ranges[0]);
+			const uint32* cells = ranges + 1;
+			uint64 child = read_cells(cells, 2);
+			uint64 parent = read_cells(cells, 2);
+			uint64 size = read_cells(cells, 2);
+			ranges = cells;
+			if (cpu < parent || cpu - parent >= size)
+				continue;
+
+			uint64 pci = cpu - parent + child;
+			const uint32* rp1Ranges = (const uint32*)fdt_getprop(gFDT, rp1,
+				"ranges", &length);
+			if (rp1Ranges == NULL || length < 7 * 4)
+				break;
+			uint32 patched[7];
+			memcpy(patched, rp1Ranges, sizeof(patched));
+			patched[2] = cpu_to_fdt32(flags);
+			patched[3] = cpu_to_fdt32((uint32)(pci >> 32));
+			patched[4] = cpu_to_fdt32((uint32)pci);
+			fdt_setprop_inplace_namelen_partial(gFDT, rp1, "ranges", 6, 0,
+				patched, sizeof(patched));
+			break;
+		}
+	}
+}
+
+
+/*!	Whether the registers of \a node can be read. The Pi 5's UARTs on the GPIO
+	header are in the RP1, behind the PCIe x4 link: with the link down, or the
+	RP1 not where the tree says, an access stalls the CPU. The firmware
+	leaves the link up with "pciex4_reset=0" in config.txt.
+*/
+static bool
+is_reachable(int node)
+{
+	for (int parent = fdt_parent_offset(gFDT, node); parent >= 0;
+			parent = fdt_parent_offset(gFDT, parent)) {
+		if (fdt_node_check_compatible(gFDT, parent, "brcm,bcm2712-pcie") == 0)
+			return sRP1Base != 0;
+	}
+	return true;
+}
+
+
 static bool
 init_uart_node(int node)
 {
@@ -272,14 +423,17 @@ init_uart_node(int node)
 
 	uart_info& uart = gKernelArgs.arch_args.uart;
 	const char* kind;
-	if (fdt_node_check_compatible(gFDT, node, "arm,pl011") == 0)
+	if (fdt_node_check_compatible(gFDT, node, "arm,pl011") == 0
+		|| fdt_node_check_compatible(gFDT, node, "arm,pl011-axi") == 0) {
 		kind = UART_KIND_PL011;
-	else
+	} else
 		return false;
 
-	if (!fdt_get_reg(node, 0, uart.regs))
+	addr_range regs;
+	if (!fdt_get_reg(node, 0, regs) || !is_reachable(node))
 		return false;
 
+	uart.regs = regs;
 	strlcpy(uart.kind, kind, sizeof(uart.kind));
 	uart.irq = get_gic_interrupt(node);
 	uart.clock = PL011_DEFAULT_CLOCK;
@@ -289,8 +443,23 @@ init_uart_node(int node)
 	uint32 rate;
 	if (frequency != NULL)
 		uart.clock = fdt32_to_cpu(*frequency);
-	else if (mailbox_get_clock_rate(MAILBOX_CLOCK_UART, false, rate) == B_OK)
+	else if ((rate = get_fixed_clock_rate(node)) != 0)
 		uart.clock = rate;
+	else if (!gBCM2712
+		&& mailbox_get_clock_rate(MAILBOX_CLOCK_UART, false, rate) == B_OK)
+		uart.clock = rate;
+	else if (gBCM2712) {
+		// The RP1's UART clock is the RP1's own; the firmware set the port
+		// up at 115200 baud ("enable_rp1_uart=1"): the divisor tells.
+		volatile uint32* pl011 = (volatile uint32*)regs.start;
+		uint32 integer = pl011[0x24 / 4];
+		uint32 fraction = pl011[0x28 / 4] & 0x3f;
+		if (integer != 0) {
+			uart.clock = (uint32)(((uint64)integer * 64 + fraction)
+				* 16 * 115200 / 64);
+		} else
+			uart.clock = 50000000;
+	}
 
 	return true;
 }
@@ -299,6 +468,11 @@ init_uart_node(int node)
 static void
 init_uart()
 {
+	// On the Pi 5 the "console" alias follows dtparam=uart0_console: the
+	// RP1's UART on GPIO 14/15 instead of the debug connector.
+	if (gBCM2712 && init_uart_node(fdt_path_offset(gFDT, "console")))
+		return;
+
 	// The console the firmware names, then the usual alias.
 	int chosen = fdt_path_offset(gFDT, "/chosen");
 	if (chosen >= 0) {
@@ -366,6 +540,7 @@ init_cpus()
 			NULL);
 		cpu.mpidr = reg != NULL ? read_cells(reg, addressCells) : 0;
 		cpu.releaseAddress = 0;
+		cpu.psci = false;
 
 		const char* method = (const char*)fdt_getprop(gFDT, node,
 			"enable-method", NULL);
@@ -375,8 +550,27 @@ init_cpus()
 		if (method != NULL && strcmp(method, "spin-table") == 0
 			&& release != NULL) {
 			cpu.releaseAddress = read_cells(release, length / 4);
+		} else if (method != NULL && strcmp(method, "psci") == 0
+			&& gPsciConduit != ARM64_PSCI_NONE) {
+			cpu.psci = true;
 		}
 	}
+}
+
+
+static void
+init_psci()
+{
+	int node = fdt_path_offset(gFDT, "/psci");
+	if (node < 0 || !is_enabled(node))
+		return;
+	const char* method = (const char*)fdt_getprop(gFDT, node, "method", NULL);
+	if (method == NULL)
+		return;
+	if (strcmp(method, "smc") == 0)
+		gPsciConduit = ARM64_PSCI_SMC;
+	else if (strcmp(method, "hvc") == 0)
+		gPsciConduit = ARM64_PSCI_HVC;
 }
 
 
@@ -386,11 +580,18 @@ fdt_init(void* fdt)
 	if (fdt == NULL || fdt_check_header(fdt) != 0)
 		panic("No device tree from the firmware");
 	gFDT = fdt;
+	gBCM2712 = fdt_node_check_compatible(fdt, 0, "brcm,bcm2712") == 0;
 
+	if (gBCM2712)
+		fixup_rp1();
 	mailbox_init();
 	init_uart();
 	serial_init();
 		// from here on dprintf() reaches the UART
+	if (sRP1Bar != 0) {
+		dprintf("RP1: BAR 1 at PCI %#" B_PRIx64 ", CPU %#" B_PRIx64 "\n",
+			sRP1Bar, sRP1Base);
+	}
 
 	dprintf("device tree at %p, %u bytes: %s\n", fdt,
 		(unsigned)fdt_totalsize(fdt),
@@ -399,9 +600,21 @@ fdt_init(void* fdt)
 	init_memory();
 	init_chosen();
 	init_interrupt_controller();
+	init_psci();
 	init_cpus();
 
-	gKernelArgs.arch_args.psci_conduit = ARM64_PSCI_NONE;
+	// The kernel restarts and powers off through PSCI where there is one.
+	gKernelArgs.arch_args.psci_conduit = gPsciConduit;
+}
+
+
+static phys_addr_t sWatchdog = 0;
+
+
+void
+fdt_set_watchdog(phys_addr_t base)
+{
+	sWatchdog = base;
 }
 
 
@@ -439,6 +652,10 @@ fdt_set_kernel_args()
 		}
 		dprintf("ARM clock: up to %" B_PRIu32 " Hz\n", rate);
 	}
+
+	int chosen = fdt_path_offset(copy, "/chosen");
+	if (sWatchdog != 0 && chosen >= 0)
+		fdt_setprop_u64(copy, chosen, "airos,watchdog", sWatchdog);
 
 	const uart_info& uart = gKernelArgs.arch_args.uart;
 	dprintf("UART: %s at %#" B_PRIx64 ", irq %" B_PRIu32 "\n",

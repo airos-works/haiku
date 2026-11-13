@@ -1,8 +1,12 @@
-# air/OS on the Raspberry Pi 4: the firmware starts the air/OS loader directly,
-# the way it starts a Linux kernel. See docs/rpi4/BOOT.md.
+# air/OS on the Raspberry Pi 4 and 5: the firmware starts the air/OS loader
+# directly, the way it starts a Linux kernel. See docs/rpi4/BOOT.md and
+# docs/rpi5/BOOT.md.
+#
+# The Pi 4 reads this file through start4.elf; the Pi 5's EEPROM bootloader
+# reads it itself (it has no start*.elf). [pi4] and [pi5] lines apply to that
+# board only, [all] ends such a section.
 
 arm_64bit=1
-enable_gic=1
 
 # Let firmware select the supported turbo speed for this board revision.
 # Later Pi 4B boards support 1.8 GHz; older boards keep their supported limit.
@@ -18,15 +22,9 @@ kernel_address=0x80000
 # airos/<version>/ once System Updater has installed one.
 include airos-boot.txt
 
-# Serial console on GPIO 14/15 (PL011, 115200 8N1). Bluetooth gets the mini
-# UART (GPIO 30 to 33).
+# Serial console on GPIO 14/15 (PL011, 115200 8N1).
 enable_uart=1
 uart_2ndstage=1
-dtoverlay=miniuart-bt
-
-# Memory for the firmware's own work: its H.264 decoder needs more than the
-# default 76 MB for 1080p, and stops answering when it runs out.
-gpu_mem=192
 
 disable_overscan=1
 # one frame buffer per HDMI output
@@ -36,9 +34,28 @@ max_framebuffers=2
 hdmi_force_hotplug:0=1
 hdmi_force_hotplug:1=1
 disable_splash=1
+
+[pi4]
+enable_gic=1
+# Bluetooth gets the mini UART (GPIO 30 to 33), the console the PL011.
+dtoverlay=miniuart-bt
+# Memory for the firmware's own work: its H.264 decoder needs more than the
+# default 76 MB for 1080p, and stops answering when it runs out.
+gpu_mem=192
 # HDMI0 up to 600 MHz: 4K monitors at 60 Hz (the firmware then runs its
 # core clock faster). Without it both outputs stop at 300 MHz, 4K at 30 Hz.
 hdmi_enable_4kp60=1
+
+[pi5]
+# GPIO 14/15 are the RP1's UART0, behind the PCIe x4 link: the firmware
+# sets the UART up and leaves the link running for the loader and the
+# kernel, and the "console" alias names that UART instead of the debug
+# connector's.
+enable_rp1_uart=1
+pciex4_reset=0
+dtparam=uart0_console
+
+[all]
 
 # cmdline.txt takes the loader's options, each a word of its own:
 #   airos.debug   the loader's and the kernel's debug output on the screen

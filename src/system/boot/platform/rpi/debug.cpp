@@ -16,6 +16,7 @@
 #include <util/ring_buffer.h>
 
 #include "console.h"
+#include "cpu.h"
 #include "serial.h"
 
 
@@ -89,8 +90,22 @@ panic(const char* format, ...)
 	console_write_debug(kHeader, sizeof(kHeader) - 1);
 	console_write_debug(buffer, length);
 
+	// Where the firmware can restart the board (PSCI, the Pi 5), do that
+	// after a while: a lab board without a hand at the power switch would
+	// stay hung otherwise.
+	cpu_reset_after(15000000);
+
 	while (true)
 		asm("wfe");
+}
+
+
+extern "C" void
+rpi_handle_exception(uint64 vector, uint64 syndrome, uint64 address,
+	uint64 faultAddress)
+{
+	panic("exception %" B_PRIu64 ": ESR %#" B_PRIx64 " at %#" B_PRIx64
+		", FAR %#" B_PRIx64, vector, syndrome, address, faultAddress);
 }
 
 

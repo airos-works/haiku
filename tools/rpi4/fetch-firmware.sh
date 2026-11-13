@@ -13,6 +13,11 @@ BASE=https://raw.githubusercontent.com/raspberrypi/firmware/$TAG/boot
 FILES=(
     start4.elf fixup4.dat LICENCE.broadcom
     bcm2711-rpi-4-b.dtb bcm2711-rpi-400.dtb bcm2711-rpi-cm4.dtb
+    # Raspberry Pi 5, 500 and CM5: the EEPROM bootloader reads config.txt
+    # and starts the loader itself; it only needs their device trees.
+    bcm2712-rpi-5-b.dtb bcm2712d0-rpi-5-b.dtb bcm2712-d-rpi-5-b.dtb
+    bcm2712-rpi-500.dtb bcm2712-rpi-cm5-cm5io.dtb bcm2712-rpi-cm5l-cm5io.dtb
+    bcm2712-rpi-cm5-cm4io.dtb bcm2712-rpi-cm5l-cm4io.dtb
     overlays/overlay_map.dtb overlays/disable-bt.dtbo overlays/miniuart-bt.dtbo
     overlays/vc4-kms-v3d-pi4.dtbo
 )
