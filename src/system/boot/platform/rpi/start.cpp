@@ -118,6 +118,8 @@ init_boot_options()
 		sBootOptions |= BOOT_OPTION_DEBUG_OUTPUT;
 		gDebugToScreen = true;
 	}
+	if (has_boot_argument("airos.rp1dump"))
+		fdt_dump_rp1_state();
 
 	// a space on the serial console opens the menu
 	bigtime_t timeout = system_time() + 100000;

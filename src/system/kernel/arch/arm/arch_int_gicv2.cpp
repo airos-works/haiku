@@ -3,6 +3,8 @@
  * Distributed under the terms of the MIT License.
  */
 
+#include <string.h>
+
 #include <interrupts.h>
 #include <interrupt_controller.h>
 #include <kernel.h>
@@ -14,6 +16,13 @@
 
 #include "arch_int_gicv2.h"
 #include "gicv2_regs.h"
+
+extern "C" {
+#include <libfdt.h>
+}
+
+
+extern void* gFDT;
 
 
 #define ICI_IRQ 0
@@ -69,15 +78,75 @@ GICv2InterruptController::GICv2InterruptController(phys_addr_t gicd_addr, phys_a
 	for (uint32 i = 8; i < lineRegs * 8; i++) // 8 bits per IRQ
 		fGicdRegs[GICD_REG_ITARGETSR + i] = bootTarget * 0x01010101;
 
-	// all SPIs level-sensitive
+	// all SPIs level-sensitive, but those the device tree says otherwise of
 	for (uint32 i = 2; i < lineRegs * 2; i++) // 2 bits per IRQ
 		fGicdRegs[GICD_REG_ICFGR + i] = 0x0;
+	_ConfigureEdgeTriggered();
 
 	// GICD configured, enable (GICC follows per-CPU)
 	fGicdRegs[GICD_REG_CTLR] = 0x03;
 
 	// PerCpuInit is not called separately for the boot CPU
 	PerCpuInit();
+}
+
+
+/*!	Makes the SPIs that the device tree describes as edge triggered so in
+	the GIC. On the Raspberry Pi 5 the RP1's interrupts arrive as message
+	signalled interrupts, which the MIP turns into pulses on SPIs: a
+	level-sensitive input would lose them.
+*/
+void
+GICv2InterruptController::_ConfigureEdgeTriggered()
+{
+	if (gFDT == NULL)
+		return;
+
+	static const char* const kCompatible[]
+		= {"arm,gic-400", "arm,cortex-a15-gic", "arm,cortex-a9-gic"};
+	int gic = -1;
+	for (size_t i = 0; i < B_COUNT_OF(kCompatible) && gic < 0; i++)
+		gic = fdt_node_offset_by_compatible(gFDT, -1, kCompatible[i]);
+	if (gic < 0)
+		return;
+	uint32 gicPhandle = fdt_get_phandle(gFDT, gic);
+
+	int node = -1;
+	while ((node = fdt_next_node(gFDT, node, NULL)) >= 0) {
+		int length;
+		const fdt32_t* interrupts = (const fdt32_t*)fdt_getprop(gFDT, node,
+			"interrupts", &length);
+		if (interrupts == NULL || length < 12 || length % 12 != 0)
+			continue;
+		const char* status = (const char*)fdt_getprop(gFDT, node, "status",
+			NULL);
+		if (status != NULL && strcmp(status, "okay") != 0
+			&& strcmp(status, "ok") != 0) {
+			continue;
+		}
+
+		// the node's interrupt parent, inherited from its ancestors
+		uint32 parent = 0;
+		for (int current = node; current >= 0 && parent == 0;
+				current = fdt_parent_offset(gFDT, current)) {
+			const fdt32_t* phandle = (const fdt32_t*)fdt_getprop(gFDT, current,
+				"interrupt-parent", NULL);
+			if (phandle != NULL)
+				parent = fdt32_to_cpu(*phandle);
+		}
+		if (parent != gicPhandle)
+			continue;
+
+		for (int i = 0; i < length / 12; i++) {
+			uint32 type = fdt32_to_cpu(interrupts[i * 3]);
+			uint32 irq = fdt32_to_cpu(interrupts[i * 3 + 1]) + 32;
+			uint32 flags = fdt32_to_cpu(interrupts[i * 3 + 2]);
+			if (type != 0 || (flags & 0x3) == 0 || irq >= (uint32)fMaxInt)
+				continue;
+			// 2 bits per IRQ, the upper one: edge triggered
+			fGicdRegs[GICD_REG_ICFGR + irq / 16] |= 2u << (irq % 16 * 2);
+		}
+	}
 }
 
 

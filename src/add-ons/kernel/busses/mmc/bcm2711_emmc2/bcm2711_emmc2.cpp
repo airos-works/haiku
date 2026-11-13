@@ -16,7 +16,11 @@
 	reach; the reachable range and the bus address offset come from the
 	parent bus' "dma-ranges" (the first boards only reach the low gigabyte).
 	Card detection is not wired to the controller on the Pi 4, so the slot is
-	simply probed when the bus comes up. */
+	simply probed when the bus comes up.
+
+	The BCM2712's (Raspberry Pi 5) SD card slot is the same kind of block
+	("brcm,bcm2712-sdhci", Linux: sdhci-brcmstb.c) and runs the same way; the
+	loader puts its fixed 200 MHz base clock into the device tree. */
 
 
 #include <algorithm>
@@ -977,10 +981,23 @@ emmc2_supports_device(device_node* parent)
 		return 0.0f;
 	}
 
-	if (strcmp(compatible, "brcm,bcm2711-emmc2") != 0)
-		return 0.0f;
+	if (strcmp(compatible, "brcm,bcm2711-emmc2") == 0)
+		return 1.0f;
 
-	return 1.0f;
+	// The Pi 5's (BCM2712) SD card slot. Its other controller of the kind
+	// is "non-removable": the Wi-Fi chip's SDIO.
+	if (strcmp(compatible, "brcm,bcm2712-sdhci") == 0) {
+		fdt_device_module_info* fdt;
+		fdt_device* fdtDevice;
+		if (gDeviceManager->get_driver(parent, (driver_module_info**)&fdt,
+				(void**)&fdtDevice) != B_OK
+			|| fdt->get_prop(fdtDevice, "non-removable", NULL) != NULL) {
+			return 0.0f;
+		}
+		return 1.0f;
+	}
+
+	return 0.0f;
 }
 
 
@@ -988,7 +1005,8 @@ static status_t
 emmc2_register_device(device_node* parent)
 {
 	device_attr attrs[] = {
-		{B_DEVICE_PRETTY_NAME, B_STRING_TYPE, {.string = "BCM2711 EMMC2"}},
+		{B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
+			{.string = "Raspberry Pi SD controller"}},
 		{}
 	};
 

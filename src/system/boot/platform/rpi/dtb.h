@@ -37,6 +37,8 @@ void fdt_set_kernel_args();
 void fdt_set_watchdog(phys_addr_t base);
 	// the kernel keeps the watchdog from firing (/chosen/airos,watchdog)
 const char* fdt_boot_arguments();
+void fdt_dump_rp1_state();
+	// Pi 5: the RP1's PCIe controller, configuration space and the MIP
 bool fdt_get_reg(int node, size_t index, addr_range& range);
 bool fdt_find_compatible_reg(const char* compatible, addr_range& range);
 

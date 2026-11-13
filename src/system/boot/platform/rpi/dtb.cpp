@@ -297,12 +297,58 @@ get_fixed_clock_rate(int node)
 
 static uint64 sRP1Base = 0;
 static uint64 sRP1Bar = 0;
+static uint64 sRP1Controller = 0;
 
 
 static inline uint32
 read_register(uint64 base, uint32 offset)
 {
 	return *(volatile uint32*)(base + offset);
+}
+
+
+/*!	The CPU address at which the controller's outbound windows show the PCI
+	address \a pci, or 0.
+*/
+static uint64
+pci_to_cpu(uint64 regs, uint64 pci)
+{
+	for (uint32 window = 0; window < 4; window++) {
+		uint64 pciBase = read_register(regs, BCM2712_PCIE_WIN_PCI_LO(window))
+			| (uint64)read_register(regs, BCM2712_PCIE_WIN_PCI_HI(window))
+				<< 32;
+		uint32 baseLimit = read_register(regs,
+			BCM2712_PCIE_WIN_BASE_LIMIT(window));
+		uint64 baseMB = ((baseLimit >> 4) & 0xfff)
+			| (uint64)(read_register(regs, BCM2712_PCIE_WIN_BASE_HI(window))
+				& 0xff) << 12;
+		uint64 limitMB = (baseLimit >> 20)
+			| (uint64)(read_register(regs, BCM2712_PCIE_WIN_LIMIT_HI(window))
+				& 0xff) << 12;
+		if (baseMB == 0 || limitMB < baseMB)
+			continue;
+		uint64 size = (limitMB - baseMB + 1) << 20;
+		if (pci >= pciBase && pci - pciBase < size)
+			return (baseMB << 20) + (pci - pciBase);
+	}
+	return 0;
+}
+
+
+static inline uint32
+rp1_config_read(uint32 offset)
+{
+	*(volatile uint32*)(sRP1Controller + BCM2712_PCIE_EXT_CFG_INDEX) = 1 << 20;
+	return read_register(sRP1Controller, BCM2712_PCIE_EXT_CFG_DATA + offset);
+}
+
+
+static inline void
+rp1_config_write(uint32 offset, uint32 value)
+{
+	*(volatile uint32*)(sRP1Controller + BCM2712_PCIE_EXT_CFG_INDEX) = 1 << 20;
+	*(volatile uint32*)(sRP1Controller + BCM2712_PCIE_EXT_CFG_DATA + offset)
+		= value;
 }
 
 
@@ -328,6 +374,7 @@ fixup_rp1()
 				!= BCM2712_PCIE_LINK_UP) {
 			continue;
 		}
+		sRP1Controller = regs;
 
 		// bus 1, device 0, function 0: the RP1
 		*(volatile uint32*)(regs + BCM2712_PCIE_EXT_CFG_INDEX) = 1 << 20;
@@ -339,27 +386,7 @@ fixup_rp1()
 		}
 		sRP1Bar = bar;
 
-		uint64 cpu = 0;
-		for (uint32 window = 0; window < 4; window++) {
-			uint64 pciBase = read_register(regs, BCM2712_PCIE_WIN_PCI_LO(window))
-				| (uint64)read_register(regs, BCM2712_PCIE_WIN_PCI_HI(window))
-					<< 32;
-			uint32 baseLimit = read_register(regs,
-				BCM2712_PCIE_WIN_BASE_LIMIT(window));
-			uint64 baseMB = ((baseLimit >> 4) & 0xfff)
-				| (uint64)(read_register(regs, BCM2712_PCIE_WIN_BASE_HI(window))
-					& 0xff) << 12;
-			uint64 limitMB = (baseLimit >> 20)
-				| (uint64)(read_register(regs,
-					BCM2712_PCIE_WIN_LIMIT_HI(window)) & 0xff) << 12;
-			if (baseMB == 0 || limitMB < baseMB)
-				continue;
-			uint64 size = (limitMB - baseMB + 1) << 20;
-			if (bar >= pciBase && bar - pciBase < size) {
-				cpu = (baseMB << 20) + (bar - pciBase);
-				break;
-			}
-		}
+		uint64 cpu = pci_to_cpu(regs, bar);
 		if (cpu == 0)
 			continue;
 		sRP1Base = cpu;
@@ -412,6 +439,41 @@ is_reachable(int node)
 			return sRP1Base != 0;
 	}
 	return true;
+}
+
+
+static void
+dump_registers(const char* name, uint64 base, uint32 from, uint32 to)
+{
+	for (uint32 offset = from; offset < to; offset += 16) {
+		dprintf("%s %04" B_PRIx32 ": %08" B_PRIx32 " %08" B_PRIx32 " %08"
+			B_PRIx32 " %08" B_PRIx32 "\n", name, offset,
+			read_register(base, offset), read_register(base, offset + 4),
+			read_register(base, offset + 8), read_register(base, offset + 12));
+	}
+}
+
+
+/*!	"airos.rp1dump": what the firmware left in the PCIe controller of the
+	RP1, the RP1's configuration space and the MSI controller (MIP), for
+	working out the RP1's interrupts and DMA.
+*/
+void
+fdt_dump_rp1_state()
+{
+	if (sRP1Controller == 0)
+		return;
+	uint64 regs = sRP1Controller;
+	dump_registers("pcie", regs, 0x4000, 0x4180);
+	dump_registers("pcie", regs, 0x4300, 0x4320);
+	dump_registers("pcie", regs, 0x4500, 0x4520);
+	*(volatile uint32*)(regs + BCM2712_PCIE_EXT_CFG_INDEX) = 1 << 20;
+	dump_registers("rp1cfg", regs + BCM2712_PCIE_EXT_CFG_DATA, 0, 0x100);
+	addr_range mip;
+	if (fdt_find_compatible_reg("brcm,bcm2712-mip", mip))
+		dump_registers("mip", mip.start, 0, 0xc0);
+	// the RP1's own MSI-X configuration and interrupt status (PCIE_APBS)
+	dump_registers("rp1apbs", sRP1Base + 0x108000, 0, 0x110);
 }
 
 
@@ -608,6 +670,185 @@ fdt_init(void* fdt)
 }
 
 
+// The RP1's interrupts (Linux: drivers/mfd/rp1.c, irq-bcm2712-mip.c)
+#define RP1_PCIE_APBS			0x108000
+#define RP1_REG_SET				0x800
+#define RP1_MSIX_CFG(irq)		(0x8 + (irq) * 4)
+#define RP1_MSIX_CFG_ENABLE		(1 << 0)
+#define RP1_MSIX_CFG_IACK_EN	(1 << 3)
+#define RP1_IRQ_COUNT			61
+#define MIP_INT_CFGL_HOST		0x20
+#define MIP_INT_CFGH_HOST		0x30
+#define MIP_INT_MASKL_HOST		0x40
+#define MIP_INT_MASKH_HOST		0x50
+#define MIP_INT_MASKL_VPU		0x60
+#define MIP_INT_MASKH_VPU		0x70
+#define BCM2712_PCIE_RC_BAR(n)	((n) <= 3 ? 0x402c + ((n) - 1) * 8 \
+	: 0x40d4 + ((n) - 4) * 8)
+#define BCM2712_PCIE_UBUS_BAR(n) ((n) <= 3 ? 0x40ac + ((n) - 1) * 8 \
+	: 0x410c + ((n) - 4) * 8)
+
+
+/*!	Makes the RP1's interrupts plain GIC interrupts for the kernel, the way
+	Linux sets them up: interrupt N of the RP1 is MSI-X vector N, a write of
+	N to the MIP, which raises SPI <msi base> + N, edge triggered. Then the
+	RP1's devices in \a tree (the kernel's copy) get those SPIs as their
+	interrupts, and drivers need to know nothing about the RP1. Level
+	triggered sources are acknowledged through the RP1's MSIX_CFG IACK bit
+	("airos,rp1-iack" names the register; the driver writes 1 << 2 there).
+*/
+static void
+setup_rp1_interrupts(void* tree)
+{
+	if (sRP1Base == 0 || sRP1Controller == 0)
+		return;
+
+	int mip = fdt_node_offset_by_compatible(tree, -1, "brcm,bcm2712-mip");
+	int length;
+	const uint32* ranges = mip >= 0
+		? (const uint32*)fdt_getprop(tree, mip, "msi-ranges", &length) : NULL;
+	if (ranges == NULL || length != 5 * 4)
+		return;
+	uint32 gicPhandle = fdt32_to_cpu(ranges[0]);
+	uint32 spiBase = fdt32_to_cpu(ranges[2]);
+	uint32 vectors = fdt32_to_cpu(ranges[4]);
+
+	// reg 0: the MIP's registers, reg 1: the address MSIs are written to
+	const uint32* reg = (const uint32*)fdt_getprop(tree, mip, "reg", &length);
+	if (reg == NULL || length < 8 * 4)
+		return;
+	uint64 mipRegs = (uint64)fdt32_to_cpu(reg[0]) << 32 | fdt32_to_cpu(reg[1]);
+	uint64 message = (uint64)fdt32_to_cpu(reg[4]) << 32 | fdt32_to_cpu(reg[5]);
+	uint32 count = vectors < RP1_IRQ_COUNT ? vectors : RP1_IRQ_COUNT;
+
+	// The controller has to pass the RP1's MSI writes on to the MIP: an
+	// inbound window (RC BAR) for the message address.
+	uint32 freeBar = 0;
+	bool mapped = false;
+	for (uint32 bar = 1; bar <= 10 && !mapped; bar++) {
+		uint32 low = read_register(sRP1Controller, BCM2712_PCIE_RC_BAR(bar));
+		uint32 high = read_register(sRP1Controller,
+			BCM2712_PCIE_RC_BAR(bar) + 4);
+		uint32 sizeCode = low & 0x1f;
+		if (sizeCode == 0) {
+			if (freeBar == 0)
+				freeBar = bar;
+			continue;
+		}
+		uint64 base = (uint64)high << 32 | (low & ~(uint32)0xfff);
+		uint32 log2 = sizeCode >= 0x1c ? sizeCode - 0x1c + 12 : sizeCode + 15;
+		if (message >= base && message - base < (1ull << log2))
+			mapped = true;
+	}
+	if (!mapped) {
+		if (freeBar == 0) {
+			dprintf("RP1: no inbound window free for the MIP\n");
+			return;
+		}
+		// 4 KB (size code 0x1c) at the message address, to the MIP
+		*(volatile uint32*)(sRP1Controller + BCM2712_PCIE_RC_BAR(freeBar))
+			= (uint32)message | 0x1c;
+		*(volatile uint32*)(sRP1Controller + BCM2712_PCIE_RC_BAR(freeBar) + 4)
+			= (uint32)(message >> 32);
+		*(volatile uint32*)(sRP1Controller + BCM2712_PCIE_UBUS_BAR(freeBar))
+			= ((uint32)mipRegs & ~(uint32)0xfff) | 1;
+		*(volatile uint32*)(sRP1Controller + BCM2712_PCIE_UBUS_BAR(freeBar) + 4)
+			= (uint32)(mipRegs >> 32);
+		dprintf("RP1: inbound window %" B_PRIu32 " for the MIP\n", freeBar);
+	}
+
+	// The MIP: everything to the host, nothing to the VPU, edge triggered.
+	volatile uint32* mipRegisters = (volatile uint32*)mipRegs;
+	mipRegisters[MIP_INT_MASKL_HOST / 4] = 0;
+	mipRegisters[MIP_INT_MASKH_HOST / 4] = 0;
+	mipRegisters[MIP_INT_MASKL_VPU / 4] = ~0u;
+	mipRegisters[MIP_INT_MASKH_VPU / 4] = ~0u;
+	mipRegisters[MIP_INT_CFGL_HOST / 4] = ~0u;
+	mipRegisters[MIP_INT_CFGH_HOST / 4] = ~0u;
+
+	// memory space and bus mastering (MSIs are memory writes)
+	rp1_config_write(0x04, rp1_config_read(0x04) | 0x6);
+
+	// the MSI-X capability
+	uint32 capability = rp1_config_read(0x34) & 0xfc;
+	while (capability != 0 && (rp1_config_read(capability) & 0xff) != 0x11)
+		capability = (rp1_config_read(capability) >> 8) & 0xfc;
+	if (capability == 0) {
+		dprintf("RP1: no MSI-X capability\n");
+		return;
+	}
+	uint32 control = rp1_config_read(capability) >> 16;
+	uint32 tableInfo = rp1_config_read(capability + 4);
+	uint32 tableBar = tableInfo & 0x7;
+	uint32 barLow = rp1_config_read(0x10 + tableBar * 4);
+	uint64 barAddress = barLow & ~(uint64)0xf;
+	if ((barLow & 0x6) == 0x4)
+		barAddress |= (uint64)rp1_config_read(0x14 + tableBar * 4) << 32;
+	uint64 table = pci_to_cpu(sRP1Controller, barAddress);
+	if (table == 0) {
+		dprintf("RP1: MSI-X table BAR %" B_PRIu32 " not mapped\n", tableBar);
+		return;
+	}
+	table += tableInfo & ~(uint32)0x7;
+	if ((control & 0x7ff) + 1 < count)
+		count = (control & 0x7ff) + 1;
+
+	volatile uint32* entries = (volatile uint32*)table;
+	for (uint32 i = 0; i < count; i++) {
+		entries[i * 4 + 0] = (uint32)message;
+		entries[i * 4 + 1] = (uint32)(message >> 32);
+		entries[i * 4 + 2] = i;
+		entries[i * 4 + 3] = 0;	// unmasked
+	}
+	// MSI-X on, the function's mask off
+	rp1_config_write(capability, (rp1_config_read(capability)
+		| (1u << 31)) & ~(1u << 30));
+
+	// The RP1's devices: GIC SPIs instead of the RP1's numbers.
+	int rp1 = -1;
+	int pcie = fdt_node_offset_by_compatible(tree, -1, "brcm,bcm2712-pcie");
+	while (pcie >= 0 && rp1 < 0) {
+		rp1 = fdt_subnode_offset(tree, pcie, "rp1");
+		if (rp1 < 0) {
+			pcie = fdt_node_offset_by_compatible(tree, pcie,
+				"brcm,bcm2712-pcie");
+		}
+	}
+	if (rp1 < 0)
+		return;
+
+	volatile uint32* apbs = (volatile uint32*)(sRP1Base + RP1_PCIE_APBS);
+	uint32 converted = 0;
+	int node;
+	fdt_for_each_subnode(node, tree, rp1) {
+		const uint32* interrupts = (const uint32*)fdt_getprop(tree, node,
+			"interrupts", &length);
+		if (interrupts == NULL || length != 8)
+			continue;
+		uint32 irq = fdt32_to_cpu(interrupts[0]);
+		uint32 type = fdt32_to_cpu(interrupts[1]);
+		if (irq >= count)
+			continue;
+
+		bool level = (type & 0xc) != 0;
+		apbs[(RP1_REG_SET + RP1_MSIX_CFG(irq)) / 4] = RP1_MSIX_CFG_ENABLE
+			| (level ? RP1_MSIX_CFG_IACK_EN : 0);
+
+		fdt32_t cells[3] = {cpu_to_fdt32(0), cpu_to_fdt32(spiBase + irq),
+			cpu_to_fdt32(1)};
+		fdt_setprop(tree, node, "interrupts", cells, sizeof(cells));
+		fdt_setprop_u32(tree, node, "interrupt-parent", gicPhandle);
+		if (level) {
+			fdt_setprop_u64(tree, node, "airos,rp1-iack",
+				sRP1Base + RP1_PCIE_APBS + RP1_REG_SET + RP1_MSIX_CFG(irq));
+		}
+		converted++;
+	}
+	dprintf("RP1: %" B_PRIu32 " MSI-X vectors to SPI %" B_PRIu32 "+, %"
+		B_PRIu32 " devices\n", count, spiBase, converted);
+}
+
+
 static phys_addr_t sWatchdog = 0;
 
 
@@ -623,7 +864,7 @@ fdt_set_kernel_args()
 {
 	// The kernel gets a copy with room for what is added below; libfdt wants
 	// the tree 8-byte aligned.
-	uint32 size = fdt_totalsize(gFDT) + 1024;
+	uint32 size = fdt_totalsize(gFDT) + 16384;
 	void* copy = kernel_args_malloc(size, 8);
 	if (copy == NULL || fdt_open_into(gFDT, copy, size) != 0)
 		panic("No memory for the device tree");
@@ -639,6 +880,23 @@ fdt_set_kernel_args()
 		dprintf("EMMC2 clock: %" B_PRIu32 " Hz\n", rate);
 	}
 
+	// The Pi 5's SD controller runs from a fixed clock that the kernel's
+	// device tree bus cannot follow by its phandle.
+	node = -1;
+	while ((node = fdt_node_offset_by_compatible(copy, node,
+			"brcm,bcm2712-sdhci")) >= 0) {
+		const uint32* clocks = (const uint32*)fdt_getprop(copy, node, "clocks",
+			NULL);
+		int clock = clocks != NULL
+			? fdt_node_offset_by_phandle(copy, fdt32_to_cpu(*clocks)) : -1;
+		const uint32* frequency = clock >= 0 ? (const uint32*)fdt_getprop(copy,
+			clock, "clock-frequency", NULL) : NULL;
+		if (frequency != NULL) {
+			fdt_setprop_u32(copy, node, "clock-frequency",
+				fdt32_to_cpu(*frequency));
+		}
+	}
+
 	// The firmware's tree has no operating points for the cores either; the
 	// kernel reports a core's "clock-frequency" as its maximum speed.
 	int cpus = fdt_path_offset(copy, "/cpus");
@@ -652,6 +910,9 @@ fdt_set_kernel_args()
 		}
 		dprintf("ARM clock: up to %" B_PRIu32 " Hz\n", rate);
 	}
+
+	if (gBCM2712)
+		setup_rp1_interrupts(copy);
 
 	int chosen = fdt_path_offset(copy, "/chosen");
 	if (sWatchdog != 0 && chosen >= 0)
