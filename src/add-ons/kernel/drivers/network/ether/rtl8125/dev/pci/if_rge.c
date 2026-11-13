@@ -241,8 +241,11 @@ rge_attach(struct device *parent, struct device *self, void *aux)
 #ifdef __FreeBSD_version
 	sc->sc_dev = dev;
 	sc->sc_dmat = bus_get_dma_tag(sc->sc_dev);
+	/* The descriptors carry 64-bit addresses (RGE_ADDR_HI/LO): a 32-bit
+	 * limit made every packet bounce on machines with memory above 4 GB
+	 * (airos-works/haiku#122). */
 	if (bus_dma_tag_create(sc->sc_dmat, 1, 0,
-		BUS_SPACE_MAXADDR_32BIT, BUS_SPACE_MAXADDR, NULL, NULL,
+		BUS_SPACE_MAXADDR, BUS_SPACE_MAXADDR, NULL, NULL,
 		BUS_SPACE_MAXSIZE_32BIT, BUS_SPACE_UNRESTRICTED, BUS_SPACE_MAXSIZE_32BIT, 0, NULL, NULL,
 		&sc->sc_dmat) != 0) {
 		device_printf(dev, "cannot create DMA parent tag\n");
@@ -427,6 +430,10 @@ rge_attach(struct device *parent, struct device *self, void *aux)
 
 	if_attach(ifp);
 	ether_ifattach(ifp, eaddr);
+#ifdef __HAIKU__
+	/* if_attach() set the send queue back to IFQ_MAXLEN (50) */
+	ifq_set_maxlen(&ifp->if_snd, RGE_TX_LIST_CNT - 1);
+#endif
 
 #if NKSTAT > 0
 	rge_kstat_attach(sc);
@@ -1449,7 +1456,15 @@ rge_rx_list_init(struct rge_queues *q)
 	q->q_rx.rge_head = NULL;
 	q->q_rx.rge_tail = &q->q_rx.rge_head;
 
+#ifdef __HAIKU__
+	/* The compatibility layer grows the posted part of the ring by one
+	 * buffer per tick at most; starting at 32 of 1024 buffers dropped
+	 * frames in every burst (airos-works/haiku#122). */
+	if_rxr_init(&q->q_rx.rge_rx_ring, RGE_RX_LIST_CNT / 2,
+	    RGE_RX_LIST_CNT - 1);
+#else
 	if_rxr_init(&q->q_rx.rge_rx_ring, 32, RGE_RX_LIST_CNT - 1);
+#endif
 	rge_fill_rx_ring(q);
 }
 
