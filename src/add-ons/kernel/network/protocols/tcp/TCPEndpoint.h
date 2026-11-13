@@ -113,6 +113,7 @@ private:
 							net_buffer* buffer);
 			int32		_Receive(tcp_segment_header& segment,
 							net_buffer* buffer);
+			int32		_ChallengeAcknowledge();
 			void		_UpdateTimestamps(tcp_segment_header& segment,
 							size_t segmentLength);
 			void		_UpdateReceiveBuffer();
@@ -208,6 +209,9 @@ private:
 	uint32			fKeepAliveProbes;
 
 	uint32			fReceivedTimestamp;
+	uint32			fTimestampOffset;
+		// added to our timestamp values, different for every connection
+	bigtime_t		fLastChallengeAcknowledge;
 
 	tcp_sequence	fReceiveSizingReference;
 	uint32			fReceiveSizingTimestamp;

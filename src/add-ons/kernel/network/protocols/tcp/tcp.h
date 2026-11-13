@@ -324,6 +324,7 @@ extern net_buffer_module_info* gBufferModule;
 extern net_datalink_module_info* gDatalinkModule;
 extern net_socket_module_info* gSocketModule;
 extern net_stack_module_info* gStackModule;
+extern struct net_secret gTCPSecret;
 
 
 EndpointManager* get_endpoint_manager(net_domain* domain);

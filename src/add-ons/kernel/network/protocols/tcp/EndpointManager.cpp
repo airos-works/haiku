@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include <KernelExport.h>
+#include <util/Random.h>
 
 #include <NetUtilities.h>
 #include <tracing.h>
@@ -132,7 +133,8 @@ protected:
 
 
 static const uint16 kLastReservedPort = 1023;
-static const uint16 kFirstEphemeralPort = 40000;
+static const uint16 kFirstEphemeralPort = 10000;
+static const uint16 kLastEphemeralPort = 65535;
 
 
 ConnectionHashDefinition::ConnectionHashDefinition(EndpointManager* manager)
@@ -219,7 +221,7 @@ EndpointManager::EndpointManager(net_domain* domain)
 	:
 	fDomain(domain),
 	fConnectionHash(this),
-	fLastPort(kFirstEphemeralPort)
+	fLastPort(0)
 {
 	rw_lock_init(&fLock, "TCP endpoint manager");
 }
@@ -470,36 +472,29 @@ EndpointManager::_BindToEphemeral(TCPEndpoint* endpoint,
 {
 	TRACE(("EndpointManager::BindToEphemeral(%p)\n", endpoint));
 
-	uint32 max = fLastPort + 65536;
+	// RFC 6056 algorithm 1: start at a random port each time, so that the
+	// next port cannot be told from the last one (airos-works/haiku#127).
+	// The range is FreeBSD's: ports stay bound while their connections are
+	// in TIME_WAIT, so IANA's 16384 dynamic ports would run out at about
+	// 140 connections a second.
+	const uint32 count = (uint32)kLastEphemeralPort - kFirstEphemeralPort + 1;
+	uint32 offset = secure_get_random<uint32>() % count;
 
-	for (int32 i = 1; i < 5; i++) {
-		// try to retrieve a more or less random port
-		uint32 step = i == 4 ? 1 : (system_time() & 0x1f) + 1;
-		uint32 counter = fLastPort + step;
+	for (uint32 i = 0; i < count; i++) {
+		uint16 port = htons(kFirstEphemeralPort + (offset + i) % count);
 
-		while (counter < max) {
-			uint16 port = counter & 0xffff;
-			if (port <= kLastReservedPort)
-				port += kLastReservedPort;
+		if (!fEndpointHash.Lookup(port).HasNext()) {
+			// found a port
+			SocketAddressStorage newAddress(AddressModule());
+			newAddress.SetTo(address);
+			newAddress.SetPort(port);
 
-			fLastPort = port;
-			port = htons(port);
+			TRACE(("   EndpointManager::BindToEphemeral(%p) -> %s\n",
+				endpoint, AddressString(Domain(), *newAddress,
+				true).Data()));
+			T(Bind(endpoint, newAddress, true));
 
-			if (!fEndpointHash.Lookup(port).HasNext()) {
-				// found a port
-				SocketAddressStorage newAddress(AddressModule());
-				newAddress.SetTo(address);
-				newAddress.SetPort(port);
-
-				TRACE(("   EndpointManager::BindToEphemeral(%p) -> %s\n",
-					endpoint, AddressString(Domain(), *newAddress,
-					true).Data()));
-				T(Bind(endpoint, newAddress, true));
-
-				return _Bind(endpoint, *newAddress);
-			}
-
-			counter += step;
+			return _Bind(endpoint, *newAddress);
 		}
 	}
 

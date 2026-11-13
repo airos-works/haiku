@@ -29,6 +29,7 @@
 #include <util/AutoLock.h>
 
 #include <NetBufferUtilities.h>
+#include <NetSecret.h>
 #include <NetUtilities.h>
 
 
@@ -47,6 +48,7 @@ net_buffer_module_info *gBufferModule;
 net_datalink_module_info *gDatalinkModule;
 net_socket_module_info *gSocketModule;
 net_stack_module_info *gStackModule;
+net_secret gTCPSecret;
 
 
 static EndpointManager* sEndpointManagers[AF_MAX];
@@ -785,14 +787,11 @@ tcp_error_received(net_error error, net_error_data* errorData, net_buffer* data)
 	net_domain* domain = data->interface_address->domain;
 	net_address_module_info* addressModule = domain->address_module;
 
-	NetBufferHeaderReader<tcp_header> bufferHeader(data);
-	if (bufferHeader.Status() < B_OK)
-		return bufferHeader.Status();
-
-	tcp_header& header = bufferHeader.Data();
-
-	uint16 headerLength = header.HeaderLength();
-	if (headerLength < sizeof(tcp_header))
+	// ICMP errors only have to quote the first 8 bytes of the datagram
+	// (RFC 792): the ports and the sequence number. Asking for a whole TCP
+	// header ignored every error that quoted no more than that.
+	tcp_header header;
+	if (data->size < 8 || gBufferModule->read(data, 0, &header, 8) != B_OK)
 		return B_BAD_DATA;
 
 	EndpointManager* endpointManager = endpoint_manager_for(domain);
@@ -866,6 +865,7 @@ static status_t
 tcp_init()
 {
 	rw_lock_init(&sEndpointManagersLock, "endpoint managers");
+	net_secret_init(gTCPSecret);
 
 	status_t status = gStackModule->register_domain_protocols(AF_INET,
 		SOCK_STREAM, 0,

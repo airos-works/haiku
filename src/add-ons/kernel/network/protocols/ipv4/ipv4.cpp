@@ -17,6 +17,7 @@
 #include <net_protocol.h>
 #include <net_stack.h>
 #include <NetBufferUtilities.h>
+#include <NetSecret.h>
 #include <ProtocolUtilities.h>
 
 #include <KernelExport.h>
@@ -202,7 +203,16 @@ net_buffer_module_info* gBufferModule;
 static struct net_domain* sDomain;
 static net_datalink_module_info* sDatalinkModule;
 static net_socket_module_info* sSocketModule;
-static int32 sPacketID;
+
+// IP IDs come from one of kPacketIDBuckets counters, picked by a keyed hash
+// of the addresses and the protocol, and offset by that hash: a host only
+// sees the counter its own packets use, shared with a few others at most,
+// instead of one counter that told it how many packets we sent to everybody
+// (RFC 7739; airos-works/haiku#127)
+static const uint32 kPacketIDBuckets = 2048;
+static int32 sPacketIDs[kPacketIDBuckets];
+static net_secret sPacketIDSecret;
+
 static RawSocketList sRawSockets;
 static mutex sRawSocketsLock;
 static mutex sFragmentLock;
@@ -232,6 +242,17 @@ RawSocket::RawSocket(net_socket* socket)
 	:
 	DatagramSocket<>("ipv4 raw socket", socket)
 {
+}
+
+
+static uint16
+next_packet_id(in_addr_t source, in_addr_t destination, uint8 protocol)
+{
+	uint32 data[3] = { source, destination, protocol };
+	uint64 hash = net_secret_hash(sPacketIDSecret, data, sizeof(data));
+
+	return (uint16)(atomic_add(&sPacketIDs[hash % kPacketIDBuckets], 1)
+		+ (uint32)(hash >> 32));
 }
 
 
@@ -1555,7 +1576,9 @@ ipv4_send_routed_data(net_protocol* _protocol, struct net_route* route,
 		header->header_length = sizeof(ipv4_header) / 4;
 		header->service_type = protocol ? protocol->service_type : 0;
 		header->total_length = htons(buffer->size);
-		header->id = htons(atomic_add(&sPacketID, 1));
+		header->id = htons(next_packet_id(source.sin_addr.s_addr,
+			destination.sin_addr.s_addr,
+			protocol ? protocol->socket->protocol : buffer->protocol));
 		header->fragment_offset = 0;
 		if (protocol != NULL) {
 			if ((protocol->flags & IP_FLAG_DONT_FRAGMENT) != 0)
@@ -2026,7 +2049,7 @@ ipv4_process_ancillary_data_no_container(net_protocol* protocol,
 status_t
 init_ipv4()
 {
-	sPacketID = (int32)system_time();
+	net_secret_init(sPacketIDSecret);
 
 	mutex_init(&sRawSocketsLock, "raw sockets");
 	mutex_init(&sFragmentLock, "IPv4 Fragments");

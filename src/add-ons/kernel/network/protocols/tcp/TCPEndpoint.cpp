@@ -14,6 +14,7 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
+#include <netinet6/in6.h>
 #include <new>
 #include <signal.h>
 #include <stdlib.h>
@@ -27,6 +28,7 @@
 #include <net_datalink.h>
 #include <net_stat.h>
 #include <NetBufferUtilities.h>
+#include <NetSecret.h>
 #include <NetUtilities.h>
 
 #include <lock.h>
@@ -399,6 +401,45 @@ tcp_now()
 }
 
 
+static size_t
+append_address(uint8* data, const sockaddr* address)
+{
+	if (address->sa_family == AF_INET) {
+		const sockaddr_in* in = (const sockaddr_in*)address;
+		memcpy(data, &in->sin_addr, sizeof(in->sin_addr));
+		memcpy(data + sizeof(in->sin_addr), &in->sin_port,
+			sizeof(in->sin_port));
+		return sizeof(in->sin_addr) + sizeof(in->sin_port);
+	}
+	if (address->sa_family == AF_INET6) {
+		const sockaddr_in6* in6 = (const sockaddr_in6*)address;
+		memcpy(data, &in6->sin6_addr, sizeof(in6->sin6_addr));
+		memcpy(data + sizeof(in6->sin6_addr), &in6->sin6_port,
+			sizeof(in6->sin6_port));
+		return sizeof(in6->sin6_addr) + sizeof(in6->sin6_port);
+	}
+	return 0;
+}
+
+
+/*!	A value that depends on the connection's addresses and ports and on a
+	secret made at boot, and that nobody else can work out: RFC 6528 for the
+	initial sequence number, RFC 7323 section 7.1 for the timestamp offset
+	(airos-works/haiku#127).
+*/
+static uint32
+connection_hash(const sockaddr* local, const sockaddr* peer, uint8 purpose)
+{
+	uint8 data[1 + 2 * (16 + 2)];
+	size_t length = 0;
+	data[length++] = purpose;
+	length += append_address(data + length, local);
+	length += append_address(data + length, peer);
+
+	return (uint32)net_secret_hash(gTCPSecret, data, length);
+}
+
+
 static inline uint32
 tcp_diff_timestamp(uint32 base)
 {
@@ -462,6 +503,8 @@ TCPEndpoint::TCPEndpoint(net_socket* socket)
 	fKeepAliveCount(TCP_KEEPALIVE_PROBES),
 	fKeepAliveProbes(0),
 	fReceivedTimestamp(0),
+	fTimestampOffset(0),
+	fLastChallengeAcknowledge(0),
 	fCongestionWindow(0),
 	fSlowStartThreshold(0),
 	fState(CLOSED),
@@ -1971,7 +2014,8 @@ TCPEndpoint::_SynchronizeSentReceive(tcp_segment_header &segment,
 		// through the timestamp it echoes (Karn).
 		if ((fFlags & FLAG_OPTION_TIMESTAMP) != 0
 			&& segment.timestamp_reply != 0) {
-			_UpdateRoundTripTime(tcp_diff_timestamp(segment.timestamp_reply),
+			_UpdateRoundTripTime(tcp_diff_timestamp(
+				segment.timestamp_reply - fTimestampOffset),
 				1);
 		} else if (fSendTime != 0 && fRetransmitInitialCount == 0)
 			_UpdateRoundTripTime(tcp_diff_timestamp(fSendTime), 1);
@@ -1994,6 +2038,23 @@ TCPEndpoint::_SynchronizeSentReceive(tcp_segment_header &segment,
 		// we handled this flag now, it must not be set for further processing
 
 	return _Receive(segment, buffer) | IMMEDIATE_ACKNOWLEDGE;
+}
+
+
+/*!	Drops a segment that failed one of the checks of RFC 5961, answering it
+	with an ACK at most every 100 ms. The limit is kept per connection: a
+	limit shared by all connections lets an attacker count the challenge
+	ACKs another connection triggered (CVE-2016-5696).
+*/
+int32
+TCPEndpoint::_ChallengeAcknowledge()
+{
+	bigtime_t now = system_time();
+	if (now - fLastChallengeAcknowledge < 100000)
+		return DROP;
+
+	fLastChallengeAcknowledge = now;
+	return DROP | IMMEDIATE_ACKNOWLEDGE;
 }
 
 
@@ -2088,11 +2149,25 @@ TCPEndpoint::_Receive(tcp_segment_header& segment, net_buffer* buffer)
 
 	if ((segment.flags & TCP_FLAG_RESET) != 0) {
 		// Is this a valid reset?
-		// We generally ignore resets in time wait state (see RFC 1337)
-		if (fLastAcknowledgeSent <= segment.sequence
-			&& tcp_sequence(segment.sequence) < (fLastAcknowledgeSent
-				+ fReceiveWindow)
-			&& fState != TIME_WAIT) {
+		// We generally ignore resets in time wait state (see RFC 1337).
+		// RFC 5961 section 3: only a reset at exactly the next expected
+		// sequence number resets the connection; any other one in the window
+		// gets a challenge ACK, which a peer that really lost the connection
+		// answers with a reset at the right number. A blind attacker would
+		// otherwise only have to hit the window (airos-works/haiku#127).
+		if (fState == TIME_WAIT)
+			return DROP;
+
+		if (segment.sequence != fReceiveNext) {
+			if (fLastAcknowledgeSent <= segment.sequence
+				&& tcp_sequence(segment.sequence) < (fLastAcknowledgeSent
+					+ fReceiveWindow)) {
+				return _ChallengeAcknowledge();
+			}
+			return DROP;
+		}
+
+		{
 			status_t error;
 			if (fState == SYNCHRONIZE_RECEIVED)
 				error = ECONNREFUSED;
@@ -2118,6 +2193,14 @@ TCPEndpoint::_Receive(tcp_segment_header& segment, net_buffer* buffer)
 	}
 
 	if ((segment.flags & TCP_FLAG_SYNCHRONIZE) != 0
+		&& fState != SYNCHRONIZE_RECEIVED && fState != CLOSED) {
+		// RFC 5961 section 4: a SYN on a synchronized connection no longer
+		// resets it; it gets a challenge ACK instead, and a peer that really
+		// restarted answers that with a reset (airos-works/haiku#127)
+		return _ChallengeAcknowledge();
+	}
+
+	if ((segment.flags & TCP_FLAG_SYNCHRONIZE) != 0
 		|| (fState == SYNCHRONIZE_RECEIVED
 			&& (fInitialReceiveSequence > segment.sequence
 				|| ((segment.flags & TCP_FLAG_ACKNOWLEDGE) != 0
@@ -2126,6 +2209,19 @@ TCPEndpoint::_Receive(tcp_segment_header& segment, net_buffer* buffer)
 		// reset the connection - either the initial SYN was faulty, or we
 		// received a SYN within the data stream
 		return DROP | RESET;
+	}
+
+	// A segment without ACK is dropped in a synchronized state (RFC 9293
+	// section 3.10.7.4), and one that acknowledges data we never sent, or
+	// data older than the largest window the peer ever offered (RFC 5961
+	// section 5), gets a challenge ACK: neither may deliver data or move
+	// the send window (airos-works/haiku#127).
+	if ((segment.flags & TCP_FLAG_ACKNOWLEDGE) == 0)
+		return DROP;
+	if (fState != SYNCHRONIZE_RECEIVED
+		&& (fSendMax < segment.acknowledge
+			|| segment.acknowledge < fSendUnacknowledged - fSendMaxWindow)) {
+		return _ChallengeAcknowledge();
 	}
 
 	// TODO: Check this! Why do we advertize a window outside of what we should
@@ -2423,6 +2519,18 @@ TCPEndpoint::ErrorReceived(net_error error, net_error_data* errorData,
 	MutexLocker locker(fLock);
 
 	if (error == B_NET_ERROR_MESSAGE_SIZE && errorData != NULL) {
+		// RFC 5927 section 4.1: act only on an error that quotes a sequence
+		// number we have sent and that is not acknowledged yet; anybody who
+		// knows the addresses and ports could forge one otherwise
+		// (airos-works/haiku#127)
+		tcp_header quoted;
+		if (gBufferModule->read(data, 0, &quoted, 8) != B_OK
+			|| tcp_sequence(quoted.Sequence()) < fSendUnacknowledged
+			|| tcp_sequence(quoted.Sequence()) >= fSendMax) {
+			gBufferModule->free(data);
+			return B_OK;
+		}
+
 		// errorData->mtu is the room left after the IP header; the floor
 		// keeps a forged error from shrinking segments to nothing
 		uint32 newMaxSegmentSize = errorData->mtu > sizeof(tcp_header)
@@ -2483,7 +2591,7 @@ TCPEndpoint::_PrepareSendSegment()
 		if ((fFlags & FLAG_OPTION_TIMESTAMP) != 0) {
 			segment.options |= TCP_HAS_TIMESTAMPS;
 			segment.timestamp_reply = fReceivedTimestamp;
-			segment.timestamp_value = tcp_now();
+			segment.timestamp_value = tcp_now() + fTimestampOffset;
 		}
 
 		if ((segment.flags & TCP_FLAG_SYNCHRONIZE) != 0
@@ -2950,7 +3058,11 @@ TCPEndpoint::_PrepareSendPath(const sockaddr* peer)
 	if (status < B_OK)
 		return status;
 
-	fInitialSendSequence = system_time() >> 4;
+	// RFC 6528: a 4 microsecond clock plus a keyed hash of the connection,
+	// so that one connection's numbers tell nothing about another's
+	fInitialSendSequence = connection_hash(*LocalAddress(), peer, 0)
+		+ (uint32)(system_time() >> 2);
+	fTimestampOffset = connection_hash(*LocalAddress(), peer, 1);
 	fSendNext = fInitialSendSequence;
 	fSendUnacknowledged = fInitialSendSequence;
 	fSendMax = fInitialSendSequence;
@@ -3040,7 +3152,8 @@ TCPEndpoint::_Acknowledged(tcp_segment_header& segment)
 			fSendNext = fSendUnacknowledged;
 
 		if (fFlags & FLAG_OPTION_TIMESTAMP) {
-			_UpdateRoundTripTime(tcp_diff_timestamp(segment.timestamp_reply),
+			_UpdateRoundTripTime(tcp_diff_timestamp(
+				segment.timestamp_reply - fTimestampOffset),
 				expectedSamples > 0 ? expectedSamples : 1);
 		} else if (fSendTime != 0 && fRoundTripStartSequence < segment.acknowledge) {
 			_UpdateRoundTripTime(tcp_diff_timestamp(fSendTime), 1);

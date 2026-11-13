@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <util/Random.h>
 #include <utility>
 
 
@@ -279,7 +280,7 @@ UdpDomainSupport::UdpDomainSupport(net_domain *domain)
 {
 	mutex_init(&fLock, "udp domain");
 
-	fLastUsedEphemeral = kFirst + rand() % (kLast - kFirst);
+	fLastUsedEphemeral = kFirst;
 }
 
 
@@ -640,27 +641,17 @@ UdpDomainSupport::_DemuxUnicast(net_buffer* buffer)
 uint16
 UdpDomainSupport::_GetNextEphemeral()
 {
-	uint16 stop, curr;
-	if (fLastUsedEphemeral < kLast) {
-		stop = fLastUsedEphemeral;
-		curr = fLastUsedEphemeral + 1;
-	} else {
-		stop = kLast;
-		curr = kFirst;
-	}
+	// RFC 6056 algorithm 1: start at a random port each time, so that the
+	// next port cannot be told from the last one (airos-works/haiku#127)
+	const uint32 count = (uint32)kLast - kFirst + 1;
+	uint32 offset = secure_get_random<uint32>() % count;
 
-	TRACE_DOMAIN("_GetNextEphemeral(), last %hu, curr %hu, stop %hu",
-		fLastUsedEphemeral, curr, stop);
-
-	// TODO: a free list could be used to avoid the impact of these two
-	//        nested loops most of the time... let's see how bad this really is
-	for (; curr != stop; curr = (curr < kLast) ? (curr + 1) : kFirst) {
-		TRACE_DOMAIN("  _GetNextEphemeral(): trying port %hu...", curr);
-
-		if (_EndpointWithPort(htons(curr)) == NULL) {
-			TRACE_DOMAIN("  _GetNextEphemeral(): ...using port %hu", curr);
-			fLastUsedEphemeral = curr;
-			return curr;
+	for (uint32 i = 0; i < count; i++) {
+		uint16 port = kFirst + (offset + i) % count;
+		if (_EndpointWithPort(htons(port)) == NULL) {
+			TRACE_DOMAIN("  _GetNextEphemeral(): ...using port %hu", port);
+			fLastUsedEphemeral = port;
+			return port;
 		}
 	}
 
