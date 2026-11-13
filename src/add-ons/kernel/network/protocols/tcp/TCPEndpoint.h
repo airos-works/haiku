@@ -177,7 +177,8 @@ private:
 	tcp_sequence	fPreviousHighestAcknowledge;
 	uint32			fDuplicateAcknowledgeCount;
 	uint32			fPreviousFlightSize;
-	uint32			fRecover;
+	tcp_sequence	fRecover;
+		// highest sequence sent when fast recovery began (RFC 6582)
 
 	net_route		*fRoute;
 		// TODO: don't use a net_route, but a net_route_info!!!
@@ -194,7 +195,15 @@ private:
 
 	// round trip time and retransmit timeout computation
 	int32			fSmoothedRoundTripTime;
+		// in ms, derived from fSmoothedRTT
 	int32			fRoundTripVariation;
+	bigtime_t		fSmoothedRTT;
+	bigtime_t		fRTTVariation;
+		// in microseconds; fSmoothedRTT < 0 until the first sample
+	uint32			fBytesAcknowledgedInAvoidance;
+		// congestion avoidance counts bytes (RFC 3465)
+	uint8			fPersistShift;
+		// back-off of the persist timer while the window stays closed
 	uint32			fSendTime;
 	tcp_sequence	fRoundTripStartSequence;
 	bigtime_t		fRetransmitTimeout;

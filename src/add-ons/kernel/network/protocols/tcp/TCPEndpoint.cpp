@@ -558,6 +558,10 @@ TCPEndpoint::TCPEndpoint(net_socket* socket)
 	fReceiveQueue(socket->receive.buffer_size),
 	fSmoothedRoundTripTime(-1),
 	fRoundTripVariation(0),
+	fSmoothedRTT(-1),
+	fRTTVariation(0),
+	fBytesAcknowledgedInAvoidance(0),
+	fPersistShift(0),
 	fSendTime(0),
 	fRoundTripStartSequence(0),
 	fRetransmitTimeout(TCP_SYN_RETRANSMIT_TIMEOUT),
@@ -1725,10 +1729,12 @@ TCPEndpoint::_DuplicateAcknowledge(tcp_segment_header &segment)
 	}
 
 	if (fDuplicateAcknowledgeCount == 3) {
-		if ((segment.acknowledge - 1) > fRecover || (fCongestionWindow > fSendMaxSegmentSize &&
-			(fSendUnacknowledged - fPreviousHighestAcknowledge) <= 4 * fSendMaxSegmentSize)) {
+		if (tcp_sequence(segment.acknowledge - 1) > fRecover
+			|| (fCongestionWindow > fSendMaxSegmentSize
+				&& (fSendUnacknowledged - fPreviousHighestAcknowledge).Number()
+					<= 4 * fSendMaxSegmentSize)) {
 			fFlags |= FLAG_RECOVERY;
-			fRecover = fSendMax.Number() - 1;
+			fRecover = fSendMax - 1;
 			fSlowStartThreshold = max_c(fPreviousFlightSize / 2, 2 * fSendMaxSegmentSize);
 			fCongestionWindow = fSlowStartThreshold + 3 * fSendMaxSegmentSize;
 			fSendNext = segment.acknowledge;
@@ -1926,12 +1932,10 @@ TCPEndpoint::_PrepareReceivePath(tcp_segment_header& segment)
 		}
 	}
 
-	if (fSendMaxSegmentSize > 2190)
-		fCongestionWindow = 2 * fSendMaxSegmentSize;
-	else if (fSendMaxSegmentSize > 1095)
-		fCongestionWindow = 3 * fSendMaxSegmentSize;
-	else
-		fCongestionWindow = 4 * fSendMaxSegmentSize;
+	// RFC 6928: an initial window of ten segments, at most 14600 bytes
+	// unless that is less than two segments
+	fCongestionWindow = min_c(10 * fSendMaxSegmentSize,
+		max_c(2 * fSendMaxSegmentSize, (uint32)14600));
 
 	fSendMaxSegments = fCongestionWindow / fSendMaxSegmentSize;
 	fSlowStartThreshold = (uint32)segment.advertised_window << fSendWindowShift;
@@ -2073,7 +2077,7 @@ TCPEndpoint::_SpawnFromCookie(TCPEndpoint* parent, tcp_segment_header& segment,
 		fInitialSendSequence = initial;
 		fSendUnacknowledged = initial;
 		fSendUrgentOffset = initial;
-		fRecover = initial.Number();
+		fRecover = initial;
 		fSendNext = initial + 1;
 		fSendMax = initial + 1;
 		fSendQueue.SetInitialSequence(initial + 1);
@@ -2254,7 +2258,9 @@ TCPEndpoint::_Receive(tcp_segment_header& segment, net_buffer* buffer)
 		&& segment.AcknowledgeOnly()
 		&& fReceiveNext == segment.sequence
 		&& advertisedWindow > 0 && advertisedWindow == fSendWindow
-		&& fSendNext == fSendMax) {
+		&& fSendNext == fSendMax
+		&& fDuplicateAcknowledgeCount == 0
+		&& (fFlags & FLAG_RECOVERY) == 0) {
 		_UpdateTimestamps(segment, segmentLength);
 
 		if (segmentLength == 0) {
@@ -2457,6 +2463,12 @@ TCPEndpoint::_Receive(tcp_segment_header& segment, net_buffer* buffer)
 	}
 #endif
 
+	// the window before this segment: a segment that changes it is a window
+	// update, not a duplicate ACK (it was compared with itself before)
+	const uint32 previousSendWindow = fSendWindow;
+	if (advertisedWindow > 0)
+		fPersistShift = 0;
+
 	if (fSendWindow < fSendMaxSegmentSize
 			&& (advertisedWindow >= fSendMaxSegmentSize
 				|| advertisedWindow > (TCP_DEFAULT_MAX_SEGMENT_SIZE * 3))) {
@@ -2480,7 +2492,7 @@ TCPEndpoint::_Receive(tcp_segment_header& segment, net_buffer* buffer)
 			return DROP | IMMEDIATE_ACKNOWLEDGE;
 
 		if (segment.acknowledge == fSendUnacknowledged) {
-			if (buffer->size == 0 && advertisedWindow == fSendWindow
+			if (buffer->size == 0 && advertisedWindow == previousSendWindow
 				&& (segment.flags & TCP_FLAG_FINISH) == 0 && fSendUnacknowledged != fSendMax) {
 				TRACE("Receive(): duplicate ack!");
 				_DuplicateAcknowledge(segment);
@@ -2488,17 +2500,8 @@ TCPEndpoint::_Receive(tcp_segment_header& segment, net_buffer* buffer)
 		} else if (segment.acknowledge < fSendUnacknowledged) {
 			return DROP;
 		} else {
-			// this segment acknowledges in flight data
-
-			if (fDuplicateAcknowledgeCount >= 3) {
-				// deflate the window.
-				if (segment.acknowledge > fRecover) {
-					uint32 flightSize = (fSendMax - fSendUnacknowledged).Number();
-					fCongestionWindow = min_c(fSlowStartThreshold,
-						max_c(flightSize, fSendMaxSegmentSize) + fSendMaxSegmentSize);
-					fFlags &= ~FLAG_RECOVERY;
-				}
-			}
+			// this segment acknowledges in flight data; _Acknowledged()
+			// ends fast recovery when it should
 
 			if (fSendMax == segment.acknowledge)
 				TRACE("Receive(): all inflight data ack'd!");
@@ -3257,7 +3260,7 @@ TCPEndpoint::_PrepareSendPath(const sockaddr* peer)
 	fSendUnacknowledged = fInitialSendSequence;
 	fSendMax = fInitialSendSequence;
 	fSendUrgentOffset = fInitialSendSequence;
-	fRecover = fInitialSendSequence.Number();
+	fRecover = fInitialSendSequence;
 
 	// we are counting the SYN here
 	fSendQueue.SetInitialSequence(fSendNext + 1);
@@ -3303,40 +3306,61 @@ TCPEndpoint::_Acknowledged(tcp_segment_header& segment)
 		uint32 flightSize = (fSendMax - fSendUnacknowledged).Number();
 		int32 expectedSamples = flightSize / (fSendMaxSegmentSize << 1);
 
-		if (fPreviousHighestAcknowledge > fSendUnacknowledged) {
-			// need to update the recover variable upon a sequence wraparound
-			fRecover = segment.acknowledge - 1;
-		}
-
-		// the acknowledgment of the SYN/ACK MUST NOT increase the size of the congestion window
-		if (fSendUnacknowledged != fInitialSendSequence) {
-			if (fCongestionWindow < fSlowStartThreshold)
-				fCongestionWindow += min_c(bytesAcknowledged, fSendMaxSegmentSize);
-			else {
-				uint32 increment = fSendMaxSegmentSize * fSendMaxSegmentSize;
-
-				if (increment < fCongestionWindow)
-					increment = 1;
-				else
-					increment /= fCongestionWindow;
-
-				fCongestionWindow += increment;
-			}
-
-			fSendMaxSegments = UINT32_MAX;
-		}
+		// the acknowledgment of the SYN/ACK MUST NOT increase the size of the
+		// congestion window
+		bool synchronizeOnly = fPreviousHighestAcknowledge == fInitialSendSequence
+			&& bytesAcknowledged == 1;
 
 		if ((fFlags & FLAG_RECOVERY) != 0) {
-			fSendNext = fSendUnacknowledged;
-			_SendQueued();
-			fCongestionWindow -= bytesAcknowledged;
+			if (tcp_sequence(segment.acknowledge) > fRecover) {
+				// A full acknowledgement ends fast recovery (RFC 6582 3.2,
+				// step 3). This used to happen in the slow path of
+				// _Receive() only, so an ACK taken by the fast path left
+				// recovery on for good (airos-works/haiku#125).
+				fCongestionWindow = min_c(fSlowStartThreshold,
+					max_c(flightSize, fSendMaxSegmentSize)
+						+ fSendMaxSegmentSize);
+				fFlags &= ~FLAG_RECOVERY;
+				fDuplicateAcknowledgeCount = 0;
+				fBytesAcknowledgedInAvoidance = 0;
+			} else {
+				// a partial acknowledgement: retransmit the next hole and
+				// deflate the window by what was acknowledged (step 4)
+				fSendNext = fSendUnacknowledged;
+				_SendQueued();
+				fSendNext = fSendMax;
 
-			if (bytesAcknowledged > fSendMaxSegmentSize)
-				fCongestionWindow += fSendMaxSegmentSize;
-
-			fSendNext = fSendMax;
-		} else
+				fCongestionWindow = bytesAcknowledged < fCongestionWindow
+					? fCongestionWindow - bytesAcknowledged : 0;
+				if (bytesAcknowledged >= fSendMaxSegmentSize)
+					fCongestionWindow += fSendMaxSegmentSize;
+				fCongestionWindow = max_c(fCongestionWindow,
+					fSendMaxSegmentSize);
+			}
+		} else {
 			fDuplicateAcknowledgeCount = 0;
+
+			if (!synchronizeOnly) {
+				// RFC 3465 byte counting: slow start grows by what was
+				// acknowledged (at most two segments per ACK), congestion
+				// avoidance by one segment per window acknowledged. Counting
+				// ACKs instead slowed growth against receivers that
+				// acknowledge many segments at once.
+				if (fCongestionWindow < fSlowStartThreshold) {
+					fCongestionWindow += min_c(bytesAcknowledged,
+						2 * fSendMaxSegmentSize);
+				} else {
+					fBytesAcknowledgedInAvoidance += bytesAcknowledged;
+					if (fBytesAcknowledgedInAvoidance >= fCongestionWindow) {
+						fBytesAcknowledgedInAvoidance -= fCongestionWindow;
+						fCongestionWindow += fSendMaxSegmentSize;
+					}
+				}
+			}
+		}
+
+		if (!synchronizeOnly)
+			fSendMaxSegments = UINT32_MAX;
 
 		if (fSendNext < fSendUnacknowledged)
 			fSendNext = fSendUnacknowledged;
@@ -3463,7 +3487,8 @@ TCPEndpoint::_Retransmit()
 		gStackModule->set_timer(&fRetransmitTimer, giveUpIn);
 	}
 
-	fRecover = fSendNext.Number() - 1;
+	fRecover = fSendNext - 1;
+	fBytesAcknowledgedInAvoidance = 0;
 	if ((fFlags & FLAG_RECOVERY) != 0)
 		fFlags &= ~FLAG_RECOVERY;
 }
@@ -3475,20 +3500,38 @@ TCPEndpoint::_UpdateRoundTripTime(int32 roundTripTime, int32 expectedSamples)
 	if (roundTripTime < 0)
 		return;
 
-	if (fSmoothedRoundTripTime <= 0) {
-		fSmoothedRoundTripTime = roundTripTime;
-		fRoundTripVariation = roundTripTime / 2;
-		fRetransmitTimeout = (fSmoothedRoundTripTime + max_c(100, fRoundTripVariation * 4))
-				* kTimestampFactor;
+	// RFC 6298 in microseconds. The estimate used to be kept in whole
+	// milliseconds and every correction divided by expectedSamples * 8, so
+	// with much data in flight (2,900 for 1 MiB) a sample had to be seconds
+	// off to move it at all, and the retransmit timeout froze at its first
+	// value (airos-works/haiku#125). RFC 7323 appendix G still scales the
+	// gains down for the many samples per round trip timestamps give, but
+	// no further than to an eighth.
+	bigtime_t sample = (bigtime_t)roundTripTime * kTimestampFactor;
+	if (sample == 0)
+		sample = kTimestampFactor / 2;
+		// below the clock's resolution
+	if (expectedSamples < 1)
+		expectedSamples = 1;
+	else if (expectedSamples > 8)
+		expectedSamples = 8;
+
+	if (fSmoothedRTT < 0) {
+		fSmoothedRTT = sample;
+		fRTTVariation = sample / 2;
 	} else {
-		int32 delta = fSmoothedRoundTripTime - roundTripTime;
+		bigtime_t delta = fSmoothedRTT - sample;
 		if (delta < 0)
 			delta = -delta;
-		fRoundTripVariation += (delta - fRoundTripVariation) / (expectedSamples * 4);
-		fSmoothedRoundTripTime += (roundTripTime - fSmoothedRoundTripTime) / (expectedSamples * 8);
-		fRetransmitTimeout = (fSmoothedRoundTripTime + max_c(100, fRoundTripVariation * 4))
-			* kTimestampFactor;
+		fRTTVariation += (delta - fRTTVariation) / (expectedSamples * 4);
+		fSmoothedRTT += (sample - fSmoothedRTT) / (expectedSamples * 8);
 	}
+
+	fSmoothedRoundTripTime = max_c((int32)(fSmoothedRTT / kTimestampFactor),
+		(int32)1);
+	fRoundTripVariation = (int32)(fRTTVariation / kTimestampFactor);
+	fRetransmitTimeout = fSmoothedRTT
+		+ max_c((bigtime_t)100 * kTimestampFactor, 4 * fRTTVariation);
 
 	if (fRetransmitTimeout > TCP_MAX_RETRANSMIT_TIMEOUT)
 		fRetransmitTimeout = TCP_MAX_RETRANSMIT_TIMEOUT;
@@ -3549,6 +3592,19 @@ TCPEndpoint::_PersistTimer(net_timer* timer, void* _endpoint)
 		return;
 
 	endpoint->_SendQueued(true);
+
+	// Keep probing, backing off, while the window stays closed and data
+	// waits: a lost window update used to stall the connection after the
+	// one probe (airos-works/haiku#125).
+	if (endpoint->fSendWindow == 0
+		&& endpoint->fSendQueue.Available(endpoint->fSendNext) > 0
+		&& !gStackModule->is_timer_active(&endpoint->fPersistTimer)
+		&& !gStackModule->is_timer_active(&endpoint->fRetransmitTimer)) {
+		if (endpoint->fPersistShift < 6)
+			endpoint->fPersistShift++;
+		gStackModule->set_timer(&endpoint->fPersistTimer,
+			TCP_PERSIST_TIMEOUT << endpoint->fPersistShift);
+	}
 }
 
 
