@@ -30,7 +30,12 @@
 #endif
 
 
-static struct list sTimers;
+// The pending timers, in a pairing heap ordered by due time: adding a timer
+// is O(1), taking the next one or removing any is O(log n) amortized. The
+// list scanned in full on every wake-up before made thousands of timers
+// (connections in TIME_WAIT) slow down every other timer of the stack
+// (airos-works/haiku#121).
+static net_timer* sTimerHeap;
 static mutex sTimerLock;
 static sem_id sTimerWaitSem;
 static ConditionVariable sWaitForTimerCondition;
@@ -323,6 +328,103 @@ fifo_socket_enqueue_buffer(net_fifo* fifo, net_socket* socket, uint8 event,
 //	#pragma mark - Timer
 
 
+static inline bool
+timer_is_earlier(const net_timer* a, const net_timer* b)
+{
+	return a->due < b->due;
+}
+
+
+/*!	Melds two heaps whose roots have no siblings and no parent. */
+static net_timer*
+timer_heap_meld(net_timer* a, net_timer* b)
+{
+	if (a == NULL)
+		return b;
+	if (b == NULL)
+		return a;
+
+	if (timer_is_earlier(b, a)) {
+		net_timer* swap = a;
+		a = b;
+		b = swap;
+	}
+
+	// b becomes the first child of a
+	b->heap_next = a->heap_child;
+	if (a->heap_child != NULL)
+		a->heap_child->heap_previous = b;
+	b->heap_previous = a;
+	a->heap_child = b;
+	return a;
+}
+
+
+/*!	Melds the sibling list starting at \a first into one heap (the classic
+	two passes, without recursion).
+*/
+static net_timer*
+timer_heap_merge_pairs(net_timer* first)
+{
+	net_timer* pairs = NULL;
+	while (first != NULL) {
+		net_timer* a = first;
+		net_timer* b = a->heap_next;
+		first = b != NULL ? b->heap_next : NULL;
+
+		a->heap_next = a->heap_previous = NULL;
+		if (b != NULL)
+			b->heap_next = b->heap_previous = NULL;
+
+		net_timer* melded = timer_heap_meld(a, b);
+		melded->heap_next = pairs;
+		pairs = melded;
+	}
+
+	net_timer* result = NULL;
+	while (pairs != NULL) {
+		net_timer* next = pairs->heap_next;
+		pairs->heap_next = NULL;
+		result = timer_heap_meld(result, pairs);
+		pairs = next;
+	}
+
+	return result;
+}
+
+
+static void
+timer_heap_add(net_timer* timer)
+{
+	timer->heap_next = timer->heap_previous = timer->heap_child = NULL;
+	sTimerHeap = timer_heap_meld(sTimerHeap, timer);
+}
+
+
+static void
+timer_heap_remove(net_timer* timer)
+{
+	if (timer == sTimerHeap) {
+		sTimerHeap = timer_heap_merge_pairs(timer->heap_child);
+		timer->heap_child = NULL;
+		return;
+	}
+
+	// unlink it from its parent's list of children
+	net_timer* previous = timer->heap_previous;
+	if (previous->heap_child == timer)
+		previous->heap_child = timer->heap_next;
+	else
+		previous->heap_next = timer->heap_next;
+	if (timer->heap_next != NULL)
+		timer->heap_next->heap_previous = previous;
+
+	net_timer* children = timer_heap_merge_pairs(timer->heap_child);
+	timer->heap_next = timer->heap_previous = timer->heap_child = NULL;
+	sTimerHeap = timer_heap_meld(sTimerHeap, children);
+}
+
+
 static status_t
 timer_thread(void* /*data*/)
 {
@@ -332,35 +434,26 @@ timer_thread(void* /*data*/)
 		bigtime_t timeout = B_INFINITE_TIMEOUT;
 
 		if (status == B_TIMED_OUT || status == B_OK) {
-			// scan timers for new timeout and/or execute a timer
+			// execute the timers that are due, and find the next timeout
 			mutex_lock(&sTimerLock);
 
-			struct net_timer* timer = NULL;
-			while (true) {
-				timer = (net_timer*)list_get_next_item(&sTimers, timer);
-				if (timer == NULL)
+			while (sTimerHeap != NULL) {
+				net_timer* timer = sTimerHeap;
+				if (timer->due > system_time()) {
+					timeout = timer->due;
 					break;
-
-				if (timer->due < system_time()) {
-					// execute timer
-					list_remove_item(&sTimers, timer);
-					timer->due = -1;
-					sCurrentTimer = timer;
-
-					mutex_unlock(&sTimerLock);
-					timer->hook(timer, timer->data);
-					mutex_lock(&sTimerLock);
-
-					sCurrentTimer = NULL;
-					sWaitForTimerCondition.NotifyAll();
-
-					timer = NULL;
-						// restart scanning as we unlocked the list
-				} else {
-					// calculate new timeout
-					if (timer->due < timeout)
-						timeout = timer->due;
 				}
+
+				timer_heap_remove(timer);
+				timer->due = -1;
+				sCurrentTimer = timer;
+
+				mutex_unlock(&sTimerLock);
+				timer->hook(timer, timer->data);
+				mutex_lock(&sTimerLock);
+
+				sCurrentTimer = NULL;
+				sWaitForTimerCondition.NotifyAll();
 			}
 
 			sTimerTimeout = timeout;
@@ -387,6 +480,7 @@ timer_thread(void* /*data*/)
 void
 init_timer(net_timer* timer, net_timer_func hook, void* data)
 {
+	timer->heap_next = timer->heap_previous = timer->heap_child = NULL;
 	timer->hook = hook;
 	timer->data = data;
 	timer->due = 0;
@@ -409,18 +503,17 @@ set_timer(net_timer* timer, bigtime_t delay)
 
 	TRACE("set_timer %p, hook %p, data %p\n", timer, timer->hook, timer->data);
 
-	if (timer->due > 0 && delay < 0) {
-		// this timer is scheduled, cancel it
-		list_remove_item(&sTimers, timer);
+	if (timer->due > 0) {
+		// this timer is scheduled: take it out, it is cancelled or moves
+		timer_heap_remove(timer);
 		timer->due = 0;
 	}
 
 	if (delay >= 0) {
-		// reschedule or add this timer
-		if (timer->due <= 0)
-			list_add_item(&sTimers, timer);
-
-		timer->due = system_time() + delay;
+		// (re)schedule this timer; a due time of 0 or less means "not
+		// scheduled", so it is at least 1
+		timer->due = max_c(system_time() + delay, 1);
+		timer_heap_add(timer);
 
 		// notify timer about the change if necessary
 		if (sTimerTimeout > timer->due)
@@ -441,7 +534,7 @@ cancel_timer(struct net_timer* timer)
 		return false;
 
 	// this timer is scheduled, cancel it
-	list_remove_item(&sTimers, timer);
+	timer_heap_remove(timer);
 	timer->due = 0;
 	return true;
 }
@@ -493,15 +586,31 @@ dump_timer(int argc, char** argv)
 {
 	kprintf("timer       hook        data        due in\n");
 
-	struct net_timer* timer = NULL;
-	while (true) {
-		timer = (net_timer*)list_get_next_item(&sTimers, timer);
-		if (timer == NULL)
-			break;
-
+	// walk the heap depth first: children, then siblings
+	struct net_timer* timer = sTimerHeap;
+	int32 count = 0;
+	while (timer != NULL) {
 		kprintf("%p  %p  %p  %" B_PRId64 "\n", timer, timer->hook, timer->data,
 			timer->due > 0 ? timer->due - system_time() : -1);
+		count++;
+
+		if (timer->heap_child != NULL) {
+			timer = timer->heap_child;
+			continue;
+		}
+		while (timer != NULL && timer->heap_next == NULL) {
+			// back up to the first ancestor that has a next sibling
+			net_timer* previous = timer->heap_previous;
+			while (previous != NULL && previous->heap_child != timer) {
+				timer = previous;
+				previous = timer->heap_previous;
+			}
+			timer = previous;
+		}
+		if (timer != NULL)
+			timer = timer->heap_next;
 	}
+	kprintf("%" B_PRId32 " timers\n", count);
 
 	return 0;
 }
@@ -510,7 +619,7 @@ dump_timer(int argc, char** argv)
 status_t
 init_timers(void)
 {
-	list_init(&sTimers);
+	sTimerHeap = NULL;
 	sTimerTimeout = B_INFINITE_TIMEOUT;
 
 	status_t status = B_OK;
@@ -522,8 +631,10 @@ init_timers(void)
 		goto err1;
 	}
 
+	// above the receive threads: timers send ACKs and retransmissions,
+	// and their hooks are short
 	sTimerThread = spawn_kernel_thread(timer_thread, "net timer",
-		B_NORMAL_PRIORITY, NULL);
+		B_URGENT_DISPLAY_PRIORITY, NULL);
 	if (sTimerThread < B_OK) {
 		status = sTimerThread;
 		goto err2;

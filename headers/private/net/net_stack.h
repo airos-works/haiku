@@ -40,7 +40,10 @@ typedef struct net_fifo {
 typedef void (*net_timer_func)(struct net_timer* timer, void* data);
 
 typedef struct net_timer {
-	struct list_link link;
+	// pairing heap links, ordered by due time (private to the stack)
+	struct net_timer* heap_next;
+	struct net_timer* heap_previous;
+	struct net_timer* heap_child;
 	net_timer_func	hook;
 	void*			data;
 	bigtime_t		due;

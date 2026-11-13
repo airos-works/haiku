@@ -1286,15 +1286,24 @@ TCPEndpoint::DelayedAcknowledge()
 	// ACKs "MUST" be generated within 500ms of the first unACKed packet, and
 	// "SHOULD" be for at least every second full-size segment. (RFC 5681 § 4.2)
 
-	bigtime_t delay = TCP_DELAYED_ACKNOWLEDGE_TIMEOUT;
-	if ((fReceiveNext - fLastAcknowledgeSent) >= (fReceiveMaxSegmentSize * 2)) {
-		// Trigger an immediate timeout rather than invoking Send directly,
-		// allowing multiple invocations to be coalesced.
-		delay = 0;
-	} else if (gStackModule->is_timer_active(&fDelayedAcknowledgeTimer)) {
-		return B_OK;
+	// a full-size segment carries the timestamp option, if it is used
+	uint32 segmentSize = fReceiveMaxSegmentSize;
+	if ((fFlags & FLAG_OPTION_TIMESTAMP) != 0 && segmentSize > 12)
+		segmentSize -= 12;
+
+	if ((fReceiveNext - fLastAcknowledgeSent).Number() >= segmentSize * 2) {
+		// Acknowledge every second full-size segment right away. This used
+		// to set the delayed ACK timer to 0 instead, so that every ACK of a
+		// bulk transfer waited for the stack's one timer thread, and a
+		// slow timer thread (thousands of timers) throttled every download
+		// (airos-works/haiku#121).
+		return _SendAcknowledge();
 	}
 
+	if (gStackModule->is_timer_active(&fDelayedAcknowledgeTimer))
+		return B_OK;
+
+	bigtime_t delay = TCP_DELAYED_ACKNOWLEDGE_TIMEOUT;
 	gStackModule->set_timer(&fDelayedAcknowledgeTimer, delay);
 	T(TimerSet(this, "delayed ack", TCP_DELAYED_ACKNOWLEDGE_TIMEOUT));
 	return B_OK;
