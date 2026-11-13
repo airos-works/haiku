@@ -199,13 +199,14 @@ ethernet_up(net_device *_device)
 		device->frame_size = ETHER_MAX_FRAME_SIZE;
 	}
 
-#if 1
-	// The network stack does not handle path MTU discovery correctly at present,
-	// so don't report frame sizes larger than the standard ethernet maximum.
-	// (We will still handle receiving frames larger than this.)
-	if (device->frame_size > ETHER_MAX_FRAME_SIZE)
+	// Larger frames need a driver that passes net_buffers: the read() path
+	// below needs a frame in one contiguous block. With such a driver, the
+	// MTU still starts at the standard 1500 (see below), and "ifconfig <if>
+	// mtu <n>" can raise it up to what the driver supports
+	// (airos-works/haiku#124).
+	if (!device->supports_net_buffer
+		&& device->frame_size > ETHER_MAX_FRAME_SIZE)
 		device->frame_size = ETHER_MAX_FRAME_SIZE;
-#endif
 
 	// Report the link state found at open: taking the interface down and up
 	// closes and reopens the device, and the link usually comes back a
@@ -234,7 +235,8 @@ ethernet_up(net_device *_device)
 	}
 
 	device->address.length = ETHER_ADDRESS_LENGTH;
-	device->mtu = device->frame_size - device->header_length;
+	device->mtu = min_c(device->frame_size, (uint32)ETHER_MAX_FRAME_SIZE)
+		- device->header_length;
 	return B_OK;
 
 err:

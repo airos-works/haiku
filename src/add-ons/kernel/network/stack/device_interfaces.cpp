@@ -93,57 +93,69 @@ device_reader_thread(void* _interface)
 }
 
 
+/*!	Takes all frames the reader thread queued at once and runs them through
+	the stack: one lock round on the queue and one on the handler list per
+	batch, instead of one each per frame (airos-works/haiku#123).
+*/
 static status_t
 device_consumer_thread(void* _interface)
 {
 	net_device_interface* interface = (net_device_interface*)_interface;
 	net_device* device = interface->device;
-	net_buffer* buffer;
+
+	struct list batch;
+	list_init_etc(&batch, offsetof(net_buffer, link));
 
 	while (atomic_get(&interface->ref_count) > 0) {
-		ssize_t status = fifo_dequeue_buffer(&interface->receive_queue, 0,
-			B_INFINITE_TIMEOUT, &buffer);
+		status_t status = fifo_dequeue_all(&interface->receive_queue, &batch);
 		if (status != B_OK) {
 			if (status == B_INTERRUPTED)
 				continue;
 			break;
 		}
 
-		if (buffer->interface_address != NULL) {
-			// If the interface is already specified, this buffer was
-			// delivered locally.
-			if (buffer->interface_address->domain->module->receive_data(buffer)
-					== B_OK)
-				buffer = NULL;
-		} else {
-			sockaddr_dl& linkAddress = *(sockaddr_dl*)buffer->source;
-			int32 genericType = buffer->type;
-			int32 specificType = B_NET_FRAME_TYPE(linkAddress.sdl_type,
-				ntohs(linkAddress.sdl_e_type));
+		RecursiveLocker locker(interface->receive_lock);
 
-			buffer->index = interface->device->index;
-
-			// Find handler for this packet
-
-			RecursiveLocker locker(interface->receive_lock);
-
-			DeviceHandlerList::Iterator iterator
-				= interface->receive_funcs.GetIterator();
-			while (buffer != NULL && iterator.HasNext()) {
-				net_device_handler* handler = iterator.Next();
-
-				// If the handler returns B_OK, it consumed the buffer - first
-				// handler wins.
-				if ((handler->type == genericType
-						|| handler->type == specificType)
-					&& handler->func(handler->cookie, device, buffer) == B_OK)
+		while (net_buffer* buffer
+				= (net_buffer*)list_remove_head_item(&batch)) {
+			if (buffer->interface_address != NULL) {
+				// If the interface is already specified, this buffer was
+				// delivered locally.
+				if (buffer->interface_address->domain->module->receive_data(
+						buffer) == B_OK)
 					buffer = NULL;
-			}
-		}
+			} else {
+				sockaddr_dl& linkAddress = *(sockaddr_dl*)buffer->source;
+				int32 genericType = buffer->type;
+				int32 specificType = B_NET_FRAME_TYPE(linkAddress.sdl_type,
+					ntohs(linkAddress.sdl_e_type));
 
-		if (buffer != NULL)
-			gNetBufferModule.free(buffer);
+				buffer->index = interface->device->index;
+
+				// Find handler for this packet
+				DeviceHandlerList::Iterator iterator
+					= interface->receive_funcs.GetIterator();
+				while (buffer != NULL && iterator.HasNext()) {
+					net_device_handler* handler = iterator.Next();
+
+					// If the handler returns B_OK, it consumed the buffer -
+					// first handler wins.
+					if ((handler->type == genericType
+							|| handler->type == specificType)
+						&& handler->func(handler->cookie, device, buffer)
+							== B_OK)
+						buffer = NULL;
+				}
+			}
+
+			if (buffer != NULL)
+				gNetBufferModule.free(buffer);
+		}
 	}
+
+	// free what is left if we were asked to quit with frames queued
+	while (net_buffer* buffer = (net_buffer*)list_remove_head_item(&batch))
+		gNetBufferModule.free(buffer);
 
 	return B_OK;
 }
@@ -217,8 +229,10 @@ allocate_device_interface(net_device* device, net_device_module_info* module)
 	snprintf(name, sizeof(name), "%s consumer", device->name);
 
 	interface->reader_thread   = -1;
+	// above the user interface: all IP and TCP input of the interface runs
+	// here (airos-works/haiku#123)
 	interface->consumer_thread = spawn_kernel_thread(device_consumer_thread,
-		name, B_DISPLAY_PRIORITY, interface);
+		name, B_URGENT_DISPLAY_PRIORITY, interface);
 	if (interface->consumer_thread < B_OK)
 		goto error2;
 	resume_thread(interface->consumer_thread);

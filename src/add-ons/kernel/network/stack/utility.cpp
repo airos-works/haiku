@@ -14,6 +14,7 @@
 
 #include <condition_variable.h>
 #include <kernel.h>
+#include <string.h>
 #include <unistd.h>
 #include <net_buffer.h>
 #include <syscall_restart.h>
@@ -105,36 +106,56 @@ UserBuffer::PadToNext(size_t length)
 // #pragma mark -
 
 
+/*!	The one's complement sum of \a length bytes, folded to 16 bits, in host
+	order. Adds 32-bit words into a 64-bit accumulator, eight at a time: the
+	one's complement sum does not depend on the word size once the carries
+	are folded back in. The 16-bit loop this replaces was 4 % of a sending
+	thread's time (airos-works/haiku#124).
+*/
 uint16
-compute_checksum(uint8* _buffer, size_t length)
+compute_checksum(uint8* buffer, size_t length)
 {
-	uint16* buffer = (uint16*)_buffer;
-	uint32 sum = 0;
+	uint64 sum = 0;
 
-	// TODO: unfold loop for speed
-	// TODO: write processor dependent version for speed
-	while (length >= 2) {
-		sum += *buffer++;
+	while (length >= 32) {
+		uint32 words[8];
+		memcpy(words, buffer, sizeof(words));
+		sum += (uint64)words[0] + words[1] + words[2] + words[3];
+		sum += (uint64)words[4] + words[5] + words[6] + words[7];
+		buffer += 32;
+		length -= 32;
+	}
+	while (length >= 4) {
+		uint32 word;
+		memcpy(&word, buffer, sizeof(word));
+		sum += word;
+		buffer += 4;
+		length -= 4;
+	}
+	if (length >= 2) {
+		uint16 half;
+		memcpy(&half, buffer, sizeof(half));
+		sum += half;
+		buffer += 2;
 		length -= 2;
 	}
-
 	if (length) {
 		// give the last byte it's proper endian-aware treatment
 #if B_HOST_IS_LENDIAN
-		sum += *(uint8*)buffer;
+		sum += *buffer;
 #else
-		uint8 ordered[2];
-		ordered[0] = *(uint8*)buffer;
-		ordered[1] = 0;
-		sum += *(uint16*)ordered;
+		sum += (uint16)*buffer << 8;
 #endif
 	}
 
-	while (sum >> 16) {
-		sum = (sum & 0xffff) + (sum >> 16);
-	}
+	// fold 64 -> 32 -> 16 bits
+	sum = (sum & 0xffffffff) + (sum >> 32);
+	sum = (sum & 0xffffffff) + (sum >> 32);
+	sum = (sum & 0xffff) + (sum >> 16);
+	sum = (sum & 0xffff) + (sum >> 16);
+	sum = (sum & 0xffff) + (sum >> 16);
 
-	return sum;
+	return (uint16)sum;
 }
 
 
@@ -284,6 +305,31 @@ fifo_dequeue_buffer(net_fifo* fifo, uint32 flags, bigtime_t timeout,
 		fifo_notify_one_reader(fifo->waiting, fifo->notify);
 
 	return status;
+}
+
+
+/*!	Waits until the FIFO holds buffers, then moves all of them to \a buffers
+	(an initialized, empty list) under one lock round.
+*/
+status_t
+fifo_dequeue_all(net_fifo* fifo, struct list* buffers)
+{
+	MutexLocker locker(fifo->lock);
+
+	while (list_is_empty(&fifo->buffers)) {
+		fifo->waiting++;
+		locker.Unlock();
+
+		status_t status = acquire_sem_etc(fifo->notify, 1, B_CAN_INTERRUPT, 0);
+		if (status < B_OK)
+			return status;
+
+		locker.Lock();
+	}
+
+	list_move_to_list(&fifo->buffers, buffers);
+	fifo->current_bytes = 0;
+	return B_OK;
 }
 
 

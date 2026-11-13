@@ -233,6 +233,9 @@ static net_secret sPacketIDSecret;
 
 static RawSocketList sRawSockets;
 static mutex sRawSocketsLock;
+static int32 sRawSocketCount;
+	// read without the lock: every received packet checks it, and there
+	// are rarely any raw sockets (airos-works/haiku#123)
 static mutex sFragmentLock;
 static FragmentTable sFragmentHash;
 static FragmentAgeList sFragmentAge;
@@ -849,6 +852,9 @@ deliver_multicast(net_protocol_module_info* module, net_buffer* buffer,
 static bool
 raw_receive_data(net_buffer* buffer)
 {
+	if (atomic_get(&sRawSocketCount) == 0)
+		return false;
+
 	MutexLocker locker(sRawSocketsLock);
 
 	if (sRawSockets.IsEmpty())
@@ -1232,6 +1238,7 @@ ipv4_open(net_protocol* _protocol)
 
 	MutexLocker locker(sRawSocketsLock);
 	sRawSockets.Add(raw);
+	atomic_add(&sRawSocketCount, 1);
 	return B_OK;
 }
 
@@ -1248,6 +1255,7 @@ ipv4_close(net_protocol* _protocol)
 
 	MutexLocker locker(sRawSocketsLock);
 	sRawSockets.Remove(raw);
+	atomic_add(&sRawSocketCount, -1);
 	delete raw;
 	protocol->raw = NULL;
 
