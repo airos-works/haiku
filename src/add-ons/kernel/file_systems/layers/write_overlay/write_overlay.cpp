@@ -193,6 +193,7 @@ public:
 
 private:
 		void				_TrimBuffers();
+		void				_SetCacheSize();
 
 		status_t			_PopulateStat();
 		status_t			_PopulateDirents();
@@ -526,6 +527,7 @@ OverlayInode::WriteStat(const struct stat *stat, uint32 statMask)
 			if (!fIsDataModified)
 				SetDataModified();
 			_TrimBuffers();
+			_SetCacheSize();
 		}
 	}
 
@@ -588,6 +590,7 @@ OverlayInode::Open(int openMode, void **_cookie)
 		if ((openMode & O_TRUNC) && fStat.st_size != 0) {
 			fStat.st_size = 0;
 			_TrimBuffers();
+			_SetCacheSize();
 
 			notify_stat_changed(SuperVolume()->id, -1, fInodeNumber, B_STAT_SIZE);
 		}
@@ -603,6 +606,7 @@ OverlayInode::Open(int openMode, void **_cookie)
 		if (fStat.st_size != 0) {
 			fStat.st_size = 0;
 			_TrimBuffers();
+			_SetCacheSize();
 			if (!fIsDataModified)
 				SetDataModified();
 
@@ -1211,6 +1215,19 @@ OverlayInode::RemoveEntry(const char *name, overlay_dirent **_entry,
 	}
 
 	return B_ENTRY_NOT_FOUND;
+}
+
+
+/*!	Tells the (disabled) file cache about a new size. Its VMCache still holds
+	the pages mappings of the file read: without this, a file truncated and
+	written again kept the old pages up to the size of its first new write,
+	and mmap() showed the old data there.
+*/
+void
+OverlayInode::_SetCacheSize()
+{
+	if (fFileCache != NULL)
+		file_cache_set_size(fFileCache, fStat.st_size);
 }
 
 
