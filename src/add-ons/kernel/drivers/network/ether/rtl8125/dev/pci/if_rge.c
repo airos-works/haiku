@@ -3946,6 +3946,52 @@ rge_txstart(void *arg)
 	RGE_WRITE_2(sc, RGE_TXSTART, RGE_TXSTART_START);
 }
 
+#ifdef __HAIKU__
+#include <vm/vm.h>
+
+/* Frames the chip dropped because the receive ring was full are only in its
+ * tally counters. Every tick asks the chip to write them to memory and reads
+ * what the previous tick asked for, so nothing waits; the increase of the
+ * missed-packet count goes to the interface's input drops, which ifconfig
+ * shows (airos-works/haiku#122). */
+static void
+rge_haiku_count_missed(struct rge_softc *sc)
+{
+	struct ifnet *ifp = &sc->sc_arpcom.ac_if;
+	uint64_t addr;
+
+	if (sc->rge_haiku_tally == NULL) {
+		/* room for the longer layout of the RTL8125's extended tally */
+		sc->rge_haiku_tally = kernel_contigmalloc(256,
+		    M_DEVBUF, M_NOWAIT | M_ZERO, 0, ~(vm_paddr_t)0,
+		    RGE_STATS_ALIGNMENT, 0);
+		if (sc->rge_haiku_tally == NULL)
+			return;
+	}
+
+	/* The buffer is filled with ones before each request: a request the
+	 * chip did not carry out (it ignores some while it starts) leaves them,
+	 * and must not become the base, or every frame missed since power-on
+	 * would be counted at once. */
+	if (sc->rge_haiku_tally_state != 0
+		&& sc->rge_haiku_tally->rge_rx_ok != UINT64_MAX) {
+		uint16_t missed = le16toh(sc->rge_haiku_tally->rge_miss_pkt);
+		if (sc->rge_haiku_tally_state == 2)
+			ifp->if_iqdrops += (uint16_t)(missed - sc->rge_haiku_missed);
+		sc->rge_haiku_missed = missed;
+		sc->rge_haiku_tally_state = 2;
+	}
+	memset(sc->rge_haiku_tally, 0xff, sizeof(struct rge_stats));
+
+	/* the dump command (bit 3) in the low address register */
+	addr = vtophys(sc->rge_haiku_tally);
+	RGE_WRITE_4(sc, 0x14, RGE_ADDR_HI(addr));
+	RGE_WRITE_4(sc, 0x10, RGE_ADDR_LO(addr) | (1U << 3));
+	if (sc->rge_haiku_tally_state == 0)
+		sc->rge_haiku_tally_state = 1;
+}
+#endif
+
 void
 rge_tick(void *arg)
 {
@@ -3954,6 +4000,9 @@ rge_tick(void *arg)
 
 	s = splnet();
 	rge_link_state(sc);
+#ifdef __HAIKU__
+	rge_haiku_count_missed(sc);
+#endif
 	splx(s);
 
 	timeout_add_sec(&sc->sc_timeout, 1);

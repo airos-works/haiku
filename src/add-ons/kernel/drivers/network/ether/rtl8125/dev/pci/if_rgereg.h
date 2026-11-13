@@ -455,6 +455,9 @@ struct rge_softc {
 	uint32_t		rge_intrs;
 #ifdef __HAIKU__
 	int32_t			rge_haiku_intr_count;
+	struct rge_stats	*rge_haiku_tally;	/* chip counters, DMA */
+	uint16_t		rge_haiku_missed;	/* last missed count */
+	int			rge_haiku_tally_state;
 #endif
 	int			rge_timerintr;
 #define RGE_IMTYPE_NONE		0
