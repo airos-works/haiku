@@ -836,7 +836,15 @@ rge_start(struct ifqueue *ifq)
 	ifp->if_timer = 5;
 
 	q->q_tx.rge_txq_prodidx = idx;
+#ifdef __HAIKU__
+	/* rge_txstart() writes one register. The compatibility layer runs
+	 * ifq_serialize()'s task on the taskqueue thread, so every frame sent
+	 * cost a thread wake-up; the callers hold Giant already
+	 * (airos-works/haiku#122). */
+	rge_txstart(sc);
+#else
 	ifq_serialize(ifq, &sc->sc_task);
+#endif
 }
 
 void
@@ -1718,7 +1726,11 @@ rge_txeof(struct rge_queues *q)
 		ifq_restart(&ifp->if_snd);
 #endif
 	else if (free == 2)
+#ifdef __HAIKU__
+		rge_txstart(sc);
+#else
 		ifq_serialize(&ifp->if_snd, &sc->sc_task);
+#endif
 	else
 		ifp->if_timer = 0;
 
