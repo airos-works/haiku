@@ -1725,13 +1725,19 @@ rge_txeof(struct rge_queues *q)
 
 	q->q_tx.rge_txq_considx = idx;
 
-	if (ifq_is_oactive(&ifp->if_snd))
+	if (ifq_is_oactive(&ifp->if_snd)) {
 #ifdef __FreeBSD_version
+		/* Clear oactive first, as OpenBSD's ifq_restart() does: the
+		 * output path (IFQ_HANDOFF) does not start a queue marked
+		 * active, so once the ring had been full, frames queued after it
+		 * drained were never sent and the interface fell silent for good
+		 * (airos-works/haiku#122). */
+		ifq_clr_oactive(&ifp->if_snd);
 		if_start(ifp);
 #else
 		ifq_restart(&ifp->if_snd);
 #endif
-	else if (free == 2)
+	} else if (free == 2)
 #ifdef __HAIKU__
 		rge_txstart(sc);
 #else
