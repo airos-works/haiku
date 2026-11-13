@@ -120,6 +120,7 @@ private:
 			void		_UpdateTimestamps(tcp_segment_header& segment,
 							size_t segmentLength);
 			void		_UpdateReceiveBuffer();
+			void		_UpdateSendBuffer();
 			void		_MarkEstablished();
 			status_t	_WaitForEstablished(MutexLocker& lock,
 							bigtime_t timeout);

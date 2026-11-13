@@ -328,10 +328,16 @@ enum {
 	FLAG_AUTO_RECEIVE_BUFFER_SIZE = 0x100,
 	FLAG_CAN_NOTIFY 			= 0x200,
 	FLAG_USER_CLOSED			= 0x400,
-	FLAG_WAS_ESTABLISHED		= 0x800
+	FLAG_WAS_ESTABLISHED		= 0x800,
 		// this connection reached ESTABLISHED; a send() once it is CLOSED
 		// without a pending error then fails with EPIPE, not ENOTCONN
+	FLAG_AUTO_SEND_BUFFER_SIZE	= 0x1000
+		// the send queue grows with the congestion window, until the
+		// application sets SO_SNDBUF
 };
+
+// what the send queue may grow to by itself (Linux's tcp_wmem maximum)
+static const size_t kMaxAutoSendBufferSize = 4 * 1024 * 1024;
 
 
 static const int kTimestampFactor = 1000;
@@ -583,7 +589,8 @@ TCPEndpoint::TCPEndpoint(net_socket* socket)
 	fSlowStartThreshold(0),
 	fState(CLOSED),
 	fFlags(FLAG_OPTION_WINDOW_SCALE | FLAG_OPTION_TIMESTAMP
-		| FLAG_OPTION_SACK_PERMITTED | FLAG_AUTO_RECEIVE_BUFFER_SIZE)
+		| FLAG_OPTION_SACK_PERMITTED | FLAG_AUTO_RECEIVE_BUFFER_SIZE
+		| FLAG_AUTO_SEND_BUFFER_SIZE)
 {
 	// TODO: to be replaced with a real read/write locking strategy!
 	mutex_init(&fLock, "tcp lock");
@@ -1231,6 +1238,7 @@ TCPEndpoint::SetSendBufferSize(size_t length)
 {
 	MutexLocker _(fLock);
 	fSendQueue.SetMaxBytes(length);
+	fFlags &= ~FLAG_AUTO_SEND_BUFFER_SIZE;
 	return B_OK;
 }
 
@@ -1917,6 +1925,41 @@ TCPEndpoint::_UpdateTimestamps(tcp_segment_header& segment,
 			&& fLastAcknowledgeSent < (sequence + segmentLength))
 			fReceivedTimestamp = segment.timestamp_value;
 	}
+}
+
+
+/*!	Grows the send queue of a connection whose application keeps it full,
+	so that it holds two congestion windows: one in flight, and one the
+	application fills meanwhile. With the fixed 64 KB, one connection could
+	not have more than 64 KB in flight, which capped an upload at 3 Gbit/s on
+	a LAN (airos-works/haiku#125). Linux does the same (tcp_sndbuf_expand()).
+*/
+void
+TCPEndpoint::_UpdateSendBuffer()
+{
+	if ((fFlags & FLAG_AUTO_SEND_BUFFER_SIZE) == 0
+		|| fSendQueue.Size() >= kMaxAutoSendBufferSize)
+		return;
+
+	// only while the application is waiting for room
+	if (fSendQueue.Free() > fSendQueue.Size() / 2)
+		return;
+
+	uint32 window = fCongestionWindow;
+	if (fSendMaxWindow > 0 && fSendMaxWindow < window)
+		window = fSendMaxWindow;
+
+	size_t target = min_c((size_t)window * 2, kMaxAutoSendBufferSize);
+	if (target <= fSendQueue.Size())
+		return;
+
+	if (low_resource_state(B_KERNEL_RESOURCE_MEMORY) != B_NO_LOW_RESOURCE)
+		return;
+
+	fSendQueue.SetMaxBytes(target);
+	socket->send.buffer_size = target;
+		// what SO_SNDBUF reports, and how much of a write the socket layer
+		// hands over at once
 }
 
 
@@ -3606,6 +3649,8 @@ TCPEndpoint::_Acknowledged(tcp_segment_header& segment)
 			gStackModule->set_timer(&fRetransmitTimer, fRetransmitTimeout);
 			T(TimerSet(this, "retransmit", fRetransmitTimeout));
 		}
+
+		_UpdateSendBuffer();
 
 		if (is_writable(fState)) {
 			// notify threads waiting on the socket to become writable again
