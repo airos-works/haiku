@@ -1,0 +1,78 @@
+From 2e046a91f8fccc8cf18f43d43171451febc5b395 Mon Sep 17 00:00:00 2001
+From: Justin Gasper <jmgasper@gmail.com>
+Date: Fri, 13 Nov 2026 18:57:48 +1100
+Subject: [PATCH] zink: a screen that could not be made leaves no thread behind
+
+zink_internal_create_screen() starts the "zfq" flush queue first thing and
+only then looks for a Vulkan device. Where there is none (a VM, or any
+machine without a Vulkan driver for its GPU) it jumped to fail, which just
+freed the screen: the queue's thread stayed, waiting on a condition variable
+with a mutex that lived inside the freed screen, and the queue stayed on
+u_queue's atexit list. Haiku's GL kit then falls back to softpipe and
+everything looks fine until
+
+- exit(): u_queue's atexit_handler locks the dead queue's mutex, so every
+  OpenGL program aborted at exit (GLTeapot: "mutex->owner == -1" in
+  __pthread_mutex_lock from atexit_handler, run by __cxa_finalize), or
+- the freed memory is used again: the waiting thread is woken through
+  whatever now lives there and aborts in util_queue_thread_func with the
+  same assertion. BambuStudio hit it every time a summit_webkit web view was
+  released or destroyed (its zfq0 thread, Zink +0x552013/+0x551d48).
+
+The failure path now takes down what the screen had started by then: the
+shader cache threads, the flush queue, the device, the debug messenger and
+the instance.
+
+Tested in QEMU (air/OS hrev60207+2634, no Vulkan device, so softpipe):
+GLTeapot quits without a report; a test with two BGLViews in one team, one
+destroyed while the other keeps drawing, then a new one after the last is
+gone, renders and exits cleanly; BambuStudio survives the setup wizard's
+Finish and Filament Manager -> other tab twice, where the image's add-on
+aborts in zfq0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/drivers/zink/zink_screen.c | 27 ++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index 383cf16..92323c4 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -3033,6 +3033,33 @@ zink_internal_create_screen(const struct pipe_screen_config *config)
+    return screen;
+ 
+ fail:
++   /* A screen that could not be made (no Vulkan device: Haiku's GL kit then
++    * falls back to softpipe) must not leave anything behind that outlives its
++    * memory. The flush queue is started first thing: its thread kept waiting
++    * on a mutex and condition variable inside the freed screen, and the queue
++    * stayed on u_queue's atexit list, so the first reuse of that memory or
++    * exit() locked a destroyed mutex (the team aborted in
++    * util_queue_thread_func or in atexit_handler).
++    */
++#ifdef ENABLE_SHADER_CACHE
++   if (screen->disk_cache) {
++      util_queue_finish(&screen->cache_put_thread);
++      util_queue_finish(&screen->cache_get_thread);
++      disk_cache_wait_for_idle(screen->disk_cache);
++      util_queue_destroy(&screen->cache_put_thread);
++      util_queue_destroy(&screen->cache_get_thread);
++   }
++#endif
++   disk_cache_destroy(screen->disk_cache);
++   if (screen->threaded)
++      util_queue_destroy(&screen->flush_queue);
++   if (screen->dev)
++      VKSCR(DestroyDevice)(screen->dev, NULL);
++   if (screen->instance) {
++      if (VK_NULL_HANDLE != screen->debugUtilsCallbackHandle)
++         VKSCR(DestroyDebugUtilsMessengerEXT)(screen->instance, screen->debugUtilsCallbackHandle, NULL);
++      vkDestroyInstance(screen->instance, NULL);
++   }
+    ralloc_free(screen);
+    return NULL;
+ }
+-- 
+2.53.0
+
