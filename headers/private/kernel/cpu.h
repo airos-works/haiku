@@ -95,6 +95,10 @@ typedef struct CACHE_LINE_ALIGN cpu_ent {
 	// which prefers the faster ones (big.LITTLE, hybrid x86). Last, so that
 	// modules built without it still find the fields before it.
 	uint32			capacity;
+
+	// ID of running_thread, which contending mutex lockers compare with
+	// the holder without touching a Thread that may be gone.
+	thread_id		running_thread_id;
 } cpu_ent;
 
 

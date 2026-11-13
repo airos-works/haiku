@@ -306,6 +306,7 @@ switch_thread(Thread* fromThread, Thread* toThread)
 	toThread->previous_cpu = toThread->cpu = cpu;
 	fromThread->cpu = NULL;
 	cpu->running_thread = toThread;
+	cpu->running_thread_id = toThread->id;
 	cpu->previous_thread = fromThread;
 
 	arch_thread_set_current_thread(toThread);
