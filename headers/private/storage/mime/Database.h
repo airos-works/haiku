@@ -117,6 +117,9 @@ class Database {
 		status_t DeleteSnifferRule(const char *type);
 		status_t DeleteSupportedTypes(const char *type, bool fullSync);
 
+		// cached tables
+		void InvalidateCaches();
+
 		// deferred notifications
 		void	DeferInstallNotification(const char* type);
 		void	UndeferInstallNotification(const char* type);

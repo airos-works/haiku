@@ -227,6 +227,22 @@ SupportingApps::DeleteSupportedTypes(const char *app, bool fullSync)
 }
 
 
+/*!	\brief Drops the supporting apps table, it is built again from the
+	database the next time it is needed.
+
+	To be called when the database changed other than through this object,
+	for example when packages with MIME types were (de)activated.
+*/
+void
+SupportingApps::InvalidateCache()
+{
+	fSupportedTypes.clear();
+	fSupportingApps.clear();
+	fStrandedTypes.clear();
+	fHaveDoneFullBuild = false;
+}
+
+
 /*! \brief Adds the given application signature to the set of supporting
 	apps for the given type.
 

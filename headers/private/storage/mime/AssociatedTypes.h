@@ -38,6 +38,8 @@ public:
 
 	status_t SetFileExtensions(const char *type, const BMessage *extensions);
 	status_t DeleteFileExtensions(const char *type);
+
+	void InvalidateCache();
 	
 	void PrintToStream() const;	
 private:

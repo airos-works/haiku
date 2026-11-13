@@ -149,6 +149,20 @@ InstalledTypes::GetInstalledSupertypes(BMessage *types)
 }
 
 
+/*!	\brief Drops the installed types lists, they are built again from the
+	database the next time they are needed.
+
+	To be called when the database changed other than through this object,
+	for example when packages with MIME types were (de)activated.
+*/
+void
+InstalledTypes::InvalidateCache()
+{
+	_Unset();
+	fHaveDoneFullBuild = false;
+}
+
+
 /*! \brief Adds the given type to the appropriate lists of installed types.
 
 	If cached messages exist, the type is simply appended to the end of

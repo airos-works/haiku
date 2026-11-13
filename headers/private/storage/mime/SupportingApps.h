@@ -35,6 +35,8 @@ public:
 
 	status_t SetSupportedTypes(const char *app, const BMessage *types, bool fullSync);
 	status_t DeleteSupportedTypes(const char *app, bool fullSync);
+
+	void InvalidateCache();
 private:
 	status_t AddSupportingApp(const char *type, const char *app);
 	status_t RemoveSupportingApp(const char *type, const char *app);

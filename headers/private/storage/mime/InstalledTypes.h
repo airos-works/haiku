@@ -41,6 +41,8 @@ class InstalledTypes {
 		status_t AddType(const char *type);
 		status_t RemoveType(const char *type);
 
+		void InvalidateCache();
+
 	private:
 		status_t _AddSupertype(const char* super);
 		status_t _AddSubtype(const char *super, const char *sub);		

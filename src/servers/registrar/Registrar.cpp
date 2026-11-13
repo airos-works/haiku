@@ -363,6 +363,7 @@ Registrar::_MessageReceived(BMessage *message)
 			fPackageWatchingManager->HandleStartStopWatching(message);
 			break;
 		case B_PACKAGE_UPDATE:
+			fMIMEManager->PostMessage(message);
 			fPackageWatchingManager->NotifyWatchers(message);
 			break;
 

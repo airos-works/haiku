@@ -184,6 +184,10 @@ Database::Delete(const char *type)
 		fInstalledTypes.RemoveType(type);
 		// Notify the supporting apps database
 		fSupportingApps.DeleteSupportedTypes(type, true);
+		// The type may still exist in a read-only database directory, with
+		// other file extensions and sniffer rule, so read them again
+		fAssociatedTypes.InvalidateCache();
+		fSnifferRules.InvalidateCache();
 		// Notify the monitor service
 		_SendDeleteNotification(type);
 	}
@@ -342,6 +346,8 @@ Database::SetFileExtensions(const char *type, const BMessage *extensions)
 		kFileExtensionsAttr, *extensions, &didCreate);
 
 	if (status == B_OK) {
+		fAssociatedTypes.SetFileExtensions(type, extensions);
+
 		if (didCreate) {
 			_SendInstallNotification(type);
 		} else {
@@ -1089,9 +1095,10 @@ status_t
 Database::DeleteFileExtensions(const char *type)
 {
 	status_t status = fLocation->DeleteAttribute(type, kFileExtensionsAttr);
-	if (status == B_OK)
+	if (status == B_OK) {
+		fAssociatedTypes.DeleteFileExtensions(type);
 		_SendMonitorUpdate(B_FILE_EXTENSIONS_CHANGED, type, B_META_MIME_DELETED);
-	else if (status == B_ENTRY_NOT_FOUND)
+	} else if (status == B_ENTRY_NOT_FOUND)
 		status = B_OK;
 
 	return status;
@@ -1322,6 +1329,24 @@ Database::DeleteSupportedTypes(const char *type, bool fullSync)
 		_SendMonitorUpdate(B_SUPPORTED_TYPES_CHANGED, type, B_META_MIME_DELETED);
 
 	return status;
+}
+
+
+/*!	\brief Makes the database forget what it has read from the database
+	directories so far.
+
+	The tables of file extensions, sniffer rules, supporting apps and installed
+	types are built again from the directories the next time they are needed.
+	To be called when the contents of the database directories changed other
+	than through this object, for example when packages were (de)activated.
+*/
+void
+Database::InvalidateCaches()
+{
+	fAssociatedTypes.InvalidateCache();
+	fInstalledTypes.InvalidateCache();
+	fSnifferRules.InvalidateCache();
+	fSupportingApps.InvalidateCache();
 }
 
 

@@ -326,6 +326,14 @@ MIMEManager::MessageReceived(BMessage *message)
 			break;
 		}
 
+		case B_PACKAGE_UPDATE:
+			// Packages were (de)activated, which can add, change or remove
+			// types in the read-only database directories (packagefs merges
+			// the packages' data/mime_db into them). Forget what we have read
+			// from them so far.
+			fDatabase.InvalidateCaches();
+			break;
+
 		default:
 			printf("MIMEMan: msg->what == %" B_PRIx32 " (%.4s)\n",
 				message->what, (char*)&(message->what));

@@ -47,7 +47,9 @@ public:
 	
 	status_t SetSnifferRule(const char *type, const char *rule);
 	status_t DeleteSnifferRule(const char *type);
-	
+
+	void InvalidateCache();
+
 	void PrintToStream() const;
 
 	struct sniffer_rule {
@@ -64,6 +66,7 @@ private:
 		BString *type);
 	ssize_t MaxBytesNeeded();
 	status_t ProcessType(const char *type, ssize_t *bytesNeeded);
+	void _ClearRuleList();
 
 	std::list<sniffer_rule> fRuleList;
 

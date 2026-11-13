@@ -189,11 +189,15 @@ status_t
 AssociatedTypes::SetFileExtensions(const char *type, const BMessage *extensions)
 {
 	status_t err = type && extensions ? B_OK : B_BAD_VALUE;
-	if (!fHaveDoneFullBuild)
+	if (err != B_OK || !fHaveDoneFullBuild)
 		return err;
 
+	// The table is keyed by lowercase types, see BuildAssociatedTypesTable()
+	std::string typeStr = BPrivate::Storage::to_lower(type);
+	type = typeStr.c_str();
+
 	std::set<std::string> oldExtensions;
-	std::set<std::string> &newExtensions = fFileExtensions[type];
+	std::set<std::string> &newExtensions = fFileExtensions[typeStr];
 	// Make a copy of the previous extensions
 	if (!err) {
 		oldExtensions = newExtensions;
@@ -204,11 +208,14 @@ AssociatedTypes::SetFileExtensions(const char *type, const BMessage *extensions)
 		newExtensions.clear();
 		const char *extension;
 		for (int32 i = 0;
-			   extensions->FindString(kTypesField, i, &extension) == B_OK;
+			   extensions->FindString(kExtensionsField, i, &extension) == B_OK;
 			     i++)
 		{
-			newExtensions.insert(extension);
-			AddAssociatedType(extension, type);
+			std::string extStr = PrepExtension(extension);
+			if (extStr.length() > 0) {
+				newExtensions.insert(extStr);
+				AddAssociatedType(extStr.c_str(), type);
+			}
 		}
 
 		// Remove any extensions that are still associated from the list
@@ -320,8 +327,23 @@ AssociatedTypes::RemoveAssociatedType(const char *extension, const char *type)
 		err = extStr.length() > 0 ? B_OK : B_BAD_VALUE;
 	}
 	if (!err)
-		fAssociatedTypes[extension].erase(type);
+		fAssociatedTypes[extStr].erase(type);
 	return err;
+}
+
+
+/*!	\brief Drops the associated types table, it is built again from the
+	database the next time it is needed.
+
+	To be called when the database changed other than through this object,
+	for example when packages with MIME types were (de)activated.
+*/
+void
+AssociatedTypes::InvalidateCache()
+{
+	fFileExtensions.clear();
+	fAssociatedTypes.clear();
+	fHaveDoneFullBuild = false;
 }
 
 // BuildAssociatedTypesTable

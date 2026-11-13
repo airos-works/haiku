@@ -132,11 +132,7 @@ SnifferRules::SnifferRules(DatabaseLocation* databaseLocation,
 */
 SnifferRules::~SnifferRules()
 {
-	for (std::list<sniffer_rule>::iterator i = fRuleList.begin();
-		   i != fRuleList.end(); i++) {
-		delete i->rule;
-		i->rule = NULL;
-	}
+	_ClearRuleList();
 }
 
 // GuessMimeType
@@ -256,6 +252,8 @@ SnifferRules::SetSnifferRule(const char *type, const char *rule)
 	// Remove any previous rule for this type
 	if (!err)
 		err = DeleteSnifferRule(type);
+	if (err != B_OK)
+		delete item.rule;
 	// Insert the new rule at the proper position in
 	// the sorted rule list (remembering that our list
 	// is sorted in ascending order using
@@ -293,12 +291,27 @@ SnifferRules::DeleteSnifferRule(const char *type)
 	for (std::list<sniffer_rule>::iterator i = fRuleList.begin();
 		   i != fRuleList.end(); i++) {
 		if (i->type == type) {
+			delete i->rule;
 			fRuleList.erase(i);
 			break;
 		}
 	}
 
 	return err;
+}
+
+/*!	\brief Drops the rule list, it is built again from the database the
+	next time it is needed.
+
+	To be called when the database changed other than through this object,
+	for example when packages with MIME types were (de)activated.
+*/
+void
+SnifferRules::InvalidateCache()
+{
+	_ClearRuleList();
+	fMaxBytesNeeded = 0;
+	fHaveDoneFullBuild = false;
 }
 
 // PrintToStream
@@ -330,7 +343,7 @@ SnifferRules::PrintToStream() const
 status_t
 SnifferRules::BuildRuleList()
 {
-	fRuleList.clear();
+	_ClearRuleList();
 
 	ssize_t maxBytesNeeded = 0;
 	ssize_t bytesNeeded = 0;
@@ -578,11 +591,24 @@ SnifferRules::ProcessType(const char *type, ssize_t *bytesNeeded)
 		rule.type = type;
 		rule.rule_string = str.String();
 		fRuleList.push_back(rule);
-	}
+	} else
+		delete rule.rule;
 	return err;
+}
+
+
+//! Deletes all rules in the rule list and empties it
+void
+SnifferRules::_ClearRuleList()
+{
+	for (std::list<sniffer_rule>::iterator i = fRuleList.begin();
+		   i != fRuleList.end(); i++) {
+		delete i->rule;
+		i->rule = NULL;
+	}
+	fRuleList.clear();
 }
 
 } // namespace Mime
 } // namespace Storage
 } // namespace BPrivate
-
