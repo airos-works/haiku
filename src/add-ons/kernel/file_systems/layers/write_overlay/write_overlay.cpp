@@ -754,9 +754,12 @@ OverlayInode::Read(void *_cookie, off_t position, void *buffer, size_t *length,
 		if (gapSize > 0) {
 			// there's a gap before our next position which we cannot
 			// fill with original file content, zero it out
-			if (ioRequest != NULL)
-				;// TODO: handle this case
-			else
+			if (ioRequest != NULL) {
+				status_t result = ioRequest->ClearData(ioRequest->Offset()
+					+ ((addr_t)pointer - (addr_t)buffer), gapSize);
+				if (result != B_OK)
+					return result;
+			} else
 				user_memset(pointer, 0, gapSize);
 
 			bytesLeft -= gapSize;
@@ -889,9 +892,12 @@ OverlayInode::Write(void *_cookie, off_t position, const void *buffer,
 			if (swallowCount == 1 && otherEnd >= newEnd) {
 				// other chunk completely covers us, just copy
 				void *target = other->buffer + (newPosition - other->position);
-				if (ioRequest != NULL)
-					ioRequest->CopyData(ioRequest->Offset(), target, length);
-				else if (user_memcpy(target, buffer, length) < B_OK)
+				if (ioRequest != NULL) {
+					status_t result = ioRequest->CopyData(ioRequest->Offset(),
+						target, length);
+					if (result != B_OK)
+						return result;
+				} else if (user_memcpy(target, buffer, length) < B_OK)
 					return B_BAD_ADDRESS;
 
 				fStat.st_mtime = time(NULL);
@@ -948,9 +954,14 @@ OverlayInode::Write(void *_cookie, off_t position, const void *buffer,
 	}
 
 	void *target = element->buffer + (position - newPosition);
-	if (ioRequest != NULL)
-		ioRequest->CopyData(0, target, length);
-	else if (user_memcpy(target, buffer, length) < B_OK)
+	if (ioRequest != NULL) {
+		// The request's data starts at its own offset, not at 0 (only a
+		// request at the start of the file got away with 0).
+		status_t result = ioRequest->CopyData(ioRequest->Offset(), target,
+			length);
+		if (result != B_OK)
+			return result;
+	} else if (user_memcpy(target, buffer, length) < B_OK)
 		return B_BAD_ADDRESS;
 
 	fStat.st_mtime = time(NULL);
