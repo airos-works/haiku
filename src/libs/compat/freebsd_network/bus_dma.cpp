@@ -741,6 +741,20 @@ bus_dmamap_sync_etc(bus_dma_tag_t dmat, bus_dmamap_t map,
 		return;
 	}
 
+#if (defined(__x86_64__) || defined(__i386__)) && !defined(FBSD_NONCOHERENT_DMA)
+	if (map->buffer_type == bus_dmamap::BUFFER_DIRECT) {
+		// x86 DMA is cache coherent, DMA memory is write-back, and x86 does
+		// not reorder stores with later stores (an uncached MMIO doorbell
+		// included) or loads with later loads, so a map that does not bounce
+		// needs no fence; FreeBSD's x86 bus_dmamap_sync() is a compiler
+		// barrier for such maps, too. The full fence cost an RTL8126's
+		// interrupt thread 30 % of its time at 4 Gbit/s
+		// (airos-works/haiku#122).
+		__asm__ __volatile__("" ::: "memory");
+		return;
+	}
+#endif
+
 	if ((op & BUS_DMASYNC_PREWRITE) != 0) {
 		if (map->buffer_type == bus_dmamap::BUFFER_TYPE_SIMPLE) {
 			memcpy((char*)map->bounce_buffer + offset,
