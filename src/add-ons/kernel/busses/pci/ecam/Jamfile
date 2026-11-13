@@ -1,6 +1,6 @@
 SubDir HAIKU_TOP src add-ons kernel busses pci ecam ;
 
-SubDirC++Flags -fno-rtti ;
+SubDirC++Flags -fno-rtti -DECAM_PCI_WITH_FDT ;
 
 UsePrivateKernelHeaders ;
 UseLibraryHeaders [ FDirName libfdt ] ;
