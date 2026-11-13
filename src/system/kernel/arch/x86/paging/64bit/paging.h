@@ -67,6 +67,12 @@
 #define X86_64_PTE_DIRTY				(1LL << 6)
 #define X86_64_PTE_PAT					(1LL << 7)
 #define X86_64_PTE_GLOBAL				(1LL << 8)
+#define X86_64_PTE_MAY_BE_CACHED		(1LL << 9)
+	// software: the accessed flag was cleared without a TLB invalidation
+	// (page daemon ageing), so a TLB may still hold the entry
+#define X86_64_PTE_IN_TLB_MASK			(X86_64_PTE_ACCESSED \
+											| X86_64_PTE_MAY_BE_CACHED)
+	// any of these set: the entry must be invalidated when changed
 #define X86_64_PTE_NOT_EXECUTABLE		(1LL << 63)
 #define X86_64_PTE_ADDRESS_MASK			0x000ffffffffff000L
 #define X86_64_PTE_PROTECTION_MASK		(X86_64_PTE_NOT_EXECUTABLE	\

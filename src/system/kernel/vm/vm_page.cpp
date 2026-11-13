@@ -28,6 +28,7 @@
 #include <heap.h>
 #include <kernel.h>
 #include <low_resource_manager.h>
+#include <smp.h>
 #include <thread.h>
 #include <tracing.h>
 #include <util/AutoLock.h>
@@ -83,8 +84,12 @@ static const bigtime_t kIdleScanWaitInterval = 1000000LL;	// 1 sec
 static const bigtime_t kBusyScanWaitInterval = 500000LL;	// 0.5 sec
 
 // Number of idle runs after which we want to have processed the full active
-// queue.
+// queue, while memory is short (a fraction of free + cached pages below
+// 1/16). With more free memory the idle scan slows down, up to 16 times
+// (#100): the ageing information is only needed once memory gets short.
 static const uint32 kIdleRunsForFullQueue = 20;
+// Pages of one cache handled under one acquisition of its lock.
+static const uint32 kIdleScanCacheRun = 32;
 
 // Maximum limit for the vm_page::usage_count.
 static const int32 kPageUsageMax = 64;
@@ -93,7 +98,30 @@ static const int32 kPageUsageAdvance = 3;
 // vm_page::usage_count debuff an unaccessed page receives in a scan.
 static const int32 kPageUsageDecline = 1;
 
-int32 gMappedPagesCount;
+struct CACHE_LINE_ALIGN mapped_pages_counter {
+	int32	count;
+};
+static mapped_pages_counter sMappedPagesCount[SMP_MAX_CPUS];
+
+
+
+void
+vm_page_add_mapped_pages(int32 count)
+{
+	// Atomic, as the thread may move to another CPU in between; the line
+	// usually stays with this CPU.
+	atomic_add(&sMappedPagesCount[smp_get_current_cpu()].count, count);
+}
+
+
+int32
+vm_page_mapped_pages_count()
+{
+	int32 count = 0;
+	for (int32 i = 0; i < smp_get_num_cpus(); i++)
+		count += atomic_get(&sMappedPagesCount[i].count);
+	return count;
+}
 
 static VMPageQueue sFreePageQueue;
 static VMPageQueue sClearPageQueue;
@@ -101,6 +129,41 @@ static ModifiedPageQueue sDefaultModifiedPageQueue;
 static VMPageQueue sInactivePageQueue;
 static VMPageQueue sActivePageQueue;
 static VMPageQueue sCachedPageQueue;
+
+// cached pages freed, and the page daemon's verdict on the rate
+static int32 sCachedPagesFreed;
+static int32 sCachedPagesFreedChecked;
+static bigtime_t sCacheChurnCheckTime;
+static bool sCacheThrashing;
+
+
+bool
+vm_page_cache_thrashing()
+{
+	return sCacheThrashing;
+}
+
+
+static void
+update_cache_churn()
+{
+	bigtime_t now = system_time();
+	bigtime_t elapsed = now - sCacheChurnCheckTime;
+	if (elapsed < 500000)
+		return;
+
+	int32 freed = atomic_get(&sCachedPagesFreed);
+	int64 rate = (int64)(freed - sCachedPagesFreedChecked) * 1000000
+		/ elapsed;
+	sCachedPagesFreedChecked = freed;
+	sCacheChurnCheckTime = now;
+
+	// more than 1/16 of the cache (or 4 MiB) recycled per second
+	int64 limit = std::max((int64)sCachedPageQueue.Count() / 16,
+		(int64)(4 * 1024 * 1024 / B_PAGE_SIZE));
+	sCacheThrashing = rate > limit;
+}
+
 
 static vm_page *sPages;
 static page_num_t sPhysicalPageOffset;
@@ -123,6 +186,26 @@ static mutex sPageDeficitLock = MUTEX_INITIALIZER("page deficit");
 // guard against concurrent changes).
 static rw_lock sFreePageQueuesLock
 	= RW_LOCK_INITIALIZER("free/clear page queues");
+
+// Per-CPU stocks of free and clear pages (#97): most allocations and frees
+// take and put pages here, under the CPU's own spinlock, and move them to
+// and from the global queues in batches. Pages in a stock keep their
+// PAGE_STATE_FREE/CLEAR state, and are counted as free like the queued ones.
+// Moving pages between a stock and the queues needs a read lock of
+// sFreePageQueuesLock; whoever needs every free page in the queues (page
+// runs) write-locks it, disables the stocks and drains them.
+struct CACHE_LINE_ALIGN page_stock {
+	spinlock				lock;
+	VMPageQueue::PageList	freePages;
+	VMPageQueue::PageList	clearPages;
+	uint32					freeCount;
+	uint32					clearCount;
+};
+static page_stock sPageStocks[SMP_MAX_CPUS];
+static int32 sPageStocksDisabled = 1;
+	// until the VM is up
+static const uint32 kPageStockBatch = 32;
+static const uint32 kPageStockMax = 64;
 
 #ifdef TRACK_PAGE_USAGE_STATS
 static page_num_t sPageUsageArrays[512];
@@ -1087,7 +1170,7 @@ dump_page_stats(int argc, char **argv)
 	kprintf("unreserved free pages: %" B_PRId32 "\n", sUnreservedFreePages);
 	kprintf("unsatisfied page reservations: %" B_PRId32 "\n",
 		sUnsatisfiedPageReservations);
-	kprintf("mapped pages: %" B_PRId32 "\n", gMappedPagesCount);
+	kprintf("mapped pages: %" B_PRId32 "\n", vm_page_mapped_pages_count());
 	kprintf("longest free pages run: %" B_PRIuPHYSADDR " pages (at %"
 		B_PRIuPHYSADDR ")\n", longestFreeRun.Length(),
 		sPages[longestFreeRun.start].physical_page_number);
@@ -1500,6 +1583,175 @@ page_queue_for(vm_page* page, uint8 state)
 }
 
 
+/*!	Moves all pages of all stocks back to the global queues. The caller
+	write-locks sFreePageQueuesLock (or otherwise knows that no stock is
+	being refilled).
+*/
+static void
+drain_page_stocks()
+{
+	for (int32 i = 0; i < smp_get_num_cpus(); i++) {
+		page_stock& stock = sPageStocks[i];
+		InterruptsSpinLocker stockLocker(stock.lock);
+		while (vm_page* page = stock.freePages.RemoveHead())
+			sFreePageQueue.PrependUnlocked(page);
+		while (vm_page* page = stock.clearPages.RemoveHead())
+			sClearPageQueue.PrependUnlocked(page);
+		stock.freeCount = 0;
+		stock.clearCount = 0;
+	}
+}
+
+
+/*!	Disables the stocks and drains them. The caller has write-locked
+	sFreePageQueuesLock.
+*/
+static void
+disable_page_stocks()
+{
+	atomic_add(&sPageStocksDisabled, 1);
+	drain_page_stocks();
+}
+
+
+static void
+enable_page_stocks()
+{
+	atomic_add(&sPageStocksDisabled, -1);
+}
+
+
+static page_num_t
+page_stocks_count()
+{
+	page_num_t count = 0;
+	for (int32 i = 0; i < smp_get_num_cpus(); i++)
+		count += sPageStocks[i].freeCount + sPageStocks[i].clearCount;
+	return count;
+}
+
+
+/*!	Takes a page from this CPU's stock, refilling it from the global queues
+	if necessary. Returns \c NULL when the stocks are disabled or the queues
+	are empty. The page leaves in state PAGE_STATE_UNUSED, so that nobody
+	looking for free pages by their state takes it; \a _wasClear tells
+	whether it was a clear one.
+*/
+static vm_page*
+page_stock_take(VMPageQueue::PageList& list, uint32& count, bool& _wasClear)
+{
+	vm_page* page = list.RemoveHead();
+	count--;
+	_wasClear = page->State() == PAGE_STATE_CLEAR;
+	page->SetState(PAGE_STATE_UNUSED);
+	return page;
+}
+
+
+static vm_page*
+page_stock_allocate(bool clear, bool& _wasClear)
+{
+	if (atomic_get(&sPageStocksDisabled) != 0)
+		return NULL;
+
+	{
+		InterruptsLocker interruptsLocker;
+		page_stock& stock = sPageStocks[smp_get_current_cpu()];
+		SpinLocker stockLocker(stock.lock);
+		if (sPageStocksDisabled == 0) {
+			if (clear && stock.clearCount > 0) {
+				return page_stock_take(stock.clearPages, stock.clearCount,
+					_wasClear);
+			}
+			if (!clear && stock.freeCount > 0) {
+				return page_stock_take(stock.freePages, stock.freeCount,
+					_wasClear);
+			}
+		}
+	}
+
+	// refill from the queue we want, falling back to the other one
+	ReadLocker locker(sFreePageQueuesLock);
+	InterruptsLocker interruptsLocker;
+	page_stock& stock = sPageStocks[smp_get_current_cpu()];
+	SpinLocker stockLocker(stock.lock);
+	if (sPageStocksDisabled != 0)
+		return NULL;
+
+	for (int pass = 0; pass < 2; pass++) {
+		bool clearQueue = clear == (pass == 0);
+		VMPageQueue& queue = clearQueue ? sClearPageQueue : sFreePageQueue;
+		VMPageQueue::PageList& list
+			= clearQueue ? stock.clearPages : stock.freePages;
+		uint32& count = clearQueue ? stock.clearCount : stock.freeCount;
+
+		SpinLocker queueLocker(queue.GetLock());
+		while (count < kPageStockBatch) {
+			vm_page* page = queue.RemoveHead();
+			if (page == NULL)
+				break;
+			list.Add(page);
+			count++;
+		}
+		queueLocker.Unlock();
+
+		if (count > 0)
+			return page_stock_take(list, count, _wasClear);
+	}
+
+	return NULL;
+}
+
+
+/*!	Puts a freed page into this CPU's stock and sets its state to
+	PAGE_STATE_FREE or PAGE_STATE_CLEAR. The state only changes with the page
+	in a stock or a queue: whoever looks for page runs takes free pages out
+	of the queues by their state. Returns \c false when the stocks are
+	disabled; the caller queues the page then.
+*/
+static bool
+page_stock_free(vm_page* page, bool clear)
+{
+	if (atomic_get(&sPageStocksDisabled) != 0)
+		return false;
+
+	const uint8 state = clear ? PAGE_STATE_CLEAR : PAGE_STATE_FREE;
+	{
+		InterruptsLocker interruptsLocker;
+		page_stock& stock = sPageStocks[smp_get_current_cpu()];
+		SpinLocker stockLocker(stock.lock);
+		if (sPageStocksDisabled != 0)
+			return false;
+		uint32& count = clear ? stock.clearCount : stock.freeCount;
+		if (count < kPageStockMax) {
+			page->SetState(state);
+			(clear ? stock.clearPages : stock.freePages).Add(page, false);
+			count++;
+			return true;
+		}
+	}
+
+	// full: move this page and a batch to the global queue
+	ReadLocker locker(sFreePageQueuesLock);
+	InterruptsLocker interruptsLocker;
+	page_stock& stock = sPageStocks[smp_get_current_cpu()];
+	SpinLocker stockLocker(stock.lock);
+	VMPageQueue& queue = clear ? sClearPageQueue : sFreePageQueue;
+	SpinLocker queueLocker(queue.GetLock());
+	page->SetState(state);
+	queue.Prepend(page);
+	if (sPageStocksDisabled == 0) {
+		VMPageQueue::PageList& list = clear ? stock.clearPages : stock.freePages;
+		uint32& count = clear ? stock.clearCount : stock.freeCount;
+		while (count > kPageStockMax - kPageStockBatch) {
+			queue.Prepend(list.RemoveTail());
+			count--;
+		}
+	}
+	return true;
+}
+
+
 static void
 free_page(vm_page* page, bool clear)
 {
@@ -1527,9 +1779,15 @@ free_page(vm_page* page, bool clear)
 	page->allocation_tracking_info.Clear();
 #endif
 
-	ReadLocker locker(sFreePageQueuesLock);
-
 	DEBUG_PAGE_ACCESS_END(page);
+
+	if (page_stock_free(page, clear)) {
+		if (!clear && sFreePageCondition.EntriesCount() > 0)
+			sFreePageCondition.NotifyAll();
+		return;
+	}
+
+	ReadLocker locker(sFreePageQueuesLock);
 
 	if (clear) {
 		page->SetState(PAGE_STATE_CLEAR);
@@ -1537,7 +1795,10 @@ free_page(vm_page* page, bool clear)
 	} else {
 		page->SetState(PAGE_STATE_FREE);
 		sFreePageQueue.PrependUnlocked(page);
-		sFreePageCondition.NotifyAll();
+		// only the page scrubber waits; don't take the condition variable's
+		// lock for every page freed (#97)
+		if (sFreePageCondition.EntriesCount() > 0)
+			sFreePageCondition.NotifyAll();
 	}
 
 	locker.Unlock();
@@ -1637,6 +1898,7 @@ mark_page_range_in_use(page_num_t startPage, page_num_t length, bool wired)
 	}
 
 	WriteLocker locker(sFreePageQueuesLock);
+	disable_page_stocks();
 
 	for (page_num_t i = 0; i < length; i++) {
 		vm_page *page = &sPages[startPage + i];
@@ -1674,6 +1936,7 @@ mark_page_range_in_use(page_num_t startPage, page_num_t length, bool wired)
 		}
 	}
 
+	enable_page_stocks();
 	return B_OK;
 }
 
@@ -1911,6 +2174,7 @@ free_cached_pages(uint32 pagesToFree, bool dontWait)
 			TA(StolenPage());
 
 			pagesFreed++;
+			atomic_add(&sCachedPagesFreed, 1);
 		}
 	}
 
@@ -1923,13 +2187,87 @@ free_cached_pages(uint32 pagesToFree, bool dontWait)
 }
 
 
+static uint32
+idle_scan_runs_for_full_queue(const page_stats& pageStats)
+{
+	uint64 available = (uint64)std::max(pageStats.totalFreePages, (int32)0)
+		+ std::max(pageStats.cachedPages, (int32)0);
+	uint64 total = vm_page_num_pages();
+
+	uint32 runs = kIdleRunsForFullQueue;
+	for (uint64 share = 16; share > 1 && available * share >= total;
+			share /= 2) {
+		runs *= 2;
+	}
+	return runs;
+}
+
+
+/*!	Ages one active page of the locked cache, without TLB invalidations
+	(#100), and puts it at the end of the queue if it stays active.
+*/
+static void
+idle_scan_page(vm_page* page, VMCache* cache)
+{
+	DEBUG_PAGE_ACCESS_START(page);
+
+	if (page->busy) {
+		// page is busy -- requeue at the end
+		vm_page_requeue(page, true, NULL);
+		DEBUG_PAGE_ACCESS_END(page);
+		return;
+	}
+
+	// Get the page active/modified flags and update the page's usage count.
+	// We completely unmap inactive temporary pages. This saves us to
+	// iterate through the inactive list as well, since we'll be notified
+	// via page fault whenever such an inactive page is used again.
+	// We don't remove the mappings of non-temporary pages, since we
+	// wouldn't notice when those would become unused and could thus be
+	// moved to the cached list.
+	int32 usageCount;
+	if (page->WiredCount() > 0 || page->usage_count > 0 || !cache->temporary)
+		usageCount = vm_test_and_clear_page_mapping_accessed(page);
+	else
+		usageCount = vm_remove_all_page_mappings_if_unaccessed(page);
+
+	if (usageCount > 0) {
+		usageCount += page->usage_count + kPageUsageAdvance;
+		if (usageCount > kPageUsageMax)
+			usageCount = kPageUsageMax;
+
+#if ENABLE_SWAP_SUPPORT
+		free_page_swap_space(page);
+#endif
+	} else {
+		usageCount += page->usage_count - (int32)kPageUsageDecline;
+		if (usageCount < 0) {
+			usageCount = 0;
+			set_page_state(page, PAGE_STATE_INACTIVE);
+		}
+	}
+
+	page->usage_count = usageCount;
+
+	// Go on with the next page next time: the scan is a clock over the
+	// queue. (It used to look at the head again, so it kept working the same
+	// few pages until they went inactive.)
+	if (page->State() == PAGE_STATE_ACTIVE)
+		vm_page_requeue(page, true, NULL);
+
+	DEBUG_PAGE_ACCESS_END(page);
+}
+
+
 static void
 idle_scan_active_pages(page_stats& pageStats)
 {
 	VMPageQueue& queue = sActivePageQueue;
 
-	// We want to scan the whole queue in roughly kIdleRunsForFullQueue runs.
-	uint32 maxToScan = queue.Count() / kIdleRunsForFullQueue + 1;
+	// We want to scan the whole queue in roughly
+	// idle_scan_runs_for_full_queue() runs.
+	uint32 maxToScan = queue.Count()
+		/ idle_scan_runs_for_full_queue(pageStats) + 1;
 
 	while (maxToScan > 0) {
 		maxToScan--;
@@ -1947,54 +2285,19 @@ idle_scan_active_pages(page_stats& pageStats)
 		if (cache == NULL)
 			continue;
 
-		if (page->State() != PAGE_STATE_ACTIVE) {
-			// page is no longer in the cache or in this queue
-			cache->ReleaseRefAndUnlock();
-			continue;
+		// Handle this page and the next ones of the same cache. Whether a
+		// page belongs to the cache is stable while we hold its lock.
+		for (uint32 run = 1; ; run++) {
+			if (page->Cache() == cache && page->State() == PAGE_STATE_ACTIVE)
+				idle_scan_page(page, cache);
+
+			if (maxToScan == 0 || run >= kIdleScanCacheRun)
+				break;
+			page = queue.Head();
+			if (page == NULL || page->Cache() != cache)
+				break;
+			maxToScan--;
 		}
-
-		DEBUG_PAGE_ACCESS_START(page);
-
-		if (page->busy) {
-			// page is busy -- requeue at the end
-			vm_page_requeue(page, true, NULL);
-			DEBUG_PAGE_ACCESS_END(page);
-			cache->ReleaseRefAndUnlock();
-			continue;
-		}
-
-		// Get the page active/modified flags and update the page's usage count.
-		// We completely unmap inactive temporary pages. This saves us to
-		// iterate through the inactive list as well, since we'll be notified
-		// via page fault whenever such an inactive page is used again.
-		// We don't remove the mappings of non-temporary pages, since we
-		// wouldn't notice when those would become unused and could thus be
-		// moved to the cached list.
-		int32 usageCount;
-		if (page->WiredCount() > 0 || page->usage_count > 0 || !cache->temporary)
-			usageCount = vm_clear_page_mapping_accessed_flags(page);
-		else
-			usageCount = vm_remove_all_page_mappings_if_unaccessed(page);
-
-		if (usageCount > 0) {
-			usageCount += page->usage_count + kPageUsageAdvance;
-			if (usageCount > kPageUsageMax)
-				usageCount = kPageUsageMax;
-
-#if ENABLE_SWAP_SUPPORT
-			free_page_swap_space(page);
-#endif
-		} else {
-			usageCount += page->usage_count - (int32)kPageUsageDecline;
-			if (usageCount < 0) {
-				usageCount = 0;
-				set_page_state(page, PAGE_STATE_INACTIVE);
-			}
-		}
-
-		page->usage_count = usageCount;
-
-		DEBUG_PAGE_ACCESS_END(page);
 
 		cache->ReleaseRefAndUnlock();
 	}
@@ -2204,7 +2507,9 @@ full_scan_active_pages(page_stats& pageStats, int32 despairLevel)
 		DEBUG_PAGE_ACCESS_START(page);
 
 		// Get the page active/modified flags and update the page's usage count.
-		int32 usageCount = vm_clear_page_mapping_accessed_flags(page);
+		// Without TLB invalidations: a stale entry only delays the accessed
+		// flag being set again (#100).
+		int32 usageCount = vm_test_and_clear_page_mapping_accessed(page);
 
 		if (usageCount > 0) {
 			usageCount += page->usage_count + kPageUsageAdvance;
@@ -2300,6 +2605,8 @@ page_daemon(void* /*unused*/)
 
 	while (true) {
 		sPageDaemonCondition.ClearActivated();
+
+		update_cache_churn();
 
 		// evaluate the free pages situation
 		page_stats pageStats;
@@ -2631,6 +2938,9 @@ vm_page_init_post_thread(kernel_args *args)
 		B_NORMAL_PRIORITY, NULL);
 	resume_thread(thread);
 
+	// the stocks of free pages can be used now
+	atomic_add(&sPageStocksDisabled, -1);
+
 	return B_OK;
 }
 
@@ -2688,6 +2998,29 @@ vm_page_reserve_pages(vm_page_reservation* reservation, uint32 count,
 
 
 bool
+vm_page_try_reserve_free_pages(vm_page_reservation* reservation, uint32 count,
+	int priority)
+{
+	if (count == 0) {
+		reservation->count = 0;
+		return true;
+	}
+
+	uint32 reserved = reserve_some_pages(count,
+		kPageReserveForPriority[priority] + sFreePagesTarget);
+	if (reserved < count) {
+		if (reserved > 0)
+			unreserve_pages(reserved);
+		return false;
+	}
+
+	TA(ReservePages(count));
+	reservation->count = count;
+	return true;
+}
+
+
+bool
 vm_page_try_reserve_pages(vm_page_reservation* reservation, uint32 count,
 	int priority)
 {
@@ -2732,9 +3065,16 @@ vm_page_allocate_page(vm_page_reservation* reservation, uint32 flags)
 		otherQueue = &sClearPageQueue;
 	}
 
-	ReadLocker locker(sFreePageQueuesLock);
+	bool stockPageWasClear = false;
+	vm_page* page = page_stock_allocate((flags & VM_PAGE_ALLOC_CLEAR) != 0,
+		stockPageWasClear);
+	const bool fromStock = page != NULL;
 
-	vm_page* page = queue->RemoveHeadUnlocked();
+	ReadLocker locker;
+	if (page == NULL) {
+		locker.SetTo(sFreePageQueuesLock, false);
+		page = queue->RemoveHeadUnlocked();
+	}
 	if (page == NULL) {
 		// if the primary queue was empty, grab the page from the
 		// secondary queue
@@ -2742,14 +3082,21 @@ vm_page_allocate_page(vm_page_reservation* reservation, uint32 flags)
 
 		if (page == NULL) {
 			// Unlikely, but possible: the page we have reserved has moved
-			// between the queues after we checked the first queue. Grab the
-			// write locker to make sure this doesn't happen again.
+			// between the queues after we checked the first queue, or it is
+			// in another CPU's stock. Grab the write locker to make sure
+			// this doesn't happen again.
 			locker.Unlock();
 			WriteLocker writeLocker(sFreePageQueuesLock);
 
 			page = queue->RemoveHead();
 			if (page == NULL)
-				otherQueue->RemoveHead();
+				page = otherQueue->RemoveHead();
+			if (page == NULL) {
+				drain_page_stocks();
+				page = queue->RemoveHead();
+				if (page == NULL)
+					page = otherQueue->RemoveHead();
+			}
 
 			if (page == NULL) {
 				panic("Had reserved page, but there is none!");
@@ -2767,6 +3114,9 @@ vm_page_allocate_page(vm_page_reservation* reservation, uint32 flags)
 	DEBUG_PAGE_ACCESS_START(page);
 
 	uint8 oldPageState = page->State();
+	if (fromStock) {
+		oldPageState = stockPageWasClear ? PAGE_STATE_CLEAR : PAGE_STATE_FREE;
+	}
 	ASSERT(oldPageState == PAGE_STATE_FREE || oldPageState == PAGE_STATE_CLEAR);
 
 	page->SetState(pageState);
@@ -3045,9 +3395,20 @@ vm_page_allocate_page_run(uint32 flags, page_num_t length,
 	}
 
 	vm_page_reservation reservation;
-	vm_page_reserve_pages(&reservation, length, priority);
+	const bool dontWait = (flags & VM_PAGE_ALLOC_DONT_WAIT) != 0;
+	if (dontWait) {
+		if (!vm_page_try_reserve_pages(&reservation, length, priority))
+			return NULL;
+	} else
+		vm_page_reserve_pages(&reservation, length, priority);
 
 	WriteLocker freeClearQueueLocker(sFreePageQueuesLock);
+
+	// every free page must be in the queues while we look for a run
+	disable_page_stocks();
+	struct StocksEnabler {
+		~StocksEnabler() { enable_page_stocks(); }
+	} stocksEnabler;
 
 	// First we try to get a run with free pages only. If that fails, we also
 	// consider cached pages. If there are only few free pages and many cached
@@ -3055,6 +3416,10 @@ vm_page_allocate_page_run(uint32 flags, page_num_t length,
 	// the first iteration in this case.
 	int32 freePages = sUnreservedFreePages;
 	bool useCached = (freePages <= 0) || ((page_num_t)freePages <= (length * 2));
+	if (dontWait) {
+		// taking cached pages from their caches could wait for those
+		useCached = false;
+	}
 
 	for (;;) {
 		if (alignmentMask != 0 || boundaryMask != 0) {
@@ -3074,7 +3439,7 @@ vm_page_allocate_page_run(uint32 flags, page_num_t length,
 		}
 
 		if (start + length > end) {
-			if (!useCached) {
+			if (!useCached && !dontWait) {
 				// The first iteration with free pages only was unsuccessful.
 				// Try again also considering cached pages.
 				useCached = true;
@@ -3082,11 +3447,14 @@ vm_page_allocate_page_run(uint32 flags, page_num_t length,
 				continue;
 			}
 
-			dprintf("vm_page_allocate_page_run(): Failed to allocate run of "
-				"length %" B_PRIuPHYSADDR " (%" B_PRIuPHYSADDR " %"
-				B_PRIuPHYSADDR ") in second iteration (align: %" B_PRIuPHYSADDR
-				" boundary: %" B_PRIuPHYSADDR ")!\n", length, requestedStart,
-				end, restrictions->alignment, restrictions->boundary);
+			if (!dontWait) {
+				dprintf("vm_page_allocate_page_run(): Failed to allocate run of "
+					"length %" B_PRIuPHYSADDR " (%" B_PRIuPHYSADDR " %"
+					B_PRIuPHYSADDR ") in second iteration (align: %"
+					B_PRIuPHYSADDR " boundary: %" B_PRIuPHYSADDR ")!\n", length,
+					requestedStart, end, restrictions->alignment,
+					restrictions->boundary);
+			}
 
 			freeClearQueueLocker.Unlock();
 			vm_page_unreserve_pages(&reservation);
@@ -3272,7 +3640,7 @@ vm_page_get_stats(system_info *info)
 	// So taking out the cached (including modified non-temporary), free and
 	// clear ones leaves us with all used pages.
 	uint32 subtractPages = info->cached_pages + sFreePageQueue.Count()
-		+ sClearPageQueue.Count();
+		+ sClearPageQueue.Count() + page_stocks_count();
 	info->used_pages = subtractPages > info->max_pages
 		? 0 : info->max_pages - subtractPages;
 

@@ -197,6 +197,8 @@ enum {
 #define VM_PAGE_ALLOC_STATE	0x00000007
 #define VM_PAGE_ALLOC_CLEAR	0x00000010
 #define VM_PAGE_ALLOC_BUSY	0x00000020
+#define VM_PAGE_ALLOC_DONT_WAIT	0x00000040
+	// page runs: fail instead of waiting for pages; free pages only
 
 
 inline

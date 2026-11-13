@@ -110,7 +110,7 @@ VMTranslationMap::UnmapArea(VMArea* area, bool deletingAddressSpace,
 
 		bool pageFullyUnmapped = false;
 		if (!page->IsMapped()) {
-			atomic_add(&gMappedPagesCount, -1);
+			vm_page_add_mapped_pages(-1);
 			pageFullyUnmapped = true;
 		}
 
@@ -163,6 +163,14 @@ VMTranslationMap::UnmapArea(VMArea* area, bool deletingAddressSpace,
 		vm_free_page_mapping(mapping->page->physical_page_number, mapping, freeFlags);
 }
 
+
+
+bool
+VMTranslationMap::TestAndClearAccessed(VMArea* area, addr_t address,
+	bool& _modified)
+{
+	return ClearAccessedAndModified(area, address, false, _modified);
+}
 
 /*!	Print mapping information for a virtual address.
 	The method navigates the paging structures and prints all relevant
@@ -258,7 +266,7 @@ VMTranslationMap::PageUnmapped(VMArea* area, page_num_t pageNumber,
 		recursive_lock_unlock(&fLock);
 
 	if (!page->IsMapped()) {
-		atomic_add(&gMappedPagesCount, -1);
+		vm_page_add_mapped_pages(-1);
 
 		if (updatePageQueue) {
 			if (page->Cache()->temporary)
@@ -324,7 +332,7 @@ VMTranslationMap::UnaccessedPageUnmapped(VMArea* area, page_num_t pageNumber)
 	recursive_lock_unlock(&fLock);
 
 	if (!page->IsMapped())
-		atomic_add(&gMappedPagesCount, -1);
+		vm_page_add_mapped_pages(-1);
 
 	if (mapping != NULL) {
 		vm_free_page_mapping(pageNumber, mapping,

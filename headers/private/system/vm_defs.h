@@ -26,9 +26,13 @@
 #define B_KERNEL_AREA			(1 << 14)
 	// Usable from userland according to its protection flags, but the area
 	// itself is not deletable, resizable, etc from userland.
+#define B_LARGE_PAGES_AREA		(1 << 15)
+	// An anonymous B_NO_LOCK area whose aligned ranges are mapped with large
+	// (2 MiB) pages where the architecture can, while memory is plentiful.
 
 #define B_USER_AREA_FLAGS		\
-	(B_USER_PROTECTION | B_OVERCOMMITTING_AREA | B_CLONEABLE_AREA)
+	(B_USER_PROTECTION | B_OVERCOMMITTING_AREA | B_CLONEABLE_AREA \
+		| B_LARGE_PAGES_AREA)
 #define B_KERNEL_AREA_FLAGS \
 	(B_KERNEL_PROTECTION | B_SHARED_AREA)
 

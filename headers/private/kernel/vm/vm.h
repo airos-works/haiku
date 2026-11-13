@@ -124,6 +124,7 @@ bool vm_test_map_modification(struct vm_page *page);
 void vm_clear_map_flags(struct vm_page *page, uint32 flags);
 void vm_remove_all_page_mappings(struct vm_page *page);
 int32 vm_clear_page_mapping_accessed_flags(struct vm_page *page);
+int32 vm_test_and_clear_page_mapping_accessed(struct vm_page *page);
 int32 vm_remove_all_page_mappings_if_unaccessed(struct vm_page *page);
 status_t vm_wire_page(team_id team, addr_t address, bool writable,
 			struct VMPageWiringInfo* info);

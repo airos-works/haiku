@@ -9,6 +9,8 @@
 
 #include "paging/X86VMTranslationMap.h"
 
+#include <vm/vm_page.h>
+
 
 struct X86PagingStructures64Bit;
 
@@ -52,6 +54,15 @@ struct X86VMTranslationMap64Bit : X86VMTranslationMap {
 									VMArea* area, addr_t address,
 									bool unmapIfUnaccessed,
 									bool& _modified);
+	virtual	bool				TestAndClearAccessed(VMArea* area,
+									addr_t address, bool& _modified);
+
+	virtual	size_t				LargePageSize() const;
+	virtual	bool				CanMapLarge(addr_t virtualAddress);
+	virtual	status_t			MapLarge(addr_t virtualAddress,
+									phys_addr_t physicalAddress,
+									uint32 attributes, uint32 memoryType,
+									vm_page_reservation* reservation);
 
 	virtual	bool				DebugGetReverseMappingInfo(
 									phys_addr_t physicalAddress,
@@ -62,8 +73,15 @@ struct X86VMTranslationMap64Bit : X86VMTranslationMap {
 									{ return fPagingStructures; }
 
 private:
+			void				_SplitLargePages(addr_t start, addr_t end);
+			void				_SplitLargePage(addr_t address, uint64* pde);
+
+private:
 			X86PagingStructures64Bit* fPagingStructures;
 			bool				fLA57;
+			int32				fLargePageCount;
+			vm_page_reservation	fSplitReservation;
+				// a page for every large page, to split it
 };
 
 

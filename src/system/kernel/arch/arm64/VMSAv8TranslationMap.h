@@ -8,6 +8,7 @@
 
 #include <arch_cpu_defs.h>
 #include <vm/VMTranslationMap.h>
+#include <vm/vm_page.h>
 
 
 static constexpr uint64_t kPteAddrMask = (((1UL << 36) - 1) << 12);
@@ -20,6 +21,9 @@ static constexpr uint64_t kPteTypeL012Table = 0x3;
 static constexpr uint64_t kPteTypeL12Block = 0x1;
 static constexpr uint64_t kPteTypeL3Page = 0x3;
 
+static constexpr uint64_t kAttrSWMAYBECACHED = (1UL << 57);
+	// AF was cleared without a TLB invalidation (page daemon ageing), so a
+	// TLB may still hold the entry
 static constexpr uint64_t kAttrSWDIRTY = (1UL << 56);
 static constexpr uint64_t kAttrSWDBM = (1UL << 55);
 static constexpr uint64_t kAttrUXN = (1UL << 54);
@@ -80,6 +84,15 @@ public:
 									VMArea* area, addr_t address,
 									bool unmapIfUnaccessed,
 									bool& _modified);
+	virtual	bool				TestAndClearAccessed(VMArea* area,
+									addr_t address, bool& _modified);
+
+	virtual	size_t				LargePageSize() const;
+	virtual	bool				CanMapLarge(addr_t virtualAddress);
+	virtual	status_t			MapLarge(addr_t virtualAddress,
+									phys_addr_t physicalAddress,
+									uint32 attributes, uint32 memoryType,
+									vm_page_reservation* reservation);
 
 	virtual	void				Flush();
 
@@ -111,6 +124,9 @@ private:
 	int fInitialLevel;
 	int fASID;
 	int fRefcount;
+	int32 fLargePageCount;
+	vm_page_reservation fSplitReservation;
+		// a page for every large page (level 2 block), to split it
 
 private:
 	static uint8_t MairIndex(uint8_t type);
@@ -123,6 +139,10 @@ private:
 		vm_page_reservation* reservation, UpdatePte &&updatePte);
 	bool AttemptPteBreakBeforeMake(uint64_t* ptePtr, uint64_t oldPte, addr_t va);
 	bool FlushVAIfAccessed(uint64_t pte, addr_t va);
+	uint64_t* LargePageEntry(addr_t va, vm_page_reservation* reservation);
+	uint64_t* BlockEntry(addr_t va);
+	void SplitLargePages(addr_t start, addr_t end);
+	void SplitLargePage(addr_t va, uint64_t* entry);
 };
 
 

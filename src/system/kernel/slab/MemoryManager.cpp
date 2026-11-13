@@ -1533,7 +1533,7 @@ MemoryManager::_MapChunk(VMArea* vmArea, addr_t address, size_t size,
 		cache->InsertPage(page, offset);
 
 		page->IncrementWiredCount();
-		atomic_add(&gMappedPagesCount, 1);
+		vm_page_add_mapped_pages(1);
 
 		translationMap->Map(vmArea->Base() + offset,
 			page->physical_page_number * B_PAGE_SIZE,
@@ -1571,7 +1571,7 @@ MemoryManager::_UnmapChunk(VMArea* vmArea, addr_t address, size_t size,
 	// unmap the pages
 	translationMap->Lock();
 	translationMap->Unmap(address, address + size - 1);
-	atomic_add(&gMappedPagesCount, -(size / B_PAGE_SIZE));
+	vm_page_add_mapped_pages(-(size / B_PAGE_SIZE));
 	translationMap->Unlock();
 
 	// free the pages
