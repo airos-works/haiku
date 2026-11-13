@@ -213,7 +213,9 @@ struct rge_tx_desc {
 	uint32_t		rge_cmdsts;
 	uint32_t		rge_extsts;
 	uint64_t		rge_addr;
+#ifndef __HAIKU__
 	uint32_t		reserved[4];
+#endif
 } __packed __aligned(16);
 
 #define RGE_TDCMDSTS_COLL	0x000f0000

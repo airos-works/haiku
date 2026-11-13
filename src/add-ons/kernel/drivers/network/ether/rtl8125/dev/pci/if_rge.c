@@ -936,7 +936,13 @@ rge_init(struct ifnet *ifp)
 	rge_write_mac_ocp(sc, 0xc140, 0xffff);
 	rge_write_mac_ocp(sc, 0xc142, 0xffff);
 
+#ifdef __HAIKU__
+	/* The 16-byte transmit descriptors Linux's r8169 uses ("disable new tx
+	 * descriptor format"): giant send (TSO) is only known to work in them. */
+	RGE_MAC_CLRBIT(sc, 0xeb58, 0x0001);
+#else
 	RGE_MAC_SETBIT(sc, 0xeb58, 0x0001);
+#endif
 
 	if (RGE_TYPE_R26(sc) || sc->rge_type == MAC_R27) {
 		RGE_CLRBIT_1(sc, 0xd8, 0x02);
