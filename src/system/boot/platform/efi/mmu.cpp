@@ -176,6 +176,26 @@ platform_allocate_region_below(void **_address, size_t size, phys_addr_t maxAddr
 }
 
 
+/*!	Makes pages the loader allocated itself, before its heap existed, part of
+	what the kernel gets mapped, as platform_allocate_region() does.
+*/
+extern "C" status_t
+platform_add_allocated_region(phys_addr_t physicalAddress, size_t size)
+{
+	memory_region *region = new(std::nothrow) memory_region {
+		next: allocated_regions,
+		vaddr: 0,
+		paddr: physicalAddress,
+		size: size
+	};
+	if (region == NULL)
+		return B_NO_MEMORY;
+
+	allocated_regions = region;
+	return B_OK;
+}
+
+
 /*!
 	Neither \a virtualAddress nor \a size need to be aligned, but the function
 	will map all pages the range intersects with.

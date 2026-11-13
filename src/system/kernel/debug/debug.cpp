@@ -120,6 +120,13 @@ static bool sBlueScreenEnabled = false;
 static bool sDebugScreenEnabled = false;
 static bool sBlueScreenOutput = true;
 static bool sEmergencyKeysEnabled = true;
+// panic_reboot_timeout in the kernel settings: seconds the kernel debugger
+// waits for a key after a panic before it restarts the machine; 0 waits for
+// ever. A panic nobody sees (a display asleep, a machine without one) leaves
+// a machine that looks alive and answers nothing until it is reset by hand;
+// the restart keeps RAM, so the loaders that keep the syslog buffer in place
+// hand the panic to the next start (/var/log/previous_syslog).
+static int32 sPanicRebootTimeout = 0;
 static spinlock sSpinlock = B_SPINLOCK_INITIALIZER;
 static int32 sDebuggerOnCPU = -1;
 
@@ -718,30 +725,70 @@ read_line(char* buffer, int32 maxLength,
 }
 
 
+static int
+try_getc(void)
+{
+	int c = arch_debug_serial_try_getchar();
+	if (c >= 0)
+		return c;
+
+	if (sBlueScreenOutput) {
+		c = blue_screen_try_getchar();
+		if (c >= 0)
+			return c;
+	}
+
+	for (uint32 i = 0; i < kMaxDebuggerModules; i++) {
+		if (sDebuggerModules[i] && sDebuggerModules[i]->debugger_getchar) {
+			c = sDebuggerModules[i]->debugger_getchar();
+			if (c >= 0)
+				return c;
+		}
+	}
+	return -1;
+}
+
+
+/*!	After a panic with panic_reboot_timeout set: restarts the machine unless
+	a key arrives within that many seconds.
+*/
+static void
+reboot_after_panic_unless_attended()
+{
+	kprintf("No key within %" B_PRId32 " seconds restarts the machine "
+		"(panic_reboot_timeout in the kernel settings).\n",
+		sPanicRebootTimeout);
+
+	// arch_debug_snooze() spins, as nothing else runs in here
+	const bigtime_t kStep = 5000;
+	for (bigtime_t waited = 0; waited < sPanicRebootTimeout * 1000000LL;
+			waited += kStep) {
+		if (try_getc() >= 0) {
+			kprintf("A key was pressed: staying in the kernel debugger.\n");
+			return;
+		}
+		arch_debug_snooze(kStep);
+	}
+
+	kprintf("Nobody answered: restarting.\n");
+#if defined(__i386__) || defined(__x86_64__)
+	// the syslog buffer must be in RAM, not only in this CPU's cache, when
+	// the next start looks for it
+	asm volatile("wbinvd" ::: "memory");
+#endif
+	arch_cpu_shutdown(true);
+	kprintf("Restarting failed.\n");
+}
+
+
 char
 kgetc(void)
 {
 	while (true) {
-		// check serial input
-		int c = arch_debug_serial_try_getchar();
+		// serial input, the blue screen's keyboard, the debugger modules
+		int c = try_getc();
 		if (c >= 0)
 			return (char)c;
-
-		// check blue screen input
-		if (sBlueScreenOutput) {
-			c = blue_screen_try_getchar();
-			if (c >= 0)
-				return (char)c;
-		}
-
-		// give the kernel debugger modules a chance
-		for (uint32 i = 0; i < kMaxDebuggerModules; i++) {
-			if (sDebuggerModules[i] && sDebuggerModules[i]->debugger_getchar) {
-				int getChar = sDebuggerModules[i]->debugger_getchar();
-				if (getChar >= 0)
-					return (char)getChar;
-			}
-		}
 
 		arch_debug_snooze(5000);
 	}
@@ -924,6 +971,11 @@ kernel_debugger_loop(const char* messagePrefix, const char* message,
 		execute_panic_commands();
 
 		blue_screen_set_paging(pagingEnabled);
+	}
+
+	if (sPanicRebootTimeout > 0 && messagePrefix != NULL
+		&& strcmp(messagePrefix, "PANIC: ") == 0) {
+		reboot_after_panic_unless_attended();
 	}
 
 	int32 continuableLine = -1;
@@ -1952,6 +2004,15 @@ debug_init_post_settings(struct kernel_args* args)
 	sEmergencyKeysEnabled = get_safemode_boolean("emergency_keys",
 		sEmergencyKeysEnabled);
 	sDebugScreenEnabled = get_safemode_boolean("debug_screen", false);
+
+	char timeout[16];
+	size_t timeoutLength = sizeof(timeout);
+	if (get_safemode_option("panic_reboot_timeout", timeout, &timeoutLength)
+			== B_OK) {
+		sPanicRebootTimeout = strtol(timeout, NULL, 10);
+		if (sPanicRebootTimeout < 0)
+			sPanicRebootTimeout = 0;
+	}
 
 	if ((sBlueScreenOutput || sDebugScreenEnabled)
 			&& blue_screen_init() != B_OK)

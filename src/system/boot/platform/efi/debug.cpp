@@ -11,9 +11,11 @@
 #include <boot/platform.h>
 #include <boot/stage2.h>
 #include <boot/stdio.h>
+#include <kernel.h>
 #include <util/ring_buffer.h>
 
 #include "efi_platform.h"
+#include "mmu.h"
 #include "serial.h"
 
 #include <efi/protocol/loaded-image.h>
@@ -28,6 +30,20 @@ static uint32 sBufferPosition;
 static const uint32 kKernelLogSize = 16384;
 
 static ring_buffer* sDebugSyslogBuffer = NULL;
+
+// The syslog buffer the kernel keeps writing to (keep_debug_output_buffer),
+// 1 MB. On x86 it is where the BIOS loader puts it, at 63 MB, whenever the
+// firmware has that memory free: a restart that keeps RAM (a reset, or the
+// kernel's own after a panic, panic_reboot_timeout) then finds the previous
+// session's log there, a panic's kernel debugger output included, and the
+// kernel saves it as /var/log/previous_syslog. Elsewhere, or when the memory
+// is taken, the buffer goes anywhere and nothing is recovered.
+static const size_t kSyslogBufferSize = 1024 * 1024;
+static const char* const kDebugSyslogSignature = "Haiku syslog";
+#if defined(__i386__) || defined(__x86_64__)
+static const efi_physical_addr kFixedSyslogBuffer = 63 * 1024 * 1024;
+#endif
+static efi_physical_addr sFixedSyslogBuffer = 0;
 
 
 static void
@@ -105,9 +121,62 @@ allocate_ring_buffer(void)
 
 
 void
+debug_reserve_syslog_buffer(void)
+{
+#if defined(__i386__) || defined(__x86_64__)
+	efi_physical_addr address = kFixedSyslogBuffer;
+	if (kBootServices->AllocatePages(AllocateAddress, EfiLoaderData,
+			kSyslogBufferSize / B_PAGE_SIZE, &address) == EFI_SUCCESS)
+		sFixedSyslogBuffer = address;
+#endif
+}
+
+
+/*!	The syslog buffer at the fixed address: what the previous session wrote
+	there goes to the kernel (previous_debug_output) when it asked for it.
+*/
+static bool
+use_fixed_ring_buffer(void)
+{
+	if (sFixedSyslogBuffer == 0
+		|| platform_add_allocated_region(sFixedSyslogBuffer, kSyslogBufferSize)
+			!= B_OK) {
+		gKernelArgs.previous_debug_size = 0;
+		return false;
+	}
+
+	uint8* base = (uint8*)(addr_t)sFixedSyslogBuffer;
+	size_t signatureLength = strlen(kDebugSyslogSignature);
+	bool recover = memcmp(base, kDebugSyslogSignature, signatureLength) == 0;
+	size_t offset = ROUNDUP(signatureLength, sizeof(void*));
+	sDebugSyslogBuffer = create_ring_buffer_etc(base + offset,
+		kSyslogBufferSize - offset, recover ? RING_BUFFER_INIT_FROM_BUFFER : 0);
+
+	size_t readable = 0;
+	if (recover && gKernelArgs.previous_debug_size != 0)
+		readable = ring_buffer_readable(sDebugSyslogBuffer);
+	gKernelArgs.previous_debug_size = 0;
+	if (readable != 0) {
+		uint8* previous = (uint8*)kernel_args_malloc(readable);
+		if (previous != NULL) {
+			ring_buffer_read(sDebugSyslogBuffer, previous, readable);
+			gKernelArgs.previous_debug_output = previous;
+			gKernelArgs.previous_debug_size = readable;
+		}
+	}
+
+	gKernelArgs.debug_output = sDebugSyslogBuffer;
+	gKernelArgs.debug_size = sDebugSyslogBuffer->size;
+	return true;
+}
+
+
+void
 debug_cleanup(void)
 {
-	allocate_ring_buffer();
+	bool fixed = use_fixed_ring_buffer();
+	if (!fixed)
+		allocate_ring_buffer();
 
 	if (sDebugSyslogBuffer != NULL) {
 		if (gKernelArgs.keep_debug_output_buffer) {
@@ -128,6 +197,17 @@ debug_cleanup(void)
 			memcpy(gKernelArgs.debug_output, sBuffer, size);
 			gKernelArgs.debug_size = size;
 		}
+	}
+
+	if (fixed) {
+		// The next start recovers this session's log only if the kernel
+		// keeps writing it here.
+		void* base = (void*)(addr_t)sFixedSyslogBuffer;
+		size_t signatureLength = strlen(kDebugSyslogSignature);
+		if (gKernelArgs.keep_debug_output_buffer)
+			memcpy(base, kDebugSyslogSignature, signatureLength);
+		else
+			memset(base, 0, signatureLength);
 	}
 }
 

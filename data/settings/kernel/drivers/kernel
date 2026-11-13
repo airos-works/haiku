@@ -28,6 +28,13 @@ load_symbols true
 #emergency_keys false
 	# Disables emergency keys (ie. Alt-SysReq+*), enabled by default.
 
+#panic_reboot_timeout 60
+	# After a panic, the kernel debugger restarts the machine unless a key is
+	# pressed within this many seconds; 0 (the default) waits for ever. For
+	# machines whose panic nobody would see: a display asleep or none. On EFI
+	# x86 and BIOS starts the next session keeps the panic in
+	# /var/log/previous_syslog.
+
 #serial_debug_output false
 	# Disables serial debug output, which is enabled by default
 

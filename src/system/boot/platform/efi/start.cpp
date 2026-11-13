@@ -96,6 +96,7 @@ convert_kernel_args()
 	fix_address(gKernelArgs.vesa_modes);
 	fix_address(gKernelArgs.edid_info);
 	fix_address(gKernelArgs.debug_output);
+	fix_address(gKernelArgs.previous_debug_output);
 	fix_address(gKernelArgs.boot_splash);
 
 	arch_convert_kernel_args();
@@ -275,6 +276,8 @@ efi_main(efi_handle image, efi_system_table *systemTable)
 	console_init();
 	serial_init();
 	serial_enable();
+	// before anything else takes memory: what the last session left there
+	debug_reserve_syslog_buffer();
 
 	sBootOptions = get_loader_boot_options() | console_check_boot_keys();
 

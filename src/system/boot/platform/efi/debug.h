@@ -10,6 +10,7 @@
 extern "C" {
 #endif
 
+void debug_reserve_syslog_buffer(void);
 void debug_cleanup(void);
 
 #ifdef __cplusplus
