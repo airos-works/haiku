@@ -850,6 +850,8 @@ init_stack()
 #endif
 	register_domain_datalink_protocols(AF_INET6, IFT_LOOP,
 		"network/datalink_protocols/loopback_frame/v1", NULL);
+	register_domain_datalink_protocols(AF_INET6, IFT_TUNNEL,
+		"network/datalink_protocols/loopback_frame/v1", NULL);
 	register_domain_datalink_protocols(AF_INET, IFT_ETHER,
 		"network/datalink_protocols/arp/v1",
 		"network/datalink_protocols/ethernet_frame/v1",

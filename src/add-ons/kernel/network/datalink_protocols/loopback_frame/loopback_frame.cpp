@@ -64,8 +64,9 @@ loopback_frame_init(struct net_interface*interface, net_domain* domain,
 		// Locally received buffers don't need a domain device handler, as the
 		// buffer reception is handled internally.
 	} else if (interface->device->type == IFT_TUNNEL) {
-		status = stack->register_domain_device_handler(
-			interface->device, B_NET_FRAME_TYPE_IPV4, domain);
+		status = stack->register_domain_device_handler(interface->device,
+			domain->family == AF_INET6
+				? B_NET_FRAME_TYPE_IPV6 : B_NET_FRAME_TYPE_IPV4, domain);
 		if (status != B_OK)
 			return status;
 	}
@@ -95,7 +96,11 @@ loopback_frame_uninit(net_datalink_protocol* protocol)
 	net_stack_module_info* stack;
 	if (get_module(NET_STACK_MODULE_NAME, (module_info**)&stack) == B_OK) {
 		stack->unregister_device_deframer(protocol->interface->device);
-		stack->unregister_device_handler(protocol->interface->device, 0);
+		if (protocol->interface->device->type == IFT_TUNNEL) {
+			stack->unregister_device_handler(protocol->interface->device,
+				protocol->domain->family == AF_INET6
+					? B_NET_FRAME_TYPE_IPV6 : B_NET_FRAME_TYPE_IPV4);
+		}
 		put_module(NET_STACK_MODULE_NAME);
 	}
 
