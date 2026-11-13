@@ -202,8 +202,11 @@ ethernet_up(net_device *_device)
 		if (device->supports_net_buffer
 			&& ioctl(device->fd, ETHER_GET_OFFLOAD, &offload,
 				sizeof(offload)) == 0
-			&& (offload & ETHER_OFFLOAD_TX_CHECKSUM_IPV4) != 0)
+			&& (offload & ETHER_OFFLOAD_TX_CHECKSUM_IPV4) != 0) {
 			device->offload |= NET_DEVICE_OFFLOAD_TX_CHECKSUM_IPV4;
+			if ((offload & ETHER_OFFLOAD_TCP_SEGMENTATION_IPV4) != 0)
+				device->offload |= NET_DEVICE_OFFLOAD_TCP_SEGMENTATION_IPV4;
+		}
 	}
 
 	if (ioctl(device->fd, ETHER_GETFRAMESIZE, &device->frame_size, sizeof(uint32)) < 0) {
@@ -293,7 +296,11 @@ ethernet_send_data(net_device *_device, net_buffer *buffer)
 	ethernet_device *device = (ethernet_device *)_device;
 
 //dprintf("try to send ethernet packet of %lu bytes (flags %ld):\n", buffer->size, buffer->flags);
-	if (buffer->size > device->frame_size || buffer->size < ETHER_HEADER_LENGTH)
+	if ((buffer->size > device->frame_size
+			&& ((buffer->buffer_flags & NET_BUFFER_SEGMENTATION_OFFLOAD) == 0
+				|| (device->offload & NET_DEVICE_OFFLOAD_TCP_SEGMENTATION_IPV4)
+					== 0))
+		|| buffer->size < ETHER_HEADER_LENGTH)
 		return B_BAD_VALUE;
 
 	if (device->supports_net_buffer) {

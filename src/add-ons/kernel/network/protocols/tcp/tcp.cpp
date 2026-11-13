@@ -440,7 +440,9 @@ add_tcp_header(net_address_module_info* addressModule,
 		segment.acknowledge, segment.urgent_offset, segment.advertised_window));
 
 	if ((buffer->buffer_flags & NET_BUFFER_L4_CHECKSUM_OFFLOAD) != 0) {
-		// the device sums the segment (airos-works/haiku#124)
+		// the device sums the segment (airos-works/haiku#124); one it is to
+		// cut up (NET_BUFFER_SEGMENTATION_OFFLOAD) starts from the same sum
+		// of the whole segment, as Linux gives Realtek chips
 		*TCPChecksumField(buffer) = Checksum::PseudoHeaderSum(addressModule,
 			buffer, IPPROTO_TCP);
 	} else {

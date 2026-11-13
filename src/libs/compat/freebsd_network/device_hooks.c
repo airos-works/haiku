@@ -21,6 +21,10 @@
  * chips have errata there, so a driver only gets checksum requests once it
  * was tested with them. */
 extern int __haiku_tx_checksum_offload __attribute__((weak));
+/* Likewise for TCP segmentation offload (CSUM_IP_TSO). The checksum field of
+ * such a segment holds the pseudo header sum with the length of the whole
+ * segment (see NET_BUFFER_SEGMENTATION_OFFLOAD), not FreeBSD's convention. */
+extern int __haiku_tcp_segmentation_offload __attribute__((weak));
 #include <kernel.h>
 #include <net_buffer.h>
 
@@ -183,7 +187,36 @@ compat_send(void *cookie, net_buffer *buffer)
 	if ((ifp->flags & DEVICE_CLOSED) != 0)
 		return B_INTERRUPTED;
 
-	if (length <= MHLEN) {
+	bool copied = false;
+	if ((buffer->buffer_flags & NET_BUFFER_SEGMENTATION_OFFLOAD) != 0
+		&& length > MJUMPAGESIZE) {
+		// a TCP segment for the device to cut up: up to 64 KB, in a chain
+		mb = m_getm2(NULL, length, M_NOWAIT, MT_DATA, M_PKTHDR);
+		if (mb == NULL)
+			return ENOBUFS;
+
+		int offset = 0;
+		for (struct mbuf* m = mb; m != NULL && offset < length;
+				m = m->m_next) {
+			int space = (m->m_flags & M_EXT) != 0 ? (int)m->m_ext.ext_size
+				: ((m->m_flags & M_PKTHDR) != 0 ? (int)MHLEN : (int)MLEN);
+			int chunk = min_c(space, length - offset);
+			status_t status = gBufferModule->read(buffer, offset,
+				mtod(m, void*), chunk);
+			if (status != B_OK) {
+				m_freem(mb);
+				return status;
+			}
+			m->m_len = chunk;
+			offset += chunk;
+		}
+		if (offset != length) {
+			m_freem(mb);
+			return E2BIG;
+		}
+		mb->m_pkthdr.len = length;
+		copied = true;
+	} else if (length <= MHLEN) {
 		mb = m_gethdr(0, MT_DATA);
 		if (mb == NULL)
 			return ENOBUFS;
@@ -195,12 +228,15 @@ compat_send(void *cookie, net_buffer *buffer)
 		length = min_c(length, mb->m_ext.ext_size);
 	}
 
-	status_t status = gBufferModule->read(buffer, 0, mtod(mb, void *), length);
-	if (status != B_OK) {
-		m_freem(mb);
-		return status;
+	if (!copied) {
+		status_t status = gBufferModule->read(buffer, 0, mtod(mb, void *),
+			length);
+		if (status != B_OK) {
+			m_freem(mb);
+			return status;
+		}
+		mb->m_pkthdr.len = mb->m_len = length;
 	}
-	mb->m_pkthdr.len = mb->m_len = length;
 
 	if ((buffer->buffer_flags & NET_BUFFER_L4_CHECKSUM_OFFLOAD) != 0) {
 		// The stack left the TCP/UDP checksum to the device (it only does so
@@ -213,7 +249,13 @@ compat_send(void *cookie, net_buffer *buffer)
 			uint8 protocol = frame[ETHER_HDR_LEN + 9];
 			// Not CSUM_IP: the IP header checksum is already computed, and
 			// with CSUM_IP some chips (e1000) add to what is there.
-			if (protocol == IPPROTO_TCP) {
+			if (protocol == IPPROTO_TCP
+				&& (buffer->buffer_flags & NET_BUFFER_SEGMENTATION_OFFLOAD)
+					!= 0) {
+				mb->m_pkthdr.csum_flags = CSUM_IP_TSO | CSUM_TCP;
+				mb->m_pkthdr.csum_data = 16;
+				mb->m_pkthdr.tso_segsz = buffer->segment_size;
+			} else if (protocol == IPPROTO_TCP) {
 				mb->m_pkthdr.csum_flags = CSUM_TCP;
 				mb->m_pkthdr.csum_data = 16;
 					// offsetof(struct tcphdr, th_sum)
@@ -370,8 +412,13 @@ compat_control(void *cookie, uint32 op, void *arg, size_t length)
 			uint32 offload = 0;
 			if (&__haiku_tx_checksum_offload != NULL
 				&& __haiku_tx_checksum_offload != 0
-				&& (ifp->if_capenable & IFCAP_TXCSUM) != 0)
+				&& (ifp->if_capenable & IFCAP_TXCSUM) != 0) {
 				offload |= ETHER_OFFLOAD_TX_CHECKSUM_IPV4;
+				if (&__haiku_tcp_segmentation_offload != NULL
+					&& __haiku_tcp_segmentation_offload != 0
+					&& (ifp->if_capenable & IFCAP_TSO4) != 0)
+					offload |= ETHER_OFFLOAD_TCP_SEGMENTATION_IPV4;
+			}
 			if (length < sizeof(offload))
 				return B_BAD_VALUE;
 			return user_memcpy(arg, &offload, sizeof(offload));

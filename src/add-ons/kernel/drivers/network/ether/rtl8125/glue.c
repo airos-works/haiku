@@ -17,3 +17,7 @@ NO_HAIKU_FIRMWARE_NAME_MAP();
 /* rge_encap() turns CSUM_IP/CSUM_TCP/CSUM_UDP into descriptor bits; checked
  * on an RTL8126 (airos-works/haiku#124) */
 int __haiku_tx_checksum_offload = 1;
+
+
+/* rge_encap() programs large send as Linux's r8169 does (airos-works/haiku#124) */
+int __haiku_tcp_segmentation_offload = 1;

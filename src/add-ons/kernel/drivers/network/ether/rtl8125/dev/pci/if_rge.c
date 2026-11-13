@@ -388,8 +388,8 @@ rge_attach(struct device *parent, struct device *self, void *aux)
 #ifdef __HAIKU__
 	/* rge_encap() turns the checksum requests of an mbuf into descriptor
 	 * bits; tell the stack it may leave IPv4 TCP/UDP checksums to us. */
-	ifp->if_capabilities |= IFCAP_TXCSUM;
-	ifp->if_capenable |= IFCAP_TXCSUM;
+	ifp->if_capabilities |= IFCAP_TXCSUM | IFCAP_TSO4;
+	ifp->if_capenable |= IFCAP_TXCSUM | IFCAP_TSO4;
 #endif
 #ifndef __FreeBSD_version
 	ifp->if_hardmtu = RGE_JUMBO_MTU;
@@ -670,6 +670,19 @@ rge_encap(struct ifnet *ifp, struct rge_queues *q, struct mbuf *m, int idx)
 			cflags |= RGE_TDEXTSTS_UDPCSUM;
 	}
 
+#ifdef __HAIKU__
+	uint32_t tsoflags = 0;
+	if ((m->m_pkthdr.csum_flags & CSUM_IP_TSO) != 0) {
+		/* Linux r8169 rtl8169_tso_csum_v2(): giant send for IPv4 replaces
+		 * the checksum bits; the chip sums each segment itself */
+		const uint8_t *frame = mtod(m, const uint8_t *);
+		uint32_t thoff = ETHER_HDR_LEN + (frame[ETHER_HDR_LEN] & 0x0f) * 4;
+		tsoflags = RGE_TDCMDSTS_GTSENV4
+		    | (thoff << RGE_TDCMDSTS_GTTCPHO_SHIFT);
+		cflags = (uint32_t)m->m_pkthdr.tso_segsz << RGE_TDEXTSTS_MSS_SHIFT;
+	}
+#endif
+
 	/* Set up hardware VLAN tagging. */
 #if NVLAN > 0
 	if (m->m_flags & M_VLANTAG)
@@ -682,6 +695,9 @@ rge_encap(struct ifnet *ifp, struct rge_queues *q, struct mbuf *m, int idx)
 
 		cmdsts = RGE_TDCMDSTS_OWN;
 		cmdsts |= txmap->dm_segs[i].ds_len;
+#ifdef __HAIKU__
+		cmdsts |= tsoflags;
+#endif
 
 		if (cur == RGE_TX_LIST_CNT - 1)
 			cmdsts |= RGE_TDCMDSTS_EOR;
@@ -700,6 +716,9 @@ rge_encap(struct ifnet *ifp, struct rge_queues *q, struct mbuf *m, int idx)
 
 	cmdsts = RGE_TDCMDSTS_SOF;
 	cmdsts |= txmap->dm_segs[0].ds_len;
+#ifdef __HAIKU__
+	cmdsts |= tsoflags;
+#endif
 
 	if (idx == RGE_TX_LIST_CNT - 1)
 		cmdsts |= RGE_TDCMDSTS_EOR;
@@ -1339,8 +1358,14 @@ rge_allocmem(struct rge_softc *sc)
 
 	/* Create DMA maps for TX buffers. */
 	for (i = 0; i < RGE_TX_LIST_CNT; i++) {
+#ifdef __HAIKU__
+		/* large enough for a TSO frame */
+		error = bus_dmamap_create(sc->sc_dmat, RGE_TSO_MAXSIZE,
+		    RGE_TX_NSEGS, RGE_JUMBO_FRAMELEN, 0,
+#else
 		error = bus_dmamap_create(sc->sc_dmat, RGE_JUMBO_FRAMELEN,
 		    RGE_TX_NSEGS, RGE_JUMBO_FRAMELEN, 0,
+#endif
 		    BUS_DMA_NOWAIT | BUS_DMA_ALLOCNOW,
 		    &q->q_tx.rge_txq[i].txq_dmamap);
 		if (error) {

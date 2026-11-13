@@ -42,6 +42,10 @@ typedef struct net_device {
 // net_device::offload
 #define NET_DEVICE_OFFLOAD_TX_CHECKSUM_IPV4	0x01
 	// computes TCP and UDP checksums over IPv4 when sending
+#define NET_DEVICE_OFFLOAD_TCP_SEGMENTATION_IPV4	0x02
+	// cuts TCP segments over IPv4 of up to NET_DEVICE_MAX_OFFLOAD_SIZE bytes
+	// into MTU-sized ones
+#define NET_DEVICE_MAX_OFFLOAD_SIZE	64000
 
 
 struct net_device_module_info {

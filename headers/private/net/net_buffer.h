@@ -22,6 +22,12 @@ enum net_buffer_flags {
 	NET_BUFFER_L4_CHECKSUM_OFFLOAD = (1 << 2),
 		// the device computes the TCP/UDP checksum; the field holds the sum
 		// of the pseudo header, as with FreeBSD's CSUM_TCP/CSUM_UDP
+	NET_BUFFER_SEGMENTATION_OFFLOAD = (1 << 3),
+		// a TCP segment larger than the MTU that the device cuts into
+		// segments of segment_size bytes of data each; the checksum field
+		// holds the sum of the pseudo header of the whole segment, length
+		// included (what Linux gives Realtek chips; FreeBSD's CSUM_TSO
+		// leaves the length out)
 };
 
 
@@ -45,6 +51,8 @@ typedef struct net_buffer {
 	uint32					size;
 	uint8					protocol;
 	uint16					buffer_flags;
+	uint16					segment_size;
+		// for NET_BUFFER_SEGMENTATION_OFFLOAD
 } net_buffer;
 
 struct ancillary_data_container;

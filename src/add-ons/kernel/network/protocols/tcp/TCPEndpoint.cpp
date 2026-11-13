@@ -3085,7 +3085,8 @@ TCPEndpoint::_ShouldSendSegment(tcp_segment_header& segment, uint32 length,
 		// - the buffer is at least larger than half of the maximum send window,
 		//   or
 		// - we're retransmitting data
-		if (length == segmentMaxSize
+		if (length >= segmentMaxSize
+				// more than one segment: for a device that segments TCP
 			|| tcp_sequence(fSendNext + length) == fSendQueue.LastSequence()
 			|| (fSendMaxWindow > 0 && length >= fSendMaxWindow / 2))
 			return true;
@@ -3318,11 +3319,35 @@ TCPEndpoint::_SendQueued(bool force)
 		length = min_c(length, fSendMaxSegmentSize);
 	}
 
+	// A device that segments TCP gets up to NET_DEVICE_MAX_OFFLOAD_SIZE in
+	// one buffer, a whole number of segments; not for retransmissions, nor
+	// in fast recovery (airos-works/haiku#124)
+	const bool segmentation = !retransmit && fDuplicateAcknowledgeCount == 0
+		&& fState == ESTABLISHED && Domain()->family == AF_INET
+		&& fRoute != NULL && fRoute->interface_address != NULL
+		&& fRoute->interface_address->interface != NULL
+		&& fRoute->interface_address->interface->device != NULL
+		&& (fRoute->interface_address->interface->device->offload
+			& NET_DEVICE_OFFLOAD_TCP_SEGMENTATION_IPV4) != 0;
+
 	do {
 		uint32 optionsLength = tcp_options_length(segment);
 		uint32 segmentMaxSize = fSendMaxSegmentSize > optionsLength
 			? fSendMaxSegmentSize - optionsLength : 0;
 		uint32 segmentLength = min_c(length, segmentMaxSize);
+		if (segmentation && segmentMaxSize > 0 && length > segmentMaxSize) {
+			// leave room for the headers in the device's limit
+			uint32 maxLength = (NET_DEVICE_MAX_OFFLOAD_SIZE - 128)
+				/ segmentMaxSize * segmentMaxSize;
+			segmentLength = min_c(length, maxLength);
+			if (segmentLength % segmentMaxSize != 0
+				&& fSendNext + segmentLength != fSendQueue.LastSequence()) {
+				// whole segments only, unless this is the end of the data:
+				// the rest waits for more data or window like any partial
+				// segment
+				segmentLength -= segmentLength % segmentMaxSize;
+			}
+		}
 
 		if (retransmit && fDuplicateAcknowledgeCount == 0
 			&& segmentLength < segmentMaxSize
@@ -3360,6 +3385,11 @@ TCPEndpoint::_SendQueued(bool force)
 		if (status < B_OK) {
 			gBufferModule->free(buffer);
 			return status;
+		}
+
+		if (segmentLength > segmentMaxSize) {
+			buffer->buffer_flags |= NET_BUFFER_SEGMENTATION_OFFLOAD;
+			buffer->segment_size = (uint16)segmentMaxSize;
 		}
 
 		sendWindow -= buffer->size;

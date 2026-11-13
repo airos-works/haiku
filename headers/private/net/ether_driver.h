@@ -37,6 +37,9 @@ enum {
 	/* TCP and UDP checksums over IPv4 when sending (net_buffers flagged
 	   NET_BUFFER_L4_CHECKSUM_OFFLOAD, with the pseudo header sum in the
 	   checksum field) */
+#define ETHER_OFFLOAD_TCP_SEGMENTATION_IPV4	0x02
+	/* TCP segments over IPv4 of up to 64000 bytes (net_buffers flagged
+	   NET_BUFFER_SEGMENTATION_OFFLOAD, see there) */
 
 
 /* ETHER_GETADDR - MAC address */

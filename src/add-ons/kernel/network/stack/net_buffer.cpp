@@ -1075,6 +1075,7 @@ copy_metadata(net_buffer* destination, const net_buffer* source)
 
 	destination->msg_flags = source->msg_flags;
 	destination->buffer_flags = source->buffer_flags;
+	destination->segment_size = source->segment_size;
 	destination->interface_address = source->interface_address;
 	if (destination->interface_address != NULL)
 		((InterfaceAddress*)destination->interface_address)->AcquireReference();
@@ -1129,6 +1130,7 @@ create_buffer(size_t headerSpace)
 	buffer->offset = 0;
 	buffer->msg_flags = 0;
 	buffer->buffer_flags = 0;
+	buffer->segment_size = 0;
 	buffer->size = 0;
 
 	CHECK_BUFFER(buffer);

@@ -1751,7 +1751,8 @@ ipv4_send_routed_data(net_protocol* _protocol, struct net_route* route,
 		ntohl(destination.sin_addr.s_addr));
 
 	uint32 mtu = route->mtu ? route->mtu : interface->device->mtu;
-	if (buffer->size > mtu) {
+	if (buffer->size > mtu
+		&& (buffer->buffer_flags & NET_BUFFER_SEGMENTATION_OFFLOAD) == 0) {
 		if (protocol != NULL && (protocol->flags & IP_FLAG_DONT_FRAGMENT) != 0)
 			return EMSGSIZE;
 

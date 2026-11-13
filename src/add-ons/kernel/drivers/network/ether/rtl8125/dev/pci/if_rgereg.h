@@ -221,6 +221,14 @@ struct rge_tx_desc {
 #define RGE_TDCMDSTS_COLL	0x000f0000
 #define RGE_TDCMDSTS_EXCESSCOLL	0x00100000
 #define RGE_TDCMDSTS_TXERR	0x00800000
+#ifdef __HAIKU__
+/* Large send (TSO), as Linux's r8169 programs it for these chips: the first
+ * word gets "giant send" and the TCP header offset, the second the MSS. */
+#define RGE_TDCMDSTS_GTSENV4	0x04000000
+#define RGE_TDCMDSTS_GTTCPHO_SHIFT	18
+#define RGE_TDEXTSTS_MSS_SHIFT	18
+#define RGE_TSO_MAXSIZE		65536
+#endif
 #define RGE_TDCMDSTS_EOF	0x10000000
 #define RGE_TDCMDSTS_SOF	0x20000000
 #define RGE_TDCMDSTS_EOR	0x40000000
