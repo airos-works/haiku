@@ -15,6 +15,9 @@ extern "C" {
 
 #include <kernel/heap.h>
 #include <kernel/vm/vm.h>
+#include <kernel/vm/vm_priv.h>
+#include <kernel/vm/VMAddressSpace.h>
+#include <kernel/vm/VMTranslationMap.h>
 
 #if defined(FBSD_NONCOHERENT_DMA)
 #include <arch/arm64/cache_poc.h>
@@ -250,6 +253,22 @@ _kernel_contig_dma_address(const void* address, size_t size,
 vm_paddr_t
 pmap_kextract(vm_offset_t virtualAddress)
 {
+	if (IS_KERNEL_ADDRESS(virtualAddress)) {
+		// Walk the kernel's page tables directly, as FreeBSD's pmap_kextract()
+		// does: get_memory_map() looks up and references the address space
+		// and locks it for every call, and drivers call this for every buffer
+		// they hand to the device (airos-works/haiku#122). The caller owns
+		// the buffer, so its mapping cannot go away meanwhile.
+		const addr_t page = ROUNDDOWN((addr_t)virtualAddress, B_PAGE_SIZE);
+		phys_addr_t physical;
+		uint32 flags;
+		if (VMAddressSpace::Kernel()->TranslationMap()->QueryInterrupt(page,
+				&physical, &flags) == B_OK
+			&& (flags & PAGE_PRESENT) != 0) {
+			return (vm_paddr_t)(physical + (virtualAddress - page));
+		}
+	}
+
 	physical_entry entry;
 	status_t status = get_memory_map((void *)virtualAddress, 1, &entry, 1);
 	if (status < B_OK) {
