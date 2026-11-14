@@ -215,6 +215,7 @@ if $(TARGET_ARCH) = arm64 {
 	# Radxa Cubie A7S's pin headers for AirPins
 	AddDriversToPackage audio hmulti :
 		bcm2835_audio
+		bcm2712_hdmi_audio
 		;
 	AddDriversToPackage misc :
 		<driver>vchiq
