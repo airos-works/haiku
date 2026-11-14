@@ -11,12 +11,17 @@ HardwareTimer *HardwareTimer::sInstance = NULL;
 void
 InterruptController::LoadRoutingSetting()
 {
+	// Opt-in until it has been tried on each board: on the Dragon Q8B
+	// (SC8280XP) the SD card's interrupt never arrived once routed away
+	// from CPU 0 - "did not find any boot partitions" - and #101 had only
+	// run in QEMU.
 	void* settings = load_driver_settings("kernel");
 	fRoutingEnabled = get_driver_boolean_parameter(settings, "irq_routing",
-		true, true);
+		false, true);
 	unload_driver_settings(settings);
-	if (!fRoutingEnabled)
-		dprintf("irq routing: off (kernel settings), shared interrupts stay on CPU 0\n");
+	dprintf("irq routing: %s (\"irq_routing\" in the kernel settings)\n",
+		fRoutingEnabled ? "on, shared interrupts go to every CPU"
+			: "off, shared interrupts stay on CPU 0");
 }
 
 
