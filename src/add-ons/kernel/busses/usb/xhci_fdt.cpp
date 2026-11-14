@@ -736,8 +736,10 @@ init_fdt(device_node* node, void** cookie)
 	platform.interrupt = resources.interrupt;
 	platform.dma_coherent = resources.dma_coherent;
 
-	// The Qualcomm glue is the core's parent node.
+	// The Qualcomm glue is the core's parent node; the Raspberry Pi 5's
+	// cores sit on the RP1's bus ("rp1").
 	bool qualcomm = false;
+	bool rp1 = false;
 	device_node* glue = gDeviceManager->get_parent_node(parent);
 	if (glue != NULL) {
 		fdt_device_module_info* glueFDT;
@@ -751,6 +753,8 @@ init_fdt(device_node* node, void** cookie)
 					"qcom,sc8280xp-dwc3")
 				|| usb_fdt_has_string(glueFDT, glueDevice, "compatible",
 					"qcom,sc8280xp-dwc3-mp");
+			const char* glueName = glueFDT->get_name(glueDevice);
+			rp1 = glueName != NULL && strcmp(glueName, "rp1") == 0;
 		}
 		gDeviceManager->put_node(glue);
 	}
@@ -769,9 +773,11 @@ init_fdt(device_node* node, void** cookie)
 		// SC8280XP's run at SuperSpeed by default (an RTL9210 NVMe adapter
 		// reads 177 MB/s on the Dragon Q8B); "dwc3_superspeed false" turns
 		// them down.
+		// The RP1's run at SuperSpeed too: they are the Pi 5's USB 3
+		// ports, with no hub of their own in between.
 		void* settings = load_driver_settings("xhci");
 		platform.usb2_only = !get_driver_boolean_parameter(settings,
-			"dwc3_superspeed", qualcomm, true);
+			"dwc3_superspeed", qualcomm || rp1, true);
 		unload_driver_settings(settings);
 
 		if (usb_fdt_has_string(fdt, device, "compatible", "rockchip,rk3588-dwc3")
