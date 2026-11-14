@@ -30,6 +30,15 @@
 #include "file_systems/packagefs/packagefs.h"
 
 
+/*!	Platforms with a store the loader can write (EFI variables) count the
+	starts of an update on trial there: returns the count for \a key, after
+	incrementing it if \a count is \c true. Weak: other platforms leave it
+	out.
+*/
+extern "C" int platform_airos_trial_starts(const char* key, bool count)
+	__attribute__((weak));
+
+
 using namespace boot;
 
 //#define TRACE_VFS
@@ -633,6 +642,12 @@ BootVolume::_ChooseAirosState()
 			return info->States().Head()->IsBootable();
 		}
 
+		int LoaderTrialStarts(const char* key)
+		{
+			return platform_airos_trial_starts != NULL
+				? platform_airos_trial_starts(key, false) : 0;
+		}
+
 		const char* NewestOldState()
 		{
 			info->LoadOldStates();
@@ -645,6 +660,18 @@ BootVolume::_ChooseAirosState()
 	airos_boot_mode mode = airos_choose_boot_state(reader, stateName,
 		sizeof(stateName));
 	fAirosBootMode = airos_boot_mode_name(mode);
+
+	if (mode == AIROS_BOOT_TRIAL && platform_airos_trial_starts != NULL) {
+		// count this start now: the kernel can only count it once it has
+		// mounted the boot volume (#120)
+		char key[B_FILE_NAME_LENGTH];
+		airos_boot_trial_key(reader, key, sizeof(key));
+		if (key[0] != '\0') {
+			int starts = platform_airos_trial_starts(key, true);
+			dprintf("airos boot: start %d of the update on trial (by the "
+				"loader's count)\n", starts);
+		}
+	}
 	if (mode == AIROS_BOOT_DEFAULT)
 		return NULL;
 

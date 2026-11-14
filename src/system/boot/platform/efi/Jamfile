@@ -34,6 +34,7 @@ local platform_src =
 	mmu.cpp
 	network.cpp
 	heap.cpp
+	airos_trial.cpp
 	acpi.cpp
 	timer.cpp
 	menu.cpp
