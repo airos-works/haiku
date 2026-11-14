@@ -558,6 +558,7 @@ TCPEndpoint::TCPEndpoint(net_socket* socket)
 	fPreviousFlightSize(0),
 	fRecover(0),
 	fScoreboardCount(0),
+	fScoreboardKeptAtTimeout(false),
 	fHighRetransmitted(0),
 	fRoute(NULL),
 	fReceiveNext(0),
@@ -1757,13 +1758,52 @@ TCPEndpoint::_DuplicateAcknowledge(tcp_segment_header &segment)
 			NET_STAT_INC(gStackModule, tcp_fast_recoveries);
 			fRecover = fSendMax - 1;
 			fSlowStartThreshold = max_c(fPreviousFlightSize / 2, 2 * fSendMaxSegmentSize);
-			fCongestionWindow = fSlowStartThreshold + 3 * fSendMaxSegmentSize;
+			const bool sack = (fFlags & FLAG_OPTION_SACK_PERMITTED) != 0;
+			// With SACK the pipe tells what is in flight, so the window is
+			// not inflated (RFC 6675); NewReno inflates it by the three
+			// segments that left the network.
+			fCongestionWindow = fSlowStartThreshold
+				+ (sack ? 0 : 3 * fSendMaxSegmentSize);
 			fSendNext = segment.acknowledge;
 			_SendQueued();
-			fHighRetransmitted = tcp_sequence(segment.acknowledge)
-				+ fSendMaxSegmentSize;
+			// the end of what was resent: a segment holds the MSS less the
+			// options, so "+ fSendMaxSegmentSize" ran 12 bytes into the next
+			// hole, which then counted as resent - a retransmit timeout
+			// after every partial ACK (airos-works/haiku#125)
+			fHighRetransmitted = fSendNext;
+			if (sack) {
+				fSendNext = fSendMax;
+				_RecoverySend();
+			}
 			TRACE("_DuplicateAcknowledge(): packet sent under fast restransmit on the receipt of 3rd dup ack");
+		} else if ((fFlags & FLAG_OPTION_SACK_PERMITTED) != 0
+			&& (fFlags & FLAG_RECOVERY) == 0) {
+			// A loss among what the last recovery sent: the window was
+			// already reduced for it (RFC 6582 avoids reducing it twice),
+			// but with SACK the hole can still be repaired now. Waiting
+			// sent hundreds of segments past it and ended in a retransmit
+			// timeout (airos-works/haiku#125).
+			fFlags |= FLAG_RECOVERY;
+			fRecover = fSendMax - 1;
+			fSendNext = segment.acknowledge;
+			_SendQueued();
+			// the end of what was resent: a segment holds the MSS less the
+			// options, so "+ fSendMaxSegmentSize" ran 12 bytes into the next
+			// hole, which then counted as resent - a retransmit timeout
+			// after every partial ACK (airos-works/haiku#125)
+			fHighRetransmitted = fSendNext;
+			fSendNext = fSendMax;
+			_RecoverySend();
 		}
+	} else if (fDuplicateAcknowledgeCount > 3
+		&& (fFlags & FLAG_RECOVERY) != 0
+		&& (fFlags & FLAG_OPTION_SACK_PERMITTED) != 0) {
+		// RFC 6675: holes first, then new data, while the pipe has room.
+		// Inflating the window by a segment per duplicate ACK instead kept
+		// the bottleneck queue as full as it was when it overflowed, and
+		// the hole retransmissions died in it too - a timeout and a resend
+		// of everything (airos-works/haiku#125).
+		_RecoverySend();
 	} else if (fDuplicateAcknowledgeCount > 3) {
 		uint32 flightSize = (fSendMax - fSendUnacknowledged).Number();
 		if ((fDuplicateAcknowledgeCount - 3) * fSendMaxSegmentSize <= flightSize)
@@ -1923,6 +1963,75 @@ TCPEndpoint::_RetransmitNextHole()
 
 	fHighRetransmitted = start + length;
 	return true;
+}
+
+
+/*!	RFC 6675 pipe: what is in the network. Data above the highest range the
+	peer reported is; holes below it are lost, unless they were retransmitted
+	(below fHighRetransmitted); reported ranges are not.
+*/
+uint32
+TCPEndpoint::_Pipe() const
+{
+	if (fScoreboardCount == 0)
+		return (fSendMax - fSendUnacknowledged).Number();
+
+	uint32 pipe = (fSendMax - fScoreboard[fScoreboardCount - 1].right).Number();
+	tcp_sequence position = fSendUnacknowledged;
+	for (int32 i = 0; i < fScoreboardCount; i++) {
+		tcp_sequence end = fScoreboard[i].left;
+		if (fHighRetransmitted < end)
+			end = fHighRetransmitted;
+		if (position < end)
+			pipe += (end - position).Number();
+		position = fScoreboard[i].right;
+	}
+	return pipe;
+}
+
+
+/*!	Fast recovery with SACK: while the pipe has room for a segment, sends the
+	next hole, else a segment of new data (RFC 6675 5, NextSeg rules 1-2).
+*/
+void
+TCPEndpoint::_RecoverySend()
+{
+	for (int32 i = 0; i < 64; i++) {
+		if (_Pipe() + fSendMaxSegmentSize > fCongestionWindow)
+			return;
+		if (_RetransmitNextHole())
+			continue;
+
+		if (fSendQueue.Available(fSendMax) == 0 || fSendWindow == 0)
+			return;
+		// one segment of new data: _SendQueued() measures the window by
+		// what was sent, not by the pipe
+		const tcp_sequence sendMax = fSendMax;
+		const uint32 window = fCongestionWindow;
+		fCongestionWindow = (fSendMax - fSendUnacknowledged).Number()
+			+ fSendMaxSegmentSize;
+		fSendNext = fSendMax;
+		_SendQueued();
+		fCongestionWindow = window;
+		if (fSendMax == sendMax)
+			return;
+	}
+}
+
+
+/*!	The resend after a timeout: moves fSendNext past ranges the peer
+	reported and returns how much follows until the next one.
+*/
+uint32
+TCPEndpoint::_SkipReported()
+{
+	for (int32 i = 0; i < fScoreboardCount; i++) {
+		if (fSendNext < fScoreboard[i].left)
+			return (fScoreboard[i].left - fSendNext).Number();
+		if (fSendNext < fScoreboard[i].right)
+			fSendNext = fScoreboard[i].right;
+	}
+	return UINT32_MAX;
 }
 
 
@@ -3404,7 +3513,22 @@ TCPEndpoint::_SendQueued(bool force)
 			}
 		}
 
+		bool holeEnd = false;
 		if (retransmit && fDuplicateAcknowledgeCount == 0
+			&& fScoreboardCount > 0) {
+			// after a timeout, skip what the peer reported
+			uint32 untilReported = _SkipReported();
+			uint32 available = fSendQueue.Available(fSendNext);
+			if (untilReported < segmentLength) {
+				segmentLength = untilReported;
+				holeEnd = true;
+			}
+			if (available < segmentLength)
+				segmentLength = available;
+			// (nothing left but a FIN still goes out below)
+		}
+
+		if (retransmit && fDuplicateAcknowledgeCount == 0 && !holeEnd
 			&& segmentLength < segmentMaxSize
 			&& fSendNext + segmentLength < fSendMax) {
 			// After a timeout, slow start resends in full segments: the
@@ -3568,6 +3692,7 @@ TCPEndpoint::_Acknowledged(tcp_segment_header& segment)
 		fPreviousHighestAcknowledge = fSendUnacknowledged;
 		fSendUnacknowledged = segment.acknowledge;
 		_PruneScoreboard();
+		fScoreboardKeptAtTimeout = false;
 		fRetransmitStart = 0;
 			// the peer makes progress, restart the give-up clock
 		uint32 flightSize = (fSendMax - fSendUnacknowledged).Number();
@@ -3591,6 +3716,17 @@ TCPEndpoint::_Acknowledged(tcp_segment_header& segment)
 				fDuplicateAcknowledgeCount = 0;
 				fBytesAcknowledgedInAvoidance = 0;
 				fHighRetransmitted = fSendUnacknowledged;
+			} else if ((fFlags & FLAG_OPTION_SACK_PERMITTED) != 0) {
+				// a partial acknowledgement with SACK: the window stays at
+				// ssthresh, the pipe says what can go (RFC 6675)
+				if (!(fSendUnacknowledged < fHighRetransmitted)
+					&& !_RetransmitNextHole()) {
+					fSendNext = fSendUnacknowledged;
+					_SendQueued();
+					fHighRetransmitted = fSendNext;
+				}
+				fSendNext = fSendMax;
+				_RecoverySend();
 			} else {
 				// a partial acknowledgement: retransmit the next hole and
 				// deflate the window by what was acknowledged (step 4). With
@@ -3602,9 +3738,8 @@ TCPEndpoint::_Acknowledged(tcp_segment_header& segment)
 					// the first unacknowledged segment was not resent yet
 					fSendNext = fSendUnacknowledged;
 					_SendQueued();
+					fHighRetransmitted = fSendNext;
 					fSendNext = fSendMax;
-					fHighRetransmitted = fSendUnacknowledged
-						+ fSendMaxSegmentSize;
 				}
 
 				fCongestionWindow = bytesAcknowledged < fCongestionWindow
@@ -3726,8 +3861,14 @@ TCPEndpoint::_Retransmit()
 			fRetransmitTimeout = TCP_MAX_RETRANSMIT_TIMEOUT;
 	}
 
-	// RFC 6675 section 5.1: after a timeout the scoreboard may be wrong
-	fScoreboardCount = 0;
+	// The resend after a timeout skips what the peer reported (as Linux
+	// does): resending all of it filled the queue again with data the peer
+	// had (airos-works/haiku#125). A peer may drop data it reported
+	// (RFC 2018 "reneging"), so a second timeout without progress clears
+	// the scoreboard (RFC 6675 5.1).
+	if (fScoreboardKeptAtTimeout)
+		fScoreboardCount = 0;
+	fScoreboardKeptAtTimeout = fScoreboardCount > 0;
 	fHighRetransmitted = fSendUnacknowledged;
 
 	fSendNext = fSendUnacknowledged;

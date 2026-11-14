@@ -138,6 +138,9 @@ private:
 			void		_PruneScoreboard();
 			bool		_NextHole(tcp_sequence& start, uint32& length) const;
 			bool		_RetransmitNextHole();
+			uint32		_Pipe() const;
+			void		_RecoverySend();
+			uint32		_SkipReported();
 
 	static	void		_TimeWaitTimer(net_timer* timer, void* _endpoint);
 	static	void		_RetransmitTimer(net_timer* timer, void* _endpoint);
@@ -194,6 +197,8 @@ private:
 	};
 	sack_range		fScoreboard[kScoreboardSize];
 	int32			fScoreboardCount;
+	bool			fScoreboardKeptAtTimeout;
+		// a timeout kept the scoreboard, and nothing was acknowledged since
 	tcp_sequence	fHighRetransmitted;
 		// highest sequence sent when fast recovery began (RFC 6582)
 
