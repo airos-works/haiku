@@ -10,6 +10,7 @@ floods. Every test prints `PASS <name>` or `FAIL <name>: why`.
 | `recovery` | one loss is repaired with one retransmission (#125) |
 | `sack` | three holes in one window are repaired at once (RFC 6675) |
 | `rtoresend` | after a retransmit timeout, a duplicate ACK does not stop the resend until the next timeout (#125) |
+| `tailloss` | the last two segments of a write are repaired by a tail loss probe in well under the 200 ms retransmit timeout (#125) |
 | `winupdate` | window updates are not duplicate ACKs |
 | `persist` | the persist timer keeps probing a closed window |
 | `ooo`, `synflood`, `fragflood`, `udpburst`, `udpempty`, `ipv6ext`, `rfc5961`, `predictable`, `mss12`, `mss1460`, `icmp`, `timewait`, `ioctl`, `priv` | the #126-#130 fixes |

@@ -1826,6 +1826,116 @@ struct delayed_ack {
 	int count;
 };
 
+/* The last two segments of a write are lost: no duplicate ACKs follow, so
+   only the retransmit timeout (200 ms or more) repaired them, unless a tail
+   loss probe (RFC 8985) asks after two round trips (#125). 20 ms path. */
+static void
+test_tail_loss(void)
+{
+	const char* name = "tail-loss";
+	struct peer p;
+	sPeerSackPermitted = 1;
+	int fd = handshake(name, &p, 1460, 1);
+	if (fd < 0) {
+		sPeerSackPermitted = 0;
+		return;
+	}
+	set_timeout(fd, 10000);
+
+	static struct delayed_ack queue[1024];
+	int head = 0, tail = 0;
+	const bigtime_t kDelay = 10000;
+		/* each way: a 20 ms round trip */
+	uint32_t base = p.guest_next;
+	const int kSegments = 20;
+	const uint32_t total = kSegments * 1448;
+	uint32_t rangeStart = 0, rangeEnd = 0;
+	int dropped = 0, retransmits = 0, round = 0;
+	bigtime_t lossTime = 0, repaired = 0;
+	uint32_t highest = base;
+	struct seg sg;
+	static char data[20 * 1448];
+	memset(data, 't', sizeof(data));
+
+	/* a few rounds first, so that the sender has a round trip estimate */
+	for (round = 0; round < 4 && repaired == 0; round++) {
+		int last = round == 3;
+		uint32_t roundBase = p.guest_next;
+		send(fd, data, total, 0);
+		bigtime_t end = now_ms() + 3000;
+		while (now_ms() < end && p.guest_next - roundBase < total) {
+			while (head != tail && queue[head].due <= system_time()) {
+				sSackCount = queue[head].count;
+				memcpy(sSackBlocks, queue[head].blocks, sizeof(sSackBlocks));
+				send_tcp(&p, F_ACK, p.seq, queue[head].ack, 0, NULL, 0);
+				head = (head + 1) % 1024;
+			}
+			sSackCount = 0;
+			if (!read_seg(&sg, 1) || sg.proto != IPPROTO_TCP
+				|| sg.sport != p.guest_port || sg.len == 0)
+				continue;
+			if (sg.has_ts)
+				p.ts_recent = sg.tsval;
+			int isRetransmit = (int32_t)(sg.seq - highest) < 0;
+			if (isRetransmit)
+				retransmits++;
+			else
+				highest = sg.seq + sg.len;
+			if (last && !isRetransmit
+				&& (int32_t)(sg.seq - (roundBase + total - 2 * 1448)) >= 0) {
+				dropped++;
+				lossTime = system_time();
+				continue;
+			}
+			uint32_t s0 = sg.seq, s1 = sg.seq + sg.len;
+			if (s0 == p.guest_next) {
+				p.guest_next = s1;
+				if (rangeEnd != rangeStart
+					&& (int32_t)(rangeStart - p.guest_next) <= 0) {
+					if ((int32_t)(rangeEnd - p.guest_next) > 0)
+						p.guest_next = rangeEnd;
+					rangeStart = rangeEnd = 0;
+				}
+			} else if ((int32_t)(s0 - p.guest_next) > 0) {
+				if (rangeStart == rangeEnd) {
+					rangeStart = s0;
+					rangeEnd = s1;
+				} else {
+					if ((int32_t)(s0 - rangeStart) < 0)
+						rangeStart = s0;
+					if ((int32_t)(s1 - rangeEnd) > 0)
+						rangeEnd = s1;
+				}
+			}
+			struct delayed_ack* a = &queue[tail];
+			a->due = system_time() + kDelay;
+			a->ack = p.guest_next;
+			a->count = rangeStart != rangeEnd ? 1 : 0;
+			a->blocks[0][0] = rangeStart;
+			a->blocks[0][1] = rangeEnd;
+			tail = (tail + 1) % 1024;
+		}
+		if (last && p.guest_next - roundBase >= total)
+			repaired = system_time();
+	}
+	send_tcp(&p, F_RST | F_ACK, p.seq, p.guest_next, 0, NULL, 0);
+	close(fd);
+	sPeerSackPermitted = 0;
+	(void)base;
+	if (dropped != 2 || repaired == 0) {
+		fail(name, "the tail was not repaired (%d dropped, %d resent)",
+			dropped, retransmits);
+		return;
+	}
+	bigtime_t took = (repaired - lossTime) / 1000;
+	if (took > 150)
+		fail(name, "two lost tail segments took %lld ms to repair",
+			(long long)took);
+	else
+		pass(name, "two lost tail segments repaired in %lld ms", (long long)took);
+}
+
+
 static void
 test_sack(void)
 {
@@ -1877,12 +1987,13 @@ test_sack(void)
 			p.ts_recent = sg.tsval;
 		segments++;
 		int isRetransmit = (int32_t)(sg.seq - highest) < 0;
-		if (isRetransmit) {
+		if (isRetransmit && firstLoss != 0) {
+			/* (a tail loss probe before the losses is not a repair) */
 			retransmits++;
 			if (firstRetransmit == 0)
 				firstRetransmit = system_time();
 			lastRetransmit = system_time();
-		} else
+		} else if (!isRetransmit)
 			highest = sg.seq + sg.len;
 
 		/* lose three segments of the first window, once each */
@@ -2037,6 +2148,8 @@ main(int argc, char** argv)
 			test_sack();
 		else if (!strcmp(t, "recovery"))
 			test_recovery();
+		else if (!strcmp(t, "tailloss"))
+			test_tail_loss();
 		else if (!strcmp(t, "rtoresend"))
 			test_rto_resend();
 		else if (!strcmp(t, "winupdate"))
