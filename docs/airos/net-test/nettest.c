@@ -1642,6 +1642,56 @@ test_rto_resend(void)
 		pass(name, "%d segments resent in 150 ms after a duplicate ACK", resent);
 }
 
+/* The last, short segment of a stream carries the FIN and is lost. After
+   the retransmit timeout, slow start (which resends full segments only)
+   took the FIN's sequence number for more data and never resent it: the
+   connection hung (#125). */
+static void
+test_fin_loss(void)
+{
+	const char* name = "fin-loss";
+	struct peer p;
+	int fd = handshake(name, &p, 1460, 1);
+	if (fd < 0)
+		return;
+	static char data[10000];
+	memset(data, 'f', sizeof(data));
+	send(fd, data, sizeof(data), 0);
+	close(fd);
+
+	uint32_t base = p.guest_next;
+	int finDropped = 0, finAcked = 0;
+	struct seg sg;
+	bigtime_t end = now_ms() + 5000;
+	while (now_ms() < end && !finAcked) {
+		if (!read_seg(&sg, 20) || sg.proto != IPPROTO_TCP
+			|| sg.sport != p.guest_port)
+			continue;
+		if (sg.has_ts)
+			p.ts_recent = sg.tsval;
+		if ((sg.flags & F_FIN) != 0 && !finDropped) {
+			finDropped = 1;
+			continue;
+		}
+		if (sg.seq == p.guest_next) {
+			p.guest_next += sg.len;
+			if ((sg.flags & F_FIN) != 0) {
+				p.guest_next++;
+				finAcked = 1;
+			}
+		}
+		send_tcp(&p, F_ACK, p.seq, p.guest_next, 0, NULL, 0);
+	}
+	send_tcp(&p, F_RST | F_ACK, p.seq, p.guest_next, 0, NULL, 0);
+	if (!finDropped)
+		fail(name, "no FIN seen");
+	else if (!finAcked)
+		fail(name, "the lost last segment and FIN were not resent in 5 s "
+			"(%u of 10000 bytes)", p.guest_next - base);
+	else
+		pass(name, "the lost last segment and FIN were resent");
+}
+
 static void
 test_window_update(void)
 {
@@ -1936,10 +1986,16 @@ test_tail_loss(void)
 }
 
 
+static int sSackMode = 0;
+	/* 0: three holes in one window; 1: one hole whose first resend is lost */
+
 static void
 test_sack(void)
 {
-	const char* name = "sack";
+	const char* name = sSackMode == 1 ? "lost-resend" : "sack";
+	uint32_t lostSeq = 0, lostLength = 0;
+	int resendDropped = 0;
+	bigtime_t holeFilled = 0;
 	struct peer p;
 	sPeerSackPermitted = 1;
 	int fd = handshake(name, &p, 1460, 1);
@@ -1996,8 +2052,20 @@ test_sack(void)
 		} else if (!isRetransmit)
 			highest = sg.seq + sg.len;
 
-		/* lose three segments of the first window, once each */
-		if (!isRetransmit && (segments == 40 || segments == 43
+		if (sSackMode == 1) {
+			/* lose one segment, and its first resend too */
+			if (!isRetransmit && segments == 15) {
+				firstLoss = system_time();
+				lostSeq = sg.seq;
+				lostLength = sg.len;
+				dropped++;
+				continue;
+			}
+			if (isRetransmit && sg.seq == lostSeq && !resendDropped) {
+				resendDropped = 1;
+				continue;
+			}
+		} else if (!isRetransmit && (segments == 40 || segments == 43
 				|| segments == 46)) {
 			if (dropped == 0)
 				firstLoss = system_time();
@@ -2006,6 +2074,9 @@ test_sack(void)
 		}
 
 		uint32_t s0 = sg.seq, s1 = sg.seq + sg.len;
+		if (lostLength != 0 && holeFilled == 0 && s0 == lostSeq
+			&& s0 == p.guest_next)
+			holeFilled = system_time();
 		if (s0 == p.guest_next) {
 			p.guest_next = s1;
 			int merged = 1;
@@ -2080,6 +2151,20 @@ test_sack(void)
 		"(30 ms round trip), first %.0f ms after the first loss\n", delivered,
 		total, dropped, retransmits, spread,
 		(firstRetransmit - firstLoss) / 1000.0);
+	if (sSackMode == 1) {
+		bigtime_t took = holeFilled != 0 ? (holeFilled - firstLoss) / 1000 : -1;
+		if (delivered < (uint32_t)total)
+			fail(name, "only %u of %d bytes arrived", delivered, total);
+		else if (!resendDropped || took < 0)
+			fail(name, "the resend was not seen");
+		else if (took > 150)
+			fail(name, "a lost resend took %lld ms to repair (the timeout)",
+				(long long)took);
+		else
+			pass(name, "a lost resend repaired %lld ms after the loss",
+				(long long)took);
+		return;
+	}
 	if (delivered < (uint32_t)total)
 		fail(name, "only %u of %d bytes arrived", delivered, total);
 	else if (retransmits > dropped + 2)
@@ -2148,6 +2233,12 @@ main(int argc, char** argv)
 			test_sack();
 		else if (!strcmp(t, "recovery"))
 			test_recovery();
+		else if (!strcmp(t, "lostresend")) {
+			sSackMode = 1;
+			test_sack();
+			sSackMode = 0;
+		} else if (!strcmp(t, "finloss"))
+			test_fin_loss();
 		else if (!strcmp(t, "tailloss"))
 			test_tail_loss();
 		else if (!strcmp(t, "rtoresend"))

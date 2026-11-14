@@ -147,6 +147,7 @@ private:
 			uint32		_Pipe() const;
 			void		_RecoverySend();
 			uint32		_SkipReported();
+			void		_NoteFirstHoleResent();
 
 	static	void		_TimeWaitTimer(net_timer* timer, void* _endpoint);
 	static	void		_RetransmitTimer(net_timer* timer, void* _endpoint);
@@ -204,6 +205,10 @@ private:
 	sack_range		fScoreboard[kScoreboardSize];
 	int32			fScoreboardCount;
 	bool			fScoreboardKeptAtTimeout;
+	tcp_sequence	fFirstHoleResentAt;
+	tcp_sequence	fFirstHoleResentBefore;
+		// fSendUnacknowledged when it was resent last in recovery, and
+		// fSendMax then: data above that reported means the resend was lost
 		// a timeout kept the scoreboard, and nothing was acknowledged since
 	tcp_sequence	fHighRetransmitted;
 		// highest sequence sent when fast recovery began (RFC 6582)
