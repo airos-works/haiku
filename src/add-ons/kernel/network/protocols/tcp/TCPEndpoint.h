@@ -135,6 +135,7 @@ private:
 			void		_ResetSlowStart();
 			uint32		_CubicCongestionEvent(uint32 flightSize);
 			void		_CubicIncrease(uint32 bytesAcknowledged);
+			void		_HystartSample(int32 roundTrip);
 			void		_DuplicateAcknowledge(tcp_segment_header& segment);
 			void		_UpdateScoreboard(const tcp_segment_header& segment);
 			void		_PruneScoreboard();
@@ -265,6 +266,12 @@ private:
 		// W_est, the window Reno would have, in bytes * 1024
 	uint64			fCubicRemainder;
 	bool			fCongestionWindowLimited;
+
+	// HyStart++ (RFC 9406) in the first slow start; RTTs in ms
+	tcp_sequence	fHystartRoundEnd;
+	uint32			fHystartLastMinimum;
+	uint32			fHystartMinimum;
+	int32			fHystartSamples;
 		// the last send left data waiting for the congestion window
 
 	tcp_state		fState;
