@@ -1686,6 +1686,19 @@ enable_smep(void* dummy, int cpu)
 }
 
 
+bool gX86PCIDEnabled = false;
+
+
+static void
+enable_pcid(void* dummy, int cpu)
+{
+	// CR3 must name PCID 0 when PCIDE is set: it does, nothing used them yet
+	x86_write_cr4(x86_read_cr4() | IA32_CR4_PCIDE);
+	memset(gCPU[cpu].arch.pcid_slots, 0, sizeof(gCPU[cpu].arch.pcid_slots));
+	gCPU[cpu].arch.pcid_next = 0;
+}
+
+
 static void
 enable_osxsave(void* dummy, int cpu)
 {
@@ -1746,6 +1759,17 @@ arch_cpu_init_post_vm(kernel_args* args)
 			arch_altcodepatch_replace(ALTCODEPATCH_TAG_CLAC, &_clac, 3);
 		} else
 			dprintf("SMAP disabled per safemode setting\n");
+	}
+
+	// Process context identifiers: switching between teams keeps their TLB
+	// entries (#104).
+	if (x86_check_feature(IA32_FEATURE_EXT_PCID, FEATURE_EXT)) {
+		if (!get_safemode_boolean("disable_pcid", false)) {
+			dprintf("enable PCID\n");
+			call_all_cpus_sync(&enable_pcid, NULL);
+			gX86PCIDEnabled = true;
+		} else
+			dprintf("PCID disabled per safemode setting\n");
 	}
 
 	// if available enable XSAVE (XSAVE and extended states)
@@ -1844,10 +1868,12 @@ arch_cpu_init_post_modules(kernel_args* args)
 void
 arch_cpu_user_tlb_invalidate(intptr_t context)
 {
-	if (context != 0 && (intptr_t)x86_read_cr3() != context)
+	if (context != 0
+		&& (intptr_t)(x86_read_cr3() & X86_CR3_ADDRESS_MASK) != context)
 		return;
 
-	x86_write_cr3(x86_read_cr3());
+	// (without the no-flush bit: flushes the current PCID's entries)
+	x86_write_cr3(x86_read_cr3() & ~X86_CR3_NOFLUSH);
 }
 
 
@@ -1869,7 +1895,8 @@ arch_cpu_global_tlb_invalidate()
 void
 arch_cpu_invalidate_tlb_range(intptr_t context, addr_t start, addr_t end)
 {
-	if (context != 0 && (intptr_t)x86_read_cr3() != context)
+	if (context != 0
+		&& (intptr_t)(x86_read_cr3() & X86_CR3_ADDRESS_MASK) != context)
 		return;
 
 	while (start <= end) {
@@ -1882,7 +1909,8 @@ arch_cpu_invalidate_tlb_range(intptr_t context, addr_t start, addr_t end)
 void
 arch_cpu_invalidate_tlb_list(intptr_t context, addr_t pages[], int num_pages)
 {
-	if (context != 0 && (intptr_t)x86_read_cr3() != context)
+	if (context != 0
+		&& (intptr_t)(x86_read_cr3() & X86_CR3_ADDRESS_MASK) != context)
 		return;
 
 	for (int i = 0; i < num_pages; i++)

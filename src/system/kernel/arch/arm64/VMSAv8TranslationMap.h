@@ -123,7 +123,8 @@ private:
 	int fMinBlockLevel;
 	int fInitialLevel;
 	int fASID;
-	int fRefcount;
+	int32 fRefcount;
+		// CPUs using it; kAsidStealing while its ASID is taken away
 	int32 fLargePageCount;
 	vm_page_reservation fSplitReservation;
 		// a page for every large page (level 2 block), to split it

@@ -479,6 +479,25 @@
 #define IA32_CR4_SMXE			(1UL << 14)
 #define IA32_CR4_FSGSBASE		(1UL << 16)
 #define IA32_CR4_PCIDE			(1UL << 17)
+
+#define X86_PCID_SLOTS			6
+#ifndef _ASSEMBLER
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern bool gX86PCIDEnabled;
+#ifdef __cplusplus
+}
+#endif
+#endif
+#ifdef __x86_64__
+#	define X86_CR3_NOFLUSH		(1UL << 63)
+#	define X86_CR3_PCID_MASK	0xfffUL
+#	define X86_CR3_ADDRESS_MASK	(~(X86_CR3_PCID_MASK | X86_CR3_NOFLUSH))
+#else
+#	define X86_CR3_NOFLUSH		0
+#	define X86_CR3_ADDRESS_MASK	(~0UL)
+#endif
 #define IA32_CR4_OSXSAVE		(1UL << 18)
 #define IA32_CR4_SMEP			(1UL << 20)
 #define IA32_CR4_SMAP			(1UL << 21)
@@ -601,6 +620,14 @@ typedef struct arch_cpu_info {
 	uint64				frequency;
 
 	struct X86PagingStructures* active_paging_structures;
+#ifdef __x86_64__
+	// PCIDs 1..X86_PCID_SLOTS for the address spaces this CPU ran last (#104)
+	struct {
+		uint64			id;			// X86PagingStructures::pcid_id
+		int64			generation;	// its tlb_generation when last flushed
+	}					pcid_slots[X86_PCID_SLOTS];
+	uint32				pcid_next;
+#endif
 
 	size_t				dr6;	// temporary storage for debug registers (cf.
 	size_t				dr7;	// x86_exit_user_debug_at_kernel_entry())

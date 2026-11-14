@@ -164,26 +164,52 @@ VMSAv8TranslationMap::~VMSAv8TranslationMap()
 }
 
 
+// A map's fRefcount while sAsidLock holder takes its ASID away.
+static const int32 kAsidStealing = INT32_MIN / 2;
+
+
 // Switch user map into TTBR0.
 // Passing kernel map here configures empty page table.
 void
 VMSAv8TranslationMap::SwitchUserMap(VMSAv8TranslationMap *from, VMSAv8TranslationMap *to)
 {
-	InterruptsSpinLocker locker(sAsidLock);
+	// The common case takes no lock (#104): a map that is in use on some
+	// CPU (fRefcount > 0) keeps its ASID, since only a map with no users
+	// gives it up, and it is taken only from a count of 0 by a
+	// compare-and-swap. The global lock is left for assigning ASIDs.
+	if (!from->fIsKernel)
+		atomic_add(&from->fRefcount, -1);
 
-	if (!from->fIsKernel) {
-		from->fRefcount--;
-	}
-
-	if (!to->fIsKernel) {
-		to->fRefcount++;
-	} else {
+	if (to->fIsKernel) {
 		arch_vm_install_empty_table_ttbr0();
 		return;
 	}
 
 	ASSERT(to->fPageTable != 0);
 	uint64_t ttbr = to->fPageTable | ((fHwFeature & HW_COMMON_NOT_PRIVATE) != 0 ? 1 : 0);
+
+	int32 count = atomic_get(&to->fRefcount);
+	while (count >= 0) {
+		int32 previous = atomic_test_and_set(&to->fRefcount, count + 1, count);
+		if (previous == count)
+			break;
+		count = previous;
+	}
+	if (count >= 0) {
+		int asid = *(volatile int*)&to->fASID;
+		if (asid != -1) {
+			WRITE_SPECIALREG(TTBR0_EL1, ((uint64_t)asid << 48) | ttbr);
+			arm64_isb();
+			return;
+		}
+	}
+
+	InterruptsSpinLocker locker(sAsidLock);
+
+	if (count < 0) {
+		// its ASID was being taken away, which is done now
+		atomic_add(&to->fRefcount, 1);
+	}
 
 	if (to->fASID != -1) {
 		WRITE_SPECIALREG(TTBR0_EL1, ((uint64_t)to->fASID << 48) | ttbr);
@@ -203,15 +229,20 @@ VMSAv8TranslationMap::SwitchUserMap(VMSAv8TranslationMap *from, VMSAv8Translatio
 
 	// The reserved entry has no user translation map.
 	for (size_t i = 1; i < kNumAsids; ++i) {
-		if (sAsidMapping[i]->fRefcount == 0) {
-			sAsidMapping[i]->fASID = -1;
-			to->fASID = i;
-			sAsidMapping[i] = to;
-
-			WRITE_SPECIALREG(TTBR0_EL1, (i << 48) | ttbr);
-			flush_tlb_whole_asid(i);
-			return;
+		VMSAv8TranslationMap* victim = sAsidMapping[i];
+		if (victim == to
+			|| atomic_test_and_set(&victim->fRefcount, kAsidStealing, 0) != 0) {
+			continue;
 		}
+
+		victim->fASID = -1;
+		to->fASID = i;
+		sAsidMapping[i] = to;
+		atomic_set(&victim->fRefcount, 0);
+
+		WRITE_SPECIALREG(TTBR0_EL1, (i << 48) | ttbr);
+		flush_tlb_whole_asid(i);
+		return;
 	}
 
 	panic("cannot assign ASID");
