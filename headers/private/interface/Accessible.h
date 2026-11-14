@@ -151,6 +151,8 @@ enum accessible_event {
 	B_ACCESSIBLE_EVENT_VALUE_CHANGED,
 	B_ACCESSIBLE_EVENT_NAME_CHANGED,
 	B_ACCESSIBLE_EVENT_STATE_CHANGED,
+		// "changed" (int64): the state bits that changed; without it,
+		// only B_ACCESSIBLE_STATE_DISABLED is assumed
 	B_ACCESSIBLE_EVENT_SELECTION_CHANGED,
 		// list/table/tab selection; "node" is the selected item
 	B_ACCESSIBLE_EVENT_TEXT_INSERTED,

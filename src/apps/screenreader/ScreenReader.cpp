@@ -44,6 +44,7 @@
 #include <AccessibilityProtocol.h>
 
 #include "CaptionWindow.h"
+#include "NodeText.h"
 #include "SpeechOutput.h"
 
 
@@ -68,16 +69,9 @@ private:
 			void				_HandleEvent(BMessage* event);
 			void				_Say(const BString& text, bool interrupt);
 
-			BString				_Describe(const BMessage& node,
-									bool withDescription = true) const;
-			BString				_DescribeWindow(const BMessage& window) const;
-			const char*			_SpokenRole(int32 role) const;
-			BString				_SpokenText(const BString& text) const;
 
 			void				_ReadFocus(bool withWindow);
 			void				_ReadAll();
-			void				_CollectText(const BMessage& node,
-									BStringList& parts) const;
 
 			bool				_IsFocus(const BMessage* event,
 									const BMessage& node) const;
@@ -291,145 +285,6 @@ ScreenReader::_Say(const BString& text, bool interrupt)
 }
 
 
-const char*
-ScreenReader::_SpokenRole(int32 role) const
-{
-	switch (role) {
-		case B_ACCESSIBLE_ROLE_UNKNOWN:
-		case B_ACCESSIBLE_ROLE_GROUP:
-		case B_ACCESSIBLE_ROLE_SCROLL_PANE:
-		case B_ACCESSIBLE_ROLE_SPLIT_PANE:
-		case B_ACCESSIBLE_ROLE_LABEL:
-		case B_ACCESSIBLE_ROLE_PARAGRAPH:
-		case B_ACCESSIBLE_ROLE_CANVAS:
-			return NULL;
-		case B_ACCESSIBLE_ROLE_POP_UP_BUTTON:
-			return "pop-up menu";
-		default:
-			return BAccessible::RoleName((accessible_role)role);
-	}
-}
-
-
-BString
-ScreenReader::_SpokenText(const BString& text) const
-{
-	if (text == " ")
-		return "space";
-	if (text == "\n")
-		return "new line";
-	if (text == "\t")
-		return "tab";
-	BString trimmed(text);
-	trimmed.Trim();
-	if (trimmed.IsEmpty())
-		return "blank";
-	return text;
-}
-
-
-BString
-ScreenReader::_Describe(const BMessage& node, bool withDescription) const
-{
-	int32 role = node.GetInt32(B_ACCESSIBLE_FIELD_ROLE, 0);
-	BString name = node.GetString(B_ACCESSIBLE_FIELD_NAME, "");
-	BString value = node.GetString(B_ACCESSIBLE_FIELD_VALUE, "");
-	uint64 states = (uint64)node.GetInt64(B_ACCESSIBLE_FIELD_STATES, 0);
-
-	BStringList parts;
-	if (!name.IsEmpty())
-		parts.Add(name);
-	if (const char* roleName = _SpokenRole(role))
-		parts.Add(roleName);
-
-	bool textRole = role == B_ACCESSIBLE_ROLE_TEXT_FIELD
-		|| role == B_ACCESSIBLE_ROLE_TEXT_AREA;
-	if ((states & B_ACCESSIBLE_STATE_PROTECTED) != 0) {
-		parts.Add("protected");
-	} else if (!value.IsEmpty() && value != name) {
-		if (textRole && value.Length() > 300) {
-			value.Truncate(300);
-			value << "…";
-		}
-		parts.Add(value);
-	} else if (textRole && value.IsEmpty())
-		parts.Add("blank");
-
-	if ((states & B_ACCESSIBLE_STATE_CHECKABLE) != 0) {
-		if ((states & B_ACCESSIBLE_STATE_CHECKED) != 0)
-			parts.Add("checked");
-		else if ((states & B_ACCESSIBLE_STATE_MIXED) != 0)
-			parts.Add("partially checked");
-		else
-			parts.Add("not checked");
-	} else if (role == B_ACCESSIBLE_ROLE_MENU_ITEM
-		&& (states & B_ACCESSIBLE_STATE_CHECKED) != 0) {
-		parts.Add("checked");
-	}
-	if (role == B_ACCESSIBLE_ROLE_TOGGLE_BUTTON)
-		parts.Add((states & B_ACCESSIBLE_STATE_PRESSED) != 0
-			? "pressed" : "not pressed");
-	if ((states & B_ACCESSIBLE_STATE_EXPANDABLE) != 0)
-		parts.Add((states & B_ACCESSIBLE_STATE_EXPANDED) != 0
-			? "expanded" : "collapsed");
-	if (role == B_ACCESSIBLE_ROLE_MENU_ITEM
-		&& (states & B_ACCESSIBLE_STATE_HAS_POPUP) != 0) {
-		parts.Add("submenu");
-	}
-	if ((states & B_ACCESSIBLE_STATE_DEFAULT) != 0)
-		parts.Add("default");
-	if ((states & B_ACCESSIBLE_STATE_DISABLED) != 0)
-		parts.Add("unavailable");
-	if (textRole && (states & B_ACCESSIBLE_STATE_READ_ONLY) != 0)
-		parts.Add("read only");
-
-	int32 index;
-	if (node.FindInt32(B_ACCESSIBLE_FIELD_INDEX, &index) == B_OK) {
-		int32 count = node.GetInt32(B_ACCESSIBLE_FIELD_COUNT,
-			node.GetInt32(B_ACCESSIBLE_FIELD_CHILD_COUNT, 0));
-		if (count > 0) {
-			BString position;
-			position << index + 1 << " of " << count;
-			parts.Add(position);
-		}
-	}
-	int32 level;
-	if (node.FindInt32(B_ACCESSIBLE_FIELD_LEVEL, &level) == B_OK && level > 1) {
-		BString text;
-		text << "level " << level;
-		parts.Add(text);
-	}
-	const char* shortcut;
-	if (node.FindString(B_ACCESSIBLE_FIELD_SHORTCUT, &shortcut) == B_OK)
-		parts.Add(shortcut);
-
-	if (withDescription) {
-		BString description = node.GetString(B_ACCESSIBLE_FIELD_DESCRIPTION,
-			"");
-		if (!description.IsEmpty() && description != name)
-			parts.Add(description);
-	}
-
-	return parts.Join(", ");
-}
-
-
-BString
-ScreenReader::_DescribeWindow(const BMessage& window) const
-{
-	int32 role = window.GetInt32(B_ACCESSIBLE_FIELD_ROLE,
-		B_ACCESSIBLE_ROLE_WINDOW);
-	BString text = window.GetString(B_ACCESSIBLE_FIELD_NAME, "");
-	if (text.IsEmpty())
-		text = "Untitled";
-	text << ", " << BAccessible::RoleName((accessible_role)role);
-	BString description = window.GetString(B_ACCESSIBLE_FIELD_DESCRIPTION, "");
-	if (!description.IsEmpty())
-		text << ", " << description;
-	return text;
-}
-
-
 bool
 ScreenReader::_IsFocus(const BMessage* event, const BMessage& node) const
 {
@@ -464,11 +319,11 @@ ScreenReader::_HandleEvent(BMessage* event)
 			fWindowTime = now;
 			fCaretLine = -1;
 
-			BString text = _DescribeWindow(window);
+			BString text = describe_window(window);
 			if (hasNode) {
 				fFocusID = node.GetInt64(B_ACCESSIBLE_FIELD_ID, 0);
 				fFocusTime = now;
-				text << ". " << _Describe(node);
+				text << ". " << describe_node(node);
 			} else
 				fFocusID = 0;
 			// don't cut off "Screen reader on"
@@ -498,7 +353,7 @@ ScreenReader::_HandleEvent(BMessage* event)
 			fFocusTime = now;
 			fCaretLine = -1;
 			// don't cut off the window title that was just started
-			_Say(_Describe(node), now - fWindowTime > kSettleTime);
+			_Say(describe_node(node), now - fWindowTime > kSettleTime);
 			break;
 		}
 
@@ -512,8 +367,12 @@ ScreenReader::_HandleEvent(BMessage* event)
 			int32 role = node.GetInt32(B_ACCESSIBLE_FIELD_ROLE, 0);
 			BString text;
 			if (what == B_ACCESSIBLE_EVENT_STATE_CHANGED) {
-				text = (states & B_ACCESSIBLE_STATE_DISABLED) != 0
-					? "unavailable" : "available";
+				// "changed": the state bits that changed; without it the
+				// event is an Interface Kit control enabled or disabled
+				int64 changed;
+				if (event->FindInt64("changed", &changed) != B_OK)
+					changed = B_ACCESSIBLE_STATE_DISABLED;
+				text = describe_state_change(node, (uint64)changed);
 			} else if ((states & B_ACCESSIBLE_STATE_CHECKABLE) != 0) {
 				if ((states & B_ACCESSIBLE_STATE_CHECKED) != 0)
 					text = "checked";
@@ -536,7 +395,7 @@ ScreenReader::_HandleEvent(BMessage* event)
 
 		case B_ACCESSIBLE_EVENT_NAME_CHANGED:
 			if (hasNode && _IsFocus(event, node))
-				_Say(_Describe(node, false), true);
+				_Say(describe_node(node, false), true);
 			break;
 
 		case B_ACCESSIBLE_EVENT_SELECTION_CHANGED:
@@ -546,7 +405,7 @@ ScreenReader::_HandleEvent(BMessage* event)
 				|| !_IsFocus(event, container) || !windowActive) {
 				break;
 			}
-			_Say(_Describe(node), true);
+			_Say(describe_node(node), true);
 			break;
 		}
 
@@ -563,7 +422,7 @@ ScreenReader::_HandleEvent(BMessage* event)
 				int32 length = event->GetInt32("length", 1);
 				text = length == 1 ? "star" : "stars";
 			} else
-				text = _SpokenText(event->GetString("text", ""));
+				text = spoken_text(event->GetString("text", ""));
 			if (what == B_ACCESSIBLE_EVENT_TEXT_DELETED
 				&& event->GetInt32("length", 0) > 1) {
 				text.Prepend("deleted ");
@@ -590,11 +449,11 @@ ScreenReader::_HandleEvent(BMessage* event)
 			}
 			int32 line = event->GetInt32("line", -1);
 			if (line != fCaretLine && fCaretLine >= 0) {
-				_Say(_SpokenText(event->GetString("line_text", "")), true);
+				_Say(spoken_text(event->GetString("line_text", "")), true);
 			} else {
 				BString character = event->GetString("char", "");
 				_Say(character.IsEmpty() ? BString("end")
-					: _SpokenText(character), true);
+					: spoken_text(character), true);
 			}
 			fCaretLine = line;
 			break;
@@ -639,66 +498,16 @@ ScreenReader::_ReadFocus(bool withWindow)
 	BString text;
 	BMessage window;
 	if (withWindow && reply.FindMessage("window", &window) == B_OK)
-		text = _DescribeWindow(window);
+		text = describe_window(window);
 	BMessage node;
 	if (reply.FindMessage("node", &node) == B_OK) {
 		fFocusID = node.GetInt64(B_ACCESSIBLE_FIELD_ID, 0);
 		if (!text.IsEmpty())
 			text << ". ";
-		text << _Describe(node);
+		text << describe_node(node);
 	} else if (text.IsEmpty())
 		text = "Nothing has the focus";
 	_Say(text, true);
-}
-
-
-void
-ScreenReader::_CollectText(const BMessage& node, BStringList& parts) const
-{
-	uint64 states = (uint64)node.GetInt64(B_ACCESSIBLE_FIELD_STATES, 0);
-	if ((states & B_ACCESSIBLE_STATE_INVISIBLE) != 0)
-		return;
-
-	int32 role = node.GetInt32(B_ACCESSIBLE_FIELD_ROLE, 0);
-	BString name = node.GetString(B_ACCESSIBLE_FIELD_NAME, "");
-	BString value = node.GetString(B_ACCESSIBLE_FIELD_VALUE, "");
-
-	switch (role) {
-		case B_ACCESSIBLE_ROLE_SCROLL_BAR:
-		case B_ACCESSIBLE_ROLE_SEPARATOR:
-			return;
-
-		case B_ACCESSIBLE_ROLE_LIST:
-		case B_ACCESSIBLE_ROLE_TREE:
-		case B_ACCESSIBLE_ROLE_TABLE:
-		case B_ACCESSIBLE_ROLE_MENU_BAR:
-		{
-			BString text = _Describe(node, false);
-			int32 count = node.GetInt32(B_ACCESSIBLE_FIELD_CHILD_COUNT, 0);
-			text << ", " << count << (count == 1 ? " item" : " items");
-			parts.Add(text);
-			return;
-		}
-
-		case B_ACCESSIBLE_ROLE_UNKNOWN:
-		case B_ACCESSIBLE_ROLE_GROUP:
-		case B_ACCESSIBLE_ROLE_SCROLL_PANE:
-		case B_ACCESSIBLE_ROLE_SPLIT_PANE:
-		case B_ACCESSIBLE_ROLE_TAB_PANEL:
-			if (!name.IsEmpty() || !value.IsEmpty())
-				parts.Add(_Describe(node, false));
-			break;
-
-		default:
-			parts.Add(_Describe(node, false));
-			break;
-	}
-
-	BMessage child;
-	for (int32 i = 0; node.FindMessage(B_ACCESSIBLE_FIELD_CHILD, i, &child)
-			== B_OK; i++) {
-		_CollectText(child, parts);
-	}
 }
 
 
@@ -722,14 +531,7 @@ ScreenReader::_ReadAll()
 		return;
 	}
 
-	BStringList parts;
-	parts.Add(_DescribeWindow(window));
-	BMessage child;
-	for (int32 i = 0; window.FindMessage(B_ACCESSIBLE_FIELD_CHILD, i, &child)
-			== B_OK; i++) {
-		_CollectText(child, parts);
-	}
-	_Say(parts.Join(". "), true);
+	_Say(read_all_text(window), true);
 }
 
 

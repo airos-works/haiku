@@ -144,7 +144,8 @@ Each carries `event` (`accessible_event`), `when`, the `node`, and:
 | focus changed | `BWindow::_SetFocus()` (every `MakeFocus()`), menu item highlight in `BMenu::_SelectItem()` | `window`, `window_active`; `container`, `menu` for menu items |
 | window activated / deactivated | `BWindow` on `B_WINDOW_ACTIVATED` | `window`; the focus as `node` |
 | value changed | `BControl::SetValue()`, `SetValueNoUpdate()`, `BColumnListView` focus row | |
-| name / state changed | `BControl::SetLabel()`, `SetEnabled()` | |
+| name changed | `BControl::SetLabel()` | |
+| state changed | `BControl::SetEnabled()` | `changed`: the state bits that changed (`int64`); missing means `B_ACCESSIBLE_STATE_DISABLED` |
 | selection changed | `BListView::Select()`, `BTabView::Select()` | `container` |
 | text inserted / deleted | `BTextView::InsertText()`, `DeleteText()` | `text`, `offset`, `length`, `hidden` |
 | caret moved | `BTextView::Select()` (arrow keys, clicks) | `caret`, `sel_start`, `sel_end`, `char`, `line`, `line_text` or the selected `text` |
@@ -204,7 +205,7 @@ Command the Alt key in the default keymap):
 | Option+Command+S | turn the screen reader on or off |
 | Option+Command+F | read the focused control again |
 | Option+Command+W | read the window title and the focused control |
-| Option+Command+R | read the whole window (every control in order) |
+| Option+Command+R | read the whole window (every control in order; on a web page, its text as sentences, links inline, headings and lists with their items, landmarks by kind) |
 | Option+Command+X | stop speaking |
 
 The review keys are only taken while the screen reader runs.
@@ -288,7 +289,9 @@ follows what the WebKit ports for ATK and macOS do:
   changed with `container`; AXChildrenChanged, AXLayoutComplete → children
   changed; AXLoadComplete → document loaded; AXLiveRegionChanged and ARIA
   live regions → `BAccessible::Announce()` (interrupt for assertive);
-  AXExpandedChanged, AXDisabledStateChanged → state changed; AXTextChanged →
+  AXExpandedChanged, AXDisabledStateChanged → state changed with `changed`
+  naming the bits (expanded, selected, pressed, disabled...), which
+  ScreenReader says as "expanded", "not selected" and so on; AXTextChanged →
   text inserted/deleted.
 - Only build the wrappers and send events while `BAccessible::IsEnabled()` is
   true (enable WebKit's accessibility with `AXObjectCache::enableAccessibility()`
