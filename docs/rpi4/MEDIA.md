@@ -159,6 +159,9 @@ What it decodes: Main and Main 10 (4:2:0, eight or ten bits) up to
 4096x4096. Not: range extensions, more than one layer, tiles together with
 wavefronts.
 
+The Raspberry Pi 5 (BCM2712) has the same block at `/axi/codec@800000`,
+programmed the same way; the driver finds either (docs/rpi5/STATUS.md).
+
 ### Checked on the board
 
 `rpi4_hevc_decode film.hevc - | md5sum` against

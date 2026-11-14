@@ -3,8 +3,8 @@
  * Distributed under the terms of the MIT License.
  */
 
-/*	HEVC on the Raspberry Pi 4's decoder block, as a decoder add-on of the
-	Media Kit (HevcDecoder does the work).
+/*	HEVC on the Raspberry Pi 4's and 5's decoder block, as a decoder add-on
+	of the Media Kit (HevcDecoder does the work).
 
 	Like rpi_mmal the add-on registers no format: a stream the block cannot
 	decode would have no other decoder in the Media Kit's lookup. A player

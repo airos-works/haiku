@@ -10,7 +10,8 @@
 #include <stdint.h>
 
 
-/*	Pictures as the Raspberry Pi 4's HEVC block makes them: columns 128
+/*	Pictures as the Raspberry Pi 4's and 5's HEVC block makes them (Linux's
+	NV12_COL128 and NV12_10_COL128, one buffer per picture): columns 128
 	bytes wide, one after the other in memory, each with all its luma rows
 	and then its chroma rows (Cb and Cr in pairs). Eight bit samples are
 	bytes; ten bit ones come three to a 32 bit word, the first in the low

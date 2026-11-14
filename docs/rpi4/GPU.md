@@ -54,6 +54,31 @@ v3dv, 2026-10-04) renders without a window: `rpi4_vk_probe` reports "V3D
   another one's state, and be waited for before it has a job; the multi-sync
   extension of the submit requests names several to signal.
 
+## Raspberry Pi 5 (V3D 7.1)
+
+The same driver handles the BCM2712's core (`brcm,2712-v3d`, Linux's
+`ver >= 71` cases in `drivers/gpu/drm/v3d`). Not yet run on the board.
+
+- Power: the V3D domain is only `PM_V3DRSTN` in `PM_GRAFX_2712` (0x304) of
+  the PM block at 0x10_7d20_0000; there are no ASB bridges. The graphics
+  domain (`PM_GRAFX`) is switched on Linux's way only if the firmware left
+  it off. The firmware V3D clock is set to its maximum before the reset is
+  released. Then the "sms" block (third `reg`) is taken out of power off
+  and reset (`v3d_idle_sms()`); a hang reset is SMS reset, then the domain
+  reset bit.
+- Two interrupt lines: `interrupts` 0 is the hub's, 1 the core's.
+- Moved: TFU registers to 0x700 with an output configuration register
+  (`v71.ioc` of the submit request) and the coefficients always written;
+  CSD queued configuration to 0x930 plus a CFG7 that is kept 0; CSD done is
+  core bit 6 (bit 5 is the counters'); the memory protection violation is
+  hub bit 6; GMP registers at 0x600.
+- The firmware property module reaches the BCM2712's mailbox at
+  0x10_7c01_3880 and passes physical message addresses (no 0xc0000000
+  alias), as the loader does.
+- Mesa needs nothing: its build has the 7.1 code (`v3d_versions` 42 and 71)
+  and reads the version from the core's identity registers.
+  `rpi4_v3d_probe` encodes its TFU job for the version the device reports.
+
 ## Mesa
 
 `tools/rpi4/mesa/build.sh` builds `libEGL_mesa.so.0` and stages it together

@@ -17,8 +17,10 @@
 #include "HevcParser.h"
 
 
-/*!	HEVC (Main and Main 10) on the decoder block of the Raspberry Pi 4,
-	through /dev/misc/rpi_hevc.
+/*!	HEVC (Main and Main 10) on the decoder block of the Raspberry Pi 4 or 5,
+	through /dev/misc/rpi_hevc. The two boards' blocks take the same
+	register writes and make the same pictures; nothing here tells them
+	apart.
 
 	The block does the slice data and makes the pictures; what a decoder does
 	around that is here: the parameter sets and slice headers, the picture

@@ -30,7 +30,8 @@ if $(TARGET_ARCH) = arm64 {
 		vchiq.cpp
 		;
 
-	# the BCM2711's HEVC decoder block for the rpi_hevc media add-on
+	# the BCM2711's and BCM2712's HEVC decoder block for the rpi_hevc media
+	# add-on
 	KernelAddon <driver>rpi_hevc :
 		rpi_hevc.cpp
 		;

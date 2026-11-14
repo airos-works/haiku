@@ -3,7 +3,8 @@
  * Distributed under the terms of the MIT License.
  */
 
-/*	Broadcom V3D 4.2, the 3D core of the BCM2711 (Raspberry Pi 4).
+/*	Broadcom V3D 4.2, the 3D core of the BCM2711 (Raspberry Pi 4), and V3D
+	7.1, the one of the BCM2712 (Raspberry Pi 5).
 
 	This is the render-only device that Mesa's v3d and v3dv drivers talk to
 	(see <graphics/v3d/v3d_haiku.h>); scan-out is somebody else's business.
@@ -23,7 +24,16 @@
 
 	The device tree's node is "disabled" unless the firmware was told to hand
 	the display pipeline to the OS (vc4-kms-v3d); the core is there all the
-	same and the driver ignores the status. */
+	same and the driver ignores the status.
+
+	What differs on the BCM2712 (Linux: the "ver >= 71" cases): the power
+	domain has no bus bridges and its reset bit is in another PM register;
+	a third register block, the system management state, has to be brought
+	out of power off and goes through a reset of its own before the core's;
+	the hub and the core have an interrupt line each; and the texture
+	formatting unit, the compute dispatch registers, the CSD done and the
+	memory protection interrupt bits have moved. The compatible says which
+	SoC this is; the hub's identity registers say which core. */
 
 
 #include <stdio.h>
@@ -69,9 +79,13 @@
 #define V3D_DEVICE_MODULE_NAME	"drivers/graphics/v3d/device_v1"
 
 // The power management block is not a child of the V3D node and the FDT
-// bus offers no way to walk to it; these are its addresses on the BCM2711.
+// bus offers no way to walk to it; these are its addresses on the BCM2711
+// and (soc@107c000000, watchdog@7d200000) on the BCM2712, which has no ASB.
 #define BCM2711_PM_BASE			0xfe100000
+#define BCM2711_PM_SIZE			0x200
 #define BCM2711_RPIVID_ASB_BASE	0xfec11000
+#define BCM2712_PM_BASE			0x107d200000ull
+#define BCM2712_PM_SIZE			0x308
 
 
 #define V3D_PAGE_SHIFT			12
@@ -80,10 +94,16 @@
 #define V3D_MAX_BO_SIZE			(512u << 20)
 #define V3D_MAX_JOB_BOS			4096
 
-// events from the interrupt handler: the core's interrupt bits as they are,
-// the hub's moved up
+// events from the interrupt handler: the core's bin and render bits as they
+// are, the rest moved up (the CSD done bit is not the same on 4.2 and 7.1)
 #define EVENT_TFU_DONE			(1 << 16)
 #define EVENT_MMU_ERROR			(1 << 17)
+#define EVENT_CSD_DONE			(1 << 18)
+
+enum {
+	SOC_BCM2711,	// V3D 4.2
+	SOC_BCM2712		// V3D 7.1
+};
 
 enum {
 	JOB_CL,
@@ -126,24 +146,34 @@ struct v3d_job {
 
 struct v3d_info {
 	device_node*	node;
+	uint32			soc;
 	uint64			hubBase;
 	uint64			hubSize;
 	uint64			coreBase;
 	uint64			coreSize;
+	uint64			smsBase;	// BCM2712
+	uint64			smsSize;
 	uint32			interrupt;
+		// the hub's, and on the BCM2711 the core's as well
+	uint32			coreInterrupt;
+		// the core's own line (BCM2712), or the same as "interrupt"
 
 	area_id			hubArea;
 	area_id			coreArea;
+	area_id			smsArea;
 	area_id			pmArea;
 	area_id			asbArea;
 	volatile uint8*	hub;
 	volatile uint8*	core;
+	volatile uint8*	sms;
 	volatile uint8*	pm;
 	volatile uint8*	asb;
 
-	uint32			version;	// 42 for V3D 4.2
+	uint32			version;	// 42 for V3D 4.2, 71 for 7.1
+	uint32			vaWidth;	// bits of the MMU's virtual addresses
 	uint32			clockRate;
 	bool			interruptInstalled;
+	bool			coreInterruptInstalled;
 
 	mutex			lock;
 		// buffers, address space, page table, handles, the job queue
@@ -237,12 +267,110 @@ asb_enable(v3d_info* info, uint32 reg)
 }
 
 
+static inline bool
+is_v71(v3d_info* info)
+{
+	return info->version >= 71;
+}
+
+
+/*!	BCM2712: the graphics power domain that the V3D domain lives in. The
+	firmware normally leaves it on; if not, it is switched on as Linux does
+	it (bcm2835_power_power_on(): ramp the inrush current up until power is
+	good, remove the electrical isolation, repair the memories, remove the
+	functional isolation).
+*/
+static status_t
+power_on_grafx_bcm2712(v3d_info* info)
+{
+	if ((read32(info->pm, PM_GRAFX) & PM_POWUP) != 0)
+		return B_OK;
+
+	INFO("switching the graphics power domain on\n");
+
+	bool good = false;
+	for (uint32 inrush = 0; inrush <= PM_INRUSH_20_MA && !good; inrush++) {
+		write32(info->pm, PM_GRAFX, PM_PASSWORD
+			| (read32(info->pm, PM_GRAFX) & ~PM_INRUSH_MASK)
+			| inrush << PM_INRUSH_SHIFT | PM_POWUP);
+		bigtime_t timeout = system_time() + 20;
+		while (!(good = (read32(info->pm, PM_GRAFX) & PM_POWOK) != 0)
+			&& system_time() < timeout) {
+			spin(1);
+		}
+	}
+	if (!good) {
+		write32(info->pm, PM_GRAFX, PM_PASSWORD
+			| (read32(info->pm, PM_GRAFX) & ~(PM_POWUP | PM_INRUSH_MASK)));
+		ERROR("the graphics power domain does not report power good\n");
+		return B_TIMED_OUT;
+	}
+
+	write32(info->pm, PM_GRAFX,
+		PM_PASSWORD | read32(info->pm, PM_GRAFX) | PM_ISPOW);
+	write32(info->pm, PM_GRAFX,
+		PM_PASSWORD | read32(info->pm, PM_GRAFX) | PM_MEMREP);
+	bigtime_t timeout = system_time() + 100;
+	while ((read32(info->pm, PM_GRAFX) & PM_MRDONE) == 0) {
+		if (system_time() > timeout) {
+			write32(info->pm, PM_GRAFX,
+				PM_PASSWORD | (read32(info->pm, PM_GRAFX) & ~PM_ISPOW));
+			ERROR("the graphics power domain's memory repair does not "
+				"finish\n");
+			return B_TIMED_OUT;
+		}
+		spin(1);
+	}
+	write32(info->pm, PM_GRAFX,
+		PM_PASSWORD | read32(info->pm, PM_GRAFX) | PM_ISFUNC);
+	return B_OK;
+}
+
+
+/*!	BCM2712: the V3D power domain is only a reset bit (Linux:
+	bcm2835_asb_power_on() with PM_GRAFX_2712 and no bridges, and no clock
+	of the domain's own). The core's clock is the firmware's V3D clock, as on
+	the BCM2711; Linux never switches it, it only sets its rate. It is set
+	to its maximum before the reset goes away.
+*/
+static status_t
+power_on_bcm2712(v3d_info* info)
+{
+	status_t status = power_on_grafx_bcm2712(info);
+	if (status != B_OK)
+		return status;
+
+	uint32 maximum = 0;
+	sFirmware->get_clock_rate(RPI_FIRMWARE_CLOCK_V3D, true, &maximum);
+	status = sFirmware->set_clock_state(RPI_FIRMWARE_CLOCK_V3D, true);
+	if (status != B_OK) {
+		INFO("the firmware does not switch the V3D clock on: %s\n",
+			strerror(status));
+	}
+	if (maximum != 0)
+		sFirmware->set_clock_rate(RPI_FIRMWARE_CLOCK_V3D, maximum);
+	sFirmware->get_clock_rate(RPI_FIRMWARE_CLOCK_V3D, false, &info->clockRate);
+	if (info->clockRate == 0)
+		ERROR("the firmware reports no V3D clock\n");
+
+	// 32 clocks for the reset to propagate
+	spin(1);
+	write32(info->pm, PM_GRAFX_2712,
+		PM_PASSWORD | read32(info->pm, PM_GRAFX_2712) | PM_V3DRSTN);
+	spin(1);
+	return B_OK;
+}
+
+
 /*!	The V3D power domain: take the core out of reset with its clock running
 	and open the bus bridges to it (Linux: bcm2835_asb_power_on()).
 */
 static status_t
 power_on(v3d_info* info)
 {
+	if (info->soc == SOC_BCM2712)
+		return power_on_bcm2712(info);
+
 	// The firmware owns the clock.
 	uint32 maximum = 0;
 	sFirmware->get_clock_rate(RPI_FIRMWARE_CLOCK_V3D, true, &maximum);
@@ -293,11 +421,71 @@ asb_disable(v3d_info* info, uint32 reg)
 static void
 power_off(v3d_info* info)
 {
+	if (info->soc == SOC_BCM2712) {
+		// no bridges, and the clock stays as it is (as on Linux)
+		write32(info->pm, PM_GRAFX_2712,
+			PM_PASSWORD | (read32(info->pm, PM_GRAFX_2712) & ~PM_V3DRSTN));
+		return;
+	}
+
 	asb_disable(info, ASB_V3D_S_CTRL);
 	asb_disable(info, ASB_V3D_M_CTRL);
 	sFirmware->set_clock_state(RPI_FIRMWARE_CLOCK_V3D, false);
 	write32(info->pm, PM_GRAFX,
 		PM_PASSWORD | (read32(info->pm, PM_GRAFX) & ~PM_V3DRSTN));
+}
+
+
+/*!	V3D 7.1: the system management state's own reset, before the core's
+	(Linux: v3d_reset_sms()).
+*/
+static void
+sms_reset(v3d_info* info)
+{
+	if (info->sms == NULL)
+		return;
+
+	write32(info->sms, V3D_SMS_REE_CS, V3D_SMS_STATE_RESET);
+	bigtime_t timeout = system_time() + 100000;
+	while (true) {
+		uint32 state = V3D_SMS_STATE(read32(info->sms, V3D_SMS_REE_CS));
+		if (state != V3D_SMS_ISOLATING_FOR_RESET
+			&& state != V3D_SMS_RESETTING) {
+			break;
+		}
+		if (system_time() > timeout) {
+			ERROR("the system management state's reset does not finish: %#"
+				B_PRIx32 "\n", read32(info->sms, V3D_SMS_REE_CS));
+			break;
+		}
+		spin(10);
+	}
+}
+
+
+/*!	V3D 7.1: takes the system management state out of power off (Linux:
+	v3d_idle_sms()); then the reset that follows it.
+*/
+static status_t
+sms_idle(v3d_info* info)
+{
+	if (info->sms == NULL)
+		return B_OK;
+
+	write32(info->sms, V3D_SMS_TEE_CS, V3D_SMS_CLEAR_POWER_OFF);
+	bigtime_t timeout = system_time() + 100000;
+	while (V3D_SMS_STATE(read32(info->sms, V3D_SMS_TEE_CS))
+			!= V3D_SMS_STATE_IDLE) {
+		if (system_time() > timeout) {
+			ERROR("the system management state does not become idle: %#"
+				B_PRIx32 "\n", read32(info->sms, V3D_SMS_TEE_CS));
+			return B_TIMED_OUT;
+		}
+		spin(10);
+	}
+
+	sms_reset(info);
+	return B_OK;
 }
 
 
@@ -776,10 +964,14 @@ init_hardware(v3d_info* info)
 	mmu_enable(info);
 
 	// interrupts: clear what is pending, unmask what the driver handles
+	// (on 7.1 the core's bit 5 is the performance counters' and the memory
+	// protection violation is the hub's)
 	const uint32 coreInterrupts = V3D_INT_OUTOMEM | V3D_INT_FLDONE
-		| V3D_INT_FRDONE | V3D_INT_CSDDONE | V3D_INT_GMPV;
+		| V3D_INT_FRDONE | (is_v71(info)
+			? V3D71_INT_CSDDONE : V3D_INT_CSDDONE | V3D_INT_GMPV);
 	const uint32 hubInterrupts = V3D_HUB_INT_MMU_WRV | V3D_HUB_INT_MMU_PTI
-		| V3D_HUB_INT_MMU_CAP | V3D_HUB_INT_TFUC;
+		| V3D_HUB_INT_MMU_CAP | V3D_HUB_INT_TFUC
+		| (is_v71(info) ? V3D71_HUB_INT_GMPV : 0);
 
 	write32(info->core, V3D_CTL_INT_MSK_SET, 0xffffffff);
 	write32(info->hub, V3D_HUB_INT_MSK_SET, 0xffffffff);
@@ -807,7 +999,9 @@ reset_hardware(v3d_info* info)
 	write32(info->core, V3D_CTL_INT_MSK_SET, 0xffffffff);
 	write32(info->hub, V3D_HUB_INT_MSK_SET, 0xffffffff);
 
-	// through the power domain, as its reset line does on Linux
+	// through the power domain, as its reset line does on Linux; on 7.1
+	// the system management state is reset first
+	sms_reset(info);
 	power_off(info);
 	spin(10);
 	if (power_on(info) != B_OK)
@@ -818,41 +1012,62 @@ reset_hardware(v3d_info* info)
 }
 
 
-static int32
-v3d_interrupt(void* data)
+/*!	The core's interrupts; returns whether there were any, and adds the
+	events they stand for to \a events.
+*/
+static bool
+handle_core_interrupt(v3d_info* info, uint32& events)
 {
-	v3d_info* info = (v3d_info*)data;
-	uint32 events = 0;
-
 	uint32 status = read32(info->core, V3D_CTL_INT_STS);
-	if (status != 0) {
-		write32(info->core, V3D_CTL_INT_CLR, status);
-		events |= status & (V3D_INT_OUTOMEM | V3D_INT_FLDONE | V3D_INT_FRDONE
-			| V3D_INT_CSDDONE);
-		if ((status & V3D_INT_GMPV) != 0)
-			dprintf("v3d: memory protection violation\n");
-	}
+	if (status == 0)
+		return false;
 
-	uint32 hubStatus = read32(info->hub, V3D_HUB_INT_STS);
-	if (hubStatus != 0) {
-		write32(info->hub, V3D_HUB_INT_CLR, hubStatus);
-		if ((hubStatus & V3D_HUB_INT_TFUC) != 0)
-			events |= EVENT_TFU_DONE;
-		if ((hubStatus & (V3D_HUB_INT_MMU_WRV | V3D_HUB_INT_MMU_PTI
-				| V3D_HUB_INT_MMU_CAP)) != 0) {
-			dprintf("v3d: MMU error at %#" B_PRIx32 "000 (AXI id %#" B_PRIx32
-				"):%s%s%s\n", read32(info->hub, V3D_MMU_VIO_ADDR),
-				read32(info->hub, V3D_MMU_VIO_ID) & 0xff,
-				(hubStatus & V3D_HUB_INT_MMU_WRV) != 0 ? " write violation" : "",
-				(hubStatus & V3D_HUB_INT_MMU_PTI) != 0 ? " invalid entry" : "",
-				(hubStatus & V3D_HUB_INT_MMU_CAP) != 0 ? " out of range" : "");
-			// writing the status bits back acknowledges them
-			write32(info->hub, V3D_MMU_CTL, read32(info->hub, V3D_MMU_CTL));
-			events |= EVENT_MMU_ERROR;
-		}
-	}
+	write32(info->core, V3D_CTL_INT_CLR, status);
+	events |= status & (V3D_INT_OUTOMEM | V3D_INT_FLDONE | V3D_INT_FRDONE);
+	if ((status & (is_v71(info) ? V3D71_INT_CSDDONE : V3D_INT_CSDDONE)) != 0)
+		events |= EVENT_CSD_DONE;
+	if (!is_v71(info) && (status & V3D_INT_GMPV) != 0)
+		dprintf("v3d: memory protection violation\n");
+	return true;
+}
 
-	if (status == 0 && hubStatus == 0)
+
+static bool
+handle_hub_interrupt(v3d_info* info, uint32& events)
+{
+	uint32 status = read32(info->hub, V3D_HUB_INT_STS);
+	if (status == 0)
+		return false;
+
+	write32(info->hub, V3D_HUB_INT_CLR, status);
+	if ((status & V3D_HUB_INT_TFUC) != 0)
+		events |= EVENT_TFU_DONE;
+	if ((status & (V3D_HUB_INT_MMU_WRV | V3D_HUB_INT_MMU_PTI
+			| V3D_HUB_INT_MMU_CAP)) != 0) {
+		// The address register holds the upper 32 bits of the MMU's
+		// virtual address (Linux: v3d_hub_irq()); the raw value too.
+		uint32 address = read32(info->hub, V3D_MMU_VIO_ADDR);
+		dprintf("v3d: MMU error at %#" B_PRIx64 " (VIO_ADDR %#" B_PRIx32
+			", AXI id %#" B_PRIx32 "):%s%s%s\n",
+			(uint64)address << (info->vaWidth - 32), address,
+			read32(info->hub, V3D_MMU_VIO_ID) & 0xff,
+			(status & V3D_HUB_INT_MMU_WRV) != 0 ? " write violation" : "",
+			(status & V3D_HUB_INT_MMU_PTI) != 0 ? " invalid entry" : "",
+			(status & V3D_HUB_INT_MMU_CAP) != 0 ? " out of range" : "");
+		// writing the status bits back acknowledges them
+		write32(info->hub, V3D_MMU_CTL, read32(info->hub, V3D_MMU_CTL));
+		events |= EVENT_MMU_ERROR;
+	}
+	if (is_v71(info) && (status & V3D71_HUB_INT_GMPV) != 0)
+		dprintf("v3d: memory protection violation\n");
+	return true;
+}
+
+
+static int32
+post_events(v3d_info* info, bool handled, uint32 events)
+{
+	if (!handled)
 		return B_UNHANDLED_INTERRUPT;
 
 	if (events != 0) {
@@ -860,6 +1075,39 @@ v3d_interrupt(void* data)
 		info->eventCondition.NotifyAll();
 	}
 	return B_HANDLED_INTERRUPT;
+}
+
+
+/*!	The one line of the BCM2711, for the core and the hub. */
+static int32
+v3d_interrupt(void* data)
+{
+	v3d_info* info = (v3d_info*)data;
+	uint32 events = 0;
+	bool core = handle_core_interrupt(info, events);
+	bool hub = handle_hub_interrupt(info, events);
+	return post_events(info, core || hub, events);
+}
+
+
+/*!	The BCM2712's lines, one each. */
+static int32
+v3d_core_interrupt(void* data)
+{
+	v3d_info* info = (v3d_info*)data;
+	uint32 events = 0;
+	bool handled = handle_core_interrupt(info, events);
+	return post_events(info, handled, events);
+}
+
+
+static int32
+v3d_hub_interrupt(void* data)
+{
+	v3d_info* info = (v3d_info*)data;
+	uint32 events = 0;
+	bool handled = handle_hub_interrupt(info, events);
+	return post_events(info, handled, events);
 }
 
 
@@ -1031,7 +1279,11 @@ run_cl(v3d_info* info, v3d_job* job, v3d_bo*& overflow)
 		dump_registers("core", info->core, 0x000, 0x200);
 		dump_registers("core", info->core, 0x300, 0x320);
 		dump_registers("core", info->core, 0x400, 0x500);
-		dump_registers("core", info->core, 0x800, 0x830);
+		// the memory protection unit (GMP)
+		if (is_v71(info))
+			dump_registers("core", info->core, 0x600, 0x630);
+		else
+			dump_registers("core", info->core, 0x800, 0x830);
 		dump_registers("core", info->core, 0xf00, 0xf30);
 		dump_registers("hub", info->hub, 0x000, 0x070);
 		return (events & EVENT_MMU_ERROR) != 0 ? B_BAD_ADDRESS : B_TIMED_OUT;
@@ -1049,20 +1301,38 @@ run_tfu(v3d_info* info, v3d_job* job)
 	const drm_v3d_submit_tfu& args = job->tfu;
 
 	atomic_set(&info->events, 0);
-	write32(info->hub, V3D_TFU_IIA, args.iia);
-	write32(info->hub, V3D_TFU_IIS, args.iis);
-	write32(info->hub, V3D_TFU_ICA, args.ica);
-	write32(info->hub, V3D_TFU_IUA, args.iua);
-	write32(info->hub, V3D_TFU_IOA, args.ioa);
-	write32(info->hub, V3D_TFU_IOS, args.ios);
-	write32(info->hub, V3D_TFU_COEF0, args.coef[0]);
-	if ((args.coef[0] & V3D_TFU_COEF0_USECOEF) != 0) {
-		write32(info->hub, V3D_TFU_COEF1, args.coef[1]);
-		write32(info->hub, V3D_TFU_COEF2, args.coef[2]);
-		write32(info->hub, V3D_TFU_COEF3, args.coef[3]);
+	if (is_v71(info)) {
+		// The output configuration is a register of its own, and there is
+		// no "use the coefficients" bit: they are always written.
+		write32(info->hub, V3D71_TFU_IIA, args.iia);
+		write32(info->hub, V3D71_TFU_IIS, args.iis);
+		write32(info->hub, V3D71_TFU_ICA, args.ica);
+		write32(info->hub, V3D71_TFU_IUA, args.iua);
+		write32(info->hub, V3D71_TFU_IOA, args.ioa);
+		write32(info->hub, V3D71_TFU_IOC, args.v71.ioc);
+		write32(info->hub, V3D71_TFU_IOS, args.ios);
+		write32(info->hub, V3D71_TFU_COEF0, args.coef[0]);
+		write32(info->hub, V3D71_TFU_COEF1, args.coef[1]);
+		write32(info->hub, V3D71_TFU_COEF2, args.coef[2]);
+		write32(info->hub, V3D71_TFU_COEF3, args.coef[3]);
+		// the configuration register starts the job
+		write32(info->hub, V3D71_TFU_ICFG, args.icfg | V3D_TFU_ICFG_IOC);
+	} else {
+		write32(info->hub, V3D_TFU_IIA, args.iia);
+		write32(info->hub, V3D_TFU_IIS, args.iis);
+		write32(info->hub, V3D_TFU_ICA, args.ica);
+		write32(info->hub, V3D_TFU_IUA, args.iua);
+		write32(info->hub, V3D_TFU_IOA, args.ioa);
+		write32(info->hub, V3D_TFU_IOS, args.ios);
+		write32(info->hub, V3D_TFU_COEF0, args.coef[0]);
+		if ((args.coef[0] & V3D_TFU_COEF0_USECOEF) != 0) {
+			write32(info->hub, V3D_TFU_COEF1, args.coef[1]);
+			write32(info->hub, V3D_TFU_COEF2, args.coef[2]);
+			write32(info->hub, V3D_TFU_COEF3, args.coef[3]);
+		}
+		// the configuration register starts the job
+		write32(info->hub, V3D_TFU_ICFG, args.icfg | V3D_TFU_ICFG_IOC);
 	}
-	// the configuration register starts the job
-	write32(info->hub, V3D_TFU_ICFG, args.icfg | V3D_TFU_ICFG_IOC);
 
 	uint32 events = wait_for_event(info, EVENT_TFU_DONE | EVENT_MMU_ERROR,
 		3000000);
@@ -1086,14 +1356,19 @@ run_csd(v3d_info* info, v3d_job* job)
 
 	atomic_set(&info->events, 0);
 	invalidate_caches(info);
+	const uint32 cfg0 = is_v71(info)
+		? V3D71_CSD_QUEUED_CFG0 : V3D_CSD_QUEUED_CFG0;
 	for (int i = 1; i <= 6; i++)
-		write32(info->core, V3D_CSD_QUEUED_CFG0 + 4 * i, args.cfg[i]);
+		write32(info->core, cfg0 + 4 * i, args.cfg[i]);
+	// 7.1 has an eighth register that nothing uses yet (as on Linux)
+	if (is_v71(info))
+		write32(info->core, V3D71_CSD_QUEUED_CFG7, 0);
 	// the first configuration register starts the dispatch
-	write32(info->core, V3D_CSD_QUEUED_CFG0, args.cfg[0]);
+	write32(info->core, cfg0, args.cfg[0]);
 
-	uint32 events = wait_for_event(info, V3D_INT_CSDDONE | EVENT_MMU_ERROR,
+	uint32 events = wait_for_event(info, EVENT_CSD_DONE | EVENT_MMU_ERROR,
 		10000000);
-	if ((events & V3D_INT_CSDDONE) == 0)
+	if ((events & EVENT_CSD_DONE) == 0)
 		return (events & EVENT_MMU_ERROR) != 0 ? B_BAD_ADDRESS : B_TIMED_OUT;
 
 	clean_caches(info);
@@ -1322,7 +1597,8 @@ read_out_syncs(uint32 flags, uint64 extensions, uint32 outSync,
 static status_t
 initialize_device(v3d_info* info)
 {
-	info->hubArea = info->coreArea = info->pmArea = info->asbArea = -1;
+	info->hubArea = info->coreArea = info->smsArea = info->pmArea
+		= info->asbArea = -1;
 	info->pageTableArea = info->scratchArea = -1;
 	info->jobSemaphore = -1;
 	info->executor = -1;
@@ -1336,18 +1612,31 @@ initialize_device(v3d_info* info)
 		status = map("v3d core", info->coreBase, info->coreSize,
 			info->coreArea, info->core);
 	}
-	if (status == B_OK) {
-		status = map("v3d pm", BCM2711_PM_BASE, 0x200, info->pmArea,
+	if (status == B_OK && info->soc == SOC_BCM2712) {
+		status = map("v3d sms", info->smsBase, info->smsSize, info->smsArea,
+			info->sms);
+		if (status == B_OK) {
+			status = map("v3d pm", BCM2712_PM_BASE, BCM2712_PM_SIZE,
+				info->pmArea, info->pm);
+		}
+	} else if (status == B_OK) {
+		status = map("v3d pm", BCM2711_PM_BASE, BCM2711_PM_SIZE, info->pmArea,
 			info->pm);
-	}
-	if (status == B_OK) {
-		status = map("v3d asb", BCM2711_RPIVID_ASB_BASE, 0x24, info->asbArea,
-			info->asb);
+		if (status == B_OK) {
+			status = map("v3d asb", BCM2711_RPIVID_ASB_BASE, 0x24,
+				info->asbArea, info->asb);
+		}
 	}
 	if (status != B_OK)
 		return status;
 
+	// Until the identity registers say otherwise, the SoC tells what to
+	// expect (power_on() and sms_idle() go by it).
+	info->version = info->soc == SOC_BCM2712 ? 71 : 42;
+
 	status = power_on(info);
+	if (status == B_OK)
+		status = sms_idle(info);
 	if (status != B_OK) {
 		ERROR("power on failed: %s\n", strerror(status));
 		return status;
@@ -1367,8 +1656,22 @@ initialize_device(v3d_info* info)
 		return B_DEVICE_NOT_FOUND;
 	}
 
+	uint32 expected = info->version;
 	info->version = V3D_HUB_IDENT1_TVER(hubIdent1) * 10
 		+ V3D_HUB_IDENT1_REV(hubIdent1);
+	if (info->version != expected) {
+		// Linux warns as well and goes by the hardware
+		ERROR("the device tree promises V3D %" B_PRIu32 ".%" B_PRIu32
+			", the core is %" B_PRIu32 ".%" B_PRIu32 "\n", expected / 10,
+			expected % 10, info->version / 10, info->version % 10);
+	}
+
+	// The MMU's address widths: the physical one must cover the page
+	// table, the virtual one scales the fault address.
+	uint32 mmuDebug = read32(info->hub, V3D_MMU_DEBUG_INFO);
+	uint32 physicalWidth = 30 + V3D_MMU_DEBUG_PA_WIDTH(mmuDebug);
+	info->vaWidth = std::max((uint32)32,
+		30 + V3D_MMU_DEBUG_VA_WIDTH(mmuDebug));
 
 	// the page table: one word per page of the 4 GB, in uncached memory
 	virtual_address_restrictions virtualRestrictions = {};
@@ -1397,6 +1700,13 @@ initialize_device(v3d_info* info)
 	if (status != B_OK)
 		return status;
 	info->scratchAddress = entry.address;
+	if ((((info->pageTableAddress + tableSize - 1) | info->scratchAddress)
+			>> physicalWidth) != 0) {
+		// only a warning: nothing has been run that would show it is wrong
+		ERROR("the page table at %#" B_PRIxPHYSADDR " may be out of the "
+			"MMU's reach (%" B_PRIu32 " bits)\n", info->pageTableAddress,
+			physicalWidth);
+	}
 
 	status = make_uncached(info->pageTableArea, info->pageTable, tableSize);
 	if (status == B_OK)
@@ -1409,7 +1719,17 @@ initialize_device(v3d_info* info)
 		return info->jobSemaphore;
 	info->stopping = false;
 
-	status = install_io_interrupt_handler(info->interrupt, v3d_interrupt,
+	// first the core's line (if it is one of its own), then the hub's; the
+	// interrupts stay masked until init_hardware()
+	if (info->coreInterrupt != info->interrupt) {
+		status = install_io_interrupt_handler(info->coreInterrupt,
+			v3d_core_interrupt, info, 0);
+		if (status != B_OK)
+			return status;
+		info->coreInterruptInstalled = true;
+	}
+	status = install_io_interrupt_handler(info->interrupt,
+		info->coreInterruptInstalled ? v3d_hub_interrupt : v3d_interrupt,
 		info, 0);
 	if (status != B_OK)
 		return status;
@@ -1430,6 +1750,15 @@ initialize_device(v3d_info* info)
 		(hubIdent1 & V3D_HUB_IDENT1_WITH_TFU) != 0 ? ", TFU" : "",
 		(hubIdent2 & V3D_HUB_IDENT2_WITH_MMU) != 0 ? ", MMU" : "",
 		info->clockRate, info->interrupt);
+	INFO("MMU: %" B_PRIu32 " bit virtual, %" B_PRIu32 " bit physical "
+		"addresses, page table at %#" B_PRIxPHYSADDR "\n", info->vaWidth,
+		physicalWidth, info->pageTableAddress);
+	if (info->soc == SOC_BCM2712) {
+		INFO("BCM2712: core interrupt %" B_PRIu32 ", system management "
+			"state %#" B_PRIx32 "/%#" B_PRIx32 "\n", info->coreInterrupt,
+			read32(info->sms, V3D_SMS_REE_CS),
+			read32(info->sms, V3D_SMS_TEE_CS));
+	}
 
 	return B_OK;
 }
@@ -1446,15 +1775,25 @@ uninitialize_device(v3d_info* info)
 		wait_for_thread(info->executor, &result);
 	}
 
-	if (info->interruptInstalled) {
+	if (info->interruptInstalled || info->coreInterruptInstalled) {
 		write32(info->core, V3D_CTL_INT_MSK_SET, 0xffffffff);
 		write32(info->hub, V3D_HUB_INT_MSK_SET, 0xffffffff);
-		remove_io_interrupt_handler(info->interrupt, v3d_interrupt, info);
+	}
+	if (info->interruptInstalled) {
+		remove_io_interrupt_handler(info->interrupt,
+			info->coreInterruptInstalled ? v3d_hub_interrupt : v3d_interrupt,
+			info);
 		info->interruptInstalled = false;
+	}
+	if (info->coreInterruptInstalled) {
+		remove_io_interrupt_handler(info->coreInterrupt, v3d_core_interrupt,
+			info);
+		info->coreInterruptInstalled = false;
 	}
 
 	const area_id areas[] = {info->pageTableArea, info->scratchArea,
-		info->hubArea, info->coreArea, info->pmArea, info->asbArea};
+		info->hubArea, info->coreArea, info->smsArea, info->pmArea,
+		info->asbArea};
 	for (area_id area : areas) {
 		if (area >= 0)
 			delete_area(area);
@@ -2155,7 +2494,8 @@ v3d_supports_device(device_node* parent)
 	const char* compatible;
 	if (sDeviceManager->get_attr_string(parent, "fdt/compatible", &compatible,
 			false) != B_OK
-		|| strcmp(compatible, "brcm,2711-v3d") != 0) {
+		|| (strcmp(compatible, "brcm,2711-v3d") != 0
+			&& strcmp(compatible, "brcm,2712-v3d") != 0)) {
 		return 0.0f;
 	}
 
@@ -2189,20 +2529,38 @@ v3d_init_driver(device_node* node, void** _cookie)
 	if (status != B_OK)
 		return status;
 
+	// the first string of the node's "compatible", as v3d_supports_device()
+	// saw it
+	int compatibleLength;
+	const char* compatible = (const char*)fdt->get_prop(device, "compatible",
+		&compatibleLength);
+	if (compatible == NULL || compatibleLength <= 0)
+		return B_BAD_DATA;
+
 	v3d_info* info = (v3d_info*)calloc(1, sizeof(v3d_info));
 	if (info == NULL)
 		return B_NO_MEMORY;
 	info->node = node;
+	info->soc = strncmp(compatible, "brcm,2712-v3d", compatibleLength) == 0
+		? SOC_BCM2712 : SOC_BCM2711;
 
-	// reg: "hub", "core0"
+	// reg: "hub", "core0", and on the BCM2712 "sms"; interrupts: one for
+	// both, or on the BCM2712 the hub's and then the core's
 	uint64 interrupt;
 	if (!fdt->get_reg(device, 0, &info->hubBase, &info->hubSize)
 		|| !fdt->get_reg(device, 1, &info->coreBase, &info->coreSize)
+		|| (info->soc == SOC_BCM2712
+			&& !fdt->get_reg(device, 2, &info->smsBase, &info->smsSize))
 		|| !fdt->get_interrupt(device, 0, NULL, &interrupt)) {
 		free(info);
 		return B_BAD_DATA;
 	}
 	info->interrupt = interrupt;
+	info->coreInterrupt = interrupt;
+	if (info->soc == SOC_BCM2712
+		&& fdt->get_interrupt(device, 1, NULL, &interrupt)) {
+		info->coreInterrupt = interrupt;
+	}
 
 	// Reserve the contiguous MMU table when this fixed FDT device is
 	// registered, and retain it between applications. Recreating it on every
