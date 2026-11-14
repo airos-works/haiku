@@ -139,6 +139,8 @@ private:
 			bool		_ProbeArmable() const;
 			void		_ArmRetransmitOrProbe();
 			void		_SendProbe();
+			uint64		_PacingRate() const;
+			bool		_PacingAllows(uint32 bytes);
 			void		_DuplicateAcknowledge(tcp_segment_header& segment);
 			void		_UpdateScoreboard(const tcp_segment_header& segment);
 			void		_PruneScoreboard();
@@ -152,6 +154,7 @@ private:
 	static	void		_TimeWaitTimer(net_timer* timer, void* _endpoint);
 	static	void		_RetransmitTimer(net_timer* timer, void* _endpoint);
 	static	void		_PersistTimer(net_timer* timer, void* _endpoint);
+	static	void		_PacingTimer(net_timer* timer, void* _endpoint);
 	static	void		_DelayedAcknowledgeTimer(net_timer* timer,
 							void* _endpoint);
 	static	void		_KeepAliveTimer(net_timer* timer, void* _endpoint);
@@ -288,6 +291,10 @@ private:
 	// timer
 	net_timer		fRetransmitTimer;
 	net_timer		fPersistTimer;
+	net_timer		fPacingTimer;
+	bigtime_t		fPacingTime;
+	int64			fPacingBudget;
+		// bytes the pacing lets out now (RFC 9002-style token bucket)
 	net_timer		fDelayedAcknowledgeTimer;
 	net_timer		fTimeWaitTimer;
 	net_timer		fKeepAliveTimer;

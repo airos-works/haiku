@@ -618,6 +618,9 @@ TCPEndpoint::TCPEndpoint(net_socket* socket)
 	fSendCondition.Init(this, "tcp send");
 
 	gStackModule->init_timer(&fPersistTimer, TCPEndpoint::_PersistTimer, this);
+	gStackModule->init_timer(&fPacingTimer, TCPEndpoint::_PacingTimer, this);
+	fPacingTime = 0;
+	fPacingBudget = 0;
 	gStackModule->init_timer(&fRetransmitTimer, TCPEndpoint::_RetransmitTimer,
 		this);
 	gStackModule->init_timer(&fDelayedAcknowledgeTimer,
@@ -649,6 +652,7 @@ TCPEndpoint::~TCPEndpoint()
 	// we need to wait for all timers to return
 	gStackModule->wait_for_timer(&fRetransmitTimer);
 	gStackModule->wait_for_timer(&fPersistTimer);
+	gStackModule->wait_for_timer(&fPacingTimer);
 	gStackModule->wait_for_timer(&fDelayedAcknowledgeTimer);
 	gStackModule->wait_for_timer(&fTimeWaitTimer);
 	gStackModule->wait_for_timer(&fKeepAliveTimer);
@@ -1446,6 +1450,7 @@ TCPEndpoint::_CancelConnectionTimers()
 	T(TimerSet(this, "retransmit", -1));
 	gStackModule->cancel_timer(&fPersistTimer);
 	T(TimerSet(this, "persist", -1));
+	gStackModule->cancel_timer(&fPacingTimer);
 	gStackModule->cancel_timer(&fDelayedAcknowledgeTimer);
 	T(TimerSet(this, "delayed ack", -1));
 	gStackModule->cancel_timer(&fKeepAliveTimer);
@@ -3635,6 +3640,11 @@ TCPEndpoint::_SendQueued(bool force)
 			break;
 		}
 
+		// pacing: what the path takes in a round trip spread over it,
+		// not sent as one burst (as Linux does)
+		if (!force && segmentLength > 0 && !_PacingAllows(segmentLength))
+			break;
+
 		net_buffer *buffer = gBufferModule->create(256);
 		if (buffer == NULL)
 			return B_NO_MEMORY;
@@ -4125,6 +4135,66 @@ TCPEndpoint::_HystartSample(int32 roundTrip)
 }
 
 
+//	#pragma mark - pacing
+
+
+/*!	The rate the connection sends at, in bytes per second: the window per
+	round trip, twice that in slow start (it doubles the window each round
+	trip) and a quarter more after it, as Linux paces; 0 before there is a
+	round trip estimate.
+*/
+uint64
+TCPEndpoint::_PacingRate() const
+{
+	if (fSmoothedRTT <= 0 || fCongestionWindow == 0
+		|| (fFlags & FLAG_LOCAL) != 0)
+		return 0;
+	uint64 rate = (uint64)fCongestionWindow * 1000000 / fSmoothedRTT;
+	return fCongestionWindow < fSlowStartThreshold ? rate * 2 : rate * 5 / 4;
+}
+
+
+/*!	Whether \a bytes may go out now; if not, the pacing timer sends them
+	when they may. The sender may get ahead by about a millisecond (at least
+	four segments). Without it a whole window left at line rate: 148 frames
+	within a millisecond from a 1 Gbit/s link into a slower uplink, a third
+	of an upload retransmitted, 0.7-14 MB/s where Linux sent 23 (#113).
+*/
+bool
+TCPEndpoint::_PacingAllows(uint32 bytes)
+{
+	uint64 rate = _PacingRate();
+	if (rate == 0)
+		return true;
+
+	const bigtime_t now = system_time();
+	const int64 burst = max_c((int64)(rate / 1000),
+		(int64)(4 * fSendMaxSegmentSize));
+	if (fPacingTime != 0) {
+		fPacingBudget += (int64)((uint64)(now - fPacingTime) * rate / 1000000);
+		if (fPacingBudget > burst)
+			fPacingBudget = burst;
+	} else
+		fPacingBudget = burst;
+	fPacingTime = now;
+
+	// a segmentation block larger than the burst still goes, and the
+	// budget goes negative for it
+	int64 needed = min_c((int64)bytes, burst);
+	if (fPacingBudget >= needed) {
+		fPacingBudget -= bytes;
+		return true;
+	}
+
+	if (!gStackModule->is_timer_active(&fPacingTimer)) {
+		bigtime_t wait = (bigtime_t)((needed - fPacingBudget) * 1000000
+			/ (int64)rate) + 1;
+		gStackModule->set_timer(&fPacingTimer, max_c(wait, (bigtime_t)20));
+	}
+	return false;
+}
+
+
 //	#pragma mark - tail loss probe (RFC 8985 7)
 
 
@@ -4367,6 +4437,19 @@ TCPEndpoint::_RetransmitTimer(net_timer* timer, void* _endpoint)
 
 	locker.Unlock();
 	gSocketModule->release_socket(endpoint->socket);
+}
+
+
+/*static*/ void
+TCPEndpoint::_PacingTimer(net_timer* timer, void* _endpoint)
+{
+	TCPEndpoint* endpoint = (TCPEndpoint*)_endpoint;
+
+	MutexLocker locker(endpoint->fLock);
+	if (!locker.IsLocked() || endpoint->State() == CLOSED)
+		return;
+
+	endpoint->_SendQueued();
 }
 
 
