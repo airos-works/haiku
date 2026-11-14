@@ -199,8 +199,16 @@ mailbox_allocate_frame_buffer(uint32 width, uint32 height,
 	if (status != B_OK)
 		return status;
 
+	// The Pi 5's firmware hands out the buffer it set up itself, at its own
+	// depth ("framebuffer_depth" in config.txt), and may say 32 regardless:
+	// the pitch tells.
 	if (sMessage[buffer] == 0 || sMessage[buffer + 1] == 0
-		|| sMessage[depthIndex] != 32) {
+		|| sMessage[depthIndex] != 32
+		|| sMessage[pitch] < sMessage[physical] * 4) {
+		dprintf("video: firmware frame buffer %" B_PRIu32 "x%" B_PRIu32
+			", depth %" B_PRIu32 ", %" B_PRIu32 " bytes per row: not 32 bits "
+			"per pixel\n", sMessage[physical], sMessage[physical + 1],
+			sMessage[depthIndex], sMessage[pitch]);
 		return B_ERROR;
 	}
 

@@ -54,6 +54,9 @@ hdmi_enable_4kp60=1
 enable_rp1_uart=1
 pciex4_reset=0
 dtparam=uart0_console
+# The firmware's frame buffer, which the loader takes over, is 16 bits per
+# pixel otherwise, and it keeps that depth whatever the loader asks for.
+framebuffer_depth=32
 
 [all]
 

@@ -187,14 +187,15 @@ usb_fdt_get_resources(device_manager_info* manager, device_node* parent,
 		&& base <= UINT64_MAX - size && size >= 0x100 && size <= SIZE_MAX
 		&& irq >= 32 && irq < 1020;
 
-	// The current ARM64 GIC setup uses level-sensitive SPIs. Require that
-	// encoding until the FDT API can propagate trigger/polarity information.
+	// An SPI, level-sensitive or (GICv2 configures those from the tree,
+	// the Raspberry Pi 5's RP1 has them) rising edge.
 	int irqLength = 0;
 	const uint8* spec = (const uint8*)fdt->get_prop(device, "interrupts",
 		&irqLength);
 	if (spec == NULL || (irqLength != 12 && irqLength != 16)
 		|| spec[0] != 0 || spec[1] != 0 || spec[2] != 0 || spec[3] != 0
-		|| spec[8] != 0 || spec[9] != 0 || spec[10] != 0 || spec[11] != 4) {
+		|| spec[8] != 0 || spec[9] != 0 || spec[10] != 0
+		|| (spec[11] != 4 && spec[11] != 1)) {
 		supported = false;
 	}
 	// FDT nodes are registered in source order. The controller node may not
@@ -204,8 +205,12 @@ usb_fdt_get_resources(device_manager_info* manager, device_node* parent,
 		fdt_device* controller;
 		if (manager->get_driver(interruptController,
 				(driver_module_info**)&controllerFDT, (void**)&controller) != B_OK
-			|| !usb_fdt_has_string(controllerFDT, controller, "compatible",
-				"arm,gic-v3")) {
+			|| (!usb_fdt_has_string(controllerFDT, controller, "compatible",
+					"arm,gic-v3")
+				&& !usb_fdt_has_string(controllerFDT, controller, "compatible",
+					"arm,gic-400")
+				&& !usb_fdt_has_string(controllerFDT, controller, "compatible",
+					"arm,cortex-a15-gic"))) {
 			supported = false;
 		}
 	}
@@ -222,8 +227,9 @@ usb_fdt_get_resources(device_manager_info* manager, device_node* parent,
 			supported = false;
 	}
 
-	// get_reg() currently returns bus addresses without translating ranges.
-	// Accept identity buses only, and do not invent a DMA/IOMMU translation.
+	// get_reg() translates addresses through the buses' "ranges". DMA
+	// addresses are not translated: accept buses whose "dma-ranges" are the
+	// identity only.
 	// The walk starts at the caller's node, whose reference stays the
 	// caller's; the ancestors' references are released here.
 	device_node* current = parent;
@@ -253,11 +259,6 @@ usb_fdt_get_resources(device_manager_info* manager, device_node* parent,
 			resources->dma_coherent = true;
 		if (!usb_fdt_is_enabled(ancestorFDT, ancestor))
 			supported = false;
-		if (current != parent && ancestorFDT->get_name(ancestor)[0] != 0
-			&& !usb_fdt_ranges_are_identity(manager, current, ancestorFDT,
-				ancestor)) {
-			supported = false;
-		}
 		device_node* next = manager->get_parent_node(current);
 		if (owned)
 			manager->put_node(current);

@@ -7,6 +7,8 @@
 #   lab.sh serial-send <text>    write text to the Pi's console (no newline added)
 #   lab.sh lun <kvm file>|none   put a file of the KVM's /data in the virtual USB disk
 #   lab.sh upload <file> <name>  copy an image to the KVM's /data/<name> (checked)
+#   lab.sh update-boot <file> <name>  the same for the first 65 MiB only (the
+#                                boot partition): the running system's BFS stays
 #   lab.sh update <file> <name>  overwrite /data/<name> in place, same size: the
 #                                virtual disk stays attached. Swapping the LUN while
 #                                the Pi's EEPROM reads it wedges the EEPROM for good
@@ -47,6 +49,9 @@ update)
 	remote=$(kvm_ssh "sha256sum /data/$3" | cut -d' ' -f1)
 	[ "$sum" = "$remote" ] || { echo "checksum mismatch" >&2; exit 1; }
 	echo "updated /data/$3 in place $sum" ;;
+update-boot)
+	head -c $((65 * 1048576)) "$2" | gzip -1 | kvm_ssh "gunzip -c > /data/$3.boot && dd if=/data/$3.boot of=/data/$3 bs=1M conv=notrunc 2>/dev/null && rm /data/$3.boot && sync"
+	echo "updated the boot partition of /data/$3" ;;
 shot)
 	. "$STATE/env.sh"
 	/mnt/HaikuWork/rpi4/venv/bin/python /mnt/HaikuWork/src/haiku/tools/rock5-itx/nanokvm.py screenshot "$2" ;;

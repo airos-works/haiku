@@ -18,6 +18,7 @@
 
 #include <arch/arm/arch_uart_pl011.h>
 #include <boot/kernel_args.h>
+#include <boot/platform.h>
 #include <boot/stage2.h>
 #include <boot/stdio.h>
 #include <kernel.h>
@@ -710,6 +711,47 @@ fdt_init(void* fdt)
 	: 0x410c + ((n) - 4) * 8)
 
 
+/*!	Makes sure that one of the PCIe controller's inbound windows (RC BARs)
+	maps PCI address \a pci to CPU address \a cpu, \a sizeCode (the
+	controller's encoding: 0x1c-0x1f 4-32 KB, 1-21 64 KB-64 GB) long.
+*/
+static bool
+add_inbound_window(uint64 pci, uint64 cpu, uint32 sizeCode, const char* what)
+{
+	uint32 freeBar = 0;
+	for (uint32 bar = 1; bar <= 10; bar++) {
+		uint32 low = read_register(sRP1Controller, BCM2712_PCIE_RC_BAR(bar));
+		uint32 high = read_register(sRP1Controller,
+			BCM2712_PCIE_RC_BAR(bar) + 4);
+		uint32 code = low & 0x1f;
+		if (code == 0) {
+			if (freeBar == 0)
+				freeBar = bar;
+			continue;
+		}
+		uint64 base = (uint64)high << 32 | (low & ~(uint32)0xfff);
+		uint32 log2 = code >= 0x1c ? code - 0x1c + 12 : code + 15;
+		if (pci >= base && pci - base < (1ull << log2))
+			return true;
+	}
+	if (freeBar == 0) {
+		dprintf("RP1: no inbound window free for %s\n", what);
+		return false;
+	}
+
+	*(volatile uint32*)(sRP1Controller + BCM2712_PCIE_RC_BAR(freeBar))
+		= (uint32)pci | sizeCode;
+	*(volatile uint32*)(sRP1Controller + BCM2712_PCIE_RC_BAR(freeBar) + 4)
+		= (uint32)(pci >> 32);
+	*(volatile uint32*)(sRP1Controller + BCM2712_PCIE_UBUS_BAR(freeBar))
+		= ((uint32)cpu & ~(uint32)0xfff) | 1;
+	*(volatile uint32*)(sRP1Controller + BCM2712_PCIE_UBUS_BAR(freeBar) + 4)
+		= (uint32)(cpu >> 32);
+	dprintf("RP1: inbound window %" B_PRIu32 " for %s\n", freeBar, what);
+	return true;
+}
+
+
 /*!	Makes the RP1's interrupts plain GIC interrupts for the kernel, the way
 	Linux sets them up: interrupt N of the RP1 is MSI-X vector N, a write of
 	N to the MIP, which raises SPI <msi base> + N, edge triggered. Then the
@@ -744,39 +786,8 @@ setup_rp1_interrupts(void* tree)
 
 	// The controller has to pass the RP1's MSI writes on to the MIP: an
 	// inbound window (RC BAR) for the message address.
-	uint32 freeBar = 0;
-	bool mapped = false;
-	for (uint32 bar = 1; bar <= 10 && !mapped; bar++) {
-		uint32 low = read_register(sRP1Controller, BCM2712_PCIE_RC_BAR(bar));
-		uint32 high = read_register(sRP1Controller,
-			BCM2712_PCIE_RC_BAR(bar) + 4);
-		uint32 sizeCode = low & 0x1f;
-		if (sizeCode == 0) {
-			if (freeBar == 0)
-				freeBar = bar;
-			continue;
-		}
-		uint64 base = (uint64)high << 32 | (low & ~(uint32)0xfff);
-		uint32 log2 = sizeCode >= 0x1c ? sizeCode - 0x1c + 12 : sizeCode + 15;
-		if (message >= base && message - base < (1ull << log2))
-			mapped = true;
-	}
-	if (!mapped) {
-		if (freeBar == 0) {
-			dprintf("RP1: no inbound window free for the MIP\n");
-			return;
-		}
-		// 4 KB (size code 0x1c) at the message address, to the MIP
-		*(volatile uint32*)(sRP1Controller + BCM2712_PCIE_RC_BAR(freeBar))
-			= (uint32)message | 0x1c;
-		*(volatile uint32*)(sRP1Controller + BCM2712_PCIE_RC_BAR(freeBar) + 4)
-			= (uint32)(message >> 32);
-		*(volatile uint32*)(sRP1Controller + BCM2712_PCIE_UBUS_BAR(freeBar))
-			= ((uint32)mipRegs & ~(uint32)0xfff) | 1;
-		*(volatile uint32*)(sRP1Controller + BCM2712_PCIE_UBUS_BAR(freeBar) + 4)
-			= (uint32)(mipRegs >> 32);
-		dprintf("RP1: inbound window %" B_PRIu32 " for the MIP\n", freeBar);
-	}
+	if (!add_inbound_window(message, mipRegs, 0x1c, "the MIP"))
+		return;
 
 	// The MIP: everything to the host, nothing to the VPU, edge triggered.
 	volatile uint32* mipRegisters = (volatile uint32*)mipRegs;
@@ -870,6 +881,99 @@ setup_rp1_interrupts(void* tree)
 }
 
 
+/*!	DMA from the RP1's devices (USB, Ethernet) reaches memory at the CPU's
+	physical addresses. The firmware maps PCI address 0 to memory 0; Linux,
+	whose device tree this is, maps PCI 0x10_0000_0000 there, which the RP1
+	may emit for its devices' low addresses. Both are there then, and the
+	kernel's tree says the identity ("dma-ranges" empty), which the drivers
+	that only know physical addresses rely on.
+*/
+static void
+setup_rp1_dma(void* tree)
+{
+	if (sRP1Controller == 0)
+		return;
+	// 64 GB (size code 21)
+	if (!add_inbound_window(0, 0, 21, "memory at PCI 0")
+		|| !add_inbound_window(0x1000000000ull, 0, 21,
+			"memory at PCI 0x10_0000_0000")) {
+		return;
+	}
+
+	int pcie = -1;
+	while ((pcie = fdt_node_offset_by_compatible(tree, pcie,
+			"brcm,bcm2712-pcie")) >= 0) {
+		int rp1 = fdt_subnode_offset(tree, pcie, "rp1");
+		if (rp1 < 0)
+			continue;
+		fdt_setprop(tree, rp1, "dma-ranges", NULL, 0);
+		fdt_setprop(tree, pcie, "dma-ranges", NULL, 0);
+	}
+}
+
+
+/*!	Takes the Ethernet PHY out of reset: its reset line is an RP1 GPIO
+	("phy-reset-gpios", ETH_RST_N on GPIO 32, active low), which Linux pulses
+	when it probes the GEM and the firmware leaves asserted. The RP1's GPIO
+	block (Linux: pinctrl-rp1.c) has three register areas, the pins' control
+	("io"), the outputs ("rio", with set/clear aliases) and the pads, in
+	three banks: GPIO 0-27, 28-33 and 34-53.
+*/
+static void
+release_rp1_phy()
+{
+	int ethernet = fdt_node_offset_by_compatible(gFDT, -1,
+		"raspberrypi,rp1-gem");
+	int length;
+	const uint32* gpios = ethernet >= 0 ? (const uint32*)fdt_getprop(gFDT,
+		ethernet, "phy-reset-gpios", &length) : NULL;
+	if (gpios == NULL || length != 12)
+		return;
+	int controller = fdt_node_offset_by_phandle(gFDT, fdt32_to_cpu(gpios[0]));
+	uint32 pin = fdt32_to_cpu(gpios[1]);
+	bool activeLow = (fdt32_to_cpu(gpios[2]) & 1) != 0;
+	addr_range io, rio, pads;
+	if (controller < 0
+		|| fdt_node_check_compatible(gFDT, controller, "raspberrypi,rp1-gpio")
+			!= 0
+		|| !fdt_get_reg(controller, 0, io) || !fdt_get_reg(controller, 1, rio)
+		|| !fdt_get_reg(controller, 2, pads) || pin >= 54) {
+		return;
+	}
+
+	static const uint32 kBankFirst[3] = {0, 28, 34};
+	uint32 bank = pin >= 34 ? 2 : pin >= 28 ? 1 : 0;
+	uint32 index = pin - kBankFirst[bank];
+	uint64 control = io.start + bank * 0x4000 + index * 8 + 4;
+	uint64 outputs = rio.start + bank * 0x4000;
+	uint64 pad = pads.start + bank * 0x4000 + 4 + index * 4;
+
+	volatile uint32* outSet = (volatile uint32*)(outputs + 0x2000);
+	volatile uint32* outClear = (volatile uint32*)(outputs + 0x3000);
+	volatile uint32* enableSet = (volatile uint32*)(outputs + 0x2000 + 4);
+	uint32 bit = 1u << index;
+
+	// asserted: low for an active low line
+	if (activeLow)
+		*outClear = bit;
+	else
+		*outSet = bit;
+	*enableSet = bit;
+	// the pad: input on, output not disabled
+	*(volatile uint32*)pad = (*(volatile uint32*)pad & ~(1u << 7)) | (1u << 6);
+	// the pin's function: the output registers (SYS_RIO)
+	*(volatile uint32*)control = (*(volatile uint32*)control & ~0x1fu) | 5;
+	spin(10000);
+
+	if (activeLow)
+		*outSet = bit;
+	else
+		*outClear = bit;
+	spin(20000);
+	dprintf("RP1: Ethernet PHY out of reset (GPIO %" B_PRIu32 ")\n", pin);
+}
+
+
 static phys_addr_t sWatchdog = 0;
 
 
@@ -932,8 +1036,11 @@ fdt_set_kernel_args()
 		dprintf("ARM clock: up to %" B_PRIu32 " Hz\n", rate);
 	}
 
-	if (gBCM2712)
+	if (gBCM2712) {
 		setup_rp1_interrupts(copy);
+		setup_rp1_dma(copy);
+		release_rp1_phy();
+	}
 
 	int chosen = fdt_path_offset(copy, "/chosen");
 	if (sWatchdog != 0 && chosen >= 0)

@@ -120,6 +120,8 @@ init_boot_options()
 	}
 	if (has_boot_argument("airos.rp1dump"))
 		fdt_dump_rp1_state();
+	if (has_boot_argument("airos.nosmp"))
+		add_safe_mode_settings("disable_smp true\n");
 
 	// a space on the serial console opens the menu
 	bigtime_t timeout = system_time() + 100000;

@@ -16,6 +16,8 @@ extern "C" {
 
 
 void *gFDT = NULL;
+
+static void init_lab_watchdog(bool startTimer);
 phys_addr_t sACPIRootPointer = 0;
 
 
@@ -52,6 +54,8 @@ arch_platform_init_post_vm(struct kernel_args *kernelArgs)
 		add_boot_item("ACPI_ROOT_POINTER", &sACPIRootPointer, sizeof(sACPIRootPointer));
 	}
 
+	// the loader's lab watchdog: the time until the timer runs is long
+	init_lab_watchdog(false);
 	return B_OK;
 }
 
@@ -77,8 +81,15 @@ pet_watchdog(timer*)
 
 
 static void
-init_lab_watchdog()
+init_lab_watchdog(bool startTimer)
 {
+	if (sWatchdog != NULL) {
+		pet_watchdog(NULL);
+		if (startTimer)
+			add_timer(&sWatchdogTimer, &pet_watchdog, 1000000, B_PERIODIC_TIMER);
+		return;
+	}
+
 	int chosen = gFDT != NULL ? fdt_path_offset(gFDT, "/chosen") : -1;
 	int length;
 	const void* property = chosen >= 0
@@ -96,7 +107,8 @@ init_lab_watchdog()
 
 	sWatchdog = (volatile uint32*)address;
 	pet_watchdog(NULL);
-	add_timer(&sWatchdogTimer, &pet_watchdog, 1000000, B_PERIODIC_TIMER);
+	if (startTimer)
+		add_timer(&sWatchdogTimer, &pet_watchdog, 1000000, B_PERIODIC_TIMER);
 	dprintf("lab watchdog at %#" B_PRIxPHYSADDR ": the board restarts if "
 		"the kernel stops for 15 s\n", base);
 }
@@ -105,6 +117,6 @@ init_lab_watchdog()
 status_t
 arch_platform_init_post_thread(struct kernel_args *kernelArgs)
 {
-	init_lab_watchdog();
+	init_lab_watchdog(true);
 	return B_OK;
 }
