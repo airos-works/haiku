@@ -564,6 +564,8 @@ TCPEndpoint::TCPEndpoint(net_socket* socket)
 	fRecover(0),
 	fScoreboardCount(0),
 	fScoreboardKeptAtTimeout(false),
+	fFirstHoleResentAt(0),
+	fFirstHoleResentBefore(0),
 	fHighRetransmitted(0),
 	fRoute(NULL),
 	fReceiveNext(0),
@@ -1804,6 +1806,7 @@ TCPEndpoint::_DuplicateAcknowledge(tcp_segment_header &segment)
 			// hole, which then counted as resent - a retransmit timeout
 			// after every partial ACK (airos-works/haiku#125)
 			fHighRetransmitted = fSendNext;
+			_NoteFirstHoleResent();
 			if (sack) {
 				fSendNext = fSendMax;
 				_RecoverySend();
@@ -1825,6 +1828,7 @@ TCPEndpoint::_DuplicateAcknowledge(tcp_segment_header &segment)
 			// hole, which then counted as resent - a retransmit timeout
 			// after every partial ACK (airos-works/haiku#125)
 			fHighRetransmitted = fSendNext;
+			_NoteFirstHoleResent();
 			fSendNext = fSendMax;
 			_RecoverySend();
 		}
@@ -1995,6 +1999,8 @@ TCPEndpoint::_RetransmitNextHole()
 		return false;
 
 	fHighRetransmitted = start + length;
+	if (start == fSendUnacknowledged)
+		_NoteFirstHoleResent();
 	return true;
 }
 
@@ -2029,6 +2035,20 @@ TCPEndpoint::_Pipe() const
 void
 TCPEndpoint::_RecoverySend()
 {
+	// A lost resend of the first hole (as RACK sees it, RFC 8985): data
+	// sent after it was reported, and the hole is still open. Only the
+	// retransmit timeout repaired it before, with the window down to one
+	// segment (airos-works/haiku#125).
+	if (fFirstHoleResentAt == fSendUnacknowledged
+		&& fSendUnacknowledged < fFirstHoleResentBefore
+		&& fScoreboardCount > 0
+		&& fFirstHoleResentBefore < fScoreboard[fScoreboardCount - 1].right) {
+		fSendNext = fSendUnacknowledged;
+		_SendQueued();
+		fSendNext = fSendMax;
+		_NoteFirstHoleResent();
+	}
+
 	for (int32 i = 0; i < 64; i++) {
 		if (_Pipe() + fSendMaxSegmentSize > fCongestionWindow)
 			return;
@@ -2049,6 +2069,17 @@ TCPEndpoint::_RecoverySend()
 		if (fSendMax == sendMax)
 			return;
 	}
+}
+
+
+/*!	Remembers that the first hole was resent, and how far data had been sent
+	then (see _RecoverySend()).
+*/
+void
+TCPEndpoint::_NoteFirstHoleResent()
+{
+	fFirstHoleResentAt = fSendUnacknowledged;
+	fFirstHoleResentBefore = fSendMax;
 }
 
 
@@ -3577,7 +3608,10 @@ TCPEndpoint::_SendQueued(bool force)
 
 		if (retransmit && fDuplicateAcknowledgeCount == 0 && !holeEnd
 			&& segmentLength < segmentMaxSize
-			&& fSendNext + segmentLength < fSendMax) {
+			&& fSendNext + segmentLength < fSendQueue.LastSequence()) {
+			// (the end of the data, not fSendMax: that counts a FIN too, so
+			// the last, short segment before a FIN was never resent after a
+			// timeout and the connection hung - airos-works/haiku#125)
 			// After a timeout, slow start resends in full segments: the
 			// window counts the MSS with its options, so what is left of it
 			// would otherwise go out as a runt of a few bytes
@@ -3774,6 +3808,7 @@ TCPEndpoint::_Acknowledged(tcp_segment_header& segment)
 					fSendNext = fSendUnacknowledged;
 					_SendQueued();
 					fHighRetransmitted = fSendNext;
+					_NoteFirstHoleResent();
 				}
 				fSendNext = fSendMax;
 				_RecoverySend();
@@ -3789,6 +3824,7 @@ TCPEndpoint::_Acknowledged(tcp_segment_header& segment)
 					fSendNext = fSendUnacknowledged;
 					_SendQueued();
 					fHighRetransmitted = fSendNext;
+					_NoteFirstHoleResent();
 					fSendNext = fSendMax;
 				}
 
