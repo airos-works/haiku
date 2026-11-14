@@ -136,6 +136,9 @@ private:
 			uint32		_CubicCongestionEvent(uint32 flightSize);
 			void		_CubicIncrease(uint32 bytesAcknowledged);
 			void		_HystartSample(int32 roundTrip);
+			bool		_ProbeArmable() const;
+			void		_ArmRetransmitOrProbe();
+			void		_SendProbe();
 			void		_DuplicateAcknowledge(tcp_segment_header& segment);
 			void		_UpdateScoreboard(const tcp_segment_header& segment);
 			void		_PruneScoreboard();

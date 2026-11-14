@@ -74,6 +74,7 @@ typedef struct net_protocol_stats {
 	// TCP loss recovery
 	uint64	tcp_retransmit_timeouts;
 	uint64	tcp_fast_recoveries;
+	uint64	tcp_loss_probes;
 } net_protocol_stats;
 
 #define NET_STAT_SYSCALLS				"network/stats"

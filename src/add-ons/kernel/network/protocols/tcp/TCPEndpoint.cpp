@@ -331,9 +331,13 @@ enum {
 	FLAG_WAS_ESTABLISHED		= 0x800,
 		// this connection reached ESTABLISHED; a send() once it is CLOSED
 		// without a pending error then fails with EPIPE, not ENOTCONN
-	FLAG_AUTO_SEND_BUFFER_SIZE	= 0x1000
+	FLAG_AUTO_SEND_BUFFER_SIZE	= 0x1000,
 		// the send queue grows with the congestion window, until the
 		// application sets SO_SNDBUF
+	FLAG_PROBE_ARMED			= 0x2000,
+		// the retransmit timer runs as a tail loss probe timeout
+	FLAG_PROBE_SENT				= 0x4000
+		// a tail loss probe went out; none again until data is acknowledged
 };
 
 // what the send queue may grow to by itself (Linux's tcp_wmem maximum)
@@ -1759,6 +1763,23 @@ TCPEndpoint::_DuplicateAcknowledge(tcp_segment_header &segment)
 			if (sendNext < fSendNext)
 				fSendNext = sendNext;
 		}
+	}
+
+	// Early retransmit (RFC 5827): when the peer reported everything up to
+	// fSendMax and nothing more is queued, no further duplicate ACKs can
+	// come - with fewer than four segments out, or as the answer to a tail
+	// loss probe. (Mid-transfer, a send queue that ran dry for a moment
+	// made it cut the window early.)
+	if (fDuplicateAcknowledgeCount < 3
+		&& (fFlags & (FLAG_OPTION_SACK_PERMITTED | FLAG_RECOVERY))
+			== FLAG_OPTION_SACK_PERMITTED
+		&& fScoreboardCount > 0
+		&& fScoreboard[fScoreboardCount - 1].right == fSendMax
+		&& fSendQueue.Available(fSendMax) == 0
+		&& ((fFlags & FLAG_PROBE_SENT) != 0
+			|| (fSendMax - fSendUnacknowledged).Number()
+				< 4 * fSendMaxSegmentSize)) {
+		fDuplicateAcknowledgeCount = 3;
 	}
 
 	if (fDuplicateAcknowledgeCount == 3) {
@@ -3619,6 +3640,10 @@ TCPEndpoint::_SendQueued(bool force)
 			T(TimerSet(this, "retransmit", fRetransmitTimeout));
 			shouldStartRetransmitTimer = false;
 		}
+		if (!retransmit && _ProbeArmable()) {
+			// a probe timeout counts from the last new data (RFC 8985 7.2)
+			_ArmRetransmitOrProbe();
+		}
 
 		length -= segmentLength;
 		segment.flags &= ~(TCP_FLAG_SYNCHRONIZE | TCP_FLAG_RESET
@@ -3833,8 +3858,8 @@ TCPEndpoint::_Acknowledged(tcp_segment_header& segment)
 		} else {
 			TRACE("data acknowledged, resetting retransmission timer to: %"
 				B_PRIdBIGTIME, fRetransmitTimeout);
-			gStackModule->set_timer(&fRetransmitTimer, fRetransmitTimeout);
-			T(TimerSet(this, "retransmit", fRetransmitTimeout));
+			fFlags &= ~FLAG_PROBE_SENT;
+			_ArmRetransmitOrProbe();
 		}
 
 		_UpdateSendBuffer();
@@ -3856,6 +3881,15 @@ void
 TCPEndpoint::_Retransmit()
 {
 	TRACE("Retransmit()");
+
+	if ((fFlags & FLAG_PROBE_ARMED) != 0) {
+		fFlags &= ~FLAG_PROBE_ARMED;
+		if (fState == ESTABLISHED && fSendUnacknowledged < fSendMax
+			&& (fFlags & (FLAG_RECOVERY | FLAG_PROBE_SENT)) == 0) {
+			_SendProbe();
+			return;
+		}
+	}
 
 	// Synchronized states give up once the peer has not acknowledged
 	// anything for the user timeout (RFC 1122 4.2.3.5 R2, RFC 5482). The
@@ -4052,6 +4086,102 @@ TCPEndpoint::_HystartSample(int32 roundTrip)
 	threshold = max_c(4U, min_c(threshold, 16U));
 	if (fHystartMinimum >= fHystartLastMinimum + threshold)
 		fSlowStartThreshold = fCongestionWindow;
+}
+
+
+//	#pragma mark - tail loss probe (RFC 8985 7)
+
+
+/*!	Whether the retransmit timer may run as a probe timeout: established,
+	with SACK (the probe's acknowledgement tells what was lost), outside
+	recovery, at the tail of what the application wrote, with data in
+	flight and no probe sent for it yet.
+*/
+bool
+TCPEndpoint::_ProbeArmable() const
+{
+	return fState == ESTABLISHED
+		&& (fFlags & (FLAG_OPTION_SACK_PERMITTED | FLAG_RECOVERY
+			| FLAG_PROBE_SENT)) == FLAG_OPTION_SACK_PERMITTED
+		&& fDuplicateAcknowledgeCount == 0 && fSmoothedRTT > 0
+		&& fSendUnacknowledged < fSendMax && fSendNext == fSendMax
+		&& fSendQueue.Available(fSendMax) == 0;
+		// Only at a tail, with nothing more queued: probes in the middle of
+		// a bulk transfer fired while slow start grew the queue faster than
+		// the round trip estimate, and cost throughput.
+}
+
+
+/*!	Arms the retransmit timer: as a probe timeout of two round trips (plus
+	the peer's delayed ACK when one segment is out) where it is shorter
+	than the retransmit timeout, else as that.
+*/
+void
+TCPEndpoint::_ArmRetransmitOrProbe()
+{
+	bigtime_t timeout = fRetransmitTimeout;
+	fFlags &= ~FLAG_PROBE_ARMED;
+	if (_ProbeArmable()) {
+		bigtime_t probe = max_c(2 * fSmoothedRTT, (bigtime_t)10000);
+		if ((fSendMax - fSendUnacknowledged).Number() <= fSendMaxSegmentSize)
+			probe += 200000;
+		if (probe < timeout) {
+			timeout = probe;
+			fFlags |= FLAG_PROBE_ARMED;
+		}
+	}
+	gStackModule->set_timer(&fRetransmitTimer, timeout);
+	T(TimerSet(this, "retransmit", timeout));
+}
+
+
+/*!	The probe: a segment of new data if there is some, else the last
+	segment again. Its acknowledgement shows the losses at the tail (with
+	SACK), which otherwise only the retransmit timeout repaired, 200 ms or
+	more after the fact (airos-works/haiku#125). The window is left alone.
+*/
+void
+TCPEndpoint::_SendProbe()
+{
+	fFlags |= FLAG_PROBE_SENT;
+	NET_STAT_INC(gStackModule, tcp_loss_probes);
+
+	const tcp_sequence sendMax = fSendMax;
+	if (fSendQueue.Available(fSendMax) > 0 && fSendWindow > 0) {
+		const uint32 window = fCongestionWindow;
+		fCongestionWindow = (fSendMax - fSendUnacknowledged).Number()
+			+ fSendMaxSegmentSize;
+		fSendNext = fSendMax;
+		_SendQueued();
+		fCongestionWindow = window;
+	}
+	if (fSendMax == sendMax) {
+		// nothing new went out: resend the last segment's data
+		tcp_segment_header segment = _PrepareSendSegment();
+		uint32 optionsLength = tcp_options_length(segment);
+		uint32 segmentMaxSize = fSendMaxSegmentSize > optionsLength
+			? fSendMaxSegmentSize - optionsLength : 0;
+		tcp_sequence end = fSendQueue.LastSequence();
+		if (fSendMax < end)
+			end = fSendMax;
+		tcp_sequence start = fSendUnacknowledged;
+		if ((end - start).Number() > segmentMaxSize)
+			start = end - segmentMaxSize;
+		uint32 length = (end - start).Number();
+		net_buffer* buffer = length > 0 ? gBufferModule->create(256) : NULL;
+		if (buffer != NULL) {
+			if (fSendQueue.Get(buffer, start, length) == B_OK) {
+				const tcp_sequence next = fSendNext;
+				fSendNext = start;
+				_PrepareAndSend(segment, buffer, true);
+				fSendNext = next;
+			} else
+				gBufferModule->free(buffer);
+		}
+	}
+
+	gStackModule->set_timer(&fRetransmitTimer, fRetransmitTimeout);
+	T(TimerSet(this, "retransmit", fRetransmitTimeout));
 }
 
 
