@@ -570,7 +570,6 @@ TCPEndpoint::TCPEndpoint(net_socket* socket)
 	fRoundTripVariation(0),
 	fSmoothedRTT(-1),
 	fRTTVariation(0),
-	fBytesAcknowledgedInAvoidance(0),
 	fPersistShift(0),
 	fSendTime(0),
 	fRoundTripStartSequence(0),
@@ -588,6 +587,14 @@ TCPEndpoint::TCPEndpoint(net_socket* socket)
 	fLastChallengeAcknowledge(0),
 	fCongestionWindow(0),
 	fSlowStartThreshold(0),
+	fCubicMaxWindow(0),
+	fCubicOrigin(0),
+	fCubicK(0),
+	fCubicEpochStart(0),
+	fCubicLastAcknowledge(0),
+	fCubicEstimate(0),
+	fCubicRemainder(0),
+	fCongestionWindowLimited(false),
 	fState(CLOSED),
 	fFlags(FLAG_OPTION_WINDOW_SCALE | FLAG_OPTION_TIMESTAMP
 		| FLAG_OPTION_SACK_PERMITTED | FLAG_AUTO_RECEIVE_BUFFER_SIZE
@@ -1757,7 +1764,7 @@ TCPEndpoint::_DuplicateAcknowledge(tcp_segment_header &segment)
 			fFlags |= FLAG_RECOVERY;
 			NET_STAT_INC(gStackModule, tcp_fast_recoveries);
 			fRecover = fSendMax - 1;
-			fSlowStartThreshold = max_c(fPreviousFlightSize / 2, 2 * fSendMaxSegmentSize);
+			fSlowStartThreshold = _CubicCongestionEvent(fPreviousFlightSize);
 			const bool sack = (fFlags & FLAG_OPTION_SACK_PERMITTED) != 0;
 			// With SACK the pipe tells what is in flight, so the window is
 			// not inflated (RFC 6675); NewReno inflates it by the three
@@ -3465,6 +3472,14 @@ TCPEndpoint::_SendQueued(bool force)
 	} else
 		sendWindow -= consumedWindow;
 
+	// whether the congestion window, not the peer's window or the
+	// application, holds data back now (see _Acknowledged())
+	if (!force) {
+		fCongestionWindowLimited = fCongestionWindow > 0
+			&& fCongestionWindow < fSendWindow
+			&& fSendQueue.Available(fSendNext) > sendWindow;
+	}
+
 	uint32 length = min_c(fSendQueue.Available(fSendNext), sendWindow);
 	if (!force && length == 0 && !state_needs_finish(fState)) {
 		// try to get a window update
@@ -3714,7 +3729,6 @@ TCPEndpoint::_Acknowledged(tcp_segment_header& segment)
 						+ fSendMaxSegmentSize);
 				fFlags &= ~FLAG_RECOVERY;
 				fDuplicateAcknowledgeCount = 0;
-				fBytesAcknowledgedInAvoidance = 0;
 				fHighRetransmitted = fSendUnacknowledged;
 			} else if ((fFlags & FLAG_OPTION_SACK_PERMITTED) != 0) {
 				// a partial acknowledgement with SACK: the window stays at
@@ -3754,19 +3768,30 @@ TCPEndpoint::_Acknowledged(tcp_segment_header& segment)
 
 			if (!synchronizeOnly) {
 				// RFC 3465 byte counting: slow start grows by what was
-				// acknowledged (at most two segments per ACK), congestion
-				// avoidance by one segment per window acknowledged. Counting
-				// ACKs instead slowed growth against receivers that
-				// acknowledge many segments at once.
+				// acknowledged (at most two segments per ACK); counting ACKs
+				// instead slowed growth against receivers that acknowledge
+				// many segments at once. Congestion avoidance is CUBIC's,
+				// which counts bytes too.
+				// Only a window in use grows (RFC 7661, Linux's
+				// tcp_is_cwnd_limited()): while the peer's window or the
+				// application held the flight back, the window grew on
+				// regardless, and once the peer opened up it went out as
+				// one burst of hundreds of segments - timeouts on a clean
+				// 2 ms path with CUBIC (airos-works/haiku#125).
+				// A sender that segments in the device holds back the rest
+				// of a 64 KB block, so the window counts as used when the
+				// last send stopped at it, too.
+				const uint32 flightBefore = flightSize + bytesAcknowledged;
 				if (fCongestionWindow < fSlowStartThreshold) {
-					fCongestionWindow += min_c(bytesAcknowledged,
-						2 * fSendMaxSegmentSize);
-				} else {
-					fBytesAcknowledgedInAvoidance += bytesAcknowledged;
-					if (fBytesAcknowledgedInAvoidance >= fCongestionWindow) {
-						fBytesAcknowledgedInAvoidance -= fCongestionWindow;
-						fCongestionWindow += fSendMaxSegmentSize;
+					if (fCongestionWindowLimited
+						|| 2 * (uint64)flightBefore >= fCongestionWindow) {
+						fCongestionWindow += min_c(bytesAcknowledged,
+							2 * fSendMaxSegmentSize);
 					}
+				} else if (fCongestionWindowLimited
+					|| (uint64)flightBefore + 3 * fSendMaxSegmentSize
+						>= fCongestionWindow) {
+					_CubicIncrease(bytesAcknowledged);
 				}
 			}
 		}
@@ -3913,7 +3938,6 @@ TCPEndpoint::_Retransmit()
 	}
 
 	fRecover = fSendNext - 1;
-	fBytesAcknowledgedInAvoidance = 0;
 	if ((fFlags & FLAG_RECOVERY) != 0)
 		fFlags &= ~FLAG_RECOVERY;
 }
@@ -3972,9 +3996,134 @@ TCPEndpoint::_UpdateRoundTripTime(int32 roundTripTime, int32 expectedSamples)
 void
 TCPEndpoint::_ResetSlowStart()
 {
-	fSlowStartThreshold = max_c((fSendMax - fSendUnacknowledged).Number() / 2,
-		2 * fSendMaxSegmentSize);
+	fSlowStartThreshold = _CubicCongestionEvent(
+		(fSendMax - fSendUnacknowledged).Number());
 	fCongestionWindow = fSendMaxSegmentSize;
+}
+
+
+//	#pragma mark - CUBIC (RFC 9438)
+
+
+// C = 0.4 segments/s^3, beta = 0.7; windows in bytes, times in ms
+static const uint32 kCubicBeta = 717;
+	// / 1024
+static const uint32 kCubicRenoAlpha = 542;
+	// 3 * (1 - beta) / (1 + beta), / 1024
+static const uint64 kCubicTimeFactor = 2500000000ULL;
+	// 1 / C in ms^3 per segment
+static const int64 kCubicMaxOffset = 40000;
+	// ms: keeps offset^3 * the segment size in 64 bits
+
+
+static uint32
+cube_root(uint64 value)
+{
+	uint64 root = 0;
+	for (int shift = 63; shift >= 0; shift -= 3) {
+		root <<= 1;
+		uint64 step = 3 * root * (root + 1) + 1;
+		if ((value >> shift) >= step) {
+			value -= step << shift;
+			root++;
+		}
+	}
+	return (uint32)root;
+}
+
+
+/*!	A loss (fast retransmit or a timeout): remembers the window as W_max
+	(less with fast convergence) and returns the new ssthresh, beta times
+	the flight size (RFC 9438 4.6, 4.7, 4.8). Halving it, as Reno does,
+	recovered too slowly on long, fast paths (airos-works/haiku#125).
+*/
+uint32
+TCPEndpoint::_CubicCongestionEvent(uint32 flightSize)
+{
+	uint32 window = fCongestionWindow;
+	if (window < fCubicMaxWindow) {
+		// fast convergence: let newer flows have the bandwidth
+		fCubicMaxWindow = (uint32)((uint64)window * (1024 + kCubicBeta)
+			/ 2048);
+	} else
+		fCubicMaxWindow = window;
+	fCubicEpochStart = 0;
+
+	return max_c((uint32)((uint64)flightSize * kCubicBeta / 1024),
+		2 * fSendMaxSegmentSize);
+}
+
+
+/*!	Congestion avoidance: grows the window along the cubic function of the
+	time since the last reduction, or as Reno would where that is faster
+	(RFC 9438 4.2-4.4).
+*/
+void
+TCPEndpoint::_CubicIncrease(uint32 bytesAcknowledged)
+{
+	const uint32 segmentSize = fSendMaxSegmentSize;
+	const uint32 window = fCongestionWindow;
+	if (window == 0 || segmentSize == 0)
+		return;
+
+	const bigtime_t now = system_time() / 1000;
+	const bigtime_t roundTrip = fSmoothedRTT > 0 ? fSmoothedRTT / 1000 : 0;
+
+	// An idle connection does not move along the curve (as Linux shifts
+	// the epoch): growth continues where it stopped.
+	if (fCubicEpochStart != 0
+		&& now - fCubicLastAcknowledge > max_c(2 * roundTrip, (bigtime_t)200)) {
+		fCubicEpochStart += now - fCubicLastAcknowledge;
+	}
+	fCubicLastAcknowledge = now;
+
+	if (fCubicEpochStart == 0) {
+		fCubicEpochStart = now > 0 ? now : 1;
+		fCubicEstimate = (uint64)window << 10;
+		fCubicRemainder = 0;
+		if (window < fCubicMaxWindow) {
+			fCubicK = cube_root((uint64)(fCubicMaxWindow - window)
+				* kCubicTimeFactor / segmentSize);
+			fCubicOrigin = fCubicMaxWindow;
+		} else {
+			fCubicK = 0;
+			fCubicOrigin = window;
+		}
+	}
+
+	// the window Reno would have reached (RFC 9438 4.3)
+	const uint32 alpha = (fCubicEstimate >> 10) >= fCubicMaxWindow
+		? 1024 : kCubicRenoAlpha;
+	fCubicEstimate += (uint64)alpha * bytesAcknowledged * segmentSize / window;
+
+	// W_cubic(t + RTT)
+	int64 offset = now - fCubicEpochStart + roundTrip - (int64)fCubicK;
+	if (offset > kCubicMaxOffset)
+		offset = kCubicMaxOffset;
+	else if (offset < -kCubicMaxOffset)
+		offset = -kCubicMaxOffset;
+	int64 target = (int64)fCubicOrigin
+		+ offset * offset * offset * (int64)segmentSize
+			/ (int64)kCubicTimeFactor;
+	if (target > (int64)window + window / 2)
+		target = (int64)window + window / 2;
+
+	const uint32 estimate = (uint32)min_c(fCubicEstimate >> 10,
+		(uint64)UINT32_MAX);
+	if (target < (int64)estimate) {
+		// the Reno-friendly region
+		if (estimate > window)
+			fCongestionWindow = estimate;
+		return;
+	}
+
+	if (target > (int64)window) {
+		fCubicRemainder += (uint64)(target - window) * bytesAcknowledged;
+		uint64 increase = fCubicRemainder / window;
+		fCubicRemainder -= increase * window;
+		fCongestionWindow = (uint32)min_c((uint64)window + increase,
+			(uint64)UINT32_MAX / 2);
+	}
 }
 
 
