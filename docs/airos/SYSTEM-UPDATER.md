@@ -139,7 +139,7 @@ System Updater keeps its state on the system volume, in
 | `downloads/` | System Updater | System Updater | packages being downloaded; reused when an update is tried again |
 | `next-boot` | System Updater | boot loader | a state to start once ("Restart into this version") |
 | `install-failed` | System Updater | System Updater | an update that could not be installed before the restart it asked for: the release's title and the error, shown (and deleted) when System Updater next opens; the boot check opens it |
-| `trial` | System Updater | boot loader | an installed update that has not started yet: its release and the state to fall back to |
+| `trial` | System Updater | boot loader | an installed update that has not started yet: its release, the state to fall back to and a token that is new for every trial |
 | `trial-attempts` | kernel | boot loader | one line per start of the release on trial |
 | `log` | System Updater | people | what was done |
 
@@ -163,6 +163,14 @@ System Updater keeps its state on the system volume, in
   the trial allows (2), it starts the latest state and tells the kernel it
   is a trial start; the kernel adds a line to `trial-attempts` as soon as it
   has mounted the boot volume.
+- A start that dies before that (a disk driver that panics, the boot volume
+  not found) adds no line. The EFI loader therefore counts its trial starts
+  itself, in the non-volatile EFI variable `AirOSTrialStarts` (vendor GUID
+  `6f2a1c47-3d84-4b5e-9a61-27c40eb853d2`, value `<token> <starts>`), and the
+  larger of the two counts decides (#120). The token in `trial` is new for
+  each trial and for each "try again", so an older count never applies.
+  Where the firmware keeps no non-volatile EFI variables (some U-Boot
+  builds) or the loader is not the EFI one, only the kernel's lines count.
 - Once the desktop has run for a while (Tracker and Deskbar up),
   System Updater's boot check deletes `trial`: the release is confirmed.
   Then it updates the EFI loader on the EFI system partition if the new

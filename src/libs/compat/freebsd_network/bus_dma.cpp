@@ -735,9 +735,19 @@ bus_dmamap_sync_etc(bus_dma_tag_t dmat, bus_dmamap_t map,
 {
 	if (map == NULL)
 		return;
-	if (map->dmat != dmat || !map->loaded || offset > map->buffer_length
+	if (map->dmat != dmat) {
+		panic("bus_dmamap_sync: wrong tag");
+		return;
+	}
+	if (!map->loaded) {
+		// As on FreeBSD, where it has nothing to bounce or flush: iflib
+		// syncs both the plain and the TSO map of a transmit slot it frees,
+		// only one of which carries the packet (airos-works/haiku#117).
+		return;
+	}
+	if (offset > map->buffer_length
 		|| length > map->buffer_length - offset) {
-		panic("bus_dmamap_sync: wrong tag, unloaded map or invalid range");
+		panic("bus_dmamap_sync: invalid range");
 		return;
 	}
 

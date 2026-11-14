@@ -23,9 +23,15 @@
 	trial			an installed update that has not been confirmed yet:
 					"key value" lines: "fallback <state>" (the state to
 					return to), "attempts <n>" (starts allowed, default 2),
-					"release <id>".
+					"release <id>", "token <word>" (new for every trial
+					start and retry).
 	trial-attempts	one line per start of the update on trial, appended by
-					the kernel.
+					the kernel once it has mounted the boot volume.
+
+	A start that ends before the kernel mounts the boot volume (a disk
+	driver panic) leaves no line there. The EFI boot loader therefore also
+	counts the starts it makes itself, in an EFI variable keyed by the
+	token (or the release), and the larger count decides (#120).
 	last-boot		"<mode> <state>": how the loader chose the running
 					state, written by the kernel; removed by an ordinary
 					start of the latest state.
@@ -133,6 +139,27 @@ airos_boot_find_value(const char* text, size_t length, const char* key,
 }
 
 
+/*!	The key the boot loader counts its starts of the update on trial under:
+	the trial's "token", else its "release"; empty without a trial.
+*/
+template<typename Reader>
+static void
+airos_boot_trial_key(Reader& reader, char* key, size_t keySize)
+{
+	char buffer[512];
+	key[0] = '\0';
+	ssize_t length = reader.ReadFile(AIROS_BOOT_TRIAL_FILE, buffer,
+		sizeof(buffer) - 1);
+	if (length < 0)
+		return;
+	buffer[length] = '\0';
+	if (!airos_boot_find_value(buffer, length, "token", key, keySize)
+		&& !airos_boot_find_value(buffer, length, "release", key, keySize)) {
+		key[0] = '\0';
+	}
+}
+
+
 /*!	Decides which state to start. \a Reader provides
 	- ssize_t ReadFile(const char* name, char* buffer, size_t size): reads a
 	  file of the boot control directory, < 0 if there is none;
@@ -140,7 +167,9 @@ airos_boot_find_value(const char* text, size_t length, const char* key,
 	  name can be started;
 	- bool LatestBootable(): whether the latest state can be started;
 	- const char* NewestOldState(): the newest old state that can be started,
-	  or NULL.
+	  or NULL;
+	- int LoaderTrialStarts(const char* key): how often the boot loader
+	  started the trial with this key itself (0 where it can't tell).
 	On return \a state holds the chosen old state's name, or is empty for the
 	latest state.
 */
@@ -207,6 +236,16 @@ airos_choose_boot_state(Reader& reader, char* state, size_t stateSize)
 		}
 		if (attemptsLength == (ssize_t)sizeof(attemptsBuffer))
 			attempts = allowed;
+
+		// the starts the loader counted, which include those that ended
+		// before the kernel could write its line
+		char key[B_FILE_NAME_LENGTH];
+		airos_boot_trial_key(reader, key, sizeof(key));
+		if (key[0] != '\0') {
+			int loaderStarts = reader.LoaderTrialStarts(key);
+			if (loaderStarts > attempts)
+				attempts = loaderStarts;
+		}
 
 		bool fallbackExists = fallback[0] != '\0'
 			&& reader.StateExists(fallback);

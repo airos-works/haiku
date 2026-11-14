@@ -1,0 +1,13 @@
+SubDir HAIKU_TOP src tests apps screenreader ;
+
+UsePrivateHeaders app interface ;
+SubDirHdrs [ FDirName $(HAIKU_TOP) src apps screenreader ] ;
+
+SimpleTest NodeTextTest :
+	NodeTextTest.cpp
+	NodeText.cpp
+	: be [ TargetLibstdc++ ] [ TargetLibsupc++ ]
+;
+
+SEARCH on [ FGristFiles NodeText.cpp ]
+	= [ FDirName $(HAIKU_TOP) src apps screenreader ] ;

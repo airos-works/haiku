@@ -282,6 +282,7 @@ private:
 	void ReadModeList();
 	bool ValidateMode(const NvKmsMode &mode);
 	NvKmsMode PreferredMode(NVDpyId dpyId);
+	static NvKmsMode HeadlessMode();
 	std::vector<NvKmsMode> ModesOf(NVDpyId dpyId);
 	void ApplyDefaultLayout();
 	void BuildLayoutMode();
@@ -512,8 +513,17 @@ NvAccelerant::NvAccelerant(int devFd):
 		debug_printf("nvidia_rm: [%" B_PRId32 "/%" B_PRId32 "]: no connected displays\n", i, totalAttempts);
 		snooze(100000);
 	}
+	// None at all: a DisplayPort monitor in deep sleep lets go of its hot
+	// plug line, so a machine started while its monitor sleeps sees nothing
+	// here. Giving up left app_server on the firmware's frame buffer for the
+	// whole session, which no monitor waking up ever replaced: a machine that
+	// runs and shows nothing until it is restarted (the X399, 2026-11-15).
+	// Start without one instead, at HeadlessMode(), with every head off; the
+	// hot plug thread reports the monitor once it is back, and app_server
+	// lays it out as it does any monitor plugged in.
 	if (fOutputs.empty()) {
-		RaiseErrno(ENODEV);
+		debug_printf("nvidia_rm: no connected display; starting without one\n");
+		fDpyId = nvInvalidDpyId();
 	}
 
 	{
@@ -523,6 +533,8 @@ NvAccelerant::NvAccelerant(int devFd):
 	}
 
 	ApplyDefaultLayout();
+	if (fOutputs.empty())
+		fLayoutMode = HeadlessMode();
 	ReadModeList();
 
 	StartEngine();
@@ -853,10 +865,36 @@ std::vector<NvKmsMode> NvAccelerant::ModesOf(NVDpyId dpyId)
 	return modes;
 }
 
-// The mode list the classic interface sees: the primary monitor's modes.
+// The mode list the classic interface sees: the primary monitor's modes, or
+// with no monitor the frame buffer's.
 void NvAccelerant::ReadModeList()
 {
+	if (fOutputs.empty()) {
+		fModeList = { fLayoutMode };
+		return;
+	}
 	fModeList = ModesOf(fDpyId);
+}
+
+// The frame buffer app_server draws into while no monitor is connected:
+// 1920x1080 at 60 Hz (CEA-861 timings), shown by no head.
+NvKmsMode NvAccelerant::HeadlessMode()
+{
+	NvKmsMode mode {};
+	NvModeTimings &t = mode.timings;
+	t.RRx1k = 60000;
+	t.pixelClockHz = 148500000;
+	t.hVisible = 1920;
+	t.hSyncStart = 2008;
+	t.hSyncEnd = 2052;
+	t.hTotal = 2200;
+	t.vVisible = 1080;
+	t.vSyncStart = 1084;
+	t.vSyncEnd = 1089;
+	t.vTotal = 1125;
+	t.hSyncPos = NV_TRUE;
+	t.vSyncPos = NV_TRUE;
+	return mode;
 }
 
 // The frame buffer is the smallest rectangle around every enabled output's
@@ -2201,8 +2239,17 @@ void NvAccelerant::HotplugThread()
 		try {
 			// Give the monitor a moment to answer its EDID before asking.
 			snooze(300000);
-			if (RefreshOutputs())
+			if (RefreshOutputs()) {
 				NotifyDisplayChange();
+				// A monitor that has just come back (a DisplayPort one out of
+				// deep sleep, or one the machine started without) may not be
+				// ready when app_server lays it out: its link is looked at a
+				// few times, as after a wake, and trained again while it
+				// shows nothing.
+				std::lock_guard<std::recursive_mutex> lock(fLock);
+				fWakeChecksLeft = 3;
+				fRecheckAt.store(system_time() + 3000000);
+			}
 		} catch (const std::system_error &ex) {
 			debug_printf("[!] nvidia_rm: re-detecting displays failed: %s\n", ex.what());
 		}

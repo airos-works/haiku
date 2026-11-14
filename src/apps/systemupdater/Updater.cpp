@@ -1705,6 +1705,12 @@ Updater::NextBootState(const SystemState& state) const
 			return state.Latest() != NULL && state.Latest()->bootable;
 		}
 
+		int LoaderTrialStarts(const char* key)
+		{
+			// (an EFI variable applications can't read)
+			return 0;
+		}
+
 		const char* NewestOldState()
 		{
 			const InstalledVersion* version = state.NewestOldState();

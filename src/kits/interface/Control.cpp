@@ -380,8 +380,12 @@ BControl::SetEnabled(bool enabled)
 		Flush();
 	}
 
-	if (ACCESSIBILITY_ENABLED())
-		BPrivate::accessibility_notify(this, B_ACCESSIBLE_EVENT_STATE_CHANGED);
+	if (ACCESSIBILITY_ENABLED()) {
+		BMessage details;
+		details.AddInt64("changed", (int64)B_ACCESSIBLE_STATE_DISABLED);
+		BPrivate::accessibility_notify(this, B_ACCESSIBLE_EVENT_STATE_CHANGED,
+			&details);
+	}
 }
 
 

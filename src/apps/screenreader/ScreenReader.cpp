@@ -19,6 +19,13 @@
 		Option+Command+R	read the whole window
 		Option+Command+X	stop speaking
 
+	Browse mode, a virtual cursor through what read-all says:
+
+		Option+Command+Down/Up		next/previous item
+		Option+Command+H K J L D	next heading, link, form field, list,
+									landmark (with Shift: the previous one)
+		Option+Command+Return		activate the item (press; focus a field)
+
 	Everything spoken is also written to the syslog ("ScreenReader: say:")
 	and, unless turned off, shown in a caption window. Without a speech
 	engine (haiku#52), the captions are the output.
@@ -44,6 +51,7 @@
 #include <AccessibilityProtocol.h>
 
 #include "CaptionWindow.h"
+#include "NodeText.h"
 #include "SpeechOutput.h"
 
 
@@ -68,16 +76,12 @@ private:
 			void				_HandleEvent(BMessage* event);
 			void				_Say(const BString& text, bool interrupt);
 
-			BString				_Describe(const BMessage& node,
-									bool withDescription = true) const;
-			BString				_DescribeWindow(const BMessage& window) const;
-			const char*			_SpokenRole(int32 role) const;
-			BString				_SpokenText(const BString& text) const;
 
 			void				_ReadFocus(bool withWindow);
 			void				_ReadAll();
-			void				_CollectText(const BMessage& node,
-									BStringList& parts) const;
+			bool				_GetWindowTree(BMessage& window);
+			void				_Browse(int32 direction, int32 kind);
+			void				_Activate();
 
 			bool				_IsFocus(const BMessage* event,
 									const BMessage& node) const;
@@ -105,6 +109,13 @@ private:
 			bigtime_t			fFocusTime;
 			bigtime_t			fTextTime;
 			int32				fCaretLine;
+
+			// browse mode
+			std::vector<browse_item> fBrowseItems;
+			int32				fBrowseIndex;
+			int64				fBrowseWindowID;
+			int64				fBrowseItemID;
+			bigtime_t			fBrowseTime;
 };
 
 
@@ -125,7 +136,11 @@ ScreenReader::ScreenReader()
 	fWindowTime(0),
 	fFocusTime(0),
 	fTextTime(0),
-	fCaretLine(-1)
+	fCaretLine(-1),
+	fBrowseIndex(-1),
+	fBrowseWindowID(0),
+	fBrowseItemID(0),
+	fBrowseTime(0)
 {
 }
 
@@ -220,6 +235,15 @@ ScreenReader::MessageReceived(BMessage* message)
 				fSpeech->Stop();
 			break;
 
+		case B_SCREEN_READER_BROWSE:
+			_Browse(message->GetInt32("direction", 1),
+				message->GetInt32("kind", BROWSE_ANY));
+			break;
+
+		case B_SCREEN_READER_ACTIVATE:
+			_Activate();
+			break;
+
 		default:
 			BApplication::MessageReceived(message);
 			break;
@@ -291,145 +315,6 @@ ScreenReader::_Say(const BString& text, bool interrupt)
 }
 
 
-const char*
-ScreenReader::_SpokenRole(int32 role) const
-{
-	switch (role) {
-		case B_ACCESSIBLE_ROLE_UNKNOWN:
-		case B_ACCESSIBLE_ROLE_GROUP:
-		case B_ACCESSIBLE_ROLE_SCROLL_PANE:
-		case B_ACCESSIBLE_ROLE_SPLIT_PANE:
-		case B_ACCESSIBLE_ROLE_LABEL:
-		case B_ACCESSIBLE_ROLE_PARAGRAPH:
-		case B_ACCESSIBLE_ROLE_CANVAS:
-			return NULL;
-		case B_ACCESSIBLE_ROLE_POP_UP_BUTTON:
-			return "pop-up menu";
-		default:
-			return BAccessible::RoleName((accessible_role)role);
-	}
-}
-
-
-BString
-ScreenReader::_SpokenText(const BString& text) const
-{
-	if (text == " ")
-		return "space";
-	if (text == "\n")
-		return "new line";
-	if (text == "\t")
-		return "tab";
-	BString trimmed(text);
-	trimmed.Trim();
-	if (trimmed.IsEmpty())
-		return "blank";
-	return text;
-}
-
-
-BString
-ScreenReader::_Describe(const BMessage& node, bool withDescription) const
-{
-	int32 role = node.GetInt32(B_ACCESSIBLE_FIELD_ROLE, 0);
-	BString name = node.GetString(B_ACCESSIBLE_FIELD_NAME, "");
-	BString value = node.GetString(B_ACCESSIBLE_FIELD_VALUE, "");
-	uint64 states = (uint64)node.GetInt64(B_ACCESSIBLE_FIELD_STATES, 0);
-
-	BStringList parts;
-	if (!name.IsEmpty())
-		parts.Add(name);
-	if (const char* roleName = _SpokenRole(role))
-		parts.Add(roleName);
-
-	bool textRole = role == B_ACCESSIBLE_ROLE_TEXT_FIELD
-		|| role == B_ACCESSIBLE_ROLE_TEXT_AREA;
-	if ((states & B_ACCESSIBLE_STATE_PROTECTED) != 0) {
-		parts.Add("protected");
-	} else if (!value.IsEmpty() && value != name) {
-		if (textRole && value.Length() > 300) {
-			value.Truncate(300);
-			value << "…";
-		}
-		parts.Add(value);
-	} else if (textRole && value.IsEmpty())
-		parts.Add("blank");
-
-	if ((states & B_ACCESSIBLE_STATE_CHECKABLE) != 0) {
-		if ((states & B_ACCESSIBLE_STATE_CHECKED) != 0)
-			parts.Add("checked");
-		else if ((states & B_ACCESSIBLE_STATE_MIXED) != 0)
-			parts.Add("partially checked");
-		else
-			parts.Add("not checked");
-	} else if (role == B_ACCESSIBLE_ROLE_MENU_ITEM
-		&& (states & B_ACCESSIBLE_STATE_CHECKED) != 0) {
-		parts.Add("checked");
-	}
-	if (role == B_ACCESSIBLE_ROLE_TOGGLE_BUTTON)
-		parts.Add((states & B_ACCESSIBLE_STATE_PRESSED) != 0
-			? "pressed" : "not pressed");
-	if ((states & B_ACCESSIBLE_STATE_EXPANDABLE) != 0)
-		parts.Add((states & B_ACCESSIBLE_STATE_EXPANDED) != 0
-			? "expanded" : "collapsed");
-	if (role == B_ACCESSIBLE_ROLE_MENU_ITEM
-		&& (states & B_ACCESSIBLE_STATE_HAS_POPUP) != 0) {
-		parts.Add("submenu");
-	}
-	if ((states & B_ACCESSIBLE_STATE_DEFAULT) != 0)
-		parts.Add("default");
-	if ((states & B_ACCESSIBLE_STATE_DISABLED) != 0)
-		parts.Add("unavailable");
-	if (textRole && (states & B_ACCESSIBLE_STATE_READ_ONLY) != 0)
-		parts.Add("read only");
-
-	int32 index;
-	if (node.FindInt32(B_ACCESSIBLE_FIELD_INDEX, &index) == B_OK) {
-		int32 count = node.GetInt32(B_ACCESSIBLE_FIELD_COUNT,
-			node.GetInt32(B_ACCESSIBLE_FIELD_CHILD_COUNT, 0));
-		if (count > 0) {
-			BString position;
-			position << index + 1 << " of " << count;
-			parts.Add(position);
-		}
-	}
-	int32 level;
-	if (node.FindInt32(B_ACCESSIBLE_FIELD_LEVEL, &level) == B_OK && level > 1) {
-		BString text;
-		text << "level " << level;
-		parts.Add(text);
-	}
-	const char* shortcut;
-	if (node.FindString(B_ACCESSIBLE_FIELD_SHORTCUT, &shortcut) == B_OK)
-		parts.Add(shortcut);
-
-	if (withDescription) {
-		BString description = node.GetString(B_ACCESSIBLE_FIELD_DESCRIPTION,
-			"");
-		if (!description.IsEmpty() && description != name)
-			parts.Add(description);
-	}
-
-	return parts.Join(", ");
-}
-
-
-BString
-ScreenReader::_DescribeWindow(const BMessage& window) const
-{
-	int32 role = window.GetInt32(B_ACCESSIBLE_FIELD_ROLE,
-		B_ACCESSIBLE_ROLE_WINDOW);
-	BString text = window.GetString(B_ACCESSIBLE_FIELD_NAME, "");
-	if (text.IsEmpty())
-		text = "Untitled";
-	text << ", " << BAccessible::RoleName((accessible_role)role);
-	BString description = window.GetString(B_ACCESSIBLE_FIELD_DESCRIPTION, "");
-	if (!description.IsEmpty())
-		text << ", " << description;
-	return text;
-}
-
-
 bool
 ScreenReader::_IsFocus(const BMessage* event, const BMessage& node) const
 {
@@ -464,11 +349,11 @@ ScreenReader::_HandleEvent(BMessage* event)
 			fWindowTime = now;
 			fCaretLine = -1;
 
-			BString text = _DescribeWindow(window);
+			BString text = describe_window(window);
 			if (hasNode) {
 				fFocusID = node.GetInt64(B_ACCESSIBLE_FIELD_ID, 0);
 				fFocusTime = now;
-				text << ". " << _Describe(node);
+				text << ". " << describe_node(node);
 			} else
 				fFocusID = 0;
 			// don't cut off "Screen reader on"
@@ -498,7 +383,7 @@ ScreenReader::_HandleEvent(BMessage* event)
 			fFocusTime = now;
 			fCaretLine = -1;
 			// don't cut off the window title that was just started
-			_Say(_Describe(node), now - fWindowTime > kSettleTime);
+			_Say(describe_node(node), now - fWindowTime > kSettleTime);
 			break;
 		}
 
@@ -512,8 +397,12 @@ ScreenReader::_HandleEvent(BMessage* event)
 			int32 role = node.GetInt32(B_ACCESSIBLE_FIELD_ROLE, 0);
 			BString text;
 			if (what == B_ACCESSIBLE_EVENT_STATE_CHANGED) {
-				text = (states & B_ACCESSIBLE_STATE_DISABLED) != 0
-					? "unavailable" : "available";
+				// "changed": the state bits that changed; without it the
+				// event is an Interface Kit control enabled or disabled
+				int64 changed;
+				if (event->FindInt64("changed", &changed) != B_OK)
+					changed = B_ACCESSIBLE_STATE_DISABLED;
+				text = describe_state_change(node, (uint64)changed);
 			} else if ((states & B_ACCESSIBLE_STATE_CHECKABLE) != 0) {
 				if ((states & B_ACCESSIBLE_STATE_CHECKED) != 0)
 					text = "checked";
@@ -536,7 +425,7 @@ ScreenReader::_HandleEvent(BMessage* event)
 
 		case B_ACCESSIBLE_EVENT_NAME_CHANGED:
 			if (hasNode && _IsFocus(event, node))
-				_Say(_Describe(node, false), true);
+				_Say(describe_node(node, false), true);
 			break;
 
 		case B_ACCESSIBLE_EVENT_SELECTION_CHANGED:
@@ -546,7 +435,7 @@ ScreenReader::_HandleEvent(BMessage* event)
 				|| !_IsFocus(event, container) || !windowActive) {
 				break;
 			}
-			_Say(_Describe(node), true);
+			_Say(describe_node(node), true);
 			break;
 		}
 
@@ -563,7 +452,7 @@ ScreenReader::_HandleEvent(BMessage* event)
 				int32 length = event->GetInt32("length", 1);
 				text = length == 1 ? "star" : "stars";
 			} else
-				text = _SpokenText(event->GetString("text", ""));
+				text = spoken_text(event->GetString("text", ""));
 			if (what == B_ACCESSIBLE_EVENT_TEXT_DELETED
 				&& event->GetInt32("length", 0) > 1) {
 				text.Prepend("deleted ");
@@ -590,11 +479,11 @@ ScreenReader::_HandleEvent(BMessage* event)
 			}
 			int32 line = event->GetInt32("line", -1);
 			if (line != fCaretLine && fCaretLine >= 0) {
-				_Say(_SpokenText(event->GetString("line_text", "")), true);
+				_Say(spoken_text(event->GetString("line_text", "")), true);
 			} else {
 				BString character = event->GetString("char", "");
 				_Say(character.IsEmpty() ? BString("end")
-					: _SpokenText(character), true);
+					: spoken_text(character), true);
 			}
 			fCaretLine = line;
 			break;
@@ -639,66 +528,16 @@ ScreenReader::_ReadFocus(bool withWindow)
 	BString text;
 	BMessage window;
 	if (withWindow && reply.FindMessage("window", &window) == B_OK)
-		text = _DescribeWindow(window);
+		text = describe_window(window);
 	BMessage node;
 	if (reply.FindMessage("node", &node) == B_OK) {
 		fFocusID = node.GetInt64(B_ACCESSIBLE_FIELD_ID, 0);
 		if (!text.IsEmpty())
 			text << ". ";
-		text << _Describe(node);
+		text << describe_node(node);
 	} else if (text.IsEmpty())
 		text = "Nothing has the focus";
 	_Say(text, true);
-}
-
-
-void
-ScreenReader::_CollectText(const BMessage& node, BStringList& parts) const
-{
-	uint64 states = (uint64)node.GetInt64(B_ACCESSIBLE_FIELD_STATES, 0);
-	if ((states & B_ACCESSIBLE_STATE_INVISIBLE) != 0)
-		return;
-
-	int32 role = node.GetInt32(B_ACCESSIBLE_FIELD_ROLE, 0);
-	BString name = node.GetString(B_ACCESSIBLE_FIELD_NAME, "");
-	BString value = node.GetString(B_ACCESSIBLE_FIELD_VALUE, "");
-
-	switch (role) {
-		case B_ACCESSIBLE_ROLE_SCROLL_BAR:
-		case B_ACCESSIBLE_ROLE_SEPARATOR:
-			return;
-
-		case B_ACCESSIBLE_ROLE_LIST:
-		case B_ACCESSIBLE_ROLE_TREE:
-		case B_ACCESSIBLE_ROLE_TABLE:
-		case B_ACCESSIBLE_ROLE_MENU_BAR:
-		{
-			BString text = _Describe(node, false);
-			int32 count = node.GetInt32(B_ACCESSIBLE_FIELD_CHILD_COUNT, 0);
-			text << ", " << count << (count == 1 ? " item" : " items");
-			parts.Add(text);
-			return;
-		}
-
-		case B_ACCESSIBLE_ROLE_UNKNOWN:
-		case B_ACCESSIBLE_ROLE_GROUP:
-		case B_ACCESSIBLE_ROLE_SCROLL_PANE:
-		case B_ACCESSIBLE_ROLE_SPLIT_PANE:
-		case B_ACCESSIBLE_ROLE_TAB_PANEL:
-			if (!name.IsEmpty() || !value.IsEmpty())
-				parts.Add(_Describe(node, false));
-			break;
-
-		default:
-			parts.Add(_Describe(node, false));
-			break;
-	}
-
-	BMessage child;
-	for (int32 i = 0; node.FindMessage(B_ACCESSIBLE_FIELD_CHILD, i, &child)
-			== B_OK; i++) {
-		_CollectText(child, parts);
-	}
 }
 
 
@@ -710,26 +549,135 @@ ScreenReader::_ReadAll()
 		return;
 	}
 
-	BMessage request(B_ACCESSIBILITY_GET_NODE);
-	request.AddInt64("id", fWindowID);
-	request.AddInt32("depth", -1);
-	BMessage reply;
 	BMessage window;
-	if (fBridge.SendMessage(&request, &reply, kQueryTimeout, kQueryTimeout)
-			!= B_OK || reply.GetInt32("status", B_ERROR) != B_OK
-		|| reply.FindMessage("node", &window) != B_OK) {
+	if (!_GetWindowTree(window)) {
 		_Say("The window does not answer", true);
 		return;
 	}
 
-	BStringList parts;
-	parts.Add(_DescribeWindow(window));
-	BMessage child;
-	for (int32 i = 0; window.FindMessage(B_ACCESSIBLE_FIELD_CHILD, i, &child)
-			== B_OK; i++) {
-		_CollectText(child, parts);
+	_Say(read_all_text(window), true);
+}
+
+
+bool
+ScreenReader::_GetWindowTree(BMessage& window)
+{
+	BMessage request(B_ACCESSIBILITY_GET_NODE);
+	request.AddInt64("id", fWindowID);
+	request.AddInt32("depth", -1);
+	BMessage reply;
+	return fBridge.SendMessage(&request, &reply, kQueryTimeout, kQueryTimeout)
+			== B_OK && reply.GetInt32("status", B_ERROR) == B_OK
+		&& reply.FindMessage("node", &window) == B_OK;
+}
+
+
+/*!	Browse mode (#119): a virtual cursor through what read-all says, item
+	by item, for web pages (where Tab only reaches what takes the focus) and
+	any other window. The tree is fetched again when it is older than a
+	second (pages change), keeping the place by the item's node.
+*/
+void
+ScreenReader::_Browse(int32 direction, int32 kind)
+{
+	if (!fBridge.IsValid() || fWindowID == 0) {
+		_Say("No window", true);
+		return;
 	}
-	_Say(parts.Join(". "), true);
+
+	bigtime_t now = system_time();
+	if (fBrowseWindowID != fWindowID || now - fBrowseTime > 1000000) {
+		BMessage window;
+		if (!_GetWindowTree(window)) {
+			_Say("The window does not answer", true);
+			return;
+		}
+		if (fBrowseWindowID != fWindowID) {
+			fBrowseIndex = -1;
+			fBrowseItemID = 0;
+		}
+		collect_browse_items(window, fBrowseItems);
+		fBrowseWindowID = fWindowID;
+		fBrowseTime = now;
+
+		// find the place again
+		if (fBrowseItemID != 0) {
+			int32 index = -1;
+			for (size_t i = 0; i < fBrowseItems.size(); i++) {
+				if (fBrowseItems[i].id == fBrowseItemID) {
+					index = (int32)i;
+					break;
+				}
+			}
+			if (index >= 0)
+				fBrowseIndex = index;
+			else if (fBrowseIndex >= (int32)fBrowseItems.size())
+				fBrowseIndex = (int32)fBrowseItems.size() - 1;
+		}
+	}
+
+	int32 from = fBrowseIndex;
+	if (from < 0 && direction < 0)
+		from = (int32)fBrowseItems.size();
+	int32 index = find_browse_item(fBrowseItems, from, direction, kind);
+	if (index < 0) {
+		BString text;
+		if (kind == BROWSE_ANY)
+			text = direction > 0 ? "Bottom" : "Top";
+		else {
+			text << "No " << (direction > 0 ? "next " : "previous ")
+				<< browse_kind_name(kind);
+		}
+		_Say(text, true);
+		return;
+	}
+
+	fBrowseIndex = index;
+	fBrowseItemID = fBrowseItems[index].id;
+	_Say(fBrowseItems[index].text, true);
+}
+
+
+void
+ScreenReader::_Activate()
+{
+	if (fBrowseWindowID != fWindowID || fBrowseIndex < 0
+		|| fBrowseIndex >= (int32)fBrowseItems.size()
+		|| fBrowseItems[fBrowseIndex].id == 0) {
+		_Say("Nothing to activate", true);
+		return;
+	}
+
+	// a field takes the focus (and is then said); anything else is pressed
+	const browse_item& item = fBrowseItems[fBrowseIndex];
+	int32 action = B_ACCESSIBLE_ACTION_PRESS;
+	switch (item.role) {
+		case B_ACCESSIBLE_ROLE_TEXT_FIELD:
+		case B_ACCESSIBLE_ROLE_TEXT_AREA:
+		case B_ACCESSIBLE_ROLE_SLIDER:
+		case B_ACCESSIBLE_ROLE_SPIN_BUTTON:
+		case B_ACCESSIBLE_ROLE_COMBO_BOX:
+			action = B_ACCESSIBLE_ACTION_FOCUS;
+			break;
+	}
+
+	BMessage request(B_ACCESSIBILITY_PERFORM_ACTION);
+	request.AddInt64("id", item.id);
+	request.AddInt32("action", action);
+	BMessage reply;
+	if (fBridge.SendMessage(&request, &reply, kQueryTimeout, kQueryTimeout)
+			!= B_OK || reply.GetInt32("status", B_ERROR) != B_OK) {
+		if (action == B_ACCESSIBLE_ACTION_PRESS) {
+			// what cannot be pressed may still take the focus
+			request.ReplaceInt32("action", B_ACCESSIBLE_ACTION_FOCUS);
+			if (fBridge.SendMessage(&request, &reply, kQueryTimeout,
+					kQueryTimeout) == B_OK
+				&& reply.GetInt32("status", B_ERROR) == B_OK) {
+				return;
+			}
+		}
+		_Say("Cannot activate this", true);
+	}
 }
 
 

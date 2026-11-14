@@ -60,8 +60,9 @@ protected:
 		sInstance = this;
 	}
 
-	// "irq_routing false" in the kernel settings keeps every shared
-	// interrupt on CPU 0, as before routing was implemented.
+	// Shared interrupts go to every CPU only with "irq_routing true" in the
+	// kernel settings; by default they stay on CPU 0, as before routing was
+	// implemented (#101; it broke the Dragon Q8B's SD card).
 	void LoadRoutingSetting();
 	bool RoutingEnabled() const { return fRoutingEnabled; }
 

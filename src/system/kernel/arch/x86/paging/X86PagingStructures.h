@@ -22,6 +22,12 @@ struct X86PagingStructures : DeferredDeletable {
 	int32						ref_count;
 	CPUSet						active_on_cpus;
 		// mask indicating on which CPUs the map is currently used
+	uint64						pcid_id;
+		// unique, never reused: CPUs keep PCIDs for these (#104)
+	int64						tlb_generation;
+		// bumped by every user TLB invalidation: a CPU that kept this
+		// address space's entries under a PCID while not running it
+		// flushes them when it comes back and finds it changed
 
 								X86PagingStructures();
 	virtual						~X86PagingStructures();

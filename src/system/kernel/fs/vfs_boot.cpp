@@ -362,15 +362,22 @@ DiskBootMethod::SortPartitions(KPartition** partitions, int32 count)
 	The boot code should then just try them one by one.
 */
 static status_t
-get_boot_partitions(KMessage& bootVolume, PartitionStack& partitions)
+get_boot_partitions(KMessage& bootVolume, PartitionStack& partitions,
+	bool verbose)
 {
-	dprintf("get_boot_partitions(): boot volume message:\n");
-	bootVolume.Dump(&dprintf);
+	// (only on the first scan: the rescans until the boot device shows up
+	// otherwise fill the syslog and push the cause out of the panic's view)
+	if (verbose) {
+		dprintf("get_boot_partitions(): boot volume message:\n");
+		bootVolume.Dump(&dprintf);
+	}
 
 	// create boot method
 	int32 bootMethodType = bootVolume.GetInt32(BOOT_METHOD, BOOT_METHOD_DEFAULT);
-	dprintf("get_boot_partitions(): boot method type: %" B_PRId32 "\n",
-		bootMethodType);
+	if (verbose) {
+		dprintf("get_boot_partitions(): boot method type: %" B_PRId32 "\n",
+			bootMethodType);
+	}
 
 	BootMethod* bootMethod = NULL;
 	switch (bootMethodType) {
@@ -554,6 +561,12 @@ struct KernelBootControlReader {
 			return false;
 		}
 		return HasSystemPackage(path.Path(), name);
+	}
+
+	int LoaderTrialStarts(const char* key)
+	{
+		// the kernel only decides where no loader read the boot volume
+		return 0;
 	}
 
 	bool LatestBootable()
@@ -779,14 +792,20 @@ vfs_mount_boot_file_system(kernel_args* args)
 	// than giving up on the first pass; a device that is already there is
 	// still found immediately.
 	const bigtime_t deadline = system_time() + kBootDeviceTimeout;
+	bool firstScan = true;
 	while (true) {
-		status = get_boot_partitions(bootVolume, partitions);
+		status = get_boot_partitions(bootVolume, partitions, firstScan);
+		firstScan = false;
 		if (status < B_OK)
 			panic("get_boot_partitions failed!");
 		if (!partitions.IsEmpty())
 			break;
 		if (system_time() >= deadline) {
-			panic("did not find any boot partitions! @! syslog | tail 15");
+			// What the disk drivers said is the cause, not the rescans:
+			// leave out what each scan logs again.
+			panic("did not find any boot partitions! @! syslog "
+				"| grep -v identify | grep -v 10102 "
+				"| grep -v get_boot_partitions | tail 45");
 			break;
 		}
 		snooze(kBootDeviceRetryInterval);

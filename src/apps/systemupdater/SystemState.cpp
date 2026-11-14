@@ -323,6 +323,19 @@ SystemState::_AddVersion(const char* state, const char* activationFile)
 }
 
 
+/*!	A word that names one trial start: the boot loader counts its starts of
+	the trial under it.
+*/
+static BString
+new_trial_token()
+{
+	BString token;
+	token.SetToFormat("%" B_PRIx64 "-%" B_PRIx32, (uint64)real_time_clock_usecs(),
+		(uint32)find_thread(NULL));
+	return token;
+}
+
+
 // #pragma mark - boot control
 
 
@@ -378,9 +391,10 @@ SystemState::StartTrial(const char* release, const char* fallback,
 
 	unlink(boot_control_path(AIROS_BOOT_TRIAL_ATTEMPTS_FILE));
 	BString content;
-	content.SetToFormat("release %s\nfallback %s\nattempts %" B_PRId32 "\n",
-		release, fallback != NULL && fallback[0] != '\0' ? fallback : "newest",
-		allowed);
+	content.SetToFormat("release %s\nfallback %s\nattempts %" B_PRId32
+		"\ntoken %s\n", release,
+		fallback != NULL && fallback[0] != '\0' ? fallback : "newest",
+		allowed, new_trial_token().String());
 	return WriteFileAtomically(boot_control_path(AIROS_BOOT_TRIAL_FILE),
 		content);
 }
@@ -392,6 +406,28 @@ SystemState::ResetTrialAttempts()
 	if (unlink(boot_control_path(AIROS_BOOT_TRIAL_ATTEMPTS_FILE)) != 0
 		&& errno != ENOENT) {
 		return errno;
+	}
+
+	// a new token: the boot loader's own count starts over too
+	BString text;
+	if (read_text_file(boot_control_path(AIROS_BOOT_TRIAL_FILE), text) == B_OK) {
+		BString content;
+		int32 start = 0;
+		while (start < text.Length()) {
+			int32 end = text.FindFirst('\n', start);
+			if (end < 0)
+				end = text.Length();
+			BString line;
+			text.CopyInto(line, start, end - start);
+			if (!line.StartsWith("token ") && !line.IsEmpty())
+				content << line << '\n';
+			start = end + 1;
+		}
+		content << "token " << new_trial_token() << '\n';
+		status_t error = WriteFileAtomically(
+			boot_control_path(AIROS_BOOT_TRIAL_FILE), content);
+		if (error != B_OK)
+			return error;
 	}
 	sync();
 	return B_OK;

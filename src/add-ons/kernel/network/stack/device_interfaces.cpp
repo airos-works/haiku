@@ -46,12 +46,97 @@ static uint32 sDeviceIndex;
 	as available, deframes them, and puts them into the receive queue of the
 	device interface.
 */
+static void process_received_batch(net_device_interface* interface,
+	struct list* batch);
+
+
+/*!	Frames a batch reader takes per call. Larger batches let receive
+	coalescing build larger segments, and TCP acknowledges once per segment:
+	64 frames held a sender with a 128 KB window to 3.5 instead of 4.2 Gbit/s
+	on the Framework Desktop, 16 are as fast as handing every frame to the
+	consumer thread.
+*/
+static const uint32 kReceiveBatchSize = 16;
+
+
+/*!	The reader of a device that hands over several frames per call: it runs
+	each batch through the stack itself, which saves the hand-off to the
+	consumer thread, a lock round and a thread wake-up per batch, and lets
+	the acknowledgements of a batch leave sooner (airos-works/haiku#123).
+	It does protocol work now, so it runs at the consumer's priority; the
+	driver's own queue holds what arrives meanwhile.
+*/
+static status_t
+device_batch_reader(net_device_interface* interface)
+{
+	net_device* device = interface->device;
+	status_t status = B_OK;
+	bool started = false;
+
+	net_buffer* buffers[kReceiveBatchSize];
+	struct list batch;
+	list_init_etc(&batch, offsetof(net_buffer, link));
+
+	while ((device->flags & IFF_UP) != 0) {
+		uint32 count = 0;
+		status = device->module->receive_data_batch(device, buffers,
+			B_COUNT_OF(buffers), &count);
+		if (status == B_NOT_SUPPORTED && !started)
+			return status;
+		if (status == B_DEVICE_NOT_FOUND) {
+			device_removed(device);
+			return status;
+		}
+		if (status != B_OK) {
+			atomic_add((int32*)&device->stats.receive.errors, 1);
+			snooze(10000);
+			continue;
+		}
+
+		if (!started) {
+			set_thread_priority(find_thread(NULL), B_URGENT_DISPLAY_PRIORITY);
+			started = true;
+		}
+
+		for (uint32 i = 0; i < count; i++) {
+			net_buffer* buffer = buffers[i];
+
+			// feed device monitors
+			if (atomic_get(&interface->monitor_count) > 0)
+				device_interface_monitor_receive(interface, buffer);
+
+			ASSERT(buffer->interface_address == NULL);
+
+			if (interface->deframe_func(device, buffer) != B_OK) {
+				gNetBufferModule.free(buffer);
+				atomic_add((int32*)&device->stats.receive.dropped, 1);
+				continue;
+			}
+
+			atomic_add((int32*)&device->stats.receive.packets, 1);
+			atomic_add64((int64*)&device->stats.receive.bytes, buffer->size);
+			list_add_item(&batch, buffer);
+		}
+
+		process_received_batch(interface, &batch);
+	}
+
+	return status;
+}
+
+
 static status_t
 device_reader_thread(void* _interface)
 {
 	net_device_interface* interface = (net_device_interface*)_interface;
 	net_device* device = interface->device;
 	status_t status = B_OK;
+
+	if (device->module->receive_data_batch != NULL) {
+		status = device_batch_reader(interface);
+		if (status != B_NOT_SUPPORTED)
+			return status;
+	}
 
 	while ((device->flags & IFF_UP) != 0) {
 		net_buffer* buffer;
@@ -94,15 +179,66 @@ device_reader_thread(void* _interface)
 }
 
 
-/*!	Takes all frames the reader thread queued at once and runs them through
-	the stack: one lock round on the queue and one on the handler list per
-	batch, instead of one each per frame (airos-works/haiku#123).
+/*!	Runs a batch of received frames through the stack: merges consecutive
+	segments of each TCP connection, then hands each frame to the handler of
+	its type, with the handler list locked once per batch instead of once per
+	frame (airos-works/haiku#123).
+*/
+static void
+process_received_batch(net_device_interface* interface, struct list* batch)
+{
+	net_device* device = interface->device;
+
+	coalesce_tcp_segments(batch);
+
+	RecursiveLocker locker(interface->receive_lock);
+
+	while (net_buffer* buffer
+			= (net_buffer*)list_remove_head_item(batch)) {
+		if (buffer->interface_address != NULL) {
+			// If the interface is already specified, this buffer was
+			// delivered locally.
+			if (buffer->interface_address->domain->module->receive_data(
+					buffer) == B_OK)
+				buffer = NULL;
+		} else {
+			sockaddr_dl& linkAddress = *(sockaddr_dl*)buffer->source;
+			int32 genericType = buffer->type;
+			int32 specificType = B_NET_FRAME_TYPE(linkAddress.sdl_type,
+				ntohs(linkAddress.sdl_e_type));
+
+			buffer->index = interface->device->index;
+
+			// Find handler for this packet
+			DeviceHandlerList::Iterator iterator
+				= interface->receive_funcs.GetIterator();
+			while (buffer != NULL && iterator.HasNext()) {
+				net_device_handler* handler = iterator.Next();
+
+				// If the handler returns B_OK, it consumed the buffer -
+				// first handler wins.
+				if ((handler->type == genericType
+						|| handler->type == specificType)
+					&& handler->func(handler->cookie, device, buffer)
+						== B_OK)
+					buffer = NULL;
+			}
+		}
+
+		if (buffer != NULL)
+			gNetBufferModule.free(buffer);
+	}
+}
+
+
+/*!	Takes all frames queued for the interface at once - frames delivered
+	locally, and those of devices that cannot hand over several frames per
+	call - and runs them through the stack.
 */
 static status_t
 device_consumer_thread(void* _interface)
 {
 	net_device_interface* interface = (net_device_interface*)_interface;
-	net_device* device = interface->device;
 
 	struct list batch;
 	list_init_etc(&batch, offsetof(net_buffer, link));
@@ -115,46 +251,7 @@ device_consumer_thread(void* _interface)
 			break;
 		}
 
-		// merge consecutive segments of each TCP connection
-		coalesce_tcp_segments(&batch);
-
-		RecursiveLocker locker(interface->receive_lock);
-
-		while (net_buffer* buffer
-				= (net_buffer*)list_remove_head_item(&batch)) {
-			if (buffer->interface_address != NULL) {
-				// If the interface is already specified, this buffer was
-				// delivered locally.
-				if (buffer->interface_address->domain->module->receive_data(
-						buffer) == B_OK)
-					buffer = NULL;
-			} else {
-				sockaddr_dl& linkAddress = *(sockaddr_dl*)buffer->source;
-				int32 genericType = buffer->type;
-				int32 specificType = B_NET_FRAME_TYPE(linkAddress.sdl_type,
-					ntohs(linkAddress.sdl_e_type));
-
-				buffer->index = interface->device->index;
-
-				// Find handler for this packet
-				DeviceHandlerList::Iterator iterator
-					= interface->receive_funcs.GetIterator();
-				while (buffer != NULL && iterator.HasNext()) {
-					net_device_handler* handler = iterator.Next();
-
-					// If the handler returns B_OK, it consumed the buffer -
-					// first handler wins.
-					if ((handler->type == genericType
-							|| handler->type == specificType)
-						&& handler->func(handler->cookie, device, buffer)
-							== B_OK)
-						buffer = NULL;
-				}
-			}
-
-			if (buffer != NULL)
-				gNetBufferModule.free(buffer);
-		}
+		process_received_batch(interface, &batch);
 	}
 
 	// free what is left if we were asked to quit with frames queued
