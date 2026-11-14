@@ -579,6 +579,23 @@ mmu_init_for_kernel()
 			ramFlags);
 	}
 
+	// The kernel's early screen output (debug_screen) reaches the frame
+	// buffer through its map of physical memory. The firmware's buffer is
+	// not RAM (VideoCore memory, or past the RAM's end on the Pi 5): map it
+	// there, uncached.
+	if (gKernelArgs.frame_buffer.enabled) {
+		phys_addr_t start = ROUNDDOWN(
+			(phys_addr_t)gKernelArgs.frame_buffer.physical_buffer.start,
+			B_PAGE_SIZE);
+		size_t size = ROUNDUP(gKernelArgs.frame_buffer.physical_buffer.start
+			+ gKernelArgs.frame_buffer.physical_buffer.size, B_PAGE_SIZE) - start;
+		if (!is_ram(start, size)) {
+			map_range(KERNEL_PMAP_BASE + start, start, size,
+				ARMv8TranslationTableDescriptor::DefaultPeripheralAttribute
+					| mair.MaskOf(MAIR_NORMAL_NC));
+		}
+	}
+
 	if (gKernelArgs.arch_args.uart.kind[0] != 0) {
 		// The kernel uses the UART before it can map anything.
 		uint64 regsStart = gKernelArgs.arch_args.uart.regs.start;

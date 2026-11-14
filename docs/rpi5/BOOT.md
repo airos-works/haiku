@@ -65,8 +65,10 @@ through PSCI after 15 s.
 ## The lab (tools/rpi5)
 
 - NanoKVM at 192.168.1.39 (HDMI0, USB, serial: its ttyS1 is the Pi's GPIO
-  14/15). Its ATX power lines are not connected to the Pi 5: nothing here
-  can switch it off and on.
+  14/15). Its ATX power lines are not connected to the Pi 5.
+- Power: the Home Assistant plug "PiSwitch" (since 2026-11-14):
+  `RPI4_STATE=/mnt/HaikuWork/rpi5/state tools/rpi4/power.py status|on|off|cycle`.
+  A cold start from the SD card answers pings after about 60 s.
 - The EEPROM's BOOT_ORDER is 0xf614 since 2026-11-14 (it was 0xf461, SD
   first): USB first, so the KVM's virtual disk decides what starts. An
   "idle" disk (rpi5-idle.img, FAT without boot files) lets it fall through

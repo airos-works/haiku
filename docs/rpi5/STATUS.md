@@ -16,6 +16,7 @@ Pi 4 and a Pi 5. How it boots: BOOT.md.
 | Ethernet | `rp1_gem`, 1 Gbit/s | DHCP, ping 0.16 ms, no loss |
 | Display | the firmware's frame buffer, 1920x1080, 32 bits | desktop on HDMI0 |
 | Watchdog | `airos.watchdog` (lab), restart through PSCI | resets after a hang |
+| `airos.debug` | loader and kernel output on the screen | boots to the network (kernel pager: P) |
 
 Not done yet:
 
@@ -29,5 +30,3 @@ Not done yet:
 - Sound (HDMI audio), the HEVC decoder, the fan (RP1 PWM), the RTC, the
   power button, the PCIe x1 connector (NVMe), USB 3 speeds, CPU frequency
   scaling.
-- `airos.debug`: the kernel's screen output while the frame buffer was 16
-  bits per pixel hung the boot; untested since `framebuffer_depth=32`.
