@@ -79,11 +79,27 @@ enum {
 	RPI_GPIO_CLAIM,
 	RPI_GPIO_RELEASE,
 	RPI_GPIO_WRITE,
-	RPI_GPIO_WAIT_EVENTS
+	RPI_GPIO_WAIT_EVENTS,
+	RPI_GPIO_DS18B20_CONVERT,
+	RPI_GPIO_DS18B20_READ
+};
+
+/*	DS18B20 operations use a pin already claimed as an input. CONVERT verifies
+	the ROM of one externally powered sensor and starts a conversion. READ is
+	allowed after 750 ms and returns its CRC-checked, signed raw temperature
+	(in units of 1/16 degree Celsius). Both leave the pin claimed. Parasite
+	power and multiple sensors on one pin are not supported by this interface.
+*/
+struct rpi_gpio_ds18b20_request {
+	uint32		pin;
+	int16		raw;			// READ: the sensor's signed raw value
+	uint16		_reserved;
+	uint64		sensor;			// the verified 64-bit ROM code
 };
 
 // rpi_gpio_info.flags
 #define RPI_GPIO_INFO_EDGE_INTERRUPTS	0x01	// else inputs are sampled
+#define RPI_GPIO_INFO_DS18B20		0x02	// DS18B20 commands are supported
 
 struct rpi_gpio_info {
 	uint32		api_version;		// RPI_GPIO_API_VERSION

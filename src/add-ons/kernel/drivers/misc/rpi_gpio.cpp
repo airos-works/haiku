@@ -24,6 +24,7 @@
 
 #include <bus/FDT.h>
 #include <condition_variable.h>
+#include <cpu.h>
 #include <device_manager.h>
 #include <kernel.h>
 #include <lock.h>
@@ -31,6 +32,7 @@
 
 #include <rpi_firmware.h>
 #include <rpi_gpio.h>
+#include <ds18b20.h>
 
 
 //#define TRACE_GPIO
@@ -78,6 +80,10 @@ struct gpio_client {
 	uint32			claimed;		// pins; changed under sLock + sEventLock
 	uint32			lost;
 	bool			closed;
+	bigtime_t		ds18b20Started;
+	uint64			ds18b20Sensor;
+	uint32			ds18b20Pin;
+	bool			ds18b20Converting;
 	rpi_gpio_event	batch[WAIT_BATCH];
 };
 
@@ -537,6 +543,176 @@ wait_events(gpio_client* client, rpi_gpio_wait& request)
 }
 
 
+static void
+one_wire_wait(uint32 microseconds)
+{
+	bigtime_t end = system_time() + microseconds;
+	while (system_time() < end)
+		cpu_pause();
+}
+
+
+static void
+one_wire_drive_low(uint32 pin)
+{
+	write_reg(REG_CLR0, 1u << pin);
+	set_function(pin, RPI_GPIO_OUTPUT);
+}
+
+
+static void
+one_wire_release(uint32 pin)
+{
+	set_function(pin, RPI_GPIO_INPUT);
+}
+
+
+static status_t
+one_wire_reset(uint32 pin)
+{
+	InterruptsSpinLocker locker(sEventLock);
+	one_wire_drive_low(pin);
+	one_wire_wait(480);
+	one_wire_release(pin);
+	one_wire_wait(70);
+	bool present = pin_level(read_reg(REG_LEV0), pin) == 0;
+	one_wire_wait(410);
+	return present ? B_OK : B_DEVICE_NOT_FOUND;
+}
+
+
+static void
+one_wire_write_bit(uint32 pin, bool high)
+{
+	one_wire_drive_low(pin);
+	one_wire_wait(high ? 5 : 65);
+	one_wire_release(pin);
+	one_wire_wait(high ? 60 : 5);
+}
+
+
+static uint8
+one_wire_read_bit(uint32 pin)
+{
+	one_wire_drive_low(pin);
+	one_wire_wait(4);
+	one_wire_release(pin);
+	one_wire_wait(8);
+	uint8 value = pin_level(read_reg(REG_LEV0), pin);
+	one_wire_wait(50);
+	return value;
+}
+
+
+static void
+one_wire_write_byte(uint32 pin, uint8 value)
+{
+	InterruptsSpinLocker locker(sEventLock);
+	for (uint8 bit = 0; bit < 8; bit++)
+		one_wire_write_bit(pin, (value & (1u << bit)) != 0);
+}
+
+
+static void
+one_wire_read(uint32 pin, uint8* data, size_t count)
+{
+	InterruptsSpinLocker locker(sEventLock);
+	for (size_t byte = 0; byte < count; byte++) {
+		uint8 value = 0;
+		for (uint8 bit = 0; bit < 8; bit++)
+			value |= one_wire_read_bit(pin) << bit;
+		data[byte] = value;
+	}
+}
+
+
+static status_t
+ds18b20_start(uint32 pin, uint64* _sensor)
+{
+	uint8 rom[8];
+	status_t status = one_wire_reset(pin);
+	if (status != B_OK)
+		return status;
+	one_wire_write_byte(pin, 0x33);
+	one_wire_read(pin, rom, sizeof(rom));
+	if (!ds18b20_rom_is_valid(rom))
+		return B_BAD_DATA;
+
+	uint64 sensor = 0;
+	for (size_t i = 0; i < sizeof(rom); i++)
+		sensor |= (uint64)rom[i] << (i * 8);
+	status = one_wire_reset(pin);
+	if (status != B_OK)
+		return status;
+	one_wire_write_byte(pin, 0xcc);
+	one_wire_write_byte(pin, 0x44);
+	*_sensor = sensor;
+	return B_OK;
+}
+
+
+static status_t
+ds18b20_read(uint32 pin, int16* _raw)
+{
+	status_t status = one_wire_reset(pin);
+	if (status != B_OK)
+		return status;
+	one_wire_write_byte(pin, 0xcc);
+	one_wire_write_byte(pin, 0xbe);
+	uint8 data[9];
+	one_wire_read(pin, data, sizeof(data));
+	if (!ds18b20_scratchpad_is_valid(data))
+		return B_BAD_DATA;
+	*_raw = ds18b20_raw_temperature(data);
+	return B_OK;
+}
+
+
+static status_t
+ds18b20_control(gpio_client* client, uint32 op, void* buffer)
+{
+	rpi_gpio_ds18b20_request request;
+	if (user_memcpy(&request, buffer, sizeof(request)) != B_OK)
+		return B_BAD_ADDRESS;
+	if (request.pin >= FIRST_UNCLAIMABLE)
+		return B_BAD_VALUE;
+
+	MutexLocker locker(sLock);
+	uint32 pin = request.pin;
+	if (sOwner[pin] != client || get_function(pin) != RPI_GPIO_INPUT)
+		return B_NOT_ALLOWED;
+
+	if (op == RPI_GPIO_DS18B20_CONVERT) {
+		{
+			InterruptsSpinLocker eventLocker(sEventLock);
+			set_edge_detection(pin, false);
+		}
+		client->ds18b20Converting = false;
+		uint64 sensor;
+		status_t status = ds18b20_start(pin, &sensor);
+		if (status != B_OK)
+			return status;
+		client->ds18b20Sensor = sensor;
+		client->ds18b20Pin = pin;
+		client->ds18b20Started = system_time();
+		client->ds18b20Converting = true;
+		request.sensor = sensor;
+		request.raw = 0;
+	} else {
+		if (!client->ds18b20Converting || client->ds18b20Pin != pin)
+			return B_NOT_ALLOWED;
+		if (system_time() - client->ds18b20Started < 750000)
+			return B_WOULD_BLOCK;
+		status_t status = ds18b20_read(pin, &request.raw);
+		if (status != B_OK)
+			return status;
+		request.sensor = client->ds18b20Sensor;
+		client->ds18b20Converting = false;
+	}
+	return user_memcpy(buffer, &request, sizeof(request));
+}
+
+
 //	#pragma mark - device hooks
 
 
@@ -553,6 +729,7 @@ gpio_open(const char* name, uint32 flags, void** _cookie)
 	client->claimed = 0;
 	client->lost = 0;
 	client->closed = false;
+	client->ds18b20Converting = false;
 	{
 		InterruptsSpinLocker locker(sEventLock);
 		client->readPosition = sEventCount;
@@ -627,6 +804,7 @@ gpio_control(void* cookie, uint32 op, void* buffer, size_t length)
 			info.board = RPI_GPIO_BOARD_RPI4;
 			if (sInterruptInstalled)
 				info.flags |= RPI_GPIO_INFO_EDGE_INTERRUPTS;
+			info.flags |= RPI_GPIO_INFO_DS18B20;
 			return user_memcpy(buffer, &info, sizeof(info));
 		}
 
@@ -673,6 +851,9 @@ gpio_control(void* cookie, uint32 op, void* buffer, size_t length)
 				return B_BAD_ADDRESS;
 			return status;
 		}
+		case RPI_GPIO_DS18B20_CONVERT:
+		case RPI_GPIO_DS18B20_READ:
+			return ds18b20_control(client, op, buffer);
 	}
 
 	return B_DEV_INVALID_IOCTL;
