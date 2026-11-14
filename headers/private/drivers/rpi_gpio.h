@@ -19,9 +19,10 @@
 	claimed; the others belong to the board (Wi-Fi, Bluetooth, the SD card,
 	Ethernet). A claimed pin belongs to the file descriptor that claimed it
 	until it is released or the descriptor is closed; then it gets back the
-	function, pull and level it had before. A claim with
-	RPI_GPIO_CLAIM_DETACH configures the pin and keeps nothing: the setting
-	stays when the program ends (a command line tool).
+	function, pull and level it had before. An output claimed with
+	RPI_GPIO_CLAIM_SAFE_OFF instead stays an output at its requested off level.
+	A claim with RPI_GPIO_CLAIM_DETACH configures the pin and keeps nothing:
+	the setting stays when the program ends (a command line tool).
 
 	Level changes of claimed pins are events, timestamped with system_time()
 	in the interrupt handler (inputs) or when the level was written
@@ -100,6 +101,7 @@ struct rpi_gpio_ds18b20_request {
 // rpi_gpio_info.flags
 #define RPI_GPIO_INFO_EDGE_INTERRUPTS	0x01	// else inputs are sampled
 #define RPI_GPIO_INFO_DS18B20		0x02	// DS18B20 commands are supported
+#define RPI_GPIO_INFO_SAFE_OFF		0x04	// RPI_GPIO_CLAIM_SAFE_OFF is supported
 
 struct rpi_gpio_info {
 	uint32		api_version;		// RPI_GPIO_API_VERSION
@@ -123,6 +125,7 @@ struct rpi_gpio_state {
 
 // rpi_gpio_claim.flags
 #define RPI_GPIO_CLAIM_DETACH	0x01
+#define RPI_GPIO_CLAIM_SAFE_OFF	0x02
 
 struct rpi_gpio_claim {
 	uint32		pin;

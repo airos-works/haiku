@@ -28,7 +28,10 @@ attribution and the user guide).
   and restored when it is released or the descriptor is closed (also when
   the program crashes). Another descriptor gets `B_BUSY`. Pins 28 and up
   (Wi-Fi SDIO, Bluetooth UART, ...) cannot be claimed. `RPI_GPIO_CLAIM_DETACH`
-  configures a pin and keeps nothing, for command line tools.
+  configures a pin and keeps nothing, for command line tools. An output claimed
+  with `RPI_GPIO_CLAIM_SAFE_OFF` instead remains an output at its explicitly
+  configured off level on release or close, so cleanup cannot restore an active
+  level. That mode cannot be combined with `DETACH`.
 - Level changes are **events** in one ring of 8192 for all descriptors, each
   reading only its own pins: inputs' edges (rising and falling detection)
   timestamped with `system_time()` in the interrupt handler, outputs' writes
@@ -124,7 +127,8 @@ two pixels thick, which also reads better.
 
 - Nothing is wired to the lab board's header: inputs were driven by their
   own pull resistors only, never by an outside signal; the throttling was
-  exercised by toggling the pulls from the self test.
+  exercised by toggling the pulls from the self test. The safe-off output mode
+  and its added release/close checks have not yet been exercised on the board.
 - Only input and output: no ALT functions (I2C, SPI, PWM, UART) to choose,
   as in pigg.
 - pigg's remote side (pigglet over TCP/iroh, porky on a Pi Pico) is not

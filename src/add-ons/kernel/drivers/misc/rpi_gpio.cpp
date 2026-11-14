@@ -91,6 +91,8 @@ struct saved_pin {
 	uint8			function;
 	uint8			pull;
 	uint8			level;
+	uint8			safeOff;
+	uint8			safeLevel;
 };
 
 
@@ -329,6 +331,13 @@ restore_pin(gpio_client* client, uint32 pin)
 	sOwner[pin] = NULL;
 
 	const saved_pin& saved = sSaved[pin];
+	if (saved.safeOff) {
+		write_reg(saved.safeLevel != 0 ? REG_SET0 : REG_CLR0, bit);
+		set_function(pin, RPI_GPIO_OUTPUT);
+		set_pull(pin, RPI_GPIO_PULL_NONE);
+		TRACE("pin %" B_PRIu32 " kept at its safe off level\n", pin);
+		return;
+	}
 	if (saved.function == RPI_GPIO_OUTPUT)
 		write_reg(saved.level != 0 ? REG_SET0 : REG_CLR0, bit);
 	set_function(pin, saved.function);
@@ -342,12 +351,15 @@ static status_t
 claim_pin(gpio_client* client, const rpi_gpio_claim& request)
 {
 	uint32 pin = request.pin;
+	bool safeOff = (request.flags & RPI_GPIO_CLAIM_SAFE_OFF) != 0;
 	if (pin >= FIRST_UNCLAIMABLE
 		|| (request.function != RPI_GPIO_INPUT
 			&& request.function != RPI_GPIO_OUTPUT)
 		|| request.pull > RPI_GPIO_PULL_DOWN
 		|| request.level < -1 || request.level > 1
-		|| (request.flags & ~RPI_GPIO_CLAIM_DETACH) != 0) {
+		|| (request.flags & ~(RPI_GPIO_CLAIM_DETACH | RPI_GPIO_CLAIM_SAFE_OFF)) != 0
+		|| (safeOff && (request.function != RPI_GPIO_OUTPUT || request.level < 0
+			|| (request.flags & RPI_GPIO_CLAIM_DETACH) != 0))) {
 		return B_BAD_VALUE;
 	}
 	bool detach = (request.flags & RPI_GPIO_CLAIM_DETACH) != 0;
@@ -363,6 +375,9 @@ claim_pin(gpio_client* client, const rpi_gpio_claim& request)
 		sSaved[pin].pull = get_pull(pin);
 		sSaved[pin].level = pin_level(read_reg(REG_LEV0), pin);
 	}
+	sSaved[pin].safeOff = safeOff;
+	if (safeOff)
+		sSaved[pin].safeLevel = request.level;
 
 	// An input of ours that only gets another pull keeps reporting its
 	// edges: the change of level is one. Anything else reports nothing
@@ -804,7 +819,7 @@ gpio_control(void* cookie, uint32 op, void* buffer, size_t length)
 			info.board = RPI_GPIO_BOARD_RPI4;
 			if (sInterruptInstalled)
 				info.flags |= RPI_GPIO_INFO_EDGE_INTERRUPTS;
-			info.flags |= RPI_GPIO_INFO_DS18B20;
+			info.flags |= RPI_GPIO_INFO_DS18B20 | RPI_GPIO_INFO_SAFE_OFF;
 			return user_memcpy(buffer, &info, sizeof(info));
 		}
 

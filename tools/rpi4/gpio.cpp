@@ -542,6 +542,37 @@ do_selftest(int argc, char** argv)
 		&& state.pull[pin] == before.pull[pin]
 		&& (state.claimed_elsewhere & bit) == 0, "closing it restores the pin");
 
+	if (!cubie) {
+		check(claim(fd, pin, RPI_GPIO_OUTPUT, RPI_GPIO_PULL_NONE, 1,
+			RPI_GPIO_CLAIM_DETACH) == B_OK, "safe-off fixture: output high");
+		other = open_device();
+		check(claim(other, pin, RPI_GPIO_INPUT, RPI_GPIO_PULL_NONE, -1,
+			RPI_GPIO_CLAIM_SAFE_OFF) == B_BAD_VALUE,
+			"safe off rejects an input");
+		check(claim(other, pin, RPI_GPIO_OUTPUT, RPI_GPIO_PULL_NONE, -1,
+			RPI_GPIO_CLAIM_SAFE_OFF) == B_BAD_VALUE,
+			"safe off requires an explicit off level");
+		check(claim(other, pin, RPI_GPIO_OUTPUT, RPI_GPIO_PULL_NONE, 0,
+			RPI_GPIO_CLAIM_DETACH | RPI_GPIO_CLAIM_SAFE_OFF) == B_BAD_VALUE,
+			"safe off cannot be detached");
+		check(claim(other, pin, RPI_GPIO_OUTPUT, RPI_GPIO_PULL_NONE, 0,
+			RPI_GPIO_CLAIM_SAFE_OFF) == B_OK, "claim with safe off");
+		write_level(other, pin, 1);
+		check(release(other, pin) == B_OK && (state_of(fd).levels & bit) == 0
+			&& state_of(fd).function[pin] == RPI_GPIO_OUTPUT,
+			"safe-off release keeps the output low, not at its old high level");
+		claim(other, pin, RPI_GPIO_OUTPUT, RPI_GPIO_PULL_NONE, 0,
+			RPI_GPIO_CLAIM_SAFE_OFF);
+		write_level(other, pin, 1);
+		close(other);
+		state = state_of(fd);
+		check(state.function[pin] == RPI_GPIO_OUTPUT && (state.levels & bit) == 0,
+			"safe-off close keeps the output low");
+		check(claim(fd, pin, before.function[pin], before.pull[pin],
+			(before.levels & bit) != 0, RPI_GPIO_CLAIM_DETACH) == B_OK,
+			"restore the initial pin configuration");
+	}
+
 	close(fd);
 	printf("%s: %d failure%s\n", sFailures == 0 ? "PASSED" : "FAILED",
 		sFailures, sFailures == 1 ? "" : "s");
