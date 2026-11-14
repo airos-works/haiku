@@ -6,7 +6,7 @@ Pi 4 and a Pi 5. How it boots: BOOT.md.
 
 | Area | State | Evidence (2026-11-14) |
 | --- | --- | --- |
-| Boot from SD | works | air/OS desktop from the SD card, minimum image |
+| Boot from SD | works | the released CI image image-rpi4-20261114054454-32f74065ac (hrev60207+2661): First-Boot Setup, SD expanded to 127.7 GB, restart, desktop |
 | Boot from USB disk | works | desktop from the KVM's virtual disk |
 | CPU | 4 x Cortex-A76 up to 2.4 GHz | About this system; PSCI 1.1 (SMC) for the cores, restart |
 | Memory | 4 GB | About this system: 4084 MiB |
