@@ -65,14 +65,25 @@ through PSCI after 15 s.
 ## The lab (tools/rpi5)
 
 - NanoKVM at 192.168.1.39 (HDMI0, USB, serial: its ttyS1 is the Pi's GPIO
-  14/15). Its ATX power lines are not connected to the Pi 5.
-- `lab.sh`: serial capture on the KVM, the KVM's virtual USB disk (LUN),
-  uploads, screenshots. Credentials live in /mnt/HaikuWork/rpi5/state.
-- `make-boot-disk.sh` builds a USB disk image with the loader, the boot
-  archive and the device trees; the EEPROM (BOOT_ORDER 0xf461: SD, NVMe,
-  USB) boots it when the SD card has nothing for a Pi 5. With the lab's
-  3 A supply the EEPROM refuses USB boot unless config.txt has
-  `usb_max_current_enable=1` (the lab disk's copy gets it).
-- The recovery OS is the Pi 4 lab's Alpine image with a [pi5] section
-  (rpi5-recovery.img on the KVM): DHCP .182, `ssh -F state/ssh_config
-  rpi5-recovery`.
+  14/15). Its ATX power lines are not connected to the Pi 5: nothing here
+  can switch it off and on.
+- The EEPROM's BOOT_ORDER is 0xf614 since 2026-11-14 (it was 0xf461, SD
+  first): USB first, so the KVM's virtual disk decides what starts. An
+  "idle" disk (rpi5-idle.img, FAT without boot files) lets it fall through
+  to the SD card; rpi5-recovery.img starts the recovery OS; pi5-boot.img
+  (`make-boot-disk.sh`) a test build.
+- `lab.sh`: serial capture on the KVM, the virtual disk (`lun`; it unbinds
+  the KVM's USB gadget for a moment when the Pi holds the disk), uploads,
+  in-place updates, screenshots. Never change the disk while the EEPROM
+  reads it (during the first seconds of a start): that wedged the EEPROM
+  twice until a power cycle. `update-boot` rewrites only the boot partition,
+  so a system running from the same disk's BFS keeps its volume.
+- A running air/OS restarts from the kernel debugger over serial: send
+  `+++` (one character a second), then `reboot`.
+- With the lab's 3 A supply the EEPROM refuses USB boot unless that disk's
+  config.txt has `usb_max_current_enable=1` (the lab disks have it).
+- The recovery OS is the Pi 4 lab's Alpine image with a [pi5] section:
+  DHCP .182, `ssh -F state/ssh_config rpi5-recovery`. Unmounting and
+  deleting its USB disk does not free the KVM's LUN; `lab.sh lun` copes.
+- Credentials live in /mnt/HaikuWork/rpi5/state (the KVM's web user is
+  "admin").
