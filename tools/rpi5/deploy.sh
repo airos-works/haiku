@@ -41,6 +41,8 @@ done
 for entry in "${blocked[@]}"; do
 	pi "grep -q '^# deploy.sh $entry\$' /boot/system/settings/packages 2>/dev/null || printf '\n# deploy.sh %s\nPackage haiku {\n\tBlockedEntries {\n\t\t%s\n\t}\n}\n' '$entry' '$entry' >> /boot/system/settings/packages"
 done
+# the lab cuts the power to recover from hangs: have it all on the disk
+pi sync
 if $restart; then
 	pi 'shutdown -r' >/dev/null 2>&1 &
 	sleep 3

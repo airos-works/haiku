@@ -33,6 +33,8 @@
 // 7.1: the output format is in the output configuration (v71.ioc)
 #define TFU71_IOC_FORMAT_SHIFT		12
 #define TFU71_IOC_FORMAT_LINEARTILE	3
+#define TFU71_IOC_FORMAT_UIF_NO_XOR	6
+#define TFU71_IOC_STRIDE_SHIFT		16
 #define TFU71_ICFG_OTYPE_SHIFT		16
 #define TFU71_ICFG_IFORMAT_SHIFT	23
 #define TEXTURE_FORMAT_RGBA8		4
@@ -185,7 +187,12 @@ main(int argc, char** argv)
 		tfu.icfg = TFU_ICFG_FORMAT_RASTER << TFU71_ICFG_IFORMAT_SHIFT
 			| TEXTURE_FORMAT_RGBA8 << TFU71_ICFG_OTYPE_SHIFT;
 		tfu.ioa = targetOffset;
-		tfu.v71.ioc = TFU71_IOC_FORMAT_LINEARTILE << TFU71_IOC_FORMAT_SHIFT;
+		// The 7.1 TFU writes a linear-tile image in 16 pixel wide columns
+		// without a stride (each one over the last): Mesa takes it for
+		// small images only. A UIF image (no XOR) has its column stride:
+		// the padded height in pairs of 4 row utiles.
+		tfu.v71.ioc = TFU71_IOC_FORMAT_UIF_NO_XOR << TFU71_IOC_FORMAT_SHIFT
+			| (kSize / 8) << TFU71_IOC_STRIDE_SHIFT;
 	} else {
 		tfu.icfg = TFU_ICFG_FORMAT_RASTER << TFU_ICFG_FORMAT_SHIFT
 			| TEXTURE_FORMAT_RGBA8 << TFU_ICFG_TTYPE_SHIFT;
@@ -243,6 +250,40 @@ main(int argc, char** argv)
 	}
 	printf("%u of %u target words are source pixels, %u untouched\n", found,
 		kSize * kSize, untouched);
+	if (found + untouched != kSize * kSize || found < kSize * kSize * 15 / 16) {
+		// where the written words are, and which source pixels they hold
+		// (as x,y; "-" untouched, "?" no source pixel)
+		for (uint32 i = 0; i < kSize * kSize; i += 4) {
+			if (i >= 128 && i % 1024 != 0)
+				continue;
+			printf("  %4u:", i);
+			for (uint32 j = i; j < i + 4; j++) {
+				int32 index = -1;
+				for (uint32 k = 0; k < kSize * kSize; k++) {
+					if (source[k] == target[j]) {
+						index = k;
+						break;
+					}
+				}
+				if (target[j] == 0xdeadbeef)
+					printf("      -");
+				else if (index < 0)
+					printf(" %08x", target[j]);
+				else
+					printf("  %2d,%2d", index % kSize, index / kSize);
+			}
+			printf("\n");
+		}
+		uint32 firstWritten = kSize * kSize, lastWritten = 0;
+		for (uint32 i = 0; i < kSize * kSize; i++) {
+			if (target[i] != 0xdeadbeef) {
+				if (firstWritten > i)
+					firstWritten = i;
+				lastWritten = i;
+			}
+		}
+		printf("  written words %u to %u\n", firstWritten, lastWritten);
+	}
 	ok &= check(found + untouched == kSize * kSize
 		&& found >= kSize * kSize * 15 / 16,
 		"the TFU wrote the image in a tiled layout");

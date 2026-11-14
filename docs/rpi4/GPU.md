@@ -78,6 +78,10 @@ The same driver handles the BCM2712's core (`brcm,2712-v3d`, Linux's
 - Mesa needs nothing: its build has the 7.1 code (`v3d_versions` 42 and 71)
   and reads the version from the core's identity registers.
   `rpi4_v3d_probe` encodes its TFU job for the version the device reports.
+  On 7.1 it writes a UIF image: the 7.1 TFU writes a linear-tile image
+  in 16 pixel wide columns with no stride, each over the last, so only a
+  small image comes out right in that layout (Mesa uses it only for
+  those).
 
 ## Mesa
 
