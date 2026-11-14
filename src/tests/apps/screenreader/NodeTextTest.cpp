@@ -22,11 +22,15 @@
 static int sFailures = 0;
 
 
+static int64 sNextID = 1;
+
+
 static BMessage
 make_node(int32 role, const char* name = NULL, const char* value = NULL,
 	uint64 states = 0)
 {
 	BMessage node;
+	node.AddInt64(B_ACCESSIBLE_FIELD_ID, sNextID++);
 	node.AddInt32(B_ACCESSIBLE_FIELD_ROLE, role);
 	if (name != NULL)
 		node.AddString(B_ACCESSIBLE_FIELD_NAME, name);
@@ -79,8 +83,8 @@ expect(const char* name, const BString& got, const char* expected)
 }
 
 
-static void
-test_web_page()
+static BMessage
+web_page()
 {
 	BMessage window = make_node(B_ACCESSIBLE_ROLE_WINDOW,
 		"Summit screen reader test - Summit");
@@ -119,7 +123,14 @@ test_web_page()
 
 	add_child(document, named_by_text(B_ACCESSIBLE_ROLE_BUTTON, "Send"));
 	add_child(window, document);
+	return window;
+}
 
+
+static void
+test_web_page()
+{
+	BMessage window = web_page();
 	expect("web-page", read_all_text(window),
 		"Summit screen reader test - Summit, window. "
 		"Summit screen reader test, document. "
@@ -197,6 +208,58 @@ test_state_changes()
 }
 
 
+static BString
+item_text(const std::vector<browse_item>& items, int32 index)
+{
+	if (index < 0 || index >= (int32)items.size())
+		return BString("(none)");
+	return items[index].text;
+}
+
+
+static void
+test_browse()
+{
+	std::vector<browse_item> items;
+	collect_browse_items(web_page(), items);
+
+	// stepping: what read-all says, one item at a time
+	BString steps;
+	for (int32 i = find_browse_item(items, -1, 1, BROWSE_ANY); i >= 0;
+			i = find_browse_item(items, i, 1, BROWSE_ANY)) {
+		if (!steps.IsEmpty())
+			steps << " | ";
+		steps << items[i].text;
+	}
+	expect("browse-steps", steps,
+		"Summit screen reader test, document | "
+		"Summit screen reader test, heading | "
+		"This paragraph has some text (link) for the screen reader to read. | "
+		"navigation landmark, Main | list, 2 items | Home, link | "
+		"About, link | form | Your name, text field, Ada | Send, button");
+
+	// jumps by kind, forwards and back
+	int32 heading = find_browse_item(items, -1, 1, BROWSE_HEADING);
+	expect("browse-heading", item_text(items, heading),
+		"Summit screen reader test, heading");
+	int32 link = find_browse_item(items, heading, 1, BROWSE_LINK);
+	expect("browse-inline-link", item_text(items, link), "some text, link");
+	int32 field = find_browse_item(items, link, 1, BROWSE_FORM_FIELD);
+	expect("browse-field", item_text(items, field),
+		"Your name, text field, Ada");
+	expect("browse-previous-landmark",
+		item_text(items, find_browse_item(items, field, -1, BROWSE_LANDMARK)),
+		"navigation landmark, Main");
+	expect("browse-list",
+		item_text(items, find_browse_item(items, -1, 1, BROWSE_LIST)),
+		"list, 2 items");
+	int32 last = find_browse_item(items, (int32)items.size(), -1, BROWSE_ANY);
+	expect("browse-none", item_text(items,
+		find_browse_item(items, last, 1, BROWSE_HEADING)), "(none)");
+	expect("browse-ids", BString(items[field].id != 0 ? "id" : "no id"), "id");
+}
+
+
 int
 main()
 {
@@ -204,6 +267,7 @@ main()
 	test_application_window();
 	test_landmarks();
 	test_state_changes();
+	test_browse();
 	printf("NodeTextTest: %d failure(s)\n", sFailures);
 	return sFailures != 0;
 }

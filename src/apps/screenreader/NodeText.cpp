@@ -350,7 +350,30 @@ names_from_contents(int32 role)
 }
 
 
-static void collect_text(const BMessage& node, BStringList& parts,
+/*!	What the tree walk collects: the parts read-all says, each with the node
+	it came from (a browse item).
+*/
+struct TextParts {
+	std::vector<browse_item>	items;
+
+	void Add(const BString& text, const BMessage& node, int32 role = -1)
+	{
+		browse_item item;
+		item.id = node.GetInt64(B_ACCESSIBLE_FIELD_ID, 0);
+		item.role = role >= 0 ? role : node.GetInt32(B_ACCESSIBLE_FIELD_ROLE, 0);
+		item.text = text;
+		item.inlineLink = false;
+		items.push_back(item);
+	}
+
+	void AddLinks(const std::vector<browse_item>& links)
+	{
+		items.insert(items.end(), links.begin(), links.end());
+	}
+};
+
+
+static void collect_text(const BMessage& node, TextParts& parts,
 	bool inDocument);
 
 
@@ -359,7 +382,7 @@ static void collect_text(const BMessage& node, BStringList& parts,
 	its own.
 */
 static void
-collect_children(const BMessage& node, BStringList& parts, bool inDocument)
+collect_children(const BMessage& node, TextParts& parts, bool inDocument)
 {
 	// links only join running text where there is some
 	bool hasText = false;
@@ -371,6 +394,8 @@ collect_children(const BMessage& node, BStringList& parts, bool inDocument)
 	}
 
 	BString run;
+	std::vector<browse_item> links;
+		// links in the running text: browse items of their own
 	for (int32 i = 0; node.FindMessage(B_ACCESSIBLE_FIELD_CHILD, i, &child)
 			== B_OK; i++) {
 		if (is_invisible(child))
@@ -385,25 +410,34 @@ collect_children(const BMessage& node, BStringList& parts, bool inDocument)
 			if (!run.IsEmpty() && run[run.Length() - 1] != ' ')
 				run << ' ';
 			run << link << ' ';
+			browse_item item;
+			item.id = child.GetInt64(B_ACCESSIBLE_FIELD_ID, 0);
+			item.role = B_ACCESSIBLE_ROLE_LINK;
+			item.text = describe_node(child, false);
+			item.inlineLink = true;
+			links.push_back(item);
 			continue;
 		}
 		collapse_spaces(run);
 		// a label in front of the field it names is said with the field
 		if (!run.IsEmpty()
 			&& run != BString(child.GetString(B_ACCESSIBLE_FIELD_NAME, ""))) {
-			parts.Add(run);
+			parts.Add(run, node, B_ACCESSIBLE_ROLE_PARAGRAPH);
 		}
+		parts.AddLinks(links);
+		links.clear();
 		run = "";
 		collect_text(child, parts, inDocument);
 	}
 	collapse_spaces(run);
 	if (!run.IsEmpty())
-		parts.Add(run);
+		parts.Add(run, node, B_ACCESSIBLE_ROLE_PARAGRAPH);
+	parts.AddLinks(links);
 }
 
 
 static void
-collect_text(const BMessage& node, BStringList& parts, bool inDocument)
+collect_text(const BMessage& node, TextParts& parts, bool inDocument)
 {
 	if (is_invisible(node))
 		return;
@@ -420,7 +454,7 @@ collect_text(const BMessage& node, BStringList& parts, bool inDocument)
 		case B_ACCESSIBLE_ROLE_DOCUMENT:
 			inDocument = true;
 			if (!name.IsEmpty())
-				parts.Add(describe_node(node, false));
+				parts.Add(describe_node(node, false), node);
 			break;
 
 		case B_ACCESSIBLE_ROLE_LIST:
@@ -431,7 +465,7 @@ collect_text(const BMessage& node, BStringList& parts, bool inDocument)
 			BString text = describe_node(node, false);
 			int32 count = node.GetInt32(B_ACCESSIBLE_FIELD_CHILD_COUNT, 0);
 			text << ", " << count << (count == 1 ? " item" : " items");
-			parts.Add(text);
+			parts.Add(text, node);
 			// On a web page the items are what there is to read; in an
 			// application they can be a whole disk's files.
 			if (!inDocument || role == B_ACCESSIBLE_ROLE_MENU_BAR)
@@ -446,7 +480,7 @@ collect_text(const BMessage& node, BStringList& parts, bool inDocument)
 		case B_ACCESSIBLE_ROLE_TAB_PANEL:
 		case B_ACCESSIBLE_ROLE_PARAGRAPH:
 			if (!name.IsEmpty() || !value.IsEmpty())
-				parts.Add(describe_node(node, false));
+				parts.Add(describe_node(node, false), node);
 			break;
 
 		case B_ACCESSIBLE_ROLE_LIST_ITEM:
@@ -456,25 +490,25 @@ collect_text(const BMessage& node, BStringList& parts, bool inDocument)
 			// on a web page, unnamed structure only holds what to read
 			if (!inDocument || !name.IsEmpty() || !value.IsEmpty()
 				|| node.GetInt64(B_ACCESSIBLE_FIELD_STATES, 0) != 0) {
-				parts.Add(describe_node(node, false));
+				parts.Add(describe_node(node, false), node);
 			}
 			break;
 
 		default:
-			parts.Add(describe_node(node, false));
+			parts.Add(describe_node(node, false), node);
 			break;
 	}
 
 	if (!name.IsEmpty() && names_from_contents(role)) {
 		// Said with its name already; only children that add to it count
-		BStringList childParts;
+		TextParts childParts;
 		collect_children(node, childParts, inDocument);
-		for (int32 i = 0; i < childParts.CountStrings(); i++) {
-			BString part = childParts.StringAt(i);
-			BString trimmed(part);
+		for (size_t i = 0; i < childParts.items.size(); i++) {
+			BString trimmed(childParts.items[i].text);
 			trimmed.Trim();
-			if (!trimmed.IsEmpty() && name.FindFirst(trimmed) < 0)
-				parts.Add(part);
+			if (childParts.items[i].inlineLink
+				|| (!trimmed.IsEmpty() && name.FindFirst(trimmed) < 0))
+				parts.items.push_back(childParts.items[i]);
 		}
 		return;
 	}
@@ -487,11 +521,13 @@ collect_text(const BMessage& node, BStringList& parts, bool inDocument)
 	given another full stop ("to read.." before).
 */
 static BString
-join_sentences(const BStringList& parts)
+join_sentences(const std::vector<browse_item>& parts)
 {
 	BString text;
-	for (int32 i = 0; i < parts.CountStrings(); i++) {
-		BString part = parts.StringAt(i);
+	for (size_t i = 0; i < parts.size(); i++) {
+		if (parts[i].inlineLink)
+			continue;
+		BString part = parts[i].text;
 		part.Trim();
 		if (part.IsEmpty())
 			continue;
@@ -511,10 +547,108 @@ join_sentences(const BStringList& parts)
 BString
 read_all_text(const BMessage& window)
 {
-	BStringList parts;
-	parts.Add(describe_window(window));
+	TextParts parts;
+	parts.Add(describe_window(window), window);
 	bool inDocument = window.GetInt32(B_ACCESSIBLE_FIELD_ROLE, 0)
 		== B_ACCESSIBLE_ROLE_DOCUMENT;
 	collect_children(window, parts, inDocument);
-	return join_sentences(parts);
+	return join_sentences(parts.items);
+}
+
+
+//	#pragma mark - browse mode
+
+
+void
+collect_browse_items(const BMessage& window, std::vector<browse_item>& items)
+{
+	TextParts parts;
+	bool inDocument = window.GetInt32(B_ACCESSIBLE_FIELD_ROLE, 0)
+		== B_ACCESSIBLE_ROLE_DOCUMENT;
+	collect_children(window, parts, inDocument);
+	items.clear();
+	for (size_t i = 0; i < parts.items.size(); i++) {
+		BString trimmed(parts.items[i].text);
+		trimmed.Trim();
+		if (!trimmed.IsEmpty())
+			items.push_back(parts.items[i]);
+	}
+}
+
+
+static bool
+is_form_field(int32 role)
+{
+	switch (role) {
+		case B_ACCESSIBLE_ROLE_TEXT_FIELD:
+		case B_ACCESSIBLE_ROLE_TEXT_AREA:
+		case B_ACCESSIBLE_ROLE_CHECK_BOX:
+		case B_ACCESSIBLE_ROLE_RADIO_BUTTON:
+		case B_ACCESSIBLE_ROLE_COMBO_BOX:
+		case B_ACCESSIBLE_ROLE_POP_UP_BUTTON:
+		case B_ACCESSIBLE_ROLE_SLIDER:
+		case B_ACCESSIBLE_ROLE_SPIN_BUTTON:
+		case B_ACCESSIBLE_ROLE_BUTTON:
+		case B_ACCESSIBLE_ROLE_TOGGLE_BUTTON:
+			return true;
+		default:
+			return false;
+	}
+}
+
+
+static bool
+matches_kind(const browse_item& item, int32 kind)
+{
+	switch (kind) {
+		case BROWSE_ANY:
+			return !item.inlineLink;
+		case BROWSE_HEADING:
+			return item.role == B_ACCESSIBLE_ROLE_HEADING;
+		case BROWSE_LINK:
+			return item.role == B_ACCESSIBLE_ROLE_LINK;
+		case BROWSE_FORM_FIELD:
+			return is_form_field(item.role);
+		case BROWSE_LIST:
+			return item.role == B_ACCESSIBLE_ROLE_LIST
+				|| item.role == B_ACCESSIBLE_ROLE_TREE
+				|| item.role == B_ACCESSIBLE_ROLE_TABLE;
+		case BROWSE_LANDMARK:
+			return item.role == B_ACCESSIBLE_ROLE_LANDMARK;
+		default:
+			return false;
+	}
+}
+
+
+int32
+find_browse_item(const std::vector<browse_item>& items, int32 from,
+	int32 direction, int32 kind)
+{
+	int32 count = (int32)items.size();
+	for (int32 i = from + direction; i >= 0 && i < count; i += direction) {
+		if (matches_kind(items[i], kind))
+			return i;
+	}
+	return -1;
+}
+
+
+const char*
+browse_kind_name(int32 kind)
+{
+	switch (kind) {
+		case BROWSE_HEADING:
+			return "heading";
+		case BROWSE_LINK:
+			return "link";
+		case BROWSE_FORM_FIELD:
+			return "form field";
+		case BROWSE_LIST:
+			return "list";
+		case BROWSE_LANDMARK:
+			return "landmark";
+		default:
+			return "item";
+	}
 }
