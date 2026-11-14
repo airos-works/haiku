@@ -133,11 +133,16 @@ private:
 			void		_Retransmit();
 			void		_UpdateRoundTripTime(int32 roundTripTime, int32 expectedSamples);
 			void		_ResetSlowStart();
+			uint32		_CubicCongestionEvent(uint32 flightSize);
+			void		_CubicIncrease(uint32 bytesAcknowledged);
 			void		_DuplicateAcknowledge(tcp_segment_header& segment);
 			void		_UpdateScoreboard(const tcp_segment_header& segment);
 			void		_PruneScoreboard();
 			bool		_NextHole(tcp_sequence& start, uint32& length) const;
 			bool		_RetransmitNextHole();
+			uint32		_Pipe() const;
+			void		_RecoverySend();
+			uint32		_SkipReported();
 
 	static	void		_TimeWaitTimer(net_timer* timer, void* _endpoint);
 	static	void		_RetransmitTimer(net_timer* timer, void* _endpoint);
@@ -194,6 +199,8 @@ private:
 	};
 	sack_range		fScoreboard[kScoreboardSize];
 	int32			fScoreboardCount;
+	bool			fScoreboardKeptAtTimeout;
+		// a timeout kept the scoreboard, and nothing was acknowledged since
 	tcp_sequence	fHighRetransmitted;
 		// highest sequence sent when fast recovery began (RFC 6582)
 
@@ -217,8 +224,6 @@ private:
 	bigtime_t		fSmoothedRTT;
 	bigtime_t		fRTTVariation;
 		// in microseconds; fSmoothedRTT < 0 until the first sample
-	uint32			fBytesAcknowledgedInAvoidance;
-		// congestion avoidance counts bytes (RFC 3465)
 	uint8			fPersistShift;
 		// back-off of the persist timer while the window stays closed
 	uint32			fSendTime;
@@ -247,6 +252,20 @@ private:
 
 	uint32			fCongestionWindow;
 	uint32			fSlowStartThreshold;
+
+	// CUBIC congestion avoidance (RFC 9438); times in ms
+	uint32			fCubicMaxWindow;
+		// W_max: the window before the last reduction
+	uint32			fCubicOrigin;
+	uint32			fCubicK;
+	bigtime_t		fCubicEpochStart;
+		// 0: no epoch started since the last reduction
+	bigtime_t		fCubicLastAcknowledge;
+	uint64			fCubicEstimate;
+		// W_est, the window Reno would have, in bytes * 1024
+	uint64			fCubicRemainder;
+	bool			fCongestionWindowLimited;
+		// the last send left data waiting for the congestion window
 
 	tcp_state		fState;
 	uint32			fFlags;
