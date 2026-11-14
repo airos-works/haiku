@@ -207,6 +207,16 @@ Command the Alt key in the default keymap):
 | Option+Command+W | read the window title and the focused control |
 | Option+Command+R | read the whole window (every control in order; on a web page, its text as sentences, links inline, headings and lists with their items, landmarks by kind) |
 | Option+Command+X | stop speaking |
+| Option+Command+Down / Up | browse mode: next / previous item (what read all says, item by item) |
+| Option+Command+H, K, J, L, D | browse mode: next heading, link, form field, list, landmark; with Shift the previous one |
+| Option+Command+Return | browse mode: activate the item (press it; a field takes the focus) |
+
+Browse mode is a virtual cursor for web pages, where Tab only reaches what
+takes the focus. It works in any window; the tree is fetched again when it
+is more than a second old, and the cursor keeps its place by the node.
+Links inside running text are read with the sentence and are still found by
+"next link". `hey application/x-vnd.Haiku-ScreenReader srBR with
+'kind=int32(1)'` drives it from a script (`srAC` activates).
 
 The review keys are only taken while the screen reader runs.
 

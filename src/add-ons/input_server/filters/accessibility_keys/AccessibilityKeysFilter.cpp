@@ -55,14 +55,58 @@ AccessibilityKeysFilter::Filter(BMessage* message, BList* _list)
 
 	int32 modifiers = message->GetInt32("modifiers", 0);
 	if ((modifiers & (B_COMMAND_KEY | B_CONTROL_KEY | B_OPTION_KEY
-			| B_SHIFT_KEY | B_MENU_KEY)) != (B_COMMAND_KEY | B_OPTION_KEY)) {
+			| B_MENU_KEY)) != (B_COMMAND_KEY | B_OPTION_KEY)) {
 		return B_DISPATCH_MESSAGE;
 	}
+	const bool shift = (modifiers & B_SHIFT_KEY) != 0;
 
 	// the Option key changes "bytes"; the unmodified character tells the key
 	int32 rawChar = tolower(message->GetInt32("raw_char", 0));
-	uint32 command;
+
+	// browse mode (a virtual cursor through what read-all says): arrows
+	// step, H K J L D jump to the next heading, link, form field, list,
+	// landmark (with Shift: the previous one), Return activates
+	int32 browseKind = -1;
+	int32 direction = shift ? -1 : 1;
 	switch (rawChar) {
+		case B_DOWN_ARROW:
+			browseKind = 0;
+			direction = 1;
+			break;
+		case B_UP_ARROW:
+			browseKind = 0;
+			direction = -1;
+			break;
+		case 'h':
+			browseKind = 1;
+			break;
+		case 'k':
+			browseKind = 2;
+			break;
+		case 'j':
+			browseKind = 3;
+			break;
+		case 'l':
+			browseKind = 4;
+			break;
+		case 'd':
+			browseKind = 5;
+			break;
+	}
+	if (browseKind < 0 && rawChar != B_ENTER && shift)
+		return B_DISPATCH_MESSAGE;
+
+	uint32 command;
+	BMessage request;
+	switch (browseKind >= 0 ? -2 : rawChar) {
+		case -2:
+			command = B_SCREEN_READER_BROWSE;
+			request.AddInt32("direction", direction);
+			request.AddInt32("kind", browseKind);
+			break;
+		case B_ENTER:
+			command = B_SCREEN_READER_ACTIVATE;
+			break;
 		case 's':
 			if (message->GetInt32("be:key_repeat", 0) == 0) {
 				thread_id thread = spawn_thread(_Toggle,
@@ -95,7 +139,7 @@ AccessibilityKeysFilter::Filter(BMessage* message, BList* _list)
 		return B_DISPATCH_MESSAGE;
 
 	BMessenger reader(NULL, info.team);
-	BMessage request(command);
+	request.what = command;
 	reader.SendMessage(&request, (BHandler*)NULL, 0);
 	return B_SKIP_MESSAGE;
 }

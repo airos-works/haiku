@@ -70,6 +70,12 @@ enum {
 	B_SCREEN_READER_READ_WINDOW		= 'srRW',
 	B_SCREEN_READER_READ_ALL		= 'srRA',
 	B_SCREEN_READER_STOP			= 'srST',
+	B_SCREEN_READER_BROWSE			= 'srBR',
+		// browse mode: "direction" int32 (1 next, -1 previous), "kind"
+		// int32 (0 any item, 1 heading, 2 link, 3 form field, 4 list,
+		// 5 landmark)
+	B_SCREEN_READER_ACTIVATE		= 'srAC',
+		// press (or focus, for a field) the browse mode item
 
 	// proposed speech_server protocol (haiku#52)
 	B_SPEECH_SPEAK					= 'SPsp',

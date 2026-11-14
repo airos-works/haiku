@@ -19,6 +19,13 @@
 		Option+Command+R	read the whole window
 		Option+Command+X	stop speaking
 
+	Browse mode, a virtual cursor through what read-all says:
+
+		Option+Command+Down/Up		next/previous item
+		Option+Command+H K J L D	next heading, link, form field, list,
+									landmark (with Shift: the previous one)
+		Option+Command+Return		activate the item (press; focus a field)
+
 	Everything spoken is also written to the syslog ("ScreenReader: say:")
 	and, unless turned off, shown in a caption window. Without a speech
 	engine (haiku#52), the captions are the output.
@@ -72,6 +79,9 @@ private:
 
 			void				_ReadFocus(bool withWindow);
 			void				_ReadAll();
+			bool				_GetWindowTree(BMessage& window);
+			void				_Browse(int32 direction, int32 kind);
+			void				_Activate();
 
 			bool				_IsFocus(const BMessage* event,
 									const BMessage& node) const;
@@ -99,6 +109,13 @@ private:
 			bigtime_t			fFocusTime;
 			bigtime_t			fTextTime;
 			int32				fCaretLine;
+
+			// browse mode
+			std::vector<browse_item> fBrowseItems;
+			int32				fBrowseIndex;
+			int64				fBrowseWindowID;
+			int64				fBrowseItemID;
+			bigtime_t			fBrowseTime;
 };
 
 
@@ -119,7 +136,11 @@ ScreenReader::ScreenReader()
 	fWindowTime(0),
 	fFocusTime(0),
 	fTextTime(0),
-	fCaretLine(-1)
+	fCaretLine(-1),
+	fBrowseIndex(-1),
+	fBrowseWindowID(0),
+	fBrowseItemID(0),
+	fBrowseTime(0)
 {
 }
 
@@ -212,6 +233,15 @@ ScreenReader::MessageReceived(BMessage* message)
 		case B_SCREEN_READER_STOP:
 			if (fSpeech != NULL)
 				fSpeech->Stop();
+			break;
+
+		case B_SCREEN_READER_BROWSE:
+			_Browse(message->GetInt32("direction", 1),
+				message->GetInt32("kind", BROWSE_ANY));
+			break;
+
+		case B_SCREEN_READER_ACTIVATE:
+			_Activate();
 			break;
 
 		default:
@@ -519,19 +549,135 @@ ScreenReader::_ReadAll()
 		return;
 	}
 
-	BMessage request(B_ACCESSIBILITY_GET_NODE);
-	request.AddInt64("id", fWindowID);
-	request.AddInt32("depth", -1);
-	BMessage reply;
 	BMessage window;
-	if (fBridge.SendMessage(&request, &reply, kQueryTimeout, kQueryTimeout)
-			!= B_OK || reply.GetInt32("status", B_ERROR) != B_OK
-		|| reply.FindMessage("node", &window) != B_OK) {
+	if (!_GetWindowTree(window)) {
 		_Say("The window does not answer", true);
 		return;
 	}
 
 	_Say(read_all_text(window), true);
+}
+
+
+bool
+ScreenReader::_GetWindowTree(BMessage& window)
+{
+	BMessage request(B_ACCESSIBILITY_GET_NODE);
+	request.AddInt64("id", fWindowID);
+	request.AddInt32("depth", -1);
+	BMessage reply;
+	return fBridge.SendMessage(&request, &reply, kQueryTimeout, kQueryTimeout)
+			== B_OK && reply.GetInt32("status", B_ERROR) == B_OK
+		&& reply.FindMessage("node", &window) == B_OK;
+}
+
+
+/*!	Browse mode (#119): a virtual cursor through what read-all says, item
+	by item, for web pages (where Tab only reaches what takes the focus) and
+	any other window. The tree is fetched again when it is older than a
+	second (pages change), keeping the place by the item's node.
+*/
+void
+ScreenReader::_Browse(int32 direction, int32 kind)
+{
+	if (!fBridge.IsValid() || fWindowID == 0) {
+		_Say("No window", true);
+		return;
+	}
+
+	bigtime_t now = system_time();
+	if (fBrowseWindowID != fWindowID || now - fBrowseTime > 1000000) {
+		BMessage window;
+		if (!_GetWindowTree(window)) {
+			_Say("The window does not answer", true);
+			return;
+		}
+		if (fBrowseWindowID != fWindowID) {
+			fBrowseIndex = -1;
+			fBrowseItemID = 0;
+		}
+		collect_browse_items(window, fBrowseItems);
+		fBrowseWindowID = fWindowID;
+		fBrowseTime = now;
+
+		// find the place again
+		if (fBrowseItemID != 0) {
+			int32 index = -1;
+			for (size_t i = 0; i < fBrowseItems.size(); i++) {
+				if (fBrowseItems[i].id == fBrowseItemID) {
+					index = (int32)i;
+					break;
+				}
+			}
+			if (index >= 0)
+				fBrowseIndex = index;
+			else if (fBrowseIndex >= (int32)fBrowseItems.size())
+				fBrowseIndex = (int32)fBrowseItems.size() - 1;
+		}
+	}
+
+	int32 from = fBrowseIndex;
+	if (from < 0 && direction < 0)
+		from = (int32)fBrowseItems.size();
+	int32 index = find_browse_item(fBrowseItems, from, direction, kind);
+	if (index < 0) {
+		BString text;
+		if (kind == BROWSE_ANY)
+			text = direction > 0 ? "Bottom" : "Top";
+		else {
+			text << "No " << (direction > 0 ? "next " : "previous ")
+				<< browse_kind_name(kind);
+		}
+		_Say(text, true);
+		return;
+	}
+
+	fBrowseIndex = index;
+	fBrowseItemID = fBrowseItems[index].id;
+	_Say(fBrowseItems[index].text, true);
+}
+
+
+void
+ScreenReader::_Activate()
+{
+	if (fBrowseWindowID != fWindowID || fBrowseIndex < 0
+		|| fBrowseIndex >= (int32)fBrowseItems.size()
+		|| fBrowseItems[fBrowseIndex].id == 0) {
+		_Say("Nothing to activate", true);
+		return;
+	}
+
+	// a field takes the focus (and is then said); anything else is pressed
+	const browse_item& item = fBrowseItems[fBrowseIndex];
+	int32 action = B_ACCESSIBLE_ACTION_PRESS;
+	switch (item.role) {
+		case B_ACCESSIBLE_ROLE_TEXT_FIELD:
+		case B_ACCESSIBLE_ROLE_TEXT_AREA:
+		case B_ACCESSIBLE_ROLE_SLIDER:
+		case B_ACCESSIBLE_ROLE_SPIN_BUTTON:
+		case B_ACCESSIBLE_ROLE_COMBO_BOX:
+			action = B_ACCESSIBLE_ACTION_FOCUS;
+			break;
+	}
+
+	BMessage request(B_ACCESSIBILITY_PERFORM_ACTION);
+	request.AddInt64("id", item.id);
+	request.AddInt32("action", action);
+	BMessage reply;
+	if (fBridge.SendMessage(&request, &reply, kQueryTimeout, kQueryTimeout)
+			!= B_OK || reply.GetInt32("status", B_ERROR) != B_OK) {
+		if (action == B_ACCESSIBLE_ACTION_PRESS) {
+			// what cannot be pressed may still take the focus
+			request.ReplaceInt32("action", B_ACCESSIBLE_ACTION_FOCUS);
+			if (fBridge.SendMessage(&request, &reply, kQueryTimeout,
+					kQueryTimeout) == B_OK
+				&& reply.GetInt32("status", B_ERROR) == B_OK) {
+				return;
+			}
+		}
+		_Say("Cannot activate this", true);
+	}
 }
 
 
