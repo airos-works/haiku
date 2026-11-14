@@ -170,6 +170,8 @@ print_statistics()
 	LINE(stats.tcp_syn_cookies_accepted, "connections made from SYN cookies");
 	LINE(stats.tcp_segments_coalesced,
 		"segments coalesced into the one before them");
+	LINE(stats.tcp_retransmit_timeouts, "retransmit timeouts");
+	LINE(stats.tcp_fast_recoveries, "fast recoveries");
 
 	printf("raw:\n");
 	LINE(stats.raw_receive_buffer_errors,

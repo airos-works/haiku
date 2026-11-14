@@ -70,6 +70,10 @@ typedef struct net_protocol_stats {
 	// receive coalescing
 	uint64	tcp_segments_coalesced;
 		// segments merged into the one before them
+
+	// TCP loss recovery
+	uint64	tcp_retransmit_timeouts;
+	uint64	tcp_fast_recoveries;
 } net_protocol_stats;
 
 #define NET_STAT_SYSCALLS				"network/stats"

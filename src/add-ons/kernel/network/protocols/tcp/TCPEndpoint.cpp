@@ -1729,6 +1729,13 @@ TCPEndpoint::_DuplicateAcknowledge(tcp_segment_header &segment)
 	if (fDuplicateAcknowledgeCount == 0)
 		fPreviousFlightSize = (fSendMax - fSendUnacknowledged).Number();
 
+	// Limited transmit and recovery send new data at fSendMax. After a
+	// timeout, slow start is still resending from fSendNext, behind
+	// fSendMax: leaving fSendNext at fSendMax stopped that resend until the
+	// next timeout, as the window then counted everything up to fSendMax as
+	// in flight - chains of 200 ms stalls (airos-works/haiku#125).
+	const tcp_sequence sendNext = fSendNext;
+
 	if (++fDuplicateAcknowledgeCount < 3) {
 		if (fSendQueue.Available(fSendMax) != 0 && fSendWindow != 0) {
 			fSendNext = fSendMax;
@@ -1736,6 +1743,8 @@ TCPEndpoint::_DuplicateAcknowledge(tcp_segment_header &segment)
 			_SendQueued();
 			TRACE("_DuplicateAcknowledge(): packet sent under limited transmit on receipt of dup ack");
 			fCongestionWindow -= fDuplicateAcknowledgeCount * fSendMaxSegmentSize;
+			if (sendNext < fSendNext)
+				fSendNext = sendNext;
 		}
 	}
 
@@ -1745,6 +1754,7 @@ TCPEndpoint::_DuplicateAcknowledge(tcp_segment_header &segment)
 				&& (fSendUnacknowledged - fPreviousHighestAcknowledge).Number()
 					<= 4 * fSendMaxSegmentSize)) {
 			fFlags |= FLAG_RECOVERY;
+			NET_STAT_INC(gStackModule, tcp_fast_recoveries);
 			fRecover = fSendMax - 1;
 			fSlowStartThreshold = max_c(fPreviousFlightSize / 2, 2 * fSendMaxSegmentSize);
 			fCongestionWindow = fSlowStartThreshold + 3 * fSendMaxSegmentSize;
@@ -1767,6 +1777,8 @@ TCPEndpoint::_DuplicateAcknowledge(tcp_segment_header &segment)
 		if (fSendQueue.Available(fSendMax) != 0) {
 			fSendNext = fSendMax;
 			_SendQueued();
+			if ((fFlags & FLAG_RECOVERY) == 0 && sendNext < fSendNext)
+				fSendNext = sendNext;
 		}
 	}
 }
@@ -3705,6 +3717,7 @@ TCPEndpoint::_Retransmit()
 		fRetransmitTimeout = TCP_SYN_RETRANSMIT_TIMEOUT;
 		fCongestionWindow = fSendMaxSegmentSize;
 	} else {
+		NET_STAT_INC(gStackModule, tcp_retransmit_timeouts);
 		_ResetSlowStart();
 		fDuplicateAcknowledgeCount = 0;
 		// Do exponential back off of the retransmit timeout
