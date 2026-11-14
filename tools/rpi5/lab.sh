@@ -33,9 +33,18 @@ serial-clear)
 serial-send)
 	kvm_ssh "printf '%s' '$2' > /dev/ttyS1" ;;
 lun)
+	# The gadget refuses a new file while the Pi holds the medium ("Resource
+	# busy", even after Linux deleted the disk): then unbind the gadget for
+	# a moment, which also disconnects the KVM's keyboard and mouse.
 	file=$2; [ "$file" = none ] && file=
-	kvm_ssh "echo > $LUN/file; echo 0 > $LUN/cdrom; echo 0 > $LUN/ro;
-		echo '$file' > $LUN/file; echo '$file' > /boot/usb.disk0; sync;
+	kvm_ssh "G=/sys/kernel/config/usb_gadget/g0
+		if ! { echo > $LUN/file && echo 0 > $LUN/cdrom && echo 0 > $LUN/ro \\
+				&& echo '$file' > $LUN/file; } 2>/dev/null; then
+			U=\$(cat \$G/UDC); echo > \$G/UDC; sleep 1
+			echo 0 > $LUN/ro; echo '$file' > $LUN/file
+			echo \$U > \$G/UDC
+		fi
+		echo '$file' > /boot/usb.disk0; sync
 		echo \"LUN: \$(cat $LUN/file)\"" ;;
 upload)
 	sum=$(sha256sum "$2" | cut -d' ' -f1)
