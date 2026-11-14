@@ -49,7 +49,8 @@ attribution and the user guide).
 
 `rpi4_gpio` (`tools/rpi4/gpio.cpp`, in the lab overlay's
 `~/config/non-packaged/bin`): `info`, `state`, `set <pin> in [up|down|none]`,
-`set <pin> out <0|1>`, `watch <pin> [pull] [seconds]`, `selftest [pin]`.
+`set <pin> out <0|1>`, `watch <pin> [pull] [seconds]`, `ds18b20 <pin>`,
+`selftest [pin]`.
 The self test needs nothing wired: it drives the pin through its pull
 resistors and as an output. On the board (2026-10-04, `evidence/airpins/
 driver-selftest-1.txt`) all 20 checks pass:
@@ -63,6 +64,26 @@ driver-selftest-1.txt`) all 20 checks pass:
 | a second descriptor | cannot claim (busy) nor write; sees the pin claimed |
 | output | high, written low (written event, reads low), high again |
 | release / close | function and pull restored |
+
+### DS18B20 temperature reading
+
+The Raspberry Pi 4 driver's `RPI_GPIO_DS18B20_CONVERT` and
+`RPI_GPIO_DS18B20_READ` ioctls support one externally powered DS18B20 on a
+claimed input. `rpi4_gpio ds18b20 <pin>` reads it once, for example
+`rpi4_gpio ds18b20 4` for GPIO 4 (header pin 7).
+
+Connect the sensor's supply and ground, and its data line through an external
+4.7 kOhm pull-up to 3.3 V. Do not use 5 V on a GPIO input. The tool disables
+the pin's internal pull, verifies the ROM and scratchpad CRCs, waits 750 ms
+for a full-resolution conversion, and prints the ROM, Celsius temperature and
+signed raw value. A read before conversion returns `B_NOT_ALLOWED`; one less
+than 750 ms after conversion returns `B_WOULD_BLOCK`. Errors identify the
+convert or read operation. Releasing or closing the descriptor restores the
+pin's previous function and pull.
+
+Parasite power, multiple sensors on a pin and automatic brewery control are
+not supported by this prototype. No DS18B20 is attached to the lab board, so
+these sensor operations have not been verified on physical hardware.
 
 ## AirPins
 

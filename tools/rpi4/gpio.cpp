@@ -13,6 +13,7 @@
 	rpi4_gpio set <pin> in [up|down|none]	configure and let go
 	rpi4_gpio set <pin> out <0|1>
 	rpi4_gpio watch <pin> [up|down|none] [seconds]
+	rpi4_gpio ds18b20 <pin>					one externally powered sensor
 	rpi4_gpio selftest [pin]				needs nothing wired to the pin
 
 	The self test drives the pin through its pull resistors and as an
@@ -31,6 +32,7 @@
 
 #include <OS.h>
 
+#include <ds18b20.h>
 #include <rpi_gpio.h>
 
 
@@ -302,6 +304,83 @@ do_watch(int argc, char** argv)
 
 
 static int
+do_ds18b20(int argc, char** argv)
+{
+	if (argc != 3) {
+		fprintf(stderr, "usage: ds18b20 <pin>\n");
+		return 1;
+	}
+	char* end = NULL;
+	errno = 0;
+	unsigned long value = strtoul(argv[2], &end, 0);
+	if (errno != 0 || end == argv[2] || *end != '\0'
+		|| value >= RPI_GPIO_MAX_PINS) {
+		fprintf(stderr, "invalid GPIO pin: %s\n", argv[2]);
+		return 1;
+	}
+	uint32 pin = (uint32)value;
+
+	int fd = open_device();
+	rpi_gpio_info info = {};
+	status_t status = control(fd, RPI_GPIO_GET_INFO, &info);
+	if (status != B_OK) {
+		fprintf(stderr, "GET_INFO: %s\n", strerror(status));
+		close(fd);
+		return 1;
+	}
+	if (sBoard != RPI_GPIO_BOARD_RPI4
+		|| (info.flags & RPI_GPIO_INFO_DS18B20) == 0) {
+		fprintf(stderr, "DS18B20 is not supported by this GPIO driver\n");
+		close(fd);
+		return 1;
+	}
+	if ((info.claimable & (1ull << pin)) == 0) {
+		fprintf(stderr, "GPIO%" B_PRIu32 " is not a claimable header pin\n", pin);
+		close(fd);
+		return 1;
+	}
+
+	rpi_gpio_state before = state_of(fd);
+	status = claim(fd, pin, RPI_GPIO_INPUT, RPI_GPIO_PULL_NONE, -1);
+	if (status != B_OK) {
+		fprintf(stderr, "GPIO%" B_PRIu32 ": %s\n", pin, strerror(status));
+		close(fd);
+		return 1;
+	}
+
+	rpi_gpio_ds18b20_request request = {};
+	request.pin = pin;
+	status = control(fd, RPI_GPIO_DS18B20_CONVERT, &request);
+	if (status != B_OK)
+		fprintf(stderr, "DS18B20 convert GPIO%" B_PRIu32 ": %s\n", pin,
+			strerror(status));
+	if (status == B_OK) {
+		snooze(750000);
+		status = control(fd, RPI_GPIO_DS18B20_READ, &request);
+		if (status != B_OK)
+			fprintf(stderr, "DS18B20 read GPIO%" B_PRIu32 ": %s\n", pin,
+				strerror(status));
+	}
+	if (status == B_OK) {
+		printf("GPIO%" B_PRIu32 " sensor %016" B_PRIx64 ": %.4f C (raw %d)\n",
+			pin, request.sensor, ds18b20_celsius(request.raw), request.raw);
+	}
+
+	status_t releaseStatus = release(fd, pin);
+	if (releaseStatus != B_OK)
+		fprintf(stderr, "release GPIO%" B_PRIu32 ": %s\n", pin,
+			strerror(releaseStatus));
+	rpi_gpio_state after = state_of(fd);
+	bool restored = after.function[pin] == before.function[pin]
+		&& after.pull[pin] == before.pull[pin];
+	if (!restored)
+		fprintf(stderr, "GPIO%" B_PRIu32 " was not restored\n", pin);
+	close(fd);
+	return status == B_OK && releaseStatus == B_OK && restored ? 0 : 1;
+}
+
+
+static int
 do_selftest(int argc, char** argv)
 {
 	uint32 pin = argc > 2 ? strtoul(argv[2], NULL, 0) : 26;
@@ -481,11 +560,13 @@ main(int argc, char** argv)
 		return do_set(argc, argv);
 	if (argc >= 2 && strcmp(argv[1], "watch") == 0)
 		return do_watch(argc, argv);
+	if (argc >= 2 && strcmp(argv[1], "ds18b20") == 0)
+		return do_ds18b20(argc, argv);
 	if (argc >= 2 && strcmp(argv[1], "selftest") == 0)
 		return do_selftest(argc, argv);
 
 	fprintf(stderr, "usage: %s info | state | set <pin> in [up|down|none] |"
 		" set <pin> out <0|1> | watch <pin> [up|down|none] [seconds] |"
-		" selftest [pin]\n", argv[0]);
+		" ds18b20 <pin> | selftest [pin]\n", argv[0]);
 	return 1;
 }
