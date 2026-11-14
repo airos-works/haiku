@@ -556,6 +556,12 @@ struct KernelBootControlReader {
 		return HasSystemPackage(path.Path(), name);
 	}
 
+	int LoaderTrialStarts(const char* key)
+	{
+		// the kernel only decides where no loader read the boot volume
+		return 0;
+	}
+
 	bool LatestBootable()
 	{
 		KPath path(directory);

@@ -192,6 +192,48 @@ arch_thread_init_tls(Thread *thread)
 }
 
 
+#ifdef __x86_64__
+/*!	The CR3 value for switching to \a structures with PCIDs (#104): the
+	kernel's own address space is PCID 0 and never needs a flush; a team's
+	gets one of the CPU's PCID slots, and its entries survive as long as
+	nothing invalidated them meanwhile. The caller has marked the address
+	space active on this CPU before: an invalidation after the generation is
+	read here interrupts this CPU, one before it shows in the generation.
+*/
+static inline addr_t
+pcid_page_directory(cpu_ent* cpu, X86PagingStructures* structures)
+{
+	static X86PagingStructures* sKernelStructures = NULL;
+	if (sKernelStructures == NULL) {
+		sKernelStructures = static_cast<X86VMTranslationMap*>(
+			VMAddressSpace::Kernel()->TranslationMap())->PagingStructures();
+	}
+
+	addr_t pageDirectory = structures->pgdir_phys;
+	if (structures == sKernelStructures)
+		return pageDirectory | X86_CR3_NOFLUSH;
+
+	const int64 generation = atomic_get64(&structures->tlb_generation);
+	auto& slots = cpu->arch.pcid_slots;
+	for (uint32 i = 0; i < X86_PCID_SLOTS; i++) {
+		if (slots[i].id != structures->pcid_id)
+			continue;
+		if (slots[i].generation == generation)
+			return pageDirectory | (i + 1) | X86_CR3_NOFLUSH;
+		slots[i].generation = generation;
+		return pageDirectory | (i + 1);
+	}
+
+	// take the next slot round robin; loading it without the no-flush bit
+	// drops what its previous address space left
+	uint32 i = cpu->arch.pcid_next++ % X86_PCID_SLOTS;
+	slots[i].id = structures->pcid_id;
+	slots[i].generation = generation;
+	return pageDirectory | (i + 1);
+}
+#endif
+
+
 void
 arch_thread_context_switch(Thread* from, Thread* to)
 {
@@ -225,6 +267,10 @@ arch_thread_context_switch(Thread* from, Thread* to)
 
 		// set the new page directory
 		addr_t newPageDirectory = toPagingStructures->pgdir_phys;
+#ifdef __x86_64__
+		if (gX86PCIDEnabled)
+			newPageDirectory = pcid_page_directory(cpuData, toPagingStructures);
+#endif
 		x86_swap_pgdir(newPageDirectory);
 
 		// This CPU no longer uses the previous paging structures.

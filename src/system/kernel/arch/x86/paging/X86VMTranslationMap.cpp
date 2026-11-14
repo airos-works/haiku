@@ -107,7 +107,11 @@ X86VMTranslationMap::Flush()
 			smp_broadcast_ici(SMP_MSG_GLOBAL_INVALIDATE_PAGES, 0, 0, 0,
 				NULL, SMP_MSG_FLAG_SYNC);
 		} else {
-			InvalidateUserTLB(PagingStructures()->active_on_cpus, x86_read_cr3());
+			// (the generation first: a CPU that starts running the address
+			// space after this either sees it changed or gets interrupted)
+			atomic_add64(&PagingStructures()->tlb_generation, 1);
+			InvalidateUserTLB(PagingStructures()->active_on_cpus,
+				PagingStructures()->pgdir_phys);
 		}
 	} else {
 		TRACE("flush_tmap: %d pages to invalidate, invalidate list\n",
@@ -118,7 +122,13 @@ X86VMTranslationMap::Flush()
 				0, (addr_t)fInvalidPages, fInvalidPagesCount, NULL,
 				SMP_MSG_FLAG_SYNC);
 		} else {
-			InvalidateTLBList(PagingStructures()->active_on_cpus, x86_read_cr3(),
+			// The context is the address space's page directory: CPUs
+			// running another one skip the invalidation. (It used to be this
+			// CPU's CR3, so remote CPUs skipped invalidations made from
+			// another team or a kernel thread, e.g. the page daemon's.)
+			atomic_add64(&PagingStructures()->tlb_generation, 1);
+			InvalidateTLBList(PagingStructures()->active_on_cpus,
+				PagingStructures()->pgdir_phys,
 				fInvalidPages, fInvalidPagesCount);
 		}
 	}

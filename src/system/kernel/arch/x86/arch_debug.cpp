@@ -32,6 +32,18 @@
 #include <vm/VMArea.h>
 
 
+/*!	Switches back after reading another team's memory: that team's entries
+	went into PCID 0, the kernel's (#104), so flush them all.
+*/
+static void
+restore_page_directory(addr_t pageDirectory)
+{
+	x86_write_cr3(pageDirectory);
+	if (gX86PCIDEnabled)
+		arch_cpu_global_tlb_invalidate();
+}
+
+
 struct stack_frame {
 	stack_frame*	previous;
 	addr_t			return_address;
@@ -745,7 +757,7 @@ stack_trace(int argc, char** argv)
 
 	if (oldPageDirectory != 0) {
 		// switch back to the previous page directory to no cause any troubles
-		x86_write_cr3(oldPageDirectory);
+		restore_page_directory(oldPageDirectory);
 	}
 
 	return 0;
@@ -906,7 +918,7 @@ show_call(int argc, char **argv)
 
 	if (oldPageDirectory != 0) {
 		// switch back to the previous page directory to not cause any troubles
-		x86_write_cr3(oldPageDirectory);
+		restore_page_directory(oldPageDirectory);
 	}
 
 	return 0;
@@ -1013,7 +1025,7 @@ cmd_in_context(int argc, char** argv)
 
 	// reset the page directory
 	if (oldPageDirectory)
-		x86_write_cr3(oldPageDirectory);
+		restore_page_directory(oldPageDirectory);
 
 	return 0;
 }
