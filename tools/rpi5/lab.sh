@@ -7,6 +7,9 @@
 #   lab.sh serial-send <text>    write text to the Pi's console (no newline added)
 #   lab.sh lun <kvm file>|none   put a file of the KVM's /data in the virtual USB disk
 #   lab.sh upload <file> <name>  copy an image to the KVM's /data/<name> (checked)
+#   lab.sh update <file> <name>  overwrite /data/<name> in place, same size: the
+#                                virtual disk stays attached. Swapping the LUN while
+#                                the Pi's EEPROM reads it wedges the EEPROM for good
 #   lab.sh shot <jpg>            screenshot of HDMI0
 #
 # Credentials stay in $RPI5_STATE (default /mnt/HaikuWork/rpi5/state):
@@ -38,6 +41,12 @@ upload)
 	remote=$(kvm_ssh "sha256sum /data/$3" | cut -d' ' -f1)
 	[ "$sum" = "$remote" ] || { echo "checksum mismatch" >&2; exit 1; }
 	echo "uploaded /data/$3 $sum" ;;
+update)
+	sum=$(sha256sum "$2" | cut -d' ' -f1)
+	gzip -1 -c "$2" | kvm_ssh "gunzip -c > /data/$3.new && dd if=/data/$3.new of=/data/$3 bs=1M conv=notrunc 2>/dev/null && rm /data/$3.new && sync"
+	remote=$(kvm_ssh "sha256sum /data/$3" | cut -d' ' -f1)
+	[ "$sum" = "$remote" ] || { echo "checksum mismatch" >&2; exit 1; }
+	echo "updated /data/$3 in place $sum" ;;
 shot)
 	. "$STATE/env.sh"
 	/mnt/HaikuWork/rpi4/venv/bin/python /mnt/HaikuWork/src/haiku/tools/rock5-itx/nanokvm.py screenshot "$2" ;;

@@ -126,6 +126,8 @@ FUNCTION(rpi_psci_secondary_entry):
 	b.ne	1f
 	bl		drop_to_el1
 1:
+	ldr		x1, =rpi_exception_vectors
+	msr		vbar_el1, x1
 	mov		x1, #(3 << 20)
 	msr		cpacr_el1, x1
 	isb

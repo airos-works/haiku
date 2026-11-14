@@ -21,11 +21,13 @@
 #include <boot/menu.h>
 #include <boot/platform.h>
 #include <boot/stage2.h>
+#include <boot/stdio.h>
 #include <kernel.h>
 #include <safemode.h>
 
 #include "dtb.h"
 #include "mmu.h"
+#include "serial.h"
 
 
 extern uint8 _start;
@@ -48,6 +50,13 @@ uint64 gPsciSecondaryStacks[MAX_FDT_CPUS];
 static uint32 sCpuIndex[256];
 static addr_t sKernelEntry;
 static kernel_args* sKernelArgs;
+
+// Each core sets its slot once its MMU is on; after the boot CPU stopped
+// waiting for them, latecomers stay in the loader.
+static volatile uint32 sCpuArrived[SMP_MAX_CPUS];
+static volatile bool sCpusClosed;
+
+static void enter_kernel(uint32 cpu);
 
 
 void
@@ -127,7 +136,18 @@ rpi_secondary_main(uint64 affinity)
 	// keeps it valid once the MMU is on.
 	mmu_enable_on_this_cpu();
 
-	uint32 cpu = sCpuIndex[affinity];
+	enter_kernel(sCpuIndex[affinity]);
+}
+
+
+static void
+enter_kernel(uint32 cpu)
+{
+	sCpuArrived[cpu] = 1;
+	asm volatile("dsb sy" : : : "memory");
+	while (sCpusClosed && cpu >= gKernelArgs.num_cpus)
+		asm volatile("wfe");
+
 	arch_enter_kernel(sKernelArgs, sKernelEntry,
 		gKernelArgs.cpu_kstack[cpu].start + gKernelArgs.cpu_kstack[cpu].size,
 		cpu);
@@ -138,10 +158,7 @@ extern "C" void
 rpi_psci_secondary_main(uint64 cpu)
 {
 	mmu_enable_on_this_cpu();
-
-	arch_enter_kernel(sKernelArgs, sKernelEntry,
-		gKernelArgs.cpu_kstack[cpu].start + gKernelArgs.cpu_kstack[cpu].size,
-		cpu);
+	enter_kernel(cpu);
 }
 
 
@@ -180,6 +197,26 @@ smp_boot_other_cpus(addr_t kernelEntry)
 	}
 	if (spinTable)
 		asm("sev");
+
+	// The kernel's boot CPU waits for all the others before it does anything
+	// at all: a core that does not come would leave it stuck without a word.
+	bigtime_t timeout = system_time() + 500000;
+	uint32 arrived = 1;
+	while (system_time() < timeout) {
+		arrived = 1;
+		while (arrived < gKernelArgs.num_cpus && sCpuArrived[arrived] != 0)
+			arrived++;
+		if (arrived == gKernelArgs.num_cpus)
+			break;
+	}
+	if (arrived < gKernelArgs.num_cpus) {
+		dprintf("smp: only %" B_PRIu32 " of %" B_PRIu32 " CPUs started\n",
+			arrived, gKernelArgs.num_cpus);
+		gKernelArgs.num_cpus = arrived;
+		serial_flush();
+	}
+	sCpusClosed = true;
+	asm volatile("dsb sy; sev" : : : "memory");
 }
 
 

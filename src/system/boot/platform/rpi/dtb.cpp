@@ -298,6 +298,8 @@ get_fixed_clock_rate(int node)
 static uint64 sRP1Base = 0;
 static uint64 sRP1Bar = 0;
 static uint64 sRP1Controller = 0;
+static uint32 sRP1BusNumbers = 0;
+static uint32 sRP1Id = 0;
 
 
 static inline uint32
@@ -376,13 +378,30 @@ fixup_rp1()
 		}
 		sRP1Controller = regs;
 
+		// The root port's own configuration space is at the start of the
+		// registers. Configuration accesses to the RP1 only go out with the
+		// bridge's bus numbers set: primary 0, secondary and subordinate 1.
+		sRP1BusNumbers = read_register(regs, 0x18);
+		if (((sRP1BusNumbers >> 8) & 0xff) != 1) {
+			*(volatile uint32*)(regs + 0x18)
+				= (sRP1BusNumbers & 0xff000000) | 0x010100;
+		}
+
 		// bus 1, device 0, function 0: the RP1
 		*(volatile uint32*)(regs + BCM2712_PCIE_EXT_CFG_INDEX) = 1 << 20;
-		uint32 low = read_register(regs, BCM2712_PCIE_EXT_CFG_DATA + 0x14);
-		uint64 bar = low & ~(uint64)0xf;
-		if ((low & 0x6) == 0x4) {
-			bar |= (uint64)read_register(regs, BCM2712_PCIE_EXT_CFG_DATA + 0x18)
-				<< 32;
+		sRP1Id = read_register(regs, BCM2712_PCIE_EXT_CFG_DATA);
+		uint64 bar;
+		if (sRP1Id != 0xffffffff) {
+			uint32 low = read_register(regs, BCM2712_PCIE_EXT_CFG_DATA + 0x14);
+			bar = low & ~(uint64)0xf;
+			if ((low & 0x6) == 0x4) {
+				bar |= (uint64)read_register(regs,
+					BCM2712_PCIE_EXT_CFG_DATA + 0x18) << 32;
+			}
+		} else {
+			// The firmware puts BAR 1 at the start of its first window.
+			bar = read_register(regs, BCM2712_PCIE_WIN_PCI_LO(0))
+				| (uint64)read_register(regs, BCM2712_PCIE_WIN_PCI_HI(0)) << 32;
 		}
 		sRP1Bar = bar;
 
@@ -464,6 +483,7 @@ fdt_dump_rp1_state()
 	if (sRP1Controller == 0)
 		return;
 	uint64 regs = sRP1Controller;
+	dump_registers("pcie", regs, 0, 0x40);
 	dump_registers("pcie", regs, 0x4000, 0x4180);
 	dump_registers("pcie", regs, 0x4300, 0x4320);
 	dump_registers("pcie", regs, 0x4500, 0x4520);
@@ -651,7 +671,8 @@ fdt_init(void* fdt)
 	serial_init();
 		// from here on dprintf() reaches the UART
 	if (sRP1Bar != 0) {
-		dprintf("RP1: BAR 1 at PCI %#" B_PRIx64 ", CPU %#" B_PRIx64 "\n",
+		dprintf("RP1: ID %#" B_PRIx32 ", bus numbers %#" B_PRIx32 ", BAR 1 at "
+			"PCI %#" B_PRIx64 ", CPU %#" B_PRIx64 "\n", sRP1Id, sRP1BusNumbers,
 			sRP1Bar, sRP1Base);
 	}
 

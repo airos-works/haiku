@@ -53,8 +53,12 @@ dprintf_args(const char* format, va_list args)
 
 	syslog_write(buffer, length);
 	serial_puts(buffer, length);
-	if (gDebugToScreen)
+	if (gDebugToScreen) {
+		// scrolling the uncached frame buffer takes long: keep the lab
+		// watchdog quiet meanwhile
+		watchdog_pet();
 		console_write_debug(buffer, length);
+	}
 }
 
 
