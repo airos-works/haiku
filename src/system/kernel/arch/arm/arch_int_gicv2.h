@@ -23,6 +23,7 @@ public:
 	void DumpRouting();
 private:
 	uint32 _CurrentCpuInterface();
+	void _ConfigureEdgeTriggered();
 
 	volatile uint32_t *fGicdRegs;
 	volatile uint32_t *fGiccRegs;

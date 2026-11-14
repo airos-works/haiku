@@ -84,6 +84,29 @@ has_boot_argument(const char* option)
 }
 
 
+/*!	"airos.watchdog": the power manager's watchdog restarts the board if the
+	loader or the kernel stops for 15 s. The kernel keeps it from firing for
+	as long as its timers run. For a lab board nobody can switch off.
+*/
+static void
+init_watchdog()
+{
+	if (!has_boot_argument("airos.watchdog"))
+		return;
+
+	static const char* const kCompatible[] = {"brcm,bcm2712-pm",
+		"brcm,bcm2711-pm", "brcm,bcm2835-pm", "brcm,bcm2835-pm-wdt"};
+	addr_range pm;
+	for (size_t i = 0; i < B_COUNT_OF(kCompatible); i++) {
+		if (fdt_find_compatible_reg(kCompatible[i], pm)) {
+			watchdog_init(pm.start);
+			fdt_set_watchdog(pm.start);
+			return;
+		}
+	}
+}
+
+
 static void
 init_boot_options()
 {
@@ -95,6 +118,10 @@ init_boot_options()
 		sBootOptions |= BOOT_OPTION_DEBUG_OUTPUT;
 		gDebugToScreen = true;
 	}
+	if (has_boot_argument("airos.rp1dump"))
+		fdt_dump_rp1_state();
+	if (has_boot_argument("airos.nosmp"))
+		add_safe_mode_settings("disable_smp true\n");
 
 	// a space on the serial console opens the menu
 	bigtime_t timeout = system_time() + 100000;
@@ -206,6 +233,7 @@ platform_start_kernel(void)
 		" CPUs\n", kernelEntry, gKernelArgs.num_cpus);
 
 	serial_flush();
+	watchdog_pet();
 	smp_boot_other_cpus(kernelEntry);
 
 	arch_enter_kernel(&gKernelArgs, kernelEntry,
@@ -238,6 +266,7 @@ rpi_start(void* fdt)
 	call_ctors();
 
 	fdt_init(fdt);
+	init_watchdog();
 	mmu_init();
 
 	video_init();

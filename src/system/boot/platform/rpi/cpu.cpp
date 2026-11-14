@@ -17,6 +17,7 @@
 #include <boot/vfs.h>
 #include <kernel/arch/arm64/arm_registers.h>
 
+#include "dtb.h"
 #include "mailbox.h"
 
 
@@ -25,6 +26,20 @@ static const uint64 kDefaultTimerFrequency = 54000000;
 
 static uint64 sTimerFrequency;
 static uint64 sTimerBase;
+
+// The power manager's watchdog (BCM2835 style, Pi 4 and Pi 5), armed with
+// "airos.watchdog" on the command line: a lab board whose power nobody can
+// switch restarts by itself when the loader or the kernel hangs.
+#define PM_PASSWORD				0x5a000000
+#define PM_RSTC					0x1c
+#define PM_WDOG					0x24
+#define PM_RSTC_WRCFG_CLEAR		0xffffffcf
+#define PM_RSTC_WRCFG_FULL_RESET	0x00000020
+#define PM_WDOG_TIMEOUT			(15 << 16)
+	// 15 s, about the longest the 20-bit counter of 1/65536 s takes
+
+static volatile uint32* sWatchdog;
+static uint64 sWatchdogPetted;
 
 
 bigtime_t
@@ -37,7 +52,13 @@ system_time()
 		sTimerBase = READ_SPECIALREG(CNTPCT_EL0);
 	}
 
-	uint64 ticks = READ_SPECIALREG(CNTPCT_EL0) - sTimerBase;
+	uint64 now = READ_SPECIALREG(CNTPCT_EL0);
+	if (sWatchdog != NULL && now - sWatchdogPetted > sTimerFrequency) {
+		sWatchdogPetted = now;
+		watchdog_pet();
+	}
+
+	uint64 ticks = now - sTimerBase;
 	return ticks / sTimerFrequency * 1000000
 		+ ticks % sTimerFrequency * 1000000 / sTimerFrequency;
 }
@@ -73,6 +94,43 @@ cpu_init()
 	}
 
 	boot_arch_cpu_init();
+}
+
+
+void
+watchdog_init(phys_addr_t base)
+{
+	sWatchdog = (volatile uint32*)base;
+	watchdog_pet();
+	uint32 control = sWatchdog[PM_RSTC / 4];
+	sWatchdog[PM_RSTC / 4] = PM_PASSWORD | (control & PM_RSTC_WRCFG_CLEAR)
+		| PM_RSTC_WRCFG_FULL_RESET;
+	dprintf("watchdog: armed at %#" B_PRIxPHYSADDR ", 15 s\n", base);
+}
+
+
+void
+watchdog_pet()
+{
+	if (sWatchdog != NULL)
+		sWatchdog[PM_WDOG / 4] = PM_PASSWORD | PM_WDOG_TIMEOUT;
+}
+
+
+void
+cpu_reset_after(bigtime_t timeout)
+{
+	if (gPsciConduit == ARM64_PSCI_NONE)
+		return;
+
+	spin(timeout);
+
+	// PSCI SYSTEM_RESET
+	register uint64 x0 asm("x0") = 0x84000009;
+	if (gPsciConduit == ARM64_PSCI_HVC)
+		asm volatile("hvc #0" : "+r" (x0) : : "memory");
+	else
+		asm volatile("smc #0" : "+r" (x0) : : "memory");
 }
 
 

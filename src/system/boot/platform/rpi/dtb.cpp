@@ -18,6 +18,7 @@
 
 #include <arch/arm/arch_uart_pl011.h>
 #include <boot/kernel_args.h>
+#include <boot/platform.h>
 #include <boot/stage2.h>
 #include <boot/stdio.h>
 #include <kernel.h>
@@ -43,6 +44,8 @@ void* gFDT = NULL;
 addr_range gBootArchive = {0, 0};
 fdt_cpu gFDTCpus[MAX_FDT_CPUS];
 uint32 gFDTCpuCount = 0;
+bool gBCM2712 = false;
+uint32 gPsciConduit = ARM64_PSCI_NONE;
 
 
 static uint64
@@ -264,6 +267,237 @@ fdt_boot_arguments()
 }
 
 
+/*!	The rate of the fixed clock that is the first of \a node's "clocks", or 0.
+*/
+static uint32
+get_fixed_clock_rate(int node)
+{
+	const uint32* clocks = (const uint32*)fdt_getprop(gFDT, node, "clocks",
+		NULL);
+	if (clocks == NULL)
+		return 0;
+	int clock = fdt_node_offset_by_phandle(gFDT, fdt32_to_cpu(*clocks));
+	if (clock < 0 || fdt_node_check_compatible(gFDT, clock, "fixed-clock") != 0)
+		return 0;
+	const uint32* frequency = (const uint32*)fdt_getprop(gFDT, clock,
+		"clock-frequency", NULL);
+	return frequency != NULL ? fdt32_to_cpu(*frequency) : 0;
+}
+
+
+// The Pi 5's PCIe x4 controller (brcmstb) with the RP1 behind it
+#define BCM2712_PCIE_STATUS				0x4068
+#define BCM2712_PCIE_LINK_UP			0x30	// PHYLINKUP, DL_ACTIVE
+#define BCM2712_PCIE_WIN_PCI_LO(w)		(0x400c + (w) * 8)
+#define BCM2712_PCIE_WIN_PCI_HI(w)		(0x4010 + (w) * 8)
+#define BCM2712_PCIE_WIN_BASE_LIMIT(w)	(0x4070 + (w) * 4)
+#define BCM2712_PCIE_WIN_BASE_HI(w)		(0x4080 + (w) * 8)
+#define BCM2712_PCIE_WIN_LIMIT_HI(w)	(0x4084 + (w) * 8)
+#define BCM2712_PCIE_EXT_CFG_DATA		0x8000
+#define BCM2712_PCIE_EXT_CFG_INDEX		0x9000
+
+static uint64 sRP1Base = 0;
+static uint64 sRP1Bar = 0;
+static uint64 sRP1Controller = 0;
+static uint32 sRP1BusNumbers = 0;
+static uint32 sRP1Id = 0;
+
+
+static inline uint32
+read_register(uint64 base, uint32 offset)
+{
+	return *(volatile uint32*)(base + offset);
+}
+
+
+/*!	The CPU address at which the controller's outbound windows show the PCI
+	address \a pci, or 0.
+*/
+static uint64
+pci_to_cpu(uint64 regs, uint64 pci)
+{
+	for (uint32 window = 0; window < 4; window++) {
+		uint64 pciBase = read_register(regs, BCM2712_PCIE_WIN_PCI_LO(window))
+			| (uint64)read_register(regs, BCM2712_PCIE_WIN_PCI_HI(window))
+				<< 32;
+		uint32 baseLimit = read_register(regs,
+			BCM2712_PCIE_WIN_BASE_LIMIT(window));
+		uint64 baseMB = ((baseLimit >> 4) & 0xfff)
+			| (uint64)(read_register(regs, BCM2712_PCIE_WIN_BASE_HI(window))
+				& 0xff) << 12;
+		uint64 limitMB = (baseLimit >> 20)
+			| (uint64)(read_register(regs, BCM2712_PCIE_WIN_LIMIT_HI(window))
+				& 0xff) << 12;
+		if (baseMB == 0 || limitMB < baseMB)
+			continue;
+		uint64 size = (limitMB - baseMB + 1) << 20;
+		if (pci >= pciBase && pci - pciBase < size)
+			return (baseMB << 20) + (pci - pciBase);
+	}
+	return 0;
+}
+
+
+static inline uint32
+rp1_config_read(uint32 offset)
+{
+	*(volatile uint32*)(sRP1Controller + BCM2712_PCIE_EXT_CFG_INDEX) = 1 << 20;
+	return read_register(sRP1Controller, BCM2712_PCIE_EXT_CFG_DATA + offset);
+}
+
+
+static inline void
+rp1_config_write(uint32 offset, uint32 value)
+{
+	*(volatile uint32*)(sRP1Controller + BCM2712_PCIE_EXT_CFG_INDEX) = 1 << 20;
+	*(volatile uint32*)(sRP1Controller + BCM2712_PCIE_EXT_CFG_DATA + offset)
+		= value;
+}
+
+
+/*!	The firmware puts the RP1 where it likes when it leaves the PCIe link up
+	for the operating system ("pciex4_reset=0"): at 0x1c_0000_0000, where
+	the device tree's "ranges" say 0x1f_0000_0000. Find out from the
+	controller's outbound windows and the RP1's BAR 1 (its peripherals) where
+	it really is, and correct the RP1's "ranges" in the tree, which the
+	kernel gets too.
+*/
+static void
+fixup_rp1()
+{
+	int pcie = -1;
+	while ((pcie = fdt_node_offset_by_compatible(gFDT, pcie,
+			"brcm,bcm2712-pcie")) >= 0) {
+		int rp1 = fdt_subnode_offset(gFDT, pcie, "rp1");
+		addr_range controller;
+		if (rp1 < 0 || !fdt_get_reg(pcie, 0, controller))
+			continue;
+		uint64 regs = controller.start;
+		if ((read_register(regs, BCM2712_PCIE_STATUS) & BCM2712_PCIE_LINK_UP)
+				!= BCM2712_PCIE_LINK_UP) {
+			continue;
+		}
+		sRP1Controller = regs;
+
+		// The root port's own configuration space is at the start of the
+		// registers. Configuration accesses to the RP1 only go out with the
+		// bridge's bus numbers set: primary 0, secondary and subordinate 1.
+		sRP1BusNumbers = read_register(regs, 0x18);
+		if (((sRP1BusNumbers >> 8) & 0xff) != 1) {
+			*(volatile uint32*)(regs + 0x18)
+				= (sRP1BusNumbers & 0xff000000) | 0x010100;
+		}
+
+		// bus 1, device 0, function 0: the RP1
+		*(volatile uint32*)(regs + BCM2712_PCIE_EXT_CFG_INDEX) = 1 << 20;
+		sRP1Id = read_register(regs, BCM2712_PCIE_EXT_CFG_DATA);
+		uint64 bar;
+		if (sRP1Id != 0xffffffff) {
+			uint32 low = read_register(regs, BCM2712_PCIE_EXT_CFG_DATA + 0x14);
+			bar = low & ~(uint64)0xf;
+			if ((low & 0x6) == 0x4) {
+				bar |= (uint64)read_register(regs,
+					BCM2712_PCIE_EXT_CFG_DATA + 0x18) << 32;
+			}
+		} else {
+			// The firmware puts BAR 1 at the start of its first window.
+			bar = read_register(regs, BCM2712_PCIE_WIN_PCI_LO(0))
+				| (uint64)read_register(regs, BCM2712_PCIE_WIN_PCI_HI(0)) << 32;
+		}
+		sRP1Bar = bar;
+
+		uint64 cpu = pci_to_cpu(regs, bar);
+		if (cpu == 0)
+			continue;
+		sRP1Base = cpu;
+
+		// The PCI address that the controller's "ranges" turn into that CPU
+		// address; the RP1's "ranges" are <child (2), PCI (3), size (2)>.
+		int length;
+		const uint32* ranges = (const uint32*)fdt_getprop(gFDT, pcie, "ranges",
+			&length);
+		const uint32* end = ranges != NULL ? ranges + length / 4 : NULL;
+		while (ranges != NULL && ranges + 7 <= end) {
+			uint32 flags = fdt32_to_cpu(ranges[0]);
+			const uint32* cells = ranges + 1;
+			uint64 child = read_cells(cells, 2);
+			uint64 parent = read_cells(cells, 2);
+			uint64 size = read_cells(cells, 2);
+			ranges = cells;
+			if (cpu < parent || cpu - parent >= size)
+				continue;
+
+			uint64 pci = cpu - parent + child;
+			const uint32* rp1Ranges = (const uint32*)fdt_getprop(gFDT, rp1,
+				"ranges", &length);
+			if (rp1Ranges == NULL || length < 7 * 4)
+				break;
+			uint32 patched[7];
+			memcpy(patched, rp1Ranges, sizeof(patched));
+			patched[2] = cpu_to_fdt32(flags);
+			patched[3] = cpu_to_fdt32((uint32)(pci >> 32));
+			patched[4] = cpu_to_fdt32((uint32)pci);
+			fdt_setprop_inplace_namelen_partial(gFDT, rp1, "ranges", 6, 0,
+				patched, sizeof(patched));
+			break;
+		}
+	}
+}
+
+
+/*!	Whether the registers of \a node can be read. The Pi 5's UARTs on the GPIO
+	header are in the RP1, behind the PCIe x4 link: with the link down, or the
+	RP1 not where the tree says, an access stalls the CPU. The firmware
+	leaves the link up with "pciex4_reset=0" in config.txt.
+*/
+static bool
+is_reachable(int node)
+{
+	for (int parent = fdt_parent_offset(gFDT, node); parent >= 0;
+			parent = fdt_parent_offset(gFDT, parent)) {
+		if (fdt_node_check_compatible(gFDT, parent, "brcm,bcm2712-pcie") == 0)
+			return sRP1Base != 0;
+	}
+	return true;
+}
+
+
+static void
+dump_registers(const char* name, uint64 base, uint32 from, uint32 to)
+{
+	for (uint32 offset = from; offset < to; offset += 16) {
+		dprintf("%s %04" B_PRIx32 ": %08" B_PRIx32 " %08" B_PRIx32 " %08"
+			B_PRIx32 " %08" B_PRIx32 "\n", name, offset,
+			read_register(base, offset), read_register(base, offset + 4),
+			read_register(base, offset + 8), read_register(base, offset + 12));
+	}
+}
+
+
+/*!	"airos.rp1dump": what the firmware left in the PCIe controller of the
+	RP1, the RP1's configuration space and the MSI controller (MIP), for
+	working out the RP1's interrupts and DMA.
+*/
+void
+fdt_dump_rp1_state()
+{
+	if (sRP1Controller == 0)
+		return;
+	uint64 regs = sRP1Controller;
+	dump_registers("pcie", regs, 0, 0x40);
+	dump_registers("pcie", regs, 0x4000, 0x4180);
+	dump_registers("pcie", regs, 0x4300, 0x4320);
+	dump_registers("pcie", regs, 0x4500, 0x4520);
+	*(volatile uint32*)(regs + BCM2712_PCIE_EXT_CFG_INDEX) = 1 << 20;
+	dump_registers("rp1cfg", regs + BCM2712_PCIE_EXT_CFG_DATA, 0, 0x100);
+	addr_range mip;
+	if (fdt_find_compatible_reg("brcm,bcm2712-mip", mip))
+		dump_registers("mip", mip.start, 0, 0xc0);
+	// the RP1's own MSI-X configuration and interrupt status (PCIE_APBS)
+	dump_registers("rp1apbs", sRP1Base + 0x108000, 0, 0x110);
+}
+
+
 static bool
 init_uart_node(int node)
 {
@@ -272,14 +506,17 @@ init_uart_node(int node)
 
 	uart_info& uart = gKernelArgs.arch_args.uart;
 	const char* kind;
-	if (fdt_node_check_compatible(gFDT, node, "arm,pl011") == 0)
+	if (fdt_node_check_compatible(gFDT, node, "arm,pl011") == 0
+		|| fdt_node_check_compatible(gFDT, node, "arm,pl011-axi") == 0) {
 		kind = UART_KIND_PL011;
-	else
+	} else
 		return false;
 
-	if (!fdt_get_reg(node, 0, uart.regs))
+	addr_range regs;
+	if (!fdt_get_reg(node, 0, regs) || !is_reachable(node))
 		return false;
 
+	uart.regs = regs;
 	strlcpy(uart.kind, kind, sizeof(uart.kind));
 	uart.irq = get_gic_interrupt(node);
 	uart.clock = PL011_DEFAULT_CLOCK;
@@ -289,8 +526,23 @@ init_uart_node(int node)
 	uint32 rate;
 	if (frequency != NULL)
 		uart.clock = fdt32_to_cpu(*frequency);
-	else if (mailbox_get_clock_rate(MAILBOX_CLOCK_UART, false, rate) == B_OK)
+	else if ((rate = get_fixed_clock_rate(node)) != 0)
 		uart.clock = rate;
+	else if (!gBCM2712
+		&& mailbox_get_clock_rate(MAILBOX_CLOCK_UART, false, rate) == B_OK)
+		uart.clock = rate;
+	else if (gBCM2712) {
+		// The RP1's UART clock is the RP1's own; the firmware set the port
+		// up at 115200 baud ("enable_rp1_uart=1"): the divisor tells.
+		volatile uint32* pl011 = (volatile uint32*)regs.start;
+		uint32 integer = pl011[0x24 / 4];
+		uint32 fraction = pl011[0x28 / 4] & 0x3f;
+		if (integer != 0) {
+			uart.clock = (uint32)(((uint64)integer * 64 + fraction)
+				* 16 * 115200 / 64);
+		} else
+			uart.clock = 50000000;
+	}
 
 	return true;
 }
@@ -299,6 +551,11 @@ init_uart_node(int node)
 static void
 init_uart()
 {
+	// On the Pi 5 the "console" alias follows dtparam=uart0_console: the
+	// RP1's UART on GPIO 14/15 instead of the debug connector.
+	if (gBCM2712 && init_uart_node(fdt_path_offset(gFDT, "console")))
+		return;
+
 	// The console the firmware names, then the usual alias.
 	int chosen = fdt_path_offset(gFDT, "/chosen");
 	if (chosen >= 0) {
@@ -366,6 +623,7 @@ init_cpus()
 			NULL);
 		cpu.mpidr = reg != NULL ? read_cells(reg, addressCells) : 0;
 		cpu.releaseAddress = 0;
+		cpu.psci = false;
 
 		const char* method = (const char*)fdt_getprop(gFDT, node,
 			"enable-method", NULL);
@@ -375,8 +633,27 @@ init_cpus()
 		if (method != NULL && strcmp(method, "spin-table") == 0
 			&& release != NULL) {
 			cpu.releaseAddress = read_cells(release, length / 4);
+		} else if (method != NULL && strcmp(method, "psci") == 0
+			&& gPsciConduit != ARM64_PSCI_NONE) {
+			cpu.psci = true;
 		}
 	}
+}
+
+
+static void
+init_psci()
+{
+	int node = fdt_path_offset(gFDT, "/psci");
+	if (node < 0 || !is_enabled(node))
+		return;
+	const char* method = (const char*)fdt_getprop(gFDT, node, "method", NULL);
+	if (method == NULL)
+		return;
+	if (strcmp(method, "smc") == 0)
+		gPsciConduit = ARM64_PSCI_SMC;
+	else if (strcmp(method, "hvc") == 0)
+		gPsciConduit = ARM64_PSCI_HVC;
 }
 
 
@@ -386,11 +663,19 @@ fdt_init(void* fdt)
 	if (fdt == NULL || fdt_check_header(fdt) != 0)
 		panic("No device tree from the firmware");
 	gFDT = fdt;
+	gBCM2712 = fdt_node_check_compatible(fdt, 0, "brcm,bcm2712") == 0;
 
+	if (gBCM2712)
+		fixup_rp1();
 	mailbox_init();
 	init_uart();
 	serial_init();
 		// from here on dprintf() reaches the UART
+	if (sRP1Bar != 0) {
+		dprintf("RP1: ID %#" B_PRIx32 ", bus numbers %#" B_PRIx32 ", BAR 1 at "
+			"PCI %#" B_PRIx64 ", CPU %#" B_PRIx64 "\n", sRP1Id, sRP1BusNumbers,
+			sRP1Bar, sRP1Base);
+	}
 
 	dprintf("device tree at %p, %u bytes: %s\n", fdt,
 		(unsigned)fdt_totalsize(fdt),
@@ -399,9 +684,303 @@ fdt_init(void* fdt)
 	init_memory();
 	init_chosen();
 	init_interrupt_controller();
+	init_psci();
 	init_cpus();
 
-	gKernelArgs.arch_args.psci_conduit = ARM64_PSCI_NONE;
+	// The kernel restarts and powers off through PSCI where there is one.
+	gKernelArgs.arch_args.psci_conduit = gPsciConduit;
+}
+
+
+// The RP1's interrupts (Linux: drivers/mfd/rp1.c, irq-bcm2712-mip.c)
+#define RP1_PCIE_APBS			0x108000
+#define RP1_REG_SET				0x800
+#define RP1_MSIX_CFG(irq)		(0x8 + (irq) * 4)
+#define RP1_MSIX_CFG_ENABLE		(1 << 0)
+#define RP1_MSIX_CFG_IACK_EN	(1 << 3)
+#define RP1_IRQ_COUNT			61
+#define MIP_INT_CFGL_HOST		0x20
+#define MIP_INT_CFGH_HOST		0x30
+#define MIP_INT_MASKL_HOST		0x40
+#define MIP_INT_MASKH_HOST		0x50
+#define MIP_INT_MASKL_VPU		0x60
+#define MIP_INT_MASKH_VPU		0x70
+#define BCM2712_PCIE_RC_BAR(n)	((n) <= 3 ? 0x402c + ((n) - 1) * 8 \
+	: 0x40d4 + ((n) - 4) * 8)
+#define BCM2712_PCIE_UBUS_BAR(n) ((n) <= 3 ? 0x40ac + ((n) - 1) * 8 \
+	: 0x410c + ((n) - 4) * 8)
+
+
+/*!	Makes sure that one of the PCIe controller's inbound windows (RC BARs)
+	maps PCI address \a pci to CPU address \a cpu, \a sizeCode (the
+	controller's encoding: 0x1c-0x1f 4-32 KB, 1-21 64 KB-64 GB) long.
+*/
+static bool
+add_inbound_window(uint64 pci, uint64 cpu, uint32 sizeCode, const char* what)
+{
+	uint32 freeBar = 0;
+	for (uint32 bar = 1; bar <= 10; bar++) {
+		uint32 low = read_register(sRP1Controller, BCM2712_PCIE_RC_BAR(bar));
+		uint32 high = read_register(sRP1Controller,
+			BCM2712_PCIE_RC_BAR(bar) + 4);
+		uint32 code = low & 0x1f;
+		if (code == 0) {
+			if (freeBar == 0)
+				freeBar = bar;
+			continue;
+		}
+		uint64 base = (uint64)high << 32 | (low & ~(uint32)0xfff);
+		uint32 log2 = code >= 0x1c ? code - 0x1c + 12 : code + 15;
+		if (pci >= base && pci - base < (1ull << log2))
+			return true;
+	}
+	if (freeBar == 0) {
+		dprintf("RP1: no inbound window free for %s\n", what);
+		return false;
+	}
+
+	*(volatile uint32*)(sRP1Controller + BCM2712_PCIE_RC_BAR(freeBar))
+		= (uint32)pci | sizeCode;
+	*(volatile uint32*)(sRP1Controller + BCM2712_PCIE_RC_BAR(freeBar) + 4)
+		= (uint32)(pci >> 32);
+	*(volatile uint32*)(sRP1Controller + BCM2712_PCIE_UBUS_BAR(freeBar))
+		= ((uint32)cpu & ~(uint32)0xfff) | 1;
+	*(volatile uint32*)(sRP1Controller + BCM2712_PCIE_UBUS_BAR(freeBar) + 4)
+		= (uint32)(cpu >> 32);
+	dprintf("RP1: inbound window %" B_PRIu32 " for %s\n", freeBar, what);
+	return true;
+}
+
+
+/*!	Makes the RP1's interrupts plain GIC interrupts for the kernel, the way
+	Linux sets them up: interrupt N of the RP1 is MSI-X vector N, a write of
+	N to the MIP, which raises SPI <msi base> + N, edge triggered. Then the
+	RP1's devices in \a tree (the kernel's copy) get those SPIs as their
+	interrupts, and drivers need to know nothing about the RP1. Level
+	triggered sources are acknowledged through the RP1's MSIX_CFG IACK bit
+	("airos,rp1-iack" names the register; the driver writes 1 << 2 there).
+*/
+static void
+setup_rp1_interrupts(void* tree)
+{
+	if (sRP1Base == 0 || sRP1Controller == 0)
+		return;
+
+	int mip = fdt_node_offset_by_compatible(tree, -1, "brcm,bcm2712-mip");
+	int length;
+	const uint32* ranges = mip >= 0
+		? (const uint32*)fdt_getprop(tree, mip, "msi-ranges", &length) : NULL;
+	if (ranges == NULL || length != 5 * 4)
+		return;
+	uint32 gicPhandle = fdt32_to_cpu(ranges[0]);
+	uint32 spiBase = fdt32_to_cpu(ranges[2]);
+	uint32 vectors = fdt32_to_cpu(ranges[4]);
+
+	// reg 0: the MIP's registers, reg 1: the address MSIs are written to
+	const uint32* reg = (const uint32*)fdt_getprop(tree, mip, "reg", &length);
+	if (reg == NULL || length < 8 * 4)
+		return;
+	uint64 mipRegs = (uint64)fdt32_to_cpu(reg[0]) << 32 | fdt32_to_cpu(reg[1]);
+	uint64 message = (uint64)fdt32_to_cpu(reg[4]) << 32 | fdt32_to_cpu(reg[5]);
+	uint32 count = vectors < RP1_IRQ_COUNT ? vectors : RP1_IRQ_COUNT;
+
+	// The controller has to pass the RP1's MSI writes on to the MIP: an
+	// inbound window (RC BAR) for the message address.
+	if (!add_inbound_window(message, mipRegs, 0x1c, "the MIP"))
+		return;
+
+	// The MIP: everything to the host, nothing to the VPU, edge triggered.
+	volatile uint32* mipRegisters = (volatile uint32*)mipRegs;
+	mipRegisters[MIP_INT_MASKL_HOST / 4] = 0;
+	mipRegisters[MIP_INT_MASKH_HOST / 4] = 0;
+	mipRegisters[MIP_INT_MASKL_VPU / 4] = ~0u;
+	mipRegisters[MIP_INT_MASKH_VPU / 4] = ~0u;
+	mipRegisters[MIP_INT_CFGL_HOST / 4] = ~0u;
+	mipRegisters[MIP_INT_CFGH_HOST / 4] = ~0u;
+
+	// memory space and bus mastering (MSIs are memory writes)
+	rp1_config_write(0x04, rp1_config_read(0x04) | 0x6);
+
+	// the MSI-X capability
+	uint32 capability = rp1_config_read(0x34) & 0xfc;
+	while (capability != 0 && (rp1_config_read(capability) & 0xff) != 0x11)
+		capability = (rp1_config_read(capability) >> 8) & 0xfc;
+	if (capability == 0) {
+		dprintf("RP1: no MSI-X capability\n");
+		return;
+	}
+	uint32 control = rp1_config_read(capability) >> 16;
+	uint32 tableInfo = rp1_config_read(capability + 4);
+	uint32 tableBar = tableInfo & 0x7;
+	uint32 barLow = rp1_config_read(0x10 + tableBar * 4);
+	uint64 barAddress = barLow & ~(uint64)0xf;
+	if ((barLow & 0x6) == 0x4)
+		barAddress |= (uint64)rp1_config_read(0x14 + tableBar * 4) << 32;
+	uint64 table = pci_to_cpu(sRP1Controller, barAddress);
+	if (table == 0) {
+		dprintf("RP1: MSI-X table BAR %" B_PRIu32 " not mapped\n", tableBar);
+		return;
+	}
+	table += tableInfo & ~(uint32)0x7;
+	if ((control & 0x7ff) + 1 < count)
+		count = (control & 0x7ff) + 1;
+
+	volatile uint32* entries = (volatile uint32*)table;
+	for (uint32 i = 0; i < count; i++) {
+		entries[i * 4 + 0] = (uint32)message;
+		entries[i * 4 + 1] = (uint32)(message >> 32);
+		entries[i * 4 + 2] = i;
+		entries[i * 4 + 3] = 0;	// unmasked
+	}
+	// MSI-X on, the function's mask off
+	rp1_config_write(capability, (rp1_config_read(capability)
+		| (1u << 31)) & ~(1u << 30));
+
+	// The RP1's devices: GIC SPIs instead of the RP1's numbers.
+	int rp1 = -1;
+	int pcie = fdt_node_offset_by_compatible(tree, -1, "brcm,bcm2712-pcie");
+	while (pcie >= 0 && rp1 < 0) {
+		rp1 = fdt_subnode_offset(tree, pcie, "rp1");
+		if (rp1 < 0) {
+			pcie = fdt_node_offset_by_compatible(tree, pcie,
+				"brcm,bcm2712-pcie");
+		}
+	}
+	if (rp1 < 0)
+		return;
+
+	volatile uint32* apbs = (volatile uint32*)(sRP1Base + RP1_PCIE_APBS);
+	uint32 converted = 0;
+	int node;
+	fdt_for_each_subnode(node, tree, rp1) {
+		const uint32* interrupts = (const uint32*)fdt_getprop(tree, node,
+			"interrupts", &length);
+		if (interrupts == NULL || length != 8)
+			continue;
+		uint32 irq = fdt32_to_cpu(interrupts[0]);
+		uint32 type = fdt32_to_cpu(interrupts[1]);
+		if (irq >= count)
+			continue;
+
+		bool level = (type & 0xc) != 0;
+		apbs[(RP1_REG_SET + RP1_MSIX_CFG(irq)) / 4] = RP1_MSIX_CFG_ENABLE
+			| (level ? RP1_MSIX_CFG_IACK_EN : 0);
+
+		fdt32_t cells[3] = {cpu_to_fdt32(0), cpu_to_fdt32(spiBase + irq),
+			cpu_to_fdt32(1)};
+		fdt_setprop(tree, node, "interrupts", cells, sizeof(cells));
+		fdt_setprop_u32(tree, node, "interrupt-parent", gicPhandle);
+		if (level) {
+			fdt_setprop_u64(tree, node, "airos,rp1-iack",
+				sRP1Base + RP1_PCIE_APBS + RP1_REG_SET + RP1_MSIX_CFG(irq));
+		}
+		converted++;
+	}
+	dprintf("RP1: %" B_PRIu32 " MSI-X vectors to SPI %" B_PRIu32 "+, %"
+		B_PRIu32 " devices\n", count, spiBase, converted);
+}
+
+
+/*!	DMA from the RP1's devices (USB, Ethernet) reaches memory at the CPU's
+	physical addresses. The firmware maps PCI address 0 to memory 0; Linux,
+	whose device tree this is, maps PCI 0x10_0000_0000 there, which the RP1
+	may emit for its devices' low addresses. Both are there then, and the
+	kernel's tree says the identity ("dma-ranges" empty), which the drivers
+	that only know physical addresses rely on.
+*/
+static void
+setup_rp1_dma(void* tree)
+{
+	if (sRP1Controller == 0)
+		return;
+	// 64 GB (size code 21)
+	if (!add_inbound_window(0, 0, 21, "memory at PCI 0")
+		|| !add_inbound_window(0x1000000000ull, 0, 21,
+			"memory at PCI 0x10_0000_0000")) {
+		return;
+	}
+
+	int pcie = -1;
+	while ((pcie = fdt_node_offset_by_compatible(tree, pcie,
+			"brcm,bcm2712-pcie")) >= 0) {
+		int rp1 = fdt_subnode_offset(tree, pcie, "rp1");
+		if (rp1 < 0)
+			continue;
+		fdt_setprop(tree, rp1, "dma-ranges", NULL, 0);
+		fdt_setprop(tree, pcie, "dma-ranges", NULL, 0);
+	}
+}
+
+
+/*!	Takes the Ethernet PHY out of reset: its reset line is an RP1 GPIO
+	("phy-reset-gpios", ETH_RST_N on GPIO 32, active low), which Linux pulses
+	when it probes the GEM and the firmware leaves asserted. The RP1's GPIO
+	block (Linux: pinctrl-rp1.c) has three register areas, the pins' control
+	("io"), the outputs ("rio", with set/clear aliases) and the pads, in
+	three banks: GPIO 0-27, 28-33 and 34-53.
+*/
+static void
+release_rp1_phy()
+{
+	int ethernet = fdt_node_offset_by_compatible(gFDT, -1,
+		"raspberrypi,rp1-gem");
+	int length;
+	const uint32* gpios = ethernet >= 0 ? (const uint32*)fdt_getprop(gFDT,
+		ethernet, "phy-reset-gpios", &length) : NULL;
+	if (gpios == NULL || length != 12)
+		return;
+	int controller = fdt_node_offset_by_phandle(gFDT, fdt32_to_cpu(gpios[0]));
+	uint32 pin = fdt32_to_cpu(gpios[1]);
+	bool activeLow = (fdt32_to_cpu(gpios[2]) & 1) != 0;
+	addr_range io, rio, pads;
+	if (controller < 0
+		|| fdt_node_check_compatible(gFDT, controller, "raspberrypi,rp1-gpio")
+			!= 0
+		|| !fdt_get_reg(controller, 0, io) || !fdt_get_reg(controller, 1, rio)
+		|| !fdt_get_reg(controller, 2, pads) || pin >= 54) {
+		return;
+	}
+
+	static const uint32 kBankFirst[3] = {0, 28, 34};
+	uint32 bank = pin >= 34 ? 2 : pin >= 28 ? 1 : 0;
+	uint32 index = pin - kBankFirst[bank];
+	uint64 control = io.start + bank * 0x4000 + index * 8 + 4;
+	uint64 outputs = rio.start + bank * 0x4000;
+	uint64 pad = pads.start + bank * 0x4000 + 4 + index * 4;
+
+	volatile uint32* outSet = (volatile uint32*)(outputs + 0x2000);
+	volatile uint32* outClear = (volatile uint32*)(outputs + 0x3000);
+	volatile uint32* enableSet = (volatile uint32*)(outputs + 0x2000 + 4);
+	uint32 bit = 1u << index;
+
+	// asserted: low for an active low line
+	if (activeLow)
+		*outClear = bit;
+	else
+		*outSet = bit;
+	*enableSet = bit;
+	// the pad: input on, output not disabled
+	*(volatile uint32*)pad = (*(volatile uint32*)pad & ~(1u << 7)) | (1u << 6);
+	// the pin's function: the output registers (SYS_RIO)
+	*(volatile uint32*)control = (*(volatile uint32*)control & ~0x1fu) | 5;
+	spin(10000);
+
+	if (activeLow)
+		*outSet = bit;
+	else
+		*outClear = bit;
+	spin(20000);
+	dprintf("RP1: Ethernet PHY out of reset (GPIO %" B_PRIu32 ")\n", pin);
+}
+
+
+static phys_addr_t sWatchdog = 0;
+
+
+void
+fdt_set_watchdog(phys_addr_t base)
+{
+	sWatchdog = base;
 }
 
 
@@ -410,7 +989,7 @@ fdt_set_kernel_args()
 {
 	// The kernel gets a copy with room for what is added below; libfdt wants
 	// the tree 8-byte aligned.
-	uint32 size = fdt_totalsize(gFDT) + 1024;
+	uint32 size = fdt_totalsize(gFDT) + 16384;
 	void* copy = kernel_args_malloc(size, 8);
 	if (copy == NULL || fdt_open_into(gFDT, copy, size) != 0)
 		panic("No memory for the device tree");
@@ -426,6 +1005,23 @@ fdt_set_kernel_args()
 		dprintf("EMMC2 clock: %" B_PRIu32 " Hz\n", rate);
 	}
 
+	// The Pi 5's SD controller runs from a fixed clock that the kernel's
+	// device tree bus cannot follow by its phandle.
+	node = -1;
+	while ((node = fdt_node_offset_by_compatible(copy, node,
+			"brcm,bcm2712-sdhci")) >= 0) {
+		const uint32* clocks = (const uint32*)fdt_getprop(copy, node, "clocks",
+			NULL);
+		int clock = clocks != NULL
+			? fdt_node_offset_by_phandle(copy, fdt32_to_cpu(*clocks)) : -1;
+		const uint32* frequency = clock >= 0 ? (const uint32*)fdt_getprop(copy,
+			clock, "clock-frequency", NULL) : NULL;
+		if (frequency != NULL) {
+			fdt_setprop_u32(copy, node, "clock-frequency",
+				fdt32_to_cpu(*frequency));
+		}
+	}
+
 	// The firmware's tree has no operating points for the cores either; the
 	// kernel reports a core's "clock-frequency" as its maximum speed.
 	int cpus = fdt_path_offset(copy, "/cpus");
@@ -439,6 +1035,16 @@ fdt_set_kernel_args()
 		}
 		dprintf("ARM clock: up to %" B_PRIu32 " Hz\n", rate);
 	}
+
+	if (gBCM2712) {
+		setup_rp1_interrupts(copy);
+		setup_rp1_dma(copy);
+		release_rp1_phy();
+	}
+
+	int chosen = fdt_path_offset(copy, "/chosen");
+	if (sWatchdog != 0 && chosen >= 0)
+		fdt_setprop_u64(copy, chosen, "airos,watchdog", sWatchdog);
 
 	const uart_info& uart = gKernelArgs.arch_args.uart;
 	dprintf("UART: %s at %#" B_PRIx64 ", irq %" B_PRIu32 "\n",

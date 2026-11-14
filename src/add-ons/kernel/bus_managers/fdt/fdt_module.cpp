@@ -445,6 +445,7 @@ fdt_read_cells(const uint32*& cells, uint32 count)
 	uint64 value = 0;
 	for (uint32 i = 0; i < count; i++)
 		value = (value << 32) | fdt32_to_cpu(*cells++);
+		// a PCI address (three cells) loses its space flags this way
 	return value;
 }
 
@@ -454,6 +455,9 @@ fdt_read_cells(const uint32*& cells, uint32 count)
 	bus above it. An empty "ranges" is the identity. A bus without the
 	property has an address space of its own (I2C and the like), and the
 	address is returned as it is.
+	A PCI bus' three-cell addresses count by their 64-bit address alone: the
+	Raspberry Pi 5's RP1 is a device tree bus behind a PCIe controller, its
+	"ranges" lead to PCI memory addresses, the controller's to CPU ones.
 */
 static uint64
 fdt_translate_address(int bus, uint64 address)
@@ -485,8 +489,7 @@ fdt_translate_address(int bus, uint64 address)
 			if (cells != NULL)
 				parentCells = fdt32_to_cpu(*cells);
 
-			// PCI-style three-cell child addresses are not plain addresses.
-			if (childCells > 2 || parentCells > 2 || sizeCells > 2)
+			if (childCells > 3 || parentCells > 3 || sizeCells > 2)
 				break;
 
 			const uint32* end = ranges + length / 4;

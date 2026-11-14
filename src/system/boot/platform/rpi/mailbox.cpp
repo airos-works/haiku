@@ -40,8 +40,9 @@
 #define TAG_SET_PIXEL_ORDER		0x00048006
 #define TAG_SET_VIRTUAL_OFFSET	0x00048009
 
-// The VideoCore sees the ARM's first gigabyte at this bus address.
-#define VC_BUS_OFFSET			0xc0000000
+// The BCM2711's VideoCore sees the ARM's first gigabyte at this bus address.
+// The BCM2712's (Pi 5) uses the ARM's physical addresses.
+#define BCM2711_VC_BUS_OFFSET	0xc0000000
 
 #define MAILBOX_TIMEOUT			1000000
 
@@ -99,7 +100,8 @@ send_message()
 	sMessage[sMessageLength++] = 0;
 	sMessage[0] = sMessageLength * 4;
 
-	uint32 address = (uint32)(addr_t)sMessage | VC_BUS_OFFSET;
+	uint32 address = (uint32)(addr_t)sMessage
+		| (gBCM2712 ? 0 : BCM2711_VC_BUS_OFFSET);
 
 	mmu_flush_data_cache(sMessage, sizeof(sMessage));
 
@@ -197,11 +199,21 @@ mailbox_allocate_frame_buffer(uint32 width, uint32 height,
 	if (status != B_OK)
 		return status;
 
+	// The Pi 5's firmware hands out the buffer it set up itself, at its own
+	// depth ("framebuffer_depth" in config.txt), and may say 32 regardless:
+	// the pitch tells.
 	if (sMessage[buffer] == 0 || sMessage[buffer + 1] == 0
-		|| sMessage[depthIndex] != 32) {
+		|| sMessage[depthIndex] != 32
+		|| sMessage[pitch] < sMessage[physical] * 4) {
+		dprintf("video: firmware frame buffer %" B_PRIu32 "x%" B_PRIu32
+			", depth %" B_PRIu32 ", %" B_PRIu32 " bytes per row: not 32 bits "
+			"per pixel\n", sMessage[physical], sMessage[physical + 1],
+			sMessage[depthIndex], sMessage[pitch]);
 		return B_ERROR;
 	}
 
+	// A bus address: the Pi 4's VideoCore puts its alias bits on top. The
+	// Pi 5's buffer is just below 1 GB too (the gap in the memory map).
 	_buffer.base = sMessage[buffer] & 0x3fffffff;
 	_buffer.size = sMessage[buffer + 1];
 	_buffer.width = sMessage[physical];
