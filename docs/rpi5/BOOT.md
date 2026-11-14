@@ -80,6 +80,9 @@ through PSCI after 15 s.
   reads it (during the first seconds of a start): that wedged the EEPROM
   twice until a power cycle. `update-boot` rewrites only the boot partition,
   so a system running from the same disk's BFS keeps its volume.
+- After `lab.sh lun` had to unbind the gadget, the KVM's keyboard can stay
+  dead in air/OS while the mouse works: `POST /api/hid/reset` on the KVM
+  brings it back.
 - A running air/OS restarts from the kernel debugger over serial: send
   `+++` (one character a second), then `reboot`.
 - With the lab's 3 A supply the EEPROM refuses USB boot unless that disk's
