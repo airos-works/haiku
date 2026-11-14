@@ -10,8 +10,10 @@
 #include <OS.h>
 
 
-/*	The HEVC decoder block of the BCM2711 (Raspberry Pi 4), for the program
-	that parses the stream: /dev/misc/rpi_hevc.
+/*	The HEVC decoder block of the BCM2711 (Raspberry Pi 4) and the BCM2712
+	(Raspberry Pi 5), for the program that parses the stream:
+	/dev/misc/rpi_hevc. The two blocks are programmed alike; nothing here
+	differs between them.
 
 	The block decodes a picture in two phases. The first reads the slice
 	data (CABAC) as a list of register writes tells it to, and leaves
@@ -42,7 +44,8 @@ struct rpi_hevc_allocate {
 	uint64	size;			// in: bytes; out: rounded up to pages
 	uint32	buffer;			// out: its number
 	area_id	area;			// out: to clone
-	uint64	physical;		// out: where the decoder finds it
+	uint64	physical;		// out: where the decoder finds it (the
+							// physical address on both SoCs)
 };
 
 // one write to a register of phase one

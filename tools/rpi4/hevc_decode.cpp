@@ -4,7 +4,8 @@
  */
 
 // rpi4_hevc_decode <file.hevc> [output | -]
-// Decodes an HEVC Annex B byte stream on the Raspberry Pi 4's decoder block
+// Decodes an HEVC Annex B byte stream on the Raspberry Pi 4's or 5's decoder
+// block
 // and writes the pictures (the visible part; eight bit as I420, ten bit as
 // P010) to the output file or, with "-", to the standard output, to compare
 // with another decoder's:

@@ -3,14 +3,26 @@
  * Distributed under the terms of the MIT License.
  */
 
-/*	/dev/misc/rpi_hevc: the HEVC decoder block of the BCM2711 for the
-	program that parses the stream (the rpi_hevc media add-on); see
-	<rpi_hevc.h>. On another board no device is found and every open fails.
+/*	/dev/misc/rpi_hevc: the HEVC decoder block of the BCM2711 (Pi 4) and
+	the BCM2712 (Pi 5) for the program that parses the stream (the rpi_hevc
+	media add-on); see <rpi_hevc.h>. On another board no device is found
+	and every open fails.
 
-	What the block's registers mean was taken from the Linux driver of
-	Raspberry Pi (Trading) Ltd, drivers/staging/media/rpivid. */
+	What the block's registers mean was taken from the Linux drivers of
+	Raspberry Pi Ltd: drivers/staging/media/rpivid (Pi 4) and
+	drivers/media/platform/raspberrypi/hevc_dec (Pi 5). Both program the
+	two phases with the same registers, the same interrupt control and the
+	same firmware clock; the Pi 5's block differs in where it is:
+	- its registers and interrupt control are above 64 GB
+	  (/axi/codec@800000), and it sees the ARM's physical addresses 1:1,
+	  as the Pi 4's does;
+	- it sits behind one of the BCM2712's IOMMUs ("iommus"), which it
+	  shares with the camera's ISP back end. Linux turns that IOMMU on;
+	  nothing here does, and the block is only used with it off (all
+	  addresses pass unchanged). */
 
 
+#include <ByteOrder.h>
 #include <Drivers.h>
 #include <KernelExport.h>
 
@@ -42,6 +54,7 @@
 
 // phase one
 #define REG_STATUS				56
+#define REG_VERSION				60
 #define REG_PU_WRITE_BASE		80
 #define REG_PU_WRITE_STRIDE		84
 #define REG_COEFF_WRITE_BASE	88
@@ -79,6 +92,11 @@
 #define INT_ALL			(INT_ACTIVE1 | INT_ACTIVE2 | INT_H264 | INT_VP9)
 #define INT_WRITE_ZERO			((0xff << 12) | (1 << 11))
 
+// the BCM2712's IOMMU in front of the block (Linux: bcm2712-iommu.c)
+#define IOMMU_CTRL				0x00
+#define IOMMU_CTRL_ENABLE		(1 << 0)
+#define IOMMU_DEBUG_INFO		0x38
+
 
 struct hevc_buffer {
 	area_id		area;
@@ -108,6 +126,9 @@ static area_id sInterruptArea = -1;
 static volatile uint32* sInterruptControl;
 static uint32 sInterrupt;
 static bool sInterruptInstalled;
+static area_id sIommuArea = -1;
+static volatile uint32* sIommu;
+static bool sPoweredBefore;
 
 static mutex sPhase1Lock = MUTEX_INITIALIZER("rpi_hevc phase 1");
 static mutex sPhase2Lock = MUTEX_INITIALIZER("rpi_hevc phase 2");
@@ -429,16 +450,72 @@ phase2(hevc_client* client, const rpi_hevc_phase2& request)
 //	#pragma mark - device
 
 
+/*!	The index of the "reg" entry that "reg-names" calls \a name, or
+	\a fallback without "reg-names".
+*/
+static uint32
+reg_index(fdt_device_module_info* fdt, fdt_device* device, const char* name,
+	uint32 fallback)
+{
+	int length;
+	const char* names = (const char*)fdt->get_prop(device, "reg-names",
+		&length);
+	if (names == NULL || length <= 0)
+		return fallback;
+
+	const char* end = names + length;
+	for (uint32 index = 0; names < end; index++) {
+		if (strncmp(names, name, end - names) == 0)
+			return index;
+		names += strnlen(names, end - names) + 1;
+	}
+	return fallback;
+}
+
+
+/*!	The registers of the IOMMU that the decoder's "iommus" names, or 0. */
+static phys_addr_t
+find_iommu(fdt_device_module_info* fdt, fdt_device* device)
+{
+	int length;
+	const uint32* iommus = (const uint32*)fdt->get_prop(device, "iommus",
+		&length);
+	if (iommus == NULL || length < 4)
+		return 0;
+
+	fdt_bus_module_info* busModule;
+	fdt_bus* bus;
+	if (sDeviceManager->get_driver(fdt->get_bus(device),
+			(driver_module_info**)&busModule, (void**)&bus) != B_OK
+		|| bus == NULL) {
+		return 0;
+	}
+	device_node* node = busModule->node_by_phandle(bus,
+		B_BENDIAN_TO_HOST_INT32(iommus[0]));
+	fdt_device_module_info* iommuModule;
+	fdt_device* iommuDevice;
+	uint64 base, size;
+	if (node == NULL || sDeviceManager->get_driver(node,
+			(driver_module_info**)&iommuModule, (void**)&iommuDevice) != B_OK
+		|| iommuDevice == NULL
+		|| !iommuModule->get_reg(iommuDevice, 0, &base, &size)) {
+		return 0;
+	}
+	return base;
+}
+
+
 static status_t
 find_decoder(phys_addr_t* _registers, size_t* _size, phys_addr_t* _control,
-	uint32* _interrupt)
+	uint32* _interrupt, phys_addr_t* _iommu)
 {
 	device_node* root = sDeviceManager->get_root_node();
 	if (root == NULL)
 		return B_DEVICE_NOT_FOUND;
 
 	static const char* const kCompatible[] = {
-		"brcm,bcm2711-hevc-dec", "raspberrypi,hevc-dec"
+		"brcm,bcm2711-hevc-dec", "brcm,bcm2712-hevc-dec",
+		"raspberrypi,hevc-dec"
 	};
 
 	device_node* node = NULL;
@@ -461,13 +538,16 @@ find_decoder(phys_addr_t* _registers, size_t* _size, phys_addr_t* _control,
 		(driver_module_info**)&fdt, (void**)&device);
 	if (status == B_OK) {
 		uint64 base, size, control, controlSize, interrupt;
-		if (fdt->get_reg(device, 0, &base, &size)
-			&& fdt->get_reg(device, 1, &control, &controlSize)
+		if (fdt->get_reg(device, reg_index(fdt, device, "hevc", 0), &base,
+				&size)
+			&& fdt->get_reg(device, reg_index(fdt, device, "intc", 1),
+				&control, &controlSize)
 			&& fdt->get_interrupt(device, 0, NULL, &interrupt)) {
 			*_registers = base;
 			*_size = size;
 			*_control = control;
 			*_interrupt = interrupt;
+			*_iommu = find_iommu(fdt, device);
 		} else
 			status = B_BAD_DATA;
 	}
@@ -477,20 +557,53 @@ find_decoder(phys_addr_t* _registers, size_t* _size, phys_addr_t* _control,
 }
 
 
+/*!	Turns the IOMMU in front of the block off, if the firmware left it on:
+	the block is given physical addresses. Nothing else in this system uses
+	that IOMMU (the ISP back end has no driver).
+*/
+static void
+bypass_iommu()
+{
+	if (sIommu == NULL)
+		return;
+
+	uint32 control = sIommu[IOMMU_CTRL / 4];
+	if ((control & IOMMU_CTRL_ENABLE) == 0)
+		return;
+
+	ERROR("the IOMMU in front of the decoder is on (control %#" B_PRIx32
+		"), turning it off\n", control);
+	sIommu[IOMMU_CTRL / 4] = 0;
+	barrier();
+}
+
+
 static void
 power(bool on)
 {
+	uint32 maximum = 0;
 	if (on) {
-		uint32 rate = 0;
-		if (sFirmware->get_clock_rate(RPI_FIRMWARE_CLOCK_HEVC, true, &rate)
-				== B_OK && rate != 0) {
-			sFirmware->set_clock_rate(RPI_FIRMWARE_CLOCK_HEVC, rate);
+		bypass_iommu();
+		if (sFirmware->get_clock_rate(RPI_FIRMWARE_CLOCK_HEVC, true, &maximum)
+				== B_OK && maximum != 0) {
+			sFirmware->set_clock_rate(RPI_FIRMWARE_CLOCK_HEVC, maximum);
 		}
 	}
 	status_t status = sFirmware->set_clock_state(RPI_FIRMWARE_CLOCK_HEVC, on);
 	if (status != B_OK)
 		ERROR("turning the clock %s: %s\n", on ? "on" : "off",
 			strerror(status));
+
+	if (on && !sPoweredBefore) {
+		// once, for the record: what the firmware made of it, and the
+		// block's own version register (it answers with its clock on)
+		sPoweredBefore = true;
+		uint32 rate = 0;
+		sFirmware->get_clock_rate(RPI_FIRMWARE_CLOCK_HEVC, false, &rate);
+		dprintf("rpi_hevc: clock %" B_PRIu32 " Hz (maximum %" B_PRIu32
+			"), version %#" B_PRIx32 "\n", rate, maximum,
+			read_reg(REG_VERSION));
+	}
 }
 
 
@@ -674,9 +787,9 @@ init_driver()
 	if (status != B_OK)
 		return status;
 
-	phys_addr_t registers, control;
+	phys_addr_t registers, control, iommu;
 	size_t size;
-	status = find_decoder(&registers, &size, &control, &sInterrupt);
+	status = find_decoder(&registers, &size, &control, &sInterrupt, &iommu);
 	if (status != B_OK) {
 		// another board: the device is there and cannot be opened
 		return B_OK;
@@ -708,6 +821,23 @@ init_driver()
 		return B_OK;
 	}
 
+	if (iommu != 0) {
+		void* iommuAddress;
+		sIommuArea = map_physical_memory("rpi_hevc iommu",
+			iommu & ~(phys_addr_t)(B_PAGE_SIZE - 1), B_PAGE_SIZE,
+			B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
+			&iommuAddress);
+		if (sIommuArea < 0) {
+			ERROR("cannot map the IOMMU at %#" B_PRIxPHYSADDR "\n", iommu);
+			return B_OK;
+		}
+		sIommu = (volatile uint32*)((uint8*)iommuAddress
+			+ (iommu & (B_PAGE_SIZE - 1)));
+		dprintf("rpi_hevc: IOMMU at %#" B_PRIxPHYSADDR ", control %#"
+			B_PRIx32 ", debug info %#" B_PRIx32 "\n", iommu,
+			sIommu[IOMMU_CTRL / 4], sIommu[IOMMU_DEBUG_INFO / 4]);
+	}
+
 	status = install_io_interrupt_handler(sInterrupt, hevc_interrupt, NULL,
 		0);
 	if (status != B_OK) {
@@ -735,6 +865,10 @@ uninit_driver()
 	if (sInterruptArea >= 0)
 		delete_area(sInterruptArea);
 	sRegistersArea = sInterruptArea = -1;
+	sIommu = NULL;
+	if (sIommuArea >= 0)
+		delete_area(sIommuArea);
+	sIommuArea = -1;
 	if (sPhase1Sem >= 0)
 		delete_sem(sPhase1Sem);
 	if (sPhase2Sem >= 0)

@@ -28,6 +28,17 @@ Not done yet:
 - Wi-Fi and Bluetooth: the CYW43455 is on the BCM2712's second SDHCI
   (non-removable) and a UART; `broadcomfmac` and `h4bcm` only know the
   Pi 4's controllers.
-- Sound (HDMI audio), the HEVC decoder, the fan (RP1 PWM), the RTC, the
+- HEVC decoder: written, not yet run on the board (branch `rpi5-hevc`).
+  The BCM2712's block (`/axi/codec@800000`) is the Pi 4's: the same
+  registers, interrupt control, firmware clock (11) and picture format
+  (Linux's `hevc_dec` programs it as `rpivid` does; its two-buffer
+  `NV12MT_COL128` is only other strides). `rpi_hevc` finds it by
+  `brcm,bcm2712-hevc-dec`, maps it above 64 GB, and turns its IOMMU
+  (`/axi/iommu@5100`, Linux's only) off if the firmware left it on;
+  `rpi_firmware` now knows the BCM2712's mailbox (`0x107c013880`,
+  physical addresses, no `0xc0000000` alias), so `rpi_thermal` and
+  `/dev/misc/rpi_property` answer on the Pi 5 too. The add-on and
+  `rpi4_hevc_decode` need no change. Test: docs/rpi4/MEDIA.md, "HEVC".
+- Sound (HDMI audio), the fan (RP1 PWM), the RTC, the
   power button, the PCIe x1 connector (NVMe), USB 3 speeds, CPU frequency
   scaling.
