@@ -4,7 +4,7 @@ UsePrivateKernelHeaders ;
 UsePrivateHeaders drivers ;
 UseLibraryHeaders [ FDirName libfdt ] ;
 
-# the root node's compatible tells whether this is a BCM2711
+# the root node's compatible tells whether this is a BCM2711 or a BCM2712
 local libFDTSources =
 	fdt.c
 	fdt_ro.c

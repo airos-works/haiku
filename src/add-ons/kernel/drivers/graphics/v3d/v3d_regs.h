@@ -6,7 +6,10 @@
 #define V3D_REGS_H
 
 
-// Broadcom V3D 4.x (BCM2711). Two register blocks: the hub and core 0.
+// Broadcom V3D 4.2 (BCM2711) and 7.1 (BCM2712). Two register blocks, the hub
+// and core 0, plus on 7.1 the system management state block ("sms"). Where
+// 7.1 moved a register or a bit, the 4.2 name stays and a V3D71_ one is
+// added (Linux: drivers/gpu/drm/v3d/v3d_regs.h, the "ver >= 71" cases).
 
 // hub
 #define V3D_HUB_AXICFG				0x0000
@@ -74,10 +77,15 @@
 #define V3D_MMU_VIO_ADDR			0x1234
 #define V3D_MMU_DEBUG_INFO			0x1238
 
+#define  V3D_MMU_DEBUG_PA_WIDTH(x)	(((x) >> 8) & 0xf)	// + 30 bits
+#define  V3D_MMU_DEBUG_VA_WIDTH(x)	(((x) >> 4) & 0xf)	// + 30 bits
+
 #define V3D_HUB_INT_TFUC			(1 << 1)
 #define V3D_HUB_INT_MMU_CAP			(1 << 3)
 #define V3D_HUB_INT_MMU_PTI			(1 << 4)
 #define V3D_HUB_INT_MMU_WRV			(1 << 5)
+#define V3D71_HUB_INT_GMPV			(1 << 6)
+	// 4.2 reports a memory protection violation in the core instead
 
 #define V3D_PTE_VALID				(1 << 28)
 #define V3D_PTE_WRITEABLE			(1 << 29)
@@ -94,8 +102,9 @@
 #define V3D_INT_FRDONE				(1 << 0)
 #define V3D_INT_FLDONE				(1 << 1)
 #define V3D_INT_OUTOMEM				(1 << 2)
-#define V3D_INT_GMPV				(1 << 5)
+#define V3D_INT_GMPV				(1 << 5)	// 4.2; on 7.1 the counters'
 #define V3D_INT_CSDDONE				(1 << 7)
+#define V3D71_INT_CSDDONE			(1 << 6)
 #define V3D_CLE_CT0CS				0x0100
 #define V3D_CLE_CT1CS				0x0104
 #define V3D_CLE_CT0CA				0x0110
@@ -110,13 +119,57 @@
 #define V3D_CLE_CT0QMS				0x0174
 #define V3D_PTB_BPOA				0x0308
 #define V3D_PTB_BPOS				0x030c
+#define V3D_GMP_STATUS				0x0800
+#define V3D71_GMP_STATUS			0x0600
 #define V3D_CSD_STATUS				0x0900
 #define V3D_CSD_QUEUED_CFG0			0x0904
+#define V3D71_CSD_QUEUED_CFG0		0x0930
+#define V3D71_CSD_QUEUED_CFG7		0x094c	// 7.1 only; Linux keeps it 0
 #define V3D_ERR_STAT				0x0f20
 
-// power management block ("pm") and its bridge control ("rpivid_asb")
+// hub: the 7.1 texture formatting unit, at 0x700 and with an output
+// configuration register before the output address
+#define V3D71_TFU_CS				0x0700
+#define V3D71_TFU_ICFG				0x0708
+#define V3D71_TFU_IIA				0x070c
+#define V3D71_TFU_ICA				0x0710
+#define V3D71_TFU_IIS				0x0714
+#define V3D71_TFU_IUA				0x0718
+#define V3D71_TFU_IOC				0x071c
+#define V3D71_TFU_IOA				0x0720
+#define V3D71_TFU_IOS				0x0724
+#define V3D71_TFU_COEF0				0x0728
+#define V3D71_TFU_COEF1				0x072c
+#define V3D71_TFU_COEF2				0x0730
+#define V3D71_TFU_COEF3				0x0734
+
+// 7.1: system management state ("sms" in the device tree)
+#define V3D_SMS_REE_CS				0x0000
+#define V3D_SMS_TEE_CS				0x0400
+#define  V3D_SMS_POWER_OFF			(1 << 30)
+#define  V3D_SMS_CLEAR_POWER_OFF	(1 << 29)
+#define  V3D_SMS_STATE(x)			((x) & 0xf)
+#define  V3D_SMS_STATE_IDLE			0x0
+#define  V3D_SMS_STATE_RESET		0x4		// what REE_CS asks for
+#define  V3D_SMS_ISOLATING_FOR_RESET	0xa
+#define  V3D_SMS_RESETTING			0xb
+#define  V3D_SMS_ISOLATING_FOR_POWER_OFF	0xc
+#define  V3D_SMS_POWER_OFF_STATE	0xd
+
+// power management block ("pm") and its bridge control ("rpivid_asb"; the
+// BCM2712 has no bridges to control, and its V3D reset is in PM_GRAFX_2712)
 #define PM_GRAFX					0x10c
+#define PM_GRAFX_2712				0x304
+#define  PM_POWUP					(1 << 0)
+#define  PM_POWOK					(1 << 1)
+#define  PM_ISPOW					(1 << 2)
+#define  PM_MEMREP					(1 << 3)
+#define  PM_MRDONE					(1 << 4)
+#define  PM_ISFUNC					(1 << 5)
 #define  PM_V3DRSTN					(1 << 6)
+#define  PM_INRUSH_SHIFT			13
+#define  PM_INRUSH_MASK				(3 << PM_INRUSH_SHIFT)
+#define  PM_INRUSH_20_MA			3
 #define PM_PASSWORD					0x5a000000
 #define ASB_V3D_S_CTRL				0x08
 #define ASB_V3D_M_CTRL				0x0c

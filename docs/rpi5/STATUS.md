@@ -20,8 +20,9 @@ Pi 4 and a Pi 5. How it boots: BOOT.md.
 
 Not done yet:
 
-- GPU: the V3D 7.1 (`brcm,2712-v3d`) has no driver; the Pi 4's v3d
-  driver and Mesa build are V3D 4.2.
+- GPU: the v3d driver knows the V3D 7.1 (`brcm,2712-v3d`) since branch
+  `rpi5-gpu` (see ../rpi4/GPU.md, "Raspberry Pi 5"); not yet run on the
+  board. Mesa's build already contains the 7.1 code.
 - Display driver: no HVS/HDMI driver (Pi 4: `rpi_display` with firmware
   planes); no mode setting, one screen, no second HDMI port.
 - Wi-Fi and Bluetooth: the CYW43455 is on the BCM2712's second SDHCI
