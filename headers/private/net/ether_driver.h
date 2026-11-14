@@ -30,7 +30,16 @@ enum {
 	ETHER_RECEIVE_NET_BUFFER,				/* receive a net_buffer */
 	ETHER_GET_OFFLOAD,
 		/* what the device computes for the stack (uint32 *, ETHER_OFFLOAD_*) */
+	ETHER_RECEIVE_NET_BUFFERS,
+		/* receive several net_buffers at once (ether_receive_batch *) */
 };
+
+/* ETHER_RECEIVE_NET_BUFFERS: waits for one frame like ETHER_RECEIVE_NET_BUFFER,
+   then also returns the frames that are already there, up to count */
+typedef struct ether_receive_batch {
+	struct net_buffer**	buffers;
+	uint32				count;	/* in: room in buffers, out: returned */
+} ether_receive_batch;
 
 /* ETHER_GET_OFFLOAD */
 #define ETHER_OFFLOAD_TX_CHECKSUM_IPV4	0x01

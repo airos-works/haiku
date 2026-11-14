@@ -120,6 +120,28 @@ compat_free(void *cookie)
 }
 
 
+static net_buffer *
+mbuf_to_net_buffer(struct mbuf *mb)
+{
+	net_buffer *buffer = gBufferModule->create(0);
+	if (buffer == NULL)
+		return NULL;
+
+	for (struct mbuf *m = mb; m != NULL; m = m->m_next) {
+		if (gBufferModule->append(buffer, mtod(m, void *), m->m_len) != B_OK) {
+			gBufferModule->free(buffer);
+			return NULL;
+		}
+	}
+
+	if ((mb->m_pkthdr.csum_flags & CSUM_L3_VALID) != 0)
+		buffer->buffer_flags |= NET_BUFFER_L3_CHECKSUM_VALID;
+	if ((mb->m_pkthdr.csum_flags & CSUM_L4_VALID) != 0)
+		buffer->buffer_flags |= NET_BUFFER_L4_CHECKSUM_VALID;
+	return buffer;
+}
+
+
 static status_t
 compat_receive(void *cookie, net_buffer **_buffer)
 {
@@ -147,31 +169,81 @@ compat_receive(void *cookie, net_buffer **_buffer)
 		IF_DEQUEUE(&ifp->receive_queue, mb);
 	} while (mb == NULL);
 
-	net_buffer *buffer = gBufferModule->create(0);
-	if (buffer == NULL) {
-		m_freem(mb);
+	net_buffer *buffer = mbuf_to_net_buffer(mb);
+	m_freem(mb);
+	if (buffer == NULL)
 		return B_NO_MEMORY;
-	}
-
-	for (struct mbuf *m = mb; m != NULL; m = m->m_next) {
-		status = gBufferModule->append(buffer, mtod(m, void *), m->m_len);
-		if (status != B_OK)
-			break;
-	}
-	if (status != B_OK) {
-		gBufferModule->free(buffer);
-		m_freem(mb);
-		return status;
-	}
-
-	if ((mb->m_pkthdr.csum_flags & CSUM_L3_VALID) != 0)
-		buffer->buffer_flags |= NET_BUFFER_L3_CHECKSUM_VALID;
-	if ((mb->m_pkthdr.csum_flags & CSUM_L4_VALID) != 0)
-		buffer->buffer_flags |= NET_BUFFER_L4_CHECKSUM_VALID;
 
 	*_buffer = buffer;
-	m_freem(mb);
 	return B_OK;
+}
+
+
+/*!	Like compat_receive(), but after the first frame also takes the frames
+	that are already queued, up to \a batch->count, with one semaphore and
+	one queue lock round for all of them (airos-works/haiku#123).
+*/
+static status_t
+compat_receive_batch(void *cookie, ether_receive_batch *batch)
+{
+	struct ifnet *ifp = cookie;
+	uint32 semFlags = B_CAN_INTERRUPT;
+	uint32 room = batch->count;
+	struct mbuf *chain[64];
+	int32 count = 0;
+
+	batch->count = 0;
+	if (room == 0)
+		return B_BAD_VALUE;
+	if (room > B_COUNT_OF(chain))
+		room = B_COUNT_OF(chain);
+
+	if ((ifp->flags & DEVICE_CLOSED) != 0)
+		return B_INTERRUPTED;
+	if (ifp->flags & DEVICE_NON_BLOCK)
+		semFlags |= B_RELATIVE_TIMEOUT;
+
+	do {
+		status_t status = acquire_sem_etc(ifp->receive_sem, 1, semFlags, 0);
+		if ((ifp->flags & DEVICE_CLOSED) != 0)
+			return B_INTERRUPTED;
+		if (status != B_OK)
+			return status;
+
+		// the frames queued meanwhile, without waiting
+		int32 units = 1, available = 0;
+		if (get_sem_count(ifp->receive_sem, &available) == B_OK
+			&& available > 0) {
+			int32 more = min_c(available, (int32)room - 1);
+			if (more > 0 && acquire_sem_etc(ifp->receive_sem, more,
+					B_RELATIVE_TIMEOUT, 0) == B_OK)
+				units += more;
+		}
+
+		IF_LOCK(&ifp->receive_queue);
+		while (count < units) {
+			struct mbuf *mb;
+			_IF_DEQUEUE(&ifp->receive_queue, mb);
+			if (mb == NULL)
+				break;
+			chain[count++] = mb;
+		}
+		IF_UNLOCK(&ifp->receive_queue);
+	} while (count == 0);
+
+	uint32 returned = 0;
+	for (int32 i = 0; i < count; i++) {
+		net_buffer *buffer = mbuf_to_net_buffer(chain[i]);
+		m_freem(chain[i]);
+		if (buffer == NULL) {
+			if_inc_counter(ifp, IFCOUNTER_IQDROPS, 1);
+			continue;
+		}
+		batch->buffers[returned++] = buffer;
+	}
+
+	batch->count = returned;
+	return returned > 0 ? B_OK : B_NO_MEMORY;
 }
 
 
@@ -438,6 +510,16 @@ compat_control(void *cookie, uint32 op, void *arg, size_t length)
 			if (!IS_KERNEL_ADDRESS(arg))
 				return B_BAD_ADDRESS;
 			return compat_receive(cookie, (net_buffer**)arg);
+
+		case ETHER_RECEIVE_NET_BUFFERS:
+		{
+			ether_receive_batch *batch = (ether_receive_batch *)arg;
+			if (arg == NULL || length < sizeof(ether_receive_batch))
+				return B_BAD_DATA;
+			if (!IS_KERNEL_ADDRESS(arg) || !IS_KERNEL_ADDRESS(batch->buffers))
+				return B_BAD_ADDRESS;
+			return compat_receive_batch(cookie, batch);
+		}
 
 		case SIOCGIFSTATS:
 		{

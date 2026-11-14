@@ -71,6 +71,12 @@ struct net_device_module_info {
 					const struct sockaddr* address);
 	status_t	(*remove_multicast)(net_device* device,
 					const struct sockaddr* address);
+
+	status_t	(*receive_data_batch)(net_device* device, net_buffer** buffers,
+					uint32 maxCount, uint32* _count);
+		// optional: waits for one buffer like receive_data(), then also
+		// returns those already there, up to maxCount; B_NOT_SUPPORTED
+		// (without waiting) when the device cannot
 };
 
 

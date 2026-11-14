@@ -34,7 +34,11 @@ struct ethernet_device : net_device, DoublyLinkedListLinkImpl<ethernet_device> {
 	int		fd;
 	uint32	frame_size;
 	bool	supports_net_buffer;
+	bool	supports_receive_batch;
 };
+
+
+status_t ethernet_receive_data(net_device *device, net_buffer **_buffer);
 
 static const bigtime_t kLinkCheckInterval = 1000000;
 	// 1 second
@@ -194,6 +198,11 @@ ethernet_up(net_device *_device)
 			device->supports_net_buffer = true;
 	}
 
+	// the same check for receiving several frames per call
+	device->supports_receive_batch = device->supports_net_buffer
+		&& ioctl(device->fd, ETHER_RECEIVE_NET_BUFFERS, NULL, 0) != 0
+		&& errno == B_BAD_DATA;
+
 	// what the driver can compute for us (only drivers passing net_buffers
 	// can see the request flags)
 	device->offload = 0;
@@ -344,6 +353,31 @@ ethernet_send_data(net_device *_device, net_buffer *buffer)
 	gBufferModule->free(original);
 	if (allocated)
 		gBufferModule->free(allocated);
+	return B_OK;
+}
+
+
+/*!	Several frames per call from drivers that pass net_buffers and know
+	ETHER_RECEIVE_NET_BUFFERS; B_NOT_SUPPORTED, at once, for all others.
+*/
+status_t
+ethernet_receive_data_batch(net_device *_device, net_buffer **buffers,
+	uint32 maxCount, uint32 *_count)
+{
+	ethernet_device *device = (ethernet_device *)_device;
+
+	if (device->fd == -1)
+		return B_FILE_ERROR;
+
+	if (!device->supports_receive_batch)
+		return B_NOT_SUPPORTED;
+
+	ether_receive_batch batch = { buffers, maxCount };
+	if (ioctl(device->fd, ETHER_RECEIVE_NET_BUFFERS, &batch, sizeof(batch))
+			!= 0)
+		return errno;
+
+	*_count = batch.count;
 	return B_OK;
 }
 
@@ -535,6 +569,7 @@ net_device_module_info sEthernetModule = {
 	ethernet_set_media,
 	ethernet_add_multicast,
 	ethernet_remove_multicast,
+	ethernet_receive_data_batch,
 };
 
 module_info *modules[] = {
