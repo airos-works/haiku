@@ -341,6 +341,7 @@ static const size_t kMaxAutoSendBufferSize = 4 * 1024 * 1024;
 
 
 static const int kTimestampFactor = 1000;
+static const uint32 kInitialSlowStartThreshold = 0x3fffffff;
 	// conversion factor between usec system time and msec tcp time
 
 static const uint32 kMinimumSendSegmentSize = 216;
@@ -595,6 +596,10 @@ TCPEndpoint::TCPEndpoint(net_socket* socket)
 	fCubicEstimate(0),
 	fCubicRemainder(0),
 	fCongestionWindowLimited(false),
+	fHystartRoundEnd(0),
+	fHystartLastMinimum(UINT32_MAX),
+	fHystartMinimum(UINT32_MAX),
+	fHystartSamples(0),
 	fState(CLOSED),
 	fFlags(FLAG_OPTION_WINDOW_SCALE | FLAG_OPTION_TIMESTAMP
 		| FLAG_OPTION_SACK_PERMITTED | FLAG_AUTO_RECEIVE_BUFFER_SIZE
@@ -2262,7 +2267,13 @@ TCPEndpoint::_PrepareReceivePath(tcp_segment_header& segment)
 		max_c(2 * fSendMaxSegmentSize, (uint32)14600));
 
 	fSendMaxSegments = fCongestionWindow / fSendMaxSegmentSize;
-	fSlowStartThreshold = (uint32)segment.advertised_window << fSendWindowShift;
+	// "Arbitrarily high" (RFC 5681 3.1): the first slow start ends at the
+	// first loss or when HyStart++ sees the round trip grow. The peer's
+	// first window (which a SYN carries unscaled) ended it at a few dozen
+	// segments against a receiver that sizes its buffer on the fly, and
+	// the rest took one segment per round trip (airos-works/haiku#125).
+	fSlowStartThreshold = kInitialSlowStartThreshold;
+	fHystartRoundEnd = fSendMax;
 }
 
 
@@ -3803,11 +3814,15 @@ TCPEndpoint::_Acknowledged(tcp_segment_header& segment)
 			fSendNext = fSendUnacknowledged;
 
 		if (fFlags & FLAG_OPTION_TIMESTAMP) {
-			_UpdateRoundTripTime(tcp_diff_timestamp(
-				segment.timestamp_reply - fTimestampOffset),
+			int32 roundTrip = tcp_diff_timestamp(
+				segment.timestamp_reply - fTimestampOffset);
+			_UpdateRoundTripTime(roundTrip,
 				expectedSamples > 0 ? expectedSamples : 1);
+			_HystartSample(roundTrip);
 		} else if (fSendTime != 0 && fRoundTripStartSequence < segment.acknowledge) {
-			_UpdateRoundTripTime(tcp_diff_timestamp(fSendTime), 1);
+			int32 roundTrip = tcp_diff_timestamp(fSendTime);
+			_UpdateRoundTripTime(roundTrip, 1);
+			_HystartSample(roundTrip);
 			fSendTime = 0;
 		}
 
@@ -3999,6 +4014,44 @@ TCPEndpoint::_ResetSlowStart()
 	fSlowStartThreshold = _CubicCongestionEvent(
 		(fSendMax - fSendUnacknowledged).Number());
 	fCongestionWindow = fSendMaxSegmentSize;
+}
+
+
+/*!	HyStart++ (RFC 9406 4.2, without its conservative phase, as Linux's
+	HyStart): leaves the first slow start once the smallest round trip of a
+	round grew by an eighth of the last round's (4 to 16 ms), before the
+	window overshoots the path by the whole queue and loses hundreds of
+	segments at once.
+*/
+void
+TCPEndpoint::_HystartSample(int32 roundTrip)
+{
+	if (fSlowStartThreshold != kInitialSlowStartThreshold || roundTrip < 0
+		|| fCongestionWindow >= fSlowStartThreshold)
+		return;
+
+	if (!(fSendUnacknowledged < fHystartRoundEnd)) {
+		// a new round: what is in flight now is acknowledged at its end
+		fHystartLastMinimum = fHystartMinimum;
+		fHystartMinimum = UINT32_MAX;
+		fHystartSamples = 0;
+		fHystartRoundEnd = fSendMax;
+	}
+
+	const int32 kSamples = 8;
+	if (fHystartSamples >= kSamples)
+		return;
+	if ((uint32)roundTrip < fHystartMinimum)
+		fHystartMinimum = roundTrip;
+	fHystartSamples++;
+
+	if (fHystartSamples < kSamples || fHystartLastMinimum == UINT32_MAX
+		|| fCongestionWindow < 16 * fSendMaxSegmentSize)
+		return;
+	uint32 threshold = fHystartLastMinimum / 8;
+	threshold = max_c(4U, min_c(threshold, 16U));
+	if (fHystartMinimum >= fHystartLastMinimum + threshold)
+		fSlowStartThreshold = fCongestionWindow;
 }
 
 
