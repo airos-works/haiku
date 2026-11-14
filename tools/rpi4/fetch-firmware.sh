@@ -18,6 +18,10 @@ FILES=(
     bcm2712-rpi-5-b.dtb bcm2712d0-rpi-5-b.dtb bcm2712-d-rpi-5-b.dtb
     bcm2712-rpi-500.dtb bcm2712-rpi-cm5-cm5io.dtb bcm2712-rpi-cm5l-cm5io.dtb
     bcm2712-rpi-cm5-cm4io.dtb bcm2712-rpi-cm5l-cm4io.dtb
+    # The firmware applies this to the tree on boards with the D0 stepping
+    # of the BCM2712 (the pin controller differs, among others); without it
+    # the tree describes a C0.
+    overlays/bcm2712d0.dtbo
     overlays/overlay_map.dtb overlays/disable-bt.dtbo overlays/miniuart-bt.dtbo
     overlays/vc4-kms-v3d-pi4.dtbo
 )

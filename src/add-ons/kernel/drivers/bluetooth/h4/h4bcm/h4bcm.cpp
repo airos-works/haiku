@@ -10,7 +10,13 @@
 	RTS/CTS); the PL011 stays the serial console. The driver powers the
 	controller through the firmware's BT_ON line, loads its patch file
 	(BCM4345C0.hcd, a list of HCI commands) when the device is opened, and
-	then passes packets between the UART and the HCI layer. */
+	then passes packets between the UART and the HCI layer.
+
+	The Raspberry Pi 5 has the same controller on the BCM2712's BCM7271
+	UART ("brcm,bcm7271-uart": a 16550 with its registers 4 bytes apart,
+	96 MHz clock, automatic RTS/CTS) on GPIO 24 to 27, and BT_ON on the
+	"gio" GPIO 29. Its line status and interrupt enable bits are where the
+	mini UART has them; only the registers are elsewhere. */
 
 
 #include <new>
@@ -36,6 +42,7 @@
 #include <bluetooth/HCI/btHCI_transport.h>
 
 #include <rpi_firmware.h>
+#include <drivers/bcm2712_pins.h>
 
 
 #define DRIVER_NAME		"h4bcm"
@@ -77,6 +84,23 @@
 #define MU_BAUD				0x68
 #define MU_INTERRUPT		(93 + 32)
 
+// the BCM2712's (Pi 5) 16550 style UART, registers 4 bytes apart
+#define U16550_DATA			0x00	// with LCR_DLAB: divisor low
+#define U16550_IER			0x04	// with LCR_DLAB: divisor high
+#define U16550_FCR			0x08
+#define  U16550_FCR_ENABLE	0x01
+#define  U16550_FCR_CLEAR	0x06
+#define  U16550_FCR_RX_8	0x80	// interrupt at 8 bytes in the FIFO
+#define U16550_LCR			0x0c
+#define  U16550_LCR_8BIT	0x03
+#define  U16550_LCR_DLAB	0x80
+#define U16550_MCR			0x10
+#define  U16550_MCR_DTR		0x01
+#define  U16550_MCR_RTS		0x02
+#define  U16550_MCR_AFE		0x20	// automatic RTS/CTS
+#define U16550_LSR			0x14
+#define BCM2712_UART_CLOCK	96000000
+
 #define GPIO_BASE			0xfe200000
 #define GPIO_FSEL3			0x0c	// pins 30 to 39, three bits each
 #define GPIO_PULL1			0xe8	// pins 16 to 31, two bits each
@@ -109,10 +133,23 @@ static rpi_firmware_module_info* sFirmware;
 
 static const char* sDeviceNames[] = { DEVICE_PATH, NULL };
 
+// the UART's registers (Pi 4: the AUX block), and the GPIOs
 static volatile uint8* sAux;
 static area_id sAuxArea = -1;
 static volatile uint8* sGpio;
 static area_id sGpioArea = -1;
+
+// the board's UART: register offsets and interrupt
+static bool sBCM2712;
+static bool sBCM2712D0;
+static uint64 sUartBase = AUX_BASE;
+static uint64 sPinctrlBase;
+static volatile uint8* sPinctrl;
+static area_id sPinctrlArea = -1;
+static uint32 sInterrupt = MU_INTERRUPT;
+static uint32 sRegData = MU_IO;
+static uint32 sRegLineStatus = MU_LSR;
+static uint32 sRegInterruptEnable = MU_IER;
 
 static mutex sLock = MUTEX_INITIALIZER("h4bcm");
 static mutex sSendLock = MUTEX_INITIALIZER("h4bcm send");
@@ -158,13 +195,13 @@ uart_interrupt(void* data)
 {
 	bool received = false;
 	while (true) {
-		uint32 status = read_aux(MU_LSR);
+		uint32 status = read_aux(sRegLineStatus);
 		if ((status & MU_LSR_OVERRUN) != 0)
 			sOverruns++;
 		if ((status & MU_LSR_DATA_READY) == 0)
 			break;
 
-		uint8 byte = read_aux(MU_IO);
+		uint8 byte = read_aux(sRegData);
 		uint32 next = (sRingHead + 1) % RING_SIZE;
 		if (next != sRingTail) {
 			sRing[sRingHead] = byte;
@@ -188,21 +225,53 @@ uart_send(const uint8* data, size_t length)
 	for (size_t i = 0; i < length; i++) {
 		// the controller's CTS holds the transmitter back when it has to
 		bigtime_t timeout = system_time() + 1000000;
-		while ((read_aux(MU_LSR) & MU_LSR_TX_READY) == 0) {
+		while ((read_aux(sRegLineStatus) & MU_LSR_TX_READY) == 0) {
 			if (system_time() > timeout) {
 				ERROR("the UART does not take data\n");
 				return;
 			}
 			snooze(50);
 		}
-		write_aux(MU_IO, data[i]);
+		write_aux(sRegData, data[i]);
 	}
+}
+
+
+static status_t
+uart_init_bcm2712()
+{
+	// GPIO 24 to 27: TXD, RXD, CTS, RTS; pull-ups on the inputs
+	for (uint32 pin = 24; pin <= 27; pin++) {
+		bcm2712_set_pin(sPinctrl, sBCM2712D0, pin, BCM2712_FUNCTION_UART0,
+			pin == 25 || pin == 26 ? BCM2712_PULL_UP : BCM2712_PULL_NONE);
+	}
+	memory_full_barrier();
+
+	uint32 divisor = (BCM2712_UART_CLOCK + 8 * BAUD_RATE) / (16 * BAUD_RATE);
+	write_aux(U16550_IER, 0);
+	write_aux(U16550_LCR, U16550_LCR_8BIT | U16550_LCR_DLAB);
+	write_aux(U16550_DATA, divisor & 0xff);
+	write_aux(U16550_IER, divisor >> 8);
+	write_aux(U16550_LCR, U16550_LCR_8BIT);
+	write_aux(U16550_FCR, U16550_FCR_ENABLE | U16550_FCR_CLEAR
+		| U16550_FCR_RX_8);
+	write_aux(U16550_MCR, U16550_MCR_DTR | U16550_MCR_RTS | U16550_MCR_AFE);
+	// whatever came before
+	while ((read_aux(U16550_LSR) & MU_LSR_DATA_READY) != 0)
+		read_aux(U16550_DATA);
+
+	INFO("BCM7271 UART at %d baud (divisor %" B_PRIu32 ")\n", BAUD_RATE,
+		divisor);
+	return B_OK;
 }
 
 
 static status_t
 uart_init()
 {
+	if (sBCM2712)
+		return uart_init_bcm2712();
+
 	// GPIO 30 to 33 to the mini UART (CTS, RTS, TXD, RXD)
 	uint32 select = *(volatile uint32*)(sGpio + GPIO_FSEL3);
 	for (uint32 pin = 30; pin <= 33; pin++) {
@@ -249,6 +318,10 @@ uart_init()
 static void
 set_power(bool on)
 {
+	if (sBCM2712) {
+		bcm2712_gpio_output(sGpio, BCM2712_GPIO_BT_ON, on);
+		return;
+	}
 	uint32 request[2] = { EXPANDER_GPIO_BASE + EXPANDER_BT_ON, on ? 1u : 0u };
 	sFirmware->property(RPI_FIRMWARE_SET_GPIO_STATE, request, sizeof(request));
 }
@@ -576,6 +649,15 @@ setup_controller()
 	if (status != B_OK) {
 		ERROR("the controller does not answer a reset: %s\n",
 			strerror(status));
+		if (sBCM2712) {
+			ERROR("UART: line status %#" B_PRIx32 ", interrupt enable %#"
+				B_PRIx32 ", modem control %#" B_PRIx32 "; ring head %" B_PRIu32
+				" tail %" B_PRIu32 ", %" B_PRIu32 " overruns\n",
+				read_aux(U16550_LSR), read_aux(U16550_IER),
+				read_aux(U16550_MCR), sRingHead, sRingTail, sOverruns);
+			free(image);
+			return status;
+		}
 		ERROR("UART: line status %#" B_PRIx32 ", status %#" B_PRIx32
 			", control %#" B_PRIx32 ", interrupt enable %#" B_PRIx32
 			", identify %#" B_PRIx32 ", baud %#" B_PRIx32 "; ring head %"
@@ -658,14 +740,26 @@ setup_controller()
 static status_t
 bring_up()
 {
-	sAuxArea = map_physical_memory("h4bcm aux", AUX_BASE, B_PAGE_SIZE,
-		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
-		(void**)&sAux);
-	sGpioArea = map_physical_memory("h4bcm gpio", GPIO_BASE, B_PAGE_SIZE,
-		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
-		(void**)&sGpio);
+	const phys_addr_t kPageMask = B_PAGE_SIZE - 1;
+	uint64 gpioBase = sBCM2712 ? BCM2712_GIO_BASE : GPIO_BASE;
+	sAuxArea = map_physical_memory("h4bcm uart", sUartBase & ~kPageMask,
+		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&sAux);
+	sGpioArea = map_physical_memory("h4bcm gpio", gpioBase & ~kPageMask,
+		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&sGpio);
 	if (sAuxArea < 0 || sGpioArea < 0)
 		return B_NO_MEMORY;
+	sAux += sUartBase & kPageMask;
+	sGpio += gpioBase & kPageMask;
+	if (sBCM2712) {
+		sPinctrlArea = map_physical_memory("h4bcm pinctrl",
+			sPinctrlBase & ~kPageMask, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&sPinctrl);
+		if (sPinctrlArea < 0)
+			return B_NO_MEMORY;
+		sPinctrl += sPinctrlBase & kPageMask;
+	}
 
 	sRingSem = create_sem(0, "h4bcm ring");
 	sSetupSem = create_sem(0, "h4bcm setup");
@@ -687,11 +781,11 @@ bring_up()
 		return sReader;
 	resume_thread(sReader);
 
-	status = install_io_interrupt_handler(MU_INTERRUPT, uart_interrupt, NULL,
+	status = install_io_interrupt_handler(sInterrupt, uart_interrupt, NULL,
 		0);
 	if (status != B_OK)
 		return status;
-	write_aux(MU_IER, MU_IER_RX);
+	write_aux(sRegInterruptEnable, MU_IER_RX);
 
 	status = setup_controller();
 	if (status != B_OK)
@@ -717,8 +811,8 @@ take_down()
 	}
 
 	if (sAux != NULL) {
-		write_aux(MU_IER, 0);
-		remove_io_interrupt_handler(MU_INTERRUPT, uart_interrupt, NULL);
+		write_aux(sRegInterruptEnable, 0);
+		remove_io_interrupt_handler(sInterrupt, uart_interrupt, NULL);
 	}
 	if (sReader >= 0) {
 		sRunning = false;
@@ -739,8 +833,10 @@ take_down()
 		delete_area(sAuxArea);
 	if (sGpioArea >= 0)
 		delete_area(sGpioArea);
-	sAuxArea = sGpioArea = -1;
-	sAux = sGpio = NULL;
+	if (sPinctrlArea >= 0)
+		delete_area(sPinctrlArea);
+	sAuxArea = sGpioArea = sPinctrlArea = -1;
+	sAux = sGpio = sPinctrl = NULL;
 }
 
 
@@ -871,10 +967,35 @@ is_raspberry_pi_4()
 }
 
 
+/*!	The Pi 5: the BCM7271 UART with the Bluetooth controller, and the pin
+	multiplexer. */
+static bool
+find_bcm2712()
+{
+	uint64 base, size, interrupt, pinctrl;
+	bool d0;
+	if (!bcm2712_find_node("brcm,bcm7271-uart", 0, 0, &base, &size,
+			&interrupt)
+		|| interrupt == 0 || !bcm2712_find_pinctrl(&pinctrl, &d0)) {
+		return false;
+	}
+
+	sBCM2712 = true;
+	sBCM2712D0 = d0;
+	sUartBase = base;
+	sInterrupt = interrupt;
+	sPinctrlBase = pinctrl;
+	sRegData = U16550_DATA;
+	sRegLineStatus = U16550_LSR;
+	sRegInterruptEnable = U16550_IER;
+	return true;
+}
+
+
 status_t
 init_hardware()
 {
-	return is_raspberry_pi_4() ? B_OK : B_ERROR;
+	return find_bcm2712() || is_raspberry_pi_4() ? B_OK : B_ERROR;
 }
 
 
@@ -889,6 +1010,8 @@ init_driver()
 		put_module(BT_HCI_MODULE_NAME);
 		return status;
 	}
+	if (find_bcm2712())
+		return B_OK;
 	status = get_module(RPI_FIRMWARE_MODULE_NAME, (module_info**)&sFirmware);
 	if (status != B_OK) {
 		put_module(NET_BUFFER_MODULE_NAME);
@@ -902,7 +1025,8 @@ init_driver()
 void
 uninit_driver()
 {
-	put_module(RPI_FIRMWARE_MODULE_NAME);
+	if (sFirmware != NULL)
+		put_module(RPI_FIRMWARE_MODULE_NAME);
 	put_module(NET_BUFFER_MODULE_NAME);
 	put_module(BT_HCI_MODULE_NAME);
 }

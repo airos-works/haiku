@@ -122,6 +122,11 @@ init_boot_options()
 		fdt_dump_rp1_state();
 	if (has_boot_argument("airos.nosmp"))
 		add_safe_mode_settings("disable_smp true\n");
+	// A test driver in /boot/system/non-packaged that stops every start can
+	// be kept out from the recovery OS, by editing cmdline.txt on the FAT
+	// partition: no boot menu to drive over the serial line.
+	if (has_boot_argument("airos.noaddons"))
+		add_safe_mode_settings("disable_user_addons true\n");
 
 	// a space on the serial console opens the menu
 	bigtime_t timeout = system_time() + 100000;

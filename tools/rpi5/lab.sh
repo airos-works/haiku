@@ -18,7 +18,18 @@
 # ssh_config (hosts kvm5, rpi5-recovery), nanokvm.password, env.sh.
 set -euo pipefail
 STATE=${RPI5_STATE:-/mnt/HaikuWork/rpi5/state}
-kvm_ssh() { ssh -F "$STATE/ssh_config" kvm5 "$@"; }
+# The KVM drops off the network for a few seconds now and then: retry
+# connection failures (ssh exits 255).
+kvm_ssh() {
+	local try status
+	for try in 1 2 3 4 5; do
+		ssh -F "$STATE/ssh_config" kvm5 "$@"
+		status=$?
+		[ $status -ne 255 ] && return $status
+		sleep 3
+	done
+	return $status
+}
 LUN=/sys/kernel/config/usb_gadget/g0/functions/mass_storage.disk0/lun.0
 
 case ${1:-} in
