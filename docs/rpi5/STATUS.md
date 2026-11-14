@@ -12,7 +12,7 @@ Pi 4 and a Pi 5. How it boots: BOOT.md.
 | Memory | 4 GB | About this system: 4084 MiB |
 | Serial console | GPIO 14/15 (RP1 UART0) | loader and kernel output, KDL in and out |
 | SD card | `bcm2711_emmc2` on the BCM2712 slot, SDMA, 50 MHz high speed | 128 GB card read and written |
-| USB | both RP1 xHCIs (`xhci_fdt`), USB 2 only (as on the other DWC3 boards) | KVM keyboard, mouse, RNDIS, mass storage |
+| USB | both RP1 xHCIs (`xhci_fdt`), SuperSpeed enabled (since 2026-11-15) | KVM keyboard, mouse, RNDIS, mass storage; no USB 3 device tried yet |
 | Ethernet | `rp1_gem`, 1 Gbit/s | DHCP, ping 0.16 ms, no loss |
 | Display | the firmware's frame buffer, 1920x1080, 32 bits | desktop on HDMI0 |
 | Watchdog | `airos.watchdog` (lab), restart through PSCI | resets after a hang |
@@ -21,6 +21,7 @@ Pi 4 and a Pi 5. How it boots: BOOT.md.
 | Wi-Fi | `broadcomfmac` on the second SDHCI (sd2, GPIO 30-35, WL_ON gio 28) | WPA2 join, DHCP, ping and ssh over Wi-Fi |
 | Bluetooth | `h4bcm` on the BCM7271 UART (GPIO 24-27, BT_ON gio 29) | patched, LE scan finds the room's devices |
 | HEVC decoding | `rpi_hevc` on `/axi/codec@800000` (910 MHz, version 0x202) | all 25 test streams byte-exact (`rpi4_hevc_decode`) |
+| Sound | `bcm2712_hdmi_audio`: the HDMI controllers' MAI fed by a 40 bit DMA channel, 16 bit stereo at 44.1 or 48 kHz, output HDMI 0 or 1, software volume | 2026-11-15: the Media Kit's default output; 48000 frames per second through the mixer for 30 s; the KVM's HDMI receiver reports the audio stream starting and stopping with each tone (nothing while idle); not listened to |
 | Temperature | `rpi_thermal` through the firmware mailbox | loads |
 
 Not done yet:
@@ -35,7 +36,33 @@ Not done yet:
 - Video: the BCM2712 has no H.264 decoder and no video encoder at all
   (only the HEVC decoder): H.264 decoding and all encoding stay in
   software (FFmpeg).
-- Sound (HDMI audio, or the RP1's I2S for a HAT), the fan (RP1 PWM), the
-  RTC, the power button, CPU frequency scaling.
+- The RP1's I2S (sound HATs), the fan (RP1 PWM), the RTC, the power
+  button, CPU frequency scaling.
 - The PCIe x1 connector (NVMe) and USB 3 speeds: the lab board has no NVMe
   drive and no USB 3 device to test with.
+
+## Sound
+
+The Pi 5 has no headphone jack, and its firmware no sound service (no
+VCHIQ): `bcm2712_hdmi_audio` drives the HDMI controllers' audio itself, on
+top of the mode the firmware set (Linux: `vc4_hdmi.c`, `bcm2835-dma.c`).
+
+- The MAI takes IEC 60958 subframes (sample in bits 12-27, channel status
+  bit 30, parity bit 31, preamble 8 at each 192 frame block start). A
+  real-time thread converts the Media Kit's 16 bit samples, applying the
+  volume, into a ring of four 20 ms periods, two ahead of the DMA.
+- DMA channel 7 of the 40 bit controller at 0x10_0001_0600 (the device
+  tree leaves 7-11 to the OS) runs one control block per period, cyclic,
+  into `MAI_DATA` (0x10_7c72_001c for HDMI 0, +0x20 for HDMI 1), paced by
+  DREQ 12 or 13; the cell in the HDMI node's `dmas` carries the DREQ and
+  the QoS flags. It interrupts at the end of each period (GIC SPI 87).
+- Audio clock regeneration: N 6144 (48 kHz) or 6272 (44.1 kHz) and CTS
+  from the pixel clock, which the firmware measures for HDMI 0 (property
+  tag 0x00030047, clock 9: 148.5 MHz at 1080p60). The firmware leaves the
+  vertical front porch out of the timing registers, so the fallback
+  estimate for HDMI 1 is a little low.
+- The MAI's sample clock comes from the DVP's 108 MHz gate: n/m = 2250/1
+  (48 kHz) or 120000/49 (44.1 kHz). The D0 stepping moved the MAI
+  threshold fields.
+- The KVM's receiver (LT6911) logs a pair of interrupts when the audio of
+  its input starts and when it stops: the check that a stream is there.
