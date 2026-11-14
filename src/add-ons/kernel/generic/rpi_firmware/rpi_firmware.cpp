@@ -4,8 +4,9 @@
  */
 
 /*	The property interface of the Raspberry Pi's VideoCore firmware
-	(mailbox channel 8), for kernel drivers. The mailbox address is the
-	BCM2711's: on any other SoC every request fails without touching it. */
+	(mailbox channel 8), for kernel drivers. It knows the mailbox of the
+	BCM2711 (Pi 4) and of the BCM2712 (Pi 5): on any other SoC every request
+	fails without touching it. */
 
 
 #include <rpi_firmware.h>
@@ -21,7 +22,9 @@
 #include <vm/vm.h>
 
 
-#define MAILBOX_BASE				0xfe00b000
+#define BCM2711_MAILBOX_BASE		0xfe00b000
+	// the BCM2712's is at 0x7c013880 of /soc@107c000000
+#define BCM2712_MAILBOX_BASE		0x107c013000ull
 #define MAILBOX_READ				0x880
 #define MAILBOX_STATUS				0x898
 #define MAILBOX_WRITE				0x8a0
@@ -30,8 +33,9 @@
 #define MAILBOX_CHANNEL_PROPERTY	8
 #define PROPERTY_SUCCESS			0x80000000
 
-// The VideoCore sees the ARM's first gigabyte at this bus address.
-#define VC_BUS_OFFSET				0xc0000000
+// The BCM2711's VideoCore sees the ARM's first gigabyte at this bus
+// address; the BCM2712's takes the ARM's physical addresses.
+#define BCM2711_VC_BUS_OFFSET		0xc0000000
 
 #define MAX_VALUE_SIZE				1024
 
@@ -42,6 +46,7 @@ static volatile uint8* sMailbox;
 static area_id sMessageArea = -1;
 static uint32* sMessage;
 static phys_addr_t sMessageAddress;
+static uint32 sBusOffset;
 static status_t sInitStatus = B_NO_INIT;
 
 extern void* gFDT;
@@ -53,10 +58,19 @@ extern void* gFDT;
 static status_t
 init()
 {
-	if (gFDT == NULL || fdt_node_check_compatible(gFDT, 0, "brcm,bcm2711") != 0)
+	if (gFDT == NULL)
+		return B_DEVICE_NOT_FOUND;
+	phys_addr_t mailboxBase;
+	if (fdt_node_check_compatible(gFDT, 0, "brcm,bcm2711") == 0) {
+		mailboxBase = BCM2711_MAILBOX_BASE;
+		sBusOffset = BCM2711_VC_BUS_OFFSET;
+	} else if (fdt_node_check_compatible(gFDT, 0, "brcm,bcm2712") == 0) {
+		mailboxBase = BCM2712_MAILBOX_BASE;
+		sBusOffset = 0;
+	} else
 		return B_DEVICE_NOT_FOUND;
 
-	sMailboxArea = map_physical_memory("rpi firmware mailbox", MAILBOX_BASE,
+	sMailboxArea = map_physical_memory("rpi firmware mailbox", mailboxBase,
 		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
 		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&sMailbox);
 	if (sMailboxArea < 0)
@@ -120,7 +134,7 @@ firmware_property(uint32 tag, void* data, size_t size)
 	sMessage[5 + words] = 0;
 	memory_full_barrier();
 
-	uint32 address = ((uint32)sMessageAddress | VC_BUS_OFFSET)
+	uint32 address = ((uint32)sMessageAddress | sBusOffset)
 		| MAILBOX_CHANNEL_PROPERTY;
 
 	bigtime_t timeout = system_time() + 1000000;
