@@ -17,7 +17,7 @@
 
 #define RPI_DISPLAY_ACCELERANT		"rpi_display.accelerant"
 #define RPI_DISPLAY_DEVICE			"graphics/rpi_display/0"
-#define RPI_DISPLAY_VERSION			2
+#define RPI_DISPLAY_VERSION			3
 #define RPI_DISPLAY_MAX_OUTPUTS		2
 
 enum {
@@ -101,7 +101,13 @@ struct rpi_display_shared_info {
 	uint32	bytes_per_row;
 	uint32	generation;
 	uint64	physical_address;
+	uint32	flags;				// RPI_DISPLAY_FIXED_MODES
 };
+
+// The outputs keep the modes the firmware set at boot and show their
+// regions unscaled (the Raspberry Pi 5, whose firmware has no planes for
+// the OS): no other sizes, no scaling, no hardware cursor.
+#define RPI_DISPLAY_FIXED_MODES		0x1
 
 struct rpi_display_layout {
 	uint32	version;

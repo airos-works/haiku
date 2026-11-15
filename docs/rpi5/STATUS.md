@@ -12,9 +12,9 @@ Pi 4 and a Pi 5. How it boots: BOOT.md.
 | Memory | 4 GB | About this system: 4084 MiB |
 | Serial console | GPIO 14/15 (RP1 UART0) | loader and kernel output, KDL in and out |
 | SD card | `bcm2711_emmc2` on the BCM2712 slot, SDMA, 50 MHz high speed | 128 GB card read and written |
-| USB | both RP1 xHCIs (`xhci_fdt`), SuperSpeed enabled (since 2026-11-15) | KVM keyboard, mouse, RNDIS, mass storage; no USB 3 device tried yet |
+| USB | both RP1 xHCIs (`xhci_fdt`), SuperSpeed (since 2026-11-15) | KVM keyboard, mouse, RNDIS, mass storage; an RTL9210 NVMe adapter (1 TB SSD) on a blue port reads 243-270 MB/s |
 | Ethernet | `rp1_gem`, 1 Gbit/s | DHCP, ping 0.16 ms, no loss |
-| Display | the firmware's frame buffer, 1920x1080, 32 bits | desktop on HDMI0 |
+| Display | `rpi_display` on the HVS's display lists: both HDMI outputs, one desktop, at the modes the firmware set (1080p) | 2026-11-15: 3840x1080 desktop over the KVM (HDMI0) and a Dell 4K monitor (HDMI1, at 1080p); HDMI0's picture checked, HDMI1's list running on the right half (registers); blanks at 60.00 Hz; GLTeapot synced at 59 FPS |
 | Watchdog | `airos.watchdog` (lab), restart through PSCI | resets after a hang |
 | `airos.debug` | loader and kernel output on the screen | boots to the network (kernel pager: P) |
 | GPU | `v3d` on the V3D 7.1.10 at 1.15 GHz, Mesa 25.3.6 | 2026-11-15: GL ES 3.1 and Vulkan 1.3 probes pass (1080p with depth exact), texture and readback probes pass, GLTeapot ~1690 FPS; `rpi4_v3d_probe` passes (TFU raster to UIF, uncached and cached) |
@@ -26,14 +26,14 @@ Pi 4 and a Pi 5. How it boots: BOOT.md.
 
 Not done yet:
 
-- Display driver: no HVS/HDMI driver; no mode setting, one screen, no
-  second HDMI port, so no direct GL presentation either. The Pi 4's
-  `rpi_display` cannot simply follow: the Pi 5 firmware answers the
-  firmware KMS queries (display id 2 for HDMI 0, 600 MHz, display count)
-  and accepts `SET_PLANE` (0x00048015), but shows nothing (tried
-  2026-11-15 with layers 1 and 100, display ids 2 and 0). A Pi 5 display
-  driver has to program the HVS and pixel valves itself (Linux:
-  `vc4_hvs.c` generation 6, `vc4_crtc.c`, `vc4_hdmi.c`).
+- Display: no mode setting. The firmware picks each output's mode at boot
+  (1080p here, also for the 4K monitor; it ignores `hdmi_mode` on the
+  Pi 5) and only for outputs connected then; air/OS shows its regions
+  unscaled at those modes (no scaled modes, a software cursor). Mode
+  setting needs the pixel valves and the HDMI PHY/PLL (Linux:
+  `vc4_crtc.c`, `vc4_hdmi_phy.c`); a hardware cursor a second plane with
+  its own UPM range. The firmware KMS tags are no way round it: the Pi 5
+  firmware accepts `SET_PLANE` (0x00048015) but shows nothing.
 - Video: the BCM2712 has no H.264 decoder and no video encoder at all
   (only the HEVC decoder): H.264 decoding and all encoding stay in
   software (FFmpeg).
@@ -74,3 +74,33 @@ top of the mode the firmware set (Linux: `vc4_hdmi.c`, `bcm2835-dma.c`).
   threshold fields.
 - The KVM's receiver (LT6911) logs a pair of interrupts when the audio of
   its input starts and when it stops: the check that a stream is there.
+
+## Display
+
+The firmware sets both HDMI outputs up at boot (`max_framebuffers=2`,
+`hdmi_force_hotplug`), each HVS channel n feeding HDMI n with one plane:
+its frame buffer, unscaled. `rpi_display` (also the Pi 4's driver)
+attaches to `brcm,bcm2712-hvs` and, instead of the Pi 4's firmware
+planes:
+
+- reads each channel's mode from `DISPn_CTRL0` (width, lines) and the
+  firmware's plane from the display list `DISPn_LPTRS` points at (HVS
+  memory from 0x4000, D0 register offsets 0x100 + 0x40 n);
+- shows a region of its frame buffer by writing a copy of that plane
+  (address, pitch, size, centered position changed; the firmware's UPM
+  fields kept) into one of two slots per channel at the end of the list
+  memory (words 0xe00 on), then pointing `LPTRS` at it: the compositor
+  takes it at the next frame;
+- points `LPTRS` back at the firmware's list when app_server lets go, so
+  the boot console shows again;
+- follows the blanks with the channel's frame count (`DISPn_STATUS`
+  bits 21:16) and the connection with `HDMI_HOTPLUG` (HDMI block + 0x1c8).
+  An output plugged in after boot stays dark: the firmware did not start
+  its channel.
+
+The accelerant gets `RPI_DISPLAY_FIXED_MODES`: each output's own mode
+only, and a region the size of the mode (app_server's own rendering
+scale is fine).
+
+Read the HVS through `/dev/misc/mem` in blocks (`dd bs=512`): four-byte
+reads came back wrong.
