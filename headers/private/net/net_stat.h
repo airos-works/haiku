@@ -75,6 +75,12 @@ typedef struct net_protocol_stats {
 	uint64	tcp_retransmit_timeouts;
 	uint64	tcp_fast_recoveries;
 	uint64	tcp_loss_probes;
+
+	// receiver drops
+	uint64	tcp_out_of_window_drops;
+		// data segments outside the receive window
+	uint64	tcp_out_of_order_drops;
+		// out-of-order segments over the queue's buffer limit
 } net_protocol_stats;
 
 #define NET_STAT_SYSCALLS				"network/stats"

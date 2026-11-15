@@ -173,6 +173,10 @@ print_statistics()
 	LINE(stats.tcp_retransmit_timeouts, "retransmit timeouts");
 	LINE(stats.tcp_fast_recoveries, "fast recoveries");
 	LINE(stats.tcp_loss_probes, "tail loss probes");
+	LINE(stats.tcp_out_of_window_drops,
+		"segments dropped outside the receive window");
+	LINE(stats.tcp_out_of_order_drops,
+		"out-of-order segments dropped (queue buffer limit)");
 
 	printf("raw:\n");
 	LINE(stats.raw_receive_buffer_errors,

@@ -200,7 +200,7 @@ private:
 	// SACK scoreboard (RFC 6675): the ranges above fSendUnacknowledged the
 	// peer reported, sorted and disjoint, and the end of what fast recovery
 	// retransmitted so far
-	enum { kScoreboardSize = 16 };
+	enum { kScoreboardSize = 64 };
 	struct sack_range {
 		tcp_sequence	left;
 		tcp_sequence	right;
@@ -208,11 +208,13 @@ private:
 	sack_range		fScoreboard[kScoreboardSize];
 	int32			fScoreboardCount;
 	bool			fScoreboardKeptAtTimeout;
+		// a timeout kept the scoreboard, and nothing was acknowledged since
 	tcp_sequence	fFirstHoleResentAt;
 	tcp_sequence	fFirstHoleResentBefore;
 		// fSendUnacknowledged when it was resent last in recovery, and
 		// fSendMax then: data above that reported means the resend was lost
-		// a timeout kept the scoreboard, and nothing was acknowledged since
+	tcp_sequence	fLastHoleResentBefore;
+		// fSendMax at the last resend of any hole
 	tcp_sequence	fHighRetransmitted;
 		// highest sequence sent when fast recovery began (RFC 6582)
 
@@ -277,13 +279,18 @@ private:
 		// W_est, the window Reno would have, in bytes * 1024
 	uint64			fCubicRemainder;
 	bool			fCongestionWindowLimited;
+		// the last send left data waiting for the congestion window
 
 	// HyStart++ (RFC 9406) in the first slow start; RTTs in ms
 	tcp_sequence	fHystartRoundEnd;
 	uint32			fHystartLastMinimum;
 	uint32			fHystartMinimum;
 	int32			fHystartSamples;
-		// the last send left data waiting for the congestion window
+	uint32			fHystartMinRoundTrip;
+		// the smallest round trip seen, ms
+	int32			fHystartHighSamples;
+		// samples in a row above the smallest round trip
+	bigtime_t		fHystartHighSince;
 
 	tcp_state		fState;
 	uint32			fFlags;

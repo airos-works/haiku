@@ -566,6 +566,7 @@ TCPEndpoint::TCPEndpoint(net_socket* socket)
 	fScoreboardKeptAtTimeout(false),
 	fFirstHoleResentAt(0),
 	fFirstHoleResentBefore(0),
+	fLastHoleResentBefore(0),
 	fHighRetransmitted(0),
 	fRoute(NULL),
 	fReceiveNext(0),
@@ -606,6 +607,9 @@ TCPEndpoint::TCPEndpoint(net_socket* socket)
 	fHystartLastMinimum(UINT32_MAX),
 	fHystartMinimum(UINT32_MAX),
 	fHystartSamples(0),
+	fHystartMinRoundTrip(UINT32_MAX),
+	fHystartHighSamples(0),
+	fHystartHighSince(0),
 	fState(CLOSED),
 	fFlags(FLAG_OPTION_WINDOW_SCALE | FLAG_OPTION_TIMESTAMP
 		| FLAG_OPTION_SACK_PERMITTED | FLAG_AUTO_RECEIVE_BUFFER_SIZE
@@ -2004,6 +2008,7 @@ TCPEndpoint::_RetransmitNextHole()
 		return false;
 
 	fHighRetransmitted = start + length;
+	fLastHoleResentBefore = fSendMax;
 	if (start == fSendUnacknowledged)
 		_NoteFirstHoleResent();
 	return true;
@@ -2044,21 +2049,47 @@ TCPEndpoint::_RecoverySend()
 	// sent after it was reported, and the hole is still open. Only the
 	// retransmit timeout repaired it before, with the window down to one
 	// segment (airos-works/haiku#125).
+	// When even the last hole resend went before data that was reported
+	// since, every resend still open was lost: a queue that overflowed
+	// took the whole burst of them, and they came back one per round trip
+	// as each became the first hole - seconds, then a timeout. They are
+	// all repaired again then.
 	if (fFirstHoleResentAt == fSendUnacknowledged
+		&& fSendUnacknowledged < fFirstHoleResentBefore
+		&& fScoreboardCount > 0
+		&& fFirstHoleResentBefore < fScoreboard[fScoreboardCount - 1].right
+		&& fLastHoleResentBefore < fScoreboard[fScoreboardCount - 1].right
+		&& fSendUnacknowledged < fHighRetransmitted) {
+		fHighRetransmitted = fSendUnacknowledged;
+	} else if (fFirstHoleResentAt == fSendUnacknowledged
 		&& fSendUnacknowledged < fFirstHoleResentBefore
 		&& fScoreboardCount > 0
 		&& fFirstHoleResentBefore < fScoreboard[fScoreboardCount - 1].right) {
 		fSendNext = fSendUnacknowledged;
 		_SendQueued();
+		const bool sent = fSendUnacknowledged < fSendNext;
 		fSendNext = fSendMax;
+		if (!sent)
+			return;
+			// (held back by the pacing, whose timer comes back here)
 		_NoteFirstHoleResent();
 	}
 
 	for (int32 i = 0; i < 64; i++) {
 		if (_Pipe() + fSendMaxSegmentSize > fCongestionWindow)
 			return;
-		if (_RetransmitNextHole())
-			continue;
+		tcp_sequence holeStart;
+		uint32 holeLength;
+		if (fScoreboardCount > 0 && _NextHole(holeStart, holeLength)) {
+			// Resends are paced like everything else: sent at line rate,
+			// they flooded the bottleneck again right after the loss that
+			// started the recovery (185 frames within a millisecond from
+			// the X399, #113).
+			if (!_PacingAllows(min_c(holeLength, fSendMaxSegmentSize)))
+				return;
+			if (_RetransmitNextHole())
+				continue;
+		}
 
 		if (fSendQueue.Available(fSendMax) == 0 || fSendWindow == 0)
 			return;
@@ -2085,6 +2116,7 @@ TCPEndpoint::_NoteFirstHoleResent()
 {
 	fFirstHoleResentAt = fSendUnacknowledged;
 	fFirstHoleResentBefore = fSendMax;
+	fLastHoleResentBefore = fSendMax;
 }
 
 
@@ -2681,12 +2713,27 @@ TCPEndpoint::_Receive(tcp_segment_header& segment, net_buffer* buffer)
 
 	ASSERT(fState != SYNCHRONIZE_SENT && fState != LISTEN);
 
+	// The window segments are accepted in: what was advertised (RCV.WND),
+	// or what the queue has room for, if that is more; it does not shrink.
+	// It was only updated below this check, and in-order data takes the
+	// fast path above: it stayed at the 64 KB the socket started with
+	// while the advertised window grew with the buffer. Everything more
+	// than 64 KB past a lost segment was dropped unreported, and the
+	// sender repaired it one segment per round trip, for minutes.
+	if (fReceiveNext < fReceiveMaxAdvertised) {
+		fReceiveWindow = max_c(fReceiveWindow,
+			(fReceiveMaxAdvertised - fReceiveNext).Number());
+	}
+	fReceiveWindow = max_c(fReceiveQueue.Free(), fReceiveWindow);
+
 	if (fState != CLOSED && fState != TIME_WAIT) {
 		// Check sequence number
 		if (!segment_in_sequence(segment, segmentLength, fReceiveNext,
 				fReceiveWindow)) {
 			TRACE("  Receive(): segment out of window, next: %" B_PRIu32
 				" wnd: %" B_PRIu32, fReceiveNext.Number(), fReceiveWindow);
+			if (segmentLength > 0)
+				NET_STAT_INC(gStackModule, tcp_out_of_window_drops);
 			if ((segment.flags & TCP_FLAG_RESET) != 0) {
 				// TODO: this doesn't look right - review!
 				return DROP;
@@ -2797,11 +2844,6 @@ TCPEndpoint::_Receive(tcp_segment_header& segment, net_buffer* buffer)
 		return _ChallengeAcknowledge();
 	}
 
-	// TODO: Check this! Why do we advertize a window outside of what we should
-	// buffer?
-	fReceiveWindow = max_c(fReceiveQueue.Free(), fReceiveWindow);
-		// the window must not shrink
-
 	// trim buffer to be within the receive window
 	int32 drop = (int32)(fReceiveNext - segment.sequence).Number();
 	if (drop > 0) {
@@ -2834,8 +2876,10 @@ TCPEndpoint::_Receive(tcp_segment_header& segment, net_buffer* buffer)
 		if ((uint32)drop >= buffer->size) {
 			// if we can accept data, or the segment is not what we'd expect,
 			// drop the segment (an immediate acknowledge is always triggered)
-			if (fReceiveWindow != 0 || segment.sequence != fReceiveNext)
+			if (fReceiveWindow != 0 || segment.sequence != fReceiveNext) {
+				NET_STAT_INC(gStackModule, tcp_out_of_window_drops);
 				return DROP | IMMEDIATE_ACKNOWLEDGE;
+			}
 
 			action |= IMMEDIATE_ACKNOWLEDGE;
 		}
@@ -2964,6 +3008,7 @@ TCPEndpoint::_Receive(tcp_segment_header& segment, net_buffer* buffer)
 		&& _ShouldReceive() && !outOfOrderLimit)
 		notify = _AddData(segment, buffer);
 	else if (outOfOrderLimit) {
+		NET_STAT_INC(gStackModule, tcp_out_of_order_drops);
 		action = (action & ~KEEP) | DROP | IMMEDIATE_ACKNOWLEDGE;
 		segment.flags &= ~TCP_FLAG_FINISH;
 	} else {
@@ -4091,8 +4136,17 @@ TCPEndpoint::_UpdateRoundTripTime(int32 roundTripTime, int32 expectedSamples)
 void
 TCPEndpoint::_ResetSlowStart()
 {
-	fSlowStartThreshold = _CubicCongestionEvent(
-		(fSendMax - fSendUnacknowledged).Number());
+	// As Linux's tcp_enter_loss(): a timeout in fast recovery, or right
+	// after another, keeps the threshold the loss already set. Otherwise
+	// the window is cut, not what was sent: that counts what the peer
+	// reported (SACK), so a timeout after a recovery set the threshold to
+	// almost twice what the path holds, and the next slow start overflowed
+	// its queue by hundreds of segments.
+	if ((fFlags & FLAG_RECOVERY) == 0
+		&& fCongestionWindow > fSendMaxSegmentSize) {
+		fSlowStartThreshold = _CubicCongestionEvent(min_c(fCongestionWindow,
+			(fSendMax - fSendUnacknowledged).Number()));
+	}
 	fCongestionWindow = fSendMaxSegmentSize;
 }
 
@@ -4110,6 +4164,9 @@ TCPEndpoint::_HystartSample(int32 roundTrip)
 		|| fCongestionWindow >= fSlowStartThreshold)
 		return;
 
+	if ((uint32)roundTrip < fHystartMinRoundTrip)
+		fHystartMinRoundTrip = roundTrip;
+
 	if (!(fSendUnacknowledged < fHystartRoundEnd)) {
 		// a new round: what is in flight now is acknowledged at its end
 		fHystartLastMinimum = fHystartMinimum;
@@ -4117,6 +4174,32 @@ TCPEndpoint::_HystartSample(int32 roundTrip)
 		fHystartSamples = 0;
 		fHystartRoundEnd = fSendMax;
 	}
+
+	// The first samples of a round are of segments sent at the start of the
+	// round before, and a paced slow start builds its queue later in the
+	// round: they still saw the path empty when the window had already
+	// grown past it. On an 80 ms path the window went from 1 to 1.5 MB with
+	// every round's first samples at the smallest round trip, and the next
+	// round lost a third of a window. So the queue also counts when the
+	// samples stand above the smallest round trip for eight in a row and a
+	// quarter of a round trip: a stalled peer (or virtual machine) delays a
+	// burst of ACKs at once, and leaving slow start early on a long path
+	// costs seconds of growth.
+	uint32 threshold = max_c(4U, min_c(fHystartMinRoundTrip / 8, 16U));
+	if (fHystartLastMinimum != UINT32_MAX
+		&& (uint32)roundTrip >= fHystartMinRoundTrip + threshold) {
+		const bigtime_t now = system_time();
+		if (fHystartHighSamples++ == 0)
+			fHystartHighSince = now;
+		if (fHystartHighSamples >= 8
+			&& now - fHystartHighSince
+				>= (bigtime_t)fHystartMinRoundTrip * 1000 / 4
+			&& fCongestionWindow >= 16 * fSendMaxSegmentSize) {
+			fSlowStartThreshold = fCongestionWindow;
+			return;
+		}
+	} else
+		fHystartHighSamples = 0;
 
 	const int32 kSamples = 8;
 	if (fHystartSamples >= kSamples)
@@ -4128,8 +4211,7 @@ TCPEndpoint::_HystartSample(int32 roundTrip)
 	if (fHystartSamples < kSamples || fHystartLastMinimum == UINT32_MAX
 		|| fCongestionWindow < 16 * fSendMaxSegmentSize)
 		return;
-	uint32 threshold = fHystartLastMinimum / 8;
-	threshold = max_c(4U, min_c(threshold, 16U));
+	threshold = max_c(4U, min_c(fHystartLastMinimum / 8, 16U));
 	if (fHystartMinimum >= fHystartLastMinimum + threshold)
 		fSlowStartThreshold = fCongestionWindow;
 }
@@ -4449,7 +4531,12 @@ TCPEndpoint::_PacingTimer(net_timer* timer, void* _endpoint)
 	if (!locker.IsLocked() || endpoint->State() == CLOSED)
 		return;
 
-	endpoint->_SendQueued();
+	if ((endpoint->fFlags & (FLAG_RECOVERY | FLAG_OPTION_SACK_PERMITTED))
+			== (FLAG_RECOVERY | FLAG_OPTION_SACK_PERMITTED)) {
+		endpoint->fSendNext = endpoint->fSendMax;
+		endpoint->_RecoverySend();
+	} else
+		endpoint->_SendQueued();
 }
 
 
