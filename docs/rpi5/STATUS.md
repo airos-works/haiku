@@ -29,10 +29,9 @@ Not done yet:
 - Display: no mode setting. The firmware picks each output's mode at boot
   (1080p here, also for the 4K monitor; it ignores `hdmi_mode` on the
   Pi 5) and only for outputs connected then; air/OS shows its regions
-  unscaled at those modes (no scaled modes, a software cursor). Mode
+  unscaled at those modes (no scaled modes). Mode
   setting needs the pixel valves and the HDMI PHY/PLL (Linux:
-  `vc4_crtc.c`, `vc4_hdmi_phy.c`); a hardware cursor a second plane with
-  its own UPM range. The firmware KMS tags are no way round it: the Pi 5
+  `vc4_crtc.c`, `vc4_hdmi_phy.c`). The firmware KMS tags are no way round it: the Pi 5
   firmware accepts `SET_PLANE` (0x00048015) but shows nothing.
 - Video: the BCM2712 has no H.264 decoder and no video encoder at all
   (only the HEVC decoder): H.264 decoding and all encoding stay in
@@ -91,6 +90,14 @@ planes:
   fields kept) into one of two slots per channel at the end of the list
   memory (words 0xe00 on), then pointing `LPTRS` at it: the compositor
   takes it at the next frame;
+- puts the cursor (64x64 buffer, premultiplied ARGB) as a second plane
+  after the region's in the list of the output under the hotspot: control
+  word 0x4800c007 (alpha from the pixels; D0 has the alpha mask in CTL0),
+  CTL2 0x2000fff0 (premultiplied), its own UPM range (units 0x3f0 and
+  0x3f4 of the 1024, handles 30 and 31; the firmware's planes use 0 and
+  0x199, handles 0 and 8). Moves rewrite the plane's position and pointer
+  words in the live list, as Linux's asynchronous updates do; showing,
+  hiding and changing outputs write new lists;
 - points `LPTRS` back at the firmware's list when app_server lets go, so
   the boot console shows again;
 - follows the blanks with the channel's frame count (`DISPn_STATUS`
