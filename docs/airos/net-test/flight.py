@@ -9,6 +9,7 @@ for r in rows:
     t=float(r[0]); d=r[1]; w=r[2]; sq=int(r[3]); ak=int(r[4]); pl=int(r[5]); win=int(r[6])
     flags=int(r[9]) if len(r)>9 else 0
     if d=='ba' and flags & 2: base=None; continue  # SYN: a new connection
+    if w!='in': continue  # the relay's lost and qdrop events repeat a frame
     if t0 is None: t0=t
     i=int((t-t0)/step)
     if d=='ba' and pl>0:

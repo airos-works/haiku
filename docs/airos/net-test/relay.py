@@ -26,6 +26,16 @@ loss = float(sys.argv[7]) if len(sys.argv) > 7 else 0.0
 lossdir = sys.argv[8] if len(sys.argv) > 8 else "ba"
 queue = int(sys.argv[9]) * 1024 if len(sys.argv) > 9 else 256 * 1024
 random.seed(int(sys.argv[10]) if len(sys.argv) > 10 else 1)
+# BURST=after:n:k:rx drops, in LOSSDIR, every k-th data frame of the n that
+# follow AFTER seconds past the first data frame (k=1: n in a row), and the
+# first resend of each of the next RX sequences resent from then on:
+# reproducible loss patterns.
+burst = [float(x) for x in os.environ.get("BURST", "").split(":") if x]
+burst_first = None
+burst_index = 0
+burst_rx = 0
+burst_high = {}
+burst_resent = set()
 
 sa = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sa.bind(("127.0.0.1", la))
@@ -62,8 +72,25 @@ def log_frame(t, d, data, what):
     flags = data[t0 + 13]
     doff = (data[t0 + 12] >> 4) * 4
     win = struct.unpack("!H", data[t0 + 14:t0 + 16])[0]
-    trace.write("%.6f %s %s %u %u %d %d %d %d %d\n" % (t, d, what, sq, ak,
-        tl - ihl - doff, win, sp, dp, flags))
+    # SACK blocks (option 5) as left-right pairs after the flags
+    sacks = []
+    i = t0 + 20
+    while i < t0 + doff and i < len(data):
+        kind = data[i]
+        if kind == 0:
+            break
+        if kind == 1:
+            i += 1
+            continue
+        if i + 1 >= len(data) or data[i + 1] < 2:
+            break
+        if kind == 5:
+            for j in range(i + 2, i + data[i + 1] - 7, 8):
+                sacks.append("%u-%u" % struct.unpack("!II", data[j:j + 8]))
+        i += data[i + 1]
+    trace.write("%.6f %s %s %u %u %d %d %d %d %d%s\n" % (t, d, what, sq, ak,
+        tl - ihl - doff, win, sp, dp, flags,
+        "".join(" " + s for s in sacks)))
 start = time.monotonic()
 last_report = start
 
@@ -84,6 +111,33 @@ def stop(*_):
     if trace:
         trace.close()
     sys.exit(0)
+
+
+def _burst_drop(now, d, data):
+    global burst_first, burst_index, burst_rx
+    if len(data) < 100 or data[12:14] != b"\x08\x00" or data[23] != 6:
+        return False
+    t0 = 14 + (data[14] & 0x0f) * 4
+    sq = struct.unpack("!I", data[t0 + 4:t0 + 8])[0]
+    resend = d in burst_high and ((sq - burst_high[d]) & 0xffffffff) >= 1 << 31
+    if not resend:
+        burst_high[d] = sq
+    if burst_first is None:
+        burst_first = now
+    if now - burst_first < burst[0]:
+        return False
+    if resend:
+        # each sequence's first resend only
+        if len(burst) > 3 and burst_rx < burst[3] and sq not in burst_resent:
+            burst_resent.add(sq)
+            burst_rx += 1
+            return True
+        return False
+    burst_index += 1
+    if burst_index > burst[1]:
+        return False
+    k = int(burst[2]) if len(burst) > 2 else 1
+    return burst_index % k == 0
 
 
 signal.signal(signal.SIGTERM, stop)
@@ -111,10 +165,16 @@ while True:
                 st["lost"] += 1
                 log_frame(now - start, d, data, "lost")
                 continue
+            if burst and (lossdir == "both" or lossdir == d) \
+                    and _burst_drop(now, d, data):
+                st["lost"] += 1
+                log_frame(now - start, d, data, "lost")
+                continue
             # bottleneck: serialization at rate, tail drop beyond the queue
             begin = max(now, free_at[d])
             if (begin - now) * rate / 8 > queue:
                 st["qdrop"] += 1
+                log_frame(now - start, d, data, "qdrop")
                 continue
             free_at[d] = begin + len(data) * 8 / rate
             seq += 1
