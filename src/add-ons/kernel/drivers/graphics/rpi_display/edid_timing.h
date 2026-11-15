@@ -137,8 +137,11 @@ cta_timing(unsigned code, firmware_timing& timing)
 */
 static inline bool
 preferred_edid_timing(const uint8_t* edid, unsigned length,
-	firmware_timing& timing, uint32_t maxClock = RPI_DEFAULT_MAX_PIXEL_CLOCK)
+	firmware_timing& timing, uint32_t maxClock = RPI_DEFAULT_MAX_PIXEL_CLOCK,
+	uint16_t wantWidth = 0, uint16_t wantHeight = 0)
 {
+	// with a size wanted, the fastest timing of that size
+	bool wanted = wantWidth != 0 && wantHeight != 0;
 	if (length < 128 || !valid_edid_block(edid, true))
 		return false;
 
@@ -148,6 +151,8 @@ preferred_edid_timing(const uint8_t* edid, unsigned length,
 	firmware_timing best = {};
 	auto consider = [&](const firmware_timing& t) {
 		if (!usable_timing(t, maxClock))
+			return;
+		if (wanted && (t.hdisplay != wantWidth || t.vdisplay != wantHeight))
 			return;
 		if (found) {
 			bool fits = havePreferred && t.hdisplay == preferred.hdisplay
@@ -170,6 +175,8 @@ preferred_edid_timing(const uint8_t* edid, unsigned length,
 		found = true;
 	};
 
+	if (wanted)
+		havePreferred = false;
 	if (havePreferred && usable_timing(preferred, maxClock)) {
 		best = preferred;
 		found = true;
@@ -217,7 +224,7 @@ preferred_edid_timing(const uint8_t* edid, unsigned length,
 			}
 		}
 	}
-	if (!found && (edid[35] & 0x20) != 0) {
+	if (!found && !wanted && (edid[35] & 0x20) != 0) {
 		// EDID explicitly advertises VGA 640x480 at 60 Hz.
 		best = {0, 0, 0, 25175, 640, 656, 752, 800, 0, 480, 490,
 			492, 525, 0, 60, 0, 0};

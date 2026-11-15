@@ -14,7 +14,7 @@ Pi 4 and a Pi 5. How it boots: BOOT.md.
 | SD card | `bcm2711_emmc2` on the BCM2712 slot, SDMA, 50 MHz high speed | 128 GB card read and written |
 | USB | both RP1 xHCIs (`xhci_fdt`), SuperSpeed (since 2026-11-15) | KVM keyboard, mouse, RNDIS, mass storage; an RTL9210 NVMe adapter (1 TB SSD) on a blue port reads 243-270 MB/s |
 | Ethernet | `rp1_gem`, 1 Gbit/s | DHCP, ping 0.16 ms, no loss |
-| Display | `rpi_display` on the HVS's display lists: both HDMI outputs, one desktop, at the modes the firmware set (1080p) | 2026-11-15: 3840x1080 desktop over the KVM (HDMI0) and a Dell 4K monitor (HDMI1, at 1080p); both pictures right (HDMI0 through the KVM, HDMI1 seen by the owner: the desktop's right half); blanks at 60.00 Hz; GLTeapot synced at 59 FPS |
+| Display | `rpi_display` on the HVS: both HDMI outputs, one desktop; mode setting (EDID's preferred mode up to 340 MHz), scaled regions, hardware cursor | 2026-11-15: the KVM at 1080p (HDMI0) and 1280x720 (set in the driver settings, the KVM reports 720p); the Dell 4K at 3840x2160 30 Hz (HDMI1, code 95), its half of the desktop scaled 2x by the HVS (seen right by the owner); blanks at 60.00 Hz; GLTeapot synced |
 | Watchdog | `airos.watchdog` (lab), restart through PSCI | resets after a hang |
 | `airos.debug` | loader and kernel output on the screen | boots to the network (kernel pager: P) |
 | GPU | `v3d` on the V3D 7.1.10 at 1.15 GHz, Mesa 25.3.6 | 2026-11-15: GL ES 3.1 and Vulkan 1.3 probes pass (1080p with depth exact), texture and readback probes pass, GLTeapot ~1690 FPS; `rpi4_v3d_probe` passes (TFU raster to UIF, uncached and cached) |
@@ -26,13 +26,13 @@ Pi 4 and a Pi 5. How it boots: BOOT.md.
 
 Not done yet:
 
-- Display: no mode setting. The firmware picks each output's mode at boot
-  (1080p here, also for the 4K monitor; it ignores `hdmi_mode` on the
-  Pi 5) and only for outputs connected then; air/OS shows its regions
-  unscaled at those modes (no scaled modes). Mode
-  setting needs the pixel valves and the HDMI PHY/PLL (Linux:
-  `vc4_crtc.c`, `vc4_hdmi_phy.c`). The firmware KMS tags are no way round it: the Pi 5
-  firmware accepts `SET_PLANE` (0x00048015) but shows nothing.
+- Display: no 4K at 60 Hz (594 MHz): above 340 MHz HDMI 2.0 needs
+  scrambling, which the monitor has to be told of over the DDC (SCDC);
+  there is no BCM2712 I2C driver for it yet. Outputs connected after boot
+  stay dark (the driver needs the firmware's plane of the channel as a
+  template). No mode choice in Screen yet: the size comes from the EDID
+  or the driver settings (`hdmi0 1280x720` in
+  `~/config/settings/kernel/drivers/rpi_display`).
 - Video: the BCM2712 has no H.264 decoder and no video encoder at all
   (only the HEVC decoder): H.264 decoding and all encoding stay in
   software (FFmpeg).
@@ -105,9 +105,22 @@ planes:
   An output plugged in after boot stays dark: the firmware did not start
   its channel.
 
-The accelerant gets `RPI_DISPLAY_FIXED_MODES`: each output's own mode
-only, and a region the size of the mode (app_server's own rendering
-scale is fine).
+Mode setting follows Linux's vc4 driver (the CRTC disable, then enable
+with the HDMI encoder's hooks), keeping what the firmware set up that
+does not depend on the mode: HSM and pixel BVB clocks (648 and 324 MHz),
+CSC, the HVS output buffers (3840 pixels by 4 lines a channel), the pixel
+valves' two pixels a clock (Linux runs one, with `ODD_TIMING`). The PHY's
+PLL and lane settings are vc6_hdmi_phy_init()'s; the firmware's own for
+148.5 MHz are the same words. The AVI InfoFrame keeps the firmware's but
+gets the new mode's video code.
+
+Scaling (regions of any size, aspect kept, as the Pi 4's firmware does):
+polyphase filtering down to 2/3, trapezoidal below, Linux's
+Mitchell-Netravali kernel at list word 0xdf0, line buffer 512 words an
+output (the firmware's planes use none). The cursor scales with its
+output's region. As on the Pi 4 the accelerant has the hardware enlarge
+only, so a 1080p screen next to a 4K one at 200% gets a 100% desktop,
+the 4K output's half scaled up.
 
 Read the HVS through `/dev/misc/mem` in blocks (`dd bs=512`): four-byte
 reads came back wrong.
