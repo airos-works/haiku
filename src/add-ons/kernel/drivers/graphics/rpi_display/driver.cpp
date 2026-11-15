@@ -31,6 +31,7 @@
 #include <KernelExport.h>
 
 #include <boot_item.h>
+#include <driver_settings.h>
 #include <frame_buffer_console.h>
 #include <graphic_driver.h>
 #include <lock.h>
@@ -116,6 +117,29 @@
 	// the firmware's planes (0 and 0x199); 4 units a cursor (3 needed)
 #define HVS6_CURSOR_UPM_HANDLE			30
 	// handles 30 and 31 (the firmware's planes use 0 and 8)
+#define HVS6_DISP_CTRL0_RESET			(1u << 30)
+#define HVS6_DISP_CTRL1(n)				(0x104 + (n) * 0x40)
+#define HVS6_DISP_CTRL1_INTLACE			(1u << 0)
+// scaling (vc4_plane.c vc4_write_ppf(), vc4_write_tpz(), the LBM)
+#define HVS6_CTL0_SCL_SHIFT				5	// SCL0 bits 7:5, SCL1 10:8
+#define HVS6_SCL_H_PPF_V_PPF			0
+#define HVS6_SCL_H_TPZ_V_PPF			1
+#define HVS6_SCL_H_PPF_V_TPZ			2
+#define HVS6_SCL_H_TPZ_V_TPZ			3
+#define HVS6_SCL_H_PPF_V_NONE			4
+#define HVS6_SCL_H_NONE_V_PPF			5
+#define HVS6_SCL_H_NONE_V_TPZ			6
+#define HVS6_SCL_H_TPZ_V_NONE			7
+#define HVS6_PPF_AGC					(1u << 30)
+#define HVS6_KERNEL_WORD				0xdf0
+	// the scaling filter, 11 words in the display list memory
+#define HVS6_KERNEL_WORDS				11
+#define HVS6_LBM_PER_OUTPUT				512
+#define HVS6_LBM_CURSOR					480
+	// a region's plane needs at most 4096 * 4 * 3 / 128 = 384 words (four
+	// words a component, red, green and blue, a line), the cursor's 64 *
+	// 4 * 4 / 128 = 8 from here (Linux's vc4_lbm_channel_size())
+	// of the 1024 line buffer words: the firmware's planes use none
 #define HVS6_SLOT_BASE					0xe00
 #define HVS6_SLOT_WORDS					0x40
 	// two slots a channel at the end of the list memory, used in turn
@@ -190,6 +214,20 @@ struct display_info {
 	uint32			regionPitch[RPI_DISPLAY_MAX_OUTPUTS];
 	uint32			activeSlot[RPI_DISPLAY_MAX_OUTPUTS];
 	bool			cursorIn[RPI_DISPLAY_MAX_OUTPUTS];
+	uint32			cursorOffset[RPI_DISPLAY_MAX_OUTPUTS];
+	uint32			cursorWordCount[RPI_DISPLAY_MAX_OUTPUTS];
+	uint32			cursorWords[RPI_DISPLAY_MAX_OUTPUTS][32];
+
+	// the BCM2712's HDMI encoders and pixel valves, for mode setting
+	area_id			modeAreas[RPI_DISPLAY_MAX_OUTPUTS][4];
+	volatile uint8*	hdmiRegs[RPI_DISPLAY_MAX_OUTPUTS];	// HDMI block
+	volatile uint8*	phyRegs[RPI_DISPLAY_MAX_OUTPUTS];
+	volatile uint8*	rmRegs[RPI_DISPLAY_MAX_OUTPUTS];
+	volatile uint8*	packetRegs[RPI_DISPLAY_MAX_OUTPUTS];
+	volatile uint8*	pvRegs[RPI_DISPLAY_MAX_OUTPUTS];
+	area_id			hdArea;
+	volatile uint8*	hdRegs;
+	uint32			modeClock[RPI_DISPLAY_MAX_OUTPUTS];	// kHz, ours
 
 	// a hardware cursor, composited by the firmware over the frame buffer;
 	// the position is the hotspot, in frame buffer pixels
@@ -550,6 +588,11 @@ map_compositor(display_info* info)
 //	#pragma mark - BCM2712 display lists
 
 
+static void output_dest(uint32 nativeWidth, uint32 nativeHeight, uint32 width,
+	uint32 height, int32* destX, int32* destY, uint32* destWidth,
+	uint32* destHeight);
+
+
 static bool
 is_bcm2712(device_node* node)
 {
@@ -624,16 +667,82 @@ hvs6_read_firmware_plane(display_info* info, uint32 index)
 }
 
 
-/*!	The words of the cursor's plane on output \a index, unscaled, cut to
-	the output; false if it is not on it.
+/*!	The words of a plane's scaling (after its pointer words): the line
+	buffer at \a lbm, the parameters, the filter. Returns the count; sets
+	the scaler field of \a control.
 */
-static bool
+static uint32
+hvs6_scaling_words(uint32 width, uint32 height, uint32 destWidth,
+	uint32 destHeight, uint32 lbm, uint32& control, uint32* words)
+{
+	enum { NONE, PPF, TPZ };
+	// as Linux picks it: polyphase down to 2/3, trapezoidal below
+	int xScaling = destWidth == width ? NONE
+		: 3 * destWidth >= 2 * width ? PPF : TPZ;
+	int yScaling = destHeight == height ? NONE
+		: 3 * destHeight >= 2 * height ? PPF : TPZ;
+	static const uint8 kScl[3][3] = {
+		// y: NONE, PPF, TPZ
+		{ 0, HVS6_SCL_H_NONE_V_PPF, HVS6_SCL_H_NONE_V_TPZ },	// x NONE
+		{ HVS6_SCL_H_PPF_V_NONE, HVS6_SCL_H_PPF_V_PPF,
+			HVS6_SCL_H_PPF_V_TPZ },								// x PPF
+		{ HVS6_SCL_H_TPZ_V_NONE, HVS6_SCL_H_TPZ_V_PPF,
+			HVS6_SCL_H_TPZ_V_TPZ }								// x TPZ
+	};
+	control &= ~(HVS6_CTL0_UNITY | (0x3fu << HVS6_CTL0_SCL_SHIFT));
+	if (xScaling == NONE && yScaling == NONE) {
+		control |= HVS6_CTL0_UNITY;
+		return 0;
+	}
+	uint32 scl = kScl[xScaling][yScaling];
+	control |= scl << HVS6_CTL0_SCL_SHIFT | scl << (HVS6_CTL0_SCL_SHIFT + 3);
+
+	uint32 count = 0;
+	if (yScaling != NONE)
+		words[count++] = lbm;
+	// horizontal, then vertical parameters (16.16 scales)
+	for (int axis = 0; axis < 2; axis++) {
+		int scaling = axis == 0 ? xScaling : yScaling;
+		uint32 source = (axis == 0 ? width : height) << 16;
+		uint32 dest = axis == 0 ? destWidth : destHeight;
+		if (scaling == PPF) {
+			uint32 scale = (source / dest) & ~1u;
+			// half a pixel in, and half the scale's rounding
+			int32 phase = -(1 << 6 >> 1)
+				+ (((int32)(source - dest * scale) >> 10) >> 1);
+			if (phase >= 1 << 6)
+				phase = (1 << 6) - 1;
+			words[count++] = HVS6_PPF_AGC | (scale & 0x1ffff) << 8
+				| ((uint32)phase & 0x7f);
+			if (axis == 1)
+				words[count++] = 0xc0c0c0c0;
+		} else if (scaling == TPZ) {
+			uint32 scale = source / dest;
+			words[count++] = (scale & 0x1fffff) << 8;
+			words[count++] = (0xffffffffu / scale) & 0xffff;
+			if (axis == 1)
+				words[count++] = 0xc0c0c0c0;
+		}
+	}
+	// the filter for each polyphase pass
+	if (xScaling == PPF || yScaling == PPF) {
+		for (int i = 0; i < 4; i++)
+			words[count++] = HVS6_KERNEL_WORD;
+	}
+	return count;
+}
+
+
+/*!	The words of the cursor's plane on output \a index, scaled as the
+	output's region is, cut to the output; 0 if it is not on it.
+*/
+static uint32
 hvs6_cursor_plane(display_info* info, uint32 index, uint32* words)
 {
 	const rpi_display_output& output = info->shared->outputs[index];
 	if (!info->cursorDefined || !info->cursorVisible
 		|| info->cursorBufferAddress == 0 || !info->regionShown[index]) {
-		return false;
+		return 0;
 	}
 	int32 regionX = info->regionX[index];
 	int32 regionY = info->regionY[index];
@@ -641,48 +750,94 @@ hvs6_cursor_plane(display_info* info, uint32 index, uint32* words)
 	int32 height = info->regionHeight[index];
 	if (info->cursorX < regionX || info->cursorX >= regionX + width
 		|| info->cursorY < regionY || info->cursorY >= regionY + height) {
-		return false;
+		return 0;
 	}
 
-	// the image's top left on the output, the region centered on it
-	int32 x = info->cursorX - regionX - info->cursor.hot_x
-		+ (int32)(output.native_width - width) / 2;
-	int32 y = info->cursorY - regionY - info->cursor.hot_y
-		+ (int32)(output.native_height - height) / 2;
-	int32 cursorWidth = info->cursor.width;
-	int32 cursorHeight = info->cursor.height;
+	// where the image lands on the output, through the region's scaling
+	int32 destX, destY;
+	uint32 destWidth, destHeight;
+	output_dest(output.native_width, output.native_height, width, height,
+		&destX, &destY, &destWidth, &destHeight);
+	int32 left = destX + (int32)((int64)(info->cursorX - regionX
+		- info->cursor.hot_x) * (int32)destWidth / width);
+	int32 top = destY + (int32)((int64)(info->cursorY - regionY
+		- info->cursor.hot_y) * (int32)destHeight / height);
+	int32 right = destX + (int32)((int64)(info->cursorX - regionX
+		- info->cursor.hot_x + info->cursor.width) * (int32)destWidth
+		/ width);
+	int32 bottom = destY + (int32)((int64)(info->cursorY - regionY
+		- info->cursor.hot_y + info->cursor.height) * (int32)destHeight
+		/ height);
+
+	// cut to the output, the source in proportion
+	int32 sourceWidth = info->cursor.width;
+	int32 sourceHeight = info->cursor.height;
 	int32 skipX = 0, skipY = 0;
-	if (x < 0) {
-		skipX = -x;
-		x = 0;
+	if (left < 0) {
+		skipX = (int32)((int64)-left * sourceWidth / (right - left) + 1);
+		left += (int32)((int64)skipX * (right - left) / sourceWidth);
 	}
-	if (y < 0) {
-		skipY = -y;
-		y = 0;
+	if (top < 0) {
+		skipY = (int32)((int64)-top * sourceHeight / (bottom - top) + 1);
+		top += (int32)((int64)skipY * (bottom - top) / sourceHeight);
 	}
-	cursorWidth -= skipX;
-	cursorHeight -= skipY;
-	if (x + cursorWidth > (int32)output.native_width)
-		cursorWidth = output.native_width - x;
-	if (y + cursorHeight > (int32)output.native_height)
-		cursorHeight = output.native_height - y;
-	if (cursorWidth <= 0 || cursorHeight <= 0)
-		return false;
+	if (left < 0)
+		left = 0;
+	if (top < 0)
+		top = 0;
+	sourceWidth -= skipX;
+	sourceHeight -= skipY;
+	if (right > (int32)output.native_width) {
+		int32 cut = right - output.native_width;
+		int32 cutSource = (int32)((int64)cut * info->cursor.width
+			/ (right - left + 1) + 1);
+		sourceWidth -= cutSource;
+		right = output.native_width;
+	}
+	if (bottom > (int32)output.native_height) {
+		int32 cut = bottom - output.native_height;
+		int32 cutSource = (int32)((int64)cut * info->cursor.height
+			/ (bottom - top + 1) + 1);
+		sourceHeight -= cutSource;
+		bottom = output.native_height;
+	}
+	int32 cursorWidth = right - left;
+	int32 cursorHeight = bottom - top;
+	if (sourceWidth <= 0 || sourceHeight <= 0 || cursorWidth <= 0
+		|| cursorHeight <= 0) {
+		return 0;
+	}
 
 	const uint32 pitch = RPI_DISPLAY_CURSOR_MAX * 4;
 	uint64 address = info->cursorBufferAddress + (uint64)skipY * pitch
 		+ skipX * 4;
-	words[0] = HVS6_CURSOR_CTL0;
-	words[1] = (uint32)y << 16 | (uint32)x;
-	words[2] = HVS6_CURSOR_CTL2;
-	words[3] = (uint32)(cursorHeight - 1) << 16 | (uint32)(cursorWidth - 1);
-	words[4] = 0xc0c0c0c0;
-	words[5] = (HVS6_CURSOR_UPM_BASE + index * 4) << 16
+	uint32 control = HVS6_CURSOR_CTL0;
+	uint32 scaling[16];
+	uint32 scalingCount = hvs6_scaling_words(sourceWidth, sourceHeight,
+		cursorWidth, cursorHeight,
+		index * HVS6_LBM_PER_OUTPUT + HVS6_LBM_CURSOR, control, scaling);
+	bool scaled = scalingCount != 0;
+
+	uint32 count = 0;
+	words[count++] = control & ~HVS6_CTL0_NEXT_MASK;
+	words[count++] = (uint32)top << 16 | (uint32)left;
+	words[count++] = HVS6_CURSOR_CTL2;
+	if (scaled) {
+		words[count++] = (uint32)(cursorHeight - 1) << 16
+			| (uint32)(cursorWidth - 1);
+	}
+	words[count++] = (uint32)(sourceHeight - 1) << 16
+		| (uint32)(sourceWidth - 1);
+	words[count++] = 0xc0c0c0c0;
+	words[count++] = (HVS6_CURSOR_UPM_BASE + index * 4) << 16
 		| (HVS6_CURSOR_UPM_HANDLE + index) << 10
 		| (uint32)((address >> 32) & 0xff);
-	words[6] = (uint32)address;
-	words[7] = pitch;
-	return true;
+	words[count++] = (uint32)address;
+	words[count++] = pitch;
+	for (uint32 i = 0; i < scalingCount; i++)
+		words[count++] = scaling[i];
+	words[0] |= count << HVS6_CTL0_NEXT_SHIFT;
+	return count;
 }
 
 
@@ -698,29 +853,43 @@ hvs6_write_list(display_info* info, uint32 index)
 	uint32 width = info->regionWidth[index];
 	uint32 height = info->regionHeight[index];
 	uint32 pitch = info->regionPitch[index];
-	uint32 destX = (output.native_width - width) / 2;
-	uint32 destY = (output.native_height - height) / 2;
+	int32 destX, destY;
+	uint32 destWidth, destHeight;
+	output_dest(output.native_width, output.native_height, width, height,
+		&destX, &destY, &destWidth, &destHeight);
 	uint64 address = info->bufferAddress
 		+ (uint64)info->regionY[index] * pitch + info->regionX[index] * 4;
 	const uint32* plane = info->firmwarePlane[index];
 
-	uint32 words[2 * HVS6_PLANE_WORDS + 1] = {
-		(plane[0] & ~HVS6_CTL0_NEXT_MASK)
-			| (HVS6_PLANE_WORDS << HVS6_CTL0_NEXT_SHIFT),
-		destY << 16 | destX,
-		plane[2],
-		(height - 1) << 16 | (width - 1),
-		0xc0c0c0c0,
-			// context, the compositor's to write
-		(plane[5] & ~0xffu) | (uint32)((address >> 32) & 0xff),
-			// keeps the firmware's UPM (fetch buffer) settings
-		(uint32)address,
-		(plane[7] & ~0x1ffffu) | pitch
-	};
-	uint32 count = HVS6_PLANE_WORDS;
-	info->cursorIn[index] = hvs6_cursor_plane(info, index, words + count);
-	if (info->cursorIn[index])
-		count += HVS6_PLANE_WORDS;
+	uint32 control = plane[0] & ~HVS6_CTL0_NEXT_MASK;
+	uint32 scaling[16];
+	uint32 scalingCount = hvs6_scaling_words(width, height, destWidth,
+		destHeight, index * HVS6_LBM_PER_OUTPUT, control, scaling);
+
+	uint32 words[64];
+	uint32 count = 0;
+	words[count++] = control;
+	words[count++] = (uint32)destY << 16 | (uint32)destX;
+	words[count++] = plane[2];
+	if (scalingCount != 0)
+		words[count++] = (destHeight - 1) << 16 | (destWidth - 1);
+	words[count++] = (height - 1) << 16 | (width - 1);
+	words[count++] = 0xc0c0c0c0;
+		// context, the compositor's to write
+	words[count++] = (plane[5] & ~0xffu) | (uint32)((address >> 32) & 0xff);
+		// keeps the firmware's UPM (fetch buffer) settings
+	words[count++] = (uint32)address;
+	words[count++] = (plane[7] & ~0x1ffffu) | pitch;
+	for (uint32 i = 0; i < scalingCount; i++)
+		words[count++] = scaling[i];
+	words[0] |= count << HVS6_CTL0_NEXT_SHIFT;
+
+	uint32 cursorCount = hvs6_cursor_plane(info, index, words + count);
+	info->cursorIn[index] = cursorCount != 0;
+	info->cursorOffset[index] = count;
+	info->cursorWordCount[index] = cursorCount;
+	memcpy(info->cursorWords[index], words + count, cursorCount * 4);
+	count += cursorCount;
 	words[count++] = HVS6_CTL0_END;
 
 	uint32 slot = HVS6_SLOT_BASE + index * 2 * HVS6_SLOT_WORDS
@@ -735,6 +904,34 @@ hvs6_write_list(display_info* info, uint32 index)
 }
 
 
+/*!	The scaling filter (Linux's Mitchell/Netravali B = C = 1/3 kernel, laid
+	out as vc4_hvs_upload_linear_kernel() does), once.
+*/
+static void
+hvs6_upload_kernel(display_info* info)
+{
+	static const int16 kCoefficients[16] = {
+		0, -2, -6, -8, -10, -8, -3, 2, 18, 50, 82, 119, 155, 187, 213, 227
+	};
+	uint32 half[6];
+	for (int i = 0; i < 6; i++) {
+		int16 c0 = kCoefficients[i * 3];
+		int16 c1 = i * 3 + 1 < 16 ? kCoefficients[i * 3 + 1] : 0;
+		int16 c2 = i * 3 + 2 < 16 ? kCoefficients[i * 3 + 2] : 0;
+		if (i == 5) {
+			// c15, c15, 0
+			c1 = kCoefficients[15];
+			c2 = 0;
+		}
+		half[i] = ((uint32)c0 & 0x1ff) | ((uint32)c1 & 0x1ff) << 9
+			| ((uint32)c2 & 0x1ff) << 18;
+	}
+	volatile uint32* kernel = hvs6_dlist(info, HVS6_KERNEL_WORD);
+	for (int i = 0; i < HVS6_KERNEL_WORDS; i++)
+		kernel[i] = i < 6 ? half[i] : half[HVS6_KERNEL_WORDS - i - 1];
+}
+
+
 /*!	Shows the region (x, y, width, height) of the frame buffer on output
 	\a index, unscaled, centered when it is smaller than the mode.
 */
@@ -744,10 +941,6 @@ hvs6_show(display_info* info, uint32 index, int32 x, int32 y, uint32 width,
 {
 	if (!info->hasFirmwarePlane[index])
 		return B_NOT_SUPPORTED;
-	const rpi_display_output& output = info->shared->outputs[index];
-	if (width > output.native_width || height > output.native_height)
-		return B_BAD_VALUE;
-
 	info->regionShown[index] = true;
 	info->regionX[index] = x;
 	info->regionY[index] = y;
@@ -770,16 +963,20 @@ hvs6_update_cursor(display_info* info)
 	for (uint32 i = 0; i < info->shared->output_count; i++) {
 		if (!info->regionShown[i])
 			continue;
-		uint32 words[HVS6_PLANE_WORDS];
-		bool on = hvs6_cursor_plane(info, i, words);
-		if (on && info->cursorIn[i]) {
+		uint32 words[32];
+		uint32 count = hvs6_cursor_plane(info, i, words);
+		if (count != 0 && info->cursorIn[i]
+			&& count == info->cursorWordCount[i]
+			&& words[0] == info->cursorWords[i][0]) {
+			// the same plane moved: the words that changed, in place
 			volatile uint32* plane = hvs6_dlist(info,
-				info->activeSlot[i] + HVS6_PLANE_WORDS);
-			plane[1] = words[1];
-			plane[3] = words[3];
-			plane[5] = words[5];
-			plane[6] = words[6];
-		} else if (on != info->cursorIn[i])
+				info->activeSlot[i] + info->cursorOffset[i]);
+			for (uint32 k = 1; k < count; k++) {
+				if (words[k] != info->cursorWords[i][k])
+					plane[k] = words[k];
+			}
+			memcpy(info->cursorWords[i], words, count * 4);
+		} else if (count != 0 || info->cursorIn[i])
 			hvs6_write_list(info, i);
 	}
 }
@@ -797,6 +994,402 @@ hvs6_restore(display_info* info, uint32 index)
 }
 
 
+
+//	#pragma mark - BCM2712 mode setting
+
+
+/*	The firmware starts each output at a mode of its choosing (1080p, also
+	on a 4K monitor) and ignores the mode options of config.txt on the Pi 5.
+	The driver sets the mode the monitor's EDID prefers itself, the way
+	Linux's vc4 driver does (vc4_crtc.c, vc4_hdmi.c, vc4_hdmi_phy.c:
+	vc6_hdmi_phy_init()), keeping what the firmware set up that does not
+	depend on the mode: the HDMI state machine and pixel clocks (648 and
+	324 MHz from the firmware, enough for 594 MHz), the colour conversion,
+	the compositor's output buffers (3840 pixels, 4 lines a channel), the
+	pixel valves' two pixels a clock. Without scrambling (and the SCDC
+	messages to the monitor it takes), up to 340 MHz: 4K at 30 Hz. */
+
+// The HDMI block (vc4_hdmi_regs.h vc6_hdmi_hdmi*_fields)
+#define HDMI6_FIFO_CTL					0x07c
+#define  HDMI6_FIFO_CTL_MASTER_SLAVE_N	(1u << 0)
+#define  HDMI6_FIFO_CTL_RECENTER		(1u << 6)
+#define  HDMI6_FIFO_CTL_RECENTER_DONE	(1u << 14)
+#define  HDMI6_FIFO_VALID_WRITE_MASK	0xefff
+#define HDMI6_RAM_PACKET_CONFIG			0x0c4
+#define HDMI6_SCHEDULER_CONTROL			0x0e8
+#define  HDMI6_SCHEDULER_MODE_HDMI		(1u << 0)
+#define  HDMI6_SCHEDULER_HDMI_ACTIVE	(1u << 1)
+#define  HDMI6_SCHEDULER_IGNORE_VSYNC_PREDICTS (1u << 5)
+#define  HDMI6_SCHEDULER_MANUAL_FORMAT	(1u << 15)
+#define HDMI6_HORZA						0x0ec
+#define HDMI6_HORZB						0x0f0
+#define HDMI6_VERTA0					0x0f4
+#define HDMI6_VERTB0					0x0f8
+#define HDMI6_VERTA1					0x100
+#define HDMI6_VERTB1					0x104
+// "hd": HDMI_VID_CTL of HDMI 0 and 1
+#define HD6_VID_CTL(n)					(0x44 + (n) * 4)
+#define  HD6_VID_CTL_ENABLE				(1u << 31)
+#define  HD6_VID_CTL_VSYNC_LOW			(1u << 28)
+#define  HD6_VID_CTL_HSYNC_LOW			(1u << 27)
+#define  HD6_VID_CTL_CLRRGB				(1u << 23)
+#define  HD6_VID_CTL_BLANKPIX			(1u << 18)
+#define  HD6_VID_CTL_BLANK_INSERT_EN	(1u << 16)
+// the PHY
+#define PHY6_RESET_CTL					0x000
+#define PHY6_POWERUP_CTL				0x004
+#define PHY6_CTL(n)						(0x008 + (n) * 4)	// lanes 0-2, clock
+#define PHY6_PLL_REFCLK					0x01c
+#define PHY6_PLL_POST_KDIV				0x028
+#define PHY6_PLL_VCOCLK_DIV				0x02c
+#define PHY6_PLL_CFG					0x044
+#define PHY6_TMDS_CLK_WORD_SEL			0x054
+#define PHY6_PLL_MISC(n)				(0x060 + (n) * 4)
+#define PHY6_PLL_RESET_CTL				0x190
+#define PHY6_PLL_POWERUP_CTL			0x194
+// the rate manager
+#define RM6_OFFSET						0x018
+// the pixel valve (vc4_regs.h PV_*)
+#define PV6_CONTROL						0x00
+#define  PV6_CONTROL_EN					(1u << 0)
+#define  PV6_CONTROL_FIFO_CLR			(1u << 1)
+#define PV6_V_CONTROL					0x04
+#define  PV6_VCONTROL_VIDEN				(1u << 0)
+#define  PV6_VCONTROL_CONTINUOUS		(1u << 1)
+#define PV6_VSYNCD_EVEN					0x08
+#define PV6_HORZA						0x0c
+#define PV6_HORZB						0x10
+#define PV6_VERTA						0x14
+#define PV6_VERTB						0x18
+#define PV6_PIXELS_PER_CLOCK			2
+	// as the firmware runs them for progressive modes
+
+#define BCM2712_MAX_PIXEL_CLOCK			340000	// kHz, without scrambling
+#define AVI_INFOFRAME_PACKET			2		// type 0x82 - 0x80
+#define PACKET_STRIDE					0x24
+
+// The PHY's lane settings by TMDS rate: words for the three data lanes'
+// and the clock lane's control registers (vc4_hdmi_phy.c's
+// vc6_hdmi_phy_settings, packed).
+static const struct {
+	uint32	minRate, maxRate;
+	uint32	lane[4];
+} kPhy6Settings[] = {
+	{ 0u, 222000000u, { 0x80828700, 0x80828700, 0x80828700, 0x80828700 } },
+	{ 222000001u, 297000000u,
+		{ 0xc0870000, 0xc0870000, 0xc0870000, 0xc0870800 } },
+	{ 297000001u, 597000044u,
+		{ 0x848f8700, 0x848f8700, 0x848f8700, 0x849f8f00 } },
+};
+static const uint32 kPhy6PllMisc[9] = {
+	0x810c6000, 0x00b8c451, 0x46402e31, 0x00b8c005, 0x42410261, 0xcc021001,
+	0xc8301c80, 0xb0804444, 0xf80f8000
+};
+
+
+static inline uint32
+reg_read(volatile uint8* base, uint32 offset)
+{
+	return *(volatile uint32*)(base + offset);
+}
+
+
+static inline void
+reg_write(volatile uint8* base, uint32 offset, uint32 value)
+{
+	*(volatile uint32*)(base + offset) = value;
+}
+
+
+static status_t
+map_page(const char* name, phys_addr_t physical, area_id& area,
+	volatile uint8*& registers)
+{
+	phys_addr_t page = physical & ~(phys_addr_t)(B_PAGE_SIZE - 1);
+	void* address;
+	area = map_physical_memory(name, page, B_PAGE_SIZE,
+		B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &address);
+	if (area < 0)
+		return area;
+	registers = (volatile uint8*)address + (physical - page);
+	return B_OK;
+}
+
+
+/*!	The registers of both outputs (Linux's bcm2712.dtsi: the HDMI nodes'
+	"hdmi", "phy", "rm", "packet" and "hd" ranges, the pixel valves).
+*/
+static status_t
+bcm2712_map_mode_registers(display_info* info)
+{
+	info->hdArea = -1;
+	for (uint32 i = 0; i < RPI_DISPLAY_MAX_OUTPUTS; i++) {
+		for (uint32 k = 0; k < 4; k++)
+			info->modeAreas[i][k] = -1;
+	}
+	status_t status = map_page("bcm2712 hdmi hd", 0x107c720000ull,
+		info->hdArea, info->hdRegs);
+	for (uint32 i = 0; status == B_OK && i < RPI_DISPLAY_MAX_OUTPUTS; i++) {
+		uint64 base = 0x107c700000ull + i * 0x5000;
+		volatile uint8* page;
+		status = map_page("bcm2712 hdmi", base + 0x1000, info->modeAreas[i][0],
+			page);
+		if (status != B_OK)
+			break;
+		info->hdmiRegs[i] = page + 0x400;
+		info->phyRegs[i] = page + 0xd00;
+		status = map_page("bcm2712 hdmi rm", base + 0x2000,
+			info->modeAreas[i][1], info->rmRegs[i]);
+		if (status == B_OK) {
+			status = map_page("bcm2712 hdmi packets", base + 0x3800,
+				info->modeAreas[i][2], info->packetRegs[i]);
+		}
+		if (status == B_OK) {
+			status = map_page("bcm2712 pixel valve",
+				0x107c410000ull + i * 0x1000, info->modeAreas[i][3],
+				info->pvRegs[i]);
+		}
+	}
+	return status;
+}
+
+
+static void
+bcm2712_unmap_mode_registers(display_info* info)
+{
+	if (info->hdArea >= 0)
+		delete_area(info->hdArea);
+	for (uint32 i = 0; i < RPI_DISPLAY_MAX_OUTPUTS; i++) {
+		for (uint32 k = 0; k < 4; k++) {
+			if (info->modeAreas[i][k] >= 0)
+				delete_area(info->modeAreas[i][k]);
+		}
+	}
+}
+
+
+/*!	vc6_hdmi_phy_init(): the PLL to ten times the TMDS character rate
+	times a divider, the lanes for the rate. */
+static void
+bcm2712_phy_init(display_info* info, uint32 index, uint64 tmdsRate)
+{
+	volatile uint8* phy = info->phyRegs[index];
+
+	// a VCO between 8 and 12 GHz, the divider in the middle of the range
+	uint32 divider = 0;
+	while (tmdsRate * divider * 10 < 8000000000ull)
+		divider++;
+	uint32 minDivider = divider;
+	while (tmdsRate * (divider + 1) * 10 < 12000000000ull)
+		divider++;
+	divider = minDivider + (divider - minDivider) / 2;
+	uint64 vco = tmdsRate * divider * 10;
+
+	uint32 setting = B_COUNT_OF(kPhy6Settings) - 1;
+	for (uint32 i = 0; i < B_COUNT_OF(kPhy6Settings); i++) {
+		if (tmdsRate >= kPhy6Settings[i].minRate
+			&& tmdsRate <= kPhy6Settings[i].maxRate) {
+			setting = i;
+			break;
+		}
+	}
+
+	reg_write(phy, PHY6_RESET_CTL, 0);
+	reg_write(phy, PHY6_POWERUP_CTL, 0);
+	for (uint32 i = 0; i < B_COUNT_OF(kPhy6PllMisc); i++)
+		reg_write(phy, PHY6_PLL_MISC(i), kPhy6PllMisc[i]);
+	// the 54 MHz crystal, CMOS
+	reg_write(phy, PHY6_PLL_REFCLK, (1u << 13) | 54);
+	reg_write(phy, PHY6_RESET_CTL, 0x7f);
+	// the rate manager's offset: the VCO over the reference, 9.22
+	uint64 offset = ((vco * 2) << 22) / 54000000ull >> 2;
+	reg_write(info->rmRegs[index], RM6_OFFSET,
+		(1u << 31) | ((uint32)offset & 0x7fffffff));
+	reg_write(phy, PHY6_PLL_VCOCLK_DIV, (1u << 10) | divider);
+	reg_write(phy, PHY6_PLL_CFG, 0);
+	reg_write(phy, PHY6_PLL_POST_KDIV, (2u << 2) | 1);
+	for (uint32 lane = 0; lane < 4; lane++)
+		reg_write(phy, PHY6_CTL(lane), kPhy6Settings[setting].lane[lane]);
+	reg_write(phy, PHY6_TMDS_CLK_WORD_SEL, tmdsRate >= 340000000 ? 3 : 0);
+	// band gap, LDO, bias, the clock and data lanes
+	reg_write(phy, PHY6_POWERUP_CTL, 0x1cf);
+	reg_write(phy, PHY6_PLL_POWERUP_CTL, 1);
+	reg_write(phy, PHY6_PLL_RESET_CTL,
+		reg_read(phy, PHY6_PLL_RESET_CTL) & ~1u);
+	reg_write(phy, PHY6_PLL_RESET_CTL,
+		reg_read(phy, PHY6_PLL_RESET_CTL) | 1u);
+	INFO("HDMI%" B_PRIu32 ": PHY for %" B_PRIu64 " Hz, VCO %" B_PRIu64
+		" Hz (divider %" B_PRIu32 "), lane settings %" B_PRIu32 "\n", index,
+		tmdsRate, vco, divider, setting);
+}
+
+
+/*!	The AVI InfoFrame the firmware left in the packet RAM, with the new
+	mode's video code (and its checksum fixed). The packet RAM is off. */
+static void
+bcm2712_update_avi(display_info* info, uint32 index, uint16 videoCode)
+{
+	volatile uint8* packet = info->packetRegs[index]
+		+ PACKET_STRIDE * AVI_INFOFRAME_PACKET;
+	// bytes 0-2, 3-6, 7-9, ...: VIC is byte 7, the checksum byte 3
+	uint32 word1 = reg_read(packet, 4);
+	uint32 word2 = reg_read(packet, 8);
+	if ((reg_read(packet, 0) & 0xff) != 0x82)
+		return;
+	uint8 oldCode = word2 & 0xff;
+	uint8 checksum = (word1 & 0xff) + oldCode - (uint8)videoCode;
+	reg_write(packet, 8, (word2 & ~0xffu) | (uint8)videoCode);
+	reg_write(packet, 4, (word1 & ~0xffu) | checksum);
+}
+
+
+/*!	Sets output \a index to \a t (Linux's vc4_crtc_disable(), then
+	vc4_crtc_atomic_enable() with the HDMI encoder's hooks). The compositor
+	channel keeps its display list. */
+static status_t
+bcm2712_set_mode(display_info* info, uint32 index, const firmware_timing& t)
+{
+	volatile uint8* hdmi = info->hdmiRegs[index];
+	volatile uint8* pv = info->pvRegs[index];
+	volatile uint8* hd = info->hdRegs;
+	if (hdmi == NULL || pv == NULL || hd == NULL)
+		return B_NO_INIT;
+	if (((t.hdisplay | t.hsync_start | t.hsync_end | t.htotal) & 1) != 0)
+		return B_BAD_VALUE;
+	uint64 tmdsRate = (uint64)t.clock * 1000;
+	bool hsyncHigh = (t.flags & 1) != 0;
+	bool vsyncHigh = (t.flags & 2) != 0;
+
+	// off: the pixel valve's video, the packets, the picture
+	reg_write(pv, PV6_V_CONTROL,
+		reg_read(pv, PV6_V_CONTROL) & ~PV6_VCONTROL_VIDEN);
+	spin(20000);
+	uint32 packets = reg_read(hdmi, HDMI6_RAM_PACKET_CONFIG);
+	reg_write(hdmi, HDMI6_RAM_PACKET_CONFIG, 0);
+	reg_write(hd, HD6_VID_CTL(index), reg_read(hd, HD6_VID_CTL(index))
+		| HD6_VID_CTL_CLRRGB | HD6_VID_CTL_BLANKPIX);
+	spin(1000);
+	uint32 pvControl = reg_read(pv, PV6_CONTROL) & ~PV6_CONTROL_EN;
+	reg_write(pv, PV6_CONTROL, pvControl);
+	reg_write(pv, PV6_CONTROL, pvControl | PV6_CONTROL_FIFO_CLR);
+	uint32 control = hvs6_read(info, HVS6_DISP_CTRL0(index));
+	hvs6_write(info, HVS6_DISP_CTRL0(index), control | HVS6_DISP_CTRL0_RESET);
+	hvs6_write(info, HVS6_DISP_CTRL0(index),
+		(control | HVS6_DISP_CTRL0_RESET) & ~HVS6_DISP_CTRL0_ENB);
+
+	// the compositor's channel at the new size
+	hvs6_write(info, HVS6_DISP_CTRL0(index), HVS6_DISP_CTRL0_RESET);
+	hvs6_write(info, HVS6_DISP_CTRL1(index),
+		hvs6_read(info, HVS6_DISP_CTRL1(index)) & ~HVS6_DISP_CTRL1_INTLACE);
+	hvs6_write(info, HVS6_DISP_CTRL0(index), HVS6_DISP_CTRL0_ENB
+		| (uint32)(t.hdisplay - 1) << 16 | (uint32)(t.vdisplay - 1));
+
+	// the encoder: PHY, timings
+	bcm2712_phy_init(info, index, tmdsRate);
+	reg_write(hdmi, HDMI6_SCHEDULER_CONTROL,
+		reg_read(hdmi, HDMI6_SCHEDULER_CONTROL)
+			| HDMI6_SCHEDULER_MANUAL_FORMAT
+			| HDMI6_SCHEDULER_IGNORE_VSYNC_PREDICTS);
+	reg_write(hdmi, HDMI6_HORZA, (vsyncHigh ? 1u << 15 : 0)
+		| (hsyncHigh ? 1u << 14 : 0) | t.hdisplay
+		| (uint32)(t.hsync_start - t.hdisplay) << 16);
+	reg_write(hdmi, HDMI6_HORZB, (uint32)(t.htotal - t.hsync_end) << 16
+		| (uint32)(t.hsync_end - t.hsync_start));
+	uint32 verta = (uint32)(t.vsync_end - t.vsync_start) << 24
+		| (uint32)(t.vsync_start - t.vdisplay) << 16 | t.vdisplay;
+	uint32 vertb = (uint32)(t.htotal >> 1) << 16
+		| (uint32)(t.vtotal - t.vsync_end);
+	reg_write(hdmi, HDMI6_VERTA0, verta);
+	reg_write(hdmi, HDMI6_VERTA1, verta);
+	reg_write(hdmi, HDMI6_VERTB0, t.vtotal - t.vsync_end);
+	reg_write(hdmi, HDMI6_VERTB1, vertb);
+
+	// the pixel valve, two pixels a clock
+	const uint32 ppc = PV6_PIXELS_PER_CLOCK;
+	reg_write(pv, PV6_HORZA, (uint32)(t.htotal - t.hsync_end) / ppc << 16
+		| (uint32)(t.hsync_end - t.hsync_start) / ppc);
+	reg_write(pv, PV6_HORZB, (uint32)(t.hsync_start - t.hdisplay) / ppc << 16
+		| (uint32)t.hdisplay / ppc);
+	reg_write(pv, PV6_V_CONTROL, PV6_VCONTROL_CONTINUOUS);
+	reg_write(pv, PV6_VSYNCD_EVEN, 0);
+	reg_write(pv, PV6_VERTA, (uint32)(t.vtotal - t.vsync_end) << 16
+		| (uint32)(t.vsync_end - t.vsync_start));
+	reg_write(pv, PV6_VERTB, (uint32)(t.vsync_start - t.vdisplay) << 16
+		| t.vdisplay);
+	reg_write(pv, PV6_CONTROL, pvControl | PV6_CONTROL_FIFO_CLR);
+	reg_write(pv, PV6_CONTROL, pvControl | PV6_CONTROL_EN);
+	reg_write(hdmi, HDMI6_FIFO_CTL, HDMI6_FIFO_CTL_MASTER_SLAVE_N);
+	reg_write(pv, PV6_V_CONTROL,
+		reg_read(pv, PV6_V_CONTROL) | PV6_VCONTROL_VIDEN);
+
+	// on: the picture, HDMI mode, the packets
+	uint32 vidControl = reg_read(hd, HD6_VID_CTL(index))
+		& ~(HD6_VID_CTL_VSYNC_LOW | HD6_VID_CTL_HSYNC_LOW
+			| HD6_VID_CTL_CLRRGB | HD6_VID_CTL_BLANKPIX);
+	reg_write(hd, HD6_VID_CTL(index), vidControl | HD6_VID_CTL_ENABLE
+		| HD6_VID_CTL_BLANK_INSERT_EN
+		| (vsyncHigh ? 0 : HD6_VID_CTL_VSYNC_LOW)
+		| (hsyncHigh ? 0 : HD6_VID_CTL_HSYNC_LOW));
+	reg_write(hdmi, HDMI6_SCHEDULER_CONTROL,
+		reg_read(hdmi, HDMI6_SCHEDULER_CONTROL) | HDMI6_SCHEDULER_MODE_HDMI);
+	bigtime_t timeout = system_time() + 1000000;
+	while ((reg_read(hdmi, HDMI6_SCHEDULER_CONTROL)
+			& HDMI6_SCHEDULER_HDMI_ACTIVE) == 0) {
+		if (system_time() > timeout) {
+			ERROR("HDMI%" B_PRIu32 ": HDMI mode does not come on\n", index);
+			break;
+		}
+		snooze(1000);
+	}
+	bcm2712_update_avi(info, index, t.video_id_code);
+	reg_write(hdmi, HDMI6_RAM_PACKET_CONFIG, packets);
+
+	// recenter the FIFO between the pixel valve and the encoder
+	uint32 drift = reg_read(hdmi, HDMI6_FIFO_CTL) & HDMI6_FIFO_VALID_WRITE_MASK;
+	for (int i = 0; i < 2; i++) {
+		reg_write(hdmi, HDMI6_FIFO_CTL, drift & ~HDMI6_FIFO_CTL_RECENTER);
+		reg_write(hdmi, HDMI6_FIFO_CTL, drift | HDMI6_FIFO_CTL_RECENTER);
+		if (i == 0)
+			snooze(1000);
+	}
+	spin(1000);
+	if ((reg_read(hdmi, HDMI6_FIFO_CTL) & HDMI6_FIFO_CTL_RECENTER_DONE) == 0)
+		ERROR("HDMI%" B_PRIu32 ": the FIFO did not recenter\n", index);
+
+	INFO("HDMI%" B_PRIu32 ": %ux%u at %u Hz, %" B_PRIu32 " kHz (code %u)\n",
+		index, t.hdisplay, t.vdisplay, t.vrefresh, t.clock, t.video_id_code);
+	return B_OK;
+}
+
+
+/*!	The timing for output \a index: its EDID's preferred one the output can
+	send, or the size set in the driver settings ("hdmi0 1280x720"). */
+static bool
+bcm2712_pick_timing(const rpi_display_output& output, uint32 index,
+	firmware_timing& timing)
+{
+	uint16 width = 0, height = 0;
+	void* settings = load_driver_settings("rpi_display");
+	if (settings != NULL) {
+		char key[8];
+		snprintf(key, sizeof(key), "hdmi%" B_PRIu32, index);
+		const char* value = get_driver_parameter(settings, key, NULL, NULL);
+		if (value != NULL) {
+			char* end;
+			unsigned long w = strtoul(value, &end, 10);
+			if (*end == 'x') {
+				width = w;
+				height = strtoul(end + 1, NULL, 10);
+			}
+		}
+		unload_driver_settings(settings);
+	}
+	return preferred_edid_timing(output.edid, output.edid_length, timing,
+		BCM2712_MAX_PIXEL_CLOCK, width, height);
+}
+
+
 static status_t
 connect_output_bcm2712(rpi_display_output& output)
 {
@@ -807,10 +1400,27 @@ connect_output_bcm2712(rpi_display_output& output)
 	if (!hvs6_read_firmware_plane(info, index))
 		return B_DEV_NOT_READY;
 
-	uint32 control = hvs6_read(info, HVS6_DISP_CTRL0(index));
 	rpi_display_output connected = {};
 	connected.id = output.id;
 	read_edid(connected);
+
+	// the EDID's mode, if it is not the firmware's
+	uint32 control = hvs6_read(info, HVS6_DISP_CTRL0(index));
+	firmware_timing timing;
+	if (bcm2712_pick_timing(connected, index, timing)
+		&& (timing.hdisplay != ((control >> 16) & 0x1fff) + 1
+			|| timing.vdisplay != (control & 0x1fff) + 1
+			|| (info->modeClock[index] != 0
+				&& timing.clock != info->modeClock[index]))) {
+		// the firmware's list (its frame buffer) until a layout comes
+		bool shown = info->regionShown[index];
+		hvs6_restore(info, index);
+		if (bcm2712_set_mode(info, index, timing) == B_OK)
+			info->modeClock[index] = timing.clock;
+		if (shown)
+			ERROR("HDMI%" B_PRIu32 ": mode changed under a layout\n", index);
+		control = hvs6_read(info, HVS6_DISP_CTRL0(index));
+	}
 	connected.native_width = ((control >> 16) & 0x1fff) + 1;
 	connected.native_height = (control & 0x1fff) + 1;
 	connected.flags = RPI_DISPLAY_OUTPUT_CONNECTED;
@@ -1075,8 +1685,11 @@ set_layout(display_info* info, const rpi_display_layout& layout)
 
 	uint32 bytesPerRow = layout.width * 4;
 	status_t status = ensure_buffer(info, (size_t)bytesPerRow * layout.height);
-	if (status != B_OK)
+	if (status != B_OK) {
+		ERROR("no frame buffer for %" B_PRIu32 "x%" B_PRIu32 ": %s\n",
+			layout.width, layout.height, strerror(status));
 		return status;
+	}
 
 	for (uint32 i = 0; i < shared.output_count; i++) {
 		rpi_display_output& output = shared.outputs[i];
@@ -1220,12 +1833,20 @@ display_init_device(void* _info, void** _cookie)
 
 	info->bcm2712 = is_bcm2712(info->node);
 	if (info->bcm2712) {
-		info->shared->flags = RPI_DISPLAY_FIXED_MODES;
-		// the outputs' modes and planes come from the compositor
+		// the outputs' planes come from the compositor
 		map_compositor(info);
 		if (info->hvsArea < 0) {
 			delete_area(info->sharedArea);
 			return B_ERROR;
+		}
+		hvs6_upload_kernel(info);
+		if (bcm2712_map_mode_registers(info) != B_OK) {
+			// the firmware's modes only
+			ERROR("cannot map the HDMI registers: no mode setting\n");
+			bcm2712_unmap_mode_registers(info);
+			info->hdRegs = NULL;
+			for (uint32 i = 0; i < RPI_DISPLAY_MAX_OUTPUTS; i++)
+				info->hdmiRegs[i] = info->pvRegs[i] = NULL;
 		}
 	}
 
@@ -1242,11 +1863,18 @@ display_init_device(void* _info, void** _cookie)
 	// still easy to find.
 	const rpi_display_shared_info& shared = *info->shared;
 	uint32 width = 0, height = 0;
+	uint32 widest = 0;
 	for (uint32 i = 0; i < shared.output_count; i++) {
 		width += shared.outputs[i].native_width;
+		if (shared.outputs[i].native_width > widest)
+			widest = shared.outputs[i].native_width;
 		if (shared.outputs[i].native_height > height)
 			height = shared.outputs[i].native_height;
 	}
+	// The BCM2712 scales: drawn at the densest output's scale, each region
+	// can be as large as the largest panel.
+	if (info->bcm2712)
+		width = widest * shared.output_count;
 	status = ensure_buffer(info, (size_t)width * 4 * height);
 	if (status != B_OK) {
 		ERROR("no memory for the frame buffer: %s\n", strerror(status));
@@ -1316,6 +1944,8 @@ display_uninit_device(void* cookie)
 	}
 	if (info->hvsArea >= 0)
 		delete_area(info->hvsArea);
+	if (info->bcm2712)
+		bcm2712_unmap_mode_registers(info);
 	mutex_destroy(&info->lock);
 	if (info->bufferArea >= 0)
 		delete_area(info->bufferArea);
