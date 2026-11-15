@@ -3,13 +3,21 @@
  * Distributed under the terms of the MIT License.
  */
 
-/*	The Raspberry Pi 4's HDMI outputs through the VideoCore firmware.
+/*	The Raspberry Pi's HDMI outputs.
 
 	The firmware sets the outputs' initial video modes and runs the
-	compositor (HVS). This driver owns one frame buffer and asks the firmware
-	for one plane per output, each showing a region of that buffer scaled to
-	the output's mode: the "firmware KMS" property tags. The accelerant
-	decides the regions (app_server's display layout). */
+	compositor (HVS). This driver owns one frame buffer and shows a region
+	of it on each output; the accelerant decides the regions (app_server's
+	display layout).
+
+	On the Pi 4 (BCM2711) it asks the firmware for one plane per output,
+	scaled to the output's mode: the "firmware KMS" property tags.
+
+	The Pi 5's (BCM2712) firmware accepts those requests but shows nothing.
+	There the driver writes the compositor's display lists itself: each
+	output's channel gets a copy of the plane the firmware set up for its
+	own frame buffer, pointed at the output's region, unscaled. The modes
+	stay the firmware's (RPI_DISPLAY_FIXED_MODES). */
 
 
 #include <new>
@@ -80,6 +88,28 @@
 #define HVS_DISPSTAT2					0x68	// frame count 2
 #define HVS_MUX_NONE					3
 
+// The BCM2712's compositor (HVS generation 6, D0 stepping; Linux's
+// vc4_regs.h SCALER6D_*, vc4_plane.c vc6_plane_mode_set()). Channel n feeds
+// HDMI n. The display lists live in the compositor's own memory, in words
+// from offset 0x4000.
+#define HVS6_MAP_SIZE					0x8000
+#define HVS6_CXM_SIZE					0x04	// display list words
+#define HVS6_DISP_CTRL0(n)				(0x100 + (n) * 0x40)
+#define HVS6_DISP_CTRL0_ENB				(1u << 31)
+#define HVS6_DISP_LPTRS(n)				(0x110 + (n) * 0x40)
+#define HVS6_DISP_STATUS(n)				(0x118 + (n) * 0x40)
+#define HVS6_DLIST						0x4000
+#define HVS6_CTL0_END					(1u << 31)
+#define HVS6_CTL0_VALID					(1u << 30)
+#define HVS6_CTL0_NEXT_SHIFT			24
+#define HVS6_CTL0_NEXT_MASK				(0x3fu << 24)
+#define HVS6_CTL0_UNITY					(1u << 15)
+#define HVS6_PLANE_WORDS				8
+	// CTL0, POS0, CTL2, POS2, context, PTR0..2 of an unscaled RGB plane
+#define HVS6_SLOT_BASE					0xe00
+#define HVS6_SLOT_WORDS					0x40
+	// two slots a channel at the end of the list memory, used in turn
+
 struct firmware_plane {
 	uint8	display;
 	uint8	plane_id;
@@ -133,6 +163,14 @@ struct display_info {
 	RetraceSemaphores* retrace;
 	class HvsRetraceFollower* retraceFollower;
 
+	// the BCM2712's display lists: the firmware's plane of each channel,
+	// its list head, and which of the driver's two slots is next
+	bool			bcm2712;
+	uint32			firmwareHead[RPI_DISPLAY_MAX_OUTPUTS];
+	uint32			firmwarePlane[RPI_DISPLAY_MAX_OUTPUTS][HVS6_PLANE_WORDS];
+	bool			hasFirmwarePlane[RPI_DISPLAY_MAX_OUTPUTS];
+	uint32			nextSlot[RPI_DISPLAY_MAX_OUTPUTS];
+
 	// a hardware cursor, composited by the firmware over the frame buffer;
 	// the position is the hotspot, in frame buffer pixels
 	area_id			cursorArea;
@@ -170,9 +208,17 @@ set_plane(const firmware_plane& plane)
 }
 
 
+static display_info* sInfo;
+static void hvs6_restore(display_info* info, uint32 index);
+
+
 static void
 remove_plane(uint32 index, uint32 display)
 {
+	if (sInfo != NULL && sInfo->bcm2712) {
+		hvs6_restore(sInfo, index);
+		return;
+	}
 	firmware_plane plane = {};
 	plane.display = display;
 	plane.plane_id = index * PLANES_PER_DISPLAY;
@@ -232,6 +278,9 @@ static status_t connect_output(rpi_display_output& output);
 	reports is the size of its frame buffer, which it scales to the mode (a
 	4K monitor gave 1920x1280).
 */
+static status_t read_outputs_bcm2712(display_info* info);
+
+
 static status_t
 read_outputs(display_info* info)
 {
@@ -239,6 +288,8 @@ read_outputs(display_info* info)
 	shared.output_count = RPI_DISPLAY_MAX_OUTPUTS;
 	shared.outputs[0].id = 2;
 	shared.outputs[1].id = 7;
+	if (info->bcm2712)
+		return read_outputs_bcm2712(info);
 	read_pixel_clock_limits();
 	uint32 count = 0;
 	status_t status = sFirmware->property(TAG_FB_GET_NUM_DISPLAYS, &count,
@@ -278,9 +329,14 @@ read_outputs(display_info* info)
 }
 
 
+static status_t connect_output_bcm2712(rpi_display_output& output);
+
+
 static status_t
 connect_output(rpi_display_output& output)
 {
+	if (sInfo != NULL && sInfo->bcm2712)
+		return connect_output_bcm2712(output);
 	rpi_display_output connected = {};
 	connected.id = output.id;
 	read_edid(connected);
@@ -385,6 +441,8 @@ protected:
 		}
 		if (fChannel < 0)
 			return -1;
+		if (fInfo->bcm2712)
+			return (_Read(HVS6_DISP_STATUS(fChannel)) >> 16) & 0x3f;
 		switch (fChannel) {
 			case 0:
 				return (_Read(HVS_DISPSTAT1) >> 20) & 0x3f;
@@ -407,6 +465,12 @@ private:
 		for (uint32 i = 0; i < shared.output_count; i++) {
 			if ((shared.outputs[i].flags & RPI_DISPLAY_OUTPUT_ENABLED) == 0)
 				continue;
+			if (fInfo->bcm2712) {
+				// channel n is HDMI n
+				if ((_Read(HVS6_DISP_CTRL0(i)) & HVS6_DISP_CTRL0_ENB) != 0)
+					return i;
+				continue;
+			}
 			uint32 mux = _Read(i == 0 ? HVS_DISPEOLN : HVS_DISPDITHER) >> 30;
 			if (mux == HVS_MUX_NONE
 				|| (_Read(HVS_DISPCTRLX(mux)) & HVS_DISPCTRLX_ENABLE) == 0) {
@@ -440,21 +504,197 @@ map_compositor(display_info* info)
 		status = B_BAD_DATA;
 	if (parent != NULL)
 		sDeviceManager->put_node(parent);
-	if (status != B_OK || size < HVS_DISPSTAT2 + 4) {
+	size_t mapSize = info->bcm2712 ? HVS6_MAP_SIZE : B_PAGE_SIZE;
+	if (status != B_OK || size < (info->bcm2712 ? HVS6_MAP_SIZE
+			: HVS_DISPSTAT2 + 4)) {
 		ERROR("no compositor registers, no vertical blanks\n");
 		return;
 	}
 
 	phys_addr_t page = base & ~(phys_addr_t)(B_PAGE_SIZE - 1);
 	void* address;
-	info->hvsArea = map_physical_memory("BCM2711 HVS", page, B_PAGE_SIZE,
-		B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY, B_KERNEL_READ_AREA,
+	// the BCM2712's display lists are the driver's to write
+	info->hvsArea = map_physical_memory(info->bcm2712 ? "BCM2712 HVS"
+			: "BCM2711 HVS", page, mapSize,
+		B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY, B_KERNEL_READ_AREA
+			| (info->bcm2712 ? B_KERNEL_WRITE_AREA : 0),
 		&address);
 	if (info->hvsArea < 0) {
 		ERROR("cannot map the compositor: %s\n", strerror(info->hvsArea));
 		return;
 	}
 	info->hvs = (volatile uint8*)address + (base - page);
+}
+
+
+//	#pragma mark - BCM2712 display lists
+
+
+static bool
+is_bcm2712(device_node* node)
+{
+	device_node* parent = sDeviceManager->get_parent_node(node);
+	if (parent == NULL)
+		return false;
+	const char* compatible;
+	bool result = sDeviceManager->get_attr_string(parent, "fdt/compatible",
+			&compatible, false) == B_OK
+		&& strcmp(compatible, "brcm,bcm2712-hvs") == 0;
+	sDeviceManager->put_node(parent);
+	return result;
+}
+
+
+static inline uint32
+hvs6_read(display_info* info, uint32 offset)
+{
+	return *(volatile uint32*)(info->hvs + offset);
+}
+
+
+static inline void
+hvs6_write(display_info* info, uint32 offset, uint32 value)
+{
+	*(volatile uint32*)(info->hvs + offset) = value;
+}
+
+
+static inline volatile uint32*
+hvs6_dlist(display_info* info, uint32 word)
+{
+	return (volatile uint32*)(info->hvs + HVS6_DLIST) + word;
+}
+
+
+/*!	Takes note of the plane the firmware put on channel \a index for its
+	frame buffer: the driver's planes are copies of it. Only an unscaled
+	RGB plane of eight words is understood.
+*/
+static bool
+hvs6_read_firmware_plane(display_info* info, uint32 index)
+{
+	uint32 control = hvs6_read(info, HVS6_DISP_CTRL0(index));
+	if ((control & HVS6_DISP_CTRL0_ENB) == 0)
+		return false;
+
+	uint32 head = hvs6_read(info, HVS6_DISP_LPTRS(index)) & 0xfff;
+	uint32 listWords = hvs6_read(info, HVS6_CXM_SIZE);
+	if (listWords > 0x1000 || listWords < HVS6_SLOT_BASE + 4 * HVS6_SLOT_WORDS)
+		listWords = 0x1000;
+	if (info->hasFirmwarePlane[index] && head >= HVS6_SLOT_BASE)
+		return true;	// showing one of the driver's lists already
+	if (head + HVS6_PLANE_WORDS + 1 > HVS6_SLOT_BASE)
+		return false;
+
+	volatile uint32* list = hvs6_dlist(info, head);
+	uint32* plane = info->firmwarePlane[index];
+	for (uint32 i = 0; i < HVS6_PLANE_WORDS; i++)
+		plane[i] = list[i];
+	if ((plane[0] & (HVS6_CTL0_VALID | HVS6_CTL0_END)) != HVS6_CTL0_VALID
+		|| (plane[0] & HVS6_CTL0_UNITY) == 0
+		|| (list[HVS6_PLANE_WORDS] & HVS6_CTL0_END) == 0) {
+		ERROR("HDMI%" B_PRIu32 ": the firmware's display list is not one "
+			"unscaled plane: %#" B_PRIx32 " %#" B_PRIx32 " ... %#" B_PRIx32
+			"\n", index, plane[0], plane[1], list[HVS6_PLANE_WORDS]);
+		return false;
+	}
+	info->firmwareHead[index] = head;
+	info->hasFirmwarePlane[index] = true;
+	return true;
+}
+
+
+/*!	Shows the region (x, y, width, height) of the frame buffer on output
+	\a index, unscaled, centered when it is smaller than the mode: a new
+	display list in the slot the compositor is not reading, then the
+	channel's list pointer, which it takes at the next frame.
+*/
+static status_t
+hvs6_show(display_info* info, uint32 index, int32 x, int32 y, uint32 width,
+	uint32 height, uint32 bytesPerRow)
+{
+	if (!info->hasFirmwarePlane[index])
+		return B_NOT_SUPPORTED;
+	const rpi_display_output& output = info->shared->outputs[index];
+	if (width > output.native_width || height > output.native_height)
+		return B_BAD_VALUE;
+	uint32 destX = (output.native_width - width) / 2;
+	uint32 destY = (output.native_height - height) / 2;
+
+	uint64 address = info->bufferAddress + (uint64)y * bytesPerRow + x * 4;
+	const uint32* plane = info->firmwarePlane[index];
+	uint32 words[HVS6_PLANE_WORDS + 1] = {
+		(plane[0] & ~HVS6_CTL0_NEXT_MASK)
+			| (HVS6_PLANE_WORDS << HVS6_CTL0_NEXT_SHIFT),
+		destY << 16 | destX,
+		plane[2],
+		(height - 1) << 16 | (width - 1),
+		0xc0c0c0c0,
+			// context, the compositor's to write
+		(plane[5] & ~0xffu) | (uint32)((address >> 32) & 0xff),
+			// keeps the firmware's UPM (fetch buffer) settings
+		(uint32)address,
+		(plane[7] & ~0x1ffffu) | bytesPerRow,
+		HVS6_CTL0_END
+	};
+
+	uint32 slot = HVS6_SLOT_BASE + index * 2 * HVS6_SLOT_WORDS
+		+ info->nextSlot[index] * HVS6_SLOT_WORDS;
+	info->nextSlot[index] ^= 1;
+	volatile uint32* list = hvs6_dlist(info, slot);
+	for (uint32 i = 0; i < B_COUNT_OF(words); i++)
+		list[i] = words[i];
+	memory_full_barrier();
+	hvs6_write(info, HVS6_DISP_LPTRS(index), slot);
+	return B_OK;
+}
+
+
+/*!	The firmware's own list again: its frame buffer, the boot console. */
+static void
+hvs6_restore(display_info* info, uint32 index)
+{
+	if (info->hvsArea < 0 || !info->hasFirmwarePlane[index])
+		return;
+	hvs6_write(info, HVS6_DISP_LPTRS(index), info->firmwareHead[index]);
+}
+
+
+static status_t
+connect_output_bcm2712(rpi_display_output& output)
+{
+	display_info* info = sInfo;
+	uint32 index = output.id == 2 ? 0 : 1;
+	// An output the firmware did not start at boot cannot be shown: there
+	// is no mode setting here.
+	if (!hvs6_read_firmware_plane(info, index))
+		return B_DEV_NOT_READY;
+
+	uint32 control = hvs6_read(info, HVS6_DISP_CTRL0(index));
+	rpi_display_output connected = {};
+	connected.id = output.id;
+	read_edid(connected);
+	connected.native_width = ((control >> 16) & 0x1fff) + 1;
+	connected.native_height = (control & 0x1fff) + 1;
+	connected.flags = RPI_DISPLAY_OUTPUT_CONNECTED;
+	output = connected;
+	INFO("HDMI%" B_PRIu32 ": %ux%u (the firmware's mode), %" B_PRIu32
+		" bytes of EDID\n", index, output.native_width,
+		output.native_height, output.edid_length);
+	return B_OK;
+}
+
+
+static status_t
+read_outputs_bcm2712(display_info* info)
+{
+	bool found = false;
+	for (uint32 i = 0; i < RPI_DISPLAY_MAX_OUTPUTS; i++) {
+		rpi_display_output& output = info->shared->outputs[i];
+		if (connect_output_bcm2712(output) == B_OK)
+			found = true;
+	}
+	return found ? B_OK : B_DEVICE_NOT_FOUND;
 }
 
 
@@ -474,7 +714,10 @@ ensure_buffer(display_info* info, size_t size)
 
 	virtual_address_restrictions virtualRestrictions = {};
 	physical_address_restrictions physicalRestrictions = {};
-	physicalRestrictions.high_address = 1ull << 30;
+	// the Pi 4's VideoCore sees the first gigabyte; the BCM2712's
+	// compositor all of it
+	if (!info->bcm2712)
+		physicalRestrictions.high_address = 1ull << 30;
 	void* address;
 	area_id area = create_area_etc(B_SYSTEM_TEAM, "rpi display frame buffer",
 		size, B_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, 0, 0,
@@ -580,6 +823,8 @@ output_dest(uint32 nativeWidth, uint32 nativeHeight, uint32 width,
 static status_t
 update_cursor_plane(display_info* info)
 {
+	if (info->bcm2712)
+		return B_OK;
 	const rpi_display_shared_info& shared = *info->shared;
 	int32 on = -1;
 	if (info->cursorDefined && info->cursorVisible) {
@@ -707,36 +952,50 @@ set_layout(display_info* info, const rpi_display_layout& layout)
 		}
 
 		// the region as large as it gets on the output with its shape kept
+		// (the BCM2712's planes are unscaled: the region, centered)
 		int32 destX, destY;
 		uint32 destWidth, destHeight;
-		output_dest(output.native_width, output.native_height, request.width,
-			request.height, &destX, &destY, &destWidth, &destHeight);
+		if (info->bcm2712) {
+			destWidth = request.width;
+			destHeight = request.height;
+			status = hvs6_show(info, i, request.x, request.y, request.width,
+				request.height, bytesPerRow);
+			if (status != B_OK) {
+				ERROR("output %" B_PRIu32 "'s plane: %s\n", i,
+					strerror(status));
+				return status;
+			}
+		} else {
+			output_dest(output.native_width, output.native_height,
+				request.width, request.height, &destX, &destY, &destWidth,
+				&destHeight);
 
-		firmware_plane plane = {};
-		plane.display = output.id;
-		plane.plane_id = i * PLANES_PER_DISPLAY;
-		plane.image_type = VC_IMAGE_XRGB8888;
-		plane.layer = PLANE_LAYER;
-		plane.width = layout.width;
-		plane.height = layout.height;
-		plane.pitch = bytesPerRow;
-		plane.vpitch = 1;
-		plane.src_x = request.x << 16;
-		plane.src_y = request.y << 16;
-		plane.src_w = request.width << 16;
-		plane.src_h = request.height << 16;
-		plane.dst_x = (int16)destX;
-		plane.dst_y = (int16)destY;
-		plane.dst_w = (uint16)destWidth;
-		plane.dst_h = (uint16)destHeight;
-		plane.alpha = 0xff;
-		plane.num_planes = 1;
-		plane.planes[0] = (uint32)info->bufferAddress | VC_BUS_OFFSET;
-		status = set_plane(plane);
-		if (status != B_OK) {
-			ERROR("the firmware did not take output %" B_PRIu32 "'s plane: "
-				"%s\n", i, strerror(status));
-			return status;
+			firmware_plane plane = {};
+			plane.display = output.id;
+			plane.plane_id = i * PLANES_PER_DISPLAY;
+			plane.image_type = VC_IMAGE_XRGB8888;
+			plane.layer = PLANE_LAYER;
+			plane.width = layout.width;
+			plane.height = layout.height;
+			plane.pitch = bytesPerRow;
+			plane.vpitch = 1;
+			plane.src_x = request.x << 16;
+			plane.src_y = request.y << 16;
+			plane.src_w = request.width << 16;
+			plane.src_h = request.height << 16;
+			plane.dst_x = (int16)destX;
+			plane.dst_y = (int16)destY;
+			plane.dst_w = (uint16)destWidth;
+			plane.dst_h = (uint16)destHeight;
+			plane.alpha = 0xff;
+			plane.num_planes = 1;
+			plane.planes[0] = (uint32)info->bufferAddress | VC_BUS_OFFSET;
+			status = set_plane(plane);
+			if (status != B_OK) {
+				ERROR("the firmware did not take output %" B_PRIu32 "'s "
+					"plane: %s\n", i, strerror(status));
+				return status;
+			}
 		}
 
 		output.flags = RPI_DISPLAY_OUTPUT_CONNECTED | RPI_DISPLAY_OUTPUT_ENABLED
@@ -779,11 +1038,14 @@ release_layout(display_info* info)
 	for (uint32 i = 0; i < shared.output_count; i++) {
 		if ((shared.outputs[i].flags & RPI_DISPLAY_OUTPUT_ENABLED) != 0) {
 			remove_plane(i, shared.outputs[i].id);
-			// the cursor rides its own plane
-			firmware_plane cursor = {};
-			cursor.display = shared.outputs[i].id;
-			cursor.plane_id = i * CURSOR_PLANES_PER_DISPLAY + info->cursorPlaneOffset;
-			set_plane(cursor);
+			if (!info->bcm2712) {
+				// the cursor rides its own plane
+				firmware_plane cursor = {};
+				cursor.display = shared.outputs[i].id;
+				cursor.plane_id = i * CURSOR_PLANES_PER_DISPLAY
+					+ info->cursorPlaneOffset;
+				set_plane(cursor);
+			}
 		}
 		shared.outputs[i].flags &= RPI_DISPLAY_OUTPUT_CONNECTED;
 	}
@@ -815,10 +1077,24 @@ display_init_device(void* _info, void** _cookie)
 	info->shared->version = RPI_DISPLAY_VERSION;
 	info->bufferArea = -1;
 	info->cursorArea = -1;
+	info->hvsArea = -1;
+
+	info->bcm2712 = is_bcm2712(info->node);
+	if (info->bcm2712) {
+		info->shared->flags = RPI_DISPLAY_FIXED_MODES;
+		// the outputs' modes and planes come from the compositor
+		map_compositor(info);
+		if (info->hvsArea < 0) {
+			delete_area(info->sharedArea);
+			return B_ERROR;
+		}
+	}
 
 	status_t status = read_outputs(info);
 	if (status != B_OK) {
 		ERROR("no display from the firmware: %s\n", strerror(status));
+		if (info->hvsArea >= 0)
+			delete_area(info->hvsArea);
 		delete_area(info->sharedArea);
 		return status;
 	}
@@ -846,18 +1122,21 @@ display_init_device(void* _info, void** _cookie)
 	info->cursorLayer = CURSOR_PLANE_LAYER;
 	info->cursorImageType = VC_IMAGE_ARGB8888;
 	info->cursorCanvas = true;
-	// BCM2711 only (the driver's compatible match). The VC5 HDMI_HOTPLUG
-	// register is at offset 0x1a8 of each HDMI block, bit 0 = connected.
-	// These read-only maps do not touch clocks, PHYs or interrupt state;
-	// those remain owned by the VideoCore firmware.
+	// The VC5 HDMI_HOTPLUG register, bit 0 = connected: offset 0x1a8 of
+	// each HDMI block of the BCM2711, 0x1c8 of the BCM2712's (Linux's
+	// bcm2711.dtsi and bcm2712.dtsi, vc4_hdmi_regs.h). These read-only maps
+	// do not touch clocks, PHYs or interrupt state; those remain owned by
+	// the VideoCore firmware.
 	for (uint32 i = 0; i < RPI_DISPLAY_MAX_OUTPUTS; i++) {
 		void* registers;
-		info->hpdAreas[i] = map_physical_memory("BCM2711 HDMI hotplug",
-			0xfef00000 + i * 0x5000, B_PAGE_SIZE,
-			B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY, B_KERNEL_READ_AREA,
-			&registers);
+		phys_addr_t page = info->bcm2712 ? 0x107c701000ull + i * 0x5000
+			: 0xfef00000 + i * 0x5000;
+		uint32 offset = info->bcm2712 ? 0x5c8 : 0x8a8;
+		info->hpdAreas[i] = map_physical_memory("rpi HDMI hotplug", page,
+			B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY,
+			B_KERNEL_READ_AREA, &registers);
 		if (info->hpdAreas[i] >= 0)
-			info->hpdRegisters[i] = (volatile uint32*)((uint8*)registers + 0x8a8);
+			info->hpdRegisters[i] = (volatile uint32*)((uint8*)registers + offset);
 		else
 			ERROR("cannot map HDMI%" B_PRIu32 " hotplug register\n", i);
 	}
@@ -868,7 +1147,8 @@ display_init_device(void* _info, void** _cookie)
 	else
 		ERROR("cannot start HDMI hotplug thread\n");
 
-	map_compositor(info);
+	if (!info->bcm2712)
+		map_compositor(info);
 	if (info->hvsArea >= 0)
 		info->retrace = new(std::nothrow) RetraceSemaphores;
 	*_cookie = info;
@@ -891,6 +1171,10 @@ display_uninit_device(void* cookie)
 	}
 	delete info->retraceFollower;
 	delete info->retrace;
+	if (info->bcm2712) {
+		for (uint32 i = 0; i < RPI_DISPLAY_MAX_OUTPUTS; i++)
+			hvs6_restore(info, i);
+	}
 	if (info->hvsArea >= 0)
 		delete_area(info->hvsArea);
 	mutex_destroy(&info->lock);
@@ -926,8 +1210,7 @@ display_close(void* cookie)
 
 
 // device_manager hands the hooks the cookie of open(); the device is found
-// through a global, there is only one.
-static display_info* sInfo;
+// through a global (sInfo, above), there is only one.
 
 
 static status_t
@@ -1072,6 +1355,9 @@ display_control(void* cookie, uint32 op, void* buffer, size_t length)
 				|| cursor.height > RPI_DISPLAY_CURSOR_MAX)
 				return B_BAD_VALUE;
 
+			// no cursor plane on the BCM2712 yet: app_server draws it
+			if (info->bcm2712)
+				return B_NOT_SUPPORTED;
 			MutexLocker locker(info->lock);
 			status = ensure_cursor_buffer(info);
 			if (status != B_OK)
@@ -1174,7 +1460,8 @@ display_supports_device(device_node* parent)
 	// drives it.
 	const char* compatible;
 	if (sDeviceManager->get_attr_string(parent, "fdt/compatible", &compatible,
-			false) != B_OK || strcmp(compatible, "brcm,bcm2711-hvs") != 0) {
+			false) != B_OK || (strcmp(compatible, "brcm,bcm2711-hvs") != 0
+				&& strcmp(compatible, "brcm,bcm2712-hvs") != 0)) {
 		return -1.0f;
 	}
 

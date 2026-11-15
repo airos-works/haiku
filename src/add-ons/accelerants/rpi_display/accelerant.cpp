@@ -264,9 +264,16 @@ rpi_init_accelerant(int device)
 	}
 	layout.width = shared.outputs[first].native_width;
 	layout.height = shared.outputs[first].native_height;
+	bool fixedModes = (shared.flags & RPI_DISPLAY_FIXED_MODES) != 0;
 	for (uint32 i = 0; i < shared.output_count; i++) {
 		if ((shared.outputs[i].flags & RPI_DISPLAY_OUTPUT_CONNECTED) == 0)
 			continue;
+		// unscaled outputs mirror only what fits them
+		if (fixedModes && i != first
+			&& (shared.outputs[i].native_width < layout.width
+				|| shared.outputs[i].native_height < layout.height)) {
+			continue;
+		}
 		rpi_display_output& output = layout.outputs[i];
 		output.flags = RPI_DISPLAY_OUTPUT_ENABLED
 			| (i != first ? RPI_DISPLAY_OUTPUT_MIRROR : 0);
@@ -326,7 +333,9 @@ rpi_get_accelerant_device_info(accelerant_device_info* info)
 {
 	info->version = B_ACCELERANT_VERSION;
 	strlcpy(info->name, "Raspberry Pi HDMI", sizeof(info->name));
-	strlcpy(info->chipset, "Broadcom BCM2711 (firmware)",
+	strlcpy(info->chipset,
+		(gInfo->shared->flags & RPI_DISPLAY_FIXED_MODES) != 0
+			? "Broadcom BCM2712" : "Broadcom BCM2711 (firmware)",
 		sizeof(info->chipset));
 	strlcpy(info->serial_no, "None", sizeof(info->serial_no));
 	info->memory = gInfo->shared->bytes_per_row * gInfo->shared->height;
@@ -579,7 +588,8 @@ rpi_get_display_outputs(display_output* outputs, uint32* _count)
 		output.version = B_DISPLAY_OUTPUT_VERSION;
 		output.id = i + 1;
 		strlcpy(output.name, output_name(source, i), sizeof(output.name));
-		output.flags = B_DISPLAY_OUTPUT_SCALABLE;
+		output.flags = (shared.flags & RPI_DISPLAY_FIXED_MODES) != 0
+			? 0 : B_DISPLAY_OUTPUT_SCALABLE;
 		if ((source.flags & RPI_DISPLAY_OUTPUT_CONNECTED) != 0)
 			output.flags |= B_DISPLAY_OUTPUT_CONNECTED;
 		output.scale = output.render_scale = 100;
@@ -628,7 +638,9 @@ rpi_get_display_output_modes(uint32 id, display_mode* modes, uint32* _count)
 	uint32 count = 0;
 	if (count < *_count)
 		modes[count++] = make_mode(output.native_width, output.native_height);
-	for (size_t i = 0; i < sizeof(kSizes) / sizeof(kSizes[0]); i++) {
+	// unscaled outputs have their mode only
+	for (size_t i = 0; (shared.flags & RPI_DISPLAY_FIXED_MODES) == 0
+			&& i < sizeof(kSizes) / sizeof(kSizes[0]); i++) {
 		if (count == *_count)
 			break;
 		if (kSizes[i][0] > output.native_width
@@ -682,6 +694,17 @@ rpi_set_display_layout(const display_output_config* configs, uint32 count,
 				scale = renderScale;
 		} else if (scale < 100 || scale > 400 || renderScale < 100
 			|| renderScale > scale) {
+			return B_BAD_VALUE;
+		}
+		bool fixedModes = (shared.flags & RPI_DISPLAY_FIXED_MODES) != 0;
+		// app_server's own rendering at a scale is fine: the region is the
+		// mode then
+		if (fixedModes && !mirror && (scale != renderScale
+				|| (config.timing.h_display != 0
+					&& (config.timing.h_display != source.native_width
+						|| config.timing.v_display
+							!= source.native_height)))) {
+			// no scaler: the output's own mode, one to one
 			return B_BAD_VALUE;
 		}
 
