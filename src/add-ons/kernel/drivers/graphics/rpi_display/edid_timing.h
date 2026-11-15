@@ -129,6 +129,60 @@ cta_timing(unsigned code, firmware_timing& timing)
 	return false;
 }
 
+/*!	The CTA-861 video code of a timing that is one of those above, 0
+	otherwise: what the AVI InfoFrame names (Linux's drm_match_cea_mode()).
+*/
+static inline uint16_t
+cta_code_of(const firmware_timing& t)
+{
+	static const uint8_t kCodes[] = {4, 16, 31, 93, 94, 95, 96, 97};
+	for (unsigned i = 0; i < sizeof(kCodes); i++) {
+		firmware_timing c;
+		if (cta_timing(kCodes[i], c) && c.clock == t.clock
+			&& c.hdisplay == t.hdisplay && c.hsync_start == t.hsync_start
+			&& c.hsync_end == t.hsync_end && c.htotal == t.htotal
+			&& c.vdisplay == t.vdisplay && c.vsync_start == t.vsync_start
+			&& c.vsync_end == t.vsync_end && c.vtotal == t.vtotal) {
+			return kCodes[i];
+		}
+	}
+	return 0;
+}
+
+/*!	The HDMI Forum vendor-specific data block (IEEE OUI C4-5D-D8): the
+	highest TMDS character rate the monitor takes (kHz, 0 if it says
+	nothing beyond HDMI 1.4's 340 MHz) and whether it has the status and
+	control data channel (SCDC) that scrambling is switched on through.
+*/
+static inline bool
+hdmi_forum_capabilities(const uint8_t* edid, unsigned length,
+	uint32_t& maxTmdsClock, bool& scdc)
+{
+	maxTmdsClock = 0;
+	scdc = false;
+	if (length < 256 || !valid_edid_block(edid, true) || edid[126] == 0
+		|| !valid_edid_block(edid + 128, false) || edid[128] != 2) {
+		return false;
+	}
+	const uint8_t* cea = edid + 128;
+	unsigned end = cea[2];
+	if (end < 4 || end > 127)
+		return false;
+	for (unsigned i = 4; i < end;) {
+		unsigned size = cea[i] & 31;
+		if (i + 1 + size > end)
+			break;
+		if ((cea[i] >> 5) == 3 && size >= 5 && cea[i + 1] == 0xd8
+			&& cea[i + 2] == 0x5d && cea[i + 3] == 0xc4) {
+			maxTmdsClock = cea[i + 5] * 5000u;
+			scdc = (cea[i + 6] & 0x80) != 0;
+			return true;
+		}
+		i += size + 1;
+	}
+	return false;
+}
+
 /*!	Picks the timing to drive a monitor with. The monitor's preferred timing
 	(its first detailed timing) when the Pi can send it; otherwise one at the
 	same size, the fastest the Pi manages (a 4K monitor preferring 60 Hz gets

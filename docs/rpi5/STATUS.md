@@ -26,9 +26,7 @@ Pi 4 and a Pi 5. How it boots: BOOT.md.
 
 Not done yet:
 
-- Display: no 4K at 60 Hz (594 MHz): above 340 MHz HDMI 2.0 needs
-  scrambling, which the monitor has to be told of over the DDC (SCDC);
-  there is no BCM2712 I2C driver for it yet. Outputs connected after boot
+- Display: outputs connected after boot
   stay dark (the driver needs the firmware's plane of the channel as a
   template). No mode choice in Screen yet: the size comes from the EDID
   or the driver settings (`hdmi0 1280x720` in
@@ -113,6 +111,16 @@ valves' two pixels a clock (Linux runs one, with `ODD_TIMING`). The PHY's
 PLL and lane settings are vc6_hdmi_phy_init()'s; the firmware's own for
 148.5 MHz are the same words. The AVI InfoFrame keeps the firmware's but
 gets the new mode's video code.
+
+Above 340 MHz (4K at 60 Hz, 594 MHz) HDMI 2.0 scrambles: when the
+EDID's HDMI Forum block has SCDC and a higher TMDS limit, the driver
+tells the monitor over the DDC (the HDMI node's `ddc`: Broadcom BSC I2C
+controllers at 0x10_7d50_8200 and 0x8280, polled, 97.5 kHz) to
+descramble and take the 1/40 clock ratio (SCDC register 0x20), then
+switches the encoder's scrambler on (HDMI + 0x1e4). A monitor forgets
+that when it sleeps: the hotplug thread reads its scrambler status (SCDC
+0x21) once a second and tells it again, as Linux does. A detailed timing
+that is a CTA mode goes out with its video code (97 for 4K60).
 
 Scaling (regions of any size, aspect kept, as the Pi 4's firmware does):
 polyphase filtering down to 2/3, trapezoidal below, Linux's
