@@ -106,7 +106,7 @@ struct rpi_display_shared_info {
 
 // The outputs keep the modes the firmware set at boot and show their
 // regions unscaled (the Raspberry Pi 5, whose firmware has no planes for
-// the OS): no other sizes, no scaling, no hardware cursor.
+// the OS): no other sizes, no scaling.
 #define RPI_DISPLAY_FIXED_MODES		0x1
 
 struct rpi_display_layout {

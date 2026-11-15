@@ -17,7 +17,8 @@
 	There the driver writes the compositor's display lists itself: each
 	output's channel gets a copy of the plane the firmware set up for its
 	own frame buffer, pointed at the output's region, unscaled. The modes
-	stay the firmware's (RPI_DISPLAY_FIXED_MODES). */
+	stay the firmware's (RPI_DISPLAY_FIXED_MODES). The cursor is a second
+	plane in the list of the output it is on. */
 
 
 #include <new>
@@ -106,6 +107,15 @@
 #define HVS6_CTL0_UNITY					(1u << 15)
 #define HVS6_PLANE_WORDS				8
 	// CTL0, POS0, CTL2, POS2, context, PTR0..2 of an unscaled RGB plane
+#define HVS6_CURSOR_CTL0				0x4800c007
+	// valid, 8 words, alpha from the pixels, unscaled, ARGB order, RGBA8888
+#define HVS6_CURSOR_CTL2				0x2000fff0
+	// premultiplied, plane alpha 0xfff
+#define HVS6_CURSOR_UPM_BASE			0x3f0
+	// the top of the 1024 UPM (fetch buffer) units of 256 bytes, far from
+	// the firmware's planes (0 and 0x199); 4 units a cursor (3 needed)
+#define HVS6_CURSOR_UPM_HANDLE			30
+	// handles 30 and 31 (the firmware's planes use 0 and 8)
 #define HVS6_SLOT_BASE					0xe00
 #define HVS6_SLOT_WORDS					0x40
 	// two slots a channel at the end of the list memory, used in turn
@@ -170,6 +180,16 @@ struct display_info {
 	uint32			firmwarePlane[RPI_DISPLAY_MAX_OUTPUTS][HVS6_PLANE_WORDS];
 	bool			hasFirmwarePlane[RPI_DISPLAY_MAX_OUTPUTS];
 	uint32			nextSlot[RPI_DISPLAY_MAX_OUTPUTS];
+	// what each channel shows: the region, and whether the cursor's plane
+	// is in its list (at activeSlot + HVS6_PLANE_WORDS)
+	bool			regionShown[RPI_DISPLAY_MAX_OUTPUTS];
+	int32			regionX[RPI_DISPLAY_MAX_OUTPUTS];
+	int32			regionY[RPI_DISPLAY_MAX_OUTPUTS];
+	uint32			regionWidth[RPI_DISPLAY_MAX_OUTPUTS];
+	uint32			regionHeight[RPI_DISPLAY_MAX_OUTPUTS];
+	uint32			regionPitch[RPI_DISPLAY_MAX_OUTPUTS];
+	uint32			activeSlot[RPI_DISPLAY_MAX_OUTPUTS];
+	bool			cursorIn[RPI_DISPLAY_MAX_OUTPUTS];
 
 	// a hardware cursor, composited by the firmware over the frame buffer;
 	// the position is the hotspot, in frame buffer pixels
@@ -604,26 +624,87 @@ hvs6_read_firmware_plane(display_info* info, uint32 index)
 }
 
 
-/*!	Shows the region (x, y, width, height) of the frame buffer on output
-	\a index, unscaled, centered when it is smaller than the mode: a new
-	display list in the slot the compositor is not reading, then the
-	channel's list pointer, which it takes at the next frame.
+/*!	The words of the cursor's plane on output \a index, unscaled, cut to
+	the output; false if it is not on it.
 */
-static status_t
-hvs6_show(display_info* info, uint32 index, int32 x, int32 y, uint32 width,
-	uint32 height, uint32 bytesPerRow)
+static bool
+hvs6_cursor_plane(display_info* info, uint32 index, uint32* words)
 {
-	if (!info->hasFirmwarePlane[index])
-		return B_NOT_SUPPORTED;
 	const rpi_display_output& output = info->shared->outputs[index];
-	if (width > output.native_width || height > output.native_height)
-		return B_BAD_VALUE;
+	if (!info->cursorDefined || !info->cursorVisible
+		|| info->cursorBufferAddress == 0 || !info->regionShown[index]) {
+		return false;
+	}
+	int32 regionX = info->regionX[index];
+	int32 regionY = info->regionY[index];
+	int32 width = info->regionWidth[index];
+	int32 height = info->regionHeight[index];
+	if (info->cursorX < regionX || info->cursorX >= regionX + width
+		|| info->cursorY < regionY || info->cursorY >= regionY + height) {
+		return false;
+	}
+
+	// the image's top left on the output, the region centered on it
+	int32 x = info->cursorX - regionX - info->cursor.hot_x
+		+ (int32)(output.native_width - width) / 2;
+	int32 y = info->cursorY - regionY - info->cursor.hot_y
+		+ (int32)(output.native_height - height) / 2;
+	int32 cursorWidth = info->cursor.width;
+	int32 cursorHeight = info->cursor.height;
+	int32 skipX = 0, skipY = 0;
+	if (x < 0) {
+		skipX = -x;
+		x = 0;
+	}
+	if (y < 0) {
+		skipY = -y;
+		y = 0;
+	}
+	cursorWidth -= skipX;
+	cursorHeight -= skipY;
+	if (x + cursorWidth > (int32)output.native_width)
+		cursorWidth = output.native_width - x;
+	if (y + cursorHeight > (int32)output.native_height)
+		cursorHeight = output.native_height - y;
+	if (cursorWidth <= 0 || cursorHeight <= 0)
+		return false;
+
+	const uint32 pitch = RPI_DISPLAY_CURSOR_MAX * 4;
+	uint64 address = info->cursorBufferAddress + (uint64)skipY * pitch
+		+ skipX * 4;
+	words[0] = HVS6_CURSOR_CTL0;
+	words[1] = (uint32)y << 16 | (uint32)x;
+	words[2] = HVS6_CURSOR_CTL2;
+	words[3] = (uint32)(cursorHeight - 1) << 16 | (uint32)(cursorWidth - 1);
+	words[4] = 0xc0c0c0c0;
+	words[5] = (HVS6_CURSOR_UPM_BASE + index * 4) << 16
+		| (HVS6_CURSOR_UPM_HANDLE + index) << 10
+		| (uint32)((address >> 32) & 0xff);
+	words[6] = (uint32)address;
+	words[7] = pitch;
+	return true;
+}
+
+
+/*!	Writes output \a index's display list, its region and the cursor's
+	plane over it if the cursor is there, into the slot the compositor is
+	not reading, then points the channel at it: the compositor takes it at
+	the next frame.
+*/
+static void
+hvs6_write_list(display_info* info, uint32 index)
+{
+	const rpi_display_output& output = info->shared->outputs[index];
+	uint32 width = info->regionWidth[index];
+	uint32 height = info->regionHeight[index];
+	uint32 pitch = info->regionPitch[index];
 	uint32 destX = (output.native_width - width) / 2;
 	uint32 destY = (output.native_height - height) / 2;
-
-	uint64 address = info->bufferAddress + (uint64)y * bytesPerRow + x * 4;
+	uint64 address = info->bufferAddress
+		+ (uint64)info->regionY[index] * pitch + info->regionX[index] * 4;
 	const uint32* plane = info->firmwarePlane[index];
-	uint32 words[HVS6_PLANE_WORDS + 1] = {
+
+	uint32 words[2 * HVS6_PLANE_WORDS + 1] = {
 		(plane[0] & ~HVS6_CTL0_NEXT_MASK)
 			| (HVS6_PLANE_WORDS << HVS6_CTL0_NEXT_SHIFT),
 		destY << 16 | destX,
@@ -634,19 +715,73 @@ hvs6_show(display_info* info, uint32 index, int32 x, int32 y, uint32 width,
 		(plane[5] & ~0xffu) | (uint32)((address >> 32) & 0xff),
 			// keeps the firmware's UPM (fetch buffer) settings
 		(uint32)address,
-		(plane[7] & ~0x1ffffu) | bytesPerRow,
-		HVS6_CTL0_END
+		(plane[7] & ~0x1ffffu) | pitch
 	};
+	uint32 count = HVS6_PLANE_WORDS;
+	info->cursorIn[index] = hvs6_cursor_plane(info, index, words + count);
+	if (info->cursorIn[index])
+		count += HVS6_PLANE_WORDS;
+	words[count++] = HVS6_CTL0_END;
 
 	uint32 slot = HVS6_SLOT_BASE + index * 2 * HVS6_SLOT_WORDS
 		+ info->nextSlot[index] * HVS6_SLOT_WORDS;
 	info->nextSlot[index] ^= 1;
 	volatile uint32* list = hvs6_dlist(info, slot);
-	for (uint32 i = 0; i < B_COUNT_OF(words); i++)
+	for (uint32 i = 0; i < count; i++)
 		list[i] = words[i];
 	memory_full_barrier();
 	hvs6_write(info, HVS6_DISP_LPTRS(index), slot);
+	info->activeSlot[index] = slot;
+}
+
+
+/*!	Shows the region (x, y, width, height) of the frame buffer on output
+	\a index, unscaled, centered when it is smaller than the mode.
+*/
+static status_t
+hvs6_show(display_info* info, uint32 index, int32 x, int32 y, uint32 width,
+	uint32 height, uint32 bytesPerRow)
+{
+	if (!info->hasFirmwarePlane[index])
+		return B_NOT_SUPPORTED;
+	const rpi_display_output& output = info->shared->outputs[index];
+	if (width > output.native_width || height > output.native_height)
+		return B_BAD_VALUE;
+
+	info->regionShown[index] = true;
+	info->regionX[index] = x;
+	info->regionY[index] = y;
+	info->regionWidth[index] = width;
+	info->regionHeight[index] = height;
+	info->regionPitch[index] = bytesPerRow;
+	hvs6_write_list(info, index);
 	return B_OK;
+}
+
+
+/*!	The cursor on the BCM2712: a plane of its own in the list of the output
+	under the hotspot. Moving it within an output rewrites its words in the
+	list the compositor reads, as Linux's asynchronous updates do; showing,
+	hiding it or moving it to another output writes new lists.
+*/
+static void
+hvs6_update_cursor(display_info* info)
+{
+	for (uint32 i = 0; i < info->shared->output_count; i++) {
+		if (!info->regionShown[i])
+			continue;
+		uint32 words[HVS6_PLANE_WORDS];
+		bool on = hvs6_cursor_plane(info, i, words);
+		if (on && info->cursorIn[i]) {
+			volatile uint32* plane = hvs6_dlist(info,
+				info->activeSlot[i] + HVS6_PLANE_WORDS);
+			plane[1] = words[1];
+			plane[3] = words[3];
+			plane[5] = words[5];
+			plane[6] = words[6];
+		} else if (on != info->cursorIn[i])
+			hvs6_write_list(info, i);
+	}
 }
 
 
@@ -657,6 +792,8 @@ hvs6_restore(display_info* info, uint32 index)
 	if (info->hvsArea < 0 || !info->hasFirmwarePlane[index])
 		return;
 	hvs6_write(info, HVS6_DISP_LPTRS(index), info->firmwareHead[index]);
+	info->regionShown[index] = false;
+	info->cursorIn[index] = false;
 }
 
 
@@ -823,8 +960,10 @@ output_dest(uint32 nativeWidth, uint32 nativeHeight, uint32 width,
 static status_t
 update_cursor_plane(display_info* info)
 {
-	if (info->bcm2712)
+	if (info->bcm2712) {
+		hvs6_update_cursor(info);
 		return B_OK;
+	}
 	const rpi_display_shared_info& shared = *info->shared;
 	int32 on = -1;
 	if (info->cursorDefined && info->cursorVisible) {
@@ -1355,9 +1494,6 @@ display_control(void* cookie, uint32 op, void* buffer, size_t length)
 				|| cursor.height > RPI_DISPLAY_CURSOR_MAX)
 				return B_BAD_VALUE;
 
-			// no cursor plane on the BCM2712 yet: app_server draws it
-			if (info->bcm2712)
-				return B_NOT_SUPPORTED;
 			MutexLocker locker(info->lock);
 			status = ensure_cursor_buffer(info);
 			if (status != B_OK)
