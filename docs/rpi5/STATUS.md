@@ -14,7 +14,7 @@ Pi 4 and a Pi 5. How it boots: BOOT.md.
 | SD card | `bcm2711_emmc2` on the BCM2712 slot, SDMA, 50 MHz high speed | 128 GB card read and written |
 | USB | both RP1 xHCIs (`xhci_fdt`), SuperSpeed (since 2026-11-15) | KVM keyboard, mouse, RNDIS, mass storage; an RTL9210 NVMe adapter (1 TB SSD) on a blue port reads 243-270 MB/s |
 | Ethernet | `rp1_gem`, 1 Gbit/s | DHCP, ping 0.16 ms, no loss |
-| Display | `rpi_display` on the HVS: both HDMI outputs, one desktop; mode setting (EDID's preferred mode up to 340 MHz), scaled regions, hardware cursor | 2026-11-15: the KVM at 1080p (HDMI0) and 1280x720 (set in the driver settings, the KVM reports 720p); the Dell 4K at 3840x2160 30 Hz (HDMI1, code 95), its half of the desktop scaled 2x by the HVS; blanks at 60.00 Hz; GLTeapot synced |
+| Display | `rpi_display` on the HVS: both HDMI outputs, one desktop; mode setting (EDID's preferred mode up to 340 MHz), scaled regions, hardware cursor | 2026-11-15: the KVM at 1080p (HDMI0) and 1280x720 (set in the driver settings, the KVM reports 720p); the Dell 4K at 3840x2160 30 Hz (HDMI1, code 95), its half of the desktop scaled 2x by the HVS (seen right by the owner); blanks at 60.00 Hz; GLTeapot synced |
 | Watchdog | `airos.watchdog` (lab), restart through PSCI | resets after a hang |
 | `airos.debug` | loader and kernel output on the screen | boots to the network (kernel pager: P) |
 | GPU | `v3d` on the V3D 7.1.10 at 1.15 GHz, Mesa 25.3.6 | 2026-11-15: GL ES 3.1 and Vulkan 1.3 probes pass (1080p with depth exact), texture and readback probes pass, GLTeapot ~1690 FPS; `rpi4_v3d_probe` passes (TFU raster to UIF, uncached and cached) |
