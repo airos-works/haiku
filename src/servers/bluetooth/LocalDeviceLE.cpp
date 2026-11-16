@@ -17,6 +17,7 @@
 #include <LELog.h>
 #include <bluetoothserver_p.h>
 
+#include <new>
 #include <string.h>
 
 
@@ -62,6 +63,8 @@ static const uint8 kEventEncryptionKeyRefresh = 0x30;
 
 // A client that vanishes mid-connection must not hold the controller forever.
 static const bigtime_t kConnectionAttemptLimit = 45000000;
+// Links (up or asked for) per controller; controllers take about as many.
+static const size_t kMaximumLELinks = 8;
 // Repeated advertisements of the same kind are forwarded at most this often.
 static const bigtime_t kAdvertisementInterval = 500000;
 // With the controller's duplicate filter on, restart the scan this often.
@@ -136,19 +139,20 @@ LocalDeviceImpl::_SendLEScanNotice(uint32 what, uint8 status)
 
 
 void
-LocalDeviceImpl::_SendLEConnectionNotice(uint32 what, status_t status)
+LocalDeviceImpl::_SendLEConnectionNotice(const LELink* link, uint32 what,
+	status_t status)
 {
-	if (!fLEConnectionListener.IsValid())
+	if (!link->listener.IsValid())
 		return;
 	BMessage notice(what);
 	notice.AddInt32("hci_id", GetID());
 	notice.AddInt32("status", status);
-	notice.AddData("address", B_RAW_TYPE, fLEConnectionAddress,
-		sizeof(fLEConnectionAddress));
-	notice.AddUInt8("address_type", fLEConnectionAddressType);
-	notice.AddUInt16("handle", fLEConnectionHandle);
-	status_t result = fLEConnectionListener.SendMessage(&notice,
-		(BHandler*)NULL, kNoticeTimeout);
+	notice.AddData("address", B_RAW_TYPE, link->address,
+		sizeof(link->address));
+	notice.AddUInt8("address_type", link->addressType);
+	notice.AddUInt16("handle", link->handle);
+	status_t result = link->listener.SendMessage(&notice, (BHandler*)NULL,
+		kNoticeTimeout);
 	if (result != B_OK) {
 		LOG(LE_LOG_ERROR, "LE link notice %.4s not delivered: %s",
 			(const char*)&what, strerror(result));
@@ -157,29 +161,89 @@ LocalDeviceImpl::_SendLEConnectionNotice(uint32 what, status_t status)
 
 
 void
-LocalDeviceImpl::_ResetLEConnection()
+LocalDeviceImpl::_RemoveLELink(LELink* link)
 {
-	fLEConnectionState = LE_CONN_IDLE;
-	fLEConnectionSince = 0;
-	fLECancelRequested = false;
-	fLEConnectionListener = BMessenger();
-	fLEConnectionHandle = 0;
-	fLEEncryptionPending = false;
-	fLEEncrypted = false;
-	fLEKeepIntervalMin = fLEKeepIntervalMax = 0;
-	fLEKeepRestores = 0;
-	fLEKeepRestoredAt = 0;
-	fLELinkInterval = fLELinkLatency = fLELinkTimeout = 0;
+	for (size_t i = 0; i < fLELinks.size(); i++) {
+		if (fLELinks[i] == link) {
+			fLELinks.erase(fLELinks.begin() + i);
+			break;
+		}
+	}
+	delete link;
+}
+
+
+LocalDeviceImpl::LELink*
+LocalDeviceImpl::_LECreating() const
+{
+	for (size_t i = 0; i < fLELinks.size(); i++) {
+		LEConnectionState state = fLELinks[i]->state;
+		if (state == LE_CONN_CREATE_SENT || state == LE_CONN_CONNECTING
+			|| state == LE_CONN_CANCELING)
+			return fLELinks[i];
+	}
+	return NULL;
+}
+
+
+LocalDeviceImpl::LELink*
+LocalDeviceImpl::_LELinkByHandle(uint16 handle) const
+{
+	for (size_t i = 0; i < fLELinks.size(); i++) {
+		LEConnectionState state = fLELinks[i]->state;
+		if ((state == LE_CONN_CONNECTED || state == LE_CONN_DISCONNECTING)
+			&& fLELinks[i]->handle == handle)
+			return fLELinks[i];
+	}
+	return NULL;
+}
+
+
+/*!	The link a request is about: the one with its "handle" or "address",
+	else the one link its "listener" holds, else the only link that is up.
+*/
+LocalDeviceImpl::LELink*
+LocalDeviceImpl::_FindLELink(const BMessage* request) const
+{
+	uint16 handle;
+	if (request != NULL && request->FindUInt16("handle", &handle) == B_OK)
+		return _LELinkByHandle(handle);
+
+	const void* address = NULL;
+	ssize_t addressSize = 0;
+	BMessenger listener;
+	bool byAddress = request != NULL && request->FindData("address",
+		B_RAW_TYPE, &address, &addressSize) == B_OK && addressSize == 6;
+	bool byListener = !byAddress && request != NULL
+		&& request->FindMessenger("listener", &listener) == B_OK;
+	LELink* found = NULL;
+	for (size_t i = 0; i < fLELinks.size(); i++) {
+		LELink* link = fLELinks[i];
+		if (link->state != LE_CONN_CONNECTED
+			&& link->state != LE_CONN_DISCONNECTING)
+			continue;
+		if (byAddress && memcmp(link->address, address, 6) != 0)
+			continue;
+		if (byListener && !(link->listener == listener))
+			continue;
+		if (found != NULL)
+			return NULL;
+		found = link;
+	}
+	return found;
 }
 
 
 bool
 LocalDeviceImpl::_LEInitiating() const
 {
-	return fLEConnectionState == LE_CONN_PENDING
-		|| fLEConnectionState == LE_CONN_CREATE_SENT
-		|| fLEConnectionState == LE_CONN_CONNECTING
-		|| fLEConnectionState == LE_CONN_CANCELING;
+	for (size_t i = 0; i < fLELinks.size(); i++) {
+		LEConnectionState state = fLELinks[i]->state;
+		if (state == LE_CONN_PENDING || state == LE_CONN_CREATE_SENT
+			|| state == LE_CONN_CONNECTING || state == LE_CONN_CANCELING)
+			return true;
+	}
+	return false;
 }
 
 
@@ -212,30 +276,80 @@ LocalDeviceImpl::_FailLEScan(uint8 status)
 
 
 status_t
-LocalDeviceImpl::_IssueLECreateConnection()
+LocalDeviceImpl::_IssueLECreateConnection(LELink* link)
 {
 	hci_cp_le_create_conn command = {};
 	command.scan_interval = B_HOST_TO_LENDIAN_INT16(0x0060);
 	command.scan_window = B_HOST_TO_LENDIAN_INT16(0x0030);
-	command.peer_address_type = fLEConnectionAddressType;
-	memcpy(&command.peer_address, fLEConnectionAddress,
-		sizeof(fLEConnectionAddress));
+	command.peer_address_type = link->addressType;
+	memcpy(&command.peer_address, link->address, sizeof(link->address));
 	// Unless the client asked for others, 30-50 ms until the peripheral
 	// asks for something else; 5 s timeout.
 	command.connection_interval_min
-		= B_HOST_TO_LENDIAN_INT16(fLECreateIntervalMin);
+		= B_HOST_TO_LENDIAN_INT16(link->createIntervalMin);
 	command.connection_interval_max
-		= B_HOST_TO_LENDIAN_INT16(fLECreateIntervalMax);
-	command.connection_latency = B_HOST_TO_LENDIAN_INT16(fLECreateLatency);
-	command.supervision_timeout = B_HOST_TO_LENDIAN_INT16(fLECreateTimeout);
+		= B_HOST_TO_LENDIAN_INT16(link->createIntervalMax);
+	command.connection_latency = B_HOST_TO_LENDIAN_INT16(link->createLatency);
+	command.supervision_timeout = B_HOST_TO_LENDIAN_INT16(link->createTimeout);
 	char address[18];
 	LOG(LE_LOG_INFO, "creating LE connection to %s (address type %u, interval "
-		"%.2f-%.2f ms)", AddressString(fLEConnectionAddress, address),
-		fLEConnectionAddressType, fLECreateIntervalMin * 1.25,
-		fLECreateIntervalMax * 1.25);
-	fLEConnectionState = LE_CONN_CREATE_SENT;
+		"%.2f-%.2f ms, %zu other link(s))",
+		AddressString(link->address, address), link->addressType,
+		link->createIntervalMin * 1.25, link->createIntervalMax * 1.25,
+		fLELinks.size() - 1);
+	link->state = LE_CONN_CREATE_SENT;
 	return _SendLECommand(kOpcodeLECreateConnection, &command,
 		sizeof(command));
+}
+
+
+status_t
+LocalDeviceImpl::_DisconnectLELink(LELink* link)
+{
+	if (link->state == LE_CONN_DISCONNECTING)
+		return B_OK;
+	if (link->state != LE_CONN_CONNECTED)
+		return B_BAD_VALUE;
+	const uint8 command[3] = {
+		(uint8)link->handle, (uint8)(link->handle >> 8), 0x13
+	};
+	LOG(LE_LOG_INFO, "disconnecting LE handle %#x", link->handle);
+	status_t result = _SendLECommand(kOpcodeDisconnect, command,
+		sizeof(command));
+	if (result == B_OK) {
+		link->state = LE_CONN_DISCONNECTING;
+		fLEDisconnectsSent.push_back(link->handle);
+	}
+	return result;
+}
+
+
+/*!	Gives up on a link that is not up yet. The link may be gone when this
+	returns.
+*/
+void
+LocalDeviceImpl::_CancelLELink(LELink* link)
+{
+	switch (link->state) {
+		case LE_CONN_PENDING:
+			_SendLEConnectionNotice(link, BT_MSG_LE_CONNECT_FAILED,
+				B_CANCELED);
+			_RemoveLELink(link);
+			break;
+		case LE_CONN_CREATE_SENT:
+			// The command status calls the cancel in.
+			link->cancelRequested = true;
+			break;
+		case LE_CONN_CONNECTING:
+			if (_SendLECommand(kOpcodeLECreateConnectionCancel, NULL, 0)
+					== B_OK) {
+				link->cancelRequested = true;
+				link->state = LE_CONN_CANCELING;
+			}
+			break;
+		default:
+			break;
+	}
 }
 
 
@@ -291,19 +405,33 @@ LocalDeviceImpl::_UpdateLE()
 			return;
 	}
 
-	if (fLEConnectionState == LE_CONN_PENDING) {
-		if (fLECancelRequested) {
-			_SendLEConnectionNotice(BT_MSG_LE_CONNECT_FAILED, B_CANCELED);
-			_ResetLEConnection();
-			_UpdateLE();
+	// The controller creates one connection at a time (Core Vol 4 Part E
+	// 7.8.12: Command Disallowed while one is pending); the next request
+	// waits for it, in order.
+	if (_LECreating() != NULL)
+		return;
+	for (size_t i = 0; i < fLELinks.size();) {
+		LELink* link = fLELinks[i];
+		if (link->state != LE_CONN_PENDING) {
+			i++;
+			continue;
+		}
+		if (link->cancelRequested) {
+			_SendLEConnectionNotice(link, BT_MSG_LE_CONNECT_FAILED,
+				B_CANCELED);
+			_RemoveLELink(link);
+			continue;
+		}
+		status_t result = _IssueLECreateConnection(link);
+		if (result == B_OK)
 			return;
-		}
-		status_t result = _IssueLECreateConnection();
-		if (result != B_OK) {
-			_SendLEConnectionNotice(BT_MSG_LE_CONNECT_FAILED, result);
-			_ResetLEConnection();
-		}
+		_SendLEConnectionNotice(link, BT_MSG_LE_CONNECT_FAILED, result);
+		_RemoveLELink(link);
 	}
+	// Nothing left to create: the scan may resume.
+	if (!fLEScanListeners.empty() && fLEScanState == LE_SCAN_IDLE
+		&& !_LEInitiating())
+		_UpdateLE();
 }
 
 
@@ -380,106 +508,131 @@ LocalDeviceImpl::StartLEConnection(const BMessenger& listener,
 			return B_BAD_VALUE;
 	}
 	BAutolock lock(fLELock);
-	if (fLEConnectionState != LE_CONN_IDLE) {
-		LOG(LE_LOG_INFO, "LE connection request refused: link is %s",
-			ConnectionStateName(fLEConnectionState));
+	char text[18];
+	// One link per peer: the controller refuses a second, and the one there
+	// is belongs to whoever asked for it.
+	for (size_t i = 0; i < fLELinks.size(); i++) {
+		if (memcmp(fLELinks[i]->address, address, 6) == 0) {
+			LOG(LE_LOG_INFO, "LE connection to %s refused: its link is %s",
+				AddressString(address, text),
+				ConnectionStateName(fLELinks[i]->state));
+			return B_BUSY;
+		}
+	}
+	if (fLELinks.size() >= kMaximumLELinks) {
+		LOG(LE_LOG_INFO, "LE connection to %s refused: %zu links already",
+			AddressString(address, text), fLELinks.size());
 		return B_BUSY;
 	}
 
-	fLEConnectionListener = listener;
-	memcpy(fLEConnectionAddress, address, sizeof(fLEConnectionAddress));
-	fLEConnectionAddressType = addressType;
-	fLEConnectionHandle = 0;
-	fLECancelRequested = false;
-	fLEEncryptionPending = false;
-	fLEEncrypted = false;
-	fLEConnectionState = LE_CONN_PENDING;
-	fLEConnectionSince = system_time();
-	fLECreateIntervalMin = intervalMin;
-	fLECreateIntervalMax = intervalMax;
-	fLECreateLatency = latency;
-	fLECreateTimeout = timeout;
-	char text[18];
-	LOG(LE_LOG_INFO, "LE connection to %s requested (scan %s)",
-		AddressString(address, text), ScanStateName(fLEScanState));
+	LELink* link = new(std::nothrow) LELink();
+	if (link == NULL)
+		return B_NO_MEMORY;
+	link->state = LE_CONN_PENDING;
+	link->since = system_time();
+	link->cancelRequested = false;
+	link->listener = listener;
+	memcpy(link->address, address, sizeof(link->address));
+	link->addressType = addressType;
+	link->handle = 0;
+	link->encryptionPending = false;
+	link->encrypted = false;
+	link->createIntervalMin = intervalMin;
+	link->createIntervalMax = intervalMax;
+	link->createLatency = latency;
+	link->createTimeout = timeout;
+	link->keepIntervalMin = link->keepIntervalMax = 0;
+	link->keepRestores = 0;
+	link->keepRestoredAt = 0;
+	link->interval = link->latency = link->timeout = 0;
+	fLELinks.push_back(link);
+	LOG(LE_LOG_INFO, "LE connection to %s requested (scan %s, %zu link(s))",
+		AddressString(address, text), ScanStateName(fLEScanState),
+		fLELinks.size());
 	_UpdateLE();
 	return B_OK;
 }
 
 
 status_t
-LocalDeviceImpl::CancelLEConnection(const BMessenger* listener)
+LocalDeviceImpl::CancelLEConnection(const BMessenger* listener,
+	const uint8* address)
 {
 	BAutolock lock(fLELock);
-	if (listener != NULL && fLEConnectionListener.IsValid()
-		&& !(*listener == fLEConnectionListener))
-		return B_NOT_ALLOWED;
-	LOG(LE_LOG_INFO, "LE connection cancel requested while %s",
-		ConnectionStateName(fLEConnectionState));
-	switch (fLEConnectionState) {
-		case LE_CONN_PENDING:
-			_SendLEConnectionNotice(BT_MSG_LE_CONNECT_FAILED, B_CANCELED);
-			_ResetLEConnection();
-			_UpdateLE();
-			return B_OK;
-		case LE_CONN_CREATE_SENT:
-			fLECancelRequested = true;
-			return B_OK;
-		case LE_CONN_CONNECTING:
-		{
-			status_t result = _SendLECommand(kOpcodeLECreateConnectionCancel,
-				NULL, 0);
-			if (result == B_OK) {
-				fLECancelRequested = true;
-				fLEConnectionState = LE_CONN_CANCELING;
-			}
-			return result;
+	bool found = false;
+	bool others = false;
+	for (size_t i = 0; i < fLELinks.size();) {
+		LELink* link = fLELinks[i];
+		if ((address != NULL && memcmp(link->address, address, 6) != 0)
+			|| link->state == LE_CONN_CONNECTED
+			|| link->state == LE_CONN_DISCONNECTING) {
+			i++;
+			continue;
 		}
-		case LE_CONN_CANCELING:
-			return B_OK;
-		default:
-			return B_BAD_VALUE;
+		if (listener != NULL && link->listener.IsValid()
+			&& !(*listener == link->listener)) {
+			others = true;
+			i++;
+			continue;
+		}
+		found = true;
+		LOG(LE_LOG_INFO, "LE connection cancel requested while %s",
+			ConnectionStateName(link->state));
+		if (link->state == LE_CONN_PENDING) {
+			// Removes it.
+			_CancelLELink(link);
+			continue;
+		}
+		_CancelLELink(link);
+		i++;
 	}
+	if (found)
+		_UpdateLE();
+	return found ? B_OK : others ? B_NOT_ALLOWED : B_BAD_VALUE;
 }
 
 
 status_t
-LocalDeviceImpl::DisconnectLEConnection(const BMessenger* listener)
+LocalDeviceImpl::DisconnectLEConnection(const BMessenger* listener,
+	const uint8* address)
 {
 	BAutolock lock(fLELock);
-	if (listener != NULL && fLEConnectionListener.IsValid()
-		&& !(*listener == fLEConnectionListener))
-		return B_NOT_ALLOWED;
-	if (fLEConnectionState == LE_CONN_DISCONNECTING)
-		return B_OK;
-	if (fLEConnectionState != LE_CONN_CONNECTED)
-		return B_BAD_VALUE;
-	const uint8 command[3] = {
-		(uint8)fLEConnectionHandle, (uint8)(fLEConnectionHandle >> 8), 0x13
-	};
-	LOG(LE_LOG_INFO, "disconnecting LE handle %#x", fLEConnectionHandle);
-	status_t result = _SendLECommand(kOpcodeDisconnect, command,
-		sizeof(command));
-	if (result == B_OK)
-		fLEConnectionState = LE_CONN_DISCONNECTING;
-	return result;
+	status_t result = B_BAD_VALUE;
+	bool others = false;
+	for (size_t i = 0; i < fLELinks.size(); i++) {
+		LELink* link = fLELinks[i];
+		if ((address != NULL && memcmp(link->address, address, 6) != 0)
+			|| (link->state != LE_CONN_CONNECTED
+				&& link->state != LE_CONN_DISCONNECTING))
+			continue;
+		if (listener != NULL && link->listener.IsValid()
+			&& !(*listener == link->listener)) {
+			others = true;
+			continue;
+		}
+		status_t status = _DisconnectLELink(link);
+		if (result != B_OK)
+			result = status;
+	}
+	return result == B_BAD_VALUE && others ? B_NOT_ALLOWED : result;
 }
 
 
 status_t
-LocalDeviceImpl::StartLEEncryption(const uint8* key, const uint8* randomNumber,
-	uint16 encryptedDiversifier)
+LocalDeviceImpl::StartLEEncryption(const BMessage* request, const uint8* key,
+	const uint8* randomNumber, uint16 encryptedDiversifier)
 {
 	if (key == NULL || (randomNumber == NULL && encryptedDiversifier != 0))
 		return B_BAD_VALUE;
 	BAutolock lock(fLELock);
-	if (fLEConnectionState != LE_CONN_CONNECTED)
+	LELink* link = _FindLELink(request);
+	if (link == NULL || link->state != LE_CONN_CONNECTED)
 		return B_NO_INIT;
-	if (fLEEncryptionPending || fLEEncrypted)
+	if (link->encryptionPending || link->encrypted)
 		return B_BUSY;
 
 	hci_cp_le_start_encryption parameters = {};
-	parameters.connection_handle = B_HOST_TO_LENDIAN_INT16(fLEConnectionHandle);
+	parameters.connection_handle = B_HOST_TO_LENDIAN_INT16(link->handle);
 	if (randomNumber != NULL) {
 		memcpy(parameters.random_number, randomNumber,
 			sizeof(parameters.random_number));
@@ -488,13 +641,15 @@ LocalDeviceImpl::StartLEEncryption(const uint8* key, const uint8* randomNumber,
 	}
 	memcpy(parameters.long_term_key, key, sizeof(parameters.long_term_key));
 	LOG(LE_LOG_INFO, "starting LE encryption on handle %#x with %s",
-		fLEConnectionHandle, randomNumber != NULL ? "a stored long-term key"
+		link->handle, randomNumber != NULL ? "a stored long-term key"
 			: "the pairing short-term key");
-	fLEEncryptionPending = true;
+	link->encryptionPending = true;
 	status_t result = _SendLECommand(kOpcodeLEStartEncryption, &parameters,
 		sizeof(parameters));
 	if (result != B_OK)
-		fLEEncryptionPending = false;
+		link->encryptionPending = false;
+	else
+		fLEEncryptionsSent.push_back(link->handle);
 	volatile uint8* secret = (volatile uint8*)&parameters;
 	for (size_t i = 0; i < sizeof(parameters); i++)
 		secret[i] = 0;
@@ -528,25 +683,48 @@ void
 LocalDeviceImpl::LEPulse()
 {
 	BAutolock lock(fLELock);
-	if (_LEInitiating() && fLEConnectionSince > 0
-		&& system_time() - fLEConnectionSince > kConnectionAttemptLimit
-		&& fLEConnectionState != LE_CONN_CANCELING) {
-		LOG(LE_LOG_ERROR, "LE connection attempt still %s after %d s; "
-			"canceling it", ConnectionStateName(fLEConnectionState),
-			(int)(kConnectionAttemptLimit / 1000000));
-		if (fLEConnectionState == LE_CONN_CONNECTING) {
-			if (_SendLECommand(kOpcodeLECreateConnectionCancel, NULL, 0)
-					== B_OK) {
-				fLECancelRequested = true;
-				fLEConnectionState = LE_CONN_CANCELING;
-			}
-		} else if (fLEConnectionState == LE_CONN_PENDING) {
-			_SendLEConnectionNotice(BT_MSG_LE_CONNECT_FAILED, B_TIMED_OUT);
-			_ResetLEConnection();
-			_UpdateLE();
-		} else
-			fLECancelRequested = true;
+	const bigtime_t now = system_time();
+	bool dropped = false;
+	for (size_t i = 0; i < fLELinks.size();) {
+		LELink* link = fLELinks[i];
+		const bool initiating = link->state == LE_CONN_PENDING
+			|| link->state == LE_CONN_CREATE_SENT
+			|| link->state == LE_CONN_CONNECTING;
+		const bool expired = initiating && !link->cancelRequested
+			&& now - link->since > kConnectionAttemptLimit;
+		if (expired) {
+			LOG(LE_LOG_ERROR, "LE connection attempt still %s after %d s; "
+				"canceling it", ConnectionStateName(link->state),
+				(int)(kConnectionAttemptLimit / 1000000));
+		} else if (link->state == LE_CONN_PENDING
+			&& !link->listener.IsValid()) {
+			LOG(LE_LOG_INFO, "LE connection requester is gone; dropping "
+				"its request");
+		} else if (link->state == LE_CONN_CONNECTED
+			&& !link->listener.IsValid()) {
+			// A link whose owner died would otherwise stay up with no one
+			// using it.
+			LOG(LE_LOG_INFO, "LE link owner is gone; disconnecting handle "
+				"%#x", link->handle);
+			_DisconnectLELink(link);
+			i++;
+			continue;
+		} else {
+			i++;
+			continue;
+		}
+		if (link->state == LE_CONN_PENDING) {
+			_SendLEConnectionNotice(link, BT_MSG_LE_CONNECT_FAILED,
+				B_TIMED_OUT);
+			_RemoveLELink(link);
+			dropped = true;
+			continue;
+		}
+		_CancelLELink(link);
+		i++;
 	}
+	if (dropped)
+		_UpdateLE();
 
 	// The event masks and the scan move on only when the controller answers
 	// the command before; an answer that never comes (a controller still
@@ -604,18 +782,6 @@ LocalDeviceImpl::LEPulse()
 			fLEScanListeners.size());
 		_UpdateLE();
 	}
-
-	// A link whose owner died would otherwise stay up with no one using it.
-	if (fLEConnectionState == LE_CONN_CONNECTED
-		&& !fLEConnectionListener.IsValid()) {
-		LOG(LE_LOG_INFO, "LE link owner is gone; disconnecting handle %#x",
-			fLEConnectionHandle);
-		const uint8 command[3] = {
-			(uint8)fLEConnectionHandle, (uint8)(fLEConnectionHandle >> 8), 0x13
-		};
-		if (_SendLECommand(kOpcodeDisconnect, command, sizeof(command)) == B_OK)
-			fLEConnectionState = LE_CONN_DISCONNECTING;
-	}
 }
 
 
@@ -662,9 +828,16 @@ LocalDeviceImpl::HandleLECommandComplete(struct hci_event_header* event)
 			fLEMaskState = LE_MASKS_NONE;
 			if (!fLEScanListeners.empty())
 				_FailLEScan(status);
-			if (_LEInitiating()) {
-				_SendLEConnectionNotice(BT_MSG_LE_CONNECT_FAILED, status);
-				_ResetLEConnection();
+			for (size_t i = 0; i < fLELinks.size();) {
+				LELink* link = fLELinks[i];
+				if (link->state == LE_CONN_CONNECTED
+					|| link->state == LE_CONN_DISCONNECTING) {
+					i++;
+					continue;
+				}
+				_SendLEConnectionNotice(link, BT_MSG_LE_CONNECT_FAILED,
+					status);
+				_RemoveLELink(link);
 			}
 			return;
 		}
@@ -740,35 +913,49 @@ LocalDeviceImpl::HandleLECommandStatus(struct hci_event_header* event)
 	const uint8 status = commandStatus->status;
 	BAutolock lock(fLELock);
 
-	if (opcode == kOpcodeLECreateConnection
-		&& fLEConnectionState == LE_CONN_CREATE_SENT) {
+	LELink* creating = _LECreating();
+	if (opcode == kOpcodeLECreateConnection && creating != NULL
+		&& creating->state == LE_CONN_CREATE_SENT) {
 		if (status != 0) {
 			LOG(LE_LOG_ERROR, "LE Create Connection rejected: %#x (%s)",
 				status, BluetoothError(status));
-			_SendLEConnectionNotice(BT_MSG_LE_CONNECT_FAILED, status);
-			_ResetLEConnection();
+			_SendLEConnectionNotice(creating, BT_MSG_LE_CONNECT_FAILED,
+				status);
+			_RemoveLELink(creating);
 			_UpdateLE();
 			return;
 		}
-		fLEConnectionState = LE_CONN_CONNECTING;
+		creating->state = LE_CONN_CONNECTING;
 		LOG(LE_LOG_INFO, "LE connection initiating; waiting for the peer to "
 			"advertise");
-		if (fLECancelRequested) {
+		if (creating->cancelRequested) {
 			if (_SendLECommand(kOpcodeLECreateConnectionCancel, NULL, 0)
 					== B_OK)
-				fLEConnectionState = LE_CONN_CANCELING;
+				creating->state = LE_CONN_CANCELING;
 		} else
-			_SendLEConnectionNotice(BT_MSG_LE_CONNECTING);
-	} else if (opcode == kOpcodeDisconnect
-		&& fLEConnectionState == LE_CONN_DISCONNECTING && status != 0) {
-		LOG(LE_LOG_ERROR, "LE Disconnect rejected: %#x", status);
-		fLEConnectionState = LE_CONN_CONNECTED;
-	} else if (opcode == kOpcodeLEStartEncryption && fLEEncryptionPending) {
+			_SendLEConnectionNotice(creating, BT_MSG_LE_CONNECTING);
+	} else if (opcode == kOpcodeDisconnect && !fLEDisconnectsSent.empty()) {
+		const uint16 handle = fLEDisconnectsSent.front();
+		fLEDisconnectsSent.erase(fLEDisconnectsSent.begin());
+		LELink* link = _LELinkByHandle(handle);
+		if (status != 0 && link != NULL
+			&& link->state == LE_CONN_DISCONNECTING) {
+			LOG(LE_LOG_ERROR, "LE Disconnect of handle %#x rejected: %#x",
+				handle, status);
+			link->state = LE_CONN_CONNECTED;
+		}
+	} else if (opcode == kOpcodeLEStartEncryption
+		&& !fLEEncryptionsSent.empty()) {
+		const uint16 handle = fLEEncryptionsSent.front();
+		fLEEncryptionsSent.erase(fLEEncryptionsSent.begin());
+		LELink* link = _LELinkByHandle(handle);
+		if (link == NULL || !link->encryptionPending)
+			return;
 		if (status != 0) {
-			LOG(LE_LOG_ERROR, "LE Start Encryption rejected: %#x (%s)", status,
-				BluetoothError(status));
-			fLEEncryptionPending = false;
-			_SendLEConnectionNotice(BT_MSG_LE_ENCRYPTION_FAILED, status);
+			LOG(LE_LOG_ERROR, "LE Start Encryption on handle %#x rejected: "
+				"%#x (%s)", handle, status, BluetoothError(status));
+			link->encryptionPending = false;
+			_SendLEConnectionNotice(link, BT_MSG_LE_ENCRYPTION_FAILED, status);
 		} else
 			LOG(LE_LOG_DEBUG, "LE Start Encryption accepted by controller");
 	}
@@ -853,14 +1040,13 @@ LocalDeviceImpl::HandleLEConnectionComplete(struct hci_event_header* event)
 	char text[18];
 	BAutolock lock(fLELock);
 
-	if (fLEConnectionState != LE_CONN_CONNECTING
-		&& fLEConnectionState != LE_CONN_CANCELING
-		&& fLEConnectionState != LE_CONN_CREATE_SENT) {
+	LELink* link = _LECreating();
+	if (link == NULL) {
 		LOG(LE_LOG_ERROR, "unexpected LE connection complete (status %#x, "
-			"handle %#x, peer %s) while %s", complete->status, handle,
-			AddressString((const uint8*)&complete->peer_address, text),
-			ConnectionStateName(fLEConnectionState));
-		if (complete->status == 0 && fLEConnectionState == LE_CONN_IDLE) {
+			"handle %#x, peer %s) with no connection being created",
+			complete->status, handle,
+			AddressString((const uint8*)&complete->peer_address, text));
+		if (complete->status == 0 && _LELinkByHandle(handle) == NULL) {
 			// Nobody asked for this link; do not leave it dangling.
 			const uint8 command[3] = { (uint8)handle, (uint8)(handle >> 8),
 				0x13 };
@@ -869,69 +1055,66 @@ LocalDeviceImpl::HandleLEConnectionComplete(struct hci_event_header* event)
 		return;
 	}
 	if (complete->status != 0) {
-		LOG(fLECancelRequested ? LE_LOG_INFO : LE_LOG_ERROR,
+		LOG(link->cancelRequested ? LE_LOG_INFO : LE_LOG_ERROR,
 			"LE connection %s: %#x (%s)",
-			fLECancelRequested ? "canceled" : "failed", complete->status,
+			link->cancelRequested ? "canceled" : "failed", complete->status,
 			BluetoothError(complete->status));
-		_SendLEConnectionNotice(BT_MSG_LE_CONNECT_FAILED,
-			fLECancelRequested ? B_CANCELED : complete->status);
-		_ResetLEConnection();
+		_SendLEConnectionNotice(link, BT_MSG_LE_CONNECT_FAILED,
+			link->cancelRequested ? B_CANCELED : complete->status);
+		_RemoveLELink(link);
 		_UpdateLE();
 		return;
 	}
 
-	fLEConnectionHandle = handle;
-	fLEConnectionState = LE_CONN_CONNECTED;
-	fLELinkInterval = B_LENDIAN_TO_HOST_INT16(complete->connection_interval);
-	fLELinkLatency = B_LENDIAN_TO_HOST_INT16(complete->connection_latency);
-	fLELinkTimeout = B_LENDIAN_TO_HOST_INT16(complete->supervision_timeout);
+	link->handle = handle;
+	link->state = LE_CONN_CONNECTED;
+	link->interval = B_LENDIAN_TO_HOST_INT16(complete->connection_interval);
+	link->latency = B_LENDIAN_TO_HOST_INT16(complete->connection_latency);
+	link->timeout = B_LENDIAN_TO_HOST_INT16(complete->supervision_timeout);
 	LOG(LE_LOG_INFO, "LE link up: handle %#x peer %s role %u interval %.2f ms "
-		"latency %u supervision %u ms", handle,
+		"latency %u supervision %u ms (%zu link(s))", handle,
 		AddressString((const uint8*)&complete->peer_address, text),
-		complete->role,
-		B_LENDIAN_TO_HOST_INT16(complete->connection_interval) * 1.25,
-		B_LENDIAN_TO_HOST_INT16(complete->connection_latency),
-		B_LENDIAN_TO_HOST_INT16(complete->supervision_timeout) * 10);
-	if (fLECancelRequested) {
-		const uint8 command[3] = { (uint8)handle, (uint8)(handle >> 8), 0x13 };
-		if (_SendLECommand(kOpcodeDisconnect, command, sizeof(command))
-				== B_OK)
-			fLEConnectionState = LE_CONN_DISCONNECTING;
-		_SendLEConnectionNotice(BT_MSG_LE_CONNECT_FAILED, B_CANCELED);
+		complete->role, link->interval * 1.25, link->latency,
+		link->timeout * 10, fLELinks.size());
+	if (link->cancelRequested) {
+		_DisconnectLELink(link);
+		_SendLEConnectionNotice(link, BT_MSG_LE_CONNECT_FAILED, B_CANCELED);
 	} else
-		_SendLEConnectionNotice(BT_MSG_LE_CONNECTED);
+		_SendLEConnectionNotice(link, BT_MSG_LE_CONNECTED);
 	_UpdateLE();
 }
 
 
 status_t
-LocalDeviceImpl::UpdateLEConnection(uint16 intervalMin, uint16 intervalMax,
-	uint16 latency, uint16 timeout, bool keepInterval)
+LocalDeviceImpl::UpdateLEConnection(const BMessage* request,
+	uint16 intervalMin, uint16 intervalMax, uint16 latency, uint16 timeout,
+	bool keepInterval)
 {
 	BAutolock lock(fLELock);
-	if (fLEConnectionState != LE_CONN_CONNECTED)
+	LELink* link = _FindLELink(request);
+	if (link == NULL || link->state != LE_CONN_CONNECTED)
 		return B_DEV_NOT_READY;
 	if (keepInterval) {
-		fLEKeepIntervalMin = intervalMin;
-		fLEKeepIntervalMax = intervalMax;
-		fLEKeepRestores = 0;
-		fLEKeepRestoredAt = 0;
+		link->keepIntervalMin = intervalMin;
+		link->keepIntervalMax = intervalMax;
+		link->keepRestores = 0;
+		link->keepRestoredAt = 0;
 	}
 	// Unspecified: what the link has (a peripheral's latency saves its
 	// battery; it is not ours to take away).
 	if (latency == 0xffff)
-		latency = fLELinkLatency;
+		latency = link->latency;
 	if (timeout == 0)
-		timeout = fLELinkTimeout;
-	if (keepInterval && fLELinkInterval >= intervalMin
-		&& fLELinkInterval <= intervalMax)
+		timeout = link->timeout;
+	if (keepInterval && link->interval >= intervalMin
+		&& link->interval <= intervalMax)
 		return B_OK;
 	// Core Vol 4 Part E 7.8.18, with the limits of Vol 6 Part B 4.5.
 	if (intervalMin < 6 || intervalMin > intervalMax || intervalMax > 3200
 		|| latency > 499 || timeout < 10 || timeout > 3200
 		|| (uint32)timeout * 4 <= (uint32)(1 + latency) * intervalMax)
 		return B_BAD_VALUE;
-	const uint16 handle = fLEConnectionHandle;
+	const uint16 handle = link->handle;
 	const uint8 command[14] = {
 		(uint8)handle, (uint8)(handle >> 8),
 		(uint8)intervalMin, (uint8)(intervalMin >> 8),
@@ -949,13 +1132,21 @@ LocalDeviceImpl::UpdateLEConnection(uint16 intervalMin, uint16 intervalMax,
 
 
 status_t
-LocalDeviceImpl::ReadRSSI(int32 handle)
+LocalDeviceImpl::ReadRSSI(const BMessage* request)
 {
 	BAutolock lock(fLELock);
-	if (handle < 0) {
-		if (fLEConnectionState != LE_CONN_CONNECTED)
+	uint16 handle;
+	if (request == NULL || request->FindUInt16("handle", &handle) != B_OK
+		|| handle == 0xffff) {
+		// An LE link.
+		BMessage selector;
+		if (request != NULL)
+			selector = *request;
+		selector.RemoveName("handle");
+		LELink* link = _FindLELink(&selector);
+		if (link == NULL || link->state != LE_CONN_CONNECTED)
 			return B_DEV_NOT_READY;
-		handle = fLEConnectionHandle;
+		handle = link->handle;
 	}
 	const uint8 command[2] = { (uint8)handle, (uint8)(handle >> 8) };
 	return _SendLECommand(kOpcodeReadRSSI, command, sizeof(command));
@@ -973,38 +1164,39 @@ LocalDeviceImpl::_KeepLEInterval(uint16 handle, uint16 interval,
 	uint16 latency, uint16 timeout)
 {
 	BAutolock lock(fLELock);
-	if (handle == fLEConnectionHandle) {
-		fLELinkInterval = interval;
-		fLELinkLatency = latency;
-		fLELinkTimeout = timeout;
-	}
-	if (fLEConnectionState != LE_CONN_CONNECTED || handle != fLEConnectionHandle
-		|| fLEKeepIntervalMin == 0
-		|| (interval >= fLEKeepIntervalMin && interval <= fLEKeepIntervalMax))
+	LELink* link = _LELinkByHandle(handle);
+	if (link == NULL)
+		return;
+	link->interval = interval;
+	link->latency = latency;
+	link->timeout = timeout;
+	if (link->state != LE_CONN_CONNECTED || link->keepIntervalMin == 0
+		|| (interval >= link->keepIntervalMin
+			&& interval <= link->keepIntervalMax))
 		return;
 	// Undone again within seconds of asking means the peer will not have it.
 	const bigtime_t now = system_time();
-	if (fLEKeepRestoredAt != 0 && now - fLEKeepRestoredAt < 5000000
-		&& ++fLEKeepRestores >= 3) {
+	if (link->keepRestoredAt != 0 && now - link->keepRestoredAt < 5000000
+		&& ++link->keepRestores >= 3) {
 		LOG(LE_LOG_INFO, "peer on handle %#x keeps choosing %.2f ms; "
 			"leaving it", handle, interval * 1.25);
-		fLEKeepIntervalMin = fLEKeepIntervalMax = 0;
+		link->keepIntervalMin = link->keepIntervalMax = 0;
 		return;
 	}
-	if ((uint32)timeout * 4 <= (uint32)(1 + latency) * fLEKeepIntervalMax)
+	if ((uint32)timeout * 4 <= (uint32)(1 + latency) * link->keepIntervalMax)
 		return;
-	fLEKeepRestoredAt = now;
+	link->keepRestoredAt = now;
 	const uint8 command[14] = {
 		(uint8)handle, (uint8)(handle >> 8),
-		(uint8)fLEKeepIntervalMin, (uint8)(fLEKeepIntervalMin >> 8),
-		(uint8)fLEKeepIntervalMax, (uint8)(fLEKeepIntervalMax >> 8),
+		(uint8)link->keepIntervalMin, (uint8)(link->keepIntervalMin >> 8),
+		(uint8)link->keepIntervalMax, (uint8)(link->keepIntervalMax >> 8),
 		(uint8)latency, (uint8)(latency >> 8),
 		(uint8)timeout, (uint8)(timeout >> 8),
 		0, 0, 0, 0
 	};
 	LOG(LE_LOG_INFO, "asking for %.2f-%.2f ms again on handle %#x (latency "
-		"%u, timeout %u ms)", fLEKeepIntervalMin * 1.25,
-		fLEKeepIntervalMax * 1.25, handle, latency, timeout * 10);
+		"%u, timeout %u ms)", link->keepIntervalMin * 1.25,
+		link->keepIntervalMax * 1.25, handle, latency, timeout * 10);
 	_SendLECommand(PACK_OPCODE(OGF_LE_CONTROL, 0x0013), command,
 		sizeof(command));
 }
@@ -1100,23 +1292,22 @@ LocalDeviceImpl::HandleLEDisconnection(uint16 handle, uint8 status,
 	uint8 reason)
 {
 	BAutolock lock(fLELock);
-	if (fLEConnectionState == LE_CONN_IDLE || handle != fLEConnectionHandle
-		|| (fLEConnectionState != LE_CONN_CONNECTED
-			&& fLEConnectionState != LE_CONN_DISCONNECTING))
+	LELink* link = _LELinkByHandle(handle);
+	if (link == NULL)
 		return false;
 	LOG(LE_LOG_INFO, "LE link down: handle %#x status %#x reason %#x (%s)",
 		handle, status, reason, BluetoothError(status == 0 ? reason : status));
-	if (status != 0 && fLEConnectionState == LE_CONN_DISCONNECTING) {
-		fLEConnectionState = LE_CONN_CONNECTED;
+	if (status != 0 && link->state == LE_CONN_DISCONNECTING) {
+		link->state = LE_CONN_CONNECTED;
 		return true;
 	}
-	if (fLEEncryptionPending) {
-		_SendLEConnectionNotice(BT_MSG_LE_ENCRYPTION_FAILED,
+	if (link->encryptionPending) {
+		_SendLEConnectionNotice(link, BT_MSG_LE_ENCRYPTION_FAILED,
 			reason != 0 ? reason : B_ERROR);
 	}
-	_SendLEConnectionNotice(BT_MSG_LE_DISCONNECTED,
+	_SendLEConnectionNotice(link, BT_MSG_LE_DISCONNECTED,
 		status == 0 ? reason : status);
-	_ResetLEConnection();
+	_RemoveLELink(link);
 	_UpdateLE();
 	return true;
 }
@@ -1127,19 +1318,18 @@ LocalDeviceImpl::HandleLEEncryptionChange(uint16 handle, uint8 status,
 	bool enabled)
 {
 	BAutolock lock(fLELock);
-	if ((fLEConnectionState != LE_CONN_CONNECTED
-			&& fLEConnectionState != LE_CONN_DISCONNECTING)
-		|| handle != fLEConnectionHandle)
+	LELink* link = _LELinkByHandle(handle);
+	if (link == NULL)
 		return false;
-	fLEEncrypted = status == 0 && enabled;
-	LOG(fLEEncrypted ? LE_LOG_INFO : LE_LOG_ERROR,
+	link->encrypted = status == 0 && enabled;
+	LOG(link->encrypted ? LE_LOG_INFO : LE_LOG_ERROR,
 		"LE encryption on handle %#x: status %#x (%s), %s", handle, status,
 		BluetoothError(status), enabled ? "enabled" : "disabled");
-	if (fLEEncryptionPending) {
-		fLEEncryptionPending = false;
-		_SendLEConnectionNotice(fLEEncrypted ? BT_MSG_LE_ENCRYPTED
+	if (link->encryptionPending) {
+		link->encryptionPending = false;
+		_SendLEConnectionNotice(link, link->encrypted ? BT_MSG_LE_ENCRYPTED
 			: BT_MSG_LE_ENCRYPTION_FAILED,
-			fLEEncrypted ? B_OK : (status != 0 ? status : B_ERROR));
+			link->encrypted ? B_OK : (status != 0 ? status : B_ERROR));
 	}
 	return true;
 }

@@ -46,7 +46,8 @@ Usage()
 	fprintf(stderr,
 		"usage: bt_le scan [seconds]\n"
 		"       bt_le pair <address> [public|random]\n"
-		"       bt_le services <address> [public|random]\n"
+		"       bt_le services <address> [public|random] [<address> "
+			"[public|random]]...\n"
 		"       bt_le list\n"
 		"       bt_le forget <address> [public|random]\n"
 		"       bt_le log [0-3]\n"
@@ -56,7 +57,10 @@ Usage()
 		"       bt_le inquiry [seconds]\n"
 		"       bt_le rssi [handle] [count]\n"
 		"Addresses are written as AA:BB:CC:DD:EE:FF. Pair a device while it\n"
-		"is in pairing mode; the log is %s.\n", LELogFilePath());
+		"is in pairing mode; the log is %s.\n"
+		"services holds a link to each device at once, then lists its GATT\n"
+		"services and reads its name, device information and battery level\n"
+		"(read only, no pairing).\n", LELogFilePath());
 }
 
 
@@ -344,6 +348,7 @@ public:
 				message->FindInt32("status", &status);
 				fLast = message->what;
 				fStatus = status;
+				fHandle = message->GetUInt16("handle", 0);
 				release_sem(fSemaphore);
 				break;
 			}
@@ -362,77 +367,194 @@ public:
 			: (fStatus != B_OK ? fStatus : B_ERROR);
 	}
 
+	uint16 Handle() const { return fHandle; }
+
 private:
 	sem_id fSemaphore;
 	uint32 fLast;
 	int32 fStatus;
+	uint16 fHandle;
 };
 
 
+struct ServicesPeer {
+	uint8 address[6];
+	uint8 type;
+	LinkListener* listener;
+	bool connected;
+};
+
+
+static const char*
+CharacteristicName(uint16 uuid)
+{
+	switch (uuid) {
+		case 0x2a00: return "device name";
+		case 0x2a01: return "appearance";
+		case 0x2a19: return "battery level";
+		case 0x2a24: return "model number";
+		case 0x2a26: return "firmware revision";
+		case 0x2a27: return "hardware revision";
+		case 0x2a28: return "software revision";
+		case 0x2a29: return "manufacturer name";
+		default: return NULL;
+	}
+}
+
+
+/*!	Reads the public, read-only values a phone's scanner shows: the GAP
+	name and appearance, the Device Information strings (but not serial
+	numbers or system IDs) and the battery level. Nothing is written and no
+	notification is enabled.
+*/
+static void
+ReadPublicValues(LEAttributeClient& client, const LEPrimaryService& service)
+{
+	if (service.uuid16 != 0x1800 && service.uuid16 != 0x180a
+		&& service.uuid16 != 0x180f)
+		return;
+	std::vector<LECharacteristic> characteristics;
+	if (client.DiscoverCharacteristics(service.startHandle, service.endHandle,
+			characteristics) != B_OK)
+		return;
+	for (const LECharacteristic& characteristic : characteristics) {
+		const char* name = CharacteristicName(characteristic.uuid16);
+		if (name == NULL || (characteristic.properties & 0x02) == 0)
+			continue;
+		std::vector<uint8> value;
+		status_t status = client.ReadAttribute(characteristic.valueHandle,
+			value);
+		if (status != B_OK) {
+			printf("    %s: not read (%s, ATT error %#x)\n", name,
+				strerror(status), client.LastATTError());
+			continue;
+		}
+		if (characteristic.uuid16 == 0x2a19 && value.size() == 1) {
+			printf("    %s: %u%%\n", name, value[0]);
+			continue;
+		}
+		if (characteristic.uuid16 == 0x2a01 && value.size() == 2) {
+			printf("    %s: 0x%04x\n", name, value[0] | (value[1] << 8));
+			continue;
+		}
+		std::string text;
+		for (uint8 byte : value) {
+			if (byte == 0)
+				break;
+			text += byte >= 0x20 && byte < 0x7f ? (char)byte : '?';
+		}
+		printf("    %s: \"%s\" (%zu bytes)\n", name, text.c_str(),
+			value.size());
+	}
+}
+
+
 static int
-Services(const uint8 peer[6], uint8 type)
+Services(std::vector<ServicesPeer>& peers)
 {
 	uint8 local[6];
 	LocalDevice* adapter = GetAdapter(local);
 	if (adapter == NULL)
 		return 1;
 	BMessenger server(BLUETOOTH_SIGNATURE);
-	LinkListener* listener = new LinkListener();
-	listener->Run();
-	BMessenger listenerMessenger(listener);
 	char text[18];
-	printf("Connecting to %s (%s, no pairing)...\n", LEAddressString(peer, text),
-		type == 0 ? "public" : "random");
+	BMessage reply;
 
-	BMessage request(BT_MSG_LE_CONNECT), reply;
-	request.AddInt32("hci_id", adapter->ID());
-	request.AddMessenger("listener", listenerMessenger);
-	request.AddData("address", B_RAW_TYPE, peer, 6);
-	request.AddUInt8("address_type", type);
-	int32 result = B_ERROR;
-	if (server.SendMessage(&request, &reply, 5000000, 5000000) == B_OK)
-		reply.FindInt32("status", &result);
-	if (result != B_OK) {
-		fprintf(stderr, "Connection request refused: %s\n", strerror(result));
-		return 1;
+	// Ask for every link first: the server creates them one after another
+	// and holds them all.
+	for (ServicesPeer& peer : peers) {
+		peer.listener = new LinkListener();
+		peer.listener->Run();
+		peer.connected = false;
+		printf("Connecting to %s (%s, no pairing)...\n",
+			LEAddressString(peer.address, text),
+			peer.type == 0 ? "public" : "random");
+		BMessage request(BT_MSG_LE_CONNECT);
+		request.AddInt32("hci_id", adapter->ID());
+		request.AddMessenger("listener", BMessenger(peer.listener));
+		request.AddData("address", B_RAW_TYPE, peer.address, 6);
+		request.AddUInt8("address_type", peer.type);
+		int32 result = B_ERROR;
+		if (server.SendMessage(&request, &reply, 5000000, 5000000) == B_OK)
+			reply.FindInt32("status", &result);
+		if (result != B_OK) {
+			fprintf(stderr, "Connection request for %s refused: %s\n", text,
+				strerror(result));
+			if (peer.listener->Lock())
+				peer.listener->Quit();
+			peer.listener = NULL;
+		}
 	}
-	status_t status = listener->Wait(20000000);
-	int exitCode = 1;
-	if (status != B_OK) {
-		fprintf(stderr, "Not connected: %s\n", strerror(status));
-		BMessage cancel(BT_MSG_LE_CONNECT_CANCEL);
-		cancel.AddInt32("hci_id", adapter->ID());
-		cancel.AddMessenger("listener", listenerMessenger);
-		server.SendMessage(&cancel, &reply, 5000000, 5000000);
-		snooze(1000000);
-	} else {
-		printf("Connected.\n");
+	int32 links = 0;
+	for (ServicesPeer& peer : peers) {
+		if (peer.listener == NULL)
+			continue;
+		LEAddressString(peer.address, text);
+		status_t status = peer.listener->Wait(20000000);
+		if (status != B_OK) {
+			fprintf(stderr, "Not connected to %s: %s\n", text,
+				strerror(status));
+			BMessage cancel(BT_MSG_LE_CONNECT_CANCEL);
+			cancel.AddInt32("hci_id", adapter->ID());
+			cancel.AddMessenger("listener", BMessenger(peer.listener));
+			server.SendMessage(&cancel, &reply, 5000000, 5000000);
+			continue;
+		}
+		peer.connected = true;
+		printf("Connected to %s, handle %#x.\n", text,
+			peer.listener->Handle());
+		links++;
+	}
+	if (links > 1)
+		printf("%" B_PRId32 " links held at once.\n", links);
+
+	int exitCode = links > 0 ? 0 : 1;
+	for (ServicesPeer& peer : peers) {
+		if (!peer.connected)
+			continue;
+		LEAddressString(peer.address, text);
 		bdaddr_t address;
-		memcpy(address.b, peer, 6);
+		memcpy(address.b, peer.address, 6);
 		LEAttributeClient client;
-		status = client.Connect(address);
+		status_t status = client.Connect(address);
 		std::vector<LEPrimaryService> services;
-		if (status == B_OK)
+		if (status == B_OK) {
+			printf("%s: ATT MTU %u\n", text, client.MTU());
 			status = client.DiscoverPrimaryServices(services);
-		if (status != B_OK)
-			fprintf(stderr, "Service discovery failed: %s\n", strerror(status));
-		else {
+		}
+		if (status != B_OK) {
+			fprintf(stderr, "%s: service discovery failed: %s\n", text,
+				strerror(status));
+			exitCode = 1;
+		} else {
 			for (const LEPrimaryService& service : services) {
-				printf("  service %#06x handles %#06x-%#06x\n", service.uuid16,
+				char uuid[16];
+				if (service.uuid16 != 0)
+					snprintf(uuid, sizeof(uuid), "0x%04x", service.uuid16);
+				else
+					strlcpy(uuid, "(128-bit)", sizeof(uuid));
+				printf("  service %s handles 0x%04x-0x%04x\n", uuid,
 					service.startHandle, service.endHandle);
+				ReadPublicValues(client, service);
 			}
-			printf("%zu primary services.\n", services.size());
-			exitCode = 0;
+			printf("%s: %zu primary services.\n", text, services.size());
 		}
 		client.Disconnect();
-		BMessage disconnect(BT_MSG_LE_DISCONNECT);
-		disconnect.AddInt32("hci_id", adapter->ID());
-		disconnect.AddMessenger("listener", listenerMessenger);
-		server.SendMessage(&disconnect, &reply, 5000000, 5000000);
-		listener->Wait(3000000);
 	}
-	if (listener->Lock())
-		listener->Quit();
+
+	for (ServicesPeer& peer : peers) {
+		if (peer.listener == NULL)
+			continue;
+		if (peer.connected) {
+			BMessage disconnect(BT_MSG_LE_DISCONNECT);
+			disconnect.AddInt32("hci_id", adapter->ID());
+			disconnect.AddMessenger("listener", BMessenger(peer.listener));
+			server.SendMessage(&disconnect, &reply, 5000000, 5000000);
+			peer.listener->Wait(3000000);
+		}
+		if (peer.listener->Lock())
+			peer.listener->Quit();
+	}
 	return exitCode;
 }
 
@@ -897,8 +1019,25 @@ main(int argc, char** argv)
 		uint8 type = (address[5] & 0xc0) == 0xc0 ? 1 : 0;
 		if (argc > 3)
 			type = strcmp(argv[3], "public") == 0 ? 0 : 1;
-		if (command[0] == 's')
-			return Services(address, type);
+		if (command[0] == 's') {
+			// <address> [type] [<address> [type]]...
+			std::vector<ServicesPeer> peers;
+			for (int i = 2; i < argc; i++) {
+				ServicesPeer peer = {};
+				if (!ParseAddress(argv[i], peer.address)) {
+					Usage();
+					return 1;
+				}
+				peer.type = (peer.address[5] & 0xc0) == 0xc0 ? 1 : 0;
+				if (i + 1 < argc && (strcmp(argv[i + 1], "public") == 0
+						|| strcmp(argv[i + 1], "random") == 0)) {
+					peer.type = argv[i + 1][0] == 'p' ? 0 : 1;
+					i++;
+				}
+				peers.push_back(peer);
+			}
+			return Services(peers);
+		}
 		return command[0] == 'p' ? Pair(address, type) : Forget(address, type);
 	}
 	Usage();

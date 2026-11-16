@@ -29,7 +29,8 @@ static const uint8 kATTCommandFlag = 0x40;
 static const uint8 kATTAttributeNotFound = 0x0a;
 static const uint8 kATTAttributeNotLong = 0x0b;
 static const uint8 kATTRequestNotSupported = 0x06;
-static const size_t kATTDefaultMTU = 23;
+static const size_t kATTDefaultMTU = B_L2CAP_LE_ATT_MINIMUM_MTU;
+static const size_t kATTMaximumMTU = B_L2CAP_LE_ATT_MAXIMUM_MTU;
 static const size_t kMaximumAttributeLength = 4096;
 // Notifications that arrive while a request waits for its answer are kept
 // for ReadNotification(). A mouse being moved sends one every few
@@ -56,7 +57,8 @@ Write16(uint8* bytes, uint16 value)
 LEAttributeClient::LEAttributeClient()
 	:
 	fSocket(-1),
-	fLastATTError(0)
+	fLastATTError(0),
+	fMTU(kATTDefaultMTU)
 {
 }
 
@@ -85,6 +87,13 @@ LEAttributeClient::Connect(const bdaddr_t& address)
 		return error;
 	}
 
+	// Take as much as an attribute can be in one PDU; the kernel asks the
+	// peer as connect() opens the channel. A kernel that does not know the
+	// option keeps the default MTU.
+	uint16 receiveMTU = kATTMaximumMTU;
+	setsockopt(fSocket, BLUETOOTH_PROTO_L2CAP, B_L2CAP_LE_ATT_MTU, &receiveMTU,
+		sizeof(receiveMTU));
+
 	sockaddr_l2cap peer = {};
 	peer.l2cap_len = sizeof(peer);
 	peer.l2cap_family = AF_BLUETOOTH;
@@ -98,8 +107,24 @@ LEAttributeClient::Connect(const bdaddr_t& address)
 		Disconnect();
 		return error;
 	}
-	LOG(LE_LOG_DEBUG, "ATT channel open");
+	_UpdateMTU();
+	LOG(LE_LOG_DEBUG, "ATT channel open, MTU %u", fMTU);
 	return B_OK;
+}
+
+
+void
+LEAttributeClient::_UpdateMTU()
+{
+	uint16 mtu = 0;
+	socklen_t length = sizeof(mtu);
+	if (fSocket >= 0 && getsockopt(fSocket, BLUETOOTH_PROTO_L2CAP,
+			B_L2CAP_LE_ATT_MTU, &mtu, &length) == 0
+		&& length == sizeof(mtu) && mtu >= kATTDefaultMTU
+		&& mtu <= kATTMaximumMTU)
+		fMTU = mtu;
+	else
+		fMTU = kATTDefaultMTU;
 }
 
 
@@ -110,6 +135,7 @@ LEAttributeClient::Disconnect()
 		close(fSocket);
 	fSocket = -1;
 	fLastATTError = 0;
+	fMTU = kATTDefaultMTU;
 	fNotifications.clear();
 }
 
@@ -119,6 +145,7 @@ LEAttributeClient::AdoptConnectedSocket(int descriptor)
 {
 	Disconnect();
 	fSocket = descriptor;
+	_UpdateMTU();
 }
 
 
@@ -137,7 +164,7 @@ LEAttributeClient::_Receive(std::vector<uint8>& response)
 	if (ready < 0)
 		return B_ERROR;
 
-	uint8 packet[517];
+	uint8 packet[kATTMaximumMTU];
 	ssize_t length = recv(fSocket, packet, sizeof(packet), 0);
 	if (length < 0) {
 		status_t error = errno;
@@ -146,9 +173,13 @@ LEAttributeClient::_Receive(std::vector<uint8>& response)
 	}
 	if (length == 0)
 		return B_DEV_NOT_READY;
-	if (length > (ssize_t)kATTDefaultMTU) {
-		LOG(LE_LOG_ERROR, "ATT PDU of %zd bytes exceeds the 23-byte MTU",
-			length);
+	if (length > (ssize_t)fMTU) {
+		// The peer may have raised the MTU with an exchange of its own.
+		_UpdateMTU();
+	}
+	if (length > (ssize_t)fMTU) {
+		LOG(LE_LOG_ERROR, "ATT PDU of %zd bytes exceeds the %u-byte MTU",
+			length, fMTU);
 		return B_BAD_DATA;
 	}
 	// The kernel confirms indications; treat them like notifications.
@@ -166,7 +197,7 @@ LEAttributeClient::_Exchange(const uint8* request, size_t requestLength,
 {
 	if (fSocket < 0)
 		return B_NO_INIT;
-	if (requestLength == 0 || requestLength > kATTDefaultMTU)
+	if (requestLength == 0 || requestLength > fMTU)
 		return B_BAD_VALUE;
 	fLastATTError = 0;
 	LELogHex(LE_LOG_TRACE, "att", "->", request, requestLength);
@@ -366,7 +397,7 @@ LEAttributeClient::ReadAttribute(uint16 handle, std::vector<uint8>& value)
 		if (value.size() + response.size() - 1 > kMaximumAttributeLength)
 			return B_BAD_DATA;
 		value.insert(value.end(), response.begin() + 1, response.end());
-		if (response.size() < kATTDefaultMTU)
+		if (response.size() < fMTU)
 			return B_OK;
 	}
 }
@@ -377,9 +408,9 @@ LEAttributeClient::WriteAttribute(uint16 handle, const uint8* value,
 	size_t length)
 {
 	if (handle == 0 || (value == NULL && length != 0)
-		|| length > kATTDefaultMTU - 3)
+		|| length > (size_t)fMTU - 3)
 		return B_BAD_VALUE;
-	uint8 request[kATTDefaultMTU] = { 0x12 };
+	uint8 request[kATTMaximumMTU] = { 0x12 };
 	Write16(request + 1, handle);
 	if (length > 0)
 		memcpy(request + 3, value, length);
@@ -444,8 +475,9 @@ LEAttributeClient::_HandlePeerPDU(const std::vector<uint8>& pdu)
 	uint8 answer[5];
 	size_t answerLength;
 	if (opcode == kATTExchangeMTURequest) {
+		// (The kernel answers these; this is for one that does not.)
 		answer[0] = kATTExchangeMTUResponse;
-		Write16(answer + 1, kATTDefaultMTU);
+		Write16(answer + 1, fMTU);
 		answerLength = 3;
 	} else {
 		// Discovery finds nothing; anything else is not supported.

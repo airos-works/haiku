@@ -69,20 +69,29 @@ public:
 	// Request handling
 	status_t 	ProcessSimpleRequest(BMessage* request);
 	// Low Energy (LocalDeviceLE.cpp). Scanning is shared: every listener
-	// receives advertisements until it stops. One LE link at a time.
+	// receives advertisements until it stops. Each LE link belongs to the
+	// listener that asked for it; several may be up at once, while the
+	// controller creates one at a time.
 	status_t StartLEScan(const BMessenger& listener);
 	status_t StopLEScan(const BMessenger* listener);
 		// NULL stops the scan for every listener.
 	status_t StartLEConnection(const BMessenger& listener,
 		const uint8* address, uint8 addressType,
 		const BMessage* parameters = NULL);
-	status_t CancelLEConnection(const BMessenger* listener);
-	status_t DisconnectLEConnection(const BMessenger* listener);
-	status_t UpdateLEConnection(uint16 intervalMin, uint16 intervalMax,
-		uint16 latency, uint16 timeout, bool keepInterval = false);
-	status_t ReadRSSI(int32 handle);
-	status_t StartLEEncryption(const uint8* key, const uint8* randomNumber,
-		uint16 encryptedDiversifier);
+	// A NULL listener means any owner; a NULL address, every link of the
+	// owner.
+	status_t CancelLEConnection(const BMessenger* listener,
+		const uint8* address = NULL);
+	status_t DisconnectLEConnection(const BMessenger* listener,
+		const uint8* address = NULL);
+	// These pick the link by the request's "handle", "address" or
+	// "listener" (the one link it owns), or take the only link there is.
+	status_t UpdateLEConnection(const BMessage* request, uint16 intervalMin,
+		uint16 intervalMax, uint16 latency, uint16 timeout,
+		bool keepInterval = false);
+	status_t ReadRSSI(const BMessage* request);
+	status_t StartLEEncryption(const BMessage* request, const uint8* key,
+		const uint8* randomNumber, uint16 encryptedDiversifier);
 	void LEPulse();
 	void LEInquiryState(bool active);
 	void Pulse();
@@ -167,30 +176,40 @@ private:
 	std::vector<BMessenger> fLEScanListeners;
 	std::vector<LEAdvertiserSeen> fLESeen;
 
-	LEConnectionState fLEConnectionState;
-	bigtime_t fLEConnectionSince;
-	bool fLECancelRequested;
-	BMessenger fLEConnectionListener;
-	uint8 fLEConnectionAddress[6];
-	uint8 fLEConnectionAddressType;
-	uint16 fLEConnectionHandle;
-	bool fLEEncryptionPending;
-	bool fLEEncrypted;
-	// What the next connection is created with (1.25 ms, events, 10 ms).
-	uint16 fLECreateIntervalMin;
-	uint16 fLECreateIntervalMax;
-	uint16 fLECreateLatency;
-	uint16 fLECreateTimeout;
-	// An interval range the client wants kept on the link, 0 for none: the
-	// peer asking for something else gets it, with this interval.
-	uint16 fLEKeepIntervalMin;
-	uint16 fLEKeepIntervalMax;
-	int32 fLEKeepRestores;
-	bigtime_t fLEKeepRestoredAt;
-	// The link's parameters now.
-	uint16 fLELinkInterval;
-	uint16 fLELinkLatency;
-	uint16 fLELinkTimeout;
+	struct LELink {
+		LEConnectionState state;
+		bigtime_t since;
+			// when the client asked for it
+		bool cancelRequested;
+		BMessenger listener;
+		uint8 address[6];
+		uint8 addressType;
+		uint16 handle;
+		bool encryptionPending;
+		bool encrypted;
+		// What the connection is created with (1.25 ms, events, 10 ms).
+		uint16 createIntervalMin;
+		uint16 createIntervalMax;
+		uint16 createLatency;
+		uint16 createTimeout;
+		// An interval range the client wants kept on the link, 0 for none:
+		// the peer asking for something else gets it, with this interval.
+		uint16 keepIntervalMin;
+		uint16 keepIntervalMax;
+		int32 keepRestores;
+		bigtime_t keepRestoredAt;
+		// The link's parameters now.
+		uint16 interval;
+		uint16 latency;
+		uint16 timeout;
+	};
+	std::vector<LELink*> fLELinks;
+		// in the order they were asked for
+	// Handles of the Disconnect and LE Start Encryption commands sent, for
+	// their Command Status events (which name no handle), oldest first.
+	std::vector<uint16> fLEDisconnectsSent;
+	std::vector<uint16> fLEEncryptionsSent;
+
 	void _KeepLEInterval(uint16 handle, uint16 interval, uint16 latency,
 		uint16 timeout);
 
@@ -198,11 +217,19 @@ private:
 	void _EnsureLEMasks();
 	void _UpdateLE();
 	bool _LEInitiating() const;
+		// a link waits to be created, or is being created
+	LELink* _LECreating() const;
+		// the link the controller is creating
+	LELink* _LELinkByHandle(uint16 handle) const;
+	LELink* _FindLELink(const BMessage* request) const;
 	void _FailLEScan(uint8 status);
-	status_t _IssueLECreateConnection();
+	status_t _IssueLECreateConnection(LELink* link);
+	status_t _DisconnectLELink(LELink* link);
+	void _CancelLELink(LELink* link);
 	void _SendLEScanNotice(uint32 what, uint8 status = 0);
-	void _SendLEConnectionNotice(uint32 what, status_t status = B_OK);
-	void _ResetLEConnection();
+	void _SendLEConnectionNotice(const LELink* link, uint32 what,
+		status_t status = B_OK);
+	void _RemoveLELink(LELink* link);
 	bool _ForwardAdvertisement(const uint8* report, size_t dataLength);
 
 	void HandleLECommandComplete(struct hci_event_header* event);

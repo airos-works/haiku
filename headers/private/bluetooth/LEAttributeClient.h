@@ -29,8 +29,9 @@ struct LECharacteristic {
 
 
 // Synchronous ATT client on the LE fixed L2CAP channel. One request may be
-// outstanding at a time. The default 23-byte ATT MTU is used until exchange
-// and L2CAP MTU control are implemented.
+// outstanding at a time. Connect() has the kernel exchange MTUs with the
+// peer, offering 517 bytes; MTU() is the result (23 bytes when the peer, or
+// the kernel, does not exchange).
 class LEAttributeClient {
 public:
 	LEAttributeClient();
@@ -41,6 +42,7 @@ public:
 	void Disconnect();
 	bool IsConnected() const { return fSocket >= 0; }
 	uint8 LastATTError() const { return fLastATTError; }
+	uint16 MTU() const { return fMTU; }
 
 	status_t DiscoverPrimaryServices(std::vector<LEPrimaryService>& services);
 	status_t DiscoverCharacteristics(uint16 startHandle, uint16 endHandle,
@@ -64,8 +66,12 @@ private:
 	status_t _Receive(std::vector<uint8>& response);
 	bool _HandlePeerPDU(const std::vector<uint8>& pdu);
 
+	void _UpdateMTU();
+
 	int fSocket;
 	uint8 fLastATTError;
+	uint16 fMTU;
+		// (in what was padding, so that the class keeps its size)
 	std::deque<Notification> fNotifications;
 };
 

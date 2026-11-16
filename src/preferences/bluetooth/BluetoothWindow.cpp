@@ -639,6 +639,8 @@ BluetoothWindow::MessageReceived(BMessage* message)
 					disconnect.AddInt32("hci_id", _HCIID());
 					disconnect.AddMessenger("listener", BMessenger(this));
 					disconnect.AddBool("force", true);
+					disconnect.AddData("address", B_RAW_TYPE,
+						device->address, sizeof(device->address));
 					BMessenger(BLUETOOTH_SIGNATURE).SendMessage(&disconnect,
 						(BHandler*)NULL, 1000000);
 				}

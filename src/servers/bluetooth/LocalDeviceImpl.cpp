@@ -96,27 +96,8 @@ LocalDeviceImpl::LocalDeviceImpl(HCIDelegate* hd)
 	  fLEScanSince(0),
 	  fLECommandSince(0),
 	  fClassicInquiryActive(false),
-	  fClassicInquirySince(0),
-	  fLEConnectionState(LE_CONN_IDLE),
-	  fLEConnectionSince(0),
-	  fLECancelRequested(false),
-	  fLEConnectionAddressType(0),
-	  fLEConnectionHandle(0),
-	  fLEEncryptionPending(false),
-	  fLEEncrypted(false),
-	  fLECreateIntervalMin(0x18),
-	  fLECreateIntervalMax(0x28),
-	  fLECreateLatency(0),
-	  fLECreateTimeout(0x1f4),
-	  fLEKeepIntervalMin(0),
-	  fLEKeepIntervalMax(0),
-	  fLEKeepRestores(0),
-	  fLEKeepRestoredAt(0),
-	  fLELinkInterval(0),
-	  fLELinkLatency(0),
-	  fLELinkTimeout(0)
+	  fClassicInquirySince(0)
 {
-	memset(fLEConnectionAddress, 0, sizeof(fLEConnectionAddress));
 	LoadRemoteDevices();
 }
 
@@ -311,6 +292,8 @@ LocalDeviceImpl::~LocalDeviceImpl()
 	// with one that is gone until their supervision timeout. The next
 	// server resets the controller as it starts anyway.
 	_SendLECommand(PACK_OPCODE(OGF_CONTROL_BASEBAND, OCF_RESET), NULL, 0);
+	for (size_t i = 0; i < fLELinks.size(); i++)
+		delete fLELinks[i];
 }
 
 

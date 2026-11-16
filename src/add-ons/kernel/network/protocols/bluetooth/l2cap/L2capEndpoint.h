@@ -48,6 +48,12 @@ public:
 			ssize_t		Receivable();
 
 			status_t	GetOption(int option, void* value, int* _length);
+			status_t	SetOption(int option, const void* value, int length);
+
+			// LE ATT channel: what this socket takes (0 for the default),
+			// and the link's ATT_MTU as an exchange sets it.
+			uint16		ATTReceiveMTU() const { return fATTReceiveMTU; }
+			void		ATTMTUChanged(uint16 mtu, bool exchangeDone);
 
 public:
 			void		_HandleCommandRejected(uint8 ident, uint16 reason,
@@ -78,6 +84,7 @@ private:
 			void		_SendQueued();
 
 			void		_SendChannelConfig();
+			void		_OpenFixedChannel();
 			status_t	_MarkEstablished();
 			void		_MarkRefused(status_t error);
 			void		_MarkClosed();
@@ -107,6 +114,7 @@ private:
 	uint16			fChannelID, fDestinationChannelID;
 	bool			fFixedChannel;
 	L2capEndpoint*	fNextFixed;
+	uint16			fATTReceiveMTU;
 	status_t		fConnectError;
 	uint8			fCommandIdent;
 	bigtime_t		fCommandDeadline;

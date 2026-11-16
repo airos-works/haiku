@@ -206,7 +206,10 @@ L2capEndpointManager::Disconnected(HciConnection* connection)
 					connection->handle, endpoint->fChannelID);
 				endpoint->fConnection = NULL;
 				endpoint->fState = L2capEndpoint::CLOSED;
+				endpoint->fConnectError = ENOTCONN;
 				endpoint->socket->error = ENOTCONN;
+				// connect() may wait for the ATT MTU exchange.
+				endpoint->fCommandWait.NotifyAll();
 			}
 		}
 		gSocketModule->notify(endpoint->socket, B_SELECT_ERROR, ENOTCONN);

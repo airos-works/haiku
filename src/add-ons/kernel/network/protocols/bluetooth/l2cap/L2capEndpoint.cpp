@@ -34,6 +34,10 @@ static l2cap_qos sDefaultQOS = {
 // said so. ACL links are reliable, so requests are not retransmitted.
 static const bigtime_t kResponseTimeout = 20000000;
 static const bigtime_t kPendingTimeout = 60000000;
+// How long connect() on an LE ATT socket waits for the peer to answer the
+// MTU exchange before it goes on with the default MTU. ATT allows 30 s; a
+// peer that takes more than a few has not understood.
+static const bigtime_t kATTExchangeTimeout = 5000000;
 
 
 static inline status_t
@@ -59,6 +63,7 @@ L2capEndpoint::L2capEndpoint(net_socket* socket)
 	fDestinationChannelID(L2CAP_NULL_CID),
 	fFixedChannel(false),
 	fNextFixed(NULL),
+	fATTReceiveMTU(0),
 	fConnectError(ECONNREFUSED),
 	fCommandIdent(L2CAP_NULL_IDENT),
 	fCommandDeadline(B_INFINITE_TIMEOUT)
@@ -155,6 +160,18 @@ L2capEndpoint::_ExpireCommand()
 {
 	ASSERT_LOCKED_MUTEX(&fLock);
 
+	if (fFixedChannel) {
+		// The ATT MTU exchange went unanswered: go on with what the link
+		// has. A late answer still sets the MTU.
+		if (fState == CONFIGURATION) {
+			dprintf("l2cap-le: handle %#x did not answer the ATT MTU "
+				"exchange; using %u\n", fConnection != NULL
+					? fConnection->handle : 0, fChannelConfig.outgoing_mtu);
+			_OpenFixedChannel();
+		}
+		return;
+	}
+
 	dprintf("l2cap: cid %#x: no answer from the peer in state %d, giving "
 		"up\n", fChannelID, fState);
 
@@ -201,6 +218,8 @@ L2capEndpoint::Shutdown()
 		fFixedChannel = false;
 		fConnection = NULL;
 		fState = CLOSED;
+		fConnectError = ECONNABORTED;
+		fCommandWait.NotifyAll();
 		return B_OK;
 	}
 
@@ -431,8 +450,11 @@ L2capEndpoint::Connect(const struct sockaddr* _address)
 		}
 		fChannelID = address->l2cap_psm;
 		fDestinationChannelID = fChannelID;
-		// ATT starts with a 23-byte MTU. SMP can carry a 65-byte public key.
-		fChannelConfig.outgoing_mtu = fChannelID == L2CAP_ATT_CID ? 23 : 65;
+		// ATT has the link's MTU, 23 bytes until an exchange. SMP can carry
+		// a 65-byte public key.
+		fChannelConfig.outgoing_mtu = fChannelID == L2CAP_ATT_CID
+			? l2cap_le_att_mtu(fConnection) : 65;
+		fChannelConfig.incoming_mtu = fChannelConfig.outgoing_mtu;
 		status = gL2capEndpointManager.BindToFixedChannel(this);
 		L2CAP_LE_TRACE("socket %p %s cid %#x on handle %#x: %s\n", this,
 			status == B_OK ? "bound" : "could not bind", fChannelID,
@@ -447,6 +469,30 @@ L2capEndpoint::Connect(const struct sockaddr* _address)
 			return status;
 		}
 		fFixedChannel = true;
+		fConnectError = B_OK;
+
+		// A socket that takes more than the default asks the peer for it
+		// first (once per link), and so sends nothing that could cross the
+		// answer.
+		if (fChannelID == L2CAP_ATT_CID
+			&& fATTReceiveMTU > B_L2CAP_LE_ATT_MINIMUM_MTU) {
+			fState = CONFIGURATION;
+			fCommandDeadline = system_time() + kATTExchangeTimeout;
+			if (l2cap_le_att_exchange_mtu(fConnection, fATTReceiveMTU)
+					== B_OK) {
+				while (fState == CONFIGURATION) {
+					status = _WaitForStateChange(timeout);
+					if (status == B_WOULD_BLOCK && timeout == 0)
+						return EINPROGRESS;
+					if (status != B_OK)
+						return status;
+				}
+				return fState == OPEN ? B_OK : fConnectError;
+			}
+			// Asked before on this link: its MTU stands.
+			fChannelConfig.outgoing_mtu = l2cap_le_att_mtu(fConnection);
+			fChannelConfig.incoming_mtu = fChannelConfig.outgoing_mtu;
+		}
 		fState = OPEN;
 		return B_OK;
 	}
@@ -559,6 +605,16 @@ L2capEndpoint::SendData(net_buffer* buffer)
 	if (buffer->size > fChannelConfig.outgoing_mtu)
 		return EMSGSIZE;
 
+	if (fFixedChannel && fChannelID == L2CAP_ATT_CID && buffer->size >= 3) {
+		// A client exchanging the MTU itself: the answer sets the link's.
+		uint8 request[3];
+		if (gBufferModule->read(buffer, 0, request, sizeof(request)) == B_OK
+			&& request[0] == 0x02) {
+			l2cap_le_att_note_request(fConnection,
+				request[1] | (request[2] << 8));
+		}
+	}
+
 	status_t status = gStackModule->fifo_enqueue_buffer(&fSendQueue, buffer);
 	if (status != B_OK)
 		return status;
@@ -636,6 +692,12 @@ L2capEndpoint::Sendable()
 	CALLED();
 	MutexLocker locker(fLock);
 
+	// Nobody may be waiting in connect() to notice that the MTU exchange of
+	// a non-blocking socket went unanswered.
+	if (fFixedChannel && fState == CONFIGURATION
+		&& system_time() >= fCommandDeadline)
+		_ExpireCommand();
+
 	if (fState != OPEN) {
 		if (_IsEstablishing())
 			return 0;
@@ -671,6 +733,21 @@ L2capEndpoint::GetOption(int option, void* value, int* _length)
 		case B_L2CAP_INCOMING_MTU:
 			result = fChannelConfig.incoming_mtu;
 			break;
+		case B_L2CAP_LE_ATT_MTU:
+			if (!fFixedChannel || fChannelID != L2CAP_ATT_CID) {
+				// Before connect(): what the socket asked for.
+				if (fState != CLOSED && fState != BOUND)
+					return ENOPROTOOPT;
+				result = fATTReceiveMTU != 0 ? fATTReceiveMTU
+					: B_L2CAP_LE_ATT_MINIMUM_MTU;
+				if (*_length < (int)sizeof(result))
+					return B_BAD_VALUE;
+				memcpy(value, &result, sizeof(result));
+				*_length = sizeof(result);
+				return B_OK;
+			}
+			result = fChannelConfig.outgoing_mtu;
+			break;
 		default:
 			return ENOPROTOOPT;
 	}
@@ -683,6 +760,59 @@ L2capEndpoint::GetOption(int option, void* value, int* _length)
 	memcpy(value, &result, sizeof(result));
 	*_length = sizeof(result);
 	return B_OK;
+}
+
+
+status_t
+L2capEndpoint::SetOption(int option, const void* value, int length)
+{
+	MutexLocker locker(fLock);
+
+	if (option != B_L2CAP_LE_ATT_MTU)
+		return ENOPROTOOPT;
+	if (value == NULL || length != (int)sizeof(uint16))
+		return B_BAD_VALUE;
+	if (fState != CLOSED && fState != BOUND)
+		return EISCONN;
+
+	uint16 mtu;
+	memcpy(&mtu, value, sizeof(mtu));
+	if (mtu < B_L2CAP_LE_ATT_MINIMUM_MTU)
+		return B_BAD_VALUE;
+	fATTReceiveMTU = min_c(mtu, B_L2CAP_LE_ATT_MAXIMUM_MTU);
+	return B_OK;
+}
+
+
+/*!	The link's ATT_MTU changed: an MTU exchange this side or the peer started
+	was answered. The first ends connect()'s wait.
+*/
+void
+L2capEndpoint::ATTMTUChanged(uint16 mtu, bool exchangeDone)
+{
+	MutexLocker locker(fLock);
+	if (!fFixedChannel || fChannelID != L2CAP_ATT_CID)
+		return;
+	fChannelConfig.outgoing_mtu = mtu;
+	fChannelConfig.incoming_mtu = mtu;
+	L2CAP_LE_TRACE("socket %p: ATT MTU %u\n", this, mtu);
+	if (exchangeDone && fState == CONFIGURATION)
+		_OpenFixedChannel();
+}
+
+
+void
+L2capEndpoint::_OpenFixedChannel()
+{
+	ASSERT_LOCKED_MUTEX(&fLock);
+
+	fState = OPEN;
+	fCommandDeadline = B_INFINITE_TIMEOUT;
+	fCommandWait.NotifyAll();
+	MutexLocker fifoLocker(fSendQueue.lock);
+	const ssize_t sendable = fSendQueue.max_bytes - fSendQueue.current_bytes;
+	fifoLocker.Unlock();
+	gSocketModule->notify(socket, B_SELECT_WRITE, sendable);
 }
 
 

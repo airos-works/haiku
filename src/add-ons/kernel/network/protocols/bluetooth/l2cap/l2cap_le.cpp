@@ -3,8 +3,8 @@
  * Distributed under the terms of the MIT License.
  *
  * Low Energy fixed-channel helpers: diagnostics switch, the LE signaling
- * channel and a minimal ATT server so a peripheral's GATT client requests
- * are answered instead of timing out the ATT bearer.
+ * channel, the ATT MTU exchange and a minimal ATT server so a peripheral's
+ * GATT client requests are answered instead of timing out the ATT bearer.
  */
 
 #include "l2cap_le.h"
@@ -17,6 +17,9 @@
 
 #include <NetBufferUtilities.h>
 #include <bluetooth/HCI/btHCI_command.h>
+#include <bluetooth/L2CAP/btL2CAP.h>
+#include <lock.h>
+#include <util/AutoLock.h>
 
 #include <l2cap.h>
 #include "l2cap_internal.h"
@@ -52,6 +55,57 @@ static const uint8 kATTHandleValueConfirmation = 0x1e;
 static const uint8 kATTInvalidHandle = 0x01;
 static const uint8 kATTRequestNotSupported = 0x06;
 static const uint8 kATTAttributeNotFound = 0x0a;
+
+static const uint16 kATTDefaultMTU = B_L2CAP_LE_ATT_MINIMUM_MTU;
+
+
+// Exchange MTU state of the LE links (Core Vol 3 Part F 3.4.2). One entry per
+// link that has seen an exchange; a link without one uses the default.
+struct att_bearer {
+	HciConnection*	connection;
+	uint16			mtu;
+	uint16			offered;
+		// the receive MTU this side gave the peer, 0 for none yet
+	bool			requested;
+		// this side's Exchange MTU Request went out (a client asks once)
+	bool			pending;
+		// and waits for its answer
+	bool			socketRequest;
+		// a socket sent it, and gets the answer
+};
+
+static mutex sBearerLock = MUTEX_INITIALIZER("l2cap le att bearers");
+static att_bearer sBearers[16];
+
+
+static att_bearer*
+find_bearer(HciConnection* connection, bool create)
+{
+	ASSERT_LOCKED_MUTEX(&sBearerLock);
+	att_bearer* unused = NULL;
+	for (size_t i = 0; i < B_COUNT_OF(sBearers); i++) {
+		if (sBearers[i].connection == connection)
+			return &sBearers[i];
+		if (sBearers[i].connection == NULL && unused == NULL)
+			unused = &sBearers[i];
+	}
+	if (!create || unused == NULL)
+		return NULL;
+	memset(unused, 0, sizeof(*unused));
+	unused->connection = connection;
+	unused->mtu = kATTDefaultMTU;
+	return unused;
+}
+
+
+static uint16
+negotiated_mtu(uint16 clientMTU, uint16 serverMTU)
+{
+	// A value below the default leaves the default (3.4.2.2).
+	if (clientMTU < kATTDefaultMTU || serverMTU < kATTDefaultMTU)
+		return kATTDefaultMTU;
+	return min_c(clientMTU, serverMTU);
+}
 
 
 void
@@ -218,9 +272,80 @@ l2cap_le_handle_signaling(HciConnection* connection, net_buffer* buffer)
 }
 
 
-bool
-l2cap_le_answer_att(HciConnection* connection, net_buffer* buffer)
+uint16
+l2cap_le_att_mtu(HciConnection* connection)
 {
+	MutexLocker _(sBearerLock);
+	att_bearer* bearer = find_bearer(connection, false);
+	return bearer != NULL ? bearer->mtu : kATTDefaultMTU;
+}
+
+
+status_t
+l2cap_le_att_exchange_mtu(HciConnection* connection, uint16 receiveMTU)
+{
+	MutexLocker locker(sBearerLock);
+	att_bearer* bearer = find_bearer(connection, true);
+	if (bearer == NULL)
+		return B_NO_MEMORY;
+	if (bearer->requested)
+		return B_NOT_ALLOWED;
+	// The request offers what an earlier answer to the peer gave (3.4.2.2).
+	if (bearer->offered == 0)
+		bearer->offered = receiveMTU;
+	bearer->requested = true;
+	bearer->pending = true;
+	bearer->socketRequest = false;
+	const uint16 offered = bearer->offered;
+	locker.Unlock();
+
+	uint8 request[3] = { kATTExchangeMTURequest, (uint8)offered,
+		(uint8)(offered >> 8) };
+	L2CAP_LE_TRACE("asking handle %#x for an ATT MTU of %u\n",
+		connection->handle, offered);
+	status_t status = send_fixed(connection, L2CAP_ATT_CID, request,
+		sizeof(request));
+	if (status != B_OK) {
+		locker.Lock();
+		bearer = find_bearer(connection, false);
+		if (bearer != NULL)
+			bearer->pending = false;
+	}
+	return status;
+}
+
+
+void
+l2cap_le_att_note_request(HciConnection* connection, uint16 receiveMTU)
+{
+	MutexLocker _(sBearerLock);
+	att_bearer* bearer = find_bearer(connection, true);
+	if (bearer == NULL)
+		return;
+	bearer->offered = receiveMTU;
+	bearer->requested = true;
+	bearer->pending = true;
+	bearer->socketRequest = true;
+}
+
+
+void
+l2cap_le_att_forget(HciConnection* connection)
+{
+	MutexLocker _(sBearerLock);
+	att_bearer* bearer = find_bearer(connection, false);
+	if (bearer != NULL)
+		bearer->connection = NULL;
+}
+
+
+bool
+l2cap_le_answer_att(HciConnection* connection, net_buffer* buffer,
+	uint16 receiveMTU, l2cap_le_att_update& update)
+{
+	update.mtu = 0;
+	update.exchangeDone = false;
+
 	uint8 packet[8];
 	if (buffer->size < 1)
 		return false;
@@ -231,13 +356,55 @@ l2cap_le_answer_att(HciConnection* connection, net_buffer* buffer)
 	const uint8 opcode = packet[0];
 	uint16 handle = length >= 3 ? packet[1] | (packet[2] << 8) : 0;
 	uint8 error = kATTRequestNotSupported;
+
+	if (opcode == kATTExchangeMTUResponse
+		|| (opcode == kATTErrorResponse && length >= 5
+			&& packet[1] == kATTExchangeMTURequest)) {
+		// The answer to an Exchange MTU Request: this side's is taken here,
+		// a socket's own goes on to it.
+		MutexLocker _(sBearerLock);
+		att_bearer* bearer = find_bearer(connection, false);
+		if (bearer == NULL || !bearer->pending)
+			return false;
+		bearer->pending = false;
+		if (opcode == kATTExchangeMTUResponse && length >= 3)
+			bearer->mtu = negotiated_mtu(bearer->offered, handle);
+		update.mtu = bearer->mtu;
+		update.exchangeDone = !bearer->socketRequest;
+		dprintf("l2cap-le: handle %#x ATT MTU %u (offered %u, the peer %s "
+			"%u)\n", connection->handle, bearer->mtu, bearer->offered,
+			opcode == kATTErrorResponse ? "does not exchange, error"
+				: "takes", opcode == kATTErrorResponse ? packet[4] : handle);
+		return !bearer->socketRequest;
+	}
+
 	switch (opcode) {
 		case kATTExchangeMTURequest:
 		{
-			// Keep the default MTU; the client and HID paths use 23 bytes.
-			uint8 response[3] = { kATTExchangeMTUResponse, 23, 0 };
-			L2CAP_LE_TRACE("answering ATT MTU request from handle %#x\n",
-				connection->handle);
+			// Answer with what this side asks for, or would: the socket's
+			// receive MTU. A link no socket has opened yet keeps the
+			// default, so a client that takes only 23-byte PDUs never gets
+			// more.
+			MutexLocker locker(sBearerLock);
+			att_bearer* bearer = find_bearer(connection, true);
+			uint16 offered = kATTDefaultMTU;
+			if (bearer != NULL && bearer->offered != 0)
+				offered = bearer->offered;
+			else if (receiveMTU != 0) {
+				offered = receiveMTU;
+				if (bearer != NULL)
+					bearer->offered = offered;
+			}
+			uint16 mtu = negotiated_mtu(length >= 3 ? handle : 0, offered);
+			if (bearer != NULL)
+				bearer->mtu = mtu;
+			locker.Unlock();
+			update.mtu = mtu;
+
+			uint8 response[3] = { kATTExchangeMTUResponse, (uint8)offered,
+				(uint8)(offered >> 8) };
+			dprintf("l2cap-le: handle %#x offers an ATT MTU of %u; answering "
+				"%u, ATT MTU %u\n", connection->handle, handle, offered, mtu);
 			send_fixed(connection, L2CAP_ATT_CID, response, sizeof(response));
 			return true;
 		}

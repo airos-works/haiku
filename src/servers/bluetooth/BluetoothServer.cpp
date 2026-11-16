@@ -303,12 +303,19 @@ void BluetoothServer::MessageReceived(BMessage* message)
 
 		case BT_MSG_LE_CONNECT_CANCEL:
 		{
+			// An "address" picks one of the listener's links.
 			LocalDeviceImpl* device = LocateDelegateFromMessage(message);
 			BMessenger listener;
 			bool hasListener
 				= message->FindMessenger("listener", &listener) == B_OK;
+			const void* address = NULL;
+			ssize_t addressSize = 0;
+			if (message->FindData("address", B_RAW_TYPE, &address,
+					&addressSize) != B_OK || addressSize != 6)
+				address = NULL;
 			status = device != NULL ? device->CancelLEConnection(
-				hasListener ? &listener : NULL) : B_BAD_VALUE;
+				hasListener ? &listener : NULL, (const uint8*)address)
+				: B_BAD_VALUE;
 			break;
 		}
 
@@ -321,8 +328,14 @@ void BluetoothServer::MessageReceived(BMessage* message)
 			bool hasListener
 				= message->FindMessenger("listener", &listener) == B_OK
 					&& !message->GetBool("force", false);
+			const void* address = NULL;
+			ssize_t addressSize = 0;
+			if (message->FindData("address", B_RAW_TYPE, &address,
+					&addressSize) != B_OK || addressSize != 6)
+				address = NULL;
 			status = device != NULL ? device->DisconnectLEConnection(
-				hasListener ? &listener : NULL) : B_BAD_VALUE;
+				hasListener ? &listener : NULL, (const uint8*)address)
+				: B_BAD_VALUE;
 			break;
 		}
 
@@ -330,7 +343,7 @@ void BluetoothServer::MessageReceived(BMessage* message)
 		{
 			LocalDeviceImpl* device = LocateDelegateFromMessage(message);
 			status = device == NULL ? B_BAD_VALUE
-				: device->UpdateLEConnection(
+				: device->UpdateLEConnection(message,
 					message->GetUInt16("interval_min", 0),
 					message->GetUInt16("interval_max", 0),
 					message->GetUInt16("latency", 0xffff),
@@ -342,9 +355,7 @@ void BluetoothServer::MessageReceived(BMessage* message)
 		case BT_MSG_READ_RSSI:
 		{
 			LocalDeviceImpl* device = LocateDelegateFromMessage(message);
-			status = device == NULL ? B_BAD_VALUE
-				: device->ReadRSSI(message->GetUInt16("handle", 0xffff) == 0xffff
-					? -1 : message->GetUInt16("handle", 0));
+			status = device == NULL ? B_BAD_VALUE : device->ReadRSSI(message);
 			break;
 		}
 
@@ -360,7 +371,8 @@ void BluetoothServer::MessageReceived(BMessage* message)
 			if (message->FindData("short_term_key", B_RAW_TYPE,
 					&key, &keySize) == B_OK) {
 				status = keySize == 16
-					? device->StartLEEncryption((const uint8*)key, NULL, 0)
+					? device->StartLEEncryption(message, (const uint8*)key,
+						NULL, 0)
 					: B_BAD_VALUE;
 				break;
 			}
@@ -373,7 +385,7 @@ void BluetoothServer::MessageReceived(BMessage* message)
 					&randomNumber, &randomSize) == B_OK && randomSize == 8
 				&& message->FindUInt16("encrypted_diversifier",
 					&encryptedDiversifier) == B_OK
-				? device->StartLEEncryption((const uint8*)key,
+				? device->StartLEEncryption(message, (const uint8*)key,
 					(const uint8*)randomNumber, encryptedDiversifier)
 				: B_BAD_VALUE;
 			break;

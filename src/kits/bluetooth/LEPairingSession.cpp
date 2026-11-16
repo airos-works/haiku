@@ -249,7 +249,7 @@ ControlLink(BMessenger& server, uint32 what, int32 hciID,
 
 
 // Asks the server for a connection; retries while another client (for
-// example the input add-on reconnecting a mouse) holds the single LE link.
+// example the input add-on reconnecting a mouse) holds the link to the peer.
 static status_t
 RequestConnection(BMessenger& server, int32 hciID, PairingListener* listener,
 	const uint8 address[6], uint8 addressType, bigtime_t busyTimeout,
@@ -524,6 +524,7 @@ LEEncryptedLink::ConnectBonded(int32 hciID, const uint8 localAddress[6],
 	memcpy(fImpl->connectionAddress, currentAddress, 6);
 	BMessage encrypt(BT_MSG_LE_START_ENCRYPTION);
 	encrypt.AddInt32("hci_id", hciID);
+	encrypt.AddMessenger("listener", listener);
 	encrypt.AddData("long_term_key", B_RAW_TYPE, bond.longTermKey, 16);
 	encrypt.AddData("random_number", B_RAW_TYPE, bond.randomNumber, 8);
 	encrypt.AddUInt16("encrypted_diversifier", bond.encryptedDiversifier);
@@ -564,6 +565,7 @@ LEEncryptedLink::KeepInterval(uint16 intervalMin, uint16 intervalMax)
 		return B_NO_INIT;
 	BMessage request(BT_MSG_LE_UPDATE_CONNECTION);
 	request.AddInt32("hci_id", fImpl->hciID);
+	request.AddMessenger("listener", BMessenger(fImpl->listener));
 	request.AddUInt16("interval_min", intervalMin);
 	request.AddUInt16("interval_max", intervalMax);
 	request.AddBool("keep_interval", true);
@@ -818,6 +820,7 @@ PairLEDevice(int32 hciID, const uint8 localAddress[6],
 
 	SetStage(result, LE_PAIRING_ENCRYPT, progress, "Encrypting the link");
 	encrypt.AddInt32("hci_id", hciID);
+	encrypt.AddMessenger("listener", listenerMessenger);
 	encrypt.AddData("short_term_key", B_RAW_TYPE, shortTermKey, 16);
 	ClearSecret(shortTermKey, sizeof(shortTermKey));
 	result.status = SendRequest(server, encrypt);

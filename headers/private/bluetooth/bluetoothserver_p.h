@@ -30,9 +30,15 @@
 #define BT_MSG_LE_ADVERTISEMENT         'leAD'
 
 // LE ACL link lifecycle. These messages do not imply pairing or a HID profile.
-// Scan stop, connect cancel and disconnect take the client's "listener" so
-// one client cannot end another's scan or link; BT_MSG_LE_DISCONNECT also
-// accepts bool "force" to end the current link whoever owns it.
+// A controller holds several links, one per peer, each owned by the listener
+// that asked for it; a connect to a peer that already has a link (or a
+// request for one) fails with B_BUSY. Requests queue: the controller creates
+// one connection at a time. Scan stop, connect cancel and disconnect take
+// the client's "listener" so one client cannot end another's scan or link,
+// and may take the peer's "address" to pick one of the listener's links
+// (all of them otherwise); BT_MSG_LE_DISCONNECT also accepts bool "force"
+// to end the link (with "address") or the links whoever owns them. Link
+// notices carry the peer's "address" and the link's "handle".
 #define BT_MSG_LE_CONNECT               'leCN'
 #define BT_MSG_LE_CONNECT_CANCEL        'leCC'
 #define BT_MSG_LE_DISCONNECT            'leDC'
@@ -41,7 +47,10 @@
 #define BT_MSG_LE_CONNECT_FAILED        'leCF'
 #define BT_MSG_LE_DISCONNECTED          'leDD'
 // Request: either short_term_key (16 bytes), or long_term_key (16 bytes),
-// random_number (8 bytes) and encrypted_diversifier (uint16).
+// random_number (8 bytes) and encrypted_diversifier (uint16). This,
+// BT_MSG_LE_UPDATE_CONNECTION and BT_MSG_READ_RSSI act on the link with the
+// request's "handle" or "address", else the one link of its "listener",
+// else the only LE link there is.
 #define BT_MSG_LE_START_ENCRYPTION      'leEN'
 // Asks the controller for other parameters on the LE link: "interval_min",
 // "interval_max" (1.25 ms units), "latency" (events), "timeout" (10 ms),

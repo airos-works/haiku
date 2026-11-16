@@ -122,6 +122,9 @@ l2cap_setsockopt(net_protocol* protocol, int level, int option,
 	const void* _value, int length)
 {
 	CALLED();
+	if (level == BLUETOOTH_PROTO_L2CAP)
+		return ((L2capEndpoint*)protocol)->SetOption(option, _value, length);
+
 	return gSocketModule->set_option(protocol->socket, level, option,
 		_value, length);
 }
@@ -311,13 +314,21 @@ l2cap_receive_data(net_buffer* buffer)
 				return ENOTCONN;
 			}
 			l2cap_le_dump("rx", connection, dcid, buffer);
-			if (dcid == L2CAP_ATT_CID
-				&& l2cap_le_answer_att(connection, buffer)) {
-				gBufferModule->free(buffer);
-				return B_OK;
-			}
 			L2capEndpoint* endpoint
 				= gL2capEndpointManager.GetForFixedChannel(connection, dcid);
+			if (dcid == L2CAP_ATT_CID) {
+				l2cap_le_att_update update;
+				bool answered = l2cap_le_answer_att(connection, buffer,
+					endpoint != NULL ? endpoint->ATTReceiveMTU() : 0, update);
+				if (endpoint != NULL && update.mtu != 0)
+					endpoint->ATTMTUChanged(update.mtu, update.exchangeDone);
+				if (answered) {
+					gBufferModule->free(buffer);
+					if (endpoint != NULL)
+						gSocketModule->release_socket(endpoint->socket);
+					return B_OK;
+				}
+			}
 			if (endpoint == NULL) {
 				uint8 opcode = 0;
 				gBufferModule->read(buffer, 0, &opcode, 1);
@@ -364,6 +375,7 @@ l2cap_error_received(net_error error, net_error_data* errorData, net_buffer* dat
 
 		// Disconnect all connections with this HciConnection.
 		gL2capEndpointManager.Disconnected(connection);
+		l2cap_le_att_forget(connection);
 
 		gBufferModule->free(data);
 		return B_OK;

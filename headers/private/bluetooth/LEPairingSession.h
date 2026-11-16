@@ -56,8 +56,8 @@ LEPairingResult PairLEDevice(int32 hciID, const uint8 localAddress[6],
 	const BMessenger* progress = NULL);
 
 // Holds an encrypted LE connection to a previously bonded peer. The ATT
-// client can be used while this object remains connected. Only one LE link
-// per controller is currently supported by the Bluetooth server.
+// client can be used while this object remains connected. Other clients may
+// hold links to other peers on the same controller meanwhile.
 class LEEncryptedLink {
 public:
 	LEEncryptedLink();
