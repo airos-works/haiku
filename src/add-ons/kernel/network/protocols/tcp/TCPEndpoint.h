@@ -142,7 +142,7 @@ private:
 			uint64		_PacingRate() const;
 			bool		_PacingAllows(uint32 bytes);
 			void		_DuplicateAcknowledge(tcp_segment_header& segment);
-			void		_UpdateScoreboard(const tcp_segment_header& segment);
+			bool		_UpdateScoreboard(const tcp_segment_header& segment);
 			void		_PruneScoreboard();
 			bool		_NextHole(tcp_sequence& start, uint32& length) const;
 			bool		_RetransmitNextHole();

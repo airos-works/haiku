@@ -1874,12 +1874,15 @@ TCPEndpoint::_DuplicateAcknowledge(tcp_segment_header &segment)
 	what is in flight (old ones, D-SACK) are ignored. When the scoreboard is
 	full, the highest ranges go first: the holes near fSendUnacknowledged
 	matter most.
+	Returns whether the blocks reported data that was not reported before.
 */
-void
+bool
 TCPEndpoint::_UpdateScoreboard(const tcp_segment_header& segment)
 {
 	if ((fFlags & FLAG_OPTION_SACK_PERMITTED) == 0)
-		return;
+		return false;
+
+	bool reported = false;
 
 	for (int i = 0; i < segment.sackCount; i++) {
 		tcp_sequence left = segment.sacks[i].left_edge;
@@ -1905,6 +1908,9 @@ TCPEndpoint::_UpdateScoreboard(const tcp_segment_header& segment)
 		}
 
 		int32 removed = end - index;
+		if (removed != 1 || left < fScoreboard[index].left
+			|| fScoreboard[index].right < right)
+			reported = true;
 		if (removed == 0) {
 			// a new range at index
 			if (fScoreboardCount == kScoreboardSize) {
@@ -1923,6 +1929,8 @@ TCPEndpoint::_UpdateScoreboard(const tcp_segment_header& segment)
 		fScoreboard[index].left = left;
 		fScoreboard[index].right = right;
 	}
+
+	return reported;
 }
 
 
@@ -2929,11 +2937,19 @@ TCPEndpoint::_Receive(tcp_segment_header& segment, net_buffer* buffer)
 		if (fSendMax < segment.acknowledge)
 			return DROP | IMMEDIATE_ACKNOWLEDGE;
 
+		// With SACK, an ACK that reports new data is a duplicate ACK even when
+		// the window changed (RFC 6675 2). Linux receivers shrink the window
+		// they advertise as their out-of-order queue fills, so the hundreds
+		// of ACKs after a burst loss all counted as window updates: no fast
+		// retransmit, a retransmit timeout instead, in half of the uploads
+		// to a server 24 ms away (#113).
+		bool reported = false;
 		if ((segment.options & TCP_HAS_SACK) != 0)
-			_UpdateScoreboard(segment);
+			reported = _UpdateScoreboard(segment);
 
 		if (segment.acknowledge == fSendUnacknowledged) {
-			if (buffer->size == 0 && advertisedWindow == previousSendWindow
+			if (buffer->size == 0
+				&& (advertisedWindow == previousSendWindow || reported)
 				&& (segment.flags & TCP_FLAG_FINISH) == 0 && fSendUnacknowledged != fSendMax) {
 				TRACE("Receive(): duplicate ack!");
 				_DuplicateAcknowledge(segment);
