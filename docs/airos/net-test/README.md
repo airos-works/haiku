@@ -82,6 +82,27 @@ reordering; 0.62-0.69 s with D-SACK undo):
 REORDER=0.005:4 SACKWIN=1 SINK="rounds 8 sink 30" ./pair-lossy.sh ro <image> "sendn 10.10.0.1 10 8" 200 12 0 ba 1024 1
 ```
 
+### Linux on the same path
+
+`pair-linux.sh` runs the same pair with a Linux sender as guest B: the
+linuxvm kernel (`data/linuxvm/vmlinuz` from the `linuxvm` package, Linux 6.18
+with virtio built in) and an initramfs of the host's static busybox and
+`lsend`, a static Linux build of nettest's `send` and `sendn`
+(`gcc -O2 -static -o $LINUXGUEST/lsend lsend.c`). The sink is still Haiku, so
+only the sender differs:
+
+```
+./pair-linux.sh lx <haiku image> "send 10.10.0.1 10 send 10.10.0.1 10" 100 10 0.01 ba 256 5
+```
+
+On 2026-11-16 (master 0f4852dfb2), three 10 s streams each, MB/s:
+
+| Path | Linux 6.18 CUBIC | Haiku |
+|---|---|---|
+| 100 Mbit/s, 20 ms, 1% loss, 256 KB queue | 0.7 0.8 0.7 | 1.1 1.1 1.0 (1 MiB and 4 MiB send buffers: 1.0-1.1) |
+| 100 Mbit/s, 80 ms, 0.05% loss, 1 MB queue | 2.3 3.1 1.0 | 1.2 1.6 0.9 |
+| 100 Mbit/s, 80 ms, no loss, 512 KB queue | 9.0 7.5 7.5 | 11.4 11.4 11.6 |
+
 Traps:
 - Write traces to `/dev/shm`. A trace on a busy disk blocked the relay for
   seconds, and the guests' retransmit timeouts during that time looked like a
