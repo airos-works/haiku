@@ -66,6 +66,10 @@ private:
 			tcp_sequence		fFirstSequence;
 			tcp_sequence		fLastSequence;
 			tcp_sequence		fPushPointer;
+			net_buffer*			fGetHint;
+				// the buffer the last Get() of a range started in: sending
+				// reads the queue in order, so the next one starts there
+				// instead of walking from the head (NULL when unknown)
 };
 
 

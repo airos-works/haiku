@@ -34,7 +34,8 @@ BufferQueue::BufferQueue(size_t maxBytes)
 	fContiguousBytes(0),
 	fFirstSequence(0),
 	fLastSequence(0),
-	fPushPointer(0)
+	fPushPointer(0),
+	fGetHint(NULL)
 {
 }
 
@@ -43,6 +44,7 @@ BufferQueue::~BufferQueue()
 {
 	// free up any buffers left in the queue
 
+	fGetHint = NULL;
 	net_buffer *buffer;
 	while ((buffer = fList.RemoveHead()) != NULL) {
 		gBufferModule->free(buffer);
@@ -122,6 +124,9 @@ BufferQueue::Add(net_buffer *buffer, tcp_sequence sequence)
 
 	if (fLastSequence < sequence + buffer->size)
 		fLastSequence = sequence + buffer->size;
+
+	// buffers may be removed or inserted below
+	fGetHint = NULL;
 
 	// find the place where to insert the buffer into the queue
 
@@ -250,6 +255,8 @@ BufferQueue::RemoveUntil(tcp_sequence sequence)
 
 		if (sequence >= buffer->sequence + buffer->size) {
 			// remove this buffer completely
+			if (buffer == fGetHint)
+				fGetHint = NULL;
 			iterator.Remove();
 			fNumBytes -= buffer->size;
 
@@ -299,14 +306,16 @@ BufferQueue::Get(net_buffer *buffer, tcp_sequence sequence, size_t bytes)
 
 	size_t bytesLeft = bytes;
 
-	// find first buffer matching the sequence
+	// find first buffer matching the sequence, from where the last range
+	// started if this one starts at or after it
 
-	SegmentList::Iterator iterator = fList.GetIterator();
-	net_buffer *source = NULL;
-	while ((source = iterator.Next()) != NULL) {
-		if (sequence < source->sequence + source->size)
-			break;
-	}
+	net_buffer *source = fGetHint;
+	if (source == NULL || sequence < tcp_sequence(source->sequence))
+		source = fList.First();
+	while (source != NULL
+		&& !(sequence < source->sequence + source->size))
+		source = fList.GetNext(source);
+	fGetHint = source;
 
 	if (source == NULL)
 		panic("we should have had that data...");
@@ -328,7 +337,7 @@ BufferQueue::Get(net_buffer *buffer, tcp_sequence sequence, size_t bytes)
 
 		bytesLeft -= size;
 		offset = 0;
-		source = iterator.Next();
+		source = fList.GetNext(source);
 	}
 
 	VERIFY();
@@ -366,6 +375,8 @@ BufferQueue::Get(size_t bytes, bool remove, net_buffer **_buffer)
 		bytesLeft -= buffer->size;
 		fFirstSequence += buffer->size;
 
+		if (buffer == fGetHint)
+			fGetHint = NULL;
 		fList.Remove(buffer);
 	}
 
@@ -390,6 +401,8 @@ BufferQueue::Get(size_t bytes, bool remove, net_buffer **_buffer)
 		fFirstSequence += size;
 
 		if (size == source->size) {
+			if (source == fGetHint)
+				fGetHint = NULL;
 			iterator.Remove();
 			gBufferModule->free(source);
 		} else {
