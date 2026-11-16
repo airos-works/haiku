@@ -80,6 +80,7 @@ struct GpuBuffer {
 	uint64	size;
 	void*	address;	// NULL when the CPU does not reach it
 	uint32	domain;
+	area_id	area;		// > 0: memory of this team's (create_host_buffer())
 };
 
 struct Source {
@@ -174,7 +175,7 @@ static void
 destroy_gpu_buffer(GpuBuffer& buffer)
 {
 	// closing the handle also ends its mapping into the VM
-	if (buffer.address != NULL) {
+	if (buffer.address != NULL && buffer.area <= 0) {
 		drm_haiku_unmap unmap = {};
 		unmap.address = (addr_t)buffer.address;
 		ioctl_amdgpu(DRM_HAIKU_IOCTL_UNMAP, &unmap);
@@ -184,7 +185,60 @@ destroy_gpu_buffer(GpuBuffer& buffer)
 		close.handle = buffer.handle;
 		ioctl_amdgpu(DRM_IOCTL_GEM_CLOSE, &close);
 	}
+	// Only after the buffer object: the driver keeps the pages of host
+	// memory wired while it has one on them, and deleting the area waits
+	// until it lets go (for good, while the object lives).
+	if (buffer.area > 0)
+		delete_area(buffer.area);
 	memset(&buffer, 0, sizeof(buffer));
+}
+
+
+/*!	Memory of this team that the GPU reads and writes as system memory (GTT),
+	through a userptr buffer object: an area of its own, which other teams
+	may clone. app_server's back buffer is such memory: a renderer that
+	copies its frames into the screen (Summit's direct present) also copies
+	them into the back buffer, importing the clone app_server hands out
+	(drawing_bits_area) as host memory (VK_EXT_external_memory_host, a userptr
+	object of its own). A mapping of one of the driver's own buffer objects
+	cannot be imported that way (amdgpu_drm wires only anonymous memory for
+	userptr objects): Summit's import of it failed (-4) and every page change
+	went through glReadPixels and app_server instead (haiku#67).
+
+	The area is created with the protection app_server's area_of_buffer()
+	sets: setting a different one would wait until the pages are no longer
+	wired, which is never while the buffer object lives. */
+static status_t
+create_host_buffer(uint64 size, GpuBuffer& buffer)
+{
+	memset(&buffer, 0, sizeof(buffer));
+	size = (size + B_PAGE_SIZE - 1) & ~(uint64)(B_PAGE_SIZE - 1);
+	void* address = NULL;
+	area_id area = create_area("amdgpu host buffer", &address, B_ANY_ADDRESS,
+		size, B_NO_LOCK, B_READ_AREA | B_WRITE_AREA | B_CLONEABLE_AREA);
+	if (area < 0)
+		return area;
+
+	drm_amdgpu_gem_userptr userptr = {};
+	userptr.addr = (uint64)(addr_t)address;
+	userptr.size = size;
+	userptr.flags = AMDGPU_GEM_USERPTR_ANONONLY | AMDGPU_GEM_USERPTR_VALIDATE
+		| AMDGPU_GEM_USERPTR_REGISTER;
+	status_t status = ioctl_amdgpu(DRM_IOCTL_AMDGPU_GEM_USERPTR, &userptr);
+	if (status != B_OK) {
+		delete_area(area);
+		return status;
+	}
+	buffer.handle = userptr.handle;
+	buffer.size = size;
+	buffer.domain = AMDGPU_GEM_DOMAIN_GTT;
+	buffer.address = address;
+	buffer.area = area;
+
+	status = map_va(buffer.handle, size, buffer.va);
+	if (status != B_OK)
+		destroy_gpu_buffer(buffer);
+	return status;
 }
 
 
@@ -605,8 +659,18 @@ create_source(uint16 width, uint16 height, color_space space, bool shadow,
 			status = create_gpu_buffer(size, AMDGPU_GEM_DOMAIN_GTT,
 				entry->buffer);
 		}
-	} else
-		status = create_gpu_buffer(size, AMDGPU_GEM_DOMAIN_GTT, entry->buffer);
+	} else {
+		// what app_server draws into, which renderers import as host
+		// memory; a GTT buffer object where amdgpu_drm has no userptr
+		// objects (or no memory to wire)
+		status = create_host_buffer(size, entry->buffer);
+		if (status != B_OK) {
+			TRACE("a %ux%u source in host memory failed (%s), it is a "
+				"buffer object\n", width, height, strerror(status));
+			status = create_gpu_buffer(size, AMDGPU_GEM_DOMAIN_GTT,
+				entry->buffer);
+		}
+	}
 	if (status != B_OK)
 		return status;
 	entry->id = sNextSourceId++;
