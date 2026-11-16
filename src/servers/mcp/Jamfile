@@ -1,6 +1,6 @@
 SubDir HAIKU_TOP src servers mcp ;
 
-UsePrivateHeaders app shared ;
+UsePrivateHeaders app interface shared ;
 UseBuildFeatureHeaders zlib ;
 SubDirHdrs $(SUBDIR) ;
 SubDirC++Flags -std=c++17 ;
@@ -23,6 +23,7 @@ Application mcp_server :
 	ScriptingTools.cpp
 	SyslogTools.cpp
 	TeamTools.cpp
+	UITools.cpp
 	: be media network bnetapi [ BuildFeatureAttribute zlib : library ] [ TargetLibstdc++ ]
 	: mcp_server.rdef
 ;

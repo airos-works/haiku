@@ -3256,6 +3256,9 @@ BView::DrawString(const char* string, int32 length, BPoint location,
 
 	_CheckLockAndSwitchCurrent();
 
+	if (ACCESSIBILITY_ENABLED())
+		BPrivate::accessibility_string_drawn(this, string, length, location);
+
 	ViewDrawStringInfo info;
 	info.stringLength = length;
 	info.location = location;
@@ -3297,6 +3300,11 @@ BView::DrawString(const char* string, int32 length, const BPoint* locations,
 		return;
 
 	_CheckLockAndSwitchCurrent();
+
+	if (ACCESSIBILITY_ENABLED() && locationCount > 0) {
+		BPrivate::accessibility_string_drawn(this, string, length,
+			locations[0]);
+	}
 
 	fOwner->fLink->StartMessage(AS_DRAW_STRING_WITH_OFFSETS);
 
@@ -6709,6 +6717,9 @@ BView::_Draw(BRect updateRect)
 
 	ConvertFromScreen(&updateRect);
 
+	if (ACCESSIBILITY_ENABLED())
+		BPrivate::accessibility_view_drawing(this, updateRect);
+
 	// TODO: make states robust (the hook implementation could
 	// mess things up if it uses non-matching Push- and PopState(),
 	// we would not be guaranteed to still have the same state on
@@ -6716,6 +6727,8 @@ BView::_Draw(BRect updateRect)
 	PushState();
 	Draw(updateRect);
 	PopState();
+	if (ACCESSIBILITY_ENABLED())
+		BPrivate::accessibility_view_drawn(this);
 	Flush();
 }
 

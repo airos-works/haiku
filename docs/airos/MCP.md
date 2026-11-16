@@ -39,10 +39,59 @@ Local administration (does not start a second server):
 /boot/system/servers/mcp_server --status
 /boot/system/servers/mcp_server --enable
 /boot/system/servers/mcp_server --disable
+/boot/system/servers/mcp_server --ui-on     # Let agents see and use applications
+/boot/system/servers/mcp_server --ui-off
 ```
 
 `--status` and `--enable` print credentials only while the endpoint is on.
 Do not put that output in public logs.
+
+## Applications without screenshots
+
+**Let agents see and use applications** (on by default, saved as
+`ui_access`) enables eight tools that read and use the windows of running
+applications through the system accessibility interface
+(`docs/airos/ACCESSIBILITY.md`). Applications need no changes: every
+Interface Kit view answers as a node with a role, name, value, states and
+actions; custom views say their class and the text they drew.
+
+| Tool | |
+|------|-|
+| `ui_windows` | every window by application: ref, title, active/modal, front-to-back order, size, position, workspace |
+| `ui_tree` | the controls of a window, application or node as an indented tree, `role "name" [ref] = value (states) {actions}`; `\|` lines are drawn text; JSON with `format: json` |
+| `ui_find` | controls in all applications by text, exact name or role, with their path |
+| `ui_act` | steps in order: press, set_value, select, focus, activate, increment, decrement, expand, collapse, show_menu, type, key, click; by ref, or by name (+ role, app, window) |
+| `ui_focus` | the active window and the focused control |
+| `ui_events` | focus, window, value, selection and text events since a sequence number; can wait |
+| `ui_wait` | wait until a window or control appears or goes away, with a value or state |
+| `ui_text` | the whole text of a text view or terminal, or what a custom view drew |
+
+Refs are `team:object` or `team:object.item` (`611:12`, `611:14.3`); they
+stay valid while the window exists, item refs while no item is inserted
+before them. Menu items work while their menu is closed, so `ui_act` can
+run "File > Save" without opening anything. Actions go to background
+windows without activating them or moving the pointer. Nodes the
+application marked with `BAccessible::SetConfirmation()` show `NEEDS
+CONFIRMATION` and refuse until the step has `confirmed: true`; password
+fields can be filled but never read. Every action is written to the syslog
+(`ui: <app> <ref> <action> ...`, password values hidden). The messages the
+application receives carry `be:agent`.
+
+The first `ui_*` call subscribes `mcp_server` to the accessibility_server,
+which starts every application's bridge; ten minutes after the last call it
+unsubscribes and the bridges stop. Turning the setting off unsubscribes at
+once.
+
+A typical exchange:
+
+```
+ui_windows {}                       -> StyledEdit: window "note.txt" [811:2] active z1 ...
+ui_tree {"ref": "811:2"}            -> text area [811:5] = "..."; menu item "Save" [811:6.4] ...
+ui_act {"steps": [{"ref": "811:5", "action": "type", "text": "Hello\n"},
+                  {"app": "StyledEdit", "name": "Save", "role": "menu item",
+                   "action": "press"}]}
+ui_wait {"app": "StyledEdit", "name": "Save", "state": "disabled"}
+```
 
 The 28 tools from the earlier MIT-licensed `apps/airos_mcp` implementation are
 retained: syslog, commands/jobs, teams, screenshots, Haiku scripting, driver
@@ -85,6 +134,9 @@ down active/partial connections and re-enabling. It leaves MCP off:
 ```sh
 python3 tools/mcp/test-service.py http://TEST-HOST:7780/mcp --ssh 'ssh test-haiku'
 ```
+
+`tools/mcp/test-ui.py` checks the `ui_*` tools against `AgentUITestApp`
+(see `docs/airos/ACCESSIBILITY.md`).
 
 Also verify the panel with the checkbox and copy button, and reboot after both
 on and off to check persisted state. A read-only live image cannot prove

@@ -17,6 +17,13 @@ void RegisterInventoryTools(McpServer& server);
 void RegisterPackageTools(McpServer& server);
 void RegisterHealthTools(McpServer& server);
 void RegisterFileTools(McpServer& server);
+void RegisterUITools(McpServer& server);
+
+// The ui_* tools work while this is set ("Let agents see and use
+// applications" in the MCP preferences). Turning it off also stops the
+// accessibility bridges the tools turned on.
+extern bool gUIAccessEnabled;
+void SetUIAccessEnabled(bool enabled);
 
 // The BApplication the GUI-facing tools need, created on first use. Returns
 // false when the registrar or app_server does not answer in time.

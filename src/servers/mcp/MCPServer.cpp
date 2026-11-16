@@ -82,6 +82,7 @@ public:
 		fServer("mcp_server", "1.0.0"),
 		fTransport(fServer),
 		fEnabled(false),
+		fUIAccess(true),
 		fError(B_OK)
 	{
 		RegisterSyslogTools(fServer);
@@ -94,6 +95,7 @@ public:
 		RegisterPackageTools(fServer);
 		RegisterHealthTools(fServer);
 		RegisterFileTools(fServer);
+		RegisterUITools(fServer);
 	}
 
 	virtual void ReadyToRun()
@@ -112,6 +114,9 @@ public:
 		if (fError != B_OK)
 			return;
 		settings.FindBool("enabled", &fEnabled);
+		if (settings.FindBool("ui_access", &fUIAccess) != B_OK)
+			fUIAccess = true;
+		SetUIAccessEnabled(fUIAccess);
 		const char* token;
 		if (settings.FindString("token", &token) == B_OK)
 			fToken = token;
@@ -129,7 +134,8 @@ public:
 
 	virtual void MessageReceived(BMessage* message)
 	{
-		if (message->what != kMCPGetStatus && message->what != kMCPSetEnabled) {
+		if (message->what != kMCPGetStatus && message->what != kMCPSetEnabled
+			&& message->what != kMCPSetUIAccess) {
 			BServer::MessageReceived(message);
 			return;
 		}
@@ -139,10 +145,19 @@ public:
 			error = message->FindBool("enabled", &enabled);
 			if (error == B_OK)
 				error = _SetEnabled(enabled);
+		} else if (message->what == kMCPSetUIAccess) {
+			bool access;
+			error = message->FindBool("ui_access", &access);
+			if (error == B_OK) {
+				fUIAccess = access;
+				SetUIAccessEnabled(access);
+				error = _Save(fEnabled);
+			}
 		}
 		BMessage reply(B_REPLY);
 		reply.AddInt32("error", error);
 		reply.AddBool("enabled", fEnabled);
+		reply.AddBool("ui_access", fUIAccess);
 		reply.AddBool("running", fTransport.IsRunning());
 		reply.AddString("connection_info", fTransport.IsRunning()
 			? _ConnectionInfo().c_str() : "");
@@ -163,6 +178,7 @@ private:
 			return errno;
 		BMessage settings;
 		settings.AddBool("enabled", enabled);
+		settings.AddBool("ui_access", fUIAccess);
 		settings.AddString("token", fToken.c_str());
 		std::vector<char> buffer(settings.FlattenedSize());
 		error = settings.Flatten(buffer.data(), buffer.size());
@@ -266,6 +282,7 @@ private:
 	McpServer fServer;
 	HttpTransport fTransport;
 	bool fEnabled;
+	bool fUIAccess;
 	status_t fError;
 	std::string fToken;
 };
@@ -280,8 +297,13 @@ main(int argc, char** argv)
 		if (strcmp(argv[1], "--enable") == 0 || strcmp(argv[1], "--disable") == 0) {
 			request.what = kMCPSetEnabled;
 			request.AddBool("enabled", strcmp(argv[1], "--enable") == 0);
+		} else if (strcmp(argv[1], "--ui-on") == 0
+			|| strcmp(argv[1], "--ui-off") == 0) {
+			request.what = kMCPSetUIAccess;
+			request.AddBool("ui_access", strcmp(argv[1], "--ui-on") == 0);
 		} else if (strcmp(argv[1], "--status") != 0) {
-			fprintf(stderr, "usage: mcp_server [--status | --enable | --disable]\n");
+			fprintf(stderr, "usage: mcp_server [--status | --enable | --disable"
+				" | --ui-on | --ui-off]\n");
 			return 1;
 		}
 		BMessage reply;
@@ -289,11 +311,14 @@ main(int argc, char** argv)
 			&reply, 5000000, 5000000);
 		if (error == B_OK)
 			reply.FindInt32("error", &error);
-		bool enabled = false, running = false;
+		bool enabled = false, running = false, uiAccess = false;
 		reply.FindBool("enabled", &enabled);
 		reply.FindBool("running", &running);
+		reply.FindBool("ui_access", &uiAccess);
 		printf("MCP: %s (saved setting: %s)\n", running ? "on" : "off",
 			enabled ? "on" : "off");
+		printf("Agents may see and use applications: %s\n",
+			uiAccess ? "yes" : "no");
 		const char* info;
 		if (reply.FindString("connection_info", &info) == B_OK)
 			fputs(info, stdout);

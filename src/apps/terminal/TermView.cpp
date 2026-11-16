@@ -69,6 +69,8 @@
 #include <TranslatorFormats.h>
 #include <TranslatorRoster.h>
 #include <UTF8.h>
+
+#include <Accessible.h>
 #include <Window.h>
 #include <image.h>
 
@@ -465,6 +467,112 @@ TermView::TermView(BMessage* archive)
 }
 
 
+// #pragma mark - TermAccessible
+
+
+/*!	The accessible node of a terminal: a text area whose value is the
+	screen, and whose text (BAccessible::Text()) is the history and the
+	screen, so that screen readers and agents can read the output and type
+	into it.
+*/
+class TermAccessible : public BAccessible {
+public:
+	TermAccessible(TermView* view) : fView(view) {}
+
+	virtual accessible_role Role() const
+	{
+		return B_ACCESSIBLE_ROLE_TEXT_AREA;
+	}
+
+	virtual BString Name() const
+	{
+		return BString("Terminal");
+	}
+
+	virtual BString Value() const
+	{
+		// the screen, without the empty lines below the last output
+		BString text = _Text(0, true);
+		while (text.EndsWith("\n"))
+			text.Truncate(text.Length() - 1);
+		static const int32 kMaxLength = 16384;
+		if (text.Length() > kMaxLength)
+			text.Remove(0, text.Length() - kMaxLength);
+		return text;
+	}
+
+	virtual uint64 States() const
+	{
+		uint64 states = B_ACCESSIBLE_STATE_FOCUSABLE
+			| B_ACCESSIBLE_STATE_EDITABLE | B_ACCESSIBLE_STATE_MULTI_LINE;
+		if (fView->IsFocus())
+			states |= B_ACCESSIBLE_STATE_FOCUSED;
+		return states;
+	}
+
+	virtual BRect Frame() const
+	{
+		if (fView->Window() == NULL)
+			return BRect(0, 0, -1, -1);
+		return fView->ConvertToScreen(fView->Bounds());
+	}
+
+	virtual uint32 Actions() const
+	{
+		return B_ACCESSIBLE_ACTION_FOCUS;
+	}
+
+	virtual status_t PerformAction(accessible_action action)
+	{
+		if (action != B_ACCESSIBLE_ACTION_FOCUS)
+			return B_NOT_SUPPORTED;
+		fView->MakeFocus(true);
+		if (fView->Window() != NULL && !fView->Window()->IsActive())
+			fView->Window()->Activate();
+		return B_OK;
+	}
+
+	virtual BString Text(int32 start, int32 end) const
+	{
+		BString text = _Text(fView->fTerminal != NULL
+			? -fView->fTerminal->HistorySize() : 0, false);
+		start = std::max((int32)0, std::min(start, text.Length()));
+		end = std::max(start, std::min(end, text.Length()));
+		return BString(text.String() + start, end - start);
+	}
+
+	virtual void AddProperties(BMessage& node) const
+	{
+		Terminal* terminal = fView->fTerminal;
+		if (terminal == NULL)
+			return;
+		terminal->Lock();
+		node.AddInt32("rows", terminal->Rows());
+		node.AddInt32("columns", terminal->Columns());
+		node.AddInt32("history", terminal->HistorySize());
+		terminal->Unlock();
+	}
+
+private:
+	BString _Text(int32 firstRow, bool screenOnly) const
+	{
+		Terminal* terminal = fView->fTerminal;
+		if (terminal == NULL)
+			return BString();
+		std::string text;
+		terminal->Lock();
+		if (screenOnly)
+			firstRow = 0;
+		terminal->GetText(TermPoint(0, firstRow),
+			TermPoint(0, terminal->Rows()), text);
+		terminal->Unlock();
+		return BString(text.data(), text.size());
+	}
+
+	TermView*	fView;
+};
+
+
 /*!	Initializes the object for further use.
 	The members fRows, fColumns, fEncoding, and fScrBufSize must
 	already be initialized; they are not touched by this method.
@@ -477,6 +585,7 @@ TermView::_InitObject(const ShellParameters& shellParameters)
 
 	fShell = NULL;
 	fTerminal = NULL;
+	fAccessible = NULL;
 	fReaderThread = -1;
 	fReaderQuit = false;
 	fWriterThread = -1;
@@ -647,6 +756,8 @@ TermView::~TermView()
 		delete fGPURenderer;
 	delete fSoftwareRenderer;
 	delete fBitmap;
+	BAccessible::Detach(this);
+	delete fAccessible;
 	delete fTerminal;
 }
 
@@ -3206,6 +3317,13 @@ TermView::AttachedToWindow()
 	// when its cursor blinks.
 	fFramePending = false;
 	_InvalidateAll();
+
+	// screen readers and agents read the text through this node; the
+	// view renders cells itself, so nothing else could tell them
+	if (fAccessible == NULL)
+		fAccessible = new(std::nothrow) TermAccessible(this);
+	if (fAccessible != NULL)
+		BAccessible::Attach(this, fAccessible);
 }
 
 

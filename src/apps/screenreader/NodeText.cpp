@@ -451,6 +451,12 @@ collect_text(const BMessage& node, TextParts& parts, bool inDocument)
 		case B_ACCESSIBLE_ROLE_SEPARATOR:
 			return;
 
+		case B_ACCESSIBLE_ROLE_POP_UP_BUTTON:
+			// its menu's items are its children (for agents); the field
+			// says its choice
+			parts.Add(describe_node(node, false), node);
+			return;
+
 		case B_ACCESSIBLE_ROLE_DOCUMENT:
 			inDocument = true;
 			if (!name.IsEmpty())
