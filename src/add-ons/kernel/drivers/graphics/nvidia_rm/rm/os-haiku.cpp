@@ -7,6 +7,7 @@ extern "C" {
 #include <nvrm_registry.h>
 }
 #include <stdio.h>
+#include <algorithm>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -23,6 +24,7 @@ extern "C" {
 #include <interrupts.h>
 #include <team.h>
 #include <vm/vm.h>
+#include <vm/vm_priv.h>
 #include <condition_variable.h>
 
 #include <PCI.h>
@@ -421,16 +423,51 @@ NV_STATUS NV_API_CALL nv_alloc_pages(
 
 	alloc->cacheType = cache_type;
 
+	const uint64 size = (uint64)page_count * B_PAGE_SIZE;
+
+	// The pages are wired in a kernel area, which the VM charges at system
+	// priority and down to its last pages: an application leaking GPU memory
+	// filled the X399's 64 GB until nothing in user land could get a page and
+	// the machine froze, instead of the application getting an error
+	// (airos-works/haiku#105). An application's allocation must leave a floor
+	// of memory for everyone else; below it, it fails like a full GPU heap.
+	const team_id team = team_get_current_team_id();
+	if (team != B_SYSTEM_TEAM) {
+		system_info info;
+		get_system_info(&info);
+		uint64 floor = (uint64)info.max_pages * B_PAGE_SIZE / 16;
+		floor = std::min<uint64>(std::max<uint64>(floor, 128 * 1024 * 1024),
+			2048ULL * 1024 * 1024);
+		if (vm_try_reserve_memory(size + floor, VM_PRIORITY_USER, 1000000)
+				!= B_OK) {
+			dprintf("nvidia_rm: team %" B_PRId32 " asked for %" B_PRIu64
+				" KiB of GPU system memory with less than %" B_PRIu64
+				" MiB left for the rest of the system; refused\n", team,
+				size / 1024, floor / 1024 / 1024);
+			return NV_ERR_NO_MEMORY;
+		}
+		vm_unreserve_memory(size + floor);
+	}
+
+	// Named after the application it was allocated for, so that "listarea 1"
+	// shows who holds the wired memory.
+	char name[B_OS_NAME_LENGTH];
+	if (team != B_SYSTEM_TEAM)
+		snprintf(name, sizeof(name), "DMA Buffer team %" B_PRId32, team);
+	else
+		strlcpy(name, "DMA Buffer", sizeof(name));
+
 	void *address = nullptr;
 	alloc->area.SetTo(create_area(
-		"DMA Buffer",
-		&address, B_ANY_KERNEL_ADDRESS, (uint64)page_count * B_PAGE_SIZE,
+		name,
+		&address, B_ANY_KERNEL_ADDRESS, size,
 		contiguous ? B_CONTIGUOUS : B_FULL_LOCK,
 		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA | B_CLONEABLE_AREA
 	));
 
 	if (!alloc->area.IsSet()) {
-		TRACE("create_area failed: %#" B_PRIx32 "(%s)\n", area, strerror(area));
+		TRACE("create_area failed: %#" B_PRIx32 "(%s)\n", alloc->area.Get(),
+			strerror(alloc->area.Get()));
 		return NV_ERR_NO_MEMORY;
 	}
 	TRACE("  area: %" B_PRId32 "\n", alloc->area.Get());
