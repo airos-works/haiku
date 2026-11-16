@@ -131,6 +131,11 @@ private:
 	bool fRaised = false;
 };
 static Runtime* sRuntime;
+// Finished, unretained runtimes detached from sRuntime while old clients
+// still hold dead queues on them. Each holds the global reference until its
+// last queue is retired; open queues keep their clients' descriptors (and so
+// the module) alive, and their workers are joined when they are detached.
+static Runtime* sZombies;
 static void PutRuntime(Runtime* runtime);
 
 class Runtime {
@@ -364,6 +369,14 @@ public:
 					space.attributes, space.config, space.status);
 			}
 		}
+		// A verified stop or recovery leaves the hardware off this memory, so
+		// release it before publishing the result. Otherwise its name would
+		// keep FirmwareMemoryRetained() refusing a fresh runtime for as long
+		// as old clients hold dead queues here. Retained memory stays.
+		if (!retained && runtime->area >= B_OK) {
+			delete_area(runtime->area);
+			runtime->area = -1;
+		}
 		{
 			MutexLocker locker(sRuntimeLock);
 			runtime->error = status;
@@ -396,6 +409,7 @@ public:
 	thread_id thread = -1;
 	ConditionVariable changed;
 	QueueSlot queues[kMaxRuntimeQueues];
+	Runtime* nextZombie = NULL;
 	uint32 references = 1;
 	uint32 live = 0;
 	uint32 creating = 1;
@@ -419,18 +433,6 @@ PutRuntime(Runtime* runtime)
 	if (last) delete runtime;
 }
 
-class RuntimeReference {
-public:
-	RuntimeReference()
-	{
-		MutexLocker locker(sRuntimeLock);
-		value = sRuntime;
-		if (value != NULL) value->references++;
-	}
-	~RuntimeReference() { if (value != NULL) PutRuntime(value); }
-	Runtime* value;
-};
-
 static int
 FindQueue(Runtime* runtime, void* client, uint32 handle)
 {
@@ -439,6 +441,45 @@ FindQueue(Runtime* runtime, void* client, uint32 handle)
 		if (queue.used && queue.client == client && queue.handle == handle) return i;
 	}
 	return -1;
+}
+
+class RuntimeReference {
+public:
+	RuntimeReference()
+	{
+		MutexLocker locker(sRuntimeLock);
+		value = sRuntime;
+		if (value != NULL) value->references++;
+	}
+	// The runtime that holds this queue: the current one, or a zombie for a
+	// queue created before a recovery. Handles are unique across runtimes.
+	RuntimeReference(void* client, uint32 handle)
+	{
+		MutexLocker locker(sRuntimeLock);
+		value = sRuntime;
+		if (value == NULL || FindQueue(value, client, handle) < 0) {
+			value = sZombies;
+			while (value != NULL && FindQueue(value, client, handle) < 0)
+				value = value->nextZombie;
+		}
+		if (value != NULL) value->references++;
+	}
+	~RuntimeReference() { if (value != NULL) PutRuntime(value); }
+	Runtime* value;
+};
+
+// sRuntimeLock held.
+static bool
+RemoveZombie(Runtime* runtime)
+{
+	for (Runtime** link = &sZombies; *link != NULL; link = &(*link)->nextZombie) {
+		if (*link == runtime) {
+			*link = runtime->nextZombie;
+			runtime->nextZombie = NULL;
+			return true;
+		}
+	}
+	return false;
 }
 
 // Called under the external hardware lock, with an API reference held. Wait
@@ -465,11 +506,53 @@ CollectRuntime(Runtime* runtime, bool& needsRecovery)
 	if (collect) {
 		{
 			MutexLocker locker(sRuntimeLock);
-			if (sRuntime != runtime) return;
-			sRuntime = NULL;
+			if (sRuntime == runtime) sRuntime = NULL;
+			else if (!RemoveZombie(runtime)) return;
 		}
 		PutRuntime(runtime);
 	}
+}
+
+// Called under the external hardware lock, before a queue is created. A
+// runtime that finished without retaining the hardware (a verified recovery)
+// can never run queues again, yet stays current while any old client keeps a
+// dead queue on it: a team stopped in the debugger, or one that never noticed
+// its lost context. Turn it into a zombie that serves those queues their
+// error, so that the new queue boots fresh firmware instead of failing.
+static void
+DetachRuntime(bool& needsRecovery)
+{
+	RuntimeReference reference;
+	Runtime* runtime = reference.value;
+	if (runtime == NULL) return;
+	uint32 held = 0;
+	{
+		MutexLocker locker(sRuntimeLock);
+		if (!runtime->finished || runtime->retained) return;
+		// creating is 0: queue creation holds the hardware lock as we do.
+		held = runtime->live;
+		if (held != 0) {
+			if (runtime->error == B_OK) runtime->error = B_IO_ERROR;
+			sRuntime = NULL;
+			runtime->nextZombie = sZombies;
+			sZombies = runtime;
+			runtime->changed.NotifyAll();
+		}
+	}
+	if (held == 0) {
+		// Nothing left to serve; collect it as the last close would have.
+		CollectRuntime(runtime, needsRecovery);
+		return;
+	}
+	// The worker published its result and only drops its reference now. Join
+	// it before firmware boots again, and so that no zombie has a thread.
+	if (runtime->thread >= B_OK) {
+		status_t result;
+		wait_for_thread(runtime->thread, &result);
+		runtime->thread = -1;
+	}
+	dprintf("mali_csf: runtime detached after recovery, %" B_PRIu32
+		" queues still held by old clients\n", held);
 }
 
 template<typename Request>
@@ -554,6 +637,7 @@ CreateQueue(const ResourceInfo& resources, void* client, void* user, size_t leng
 	ClientVmLease lease = {};
 	status = AcquireClientVm(client, request.vm, 0, lease);
 	if (status != B_OK) return status;
+	DetachRuntime(needsRecovery);
 	RuntimeReference reference;
 	Runtime* runtime = reference.value;
 	if (runtime == NULL) {
@@ -660,13 +744,33 @@ DestroyQueues(Runtime* runtime, void* client, uint32 handle, bool& needsRecovery
 void
 CloseQueues(void* client, bool& needsRecovery)
 {
-	RuntimeReference reference;
-	if (reference.value != NULL) DestroyQueues(reference.value, client, 0, needsRecovery);
+	{
+		RuntimeReference reference;
+		if (reference.value != NULL) DestroyQueues(reference.value, client, 0, needsRecovery);
+	}
+	// Then the dead queues this client still holds on detached runtimes. Each
+	// pass retires all of them on one zombie, which may free it.
+	for (;;) {
+		Runtime* runtime = NULL;
+		{
+			MutexLocker locker(sRuntimeLock);
+			for (Runtime* zombie = sZombies; zombie != NULL && runtime == NULL;
+					zombie = zombie->nextZombie) {
+				for (unsigned i = 0; i < kMaxRuntimeQueues; i++) {
+					const QueueSlot& queue = zombie->queues[i];
+					if (queue.used && queue.client == client) { runtime = zombie; break; }
+				}
+			}
+			if (runtime == NULL) return;
+			runtime->references++;
+		}
+		DestroyQueues(runtime, client, 0, needsRecovery);
+		PutRuntime(runtime);
+	}
 }
 
 static status_t
-SubmitQueue(Runtime* runtime, void* client, void* user, size_t length, bool synchronized,
-	void* syncClient)
+SubmitQueue(void* client, void* user, size_t length, bool synchronized, void* syncClient)
 {
 	QueueSubmitSync extended = {};
 	QueueSubmit& request = extended.queue;
@@ -688,6 +792,9 @@ SubmitQueue(Runtime* runtime, void* client, void* user, size_t length, bool sync
 		|| (request.streamAddress & 7) != 0 || (request.streamBytes & 7) != 0
 		|| request.streamBytes > kMaxStreamBytes
 		|| (request.streamBytes == 0 && request.streamAddress != 0)) return B_BAD_VALUE;
+	RuntimeReference reference(client, request.handle);
+	Runtime* runtime = reference.value;
+	if (runtime == NULL) return B_ENTRY_NOT_FOUND;
 	uint32 vm;
 	{
 		MutexLocker locker(sRuntimeLock);
@@ -744,7 +851,7 @@ SubmitQueue(Runtime* runtime, void* client, void* user, size_t length, bool sync
 }
 
 static status_t
-WaitQueue(Runtime* runtime, void* client, void* user, size_t length)
+WaitQueue(void* client, void* user, size_t length)
 {
 	QueueWait request;
 	status_t status = ReadQueueRequest(user, length, request);
@@ -754,6 +861,9 @@ WaitQueue(Runtime* runtime, void* client, void* user, size_t length)
 	bigtime_t now = system_time();
 	if (request.timeoutMicros > INT64_MAX - now) return B_BAD_VALUE;
 	bigtime_t deadline = request.timeoutMicros >= 0 ? now + request.timeoutMicros : 0;
+	RuntimeReference reference(client, request.handle);
+	Runtime* runtime = reference.value;
+	if (runtime == NULL) return B_ENTRY_NOT_FOUND;
 	MutexLocker locker(sRuntimeLock);
 	for (;;) {
 		int slot = FindQueue(runtime, client, request.handle);
@@ -778,22 +888,17 @@ ControlQueues(const ResourceInfo& resources, void* client, uint32 op, void* user
 	size_t length, bool& needsRecovery, void* syncClient)
 {
 	if (op == kCreateQueue) return CreateQueue(resources, client, user, length, needsRecovery);
-	RuntimeReference reference;
-	Runtime* runtime = reference.value;
-	if (runtime == NULL) return B_ENTRY_NOT_FOUND;
 	if (op == kSubmitQueue || op == kSubmitQueueSync)
-		return SubmitQueue(runtime, client, user, length, op == kSubmitQueueSync, syncClient);
-	if (op == kWaitQueue) return WaitQueue(runtime, client, user, length);
+		return SubmitQueue(client, user, length, op == kSubmitQueueSync, syncClient);
+	if (op == kWaitQueue) return WaitQueue(client, user, length);
 	if (op == kDestroyQueue) {
 		QueueHandle request;
 		status_t status = ReadQueueRequest(user, length, request);
 		if (status != B_OK) return status;
 		if (request.reserved != 0 || request.handle == 0) return B_BAD_VALUE;
-		{
-			MutexLocker locker(sRuntimeLock);
-			if (FindQueue(runtime, client, request.handle) < 0) return B_ENTRY_NOT_FOUND;
-		}
-		DestroyQueues(runtime, client, request.handle, needsRecovery);
+		RuntimeReference reference(client, request.handle);
+		if (reference.value == NULL) return B_ENTRY_NOT_FOUND;
+		DestroyQueues(reference.value, client, request.handle, needsRecovery);
 		return needsRecovery ? B_IO_ERROR : B_OK;
 	}
 	if (op == kGetQueueProperties) {
@@ -802,6 +907,9 @@ ControlQueues(const ResourceInfo& resources, void* client, uint32 op, void* user
 		if (status != B_OK) return status;
 		if (request.flags != 0 || request.reserved != 0
 			|| request.reserved2[0] != 0 || request.reserved2[1] != 0) return B_BAD_VALUE;
+		RuntimeReference reference(client, request.handle);
+		Runtime* runtime = reference.value;
+		if (runtime == NULL) return B_ENTRY_NOT_FOUND;
 		MutexLocker locker(sRuntimeLock);
 		if (FindQueue(runtime, client, request.handle) < 0) return B_ENTRY_NOT_FOUND;
 		QueueProperties result = {};
@@ -815,6 +923,9 @@ ControlQueues(const ResourceInfo& resources, void* client, uint32 op, void* user
 		if (status != B_OK) return status;
 		if (request.state != 0 || request.error != 0
 			|| request.reserved[0] != 0 || request.reserved[1] != 0) return B_BAD_VALUE;
+		RuntimeReference reference(client, request.handle);
+		Runtime* runtime = reference.value;
+		if (runtime == NULL) return B_ENTRY_NOT_FOUND;
 		MutexLocker locker(sRuntimeLock);
 		int slot = FindQueue(runtime, client, request.handle);
 		if (slot < 0) return B_ENTRY_NOT_FOUND;
@@ -834,6 +945,9 @@ ControlQueues(const ResourceInfo& resources, void* client, uint32 op, void* user
 	status_t status = ReadQueueRequest(user, length, request);
 	if (status != B_OK) return status;
 	if (request.reserved != 0) return B_BAD_VALUE;
+	RuntimeReference reference(client, request.handle);
+	Runtime* runtime = reference.value;
+	if (runtime == NULL) return B_ENTRY_NOT_FOUND;
 	MutexLocker locker(sRuntimeLock);
 	int slot = FindQueue(runtime, client, request.handle);
 	if (slot < 0) return B_ENTRY_NOT_FOUND;
