@@ -13,6 +13,7 @@ Parts:
 | Interface Kit hooks | `BWindow`, `BView`, `BControl`, `BTextView`, `BListView`, `BTabView`, `BMenu`, `BColumnListView`, `BApplication` | focus, activation, value, text, caret, selection and menu events |
 | `accessibility_server` | `src/servers/accessibility`, on-demand launch_daemon service | connects applications and assistive technologies |
 | `ScreenReader` | `src/apps/screenreader` | speaks focus, values, windows; captions |
+| agent tools | `mcp_server` (`src/servers/mcp/UITools.cpp`) | `ui_*` MCP tools: AI agents read and use applications without screenshots |
 | `accessibility_keys` | input_server filter | Option+Command+S/F/W/R/X |
 | tests | `src/tests/kits/interface/accessibility` | `AccessibilityTestApp`, `accessibility_tree_test` |
 
@@ -63,6 +64,9 @@ A node is described as a `BMessage` (fields in `AccessibilityProtocol.h`):
 | `index`, `count` | int32 | position among siblings ("2 of 5") |
 | `level` | int32 | tree items, headings |
 | `shortcut` | string | menu item shortcut |
+| `drawn_text` | string | what a custom view drew, line by line (see below) |
+| `class` | string | the C++ class of a view the Interface Kit does not know |
+| `confirm` | string | the application wants a person to confirm acting on this node |
 
 Custom trees add their own fields (`AddProperties()`), for example `url`.
 
@@ -86,9 +90,9 @@ names, values and states come from the views themselves:
 | `BSpinner`, `BDecimalSpinner` | spin button | label; text and range |
 | `BSlider`, `BChannelSlider` | slider | label; `UpdateText()` or value; range |
 | `BScrollBar` | scroll bar | value, range, orientation |
-| `BMenuField` | pop-up button | label; chosen item |
-| `BMenuBar`, `BMenu` | menu bar, menu | items as children (label, shortcut, checked, submenu, disabled) |
-| `BListView`, `BOutlineListView` | list, tree | selected item; items as children (text, selected, level, expanded) |
+| `BMenuField` | pop-up button | label; chosen item; its menu's items as children |
+| `BMenuBar`, `BMenu` | menu bar, menu | items as children (label, shortcut, checked, submenu, disabled); a submenu's items are children of its item, also while it is closed |
+| `BListView`, `BOutlineListView` | list, tree | selected item; items as children (text, selected, level, expanded); items that are not `BStringItem`s are named by what they drew |
 | `BColumnListView` | table | focused row's string fields (rows are not children yet) |
 | `BTabView` | tab list | selected tab; tabs as children |
 | `BStatusBar` | progress bar | label; text and percent |
@@ -98,6 +102,61 @@ names, values and states come from the views themselves:
 Unlabeled controls fall back to their tool tip, then to a `BStringView` right
 in front of them. Disabled controls are "disabled"; navigable views are
 "focusable".
+
+### Drawn text of custom views
+
+Views the Interface Kit does not know (role unknown or group) say what they
+are (`class`, demangled: `StatusView`, `ActivityView`) and what they drew
+(`drawn_text`). While the bridge runs, `BView::DrawString()` records each
+string with its position per view (at most 400 per view, 512 bytes each),
+and each `Draw()` is a pass: when it ends, a string the pass did not draw
+again is dropped if it lay in the update rect, outside the view's bounds,
+or if the pass also drew outside the update rect (views that always draw
+everything; their update rect can be just the visible part). `drawn_text`
+joins the strings by baseline into lines. List items that are not
+`BStringItem`s get their name from the strings drawn in their frame.
+
+The text is only known once a view drew after the bridge started. Enabling
+invalidates every view of every window (`Invalidate()` on a parent does not
+redraw its children, and from another thread it needs a `Flush()`). A view
+that has still not drawn when a client asks is invalidated then, and its
+node carries `drawn_pending`: `mcp_server` then calls
+`BPrivate::read_window_bitmap()` for the application's windows, which makes
+them draw the parts other windows or the screen saver cover, and asks again
+150 ms later. Views that draw into a `BBitmap` first (Terminal's renderer)
+draw no strings into the window; they need a `BAccessible` (Terminal has
+one: a text area whose value is the screen and whose text is the history
+and the screen).
+
+### Agents
+
+`mcp_server` is an assistive technology too: its `ui_*` tools (see
+`docs/airos/MCP.md`) subscribe to the server on first use and unsubscribe
+after ten idle minutes, so applications run without a bridge again. Agents
+need more than a screen reader, so the bridge also answers:
+
+- `B_ACCESSIBILITY_SET_VALUE` (`id`, `value` string): the text of a text
+  field or area (password fields can be filled, never read), a check box
+  (`on`/`off`), slider, spinner or scroll bar (a number), color control
+  (`#rrggbb`), or the item with that label in a pop-up menu field, list,
+  tab view or radio menu. Controls are invoked as if a person changed them.
+- `B_ACCESSIBILITY_INPUT` (`id` and `text`, `key` + `modifiers`, or
+  `click` + `button` + `point`): synthetic input for views without
+  semantics. Key and mouse messages go to the node's window (the focus
+  view, or the view under the point) without moving the mouse pointer or
+  activating the window, so agents can work in background windows. Typing
+  focuses the node first with the caret at the end of its text.
+- Requests with `agent` true: the messages of the controls the bridge
+  invokes (control and list invocation and selection messages, menu items,
+  synthetic keys and clicks) carry `be:agent` true, so an application can
+  tell an agent's change from a person's.
+- `BAccessible::SetConfirmation(view, "Deletes every document")` marks a
+  view whose action needs a person (node field `confirm`); `ui_act` refuses
+  to press or change it until the agent repeats the step with
+  `confirmed=true`, which it may only do after asking. Password fields
+  (`B_ACCESSIBLE_STATE_PROTECTED`) never give out their text.
+- `B_ACCESSIBILITY_GET_FOCUS` falls back to an application's first visible
+  window when none of its windows is active.
 
 ### Custom names and trees
 
@@ -309,6 +368,15 @@ follows what the WebKit ports for ATK and macOS do:
 
 ## Testing
 
+Agent tools, from a build host against a machine with MCP on (all 45 checks
+must pass; `--library-path` runs the test program with an uninstalled
+libbe.so):
+
+```
+python3 tools/mcp/test-ui.py http://HOST:7780/mcp --token TOKEN \
+    --ssh 'ssh user@host' --app /boot/home/tests/AgentUITestApp
+```
+
 ```
 # in a QEMU image built with the test programs (UserBuildConfig:
 # AddFilesToHaikuImage home tests : AccessibilityTestApp accessibility_tree_test ;)
@@ -348,8 +416,10 @@ Start the screen reader with Option+Command+S, move with Tab in
   lists need a `BAccessible` or a text-providing item class. Unnamed views
   (Network's list, a bare menu bar) have no name.
 - `BColumnListView` rows, `BOutlineListView` subtrees of collapsed items,
-  closed submenus, Tracker's file views and Deskbar replicants are not
-  described; custom-drawn views without `BAccessible` are "unknown".
+  Tracker's file views and Deskbar replicants are not described as nodes;
+  custom-drawn views without `BAccessible` are "unknown" with their class
+  and drawn text. Views that draw text into bitmaps (games, GL views) have
+  none.
 - Item IDs are index based; no "children changed" events from the Interface
   Kit yet; events only for the focused control (plus announcements).
 - Speech depends on haiku#52; the speech_server protocol above is a proposal.

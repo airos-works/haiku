@@ -19,3 +19,9 @@ Application fake_speech_server :
 	: be [ TargetLibstdc++ ]
 	: fake_speech_server.rdef
 ;
+
+Application AgentUITestApp :
+	AgentUITestApp.cpp
+	: be [ TargetLibstdc++ ]
+	: AgentUITestApp.rdef
+;

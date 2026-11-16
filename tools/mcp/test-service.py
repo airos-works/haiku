@@ -96,9 +96,11 @@ try:
         'team_threads', 'team_kill', 'screenshot', 'screen_info', 'hey', 'app_list',
         'app_launch', 'driver_deploy', 'driver_status', 'hw_inventory',
         'package_list', 'package_info', 'package_install', 'package_uninstall',
-        'file_put', 'file_get', 'file_list', 'file_hash', 'health_check'}
+        'file_put', 'file_get', 'file_list', 'file_hash', 'health_check',
+        'ui_windows', 'ui_tree', 'ui_find', 'ui_act', 'ui_focus', 'ui_events',
+        'ui_wait', 'ui_text'}
     assert tools == expected, tools ^ expected
-    print('PASS MCP initialization, notifications and all 28 existing tools exposed')
+    print('PASS MCP initialization, notifications and all 36 tools exposed')
 
     def tool(name, arguments):
         result = rpc('tools/call', {'name': name, 'arguments': arguments})
