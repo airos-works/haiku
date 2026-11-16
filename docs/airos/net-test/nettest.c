@@ -2297,6 +2297,104 @@ test_seq_wrap(void)
 }
 
 
+/* Reordering by two segments: two duplicate ACKs with SACK, then the
+   segment arrives. Limited transmit sends new data for those two ACKs and
+   used to put the send point back behind it, so the next send repeated
+   both segments: two resends for nothing at every reordering (#113). With
+   no loss, nothing may be sent twice. */
+static void
+test_reorder(void)
+{
+	const char* name = "reorder";
+	struct peer p;
+	sPeerSackPermitted = 1;
+	int fd = handshake(name, &p, 1460, 1);
+	if (fd < 0) {
+		sPeerSackPermitted = 0;
+		return;
+	}
+	int size = 1024 * 1024;
+	setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
+	set_timeout(fd, 10000);
+
+	const int total = 600 * 1024;
+	struct send_args args = { fd, total };
+	pthread_t thread;
+	pthread_create(&thread, NULL, sender_thread, &args);
+
+	uint32_t base = p.guest_next, highest = base;
+	int segments = 0, retransmits = 0, events = 0;
+	uint32_t heldSeq = 0, heldLength = 0, sackLeft = 0, sackRight = 0;
+	int held = 0;
+	struct seg sg;
+	bigtime_t end = now_ms() + 15000;
+	while (now_ms() < end && p.guest_next - base < (uint32_t)total) {
+		if (!read_seg(&sg, 300))
+			continue;
+		if (sg.proto != IPPROTO_TCP || sg.sport != p.guest_port || sg.len == 0)
+			continue;
+		if (sg.has_ts)
+			p.ts_recent = sg.tsval;
+		segments++;
+		if ((int32_t)(sg.seq - highest) < 0) {
+			retransmits++;
+			printf("  sent again: +%u (highest +%u, acked +%u)\n",
+				sg.seq - base, highest - base, p.guest_next - base);
+		} else
+			highest = sg.seq + sg.len;
+
+		/* every 60th segment arrives two segments late */
+		if (!held && events < 5 && segments % 60 == 0
+			&& sg.seq == p.guest_next) {
+			held = 1;
+			heldSeq = sg.seq;
+			heldLength = sg.len;
+			sackLeft = sackRight = 0;
+			continue;
+		}
+		if (held && sg.seq != heldSeq) {
+			if (sackLeft == 0)
+				sackLeft = sg.seq;
+			sackRight = sg.seq + sg.len;
+			sSackCount = 1;
+			sSackBlocks[0][0] = sackLeft;
+			sSackBlocks[0][1] = sackRight;
+			send_tcp(&p, F_ACK, p.seq, p.guest_next, 0, NULL, 0);
+			sSackCount = 0;
+			if (sackRight - sackLeft >= 2 * heldLength) {
+				/* the late segment arrives now */
+				p.guest_next = sackRight;
+				held = 0;
+				events++;
+				send_tcp(&p, F_ACK, p.seq, p.guest_next, 0, NULL, 0);
+			}
+			continue;
+		}
+		if (held && sg.seq == heldSeq) {
+			/* resent before it came: fill the hole all the same */
+			p.guest_next = sackRight != 0 ? sackRight : sg.seq + sg.len;
+			held = 0;
+			events++;
+		} else if (sg.seq == p.guest_next)
+			p.guest_next += sg.len;
+		send_tcp(&p, F_ACK, p.seq, p.guest_next, 0, NULL, 0);
+	}
+	uint32_t delivered = p.guest_next - base;
+	send_tcp(&p, F_RST | F_ACK, p.seq, p.guest_next, 0, NULL, 0);
+	close(fd);
+	pthread_join(thread, NULL);
+	sPeerSackPermitted = 0;
+	if (delivered < (uint32_t)total || events == 0)
+		fail(name, "%u of %d bytes, %d reorderings", delivered, total, events);
+	else if (retransmits > 0)
+		fail(name, "%d segments sent twice for %d reorderings without loss",
+			retransmits, events);
+	else
+		pass(name, "%d reorderings by two segments, nothing sent twice",
+			events);
+}
+
+
 static int sSackMode = 0;
 	/* 0: three holes in one window; 1: one hole whose first resend is lost */
 
@@ -2551,6 +2649,8 @@ main(int argc, char** argv)
 			test_sack();
 		else if (!strcmp(t, "recovery"))
 			test_recovery();
+		else if (!strcmp(t, "reorder"))
+			test_reorder();
 		else if (!strcmp(t, "rttramp"))
 			test_rtt_ramp();
 		else if (!strcmp(t, "seqwrap"))

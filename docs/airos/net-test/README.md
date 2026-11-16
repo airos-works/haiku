@@ -13,6 +13,7 @@ floods. Every test prints `PASS <name>` or `FAIL <name>: why`.
 | `lostresend` | a segment and its first resend are lost in a bulk transfer: repaired well before the retransmit timeout (#125) |
 | `finloss` | the last short segment with the FIN is lost after close(): it is resent (#125; it never was) |
 | `tailloss` | the last two segments of a write are repaired by a tail loss probe in well under the 200 ms retransmit timeout (#125) |
+| `reorder` | a segment arrives two segments late (two duplicate ACKs with SACK, no loss): nothing is sent twice (#113: limited transmit repeated two segments every time) |
 | `rttramp` | the peer's ACKs come back later and later (20 to 420 ms) with 64 KB in flight: the round trip estimate follows, no spurious timeouts (#125 item 2) |
 | `seqwrap` | a loss just past 2^32 is repaired by fast retransmit, without SACK (#125 item 4; the guest connects from successive ports until its initial sequence number lies 1-3 MB below 2^32) |
 | `seqnowrap` | the same loss without the wrap; failed for initial sequence numbers above 2^31 |
@@ -58,6 +59,9 @@ replaces the sink's arguments.
 
 The relay also takes, in its environment:
 - `BURST=after:n:k:rx`: reproducible loss (see `relay.py`).
+- `REORDER=p:k`: a data frame arrives, with probability p, k frame times
+  late, behind the k frames sent after it. A Haiku receiver now answers
+  the resends this causes with D-SACKs, as Linux does.
 - `SACKWIN=1`: every ACK carrying SACK blocks advertises a smaller window
   than the one before, as a Linux receiver's does while its out-of-order
   queue fills. A Haiku receiver keeps its window, so without this a sender
@@ -68,6 +72,14 @@ An upload like the X399's to a server 24 ms away:
 
 ```
 SACKWIN=1 SINK="rounds 8 sink 30" ./pair-lossy.sh sy <image> "sendn 10.10.0.1 10 8" 200 12 0 ba 128 1
+```
+
+and the same path reordering 0.5% of the frames by four, without loss
+(10 MB took 3 s with a fast recovery cutting the window at every
+reordering; 0.62-0.69 s with D-SACK undo):
+
+```
+REORDER=0.005:4 SACKWIN=1 SINK="rounds 8 sink 30" ./pair-lossy.sh ro <image> "sendn 10.10.0.1 10 8" 200 12 0 ba 1024 1
 ```
 
 Traps:

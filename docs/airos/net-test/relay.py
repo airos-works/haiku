@@ -42,6 +42,10 @@ burst_resent = set()
 # duplicates (RFC 5681), which a sender must still count (RFC 6675).
 sackwin = os.environ.get("SACKWIN", "") not in ("", "0")
 sackwin_run = 0
+# REORDER=p:k delays a data frame in LOSSDIR, with probability p, by k
+# frame times at the bottleneck rate: it arrives after the k frames sent
+# behind it, as on paths that spread a flow over several links or queues.
+reorder = [float(x) for x in os.environ.get("REORDER", "").split(":") if x]
 
 sa = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sa.bind(("127.0.0.1", la))
@@ -106,8 +110,8 @@ def report(tag="NT relay"):
     parts = []
     for d in ("ab", "ba"):
         s = stats[d]
-        parts.append("%s in %d out %d lost %d qdrop %d %.1f Mbit/s" % (
-            d, s["in"], s["out"], s["lost"], s["qdrop"],
+        parts.append("%s in %d out %d lost %d qdrop %d reord %d %.1f Mbit/s" % (
+            d, s["in"], s["out"], s["lost"], s["qdrop"], s.get("reordered", 0),
             s["bytes"] * 8 / max(t, 1e-3) / 1e6))
     print("%s t=%.0f %s" % (tag, t, " | ".join(parts)), flush=True)
 
@@ -224,7 +228,13 @@ while True:
                 continue
             free_at[d] = begin + len(data) * 8 / rate
             seq += 1
-            heapq.heappush(heap, (free_at[d] + delay, seq, out, dest, data, d))
+            extra = 0.0
+            if reorder and (lossdir == "both" or lossdir == d) \
+                    and len(data) > 100 and random.random() < reorder[0]:
+                extra = reorder[1] * 1514 * 8 / rate
+                stats[d]["reordered"] = stats[d].get("reordered", 0) + 1
+            heapq.heappush(heap, (free_at[d] + delay + extra, seq, out, dest,
+                data, d))
     while heap and heap[0][0] <= now:
         _, _, out, dest, data, d = heapq.heappop(heap)
         try:
