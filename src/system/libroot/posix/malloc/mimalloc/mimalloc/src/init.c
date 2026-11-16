@@ -213,7 +213,9 @@ mi_threadid_t _mi_thread_id(void) mi_attr_noexcept {
 }
 
 // the theap belonging to the main heap
+#if !defined(MI_HAIKU_LIBROOT)
 mi_decl_hidden mi_decl_thread mi_theap_t* __mi_theap_main = NULL;
+#endif
 
 #if MI_TLS_MODEL_THREAD_LOCAL
 // the thread-local main theap for allocation

@@ -1,0 +1,161 @@
+mimalloc as libroot's allocator (experimental, off by default)
+==============================================================
+
+This directory holds mimalloc 3.2.8 (the copy WebKit bundles in
+Source/bmalloc/mimalloc, MIT license, see mimalloc/LICENSE) and the glue that
+makes it the malloc() of libroot.so. The default allocator stays the OpenBSD
+one in ../openbsd. Background and measurements: airos-works/haiku#75.
+
+
+Building
+--------
+
+Set, for example in the build directory's UserBuildConfig:
+
+	HAIKU_LIBROOT_MALLOC = mimalloc ;
+
+That builds mimalloc with overcommitted arenas (see "Memory accounting"
+below), the mode chosen for air/OS. HAIKU_LIBROOT_MALLOC = mimalloc-strict
+builds it with strict accounting instead. Without the setting libroot.so is
+the same file as before, byte for byte.
+
+jam does not notice that the switch changed. After changing it, remove
+libroot.so from the build directory
+(objects/haiku/<arch>/release/system/libroot/libroot.so) and build again.
+libroot_debug.so is not affected: it keeps its debug heaps.
+
+Only 64 bit targets (x86_64, arm64): the glue reads the thread pointer with
+__builtin_thread_pointer(), and mimalloc needs C11 atomics, which rules out
+the gcc2 half of an x86_gcc2 hybrid.
+
+
+What is where
+-------------
+
+libroot_malloc.c
+	The malloc() family (malloc, calloc, realloc, free, posix_memalign,
+	aligned_alloc, memalign, valloc, malloc_usable_size) and the hooks
+	libroot calls: __init_heap, __heap_thread_init, __heap_thread_exit,
+	__heap_before_fork, __heap_after_fork_parent, __heap_after_fork_child,
+	__heap_terminate_after. It includes all of mimalloc (mimalloc/src/static.c)
+	and is compiled with hidden visibility: libroot exports exactly the
+	symbols it exported before, minus the OpenBSD allocator's private page
+	allocator (__allocate_pages and friends). No mi_*() function is exported,
+	so an application that brings its own mimalloc keeps using its own.
+
+mimalloc/src/prim/haiku/prim.c
+	The operating system primitives. (mimalloc's own unix/prim.c is what an
+	application's copy of mimalloc uses on Haiku.)
+
+mimalloc/
+	The imported sources. Changes against the import are all marked with
+	MI_HAIKU_LIBROOT or a "haiku:" comment:
+	- include/mimalloc/prim.h, src/init.c, src/threadlocal.c, src/options.c:
+	  no ELF thread local storage; the per thread pointers live in four
+	  fixed TLS slots (see "Thread local storage").
+	- src/prim/prim.c: selects haiku/prim.c.
+	- src/alloc.c: no weak fallback for std::get_new_handler(). As a hidden
+	  symbol it took libroot's real one out of the exports.
+	- src/page.c: a purge that is due runs with the next allocation that
+	  leaves the fast path.
+	- src/arena.c: a visit of all arenas no longer forgets purges that are
+	  not due yet (upstream bug: after that only a forced collection returned
+	  the memory). Everything waiting for a purge is purged at once when
+	  more than 32 MiB were scheduled since the last purge (see "Memory
+	  return").
+
+
+Design notes
+------------
+
+Thread local storage. ELF TLS in libroot goes through the runtime loader,
+which allocates the blocks on first use and frees them at thread exit before
+libroot's heap hook runs. The allocator uses kernel TLS slots instead: one
+load from the thread pointer, no initialisation, valid for the whole life of
+the thread and inherited by fork(). The default heap is in TLS_MALLOC_SLOT,
+the slot the OpenBSD allocator uses as well. The other three (the cached
+heap, the main heap's thread heap, mimalloc's thread locals) are the first
+three slots tls_allocate() hands out, TLS_FIRST_FREE_SLOT and the two after
+it: __init_heap() allocates them before anything else in the process can
+and stops in the debugger if it does not get exactly those, so that they
+are constants in the allocator's code. tls.h stays unchanged, and with it
+the kernel and the rest of libroot; tls_allocate() has three slots fewer to
+hand out (of TLS_MAX_KEYS, 64).
+__heap_thread_init() stores mimalloc's empty heap in the slots:
+mimalloc's "slot starts as NULL" model crashed in realloc() when that was
+the first call of a thread.
+
+Memory accounting. The kernel does not overcommit ordinary areas. Two modes
+(see prim.c):
+- overcommit (HAIKU_LIBROOT_MALLOC = mimalloc, the air/OS choice, as on
+  Linux): arenas are mapped read/write with MAP_NORESERVE. The
+  kernel commits each page when it is first touched and releases it on
+  MADV_FREE. No system call to commit, and fork() is as fast as before. When
+  memory runs out the touch fails (the program crashes) where malloc() would
+  have returned NULL.
+- strict (HAIKU_LIBROOT_MALLOC = mimalloc-strict, or
+  MIMALLOC_HAIKU_OVERCOMMIT=0 in a program's environment): arenas are
+  reserved PROT_NONE and committed with mprotect(). malloc() returns NULL
+  when memory runs out, but the areas get a protection per page: fork() of a 256 MiB heap took 20 ms instead of 2 ms
+  (5.5 ms with a kernel change that write-protects runs of pages at once,
+  which is not on master: overcommit mode does not need it, its areas have
+  one protection).
+
+Arena size. Address space is reserved 64 MiB at a time, not 1 GiB: in strict
+mode the kernel allocates 4 bits per page of an area with mixed protections
+(128 KiB per GiB, in every team).
+
+Memory return. Freed pages are given back with MADV_FREE one second after
+they became free (mimalloc's purge delay), when the next allocation leaves
+the fast path or the next page becomes free; there is no timer. Pages freed
+and reused within the delay are not given back and faulted in again, which
+is where much of the speed comes from. To bound what a program keeps when
+it frees a lot and then goes idle, everything that waits for a purge is
+given back at once when more than 32 MiB (MI_HAIKU_PURGE_PENDING_MAX) were
+scheduled since the last purge. So an idle program keeps less than 32 MiB of
+freed memory, plus at most one empty page per size class and thread
+(mimalloc's "retired" pages) and the free space in partly used pages.
+Measured on the X399 (team's resident memory after freeing everything,
+idle for 2 s; the OpenBSD allocator in brackets):
+	256 MiB in 1 KiB blocks:    6.5 MiB (11.0)
+	200 MiB in 256 KiB blocks: 20.4 MiB (5.1)
+	24 MiB in 1 KiB blocks:    24.9 MiB (1.3)
+The next allocation off the fast path brings the last two down to 1.7 and
+0.5 MiB. MIMALLOC_PURGE_DELAY=0 returns memory at once, at a cost.
+
+fork(). The hooks take mimalloc's eight locks before the fork and release
+them in the parent; the child sets them up again. The heaps of the threads
+that do not exist in the child stay as they were: their blocks are valid and
+can be freed, but that memory is not reused in the child.
+
+Environment. mimalloc's MIMALLOC_* variables work (MIMALLOC_VERBOSE=1,
+MIMALLOC_SHOW_STATS=1, MIMALLOC_PURGE_DELAY=<ms>, ...).
+
+
+Known differences and open points
+---------------------------------
+
+- malloc(n) with n <= 8 returns memory aligned to 8 bytes (16 for everything
+  larger). The OpenBSD allocator aligns everything to 16.
+- No detection of invalid frees, no canaries, no junk filling: the OpenBSD
+  allocator aborts on a pointer it does not know; mimalloc (built with
+  MI_SECURE=0, no debug) may corrupt its lists instead. libroot_debug.so
+  remains the tool for that.
+- A thread that is killed (kill_thread()) does not run the exit hook: its
+  heap and pages stay assigned to it for the life of the team. Blocks in
+  them can be freed by other threads, but that memory is never reused.
+  Measured: threads that allocate 200 blocks of 16 B to 300 KB, free half
+  and leave the rest to the main thread to free; after 500 rounds the team
+  holds 1.1 MiB more per killed thread (the OpenBSD allocator: 114 KiB, not
+  looked into); for threads that return, neither allocator grows.
+  Taking the dead thread's heap over from another thread is not safe in
+  general: kill_thread() can stop a thread anywhere, also in the middle of
+  the allocator. In the servers kill_thread() is an error path (a thread
+  that could not be resumed, a registrar helper still running at shutdown);
+  some applications end helper threads with it (Magnify, SoundRecorder,
+  Expander, ProcessController, Cortex's media nodes). A program that kills
+  threads in a loop grows by about the size of each killed thread's pages.
+- No strong random source at start (mimalloc's free list encoding is off
+  with MI_SECURE=0, so this only seeds its heap tags).
+- arm64: builds; a minimum image booted under QEMU (11 Nov). Not run on
+  arm64 hardware yet.

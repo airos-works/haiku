@@ -1156,6 +1156,18 @@ void _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx) {
 static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_t slices);
 static void mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subproc, size_t tseq);
 
+#if defined(MI_HAIKU_LIBROOT)
+// haiku: Freed memory is given back after the purge delay, but only when the
+// program calls into the allocator again: libroot has no timer for it. To
+// bound what a program keeps after a burst of frees (and then goes idle),
+// everything that waits for a purge is given back at once when more than
+// MI_HAIKU_PURGE_PENDING_MAX bytes have been scheduled since the last purge.
+#ifndef MI_HAIKU_PURGE_PENDING_MAX
+#define MI_HAIKU_PURGE_PENDING_MAX  (32 * MI_MiB)
+#endif
+static _Atomic(size_t) mi_haiku_purge_pending;  // slices scheduled since the last purge (an estimate)
+#endif
+
 void _mi_arenas_free(void* p, size_t size, mi_memid_t memid) {
   if (p==NULL) return;
   if (size==0) return;
@@ -1211,6 +1223,19 @@ void _mi_arenas_free(void* p, size_t size, mi_memid_t memid) {
 
   // try to purge expired decommits
   // mi_arenas_try_purge(false, false, NULL);
+
+  #if defined(MI_HAIKU_LIBROOT)
+  // haiku: too much is waiting for a purge; give it all back now (the slices
+  // freed above included)
+  if mi_unlikely(memid.memkind == MI_MEM_ARENA
+                 && mi_atomic_load_relaxed(&mi_haiku_purge_pending) >= MI_HAIKU_PURGE_PENDING_MAX / MI_ARENA_SLICE_SIZE) {
+    mi_atomic_store_relaxed(&mi_haiku_purge_pending, (size_t)0);
+    size_t slice_index_unused;
+    size_t slice_count_unused;
+    mi_arena_t* arena = mi_arena_from_memid(memid, &slice_index_unused, &slice_count_unused);
+    if (arena != NULL) { mi_arenas_try_purge(true /* force */, true /* visit all */, arena->subproc, 0); }
+  }
+  #endif
 }
 
 // Purge the arenas; if `force_purge` is true, amenable parts are purged even if not yet expired
@@ -1906,6 +1931,9 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
       // already an expiration was set
     }
     mi_bitmap_setN(arena->slices_purge, slice_index, slice_count, NULL);
+    #if defined(MI_HAIKU_LIBROOT)
+    mi_atomic_add_relaxed(&mi_haiku_purge_pending, slice_count);
+    #endif
   }
 }
 
@@ -2004,6 +2032,7 @@ static void mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subpro
     size_t max_purge_count = (visit_all ? max_arena : (max_arena/4)+1);
     bool all_visited = true;
     bool any_purged = false;
+    mi_msecs_t pending_expire = 0;  // haiku: the earliest purge that is scheduled but not due yet
     for (size_t _i = 0; _i < max_arena; _i++) {
       size_t i = _i + arena_start;
       if (i >= max_arena) { i -= max_arena; }
@@ -2017,10 +2046,25 @@ static void mi_arenas_try_purge(bool force, bool visit_all, mi_subproc_t* subpro
           }
           max_purge_count--;
         }
+        else {
+          const mi_msecs_t expire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
+          if (expire != 0 && (pending_expire == 0 || expire < pending_expire)) { pending_expire = expire; }
+        }
       }
     }
+    #if defined(MI_HAIKU_LIBROOT)
+    if (all_visited && pending_expire == 0) {
+      // haiku: nothing waits for a purge any more
+      mi_atomic_store_relaxed(&mi_haiku_purge_pending, (size_t)0);
+    }
+    #endif
     if (all_visited && !any_purged) {
-      mi_atomic_storei64_release(&subproc->purge_expire, 0);
+      // haiku: Do not forget the purges that are not due yet. A visit of all
+      // arenas (a thread exits, say) right after a burst of frees used to
+      // clear the global expiration; the arenas kept theirs, so that nothing
+      // set the global one again, and the memory was only returned by a
+      // forced collection.
+      mi_atomic_storei64_release(&subproc->purge_expire, pending_expire);
     }
   }
 }

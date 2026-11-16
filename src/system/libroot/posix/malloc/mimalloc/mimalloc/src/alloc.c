@@ -601,7 +601,7 @@ static bool mi_try_new_handler(bool nothrow) {
 #else
 typedef void (*std_new_handler_t)(void);
 
-#if (defined(__GNUC__) || (defined(__clang__) && !defined(_MSC_VER)))  // exclude clang-cl, see issue #631
+#if (defined(__GNUC__) || (defined(__clang__) && !defined(_MSC_VER))) && !defined(MI_HAIKU_LIBROOT)  // exclude clang-cl, see issue #631; libroot: the mi_new functions are unused, and a (hidden) definition here would take std::get_new_handler() out of libroot's exports
 std_new_handler_t __attribute__((weak)) _ZSt15get_new_handlerv(void) {
   return NULL;
 }
