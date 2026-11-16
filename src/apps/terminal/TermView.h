@@ -50,6 +50,7 @@ class ShellParameters;
 class Shell;
 class TermDragAndDrop;
 class TermFileTransfer;
+class TermAccessible;
 class TermRenderer;
 
 
@@ -356,9 +357,12 @@ private:
 			void				_SetPointerShape(const char* shape);
 
 private:
+	friend class TermAccessible;
+
 			Listener*			fListener;
 			Shell*				fShell;
 			Terminal*			fTerminal;
+			TermAccessible*		fAccessible;
 
 			thread_id			fReaderThread;
 			std::atomic<bool>	fReaderQuit;
