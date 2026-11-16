@@ -570,6 +570,8 @@ TCPEndpoint::TCPEndpoint(net_socket* socket)
 	fHighRetransmitted(0),
 	fRoute(NULL),
 	fReceiveNext(0),
+	fDuplicateSackLeft(0),
+	fDuplicateSackRight(0),
 	fReceiveMaxAdvertised(0),
 	fReceiveWindow(socket->receive.buffer_size),
 	fReceiveMaxSegmentSize(TCP_DEFAULT_MAX_SEGMENT_SIZE),
@@ -603,6 +605,14 @@ TCPEndpoint::TCPEndpoint(net_socket* socket)
 	fCubicEstimate(0),
 	fCubicRemainder(0),
 	fCongestionWindowLimited(false),
+	fUndoRetransmits(-1),
+	fUndoMarker(0),
+	fUndoCongestionWindow(0),
+	fUndoSlowStartThreshold(0),
+	fUndoCubicMaxWindow(0),
+	fUndoCubicOrigin(0),
+	fUndoCubicK(0),
+	fUndoCubicEpochStart(0),
 	fHystartRoundEnd(0),
 	fHystartLastMinimum(UINT32_MAX),
 	fHystartMinimum(UINT32_MAX),
@@ -1762,7 +1772,11 @@ TCPEndpoint::_DuplicateAcknowledge(tcp_segment_header &segment)
 	// fSendMax: leaving fSendNext at fSendMax stopped that resend until the
 	// next timeout, as the window then counted everything up to fSendMax as
 	// in flight - chains of 200 ms stalls (airos-works/haiku#125).
+	// Only then: when fSendNext was at fSendMax, putting it back behind the
+	// new data just sent made the next send repeat that data, two segments
+	// resent for nothing at every reordering (#113).
 	const tcp_sequence sendNext = fSendNext;
+	const bool resending = fSendNext < fSendMax;
 
 	if (++fDuplicateAcknowledgeCount < 3) {
 		if (fSendQueue.Available(fSendMax) != 0 && fSendWindow != 0) {
@@ -1771,7 +1785,7 @@ TCPEndpoint::_DuplicateAcknowledge(tcp_segment_header &segment)
 			_SendQueued();
 			TRACE("_DuplicateAcknowledge(): packet sent under limited transmit on receipt of dup ack");
 			fCongestionWindow -= fDuplicateAcknowledgeCount * fSendMaxSegmentSize;
-			if (sendNext < fSendNext)
+			if (resending && sendNext < fSendNext)
 				fSendNext = sendNext;
 		}
 	}
@@ -1800,6 +1814,7 @@ TCPEndpoint::_DuplicateAcknowledge(tcp_segment_header &segment)
 					<= 4 * fSendMaxSegmentSize)) {
 			fFlags |= FLAG_RECOVERY;
 			NET_STAT_INC(gStackModule, tcp_fast_recoveries);
+			_SaveForUndo();
 			fRecover = fSendMax - 1;
 			fSlowStartThreshold = _CubicCongestionEvent(fPreviousFlightSize);
 			const bool sack = (fFlags & FLAG_OPTION_SACK_PERMITTED) != 0;
@@ -1855,7 +1870,8 @@ TCPEndpoint::_DuplicateAcknowledge(tcp_segment_header &segment)
 		if (fSendQueue.Available(fSendMax) != 0) {
 			fSendNext = fSendMax;
 			_SendQueued();
-			if ((fFlags & FLAG_RECOVERY) == 0 && sendNext < fSendNext)
+			if ((fFlags & FLAG_RECOVERY) == 0 && resending
+				&& sendNext < fSendNext)
 				fSendNext = sendNext;
 		}
 	}
@@ -2136,6 +2152,77 @@ TCPEndpoint::_InitRecoveryMarks(tcp_sequence initial)
 	fFirstHoleResentBefore = initial;
 	fLastHoleResentBefore = initial;
 	fHystartRoundEnd = initial;
+}
+
+
+/*!	Before fast recovery cuts the window: remembers it, so that it can be
+	restored when every resend turns out to have been unnecessary. When an
+	earlier recovery still waits for its D-SACKs, the older, larger window
+	is kept, and both are undone together.
+*/
+void
+TCPEndpoint::_SaveForUndo()
+{
+	if (fUndoRetransmits > 0) {
+		if (fUndoCongestionWindow < fCongestionWindow)
+			fUndoCongestionWindow = fCongestionWindow;
+		return;
+	}
+
+	fUndoRetransmits = 0;
+	fUndoMarker = fSendUnacknowledged;
+	fUndoCongestionWindow = fCongestionWindow;
+	fUndoSlowStartThreshold = fSlowStartThreshold;
+	fUndoCubicMaxWindow = fCubicMaxWindow;
+	fUndoCubicOrigin = fCubicOrigin;
+	fUndoCubicK = fCubicK;
+	fUndoCubicEpochStart = fCubicEpochStart;
+}
+
+
+/*!	A D-SACK (RFC 2883: a first block below the cumulative ACK, or inside
+	the second block) reports data the peer got twice. Once all that fast
+	recovery resent came back that way, nothing was lost: the path had
+	reordered the segments, and the window is restored (RFC 3708, Linux's
+	tcp_try_undo_dsack()). Without this, every reordering cut the window
+	by 30% for good: 3 s instead of 1 s for 10 MB at 0.5% reordering.
+*/
+void
+TCPEndpoint::_CheckDuplicateSack(const tcp_segment_header& segment)
+{
+	if (segment.sackCount == 0 || fUndoRetransmits <= 0)
+		return;
+
+	tcp_sequence left = segment.sacks[0].left_edge;
+	tcp_sequence right = segment.sacks[0].right_edge;
+	if (!(left < right))
+		return;
+	bool duplicate = right <= tcp_sequence(segment.acknowledge);
+	if (!duplicate && segment.sackCount > 1) {
+		duplicate = !(left < tcp_sequence(segment.sacks[1].left_edge))
+			&& !(tcp_sequence(segment.sacks[1].right_edge) < right);
+	}
+	if (!duplicate || left < fUndoMarker)
+		return;
+
+	uint32 segmentSize = fSendMaxSegmentSize > 40
+		? fSendMaxSegmentSize - 40 : fSendMaxSegmentSize;
+	int32 segments = ((right - left).Number() + segmentSize - 1)
+		/ segmentSize;
+	fUndoRetransmits -= max_c(segments, (int32)1);
+	if (fUndoRetransmits > 0)
+		return;
+
+	fUndoRetransmits = -1;
+	NET_STAT_INC(gStackModule, tcp_recovery_undos);
+	if (fCongestionWindow < fUndoCongestionWindow)
+		fCongestionWindow = fUndoCongestionWindow;
+	if (fSlowStartThreshold < fUndoSlowStartThreshold)
+		fSlowStartThreshold = fUndoSlowStartThreshold;
+	fCubicMaxWindow = fUndoCubicMaxWindow;
+	fCubicOrigin = fUndoCubicOrigin;
+	fCubicK = fUndoCubicK;
+	fCubicEpochStart = fUndoCubicEpochStart;
 }
 
 
@@ -2780,7 +2867,16 @@ TCPEndpoint::_Receive(tcp_segment_header& segment, net_buffer* buffer)
 				fReceiveWindow)) {
 			TRACE("  Receive(): segment out of window, next: %" B_PRIu32
 				" wnd: %" B_PRIu32, fReceiveNext.Number(), fReceiveWindow);
-			if (segmentLength > 0)
+			if (segmentLength > 0 && (segment.flags & TCP_FLAG_RESET) == 0
+				&& fState >= ESTABLISHED
+				&& tcp_sequence(segment.sequence + segmentLength)
+					<= fReceiveNext) {
+				// data we have already: the ACK tells the sender with a
+				// D-SACK (RFC 2883), so that it can undo the window
+				// reduction of a spurious retransmission (RFC 3708)
+				fDuplicateSackLeft = segment.sequence;
+				fDuplicateSackRight = segment.sequence + segmentLength;
+			} else if (segmentLength > 0)
 				NET_STAT_INC(gStackModule, tcp_out_of_window_drops);
 			if ((segment.flags & TCP_FLAG_RESET) != 0) {
 				// TODO: this doesn't look right - review!
@@ -2984,8 +3080,10 @@ TCPEndpoint::_Receive(tcp_segment_header& segment, net_buffer* buffer)
 		// retransmit, a retransmit timeout instead, in half of the uploads
 		// to a server 24 ms away (#113).
 		bool reported = false;
-		if ((segment.options & TCP_HAS_SACK) != 0)
+		if ((segment.options & TCP_HAS_SACK) != 0) {
+			_CheckDuplicateSack(segment);
 			reported = _UpdateScoreboard(segment);
+		}
 
 		if (segment.acknowledge == fSendUnacknowledged) {
 			if (buffer->size == 0
@@ -3292,15 +3390,29 @@ TCPEndpoint::_PrepareSendSegment()
 				segment.options |= TCP_SACK_PERMITTED;
 		}
 
-		if (!fReceiveQueue.IsContiguous()
+		const bool duplicate = fDuplicateSackLeft < fDuplicateSackRight
+			&& (fFlags & FLAG_OPTION_SACK_PERMITTED) != 0;
+		if ((!fReceiveQueue.IsContiguous() || duplicate)
 				&& (fFlags & FLAG_OPTION_SACK_PERMITTED) != 0) {
 			segment.options |= TCP_HAS_SACK;
 			int maxSackCount = MAX_SACK_BLKS
 				- (((fFlags & FLAG_OPTION_TIMESTAMP) != 0) ? 1 : 0);
 			memset(segment.sacks, 0, sizeof(segment.sacks));
-			segment.sackCount = fReceiveQueue.PopulateSackInfo(fReceiveNext,
-				maxSackCount, segment.sacks);
+			int first = 0;
+			if (duplicate) {
+				// the D-SACK goes first (RFC 2883 4)
+				segment.sacks[0].left_edge = htonl(fDuplicateSackLeft.Number());
+				segment.sacks[0].right_edge
+					= htonl(fDuplicateSackRight.Number());
+				first = 1;
+			}
+			segment.sackCount = first;
+			if (!fReceiveQueue.IsContiguous()) {
+				segment.sackCount += fReceiveQueue.PopulateSackInfo(
+					fReceiveNext, maxSackCount - first, segment.sacks + first);
+			}
 		}
+		fDuplicateSackLeft = fDuplicateSackRight;
 	}
 
 	size_t availableBytes = fReceiveQueue.Free();
@@ -3332,6 +3444,9 @@ TCPEndpoint::_PrepareAndSend(tcp_segment_header& segment, net_buffer* buffer,
 {
 	LocalAddress().CopyTo(buffer->source);
 	PeerAddress().CopyTo(buffer->destination);
+
+	if (isRetransmit && fUndoRetransmits >= 0 && buffer->size > 0)
+		fUndoRetransmits++;
 
 	uint32 size = buffer->size, segmentLength = size;
 	segment.sequence = fSendNext.Number();
@@ -3915,9 +4030,15 @@ TCPEndpoint::_Acknowledged(tcp_segment_header& segment)
 			} else if ((fFlags & FLAG_OPTION_SACK_PERMITTED) != 0) {
 				// a partial acknowledgement with SACK: the window stays at
 				// ssthresh, the pipe says what can go (RFC 6675)
-				if (!(fSendUnacknowledged < fHighRetransmitted)
-					&& !_RetransmitNextHole())
-					_ResendFirstUnacknowledged();
+				// Only what the scoreboard shows lost is resent (RFC 6675
+				// NextSeg()). Resending the first unacknowledged segment
+				// when it named no hole, as NewReno does, resent a whole
+				// window one segment per ACK after a reordering had started
+				// recovery: data the peer had, reported back as D-SACKs,
+				// and recovery after recovery cut the window to a
+				// crawl (#113).
+				if (!(fSendUnacknowledged < fHighRetransmitted))
+					_RetransmitNextHole();
 				fSendNext = fSendMax;
 				_RecoverySend();
 			} else {
@@ -4035,6 +4156,9 @@ TCPEndpoint::_Retransmit()
 			return;
 		}
 	}
+
+	// a timeout is not undone
+	fUndoRetransmits = -1;
 
 	// Synchronized states give up once the peer has not acknowledged
 	// anything for the user timeout (RFC 1122 4.2.3.5 R2, RFC 5482). The

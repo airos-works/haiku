@@ -152,6 +152,8 @@ private:
 			void		_NoteFirstHoleResent();
 			bool		_ResendFirstUnacknowledged();
 			void		_InitRecoveryMarks(tcp_sequence initial);
+			void		_SaveForUndo();
+			void		_CheckDuplicateSack(const tcp_segment_header& segment);
 
 	static	void		_TimeWaitTimer(net_timer* timer, void* _endpoint);
 	static	void		_RetransmitTimer(net_timer* timer, void* _endpoint);
@@ -225,6 +227,9 @@ private:
 		// (the latter will automatically adapt to routing changes)
 
 	tcp_sequence	fReceiveNext;
+	tcp_sequence	fDuplicateSackLeft;
+	tcp_sequence	fDuplicateSackRight;
+		// a duplicate segment the next ACK reports (RFC 2883); empty: none
 	tcp_sequence	fReceiveMaxAdvertised;
 	uint32			fReceiveWindow;
 	uint32			fReceiveMaxSegmentSize;
@@ -282,6 +287,17 @@ private:
 	uint64			fCubicRemainder;
 	bool			fCongestionWindowLimited;
 		// the last send left data waiting for the congestion window
+
+	// undoing a window reduction that D-SACKs show was spurious (RFC 3708)
+	int32			fUndoRetransmits;
+		// resends not yet reported as duplicates; -1: nothing to undo
+	tcp_sequence	fUndoMarker;
+	uint32			fUndoCongestionWindow;
+	uint32			fUndoSlowStartThreshold;
+	uint32			fUndoCubicMaxWindow;
+	uint32			fUndoCubicOrigin;
+	uint32			fUndoCubicK;
+	bigtime_t		fUndoCubicEpochStart;
 
 	// HyStart++ (RFC 9406) in the first slow start; RTTs in ms
 	tcp_sequence	fHystartRoundEnd;

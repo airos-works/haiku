@@ -81,6 +81,9 @@ typedef struct net_protocol_stats {
 		// data segments outside the receive window
 	uint64	tcp_out_of_order_drops;
 		// out-of-order segments over the queue's buffer limit
+
+	uint64	tcp_recovery_undos;
+		// fast recoveries undone: D-SACKs showed every resend unnecessary
 } net_protocol_stats;
 
 #define NET_STAT_SYSCALLS				"network/stats"
