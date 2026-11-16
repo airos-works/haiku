@@ -24,12 +24,18 @@
 #include <AccessibilityPrivate.h>
 #include <AccessibilityProtocol.h>
 
+#include <algorithm>
 #include <map>
 #include <new>
+#include <typeinfo>
+#include <vector>
 
 #include <ctype.h>
+#include <cxxabi.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <Alert.h>
@@ -116,11 +122,49 @@ static EntryMap sEntries;
 static IDMap sIDs;
 static StringMap sNames;
 static StringMap sDescriptions;
+static StringMap sConfirmations;
 static AttachMap sAttached;
 static int32 sNextID = kAppRootID + 1;
 
 static BMessenger sServer;
 static BLooper* sBridge = NULL;
+
+// Set by the bridge thread while it handles a request that carries
+// "agent": the messages of the controls it invokes get "be:agent".
+static bool sAgentRequest = false;
+
+
+// What custom views drew with DrawString(), kept only while an assistive
+// technology runs: the text of views the Interface Kit does not know.
+struct DrawnString {
+	BPoint	where;
+	BString	text;
+	uint32	pass;
+};
+typedef std::vector<DrawnString> DrawnList;
+
+/*!	The strings of one view. Each Draw() is a pass: when it ends, a string
+	it did not draw again is gone if it lay in the update rect - or if the
+	pass drew outside the update rect too, which views that always draw
+	everything do (their update rect may only be the visible part).
+*/
+struct DrawnView {
+	DrawnList	strings;
+	uint32		pass;
+	BRect		updateRect;
+	bool		drawing;
+	bool		drewOutside;
+	bool		requested;
+
+	DrawnView() : pass(0), drawing(false), drewOutside(false),
+		requested(false) {}
+};
+typedef std::map<const BView*, DrawnView> DrawnMap;
+
+static const int32 kMaxDrawnStrings = 400;
+static const int32 kMaxDrawnStringLength = 512;
+static BLocker sDrawnLock("accessibility drawn text");
+static DrawnMap sDrawn;
 
 
 // Destroyed before the registry above: views deleted during static
@@ -221,6 +265,37 @@ object_registry_id(BAccessible* object)
 	if (id == 0)
 		id = register_object(ENTRY_OBJECT, object, host->Window());
 	return id;
+}
+
+
+/*!	The window a view belongs to; for a closed submenu (or the menu of a
+	menu field), the window of the menu it hangs off.
+*/
+static BWindow*
+owner_window(BView* view)
+{
+	if (view->Window() != NULL)
+		return view->Window();
+	if (BMenu* menu = dynamic_cast<BMenu*>(view)) {
+		for (BMenu* super = menu->Supermenu(); super != NULL;
+				super = super->Supermenu()) {
+			if (super->Window() != NULL)
+				return super->Window();
+		}
+	}
+	return NULL;
+}
+
+
+//!	The menu whose items are the virtual children of a view.
+static BMenu*
+item_menu(BView* view)
+{
+	if (BMenu* menu = dynamic_cast<BMenu*>(view))
+		return menu;
+	if (BMenuField* field = dynamic_cast<BMenuField*>(view))
+		return field->Menu();
+	return NULL;
 }
 
 
@@ -491,7 +566,7 @@ count_items(BView* view)
 {
 	if (BListView* list = dynamic_cast<BListView*>(view))
 		return list->CountItems();
-	if (BMenu* menu = dynamic_cast<BMenu*>(view))
+	if (BMenu* menu = item_menu(view))
 		return menu->CountItems();
 	if (BTabView* tabView = dynamic_cast<BTabView*>(view))
 		return tabView->CountTabs();
@@ -499,12 +574,147 @@ count_items(BView* view)
 }
 
 
-static bool
-describe_item(BView* view, int32 index, BMessage& node)
+// #pragma mark - drawn text
+
+
+static void
+join_drawn_text(std::vector<DrawnString>& strings, BString& text)
 {
-	int32 registryID = register_object(ENTRY_VIEW, view, view->Window());
+	struct ByLine {
+		bool operator()(const DrawnString& a, const DrawnString& b) const
+		{
+			if (fabsf(a.where.y - b.where.y) > 2)
+				return a.where.y < b.where.y;
+			return a.where.x < b.where.x;
+		}
+	};
+	std::stable_sort(strings.begin(), strings.end(), ByLine());
+
+	float lineY = 0;
+	for (size_t i = 0; i < strings.size(); i++) {
+		if (i == 0 || fabsf(strings[i].where.y - lineY) > 2) {
+			if (i > 0)
+				text << "\n";
+			lineY = strings[i].where.y;
+		} else
+			text << " ";
+		text << strings[i].text;
+		if (text.Length() > kMaxValueLength) {
+			text.Truncate(kMaxValueLength);
+			break;
+		}
+	}
+}
+
+
+static void
+collect_drawn_text(BView* view, BView* host, const BRect* within,
+	std::vector<DrawnString>& strings, int32 depth)
+{
+	{
+		BAutolock locker(sDrawnLock);
+		DrawnMap::iterator found = sDrawn.find(view);
+		if (found != sDrawn.end()) {
+			for (size_t i = 0; i < found->second.strings.size(); i++) {
+				DrawnString entry = found->second.strings[i];
+				if (view != host && view->Window() != NULL) {
+					entry.where = host->ConvertFromScreen(
+						view->ConvertToScreen(entry.where));
+				}
+				if (within == NULL || within->Contains(entry.where))
+					strings.push_back(entry);
+			}
+		}
+	}
+	if (depth <= 0)
+		return;
+	for (int32 i = 0; i < view->CountChildren(); i++) {
+		BView* child = view->ChildAt(i);
+		if (!child->IsHidden(child))
+			collect_drawn_text(child, host, within, strings, depth - 1);
+	}
+}
+
+
+/*!	The text a view drew (and, with \a subtree, its child views), line
+	by line; only what lies in \a within (view coordinates) if given.
+*/
+static BString
+drawn_text(BView* view, const BRect* within = NULL, bool subtree = false)
+{
+	std::vector<DrawnString> strings;
+	collect_drawn_text(view, view, within, strings, subtree ? 8 : 0);
+	BString text;
+	join_drawn_text(strings, text);
+	return text;
+}
+
+
+/*!	Whether the text of a view is known. A view that has not drawn since
+	the bridge started is asked to draw once (its window is locked), and
+	its node says "drawn_pending" so the client can read it again shortly.
+*/
+static bool
+drawn_text_pending(BView* view)
+{
+	{
+		BAutolock locker(sDrawnLock);
+		DrawnView& drawn = sDrawn[view];
+		if (drawn.requested || !drawn.strings.empty())
+			return false;
+		drawn.requested = true;
+	}
+	gAccessibilityViewData = true;
+		// ~BView() must forget the view
+	view->Invalidate();
+	if (view->Window() != NULL)
+		view->Window()->Flush();
+	return true;
+}
+
+
+//!	The C++ class of a view, for views the Interface Kit does not know.
+static BString
+class_name(const std::type_info& type)
+{
+	BString name;
+	int status = 0;
+	char* demangled = abi::__cxa_demangle(type.name(), NULL, NULL, &status);
+	if (status == 0 && demangled != NULL)
+		name = demangled;
+	else
+		name = type.name();
+	free(demangled);
+	return name;
+}
+
+
+//!	The text of a list item: a BStringItem's, or what the list drew there.
+static BString
+list_item_text(BListView* list, int32 index)
+{
+	BListItem* item = list->ItemAt(index);
+	if (BStringItem* stringItem = dynamic_cast<BStringItem*>(item))
+		return BString(stringItem->Text());
+	if (item == NULL || list->Window() == NULL)
+		return BString();
+	BRect frame = list->ItemFrame(index);
+	BString text = drawn_text(list, &frame);
+	text.ReplaceAll("\n", " ");
+	return text;
+}
+
+
+static bool
+describe_item(BView* view, int32 index, BMessage& node, int32 depth = 0)
+{
+	if (depth < -kMaxDepth)
+		return false;
+	BWindow* window = owner_window(view);
+	int32 registryID = register_object(ENTRY_VIEW, view, window);
 	int64 id = make_id(registryID, index + 1);
 	int64 parent = make_id(registryID);
+	BMenu* submenu = NULL;
 	int32 count = count_items(view);
 	if (index < 0 || index >= count)
 		return false;
@@ -521,8 +731,7 @@ describe_item(BView* view, int32 index, BMessage& node)
 		BOutlineListView* outline = dynamic_cast<BOutlineListView*>(list);
 		role = outline != NULL
 			? B_ACCESSIBLE_ROLE_TREE_ITEM : B_ACCESSIBLE_ROLE_LIST_ITEM;
-		if (BStringItem* stringItem = dynamic_cast<BStringItem*>(item))
-			name = stringItem->Text();
+		name = list_item_text(list, index);
 		if (name.IsEmpty())
 			name.SetToFormat("Item %" B_PRId32, index + 1);
 		states = B_ACCESSIBLE_STATE_SELECTABLE;
@@ -542,8 +751,17 @@ describe_item(BView* view, int32 index, BMessage& node)
 		}
 		frame = list->ConvertToScreen(list->ItemFrame(index));
 		actions |= B_ACCESSIBLE_ACTION_SELECT | B_ACCESSIBLE_ACTION_PRESS;
-	} else if (BMenu* menu = dynamic_cast<BMenu*>(view)) {
+	} else if (BMenu* menu = item_menu(view)) {
 		BMenuItem* item = menu->ItemAt(index);
+		if (item == NULL)
+			return false;
+		// the items of a closed submenu hang off the item that opens it
+		if (menu == view && menu->Supermenu() != NULL
+			&& menu->Superitem() != NULL) {
+			BMenu* super = menu->Supermenu();
+			parent = make_id(register_object(ENTRY_VIEW, super,
+				owner_window(super)), super->IndexOf(menu->Superitem()) + 1);
+		}
 		if (dynamic_cast<BSeparatorItem*>(item) != NULL)
 			role = B_ACCESSIBLE_ROLE_SEPARATOR;
 		else {
@@ -559,8 +777,12 @@ describe_item(BView* view, int32 index, BMessage& node)
 			if (!shortcut.IsEmpty())
 				node.AddString(B_ACCESSIBLE_FIELD_SHORTCUT, shortcut);
 			actions = B_ACCESSIBLE_ACTION_PRESS;
+			submenu = item->Submenu();
 		}
-		frame = menu->ConvertToScreen(item->Frame());
+		if (menu->Window() != NULL)
+			frame = menu->ConvertToScreen(item->Frame());
+		else if (menu != view && view->Window() != NULL)
+			frame = view->ConvertToScreen(view->Bounds());
 	} else if (BTabView* tabView = dynamic_cast<BTabView*>(view)) {
 		role = B_ACCESSIBLE_ROLE_TAB;
 		BTab* tab = tabView->TabAt(index);
@@ -581,7 +803,22 @@ describe_item(BView* view, int32 index, BMessage& node)
 	add_common(node, id, parent, role, name, states, frame, actions);
 	node.AddInt32(B_ACCESSIBLE_FIELD_INDEX, index);
 	node.AddInt32(B_ACCESSIBLE_FIELD_COUNT, count);
-	node.AddInt32(B_ACCESSIBLE_FIELD_CHILD_COUNT, 0);
+
+	// a submenu's items are children of its item, open or not
+	int32 childCount = 0;
+	if (submenu != NULL && window != NULL) {
+		int32 submenuID = register_object(ENTRY_VIEW, submenu, window);
+		childCount = submenu->CountItems();
+		for (int32 i = 0; i < childCount; i++) {
+			node.AddInt64(B_ACCESSIBLE_FIELD_CHILD_IDS, make_id(submenuID, i + 1));
+			if (depth != 0) {
+				BMessage childNode;
+				if (describe_item(submenu, i, childNode, depth - 1))
+					node.AddMessage(B_ACCESSIBLE_FIELD_CHILD, &childNode);
+			}
+		}
+	}
+	node.AddInt32(B_ACCESSIBLE_FIELD_CHILD_COUNT, childCount);
 	return true;
 }
 
@@ -787,9 +1024,10 @@ describe_view(BView* view, int32 sub, BMessage& node, int32 depth)
 		if (list->ListType() == B_MULTIPLE_SELECTION_LIST)
 			states |= B_ACCESSIBLE_STATE_MULTI_SELECTABLE;
 		int32 selected = list->CurrentSelection();
-		if (BStringItem* item
-				= dynamic_cast<BStringItem*>(list->ItemAt(selected))) {
-			node.AddString(B_ACCESSIBLE_FIELD_VALUE, item->Text());
+		if (selected >= 0) {
+			BString text = list_item_text(list, selected);
+			if (!text.IsEmpty())
+				node.AddString(B_ACCESSIBLE_FIELD_VALUE, text);
 		}
 		if (selected >= 0)
 			node.AddInt32(B_ACCESSIBLE_FIELD_INDEX, selected);
@@ -823,6 +1061,31 @@ describe_view(BView* view, int32 sub, BMessage& node, int32 depth)
 	add_common(node, view_id(view), parent_id_of_view(view), role, name,
 		states, frame, actions);
 
+	StringMap::iterator confirmation = sConfirmations.find(view);
+	if (confirmation != sConfirmations.end())
+		node.AddString(B_ACCESSIBLE_FIELD_CONFIRM, confirmation->second);
+
+	if (role == B_ACCESSIBLE_ROLE_UNKNOWN || role == B_ACCESSIBLE_ROLE_GROUP) {
+		// a view the Interface Kit does not know: say what it is and
+		// what it drew
+		const std::type_info& type = typeid(*view);
+		if (type != typeid(BView) && type != typeid(BBox))
+			node.AddString(B_ACCESSIBLE_FIELD_CLASS, class_name(type));
+		if (window != NULL) {
+			if (drawn_text_pending(view))
+				node.AddBool("drawn_pending", true);
+			BString text = drawn_text(view);
+			if (!text.IsEmpty() && text != name)
+				node.AddString(B_ACCESSIBLE_FIELD_DRAWN_TEXT, text);
+		}
+	} else if (BListView* list = dynamic_cast<BListView*>(view)) {
+		// items that draw their own text
+		if (window != NULL && list->CountItems() > 0
+			&& dynamic_cast<BStringItem*>(list->ItemAt(0)) == NULL
+			&& drawn_text_pending(view))
+			node.AddBool("drawn_pending", true);
+	}
+
 	StringMap::iterator description = sDescriptions.find(view);
 	if (description != sDescriptions.end()) {
 		node.AddString(B_ACCESSIBLE_FIELD_DESCRIPTION, description->second);
@@ -833,7 +1096,7 @@ describe_view(BView* view, int32 sub, BMessage& node, int32 depth)
 	}
 
 	// children: virtual items, then child views (except for composites)
-	int32 registryID = register_object(ENTRY_VIEW, view, window);
+	int32 registryID = register_object(ENTRY_VIEW, view, owner_window(view));
 	int32 itemCount = count_items(view);
 	int32 count = 0;
 	for (int32 i = 0; i < itemCount; i++) {
@@ -841,7 +1104,7 @@ describe_view(BView* view, int32 sub, BMessage& node, int32 depth)
 		count++;
 		if (depth != 0) {
 			BMessage childNode;
-			if (describe_item(view, i, childNode))
+			if (describe_item(view, i, childNode, depth - 1))
 				node.AddMessage(B_ACCESSIBLE_FIELD_CHILD, &childNode);
 		}
 	}
@@ -900,6 +1163,14 @@ describe_object(BAccessible* object, BMessage& node, int32 depth)
 		node.AddInt32(B_ACCESSIBLE_FIELD_SEL_END, end);
 	}
 	object->AddProperties(node);
+
+	if (object->Parent() == NULL && host != NULL && host->Window() != NULL
+		&& !node.HasString(B_ACCESSIBLE_FIELD_DRAWN_TEXT)) {
+		// what the host view and its parts drew (the rows of a table)
+		BString text = drawn_text(host, NULL, true);
+		if (!text.IsEmpty())
+			node.AddString(B_ACCESSIBLE_FIELD_DRAWN_TEXT, text);
+	}
 
 	int32 count = object->CountChildren();
 	int32 added = 0;
@@ -1007,7 +1278,7 @@ resolve_id(int64 id, RegistryEntry& _entry, BLooper*& _looper)
 	}
 	if (found->second.type == ENTRY_VIEW) {
 		BView* view = (BView*)found->second.object;
-		if (view->Looper() != looper) {
+		if (view->Looper() != looper && owner_window(view) != looper) {
 			sRegistryLock.Unlock();
 			looper->Unlock();
 			return B_ENTRY_NOT_FOUND;
@@ -1048,7 +1319,7 @@ describe_id(int64 id, BMessage& node, int32 depth)
 			break;
 		case ENTRY_VIEW:
 			if (sub > 0) {
-				if (!describe_item((BView*)entry.object, sub - 1, node))
+				if (!describe_item((BView*)entry.object, sub - 1, node, depth))
 					status = B_ENTRY_NOT_FOUND;
 			} else
 				describe_view((BView*)entry.object, 0, node, depth);
@@ -1065,6 +1336,48 @@ describe_id(int64 id, BMessage& node, int32 depth)
 // #pragma mark - actions
 
 
+//!	Invokes a control; for an agent's request its message says so.
+static status_t
+invoke_control(BControl* control)
+{
+	if (!sAgentRequest || control->Message() == NULL)
+		return control->Invoke();
+	BMessage message(*control->Message());
+	message.AddBool("be:agent", true);
+	return control->Invoke(&message);
+}
+
+
+static status_t
+invoke_list(BListView* list)
+{
+	if (!sAgentRequest || list->InvocationMessage() == NULL)
+		return list->Invoke();
+	BMessage message(*list->InvocationMessage());
+	message.AddBool("be:agent", true);
+	return list->Invoke(&message);
+}
+
+
+//!	Selects a list item; for an agent's request the selection message
+//	says so.
+static void
+select_list_item(BListView* list, int32 index)
+{
+	BMessage* selection = list->SelectionMessage();
+	if (!sAgentRequest || selection == NULL) {
+		list->Select(index);
+		return;
+	}
+	BMessage original(*selection);
+	BMessage* marked = new BMessage(original);
+	marked->AddBool("be:agent", true);
+	list->SetSelectionMessage(marked);
+	list->Select(index);
+	list->SetSelectionMessage(new BMessage(original));
+}
+
+
 static status_t
 perform_item_action(BView* view, int32 index, accessible_action action)
 {
@@ -1074,11 +1387,11 @@ perform_item_action(BView* view, int32 index, accessible_action action)
 		BOutlineListView* outline = dynamic_cast<BOutlineListView*>(list);
 		switch (action) {
 			case B_ACCESSIBLE_ACTION_SELECT:
-				list->Select(index);
+				select_list_item(list, index);
 				return B_OK;
 			case B_ACCESSIBLE_ACTION_PRESS:
-				list->Select(index);
-				list->Invoke();
+				select_list_item(list, index);
+				invoke_list(list);
 				return B_OK;
 			case B_ACCESSIBLE_ACTION_EXPAND:
 				if (outline == NULL)
@@ -1093,17 +1406,22 @@ perform_item_action(BView* view, int32 index, accessible_action action)
 			default:
 				break;
 		}
-	} else if (BMenu* menu = dynamic_cast<BMenu*>(view)) {
+	} else if (BMenu* menu = item_menu(view)) {
 		BMenuItem* item = menu->ItemAt(index);
 		if (item == NULL)
 			return B_ENTRY_NOT_FOUND;
-		if (action == B_ACCESSIBLE_ACTION_PRESS && item->IsEnabled()
-			&& item->Message() != NULL) {
-			// what BMenuItem::Invoke() (protected) sends
+		if (action == B_ACCESSIBLE_ACTION_PRESS && !item->IsEnabled())
+			return B_NOT_ALLOWED;
+		if (action == B_ACCESSIBLE_ACTION_PRESS && item->Message() != NULL) {
+			// what BMenuItem::Invoke() (protected) does
+			if (menu->IsRadioMode())
+				item->SetMarked(true);
 			BMessage message(*item->Message());
 			message.AddInt64("when", system_time());
 			message.AddPointer("source", item);
 			message.AddInt32("index", index);
+			if (sAgentRequest)
+				message.AddBool("be:agent", true);
 			item->BInvoker::Invoke(&message);
 			return B_OK;
 		}
@@ -1150,7 +1468,7 @@ perform_view_action(BView* view, accessible_action action)
 					? B_CONTROL_OFF : B_CONTROL_ON);
 			}
 		}
-		control->Invoke();
+		invoke_control(control);
 		return B_OK;
 	}
 
@@ -1167,7 +1485,7 @@ perform_view_action(BView* view, accessible_action action)
 		if (BSlider* slider = dynamic_cast<BSlider*>(view)) {
 			int32 step = max_c(1, slider->KeyIncrementValue());
 			slider->SetValue(slider->Value() + (up ? step : -step));
-			slider->Invoke();
+			invoke_control(slider);
 			return B_OK;
 		}
 		if (BScrollBar* scrollBar = dynamic_cast<BScrollBar*>(view)) {
@@ -1207,6 +1525,484 @@ perform_action(int64 id, accessible_action action)
 			status = ((BAccessible*)entry.object)->PerformAction(action);
 			break;
 	}
+	unlock_resolved(looper);
+	return status;
+}
+
+
+// #pragma mark - setting values
+
+
+static BString
+plain_label(const char* label)
+{
+	BString string = clean_label(label);
+	if (string.EndsWith("\xE2\x80\xA6"))	// …
+		string.Truncate(string.Length() - 3);
+	else if (string.EndsWith("..."))
+		string.Truncate(string.Length() - 3);
+	string.RemoveAll("_");
+	string.Trim();
+	return string;
+}
+
+
+static BString
+item_label(BView* view, int32 index)
+{
+	if (BListView* list = dynamic_cast<BListView*>(view))
+		return list_item_text(list, index);
+	if (BMenu* menu = item_menu(view)) {
+		BMenuItem* item = menu->ItemAt(index);
+		return item != NULL ? BString(item->Label()) : BString();
+	}
+	if (BTabView* tabView = dynamic_cast<BTabView*>(view)) {
+		BTab* tab = tabView->TabAt(index);
+		return tab != NULL ? BString(tab->Label()) : BString();
+	}
+	return BString();
+}
+
+
+/*!	The item of a list, menu or tab view whose label is \a label (ignoring
+	case, a trailing ellipsis or colon); -1 when there is none, -2 when
+	several items have it.
+*/
+static int32
+find_item(BView* view, const char* label)
+{
+	BString wanted = plain_label(label);
+	int32 count = count_items(view);
+	int32 found = -1;
+	for (int32 i = 0; i < count; i++) {
+		if (plain_label(item_label(view, i)).ICompare(wanted) != 0)
+			continue;
+		if (found >= 0)
+			return -2;
+		found = i;
+	}
+	return found;
+}
+
+
+static bool
+parse_on_off(const char* value, int32& _value)
+{
+	BString string(value);
+	string.Trim().ToLower();
+	if (string == "on" || string == "true" || string == "1"
+		|| string == "checked" || string == "yes") {
+		_value = B_CONTROL_ON;
+		return true;
+	}
+	if (string == "off" || string == "false" || string == "0"
+		|| string == "unchecked" || string == "no") {
+		_value = B_CONTROL_OFF;
+		return true;
+	}
+	if (string == "mixed" || string == "partial") {
+		_value = B_CONTROL_PARTIALLY_ON;
+		return true;
+	}
+	return false;
+}
+
+
+static bool
+parse_number(const char* value, double& _number)
+{
+	char* end;
+	_number = strtod(value, &end);
+	while (end != NULL && isspace(*end))
+		end++;
+	return end != value && end != NULL && *end == '\0';
+}
+
+
+static status_t
+set_view_value(BView* view, const char* value)
+{
+	view = effective_view(view);
+	if (attached_root(view) != NULL)
+		return B_NOT_SUPPORTED;
+
+	BControl* control = dynamic_cast<BControl*>(view);
+	if (control != NULL && !control->IsEnabled())
+		return B_NOT_ALLOWED;
+
+	if (BTextControl* textControl = dynamic_cast<BTextControl*>(view)) {
+		if (!textControl->TextView()->IsEditable())
+			return B_NOT_ALLOWED;
+		textControl->SetText(value);
+		invoke_control(textControl);
+		return B_OK;
+	}
+	if (BAbstractSpinner* spinner = dynamic_cast<BAbstractSpinner*>(view)) {
+		double number;
+		if (!parse_number(value, number))
+			return B_BAD_VALUE;
+		if (BSpinner* intSpinner = dynamic_cast<BSpinner*>(spinner))
+			intSpinner->SetValue((int32)lround(number));
+		else if (BDecimalSpinner* decimal
+				= dynamic_cast<BDecimalSpinner*>(spinner))
+			decimal->SetValue(number);
+		else {
+			spinner->TextView()->SetText(value);
+			spinner->SetValueFromText();
+		}
+		return B_OK;
+	}
+	if (BSlider* slider = dynamic_cast<BSlider*>(view)) {
+		double number;
+		if (!parse_number(value, number))
+			return B_BAD_VALUE;
+		int32 minimum, maximum;
+		slider->GetLimits(&minimum, &maximum);
+		slider->SetValue(max_c(minimum, min_c(maximum,
+			(int32)lround(number))));
+		invoke_control(slider);
+		return B_OK;
+	}
+	if (BScrollBar* scrollBar = dynamic_cast<BScrollBar*>(view)) {
+		double number;
+		if (!parse_number(value, number))
+			return B_BAD_VALUE;
+		scrollBar->SetValue(number);
+		return B_OK;
+	}
+	if (BColorControl* color = dynamic_cast<BColorControl*>(view)) {
+		unsigned int red, green, blue;
+		if (sscanf(value, "#%02x%02x%02x", &red, &green, &blue) != 3)
+			return B_BAD_VALUE;
+		rgb_color rgb = { (uint8)red, (uint8)green, (uint8)blue, 255 };
+		color->SetValue(rgb);
+		invoke_control(color);
+		return B_OK;
+	}
+	if (dynamic_cast<BMenuField*>(view) != NULL
+		|| dynamic_cast<BListView*>(view) != NULL
+		|| dynamic_cast<BTabView*>(view) != NULL
+		|| (dynamic_cast<BMenu*>(view) != NULL
+			&& ((BMenu*)view)->IsRadioMode())) {
+		if (BMenuField* field = dynamic_cast<BMenuField*>(view)) {
+			if (!field->IsEnabled())
+				return B_NOT_ALLOWED;
+		}
+		int32 index = find_item(view, value);
+		if (index == -1)
+			return B_ENTRY_NOT_FOUND;
+		if (index < 0)
+			return B_NAME_IN_USE;
+		if (BListView* list = dynamic_cast<BListView*>(view)) {
+			select_list_item(list, index);
+			list->ScrollToSelection();
+			return B_OK;
+		}
+		return perform_item_action(view, index, B_ACCESSIBLE_ACTION_PRESS);
+	}
+	if (control != NULL) {
+		int32 newValue;
+		if (!parse_on_off(value, newValue)) {
+			double number;
+			if (!parse_number(value, number))
+				return B_BAD_VALUE;
+			newValue = (int32)lround(number);
+		}
+		if (dynamic_cast<BRadioButton*>(control) != NULL
+			&& newValue != B_CONTROL_ON) {
+			// a radio button is turned off by turning on another one
+			return B_NOT_ALLOWED;
+		}
+		if (control->Value() != newValue) {
+			control->SetValue(newValue);
+			invoke_control(control);
+		}
+		return B_OK;
+	}
+	if (BTextView* textView = dynamic_cast<BTextView*>(view)) {
+		if (!textView->IsEditable())
+			return B_NOT_ALLOWED;
+		textView->SetText(value);
+		return B_OK;
+	}
+	return B_NOT_SUPPORTED;
+}
+
+
+static status_t
+set_value(int64 id, const char* value)
+{
+	if (value == NULL)
+		return B_BAD_VALUE;
+
+	RegistryEntry entry;
+	BLooper* looper;
+	status_t status = resolve_id(id, entry, looper);
+	if (status != B_OK)
+		return status;
+
+	int32 sub = (int32)(id & 0xffffffff);
+	if (entry.type == ENTRY_VIEW && sub == 0)
+		status = set_view_value((BView*)entry.object, value);
+	else
+		status = B_NOT_SUPPORTED;
+	unlock_resolved(looper);
+	return status;
+}
+
+
+// #pragma mark - synthetic input
+
+
+struct KeyName {
+	const char*	name;
+	char		byte;
+	int32		key;
+};
+
+static const KeyName kKeyNames[] = {
+	{ "enter", B_ENTER, 0x47 },
+	{ "return", B_ENTER, 0x47 },
+	{ "escape", B_ESCAPE, 0x01 },
+	{ "esc", B_ESCAPE, 0x01 },
+	{ "tab", B_TAB, 0x26 },
+	{ "backspace", B_BACKSPACE, 0x1e },
+	{ "delete", B_DELETE, 0x34 },
+	{ "insert", B_INSERT, 0x1f },
+	{ "space", ' ', 0x5e },
+	{ "up", B_UP_ARROW, 0x57 },
+	{ "down", B_DOWN_ARROW, 0x62 },
+	{ "left", B_LEFT_ARROW, 0x61 },
+	{ "right", B_RIGHT_ARROW, 0x63 },
+	{ "home", B_HOME, 0x20 },
+	{ "end", B_END, 0x35 },
+	{ "pageup", B_PAGE_UP, 0x21 },
+	{ "pagedown", B_PAGE_DOWN, 0x36 },
+};
+
+
+static void
+post_key(BWindow* window, const char* bytes, int32 length, int32 key,
+	uint32 modifiers)
+{
+	BMessenger focus(NULL, window);
+		// the preferred handler: the focus view, or the default button
+	char rawChar = length == 1 ? (char)tolower(bytes[0]) : bytes[0];
+	for (int32 i = 0; i < 2; i++) {
+		BMessage message(i == 0 ? B_KEY_DOWN : B_KEY_UP);
+		message.AddInt64("when", system_time());
+		message.AddInt32("modifiers", modifiers);
+		message.AddInt32("key", key);
+		message.AddInt32("raw_char", (uint8)rawChar);
+		for (int32 j = 0; j < length; j++)
+			message.AddInt8("byte", bytes[j]);
+		message.AddString("bytes", BString(bytes, length));
+		if (sAgentRequest)
+			message.AddBool("be:agent", true);
+		focus.SendMessage(&message, (BHandler*)NULL, 0);
+	}
+}
+
+
+static status_t
+type_text(BWindow* window, const char* text)
+{
+	for (const char* c = text; *c != '\0';) {
+		int32 length = 1;
+		uint8 lead = (uint8)*c;
+		if (lead >= 0xf0)
+			length = 4;
+		else if (lead >= 0xe0)
+			length = 3;
+		else if (lead >= 0xc0)
+			length = 2;
+		for (int32 i = 1; i < length; i++) {
+			if (c[i] == '\0')
+				return B_BAD_VALUE;
+		}
+		if (*c == '\n')
+			post_key(window, "\n", 1, 0x47, 0);
+		else if (*c == '\t')
+			post_key(window, "\t", 1, 0x26, 0);
+		else
+			post_key(window, c, length, 0, 0);
+		c += length;
+	}
+	return B_OK;
+}
+
+
+static status_t
+press_key(BWindow* window, const char* name, uint32 modifiers)
+{
+	BString key(name);
+	key.ToLower();
+	for (size_t i = 0; i < sizeof(kKeyNames) / sizeof(kKeyNames[0]); i++) {
+		if (key == kKeyNames[i].name) {
+			post_key(window, &kKeyNames[i].byte, 1, kKeyNames[i].key,
+				modifiers);
+			return B_OK;
+		}
+	}
+	if (key.Length() >= 2 && key[0] == 'f' && isdigit(key[1])) {
+		int number = atoi(key.String() + 1);
+		if (number < 1 || number > 12)
+			return B_BAD_VALUE;
+		char byte = B_FUNCTION_KEY;
+		post_key(window, &byte, 1, B_F1_KEY + number - 1, modifiers);
+		return B_OK;
+	}
+	// one character, as typed with the modifiers (Command+S)
+	int32 length = strlen(name);
+	if (length < 1 || length > 4)
+		return B_BAD_VALUE;
+	post_key(window, name, length, 0, modifiers);
+	return B_OK;
+}
+
+
+static void
+post_click(BWindow* window, BPoint screenWhere, int32 clicks, int32 button,
+	uint32 modifiers)
+{
+	BView* target = window->FindView(window->ConvertFromScreen(screenWhere));
+	if (target == NULL)
+		return;
+	uint32 buttons = button == 2 ? B_SECONDARY_MOUSE_BUTTON
+		: button == 3 ? B_TERTIARY_MOUSE_BUTTON : B_PRIMARY_MOUSE_BUTTON;
+	for (int32 click = 1; click <= clicks; click++) {
+		BMessage down(B_MOUSE_DOWN);
+		down.AddInt64("when", system_time());
+		down.AddPoint("screen_where", screenWhere);
+		down.AddInt32("buttons", buttons);
+		down.AddInt32("clicks", click);
+		down.AddInt32("modifiers", modifiers);
+		if (sAgentRequest)
+			down.AddBool("be:agent", true);
+		window->PostMessage(&down, target);
+
+		BMessage up(B_MOUSE_UP);
+		up.AddInt64("when", system_time());
+		up.AddPoint("screen_where", screenWhere);
+		up.AddInt32("buttons", 0);
+		up.AddInt32("modifiers", modifiers);
+		if (sAgentRequest)
+			up.AddBool("be:agent", true);
+		window->PostMessage(&up, target);
+	}
+}
+
+
+/*!	Gives the view the keyboard focus, as clicking into it would: the
+	caret goes to the end of a text instead of selecting all of it.
+*/
+static void
+focus_for_input(BView* view)
+{
+	if (view == NULL)
+		return;
+	BTextView* textView = dynamic_cast<BTextView*>(view);
+	if (BTextControl* control = dynamic_cast<BTextControl*>(view))
+		textView = control->TextView();
+	else if (BAbstractSpinner* spinner = dynamic_cast<BAbstractSpinner*>(view))
+		textView = spinner->TextView();
+	BView* target = textView != NULL ? textView : view;
+	if (target->IsFocus())
+		return;
+	target->MakeFocus(true);
+	if (textView != NULL)
+		textView->Select(textView->TextLength(), textView->TextLength());
+}
+
+
+static status_t
+send_input(BMessage* request)
+{
+	int64 id = request->GetInt64("id", 0);
+	uint32 modifiers = (uint32)request->GetInt32("modifiers", 0);
+
+	BWindow* window = NULL;
+	BView* view = NULL;
+	BRect frame;
+	RegistryEntry entry;
+	BLooper* looper = NULL;
+
+	if (id == 0) {
+		for (int32 i = 0; be_app != NULL; i++) {
+			BWindow* candidate = be_app->WindowAt(i);
+			if (candidate == NULL)
+				break;
+			if (candidate->IsActive()) {
+				window = candidate;
+				break;
+			}
+		}
+		if (window == NULL)
+			return B_ENTRY_NOT_FOUND;
+		if (window->LockWithTimeout(kLockTimeout) != B_OK)
+			return B_BUSY;
+		sRegistryLock.Lock();
+		looper = window;
+		frame = window->Frame();
+	} else {
+		status_t status = resolve_id(id, entry, looper);
+		if (status != B_OK)
+			return status;
+		int32 sub = (int32)(id & 0xffffffff);
+		if (entry.type == ENTRY_WINDOW) {
+			window = (BWindow*)entry.object;
+			frame = window->Frame();
+		} else if (entry.type == ENTRY_VIEW) {
+			view = effective_view((BView*)entry.object);
+			window = view->Window();
+			if (window == NULL) {
+				unlock_resolved(looper);
+				return B_NOT_ALLOWED;
+			}
+			if (sub > 0) {
+				BMessage item;
+				if (!describe_item(view, sub - 1, item)
+					|| item.FindRect(B_ACCESSIBLE_FIELD_FRAME, &frame) != B_OK) {
+					unlock_resolved(looper);
+					return B_ENTRY_NOT_FOUND;
+				}
+			} else
+				frame = view->ConvertToScreen(view->Bounds());
+		} else {
+			BAccessible* object = (BAccessible*)entry.object;
+			view = object->Host();
+			window = view != NULL ? view->Window() : NULL;
+			frame = object->Frame();
+			if (window == NULL) {
+				unlock_resolved(looper);
+				return B_NOT_ALLOWED;
+			}
+		}
+	}
+
+	status_t status = B_BAD_VALUE;
+	const char* text;
+	const char* key;
+	int32 clicks;
+	if (request->FindString("text", &text) == B_OK) {
+		focus_for_input(view);
+		status = type_text(window, text);
+	} else if (request->FindString("key", &key) == B_OK) {
+		focus_for_input(view);
+		status = press_key(window, key, modifiers);
+	} else if (request->FindInt32("click", &clicks) == B_OK) {
+		BPoint where;
+		if (request->FindPoint("point", &where) != B_OK) {
+			where.x = floorf((frame.left + frame.right) / 2);
+			where.y = floorf((frame.top + frame.bottom) / 2);
+		}
+		if (clicks < 1 || clicks > 3)
+			clicks = 1;
+		post_click(window, where, clicks, request->GetInt32("button", 1),
+			modifiers);
+		status = B_OK;
+	}
+
 	unlock_resolved(looper);
 	return status;
 }
@@ -1306,6 +2102,7 @@ public:
 	{
 		BMessage reply(B_ACCESSIBILITY_REPLY);
 		status_t status = B_OK;
+		sAgentRequest = message->GetBool("agent", false);
 
 		switch (message->what) {
 			case kMsgInitialState:
@@ -1343,10 +2140,21 @@ public:
 				status = _GetText(message, reply);
 				break;
 
+			case B_ACCESSIBILITY_SET_VALUE:
+				status = set_value(message->GetInt64("id", 0),
+					message->GetString("value", NULL));
+				break;
+
+			case B_ACCESSIBILITY_INPUT:
+				status = send_input(message);
+				break;
+
 			default:
+				sAgentRequest = false;
 				BLooper::MessageReceived(message);
 				return;
 		}
+		sAgentRequest = false;
 
 		reply.AddInt32("status", status);
 		message->SendReply(&reply, (BHandler*)NULL, kLockTimeout);
@@ -1380,6 +2188,15 @@ private:
 	status_t _GetFocus(BMessage& reply)
 	{
 		BWindow* window = _ActiveWindow();
+		for (int32 i = 0; window == NULL && be_app != NULL; i++) {
+			// no window of the application is active: its first visible
+			// one ("window_active" false in the reply)
+			BWindow* candidate = be_app->WindowAt(i);
+			if (candidate == NULL)
+				break;
+			if (!candidate->IsHidden() && !candidate->IsMinimized())
+				window = candidate;
+		}
 		if (window == NULL)
 			return B_ENTRY_NOT_FOUND;
 		BMessenger messenger(window);
@@ -1442,6 +2259,18 @@ private:
 // #pragma mark - hooks
 
 
+/*!	Invalidates a view and every view in it: app_server only redraws the
+	part of a parent that its children do not cover.
+*/
+static void
+invalidate_tree(BView* view)
+{
+	view->Invalidate();
+	for (int32 i = 0; i < view->CountChildren(); i++)
+		invalidate_tree(view->ChildAt(i));
+}
+
+
 namespace BPrivate {
 
 
@@ -1466,6 +2295,21 @@ accessibility_enable(BMessage* message)
 
 	gAccessibilityEnabled = true;
 
+	// redraw every window once, so the text custom views draw is known
+	for (int32 i = 0; be_app != NULL; i++) {
+		BWindow* window = be_app->WindowAt(i);
+		if (window == NULL)
+			break;
+		BMessenger messenger(window);
+		if (messenger.LockTargetWithTimeout(kLockTimeout) != B_OK)
+			continue;
+		for (int32 j = 0; j < window->CountChildren(); j++)
+			invalidate_tree(window->ChildAt(j));
+		window->Flush();
+			// Invalidate() leaves the request in the link otherwise
+		window->Unlock();
+	}
+
 	app_info info;
 	BMessage reg(B_ACCESSIBILITY_REGISTER);
 	reg.AddMessenger("bridge", BMessenger(sBridge));
@@ -1482,6 +2326,10 @@ void
 accessibility_disable()
 {
 	gAccessibilityEnabled = false;
+	{
+		BAutolock locker(sDrawnLock);
+		sDrawn.clear();
+	}
 	{
 		BAutolock locker(sRegistryLock);
 		sServer = BMessenger();
@@ -1503,10 +2351,87 @@ accessibility_view_deleted(BView* view)
 	unregister_object(view);
 	sNames.erase(view);
 	sDescriptions.erase(view);
+	sConfirmations.erase(view);
+	{
+		BAutolock drawnLocker(sDrawnLock);
+		sDrawn.erase(view);
+	}
 	AttachMap::iterator found = sAttached.find(view);
 	if (found != sAttached.end()) {
 		BAccessiblePrivate::Host(found->second) = NULL;
 		sAttached.erase(found);
+	}
+}
+
+
+void
+accessibility_string_drawn(BView* view, const char* string, int32 length,
+	BPoint location)
+{
+	if (length > kMaxDrawnStringLength)
+		length = kMaxDrawnStringLength;
+
+	BAutolock locker(sDrawnLock);
+	DrawnView& drawn = sDrawn[view];
+	DrawnList& list = drawn.strings;
+	if (drawn.drawing && !drawn.updateRect.Contains(location))
+		drawn.drewOutside = true;
+	// what is drawn again at the same place replaces what was there
+	for (DrawnList::iterator i = list.begin(); i != list.end(); i++) {
+		if (fabsf(i->where.x - location.x) < 0.5f
+			&& fabsf(i->where.y - location.y) < 0.5f) {
+			list.erase(i);
+			break;
+		}
+	}
+	if ((int32)list.size() >= kMaxDrawnStrings)
+		list.erase(list.begin());
+	DrawnString entry;
+	entry.where = location;
+	entry.text.SetTo(string, length);
+	entry.pass = drawn.pass;
+	list.push_back(entry);
+	gAccessibilityViewData = true;
+		// ~BView() must forget the view
+}
+
+
+void
+accessibility_view_drawing(BView* view, BRect updateRect)
+{
+	BAutolock locker(sDrawnLock);
+	DrawnMap::iterator found = sDrawn.find(view);
+	if (found == sDrawn.end())
+		return;
+	DrawnView& drawn = found->second;
+	drawn.pass++;
+	drawn.drawing = true;
+	drawn.drewOutside = false;
+	// a baseline sits up to a line below the top of its text
+	drawn.updateRect = updateRect;
+	drawn.updateRect.bottom += 24;
+}
+
+
+void
+accessibility_view_drawn(BView* view)
+{
+	BAutolock locker(sDrawnLock);
+	DrawnMap::iterator found = sDrawn.find(view);
+	if (found == sDrawn.end())
+		return;
+	DrawnView& drawn = found->second;
+	if (!drawn.drawing)
+		return;
+	drawn.drawing = false;
+	// what lies outside the view (it shrank) cannot be seen any more
+	BRect bounds = view->Bounds().InsetByCopy(-4, -4);
+	DrawnList& list = drawn.strings;
+	for (size_t i = list.size(); i-- > 0;) {
+		if (list[i].pass != drawn.pass
+			&& (drawn.drewOutside || drawn.updateRect.Contains(list[i].where)
+				|| !bounds.Contains(list[i].where)))
+			list.erase(list.begin() + i);
 	}
 }
 
@@ -1939,6 +2864,21 @@ BAccessible::SetDescription(BView* view, const char* description)
 		sDescriptions.erase(view);
 	else
 		sDescriptions[view] = description;
+	gAccessibilityViewData = true;
+	return B_OK;
+}
+
+
+/*static*/ status_t
+BAccessible::SetConfirmation(BView* view, const char* consequence)
+{
+	if (view == NULL)
+		return B_BAD_VALUE;
+	BAutolock locker(sRegistryLock);
+	if (consequence == NULL)
+		sConfirmations.erase(view);
+	else
+		sConfirmations[view] = consequence;
 	gAccessibilityViewData = true;
 	return B_OK;
 }

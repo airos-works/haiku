@@ -227,6 +227,12 @@ public:
 	static	status_t			SetName(BView* view, const char* name);
 	static	status_t			SetDescription(BView* view,
 									const char* description);
+	static	status_t			SetConfirmation(BView* view,
+									const char* consequence);
+									// what pressing or changing the view
+									// does ("Deletes the project and all
+									// its files"); agents must ask a
+									// person first. NULL removes it.
 
 	static	bool				IsEnabled();
 									// an assistive technology listens

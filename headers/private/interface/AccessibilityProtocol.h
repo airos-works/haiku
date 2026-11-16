@@ -61,6 +61,26 @@ enum {
 	B_ACCESSIBILITY_GET_TEXT		= 'acGT',
 		// "id" int64, "start" int32, "end" int32; reply: "text"
 
+	B_ACCESSIBILITY_SET_VALUE		= 'acSV',
+		// "id" int64, "value" string: types the text of a text field or
+		// area (password fields may be filled, never read), sets a check
+		// box ("on", "off"), slider, spinner or scroll bar (a number),
+		// color control ("#rrggbb"), or picks the item with that label in
+		// a pop-up menu field, list, tab view or radio menu
+	B_ACCESSIBILITY_INPUT			= 'acIN',
+		// synthetic input for views that have no semantic action; "id"
+		// int64 (a view, item or window; 0 = the active window) and one of
+		// "text" string (typed into the node, which takes the focus),
+		// "key" string (a key name: enter, escape, tab, backspace, delete,
+		// space, up, down, left, right, home, end, pageup, pagedown,
+		// f1-f12, or one character) with "modifiers" int32, or "click"
+		// int32 (click count) with "button" int32 (1-3) and "point"
+		// BPoint (screen coordinates; default: the node's centre)
+
+	// Requests from an AI agent rather than a person's assistive
+	// technology carry "agent" bool true; the messages the application
+	// receives from the controls it acts on then carry "be:agent" true.
+
 	B_ACCESSIBILITY_REPLY			= 'acRP',
 		// "status" int32 (status_t), plus the request's results
 
@@ -108,6 +128,14 @@ enum {
 #define B_ACCESSIBLE_FIELD_COUNT		"count"			// int32 (siblings)
 #define B_ACCESSIBLE_FIELD_LEVEL		"level"			// int32 (trees)
 #define B_ACCESSIBLE_FIELD_SHORTCUT		"shortcut"		// string
+#define B_ACCESSIBLE_FIELD_DRAWN_TEXT	"drawn_text"	// string: what a
+	// custom-drawn view (or a list item without text) drew, line by line
+#define B_ACCESSIBLE_FIELD_CLASS		"class"			// string: the C++
+	// class of a view the Interface Kit does not know (custom views)
+#define B_ACCESSIBLE_FIELD_CONFIRM		"confirm"		// string: the
+	// application asks that a person confirms acting on this node; an
+	// agent must ask before it presses or changes it
+	// (BAccessible::SetConfirmation())
 
 
 #endif	// _ACCESSIBILITY_PROTOCOL_H

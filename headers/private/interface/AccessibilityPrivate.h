@@ -65,6 +65,12 @@ void accessibility_item_selected(BView* view, int32 index);
 	// list, outline list, column list, tab view
 void accessibility_menu_item_selected(BMenu* menu, BMenuItem* item);
 
+// drawn text of custom views (BView::DrawString(), BView::_Draw())
+void accessibility_string_drawn(BView* view, const char* string,
+	int32 length, BPoint location);
+void accessibility_view_drawing(BView* view, BRect updateRect);
+void accessibility_view_drawn(BView* view);
+
 
 }	// namespace BPrivate
 
