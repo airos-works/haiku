@@ -62,6 +62,12 @@ The relay also takes, in its environment:
 - `REORDER=p:k`: a data frame arrives, with probability p, k frame times
   late, behind the k frames sent after it. A Haiku receiver now answers
   the resends this causes with D-SACKs, as Linux does.
+- `JITTER=amp:period`: adds to the delay, both ways, an offset drawn anew
+  from 0 to amp ms every period ms; frames still arrive in order. The X399's
+  path to Sydney wanders like this in the evening (28-37 ms), and slow start
+  ended early on it. On `JITTER=7:60`, 200 Mbit/s, 30 ms, 10 MB uploads:
+  Linux 0.92-1.71 s, Haiku 2.8-3.7 s before the fix, 0.75-2.97 s (median
+  1.06) after it.
 - `SACKWIN=1`: every ACK carrying SACK blocks advertises a smaller window
   than the one before, as a Linux receiver's does while its out-of-order
   queue fills. A Haiku receiver keeps its window, so without this a sender

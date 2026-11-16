@@ -46,6 +46,13 @@ sackwin_run = 0
 # frame times at the bottleneck rate: it arrives after the k frames sent
 # behind it, as on paths that spread a flow over several links or queues.
 reorder = [float(x) for x in os.environ.get("REORDER", "").split(":") if x]
+# JITTER=amp_ms:period_ms adds to the delay, in both directions, an offset
+# drawn anew from 0..amp every period; frames still leave in order. Paths
+# whose round trip wanders by a few ms ended slow start early (HyStart).
+jitter = [float(x) for x in os.environ.get("JITTER", "").split(":") if x]
+jitter_offset = 0.0
+jitter_next = 0.0
+last_due = {"ab": 0.0, "ba": 0.0}
 
 sa = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sa.bind(("127.0.0.1", la))
@@ -233,8 +240,16 @@ while True:
                     and len(data) > 100 and random.random() < reorder[0]:
                 extra = reorder[1] * 1514 * 8 / rate
                 stats[d]["reordered"] = stats[d].get("reordered", 0) + 1
-            heapq.heappush(heap, (free_at[d] + delay + extra, seq, out, dest,
-                data, d))
+            due = free_at[d] + delay + extra
+            if jitter:
+                if now >= jitter_next:
+                    jitter_offset = random.uniform(0, jitter[0] / 1000)
+                    jitter_next = now + jitter[1] / 1000
+                due += jitter_offset
+                if extra == 0.0:
+                    due = max(due, last_due[d])
+                    last_due[d] = due
+            heapq.heappush(heap, (due, seq, out, dest, data, d))
     while heap and heap[0][0] <= now:
         _, _, out, dest, data, d = heapq.heappop(heap)
         try:
