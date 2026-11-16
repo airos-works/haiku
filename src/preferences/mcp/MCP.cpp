@@ -20,6 +20,7 @@
 #define B_TRANSLATION_CONTEXT "MCPWindow"
 
 static const uint32 kToggle = 'mtog';
+static const uint32 kToggleUI = 'mtui';
 static const uint32 kRefresh = 'mref';
 static const uint32 kCopy = 'mcop';
 
@@ -34,6 +35,13 @@ public:
 	{
 		fEnabled = new BCheckBox("enabled", B_TRANSLATE("Enable MCP"),
 			new BMessage(kToggle));
+		fUIAccess = new BCheckBox("ui access",
+			B_TRANSLATE("Let agents see and use applications"),
+			new BMessage(kToggleUI));
+		fUIAccess->SetToolTip(B_TRANSLATE("Agents read the windows and "
+			"controls of running applications and press, type and choose in "
+			"them, without screenshots. Password fields are never read; "
+			"controls that ask for confirmation wait for you."));
 		fStatus = new BStringView("status", B_TRANSLATE("Connecting to MCP server…"));
 		BTextView* description = new BTextView("description");
 		description->SetText(B_TRANSLATE("Allow AI agents to use this computer through "
@@ -58,6 +66,7 @@ public:
 			.SetInsets(B_USE_WINDOW_INSETS)
 			.Add(fEnabled)
 			.Add(description)
+			.Add(fUIAccess)
 			.Add(fStatus)
 			.Add(scroll)
 			.AddGroup(B_HORIZONTAL)
@@ -85,15 +94,17 @@ public:
 				be_clipboard->Commit();
 				be_clipboard->Unlock();
 			}
-		} else if (message->what == kRefresh || message->what == kToggle)
-			_Update(message->what == kToggle);
+		} else if (message->what == kRefresh || message->what == kToggle
+			|| message->what == kToggleUI)
+			_Update(message->what);
 		else
 			BWindow::MessageReceived(message);
 	}
 
 private:
-	void _Update(bool toggle)
+	void _Update(uint32 what)
 	{
+		bool toggle = what == kToggle;
 		BMessenger server(kMCPServerSignature);
 		if (!server.IsValid()) {
 			be_roster->Launch(kMCPServerSignature);
@@ -102,6 +113,10 @@ private:
 		BMessage request(toggle ? kMCPSetEnabled : kMCPGetStatus);
 		if (toggle)
 			request.AddBool("enabled", fEnabled->Value() == B_CONTROL_ON);
+		if (what == kToggleUI) {
+			request.what = kMCPSetUIAccess;
+			request.AddBool("ui_access", fUIAccess->Value() == B_CONTROL_ON);
+		}
 		BMessage reply;
 		status_t error = server.SendMessage(&request, &reply, 1000000, 1000000);
 		bool available = error == B_OK;
@@ -112,6 +127,10 @@ private:
 		reply.FindBool("running", &running);
 		fEnabled->SetValue(enabled ? B_CONTROL_ON : B_CONTROL_OFF);
 		fEnabled->SetEnabled(available);
+		bool uiAccess = true;
+		reply.FindBool("ui_access", &uiAccess);
+		fUIAccess->SetValue(uiAccess ? B_CONTROL_ON : B_CONTROL_OFF);
+		fUIAccess->SetEnabled(available);
 		BString status;
 		if (error != B_OK) {
 			status.SetToFormat(B_TRANSLATE("MCP error: %s"), strerror(error));
@@ -129,6 +148,7 @@ private:
 	}
 
 	BCheckBox* fEnabled;
+	BCheckBox* fUIAccess;
 	BStringView* fStatus;
 	BTextView* fInfo;
 	BButton* fCopy;
