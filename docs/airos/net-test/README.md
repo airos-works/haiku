@@ -13,6 +13,9 @@ floods. Every test prints `PASS <name>` or `FAIL <name>: why`.
 | `lostresend` | a segment and its first resend are lost in a bulk transfer: repaired well before the retransmit timeout (#125) |
 | `finloss` | the last short segment with the FIN is lost after close(): it is resent (#125; it never was) |
 | `tailloss` | the last two segments of a write are repaired by a tail loss probe in well under the 200 ms retransmit timeout (#125) |
+| `rttramp` | the peer's ACKs come back later and later (20 to 420 ms) with 64 KB in flight: the round trip estimate follows, no spurious timeouts (#125 item 2) |
+| `seqwrap` | a loss just past 2^32 is repaired by fast retransmit, without SACK (#125 item 4; the guest connects from successive ports until its initial sequence number lies 1-3 MB below 2^32) |
+| `seqnowrap` | the same loss without the wrap; failed for initial sequence numbers above 2^31 |
 | `winupdate` | window updates are not duplicate ACKs |
 | `persist` | the persist timer keeps probing a closed window |
 | `ooo`, `synflood`, `fragflood`, `udpburst`, `udpempty`, `ipv6ext`, `rfc5961`, `predictable`, `mss12`, `mss1460`, `icmp`, `timewait`, `ioctl`, `priv` | the #126-#130 fixes |
@@ -29,7 +32,8 @@ expects.
 
 ```
 ./build.sh
-./mkscript.sh full.sh bin/nettest recovery sack rtoresend winupdate persist
+./mkscript.sh full.sh bin/nettest recovery sack rtoresend lostresend finloss tailloss \
+	winupdate persist rttramp seqwrap seqnowrap
 IMAGE=haiku-nightly.image SCRIPT=full.sh ../kernel-perf/qemu-run.sh nettest
 ```
 

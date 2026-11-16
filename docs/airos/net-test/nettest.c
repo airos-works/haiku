@@ -1941,6 +1941,7 @@ struct delayed_ack {
 	uint32_t ack;
 	uint32_t blocks[3][2];
 	int count;
+	uint32_t tsecr;
 };
 
 /* The last two segments of a write are lost: no duplicate ACKs follow, so
@@ -2050,6 +2051,249 @@ test_tail_loss(void)
 			(long long)took);
 	else
 		pass(name, "two lost tail segments repaired in %lld ms", (long long)took);
+}
+
+
+/* #125 item 2: the round trip estimate used to freeze with much data in
+   flight (corrections divided by the flight in segment pairs, in whole
+   ms), so the retransmit timeout stayed near its first value while the
+   real round trip grew past it. Here the peer's ACKs come back later and
+   later, from 20 ms to 420 ms over five seconds, with 64 KB in flight: a
+   working estimate follows, a frozen one fires spurious timeouts. */
+static void
+test_rtt_ramp(void)
+{
+	const char* name = "rtt-ramp";
+	struct peer p;
+	int fd = handshake(name, &p, 1460, 1);
+	if (fd < 0)
+		return;
+	int size = 1024 * 1024;
+	setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
+	set_timeout(fd, 10000);
+
+	struct send_args args = { fd, 16 * 1024 * 1024 };
+	pthread_t thread;
+	pthread_create(&thread, NULL, sender_thread, &args);
+
+	static struct delayed_ack queue[4096];
+	int head = 0, tail = 0;
+	uint32_t base = p.guest_next, highest = base;
+	int segments = 0, retransmits = 0;
+	struct seg sg;
+	const bigtime_t start = system_time();
+	const bigtime_t kDuration = 5000000;
+	while (system_time() - start < kDuration) {
+		while (head != tail && queue[head].due <= system_time()) {
+			/* the timestamp of the segment this ACK answers (RFC 7323 4.3),
+			   or the guest measures no delay at all */
+			p.ts_recent = queue[head].tsecr;
+			send_tcp(&p, F_ACK, p.seq, queue[head].ack, 0, NULL, 0);
+			head = (head + 1) % 4096;
+		}
+		if (!read_seg(&sg, 1) || sg.proto != IPPROTO_TCP
+			|| sg.sport != p.guest_port || sg.len == 0)
+			continue;
+		segments++;
+		if ((int32_t)(sg.seq - highest) < 0)
+			retransmits++;
+		else
+			highest = sg.seq + sg.len;
+		if (sg.seq == p.guest_next)
+			p.guest_next += sg.len;
+		queue[tail].tsecr = sg.tsval;
+		bigtime_t delay = 20000 + (system_time() - start) * 400000 / kDuration;
+		if ((tail + 1) % 4096 == head)
+			continue;
+		queue[tail].due = system_time() + delay;
+		queue[tail].ack = p.guest_next;
+		tail = (tail + 1) % 4096;
+	}
+	uint32_t delivered = p.guest_next - base;
+	send_tcp(&p, F_RST | F_ACK, p.seq, p.guest_next, 0, NULL, 0);
+	close(fd);
+	pthread_join(thread, NULL);
+	if (delivered < 256 * 1024)
+		fail(name, "only %u bytes in 5 s", delivered);
+	else if (retransmits > 0)
+		fail(name, "%d spurious retransmissions while the round trip grew "
+			"to 420 ms (%u bytes)", retransmits, delivered);
+	else
+		pass(name, "round trip 20 to 420 ms: no retransmissions (%u bytes, "
+			"%d segments)", delivered, segments);
+}
+
+/* the guest connects from successive local ports until its initial
+   sequence number lies 1 to 3 MB below 2^32; returns the socket */
+static int
+handshake_near_wrap(const char* test, struct peer* p)
+{
+	for (int port = 20000; port < 65000; port++) {
+		memset(p, 0, sizeof(*p));
+		p->with_ts = 1;
+		p->tsval = 1000;
+		p->seq = 0x10000000;
+		int fd = socket(AF_INET, SOCK_STREAM, 0);
+		int one = 1;
+		setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+		struct sockaddr_in a;
+		memset(&a, 0, sizeof(a));
+		a.sin_len = sizeof(a);
+		a.sin_family = AF_INET;
+		a.sin_port = htons(port);
+		if (bind(fd, (struct sockaddr*)&a, sizeof(a)) != 0) {
+			close(fd);
+			continue;
+		}
+		fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+		a.sin_port = htons(PEER_PORT);
+		a.sin_addr.s_addr = inet_addr(PEER_ADDR);
+		connect(fd, (struct sockaddr*)&a, sizeof(a));
+
+		struct seg s;
+		int got = 0;
+		bigtime_t end = now_ms() + 500;
+		while (!got && now_ms() < end) {
+			if (read_seg(&s, 100) && s.proto == IPPROTO_TCP
+				&& (s.flags & F_SYN) && !(s.flags & F_ACK)
+				&& s.dport == PEER_PORT && s.sport == port)
+				got = 1;
+		}
+		if (!got) {
+			close(fd);
+			continue;
+		}
+		p->guest_port = port;
+		p->guest_next = s.seq + 1;
+		p->ts_recent = s.tsval;
+		uint32_t below = 0u - p->guest_next;
+		if (below < 1024 * 1024 || below > 3 * 1024 * 1024) {
+			send_tcp(p, F_RST | F_ACK, 0, p->guest_next, 0, NULL, 0);
+			close(fd);
+			continue;
+		}
+		send_tcp(p, F_SYN | F_ACK, p->seq, p->guest_next, 1460, NULL, 0);
+		p->seq++;
+		end = now_ms() + 3000;
+		while (now_ms() < end) {
+			if (!read_seg(&s, 500))
+				continue;
+			if (s.proto == IPPROTO_TCP && s.sport == port
+				&& (s.flags & F_ACK) && !(s.flags & F_SYN)) {
+				if (s.has_ts)
+					p->ts_recent = s.tsval;
+				fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
+				printf("  port %d: initial sequence %u bytes below 2^32\n",
+					port, below);
+				return fd;
+			}
+		}
+		close(fd);
+	}
+	fail(test, "no local port gave an initial sequence near 2^32");
+	return -1;
+}
+
+/* #125 item 4: the recovery point was a plain uint32 compared with ">", so
+   once the sequence numbers wrapped past 2^32 a loss no longer started fast
+   retransmit and waited for the timeout. No SACK, and the peer acknowledges
+   every eighth segment (as delayed ACKs do), so that only the recovery
+   point decides. */
+static int sWrapControl = 0;
+	/* 1: the same loss 1 MB into a connection that does not wrap */
+
+static void
+test_seq_wrap(void)
+{
+	const char* name = sWrapControl ? "seq-nowrap" : "seq-wrap";
+	struct peer p;
+	int fd = sWrapControl ? handshake(name, &p, 1460, 1)
+		: handshake_near_wrap(name, &p);
+	if (fd < 0)
+		return;
+	int size = 1024 * 1024;
+	setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
+	set_timeout(fd, 10000);
+
+	const uint32_t total = sWrapControl ? 2 * 1024 * 1024
+		: (0u - p.guest_next) + 1024 * 1024;
+	struct send_args args = { fd, (int)total };
+	pthread_t thread;
+	pthread_create(&thread, NULL, sender_thread, &args);
+
+	uint32_t base = p.guest_next, highest = base;
+	int segments = 0, retransmits = 0, lostOnce = 0, inOrder = 0;
+	int afterLoss = 0, dupacks = 0;
+	uint32_t flightAtLoss = 0;
+	uint32_t lostSeq = 0;
+	bigtime_t lossTime = 0, repaired = 0;
+	struct seg sg;
+	bigtime_t end = now_ms() + 20000;
+	while (now_ms() < end && p.guest_next - base < total) {
+		if (!read_seg(&sg, 20)) {
+			/* nothing more coming: acknowledge what is there */
+			send_tcp(&p, F_ACK, p.seq, p.guest_next, 0, NULL, 0);
+			inOrder = 0;
+			continue;
+		}
+		if (sg.proto != IPPROTO_TCP || sg.sport != p.guest_port || sg.len == 0)
+			continue;
+		if (sg.has_ts)
+			p.ts_recent = sg.tsval;
+		segments++;
+		if ((int32_t)(sg.seq - highest) < 0)
+			retransmits++;
+		else
+			highest = sg.seq + sg.len;
+
+		/* lose the first segment past the wrap, 64 KB into it */
+		if (!lostOnce && (sWrapControl
+				? sg.seq - base >= 1024 * 1024 && sg.seq - base < total
+				: sg.seq >= 65536 && sg.seq < base)) {
+			lostOnce = 1;
+			lostSeq = sg.seq;
+			lossTime = system_time();
+			flightAtLoss = sg.seq - p.guest_next;
+			continue;
+		}
+		int ack = 0;
+		if (sg.seq == p.guest_next) {
+			p.guest_next += sg.len;
+			if (lostOnce && sg.seq == lostSeq) {
+				p.guest_next = highest;
+				repaired = system_time();
+				ack = 1;
+			} else if (++inOrder >= 8)
+				ack = 1;
+		} else {
+			ack = 1;
+				/* out of order: a duplicate ACK at once */
+			if (lostOnce && repaired == 0) {
+				afterLoss++;
+				dupacks++;
+			}
+		}
+		if (ack) {
+			send_tcp(&p, F_ACK, p.seq, p.guest_next, 0, NULL, 0);
+			inOrder = 0;
+		}
+	}
+	uint32_t delivered = p.guest_next - base;
+	send_tcp(&p, F_RST | F_ACK, p.seq, p.guest_next, 0, NULL, 0);
+	close(fd);
+	pthread_join(thread, NULL);
+	if (!lostOnce || delivered < total)
+		fail(name, "%u of %u bytes (%s)", delivered, total,
+			lostOnce ? "the loss was not repaired" : "no segment past the wrap");
+	else if (repaired - lossTime > 150000 || retransmits > 5)
+		fail(name, "a loss past 2^32 took %lld ms and %d retransmissions "
+			"(%d duplicate ACKs, %u bytes unacknowledged before it)",
+			(long long)(repaired - lossTime) / 1000, retransmits, dupacks,
+			flightAtLoss);
+	else
+		pass(name, "a loss past 2^32 repaired in %lld ms with %d "
+			"retransmission(s)", (long long)(repaired - lossTime) / 1000,
+			retransmits);
 }
 
 
@@ -2307,6 +2551,15 @@ main(int argc, char** argv)
 			test_sack();
 		else if (!strcmp(t, "recovery"))
 			test_recovery();
+		else if (!strcmp(t, "rttramp"))
+			test_rtt_ramp();
+		else if (!strcmp(t, "seqwrap"))
+			test_seq_wrap();
+		else if (!strcmp(t, "seqnowrap")) {
+			sWrapControl = 1;
+			test_seq_wrap();
+			sWrapControl = 0;
+		}
 		else if (!strcmp(t, "lostresend")) {
 			sSackMode = 1;
 			test_sack();
