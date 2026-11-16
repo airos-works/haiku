@@ -12,7 +12,7 @@ mk() { # $1 role, $2 address, $3 test args
 	./mkscript.sh $Q/pl-$N-$1.sh bin/nettest $3
 	sed -i "s#^/tmp/nt/testbin#IF=\$(ifconfig -a | grep -o '^/dev/net/[^ \\t]*' | head -1); ifconfig \$IF inet $2 netmask 255.255.255.0 up; sleep 3; /tmp/nt/testbin#" $Q/pl-$N-$1.sh
 }
-mk a 10.10.0.1 "sink 30"
+mk a 10.10.0.1 "${SINK:-sink 30}"
 mk b 10.10.0.2 "$SARGS"
 echo 'sleep 12; netstat -s | sed -n "/^tcp/,/^udp/p" | while read l; do echo "NT $l" > /dev/dprintf; done' >> $Q/pl-$N-b.sh
 TRACE=${TRACE:-} python3 -u relay.py $LA $QA $LB $QB $RARGS > relay-$N.log 2>&1 &

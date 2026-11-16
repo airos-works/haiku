@@ -36,6 +36,12 @@ burst_index = 0
 burst_rx = 0
 burst_high = {}
 burst_resent = set()
+# SACKWIN=1 shrinks the window of every ACK that carries SACK blocks by one
+# more unit than the one before, as a Linux receiver's does while its
+# out-of-order queue fills: such ACKs are window changes, not plain
+# duplicates (RFC 5681), which a sender must still count (RFC 6675).
+sackwin = os.environ.get("SACKWIN", "") not in ("", "0")
+sackwin_run = 0
 
 sa = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sa.bind(("127.0.0.1", la))
@@ -113,6 +119,44 @@ def stop(*_):
     sys.exit(0)
 
 
+def _sack_window(data):
+    """Returns data with the window shrunk if it is a TCP ACK with SACK."""
+    global sackwin_run
+    if len(data) < 54 or data[12:14] != b"\x08\x00" or data[23] != 6:
+        return data
+    t0 = 14 + (data[14] & 0x0f) * 4
+    doff = (data[t0 + 12] >> 4) * 4
+    i = t0 + 20
+    has_sack = False
+    while i < t0 + doff and i < len(data):
+        kind = data[i]
+        if kind == 0:
+            break
+        if kind == 1:
+            i += 1
+            continue
+        if i + 1 >= len(data) or data[i + 1] < 2:
+            break
+        if kind == 5:
+            has_sack = True
+        i += data[i + 1]
+    if not has_sack:
+        sackwin_run = 0
+        return data
+    sackwin_run += 1
+    old = struct.unpack("!H", data[t0 + 14:t0 + 16])[0]
+    new = max(old - min(sackwin_run, 4096), 1)
+    # incremental checksum update (RFC 1624)
+    c = struct.unpack("!H", data[t0 + 16:t0 + 18])[0]
+    x = (~c & 0xffff) + (~old & 0xffff) + new
+    x = (x & 0xffff) + (x >> 16)
+    x = (x & 0xffff) + (x >> 16)
+    b = bytearray(data)
+    b[t0 + 14:t0 + 16] = struct.pack("!H", new)
+    b[t0 + 16:t0 + 18] = struct.pack("!H", ~x & 0xffff)
+    return bytes(b)
+
+
 def _burst_drop(now, d, data):
     global burst_first, burst_index, burst_rx
     if len(data) < 100 or data[12:14] != b"\x08\x00" or data[23] != 6:
@@ -157,6 +201,8 @@ while True:
                 data = s.recv(65536)
             except BlockingIOError:
                 break
+            if sackwin:
+                data = _sack_window(data)
             st = stats[d]
             st["in"] += 1
             log_frame(now - start, d, data, "in")

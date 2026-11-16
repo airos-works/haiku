@@ -1774,6 +1774,8 @@ test_persist(void)
 
 /* ---- throughput between two guests ---- */
 
+static int sSinkRounds = 3;
+
 static void
 tcp_sink(int seconds)
 {
@@ -1788,7 +1790,7 @@ tcp_sink(int seconds)
 	bind(l, (struct sockaddr*)&a, sizeof(a));
 	listen(l, 4);
 	printf("sink ready\n");
-	for (int round = 0; round < 3; round++) {
+	for (int round = 0; round < sSinkRounds; round++) {
 		int c = accept(l, NULL, NULL);
 		if (c < 0)
 			break;
@@ -1865,6 +1867,71 @@ tcp_send_to(const char* address, int seconds)
 	double secs = (system_time() - start) / 1e6;
 	printf("RATE send %.1f MB/s\n", total / secs / 1e6);
 	close(c);
+}
+
+static int sLinger = -1;
+
+/* sendn: <count> connections, each writing <megabytes> MB and closing, like
+   an HTTP upload; prints each one's time until the receiver closes (with
+   "linger <s>" first: until a lingering close() returns) */
+static void
+tcp_send_count(const char* address, int megabytes, int count)
+{
+	static unsigned char buf[251 * 1044];
+	for (size_t j = 0; j < sizeof(buf); j++)
+		buf[j] = (unsigned char)(j % 251);
+	struct sockaddr_in a;
+	memset(&a, 0, sizeof(a));
+	a.sin_len = sizeof(a);
+	a.sin_family = AF_INET;
+	a.sin_port = htons(5900);
+	a.sin_addr.s_addr = inet_addr(address);
+	for (int k = 0; k < count; k++) {
+		int c = -1;
+		for (int i = 0; i < 60; i++) {
+			c = socket(AF_INET, SOCK_STREAM, 0);
+			if (connect(c, (struct sockaddr*)&a, sizeof(a)) == 0)
+				break;
+			close(c);
+			c = -1;
+			usleep(500000);
+		}
+		if (c < 0) {
+			printf("FAIL sendn: no connection to %s\n", address);
+			return;
+		}
+		if (sLinger >= 0) {
+			struct linger l = { 1, sLinger };
+			setsockopt(c, SOL_SOCKET, SO_LINGER, &l, sizeof(l));
+		}
+		size_t want = (size_t)megabytes << 20, total = 0;
+		bigtime_t start = system_time();
+		while (total < want) {
+			size_t offset = total % sizeof(buf);
+			size_t len = sizeof(buf) - offset;
+			if (len > want - total)
+				len = want - total;
+			ssize_t n = send(c, buf + offset, len, 0);
+			if (n <= 0)
+				break;
+			total += n;
+		}
+		if (sLinger > 0) {
+			/* a lingering close returns once everything is acknowledged */
+			close(c);
+		} else {
+			/* like an HTTP upload: done when the peer has everything and
+			   closes */
+			shutdown(c, SHUT_WR);
+			char tmp[64];
+			while (recv(c, tmp, sizeof(tmp), 0) > 0)
+				;
+			close(c);
+		}
+		double secs = (system_time() - start) / 1e6;
+		printf("SENDN %d %.3f s %.1f MB/s\n", k, secs, total / secs / 1e6);
+		usleep(1000000);
+	}
 }
 
 /* ---- #125: SACK-based recovery ---- */
@@ -2205,7 +2272,14 @@ main(int argc, char** argv)
 		const char* t = argv[i];
 		if (!strcmp(t, "sink"))
 			tcp_sink(atoi(argv[++i]));
-		else if (!strcmp(t, "sndbuf"))
+		else if (!strcmp(t, "linger"))
+			sLinger = atoi(argv[++i]);
+		else if (!strcmp(t, "rounds"))
+			sSinkRounds = atoi(argv[++i]);
+		else if (!strcmp(t, "sendn")) {
+			tcp_send_count(argv[i + 1], atoi(argv[i + 2]), atoi(argv[i + 3]));
+			i += 3;
+		} else if (!strcmp(t, "sndbuf"))
 			sSendBufferSize = atoi(argv[++i]);
 		else if (!strcmp(t, "send")) {
 			tcp_send_to(argv[i + 1], atoi(argv[i + 2]));

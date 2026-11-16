@@ -17,6 +17,7 @@ floods. Every test prints `PASS <name>` or `FAIL <name>: why`.
 | `persist` | the persist timer keeps probing a closed window |
 | `ooo`, `synflood`, `fragflood`, `udpburst`, `udpempty`, `ipv6ext`, `rfc5961`, `predictable`, `mss12`, `mss1460`, `icmp`, `timewait`, `ioctl`, `priv` | the #126-#130 fixes |
 | `sink N` / `[sndbuf B] send ADDR S` | throughput between two guests |
+| `[rounds R] sink N` / `[linger S] sendn ADDR MB COUNT` | COUNT uploads of MB each, timed until the receiver closes (or, with `linger`, until a lingering `close()` returns); the sink takes R connections (default 3) |
 
 ## Running
 
@@ -48,7 +49,22 @@ root; unprivileged user namespaces are not available on the build server).
 It prints the receive rates, the sender's `netstat -s` TCP counters
 (retransmissions, retransmit timeouts, fast recoveries) and the relay's
 counters. `TRACE=/dev/shm/file` makes the relay log every TCP frame;
-`flight.py` and `gaps.py` read such a trace.
+`flight.py` and `gaps.py` read such a trace. `SINK="rounds 8 sink 30"`
+replaces the sink's arguments.
+
+The relay also takes, in its environment:
+- `BURST=after:n:k:rx`: reproducible loss (see `relay.py`).
+- `SACKWIN=1`: every ACK carrying SACK blocks advertises a smaller window
+  than the one before, as a Linux receiver's does while its out-of-order
+  queue fills. A Haiku receiver keeps its window, so without this a sender
+  that ignored such ACKs as window updates passed every test here and still
+  timed out in half of its uploads to a Linux server (#113).
+
+An upload like the X399's to a server 24 ms away:
+
+```
+SACKWIN=1 SINK="rounds 8 sink 30" ./pair-lossy.sh sy <image> "sendn 10.10.0.1 10 8" 200 12 0 ba 128 1
+```
 
 Traps:
 - Write traces to `/dev/shm`. A trace on a busy disk blocked the relay for
@@ -59,5 +75,9 @@ Traps:
 - The sender's script powers the guest off when it is done; `close()`
   returns with up to 4 MB still queued, so it waits 12 s before `netstat`
   to let the last stream drain.
+- A guest can stop for 100-250 ms under load. A receiving guest then sends
+  no ACKs and drops part of what arrives in its virtio ring, and the sender's
+  retransmit timeout is right: look for a silence in the ACKs of the trace
+  before blaming the sender.
 - The relay's UDP sockets are capped at `net.core.rmem_max` (about 200 KB), so
   very large bursts also lose frames before the relay sees them.
