@@ -3975,6 +3975,10 @@ TCPEndpoint::_Acknowledged(tcp_segment_header& segment)
 			// notify threads waiting on the socket to become writable again
 			fSendCondition.NotifyAll();
 			gSocketModule->notify(socket, B_SELECT_WRITE, fSendQueue.Free());
+		} else if (fSendQueue.Used() == 0) {
+			// a close() lingering for the queue to drain waits for this;
+			// it slept out the whole linger time before
+			fSendCondition.NotifyAll();
 		}
 	}
 
