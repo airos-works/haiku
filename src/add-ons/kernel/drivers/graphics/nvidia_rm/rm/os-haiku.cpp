@@ -472,15 +472,27 @@ NV_STATUS NV_API_CALL nv_alloc_pages(
 	}
 	TRACE("  area: %" B_PRId32 "\n", alloc->area.Get());
 
-	for (uint32 page = 0; page < ((contiguous) ? 1 : page_count); page++) {
-		physical_entry table;
-		if (get_memory_map((uint8*)address + (uint64)page * B_PAGE_SIZE, B_PAGE_SIZE, &table, 1) < B_OK)
+	// RM wants the physical address of every page (only the first for
+	// contiguous memory). Ask for the area's physical runs, 64 at a time,
+	// instead of one get_memory_map() call per page: an 8 MiB buffer took
+	// 2048 calls (airos-works/haiku#132).
+	const uint32 wantedPages = contiguous ? 1 : page_count;
+	for (uint32 page = 0; page < wantedPages;) {
+		physical_entry table[64];
+		uint32 entries = B_COUNT_OF(table);
+		status_t status = get_memory_map_etc(B_SYSTEM_TEAM,
+			(uint8*)address + (uint64)page * B_PAGE_SIZE,
+			(size_t)(wantedPages - page) * B_PAGE_SIZE, table, &entries);
+		if ((status != B_OK && status != B_BUFFER_OVERFLOW) || entries == 0)
 			abort();
 
-		uint64 physAdr = table.address;
-
-		pte_array[page] = physAdr;
-		// dprintf("  pte_array[%" B_PRIu32 "]: %#" B_PRIx64 "\n", page, physAdr);
+		for (uint32 i = 0; i < entries && page < wantedPages; i++) {
+			for (phys_size_t offset = 0;
+					offset < table[i].size && page < wantedPages;
+					offset += B_PAGE_SIZE) {
+				pte_array[page++] = table[i].address + offset;
+			}
+		}
 	}
 	TRACE("  pte_array[0]: %#" B_PRIx64 "\n", pte_array[0]);
 	alloc->physBase = pte_array[0];
