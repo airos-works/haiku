@@ -150,6 +150,8 @@ private:
 			void		_RecoverySend();
 			uint32		_SkipReported();
 			void		_NoteFirstHoleResent();
+			bool		_ResendFirstUnacknowledged();
+			void		_InitRecoveryMarks(tcp_sequence initial);
 
 	static	void		_TimeWaitTimer(net_timer* timer, void* _endpoint);
 	static	void		_RetransmitTimer(net_timer* timer, void* _endpoint);

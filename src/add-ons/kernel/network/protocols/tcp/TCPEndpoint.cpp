@@ -1808,14 +1808,7 @@ TCPEndpoint::_DuplicateAcknowledge(tcp_segment_header &segment)
 			// segments that left the network.
 			fCongestionWindow = fSlowStartThreshold
 				+ (sack ? 0 : 3 * fSendMaxSegmentSize);
-			fSendNext = segment.acknowledge;
-			_SendQueued();
-			// the end of what was resent: a segment holds the MSS less the
-			// options, so "+ fSendMaxSegmentSize" ran 12 bytes into the next
-			// hole, which then counted as resent - a retransmit timeout
-			// after every partial ACK (airos-works/haiku#125)
-			fHighRetransmitted = fSendNext;
-			_NoteFirstHoleResent();
+			_ResendFirstUnacknowledged();
 			if (sack) {
 				fSendNext = fSendMax;
 				_RecoverySend();
@@ -1830,14 +1823,7 @@ TCPEndpoint::_DuplicateAcknowledge(tcp_segment_header &segment)
 			// timeout (airos-works/haiku#125).
 			fFlags |= FLAG_RECOVERY;
 			fRecover = fSendMax - 1;
-			fSendNext = segment.acknowledge;
-			_SendQueued();
-			// the end of what was resent: a segment holds the MSS less the
-			// options, so "+ fSendMaxSegmentSize" ran 12 bytes into the next
-			// hole, which then counted as resent - a retransmit timeout
-			// after every partial ACK (airos-works/haiku#125)
-			fHighRetransmitted = fSendNext;
-			_NoteFirstHoleResent();
+			_ResendFirstUnacknowledged();
 			fSendNext = fSendMax;
 			_RecoverySend();
 		}
@@ -1859,6 +1845,12 @@ TCPEndpoint::_DuplicateAcknowledge(tcp_segment_header &segment)
 		// instead of waiting a round trip for each (RFC 6675)
 		if ((fFlags & FLAG_RECOVERY) != 0)
 			_RetransmitNextHole();
+
+		// a fast retransmit the pacing held back goes before new data:
+		// sending new data from fSendMax forgot it until the retransmit
+		// timeout
+		if ((fFlags & FLAG_RECOVERY) != 0 && !_ResendFirstUnacknowledged())
+			return;
 
 		if (fSendQueue.Available(fSendMax) != 0) {
 			fSendNext = fSendMax;
@@ -2125,6 +2117,53 @@ TCPEndpoint::_NoteFirstHoleResent()
 	fFirstHoleResentAt = fSendUnacknowledged;
 	fFirstHoleResentBefore = fSendMax;
 	fLastHoleResentBefore = fSendMax;
+}
+
+
+/*!	Starts the sequence numbers that loss recovery compares in the send
+	space. They were 0, which half of all initial sequence numbers place
+	ahead of everything sent: comparisons are modulo 2^32. Until the first
+	fast retransmit overwrote it, fHighRetransmitted then said every hole
+	was resent already, so the first resend was skipped and only the
+	retransmit timeout repaired the loss (airos-works/haiku#125).
+*/
+void
+TCPEndpoint::_InitRecoveryMarks(tcp_sequence initial)
+{
+	fPreviousHighestAcknowledge = initial;
+	fHighRetransmitted = initial;
+	fFirstHoleResentAt = initial;
+	fFirstHoleResentBefore = initial;
+	fLastHoleResentBefore = initial;
+	fHystartRoundEnd = initial;
+}
+
+
+/*!	In fast recovery, resends the first unacknowledged segment unless that
+	was done already. Returns whether it has gone out: the pacing may hold
+	it back, and then the pacing timer or the next duplicate ACK tries
+	again (fHighRetransmitted stays below it). Without SACK nothing else
+	remembered it: the next duplicate ACK sent new data instead, and only
+	the retransmit timeout repaired the loss (airos-works/haiku#125).
+	Leaves fSendNext after what it sent.
+*/
+bool
+TCPEndpoint::_ResendFirstUnacknowledged()
+{
+	if (fSendUnacknowledged < fHighRetransmitted)
+		return true;
+
+	fSendNext = fSendUnacknowledged;
+	_SendQueued();
+	if (!(fSendUnacknowledged < fSendNext))
+		return false;
+
+	// the end of what was resent: a segment holds the MSS less the options,
+	// so "+ fSendMaxSegmentSize" ran 12 bytes into the next hole, which then
+	// counted as resent - a retransmit timeout after every partial ACK
+	fHighRetransmitted = fSendNext;
+	_NoteFirstHoleResent();
+	return true;
 }
 
 
@@ -2510,6 +2549,7 @@ TCPEndpoint::_SpawnFromCookie(TCPEndpoint* parent, tcp_segment_header& segment,
 		fSendUnacknowledged = initial;
 		fSendUrgentOffset = initial;
 		fRecover = initial;
+		_InitRecoveryMarks(initial);
 		fSendNext = initial + 1;
 		fSendMax = initial + 1;
 		fSendQueue.SetInitialSequence(initial + 1);
@@ -3807,6 +3847,7 @@ TCPEndpoint::_PrepareSendPath(const sockaddr* peer)
 	fSendMax = fInitialSendSequence;
 	fSendUrgentOffset = fInitialSendSequence;
 	fRecover = fInitialSendSequence;
+	_InitRecoveryMarks(fInitialSendSequence);
 
 	// we are counting the SYN here
 	fSendQueue.SetInitialSequence(fSendNext + 1);
@@ -3875,12 +3916,8 @@ TCPEndpoint::_Acknowledged(tcp_segment_header& segment)
 				// a partial acknowledgement with SACK: the window stays at
 				// ssthresh, the pipe says what can go (RFC 6675)
 				if (!(fSendUnacknowledged < fHighRetransmitted)
-					&& !_RetransmitNextHole()) {
-					fSendNext = fSendUnacknowledged;
-					_SendQueued();
-					fHighRetransmitted = fSendNext;
-					_NoteFirstHoleResent();
-				}
+					&& !_RetransmitNextHole())
+					_ResendFirstUnacknowledged();
 				fSendNext = fSendMax;
 				_RecoverySend();
 			} else {
@@ -3892,10 +3929,7 @@ TCPEndpoint::_Acknowledged(tcp_segment_header& segment)
 				if (!_RetransmitNextHole()
 					&& !(fSendUnacknowledged < fHighRetransmitted)) {
 					// the first unacknowledged segment was not resent yet
-					fSendNext = fSendUnacknowledged;
-					_SendQueued();
-					fHighRetransmitted = fSendNext;
-					_NoteFirstHoleResent();
+					_ResendFirstUnacknowledged();
 					fSendNext = fSendMax;
 				}
 
@@ -4555,6 +4589,12 @@ TCPEndpoint::_PacingTimer(net_timer* timer, void* _endpoint)
 			== (FLAG_RECOVERY | FLAG_OPTION_SACK_PERMITTED)) {
 		endpoint->fSendNext = endpoint->fSendMax;
 		endpoint->_RecoverySend();
+	} else if ((endpoint->fFlags & FLAG_RECOVERY) != 0) {
+		// NewReno: the fast retransmit first, if it was held back
+		if (endpoint->_ResendFirstUnacknowledged()) {
+			endpoint->fSendNext = endpoint->fSendMax;
+			endpoint->_SendQueued();
+		}
 	} else
 		endpoint->_SendQueued();
 }
