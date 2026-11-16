@@ -2202,10 +2202,13 @@ display_control(void* cookie, uint32 op, void* buffer, size_t length)
 
 		case RPI_DISPLAY_GET_STATE:
 		{
-			if (length != sizeof(rpi_display_shared_info))
+			// Mesa's V3D present asks with the size the info had before
+			// flags were added (version 2): it gets that part.
+			if (length != sizeof(rpi_display_shared_info)
+				&& length != offsetof(rpi_display_shared_info, flags))
 				return B_BAD_VALUE;
 			MutexLocker locker(info->lock);
-			return user_memcpy(buffer, info->shared, sizeof(*info->shared));
+			return user_memcpy(buffer, info->shared, length);
 		}
 
 		case RPI_DISPLAY_SET_CHANGE_PORT:
