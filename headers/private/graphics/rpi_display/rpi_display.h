@@ -43,7 +43,42 @@ enum {
 	// bool; shows or hides the cursor
 	RPI_DISPLAY_SHOW_CURSOR,
 	// struct rpi_display_cursor_config; experiments with the cursor's plane
-	RPI_DISPLAY_CURSOR_CONFIG
+	RPI_DISPLAY_CURSOR_CONFIG,
+	// struct rpi_display_source: memory the DMA engine copies from, mapped
+	// into the caller, or a shadow only the engine reaches
+	// (RPI_DISPLAY_DEVICE_COPIES)
+	RPI_DISPLAY_CREATE_SOURCE,
+	// uint32: a source's id
+	RPI_DISPLAY_DELETE_SOURCE,
+	// struct rpi_display_copy; returns once the rectangles are copied
+	RPI_DISPLAY_COPY
+};
+
+// sources and copies
+#define RPI_DISPLAY_SOURCE_SHADOW		0x1
+	// only the engine reaches it: not mapped into the caller
+#define RPI_DISPLAY_FRAME_BUFFER_ID		0
+	// as a copy's destination: the frame buffer
+#define RPI_DISPLAY_MAX_COPY_RECTS		128
+
+struct rpi_display_source {
+	uint32	flags;			// RPI_DISPLAY_SOURCE_*
+	uint16	width;
+	uint16	height;
+	// filled in: B_RGB32 pixels, bytes_per_row apart; area and address are
+	// the caller's mapping (-1 and NULL for a shadow)
+	uint32	id;
+	uint32	bytes_per_row;
+	area_id	area;
+	void*	address;
+};
+
+struct rpi_display_copy {
+	uint32	from;			// a source's id
+	uint32	to;				// a source's id or RPI_DISPLAY_FRAME_BUFFER_ID
+	uint32	count;
+	// left, top, right, bottom each (inclusive): the same place in both
+	const uint16* rects;
 };
 
 // the hardware cursor's buffer is this many pixels a side
@@ -108,6 +143,9 @@ struct rpi_display_shared_info {
 // regions unscaled (the Raspberry Pi 5, whose firmware has no planes for
 // the OS): no other sizes, no scaling.
 #define RPI_DISPLAY_FIXED_MODES		0x1
+// The SoC's DMA engine copies rectangles between sources and into the frame
+// buffer (RPI_DISPLAY_CREATE_SOURCE, RPI_DISPLAY_COPY).
+#define RPI_DISPLAY_DEVICE_COPIES	0x2
 
 struct rpi_display_layout {
 	uint32	version;

@@ -248,6 +248,13 @@ struct display_info {
 	int8			cursorLayer;
 	uint8			cursorImageType;
 	bool			cursorCanvas;
+
+	// copies by the SoC's DMA engine (RPI_DISPLAY_COPY): one channel fills
+	// sources and shadows, the other copies to the frame buffer, so that a
+	// flush at a blank does not wait behind a long copy into a shadow
+	struct display_dma_channel* dmaChannels;
+	struct display_source* sources;
+	uint32			nextSourceID;
 };
 
 
@@ -1998,6 +2005,611 @@ release_layout(display_info* info)
 //	#pragma mark - device
 
 
+//	#pragma mark - copies by the DMA engine
+
+
+/*!	The BCM2712's 40 bit DMA channels (Linux: bcm2835-dma.c, BCM2711_DMA40_*;
+	the "dma40" controller of bcm2712.dtsi, channels 6 to 10 left to the OS,
+	7 taken by the HDMI audio driver). A copy is a chain of control blocks in
+	2D mode, one per rectangle: rows of XLENGTH bytes, YLENGTH of them, the
+	strides added at each row's end. The engine does not snoop the CPU's
+	caches: what the CPU drew into a source is written back first, and the
+	shadows and the frame buffer are memory the CPU does not cache.
+*/
+#define DMA40_BASE					0x1000010000ull
+#define DMA40_CHANNEL_SIZE			0x100
+#define DMA40_CS					0x00
+#define DMA40_CB					0x04
+#define DMA40_DEBUG					0x0c
+#define DMA40_CS_ACTIVE				(1u << 0)
+#define DMA40_CS_END				(1u << 1)
+#define DMA40_CS_INT				(1u << 2)
+#define DMA40_CS_ERR				(1u << 10)
+#define DMA40_CS_WAIT_FOR_WRITES	(1u << 28)
+#define DMA40_CS_ABORT				(1u << 30)
+#define DMA40_CS_HALT				(1u << 31)
+#define DMA40_DEBUG_RESET			(1u << 23)
+#define DMA40_TI_TDMODE				(1u << 1)
+#define DMA40_TI_WAIT_RESP			(1u << 2)
+#define DMA40_TI_WAIT_RD_RESP		(1u << 3)
+#define DMA40_INFO_BURST(x)			(((uint32)(x) & 15) << 8)
+#define DMA40_INFO_INC				(1u << 12)
+#define DMA40_INFO_SIZE_32			(0u << 13)
+#define DMA40_INFO_SIZE_128			(2u << 13)
+#define DMA40_INFO_STRIDE(x)		(((uint32)(x) & 0xffff) << 16)
+
+// Two engines a direction, each copying half of the rows: one engine
+// moves about 1 GB/s, two together more. Filling sources and shadows;
+// copying to the frame buffer.
+static const uint32 kDmaEngines[2][2] = { { 6, 8 }, { 9, 10 } };
+#define DMA_FILL					0
+#define DMA_SCREEN					1
+#define DMA_CHANNEL_COUNT			2
+#define DMA_ENGINES					2
+#define DMA_BLOCK_PAGES				4
+#define DMA_MAX_BLOCKS				(DMA_BLOCK_PAGES * B_PAGE_SIZE / 32)
+#define MAX_SOURCES					8
+static const bigtime_t kDmaTimeout = 200000;
+// bursts of 16 transfers: 4 and 8 copy a half and a fifth slower; waiting
+// for each write's response makes no difference
+#define DMA_BURST					15
+
+struct dma40_cb {
+	uint32	ti;
+	uint32	src;
+	uint32	srci;
+	uint32	dst;
+	uint32	dsti;
+	uint32	len;
+	uint32	next_cb;
+	uint32	reserved;
+};
+
+struct dma_engine {
+	area_id			registersArea;
+	volatile uint8*	registers;
+	area_id			blocksArea;
+	dma40_cb*		blocks;
+	phys_addr_t		blocksPhysical;
+	uint32			blockCount;		// of the copy under way
+	uint64			bytes;
+};
+
+// one direction's engines
+struct display_dma_channel {
+	mutex			lock;
+	dma_engine		engines[DMA_ENGINES];
+	bool			failed;
+	// statistics, for the syslog now and then
+	uint32			copies;
+	uint64			bytes;
+	bigtime_t		busy;
+	bigtime_t		reported;
+};
+
+struct display_source {
+	uint32			id;			// 0: free
+	void*			owner;		// the cookie that made it
+	bool			shadow;
+	area_id			area;
+	uint8*			address;
+	phys_addr_t		physical;
+	uint32			width;
+	uint32			height;
+	uint32			bytesPerRow;
+	team_id			team;
+	area_id			clone;
+};
+
+
+static void
+dma_reset(dma_engine& engine)
+{
+	reg_write(engine.registers, DMA40_CS, DMA40_CS_HALT);
+	spin(10);
+	reg_write(engine.registers, DMA40_DEBUG, DMA40_DEBUG_RESET);
+	spin(10);
+	reg_write(engine.registers, DMA40_CS, DMA40_CS_INT | DMA40_CS_END);
+}
+
+
+static void
+uninit_dma(display_info* info)
+{
+	if (info->dmaChannels != NULL) {
+		for (uint32 i = 0; i < DMA_CHANNEL_COUNT; i++) {
+			display_dma_channel& channel = info->dmaChannels[i];
+			for (uint32 k = 0; k < DMA_ENGINES; k++) {
+				dma_engine& engine = channel.engines[k];
+				if (engine.registers != NULL)
+					dma_reset(engine);
+				if (engine.registersArea >= 0)
+					delete_area(engine.registersArea);
+				if (engine.blocksArea >= 0)
+					delete_area(engine.blocksArea);
+			}
+			mutex_destroy(&channel.lock);
+		}
+		delete[] info->dmaChannels;
+		info->dmaChannels = NULL;
+	}
+	if (info->sources != NULL) {
+		for (uint32 i = 0; i < MAX_SOURCES; i++) {
+			if (info->sources[i].id != 0)
+				delete_area(info->sources[i].area);
+		}
+		delete[] info->sources;
+		info->sources = NULL;
+	}
+}
+
+
+static status_t
+init_engine(dma_engine& engine, uint32 number)
+{
+	if (map_page("rpi display dma", DMA40_BASE + number * DMA40_CHANNEL_SIZE,
+			engine.registersArea, engine.registers) != B_OK)
+		return B_ERROR;
+
+	virtual_address_restrictions virtualRestrictions = {};
+	physical_address_restrictions physicalRestrictions = {};
+	void* address;
+	engine.blocksArea = create_area_etc(B_SYSTEM_TEAM, "rpi display dma blocks",
+		DMA_BLOCK_PAGES * B_PAGE_SIZE, B_CONTIGUOUS,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, 0, 0, &virtualRestrictions,
+		&physicalRestrictions, &address);
+	physical_entry entry;
+	if (engine.blocksArea < 0
+		|| get_memory_map(address, B_PAGE_SIZE, &entry, 1) != B_OK
+		|| vm_set_area_memory_type(engine.blocksArea, entry.address,
+			B_UNCACHED_MEMORY) != B_OK)
+		return B_ERROR;
+	engine.blocks = (dma40_cb*)address;
+	engine.blocksPhysical = entry.address;
+	dma_reset(engine);
+	return B_OK;
+}
+
+
+/*!	The engines, their control blocks, and the source table; with any of it
+	missing there are no copies (and the accelerant offers none). */
+static void
+init_dma(display_info* info)
+{
+	if (!info->bcm2712)
+		return;
+	// "device_copies false" in the driver's settings: the CPU copies, as
+	// before; "device_copies test": the ioctls work, but the accelerant is
+	// not told
+	void* settings = load_driver_settings("rpi_display");
+	const char* mode = get_driver_parameter(settings, "device_copies", "true",
+		"true");
+	bool enabled = strcmp(mode, "false") != 0;
+	bool advertised = enabled && strcmp(mode, "test") != 0;
+	unload_driver_settings(settings);
+	if (!enabled)
+		return;
+	info->dmaChannels = new(std::nothrow) display_dma_channel[DMA_CHANNEL_COUNT];
+	info->sources = new(std::nothrow) display_source[MAX_SOURCES];
+	if (info->dmaChannels == NULL || info->sources == NULL) {
+		delete[] info->dmaChannels;
+		delete[] info->sources;
+		info->dmaChannels = NULL;
+		info->sources = NULL;
+		return;
+	}
+	memset(info->sources, 0, sizeof(display_source) * MAX_SOURCES);
+	info->nextSourceID = 1;
+
+	bool ok = true;
+	for (uint32 i = 0; i < DMA_CHANNEL_COUNT; i++) {
+		display_dma_channel& channel = info->dmaChannels[i];
+		memset(&channel, 0, sizeof(channel));
+		mutex_init(&channel.lock, i == DMA_FILL ? "rpi display dma fill"
+			: "rpi display dma screen");
+		for (uint32 k = 0; k < DMA_ENGINES; k++) {
+			channel.engines[k].registersArea = -1;
+			channel.engines[k].blocksArea = -1;
+			if (ok && init_engine(channel.engines[k], kDmaEngines[i][k]) != B_OK)
+				ok = false;
+		}
+	}
+	if (!ok) {
+		ERROR("no DMA channels: the CPU copies to the screen\n");
+		uninit_dma(info);
+		return;
+	}
+	if (advertised)
+		info->shared->flags |= RPI_DISPLAY_DEVICE_COPIES;
+}
+
+
+static display_source*
+find_source(display_info* info, uint32 id)
+{
+	if (info->sources == NULL || id == 0)
+		return NULL;
+	for (uint32 i = 0; i < MAX_SOURCES; i++) {
+		if (info->sources[i].id == id)
+			return &info->sources[i];
+	}
+	return NULL;
+}
+
+
+/*!	Both channels, before the device lock (the order copies take them in):
+	held while a source or the frame buffer is let go of, which a copy under
+	way may still read or write. */
+static void
+lock_dma(display_info* info)
+{
+	if (info->dmaChannels == NULL)
+		return;
+	for (uint32 i = 0; i < DMA_CHANNEL_COUNT; i++)
+		mutex_lock(&info->dmaChannels[i].lock);
+}
+
+
+static void
+unlock_dma(display_info* info)
+{
+	if (info->dmaChannels == NULL)
+		return;
+	for (uint32 i = DMA_CHANNEL_COUNT; i-- > 0;)
+		mutex_unlock(&info->dmaChannels[i].lock);
+}
+
+
+static void
+delete_source(display_source& source)
+{
+	// the caller's mapping first: its pages stay with it otherwise
+	if (source.clone >= 0)
+		vm_delete_area(source.team, source.clone, true);
+	delete_area(source.area);
+	source.id = 0;
+}
+
+
+static status_t
+create_source(display_info* info, void* owner, rpi_display_source& request)
+{
+	if (info->sources == NULL)
+		return B_NOT_SUPPORTED;
+	if (request.width == 0 || request.height == 0)
+		return B_BAD_VALUE;
+	display_source* source = NULL;
+	for (uint32 i = 0; i < MAX_SOURCES; i++) {
+		if (info->sources[i].id == 0) {
+			source = &info->sources[i];
+			break;
+		}
+	}
+	if (source == NULL)
+		return B_NO_MEMORY;
+
+	// whole 64 byte lines a row: the CPU's cache lines, and the engine's
+	// bursts start aligned
+	const bool shadow = (request.flags & RPI_DISPLAY_SOURCE_SHADOW) != 0;
+	uint32 bytesPerRow = ROUNDUP((uint32)request.width * 4, 64);
+	size_t size = ROUNDUP((size_t)bytesPerRow * request.height, B_PAGE_SIZE);
+	virtual_address_restrictions virtualRestrictions = {};
+	physical_address_restrictions physicalRestrictions = {};
+	void* address;
+	area_id area = create_area_etc(B_SYSTEM_TEAM, shadow
+			? "rpi display shadow" : "rpi display source", size, B_CONTIGUOUS,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, 0, 0, &virtualRestrictions,
+		&physicalRestrictions, &address);
+	if (area < 0)
+		return area;
+	physical_entry entry;
+	status_t status = get_memory_map(address, B_PAGE_SIZE, &entry, 1);
+	// a shadow is the engine's alone: not cached, nothing to write back
+	if (status == B_OK && shadow) {
+		status = vm_set_area_memory_type(area, entry.address,
+			B_WRITE_COMBINING_MEMORY);
+	}
+	if (status != B_OK) {
+		delete_area(area);
+		return status;
+	}
+	memset(address, 0, size);
+	if (!shadow) {
+		// nothing of the clear stays in the cache to be written back over
+		// what the engine copies later
+		for (addr_t line = (addr_t)address; line < (addr_t)address + size;
+				line += 64)
+			asm volatile("dc civac, %0" :: "r"(line) : "memory");
+		asm volatile("dsb sy" ::: "memory");
+	}
+
+	area_id clone = -1;
+	void* cloneAddress = NULL;
+	if (!shadow) {
+		clone = vm_clone_area(team_get_current_team_id(), "rpi display source",
+			&cloneAddress, B_ANY_ADDRESS, B_READ_AREA | B_WRITE_AREA, 0, area,
+			true);
+		if (clone < 0) {
+			delete_area(area);
+			return clone;
+		}
+	}
+
+	source->id = info->nextSourceID++;
+	if (info->nextSourceID == 0)
+		info->nextSourceID = 1;
+	source->owner = owner;
+	source->shadow = shadow;
+	source->area = area;
+	source->address = (uint8*)address;
+	source->physical = entry.address;
+	source->width = request.width;
+	source->height = request.height;
+	source->bytesPerRow = bytesPerRow;
+	source->team = team_get_current_team_id();
+	source->clone = clone;
+
+	request.id = source->id;
+	request.bytes_per_row = bytesPerRow;
+	request.area = clone;
+	request.address = cloneAddress;
+	INFO("%s %" B_PRIu32 ": %" B_PRIu32 "x%" B_PRIu32 " at %#" B_PRIxPHYSADDR
+		"\n", shadow ? "shadow" : "source", source->id, source->width,
+		source->height, source->physical);
+	return B_OK;
+}
+
+
+/*!	One end of a copy: a source, or the frame buffer for
+	RPI_DISPLAY_FRAME_BUFFER_ID. Locked. */
+struct copy_end {
+	phys_addr_t	physical;
+	uint8*		address;		// where the CPU caches it, else NULL
+	uint32		bytesPerRow;
+	uint32		width;
+	uint32		height;
+};
+
+
+static bool
+copy_end_of(display_info* info, uint32 id, copy_end& end)
+{
+	if (id == RPI_DISPLAY_FRAME_BUFFER_ID) {
+		if (info->bufferArea < 0)
+			return false;
+		end.physical = info->bufferAddress;
+		end.address = NULL;
+		end.bytesPerRow = info->shared->bytes_per_row;
+		end.width = info->shared->width;
+		end.height = info->shared->height;
+		return end.bytesPerRow != 0;
+	}
+	display_source* source = find_source(info, id);
+	if (source == NULL)
+		return false;
+	end.physical = source->physical;
+	end.address = source->shadow ? NULL : source->address;
+	end.bytesPerRow = source->bytesPerRow;
+	end.width = source->width;
+	end.height = source->height;
+	return true;
+}
+
+
+/*!	Control blocks for rows [top, top + rows) of a rectangle, on one engine.
+	Rows that do not start on 16 bytes: 32 bit transfers are some eight times
+	slower than 128 bit ones, so only the up to three pixels on either side
+	go that way (both ends have the same alignment: their rows are whole 64
+	byte lines apart). */
+static bool
+add_blocks(dma_engine& engine, const copy_end& from, const copy_end& to,
+	uint32 left, uint32 top, uint32 rowBytes, uint32 rows)
+{
+	uint64 source = from.physical + (uint64)top * from.bytesPerRow + left * 4;
+	uint64 destination = to.physical + (uint64)top * to.bytesPerRow + left * 4;
+	uint32 head = (16 - (uint32)(source & 15)) & 15;
+	if ((destination & 15) != (source & 15) || head >= rowBytes)
+		head = rowBytes;
+	uint32 middle = (rowBytes - head) & ~15u;
+	uint32 tail = rowBytes - head - middle;
+	const uint32 parts[3][2] = {
+		{ 0, head }, { head, middle }, { head + middle, tail }
+	};
+	for (uint32 k = 0; k < 3; k++) {
+		uint32 offset = parts[k][0], width = parts[k][1];
+		if (width == 0)
+			continue;
+		if (engine.blockCount == DMA_MAX_BLOCKS)
+			return false;
+		uint64 partSource = source + offset;
+		uint64 partDestination = destination + offset;
+		uint32 size = (partSource & 15) == 0 && (partDestination & 15) == 0
+			&& (width & 15) == 0 ? DMA40_INFO_SIZE_128 : DMA40_INFO_SIZE_32;
+		dma40_cb& block = engine.blocks[engine.blockCount];
+		block.ti = DMA40_TI_TDMODE;
+		block.src = (uint32)partSource;
+		block.srci = (uint32)(partSource >> 32) | DMA40_INFO_INC | size
+			| DMA40_INFO_BURST(DMA_BURST)
+			| DMA40_INFO_STRIDE(from.bytesPerRow - width);
+		block.dst = (uint32)partDestination;
+		block.dsti = (uint32)(partDestination >> 32) | DMA40_INFO_INC | size
+			| DMA40_INFO_BURST(DMA_BURST)
+			| DMA40_INFO_STRIDE(to.bytesPerRow - width);
+		// YLENGTH counts the rows after the first
+		block.len = ((rows - 1) << 16) | width;
+		block.next_cb = 0;
+		block.reserved = 0;
+		if (engine.blockCount > 0) {
+			engine.blocks[engine.blockCount - 1].next_cb = (uint32)(
+				(engine.blocksPhysical + engine.blockCount * sizeof(dma40_cb))
+					>> 5);
+		}
+		engine.blockCount++;
+	}
+	engine.bytes += (uint64)rowBytes * rows;
+	return true;
+}
+
+
+/*!	Copies the rectangles from one end to the other, and returns once the
+	engines have written them. Called without the device lock. */
+static status_t
+dma_copy(display_info* info, display_dma_channel& channel,
+	const rpi_display_copy& request, const uint16* rects)
+{
+	const uint32 count = request.count;
+	if (count == 0)
+		return B_OK;
+	if (count > RPI_DISPLAY_MAX_COPY_RECTS)
+		return B_BAD_VALUE;
+
+	// The channel's lock keeps both ends: letting go of a source or the
+	// frame buffer takes it first.
+	MutexLocker locker(channel.lock);
+	if (channel.failed)
+		return B_ERROR;
+	copy_end from, to;
+	{
+		MutexLocker deviceLocker(info->lock);
+		if (request.from == RPI_DISPLAY_FRAME_BUFFER_ID
+			|| !copy_end_of(info, request.from, from)
+			|| !copy_end_of(info, request.to, to))
+			return B_BAD_VALUE;
+	}
+	if (from.bytesPerRow > 0x7fff || to.bytesPerRow > 0x7fff)
+		return B_BAD_VALUE;
+
+	for (uint32 k = 0; k < DMA_ENGINES; k++) {
+		channel.engines[k].blockCount = 0;
+		channel.engines[k].bytes = 0;
+	}
+	uint64 bytes = 0;
+	for (uint32 i = 0; i < count; i++) {
+		const uint16* r = rects + i * 4;
+		uint32 left = r[0], top = r[1], right = r[2], bottom = r[3];
+		if (right < left || bottom < top || right >= from.width
+			|| right >= to.width || bottom >= from.height
+			|| bottom >= to.height)
+			return B_BAD_VALUE;
+		uint32 rowBytes = (right - left + 1) * 4;
+		uint32 rows = bottom - top + 1;
+
+		// what the CPU drew is written back to memory, where the engines
+		// read
+		if (from.address != NULL) {
+			uint8* row = from.address + (size_t)top * from.bytesPerRow
+				+ left * 4;
+			for (uint32 y = 0; y < rows; y++, row += from.bytesPerRow) {
+				for (addr_t line = (addr_t)row & ~(addr_t)63;
+						line < (addr_t)row + rowBytes; line += 64)
+					asm volatile("dc cvac, %0" :: "r"(line) : "memory");
+			}
+		}
+
+		// a large one half each, small ones to the engine with less to do
+		bool ok;
+		if (rows >= 16 && (uint64)rowBytes * rows >= 64 * 1024) {
+			uint32 half = rows / 2;
+			ok = add_blocks(channel.engines[0], from, to, left, top, rowBytes,
+					half)
+				&& add_blocks(channel.engines[1], from, to, left, top + half,
+					rowBytes, rows - half);
+		} else {
+			dma_engine& engine = channel.engines[0].bytes
+				<= channel.engines[1].bytes ? channel.engines[0]
+					: channel.engines[1];
+			ok = add_blocks(engine, from, to, left, top, rowBytes, rows);
+		}
+		if (!ok)
+			return B_BAD_VALUE;
+		bytes += (uint64)rowBytes * rows;
+	}
+	asm volatile("dsb sy" ::: "memory");
+
+	bigtime_t start = system_time();
+	uint64 most = 0;
+	for (uint32 k = 0; k < DMA_ENGINES; k++) {
+		dma_engine& engine = channel.engines[k];
+		if (engine.blockCount == 0)
+			continue;
+		reg_write(engine.registers, DMA40_CS, DMA40_CS_INT | DMA40_CS_END);
+		reg_write(engine.registers, DMA40_CB,
+			(uint32)(engine.blocksPhysical >> 5));
+		reg_write(engine.registers, DMA40_CS, DMA40_CS_ACTIVE
+			| DMA40_CS_WAIT_FOR_WRITES);
+		if (engine.bytes > most)
+			most = engine.bytes;
+	}
+
+	// about 1 GB/s an engine: sleep through most of it, then look often
+	bigtime_t expected = most / 1000;
+	if (expected > 200)
+		snooze(expected - 100);
+	bool failed = false;
+	for (uint32 k = 0; k < DMA_ENGINES; k++) {
+		dma_engine& engine = channel.engines[k];
+		if (engine.blockCount == 0)
+			continue;
+		uint32 cs;
+		while (true) {
+			cs = reg_read(engine.registers, DMA40_CS);
+			if ((cs & DMA40_CS_ACTIVE) == 0 || (cs & DMA40_CS_ERR) != 0)
+				break;
+			if (system_time() - start > kDmaTimeout)
+				break;
+			if (expected > 200)
+				snooze(50);
+			else
+				spin(5);
+		}
+		if ((cs & DMA40_CS_ACTIVE) != 0 || (cs & DMA40_CS_ERR) != 0) {
+			ERROR("DMA copy of %" B_PRIu32 " rectangles failed on channel %"
+				B_PRIu32 " (cs %#" B_PRIx32 ", %" B_PRIdBIGTIME " us): the CPU "
+				"copies from now on\n", count, kDmaEngines[&channel
+					- info->dmaChannels][k], cs, system_time() - start);
+			failed = true;
+		}
+	}
+	bigtime_t elapsed = system_time() - start;
+	if (failed) {
+		for (uint32 k = 0; k < DMA_ENGINES; k++)
+			dma_reset(channel.engines[k]);
+		channel.failed = true;
+		return B_ERROR;
+	}
+
+	channel.copies++;
+	channel.bytes += bytes;
+	channel.busy += elapsed;
+	if (start - channel.reported > 60000000) {
+		if (channel.reported != 0 && channel.busy > 0) {
+			INFO("DMA %s: %" B_PRIu32 " copies, %" B_PRIu64 " MB in %"
+				B_PRIdBIGTIME " ms (%" B_PRIu64 " MB/s)\n",
+				&channel == &info->dmaChannels[DMA_FILL] ? "fill" : "screen",
+				channel.copies, channel.bytes >> 20, channel.busy / 1000,
+				channel.bytes / channel.busy);
+		}
+		channel.copies = 0;
+		channel.bytes = 0;
+		channel.busy = 0;
+		channel.reported = start;
+	}
+	return B_OK;
+}
+
+
+static status_t
+copy_rects(display_info* info, const rpi_display_copy& request,
+	const uint16* rects)
+{
+	if (info->dmaChannels == NULL)
+		return B_NOT_SUPPORTED;
+	return dma_copy(info, info->dmaChannels[request.to
+		== RPI_DISPLAY_FRAME_BUFFER_ID ? DMA_SCREEN : DMA_FILL], request,
+		rects);
+}
+
+
 static status_t
 display_init_device(void* _info, void** _cookie)
 {
@@ -2104,6 +2716,7 @@ display_init_device(void* _info, void** _cookie)
 		map_compositor(info);
 	if (info->hvsArea >= 0)
 		info->retrace = new(std::nothrow) RetraceSemaphores;
+	init_dma(info);
 	*_cookie = info;
 	return B_OK;
 }
@@ -2132,6 +2745,7 @@ display_uninit_device(void* cookie)
 		delete_area(info->hvsArea);
 	if (info->bcm2712)
 		bcm2712_unmap_mode_registers(info);
+	uninit_dma(info);
 	mutex_destroy(&info->lock);
 	if (info->bufferArea >= 0)
 		delete_area(info->bufferArea);
@@ -2172,6 +2786,9 @@ static status_t
 display_free(void* cookie)
 {
 	display_info* info = sInfo;
+	// its sources, and the layout's frame buffer, go: no copy may be under
+	// way into them
+	lock_dma(info);
 	MutexLocker locker(info->lock);
 	if (info->notificationOwner == cookie) {
 		info->notificationOwner = NULL;
@@ -2181,7 +2798,19 @@ display_free(void* cookie)
 		release_layout(info);
 		info->owner = NULL;
 	}
+	if (info->sources != NULL) {
+		for (uint32 i = 0; i < MAX_SOURCES; i++) {
+			display_source& source = info->sources[i];
+			if (source.id != 0 && source.owner == cookie) {
+				// its team is going or gone: its mapping goes with it
+				source.clone = -1;
+				delete_source(source);
+			}
+		}
+	}
 	atomic_add(&info->openCount, -1);
+	locker.Unlock();
+	unlock_dma(info);
 	free(cookie);
 	return B_OK;
 }
@@ -2209,6 +2838,57 @@ display_control(void* cookie, uint32 op, void* buffer, size_t length)
 				return B_BAD_VALUE;
 			MutexLocker locker(info->lock);
 			return user_memcpy(buffer, info->shared, length);
+		}
+
+		case RPI_DISPLAY_CREATE_SOURCE:
+		{
+			rpi_display_source request;
+			if (length != sizeof(request)
+				|| user_memcpy(&request, buffer, sizeof(request)) != B_OK)
+				return B_BAD_VALUE;
+			MutexLocker locker(info->lock);
+			status_t status = create_source(info, cookie, request);
+			if (status != B_OK)
+				return status;
+			if (user_memcpy(buffer, &request, sizeof(request)) != B_OK) {
+				delete_source(*find_source(info, request.id));
+				return B_BAD_ADDRESS;
+			}
+			return B_OK;
+		}
+
+		case RPI_DISPLAY_DELETE_SOURCE:
+		{
+			uint32 id;
+			if (length != sizeof(id)
+				|| user_memcpy(&id, buffer, sizeof(id)) != B_OK)
+				return B_BAD_VALUE;
+			// not while a copy reads or writes it
+			lock_dma(info);
+			MutexLocker locker(info->lock);
+			display_source* source = find_source(info, id);
+			status_t status = B_BAD_VALUE;
+			if (source != NULL && source->owner == cookie) {
+				delete_source(*source);
+				status = B_OK;
+			}
+			locker.Unlock();
+			unlock_dma(info);
+			return status;
+		}
+
+		case RPI_DISPLAY_COPY:
+		{
+			rpi_display_copy request;
+			if (length != sizeof(request)
+				|| user_memcpy(&request, buffer, sizeof(request)) != B_OK
+				|| request.count > RPI_DISPLAY_MAX_COPY_RECTS)
+				return B_BAD_VALUE;
+			uint16 rects[RPI_DISPLAY_MAX_COPY_RECTS * 4];
+			if (user_memcpy(rects, request.rects,
+					request.count * 4 * sizeof(uint16)) != B_OK)
+				return B_BAD_ADDRESS;
+			return copy_rects(info, request, rects);
 		}
 
 		case RPI_DISPLAY_SET_CHANGE_PORT:
@@ -2248,12 +2928,17 @@ display_control(void* cookie, uint32 op, void* buffer, size_t length)
 			if (status != B_OK)
 				return status;
 
+			// the frame buffer may be replaced: not while a copy writes it
+			lock_dma(info);
 			MutexLocker locker(info->lock);
 			if (info->owner != NULL && info->owner != cookie)
-				return B_BUSY;
-			status = set_layout(info, layout);
+				status = B_BUSY;
+			else
+				status = set_layout(info, layout);
 			if (status == B_OK)
 				info->owner = cookie;
+			locker.Unlock();
+			unlock_dma(info);
 			return status;
 		}
 

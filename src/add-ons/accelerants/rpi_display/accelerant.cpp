@@ -790,6 +790,110 @@ rpi_set_display_layout(const display_output_config* configs, uint32 count,
 }
 
 
+//	#pragma mark - copies by the DMA engine
+
+
+/*!	app_server's back buffer and the flush's shadows, in memory the SoC's DMA
+	engine reaches (RPI_DISPLAY_DEVICE_COPIES): the engine copies what was
+	drawn into the shadows and from them to the screen, where the CPU did
+	both copies (a 4K screen at 200 %: half a core while a window is
+	dragged). The copies take the driver's ioctls; the driver writes the
+	CPU's caches back first. */
+
+
+static status_t
+create_source(uint16 width, uint16 height, color_space space, uint32 flags,
+	frame_buffer_source* source)
+{
+	if (space != B_RGB32 && space != B_RGBA32)
+		return B_BAD_VALUE;
+	rpi_display_source request = {};
+	request.flags = flags;
+	request.width = width;
+	request.height = height;
+	if (ioctl(gInfo->device, RPI_DISPLAY_CREATE_SOURCE, &request,
+			sizeof(request)) != 0)
+		return errno;
+	source->id = request.id;
+	source->bits = request.address;
+	source->bytes_per_row = request.bytes_per_row;
+	source->width = width;
+	source->height = height;
+	source->space = space;
+	return B_OK;
+}
+
+
+static status_t
+rpi_create_frame_buffer_source(uint16 width, uint16 height, color_space space,
+	frame_buffer_source* source)
+{
+	return create_source(width, height, space, 0, source);
+}
+
+
+static status_t
+rpi_create_frame_buffer_shadow(uint16 width, uint16 height, color_space space,
+	frame_buffer_source* shadow)
+{
+	return create_source(width, height, space, RPI_DISPLAY_SOURCE_SHADOW,
+		shadow);
+}
+
+
+static void
+rpi_delete_frame_buffer_source(uint32 id)
+{
+	// the driver takes the mapping it made in this team with it
+	ioctl(gInfo->device, RPI_DISPLAY_DELETE_SOURCE, &id, sizeof(id));
+}
+
+
+static status_t
+copy_rects(uint32 from, uint32 to, const fill_rect_params* list, uint32 count)
+{
+	static_assert(sizeof(fill_rect_params) == 4 * sizeof(uint16),
+		"fill_rect_params as the driver takes rectangles");
+	while (count > 0) {
+		uint32 chunk = min_c(count, (uint32)RPI_DISPLAY_MAX_COPY_RECTS);
+		rpi_display_copy request = { from, to, chunk, (const uint16*)list };
+		if (ioctl(gInfo->device, RPI_DISPLAY_COPY, &request,
+				sizeof(request)) != 0)
+			return errno;
+		list += chunk;
+		count -= chunk;
+	}
+	return B_OK;
+}
+
+
+static status_t
+rpi_copy_to_frame_buffer(uint32 id, const fill_rect_params* list, uint32 count)
+{
+	return copy_rects(id, RPI_DISPLAY_FRAME_BUFFER_ID, list, count);
+}
+
+
+static status_t
+rpi_copy_frame_buffer_source(uint32 from, uint32 to,
+	const fill_rect_params* list, uint32 count)
+{
+	return copy_rects(from, to, list, count);
+}
+
+
+static bool
+device_copies()
+{
+	// RPI_DISPLAY_NO_DEVICE_COPIES=1 in app_server's environment: the CPU
+	// copies, as without the engine
+	const char* off = getenv("RPI_DISPLAY_NO_DEVICE_COPIES");
+	return gInfo != NULL && !gInfo->is_clone
+		&& (gInfo->shared->flags & RPI_DISPLAY_DEVICE_COPIES) != 0
+		&& (off == NULL || strcmp(off, "1") != 0);
+}
+
+
 //	#pragma mark -
 
 
@@ -846,6 +950,17 @@ get_accelerant_hook(uint32 feature, void* data)
 			return (void*)rpi_set_display_layout;
 		case B_SET_DISPLAY_CHANGE_PORT:
 			return (void*)rpi_set_display_change_port;
+
+		case B_CREATE_FRAME_BUFFER_SOURCE:
+			return device_copies() ? (void*)rpi_create_frame_buffer_source : NULL;
+		case B_DELETE_FRAME_BUFFER_SOURCE:
+			return device_copies() ? (void*)rpi_delete_frame_buffer_source : NULL;
+		case B_COPY_TO_FRAME_BUFFER:
+			return device_copies() ? (void*)rpi_copy_to_frame_buffer : NULL;
+		case B_CREATE_FRAME_BUFFER_SHADOW:
+			return device_copies() ? (void*)rpi_create_frame_buffer_shadow : NULL;
+		case B_COPY_FRAME_BUFFER_SOURCE:
+			return device_copies() ? (void*)rpi_copy_frame_buffer_source : NULL;
 	}
 	return NULL;
 }

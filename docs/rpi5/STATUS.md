@@ -17,7 +17,7 @@ Pi 4 and a Pi 5. How it boots: BOOT.md.
 | Display | `rpi_display` on the HVS: both HDMI outputs, one desktop; mode setting (EDID's preferred mode up to 340 MHz), scaled regions, hardware cursor | 2026-11-15: the KVM at 1080p (HDMI0) and 1280x720 (set in the driver settings, the KVM reports 720p); the Dell 4K at 3840x2160 30 Hz (HDMI1, code 95), its half of the desktop scaled 2x by the HVS (seen right by the owner); blanks at 60.00 Hz; GLTeapot synced |
 | Watchdog | `airos.watchdog` (lab), restart through PSCI | resets after a hang |
 | `airos.debug` | loader and kernel output on the screen | boots to the network (kernel pager: P) |
-| GPU | `v3d` on the V3D 7.1.10 at 1.15 GHz, Mesa 25.3.6 | 2026-11-15: GL ES 3.1 and Vulkan 1.3 probes pass (1080p with depth exact), texture and readback probes pass, GLTeapot ~1690 FPS; `rpi4_v3d_probe` passes (TFU raster to UIF, uncached and cached) |
+| GPU | `v3d` on the V3D 7.1.10 at 1.15 GHz, Mesa 25.3.6 | 2026-11-15: GL ES 3.1 and Vulkan 1.3 probes pass (1080p with depth exact), texture and readback probes pass, GLTeapot ~1690 FPS; 2026-11-16: GL windows present straight into the screen (60 fps at 1% CPU at 200%); `rpi4_v3d_probe` passes (TFU raster to UIF, uncached and cached) |
 | Wi-Fi | `broadcomfmac` on the second SDHCI (sd2, GPIO 30-35, WL_ON gio 28) | WPA2 join, DHCP, ping and ssh over Wi-Fi |
 | Bluetooth | `h4bcm` on the BCM7271 UART (GPIO 24-27, BT_ON gio 29) | patched, LE scan finds the room's devices |
 | HEVC decoding | `rpi_hevc` on `/axi/codec@800000` (910 MHz, version 0x202) | all 25 test streams byte-exact (`rpi4_hevc_decode`) |
@@ -129,6 +129,34 @@ output (the firmware's planes use none). The cursor scales with its
 output's region. As on the Pi 4 the accelerant has the hardware enlarge
 only, so a 1080p screen next to a 4K one at 200% gets a 100% desktop,
 the 4K output's half scaled up.
+
+Copies by the DMA engine (2026-11-16): app_server's back buffer is a
+"frame buffer source" and the vertical blank flush's shadows are memory
+only the SoC's DMA reaches (`B_CREATE_FRAME_BUFFER_SOURCE`,
+`B_CREATE_FRAME_BUFFER_SHADOW`, `B_COPY_FRAME_BUFFER_SOURCE`,
+`B_COPY_TO_FRAME_BUFFER`, as on AMD and NVIDIA): the 40 bit DMA
+controller's channels 6 and 8 fill the shadows from the back buffer, 9 and
+10 copy them to the frame buffer, each pair half the rows of a rectangle
+(control blocks in 2D mode; YLENGTH counts the rows after the first). The
+engine does not snoop: the driver writes the back buffer's lines back
+(`dc cvac`) before a copy; shadows are write-combined. 128 bit transfers
+only from 16 byte boundaries (32 bit ones run 130 MB/s), so up to three
+pixels each side of a row go apart. About 1 GB/s a channel, 1.9 GB/s for a
+whole 5760x2160 frame on two, 2.6 GB/s with all four. A window dragged on
+the 4K screen at 200% (`movetest`): the whole system 6.4% busy instead of
+13.4%, app_server's thread a sixth of a core instead of a third, the
+flush thread idle. Off with `device_copies false` in
+`~/config/settings/kernel/drivers/rpi_display`.
+
+OpenGL windows (BGLView) present straight into the frame buffer with the
+V3D (airos-works/mesa 108fa41, haiku#109): GLTeapot at 200% 60 fps with
+the system 1% busy, where app_server read back, scaled and copied every
+frame on the CPU (about half of four cores).
+
+`profile` panics this kernel (hrev60207+2661) in `SystemProfiler::Init`
+→ `lock_memory_etc` → `vm_soft_fault` → `PageUnmapped` (a NULL area),
+with or without the DMA copies: twice on 2026-11-16 after it had run
+cleanly earlier that day. Do not profile on the Pi until that is fixed.
 
 Read the HVS through `/dev/misc/mem` in blocks (`dd bs=512`): four-byte
 reads came back wrong.
