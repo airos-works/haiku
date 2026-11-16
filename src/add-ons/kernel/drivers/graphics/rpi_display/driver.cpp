@@ -228,6 +228,10 @@ struct display_info {
 	area_id			hdArea;
 	volatile uint8*	hdRegs;
 	uint32			modeClock[RPI_DISPLAY_MAX_OUTPUTS];	// kHz, ours
+	// the DDC's I2C controllers, for the monitors' SCDC
+	area_id			ddcArea;
+	volatile uint8*	ddcRegs[RPI_DISPLAY_MAX_OUTPUTS];
+	bool			scrambling[RPI_DISPLAY_MAX_OUTPUTS];
 
 	// a hardware cursor, composited by the firmware over the frame buffer;
 	// the position is the hotspot, in frame buffer pixels
@@ -423,15 +427,27 @@ connect_output(rpi_display_output& output)
 }
 
 
+static void bcm2712_check_scrambling(display_info* info, uint32 index);
+
+
 static int32
 poll_outputs(void* cookie)
 {
 	display_info* info = (display_info*)cookie;
 	bool previous[2] = {false, false};
 	bigtime_t retryAt[2] = {0, 0};
+	uint32 polls = 0;
 	while (atomic_get(&info->stopping) == 0) {
 		snooze(250000);
 		MutexLocker locker(info->lock);
+		if (info->bcm2712 && ++polls % 4 == 0) {
+			for (uint32 i = 0; i < RPI_DISPLAY_MAX_OUTPUTS; i++) {
+				if (info->hpdRegisters[i] != NULL
+					&& (*info->hpdRegisters[i] & 1) != 0) {
+					bcm2712_check_scrambling(info, i);
+				}
+			}
+		}
 		bool changed = false;
 		for (uint32 i = 0; i < RPI_DISPLAY_MAX_OUTPUTS; i++) {
 			if (info->hpdRegisters[i] == NULL)
@@ -1065,6 +1081,34 @@ hvs6_restore(display_info* info, uint32 index)
 	// as the firmware runs them for progressive modes
 
 #define BCM2712_MAX_PIXEL_CLOCK			340000	// kHz, without scrambling
+#define BCM2712_MAX_SCRAMBLED_CLOCK		600000	// kHz, what the PHY reaches
+#define HDMI6_SCRAMBLER_CTL				0x1e4
+#define  HDMI6_SCRAMBLER_ENABLE			(1u << 0)
+
+// The DDC: Broadcom's "BSC" I2C controllers (i2c-brcmstb.c), polled,
+// eight one-byte data registers
+#define BSC_CHIP_ADDRESS				0x00
+#define BSC_DATA_IN(n)					(0x04 + (n) * 4)
+#define BSC_CNT							0x24
+#define BSC_CTL							0x28
+#define  BSC_CTL_READ					1
+#define  BSC_CTL_97500_HZ				(1u << 4 | 1u << 7)
+	// 390 kHz, divided by four
+#define BSC_IIC_ENABLE					0x2c
+#define  BSC_IIC_ENABLE_ENABLE			(1u << 0)
+#define  BSC_IIC_ENABLE_INTRP			(1u << 1)
+#define  BSC_IIC_ENABLE_NOACK			(1u << 2)
+#define  BSC_IIC_ENABLE_NOSTOP			(1u << 4)
+#define  BSC_IIC_ENABLE_RESTART			(1u << 6)
+#define BSC_DATA_OUT(n)					(0x30 + (n) * 4)
+#define BSC_CTLHI						0x50
+
+// SCDC (HDMI 2.0): the monitor's registers at I2C address 0x54
+#define SCDC_ADDRESS					0x54
+#define SCDC_TMDS_CONFIG				0x20
+#define  SCDC_SCRAMBLING_ENABLE			(1u << 0)
+#define  SCDC_TMDS_CLOCK_RATIO_40		(1u << 1)
+#define SCDC_SCRAMBLER_STATUS			0x21
 #define AVI_INFOFRAME_PACKET			2		// type 0x82 - 0x80
 #define PACKET_STRIDE					0x24
 
@@ -1128,6 +1172,13 @@ bcm2712_map_mode_registers(display_info* info)
 		for (uint32 k = 0; k < 4; k++)
 			info->modeAreas[i][k] = -1;
 	}
+	info->ddcArea = -1;
+	volatile uint8* ddc;
+	if (map_page("bcm2712 hdmi ddc", 0x107d508200ull, info->ddcArea, ddc)
+			== B_OK) {
+		info->ddcRegs[0] = ddc;
+		info->ddcRegs[1] = ddc + 0x80;
+	}
 	status_t status = map_page("bcm2712 hdmi hd", 0x107c720000ull,
 		info->hdArea, info->hdRegs);
 	for (uint32 i = 0; status == B_OK && i < RPI_DISPLAY_MAX_OUTPUTS; i++) {
@@ -1160,6 +1211,8 @@ bcm2712_unmap_mode_registers(display_info* info)
 {
 	if (info->hdArea >= 0)
 		delete_area(info->hdArea);
+	if (info->ddcArea >= 0)
+		delete_area(info->ddcArea);
 	for (uint32 i = 0; i < RPI_DISPLAY_MAX_OUTPUTS; i++) {
 		for (uint32 k = 0; k < 4; k++) {
 			if (info->modeAreas[i][k] >= 0)
@@ -1244,6 +1297,118 @@ bcm2712_update_avi(display_info* info, uint32 index, uint16 videoCode)
 }
 
 
+/*!	One I2C message on output \a index's DDC: \a length (at most 8) bytes
+	written or read, \a flags the start and stop conditions. */
+static status_t
+bsc_transfer(display_info* info, uint32 index, uint8 address, bool read,
+	uint8* data, uint32 length, uint32 flags)
+{
+	volatile uint8* bsc = info->ddcRegs[index];
+	if (bsc == NULL || length == 0 || length > 8)
+		return B_BAD_VALUE;
+
+	reg_write(bsc, BSC_CTLHI, 0);
+	reg_write(bsc, BSC_CTL, BSC_CTL_97500_HZ | (read ? BSC_CTL_READ : 0));
+	reg_write(bsc, BSC_CHIP_ADDRESS, address << 1 | (read ? 1 : 0));
+	reg_write(bsc, BSC_CNT, length);
+	if (!read) {
+		for (uint32 i = 0; i < length; i++)
+			reg_write(bsc, BSC_DATA_IN(i), data[i]);
+	}
+	reg_write(bsc, BSC_IIC_ENABLE, flags | BSC_IIC_ENABLE_ENABLE);
+
+	status_t status = B_OK;
+	bigtime_t timeout = system_time() + 100000;
+	while ((reg_read(bsc, BSC_IIC_ENABLE) & BSC_IIC_ENABLE_INTRP) == 0) {
+		if (system_time() > timeout) {
+			status = B_TIMED_OUT;
+			break;
+		}
+		spin(20);
+	}
+	if (status == B_OK
+		&& (reg_read(bsc, BSC_IIC_ENABLE) & BSC_IIC_ENABLE_NOACK) != 0) {
+		status = B_DEV_NOT_READY;
+	}
+	if (status == B_OK && read) {
+		for (uint32 i = 0; i < length; i++)
+			data[i] = reg_read(bsc, BSC_DATA_OUT(i)) & 0xff;
+	}
+	reg_write(bsc, BSC_CNT, 0);
+	reg_write(bsc, BSC_IIC_ENABLE, 0);
+	return status;
+}
+
+
+static status_t
+scdc_read(display_info* info, uint32 index, uint8 offset, uint8& value)
+{
+	// the offset without a stop, then the read after a repeated start
+	status_t status = bsc_transfer(info, index, SCDC_ADDRESS, false, &offset,
+		1, BSC_IIC_ENABLE_RESTART | BSC_IIC_ENABLE_NOSTOP);
+	if (status == B_OK)
+		status = bsc_transfer(info, index, SCDC_ADDRESS, true, &value, 1, 0);
+	return status;
+}
+
+
+static status_t
+scdc_write(display_info* info, uint32 index, uint8 offset, uint8 value)
+{
+	uint8 data[2] = { offset, value };
+	return bsc_transfer(info, index, SCDC_ADDRESS, false, data, 2, 0);
+}
+
+
+/*!	HDMI 2.0 scrambling and the 1/40 TMDS clock ratio, in the monitor
+	(SCDC) and in the encoder, for TMDS rates above 340 MHz (Linux's
+	vc4_hdmi_enable_scrambling()). */
+static void
+bcm2712_set_scrambling(display_info* info, uint32 index, bool enable)
+{
+	volatile uint8* hdmi = info->hdmiRegs[index];
+	if (!enable) {
+		if (!info->scrambling[index])
+			return;
+		scdc_write(info, index, SCDC_TMDS_CONFIG, 0);
+		reg_write(hdmi, HDMI6_SCRAMBLER_CTL,
+			reg_read(hdmi, HDMI6_SCRAMBLER_CTL) & ~HDMI6_SCRAMBLER_ENABLE);
+		info->scrambling[index] = false;
+		return;
+	}
+
+	status_t status = scdc_write(info, index, SCDC_TMDS_CONFIG,
+		SCDC_SCRAMBLING_ENABLE | SCDC_TMDS_CLOCK_RATIO_40);
+	if (status != B_OK) {
+		ERROR("HDMI%" B_PRIu32 ": the monitor's SCDC: %s\n", index,
+			strerror(status));
+	}
+	reg_write(hdmi, HDMI6_SCRAMBLER_CTL,
+		reg_read(hdmi, HDMI6_SCRAMBLER_CTL) | HDMI6_SCRAMBLER_ENABLE);
+	info->scrambling[index] = true;
+}
+
+
+/*!	A monitor forgets the SCDC settings when it is switched off or sleeps:
+	asked again once a second while it should scramble (Linux's
+	vc4_hdmi_scrambling_wq()). */
+static void
+bcm2712_check_scrambling(display_info* info, uint32 index)
+{
+	if (!info->scrambling[index])
+		return;
+	uint8 status;
+	if (scdc_read(info, index, SCDC_SCRAMBLER_STATUS, status) != B_OK
+		|| (status & 1) != 0) {
+		return;
+	}
+	INFO("HDMI%" B_PRIu32 ": the monitor stopped descrambling, on again\n",
+		index);
+	scdc_write(info, index, SCDC_TMDS_CONFIG,
+		SCDC_SCRAMBLING_ENABLE | SCDC_TMDS_CLOCK_RATIO_40);
+}
+
+
 /*!	Sets output \a index to \a t (Linux's vc4_crtc_disable(), then
 	vc4_crtc_atomic_enable() with the HDMI encoder's hooks). The compositor
 	channel keeps its display list. */
@@ -1261,7 +1426,8 @@ bcm2712_set_mode(display_info* info, uint32 index, const firmware_timing& t)
 	bool hsyncHigh = (t.flags & 1) != 0;
 	bool vsyncHigh = (t.flags & 2) != 0;
 
-	// off: the pixel valve's video, the packets, the picture
+	// off: the pixel valve's video, the packets, the picture, scrambling
+	bcm2712_set_scrambling(info, index, false);
 	reg_write(pv, PV6_V_CONTROL,
 		reg_read(pv, PV6_V_CONTROL) & ~PV6_VCONTROL_VIDEN);
 	spin(20000);
@@ -1357,6 +1523,9 @@ bcm2712_set_mode(display_info* info, uint32 index, const firmware_timing& t)
 	if ((reg_read(hdmi, HDMI6_FIFO_CTL) & HDMI6_FIFO_CTL_RECENTER_DONE) == 0)
 		ERROR("HDMI%" B_PRIu32 ": the FIFO did not recenter\n", index);
 
+	if (tmdsRate > BCM2712_MAX_PIXEL_CLOCK * 1000ull)
+		bcm2712_set_scrambling(info, index, true);
+
 	INFO("HDMI%" B_PRIu32 ": %ux%u at %u Hz, %" B_PRIu32 " kHz (code %u)\n",
 		index, t.hdisplay, t.vdisplay, t.vrefresh, t.clock, t.video_id_code);
 	return B_OK;
@@ -1385,8 +1554,23 @@ bcm2712_pick_timing(const rpi_display_output& output, uint32 index,
 		}
 		unload_driver_settings(settings);
 	}
-	return preferred_edid_timing(output.edid, output.edid_length, timing,
-		BCM2712_MAX_PIXEL_CLOCK, width, height);
+	// above 340 MHz with scrambling, if the monitor can be told of it
+	uint32 maxClock = BCM2712_MAX_PIXEL_CLOCK;
+	uint32 maxTmds;
+	bool scdc;
+	if (sInfo->ddcRegs[index] != NULL
+		&& hdmi_forum_capabilities(output.edid, output.edid_length, maxTmds,
+			scdc) && scdc && maxTmds > maxClock) {
+		maxClock = min_c(maxTmds, BCM2712_MAX_SCRAMBLED_CLOCK);
+	}
+	if (!preferred_edid_timing(output.edid, output.edid_length, timing,
+			maxClock, width, height)) {
+		return false;
+	}
+	// a detailed timing that is a CTA mode is named as one
+	if (timing.video_id_code == 0 && (timing.flags & RPI_TIMING_DVI) == 0)
+		timing.video_id_code = cta_code_of(timing);
+	return true;
 }
 
 
@@ -1425,7 +1609,7 @@ connect_output_bcm2712(rpi_display_output& output)
 	connected.native_height = (control & 0x1fff) + 1;
 	connected.flags = RPI_DISPLAY_OUTPUT_CONNECTED;
 	output = connected;
-	INFO("HDMI%" B_PRIu32 ": %ux%u (the firmware's mode), %" B_PRIu32
+	INFO("HDMI%" B_PRIu32 ": %ux%u, %" B_PRIu32
 		" bytes of EDID\n", index, output.native_width,
 		output.native_height, output.edid_length);
 	return B_OK;
@@ -1845,8 +2029,10 @@ display_init_device(void* _info, void** _cookie)
 			ERROR("cannot map the HDMI registers: no mode setting\n");
 			bcm2712_unmap_mode_registers(info);
 			info->hdRegs = NULL;
-			for (uint32 i = 0; i < RPI_DISPLAY_MAX_OUTPUTS; i++)
+			for (uint32 i = 0; i < RPI_DISPLAY_MAX_OUTPUTS; i++) {
 				info->hdmiRegs[i] = info->pvRegs[i] = NULL;
+				info->ddcRegs[i] = NULL;
+			}
 		}
 	}
 
