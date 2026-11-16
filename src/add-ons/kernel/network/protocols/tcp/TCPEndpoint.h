@@ -309,6 +309,9 @@ private:
 	int32			fHystartHighSamples;
 		// samples in a row above the smallest round trip
 	bigtime_t		fHystartHighSince;
+	uint32			fHystartJitter;
+		// how far samples rose above the smallest round trip while the
+		// window was too small to queue, ms
 
 	tcp_state		fState;
 	uint32			fFlags;

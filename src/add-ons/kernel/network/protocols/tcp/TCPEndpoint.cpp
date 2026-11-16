@@ -620,6 +620,7 @@ TCPEndpoint::TCPEndpoint(net_socket* socket)
 	fHystartMinRoundTrip(UINT32_MAX),
 	fHystartHighSamples(0),
 	fHystartHighSince(0),
+	fHystartJitter(0),
 	fState(CLOSED),
 	fFlags(FLAG_OPTION_WINDOW_SCALE | FLAG_OPTION_TIMESTAMP
 		| FLAG_OPTION_SACK_PERMITTED | FLAG_AUTO_RECEIVE_BUFFER_SIZE
@@ -4344,6 +4345,9 @@ TCPEndpoint::_HystartSample(int32 roundTrip)
 
 	if ((uint32)roundTrip < fHystartMinRoundTrip)
 		fHystartMinRoundTrip = roundTrip;
+	if (fCongestionWindow < 16 * fSendMaxSegmentSize
+		&& (uint32)roundTrip - fHystartMinRoundTrip > fHystartJitter)
+		fHystartJitter = (uint32)roundTrip - fHystartMinRoundTrip;
 
 	if (!(fSendUnacknowledged < fHystartRoundEnd)) {
 		// a new round: what is in flight now is acknowledged at its end
@@ -4363,7 +4367,13 @@ TCPEndpoint::_HystartSample(int32 roundTrip)
 	// quarter of a round trip: a stalled peer (or virtual machine) delays a
 	// burst of ACKs at once, and leaving slow start early on a long path
 	// costs seconds of growth.
+	// The rise has to stand out of the path's own noise, as the first
+	// rounds showed it before the window could queue: the X399's path to
+	// Sydney wanders by 4 to 7 ms in the evening, and every such step ended
+	// slow start at a fraction of the path - uploads took 2 to 5 s where
+	// Linux took 0.5 (#113).
 	uint32 threshold = max_c(4U, min_c(fHystartMinRoundTrip / 8, 16U));
+	threshold = max_c(threshold, min_c(fHystartJitter + 2, 32U));
 	if (fHystartLastMinimum != UINT32_MAX
 		&& (uint32)roundTrip >= fHystartMinRoundTrip + threshold) {
 		const bigtime_t now = system_time();
