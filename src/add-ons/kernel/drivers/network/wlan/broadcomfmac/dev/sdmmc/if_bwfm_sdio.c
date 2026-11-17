@@ -333,18 +333,17 @@ bwfm_sdio_poller(void *arg)
 	struct bwfm_sdio_softc *sc = arg;
 
 	/*
-	 * The bus task runs here, not on the shared task queue: the callers
-	 * that wait for a command's response sit on that queue's one thread.
+	 * The bus task runs here and in the card's interrupt handler, not on
+	 * the shared task queue: the callers that wait for a command's
+	 * response sit on that queue's one thread.
 	 */
 	while (sc->sc_poll) {
 		/*
-		 * The card's interrupt wakes the thread, and so does whoever has
-		 * something to send. Nothing the card raises while the interrupt is
-		 * off gets lost: turning it back on samples the card's line again.
-		 * The card is still served unasked twenty times a second in case
-		 * the controller misses one; on the board those found a frame two
-		 * times in 3000, no more often than frames happen to arrive during
-		 * a serve. (It used to be every millisecond for 300 ms after any
+		 * Whoever has something to send wakes the thread. The card is
+		 * also served unasked twenty times a second in case the controller
+		 * misses an interrupt; on the board those found a frame two times
+		 * in 3000, no more often than frames happen to arrive during a
+		 * serve. (It used to be every millisecond for 300 ms after any
 		 * frame, and a network's broadcasts kept that up for good: 3 % of
 		 * a core with nothing to do.)
 		 */
@@ -355,19 +354,26 @@ bwfm_sdio_poller(void *arg)
 		mtx_lock(&Giant);
 		bwfm_sdio_task(sc);
 		mtx_unlock(&Giant);
-
-		/* the handler turned the interrupt off; the card is served now */
-		rpi_sdio_enable_card_interrupt();
 	}
 	return 0;
 }
 
+/*
+ * The card's interrupt, in the SDIO bus' interrupt thread: the card is
+ * served before this returns, and the bus then lets its interrupt through
+ * again. Nothing the card raises while the interrupt is off gets lost:
+ * turning it back on samples the card's line again.
+ */
 static void
 bwfm_sdio_card_interrupt(void *arg)
 {
 	struct bwfm_sdio_softc *sc = arg;
 
-	release_sem_etc(sc->sc_poll_sem, 1, B_DO_NOT_RESCHEDULE);
+	if (!sc->sc_poll)
+		return;
+	mtx_lock(&Giant);
+	bwfm_sdio_task(sc);
+	mtx_unlock(&Giant);
 }
 
 static void
@@ -401,7 +407,7 @@ bwfm_sdio_attach(struct device *parent, struct device *self, void *aux)
 
 #ifdef __HAIKU__
 	sc->sc_sc.sc_dev = dev;
-	if (rpi_sdio_init() != B_OK)
+	if (bwfm_host_init() != B_OK)
 		return ENXIO;
 #else
 	printf("\n");
@@ -514,7 +520,7 @@ bwfm_sdio_attach(struct device *parent, struct device *self, void *aux)
 err:
 	free(sc->sc_sf, M_DEVBUF, 0);
 #ifdef __HAIKU__
-	rpi_sdio_uninit();
+	bwfm_host_uninit();
 	return ENXIO;
 #endif
 }
@@ -665,10 +671,8 @@ bwfm_sdio_preinit(struct bwfm_softc *bwfm)
 		sc->sc_ih = sc;
 		/* the card signals function 1 and 2 events on its line */
 		bwfm_sdio_write_1(sc, 0x04, 0x07);
-		if (rpi_sdio_set_interrupt_handler(bwfm_sdio_card_interrupt,
-		    sc) == B_OK)
-			rpi_sdio_enable_card_interrupt();
-		else
+		if (bwfm_host_set_interrupt_handler(bwfm_sdio_card_interrupt,
+		    sc) != B_OK)
 			printf("%s: no card interrupt, polling\n", DEVNAME(sc));
 		resume_thread(sc->sc_poller);
 	}
@@ -981,7 +985,8 @@ bwfm_sdio_haiku_detach(device_t dev)
 	}
 
 	if (sc->sc_poll) {
-		rpi_sdio_set_interrupt_handler(NULL, NULL);
+		/* returns once the handler is not running any more */
+		bwfm_host_set_interrupt_handler(NULL, NULL);
 		sc->sc_poll = 0;
 		release_sem(sc->sc_poll_sem);
 		wait_for_thread(sc->sc_poller, &result);
@@ -992,7 +997,7 @@ bwfm_sdio_haiku_detach(device_t dev)
 	ml_purge(&sc->sc_tx_queue);
 	rw_exit(sc->sc_lock);
 
-	rpi_sdio_uninit();
+	bwfm_host_uninit();
 	return 0;
 }
 

@@ -10,13 +10,7 @@
 	command are written together), and two writes need more than two card
 	clock cycles between them. Commands and data are polled; data goes
 	through the data register a word at a time. Only the card's own
-	interrupt (its functions asking for service) uses the interrupt line.
-
-	On the Raspberry Pi 5 the chip (the same CYW43455) is on the BCM2712's
-	second SDHCI ("brcm,bcm2712-sdhci", non-removable): the same register
-	set with a block of configuration registers next to it, a fixed 200 MHz
-	base clock, pins (GPIO 30 to 35) that nobody set up, and the power line
-	WL_ON on GPIO 28 instead of the firmware's expander. */
+	interrupt (its functions asking for service) uses the interrupt line. */
 
 
 #include "sdio_host.h"
@@ -32,7 +26,6 @@
 #include <util/AutoLock.h>
 
 #include <rpi_firmware.h>
-#include <drivers/bcm2712_pins.h>
 
 
 //#define TRACE_SDIO
@@ -44,8 +37,8 @@
 #define ERROR(x...)	dprintf("broadcomfmac: sdio: " x)
 
 // where the BCM2711 has things (ARM physical addresses)
-#define BCM2711_SDHCI_BASE		0xfe300000
-#define BCM2711_SDHCI_INTERRUPT	(126 + 32)
+#define SDHCI_BASE				0xfe300000
+#define SDHCI_INTERRUPT			(126 + 32)
 	// shared with the other SD controller (the card slot's)
 #define GPIO_BASE				0xfe200000
 #define GPIO_FSEL3				0x0c	// pins 30 to 39, three bits each
@@ -54,15 +47,6 @@
 #define GPIO_PULL_UP			1
 #define EXPANDER_GPIO_BASE		128
 #define EXPANDER_WL_ON			1
-
-// the BCM2712's (Pi 5) SDHCI configuration registers (Linux: sdhci-brcmstb.c)
-#define CFG_CTRL				0x00
-#define  CFG_CTRL_SDCD_N_TEST_EN	(1u << 31)	// force the card's presence
-#define  CFG_CTRL_SDCD_N_TEST_LEV	(1u << 30)
-#define CFG_SD_PIN_SEL			0x44
-#define  CFG_SD_PIN_SEL_MASK	0x3
-#define  CFG_SD_PIN_SEL_SD		(1u << 1)
-#define BCM2712_BASE_CLOCK		200000000
 
 #define REG_BLOCK				0x04
 #define REG_ARGUMENT			0x08
@@ -134,19 +118,6 @@ static area_id sRegisterArea = -1;
 static volatile uint8* sGpio;
 static area_id sGpioArea = -1;
 static rpi_firmware_module_info* sFirmware;
-
-// The board: the Pi 4's controller and GPIOs, or the Pi 5's second SDHCI,
-// its pin multiplexer and the "gio" GPIO block with WL_ON.
-static bool sBCM2712;
-static bool sBCM2712D0;
-static phys_addr_t sSdhciBase = BCM2711_SDHCI_BASE;
-static uint32 sInterrupt = BCM2711_SDHCI_INTERRUPT;
-static phys_addr_t sConfigBase;
-static phys_addr_t sPinctrlBase;
-static volatile uint8* sConfig;
-static area_id sConfigArea = -1;
-static volatile uint8* sPinctrl;
-static area_id sPinctrlArea = -1;
 static mutex sLock = MUTEX_INITIALIZER("broadcomfmac sdio");
 static uint32 sBaseClock;
 static uint32 sClock;
@@ -367,17 +338,6 @@ rw_extended(bool write, uint32 function, uint32 address, uint8* buffer,
 static void
 setup_pins()
 {
-	if (sBCM2712) {
-		// GPIO 30 (clock) to 35 to the SDIO controller, pull-ups on all but
-		// the clock
-		for (uint32 pin = 30; pin <= 35; pin++) {
-			bcm2712_set_pin(sPinctrl, sBCM2712D0, pin, BCM2712_FUNCTION_SD2,
-				pin == 30 ? BCM2712_PULL_NONE : BCM2712_PULL_UP);
-		}
-		memory_full_barrier();
-		return;
-	}
-
 	// GPIO 34 to 39 to the SDIO controller (ALT3), pull-ups on all but the
 	// clock
 	uint32 select = *(volatile uint32*)(sGpio + GPIO_FSEL3);
@@ -398,10 +358,6 @@ setup_pins()
 static status_t
 set_power(bool on)
 {
-	if (sBCM2712) {
-		bcm2712_gpio_output(sGpio, BCM2712_GPIO_WL_ON, on);
-		return B_OK;
-	}
 	uint32 request[2] = { EXPANDER_GPIO_BASE + EXPANDER_WL_ON, on ? 1u : 0u };
 	return sFirmware->property(RPI_FIRMWARE_SET_GPIO_STATE, request,
 		sizeof(request));
@@ -411,47 +367,9 @@ set_power(bool on)
 //	#pragma mark -
 
 
-static bool
-is_non_removable(fdt_device_module_info* module, fdt_device* device)
-{
-	return module->get_prop(device, "non-removable", NULL) != NULL;
-}
-
-
-/*!	The Pi 5: the BCM2712's SDHCI that the device tree calls non-removable
-	(the Wi-Fi's; the other one is the card slot's), with the pin
-	multiplexer. */
-static bool
-find_bcm2712()
-{
-	uint64 base, size, interrupt, config;
-	if (!bcm2712_find_node("brcm,bcm2712-sdhci", 0, 0, &base, &size,
-			&interrupt, is_non_removable)
-		|| !bcm2712_find_node("brcm,bcm2712-sdhci", base, 1, &config, &size,
-			NULL, is_non_removable)) {
-		return false;
-	}
-	uint64 pinctrl;
-	bool d0;
-	if (!bcm2712_find_pinctrl(&pinctrl, &d0))
-		return false;
-
-	sBCM2712 = true;
-	sBCM2712D0 = d0;
-	sSdhciBase = base;
-	sConfigBase = config;
-	sInterrupt = interrupt;
-	sPinctrlBase = pinctrl;
-	return true;
-}
-
-
 bool
 rpi_sdio_present(void)
 {
-	if (find_bcm2712())
-		return true;
-
 	// The device tree says which board this is: look for the BCM2711's
 	// second SD controller, which only this family has.
 	device_manager_info* manager;
@@ -479,7 +397,7 @@ rpi_sdio_present(void)
 		found = manager->get_driver(node, (driver_module_info**)&module,
 			(void**)&device) == B_OK
 			&& module->get_reg(device, 0, &address, &length)
-			&& address != BCM2711_SDHCI_BASE;
+			&& address != SDHCI_BASE;
 		manager->put_node(node);
 	}
 	manager->put_node(root);
@@ -492,70 +410,31 @@ rpi_sdio_present(void)
 status_t
 rpi_sdio_init(void)
 {
-	status_t status;
-	if (!sBCM2712 && !find_bcm2712()) {
-		// The Pi 4's power line and clock are the firmware's.
-		status = get_module(RPI_FIRMWARE_MODULE_NAME, (module_info**)&sFirmware);
-		if (status != B_OK)
-			return status;
-	}
+	status_t status = get_module(RPI_FIRMWARE_MODULE_NAME,
+		(module_info**)&sFirmware);
+	if (status != B_OK)
+		return status;
 
-	sRegisterArea = map_physical_memory("broadcomfmac sdio",
-		sSdhciBase & ~(phys_addr_t)(B_PAGE_SIZE - 1), B_PAGE_SIZE,
-		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
-		(void**)&sRegisters);
-	sGpioArea = map_physical_memory("broadcomfmac gpio",
-		sBCM2712 ? BCM2712_GIO_BASE & ~(phys_addr_t)(B_PAGE_SIZE - 1)
-			: GPIO_BASE, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+	sRegisterArea = map_physical_memory("broadcomfmac sdio", SDHCI_BASE,
+		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&sRegisters);
+	sGpioArea = map_physical_memory("broadcomfmac gpio", GPIO_BASE,
+		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
 		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&sGpio);
 	if (sRegisterArea < 0 || sGpioArea < 0) {
 		rpi_sdio_uninit();
 		return B_NO_MEMORY;
 	}
-	sRegisters += sSdhciBase & (B_PAGE_SIZE - 1);
-	if (sBCM2712) {
-		sGpio += BCM2712_GIO_BASE & (B_PAGE_SIZE - 1);
-		sConfigArea = map_physical_memory("broadcomfmac sdio config",
-			sConfigBase & ~(phys_addr_t)(B_PAGE_SIZE - 1), B_PAGE_SIZE,
-			B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
-			(void**)&sConfig);
-		sPinctrlArea = map_physical_memory("broadcomfmac pinctrl",
-			sPinctrlBase & ~(phys_addr_t)(B_PAGE_SIZE - 1), B_PAGE_SIZE,
-			B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
-			(void**)&sPinctrl);
-		if (sConfigArea < 0 || sPinctrlArea < 0) {
-			rpi_sdio_uninit();
-			return B_NO_MEMORY;
-		}
-		sConfig += sConfigBase & (B_PAGE_SIZE - 1);
-		sPinctrl += sPinctrlBase & (B_PAGE_SIZE - 1);
-	}
 
 	MutexLocker locker(sLock);
 
-	if (sBCM2712) {
-		sBaseClock = BCM2712_BASE_CLOCK;
-		// The card is always there; SD (not eMMC) pin timing.
-		volatile uint32* control = (volatile uint32*)(sConfig + CFG_CTRL);
-		*control = (*control & ~CFG_CTRL_SDCD_N_TEST_LEV)
-			| CFG_CTRL_SDCD_N_TEST_EN;
-		volatile uint32* pins = (volatile uint32*)(sConfig + CFG_SD_PIN_SEL);
-		*pins = (*pins & ~CFG_SD_PIN_SEL_MASK) | CFG_SD_PIN_SEL_SD;
-		asm volatile("dsb sy; isb" ::: "memory");
-		TRACE("BCM2712: config %#" B_PRIx32 " pin select %#" B_PRIx32
-			", SDHCI caps %#" B_PRIx32 "\n", *control, *pins,
-			read_reg(0x40));
-	} else if (sFirmware->get_clock_rate(RPI_FIRMWARE_CLOCK_EMMC, false,
-			&sBaseClock) != B_OK || sBaseClock == 0) {
+	if (sFirmware->get_clock_rate(RPI_FIRMWARE_CLOCK_EMMC, false, &sBaseClock)
+			!= B_OK || sBaseClock == 0) {
 		sBaseClock = 100000000;
 	}
 
 	// the chip out of reset, then the controller from scratch
-	TRACE("pins (pinctrl %#" B_PRIx64 ", D0 %d)\n", (uint64)sPinctrlBase,
-		sBCM2712D0);
 	setup_pins();
-	asm volatile("dsb sy; isb" ::: "memory");
-	TRACE("power\n");
 	set_power(false);
 	snooze(20000);
 	set_power(true);
@@ -645,11 +524,11 @@ rpi_sdio_uninit(void)
 {
 	if (sInterruptInstalled) {
 		write_reg(REG_INTERRUPT_ENABLE, 0);
-		remove_io_interrupt_handler(sInterrupt, card_interrupt, NULL);
+		remove_io_interrupt_handler(SDHCI_INTERRUPT, card_interrupt, NULL);
 		sInterruptInstalled = false;
 	}
 	sCardHandler = NULL;
-	if (sRegisters != NULL && sGpio != NULL && (sFirmware != NULL || sBCM2712)) {
+	if (sRegisters != NULL && sFirmware != NULL) {
 		write_reg(REG_INTERRUPT_MASK, 0);
 		set_power(false);
 	}
@@ -657,12 +536,8 @@ rpi_sdio_uninit(void)
 		delete_area(sRegisterArea);
 	if (sGpioArea >= 0)
 		delete_area(sGpioArea);
-	if (sConfigArea >= 0)
-		delete_area(sConfigArea);
-	if (sPinctrlArea >= 0)
-		delete_area(sPinctrlArea);
-	sRegisterArea = sGpioArea = sConfigArea = sPinctrlArea = -1;
-	sRegisters = sGpio = sConfig = sPinctrl = NULL;
+	sRegisterArea = sGpioArea = -1;
+	sRegisters = sGpio = NULL;
 	if (sFirmware != NULL)
 		put_module(RPI_FIRMWARE_MODULE_NAME);
 	sFirmware = NULL;
@@ -809,7 +684,7 @@ rpi_sdio_set_interrupt_handler(void (*handler)(void*), void* data)
 	if (handler == NULL || sInterruptInstalled)
 		return B_OK;
 
-	status_t status = install_io_interrupt_handler(sInterrupt,
+	status_t status = install_io_interrupt_handler(SDHCI_INTERRUPT,
 		card_interrupt, NULL, 0);
 	if (status == B_OK)
 		sInterruptInstalled = true;

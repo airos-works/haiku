@@ -44,7 +44,7 @@ USB devices draw 1.6 A from a supply that may not have it); add it under
 | Watchdog | `airos.watchdog` (lab), restart through PSCI | resets after a hang |
 | `airos.debug` | loader and kernel output on the screen | boots to the network (kernel pager: P) |
 | GPU | `v3d` on the V3D 7.1.10 at 1.15 GHz, Mesa 25.3.6 | 2026-11-15: GL ES 3.1 and Vulkan 1.3 probes pass (1080p with depth exact), texture and readback probes pass, GLTeapot ~1690 FPS; 2026-11-16: GL windows present straight into the screen (60 fps at 1% CPU at 200%); `rpi4_v3d_probe` passes (TFU raster to UIF, uncached and cached) |
-| Wi-Fi | `broadcomfmac` on the second SDHCI (sd2, GPIO 30-35, WL_ON gio 28) | WPA2 join, DHCP, ping and ssh over Wi-Fi |
+| Wi-Fi | `broadcomfmac` on the MMC bus' SDIO function: `bcm2711_emmc2` runs the second SDHCI (sd2, GPIO 30-35, WL_ON gio 28), the bus finds the CYW43455 (02d0:4345, 3 functions, 4 bit, 50 MHz high speed) | WPA2 join, DHCP, ping and ssh over Wi-Fi; 2026-11-17 on the generic SDIO layer: 13.5-14.5 MB/s to the Pi, 10.7-11.5 MB/s from it (the driver's own SDIO host before: 13.7-14.9 and 11.0-11.6), join 3 s, driver reload |
 | Bluetooth | `h4bcm` on the BCM7271 UART (GPIO 24-27, BT_ON gio 29) | patched, LE scan finds the room's devices |
 | HEVC decoding | `rpi_hevc` on `/axi/codec@800000` (910 MHz, version 0x202) | all 25 test streams byte-exact (`rpi4_hevc_decode`) |
 | Sound | `bcm2712_hdmi_audio`: the HDMI controllers' MAI fed by a 40 bit DMA channel, 16 bit stereo at 44.1 or 48 kHz, output HDMI 0 or 1, software volume | 2026-11-15: the Media Kit's default output; 48000 frames per second through the mixer for 30 s; the KVM's HDMI receiver reports the audio stream starting and stopping with each tone (nothing while idle); not listened to |

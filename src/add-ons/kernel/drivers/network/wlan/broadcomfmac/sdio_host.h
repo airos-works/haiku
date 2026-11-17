@@ -10,8 +10,11 @@
 
 
 /*	The Raspberry Pi 4's SDIO port: the BCM2711's first SD host controller
-	(Arasan, "mmcnr") with the board's Wi-Fi chip as its only card. Haiku's
-	MMC bus has no SDIO, so the Wi-Fi driver brings its own small host. */
+	(Arasan, "mmcnr") with the board's Wi-Fi chip as its only card. No driver
+	of the MMC bus runs that controller yet (its clock and the chip's power
+	line WL_ON are the firmware's, behind its mailbox), so the Wi-Fi driver
+	brings its own small host for it, behind an SDIO function interface
+	(bwfm_host.cpp). The Pi 5's port is the MMC bus' (bcm2711_emmc2). */
 
 #ifdef __cplusplus
 extern "C" {

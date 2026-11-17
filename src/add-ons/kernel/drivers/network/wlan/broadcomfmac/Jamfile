@@ -14,8 +14,9 @@ UseHeaders [ FDirName $(SUBDIR) ] : true ;
 SEARCH_SOURCE += [ FDirName $(SUBDIR) dev ic ] ;
 SEARCH_SOURCE += [ FDirName $(SUBDIR) dev sdmmc ] ;
 
-# Broadcom/Cypress FullMAC Wi-Fi on SDIO (the Raspberry Pi 4's CYW43455):
-# OpenBSD's bwfm on a small SDIO host of its own.
+# Broadcom/Cypress FullMAC Wi-Fi on SDIO (the Raspberry Pi 4's and 5's
+# CYW43455): OpenBSD's bwfm on an SDIO function of the MMC bus, or on the
+# Pi 4's port with a small SDIO host of its own.
 KernelAddon broadcomfmac :
 	bwfm.c
 	if_bwfm_sdio.c

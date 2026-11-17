@@ -21,6 +21,7 @@
 #include "IOSchedulerSimple.h"
 #include "mmc.h"
 #include "sdhci.h"
+#include "sdhci_intel.h"
 
 
 //#define TRACE_SDHCI
@@ -73,8 +74,32 @@ init_bus_acpi(device_node* node, void** bus_cookie)
 	device_node* acpiParent = gDeviceManager->get_parent_node(parent);
 	gDeviceManager->get_driver(acpiParent, (driver_module_info**)&acpi,
 			(void**)&device);
+
+	// Power the controller and what hangs off it (the Wi-Fi chip of the SDIO
+	// slot), as Linux does for every ACPI SD host
+	// (acpi_device_fix_up_power_extended() in sdhci_acpi_probe()), and on
+	// Bay Trail clear the OCP timeout (sdhci_acpi_byt_setting()). Only for
+	// Intel's controllers, so far: the others work without.
+	const char* hid = NULL;
+	const char* uid = NULL;
+	const char* path = NULL;
+	gDeviceManager->get_attr_string(acpiParent, ACPI_DEVICE_HID_ITEM, &hid,
+		false);
+	gDeviceManager->get_attr_string(acpiParent, ACPI_DEVICE_UID_ITEM, &uid,
+		false);
+	if (sdhci_intel_acpi_is_slot(hid, uid)) {
+		if (gDeviceManager->get_attr_string(acpiParent, ACPI_DEVICE_PATH_ITEM,
+				&path, false) == B_OK)
+			sdhci_acpi_fix_up_power(path);
+		sdhci_intel_byt_ocp_fixup();
+	}
+
 	gDeviceManager->put_node(acpiParent);
 	gDeviceManager->put_node(parent);
+
+	uint32 slotQuirks = 0;
+	gDeviceManager->get_attr_uint32(node, SDHCI_SLOT_QUIRKS_ATTRIBUTE,
+		&slotQuirks, false);
 
 	// Ignore invalid bars
 	TRACE("Register SD bus\n");
@@ -112,7 +137,8 @@ init_bus_acpi(device_node* node, void** bus_cookie)
 	uint32_t irq = crs.irq;
 	TRACE("irq interrupt line: %d\n", irq);
 
-	SdhciBus* bus = new(std::nothrow) SdhciBus(_regs, irq, true);
+	SdhciBus* bus = new(std::nothrow) SdhciBus(_regs, irq, true, NULL,
+		slotQuirks);
 
 	status_t status = B_NO_MEMORY;
 	if (bus != NULL)
@@ -147,9 +173,21 @@ register_child_devices_acpi(void* cookie)
 
 	TRACE("register_child_devices\n");
 
+	const char* hid = NULL;
+	const char* uid = NULL;
+	gDeviceManager->get_attr_string(parent, ACPI_DEVICE_HID_ITEM, &hid, false);
+	gDeviceManager->get_attr_string(parent, ACPI_DEVICE_UID_ITEM, &uid, false);
+	uint32 slotQuirks = sdhci_intel_acpi_slot_quirks(hid, uid);
+	gDeviceManager->put_node(parent);
+	if (slotQuirks != 0) {
+		TRACE_ALWAYS("%s (_UID %s): Intel SDIO slot\n", hid,
+			uid != NULL ? uid : "-");
+	}
+
 	char prettyName[25];
 
-	sprintf(prettyName, "SDHC bus");
+	sprintf(prettyName, (slotQuirks & SDHCI_SLOT_NON_REMOVABLE) != 0
+		? "SDHC bus (SDIO)" : "SDHC bus");
 	device_attr attrs[] = {
 		// properties of this controller for mmc bus manager
 		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE, { .string = prettyName } },
@@ -158,6 +196,10 @@ register_child_devices_acpi(void* cookie)
 		{ B_DEVICE_BUS, B_STRING_TYPE, {.string = "mmc"} },
 		// standard SDHCI: SD high speed with the capability bit (SetClock)
 		{ kMmcSdHighSpeedAttribute, B_UINT8_TYPE, { .ui8 = 1 }},
+		{ kMmcSdioHighSpeedAttribute, B_UINT8_TYPE, { .ui8 = 1 }},
+		{ kMmcNonRemovableAttribute, B_UINT8_TYPE,
+			{ .ui8 = (uint8)((slotQuirks & SDHCI_SLOT_NON_REMOVABLE) != 0) }},
+		{ SDHCI_SLOT_QUIRKS_ATTRIBUTE, B_UINT32_TYPE, { .ui32 = slotQuirks }},
 
 		// DMA properties
 		// The high alignment is to force access only to complete sectors
@@ -198,19 +240,18 @@ supports_device_acpi(device_node* parent)
 		return 0.0f;
 	}
 
-	if (gDeviceManager->get_attr_string(parent, ACPI_DEVICE_UID_ITEM, &uid, false)) {
-		TRACE("No uid attribute\n");
-		return 0.0f;
-	}
-
-	if (gDeviceManager->get_attr_string(parent, ACPI_DEVICE_CID_ITEM, &cid, false)) {
-		TRACE("No cid attribute\n");
-		return 0.0f;
-	}
+	if (gDeviceManager->get_attr_string(parent, ACPI_DEVICE_UID_ITEM, &uid, false))
+		uid = NULL;
+	if (gDeviceManager->get_attr_string(parent, ACPI_DEVICE_CID_ITEM, &cid, false))
+		cid = NULL;
 
 	// The HID and UID determine whether a given host controller is SD, SDIO, or eMMC.
-	// The CID determines whether an ACPI device is a host controller at all.
-	if (strcmp(cid, "PNP0D40") != 0) {
+	// The CID PNP0D40 says that an ACPI device is a standard host controller;
+	// Intel's are known by their HID too, as Linux knows them (they need not
+	// have the CID).
+	if ((cid == NULL || strcmp(cid, "PNP0D40") != 0)
+		&& strcmp(hid, "PNP0D40") != 0
+		&& !sdhci_intel_acpi_is_slot(hid, uid)) {
 		return 0.0f;
 	}
 
@@ -218,7 +259,8 @@ supports_device_acpi(device_node* parent)
 	acpi_device* device;
 	gDeviceManager->get_driver(parent, (driver_module_info**)&acpi,
 		(void**)&device);
-	TRACE("SDHCI Device found! hid: %s, uid: %s\n", hid, uid);
+	TRACE("SDHCI Device found! hid: %s, uid: %s\n", hid,
+		uid != NULL ? uid : "-");
 
 	return 0.8f;
 }
@@ -245,4 +287,7 @@ mmc_bus_interface gSDHCIACPIDeviceModule = {
 	.set_card_type = set_card_type,
 	.read_extended_csd = read_extended_csd,
 	.switch_sd_function = switch_sd_function,
+	.sdio_transfer = sdio_transfer,
+	.set_sdio_interrupt_handler = set_sdio_interrupt_handler,
+	.enable_sdio_interrupt = enable_sdio_interrupt,
 };

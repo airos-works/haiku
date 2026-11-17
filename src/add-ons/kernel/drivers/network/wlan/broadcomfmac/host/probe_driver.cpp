@@ -12,7 +12,7 @@
 
 #include <string.h>
 
-#include "sdio_host.h"
+#include "bwfm_host.h"
 
 
 int32 api_version = B_CUR_DRIVER_API_VERSION;
@@ -21,31 +21,31 @@ int32 api_version = B_CUR_DRIVER_API_VERSION;
 status_t
 init_hardware()
 {
-	if (!rpi_sdio_present()) {
-		dprintf("broadcomfmac probe: not a Raspberry Pi 4\n");
+	if (!bwfm_host_present()) {
+		dprintf("broadcomfmac probe: no Wi-Fi chip\n");
 		return B_ERROR;
 	}
 
-	status_t status = rpi_sdio_init();
+	status_t status = bwfm_host_init();
 	dprintf("broadcomfmac probe: init: %s\n", strerror(status));
 	if (status == B_OK)
-		status = rpi_sdio_enable_function(1, true);
+		status = bwfm_host_enable_function(1, true);
 	dprintf("broadcomfmac probe: function 1: %s\n", strerror(status));
 	if (status == B_OK) {
 		// backplane window to the chip common core at 0x18000000
 		uint8 window[3] = { 0x00, 0x00, 0x18 };
 		for (int i = 0; i < 3 && status == B_OK; i++)
-			status = rpi_sdio_rw_byte(true, 1, 0x1000a + i, &window[i]);
+			status = bwfm_host_rw_byte(true, 1, 0x1000a + i, &window[i]);
 		uint32 id = 0;
 		if (status == B_OK) {
-			status = rpi_sdio_rw_extended(false, 1, 0x8000, (uint8*)&id, 4,
+			status = bwfm_host_rw_extended(false, 1, 0x8000, (uint8*)&id, 4,
 				true);
 		}
 		dprintf("broadcomfmac probe: chip id register %#" B_PRIx32 " (%s): "
 			"chip %#" B_PRIx32 " revision %" B_PRIu32 "\n", id,
 			strerror(status), id & 0xffff, (id >> 16) & 0xf);
 	}
-	rpi_sdio_uninit();
+	bwfm_host_uninit();
 	return B_ERROR;
 }
 

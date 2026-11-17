@@ -18,6 +18,7 @@
 #include <ACPI.h>
 #include "acpi.h"
 
+#include <ByteOrder.h>
 #include <KernelExport.h>
 #include <arch/atomic.h>
 #include <vm/vm.h>
@@ -54,7 +55,7 @@ sdhci_generic_interrupt(void* data)
 
 
 SdhciBus::SdhciBus(struct registers* registers, uint32_t irq, bool poll,
-	const sdhci_platform_info* platform)
+	const sdhci_platform_info* platform, uint32 slotQuirks)
 	:
 	fRegisters(registers),
 	fCommandResult(0),
@@ -74,8 +75,16 @@ SdhciBus::SdhciBus(struct registers* registers, uint32_t irq, bool poll,
 	fAdmaAddress(0),
 	fDMAQuarantined(false),
 	fReportedHighCpuRead(false),
-	fReportedHighCpuWrite(false)
+	fReportedHighCpuWrite(false),
+	fSlotQuirks(slotQuirks),
+	fSdioInterruptEnabled(false),
+	fSdioHandler(NULL),
+	fSdioHandlerData(NULL),
+	fSdioTransfer(false),
+	fSdioTransferMode(0)
 {
+	B_INITIALIZE_SPINLOCK(&fInterruptLock);
+
 	if (irq == 0 || irq == 0xff) {
 		ERROR("IRQ not assigned\n");
 		fStatus = B_BAD_DATA;
@@ -182,13 +191,20 @@ SdhciBus::SdhciBus(struct registers* registers, uint32_t irq, bool poll,
 	}
 #endif
 
-	// Finally, configure some useful interrupts
-	EnableInterrupts(SDHCI_INT_CMD_CMP | SDHCI_INT_CARD_REM
-		| SDHCI_INT_TRANS_CMP | SDHCI_INT_ERROR | SDHCI_INT_ERROR_MASK);
+	// Finally, configure some useful interrupts. A soldered card is never
+	// removed, and its slot's card detection may be wrong (Intel's SDIO
+	// slots): no card events for it.
+	EnableInterrupts(SDHCI_INT_CMD_CMP | SDHCI_INT_TRANS_CMP | SDHCI_INT_ERROR
+		| SDHCI_INT_ERROR_MASK
+		| ((fSlotQuirks & SDHCI_SLOT_NON_REMOVABLE) == 0
+			? SDHCI_INT_CARD_REM : 0));
 
 	// We want to see the other bits in the status register, but not have an
-	// interrupt trigger on buffer readiness: EXT_CSD uses polled PIO.
-	fRegisters->interrupt_status_enable |= SDHCI_INT_ERROR_MASK | SDHCI_INT_NORMAL_MASK;
+	// interrupt trigger on buffer readiness: EXT_CSD uses polled PIO. The
+	// SDIO card interrupt stays off until a function driver wants it: its
+	// status follows the card's line and is cleared only by disabling it.
+	fRegisters->interrupt_status_enable |= SDHCI_INT_ERROR_MASK
+		| (SDHCI_INT_NORMAL_MASK & ~SDHCI_INT_CARD_INT);
 
 	if (poll) {
 		// Spawn a polling thread, as the interrupts won't currently work on ACPI.
@@ -333,6 +349,22 @@ SdhciBus::ExecuteCommand(uint8_t command, uint32_t argument, uint32_t* response)
 		case MMC_SEND_OP_COND:
 		case SD_SEND_OP_COND: // SD Application command
 			replyType = Command::kR3Type;
+			break;
+
+		// SDIO (SDIO Simplified Specification 3.00, 5)
+		case SD_IO_SEND_OP_COND:
+			// R4: 48 bits, no CRC and no command index, as R3
+			replyType = Command::kR3Type;
+			break;
+		case SD_IO_RW_DIRECT:
+			// R5: 48 bits with CRC and command index, as R1
+			replyType = Command::kR1Type;
+			break;
+		case SD_IO_RW_EXTENDED:
+			if (!fSdioTransfer)
+				return B_BAD_VALUE;
+			replyType = Command::kR1Type | Command::kDataPresent;
+			transferMode = fSdioTransferMode;
 			break;
 
 		// Commands defined with different reply types in SD and MMC specifications
@@ -493,6 +525,7 @@ SdhciBus::SetClock(int kilohertz, bool allowAuto)
 	(void)allowAuto;
 	if (kilohertz == 400)
 		PowerOn();
+	bool highSpeed = kilohertz > 25000 && fRegisters->capabilities.HighSpeed();
 	uint32 baseClock = fRegisters->capabilities.BaseClockFrequency() * 1000;
 	fRegisters->clock_control.DisableSD();
 	memory_full_barrier();
@@ -525,12 +558,18 @@ SdhciBus::SetClock(int kilohertz, bool allowAuto)
 		fStatus = B_NOT_SUPPORTED;
 		return;
 	}
-	if (fRegisters->host_controller_version.specVersion >= 2)
-		fRegisters->host_control_2 &= ~(1 << 15);
+	if (fRegisters->host_controller_version.specVersion >= 2) {
+		uint16 control2 = fRegisters->host_control_2 & ~(1 << 15);
+		if ((fSlotQuirks & SDHCI_SLOT_HS_AS_SDR25) != 0) {
+			// UHS mode select: SDR25 with high speed, as Linux does on
+			// Intel's controllers (sdhci_intel_set_uhs_signaling)
+			control2 = (control2 & ~7) | (highSpeed ? 1 : 0);
+		}
+		fRegisters->host_control_2 = control2;
+	}
 	// above the default 25 MHz the card runs in high speed timing, and the
 	// host samples for it
-	fRegisters->host_control.SetHighSpeed(kilohertz > 25000
-		&& fRegisters->capabilities.HighSpeed());
+	fRegisters->host_control.SetHighSpeed(highSpeed);
 	divider = fRegisters->clock_control.SetDivider(divider);
 	fRegisters->clock_control.EnableInternal();
 	bigtime_t deadline = system_time() + 100000;
@@ -707,6 +746,123 @@ SdhciBus::SwitchSdFunction(uint32_t argument, uint8_t data[64])
 }
 
 
+/*!	SDIO CMD53 and its data phase, by PIO through the buffer data port: a
+	byte mode transfer (\a blockCount 0) of \a blockSize bytes, or
+	\a blockCount blocks. The caller has built the argument.
+*/
+status_t
+SdhciBus::SdioTransfer(uint32_t argument, bool write, void* _buffer,
+	uint16_t blockSize, uint16_t blockCount, uint32_t* response)
+{
+	if (fStatus != B_OK)
+		return fStatus;
+	if (_buffer == NULL || response == NULL || blockSize == 0
+		|| blockSize > 2048 || (blockCount == 0 && blockSize > 512))
+		return B_BAD_VALUE;
+
+	uint16_t blocks = blockCount == 0 ? 1 : blockCount;
+	fRegisters->block_size.ConfigureTransfer(blockSize,
+		BlockSize::kDmaBoundary512K);
+	fRegisters->block_count = blocks;
+	fSdioTransferMode = (write ? TransferMode::kWrite : TransferMode::kRead)
+		| (blocks > 1 ? TransferMode::kMulti | TransferMode::kBlockCountEnable
+			: 0);
+		// no auto CMD12: CMD53 ends by its count
+
+	fSdioTransfer = true;
+	status_t status = ExecuteCommand(SD_IO_RW_EXTENDED, argument, response);
+	fSdioTransfer = false;
+	if (status != B_OK)
+		return status;
+	if ((*response & 0xcb00) != 0) {
+		// R5 error flags: there may be no data phase
+		RecoverError();
+		return B_IO_ERROR;
+	}
+
+	uint8* buffer = (uint8*)_buffer;
+	uint32 ready = write ? (1 << 10) : (1 << 11);
+		// buffer write/read enable in the present state
+	bigtime_t deadline = system_time() + 1000000;
+	for (uint16_t block = 0; block < blocks; block++) {
+		while ((fRegisters->present_state.Bits() & ready) == 0) {
+			if ((atomic_get(&fCommandResult) & SDHCI_INT_ERROR_MASK) != 0) {
+				RecoverError();
+				return B_IO_ERROR;
+			}
+			if (system_time() >= deadline) {
+				ERROR("SDIO %s: buffer not ready (block %u of %u, present "
+					"%#" B_PRIx32 ")\n", write ? "write" : "read", block,
+					blocks, fRegisters->present_state.Bits());
+				RecoverError();
+				return B_TIMED_OUT;
+			}
+			spin(5);
+		}
+		for (uint16_t offset = 0; offset < blockSize; offset += 4) {
+			uint32_t bytes = blockSize - offset < 4 ? blockSize - offset : 4;
+			uint32_t word = 0;
+			if (write) {
+				memcpy(&word, buffer + offset, bytes);
+				fRegisters->buffer_data_port = B_HOST_TO_LENDIAN_INT32(word);
+			} else {
+				word = B_LENDIAN_TO_HOST_INT32(fRegisters->buffer_data_port);
+				memcpy(buffer + offset, &word, bytes);
+			}
+		}
+		buffer += blockSize;
+	}
+	fRegisters->interrupt_status = SDHCI_INT_BUF_READ_READY
+		| SDHCI_INT_BUF_WRITE_READY;
+
+	status = WaitForCompletion(SDHCI_INT_TRANS_CMP, 1000000);
+	if (status != B_OK) {
+		ERROR("SDIO %s of %u x %u bytes did not complete: %s\n",
+			write ? "write" : "read", blocks, blockSize, strerror(status));
+		RecoverError();
+	}
+	return status;
+}
+
+
+bool
+SdhciBus::HighSpeedCapable()
+{
+	return fRegisters->capabilities.HighSpeed();
+}
+
+
+void
+SdhciBus::SetSdioInterruptHandler(void (*handler)(void*), void* data)
+{
+	cpu_status state = disable_interrupts();
+	acquire_spinlock(&fInterruptLock);
+	fSdioHandler = handler;
+	fSdioHandlerData = data;
+	release_spinlock(&fInterruptLock);
+	restore_interrupts(state);
+}
+
+
+void
+SdhciBus::EnableSdioInterrupt(bool enable)
+{
+	cpu_status state = disable_interrupts();
+	acquire_spinlock(&fInterruptLock);
+	fSdioInterruptEnabled = enable;
+	if (enable) {
+		fRegisters->interrupt_status_enable |= SDHCI_INT_CARD_INT;
+		fRegisters->interrupt_signal_enable |= SDHCI_INT_CARD_INT;
+	} else {
+		fRegisters->interrupt_signal_enable &= ~SDHCI_INT_CARD_INT;
+		fRegisters->interrupt_status_enable &= ~SDHCI_INT_CARD_INT;
+	}
+	memory_full_barrier();
+	release_spinlock(&fInterruptLock);
+	restore_interrupts(state);
+}
+
+
 /*!	A command with a single short data block to read by PIO (EXT_CSD, the SD
 	switch status).
 */
@@ -764,6 +920,11 @@ SdhciBus::SetScanSemaphore(sem_id sem)
 	}
 
 	// If there is already a card in, start a scan immediately
+	if ((fSlotQuirks & SDHCI_SLOT_NON_REMOVABLE) != 0) {
+		// soldered: there is nothing to wait for
+		release_sem(fScanSemaphore);
+		return;
+	}
 	if (fRegisters->present_state.IsCardInserted())
 		release_sem(fScanSemaphore);
 
@@ -805,22 +966,38 @@ SdhciBus::SetCardType(card_type type)
 bool
 SdhciBus::PowerOn()
 {
-	if (!fRegisters->present_state.IsCardInserted()) {
+	if ((fSlotQuirks & SDHCI_SLOT_NON_REMOVABLE) == 0
+		&& !fRegisters->present_state.IsCardInserted()) {
 		TRACE("Card not inserted, not powering on for now\n");
 		return false;
 	}
 
 	uint8_t supportedVoltages = fRegisters->capabilities.SupportedVoltages();
+	uint8_t voltage;
 	if ((supportedVoltages & Capabilities::k3v3) != 0)
-		fRegisters->power_control.SetVoltage(PowerControl::k3v3);
+		voltage = PowerControl::k3v3;
 	else if ((supportedVoltages & Capabilities::k3v0) != 0)
-		fRegisters->power_control.SetVoltage(PowerControl::k3v0);
+		voltage = PowerControl::k3v0;
 	else if ((supportedVoltages & Capabilities::k1v8) != 0)
-		fRegisters->power_control.SetVoltage(PowerControl::k1v8);
+		voltage = PowerControl::k1v8;
 	else {
 		fRegisters->power_control.PowerOff();
 		ERROR("No voltage is supported\n");
 		return false;
+	}
+	fRegisters->power_control.SetVoltage(voltage);
+
+	if ((fSlotQuirks & SDHCI_SLOT_POWER_RETRY) != 0) {
+		// Intel: bus power may not take while the card's presence has not
+		// propagated after D3; write it again, for up to 2 ms (Linux:
+		// sdhci_intel_set_power)
+		for (int i = 0; i < 20 && (fRegisters->power_control.Bits() & 1) == 0;
+				i++) {
+			spin(100);
+			fRegisters->power_control.SetVoltage(voltage);
+		}
+		if ((fRegisters->power_control.Bits() & 1) == 0)
+			ERROR("bus power does not come on\n");
 	}
 
 	return true;
@@ -873,8 +1050,16 @@ SdhciBus::RecoverError()
 		| SDHCI_INT_ERROR | SDHCI_INT_ERROR_MASK
 		| SDHCI_INT_BUF_READ_READY | SDHCI_INT_BUF_WRITE_READY;
 	atomic_set(&fCommandResult, 0);
+	// The card interrupt may have come (and been masked) in the meantime.
+	cpu_status state = disable_interrupts();
+	acquire_spinlock(&fInterruptLock);
+	signals &= ~SDHCI_INT_CARD_INT;
+	if (fSdioInterruptEnabled)
+		signals |= SDHCI_INT_CARD_INT;
 	fRegisters->interrupt_signal_enable = signals;
 	memory_full_barrier();
+	release_spinlock(&fInterruptLock);
+	restore_interrupts(state);
 }
 
 int32
@@ -932,6 +1117,28 @@ SdhciBus::HandleInterrupt()
 
 		fRegisters->interrupt_status = SDHCI_INT_CARD_INS;
 		TRACE("Card presence interrupt handled\n");
+	}
+
+	if ((intmask & SDHCI_INT_CARD_INT) != 0) {
+		// The SDIO card's interrupt follows its DAT1 line: it is cleared
+		// only by disabling it, until the card's functions have been
+		// served. The handler (the MMC bus) has them served and enables it
+		// again. (The polling thread may get here as well as the interrupt.)
+		cpu_status state = disable_interrupts();
+		acquire_spinlock(&fInterruptLock);
+		bool enabled = fSdioInterruptEnabled;
+		if (enabled) {
+			fSdioInterruptEnabled = false;
+			fRegisters->interrupt_signal_enable &= ~SDHCI_INT_CARD_INT;
+			fRegisters->interrupt_status_enable &= ~SDHCI_INT_CARD_INT;
+			memory_full_barrier();
+		}
+		void (*handler)(void*) = fSdioHandler;
+		void* handlerData = fSdioHandlerData;
+		release_spinlock(&fInterruptLock);
+		restore_interrupts(state);
+		if (enabled && handler != NULL)
+			handler(handlerData);
 	}
 
 	uint32_t completion = intmask & (SDHCI_INT_CMD_CMP | SDHCI_INT_TRANS_CMP
@@ -1103,6 +1310,12 @@ set_clock(void* controller, uint32_t kilohertz)
 {
 	SdhciBus* bus = (SdhciBus*)controller;
 
+	// SDIO high speed asks for 50 MHz and goes back to 25 if refused; a
+	// controller without high speed timing does not get there.
+	if (kilohertz > 25000 && bus->CardType() == CARD_TYPE_SDIO
+		&& !bus->HighSpeedCapable())
+		return B_NOT_SUPPORTED;
+
 	bus->SetClock(kilohertz, true);
 	return bus->InitCheck();
 }
@@ -1169,6 +1382,30 @@ terminate_bus(void* controller)
 {
 	SdhciBus* bus = (SdhciBus*)controller;
 	bus->TerminateBus();
+}
+
+
+status_t
+sdio_transfer(void* controller, uint32_t argument, bool write, void* buffer,
+	uint16_t blockSize, uint16_t blockCount, uint32_t* response)
+{
+	return ((SdhciBus*)controller)->SdioTransfer(argument, write, buffer,
+		blockSize, blockCount, response);
+}
+
+
+void
+set_sdio_interrupt_handler(void* controller, void (*handler)(void*),
+	void* data)
+{
+	((SdhciBus*)controller)->SetSdioInterruptHandler(handler, data);
+}
+
+
+void
+enable_sdio_interrupt(void* controller, bool enable)
+{
+	((SdhciBus*)controller)->EnableSdioInterrupt(enable);
 }
 
 

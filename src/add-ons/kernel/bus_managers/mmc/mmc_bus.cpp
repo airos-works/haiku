@@ -23,9 +23,21 @@ MMCBus::MMCBus(device_node* node)
 	fScanSemaphore(-1),
 	fLockSemaphore(-1),
 	fActiveDevice(0),
-	fCardType(CARD_TYPE_UNKNOWN)
+	fCardType(CARD_TYPE_UNKNOWN),
+	fSdioRca(0),
+	fSdioInterruptEnable(0),
+	fSdioInterruptSemaphore(-1),
+	fSdioInterruptThread(-1),
+	fSdioHostHandlerSet(false),
+	fSdioDispatching(false)
 {
 	CALLED();
+
+	memset(&fSdio, 0, sizeof(fSdio));
+	memset(fSdioHandlers, 0, sizeof(fSdioHandlers));
+	memset(fSdioHandlerData, 0, sizeof(fSdioHandlerData));
+	mutex_init(&fSdioHandlerLock, "mmc bus sdio handlers");
+	fSdioDispatchDone.Init(this, "sdio dispatch");
 
 	// Get the parent info, it includes the API to send commands to the hardware
 	device_node* parent = gDeviceManager->get_parent_node(node);
@@ -83,8 +95,10 @@ MMCBus::~MMCBus()
 	status_t result;
 	if (fWorkerThread >= B_OK)
 		wait_for_thread(fWorkerThread, &result);
+	_StopSdioInterrupts();
 	if (fLockSemaphore >= B_OK)
 		delete_sem(fLockSemaphore);
+	mutex_destroy(&fSdioHandlerLock);
 }
 
 
@@ -420,12 +434,19 @@ MMCBus::_WorkerThread(void* cookie)
 	int identifyRetries = 0;
 	while (bus->fStatus != B_SHUTTING_DOWN) {
 		if (activeRca != 0) {
+			// SDIO cards do not answer CMD13: they are asked for their
+			// CCCR revision instead.
 			uint32_t cardStatus;
-			if (bus->ExecuteCommand(0, SEND_STATUS, ((uint32)activeRca) << 16,
-					&cardStatus) == B_OK) {
+			if (bus->fSdioRca == activeRca ? bus->_SdioAlive()
+				: bus->ExecuteCommand(0, SEND_STATUS,
+					((uint32)activeRca) << 16, &cardStatus) == B_OK) {
 				TRACE("the card at RCA %x is still there\n", activeRca);
 				bus->_AcquireScanSemaphore();
 				continue;
+			}
+			if (bus->fSdioRca == activeRca) {
+				ERROR("the SDIO card does not answer any more\n");
+				bus->fSdioRca = 0;
 			}
 			activeRca = 0;
 		}
@@ -506,6 +527,19 @@ MMCBus::_WorkerThread(void* cookie)
 					snooze(100000);
 				}
 			} while ((ocr & (1 << 31)) == 0 && system_time() < deadline);
+			if (status != B_OK && bus->_SdioCapable()) {
+				// No memory card answers ACMD41: it may be an I/O card.
+				// (A memory card is looked for first, so that SD and MMC
+				// cards are set up as before on SDIO capable hosts too; a
+				// combo card is used as a memory card.)
+				if (bus->_ProbeSdio() == B_OK) {
+					bus->_PublishSdioFunctions();
+					activeRca = bus->fSdioRca;
+					identifyRetries = 0;
+					bus->_AcquireScanSemaphore();
+					continue;
+				}
+			}
 			if (status != B_OK || (ocr & (1 << 31)) == 0) {
 				ERROR("Card initialization did not complete: %s\n", strerror(status));
 				bus->_TerminateBus();

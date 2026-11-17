@@ -6,12 +6,12 @@
 #define BROADCOMFMAC_SDMMC_SHIM_H
 
 
-/*	What if_bwfm_sdio.c uses of OpenBSD's sdmmc(4), on the driver's own SDIO
-	host (sdio_host.h). */
+/*	What if_bwfm_sdio.c uses of OpenBSD's sdmmc(4), on the chip's SDIO card
+	(bwfm_host.h: the MMC bus' SDIO function, or the Raspberry Pi 4's port). */
 
 #include <sys/rwlock.h>
 
-#include "sdio_host.h"
+#include "bwfm_host.h"
 
 
 struct sdmmc_softc {
@@ -28,21 +28,21 @@ struct sdmmc_function {
 static inline int
 sdmmc_io_set_blocklen(struct sdmmc_function* sf, unsigned int length)
 {
-	return rpi_sdio_set_block_size(sf->number, length) == B_OK ? 0 : EIO;
+	return bwfm_host_set_block_size(sf->number, length) == B_OK ? 0 : EIO;
 }
 
 
 static inline int
 sdmmc_io_function_enable(struct sdmmc_function* sf)
 {
-	return rpi_sdio_enable_function(sf->number, true) == B_OK ? 0 : EIO;
+	return bwfm_host_enable_function(sf->number, true) == B_OK ? 0 : EIO;
 }
 
 
 static inline void
 sdmmc_io_function_disable(struct sdmmc_function* sf)
 {
-	rpi_sdio_enable_function(sf->number, false);
+	bwfm_host_enable_function(sf->number, false);
 }
 
 
@@ -50,7 +50,7 @@ static inline uint8_t
 sdmmc_io_read_1(struct sdmmc_function* sf, int reg)
 {
 	uint8_t value = 0;
-	rpi_sdio_rw_byte(false, sf->number, reg, &value);
+	bwfm_host_rw_byte(false, sf->number, reg, &value);
 	return value;
 }
 
@@ -58,7 +58,7 @@ sdmmc_io_read_1(struct sdmmc_function* sf, int reg)
 static inline void
 sdmmc_io_write_1(struct sdmmc_function* sf, int reg, uint8_t value)
 {
-	rpi_sdio_rw_byte(true, sf->number, reg, &value);
+	bwfm_host_rw_byte(true, sf->number, reg, &value);
 }
 
 
@@ -66,7 +66,7 @@ static inline uint32_t
 sdmmc_io_read_4(struct sdmmc_function* sf, int reg)
 {
 	uint32_t value = 0;
-	rpi_sdio_rw_extended(false, sf->number, reg, (uint8*)&value, 4, true);
+	bwfm_host_rw_extended(false, sf->number, reg, (uint8*)&value, 4, true);
 	return le32toh(value);
 }
 
@@ -75,7 +75,7 @@ static inline void
 sdmmc_io_write_4(struct sdmmc_function* sf, int reg, uint32_t value)
 {
 	value = htole32(value);
-	rpi_sdio_rw_extended(true, sf->number, reg, (uint8*)&value, 4, true);
+	bwfm_host_rw_extended(true, sf->number, reg, (uint8*)&value, 4, true);
 }
 
 
@@ -83,7 +83,7 @@ static inline int
 sdmmc_io_read_multi_1(struct sdmmc_function* sf, int reg, u_char* data,
 	int length)
 {
-	return rpi_sdio_rw_extended(false, sf->number, reg, data, length, false)
+	return bwfm_host_rw_extended(false, sf->number, reg, data, length, false)
 		== B_OK ? 0 : EIO;
 }
 
@@ -92,7 +92,7 @@ static inline int
 sdmmc_io_read_region_1(struct sdmmc_function* sf, int reg, u_char* data,
 	int length)
 {
-	return rpi_sdio_rw_extended(false, sf->number, reg, data, length, true)
+	return bwfm_host_rw_extended(false, sf->number, reg, data, length, true)
 		== B_OK ? 0 : EIO;
 }
 
@@ -101,7 +101,7 @@ static inline int
 sdmmc_io_write_region_1(struct sdmmc_function* sf, int reg, u_char* data,
 	int length)
 {
-	return rpi_sdio_rw_extended(true, sf->number, reg, data, length, true)
+	return bwfm_host_rw_extended(true, sf->number, reg, data, length, true)
 		== B_OK ? 0 : EIO;
 }
 
