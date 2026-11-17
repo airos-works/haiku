@@ -326,6 +326,7 @@ Zink keeps its shader cache in the usual Mesa cache directory, limited to 128 MB
 
 Summit's web process composites each page into a framebuffer object. Without help it reads every frame back, which serializes each step. With this port it hands the frame to `summit_haiku_present_framebuffer()` instead, from Summit's Mesa patch 06 (`apps/summit/tools/mesa-vm`).
 - The interface is unchanged: `summit_haiku_present_framebuffer`, `_wait_idle` and `_release`, exported by `libEGL_mesa.so.0` and found with `get_image_symbol()`; `struct summit_haiku_present` version 1; the return codes; and a completion callback for every present, after a device loss too.
+- Patch 07 (deferred presents) adds `summit_haiku_present_version()`, which returns 2, and version 2 of the structure: `flags` and `before_copy`. Summit finds the function and then sends deferred presents by itself. See [Deferred presents](#deferred-presents-version-2).
 - The port is `zink_haiku_present.[ch]` and `zink_haiku_present_gl.c` in `mesa-haiku-gl.patch`, and the frame buffer import in `mesa-haiku-pvr.patch`. Patch 05 (frame copies) is x86 readback tuning and is not taken.
 
 What a present does:
@@ -343,6 +344,23 @@ What a present does:
 - **The image** must be B8G8R8A8 or B8G8R8X8 (-2 otherwise). Summit makes its target `GL_BGRA8_EXT` when the context has `GL_EXT_texture_format_BGRA8888` and `GL_EXT_read_format_bgra`, which zink on this driver has. Its direct present is only for TextureMapper compositing, not Skia.
 - **Release** waits until every present has finished before letting go of the import and the staging buffers. `eglTerminate()` releases them too, and so does exit.
 
+#### Deferred presents (version 2)
+
+Because the board's app_server reports scan timing, Summit times each version 1 present to the scan. On the compositing thread it calls `glFinish()`, waits for the scan to leave the page's rows, and only then presents. On 31 October, `present117/scroll.html` scrolled at 46-47 fps that way, with 16.6 ms of compositing thread per frame, against 59.6-59.9 fps and 5.0 ms with `SUMMIT_DIRECT_PRESENT_SCAN_TIMING=0` (airos-works/haiku#50). A version 2 present with `SUMMIT_HAIKU_PRESENT_DEFERRED` moves both waits to the helper thread, as Summit's patch 07 does on x86_64:
+- **The caller's batch** copies the frame's rectangles into one of four images of our own in video memory. Each image matches the frame's size and format, is made at first use, and is kept in `GENERAL` layout. It is picked by the present's slot, like the staging buffers. The same batch copies the window system's rectangles into the staging buffer, as before. The batch then signals a timeline semaphore with the present's sequence number and is flushed without waiting for the submission. The caller can composite its next frame into the same image at once.
+- **The helper thread**:
+  1. waits for that semaphore;
+  2. calls `before_copy(cookie, 0)`, which is where Summit waits for the scan;
+  3. takes zink's queue lock, waits for the queue to go idle, and calls `before_copy(cookie, 1)`;
+  4. submits the copy from our image into the frame buffer at once, then lets go of the queue;
+  5. while the GPU copies, copies the staging buffer on into the window system's copy;
+  6. waits for the GPU copy, then calls `completed()`.
+  Without a frame buffer to copy into, only attempt 0 comes, and the staging copy follows it.
+- **A non-zero `before_copy`** drops both copies. The screen and the window system's copy keep what they had, and `completed()` still comes.
+- **Errors.** -6 means the images or the helper's semaphores and command buffers could not be made. Nothing has been recorded by then, and Summit presents without the flag from then on. On a lost device, a deferred present is completed without copying, as a version 1 present is. A wait on the helper thread gives up when zink marks the device lost.
+- **Limits.** At most three deferred presents are in flight (`frames_in_flight` is clamped).
+- **Not changed.** Version 1 presents work as before.
+
 `pvr_present [--rect X,Y,W,H] [--color 0xAARRGGBB] [--expect-none] [--shim]` tests the front alone with Vulkan.
 - It imports the frame buffer and has the GPU fill a rectangle row by row.
 - It then reads the rectangle back through the import's CPU map, and checks a few pixels beside it, which must not turn the fill colour.
@@ -350,7 +368,7 @@ What a present does:
 - `--expect-none` passes when there is nothing to import.
 - `--shim` skips the pixel checks, because the shim runs nothing.
 
-`pvr_glpresent [--frames N] [--front-bpr N] [--front-refused] [--library NAME] [--shim] [--lost]` tests the whole path through Summit's entry points.
+`pvr_glpresent [--frames N] [--front-bpr N] [--front-refused] [--library NAME] [--shim] [--lost] [--deferred] [--drop]` tests the whole path through Summit's entry points.
 - It makes an ES 2 context with a `GL_BGRA8_EXT` renderbuffer target, as Summit does.
 - It presents 30 frames into a padded 320x240 stand-in for app_server's copy, with two rectangles that are partly outside the image.
 - It checks that every present's callback came, that the rectangles hold the colour, and that every other byte is untouched.
@@ -358,6 +376,10 @@ What a present does:
 - `--scene DRAWS` draws a WebGL-like frame before each present. Each of the DRAWS textured quads gets a `glBufferSubData()` and a `glUniform4f()` of its own. The quads go into a column the rectangles leave out, so they let you count what such a frame allocates.
 - `--new-texture` makes the scene sample a new 512x512 texture each frame and delete the old one, as WebKit makes one per frame.
 - `--front-bpr N` also copies to the frame buffer; use the bytes per row that `pvr_present` prints. The present must succeed, unless `--front-refused` is also given, which expects -3: no frame buffer to be had.
+- `--deferred` sends version 2 presents with `SUMMIT_HAIKU_PRESENT_DEFERRED`, after checking that `summit_haiku_present_version()` says 2.
+  - It counts the `before_copy` calls: attempt 0 must come once per present, and attempt 1 once per present that copies into the frame buffer.
+  - After the last present, the image is cleared to white before anything is waited for. The window system's copy must still hold the presented colour.
+- `--drop`, with `--deferred`, makes `before_copy` refuse every copy. Nothing may land, and every callback must still come.
 
 ## Host smoke test (`build.sh shim`)
 
@@ -381,6 +403,14 @@ The shim executes nothing. So in the expected results:
 - `pvr_present --expect-none` passes, because there is no frame buffer. `pvr_present-scanout` imports the stand-in, submits the fills and passes without checking pixels.
 - `pvr_glpresent --shim --front-bpr 4096 --front-refused` passes. The frame buffer is refused (-3), and the other refusals come back as expected.
 - `pvr_glpresent-scanout` presents to the stand-in frame buffer as well, and gets 31 completions for its 31 presents. 30 presents bring 30 callbacks, and exactly the clipped rectangles (20736 bytes) are copied: zeros, from a staging buffer the shim never ran a copy into.
+- The deferred runs all pass:
+  - `pvr_glpresent-deferred` has no frame buffer. It gets 30 presents and 30 completions, and `before_copy` is called with attempt 0 30 times and attempt 1 never.
+  - `pvr_glpresent-deferred-scanout` gets 31 of each attempt, with one more `SUBMIT_JOBS` per present: the helper's copy into the frame buffer.
+  - `pvr_glpresent-deferred-drop-scanout` leaves every byte at 0xee, and every callback still comes.
+  - `lost-pvr_glpresent-deferred` (EIO from submit 6) brings every callback and exits 0.
+- The shim's waits succeed before the batch they wait for is even submitted. So the helper can let a deferred present go before zink's flush thread has submitted it, and the in-flight limit does not hold the caller back. Two things follow:
+  - A release used to destroy the present semaphore while a batch that signals it still sat in the flush queue: an assertion in `vkQueueSubmit` in about 1 in 10 parallel runs. Release now drains the flush queue and waits for the queue to go idle first.
+  - With `--scene`, zink's batch states pile up behind the flush thread, which waits for the queue lock while the helper holds it. That is 527 buffer objects after 540 frames, all closed at teardown. On the board, a wait for a point not yet submitted waits for the submission (`WAIT_FOR_SUBMIT`), so three presents in flight bound this.
 - `pvr_vkbench` (fence; then `--timeline --rerecord`) and `pvr_glbench` each run for 3 s with 1 s lines and fail their pixel or word checks. On the host their rates measure the driver and zink CPU paths only, because the shim executes nothing.
 - `pvr_copybench-scanout` (`SCANOUT=1920x1080 pvr_copybench --runs 2`) runs every case, frame buffer included, and passes. Its times measure nothing.
 - `pvr_glcomposite --frames 2 --shim --expect zink` runs every case and passes, without its pixel checks.
@@ -396,7 +426,7 @@ Counting a present (`pvr_glpresent`, 90 against 30 frames):
 
 On the board, each of these is still kernel work every frame: areas and MMU flushes, but no firmware objects now.
 
-Then come four GPU-reset runs: `lost-pvr_vkfill`, `lost-pvr_glprobe`, `lost-pvr_glreset` and `lost-pvr_glpresent`. `PVR_TRACE_FAIL_SUBMIT=N` makes the tracer fail the N-th `SUBMIT_JOBS` and every later one with `EIO`, as the kernel does after a reset; the shim is not called. N is 1 for the first two runs, 10 for `pvr_glreset` and 6 for `pvr_glpresent`, so for those two the loss comes in the middle of their frames. Each run is given 60 s. The expected results:
+Then come five GPU-reset runs: `lost-pvr_vkfill`, `lost-pvr_glprobe`, `lost-pvr_glreset`, `lost-pvr_glpresent` and `lost-pvr_glpresent-deferred`. `PVR_TRACE_FAIL_SUBMIT=N` makes the tracer fail the N-th `SUBMIT_JOBS` and every later one with `EIO`, as the kernel does after a reset; the shim is not called. N is 1 for the first two runs, 10 for `pvr_glreset` and 6 for both `pvr_glpresent` runs, so for those the loss comes in the middle of their frames. Each run is given 60 s. The expected results:
 - `lost-pvr_vkfill` exits 1 with `vkQueueSubmit ...: -4` (`VK_ERROR_DEVICE_LOST`). The trace shows `[injected EIO]`, then a `SYNCOBJ_SIGNAL` of the fence's syncobj. The drm-shim does not implement that request (`unhandled core DRM ioctl 0xC5`), but the kernel driver does.
 - `lost-pvr_glprobe` exits 1 with `FAIL` within milliseconds, after zink's `VK_ERROR_DEVICE_LOST` line. The trace shows the one failed `SUBMIT_JOBS`, then a `SYNCOBJ_TIMELINE_SIGNAL` of zink's batch timeline point, then no more submits. A hang shows up as exit 124 marked `(HUNG)`.
 - `lost-pvr_glpresent` (EIO from submit 6) still brings a callback for every present, copies nothing, and exits 0.

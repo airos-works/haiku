@@ -566,6 +566,9 @@ shim() {
 		"SCANOUT=1920x1080 pvr_copybench --runs 2" \
 		"pvr_glpresent --shim --front-bpr 4096 --front-refused" \
 		"SCANOUT=640x480 pvr_glpresent --shim --front-bpr 2560" \
+		"pvr_glpresent --shim --deferred" \
+		"SCANOUT=640x480 pvr_glpresent --shim --front-bpr 2560 --deferred" \
+		"SCANOUT=640x480 pvr_glpresent --shim --front-bpr 2560 --deferred --drop" \
 		"pvr_glbench --seconds 3 --interval 1 --expect zink" \
 		"pvr_glcomposite --frames 2 --shim --expect zink" \
 		"pvr_glxfb --shim" "pvr_glxfb --shim --desktop" \
@@ -581,6 +584,8 @@ shim() {
 		esac
 		name=${run%% *}
 		case "$run" in
+		*--deferred*--drop) name=$name-deferred-drop ;;
+		*--deferred) name=$name-deferred ;;
 		*--resize*--mark) name=balance-resize-$name ;;
 		*--mark) name=balance-$name ;;
 		*--timeline*) name=$name-timeline-rerecord ;;
@@ -620,7 +625,8 @@ shim() {
 	local rc fail
 	for run in "1 pvr_vkfill" "1 pvr_glprobe --expect zink" \
 		"10 pvr_glreset --frames 300" \
-		"6 SCANOUT=640x480 pvr_glpresent --shim --lost --front-bpr 2560"; do
+		"6 SCANOUT=640x480 pvr_glpresent --shim --lost --front-bpr 2560" \
+		"6 SCANOUT=640x480 pvr_glpresent --shim --lost --front-bpr 2560 --deferred"; do
 		fail=${run%% *}
 		run=${run#* }
 		scanout=
@@ -629,6 +635,9 @@ shim() {
 			run=${run#* } ;;
 		esac
 		name=lost-${run%% *}
+		case "$run" in
+		*--deferred) name=$name-deferred ;;
+		esac
 		if (ulimit -s 256
 			[ -z "$scanout" ] || export PVR_SHIM_SCANOUT=$scanout
 			PVR_TRACE_FAIL_SUBMIT=$fail PVR_SHIM_DEVICE_BVNC=$SHIM_BVNC \

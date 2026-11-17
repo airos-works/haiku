@@ -78,6 +78,32 @@ shared V3D bitmaps, plus the zink pieces of the air/OS x86_64 fork
         entry points are built into the Linux DRI driver for the host
         smoke test (pvr_glpresent)
       Patch 05 (frame copies, x86 readback tuning) is not taken
+  zink_haiku_present.[ch], zink_haiku_present_gl.c, egl*.sym,
+  egl-*symbols.txt, dri.sym.in
+      Summit's patch 07 (deferred presents, airos-works/mesa
+      airos-25.3.6-x86_64 5722c8fa32): summit_haiku_present_version()
+      says 2, and a version-2 present with SUMMIT_HAIKU_PRESENT_DEFERRED
+      waits neither for the frame nor for the scan on the caller's thread.
+      The caller's batch copies the frame's rectangles into one of four
+      images of our own in video memory (by the present's slot, like the
+      staging buffers; created at the frame's size and format on first
+      use) and, as before, the window system's rectangles into the staging
+      buffer, signals a timeline semaphore with the present's sequence
+      number and is flushed without waiting for the submission. The helper
+      thread waits for that semaphore, calls before_copy (attempt 0, where
+      Summit waits for the scan to leave the page's rows), takes zink's
+      queue, waits for it to go idle, calls before_copy again (attempt 1)
+      and submits the copy from our image into the frame buffer at once;
+      while the GPU copies, it copies the staging buffer on into the window
+      system's copy, then waits for the GPU copy and calls completed(). A
+      non-zero before_copy drops both copies; -6 (our images cannot be
+      had) tells the caller to present without the flag. Version 1 presents
+      are unchanged, and a deferred present on a lost device is completed
+      without copying, as a version 1 one is. At most three deferred
+      presents are in flight. Release drains zink's flush queue and waits
+      for the queue to go idle before the semaphores, images and command
+      buffers go: a present can be over before the flush thread has
+      returned from submitting the batch that signals it.
   src/gallium/drivers/zink/zink_batch.c, zink_context.c
       a lost device: batches ended after the loss were never submitted, so
       they stayed "unflushed" forever and zink_batch_usage_unflushed_wait()
@@ -1009,20 +1035,21 @@ diff -ruN a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haik
 diff -ruN a/src/egl/egl-glvnd.sym b/src/egl/egl-glvnd.sym
 --- a/src/egl/egl-glvnd.sym
 +++ b/src/egl/egl-glvnd.sym
-@@ -1,5 +1,9 @@
+@@ -1,5 +1,10 @@
  {
  	global:
 +		haiku_mesa_readback_band_bytes;
 +		summit_haiku_present_framebuffer;
 +		summit_haiku_present_wait_idle;
 +		summit_haiku_present_release;
++		summit_haiku_present_version;
  		__egl_Main;
  		MesaGLInteropEGLQueryDeviceInfo;
  		MesaGLInteropEGLExportObject;
 diff -ruN a/src/egl/egl-glvnd-symbols.txt b/src/egl/egl-glvnd-symbols.txt
 --- a/src/egl/egl-glvnd-symbols.txt
 +++ b/src/egl/egl-glvnd-symbols.txt
-@@ -2,3 +2,7 @@
+@@ -2,3 +2,8 @@
  MesaGLInteropEGLQueryDeviceInfo
  MesaGLInteropEGLExportObject
  MesaGLInteropEGLFlushObjects
@@ -1030,23 +1057,25 @@ diff -ruN a/src/egl/egl-glvnd-symbols.txt b/src/egl/egl-glvnd-symbols.txt
 +summit_haiku_present_framebuffer (optional)
 +summit_haiku_present_wait_idle (optional)
 +summit_haiku_present_release (optional)
++summit_haiku_present_version (optional)
 diff -ruN a/src/egl/egl.sym b/src/egl/egl.sym
 --- a/src/egl/egl.sym
 +++ b/src/egl/egl.sym
-@@ -1,5 +1,9 @@
+@@ -1,5 +1,10 @@
  {
  	global:
 +		haiku_mesa_readback_band_bytes;
 +		summit_haiku_present_framebuffer;
 +		summit_haiku_present_wait_idle;
 +		summit_haiku_present_release;
++		summit_haiku_present_version;
  		egl*;
  		MesaGLInteropEGL*;
  	local:
 diff -ruN a/src/egl/egl-symbols.txt b/src/egl/egl-symbols.txt
 --- a/src/egl/egl-symbols.txt
 +++ b/src/egl/egl-symbols.txt
-@@ -45,3 +45,7 @@
+@@ -45,3 +45,8 @@
  MesaGLInteropEGLQueryDeviceInfo
  MesaGLInteropEGLExportObject
  MesaGLInteropEGLFlushObjects
@@ -1054,6 +1083,7 @@ diff -ruN a/src/egl/egl-symbols.txt b/src/egl/egl-symbols.txt
 +summit_haiku_present_framebuffer (optional)
 +summit_haiku_present_wait_idle (optional)
 +summit_haiku_present_release (optional)
++summit_haiku_present_version (optional)
 diff -ruN a/src/egl/meson.build b/src/egl/meson.build
 --- a/src/egl/meson.build
 +++ b/src/egl/meson.build
@@ -1378,7 +1408,7 @@ diff -ruN a/src/gallium/drivers/zink/zink_descriptors.c b/src/gallium/drivers/zi
 diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.c b/src/gallium/drivers/zink/zink_haiku_present.c
 --- a/src/gallium/drivers/zink/zink_haiku_present.c
 +++ b/src/gallium/drivers/zink/zink_haiku_present.c
-@@ -0,0 +1,725 @@
+@@ -0,0 +1,1177 @@
 +/*
 + * Presenting a finished frame straight into the screen on Haiku; see
 + * zink_haiku_present.h.
@@ -1397,6 +1427,16 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.c b/src/gallium/drivers/
 + * rectangle's edge could be written back by one side over the other's
 + * pixels. Processor stores into it, from the helper thread, are coherent
 + * with app_server's.
++ *
++ * A deferred present (SUMMIT_HAIKU_PRESENT_DEFERRED) does not even wait for
++ * the frame before its copy into the frame buffer goes to the GPU: the
++ * program's batch copies the frame's rectangles into one of a few images of
++ * our own in video memory (and the window system's into the staging buffer,
++ * as before), and the helper thread copies from that image into the frame
++ * buffer once the batch is done and the program's before_copy says when,
++ * then copies the staging buffer on. The program composites its next frame
++ * meanwhile, into the same image if it likes, and does not wait for the GPU
++ * or the scan on its own thread.
 + *
 + * SPDX-License-Identifier: MIT
 + */
@@ -1454,6 +1494,23 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.c b/src/gallium/drivers/
 + * lines for the processor's copy on. */
 +#define BACK_ROW_ALIGN 16
 +
++/* A deferred present's own copy of the frame in video memory, of the
++ * frame's size and format, which the helper copies the frame buffer's
++ * rectangles from; kept in VK_IMAGE_LAYOUT_GENERAL. Indexed like the
++ * staging buffers: only the present in flight that holds the index touches
++ * it, the program's thread before the present is queued, the helper after. */
++struct deferred_slot {
++   VkImage image;
++   VkDeviceMemory memory;
++   VkFormat format;
++   uint32_t width, height;
++   bool general;
++   VkCommandBuffer cmdbuf;
++   VkBuffer front_buffer;
++   unsigned front_count;
++   VkBufferImageCopy front[MAX_RECTS];
++};
++
 +struct back_slot {
 +   VkDeviceMemory memory;
 +   VkBuffer buffer;
@@ -1478,6 +1535,14 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.c b/src/gallium/drivers/
 +   void (*completed)(void *cookie);
 +   void *cookie;
 +   int slot;                      /* back_slot to copy on, or -1 */
++   /* A deferred present: the value of present_sem that says the program's
++    * batch (the frame and its copies into our image and the staging buffer)
++    * is done, and the deferred_slot to copy into the frame buffer from, or
++    * -1. */
++   bool deferred;
++   uint64_t sequence;
++   int front_slot;
++   int (*before_copy)(void *cookie, uint32_t attempt);
 +};
 +
 +static struct {
@@ -1502,6 +1567,15 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.c b/src/gallium/drivers/
 +#endif
 +
 +   struct back_slot back[BACK_SLOTS];
++
++   /* Deferred presents. present_sem is signalled by the program's batches
++    * with a present's sequence number, copy_sem by the helper's copies into
++    * the frame buffer. The command pool is used only by the helper once it
++    * exists. */
++   struct deferred_slot deferred[BACK_SLOTS];
++   VkSemaphore present_sem, copy_sem;
++   VkCommandPool command_pool;
++   uint64_t deferred_sequence;
 +
 +   /* Presents whose copies the helper thread waits for. */
 +   struct completion queue[MAX_QUEUED];
@@ -1574,6 +1648,104 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.c b/src/gallium/drivers/
 +}
 +
 +
++/* Waits, a second at a time, until a timeline semaphore reaches value;
++ * false if the device was lost meanwhile. */
++static bool
++wait_timeline(struct zink_screen *screen, VkSemaphore semaphore, uint64_t value)
++{
++   VkSemaphoreWaitInfo wait = {
++      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
++      .semaphoreCount = 1,
++      .pSemaphores = &semaphore,
++      .pValues = &value,
++   };
++   for (;;) {
++      if (screen->device_lost)
++         return false;
++      VkResult result = VKSCR(WaitSemaphores)(screen->dev, &wait, 1000000000ull);
++      if (result == VK_SUCCESS)
++         return !screen->device_lost;
++      if (result != VK_TIMEOUT)
++         return false;
++   }
++}
++
++
++/* On the helper thread: the copies of a deferred present, from its image
++ * into the frame buffer and from the staging buffer into the window
++ * system's copy. */
++static void
++copy_deferred(struct zink_screen *screen, const struct completion *entry)
++{
++   /* The program's frame, and its copies into our image and the staging
++    * buffer, are done. */
++   if (!wait_timeline(screen, state.present_sem, entry->sequence))
++      return;
++   if (entry->before_copy != NULL && entry->before_copy(entry->cookie, 0) != 0)
++      return;
++
++   bool submitted = false;
++   if (entry->front_slot >= 0) {
++      struct deferred_slot *slot = &state.deferred[entry->front_slot];
++      VkCommandBuffer cmdbuf = slot->cmdbuf;
++      VkCommandBufferBeginInfo begin = {
++         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
++      };
++      if (VKSCR(ResetCommandBuffer)(cmdbuf, 0) != VK_SUCCESS
++          || VKSCR(BeginCommandBuffer)(cmdbuf, &begin) != VK_SUCCESS)
++         return;
++      /* The image was written, and the frame buffer by the copies before;
++       * barriers order work earlier on the same queue too. */
++      VkMemoryBarrier before = {
++         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++         .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
++      };
++      VKSCR(CmdPipelineBarrier)(cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before,
++                                0, NULL, 0, NULL);
++      VKSCR(CmdCopyImageToBuffer)(cmdbuf, slot->image, VK_IMAGE_LAYOUT_GENERAL,
++                                  slot->front_buffer, slot->front_count,
++                                  slot->front);
++      if (VKSCR(EndCommandBuffer)(cmdbuf) != VK_SUCCESS)
++         return;
++
++      VkTimelineSemaphoreSubmitInfo timeline = {
++         .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
++         .signalSemaphoreValueCount = 1,
++         .pSignalSemaphoreValues = &entry->sequence,
++      };
++      VkSubmitInfo submit = {
++         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++         .pNext = &timeline,
++         .commandBufferCount = 1,
++         .pCommandBuffers = &cmdbuf,
++         .signalSemaphoreCount = 1,
++         .pSignalSemaphores = &state.copy_sem,
++      };
++      /* The copy has to start when before_copy returns, so nothing may be
++       * ahead of it on the queue: hold it (zink's submissions wait), let
++       * what other threads submitted meanwhile finish, and ask again. */
++      simple_mtx_lock(screen->queue_lock);
++      VKSCR(QueueWaitIdle)(screen->queue);
++      bool skip = entry->before_copy != NULL
++         && entry->before_copy(entry->cookie, 1) != 0;
++      VkResult result = skip ? VK_NOT_READY
++         : VKSCR(QueueSubmit)(screen->queue, 1, &submit, VK_NULL_HANDLE);
++      simple_mtx_unlock(screen->queue_lock);
++      if (result != VK_SUCCESS)
++         return;
++      submitted = true;
++   }
++   /* The window system's copy meanwhile, with the processor. */
++   if (entry->slot >= 0)
++      copy_back(screen, &state.back[entry->slot]);
++   if (submitted)
++      wait_timeline(screen, state.copy_sem, entry->sequence);
++}
++
++
 +static void *
 +completion_thread(void *data)
 +{
@@ -1589,7 +1761,10 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.c b/src/gallium/drivers/
 +      /* On a lost device nothing ran: there is nothing to copy on, but the
 +       * program still hears that the present is over. */
 +      bool ran = !screen->device_lost;
-+      if (ran && entry.batch_id != 0 && screen->sem != VK_NULL_HANDLE) {
++      if (entry.deferred) {
++         if (ran)
++            copy_deferred(screen, &entry);
++      } else if (ran && entry.batch_id != 0 && screen->sem != VK_NULL_HANDLE) {
 +         VkSemaphoreWaitInfo wait = {
 +            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
 +            .semaphoreCount = 1,
@@ -1600,7 +1775,7 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.c b/src/gallium/drivers/
 +                  == VK_SUCCESS
 +               && !screen->device_lost;
 +      }
-+      if (ran && entry.slot >= 0)
++      if (!entry.deferred && ran && entry.slot >= 0)
 +         copy_back(screen, &state.back[entry.slot]);
 +      if (entry.completed != NULL)
 +         entry.completed(entry.cookie);
@@ -1818,6 +1993,169 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.c b/src/gallium/drivers/
 +static void release_at_exit(void);
 +
 +
++/* With the lock held: the semaphores and command buffers of deferred
++ * presents. */
++static bool
++ensure_deferred(struct zink_screen *screen)
++{
++   if (state.command_pool != VK_NULL_HANDLE)
++      return true;
++   VkSemaphoreTypeCreateInfo type = {
++      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
++      .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
++      .initialValue = 0,
++   };
++   VkSemaphoreCreateInfo sci = {
++      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
++      .pNext = &type,
++   };
++   VkCommandPoolCreateInfo cpci = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++      .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
++      .queueFamilyIndex = screen->gfx_queue,
++   };
++   VkCommandBuffer cmdbufs[BACK_SLOTS];
++   VkCommandBufferAllocateInfo cbai = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++      .commandBufferCount = BACK_SLOTS,
++   };
++   if (VKSCR(CreateSemaphore)(screen->dev, &sci, NULL, &state.present_sem) != VK_SUCCESS
++       || VKSCR(CreateSemaphore)(screen->dev, &sci, NULL, &state.copy_sem) != VK_SUCCESS
++       || VKSCR(CreateCommandPool)(screen->dev, &cpci, NULL, &state.command_pool) != VK_SUCCESS)
++      goto fail;
++   cbai.commandPool = state.command_pool;
++   if (VKSCR(AllocateCommandBuffers)(screen->dev, &cbai, cmdbufs) != VK_SUCCESS)
++      goto fail;
++   for (unsigned i = 0; i < BACK_SLOTS; i++)
++      state.deferred[i].cmdbuf = cmdbufs[i];
++   state.deferred_sequence = 0;
++   return true;
++
++fail:
++   if (state.command_pool != VK_NULL_HANDLE)
++      VKSCR(DestroyCommandPool)(screen->dev, state.command_pool, NULL);
++   if (state.copy_sem != VK_NULL_HANDLE)
++      VKSCR(DestroySemaphore)(screen->dev, state.copy_sem, NULL);
++   if (state.present_sem != VK_NULL_HANDLE)
++      VKSCR(DestroySemaphore)(screen->dev, state.present_sem, NULL);
++   state.command_pool = VK_NULL_HANDLE;
++   state.copy_sem = state.present_sem = VK_NULL_HANDLE;
++   return false;
++}
++
++
++static void
++drop_deferred_image(struct zink_screen *screen, struct deferred_slot *slot)
++{
++   if (slot->image != VK_NULL_HANDLE)
++      VKSCR(DestroyImage)(screen->dev, slot->image, NULL);
++   if (slot->memory != VK_NULL_HANDLE)
++      VKSCR(FreeMemory)(screen->dev, slot->memory, NULL);
++   slot->image = VK_NULL_HANDLE;
++   slot->memory = VK_NULL_HANDLE;
++   slot->width = slot->height = 0;
++   slot->general = false;
++}
++
++
++/* With the lock held, and no present in flight using the slot: an image of
++ * the frame's size and format in video memory. */
++static bool
++ensure_deferred_image(struct zink_screen *screen, struct deferred_slot *slot,
++                      VkFormat format, uint32_t width, uint32_t height)
++{
++   if (slot->image != VK_NULL_HANDLE && slot->format == format
++       && slot->width == width && slot->height == height)
++      return true;
++   drop_deferred_image(screen, slot);
++   VkImageCreateInfo ici = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = format,
++      .extent = { width, height, 1 },
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++   };
++   if (VKSCR(CreateImage)(screen->dev, &ici, NULL, &slot->image) != VK_SUCCESS) {
++      slot->image = VK_NULL_HANDLE;
++      return false;
++   }
++   VkMemoryRequirements reqs;
++   VKSCR(GetImageMemoryRequirements)(screen->dev, slot->image, &reqs);
++   uint32_t type = UINT32_MAX;
++   for (uint32_t i = 0; i < screen->info.mem_props.memoryTypeCount; i++) {
++      if ((reqs.memoryTypeBits & BITFIELD_BIT(i))
++          && (screen->info.mem_props.memoryTypes[i].propertyFlags
++              & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
++         type = i;
++         break;
++      }
++   }
++   VkMemoryAllocateInfo mai = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = reqs.size,
++      .memoryTypeIndex = type,
++   };
++   if (type == UINT32_MAX
++       || VKSCR(AllocateMemory)(screen->dev, &mai, NULL, &slot->memory)
++          != VK_SUCCESS) {
++      slot->memory = VK_NULL_HANDLE;
++      drop_deferred_image(screen, slot);
++      return false;
++   }
++   if (VKSCR(BindImageMemory)(screen->dev, slot->image, slot->memory, 0)
++       != VK_SUCCESS) {
++      drop_deferred_image(screen, slot);
++      return false;
++   }
++   slot->format = format;
++   slot->width = width;
++   slot->height = height;
++   slot->general = false;
++   return true;
++}
++
++
++/* With the lock held: lets go of what deferred presents use, once none is
++ * in flight. */
++static void
++drop_deferred(struct zink_screen *screen)
++{
++   wait_idle_locked();
++   if (state.command_pool == VK_NULL_HANDLE)
++      return;
++   /* A present is over once the helper saw present_sem reach its number,
++    * which may be before zink's flush thread has returned from submitting
++    * the batch that signals it (a wait for a point not yet submitted only
++    * waits for the submission; drm-shim's waits do not wait at all). Its
++    * semaphores, our images and command buffers may only go once every
++    * batch that uses them is submitted and done. */
++   if (util_queue_is_initialized(&screen->flush_queue))
++      util_queue_finish(&screen->flush_queue);
++   simple_mtx_lock(screen->queue_lock);
++   VKSCR(QueueWaitIdle)(screen->queue);
++   simple_mtx_unlock(screen->queue_lock);
++   for (unsigned i = 0; i < BACK_SLOTS; i++) {
++      drop_deferred_image(screen, &state.deferred[i]);
++      state.deferred[i].cmdbuf = VK_NULL_HANDLE;
++   }
++   if (state.command_pool != VK_NULL_HANDLE)
++      VKSCR(DestroyCommandPool)(screen->dev, state.command_pool, NULL);
++   if (state.copy_sem != VK_NULL_HANDLE)
++      VKSCR(DestroySemaphore)(screen->dev, state.copy_sem, NULL);
++   if (state.present_sem != VK_NULL_HANDLE)
++      VKSCR(DestroySemaphore)(screen->dev, state.present_sem, NULL);
++   state.command_pool = VK_NULL_HANDLE;
++   state.copy_sem = state.present_sem = VK_NULL_HANDLE;
++}
++
++
 +/* Clips one of the present's rectangles to the image and to a surface of
 + * width x height pixels; false if nothing is left. */
 +static bool
@@ -1912,14 +2250,140 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.c b/src/gallium/drivers/
 +}
 +
 +
++/* With the lock held, room in the queue and the device not lost: a deferred
++ * present (see SUMMIT_HAIKU_PRESENT_DEFERRED) into the frame buffer's
++ * regions front and, through the staging buffer of slot index, the window
++ * system's regions back. Returns 0, or -6 when our own image cannot be had,
++ * before anything was recorded. */
++static int
++present_deferred(struct zink_context *ctx, struct zink_screen *screen,
++                 struct pipe_resource *image, struct zink_resource *res,
++                 const struct summit_haiku_present *p, unsigned index,
++                 const VkBufferImageCopy *front, unsigned front_count,
++                 const VkBufferImageCopy *back, unsigned back_count)
++{
++   if (!ensure_deferred(screen))
++      return -6;
++   struct deferred_slot *slot = &state.deferred[index];
++   if (front_count != 0
++       && !ensure_deferred_image(screen, slot, res->format, image->width0,
++                                 image->height0))
++      return -6;
++   const uint64_t sequence = state.deferred_sequence + 1;
++
++   /* what was drawn last, a clear that is still pending included */
++   zink_fb_clears_apply(ctx, image, 0, 1);
++   zink_batch_no_rp(ctx);
++   screen->image_barrier(ctx, res, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                         VK_ACCESS_TRANSFER_READ_BIT,
++                         VK_PIPELINE_STAGE_TRANSFER_BIT);
++   zink_batch_reference_resource_rw(ctx, res, false);
++   VkCommandBuffer cmdbuf = ctx->bs->cmdbuf;
++
++   if (front_count != 0) {
++      /* What the copy into the frame buffer reads, in the image's texels:
++       * the same places in our image. */
++      static VkImageCopy copies[MAX_RECTS];
++      for (unsigned i = 0; i < front_count; i++) {
++         copies[i] = (VkImageCopy) {
++            .srcSubresource = front[i].imageSubresource,
++            .srcOffset = front[i].imageOffset,
++            .dstSubresource = front[i].imageSubresource,
++            .dstOffset = front[i].imageOffset,
++            .extent = front[i].imageExtent,
++         };
++      }
++      /* The slot's last copy into the frame buffer read it (and has
++       * finished). */
++      VkImageMemoryBarrier into_slot = {
++         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++         .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++         .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++         .oldLayout = slot->general ? VK_IMAGE_LAYOUT_GENERAL
++                                    : VK_IMAGE_LAYOUT_UNDEFINED,
++         .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++         .image = slot->image,
++         .subresourceRange = {
++            .aspectMask = res->aspect,
++            .baseMipLevel = 0,
++            .levelCount = 1,
++            .baseArrayLayer = 0,
++            .layerCount = 1,
++         },
++      };
++      VKCTX(CmdPipelineBarrier)(cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL,
++                                0, NULL, 1, &into_slot);
++      slot->general = true;
++      VKCTX(CmdCopyImage)(cmdbuf, res->obj->image, res->layout, slot->image,
++                          VK_IMAGE_LAYOUT_GENERAL, front_count, copies);
++      memcpy(slot->front, front, front_count * sizeof(*front));
++      slot->front_count = front_count;
++      slot->front_buffer = state.scanout_buffer;
++   }
++   if (back_count != 0) {
++      /* As in an immediate present: into the staging buffer, which the
++       * helper reads with the processor once the batch is done. */
++      VkMemoryBarrier before = {
++         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++         .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++      };
++      VKCTX(CmdPipelineBarrier)(cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before,
++                                0, NULL, 0, NULL);
++      VKCTX(CmdCopyImageToBuffer)(cmdbuf, res->obj->image, res->layout,
++                                  state.back[index].buffer, back_count, back);
++      VkMemoryBarrier after = {
++         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++         .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
++      };
++      VKCTX(CmdPipelineBarrier)(cmdbuf, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &after,
++                                0, NULL, 0, NULL);
++   }
++   ctx->bs->has_work = true;
++
++   /* The frame's batch, these copies last, says it is done on present_sem.
++    * It goes to the GPU without waiting here, for the GPU or (with
++    * threaded submission) for the submission itself. */
++   util_dynarray_append_typed(&ctx->bs->user_signal_semaphores, VkSemaphore,
++                              state.present_sem);
++   util_dynarray_append_typed(&ctx->bs->user_signal_semaphore_values,
++                              uint64_t, sequence);
++   ctx->base.flush(&ctx->base, NULL, PIPE_FLUSH_ASYNC);
++   state.deferred_sequence = sequence;
++
++   unsigned tail = (state.queue_head + state.queue_count) % MAX_QUEUED;
++   state.queue[tail] = (struct completion) {
++      .completed = p->completed,
++      .cookie = p->cookie,
++      .slot = back_count != 0 ? (int)index : -1,
++      .deferred = true,
++      .sequence = sequence,
++      .front_slot = front_count != 0 ? (int)index : -1,
++      .before_copy = p->before_copy,
++   };
++   state.queue_count++;
++   state.submitted++;
++   pthread_cond_broadcast(&state.changed);
++   return 0;
++}
++
++
 +int
 +zink_haiku_present(struct pipe_context *pipe, struct pipe_resource *image,
 +                   const struct summit_haiku_present *p)
 +{
 +   if (pipe == NULL || image == NULL || p == NULL
-+       || p->version != SUMMIT_HAIKU_PRESENT_VERSION
++       || p->version < 1 || p->version > SUMMIT_HAIKU_PRESENT_VERSION
 +       || (p->rect_count > 0 && p->rects == NULL))
 +      return -1;
++   const bool deferred = p->version >= 2
++      && (p->flags & SUMMIT_HAIKU_PRESENT_DEFERRED) != 0;
 +   /* The screen holds 32 bit pixels in the order B, G, R, A; copying is
 +    * byte for byte, so the image must be in that order already. */
 +   if (image->format != PIPE_FORMAT_B8G8R8A8_UNORM
@@ -1951,6 +2415,8 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.c b/src/gallium/drivers/
 +    * in flight may hold a staging buffer. */
 +   unsigned in_flight = p->frames_in_flight ? p->frames_in_flight : 2;
 +   in_flight = CLAMP(in_flight, 1, BACK_SLOTS);
++   if (deferred)
++      in_flight = MIN2(in_flight, BACK_SLOTS - 1);
 +   while (state.submitted - state.finished >= in_flight
 +          || state.queue_count == MAX_QUEUED)
 +      pthread_cond_wait(&state.changed, &state.lock);
@@ -1959,6 +2425,8 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.c b/src/gallium/drivers/
 +   const unsigned image_height = image->height0;
 +   static VkBufferImageCopy front[MAX_RECTS], back[MAX_RECTS];
 +   unsigned front_count = 0, back_count = 0;
++   /* free: the present that used it last has finished */
++   const unsigned index = state.submitted % BACK_SLOTS;
 +   int slot_index = -1;
 +   int result = 0;
 +
@@ -1972,8 +2440,7 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.c b/src/gallium/drivers/
 +      if (p->back_bytes_per_row < p->back_width * 4)
 +         result = -4;
 +      else {
-+         /* free: the present that used it last has finished */
-+         slot_index = state.submitted % BACK_SLOTS;
++         slot_index = index;
 +         struct back_slot *slot = &state.back[slot_index];
 +         uint64_t bytes = 0;
 +         back_count = back_regions(back, slot, p, res, image_width,
@@ -1994,6 +2461,13 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.c b/src/gallium/drivers/
 +      pthread_mutex_unlock(&state.lock);
 +      if (result == 0 && p->completed != NULL)
 +         p->completed(p->cookie);
++      return result;
++   }
++
++   if (deferred && !screen->device_lost) {
++      result = present_deferred(ctx, screen, image, res, p, index, front,
++                                front_count, back, back_count);
++      pthread_mutex_unlock(&state.lock);
 +      return result;
 +   }
 +
@@ -2076,6 +2550,7 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.c b/src/gallium/drivers/
 +      for (unsigned i = 0; i < BACK_SLOTS; i++)
 +         drop_back_slot(screen, &state.back[i]);
 +      drop_scanout(screen);
++      drop_deferred(screen);
 +      if (pscreen != NULL)
 +         state.screen = NULL;
 +   }
@@ -2097,6 +2572,13 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.c b/src/gallium/drivers/
 +}
 +
 +
++int
++zink_haiku_present_version(void)
++{
++   return SUMMIT_HAIKU_PRESENT_VERSION;
++}
++
++
 +void
 +zink_haiku_present_wait_idle(void)
 +{
@@ -2107,7 +2589,7 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.c b/src/gallium/drivers/
 diff -ruN a/src/gallium/drivers/zink/zink_haiku_present_gl.c b/src/gallium/drivers/zink/zink_haiku_present_gl.c
 --- a/src/gallium/drivers/zink/zink_haiku_present_gl.c
 +++ b/src/gallium/drivers/zink/zink_haiku_present_gl.c
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,71 @@
 +/*
 + * Summit's entry points to zink_haiku_present.h, for the current OpenGL
 + * (ES) context. Summit's web process composites each page into a
@@ -2171,10 +2653,18 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present_gl.c b/src/gallium/drive
 +{
 +   zink_haiku_present_release(NULL);
 +}
++
++/* The highest struct summit_haiku_present version taken: 2 has
++ * SUMMIT_HAIKU_PRESENT_DEFERRED. A Mesa without this takes only version 1. */
++PUBLIC int
++summit_haiku_present_version(void)
++{
++   return zink_haiku_present_version();
++}
 diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.h b/src/gallium/drivers/zink/zink_haiku_present.h
 --- a/src/gallium/drivers/zink/zink_haiku_present.h
 +++ b/src/gallium/drivers/zink/zink_haiku_present.h
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,127 @@
 +/*
 + * Presenting a finished frame straight into the screen on Haiku, for a
 + * program that composites with OpenGL ES through EGL (Summit's web process).
@@ -2189,6 +2679,12 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.h b/src/gallium/drivers/
 + * a helper thread copies them on into the window system's copy once the GPU
 + * is done: the GPU never writes memory app_server's processor writes too.
 + * Nothing waits for the GPU on the program's thread.
++ *
++ * A deferred present (version 2, SUMMIT_HAIKU_PRESENT_DEFERRED) does not
++ * copy into the frame buffer in the program's work either: that work copies
++ * the frame into one of a few images of our own in video memory, and the
++ * helper thread copies from there into the frame buffer once the frame is
++ * done and the program's before_copy says when.
 + *
 + * SPDX-License-Identifier: MIT
 + */
@@ -2205,7 +2701,19 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.h b/src/gallium/drivers/
 +struct pipe_resource;
 +struct pipe_screen;
 +
-+#define SUMMIT_HAIKU_PRESENT_VERSION 1
++/* Version 2 adds flags and before_copy; a version 1 request is still taken. */
++#define SUMMIT_HAIKU_PRESENT_VERSION 2
++
++/* The copies into the screen are made on the helper thread, not in the
++ * caller's batch: the call only adds a copy of the frame into one of a few
++ * images of Mesa's own in video memory (and of the window system's
++ * rectangles into the staging buffer) to the caller's work, and returns
++ * without waiting for the GPU. The helper waits for that work, asks
++ * before_copy whether and when to copy (a caller that times copies to the
++ * monitor's scan waits there), and then submits the copy into the frame
++ * buffer on its own and copies the staging buffer on into the window
++ * system's copy. The caller's next frame is composited meanwhile. */
++#define SUMMIT_HAIKU_PRESENT_DEFERRED 0x1
 +
 +struct summit_haiku_present {
 +   uint32_t version;              /* SUMMIT_HAIKU_PRESENT_VERSION */
@@ -2232,15 +2740,34 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.h b/src/gallium/drivers/
 +    * nothing could be copied. May be NULL. */
 +   void (*completed)(void *cookie);
 +   void *cookie;
++   /* Version 2. */
++   uint32_t flags;                /* SUMMIT_HAIKU_PRESENT_DEFERRED */
++   /* With SUMMIT_HAIKU_PRESENT_DEFERRED, called on the helper thread once
++    * the frame is finished on the GPU, right before its copies are
++    * submitted. attempt 0 is called with nothing held, and may wait as long
++    * as it likes. Then the helper takes the GPU's queue and waits until the
++    * work other threads submitted meanwhile has finished, and calls it again
++    * (attempt 1) holding the queue: the copy into the frame buffer starts as
++    * soon as that returns, so it still starts at a moment it chose. It
++    * should return at once unless that work took long; other submissions
++    * wait meanwhile. (Without a frame buffer to copy into, only attempt 0
++    * comes.) A non-zero return drops this present's copies (the screen and
++    * the window system's copy keep what they had; completed is still
++    * called). May be NULL. */
++   int (*before_copy)(void *cookie, uint32_t attempt);
 +};
 +
 +/* Returns 0 when the copies were submitted, a negative number when this
 + * present cannot go to the screen (the caller then presents some other way):
 + * -1 bad arguments, -2 unsupported image format, -3 no frame buffer to be had
 + * or it is not the one described, -4 the window system's copy could not be
-+ * made, -5 nothing visible. */
++ * made, -5 nothing visible, -6 a deferred present could not get Mesa's own
++ * images in video memory (nothing was done: present without the flag). */
 +int zink_haiku_present(struct pipe_context *pipe, struct pipe_resource *image,
 +                       const struct summit_haiku_present *present);
++
++/* The highest SUMMIT_HAIKU_PRESENT_VERSION this Mesa takes. */
++int zink_haiku_present_version(void);
 +
 +/* Waits until every present submitted so far has finished. */
 +void zink_haiku_present_wait_idle(void);
@@ -2258,6 +2785,7 @@ diff -ruN a/src/gallium/drivers/zink/zink_haiku_present.h b/src/gallium/drivers/
 +                                     const struct summit_haiku_present *present);
 +void summit_haiku_present_wait_idle(void);
 +void summit_haiku_present_release(void);
++int summit_haiku_present_version(void);
 +
 +#ifdef __cplusplus
 +}
@@ -2709,13 +3237,14 @@ diff -ruN a/src/gallium/frontends/hgl/meson.build b/src/gallium/frontends/hgl/me
 diff -ruN a/src/gallium/targets/dri/dri.sym.in b/src/gallium/targets/dri/dri.sym.in
 --- a/src/gallium/targets/dri/dri.sym.in
 +++ b/src/gallium/targets/dri/dri.sym.in
-@@ -9,6 +9,9 @@
+@@ -9,6 +9,10 @@
                  _mesa_glapi_tls_Context;
                  _mesa_glapi_tls_Dispatch;
  
 +		summit_haiku_present_framebuffer;
 +		summit_haiku_present_wait_idle;
 +		summit_haiku_present_release;
++		summit_haiku_present_version;
  		ddebug_screen_create;
  		noop_screen_create;
  		util_run_tests;

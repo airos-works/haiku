@@ -21,6 +21,7 @@
 // a frame buffer that cannot be had (-3, the host) or is used.
 //   pvr_glpresent [--frames N] [--front-bpr N] [--front-refused]
 //       [--scene DRAWS] [--new-texture] [--library NAME] [--shim] [--lost]
+//       [--deferred] [--drop]
 // --front-bpr: also copy into the screen's frame buffer, whose rows have
 // that many bytes (pvr_present prints it), where it must work, or with
 // --front-refused be refused (-3, no frame buffer to be had); --scene: draw
@@ -33,6 +34,13 @@
 // the GPU runs nothing (build.sh shim), so the rectangles must hold what the
 // untouched staging buffer held, zeros; --lost: the device is lost on the
 // way (injected), so only the callbacks and the end of the run count.
+// --deferred: version 2 presents with SUMMIT_HAIKU_PRESENT_DEFERRED, as
+// Summit makes them where summit_haiku_present_version() is 2 or more: the
+// copies are made on Mesa's helper thread, which calls before_copy (counted)
+// first; after the last present the image is cleared to another colour
+// before anything is waited for, and the copies must still hold the frame
+// as presented. --drop (with --deferred): before_copy refuses every copy, so
+// nothing may land, and every callback must still come.
 
 
 #include <dlfcn.h>
@@ -55,7 +63,8 @@
 #define BACK_PITCH		(BACK_WIDTH * 4 + 64)
 #define FILL			0xee
 
-// zink_haiku_present.h's interface, version 1
+// zink_haiku_present.h's interface, version 2 (version 1 ends at cookie)
+#define SUMMIT_HAIKU_PRESENT_DEFERRED	0x1
 struct summit_haiku_present {
 	uint32_t	version;
 	int32_t		origin_x, origin_y;
@@ -68,13 +77,18 @@ struct summit_haiku_present {
 	uint32_t	frames_in_flight;
 	void		(*completed)(void* cookie);
 	void*		cookie;
+	uint32_t	flags;
+	int			(*before_copy)(void* cookie, uint32_t attempt);
 };
 
 typedef int (*present_function)(unsigned framebuffer,
 	const struct summit_haiku_present* present);
 typedef void (*void_function)(void);
+typedef int (*int_function)(void);
 
 static volatile int sCompleted;
+static volatile int sBeforeCopy[2];
+static int sDrop;
 
 
 static void
@@ -82,6 +96,17 @@ completed(void* cookie)
 {
 	__atomic_add_fetch(&sCompleted, 1, __ATOMIC_SEQ_CST);
 	(void)cookie;
+}
+
+
+// on Mesa's helper thread, before a deferred present's copies
+static int
+before_copy(void* cookie, uint32_t attempt)
+{
+	(void)cookie;
+	if (attempt < 2)
+		__atomic_add_fetch(&sBeforeCopy[attempt], 1, __ATOMIC_SEQ_CST);
+	return sDrop;
 }
 
 
@@ -240,7 +265,7 @@ main(int argc, char** argv)
 	unsigned frames = 30, frontBpr = 0;
 	int shim = 0, lost = 0, frontRefused = 0;
 	unsigned sceneDraws = 0;
-	int newTexture = 0;
+	int newTexture = 0, deferred = 0;
 #ifdef __HAIKU__
 	const char* library = "libEGL_mesa.so.0";
 #else
@@ -263,12 +288,20 @@ main(int argc, char** argv)
 			newTexture = 1;
 		else if (strcmp(argv[i], "--lost") == 0)
 			lost = 1;
+		else if (strcmp(argv[i], "--deferred") == 0)
+			deferred = 1;
+		else if (strcmp(argv[i], "--drop") == 0)
+			sDrop = 1;
 		else {
 			printf("usage: %s [--frames N] [--front-bpr N] [--front-refused] "
 				"[--scene DRAWS] [--new-texture] [--library NAME] [--shim] "
-				"[--lost]\n", argv[0]);
+				"[--lost] [--deferred] [--drop]\n", argv[0]);
 			return 2;
 		}
+	}
+	if (sDrop && !deferred) {
+		printf("--drop needs --deferred\n");
+		return 2;
 	}
 
 	EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
@@ -327,6 +360,15 @@ main(int argc, char** argv)
 		printf("FAIL: no summit_haiku_present_* in %s\n", library);
 		return 1;
 	}
+	// as Summit asks: a Mesa without it takes version 1 only
+	int_function versionFunction = (int_function)find_symbol(library,
+		"summit_haiku_present_version");
+	int version = versionFunction != NULL ? versionFunction() : 1;
+	printf("summit_haiku_present_version: %d\n", version);
+	if (deferred && version < 2) {
+		printf("FAIL: deferred presents need version 2\n");
+		return 1;
+	}
 
 	int ok = 1;
 	uint8_t* back = malloc((size_t)BACK_PITCH * BACK_HEIGHT);
@@ -338,7 +380,7 @@ main(int argc, char** argv)
 		120, 100, 200, 199,		// partly right of and below it
 	};
 	struct summit_haiku_present request = {
-		.version = 1,
+		.version = deferred ? 2 : 1,
 		.origin_x = origin[0],
 		.origin_y = origin[1],
 		.rect_count = 2,
@@ -351,6 +393,8 @@ main(int argc, char** argv)
 		.frames_in_flight = 2,
 		.completed = completed,
 		.cookie = NULL,
+		.flags = deferred ? SUMMIT_HAIKU_PRESENT_DEFERRED : 0,
+		.before_copy = deferred ? before_copy : NULL,
 	};
 
 	// the refusals: an RGBA image, and a framebuffer object not bound
@@ -406,12 +450,35 @@ main(int argc, char** argv)
 		}
 		presented++;
 	}
+	if (deferred) {
+		// drawn after the last present, before its copies may have been
+		// made: they must come from the frame as presented
+		glClearColor(1, 1, 1, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glFlush();
+	}
 	waitIdle();
 	printf("%d presents, %d completions\n", presented, sCompleted);
 	ok &= sCompleted == presented;
+	if (deferred) {
+		// attempt 1 comes only for a copy into the frame buffer, and not
+		// after attempt 0 dropped the present
+		const int front = frontBpr != 0 && !frontRefused && !sDrop;
+		printf("before_copy: %d attempt 0, %d attempt 1 (expected %d and "
+			"%d%s)\n", sBeforeCopy[0], sBeforeCopy[1], presented,
+			front ? presented : 0, lost ? ", or fewer: device lost" : "");
+		if (lost) {
+			ok &= sBeforeCopy[0] <= presented
+				&& sBeforeCopy[1] <= sBeforeCopy[0];
+		} else {
+			ok &= sBeforeCopy[0] == presented
+				&& sBeforeCopy[1] == (front ? presented : 0);
+		}
+	}
 
 	// what landed: the rectangles clipped to the image are the colour (or
-	// zeros under the shim), the rest is untouched, the padding included
+	// zeros under the shim; nothing with --drop), the rest is untouched, the
+	// padding included
 	unsigned inside = 0, wrongInside = 0, wrongOutside = 0;
 	for (int y = 0; y < BACK_HEIGHT; y++) {
 		for (int x = 0; x < BACK_PITCH; x++) {
@@ -428,7 +495,7 @@ main(int argc, char** argv)
 			uint8_t value = back[(size_t)y * BACK_PITCH + x];
 			if (in) {
 				inside++;
-				uint8_t want = shim ? 0 : color[x % 4];
+				uint8_t want = sDrop ? FILL : shim ? 0 : color[x % 4];
 				if (value != want && !lost)
 					wrongInside++;
 			} else if (value != FILL)
