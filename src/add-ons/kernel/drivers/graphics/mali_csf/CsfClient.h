@@ -12,6 +12,8 @@ status_t AccessClient(void* cookie);
 void CloseClient(void* cookie);
 void FreeClient(void* cookie);
 status_t ControlClient(void* cookie, uint32 op, void* buffer, size_t length);
+// kImportBuffer: the caller watches the opening team first (driver.cpp).
+status_t ImportClientBuffer(void* cookie, void* buffer, size_t length);
 
 // Kernel-only ownership for scheduled work. A lease pins an immutable root and
 // every buffer mapped by that generation, independently of handles/fd lifetime.

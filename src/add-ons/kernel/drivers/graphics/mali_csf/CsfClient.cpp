@@ -4,6 +4,9 @@
 #include <team.h>
 #include <util/AutoLock.h>
 #include <vm/vm.h>
+#include <vm/VMAddressSpace.h>
+#include <vm/VMArea.h>
+#include <vm/VMCache.h>
 #include <stdlib.h>
 #if defined(__aarch64__)
 #include <arch/arm64/cache_line_size.h>
@@ -27,12 +30,14 @@ static const uint32 kMaxGlobalHeaps = 256;
 static const uint64 kMaxGlobalHeapBytes = UINT64_C(512) << 20;
 static uint32 sHeaps, sHeapChunks, sHeapTablePages, sHeapGenerations;
 static uint64 sHeapBytes;
+static const uint64 kMaxGlobalImportedBytes = UINT64_C(1) << 30;
+static uint64 sImportedBytes;
 // Mesa reports a refused allocation only as GL_OUT_OF_MEMORY, which does not
 // tell a full quota from a full machine. Name the bound, once per kind.
 enum {
 	kRefusedClients, kRefusedBufferCount, kRefusedClientBytes, kRefusedGlobalBytes,
 	kRefusedVms, kRefusedMappings, kRefusedMappedBytes, kRefusedGenerations,
-	kRefusedTablePages
+	kRefusedTablePages, kRefusedImportedBytes
 };
 static uint32 sRefusalsLogged;
 
@@ -62,12 +67,24 @@ struct ClientAccount {
 	uint32 references;
 	uint32 buffers;
 	uint64 bytes;
+	uint64 importedBytes;
 	uint32 heaps;
 	uint64 heapBytes;
 };
 
+// How an imported buffer holds the team's pages (kImportBuffer).
+enum {
+	kNotImported = 0,
+	kImportWired, // lock_memory_etc() of the range in the team
+	kImportCacheReference // a reference to a contiguous area's cache
+};
+
 struct ClientBuffer : ClientMemory {
 	bool cached;
+	uint8 import;
+	team_id team;
+	addr_t userAddress;
+	VMCache* cache;
 	ClientBuffer* next;
 	uint32 handle;
 	uint32 references;
@@ -227,13 +244,34 @@ ReleaseAccount(ClientAccount* account)
 }
 
 static void
+ReleaseImport(ClientBuffer* buffer)
+{
+	if (buffer->import == kImportWired) {
+		// Fails harmlessly once the team's address space is gone, and with it
+		// the wiring. The team closes its files (and the watcher in driver.cpp
+		// closes this client) before that.
+		unlock_memory_etc(buffer->team, (void*)buffer->userAddress, buffer->bytes,
+			B_READ_DEVICE);
+	} else if (buffer->import == kImportCacheReference)
+		buffer->cache->ReleaseRef();
+	buffer->import = kNotImported;
+	buffer->cache = NULL;
+}
+
+static void
 ReleaseBuffer(ClientBuffer* buffer)
 {
 	if (--buffer->references != 0)
 		return;
-	buffer->account->bytes -= buffer->bytes;
+	if (buffer->import != kNotImported) {
+		buffer->account->importedBytes -= buffer->bytes;
+		sImportedBytes -= buffer->bytes;
+		ReleaseImport(buffer);
+	} else {
+		buffer->account->bytes -= buffer->bytes;
+		sBufferBytes -= buffer->bytes;
+	}
 	buffer->account->buffers--;
-	sBufferBytes -= buffer->bytes;
 	sBuffers--;
 	ReleaseAccount(buffer->account);
 	// User CPU clones retain the VM cache independently after this area is gone.
@@ -644,6 +682,224 @@ CreateBuffer(Client* client, BufferCreate& request)
 	sBufferBytes += bytes;
 	request.bytes = bytes;
 	request.handle = buffer->handle;
+	return B_OK;
+}
+
+// The calling team's area covering [address, address + bytes): writable,
+// ordinary memory. The address space must be read-locked.
+static VMArea*
+LookupImportArea(VMAddressSpace* space, addr_t address, size_t bytes)
+{
+	VMArea* area = space->LookupArea(address);
+	if (area == NULL || address - area->Base() > area->Size()
+		|| bytes > area->Size() - (address - area->Base())
+		|| (area->protection & (B_READ_AREA | B_WRITE_AREA))
+			!= (B_READ_AREA | B_WRITE_AREA)
+		|| area->cache_type != CACHE_TYPE_RAM) {
+		return NULL;
+	}
+	return area;
+}
+
+static bool
+CpuCachedArea(const VMArea* area)
+{
+	// The default memory type is normal write-back memory.
+	return area->MemoryType() == 0 || area->MemoryType() == B_WRITE_BACK_MEMORY;
+}
+
+// The physical pages of [address, address + bytes) of a contiguous area (a
+// frame buffer a display driver cloned into the team), with a reference to
+// their cache instead of wiring: the pages stay with the cache when the area,
+// its source or the source's other clones go, and the display driver may
+// replace its frame buffer (which turns the clones into null areas, which a
+// wired range must not be) without waiting for this client.
+static status_t
+ReferenceContiguousPages(VMArea* area, addr_t address, size_t bytes, uint64* pages,
+	VMCache*& _cache)
+{
+	VMCache* cache = vm_area_get_locked_cache(area);
+	status_t status = cache->source == NULL ? B_OK : B_NOT_SUPPORTED;
+	off_t offset = area->cache_offset + (address - area->Base());
+	for (size_t i = 0; status == B_OK && i < bytes / B_PAGE_SIZE; i++) {
+		vm_page* page = cache->LookupPage(offset + i * B_PAGE_SIZE);
+		if (page == NULL || page->busy) {
+			status = B_BAD_ADDRESS;
+			break;
+		}
+		pages[i] = (uint64)page->physical_page_number * B_PAGE_SIZE;
+		if (!GpuPageTable::ValidPhysical(pages[i]))
+			status = B_BAD_VALUE;
+	}
+	if (status == B_OK) {
+		cache->AcquireRefLocked();
+		_cache = cache;
+	}
+	vm_area_put_locked_cache(cache);
+	return status;
+}
+
+// Wires [address, address + bytes) in the calling team, as for a transfer
+// into user memory, and returns its physical pages. Not a kernel clone of the
+// team's area: such a clone maps a wired source's pages without mapping
+// objects, and wiring it for writing does copy-on-write on them.
+static status_t
+WireTeamPages(addr_t address, size_t bytes, uint64* pages, bool& cached)
+{
+	const team_id team = team_get_current_team_id();
+	status_t status = lock_memory_etc(team, (void*)address, bytes, B_READ_DEVICE);
+	if (status != B_OK)
+		return status;
+	// Mapped now, as get_memory_map() needs: a fully locked clone maps its
+	// pages only once they are touched.
+	for (size_t offset = 0; status == B_OK && offset < bytes; offset += B_PAGE_SIZE) {
+		uint8 byte;
+		status = user_memcpy(&byte, (const void*)(address + offset), 1);
+	}
+	// While the range is wired its areas cannot go: check what it is now.
+	if (status == B_OK) {
+		VMAddressSpace* space = VMAddressSpace::GetCurrent();
+		if (space == NULL)
+			status = B_BAD_TEAM_ID;
+		else {
+			space->ReadLock();
+			VMArea* area = LookupImportArea(space, address, bytes);
+			if (area == NULL || area->wiring == B_CONTIGUOUS)
+				status = B_BAD_ADDRESS;
+			else
+				cached = CpuCachedArea(area);
+			space->ReadUnlock();
+			space->Put();
+		}
+	}
+	for (size_t i = 0; status == B_OK && i < bytes / B_PAGE_SIZE; i++) {
+		physical_entry entry;
+		status = get_memory_map((const void*)(address + i * B_PAGE_SIZE), B_PAGE_SIZE,
+			&entry, 1);
+		if (status == B_OK && (entry.size < B_PAGE_SIZE
+				|| !GpuPageTable::ValidPhysical(entry.address))) {
+			status = B_BAD_VALUE;
+		}
+		if (status == B_OK)
+			pages[i] = entry.address;
+	}
+	if (status != B_OK)
+		unlock_memory_etc(team, (void*)address, bytes, B_READ_DEVICE);
+	return status;
+}
+
+// kImportBuffer. The memory work runs without sClientLock: wiring may fault
+// pages in. The client is checked again before the buffer is published.
+status_t
+MaliCSF::ImportClientBuffer(void* cookie, void* user, size_t length)
+{
+	BufferImport request;
+	status_t status = ReadRequest(user, length, request);
+	if (status != B_OK)
+		return status;
+	const addr_t address = (addr_t)request.address;
+	const size_t bytes = (size_t)request.bytes;
+	if (request.flags != 0 || request.handle != 0 || request.reserved != 0
+		|| request.address != address || bytes == 0 || bytes > kMaxBufferBytes
+		|| ((address | bytes) & (B_PAGE_SIZE - 1)) != 0
+		|| address + bytes < address || !IS_USER_ADDRESS(address)
+		|| !IS_USER_ADDRESS(address + bytes - 1)) {
+		return B_BAD_VALUE;
+	}
+	{
+		MutexLocker locker(sClientLock);
+		Client* client = (Client*)cookie;
+		status = CheckAccess(client);
+		if (status != B_OK)
+			return status;
+		if (!client->writable)
+			return B_NOT_ALLOWED;
+		// Checked again below; refusing early spares the wiring.
+		if (bytes > kMaxClientImportedBytes - client->account->importedBytes
+			|| bytes > kMaxGlobalImportedBytes - sImportedBytes)
+			return B_NO_MEMORY;
+	}
+
+	ClientBuffer* buffer = (ClientBuffer*)calloc(1, sizeof(ClientBuffer));
+	if (buffer == NULL)
+		return B_NO_MEMORY;
+	buffer->area = -1;
+	buffer->bytes = bytes;
+	buffer->pages = (uint64*)malloc(bytes / B_PAGE_SIZE * sizeof(uint64));
+	if (buffer->pages == NULL) {
+		free(buffer);
+		return B_NO_MEMORY;
+	}
+	buffer->team = team_get_current_team_id();
+	buffer->userAddress = address;
+
+	VMAddressSpace* space = VMAddressSpace::GetCurrent();
+	if (space == NULL) {
+		DeleteMemory(*buffer);
+		free(buffer);
+		return B_BAD_TEAM_ID;
+	}
+	space->ReadLock();
+	VMArea* area = LookupImportArea(space, address, bytes);
+	bool contiguous = area != NULL && area->wiring == B_CONTIGUOUS;
+	status = area == NULL ? B_BAD_ADDRESS : B_OK;
+	if (contiguous) {
+		buffer->cached = CpuCachedArea(area);
+		status = ReferenceContiguousPages(area, address, bytes, buffer->pages, buffer->cache);
+		if (status == B_OK)
+			buffer->import = kImportCacheReference;
+	}
+	space->ReadUnlock();
+	space->Put();
+	if (status == B_OK && !contiguous) {
+		status = WireTeamPages(address, bytes, buffer->pages, buffer->cached);
+		if (status == B_OK)
+			buffer->import = kImportWired;
+	}
+	if (status != B_OK) {
+		DeleteMemory(*buffer);
+		free(buffer);
+		return status;
+	}
+
+	MutexLocker locker(sClientLock);
+	Client* client = (Client*)cookie;
+	status = CheckAccess(client);
+	if (status == B_OK && !client->writable)
+		status = B_NOT_ALLOWED;
+	if (status == B_OK && (client->account->buffers == kMaxClientBuffers
+			|| sNextHandle == 0)) {
+		LogRefusal(kRefusedBufferCount, "buffers of one client", client->account->buffers,
+			kMaxClientBuffers);
+		status = B_NO_MEMORY;
+	}
+	if (status == B_OK && (bytes > kMaxClientImportedBytes - client->account->importedBytes
+			|| bytes > kMaxGlobalImportedBytes - sImportedBytes)) {
+		LogRefusal(kRefusedImportedBytes, "imported bytes",
+			sImportedBytes, kMaxGlobalImportedBytes);
+		status = B_NO_MEMORY;
+	}
+	if (status == B_OK) {
+		request.flags = kBufferImported | (buffer->cached ? kBufferCpuCached : 0);
+		request.handle = sNextHandle;
+		status = user_memcpy(user, &request, sizeof(request));
+	}
+	if (status != B_OK) {
+		ReleaseImport(buffer);
+		DeleteMemory(*buffer);
+		free(buffer);
+		return status;
+	}
+	buffer->handle = sNextHandle++;
+	buffer->references = 1;
+	buffer->account = client->account;
+	buffer->account->references++;
+	buffer->next = client->first;
+	client->first = buffer;
+	client->account->buffers++;
+	client->account->importedBytes += bytes;
+	sBuffers++;
+	sImportedBytes += bytes;
 	return B_OK;
 }
 
@@ -1075,7 +1331,7 @@ MaliCSF::ControlClient(void* cookie, uint32 op, void* user, size_t length)
 			return B_BAD_VALUE;
 		ClientInfo info = {};
 		info.version = kClientVersion;
-		info.capabilities = client->writable ? kClientCpuBuffers | kClientVmMappings | kClientQueues | kClientSynchronization | kClientHeaps | kClientProperties | kClientCachedBuffers : 0;
+		info.capabilities = client->writable ? kClientCpuBuffers | kClientVmMappings | kClientQueues | kClientSynchronization | kClientHeaps | kClientProperties | kClientCachedBuffers | kClientImportedBuffers : 0;
 		info.maxBuffers = kMaxClientBuffers;
 		info.maxBufferBytes = kMaxBufferBytes;
 		info.maxClientBytes = kMaxClientBufferBytes;
@@ -1181,6 +1437,8 @@ MaliCSF::ControlClient(void* cookie, uint32 op, void* user, size_t length)
 			return B_ENTRY_NOT_FOUND;
 		request.bytes = buffer->bytes;
 		request.flags = buffer->cached ? kBufferCpuCached : kBufferNormalNoncacheable;
+		if (buffer->import != kNotImported)
+			request.flags |= kBufferImported;
 		return user_memcpy(user, &request, sizeof(request));
 	}
 	BufferMap request;
@@ -1194,6 +1452,9 @@ MaliCSF::ControlClient(void* cookie, uint32 op, void* user, size_t length)
 	ClientBuffer* buffer = *FindBuffer(client, request.handle);
 	if (buffer == NULL)
 		return B_ENTRY_NOT_FOUND;
+	// An import is the team's own memory, mapped already.
+	if (buffer->import != kNotImported)
+		return B_NOT_ALLOWED;
 	void* address = NULL;
 	area_id area = vm_clone_area(client->owner, "Mali CSF buffer mapping", &address,
 		B_ANY_ADDRESS, B_READ_AREA | B_WRITE_AREA, 0, buffer->area, true);

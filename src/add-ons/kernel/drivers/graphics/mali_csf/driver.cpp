@@ -9,6 +9,7 @@
 #include <driver_settings.h>
 #include <lock.h>
 #include <smp.h>
+#include <team.h>
 #include <util/AutoLock.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -47,7 +48,22 @@ struct OpenHandle {
 	Controller* controller;
 	void* client;
 	void* synchronization;
+	// For the team watcher of imports (OwnerGone): every open is listed.
+	OpenHandle* nextOpen;
+	uint32 id;
+	team_id owner;
+	int32 watching;
 };
+
+// Imported memory (kImportBuffer) is pinned in the importing team until the
+// client lets go of it, and its areas cannot be deleted before. A dying team
+// closes its files before its address space goes, which does that, unless
+// another team (a fork) still shares the descriptor: then the team's teardown
+// would wait for that team. So the team that imports is watched, and its
+// client is closed when it exits, whoever holds the descriptor then.
+static mutex sOpenLock = MUTEX_INITIALIZER("Mali CSF opens");
+static OpenHandle* sOpenHandles;
+static uint32 sNextOpenId = 1;
 
 
 #include "CsfHardware.h"
@@ -439,19 +455,60 @@ InitDriver(device_node* node, void** cookie)
 static void UninitDriver(void* cookie) { free(cookie); }
 static status_t InitDevice(void* driver, void** device) { *device = driver; return B_OK; }
 static void UninitDevice(void*) {}
-static status_t Close(void* cookie)
+// Idempotent: the team watcher and the descriptor's close may both run it.
+static void CloseHandle(OpenHandle* opened)
 {
-	OpenHandle* opened = (OpenHandle*)cookie;
 	MutexLocker locker(sHardwareLock);
 	CloseQueues(opened->client, opened->controller->identityNeedsRecovery);
 	CloseSyncClient(opened->synchronization);
 	CloseClient(opened->client);
+}
+// Called with the dying team locked, before its files are closed and its
+// address space goes. Takes no team lock itself.
+static void OwnerGone(team_id, void* data)
+{
+	const uint32 id = (uint32)(addr_t)data;
+	MutexLocker locker(sOpenLock);
+	for (OpenHandle* opened = sOpenHandles; opened != NULL; opened = opened->nextOpen) {
+		if (opened->id == id) {
+			CloseHandle(opened);
+			break;
+		}
+	}
+}
+static status_t WatchOwner(OpenHandle* opened)
+{
+	if (atomic_test_and_set(&opened->watching, 1, 0) != 0)
+		return B_OK;
+	status_t status = start_watching_team(opened->owner, OwnerGone,
+		(void*)(addr_t)opened->id);
+	if (status != B_OK)
+		atomic_set(&opened->watching, 0);
+	return status;
+}
+static status_t Close(void* cookie)
+{
+	CloseHandle((OpenHandle*)cookie);
 	return B_OK;
 }
 static status_t Free(void* cookie)
 {
-	FreeSyncClient(((OpenHandle*)cookie)->synchronization);
-	FreeClient(((OpenHandle*)cookie)->client);
+	OpenHandle* opened = (OpenHandle*)cookie;
+	{
+		// Once unlisted, a running OwnerGone() can no longer find it; one that
+		// found it holds sOpenLock until it is done.
+		MutexLocker locker(sOpenLock);
+		OpenHandle** link = &sOpenHandles;
+		while (*link != NULL && *link != opened)
+			link = &(*link)->nextOpen;
+		if (*link != NULL)
+			*link = opened->nextOpen;
+	}
+	// Not under sOpenLock: OwnerGone() runs with the team locked.
+	if (atomic_get(&opened->watching) != 0)
+		stop_watching_team(opened->owner, OwnerGone, (void*)(addr_t)opened->id);
+	FreeSyncClient(opened->synchronization);
+	FreeClient(opened->client);
 	free(cookie);
 	return B_OK;
 }
@@ -487,6 +544,15 @@ Open(void* cookie, const char*, int mode, void** handle)
 	if (status != B_OK) {
 		FreeClient(opened->client); free(opened); return status;
 	}
+	opened->owner = team_get_current_team_id();
+	{
+		MutexLocker locker(sOpenLock);
+		opened->id = sNextOpenId++;
+		if (opened->id == 0)
+			opened->id = sNextOpenId++;
+		opened->nextOpen = sOpenHandles;
+		sOpenHandles = opened;
+	}
 	*handle = opened;
 	return B_OK;
 }
@@ -515,6 +581,11 @@ Control(void* cookie, uint32 op, void* buffer, size_t length)
 	status_t access = AccessClient(opened->client);
 	if (access != B_OK)
 		return access;
+	if (op == kImportBuffer) {
+		// Only the opening team gets here (AccessClient).
+		status_t status = WatchOwner(opened);
+		return status == B_OK ? ImportClientBuffer(opened->client, buffer, length) : status;
+	}
 	if ((op >= kGetClientInfo && op <= kGetBufferInfo) || (op >= kCreateVm && op <= kBindVm)
 		|| (op >= kCreateHeap && op <= kGetHeapInfo))
 		return ControlClient(opened->client, op, buffer, length);
