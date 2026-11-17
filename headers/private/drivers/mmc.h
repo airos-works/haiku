@@ -120,8 +120,11 @@ enum SD_COMMANDS {
 	// Application specific commands, class 8
 	SD_APP_CMD = 55,
 
-	// I/O mode commands, class 9
-	SD_IO_ABORT = 52,
+	// I/O mode commands, class 9 (SDIO Simplified Specification 3.00, 5)
+	SD_IO_SEND_OP_COND = 5,		// R4; MMC's CMD5 (SLEEP_AWAKE) is not used
+	SD_IO_RW_DIRECT = 52,		// R5
+	SD_IO_ABORT = 52,			// a CMD52 write to CCCR 0x06
+	SD_IO_RW_EXTENDED = 53,		// R5 and a data phase
 };
 
 
@@ -173,6 +176,25 @@ typedef struct mmc_bus_interface {
 		uint8_t data[64]);
 		// SD CMD6 (SWITCH_FUNC) to the selected card, with its 64-byte status
 		// data phase. Optional: without it, SD cards stay at default speed.
+
+	// SDIO. A host that has sdio_transfer also answers CMD5 (R4) and CMD52
+	// (R5) through execute_command; the bus only looks for SDIO cards on
+	// such a host. All three are optional.
+	status_t (*sdio_transfer)(void* controller, uint32_t argument,
+		bool write, void* buffer, uint16_t blockSize, uint16_t blockCount,
+		uint32_t* response);
+		// CMD53 with its data phase, by PIO or through the host's own
+		// buffer: \a buffer is kernel memory. \a blockCount 0 is a byte mode
+		// transfer of \a blockSize (1 to 512) bytes, otherwise \a blockCount
+		// blocks of \a blockSize. \a argument is the complete CMD53 argument.
+	void (*set_sdio_interrupt_handler)(void* controller,
+		void (*handler)(void* data), void* data);
+		// \a handler is called in interrupt context when the card raises
+		// its interrupt (DAT1). The host masks the card interrupt before
+		// calling it (the line stays low until the card's functions have
+		// been served, and the status bit cannot be cleared before that);
+		// enable_sdio_interrupt(true) unmasks it again.
+	void (*enable_sdio_interrupt)(void* controller, bool enable);
 } mmc_bus_interface;
 
 
@@ -206,6 +228,9 @@ const char* const kMmcMaxBusWidthAttribute = "mmc/max_bus_width";
 const char* const kMmcSdHighSpeedAttribute = "mmc/sd_high_speed";
 	// set to 1 by a host whose SD high speed mode (50 MHz) was verified
 const char* const kMmcBusWidthAttribute = "mmc/bus_width";
+const char* const kMmcSdioHighSpeedAttribute = "mmc/sdio_high_speed";
+	// set to 1 by a host that can clock an SDIO card with 50 MHz in high
+	// speed timing; without it SDIO cards stay at 25 MHz
 
 
 #endif /* _MMC_H */

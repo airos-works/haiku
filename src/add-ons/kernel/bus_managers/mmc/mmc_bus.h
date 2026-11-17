@@ -16,6 +16,8 @@
 #include <lock.h>
 #include <util/AutoLock.h>
 #include "mmc.h"
+#include "sdio.h"
+#include "sdio_card.h"
 
 
 #define MMCBUS_TRACE
@@ -155,11 +157,49 @@ public:
 
 				void			AcquireBus() { acquire_sem(fLockSemaphore); }
 				void			ReleaseBus() { release_sem(fLockSemaphore); }
+
+				// SDIO, for the function nodes (sdio_function_interface).
+				// They take the bus lock themselves.
+				status_t		SdioReadByte(uint8 function, uint32 address,
+									uint8* _value);
+				status_t		SdioWriteByte(uint8 function, uint32 address,
+									uint8 value, uint8* _readBack);
+				status_t		SdioTransfer(bool write, uint8 function,
+									uint32 address, bool increment,
+									uint8* buffer, size_t length);
+				status_t		SdioSetBlockSize(uint8 function, uint16 size);
+				status_t		SdioEnableFunction(uint8 function,
+									bool enable);
+				status_t		SdioSetInterruptHandler(uint8 function,
+									sdio_interrupt_handler handler,
+									void* data);
+				status_t		SdioGetCardInfo(sdio_card_info* info);
+
 private:
 				status_t		_ActivateDevice(uint16_t rca);
 				void			_AcquireScanSemaphore();
 				void			_TerminateBus();
 		static	status_t		_WorkerThread(void*);
+
+				bool			_SdioCapable() const;
+				status_t		_ProbeSdio();
+				bool			_SdioAlive();
+				void			_PublishSdioFunctions();
+				sdio_host_ops	_SdioHostOps();
+				status_t		_SdioDirect(bool write, uint8 function,
+									uint32 address, uint8 value,
+									uint8* _value, bool readAfterWrite);
+		static	status_t		_SdioCommand(void* cookie, uint8 command,
+									uint32 argument, uint32* response);
+		static	status_t		_SdioHostTransfer(void* cookie,
+									uint32 argument, bool write, void* buffer,
+									uint16 blockSize, uint16 blockCount,
+									uint32* response);
+		static	void			_SdioSleep(void* cookie, bigtime_t duration);
+		static	bigtime_t		_SdioTime(void* cookie);
+		static	void			_SdioInterrupt(void* data);
+		static	status_t		_SdioInterruptThread(void* data);
+				void			_StopSdioInterrupts();
 
 private:
 
@@ -172,6 +212,18 @@ private:
 		sem_id					fLockSemaphore;
 		uint16					fActiveDevice;
 		card_type				fCardType;
+
+		// the SDIO card, if there is one (fSdioRca != 0)
+		uint16					fSdioRca;
+		sdio_card				fSdio;
+		recursive_lock			fSdioHandlerLock;
+			// the handlers, IENx, and a dispatch in progress
+		sdio_interrupt_handler	fSdioHandlers[SDIO_MAX_FUNCTIONS];
+		void*					fSdioHandlerData[SDIO_MAX_FUNCTIONS];
+		uint8					fSdioInterruptEnable;
+		sem_id					fSdioInterruptSemaphore;
+		thread_id				fSdioInterruptThread;
+		bool					fSdioHostHandlerSet;
 		// FIXME card type shall be extended to map card type to RCA.
 		// In theory RCA is 16 bit allowing for 2^16 devices on signle bus
 		// Practically this is limited by bus max capacitance(ver low speed)
