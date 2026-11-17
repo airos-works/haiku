@@ -1,0 +1,22 @@
+SubDir HAIKU_TOP src tests add-ons kernel drivers usb_ncm ;
+
+# ntb_test: building and parsing the Network Transfer Blocks of usb_ncm (also
+# builds on any host, see the file).
+# ncmstat: what usb_ncm negotiated and counted.
+
+local usbNCMDir = [ FDirName $(HAIKU_TOP) src add-ons kernel drivers network
+	ether usb_ncm ] ;
+
+SubDirHdrs $(usbNCMDir) ;
+
+SimpleTest ntb_test :
+	ntb_test.cpp
+	NTB.cpp
+	: [ TargetLibsupc++ ] [ TargetLibstdc++ ]
+;
+
+SEARCH on [ FGristFiles NTB.cpp ] = $(usbNCMDir) ;
+
+SimpleTest ncmstat :
+	ncmstat.cpp
+;
