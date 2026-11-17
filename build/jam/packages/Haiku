@@ -167,6 +167,7 @@ AddNewDriversToPackage network :
 	rp1_gem@arm64
 	dwc_eqos@arm64
 	usb_ecm
+	usb_ncm
 	virtio_net
 	;
 AddNewDriversToPackage input :

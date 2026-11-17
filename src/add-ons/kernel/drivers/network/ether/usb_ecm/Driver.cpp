@@ -154,28 +154,54 @@ usb_ecm_supports_device(device_node *parent)
 		return 0.0;
 
 
-	// check whether it's really an ECM device
+	// Check whether it's really an ECM device. The interfaces of all its
+	// configurations come as class, subclass and protocol attributes.
 	device_attr *attr = NULL;
-	uint8 baseClass = 0, subclass = 0;
+	uint8 baseClass = 0;
+	bool haveClass = false;
+	bool hasECM = false;
+	bool hasNCM = false;
 	while (gDeviceManager->get_next_attr(parent, &attr) == B_OK) {
 		if (attr->type != B_UINT8_TYPE)
 			continue;
 
-		if (!strcmp(attr->name, USB_DEVICE_CLASS))
+		if (!strcmp(attr->name, USB_DEVICE_CLASS)) {
 			baseClass = attr->value.ui8;
-		if (!strcmp(attr->name, USB_DEVICE_SUBCLASS))
-			subclass = attr->value.ui8;
-		if (baseClass != 0 && subclass != 0) {
-			if (baseClass == USB_COMMUNICATION_DEVICE_CLASS
-				&& subclass == USB_CDC_COMMUNICATION_INTERFACE_ECM_SUBCLASS)
-				break;
-			baseClass = subclass = 0;
+			haveClass = true;
+		} else if (!strcmp(attr->name, USB_DEVICE_SUBCLASS) && haveClass) {
+			if (baseClass == USB_CDC_COMMUNICATION_INTERFACE_CLASS) {
+				if (attr->value.ui8
+						== USB_CDC_COMMUNICATION_INTERFACE_ECM_SUBCLASS)
+					hasECM = true;
+				else if (attr->value.ui8
+						== USB_CDC_COMMUNICATION_INTERFACE_NCM_SUBCLASS)
+					hasNCM = true;
+			}
+			haveClass = false;
 		}
 	}
 
-	if (baseClass != USB_CDC_COMMUNICATION_INTERFACE_CLASS
-		|| subclass != USB_CDC_COMMUNICATION_INTERFACE_ECM_SUBCLASS)
+	if (!hasECM)
 		return 0.0;
+
+	// A device that offers NCM as well (the Realtek RTL8156 does) is left to
+	// usb_ncm, which carries many frames per transfer, where usb_ecm needs
+	// one per frame. Every driver that supports a USB device gets it, so
+	// only one of them may say yes: they would set different configurations.
+	// The device stays here without usb_ncm (not installed, or disabled in
+	// its settings) or when usb_ncm cannot drive its NCM function.
+	if (hasNCM) {
+		static const char* kNCMDriver = "drivers/network/usb_ncm/driver_v1";
+		driver_module_info* ncmDriver;
+		if (get_module(kNCMDriver, (module_info**)&ncmDriver) == B_OK) {
+			float support = ncmDriver->supports_device(parent);
+			put_module(kNCMDriver);
+			if (support > 0.0) {
+				TRACE_ALWAYS("leaving a device that offers NCM to usb_ncm\n");
+				return 0.0;
+			}
+		}
+	}
 
 	TRACE("USB-ECM device found!\n");
 

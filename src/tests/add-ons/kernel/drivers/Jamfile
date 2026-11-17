@@ -8,3 +8,4 @@ SubInclude HAIKU_TOP src tests add-ons kernel drivers npu ;
 SubInclude HAIKU_TOP src tests add-ons kernel drivers nvmm ;
 SubInclude HAIKU_TOP src tests add-ons kernel drivers random ;
 SubInclude HAIKU_TOP src tests add-ons kernel drivers tty ;
+SubInclude HAIKU_TOP src tests add-ons kernel drivers usb_ncm ;
