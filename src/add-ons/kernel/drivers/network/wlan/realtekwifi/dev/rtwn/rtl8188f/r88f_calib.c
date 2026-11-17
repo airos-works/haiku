@@ -209,9 +209,13 @@ r88f_fill_iqk_matrix_a(struct rtwn_softc *sc,
 	rtwn_bb_setbits(sc, R92C_OFDM0_TXAFE(0), 0xf0000000,
 		 ((tx0_c & 0x3c0) >> 6) << 28);
 
+	/*
+	 * Haiku: bits 21:16 take the C (imaginary) term, as r88e_calib.c and
+	 * r92c_calib.c write them; FreeBSD wrote tx0_a here.
+	 */
 	reg = rtwn_bb_read(sc, R92C_OFDM0_TXIQIMBALANCE(0));
 	reg &= ~0x003f0000;
-	reg |= ((tx0_a & 0x3f) << 16);
+	reg |= ((tx0_c & 0x3f) << 16);
 	rtwn_bb_write(sc, R92C_OFDM0_TXIQIMBALANCE(0), reg);
 
 	reg = rtwn_bb_read(sc, R92C_OFDM0_ECCATHRESHOLD);
