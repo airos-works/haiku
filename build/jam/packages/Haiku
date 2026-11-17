@@ -67,6 +67,7 @@ AddFilesToPackage add-ons kernel busses usb :
 	<usb>ohci
 	<usb>ehci
 	<usb>xhci
+	<usb>dwc2@arm64
 	usb4@x86,x86_64
 	;
 AddFilesToPackage add-ons kernel busses virtio :
@@ -435,6 +436,7 @@ AddBootModuleSymlinksToPackage
 	ufshci
 	usb
 	usb_disk
+	<usb>dwc2@arm64
 	<usb>ehci
 	<usb>ohci
 	<usb>uhci

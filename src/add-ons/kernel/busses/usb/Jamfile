@@ -27,6 +27,13 @@ KernelAddon <usb>ehci :
 	: ehci.rdef
 	;
 
+KernelAddon <usb>dwc2 :
+	dwc2.cpp
+	dwc2_rh.cpp
+	: libusb.a
+	: dwc2.rdef
+	;
+
 KernelAddon <usb>xhci :
 	xhci.cpp
 	xhci_fdt.cpp

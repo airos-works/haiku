@@ -1,0 +1,15 @@
+/*
+ * dwc2.rdef
+ */
+
+resource app_signature "application/x-vnd.haiku-dwc2";
+
+resource app_version {
+	major  = 1,
+	middle = 0,
+	minor  = 0,
+	variety = 0,
+	internal = 0,
+	short_info = "DWC2 host controller driver",
+	long_info = "Haiku DWC2 HCD - Copyright 2026, air/OS."
+};
