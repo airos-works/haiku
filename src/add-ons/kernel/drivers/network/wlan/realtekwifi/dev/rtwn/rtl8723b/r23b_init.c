@@ -139,8 +139,10 @@ r23b_init_bb(struct rtwn_softc *sc)
 	rtwn_setbits_2(sc, R92C_SYS_FUNC_EN, 0, R92C_SYS_FUNC_EN_BBRSTB |
 	    R92C_SYS_FUNC_EN_BB_GLB_RST | R92C_SYS_FUNC_EN_DIO_RF);
 
-	/* Select antenna S0. */
-	rtwn_write_4(sc, R23B_ANT_SEL, R23B_ANT_SEL_S0);
+	/* Select the antenna port (Haiku: S1 on SDIO modules wired so). */
+	rtwn_write_4(sc, R23B_ANT_SEL,
+	    ((struct r23b_softc *)sc->sc_priv)->ant_main ?
+	    R23B_ANT_SEL_S1 : R23B_ANT_SEL_S0);
 
 	r23b_init_bb_common(sc);
 }
@@ -257,14 +259,19 @@ r23b_post_init(struct rtwn_softc *sc)
 	rtwn_setbits_1(sc, R88E_BB_PAD_CTRL, 0x1, 0);
 
 #ifndef RTWN_WITHOUT_UCODE
-	/* Inform firmware of the antenna inversion. */
+	/* Inform firmware of the antenna inversion (Haiku: none at S1). */
 	cmd.internal_switch = 0;
-	cmd.invert = 1;
+	cmd.invert = ((struct r23b_softc *)sc->sc_priv)->ant_main ? 0 : 1;
 
 	r88e_fw_cmd(sc, R23B_CMD_ANT_INV, &cmd, sizeof(cmd));
 #endif
 
-	rtwn_write_4(sc, R23B_ANT_SEL, 0x80);
+	/*
+	 * Antenna shared with Bluetooth (PTA): 0x80 at S0; Haiku: 0x200 at S1
+	 * (Linux staging hal/HalBtc8723b1Ant.c halbtc8723b1ant_SetAntPath()).
+	 */
+	rtwn_write_4(sc, R23B_ANT_SEL,
+	    ((struct r23b_softc *)sc->sc_priv)->ant_main ? 0x200 : 0x80);
 
 #ifndef RTWN_WITHOUT_UCODE
 	r88e_fw_cmd(sc, R23B_CMD_PS_TDMA, ps_tdma, sizeof(ps_tdma));

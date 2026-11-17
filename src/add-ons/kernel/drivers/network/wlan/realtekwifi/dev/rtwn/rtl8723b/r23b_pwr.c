@@ -66,8 +66,11 @@
 
 #include <dev/rtwn/rtl8192c/r92c_reg.h>
 
+#include <dev/rtwn/rtl8192e/r92e_var.h>
+
 #include <dev/rtwn/rtl8723b/r23b.h>
 #include <dev/rtwn/rtl8723b/r23b_reg.h>
+#include <dev/rtwn/rtl8723b/r23b_var.h>
 
 /*
  * Card emulation -> active, plus the MAC and Bluetooth coexistence setup
@@ -81,6 +84,7 @@ r23b_power_on(struct rtwn_softc *sc)
 	if (res != 0)		\
 		return (EIO);	\
 } while(0)
+	struct r23b_softc *rs = sc->sc_priv;
 	int ntries;
 
 	/* Enable LDOA12 MACRO block for all interfaces. */
@@ -174,8 +178,18 @@ r23b_power_on(struct rtwn_softc *sc)
 	    R92C_SYS_FUNC_EN_BBRSTB | R92C_SYS_FUNC_EN_BB_GLB_RST));
 	RTWN_CHK(rtwn_write_1(sc, R23B_GNT_BT + 1, 0x18));
 	RTWN_CHK(rtwn_write_1(sc, 0x76e, 0x4));
-	RTWN_CHK(rtwn_write_4(sc, R23B_ANT_SEL, R23B_ANT_SEL_S0));
-	RTWN_CHK(rtwn_write_1(sc, 0xfe08, 0x1));
+	/*
+	 * Haiku: the antenna port and the bus' local antenna register (bit 0:
+	 * inverted, bit 2: two antennas) depend on the attachment; see
+	 * struct r23b_softc. Zeros there: FreeBSD's RTL8723BU values.
+	 */
+	RTWN_CHK(rtwn_write_4(sc, R23B_ANT_SEL,
+	    rs->ant_main ? R23B_ANT_SEL_S1 : R23B_ANT_SEL_S0));
+	if (rs->rs_ant_local_write != NULL) {
+		RTWN_CHK(rs->rs_ant_local_write(sc, (rs->ant_main ? 0 : 0x1) |
+		    (rs->bt_antnum == 0 ? 0x4 : 0)));
+	} else
+		RTWN_CHK(rtwn_write_1(sc, 0xfe08, 0x1));
 
 	RTWN_CHK(rtwn_setbits_2(sc, R92C_PWR_DATA, 0,
 	    R23B_PWR_DATA_RFE_CTRL_EN));
