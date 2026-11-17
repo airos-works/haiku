@@ -23,6 +23,7 @@ HaikuSubInclude intel22x ;
 HaikuSubInclude ipro100 ;
 HaikuSubInclude ipro1000 ;
 HaikuSubInclude jmicron2x0 ;
+HaikuSubInclude microchip_lan78xx ;
 HaikuSubInclude marvell_yukon ;
 HaikuSubInclude nforce ;
 HaikuSubInclude pcnet ;

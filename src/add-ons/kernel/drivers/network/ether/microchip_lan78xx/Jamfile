@@ -1,0 +1,25 @@
+SubDir HAIKU_TOP src add-ons kernel drivers network ether microchip_lan78xx ;
+
+UseHeaders [ FDirName $(HAIKU_TOP) src libs compat freebsd_network compat ]
+	: true ;
+UsePrivateHeaders net system drivers ;
+UsePrivateKernelHeaders ;
+
+SubDirCcFlags [ FDefines _KERNEL=1 FBSD_DRIVER=1 ] ;
+
+UseHeaders [ FDirName $(SUBDIR) ] : true ;
+
+SEARCH_SOURCE += [ FDirName $(SUBDIR) dev usb net ] ;
+
+KernelAddon microchip_lan78xx :
+	glue.c
+	if_muge.c
+	:
+	freebsd_mii.a
+	freebsd_usb.a
+	libfreebsd_network.a
+	;
+
+ObjectHdrs [ FGristFiles if_muge$(SUFOBJ) ]
+	: [ FDirName $(HAIKU_COMMON_PLATFORM_OBJECT_DIR) libs compat freebsd_network ] ;
+Includes [ FGristFiles if_muge.c ] : <src!libs!compat!freebsd_network>usbdevs.h ;
