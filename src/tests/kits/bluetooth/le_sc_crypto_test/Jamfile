@@ -1,0 +1,10 @@
+SubDir HAIKU_TOP src tests kits bluetooth le_sc_crypto_test ;
+
+UsePrivateHeaders bluetooth ;
+
+# The SMP initiator test (smp_initiator_test.cpp) runs on the host only, from
+# run.sh.
+SimpleTest le_sc_crypto_test :
+	le_sc_crypto_test.cpp
+	: libbluetooth.so [ TargetLibstdc++ ]
+;

@@ -13,6 +13,7 @@ UseHeaders [ FDirName $(HAIKU_TOP) src add-ons kernel drivers input
 SubDirC++Flags -DUSERLAND_HID ;
 
 SubDirHdrs [ FDirName $(SUBDIR) UI ] ;
+SubDirHdrs [ FDirName $(HAIKU_TOP) src libs microecc ] ;
 
 local architectureObject ;
 for architectureObject in [ MultiArchSubDirSetup ] {
@@ -42,6 +43,10 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 			HIDReportItem.cpp
 			LELegacyPairingCrypto.cpp
 			LELegacyPairingClient.cpp
+			LESecureConnectionsCrypto.cpp
+			LESMPChannel.cpp
+			LESMPInitiator.cpp
+			LEP256.c
 			LEBondStore.cpp
 			LEPairingSession.cpp
 			LELog.cpp

@@ -64,6 +64,37 @@
 #define BT_MSG_LE_ENCRYPTED             'leED'
 #define BT_MSG_LE_ENCRYPTION_FAILED     'leEF'
 
+// Pairing for applications: secures the LE link the requester holds. The
+// request names the link with "hci_id" and the "listener" that owns it
+// (plus the peer's "address" when the listener holds several); another
+// client's link is refused with B_NOT_ALLOWED. When a bond for the peer is
+// stored (under this address, its identity address, or resolved with its
+// IRK), the link is encrypted with it and nobody is asked. Otherwise the
+// server pairs: LE Secure Connections when the device supports it (legacy
+// pairing else), after the user agrees in a system prompt that names the
+// application and the device (Just Works), shows the six digits to compare
+// (Numeric Comparison) or the passkey to type on the device (Passkey Entry).
+// The new bond is stored for the next connection.
+// Optional: "device_name" (string, shown in the prompt), "fresh" (bool,
+// pair again even with a bond), "bonded_only" (bool, only use a stored bond,
+// never prompt or pair).
+// The reply (BT_MSG_LE_PAIR_RESULT) comes when it is done, which may take a
+// few minutes with the prompt; send the request with a reply handler or a
+// long reply timeout. Its "status" (int32) is B_OK, B_CANCELED (the user
+// declined or did not answer), B_PERMISSION_DENIED (the device refused),
+// B_BAD_DATA (the device's values did not check out), B_ENTRY_NOT_FOUND
+// (bonded_only without a bond), B_BUSY (another pairing runs on the link),
+// B_NOT_ALLOWED, B_TIMED_OUT, or an error. Also: "smp_reason" (uint8, the
+// SMP Pairing Failed reason, 0 for none), "smp_reason_remote" (bool, the
+// device sent it), "hci_status" (uint8, of a failed encryption),
+// "encrypted", "bonded", "reused_bond", "secure_connections",
+// "authenticated" (bools), "method" (int32, LESMPMethod, -1 for none),
+// "key_size" (uint8) and "detail" (string, a sentence for the user).
+// The link's listener also gets BT_MSG_LE_ENCRYPTED or
+// BT_MSG_LE_ENCRYPTION_FAILED as usual.
+#define BT_MSG_LE_PAIR                  'lePR'
+#define BT_MSG_LE_PAIR_RESULT           'lePD'
+
 // Discovery
 #define BT_MSG_INQUIRY_STARTED          'IqSt'
 #define BT_MSG_INQUIRY_COMPLETED        'IqCM'

@@ -15,6 +15,7 @@ Application bluetooth_server
 	LocalDeviceHandler.cpp
 	LocalDeviceImpl.cpp
 	LocalDeviceLE.cpp
+	LESecurity.cpp
 	SDPServer.cpp
 	SDPClient.cpp
 	: be network libbluetooth.so

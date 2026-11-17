@@ -92,6 +92,11 @@ public:
 	status_t ReadRSSI(const BMessage* request);
 	status_t StartLEEncryption(const BMessage* request, const uint8* key,
 		const uint8* randomNumber, uint16 encryptedDiversifier);
+	// Secures an application's link (BT_MSG_LE_PAIR, LESecurity.cpp): the
+	// stored bond, or pairing after the user agrees. Takes the detached
+	// request and answers it when done; returns an error (and leaves the
+	// request to the caller) only when it could not start.
+	status_t PairLELink(BMessage* request);
 	void LEPulse();
 	void LEInquiryState(bool active);
 	void Pulse();
@@ -177,6 +182,8 @@ private:
 	std::vector<LEAdvertiserSeen> fLESeen;
 
 	struct LELink {
+		uint32 serial;
+			// unique for the server's lifetime; handles are reused
 		LEConnectionState state;
 		bigtime_t since;
 			// when the client asked for it
@@ -187,6 +194,12 @@ private:
 		uint16 handle;
 		bool encryptionPending;
 		bool encrypted;
+		uint32 encryptionChanges;
+			// counts encryption results, for a pairing job waiting for one
+		uint8 encryptionStatus;
+			// HCI status of the last one
+		bool securing;
+			// a BT_MSG_LE_PAIR job works on the link
 		// What the connection is created with (1.25 ms, events, 10 ms).
 		uint16 createIntervalMin;
 		uint16 createIntervalMax;
@@ -205,6 +218,23 @@ private:
 	};
 	std::vector<LELink*> fLELinks;
 		// in the order they were asked for
+	uint32 fLELinkSerial;
+	int32 fLESecurityJobs;
+		// BT_MSG_LE_PAIR jobs running (atomic)
+	volatile bool fLEGoingAway;
+		// the device is being deleted; jobs end at once
+
+	struct LESecurityJob;
+	static status_t _LESecurityThread(void* data);
+	void _RunLESecurity(LESecurityJob* job);
+	status_t _LESecurityLink(uint32 serial, uint16* handle, bool* encrypted,
+		uint32* encryptionChanges);
+	status_t _EncryptLESecurityLink(uint32 serial, const uint8* key,
+		const uint8* randomNumber, uint16 encryptedDiversifier,
+		uint32* encryptionChanges);
+	status_t _WaitLESecurityEncryption(uint32 serial, uint32 changesBefore,
+		bigtime_t timeout, uint8* hciStatus);
+	void _EndLESecurity(uint32 serial);
 	// Handles of the Disconnect and LE Start Encryption commands sent, for
 	// their Command Status events (which name no handle), oldest first.
 	std::vector<uint16> fLEDisconnectsSent;

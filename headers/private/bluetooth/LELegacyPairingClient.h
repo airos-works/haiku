@@ -37,6 +37,10 @@ struct LELegacyBondKey {
 	uint8 identityAddress[6];
 	uint8 identityAddressType;
 	bool hasIdentity;
+	bool secureConnections;
+		// an LE Secure Connections LTK (EDIV and Rand are zero)
+	bool authenticated;
+		// paired with MITM protection (Numeric Comparison or Passkey Entry)
 };
 
 

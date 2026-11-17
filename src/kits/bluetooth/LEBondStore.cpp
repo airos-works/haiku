@@ -5,6 +5,8 @@
 
 #include <LEBondStore.h>
 
+#include <LELegacyPairingCrypto.h>
+
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -45,6 +47,16 @@ enum {
 };
 
 static const uint8 kFileMagic[8] = { 'H', 'L', 'B', 'O', 'N', 'D', '0', '1' };
+
+enum {
+	kFlagLongTermKey		= 0x01,
+	kFlagIdentity			= 0x02,
+	kFlagSecureConnections	= 0x04,
+		// the LTK came from LE Secure Connections (EDIV and Rand are 0)
+	kFlagAuthenticated		= 0x08,
+		// paired with MITM protection
+	kKnownFlags				= 0x0f
+};
 
 
 status_t
@@ -185,7 +197,11 @@ SaveLEBond(const char* directory, const uint8 localAddress[6],
 	memcpy(record + kLocalAddress, localAddress, 6);
 	record[kPeerType] = peerType;
 	memcpy(record + kPeerAddress, peerAddress, 6);
-	record[kFlags] = 1;
+	record[kFlags] = kFlagLongTermKey;
+	if (bond.secureConnections)
+		record[kFlags] |= kFlagSecureConnections;
+	if (bond.authenticated)
+		record[kFlags] |= kFlagAuthenticated;
 	record[kKeySize] = bond.keySize;
 	memcpy(record + kLongTermKey, bond.longTermKey, 16);
 	for (uint8 i = bond.keySize; i < 16; i++)
@@ -194,7 +210,7 @@ SaveLEBond(const char* directory, const uint8 localAddress[6],
 	record[kDiversifier] = bond.encryptedDiversifier;
 	record[kDiversifier + 1] = bond.encryptedDiversifier >> 8;
 	if (bond.hasIdentity) {
-		record[kFlags] |= 2;
+		record[kFlags] |= kFlagIdentity;
 		record[kIdentityType] = bond.identityAddressType;
 		memcpy(record + kIdentityAddress, bond.identityAddress, 6);
 		memcpy(record + kIdentityKey, bond.identityResolvingKey, 16);
@@ -287,8 +303,8 @@ LoadLEBond(const char* directory, const uint8 localAddress[6],
 			|| memcmp(record + kLocalAddress, localAddress, 6) != 0
 			|| record[kPeerType] != peerType
 			|| memcmp(record + kPeerAddress, peerAddress, 6) != 0
-			|| (record[kFlags] & ~3) != 0
-			|| (record[kFlags] & 1) == 0
+			|| (record[kFlags] & ~kKnownFlags) != 0
+			|| (record[kFlags] & kFlagLongTermKey) == 0
 			|| record[kKeySize] < 7 || record[kKeySize] > 16
 			|| checksum != Checksum(record, kChecksum)))
 		status = B_BAD_DATA;
@@ -301,7 +317,10 @@ LoadLEBond(const char* directory, const uint8 localAddress[6],
 		memcpy(bond.randomNumber, record + kRandomNumber, 8);
 		bond.encryptedDiversifier = record[kDiversifier]
 			| ((uint16)record[kDiversifier + 1] << 8);
-		bond.hasIdentity = (record[kFlags] & 2) != 0;
+		bond.secureConnections
+			= (record[kFlags] & kFlagSecureConnections) != 0;
+		bond.authenticated = (record[kFlags] & kFlagAuthenticated) != 0;
+		bond.hasIdentity = (record[kFlags] & kFlagIdentity) != 0;
 		if (bond.hasIdentity) {
 			if (record[kIdentityType] > 1)
 				status = B_BAD_DATA;
@@ -504,6 +523,51 @@ ListLEBonds(const char* directory, std::vector<LEBondedDevice>& devices)
 	}
 	closedir(dir);
 	return B_OK;
+}
+
+
+
+status_t
+FindLEBond(const char* directory, const uint8 localAddress[6],
+	const uint8 peerAddress[6], uint8 peerAddressType, LELegacyBondKey& bond,
+	uint8 storedAddress[6], uint8* storedType)
+{
+	if (localAddress == NULL || peerAddress == NULL || storedAddress == NULL
+		|| storedType == NULL || peerAddressType > 1)
+		return B_BAD_VALUE;
+	status_t status = LoadLEBond(directory, localAddress, 0, peerAddress,
+		peerAddressType, bond);
+	if (status == B_OK) {
+		memcpy(storedAddress, peerAddress, 6);
+		*storedType = peerAddressType;
+		return B_OK;
+	}
+	std::vector<LEBondedDevice> devices;
+	if (ListLEBonds(directory, devices) != B_OK)
+		return B_ENTRY_NOT_FOUND;
+	const bool resolvable = peerAddressType == 1
+		&& (peerAddress[5] & 0xc0) == 0x40;
+	for (size_t i = 0; i < devices.size(); i++) {
+		const LEBondedDevice& device = devices[i];
+		if (device.localAddressType != 0
+			|| memcmp(device.localAddress, localAddress, 6) != 0)
+			continue;
+		if (LoadLEBond(directory, device.localAddress, 0, device.peerAddress,
+				device.peerAddressType, bond) != B_OK)
+			continue;
+		bool matches = bond.hasIdentity
+			&& ((bond.identityAddressType == peerAddressType
+					&& memcmp(bond.identityAddress, peerAddress, 6) == 0)
+				|| (resolvable && LEResolvePrivateAddress(
+					bond.identityResolvingKey, peerAddress)));
+		if (matches) {
+			memcpy(storedAddress, device.peerAddress, 6);
+			*storedType = device.peerAddressType;
+			return B_OK;
+		}
+	}
+	ClearSecret(&bond, sizeof(bond));
+	return B_ENTRY_NOT_FOUND;
 }
 
 } // namespace Bluetooth

@@ -61,6 +61,14 @@ struct LEBondedDevice {
 status_t ListLEBonds(const char* directory,
 	std::vector<LEBondedDevice>& devices);
 
+// The bond for a peer seen at this address: the one stored under it, else
+// one whose identity address it is or whose IRK resolves it (a peer with a
+// resolvable private address shows a new one every few minutes). The
+// address the bond is stored under goes to storedAddress/storedType.
+status_t FindLEBond(const char* directory, const uint8 localAddress[6],
+	const uint8 peerAddress[6], uint8 peerAddressType, LELegacyBondKey& bond,
+	uint8 storedAddress[6], uint8* storedType);
+
 } // namespace Bluetooth
 
 #endif

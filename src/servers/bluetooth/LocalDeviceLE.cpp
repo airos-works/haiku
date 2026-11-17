@@ -528,6 +528,7 @@ LocalDeviceImpl::StartLEConnection(const BMessenger& listener,
 	LELink* link = new(std::nothrow) LELink();
 	if (link == NULL)
 		return B_NO_MEMORY;
+	link->serial = ++fLELinkSerial;
 	link->state = LE_CONN_PENDING;
 	link->since = system_time();
 	link->cancelRequested = false;
@@ -537,6 +538,9 @@ LocalDeviceImpl::StartLEConnection(const BMessenger& listener,
 	link->handle = 0;
 	link->encryptionPending = false;
 	link->encrypted = false;
+	link->encryptionChanges = 0;
+	link->encryptionStatus = 0;
+	link->securing = false;
 	link->createIntervalMin = intervalMin;
 	link->createIntervalMax = intervalMax;
 	link->createLatency = latency;
@@ -955,6 +959,8 @@ LocalDeviceImpl::HandleLECommandStatus(struct hci_event_header* event)
 			LOG(LE_LOG_ERROR, "LE Start Encryption on handle %#x rejected: "
 				"%#x (%s)", handle, status, BluetoothError(status));
 			link->encryptionPending = false;
+			link->encryptionStatus = status;
+			link->encryptionChanges++;
 			_SendLEConnectionNotice(link, BT_MSG_LE_ENCRYPTION_FAILED, status);
 		} else
 			LOG(LE_LOG_DEBUG, "LE Start Encryption accepted by controller");
@@ -1322,6 +1328,8 @@ LocalDeviceImpl::HandleLEEncryptionChange(uint16 handle, uint8 status,
 	if (link == NULL)
 		return false;
 	link->encrypted = status == 0 && enabled;
+	link->encryptionStatus = status != 0 ? status : (enabled ? 0 : 0x05);
+	link->encryptionChanges++;
 	LOG(link->encrypted ? LE_LOG_INFO : LE_LOG_ERROR,
 		"LE encryption on handle %#x: status %#x (%s), %s", handle, status,
 		BluetoothError(status), enabled ? "enabled" : "disabled");

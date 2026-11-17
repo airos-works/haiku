@@ -12,6 +12,7 @@
 #include <LELegacyPairingCrypto.h>
 #include <LELegacyPairingClient.h>
 #include <LELog.h>
+#include <LESMPInitiator.h>
 #include <bluetooth/L2CAP/btL2CAP.h>
 #include <bluetoothserver_p.h>
 
@@ -712,10 +713,10 @@ ProbeHIDMouse(LEPairingResult& result, const uint8 localAddress[6],
 LEPairingResult
 PairLEDevice(int32 hciID, const uint8 localAddress[6],
 	const uint8 peerAddress[6], uint8 peerAddressType,
-	const BMessenger* progress)
+	const BMessenger* progress, uint32 flags)
 {
 	LEPairingResult result = { B_BAD_VALUE, LE_PAIRING_CONNECT, false, false,
-		false, false, B_NO_INIT, "" };
+		false, false, B_NO_INIT, false, false, "" };
 	if (hciID < 0 || localAddress == NULL || peerAddress == NULL
 		|| peerAddressType > 1) {
 		SetDetail(result, "Invalid pairing request.");
@@ -749,11 +750,11 @@ PairLEDevice(int32 hciID, const uint8 localAddress[6],
 	bool connected = false;
 	char directory[1024];
 	ScopedBondKey bond;
-	uint8 distribution = 0;
-	uint8 keySize = 0;
+	LESMPOptions options;
+	LESMPResult smp;
+	memset(&smp, 0, sizeof(smp));
 	LinkEvent event;
 	BMessage encrypt(BT_MSG_LE_START_ENCRYPTION);
-	uint8 shortTermKey[16] = {};
 	bigtime_t started = system_time();
 
 	result.status = RequestConnection(server, hciID, listener, peerAddress,
@@ -806,9 +807,17 @@ PairLEDevice(int32 hciID, const uint8 localAddress[6],
 
 	SetStage(result, LE_PAIRING_SMP_REQUEST, progress,
 		"Exchanging pairing features");
-	result.status = LELegacyPairJustWorks(smpSocket, localAddress, 0,
-		peerAddress, peerAddressType, shortTermKey, &distribution,
-		&keySize, progress, result.detail, sizeof(result.detail));
+	// The user picked the device here; with no way to show or compare a
+	// number, this is Just Works, with Secure Connections when the device
+	// offers it (its keys cannot be recovered by someone listening).
+	options.ioCapability = LE_SMP_IO_NO_INPUT_NO_OUTPUT;
+	options.mitm = false;
+	options.secureConnections = (flags & LE_PAIRING_LEGACY_ONLY) == 0;
+	result.status = LESMPPairAsInitiator(smpSocket, localAddress, 0,
+		peerAddress, peerAddressType, options, NULL, smp, progress,
+		result.detail, sizeof(result.detail));
+	result.secureConnections = smp.secureConnections;
+	result.authenticated = smp.authenticated;
 	if (result.status != B_OK) {
 		status_t reason;
 		if (listener->Disconnected(&reason)) {
@@ -821,8 +830,9 @@ PairLEDevice(int32 hciID, const uint8 localAddress[6],
 	SetStage(result, LE_PAIRING_ENCRYPT, progress, "Encrypting the link");
 	encrypt.AddInt32("hci_id", hciID);
 	encrypt.AddMessenger("listener", listenerMessenger);
-	encrypt.AddData("short_term_key", B_RAW_TYPE, shortTermKey, 16);
-	ClearSecret(shortTermKey, sizeof(shortTermKey));
+	// The legacy STK or the Secure Connections LTK, both with zero EDIV
+	// and Rand.
+	encrypt.AddData("short_term_key", B_RAW_TYPE, smp.key, 16);
 	result.status = SendRequest(server, encrypt);
 	if (result.status == B_OK) {
 		result.status = listener->WaitFor(BT_MSG_LE_ENCRYPTED, event,
@@ -837,10 +847,19 @@ PairLEDevice(int32 hciID, const uint8 localAddress[6],
 
 	SetStage(result, LE_PAIRING_KEYS, progress,
 		"Receiving the device's keys");
-	result.status = LELegacyReceiveResponderKeys(smpSocket, distribution,
-		keySize, bond, result.detail, sizeof(result.detail));
+	result.status = LELegacyReceiveResponderKeys(smpSocket, smp.responderKeys,
+		smp.keySize, bond, result.detail, sizeof(result.detail));
 	if (result.status != B_OK)
 		goto done;
+	if (smp.secureConnections && smp.bonding) {
+		// The LTK is the one the pairing derived; nothing is sent for it.
+		memcpy(bond.longTermKey, smp.key, 16);
+		memset(bond.randomNumber, 0, sizeof(bond.randomNumber));
+		bond.encryptedDiversifier = 0;
+		bond.hasLongTermKey = true;
+	}
+	bond.secureConnections = smp.secureConnections;
+	bond.authenticated = smp.authenticated;
 	if (!bond.hasLongTermKey) {
 		// Paired for this connection only; the device cannot reconnect.
 		LOG(LE_LOG_ERROR, "device distributed no long-term key; it will not "
@@ -887,7 +906,7 @@ done:
 		if (listener->Lock())
 			listener->Quit();
 		result.stage = outcomeStage;
-		ClearSecret(shortTermKey, sizeof(shortTermKey));
+		ClearSecret(&smp, sizeof(smp));
 		if (result.status != B_OK && result.detail[0] == '\0')
 			SetDetail(result, "%s", StatusText(result.status));
 		LOG(result.status == B_OK ? LE_LOG_INFO : LE_LOG_ERROR,
@@ -897,6 +916,71 @@ done:
 			result.detail[0] != '\0' ? ": " : "", result.detail);
 	}
 	return result;
+}
+
+
+// #pragma mark - pairing for applications
+
+
+void
+LELinkSecurityFromReply(const BMessage& reply, LELinkSecurity& result)
+{
+	memset(&result, 0, sizeof(result));
+	result.status = reply.GetInt32("status", B_BAD_DATA);
+	result.smpReason = reply.GetUInt8("smp_reason", 0);
+	result.smpReasonRemote = reply.GetBool("smp_reason_remote", false);
+	result.hciStatus = reply.GetUInt8("hci_status", 0);
+	result.encrypted = reply.GetBool("encrypted", false);
+	result.bonded = reply.GetBool("bonded", false);
+	result.reusedBond = reply.GetBool("reused_bond", false);
+	result.secureConnections = reply.GetBool("secure_connections", false);
+	result.authenticated = reply.GetBool("authenticated", false);
+	result.method = reply.GetInt32("method", -1);
+	result.keySize = reply.GetUInt8("key_size", 0);
+	const char* detail = reply.GetString("detail", NULL);
+	if (detail != NULL)
+		strlcpy(result.detail, detail, sizeof(result.detail));
+}
+
+
+status_t
+SecureLELink(int32 hciID, const BMessenger& listener,
+	const uint8 peerAddress[6], LELinkSecurity& result, uint32 flags,
+	const char* deviceName, bigtime_t timeout)
+{
+	memset(&result, 0, sizeof(result));
+	result.method = -1;
+	result.status = B_BAD_VALUE;
+	if (hciID < 0 || !listener.IsValid())
+		return result.status;
+	BMessenger server(BLUETOOTH_SIGNATURE);
+	if (!server.IsValid()) {
+		result.status = B_NO_INIT;
+		strlcpy(result.detail, "The Bluetooth service is not running.",
+			sizeof(result.detail));
+		return result.status;
+	}
+	BMessage request(BT_MSG_LE_PAIR);
+	request.AddInt32("hci_id", hciID);
+	request.AddMessenger("listener", listener);
+	if (peerAddress != NULL)
+		request.AddData("address", B_RAW_TYPE, peerAddress, 6);
+	if (deviceName != NULL && deviceName[0] != '\0')
+		request.AddString("device_name", deviceName);
+	if ((flags & LE_SECURE_FRESH) != 0)
+		request.AddBool("fresh", true);
+	if ((flags & LE_SECURE_BONDED_ONLY) != 0)
+		request.AddBool("bonded_only", true);
+	BMessage reply;
+	status_t status = server.SendMessage(&request, &reply, 5000000, timeout);
+	if (status != B_OK) {
+		result.status = status;
+		snprintf(result.detail, sizeof(result.detail), "No answer from the "
+			"Bluetooth service: %s.", strerror(status));
+		return status;
+	}
+	LELinkSecurityFromReply(reply, result);
+	return result.status;
 }
 
 } // namespace Bluetooth

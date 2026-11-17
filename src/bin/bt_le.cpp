@@ -25,6 +25,7 @@
 #include <LEBondStore.h>
 #include <LELog.h>
 #include <LEPairingSession.h>
+#include <LESMPInitiator.h>
 #include <bluetoothserver_p.h>
 
 #include <algorithm>
@@ -45,7 +46,8 @@ Usage()
 {
 	fprintf(stderr,
 		"usage: bt_le scan [seconds]\n"
-		"       bt_le pair <address> [public|random]\n"
+		"       bt_le pair <address> [public|random] [legacy]\n"
+		"       bt_le secure <address> [public|random] [fresh|bonded]\n"
 		"       bt_le services <address> [public|random] [<address> "
 			"[public|random]]...\n"
 		"       bt_le list\n"
@@ -60,7 +62,11 @@ Usage()
 		"is in pairing mode; the log is %s.\n"
 		"services holds a link to each device at once, then lists its GATT\n"
 		"services and reads its name, device information and battery level\n"
-		"(read only, no pairing).\n", LELogFilePath());
+		"(read only, no pairing).\n"
+		"secure connects like an application and asks the Bluetooth service\n"
+		"to secure the link: the stored bond, or pairing after the system's\n"
+		"prompt (fresh: pair again; bonded: only use a stored bond).\n",
+		LELogFilePath());
 }
 
 
@@ -291,7 +297,7 @@ public:
 
 
 static int
-Pair(const uint8 peer[6], uint8 type)
+Pair(const uint8 peer[6], uint8 type, uint32 flags)
 {
 	uint8 local[6];
 	LocalDevice* adapter = GetAdapter(local);
@@ -304,7 +310,7 @@ Pair(const uint8 peer[6], uint8 type)
 	printer->Run();
 	BMessenger progress(printer);
 	LEPairingResult result = PairLEDevice(adapter->ID(), local, peer, type,
-		&progress);
+		&progress, flags);
 	snooze(100000);
 	if (printer->Lock())
 		printer->Quit();
@@ -314,8 +320,10 @@ Pair(const uint8 peer[6], uint8 type)
 		printf("Details: %s\n", LELogFilePath());
 		return 1;
 	}
-	printf("Paired%s. Encrypted: %s, bonded: %s.\n",
+	printf("Paired%s (%s). Encrypted: %s, bonded: %s.\n",
 		result.hidMouseReady ? " as a mouse" : "",
+		result.secureConnections ? "LE Secure Connections"
+			: "legacy pairing",
 		result.encrypted ? "yes" : "no", result.bonded ? "yes" : "no");
 	if (!result.hidMouseReady && result.detail[0] != '\0')
 		printf("Note: %s\n", result.detail);
@@ -555,6 +563,110 @@ Services(std::vector<ServicesPeer>& peers)
 		if (peer.listener->Lock())
 			peer.listener->Quit();
 	}
+	return exitCode;
+}
+
+
+/*!	Connects to the peer the way an application does and asks the server
+	to secure the link (BT_MSG_LE_PAIR): with a stored bond the link is
+	encrypted without asking; otherwise the server pairs after the system's
+	prompt. Then reads the public GATT values over the link (read only) and
+	disconnects.
+*/
+static int
+Secure(const uint8 peer[6], uint8 type, uint32 flags)
+{
+	uint8 local[6];
+	LocalDevice* adapter = GetAdapter(local);
+	if (adapter == NULL)
+		return 1;
+	BMessenger server(BLUETOOTH_SIGNATURE);
+	char text[18];
+	LEAddressString(peer, text);
+	LinkListener* listener = new LinkListener();
+	listener->Run();
+	BMessenger listenerMessenger(listener);
+
+	printf("Connecting to %s (%s)...\n", text,
+		type == 0 ? "public" : "random");
+	BMessage request(BT_MSG_LE_CONNECT), reply;
+	request.AddInt32("hci_id", adapter->ID());
+	request.AddMessenger("listener", listenerMessenger);
+	request.AddData("address", B_RAW_TYPE, peer, 6);
+	request.AddUInt8("address_type", type);
+	int32 status = B_ERROR;
+	if (server.SendMessage(&request, &reply, 5000000, 5000000) == B_OK)
+		reply.FindInt32("status", &status);
+	if (status == B_OK)
+		status = listener->Wait(20000000);
+	if (status != B_OK) {
+		fprintf(stderr, "Not connected: %s\n", strerror(status));
+		BMessage cancel(BT_MSG_LE_CONNECT_CANCEL);
+		cancel.AddInt32("hci_id", adapter->ID());
+		cancel.AddMessenger("listener", listenerMessenger);
+		server.SendMessage(&cancel, &reply, 5000000, 5000000);
+		if (listener->Lock())
+			listener->Quit();
+		return 1;
+	}
+	printf("Connected, handle %#x. Asking the Bluetooth service to secure "
+		"the link%s...\n", listener->Handle(),
+		(flags & LE_SECURE_BONDED_ONLY) != 0 ? " with the stored bond"
+			: (flags & LE_SECURE_FRESH) != 0 ? " by pairing again" : "");
+
+	LELinkSecurity security;
+	SecureLELink(adapter->ID(), listenerMessenger, peer, security, flags);
+	if (security.status == B_OK) {
+		printf("Secured: %s%s%s, %u-byte key, %s.\n",
+			security.reusedBond ? "stored bond"
+				: security.method >= 0
+					? LESMPMethodName((LESMPMethod)security.method)
+					: "already encrypted",
+			security.secureConnections ? ", LE Secure Connections"
+				: security.encrypted ? ", legacy" : "",
+			security.authenticated ? ", authenticated" : "",
+			security.keySize,
+			security.bonded ? "bonded" : "not bonded");
+	} else {
+		printf("Not secured: %s", strerror(security.status));
+		if (security.smpReason != 0) {
+			printf(" (SMP reason %#x, sent by %s)", security.smpReason,
+				security.smpReasonRemote ? "the device" : "this computer");
+		}
+		if (security.hciStatus != 0)
+			printf(" (HCI %#x)", security.hciStatus);
+		printf("\n");
+	}
+	if (security.detail[0] != '\0')
+		printf("%s\n", security.detail);
+
+	int exitCode = security.status == B_OK ? 0 : 1;
+	if (security.status == B_OK) {
+		bdaddr_t address;
+		memcpy(address.b, peer, 6);
+		LEAttributeClient client;
+		std::vector<LEPrimaryService> services;
+		status_t readStatus = client.Connect(address);
+		if (readStatus == B_OK)
+			readStatus = client.DiscoverPrimaryServices(services);
+		if (readStatus == B_OK) {
+			for (const LEPrimaryService& service : services)
+				ReadPublicValues(client, service);
+		} else {
+			fprintf(stderr, "GATT read over the secured link failed: %s\n",
+				strerror(readStatus));
+		}
+		client.Disconnect();
+	}
+
+	BMessage disconnect(BT_MSG_LE_DISCONNECT);
+	disconnect.AddInt32("hci_id", adapter->ID());
+	disconnect.AddMessenger("listener", listenerMessenger);
+	server.SendMessage(&disconnect, &reply, 5000000, 5000000);
+	listener->Wait(3000000);
+	if (listener->Lock())
+		listener->Quit();
+	printf("Details: %s\n", LELogFilePath());
 	return exitCode;
 }
 
@@ -1007,6 +1119,31 @@ main(int argc, char** argv)
 			strerror(status));
 		return status == B_OK ? 0 : 1;
 	}
+	if (strcmp(command, "secure") == 0 && argc > 2) {
+		// bt_le secure <address> [public|random] [fresh|bonded]
+		uint8 address[6];
+		if (!ParseAddress(argv[2], address)) {
+			Usage();
+			return 1;
+		}
+		uint8 type = (address[5] & 0xc0) == 0xc0 ? 1 : 0;
+		uint32 flags = 0;
+		for (int i = 3; i < argc; i++) {
+			if (strcmp(argv[i], "public") == 0)
+				type = 0;
+			else if (strcmp(argv[i], "random") == 0)
+				type = 1;
+			else if (strcmp(argv[i], "fresh") == 0)
+				flags |= LE_SECURE_FRESH;
+			else if (strcmp(argv[i], "bonded") == 0)
+				flags |= LE_SECURE_BONDED_ONLY;
+			else {
+				Usage();
+				return 1;
+			}
+		}
+		return Secure(address, type, flags);
+	}
 	if ((strcmp(command, "pair") == 0 || strcmp(command, "forget") == 0
 			|| strcmp(command, "services") == 0)
 		&& argc > 2) {
@@ -1017,8 +1154,13 @@ main(int argc, char** argv)
 		}
 		// Most mice use a random static address (top two bits set).
 		uint8 type = (address[5] & 0xc0) == 0xc0 ? 1 : 0;
-		if (argc > 3)
+		uint32 pairFlags = 0;
+		if (argc > 3 && strcmp(argv[3], "legacy") != 0)
 			type = strcmp(argv[3], "public") == 0 ? 0 : 1;
+		for (int i = 3; i < argc && command[0] == 'p'; i++) {
+			if (strcmp(argv[i], "legacy") == 0)
+				pairFlags |= LE_PAIRING_LEGACY_ONLY;
+		}
 		if (command[0] == 's') {
 			// <address> [type] [<address> [type]]...
 			std::vector<ServicesPeer> peers;
@@ -1038,7 +1180,8 @@ main(int argc, char** argv)
 			}
 			return Services(peers);
 		}
-		return command[0] == 'p' ? Pair(address, type) : Forget(address, type);
+		return command[0] == 'p' ? Pair(address, type, pairFlags)
+			: Forget(address, type);
 	}
 	Usage();
 	return 1;

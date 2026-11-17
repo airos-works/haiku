@@ -391,6 +391,26 @@ void BluetoothServer::MessageReceived(BMessage* message)
 			break;
 		}
 
+		case BT_MSG_LE_PAIR:
+		{
+			// Answered by the pairing job when it is done.
+			LocalDeviceImpl* device = LocateDelegateFromMessage(message);
+			if (device == NULL) {
+				status = B_BAD_VALUE;
+				break;
+			}
+			BMessage* request = DetachCurrentMessage();
+			status = device->PairLELink(request);
+			if (status == B_OK)
+				return;
+			reply.what = BT_MSG_LE_PAIR_RESULT;
+			reply.AddInt32("status", status);
+			reply.AddInt32("method", -1);
+			request->SendReply(&reply);
+			delete request;
+			return;
+		}
+
 		case BT_MSG_GET_PROPERTY:
 			status = HandleGetProperty(message, &reply);
 			break;

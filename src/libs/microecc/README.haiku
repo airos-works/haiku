@@ -1,0 +1,15 @@
+micro-ecc, a small ECDH and ECDSA implementation by Kenneth MacKay.
+
+Source:   https://github.com/kmackay/micro-ecc
+Version:  v1.2 (commit 541b3a78026420a3e369c4c9281c396b5e531113, 2024-11-13)
+Licence:  BSD 2-clause, see LICENSE.txt
+
+Only the C sources are kept (uECC.c, uECC.h, uECC_vli.h, types.h,
+curve-specific.inc, platform-specific.inc), unmodified. The assembly files are
+for 32-bit ARM and AVR, which Haiku does not build this for.
+
+Used by the Bluetooth kit for LE Secure Connections pairing (P-256 ECDH):
+src/kits/bluetooth/LEP256.c includes uECC.c with only secp256r1 enabled and
+its symbols hidden, and sets getentropy() as the random number source. The
+results are checked against the Bluetooth Core specification's sample data by
+src/tests/kits/bluetooth/le_sc_crypto_test.

@@ -96,7 +96,10 @@ LocalDeviceImpl::LocalDeviceImpl(HCIDelegate* hd)
 	  fLEScanSince(0),
 	  fLECommandSince(0),
 	  fClassicInquiryActive(false),
-	  fClassicInquirySince(0)
+	  fClassicInquirySince(0),
+	  fLELinkSerial(0),
+	  fLESecurityJobs(0),
+	  fLEGoingAway(false)
 {
 	LoadRemoteDevices();
 }
@@ -286,6 +289,11 @@ LocalDeviceImpl::HandlePairSetupCommandComplete(struct hci_event_header* event)
 
 LocalDeviceImpl::~LocalDeviceImpl()
 {
+	// Pairing jobs for applications look at fLEGoingAway every few hundred
+	// milliseconds and answer their requests.
+	fLEGoingAway = true;
+	for (int i = 0; i < 200 && atomic_get(&fLESecurityJobs) > 0; i++)
+		snooze(50000);
 	SaveRemoteDevices();
 	// Drop every link on the way out (the server quits for a restart or a
 	// reboot): the peers look for a host again at once instead of staying
