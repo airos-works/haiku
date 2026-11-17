@@ -161,7 +161,7 @@ r10bu_attach(struct rtwn_usb_softc *uc)
 	sc->sc_sta_beacon_enable	= r88e_sta_beacon_enable;
 	sc->sc_beacon_set_rate		= rtwn_nop_void_int;
 	sc->sc_beacon_select		= rtwn_nop_softc_int;
-	sc->sc_temp_measure		= r88e_temp_measure;
+	sc->sc_temp_measure		= r10b_temp_measure;
 	sc->sc_temp_read		= r88e_temp_read;
 	sc->sc_init_tx_agg		= rtwn_nop_softc;
 	sc->sc_init_rx_agg		= r10bu_init_rx_agg;

@@ -55,11 +55,15 @@
 static int
 r10b_indirect_wait(struct rtwn_softc *sc)
 {
+	uint32_t ctrl;
 	int ntries;
 
 	for (ntries = 0; ntries < R10B_INDIRECT_POLL; ntries++) {
-		if (!(rtwn_read_4(sc, R10B_INDIRECT_CTRL) &
-		    R10B_INDIRECT_CTRL_BUSY))
+		ctrl = rtwn_read_4(sc, R10B_INDIRECT_CTRL);
+		/* All ones: the USB read failed (device gone), stop now. */
+		if (ctrl == 0xffffffff)
+			return (EIO);
+		if (!(ctrl & R10B_INDIRECT_CTRL_BUSY))
 			return (0);
 	}
 	return (ETIMEDOUT);
@@ -102,16 +106,17 @@ r10b_syson_write(struct rtwn_softc *sc, uint32_t addr, uint32_t val)
 int
 r10b_efuse_read_1(struct rtwn_softc *sc, uint16_t addr, uint8_t *val)
 {
+	uint32_t ctrl = 0;
 	int ntries;
 
 	rtwn_write_4(sc, R10B_INDIRECT_ADDR, addr);
 	rtwn_write_4(sc, R10B_INDIRECT_CTRL, R10B_INDIRECT_CMD_EFUSE_READ);
 	for (ntries = 0; ntries < R10B_EFUSE_POLL; ntries++) {
-		if (!(rtwn_read_4(sc, R10B_INDIRECT_CTRL) &
-		    R10B_INDIRECT_CTRL_BUSY))
+		ctrl = rtwn_read_4(sc, R10B_INDIRECT_CTRL);
+		if (ctrl == 0xffffffff || !(ctrl & R10B_INDIRECT_CTRL_BUSY))
 			break;
 	}
-	if (ntries == R10B_EFUSE_POLL) {
+	if (ntries == R10B_EFUSE_POLL || ctrl == 0xffffffff) {
 		device_printf(sc->sc_dev,
 		    "could not read efuse byte at address 0x%x\n", addr);
 		return (ETIMEDOUT);

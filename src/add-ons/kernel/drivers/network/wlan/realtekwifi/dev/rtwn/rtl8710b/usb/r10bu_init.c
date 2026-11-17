@@ -54,8 +54,13 @@ r10bu_wait_pwr_fsm(struct rtwn_softc *sc, uint8_t bit)
 {
 	int ntries;
 
+	uint8_t reg;
+
 	for (ntries = 0; ntries < R10BU_POWER_POLL; ntries++) {
-		if (!(rtwn_read_1(sc, R10B_PWR_FSM) & bit))
+		reg = rtwn_read_1(sc, R10B_PWR_FSM);
+		if (reg == 0xff)	/* USB read failed: device gone */
+			return (EIO);
+		if (!(reg & bit))
 			return (0);
 		rtwn_delay(sc, 10);
 	}
@@ -129,6 +134,7 @@ r10bu_flush_fifo(struct rtwn_softc *sc)
 	rtwn_write_1(sc, R92C_TXPAUSE, R92C_TX_QUEUE_ALL);
 	rtwn_setbits_4(sc, R92C_RXPKT_NUM, 0, R10B_RXPKT_NUM_RW_RELEASE_EN);
 	for (ntries = 0; ntries < 100; ntries++) {
+		/* All ones (a failed read) also has the idle bit. */
 		if (rtwn_read_4(sc, R92C_RXPKT_NUM) & R10B_RXPKT_NUM_RXDMA_IDLE)
 			break;
 	}
@@ -170,11 +176,12 @@ r10bu_power_off(struct rtwn_softc *sc)
 	/* Active -> low power: wait for the scheduler to go idle. */
 	rtwn_write_1(sc, R92C_TXPAUSE, R92C_TX_QUEUE_ALL);
 	for (ntries = 0; ntries < 100; ntries++) {
-		if (rtwn_read_4(sc, R10B_SCH_TX_CMD) == 0)
+		reg = rtwn_read_4(sc, R10B_SCH_TX_CMD);
+		if (reg == 0 || reg == 0xffffffff)
 			break;
 		rtwn_delay(sc, 10);
 	}
-	if (ntries == 100) {
+	if (ntries == 100 || reg == 0xffffffff) {
 		device_printf(sc->sc_dev, "%s: failed to flush TX queue\n",
 		    __func__);
 	} else {

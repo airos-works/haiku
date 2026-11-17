@@ -331,6 +331,17 @@ r10b_set_crystal_cap(struct rtwn_softc *sc)
 	r10b_syson_write(sc, R10B_SYSON_XTAL_CTRL0, reg);
 }
 
+/*
+ * Start a thermal meter reading: set the trigger bits of RF 0x42 and keep
+ * the rest (rtl8xxxu's gen2 thermal meter for the RTL8188F and RTL8710B),
+ * where r88e_temp_measure() overwrites the register.
+ */
+void
+r10b_temp_measure(struct rtwn_softc *sc)
+{
+	rtwn_rf_setbits(sc, 0, R10B_RF_T_METER, 0, 0x30000);
+}
+
 void
 r10b_postattach(struct rtwn_softc *sc)
 {

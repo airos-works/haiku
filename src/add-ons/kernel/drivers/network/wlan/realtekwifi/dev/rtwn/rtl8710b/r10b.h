@@ -73,6 +73,7 @@ void	r10b_init_stats(struct rtwn_softc *);
 void	r10b_set_crystal_cap(struct rtwn_softc *);
 void	r10b_detach_private(struct rtwn_softc *);
 void	r10b_postattach(struct rtwn_softc *);
+void	r10b_temp_measure(struct rtwn_softc *);
 
 /* r10b_rom.c */
 uint32_t r10b_syson_read(struct rtwn_softc *, uint32_t);
