@@ -150,7 +150,7 @@ none of its frames reached the wire: no DHCP offer, and with a static .41 the
 server's ARP entry for .41 stayed incomplete while the laptop counted the ARP
 requests in and its replies out. The same with `tx_max_datagrams 1`.
 
-Cause (found offline, to be confirmed on the laptop): the datagrams sat 2
+Cause (confirmed by the second run below): the datagrams sat 2
 bytes off. The RTL8156 asks for `wNdpOutDivisor` 4 and
 `wNdpOutPayloadRemainder` 2. That remainder places the payload after the
 Ethernet header, so the frame itself belongs at offset % 4 == 0 (Linux'
@@ -186,6 +186,33 @@ boot. Then:
    up) and the packet filter.
 5. Remove `debug 1` (or leave it: it stops after `debug_ntbs` NTBs each way)
    and go on with the test plan from step 3.
+
+## Second run on the RTL8156 (18 November 2026): above 2 Gbit/s both ways
+
+Laptop build: its CI kernel (+2559) with master's network code and this
+branch (a126a0225e). DHCP gave .41 at once; the syslog showed the NDP at 12
+and every datagram at offset % 4 == 0. Against the Linux build server over
+the 2.5 Gbit/s link:
+
+| | usb_ecm (ECM) | usb_ncm (NCM) |
+|---|---|---|
+| upload, a sender bound to .41, receiver reading 1 MB per `recv()` | - | 2.3 Gbit/s |
+| upload, iperf3: 1 / 4 streams / `-w 1M` | 664 / 711 / 703 | 1,742 / 1,972 / 1,961 |
+| UDP upload, 2 Gbit/s offered | - | 1,954 delivered (2.3 % lost) |
+| download, iperf3 `-R`: 1 / 4 streams | 522 / 524 | 1,975-2,125 / 2,274-2,339 |
+
+`ncmstat` after the runs: 10.4 million datagrams received in 569,000 NTBs
+(18 per NTB, up to 364), 9.1 million sent in 1.5 million NTBs (6 per NTB, up
+to 21); no bad NTBs, errors or drops; 195,000 `waits` (every OUT buffer
+busy), so `tx_transfers` may still gain. `ifconfig down`/`up` 10 times idle
+and 10 times during a download: receiving resumed every time, the address
+stayed, and the QEMU rig's receive stall did not happen. Not yet done: cable
+out and in, unplugging during a transfer, a reboot with the interface down.
+
+Measuring trap on this laptop: Wi-Fi, the dock's RTL8153 and the RTL8156 are
+on one subnet with routes of equal metric, the dock's first, and `iperf3 -B`
+only chooses the source address. Uploads (and a download's ACKs) left through
+the dock's 1 Gbit/s adapter until `ifconfig /dev/net/usb_ecm/0 down`.
 
 ## Test plan: RTL8156 on the Framework 13
 
