@@ -22,6 +22,7 @@ KernelAddon sdhci :
 	sdhci_fdt.cpp
 	sdhci_acpi.cpp
 	sdhci_pci.cpp
+	sdhci_intel.cpp
 	$(qcomSources)
 ;
 

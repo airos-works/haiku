@@ -21,6 +21,7 @@
 #include "IOSchedulerSimple.h"
 #include "mmc.h"
 #include "sdhci.h"
+#include "sdhci_intel.h"
 
 
 //#define TRACE_SDHCI
@@ -124,7 +125,15 @@ init_bus_pci(device_node* node, void** bus_cookie)
 	uint8_t irq = pciInfo.u.h0.interrupt_line;
 	TRACE("irq interrupt line: %d\n", irq);
 
-	SdhciBus* bus = new(std::nothrow) SdhciBus(_regs, irq, false);
+	uint32 slotQuirks = 0;
+	gDeviceManager->get_attr_uint32(node, SDHCI_SLOT_QUIRKS_ATTRIBUTE,
+		&slotQuirks, false);
+	// Bay Trail: its OCP timeout (Linux: byt_ocp_setting())
+	if (sdhci_intel_pci_is_baytrail(pciInfo.vendor_id, pciInfo.device_id))
+		sdhci_intel_byt_ocp_fixup();
+
+	SdhciBus* bus = new(std::nothrow) SdhciBus(_regs, irq, false, NULL,
+		slotQuirks);
 
 	status_t status = B_NO_MEMORY;
 	if (bus != NULL)
@@ -157,6 +166,13 @@ register_child_devices_pci(void* cookie)
 	gDeviceManager->get_driver(parent, (driver_module_info**)&pci,
 		(void**)&device);
 	uint8 slotsInfo = pci->read_pci_config(device, SDHCI_PCI_SLOT_INFO, 1);
+	uint16 vendorId = 0, deviceId = 0;
+	gDeviceManager->get_attr_uint16(parent, B_DEVICE_VENDOR_ID, &vendorId,
+		false);
+	gDeviceManager->get_attr_uint16(parent, B_DEVICE_ID, &deviceId, false);
+	uint32 slotQuirks = sdhci_intel_pci_slot_quirks(vendorId, deviceId);
+	if (slotQuirks != 0)
+		TRACE_ALWAYS("%04x:%04x: Intel SDIO slot\n", vendorId, deviceId);
 	uint8 bar = SDHCI_PCI_SLOT_INFO_FIRST_BASE_INDEX(slotsInfo);
 	uint8 slotsCount = SDHCI_PCI_SLOTS(slotsInfo);
 
@@ -179,6 +195,10 @@ register_child_devices_pci(void* cookie)
 			{ B_DEVICE_BUS, B_STRING_TYPE, {.string = "mmc"} },
 		// standard SDHCI: SD high speed with the capability bit (SetClock)
 		{ kMmcSdHighSpeedAttribute, B_UINT8_TYPE, { .ui8 = 1 }},
+		{ kMmcSdioHighSpeedAttribute, B_UINT8_TYPE, { .ui8 = 1 }},
+		{ kMmcNonRemovableAttribute, B_UINT8_TYPE,
+			{ .ui8 = (uint8)((slotQuirks & SDHCI_SLOT_NON_REMOVABLE) != 0) }},
+		{ SDHCI_SLOT_QUIRKS_ATTRIBUTE, B_UINT32_TYPE, { .ui32 = slotQuirks }},
 
 			// DMA properties
 			// The high alignment is to force access only to complete sectors
@@ -333,4 +353,7 @@ mmc_bus_interface gSDHCIPCIDeviceModule = {
 	.set_card_type = set_card_type,
 	.read_extended_csd = read_extended_csd,
 	.switch_sd_function = switch_sd_function,
+	.sdio_transfer = sdio_transfer,
+	.set_sdio_interrupt_handler = set_sdio_interrupt_handler,
+	.enable_sdio_interrupt = enable_sdio_interrupt,
 };

@@ -40,10 +40,26 @@ struct sdhci_platform_info {
 };
 
 
+// Slot quirks of ACPI and PCI hosts ("sdhci/quirks" on the slot's node)
+#define SDHCI_SLOT_NON_REMOVABLE	0x01
+	// a soldered card (Wi-Fi): present whatever card detection says, which
+	// is broken on Intel's SDIO slots (Linux: SDHCI_QUIRK_BROKEN_CARD_DETECTION,
+	// MMC_CAP_NONREMOVABLE)
+#define SDHCI_SLOT_POWER_RETRY		0x02
+	// bus power may not take after the controller came out of D3: write it
+	// again for up to 2 ms (Linux: sdhci_intel_set_power)
+#define SDHCI_SLOT_HS_AS_SDR25		0x04
+	// high speed timing also selects SDR25 in Host Control 2 (Linux:
+	// sdhci_intel_set_uhs_signaling)
+
+#define SDHCI_SLOT_QUIRKS_ATTRIBUTE	"sdhci/quirks"
+
+
 class SdhciBus {
 	public:
 								SdhciBus(struct registers* registers, uint32_t irq, bool poll,
-									const sdhci_platform_info* platform = NULL);
+									const sdhci_platform_info* platform = NULL,
+									uint32 slotQuirks = 0);
 								~SdhciBus();
 
 			void				EnableInterrupts(uint32_t mask);
@@ -63,6 +79,14 @@ class SdhciBus {
 			status_t			ReadExtendedCsd(uint8_t data[512]);
 			status_t			SwitchSdFunction(uint32_t argument,
 									uint8_t data[64]);
+			status_t			SdioTransfer(uint32_t argument, bool write,
+									void* buffer, uint16_t blockSize,
+									uint16_t blockCount, uint32_t* response);
+			void				SetSdioInterruptHandler(
+									void (*handler)(void*), void* data);
+			void				EnableSdioInterrupt(bool enable);
+			bool				HighSpeedCapable();
+			card_type			CardType() const { return fCardType; }
 
 	private:
 			bool				PowerOn();
@@ -96,6 +120,16 @@ class SdhciBus {
 			bool				fDMAQuarantined;
 			bool				fReportedHighCpuRead;
 			bool				fReportedHighCpuWrite;
+			uint32				fSlotQuirks;
+			// SDIO
+			spinlock			fInterruptLock;
+				// the card interrupt's enable bits, against the handler
+			bool				fSdioInterruptEnabled;
+			void				(*fSdioHandler)(void*);
+			void*				fSdioHandlerData;
+			bool				fSdioTransfer;
+				// a command 53 now has this transfer mode:
+			uint16				fSdioTransferMode;
 };
 
 
@@ -315,6 +349,7 @@ class SoftwareReset {
 #define SDHCI_INT_CARD_INS			0x00000040	// card insertion enable
 #define SDHCI_INT_CARD_REM			0x00000080	// card removal enable
 #define SDHCI_INT_CARD_STATUS		0x00000100
+#define SDHCI_INT_CARD_INT			SDHCI_INT_CARD_STATUS	// SDIO, level
 #define SDHCI_INT_A					0x00000200
 #define SDHCI_INT_B					0x00000400
 #define SDHCI_INT_C					0x00000800
@@ -592,6 +627,11 @@ void set_scan_semaphore(void* controller, sem_id sem);
 void set_bus_width(void* controller, int width);
 void set_card_type(void* controller, card_type type);
 void terminate_bus(void* controller);
+status_t sdio_transfer(void* controller, uint32_t argument, bool write,
+	void* buffer, uint16_t blockSize, uint16_t blockCount, uint32_t* response);
+void set_sdio_interrupt_handler(void* controller, void (*handler)(void*),
+	void* data);
+void enable_sdio_interrupt(void* controller, bool enable);
 
 extern mmc_bus_interface gSDHCIACPIDeviceModule;
 extern mmc_bus_interface gSDHCIPCIDeviceModule;
