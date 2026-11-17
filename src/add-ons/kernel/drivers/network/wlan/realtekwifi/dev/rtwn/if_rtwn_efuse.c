@@ -229,6 +229,10 @@ rtwn_efuse_read_prepare(struct rtwn_softc *sc, uint8_t *rom, uint16_t size)
 	if (error != 0)
 		return (error);
 
+	/* Haiku: chip-specific eFuse access (see if_rtwnvar.h). */
+	if (sc->sc_efuse_read != NULL)
+		return (sc->sc_efuse_read(sc, rom, size));
+
 	error = rtwn_efuse_switch_power(sc);
 	if (error != 0)
 		goto fail;

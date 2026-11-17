@@ -299,6 +299,14 @@ struct rtwn_softc {
 			    const uint8_t[]);
 	void		(*sc_efuse_postread)(struct rtwn_softc *);
 	int		(*sc_efuse_preread)(struct rtwn_softc *);
+	/*
+	 * Haiku: optional (NULL for every FreeBSD chip). A chip whose eFuse
+	 * is not behind R92C_EFUSE_CTRL (the RTL8710B reads it through its
+	 * USB host indirect access) reads the logical map itself; the
+	 * generic eFuse power switching and reader are skipped.
+	 */
+	int		(*sc_efuse_read)(struct rtwn_softc *, uint8_t *,
+			    uint16_t);
 	void		(*sc_parse_rom)(struct rtwn_softc *, uint8_t *);
 	void		(*sc_set_led)(struct rtwn_softc *, int, int);
 	int		(*sc_power_on)(struct rtwn_softc *);

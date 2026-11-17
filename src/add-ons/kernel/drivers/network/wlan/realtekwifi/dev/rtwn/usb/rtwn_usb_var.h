@@ -78,6 +78,11 @@ struct rtwn_usb_softc {
 
 	int			ntx;
 	int			tx_agg_desc_num;
+	/*
+	 * Haiku: the RTL8710B takes the one's complement of the usual
+	 * TX descriptor checksum (0 for every FreeBSD chip).
+	 */
+	int			tx_csum_invert;
 
 	uint8_t			wme2qid[4];
 };
