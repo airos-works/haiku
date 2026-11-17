@@ -38,7 +38,7 @@
  * the driver's vc4_bo. Differences: the render tiles must lie within the
  * frame (and with a binner list, within its tiles: Linux lets the maximum
  * reach one past them), and a full resolution surface must hold the last
- * tile whole.
+ * tile whole, and 4x multisampling must come with 4x decimation.
  */
 
 #include "vc4_packet.h"
@@ -573,6 +573,15 @@ vc4_rcl_render_config_surface_setup(vc4_exec_info *exec,
 			   VC4_RENDER_CONFIG_DECIMATE_MODE_4X)) {
 		DRM_DEBUG("Unknown bits in render config: 0x%04x\n",
 			  surf->bits);
+		return B_BAD_VALUE;
+	}
+
+	/* air/OS: with 4x multisampling the colour store must decimate, or it
+	 * would write four times what the surface's size was checked for
+	 * (Mesa always sets both). */
+	if ((surf->bits & VC4_RENDER_CONFIG_MS_MODE_4X) &&
+	    !(surf->bits & VC4_RENDER_CONFIG_DECIMATE_MODE_4X)) {
+		DRM_DEBUG("4x multisampling without 4x decimation\n");
 		return B_BAD_VALUE;
 	}
 

@@ -136,8 +136,19 @@ Stricter than Linux (Mesa never does what these refuse):
   otherwise; with a binner CL also within its tiles: Linux lets the maximum
   be one past them), frames are at most 4096 square;
 - a full resolution surface must hold its last tile whole;
+- the binning config's tile state and first list blocks must fit its 512 KB
+  slot (Linux lets 255x255 tiles write megabytes past it; Mesa's largest,
+  2048x2048 with 4x MSAA, takes 320 KB);
+- a cube map's face offsets must not wrap around 32 bits;
+- 4x multisampling only with 4x decimation of the colour store;
+- a shader's program end must have its two delay slots within the code
+  (Linux runs them from past the end of what it checked, when the end is in
+  the last two instructions of a page);
 - the overflow memory given to the binner is its 512 KB slot (Linux writes
-  the whole bin buffer's size to `BPOS`).
+  the whole bin buffer's size to `BPOS`), and submissions leave 4 slots for
+  the running job's overflow;
+- a packet handler's error is passed on (an interrupted wait for a bin slot
+  is repeated by Mesa instead of dropping the job).
 
 ### Requests
 

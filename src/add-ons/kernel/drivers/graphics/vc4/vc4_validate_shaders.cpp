@@ -42,7 +42,8 @@
  *
  * air/OS: Linux' drivers/gpu/drm/vc4/vc4_validate_shaders.c (rpi-6.6.y) in
  * C++. The shader is validated in the kernel's copy of the caller's code,
- * which is then what goes into the shader BO.
+ * which is then what goes into the shader BO; a program end must have its
+ * two delay slots within the code.
  */
 
 #include <stdlib.h>
@@ -676,7 +677,15 @@ vc4_validate_branches(vc4_shader_validation_state *validation_state)
 			 * finished.  validation_state->max_ip is the
 			 * instruction after the last valid instruction in the
 			 * program.
+			 *
+			 * air/OS: the delay slots must be inside the code
+			 * (Linux lets max_ip grow past the end of the BO).
 			 */
+			if (ip + 3 > validation_state->max_ip) {
+				DRM_DEBUG("program end at %d without its delay "
+					  "slots\n", ip);
+				return false;
+			}
 			validation_state->max_ip = ip + 3;
 			continue;
 		}

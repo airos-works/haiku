@@ -116,6 +116,8 @@
 #define VC4_BIN_SLOT_SIZE		(512 * 1024)
 #define VC4_BIN_SLOTS			(VC4_BIN_SIZE / VC4_BIN_SLOT_SIZE)
 #define VC4_BIN_BOUNDARY		0x10000000u
+// Slots a submission may not take: the running job's overflow memory
+#define VC4_BIN_RESERVED_SLOTS	4
 
 #define VC4_DEFAULT_POOL_MB		64
 #define VC4_MIN_POOL_MB			8
@@ -196,6 +198,7 @@ struct vc4_info {
 	int64			interrupts;
 	bool			polling;
 		// the interrupts do not arrive: the job thread looks for itself
+	uint32			missedInterrupts;
 	uint32			resets;
 
 	bool			hangStateValid;
@@ -608,13 +611,15 @@ unmap_bo(vc4_bo* bo)
 //	#pragma mark - binner memory
 
 
-/*!	A free slot, or -1. Device locked. */
+/*!	A free slot, or -1 when no more than \a reserve are left. Device
+	locked.
+*/
 static int
-take_bin_slot(vc4_info* info)
+take_bin_slot(vc4_info* info, uint32 reserve = 0)
 {
 	uint32 freeSlots = ~info->binSlotsUsed
 		& (uint32)(((uint64)1 << VC4_BIN_SLOTS) - 1);
-	if (freeSlots == 0)
+	if ((uint32)__builtin_popcount(freeSlots) <= reserve)
 		return -1;
 	int slot = __builtin_ffs(freeSlots) - 1;
 	info->binSlotsUsed |= BIT(slot);
@@ -628,14 +633,16 @@ static status_t wait_for_job(vc4_info* info, uint64 seqno,
 
 /*!	A slot for a job's tile state and lists (Linux: vc4_v3d_get_bin_slot()):
 	waits for the jobs queued so far, whose slots are given back when they
-	are done, while there is none.
+	are done, while there is none. A few slots stay for the overflow
+	memory of the job that runs: without it the binner stalls and the job
+	is given up.
 */
 int
 vc4_get_bin_slot(vc4_info* info)
 {
 	while (true) {
 		MutexLocker locker(info->lock);
-		int slot = take_bin_slot(info);
+		int slot = take_bin_slot(info, VC4_BIN_RESERVED_SLOTS);
 		if (slot >= 0)
 			return slot;
 		uint64 seqno = info->submitted;
@@ -783,14 +790,19 @@ wait_for_list(vc4_info* info, vc4_exec_info* job, uint32 thread,
 	uint32 doneEvent, uint32 startCount)
 {
 	const uint32 counter = thread == 0 ? V3D_BFC : V3D_RFC;
+	// only the binner asks for memory; a request that came after its
+	// flush is not the renderer's
+	const uint32 outOfMemory = thread == 0 ? V3D_INT_OUTOMEM : 0;
 	uint32 lastAddress = read32(info, V3D_CTNCA(thread));
 	bigtime_t lastProgress = system_time();
 
 	while (true) {
-		uint32 events = wait_for_event(info, doneEvent | V3D_INT_OUTOMEM,
+		uint32 events = wait_for_event(info, doneEvent | outOfMemory,
 			info->polling ? VC4_POLL_INTERVAL : VC4_CHECK_INTERVAL);
-		if ((events & doneEvent) != 0)
+		if ((events & doneEvent) != 0) {
+			info->missedInterrupts = 0;
 			return B_OK;
+		}
 		if ((events & V3D_INT_OUTOMEM) != 0) {
 			TRACE("job %" B_PRIu64 ": binner out of memory\n", job->seqno);
 			// without memory the binner stalls, and the check below ends it
@@ -800,8 +812,12 @@ wait_for_list(vc4_info* info, vc4_exec_info* job, uint32 thread,
 
 		if ((read32(info, counter) & 0xff) != startCount) {
 			// the interrupt may just have come
+			// A late interrupt can look the same once; three lists in a
+			// row cannot.
 			if ((atomic_and(&info->events, ~(int32)doneEvent) & doneEvent)
-					== 0 && !info->polling) {
+					!= 0) {
+				info->missedInterrupts = 0;
+			} else if (!info->polling && ++info->missedInterrupts >= 3) {
 				ERROR("job %" B_PRIu64 " finished without its interrupt "
 					"(%" B_PRId64 " so far): polling the core from now on\n",
 					job->seqno, atomic_get64(&info->interrupts));

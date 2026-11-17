@@ -45,9 +45,14 @@
  * air/OS: Linux' drivers/gpu/drm/vc4/vc4_validate.c (rpi-6.6.y) in C++ on
  * the driver's vc4_bo. Differences: a shader record's handles must be
  * below the BO count (Linux accepts the count itself), a shader BO's
- * validation state is checked before it is used, and the uniforms the
- * shader records consume are counted against the submitted uniform data.
+ * validation state is checked before it is used, the uniforms the
+ * shader records consume are counted against the submitted uniform data,
+ * the tile state and lists of the binning config must fit its bin slot, a
+ * cube map's face offsets must not wrap, and a packet handler's error is
+ * passed on as it is.
  */
+
+#include <limits.h>
 
 #include <algorithm>
 
@@ -380,6 +385,17 @@ validate_tile_binning_config(VALIDATE_ARGS)
 		return B_BAD_VALUE;
 	}
 
+	/* air/OS: the tile state (48 bytes a tile) and the first 32 byte block
+	 * of each tile's list must fit the slot (Linux does not check: 255x255
+	 * tiles would have the binner write megabytes past it). Mesa's largest
+	 * frame, 2048x2048 in 32x32 tiles, takes 320 KB of the 512. */
+	if (ROUNDUP(48 * tile_count, 4096u) + 32 * tile_count
+	    > vc4_bin_alloc_size(exec->dev)) {
+		DRM_DEBUG("Tile binning config of %dx%d too large\n",
+			  exec->bin_tiles_x, exec->bin_tiles_y);
+		return B_BAD_VALUE;
+	}
+
 	bin_slot = vc4_get_bin_slot(exec->dev);
 	if (bin_slot < 0) {
 		if (bin_slot != B_INTERRUPTED) {
@@ -522,12 +538,14 @@ vc4_validate_bin_cl(uint8_t* validated, uint8_t* unvalidated,
 		if (cmd != VC4_PACKET_GEM_HANDLES)
 			memcpy(dst_pkt, src_pkt, info->len);
 
-		if (info->func && info->func(exec,
-					     dst_pkt + 1,
-					     src_pkt + 1)) {
+		int ret = info->func ? info->func(exec, dst_pkt + 1,
+						  src_pkt + 1) : 0;
+		if (ret) {
 			DRM_DEBUG("0x%08x: packet %d (%s) failed to validate\n",
 				  src_offset, cmd, info->name);
-			return B_BAD_VALUE;
+			/* air/OS: the handler's error, an interrupted wait for
+			 * a bin slot included (Linux: -EINVAL) */
+			return ret;
 		}
 
 		src_offset += info->len;
@@ -679,6 +697,12 @@ reloc_tex(vc4_exec_info* exec,
 			tiling_format = VC4_TILING_FORMAT_LT;
 		else
 			tiling_format = VC4_TILING_FORMAT_T;
+	}
+
+	/* air/OS: the faces' offsets in 32 bits (Linux lets them wrap) */
+	if ((uint64_t)offset + (uint64_t)cube_map_stride * 5 > UINT32_MAX) {
+		DRM_DEBUG("Cube map stride 0x%08x too large\n", cube_map_stride);
+		goto fail;
 	}
 
 	if (!vc4_check_tex_size(exec, tex, offset + cube_map_stride * 5,

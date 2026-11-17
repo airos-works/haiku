@@ -120,6 +120,32 @@ int main() {
 	vc4_validated_shader_info* vs = vc4_validate_shader(unif, sizeof(unif));
 	CHECK(vs != NULL && vs->uniforms_size == 4 && vs->uniforms_src_size == 4);
 
+	// a program end without its delay slots inside the code
+	uint64 cut[2] = {qpu_nop(QPU_SIG_NONE), qpu_nop(QPU_SIG_PROG_END)};
+	CHECK(vc4_validate_shader(cut, sizeof(cut)) == NULL);
+
+	// a binning config whose tile state would not fit its slot
+	init_args(args);
+	args.color_write.hindex = 0;
+	args.color_write.bits = VC4_SET_FIELD(VC4_RENDER_CONFIG_FORMAT_RGBA8888, VC4_RENDER_CONFIG_FORMAT);
+	args.width = 128; args.height = 96; args.max_x_tile = 1; args.max_y_tile = 1;
+	uint8 huge[16 + 3] = {};
+	huge[0] = VC4_PACKET_TILE_BINNING_MODE_CONFIG; huge[13] = 255; huge[14] = 255;
+	huge[16] = VC4_PACKET_START_TILE_BINNING; huge[17] = VC4_PACKET_INCREMENT_SEMAPHORE; huge[18] = VC4_PACKET_FLUSH;
+	args.bin_cl = (uint64)(uintptr_t)huge; args.bin_cl_size = sizeof(huge);
+	CHECK(run_job(args, bos, 1, exec) == B_BAD_VALUE);
+	// Mesa's largest: 2048x2048 with 4x MSAA, 64x64 tiles of 32x32
+	huge[13] = 64; huge[14] = 64;
+	CHECK(run_job(args, bos, 1, exec) == 0);
+	args.bin_cl_size = 0;
+
+	// 4x multisampling without 4x decimation
+	args.color_write.bits |= VC4_RENDER_CONFIG_MS_MODE_4X;
+	CHECK(run_job(args, bos, 1, exec) == B_BAD_VALUE);
+	args.color_write.bits |= VC4_RENDER_CONFIG_DECIMATE_MODE_4X;
+	args.max_x_tile = 3; args.max_y_tile = 2;
+	CHECK(run_job(args, bos, 1, exec) == 0);
+
 	// 5. a draw: shader state with one attribute, 3 vertices
 	vc4_bo* fsbo = make_bo(4096); fsbo->validated_shader = fs;
 	vc4_bo* vsbo = make_bo(4096); vsbo->validated_shader = vs;
