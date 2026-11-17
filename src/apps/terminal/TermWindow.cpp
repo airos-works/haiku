@@ -17,6 +17,7 @@
 
 #include "TermWindow.h"
 
+#include <algorithm>
 #include <new>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,9 +25,11 @@
 #include <strings.h>
 #include <time.h>
 
+#include <map>
 #include <regex>
 
 #include <Alert.h>
+#include <Beep.h>
 #include <Application.h>
 #include <Catalog.h>
 #include <CharacterSet.h>
@@ -64,8 +67,8 @@
 #include "Arguments.h"
 #include "AppearPrefView.h"
 #include "Colors.h"
-#include "FindWindow.h"
 #include "Globals.h"
+#include "PaneView.h"
 #include "PrefWindow.h"
 #include "PrefHandler.h"
 #include "SetTitleDialog.h"
@@ -97,6 +100,18 @@ static const uint32 kEditWindowTitle = 'EWti';
 static const uint32 kTabTitleChanged = 'TTch';
 static const uint32 kWindowTitleChanged = 'WTch';
 static const uint32 kUpdateSwitchTerminalsMenuItem = 'Ustm';
+static const uint32 kSplitSideBySide = 'SPsb';
+static const uint32 kSplitTopAndBottom = 'SPtb';
+static const uint32 kClosePane = 'CPan';
+static const uint32 kNextPane = 'NPan';
+static const uint32 kPreviousPane = 'PPan';
+static const uint32 kSelectPane = 'SPan';
+static const uint32 kMaximizePane = 'MPan';
+static const uint32 kEqualizePanes = 'EPan';
+static const uint32 kFindNext = 'FNxt';
+static const uint32 kFindPrevious = 'FPrv';
+static const uint32 kFindSelection = 'FSel';
+static const uint32 kAlertOnNextMark = 'AoNm';
 
 using namespace BPrivate ; // BCharacterSet stuff
 
@@ -169,13 +184,21 @@ struct TermWindow::Session {
 	SessionID				id;
 	int32					index;
 	Title					title;
+	PaneView*				paneView;
 	TermViewContainerView*	containerView;
+		// the active pane
+	std::map<TermView*, BString> paneTitles;
+		// the titles programs gave their panes
+	bool					titleFromPane;
+		// the tab's title is a pane's, not one the user gave it
 
 	Session(SessionID id, int32 index, TermViewContainerView* containerView)
 		:
 		id(id),
 		index(index),
-		containerView(containerView)
+		paneView(NULL),
+		containerView(containerView),
+		titleFromPane(false)
 	{
 		title.title = B_TRANSLATE("Shell ");
 		title.title << index;
@@ -200,17 +223,15 @@ TermWindow::TermWindow(const Arguments& args)
 	fPrintSettings(NULL),
 	fPrefWindow(NULL),
 	fThemeWindow(NULL),
-	fFindPanel(NULL),
 	fSavedFrame(0, 0, -1, -1),
 	fSetWindowTitleDialog(NULL),
 	fSetTabTitleDialog(NULL),
-	fFindString(""),
-	fFindNextMenuItem(NULL),
-	fFindPreviousMenuItem(NULL),
-	fFindSelection(false),
-	fForwardSearch(false),
-	fMatchCase(false),
-	fMatchWord(false),
+	fIncreaseFontSizeMenuItem(NULL),
+	fDecreaseFontSizeMenuItem(NULL),
+	fCloseViewMenuItem(NULL),
+	fPanesMenu(NULL),
+	fMaximizePaneMenuItem(NULL),
+	fAlertOnNextMarkMenuItem(NULL),
 	fFullScreen(false)
 {
 	// register this terminal
@@ -282,11 +303,6 @@ TermWindow::~TermWindow()
 	if (fPrefWindow)
 		fPrefWindow->PostMessage(B_QUIT_REQUESTED);
 
-	if (fFindPanel && fFindPanel->Lock()) {
-		fFindPanel->Quit();
-		fFindPanel = NULL;
-	}
-
 	PrefHandler::DeleteDefault();
 
 	for (int32 i = 0; Session* session = _SessionAt(i); i++)
@@ -322,6 +338,15 @@ TermWindow::_InitWindow()
 	AddShortcut(B_LEFT_ARROW, B_COMMAND_KEY | B_SHIFT_KEY, new BMessage(MSG_MOVE_TAB_LEFT));
 	AddShortcut(B_RIGHT_ARROW, B_COMMAND_KEY | B_SHIFT_KEY, new BMessage(MSG_MOVE_TAB_RIGHT));
 
+	// panes, as in iTerm2: Command+Option+arrows
+	const int32 kPaneKeys[4] = { B_LEFT_ARROW, B_RIGHT_ARROW, B_UP_ARROW,
+		B_DOWN_ARROW };
+	for (int32 i = 0; i < 4; i++) {
+		BMessage* message = new BMessage(kSelectPane);
+		message->AddInt32("direction", i);
+		AddShortcut(kPaneKeys[i], B_COMMAND_KEY | B_OPTION_KEY, message);
+	}
+
 	BRect textFrame = Bounds();
 	textFrame.top = fMenuBar->Bounds().bottom + 1.0;
 
@@ -336,62 +361,66 @@ TermWindow::_InitWindow()
 
 
 bool
-TermWindow::_CanClose(int32 index)
+TermWindow::_CanClose(int32 index, TermView* onlyView)
 {
 	bool warnOnExit = PrefHandler::Default()->getBool(PREF_WARN_ON_EXIT);
 
 	if (!warnOnExit)
 		return true;
 
+	// the terminals that would go: one pane, a tab's, or all
+	std::vector<TermView*> views;
+	if (onlyView != NULL)
+		views.push_back(onlyView);
+	else if (index != -1)
+		_SessionTermViews(_SessionAt(index), views);
+	else
+		_AllTermViews(views);
+
 	uint32 busyProcessCount = 0;
 	BString busyProcessNames;
 		// all names, separated by "\n\t"
 
-	if (index != -1) {
+	for (size_t i = 0; i < views.size(); i++) {
 		ShellInfo shellInfo;
 		ActiveProcessInfo info;
-		TermView* termView = _TermViewAt(index);
+		TermView* termView = views[i];
 		if (termView->GetShellInfo(shellInfo)
 			&& termView->GetActiveProcessInfo(info)
 			&& (info.ID() != shellInfo.ProcessID()
 				|| !shellInfo.IsDefaultShell())) {
-			busyProcessCount++;
-			busyProcessNames = info.Name();
-		}
-	} else {
-		for (int32 i = 0; i < fSessions.CountItems(); i++) {
-			ShellInfo shellInfo;
-			ActiveProcessInfo info;
-			TermView* termView = _TermViewAt(i);
-			if (termView->GetShellInfo(shellInfo)
-				&& termView->GetActiveProcessInfo(info)
-				&& (info.ID() != shellInfo.ProcessID()
-					|| !shellInfo.IsDefaultShell())) {
-				if (++busyProcessCount > 1)
-					busyProcessNames << "\n\t";
-				busyProcessNames << info.Name();
-			}
+			if (++busyProcessCount > 1)
+				busyProcessNames << "\n\t";
+			busyProcessNames << info.Name();
 		}
 	}
 
 	if (busyProcessCount == 0)
 		return true;
 
+	bool closesWindow = index == -1
+		|| (onlyView == NULL && fSessions.CountItems() == 1);
 	BString alertMessage;
 	if (busyProcessCount == 1) {
 		// Only one pending process. Select the alert text depending on whether
 		// the terminal will be closed.
-		alertMessage = index == -1 || fSessions.CountItems() == 1
+		alertMessage = closesWindow
 			? B_TRANSLATE("The process \"%1\" is still running.\n"
 				"If you close %appname%, the process will be killed.")
-			: B_TRANSLATE("The process \"%1\" is still running.\n"
-				"If you close the tab, the process will be killed.");
+			: onlyView != NULL
+				? B_TRANSLATE("The process \"%1\" is still running.\n"
+					"If you close the pane, the process will be killed.")
+				: B_TRANSLATE("The process \"%1\" is still running.\n"
+					"If you close the tab, the process will be killed.");
 	} else {
 		// multiple pending processes
-		alertMessage = B_TRANSLATE(
-			"The following processes are still running:\n\n"
-			"\t%1\n\n"
-			"If you close %appname%, the processes will be killed.");
+		alertMessage = closesWindow
+			? B_TRANSLATE("The following processes are still running:\n\n"
+				"\t%1\n\n"
+				"If you close %appname%, the processes will be killed.")
+			: B_TRANSLATE("The following processes are still running:\n\n"
+				"\t%1\n\n"
+				"If you close the tab, the processes will be killed.");
 	}
 	alertMessage.ReplaceFirst("%appname%", B_TRANSLATE_SYSTEM_NAME("Terminal"));
 	alertMessage.ReplaceFirst("%1", busyProcessNames);
@@ -444,6 +473,19 @@ TermWindow::MenusBeginning()
 
 	fDecreaseFontSizeMenuItem->SetEnabled(size > kMinimumFontSize);
 	fIncreaseFontSizeMenuItem->SetEnabled(size < kMaximumFontSize);
+
+	// panes
+	Session* session = _SessionAt(fTabView->Selection());
+	int32 paneCount = session != NULL && session->paneView != NULL
+		? session->paneView->CountPanes() : 1;
+	fCloseViewMenuItem->SetLabel(paneCount > 1
+		? B_TRANSLATE("Close active pane") : B_TRANSLATE("Close active tab"));
+	for (int32 i = 0; BMenuItem* item = fPanesMenu->ItemAt(i); i++)
+		item->SetEnabled(paneCount > 1);
+	fMaximizePaneMenuItem->SetMarked(session != NULL
+		&& session->paneView != NULL
+		&& session->paneView->Maximized() != NULL);
+	fAlertOnNextMarkMenuItem->SetMarked(view->AlertOnNextMark());
 
 	BWindow::MenusBeginning();
 }
@@ -515,6 +557,23 @@ TermWindow::_SetupMenu()
 				.GetItem(fSwitchTerminalsMenuItem)
 			.AddItem(newTerminal, MENU_NEW_TERM, 'N')
 			.AddItem(B_TRANSLATE("New tab"), kNewTab, 'T')
+			.AddItem(B_TRANSLATE("Split vertically"), kSplitSideBySide, 'D')
+			.AddItem(B_TRANSLATE("Split horizontally"), kSplitTopAndBottom,
+				'D', B_SHIFT_KEY)
+			.AddMenu(B_TRANSLATE("Panes"))
+				.GetMenu(fPanesMenu)
+				.AddItem(B_TRANSLATE("Select next pane"), kNextPane, ']')
+				.AddItem(B_TRANSLATE("Select previous pane"), kPreviousPane,
+					'[')
+				.AddSeparator()
+				.AddItem(B_TRANSLATE("Maximize active pane"), kMaximizePane,
+					B_ENTER, B_SHIFT_KEY)
+					.GetItem(fMaximizePaneMenuItem)
+				.AddItem(B_TRANSLATE("Make panes the same size"),
+					kEqualizePanes)
+				.AddSeparator()
+				.AddItem(B_TRANSLATE("Close active pane"), kClosePane)
+			.End()
 			.AddSeparator()
 			.AddItem(B_TRANSLATE("Page setup" B_UTF8_ELLIPSIS), MENU_PAGE_SETUP)
 			.AddItem(B_TRANSLATE("Print"), MENU_PRINT, 'P')
@@ -522,6 +581,7 @@ TermWindow::_SetupMenu()
 			.AddItem(B_TRANSLATE("Close window"), B_QUIT_REQUESTED, 'W',
 				B_SHIFT_KEY)
 			.AddItem(B_TRANSLATE("Close active tab"), kCloseView, 'W')
+				.GetItem(fCloseViewMenuItem)
 			.AddItem(B_TRANSLATE("Quit"), B_QUIT_REQUESTED, 'Q')
 		.End()
 
@@ -534,13 +594,15 @@ TermWindow::_SetupMenu()
 			.AddItem(B_TRANSLATE("Clear all"), MENU_CLEAR_ALL, 'L')
 			.AddSeparator()
 			.AddItem(B_TRANSLATE("Find" B_UTF8_ELLIPSIS), MENU_FIND_STRING, 'F')
-			.AddItem(B_TRANSLATE("Find previous"), MENU_FIND_PREVIOUS, 'G',
-					B_SHIFT_KEY)
-				.GetItem(fFindPreviousMenuItem)
-				.SetEnabled(false)
-			.AddItem(B_TRANSLATE("Find next"), MENU_FIND_NEXT, 'G')
-				.GetItem(fFindNextMenuItem)
-				.SetEnabled(false)
+			.AddItem(B_TRANSLATE("Find next"), kFindNext, 'G')
+			.AddItem(B_TRANSLATE("Find previous"), kFindPrevious, 'G',
+				B_SHIFT_KEY)
+			.AddItem(B_TRANSLATE("Use selection for find"), kFindSelection,
+				'E')
+			.AddSeparator()
+			.AddItem(B_TRANSLATE("Alert on next mark"), kAlertOnNextMark,
+				'A', B_SHIFT_KEY)
+				.GetItem(fAlertOnNextMarkMenuItem)
 		.End()
 
 		// Settings
@@ -714,7 +776,6 @@ void
 TermWindow::MessageReceived(BMessage *message)
 {
 	int32 encodingId;
-	bool findresult;
 
 	if (message->WasDropped())
 		_SetTermColors();
@@ -805,82 +866,91 @@ TermWindow::MessageReceived(BMessage *message)
 			break;
 
 		case MENU_FIND_STRING:
-			if (fFindPanel == NULL) {
-				fFindPanel = new FindWindow(this, fFindString, fFindSelection,
-					fMatchWord, fMatchCase, fForwardSearch);
-
-				fFindPanel->CenterIn(Frame());
-				_MoveWindowInScreen(fFindPanel);
-				fFindPanel->Show();
-			} else
-				fFindPanel->Activate();
+			_ActiveTermView()->ShowFindBar();
 			break;
 
-		case MSG_FIND:
+		case kFindNext:
+		case kFindPrevious:
+		case MENU_FIND_NEXT:
+		case MENU_FIND_PREVIOUS:
+			// "next" goes up, to older text, as Terminal always did
+			_ActiveTermView()->FindAgain(message->what == kFindNext
+				|| message->what == MENU_FIND_NEXT);
+			break;
+
+		case kFindSelection:
 		{
-			fFindPanel->PostMessage(B_QUIT_REQUESTED);
-			message->FindBool("findselection", &fFindSelection);
-			if (!fFindSelection)
-				message->FindString("findstring", &fFindString);
+			BString selection;
+			_ActiveTermView()->GetSelection(selection);
+			int32 lineEnd = selection.FindFirst('\n');
+			if (lineEnd >= 0)
+				selection.Truncate(lineEnd);
+			if (selection.IsEmpty())
+				beep();
 			else
-				_ActiveTermView()->GetSelection(fFindString);
-
-			if (fFindString.Length() == 0) {
-				const char* errorMsg = !fFindSelection
-					? B_TRANSLATE("No search string was entered.")
-					: B_TRANSLATE("Nothing is selected.");
-				BAlert* alert = new BAlert(B_TRANSLATE("Find failed"),
-					errorMsg, B_TRANSLATE("OK"), NULL, NULL,
-					B_WIDTH_AS_USUAL, B_WARNING_ALERT);
-				alert->SetFlags(alert->Flags() | B_CLOSE_ON_ESCAPE);
-
-				alert->Go();
-				fFindPreviousMenuItem->SetEnabled(false);
-				fFindNextMenuItem->SetEnabled(false);
-				break;
-			}
-
-			message->FindBool("forwardsearch", &fForwardSearch);
-			message->FindBool("matchcase", &fMatchCase);
-			message->FindBool("matchword", &fMatchWord);
-			findresult = _ActiveTermView()->Find(fFindString, fForwardSearch,
-				fMatchCase, fMatchWord);
-
-			if (!findresult) {
-				BAlert* alert = new BAlert(B_TRANSLATE("Find failed"),
-					B_TRANSLATE("Text not found."),
-					B_TRANSLATE("OK"), NULL, NULL,
-					B_WIDTH_AS_USUAL, B_WARNING_ALERT);
-				alert->SetFlags(alert->Flags() | B_CLOSE_ON_ESCAPE);
-				alert->Go();
-				fFindPreviousMenuItem->SetEnabled(false);
-				fFindNextMenuItem->SetEnabled(false);
-				break;
-			}
-
-			// Enable the menu items Find Next and Find Previous
-			fFindPreviousMenuItem->SetEnabled(true);
-			fFindNextMenuItem->SetEnabled(true);
+				_ActiveTermView()->ShowFindBar(selection);
 			break;
 		}
 
-		case MENU_FIND_NEXT:
-		case MENU_FIND_PREVIOUS:
-			findresult = _ActiveTermView()->Find(fFindString,
-				(message->what == MENU_FIND_NEXT) == fForwardSearch,
-				fMatchCase, fMatchWord);
-			if (!findresult) {
-				BAlert* alert = new BAlert(B_TRANSLATE("Find failed"),
-					B_TRANSLATE("Not found."), B_TRANSLATE("OK"),
-					NULL, NULL, B_WIDTH_AS_USUAL, B_WARNING_ALERT);
-				alert->SetFlags(alert->Flags() | B_CLOSE_ON_ESCAPE);
-				alert->Go();
-			}
+		case kAlertOnNextMark:
+		{
+			TermView* view = _ActiveTermView();
+			view->SetAlertOnNextMark(!view->AlertOnNextMark());
+			break;
+		}
+
+		case kSplitSideBySide:
+		case kSplitTopAndBottom:
+			_SplitPane(message->what == kSplitSideBySide);
 			break;
 
-		case MSG_FIND_CLOSED:
-			fFindPanel = NULL;
+		case kClosePane:
+		{
+			Session* session = _SessionAt(fTabView->Selection());
+			if (session != NULL)
+				_RemovePane(session, session->containerView->GetTermView());
 			break;
+		}
+
+		case kNextPane:
+		case kPreviousPane:
+			_CyclePane(message->what == kNextPane);
+			break;
+
+		case kSelectPane:
+			_NavigatePane(message->GetInt32("direction", 0));
+			break;
+
+		case kMaximizePane:
+		{
+			Session* session = _SessionAt(fTabView->Selection());
+			if (session == NULL || session->paneView->CountPanes() < 2)
+				break;
+			BView* pane = session->containerView->Parent();
+			session->paneView->SetMaximized(
+				session->paneView->Maximized() == pane ? NULL : pane);
+			_UpdateDimming(session);
+			break;
+		}
+
+		case kEqualizePanes:
+		{
+			Session* session = _SessionAt(fTabView->Selection());
+			if (session != NULL)
+				session->paneView->Equalize();
+			break;
+		}
+
+		case MSG_TERM_VIEW_EVENTS:
+		{
+			// what a terminal in a hidden tab reported
+			TermView* view;
+			if (message->FindPointer("view", (void**)&view) == B_OK
+				&& _SessionForTermView(view) != NULL) {
+				view->HandleDetachedEvents();
+			}
+			break;
+		}
 
 		case MENU_ENCODING:
 			if (message->FindInt32("op", &encodingId) == B_OK)
@@ -896,6 +966,9 @@ TermWindow::MessageReceived(BMessage *message)
 			}
 
 			for (int32 i = 0; i < fTabView->CountTabs(); i++) {
+				// split tabs keep their panes' sizes
+				if (_SessionAt(i)->paneView->CountPanes() > 1)
+					continue;
 				TermView* view = _TermViewAt(i);
 				view->SetTermSize(rows, columns, true);
 				_ResizeView(view);
@@ -908,10 +981,10 @@ TermWindow::MessageReceived(BMessage *message)
 			bool blinkingCursor
 				= PrefHandler::Default()->getBool(PREF_BLINK_CURSOR);
 
-			for (int32 i = 0; i < fTabView->CountTabs(); i++) {
-				TermView* view = _TermViewAt(i);
-				view->SwitchCursorBlinking(blinkingCursor);
-			}
+			std::vector<TermView*> views;
+			_AllTermViews(views);
+			for (size_t i = 0; i < views.size(); i++)
+				views[i]->SwitchCursorBlinking(blinkingCursor);
 			break;
 		}
 
@@ -921,11 +994,7 @@ TermWindow::MessageReceived(BMessage *message)
 		{
 			BFont font;
 			_GetPreferredFont(font);
-			for (int32 i = 0; i < fTabView->CountTabs(); i++) {
-				TermView* view = _TermViewAt(i);
-				view->SetTermFont(&font);
-				_ResizeView(view);
-			}
+			_ApplyFont(font);
 			break;
 		}
 
@@ -952,11 +1021,7 @@ TermWindow::MessageReceived(BMessage *message)
 			font.SetSize(atoi(size));
 			PrefHandler::Default()->setInt32(PREF_HALF_FONT_SIZE,
 				(int32)atoi(size));
-			for (int32 i = 0; i < fTabView->CountTabs(); i++) {
-				TermView* view = _TermViewAt(i);
-				_TermViewAt(i)->SetTermFont(&font);
-				_ResizeView(view);
-			}
+			_ApplyFont(font);
 			break;
 		}
 
@@ -965,10 +1030,10 @@ TermWindow::MessageReceived(BMessage *message)
 			bool useOptionAsMetaKey
 				= PrefHandler::Default()->getBool(PREF_USE_OPTION_AS_META);
 
-			for (int32 i = 0; i < fTabView->CountTabs(); i++) {
-				TermView* view = _TermViewAt(i);
-				view->SetUseOptionAsMetaKey(useOptionAsMetaKey);
-			}
+			std::vector<TermView*> views;
+			_AllTermViews(views);
+			for (size_t i = 0; i < views.size(); i++)
+				views[i]->SetUseOptionAsMetaKey(useOptionAsMetaKey);
 			break;
 		}
 
@@ -979,9 +1044,9 @@ TermWindow::MessageReceived(BMessage *message)
 				fSavedFrame = Frame();
 				BScreen screen(this);
 
-				for (int32 i = fTabView->CountTabs() - 1; i >= 0; i--)
-					_TermViewAt(i)->ScrollBar()->ResizeBy(0,
-						(be_control_look->GetScrollBarWidth(B_VERTICAL) - 1));
+				// no resize knob: the scroll bars reach the corner
+				for (int32 i = fSessions.CountItems() - 1; i >= 0; i--)
+					_SessionAt(i)->paneView->SetCornerInset(0);
 
 				fMenuBar->Hide();
 				fTabView->ResizeBy(0, mbHeight);
@@ -999,9 +1064,10 @@ TermWindow::MessageReceived(BMessage *message)
 				float mbHeight = fMenuBar->Bounds().Height() + 1;
 				fMenuBar->Show();
 
-				for (int32 i = fTabView->CountTabs() - 1; i >= 0; i--)
-					_TermViewAt(i)->ScrollBar()->ResizeBy(0,
-						-(be_control_look->GetScrollBarWidth(B_VERTICAL) - 1));
+				for (int32 i = fSessions.CountItems() - 1; i >= 0; i--) {
+					_SessionAt(i)->paneView->SetCornerInset(
+						be_control_look->GetScrollBarWidth(B_VERTICAL) - 1);
+				}
 
 				ResizeTo(fSavedFrame.Width(), fSavedFrame.Height());
 				MoveTo(fSavedFrame.left, fSavedFrame.top);
@@ -1057,18 +1123,16 @@ TermWindow::MessageReceived(BMessage *message)
 				|| message->FindInt32("actions", &actions) != B_OK) {
 				break;
 			}
-			for (int32 i = 0; i < fSessions.CountItems(); i++) {
-				TermView* termView = _TermViewAt(i);
+			std::vector<TermView*> views;
+			_AllTermViews(views);
+			for (size_t i = 0; i < views.size(); i++) {
+				TermView* termView = views[i];
 				BString key;
 				key.SetToFormat("%p", termView);
 				if (key != view)
 					continue;
-				if ((actions & 1) != 0) {
-					if (IsMinimized())
-						Minimize(false);
-					Activate();
-					fTabView->Select(i);
-				}
+				if ((actions & 1) != 0)
+					ShowTermView(termView);
 				if ((actions & 2) != 0) {
 					termView->NotificationActivated(identifier,
 						message->GetInt32("button", 0));
@@ -1086,12 +1150,13 @@ TermWindow::MessageReceived(BMessage *message)
 				|| message->FindString("id", &identifier) != B_OK) {
 				break;
 			}
-			for (int32 i = 0; i < fSessions.CountItems(); i++) {
-				TermView* termView = _TermViewAt(i);
+			std::vector<TermView*> views;
+			_AllTermViews(views);
+			for (size_t i = 0; i < views.size(); i++) {
 				BString key;
-				key.SetToFormat("%p", termView);
+				key.SetToFormat("%p", views[i]);
 				if (key == view) {
-					termView->NotificationClosed(identifier);
+					views[i]->NotificationClosed(identifier);
 					break;
 				}
 			}
@@ -1123,6 +1188,7 @@ TermWindow::MessageReceived(BMessage *message)
 					session->title.pattern.Truncate(0);
 					session->title.patternUserDefined = false;
 				}
+				session->titleFromPane = false;
 				_UpdateSessionTitle(_IndexOfSession(session));
 			}
 			break;
@@ -1163,17 +1229,26 @@ TermWindow::MessageReceived(BMessage *message)
 
 		case kCloseView:
 		{
-			int32 index = -1;
+			// a pane whose shell quit, the menu (the active pane of a
+			// split tab, or the tab), or a tab's menu
 			SessionID sessionID(*message, "session");
-			if (sessionID.IsValid()) {
-				if (Session* session = _SessionForID(sessionID))
-					index = _IndexOfSession(session);
-			} else
-				index = _IndexOfTermView(_ActiveTermView());
-
-			if (index >= 0)
-				_RemoveTab(index);
-
+			Session* session = sessionID.IsValid()
+				? _SessionForID(sessionID) : _SessionAt(fTabView->Selection());
+			if (session == NULL)
+				break;
+			TermView* view = NULL;
+			if (message->FindPointer("view", (void**)&view) != B_OK
+				&& !sessionID.IsValid()) {
+				view = session->containerView->GetTermView();
+			}
+			if (view != NULL && session->paneView->CountPanes() > 1) {
+				std::vector<TermView*> views;
+				_SessionTermViews(session, views);
+				if (std::find(views.begin(), views.end(), view) != views.end())
+					_RemovePane(session, view, !message->HasInt32("reason"));
+				break;
+			}
+			_RemoveTab(_IndexOfSession(session));
 			break;
 		}
 
@@ -1261,13 +1336,15 @@ TermWindow::WindowActivated(bool activated)
 void
 TermWindow::_SetTermColors()
 {
-	for (int32 index = fTabView->CountTabs() - 1; index >= 0; index--) {
-		TermViewContainerView* container = _TermViewContainerViewAt(index);
+	std::vector<TermView*> views;
+	_AllTermViews(views);
+	for (size_t i = 0; i < views.size(); i++) {
+		TermViewContainerView* container
+			= (TermViewContainerView*)views[i]->Parent();
 		_SetTermColors(container);
 		container->Invalidate();
+		views[i]->Invalidate();
 	}
-
-	_ActiveTermView()->Invalidate();
 }
 
 
@@ -1382,8 +1459,12 @@ TermWindow::_NewTab()
 }
 
 
-void
-TermWindow::_AddTab(const Arguments* args, const BString& currentDirectory)
+/*!	A terminal for a pane: its view, the container that gives it a margin,
+	and the scroll view around them (the pane).
+*/
+TermViewContainerView*
+TermWindow::_CreatePane(const Arguments* args, const BString& currentDirectory,
+	bool firstSession, BScrollView*& _scrollView)
 {
 	int argc = 0;
 	const char* const* argv = NULL;
@@ -1391,33 +1472,58 @@ TermWindow::_AddTab(const Arguments* args, const BString& currentDirectory)
 		args->GetShellArguments(argc, argv);
 	ShellParameters shellParameters(argc, argv, currentDirectory);
 
-	try {
-		TermView* view = new TermView(
-			PrefHandler::Default()->getInt32(PREF_ROWS),
-			PrefHandler::Default()->getInt32(PREF_COLS),
-			shellParameters,
-			PrefHandler::Default()->getInt32(PREF_HISTORY_SIZE));
-		view->SetListener(this);
+	TermView* view = new TermView(
+		PrefHandler::Default()->getInt32(PREF_ROWS),
+		PrefHandler::Default()->getInt32(PREF_COLS),
+		shellParameters,
+		PrefHandler::Default()->getInt32(PREF_HISTORY_SIZE));
+	view->SetListener(this);
 
+	TermViewContainerView* containerView = new TermViewContainerView(view);
+	_scrollView = new TermScrollView("scrollView", containerView, view,
+		firstSession);
+
+	BFont font;
+	_GetPreferredFont(font);
+	view->SetTermFont(&font);
+
+	view->SetMouseClipboard(gMouseClipboard);
+
+	const BCharacterSet* charset
+		= BCharacterSetRoster::FindCharacterSetByName(
+			PrefHandler::Default()->getString(PREF_TEXT_ENCODING));
+	if (charset != NULL)
+		view->SetEncoding(charset->GetConversionID());
+
+	view->SetKeymap(fKeymap, fKeymapChars);
+	view->SetUseOptionAsMetaKey(
+		PrefHandler::Default()->getBool(PREF_USE_OPTION_AS_META));
+
+	_SetTermColors(containerView);
+	return containerView;
+}
+
+
+void
+TermWindow::_AddTab(const Arguments* args, const BString& currentDirectory)
+{
+	try {
 		bool firstSession = fSessions.IsEmpty();
 
-		TermViewContainerView* containerView = new TermViewContainerView(view);
-		BScrollView* scrollView = new TermScrollView("scrollView",
-			containerView, view, firstSession);
-		if (!fFullScreen)
-			scrollView->ScrollBar(B_VERTICAL)
-				->ResizeBy(0, -(be_control_look->GetScrollBarWidth(B_VERTICAL) - 1));
+		BScrollView* scrollView;
+		TermViewContainerView* containerView = _CreatePane(args,
+			currentDirectory, firstSession, scrollView);
+		TermView* view = containerView->GetTermView();
 
 		if (firstSession)
 			fTabView->SetScrollView(scrollView);
 
 		Session* session = new Session(_NewSessionID(), _NewSessionIndex(),
 			containerView);
+		session->paneView = new PaneView(scrollView);
+		session->paneView->SetCornerInset(fFullScreen ? 0
+			: be_control_look->GetScrollBarWidth(B_VERTICAL) - 1);
 		fSessions.AddItem(session);
-
-		BFont font;
-		_GetPreferredFont(font);
-		view->SetTermFont(&font);
 
 		float width, height;
 		view->GetFontSize(&width, &height);
@@ -1448,24 +1554,11 @@ TermWindow::_AddTab(const Arguments* args, const BString& currentDirectory)
 		}
 
 		BTab* tab = new BTab;
-		fTabView->AddTab(scrollView, tab);
+		fTabView->AddTab(session->paneView, tab);
 		view->SetScrollBar(scrollView->ScrollBar(B_VERTICAL));
-		view->SetMouseClipboard(gMouseClipboard);
 		// Only sync clipboard for the initial tab.
 		if (firstSession)
 			view->SyncClipboard();
-
-		const BCharacterSet* charset
-			= BCharacterSetRoster::FindCharacterSetByName(
-				PrefHandler::Default()->getString(PREF_TEXT_ENCODING));
-		if (charset != NULL)
-			view->SetEncoding(charset->GetConversionID());
-
-		view->SetKeymap(fKeymap, fKeymapChars);
-		view->SetUseOptionAsMetaKey(
-			PrefHandler::Default()->getBool(PREF_USE_OPTION_AS_META));
-
-		_SetTermColors(containerView);
 
 		int32 tabIndex = fTabView->CountTabs() - 1;
 		fTabView->Select(tabIndex);
@@ -1497,6 +1590,16 @@ TermWindow::_RemoveTab(int32 index, bool ask)
 			if (fSessions.CountItems() == 1) {
 				fTabView->SetScrollView(dynamic_cast<BScrollView*>(
 					_SessionAt(0)->containerView->Parent()));
+			} else {
+				// the tab view must not keep a scroll view that goes
+				std::vector<TermView*> views;
+				_SessionTermViews(session, views);
+				for (size_t i = 0; i < views.size(); i++) {
+					if (fTabView->ScrollView()
+						== views[i]->Parent()->Parent()) {
+						fTabView->SetScrollView(NULL);
+					}
+				}
 			}
 
 			delete session;
@@ -1532,15 +1635,35 @@ TermWindow::_SetFontSize(float size)
 
 	font.SetSize(size);
 	PrefHandler::Default()->setInt32(PREF_HALF_FONT_SIZE, (int32)size);
-	for (int32 i = 0; i < fTabView->CountTabs(); i++) {
-		TermView* view = _TermViewAt(i);
-		_TermViewAt(i)->SetTermFont(&font);
-		if (fFullScreen) {
-			view->SetTermSize(view->Frame(), true);
-			view->Invalidate();
-		} else
-			_ResizeView(view);
+	_ApplyFont(font);
+}
+
+
+/*!	A new font for every terminal. The active tab decides the window's size:
+	it fits a single terminal's rows and columns; a split tab, full screen
+	or another tab keeps the size, and its terminals get other rows and
+	columns.
+*/
+void
+TermWindow::_ApplyFont(const BFont& font)
+{
+	TermView* activeView = _ActiveTermView();
+	Session* activeSession = _SessionAt(fTabView->Selection());
+	bool fitWindow = !fFullScreen && activeSession != NULL
+		&& activeSession->paneView->CountPanes() == 1;
+
+	std::vector<TermView*> views;
+	_AllTermViews(views);
+	for (size_t i = 0; i < views.size(); i++) {
+		TermView* view = views[i];
+		view->SetTermFont(&font);
+		if (view == activeView && fitWindow)
+			continue;
+		view->SetTermSize(view->Bounds(), true);
+		view->Invalidate();
 	}
+	if (fitWindow)
+		_ResizeView(activeView);
 }
 
 
@@ -1598,20 +1721,12 @@ TermWindow::_TermViewAt(int32 index) const
 }
 
 
+//!	The index of the tab the view is in (any of its panes).
 int32
 TermWindow::_IndexOfTermView(TermView* termView) const
 {
-	if (!termView)
-		return -1;
-
-	// find the view
-	int32 count = fTabView->CountTabs();
-	for (int32 i = count - 1; i >= 0; i--) {
-		if (termView == _TermViewAt(i))
-			return i;
-	}
-
-	return -1;
+	Session* session = _SessionForTermView(termView);
+	return session != NULL ? _IndexOfSession(session) : -1;
 }
 
 
@@ -1644,11 +1759,11 @@ TermWindow::_IndexOfSession(Session* session) const
 void
 TermWindow::_CheckChildren()
 {
-	int32 count = fSessions.CountItems();
-	for (int32 i = count - 1; i >= 0; i--) {
-		Session* session = _SessionAt(i);
-		if (session->containerView->GetTermView()->CheckShellGone())
-			NotifyTermViewQuit(session->containerView->GetTermView(), 0);
+	std::vector<TermView*> views;
+	_AllTermViews(views);
+	for (size_t i = 0; i < views.size(); i++) {
+		if (views[i]->CheckShellGone())
+			NotifyTermViewQuit(views[i], 0);
 	}
 }
 
@@ -1666,6 +1781,10 @@ TermWindow::FrameResized(float newWidth, float newHeight)
 {
 	BWindow::FrameResized(newWidth, newHeight);
 
+	// the size of new terminals: not that of a pane
+	Session* session = _SessionAt(fTabView->Selection());
+	if (session == NULL || session->paneView->CountPanes() > 1)
+		return;
 	TermView* view = _ActiveTermView();
 	PrefHandler::Default()->setInt32(PREF_COLS, view->Columns());
 	PrefHandler::Default()->setInt32(PREF_ROWS, view->Rows());
@@ -1697,6 +1816,13 @@ TermWindow::Minimize(bool minimize)
 void
 TermWindow::TabSelected(SmartTabView* tabView, int32 index)
 {
+	// the tab's active pane has the focus
+	if (Session* session = _SessionAt(index)) {
+		TermView* view = session->containerView->GetTermView();
+		if (view->Window() != NULL && !view->IsFocus())
+			view->MakeFocus(true);
+		_UpdateDimming(session);
+	}
 	SessionChanged();
 }
 
@@ -1765,9 +1891,10 @@ TermWindow::NotifyTermViewQuit(TermView* view, int32 reason)
 {
 	// Since the notification can come from the view, we send a message to
 	// ourselves to avoid deleting the caller synchronously.
-	if (Session* session = _SessionAt(_IndexOfTermView(view))) {
+	if (Session* session = _SessionForTermView(view)) {
 		BMessage message(kCloseView);
 		session->id.AddToMessage(message, "session");
+		message.AddPointer("view", view);
 		message.AddInt32("reason", reason);
 		PostMessage(&message);
 	}
@@ -1777,12 +1904,17 @@ TermWindow::NotifyTermViewQuit(TermView* view, int32 reason)
 void
 TermWindow::SetTermViewTitle(TermView* view, const char* title)
 {
-	int32 index = _IndexOfTermView(view);
-	if (Session* session = _SessionAt(index)) {
-		session->title.pattern = title;
-		session->title.patternUserDefined = true;
-		_UpdateSessionTitle(index);
-	}
+	Session* session = _SessionForTermView(view);
+	if (session == NULL)
+		return;
+	// a pane's title is the tab's while the pane is active
+	session->paneTitles[view] = title;
+	if (session->containerView->GetTermView() != view)
+		return;
+	session->title.pattern = title;
+	session->title.patternUserDefined = true;
+	session->titleFromPane = true;
+	_UpdateSessionTitle(_IndexOfSession(session));
 }
 
 
@@ -1841,11 +1973,315 @@ TermWindow::NextTermView(TermView* view)
 }
 
 
+// #pragma mark - split panes
+
+
+void
+TermWindow::TermViewFocused(TermView* view)
+{
+	Session* session = _SessionForTermView(view);
+	if (session == NULL)
+		return;
+	TermViewContainerView* containerView
+		= (TermViewContainerView*)view->Parent();
+	if (session->containerView != containerView)
+		_ActivatePane(session, containerView, false);
+}
+
+
+bool
+TermWindow::IsActiveTermView(TermView* view)
+{
+	Session* session = _SessionForTermView(view);
+	return session == NULL || session->containerView->GetTermView() == view;
+}
+
+
+void
+TermWindow::ShowTermView(TermView* view)
+{
+	Session* session = _SessionForTermView(view);
+	if (session == NULL)
+		return;
+	if (IsMinimized())
+		Minimize(false);
+	Activate();
+	int32 index = _IndexOfSession(session);
+	if (fTabView->Selection() != index)
+		fTabView->Select(index);
+	_ActivatePane(session, (TermViewContainerView*)view->Parent());
+}
+
+
+void
+TermWindow::GetTermViewTitle(TermView* view, BString& title)
+{
+	Session* session = _SessionForTermView(view);
+	if (session == NULL)
+		return;
+	title = session->title.title;
+	std::map<TermView*, BString>::iterator found
+		= session->paneTitles.find(view);
+	if (session->containerView->GetTermView() != view
+		&& found != session->paneTitles.end() && !found->second.IsEmpty()) {
+		title = found->second;
+	}
+}
+
+
+/*!	The pane of a split tab is a scroll view, with the container, with the
+	terminal.
+*/
+/*static*/ TermViewContainerView*
+TermWindow::_ContainerOfPane(BView* pane)
+{
+	if (pane == NULL)
+		return NULL;
+	for (int32 i = 0; BView* child = pane->ChildAt(i); i++) {
+		if (TermViewContainerView* container
+				= dynamic_cast<TermViewContainerView*>(child)) {
+			return container;
+		}
+	}
+	return NULL;
+}
+
+
+void
+TermWindow::_SessionTermViews(Session* session,
+	std::vector<TermView*>& views) const
+{
+	if (session == NULL)
+		return;
+	if (session->paneView == NULL) {
+		views.push_back(session->containerView->GetTermView());
+		return;
+	}
+	for (int32 i = 0; BView* pane = session->paneView->PaneAt(i); i++) {
+		if (TermViewContainerView* container = _ContainerOfPane(pane))
+			views.push_back(container->GetTermView());
+	}
+}
+
+
+void
+TermWindow::_AllTermViews(std::vector<TermView*>& views) const
+{
+	for (int32 i = 0; Session* session = _SessionAt(i); i++)
+		_SessionTermViews(session, views);
+}
+
+
+TermWindow::Session*
+TermWindow::_SessionForTermView(TermView* view) const
+{
+	if (view == NULL)
+		return NULL;
+	for (int32 i = 0; Session* session = _SessionAt(i); i++) {
+		if (session->containerView->GetTermView() == view)
+			return session;
+		std::vector<TermView*> views;
+		_SessionTermViews(session, views);
+		if (std::find(views.begin(), views.end(), view) != views.end())
+			return session;
+	}
+	return NULL;
+}
+
+
+//!	Splits the active pane of the active tab in two, as iTerm2 does.
+void
+TermWindow::_SplitPane(bool sideBySide)
+{
+	Session* session = _SessionAt(fTabView->Selection());
+	if (session == NULL)
+		return;
+
+	TermView* activeView = session->containerView->GetTermView();
+	BView* pane = session->containerView->Parent();
+
+	// room for a few rows and columns in each half
+	float fontWidth, fontHeight;
+	activeView->GetFontSize(&fontWidth, &fontHeight);
+	float minimumWidth = MIN_COLS * fontWidth + 2 * kTermViewOffset
+		+ be_control_look->GetScrollBarWidth(B_VERTICAL);
+	float minimumHeight = 3 * fontHeight + 2 * kTermViewOffset;
+	if (!session->paneView->CanSplit(pane, sideBySide, minimumWidth,
+			minimumHeight)) {
+		beep();
+		return;
+	}
+
+	// the new shell starts where the active one is
+	BString directory;
+	ActiveProcessInfo info;
+	if (activeView->GetActiveProcessInfo(info))
+		directory = info.CurrentDirectory();
+
+	BScrollView* scrollView;
+	TermViewContainerView* containerView;
+	try {
+		containerView = _CreatePane(NULL, directory, false, scrollView);
+	} catch (...) {
+		beep();
+		return;
+	}
+	TermView* view = containerView->GetTermView();
+
+	// active first, so the new pane takes the focus when it is attached
+	session->containerView = containerView;
+	session->paneView->Split(pane, scrollView, sideBySide);
+	view->SetScrollBar(scrollView->ScrollBar(B_VERTICAL));
+	_ActivatePane(session, containerView);
+}
+
+
+//!	Closes a pane; the last one closes the tab.
+void
+TermWindow::_RemovePane(Session* session, TermView* view, bool ask)
+{
+	if (session == NULL || view == NULL)
+		return;
+	if (session->paneView->CountPanes() <= 1) {
+		_RemoveTab(_IndexOfSession(session), ask);
+		return;
+	}
+	if (ask && !_CanClose(_IndexOfSession(session), view))
+		return;
+
+	_FinishTitleDialog();
+
+	TermViewContainerView* containerView
+		= (TermViewContainerView*)view->Parent();
+	BView* pane = containerView->Parent();
+	bool wasActive = session->containerView == containerView;
+
+	// the pane next to it gets the focus
+	BView* next = NULL;
+	for (int32 direction = PaneView::RIGHT; next == NULL
+			&& direction <= PaneView::DOWN; direction++) {
+		next = session->paneView->Neighbor(pane, direction);
+	}
+	if (next == NULL)
+		next = session->paneView->Neighbor(pane, PaneView::LEFT);
+	if (next == NULL) {
+		int32 index = session->paneView->IndexOf(pane);
+		next = session->paneView->PaneAt(index > 0 ? index - 1 : 1);
+	}
+
+	if (fTabView->ScrollView() == pane)
+		fTabView->SetScrollView(NULL);
+	session->paneTitles.erase(view);
+	session->paneView->RemovePane(pane);
+	delete pane;
+
+	if (wasActive || _ContainerOfPane(next) == NULL) {
+		TermViewContainerView* nextContainer = _ContainerOfPane(next);
+		if (nextContainer == NULL) {
+			nextContainer = _ContainerOfPane(session->paneView->PaneAt(0));
+		}
+		session->containerView = nextContainer;
+		_ActivatePane(session, nextContainer);
+	} else
+		_UpdateDimming(session);
+}
+
+
+void
+TermWindow::_ActivatePane(Session* session,
+	TermViewContainerView* containerView, bool focus)
+{
+	if (session == NULL || containerView == NULL)
+		return;
+	session->containerView = containerView;
+	TermView* view = containerView->GetTermView();
+	if (focus && view->Window() != NULL && !view->IsFocus())
+		view->MakeFocus(true);
+
+	// a maximized pane gives way to the one chosen
+	BView* maximized = session->paneView->Maximized();
+	if (maximized != NULL && maximized != containerView->Parent())
+		session->paneView->SetMaximized(containerView->Parent());
+
+	// the tab's title is that of its active pane
+	std::map<TermView*, BString>::iterator found
+		= session->paneTitles.find(view);
+	if (found != session->paneTitles.end()) {
+		session->title.pattern = found->second;
+		session->title.patternUserDefined = true;
+		session->titleFromPane = true;
+	} else if (session->titleFromPane) {
+		// back to the settings' pattern
+		session->title.pattern.Truncate(0);
+		session->title.patternUserDefined = false;
+		session->titleFromPane = false;
+	}
+
+	_UpdateDimming(session);
+	_UpdateSessionTitle(_IndexOfSession(session));
+}
+
+
+void
+TermWindow::_NavigatePane(int32 direction)
+{
+	Session* session = _SessionAt(fTabView->Selection());
+	if (session == NULL)
+		return;
+	BView* next = session->paneView->Neighbor(
+		session->containerView->Parent(), direction);
+	if (next == NULL)
+		return;
+	_ActivatePane(session, _ContainerOfPane(next));
+}
+
+
+void
+TermWindow::_CyclePane(bool next)
+{
+	Session* session = _SessionAt(fTabView->Selection());
+	if (session == NULL)
+		return;
+	int32 count = session->paneView->CountPanes();
+	if (count < 2)
+		return;
+	int32 index = session->paneView->IndexOf(
+		session->containerView->Parent());
+	index = (index + (next ? 1 : count - 1)) % count;
+	_ActivatePane(session,
+		_ContainerOfPane(session->paneView->PaneAt(index)));
+}
+
+
+void
+TermWindow::_UpdateDimming(Session* session)
+{
+	if (session == NULL)
+		return;
+	bool dim = PrefHandler::Default()->getBool(PREF_DIM_INACTIVE_PANES)
+		&& session->paneView->CountPanes() > 1
+		&& session->paneView->Maximized() == NULL;
+	std::vector<TermView*> views;
+	_SessionTermViews(session, views);
+	TermView* active = session->containerView->GetTermView();
+	for (size_t i = 0; i < views.size(); i++)
+		views[i]->SetDimmed(dim && views[i] != active);
+}
+
+
 void
 TermWindow::_ResizeView(TermView *view)
 {
 	float fontWidth, fontHeight;
 	view->GetFontSize(&fontWidth, &fontHeight);
+
+	// a pane of a split tab keeps its size; the window does too
+	Session* session = _SessionForTermView(view);
+	if (session != NULL && session->paneView->CountPanes() > 1) {
+		view->SetTermSize(view->Bounds(), true);
+		view->Invalidate();
+		return;
+	}
 
 	float minimumHeight = -1;
 	if (fMenuBar != NULL)
@@ -2205,10 +2641,10 @@ TermWindow::_UpdateKeymap()
 
 	get_key_map(&fKeymap, &fKeymapChars);
 
-	for (int32 i = 0; i < fTabView->CountTabs(); i++) {
-		TermView* view = _TermViewAt(i);
-		view->SetKeymap(fKeymap, fKeymapChars);
-	}
+	std::vector<TermView*> views;
+	_AllTermViews(views);
+	for (size_t i = 0; i < views.size(); i++)
+		views[i]->SetKeymap(fKeymap, fKeymapChars);
 }
 
 
@@ -2310,11 +2746,11 @@ TermWindow::_RemoteControl(BMessage* message)
 	if (respond)
 		sender->RemoteControlReply(reply);
 
-	// tabs to close go after the answer, which may be theirs
+	// panes to close go after the answer, which may be theirs
 	for (int32 i = 0; i < closing.CountItems(); i++) {
-		int32 index = _IndexOfTermView((TermView*)closing.ItemAt(i));
-		if (index >= 0)
-			_RemoveTab(index, false);
+		TermView* view = (TermView*)closing.ItemAt(i);
+		if (Session* session = _SessionForTermView(view))
+			_RemovePane(session, view, false);
 	}
 }
 
@@ -2349,15 +2785,17 @@ TermWindow::_RunRemoteCommand(TermView* sender, const BMessage& command,
 		BString cwd = payload.GetString("cwd", "");
 		if (cwd == "current" || cwd == "last_reported" || cwd == "oldest") {
 			ActiveProcessInfo info;
-			cwd = _TermViewAt(_IndexOfTermView(sender))
-				->GetActiveProcessInfo(info) ? info.CurrentDirectory()
-				: BString();
+			cwd = sender->GetActiveProcessInfo(info)
+				? info.CurrentDirectory() : BString();
 		}
 		BString title = payload.GetString("tab_title",
 			payload.GetString("window_title", payload.GetString("title", "")));
+		// kitty's windows are panes: "window" (the default) splits the
+		// sender's tab, "tab" opens one, "os-window" another Terminal
 		BString type = payload.GetString("type", "window");
 		bool newWindow = type == "os-window"
 			|| BString(payload.GetString("window_type", "")) == "os";
+		bool newPane = type == "window" && !newWindow;
 
 		if (newWindow) {
 			std::vector<const char*> argv;
@@ -2376,6 +2814,49 @@ TermWindow::_RunRemoteCommand(TermView* sender, const BMessage& command,
 			if (status != B_OK) {
 				ok = false;
 				error.SetToFormat("Cannot start Terminal: %s", strerror(status));
+			}
+		} else if (newPane) {
+			Session* session = _SessionForTermView(sender);
+			int32 previous = fTabView->Selection();
+			TermViewContainerView* previousPane = session->containerView;
+			fTabView->Select(_IndexOfSession(session));
+			_ActivatePane(session, (TermViewContainerView*)sender->Parent());
+			BView* pane = sender->Parent()->Parent();
+			BString location = payload.GetString("location", "");
+			bool sideBySide = location == "vsplit" ? true
+				: location == "hsplit" ? false
+				: pane->Bounds().Width() >= pane->Bounds().Height() * 1.5;
+			int32 before = session->paneView->CountPanes();
+			_SplitPane(sideBySide);
+			if (session->paneView->CountPanes() == before) {
+				ok = false;
+				error = "There is no room for another pane";
+			} else {
+				TermView* view = session->containerView->GetTermView();
+				if (!arguments.empty()) {
+					// the command runs in the new pane's shell
+					BString text;
+					for (size_t i = 0; i < arguments.size(); i++) {
+						if (i > 0)
+							text << ' ';
+						BString argument = arguments[i];
+						argument.CharacterEscape(kShellEscapeCharacters, '\\');
+						text << argument;
+					}
+					text << '\n';
+					BMessage textPayload;
+					textPayload.AddString("data", BString("text:") << text);
+					BString ignored;
+					BString ignoredError;
+					view->RemoteCommand("send-text", textPayload, ignored,
+						ignoredError);
+				}
+				data << view->RemoteControlID();
+				hasData = true;
+				if (payload.GetBool("keep_focus", false)) {
+					fTabView->Select(previous);
+					_ActivatePane(session, previousPane);
+				}
 			}
 		} else {
 			std::vector<const char*> argv;
@@ -2450,32 +2931,40 @@ TermWindow::_RunRemoteCommand(TermView* sender, const BMessage& command,
 			PostMessage(&resize);
 		}
 	} else {
-		// commands about tabs
-		std::vector<int32> indexes;
-		if (!_MatchRemoteTabs(payload, sender, indexes, error))
+		// commands about kitty's windows (panes) and tabs
+		std::vector<TermView*> views;
+		if (!_MatchRemoteTabs(payload, sender, views, error))
 			ok = false;
 		else if (name == "focus-window" || name == "focus-tab") {
-			if (IsMinimized())
-				Minimize(false);
-			Activate();
-			fTabView->Select(indexes[0]);
-		} else if (name == "close-window" || name == "close-tab") {
-			for (size_t i = 0; i < indexes.size(); i++)
-				_closing.AddItem(_TermViewAt(indexes[i]));
+			ShowTermView(views[0]);
+		} else if (name == "close-window") {
+			for (size_t i = 0; i < views.size(); i++)
+				_closing.AddItem(views[i]);
+		} else if (name == "close-tab") {
+			// every pane of the tabs
+			for (size_t i = 0; i < views.size(); i++) {
+				std::vector<TermView*> panes;
+				_SessionTermViews(_SessionForTermView(views[i]), panes);
+				for (size_t j = 0; j < panes.size(); j++) {
+					if (!_closing.HasItem(panes[j]))
+						_closing.AddItem(panes[j]);
+				}
+			}
 		} else if (name == "set-tab-title") {
 			BString title = payload.GetString("title", "");
-			for (size_t i = 0; i < indexes.size(); i++) {
-				Session* session = _SessionAt(indexes[i]);
+			for (size_t i = 0; i < views.size(); i++) {
+				Session* session = _SessionForTermView(views[i]);
 				session->title.pattern = title;
 				session->title.pattern.ReplaceAll("%", "%%");
 				session->title.patternUserDefined = !title.IsEmpty();
-				_UpdateSessionTitle(indexes[i]);
+				session->titleFromPane = false;
+				_UpdateSessionTitle(_IndexOfSession(session));
 			}
 		} else {
 			// what one terminal does; text comes from the first
-			for (size_t i = 0; i < indexes.size() && ok; i++) {
+			for (size_t i = 0; i < views.size() && ok; i++) {
 				BString text;
-				ok = _TermViewAt(indexes[i])->RemoteCommand(name.String(),
+				ok = views[i]->RemoteCommand(name.String(),
 					payload, text, error);
 				if (i == 0) {
 					data = text;
@@ -2499,30 +2988,32 @@ TermWindow::_RunRemoteCommand(TermView* sender, const BMessage& command,
 }
 
 
-/*!	The tabs a command is about: those its "match" (or "match_window")
-	expression names, or all of them, the sender's (self), or else the
-	active one. kitty's id:, title:, pid:, num:, recent:0 and state:
-	(focused, active, self) are understood.
+/*!	The panes (kitty's windows) a command is about: those its "match" (or
+	"match_window") expression names, or all of them, the sender's (self),
+	or else the active one. kitty's id:, title:, pid:, num:, recent:0 and
+	state: (focused, active, self) are understood; title: matches the tab's
+	title, num: counts the panes of all tabs.
 */
 bool
 TermWindow::_MatchRemoteTabs(const BMessage& payload, TermView* sender,
-	std::vector<int32>& _indexes, BString& _error)
+	std::vector<TermView*>& _views, BString& _error)
 {
-	int32 count = fSessions.CountItems();
+	std::vector<TermView*> views;
+	_AllTermViews(views);
 	if (payload.GetBool("all", false)) {
-		for (int32 i = 0; i < count; i++)
-			_indexes.push_back(i);
+		_views = views;
 		return true;
 	}
 	if (payload.GetBool("self", false)) {
-		_indexes.push_back(_IndexOfTermView(sender));
+		_views.push_back(sender);
 		return true;
 	}
 
+	TermView* active = _ActiveTermView();
 	BString match = payload.GetString("match",
 		payload.GetString("match_window", ""));
 	if (match.IsEmpty()) {
-		_indexes.push_back(fTabView->Selection());
+		_views.push_back(active);
 		return true;
 	}
 
@@ -2533,19 +3024,19 @@ TermWindow::_MatchRemoteTabs(const BMessage& payload, TermView* sender,
 		match.CopyInto(field, 0, colon);
 		match.CopyInto(value, colon + 1, match.Length() - colon - 1);
 	}
-	for (int32 i = 0; i < count; i++) {
-		TermView* view = _TermViewAt(i);
+	for (size_t i = 0; i < views.size(); i++) {
+		TermView* view = views[i];
 		bool matches = false;
 		if (field == "id")
 			matches = view->RemoteControlID() == atoi(value.String());
 		else if (field == "num")
-			matches = i == atoi(value.String());
+			matches = (int32)i == atoi(value.String());
 		else if (field == "recent")
-			matches = atoi(value.String()) == 0 && i == fTabView->Selection();
+			matches = atoi(value.String()) == 0 && view == active;
 		else if (field == "state") {
 			matches = value == "self" ? view == sender
 				: (value == "focused" || value == "active")
-					&& i == fTabView->Selection();
+					&& view == active;
 		} else if (field == "pid") {
 			ShellInfo info;
 			matches = view->GetShellInfo(info)
@@ -2553,8 +3044,9 @@ TermWindow::_MatchRemoteTabs(const BMessage& payload, TermView* sender,
 		} else if (field == "title") {
 			try {
 				std::regex pattern(value.String());
-				matches = std::regex_search(
-					_SessionAt(i)->title.title.String(), pattern);
+				BString title;
+				GetTermViewTitle(view, title);
+				matches = std::regex_search(title.String(), pattern);
 			} catch (...) {
 				_error.SetToFormat("Not a regular expression: %s",
 					value.String());
@@ -2566,18 +3058,18 @@ TermWindow::_MatchRemoteTabs(const BMessage& payload, TermView* sender,
 			return false;
 		}
 		if (matches)
-			_indexes.push_back(i);
+			_views.push_back(view);
 	}
-	if (_indexes.empty() && !payload.GetBool("ignore_no_match", false)) {
-		_error.SetToFormat("No matching tabs for expression: %s",
+	if (_views.empty() && !payload.GetBool("ignore_no_match", false)) {
+		_error.SetToFormat("No matching windows for expression: %s",
 			match.String());
 		return false;
 	}
-	return !_indexes.empty();
+	return !_views.empty();
 }
 
 
-//!	kitty's ls: this window, its tabs, each with one "window", as JSON.
+//!	kitty's ls: this window, its tabs, each with its panes as windows.
 void
 TermWindow::_RemoteList(TermView* sender, BString& json)
 {
@@ -2588,44 +3080,68 @@ TermWindow::_RemoteList(TermView* sender, BString& json)
 		<< ",\"wm_class\":\"Terminal\",\"wm_name\":\"Terminal\""
 		<< ",\"tabs\":[";
 	for (int32 i = 0; i < fSessions.CountItems(); i++) {
-		TermView* view = _TermViewAt(i);
 		Session* session = _SessionAt(i);
-		int32 id = view->RemoteControlID();
-		bool active = i == selection;
-		const char* yes = active ? "true" : "false";
-		const char* focused = active && IsActive() ? "true" : "false";
-		ShellInfo shellInfo;
-		ActiveProcessInfo processInfo;
-		bool haveShell = view->GetShellInfo(shellInfo);
-		bool haveProcess = view->GetActiveProcessInfo(processInfo);
+		std::vector<TermView*> views;
+		_SessionTermViews(session, views);
+		TermView* activeView = session->containerView->GetTermView();
+		bool activeTab = i == selection;
+		const char* yes = activeTab ? "true" : "false";
+		const char* focused = activeTab && IsActive() ? "true" : "false";
 
 		if (i > 0)
 			json << ",";
-		json << "{\"id\":" << id << ",\"is_active\":" << yes
+		json << "{\"id\":" << session->id.ID() + 1
+			<< ",\"is_active\":" << yes
 			<< ",\"is_focused\":" << focused << ",\"title\":";
 		append_json_string(json, session->title.title.String());
-		json << ",\"layout\":\"stack\",\"enabled_layouts\":[\"stack\"]"
-			<< ",\"active_window_history\":[" << id << "]"
-			<< ",\"groups\":[{\"id\":" << id << ",\"windows\":[" << id
-			<< "]}],\"windows\":[{\"id\":" << id << ",\"is_active\":" << yes
-			<< ",\"is_focused\":" << focused << ",\"is_self\":"
-			<< (view == sender ? "true" : "false") << ",\"title\":";
-		append_json_string(json, session->title.title.String());
-		json << ",\"pid\":" << (haveShell ? (int32)shellInfo.ProcessID() : 0)
-			<< ",\"cwd\":";
-		append_json_string(json, haveProcess
-			? processInfo.CurrentDirectory().String() : "");
-		json << ",\"cmdline\":[],\"env\":{},\"foreground_processes\":[";
-		if (haveProcess) {
-			json << "{\"pid\":" << (int32)processInfo.ID()
-				<< ",\"cmdline\":[";
-			append_json_string(json, processInfo.Name().String());
-			json << "],\"cwd\":";
-			append_json_string(json, processInfo.CurrentDirectory().String());
-			json << "}";
+		const char* layout = views.size() > 1 ? "splits" : "stack";
+		json << ",\"layout\":\"" << layout << "\",\"enabled_layouts\":[\""
+			<< layout << "\"],\"active_window_history\":["
+			<< activeView->RemoteControlID() << "],\"groups\":[";
+		for (size_t j = 0; j < views.size(); j++) {
+			int32 id = views[j]->RemoteControlID();
+			json << (j > 0 ? "," : "") << "{\"id\":" << id
+				<< ",\"windows\":[" << id << "]}";
 		}
-		json << "],\"lines\":" << view->Rows() << ",\"columns\":"
-			<< view->Columns() << ",\"user_vars\":{}}]}";
+		json << "],\"windows\":[";
+		for (size_t j = 0; j < views.size(); j++) {
+			TermView* view = views[j];
+			bool active = view == activeView;
+			bool viewFocused = active && activeTab && IsActive();
+			ShellInfo shellInfo;
+			ActiveProcessInfo processInfo;
+			bool haveShell = view->GetShellInfo(shellInfo);
+			bool haveProcess = view->GetActiveProcessInfo(processInfo);
+			BString title;
+			GetTermViewTitle(view, title);
+
+			if (j > 0)
+				json << ",";
+			json << "{\"id\":" << view->RemoteControlID()
+				<< ",\"is_active\":" << (active ? "true" : "false")
+				<< ",\"is_focused\":" << (viewFocused ? "true" : "false")
+				<< ",\"is_self\":" << (view == sender ? "true" : "false")
+				<< ",\"title\":";
+			append_json_string(json, title.String());
+			json << ",\"pid\":"
+				<< (haveShell ? (int32)shellInfo.ProcessID() : 0)
+				<< ",\"cwd\":";
+			append_json_string(json, haveProcess
+				? processInfo.CurrentDirectory().String() : "");
+			json << ",\"cmdline\":[],\"env\":{},\"foreground_processes\":[";
+			if (haveProcess) {
+				json << "{\"pid\":" << (int32)processInfo.ID()
+					<< ",\"cmdline\":[";
+				append_json_string(json, processInfo.Name().String());
+				json << "],\"cwd\":";
+				append_json_string(json,
+					processInfo.CurrentDirectory().String());
+				json << "}";
+			}
+			json << "],\"lines\":" << view->Rows() << ",\"columns\":"
+				<< view->Columns() << ",\"user_vars\":{}}";
+		}
+		json << "]}";
 	}
 	json << "]}]";
 }

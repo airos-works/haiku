@@ -5,7 +5,8 @@ menus, preferences, keyboard shortcuts and icon. Underneath, it is a new
 terminal. The emulator was rewritten to understand what modern command line
 programs send (kitty's protocol extensions, true color, styled underlines,
 images, the kitty keyboard protocol). Drawing was rewritten so the GPU can do
-it.
+it. From iTerm2 it took split panes, the search bar, inline images
+(`OSC 1337`) and alerts as notifications (see *Panes, search and alerts*).
 
 What it does not do yet, compared with kitty, is in
 [TERMINAL-KITTY-GAPS.md](TERMINAL-KITTY-GAPS.md).
@@ -44,7 +45,7 @@ underlines (`Smulx`, `Setulc`) and true color (`RGB`, `Tc`).
 | Miscellaneous | `CSI ? s`/`r` without parameters, `SGR 221`/`222`, `CSI 22 J`, DECCARA/DECSACE with every SGR attribute, the mouse-leave event | Complete. |
 | Shell integration | `OSC 133` | Prompt and output marks; jumping between prompts. |
 | Multiple cursors | `CSI > ... SP q` | Complete: block, beam, underline and follow-the-cursor shapes at points, rectangles or the cursor; their two colors (`30`, `40`, including "special"); the support, cursor and color queries. They blink with the cursor, show when DECTCEM hides it, and go with ED 2/3/22, a reset, the other screen and a resize. |
-| Remote control | `DCS @kitty-cmd` | Off unless the settings say `"RemoteControl" , "yes"` (as kitty's `allow_remote_control` is off). The commands that fit Terminal's windows and tabs, kitty's "windows": `ls`, `launch` and `new-window` (a tab, or another Terminal), `send-text`, `get-text` (screen, all, selection, command outputs), `set-tab-title`, `set-window-title`, `set-colors`, `get-colors`, `scroll-window`, `focus-window`/`focus-tab`, `close-window`/`close-tab`, `set-font-size`, `resize-os-window`, `signal-child`; kitty's `match` expressions `id:`, `title:`, `pid:`, `num:`, `recent:0`, `state:`, and `self`/`all`. Commands encrypted for `KITTY_PUBLIC_KEY` with a password (`kitten @ --password`) run when it is the settings' `"RemoteControlPassword"`, even with remote control off. Not: kitty's per-password lists of allowed commands, async and streaming commands. |
+| Remote control | `DCS @kitty-cmd` | kitty's windows are Terminal's panes: `launch` (and `new-window`) with the default type `window` splits the sender's tab (`--location=vsplit` side by side, `hsplit` on top of each other, otherwise along the longer side) and types the command into the new pane's shell; `--type=tab` opens a tab, `os-window` another Terminal. `ls` lists each tab's panes as its windows (layout `splits`), `close-window` closes a pane, `close-tab` all of a tab's. Off unless the settings say `"RemoteControl" , "yes"` (as kitty's `allow_remote_control` is off). The commands that fit Terminal's windows and tabs, kitty's "windows": `ls`, `launch` and `new-window` (a tab, or another Terminal), `send-text`, `get-text` (screen, all, selection, command outputs), `set-tab-title`, `set-window-title`, `set-colors`, `get-colors`, `scroll-window`, `focus-window`/`focus-tab`, `close-window`/`close-tab`, `set-font-size`, `resize-os-window`, `signal-child`; kitty's `match` expressions `id:`, `title:`, `pid:`, `num:`, `recent:0`, `state:`, and `self`/`all`. Commands encrypted for `KITTY_PUBLIC_KEY` with a password (`kitten @ --password`) run when it is the settings' `"RemoteControlPassword"`, even with remote control off. Not: kitty's per-password lists of allowed commands, async and streaming commands. |
 | Drag and drop | `OSC 72` | Drops: a program that registers (`t=a`) hears about drags over it (`t=m`, with the types once and when they change, and when the drag leaves), takes or refuses them, gets the drop (`t=M`) and asks for its data by type: files as `text/uri-list` (and their paths as `text/plain`), anything else by MIME type. A program on another machine (its machine id differs, `t=a:x=1`) reads dropped files, symbolic links and directories through the terminal. Drags: a program that offers them (`t=o:x=1`) gets the drag gesture instead of a selection starting, offers types, sends their data and an image (RGB, RGBA, PNG or text) and starts the drag; Tracker, for one, takes text and files from it. Not: data asked for after the drop rather than sent before (`t=e:x=5`), pulling files from a program on another machine (`t=k`), changing the image during the drag. Haiku does not tell the source where its drag went, so "dropped" and "finished" come when the button goes up. Terminal's machine id is a random one kept in `~/config/settings/Terminal/machine_id`. |
 | File transfer | `OSC 5113` | Both ways: a program sends files, directories, symbolic and hard links with their times and permissions (a send session), or reads them from this computer (a receive session), zlib-compressed or not, after the user allows it in an alert naming what is asked for. A password, the settings' `"FileTransferPassword"`, skips the alert: encrypted for `KITTY_PUBLIC_KEY` (`kitten transfer -p`) or as kitty's older SHA-256 form. Cancel, quiet modes, ten sessions of each kind, ten minutes without activity end a session. Files are written next to their place and moved there at the end; hard links become copies on BFS, which has none. Tested with kitty 0.49.2's `kitten transfer` on Linux both ways (a 200 MB file at 3.1 MB/s to air/OS, 4.5 MB/s from it). Not: rsync deltas (`kitten transfer -x`), refused per file so the client sends whole files. |
 
@@ -71,7 +72,26 @@ underlines (`Smulx`, `Setulc`) and true color (`RGB`, `Tc`).
   clusters (2027, always on).
 - **OSC:** 0/1/2 titles, 7 working directory, 8 hyperlinks, 9 and 777
   notifications (iTerm2, urxvt), `9;4` progress (shown as a progress
-  notification), 52 clipboard, 1337 `CurrentDir`.
+  notification), 52 clipboard, 133 shell integration marks, 1337 (iTerm2,
+  below).
+
+### iTerm2's extensions (OSC 1337)
+
+| Sequence | Does |
+| --- | --- |
+| `File=inline=1;...:`*base64* | An inline image, as iTerm2's `imgcat` sends it: any format the Translation Kit reads (PNG, JPEG, GIF's first frame, WebP, ...). `width` and `height` in cells (`N`), points (`Npx`, one point is one logical pixel, so images keep their size at 200 %), percent of the terminal (`N%`) or `auto` (the image's own size, in points); `preserveAspectRatio=0` stretches it; `doNotMoveCursor=1`. It is placed at the cursor, no wider than the space to the right, over cells it clears; the cursor goes after it on its last row, as iTerm2 leaves it (so `imgcat`'s newline puts the prompt below). It scrolls with the text and goes with `clear` like a kitty image. Up to 64 MB in one sequence (other OSC strings stay limited to 1 MB). |
+| `MultipartFile=`*args*, `FilePart=`*base64*, `FileEnd` | The same in pieces (iTerm2 3.5's `imgcat`, and through tmux). |
+| `File=` without `inline=1` | A download: Terminal asks whether to save it, then saves it in `~/Downloads` (`name 2.ext` if the name is taken) and says so in a notification, which opens it when clicked. |
+| `ReportCellSize` | Answers `OSC 1337 ; ReportCellSize=`*height*`;`*width*`;`*scale* `ST`, in points. |
+| `RequestAttention=yes`, `once`, `no` | A notification "needs your attention" when the terminal is not seen (`yes` stays until clicked); `no` takes it back. |
+| `StealFocus` | Brings the window, the tab and the pane to the front. |
+| `SetMark` | A mark at the cursor's line: the prompt jumps (Ctrl+Shift+Z/X) stop there, and *Alert on next mark* fires. |
+| `ClearScrollback`, `CursorShape=0/1/2`, `Copy=:`*base64*, `SetUserVar=`*name*`=`*base64*, `ReportVariable=`*base64*, `CurrentDir=` | As in iTerm2. |
+
+`TERM_PROGRAM` stays `airos-terminal`; programs that only try iTerm2's
+images when it says `iTerm.app` need to be told (`timg -pi`), or given
+`TERM_PROGRAM=iTerm.app` for one command.
+`imgcat` itself sends the sequence whatever the terminal.
 
 ### Text
 
@@ -204,6 +224,69 @@ integration does. It wraps `PS1` and `PS2` before each prompt, so a profile
 that sets its own prompt keeps the marks. `AIROS_TERMINAL_INTEGRATION=0` in
 the environment turns it off.
 
+## Panes, search and alerts
+
+### Split panes
+
+Any tab can be split, again and again, as in iTerm2. The new pane starts a
+shell in the active pane's directory.
+
+| Keys | Does |
+| --- | --- |
+| Alt+D | Split the active pane vertically (side by side) |
+| Alt+Shift+D | Split it horizontally (one above the other) |
+| Alt+] / Alt+[ | The next / previous pane |
+| Alt+Option+arrow keys | The pane to the left, right, above or below |
+| Alt+Shift+Enter | Maximize the active pane (the others stay running); again to go back |
+| Alt+W | Close the active pane (the tab, when it has only one) |
+
+These are also in **Terminal ▸ Split vertically / Split horizontally** and
+**Terminal ▸ Panes** (*Make panes the same size*, *Close active pane*).
+Click a pane to make it the active one. The dividers can be dragged; a
+double click on one shares its room out evenly again. Panes that are not
+active are dimmed, unless the settings say `"Dim inactive panes" ,
+"false"`. A pane whose shell quits closes; the last one closes its tab. The
+tab's title is that of its active pane. Changing the font size keeps the
+window's size when the tab is split: the panes get fewer or more rows.
+Closing a pane whose shell runs something asks first, as closing a tab does.
+
+### Search
+
+**Edit ▸ Find** (Alt+F) opens a search bar at the top right of the active
+pane, iTerm2's find bar instead of the old dialog. It finds as you type, in
+the history and on the screen, highlights every match (yellow; the current
+one orange, and selected so Alt+C copies it) and counts them ("3 of 17").
+Return or the up arrow goes to the match above (older), Shift+Return or the
+down arrow to the one below; Alt+G and Alt+Shift+G do the same from the
+terminal. Escape or the × closes the bar. The menu at its left chooses the
+case (*Smart case*, the default: the case matters only when the text has a
+capital; *Match case*; *Ignore case*), *Regular expression* (ECMAScript) and
+*Whole words*. A match can cross a line the terminal wrapped, not a line
+end. While the bar is open, new output is searched again (at most every
+quarter second). **Use selection for find** (Alt+E) searches for the
+selected text.
+
+### Notifications and alerts
+
+Programs' own notifications (OSC 9, 99 and 777, iTerm2's
+`RequestAttention`) go to the system's notifications, as before; a click
+shows the tab and the pane they came from. Terminal adds its own, as
+iTerm2 does:
+
+- **The bell** in a terminal you cannot see (another tab, another window
+  in front, minimized) shows a notification, at most every five seconds
+  per pane. `"Notify on bell" , "false"` in the settings turns it off.
+- **A long command finished** where you cannot see it: with the shell
+  integration's marks (OSC 133, on by default for bash), a command that ran
+  10 seconds or more says it finished or failed (with its exit status) and
+  how long it took. `"Notify when commands finish" , "30"` changes the
+  time, `"0"` turns it off.
+- **Edit ▸ Alert on next mark** (Alt+Shift+A) asks for a notification when
+  the running command finishes, or a program sets a mark, seen or not.
+
+Terminals in tabs that are not shown handle their notifications, bells and
+marks at once; before, they waited until the tab was shown.
+
 ## Links
 
 **Click a link to open it** in the default browser (Summit). Hovering over
@@ -310,7 +393,7 @@ Window 0`) has:
 | `src/apps/terminal/emulator/` | The emulator: parser, screen and history, sequences, OSC commands, key and mouse encoding, kitty graphics. Plain C++ with no Interface Kit, so it builds and is tested on the build host. `UnicodeTables.cpp` and `ColorNames.cpp` are generated (see their headers). |
 | `src/apps/terminal/render/` | Frames for the renderers (`FrameBuilder`), the glyph atlas (`GlyphCache`), box drawing, the software renderer. |
 | `src/apps/terminal/render/opengl/` | The OpenGL renderer add-on. |
-| `src/apps/terminal/` | The application: windows, tabs, preferences (unchanged), `TermView` (input, selection, scrolling, drawing, events from the emulator), `Shell`. |
+| `src/apps/terminal/` | The application: windows, tabs, preferences (unchanged), `TermView` (input, selection, scrolling, drawing, events from the emulator, searching, alerts), `PaneView` (a tab's split panes), `FindBar`, `Shell`. |
 
 The old engine (`TermParse`, `TerminalBuffer`, `BasicTerminalBuffer`,
 `HistoryBuffer`, the VT tables) is gone.
@@ -318,9 +401,11 @@ The old engine (`TermParse`, `TerminalBuffer`, `BasicTerminalBuffer`,
 ## Tests
 
 - `make -C src/tests/apps/terminal test` builds the emulator with
-  AddressSanitizer on the build host and runs 300 checks: parsing, cursor
+  AddressSanitizer on the build host and runs 550 checks: parsing, cursor
   movement, margins, wrapping and reflow, history, every reply, keys, mouse,
-  paste, the kitty protocols, grapheme clusters.
+  paste, the kitty protocols, grapheme clusters, iTerm2's OSC 1337 (image
+  sizes, cursor, pieces, downloads), searching for all matches (case,
+  words, regular expressions, wraps, wide characters), shell marks.
 - `jam GLStressTest` builds a program that drives the OpenGL add-on with
   made-up frames at any size (`STRESS_FULL`, `STRESS_RESIZE`,
   `STRESS_ATLAS`, `STRESS_IMAGE`) and reports frame times and GPU loss.
@@ -329,3 +414,15 @@ The old engine (`TermParse`, `TerminalBuffer`, `BasicTerminalBuffer`,
   paste, resize reflow, wheel scrolling, notifications, kitty keyboard flags
   1 and 11, SGR mouse reports, and switching between the GPU and software
   renderers mid-run.
+- In a QEMU VM of the branch's image (2026-11-17): `imgcat`-style images
+  (natural size, `width=20`, `height=2` next to text, multipart, `clear`
+  removing them), 24-bit colors; splitting vertically and horizontally with
+  `stty size` right in every pane (a new pane once kept 80 × 25: detached
+  views do not resize their children), pane keys, maximize, closing panes
+  (`exit`, Alt+W, the alert for a busy pane), clicking a pane, dragging a
+  divider, font size in split and single tabs; the search bar (127 matches
+  counted and highlighted, Return, smart case, regular expressions, the
+  options menu, new output found while it is open); notifications from a
+  hidden tab (bell, a failed 11 s command, RequestAttention) and a click on
+  one bringing its tab back; Alert on next mark; a download saved after the
+  alert; kitty's `launch --location=vsplit` and `ls` listing the panes.

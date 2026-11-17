@@ -94,6 +94,7 @@ static const uint32 MSG_ACTIVATE_TERM					= 'msat';
 static const uint32 MSG_NOTIFICATION_ACTIVATED			= 'ntac';
 static const uint32 MSG_NOTIFICATION_CLOSED				= 'ntcl';
 static const uint32 MSG_REMOTE_CONTROL					= 'rmct';
+static const uint32 MSG_TERM_VIEW_EVENTS				= 'tvev';
 
 // A click on a notification starts Terminal with this argument, the team and
 // the view that sent it, the notification's id and what to do (bit 0: show
@@ -172,6 +173,16 @@ static const char* const PREF_EMULATE_BOLD = "Emulate bold";
 	// the mouse wheel sends cursor keys on the alternate screen (DECSET
 	// 1007): on by default, as in kitty and VTE (xterm has it off)
 static const char* const PREF_ALTERNATE_SCROLL = "Alternate screen scroll";
+
+	// split panes: the ones that are not active are drawn dimmed
+static const char* const PREF_DIM_INACTIVE_PANES = "Dim inactive panes";
+	// a notification when the bell rings in a terminal that is not seen
+static const char* const PREF_NOTIFY_ON_BELL = "Notify on bell";
+	// a notification when a command that ran at least this many seconds
+	// finishes in a terminal that is not seen (0: never); needs the shell
+	// integration's marks (OSC 133)
+static const char* const PREF_NOTIFY_COMMAND_SECONDS
+	= "Notify when commands finish";
 
 static const char* const PREF_TAB_TITLE = "Tab title";
 static const char* const PREF_WINDOW_TITLE = "Window title";

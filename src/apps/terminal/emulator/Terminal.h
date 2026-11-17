@@ -337,9 +337,11 @@ public:
 		//! kitty's file transfer (OSC 5113): what follows "5113;".
 		virtual	void			TerminalFileTransfer(const char* data);
 		//! Shell integration marks: 'A' a prompt starts, 'C' a command's
-		//! output starts, 'D' it finished (with its \a status, or -1),
-		//! 'M' iTerm2's SetMark.
-		virtual	void			TerminalShellMark(char mark, int32 status);
+		//! output starts (\a command is what was typed after the prompt,
+		//! if known), 'D' it finished (with its \a status, or -1), 'M'
+		//! iTerm2's SetMark.
+		virtual	void			TerminalShellMark(char mark, int32 status,
+									const char* command);
 		//! iTerm2's RequestAttention: "yes", "once", "no" or "fireworks".
 		virtual	void			TerminalRequestAttention(const char* value);
 		//! iTerm2's StealFocus.
@@ -895,6 +897,10 @@ private:
 				size_t			size;
 			}					fClipboardWrite;
 			Base64Decoder		fClipboardDecoder;
+
+			// where the command typed after the prompt starts (OSC 133 B)
+			int64				fCommandLine;
+			int32				fCommandColumn;
 
 			// iTerm2: a file in pieces (MultipartFile), user variables
 			bool				fMultipartActive;

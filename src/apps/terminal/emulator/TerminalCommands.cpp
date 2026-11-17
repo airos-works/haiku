@@ -1172,26 +1172,56 @@ Terminal::_ShellIntegration(const char* spec)
 			line.flags |= secondary ? LINE_SECONDARY_PROMPT : LINE_PROMPT;
 			break;
 		}
+		case 'B':
+			// the command is typed from here
+			if (fScreen == &fMain) {
+				fCommandLine = AbsoluteLine(fCursorY);
+				fCommandColumn = fCursorX;
+			}
+			break;
 		case 'C':
 			line.flags &= ~(LINE_PROMPT | LINE_SECONDARY_PROMPT);
 			line.flags |= LINE_OUTPUT;
 			break;
 		default:
-			// B and kitty's private k markers carry nothing we use
+			// kitty's private k markers carry nothing we use
 			break;
 	}
 
+	char mark = parts[0][0];
+	std::string command;
+	if (mark == 'C' && fCommandLine >= 0 && fScreen == &fMain) {
+		// what was typed between the prompt and the output
+		int64 row = fCommandLine - AbsoluteLine(0);
+		if (row >= -HistorySize() && row <= fCursorY) {
+			std::string text;
+			GetText(TermPoint(fCommandColumn, (int32)row),
+				TermPoint(fCursorX, fCursorY), text);
+			for (size_t i = 0; i < text.size(); i++) {
+				if (text[i] == '\n' || text[i] == '\r' || text[i] == '\t')
+					text[i] = ' ';
+			}
+			size_t first = text.find_first_not_of(' ');
+			size_t last = text.find_last_not_of(' ');
+			if (first != std::string::npos)
+				command = text.substr(first, last - first + 1);
+			if (command.size() > 200)
+				command = command.substr(0, 200);
+		}
+	}
+	if (mark == 'C' || mark == 'A')
+		fCommandLine = -1;
+
 	if (fListener == NULL)
 		return;
-	char mark = parts[0][0];
 	if (mark == 'A' && parts.size() > 1 && parts[1] == "k=s")
 		return;
 	if (mark == 'A' || mark == 'C')
-		fListener->TerminalShellMark(mark, -1);
+		fListener->TerminalShellMark(mark, -1, command.c_str());
 	else if (mark == 'D') {
 		fListener->TerminalShellMark('D', parts.size() > 1
 			&& !parts[1].empty() && isdigit((unsigned char)parts[1][0])
-				? atoi(parts[1].c_str()) : -1);
+				? atoi(parts[1].c_str()) : -1, "");
 	}
 }
 
@@ -1300,7 +1330,7 @@ Terminal::_ITerm2(const std::string& argument)
 			_Touch(fCursorY);
 		}
 		if (fListener != NULL)
-			fListener->TerminalShellMark('M', -1);
+			fListener->TerminalShellMark('M', -1, "");
 	} else if (key == "CursorShape") {
 		// 0 block, 1 vertical bar, 2 underline
 		int32 shape = atoi(value.c_str());

@@ -105,11 +105,14 @@ struct Recorder : Terminal::Listener {
 	{
 		fileTransfers.push_back(data);
 	}
-	virtual void TerminalShellMark(char mark, int32 status)
+	virtual void TerminalShellMark(char mark, int32 status,
+		const char* command)
 	{
 		marks += mark;
 		if (mark == 'D')
 			lastStatus = status;
+		if (mark == 'C')
+			lastCommand = command;
 	}
 	virtual void TerminalRequestAttention(const char* value)
 	{
@@ -124,6 +127,7 @@ struct Recorder : Terminal::Listener {
 	std::vector<std::string> fileTransfers;
 	std::string marks;
 	int32 lastStatus = -2;
+	std::string lastCommand;
 	std::string attention;
 	std::string downloadName;
 	std::string downloadData;
@@ -1785,6 +1789,11 @@ TestITerm2()
 			"\r\n\x1b]133;D;3\x07\x1b]133;A;k=s\x07");
 		CHECK_EQUAL(f.recorder.marks, "ACD");
 		CHECK(f.recorder.lastStatus == 3);
+		CHECK_EQUAL(f.recorder.lastCommand, "ls");
+		// a command over two lines, scrolled into the history
+		f.Feed("\x1b]133;A\x07$ \x1b]133;B\x07make all"
+			"\r\n> install\r\n\r\n\r\n\x1b]133;C\x07");
+		CHECK_EQUAL(f.recorder.lastCommand, "make all > install");
 	}
 
 	TerminalGraphics::SetCodecs(NULL, InflateWithZlib);

@@ -75,7 +75,8 @@ void Terminal::Listener::TerminalDragAndDrop(const char* data)
 	{}
 void Terminal::Listener::TerminalFileTransfer(const char* data)
 	{}
-void Terminal::Listener::TerminalShellMark(char mark, int32 status) {}
+void Terminal::Listener::TerminalShellMark(char mark, int32 status,
+	const char* command) {}
 void Terminal::Listener::TerminalRequestAttention(const char* value) {}
 void Terminal::Listener::TerminalStealFocus() {}
 void Terminal::Listener::TerminalDownload(const char* name,
@@ -122,6 +123,8 @@ Terminal::Terminal()
 	fDarkColorScheme(false),
 	fRectangularAttributes(false),
 	fSynchronizedSince(0),
+	fCommandLine(-1),
+	fCommandColumn(0),
 	fMultipartActive(false),
 	fGraphics(NULL)
 {
