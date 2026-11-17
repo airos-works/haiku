@@ -15,6 +15,7 @@ UseHeaders [ FDirName $(SUBDIR) ] : true ;
 
 SEARCH_SOURCE += [ FDirName $(SUBDIR) dev rtwn ] ;
 SEARCH_SOURCE += [ FDirName $(SUBDIR) dev rtwn pci ] ;
+SEARCH_SOURCE += [ FDirName $(SUBDIR) dev rtwn sdio ] ;
 SEARCH_SOURCE += [ FDirName $(SUBDIR) dev rtwn usb ] ;
 SEARCH_SOURCE += [ FDirName $(SUBDIR) dev rtwn rtl8188e ] ;
 SEARCH_SOURCE += [ FDirName $(SUBDIR) dev rtwn rtl8188e pci ] ;
@@ -25,6 +26,7 @@ SEARCH_SOURCE += [ FDirName $(SUBDIR) dev rtwn rtl8192c usb ] ;
 SEARCH_SOURCE += [ FDirName $(SUBDIR) dev rtwn rtl8192e ] ;
 SEARCH_SOURCE += [ FDirName $(SUBDIR) dev rtwn rtl8192e usb ] ;
 SEARCH_SOURCE += [ FDirName $(SUBDIR) dev rtwn rtl8723b ] ;
+SEARCH_SOURCE += [ FDirName $(SUBDIR) dev rtwn rtl8723b sdio ] ;
 SEARCH_SOURCE += [ FDirName $(SUBDIR) dev rtwn rtl8723b usb ] ;
 SEARCH_SOURCE += [ FDirName $(SUBDIR) dev rtwn rtl8812a ] ;
 SEARCH_SOURCE += [ FDirName $(SUBDIR) dev rtwn rtl8812a usb ] ;
@@ -49,6 +51,12 @@ KernelAddon realtekwifi :
 	rtwn_pci_reg.c
 	rtwn_pci_rx.c
 	rtwn_pci_tx.c
+
+	# sdio/ (Haiku: RTL8723BS, off unless the driver settings say "sdio 1")
+	rtwn_sdio_attach.c
+	rtwn_sdio_reg.c
+	rtwn_sdio_rx.c
+	rtwn_sdio_tx.c
 
 	# usb/
 	rtwn_usb_attach.c
@@ -130,6 +138,11 @@ KernelAddon realtekwifi :
 	r23b_rom.c
 	r23b_rx.c
 
+	# rtl8723b/sdio/
+	r23bs_attach.c
+	r23bs_init.c
+	r23bs_rom.c
+
 	# rtl8723b/usb/
 	r23bu_attach.c
 	r23bu_init.c
@@ -171,6 +184,7 @@ KernelAddon realtekwifi :
 	:
 	freebsd_wlan.a
 	freebsd_usb.a
+	freebsd_sdio.a
 	libfreebsd_network.a
 	;
 
