@@ -344,7 +344,7 @@ reschedule(int32 nextState)
 	ThreadData* oldThreadData = oldThread->scheduler_data;
 
 	CPUSet oldThreadMask;
-	bool useOldThreadMask, fetchedOldThreadMask = false;
+	bool useOldThreadMask = false;
 
 	oldThreadData->StopCPUTime();
 
@@ -367,7 +367,6 @@ reschedule(int32 nextState)
 
 			oldThreadMask = oldThreadData->GetCPUMask();
 			useOldThreadMask = !oldThreadMask.IsEmpty();
-			fetchedOldThreadMask = true;
 
 			if (!oldThreadData->IsIdle() && (!useOldThreadMask || oldThreadMask.GetBit(thisCPU))) {
 				oldThreadData->Continues();
@@ -415,12 +414,15 @@ reschedule(int32 nextState)
 		} else
 			nextThreadData = oldThreadData;
 	} else {
-		if (!fetchedOldThreadMask) {
-			oldThreadMask = oldThreadData->GetCPUMask();
-			useOldThreadMask = !oldThreadMask.IsEmpty();
-			fetchedOldThreadMask = true;
-		}
-		bool oldThreadShouldMigrate = useOldThreadMask && !oldThreadMask.GetBit(thisCPU);
+		// A thread that runs outside its CPU mask moves to a CPU of the mask,
+		// if it stays ready. One that is going to wait (or die) must not be
+		// put into a run queue: it would be run again before anything woke
+		// it up, and return from thread_block() with its wait still pending
+		// (#137). It is placed according to its mask when it wakes up.
+		// (A core's threads run on any of its CPUs, so with SMT a thread
+		// that may only use one of them runs on the others, too.)
+		bool oldThreadShouldMigrate = enqueueOldThread && useOldThreadMask
+			&& !oldThreadMask.GetBit(thisCPU);
 		// Low latency: a thread that never waits is placed only when it wakes
 		// up, so it would stay wherever it started. It moves to a core that
 		// has nothing to do
