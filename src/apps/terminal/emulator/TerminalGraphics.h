@@ -46,6 +46,35 @@ struct ImageDraw {
 };
 
 
+//! A width or height of an iTerm2 inline image (OSC 1337 File=).
+enum {
+	INLINE_SIZE_AUTO = 0,
+	INLINE_SIZE_CELLS,
+	INLINE_SIZE_PIXELS,		// logical pixels (iTerm2's points)
+	INLINE_SIZE_PERCENT		// of the terminal's width or height
+};
+
+struct InlineImageSize {
+	int32				unit;
+	double				value;
+};
+
+struct InlineImageSpec {
+	InlineImageSize		width;
+	InlineImageSize		height;
+	bool				preserveAspectRatio;
+	bool				moveCursor;
+
+	InlineImageSpec()
+		:
+		preserveAspectRatio(true),
+		moveCursor(true)
+	{
+		width.unit = height.unit = INLINE_SIZE_AUTO;
+		width.value = height.value = 0;
+	}
+};
+
 // z-index bands
 static const int32 kBelowBackgroundsZ = -1073741824;
 
@@ -70,6 +99,11 @@ public:
 
 			void				HandleCommand(const char* data,
 									size_t length);
+			//! iTerm2's inline image: \a data in any format the decoder
+			//! knows, placed at the cursor over the cells it covers, which
+			//! are cleared. Returns false if it cannot be decoded.
+			bool				PutInlineImage(const std::string& data,
+									const InlineImageSpec& spec);
 
 			// hooks from the terminal
 	inline	void				CellsChanged(int32 row, int32 from,

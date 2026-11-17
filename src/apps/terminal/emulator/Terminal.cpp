@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <new>
+#include <regex>
 
 #include <OS.h>
 
@@ -74,6 +75,11 @@ void Terminal::Listener::TerminalDragAndDrop(const char* data)
 	{}
 void Terminal::Listener::TerminalFileTransfer(const char* data)
 	{}
+void Terminal::Listener::TerminalShellMark(char mark, int32 status) {}
+void Terminal::Listener::TerminalRequestAttention(const char* value) {}
+void Terminal::Listener::TerminalStealFocus() {}
+void Terminal::Listener::TerminalDownload(const char* name,
+	const std::string& data) {}
 
 
 // #pragma mark - Terminal
@@ -87,6 +93,7 @@ Terminal::Terminal()
 	fRows(0),
 	fCellWidth(8),
 	fCellHeight(16),
+	fPixelScale(1.0f),
 	fScreen(&fMain),
 	fLinesScrolled(0),
 	fGeneration(0),
@@ -115,6 +122,7 @@ Terminal::Terminal()
 	fDarkColorScheme(false),
 	fRectangularAttributes(false),
 	fSynchronizedSince(0),
+	fMultipartActive(false),
 	fGraphics(NULL)
 {
 	pthread_mutexattr_t attributes;
@@ -262,6 +270,14 @@ Terminal::SetCellSize(int32 width, int32 height)
 		fCellWidth = width;
 	if (height > 0)
 		fCellHeight = height;
+}
+
+
+void
+Terminal::SetPixelScale(float scale)
+{
+	if (scale > 0)
+		fPixelScale = scale;
 }
 
 
@@ -1003,6 +1019,143 @@ Terminal::Find(const char* pattern, TermPoint start, bool forward,
 
 	delete[] cells;
 	return found;
+}
+
+
+/*!	Every match, for the search bar to highlight and count. Logical lines
+	(rows joined where they wrapped) are searched one at a time, so a match
+	can cross a soft wrap but not a line end.
+*/
+bool
+Terminal::FindAll(const char* pattern, bool matchCase, bool matchWord,
+	bool regex, std::vector<std::pair<TermPoint, TermPoint> >& _matches,
+	size_t limit) const
+{
+	_matches.clear();
+	std::vector<uint32> needle;
+	decode_pattern(pattern, needle);
+	if (needle.empty())
+		return true;
+	if (!matchCase) {
+		for (size_t i = 0; i < needle.size(); i++)
+			needle[i] = fold_case(needle[i]);
+	}
+
+	std::wregex expression;
+	if (regex) {
+		std::wstring wide;
+		for (size_t i = 0; i < needle.size(); i++) {
+			wide += sizeof(wchar_t) < 4 && needle[i] > 0xffff
+				? (wchar_t)0xfffd : (wchar_t)needle[i];
+		}
+		try {
+			expression.assign(wide, matchCase ? std::regex::ECMAScript
+				: std::regex::ECMAScript | std::regex::icase);
+		} catch (...) {
+			return false;
+		}
+	}
+
+	TerminalCell* cells = new(std::nothrow) TerminalCell[fColumns];
+	if (cells == NULL)
+		return true;
+
+	LogicalLine line;
+	std::wstring text;
+	int32 row = -HistorySize();
+	while (row < fRows && _matches.size() < limit) {
+		// the logical line starting at this row
+		line.characters.clear();
+		line.positions.clear();
+		while (row < fRows) {
+			uint16 flags = 0;
+			GetLine(row, cells, &flags);
+			int32 length = fColumns;
+			if ((flags & LINE_WRAPPED) == 0) {
+				while (length > 0 && cells[length - 1].IsEmpty())
+					length--;
+			}
+			for (int32 x = 0; x < length; x++) {
+				if (cells[x].IsWideTail())
+					continue;
+				uint32 c = ' ';
+				uint32 codePoints[1];
+				if (!cells[x].IsEmpty() && GetCharacter(cells[x].character,
+						codePoints, 1) == 1) {
+					c = codePoints[0];
+				}
+				line.characters.push_back(matchCase ? c : fold_case(c));
+				line.positions.push_back(TermPoint(x, row));
+			}
+			row++;
+			if ((flags & LINE_WRAPPED) == 0)
+				break;
+		}
+
+		const std::vector<uint32>& characters = line.characters;
+		size_t count = characters.size();
+		// adds the match [first, last) unless it is not a whole word
+		struct Adder {
+			static void Add(const Terminal* terminal, const LogicalLine& line,
+				size_t first, size_t last, bool matchWord,
+				std::vector<std::pair<TermPoint, TermPoint> >& matches)
+			{
+				if (last <= first)
+					return;
+				if (matchWord && ((first > 0
+						&& is_word_character(line.characters[first - 1]))
+					|| (last < line.characters.size()
+						&& is_word_character(line.characters[last])))) {
+					return;
+				}
+				TermPoint lastPosition = line.positions[last - 1];
+				TerminalCell cell;
+				terminal->GetCell(lastPosition.y, lastPosition.x, cell);
+				matches.push_back(std::make_pair(line.positions[first],
+					TermPoint(lastPosition.x + (cell.IsWide() ? 2 : 1),
+						lastPosition.y)));
+			}
+		};
+
+		if (!regex) {
+			for (size_t i = 0; i + needle.size() <= count
+					&& _matches.size() < limit; i++) {
+				if (memcmp(&characters[i], needle.data(),
+						needle.size() * sizeof(uint32)) != 0) {
+					continue;
+				}
+				size_t before = _matches.size();
+				Adder::Add(this, line, i, i + needle.size(), matchWord,
+					_matches);
+				if (_matches.size() > before)
+					i += needle.size() - 1;
+			}
+			continue;
+		}
+
+		if (count == 0)
+			continue;
+		text.resize(count);
+		for (size_t i = 0; i < count; i++) {
+			text[i] = sizeof(wchar_t) < 4 && characters[i] > 0xffff
+				? (wchar_t)0xfffd : (wchar_t)characters[i];
+		}
+		try {
+			std::wsregex_iterator end;
+			for (std::wsregex_iterator it(text.begin(), text.end(),
+					expression); it != end && _matches.size() < limit; it++) {
+				size_t first = it->position(0);
+				size_t length = it->length(0);
+				Adder::Add(this, line, first, first + length, matchWord,
+					_matches);
+			}
+		} catch (...) {
+			// too complex for this line (regex_error): no matches in it
+		}
+	}
+
+	delete[] cells;
+	return true;
 }
 
 

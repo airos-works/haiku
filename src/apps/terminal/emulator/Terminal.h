@@ -336,6 +336,18 @@ public:
 		virtual	void			TerminalDragAndDrop(const char* data);
 		//! kitty's file transfer (OSC 5113): what follows "5113;".
 		virtual	void			TerminalFileTransfer(const char* data);
+		//! Shell integration marks: 'A' a prompt starts, 'C' a command's
+		//! output starts, 'D' it finished (with its \a status, or -1),
+		//! 'M' iTerm2's SetMark.
+		virtual	void			TerminalShellMark(char mark, int32 status);
+		//! iTerm2's RequestAttention: "yes", "once", "no" or "fireworks".
+		virtual	void			TerminalRequestAttention(const char* value);
+		//! iTerm2's StealFocus.
+		virtual	void			TerminalStealFocus();
+		//! A file iTerm2's File= sent without inline=1: to be saved, if
+		//! the user wants it. \a name may be empty.
+		virtual	void			TerminalDownload(const char* name,
+									const std::string& data);
 	};
 
 	struct CursorInfo {
@@ -375,6 +387,9 @@ public:
 			void				SetCellSize(int32 width, int32 height);
 			int32				CellWidth() const	{ return fCellWidth; }
 			int32				CellHeight() const	{ return fCellHeight; }
+			//! Device pixels per logical pixel (iTerm2's points).
+			void				SetPixelScale(float scale);
+			float				PixelScale() const	{ return fPixelScale; }
 
 			status_t			SetHistoryCapacity(int32 lines);
 
@@ -422,6 +437,15 @@ public:
 									bool forward, bool matchCase,
 									bool matchWord, TermPoint& _matchStart,
 									TermPoint& _matchEnd) const;
+			//! All matches of \a pattern in the history and on the screen,
+			//! in order, at most \a limit. With \a regex the pattern is an
+			//! ECMAScript regular expression. Returns false for a regular
+			//! expression that is not valid.
+			bool				FindAll(const char* pattern, bool matchCase,
+									bool matchWord, bool regex,
+									std::vector<std::pair<TermPoint,
+										TermPoint> >& _matches,
+									size_t limit = 100000) const;
 			//! Previous/next shell prompt (OSC 133) from \a row.
 			bool				FindPrompt(int32 row, bool forward,
 									int32& _row) const;
@@ -760,6 +784,9 @@ private:
 			void				_PopColors(int32 index);
 			void				_ClipboardProtocol(const char* data);
 			void				_TextSizing(const char* data);
+			void				_ITerm2(const std::string& argument);
+			void				_ITerm2File(const std::string& arguments,
+									const std::string& data);
 
 	// device control strings
 			void				_RequestStatusString(const char* request);
@@ -779,6 +806,7 @@ private:
 			int32				fRows;
 			int32				fCellWidth;
 			int32				fCellHeight;
+			float				fPixelScale;
 
 			Screen				fMain;
 			Screen				fAlternate;
@@ -867,6 +895,12 @@ private:
 				size_t			size;
 			}					fClipboardWrite;
 			Base64Decoder		fClipboardDecoder;
+
+			// iTerm2: a file in pieces (MultipartFile), user variables
+			bool				fMultipartActive;
+			std::string			fMultipartArguments;
+			std::string			fMultipartData;
+			std::map<std::string, std::string> fUserVariables;
 
 			std::string			fOutput;
 			TerminalGraphics*	fGraphics;
