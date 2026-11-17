@@ -23,7 +23,12 @@ the lab Pi 5 from the KVM's virtual USB disk, unchanged except for the lab's
 `rpi_display` 3840x2160 at 60 Hz on HDMI 1 with app_server's DMA flushes,
 `broadcomfmac`, `h4bcm` patched, `bcm2712_hdmi_audio`, `rpi_thermal`, first
 login. The SD card's install, made from a CI image and updated by System
-Updater (20261116.2347), starts the same way.
+Updater (20261116.2347), starts the same way. The lab Pi 4 (4 GB, rev 1.5)
+took release 20261117.0539 (hrev60207+2758, which has these checks) through
+System Updater, loader and boot archive included, and started it to the
+desktop: SD card at 50 MHz, BFS from it, VL805 USB, V3D 4.2, GENET 1 Gbit and
+DHCP, 4K60 on HDMI 0, VCHIQ sound, Wi-Fi and Bluetooth drivers; the update was
+confirmed after one start.
 
 USB boot on a supply that is not 5 A: the EEPROM boots from USB only when
 config.txt has `usb_max_current_enable=1`. The image leaves it out (it lets
