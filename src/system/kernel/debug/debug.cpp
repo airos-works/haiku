@@ -2622,6 +2622,26 @@ debug_is_debugged_team(team_id teamID)
 
 
 //	#pragma mark -
+/*!	Enters the kernel debugger for _user_kernel_debugger() with a message
+	that names initial commands (see execute_panic_commands()).
+*/
+static void
+user_kernel_debugger_with_commands(const char* format, ...)
+{
+	// (variadic only for the va_list kernel_debugger_internal() takes)
+	va_list args;
+	va_start(args, format);
+
+	cpu_status state = disable_interrupts();
+
+	kernel_debugger_internal("USER: ", format, args, smp_get_current_cpu());
+
+	restore_interrupts(state);
+
+	va_end(args);
+}
+
+
 //	userland syscalls
 
 
@@ -2638,6 +2658,22 @@ _user_kernel_debugger(const char* userMessage)
 	if (userMessage == NULL || !IS_USER_ADDRESS(userMessage) || user_strlcpy(
 			message + length, userMessage, sizeof(message) - length) < 0) {
 		return B_BAD_ADDRESS;
+	}
+
+	if (strstr(message, kKDLMessageCommandSeparator) != NULL) {
+		// Commands for the debugger to run on entry, as a panic() message may
+		// carry them: "what happened@!threads 123; bt 456; reboot". With
+		// "reboot" last, a machine nobody can type at (a hung desktop whose
+		// keyboard the debugger does not drive) records its state in the
+		// syslog buffer, which the next start keeps as previous_syslog.
+		// The message is the format execute_panic_commands() looks for the
+		// commands in, so it must not have any of its own.
+		for (char* c = message + length; *c != '\0'; c++) {
+			if (*c == '%')
+				*c = '?';
+		}
+		user_kernel_debugger_with_commands(message + length);
+		return B_OK;
 	}
 
 	kernel_debugger(message);

@@ -23,6 +23,12 @@
 static int
 cmd_reboot(int argc, char **argv)
 {
+#if defined(__i386__) || defined(__x86_64__)
+	// What the debugger printed is in the syslog buffer, which the loaders
+	// that keep it hand to the next start (previous_syslog): it must be in
+	// RAM, not only in this CPU's caches, when the machine resets.
+	asm volatile("wbinvd" ::: "memory");
+#endif
 	arch_cpu_shutdown(true);
 	return 0;
 		// I'll be really suprised if this line ever runs! ;-)
