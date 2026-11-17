@@ -51,6 +51,11 @@ enum usb_hc_mode {
 };
 #define	USB_MODE_MAX	(USB_MODE_DUAL+1)
 
+/* interface classes, as in FreeBSD's usb.h */
+#define	UICLASS_VENDOR		0xff
+#define	UISUBCLASS_VENDOR	0xff
+#define	UIPROTO_VENDOR		0xff
+
 #define usb_endpoint_descriptor freebsd_usb_endpoint_descriptor
 struct usb_endpoint_descriptor {
 	uByte	bLength;

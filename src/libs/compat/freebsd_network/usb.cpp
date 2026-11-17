@@ -115,7 +115,8 @@ get_next_usb_device(uint32* cookie, freebsd_usb_device* result)
 
 
 static status_t
-get_usb_device_attach_arg(struct freebsd_usb_device* device, struct usb_attach_arg* uaa)
+get_usb_device_attach_arg(struct freebsd_usb_device* device, size_t ifaceIndex,
+	struct usb_attach_arg* uaa)
 {
 	memset(uaa, 0, sizeof(struct usb_attach_arg));
 
@@ -135,16 +136,19 @@ get_usb_device_attach_arg(struct freebsd_usb_device* device, struct usb_attach_a
 	if (config == NULL)
 		return B_BAD_VALUE;
 
-	// TODO: represent more than just interface[0], but how?
-	usb_interface_info* iface = config->interface[0].active;
-	if (iface == NULL)
+	if (ifaceIndex >= config->interface_count)
+		return B_BAD_INDEX;
+	usb_interface_info* iface = config->interface[ifaceIndex].active;
+	if (iface == NULL || iface->descr == NULL)
 		return B_NO_INIT;
 
 	uaa->info.bInterfaceClass = iface->descr->interface_class;
 	uaa->info.bInterfaceSubClass = iface->descr->interface_subclass;
 	uaa->info.bInterfaceProtocol = iface->descr->interface_protocol;
+	uaa->info.bIfaceIndex = ifaceIndex;
+	uaa->info.bIfaceNum = iface->descr->interface_number;
 
-	// TODO: bIface{Index,Num}, bConfig{Index,Num}
+	// TODO: bConfig{Index,Num}
 
 	uaa->device = device;
 	uaa->iface = NULL;
@@ -214,20 +218,29 @@ _fbsd_init_hardware_uhub(driver_t* drivers[])
 	uint32 cookie = 0;
 	struct freebsd_usb_device udev = {};
 	while ((status = get_next_usb_device(&cookie, &udev)) == B_OK) {
-		int best = 0;
-		driver_t* driver = NULL;
-
-		struct usb_attach_arg uaa;
-		status = get_usb_device_attach_arg(&udev, &uaa);
-		if (status != B_OK)
+		const usb_configuration_info* config
+			= sUSB->get_configuration(udev.haiku_usb_device);
+		if (config == NULL)
 			continue;
 
-		struct device device = {};
-		device.parent = root;
-		device.root = root;
-		device_set_ivars(&device, &uaa);
+		// Interface 0 first, as before; the others only when no driver
+		// takes interface 0. Combination devices such as the RTL8723BU
+		// have their Bluetooth half on interfaces 0 and 1 and the Wi-Fi
+		// half on interface 2; drivers that match by vendor and product
+		// alone (and accept any interface) still attach exactly once.
+		driver_t* driver = NULL;
+		struct usb_attach_arg uaa;
+		for (size_t i = 0; i < config->interface_count && driver == NULL; i++) {
+			if (get_usb_device_attach_arg(&udev, i, &uaa) != B_OK)
+				continue;
 
-		driver = __haiku_probe_drivers(&device, drivers);
+			struct device device = {};
+			device.parent = root;
+			device.root = root;
+			device_set_ivars(&device, &uaa);
+
+			driver = __haiku_probe_drivers(&device, drivers);
+		}
 		if (driver == NULL)
 			continue;
 
