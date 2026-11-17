@@ -387,8 +387,14 @@ Emmc2Bus::_SetUpSdioPort()
 {
 	uint64 pinctrlBase;
 	bool d0;
-	if (fDevice.config == 0 || !bcm2712_find_pinctrl(&pinctrlBase, &d0)) {
-		ERROR("SDIO port: no configuration registers or pin multiplexer\n");
+	if (fDevice.config == 0) {
+		ERROR("SDIO port: no configuration registers in the device tree\n");
+		return B_DEVICE_NOT_FOUND;
+	}
+	if (!bcm2712_find_pinctrl(&pinctrlBase, &d0)) {
+		// The boot device probe comes before the pin multiplexer's device
+		// tree node can be found; the probe after it sets the port up.
+		INFO("SDIO port: no pin multiplexer yet\n");
 		return B_DEVICE_NOT_FOUND;
 	}
 
