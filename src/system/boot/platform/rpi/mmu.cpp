@@ -58,6 +58,11 @@ struct memory_region {
 // (the frame buffer is in there).
 static const phys_addr_t kPeripheralBase = 0xfc000000;
 
+// The BCM2837's (Pi 3) peripherals and the cores' local interrupt
+// controller (0x40000000), 2 MB aligned.
+static const phys_addr_t kBCM2837PeripheralBase = 0x3f000000;
+static const phys_addr_t kBCM2837PeripheralEnd = 0x41000000;
+
 // The BCM2712's (Pi 5) peripherals are all above 64 GB: the SoC's own at
 // 0x10_0000_0000, the PCIe windows, and with them the RP1 (UARTs, USB,
 // Ethernet) at 0x1f_0000_0000. Below 4 GB is only RAM there.
@@ -408,7 +413,13 @@ identity_flags(phys_addr_t address, size_t size, bool memoryKnown)
 	// Before the device tree has been read the SoC is not known: the
 	// BCM2711's window is device memory then. The loader allocates from the
 	// bottom of RAM, so a Pi 5 has no business up there before that.
-	if ((address >= kPeripheralBase && address < 0x100000000ull
+	if (gBCM2837) {
+		if (address >= kBCM2837PeripheralBase
+			&& address < kBCM2837PeripheralEnd) {
+			return ARMv8TranslationTableDescriptor::DefaultPeripheralAttribute
+				| mair.MaskOf(MAIR_DEVICE_nGnRnE) | kBlock;
+		}
+	} else if ((address >= kPeripheralBase && address < 0x100000000ull
 			&& (!memoryKnown || !gBCM2712))
 		|| (address >= kBCM2712PeripheralBase
 			&& address < kBCM2712PeripheralEnd)) {
@@ -536,6 +547,12 @@ mmu_flush_data_cache(void* address, size_t size)
 void
 mmu_init_early()
 {
+	// The BCM2837 has Cortex-A53 cores, the BCM2711 A72s, the BCM2712 A76s:
+	// the SoC's peripheral window must be device memory from the start.
+	uint64 midr = READ_SPECIALREG(MIDR_EL1);
+	if (((midr >> 24) & 0xff) == 0x41 && ((midr >> 4) & 0xfff) == 0xd03)
+		gBCM2837 = true;
+
 	build_identity_map(false);
 	mmu_enable_on_this_cpu();
 }

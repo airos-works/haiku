@@ -23,6 +23,7 @@
 #include "VMSAv8TranslationMap.h"
 #include <string.h>
 
+#include "arch_int_bcm2836.h"
 #include "arch_int_gicv2.h"
 #include "arch_int_gicv3.h"
 #include "soc.h"
@@ -118,6 +119,12 @@ arch_int_init_post_vm(kernel_args *args)
 		ic = new(std::nothrow)
 			GICv3InterruptController(args->arch_args.interrupt_controller.regs1.start,
 				args->arch_args.interrupt_controller.regs2.start, args->num_cpus);
+	}
+
+	if (strcmp(args->arch_args.interrupt_controller.kind, INTC_KIND_BCM2836) == 0) {
+		ic = new(std::nothrow) BCM2836InterruptController(
+			args->arch_args.interrupt_controller.regs1.start,
+			args->arch_args.interrupt_controller.regs2.start);
 	}
 
 	if (ic == NULL)

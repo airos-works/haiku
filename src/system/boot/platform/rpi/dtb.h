@@ -28,6 +28,10 @@ extern fdt_cpu gFDTCpus[MAX_FDT_CPUS];
 extern uint32 gFDTCpuCount;
 extern bool gBCM2712;
 	// a Raspberry Pi 5 (or 500, CM5): the SoC is a BCM2712
+extern bool gBCM2837;
+	// a Raspberry Pi 3 (or Zero 2, CM3): the SoC is a BCM2837, its
+	// peripherals at 0x3f000000, no GIC. Known from the cores (Cortex-A53)
+	// before the device tree is read.
 extern uint32 gPsciConduit;
 	// ARM64_PSCI_*, from /psci
 

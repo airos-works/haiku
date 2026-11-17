@@ -27,6 +27,7 @@ KernelMergeObject kernel_arch_arm64.o :
 	arch_real_time_clock.cpp
 	arch_platform.cpp
 	arch_asm.S
+	arch_int_bcm2836.cpp
 	arch_int_gicv2.cpp
 	arch_int_gicv3.cpp
 	arch_int_gicv3_its.cpp

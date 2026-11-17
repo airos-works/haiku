@@ -16,6 +16,8 @@
 #define		INTC_KIND_OMAP3		"omap3"
 #define		INTC_KIND_PXA		"pxa"
 #define		INTC_KIND_SUN4I		"sun4i"
+#define		INTC_KIND_BCM2836	"bcm2836"
+	// regs1: the ARM control block, regs2: the local controller
 
 
 enum { GICV2 = 2, GICV3 = 3, GICV4 = 4 };

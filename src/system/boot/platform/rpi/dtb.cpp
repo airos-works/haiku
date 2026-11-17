@@ -45,6 +45,7 @@ addr_range gBootArchive = {0, 0};
 fdt_cpu gFDTCpus[MAX_FDT_CPUS];
 uint32 gFDTCpuCount = 0;
 bool gBCM2712 = false;
+bool gBCM2837 = false;
 uint32 gPsciConduit = ARM64_PSCI_NONE;
 
 
@@ -161,6 +162,124 @@ get_gic_interrupt(int node)
 	if (type == GIC_INTERRUPT_TYPE_SPI)
 		return number + GIC_INTERRUPT_BASE_SPI;
 	return number + GIC_INTERRUPT_BASE_PPI;
+}
+
+
+/*!	The phandle of the interrupt controller \a node's interrupts go to. */
+static uint32
+interrupt_parent(const void* tree, int node)
+{
+	while (node >= 0) {
+		const uint32* parent = (const uint32*)fdt_getprop(tree, node,
+			"interrupt-parent", NULL);
+		if (parent != NULL)
+			return fdt32_to_cpu(*parent);
+		node = fdt_parent_offset(tree, node);
+	}
+	return 0;
+}
+
+
+// The BCM2836/BCM2837 interrupt numbers of the kernel, see
+// arch_int_bcm2836.h: the VideoCore's interrupts are SPIs from 32 on, the
+// ARM's own (basic bank) follow at 96; the local controller's inputs are
+// PPIs.
+#define BCM2836_GPU_IRQ_BASE	32
+#define BCM2836_BASIC_IRQ_BASE	96
+
+static int sArmctrlPhandle = -1;
+static int sLocalPhandle = -1;
+
+
+/*!	The kernel's number of interrupt \a index of \a node in a BCM2837 tree
+	as the firmware has it (two cells: bank and number for the ARM control
+	block, number and flags for the local controller), or 0.
+*/
+static uint32
+bcm2837_interrupt(const void* tree, int node, int index)
+{
+	int length;
+	const uint32* cells = (const uint32*)fdt_getprop(tree, node, "interrupts",
+		&length);
+	if (cells == NULL || length < (index + 1) * 8)
+		return 0;
+	uint32 first = fdt32_to_cpu(cells[index * 2]);
+	uint32 second = fdt32_to_cpu(cells[index * 2 + 1]);
+
+	uint32 parent = interrupt_parent(tree, node);
+	if ((int)parent == sArmctrlPhandle) {
+		if (first == 0 && second < 8)
+			return BCM2836_BASIC_IRQ_BASE + second;
+		if ((first == 1 || first == 2) && second < 32)
+			return BCM2836_GPU_IRQ_BASE + (first - 1) * 32 + second;
+		return 0;
+	}
+	if ((int)parent == sLocalPhandle) {
+		// the cores' timers CNTPS, CNTPNS, CNTHP, CNTV; the PMU
+		static const uint32 kLocal[10] = {29, 30, 26, 27, 0, 0, 0, 0, 0, 23};
+		return first < 10 ? kLocal[first] : 0;
+	}
+	return 0;
+}
+
+
+/*!	Gives the BCM2837's device interrupts GIC-style specifiers in the
+	kernel's copy of the tree (\a tree): <0 SPI flags> for the ARM control
+	block's, <1 PPI flags> for the local controller's. The kernel's device
+	tree bus and drivers then number them as they would a GIC's, see
+	arch_int_bcm2836.h. Interrupts that go to other controllers (the GPIO
+	pins) stay as they are.
+*/
+static void
+convert_bcm2837_interrupts(void* tree)
+{
+	if (sArmctrlPhandle < 0 || sLocalPhandle < 0)
+		return;
+
+	uint32 converted = 0;
+	int node = -1;
+	while ((node = fdt_next_node(tree, node, NULL)) >= 0) {
+		int length;
+		const uint32* cells = (const uint32*)fdt_getprop(tree, node,
+			"interrupts", &length);
+		if (cells == NULL || length <= 0 || length % 8 != 0)
+			continue;
+		uint32 parent = interrupt_parent(tree, node);
+		if ((int)parent != sArmctrlPhandle && (int)parent != sLocalPhandle)
+			continue;
+
+		uint32 count = length / 8;
+		fdt32_t specifiers[3 * 32];
+		if (count > 32)
+			continue;
+		for (uint32 i = 0; i < count; i++) {
+			uint32 irq = bcm2837_interrupt(tree, node, i);
+			bool ppi = irq != 0 && irq < BCM2836_GPU_IRQ_BASE;
+			specifiers[i * 3] = cpu_to_fdt32(ppi ? 1 : 0);
+			specifiers[i * 3 + 1] = cpu_to_fdt32(irq == 0 ? 0x3ff
+				: ppi ? irq - 16 : irq - 32);
+			specifiers[i * 3 + 2] = cpu_to_fdt32(4);
+		}
+		// The property is set on the node itself: the parent may come
+		// from an ancestor (the root names the ARM control block).
+		if (fdt_setprop(tree, node, "interrupts", specifiers,
+				count * 12) != 0
+			|| fdt_setprop_u32(tree, node, "interrupt-parent", parent) != 0) {
+			dprintf("BCM2837: no room to convert the interrupts of %s\n",
+				fdt_get_name(tree, node, NULL));
+			return;
+		}
+		converted++;
+	}
+
+	int armctrl = fdt_node_offset_by_phandle(tree, sArmctrlPhandle);
+	int local = fdt_node_offset_by_phandle(tree, sLocalPhandle);
+	if (armctrl >= 0)
+		fdt_setprop_u32(tree, armctrl, "#interrupt-cells", 3);
+	if (local >= 0)
+		fdt_setprop_u32(tree, local, "#interrupt-cells", 3);
+	dprintf("BCM2837: interrupts of %" B_PRIu32 " devices converted\n",
+		converted);
 }
 
 
@@ -518,7 +637,8 @@ init_uart_node(int node)
 
 	uart.regs = regs;
 	strlcpy(uart.kind, kind, sizeof(uart.kind));
-	uart.irq = get_gic_interrupt(node);
+	uart.irq = gBCM2837 ? bcm2837_interrupt(gFDT, node, 0)
+		: get_gic_interrupt(node);
 	uart.clock = PL011_DEFAULT_CLOCK;
 
 	const uint32* frequency = (const uint32*)fdt_getprop(gFDT, node,
@@ -587,6 +707,21 @@ init_interrupt_controller()
 		= {"arm,gic-400", "arm,cortex-a15-gic"};
 
 	intc_info& controller = gKernelArgs.arch_args.interrupt_controller;
+
+	// BCM2836/BCM2837: the ARM control block and the cores' local controller
+	int armctrl = fdt_node_offset_by_compatible(gFDT, -1,
+		"brcm,bcm2836-armctrl-ic");
+	int local = fdt_node_offset_by_compatible(gFDT, -1,
+		"brcm,bcm2836-l1-intc");
+	if (armctrl >= 0 && local >= 0) {
+		strlcpy(controller.kind, INTC_KIND_BCM2836, sizeof(controller.kind));
+		fdt_get_reg(armctrl, 0, controller.regs1);
+		fdt_get_reg(local, 0, controller.regs2);
+		sArmctrlPhandle = fdt_get_phandle(gFDT, armctrl);
+		sLocalPhandle = fdt_get_phandle(gFDT, local);
+		return;
+	}
+
 	for (size_t i = 0; i < B_COUNT_OF(kCompatible); i++) {
 		int node = fdt_node_offset_by_compatible(gFDT, -1, kCompatible[i]);
 		if (node < 0)
@@ -664,10 +799,14 @@ fdt_init(void* fdt)
 		panic("No device tree from the firmware");
 	gFDT = fdt;
 	gBCM2712 = fdt_node_check_compatible(fdt, 0, "brcm,bcm2712") == 0;
+	if (fdt_node_check_compatible(fdt, 0, "brcm,bcm2837") == 0)
+		gBCM2837 = true;
 
 	if (gBCM2712)
 		fixup_rp1();
 	mailbox_init();
+	init_interrupt_controller();
+		// before the UART: its interrupt is numbered for the controller
 	init_uart();
 	serial_init();
 		// from here on dprintf() reaches the UART
@@ -683,7 +822,6 @@ fdt_init(void* fdt)
 
 	init_memory();
 	init_chosen();
-	init_interrupt_controller();
 	init_psci();
 	init_cpus();
 
@@ -1035,6 +1173,9 @@ fdt_set_kernel_args()
 		}
 		dprintf("ARM clock: up to %" B_PRIu32 " Hz\n", rate);
 	}
+
+	if (gBCM2837)
+		convert_bcm2837_interrupts(copy);
 
 	if (gBCM2712) {
 		setup_rp1_interrupts(copy);
