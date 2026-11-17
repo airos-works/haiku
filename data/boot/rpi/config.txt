@@ -1,10 +1,11 @@
-# air/OS on the Raspberry Pi 4 and 5: the firmware starts the air/OS loader
-# directly, the way it starts a Linux kernel. See docs/rpi4/BOOT.md and
-# docs/rpi5/BOOT.md.
+# air/OS on the Raspberry Pi 3, 4 and 5: the firmware starts the air/OS
+# loader directly, the way it starts a Linux kernel. See docs/rpi3/BOOT.md,
+# docs/rpi4/BOOT.md and docs/rpi5/BOOT.md.
 #
-# The Pi 4 reads this file through start4.elf; the Pi 5's EEPROM bootloader
-# reads it itself (it has no start*.elf). [pi4] and [pi5] lines apply to that
-# board only, [all] ends such a section.
+# The Pi 3 reads this file through start.elf, the Pi 4 through start4.elf;
+# the Pi 5's EEPROM bootloader reads it itself (it has no start*.elf).
+# [pi3], [pi4] and [pi5] lines apply to that board only, [all] ends such a
+# section.
 
 arm_64bit=1
 
@@ -34,6 +35,15 @@ max_framebuffers=2
 hdmi_force_hotplug:0=1
 hdmi_force_hotplug:1=1
 disable_splash=1
+
+[pi3]
+# Bluetooth gets the mini UART (GPIO 32/33), the console the PL011. The mini
+# UART's baud rate follows the core clock: keep that fixed.
+dtoverlay=miniuart-bt
+core_freq=250
+# The firmware's H.264 decoder and the 3D core's binner want VideoCore
+# memory; the rest of the 1 GB stays the ARM's.
+gpu_mem=128
 
 [pi4]
 enable_gic=1

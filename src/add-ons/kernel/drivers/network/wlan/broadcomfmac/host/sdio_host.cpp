@@ -45,8 +45,21 @@
 #define GPIO_PULL2				0xec	// pins 32 to 47, two bits each
 #define GPIO_ALT3				7
 #define GPIO_PULL_UP			1
+// the BCM2837's (Pi 3 B+): the same controller and pins, its peripherals at
+// 0x3f000000, the controller's interrupt the VideoCore's 62 (the kernel
+// numbers those from 32), the BCM2835's GPPUD/GPPUDCLK pull-up sequence
+#define BCM2837_SDHCI_BASE		0x3f300000
+#define BCM2837_SDHCI_INTERRUPT	(62 + 32)
+#define BCM2837_GPIO_BASE		0x3f200000
+#define GPIO_GPPUD				0x94
+#define GPIO_GPPUDCLK1			0x9c	// pins 32 to 53
 #define EXPANDER_GPIO_BASE		128
 #define EXPANDER_WL_ON			1
+
+static bool sBCM2837;
+static phys_addr_t sSdhciBase = SDHCI_BASE;
+static uint32 sSdhciInterrupt = SDHCI_INTERRUPT;
+static phys_addr_t sGpioBase = GPIO_BASE;
 
 #define REG_BLOCK				0x04
 #define REG_ARGUMENT			0x08
@@ -350,7 +363,17 @@ setup_pins()
 			pull |= GPIO_PULL_UP << ((pin - 32) * 2);
 	}
 	*(volatile uint32*)(sGpio + GPIO_FSEL3) = select;
-	*(volatile uint32*)(sGpio + GPIO_PULL2) = pull;
+	if (sBCM2837) {
+		// GPPUD says what (2: up), the clock register which pins
+		volatile uint32* gpio = (volatile uint32*)sGpio;
+		gpio[GPIO_GPPUD / 4] = 2;
+		spin(5);
+		gpio[GPIO_GPPUDCLK1 / 4] = 0x1f << (35 - 32);
+		spin(5);
+		gpio[GPIO_GPPUD / 4] = 0;
+		gpio[GPIO_GPPUDCLK1 / 4] = 0;
+	} else
+		*(volatile uint32*)(sGpio + GPIO_PULL2) = pull;
 	memory_full_barrier();
 }
 
@@ -377,6 +400,28 @@ rpi_sdio_present(void)
 			!= B_OK) {
 		return false;
 	}
+
+	// The Pi 3 (BCM2837): its cores' local interrupt controller is the
+	// BCM2836/BCM2837's own. The card slot is on the other controller (the
+	// "sdhost"), so this one is the Wi-Fi chip's.
+	device_attr bcm2837[] = {
+		{ "fdt/compatible", B_STRING_TYPE,
+			{ .string = "brcm,bcm2836-l1-intc" } },
+		{}
+	};
+	device_node* root2837 = manager->get_root_node();
+	device_node* intc = NULL;
+	if (manager->find_child_node(root2837, bcm2837, &intc) == B_OK) {
+		manager->put_node(intc);
+		manager->put_node(root2837);
+		put_module(B_DEVICE_MANAGER_MODULE_NAME);
+		sBCM2837 = true;
+		sSdhciBase = BCM2837_SDHCI_BASE;
+		sSdhciInterrupt = BCM2837_SDHCI_INTERRUPT;
+		sGpioBase = BCM2837_GPIO_BASE;
+		return true;
+	}
+	manager->put_node(root2837);
 
 	device_attr attributes[] = {
 		{ "fdt/compatible", B_STRING_TYPE,
@@ -415,10 +460,10 @@ rpi_sdio_init(void)
 	if (status != B_OK)
 		return status;
 
-	sRegisterArea = map_physical_memory("broadcomfmac sdio", SDHCI_BASE,
+	sRegisterArea = map_physical_memory("broadcomfmac sdio", sSdhciBase,
 		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
 		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&sRegisters);
-	sGpioArea = map_physical_memory("broadcomfmac gpio", GPIO_BASE,
+	sGpioArea = map_physical_memory("broadcomfmac gpio", sGpioBase,
 		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
 		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&sGpio);
 	if (sRegisterArea < 0 || sGpioArea < 0) {
@@ -524,7 +569,7 @@ rpi_sdio_uninit(void)
 {
 	if (sInterruptInstalled) {
 		write_reg(REG_INTERRUPT_ENABLE, 0);
-		remove_io_interrupt_handler(SDHCI_INTERRUPT, card_interrupt, NULL);
+		remove_io_interrupt_handler(sSdhciInterrupt, card_interrupt, NULL);
 		sInterruptInstalled = false;
 	}
 	sCardHandler = NULL;
@@ -684,7 +729,7 @@ rpi_sdio_set_interrupt_handler(void (*handler)(void*), void* data)
 	if (handler == NULL || sInterruptInstalled)
 		return B_OK;
 
-	status_t status = install_io_interrupt_handler(SDHCI_INTERRUPT,
+	status_t status = install_io_interrupt_handler(sSdhciInterrupt,
 		card_interrupt, NULL, 0);
 	if (status == B_OK)
 		sInterruptInstalled = true;

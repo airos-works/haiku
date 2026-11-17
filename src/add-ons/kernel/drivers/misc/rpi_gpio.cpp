@@ -3,9 +3,14 @@
  * Distributed under the terms of the MIT License.
  */
 
-/*	/dev/misc/rpi_gpio: the BCM2711's general purpose I/O pins for programs
-	such as AirPins; see <rpi_gpio.h>. On another board the driver finds no
-	device and publishes nothing.
+/*	/dev/misc/rpi_gpio: the BCM2711's (Pi 4) and BCM2837's (Pi 3) general
+	purpose I/O pins for programs such as AirPins; see <rpi_gpio.h>. On
+	another board the driver finds no device and publishes nothing.
+
+	The BCM2837's controller is the BCM2711's but for the pulls: they are
+	set with the GPPUD/GPPUDCLK sequence and cannot be read back, so the
+	driver remembers what it set (from the reset defaults: up on GPIO 0 to
+	8, down above).
 
 	Only the pins of the 40-pin header (GPIO 0 to 27, all in the first of
 	the controller's banks) can be claimed, so every register this driver
@@ -55,6 +60,12 @@
 #define REG_AREN0			0x7c
 #define REG_AFEN0			0x88
 #define REG_PULL(n)			(0xe4 + 4 * (n))	// sixteen pins each, two bits
+// the BCM2835/BCM2837's pull control
+#define REG_GPPUD			0x94
+#define REG_GPPUDCLK0		0x98
+#define GPPUD_OFF			0
+#define GPPUD_DOWN			1
+#define GPPUD_UP			2
 
 #define PIN_COUNT			58
 #define HEADER_PINS			0x0fffffffu			// GPIO 0 to 27
@@ -98,6 +109,10 @@ static area_id sRegistersArea = -1;
 static volatile uint8* sRegisters;
 static uint32 sInterrupt;
 static bool sInterruptInstalled;
+static bool sLegacyPulls;
+	// BCM2837: GPPUD, no read back
+static uint8 sPulls[PIN_COUNT];
+	// what this driver set, RPI_GPIO_PULL_* (legacy pulls only)
 static uint32 sBoardRevision;
 static uint64 sBoardSerial;
 
@@ -156,6 +171,8 @@ set_function(uint32 pin, uint8 function)
 static uint8
 get_pull(uint32 pin)
 {
+	if (sLegacyPulls)
+		return pin < PIN_COUNT ? sPulls[pin] : RPI_GPIO_PULL_NONE;
 	return (read_reg(REG_PULL(pin / 16)) >> ((pin % 16) * 2)) & 3;
 }
 
@@ -163,6 +180,19 @@ get_pull(uint32 pin)
 static void
 set_pull(uint32 pin, uint8 pull)
 {
+	if (sLegacyPulls) {
+		// what, then which pins, each held for 150 cycles
+		write_reg(REG_GPPUD, pull == RPI_GPIO_PULL_UP ? GPPUD_UP
+			: pull == RPI_GPIO_PULL_DOWN ? GPPUD_DOWN : GPPUD_OFF);
+		spin(2);
+		write_reg(REG_GPPUDCLK0 + 4 * (pin / 32), 1u << (pin % 32));
+		spin(2);
+		write_reg(REG_GPPUD, GPPUD_OFF);
+		write_reg(REG_GPPUDCLK0 + 4 * (pin / 32), 0);
+		if (pin < PIN_COUNT)
+			sPulls[pin] = pull;
+		return;
+	}
 	uint32 shift = (pin % 16) * 2;
 	uint32 value = read_reg(REG_PULL(pin / 16));
 	value = (value & ~(3u << shift)) | ((uint32)pull << shift);
@@ -721,8 +751,23 @@ find_controller(phys_addr_t* _registers, size_t* _size, uint32* _interrupt)
 		{}
 	};
 	device_node* node = NULL;
-	if (sDeviceManager->find_child_node(root, attributes, &node) != B_OK)
+	if (sDeviceManager->find_child_node(root, attributes, &node) != B_OK) {
 		node = NULL;
+		// the Pi 3's
+		device_attr bcm2835[] = {
+			{ "fdt/compatible", B_STRING_TYPE,
+				{ .string = "brcm,bcm2835-gpio" } },
+			{}
+		};
+		if (sDeviceManager->find_child_node(root, bcm2835, &node) == B_OK) {
+			sLegacyPulls = true;
+			for (uint32 pin = 0; pin < PIN_COUNT; pin++) {
+				sPulls[pin] = pin <= 8 ? RPI_GPIO_PULL_UP
+					: RPI_GPIO_PULL_DOWN;
+			}
+		} else
+			node = NULL;
+	}
 	sDeviceManager->put_node(root);
 	if (node == NULL)
 		return B_DEVICE_NOT_FOUND;

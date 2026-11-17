@@ -10,7 +10,8 @@
 	of it on each output; the accelerant decides the regions (app_server's
 	display layout).
 
-	On the Pi 4 (BCM2711) it asks the firmware for one plane per output,
+	On the Pi 3 (BCM2837) and the Pi 4 (BCM2711) it asks the firmware for
+	one plane per output,
 	scaled to the output's mode: the "firmware KMS" property tags.
 
 	The Pi 5's (BCM2712) firmware accepts those requests but shows nothing.
@@ -89,6 +90,10 @@
 #define HVS_DISPSTAT1					0x58	// frame counts 0 and 1
 #define HVS_DISPSTAT2					0x68	// frame count 2
 #define HVS_MUX_NONE					3
+// The BCM2835's compositor (Pi 3, HVS generation 4): no muxes, each channel
+// its frame count in its own DISPSTATX, bits 17..12. The firmware shows
+// HDMI on channel 1.
+#define HVS4_DISPSTATX(x)				(0x48 + (x) * 0x10)
 
 // The BCM2712's compositor (HVS generation 6, D0 stepping; Linux's
 // vc4_regs.h SCALER6D_*, vc4_plane.c vc6_plane_mode_set()). Channel n feeds
@@ -200,6 +205,8 @@ struct display_info {
 	// the BCM2712's display lists: the firmware's plane of each channel,
 	// its list head, and which of the driver's two slots is next
 	bool			bcm2712;
+	bool			bcm2835;
+		// the Pi 3's compositor (HVS 4)
 	uint32			firmwareHead[RPI_DISPLAY_MAX_OUTPUTS];
 	uint32			firmwarePlane[RPI_DISPLAY_MAX_OUTPUTS][HVS6_PLANE_WORDS];
 	bool			hasFirmwarePlane[RPI_DISPLAY_MAX_OUTPUTS];
@@ -524,6 +531,8 @@ protected:
 			return -1;
 		if (fInfo->bcm2712)
 			return (_Read(HVS6_DISP_STATUS(fChannel)) >> 16) & 0x3f;
+		if (fInfo->bcm2835)
+			return (_Read(HVS4_DISPSTATX(fChannel)) >> 12) & 0x3f;
 		switch (fChannel) {
 			case 0:
 				return (_Read(HVS_DISPSTAT1) >> 20) & 0x3f;
@@ -551,6 +560,17 @@ private:
 				if ((_Read(HVS6_DISP_CTRL0(i)) & HVS6_DISP_CTRL0_ENB) != 0)
 					return i;
 				continue;
+			}
+			if (fInfo->bcm2835) {
+				// one HDMI output: the enabled channel, 1 first
+				static const int32 kChannels[3] = {1, 0, 2};
+				for (int32 c = 0; c < 3; c++) {
+					if ((_Read(HVS_DISPCTRLX(kChannels[c]))
+							& HVS_DISPCTRLX_ENABLE) != 0) {
+						return kChannels[c];
+					}
+				}
+				return -1;
 			}
 			uint32 mux = _Read(i == 0 ? HVS_DISPEOLN : HVS_DISPDITHER) >> 30;
 			if (mux == HVS_MUX_NONE
@@ -596,7 +616,7 @@ map_compositor(display_info* info)
 	void* address;
 	// the BCM2712's display lists are the driver's to write
 	info->hvsArea = map_physical_memory(info->bcm2712 ? "BCM2712 HVS"
-			: "BCM2711 HVS", page, mapSize,
+			: info->bcm2835 ? "BCM2835 HVS" : "BCM2711 HVS", page, mapSize,
 		B_ANY_KERNEL_ADDRESS | B_UNCACHED_MEMORY, B_KERNEL_READ_AREA
 			| (info->bcm2712 ? B_KERNEL_WRITE_AREA : 0),
 		&address);
@@ -614,6 +634,21 @@ map_compositor(display_info* info)
 static void output_dest(uint32 nativeWidth, uint32 nativeHeight, uint32 width,
 	uint32 height, int32* destX, int32* destY, uint32* destWidth,
 	uint32* destHeight);
+
+
+static bool
+compositor_is(device_node* node, const char* kind)
+{
+	device_node* parent = sDeviceManager->get_parent_node(node);
+	if (parent == NULL)
+		return false;
+	const char* compatible;
+	bool result = sDeviceManager->get_attr_string(parent, "fdt/compatible",
+			&compatible, false) == B_OK
+		&& strcmp(compatible, kind) == 0;
+	sDeviceManager->put_node(parent);
+	return result;
+}
 
 
 static bool
@@ -2628,6 +2663,7 @@ display_init_device(void* _info, void** _cookie)
 	info->hvsArea = -1;
 
 	info->bcm2712 = is_bcm2712(info->node);
+	info->bcm2835 = compositor_is(info->node, "brcm,bcm2835-hvs");
 	if (info->bcm2712) {
 		// the outputs' planes come from the compositor
 		map_compositor(info);
@@ -3101,7 +3137,8 @@ display_supports_device(device_node* parent)
 	const char* compatible;
 	if (sDeviceManager->get_attr_string(parent, "fdt/compatible", &compatible,
 			false) != B_OK || (strcmp(compatible, "brcm,bcm2711-hvs") != 0
-				&& strcmp(compatible, "brcm,bcm2712-hvs") != 0)) {
+				&& strcmp(compatible, "brcm,bcm2712-hvs") != 0
+				&& strcmp(compatible, "brcm,bcm2835-hvs") != 0)) {
 		return -1.0f;
 	}
 

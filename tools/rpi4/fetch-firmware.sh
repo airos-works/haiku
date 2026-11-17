@@ -11,6 +11,11 @@ TAG=${RPI_FIRMWARE_TAG:-1.20260915}
 DIR=${1:-/mnt/HaikuWork/rpi4/firmware/$TAG}
 BASE=https://raw.githubusercontent.com/raspberrypi/firmware/$TAG/boot
 FILES=(
+    # Raspberry Pi 3 (3 B, 3 B+, Zero 2 W, CM3): the boot ROM loads
+    # bootcode.bin, which starts the VideoCore firmware start.elf.
+    bootcode.bin start.elf fixup.dat
+    bcm2710-rpi-3-b.dtb bcm2710-rpi-3-b-plus.dtb bcm2710-rpi-zero-2-w.dtb
+    bcm2710-rpi-cm3.dtb
     start4.elf fixup4.dat LICENCE.broadcom
     bcm2711-rpi-4-b.dtb bcm2711-rpi-400.dtb bcm2711-rpi-cm4.dtb
     # Raspberry Pi 5, 500 and CM5: the EEPROM bootloader reads config.txt

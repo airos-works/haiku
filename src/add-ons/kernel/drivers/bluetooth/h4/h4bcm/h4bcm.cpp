@@ -12,6 +12,11 @@
 	(BCM4345C0.hcd, a list of HCI commands) when the device is opened, and
 	then passes packets between the UART and the HCI layer.
 
+	The Raspberry Pi 3 B+ (BCM2837) has it wired the same way: the mini UART
+	on GPIO 30 to 33, BT_ON on the firmware's expander. Its peripherals are
+	at 0x3f000000, the mini UART's interrupt is the VideoCore's 29, and its
+	pull-ups take the BCM2835's GPPUD/GPPUDCLK sequence.
+
 	The Raspberry Pi 5 has the same controller on the BCM2712's BCM7271
 	UART ("brcm,bcm7271-uart": a 16550 with its registers 4 bytes apart,
 	96 MHz clock, automatic RTS/CTS) on GPIO 24 to 27, and BT_ON on the
@@ -83,6 +88,13 @@
 #define  MU_CNTL_CTS_LOW	(1 << 7)	// automatic CTS asserts low
 #define MU_BAUD				0x68
 #define MU_INTERRUPT		(93 + 32)
+// the BCM2837's (Pi 3): the kernel numbers the VideoCore's interrupts from 32
+#define BCM2837_AUX_BASE	0x3f215000
+#define BCM2837_GPIO_BASE	0x3f200000
+#define BCM2837_MU_INTERRUPT	(29 + 32)
+#define GPIO_GPPUD			0x94
+#define GPIO_GPPUDCLK0		0x98
+#define GPIO_GPPUDCLK1		0x9c
 
 // the BCM2712's (Pi 5) 16550 style UART, registers 4 bytes apart
 #define U16550_DATA			0x00	// with LCR_DLAB: divisor low
@@ -140,6 +152,8 @@ static volatile uint8* sGpio;
 static area_id sGpioArea = -1;
 
 // the board's UART: register offsets and interrupt
+static bool sBCM2837;
+static uint64 sGpioBase = GPIO_BASE;
 static bool sBCM2712;
 static bool sBCM2712D0;
 static uint64 sUartBase = AUX_BASE;
@@ -281,6 +295,19 @@ uart_init()
 	*(volatile uint32*)(sGpio + GPIO_FSEL3) = select;
 
 	// pull-ups on the inputs
+	if (sBCM2837) {
+		// GPPUD says what, the clock register which pins, 150 cycles each
+		volatile uint32* gpio = (volatile uint32*)sGpio;
+		gpio[GPIO_GPPUD / 4] = GPIO_PULL_UP + 1;
+			// the BCM2835's codes: 0 off, 1 down, 2 up
+		spin(5);
+		gpio[GPIO_GPPUDCLK0 / 4] = (1u << 30) | (1u << 31);
+		gpio[GPIO_GPPUDCLK1 / 4] = 1u << (33 - 32);
+		spin(5);
+		gpio[GPIO_GPPUD / 4] = 0;
+		gpio[GPIO_GPPUDCLK0 / 4] = 0;
+		gpio[GPIO_GPPUDCLK1 / 4] = 0;
+	} else {
 	uint32 pull = *(volatile uint32*)(sGpio + GPIO_PULL1);
 	pull = (pull & ~(0xfu << ((30 - 16) * 2)))
 		| (GPIO_PULL_UP << ((30 - 16) * 2));
@@ -288,6 +315,7 @@ uart_init()
 	pull = *(volatile uint32*)(sGpio + GPIO_PULL2);
 	pull = (pull & ~0xfu) | (GPIO_PULL_UP << ((33 - 32) * 2));
 	*(volatile uint32*)(sGpio + GPIO_PULL2) = pull;
+	}
 	memory_full_barrier();
 
 	uint32 clock = 0;
@@ -741,7 +769,7 @@ static status_t
 bring_up()
 {
 	const phys_addr_t kPageMask = B_PAGE_SIZE - 1;
-	uint64 gpioBase = sBCM2712 ? BCM2712_GIO_BASE : GPIO_BASE;
+	uint64 gpioBase = sBCM2712 ? BCM2712_GIO_BASE : sGpioBase;
 	sAuxArea = map_physical_memory("h4bcm uart", sUartBase & ~kPageMask,
 		B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
 		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, (void**)&sAux);
@@ -941,9 +969,34 @@ static device_hooks sDeviceHooks = {
 //	#pragma mark - driver
 
 
+static bool has_node(const char* compatible);
+
+
 /*!	Only on a board with the BCM2711: the addresses above are its. */
 static bool
 is_raspberry_pi_4()
+{
+	return has_node("brcm,bcm2711-emmc2");
+}
+
+
+/*!	The Pi 3 (BCM2837): its cores' local interrupt controller is unique to
+	the BCM2836/BCM2837. */
+static bool
+find_bcm2837()
+{
+	if (!has_node("brcm,bcm2836-l1-intc"))
+		return false;
+	sBCM2837 = true;
+	sUartBase = BCM2837_AUX_BASE;
+	sGpioBase = BCM2837_GPIO_BASE;
+	sInterrupt = BCM2837_MU_INTERRUPT;
+	return true;
+}
+
+
+static bool
+has_node(const char* compatible)
 {
 	device_manager_info* manager;
 	if (get_module(B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&manager)
@@ -952,8 +1005,7 @@ is_raspberry_pi_4()
 	}
 
 	device_attr attributes[] = {
-		{ "fdt/compatible", B_STRING_TYPE,
-			{ .string = "brcm,bcm2711-emmc2" } },
+		{ "fdt/compatible", B_STRING_TYPE, { .string = compatible } },
 		{}
 	};
 	device_node* root = manager->get_root_node();
@@ -995,7 +1047,8 @@ find_bcm2712()
 status_t
 init_hardware()
 {
-	return find_bcm2712() || is_raspberry_pi_4() ? B_OK : B_ERROR;
+	return find_bcm2712() || find_bcm2837() || is_raspberry_pi_4()
+		? B_OK : B_ERROR;
 }
 
 
@@ -1012,6 +1065,7 @@ init_driver()
 	}
 	if (find_bcm2712())
 		return B_OK;
+	find_bcm2837();
 	status = get_module(RPI_FIRMWARE_MODULE_NAME, (module_info**)&sFirmware);
 	if (status != B_OK) {
 		put_module(NET_BUFFER_MODULE_NAME);

@@ -5,8 +5,8 @@
 
 /*	The property interface of the Raspberry Pi's VideoCore firmware
 	(mailbox channel 8), for kernel drivers. The mailbox addresses are the
-	BCM2711's (Pi 4) and the BCM2712's (Pi 5): on any other SoC every request
-	fails without touching anything. */
+	BCM2837's (Pi 3), the BCM2711's (Pi 4) and the BCM2712's (Pi 5): on any
+	other SoC every request fails without touching anything. */
 
 
 #include <rpi_firmware.h>
@@ -25,6 +25,7 @@
 // The mailbox registers are at 0x880 in this page: mailbox@7e00b880 behind
 // the BCM2711's soc ranges, mailbox@7c013880 behind the BCM2712's (soc at
 // 0x10_0000_0000).
+#define BCM2837_MAILBOX_BASE		0x3f00b000
 #define BCM2711_MAILBOX_BASE		0xfe00b000
 #define BCM2712_MAILBOX_BASE		0x107c013000ull
 #define MAILBOX_READ				0x880
@@ -35,7 +36,8 @@
 #define MAILBOX_CHANNEL_PROPERTY	8
 #define PROPERTY_SUCCESS			0x80000000
 
-// The BCM2711's VideoCore sees the ARM's first gigabyte at this bus address;
+// The BCM2837's and BCM2711's VideoCore sees the ARM's first gigabyte at
+// this bus address (uncached, past its L2 cache);
 // the BCM2712's takes the ARM's physical addresses (as the loader's
 // mailbox.cpp does it).
 #define BCM2711_VC_BUS_OFFSET		0xc0000000
@@ -67,6 +69,9 @@ init()
 	phys_addr_t mailbox;
 	if (fdt_node_check_compatible(gFDT, 0, "brcm,bcm2711") == 0) {
 		mailbox = BCM2711_MAILBOX_BASE;
+		sBusOffset = BCM2711_VC_BUS_OFFSET;
+	} else if (fdt_node_check_compatible(gFDT, 0, "brcm,bcm2837") == 0) {
+		mailbox = BCM2837_MAILBOX_BASE;
 		sBusOffset = BCM2711_VC_BUS_OFFSET;
 	} else if (fdt_node_check_compatible(gFDT, 0, "brcm,bcm2712") == 0) {
 		mailbox = BCM2712_MAILBOX_BASE;

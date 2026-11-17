@@ -1,13 +1,15 @@
 # The Raspberry Pi boot files (arm64): the boot archive that the firmware
 # loads along with the loader, and an SD card image with a FAT boot partition
-# and the system on BFS. One image starts the Pi 4 (400, CM4) and the Pi 5
-# (500, CM5): config.txt has a section for each (docs/rpi5/BOOT.md).
+# and the system on BFS. One image starts the Pi 3 (3 B, 3 B+, Zero 2 W),
+# the Pi 4 (400, CM4) and the Pi 5 (500, CM5): config.txt has a section for
+# each (docs/rpi5/BOOT.md, docs/rpi3/BOOT.md).
 #
 #	jam -q @<profile> airos-rpi-boot-archive
 #	jam -q @<profile> airos-rpi-image
 #
-# The firmware files (start4.elf, fixup4.dat, the BCM2711's and the BCM2712's
-# device trees and overlays) are not part of the tree: HAIKU_RPI_FIRMWARE_DIR
+# The firmware files (bootcode.bin, start.elf and fixup.dat for the Pi 3,
+# start4.elf and fixup4.dat for the Pi 4, the BCM2837's, BCM2711's and
+# BCM2712's device trees and overlays) are not part of the tree: HAIKU_RPI_FIRMWARE_DIR
 # names a directory filled by tools/rpi4/fetch-firmware.sh.
 
 HAIKU_RPI_BOOT_ARCHIVE_CONTAINER_NAME = airos-rpi-boot-archive-container ;
@@ -135,9 +137,11 @@ actions BuildRpiSDImage1
 	export $(HOST_ADD_BUILD_COMPATIBILITY_LIB_DIR)
 
 	firmware="$(RPI_FIRMWARE_DIR)"
-	# The Pi 4's firmware and tree; the Pi 5's EEPROM bootloader needs no
-	# start*.elf, only its trees and the overlay for D0 steppings.
-	for file in start4.elf fixup4.dat bcm2711-rpi-4-b.dtb \
+	# The Pi 3's boot ROM loads bootcode.bin, which starts start.elf; the Pi
+	# 4's EEPROM start4.elf; the Pi 5's EEPROM bootloader needs no start*.elf,
+	# only its trees and the overlay for D0 steppings.
+	for file in bootcode.bin start.elf fixup.dat bcm2710-rpi-3-b-plus.dtb \
+			start4.elf fixup4.dat bcm2711-rpi-4-b.dtb \
 			bcm2712-rpi-5-b.dtb bcm2712d0-rpi-5-b.dtb overlays/bcm2712d0.dtbo ; do
 		if [ ! -f "$firmware/$file" ] ; then
 			echo "Raspberry Pi firmware file $firmware/$file is missing;" \
@@ -168,8 +172,8 @@ actions BuildRpiSDImage1
 	echo "cp --ignore-attributes :$(2[7]) myfs/cmdline.txt" | $FATFS $(1)
 	echo "cp --ignore-attributes :$(2[8]) myfs/airos-boot.txt" | $FATFS $(1)
 
-	for file in "$firmware"/*.elf "$firmware"/*.dat "$firmware"/*.dtb \
-			"$firmware"/LICENCE.broadcom ; do
+	for file in "$firmware"/bootcode.bin "$firmware"/*.elf "$firmware"/*.dat \
+			"$firmware"/*.dtb "$firmware"/LICENCE.broadcom ; do
 		[ -f "$file" ] || continue
 		echo "cp --ignore-attributes :$file myfs/`basename $file`" | $FATFS $(1)
 	done
