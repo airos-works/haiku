@@ -1,0 +1,11 @@
+SubDir HAIKU_TOP src add-ons kernel busses mmc bcm2835_sdhost ;
+
+SubDirC++Flags -fno-rtti ;
+
+UsePrivateKernelHeaders ;
+UsePrivateHeaders drivers ;
+SubDirHdrs $(HAIKU_TOP) src system kernel device_manager ;
+
+KernelAddon bcm2835_sdhost :
+	bcm2835_sdhost.cpp
+;
