@@ -22,10 +22,12 @@
 #define RPI_FIRMWARE_GET_CLOCK_RATE			0x00030002
 #define RPI_FIRMWARE_GET_MAX_CLOCK_RATE		0x00030004
 #define RPI_FIRMWARE_GET_TEMPERATURE		0x00030006
+#define RPI_FIRMWARE_GET_DOMAIN_STATE		0x00030030
 #define RPI_FIRMWARE_GET_GPIO_STATE			0x00030041
 #define RPI_FIRMWARE_NOTIFY_XHCI_RESET		0x00030058
 #define RPI_FIRMWARE_SET_CLOCK_STATE		0x00038001
 #define RPI_FIRMWARE_SET_CLOCK_RATE			0x00038002
+#define RPI_FIRMWARE_SET_DOMAIN_STATE		0x00038030
 #define RPI_FIRMWARE_SET_GPIO_STATE			0x00038041
 
 // clocks
@@ -41,6 +43,10 @@
 #define RPI_FIRMWARE_CLOCK_EMMC2			12
 #define RPI_FIRMWARE_CLOCK_M2MC				13
 #define RPI_FIRMWARE_CLOCK_PIXEL_BVB		14
+
+// power domains of the DOMAIN_STATE tags: {domain, state}; the device
+// tree's index (dt-bindings/power/raspberrypi-power.h) plus one
+#define RPI_FIRMWARE_DOMAIN_V3D				11
 
 
 typedef struct rpi_firmware_module_info {

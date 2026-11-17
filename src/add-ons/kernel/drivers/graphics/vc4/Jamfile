@@ -1,0 +1,14 @@
+SubDir HAIKU_TOP src add-ons kernel drivers graphics vc4 ;
+
+SubDirC++Flags -fno-rtti ;
+
+UsePrivateKernelHeaders ;
+UsePrivateHeaders drivers graphics system ;
+
+KernelAddon vc4 :
+	driver.cpp
+	vc4_gem.cpp
+	vc4_render_cl.cpp
+	vc4_validate.cpp
+	vc4_validate_shaders.cpp
+;

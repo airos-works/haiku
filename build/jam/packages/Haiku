@@ -150,6 +150,7 @@ AddNewDriversToPackage graphics :
 	qcom_display@arm64
 	sunxi_display@arm64
 	v3d@arm64
+	vc4@arm64
 	virtio_gpu
 	;
 # Neural processors. The drivers are loaded when something looks into
