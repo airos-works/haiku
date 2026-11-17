@@ -249,7 +249,7 @@ wlan_control(void* cookie, uint32 op, void* arg, size_t length)
 			// We need a scan_result of maximum possible size to work with.
 			struct ieee80211req_scan_result* sr = (struct ieee80211req_scan_result*)
 				alloca(sizeof(struct ieee80211req_scan_result) + IEEE80211_NWID_LEN
-					+ 257 + IEEE80211_HE_CAPS_IE_MAX_LEN);
+					+ 257 + IEEE80211_HE_CAPS_IE_MAX_LEN + 2 + 4);
 
 			uint16 remaining = ireq.i_len, offset = 0;
 			for (int i = 0; remaining > 0; i++) {
@@ -273,6 +273,9 @@ wlan_control(void* cookie, uint32 op, void* arg, size_t length)
 				const uint8_t heLen = nodereq.nr_hecaps_ie_len <=
 					IEEE80211_HE_CAPS_IE_MAX_LEN ? nodereq.nr_hecaps_ie_len : 0;
 				ieLen += heLen;
+				const uint8_t rsnxeLen = nodereq.nr_rsnxe_len != 0
+					? 2 + MIN(nodereq.nr_rsnxe_len, sizeof(nodereq.nr_rsnxe)) : 0;
+				ieLen += rsnxeLen;
 				size += ieLen;
 				const int32 roundedSize = roundup(size, 4);
 				if (remaining < roundedSize)
@@ -307,6 +310,14 @@ wlan_control(void* cookie, uint32 op, void* arg, size_t length)
 					nodereq.nr_rsnie, rsnLen);
 				memcpy((uint8*)sr + sr->isr_ie_off + sr->isr_ssid_len + rsnLen,
 					nodereq.nr_hecaps_ie, heLen);
+				if (rsnxeLen != 0) {
+					// RSN Extension element, for WPA3 hash-to-element
+					uint8* rsnxe = (uint8*)sr + sr->isr_ie_off
+						+ sr->isr_ssid_len + rsnLen + heLen;
+					rsnxe[0] = IEEE80211_ELEMID_RSNXE;
+					rsnxe[1] = rsnxeLen - 2;
+					memcpy(rsnxe + 2, nodereq.nr_rsnxe, rsnxeLen - 2);
+				}
 
 				sr->isr_len = roundedSize;
 				if (user_memcpy((uint8*)ireq.i_data + offset, sr, size) != B_OK)
@@ -521,6 +532,33 @@ wlan_control(void* cookie, uint32 op, void* arg, size_t length)
 			break;
 		}
 
+		case IEEE80211_IOC_HAIKU_SAE_PASSWORD: {
+			if (op != SIOCS80211
+				|| ireq.i_len < (int)sizeof(struct ieee80211_haiku_sae_password))
+				return B_BAD_VALUE;
+
+			struct ieee80211_haiku_sae_password request;
+			if (user_memcpy(&request, ireq.i_data, sizeof(request)) != B_OK)
+				return B_BAD_ADDRESS;
+			if (request.i_ssid_len > IEEE80211_NWID_LEN
+				|| request.i_password_len > IEEE80211_HAIKU_SAE_PASSWORD_MAXLEN
+				|| request.i_password_len > IEEE80211_SAE_PASSWORD_MAXLEN) {
+				explicit_bzero(&request, sizeof(request));
+				return B_BAD_VALUE;
+			}
+			if ((ic->ic_caps & IEEE80211_C_RSN) == 0) {
+				explicit_bzero(&request, sizeof(request));
+				return EOPNOTSUPP;
+			}
+
+			IFF_LOCKGIANT(ifp);
+			status_t status = ieee80211_sae_set_password(ic, request.i_ssid,
+				request.i_ssid_len, request.i_password, request.i_password_len);
+			IFF_UNLOCKGIANT(ifp);
+			explicit_bzero(&request, sizeof(request));
+			return status;
+		}
+
 		case IEEE80211_IOC_HAIKU_JOIN: {
 			if (op != SIOCS80211
 				|| ireq.i_len < (int)sizeof(struct ieee80211_haiku_join_req))
@@ -559,9 +597,10 @@ wlan_control(void* cookie, uint32 op, void* arg, size_t length)
 
 				case B_NETWORK_AUTHENTICATION_WPA:
 				case B_NETWORK_AUTHENTICATION_WPA2:
+				case B_NETWORK_AUTHENTICATION_WPA3:
 					wpaparams.i_enabled = 1;
 					wpaparams.i_protos |=
-						(haiku_join->i_authentication_mode == B_NETWORK_AUTHENTICATION_WPA2) ?
+						(haiku_join->i_authentication_mode != B_NETWORK_AUTHENTICATION_WPA) ?
 							IEEE80211_WPA_PROTO_WPA2 : IEEE80211_WPA_PROTO_WPA1;
 
 					// NOTE: i_wpaparams.i_groupcipher is not a flags field!
@@ -577,6 +616,24 @@ wlan_control(void* cookie, uint32 op, void* arg, size_t length)
 						wpaparams.i_akms |= IEEE80211_WPA_AKM_SHA256_8021X;
 					if ((haiku_join->i_key_mode & B_KEY_MODE_PSK_SHA256) != 0)
 						wpaparams.i_akms |= IEEE80211_WPA_AKM_SHA256_PSK;
+
+					// WPA3: with an SAE password set for this SSID (see
+					// IEEE80211_IOC_HAIKU_SAE_PASSWORD), offer SAE next to
+					// the PSK AKMs; net80211 prefers it where the AP has it.
+					if (haiku_join->i_authentication_mode != B_NETWORK_AUTHENTICATION_WPA
+						&& (ic->ic_caps & IEEE80211_C_MFP) != 0
+						&& ic->ic_sae != NULL
+						&& ic->ic_sae->ssid_len == haiku_join->i_nwid_len
+						&& memcmp(ic->ic_sae->ssid, haiku_join->i_nwid,
+							haiku_join->i_nwid_len) == 0) {
+						if (wpaparams.i_akms == 0) {
+							// what setwpaparms() would default to
+							wpaparams.i_akms = IEEE80211_WPA_AKM_PSK
+								| IEEE80211_WPA_AKM_SHA256_PSK;
+						}
+						wpaparams.i_akms |= IEEE80211_WPA_AKM_SAE;
+						TRACE("openbsd wlan_control: join offers SAE (WPA3)\n");
+					}
 
 					if (haiku_join->i_key_len > IEEE80211_PMK_LEN
 						|| haiku_join->i_key_len > sizeof(wpapsk.i_psk)

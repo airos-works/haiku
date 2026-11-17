@@ -816,6 +816,22 @@ struct ieee80211_haiku_tx_rate {
 		/* channel width in MHz */
 	uint16 i_reserved;
 };
+
+/*
+	Haiku extension: the WPA3-Personal (SAE) password for an SSID. Set it
+	before IEEE80211_IOC_HAIKU_JOIN; joining that SSID then authenticates with
+	SAE where the access point offers it, PSK otherwise. Only the stacks that
+	run the handshake in the kernel (openbsd_wlan) take it; others answer
+	EINVAL. An empty password clears it. It cannot be read back.
+*/
+#define IEEE80211_IOC_HAIKU_SAE_PASSWORD		0x6004
+#define IEEE80211_HAIKU_SAE_PASSWORD_MAXLEN		128
+struct ieee80211_haiku_sae_password {
+	uint8 i_ssid[IEEE80211_NWID_LEN];
+	uint8 i_ssid_len;
+	uint8 i_password_len;
+	uint8 i_password[IEEE80211_HAIKU_SAE_PASSWORD_MAXLEN];
+};
 #endif /* __HAIKU__ */
 
 /*

@@ -65,11 +65,26 @@ ieee80211_is_8021x_akm(enum ieee80211_akm akm)
 	    akm == IEEE80211_AKM_SHA256_8021X;
 }
 
+/* AKMs with the SHA-256 KDF, AES-128-CMAC MIC and AES key wrap. SAE uses
+ * Key Descriptor Version 0 for them where the others use version 3. */
 static __inline int
 ieee80211_is_sha256_akm(enum ieee80211_akm akm)
 {
 	return akm == IEEE80211_AKM_SHA256_8021X ||
-	    akm == IEEE80211_AKM_SHA256_PSK;
+	    akm == IEEE80211_AKM_SHA256_PSK ||
+	    akm == IEEE80211_AKM_SAE;
+}
+
+/* Key Descriptor Version of EAPOL-Key frames for an AKM and ciphers */
+static __inline int
+ieee80211_eapol_key_desc(enum ieee80211_akm akm, int ccmp)
+{
+	if (akm == IEEE80211_AKM_SAE)
+		return 0;	/* EAPOL_KEY_DESC_V0 */
+	if (akm == IEEE80211_AKM_SHA256_8021X ||
+	    akm == IEEE80211_AKM_SHA256_PSK)
+		return 3;	/* EAPOL_KEY_DESC_V3 */
+	return ccmp ? 2 : 1;
 }
 
 struct ieee80211_key {

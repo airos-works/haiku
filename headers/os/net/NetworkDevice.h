@@ -16,7 +16,9 @@ enum {
 	B_NETWORK_AUTHENTICATION_WEP		= 1,
 	B_NETWORK_AUTHENTICATION_WPA		= 2,
 	B_NETWORK_AUTHENTICATION_WPA2		= 3,
-	B_NETWORK_AUTHENTICATION_EAP		= 4
+	B_NETWORK_AUTHENTICATION_EAP		= 4,
+	B_NETWORK_AUTHENTICATION_WPA3		= 5
+		// WPA3-Personal (SAE); also offered next to WPA2 in transition mode
 };
 
 // cipher algorithms
@@ -38,7 +40,11 @@ enum {
 	B_KEY_MODE_FT_PSK					= 0x0040,
 	B_KEY_MODE_IEEE802_1X_SHA256		= 0x0080,
 	B_KEY_MODE_PSK_SHA256				= 0x0100,
-	B_KEY_MODE_WPS						= 0x0200
+	B_KEY_MODE_WPS						= 0x0200,
+	B_KEY_MODE_SAE						= 0x0400,
+	B_KEY_MODE_FT_SAE					= 0x0800,
+	B_KEY_MODE_OWE						= 0x1000,
+	B_KEY_MODE_SAE_EXT_KEY				= 0x2000
 };
 
 // eap encapsulation method (IEEE 802.1x)
@@ -81,6 +87,11 @@ struct wireless_network {
 // flags
 #define B_NETWORK_IS_ENCRYPTED			0x01
 #define B_NETWORK_IS_PERSISTENT			0x02
+#define B_NETWORK_MFP_CAPABLE			0x04
+	// management frame protection offered (RSN capabilities)
+#define B_NETWORK_MFP_REQUIRED			0x08
+#define B_NETWORK_SAE_H2E				0x10
+	// SAE hash-to-element offered (RSN Extension element)
 
 
 class BNetworkDevice {

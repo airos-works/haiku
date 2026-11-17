@@ -1136,6 +1136,11 @@ ieee80211_add_rsn_body(u_int8_t *frm, struct ieee80211com *ic,
 		*frm++ = 6;
 		count++;
 	}
+	if (!wpa && (ni->ni_rsnakms & IEEE80211_AKM_SAE)) {
+		memcpy(frm, oui, 3); frm += 3;
+		*frm++ = 8;
+		count++;
+	}
 	/* write AKM Suite List Count field */
 	LE_WRITE_2(pcount, count);
 
@@ -1159,7 +1164,10 @@ ieee80211_add_rsn_body(u_int8_t *frm, struct ieee80211com *ic,
 	    IEEE80211_RSNCAP_GTKSA_RCNT_MASK));
 	if (pmf) {
 		rsncaps |= IEEE80211_RSNCAP_MFPC;
-		if (ic->ic_flags & IEEE80211_F_MFPR)
+		/* SAE requires management frame protection */
+		if ((ic->ic_flags & IEEE80211_F_MFPR) ||
+		    (ic->ic_opmode == IEEE80211_M_STA &&
+		    ni->ni_rsnakms == IEEE80211_AKM_SAE))
 			rsncaps |= IEEE80211_RSNCAP_MFPR;
 	}
 	if (ic->ic_flags & IEEE80211_F_PBAR)
@@ -1500,6 +1508,15 @@ ieee80211_get_auth(struct ieee80211com *ic, struct ieee80211_node *ni,
 	struct mbuf *m;
 	u_int8_t *frm;
 
+	/*
+	 * SAE Commit or Confirm, when this join authenticates with SAE. Never
+	 * Open System then: nothing goes out if there is nothing to send.
+	 */
+	if (ic->ic_opmode == IEEE80211_M_STA && ni == ic->ic_bss &&
+	    ieee80211_sae_selected(ic, ni))
+		return (seq == 1 || seq == 2) && status == 0
+		    ? ieee80211_sae_get_auth(ic, ni, seq) : NULL;
+
 	MGETHDR(m, M_DONTWAIT, MT_DATA);
 	if (m == NULL)
 		return NULL;
@@ -1580,7 +1597,7 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
 		2 + IEEE80211_WPAIE_MAXLEN : 0) +
 	    ((ic->ic_flags & IEEE80211_F_HTON) ? 28 + 9 : 0) +
 	    ((ic->ic_flags & IEEE80211_F_VHTON) ? 14 : 0) +
-	    hecapslen);
+	    hecapslen + 3 /* RSNXE */);
 	if (m == NULL)
 		return NULL;
 
@@ -1619,6 +1636,12 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
 		frm = ieee80211_add_vhtcaps(frm, ic);
 	if (hecapslen)
 		frm = ieee80211_add_hecaps(frm, ic);
+	if (ieee80211_sae_selected(ic, ni) && ieee80211_sae_use_h2e(ic, ni)) {
+		/* RSN Extension element: we use hash-to-element */
+		*frm++ = IEEE80211_ELEMID_RSNXE;
+		*frm++ = 1;
+		*frm++ = IEEE80211_RSNXE_SAE_H2E;	/* field length 0 + 1 */
+	}
 
 	m->m_pkthdr.len = m->m_len = frm - mtod(m, u_int8_t *);
 

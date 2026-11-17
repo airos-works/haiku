@@ -410,6 +410,9 @@ struct ieee80211com {
 	uint16_t		ic_he_txmcs_80p80;
 
 	TAILQ_HEAD(, ieee80211_ess)	 ic_ess;
+
+	/* SAE password and exchange (ieee80211_sae_sta.c) */
+	struct ieee80211_sae_sta	*ic_sae;
 };
 #define	ic_if		ic_ac.ac_if
 #define	ic_softc	ic_if.if_softc
@@ -537,5 +540,7 @@ struct ieee80211_ess *ieee80211_get_ess(struct ieee80211com *, const char *, int
 void	ieee80211_begin_bgscan(struct ifnet *);
 
 extern	int ieee80211_cache_size;
+
+#include <net80211/ieee80211_sae.h>
 
 #endif /* _NET80211_IEEE80211_VAR_H_ */

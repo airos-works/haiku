@@ -1137,16 +1137,17 @@ ieee80211_match_bss(struct ieee80211com *ic, struct ieee80211_node *ni,
 		 * to overlap with any value the STA supports, the STA shall
 		 * decline to associate with that AP.
 		 */
+		u_int akms = ni->ni_rsnakms & ic->ic_rsnakms;
+
 		if ((ni->ni_rsnprotos & ic->ic_rsnprotos) == 0)
 			fail |= IEEE80211_NODE_ASSOCFAIL_WPA_PROTO;
-		if ((ni->ni_rsnakms & ic->ic_rsnakms) == 0)
+		/* PSK AKMPs need a PSK, SAE a password for this SSID */
+		if (!(ic->ic_flags & IEEE80211_F_PSK))
+			akms &= ~(IEEE80211_AKM_PSK | IEEE80211_AKM_SHA256_PSK);
+		if (!ieee80211_sae_usable(ic, ni))
+			akms &= ~IEEE80211_AKM_SAE;
+		if (akms == 0)
 			fail |= IEEE80211_NODE_ASSOCFAIL_WPA_PROTO;
-		if ((ni->ni_rsnakms & ic->ic_rsnakms &
-		     ~(IEEE80211_AKM_PSK | IEEE80211_AKM_SHA256_PSK)) == 0) {
-			/* AP only supports PSK AKMPs */
-			if (!(ic->ic_flags & IEEE80211_F_PSK))
-				fail |= IEEE80211_NODE_ASSOCFAIL_WPA_PROTO;
-		}
 		if (ni->ni_rsngroupcipher != IEEE80211_CIPHER_WEP40 &&
 		    ni->ni_rsngroupcipher != IEEE80211_CIPHER_TKIP &&
 		    ni->ni_rsngroupcipher != IEEE80211_CIPHER_CCMP &&
@@ -1690,8 +1691,11 @@ ieee80211_choose_rsnparams(struct ieee80211com *ic)
 
 	/* filter out unsupported AKMPs */
 	ni->ni_rsnakms &= ic->ic_rsnakms;
-	/* prefer SHA-256 based AKMPs */
-	if ((ic->ic_flags & IEEE80211_F_PSK) && (ni->ni_rsnakms &
+	if ((ni->ni_rsnakms & IEEE80211_AKM_SAE) &&
+	    ieee80211_sae_usable(ic, ni)) {
+		/* WPA3: prefer SAE, with management frame protection */
+		ni->ni_rsnakms = IEEE80211_AKM_SAE;
+	} else if ((ic->ic_flags & IEEE80211_F_PSK) && (ni->ni_rsnakms &
 	    (IEEE80211_AKM_PSK | IEEE80211_AKM_SHA256_PSK))) {
 		/* AP supports PSK AKMP and a PSK is configured */
 		if (ni->ni_rsnakms & IEEE80211_AKM_SHA256_PSK)

@@ -1626,7 +1626,7 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, struct mbuf *m,
 	const u_int8_t *frm, *efrm;
 	const u_int8_t *tstamp, *ssid, *rates, *xrates, *edcaie, *wmmie, *tim;
 	const u_int8_t *rsnie, *wpaie, *htcaps, *htop, *vhtcaps, *vhtop;
-	const u_int8_t *hecaps, *heop;
+	const u_int8_t *hecaps, *heop, *rsnxe;
 	u_int16_t capinfo, bintval;
 	u_int8_t chan, bchan, erp;
 	int is_new;
@@ -1667,7 +1667,7 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, struct mbuf *m,
 	capinfo = LE_READ_2(frm); frm += 2;
 
 	ssid = rates = xrates = edcaie = wmmie = rsnie = wpaie = tim = NULL;
-	htcaps = htop = vhtcaps = vhtop = hecaps = heop = NULL;
+	htcaps = htop = vhtcaps = vhtop = hecaps = heop = rsnxe = NULL;
 	if (rxi->rxi_chan)
 		bchan = rxi->rxi_chan;
 	else
@@ -1705,6 +1705,9 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, struct mbuf *m,
 			break;
 		case IEEE80211_ELEMID_RSN:
 			rsnie = frm;
+			break;
+		case IEEE80211_ELEMID_RSNXE:
+			rsnxe = frm;
 			break;
 		case IEEE80211_ELEMID_EDCAPARMS:
 			edcaie = frm;
@@ -1971,6 +1974,11 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, struct mbuf *m,
 		ni->ni_rsngroupcipher = 0;
 		ni->ni_rsngroupmgmtcipher = 0;
 		ni->ni_rsncaps = 0;
+		ni->ni_rsnxe_len = 0;
+		if (rsnxe != NULL && rsnxe[1] != 0) {
+			ni->ni_rsnxe_len = MIN(rsnxe[1], sizeof(ni->ni_rsnxe));
+			memcpy(ni->ni_rsnxe, rsnxe + 2, ni->ni_rsnxe_len);
+		}
 
 		if (rsnie != NULL &&
 		    ieee80211_parse_rsn(ic, rsnie, &rsn) == 0) {
@@ -2203,7 +2211,15 @@ ieee80211_recv_auth(struct ieee80211com *ic, struct mbuf *m,
 	DPRINTF(("auth %d seq %d from %s\n", algo, seq,
 	    ether_sprintf((u_int8_t *)wh->i_addr2)));
 
-	/* only "open" auth mode is supported */
+	/* SAE (WPA3), for a station whose join chose it */
+	if (algo == IEEE80211_AUTH_ALG_SAE && ic->ic_opmode == IEEE80211_M_STA &&
+	    ieee80211_sae_selected(ic, ic->ic_bss)) {
+		ieee80211_sae_recv_auth(ic, ni, wh, frm,
+		    mtod(m, const u_int8_t *) + m->m_len, seq, status);
+		return;
+	}
+
+	/* otherwise only "open" auth mode is supported */
 	if (algo != IEEE80211_AUTH_ALG_OPEN) {
 		DPRINTF(("unsupported auth algorithm %d from %s\n",
 		    algo, ether_sprintf((u_int8_t *)wh->i_addr2)));

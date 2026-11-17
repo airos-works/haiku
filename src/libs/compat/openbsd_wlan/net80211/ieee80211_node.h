@@ -321,6 +321,9 @@ struct ieee80211_node {
 	enum ieee80211_cipher	ni_rsngroupcipher;
 	enum ieee80211_cipher	ni_rsngroupmgmtcipher;
 	u_int16_t		ni_rsncaps;
+	/* RSN Extension element capabilities (SAE hash-to-element) */
+	u_int8_t		ni_rsnxe_len;
+	u_int8_t		ni_rsnxe[4];
 	enum ieee80211_cipher	ni_rsncipher;
 	u_int8_t		ni_nonce[EAPOL_KEY_NONCE_LEN];
 	u_int8_t		ni_pmk[IEEE80211_PMK_LEN];

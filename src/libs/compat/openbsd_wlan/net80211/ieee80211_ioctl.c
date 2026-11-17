@@ -167,6 +167,9 @@ ieee80211_node2req(struct ieee80211com *ic, const struct ieee80211_node *ni,
 		memcpy(nr->nr_hecaps_ie, ni->ni_hecaps_ie,
 		    nr->nr_hecaps_ie_len);
 	}
+
+	nr->nr_rsnxe_len = MIN(ni->ni_rsnxe_len, sizeof(nr->nr_rsnxe));
+	memcpy(nr->nr_rsnxe, ni->ni_rsnxe, nr->nr_rsnxe_len);
 }
 
 void
@@ -341,6 +344,9 @@ ieee80211_ioctl_setwpaparms(struct ieee80211com *ic,
 		ic->ic_rsnakms |= IEEE80211_AKM_8021X;
 	if (wpa->i_akms & IEEE80211_WPA_AKM_SHA256_8021X)
 		ic->ic_rsnakms |= IEEE80211_AKM_SHA256_8021X;
+	if ((wpa->i_akms & IEEE80211_WPA_AKM_SAE) &&
+	    (ic->ic_caps & IEEE80211_C_MFP))
+		ic->ic_rsnakms |= IEEE80211_AKM_SAE;
 	if (ic->ic_rsnakms == 0) {	/* set to default (PSK) */
 		ic->ic_rsnakms = IEEE80211_AKM_PSK;
 		if (ic->ic_caps & IEEE80211_C_MFP)
@@ -401,6 +407,8 @@ ieee80211_ioctl_getwpaparms(struct ieee80211com *ic,
 		wpa->i_akms |= IEEE80211_WPA_AKM_8021X;
 	if (ic->ic_rsnakms & IEEE80211_AKM_SHA256_8021X)
 		wpa->i_akms |= IEEE80211_WPA_AKM_SHA256_8021X;
+	if (ic->ic_rsnakms & IEEE80211_AKM_SAE)
+		wpa->i_akms |= IEEE80211_WPA_AKM_SAE;
 
 	if (ic->ic_rsngroupcipher == IEEE80211_CIPHER_WEP40)
 		wpa->i_groupcipher = IEEE80211_WPA_CIPHER_WEP40;

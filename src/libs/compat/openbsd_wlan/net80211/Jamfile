@@ -35,6 +35,8 @@ KernelStaticLibrary openbsd_wlan.a :
 	ieee80211_ra_vht.c
 	ieee80211_regdomain.c
 	ieee80211_rssadapt.c
+	ieee80211_sae.c
+	ieee80211_sae_sta.c
 
 	aes.c
 	arc4.c

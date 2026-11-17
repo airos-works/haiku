@@ -95,6 +95,9 @@ ieee80211_crypto_detach(struct ifnet *ifp)
 	/* clear pre-shared key from memory */
 	explicit_bzero(ic->ic_psk, IEEE80211_PMK_LEN);
 
+	/* and the SAE password and keys */
+	ieee80211_sae_detach(ic);
+
 #ifndef IEEE80211_STA_ONLY
 	timeout_del(&ic->ic_tkip_micfail_timeout);
 #endif
@@ -492,6 +495,7 @@ ieee80211_eapol_key_mic(struct ieee80211_eapol_key *key, const u_int8_t *kck)
 		/* truncate HMAC-SHA1 to its 128 MSBs */
 		memcpy(key->mic, digest, EAPOL_KEY_MIC_LEN);
 		break;
+	case EAPOL_KEY_DESC_V0:	/* SAE: as V3 (12.7.3, AKM 00-0F-AC:8) */
 	case EAPOL_KEY_DESC_V3:
 		AES_CMAC_Init(&ctx.cmac);
 		AES_CMAC_SetKey(&ctx.cmac, kck);
@@ -558,6 +562,7 @@ ieee80211_eapol_key_encrypt(struct ieee80211com *ic,
 		rc4_skip(&ctx.rc4, RC4STATE);
 		rc4_crypt(&ctx.rc4, data, data, len);
 		break;
+	case EAPOL_KEY_DESC_V0:	/* SAE */
 	case EAPOL_KEY_DESC_V2:
 	case EAPOL_KEY_DESC_V3:
 		if (len < 16 || (len & 7) != 0) {
@@ -611,6 +616,7 @@ ieee80211_eapol_key_decrypt(struct ieee80211_eapol_key *key,
 		rc4_skip(&ctx.rc4, RC4STATE);
 		rc4_crypt(&ctx.rc4, data, data, len);
 		return 0;
+	case EAPOL_KEY_DESC_V0:	/* SAE */
 	case EAPOL_KEY_DESC_V2:
 	case EAPOL_KEY_DESC_V3:
 		/* Key Data Length must be a multiple of 8 */

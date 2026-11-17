@@ -125,17 +125,16 @@ ieee80211_eapol_key_input(struct ieee80211com *ic, struct mbuf *m,
 
 	/* discard EAPOL-Key frames with an unknown descriptor version */
 	desc = info & EAPOL_KEY_VERSION_MASK;
-	if (desc < EAPOL_KEY_DESC_V1 || desc > EAPOL_KEY_DESC_V3)
+	if (desc > EAPOL_KEY_DESC_V3)
 		goto done;
 
-	if (ieee80211_is_sha256_akm(ni->ni_rsnakms)) {
-		if (desc != EAPOL_KEY_DESC_V3)
+	if (ieee80211_is_sha256_akm(ni->ni_rsnakms) ||
+	    ni->ni_rsncipher == IEEE80211_CIPHER_CCMP ||
+	    ni->ni_rsngroupcipher == IEEE80211_CIPHER_CCMP) {
+		if (desc != ieee80211_eapol_key_desc(ni->ni_rsnakms, 1))
 			goto done;
-	} else if (ni->ni_rsncipher == IEEE80211_CIPHER_CCMP ||
-	     ni->ni_rsngroupcipher == IEEE80211_CIPHER_CCMP) {
-		if (desc != EAPOL_KEY_DESC_V2)
-			goto done;
-	}
+	} else if (desc == EAPOL_KEY_DESC_V0)
+		goto done;
 
 	/* make sure the key data field is contiguous */
 	if (m->m_len < totlen && (m = m_pullup(m, totlen)) == NULL) {
@@ -249,6 +248,15 @@ ieee80211_recv_4way_msg1(struct ieee80211com *ic,
 			return;
 		}
 		memcpy(ni->ni_pmk, pmk->pmk_key, IEEE80211_PMK_LEN);
+	} else if (ni->ni_rsnakms == IEEE80211_AKM_SAE) {
+		/* the PMK of our SAE exchange with this access point */
+		const u_int8_t *saepmk = ieee80211_sae_pmk(ic, ni);
+		if (saepmk == NULL) {
+			DPRINTF(("no SAE PMK for %s\n",
+			    ether_sprintf(ni->ni_macaddr)));
+			return;
+		}
+		memcpy(ni->ni_pmk, saepmk, IEEE80211_PMK_LEN);
 	} else	/* use pre-shared key */
 		memcpy(ni->ni_pmk, ic->ic_psk, IEEE80211_PMK_LEN);
 	ni->ni_flags |= IEEE80211_NODE_PMK;
@@ -364,7 +372,7 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
 	struct ieee80211_ptk tptk;
 	struct ieee80211_key *k;
 	const u_int8_t *frm, *efrm;
-	const u_int8_t *rsnie1, *rsnie2, *gtk, *igtk;
+	const u_int8_t *rsnie1, *rsnie2, *gtk, *igtk, *rsnxe;
 	u_int16_t info, reason = 0;
 	int keylen, deferlink = 0;
 
@@ -427,7 +435,7 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
 	 * RSN IEs in message 3/4.  We only take into account the IE of the
 	 * version of the protocol we negotiated at association time.
 	 */
-	rsnie1 = rsnie2 = gtk = igtk = NULL;
+	rsnie1 = rsnie2 = gtk = igtk = rsnxe = NULL;
 	while (frm + 2 <= efrm) {
 		if (frm + 2 + frm[1] > efrm)
 			break;
@@ -440,6 +448,9 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
 			else if (rsnie2 == NULL)
 				rsnie2 = frm;
 			/* ignore others if more than two RSN IEs */
+			break;
+		case IEEE80211_ELEMID_RSNXE:
+			rsnxe = frm;
 			break;
 		case IEEE80211_ELEMID_VENDOR:
 			if (frm[1] < 4)
@@ -498,6 +509,22 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
 	    memcmp(rsnie1, ni->ni_rsnie, 2 + rsnie1[1]) != 0) {
 		reason = IEEE80211_REASON_RSN_DIFFERENT_IE;
 		goto deauth;
+	}
+
+	/*
+	 * With SAE, the RSN Extension element must also be the one from the
+	 * beacon (12.7.6.4): otherwise an attacker could have hidden the
+	 * access point's hash-to-element support.
+	 */
+	if (ni->ni_rsnakms == IEEE80211_AKM_SAE) {
+		u_int n = rsnxe != NULL ? rsnxe[1] : 0;
+		if (n > sizeof(ni->ni_rsnxe))
+			n = sizeof(ni->ni_rsnxe);
+		if (n != ni->ni_rsnxe_len ||
+		    (n != 0 && memcmp(rsnxe + 2, ni->ni_rsnxe, n) != 0)) {
+			reason = IEEE80211_REASON_RSN_DIFFERENT_IE;
+			goto deauth;
+		}
 	}
 
 	/*

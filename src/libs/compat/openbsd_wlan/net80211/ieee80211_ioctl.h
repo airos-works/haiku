@@ -362,6 +362,10 @@ struct ieee80211_nodereq {
 	uint8_t			nr_hecaps_ie[IEEE80211_HE_CAPS_IE_MAX_LEN];
 
 	u_int32_t	nr_assoc_fail;	/* association failure reasons */
+
+	/* RSN Extension element capabilities (Haiku: scan results) */
+	uint8_t			nr_rsnxe_len;
+	uint8_t			nr_rsnxe[4];
 };
 
 #define IEEE80211_NODEREQ_STATE(_s)	(1 << _s)
