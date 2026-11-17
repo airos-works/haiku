@@ -33,5 +33,6 @@ SEARCH on [ FGristFiles fdt.c fdt_ro.c ]
 
 if $(TARGET_ARCH) = arm64 {
 	SubInclude HAIKU_TOP src add-ons kernel busses mmc bcm2711_emmc2 ;
+	SubInclude HAIKU_TOP src add-ons kernel busses mmc bcm2835_sdhost ;
 	SubInclude HAIKU_TOP src add-ons kernel busses mmc sunxi_mmc ;
 }

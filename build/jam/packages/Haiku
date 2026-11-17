@@ -41,6 +41,7 @@ AddFilesToPackage add-ons kernel busses i2c :
 	;
 AddFilesToPackage add-ons kernel busses mmc :
 	bcm2711_emmc2@arm64
+	bcm2835_sdhost@arm64
 	sdhci
 	sunxi_mmc@arm64
 	;
@@ -399,6 +400,7 @@ AddBootModuleSymlinksToPackage
 	ata
 	ata_adapter
 	bcm2711_emmc2@arm64
+	bcm2835_sdhost@arm64
 	bfs
 	dpc
 	efi_gpt
