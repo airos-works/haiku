@@ -264,10 +264,10 @@ ThreadData::CancelPenalty()
 	int32 oldAdditionalPenalty = fAdditionalPenalty;
 	fPriorityPenalty = 0;
 	// The additional penalty rotates the priorities of busy threads, so that
-	// none of them starves. It grew with every wait as well (GoesAway()), so
-	// a thread that woke up after waiting long enough got a priority anywhere
-	// between 1 and its own, and lost the faster core to a busy thread of
-	// the same priority (big.LITTLE) as often as not.
+	// none of them starves. It used to grow with every wait as well
+	// (GoesAway()), so a thread that woke up after waiting long enough got a
+	// priority anywhere between 1 and its own, and lost the faster core to a
+	// busy thread of the same priority (big.LITTLE) as often as not.
 	fAdditionalPenalty = 0;
 
 	if (oldPenalty != 0 || oldAdditionalPenalty != 0) {
@@ -371,10 +371,14 @@ ThreadData::GoesAway()
 
 	ASSERT(fReady);
 
-	if (!HasQuantumEnded(false, false)) {
-		fAdditionalPenalty++;
-		_ComputeEffectivePriority();
-	}
+	// Only the time it ran counts (a quantum used up penalizes it there).
+	// Waiting used to add to the additional penalty too, and a thread that
+	// woke up again within half a quantum (CancelPenalty() comes only after
+	// longer sleeps) got its priority rotated a step down with every wait:
+	// every tenth wake-up of a thread of priority 10 came at priority 1, did
+	// not preempt busy threads of priority 1 and waited for one of them to
+	// use up its quantum (request/response p99 0.17 -> 9.4 ms, #135).
+	HasQuantumEnded(false, false);
 
 	fLastInterruptTime = 0;
 
@@ -431,8 +435,18 @@ ThreadData::Enqueue(bool& wasRunQueueEmpty)
 	SCHEDULER_ENTER_FUNCTION();
 
 	if (!fReady) {
+		bigtime_t timeSlept = system_time() - fWentSleep;
+
+		// The time a thread waited makes up for the time it ran: only a
+		// thread that runs more than it waits uses up its quantum and gets
+		// penalized. The time it ran used to add up over every wait shorter
+		// than half a quantum (CancelPenalty()), so a thread that answered
+		// requests every 100 us at a few percent of a CPU sank to the
+		// lowest priority after a few thousand of them, and woke up behind
+		// busy threads of priority 1 (#135).
+		fTimeUsed = std::max(fTimeUsed - timeSlept, (bigtime_t)0);
+
 		if (gTrackCoreLoad) {
-			bigtime_t timeSlept = system_time() - fWentSleep;
 			bool updateLoad = timeSlept > 0;
 
 			fCore->AddLoad(fNeededLoad, fLoadMeasurementEpoch, !updateLoad);
