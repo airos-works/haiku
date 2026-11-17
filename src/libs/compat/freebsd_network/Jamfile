@@ -60,6 +60,14 @@ KernelStaticLibrary freebsd_usb.a :
 	usb_util.c
 	;
 
+# SDIO function drivers: the functions of the MMC bus' SDIO cards
+KernelStaticLibrary freebsd_sdio.a :
+	sdio.cpp
+	;
+
+ObjectHdrs [ FGristFiles sdio$(SUFOBJ) ]
+	: [ FDirName $(HAIKU_TOP) headers private drivers ] ;
+
 SEARCH_SOURCE += [ FDirName $(SUBDIR) dev mii ] ;
 
 KernelStaticLibrary freebsd_mii.a :

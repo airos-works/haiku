@@ -35,6 +35,8 @@ struct root_device_softc {
 		BUS_fixed,
 			// a device the driver finds itself (on an SoC), nothing to
 			// enumerate
+		BUS_sdio,
+			// a function of an SDIO card of the MMC bus (sdio.cpp)
 	} bus;
 
 	struct pci_info	pci_info;
@@ -43,6 +45,7 @@ struct root_device_softc {
 	uint32			msi_start_vector;
 
 	struct freebsd_usb_device* usb_dev;
+	struct sdio_func* sdio_func;
 };
 
 enum {
@@ -91,6 +94,7 @@ status_t init_pci();
 void uninit_pci();
 
 void uninit_usb() __attribute__((weak));
+void uninit_sdio() __attribute__((weak));
 
 void report_probed_device(int bus, void* compat_device, driver_t* driver,
 	void (*prepare_attach)(void*, device_t), void (*free_compat_device)(void*));

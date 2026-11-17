@@ -83,6 +83,10 @@ status_t _fbsd_init_hardware();
 status_t _fbsd_init_hardware_pci(driver_t* drivers[]);
 status_t _fbsd_init_hardware_uhub(driver_t* drivers[]);
 status_t _fbsd_init_hardware_fixed(driver_t* driver);
+status_t _fbsd_init_hardware_sdio(driver_t* drivers[], const uint16* vendors,
+	size_t vendorCount, bigtime_t wait);
+status_t _fbsd_sdio_find(uint16 vendor, const uint16* devices,
+	size_t deviceCount, uint16* _device, uint8* _function);
 status_t _fbsd_init_drivers();
 void _fbsd_init_bus_dma(const char* driverName);
 status_t _fbsd_uninit_drivers();

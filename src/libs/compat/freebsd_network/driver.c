@@ -67,6 +67,11 @@ init_root_device(device_t *_root, int bus_type)
 		NULL,
 		sizeof(struct root_device_softc),
 	};
+	static driver_t sRootDriverSDIO = {
+		"sdiob",
+		NULL,
+		sizeof(struct root_device_softc),
+	};
 
 	device_t root = device_add_child(NULL, NULL, 0);
 	if (root == NULL)
@@ -86,6 +91,8 @@ init_root_device(device_t *_root, int bus_type)
 		root->driver = &sRootDriverUSB;
 	else if (bus_type == BUS_fixed)
 		root->driver = &sRootDriverFixed;
+	else if (bus_type == BUS_sdio)
+		root->driver = &sRootDriverSDIO;
 	else
 		panic("unknown bus type");
 	((struct root_device_softc*)root->softc)->bus = bus_type;
@@ -347,6 +354,8 @@ err2:
 
 	if (uninit_usb != NULL)
 		uninit_usb();
+	if (uninit_sdio != NULL)
+		uninit_sdio();
 	uninit_pci();
 
 	return status;
@@ -373,6 +382,8 @@ _fbsd_uninit_drivers()
 
 	if (uninit_usb != NULL)
 		uninit_usb();
+	if (uninit_sdio != NULL)
+		uninit_sdio();
 	uninit_pci();
 
 	return B_OK;
