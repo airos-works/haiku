@@ -30,6 +30,7 @@ HAIKU_FIRMWARE_VERSION(0);
 HAIKU_FIRMWARE_NAME_MAP({
 	{"rtwn-rtl8188eefw", "rtwn-rtl8188eefw.ucode"},
 	{"rtwn-rtl8188eufw", "rtwn-rtl8188eufw.ucode"},
+	{"rtwn-rtl8188fufw", "rtwn-rtl8188fufw.ucode"},
 	{"rtwn-rtl8192cfwE", "rtwn-rtl8192cfwE.ucode"},
 	{"rtwn-rtl8192cfwE_B", "rtwn-rtl8192cfwE_B.ucode"},
 	{"rtwn-rtl8192cfwU", "rtwn-rtl8192cfwU.ucode"},
