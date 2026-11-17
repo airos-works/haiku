@@ -35,6 +35,7 @@ HAIKU_FIRMWARE_NAME_MAP({
 	{"rtwn-rtl8192cfwU", "rtwn-rtl8192cfwU.ucode"},
 	{"rtwn-rtl8192cfwT", "rtwn-rtl8192cfwT.ucode"},
 	{"rtwn-rtl8192eufw", "rtwn-rtl8192eufw.ucode"},
+	{"rtwn-rtl8723bufw", "rtwn-rtl8723bufw.ucode"},
 	{"rtwn-rtl8812aufw", "rtwn-rtl8812aufw.ucode"},
 	{"rtwn-rtl8821aufw", "rtwn-rtl8821aufw.ucode"},
 });
