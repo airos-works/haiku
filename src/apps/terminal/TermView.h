@@ -44,6 +44,7 @@ class BScrollView;
 class BString;
 class BStringView;
 class DefaultCharClassifier;
+class FindBar;
 class InlineInput;
 class ShellInfo;
 class ShellParameters;
@@ -150,6 +151,32 @@ public:
 									int32 button = 0);
 			void				NotificationClosed(const char* identifier);
 
+			//! In a split tab, the panes that are not the active one are
+			//! drawn dimmed (as iTerm2 does).
+			void				SetDimmed(bool dimmed);
+
+	virtual	void				MakeFocus(bool focusState = true);
+			bool				IsDimmed() const	{ return fDimmed; }
+
+			// the search bar (iTerm2's find bar): shows it with \a text
+			// (or what was searched last), and goes to the match above or
+			// below
+			void				ShowFindBar(const char* text = NULL);
+			void				HideFindBar();
+			bool				IsFindBarVisible() const
+									{ return fFindBar != NULL; }
+			void				FindAgain(bool up);
+
+			//! What the program reported while the view was in a tab that
+			//! is not shown (detached): the window hands it over.
+			void				HandleDetachedEvents();
+
+			// iTerm2's "Alert on next mark": a notification when the
+			// running command finishes, or the next mark is set
+			void				SetAlertOnNextMark(bool alert);
+			bool				AlertOnNextMark() const
+									{ return fAlertOnNextMark; }
+
 			// kitty's remote control: TermWindow carries the commands out
 			int32				RemoteControlID() const
 									{ return fRemoteControlID; }
@@ -163,7 +190,6 @@ protected:
 	virtual void				DetachedFromWindow();
 	virtual void				Draw(BRect updateRect);
 	virtual void				WindowActivated(bool active);
-	virtual void				MakeFocus(bool focusState = true);
 	virtual void				KeyDown(const char* bytes, int32 numBytes);
 	virtual void				KeyUp(const char* bytes, int32 numBytes);
 
@@ -210,6 +236,24 @@ private:
 
 			BBitmap*			_NotificationIcon(
 									const TermNotification& notification);
+			void				_SendNotification(
+									const TermNotification& notification);
+			void				_Notify(const char* title, const char* body,
+									bool important);
+			bool				_IsSeen() const;
+			void				_ShellMark(char mark, int32 status,
+									const char* command);
+			void				_AskDownload(const std::string& name,
+									const std::string& data);
+			void				_SaveDownload(int32 id);
+
+			// searching
+			void				_SearchChanged();
+			void				_RunSearch(bool keepCurrent);
+			void				_GoToMatch(int32 index);
+			void				_UpdateFindStatus();
+			void				_AddSearchHighlights(FrameState& state,
+									bool current);
 
 private:
 	// Terminal::Listener, called on the reader thread with the terminal
@@ -244,6 +288,12 @@ private:
 	virtual	void				TerminalModesChanged();
 	virtual	void				TerminalProgressChanged(int32 state,
 									int32 percent);
+	virtual	void				TerminalShellMark(char mark, int32 status,
+									const char* command);
+	virtual	void				TerminalRequestAttention(const char* value);
+	virtual	void				TerminalStealFocus();
+	virtual	void				TerminalDownload(const char* name,
+									const std::string& data);
 
 private:
 			status_t			_InitObject(
@@ -488,6 +538,33 @@ private:
 			std::map<std::string, std::string> fNotifications;
 			int32				fNotificationCounter;
 
+			// the window, also while the view is detached (a hidden tab)
+			BMessenger			fWindowMessenger;
+			bool				fDimmed;
+
+			// searching
+			FindBar*			fFindBar;
+			std::vector<std::pair<TermPoint, TermPoint> > fMatches;
+			int32				fCurrentMatch;
+			BString				fSearchText;
+			bool				fSearchMatchCase;
+			bool				fSearchWholeWords;
+			bool				fSearchRegularExpression;
+			bool				fSearchValid;
+			bool				fSearchPending;
+			uint64				fSearchGeneration;
+			bigtime_t			fLastSearchTime;
+			bigtime_t			fSearchCost;
+
+			// alerts
+			bool				fAlertOnNextMark;
+			bigtime_t			fLastBellNotification;
+			bigtime_t			fCommandStart;
+			BString				fCommandText;
+			std::map<int32, std::pair<std::string, std::string> >
+								fPendingDownloads;
+			int32				fDownloadCounter;
+
 			// states
 			DefaultState*		fDefaultState;
 			SelectState*		fSelectState;
@@ -509,6 +586,16 @@ public:
 									const char* title);
 	virtual	void				PreviousTermView(TermView* view);
 	virtual	void				NextTermView(TermView* view);
+	//! The view got the keyboard focus (a click, or the keyboard).
+	virtual	void				TermViewFocused(TermView* view);
+	//! Whether the view is the active pane of its tab: only that one
+	//! takes the focus when its tab is shown.
+	virtual	bool				IsActiveTermView(TermView* view);
+	//! Bring the view to the front: its window, tab and pane.
+	virtual	void				ShowTermView(TermView* view);
+	//! The title of the view's tab, for notifications.
+	virtual	void				GetTermViewTitle(TermView* view,
+									BString& title);
 };
 
 

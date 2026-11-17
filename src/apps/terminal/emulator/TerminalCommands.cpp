@@ -341,14 +341,7 @@ Terminal::OscDispatch(const char* data, size_t length)
 			break;
 		}
 		case 1337:
-			// iTerm2: only the working directory
-			if (argument.compare(0, 11, "CurrentDir=") == 0) {
-				fWorkingDirectory = "file://" + argument.substr(11);
-				if (fListener != NULL) {
-					fListener->TerminalWorkingDirectoryChanged(
-						fWorkingDirectory.c_str());
-				}
-			}
+			_ITerm2(argument);
 			break;
 		case 5522:
 			_ClipboardProtocol(argument.c_str());
@@ -1179,14 +1172,251 @@ Terminal::_ShellIntegration(const char* spec)
 			line.flags |= secondary ? LINE_SECONDARY_PROMPT : LINE_PROMPT;
 			break;
 		}
+		case 'B':
+			// the command is typed from here
+			if (fScreen == &fMain) {
+				fCommandLine = AbsoluteLine(fCursorY);
+				fCommandColumn = fCursorX;
+			}
+			break;
 		case 'C':
 			line.flags &= ~(LINE_PROMPT | LINE_SECONDARY_PROMPT);
 			line.flags |= LINE_OUTPUT;
 			break;
 		default:
-			// B, D and kitty's private k markers carry nothing we use
+			// kitty's private k markers carry nothing we use
 			break;
 	}
+
+	char mark = parts[0][0];
+	std::string command;
+	if (mark == 'C' && fCommandLine >= 0 && fScreen == &fMain) {
+		// what was typed between the prompt and the output
+		int64 row = fCommandLine - AbsoluteLine(0);
+		if (row >= -HistorySize() && row <= fCursorY) {
+			std::string text;
+			GetText(TermPoint(fCommandColumn, (int32)row),
+				TermPoint(fCursorX, fCursorY), text);
+			for (size_t i = 0; i < text.size(); i++) {
+				if (text[i] == '\n' || text[i] == '\r' || text[i] == '\t')
+					text[i] = ' ';
+			}
+			size_t first = text.find_first_not_of(' ');
+			size_t last = text.find_last_not_of(' ');
+			if (first != std::string::npos)
+				command = text.substr(first, last - first + 1);
+			if (command.size() > 200)
+				command = command.substr(0, 200);
+		}
+	}
+	if (mark == 'C' || mark == 'A')
+		fCommandLine = -1;
+
+	if (fListener == NULL)
+		return;
+	if (mark == 'A' && parts.size() > 1 && parts[1] == "k=s")
+		return;
+	if (mark == 'A' || mark == 'C')
+		fListener->TerminalShellMark(mark, -1, command.c_str());
+	else if (mark == 'D') {
+		fListener->TerminalShellMark('D', parts.size() > 1
+			&& !parts[1].empty() && isdigit((unsigned char)parts[1][0])
+				? atoi(parts[1].c_str()) : -1, "");
+	}
+}
+
+
+// #pragma mark - iTerm2
+
+
+//!	Base64 with whatever line breaks and spaces the encoder put in.
+static bool
+decode_base64_lenient(const std::string& input, std::string& output)
+{
+	std::string compact;
+	compact.reserve(input.size());
+	for (size_t i = 0; i < input.size(); i++) {
+		char c = input[i];
+		if (c != '\n' && c != '\r' && c != ' ' && c != '\t')
+			compact += c;
+	}
+	return base64_decode(compact.data(), compact.size(), output);
+}
+
+
+//!	An iTerm2 image dimension: "N" cells, "Npx", "N%" or "auto".
+static InlineImageSize
+parse_inline_image_size(const std::string& value)
+{
+	InlineImageSize size;
+	size.unit = INLINE_SIZE_AUTO;
+	size.value = 0;
+	if (value.empty() || value == "auto" || !isdigit((unsigned char)value[0]))
+		return size;
+	size.value = atof(value.c_str());
+	if (value.size() > 2 && value.compare(value.size() - 2, 2, "px") == 0)
+		size.unit = INLINE_SIZE_PIXELS;
+	else if (value[value.size() - 1] == '%')
+		size.unit = INLINE_SIZE_PERCENT;
+	else
+		size.unit = INLINE_SIZE_CELLS;
+	if (size.value <= 0)
+		size.unit = INLINE_SIZE_AUTO;
+	return size;
+}
+
+
+/*!	iTerm2's proprietary sequences (OSC 1337): inline images and files
+	(File=, MultipartFile=, FilePart=, FileEnd), the working directory,
+	the cell size, marks, attention, the clipboard, user variables.
+*/
+void
+Terminal::_ITerm2(const std::string& argument)
+{
+	size_t equals = argument.find('=');
+	std::string key = argument.substr(0, equals);
+	std::string value = equals == std::string::npos
+		? std::string() : argument.substr(equals + 1);
+
+	if (key == "CurrentDir") {
+		fWorkingDirectory = "file://" + value;
+		if (fListener != NULL)
+			fListener->TerminalWorkingDirectoryChanged(
+				fWorkingDirectory.c_str());
+	} else if (key == "File") {
+		// File=key=value;...:base64
+		size_t colon = value.find(':');
+		if (colon == std::string::npos)
+			return;
+		_ITerm2File(value.substr(0, colon), value.substr(colon + 1));
+	} else if (key == "MultipartFile") {
+		fMultipartActive = true;
+		fMultipartArguments = value;
+		fMultipartData.clear();
+	} else if (key == "FilePart") {
+		if (!fMultipartActive)
+			return;
+		if (fMultipartData.size() + value.size() > 64 * 1024 * 1024) {
+			// too large: dropped
+			fMultipartActive = false;
+			fMultipartData.clear();
+			return;
+		}
+		fMultipartData += value;
+	} else if (key == "FileEnd") {
+		if (!fMultipartActive)
+			return;
+		fMultipartActive = false;
+		std::string data;
+		data.swap(fMultipartData);
+		_ITerm2File(fMultipartArguments, data);
+	} else if (key == "ReportCellSize") {
+		// height and width in points, and the scale
+		float scale = fPixelScale > 0 ? fPixelScale : 1;
+		_Reply("\x1b]1337;ReportCellSize=%.2f;%.2f;%.2f\x1b\\",
+			fCellHeight / scale, fCellWidth / scale, scale);
+	} else if (key == "RequestAttention") {
+		if (fListener != NULL)
+			fListener->TerminalRequestAttention(value.c_str());
+	} else if (key == "StealFocus") {
+		if (fListener != NULL)
+			fListener->TerminalStealFocus();
+	} else if (key == "ClearScrollback") {
+		_EraseInDisplay(3, false);
+	} else if (key == "SetMark") {
+		if (fCursorY >= 0 && fCursorY < fRows) {
+			TerminalLine& line = _Line(fCursorY);
+			line.flags |= LINE_PROMPT;
+			_Touch(fCursorY);
+		}
+		if (fListener != NULL)
+			fListener->TerminalShellMark('M', -1, "");
+	} else if (key == "CursorShape") {
+		// 0 block, 1 vertical bar, 2 underline
+		int32 shape = atoi(value.c_str());
+		fCursorShape = shape == 1 ? CURSOR_SHAPE_BEAM
+			: shape == 2 ? CURSOR_SHAPE_UNDERLINE : CURSOR_SHAPE_BLOCK;
+		_Changed();
+	} else if (key == "Copy") {
+		// Copy=[clipboard]:base64
+		size_t colon = value.find(':');
+		std::string text;
+		if (decode_base64_lenient(colon == std::string::npos ? value
+				: value.substr(colon + 1), text) && fListener != NULL) {
+			fListener->TerminalSetClipboard("c", text.data(), text.size());
+		}
+	} else if (key == "SetUserVar") {
+		size_t separator = value.find('=');
+		if (separator == std::string::npos || separator == 0)
+			return;
+		std::string decoded;
+		if (!decode_base64_lenient(value.substr(separator + 1), decoded))
+			return;
+		if (fUserVariables.size() < 256
+			|| fUserVariables.find(value.substr(0, separator))
+				!= fUserVariables.end()) {
+			fUserVariables[value.substr(0, separator)]
+				= decoded.substr(0, 4096);
+		}
+	} else if (key == "ReportVariable") {
+		std::string name;
+		if (!decode_base64_lenient(value, name))
+			return;
+		std::string answer;
+		std::map<std::string, std::string>::const_iterator found
+			= fUserVariables.find(name.compare(0, 5, "user.") == 0
+				? name.substr(5) : name);
+		if (found != fUserVariables.end())
+			base64_encode(found->second.data(), found->second.size(), answer);
+		_Reply("\x1b]1337;ReportVariable=%s\x1b\\", answer.c_str());
+	}
+}
+
+
+/*!	An iTerm2 file: shown in the text when inline=1 (an image), else
+	offered to the user to be saved.
+*/
+void
+Terminal::_ITerm2File(const std::string& arguments, const std::string& data)
+{
+	std::vector<std::string> pairs;
+	split(arguments, ';', pairs);
+	std::string name;
+	InlineImageSpec spec;
+	bool show = false;
+	for (size_t i = 0; i < pairs.size(); i++) {
+		size_t equals = pairs[i].find('=');
+		if (equals == std::string::npos)
+			continue;
+		std::string key = pairs[i].substr(0, equals);
+		std::string value = pairs[i].substr(equals + 1);
+		if (key == "name") {
+			std::string decoded;
+			if (decode_base64_lenient(value, decoded))
+				name = sanitize_text(decoded, false);
+		} else if (key == "inline")
+			show = value == "1";
+		else if (key == "width")
+			spec.width = parse_inline_image_size(value);
+		else if (key == "height")
+			spec.height = parse_inline_image_size(value);
+		else if (key == "preserveAspectRatio")
+			spec.preserveAspectRatio = value != "0";
+		else if (key == "doNotMoveCursor")
+			spec.moveCursor = value != "1";
+	}
+
+	std::string contents;
+	if (!decode_base64_lenient(data, contents) || contents.empty())
+		return;
+
+	if (!show) {
+		if (fListener != NULL)
+			fListener->TerminalDownload(name.c_str(), contents);
+		return;
+	}
+	if (fGraphics != NULL)
+		fGraphics->PutInlineImage(contents, spec);
 }
 
 

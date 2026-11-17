@@ -54,6 +54,7 @@ public:
 	virtual BRect				DrawTabs();
 
 			void				SetScrollView(BScrollView* scrollView);
+			BScrollView*		ScrollView() const	{ return fScrollView; }
 
 			void				SetListener(Listener* listener)
 									{ fListener = listener; }

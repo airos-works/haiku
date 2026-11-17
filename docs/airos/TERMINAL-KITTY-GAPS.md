@@ -150,7 +150,7 @@ listed for completeness.
 | Hints: pick URLs, paths, hashes with the keyboard | M | |
 | Marks: highlight text matching a pattern | S-M | Terminal has Find. |
 | Configurable key and mouse bindings | M | Terminal's shortcuts are fixed. |
-| Splits and layouts (several shells side by side in a tab) | L | Terminal has windows and tabs. |
+| Layouts (kitty's tall, fat, grid, stack, ... arranged for you) | M | Splits are done (iTerm2's split panes, see TERMINAL.md); kitty's automatic layouts and `goto_layout` are not. |
 | Sessions (startup layouts) | M | |
 | Broadcast typing to several shells | S | |
 

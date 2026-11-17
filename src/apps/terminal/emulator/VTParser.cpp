@@ -485,8 +485,14 @@ void
 VTParser::_StringPut(uint8 c)
 {
 	if (fStringLength >= fStringLimit) {
-		fStringOverflow = true;
-		return;
+		// iTerm2 sends a whole file in one OSC 1337;File=
+		if (fState == STATE_OSC_STRING && fStringLimit < kMaxAPCLength
+			&& fStringLength >= 10 && memcmp(fString, "1337;File=", 10) == 0) {
+			fStringLimit = kMaxAPCLength;
+		} else {
+			fStringOverflow = true;
+			return;
+		}
 	}
 
 	if (fStringLength == fStringCapacity) {

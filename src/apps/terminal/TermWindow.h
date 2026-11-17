@@ -50,7 +50,8 @@ class BFile;
 class BFont;
 class BMenu;
 class BMenuBar;
-class FindWindow;
+class BScrollView;
+class PaneView;
 class PrefWindow;
 class TermViewContainerView;
 class ThemeWindow;
@@ -98,6 +99,11 @@ private:
 									const char* title);
 	virtual	void				PreviousTermView(TermView* view);
 	virtual	void				NextTermView(TermView* view);
+	virtual	void				TermViewFocused(TermView* view);
+	virtual	bool				IsActiveTermView(TermView* view);
+	virtual	void				ShowTermView(TermView* view);
+	virtual	void				GetTermViewTitle(TermView* view,
+									BString& title);
 
 	// SetTitleDialog::Listener
 	virtual	void				TitleChanged(SetTitleDialog* dialog,
@@ -121,6 +127,7 @@ private:
 									const char* field);
 
 				bool			IsValid() const		{ return fID >= 0; }
+				int32			ID() const			{ return fID; }
 
 				status_t		AddToMessage(BMessage& message,
 									const char* field) const;
@@ -162,7 +169,29 @@ private:
 			void				_NavigateTab(int32 index, int32 direction,
 									bool move);
 
-			bool				_CanClose(int32 index);
+			bool				_CanClose(int32 index,
+									TermView* onlyView = NULL);
+
+			// split panes
+			TermViewContainerView* _CreatePane(const Arguments* args,
+									const BString& currentDirectory,
+									bool firstSession,
+									BScrollView*& _scrollView);
+			void				_SplitPane(bool sideBySide);
+			void				_RemovePane(Session* session, TermView* view,
+									bool ask = true);
+			void				_ActivatePane(Session* session,
+									TermViewContainerView* containerView,
+									bool focus = true);
+			void				_NavigatePane(int32 direction);
+			void				_CyclePane(bool next);
+			void				_UpdateDimming(Session* session);
+			void				_AllTermViews(std::vector<TermView*>& views)
+									const;
+			void				_SessionTermViews(Session* session,
+									std::vector<TermView*>& views) const;
+			Session*			_SessionForTermView(TermView* view) const;
+	static	TermViewContainerView* _ContainerOfPane(BView* pane);
 
 			TermViewContainerView* _ActiveTermViewContainerView() const;
 			TermViewContainerView* _TermViewContainerViewAt(int32 index) const;
@@ -194,13 +223,14 @@ private:
 			void				_UpdateKeymap();
 
 			void				_SetFontSize(float size);
+			void				_ApplyFont(const BFont& font);
 			void				_RemoteControl(BMessage* message);
 			bool				_RunRemoteCommand(TermView* sender,
 									const BMessage& command, BString& _reply,
 									BList& _closing);
 			bool				_MatchRemoteTabs(const BMessage& payload,
 									TermView* sender,
-									std::vector<int32>& _indexes,
+									std::vector<TermView*>& _views,
 									BString& _error);
 			void				_RemoteList(TermView* sender, BString& json);
 
@@ -224,7 +254,6 @@ private:
 			BMessage*			fPrintSettings;
 			PrefWindow*			fPrefWindow;
 			ThemeWindow*		fThemeWindow;
-			FindWindow*			fFindPanel;
 			BRect				fSavedFrame;
 			window_look			fSavedLook;
 
@@ -232,17 +261,12 @@ private:
 			SetTitleDialog*		fSetTabTitleDialog;
 			SessionID			fSetTabTitleSession;
 
-			// Saved search parameters
-			BString				fFindString;
-			BMenuItem*			fFindNextMenuItem;
-			BMenuItem*			fFindPreviousMenuItem;
 			BMenuItem*			fIncreaseFontSizeMenuItem;
 			BMenuItem*			fDecreaseFontSizeMenuItem;
-
-			bool				fFindSelection;
-			bool				fForwardSearch;
-			bool				fMatchCase;
-			bool				fMatchWord;
+			BMenuItem*			fCloseViewMenuItem;
+			BMenu*				fPanesMenu;
+			BMenuItem*			fMaximizePaneMenuItem;
+			BMenuItem*			fAlertOnNextMarkMenuItem;
 
 			bool				fFullScreen;
 
