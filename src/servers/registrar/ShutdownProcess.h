@@ -57,6 +57,9 @@ private:
 			bool				_LockAppLists();
 			void				_UnlockAppLists();
 
+			bool				_InitGUIContext();
+	static	status_t			_GUIConnectEntry(void* data);
+
 			void				_InitShutdownWindow();
 			void				_SetShowShutdownWindow(bool show);
 			void				_AddShutdownWindowApps(AppInfoList& infos);

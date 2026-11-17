@@ -14,6 +14,7 @@
 #include <string.h>
 
 #include <signal.h>
+#include <syslog.h>
 #include <unistd.h>
 
 #include <Alert.h>
@@ -34,6 +35,8 @@
 #include <TextView.h>
 #include <Window.h>
 
+#include <AppServerLink.h>
+#include <ServerProtocol.h>
 #include <TokenSpace.h>
 #include <util/DoublyLinkedList.h>
 
@@ -72,6 +75,16 @@ static const bigtime_t kNonAppQuitTimeout = 500000; // 0.5 s
 // The time span the app that has aborted the shutdown shall be displayed in
 // the shutdown window before closing it automatically.
 static const bigtime_t kDisplayAbortingAppTimeout = 3000000; // 3 s
+
+// The time span the connection to app_server for the shutdown window may take.
+// Without a reply by then (app_server hung, or killed but its team not gone),
+// the shutdown goes on without the window.
+static const bigtime_t kGUIConnectTimeout = 10000000; // 10 s
+
+// The name of the thread that connects to app_server, and the last one of them
+// that did not finish in time (and may still be blocked).
+static const char* const kGUIConnectThreadName = "shutdown app_server connect";
+static thread_id sGUIConnectThread = -1;
 
 // The speed of the animation played when an application is blocked on a modal
 // panel.
@@ -750,8 +763,8 @@ ShutdownProcess::Init(BMessage* request)
 	if (fInternalEventSemaphore < 0)
 		RETURN_ERROR(fInternalEventSemaphore);
 
-	// init the app server connection
-	fHasGUI = Registrar::App()->InitGUIContext() == B_OK;
+	// The worker connects to app_server (_InitGUIContext()): this thread runs
+	// the roster, which the connection may have to ask.
 
 	// start watching application quits
 	status_t error = fRoster->AddWatcher(this);
@@ -1207,6 +1220,84 @@ ShutdownProcess::_PrepareShutdownMessage(BMessage& message) const
 }
 
 
+/*!	Connects the registrar to app_server for the shutdown window, and returns
+	whether it can be used.
+
+	A shutdown must not depend on app_server: it may have been killed or hang.
+	Connecting waits for app_server's replies without a time limit, and when
+	app_server is not running, it asks the roster for it, that is the
+	registrar's main thread (which is why Init() must not connect). So a thread
+	of its own connects, and the shutdown goes on without the window when that
+	did not succeed within kGUIConnectTimeout.
+*/
+bool
+ShutdownProcess::_InitGUIContext()
+{
+	if (sGUIConnectThread >= 0) {
+		// An earlier attempt timed out: as long as it is blocked, app_server
+		// does not answer, and BServer must not be entered again.
+		thread_info info;
+		if (get_thread_info(sGUIConnectThread, &info) == B_OK
+			&& info.team == be_app->Team()
+			&& strcmp(info.name, kGUIConnectThreadName) == 0) {
+			syslog(LOG_WARNING, "registrar: app_server still does not answer, "
+				"shutting down without the shutdown window\n");
+			return false;
+		}
+		sGUIConnectThread = -1;
+	}
+
+	thread_id thread = spawn_thread(&_GUIConnectEntry, kGUIConnectThreadName,
+		B_NORMAL_PRIORITY, NULL);
+	if (thread < 0)
+		return false;
+	resume_thread(thread);
+
+	status_t result = B_ERROR;
+	status_t error = wait_for_thread_etc(thread, B_RELATIVE_TIMEOUT,
+		kGUIConnectTimeout, &result);
+	if (error == B_OK && result == B_OK)
+		return true;
+
+	if (error != B_OK) {
+		sGUIConnectThread = thread;
+		syslog(LOG_WARNING, "registrar: app_server did not answer within %"
+			B_PRIdBIGTIME " s, shutting down without the shutdown window\n",
+			kGUIConnectTimeout / 1000000);
+	} else {
+		syslog(LOG_NOTICE, "registrar: no app_server (%s), shutting down "
+			"without the shutdown window\n", strerror(result));
+	}
+	return false;
+}
+
+
+/*static*/ status_t
+ShutdownProcess::_GUIConnectEntry(void* /*data*/)
+{
+	status_t error = Registrar::App()->InitGUIContext();
+	if (error != B_OK)
+		return error;
+
+	// The GUI context is set up only once: app_server may have gone since.
+	// The link's port then still takes messages (app_server hands it to the
+	// client), but no reply ever comes.
+	AppServerLink link;
+	team_info teamInfo;
+	error = get_team_info(link.TargetTeam(), &teamInfo);
+	if (error != B_OK)
+		return error;
+
+	// and app_server must answer
+	link.StartMessage(AS_CURRENT_WORKSPACE);
+	int32 code;
+	error = link.FlushWithReply(code);
+	if (error == B_OK && code != B_OK)
+		error = code;
+	return error;
+}
+
+
 status_t
 ShutdownProcess::_ShutDown()
 {
@@ -1324,6 +1415,9 @@ ShutdownProcess::_WorkerDoShutdown()
 	bool synchronous;
 	if (fRequest->FindBool("synchronous", &synchronous) == B_OK && !synchronous)
 		_SendReply(B_OK);
+
+	// connect to app_server for the shutdown window, if it's there
+	fHasGUI = _InitGUIContext();
 
 	// ask the user to confirm the shutdown, if desired
 	bool askUser;
@@ -1796,8 +1890,11 @@ ShutdownProcess::_QuitBlockingApp(AppInfoList& list, team_id team,
 		if (fDebuggedTeams.Contains(team))
 			debugged = true;
 	}
-	if (!debugged)
+	if (!debugged && fHasGUI) {
+		// This asks app_server. Without the shutdown window, app_server is
+		// gone or does not answer, and nobody could close a modal panel.
 		modal = BPrivate::is_app_showing_modal_window(team);
+	}
 
 	if (modal) {
 		// app blocks on a modal window
