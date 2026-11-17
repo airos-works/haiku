@@ -17,7 +17,9 @@
  *    synchronous;
  *  - what allocating + binding + mapping, and freeing, a buffer costs.
  * VKPERF_UUID_ONLY=1 prints the device and its pipelineCacheUUID and stops;
- * VKPERF_ALLOC_ONLY=1 measures the allocation costs only.
+ * VKPERF_ALLOC_ONLY=1 measures the allocation costs only;
+ * VKPERF_ALLOC=<type>:<KiB>:<count>[:1] with it measures one case (memory
+ * type, size, how many; 1 = free each before making the next).
  *
  * Build with the air/OS SDK (no Vulkan SDK needed, only Mesa's headers):
  *   . /data1/airos/sdk/x86_64/env.sh
@@ -529,6 +531,15 @@ int main(int argc, char **argv)
 
 allocation_cost:
 	printf("\nallocation cost\n");
+	if (getenv("VKPERF_ALLOC") != NULL) {
+		/* one case: VKPERF_ALLOC=<type>:<KiB>:<count>[:one-by-one] */
+		int type = -1, kib = 0, count = 0, oneByOne = 0;
+		sscanf(getenv("VKPERF_ALLOC"), "%d:%d:%d:%d", &type, &kib, &count, &oneByOne);
+		char what[64];
+		snprintf(what, sizeof(what), "%d KiB of type %d", kib, type);
+		alloc_cost_etc(type, (VkDeviceSize)kib << 10, count, what, 0, oneByOne);
+		return 0;
+	}
 	if (host >= 0) alloc_cost(host, 64 << 10, 200, "64 KiB host-visible");
 	if (host >= 0) alloc_cost(host, 1 << 20, 100, "1 MiB host-visible");
 	if (local >= 0) alloc_cost(local, 64 << 10, 200, "64 KiB device-local");

@@ -1,0 +1,22 @@
+#version 450
+// vkbigpage: random texel fetches from a large 2D texture (texture units and
+// their TLB path rather than the load/store path of randbuf.comp).
+layout(local_size_x = 256) in;
+layout(binding = 0) uniform sampler2D tex;
+layout(binding = 1, std430) buffer Result { uint v[]; } res;
+layout(push_constant) uniform PC {
+	uint sizeMask;	// width - 1 (square, power of two)
+	uint iters;
+} pc;
+void main()
+{
+	uint id = gl_GlobalInvocationID.x;
+	uint x = id * 2654435761u + 0x9e3779b9u;
+	vec4 acc = vec4(0.0);
+	for (uint i = 0; i < pc.iters; i++) {
+		x = x * 1664525u + 1013904223u;
+		uint y = x * 22695477u + 1u;
+		acc += texelFetch(tex, ivec2((x >> 7) & pc.sizeMask, (y >> 9) & pc.sizeMask), 0);
+	}
+	res.v[id] = floatBitsToUint(acc.x + acc.y + acc.z + acc.w);
+}
