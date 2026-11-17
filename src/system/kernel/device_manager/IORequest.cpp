@@ -998,8 +998,16 @@ IORequest::NotifyFinished()
 
 	// notify callback
 	if (finishedCallback != NULL) {
+		// The callback may run on a thread that completes I/O for others (a
+		// disk driver's completion thread, or any thread polling a queue):
+		// it must not free vnodes itself, as a file system then waits for
+		// locks whose holders may be waiting for this very thread's
+		// completions (put_vnode()).
+		Thread* thread = thread_get_current_thread();
+		thread->io_completion_depth++;
 		finishedCallback(finishedCookie, this, status, partialTransfer,
 			transferredBytes);
+		thread->io_completion_depth--;
 	}
 
 	// notify parent

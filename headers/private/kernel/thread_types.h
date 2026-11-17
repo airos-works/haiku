@@ -427,6 +427,15 @@ private:
 			UserTimerList		fUserTimers;			// protected by fLock
 			ThreadTimeUserTimerList fCPUTimeUserTimers;
 									// protected by time_lock
+
+public:
+	// (Last, so that the fields before it keep their offsets for drivers
+	// built against the previous layout.)
+			int32				io_completion_depth;
+				// > 0 while the thread runs the finished callbacks of an I/O
+				// request (IORequest::NotifyFinished()): a vnode it releases
+				// then is freed by the vnode undertaker, not by this thread
+				// (see put_vnode()). Only accessed by the thread itself.
 };
 
 

@@ -3946,7 +3946,18 @@ put_vnode(fs_volume* volume, ino_t vnodeID)
 		return B_BAD_VALUE;
 	}
 
-	dec_vnode_ref_count(vnode, false, true);
+	// A file system releasing the reference its I/O held, from the request's
+	// finished callback (BFS' iterative_io_finished_hook(), for example),
+	// runs on whatever thread completed the I/O: an NVMe queue's completion
+	// thread, say. If that was the last reference to a removed file, freeing
+	// it here would have the file system free its blocks (BFS: a journal
+	// transaction) on that thread, while the holder of the journal may be
+	// waiting for I/O that only that thread completes: neither ever goes on,
+	// and every program that touches the disk hangs after it. The undertaker
+	// frees it instead, as it does vnodes released outside the file system.
+	const bool reenter
+		= thread_get_current_thread()->io_completion_depth == 0;
+	dec_vnode_ref_count(vnode, false, reenter);
 	return B_OK;
 }
 
