@@ -31,6 +31,7 @@
 #include <ByteOrder.h>
 #include <driver_settings.h>
 #include <net/if_media.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -44,6 +45,8 @@ enum {
 	NCM_GET_NTB_PARAMETERS			= 0x80,
 	NCM_SET_NTB_FORMAT				= 0x84,
 	NCM_SET_NTB_INPUT_SIZE			= 0x86,
+	NCM_GET_MAX_DATAGRAM_SIZE		= 0x87,
+	NCM_SET_MAX_DATAGRAM_SIZE		= 0x88,
 	NCM_SET_CRC_MODE				= 0x8a
 };
 
@@ -111,6 +114,56 @@ static const uint32 kMinNTBSize = 2048;
 	// USB_CDC_NCM_NTB_MIN_IN_SIZE
 static const uint32 kMaxNTBSize = 65536;
 static const size_t kMinFrame = 60;
+static const uint32 kMaxDatagramSize = 8192;
+	// what SET_MAX_DATAGRAM_SIZE asks for at most, as Linux does
+static const uint32 kDefaultDebugNTBs = 8;
+static const size_t kDebugDatagramBytes = 64;
+static const uint32 kDebugMaxDatagrams = 8;
+	// datagrams of an NTB dumped
+
+
+static const char*
+request_name(uint8 request)
+{
+	switch (request) {
+		case NCM_SET_ETHERNET_PACKET_FILTER:
+			return "SET_ETHERNET_PACKET_FILTER";
+		case NCM_GET_NTB_PARAMETERS:
+			return "GET_NTB_PARAMETERS";
+		case NCM_SET_NTB_FORMAT:
+			return "SET_NTB_FORMAT";
+		case NCM_SET_NTB_INPUT_SIZE:
+			return "SET_NTB_INPUT_SIZE";
+		case NCM_GET_MAX_DATAGRAM_SIZE:
+			return "GET_MAX_DATAGRAM_SIZE";
+		case NCM_SET_MAX_DATAGRAM_SIZE:
+			return "SET_MAX_DATAGRAM_SIZE";
+		case NCM_SET_CRC_MODE:
+			return "SET_CRC_MODE";
+		default:
+			return "request";
+	}
+}
+
+
+/*!	Hex lines of 16 bytes to the syslog, each with \a prefix and the offset
+	of its first byte (\a base plus where it is in \a data).
+*/
+static void
+dump_bytes(const char* prefix, const uint8* data, size_t length, size_t base)
+{
+	for (size_t line = 0; line < length; line += 16) {
+		char text[16 * 3 + 1];
+		size_t used = 0;
+		for (size_t i = line; i < length && i < line + 16; i++) {
+			snprintf(text + used, sizeof(text) - used, " %02x", data[i]);
+			used += 3;
+		}
+		text[used] = '\0';
+		dprintf(DRIVER_NAME ": %s %04" B_PRIxSIZE ":%s\n", prefix,
+			base + line, text);
+	}
+}
 
 
 static inline bool
@@ -180,6 +233,10 @@ NCMDevice::NCMDevice(usb_device device)
 	fTxTransfers(kDefaultTxTransfers),
 	fTxEager(kDefaultTxEager),
 	fTxDatagramSetting(kDefaultTxDatagrams),
+	fDebug(0),
+	fDebugNTBs(kDefaultDebugNTBs),
+	fDebugTxCompletions(0),
+	fDebugNotifications(0),
 	fRxBufferSize(0),
 	fRxDoneHead(0),
 	fRxDoneCount(0),
@@ -473,6 +530,8 @@ NCMDevice::_ReadSettings()
 	fTxTransfers = kDefaultTxTransfers;
 	fTxEager = kDefaultTxEager;
 	fTxDatagramSetting = kDefaultTxDatagrams;
+	fDebug = 0;
+	fDebugNTBs = kDefaultDebugNTBs;
 
 	void* handle = load_driver_settings(DRIVER_NAME);
 	if (handle == NULL)
@@ -490,6 +549,8 @@ NCMDevice::_ReadSettings()
 		{ "tx_transfers", &fTxTransfers, 1, kMaxTxTransfers },
 		{ "tx_eager", &fTxEager, 1, kMaxTxTransfers },
 		{ "tx_max_datagrams", &fTxDatagramSetting, 1, 256 },
+		{ "debug", &fDebug, 0, 1 },
+		{ "debug_ntbs", &fDebugNTBs, 1, 1000 },
 	};
 	for (size_t i = 0; i < B_COUNT_OF(settings); i++) {
 		const char* text = get_driver_parameter(handle, settings[i].name,
@@ -504,6 +565,11 @@ NCMDevice::_ReadSettings()
 		*settings[i].value = value;
 	}
 	unload_driver_settings(handle);
+
+	if (fDebug != 0) {
+		TRACE_ALWAYS("debug: setup requests and the first %" B_PRIu32
+			" NTBs each way go to the syslog\n", fDebugNTBs);
+	}
 }
 
 
@@ -516,8 +582,41 @@ NCMDevice::_ClassRequest(bool in, uint8 request, uint16 value, void* data,
 		(in ? USB_REQTYPE_INTERFACE_IN : USB_REQTYPE_INTERFACE_OUT)
 			| USB_REQTYPE_CLASS,
 		request, value, fControlInterface, length, data, &actualLength);
+
+	if (fDebug != 0) {
+		TRACE_ALWAYS("debug: %s (0x%02x, %s) value 0x%04x index %u length %"
+			B_PRIuSIZE ": %s, %" B_PRIuSIZE " bytes\n", request_name(request),
+			request, in ? "in" : "out", value, fControlInterface, length,
+			strerror(status), actualLength);
+		if (data != NULL && length > 0) {
+			dump_bytes("debug:   ", (const uint8*)data,
+				in ? min_c(actualLength, length) : length, 0);
+		}
+	}
+
 	if (status == B_OK && in && actualLength != length)
 		status = B_IO_ERROR;
+	return status;
+}
+
+
+/*!	Selects \a alternate of the data interface (SET_INTERFACE). */
+status_t
+NCMDevice::_SetAltInterface(uint8 alternate)
+{
+	const usb_configuration_info* config
+		= gUSBModule->get_configuration(fDevice);
+	if (config == NULL || fDataInterface >= config->interface_count
+		|| alternate >= config->interface[fDataInterface].alt_count) {
+		return B_BAD_VALUE;
+	}
+
+	status_t status = gUSBModule->set_alt_interface(fDevice,
+		&config->interface[fDataInterface].alt[alternate]);
+	if (fDebug != 0) {
+		TRACE_ALWAYS("debug: SET_INTERFACE %u alternate %u: %s\n",
+			fDataInterface, alternate, strerror(status));
+	}
 	return status;
 }
 
@@ -608,9 +707,10 @@ NCMDevice::_Negotiate()
 		return B_NOT_SUPPORTED;
 	}
 	fTxNTBSize = fTxWriter.Capacity();
-	fTxDivisor = outDivisor;
-	fTxRemainder = outRemainder;
-	fTxAlignment = outAlignment;
+	// what is used, after the sanity checks
+	fTxDivisor = fTxWriter.Divisor();
+	fTxRemainder = fTxWriter.PayloadRemainder();
+	fTxAlignment = fTxWriter.NDPAlignment();
 
 	// Frames as long as the Ethernet descriptor says (with room for a VLAN
 	// tag when receiving), as long as an empty NTB can carry one.
@@ -625,10 +725,57 @@ NCMDevice::_Negotiate()
 
 	TRACE_ALWAYS("NTB%s: in %" B_PRIu32 " (max %" B_PRIu32 "), out %"
 		B_PRIu32 " (max %" B_PRIu32 ", divisor %u, remainder %u, alignment "
-		"%u, %" B_PRIu32 " datagrams)\n", fNTB32 ? "32" : "16", fRxNTBSize,
+		"%u, %" B_PRIu32 " datagrams; datagrams at offset %% %u == %u, NDP "
+		"at %" B_PRIuSIZE ")\n", fNTB32 ? "32" : "16", fRxNTBSize,
 		fDeviceRxMax, fTxNTBSize, fDeviceTxMax, outDivisor, outRemainder,
-		outAlignment, fTxMaxDatagrams);
+		outAlignment, fTxMaxDatagrams, fTxWriter.Divisor(),
+		fTxWriter.FrameRemainder(), fTxWriter.NDPOffset());
+
+	_SetMaxDatagramSize();
 	return B_OK;
+}
+
+
+/*!	Tells a function that has the request (bmNetworkCapabilities bit 3) the
+	largest datagram we send and take, as Linux' cdc_ncm does: it asks first
+	and sets it when it differs. Should the function keep a smaller one, our
+	frames stay within it.
+*/
+void
+NCMDevice::_SetMaxDatagramSize()
+{
+	if ((fNetworkCapabilities & NCM_CAP_MAX_DATAGRAM_SIZE) == 0)
+		return;
+
+	uint32 wanted = min_c(fMaxFrame, kMaxDatagramSize);
+
+	uint16 current = 0;
+	status_t status = _ClassRequest(true, NCM_GET_MAX_DATAGRAM_SIZE, 0,
+		&current, sizeof(current));
+	if (status != B_OK) {
+		TRACE_ALWAYS("GET_MAX_DATAGRAM_SIZE failed: %s\n", strerror(status));
+		current = 0;
+	} else
+		current = B_LENDIAN_TO_HOST_INT16(current);
+
+	if (current == wanted)
+		return;
+
+	uint16 value = B_HOST_TO_LENDIAN_INT16((uint16)wanted);
+	status = _ClassRequest(false, NCM_SET_MAX_DATAGRAM_SIZE, 0, &value,
+		sizeof(value));
+	if (status == B_OK) {
+		TRACE_ALWAYS("max datagram size %u -> %" B_PRIu32 "\n", current,
+			wanted);
+		return;
+	}
+
+	TRACE_ALWAYS("SET_MAX_DATAGRAM_SIZE %" B_PRIu32 " failed: %s\n", wanted,
+		strerror(status));
+	if (current >= 1514 && current < fMaxFrame) {
+		fMaxFrame = current;
+		TRACE_ALWAYS("frames of at most %" B_PRIu32 " bytes\n", fMaxFrame);
+	}
 }
 
 
@@ -714,8 +861,7 @@ NCMDevice::Open()
 	// The data interface without endpoints first: the NTB parameters can
 	// only change there, and the switch to the NTB alternate resets the
 	// function's data path (NCM 1.0, 7.2).
-	gUSBModule->set_alt_interface(fDevice,
-		&config->interface[fDataInterface].alt[0]);
+	_SetAltInterface(0);
 
 	status_t status = _Negotiate();
 	if (status != B_OK)
@@ -725,9 +871,7 @@ NCMDevice::Open()
 	if (status != B_OK)
 		return status;
 
-	config = gUSBModule->get_configuration(fDevice);
-	status = gUSBModule->set_alt_interface(fDevice,
-		&config->interface[fDataInterface].alt[fDataAlternate]);
+	status = _SetAltInterface(fDataAlternate);
 	if (status != B_OK) {
 		TRACE_ALWAYS("selecting the NTB alternate failed: %s\n",
 			strerror(status));
@@ -739,6 +883,9 @@ NCMDevice::Open()
 	config = gUSBModule->get_configuration(fDevice);
 	const usb_interface_info* data = config->interface[fDataInterface].active;
 	fReadEndpoint = fWriteEndpoint = 0;
+	uint8 readAddress = 0;
+	uint8 writeAddress = 0;
+	uint16 readMaxPacketSize = 0;
 	for (size_t i = 0; i < data->endpoint_count; i++) {
 		const usb_endpoint_descriptor* descriptor = data->endpoint[i].descr;
 		if ((descriptor->attributes & USB_ENDPOINT_ATTR_MASK)
@@ -746,10 +893,14 @@ NCMDevice::Open()
 			continue;
 		}
 		if ((descriptor->endpoint_address & USB_ENDPOINT_ADDR_DIR_IN) != 0) {
-			if (fReadEndpoint == 0)
+			if (fReadEndpoint == 0) {
 				fReadEndpoint = data->endpoint[i].handle;
+				readAddress = descriptor->endpoint_address;
+				readMaxPacketSize = descriptor->max_packet_size & 0x7ff;
+			}
 		} else if (fWriteEndpoint == 0) {
 			fWriteEndpoint = data->endpoint[i].handle;
+			writeAddress = descriptor->endpoint_address;
 			fWriteMaxPacketSize = descriptor->max_packet_size & 0x7ff;
 		}
 	}
@@ -764,11 +915,19 @@ NCMDevice::Open()
 		return B_ERROR;
 	fNotifyEndpoint = control->endpoint[0].handle;
 
+	TRACE_ALWAYS("interface %u alternate %u: bulk in 0x%02x (%u), out 0x%02x "
+		"(%u); notifications 0x%02x on interface %u\n", fDataInterface,
+		data->descr->alternate_setting, readAddress, readMaxPacketSize,
+		writeAddress, fWriteMaxPacketSize,
+		control->endpoint[0].descr->endpoint_address, fControlInterface);
+
 	status = _SetPacketFilter();
 	if (status != B_OK)
 		TRACE_ALWAYS("setting the packet filter failed: %s\n", strerror(status));
 
 	memset(&fStats, 0, sizeof(fStats));
+	fDebugTxCompletions = 0;
+	fDebugNotifications = 0;
 	atomic_set(&fNotifyStopping, 0);
 
 	// sending
@@ -1086,6 +1245,9 @@ NCMDevice::_NextDatagram(bool block)
 			fMaxFrame + 4, fRxDatagrams, kMaxRxDatagrams, &count,
 			&parseStats);
 
+		if (fDebug != 0 && fStats.rx_ntbs < fDebugNTBs)
+			_DumpNTB("rx", fStats.rx_ntbs, slot.buffer, slot.length);
+
 		fStats.rx_ntbs++;
 		fStats.rx_bad_datagrams += parseStats.bad_datagrams;
 		fStats.rx_truncated += parseStats.truncated;
@@ -1307,6 +1469,8 @@ NCMDevice::_SubmitLocked(flush_reason reason)
 
 	size_t length = fTxWriter.Finish(fTxSequence++, fWriteMaxPacketSize,
 		fDeviceTxMax);
+	if (fDebug != 0 && fStats.tx_ntbs < fDebugNTBs)
+		_DumpNTB("tx", fStats.tx_ntbs, slot.buffer, length);
 	slot.datagrams = count;
 	slot.state = TX_IN_FLIGHT;
 	fTxInFlight++;
@@ -1355,6 +1519,13 @@ NCMDevice::_WriteCallback(void* cookie, int32 status, void* data,
 		if (slot->state == TX_IN_FLIGHT) {
 			slot->state = TX_FREE;
 			device->fTxInFlight--;
+		}
+
+		if (device->fDebug != 0
+			&& device->fDebugTxCompletions < device->fDebugNTBs) {
+			device->fDebugTxCompletions++;
+			TRACE_ALWAYS("debug: tx NTB completed: %s, %" B_PRIuSIZE
+				" bytes\n", strerror(status), actualLength);
 		}
 
 		if (status != B_OK && status != B_CANCELED) {
@@ -1409,6 +1580,90 @@ NCMDevice::Write(const uint8* buffer, size_t* numBytes)
 	if (status != B_OK)
 		*numBytes = 0;
 	return status;
+}
+
+
+/*!	"debug 1": the header, the NDPs and the start of each datagram of an NTB
+	to the syslog, read from the bytes as they are (not from what the writer
+	or the parser think they are).
+*/
+void
+NCMDevice::_DumpNTB(const char* what, uint64 number, const uint8* data,
+	size_t length)
+{
+	char prefix[32];
+	snprintf(prefix, sizeof(prefix), "debug: %s %" B_PRIu64, what, number);
+
+	if (length < 12) {
+		TRACE_ALWAYS("%s: %" B_PRIuSIZE " bytes, too short\n", prefix,
+			length);
+		dump_bytes(prefix, data, length, 0);
+		return;
+	}
+
+	uint32 signature = ncm::read32(data);
+	bool ntb32 = signature == ncm::kNTH32Signature;
+	size_t headerLength = ntb32 ? ncm::kNTH32Size : ncm::kNTH16Size;
+	uint32 blockLength = ntb32 ? ncm::read32(data + 8) : ncm::read16(data + 8);
+	size_t ndpIndex = ntb32
+		? (length >= 16 ? ncm::read32(data + 12) : 0) : ncm::read16(data + 10);
+	TRACE_ALWAYS("%s: transfer %" B_PRIuSIZE " bytes, signature 0x%08" B_PRIx32
+		", header length %u, sequence %u, block length %" B_PRIu32
+		", NDP index %" B_PRIuSIZE "\n", prefix, length, signature,
+		ncm::read16(data + 4), ncm::read16(data + 6), blockLength, ndpIndex);
+	dump_bytes(prefix, data, min_c(length, headerLength), 0);
+
+	const uint16 divisor = fTxWriter.Divisor();
+	for (uint32 ndp = 0; ndp < 4 && ndpIndex != 0; ndp++) {
+		const size_t ndpHeader = ntb32
+			? ncm::kNDP32HeaderSize : ncm::kNDP16HeaderSize;
+		const size_t entrySize = ntb32
+			? ncm::kNDP32EntrySize : ncm::kNDP16EntrySize;
+		if (ndpIndex + ndpHeader > length) {
+			TRACE_ALWAYS("%s: NDP at %" B_PRIuSIZE " beyond the transfer\n",
+				prefix, ndpIndex);
+			return;
+		}
+
+		const uint8* header = data + ndpIndex;
+		size_t ndpLength = ncm::read16(header + 4);
+		size_t next = ntb32 ? ncm::read32(header + 8) : ncm::read16(header + 6);
+		TRACE_ALWAYS("%s: NDP at %" B_PRIuSIZE " (%% %u = %" B_PRIuSIZE
+			"): signature 0x%08" B_PRIx32 ", length %" B_PRIuSIZE
+			", next %" B_PRIuSIZE "\n", prefix, ndpIndex, fTxWriter
+				.NDPAlignment(), ndpIndex % fTxWriter.NDPAlignment(),
+			ncm::read32(header), ndpLength, next);
+		size_t shown = min_c(min_c(ndpLength, (size_t)128),
+			length - ndpIndex);
+		dump_bytes(prefix, header, shown, ndpIndex);
+
+		const uint8* entry = header + ndpHeader;
+		for (uint32 i = 0; i < kDebugMaxDatagrams; i++, entry += entrySize) {
+			if ((size_t)(entry + entrySize - data) > length
+				|| (size_t)(entry + entrySize - header) > ndpLength) {
+				break;
+			}
+			size_t offset = ntb32 ? ncm::read32(entry) : ncm::read16(entry);
+			size_t datagramLength
+				= ntb32 ? ncm::read32(entry + 4) : ncm::read16(entry + 2);
+			if (offset == 0 || datagramLength == 0)
+				break;
+
+			TRACE_ALWAYS("%s: datagram %" B_PRIu32 " at %" B_PRIuSIZE
+				" (%% %u = %" B_PRIuSIZE ", payload %% %u = %" B_PRIuSIZE
+				"), %" B_PRIuSIZE " bytes\n", prefix, i, offset, divisor,
+				offset % divisor, divisor,
+				(offset + ncm::kEthernetHeaderSize) % divisor,
+				datagramLength);
+			if (offset < length) {
+				dump_bytes(prefix, data + offset,
+					min_c(min_c(datagramLength, kDebugDatagramBytes),
+						length - offset), offset);
+			}
+		}
+
+		ndpIndex = next;
+	}
 }
 
 
@@ -1577,6 +1832,15 @@ NCMDevice::_NotifyCallback(void* cookie, int32 status, void* data,
 		atomic_add(&device->fInsideNotify, -1);
 		atomic_add(&device->fPendingTransfers, -1);
 		return;
+	}
+
+	if (device->fDebug != 0 && status == B_OK
+		&& device->fDebugNotifications < device->fDebugNTBs) {
+		device->fDebugNotifications++;
+		TRACE_ALWAYS("debug: notification of %" B_PRIuSIZE " bytes\n",
+			actualLength);
+		dump_bytes("debug:   ", device->fNotifyBuffer,
+			min_c(actualLength, (size_t)device->fNotifyBufferLength), 0);
 	}
 
 	if (status == B_OK && actualLength >= sizeof(cdc_notification)) {
@@ -1895,6 +2159,12 @@ NCMDevice::_SetPHYPower(bool on)
 	if (_RealtekPHYRead(0, &control) != B_OK) {
 		TRACE_ALWAYS("cannot read the PHY control register\n");
 		return;
+	}
+	if (fDebug != 0) {
+		TRACE_ALWAYS("debug: Realtek PHY control 0x%04x (%s), power %s "
+			"asked\n", control,
+			(control & kBMCRPowerDown) != 0 ? "powered down" : "powered up",
+			on ? "up" : "down");
 	}
 
 	if (on) {

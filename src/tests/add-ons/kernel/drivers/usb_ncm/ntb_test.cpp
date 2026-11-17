@@ -115,7 +115,9 @@ round_trip(bool ntb32, size_t capacity, uint16_t divisor, uint16_t remainder,
 
 	for (uint32_t i = 0; i < count && i < added; i++) {
 		CHECK(datagrams[i].length == lengths[i]);
-		CHECK(datagrams[i].offset % effectiveDivisor == effectiveRemainder);
+		// the remainder is that of the payload after the Ethernet header
+		CHECK((datagrams[i].offset + kEthernetHeaderSize) % effectiveDivisor
+			== effectiveRemainder);
 		CHECK(frame_matches(buffer.data() + datagrams[i].offset,
 			datagrams[i].length, i));
 	}
@@ -189,9 +191,13 @@ test_padding()
 	writer.Start(buffer.data());
 	writer.Add(1500);
 	size_t used = writer.Used();
+	// where the second datagram goes: its payload on a 4 byte boundary
+	size_t second = used;
+	while ((second + kEthernetHeaderSize) % 4 != 0)
+		second++;
 	writer.Start(buffer.data());
 	writer.Add(1500);
-	writer.Add(2048 - ((used + 3) & ~(size_t)3));
+	writer.Add(2048 - second);
 	CHECK(writer.Used() == 2048);
 	size_t length = writer.Finish(1, 512, 16384);
 	CHECK(length == 2049);
@@ -200,20 +206,247 @@ test_padding()
 	// at the function's maximum, no padding: it knows where that ends
 	writer.Start(buffer.data());
 	writer.Add(1500);
-	writer.Add(2048 - ((used + 3) & ~(size_t)3));
+	writer.Add(2048 - second);
 	length = writer.Finish(1, 512, 2048);
 	CHECK(length == 2048);
 
 	// the padded block still parses
 	writer.Start(buffer.data());
 	writer.Add(1500);
-	writer.Add(2048 - ((used + 3) & ~(size_t)3));
+	writer.Add(2048 - second);
 	length = writer.Finish(1, 512, 16384);
 	datagram datagrams[8];
 	uint32_t count;
 	CHECK(parse_ntb(buffer.data(), length, 4096, datagrams, 8, &count, NULL)
 		== PARSE_OK);
 	CHECK(count == 2);
+}
+
+
+struct layout {
+	uint16_t	divisor;
+	uint16_t	remainder;
+	uint16_t	alignment;
+	// what the writer has to use: nonsense falls back to 4/0/4
+	uint16_t	effectiveDivisor;
+	uint16_t	effectivePayloadRemainder;
+	uint16_t	effectiveAlignment;
+};
+
+
+/*!	Builds an NTB as usb_ncm sends it and checks every rule of NCM 1.0 (and
+	of what Linux' cdc_ncm and FreeBSD's cdce send) straight from the bytes,
+	without parse_ntb():
+	- NTH: signature, wHeaderLength, wSequence, wBlockLength equal to the
+	  transfer length and within the function's dwNtbOutMaxSize, wNdpIndex on
+	  wNdpOutAlignment;
+	- NDP: signature without CRC ("NCM0"/"ncm0"), wLength counting the used
+	  entries and the terminating zero entry, wNextNdpIndex 0, room for
+	  maxDatagrams entries before the first datagram;
+	- datagrams: in order, not overlapping each other or the NDP, within the
+	  block, each one's payload after the Ethernet header at
+	  wNdpOutPayloadRemainder modulo wNdpOutDivisor;
+	- no transfer that ends on a packet boundary below dwNtbOutMaxSize (the
+	  function would wait for more), the padding byte zero.
+*/
+static void
+check_layout(bool ntb32, size_t capacity, const layout& l,
+	uint32_t maxDatagrams, const std::vector<size_t>& lengths,
+	uint16_t maxPacketSize, uint32_t deviceMaxSize)
+{
+	std::vector<uint8_t> buffer(capacity + 1, 0xee);
+	NTBWriter writer;
+	CHECK(writer.Init(ntb32, capacity, l.divisor, l.remainder, l.alignment,
+		maxDatagrams));
+	CHECK(writer.Divisor() == l.effectiveDivisor);
+	CHECK(writer.PayloadRemainder() == l.effectivePayloadRemainder);
+	CHECK(writer.NDPAlignment() == l.effectiveAlignment);
+	writer.Start(buffer.data());
+
+	std::vector<size_t> added;
+	for (size_t i = 0; i < lengths.size(); i++) {
+		uint8_t* target = writer.Add(lengths[i]);
+		if (target == NULL)
+			break;
+		fill_frame(target, lengths[i], (uint32_t)i);
+		added.push_back(lengths[i]);
+	}
+	CHECK(!added.empty());
+	const uint16_t sequence = 0x1234;
+	size_t length = writer.Finish(sequence, maxPacketSize, deviceMaxSize);
+	const uint8_t* data = buffer.data();
+
+	// NTH
+	const size_t headerSize = ntb32 ? kNTH32Size : kNTH16Size;
+	CHECK(read32(data) == (ntb32 ? kNTH32Signature : kNTH16Signature));
+	CHECK(read16(data + 4) == headerSize);
+	CHECK(read16(data + 6) == sequence);
+	size_t blockLength = ntb32 ? read32(data + 8) : read16(data + 8);
+	size_t ndpIndex = ntb32 ? read32(data + 12) : read16(data + 10);
+	CHECK(blockLength == length);
+	CHECK(length <= capacity);
+	CHECK(length <= deviceMaxSize);
+	CHECK(ndpIndex >= headerSize);
+	CHECK(ndpIndex % l.effectiveAlignment == 0);
+	// right after the header, as Linux and FreeBSD put it
+	CHECK(ndpIndex < headerSize + l.effectiveAlignment);
+
+	// NDP
+	const size_t ndpHeaderSize = ntb32 ? kNDP32HeaderSize : kNDP16HeaderSize;
+	const size_t entrySize = ntb32 ? kNDP32EntrySize : kNDP16EntrySize;
+	const uint8_t* ndp = data + ndpIndex;
+	CHECK(read32(ndp) == (ntb32 ? kNDP32Signature : kNDP16Signature));
+	size_t ndpLength = read16(ndp + 4);
+	CHECK(ndpLength == ndpHeaderSize + (added.size() + 1) * entrySize);
+	CHECK(ndpLength % 4 == 0);
+	if (ntb32) {
+		CHECK(read16(ndp + 6) == 0);
+		CHECK(read32(ndp + 8) == 0);
+		CHECK(read32(ndp + 12) == 0);
+	} else
+		CHECK(read16(ndp + 6) == 0);
+	const size_t ndpEnd = ndpIndex + ndpHeaderSize
+		+ (maxDatagrams + 1) * entrySize;
+
+	size_t previousEnd = ndpEnd;
+	for (size_t i = 0; i <= added.size(); i++) {
+		const uint8_t* entry = ndp + ndpHeaderSize + i * entrySize;
+		size_t offset = ntb32 ? read32(entry) : read16(entry);
+		size_t datagramLength = ntb32 ? read32(entry + 4) : read16(entry + 2);
+		if (i == added.size()) {
+			// the terminating entry, and the unused ones after it
+			for (size_t j = i; j <= maxDatagrams; j++) {
+				const uint8_t* unused = ndp + ndpHeaderSize + j * entrySize;
+				for (size_t k = 0; k < entrySize; k++)
+					CHECK(unused[k] == 0);
+			}
+			break;
+		}
+
+		CHECK(datagramLength == added[i]);
+		CHECK(offset >= previousEnd);
+		CHECK(offset - previousEnd < l.effectiveDivisor);
+		CHECK((offset + kEthernetHeaderSize) % l.effectiveDivisor
+			== l.effectivePayloadRemainder);
+		CHECK(offset + datagramLength <= length);
+		CHECK(frame_matches(data + offset, datagramLength, (uint32_t)i));
+		// the gap before it is zeroed
+		for (size_t k = previousEnd; k < offset; k++)
+			CHECK(data[k] == 0);
+		previousEnd = offset + datagramLength;
+	}
+
+	// ends with the last datagram, or one byte after it
+	CHECK(length == previousEnd || length == previousEnd + 1);
+	if (length == previousEnd + 1) {
+		CHECK(data[previousEnd] == 0);
+		CHECK(previousEnd % maxPacketSize == 0);
+	}
+	if (maxPacketSize != 0 && length < deviceMaxSize)
+		CHECK(length % maxPacketSize != 0);
+
+	// and the parser agrees
+	datagram datagrams[300];
+	uint32_t count = 0;
+	parse_stats stats = {};
+	CHECK(parse_ntb(data, length, kMaxFrame, datagrams, 300, &count, &stats)
+		== PARSE_OK);
+	CHECK(count == added.size());
+	CHECK(stats.bad_datagrams == 0);
+}
+
+
+static void
+test_layouts()
+{
+	const layout layouts[] = {
+		// the Realtek RTL8156: datagrams on 4 byte boundaries
+		{ 4, 2, 4, 4, 2, 4 },
+		// Linux' f_ncm
+		{ 4, 0, 4, 4, 0, 4 },
+		{ 4, 1, 4, 4, 1, 4 },
+		{ 4, 3, 8, 4, 3, 8 },
+		{ 8, 0, 8, 8, 0, 8 },
+		{ 8, 2, 8, 8, 2, 8 },
+		{ 8, 6, 16, 8, 6, 16 },
+		{ 16, 14, 16, 16, 14, 16 },
+		{ 32, 14, 16, 32, 14, 16 },
+		{ 32, 0, 32, 32, 0, 32 },
+		{ 64, 2, 64, 64, 2, 64 },
+		// nonsense: divisor and alignment 4, remainder 0
+		{ 3, 9, 0, 4, 0, 4 },
+		{ 4, 4, 6, 4, 0, 4 },
+		{ 0, 0, 2, 4, 0, 4 },
+	};
+
+	const std::vector<std::vector<size_t>> sets = {
+		{ 42 },				// an ARP reply
+		{ 342 },			// a DHCP discover
+		{ 60, 1514, 66, 54, 1000, 14, 1513, 590 },
+		std::vector<size_t>(12, 1514),
+		std::vector<size_t>(40, 60),
+		{ 15, 16, 17, 18, 19, 20, 21 },
+	};
+
+	for (const layout& l : layouts) {
+		for (const auto& lengths : sets) {
+			for (uint32_t maxDatagrams : { 1u, 2u, 3u, 32u, 40u }) {
+				// what the RTL8156 asks for: 17404 out, 1024 byte packets
+				check_layout(false, 17404, l, maxDatagrams, lengths, 1024,
+					17404);
+				check_layout(false, 16384, l, maxDatagrams, lengths, 512,
+					16384);
+				check_layout(false, 16384, l, maxDatagrams, lengths, 64,
+					65536);
+				check_layout(true, 65536, l, maxDatagrams, lengths, 1024,
+					65536);
+			}
+		}
+	}
+
+	// Every length from an Ethernet header up, one and two at a time: the
+	// padding byte comes and goes with the packet boundary.
+	for (const layout& l : layouts) {
+		for (size_t length = 14; length <= 1514; length++) {
+			check_layout(false, 17404, l, 32, { length }, 1024, 17404);
+			check_layout(false, 4096, l, 1, { length }, 64, 65536);
+			check_layout(false, 17404, l, 32, { length, 1514 - length / 2 },
+				512, 17404);
+		}
+	}
+}
+
+
+/*!	The exact bytes of an ARP reply sent to an RTL8156 (divisor 4, payload
+	remainder 2, NDP alignment 4) with one datagram per NTB: what Linux'
+	cdc_ncm sends with tx_max_datagrams 1.
+*/
+static void
+test_rtl8156_bytes()
+{
+	std::vector<uint8_t> buffer(17405, 0xee);
+	NTBWriter writer;
+	CHECK(writer.Init(false, 17404, 4, 2, 4, 1));
+	CHECK(writer.FrameRemainder() == 0);
+	writer.Start(buffer.data());
+	uint8_t* target = writer.Add(42);
+	CHECK(target == buffer.data() + 28);
+	fill_frame(target, 42, 0);
+	size_t length = writer.Finish(5, 1024, 17404);
+	CHECK(length == 70);
+
+	const uint8_t expected[28] = {
+		'N', 'C', 'M', 'H', 12, 0, 5, 0, 70, 0, 12, 0,
+		'N', 'C', 'M', '0', 16, 0, 0, 0, 28, 0, 42, 0, 0, 0, 0, 0
+	};
+	CHECK(memcmp(buffer.data(), expected, sizeof(expected)) == 0);
+
+	// with room for 32 entries: the NDP takes 8 + 33 * 4 bytes, the frame
+	// follows at 152 (Linux, with its 40 entries, puts it at 184)
+	CHECK(writer.Init(false, 17404, 4, 2, 4, 32));
+	writer.Start(buffer.data());
+	CHECK(writer.Add(342) == buffer.data() + 152);
+	CHECK(writer.Add(42) == buffer.data() + 152 + 344);
 }
 
 
@@ -517,6 +750,8 @@ main()
 {
 	test_round_trips();
 	test_padding();
+	test_layouts();
+	test_rtl8156_bytes();
 	test_parse_good();
 	test_parse_bad();
 	test_fuzz();

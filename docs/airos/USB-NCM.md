@@ -36,9 +36,12 @@ set different configurations. A device like the RTL8156 offers three:
 
 - **Setup.** With the data interface in alternate 0: `GET_NTB_PARAMETERS`,
   `SET_NTB_FORMAT` (16 bit, or 32 bit for a function that has nothing else),
-  `SET_CRC_MODE` off, `SET_NTB_INPUT_SIZE`; then the NTB alternate (protocol 1)
-  and `SET_ETHERNET_PACKET_FILTER` (directed, broadcast, all multicast;
-  promiscuous on request). Link and speed come from the `NetworkConnection` and
+  `SET_CRC_MODE` off, `SET_NTB_INPUT_SIZE`, and for a function that has it
+  (`bmNetworkCapabilities` bit 3) `GET_MAX_DATAGRAM_SIZE`, then
+  `SET_MAX_DATAGRAM_SIZE` with the largest frame if that differs (as Linux'
+  `cdc_ncm` does); then the NTB alternate (protocol 1) and
+  `SET_ETHERNET_PACKET_FILTER` (directed, broadcast, all multicast;
+  promiscuous on request). The syslog names the bulk endpoints taken. Link and speed come from the `NetworkConnection` and
   `ConnectionSpeedChange` notifications.
 - **Receiving.** Several bulk IN transfers of the NTB input size stay queued.
   The stack's reader takes the datagrams of a completed NTB, up to 16 per call
@@ -49,8 +52,14 @@ set different configurations. A device like the RTL8156 offers three:
 - **Sending.** Frames (`ETHER_SEND_NET_BUFFER`, no copy before the one into
   the NTB) are packed into the NTB being filled: NTH, the NDP with room for
   the most datagrams, then the datagrams at the function's divisor and
-  remainder. The NTB goes out at once while fewer than `tx_eager` transfers
-  are in flight, when it is full (size or datagram count), or else when a
+  remainder. `wNdpOutPayloadRemainder` is that of the datagram's *payload*,
+  the part after its 14-byte Ethernet header (the function wants the IP
+  header aligned; Linux' `cdc_ncm` and FreeBSD's `cdce` both subtract 14), so
+  a datagram starts where
+  `(offset + 14) % wNdpOutDivisor == wNdpOutPayloadRemainder`. The RTL8156
+  asks for 4/2: frames start on 4-byte boundaries. The NTB goes out at once
+  while fewer than `tx_eager` transfers are in flight, when it is full (size
+  or datagram count), or else when a
   transfer completes. A frame therefore waits only while transfers are in
   flight, and the next completion sends it, so there is no flush timer; under
   load the NTBs grow to what the bus takes. A block that would end on a packet
@@ -72,6 +81,8 @@ the interface down and up to apply):
 | `tx_transfers` | 8 | 1-12 | most bulk OUT transfers in flight |
 | `tx_eager` | 2 | 1-12 | below this many in flight an NTB goes out at once |
 | `tx_max_datagrams` | 32 | 1-256 | datagrams per NTB sent (capped by `wNtbOutMaxDatagrams`) |
+| `debug` | 0 | 0-1 | `debug 1`: each class request (value, data, result), `SET_INTERFACE`, the first notifications, and the first `debug_ntbs` NTBs each way (NTH, NDPs, each datagram's offset and its first 64 bytes, up to 8 datagrams) and TX completions go to the syslog as hex |
+| `debug_ntbs` | 8 | 1-1000 | how many NTBs `debug 1` dumps each way |
 | `disable` | false | | `disable true` keeps the module from loading (read when it loads, so at the latest at the next boot): `usb_ecm` then takes devices that also offer ECM, as before |
 
 `ncmstat [/dev/net/usb_ncm/N]` (built from
@@ -88,7 +99,13 @@ close.
 
 - `ntb_test` (same directory, also builds on any host with
   `-fsanitize=address,undefined`): NTBs built by the writer parse back to the
-  same datagrams in both formats and with odd alignments; broken headers,
+  same datagrams in both formats and with odd alignments; every TX layout rule
+  checked straight from the bytes for 14 divisor/remainder/alignment
+  combinations (4/2/4 of the RTL8156 among them, and nonsense values that
+  fall back to 4/0/4), 1 to 40 datagrams, 16 and 32 bit, packet sizes 64 to
+  1024 (NTH fields, NDP signature/length/terminator/next index, payload
+  alignment, zeroed gaps, the short-packet padding byte); the exact bytes of
+  an ARP reply in a one-datagram NTB for the RTL8156; broken headers,
   NDPs outside the block, NDP loops, chains, bad datagram entries; 200,000
   randomly damaged blocks never yield a datagram outside the transfer.
 - **QEMU with Linux' NCM gadget as the function** (November 2026): a Linux
@@ -114,11 +131,66 @@ close.
     Linux' `cdc_ncm` loses its receive path on the same rig in 8 of 15 down
     and up cycles under traffic, so this is taken to be the rig (usbip-vudc
     and usbredir); it is a thing to watch for on real hardware.
+- **The same rig with a strict gadget** (`/data1/scratch/ncm-tx-rig`):
+  Linux v7.0's `f_ncm` built for the peer kernel with three module
+  parameters (`patch_fncm.py`): `out_remainder=2` offers what the RTL8156
+  offers, `strict_align=1` drops every datagram whose payload is not at
+  that remainder, `dump_ntbs=N` hex dumps the first NTBs received. The
+  usb_ncm before the fix reproduces the laptop: "misplaced datagram at 154
+  (payload % 4 = 0, want 2), dropped", no DHCP, no ping answered. After
+  it: DHCP, ping, 50 pings of 1472 bytes, TCP 230 Mbit/s up and 226 down,
+  285,000 datagrams (up to 32 per NTB) all in place, none dropped.
+  `f_ncm` has no `GET`/`SET_MAX_DATAGRAM_SIZE`, so that path is untested.
+
+## First run on the RTL8156 (17 November 2026): nothing sent arrived
+
+Setup, the link (2500/2500 from the notifications) and receiving all worked:
+thousands of NTBs, no bad ones. Every NTB sent completed without an error, but
+none of its frames reached the wire: no DHCP offer, and with a static .41 the
+server's ARP entry for .41 stayed incomplete while the laptop counted the ARP
+requests in and its replies out. The same with `tx_max_datagrams 1`.
+
+Cause (found offline, to be confirmed on the laptop): the datagrams sat 2
+bytes off. The RTL8156 asks for `wNdpOutDivisor` 4 and
+`wNdpOutPayloadRemainder` 2. That remainder places the payload after the
+Ethernet header, so the frame itself belongs at offset % 4 == 0 (Linux'
+`cdc_ncm`, `cdc_ncm_fix_modulus()`, and FreeBSD's `cdce_ncm_init()` both
+compute `(remainder - 14) & (divisor - 1)`). `usb_ncm` put the frame start at
+offset % 4 == 2. A one-datagram NTB had the frame at 30 where Linux puts it
+at 28. Linux' `f_ncm` gadget on the QEMU rig ignores the alignment and
+offers remainder 0, which is why TX worked there. Everything else matched
+`cdc_ncm` byte for byte: the NDP right after the NTH at 12, `NCM0`, `wLength`
+of the used entries plus the zero entry, `wNextNdpIndex` 0, `wBlockLength`
+equal to the transfer, a pad byte instead of a zero length packet, the
+bulk OUT endpoint of the data interface's alternate 1.
+
+Changed: the payload remainder rule above, `GET`/`SET_MAX_DATAGRAM_SIZE`
+(the RTL8156 has capability bit 3; Linux sends it), the `debug` switch, and
+an endpoint line in the syslog. Short frames are still not padded to 60
+bytes: Linux' `cdc_ncm` does not either, the function pads.
+
+**Next laptop run:** install as in step 2 below, with
+`debug 1` in `/boot/home/config/settings/kernel/drivers/usb_ncm` for the first
+boot. Then:
+1. The syslog has `usb_ncm: NTB16: ... datagrams at offset % 4 == 0, NDP at
+   12` and `interface 1 alternate 1: bulk in 0x8? (1024), out 0x0? (1024)`.
+2. DHCP gives .41 (or with the static address, the server's
+   `ip neigh show 192.168.1.41` is `REACHABLE`); `ping 192.168.1.200`.
+3. Whatever the result, save the syslog lines `usb_ncm: debug:` (the setup
+   requests with their answers, `GET_MAX_DATAGRAM_SIZE`, the first 8 TX NTBs
+   with "datagram 0 at N (% 4 = 0, ...)", their completions, the first 8 RX
+   NTBs, whose offsets show where the RTL8156 itself puts frames).
+4. If TX still fails: compare the dumped bytes with the `cdc_ncm` layout in
+   the section above; next suspects are the Realtek PHY requests made in the
+   NCM configuration (try with `_SetPHYPower` skipped: the PHY was already
+   up) and the packet filter.
+5. Remove `debug 1` (or leave it: it stops after `debug_ntbs` NTBs each way)
+   and go on with the test plan from step 3.
 
 ## Test plan: RTL8156 on the Framework 13
 
-Not run yet: the laptop's reboots can hang in shutdown (#136), so this runs
-with the owner around. Adapter: 0bda:8156, configurations vendor (index 0),
+First run 17 November 2026, see above; the laptop's reboots can hang in
+shutdown (#136), so this runs with the owner around. Adapter: 0bda:8156, configurations vendor (index 0),
 NCM (1), ECM (2); laptop on the 2.5 Gbit/s port, RTL8156 at 192.168.1.41
 (Wi-Fi .31 and the dock's RTL8153 .195 share the subnet, so every iperf3
 binds to .41). Peer: the Linux build server, 192.168.1.200.

@@ -97,6 +97,8 @@ private:
 									uint16 value, void* data,
 									size_t length);
 			status_t			_Negotiate();
+			void				_SetMaxDatagramSize();
+			status_t			_SetAltInterface(uint8 alternate);
 			status_t			_SetPacketFilter();
 			status_t			_AllocateBuffers();
 			void				_FreeBuffers();
@@ -117,6 +119,10 @@ private:
 			void				_SubmitLocked(flush_reason reason);
 	static	void				_WriteCallback(void* cookie, int32 status,
 									void* data, size_t actualLength);
+
+			// "debug" in the settings: the bytes to the syslog
+			void				_DumpNTB(const char* what, uint64 number,
+									const uint8* data, size_t length);
 
 	static	void				_NotifyCallback(void* cookie, int32 status,
 									void* data, size_t actualLength);
@@ -181,6 +187,11 @@ private:
 			uint32				fTxTransfers;
 			uint32				fTxEager;
 			uint32				fTxDatagramSetting;
+			uint32				fDebug;
+				// setup requests, the first fDebugNTBs NTBs each way
+			uint32				fDebugNTBs;
+			uint32				fDebugTxCompletions;
+			uint32				fDebugNotifications;
 
 			// receiving: completed reads in the order they completed
 			rx_slot				fRxSlots[kMaxRxTransfers];

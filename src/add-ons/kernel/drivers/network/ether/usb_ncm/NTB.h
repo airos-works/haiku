@@ -115,10 +115,17 @@ parse_result parse_ntb(const uint8_t* data, size_t length,
 
 
 /*!	Builds one NTB in a buffer: the header, one NDP right after it, room
-	reserved there for up to maxDatagrams entries, then the datagrams, each
-	placed at the payload divisor and remainder the function asks for. The NDP
+	reserved there for up to maxDatagrams entries, then the datagrams. The NDP
 	first is what Linux' cdc_ncm and FreeBSD's cdce send, so functions know
 	it.
+
+	wNdpOutDivisor and wNdpOutPayloadRemainder place the datagram's payload,
+	the part after its 14 byte Ethernet header (the IP header is what a
+	function wants aligned): each datagram starts where
+	(offset + 14) % divisor == remainder. Linux' cdc_ncm and FreeBSD's cdce
+	do the same. A Realtek RTL8156 asks for divisor 4, remainder 2, so its
+	frames start on 4 byte boundaries; while they started 2 bytes later,
+	none of them reached the wire, without an error on the USB side.
 */
 class NTBWriter {
 public:
@@ -126,8 +133,11 @@ public:
 
 			/*!	\a capacity is the largest NTB to build (at most
 				dwNtbOutMaxSize); the buffer must have one byte more, for the
-				padding Finish() may add. Returns false for parameters that
-				cannot work. */
+				padding Finish() may add. \a divisor and \a remainder are
+				wNdpOutDivisor and wNdpOutPayloadRemainder as the function
+				gives them (see above), \a ndpAlignment is
+				wNdpOutAlignment. Returns false for parameters that cannot
+				work. */
 			bool				Init(bool ntb32, size_t capacity,
 									uint16_t divisor, uint16_t remainder,
 									uint16_t ndpAlignment,
@@ -141,6 +151,13 @@ public:
 			size_t				Used() const { return fEnd; }
 			size_t				Capacity() const { return fCapacity; }
 			uint32_t			MaxDatagrams() const { return fMaxDatagrams; }
+			uint16_t			Divisor() const { return fDivisor; }
+			uint16_t			PayloadRemainder() const
+									{ return fPayloadRemainder; }
+			uint16_t			NDPAlignment() const { return fNDPAlignment; }
+			/*!	Where datagrams start: offset % Divisor() is this. */
+			uint16_t			FrameRemainder() const { return fRemainder; }
+			size_t				NDPOffset() const { return fNDPOffset; }
 
 			/*!	Whether a datagram of \a length bytes still fits. */
 			bool				CanAdd(size_t length) const;
@@ -170,6 +187,9 @@ private:
 			size_t				fCapacity;
 			uint16_t			fDivisor;
 			uint16_t			fRemainder;
+				// of the datagram start, from the payload remainder
+			uint16_t			fPayloadRemainder;
+			uint16_t			fNDPAlignment;
 			uint32_t			fMaxDatagrams;
 			size_t				fNDPOffset;
 			size_t				fFirstDatagram;

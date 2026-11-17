@@ -181,6 +181,8 @@ NTBWriter::NTBWriter()
 	fCapacity(0),
 	fDivisor(4),
 	fRemainder(0),
+	fPayloadRemainder(0),
+	fNDPAlignment(4),
 	fMaxDatagrams(0),
 	fNDPOffset(0),
 	fFirstDatagram(0),
@@ -223,7 +225,13 @@ NTBWriter::Init(bool ntb32, size_t capacity, uint16_t divisor,
 	fNTB32 = ntb32;
 	fCapacity = capacity;
 	fDivisor = divisor;
-	fRemainder = remainder;
+	fPayloadRemainder = remainder;
+	// The remainder is that of the payload after the Ethernet header: the
+	// datagram itself starts 14 bytes earlier (as in Linux' cdc_ncm and
+	// FreeBSD's cdce).
+	fRemainder = (uint16_t)((remainder - kEthernetHeaderSize)
+		& (size_t)(divisor - 1));
+	fNDPAlignment = ndpAlignment;
 	fMaxDatagrams = maxDatagrams;
 	fNDPOffset = ndpOffset;
 	fFirstDatagram = ndpOffset + ndpSize;
@@ -248,7 +256,7 @@ NTBWriter::Start(uint8_t* buffer)
 size_t
 NTBWriter::_AlignedOffset(size_t offset) const
 {
-	// the next offset with offset % divisor == remainder
+	// the next offset with offset % divisor == the datagram remainder
 	return offset + ((fRemainder - offset) & (size_t)(fDivisor - 1));
 }
 
