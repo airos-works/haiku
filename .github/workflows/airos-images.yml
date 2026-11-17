@@ -2,9 +2,10 @@
 # (airos-works/airos-ci) from the pushed commit:
 #   x86_64  airos-x86_64.iso   USB stick / CD, EFI and BIOS (X399 and other PCs)
 #   arm64   airos-arm64.iso    USB stick, UEFI (ROCK 5 ITX and other arm64 machines)
-#   rpi4    airos-rpi4.img     Raspberry Pi 4 SD card (Balena Etcher), boots directly
+#   rpi4    airos-rpi4.img     Raspberry Pi 4 and 5 SD card (Balena Etcher), boots directly
 #   cubie   airos-cubie.img    Radxa Cubie A7S SD card with U-Boot and UEFI
-# Each image is smoke-tested (Pi: SD layout) and published on the build server
+# Each image is smoke-tested (Pi: SD layout, both boards' boot files, drivers
+# and firmware) and published on the build server
 # and as a public, immutable GitHub prerelease; its packages go into the
 # target's System Updater feed (http://192.168.1.200/updates/<target>/,
 # docs/airos/SYSTEM-UPDATER.md), which is mirrored to GitHub Releases
