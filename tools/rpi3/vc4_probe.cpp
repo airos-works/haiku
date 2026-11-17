@@ -145,11 +145,12 @@ print_info(const char* when)
 		" KB free), %" B_PRIu64 " KB outside it, binner %" B_PRIu32
 		" KB (slots %#" B_PRIx32 "), jobs %" B_PRIu64 "/%" B_PRIu64
 		", resets %" B_PRIu32 ", interrupt %" B_PRIu32 " (%" B_PRIu64
-		" handled)\n", when, info.ident[0], info.ident[1], info.ident[2],
+		" handled%s)\n", when, info.ident[0], info.ident[1], info.ident[2],
 		info.clock_rate, info.pool_size / 1024, info.pool_free / 1024,
 		info.contiguous_bytes / 1024, info.bin_size / 1024,
 		info.bin_slots_used, info.completed, info.submitted, info.resets,
-		info.interrupt, info.interrupts);
+		info.interrupt, info.interrupts,
+		info.polling ? ", NOT arriving: polling" : "");
 }
 
 
@@ -408,7 +409,8 @@ main(int argc, char** argv)
 	printf("     V3D %" B_PRIu32 ".%" B_PRIu32 ", %" B_PRIu32 " slice(s), %"
 		B_PRIu32 " QPUs and %" B_PRIu32 " TMUs per slice, %" B_PRIu32
 		" KB VPM\n", ident0 >> 24, ident1 & 0xf, (ident1 >> 4) & 0xf,
-		(ident1 >> 8) & 0xf, (ident1 >> 12) & 0xf, (ident1 >> 28) * 4);
+		(ident1 >> 8) & 0xf, (ident1 >> 12) & 0xf,
+		(ident1 >> 28) != 0 ? (ident1 >> 28) : 16);
 	check(get_param(DRM_VC4_PARAM_SUPPORTS_BRANCHES) == 1
 			&& get_param(DRM_VC4_PARAM_SUPPORTS_THREADED_FS) == 1
 			&& get_param(DRM_VC4_PARAM_SUPPORTS_ETC1) == 1
@@ -457,7 +459,7 @@ main(int argc, char** argv)
 	request(VC4_HAIKU_GET_INFO, &info, sizeof(info));
 	print_info("after");
 	check(info.resets == 0, "no job hung (%" B_PRIu32 " resets)", info.resets);
-	check(info.interrupts > 0, "the core's interrupts arrive");
+	check(info.interrupts > 0 && !info.polling, "the core's interrupts arrive");
 
 	drm_vc4_get_hang_state hang = {};
 	status = request(VC4_HAIKU_GET_HANG_STATE, &hang, sizeof(hang));

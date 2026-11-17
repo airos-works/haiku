@@ -88,6 +88,9 @@ struct vc4_haiku_info {
 	uint32	interrupt;
 	uint64	interrupts;
 		// handled so far
+	uint32	polling;
+		// 1: a job finished without its interrupt; the driver polls
+	uint32	pad;
 };
 
 // DRM_FORMAT_MOD_BROADCOM_VC4_T_TILED (drm_fourcc.h), for SET/GET_TILING

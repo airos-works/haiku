@@ -43,7 +43,9 @@
 	512 KB slot of a 16 MB buffer for its tile state and lists, and more
 	slots when it runs out (the "out of memory" interrupt). A job that does
 	not get anywhere for a second is given up: the core is reset through
-	its power domain, as Linux does it.
+	its power domain, as Linux does it. Should the interrupts not come
+	through, the core's flush and frame counters still tell when a list is
+	done, and the driver polls them.
 
 	Power. The firmware owns the V3D power domain and clock (Linux:
 	raspberrypi-power and clk-raspberrypi); the driver asks it through the
@@ -122,8 +124,10 @@
 #define VC4_MAX_JOB_BOS			16384
 
 // A job that has not moved on in this long is given up (Linux: 100 ms).
-#define VC4_PROGRESS_INTERVAL	250000
-#define VC4_STALLS_ALLOWED		4
+#define VC4_STALL_TIMEOUT		1000000
+// How often a running job is looked at: with interrupts, and without them.
+#define VC4_CHECK_INTERVAL		250000
+#define VC4_POLL_INTERVAL		1000
 
 #define VC4_SLCACTL_ALL \
 	(VC4_SET_FIELD(0xf, V3D_SLCACTL_T1CC) | VC4_SET_FIELD(0xf, V3D_SLCACTL_T0CC) \
@@ -190,6 +194,8 @@ struct vc4_info {
 	int32			events;
 	ConditionVariable eventCondition;
 	int64			interrupts;
+	bool			polling;
+		// the interrupts do not arrive: the job thread looks for itself
 	uint32			resets;
 
 	bool			hangStateValid;
@@ -766,17 +772,23 @@ give_overflow(vc4_info* info, vc4_exec_info* job)
 /*!	Waits until control list thread \a thread is done (\a doneEvent),
 	giving the binner memory when it asks. Gives up when the thread's
 	address has not moved for a while (Linux: vc4_hangcheck_elapsed()).
+
+	The core counts the binning flushes and rendered frames (BFC, RFC), with
+	or without interrupts: when the count moved (from \a startCount) but the
+	interrupt did not come, the interrupts do not get through, and the
+	thread polls the core from then on.
 */
 static status_t
-wait_for_thread(vc4_info* info, vc4_exec_info* job, uint32 thread,
-	uint32 doneEvent)
+wait_for_list(vc4_info* info, vc4_exec_info* job, uint32 thread,
+	uint32 doneEvent, uint32 startCount)
 {
+	const uint32 counter = thread == 0 ? V3D_BFC : V3D_RFC;
 	uint32 lastAddress = read32(info, V3D_CTNCA(thread));
-	uint32 stalls = 0;
+	bigtime_t lastProgress = system_time();
 
 	while (true) {
 		uint32 events = wait_for_event(info, doneEvent | V3D_INT_OUTOMEM,
-			VC4_PROGRESS_INTERVAL);
+			info->polling ? VC4_POLL_INTERVAL : VC4_CHECK_INTERVAL);
 		if ((events & doneEvent) != 0)
 			return B_OK;
 		if ((events & V3D_INT_OUTOMEM) != 0) {
@@ -786,13 +798,31 @@ wait_for_thread(vc4_info* info, vc4_exec_info* job, uint32 thread,
 			continue;
 		}
 
+		if ((read32(info, counter) & 0xff) != startCount) {
+			// the interrupt may just have come
+			if ((atomic_and(&info->events, ~(int32)doneEvent) & doneEvent)
+					== 0 && !info->polling) {
+				ERROR("job %" B_PRIu64 " finished without its interrupt "
+					"(%" B_PRId64 " so far): polling the core from now on\n",
+					job->seqno, atomic_get64(&info->interrupts));
+				info->polling = true;
+			}
+			return B_OK;
+		}
+		if (info->polling && thread == 0
+			&& (read32(info, V3D_INTCTL) & read32(info, V3D_INTENA)
+				& V3D_INT_OUTOMEM) != 0) {
+			write32(info, V3D_INTDIS, V3D_INT_OUTOMEM);
+			give_overflow(info, job);
+			continue;
+		}
+
+		bigtime_t now = system_time();
 		uint32 address = read32(info, V3D_CTNCA(thread));
 		if (address != lastAddress) {
 			lastAddress = address;
-			stalls = 0;
-			continue;
-		}
-		if (++stalls >= VC4_STALLS_ALLOWED)
+			lastProgress = now;
+		} else if (now - lastProgress >= VC4_STALL_TIMEOUT)
 			return B_TIMED_OUT;
 	}
 }
@@ -815,10 +845,11 @@ run_job(vc4_info* info, vc4_exec_info* job)
 			return status;
 
 		// writing the end address starts the thread
+		uint32 flushes = read32(info, V3D_BFC) & 0xff;
 		write32(info, V3D_CTNCA(0), job->ct0ca);
 		write32(info, V3D_CTNEA(0), job->ct0ea);
 
-		status = wait_for_thread(info, job, 0, V3D_INT_FLDONE);
+		status = wait_for_list(info, job, 0, V3D_INT_FLDONE, flushes);
 		write32(info, V3D_INTDIS, V3D_INT_OUTOMEM);
 		if (status != B_OK) {
 			ERROR("job %" B_PRIu64 ": the binner did not finish\n",
@@ -828,10 +859,11 @@ run_job(vc4_info* info, vc4_exec_info* job)
 	}
 
 	flush_texture_caches(info);
+	uint32 frames = read32(info, V3D_RFC) & 0xff;
 	write32(info, V3D_CTNCA(1), job->ct1ca);
 	write32(info, V3D_CTNEA(1), job->ct1ea);
 
-	status_t status = wait_for_thread(info, job, 1, V3D_INT_FRDONE);
+	status_t status = wait_for_list(info, job, 1, V3D_INT_FRDONE, frames);
 	if (status != B_OK) {
 		ERROR("job %" B_PRIu64 ": the render list did not finish\n",
 			job->seqno);
@@ -1538,6 +1570,7 @@ vc4_control(void* cookie, uint32 op, void* buffer, size_t length)
 			request.resets = info->resets;
 			request.interrupt = info->interrupt;
 			request.interrupts = atomic_get64(&info->interrupts);
+			request.polling = info->polling ? 1 : 0;
 			locker.Unlock();
 
 			if (buffer == NULL || !IS_USER_ADDRESS(buffer))
@@ -1637,6 +1670,8 @@ initialize_device(vc4_info* info, uint32 poolMB)
 	resume_thread(info->executor);
 
 	uint32 ident1 = info->ident[1];
+	// the VPM size is in KB, 0 for 16
+	uint32 vpmSize = VC4_GET_FIELD(ident1, V3D_IDENT1_VPM_SIZE);
 	INFO("V3D %" B_PRIu32 ".%" B_PRIu32 ": %" B_PRIu32 " slice(s) of %"
 		B_PRIu32 " QPUs and %" B_PRIu32 " texture units, %" B_PRIu32 " KB VPM, %"
 		B_PRIu32 " semaphores; clock %" B_PRIu32 " Hz, interrupt %" B_PRIu32
@@ -1644,7 +1679,7 @@ initialize_device(vc4_info* info, uint32 poolMB)
 		VC4_GET_FIELD(ident1, V3D_IDENT1_NSLC),
 		VC4_GET_FIELD(ident1, V3D_IDENT1_QUPS),
 		VC4_GET_FIELD(ident1, V3D_IDENT1_TUPS),
-		VC4_GET_FIELD(ident1, V3D_IDENT1_VPM_SIZE) * 4,
+		vpmSize != 0 ? vpmSize : 16,
 		VC4_GET_FIELD(ident1, V3D_IDENT1_NSEM), info->clockRate,
 		info->interrupt);
 	INFO("binner memory at %#" B_PRIxPHYSADDR ", buffer pool of %" B_PRIu32
