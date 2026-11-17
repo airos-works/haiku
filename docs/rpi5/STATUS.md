@@ -4,6 +4,32 @@ Board: Raspberry Pi 5 Model B rev 1.1, 4 GB (c04171), BCM2712 D0 (the firmware a
 The image is the Pi image (`airos-rpi-image`); one SD card starts both a
 Pi 4 and a Pi 5. How it boots: BOOT.md.
 
+## The release image
+
+CI's `airos-rpi4.img` (airos-works/airos-ci `images/build-image.sh rpi4`,
+published as `image-rpi4-*`, updated through the `rpi4` System Updater feed)
+is that one image: there is no separate Pi 5 image. It carries the BCM2712
+device trees and the D0 overlay (airos-ci `deps/build-firmware.sh`), the
+`[pi5]` section of config.txt, and the Pi 5's drivers in the haiku package
+(they are built for every arm64 image). The image build stops when the Pi 5's
+trees or overlay are missing (`build/jam/images/RpiBootImage`), and CI's smoke
+test (`images/smoke-test.sh rpi4`) refuses to publish an image that lacks the
+boot files, config.txt settings, drivers or Wi-Fi/Bluetooth firmware of
+either board.
+
+2026-11-17: image-rpi4-20261117005911-4c6dd3bf67 (hrev60207+2744) started
+the lab Pi 5 from the KVM's virtual USB disk, unchanged except for the lab's
+`usb_max_current_enable=1` (3 A supply): `rp1_gem` 1 Gbit and DHCP, V3D 7.1,
+`rpi_display` 3840x2160 at 60 Hz on HDMI 1 with app_server's DMA flushes,
+`broadcomfmac`, `h4bcm` patched, `bcm2712_hdmi_audio`, `rpi_thermal`, first
+login. The SD card's install, made from a CI image and updated by System
+Updater (20261116.2347), starts the same way.
+
+USB boot on a supply that is not 5 A: the EEPROM boots from USB only when
+config.txt has `usb_max_current_enable=1`. The image leaves it out (it lets
+USB devices draw 1.6 A from a supply that may not have it); add it under
+`[pi5]` to boot the image from a USB disk on such a supply.
+
 | Area | State | Evidence (2026-11-14) |
 | --- | --- | --- |
 | Boot from SD | works | the released CI image image-rpi4-20261114054454-32f74065ac (hrev60207+2661): First-Boot Setup, SD expanded to 127.7 GB, restart, desktop |

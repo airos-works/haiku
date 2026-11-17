@@ -222,7 +222,8 @@ rule SetCPUProfile architecture : profile
 	#	rpi4: Cortex-A72 (Raspberry Pi 4). Schedules for the A72 and inlines
 	#		atomics: the A72 has no LSE, so the outlined helpers (which pick
 	#		LSE where the CPU has it, see glue/init_term_dyn.c) are a call per
-	#		atomic operation for nothing.
+	#		atomic operation for nothing. The Pi image built with it also
+	#		starts the Pi 5, whose Cortex-A76 runs the A72's code as it is.
 
 	local flags ;
 	switch $(HAIKU_CPU_$(architecture)):$(profile) {
