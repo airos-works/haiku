@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <condition_variable.h>
 #include <lock.h>
 #include <util/AutoLock.h>
 #include "mmc.h"
@@ -216,14 +217,16 @@ private:
 		// the SDIO card, if there is one (fSdioRca != 0)
 		uint16					fSdioRca;
 		sdio_card				fSdio;
-		recursive_lock			fSdioHandlerLock;
-			// the handlers, IENx, and a dispatch in progress
+		mutex					fSdioHandlerLock;
+			// the handlers, IENx, and the host's card interrupt
 		sdio_interrupt_handler	fSdioHandlers[SDIO_MAX_FUNCTIONS];
 		void*					fSdioHandlerData[SDIO_MAX_FUNCTIONS];
 		uint8					fSdioInterruptEnable;
 		sem_id					fSdioInterruptSemaphore;
 		thread_id				fSdioInterruptThread;
 		bool					fSdioHostHandlerSet;
+		bool					fSdioDispatching;
+		ConditionVariable		fSdioDispatchDone;
 		// FIXME card type shall be extended to map card type to RCA.
 		// In theory RCA is 16 bit allowing for 2^16 devices on signle bus
 		// Practically this is limited by bus max capacitance(ver low speed)

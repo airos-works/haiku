@@ -28,14 +28,16 @@ MMCBus::MMCBus(device_node* node)
 	fSdioInterruptEnable(0),
 	fSdioInterruptSemaphore(-1),
 	fSdioInterruptThread(-1),
-	fSdioHostHandlerSet(false)
+	fSdioHostHandlerSet(false),
+	fSdioDispatching(false)
 {
 	CALLED();
 
 	memset(&fSdio, 0, sizeof(fSdio));
 	memset(fSdioHandlers, 0, sizeof(fSdioHandlers));
 	memset(fSdioHandlerData, 0, sizeof(fSdioHandlerData));
-	recursive_lock_init(&fSdioHandlerLock, "mmc bus sdio handlers");
+	mutex_init(&fSdioHandlerLock, "mmc bus sdio handlers");
+	fSdioDispatchDone.Init(this, "sdio dispatch");
 
 	// Get the parent info, it includes the API to send commands to the hardware
 	device_node* parent = gDeviceManager->get_parent_node(node);
@@ -96,7 +98,7 @@ MMCBus::~MMCBus()
 	_StopSdioInterrupts();
 	if (fLockSemaphore >= B_OK)
 		delete_sem(fLockSemaphore);
-	recursive_lock_destroy(&fSdioHandlerLock);
+	mutex_destroy(&fSdioHandlerLock);
 }
 
 

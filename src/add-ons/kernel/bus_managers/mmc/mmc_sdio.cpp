@@ -435,35 +435,68 @@ MMCBus::_SdioInterruptThread(void* data)
 	MMCBus* bus = (MMCBus*)data;
 
 	while (acquire_sem(bus->fSdioInterruptSemaphore) == B_OK) {
-		RecursiveLocker locker(bus->fSdioHandlerLock);
-
-		uint8 handlers = 0;
-		for (uint8 function = 1; function < SDIO_MAX_FUNCTIONS; function++) {
-			if (bus->fSdioHandlers[function] != NULL)
-				handlers |= 1 << function;
+		// What to call is taken under the lock; the calls are made without
+		// it, so that a handler may block on its driver's locks while that
+		// driver adds a handler (broadcomfmac's attach holds them).
+		sdio_interrupt_handler handlers[SDIO_MAX_FUNCTIONS];
+		void* handlerData[SDIO_MAX_FUNCTIONS];
+		uint8 functions = 0;
+		bool distinct = false;
+		{
+			MutexLocker locker(bus->fSdioHandlerLock);
+			for (uint8 function = 1; function < SDIO_MAX_FUNCTIONS;
+					function++) {
+				handlers[function] = bus->fSdioHandlers[function];
+				handlerData[function] = bus->fSdioHandlerData[function];
+				if (handlers[function] == NULL)
+					continue;
+				for (uint8 other = 1; other < function && !distinct; other++) {
+					if ((functions & (1 << other)) != 0
+						&& (handlers[other] != handlers[function]
+							|| handlerData[other] != handlerData[function]))
+						distinct = true;
+				}
+				functions |= 1 << function;
+			}
+			if (functions == 0) {
+				// stays masked until a handler comes
+				continue;
+			}
+			bus->fSdioDispatching = true;
 		}
-		if (handlers == 0) {
-			// stays masked until a handler comes
-			continue;
-		}
 
-		// With one handler the card's pending register is not read: that
-		// handler is called (Linux does the same).
-		bool single = (handlers & (handlers - 1)) == 0;
+		// With one handler (one function, or one handler for all of them)
+		// the card's pending register is not read: it is called (Linux does
+		// the same for a single function).
 		uint8 pending = 0;
-		if (!single
+		if (distinct
 			&& bus->SdioReadByte(0, SDIO_CCCR_INT_PENDING, &pending) != B_OK) {
 			// served all the same: a function that has nothing finds that
-			pending = handlers;
+			pending = functions;
 		}
 
-		uint8 serve = sdio_interrupts_to_serve(handlers, pending, !single);
+		uint8 serve = sdio_interrupts_to_serve(functions, pending, distinct);
+		uint8 called = 0;
 		for (uint8 function = 1; function < SDIO_MAX_FUNCTIONS; function++) {
-			if ((serve & (1 << function)) != 0)
-				bus->fSdioHandlers[function](bus->fSdioHandlerData[function]);
+			if ((serve & (1 << function)) == 0)
+				continue;
+			// a handler for several functions is called once
+			bool done = false;
+			for (uint8 other = 1; other < function && !done; other++) {
+				done = (called & (1 << other)) != 0
+					&& handlers[other] == handlers[function]
+					&& handlerData[other] == handlerData[function];
+			}
+			if (!done)
+				handlers[function](handlerData[function]);
+			called |= 1 << function;
 		}
 
-		bus->fController->enable_sdio_interrupt(bus->fCookie, true);
+		MutexLocker locker(bus->fSdioHandlerLock);
+		bus->fSdioDispatching = false;
+		bus->fSdioDispatchDone.NotifyAll();
+		if (bus->fSdioHostHandlerSet)
+			bus->fController->enable_sdio_interrupt(bus->fCookie, true);
 	}
 	return B_OK;
 }
@@ -479,9 +512,7 @@ MMCBus::SdioSetInterruptHandler(uint8 function, sdio_interrupt_handler handler,
 		|| fController->enable_sdio_interrupt == NULL)
 		return B_NOT_SUPPORTED;
 
-	// Held across a dispatch: once a handler is taken away, it is not
-	// running any more (unless it takes itself away).
-	RecursiveLocker locker(fSdioHandlerLock);
+	MutexLocker locker(fSdioHandlerLock);
 
 	if (handler != NULL && fSdioInterruptThread < 0) {
 		fSdioInterruptSemaphore = create_sem(0, "sdio interrupt");
@@ -521,6 +552,18 @@ MMCBus::SdioSetInterruptHandler(uint8 function, sdio_interrupt_handler handler,
 		fController->enable_sdio_interrupt(fCookie, false);
 		fController->set_sdio_interrupt_handler(fCookie, NULL, NULL);
 		fSdioHostHandlerSet = false;
+	}
+
+	// Once a handler is taken away, it does not run any more: wait for a
+	// dispatch that may still call it (unless it takes itself away).
+	if (handler == NULL && find_thread(NULL) != fSdioInterruptThread) {
+		while (fSdioDispatching) {
+			ConditionVariableEntry entry;
+			fSdioDispatchDone.Add(&entry);
+			locker.Unlock();
+			entry.Wait();
+			locker.Lock();
+		}
 	}
 	return B_OK;
 }

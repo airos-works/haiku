@@ -190,13 +190,16 @@ typedef struct sdio_function_interface {
 	status_t (*enable_function)(void* cookie, uint8 function, bool enable);
 
 	/*!	The function's interrupt: \a handler is called in a thread of the
-		bus (it may do I/O) when the card raises its interrupt and the
-		function has one pending, or every time if it is the card's only
-		handler (the card's pending register is then not read). The card
-		interrupt is masked from the host's interrupt until all handlers
-		have returned: a handler serves its function before it returns, or
-		the interrupt comes back at once. Sets the function's and the
-		master's bit in IENx; a NULL \a handler takes them away again. */
+		bus (it may do I/O and take its driver's locks) when the card raises
+		its interrupt and the function has one pending, or every time if it
+		is the card's only handler (the card's pending register is then not
+		read). The same handler and data for several functions count as one
+		and are called once. The card interrupt is masked from the host's
+		interrupt until all handlers have returned: a handler serves its
+		functions before it returns, or the interrupt comes back at once.
+		Sets the function's and the master's bit in IENx; a NULL \a handler
+		takes them away again, and returns once the old handler is no longer
+		running. */
 	status_t (*set_interrupt_handler)(void* cookie, uint8 function,
 		sdio_interrupt_handler handler, void* data);
 
