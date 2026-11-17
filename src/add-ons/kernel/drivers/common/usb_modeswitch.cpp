@@ -9,6 +9,7 @@
 /*
 	Devices and messages reference: usb-modeswitch-data-20100826
 	Huawei devices updated to usb-modeswitch-data-20150115
+	Realtek Wi-Fi devices from usb-modeswitch-data-20261111
 */
 
 #include <ByteOrder.h>
@@ -127,6 +128,7 @@ unsigned char kDevicesMsg[][31] = {
 #define OLIVETTI_VENDOR	0x0b3c
 #define OPTION_VENDOR	0x0af0
 #define ATHEROS_VENDOR	0x0cf3
+#define REALTEK_VENDOR	0x0bda
 
 
 static const struct {
@@ -283,6 +285,15 @@ static const struct {
 	{{ 0, 0, 0, OPTION_VENDOR, 0xd257}, MSG_OPTION_1},
 	{{ 0, 0, 0, OPTION_VENDOR, 0xd357}, MSG_OPTION_1},
 	{{ 0, 0, 0, ATHEROS_VENDOR, 0x20ff}, MSG_ATHEROS_1},
+	// Realtek Wi-Fi dongles that first show up as a "Driver Storage" CD.
+	// 0bda:1a2b is Realtek's driver CD ID shared by many chips and brands
+	// (an RTL8821CU D-Link DWA-171 comes back as 2001:331d, Realtek's own
+	// as 0bda:b851); 0bda:a192 is the RTL8192FU (back as 0bda:f192).
+	// usb_modeswitch switches them with StandardEject: ALLOW MEDIUM REMOVAL,
+	// then START STOP UNIT with the eject bit, which is what MSG_ZTE_1 and
+	// MSG_ZTE_2 send.
+	{{ 0, 0, 0, REALTEK_VENDOR, 0x1a2b}, MSG_ZTE_1, MSG_ZTE_2},
+	{{ 0, 0, 0, REALTEK_VENDOR, 0xa192}, MSG_ZTE_1, MSG_ZTE_2},
 };
 static uint32 kDevicesCount = sizeof(kDevices) / sizeof(kDevices[0]);
 
