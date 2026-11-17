@@ -124,6 +124,7 @@ adapters** work in any USB port.
 | Ralink/MediaTek RT2560, RT2561/2561S, RT2661, RT2760/2790, RT2860/2890, RT3060/3062, RT3090/3091/3092, RT3390, RT3562/3591/3592/3593, RT5390/5392 | `ralinkwifi` | PCI / mini PCIe | 802.11b/g/n | ralink_wifi_firmwares |
 | Realtek RTL8188CE, RTL8192CE, RTL8188EE | `realtekwifi` | mini PCIe | 802.11n | realtek_wifi_firmwares |
 | Realtek RTL8188CU/CUS/CTV/RU, RTL8191CU, RTL8192CU, RTL8188EU/ETV, RTL8192EU, RTL8812AU, RTL8821AU | `realtekwifi` | USB | 802.11n/ac | realtek_wifi_firmwares |
+| Realtek RTL8188FU/FTV, RTL8188GU (RTL8710BU) — branch `rtl8710b`, untested, see `docs/airos/RTL8710B.md` | `realtekwifi` | USB | 802.11n | realtek_wifi_extra_firmwares (planned; RTL8710B tables are GPL-2.0 data) |
 | Ralink/MediaTek RT2070, RT2770, RT2870, RT3070/3071/3072, RT3370, RT3572/3573, RT5370/5372, RT5572, RT8070 | `ralinkwifi` (run) | USB | 802.11n | ralink_wifi_firmwares |
 | MediaTek MT7601U | `ralinkwifi` (mtw) | USB | 802.11n | ralink_wifi_firmwares |
 | Ralink RT2501/RT2573, RT2500USB | `ralinkwifi` (rum, ural) | USB | 802.11b/g | ralink_wifi_firmwares / none |
