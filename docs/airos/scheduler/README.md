@@ -36,6 +36,10 @@ three machines (November 2026):
   AMD package energy (amd_pstates' `amd_energy` syscall), Zen 1 P-state
   scaling switch, and disabling/enabling CPUs as s2idle does.
 - `pstate-ab.sh`: Zen 1 P-state scaling off vs on in one boot.
+- `wakelat.c`: wake-up latency while threads of priority 1 keep every CPU
+  busy (#135): `pingpong N s [prio]` (two threads bounce a semaphore),
+  `timer N s interval [prio]`, `fair N s`, `share ...` (work done by
+  threads that sleep in turn next to busy ones), `mode lowlat|powersave`.
 - `cputype.c`: CPUID core type of each CPU (pinned; `get_cpuid()` answers for
   the CPU it runs on).
 - `build.sh`: cross-builds them against a configured build dir.
@@ -157,6 +161,32 @@ by default only on the RK3588).
 Suite, CPU off/on cycles and a 10 minute soak of mixed load (about 1270
 power-downs, none refused) pass; throughput unchanged. Not measured in
 watts: nothing meters the board.
+
+## Wake-ups next to busy threads of priority 1 (#135, 2026-11-17)
+
+With every CPU busy at priority 1, a thread that woke up often (a request
+every 100 us) now and then waited a whole quantum: its effective priority
+had come down to 1. GoesAway() added to the additional penalty at every
+wait (priority 10 went 10, 9, ... 1 over ten wake-ups), and the time it
+ran added up over waits shorter than half a quantum until it made one;
+CancelPenalty() only runs after longer waits. Now only running time counts,
+and a wait makes up for the time run. Separately, reschedule() could leave
+its own CPU's invoke_scheduler set, which kept other CPUs from sending it
+an ICI until its next interrupt.
+
+| | CI kernel (+2743) | fixed |
+|---|---|---|
+| X399 TCP request/response, 32 loops: per s, p99 | 1 720, 4 176 us | 8 471-8 569, 429-533 us |
+| X399 same, power saving | | 8 990, 266 us |
+| X399 wakelat pingpong 32 10: per s, over 1 ms | 2 269, 9.4 % | 246 558, 0.004 % |
+| X399 wakelat timer 32 4 200: p99 | 3 295 us | 6 us |
+| QEMU 8 vCPUs pingpong 8: p90 / over 1 ms | 2 537 us / 10.5 % | 32 us / 0 |
+| QEMU pingpong 24 (more busy threads than CPUs), over 1 ms: penalty fix alone / both | 50 | 0 |
+
+A ping-pong pair that keeps a CPU busy all the time is still penalized
+down to priority 1 on purpose (the X399 instrumented run: every late
+wake-up left was such a thread), so `wakelat pingpong` with more busy
+threads than CPUs still shows some quantum-long waits.
 
 ## Open
 
