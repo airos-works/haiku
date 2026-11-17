@@ -1122,6 +1122,57 @@ fdt_set_watchdog(phys_addr_t base)
 }
 
 
+/*!	Gives the pins of the BCM2837's SD host controller ("sdhost") their
+	function, as its "pinctrl-0" group in the tree says (GPIO 48 to 53,
+	ALT0). The firmware has done so on the boards already; QEMU's raspi3b
+	connects the card to whichever of its two SD controllers the pins select
+	and starts with the other one (the Arasan SDHCI, which on the board
+	serves the Wi-Fi chip on GPIO 34 to 39 instead).
+*/
+static void
+mux_bcm2837_sd_pins()
+{
+	int sdhost = fdt_node_offset_by_compatible(gFDT, -1,
+		"brcm,bcm2835-sdhost");
+	if (sdhost < 0 || !is_enabled(sdhost))
+		return;
+	const uint32* group = (const uint32*)fdt_getprop(gFDT, sdhost, "pinctrl-0",
+		NULL);
+	int groupNode = group != NULL
+		? fdt_node_offset_by_phandle(gFDT, fdt32_to_cpu(*group)) : -1;
+	int controller = groupNode >= 0 ? fdt_parent_offset(gFDT, groupNode) : -1;
+	int pinsLength, functionLength;
+	const uint32* pins = groupNode >= 0 ? (const uint32*)fdt_getprop(gFDT,
+		groupNode, "brcm,pins", &pinsLength) : NULL;
+	const uint32* functions = groupNode >= 0 ? (const uint32*)fdt_getprop(
+		gFDT, groupNode, "brcm,function", &functionLength) : NULL;
+	addr_range gpio;
+	if (pins == NULL || functions == NULL || functionLength < 4
+		|| controller < 0
+		|| fdt_node_check_compatible(gFDT, controller, "brcm,bcm2835-gpio")
+			!= 0
+		|| !fdt_get_reg(controller, 0, gpio)) {
+		return;
+	}
+
+	// GPFSEL0 to GPFSEL5: three bits a pin, ten pins a register. One
+	// function for all pins, or one each.
+	uint32 count = pinsLength / 4;
+	for (uint32 i = 0; i < count; i++) {
+		uint32 pin = fdt32_to_cpu(pins[i]);
+		uint32 function = fdt32_to_cpu(
+			functions[(uint32)functionLength / 4 > i ? i : 0]);
+		if (pin >= 54 || function > 7)
+			continue;
+		volatile uint32* select = (volatile uint32*)(gpio.start
+			+ (pin / 10) * 4);
+		uint32 shift = (pin % 10) * 3;
+		*select = (*select & ~(7u << shift)) | function << shift;
+	}
+	dprintf("BCM2837: SD host pins set (%" B_PRIu32 " pins)\n", count);
+}
+
+
 void
 fdt_set_kernel_args()
 {
@@ -1141,6 +1192,15 @@ fdt_set_kernel_args()
 		&& mailbox_get_clock_rate(MAILBOX_CLOCK_EMMC2, false, rate) == B_OK) {
 		fdt_setprop_u32(copy, node, "clock-frequency", rate);
 		dprintf("EMMC2 clock: %" B_PRIu32 " Hz\n", rate);
+	}
+
+	// The Pi 3's SD host runs from the VideoCore's core clock, which the
+	// firmware sets (250 MHz with enable_uart=1).
+	node = fdt_node_offset_by_compatible(copy, -1, "brcm,bcm2835-sdhost");
+	if (gBCM2837 && node >= 0
+		&& mailbox_get_clock_rate(MAILBOX_CLOCK_CORE, false, rate) == B_OK) {
+		fdt_setprop_u32(copy, node, "clock-frequency", rate);
+		dprintf("SD host clock: %" B_PRIu32 " Hz\n", rate);
 	}
 
 	// The Pi 5's SD controller runs from a fixed clock that the kernel's
@@ -1174,8 +1234,10 @@ fdt_set_kernel_args()
 		dprintf("ARM clock: up to %" B_PRIu32 " Hz\n", rate);
 	}
 
-	if (gBCM2837)
+	if (gBCM2837) {
 		convert_bcm2837_interrupts(copy);
+		mux_bcm2837_sd_pins();
+	}
 
 	if (gBCM2712) {
 		setup_rp1_interrupts(copy);

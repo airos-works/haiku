@@ -12,6 +12,7 @@
 // clock IDs of the property interface
 #define MAILBOX_CLOCK_UART	2
 #define MAILBOX_CLOCK_ARM	3
+#define MAILBOX_CLOCK_CORE	4	// the VideoCore's, the Pi 3's SD host runs from it
 #define MAILBOX_CLOCK_EMMC2	12
 
 struct mailbox_frame_buffer {
