@@ -23,6 +23,7 @@ void	r92eu_attach(struct rtwn_usb_softc *);
 void	r88eu_attach(struct rtwn_usb_softc *);
 void	r88fu_attach(struct rtwn_usb_softc *);
 void	r23bu_attach(struct rtwn_usb_softc *);
+void	r10bu_attach(struct rtwn_usb_softc *);
 void	r12au_attach(struct rtwn_usb_softc *);
 void	r21au_attach(struct rtwn_usb_softc *);
 
@@ -34,6 +35,7 @@ enum {
 	RTWN_CHIP_RTL8723BU,
 	RTWN_CHIP_RTL8812AU,
 	RTWN_CHIP_RTL8821AU,
+	RTWN_CHIP_RTL8710BU,	/* Haiku */
 	RTWN_CHIP_MAX_USB
 };
 
@@ -196,6 +198,19 @@ static const STRUCT_USB_HOST_ID rtwn_devs[] = {
 	RTWN_RTL8821AU_DEV(TPLINK,		T2UPLUS),
 	RTWN_RTL8821AU_DEV(TPLINK,		T2UV3),
 #undef RTWN_RTL8821AU_DEV
+
+	/*
+	 * Haiku: RTL8710BU, sold as the RTL8188GU (not the RTL8188GTV).
+	 * The IDs Linux's rtl8xxxu lists; the dongles show up as a driver
+	 * CD (0bda:1a2b) until usb_modeswitch ejects it.
+	 */
+#define RTWN_RTL8710BU_DEV(v, p) \
+	{ USB_VP(USB_VENDOR_##v, USB_PRODUCT_##v##_##p), \
+	  USB_IF_CSI(UICLASS_VENDOR, UISUBCLASS_VENDOR, \
+	  RTWN_USB_DEVINFO(RTWN_CHIP_RTL8710BU, 0)) }
+	RTWN_RTL8710BU_DEV(REALTEK,		RTL8710BU),
+	RTWN_RTL8710BU_DEV(REALTEK,		RTL8710BU_2),
+#undef RTWN_RTL8710BU_DEV
 };
 
 typedef void	(*chip_usb_attach)(struct rtwn_usb_softc *);
@@ -207,7 +222,8 @@ static const chip_usb_attach rtwn_chip_usb_attach[RTWN_CHIP_MAX_USB] = {
 	[RTWN_CHIP_RTL8188FU] = r88fu_attach,
 	[RTWN_CHIP_RTL8723BU] = r23bu_attach,
 	[RTWN_CHIP_RTL8812AU] = r12au_attach,
-	[RTWN_CHIP_RTL8821AU] = r21au_attach
+	[RTWN_CHIP_RTL8821AU] = r21au_attach,
+	[RTWN_CHIP_RTL8710BU] = r10bu_attach
 };
 
 static __inline void
