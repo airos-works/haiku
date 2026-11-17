@@ -233,6 +233,10 @@ SecurityName(const wireless_network& network)
 		case B_NETWORK_AUTHENTICATION_WPA2:
 			name = "WPA2";
 			break;
+		case B_NETWORK_AUTHENTICATION_WPA3:
+			name = (network.key_mode & (B_KEY_MODE_PSK
+				| B_KEY_MODE_PSK_SHA256)) != 0 ? "WPA2/WPA3" : "WPA3";
+			break;
 		case B_NETWORK_AUTHENTICATION_EAP:
 			return B_TRANSLATE("WPA Enterprise");
 		default:
@@ -1112,7 +1116,9 @@ WiFiController::_UpdateSaved(bool force)
 			authentication = B_NETWORK_AUTHENTICATION_NONE;
 			const char* mode;
 			if (network.FindString("authentication", &mode) == B_OK) {
-				if (strcasecmp(mode, "wpa2") == 0)
+				if (strcasecmp(mode, "wpa3") == 0)
+					authentication = B_NETWORK_AUTHENTICATION_WPA3;
+				else if (strcasecmp(mode, "wpa2") == 0)
 					authentication = B_NETWORK_AUTHENTICATION_WPA2;
 				else if (strcasecmp(mode, "wpa") == 0)
 					authentication = B_NETWORK_AUTHENTICATION_WPA;
@@ -1206,10 +1212,12 @@ WiFiController::_CheckJoin(bool associated, bool link, const BString& name)
 				add.AddString("password", fJoinPassword);
 			add.AddUInt32("flags", fJoinSecured ? B_NETWORK_IS_ENCRYPTED : 0);
 			add.AddUInt32("authentication_mode", fJoinAuthentication);
-			bool wpa = fJoinAuthentication == B_NETWORK_AUTHENTICATION_WPA2
+			bool wpa = fJoinAuthentication == B_NETWORK_AUTHENTICATION_WPA3
+				|| fJoinAuthentication == B_NETWORK_AUTHENTICATION_WPA2
 				|| fJoinAuthentication == B_NETWORK_AUTHENTICATION_WPA;
 			uint32 cipher = fJoinAuthentication
-					== B_NETWORK_AUTHENTICATION_WPA2 ? B_NETWORK_CIPHER_CCMP
+					== B_NETWORK_AUTHENTICATION_WPA2 || fJoinAuthentication
+					== B_NETWORK_AUTHENTICATION_WPA3 ? B_NETWORK_CIPHER_CCMP
 				: fJoinAuthentication == B_NETWORK_AUTHENTICATION_WPA
 					? B_NETWORK_CIPHER_TKIP : B_NETWORK_CIPHER_NONE;
 			add.AddUInt32("cipher", cipher);

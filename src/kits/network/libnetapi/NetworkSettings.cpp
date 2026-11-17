@@ -751,6 +751,9 @@ BNetworkSettings::_ConvertNetworkToSettings(BMessage& message)
 			case B_NETWORK_AUTHENTICATION_WPA2:
 				authenticationString = "wpa2";
 				break;
+			case B_NETWORK_AUTHENTICATION_WPA3:
+				authenticationString = "wpa3";
+				break;
 		}
 
 		if (result == B_OK && authenticationString != NULL)
@@ -818,6 +821,9 @@ BNetworkSettings::_ConvertNetworkFromSettings(BMessage& message)
 		} else if (strcasecmp(authentication, "wpa2") == 0) {
 			message.AddUInt32("authentication_mode",
 				B_NETWORK_AUTHENTICATION_WPA2);
+		} else if (strcasecmp(authentication, "wpa3") == 0) {
+			message.AddUInt32("authentication_mode",
+				B_NETWORK_AUTHENTICATION_WPA3);
 		}
 
 		message.RemoveName("authentication");

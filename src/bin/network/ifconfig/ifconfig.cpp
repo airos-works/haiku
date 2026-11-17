@@ -25,6 +25,7 @@
 #include <NetworkRoster.h>
 
 #include <NetServer.h>
+#include <String.h>
 
 extern "C" {
 #	include <freebsd_network/compat/sys/cdefs.h>
@@ -241,7 +242,7 @@ get_cipher(uint32 cipher)
 
 
 const char*
-get_authentication_mode(uint32 mode, uint32 flags)
+get_authentication_mode(uint32 mode, uint32 flags, uint32 keyMode = 0)
 {
 	switch (mode) {
 		default:
@@ -255,6 +256,12 @@ get_authentication_mode(uint32 mode, uint32 flags)
 			return "WPA";
 		case B_NETWORK_AUTHENTICATION_WPA2:
 			return "WPA2";
+		case B_NETWORK_AUTHENTICATION_WPA3:
+			if ((keyMode & (B_KEY_MODE_PSK | B_KEY_MODE_PSK_SHA256)) != 0)
+				return "WPA2/WPA3";
+			return "WPA3";
+		case B_NETWORK_AUTHENTICATION_EAP:
+			return "EAP";
 	}
 }
 
@@ -266,13 +273,56 @@ show_wireless_network_header(bool verbose)
 }
 
 
+static BString
+get_key_modes(uint32 keyMode)
+{
+	static const struct {
+		uint32		mode;
+		const char*	name;
+	} kModes[] = {
+		{ B_KEY_MODE_IEEE802_1X, "802.1X" },
+		{ B_KEY_MODE_PSK, "PSK" },
+		{ B_KEY_MODE_FT_IEEE802_1X, "FT-802.1X" },
+		{ B_KEY_MODE_FT_PSK, "FT-PSK" },
+		{ B_KEY_MODE_IEEE802_1X_SHA256, "802.1X-SHA256" },
+		{ B_KEY_MODE_PSK_SHA256, "PSK-SHA256" },
+		{ B_KEY_MODE_SAE, "SAE" },
+		{ B_KEY_MODE_FT_SAE, "FT-SAE" },
+		{ B_KEY_MODE_OWE, "OWE" },
+		{ B_KEY_MODE_SAE_EXT_KEY, "SAE-EXT-KEY" },
+	};
+
+	BString modes;
+	for (size_t i = 0; i < sizeof(kModes) / sizeof(kModes[0]); i++) {
+		if ((keyMode & kModes[i].mode) == 0)
+			continue;
+		if (!modes.IsEmpty())
+			modes << ",";
+		modes << kModes[i].name;
+	}
+	return modes.IsEmpty() ? BString("-") : modes;
+}
+
+
 void
 show_wireless_network(const wireless_network& network, bool verbose)
 {
-	printf("%-32s %-20s %6u  %s\n", network.name,
+	printf("%-32s %-20s %6u  %s", network.name,
 		network.address.ToString().String(),
 		network.signal_strength / 2,
-		get_authentication_mode(network.authentication_mode, network.flags));
+		get_authentication_mode(network.authentication_mode, network.flags,
+			network.key_mode));
+	if (verbose && network.authentication_mode
+			>= B_NETWORK_AUTHENTICATION_WPA) {
+		// the key management suites (AKMs) and the protections offered
+		printf("  akm %s%s%s",
+			get_key_modes(network.key_mode).String(),
+			(network.flags & B_NETWORK_MFP_REQUIRED) != 0 ? " mfp-required"
+				: (network.flags & B_NETWORK_MFP_CAPABLE) != 0
+					? " mfp-capable" : "",
+			(network.flags & B_NETWORK_SAE_H2E) != 0 ? " sae-h2e" : "");
+	}
+	printf("\n");
 }
 
 

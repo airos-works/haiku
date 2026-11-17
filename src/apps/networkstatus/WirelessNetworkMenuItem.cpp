@@ -63,6 +63,9 @@ WirelessNetworkMenuItem::AuthenticationName(int32 mode)
 		case B_NETWORK_AUTHENTICATION_WPA2:
 			return B_TRANSLATE_CONTEXT("WPA2", "WPA2 protected network");
 			break;
+		case B_NETWORK_AUTHENTICATION_WPA3:
+			return B_TRANSLATE_CONTEXT("WPA3", "WPA3 protected network");
+			break;
 		case B_NETWORK_AUTHENTICATION_EAP:
 			return B_TRANSLATE_CONTEXT("EAP", "EAP protected network");
 			break;

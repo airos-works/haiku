@@ -1148,7 +1148,11 @@ NetServer::_JoinNetwork(const BMessage& message, const BNetworkAddress* address,
 		|| (found && networkMessage.FindString("authentication", &string)
 				== B_OK && !string.IsEmpty())) {
 		askForConfig = false;
-		if (string.ICompare("wpa2") == 0) {
+		if (string.ICompare("wpa3") == 0) {
+			network.authentication_mode = B_NETWORK_AUTHENTICATION_WPA3;
+			network.key_mode = B_KEY_MODE_SAE;
+			network.cipher = network.group_cipher = B_NETWORK_CIPHER_CCMP;
+		} else if (string.ICompare("wpa2") == 0) {
 			network.authentication_mode = B_NETWORK_AUTHENTICATION_WPA2;
 			network.key_mode = B_KEY_MODE_IEEE802_1X;
 			network.cipher = network.group_cipher = B_NETWORK_CIPHER_CCMP;
@@ -1164,6 +1168,28 @@ NetServer::_JoinNetwork(const BMessage& message, const BNetworkAddress* address,
 			fprintf(stderr, "%s: invalid authentication mode.\n", name);
 			askForConfig = true;
 		}
+	}
+
+	// WPA3 (SAE) needs the password itself, not the PSK the supplicant
+	// derives from it. Stacks that authenticate in the kernel take it here,
+	// before the supplicant's join; the others refuse the request.
+	if (password != NULL && (askForConfig || network.authentication_mode
+			>= B_NETWORK_AUTHENTICATION_WPA)) {
+		struct ieee80211_haiku_sae_password sae;
+		memset(&sae, 0, sizeof(sae));
+		size_t nameLength = strnlen(network.name, sizeof(sae.i_ssid));
+		size_t passwordLength = strlen(password);
+		if (passwordLength <= sizeof(sae.i_password)) {
+			memcpy(sae.i_ssid, network.name, nameLength);
+			sae.i_ssid_len = nameLength;
+			memcpy(sae.i_password, password, passwordLength);
+			sae.i_password_len = passwordLength;
+			set_80211(deviceName, IEEE80211_IOC_HAIKU_SAE_PASSWORD, &sae,
+				sizeof(sae));
+		}
+		volatile uint8* wipe = (volatile uint8*)&sae;
+		for (size_t i = 0; i < sizeof(sae); i++)
+			wipe[i] = 0;
 	}
 
 	// We always try to join via the wpa_supplicant. Even if we could join

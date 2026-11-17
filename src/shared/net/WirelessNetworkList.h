@@ -180,6 +180,8 @@ WirelessAuthenticationKeyword(uint32 mode)
 			return "wpa";
 		case B_NETWORK_AUTHENTICATION_WPA2:
 			return "wpa2";
+		case B_NETWORK_AUTHENTICATION_WPA3:
+			return "wpa3";
 		default:
 			return NULL;
 	}
@@ -196,6 +198,8 @@ WirelessAuthenticationLabel(uint32 mode, bool secured)
 			return "WPA";
 		case B_NETWORK_AUTHENTICATION_WPA2:
 			return "WPA2";
+		case B_NETWORK_AUTHENTICATION_WPA3:
+			return "WPA3";
 		case B_NETWORK_AUTHENTICATION_EAP:
 			return "EAP";
 		default:

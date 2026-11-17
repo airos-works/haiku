@@ -35,6 +35,8 @@ get_authentication_mode(uint32 mode)
 			return "WPA";
 		case B_NETWORK_AUTHENTICATION_WPA2:
 			return "WPA2";
+		case B_NETWORK_AUTHENTICATION_WPA3:
+			return "WPA3";
 	}
 }
 

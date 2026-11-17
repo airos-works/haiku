@@ -52,7 +52,8 @@ JoinOtherWindow::JoinOtherWindow(BWindow* parent,
 		{ B_TRANSLATE("None"), B_NETWORK_AUTHENTICATION_NONE },
 		{ B_TRANSLATE("WEP"), B_NETWORK_AUTHENTICATION_WEP },
 		{ B_TRANSLATE("WPA Personal"), B_NETWORK_AUTHENTICATION_WPA },
-		{ B_TRANSLATE("WPA2 Personal"), B_NETWORK_AUTHENTICATION_WPA2 }
+		{ B_TRANSLATE("WPA2 Personal"), B_NETWORK_AUTHENTICATION_WPA2 },
+		{ B_TRANSLATE("WPA3 Personal"), B_NETWORK_AUTHENTICATION_WPA3 }
 	};
 	for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
 		BMessage* message = new BMessage(kMsgChanged);

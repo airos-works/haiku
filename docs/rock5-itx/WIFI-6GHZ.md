@@ -7,7 +7,7 @@ parts that can be verified on 2.4 and 5 GHz are worth landing ahead of one.
 
 ## The two questions the issue asks
 
-**Can the join path do SAE? No.** `ifconfig join`, the Wi-Fi preferences and
+**Can the join path do SAE? It could not on 11-11; it can now, see "WPA3-SAE" below.** `ifconfig join`, the Wi-Fi preferences and
 `wifiautojoin` end in `IEEE80211_IOC_HAIKU_JOIN`
 (`openbsd_wlan/net80211/ieee80211_haiku.cpp`), which hands net80211 a
 pre-shared key and the AKMs 802.1X, PSK and their SHA-256 variants. net80211
@@ -41,6 +41,53 @@ apply on every machine, PCs included, and those defaults forbid 6 GHz here.
 Regulatory set-up is therefore a prerequisite too, not a later refinement. On
 FDT boards (ROCK 5) there is no ACPI to ask; a driver setting would have to
 stand in for it.
+
+## WPA3-SAE (2026-11-18)
+
+The SAE prerequisite is implemented in the kernel, for the drivers built on
+`openbsd_wlan` (iaxwifi200, idualwifi7260: the ones with management frame
+protection). Design and state:
+
+- **Where.** In net80211, next to its own four-way handshake, because that is
+  how these drivers join: wpa_supplicant only derives the PSK and hands it over
+  with `IEEE80211_IOC_HAIKU_JOIN`. SAE needs the password itself, so a new
+  `IEEE80211_IOC_HAIKU_SAE_PASSWORD` takes it for one SSID before the join.
+  net_server sends it whenever a join request carries a password; the
+  supplicant change on airos-works/wpa_supplicant branch `wpa3-sae-63` also
+  sends it for passwords it reads from the keystore (saved networks). Drivers
+  on the FreeBSD stack (mt7922wifi and the rest) refuse the request: their
+  supplicant does the handshake and would need its own SAE (OpenSSL build,
+  SME frames in `driver_bsd`).
+- **Exchange.** `net80211/ieee80211_sae.c` is the cryptography: its own P-256
+  arithmetic (Montgomery form, fixed-length ladder), hunting-and-pecking with
+  40 rounds minimum, hash-to-element (SSWU, Z = -10), commit and confirm, KCK,
+  PMK, PMKID, anti-clogging tokens, rejected groups as the H2E salt.
+  `ieee80211_sae_sta.c` sends and receives the Authentication frames
+  (algorithm 3) and keeps the PMK for the four-way handshake.
+- **Policy.** When the AP offers AKM 8 with MFP capability and BIP, and the
+  password is set for its SSID, net80211 prefers SAE over PSK (transition
+  mode chooses SAE), sets MFPR in its RSN element and uses MFP. Hash-to-element
+  is used whenever the AP's RSN Extension element asks for it (always on
+  6 GHz), and then our association request carries the RSNXE too. Message 3's
+  RSNXE must match the beacon's. EAPOL-Key frames use descriptor version 0
+  (AES-CMAC MIC, AES key wrap, SHA-256 KDF).
+- **Reporting.** `ifconfig <dev> list -v` prints the AKMs, MFP and H2E of each
+  scan result (`akm PSK,SAE mfp-capable sae-h2e`); the auth column says WPA3
+  or WPA2/WPA3; the Wi-Fi preferences and Deskbar menu say WPA3. A new
+  `B_NETWORK_AUTHENTICATION_WPA3`, key modes `B_KEY_MODE_SAE` (and FT-SAE,
+  OWE, SAE-EXT-KEY for display) and flags `B_NETWORK_MFP_*`,
+  `B_NETWORK_SAE_H2E`.
+- **Verified offline.** `src/tests/add-ons/kernel/network/wlan_sae/run.sh`:
+  IEEE 802.11-2020 Annex J.10 (commit message, KCK, PMK, PMKID; H2E PT and
+  PWE), RFC 9380 J.1.1 SSWU vectors, RFC 6979 scalar multiplication, and
+  exchanges between two instances (H&P, H2E, anti-clogging, wrong password,
+  reflection). An interop harness against hostap's `sae.c` with OpenSSL
+  (scratch, not in the tree) agreed on PMK, PMKID and both confirms in 32
+  H&P and H2E exchanges.
+- **Not done.** AKM 24 (SAE-EXT-KEY: other MIC and key lengths), FT-SAE,
+  password identifiers, SAE-PK, PMKSA caching (every join runs SAE), OWE,
+  passwords shorter than 8 characters through the stock supplicant (its PSK
+  step refuses them). No live test yet: the lab's Gaspers APs offer PSK only.
 
 ## Channel model
 

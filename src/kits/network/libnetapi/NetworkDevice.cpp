@@ -192,6 +192,15 @@ from_rsn_key_mode(uint32 mode)
 			return B_KEY_MODE_IEEE802_1X_SHA256;
 		case 6:
 			return B_KEY_MODE_PSK_SHA256;
+		case 8:
+			return B_KEY_MODE_SAE;
+		case 9:
+			return B_KEY_MODE_FT_SAE;
+		case 18:
+			return B_KEY_MODE_OWE;
+		case 24:
+		case 25:
+			return B_KEY_MODE_SAE_EXT_KEY;
 	}
 }
 
@@ -256,6 +265,15 @@ parse_ie_rsn(wireless_network& network, ie_data* ie)
 		return;
 
 	parse_ie_rsn_wpa(network, data, length);
+
+	// RSN capabilities: management frame protection
+	if (length >= 2) {
+		uint16 capabilities = read_le16(data, length);
+		if ((capabilities & 0x0080) != 0)
+			network.flags |= B_NETWORK_MFP_CAPABLE;
+		if ((capabilities & 0x0040) != 0)
+			network.flags |= B_NETWORK_MFP_REQUIRED;
+	}
 }
 
 
@@ -311,6 +329,11 @@ parse_ie(wireless_network& network, uint8* _ie, int32 ieLength)
 				if (!hadRSN && parse_ie_wpa(network, ie))
 					hadWPA = true;
 				break;
+			case 244:
+				// RSN Extension element: SAE hash-to-element
+				if (ie->length >= 1 && (ie->data[0] & 0x20) != 0)
+					network.flags |= B_NETWORK_SAE_H2E;
+				break;
 		}
 
 		ieLength -= 2 + ie->length;
@@ -320,7 +343,11 @@ parse_ie(wireless_network& network, uint8* _ie, int32 ieLength)
 	if (hadRSN || hadWPA) {
 		// Determine authentication mode
 
-		if ((network.key_mode & (B_KEY_MODE_IEEE802_1X_SHA256
+		if (hadRSN && (network.key_mode & (B_KEY_MODE_SAE | B_KEY_MODE_FT_SAE
+				| B_KEY_MODE_SAE_EXT_KEY)) != 0) {
+			// WPA3-Personal, alone or next to WPA2 (transition mode)
+			network.authentication_mode = B_NETWORK_AUTHENTICATION_WPA3;
+		} else if ((network.key_mode & (B_KEY_MODE_IEEE802_1X_SHA256
 				| B_KEY_MODE_PSK_SHA256)) != 0) {
 			network.authentication_mode = B_NETWORK_AUTHENTICATION_WPA2;
 		} else if ((network.key_mode & (B_KEY_MODE_IEEE802_1X
