@@ -4,9 +4,11 @@ UsePrivateKernelHeaders ;
 UsePrivateHeaders drivers ;
 UseHeaders [ FDirName $(SUBDIR) $(DOTDOT) ] : true ;
 
-# The SDIO host is plain Haiku kernel code; it is built apart from the
-# driver, whose compatibility headers stand in for the system's.
+# The chip's SDIO card (the MMC bus' function, or the Raspberry Pi 4's port
+# with the driver's own host) is plain Haiku kernel code; it is built apart
+# from the driver, whose compatibility headers stand in for the system's.
 KernelStaticLibrary broadcomfmac_sdio_host.a :
+	bwfm_host.cpp
 	sdio_host.cpp
 	;
 

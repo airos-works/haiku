@@ -7,7 +7,7 @@
 #include <sys/bus.h>
 #include <sys/haiku-module.h>
 
-#include "sdio_host.h"
+#include "bwfm_host.h"
 
 
 HAIKU_FBSD_WLAN_DRIVERS_GLUE(broadcomfmac)
@@ -23,9 +23,10 @@ extern driver_t* DRIVER_MODULE_NAME(bwfm, sdio);
 void
 __haiku_init_hardware()
 {
-	// The chip is not on a bus that can be enumerated: it is the card of
-	// the Raspberry Pi 4's SDIO controller. The attach routine talks to it.
-	if (rpi_sdio_present())
+	// The chip is not on a bus of the compatibility layer: it is an SDIO
+	// card, of the MMC bus (the Raspberry Pi 5's port) or of the Raspberry
+	// Pi 4's port. The attach routine talks to it.
+	if (bwfm_host_present())
 		_fbsd_init_hardware_fixed(DRIVER_MODULE_NAME(bwfm, sdio));
 }
 

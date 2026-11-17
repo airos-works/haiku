@@ -20,7 +20,16 @@
 
 	The BCM2712's (Raspberry Pi 5) SD card slot is the same kind of block
 	("brcm,bcm2712-sdhci", Linux: sdhci-brcmstb.c) and runs the same way; the
-	loader puts its fixed 200 MHz base clock into the device tree. */
+	loader puts its fixed 200 MHz base clock into the device tree.
+
+	So is the Pi 5's other one, the SDIO port of its Wi-Fi chip (the device
+	tree calls it "non-removable"). For it the driver also does what the
+	firmware does not: the pins (GPIO 30 to 35), the chip's power line WL_ON
+	(GPIO 28 of the "gio" block) and the controller's configuration
+	registers (card present, SD pin timing). CMD53 data goes through the
+	data register, a word at a time, and the card interrupt is let through
+	for the MMC bus' SDIO functions. This is what broadcomfmac's own SDIO
+	host did on the Pi 5, which then gave way to the MMC bus. */
 
 
 #include <algorithm>
@@ -39,6 +48,9 @@
 
 #include "IOSchedulerSimple.h"
 #include "mmc.h"
+#include "sdio.h"
+
+#include <drivers/bcm2712_pins.h>
 
 
 //#define TRACE_EMMC2
@@ -119,6 +131,7 @@
 #define INT_COMMAND_COMPLETE	(1 << 0)
 #define INT_TRANSFER_COMPLETE	(1 << 1)
 #define INT_DMA					(1 << 3)
+#define INT_CARD				(1 << 8)	// SDIO, follows the card's line
 #define INT_ERROR				(1 << 15)
 #define INT_COMMAND_TIMEOUT		(1 << 16)
 #define INT_DATA_TIMEOUT		(1 << 20)
@@ -131,6 +144,15 @@
 
 // what the firmware clocks the controller with, unless the device tree says
 #define DEFAULT_BASE_CLOCK		100000000
+
+// the BCM2712's SDHCI configuration registers, the device tree's second
+// register range (Linux: sdhci-brcmstb.c)
+#define CFG_CTRL				0x00
+#define  CFG_CTRL_SDCD_N_TEST_EN	(1u << 31)	// force the card's presence
+#define  CFG_CTRL_SDCD_N_TEST_LEV	(1u << 30)
+#define CFG_SD_PIN_SEL			0x44
+#define  CFG_SD_PIN_SEL_MASK	0x3
+#define  CFG_SD_PIN_SEL_SD		(1u << 1)
 
 static const size_t kDmaBufferSize = 512 * 1024;
 static const uint32 kBlockSize = 512;
@@ -146,6 +168,10 @@ struct emmc2_device {
 	uint32			interrupt;
 	uint32			baseClock;		// Hz
 	uint32			busWidth;
+	// the Pi 5's Wi-Fi SDIO port: its configuration registers
+	bool			sdio;
+	uint64			config;
+	uint64			configSize;
 	// from the parent's dma-ranges
 	uint64			dmaHighAddress;	// CPU addresses below this are reachable
 	int64			dmaBusOffset;	// bus address = CPU address + this
@@ -170,6 +196,13 @@ public:
 									{ fCardType = type; }
 			void				Terminate();
 
+			status_t			SdioTransfer(uint32 argument, bool write,
+									void* buffer, uint16 blockSize,
+									uint16 blockCount, uint32* response);
+			void				SetSdioInterruptHandler(
+									void (*handler)(void*), void* data);
+			void				EnableSdioInterrupt(bool enable);
+
 			int32				HandleInterrupt();
 
 private:
@@ -190,6 +223,8 @@ private:
 			status_t			_SendCommand(uint8 command, uint32 argument,
 									uint32 flags, uint32* response);
 			status_t			_Wait(uint32 mask, bigtime_t timeout);
+			status_t			_SetUpSdioPort();
+			void				_SetWifiPower(bool on);
 
 private:
 			emmc2_device		fDevice;
@@ -205,6 +240,17 @@ private:
 			area_id				fBufferArea;
 			void*				fBuffer;
 			phys_addr_t			fBufferAddress;
+			// the SDIO port
+			area_id				fConfigArea;
+			volatile uint8*		fConfig;
+			area_id				fGioArea;
+			volatile uint8*		fGio;
+			spinlock			fInterruptLock;
+			uint32				fInterruptMask;
+				// the events latched and signalled: INT_WANTED, and
+				// INT_CARD while the card interrupt is wanted
+			void				(*fSdioHandler)(void*);
+			void*				fSdioHandlerData;
 };
 
 
@@ -228,9 +274,17 @@ Emmc2Bus::Emmc2Bus(const emmc2_device& device)
 	fUseDMA(true),
 	fBufferArea(-1),
 	fBuffer(NULL),
-	fBufferAddress(0)
+	fBufferAddress(0),
+	fConfigArea(-1),
+	fConfig(NULL),
+	fGioArea(-1),
+	fGio(NULL),
+	fInterruptMask(INT_WANTED),
+	fSdioHandler(NULL),
+	fSdioHandlerData(NULL)
 {
 	fEventCondition.Init(this, "emmc2 events");
+	B_INITIALIZE_SPINLOCK(&fInterruptLock);
 
 	fRegisterArea = map_physical_memory("emmc2 registers", fDevice.registers,
 		fDevice.registersSize, B_ANY_KERNEL_ADDRESS,
@@ -248,6 +302,12 @@ Emmc2Bus::Emmc2Bus(const emmc2_device& device)
 	if (fStatus != B_OK)
 		return;
 
+	if (fDevice.sdio) {
+		fStatus = _SetUpSdioPort();
+		if (fStatus != B_OK)
+			return;
+	}
+
 	fStatus = _Reset(CONTROL1_RESET_ALL);
 	if (fStatus != B_OK) {
 		ERROR("the controller does not come out of reset\n");
@@ -256,7 +316,7 @@ Emmc2Bus::Emmc2Bus(const emmc2_device& device)
 
 	_Write(REG_INTERRUPT_ENABLE, 0);
 	_Write(REG_INTERRUPT_MASK, INT_WANTED);
-	_Write(REG_INTERRUPT, 0xffffffff);
+	_Write(REG_INTERRUPT, 0xffffffff & ~INT_CARD);
 
 	fStatus = install_io_interrupt_handler(fDevice.interrupt, emmc2_interrupt,
 		this, 0);
@@ -295,10 +355,87 @@ Emmc2Bus::~Emmc2Bus()
 	if (fInterruptInstalled) {
 		remove_io_interrupt_handler(fDevice.interrupt, emmc2_interrupt, this);
 	}
+	if (fGio != NULL)
+		_SetWifiPower(false);
+	if (fGioArea >= 0)
+		delete_area(fGioArea);
+	if (fConfigArea >= 0)
+		delete_area(fConfigArea);
 	if (fBufferArea >= 0)
 		delete_area(fBufferArea);
 	if (fRegisterArea >= 0)
 		delete_area(fRegisterArea);
+}
+
+
+void
+Emmc2Bus::_SetWifiPower(bool on)
+{
+	bcm2712_gpio_output(fGio, BCM2712_GPIO_WL_ON, on);
+	memory_full_barrier();
+}
+
+
+/*!	The Pi 5's Wi-Fi port, before the controller is reset: the card is always
+	there and has SD pin timing (configuration registers), its pins are the
+	controller's with pull-ups but on the clock, and the chip is powered up
+	afresh (WL_ON low, then high and 200 ms for the chip; Linux's wl_on_reg
+	waits 150 ms).
+*/
+status_t
+Emmc2Bus::_SetUpSdioPort()
+{
+	uint64 pinctrlBase;
+	bool d0;
+	if (fDevice.config == 0 || !bcm2712_find_pinctrl(&pinctrlBase, &d0)) {
+		ERROR("SDIO port: no configuration registers or pin multiplexer\n");
+		return B_DEVICE_NOT_FOUND;
+	}
+
+	fConfigArea = map_physical_memory("emmc2 sdio config",
+		fDevice.config & ~(phys_addr_t)(B_PAGE_SIZE - 1), B_PAGE_SIZE,
+		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
+		(void**)&fConfig);
+	fGioArea = map_physical_memory("emmc2 sdio gio",
+		BCM2712_GIO_BASE & ~(phys_addr_t)(B_PAGE_SIZE - 1), B_PAGE_SIZE,
+		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
+		(void**)&fGio);
+	volatile uint8* pinctrl;
+	area_id pinctrlArea = map_physical_memory("emmc2 sdio pinctrl",
+		pinctrlBase & ~(phys_addr_t)(B_PAGE_SIZE - 1), B_PAGE_SIZE,
+		B_ANY_KERNEL_ADDRESS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
+		(void**)&pinctrl);
+	if (fConfigArea < 0 || fGioArea < 0 || pinctrlArea < 0) {
+		if (pinctrlArea >= 0)
+			delete_area(pinctrlArea);
+		fConfig = NULL;
+		fGio = NULL;
+		return B_NO_MEMORY;
+	}
+	fConfig += fDevice.config & (B_PAGE_SIZE - 1);
+	fGio += BCM2712_GIO_BASE & (B_PAGE_SIZE - 1);
+	pinctrl += pinctrlBase & (B_PAGE_SIZE - 1);
+
+	volatile uint32* control = (volatile uint32*)(fConfig + CFG_CTRL);
+	*control = (*control & ~CFG_CTRL_SDCD_N_TEST_LEV) | CFG_CTRL_SDCD_N_TEST_EN;
+	volatile uint32* pins = (volatile uint32*)(fConfig + CFG_SD_PIN_SEL);
+	*pins = (*pins & ~CFG_SD_PIN_SEL_MASK) | CFG_SD_PIN_SEL_SD;
+
+	for (uint32 pin = 30; pin <= 35; pin++) {
+		bcm2712_set_pin(pinctrl, d0, pin, BCM2712_FUNCTION_SD2,
+			pin == 30 ? BCM2712_PULL_NONE : BCM2712_PULL_UP);
+	}
+	asm volatile("dsb sy; isb" ::: "memory");
+	delete_area(pinctrlArea);
+
+	_SetWifiPower(false);
+	snooze(20000);
+	_SetWifiPower(true);
+	snooze(200000);
+
+	INFO("SDIO port: configuration %#" B_PRIx64 ", pins 30-35 (%s), WL_ON on\n",
+		fDevice.config, d0 ? "D0" : "C0");
+	return B_OK;
 }
 
 
@@ -594,6 +731,16 @@ Emmc2Bus::ExecuteCommand(uint8 command, uint32 argument, uint32* response)
 			flags = CMD_R3;
 			break;
 
+		case SD_IO_SEND_OP_COND:
+			// R4, without CRC and index as R3
+			flags = CMD_R3;
+			break;
+
+		case SD_IO_RW_DIRECT:
+			// R5, checked as R1
+			flags = CMD_R1;
+			break;
+
 		case SD_SEND_RELATIVE_ADDR:
 			flags = is_mmc_card(fCardType) ? CMD_R1 : CMD_R6;
 			break;
@@ -847,6 +994,108 @@ Emmc2Bus::_SwitchToHighSpeed()
 }
 
 
+/*!	SDIO CMD53 with its data phase through the data register, as
+	broadcomfmac's own host did on this controller: the block size and count
+	in one write, the transfer mode with the command.
+*/
+status_t
+Emmc2Bus::SdioTransfer(uint32 argument, bool write, void* _buffer,
+	uint16 blockSize, uint16 blockCount, uint32* response)
+{
+	if (fStatus != B_OK)
+		return fStatus;
+	if (_buffer == NULL || response == NULL || blockSize == 0
+		|| blockSize > 2048 || (blockCount == 0 && blockSize > 512))
+		return B_BAD_VALUE;
+
+	uint32 blocks = blockCount == 0 ? 1 : blockCount;
+	_Write(REG_CONTROL0, _Read(REG_CONTROL0) & ~CONTROL0_DMA_MASK);
+	_Write(REG_BLOCK, blockSize | BLOCK_SDMA_BOUNDARY_512K | blocks << 16);
+
+	uint32 flags = CMD_R1 | CMD_DATA | (write ? 0 : TM_READ)
+		| (blocks > 1 ? TM_MULTI_BLOCK | TM_BLOCK_COUNT : 0);
+	status_t status = _SendCommand(SD_IO_RW_EXTENDED, argument, flags,
+		response);
+	if (status != B_OK)
+		return status;
+	if ((*response & SDIO_R5_ERROR_MASK) != 0) {
+		_Recover();
+		return B_IO_ERROR;
+	}
+
+	uint8* buffer = (uint8*)_buffer;
+	uint32 ready = write ? STATE_WRITE_READY : STATE_READ_READY;
+	for (uint32 block = 0; block < blocks; block++) {
+		bigtime_t timeout = system_time() + 1000000;
+		uint32 spins = 0;
+		while ((_Read(REG_PRESENT_STATE) & ready) == 0) {
+			if ((atomic_get(&fEvents) & (INT_ERROR | INT_ERROR_MASK)) != 0) {
+				_Recover();
+				return B_IO_ERROR;
+			}
+			if (system_time() > timeout) {
+				ERROR("SDIO %s: the buffer does not get ready (block %"
+					B_PRIu32 " of %" B_PRIu32 ")\n", write ? "write" : "read",
+					block, blocks);
+				_Recover();
+				return B_TIMED_OUT;
+			}
+			if (++spins > 2000)
+				snooze(20);
+		}
+		for (uint32 i = 0; i < blockSize; i += 4) {
+			uint32 word = 0;
+			uint32 bytes = blockSize - i < 4 ? blockSize - i : 4;
+			if (write) {
+				memcpy(&word, buffer + i, bytes);
+				*(volatile uint32*)(fRegisters + REG_DATA) = word;
+			} else {
+				word = *(volatile uint32*)(fRegisters + REG_DATA);
+				memcpy(buffer + i, &word, bytes);
+			}
+		}
+		buffer += blockSize;
+	}
+	memory_full_barrier();
+
+	status = _Wait(INT_TRANSFER_COMPLETE, 1000000);
+	if (status != B_OK) {
+		ERROR("SDIO %s of %" B_PRIu32 " x %u bytes did not complete: %s\n",
+			write ? "write" : "read", blocks, blockSize, strerror(status));
+		_Recover();
+	}
+	return status;
+}
+
+
+void
+Emmc2Bus::SetSdioInterruptHandler(void (*handler)(void*), void* data)
+{
+	cpu_status state = disable_interrupts();
+	acquire_spinlock(&fInterruptLock);
+	fSdioHandler = handler;
+	fSdioHandlerData = data;
+	release_spinlock(&fInterruptLock);
+	restore_interrupts(state);
+}
+
+
+/*!	The card interrupt on or off. The status bit follows the card's line and
+	is only cleared by taking it out of the latched events: both registers.
+*/
+void
+Emmc2Bus::EnableSdioInterrupt(bool enable)
+{
+	cpu_status state = disable_interrupts();
+	acquire_spinlock(&fInterruptLock);
+	fInterruptMask = enable ? (INT_WANTED | INT_CARD) : INT_WANTED;
+	_Write(REG_INTERRUPT_MASK, fInterruptMask);
+	_Write(REG_INTERRUPT_ENABLE, fInterruptMask);
+	release_spinlock(&fInterruptLock);
+	restore_interrupts(state);
+}
+
+
 void
 Emmc2Bus::SetScanSemaphore(sem_id semaphore)
 {
@@ -883,6 +1132,27 @@ Emmc2Bus::HandleInterrupt()
 	uint32 events = _Read(REG_INTERRUPT);
 	if (events == 0 || events == 0xffffffff)
 		return B_UNHANDLED_INTERRUPT;
+
+	if ((events & INT_CARD) != 0) {
+		// The card wants its functions served. Its line stays low until
+		// then, and the controller holds on to the bit until it is masked:
+		// off until the MMC bus has them served and turns it on again.
+		acquire_spinlock(&fInterruptLock);
+		bool wanted = (fInterruptMask & INT_CARD) != 0;
+		if (wanted) {
+			fInterruptMask = INT_WANTED;
+			_Write(REG_INTERRUPT_ENABLE, fInterruptMask);
+			_Write(REG_INTERRUPT_MASK, fInterruptMask);
+		}
+		void (*handler)(void*) = fSdioHandler;
+		void* handlerData = fSdioHandlerData;
+		release_spinlock(&fInterruptLock);
+		if (wanted && handler != NULL)
+			handler(handlerData);
+		events &= ~INT_CARD;
+		if (events == 0)
+			return B_INVOKE_SCHEDULER;
+	}
 
 	// acknowledge
 	*(volatile uint32*)(fRegisters + REG_INTERRUPT) = events;
@@ -984,18 +1254,10 @@ emmc2_supports_device(device_node* parent)
 	if (strcmp(compatible, "brcm,bcm2711-emmc2") == 0)
 		return 1.0f;
 
-	// The Pi 5's (BCM2712) SD card slot. Its other controller of the kind
-	// is "non-removable": the Wi-Fi chip's SDIO.
-	if (strcmp(compatible, "brcm,bcm2712-sdhci") == 0) {
-		fdt_device_module_info* fdt;
-		fdt_device* fdtDevice;
-		if (gDeviceManager->get_driver(parent, (driver_module_info**)&fdt,
-				(void**)&fdtDevice) != B_OK
-			|| fdt->get_prop(fdtDevice, "non-removable", NULL) != NULL) {
-			return 0.0f;
-		}
+	// The Pi 5's (BCM2712) SD card slot, and its other controller of the
+	// kind, "non-removable": the Wi-Fi chip's SDIO.
+	if (strcmp(compatible, "brcm,bcm2712-sdhci") == 0)
 		return 1.0f;
-	}
 
 	return 0.0f;
 }
@@ -1055,6 +1317,19 @@ emmc2_init_driver(device_node* node, void** _cookie)
 	device->busWidth = property != NULL && length == 4
 		? B_BENDIAN_TO_HOST_INT32(*property) : 4;
 
+	// the Pi 5's Wi-Fi port: "non-removable", with configuration registers
+	device->sdio = false;
+	device->config = device->configSize = 0;
+	const char* compatible;
+	if (gDeviceManager->get_attr_string(parent, "fdt/compatible", &compatible,
+			false) == B_OK
+		&& strcmp(compatible, "brcm,bcm2712-sdhci") == 0
+		&& fdt->get_prop(fdtDevice, "non-removable", NULL) != NULL) {
+		device->sdio = true;
+		if (!fdt->get_reg(fdtDevice, 1, &device->config, &device->configSize))
+			device->config = 0;
+	}
+
 	// The bus' dma-ranges say which memory the controller reaches, and at
 	// which bus address: <bus address, CPU address, size>. Without them,
 	// stay in the first gigabyte, which every board revision can reach.
@@ -1096,11 +1371,14 @@ emmc2_register_child_devices(void* cookie)
 	emmc2_device* device = (emmc2_device*)cookie;
 
 	device_attr attrs[] = {
-		{B_DEVICE_PRETTY_NAME, B_STRING_TYPE, {.string = "SD card slot"}},
+		{B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
+			{.string = device->sdio ? "Wi-Fi SDIO port" : "SD card slot"}},
 		{B_DEVICE_BUS, B_STRING_TYPE, {.string = "mmc"}},
 		{B_DEVICE_FIXED_CHILD, B_STRING_TYPE, {.string = MMC_BUS_MODULE_NAME}},
 		{kMmcReadOnlyAttribute, B_UINT8_TYPE, {.ui8 = 0}},
-		{kMmcNonRemovableAttribute, B_UINT8_TYPE, {.ui8 = 0}},
+		{kMmcNonRemovableAttribute, B_UINT8_TYPE, {.ui8 = device->sdio}},
+		// the card's high speed mode, as broadcomfmac's host had it
+		{kMmcSdioHighSpeedAttribute, B_UINT8_TYPE, {.ui8 = device->sdio}},
 		{kMmcMaxBusWidthAttribute, B_UINT8_TYPE,
 			{.ui8 = (uint8)device->busWidth}},
 		{kMmcEnableCacheAttribute, B_UINT8_TYPE, {.ui8 = 0}},
@@ -1215,6 +1493,30 @@ emmc2_read_extended_csd(void* cookie, uint8_t data[512])
 }
 
 
+static status_t
+emmc2_sdio_transfer(void* cookie, uint32_t argument, bool write, void* buffer,
+	uint16_t blockSize, uint16_t blockCount, uint32_t* response)
+{
+	return ((Emmc2Bus*)cookie)->SdioTransfer(argument, write, buffer,
+		blockSize, blockCount, response);
+}
+
+
+static void
+emmc2_set_sdio_interrupt_handler(void* cookie, void (*handler)(void*),
+	void* data)
+{
+	((Emmc2Bus*)cookie)->SetSdioInterruptHandler(handler, data);
+}
+
+
+static void
+emmc2_enable_sdio_interrupt(void* cookie, bool enable)
+{
+	((Emmc2Bus*)cookie)->EnableSdioInterrupt(enable);
+}
+
+
 static driver_module_info sEmmc2Driver = {
 	{
 		EMMC2_DRIVER_MODULE_NAME,
@@ -1245,7 +1547,11 @@ static mmc_bus_interface sEmmc2Bus = {
 	.set_bus_width = emmc2_set_bus_width,
 	.terminate_bus = emmc2_terminate_bus,
 	.set_card_type = emmc2_set_card_type,
-	.read_extended_csd = emmc2_read_extended_csd
+	.read_extended_csd = emmc2_read_extended_csd,
+	.switch_sd_function = NULL,
+	.sdio_transfer = emmc2_sdio_transfer,
+	.set_sdio_interrupt_handler = emmc2_set_sdio_interrupt_handler,
+	.enable_sdio_interrupt = emmc2_enable_sdio_interrupt
 };
 
 module_dependency module_dependencies[] = {
