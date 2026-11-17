@@ -120,38 +120,78 @@ close.
 Not run yet: the laptop's reboots can hang in shutdown (#136), so this runs
 with the owner around. Adapter: 0bda:8156, configurations vendor (index 0),
 NCM (1), ECM (2); laptop on the 2.5 Gbit/s port, RTL8156 at 192.168.1.41
-(Wi-Fi .31 and the dock's RTL8153 .195 share the subnet: bind to .41).
+(Wi-Fi .31 and the dock's RTL8153 .195 share the subnet, so every iperf3
+binds to .41). Peer: the Linux build server, 192.168.1.200.
 
-1. **Baseline (usb_ecm, laptop build 2561, 17 Nov):** `iperf3 -c
-   192.168.1.200 -B 192.168.1.41`: up 664 Mbit/s (1 MB buffer 703, 4 streams
-   711), TCP down 522-524, UDP down offered at 2 Gbit/s: 1.0 Gbit/s delivered
-   (about 87,000 frames/s, 50 % lost).
-2. **Install** an image or `haiku.hpkg` with this driver: `usb_ecm` changed
-   too, and both are packaged, so a non-packaged copy does not do (the
-   packaged module wins). Reboot.
-3. **Driver selection:** syslog has `usb_ecm: leaving a device that offers NCM
-   to usb_ncm`, `usb_ncm: NCM in configuration 1, interfaces ...` and the
-   `NTB16: in ... out ...` line; `ifconfig` shows `/dev/net/usb_ncm/0` with
-   .41 from DHCP; `ncmstat` shows what the RTL8156 asked for (record it). The
-   dock's RTL8153 (no NCM) still comes up as `/dev/net/usb_ecm/0` (.195).
-4. **Throughput** against the build server (.200), 20 s each, `ncmstat`
-   before and after each: up `iperf3 -c 192.168.1.200 -B 192.168.1.41 -t 20`,
-   also `-P 4` and `-w 1M`; for uploads also a receiver that reads 1 MB at a
-   time on .200 (iperf3's server is a slow reader that holds back receive
-   autotuning); down with `-R`; UDP down `-u -b 2G -R` and up `-u -b 2G`.
+1. **Baseline** (usb_ecm in ECM mode, laptop build 2561, 17 Nov), with
+   `iperf3 -c 192.168.1.200 -B 192.168.1.41`: up 664 Mbit/s (1 MB buffer
+   703, 4 streams 711), TCP down 522-524, UDP offered at 2 Gbit/s down:
+   1.0 Gbit/s delivered (about 87,000 frames/s, 50 % lost).
+2. **Install.** Both add-ons are kernel modules in
+   `add-ons/kernel/drivers/network/`. The kernel searches the packaged
+   `/boot/system/add-ons` before `/boot/system/non-packaged/add-ons`, so a
+   non-packaged `usb_ecm` never replaces the packaged one, and a
+   non-packaged `usb_ncm` next to the old packaged `usb_ecm` would leave both
+   drivers attached to the RTL8156, setting different configurations. Two
+   ways that work:
+   - **A `haiku.hpkg` built from this branch** on the laptop's base revision
+     (`jam -q haiku.hpkg`), installed like the other test builds and
+     activated by a reboot. Both modules come from it.
+   - **Without a package rebuild:** hide the packaged `usb_ecm` and put both
+     new modules in non-packaged. `/boot/system/settings/packages`:
+     ```
+     Package haiku {
+     	BlockedEntries {
+     		add-ons/kernel/drivers/network/usb_ecm
+     	}
+     }
+     ```
+     (merged into the file if it exists), copy `usb_ecm` and `usb_ncm` from
+     `objects/haiku/x86_64/release/add-ons/kernel/drivers/network/ether/`
+     to `/boot/system/non-packaged/add-ons/kernel/drivers/network/`, reboot.
+     These are device-manager modules: nothing watches that directory, so the
+     copies are only loaded at the next probe (no live-load trap). To undo:
+     delete both copies and the `BlockedEntries` lines, reboot.
+   Also copy `ncmstat` (`objects/.../tests/add-ons/kernel/drivers/usb_ncm/`).
+3. **Driver selection:** the syslog has `usb_ecm: leaving a device that
+   offers NCM to usb_ncm`, `usb_ncm: NCM in configuration 1, interfaces ...`
+   and `usb_ncm: NTB16: in ... out ...`; `ifconfig` shows
+   `/dev/net/usb_ncm/0` with .41 from DHCP; `ncmstat` shows what the RTL8156
+   asked for (record it). The dock's RTL8153 (no NCM) still comes up as
+   `/dev/net/usb_ecm/0` with .195.
+4. **Throughput,** 20 s each, `ncmstat` before and after each:
+   - up: `iperf3 -c 192.168.1.200 -B 192.168.1.41 -t 20`, also with `-P 4`
+     and `-w 1M`, and against a receiver on .200 that reads 1 MB per
+     `recv()` (iperf3's server is a slow reader that holds back Linux'
+     receive autotuning);
+   - down: the same with `-R`;
+   - UDP: `-u -b 2G -R` (down) and `-u -b 2G` (up).
    Target: above 2 Gbit/s both ways. Look at datagrams per NTB, the flush
-   reasons, `waits` (all 8 OUT buffers busy) and the receive errors.
-5. **If short of it,** the settings file (take the interface down and up after
-   each change): `rx_ntb_size 65536`, `rx_transfers 12`, `tx_ntb_size 65536`,
-   `tx_transfers 12`, `tx_eager 1` / `4`. `profile -a -k` during a download
-   shows whether the xHCI driver's copy of each NTB through its bounce buffers
-   (`ReadDescriptor`, in the controller's finisher thread) is the next limit.
+   reasons, `waits` (all OUT buffers busy), bad NTBs and the errors.
+5. **If short of it,** the settings file
+   `/boot/home/config/settings/kernel/drivers/usb_ncm` (read at each open:
+   `ifconfig /dev/net/usb_ncm/0 down`, then `up`, after each change):
+   `rx_ntb_size 65536`, `rx_transfers 12`, `tx_ntb_size 65536`,
+   `tx_transfers 12`, `tx_eager 1` or `4`. `profile -a -k` during a download
+   shows whether the xHCI driver's copy of each NTB through its bounce
+   buffers (`ReadDescriptor`, in the controller's finisher thread) is the
+   next limit.
 6. **Robustness:** cable out and in (link down and up from the
-   notifications, DHCP again); adapter unplugged during a transfer and plugged
-   back; `ifconfig down`/`up` 10 times, idle and under traffic (watch for the
-   receive stall seen on the QEMU rig: `ncmstat` "reads queued" with nothing
-   received); link lights off while the interface is down (PHY power); a
-   reboot with the interface left down.
+   notifications, DHCP again); the adapter unplugged during a transfer and
+   plugged back; link lights off while the interface is down (PHY power); a
+   reboot with the interface left down; `ifconfig down`/`up` 10 times idle,
+   10 times while iperf3 runs, and once right after a replug.
+   **The receive stall seen on the QEMU rig** would look like this: after the
+   `up`, DHCP and ping get no answer although the link is up and frames go
+   out; `ncmstat` shows `rx: 0 ntbs` (or a count that stops growing),
+   "8 reads queued, 0 completed and not taken", no receive errors, and `tx`
+   NTBs going out. It ended with the next down and up. If it happens on the
+   RTL8156, it is real: record `ncmstat`, the syslog and `listusb -v`, and try
+   whether a down and up ends it.
 7. **Way back:** `disable true` in
-   `/boot/home/config/settings/kernel/drivers/usb_ncm` and a reboot (or a
-   replug) gives the adapter back to `usb_ecm` in its ECM configuration.
+   `/boot/home/config/settings/kernel/drivers/usb_ncm`, then a reboot (or
+   unplugging and replugging the adapter) gives the RTL8156 back to `usb_ecm`
+   in its ECM configuration. The module refuses to load while that line is
+   there, and `usb_ecm` only steps aside for a loaded `usb_ncm`. With the
+   non-packaged install, deleting the copies and the `BlockedEntries` lines
+   and rebooting restores the old drivers.
