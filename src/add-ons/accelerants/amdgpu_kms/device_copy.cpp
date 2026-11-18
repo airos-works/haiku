@@ -212,14 +212,17 @@ destroy_gpu_buffer(GpuBuffer& buffer)
 static bool
 host_back_buffer_enabled()
 {
-	// "host_back_buffer false" in the amdgpu_kms driver settings: app_server's
-	// back buffer is a GTT buffer object as before haiku#67 (renderers then
-	// read pages back instead of importing it)
+	// Off unless "host_back_buffer true" is in the amdgpu_kms driver settings:
+	// app_server's back buffer is a GTT buffer object as before haiku#67, and
+	// renderers read pages back instead of importing it. With the back buffer
+	// in host memory, app_server froze on the Framework Desktop whenever
+	// Summit opened or presented a window (2026-11-18: its threads stuck in
+	// the kernel, nothing logged); the cause is not known yet.
 	static int32 sEnabled = -1;
 	if (sEnabled < 0) {
 		void* handle = load_driver_settings("amdgpu_kms");
 		sEnabled = get_driver_boolean_parameter(handle, "host_back_buffer",
-			true, true) ? 1 : 0;
+			false, true) ? 1 : 0;
 		unload_driver_settings(handle);
 	}
 	return sEnabled != 0;
