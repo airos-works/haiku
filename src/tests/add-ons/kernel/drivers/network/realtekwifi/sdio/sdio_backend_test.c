@@ -688,6 +688,62 @@ test_give_up(void)
 	sQuiet = 0;
 }
 
+/*
+ * The firmware window takes one dword per 4-byte CMD53 (the vendor driver's
+ * rtw_write32() per dword), the tail byte by byte; with the MAC off,
+ * everything as CMD52s. A 196-byte CMD53 into the MAC domain went through
+ * without an error on the first laptop and the checksum never came (#133).
+ */
+static void
+test_fw_write_block(void)
+{
+	struct rtwn_softc *sc;
+	uint8_t buf[196];
+	int i, w52 = 0, w53 = 0, bad = 0;
+
+	printf("firmware download\n");
+	for (i = 0; i < (int)sizeof(buf); i++)
+		buf[i] = (uint8_t)(i * 7 + 3);
+
+	model_reset();
+	sc = setup_softc();
+	sSoftc.sd_mac_on = 1;
+	CHECK(rtwn_sdio_fw_write_block(sc, buf, 0x1000, sizeof(buf)) == 0);
+	CHECK(sOpCount == (int)sizeof(buf) / 4);
+	for (i = 0; i < sOpCount; i++) {
+		if (sOps[i].kind != OP_W53 || sOps[i].len != 4
+		    || sOps[i].dom != MAC || sOps[i].reg != 0x1000u + i * 4)
+			bad++;
+	}
+	CHECK(bad == 0);
+	CHECK(memcmp(sMac + 0x1000, buf, sizeof(buf)) == 0);
+
+	/* a page's tail: 7 bytes, one dword and three bytes */
+	model_reset();
+	sc = setup_softc();
+	sSoftc.sd_mac_on = 1;
+	CHECK(rtwn_sdio_fw_write_block(sc, buf, 0x1c48, 7) == 0);
+	for (i = 0; i < sOpCount; i++) {
+		if (sOps[i].kind == OP_W53 && sOps[i].len == 4)
+			w53++;
+		else if (sOps[i].kind == OP_W52)
+			w52++;
+	}
+	CHECK(sOpCount == 4 && w53 == 1 && w52 == 3);
+	CHECK(memcmp(sMac + 0x1c48, buf, 7) == 0);
+
+	/* MAC off: no CMD53 at all */
+	model_reset();
+	sc = setup_softc();
+	sSoftc.sd_mac_on = 0;
+	CHECK(rtwn_sdio_fw_write_block(sc, buf, 0x1000, 12) == 0);
+	CHECK(sOpCount == 12);
+	for (i = 0; i < sOpCount; i++)
+		CHECK(sOps[i].kind == OP_W52);
+	CHECK(memcmp(sMac + 0x1000, buf, 12) == 0);
+	printf("  dword CMD53s, byte tail, CMD52s with the MAC off\n");
+}
+
 int
 main(void)
 {
@@ -696,6 +752,7 @@ main(void)
 	test_power_on_off();
 	test_timeouts();
 	test_give_up();
+	test_fw_write_block();
 
 	if (sFailures != 0) {
 		printf("%d check(s) FAILED\n", sFailures);

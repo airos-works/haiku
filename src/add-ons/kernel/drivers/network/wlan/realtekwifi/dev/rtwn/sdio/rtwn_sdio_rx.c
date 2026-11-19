@@ -204,13 +204,13 @@ rtwn_sdio_rx_frame(struct rtwn_softc *sc, struct mbuf *m)
 }
 
 /*
- * The card interrupt, in a thread of the MMC bus: the card's interrupt
- * stays masked until this returns.
+ * Serves what HISR shows: from the card interrupt, or from the status task
+ * when card interrupts do not come (\a polled). Returns whether there was
+ * anything to do.
  */
-void
-rtwn_sdio_intr(void *arg)
+static int
+rtwn_sdio_serve(struct rtwn_softc *sc, int polled)
 {
-	struct rtwn_softc *sc = arg;
 	struct rtwn_sdio_softc *sd = RTWN_SDIO_SOFTC(sc);
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct mbuf *m0 = NULL, **tail = &m0, *m, *next;
@@ -224,20 +224,28 @@ rtwn_sdio_intr(void *arg)
 		 * a warm boot from another OS say): mask it at the chip, or the
 		 * bus calls us again as soon as we return.
 		 */
-		if (!sd->sd_gone) {
+		if (!polled && !sd->sd_gone) {
 			sd->sd_himr = 0;
 			rtwn_sdio_write_local_4(sc, RTWN_SDIO_HIMR, 0);
 		}
 		RTWN_UNLOCK(sc);
-		return;
+		return (0);
 	}
+	if (!polled)
+		sd->sd_intrs++;
 
 	hisr = rtwn_sdio_read_local_4(sc, RTWN_SDIO_HISR);
 	if (hisr == 0xffffffff) {
 		RTWN_UNLOCK(sc);
-		return;
+		return (0);
 	}
 	hisr &= sd->sd_himr | RTWN_SDIO_INT_W1C;
+	if (hisr == 0) {
+		RTWN_UNLOCK(sc);
+		return (0);
+	}
+	if (polled)
+		sd->sd_polls++;
 
 	ack = hisr & RTWN_SDIO_INT_W1C;
 	if (ack != 0)
@@ -282,4 +290,22 @@ rtwn_sdio_intr(void *arg)
 		rtwn_start(sc);
 		RTWN_UNLOCK(sc);
 	}
+	return (1);
+}
+
+/*
+ * The card interrupt, in a thread of the MMC bus: the card's interrupt
+ * stays masked until this returns.
+ */
+void
+rtwn_sdio_intr(void *arg)
+{
+	(void)rtwn_sdio_serve(arg, 0);
+}
+
+/* The polling fallback (rtwn_sdio_status_task()). */
+int
+rtwn_sdio_poll(struct rtwn_softc *sc)
+{
+	return (rtwn_sdio_serve(sc, 1));
 }

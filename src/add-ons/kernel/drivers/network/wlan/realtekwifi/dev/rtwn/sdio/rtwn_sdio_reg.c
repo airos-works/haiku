@@ -319,21 +319,36 @@ rtwn_sdio_delay(struct rtwn_softc *sc, int usec)
 
 /*
  * Firmware download: rtwn_fw_loadpage() hands over the image in pieces of
- * up to 196 bytes for the 4 KiB window at 0x1000. Aligned whole words go
- * as one byte mode CMD53 (the vendor driver writes the window in dwords),
- * the rest as CMD52s.
+ * up to 196 bytes for the 4 KiB window at 0x1000. They go one dword per
+ * 4-byte CMD53, the rest byte by byte, as the vendor driver writes the
+ * window (staging rtl8723bs hal/rtl8723b_hal_init.c _BlockWrite(): "use
+ * 4-byte write to download FW", rtw_write32() per dword; rtw88's legacy
+ * download writes dwords too). A longer CMD53 into the MAC domain does not
+ * land: the first laptop that ran this (#133) wrote 196-byte CMD53s without
+ * a bus error and never got the checksum report.
  */
 int
 rtwn_sdio_fw_write_block(struct rtwn_softc *sc, const uint8_t *buf,
     uint16_t reg, int len)
 {
 	struct rtwn_sdio_softc *sd = RTWN_SDIO_SOFTC(sc);
+	int error;
 
-	if (sd->sd_mac_on && (reg & 3) == 0 && len >= 4 && (len & 3) == 0 &&
-	    len <= RTWN_SDIO_BLOCK_SIZE) {
-		return (rtwn_sdio_cmd53_write(sd, rtwn_sdio_mac_addr(reg), buf,
-		    len));
+	while (len >= 4 && (reg & 3) == 0) {
+		if (sd->sd_mac_on)
+			error = rtwn_sdio_cmd53_write(sd,
+			    rtwn_sdio_mac_addr(reg), buf, 4);
+		else
+			error = rtwn_sdio_cmd52_write(sd,
+			    rtwn_sdio_mac_addr(reg), buf, 4);
+		if (error != 0)
+			return (error);
+		buf += 4;
+		reg += 4;
+		len -= 4;
 	}
+	if (len == 0)
+		return (0);
 	return (rtwn_sdio_cmd52_write(sd, rtwn_sdio_mac_addr(reg), buf, len));
 }
 

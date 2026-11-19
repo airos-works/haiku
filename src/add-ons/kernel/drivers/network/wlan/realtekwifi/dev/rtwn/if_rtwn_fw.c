@@ -190,8 +190,9 @@ rtwn_load_firmware(struct rtwn_softc *sc)
 	}
 	if (ntries == 3) {
 		device_printf(sc->sc_dev,
-		    "%s: failed to upload firmware %s (error %d)\n",
-		    __func__, sc->fwname, error);
+		    "%s: failed to upload firmware %s (error %d, MCUFWDL "
+		    "%#010x)\n", __func__, sc->fwname, error,
+		    rtwn_read_4(sc, R92C_MCUFWDL));
 		goto fail;
 	}
 
@@ -211,7 +212,8 @@ rtwn_load_firmware(struct rtwn_softc *sc)
 	}
 	if (ntries == 20) {
 		device_printf(sc->sc_dev,
-		    "timeout waiting for firmware readiness\n");
+		    "timeout waiting for firmware readiness (MCUFWDL %#010x)\n",
+		    rtwn_read_4(sc, R92C_MCUFWDL));
 		error = ETIMEDOUT;
 		goto fail;
 	}

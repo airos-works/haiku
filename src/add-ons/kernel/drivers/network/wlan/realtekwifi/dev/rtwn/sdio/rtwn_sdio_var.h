@@ -27,6 +27,17 @@
 /* Consecutive failed bus transfers after which the card counts as gone. */
 #define RTWN_SDIO_MAX_ERRORS		32
 
+/*
+ * The status task: once a second while the interface is up it checks that
+ * pending work at the chip (HISR) brought a card interrupt; if not, it
+ * serves the chip itself from then on, every RTWN_SDIO_POLL_MS. For the
+ * first RTWN_SDIO_STATUS_LOG_S seconds it logs the counters every
+ * RTWN_SDIO_STATUS_EVERY_S.
+ */
+#define RTWN_SDIO_POLL_MS		10
+#define RTWN_SDIO_STATUS_LOG_S		30
+#define RTWN_SDIO_STATUS_EVERY_S	5
+
 struct rtwn_sdio_txbuf {
 	uint8_t				*buf;
 	int				len;	/* descriptor + frame */
@@ -67,6 +78,18 @@ struct rtwn_sdio_softc {
 
 	/* RX */
 	uint8_t			*sd_rx_buf;
+
+	/* status and the polling fallback (rtwn_sdio_status_task()) */
+	struct taskqueue	*sd_status_tq;
+	struct timeout_task	sd_status_task;
+	int			sd_status_start;	/* ticks */
+	int			sd_status_next;		/* ticks */
+	int			sd_status_check;	/* ticks */
+	uint32_t		sd_intrs;	/* card interrupts served */
+	uint32_t		sd_check_intrs;
+	uint32_t		sd_polls;	/* polls that found work */
+	int			sd_stuck_checks; /* work, no interrupt */
+	uint8_t			sd_polling;	/* no card interrupts: poll */
 
 	/* counters for the log */
 	uint32_t		sd_rx_reads;
@@ -123,5 +146,6 @@ void		rtwn_sdio_update_free_pages(struct rtwn_softc *);
 
 /* rtwn_sdio_rx.c */
 void		rtwn_sdio_intr(void *);
+int		rtwn_sdio_poll(struct rtwn_softc *);
 
 #endif	/* RTWN_SDIO_VAR_H */

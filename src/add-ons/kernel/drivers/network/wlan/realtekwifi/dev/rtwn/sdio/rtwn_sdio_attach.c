@@ -87,6 +87,95 @@ rtwn_sdio_probe(device_t dev)
 	return (BUS_PROBE_DEFAULT);
 }
 
+static int
+rtwn_sdio_ms_ticks(int ms)
+{
+	return ((int)MAX(1, ms * hz / 1000));
+}
+
+static void
+rtwn_sdio_log_status(struct rtwn_softc *sc, uint32_t hisr, uint16_t rxlen)
+{
+	struct rtwn_sdio_softc *sd = RTWN_SDIO_SOFTC(sc);
+
+	RTWN_SDIO_LOG(sc, "status after %d s: %u card interrupts, %u polls "
+	    "with work%s, HISR %#x HIMR %#x RX0_REQ_LEN %u; RX %u reads %u "
+	    "packets; TX %u frames %u dropped, pages free %u/%u/%u/%u\n",
+	    (int)((ticks - sd->sd_status_start) / hz), sd->sd_intrs,
+	    sd->sd_polls, sd->sd_polling ? " (polling)" : "", hisr,
+	    sd->sd_himr, rxlen, sd->sd_rx_reads, sd->sd_rx_pkts,
+	    sd->sd_tx_frames, sd->sd_tx_dropped, sd->sd_free_pages[0],
+	    sd->sd_free_pages[1], sd->sd_free_pages[2], sd->sd_free_pages[3]);
+}
+
+/*
+ * While the interface is up: checks once a second that work pending at the
+ * chip brought a card interrupt, and serves the chip itself from then on
+ * if it did not (the card interrupt depends on the host controller's
+ * handling of DAT1, untested on most of the hosts this may run on); logs
+ * the counters for the first seconds. In its own thread, so that the TX
+ * task waiting for pages does not hold it up.
+ */
+static void
+rtwn_sdio_status_task(void *arg, int pending)
+{
+	struct rtwn_softc *sc = arg;
+	struct rtwn_sdio_softc *sd = RTWN_SDIO_SOFTC(sc);
+	uint32_t hisr;
+	uint16_t rxlen;
+	int now, poll;
+
+	RTWN_LOCK(sc);
+	if (!sd->sd_xfers || sd->sd_gone) {
+		RTWN_UNLOCK(sc);
+		return;
+	}
+	now = ticks;
+	poll = sd->sd_polling;
+	if (now - sd->sd_status_check >= hz * 9 / 10) {
+		sd->sd_status_check = now;
+		hisr = rtwn_sdio_read_local_4(sc, RTWN_SDIO_HISR);
+		rxlen = rtwn_sdio_read_local_2(sc, RTWN_SDIO_RX0_REQ_LEN);
+		/*
+		 * Work at two checks in a row and not one card interrupt in
+		 * between: they do not come. (Once could be work that came
+		 * just now.)
+		 */
+		if (hisr != 0xffffffff && (hisr & sd->sd_himr) != 0 &&
+		    sd->sd_intrs == sd->sd_check_intrs)
+			sd->sd_stuck_checks++;
+		else
+			sd->sd_stuck_checks = 0;
+		if (!sd->sd_polling && sd->sd_stuck_checks >= 2) {
+			sd->sd_polling = 1;
+			poll = 1;
+			RTWN_SDIO_LOG(sc, "HISR %#x has had work (HIMR %#x) for "
+			    "a second with no card interrupt: serving the chip "
+			    "every %d ms from now on\n", hisr, sd->sd_himr,
+			    RTWN_SDIO_POLL_MS);
+		}
+		sd->sd_check_intrs = sd->sd_intrs;
+		if (now - sd->sd_status_start <= RTWN_SDIO_STATUS_LOG_S * hz &&
+		    now - sd->sd_status_next >= 0) {
+			sd->sd_status_next = now + RTWN_SDIO_STATUS_EVERY_S * hz;
+			rtwn_sdio_log_status(sc, hisr, rxlen);
+		}
+	}
+	RTWN_UNLOCK(sc);
+
+	if (poll)
+		(void)rtwn_sdio_poll(sc);
+
+	RTWN_LOCK(sc);
+	if (sd->sd_xfers && !sd->sd_gone) {
+		taskqueue_enqueue_timeout(sd->sd_status_tq,
+		    &sd->sd_status_task, sd->sd_polling ?
+		    rtwn_sdio_ms_ticks(RTWN_SDIO_POLL_MS) :
+		    rtwn_sdio_ms_ticks(1000));
+	}
+	RTWN_UNLOCK(sc);
+}
+
 static void
 rtwn_sdio_start_xfers(struct rtwn_softc *sc)
 {
@@ -122,10 +211,20 @@ rtwn_sdio_start_xfers(struct rtwn_softc *sc)
 	rtwn_sdio_write_local_4(sc, RTWN_SDIO_HIMR, sd->sd_himr);
 	sd->sd_xfers = 1;
 
-	RTWN_SDIO_LOG(sc, "running: TX pages free high %u normal %u low %u "
-	    "public %u, OQT %u, HIMR %#x\n", sd->sd_free_pages[0],
-	    sd->sd_free_pages[1], sd->sd_free_pages[2], sd->sd_free_pages[3],
-	    sd->sd_oqt_free, sd->sd_himr);
+	RTWN_SDIO_LOG(sc, "running: firmware %s (version %u), TX pages free "
+	    "high %u normal %u low %u public %u, OQT %u, HIMR %#x\n",
+	    (sc->sc_flags & RTWN_FW_LOADED) ? "running" : "NOT loaded",
+	    sc->fwver, sd->sd_free_pages[0], sd->sd_free_pages[1],
+	    sd->sd_free_pages[2], sd->sd_free_pages[3], sd->sd_oqt_free,
+	    sd->sd_himr);
+
+	sd->sd_status_start = ticks;
+	sd->sd_status_check = sd->sd_status_start;
+	sd->sd_status_next = sd->sd_status_start + 2 * hz;
+	sd->sd_check_intrs = sd->sd_intrs;
+	sd->sd_stuck_checks = 0;
+	taskqueue_enqueue_timeout(sd->sd_status_tq, &sd->sd_status_task,
+	    rtwn_sdio_ms_ticks(sd->sd_polling ? RTWN_SDIO_POLL_MS : 1000));
 }
 
 static void
@@ -137,10 +236,13 @@ rtwn_sdio_abort_xfers(struct rtwn_softc *sc)
 
 	if (sd->sd_xfers) {
 		RTWN_SDIO_LOG(sc, "stopping: %u RX reads, %u RX packets, %u TX "
-		    "frames, %u dropped\n", sd->sd_rx_reads, sd->sd_rx_pkts,
-		    sd->sd_tx_frames, sd->sd_tx_dropped);
+		    "frames, %u dropped, %u card interrupts, %u polls with "
+		    "work\n", sd->sd_rx_reads, sd->sd_rx_pkts, sd->sd_tx_frames,
+		    sd->sd_tx_dropped, sd->sd_intrs, sd->sd_polls);
 	}
 	sd->sd_xfers = 0;
+	/* Not waited for: it takes the lock, and ends by itself now. */
+	taskqueue_cancel_timeout(sd->sd_status_tq, &sd->sd_status_task, NULL);
 	sd->sd_himr = 0;
 	rtwn_sdio_write_local_4(sc, RTWN_SDIO_HIMR, 0);
 	wakeup(sd);
@@ -280,6 +382,17 @@ rtwn_sdio_attach(device_t self)
 	taskqueue_start_threads(&sd->sd_tq, 1, PI_NET, "%s tx",
 	    device_get_nameunit(self));
 
+	sd->sd_status_tq = taskqueue_create("rtwn_sdio_status", M_NOWAIT,
+	    taskqueue_thread_enqueue, &sd->sd_status_tq);
+	if (sd->sd_status_tq == NULL) {
+		error = ENOMEM;
+		goto fail;
+	}
+	TIMEOUT_TASK_INIT(sd->sd_status_tq, &sd->sd_status_task, 0,
+	    rtwn_sdio_status_task, sc);
+	taskqueue_start_threads(&sd->sd_status_tq, 1, PI_NET, "%s status",
+	    device_get_nameunit(self));
+
 	/* Read what the chip is and power it on to read its efuse. */
 	RTWN_LOCK(sc);
 	error = rtwn_sdio_check_chip(sc);
@@ -329,6 +442,11 @@ fail:
 	}
 	if (attached)
 		rtwn_detach(sc);
+	if (sd->sd_status_tq != NULL) {
+		taskqueue_drain_timeout(sd->sd_status_tq, &sd->sd_status_task);
+		taskqueue_free(sd->sd_status_tq);
+		sd->sd_status_tq = NULL;
+	}
 	if (sd->sd_tq != NULL) {
 		taskqueue_drain(sd->sd_tq, &sd->sd_tx_task);
 		taskqueue_free(sd->sd_tq);
@@ -359,6 +477,11 @@ rtwn_sdio_detach(device_t self)
 	/* Generic detach; stops the device (rtwn_stop(): power off). */
 	rtwn_detach(sc);
 
+	if (sd->sd_status_tq != NULL) {
+		taskqueue_drain_timeout(sd->sd_status_tq, &sd->sd_status_task);
+		taskqueue_free(sd->sd_status_tq);
+		sd->sd_status_tq = NULL;
+	}
 	if (sd->sd_tq != NULL) {
 		taskqueue_drain(sd->sd_tq, &sd->sd_tx_task);
 		taskqueue_free(sd->sd_tq);
