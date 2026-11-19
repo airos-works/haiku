@@ -204,7 +204,8 @@ nvencFree(NvencEngine *engine, NvencBuffer *buffer)
 		nvRmApiUnmapMemory(&engine->rm, engine->device, state->physical, 0, &state->mapping);
 	if (state->virt != 0) {
 		nvRmApiUnmapMemoryDma(&engine->rm, engine->device, state->virt,
-			state->physical, 0, buffer->gpuAddress);
+			state->physical, 0, buffer->gpuAddress, 0);
+			/* (size 0: the whole mapping) */
 		nvRmApiFree(&engine->rm, state->virt);
 	}
 	if (state->physical != 0)

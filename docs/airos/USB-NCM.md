@@ -1,0 +1,296 @@
+# USB CDC NCM (usb_ncm)
+
+`usb_ncm` drives USB Ethernet functions of the CDC Network Control Model
+(NCM 1.0): 2.5 Gbit/s Realtek RTL8156 adapters, many docks, phones and Linux
+USB gadgets (`f_ncm`). It replaces `usb_ecm` for every device that offers NCM
+(airos-works/haiku#123).
+
+## Why
+
+ECM carries one Ethernet frame per USB transfer. With `usb_ecm`, the Framework
+13's RTL8156 ran 651-703 Mbit/s up and 522-524 down on a 2.5 Gbit/s link, the
+same as a 1 Gbit/s RTL8153: every frame costs a transfer, a doorbell write, a
+completion and a thread wake-up. NCM packs many frames into one Network
+Transfer Block (NTB), so those costs are paid per block.
+
+## Which driver takes a device
+
+Every driver that says it supports a USB device gets it (the USB bus node has
+`B_FIND_MULTIPLE_CHILDREN`), so two drivers must not both say yes: they would
+set different configurations. A device like the RTL8156 offers three:
+
+| index | configuration |
+|---|---|
+| 0 | vendor specific (Linux' `r8152`) |
+| 1 | CDC NCM (communication interface 2/0x0d, data interface protocol 1) |
+| 2 | CDC ECM |
+
+- `usb_ncm` supports any device with a CDC NCM interface in any configuration
+  and sets that configuration (unless it is the current one, so that the other
+  functions of a composite device keep their endpoints).
+- `usb_ecm` steps aside for a device that also offers NCM, as long as the
+  `usb_ncm` module is installed. Without it, `usb_ecm` takes such a device as
+  before.
+
+## How it works
+
+- **Setup.** With the data interface in alternate 0: `GET_NTB_PARAMETERS`,
+  `SET_NTB_FORMAT` (16 bit, or 32 bit for a function that has nothing else),
+  `SET_CRC_MODE` off, `SET_NTB_INPUT_SIZE`, and for a function that has it
+  (`bmNetworkCapabilities` bit 3) `GET_MAX_DATAGRAM_SIZE`, then
+  `SET_MAX_DATAGRAM_SIZE` with the largest frame if that differs (as Linux'
+  `cdc_ncm` does); then the NTB alternate (protocol 1) and
+  `SET_ETHERNET_PACKET_FILTER` (directed, broadcast, all multicast;
+  promiscuous on request). The syslog names the bulk endpoints taken. Link and speed come from the `NetworkConnection` and
+  `ConnectionSpeedChange` notifications.
+- **Receiving.** Several bulk IN transfers of the NTB input size stay queued.
+  The stack's reader takes the datagrams of a completed NTB, up to 16 per call
+  (`ETHER_RECEIVE_NET_BUFFERS`); the transfer goes back to the device as soon
+  as its last datagram is out. Every NDP in the chain is read; entries that
+  point outside the block, or are shorter than an Ethernet header or longer
+  than a frame, are skipped and counted.
+- **Sending.** Frames (`ETHER_SEND_NET_BUFFER`, no copy before the one into
+  the NTB) are packed into the NTB being filled: NTH, the NDP with room for
+  the most datagrams, then the datagrams at the function's divisor and
+  remainder. `wNdpOutPayloadRemainder` is that of the datagram's *payload*,
+  the part after its 14-byte Ethernet header (the function wants the IP
+  header aligned; Linux' `cdc_ncm` and FreeBSD's `cdce` both subtract 14), so
+  a datagram starts where
+  `(offset + 14) % wNdpOutDivisor == wNdpOutPayloadRemainder`. The RTL8156
+  asks for 4/2: frames start on 4-byte boundaries. The NTB goes out at once
+  while fewer than `tx_eager` transfers are in flight, when it is full (size
+  or datagram count), or else when a
+  transfer completes. A frame therefore waits only while transfers are in
+  flight, and the next completion sends it, so there is no flush timer; under
+  load the NTBs grow to what the bus takes. A block that would end on a packet
+  boundary gets one byte of padding instead of a zero length packet.
+- **Realtek PHY.** As in `usb_ecm`, the RTL815x PHY is powered up at open
+  (`usb_ecm` powers it down while its interface is down, and a later boot can
+  find it so) and down at close.
+
+## Tunables
+
+`/boot/home/config/settings/kernel/drivers/usb_ncm`, read at each open (take
+the interface down and up to apply):
+
+| key | default | range | meaning |
+|---|---|---|---|
+| `rx_ntb_size` | 32768 | 2048-65536 | NTB input size asked for (capped by the function's `dwNtbInMaxSize`) |
+| `tx_ntb_size` | 32768 | 2048-65536 | largest NTB sent (capped by `dwNtbOutMaxSize`) |
+| `rx_transfers` | 8 | 1-12 | bulk IN transfers kept queued |
+| `tx_transfers` | 8 | 1-12 | most bulk OUT transfers in flight |
+| `tx_eager` | 2 | 1-12 | below this many in flight an NTB goes out at once |
+| `tx_max_datagrams` | 32 | 1-256 | datagrams per NTB sent (capped by `wNtbOutMaxDatagrams`) |
+| `debug` | 0 | 0-1 | `debug 1`: each class request (value, data, result), `SET_INTERFACE`, the first notifications, and the first `debug_ntbs` NTBs each way (NTH, NDPs, each datagram's offset and its first 64 bytes, up to 8 datagrams) and TX completions go to the syslog as hex |
+| `debug_ntbs` | 8 | 1-1000 | how many NTBs `debug 1` dumps each way |
+| `disable` | false | | `disable true` keeps the module from loading (read when it loads, so at the latest at the next boot): `usb_ecm` then takes devices that also offer ECM, as before |
+
+`ncmstat [/dev/net/usb_ncm/N]` (built from
+`src/tests/add-ons/kernel/drivers/usb_ncm`) prints what was negotiated and the
+counters: NTBs and datagrams each way, datagrams per NTB, why NTBs were sent
+(idle, full, on completion), waits for a free buffer, bad NTBs and datagrams,
+errors, and right now: reads queued with the device, completed reads not yet
+taken, writes in flight. It opens the device read only, which leaves it to the
+network stack.
+The syslog gets the negotiated parameters at each open and a summary at each
+close.
+
+## Tests
+
+- `ntb_test` (same directory, also builds on any host with
+  `-fsanitize=address,undefined`): NTBs built by the writer parse back to the
+  same datagrams in both formats and with odd alignments; every TX layout rule
+  checked straight from the bytes for 14 divisor/remainder/alignment
+  combinations (4/2/4 of the RTL8156 among them, and nonsense values that
+  fall back to 4/0/4), 1 to 40 datagrams, 16 and 32 bit, packet sizes 64 to
+  1024 (NTH fields, NDP signature/length/terminator/next index, payload
+  alignment, zeroed gaps, the short-packet padding byte); the exact bytes of
+  an ARP reply in a one-datagram NTB for the RTL8156; broken headers,
+  NDPs outside the block, NDP loops, chains, bad datagram entries; 200,000
+  randomly damaged blocks never yield a datagram outside the transfer.
+- **QEMU with Linux' NCM gadget as the function** (November 2026): a Linux
+  guest runs `f_ncm` (configfs) on the `usbip-vudc` virtual UDC, attaches it
+  to itself with `vhci-hcd` and exports it with `usbredirect`; the air/OS
+  guest gets it through `qemu-xhci` + `usb-redir`. High speed, so this checks
+  correctness, not 2.5 Gbit/s. Results with the defaults (16 KiB NTBs, which
+  is what `f_ncm` offers):
+  - TCP 228-231 Mbit/s up and 217-230 down; Linux' `cdc_ncm` on the same rig
+    managed 137-139 up and 155-203 down.
+  - 64-byte UDP datagrams to air/OS: 80,000 per second, none lost, up to 31 in
+    one NTB; sent: up to 32 per NTB.
+  - DHCP, ping, 200 pings of 1472 bytes: all answered; no bad NTB.
+  - Gadget unbind and bind (a replug): the device goes and comes back as
+    `/dev/net/usb_ncm/1`, DHCP and traffic resume.
+  - A gadget with ECM in its first configuration and NCM in its second (like
+    the RTL8156): `usb_ecm` leaves it to `usb_ncm`, which selects the NCM
+    configuration; with `disable true`, `usb_ecm` takes it after a replug.
+  - `ifconfig down` and `up` 15 times: all work. Known rig problem: the first
+    down and up after a replug, or one done while traffic flows, sometimes
+    leaves the bulk IN transfers queued with the controller without ever
+    completing (the gadget sends; nothing arrives) until the next down and up.
+    Linux' `cdc_ncm` loses its receive path on the same rig in 8 of 15 down
+    and up cycles under traffic, so this is taken to be the rig (usbip-vudc
+    and usbredir); it is a thing to watch for on real hardware.
+- **The same rig with a strict gadget** (`/data1/scratch/ncm-tx-rig`):
+  Linux v7.0's `f_ncm` built for the peer kernel with three module
+  parameters (`patch_fncm.py`): `out_remainder=2` offers what the RTL8156
+  offers, `strict_align=1` drops every datagram whose payload is not at
+  that remainder, `dump_ntbs=N` hex dumps the first NTBs received. The
+  usb_ncm before the fix reproduces the laptop: "misplaced datagram at 154
+  (payload % 4 = 0, want 2), dropped", no DHCP, no ping answered. After
+  it: DHCP, ping, 50 pings of 1472 bytes, TCP 230 Mbit/s up and 226 down,
+  285,000 datagrams (up to 32 per NTB) all in place, none dropped.
+  `f_ncm` has no `GET`/`SET_MAX_DATAGRAM_SIZE`, so that path is untested.
+
+## First run on the RTL8156 (17 November 2026): nothing sent arrived
+
+Setup, the link (2500/2500 from the notifications) and receiving all worked:
+thousands of NTBs, no bad ones. Every NTB sent completed without an error, but
+none of its frames reached the wire: no DHCP offer, and with a static .41 the
+server's ARP entry for .41 stayed incomplete while the laptop counted the ARP
+requests in and its replies out. The same with `tx_max_datagrams 1`.
+
+Cause (confirmed by the second run below): the datagrams sat 2
+bytes off. The RTL8156 asks for `wNdpOutDivisor` 4 and
+`wNdpOutPayloadRemainder` 2. That remainder places the payload after the
+Ethernet header, so the frame itself belongs at offset % 4 == 0 (Linux'
+`cdc_ncm`, `cdc_ncm_fix_modulus()`, and FreeBSD's `cdce_ncm_init()` both
+compute `(remainder - 14) & (divisor - 1)`). `usb_ncm` put the frame start at
+offset % 4 == 2. A one-datagram NTB had the frame at 30 where Linux puts it
+at 28. Linux' `f_ncm` gadget on the QEMU rig ignores the alignment and
+offers remainder 0, which is why TX worked there. Everything else matched
+`cdc_ncm` byte for byte: the NDP right after the NTH at 12, `NCM0`, `wLength`
+of the used entries plus the zero entry, `wNextNdpIndex` 0, `wBlockLength`
+equal to the transfer, a pad byte instead of a zero length packet, the
+bulk OUT endpoint of the data interface's alternate 1.
+
+Changed: the payload remainder rule above, `GET`/`SET_MAX_DATAGRAM_SIZE`
+(the RTL8156 has capability bit 3; Linux sends it), the `debug` switch, and
+an endpoint line in the syslog. Short frames are still not padded to 60
+bytes: Linux' `cdc_ncm` does not either, the function pads.
+
+**Next laptop run:** install as in step 2 below, with
+`debug 1` in `/boot/home/config/settings/kernel/drivers/usb_ncm` for the first
+boot. Then:
+1. The syslog has `usb_ncm: NTB16: ... datagrams at offset % 4 == 0, NDP at
+   12` and `interface 1 alternate 1: bulk in 0x8? (1024), out 0x0? (1024)`.
+2. DHCP gives .41 (or with the static address, the server's
+   `ip neigh show 192.168.1.41` is `REACHABLE`); `ping 192.168.1.200`.
+3. Whatever the result, save the syslog lines `usb_ncm: debug:` (the setup
+   requests with their answers, `GET_MAX_DATAGRAM_SIZE`, the first 8 TX NTBs
+   with "datagram 0 at N (% 4 = 0, ...)", their completions, the first 8 RX
+   NTBs, whose offsets show where the RTL8156 itself puts frames).
+4. If TX still fails: compare the dumped bytes with the `cdc_ncm` layout in
+   the section above; next suspects are the Realtek PHY requests made in the
+   NCM configuration (try with `_SetPHYPower` skipped: the PHY was already
+   up) and the packet filter.
+5. Remove `debug 1` (or leave it: it stops after `debug_ntbs` NTBs each way)
+   and go on with the test plan from step 3.
+
+## Second run on the RTL8156 (18 November 2026): above 2 Gbit/s both ways
+
+Laptop build: its CI kernel (+2559) with master's network code and this
+branch (a126a0225e). DHCP gave .41 at once; the syslog showed the NDP at 12
+and every datagram at offset % 4 == 0. Against the Linux build server over
+the 2.5 Gbit/s link:
+
+| | usb_ecm (ECM) | usb_ncm (NCM) |
+|---|---|---|
+| upload, a sender bound to .41, receiver reading 1 MB per `recv()` | - | 2.3 Gbit/s |
+| upload, iperf3: 1 / 4 streams / `-w 1M` | 664 / 711 / 703 | 1,742 / 1,972 / 1,961 |
+| UDP upload, 2 Gbit/s offered | - | 1,954 delivered (2.3 % lost) |
+| download, iperf3 `-R`: 1 / 4 streams | 522 / 524 | 1,975-2,125 / 2,274-2,339 |
+
+`ncmstat` after the runs: 10.4 million datagrams received in 569,000 NTBs
+(18 per NTB, up to 364), 9.1 million sent in 1.5 million NTBs (6 per NTB, up
+to 21); no bad NTBs, errors or drops; 195,000 `waits` (every OUT buffer
+busy), so `tx_transfers` may still gain. `ifconfig down`/`up` 10 times idle
+and 10 times during a download: receiving resumed every time, the address
+stayed, and the QEMU rig's receive stall did not happen. Not yet done: cable
+out and in, unplugging during a transfer, a reboot with the interface down.
+
+Measuring trap on this laptop: Wi-Fi, the dock's RTL8153 and the RTL8156 are
+on one subnet with routes of equal metric, the dock's first, and `iperf3 -B`
+only chooses the source address. Uploads (and a download's ACKs) left through
+the dock's 1 Gbit/s adapter until `ifconfig /dev/net/usb_ecm/0 down`.
+
+## Test plan: RTL8156 on the Framework 13
+
+First run 17 November 2026, see above; the laptop's reboots can hang in
+shutdown (#136), so this runs with the owner around. Adapter: 0bda:8156, configurations vendor (index 0),
+NCM (1), ECM (2); laptop on the 2.5 Gbit/s port, RTL8156 at 192.168.1.41
+(Wi-Fi .31 and the dock's RTL8153 .195 share the subnet, so every iperf3
+binds to .41). Peer: the Linux build server, 192.168.1.200.
+
+1. **Baseline** (usb_ecm in ECM mode, laptop build 2561, 17 Nov), with
+   `iperf3 -c 192.168.1.200 -B 192.168.1.41`: up 664 Mbit/s (1 MB buffer
+   703, 4 streams 711), TCP down 522-524, UDP offered at 2 Gbit/s down:
+   1.0 Gbit/s delivered (about 87,000 frames/s, 50 % lost).
+2. **Install.** Both add-ons are kernel modules in
+   `add-ons/kernel/drivers/network/`. The kernel searches the packaged
+   `/boot/system/add-ons` before `/boot/system/non-packaged/add-ons`, so a
+   non-packaged `usb_ecm` never replaces the packaged one, and a
+   non-packaged `usb_ncm` next to the old packaged `usb_ecm` would leave both
+   drivers attached to the RTL8156, setting different configurations. Two
+   ways that work:
+   - **A `haiku.hpkg` built from this branch** on the laptop's base revision
+     (`jam -q haiku.hpkg`), installed like the other test builds and
+     activated by a reboot. Both modules come from it.
+   - **Without a package rebuild:** hide the packaged `usb_ecm` and put both
+     new modules in non-packaged. `/boot/system/settings/packages`:
+     ```
+     Package haiku {
+     	BlockedEntries {
+     		add-ons/kernel/drivers/network/usb_ecm
+     	}
+     }
+     ```
+     (merged into the file if it exists), copy `usb_ecm` and `usb_ncm` from
+     `objects/haiku/x86_64/release/add-ons/kernel/drivers/network/ether/`
+     to `/boot/system/non-packaged/add-ons/kernel/drivers/network/`, reboot.
+     These are device-manager modules: nothing watches that directory, so the
+     copies are only loaded at the next probe (no live-load trap). To undo:
+     delete both copies and the `BlockedEntries` lines, reboot.
+   Also copy `ncmstat` (`objects/.../tests/add-ons/kernel/drivers/usb_ncm/`).
+3. **Driver selection:** the syslog has `usb_ecm: leaving a device that
+   offers NCM to usb_ncm`, `usb_ncm: NCM in configuration 1, interfaces ...`
+   and `usb_ncm: NTB16: in ... out ...`; `ifconfig` shows
+   `/dev/net/usb_ncm/0` with .41 from DHCP; `ncmstat` shows what the RTL8156
+   asked for (record it). The dock's RTL8153 (no NCM) still comes up as
+   `/dev/net/usb_ecm/0` with .195.
+4. **Throughput,** 20 s each, `ncmstat` before and after each:
+   - up: `iperf3 -c 192.168.1.200 -B 192.168.1.41 -t 20`, also with `-P 4`
+     and `-w 1M`, and against a receiver on .200 that reads 1 MB per
+     `recv()` (iperf3's server is a slow reader that holds back Linux'
+     receive autotuning);
+   - down: the same with `-R`;
+   - UDP: `-u -b 2G -R` (down) and `-u -b 2G` (up).
+   Target: above 2 Gbit/s both ways. Look at datagrams per NTB, the flush
+   reasons, `waits` (all OUT buffers busy), bad NTBs and the errors.
+5. **If short of it,** the settings file
+   `/boot/home/config/settings/kernel/drivers/usb_ncm` (read at each open:
+   `ifconfig /dev/net/usb_ncm/0 down`, then `up`, after each change):
+   `rx_ntb_size 65536`, `rx_transfers 12`, `tx_ntb_size 65536`,
+   `tx_transfers 12`, `tx_eager 1` or `4`. `profile -a -k` during a download
+   shows whether the xHCI driver's copy of each NTB through its bounce
+   buffers (`ReadDescriptor`, in the controller's finisher thread) is the
+   next limit.
+6. **Robustness:** cable out and in (link down and up from the
+   notifications, DHCP again); the adapter unplugged during a transfer and
+   plugged back; link lights off while the interface is down (PHY power); a
+   reboot with the interface left down; `ifconfig down`/`up` 10 times idle,
+   10 times while iperf3 runs, and once right after a replug.
+   **The receive stall seen on the QEMU rig** would look like this: after the
+   `up`, DHCP and ping get no answer although the link is up and frames go
+   out; `ncmstat` shows `rx: 0 ntbs` (or a count that stops growing),
+   "8 reads queued, 0 completed and not taken", no receive errors, and `tx`
+   NTBs going out. It ended with the next down and up. If it happens on the
+   RTL8156, it is real: record `ncmstat`, the syslog and `listusb -v`, and try
+   whether a down and up ends it.
+7. **Way back:** `disable true` in
+   `/boot/home/config/settings/kernel/drivers/usb_ncm`, then a reboot (or
+   unplugging and replugging the adapter) gives the RTL8156 back to `usb_ecm`
+   in its ECM configuration. The module refuses to load while that line is
+   there, and `usb_ecm` only steps aside for a loaded `usb_ncm`. With the
+   non-packaged install, deleting the copies and the `BlockedEntries` lines
+   and rebooting restores the old drivers.

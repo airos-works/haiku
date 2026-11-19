@@ -75,7 +75,8 @@ static int32* sCPUToCore;
 static int32* sCPUToPackage;
 
 
-static void enqueue(Thread* thread, bool newOne);
+static void enqueue(Thread* thread, bool newOne,
+	bool rescheduleHere = true);
 
 
 void
@@ -92,8 +93,15 @@ scheduler_dump_thread_data(Thread* thread)
 }
 
 
+/*!	\a rescheduleHere false: the caller is reschedule(), which has chosen the
+	thread this CPU runs next already, among them \a thread. A reschedule
+	requested of this CPU now would only be acted on at its next interrupt,
+	and until then other CPUs that enqueue a thread for it send no ICI (they
+	see invoke_scheduler set): a thread woken up for it then waited for the
+	end of the quantum of whatever ran there (#135).
+*/
 static void
-enqueue(Thread* thread, bool newOne)
+enqueue(Thread* thread, bool newOne, bool rescheduleHere)
 {
 	SCHEDULER_ENTER_FUNCTION();
 
@@ -133,7 +141,8 @@ enqueue(Thread* thread, bool newOne)
 		|| wasRunQueueEmpty) {
 
 		if (targetCPU->ID() == smp_get_current_cpu()) {
-			gCPU[targetCPU->ID()].invoke_scheduler = true;
+			if (rescheduleHere)
+				gCPU[targetCPU->ID()].invoke_scheduler = true;
 		} else if (atomic_get_and_set(&gCPU[targetCPU->ID()].invoke_scheduler, true) != true) {
 			smp_send_ici(targetCPU->ID(), SMP_MSG_RESCHEDULE, 0, 0, 0,
 				NULL, SMP_MSG_FLAG_ASYNC);
@@ -335,7 +344,7 @@ reschedule(int32 nextState)
 	ThreadData* oldThreadData = oldThread->scheduler_data;
 
 	CPUSet oldThreadMask;
-	bool useOldThreadMask, fetchedOldThreadMask = false;
+	bool useOldThreadMask = false;
 
 	oldThreadData->StopCPUTime();
 
@@ -358,7 +367,6 @@ reschedule(int32 nextState)
 
 			oldThreadMask = oldThreadData->GetCPUMask();
 			useOldThreadMask = !oldThreadMask.IsEmpty();
-			fetchedOldThreadMask = true;
 
 			if (!oldThreadData->IsIdle() && (!useOldThreadMask || oldThreadMask.GetBit(thisCPU))) {
 				oldThreadData->Continues();
@@ -406,12 +414,15 @@ reschedule(int32 nextState)
 		} else
 			nextThreadData = oldThreadData;
 	} else {
-		if (!fetchedOldThreadMask) {
-			oldThreadMask = oldThreadData->GetCPUMask();
-			useOldThreadMask = !oldThreadMask.IsEmpty();
-			fetchedOldThreadMask = true;
-		}
-		bool oldThreadShouldMigrate = useOldThreadMask && !oldThreadMask.GetBit(thisCPU);
+		// A thread that runs outside its CPU mask moves to a CPU of the mask,
+		// if it stays ready. One that is going to wait (or die) must not be
+		// put into a run queue: it would be run again before anything woke
+		// it up, and return from thread_block() with its wait still pending
+		// (#137). It is placed according to its mask when it wakes up.
+		// (A core's threads run on any of its CPUs, so with SMT a thread
+		// that may only use one of them runs on the others, too.)
+		bool oldThreadShouldMigrate = enqueueOldThread && useOldThreadMask
+			&& !oldThreadMask.GetBit(thisCPU);
 		// Low latency: a thread that never waits is placed only when it wakes
 		// up, so it would stay wherever it started. It moves to a core that
 		// has nothing to do
@@ -478,7 +489,7 @@ reschedule(int32 nextState)
 	if (nextThread != oldThread) {
 		if (enqueueOldThread) {
 			if (putOldThreadAtBack)
-				enqueue(oldThread, false);
+				enqueue(oldThread, false, false);
 			else if (gCurrentMode == &gSchedulerLowLatencyMode
 				&& oldThread->pinned_to_cpu == 0
 				&& FastestIdleCore(oldThreadData, core->Capacity()) != NULL) {
@@ -486,7 +497,7 @@ reschedule(int32 nextState)
 				// fast idle. (Not a slower one: a busy thread that a short
 				// wake-up sent to a little core ran there at a third of the
 				// speed until its quantum ended.)
-				enqueue(oldThread, true);
+				enqueue(oldThread, true, false);
 			} else
 				oldThreadData->PutBack();
 		}

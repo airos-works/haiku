@@ -105,8 +105,32 @@ struct Recorder : Terminal::Listener {
 	{
 		fileTransfers.push_back(data);
 	}
+	virtual void TerminalShellMark(char mark, int32 status,
+		const char* command)
+	{
+		marks += mark;
+		if (mark == 'D')
+			lastStatus = status;
+		if (mark == 'C')
+			lastCommand = command;
+	}
+	virtual void TerminalRequestAttention(const char* value)
+	{
+		attention = value;
+	}
+	virtual void TerminalDownload(const char* name, const std::string& data)
+	{
+		downloadName = name;
+		downloadData = data;
+	}
 
 	std::vector<std::string> fileTransfers;
+	std::string marks;
+	int32 lastStatus = -2;
+	std::string lastCommand;
+	std::string attention;
+	std::string downloadName;
+	std::string downloadData;
 };
 
 
@@ -1555,6 +1579,227 @@ TestLinks()
 }
 
 
+static std::string
+FindAllText(Fixture& f, const char* pattern, bool matchCase, bool matchWord,
+	bool regex)
+{
+	std::vector<std::pair<TermPoint, TermPoint> > matches;
+	if (!f.terminal.FindAll(pattern, matchCase, matchWord, regex, matches))
+		return "invalid";
+	std::string text;
+	for (size_t i = 0; i < matches.size(); i++) {
+		char buffer[64];
+		snprintf(buffer, sizeof(buffer), "%s%d,%d-%d,%d", i > 0 ? " " : "",
+			(int)matches[i].first.x, (int)matches[i].first.y,
+			(int)matches[i].second.x, (int)matches[i].second.y);
+		text += buffer;
+	}
+	return text;
+}
+
+
+static void
+TestFindAll()
+{
+	Fixture f(10, 4, 100);
+	f.Feed("Foo foo\r\nxfoox FOO\r\nabcdefghfo\r\no end");
+	CHECK_EQUAL(FindAllText(f, "foo", false, false, false),
+		"0,0-3,0 4,0-7,0 1,1-4,1 6,1-9,1");
+	CHECK_EQUAL(FindAllText(f, "foo", true, false, false),
+		"4,0-7,0 1,1-4,1");
+	CHECK_EQUAL(FindAllText(f, "foo", false, true, false),
+		"0,0-3,0 4,0-7,0 6,1-9,1");
+	CHECK_EQUAL(FindAllText(f, "", false, false, false), "");
+	// over a soft wrap ("fo" + "o")
+	Fixture w(10, 3, 100);
+	w.Feed("abcdefghfoo bar");
+	CHECK_EQUAL(FindAllText(w, "foo", false, false, false), "8,0-1,1");
+	// regular expressions, case folded unless asked
+	CHECK_EQUAL(FindAllText(f, "f[o]+", false, false, true),
+		"0,0-3,0 4,0-7,0 1,1-4,1 6,1-9,1 8,2-10,2");
+	CHECK_EQUAL(FindAllText(f, "F\\w+", true, false, true),
+		"0,0-3,0 6,1-9,1");
+	CHECK_EQUAL(FindAllText(f, "^x", false, false, true), "0,1-1,1");
+	CHECK_EQUAL(FindAllText(f, "o*", false, false, true),
+		"1,0-3,0 5,0-7,0 2,1-4,1 7,1-9,1 9,2-10,2 0,3-1,3");
+	CHECK_EQUAL(FindAllText(f, "(", false, false, true), "invalid");
+	// the history too, and the limit
+	Fixture h(10, 2, 100);
+	h.Feed("ab\r\nab\r\nab\r\nab");
+	CHECK_EQUAL(FindAllText(h, "b", true, false, false),
+		"1,-2-2,-2 1,-1-2,-1 1,0-2,0 1,1-2,1");
+	std::vector<std::pair<TermPoint, TermPoint> > matches;
+	CHECK(h.terminal.FindAll("b", true, false, false, matches, 3));
+	CHECK(matches.size() == 3);
+	// wide characters end two cells on
+	Fixture u(10, 2, 100);
+	u.Feed("a\xe4\xb8\xad\xe6\x96\x87" "b");
+	CHECK_EQUAL(FindAllText(u, "\xe4\xb8\xad\xe6\x96\x87", true, false,
+		false), "1,0-5,0");
+}
+
+
+/*!	A test decoder: "IMG:<width>x<height>" as opaque red pixels. */
+static bool
+DecodeTestImage(const uint8* data, size_t length, int32& width,
+	int32& height, std::vector<uint8>& rgba)
+{
+	std::string text((const char*)data, length);
+	if (text.compare(0, 4, "IMG:") != 0
+		|| sscanf(text.c_str() + 4, "%dx%d", &width, &height) != 2)
+		return false;
+	rgba.assign((size_t)width * height * 4, 0);
+	for (size_t i = 0; i < rgba.size(); i += 4) {
+		rgba[i] = 255;
+		rgba[i + 3] = 255;
+	}
+	return true;
+}
+
+
+static std::string
+ITerm2File(const std::string& arguments, const std::string& contents)
+{
+	std::string encoded;
+	base64_encode(contents.data(), contents.size(), encoded);
+	return "\x1b]1337;File=" + arguments + ":" + encoded + "\x07";
+}
+
+
+static void
+TestITerm2()
+{
+	TerminalGraphics::SetCodecs(DecodeTestImage, InflateWithZlib);
+
+	// an image of 25x30 pixels at its own size: 3 by 2 cells of 10x20,
+	// the text under it cleared, the cursor after it on its last row
+	{
+		Fixture f(20, 10, 100);
+		f.Feed("0123456789\r\n0123456789\r\n0123456789\x1b[2;3H");
+		f.Feed(ITerm2File("inline=1;size=10", "IMG:25x30"));
+		CHECK(f.terminal.Graphics()->HasPlacements());
+		std::vector<ImageDraw> draws;
+		f.terminal.Graphics()->CollectDraws(0, 10, draws);
+		CHECK(draws.size() == 1);
+		CHECK(draws[0].x == 20 && draws[0].y == 20);
+		CHECK(draws[0].width == 25 && draws[0].height == 30);
+		CHECK_EQUAL(f.Row(1), "01   56789");
+		CHECK_EQUAL(f.Row(2), "01   56789");
+		CHECK(f.Cursor() == TermPoint(5, 2));
+		f.Feed("\r\nnext");
+		CHECK_EQUAL(f.Row(3), "next");
+	}
+	// sizes in cells, pixels and percent; points are scaled
+	{
+		Fixture f(20, 10, 100);
+		f.Feed(ITerm2File("inline=1;width=50%", "IMG:25x30"));
+		std::vector<ImageDraw> draws;
+		f.terminal.Graphics()->CollectDraws(0, 10, draws);
+		CHECK(draws.size() == 1);
+		CHECK(draws[0].width == 100 && draws[0].height == 120);
+		CHECK(f.Cursor() == TermPoint(10, 5));
+	}
+	{
+		Fixture f(20, 10, 100);
+		f.terminal.SetPixelScale(2);
+		f.Feed(ITerm2File("inline=1;width=4;height=20px;"
+			"preserveAspectRatio=0", "IMG:25x30"));
+		std::vector<ImageDraw> draws;
+		f.terminal.Graphics()->CollectDraws(0, 10, draws);
+		CHECK(draws.size() == 1);
+		CHECK(draws[0].width == 40 && draws[0].height == 40);
+		CHECK(f.Cursor() == TermPoint(4, 1));
+		// auto at scale 2: twice the pixels; no wider than the screen
+		f.Feed("\r\n");
+		f.Feed(ITerm2File("inline=1", "IMG:150x10"));
+		draws.clear();
+		f.terminal.Graphics()->CollectDraws(0, 10, draws);
+		CHECK(draws.size() == 2);
+		CHECK(draws[1].width == 200 && draws[1].height == 13);
+		// at the right margin the cursor waits to wrap
+		CHECK(f.Cursor() == TermPoint(19, 2));
+		f.Feed("x");
+		CHECK(f.Cursor() == TermPoint(1, 3));
+	}
+	// doNotMoveCursor, line breaks in the base64, images that scroll
+	{
+		Fixture f(20, 4, 100);
+		f.Feed("\x1b[4;1H");
+		std::string encoded;
+		base64_encode("IMG:10x50", 9, encoded);
+		encoded.insert(4, "\r\n");
+		f.Feed("\x1b]1337;File=inline=1;doNotMoveCursor=1:" + encoded
+			+ "\x1b\\");
+		CHECK(f.terminal.Graphics()->HasPlacements());
+		// three rows: two scrolled up to make room, the cursor stays at
+		// the image
+		CHECK(f.Cursor() == TermPoint(0, 1));
+		CHECK(f.terminal.HistorySize() == 2);
+	}
+	// downloads, and files in pieces
+	{
+		Fixture f(20, 4, 100);
+		std::string name;
+		base64_encode("notes.txt", 9, name);
+		f.Feed(ITerm2File("name=" + name + ";size=5", "hello"));
+		CHECK_EQUAL(f.recorder.downloadName, "notes.txt");
+		CHECK_EQUAL(f.recorder.downloadData, "hello");
+		CHECK(!f.terminal.Graphics()->HasPlacements());
+
+		std::string encoded;
+		base64_encode("IMG:10x20", 9, encoded);
+		f.Feed("\x1b]1337;MultipartFile=inline=1\x07");
+		f.Feed("\x1b]1337;FilePart=" + encoded.substr(0, 5) + "\x07");
+		f.Feed("\x1b]1337;FilePart=" + encoded.substr(5) + "\x07");
+		CHECK(!f.terminal.Graphics()->HasPlacements());
+		f.Feed("\x1b]1337;FileEnd\x07");
+		CHECK(f.terminal.Graphics()->HasPlacements());
+		CHECK(f.Cursor() == TermPoint(1, 0));
+	}
+	// an image larger than the usual OSC limit
+	{
+		Fixture f(20, 4, 100);
+		std::string contents = "IMG:10x20" + std::string(2 * 1024 * 1024, ' ');
+		f.Feed(ITerm2File("inline=1", contents));
+		CHECK(f.terminal.Graphics()->HasPlacements());
+	}
+	// the cell size, marks, attention, the clipboard, variables
+	{
+		Fixture f(20, 4, 100);
+		f.terminal.SetPixelScale(2);
+		f.Feed("\x1b]1337;ReportCellSize\x07");
+		CHECK_EQUAL(f.Reply(),
+			"\x1b]1337;ReportCellSize=10.00;5.00;2.00\x1b\\");
+		f.Feed("\x1b]1337;SetMark\x07\x1b]1337;RequestAttention=yes\x07");
+		CHECK_EQUAL(f.recorder.marks, "M");
+		CHECK((f.terminal.LineFlags(0) & LINE_PROMPT) != 0);
+		CHECK_EQUAL(f.recorder.attention, "yes");
+		f.Feed("\x1b]1337;Copy=:aGk=\x07");
+		CHECK_EQUAL(f.recorder.clipboard, "hi");
+		f.Feed("\x1b]1337;SetUserVar=foo=YmFy\x07"
+			"\x1b]1337;ReportVariable=dXNlci5mb28=\x07");
+		CHECK_EQUAL(f.Reply(), "\x1b]1337;ReportVariable=YmFy\x1b\\");
+		f.Feed("\x1b]1337;CurrentDir=/boot/home\x07");
+		CHECK_EQUAL(f.recorder.directory, "file:///boot/home");
+	}
+	// shell integration marks reach the listener
+	{
+		Fixture f(20, 4, 100);
+		f.Feed("\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07out"
+			"\r\n\x1b]133;D;3\x07\x1b]133;A;k=s\x07");
+		CHECK_EQUAL(f.recorder.marks, "ACD");
+		CHECK(f.recorder.lastStatus == 3);
+		CHECK_EQUAL(f.recorder.lastCommand, "ls");
+		// a command over two lines, scrolled into the history
+		f.Feed("\x1b]133;A\x07$ \x1b]133;B\x07make all"
+			"\r\n> install\r\n\r\n\r\n\x1b]133;C\x07");
+		CHECK_EQUAL(f.recorder.lastCommand, "make all > install");
+	}
+
+	TerminalGraphics::SetCodecs(NULL, InflateWithZlib);
+}
+
+
 int
 main()
 {
@@ -1573,6 +1818,8 @@ main()
 	TestFind();
 	TestLinks();
 	TestGraphics();
+	TestFindAll();
+	TestITerm2();
 
 	printf("%d checks, %d failed\n", sChecks, sFailures);
 	return sFailures == 0 ? 0 : 1;

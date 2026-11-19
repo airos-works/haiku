@@ -69,6 +69,8 @@
 #include <TranslatorFormats.h>
 #include <TranslatorRoster.h>
 #include <UTF8.h>
+#include <UnicodeChar.h>
+#include <StringForSize.h>
 
 #include <Accessible.h>
 #include <Window.h>
@@ -79,6 +81,7 @@
 #include "TermDragAndDrop.h"
 #include "TermFileTransfer.h"
 #include "Colors.h"
+#include "FindBar.h"
 #include "InlineInput.h"
 #include "PrefHandler.h"
 #include "Shell.h"
@@ -138,6 +141,8 @@ static const uint32 kRenderFrame = 'TRnd';
 static const uint32 kEventsPending = 'TEvt';
 static const uint32 kAnimate = 'TAni';
 static const uint32 kClipboardReadAnswer = 'TCra';
+static const uint32 kDownloadAnswer = 'TDla';
+static const uint32 kSearchUpdate = 'TSup';
 
 // at most this many frames a second
 static const bigtime_t kFrameInterval = 1000000 / 120;
@@ -185,7 +190,11 @@ enum {
 	EVENT_PROGRESS,
 	EVENT_REMOTE_CONTROL,
 	EVENT_DRAG_AND_DROP,
-	EVENT_FILE_TRANSFER
+	EVENT_FILE_TRANSFER,
+	EVENT_SHELL_MARK,
+	EVENT_ATTENTION,
+	EVENT_STEAL_FOCUS,
+	EVENT_DOWNLOAD
 };
 
 
@@ -660,6 +669,21 @@ TermView::_InitObject(const ShellParameters& shellParameters)
 	fModifiers = 0;
 	fMouseClipboard = be_clipboard;
 	fNotificationCounter = 0;
+	fDimmed = false;
+	fFindBar = NULL;
+	fCurrentMatch = -1;
+	fSearchMatchCase = false;
+	fSearchWholeWords = false;
+	fSearchRegularExpression = false;
+	fSearchValid = true;
+	fSearchPending = false;
+	fSearchGeneration = 0;
+	fLastSearchTime = 0;
+	fSearchCost = 0;
+	fAlertOnNextMark = false;
+	fLastBellNotification = 0;
+	fCommandStart = 0;
+	fDownloadCounter = 0;
 	fDefaultState = new(std::nothrow) DefaultState(this);
 	fSelectState = new(std::nothrow) SelectState(this);
 	fHyperLinkState = new(std::nothrow) HyperLinkState(this);
@@ -1669,6 +1693,7 @@ TermView::_UpdateMetrics()
 	const RenderMetrics& metrics = fGlyphs.Metrics();
 	fTerminal->Lock();
 	fTerminal->SetCellSize(metrics.cellWidth, metrics.cellHeight);
+	fTerminal->SetPixelScale(fScale);
 	fTerminal->Unlock();
 
 	fBuilder.Invalidate();
@@ -1880,7 +1905,15 @@ TermView::_PostEvent(Event* event)
 		BMessage message(kEventsPending);
 		if (BMessenger(this).SendMessage(&message, (BHandler*)NULL, 0)
 				!= B_OK) {
-			fEventsPosted = false;
+			// detached, in a tab that is not shown: the window passes
+			// them on (notifications must not wait for the tab)
+			BMessage windowMessage(MSG_TERM_VIEW_EVENTS);
+			windowMessage.AddPointer("view", this);
+			if (!fWindowMessenger.IsValid()
+				|| fWindowMessenger.SendMessage(&windowMessage,
+					(BHandler*)NULL, 0) != B_OK) {
+				fEventsPosted = false;
+			}
 		}
 	}
 }
@@ -2079,6 +2112,51 @@ TermView::TerminalProgressChanged(int32 state, int32 percent)
 }
 
 
+void
+TermView::TerminalShellMark(char mark, int32 status, const char* command)
+{
+	Event* event = new(std::nothrow) Event(EVENT_SHELL_MARK);
+	if (event != NULL) {
+		event->value1 = mark;
+		event->value2 = status;
+		event->text = command;
+		_PostEvent(event);
+	}
+}
+
+
+void
+TermView::TerminalRequestAttention(const char* value)
+{
+	Event* event = new(std::nothrow) Event(EVENT_ATTENTION);
+	if (event != NULL) {
+		event->text = value;
+		_PostEvent(event);
+	}
+}
+
+
+void
+TermView::TerminalStealFocus()
+{
+	Event* event = new(std::nothrow) Event(EVENT_STEAL_FOCUS);
+	if (event != NULL)
+		_PostEvent(event);
+}
+
+
+void
+TermView::TerminalDownload(const char* name, const std::string& data)
+{
+	Event* event = new(std::nothrow) Event(EVENT_DOWNLOAD);
+	if (event != NULL) {
+		event->text = name;
+		event->data = data;
+		_PostEvent(event);
+	}
+}
+
+
 // #pragma mark - events from the terminal (window thread)
 
 
@@ -2108,8 +2186,33 @@ TermView::_HandleEvents()
 	fEventsPosted = false;
 	fTerminal->Unlock();
 
+	// In a tab that is not shown (detached), only what does not need the
+	// view on screen is handled now; the rest waits for the tab.
+	bool attached = Window() != NULL;
+	std::vector<Event*> deferred;
+
 	for (size_t i = 0; i < events.size(); i++) {
 		Event* event = events[i];
+		if (!attached) {
+			switch (event->type) {
+				case EVENT_TITLE:
+				case EVENT_BELL:
+				case EVENT_SET_CLIPBOARD:
+				case EVENT_CLIPBOARD_WRITE:
+				case EVENT_NOTIFY:
+				case EVENT_CLOSE_NOTIFICATION:
+				case EVENT_PROGRESS:
+				case EVENT_SHELL_MARK:
+				case EVENT_ATTENTION:
+				case EVENT_STEAL_FOCUS:
+				case EVENT_WORKING_DIRECTORY:
+				case EVENT_COLORS:
+					break;
+				default:
+					deferred.push_back(event);
+					continue;
+			}
+		}
 		switch (event->type) {
 			case EVENT_TITLE:
 				if (fListener != NULL)
@@ -2117,7 +2220,65 @@ TermView::_HandleEvents()
 				break;
 
 			case EVENT_BELL:
+			{
 				beep();
+				// unseen: as a notification, at most every few seconds
+				bigtime_t now = system_time();
+				if (!_IsSeen() && PrefHandler::Default() != NULL
+					&& PrefHandler::Default()->getBool(PREF_NOTIFY_ON_BELL)
+					&& now - fLastBellNotification > 5000000) {
+					fLastBellNotification = now;
+					BString title;
+					if (fListener != NULL)
+						fListener->GetTermViewTitle(this, title);
+					_Notify(title, B_TRANSLATE("The bell rang."), false);
+				}
+				break;
+			}
+
+			case EVENT_SHELL_MARK:
+				_ShellMark((char)event->value1, event->value2,
+					event->text.c_str());
+				break;
+
+			case EVENT_ATTENTION:
+			{
+				// iTerm2's RequestAttention: a notification until it is
+				// looked at, or taken back with "no"
+				TermNotification notification;
+				notification.identifier = "airos-attention";
+				if (event->text == "no") {
+					BString identifier;
+					identifier.SetToFormat("terminal-%p-%s", this,
+						notification.identifier.c_str());
+					BNotification message(B_INFORMATION_NOTIFICATION);
+					message.SetGroup(B_TRANSLATE_SYSTEM_NAME("Terminal"));
+					message.SetMessageID(identifier);
+					message.Send(1);
+					break;
+				}
+				if (_IsSeen())
+					break;
+				BString title;
+				if (fListener != NULL)
+					fListener->GetTermViewTitle(this, title);
+				notification.title = title.String();
+				notification.body = B_TRANSLATE("A program needs your "
+					"attention.");
+				notification.urgency = 2;
+				if (event->text == "yes")
+					notification.timeout = 0;
+				_SendNotification(notification);
+				break;
+			}
+
+			case EVENT_STEAL_FOCUS:
+				if (fListener != NULL)
+					fListener->ShowTermView(this);
+				break;
+
+			case EVENT_DOWNLOAD:
+				_AskDownload(event->text, event->data);
 				break;
 
 			case EVENT_SET_CLIPBOARD:
@@ -2178,87 +2339,8 @@ TermView::_HandleEvents()
 			}
 
 			case EVENT_NOTIFY:
-			{
-				const TermNotification& notification = event->notification;
-				notification_type type = notification.urgency >= 2
-					? B_IMPORTANT_NOTIFICATION : B_INFORMATION_NOTIFICATION;
-				BNotification message(type);
-				message.SetGroup(B_TRANSLATE_SYSTEM_NAME("Terminal"));
-				message.SetTitle(notification.title.c_str());
-				message.SetContent(notification.body.c_str());
-				BString identifier;
-				if (!notification.identifier.empty()) {
-					identifier.SetToFormat("terminal-%p-%s", this,
-						notification.identifier.c_str());
-					message.SetMessageID(identifier);
-				}
-
-				BBitmap* icon = _NotificationIcon(notification);
-				if (icon != NULL) {
-					message.SetIcon(icon);
-					delete icon;
-				}
-
-				// A click starts Terminal, which passes it on to this view
-				// (see TermApp::ArgvReceived()).
-				if (notification.focusOnActivation
-					|| notification.reportActivation) {
-					message.SetOnClickApp(TERM_SIGNATURE);
-					message.AddOnClickArg(NOTIFICATION_ACTIVATED_ARGUMENT);
-					BString argument;
-					argument.SetToFormat("%" B_PRId32, be_app->Team());
-					message.AddOnClickArg(argument);
-					argument.SetToFormat("%p", this);
-					message.AddOnClickArg(argument);
-					message.AddOnClickArg(notification.identifier.empty()
-						? "0" : notification.identifier.c_str());
-					argument.SetToFormat("%d",
-						(notification.focusOnActivation ? 1 : 0)
-							| (notification.reportActivation ? 2 : 0));
-					message.AddOnClickArg(argument);
-				}
-
-				// w: milliseconds; 0 is "never", a day here
-				bigtime_t timeout = -1;
-				if (notification.timeout > 0)
-					timeout = (bigtime_t)notification.timeout * 1000;
-				else if (notification.timeout == 0)
-					timeout = 24LL * 3600 * 1000000;
-
-				// Sent as BNotification::Send() does, with the fields air/OS's
-				// notification_server answers: clicks and buttons, and the
-				// notification going away (see its NotificationView).
-				BMessage request(kNotificationMessage);
-				if (message.Archive(&request) != B_OK)
-					break;
-				if (timeout > 0)
-					request.AddInt64("timeout", timeout);
-				BString view;
-				view.SetToFormat("%p", this);
-				const char* id = notification.identifier.empty() ? "0"
-					: notification.identifier.c_str();
-				request.AddMessenger("_reply:target", BMessenger(Window()));
-				if (notification.focusOnActivation
-					|| notification.reportActivation) {
-					BMessage activated(MSG_NOTIFICATION_ACTIVATED);
-					activated.AddString("view", view);
-					activated.AddString("id", id);
-					activated.AddInt32("actions",
-						(notification.focusOnActivation ? 1 : 0)
-							| (notification.reportActivation ? 2 : 0));
-					request.AddMessage("_reply:activated", &activated);
-				}
-				if (notification.reportClose) {
-					BMessage closed(MSG_NOTIFICATION_CLOSED);
-					closed.AddString("view", view);
-					closed.AddString("id", id);
-					request.AddMessage("_reply:closed", &closed);
-				}
-				for (size_t i = 0; i < notification.buttons.size(); i++)
-					request.AddString("_buttons", notification.buttons[i].c_str());
-				BMessenger(kNotificationServerSignature).SendMessage(&request);
+				_SendNotification(event->notification);
 				break;
-			}
 
 			case EVENT_DRAG_AND_DROP:
 				if (fDragAndDrop != NULL)
@@ -2328,6 +2410,311 @@ TermView::_HandleEvents()
 		}
 		delete event;
 	}
+
+	if (!deferred.empty()) {
+		fTerminal->Lock();
+		fEvents.insert(fEvents.begin(), deferred.begin(), deferred.end());
+		fTerminal->Unlock();
+	}
+}
+
+
+void
+TermView::HandleDetachedEvents()
+{
+	_HandleEvents();
+}
+
+
+bool
+TermView::_IsSeen() const
+{
+	return Window() != NULL && Window()->IsActive()
+		&& !Window()->IsMinimized();
+}
+
+
+//!	A notification of Terminal's own; a click shows this terminal.
+void
+TermView::_Notify(const char* title, const char* body, bool important)
+{
+	TermNotification notification;
+	notification.title = title != NULL && title[0] != '\0'
+		? title : B_TRANSLATE_SYSTEM_NAME("Terminal");
+	notification.body = body;
+	notification.urgency = important ? 2 : 1;
+	notification.focusOnActivation = true;
+	_SendNotification(notification);
+}
+
+
+static BString
+duration_string(bigtime_t duration)
+{
+	int64 seconds = duration / 1000000;
+	BString text;
+	if (seconds < 60)
+		text.SetToFormat(B_TRANSLATE("%" B_PRId64 " s"), seconds);
+	else if (seconds < 3600) {
+		text.SetToFormat(B_TRANSLATE("%" B_PRId64 " min %" B_PRId64 " s"),
+			seconds / 60, seconds % 60);
+	} else {
+		text.SetToFormat(B_TRANSLATE("%" B_PRId64 " h %" B_PRId64 " min"),
+			seconds / 3600, (seconds / 60) % 60);
+	}
+	return text;
+}
+
+
+/*!	Shell integration marks (OSC 133) and iTerm2's SetMark: a command that
+	ran long finished while nobody looked, or the user asked to hear about
+	the next mark.
+*/
+void
+TermView::_ShellMark(char mark, int32 status, const char* command)
+{
+	if (mark == 'C') {
+		fCommandStart = system_time();
+		fCommandText = command;
+		return;
+	}
+
+	bool finished = fCommandStart != 0 && (mark == 'D' || mark == 'A');
+	bigtime_t duration = finished ? system_time() - fCommandStart : 0;
+	if (finished)
+		fCommandStart = 0;
+	if (!finished && !fAlertOnNextMark)
+		return;
+
+	BString title;
+	if (fListener != NULL)
+		fListener->GetTermViewTitle(this, title);
+
+	BString body;
+	if (finished) {
+		BString name = fCommandText.IsEmpty()
+			? BString(B_TRANSLATE("The command"))
+			: BString("\xe2\x80\x9c") << fCommandText << "\xe2\x80\x9d";
+		if (status > 0) {
+			body.SetToFormat(B_TRANSLATE("%s failed (exit status %"
+				B_PRId32 ") after %s."), name.String(), status,
+				duration_string(duration).String());
+		} else {
+			body.SetToFormat(B_TRANSLATE("%s finished after %s."),
+				name.String(), duration_string(duration).String());
+		}
+	} else
+		body = B_TRANSLATE("A mark was set.");
+
+	if (fAlertOnNextMark) {
+		// asked for: always
+		fAlertOnNextMark = false;
+		_Notify(title, body, false);
+		return;
+	}
+
+	int32 seconds = PrefHandler::Default() != NULL
+		? PrefHandler::Default()->getInt32(PREF_NOTIFY_COMMAND_SECONDS) : 0;
+	if (seconds > 0 && duration >= (bigtime_t)seconds * 1000000
+		&& !_IsSeen()) {
+		_Notify(title, body, status > 0);
+	}
+}
+
+
+void
+TermView::SetAlertOnNextMark(bool alert)
+{
+	fAlertOnNextMark = alert;
+}
+
+
+/*!	iTerm2's File= without inline=1: a file the program offers. Saved to
+	the Downloads folder if the user wants it.
+*/
+void
+TermView::_AskDownload(const std::string& name, const std::string& data)
+{
+	int32 id = ++fDownloadCounter;
+	BString fileName = name.c_str();
+	int32 slash = fileName.FindLast('/');
+	if (slash >= 0)
+		fileName.Remove(0, slash + 1);
+	if (fileName.IsEmpty() || fileName == "." || fileName == "..")
+		fileName = B_TRANSLATE("Download");
+	fPendingDownloads[id] = std::make_pair(std::string(fileName.String()),
+		data);
+
+	char size[128];
+	BString text;
+	text.SetToFormat(B_TRANSLATE("A program running in Terminal wants to "
+		"save the file \"%s\" (%s) in your Downloads folder."),
+		fileName.String(), string_for_size(data.size(), size, sizeof(size)));
+	BAlert* alert = new BAlert(B_TRANSLATE("Download"), text,
+		B_TRANSLATE("Save"), B_TRANSLATE("Don't save"), NULL,
+		B_WIDTH_AS_USUAL, B_INFO_ALERT);
+	alert->SetShortcut(1, B_ESCAPE);
+	BMessage* answer = new BMessage(kDownloadAnswer);
+	answer->AddInt32("id", id);
+	alert->Go(new BInvoker(answer, this));
+}
+
+
+void
+TermView::_SaveDownload(int32 id)
+{
+	std::map<int32, std::pair<std::string, std::string> >::iterator found
+		= fPendingDownloads.find(id);
+	if (found == fPendingDownloads.end())
+		return;
+	std::string name = found->second.first;
+	std::string data;
+	data.swap(found->second.second);
+	fPendingDownloads.erase(found);
+
+	BPath path;
+	if (find_directory(B_USER_DIRECTORY, &path) != B_OK
+		|| path.Append("Downloads") != B_OK) {
+		return;
+	}
+	create_directory(path.Path(), 0755);
+
+	// a name that is not taken: "name 2.ext"
+	BString base = name.c_str();
+	BString extension;
+	int32 dot = base.FindLast('.');
+	if (dot > 0) {
+		base.CopyInto(extension, dot, base.Length() - dot);
+		base.Truncate(dot);
+	}
+	BPath target;
+	BEntry entry;
+	for (int32 i = 1; i < 1000; i++) {
+		BString candidate = base;
+		if (i > 1)
+			candidate << " " << i;
+		candidate << extension;
+		target = path;
+		target.Append(candidate);
+		entry.SetTo(target.Path());
+		if (!entry.Exists())
+			break;
+	}
+
+	BFile file(target.Path(), B_WRITE_ONLY | B_CREATE_FILE | B_FAIL_IF_EXISTS);
+	status_t status = file.InitCheck();
+	if (status == B_OK) {
+		ssize_t written = file.Write(data.data(), data.size());
+		if (written != (ssize_t)data.size())
+			status = written < 0 ? written : B_IO_ERROR;
+	}
+	file.Unset();
+
+	BNotification notification(status == B_OK ? B_INFORMATION_NOTIFICATION
+		: B_ERROR_NOTIFICATION);
+	notification.SetGroup(B_TRANSLATE_SYSTEM_NAME("Terminal"));
+	BString text;
+	if (status == B_OK) {
+		update_mime_info(target.Path(), false, true, false);
+		notification.SetTitle(B_TRANSLATE("Download saved"));
+		text.SetToFormat(B_TRANSLATE("\"%s\" is in your Downloads folder."),
+			target.Leaf());
+		entry_ref ref;
+		if (get_ref_for_path(target.Path(), &ref) == B_OK)
+			notification.SetOnClickFile(&ref);
+	} else {
+		BEntry(target.Path()).Remove();
+		notification.SetTitle(B_TRANSLATE("Download failed"));
+		text.SetToFormat(B_TRANSLATE("\"%s\" could not be saved: %s"),
+			target.Leaf(), strerror(status));
+	}
+	notification.SetContent(text);
+	notification.Send();
+}
+
+
+/*!	A notification through the notification server, as BNotification::Send()
+	sends it, with the fields air/OS's notification_server answers: clicks
+	and buttons, and the notification going away.
+*/
+void
+TermView::_SendNotification(const TermNotification& notification)
+{
+	notification_type type = notification.urgency >= 2
+		? B_IMPORTANT_NOTIFICATION : B_INFORMATION_NOTIFICATION;
+	BNotification message(type);
+	message.SetGroup(B_TRANSLATE_SYSTEM_NAME("Terminal"));
+	message.SetTitle(notification.title.c_str());
+	message.SetContent(notification.body.c_str());
+	BString identifier;
+	if (!notification.identifier.empty()) {
+		identifier.SetToFormat("terminal-%p-%s", this,
+			notification.identifier.c_str());
+		message.SetMessageID(identifier);
+	}
+
+	BBitmap* icon = _NotificationIcon(notification);
+	if (icon != NULL) {
+		message.SetIcon(icon);
+		delete icon;
+	}
+
+	// A click starts Terminal, which passes it on to this view
+	// (see TermApp::ArgvReceived()).
+	if (notification.focusOnActivation
+		|| notification.reportActivation) {
+		message.SetOnClickApp(TERM_SIGNATURE);
+		message.AddOnClickArg(NOTIFICATION_ACTIVATED_ARGUMENT);
+		BString argument;
+		argument.SetToFormat("%" B_PRId32, be_app->Team());
+		message.AddOnClickArg(argument);
+		argument.SetToFormat("%p", this);
+		message.AddOnClickArg(argument);
+		message.AddOnClickArg(notification.identifier.empty()
+			? "0" : notification.identifier.c_str());
+		argument.SetToFormat("%d",
+			(notification.focusOnActivation ? 1 : 0)
+				| (notification.reportActivation ? 2 : 0));
+		message.AddOnClickArg(argument);
+	}
+
+	// w: milliseconds; 0 is "never", a day here
+	bigtime_t timeout = -1;
+	if (notification.timeout > 0)
+		timeout = (bigtime_t)notification.timeout * 1000;
+	else if (notification.timeout == 0)
+		timeout = 24LL * 3600 * 1000000;
+
+	// see notification_server's NotificationView
+	BMessage request(kNotificationMessage);
+	if (message.Archive(&request) != B_OK)
+		return;
+	if (timeout > 0)
+		request.AddInt64("timeout", timeout);
+	BString view;
+	view.SetToFormat("%p", this);
+	const char* id = notification.identifier.empty() ? "0"
+		: notification.identifier.c_str();
+	request.AddMessenger("_reply:target", fWindowMessenger);
+	if (notification.focusOnActivation
+		|| notification.reportActivation) {
+		BMessage activated(MSG_NOTIFICATION_ACTIVATED);
+		activated.AddString("view", view);
+		activated.AddString("id", id);
+		activated.AddInt32("actions",
+			(notification.focusOnActivation ? 1 : 0)
+				| (notification.reportActivation ? 2 : 0));
+		request.AddMessage("_reply:activated", &activated);
+	}
+	if (notification.reportClose) {
+		BMessage closed(MSG_NOTIFICATION_CLOSED);
+		closed.AddString("view", view);
+		closed.AddString("id", id);
+		request.AddMessage("_reply:closed", &closed);
+	}
+	for (size_t i = 0; i < notification.buttons.size(); i++)
+		request.AddString("_buttons", notification.buttons[i].c_str());
+	BMessenger(kNotificationServerSignature).SendMessage(&request);
 }
 
 
@@ -2492,6 +2879,10 @@ TermView::_RenderFrame()
 					if (fSelection.start.y < -historySize)
 						fSelection.start = fSelection.end = TermPoint(0, 0);
 				}
+				for (size_t i = 0; i < fMatches.size(); i++) {
+					fMatches[i].first.y -= delta;
+					fMatches[i].second.y -= delta;
+				}
 			}
 			fLinesScrolled = linesScrolled;
 		}
@@ -2509,6 +2900,7 @@ TermView::_RenderFrame()
 			: rgb_value(fCursorBackColor);
 		state.cursorTextColor = cursorText != kColorUnset ? cursorText
 			: rgb_value(fCursorForeColor);
+		_AddSearchHighlights(state, false);
 		if (!fSelection.IsEmpty()) {
 			FrameHighlight highlight;
 			highlight.start = fSelection.start;
@@ -2523,6 +2915,7 @@ TermView::_RenderFrame()
 			highlight.underline = false;
 			state.highlights.push_back(highlight);
 		}
+		_AddSearchHighlights(state, true);
 		bool hoverLinkGone = false;
 		if (fHoverLink && fActiveState == fDefaultState
 			&& fTerminal->ContentGeneration() != fHoverGeneration) {
@@ -2559,7 +2952,17 @@ TermView::_RenderFrame()
 
 		TerminalGraphics* graphics = fTerminal->Graphics();
 		bool animating = graphics != NULL && graphics->HasAnimations();
+		bool searchStale = fFindBar != NULL && !fSearchText.IsEmpty()
+			&& fTerminal->ContentGeneration() != fSearchGeneration;
 		fTerminal->Unlock();
+
+		if (searchStale && !fSearchPending) {
+			// the text changed: find again, soon, but not on every frame
+			fSearchPending = true;
+			BMessage message(kSearchUpdate);
+			BMessageRunner::StartSending(BMessenger(this), &message,
+				std::max((bigtime_t)250000, 4 * fSearchCost), 1);
+		}
 
 		if (hoverLinkGone) {
 			// no link under the pointer any more: its pointer goes, too
@@ -2723,6 +3126,17 @@ TermView::Draw(BRect updateRect)
 	} else {
 		SetHighColor(fTextBackColor);
 		FillRect(updateRect);
+	}
+
+	if (fDimmed) {
+		// an inactive pane: veiled in its background color
+		rgb_color veil = fTextBackColor;
+		veil.alpha = 110;
+		SetDrawingMode(B_OP_ALPHA);
+		SetBlendingMode(B_CONSTANT_ALPHA, B_ALPHA_OVERLAY);
+		SetHighColor(veil);
+		FillRect(updateRect);
+		SetDrawingMode(B_OP_COPY);
 	}
 
 	if (fInline && fInline->IsActive())
@@ -3293,13 +3707,19 @@ TermView::AttachedToWindow()
 	// was detached from the window. On such conditions FrameResized was not
 	// called when the resize occured
 	SetTermSize(Bounds(), true);
-	MakeFocus(true);
+	// in a split tab, only the active pane takes the focus
+	if (fListener == NULL || fListener->IsActiveTermView(this))
+		MakeFocus(true);
 	if (fScrollBar) {
 		fScrollBar->SetSteps(fFontHeight, fFontHeight * fRows);
 		_UpdateScrollBarRange();
 	}
 
 	BMessenger thisMessenger(this);
+
+	fTerminal->Lock();
+	fWindowMessenger = BMessenger(Window());
+	fTerminal->Unlock();
 
 	BMessage message(kUpdateSigWinch);
 	fWinchRunner = new (std::nothrow) BMessageRunner(thisMessenger,
@@ -3376,7 +3796,10 @@ TermView::WindowActivated(bool active)
 void
 TermView::MakeFocus(bool focusState)
 {
+	bool wasFocus = IsFocus();
 	BView::MakeFocus(focusState);
+	if (focusState && !wasFocus && fListener != NULL && Window() != NULL)
+		fListener->TermViewFocused(this);
 
 	if (focusState && Window() && Window()->IsActive()) {
 		if (!fActive)
@@ -4063,6 +4486,254 @@ TermView::Clear()
 }
 
 
+// #pragma mark - the search bar
+
+
+void
+TermView::SetDimmed(bool dimmed)
+{
+	if (dimmed == fDimmed)
+		return;
+	fDimmed = dimmed;
+	Invalidate();
+}
+
+
+void
+TermView::ShowFindBar(const char* text)
+{
+	bool created = false;
+	if (fFindBar == NULL) {
+		fFindBar = new(std::nothrow) FindBar(this);
+		if (fFindBar == NULL)
+			return;
+		AddChild(fFindBar);
+		created = true;
+		if (text == NULL && !fSearchText.IsEmpty())
+			fFindBar->SetText(fSearchText);
+	}
+	if (text != NULL)
+		fFindBar->SetText(text);
+	fFindBar->FocusField();
+	if (created || text != NULL)
+		_SearchChanged();
+}
+
+
+void
+TermView::HideFindBar()
+{
+	if (fFindBar == NULL)
+		return;
+	bool hadFocus = fFindBar->HasFocus();
+	RemoveChild(fFindBar);
+	delete fFindBar;
+	fFindBar = NULL;
+	fMatches.clear();
+	fCurrentMatch = -1;
+	if (hadFocus || Window() == NULL || Window()->CurrentFocus() == NULL)
+		MakeFocus(true);
+	_ScheduleFrame();
+}
+
+
+void
+TermView::FindAgain(bool up)
+{
+	if (fFindBar == NULL) {
+		if (fSearchText.IsEmpty()) {
+			ShowFindBar();
+			return;
+		}
+		ShowFindBar();
+	}
+	if (fMatches.empty())
+		return;
+
+	int32 count = fMatches.size();
+	int32 index = fCurrentMatch;
+	if (index < 0)
+		index = up ? count - 1 : 0;
+	else if (up)
+		index = index == 0 ? count - 1 : index - 1;
+	else
+		index = index == count - 1 ? 0 : index + 1;
+	_GoToMatch(index);
+	_UpdateFindStatus();
+}
+
+
+//!	The text or the options in the bar changed: find from scratch.
+void
+TermView::_SearchChanged()
+{
+	if (fFindBar == NULL)
+		return;
+	fSearchText = fFindBar->Text();
+	fSearchWholeWords = fFindBar->IsWholeWords();
+	fSearchRegularExpression = fFindBar->IsRegularExpression();
+	switch (fFindBar->CaseMode()) {
+		case FIND_MATCH_CASE:
+			fSearchMatchCase = true;
+			break;
+		case FIND_IGNORE_CASE:
+			fSearchMatchCase = false;
+			break;
+		default:
+		{
+			// smart: a capital letter asks for the case
+			fSearchMatchCase = false;
+			const char* text = fSearchText.String();
+			while (*text != '\0') {
+				uint32 c = BUnicodeChar::FromUTF8(&text);
+				if (BUnicodeChar::IsUpper(c)) {
+					fSearchMatchCase = true;
+					break;
+				}
+			}
+			break;
+		}
+	}
+	_RunSearch(false);
+}
+
+
+/*!	Finds all matches. With \a keepCurrent (the text changed under the
+	bar), the current match stays where it was; otherwise it is the one
+	nearest the bottom of the view, going up, as in iTerm2.
+*/
+void
+TermView::_RunSearch(bool keepCurrent)
+{
+	TermPoint previous;
+	bool hadCurrent = keepCurrent && fCurrentMatch >= 0
+		&& fCurrentMatch < (int32)fMatches.size();
+	if (hadCurrent)
+		previous = fMatches[fCurrentMatch].first;
+
+	fMatches.clear();
+	fCurrentMatch = -1;
+	fSearchValid = true;
+
+	bigtime_t start = system_time();
+	fTerminal->Lock();
+	if (!fSearchText.IsEmpty()) {
+		fSearchValid = fTerminal->FindAll(fSearchText.String(),
+			fSearchMatchCase, fSearchWholeWords, fSearchRegularExpression,
+			fMatches);
+	}
+	fSearchGeneration = fTerminal->ContentGeneration();
+	int32 bottom = _FirstRow() + fRows - 1;
+	fTerminal->Unlock();
+	fLastSearchTime = system_time();
+	fSearchCost = fLastSearchTime - start;
+
+	if (!fMatches.empty()) {
+		if (hadCurrent) {
+			// the same match, or the next one after where it was
+			std::vector<std::pair<TermPoint, TermPoint> >::iterator found
+				= std::lower_bound(fMatches.begin(), fMatches.end(),
+					std::make_pair(previous, TermPoint(INT32_MIN, INT32_MIN)));
+			fCurrentMatch = std::min((int32)(found - fMatches.begin()),
+				(int32)fMatches.size() - 1);
+		} else {
+			fCurrentMatch = 0;
+			for (int32 i = fMatches.size() - 1; i >= 0; i--) {
+				if (fMatches[i].first.y <= bottom) {
+					fCurrentMatch = i;
+					break;
+				}
+			}
+		}
+	}
+
+	if (!keepCurrent && fCurrentMatch >= 0)
+		_GoToMatch(fCurrentMatch);
+	_UpdateFindStatus();
+	_ScheduleFrame();
+}
+
+
+void
+TermView::_GoToMatch(int32 index)
+{
+	if (index < 0 || index >= (int32)fMatches.size())
+		return;
+	fCurrentMatch = index;
+	// selected, so it can be copied
+	_Select(fMatches[index].first, fMatches[index].second, false, true);
+	_ScrollToRange(fMatches[index].first, fMatches[index].second);
+	_ScheduleFrame();
+}
+
+
+void
+TermView::_UpdateFindStatus()
+{
+	if (fFindBar == NULL)
+		return;
+	BString status;
+	bool error = false;
+	if (!fSearchValid) {
+		status = B_TRANSLATE("Not valid");
+		error = true;
+	} else if (fSearchText.IsEmpty())
+		status = "";
+	else if (fMatches.empty()) {
+		status = B_TRANSLATE("No matches");
+		error = true;
+	} else {
+		status.SetToFormat(B_TRANSLATE("%" B_PRId32 " of %" B_PRId32 "%s"),
+			fCurrentMatch + 1, (int32)fMatches.size(),
+			fMatches.size() >= 100000 ? "+" : "");
+	}
+	fFindBar->SetStatus(status, error);
+}
+
+
+/*!	The matches in view, in yellow; the current one (\a current) in orange,
+	over the selection.
+*/
+void
+TermView::_AddSearchHighlights(FrameState& state, bool current)
+{
+	if (fFindBar == NULL || fMatches.empty())
+		return;
+
+	FrameHighlight highlight;
+	highlight.useColors = true;
+	highlight.foreground = 0x000000;
+	highlight.underline = false;
+	if (current) {
+		if (fCurrentMatch < 0 || fCurrentMatch >= (int32)fMatches.size())
+			return;
+		highlight.start = fMatches[fCurrentMatch].first;
+		highlight.end = fMatches[fCurrentMatch].second;
+		highlight.background = 0xff9632;
+		if (highlight.end.y >= state.firstRow
+			&& highlight.start.y < state.firstRow + fRows) {
+			state.highlights.push_back(highlight);
+		}
+		return;
+	}
+
+	int32 first = state.firstRow;
+	int32 last = first + fRows - 1;
+	std::vector<std::pair<TermPoint, TermPoint> >::const_iterator it
+		= std::lower_bound(fMatches.begin(), fMatches.end(),
+			std::make_pair(TermPoint(0, first - 1),
+				TermPoint(INT32_MIN, INT32_MIN)));
+	highlight.background = 0xffe14d;
+	for (; it != fMatches.end() && it->first.y <= last; it++) {
+		if (it->second.y < first)
+			continue;
+		highlight.start = it->first;
+		highlight.end = it->second;
+		state.highlights.push_back(highlight);
+	}
+}
+
+
 // Find a string, and select it if found
 bool
 TermView::Find(const BString &str, bool forwardSearch, bool matchCase,
@@ -4514,6 +5185,32 @@ TermView::MessageReceived(BMessage *message)
 			}
 			break;
 		}
+		case kDownloadAnswer:
+		{
+			int32 id = message->GetInt32("id", 0);
+			if (message->GetInt32("which", 1) == 0)
+				_SaveDownload(id);
+			else
+				fPendingDownloads.erase(id);
+			break;
+		}
+
+		case MSG_FIND_BAR_CHANGED:
+			_SearchChanged();
+			break;
+		case MSG_FIND_BAR_UP:
+		case MSG_FIND_BAR_DOWN:
+			FindAgain(message->what == MSG_FIND_BAR_UP);
+			break;
+		case MSG_FIND_BAR_CLOSE:
+			HideFindBar();
+			break;
+		case kSearchUpdate:
+			fSearchPending = false;
+			if (fFindBar != NULL)
+				_RunSearch(true);
+			break;
+
 		case kClipboardReadAnswer:
 		{
 			// the user's answer to reading the clipboard (0 = allow)
@@ -5051,5 +5748,30 @@ TermView::Listener::PreviousTermView(TermView* view)
 
 void
 TermView::Listener::NextTermView(TermView* view)
+{
+}
+
+
+void
+TermView::Listener::TermViewFocused(TermView* view)
+{
+}
+
+
+bool
+TermView::Listener::IsActiveTermView(TermView* view)
+{
+	return true;
+}
+
+
+void
+TermView::Listener::ShowTermView(TermView* view)
+{
+}
+
+
+void
+TermView::Listener::GetTermViewTitle(TermView* view, BString& title)
 {
 }

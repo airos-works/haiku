@@ -86,6 +86,13 @@ struct TerminalGraphics::Placement {
 	uint32				parentPlacement;
 	int32				parentColumns;	// H
 	int32				parentRows;		// V
+	// iTerm2's inline images: drawn at this size (pixels) for this cell
+	// size, scaled with the cells
+	bool				inlineImage;
+	int32				inlineWidth;
+	int32				inlineHeight;
+	int32				inlineCellWidth;
+	int32				inlineCellHeight;
 };
 
 
@@ -684,6 +691,164 @@ TerminalGraphics::_Transmit(Command& command, const std::string& payload)
 }
 
 
+bool
+TerminalGraphics::PutInlineImage(const std::string& data,
+	const InlineImageSpec& spec)
+{
+	std::vector<uint8> pixels;
+	int32 width = 0;
+	int32 height = 0;
+	if (sDecodePNG == NULL || !sDecodePNG((const uint8*)data.data(),
+			data.size(), width, height, pixels)
+		|| width <= 0 || height <= 0 || width > kMaxImageSize
+		|| height > kMaxImageSize
+		|| pixels.size() != (size_t)width * height * 4) {
+		return false;
+	}
+
+	Terminal* terminal = fTerminal;
+	int32 cellWidth = std::max((int32)1, terminal->fCellWidth);
+	int32 cellHeight = std::max((int32)1, terminal->fCellHeight);
+	double scale = terminal->fPixelScale > 0 ? terminal->fPixelScale : 1;
+
+	// the size asked for, in device pixels; 0 is "auto"
+	struct Converter {
+		static double Convert(const InlineImageSize& size, int32 cell,
+			int32 cells, double scale)
+		{
+			switch (size.unit) {
+				case INLINE_SIZE_CELLS:
+					return size.value * cell;
+				case INLINE_SIZE_PIXELS:
+					return size.value * scale;
+				case INLINE_SIZE_PERCENT:
+					return size.value * cell * cells / 100.0;
+				default:
+					return 0;
+			}
+		}
+	};
+	double drawWidth = Converter::Convert(spec.width, cellWidth,
+		terminal->fColumns, scale);
+	double drawHeight = Converter::Convert(spec.height, cellHeight,
+		terminal->fRows, scale);
+	// an image's own size is in points, as on a Mac
+	double naturalWidth = width * scale;
+	double naturalHeight = height * scale;
+
+	if (drawWidth <= 0 && drawHeight <= 0) {
+		drawWidth = naturalWidth;
+		drawHeight = naturalHeight;
+	} else if (drawWidth <= 0) {
+		drawWidth = spec.preserveAspectRatio
+			? drawHeight * naturalWidth / naturalHeight : naturalWidth;
+	} else if (drawHeight <= 0) {
+		drawHeight = spec.preserveAspectRatio
+			? drawWidth * naturalHeight / naturalWidth : naturalHeight;
+	} else if (spec.preserveAspectRatio) {
+		// as large as fits into the box
+		double fit = std::min(drawWidth / naturalWidth,
+			drawHeight / naturalHeight);
+		drawWidth = naturalWidth * fit;
+		drawHeight = naturalHeight * fit;
+	}
+
+	// no wider than the space right of the cursor
+	int32 column = std::min(terminal->fCursorX, terminal->fColumns - 1);
+	double available = (double)(terminal->fColumns - column) * cellWidth;
+	if (drawWidth > available) {
+		if (spec.preserveAspectRatio)
+			drawHeight = drawHeight * available / drawWidth;
+		drawWidth = available;
+	}
+	drawHeight = std::min(drawHeight, (double)kMaxImageSize);
+	int32 pixelWidth = std::max((int32)1, (int32)(drawWidth + 0.5));
+	int32 pixelHeight = std::max((int32)1, (int32)(drawHeight + 0.5));
+	int32 columns = std::max((int32)1,
+		(pixelWidth + cellWidth - 1) / cellWidth);
+	int32 rows = std::max((int32)1, (pixelHeight + cellHeight - 1) / cellHeight);
+
+	// make room below the cursor, as the lines of text the image takes
+	// in iTerm2 would
+	int32 top = std::max((int32)0, std::min(terminal->fCursorY,
+		terminal->fRows - 1));
+	int32 last = top + rows - 1;
+	if (last > terminal->fBottom && top <= terminal->fBottom) {
+		int32 count = std::min(last - terminal->fBottom,
+			terminal->fBottom - terminal->fTop + 1);
+		terminal->_ScrollUp(count);
+		top = std::max(terminal->fTop, top - count);
+	}
+	int32 bottom = std::min(top + rows - 1, terminal->fRows - 1);
+	for (int32 row = top; row <= bottom; row++) {
+		terminal->_ClearLine(row, column,
+			std::min(column + columns, terminal->fColumns) - 1);
+	}
+
+	Store& store = _Store();
+	size_t memory = pixels.size();
+	_EnforceQuota(memory);
+
+	uint32 id;
+	do {
+		id = store.nextId++;
+		if (store.nextId == 0)
+			store.nextId = 0x80000000;
+	} while (store.images.find(id) != store.images.end());
+
+	Image* image = new Image;
+	image->id = id;
+	image->number = 0;
+	image->clientId = false;
+	image->width = width;
+	image->height = height;
+	std::shared_ptr<ImageFrame> frame(new ImageFrame);
+	frame->pixels.swap(pixels);
+	frame->gap = 0;
+	frame->serial = ++sFrameSerial;
+	image->frames.push_back(frame);
+	image->currentFrame = 0;
+	image->animationState = 1;
+	image->loops = 0;
+	image->loopsDone = 0;
+	image->frameStart = system_time();
+	image->lastUsed = system_time();
+	image->memory = memory;
+	store.images[id] = image;
+	store.memory += memory;
+
+	Placement* placement = new Placement;
+	memset(placement, 0, sizeof(*placement));
+	placement->imageId = id;
+	placement->line = fAlternateActive ? top : terminal->AbsoluteLine(top);
+	placement->column = column;
+	placement->requestedColumns = columns;
+	placement->requestedRows = rows;
+	placement->inlineImage = true;
+	placement->inlineWidth = pixelWidth;
+	placement->inlineHeight = pixelHeight;
+	placement->inlineCellWidth = cellWidth;
+	placement->inlineCellHeight = cellHeight;
+	_ComputeExtent(*placement, *image);
+	store.placements.push_back(placement);
+	_Changed();
+
+	if (spec.moveCursor) {
+		// after the image on its last row, as if it had been printed
+		int32 x = column + columns;
+		int32 y = bottom;
+		terminal->_SetCursor(std::min(x, terminal->fColumns - 1), y);
+		if (x >= terminal->fColumns)
+			terminal->fPendingWrap = terminal->fModes.autoWrap;
+	} else if (top != terminal->fCursorY) {
+		// it stays at the image, which moved up to make room
+		terminal->_SetCursor(column, top);
+	}
+	terminal->_TouchRange(top, bottom);
+	return true;
+}
+
+
 void
 TerminalGraphics::_EnforceQuota(size_t incoming)
 {
@@ -743,6 +908,23 @@ TerminalGraphics::_ComputeExtent(Placement& placement, const Image& image)
 
 	placement.offsetX = std::min(placement.offsetX, cellWidth - 1);
 	placement.offsetY = std::min(placement.offsetY, cellHeight - 1);
+
+	if (placement.inlineImage) {
+		// iTerm2: the size it was given, in the cells it covers
+		double scaleX = (double)cellWidth
+			/ std::max((int32)1, placement.inlineCellWidth);
+		double scaleY = (double)cellHeight
+			/ std::max((int32)1, placement.inlineCellHeight);
+		placement.drawX = 0;
+		placement.drawY = 0;
+		placement.drawWidth = std::max((int32)1,
+			(int32)(placement.inlineWidth * scaleX + 0.5));
+		placement.drawHeight = std::max((int32)1,
+			(int32)(placement.inlineHeight * scaleY + 0.5));
+		placement.columns = std::max((int32)1, (int32)placement.requestedColumns);
+		placement.rows = std::max((int32)1, (int32)placement.requestedRows);
+		return;
+	}
 
 	int32 columns = placement.requestedColumns;
 	int32 rows = placement.requestedRows;

@@ -1,0 +1,26 @@
+#version 450
+// vkbigpage: random 4-byte loads over a buffer reached by its device
+// address. Each thread does pc.iters independent loads, so the GPU keeps many
+// in flight and the time per load is set by DRAM and by GPU TLB misses.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 256) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint v[]; };
+layout(push_constant) uniform PC {
+	uint64_t base;
+	uint64_t result;
+	uint mask;	// words - 1, words a power of two
+	uint iters;
+} pc;
+void main()
+{
+	uint id = gl_GlobalInvocationID.x;
+	uint x = id * 2654435761u + 0x9e3779b9u;
+	uint acc = 0;
+	Words b = Words(pc.base);
+	for (uint i = 0; i < pc.iters; i++) {
+		x = x * 1664525u + 1013904223u;
+		acc += b.v[(x ^ (x >> 15)) & pc.mask];
+	}
+	Words(pc.result).v[id] = acc;
+}

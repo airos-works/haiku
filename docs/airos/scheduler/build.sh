@@ -1,5 +1,5 @@
 #!/bin/bash
-# build.sh: schedperf and cputype for x86_64 and arm64 -> out/<name>-<arch>
+# build.sh: schedperf, cputype and wakelat for x86_64 and arm64 -> out/<name>-<arch>
 # Uses the CI cross tools and a configured build dir's libroot (BUILD_X86,
 # BUILD_ARM64 override them).
 set -e
@@ -17,7 +17,7 @@ for arch in x86_64 arm64; do
 	esac
 	G=$O/system/glue/arch/$arch
 	GL=$CT/lib/gcc/$T/13.3.0
-	for prog in schedperf cputype; do
+	for prog in schedperf cputype wakelat; do
 		[ $prog = cputype ] && [ $arch = arm64 ] && continue
 		$CT/bin/$T-gcc -O2 -Wall -nostdinc -isystem $GL/include $INC \
 			-c $prog.c -o out/$prog-$arch.o

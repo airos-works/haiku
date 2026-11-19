@@ -1347,6 +1347,35 @@ each USB port, the serial console, and a Bluetooth device to pair with.
         578.28 before, 612.21 and 620.64 after (the experiment: 619 -> 578);
         Suits is lower (571, 588 -> 507, 497), the rest level or higher
   `NVK_NVRM_SYNC_SUBMIT=1` waits in every submission as before.
+- 2026-11-17: GPU page sizes, sparse binds and allocation cost on NVK (#132,
+  airos-works/mesa-nvk e7a8d5d, 4b32273, 6121f4a; airos-ci 302df6a).
+  * Every GPU page used to be 4 KiB. Video memory now gets 64 KiB pages from
+    64 KiB and 2 MiB pages from 2 MiB (`NVK_NVRM_PAGES=4k|64k|2m` caps it).
+    `tests/vkbigpage tlb`, random loads with 4 KiB / 64 KiB / 2 MiB pages:
+        1 GiB buffer   0.07 / 0.92 / 1.83 Gloads/s
+        1 GiB texture  0.07 / 0.93 / 1.75 Gfetches/s (RGBA8 16384x16384)
+        256 MiB        0.18 / 1.14 / 1.84 Gloads/s
+        allocating 1 GiB  25.6 / 9.6 / 0.15 ms
+    WebGL Aquarium (20,000 fish) in Summit stays at 25-26 fps: it is
+    draw-call bound.
+  * What RM does with a bind inside a big page (`tests/vkbigpage sub`): it
+    maps with the memory's page size and refuses a bind whose memory offset
+    is not aligned to it (0x1f or 0x37; with 2 MiB pages, any bind under
+    2 MiB), and when the GPU address and the memory offset are the same
+    distance into a big page it maps the whole page without a word: a 4 KiB
+    sparse bind took the 60 KiB around it with it. nvkmd now asks for the
+    largest page size each bind is aligned to, and 4 KiB for sparse binds.
+  * Sparse binds were dropped altogether: reading a sparse buffer hung the
+    queue. They now reach RM, unbound pages of a residency range read zero.
+  * Allocation cost (`tests/rmcost`, and nvkmd timed step by step): an empty
+    RM control takes 1.1 us, an ioctl the driver answers itself 0.3 us; the
+    time goes into RM's page table and TLB work - the GPU range (20-85 us),
+    the GPU mapping (20-60), freeing the range (35-117), plus the clearing of
+    new system memory (76 us for 1 MiB) and the CPU mapping (22-49). Freed
+    system memory up to 4 MiB is now kept 2 s for reuse (32 MiB at most,
+    `NVK_NVRM_MEM_CACHE=0` turns it off): 64 KiB allocate+map 87 -> 2.6 us,
+    1 MiB 199 -> 24 us, frees 70-190 -> 0.3 us. Video memory is not kept:
+    RM clears it, and clearing it again would take the GPU.
 - 2026-09-19: measured what 2D drawing costs, since the accelerant offers no 2D
   hooks at all and every pixel app_server draws crosses the bus. The same
   drawing into an off-screen bitmap, against a window on the screen

@@ -39,6 +39,7 @@
 
 #include "accelerant.h"
 
+#include <driver_settings.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -208,10 +209,32 @@ destroy_gpu_buffer(GpuBuffer& buffer)
 	The area is created with the protection app_server's area_of_buffer()
 	sets: setting a different one would wait until the pages are no longer
 	wired, which is never while the buffer object lives. */
+static bool
+host_back_buffer_enabled()
+{
+	// Off unless "host_back_buffer true" is in the amdgpu_kms driver settings:
+	// app_server's back buffer is a GTT buffer object as before haiku#67, and
+	// renderers read pages back instead of importing it. With the back buffer
+	// in host memory, app_server froze on the Framework Desktop whenever
+	// Summit opened or presented a window (2026-11-18: its threads stuck in
+	// the kernel, nothing logged); the cause is not known yet.
+	static int32 sEnabled = -1;
+	if (sEnabled < 0) {
+		void* handle = load_driver_settings("amdgpu_kms");
+		sEnabled = get_driver_boolean_parameter(handle, "host_back_buffer",
+			false, true) ? 1 : 0;
+		unload_driver_settings(handle);
+	}
+	return sEnabled != 0;
+}
+
+
 static status_t
 create_host_buffer(uint64 size, GpuBuffer& buffer)
 {
 	memset(&buffer, 0, sizeof(buffer));
+	if (!host_back_buffer_enabled())
+		return B_NOT_SUPPORTED;
 	size = (size + B_PAGE_SIZE - 1) & ~(uint64)(B_PAGE_SIZE - 1);
 	void* address = NULL;
 	area_id area = create_area("amdgpu host buffer", &address, B_ANY_ADDRESS,
