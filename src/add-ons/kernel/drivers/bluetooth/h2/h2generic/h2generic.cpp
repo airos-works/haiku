@@ -98,6 +98,10 @@ usb_support_descriptor supported_devices[] = {
 	{ 0, 0, 0, 0x05ac, 0x821a },
 	// Apple MacMini5,1
 	{ 0, 0, 0, 0x05ac, 0x8281 },
+	// Apple's later Broadcom radios (iMac18,x and others): HCI on a vendor
+	// specific interface (0xff/0x01/0x01) behind two HID proxy interfaces,
+	// like Linux btusb's USB_VENDOR_AND_INTERFACE_INFO(0x05ac, ...) entry
+	{ 0xff, 0x01, 0x01, 0x05ac, 0 },
 
 	// AVM BlueFRITZ! USB v2.0
 	{ 0, 0, 0, 0x057c, 0x3800 },
@@ -251,6 +255,58 @@ fetch_device(bt_usb_dev* dev, hci_id hid)
 #pragma mark -
 #endif
 
+static bool
+is_hci_class(const usb_interface_descriptor* descr)
+{
+	return descr->interface_protocol == UDPROTO_BLUETOOTH
+		&& descr->interface_subclass == UDSUBCLASS_RF
+		&& (descr->interface_class == UDCLASS_WIRELESS
+			|| descr->interface_class == 0xff);
+}
+
+
+/*!	Returns the index of the interface that carries HCI events and ACL data:
+	one with an interrupt IN and bulk IN and OUT endpoints, preferably of the
+	Bluetooth class. Radios listed by vendor and product without the class
+	keep it on interface 0.
+*/
+static int
+find_hci_interface(const usb_configuration_info* config)
+{
+	int fallback = -1;
+	for (size_t i = 0; i < config->interface_count; i++) {
+		if (config->interface[i].alt_count == 0)
+			continue;
+		const usb_interface_info* uif = &config->interface[i].alt[0];
+		bool intrIn = false, bulkIn = false, bulkOut = false;
+		for (size_t e = 0; e < uif->endpoint_count; e++) {
+			const usb_endpoint_descriptor* d = uif->endpoint[e].descr;
+			bool in = (d->endpoint_address & USB_ENDPOINT_ADDR_DIR_IN) != 0;
+			switch (d->attributes & USB_ENDPOINT_ATTR_MASK) {
+				case USB_ENDPOINT_ATTR_INTERRUPT:
+					intrIn |= in;
+					break;
+				case USB_ENDPOINT_ATTR_BULK:
+					if (in)
+						bulkIn = true;
+					else
+						bulkOut = true;
+					break;
+			}
+		}
+		if (!intrIn || !bulkIn || !bulkOut)
+			continue;
+		if (is_hci_class(uif->descr))
+			return i;
+		if (fallback < 0)
+			fallback = i;
+	}
+	if (fallback < 0 && config->interface_count > 0)
+		fallback = 0;
+	return fallback;
+}
+
+
 // called by USB Manager when device is added to the USB
 static status_t
 device_added(usb_device dev, void** cookie)
@@ -264,6 +320,7 @@ device_added(usb_device dev, void** cookie)
 	status_t 	err = B_ERROR;
 	bt_usb_dev* new_bt_dev = spawn_device(dev);
 	int e;
+	int hciInterface;
 
 	TRACE("%s: device_added(%p)\n", __func__, new_bt_dev);
 
@@ -285,8 +342,20 @@ device_added(usb_device dev, void** cookie)
 	TRACE("%s: found %" B_PRIuSIZE " alt interfaces.\n", __func__,
 		config->interface->alt_count);
 
-	// set first interface
-	interface = &config->interface->alt[0];
+	// The HCI interface: the first one with the Bluetooth class (or Apple's
+	// vendor specific 0xff/0x01/0x01) whose endpoints carry HCI. Usually
+	// interface 0, but Apple's Broadcom radios put two HID proxy interfaces
+	// (keyboard, mouse) before it. SCO is on the interface after it.
+	hciInterface = find_hci_interface(config);
+	if (hciInterface < 0) {
+		ERROR("%s: no HCI interface\n", __func__);
+		err = ENODEV;
+		goto bail;
+	}
+	if (hciInterface > 0)
+		dprintf("h2generic: %s: HCI on interface %d\n", __func__, hciInterface);
+
+	interface = &config->interface[hciInterface].alt[0];
 	err = usb->set_alt_interface(new_bt_dev->dev, interface);
 
 	if (err != B_OK) {
@@ -295,8 +364,9 @@ device_added(usb_device dev, void** cookie)
 	}
 
 	// TODO: Do this only when sco is needed
-	if (config->interface_count > 1 && config->interface[1].alt_count > 5) {
-		interface = &config->interface[1].alt[5];
+	if ((size_t)hciInterface + 1 < config->interface_count
+		&& config->interface[hciInterface + 1].alt_count > 5) {
+		interface = &config->interface[hciInterface + 1].alt[5];
 		err = usb->set_alt_interface(new_bt_dev->dev, interface);
 
 		if (err != B_OK) {
@@ -338,14 +408,6 @@ device_added(usb_device dev, void** cookie)
 		goto bail;
 	}
 
-	// security check
-	if (config->interface->active->descr->interface_number > 0) {
-		ERROR("%s: Strange condition happened %d\n", __func__,
-			config->interface->active->descr->interface_number);
-		err = B_ERROR;
-		goto bail;
-	}
-
 	TRACE("%s: Found %" B_PRIuSIZE " interfaces. Expected 3\n", __func__,
 		config->interface_count);
 
@@ -353,10 +415,12 @@ device_added(usb_device dev, void** cookie)
 	for (size_t i = 0; i < config->interface_count; i++) {
 		uif = config->interface[i].active;
 
-		// Events and ACL data use the first interface only. MediaTek radios
+		// Events and ACL data use the HCI interface only. MediaTek radios
 		// have a third interface whose bulk and interrupt endpoints look
-		// just like the HCI ones (from the x399-workstation branch).
-		bool primary = uif->descr->interface_number == 0;
+		// just like the HCI ones (from the x399-workstation branch), Apple's
+		// HID proxy interfaces have interrupt endpoints of their own.
+		bool primary = i == (size_t)hciInterface;
+		bool sco = i == (size_t)hciInterface + 1;
 
 		for (e = 0; e < uif->descr->num_endpoints; e++) {
 
@@ -388,6 +452,8 @@ device_added(usb_device dev, void** cookie)
 					}
 					break;
 				case USB_ENDPOINT_ATTR_ISOCHRONOUS:
+					if (!sco)
+						break;
 					if (ep->descr->endpoint_address & USB_ENDPOINT_ADDR_DIR_IN) {
 						new_bt_dev->iso_in_ep = ep;
 						new_bt_dev->max_packet_size_iso_in = ep->descr->max_packet_size;
