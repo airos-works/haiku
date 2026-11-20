@@ -258,6 +258,7 @@ uint64_t	ifmedia_baudrate(int);
 #define	IFM_400G_DR4	IFM_X(115)	/* 400GBase-DR4 */
 #define	IFM_400G_AUI8_AC IFM_X(116)	/* 400G-AUI8 active copper/optical */
 #define	IFM_400G_AUI8	IFM_X(117)	/* 400G-AUI8 */
+#define	IFM_1000_BX	IFM_X(121)	/* 1000Base-BX */
 
 /*
  * Please update ieee8023ad_lacp.c:lacp_compose_key()

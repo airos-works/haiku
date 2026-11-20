@@ -41,6 +41,9 @@ struct sysctl_oid {
 #define	CTLTYPE_LONG	7	/* name describes a long */
 #define	CTLTYPE_ULONG	8	/* name describes an unsigned long */
 #define CTLTYPE_U64		9	/* name describes an unsigned 64-bit number */
+#define CTLTYPE_U8		0xa	/* name describes an unsigned 8-bit number */
+#define CTLTYPE_U16		0xb	/* name describes an unsigned 16-bit number */
+#define CTLTYPE_U32		0xf	/* name describes an unsigned 32-bit number */
 
 #define CTLFLAG_RD	0x80000000	/* Allow reads of variable */
 #define CTLFLAG_WR	0x40000000	/* Allow writes to the variable */

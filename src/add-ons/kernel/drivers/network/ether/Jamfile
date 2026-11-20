@@ -20,6 +20,7 @@ HaikuSubInclude broadcom570x ;
 HaikuSubInclude broadcom440x ;
 HaikuSubInclude dec21xxx ;
 HaikuSubInclude intel22x ;
+HaikuSubInclude ixgbe ;
 HaikuSubInclude ipro100 ;
 HaikuSubInclude ipro1000 ;
 HaikuSubInclude jmicron2x0 ;
