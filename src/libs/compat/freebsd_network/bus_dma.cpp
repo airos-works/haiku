@@ -130,7 +130,9 @@ bus_dma_tag_create(bus_dma_tag_t parent, bus_size_t alignment, bus_addr_t bounda
 	*dmat = NULL;
 	// Parent tags may describe an unrestricted scatter/gather count without
 	// ever allocating a map themselves (RTL8125 does this for its DMA ceiling).
-	if (nsegments == (int)BUS_SPACE_UNRESTRICTED)
+	// Others, re(4), dc(4) and ae(4) among them, pass 0 for such a tag: FreeBSD
+	// accepts that too, so treat it the same way.
+	if (nsegments == (int)BUS_SPACE_UNRESTRICTED || nsegments == 0)
 		nsegments = INT32_MAX;
 	if (alignment == 0 || (alignment & (alignment - 1)) != 0
 		|| (boundary != 0 && (boundary & (boundary - 1)) != 0)
