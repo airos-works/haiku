@@ -232,10 +232,10 @@ diag_parent_path_length(const efi_device_path_protocol* path)
 
 
 static efi_status
-diag_write_log(efi_handle handle, const char* stage)
+diag_write_file(efi_handle handle, const char16_t* kName, const char* header,
+	const void* data, size_t dataLength)
 {
 	static efi_guid fileSystemGUID = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID;
-	static const char16_t kName[] = u"\\airos-loader.log";
 
 	efi_simple_file_system_protocol* fileSystem = NULL;
 	efi_file_protocol* root = NULL;
@@ -256,13 +256,11 @@ diag_write_log(efi_handle handle, const char* stage)
 	status = root->Open(root, &file, kName, EFI_FILE_MODE_READ
 		| EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0);
 	if (status == EFI_SUCCESS) {
-		char header[128];
-		size_t length = snprintf(header, sizeof(header),
-			"=== airOS boot loader log, stage: %s ===\n", stage);
-		status = file->Write(file, &length, header);
-		length = sBufferPosition;
-		if (status == EFI_SUCCESS)
-			status = file->Write(file, &length, sBuffer);
+		size_t length = strlen(header);
+		status = file->Write(file, &length, (void*)header);
+		length = dataLength;
+		if (status == EFI_SUCCESS && length != 0)
+			status = file->Write(file, &length, (void*)data);
 		if (status == EFI_SUCCESS)
 			status = file->Flush(file);
 		file->Close(file);
@@ -278,15 +276,13 @@ diag_write_log(efi_handle handle, const char* stage)
 	goes to another file system on the same disk, such as the EFI system
 	partition of a USB stick. \a stage says how far the loader got.
 */
-void
-platform_save_boot_log(const char* stage)
+static void
+diag_save_file(const char16_t* name, const char* header, const void* data,
+	size_t dataLength)
 {
 	static efi_guid loadedImageGUID = EFI_LOADED_IMAGE_PROTOCOL_GUID;
 	static efi_guid fileSystemGUID = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID;
 	static efi_guid devicePathGUID = EFI_DEVICE_PATH_PROTOCOL_GUID;
-
-	dprintf("diag: saving the log (stage: %s, %" B_PRIu32 " bytes)\n", stage,
-		sBufferPosition);
 
 	efi_loaded_image_protocol* loadedImage = NULL;
 	efi_status status = kBootServices->HandleProtocol(kImage, &loadedImageGUID,
@@ -297,10 +293,9 @@ platform_save_boot_log(const char* stage)
 		return;
 	}
 
-	status = diag_write_log(loadedImage->DeviceHandle, stage);
+	status = diag_write_file(loadedImage->DeviceHandle, name, header, data,
+		dataLength);
 	if (status == EFI_SUCCESS) {
-		dprintf("diag: log saved to \\airos-loader.log on the loader's "
-			"volume\n");
 		return;
 	}
 	dprintf("diag: saving the log on the loader's volume failed: %#" B_PRIx64
@@ -332,12 +327,59 @@ platform_save_boot_log(const char* stage)
 			|| memcmp(path, imagePath, parentLength) != 0) {
 			continue;
 		}
-		status = diag_write_log(handles[i], stage);
+		status = diag_write_file(handles[i], name, header, data, dataLength);
 		dprintf("diag: saving the log on file system %p of the same disk: %#"
 			B_PRIx64 "\n", handles[i], (uint64)status);
 		if (status == EFI_SUCCESS)
 			return;
 	}
+}
+
+
+void
+platform_save_boot_log(const char* stage)
+{
+	dprintf("diag: saving the log (stage: %s, %" B_PRIu32 " bytes)\n", stage,
+		sBufferPosition);
+	char header[160];
+	snprintf(header, sizeof(header),
+		"=== airOS boot loader log, last stage reached: %s ===\n", stage);
+	diag_save_file(u"\\airos-loader.log", header, sBuffer, sBufferPosition);
+}
+
+
+/*!	Saves what the previous session left in the syslog buffer at the fixed
+	address (a restart that kept RAM) to \\airos-prev-syslog.log.
+*/
+void
+platform_save_previous_syslog(void)
+{
+	if (sFixedSyslogBuffer == 0) {
+		dprintf("diag: fixed syslog buffer not available\n");
+		return;
+	}
+	uint8* base = (uint8*)(addr_t)sFixedSyslogBuffer;
+	size_t signatureLength = strlen(kDebugSyslogSignature);
+	if (memcmp(base, kDebugSyslogSignature, signatureLength) != 0) {
+		dprintf("diag: no syslog from a previous session in RAM\n");
+		return;
+	}
+	size_t offset = ROUNDUP(signatureLength, sizeof(void*));
+	ring_buffer* buffer = create_ring_buffer_etc(base + offset,
+		kSyslogBufferSize - offset, RING_BUFFER_INIT_FROM_BUFFER);
+	size_t readable = buffer != NULL ? ring_buffer_readable(buffer) : 0;
+	dprintf("diag: previous session's syslog in RAM: %zu bytes\n", readable);
+	if (readable == 0 || readable > kSyslogBufferSize)
+		return;
+	void* data = NULL;
+	if (kBootServices->AllocatePool(EfiLoaderData, readable, &data)
+			!= EFI_SUCCESS)
+		return;
+	readable = ring_buffer_peek(buffer, 0, data, readable);
+	diag_save_file(u"\\airos-prev-syslog.log",
+		"=== previous session's kernel syslog (from RAM) ===\n", data,
+		readable);
+	kBootServices->FreePool(data);
 }
 
 

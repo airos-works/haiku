@@ -280,17 +280,30 @@ console_control_apple(bool graphics)
 	static int8 sIsApple = -1;
 	if (sIsApple < 0)
 		sIsApple = is_apple_firmware() ? 1 : 0;
+	dprintf("diag: console control (%s): Apple firmware: %d\n",
+		graphics ? "graphics" : "text", sIsApple);
 	if (sIsApple == 0)
 		return;
 
 	efi_guid consoleControlGUID = EFI_CONSOLE_CONTROL_PROTOCOL_GUID;
 	efi_console_control_protocol* consoleControl = NULL;
-	if (kBootServices->LocateProtocol(&consoleControlGUID, NULL,
-			(void**)&consoleControl) != EFI_SUCCESS || consoleControl == NULL)
+	efi_status status = kBootServices->LocateProtocol(&consoleControlGUID,
+		NULL, (void**)&consoleControl);
+	dprintf("diag: console control protocol: %#" B_PRIx64 " %p\n",
+		(uint64)status, consoleControl);
+	if (status != EFI_SUCCESS || consoleControl == NULL)
 		return;
 
-	consoleControl->SetMode(consoleControl, graphics
+	efi_console_control_screen_mode mode = EfiConsoleControlScreenMax;
+	bool gopUga = false, locked = false;
+	status = consoleControl->GetMode(consoleControl, &mode, &gopUga, &locked);
+	dprintf("diag: console control mode before: %#" B_PRIx64 " mode %d gop %d "
+		"stdin locked %d\n", (uint64)status, (int)mode, gopUga, locked);
+	status = consoleControl->SetMode(consoleControl, graphics
 		? EfiConsoleControlScreenGraphics : EfiConsoleControlScreenText);
+	consoleControl->GetMode(consoleControl, &mode, &gopUga, &locked);
+	dprintf("diag: console control SetMode: %#" B_PRIx64 ", mode now %d\n",
+		(uint64)status, (int)mode);
 }
 
 
@@ -344,6 +357,9 @@ console_init(void)
 
 	console_control_apple(false);
 	update_screen_size();
+	dprintf("diag: text console %d modes, using mode %d: %dx%d\n",
+		(int)kSystemTable->ConOut->Mode->MaxMode, (int)sScreenMode,
+		(int)sConsole.fScreenWidth, (int)sConsole.fScreenHeight);
 	console_hide_cursor();
 	console_clear_screen();
 #else
@@ -378,6 +394,8 @@ console_check_boot_keys(void)
 		if (status != EFI_SUCCESS)
 			continue;
 
+		dprintf("diag: boot key: scan %#x char %#x\n", key.ScanCode,
+			key.UnicodeChar);
 		if (key.UnicodeChar == 0 && key.ScanCode == SCAN_ESC)
 			return BOOT_OPTION_DEBUG_OUTPUT;
 		if (key.UnicodeChar == ' ')

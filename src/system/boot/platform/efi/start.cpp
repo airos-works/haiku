@@ -199,7 +199,20 @@ platform_start_kernel(void)
 				"disable_onscreen_paging true\n");
 	}
 
+	dprintf("diag: frame buffer %#" B_PRIx64 " size %#" B_PRIx64 " %" B_PRIu32
+		"x%" B_PRIu32 "x%" B_PRIu8 " bpr %" B_PRIu32 " enabled %d\n",
+		(uint64)gKernelArgs.frame_buffer.physical_buffer.start,
+		(uint64)gKernelArgs.frame_buffer.physical_buffer.size,
+		gKernelArgs.frame_buffer.width, gKernelArgs.frame_buffer.height,
+		gKernelArgs.frame_buffer.depth, gKernelArgs.frame_buffer.bytes_per_row,
+		gKernelArgs.frame_buffer.enabled);
+	// Diagnostic build: the kernel keeps writing its syslog to the buffer at
+	// the fixed address, which the next start saves to the stick after a
+	// restart that kept RAM.
+	gKernelArgs.keep_debug_output_buffer = true;
+	platform_save_boot_log("starting the other CPUs");
 	smp_init_other_cpus();
+	platform_save_boot_log("other CPUs started; exiting boot services next");
 #ifdef _BOOT_FDT_SUPPORT
 	dtb_set_kernel_args();
 #endif
@@ -293,6 +306,9 @@ efi_main(efi_handle image, efi_system_table *systemTable)
 	debug_reserve_syslog_buffer();
 
 	sBootOptions = get_loader_boot_options() | console_check_boot_keys();
+	dprintf("diag: boot options %#" B_PRIx32 "\n", sBootOptions);
+	platform_save_previous_syslog();
+	platform_save_boot_log("loader started");
 
 	// disable apm in case we ever load a 32-bit kernel...
 	gKernelArgs.platform_args.apm.version = 0;

@@ -77,6 +77,7 @@ extern size_t platform_get_user_input_text(Menu *menu, MenuItem *item,
 	char *buffer, size_t bufferSize);
 extern char* platform_debug_get_log_buffer(size_t* _size);
 extern void platform_save_boot_log(const char* stage);
+extern void platform_save_previous_syslog(void);
 	// diagnostic builds: store the boot loader log where it can be read later
 
 #endif

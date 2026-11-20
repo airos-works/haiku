@@ -97,6 +97,7 @@ main(stage2_args *args)
 			// user requested to quit the loader
 			goto out;
 		}
+		platform_save_boot_log("boot menu left");
 	}
 
 	if (bootVolume.IsValid()) {
@@ -137,11 +138,13 @@ main(stage2_args *args)
 			}
 
 			register_boot_file_system(bootVolume);
+			platform_save_boot_log("kernel loaded, loading modules");
 
 			if ((platform_boot_options() & BOOT_OPTION_DEBUG_OUTPUT) == 0)
 				platform_switch_to_logo();
 
 			load_modules(args, bootVolume);
+			platform_save_boot_log("modules loaded");
 
 			gKernelArgs.ucode_data = NULL;
 			gKernelArgs.ucode_data_size = 0;
@@ -152,6 +155,7 @@ main(stage2_args *args)
 			// apply boot settings
 			apply_boot_settings();
 #endif
+			platform_save_boot_log("microcode and boot settings done");
 
 			// set up kernel args version info
 			gKernelArgs.kernel_args_size = sizeof(kernel_args);
