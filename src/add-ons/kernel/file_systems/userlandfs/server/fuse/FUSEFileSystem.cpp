@@ -184,6 +184,25 @@ FUSEFileSystem::DeleteVolume(Volume* volume)
 }
 
 
+/*!	See fuse_haiku_notify_change(). The file system stops calling this before
+	its destroy() returns, which is before the volume is deleted, so the
+	volume does not have to be kept here while it is busy.
+*/
+status_t
+FUSEFileSystem::NotifyChange(int what, const char* directory,
+	const char* name)
+{
+	AutoLocker<Locker> locker(fLock);
+	FUSEVolume* volume = static_cast<FUSEVolume*>(fVolumes.Head());
+	locker.Unlock();
+
+	if (volume == NULL)
+		return B_NO_INIT;
+
+	return volume->NotifyChange(what, directory, name);
+}
+
+
 void
 FUSEFileSystem::InitRequestThreadContext(RequestThreadContext* context)
 {

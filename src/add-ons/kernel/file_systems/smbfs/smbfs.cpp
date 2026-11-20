@@ -46,6 +46,7 @@
 #include <smb2/libsmb2-raw.h>
 
 #include "Connection.h"
+#include "DirectoryWatcher.h"
 #include "StatCache.h"
 
 
@@ -97,6 +98,7 @@ struct FileHandle {
 static Options sOptions;
 static ConnectionPool sPool;
 static StatCache sStatCache;
+static DirectoryWatcher sWatcher;
 
 static pthread_mutex_t sHandlesLock = PTHREAD_MUTEX_INITIALIZER;
 static std::set<FileHandle*> sHandles;
@@ -1145,8 +1147,56 @@ smbfs_readdir(const char* path, void* buffer, fuse_fill_dir_t filler,
 		}
 
 		smb2_closedir(context, directory);
+
+		// who reads a directory shows it, and wants to know when it changes
+		sWatcher.WatchDirectory(path, serverPath);
 		return 0;
 	});
+}
+
+
+/*!	The server said that something changed in \a directory (\a serverDirectory
+	on the server) that this volume did not do: somebody else did, on
+	another machine or on the server itself. What is remembered of it is out
+	of date, and whoever shows the directory should hear of it.
+*/
+static void
+directory_changed(int what, const std::string& directory,
+	const std::string& serverDirectory, const std::string& name)
+{
+	const std::string serverPath = serverDirectory.empty()
+		? name : serverDirectory + "/" + name;
+
+	// the directory's own times changed with it
+	sStatCache.Remove(serverDirectory);
+
+	int change;
+	switch (what) {
+		case DirectoryWatcher::kEntryCreated:
+			sStatCache.Remove(serverPath);
+			change = FUSE_HAIKU_ENTRY_CREATED;
+			break;
+		case DirectoryWatcher::kEntryRemoved:
+			sStatCache.RemoveTree(serverPath);
+			change = FUSE_HAIKU_ENTRY_REMOVED;
+			break;
+		case DirectoryWatcher::kEntryChanged:
+			sStatCache.Remove(serverPath);
+			change = FUSE_HAIKU_ENTRY_CHANGED;
+			break;
+		case DirectoryWatcher::kDirectoryChanged:
+			if (serverDirectory.empty())
+				sStatCache.Clear();
+			else
+				sStatCache.RemoveTree(serverDirectory);
+			change = FUSE_HAIKU_DIRECTORY_CHANGED;
+			break;
+		default:
+			return;
+	}
+
+	fuse_haiku_notify_change(change, directory.c_str(),
+		what == DirectoryWatcher::kDirectoryChanged ? NULL : name.c_str());
 }
 
 
@@ -1162,6 +1212,8 @@ smbfs_init(struct fuse_conn_info* info)
 static void
 smbfs_destroy(void* data)
 {
+	// before the volume goes, which it tells about changes
+	sWatcher.Shutdown();
 	sPool.DisconnectAll();
 	syslog(LOG_INFO, "smbfs: //%s/%s unmounted\n", sOptions.server.c_str(),
 		sOptions.share.c_str());
@@ -1371,6 +1423,10 @@ main(int argc, char** argv)
 	// the server keeps the file, deleted or not, for as long as it runs.
 	operations.flag_nullpath_ok = 1;
 
+	sWatcher.Init(&sOptions, &directory_changed);
+
 	char* fuseArguments[] = { argv[0], NULL };
-	return fuse_main(1, fuseArguments, &operations, NULL);
+	int result = fuse_main(1, fuseArguments, &operations, NULL);
+	sWatcher.Shutdown();
+	return result;
 }

@@ -50,6 +50,9 @@ public:
 	virtual	status_t			CreateVolume(Volume** _volume, dev_t id);
 	virtual	status_t			DeleteVolume(Volume* volume);
 
+			status_t			NotifyChange(int what, const char* directory,
+									const char* name);
+
 	virtual	void				InitRequestThreadContext(
 									RequestThreadContext* context);
 
