@@ -231,8 +231,32 @@ X86VMTranslationMapEPT::Map(addr_t virtualAddress, phys_addr_t physicalAddress,
 status_t
 X86VMTranslationMapEPT::Unmap(addr_t start, addr_t end)
 {
-	ASSERT_UNREACHABLE();
-	return B_ERROR;
+	start = ROUNDDOWN(start, B_PAGE_SIZE);
+	if (start >= end)
+		return B_OK;
+
+	TRACE("X86VMTranslationMapEPT::Unmap(%#" B_PRIxADDR ", %#" B_PRIxADDR
+		")\n", start, end);
+
+	ThreadCPUPinner pinner(thread_get_current_thread());
+
+	for (; start < end && start != 0; start += B_PAGE_SIZE) {
+		uint64* entry = X86PagingMethodEPT::PageTableEntryForAddress(
+			fPagingStructures->VirtualPMLTop(), start, fIsKernelMap,
+			false, NULL, fPageMapper, fMapCount);
+		if (entry == NULL || (*entry & EPT_PTE_PRESENT) == 0)
+			continue;
+
+		uint64 oldEntry = X86PagingMethodEPT::ClearTableEntry(entry);
+		fMapCount--;
+
+		if ((oldEntry & EPT_PTE_ACCESSED) != 0) {
+			// only an entry with the accessed flag set can be in a TLB
+			InvalidatePage(start);
+		}
+	}
+
+	return B_OK;
 }
 
 
@@ -438,8 +462,55 @@ status_t
 X86VMTranslationMapEPT::Protect(addr_t start, addr_t end, uint32 attributes,
 	uint32 memoryType)
 {
-	ASSERT_UNREACHABLE();
-	return B_ERROR;
+	// vm_soft_fault() changes the protection of a page that is mapped already
+	// (ProtectPage()); with the old ASSERT_UNREACHABLE() stub a release kernel
+	// fell through into whatever function followed and corrupted the heap.
+	start = ROUNDDOWN(start, B_PAGE_SIZE);
+	if (start >= end)
+		return B_OK;
+
+	TRACE("X86VMTranslationMapEPT::Protect(%#" B_PRIxADDR ", %#" B_PRIxADDR
+		", %#" B_PRIx32 ")\n", start, end, attributes);
+
+	// the same flags PutPageTableEntryInTable() derives from the attributes
+	uint64 newFlags = EPT_PTE_IGNORE_PAT
+		| X86PagingMethodEPT::MemoryTypeToPageTableEntryFlags(memoryType);
+	if ((attributes & B_WRITE_AREA) != 0)
+		newFlags |= EPT_PTE_WRITABLE;
+	if ((attributes & B_EXECUTE_AREA) != 0)
+		newFlags |= EPT_PTE_EXECUTABLE;
+	const uint64 replacedFlags = EPT_PTE_WRITABLE | EPT_PTE_EXECUTABLE
+		| EPT_PTE_IGNORE_PAT | (7LL << 3);
+
+	ThreadCPUPinner pinner(thread_get_current_thread());
+
+	for (; start < end && start != 0; start += B_PAGE_SIZE) {
+		uint64* entry = X86PagingMethodEPT::PageTableEntryForAddress(
+			fPagingStructures->VirtualPMLTop(), start, fIsKernelMap,
+			false, NULL, fPageMapper, fMapCount);
+		if (entry == NULL)
+			continue;
+
+		// set the new flags atomically, keeping the accessed and dirty ones
+		uint64 oldEntry = *entry;
+		while (true) {
+			if ((oldEntry & EPT_PTE_PRESENT) == 0)
+				break;
+			uint64 seen = X86PagingMethodEPT::TestAndSetTableEntry(entry,
+				(oldEntry & ~replacedFlags) | newFlags, oldEntry);
+			if (seen == oldEntry)
+				break;
+			oldEntry = seen;
+		}
+
+		if ((oldEntry & EPT_PTE_PRESENT) != 0
+			&& (oldEntry & EPT_PTE_ACCESSED) != 0) {
+			// only an entry with the accessed flag set can be in a TLB
+			InvalidatePage(start);
+		}
+	}
+
+	return B_OK;
 }
 
 

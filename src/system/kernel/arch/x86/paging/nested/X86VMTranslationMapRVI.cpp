@@ -83,6 +83,10 @@ status_t
 X86VMTranslationMapRVI::Protect(addr_t start, addr_t end, uint32 attributes,
 	uint32 memoryType)
 {
-	ASSERT_UNREACHABLE();
-	return B_ERROR;
+	// As in Map(): always B_EXECUTE_AREA, so that the NX flag isn't set.
+	// (vm_soft_fault() calls this through ProtectPage() for a page that is
+	// mapped already; the ASSERT_UNREACHABLE() stub this replaces fell
+	// through into the next function in a release kernel.)
+	return X86VMTranslationMap64Bit::Protect(start, end,
+		attributes | B_EXECUTE_AREA, memoryType);
 }
