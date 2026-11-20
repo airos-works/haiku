@@ -271,8 +271,9 @@ is_apple_firmware()
 	written through the text output protocol: the boot menu and the loader's
 	debug output stay invisible (a black screen) until the console is put
 	into text mode with the non-standard Console Control protocol. Upstream
-	dropped this call (Haiku #16753, the keyboard stopped working on the
-	reporter's machines), so it is limited to Apple firmware here.
+	dropped this call (Haiku #16753, the keyboard stopped working); that was
+	the protocol's wrong layout (see console-control.h), but the call stays
+	limited to Apple firmware, the only one known to need it.
 */
 void
 console_control_apple(bool graphics)
