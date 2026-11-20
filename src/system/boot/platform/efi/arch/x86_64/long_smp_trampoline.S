@@ -7,6 +7,9 @@
 // Relocatable. Before calling, long_smp_trampoline_args should point
 // to a struct long_trampoline_args (see smp.cpp). This pointer should
 // be 16-byte aligned, below 1MB and identity-mapped.
+// The arguments (and the GDT in them) are reached in real mode through their
+// own segment, so they need not be in the first 64 KB, which firmware may
+// keep for itself and leave unmapped (Apple does).
 .globl long_smp_trampoline
 .globl long_smp_trampoline_end
 .globl long_smp_trampoline_args
@@ -30,11 +33,13 @@ long_smp_trampoline_args:
 	movl %esi, %eax
 	shrl $4, %eax
 	movw %ax, %ss
+	movw %ax, %ds
 	xorw %sp, %sp
 
 	// Switch to protected mode.
 	popl %ebx
 	popl %edx
+	subl %esi, %edx		// the GDTR as an offset into the argument segment
 	lgdt (%edx)
 
 	movl   %cr0,%eax

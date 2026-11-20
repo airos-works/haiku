@@ -27,6 +27,7 @@
 
 #include "mmu.h"
 #include "acpi.h"
+#include "efi_platform.h"
 
 
 #define NO_SMP 0
@@ -288,6 +289,12 @@ arch_smp_get_current_cpu(void)
 }
 
 
+// The AP trampoline: a page for its arguments and stack, and one for its code,
+// both below 640 KB (the STARTUP IPI vector is a page number below 0xa0).
+static uint64 sTrampolineStack = 0x8000;
+static uint64 sTrampolineCode = 0x9000;
+
+
 void
 arch_smp_init_other_cpus(void)
 {
@@ -321,6 +328,21 @@ arch_smp_init_other_cpus(void)
 	if (gKernelArgs.num_cpus < 2)
 		return;
 
+	// Get the trampoline's pages from the firmware while it can still be
+	// asked. The fixed 0x8000/0x9000 need not be free, nor even mapped in the
+	// firmware's page tables the loader still runs on when it starts the APs
+	// after ExitBootServices: Apple firmware (a 2017 iMac) keeps the first
+	// 64 KB as boot services data and maps them not present, so copying the
+	// trampoline there faulted and the boot stopped.
+	efi_physical_addr address = 0x9ffff;
+	if (kBootServices->AllocatePages(AllocateMaxAddress, EfiLoaderData, 2,
+			&address) == EFI_SUCCESS
+		&& address >= 0x1000 && address + 2 * B_PAGE_SIZE <= 0xa0000) {
+		sTrampolineStack = address;
+		sTrampolineCode = address + B_PAGE_SIZE;
+	} else
+		dprintf("smp: no low memory for the AP trampoline, using 0x8000\n");
+
 	for (uint32 i = 1; i < gKernelArgs.num_cpus; i++) {
 		// create a final stack the trampoline code will put the ap processor on
 		void * stack = NULL;
@@ -340,10 +362,10 @@ arch_smp_boot_other_cpus(addr_t pagedir, uint64 kernelEntry, addr_t virtKernelAr
 {
 	TRACE("trampolining other cpus\n");
 
-	// allocate a stack and a code area for the smp trampoline
-	// (these have to be < 1M physical, 0xa0000-0xfffff is reserved by the BIOS)
-	uint64 trampolineCode = 0x9000;
-	uint64 trampolineStack = 0x8000;
+	// the stack and code area for the smp trampoline, from
+	// arch_smp_init_other_cpus()
+	uint64 trampolineCode = sTrampolineCode;
+	uint64 trampolineStack = sTrampolineStack;
 
 	// copy the trampoline code over
 	copy_trampoline_code(trampolineCode, trampolineStack);
