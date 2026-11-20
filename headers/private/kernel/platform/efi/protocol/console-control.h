@@ -17,9 +17,11 @@ typedef enum {
 	EfiConsoleControlScreenMax
 } efi_console_control_screen_mode;
 
+// The protocol has no revision field (EDK's EFI_CONSOLE_CONTROL_PROTOCOL,
+// rEFInd, GRUB): with one, every call landed on the next function, and
+// switching to graphics mode called LockStdIn with a bogus password, which
+// locked the keyboard (Haiku #16753).
 typedef struct efi_console_control_protocol {
-	uint64_t Revision;
-
 	efi_status (*GetMode) (struct efi_console_control_protocol* self,
 		efi_console_control_screen_mode* mode,
 		bool* gopUgaExists,
@@ -29,6 +31,6 @@ typedef struct efi_console_control_protocol {
 		efi_console_control_screen_mode mode) EFIAPI;
 
 	efi_status (*LockStdIn) (struct efi_console_control_protocol* self,
-		uint16_t* password);
+		uint16_t* password) EFIAPI;
 
 } efi_console_control_protocol;
