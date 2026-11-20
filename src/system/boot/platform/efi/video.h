@@ -12,6 +12,7 @@ class Menu;
 class MenuItem;
 
 bool video_mode_hook(Menu *menu, MenuItem *item);
+bool video_set_kernel_frame_buffer(void);
 Menu *video_mode_menu();
 
 #endif	/* VIDEO_H */

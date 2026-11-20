@@ -37,6 +37,7 @@
 #include "serial.h"
 #include "smp.h"
 #include "timer.h"
+#include "video.h"
 
 
 extern void (*__ctor_list)(void);
@@ -178,13 +179,25 @@ get_kernel_regions(addr_range& text, addr_range& data)
 extern "C" void
 platform_start_kernel(void)
 {
-#ifdef __aarch64__
-	// Debug output (ESC at boot) without a serial console also goes to the
-	// screen: on boards whose firmware leaves no UART running it is all
-	// there is to see.
-	if ((sBootOptions & BOOT_OPTION_DEBUG_OUTPUT) != 0 && gUART == NULL)
-		add_safe_mode_settings("debug_screen true\n");
+	if ((sBootOptions & BOOT_OPTION_DEBUG_OUTPUT) != 0) {
+		// The boot splash was skipped, and with it the frame buffer set up
+		// for the kernel: give it one for on-screen output.
+		if (gKernelArgs.frame_buffer.physical_buffer.start == 0)
+			video_set_kernel_frame_buffer();
+
+		// Debug output (ESC at boot) also goes to the screen: on machines
+		// without a UART (laptops, Macs, boards whose firmware leaves none
+		// running) it is all there is to see. x86 always sets up COM1 whether
+		// or not there is one, so there it goes to the screen as well, as it
+		// did with the BIOS loader. Without paging: no keyboard answers the
+		// "press a key" prompt this early (a USB keyboard needs the USB stack),
+		// and when the boot hangs the last screen shows where.
+#if !defined(__i386__) && !defined(__x86_64__)
+		if (gUART == NULL)
 #endif
+			add_safe_mode_settings("debug_screen true\n"
+				"disable_onscreen_paging true\n");
+	}
 
 	smp_init_other_cpus();
 #ifdef _BOOT_FDT_SUPPORT

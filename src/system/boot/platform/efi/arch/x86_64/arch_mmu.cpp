@@ -243,6 +243,17 @@ arch_mmu_generate_post_efi_page_tables(size_t memory_map_size,
 	// Want to map at least 4GB, there may be stuff other than usable RAM that
 	// could be in the first 4GB of physical address space.
 	maxAddress = std::max(maxAddress, (uint64)0x100000000ll);
+
+	// The kernel reaches the frame buffer through the physical map from its
+	// first instructions on (early on-screen debug output, a panic before the
+	// VM is up). Firmware can put it in a 64-bit BAR above both RAM and 4 GB.
+	if (gKernelArgs.frame_buffer.enabled
+		&& gKernelArgs.frame_buffer.physical_buffer.size != 0) {
+		uint64 frameBufferEnd = gKernelArgs.frame_buffer.physical_buffer.start
+			+ gKernelArgs.frame_buffer.physical_buffer.size;
+		if (frameBufferEnd <= 512 * 0x40000000ull)
+			maxAddress = std::max(maxAddress, frameBufferEnd);
+	}
 	maxAddress = ROUNDUP(maxAddress, 0x40000000);
 
 	// Currently only use 1 PDPT (512GB). This will need to change if someone
