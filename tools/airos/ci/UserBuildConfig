@@ -82,13 +82,13 @@
 #   AIROS_CI_FIRMWARE       a tree copied to system/non-packaged/data/firmware
 #   AIROS_CI_AMDGPU         (x86_64) the GPU user land of amdgpu_drm and
 #                           nouveau_drm: a tree copied to
-#                           system/non-packaged/amdgpu, which the boot script
+#                           system/non-packaged/amdgpu, which boot/gpu-user-land
 #                           links into system/non-packaged where amdgpu_drm
 #                           or nouveau_drm drives a GPU
 #   AIROS_CI_ADRENO         (arm64) the Dragon Q8B's GPU user land: a tree
 #                           copied to system/non-packaged/adreno (Turnip,
 #                           zink's EGL vendor library, libvulkan.so.1), which
-#                           the boot script links into system/non-packaged
+#                           boot/gpu-user-land links into system/non-packaged
 #                           where the adreno driver publishes the GPU; its
 #                           firmware comes with AIROS_CI_FIRMWARE
 #   AIROS_CI_FILES          a jam file CI generates that names each file of
@@ -393,7 +393,7 @@ rule UserBuildConfigRulePreImage
 		}
 		# x86_64: libdrm, libva, libglvnd and Mesa (radeonsi, nouveau, RADV, NVK,
 		# VA-API) and the amduvd decoder for amdgpu_drm and nouveau_drm, kept
-		# apart: the boot script links them into place only where one of those
+		# apart: boot/gpu-user-land links them into place only where one of those
 		# drives a GPU.
 		if $(AIROS_CI_AMDGPU) {
 			CopyDirectoryToHaikuImage system non-packaged : $(AIROS_CI_AMDGPU)
@@ -413,6 +413,18 @@ rule UserBuildConfigRulePreImage
 		local bootscript = <airos-ci>UserBootscript ;
 		SEARCH on $(bootscript) = [ FDirName $(tree) boot ] ;
 		AddFilesToHaikuImage home config settings boot : $(bootscript) ;
+
+		# The launch daemon links the GPU user land that fits the machine
+		# (above) at every start. These live in system/non-packaged, so a
+		# release carries them in its payload and an update brings their
+		# changes; the user's UserBootscript is never updated.
+		local gpuUserLand = <airos-ci>gpu-user-land ;
+		local gpuUserLandJob = <airos-ci>airos-gpu-user-land ;
+		SEARCH on $(gpuUserLand) $(gpuUserLandJob) = [ FDirName $(tree) boot ] ;
+		AddFilesToHaikuImage system non-packaged data airos-boot
+			: $(gpuUserLand) ;
+		AddFilesToHaikuImage system non-packaged data user_launch
+			: $(gpuUserLandJob) ;
 	}
 
 	if $(AIROS_ROCK5) || $(AIROS_RPI4) || $(AIROS_CUBIE) {

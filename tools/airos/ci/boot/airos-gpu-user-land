@@ -1,0 +1,5 @@
+# air/OS: links the GPU user land that fits the machine's GPU into
+# system/non-packaged at every start (tools/airos/ci/boot/gpu-user-land).
+job airos-gpu-user-land {
+	launch /bin/sh /boot/system/non-packaged/data/airos-boot/gpu-user-land
+}

@@ -261,10 +261,10 @@ firmware. Only the WX 5100 has been tried.
 The air/OS x86_64 images the build server makes (airos-works/airos-ci) carry
 all of it since 2026-10-13: the `amdgpu_drm` and `amdgpu_firmwares` packages
 in `system/packages`, and the user land and the amduvd add-on, cross-built
-from the same forks, in `system/non-packaged/amdgpu`. The image's boot script
-(`tools/airos/ci/boot/UserBootscript`) links that user land into
-`system/non-packaged` where amdgpu_drm drives a GPU and removes the links
-elsewhere, as its libGL and libEGL would take OpenGL from every other
+from the same forks, in `system/non-packaged/amdgpu`. A start job of the
+launch daemon (`tools/airos/ci/boot/gpu-user-land`, which each release
+brings) links that user land into `system/non-packaged` where amdgpu_drm or
+nouveau_drm drives a GPU and removes the links elsewhere, as its libGL and libEGL would take OpenGL from every other
 machine (Zink on NVIDIA cards). See airos-ci's `docs/x86_64-gpu.md`.
 
 For a machine that is already installed, the pieces, built by
