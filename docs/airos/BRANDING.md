@@ -39,8 +39,13 @@ Removed: the Haiku3d demo (it renders the HAIKU letters) and the Leaves screen
 saver, from the build, the regular image and the ROCK 5 profile's extra demos.
 
 Left as they are: Haiku's own credits and trademarks in *About this system*,
-the Haiku logo artwork in `data/artwork`, and the `.VolumeIcon.icns` that only
-Mac-style boot pickers show.
+and the Haiku logo artwork in `data/artwork`.
+
+The `.VolumeIcon.icns` that Apple's boot picker (Option at power on) shows for
+the USB stick and for a disk the Installer set up is the mark,
+`data/artwork/airos/VolumeIcon.icns` (`generate.py --only mac-volume-icon`
+rewrites just that file). The image build puts it on the EFI system partition
+and the `haiku` package ships it next to the EFI loader for the Installer.
 
 ## Icon style
 

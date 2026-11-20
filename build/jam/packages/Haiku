@@ -20,6 +20,13 @@ local bootTarget ;
 for bootTarget in $(HAIKU_BOOT_TARGETS) {
 	AddFilesToPackage data platform_loaders : haiku_loader.$(bootTarget) ;
 }
+if efi in $(HAIKU_BOOT_TARGETS) {
+	# the volume icon Apple's boot picker shows; the Installer puts it on the
+	# EFI system partition next to the loader
+	local macVolumeIcon = <airos-artwork>VolumeIcon.icns ;
+	SEARCH on $(macVolumeIcon) = [ FDirName $(HAIKU_TOP) data artwork airos ] ;
+	AddFilesToPackage data platform_loaders : $(macVolumeIcon) ;
+}
 
 # modules
 AddFilesToPackage add-ons kernel bus_managers : $(SYSTEM_ADD_ONS_BUS_MANAGERS) ;

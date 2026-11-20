@@ -1702,8 +1702,9 @@ actions BuildCDBootPPCImage1 bind MAPS
 
 rule BuildEfiSystemPartition image : efiLoader
 {
+	# air/OS mark, from tools/airos-branding/generate.py
 	local macVolumeIcon = [ FDirName
-		$(HAIKU_TOP) data artwork VolumeIcon.icns ] ;
+		$(HAIKU_TOP) data artwork airos VolumeIcon.icns ] ;
 	local fatshell = <build>fat_shell ;
 
 	Depends $(image) : $(efiLoader) ;

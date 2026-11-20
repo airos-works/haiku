@@ -243,15 +243,75 @@ def logo_svg(width=560):
 			round(height), '\n'.join(parts)))
 
 
+def _icns_rle(channel):
+	"""Apple's icns run-length encoding of one 8-bit channel plane."""
+	out = bytearray()
+	i, n = 0, len(channel)
+	while i < n:
+		run = 1
+		while i + run < n and run < 130 and channel[i + run] == channel[i]:
+			run += 1
+		if run >= 3:
+			out += bytes((0x80 + run - 3, channel[i]))
+			i += run
+			continue
+		start = i
+		while i < n and i - start < 128:
+			if (i + 2 < n and channel[i] == channel[i + 1] == channel[i + 2]):
+				break
+			i += 1
+		out.append(i - start - 1)
+		out += channel[start:i]
+	return bytes(out)
+
+
+def mac_volume_icon():
+	"""The icon Apple's boot picker (Option at power on) shows for a volume:
+	.VolumeIcon.icns in the root of the EFI system partition. The image build
+	puts it on the ESP of every UEFI image, and the Installer copies it to
+	the ESP it creates. Same entries as Haiku's file, which Mac firmware
+	shows: PNG at 32-1024 px, RLE ARGB at 16 and 32 px."""
+	app = icons.app_icon().data()
+
+	def rgba(size):
+		return Image.open(io.BytesIO(png_bytes(hvif_render.render(app, size)))
+			).convert('RGBA')
+
+	def png(size):
+		buf = io.BytesIO()
+		rgba(size).save(buf, 'PNG', optimize=True)
+		return buf.getvalue()
+
+	def argb(size):
+		image = rgba(size)
+		return b'ARGB' + b''.join(_icns_rle(image.getchannel(c).tobytes())
+			for c in 'ARGB')
+
+	entries = [(b'ic12', png(64)), (b'ic07', png(128)), (b'ic13', png(256)),
+		(b'ic08', png(256)), (b'ic04', argb(16)), (b'ic14', png(512)),
+		(b'ic09', png(512)), (b'ic05', argb(32)), (b'ic10', png(1024)),
+		(b'ic11', png(32))]
+	body = b''.join(kind + (8 + len(data)).to_bytes(4, 'big') + data
+		for kind, data in entries)
+	write('data/artwork/airos/VolumeIcon.icns',
+		b'icns' + (8 + len(body)).to_bytes(4, 'big') + body)
+
+
 def main():
 	parser = argparse.ArgumentParser(description=__doc__,
 		formatter_class=argparse.RawDescriptionHelpFormatter)
 	parser.add_argument('--boot-screen-tool')
+	parser.add_argument('--only', choices=['mac-volume-icon'],
+		help='regenerate only this asset')
 	args = parser.parse_args()
+	if args.only == 'mac-volume-icon':
+		mac_volume_icon()
+		return
 	install_vector_icons(vector_icons())
 	boot_screen(args.boot_screen_tool)
 	desktop()
 	brand_files()
+	mac_volume_icon()
 
 
 if __name__ == '__main__':

@@ -1233,6 +1233,32 @@ WorkerThread::_InstallEFILoader(partition_id espID)
 		return status;
 	}
 
+	// Apple's boot picker shows .VolumeIcon.icns from the volume root as the
+	// disk's icon. It is decoration: a missing or unwritable one is no error.
+	BPath iconPath(loaderPath);
+	BFile icon;
+	if (iconPath.GetParent(&iconPath) == B_OK
+		&& iconPath.Append("VolumeIcon.icns") == B_OK
+		&& icon.SetTo(iconPath.Path(), B_READ_ONLY) == B_OK) {
+		BPath espRoot;
+		esp->GetMountPoint(&espRoot);
+		BPath iconTarget(espRoot.Path(), ".VolumeIcon.icns");
+		BFile target(iconTarget.Path(),
+			B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);
+		status_t iconStatus = target.InitCheck();
+		while (iconStatus == B_OK) {
+			ssize_t bytesRead = icon.Read(buffer, sizeof(buffer));
+			if (bytesRead <= 0)
+				break;
+			if (target.Write(buffer, bytesRead) != bytesRead)
+				iconStatus = B_IO_ERROR;
+		}
+		if (iconStatus != B_OK) {
+			syslog(LOG_NOTICE, "Installer: no volume icon on the EFI system "
+				"partition: %s\n", strerror(iconStatus));
+		}
+	}
+
 	// Nothing else needs the partition; unmounting it writes everything out.
 	esp->Unmount();
 	return B_OK;
