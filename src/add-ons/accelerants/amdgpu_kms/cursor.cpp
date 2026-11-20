@@ -10,9 +10,10 @@
 #include <string.h>
 
 
-// The display engine's cursor: 128 x 128 premultiplied ARGB on every
-// CRTC, positioned in each monitor's own pixels.
-static const uint32 kCursorSize = 128;
+// The display engine's cursor: premultiplied ARGB on every CRTC, positioned
+// in each monitor's own pixels; 128 x 128 on amdgpu, 64 x 64 on nouveau's
+// older display engines (gInfo->cursorSize, the cards' smallest).
+#define kCursorSize (gInfo->cursorSize)
 
 
 /*!	Whether every monitor can show the cursor: amdgpu_dm wants an overlay

@@ -136,6 +136,13 @@ init_card(Card& card, int fd)
 		card.driver[0] = '\0';
 	card.isAmdgpu = strcmp(card.driver, "amdgpu") == 0;
 
+	// the cursor's size: amdgpu takes 128 x 128, nouveau's display engines
+	// before Maxwell 64 x 64
+	drm_get_cap cap = {};
+	cap.capability = DRM_CAP_CURSOR_WIDTH;
+	card.cursorSize = Kms::Ioctl(fd, DRM_IOCTL_GET_CAP, &cap) == B_OK
+		&& cap.value != 0 ? min_c((uint32)cap.value, 128) : 128;
+
 	status_t status = Kms::GetResources(fd, card.resources);
 	if (status == B_OK) {
 		card.planeCount = Kms::kMaxObjects;
@@ -246,6 +253,12 @@ open_other_cards(void)
 			break;
 		if (entry->d_name[0] == '.')
 			continue;
+		// Only the DRM drivers' nodes (amdgpu_drm_0, nouveau_drm_1): opening
+		// another driver's starts its GPU (nvidia_rm's did, on a GPU
+		// nouveau_drm drove).
+		const char* drm = strstr(entry->d_name, "_drm_");
+		if (drm == NULL || drm[5] < '0' || drm[5] > '9')
+			continue;
 		char path[B_PATH_NAME_LENGTH];
 		snprintf(path, sizeof(path), "%s/%s", kDirectory, entry->d_name);
 		struct stat candidateStat;
@@ -299,6 +312,9 @@ amdgpu_init_accelerant(int device)
 	TRACE("DRM driver \"%s\"%s\n", gInfo->cards[0].driver,
 		gInfo->isAmdgpu ? "" : ": no copies by the GPU");
 	open_other_cards();
+	gInfo->cursorSize = 128;
+	for (uint32 c = 0; c < gInfo->cardCount; c++)
+		gInfo->cursorSize = min_c(gInfo->cursorSize, gInfo->cards[c].cursorSize);
 
 	status = probe_outputs();
 	if (status != B_OK) {

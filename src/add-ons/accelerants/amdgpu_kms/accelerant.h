@@ -65,6 +65,7 @@ struct Card {
 	Kms::Buffer			frameBuffer;
 	uint32				modeBlobs[Kms::kMaxObjects];	// per CRTC index
 	Kms::Buffer			cursor;
+	uint32				cursorSize;		// DRM_CAP_CURSOR_WIDTH, at most 128
 };
 
 
@@ -149,6 +150,7 @@ struct accelerant_info {
 	thread_id			outputRetraceThreads[kMaxOutputs];
 	uint32				outputRetraceConnectors[kMaxOutputs];
 
+	uint32				cursorSize;		// the cards' smallest
 	uint32*				cursorImage;	// what is in the cards' cursor
 										// buffers: video memory can be lost
 	uint32				vramLost;		// AMDGPU_INFO_VRAM_LOST_COUNTER
