@@ -1459,6 +1459,23 @@ usb_disk_uninit_device(void* _cookie)
 }
 
 
+/*!	While the device is open (a volume on it mounted, the boot volume maybe),
+	its bus keeps running through a suspend to idle: a mass storage device
+	may not come back from a suspend as the same device, and the volume would
+	be lost.
+*/
+static void
+usb_disk_keep_bus_running(disk_device* device, bool keepRunning)
+{
+	usb_keep_awake_args args = { device->device, keepRunning };
+	status_t status = gUSBModule->usb_ioctl(B_USB_KEEP_BUS_RUNNING, &args,
+		sizeof(args));
+	if (status != B_OK && status != B_NOT_SUPPORTED) {
+		TRACE_ALWAYS("cannot keep the bus running: %s\n", strerror(status));
+	}
+}
+
+
 static status_t
 usb_disk_open(void* deviceCookie, const char* path, int flags, void** _cookie)
 {
@@ -1489,7 +1506,8 @@ usb_disk_open(void* deviceCookie, const char* path, int flags, void** _cookie)
 			if (device->removed)
 				return B_ERROR;
 
-			device->open_count++;
+			if (device->open_count++ == 0)
+				usb_disk_keep_bus_running(device, true);
 			*_cookie = lun;
 			return B_OK;
 		}
@@ -1523,7 +1541,8 @@ usb_disk_free(void* cookie)
 	device_lun* lun = (device_lun*)cookie;
 	disk_device* device = lun->device;
 	mutex_lock(&device->lock);
-	device->open_count--;
+	if (--device->open_count == 0 && !device->removed)
+		usb_disk_keep_bus_running(device, false);
 	mutex_unlock(&device->lock);
 
 	// The device will actually be freed by uninit_driver.

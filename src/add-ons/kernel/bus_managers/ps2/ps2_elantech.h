@@ -51,6 +51,7 @@ typedef struct {
 			uint32				x;
 			uint32				y;
 			uint32				fingers;
+			uint8				buttons;
 
 
 			uint8				buffer[PS2_PACKET_ELANTECH];

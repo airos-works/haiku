@@ -136,6 +136,8 @@ struct xhci_device {
 
 	bool keep_awake;
 		// its driver wants its root port kept out of U3 in a suspend to idle
+	bool keep_running;
+		// its driver wants the whole bus left running in a suspend to idle
 };
 
 
@@ -165,6 +167,8 @@ public:
 	virtual	status_t			NotifyPipeChange(Pipe *pipe,
 									usb_change change);
 	virtual	status_t			SetKeepAwake(Device *device, bool keepAwake);
+	virtual	status_t			SetKeepRunning(Device *device,
+									bool keepRunning);
 	virtual	status_t			PlatformResetPort(uint8 index);
 
 	virtual	Device *			AllocateDevice(Hub *parent,
@@ -346,6 +350,7 @@ private:
 			phys_addr_t			fCmdRingPhysical;
 			bool				fPortsDisconnected;
 			bool				fIdleSuspended;
+			bool				fIdleKeptRunning;
 				// transfers are refused and doorbells held back
 			bool				fIdleHalted;
 				// commands are refused

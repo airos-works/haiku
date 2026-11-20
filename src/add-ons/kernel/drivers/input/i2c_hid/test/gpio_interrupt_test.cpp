@@ -613,6 +613,43 @@ static void test_gemini_lake_ideapad()
 	CHECK(reg32(base, 0x110) == (1u << 18), "GPI_IE bit 18");
 	delete interrupt;
 }
+
+// Real firmware: the Lenovo Yoga 11e 5th gen (Gemini Lake, BIOS R1D): the
+// touchscreen TPL1 on I2C4 has GpioInt (Level, ActiveLow) pin 0x44 on \_SB.GPO0
+// (INT3453 _UID 2, "North"), whose _CRS window (GP0L) is only 0xaff bytes;
+// the controller is revision 0x94 or later (four registers per pad), so its 80
+// pads from PADBAR 0x600 end at 0xb00.
+static void test_gemini_lake_yoga11e()
+{
+	printf("\n=== Gemini Lake, Lenovo Yoga 11e firmware: GPO0 (INT3453 uid 2) pin 68, window 0xaff\n");
+	const uint64 base = 0xd0c50000ull;
+	region(base, 0x1000);
+	reg32(base, 0) = 0x00940000;
+	reg32(base, 0xc) = 0x600;
+	reg32(base, 0x600 + 68 * 16) = kRxState;
+	reg32(base, 0xb0 + 8) = 1u << 4;	// HOSTSW_OWN register 2 (pins 64-95), bit 4
+
+	FakeDevice controller = {};
+	controller.hid = "INT3453";
+	controller.uid = "2";
+	controller.memory.push_back({base, 0xaff});
+	controller.irq = 14;
+	controller.level = true;
+	controller.low = true;
+	sDevices["\\_SB.GPO0"] = controller;
+	sDevices["\\_SB.PCI0.I2C4.TPL1"] = touchpad("\\_SB.GPO0", 0x44);
+
+	GpioInterrupt* interrupt = create("\\_SB.PCI0.I2C4.TPL1", B_OK, "Yoga 11e");
+	if (interrupt == NULL)
+		return;
+	CHECK(interrupt->CanInterrupt(), "host mode");
+	CHECK((reg32(base, 0x600 + 68 * 16) & (kRxEvMask | kRxInv)) == kRxInv,
+		"pad 68 level/low");
+	interrupt->Wait(1000);
+	CHECK(reg32(base, 0x110 + 8) == (1u << 4), "GPI_IE register 2 bit 4: %08x",
+		reg32(base, 0x110 + 8));
+	delete interrupt;
+}
 #endif
 
 int main()
@@ -624,6 +661,7 @@ int main()
 	test_gemini_lake();
 	test_apollo_lake_e403na();
 	test_gemini_lake_ideapad();
+	test_gemini_lake_yoga11e();
 #endif
 	printf("\n%d failure%s\n", sFailures, sFailures == 1 ? "" : "s");
 	return sFailures != 0;

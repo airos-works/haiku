@@ -327,6 +327,14 @@ BusManager::SetKeepAwake(Device *device, bool keepAwake)
 }
 
 
+status_t
+BusManager::SetKeepRunning(Device *device, bool keepRunning)
+{
+	// overridden by the controllers that suspend their buses
+	return B_NOT_SUPPORTED;
+}
+
+
 /*!	Resets the device behind root hub port \a index by platform means, for an
 	internal device that no longer answers on the bus at all. The device
 	connects again once it is out of reset.

@@ -276,6 +276,15 @@ typedef struct usb_keep_awake_args {
 } usb_keep_awake_args;
 
 /*
+ * usb_ioctl() opcode (usb_keep_awake_args): keep the whole bus of a device
+ * running while the system suspends to idle, for a device that holds a file
+ * system (the boot volume, maybe). A mass storage device may not come back
+ * from a suspend as the same device (a card reader that connects again), and
+ * its volumes would go with it.
+ */
+#define	B_USB_KEEP_BUS_RUNNING		'kprn'
+
+/*
  * usb_ioctl() opcode: the speed a device runs at, one of the
  * B_USB_DEVICE_SPEED_* below. (A high-speed device's isochronous endpoints
  * count their interval in 125 us microframes, a full-speed one's in 1 ms

@@ -253,6 +253,8 @@ virtual	status_t						NotifyPipeChange(Pipe *pipe,
 
 virtual	status_t						SetKeepAwake(Device *device,
 											bool keepAwake);
+virtual	status_t						SetKeepRunning(Device *device,
+											bool keepRunning);
 virtual	status_t						PlatformResetPort(uint8 index);
 
 		Object *						RootObject() const
