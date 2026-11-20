@@ -14,7 +14,7 @@ static Output*
 find_output(Layout& layout, uint32 id)
 {
 	for (uint32 i = 0; i < gInfo->outputCount; i++) {
-		if (layout.outputs[i].connector == id)
+		if (layout.outputs[i].id == id)
 			return &layout.outputs[i];
 	}
 	return NULL;
@@ -39,7 +39,7 @@ amdgpu_get_display_outputs(display_output* outputs, uint32* _count)
 		display_output& output = outputs[i];
 		memset(&output, 0, sizeof(output));
 		output.version = B_DISPLAY_OUTPUT_VERSION;
-		output.id = source.connector;
+		output.id = source.id;
 		strlcpy(output.name, source.name, sizeof(output.name));
 		output.flags = B_DISPLAY_OUTPUT_SCALABLE;
 		if (source.connected)
@@ -77,7 +77,7 @@ amdgpu_get_display_output_modes(uint32 id, display_mode* modes,
 {
 	const Output* output = NULL;
 	for (uint32 i = 0; i < gInfo->outputCount; i++) {
-		if (gInfo->outputs[i].connector == id)
+		if (gInfo->outputs[i].id == id)
 			output = &gInfo->outputs[i];
 	}
 	if (output == NULL)

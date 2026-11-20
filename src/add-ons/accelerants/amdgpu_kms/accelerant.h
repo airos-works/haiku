@@ -20,16 +20,59 @@
 	All monitors show regions of one frame buffer in VRAM, which the CPU
 	writes through the PCI aperture: app_server sees one screen whose layout
 	it sets with the display layout hooks, each region scaled to its
-	monitor's mode by the display engine where it is not the same size. */
+	monitor's mode by the display engine where it is not the same size.
+
+	More than one GPU: the device app_server opened is the first card; the
+	other graphics devices this accelerant serves (another GPU of the same
+	or another DRM driver, /dev/graphics/nouveau_drm_1) are opened as well,
+	and their monitors join the layout. Every card scans out a frame buffer
+	of its own the size of the whole layout; app_server's flushes come
+	through the frame buffer source hooks (multi_card.cpp), which copy what
+	was drawn into every card whose monitors show it. So one desktop spans
+	all the GPUs, and a window dragged from one monitor to another moves
+	from one GPU to the other. */
 
 
 static const uint32 kMaxOutputs = 16;
 	// eDP, up to four DisplayPort or HDMI PHYs, and four USB4 (DPIA) links
 	// on current AMD APUs; more on desktop GPUs
+static const uint32 kMaxCards = 4;
+
+
+// one GPU's display engine, through its DRM primary node
+struct Card {
+	int					fd;
+	bool				owned;			// opened here (not app_server's)
+	bool				isAmdgpu;		// else another DRM driver (nouveau_drm):
+										// KMS only, no device copies
+	char				driver[32];
+
+	Kms::Resources		resources;
+	Kms::Plane			planes[Kms::kMaxObjects];
+	uint32				planeCount;
+	uint32				crtcPrimaryPlane[Kms::kMaxObjects];
+	uint32				crtcCursorPlane[Kms::kMaxObjects];
+
+	// properties (the same ID on every object of a type)
+	uint32				connectorCrtcId;
+	uint32				crtcModeId;
+	uint32				crtcActive;
+	uint32				planeFbId;
+	uint32				planeCrtcId;
+	uint32				planeSrcX, planeSrcY, planeSrcW, planeSrcH;
+	uint32				planeCrtcX, planeCrtcY, planeCrtcW, planeCrtcH;
+
+	Kms::Buffer			frameBuffer;
+	uint32				modeBlobs[Kms::kMaxObjects];	// per CRTC index
+	Kms::Buffer			cursor;
+};
 
 
 struct Output {
-	uint32				connector;		// DRM connector, also the output's ID
+	uint32				id;				// the output's ID for app_server:
+										// the connector on the first card
+	uint32				card;			// index into gInfo->cards
+	uint32				connector;		// DRM connector on its card
 	char				name[B_DISPLAY_OUTPUT_NAME_LENGTH];
 	bool				connected;
 	bool				internal;		// a laptop's own panel
@@ -74,36 +117,24 @@ struct SharedInfo {
 
 
 struct accelerant_info {
-	int					device;
+	int					device;			// the first card's, app_server's
 	bool				isClone;
+	bool				isAmdgpu;		// the first card is amdgpu's
 	area_id				sharedArea;
 	SharedInfo*			shared;
 	area_id				clonedFrameBuffer;
 	void*				cloneFrameBuffer;
 
-	Kms::Resources		resources;
-	Kms::Plane			planes[Kms::kMaxObjects];
-	uint32				planeCount;
-	uint32				crtcPrimaryPlane[Kms::kMaxObjects];
-	uint32				crtcCursorPlane[Kms::kMaxObjects];
-
-	// properties (the same ID on every object of a type)
-	uint32				connectorCrtcId;
-	uint32				crtcModeId;
-	uint32				crtcActive;
-	uint32				planeFbId;
-	uint32				planeCrtcId;
-	uint32				planeSrcX, planeSrcY, planeSrcW, planeSrcH;
-	uint32				planeCrtcX, planeCrtcY, planeCrtcW, planeCrtcH;
+	Card				cards[kMaxCards];
+	uint32				cardCount;
 
 	Output				outputs[kMaxOutputs];	// as now driven
 	uint32				outputCount;
 	Layout				pending;		// SET_DISPLAY_LAYOUT's, until its
 	bool				hasPending;		// mode is set
 
-	Kms::Buffer			frameBuffer;
-	uint32				frameBufferGeneration;	// counts its replacements
-	uint32				modeBlobs[Kms::kMaxObjects];	// per CRTC index
+	uint32				frameBufferGeneration;	// counts the first card's
+												// frame buffer's replacements
 	display_mode		mode;
 	bool				modeSet;
 	display_mode*		modeList;
@@ -118,8 +149,8 @@ struct accelerant_info {
 	thread_id			outputRetraceThreads[kMaxOutputs];
 	uint32				outputRetraceConnectors[kMaxOutputs];
 
-	Kms::Buffer			cursor;
-	uint32*				cursorImage;	// what is in it: video memory can be lost
+	uint32*				cursorImage;	// what is in the cards' cursor
+										// buffers: video memory can be lost
 	uint32				vramLost;		// AMDGPU_INFO_VRAM_LOST_COUNTER
 	uint16				cursorHotX;
 	uint16				cursorHotY;
@@ -141,6 +172,33 @@ struct accelerant_info {
 
 
 extern accelerant_info* gInfo;
+
+
+static inline Card&
+card_of(const Output& output)
+{
+	return gInfo->cards[output.card];
+}
+
+
+static inline uint32
+output_id(uint32 card, uint32 connector)
+{
+	return card == 0 ? connector : (card << 24) | connector;
+}
+
+
+// more GPUs (accelerant.cpp, multi_card.cpp)
+status_t init_card(Card& card, int fd);
+void uninit_card(Card& card);
+void open_other_cards(void);
+bool multi_card_copies(void);
+status_t multi_card_create_source(uint16 width, uint16 height,
+	color_space space, frame_buffer_source* source);
+void multi_card_delete_source(uint32 id);
+status_t multi_card_copy(uint32 id, const fill_rect_params* list,
+	uint32 count);
+void multi_card_fill_from_first(void);
 
 
 // outputs and modes (mode.cpp)

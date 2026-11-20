@@ -374,7 +374,7 @@ init_device_copies(void)
 	if (sInitialized)
 		return sAvailable;
 	sInitialized = true;
-	if (gInfo->isClone)
+	if (gInfo->isClone || !gInfo->isAmdgpu)
 		return false;
 
 	drm_amdgpu_info_device device = {};
@@ -444,10 +444,10 @@ map_target(void)
 	if (sTargetMapped && sTargetGeneration == gInfo->frameBufferGeneration)
 		return B_OK;
 	sTargetMapped = false;
-	if (gInfo->frameBuffer.handle == 0)
+	if (gInfo->cards[0].frameBuffer.handle == 0)
 		return B_NO_INIT;
-	status_t status = map_va(gInfo->frameBuffer.handle,
-		gInfo->frameBuffer.size, sTargetVa);
+	status_t status = map_va(gInfo->cards[0].frameBuffer.handle,
+		gInfo->cards[0].frameBuffer.size, sTargetVa);
 	if (status != B_OK)
 		return status;
 	sTargetGeneration = gInfo->frameBufferGeneration;
@@ -463,7 +463,7 @@ target_surface(Surface& surface)
 	status_t status = map_target();
 	if (status != B_OK)
 		return status;
-	const Kms::Buffer& target = gInfo->frameBuffer;
+	const Kms::Buffer& target = gInfo->cards[0].frameBuffer;
 	surface.handle = target.handle;
 	surface.va = sTargetVa;
 	surface.address = target.address;
@@ -718,6 +718,8 @@ extern "C" status_t
 amdgpu_create_frame_buffer_source(uint16 width, uint16 height,
 	color_space space, frame_buffer_source* source)
 {
+	if (multi_card_copies())
+		return multi_card_create_source(width, height, space, source);
 	return create_source(width, height, space, false, source);
 }
 
@@ -728,6 +730,8 @@ extern "C" status_t
 amdgpu_create_frame_buffer_shadow(uint16 width, uint16 height,
 	color_space space, frame_buffer_source* shadow)
 {
+	if (multi_card_copies())
+		return B_NOT_SUPPORTED;
 	return create_source(width, height, space, true, shadow);
 }
 
@@ -735,6 +739,10 @@ amdgpu_create_frame_buffer_shadow(uint16 width, uint16 height,
 extern "C" void
 amdgpu_delete_frame_buffer_source(uint32 id)
 {
+	if (multi_card_copies()) {
+		multi_card_delete_source(id);
+		return;
+	}
 	Locker _;
 	Source* source = find_source(id);
 	if (source == NULL)
@@ -794,6 +802,8 @@ extern "C" status_t
 amdgpu_copy_to_frame_buffer(uint32 id, const fill_rect_params* list,
 	uint32 count)
 {
+	if (multi_card_copies())
+		return multi_card_copy(id, list, count);
 	status_t status = try_copy_to_frame_buffer(id, list, count);
 	if (status == ECANCELED)
 		status = try_copy_to_frame_buffer(id, list, count);
@@ -809,6 +819,8 @@ extern "C" status_t
 amdgpu_copy_frame_buffer_source(uint32 from, uint32 to,
 	const fill_rect_params* list, uint32 count)
 {
+	if (multi_card_copies())
+		return B_NOT_SUPPORTED;
 	status_t status = try_copy_between_sources(from, to, list, count);
 	if (status == ECANCELED)
 		status = try_copy_between_sources(from, to, list, count);

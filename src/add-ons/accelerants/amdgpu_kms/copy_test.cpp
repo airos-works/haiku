@@ -59,7 +59,7 @@ fill(const frame_buffer_source& source, uint32 seed, uint32 left = 0,
 static status_t
 create_frame_buffer(uint32 width, uint32 height)
 {
-	Kms::Buffer& buffer = gInfo->frameBuffer;
+	Kms::Buffer& buffer = gInfo->cards[0].frameBuffer;
 	buffer.pitch = (width * 4 + 255) & ~255u;
 	buffer.size = ((uint64)buffer.pitch * height + B_PAGE_SIZE - 1)
 		& ~(uint64)(B_PAGE_SIZE - 1);
@@ -102,7 +102,7 @@ static void
 check_screen(const char* what, const frame_buffer_source& back,
 	const fill_rect_params* focus = NULL)
 {
-	const Kms::Buffer& screen = gInfo->frameBuffer;
+	const Kms::Buffer& screen = gInfo->cards[0].frameBuffer;
 	uint32 wrong = 0, checked = 0;
 	uint32 firstX = 0, firstY = 0, want = 0, got = 0;
 	for (uint32 y = 0; y < back.height; y++) {
@@ -261,7 +261,7 @@ main(int argc, char** argv)
 		return 2;
 	}
 	printf("     %ux%u, frame buffer stand-in in video memory, pitch %u\n",
-		width, height, gInfo->frameBuffer.pitch);
+		width, height, gInfo->cards[0].frameBuffer.pitch);
 	uint64 pixels = (uint64)width * height;
 
 	frame_buffer_source back, video, system;

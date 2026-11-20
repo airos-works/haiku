@@ -29,16 +29,18 @@ try_cursor(void)
 		const Output& output = gInfo->outputs[i];
 		if (!output.enabled || output.crtcIndex < 0)
 			continue;
-		status = Kms::SetCursor(gInfo->device,
-			gInfo->resources.crtcs[output.crtcIndex], gInfo->cursor.handle,
+		Card& card = card_of(output);
+		status = Kms::SetCursor(card.fd,
+			card.resources.crtcs[output.crtcIndex], card.cursor.handle,
 			kCursorSize, kCursorSize, gInfo->cursorHotX, gInfo->cursorHotY);
 	}
 	if (status != B_OK) {
 		for (uint32 i = 0; i < gInfo->outputCount; i++) {
 			const Output& output = gInfo->outputs[i];
 			if (output.enabled && output.crtcIndex >= 0) {
-				Kms::SetCursor(gInfo->device,
-					gInfo->resources.crtcs[output.crtcIndex], 0, 0, 0, 0, 0);
+				Card& card = card_of(output);
+				Kms::SetCursor(card.fd,
+					card.resources.crtcs[output.crtcIndex], 0, 0, 0, 0, 0);
 			}
 		}
 	}
@@ -55,9 +57,13 @@ amdgpu_set_cursor_bitmap(uint16 width, uint16 height, uint16 hotX,
 	if (space != B_RGBA32 || width > kCursorSize || height > kCursorSize
 		|| hotX >= width || hotY >= height)
 		return B_BAD_VALUE;
-	if (gInfo->cursor.handle == 0) {
-		status_t status = Kms::CreateBuffer(gInfo->device, kCursorSize,
-			kCursorSize, DRM_FORMAT_ARGB8888, gInfo->cursor, false);
+	// a cursor buffer on every card
+	for (uint32 c = 0; c < gInfo->cardCount; c++) {
+		Card& card = gInfo->cards[c];
+		if (card.cursor.handle != 0)
+			continue;
+		status_t status = Kms::CreateBuffer(card.fd, kCursorSize,
+			kCursorSize, DRM_FORMAT_ARGB8888, card.cursor, false);
 		if (status != B_OK)
 			return status;
 	}
@@ -99,12 +105,17 @@ amdgpu_set_cursor_bitmap(uint16 width, uint16 height, uint16 hotX,
 void
 restore_cursor_image(void)
 {
-	if (gInfo->cursorImage == NULL || gInfo->cursor.address == NULL)
+	if (gInfo->cursorImage == NULL)
 		return;
-	uint8* bits = (uint8*)gInfo->cursor.address;
-	for (uint32 y = 0; y < kCursorSize; y++) {
-		memcpy(bits + y * gInfo->cursor.pitch,
-			gInfo->cursorImage + y * kCursorSize, kCursorSize * 4);
+	for (uint32 c = 0; c < gInfo->cardCount; c++) {
+		const Kms::Buffer& cursor = gInfo->cards[c].cursor;
+		if (cursor.address == NULL)
+			continue;
+		uint8* bits = (uint8*)cursor.address;
+		for (uint32 y = 0; y < kCursorSize; y++) {
+			memcpy(bits + y * cursor.pitch,
+				gInfo->cursorImage + y * kCursorSize, kCursorSize * 4);
+		}
 	}
 }
 
@@ -121,7 +132,7 @@ amdgpu_wait_for_display_restore(bigtime_t timeout)
 	bigtime_t end = system_time() + timeout;
 	do {
 		uint32 lost;
-		if (Kms::VramLostCounter(gInfo->device, lost) == B_OK
+		if (gInfo->isAmdgpu && Kms::VramLostCounter(gInfo->device, lost) == B_OK
 			&& lost != gInfo->vramLost) {
 			gInfo->vramLost = lost;
 			debug_printf("amdgpu_kms: video memory was lost (GPU reset); "
@@ -142,20 +153,21 @@ update_cursor(void)
 {
 	if (gInfo == NULL || gInfo->isClone)
 		return;
-	bool show = gInfo->cursorVisible && gInfo->cursor.handle != 0
+	bool show = gInfo->cursorVisible && gInfo->cards[0].cursor.handle != 0
 		&& gInfo->dpmsMode == B_DPMS_ON;
 	for (uint32 i = 0; i < gInfo->outputCount; i++) {
 		const Output& output = gInfo->outputs[i];
 		if (!output.enabled || output.crtcIndex < 0)
 			continue;
-		uint32 crtc = gInfo->resources.crtcs[output.crtcIndex];
-		if (!show) {
+		Card& card = card_of(output);
+		uint32 crtc = card.resources.crtcs[output.crtcIndex];
+		if (!show || card.cursor.handle == 0) {
 			if (!gInfo->cursorSet)
-				Kms::SetCursor(gInfo->device, crtc, 0, 0, 0, 0, 0);
+				Kms::SetCursor(card.fd, crtc, 0, 0, 0, 0, 0);
 			continue;
 		}
 		if (!gInfo->cursorSet) {
-			Kms::SetCursor(gInfo->device, crtc, gInfo->cursor.handle,
+			Kms::SetCursor(card.fd, crtc, card.cursor.handle,
 				kCursorSize, kCursorSize, gInfo->cursorHotX, gInfo->cursorHotY);
 		}
 		int32 x = gInfo->cursorX - output.x;
@@ -164,7 +176,7 @@ update_cursor(void)
 			x = x * (int32)output.timing.hdisplay / (int32)output.width;
 			y = y * (int32)output.timing.vdisplay / (int32)output.height;
 		}
-		Kms::MoveCursor(gInfo->device, crtc, x - gInfo->cursorHotX,
+		Kms::MoveCursor(card.fd, crtc, x - gInfo->cursorHotX,
 			y - gInfo->cursorHotY);
 	}
 	gInfo->cursorSet = true;

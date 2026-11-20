@@ -30,6 +30,16 @@ status_t NvHaikuDevice::Probe(ObjectDeleter<NvHaikuDevice> &outDevice, const pci
 	))
 		return ENODEV;
 
+	// The 570 resource manager drives Maxwell and newer. Older GPUs (Kepler,
+	// Fermi, Tesla: device IDs below GM108's 0x1340) are nouveau_drm's;
+	// probing them here would touch a GPU another driver runs.
+	if (pciInfo.device_id < 0x1340) {
+		dprintf("  %02x.%02x.%02x: %04x.%04x is older than Maxwell, left to "
+			"nouveau_drm\n", pciInfo.bus, pciInfo.device, pciInfo.function,
+			pciInfo.vendor_id, pciInfo.device_id);
+		return ENODEV;
+	}
+
 	dprintf("  %02x.%02x.%02x: %04x.%04x\n",
 		pciInfo.bus,
 		pciInfo.device,

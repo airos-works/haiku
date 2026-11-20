@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include <Drivers.h>
+#include <graphic_driver.h>
 
 
 #define TRACE(x...) debug_printf("amdgpu_kms: " x)
@@ -76,8 +77,11 @@ init_common(int device, bool isClone)
 		gInfo->outputRetraceSemaphores[i] = -1;
 		gInfo->outputRetraceThreads[i] = -1;
 	}
-	gInfo->frameBuffer.area = -1;
-	gInfo->cursor.area = -1;
+	for (uint32 c = 0; c < kMaxCards; c++) {
+		gInfo->cards[c].fd = -1;
+		gInfo->cards[c].frameBuffer.area = -1;
+		gInfo->cards[c].cursor.area = -1;
+	}
 	gInfo->changePort = -1;
 	gInfo->hotplugThread = -1;
 	gInfo->dpmsMode = B_DPMS_ON;
@@ -104,6 +108,180 @@ first_object(const uint32* objects, uint32 count)
 }
 
 
+/*!	Sets up the display engine of the DRM device \a fd as \a card: atomic
+	mode setting, its CRTCs and planes and the IDs of the properties set.
+*/
+status_t
+init_card(Card& card, int fd)
+{
+	card.fd = fd;
+	card.frameBuffer.area = -1;
+	card.cursor.area = -1;
+
+	// atomic mode setting and every plane
+	if (Kms::SetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) != B_OK
+		|| Kms::SetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1) != B_OK) {
+		TRACE("no atomic mode setting\n");
+		return B_NOT_SUPPORTED;
+	}
+	// the first opener is the master already; ask in case it is not
+	Kms::Ioctl(fd, DRM_IOCTL_SET_MASTER, NULL);
+
+	// The driver: amdgpu's own ioctls (device copies) only on amdgpu; other
+	// drivers' private ioctl numbers mean something else.
+	drm_version version = {};
+	version.name = card.driver;
+	version.name_len = sizeof(card.driver) - 1;
+	if (Kms::Ioctl(fd, DRM_IOCTL_VERSION, &version) != B_OK)
+		card.driver[0] = '\0';
+	card.isAmdgpu = strcmp(card.driver, "amdgpu") == 0;
+
+	status_t status = Kms::GetResources(fd, card.resources);
+	if (status == B_OK) {
+		card.planeCount = Kms::kMaxObjects;
+		status = Kms::GetPlanes(fd, card.planes, card.planeCount);
+	}
+	if (status != B_OK || card.resources.crtcCount == 0) {
+		TRACE("no display resources: %s\n", strerror(status));
+		return status != B_OK ? status : B_ERROR;
+	}
+	for (uint32 c = 0; c < card.resources.crtcCount; c++) {
+		for (uint32 p = 0; p < card.planeCount; p++) {
+			const Kms::Plane& plane = card.planes[p];
+			if ((plane.possibleCrtcs & (1 << c)) == 0)
+				continue;
+			if (plane.type == Kms::kPlanePrimary
+				&& card.crtcPrimaryPlane[c] == 0)
+				card.crtcPrimaryPlane[c] = plane.id;
+			else if (plane.type == Kms::kPlaneCursor
+				&& card.crtcCursorPlane[c] == 0)
+				card.crtcCursorPlane[c] = plane.id;
+		}
+	}
+
+	uint32 connector = first_object(card.resources.connectors,
+		card.resources.connectorCount);
+	uint32 crtc = card.resources.crtcs[0];
+	uint32 plane = card.crtcPrimaryPlane[0];
+	card.connectorCrtcId = Kms::PropertyId(fd, connector,
+		DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
+	card.crtcModeId = Kms::PropertyId(fd, crtc, DRM_MODE_OBJECT_CRTC,
+		"MODE_ID");
+	card.crtcActive = Kms::PropertyId(fd, crtc, DRM_MODE_OBJECT_CRTC,
+		"ACTIVE");
+	card.planeFbId = Kms::PropertyId(fd, plane, DRM_MODE_OBJECT_PLANE,
+		"FB_ID");
+	card.planeCrtcId = Kms::PropertyId(fd, plane, DRM_MODE_OBJECT_PLANE,
+		"CRTC_ID");
+	card.planeSrcX = Kms::PropertyId(fd, plane, DRM_MODE_OBJECT_PLANE,
+		"SRC_X");
+	card.planeSrcY = Kms::PropertyId(fd, plane, DRM_MODE_OBJECT_PLANE,
+		"SRC_Y");
+	card.planeSrcW = Kms::PropertyId(fd, plane, DRM_MODE_OBJECT_PLANE,
+		"SRC_W");
+	card.planeSrcH = Kms::PropertyId(fd, plane, DRM_MODE_OBJECT_PLANE,
+		"SRC_H");
+	card.planeCrtcX = Kms::PropertyId(fd, plane, DRM_MODE_OBJECT_PLANE,
+		"CRTC_X");
+	card.planeCrtcY = Kms::PropertyId(fd, plane, DRM_MODE_OBJECT_PLANE,
+		"CRTC_Y");
+	card.planeCrtcW = Kms::PropertyId(fd, plane, DRM_MODE_OBJECT_PLANE,
+		"CRTC_W");
+	card.planeCrtcH = Kms::PropertyId(fd, plane, DRM_MODE_OBJECT_PLANE,
+		"CRTC_H");
+	if (card.connectorCrtcId == 0 || card.crtcModeId == 0
+		|| card.crtcActive == 0 || card.planeFbId == 0
+		|| card.planeCrtcId == 0 || plane == 0) {
+		TRACE("mode setting properties missing\n");
+		return B_NOT_SUPPORTED;
+	}
+	TRACE("%s: %" B_PRIu32 " CRTC(s), %" B_PRIu32 " plane(s), %" B_PRIu32
+		" connector(s)\n", card.driver[0] != '\0' ? card.driver : "DRM",
+		card.resources.crtcCount, card.planeCount,
+		card.resources.connectorCount);
+	return B_OK;
+}
+
+
+/*!	A card's buffers go; a card this accelerant opened is closed, which
+	leaves its monitors dark. */
+void
+uninit_card(Card& card)
+{
+	if (card.fd < 0)
+		return;
+	Kms::DestroyBuffer(card.fd, card.cursor);
+	if (card.owned) {
+		for (uint32 c = 0; c < Kms::kMaxObjects; c++)
+			Kms::DestroyBlob(card.fd, card.modeBlobs[c]);
+		Kms::DestroyBuffer(card.fd, card.frameBuffer);
+		close(card.fd);
+	}
+	card.fd = -1;
+}
+
+
+/*!	The other GPUs this accelerant serves: every graphics device that names
+	it, but the one app_server opened. Each one's monitors join the layout.
+	The file ~/config/settings/amdgpu_kms_single_card keeps to the one
+	app_server opened. */
+void
+open_other_cards(void)
+{
+	struct stat ignored;
+	if (stat("/boot/home/config/settings/amdgpu_kms_single_card", &ignored)
+			== 0) {
+		TRACE("one card only (amdgpu_kms_single_card)\n");
+		return;
+	}
+	struct stat firstStat;
+	if (fstat(gInfo->device, &firstStat) != 0)
+		return;
+	const char* kDirectory = "/dev/graphics";
+	DIR* directory = opendir(kDirectory);
+	if (directory == NULL)
+		return;
+	while (dirent* entry = readdir(directory)) {
+		if (gInfo->cardCount >= kMaxCards)
+			break;
+		if (entry->d_name[0] == '.')
+			continue;
+		char path[B_PATH_NAME_LENGTH];
+		snprintf(path, sizeof(path), "%s/%s", kDirectory, entry->d_name);
+		struct stat candidateStat;
+		if (stat(path, &candidateStat) != 0
+			|| (candidateStat.st_dev == firstStat.st_dev
+				&& candidateStat.st_ino == firstStat.st_ino))
+			continue;
+		// only devices that name this accelerant: the others are not DRM
+		// devices (the framebuffer or VESA device, nvidia_rm's)
+		int fd = open(path, B_READ_WRITE | O_CLOEXEC);
+		if (fd < 0)
+			continue;
+		char signature[B_FILE_NAME_LENGTH] = {};
+		if (ioctl(fd, B_GET_ACCELERANT_SIGNATURE, signature,
+				sizeof(signature)) != 0
+			|| strcmp(signature, "amdgpu_kms.accelerant") != 0) {
+			close(fd);
+			continue;
+		}
+		Card& card = gInfo->cards[gInfo->cardCount];
+		memset(&card, 0, sizeof(card));
+		if (init_card(card, fd) != B_OK) {
+			TRACE("%s: not used\n", path);
+			close(fd);
+			card.fd = -1;
+			continue;
+		}
+		card.owned = true;
+		gInfo->cardCount++;
+		TRACE("%s joins the desktop as card %" B_PRIu32 "\n", path,
+			gInfo->cardCount);
+	}
+	closedir(directory);
+}
+
+
 extern "C" status_t
 amdgpu_init_accelerant(int device)
 {
@@ -111,84 +289,26 @@ amdgpu_init_accelerant(int device)
 	if (status != B_OK)
 		return status;
 
-	// atomic mode setting and every plane
-	if (Kms::SetClientCap(device, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) != B_OK
-		|| Kms::SetClientCap(device, DRM_CLIENT_CAP_ATOMIC, 1) != B_OK) {
-		TRACE("no atomic mode setting\n");
-		uninit_common();
-		return B_NOT_SUPPORTED;
-	}
-	// the first opener is the master already; ask in case it is not
-	Kms::Ioctl(device, DRM_IOCTL_SET_MASTER, NULL);
-
-	status = Kms::GetResources(device, gInfo->resources);
-	if (status == B_OK) {
-		gInfo->planeCount = Kms::kMaxObjects;
-		status = Kms::GetPlanes(device, gInfo->planes, gInfo->planeCount);
-	}
-	if (status != B_OK || gInfo->resources.crtcCount == 0) {
-		TRACE("no display resources: %s\n", strerror(status));
-		uninit_common();
-		return status != B_OK ? status : B_ERROR;
-	}
-	for (uint32 c = 0; c < gInfo->resources.crtcCount; c++) {
-		for (uint32 p = 0; p < gInfo->planeCount; p++) {
-			const Kms::Plane& plane = gInfo->planes[p];
-			if ((plane.possibleCrtcs & (1 << c)) == 0)
-				continue;
-			if (plane.type == Kms::kPlanePrimary
-				&& gInfo->crtcPrimaryPlane[c] == 0)
-				gInfo->crtcPrimaryPlane[c] = plane.id;
-			else if (plane.type == Kms::kPlaneCursor
-				&& gInfo->crtcCursorPlane[c] == 0)
-				gInfo->crtcCursorPlane[c] = plane.id;
-		}
-	}
-
-	uint32 connector = first_object(gInfo->resources.connectors,
-		gInfo->resources.connectorCount);
-	uint32 crtc = gInfo->resources.crtcs[0];
-	uint32 plane = gInfo->crtcPrimaryPlane[0];
-	gInfo->connectorCrtcId = Kms::PropertyId(device, connector,
-		DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
-	gInfo->crtcModeId = Kms::PropertyId(device, crtc, DRM_MODE_OBJECT_CRTC,
-		"MODE_ID");
-	gInfo->crtcActive = Kms::PropertyId(device, crtc, DRM_MODE_OBJECT_CRTC,
-		"ACTIVE");
-	gInfo->planeFbId = Kms::PropertyId(device, plane, DRM_MODE_OBJECT_PLANE,
-		"FB_ID");
-	gInfo->planeCrtcId = Kms::PropertyId(device, plane, DRM_MODE_OBJECT_PLANE,
-		"CRTC_ID");
-	gInfo->planeSrcX = Kms::PropertyId(device, plane, DRM_MODE_OBJECT_PLANE,
-		"SRC_X");
-	gInfo->planeSrcY = Kms::PropertyId(device, plane, DRM_MODE_OBJECT_PLANE,
-		"SRC_Y");
-	gInfo->planeSrcW = Kms::PropertyId(device, plane, DRM_MODE_OBJECT_PLANE,
-		"SRC_W");
-	gInfo->planeSrcH = Kms::PropertyId(device, plane, DRM_MODE_OBJECT_PLANE,
-		"SRC_H");
-	gInfo->planeCrtcX = Kms::PropertyId(device, plane, DRM_MODE_OBJECT_PLANE,
-		"CRTC_X");
-	gInfo->planeCrtcY = Kms::PropertyId(device, plane, DRM_MODE_OBJECT_PLANE,
-		"CRTC_Y");
-	gInfo->planeCrtcW = Kms::PropertyId(device, plane, DRM_MODE_OBJECT_PLANE,
-		"CRTC_W");
-	gInfo->planeCrtcH = Kms::PropertyId(device, plane, DRM_MODE_OBJECT_PLANE,
-		"CRTC_H");
-	if (gInfo->connectorCrtcId == 0 || gInfo->crtcModeId == 0
-		|| gInfo->crtcActive == 0 || gInfo->planeFbId == 0
-		|| gInfo->planeCrtcId == 0 || plane == 0) {
-		TRACE("mode setting properties missing\n");
-		uninit_common();
-		return B_NOT_SUPPORTED;
-	}
-
-	status = probe_outputs();
+	status = init_card(gInfo->cards[0], device);
 	if (status != B_OK) {
 		uninit_common();
 		return status;
 	}
-	Kms::VramLostCounter(device, gInfo->vramLost);
+	gInfo->cardCount = 1;
+	gInfo->isAmdgpu = gInfo->cards[0].isAmdgpu;
+	TRACE("DRM driver \"%s\"%s\n", gInfo->cards[0].driver,
+		gInfo->isAmdgpu ? "" : ": no copies by the GPU");
+	open_other_cards();
+
+	status = probe_outputs();
+	if (status != B_OK) {
+		for (uint32 c = 1; c < gInfo->cardCount; c++)
+			uninit_card(gInfo->cards[c]);
+		uninit_common();
+		return status;
+	}
+	if (gInfo->isAmdgpu)
+		Kms::VramLostCounter(device, gInfo->vramLost);
 
 	SharedInfo* shared;
 	gInfo->sharedArea = create_area("amdgpu_kms shared info", (void**)&shared,
@@ -196,8 +316,11 @@ amdgpu_init_accelerant(int device)
 		B_FULL_LOCK,
 		B_READ_AREA | B_WRITE_AREA | B_CLONEABLE_AREA);
 	if (gInfo->sharedArea < 0) {
+		status = gInfo->sharedArea;
+		for (uint32 c = 1; c < gInfo->cardCount; c++)
+			uninit_card(gInfo->cards[c]);
 		uninit_common();
-		return gInfo->sharedArea;
+		return status;
 	}
 	gInfo->shared = shared;
 	memset(shared, 0, sizeof(SharedInfo));
@@ -208,9 +331,8 @@ amdgpu_init_accelerant(int device)
 		TRACE("the device's path was not found: no clones\n");
 
 	create_mode_list();
-	TRACE("%" B_PRIu32 " output(s), %" B_PRIu32 " CRTC(s), %" B_PRIu32
-		" plane(s)\n", gInfo->outputCount, gInfo->resources.crtcCount,
-		gInfo->planeCount);
+	TRACE("%" B_PRIu32 " output(s) on %" B_PRIu32 " card(s)\n",
+		gInfo->outputCount, gInfo->cardCount);
 	return B_OK;
 }
 
@@ -279,7 +401,8 @@ amdgpu_uninit_accelerant(void)
 	} else {
 		// the display shows what it showed; app_server is going away
 		uninit_device_copies();
-		Kms::DestroyBuffer(gInfo->device, gInfo->cursor);
+		for (uint32 c = 0; c < gInfo->cardCount; c++)
+			uninit_card(gInfo->cards[c]);
 		if (gInfo->sharedArea >= 0)
 			delete_area(gInfo->sharedArea);
 	}
@@ -291,8 +414,15 @@ extern "C" status_t
 amdgpu_get_accelerant_device_info(accelerant_device_info* info)
 {
 	info->version = B_ACCELERANT_VERSION;
-	strlcpy(info->name, "AMD Radeon (amdgpu_drm)", sizeof(info->name));
-	strlcpy(info->chipset, "amdgpu", sizeof(info->chipset));
+	const char* driver = gInfo->isClone || gInfo->cards[0].driver[0] == '\0'
+		? "amdgpu" : gInfo->cards[0].driver;
+	if (strcmp(driver, "nouveau") == 0)
+		strlcpy(info->name, "NVIDIA (nouveau_drm)", sizeof(info->name));
+	else if (strcmp(driver, "amdgpu") == 0)
+		strlcpy(info->name, "AMD Radeon (amdgpu_drm)", sizeof(info->name));
+	else
+		snprintf(info->name, sizeof(info->name), "%s (DRM)", driver);
+	strlcpy(info->chipset, driver, sizeof(info->chipset));
 	strlcpy(info->serial_no, "", sizeof(info->serial_no));
 	info->memory = 0;
 	info->dac_speed = 0;
@@ -309,7 +439,8 @@ retrace_thread(void*)
 	while (!gInfo->quitRetrace) {
 		Output* primary = primary_output();
 		if (primary == NULL || gInfo->dpmsMode != B_DPMS_ON
-			|| Kms::WaitVBlank(gInfo->device, primary->crtcIndex) != B_OK) {
+			|| Kms::WaitVBlank(card_of(*primary).fd, primary->crtcIndex)
+				!= B_OK) {
 			// nothing being scanned out: a 60 Hz clock instead
 			snooze(16667);
 		}
@@ -350,18 +481,19 @@ static status_t
 output_retrace_thread(void* data)
 {
 	uint32 index = (uint32)(addr_t)data;
-	uint32 connector = gInfo->outputRetraceConnectors[index];
+	uint32 id = gInfo->outputRetraceConnectors[index];
 	while (!gInfo->quitRetrace) {
 		Output* output = NULL;
 		for (uint32 i = 0; i < gInfo->outputCount; i++) {
-			if (gInfo->outputs[i].connector == connector) {
+			if (gInfo->outputs[i].id == id) {
 				output = &gInfo->outputs[i];
 				break;
 			}
 		}
 		if (output == NULL || !output->enabled || output->crtcIndex < 0
 			|| gInfo->dpmsMode != B_DPMS_ON
-			|| Kms::WaitVBlank(gInfo->device, output->crtcIndex) != B_OK) {
+			|| Kms::WaitVBlank(card_of(*output).fd, output->crtcIndex)
+				!= B_OK) {
 			snooze(16667);
 		}
 		release_sem_etc(gInfo->outputRetraceSemaphores[index], 1,
@@ -379,7 +511,7 @@ amdgpu_get_display_output_retrace_semaphore(uint32 id)
 	refresh_outputs();
 	int32 index = -1;
 	for (uint32 i = 0; i < gInfo->outputCount; i++) {
-		if (gInfo->outputs[i].connector == id) {
+		if (gInfo->outputs[i].id == id) {
 			index = i;
 			break;
 		}
@@ -428,7 +560,7 @@ amdgpu_get_display_output_scan_line(uint32 id, int32* _line, int32* _lines,
 		return B_UNSUPPORTED;
 	Output* output = NULL;
 	for (uint32 i = 0; i < gInfo->outputCount; i++) {
-		if (gInfo->outputs[i].connector == id) {
+		if (gInfo->outputs[i].id == id) {
 			output = &gInfo->outputs[i];
 			break;
 		}
@@ -441,7 +573,7 @@ amdgpu_get_display_output_scan_line(uint32 id, int32* _line, int32* _lines,
 		return B_NOT_ALLOWED;
 
 	bigtime_t scanStart;
-	status_t status = Kms::LastVBlank(gInfo->device, output->crtcIndex,
+	status_t status = Kms::LastVBlank(card_of(*output).fd, output->crtcIndex,
 		&scanStart);
 	if (status != B_OK)
 		return status;

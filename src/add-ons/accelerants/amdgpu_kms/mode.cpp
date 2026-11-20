@@ -7,6 +7,7 @@
 #include "accelerant.h"
 
 #include <errno.h>
+#include <new>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -122,10 +123,13 @@ update_connector_list(void)
 		= (Kms::Resources*)malloc(sizeof(Kms::Resources));
 	if (resources == NULL)
 		return;
-	if (Kms::GetResources(gInfo->device, *resources) == B_OK) {
-		memcpy(gInfo->resources.connectors, resources->connectors,
-			sizeof(resources->connectors));
-		gInfo->resources.connectorCount = resources->connectorCount;
+	for (uint32 c = 0; c < gInfo->cardCount; c++) {
+		Card& card = gInfo->cards[c];
+		if (Kms::GetResources(card.fd, *resources) == B_OK) {
+			memcpy(card.resources.connectors, resources->connectors,
+				sizeof(resources->connectors));
+			card.resources.connectorCount = resources->connectorCount;
+		}
 	}
 	free(resources);
 }
@@ -145,27 +149,38 @@ hotplug_generation(void)
 status_t
 probe_outputs(void)
 {
-	int fd = gInfo->device;
 	// (before looking: an event during the probe is looked at again)
 	gInfo->probedGeneration = hotplug_generation();
 	update_connector_list();
 	gInfo->outputCount = 0;
-	for (uint32 i = 0; i < gInfo->resources.connectorCount
+	for (uint32 c = 0; c < gInfo->cardCount; c++) {
+	Card& card = gInfo->cards[c];
+	int fd = card.fd;
+	for (uint32 i = 0; i < card.resources.connectorCount
 			&& gInfo->outputCount < kMaxOutputs; i++) {
 		Kms::Connector* connector
 			= (Kms::Connector*)malloc(sizeof(Kms::Connector));
 		if (connector == NULL)
 			return B_NO_MEMORY;
-		if (Kms::GetConnector(fd, gInfo->resources.connectors[i], *connector)
+		if (Kms::GetConnector(fd, card.resources.connectors[i], *connector)
 				!= B_OK) {
 			free(connector);
 			continue;
 		}
 		Output& output = gInfo->outputs[gInfo->outputCount++];
 		memset(&output, 0, sizeof(output));
+		output.card = c;
 		output.connector = connector->id;
-		snprintf(output.name, sizeof(output.name), "%s-%" B_PRIu32,
-			Kms::ConnectorTypeName(connector->type), connector->typeId);
+		output.id = output_id(c, connector->id);
+		// the second GPU's "DP-1" is another connector than the first's
+		if (c == 0) {
+			snprintf(output.name, sizeof(output.name), "%s-%" B_PRIu32,
+				Kms::ConnectorTypeName(connector->type), connector->typeId);
+		} else {
+			snprintf(output.name, sizeof(output.name), "%s-%" B_PRIu32
+				" (GPU %" B_PRIu32 ")", Kms::ConnectorTypeName(connector->type),
+				connector->typeId, c + 1);
+		}
 		output.connected = connector->connected && connector->modeCount > 0;
 		output.internal = connector->type == DRM_MODE_CONNECTOR_eDP
 			|| connector->type == DRM_MODE_CONNECTOR_LVDS
@@ -195,6 +210,7 @@ probe_outputs(void)
 			output.connected ? "connected" : "disconnected", output.modeCount,
 			output.edidLength > 0 ? ", EDID" : "");
 		free(connector);
+	}
 	}
 	return gInfo->outputCount > 0 ? B_OK : B_ENTRY_NOT_FOUND;
 }
@@ -229,7 +245,7 @@ remap_pending(uint32 previousCount)
 		output.crtcIndex = -1;
 		for (uint32 j = 0; j < previousCount; j++) {
 			const Output& was = old->outputs[j];
-			if (was.connector != output.connector || !was.enabled)
+			if (was.id != output.id || !was.enabled)
 				continue;
 			if (!output.connected || output.edidLength != was.edidLength
 				|| memcmp(output.edid, was.edid, was.edidLength) != 0) {
@@ -253,7 +269,7 @@ remap_pending(uint32 previousCount)
 			continue;
 		bool found = false;
 		for (uint32 i = 0; i < gInfo->outputCount && !found; i++)
-			found = gInfo->outputs[i].connector == old->outputs[j].connector;
+			found = gInfo->outputs[i].id == old->outputs[j].id;
 		valid = found;
 	}
 	if (!valid) {
@@ -283,7 +299,7 @@ refresh_outputs(void)
 			Output& output = gInfo->outputs[i];
 			for (uint32 j = 0; j < previousCount; j++) {
 				const Output& old = previous[j];
-				if (old.connector != output.connector)
+				if (old.id != output.id)
 					continue;
 				output.enabled = old.enabled;
 				output.mirror = old.mirror;
@@ -458,48 +474,141 @@ buffer_fits(const Kms::Buffer& buffer, const Layout& layout)
 }
 
 
-/*!	Drives the monitors as \a layout says, in one atomic commit, on the
-	current frame buffer when it is large enough and on a new one otherwise;
-	with \a testOnly, only asks whether that would work. Assigns the outputs'
-	CRTCs.
+/*!	Whether \a card shows anything of \a layout. The first card always
+	gets a frame buffer: it is app_server's.
+*/
+static bool
+card_in_layout(const Layout& layout, uint32 card)
+{
+	if (card == 0)
+		return true;
+	for (uint32 i = 0; i < gInfo->outputCount; i++) {
+		if (layout.outputs[i].enabled && layout.outputs[i].card == card)
+			return true;
+	}
+	return false;
+}
+
+
+/*!	Adds what \a card does for \a layout to \a request: its monitors on the
+	frame buffer \a buffer, its cursors off, the CRTCs it does not use off.
+	Creates the mode blobs into \a blobs.
+*/
+static status_t
+add_card_layout(Kms::AtomicRequest& request, uint32 cardIndex,
+	const Layout& layout, const Kms::Buffer& buffer, uint32* blobs)
+{
+	Card& card = gInfo->cards[cardIndex];
+	uint32 usedCrtcs = 0;
+	status_t status = B_OK;
+	for (uint32 i = 0; i < gInfo->outputCount; i++) {
+		const Output& output = layout.outputs[i];
+		if (output.card != cardIndex)
+			continue;
+		if (!output.enabled) {
+			request.Add(output.connector, card.connectorCrtcId, 0);
+			continue;
+		}
+		usedCrtcs |= 1 << output.crtcIndex;
+		uint32 crtc = card.resources.crtcs[output.crtcIndex];
+		uint32 plane = card.crtcPrimaryPlane[output.crtcIndex];
+		status = Kms::CreateBlob(card.fd, &output.timing, sizeof(output.timing),
+			blobs[output.crtcIndex]);
+		if (status != B_OK)
+			return status;
+		request.Add(output.connector, card.connectorCrtcId, crtc);
+		request.Add(crtc, card.crtcModeId, blobs[output.crtcIndex]);
+		request.Add(crtc, card.crtcActive,
+			gInfo->dpmsMode == B_DPMS_ON ? 1 : 0);
+		request.Add(plane, card.planeFbId, buffer.framebuffer);
+		request.Add(plane, card.planeCrtcId, crtc);
+		uint32 width = min_c(output.width, layout.width - output.x);
+		uint32 height = min_c(output.height, layout.height - output.y);
+		request.Add(plane, card.planeSrcX, (uint64)output.x << 16);
+		request.Add(plane, card.planeSrcY, (uint64)output.y << 16);
+		request.Add(plane, card.planeSrcW, (uint64)width << 16);
+		request.Add(plane, card.planeSrcH, (uint64)height << 16);
+		uint32 x, y, w, h;
+		destination(output, x, y, w, h);
+		request.Add(plane, card.planeCrtcX, x);
+		request.Add(plane, card.planeCrtcY, y);
+		request.Add(plane, card.planeCrtcW, w);
+		request.Add(plane, card.planeCrtcH, h);
+	}
+	// The cursors go, and come back when the monitors are on (update_
+	// cursor()): a cursor left on a CRTC without its primary plane, or over
+	// a plane scaled differently, would need an overlay cursor, which DCE
+	// display engines do not have (amdgpu_dm refuses the commit).
+	for (uint32 c = 0; c < card.resources.crtcCount; c++) {
+		if (card.crtcCursorPlane[c] != 0) {
+			request.Add(card.crtcCursorPlane[c], card.planeFbId, 0);
+			request.Add(card.crtcCursorPlane[c], card.planeCrtcId, 0);
+		}
+	}
+	for (uint32 c = 0; c < card.resources.crtcCount; c++) {
+		if ((usedCrtcs & (1 << c)) != 0)
+			continue;
+		uint32 crtc = card.resources.crtcs[c];
+		request.Add(crtc, card.crtcActive, 0);
+		request.Add(crtc, card.crtcModeId, 0);
+		if (card.crtcPrimaryPlane[c] != 0) {
+			request.Add(card.crtcPrimaryPlane[c], card.planeFbId, 0);
+			request.Add(card.crtcPrimaryPlane[c], card.planeCrtcId, 0);
+		}
+	}
+	return B_OK;
+}
+
+
+/*!	Drives the monitors as \a layout says, in one atomic commit per card,
+	each card on its current frame buffer when it is large enough and on a
+	new one otherwise; with \a testOnly, only asks whether that would work.
+	Assigns the outputs' CRTCs. Every card's frame buffer is the size of the
+	whole layout, its monitors show their regions of it.
 */
 status_t
 apply_layout(Layout& layout, bool testOnly)
 {
-	int fd = gInfo->device;
-	if (layout.width == 0 || layout.height == 0
-		|| (gInfo->resources.maxWidth != 0
-			&& layout.width > gInfo->resources.maxWidth)
-		|| (gInfo->resources.maxHeight != 0
-			&& layout.height > gInfo->resources.maxHeight))
+	if (layout.width == 0 || layout.height == 0)
 		return B_BAD_VALUE;
+	for (uint32 c = 0; c < gInfo->cardCount; c++) {
+		const Kms::Resources& resources = gInfo->cards[c].resources;
+		if (card_in_layout(layout, c)
+			&& ((resources.maxWidth != 0 && layout.width > resources.maxWidth)
+				|| (resources.maxHeight != 0
+					&& layout.height > resources.maxHeight)))
+			return B_BAD_VALUE;
+	}
 
 	// CRTCs: a monitor keeps the one it has (moving it is a mode set on a
-	// monitor that did not change), the others get free ones
-	uint32 usedCrtcs = 0;
+	// monitor that did not change), the others get free ones of their card
+	uint32 usedCrtcs[kMaxCards] = {};
 	for (uint32 i = 0; i < gInfo->outputCount; i++) {
 		Output& output = layout.outputs[i];
 		const Output& current = gInfo->outputs[i];
+		const Card& card = card_of(output);
 		int32 c = current.crtcIndex;
 		output.crtcIndex = -1;
-		if (output.enabled && current.connector == output.connector
+		if (output.enabled && current.id == output.id
 			&& current.enabled && c >= 0
 			&& (output.possibleCrtcs & (1 << c)) != 0
-			&& (usedCrtcs & (1 << c)) == 0 && gInfo->crtcPrimaryPlane[c] != 0) {
+			&& (usedCrtcs[output.card] & (1 << c)) == 0
+			&& card.crtcPrimaryPlane[c] != 0) {
 			output.crtcIndex = c;
-			usedCrtcs |= 1 << c;
+			usedCrtcs[output.card] |= 1 << c;
 		}
 	}
 	for (uint32 i = 0; i < gInfo->outputCount; i++) {
 		Output& output = layout.outputs[i];
 		if (!output.enabled || output.crtcIndex >= 0)
 			continue;
-		for (uint32 c = 0; c < gInfo->resources.crtcCount; c++) {
+		const Card& card = card_of(output);
+		for (uint32 c = 0; c < card.resources.crtcCount; c++) {
 			if ((output.possibleCrtcs & (1 << c)) != 0
-				&& (usedCrtcs & (1 << c)) == 0
-				&& gInfo->crtcPrimaryPlane[c] != 0) {
+				&& (usedCrtcs[output.card] & (1 << c)) == 0
+				&& card.crtcPrimaryPlane[c] != 0) {
 				output.crtcIndex = c;
-				usedCrtcs |= 1 << c;
+				usedCrtcs[output.card] |= 1 << c;
 				break;
 			}
 		}
@@ -507,125 +616,129 @@ apply_layout(Layout& layout, bool testOnly)
 			return B_NOT_SUPPORTED;
 	}
 
-	// The frame buffer: the current one when it is large enough, else a new
+	// The frame buffers: the current one when it is large enough, else a new
 	// one with a little room to spare. With 4K monitors one is tens of
 	// megabytes, and an APU has little VRAM to pin it in (512 MB on the
 	// Framework 13's 760M, shared with everything else the GPU does):
 	// pinning a second 9935x2160 buffer next to the current 9936x2160 one
 	// failed with ENOMEM when the scale went from 200 to 175%.
-	Kms::Buffer buffer;
+	Kms::Buffer buffers[kMaxCards];
+	bool reused[kMaxCards] = {};
+	bool used[kMaxCards] = {};
+	uint32 blobs[kMaxCards][Kms::kMaxObjects];
+	memset(blobs, 0, sizeof(blobs));
 	status_t status = B_OK;
-	bool reused = buffer_fits(gInfo->frameBuffer, layout);
-	if (reused)
-		buffer = gInfo->frameBuffer;
-	else {
-		status = Kms::CreateBuffer(fd, round_up(layout.width, 64),
-			round_up(layout.height, 16), DRM_FORMAT_XRGB8888, buffer);
-	}
-	if (status != B_OK) {
-		TRACE("no %" B_PRIu32 "x%" B_PRIu32 " frame buffer: %s\n",
-			layout.width, layout.height, strerror(status));
-		return status;
+	for (uint32 c = 0; c < gInfo->cardCount && status == B_OK; c++) {
+		Card& card = gInfo->cards[c];
+		used[c] = card_in_layout(layout, c);
+		memset(&buffers[c], 0, sizeof(Kms::Buffer));
+		buffers[c].area = -1;
+		if (!used[c]) {
+			// its monitors go dark; the buffer is freed once that is done
+			continue;
+		}
+		reused[c] = buffer_fits(card.frameBuffer, layout);
+		if (reused[c])
+			buffers[c] = card.frameBuffer;
+		else {
+			status = Kms::CreateBuffer(card.fd, round_up(layout.width, 64),
+				round_up(layout.height, 16), DRM_FORMAT_XRGB8888, buffers[c]);
+			if (status != B_OK) {
+				TRACE("no %" B_PRIu32 "x%" B_PRIu32 " frame buffer on card %"
+					B_PRIu32 ": %s\n", layout.width, layout.height, c,
+					strerror(status));
+			}
+		}
 	}
 
-	uint32 blobs[Kms::kMaxObjects] = {};
-	Kms::AtomicRequest request;
-	for (uint32 i = 0; i < gInfo->outputCount; i++) {
-		Output& output = layout.outputs[i];
-		if (!output.enabled) {
-			request.Add(output.connector, gInfo->connectorCrtcId, 0);
-			continue;
+	// every card is asked first; only when all of them can, they are set
+	// (on the heap: one is several KB; no libstdc++ in an accelerant)
+	Kms::AtomicRequest* requests = (Kms::AtomicRequest*)malloc(
+		sizeof(Kms::AtomicRequest) * gInfo->cardCount);
+	if (requests == NULL)
+		status = B_NO_MEMORY;
+	for (uint32 c = 0; requests != NULL && c < gInfo->cardCount; c++)
+		new(&requests[c]) Kms::AtomicRequest;
+	for (uint32 c = 0; c < gInfo->cardCount && status == B_OK; c++) {
+		status = add_card_layout(requests[c], c, layout, buffers[c],
+			blobs[c]);
+		if (status == B_OK) {
+			status = requests[c].Commit(gInfo->cards[c].fd,
+				DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_TEST_ONLY);
 		}
-		uint32 crtc = gInfo->resources.crtcs[output.crtcIndex];
-		uint32 plane = gInfo->crtcPrimaryPlane[output.crtcIndex];
-		status = Kms::CreateBlob(fd, &output.timing, sizeof(output.timing),
-			blobs[output.crtcIndex]);
-		if (status != B_OK)
-			break;
-		request.Add(output.connector, gInfo->connectorCrtcId, crtc);
-		request.Add(crtc, gInfo->crtcModeId, blobs[output.crtcIndex]);
-		request.Add(crtc, gInfo->crtcActive,
-			gInfo->dpmsMode == B_DPMS_ON ? 1 : 0);
-		request.Add(plane, gInfo->planeFbId, buffer.framebuffer);
-		request.Add(plane, gInfo->planeCrtcId, crtc);
-		uint32 width = min_c(output.width, layout.width - output.x);
-		uint32 height = min_c(output.height, layout.height - output.y);
-		request.Add(plane, gInfo->planeSrcX, (uint64)output.x << 16);
-		request.Add(plane, gInfo->planeSrcY, (uint64)output.y << 16);
-		request.Add(plane, gInfo->planeSrcW, (uint64)width << 16);
-		request.Add(plane, gInfo->planeSrcH, (uint64)height << 16);
-		uint32 x, y, w, h;
-		destination(output, x, y, w, h);
-		request.Add(plane, gInfo->planeCrtcX, x);
-		request.Add(plane, gInfo->planeCrtcY, y);
-		request.Add(plane, gInfo->planeCrtcW, w);
-		request.Add(plane, gInfo->planeCrtcH, h);
+		if (status != B_OK && gInfo->cardCount > 1)
+			TRACE("card %" B_PRIu32 " cannot have the layout\n", c);
 	}
-	// The cursors go, and come back when the monitors are on (update_
-	// cursor()): a cursor left on a CRTC without its primary plane, or over
-	// a plane scaled differently, would need an overlay cursor, which DCE
-	// display engines do not have (amdgpu_dm refuses the commit).
-	for (uint32 c = 0; status == B_OK && c < gInfo->resources.crtcCount; c++) {
-		if (gInfo->crtcCursorPlane[c] != 0) {
-			request.Add(gInfo->crtcCursorPlane[c], gInfo->planeFbId, 0);
-			request.Add(gInfo->crtcCursorPlane[c], gInfo->planeCrtcId, 0);
+	for (uint32 c = 0; c < gInfo->cardCount && status == B_OK && !testOnly;
+			c++) {
+		status = requests[c].Commit(gInfo->cards[c].fd,
+			DRM_MODE_ATOMIC_ALLOW_MODESET);
+		if (status != B_OK && c > 0) {
+			// the cards before it show the new layout already: what is left
+			// is this card's monitors staying as they were
+			TRACE("card %" B_PRIu32 " refused the layout it accepted in the "
+				"test: %s\n", c, strerror(status));
 		}
 	}
-	for (uint32 c = 0; status == B_OK && c < gInfo->resources.crtcCount; c++) {
-		if ((usedCrtcs & (1 << c)) != 0)
-			continue;
-		uint32 crtc = gInfo->resources.crtcs[c];
-		request.Add(crtc, gInfo->crtcActive, 0);
-		request.Add(crtc, gInfo->crtcModeId, 0);
-		if (gInfo->crtcPrimaryPlane[c] != 0) {
-			request.Add(gInfo->crtcPrimaryPlane[c], gInfo->planeFbId, 0);
-			request.Add(gInfo->crtcPrimaryPlane[c], gInfo->planeCrtcId, 0);
-		}
-	}
-	if (status == B_OK) {
-		status = request.Commit(fd, DRM_MODE_ATOMIC_ALLOW_MODESET
-			| (testOnly ? DRM_MODE_ATOMIC_TEST_ONLY : 0));
-	}
+	free(requests);
 	if (status != B_OK || testOnly) {
 		if (status != B_OK) {
 			TRACE("%s %" B_PRIu32 "x%" B_PRIu32 " layout: %s\n",
 				testOnly ? "cannot have the" : "setting the", layout.width,
 				layout.height, strerror(status));
 		}
-		for (uint32 c = 0; c < Kms::kMaxObjects; c++)
-			Kms::DestroyBlob(fd, blobs[c]);
-		if (!reused)
-			Kms::DestroyBuffer(fd, buffer);
+		for (uint32 c = 0; c < gInfo->cardCount; c++) {
+			for (uint32 b = 0; b < Kms::kMaxObjects; b++)
+				Kms::DestroyBlob(gInfo->cards[c].fd, blobs[c][b]);
+			if (used[c] && !reused[c])
+				Kms::DestroyBuffer(gInfo->cards[c].fd, buffers[c]);
+		}
 		return status;
 	}
 
 	// it is on screen
+	int fd = gInfo->device;
+	const Kms::Buffer& buffer = buffers[0];
 	// Renderers that copy their frames straight into the screen (Summit)
 	// take it from the driver. It is offered again with every layout, also
 	// when the buffer stayed the same, so that one refused offer does not
 	// leave them without it until the next resize (haiku#43); a refusal is
 	// worth a line in the syslog, as nothing else shows it. An older driver
-	// does not know the call (B_DEV_INVALID_IOCTL / ENOTTY).
-	status_t published = Kms::PublishScanout(fd, buffer, DRM_FORMAT_XRGB8888);
-	if (published != B_OK && published != B_DEV_INVALID_IOCTL
-		&& published != ENOTTY) {
-		syslog(LOG_WARNING, "amdgpu_kms: the %" B_PRIu32 "x%" B_PRIu32
-			" frame buffer (pitch %" B_PRIu32 ") was not offered to renderers:"
-			" %s\n", buffer.width, buffer.height, buffer.pitch,
-			strerror(published));
+	// does not know the call (B_DEV_INVALID_IOCTL / ENOTTY). With more cards,
+	// such a renderer would draw on the first one only.
+	if (gInfo->cardCount == 1) {
+		status_t published = Kms::PublishScanout(fd, buffer,
+			DRM_FORMAT_XRGB8888);
+		if (published != B_OK && published != B_DEV_INVALID_IOCTL
+			&& published != ENOTTY) {
+			syslog(LOG_WARNING, "amdgpu_kms: the %" B_PRIu32 "x%" B_PRIu32
+				" frame buffer (pitch %" B_PRIu32 ") was not offered to "
+				"renderers: %s\n", buffer.width, buffer.height, buffer.pitch,
+				strerror(published));
+		}
 	}
-	if (!reused) {
-		// no copy by the GPU runs into the old one meanwhile
-		lock_device_copies();
-		Kms::DestroyBuffer(fd, gInfo->frameBuffer);
-		gInfo->frameBuffer = buffer;
-		gInfo->frameBufferGeneration++;
-		unlock_device_copies();
+	// no copy (by the GPU or to the other cards) runs into the old buffers
+	// meanwhile
+	lock_device_copies();
+	for (uint32 c = 0; c < gInfo->cardCount; c++) {
+		Card& card = gInfo->cards[c];
+		if (!reused[c] && (used[c] || card.frameBuffer.handle != 0)) {
+			Kms::DestroyBuffer(card.fd, card.frameBuffer);
+			card.frameBuffer = buffers[c];
+			if (c == 0)
+				gInfo->frameBufferGeneration++;
+		}
+		for (uint32 b = 0; b < Kms::kMaxObjects; b++) {
+			Kms::DestroyBlob(card.fd, card.modeBlobs[b]);
+			card.modeBlobs[b] = blobs[c][b];
+		}
 	}
-	for (uint32 c = 0; c < Kms::kMaxObjects; c++) {
-		Kms::DestroyBlob(fd, gInfo->modeBlobs[c]);
-		gInfo->modeBlobs[c] = blobs[c];
+	if (gInfo->cardCount > 1) {
+		// the other cards show what the first one has until app_server
+		// draws everything again
+		multi_card_fill_from_first();
 	}
+	unlock_device_copies();
 	for (uint32 i = 0; i < gInfo->outputCount; i++) {
 		Output& output = gInfo->outputs[i];
 		const Output& applied = layout.outputs[i];
@@ -771,10 +884,10 @@ amdgpu_propose_display_mode(display_mode* target, const display_mode* low,
 {
 	if (target->virtual_width < 320 || target->virtual_height < 200)
 		return B_BAD_VALUE;
-	if ((gInfo->resources.maxWidth != 0
-			&& target->virtual_width > gInfo->resources.maxWidth)
-		|| (gInfo->resources.maxHeight != 0
-			&& target->virtual_height > gInfo->resources.maxHeight))
+	const Kms::Resources& resources = gInfo->cards[0].resources;
+	if ((resources.maxWidth != 0 && target->virtual_width > resources.maxWidth)
+		|| (resources.maxHeight != 0
+			&& target->virtual_height > resources.maxHeight))
 		return B_BAD_VALUE;
 	return B_OK;
 }
@@ -872,11 +985,12 @@ amdgpu_get_frame_buffer_config(frame_buffer_config* config)
 		config->bytes_per_row = gInfo->shared->bytesPerRow;
 		return gInfo->cloneFrameBuffer != NULL ? B_OK : B_ERROR;
 	}
-	if (gInfo->frameBuffer.address == NULL)
+	const Kms::Buffer& frameBuffer = gInfo->cards[0].frameBuffer;
+	if (frameBuffer.address == NULL)
 		return B_ERROR;
-	config->frame_buffer = gInfo->frameBuffer.address;
+	config->frame_buffer = frameBuffer.address;
 	config->frame_buffer_dma = NULL;
-	config->bytes_per_row = gInfo->frameBuffer.pitch;
+	config->bytes_per_row = frameBuffer.pitch;
 	return B_OK;
 }
 
@@ -957,21 +1071,27 @@ connected_outputs_changed(void)
 	// an MST hub added or removed connectors
 	Kms::Resources* resources
 		= (Kms::Resources*)malloc(sizeof(Kms::Resources));
-	if (resources != NULL && Kms::GetResources(gInfo->device, *resources)
-			== B_OK) {
-		uint32 count = min_c(resources->connectorCount, kMaxOutputs);
-		if (count != gInfo->outputCount)
-			changed = true;
-		for (uint32 i = 0; i < count && !changed; i++) {
-			if (resources->connectors[i] != gInfo->outputs[i].connector)
+	uint32 total = 0;
+	for (uint32 c = 0; resources != NULL && c < gInfo->cardCount && !changed;
+			c++) {
+		if (Kms::GetResources(gInfo->cards[c].fd, *resources) != B_OK)
+			continue;
+		for (uint32 i = 0; i < resources->connectorCount && !changed; i++) {
+			if (total >= kMaxOutputs)
+				break;
+			const Output& output = gInfo->outputs[total++];
+			if (total > gInfo->outputCount || output.card != c
+				|| resources->connectors[i] != output.connector)
 				changed = true;
 		}
 	}
+	if (resources != NULL && total != gInfo->outputCount)
+		changed = true;
 	free(resources);
 
 	for (uint32 i = 0; i < gInfo->outputCount && !changed; i++) {
 		const Output& output = gInfo->outputs[i];
-		if (Kms::GetConnector(gInfo->device, output.connector, *connector)
+		if (Kms::GetConnector(card_of(output).fd, output.connector, *connector)
 				!= B_OK) {
 			changed = true;
 			break;
@@ -993,13 +1113,16 @@ amdgpu_set_dpms_mode(uint32 dpmsMode)
 	if (gInfo->isClone)
 		return B_NOT_ALLOWED;
 	uint32 active = dpmsMode == B_DPMS_ON ? 1 : 0;
-	Kms::AtomicRequest request;
+	Kms::AtomicRequest requests[kMaxCards];
+	uint32 cardCrtcs[kMaxCards] = {};
 	uint32 crtcs = 0;
 	for (uint32 i = 0; i < gInfo->outputCount; i++) {
 		const Output& output = gInfo->outputs[i];
 		if (output.enabled && output.crtcIndex >= 0) {
-			request.Add(gInfo->resources.crtcs[output.crtcIndex],
-				gInfo->crtcActive, active);
+			const Card& card = card_of(output);
+			requests[output.card].Add(card.resources.crtcs[output.crtcIndex],
+				card.crtcActive, active);
+			cardCrtcs[output.card]++;
 			crtcs++;
 		}
 	}
@@ -1009,8 +1132,15 @@ amdgpu_set_dpms_mode(uint32 dpmsMode)
 	debug_printf("amdgpu_kms: displays %s (%" B_PRIu32 " CRTCs)...\n",
 		active ? "on" : "off", crtcs);
 	bigtime_t started = system_time();
-	status_t status = request.Commit(gInfo->device,
-		DRM_MODE_ATOMIC_ALLOW_MODESET);
+	status_t status = B_OK;
+	for (uint32 c = 0; c < gInfo->cardCount; c++) {
+		if (cardCrtcs[c] == 0 && c > 0)
+			continue;
+		status_t cardStatus = requests[c].Commit(gInfo->cards[c].fd,
+			DRM_MODE_ATOMIC_ALLOW_MODESET);
+		if (cardStatus != B_OK)
+			status = cardStatus;
+	}
 	debug_printf("amdgpu_kms: displays %s: %s in %.1f ms\n",
 		active ? "on" : "off", status == B_OK ? "done" : strerror(status),
 		(system_time() - started) / 1000.0);
