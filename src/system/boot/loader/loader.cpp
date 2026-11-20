@@ -176,6 +176,15 @@ load_modules_from(BootVolume& volume, const char* path)
 	if (modules == NULL)
 		return B_ENTRY_NOT_FOUND;
 
+	// Diagnostic build: a module of the same name in airos-diag/<path> in the
+	// boot volume's root is loaded instead of the packaged one.
+	char diagPath[B_PATH_NAME_LENGTH];
+	snprintf(diagPath, sizeof(diagPath), "airos-diag/%s", path);
+	Directory* diagModules = NULL;
+	int diagFD = open_from(volume.RootDirectory(), diagPath, O_RDONLY);
+	if (diagFD >= 0)
+		diagModules = (Directory*)get_node_from(diagFD);
+
 	void *cookie;
 	if (modules->Open(&cookie, O_RDONLY) == B_OK) {
 		char name[B_FILE_NAME_LENGTH];
@@ -186,7 +195,16 @@ load_modules_from(BootVolume& volume, const char* path)
 			char stage[B_PATH_NAME_LENGTH];
 			snprintf(stage, sizeof(stage), "loading module %s/%s", path, name);
 			platform_save_boot_log(stage);
-			status_t status = elf_load_image(modules, name);
+			Directory* from = modules;
+			if (diagModules != NULL) {
+				int test = open_from(diagModules, name, O_RDONLY);
+				if (test >= 0) {
+					close(test);
+					from = diagModules;
+					dprintf("diag: module %s/%s from airos-diag\n", path, name);
+				}
+			}
+			status_t status = elf_load_image(from, name);
 			if (status != B_OK)
 				dprintf("Could not load \"%s\" error %" B_PRIx32 "\n", name, status);
 			else
@@ -195,6 +213,9 @@ load_modules_from(BootVolume& volume, const char* path)
 
 		modules->Close(cookie);
 	}
+
+	if (diagFD >= 0)
+		close(diagFD);
 
 	return B_OK;
 }

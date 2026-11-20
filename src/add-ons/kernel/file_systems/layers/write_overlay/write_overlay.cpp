@@ -86,7 +86,68 @@ struct write_buffer {
 	write_buffer *	next;
 	off_t			position;
 	size_t			length;
+	uint32			magic;
 	uint8			buffer[1];
+};
+
+
+// Debug build (write_overlay corruption hunt): every write buffer carries a
+// magic and a canary behind its data, freed ones are poisoned, and the list is
+// checked on entry to and exit from every operation on it.
+static const uint32 kWriteBufferMagic = 0x57425546;
+static const uint32 kWriteBufferFreed = 0xdeadd00d;
+static const uint64 kWriteBufferCanary = 0xc0ffee11deadbeefULL;
+
+
+static write_buffer*
+wb_alloc(size_t length)
+{
+	write_buffer* buffer = (write_buffer*)malloc(sizeof(write_buffer) - 1
+		+ length + sizeof(uint64));
+	if (buffer == NULL)
+		return NULL;
+	buffer->magic = kWriteBufferMagic;
+	buffer->length = length;
+	memcpy(buffer->buffer + length, &kWriteBufferCanary, sizeof(uint64));
+	return buffer;
+}
+
+
+static void
+wb_set_canary(write_buffer* buffer)
+{
+	memcpy(buffer->buffer + buffer->length, &kWriteBufferCanary,
+		sizeof(uint64));
+}
+
+
+static void
+wb_free(write_buffer* buffer)
+{
+	buffer->magic = kWriteBufferFreed;
+	memset(buffer->buffer, 0xdb, buffer->length < 256 ? buffer->length : 256);
+	free(buffer);
+}
+
+
+static inline bool
+wb_kernel_address(const void* address)
+{
+#ifdef __x86_64__
+	return (addr_t)address >= 0xffff800000000000ULL;
+#else
+	return address != NULL;
+#endif
+}
+
+
+struct wb_op {
+	char		op;
+	char		phase;
+	thread_id	thread;
+	off_t		position;
+	size_t		length;
+	int32		count;
 };
 
 
@@ -193,6 +254,12 @@ public:
 
 private:
 		void				_TrimBuffers();
+	public:
+		void				_CheckBuffers(char op, char phase, off_t position,
+								size_t length);
+	private:
+		wb_op				fOps[16];
+		uint32				fOpIndex;
 		void				_SetCacheSize();
 
 		status_t			_PopulateStat();
@@ -271,6 +338,8 @@ OverlayInode::OverlayInode(OverlayVolume *volume, fs_vnode *superVnode,
 {
 	TRACE("inode created %" B_PRIdINO "\n", fInodeNumber);
 
+	fOpIndex = 0;
+	memset(fOps, 0, sizeof(fOps));
 	recursive_lock_init(&fLock, "write overlay inode lock");
 	if (superVnode != NULL)
 		fSuperVnode = *superVnode;
@@ -301,7 +370,7 @@ OverlayInode::~OverlayInode()
 	write_buffer *element = fWriteBuffers;
 	while (element) {
 		write_buffer *next = element->next;
-		free(element);
+		wb_free(element);
 		element = next;
 	}
 
@@ -691,6 +760,7 @@ OverlayInode::Read(void *_cookie, off_t position, void *buffer, size_t *length,
 	bool readPages, IORequest *ioRequest)
 {
 	RecursiveLocker locker(fLock);
+	_CheckBuffers('R', '<', position, *length);
 	if (position >= fStat.st_size) {
 		*length = 0;
 		return B_OK;
@@ -861,6 +931,8 @@ OverlayInode::Write(void *_cookie, off_t position, const void *buffer,
 	if (!fIsDataModified)
 		SetDataModified();
 
+	_CheckBuffers('W', '<', position, length);
+
 	// find insertion point
 	write_buffer **link = &fWriteBuffers;
 	write_buffer *other = fWriteBuffers;
@@ -900,6 +972,7 @@ OverlayInode::Write(void *_cookie, off_t position, const void *buffer,
 				} else if (user_memcpy(target, buffer, length) < B_OK)
 					return B_BAD_ADDRESS;
 
+				_CheckBuffers('W', 'c', position, length);
 				fStat.st_mtime = time(NULL);
 				if (fIsAttribute) {
 					notify_attribute_changed(SuperVolume()->id, -1,
@@ -921,8 +994,7 @@ OverlayInode::Write(void *_cookie, off_t position, const void *buffer,
 		other = other->next;
 	}
 
-	write_buffer *element = (write_buffer *)malloc(sizeof(write_buffer) - 1
-		+ newLength);
+	write_buffer *element = wb_alloc(newLength);
 	if (element == NULL)
 		return B_NO_MEMORY;
 
@@ -948,7 +1020,7 @@ OverlayInode::Write(void *_cookie, off_t position, const void *buffer,
 				swallow->buffer, swallow->length);
 
 			element->next = swallow->next;
-			free(swallow);
+			wb_free(swallow);
 			swallow = element->next;
 		}
 	}
@@ -964,6 +1036,7 @@ OverlayInode::Write(void *_cookie, off_t position, const void *buffer,
 	} else if (user_memcpy(target, buffer, length) < B_OK)
 		return B_BAD_ADDRESS;
 
+	_CheckBuffers('W', '>', position, length);
 	fStat.st_mtime = time(NULL);
 
 	if (fIsAttribute) {
@@ -1243,8 +1316,57 @@ OverlayInode::_SetCacheSize()
 
 
 void
+OverlayInode::_CheckBuffers(char op, char phase, off_t position, size_t length)
+{
+	int32 count = 0;
+	off_t lastEnd = -1;
+	for (write_buffer* buffer = fWriteBuffers; buffer != NULL;
+			buffer = buffer->next, count++) {
+		uint64 canary = 0;
+		bool sane = wb_kernel_address(buffer)
+			&& buffer->magic == kWriteBufferMagic
+			&& buffer->position >= 0 && buffer->position >= lastEnd
+			&& buffer->length < 1024 * 1024 * 1024;
+		if (sane)
+			memcpy(&canary, buffer->buffer + buffer->length, sizeof(canary));
+		if (!sane || canary != kWriteBufferCanary) {
+			bool kernelAddress = wb_kernel_address(buffer);
+			dprintf("write_overlay: bad write buffer list of inode %" B_PRIdINO
+				" \"%s\" at %c%c (position %" B_PRIdOFF ", length %zu, thread"
+				" %" B_PRId32 "): buffer %" B_PRId32 " %p magic %#" B_PRIx32
+				" position %" B_PRIdOFF " length %zu canary %#" B_PRIx64
+				" previous end %" B_PRIdOFF "\n", fInodeNumber, fName, op,
+				phase, position, length, find_thread(NULL), count,
+				buffer, kernelAddress ? buffer->magic : 0,
+				kernelAddress ? buffer->position : 0,
+				kernelAddress ? buffer->length : 0, canary, lastEnd);
+			for (uint32 i = 0; i < 16; i++) {
+				const wb_op& entry = fOps[(fOpIndex + i) % 16];
+				dprintf("  op %c%c thread %" B_PRId32 " position %" B_PRIdOFF
+					" length %zu buffers %" B_PRId32 "\n",
+					entry.op ? entry.op : '-', entry.phase ? entry.phase : '-',
+					entry.thread, entry.position, entry.length, entry.count);
+			}
+			panic("write_overlay: corrupt write buffer list (%c%c)", op, phase);
+			return;
+		}
+		lastEnd = buffer->position + buffer->length;
+	}
+
+	wb_op& entry = fOps[fOpIndex++ % 16];
+	entry.op = op;
+	entry.phase = phase;
+	entry.thread = find_thread(NULL);
+	entry.position = position;
+	entry.length = length;
+	entry.count = count;
+}
+
+
+void
 OverlayInode::_TrimBuffers()
 {
+	_CheckBuffers('T', '<', fStat.st_size, 0);
 	// the file size has been changed and we want to trim
 	// off everything that goes beyond the new size
 	write_buffer **link = &fWriteBuffers;
@@ -1268,7 +1390,7 @@ OverlayInode::_TrimBuffers()
 		// got a crossing buffer to resize
 		size_t newLength = fStat.st_size - buffer->position;
 		write_buffer *newBuffer = (write_buffer *)realloc(buffer,
-			sizeof(write_buffer) - 1 + newLength);
+			sizeof(write_buffer) - 1 + newLength + sizeof(uint64));
 
 		if (newBuffer != NULL) {
 			buffer = newBuffer;
@@ -1279,6 +1401,7 @@ OverlayInode::_TrimBuffers()
 		}
 
 		buffer->length = newLength;
+		wb_set_canary(buffer);
 		link = &buffer->next;
 		buffer = buffer->next;
 	}
@@ -1287,9 +1410,10 @@ OverlayInode::_TrimBuffers()
 	*link = NULL;
 	while (buffer != NULL) {
 		write_buffer *next = buffer->next;
-		free(buffer);
+		wb_free(buffer);
 		buffer = next;
 	}
+	_CheckBuffers('T', '>', fStat.st_size, 0);
 }
 
 

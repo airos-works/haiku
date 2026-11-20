@@ -197,6 +197,8 @@ platform_start_kernel(void)
 #endif
 			add_safe_mode_settings("debug_screen true\n"
 				"disable_onscreen_paging true\n");
+	// TEST: write_overlay corruption hunt, PCIDs off
+	add_safe_mode_settings("disable_pcid true\n");
 	}
 
 	dprintf("diag: frame buffer %#" B_PRIx64 " size %#" B_PRIx64 " %" B_PRIu32
