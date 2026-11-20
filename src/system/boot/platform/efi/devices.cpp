@@ -120,6 +120,11 @@ EfiDevice::~EfiDevice()
 }
 
 
+// Diagnostic build: block reads so far, logged with every saved log.
+uint64 gDiagReadCalls = 0;
+uint64 gDiagReadBytes = 0;
+
+
 ssize_t
 EfiDevice::ReadAt(void *cookie, off_t pos, void *buffer, size_t bufferSize)
 {
@@ -159,6 +164,8 @@ EfiDevice::ReadAt(void *cookie, off_t pos, void *buffer, size_t bufferSize)
 			toCopy = numBlocks * blockSize - offset;
 		}
 
+		gDiagReadCalls++;
+		gDiagReadBytes += numBlocks * blockSize;
 		efi_status status = fBlockIo->ReadBlocks(fBlockIo,
 			fBlockIo->Media->MediaId, block, numBlocks * blockSize,
 			sBounceBuffer);

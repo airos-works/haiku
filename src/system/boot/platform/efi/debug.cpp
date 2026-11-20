@@ -90,6 +90,19 @@ panic(const char *format, ...)
 {
 	va_list args;
 
+	// Diagnostic build: a panic's message only reaches a console nobody may
+	// see (Apple), so it goes into the log on the stick as well.
+	static bool sPanicking = false;
+	if (!sPanicking) {
+		sPanicking = true;
+		char message[512];
+		va_start(args, format);
+		vsnprintf(message, sizeof(message), format, args);
+		va_end(args);
+		dprintf("*** PANIC *** %s\n", message);
+		platform_save_boot_log("PANIC (message at the end)");
+	}
+
 	platform_switch_to_text_mode();
 
 	puts("*** PANIC ***");
@@ -341,9 +354,13 @@ platform_save_boot_log(const char* stage)
 {
 	dprintf("diag: saving the log (stage: %s, %" B_PRIu32 " bytes)\n", stage,
 		sBufferPosition);
-	char header[160];
+	extern uint64 gDiagReadCalls, gDiagReadBytes;
+	char header[320];
 	snprintf(header, sizeof(header),
-		"=== airOS boot loader log, last stage reached: %s ===\n", stage);
+		"=== airOS boot loader log, last stage reached: %s ===\n"
+		"=== at %" B_PRId64 " ms, %" B_PRIu64 " block reads, %" B_PRIu64
+		" KB read ===\n", stage, system_time() / 1000, gDiagReadCalls,
+		gDiagReadBytes / 1024);
 	diag_save_file(u"\\airos-loader.log", header, sBuffer, sBufferPosition);
 }
 

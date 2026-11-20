@@ -175,9 +175,14 @@ load_modules_from(BootVolume& volume, const char* path)
 			if (!strcmp(name, ".") || !strcmp(name, ".."))
 				continue;
 
+			char stage[B_PATH_NAME_LENGTH];
+			snprintf(stage, sizeof(stage), "loading module %s/%s", path, name);
+			platform_save_boot_log(stage);
 			status_t status = elf_load_image(modules, name);
 			if (status != B_OK)
 				dprintf("Could not load \"%s\" error %" B_PRIx32 "\n", name, status);
+			else
+				dprintf("diag: loaded module %s/%s\n", path, name);
 		}
 
 		modules->Close(cookie);

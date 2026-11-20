@@ -142,6 +142,7 @@ main(stage2_args *args)
 
 			if ((platform_boot_options() & BOOT_OPTION_DEBUG_OUTPUT) == 0)
 				platform_switch_to_logo();
+			platform_save_boot_log("splash drawn, loading modules");
 
 			load_modules(args, bootVolume);
 			platform_save_boot_log("modules loaded");
