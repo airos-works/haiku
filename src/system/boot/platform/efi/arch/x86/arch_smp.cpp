@@ -27,6 +27,7 @@
 
 #include "mmu.h"
 #include "acpi.h"
+#include "efi_platform.h"
 #include "video.h"
 
 
@@ -49,6 +50,18 @@ uint32 get_sentinel(uint64 trampolineStack);
 static bool sX2APIC = false;
 
 
+static uint64 sTSCPerMicrosecond = 0;
+
+
+static inline uint64
+read_tsc()
+{
+	uint32 low, high;
+	asm volatile("rdtsc" : "=a"(low), "=d"(high));
+	return ((uint64)high << 32) | low;
+}
+
+
 static void
 hpet_spin(bigtime_t microseconds)
 {
@@ -65,12 +78,29 @@ hpet_spin(bigtime_t microseconds)
 
 	uint64 end = hpet->u0.counter64
 		+ ((microseconds * 1000000000ULL) / HPET_GET_PERIOD(hpet));
-	while (hpet->u0.counter64 < end)
+	// Diagnostic build: never wait forever on an HPET that does not count.
+	for (uint64 i = 0; hpet->u0.counter64 < end && i < 100000000ULL; i++)
 		asm volatile("pause");
 
 	hpet->config = originalConfig;
 }
-#define spin hpet_spin
+
+
+static void
+diag_spin(bigtime_t microseconds)
+{
+	// Diagnostic build: the TSC, calibrated against the firmware's Stall()
+	// before ExitBootServices, so that the waits do not depend on the HPET.
+	if (sTSCPerMicrosecond == 0) {
+		hpet_spin(microseconds);
+		return;
+	}
+
+	uint64 end = read_tsc() + microseconds * sTSCPerMicrosecond;
+	while (read_tsc() < end)
+		asm volatile("pause");
+}
+#define spin diag_spin
 
 
 static uint32
@@ -319,6 +349,50 @@ arch_smp_init_other_cpus(void)
 
 	TRACE("smp: apic (mapped) = %lx\n", (addr_t)gKernelArgs.arch_args.apic.Pointer());
 
+	// Diagnostic build: what the AP start after ExitBootServices depends on,
+	// in the log that is saved before it.
+	{
+		uint32 bootID = apic_local_id();
+		dprintf("diag: smp: x2APIC %d, local APIC %#" B_PRIx32 ", boot CPU APIC ID %"
+			B_PRIu32 ", %" B_PRIu32 " CPUs:", sX2APIC ? 1 : 0,
+			(uint32)gKernelArgs.arch_args.apic_phys, bootID, gKernelArgs.num_cpus);
+		for (uint32 i = 0; i < gKernelArgs.num_cpus; i++)
+			dprintf(" %" B_PRIu32, gKernelArgs.arch_args.cpu_apic_id[i]);
+		dprintf("\n");
+
+		// The loader starts CPUs 1 and up, so the boot CPU has to be CPU 0;
+		// the MADT need not list it first.
+		for (uint32 i = 1; i < gKernelArgs.num_cpus; i++) {
+			if (gKernelArgs.arch_args.cpu_apic_id[i] != bootID)
+				continue;
+			gKernelArgs.arch_args.cpu_apic_id[i]
+				= gKernelArgs.arch_args.cpu_apic_id[0];
+			gKernelArgs.arch_args.cpu_apic_id[0] = bootID;
+			dprintf("diag: smp: boot CPU was entry %" B_PRIu32 " of the MADT, "
+				"moved to CPU 0\n", i);
+			break;
+		}
+
+		uint64 tsc = read_tsc();
+		kBootServices->Stall(10000);
+		sTSCPerMicrosecond = (read_tsc() - tsc) / 10000;
+		dprintf("diag: smp: TSC %" B_PRIu64 " MHz\n", sTSCPerMicrosecond);
+
+		// still the physical address here: fix_address() comes later
+		hpet_regs* hpet = (hpet_regs*)(addr_t)gKernelArgs.arch_args.hpet.Get();
+		if (hpet != NULL) {
+			uint64 config = hpet->config;
+			uint64 first = hpet->u0.counter64;
+			kBootServices->Stall(1000);
+			uint64 second = hpet->u0.counter64;
+			dprintf("diag: smp: HPET %#" B_PRIx32 " caps %#" B_PRIx64 " config %#"
+				B_PRIx64 ", counter %#" B_PRIx64 " -> %#" B_PRIx64 " in 1 ms\n",
+				gKernelArgs.arch_args.hpet_phys, hpet->capabilities, config,
+				first, second);
+		} else
+			dprintf("diag: smp: no HPET\n");
+	}
+
 	if (gKernelArgs.num_cpus < 2)
 		return;
 
@@ -336,6 +410,19 @@ arch_smp_init_other_cpus(void)
 }
 
 
+static bool
+diag_wait_delivered()
+{
+	// Diagnostic build: wait at most 100 ms for an IPI to be sent.
+	for (int i = 0; i < 10000; i++) {
+		if (apic_interrupt_delivered())
+			return true;
+		spin(10);
+	}
+	return false;
+}
+
+
 void
 arch_smp_boot_other_cpus(addr_t pagedir, uint64 kernelEntry, addr_t virtKernelArgs)
 {
@@ -348,6 +435,8 @@ arch_smp_boot_other_cpus(addr_t pagedir, uint64 kernelEntry, addr_t virtKernelAr
 
 	// copy the trampoline code over
 	copy_trampoline_code(trampolineCode, trampolineStack);
+	// slot 0 of the CPU row (white): the trampoline code is in place
+	video_diag_cpu_mark(0, kDiagCPUTrampoline);
 
 	// boot the cpus
 	TRACE("we have %" B_PRId32 " CPUs to boot...\n", gKernelArgs.num_cpus - 1);
@@ -357,7 +446,7 @@ arch_smp_boot_other_cpus(addr_t pagedir, uint64 kernelEntry, addr_t virtKernelAr
 		uint64 numStartups;
 		uint32 j;
 
-		video_diag_cpu_mark(i, false);
+		video_diag_cpu_mark(i, kDiagCPUStarting);
 		prepare_trampoline_args(trampolineCode, trampolineStack,
 			pagedir, kernelEntry, virtKernelArgs, i);
 
@@ -373,8 +462,7 @@ arch_smp_boot_other_cpus(addr_t pagedir, uint64 kernelEntry, addr_t virtKernelAr
 				| APIC_DELIVERY_MODE_INIT);
 
 		// wait for pending to end
-		while (!apic_interrupt_delivered())
-			asm volatile ("pause;");
+		bool delivered = diag_wait_delivered();
 
 		spin(200);
 
@@ -383,8 +471,8 @@ arch_smp_boot_other_cpus(addr_t pagedir, uint64 kernelEntry, addr_t virtKernelAr
 			APIC_TRIGGER_MODE_LEVEL | APIC_DELIVERY_MODE_INIT);
 
 		// wait for pending to end
-		while (!apic_interrupt_delivered())
-			asm volatile ("pause;");
+		delivered = diag_wait_delivered() && delivered;
+		video_diag_cpu_mark(i, delivered ? kDiagCPUInitSent : kDiagCPUNotDelivered);
 
 		/* wait 10ms */
 		spin(10000);
@@ -402,16 +490,30 @@ arch_smp_boot_other_cpus(addr_t pagedir, uint64 kernelEntry, addr_t virtKernelAr
 			/* wait */
 			spin(200);
 
-			while (!apic_interrupt_delivered())
-				asm volatile ("pause");
+			delivered = diag_wait_delivered() && delivered;
 		}
+		video_diag_cpu_mark(i, delivered ? kDiagCPUStartupSent : kDiagCPUNotDelivered);
 
 		// Wait for the trampoline code to clear the final stack location.
 		// This serves as a notification for us that it has loaded the address
 		// and it is safe for us to overwrite it to trampoline the next CPU.
-		while (get_sentinel(trampolineStack) != 0)
+		// Diagnostic build: give up after a second, put that CPU back into
+		// INIT and boot with the CPUs started so far.
+		bigtime_t waited = 0;
+		while (get_sentinel(trampolineStack) != 0 && waited < 1000000) {
 			spin(1000);
-		video_diag_cpu_mark(i, true);
+			waited += 1000;
+		}
+		if (get_sentinel(trampolineStack) != 0) {
+			video_diag_cpu_mark(i, kDiagCPUTimedOut);
+			apic_set_interrupt_command(gKernelArgs.arch_args.cpu_apic_id[i],
+				APIC_TRIGGER_MODE_LEVEL | APIC_INTR_COMMAND_1_ASSERT
+					| APIC_DELIVERY_MODE_INIT);
+			diag_wait_delivered();
+			gKernelArgs.num_cpus = i;
+			break;
+		}
+		video_diag_cpu_mark(i, kDiagCPUStarted);
 	}
 
 	TRACE("done trampolining\n");

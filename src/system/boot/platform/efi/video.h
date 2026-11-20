@@ -17,6 +17,15 @@ Menu *video_mode_menu();
 
 // diagnostic progress marks, valid until the loader enters the kernel
 void video_diag_mark(int step);
-void video_diag_cpu_mark(int cpu, bool started);
+enum {
+	kDiagCPUTrampoline,		// white
+	kDiagCPUStarting,		// yellow
+	kDiagCPUInitSent,		// orange
+	kDiagCPUStartupSent,	// blue
+	kDiagCPUStarted,		// green
+	kDiagCPUNotDelivered,	// purple: an IPI was never sent
+	kDiagCPUTimedOut		// red: given up after a second
+};
+void video_diag_cpu_mark(int cpu, int state);
 
 #endif	/* VIDEO_H */

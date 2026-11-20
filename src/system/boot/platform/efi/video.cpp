@@ -428,10 +428,15 @@ video_diag_mark(int step)
 
 
 void
-video_diag_cpu_mark(int cpu, bool started)
+video_diag_cpu_mark(int cpu, int state)
 {
-	// bottom row: one square per CPU, yellow while it is being started,
-	// green once it has picked up its start arguments
+	// bottom row: slot 0 for the trampoline code, then one square per CPU
+	// that shows how far its start got (see video.h)
+	static const uint32 kColors[] = {
+		0xffffff, 0xffe000, 0xff8000, 0x2040ff, 0x00c000, 0x9020e0, 0xe00000
+	};
+	if (state < 0 || state >= (int)(sizeof(kColors) / sizeof(kColors[0])))
+		return;
 	diag_fill(16 + cpu * 40, gKernelArgs.frame_buffer.height - 16 - 32, 32,
-		started ? 0x00c000 : 0xffe000);
+		kColors[state]);
 }
