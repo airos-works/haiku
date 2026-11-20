@@ -379,3 +379,59 @@ platform_set_palette(const uint8 *palette)
 	panic("platform_set_palette unsupported");
 	return;
 }
+
+
+// #pragma mark - diagnostic progress marks
+
+
+// Diagnostic build: squares drawn straight into the frame buffer for the steps
+// after the last log save, when nothing can be written to the disk or shown
+// through the firmware any more (ExitBootServices, SetVirtualAddressMap,
+// starting the other CPUs). They rely on the firmware's identity mapping, so
+// they work until the loader enters the kernel.
+static void
+diag_fill(uint32 x, uint32 y, uint32 size, uint32 color)
+{
+	if (!gKernelArgs.frame_buffer.enabled
+		|| gKernelArgs.frame_buffer.depth != 32
+		|| gKernelArgs.frame_buffer.physical_buffer.start == 0
+		|| x + size > gKernelArgs.frame_buffer.width
+		|| y + size > gKernelArgs.frame_buffer.height)
+		return;
+
+	uint8* base = (uint8*)(addr_t)gKernelArgs.frame_buffer.physical_buffer.start;
+	for (uint32 row = 0; row < size; row++) {
+		volatile uint32* line = (volatile uint32*)(base
+			+ (y + row) * gKernelArgs.frame_buffer.bytes_per_row) + x;
+		for (uint32 column = 0; column < size; column++) {
+			bool border = row < 3 || column < 3 || row >= size - 3
+				|| column >= size - 3;
+			line[column] = border ? 0xffffff : color;
+		}
+	}
+}
+
+
+void
+video_diag_mark(int step)
+{
+	// steps cycle through red, orange, yellow, green, cyan, blue, purple, pink
+	static const uint32 kColors[] = {
+		0xe00000, 0xff8000, 0xffe000, 0x00c000,
+		0x00e0e0, 0x2040ff, 0x9020e0, 0xff60c0
+	};
+	// bottom left, above the CPU row: the kernel's on-screen output starts at
+	// the top and only gets here after a whole screen of text
+	diag_fill(16 + step * 64, gKernelArgs.frame_buffer.height - 16 - 32 - 16 - 56,
+		56, kColors[step % (sizeof(kColors) / sizeof(kColors[0]))]);
+}
+
+
+void
+video_diag_cpu_mark(int cpu, bool started)
+{
+	// bottom row: one square per CPU, yellow while it is being started,
+	// green once it has picked up its start arguments
+	diag_fill(16 + cpu * 40, gKernelArgs.frame_buffer.height - 16 - 32, 32,
+		started ? 0x00c000 : 0xffe000);
+}

@@ -27,6 +27,7 @@
 
 #include "mmu.h"
 #include "acpi.h"
+#include "video.h"
 
 
 #define NO_SMP 0
@@ -356,6 +357,7 @@ arch_smp_boot_other_cpus(addr_t pagedir, uint64 kernelEntry, addr_t virtKernelAr
 		uint64 numStartups;
 		uint32 j;
 
+		video_diag_cpu_mark(i, false);
 		prepare_trampoline_args(trampolineCode, trampolineStack,
 			pagedir, kernelEntry, virtKernelArgs, i);
 
@@ -409,6 +411,7 @@ arch_smp_boot_other_cpus(addr_t pagedir, uint64 kernelEntry, addr_t virtKernelAr
 		// and it is safe for us to overwrite it to trampoline the next CPU.
 		while (get_sentinel(trampolineStack) != 0)
 			spin(1000);
+		video_diag_cpu_mark(i, true);
 	}
 
 	TRACE("done trampolining\n");

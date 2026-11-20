@@ -19,6 +19,7 @@
 #include "mmu.h"
 #include "serial.h"
 #include "smp.h"
+#include "video.h"
 
 
 // From entry.S
@@ -94,6 +95,7 @@ arch_start_kernel(addr_t kernelEntry)
 	// Generate page tables for use after ExitBootServices.
 	uint64_t final_pml4 = arch_mmu_generate_post_efi_page_tables(
 		memoryMapSize, memoryMap, descriptorSize, descriptorVersion);
+	video_diag_mark(4);
 
 	// Attempt to fetch the memory map and exit boot services.
 	// This needs to be done in a loop, as ExitBootServices can change the
@@ -113,6 +115,7 @@ arch_start_kernel(addr_t kernelEntry)
 		if (kBootServices->ExitBootServices(kImage, mapKey) == EFI_SUCCESS) {
 			// Disconnect from EFI serial_io / stdio services
 			serial_kernel_handoff();
+			video_diag_mark(5);
 			dprintf("Unhooked from EFI serial services\n");
 			break;
 		}
@@ -131,8 +134,10 @@ arch_start_kernel(addr_t kernelEntry)
 	// Re-init and activate serial in a horrific post-EFI landscape. Clowns roam the land freely.
 	serial_init();
 	serial_enable();
+	video_diag_mark(8);
 
 	smp_boot_other_cpus(final_pml4, kernelEntry, (addr_t)&gKernelArgs);
+	video_diag_mark(9);
 
 	// Enter the kernel!
 	dprintf("arch_enter_kernel(final_pml4: 0x%08" PRIx64 ", kernelArgs: %p, "

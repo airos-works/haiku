@@ -213,6 +213,7 @@ platform_start_kernel(void)
 	platform_save_boot_log("starting the other CPUs");
 	smp_init_other_cpus();
 	platform_save_boot_log("other CPUs started; exiting boot services next");
+	video_diag_mark(0);
 #ifdef _BOOT_FDT_SUPPORT
 	dtb_set_kernel_args();
 #endif
@@ -227,9 +228,11 @@ platform_start_kernel(void)
 	dprintf("  entry: %#lx\n", kernelEntry);
 
 	debug_cleanup();
+	video_diag_mark(1);
 
 	arch_mmu_init();
 	convert_kernel_args();
+	video_diag_mark(2);
 
 	// map in a kernel stack
 	void *stack_address = NULL;
@@ -244,6 +247,7 @@ platform_start_kernel(void)
 
 	// Apply any weird EFI quirks
 	quirks_init();
+	video_diag_mark(3);
 
 	// Begin architecture-centric kernel entry.
 	arch_start_kernel(kernelEntry);
@@ -306,6 +310,9 @@ efi_main(efi_handle image, efi_system_table *systemTable)
 	debug_reserve_syslog_buffer();
 
 	sBootOptions = get_loader_boot_options() | console_check_boot_keys();
+	// Diagnostic build: always as if ESC was held, so that the kernel's
+	// output shows on the screen without having to catch the key.
+	sBootOptions |= BOOT_OPTION_DEBUG_OUTPUT;
 	dprintf("diag: boot options %#" B_PRIx32 "\n", sBootOptions);
 	platform_save_previous_syslog();
 	platform_save_boot_log("loader started");

@@ -20,6 +20,7 @@
 
 #include "mmu.h"
 #include "efi_platform.h"
+#include "video.h"
 
 
 //#define TRACE_MMU
@@ -153,8 +154,10 @@ arch_mmu_post_efi_setup(size_t memory_map_size,
 		gKernelArgs.num_virtual_allocated_ranges);
 
 	// Switch EFI to virtual mode, using the kernel pmap.
+	video_diag_mark(6);
 	kRuntimeServices->SetVirtualAddressMap(memory_map_size, descriptor_size,
 		descriptor_version, memory_map);
+	video_diag_mark(7);
 
 #ifdef TRACE_MEMORY_MAP
 	dprintf("phys memory ranges:\n");
