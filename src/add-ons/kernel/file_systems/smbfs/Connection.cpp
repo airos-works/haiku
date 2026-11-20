@@ -40,7 +40,8 @@ Connection::Connection()
 	fContext(NULL),
 	fGeneration(0),
 	fLastFailure(0),
-	fLastError(0)
+	fLastError(0),
+	fCancelFD(-1)
 {
 	pthread_mutex_init(&fLock, NULL);
 }
@@ -212,20 +213,28 @@ Connection::Wait(Request& request)
 		+ (fOptions->timeout + 5) * 1000000LL;
 
 	while (!request.finished) {
-		struct pollfd pollFD;
-		pollFD.fd = smb2_get_fd(fContext);
-		pollFD.events = smb2_which_events(fContext);
-		pollFD.revents = 0;
+		struct pollfd pollFDs[2];
+		pollFDs[0].fd = smb2_get_fd(fContext);
+		pollFDs[0].events = smb2_which_events(fContext);
+		pollFDs[0].revents = 0;
+		pollFDs[1].fd = fCancelFD;
+		pollFDs[1].events = POLLIN;
+		pollFDs[1].revents = 0;
 
-		if (poll(&pollFD, 1, 1000) < 0) {
+		if (poll(pollFDs, fCancelFD >= 0 ? 2 : 1, 1000) < 0) {
 			if (errno == EINTR)
 				continue;
 			return false;
 		}
 
+		if ((pollFDs[1].revents & (POLLIN | POLLHUP | POLLERR)) != 0
+			&& fCancelFD >= 0) {
+			break;
+		}
+
 		// without events too, that is where it finds requests that took
 		// too long
-		if (smb2_service(fContext, pollFD.revents) < 0)
+		if (smb2_service(fContext, pollFDs[0].revents) < 0)
 			break;
 
 		if (system_time() > deadline)

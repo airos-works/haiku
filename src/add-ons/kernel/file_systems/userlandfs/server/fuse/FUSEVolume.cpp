@@ -8,6 +8,9 @@
 #include <dirent.h>
 
 #include <algorithm>
+#include <set>
+#include <string>
+#include <vector>
 
 #include <fs_info.h>
 #include <NodeMonitor.h>
@@ -1678,7 +1681,7 @@ FUSEVolume::WriteStat(void* _node, const struct stat* st, uint32 mask)
 
 	if (changedFields != 0) {
 		UserlandFS::KernelEmu::notify_listener(B_STAT_CHANGED, changedFields,
-			fID, 0, 0, node->id, NULL, NULL);
+			fID, 0, _ParentID(node), node->id, NULL, NULL);
 	}
 
 	return B_OK;
@@ -1856,7 +1859,8 @@ FUSEVolume::Open(void* _node, int openMode, void** _cookie)
 
 		// send node monitoring message
 		UserlandFS::KernelEmu::notify_listener(B_STAT_CHANGED,
-			B_STAT_SIZE | B_STAT_MODIFICATION_TIME, fID, 0, 0, node->id, NULL,
+			B_STAT_SIZE | B_STAT_MODIFICATION_TIME, fID, 0, _ParentID(node),
+			node->id, NULL,
 			NULL);
 	}
 
@@ -2069,7 +2073,8 @@ FUSEVolume::Write(void* _node, void* _cookie, off_t pos, const void* buffer,
 
 	// send node monitoring message
 	UserlandFS::KernelEmu::notify_listener(B_STAT_CHANGED,
-		B_STAT_SIZE | B_STAT_MODIFICATION_TIME, fID, 0, 0, node->id, NULL,
+		B_STAT_SIZE | B_STAT_MODIFICATION_TIME, fID, 0, _ParentID(node),
+			node->id, NULL,
 		NULL);
 		// TODO: The size possibly doesn't change.
 		// TODO: Avoid message flooding -- use a timeout and set the
@@ -2673,6 +2678,266 @@ FUSEVolume::ReadAttrStat(void* _node, void* _cookie, struct stat* st)
 	st->st_type = cookie->Type();
 
 	return B_OK;
+}
+
+
+// #pragma mark - changes made elsewhere
+
+
+/*!	Volume must be locked. Returns the directory \a node is in, for the
+	node monitor: those who watch the children of a directory hear of the
+	stat changes of what is in it, Tracker for one. 0 when it is in none.
+*/
+ino_t
+FUSEVolume::_ParentID(FUSENode* node)
+{
+	FUSEEntry* entry = node->entries.Head();
+	return entry != NULL ? entry->parent->id : 0;
+}
+
+
+/*!	Reports a change the file system did not make itself. See
+	fuse_haiku_notify_change().
+*/
+status_t
+FUSEVolume::NotifyChange(int what, const char* directory, const char* name)
+{
+	if (fRootNode == NULL)
+		return B_NO_INIT;
+	if (directory == NULL)
+		return B_BAD_VALUE;
+	if (what != FUSE_HAIKU_DIRECTORY_CHANGED
+		&& (name == NULL || name[0] == '\0' || strchr(name, '/') != NULL
+			|| strcmp(name, ".") == 0 || strcmp(name, "..") == 0)) {
+		return B_BAD_VALUE;
+	}
+
+	FUSENode* dir;
+	status_t error = _GetKnownDirectory(directory, &dir);
+	if (error != B_OK) {
+		// Nobody has asked about the directory, so nobody can be watching
+		// it or know anything that is out of date now.
+		return error;
+	}
+
+	switch (what) {
+		case FUSE_HAIKU_ENTRY_CREATED:
+			_NotifyEntryCreated(dir, name);
+			break;
+		case FUSE_HAIKU_ENTRY_REMOVED:
+			_NotifyEntryRemoved(dir, name);
+			break;
+		case FUSE_HAIKU_ENTRY_CHANGED:
+			_NotifyEntryChanged(dir, name);
+			break;
+		case FUSE_HAIKU_DIRECTORY_CHANGED:
+			error = _RescanDirectory(dir);
+			break;
+		default:
+			error = B_BAD_VALUE;
+			break;
+	}
+
+	AutoLocker<Locker> locker(fLock);
+	_PutNode(dir);
+	return error;
+}
+
+
+/*!	Finds the directory at \a path among the entries the volume knows,
+	without asking the file system, and returns it with a reference.
+*/
+status_t
+FUSEVolume::_GetKnownDirectory(const char* path, FUSENode** _dir)
+{
+	char buffer[B_PATH_NAME_LENGTH];
+	if (strlcpy(buffer, path, sizeof(buffer)) >= sizeof(buffer))
+		RETURN_ERROR(B_NAME_TOO_LONG);
+
+	AutoLocker<Locker> locker(fLock);
+
+	FUSENode* node = fRootNode;
+	char* state = NULL;
+	for (char* component = strtok_r(buffer, "/", &state); component != NULL;
+			component = strtok_r(NULL, "/", &state)) {
+		if (strcmp(component, ".") == 0)
+			continue;
+		if (strcmp(component, "..") == 0)
+			return B_BAD_VALUE;
+
+		FUSEEntry* entry = fEntries.Lookup(FUSEEntryRef(node->id, component));
+		if (entry == NULL)
+			return B_ENTRY_NOT_FOUND;
+		node = entry->node;
+	}
+
+	if (!S_ISDIR(node->type))
+		return B_NOT_A_DIRECTORY;
+
+	node->refCount++;
+	*_dir = node;
+	return B_OK;
+}
+
+
+void
+FUSEVolume::_NotifyEntryCreated(FUSENode* dir, const char* name)
+{
+	NodeReadLocker nodeLocker(this, dir, false);
+	if (nodeLocker.Status() != B_OK)
+		return;
+
+	AutoLocker<Locker> locker(fLock);
+	FUSEEntry* entry = fEntries.Lookup(FUSEEntryRef(dir->id, name));
+	if (entry != NULL) {
+		// Known already: this volume made it, and the server tells what it
+		// did, or it was replaced. Either way it may look different now.
+		ino_t nodeID = entry->node->id;
+		locker.Unlock();
+		UserlandFS::KernelEmu::notify_listener(B_STAT_CHANGED,
+			B_STAT_SIZE | B_STAT_MODIFICATION_TIME, fID, 0, dir->id, nodeID,
+			NULL, NULL);
+		return;
+	}
+	locker.Unlock();
+
+	// Asks the file system, which is where it may turn out to be gone again.
+	// The new entry keeps the node; no vnode is needed for telling of it.
+	ino_t nodeID;
+	if (!_GetNodeID(dir, name, &nodeID))
+		return;
+
+	UserlandFS::KernelEmu::notify_listener(B_ENTRY_CREATED, 0, fID, 0,
+		dir->id, nodeID, NULL, name);
+}
+
+
+void
+FUSEVolume::_NotifyEntryRemoved(FUSENode* dir, const char* name)
+{
+	NodeWriteLocker nodeLocker(this, dir, false);
+	if (nodeLocker.Status() != B_OK)
+		return;
+
+	AutoLocker<Locker> locker(fLock);
+	FUSEEntry* entry = fEntries.Lookup(FUSEEntryRef(dir->id, name));
+	if (entry == NULL) {
+		// unknown, or this volume removed it and the server tells
+		return;
+	}
+
+	ino_t nodeID = entry->node->id;
+	_RemoveEntry(entry);
+	locker.Unlock();
+
+	UserlandFS::KernelEmu::notify_listener(B_ENTRY_REMOVED, 0, fID, 0,
+		dir->id, nodeID, NULL, name);
+}
+
+
+void
+FUSEVolume::_NotifyEntryChanged(FUSENode* dir, const char* name)
+{
+	AutoLocker<Locker> locker(fLock);
+	FUSEEntry* entry = fEntries.Lookup(FUSEEntryRef(dir->id, name));
+	if (entry == NULL)
+		return;
+
+	ino_t nodeID = entry->node->id;
+	locker.Unlock();
+
+	UserlandFS::KernelEmu::notify_listener(B_STAT_CHANGED,
+		B_STAT_SIZE | B_STAT_MODIFICATION_TIME, fID, 0, dir->id, nodeID, NULL,
+		NULL);
+}
+
+
+/*!	Reads \a dir again and reports what came and went since the volume last
+	saw it, and that what stayed may have changed. For when the file system
+	cannot tell what changed.
+*/
+status_t
+FUSEVolume::_RescanDirectory(FUSENode* dir)
+{
+	if (fFS == NULL || fFS->ops.readdir == NULL)
+		return B_UNSUPPORTED;
+
+	char path[B_PATH_NAME_LENGTH];
+	size_t pathLen;
+	AutoLocker<Locker> locker(fLock);
+	status_t error = _BuildPath(dir, path, pathLen);
+	locker.Unlock();
+	if (error != B_OK)
+		return error;
+
+	std::set<std::string> names;
+	{
+		NodeReadLocker nodeLocker(this, dir, false);
+		if (nodeLocker.Status() != B_OK)
+			return nodeLocker.Status();
+
+		fuse_file_info info;
+		memset(&info, 0, sizeof(info));
+		int fuseError = fuse_fs_opendir(fFS, path, &info);
+		if (fuseError != 0)
+			return fuseError;
+		fuseError = fuse_fs_readdir(fFS, path, &names, &_CollectDirEntryName,
+			0, &info);
+		fuse_fs_releasedir(fFS, path, &info);
+		if (fuseError != 0)
+			return fuseError;
+	}
+	names.erase(".");
+	names.erase("..");
+
+	std::vector<std::string> removed;
+	std::vector<ino_t> kept;
+	locker.Lock();
+	FUSEEntryTable::Iterator it = fEntries.GetIterator();
+	while (FUSEEntry* entry = it.Next()) {
+		if (entry->parent != dir || entry->node == dir)
+			continue;
+		try {
+			if (names.erase(entry->name) == 0)
+				removed.push_back(entry->name);
+			else
+				kept.push_back(entry->node->id);
+		} catch (...) {
+			return B_NO_MEMORY;
+		}
+	}
+	locker.Unlock();
+
+	// Whoever looks at what stayed reads its stat again, which the file
+	// system has just been asked about with the directory.
+	for (size_t i = 0; i < kept.size(); i++) {
+		UserlandFS::KernelEmu::notify_listener(B_STAT_CHANGED,
+			B_STAT_SIZE | B_STAT_MODIFICATION_TIME, fID, 0, dir->id, kept[i],
+			NULL, NULL);
+	}
+
+	// what is left of the names is new
+	for (size_t i = 0; i < removed.size(); i++)
+		_NotifyEntryRemoved(dir, removed[i].c_str());
+	for (std::set<std::string>::const_iterator name = names.begin();
+			name != names.end(); name++) {
+		_NotifyEntryCreated(dir, name->c_str());
+	}
+
+	return B_OK;
+}
+
+
+/*static*/ int
+FUSEVolume::_CollectDirEntryName(void* buffer, const char* name,
+	const struct stat* st, off_t offset)
+{
+	try {
+		((std::set<std::string>*)buffer)->insert(name);
+	} catch (...) {
+		return 1;
+	}
+	return 0;
 }
 
 

@@ -59,6 +59,16 @@ fuse_version(void)
 }
 
 
+int
+fuse_haiku_notify_change(int what, const char* directory, const char* name)
+{
+	FUSEFileSystem* fileSystem = FUSEFileSystem::GetInstance();
+	if (fileSystem == NULL)
+		return B_NO_INIT;
+	return fileSystem->NotifyChange(what, directory, name);
+}
+
+
 struct fuse_context*
 fuse_get_context(void)
 {

@@ -79,8 +79,10 @@ SidebarView::AttachedToWindow()
 	SetLowUIColor(B_PANEL_BACKGROUND_COLOR);
 	SetHighUIColor(B_PANEL_TEXT_COLOR);
 
-	// mounts and unmounts, and changes to the favorites
-	BVolumeRoster().StartWatching(BMessenger(this));
+	// mounts and unmounts, and changes to the favorites. Not through a
+	// BVolumeRoster: one that goes away stops what it started watching, and
+	// the sidebar would never hear of a volume mounted after it was shown.
+	watch_node(NULL, B_WATCH_MOUNT, BMessenger(this));
 	BPath path;
 	if (find_directory(B_USER_SETTINGS_DIRECTORY, &path, true) == B_OK
 		&& path.Append(kGoDirectory) == B_OK) {
@@ -98,7 +100,6 @@ SidebarView::AttachedToWindow()
 void
 SidebarView::DetachedFromWindow()
 {
-	BVolumeRoster().StopWatching();
 	stop_watching(this);
 }
 

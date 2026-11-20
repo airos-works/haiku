@@ -11,6 +11,7 @@ SubDirC++Flags -DFUSE_USE_VERSION=26 -D_FILE_OFFSET_BITS=64 ;
 
 Addon smbfs :
 	Connection.cpp
+	DirectoryWatcher.cpp
 	StatCache.cpp
 	smbfs.cpp
 	:

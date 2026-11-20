@@ -120,6 +120,37 @@ struct fuse_file_info {
 	| ((uint32_t)'D' << 8) | (uint32_t)'I')
 
 /**
+ * Haiku extension: what fuse_haiku_notify_change() reports.
+ *
+ * FUSE_HAIKU_ENTRY_CREATED: the entry appeared
+ * FUSE_HAIKU_ENTRY_REMOVED: the entry is gone
+ * FUSE_HAIKU_ENTRY_CHANGED: the contents or the stat data of the entry changed
+ * FUSE_HAIKU_DIRECTORY_CHANGED: anything in the directory may have changed;
+ *	\a name is ignored and the directory is read again to find out what
+ */
+#define FUSE_HAIKU_ENTRY_CREATED		1
+#define FUSE_HAIKU_ENTRY_REMOVED		2
+#define FUSE_HAIKU_ENTRY_CHANGED		3
+#define FUSE_HAIKU_DIRECTORY_CHANGED	4
+
+/**
+ * Haiku extension: tells the volume that the entry \a name in the directory
+ * \a directory (a path as the operations get them) changed without the file
+ * system having been asked to do it, as when another machine changes a
+ * network share. Those who watch the directory or the node with the node
+ * monitor (Tracker, file panels) hear of it, and what the volume remembered
+ * about the entry is forgotten.
+ *
+ * Only what somebody has looked at is reported: a directory the volume has
+ * not been asked about yet is ignored. May be called from any thread of the
+ * file system, but not from within an operation on the same directory.
+ *
+ * Returns 0 or an error code.
+ */
+int fuse_haiku_notify_change(int what, const char *directory,
+	const char *name);
+
+/**
  * Ioctl flags
  *
  * FUSE_IOCTL_COMPAT: 32bit compat ioctl on 64bit machine

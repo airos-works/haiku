@@ -78,6 +78,9 @@ public:
 								~Connection();
 
 			void				Init(const Options* options, int index);
+			void				SetCancelFD(int fd)
+									{ fCancelFD = fd; }
+									// when it can be read, Wait() gives up
 
 			void				Lock();
 			bool				TryLock();
@@ -107,6 +110,7 @@ private:
 			uint32				fGeneration;
 			bigtime_t			fLastFailure;
 			int					fLastError;
+			int					fCancelFD;
 };
 
 

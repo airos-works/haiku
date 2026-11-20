@@ -124,6 +124,10 @@ public:
 	virtual	status_t			ReadAttrStat(void* node, void* cookie,
 									struct stat* st);
 
+	// changes the file system did not make (see fuse_haiku_notify_change())
+			status_t			NotifyChange(int what, const char* directory,
+									const char* name);
+
 private:
 	struct DirEntryCache;
 	struct DirCookie;
@@ -200,6 +204,20 @@ private:
 			status_t			_BuildPath(FUSENode* node, char* path,
 									size_t& pathLen);
 			bool				_IsUnlinked(FUSENode* node);
+
+			ino_t				_ParentID(FUSENode* node);
+			status_t			_GetKnownDirectory(const char* path,
+									FUSENode** _dir);
+			void				_NotifyEntryCreated(FUSENode* dir,
+									const char* name);
+			void				_NotifyEntryRemoved(FUSENode* dir,
+									const char* name);
+			void				_NotifyEntryChanged(FUSENode* dir,
+									const char* name);
+			status_t			_RescanDirectory(FUSENode* dir);
+	static	int					_CollectDirEntryName(void* buffer,
+									const char* name, const struct stat* st,
+									off_t offset);
 
 	static	int					_AddReadDirEntryLowLevel(void* buffer, char* buf, size_t bufsize,
 									const char* name, const struct stat* st, off_t offset);
