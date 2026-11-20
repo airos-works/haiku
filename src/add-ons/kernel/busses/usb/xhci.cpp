@@ -383,6 +383,7 @@ XHCI::XHCI(pci_info *info, 	pci_device_module_info* pci, pci_device* device, Sta
 		fCmdRingPhysical(0),
 		fPortsDisconnected(false),
 		fIdleSuspended(false),
+		fIdleKeptRunning(false),
 		fIdleHalted(false),
 		fIdleD3Allowed(false),
 		fIdlePoweredDown(false),
@@ -1037,8 +1038,21 @@ XHCI::_SetInterruptModeration()
 status_t
 XHCI::Suspend(int32 state)
 {
-	if (state == ACPI_POWER_STATE_ON)
+	if (state == ACPI_POWER_STATE_ON) {
+		// A device with a file system keeps the whole bus running: a mass
+		// storage device may not come back from a suspend as the same device
+		// (a card reader that connects again), and its volumes would go with
+		// it, the boot volume of a machine started from a USB disk too.
+		for (int32 slot = 1; slot < XHCI_MAX_DEVICES; slot++) {
+			if (fDevices[slot].slot != 0 && fDevices[slot].keep_running) {
+				TRACE_ALWAYS("slot %" B_PRId32 " holds a file system, the bus "
+					"keeps running\n", slot);
+				fIdleKeptRunning = true;
+				return B_OK;
+			}
+		}
 		return _SuspendToIdle();
+	}
 
 	TRACE_ALWAYS("suspending\n");
 
@@ -1052,6 +1066,10 @@ XHCI::Suspend(int32 state)
 status_t
 XHCI::Resume()
 {
+	if (fIdleKeptRunning) {
+		fIdleKeptRunning = false;
+		return B_OK;
+	}
 	if (fIdleSuspended)
 		return _ResumeFromIdle();
 
@@ -2033,6 +2051,18 @@ XHCI::SetKeepAwake(Device *usbDevice, bool keepAwake)
 		return B_BAD_VALUE;
 
 	device->keep_awake = keepAwake;
+	return B_OK;
+}
+
+
+status_t
+XHCI::SetKeepRunning(Device *usbDevice, bool keepRunning)
+{
+	xhci_device* device = (xhci_device*)usbDevice->ControllerCookie();
+	if (device == NULL || device->slot == 0)
+		return B_BAD_VALUE;
+
+	device->keep_running = keepRunning;
 	return B_OK;
 }
 
