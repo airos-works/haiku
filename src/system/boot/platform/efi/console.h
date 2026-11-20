@@ -11,6 +11,7 @@
 
 status_t console_init(void);
 uint32 console_check_boot_keys(void);
+void console_control_apple(bool graphics);
 
 
 #endif	/* CONSOLE_H */

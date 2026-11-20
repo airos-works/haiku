@@ -249,6 +249,51 @@ graphics_output(uint32* width, uint32* height)
 }
 
 
+static bool
+is_apple_firmware()
+{
+	const char16_t* vendor = (const char16_t*)kSystemTable->FirmwareVendor;
+	if (vendor == NULL)
+		return false;
+	static const char16_t kApple[] = u"Apple";
+	for (size_t i = 0; vendor[i] != 0; i++) {
+		size_t j = 0;
+		while (kApple[j] != 0 && vendor[i + j] == kApple[j])
+			j++;
+		if (kApple[j] == 0)
+			return true;
+	}
+	return false;
+}
+
+
+/*!	Apple's firmware starts in its graphics console mode, which shows nothing
+	written through the text output protocol: the boot menu and the loader's
+	debug output stay invisible (a black screen) until the console is put
+	into text mode with the non-standard Console Control protocol. Upstream
+	dropped this call (Haiku #16753, the keyboard stopped working on the
+	reporter's machines), so it is limited to Apple firmware here.
+*/
+void
+console_control_apple(bool graphics)
+{
+	static int8 sIsApple = -1;
+	if (sIsApple < 0)
+		sIsApple = is_apple_firmware() ? 1 : 0;
+	if (sIsApple == 0)
+		return;
+
+	efi_guid consoleControlGUID = EFI_CONSOLE_CONTROL_PROTOCOL_GUID;
+	efi_console_control_protocol* consoleControl = NULL;
+	if (kBootServices->LocateProtocol(&consoleControlGUID, NULL,
+			(void**)&consoleControl) != EFI_SUCCESS || consoleControl == NULL)
+		return;
+
+	consoleControl->SetMode(consoleControl, graphics
+		? EfiConsoleControlScreenGraphics : EfiConsoleControlScreenText);
+}
+
+
 static void update_screen_size(void)
 {
 	size_t width, height;
@@ -297,6 +342,7 @@ console_init(void)
 #if 1
 	gConsoleNode = &sConsole;
 
+	console_control_apple(false);
 	update_screen_size();
 	console_hide_cursor();
 	console_clear_screen();
@@ -344,6 +390,7 @@ console_check_boot_keys(void)
 extern "C" void
 platform_switch_to_text_mode(void)
 {
+	console_control_apple(false);
 	kSystemTable->ConOut->Reset(kSystemTable->ConOut, false);
 	kSystemTable->ConOut->SetMode(kSystemTable->ConOut, sScreenMode);
 }

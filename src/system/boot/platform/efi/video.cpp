@@ -18,6 +18,7 @@
 #include <edid.h>
 #include <util/list.h>
 
+#include "console.h"
 #include "efi_platform.h"
 #include <efi/protocol/edid.h>
 #include <efi/protocol/graphics-output.h>
@@ -281,15 +282,22 @@ platform_init_video(void)
 }
 
 
-extern "C" void
-platform_switch_to_logo(void)
+/*!	Sets the graphics mode the kernel will use and describes its frame
+	buffer in the kernel args. Without it (debug output instead of the boot
+	splash) the kernel has no frame buffer address for on-screen output.
+*/
+bool
+video_set_kernel_frame_buffer(void)
 {
 	if (sGraphicsOutput == NULL || !gKernelArgs.frame_buffer.enabled)
-		return;
+		return false;
 
 	if (!sModeChosen)
 		get_mode_from_settings();
 
+	// Apple firmware draws its text console over the frame buffer unless it
+	// is back in graphics mode.
+	console_control_apple(true);
 	sGraphicsOutput->SetMode(sGraphicsOutput, sGraphicsMode);
 	gKernelArgs.frame_buffer.physical_buffer.start =
 		sGraphicsOutput->Mode->FrameBufferBase;
@@ -301,8 +309,15 @@ platform_switch_to_logo(void)
 	gKernelArgs.frame_buffer.depth = depth;
 	gKernelArgs.frame_buffer.bytes_per_row = sGraphicsOutput->Mode->Info->PixelsPerScanLine
 			* ((depth + 7) / 8);
+	return true;
+}
 
-	video_display_splash(gKernelArgs.frame_buffer.physical_buffer.start);
+
+extern "C" void
+platform_switch_to_logo(void)
+{
+	if (video_set_kernel_frame_buffer())
+		video_display_splash(gKernelArgs.frame_buffer.physical_buffer.start);
 }
 
 
