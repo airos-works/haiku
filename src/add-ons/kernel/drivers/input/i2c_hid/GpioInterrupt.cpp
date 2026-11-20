@@ -548,7 +548,11 @@ IntelGpioController::Init(const controller_resources& resources)
 			return B_BAD_DATA;
 		}
 
-		community.size = resources.length[bar];
+		// The mapping is whole pages anyway. Some firmware gives the window
+		// one byte short (Lenovo Yoga 11e 5th gen, Gemini Lake: 0xaff for
+		// 80 pads of 16 bytes from 0x600); Linux does not check it at all.
+		community.size = (resources.length[bar] + B_PAGE_SIZE - 1)
+			& ~(uint32)(B_PAGE_SIZE - 1);
 		community.area = map_physical_memory("i2c_hid gpio community",
 			resources.base[bar], community.size, B_ANY_KERNEL_ADDRESS,
 			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
