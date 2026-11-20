@@ -90,6 +90,8 @@ get_accelerant_hook(uint32 feature, void* data)
 			return (void*)amdgpu_create_frame_buffer_shadow;
 		case B_COPY_FRAME_BUFFER_SOURCE:
 			return (void*)amdgpu_copy_frame_buffer_source;
+		case B_FRAME_BUFFER_IS_PARTIAL:
+			return (void*)amdgpu_frame_buffer_is_partial;
 	}
 	return NULL;
 }

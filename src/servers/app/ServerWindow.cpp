@@ -4575,9 +4575,12 @@ ServerWindow::HandleDirectConnection(int32 bufferState, int32 driverState)
 	::HWInterface* graphicsCard = fDesktop->HWInterface();
 	bool devicePixels = (fWindow->Flags() & B_DIRECT_DEVICE_PIXELS) != 0
 		&& graphicsCard->SoftwareScale() == 100;
-	if ((graphicsCard->SoftwareScale() != 100
-			|| graphicsCard->RenderScale() != 100)
-		&& !devicePixels
+	// Neither is a front buffer that is only part of the picture (several
+	// GPUs): a window drawing into it would show on one of them only.
+	if ((((graphicsCard->SoftwareScale() != 100
+				|| graphicsCard->RenderScale() != 100)
+			&& !devicePixels)
+			|| graphicsCard->FrontBufferIsPartial())
 		&& (bufferState & B_DIRECT_MODE_MASK) != B_DIRECT_STOP) {
 		if (!fIsDirectlyAccessing)
 			return;

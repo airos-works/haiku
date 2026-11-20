@@ -213,3 +213,13 @@ multi_card_fill_from_first(void)
 			first.height, 0, 0, first.width, first.height);
 	}
 }
+
+
+/*!	B_FRAME_BUFFER_IS_PARTIAL: with more than one card, the first card's
+	frame buffer is not what all the monitors show; direct windows are kept
+	out of it (app_server stops their direct access). */
+extern "C" bool
+amdgpu_frame_buffer_is_partial(void)
+{
+	return multi_card_copies();
+}

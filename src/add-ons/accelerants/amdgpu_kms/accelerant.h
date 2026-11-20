@@ -201,6 +201,7 @@ void multi_card_delete_source(uint32 id);
 status_t multi_card_copy(uint32 id, const fill_rect_params* list,
 	uint32 count);
 void multi_card_fill_from_first(void);
+extern "C" bool amdgpu_frame_buffer_is_partial(void);
 
 
 // outputs and modes (mode.cpp)

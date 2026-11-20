@@ -101,6 +101,10 @@ enum {
 	   screen, so that the CPU does not copy what was drawn a second time */
 	B_CREATE_FRAME_BUFFER_SHADOW,		/* optional */
 	B_COPY_FRAME_BUFFER_SOURCE,			/* optional */
+	/* whether the frame buffer is only part of what the monitors show (more
+	   than one GPU: each shows its own copy of its part): then nothing may
+	   draw into it directly, only through the copies above */
+	B_FRAME_BUFFER_IS_PARTIAL,			/* optional */
 
 	/* 3D acceleration */
 	B_ACCELERANT_PRIVATE_START = (int)0x80000000
@@ -490,6 +494,7 @@ typedef status_t (*create_frame_buffer_shadow)(uint16 width, uint16 height,
    Anything but B_OK: nothing may have been copied. */
 typedef status_t (*copy_frame_buffer_source)(uint32 from, uint32 to,
 	const fill_rect_params* list, uint32 count);
+typedef bool (*frame_buffer_is_partial)(void);
 /*
 	The uint16* list points to a list of tripples:
 		list[N+0]  Y co-ordinate of span

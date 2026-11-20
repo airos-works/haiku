@@ -197,6 +197,7 @@ AccelerantHWInterface::AccelerantHWInterface()
 	fAccCopyToFrameBuffer(NULL),
 	fAccCreateFrameBufferShadow(NULL),
 	fAccCopyFrameBufferSource(NULL),
+	fAccFrameBufferIsPartial(NULL),
 	fDeviceCopyFailed(false),
 
 	fModeCount(0),
@@ -512,6 +513,8 @@ AccelerantHWInterface::_SetupDefaultHooks()
 		B_CREATE_FRAME_BUFFER_SHADOW, NULL);
 	fAccCopyFrameBufferSource = (copy_frame_buffer_source)fAccelerantHook(
 		B_COPY_FRAME_BUFFER_SOURCE, NULL);
+	fAccFrameBufferIsPartial = (frame_buffer_is_partial)fAccelerantHook(
+		B_FRAME_BUFFER_IS_PARTIAL, NULL);
 	if (fAccCreateFrameBufferSource == NULL
 		|| fAccDeleteFrameBufferSource == NULL
 		|| fAccCopyToFrameBuffer == NULL) {
@@ -2074,6 +2077,13 @@ bool
 AccelerantHWInterface::IsDoubleBuffered() const
 {
 	return fBackBuffer.IsSet();
+}
+
+
+bool
+AccelerantHWInterface::FrontBufferIsPartial() const
+{
+	return fAccFrameBufferIsPartial != NULL && fAccFrameBufferIsPartial();
 }
 
 

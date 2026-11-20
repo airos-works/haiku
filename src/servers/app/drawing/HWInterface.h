@@ -185,6 +185,9 @@ public:
 	virtual	RenderingBuffer*	FrontBuffer() const = 0;
 	virtual	RenderingBuffer*	BackBuffer() const = 0;
 	virtual	bool				IsDoubleBuffered() const = 0;
+	// The front buffer is not all the monitors show (several GPUs, each with
+	// a copy of its part): direct windows must not draw into it.
+	virtual	bool				FrontBufferIsPartial() const { return false; }
 
 	// Parts of the drawing buffer a direct window left out of date: it wrote
 	// only the frame buffer there (BDirectWindow::MarkDrawingBitsStale()).

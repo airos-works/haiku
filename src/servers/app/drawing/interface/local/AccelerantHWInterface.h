@@ -104,6 +104,7 @@ public:
 	virtual	RenderingBuffer*	FrontBuffer() const;
 	virtual	RenderingBuffer*	BackBuffer() const;
 	virtual	bool				IsDoubleBuffered() const;
+	virtual	bool				FrontBufferIsPartial() const;
 
 protected:
 	virtual	void				_CopyBackToFront(/*const*/ BRegion& region);
@@ -224,6 +225,7 @@ private:
 			copy_to_frame_buffer fAccCopyToFrameBuffer;
 			create_frame_buffer_shadow fAccCreateFrameBufferShadow;
 			copy_frame_buffer_source fAccCopyFrameBufferSource;
+			frame_buffer_is_partial fAccFrameBufferIsPartial;
 			bool				fDeviceCopyFailed;
 
 			frame_buffer_config	fFrameBufferConfig;
