@@ -94,9 +94,68 @@ non_boot_cpu_init(void* args, int currentCPU)
 }
 
 
+#if defined(__x86_64__)
+// Diagnostic build: squares drawn straight into the frame buffer through the
+// physical map, for the steps before the on-screen debug output exists (the
+// 2017 iMac boot hang). Bottom row: each CPU's square turns cyan when it
+// enters the kernel, blue once all CPUs met, pink once it is set up. The row
+// above the loader's squares: the boot CPU's steps up to debug_init().
+static void
+diag_kernel_fill(const kernel_args* args, uint32 x, uint32 y, uint32 size,
+	uint32 color)
+{
+	if (!args->frame_buffer.enabled || args->frame_buffer.depth != 32
+		|| args->frame_buffer.physical_buffer.start == 0
+		|| x + size > args->frame_buffer.width
+		|| y + size > args->frame_buffer.height)
+		return;
+
+	uint8* base = (uint8*)(KERNEL_PMAP_BASE
+		+ args->frame_buffer.physical_buffer.start);
+	for (uint32 row = 0; row < size; row++) {
+		volatile uint32* line = (volatile uint32*)(base
+			+ (y + row) * args->frame_buffer.bytes_per_row) + x;
+		for (uint32 column = 0; column < size; column++) {
+			bool border = row < 3 || column < 3 || row >= size - 3
+				|| column >= size - 3;
+			line[column] = border ? 0xffffff : color;
+		}
+	}
+}
+
+
+static void
+diag_kernel_step(const kernel_args* args, int step)
+{
+	static const uint32 kColors[] = {
+		0xe00000, 0xff8000, 0xffe000, 0x00c000,
+		0x00e0e0, 0x2040ff, 0x9020e0, 0xff60c0
+	};
+	diag_kernel_fill(args, 16 + step * 48,
+		args->frame_buffer.height - 16 - 32 - 16 - 56 - 16 - 40, 40,
+		kColors[step % (sizeof(kColors) / sizeof(kColors[0]))]);
+}
+
+
+static void
+diag_kernel_cpu(const kernel_args* args, int cpu, uint32 color)
+{
+	diag_kernel_fill(args, 16 + cpu * 40, args->frame_buffer.height - 16 - 32,
+		32, color);
+}
+#else
+#	define diag_kernel_step(args, step)
+#	define diag_kernel_cpu(args, cpu, color)
+#endif
+
+
 extern "C" int
 _start(kernel_args *bootKernelArgs, int currentCPU)
 {
+	diag_kernel_cpu(bootKernelArgs, currentCPU, 0x00e0e0);
+	if (currentCPU == 0)
+		diag_kernel_step(bootKernelArgs, 0);
+
 	if (bootKernelArgs->version == CURRENT_KERNEL_ARGS_VERSION
 		&& bootKernelArgs->kernel_args_size == kernel_args_size_v1) {
 		sKernelArgs.ucode_data = NULL;
@@ -112,27 +171,42 @@ _start(kernel_args *bootKernelArgs, int currentCPU)
 	}
 
 	smp_set_num_cpus(bootKernelArgs->num_cpus);
+	if (currentCPU == 0)
+		diag_kernel_step(bootKernelArgs, 1);
 
 	// wait for all the cpus to get here
 	smp_cpu_rendezvous(&sCpuRendezvous);
+	diag_kernel_cpu(bootKernelArgs, currentCPU, 0x2040ff);
+	if (currentCPU == 0)
+		diag_kernel_step(bootKernelArgs, 2);
 
 	// the passed in kernel args are in a non-allocated range of memory
 	if (currentCPU == 0)
 		memcpy((void*)&sKernelArgs, bootKernelArgs, bootKernelArgs->kernel_args_size);
 
 	smp_cpu_rendezvous(&sCpuRendezvous2);
+	if (currentCPU == 0)
+		diag_kernel_step(&sKernelArgs, 3);
 
 	// do any pre-booting cpu config
 	cpu_preboot_init_percpu(&sKernelArgs, currentCPU);
+	if (currentCPU == 0)
+		diag_kernel_step(&sKernelArgs, 4);
 	thread_preboot_init_percpu(&sKernelArgs, currentCPU);
+	diag_kernel_cpu(&sKernelArgs, currentCPU, 0xff60c0);
+	if (currentCPU == 0)
+		diag_kernel_step(&sKernelArgs, 5);
 
 	// if we're not a boot cpu, spin here until someone wakes us up
 	if (smp_trap_non_boot_cpus(currentCPU, &sCpuRendezvous3)) {
+		diag_kernel_step(&sKernelArgs, 6);
 		// init platform
 		arch_platform_init(&sKernelArgs);
+		diag_kernel_step(&sKernelArgs, 7);
 
 		// setup debug output
 		debug_init(&sKernelArgs);
+		diag_kernel_step(&sKernelArgs, 8);
 		set_dprintf_enabled(true);
 		dprintf("Welcome to kernel debugger output!\n");
 		dprintf("Haiku revision: %s, debug level: %d\n", get_haiku_revision(),

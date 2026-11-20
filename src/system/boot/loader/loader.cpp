@@ -40,6 +40,12 @@
 static const char* const kSystemDirectoryPrefix = SYSTEM_DIRECTORY_PREFIX;
 
 static const char *sKernelPaths[][2] = {
+	// Diagnostic build: a kernel put in the boot volume's root takes
+	// precedence over the packaged one.
+	{ "airos-diag/" KERNEL_IMAGE, KERNEL_IMAGE },
+#ifdef ALTERNATE_BOOT_ARCH
+	{ "airos-diag/" ALTERNATE_KERNEL_IMAGE, ALTERNATE_KERNEL_IMAGE },
+#endif
 	{ KERNEL_PATH, KERNEL_IMAGE },
 #ifdef ALTERNATE_BOOT_ARCH
 	{ ALTERNATE_KERNEL_PATH, ALTERNATE_KERNEL_IMAGE },
@@ -75,6 +81,7 @@ find_kernel(BootVolume& volume, const char** name = NULL)
 {
 	for (int32 i = 0; sKernelPaths[i][0] != NULL; i++) {
 		int fd = open_maybe_packaged(volume, sKernelPaths[i][0], O_RDONLY);
+		dprintf("diag: kernel %s: %d\n", sKernelPaths[i][0], fd);
 		if (fd >= 0) {
 			if (name)
 				*name = sKernelPaths[i][1];
@@ -129,6 +136,7 @@ load_kernel(stage2_args* args, BootVolume& volume)
 		return fd;
 
 	dprintf("load kernel %s...\n", name);
+
 
 	elf_init();
 	preloaded_image *image;
