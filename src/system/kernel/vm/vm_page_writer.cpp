@@ -979,6 +979,16 @@ status_t
 vm_page_write_modified_page_range(struct VMCache* cache, uint32 firstPage,
 	uint32 endPage)
 {
+	// Off for now: on a 16-core Xeon with an NVMe disk the asynchronous runs
+	// below still panicked under concurrent fsync() and sync() (a transfer of
+	// a run being finished without its cache, after the notification race in
+	// PageWriterRun was fixed): some completion still reaches a run that is
+	// already finished or reused. Until that is found, fsync() and sync()
+	// write one transfer at a time as before efe75687b7.
+	static const bool kAsynchronousRuns = false;
+	if (!kAsynchronousRuns)
+		return write_modified_page_range_synchronously(cache, firstPage, endPage);
+
 	// Asynchronous writes, in runs: one is written while the next is
 	// collected and scheduled. (The caller's reference to the cache keeps
 	// its store, which may be on its way out: no references of our own.)
