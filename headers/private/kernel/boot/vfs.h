@@ -43,6 +43,8 @@ class Node : public DoublyLinkedListLinkImpl<Node> {
 		virtual int32 Type() const;
 		virtual off_t Size() const;
 		virtual ino_t Inode() const;
+		virtual uint32 LogicalBlockSize() const;
+			// of a disk: the unit its partition tables count in
 
 		void Stat(struct stat& stat);
 
@@ -186,7 +188,8 @@ extern Node* get_node_from(int fd);
 extern Directory* directory_from(DIR* dir);
 	// does not return a reference
 
-extern status_t add_partitions_for(int fd, bool mountFileSystems, bool isBootDevice = false);
+extern status_t add_partitions_for(int fd, bool mountFileSystems, bool isBootDevice = false,
+	uint32 blockSize = 512);
 extern status_t add_partitions_for(Node *device, bool mountFileSystems, bool isBootDevice = false);
 
 #endif	/* __cplusplus */

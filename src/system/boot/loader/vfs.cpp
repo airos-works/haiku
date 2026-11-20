@@ -165,6 +165,13 @@ Node::Inode() const
 }
 
 
+uint32
+Node::LogicalBlockSize() const
+{
+	return 512;
+}
+
+
 void
 Node::Stat(struct stat& stat)
 {

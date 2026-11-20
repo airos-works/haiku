@@ -445,15 +445,17 @@ Partition::Scan(bool mountFileSystems, bool isBootDevice)
 	All created partitions are added to the gPartitions list.
 */
 status_t
-add_partitions_for(int fd, bool mountFileSystems, bool isBootDevice)
+add_partitions_for(int fd, bool mountFileSystems, bool isBootDevice,
+	uint32 blockSize)
 {
 	TRACE(("add_partitions_for(fd = %d, mountFS = %s)\n", fd,
 		mountFileSystems ? "yes" : "no"));
 
 	Partition *partition = new(nothrow) Partition(fd);
 
-	// set some magic/default values
-	partition->block_size = 512;
+	// The unit partition tables count in: a GUID partition table starts in
+	// block 1, at 4096 on a disk with 4 KiB logical blocks (Apple's SSDs).
+	partition->block_size = blockSize;
 
 	struct stat stat;
 	if (fstat(fd, &stat) == B_OK)
@@ -487,7 +489,8 @@ add_partitions_for(Node *device, bool mountFileSystems, bool isBootDevice)
 	if (fd < B_OK)
 		return fd;
 
-	status_t status = add_partitions_for(fd, mountFileSystems, isBootDevice);
+	status_t status = add_partitions_for(fd, mountFileSystems, isBootDevice,
+		device->LogicalBlockSize());
 	if (status < B_OK)
 		dprintf("add_partitions_for(%d) failed: %" B_PRIx32 "\n", fd, status);
 

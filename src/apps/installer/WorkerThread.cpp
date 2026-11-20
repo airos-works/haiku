@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <functional>
 #include <set>
 #include <string>
@@ -1109,11 +1110,15 @@ WorkerThread::_PrepareWholeDisk(partition_id diskID, partition_id& _bootID,
 
 	_SetStatusMessage(B_TRANSLATE("Formatting the partitions" B_UTF8_ELLIPSIS));
 
+	// BFS blocks can't be smaller than the disk's (4 KiB on Apple's SSDs)
+	BString bfsParameters;
+	bfsParameters.SetToFormat("block_size %" B_PRIu32 "\n",
+		std::max((uint32)2048, device.BlockSize()));
 	status = _InitializePartition(diskID, _espID, kPartitionTypeFAT32, "EFI",
 		"fat 32;\n");
 	if (status == B_OK) {
 		status = _InitializePartition(diskID, _bootID, kPartitionTypeBFS,
-			kWholeDiskVolumeName, "block_size 2048\n");
+			kWholeDiskVolumeName, bfsParameters.String());
 	}
 	if (status != B_OK) {
 		fErrorContext = B_TRANSLATE("The partitions could not be "

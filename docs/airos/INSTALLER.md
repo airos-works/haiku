@@ -27,14 +27,19 @@ anything. Then the Installer (`WorkerThread::_PrepareWholeDisk()`):
 1. unmounts every volume on the disk (forcibly if one is busy: the user has
    agreed to erase it);
 2. writes an empty GUID partition map;
-3. creates a 256 MiB *EFI system partition* and one *Be File System*
-   partition over the rest, both aligned to 1 MiB;
-4. formats them: FAT32 named `EFI`, BFS named `airOS` (2 KiB blocks);
+3. creates a 512 MiB *EFI system partition* and one *Be File System*
+   partition over the rest, both aligned to 1 MiB. FAT32 needs at least
+   65525 clusters: on a disk with 4 KiB sectors (Apple's NVMe SSDs, such as
+   the 2017 iMac's) a 256 MiB partition has fewer and cannot be formatted;
+4. formats them: FAT32 named `EFI`, BFS named `airOS` (2 KiB blocks, or the
+   disk's block size where that is larger: 4 KiB on Apple's SSDs);
 5. installs onto the BFS partition as for any partition;
 6. copies the system's EFI loader (`/boot/system/data/platform_loaders/
    haiku_loader.efi`) to the removable-media path of the EFI system partition,
    `EFI/BOOT/BOOTAA64.EFI` (`BOOTX64.EFI` on x86_64). UEFI firmware starts that
-   from a disk without a boot entry, so no NVRAM variable is needed;
+   from a disk without a boot entry, so no NVRAM variable is needed. Next to
+   it goes `.VolumeIcon.icns` (from the same folder), the icon Apple's boot
+   picker shows for the disk;
 7. writes everything out (`sync`) before it reports success.
 
 Each partitioning step is written on its own and retried on a freshly read
@@ -152,7 +157,7 @@ noted:
 
 | Test | Result |
 | --- | --- |
-| install onto the blank disk | installs; the disk has a GPT, a 256 MiB FAT32 ESP with `EFI/BOOT/BOOTAA64.EFI` and the `airOS` BFS partition; it boots alone to the desktop |
+| install onto the blank disk | installs; the disk has a GPT, a 512 MiB FAT32 ESP with `EFI/BOOT/BOOTAA64.EFI` and the `airOS` BFS partition; it boots alone to the desktop |
 | install onto the MBR disk | erases it (its FAT volume unmounted), installs, boots alone to the desktop with every application in Deskbar's menu; Summit starts and shows its start page |
 | live session with the ISO read-only | boots read-only beneath the overlay (`Boot partition is on a hybrid ISO image, using it read-only.`), no panic |
 | ISO as a USB CD-ROM | boots read-only beneath the overlay; QEMU's emulated USB CD-ROM then failed a transfer while copying (`usb_disk: sending or receiving of the data failed`), so the NanoKVM's disk mode is used |

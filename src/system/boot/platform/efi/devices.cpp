@@ -102,6 +102,8 @@ class EfiDevice : public Node
 		virtual off_t Size() const {
 			return (fBlockIo->Media->LastBlock + 1) * BlockSize(); }
 
+		virtual uint32 LogicalBlockSize() const { return BlockSize(); }
+
 		uint32 BlockSize() const { return fBlockIo->Media->BlockSize; }
 	private:
 		efi_block_io_protocol*		fBlockIo;
