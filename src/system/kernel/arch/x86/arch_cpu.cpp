@@ -1762,14 +1762,19 @@ arch_cpu_init_post_vm(kernel_args* args)
 	}
 
 	// Process context identifiers: switching between teams keeps their TLB
-	// entries (#104).
+	// entries (#104). Off unless asked for ("enable_pcid"): with them, a
+	// process could still write through a stale translation into a page that
+	// had been freed and reused, which corrupted kernel heap memory (two
+	// write_overlay files' buffers ended up sharing data, and the overlay
+	// panicked with a general protection fault). The race is not found yet.
 	if (x86_check_feature(IA32_FEATURE_EXT_PCID, FEATURE_EXT)) {
-		if (!get_safemode_boolean("disable_pcid", false)) {
+		if (get_safemode_boolean("enable_pcid", false)
+			&& !get_safemode_boolean("disable_pcid", false)) {
 			dprintf("enable PCID\n");
 			call_all_cpus_sync(&enable_pcid, NULL);
 			gX86PCIDEnabled = true;
 		} else
-			dprintf("PCID disabled per safemode setting\n");
+			dprintf("PCID not enabled (safe mode option \"enable_pcid\")\n");
 	}
 
 	// if available enable XSAVE (XSAVE and extended states)
