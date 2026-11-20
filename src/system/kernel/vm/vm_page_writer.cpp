@@ -124,6 +124,9 @@ private:
 	uint32				fWrapperCount;
 	uint32				fTransferCount;
 	int32				fPendingTransfers;
+	int32				fNotified;
+		// set once the last transfer's notification is complete: until then
+		// the notifier still uses fAllFinishedCondition
 	PageWriteWrapper*	fWrappers;
 	PageWriteTransfer*	fTransfers;
 	ConditionVariable	fAllFinishedCondition;
@@ -430,6 +433,7 @@ PageWriterRun::Init(uint32 maxPages, uint32 maxTransfers,
 	fWrapperCount = 0;
 	fTransferCount = 0;
 	fPendingTransfers = 0;
+	fNotified = 1;
 
 	fWrappers = new(malloc_flags(allocationFlags)) PageWriteWrapper[maxPages];
 	fTransfers
@@ -486,9 +490,16 @@ void
 PageWriterRun::Start(uint32 flags)
 {
 	atomic_set(&fPendingTransfers, fTransferCount);
+	atomic_set(&fNotified, 0);
 
 	fAllFinishedCondition.Init(this, "page writer wait for I/O");
 	fAllFinishedCondition.Add(&fWaitEntry);
+
+	if (fTransferCount == 0) {
+		atomic_set(&fNotified, 1);
+		fAllFinishedCondition.NotifyAll();
+		return;
+	}
 
 	// schedule writes
 	for (uint32 i = 0; i < fTransferCount; i++)
@@ -505,6 +516,17 @@ PageWriterRun::Finish()
 {
 	// wait until all pages have been written
 	fWaitEntry.Wait();
+
+	// The waiter is woken from inside NotifyAll(), which goes on using the
+	// condition variable (its entry list, its spinlock) for a moment, on the
+	// thread that completed the last transfer. This run is started again or
+	// deleted next (vm_page_write_modified_page_range() does that at once):
+	// re-initializing the variable under the notifier corrupted its lock and
+	// let the old notification wake the next wait early, completing pages
+	// still being written ("completing page write wrapper that is not
+	// active", a fault in ~PageWriterRun()).
+	while (atomic_get(&fNotified) == 0)
+		cpu_pause();
 
 	// mark pages depending on whether they could be written or not
 
@@ -545,8 +567,11 @@ void
 PageWriterRun::PageWritten(PageWriteTransfer* transfer, status_t status,
 	bool partialTransfer, size_t bytesTransferred)
 {
-	if (atomic_add(&fPendingTransfers, -1) == 1)
+	if (atomic_add(&fPendingTransfers, -1) == 1) {
 		fAllFinishedCondition.NotifyAll();
+		// the last access to this run
+		atomic_set(&fNotified, 1);
+	}
 }
 
 
