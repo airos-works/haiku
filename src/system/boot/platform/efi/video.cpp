@@ -433,7 +433,8 @@ video_diag_cpu_mark(int cpu, int state)
 	// bottom row: slot 0 for the trampoline code, then one square per CPU
 	// that shows how far its start got (see video.h)
 	static const uint32 kColors[] = {
-		0xffffff, 0xffe000, 0xff8000, 0x2040ff, 0x00c000, 0x9020e0, 0xe00000
+		0xffffff, 0xffe000, 0xff8000, 0x2040ff, 0x00c000, 0x9020e0, 0xe00000,
+		0x808080
 	};
 	if (state < 0 || state >= (int)(sizeof(kColors) / sizeof(kColors[0])))
 		return;

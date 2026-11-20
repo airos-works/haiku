@@ -319,6 +319,74 @@ arch_smp_get_current_cpu(void)
 }
 
 
+static uint64 sTrampolineStack = 0x8000;
+static uint64 sTrampolineCode = 0x9000;
+
+
+static void
+diag_log_mapping(uint64 address)
+{
+	// Diagnostic build: how the firmware's page tables (which the loader
+	// still runs on when it starts the APs) map a low address.
+	uint64 cr3;
+	asm volatile("movq %%cr3, %0" : "=r"(cr3));
+	uint64 cr0;
+	asm volatile("movq %%cr0, %0" : "=r"(cr0));
+	dprintf("diag: smp: cr0 %#" B_PRIx64 " cr3 %#" B_PRIx64 ", %#" B_PRIx64 ":",
+		cr0, cr3, address);
+	uint64 table = cr3 & 0x000ffffffffff000ULL;
+	const int shifts[] = { 39, 30, 21, 12 };
+	for (int level = 0; level < 4; level++) {
+		uint64 entry = ((uint64*)(addr_t)table)[(address >> shifts[level]) & 0x1ff];
+		dprintf(" L%d %#" B_PRIx64, 4 - level, entry);
+		if ((entry & 1) == 0) {
+			dprintf(" (not present)");
+			break;
+		}
+		if (level > 0 && level < 3 && (entry & 0x80) != 0) {
+			dprintf(" (large page)");
+			break;
+		}
+		table = entry & 0x000ffffffffff000ULL;
+	}
+	dprintf("\n");
+}
+
+
+static void
+diag_log_low_memory_map()
+{
+	size_t size = 0;
+	size_t key;
+	size_t descriptorSize;
+	uint32_t version;
+	efi_memory_descriptor dummy;
+	if (kBootServices->GetMemoryMap(&size, &dummy, &key, &descriptorSize,
+			&version) != EFI_BUFFER_TOO_SMALL)
+		return;
+	size += 4 * descriptorSize;
+	efi_memory_descriptor* map = NULL;
+	if (kBootServices->AllocatePool(EfiLoaderData, size, (void**)&map)
+			!= EFI_SUCCESS)
+		return;
+	if (kBootServices->GetMemoryMap(&size, map, &key, &descriptorSize,
+			&version) == EFI_SUCCESS) {
+		for (size_t i = 0; i < size / descriptorSize; i++) {
+			efi_memory_descriptor* entry = (efi_memory_descriptor*)
+				((addr_t)map + i * descriptorSize);
+			if (entry->PhysicalStart >= 0x100000)
+				continue;
+			dprintf("diag: smp: low memory %#" B_PRIx64 "-%#" B_PRIx64
+				" type %" B_PRIu32 " attr %#" B_PRIx64 "\n",
+				entry->PhysicalStart,
+				entry->PhysicalStart + entry->NumberOfPages * B_PAGE_SIZE,
+				entry->Type, entry->Attribute);
+		}
+	}
+	kBootServices->FreePool(map);
+}
+
+
 void
 arch_smp_init_other_cpus(void)
 {
@@ -396,6 +464,30 @@ arch_smp_init_other_cpus(void)
 	if (gKernelArgs.num_cpus < 2)
 		return;
 
+	// The AP trampoline (code page plus argument/stack page below it) has to
+	// be below 1 MB. Ask the firmware for it while it still can be asked: the
+	// fixed 0x8000/0x9000 used so far need not be usable memory, nor mapped
+	// writable in the firmware's page tables we still run on after
+	// ExitBootServices.
+	{
+		efi_physical_addr address = 0x9ffff;
+		efi_status status = kBootServices->AllocatePages(AllocateMaxAddress,
+			EfiLoaderData, 2, &address);
+		if (status == EFI_SUCCESS && address >= 0x1000 && address + 0x2000 <= 0xa0000) {
+			sTrampolineStack = address;
+			sTrampolineCode = address + 0x1000;
+		}
+		dprintf("diag: smp: low memory for the trampoline: %#" B_PRIx64
+			" (status %#" B_PRIx64 "), using stack %#" B_PRIx64 ", code %#"
+			B_PRIx64 "\n", (uint64)address, (uint64)status, sTrampolineStack,
+			sTrampolineCode);
+		diag_log_mapping(0x8000);
+		diag_log_mapping(0x9000);
+		diag_log_mapping(sTrampolineStack);
+		diag_log_mapping(sTrampolineCode);
+		diag_log_low_memory_map();
+	}
+
 	for (uint32 i = 1; i < gKernelArgs.num_cpus; i++) {
 		// create a final stack the trampoline code will put the ap processor on
 		void * stack = NULL;
@@ -430,10 +522,13 @@ arch_smp_boot_other_cpus(addr_t pagedir, uint64 kernelEntry, addr_t virtKernelAr
 
 	// allocate a stack and a code area for the smp trampoline
 	// (these have to be < 1M physical, 0xa0000-0xfffff is reserved by the BIOS)
-	uint64 trampolineCode = 0x9000;
-	uint64 trampolineStack = 0x8000;
+	// (allocated from the firmware in arch_smp_init_other_cpus())
+	uint64 trampolineCode = sTrampolineCode;
+	uint64 trampolineStack = sTrampolineStack;
 
 	// copy the trampoline code over
+	// slot 0 of the CPU row: grey while copying, white once copied
+	video_diag_cpu_mark(0, kDiagCPUCopying);
 	copy_trampoline_code(trampolineCode, trampolineStack);
 	// slot 0 of the CPU row (white): the trampoline code is in place
 	video_diag_cpu_mark(0, kDiagCPUTrampoline);
