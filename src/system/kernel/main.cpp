@@ -144,6 +144,17 @@ diag_kernel_cpu(const kernel_args* args, int cpu, uint32 color)
 	diag_kernel_fill(args, 16 + cpu * 40, args->frame_buffer.height - 16 - 32,
 		32, color);
 }
+
+
+/*!	Diagnostic build: squares to the right of the loader's row, for steps
+	inside other kernel code (debug_output()).
+*/
+extern "C" void
+diag_kernel_detail(int index, uint32 color)
+{
+	diag_kernel_fill(&sKernelArgs, 16 + 10 * 64 + 16 + index * 48,
+		sKernelArgs.frame_buffer.height - 16 - 32 - 16 - 56 + 8, 40, color);
+}
 #else
 #	define diag_kernel_step(args, step)
 #	define diag_kernel_cpu(args, cpu, color)

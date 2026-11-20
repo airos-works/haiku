@@ -91,6 +91,13 @@ static arch_debug_registers sDebugRegisters[SMP_MAX_CPUS];
 
 static debug_page_fault_info sPageFaultInfo;
 
+#if defined(__x86_64__)
+// diagnostic build: squares on the screen (kernel main.cpp)
+extern "C" void diag_kernel_detail(int index, uint32 color);
+#else
+#	define diag_kernel_detail(index, color)
+#endif
+
 static bool sSerialDebugEnabled = true;
 
 // Serial output has its own thread once the kernel runs threads. A 16550 at
@@ -1739,12 +1746,29 @@ debug_output(const char* string, int32 length, bool notifySyslog)
 	} else {
 		flush_pending_repeats(notifySyslog);
 
+#if defined(__x86_64__)
+		// Diagnostic build: the first output's sinks, one square each to the
+		// right of the loader's row (red: entered, orange: serial done,
+		// yellow: syslog done, green: screen done).
+		static int32 sDiagOutputs = 0;
+		bool diag = sDiagOutputs++ == 0;
+		if (diag)
+			diag_kernel_detail(0, 0xe00000);
+#else
+		const bool diag = false;
+#endif
 		if (sSerialDebugEnabled)
 			serial_puts(string, length);
+		if (diag)
+			diag_kernel_detail(1, 0xff8000);
 		if (sSyslogOutputEnabled)
 			syslog_write(string, length, notifySyslog);
+		if (diag)
+			diag_kernel_detail(2, 0xffe000);
 		if (sBlueScreenEnabled || sDebugScreenEnabled)
 			blue_screen_puts(string);
+		if (diag)
+			diag_kernel_detail(3, 0x00c000);
 		if (sSerialDebugEnabled) {
 			for (uint32 i = 0; i < kMaxDebuggerModules; i++) {
 				if (sDebuggerModules[i] && sDebuggerModules[i]->debugger_puts)
