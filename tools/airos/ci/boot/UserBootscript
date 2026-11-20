@@ -47,11 +47,13 @@ link_gpu_user_land()
 	fi
 }
 
-# The AMD GPU user land (x86_64): libdrm, libva, libglvnd and Mesa (radeonsi,
-# RADV, the VA-API driver) and the amduvd decoder, where amdgpu_drm drives a
-# GPU. Its libGL and libEGL come before the system's, which every other
-# machine keeps (Zink on NVIDIA cards, llvmpipe elsewhere).
-ls /dev/graphics/amdgpu_drm_* > /dev/null 2>&1
+# The GPU user land of Linux's DRM drivers (x86_64): libdrm, libva, libglvnd
+# and Mesa (radeonsi and RADV for amdgpu_drm, nouveau and NVK for nouveau_drm,
+# the VA-API driver) and the amduvd decoder, where amdgpu_drm or nouveau_drm
+# drives a GPU. Its libGL and libEGL come before the system's, which every
+# other machine keeps (Zink on newer NVIDIA cards, llvmpipe elsewhere).
+ls /dev/graphics/amdgpu_drm_* /dev/graphics/nouveau_drm_* 2> /dev/null \
+	| grep -q .
 link_gpu_user_land /boot/system/non-packaged/amdgpu $?
 
 # The Dragon Q8B's (arm64): Turnip, libvulkan.so.1 and zink's EGL vendor

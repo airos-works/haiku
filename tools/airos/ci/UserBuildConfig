@@ -80,10 +80,11 @@
 #   AIROS_CI_FLUIDLITE      (arm64) a prefix with FluidLite for the MIDI kit,
 #                           read by build/jam/BuildFeatures
 #   AIROS_CI_FIRMWARE       a tree copied to system/non-packaged/data/firmware
-#   AIROS_CI_AMDGPU         (x86_64) the AMD GPU user land: a tree copied to
+#   AIROS_CI_AMDGPU         (x86_64) the GPU user land of amdgpu_drm and
+#                           nouveau_drm: a tree copied to
 #                           system/non-packaged/amdgpu, which the boot script
 #                           links into system/non-packaged where amdgpu_drm
-#                           drives a GPU
+#                           or nouveau_drm drives a GPU
 #   AIROS_CI_ADRENO         (arm64) the Dragon Q8B's GPU user land: a tree
 #                           copied to system/non-packaged/adreno (Turnip,
 #                           zink's EGL vendor library, libvulkan.so.1), which
@@ -390,9 +391,10 @@ rule UserBuildConfigRulePreImage
 			CopyDirectoryToHaikuImage system non-packaged data : $(AIROS_CI_FIRMWARE)
 				: firmware ;
 		}
-		# x86_64: libdrm, libva, libglvnd and Mesa (radeonsi, RADV, VA-API) and the
-		# amduvd decoder for amdgpu_drm, kept apart: the boot script links them
-		# into place only where amdgpu_drm drives a GPU.
+		# x86_64: libdrm, libva, libglvnd and Mesa (radeonsi, nouveau, RADV, NVK,
+		# VA-API) and the amduvd decoder for amdgpu_drm and nouveau_drm, kept
+		# apart: the boot script links them into place only where one of those
+		# drives a GPU.
 		if $(AIROS_CI_AMDGPU) {
 			CopyDirectoryToHaikuImage system non-packaged : $(AIROS_CI_AMDGPU)
 				: amdgpu ;
