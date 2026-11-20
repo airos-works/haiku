@@ -144,6 +144,16 @@ finger_width_hack(touchpad_movement *event)
 }
 
 
+// The finger whose position a v4 touchpad's events carry: the one with the
+// lowest id, so that the pointer goes on with the finger left when the first
+// one is lifted.
+static inline int
+v4_primary_finger(uint32 fingers)
+{
+	return fingers != 0 ? __builtin_ctz(fingers) : 0;
+}
+
+
 /* Common legend
  * L: Left mouse button pressed
  * R: Right mouse button pressed
@@ -631,15 +641,26 @@ elantech_process_packet_v4(elantech_cookie *cookie, touchpad_movement *_event,
 			TRACE("ELANTECH: Fingers bitmap %" B_PRId32 ", raw %x (STATUS)\n",
 				event.fingers, packet[1]);
 
-			// This is required for the mouse to not disapear after first iteration.
-			event.xPosition = 0;
-			event.yPosition = 0;
+			if (event.fingers != 0) {
+				// The fingers' positions follow in head packets. This packet
+				// has none: reporting one (0,0 means no touch to the input
+				// server) made the second finger of a scroll a lift, so a
+				// two finger tap = a right click started every scroll.
+				cookie->fingers = event.fingers;
+				if (event.buttons == cookie->buttons)
+					return IGNORE_EVENT;
 
-			// Pressure is not provided on this packet, so make it up with sensible values
-			if (event.fingers == 0)
+				// a click of the pad: where the fingers were
+				event.xPosition = cookie->x;
+				event.yPosition = cookie->y;
+				event.zPressure = cookie->previousZ != 0
+					? cookie->previousZ : DEFAULT_PRESSURE;
+			} else {
+				// all fingers lifted
+				event.xPosition = 0;
+				event.yPosition = 0;
 				event.zPressure = 0;
-			else
-				event.zPressure = DEFAULT_PRESSURE;
+			}
 
 			TRACE("ELANTECH: Pos: %" B_PRId32 ":%" B_PRId32 " (STATUS)\n",
 				cookie->x, cookie->y);
@@ -684,11 +705,11 @@ elantech_process_packet_v4(elantech_cookie *cookie, touchpad_movement *_event,
 			// That's in sync with the logic on BSDs and Linux drivers providing MT events.
 			//event.fingers = cookie->fingers;
 			event.fingers = cookie->fingers | (1 << id);
-			//event.fingers = (1 << id);
 
-			// only process first finger
-			if (id != 0) {
-				TRACE("ELANTECH: RET Only process first finger. (HEAD)\n");
+			// only the primary finger moves the pointer
+			if (id != v4_primary_finger(event.fingers)) {
+				cookie->fingers = event.fingers;
+				TRACE("ELANTECH: RET Only process the primary finger. (HEAD)\n");
 				return IGNORE_EVENT;
 			}
 
@@ -732,8 +753,9 @@ elantech_process_packet_v4(elantech_cookie *cookie, touchpad_movement *_event,
 
 			event.buttons = (packet[0] & 0x3);
 
-			// Pressure is not provided on this packet, so make it up with sensible values
-			event.zPressure = DEFAULT_PRESSURE;
+			// Pressure is not provided on this packet: the head packet's goes on
+			event.zPressure = cookie->previousZ != 0
+				? cookie->previousZ : DEFAULT_PRESSURE;
 
 			TRACE("ELANTECH: Finger %d, raw %x (MOTION id)\n", (packet[0] & 0xe0) >>5, packet[0]);
 			TRACE("ELANTECH: Finger %d, raw %x (MOTION sid)\n", (packet[3] & 0xe0) >>5, packet[3]);
@@ -748,14 +770,21 @@ elantech_process_packet_v4(elantech_cookie *cookie, touchpad_movement *_event,
 			// As per testing let's assume a new fingers are added.
 			// That's in sync with the logic BSDs and Linux drivers providing MT events.
 			//event.fingers = cookie->fingers;
-			event.fingers = cookie->fingers | (1 << id) | (1 << sid);
-			//event.fingers = (1 << id) | (1 << sid);
-
-			if ((id < 0 || id >= ELANTECH_MAX_FINGERS)
-				&& (sid < 0 || sid >= ELANTECH_MAX_FINGERS)) {
+			// an id of 0 (here -1) means the packet has no such finger
+			bool idValid;
+			idValid = id >= 0 && id < ELANTECH_MAX_FINGERS;
+			bool sidValid;
+			sidValid = sid >= 0 && sid < ELANTECH_MAX_FINGERS;
+			if (!idValid && !sidValid) {
 				TRACE("ELANTECH: Not right fingers (MOTION)");
 				return IGNORE_EVENT;
 			}
+
+			event.fingers = cookie->fingers;
+			if (idValid)
+				event.fingers |= 1 << id;
+			if (sidValid)
+				event.fingers |= 1 << sid;
 
 #ifdef ELANTECH_ENABLE_HARDWARE_PALM_DETECTION
 			if (cookie->palm) {
@@ -773,27 +802,22 @@ elantech_process_packet_v4(elantech_cookie *cookie, touchpad_movement *_event,
 			int weight;
 			weight = (packet[0] & 0x10) ? 5 : 1;
 
-			// Only take care for finger id 0 for now.
+			// Only the primary finger moves the pointer.
 			// TODO: Change this when support for Multi-finger is available on Haiku
-			if (id == 0 || sid ==0) {
-				if (id < 0 || id >= ELANTECH_MAX_FINGERS)
-					event.fingers |= 1 << id;
-				if (sid < 0 || sid >= ELANTECH_MAX_FINGERS)
-					event.fingers |= 1 << sid;
-
-				if (id == 0) {
-					deltaX += weight * (int8)packet[1];
-					deltaY += weight * (int8)packet[2];
-				} else if (sid == 0) {
-					deltaX += weight * (int8)packet[4];
-					deltaY += weight * (int8)packet[5];
-				}
-
-				TRACE("ELANTECH: dx: %d dy: %d (MOTION)\n", deltaX, deltaY);
+			int primary;
+			primary = v4_primary_finger(event.fingers);
+			if (idValid && id == primary) {
+				deltaX += weight * (int8)packet[1];
+				deltaY += weight * (int8)packet[2];
+			} else if (sidValid && sid == primary) {
+				deltaX += weight * (int8)packet[4];
+				deltaY += weight * (int8)packet[5];
 			} else {
-				TRACE("ELANTECH: Ignore invalid or non 0 finger ids (MOTION)\n");
+				cookie->fingers = event.fingers;
+				TRACE("ELANTECH: Ignore fingers other than the primary (MOTION)\n");
 				return IGNORE_EVENT;
 			}
+			TRACE("ELANTECH: dx: %d dy: %d (MOTION)\n", deltaX, deltaY);
 
 			// TODO: Avoid this conversion from rel to abs coordinates when Haiku supports both
 			// type of coordinate systems for touchpads. Do the conversion as part of the driver
@@ -832,6 +856,7 @@ elantech_process_packet_v4(elantech_cookie *cookie, touchpad_movement *_event,
 	}
 
 	cookie->fingers = event.fingers;
+	cookie->buttons = event.buttons;
 	TRACE("ELANTECH: buttons %d\n", event.buttons);
 	TRACE("ELANTECH: zPressure %d\n", event.zPressure);
 
@@ -1500,7 +1525,8 @@ elantech_ioctl(void *_cookie, uint32 op, void *buffer, size_t length)
 			return user_memcpy(buffer, &read, sizeof(read));
 
 		default:
-			INFO("ELANTECH: unknown opcode: 0x%" B_PRIx32 "\n", op);
+			// the input server's settings ioctls (MS_SET_*): nothing to set
+			TRACE("ELANTECH: unknown opcode: 0x%" B_PRIx32 "\n", op);
 			return B_BAD_VALUE;
 	}
 }
