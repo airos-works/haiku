@@ -48,6 +48,8 @@ struct Card {
 	bool				owned;			// opened here (not app_server's)
 	bool				isAmdgpu;		// else another DRM driver (nouveau_drm):
 										// KMS only, no device copies
+	bool				isI915;			// i915_drm: copies by its blitter
+										// (i915_copy.cpp)
 	char				driver[32];
 
 	Kms::Resources		resources;
@@ -243,6 +245,16 @@ void timing_to_mode(const display_timing& timing, drm_mode_modeinfo& mode);
 int32 find_output_mode(const Output& output, const display_timing& timing);
 Output* primary_output(void);
 void update_cursor(void);
+
+// copies to the screen by an Intel GPU's blitter (i915_copy.cpp)
+status_t i915_create_frame_buffer_source(uint16 width, uint16 height,
+	color_space space, frame_buffer_source* source);
+void i915_delete_frame_buffer_source(uint32 id);
+status_t i915_copy_to_frame_buffer(uint32 id, const fill_rect_params* list,
+	uint32 count);
+void uninit_i915_copies(void);
+void lock_i915_copies(void);
+void unlock_i915_copies(void);
 
 // copies to the screen by the GPU (device_copy.cpp)
 void uninit_device_copies(void);

@@ -135,6 +135,7 @@ init_card(Card& card, int fd)
 	if (Kms::Ioctl(fd, DRM_IOCTL_VERSION, &version) != B_OK)
 		card.driver[0] = '\0';
 	card.isAmdgpu = strcmp(card.driver, "amdgpu") == 0;
+	card.isI915 = strcmp(card.driver, "i915") == 0;
 
 	// the cursor's size: amdgpu takes 128 x 128, nouveau's display engines
 	// before Maxwell 64 x 64
@@ -439,6 +440,8 @@ amdgpu_get_accelerant_device_info(accelerant_device_info* info)
 		strlcpy(info->name, "NVIDIA (nouveau_drm)", sizeof(info->name));
 	else if (strcmp(driver, "amdgpu") == 0)
 		strlcpy(info->name, "AMD Radeon (amdgpu_drm)", sizeof(info->name));
+	else if (strcmp(driver, "i915") == 0)
+		strlcpy(info->name, "Intel (i915_drm)", sizeof(info->name));
 	else
 		snprintf(info->name, sizeof(info->name), "%s (DRM)", driver);
 	strlcpy(info->chipset, driver, sizeof(info->chipset));

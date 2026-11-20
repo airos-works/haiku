@@ -718,6 +718,8 @@ extern "C" status_t
 amdgpu_create_frame_buffer_source(uint16 width, uint16 height,
 	color_space space, frame_buffer_source* source)
 {
+	if (gInfo->cards[0].isI915 && !multi_card_copies())
+		return i915_create_frame_buffer_source(width, height, space, source);
 	if (multi_card_copies())
 		return multi_card_create_source(width, height, space, source);
 	return create_source(width, height, space, false, source);
@@ -730,7 +732,7 @@ extern "C" status_t
 amdgpu_create_frame_buffer_shadow(uint16 width, uint16 height,
 	color_space space, frame_buffer_source* shadow)
 {
-	if (multi_card_copies())
+	if (multi_card_copies() || gInfo->cards[0].isI915)
 		return B_NOT_SUPPORTED;
 	return create_source(width, height, space, true, shadow);
 }
@@ -739,6 +741,10 @@ amdgpu_create_frame_buffer_shadow(uint16 width, uint16 height,
 extern "C" void
 amdgpu_delete_frame_buffer_source(uint32 id)
 {
+	if (gInfo->cards[0].isI915 && !multi_card_copies()) {
+		i915_delete_frame_buffer_source(id);
+		return;
+	}
 	if (multi_card_copies()) {
 		multi_card_delete_source(id);
 		return;
@@ -802,6 +808,8 @@ extern "C" status_t
 amdgpu_copy_to_frame_buffer(uint32 id, const fill_rect_params* list,
 	uint32 count)
 {
+	if (gInfo->cards[0].isI915 && !multi_card_copies())
+		return i915_copy_to_frame_buffer(id, list, count);
 	if (multi_card_copies())
 		return multi_card_copy(id, list, count);
 	status_t status = try_copy_to_frame_buffer(id, list, count);
@@ -855,6 +863,7 @@ device_copy_source_domain(uint32 id)
 void
 uninit_device_copies(void)
 {
+	uninit_i915_copies();
 	Locker _;
 	wait_idle();
 	for (uint32 i = 0; i < kMaxSources; i++) {
@@ -881,6 +890,7 @@ uninit_device_copies(void)
 void
 lock_device_copies(void)
 {
+	lock_i915_copies();
 	pthread_mutex_lock(&sLock);
 	wait_idle();
 }
@@ -890,4 +900,5 @@ void
 unlock_device_copies(void)
 {
 	pthread_mutex_unlock(&sLock);
+	unlock_i915_copies();
 }

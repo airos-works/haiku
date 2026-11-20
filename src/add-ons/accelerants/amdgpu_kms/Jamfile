@@ -10,6 +10,7 @@ Addon amdgpu_kms.accelerant :
 	cursor.cpp
 	device_copy.cpp
 	hooks.cpp
+	i915_copy.cpp
 	kms.cpp
 	layout.cpp
 	mode.cpp
