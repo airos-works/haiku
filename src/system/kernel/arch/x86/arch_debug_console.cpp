@@ -424,20 +424,25 @@ arch_debug_serial_putchar(const char c)
 static void
 arch_debug_serial_puts_locked(const char *string)
 {
+	// A line feed goes out as carriage return and line feed. They need not
+	// fit into the FIFO together: a port without one (or that does not say it
+	// has one) only ever has room for a single character, and waiting for
+	// room for two never ended there.
+	bool carriageReturnSent = false;
 	while (*string != '\0') {
 		if (!wait_for_transmitter())
 			return;
-		// the FIFO is empty: fill it without looking at the status again,
-		// counting the carriage return a line feed turns into
+		// the FIFO is empty: fill it without looking at the status again
 		uint8 room = sSerialFifoSize;
 		while (*string != '\0' && room > 0) {
 			char c = *string;
-			if (c == '\n') {
-				if (room < 2)
-					break;
+			if (c == '\n' && !carriageReturnSent) {
 				out8('\r', sSerialBasePort + SERIAL_TRANSMIT_BUFFER);
 				room--;
+				carriageReturnSent = true;
+				continue;
 			}
+			carriageReturnSent = false;
 			string++;
 			if (c == '\r')
 				continue;
