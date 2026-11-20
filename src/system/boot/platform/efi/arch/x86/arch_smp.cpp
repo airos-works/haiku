@@ -470,26 +470,20 @@ arch_smp_init_other_cpus(void)
 	// writable in the firmware's page tables we still run on after
 	// ExitBootServices.
 	{
-		// The argument/stack page is read in real mode through segment 0
-		// (lgdt), so it has to be below 64 KB; the code page only below
-		// 640 KB, for the STARTUP IPI vector.
-		efi_physical_addr stack = 0xffff;
-		efi_status stackStatus = kBootServices->AllocatePages(
-			AllocateMaxAddress, EfiLoaderData, 1, &stack);
-		efi_physical_addr code = 0x9ffff;
-		efi_status codeStatus = kBootServices->AllocatePages(
-			AllocateMaxAddress, EfiLoaderData, 1, &code);
-		if (stackStatus == EFI_SUCCESS && codeStatus == EFI_SUCCESS
-			&& stack >= 0x1000 && stack + 0x1000 <= 0x10000
-			&& code >= 0x1000 && code + 0x1000 <= 0xa0000) {
-			sTrampolineStack = stack;
-			sTrampolineCode = code;
+		// Two pages below 640 KB (the STARTUP IPI vector is a page number
+		// below 0xa0): the argument/stack page and the code page above it.
+		efi_physical_addr address = 0x9ffff;
+		efi_status status = kBootServices->AllocatePages(AllocateMaxAddress,
+			EfiLoaderData, 2, &address);
+		if (status == EFI_SUCCESS && address >= 0x1000
+			&& address + 0x2000 <= 0xa0000) {
+			sTrampolineStack = address;
+			sTrampolineCode = address + 0x1000;
 		}
-		dprintf("diag: smp: low memory for the trampoline: stack %#" B_PRIx64
-			" (status %#" B_PRIx64 "), code %#" B_PRIx64 " (status %#" B_PRIx64
-			"); using stack %#" B_PRIx64 ", code %#" B_PRIx64 "\n",
-			(uint64)stack, (uint64)stackStatus, (uint64)code,
-			(uint64)codeStatus, sTrampolineStack, sTrampolineCode);
+		dprintf("diag: smp: low memory for the trampoline: %#" B_PRIx64
+			" (status %#" B_PRIx64 "); using stack %#" B_PRIx64 ", code %#"
+			B_PRIx64 "\n", (uint64)address, (uint64)status, sTrampolineStack,
+			sTrampolineCode);
 		diag_log_mapping(0x8000);
 		diag_log_mapping(0x9000);
 		diag_log_mapping(sTrampolineStack);
