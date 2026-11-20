@@ -40,6 +40,9 @@ static const uint32 kMaxCards = 4;
 
 
 // one GPU's display engine, through its DRM primary node
+struct NouveauCopier;
+
+
 struct Card {
 	int					fd;
 	bool				owned;			// opened here (not app_server's)
@@ -66,6 +69,9 @@ struct Card {
 	uint32				modeBlobs[Kms::kMaxObjects];	// per CRTC index
 	Kms::Buffer			cursor;
 	uint32				cursorSize;		// DRM_CAP_CURSOR_WIDTH, at most 128
+
+	NouveauCopier*		copier;			// nouveau's 2D engine for the flush
+	bool				copierTried;
 };
 
 
@@ -202,6 +208,24 @@ status_t multi_card_copy(uint32 id, const fill_rect_params* list,
 	uint32 count);
 void multi_card_fill_from_first(void);
 extern "C" bool amdgpu_frame_buffer_is_partial(void);
+
+// copies by nouveau's 2D engine (nouveau_copy.cpp); rectangles with
+// exclusive right and bottom edges
+struct copy_rect {
+	int32	left;
+	int32	top;
+	int32	right;
+	int32	bottom;
+};
+NouveauCopier* nouveau_copy_init(int fd);
+void nouveau_copy_uninit(NouveauCopier* copier);
+status_t nouveau_copy_import(NouveauCopier* copier, void* address, size_t size,
+	uint32& _handle, uint64& _va);
+void nouveau_copy_release(NouveauCopier* copier, uint32 handle);
+status_t nouveau_copy_rects(NouveauCopier* copier, uint32 sourceHandle,
+	uint64 sourceVa, uint32 sourcePitch, uint32 sourceWidth,
+	uint32 sourceHeight, const Kms::Buffer& target, const copy_rect* rects,
+	uint32 count);
 
 
 // outputs and modes (mode.cpp)

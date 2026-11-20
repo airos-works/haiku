@@ -217,6 +217,9 @@ uninit_card(Card& card)
 {
 	if (card.fd < 0)
 		return;
+	nouveau_copy_uninit(card.copier);
+	card.copier = NULL;
+	card.copierTried = false;
 	Kms::DestroyBuffer(card.fd, card.cursor);
 	if (card.owned) {
 		for (uint32 c = 0; c < Kms::kMaxObjects; c++)

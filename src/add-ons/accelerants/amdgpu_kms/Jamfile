@@ -14,6 +14,7 @@ Addon amdgpu_kms.accelerant :
 	layout.cpp
 	mode.cpp
 	multi_card.cpp
+	nouveau_copy.cpp
 	: libaccelerantscommon.a
 ;
 
@@ -23,5 +24,6 @@ Application amdcopytest :
 	device_copy.cpp
 	kms.cpp
 	multi_card.cpp
+	nouveau_copy.cpp
 	: [ TargetLibstdc++ ]
 ;
