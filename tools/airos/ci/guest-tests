@@ -30,3 +30,8 @@ neural_kit_test
 # child teams) left their per-CPU profiling timers armed; one fired for the
 # idle thread and panicked in profiling_event() (Framework 13, 2026-11-10)
 profiler_detach_test
+# the page writer's writes of fragmented files against a stream of metadata
+# writes: nvme_disk sent the next part of a transfer from its completion
+# report, behind a bounced write that waited for that report, and every
+# write to the disk stopped for good (a desktop's mouse went first, #141)
+fragmented_write_test

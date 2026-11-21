@@ -32,6 +32,12 @@ SimpleTest pipe_fd_table_full_test : pipe_fd_table_full_test.cpp ;
 # profiling_event(); in tools/airos/ci/guest-tests too
 SimpleTest profiler_detach_test : profiler_detach_test.cpp ;
 
+# the page writer's writes of fragmented files against metadata writes: a
+# disk driver's completion report that sent the next part of a transfer
+# itself stopped every write to an NVMe disk (airos-works/haiku#141); in
+# tools/airos/ci/guest-tests too
+SimpleTest fragmented_write_test : fragmented_write_test.cpp ;
+
 SimpleTest hello_avx : hello_avx.c ;
 local avxSource = [ FGristFiles hello_avx.c ] ;
 local avxObject = $(avxSource:S=$(SUFOBJ)) ;

@@ -214,6 +214,14 @@ struct nvme_disk_driver_info {
 	RequestOwnerHashTable	request_owners;
 	mutex					request_owners_lock;
 
+	// Requests that the report of a finished transfer started (the next
+	// part of an iterative file system request): this thread sends them,
+	// see report_transfers().
+	spinlock				deferred_lock;
+	IORequestList			deferred_requests;
+	ConditionVariable		deferred_condition;
+	thread_id				deferred_thread;
+
 	rw_lock					rounded_write_lock;
 
 	rw_lock					suspend_lock;
@@ -598,6 +606,9 @@ nvme_disk_init_device(void* _info, void** _cookie)
 		return B_ERROR;
 
 	mutex_init(&info->request_owners_lock, "nvme request owners");
+	B_INITIALIZE_SPINLOCK(&info->deferred_lock);
+	info->deferred_condition.Init(info, "nvme_disk deferred requests");
+	info->deferred_thread = -1;
 
 	// set up rounded-write lock
 	rw_lock_init(&info->rounded_write_lock, "nvme rounded writes");
@@ -810,6 +821,68 @@ io_finished_callback(nvme_io_request* request, const struct nvme_cpl* cpl)
 }
 
 
+/*!	Gives requests to the thread that sends what reports started.
+*/
+static void
+defer_requests(nvme_disk_driver_info* info, IORequestList& requests)
+{
+	if (requests.IsEmpty())
+		return;
+
+	InterruptsSpinLocker locker(info->deferred_lock);
+	info->deferred_requests.TakeFrom(&requests);
+	locker.Unlock();
+	info->deferred_condition.NotifyAll();
+}
+
+
+/*!	Reports finished transfers to those who asked for them. A report may
+	start more I/O on this thread, as an iterative file system request goes
+	on with its next part. That must not be sent from here: sending waits
+	for rounded_write_lock and suspend_lock, and whoever holds or awaits
+	those for writing waits in turn for the transfers this thread has yet
+	to report, or, on a completion thread, yet to complete. (A bounced
+	write that waited for the lock while such a request arrived stopped
+	every write to the disk for good, reads went on.) So such requests are
+	collected, as they are for a thread that is sending one itself (its
+	nvme_disk_io_request() sends them when it is done), and given to the
+	thread for deferred requests.
+*/
+static void
+report_transfers(nvme_disk_driver_info* info, nvme_async_io* done)
+{
+	if (done == NULL)
+		return;
+
+	const thread_id thread = thread_get_current_thread_id();
+	NVMeRequestOwner owner;
+	bool ownerAdded = false;
+	{
+		MutexLocker locker(info->request_owners_lock);
+		if (info->request_owners.Lookup(thread) == NULL) {
+			owner.team = thread_get_current_thread()->team->id;
+			owner.thread = thread;
+			owner.priority = thread_get_io_priority(thread);
+			info->request_owners.InsertUnchecked(&owner);
+			ownerAdded = true;
+		}
+	}
+
+	while (done != NULL) {
+		nvme_async_io* next = done->next;
+		async_io_done(done);
+		done = next;
+	}
+
+	if (ownerAdded) {
+		MutexLocker locker(info->request_owners_lock);
+		info->request_owners.Remove(&owner);
+		locker.Unlock();
+		defer_requests(info, owner.requests_queue);
+	}
+}
+
+
 /*!	Completes what the controller finished on this queue. Any thread may do
 	this; the queue's completion thread does it on every interrupt.
 */
@@ -831,11 +904,7 @@ poll_qpair(qpair_info* qpinfo)
 		done = qpinfo->done;
 		qpinfo->done = NULL;
 	}
-	while (done != NULL) {
-		nvme_async_io* next = done->next;
-		async_io_done(done);
-		done = next;
-	}
+	report_transfers(info, done);
 	return completions;
 }
 
@@ -930,6 +999,41 @@ completion_thread(void* data)
 }
 
 
+static status_t nvme_disk_io_request(nvme_disk_handle* handle,
+	io_request* request, bool waited);
+
+
+/*!	Sends the requests that reports started (see report_transfers()). It
+	may wait for whatever sending takes, as it completes no queue but in
+	waiting for a command of its own, and reports only what that finds.
+*/
+static status_t
+deferred_requests_thread(void* data)
+{
+	nvme_disk_driver_info* info = (nvme_disk_driver_info*)data;
+	nvme_disk_handle handle;
+	handle.info = info;
+
+	while (true) {
+		ConditionVariableEntry entry;
+		InterruptsSpinLocker locker(info->deferred_lock);
+		io_request* request = info->deferred_requests.RemoveHead();
+		if (request == NULL) {
+			if (atomic_get(&info->quit) != 0)
+				break;
+			info->deferred_condition.Add(&entry);
+			locker.Unlock();
+			entry.Wait();
+			continue;
+		}
+		locker.Unlock();
+
+		nvme_disk_io_request(&handle, request, false);
+	}
+	return B_OK;
+}
+
+
 static status_t
 start_threads(nvme_disk_driver_info* info)
 {
@@ -937,6 +1041,12 @@ start_threads(nvme_disk_driver_info* info)
 	info->queues_down = 0;
 	info->pollers = 0;
 	info->bounced = 0;
+
+	info->deferred_thread = spawn_kernel_thread(deferred_requests_thread,
+		"nvme_disk deferred requests", B_URGENT_DISPLAY_PRIORITY, info);
+	if (info->deferred_thread < 0)
+		return info->deferred_thread;
+	resume_thread(info->deferred_thread);
 
 	for (uint32 i = 0; i < info->qpair_count; i++) {
 		char name[B_OS_NAME_LENGTH];
@@ -963,6 +1073,16 @@ stop_threads(nvme_disk_driver_info* info)
 		qpinfo->interrupt.NotifyAll();
 		wait_for_thread(qpinfo->thread, NULL);
 		qpinfo->thread = -1;
+	}
+	if (info->deferred_thread >= 0) {
+		// (after the completion threads: none of them defers any more; with
+		// the lock, as the thread looks at "quit" and then waits with it)
+		{
+			InterruptsSpinLocker locker(info->deferred_lock);
+			info->deferred_condition.NotifyAll();
+		}
+		wait_for_thread(info->deferred_thread, NULL);
+		info->deferred_thread = -1;
 	}
 }
 
@@ -1694,6 +1814,13 @@ nvme_disk_io_request(nvme_disk_handle* handle, io_request* request,
 	NVMeRequestOwner* existingOwner = handle->info->request_owners.Lookup(
 		thread_get_current_thread_id());
 	if (existingOwner != NULL) {
+		if (waited) {
+			// The caller waits for this one (a file system reading a block
+			// in a callback): nobody would send it before that wait.
+			requestOwnersLocker.Unlock();
+			do_io(handle, request, true);
+			return B_OK;
+		}
 		existingOwner->requests_queue.Add(request);
 		return B_OK;
 	}
