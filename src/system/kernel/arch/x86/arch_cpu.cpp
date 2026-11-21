@@ -1942,8 +1942,17 @@ arch_cpu_shutdown(bool rebootSystem)
 	// try to reset the system using the keyboard controller
 	out8(0xfe, 0x64);
 
-	// Give some time to the controller to do its job (0.5s)
-	snooze(500000);
+	// Give some time to the controller to do its job (0.5s). Spinning, not
+	// snoozing: interrupts are off, and this also runs in the kernel
+	// debugger (its "reboot" command, a panic's restart), where blocking
+	// panics again. Macs have no keyboard controller at all.
+	spin(500000);
+
+	// the chipset's reset control register (PCI CF9: a full reset)
+	out8(0x02, 0xcf9);
+	spin(10);
+	out8(0x0e, 0xcf9);
+	spin(500000);
 
 	// if that didn't help, try it this way
 	x86_reboot();
