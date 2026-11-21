@@ -239,8 +239,8 @@ mutex gLock;
 
 /*!	Whether air/OS's i915_drm (Linux's i915, the linux-drm fork) drives this
 	GPU, which then is not ours: two drivers on one GPU stop the machine. It
-	takes Gen 9's big cores (Skylake, Kaby Lake, Coffee Lake, Comet Lake),
-	and every Gen 9 and later GPU with "haiku_probe all" in its settings,
+	takes Gen 9's big cores (Skylake, Kaby Lake, Coffee Lake, Comet Lake)
+	and Gemini Lake, and every Gen 9 and later GPU with "haiku_probe all" in its settings,
 	unless "haiku_gpus" leaves this one out, while it is installed and has
 	not given up after starts that did not finish (its start marker: a count
 	of 2 or more from an earlier boot). The same rule as is_i915_gpu() in
@@ -271,12 +271,11 @@ i915_drm_drives(const pci_info& info, uint32 type)
 		unload_driver_settings(handle);
 	}
 
-	// Gen 9's low power parts (Broxton/Apollo Lake, Gemini Lake), which
-	// this driver lists under Kaby Lake, are i915_drm's only with
-	// "haiku_probe all", as Gen 11 and later are
+	// Broxton/Apollo Lake, which this driver lists under Kaby Lake, is
+	// i915_drm's only with "haiku_probe all", as Gen 11 and later are;
+	// Gemini Lake (the Yoga 11e) it takes by default
 	static const uint16 kGen9LowPower[] = {
 		0x0a84, 0x1a84, 0x1a85, 0x5a84, 0x5a85,	// Broxton, Apollo Lake
-		0x3184, 0x3185,							// Gemini Lake
 	};
 	bool lowPower = false;
 	for (size_t i = 0; i < B_COUNT_OF(kGen9LowPower); i++)
