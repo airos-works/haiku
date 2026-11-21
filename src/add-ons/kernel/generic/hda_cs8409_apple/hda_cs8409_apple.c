@@ -224,6 +224,16 @@ cs8409_record_start(void* cookie, uint32 stream, uint32 format,
 	cs_8409_capture_setup(codec);
 	dprintf("hda_cs8409: recording on (stream %" B_PRIu32 ", format %#"
 		B_PRIx32 ")\n", stream, format);
+
+}
+
+
+/*	The internal microphone's ADC: hda would put every input converter on the
+	record stream, and the CS8409 sends nothing on it then. */
+static uint32
+cs8409_record_converter(void* cookie)
+{
+	return ((cs8409_apple*)cookie)->spec.intmike_adc_nid;
 }
 
 
@@ -260,7 +270,8 @@ static hda_codec_hooks_module_info sCS8409AppleModule = {
 	cs8409_playback_start,
 	cs8409_playback_stop,
 	cs8409_record_start,
-	cs8409_record_stop
+	cs8409_record_stop,
+	cs8409_record_converter
 };
 
 

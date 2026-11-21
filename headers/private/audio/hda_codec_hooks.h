@@ -48,6 +48,9 @@ typedef struct hda_codec_hooks_module_info {
 	void		(*record_start)(void* cookie, uint32 stream, uint32 format,
 					uint32 channels);
 	void		(*record_stop)(void* cookie);
+
+	/* the one input converter to record through, or 0 for all of them */
+	uint32		(*record_converter)(void* cookie);
 } hda_codec_hooks_module_info;
 
 

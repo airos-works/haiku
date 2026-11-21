@@ -1625,6 +1625,21 @@ hda_audio_group_get_widgets(hda_audio_group* audioGroup, hda_stream* stream)
 	// Some codecs run at one rate only, such as the Cirrus Logic CS8409 of
 	// Apple's Macs at 44.1 kHz: its links to the speaker amplifiers and the
 	// headphone codec are set up for that.
+	hda_codec* codec = audioGroup->codec;
+	if (stream->type == STREAM_RECORD && codec->hooks != NULL
+		&& codec->hooks->record_converter != NULL) {
+		// Every converter gets the stream on channel 0. On the record side,
+		// a codec may then send nothing at all, as the CS8409 does.
+		uint32 converter = codec->hooks->record_converter(codec->hooks_cookie);
+		for (uint32 i = 0; i < count; i++) {
+			if (stream->io_widgets[i] == converter) {
+				stream->io_widgets[0] = converter;
+				count = 1;
+				break;
+			}
+		}
+	}
+
 	uint32 fixedRate = hda_codec_fixed_rate(audioGroup->codec);
 	uint32 fixedRateMask = fixedRate == 44100 ? B_SR_44100
 		: fixedRate == 48000 ? B_SR_48000 : fixedRate == 96000 ? B_SR_96000 : 0;
