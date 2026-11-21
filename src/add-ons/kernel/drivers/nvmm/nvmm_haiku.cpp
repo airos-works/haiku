@@ -306,6 +306,11 @@ os_curcpu_tss_sel()
 struct haiku_vmobj {
 	VMCache *cache;
 	int32	ref_count;
+	off_t	base;
+		// where the object starts in the cache
+	bool	existing;
+		// the cache of an area its team made (os_vmobj_existing()): only
+		// referenced, its areas are not ours to unmap
 };
 
 
@@ -507,11 +512,107 @@ os_vmobj_create(voff_t size)
 		return NULL;
 	}
 	ret->ref_count = 0;
+	ret->base = 0;
+	ret->existing = false;
 	ret->cache->temporary = 1;
 	ret->cache->virtual_base = 0;
 	ret->cache->virtual_end = size;
 
 	return ret;
+}
+
+
+static VMAddressSpace* address_space_for(os_vmmap_t *map);
+
+
+/*!	The memory at [va, va + size) of \a map as an object that can be mapped
+	into a guest: the range has to lie in one area that is fully locked (its
+	pages are there and stay), that its team may read and write, and that has
+	ordinary pages (not device memory). The object holds a reference to the
+	area's cache; the area itself stays as it is.
+*/
+extern "C" os_vmobj_t *
+os_vmobj_existing(os_vmmap_t *map, vaddr_t va, vsize_t size)
+{
+	if (size == 0 || va + size < va)
+		return NULL;
+
+	os_vmobj_t *ret = (os_vmobj_t *)os_mem_alloc(sizeof(os_vmobj_t));
+	if (ret == NULL)
+		return NULL;
+
+	VMAddressSpace* addressSpace = address_space_for(map);
+	if (addressSpace->ReadLock() != B_OK) {
+		os_mem_free(ret, sizeof(os_vmobj_t));
+		return NULL;
+	}
+
+	bool found = false;
+	VMArea* area = addressSpace->LookupArea(va);
+	const uint32 needed = B_READ_AREA | B_WRITE_AREA;
+	if (area != NULL && va >= area->Base()
+		&& size <= area->Size() - (va - area->Base())
+		&& area->wiring == B_FULL_LOCK
+		&& (area->protection & needed) == needed) {
+		VMCache* cache = vm_area_get_locked_cache(area);
+		if (cache->type == CACHE_TYPE_RAM) {
+			cache->AcquireRefLocked();
+			ret->cache = cache;
+			ret->ref_count = 0;
+			ret->base = area->cache_offset + (va - area->Base());
+			ret->existing = true;
+			found = true;
+		}
+		vm_area_put_locked_cache(cache);
+	}
+
+	if (!found) {
+		dprintf("nvmm: existing memory %#" B_PRIxADDR " + %#" B_PRIxSIZE
+			" refused: %s\n", va, size,
+			area == NULL ? "no area"
+				: area->wiring != B_FULL_LOCK ? "the area is not fully locked"
+				: (area->protection & needed) != needed ? "the area is not writable"
+				: size > area->Size() - (va - area->Base()) ? "past the area's end"
+				: "not ordinary memory");
+	}
+
+	addressSpace->ReadUnlock();
+
+	if (!found) {
+		os_mem_free(ret, sizeof(os_vmobj_t));
+		return NULL;
+	}
+	return ret;
+}
+
+
+/*!	Unmaps every area of \a map that maps \a vmobj's cache (the guest's
+	mappings of an os_vmobj_existing() object).
+*/
+extern "C" void
+os_vmobj_unmap_all(os_vmmap_t *map, os_vmobj_t *vmobj)
+{
+	VMAddressSpace* addressSpace = address_space_for(map);
+
+	while (true) {
+		vmobj->cache->Lock();
+		VMArea* area = vmobj->cache->areas.First();
+		while (area != NULL && area->address_space != addressSpace)
+			area = vmobj->cache->areas.GetNext(area);
+		if (area == NULL) {
+			vmobj->cache->Unlock();
+			break;
+		}
+		vaddr_t start = area->Base();
+		vmobj->cache->Unlock();
+
+		addressSpace->WriteLock();
+		if (addressSpace->LookupArea(start) == area
+				&& area->cache == vmobj->cache) {
+			vm_unmap_address_range(addressSpace, start, area->Size(), true);
+		}
+		addressSpace->WriteUnlock();
+	}
 }
 
 
@@ -528,6 +629,14 @@ os_vmobj_rel(os_vmobj_t *vmobj)
 	int32 previous = atomic_add(&vmobj->ref_count, -1);
 	if (previous != 0)
 		return;
+
+	if (vmobj->existing) {
+		// its areas belong to their teams; the guest's went with
+		// os_vmobj_unmap_all() or go with the guest's address space
+		vmobj->cache->ReleaseRef();
+		os_mem_free(vmobj, sizeof(os_vmobj_t));
+		return;
+	}
 
 	while (true) {
 		vmobj->cache->Lock();
@@ -603,7 +712,8 @@ os_vmobj_map(os_vmmap_t *map, vaddr_t *addr, vsize_t size, os_vmobj_t *vmobj,
 	};
 	VMArea *area;
 	status = vm_map_cache(addressSpace, vmobj->cache,
-		vmobj->cache->virtual_base + offset, "nvmm_vmobj_area",
+		(vmobj->existing ? vmobj->base : vmobj->cache->virtual_base) + offset,
+		"nvmm_vmobj_area",
 		size, wiring, prot, maxprot, REGION_NO_PRIVATE_MAP, flags,
 		&addressRestrictions, kernel, &area, (void **)addr);
 

@@ -504,6 +504,7 @@ nvmm_hva_map(struct nvmm_machine *mach, uintptr_t hva, size_t size)
 	args.machid = mach->machid;
 	args.hva = hva;
 	args.size = size;
+	args.flags = 0;
 
 	ret = ioctl(nvmm_fd, NVMM_IOC_HVA_MAP, &args);
 	if (ret == -1)
@@ -511,6 +512,31 @@ nvmm_hva_map(struct nvmm_machine *mach, uintptr_t hva, size_t size)
 
 	return 0;
 }
+
+#ifdef __HAIKU__
+/*
+ * air/OS: like nvmm_hva_map(), but the range keeps the memory it has: it
+ * must lie in one fully locked (B_FULL_LOCK), writable area of ordinary
+ * memory, which nvmm_gpa_map() then maps into the guest. For memory shared
+ * with another process. nvmm_hva_unmap() ends it and removes it from the
+ * guest; the area is left alone.
+ */
+int
+nvmm_hva_map_existing(struct nvmm_machine *mach, uintptr_t hva, size_t size)
+{
+	struct nvmm_ioc_hva_map args;
+
+	args.machid = mach->machid;
+	args.hva = hva;
+	args.size = size;
+	args.flags = 0;
+
+	if (ioctl(nvmm_fd, NVMM_IOC_HVA_MAP_EXISTING, &args) == -1)
+		return -1;
+
+	return 0;
+}
+#endif
 
 int
 nvmm_hva_unmap(struct nvmm_machine *mach, uintptr_t hva, size_t size)
