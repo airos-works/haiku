@@ -1,0 +1,13 @@
+SubDir HAIKU_TOP src add-ons kernel generic hda_cs8409_apple ;
+
+# GPL-2.0: the CS8409 sequences in apple/ come from snd_hda_macbookpro.
+
+UsePrivateHeaders audio ;
+UsePrivateKernelHeaders ;
+
+SubDirCcFlags -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable
+	-Wno-unused-label -Wno-sign-compare -Wno-missing-prototypes -Wno-unused-value ;
+
+KernelAddon cs8409_apple :
+	hda_cs8409_apple.c
+	;

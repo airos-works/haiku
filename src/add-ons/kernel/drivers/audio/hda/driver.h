@@ -9,10 +9,12 @@
 #ifndef _HDA_H_
 #define _HDA_H_
 
+#include <hda_codec_hooks.h>
 #include <KernelExport.h>
 #include <Drivers.h>
 #include <PCI.h>
 #include <debug.h>
+#include <lock.h>
 
 #include <string.h>
 #include <stdlib.h>
@@ -74,6 +76,7 @@ struct hda_controller {
 	uint32			rirb_length;
 	uint32			rirb_read_pos;
 	uint32			corb_write_pos;
+	mutex			verb_lock;		/* one hda_send_verbs() at a time */
 	area_id			corb_rirb_pos_area;
 	corb_t*			corb;
 	rirb_t*			rirb;
@@ -162,6 +165,7 @@ struct hda_stream {
 	uint32		sample_rate;
 	uint32		sample_format;
 
+	uint32		format;				/* HDA stream format */
 	uint32		num_buffers;
 	uint32		num_channels;
 	uint32		buffer_length;	/* size of buffer in samples */
@@ -309,6 +313,7 @@ struct hda_codec {
 	sem_id		response_sem;
 	uint32		responses[MAX_CODEC_RESPONSES];
 	uint32		response_count;
+	uint32		late_responses;		/* still due for verbs that timed out */
 
 	sem_id		unsol_response_sem;
 	thread_id	unsol_response_thread;
@@ -319,6 +324,11 @@ struct hda_codec {
 	uint32		num_audio_groups;
 
 	struct hda_controller* controller;
+
+	/* vendor setup beyond the HDA specification, see hda_codec_hooks.h */
+	hda_codec_hooks_module_info* hooks;
+	void*		hooks_cookie;
+	hda_codec_hook_ops hook_ops;
 };
 
 
@@ -367,6 +377,9 @@ hda_widget* hda_audio_group_get_widget(hda_audio_group* audioGroup, uint32 nodeI
 status_t hda_audio_group_get_widgets(hda_audio_group* audioGroup,
 	hda_stream* stream);
 hda_codec* hda_codec_new(hda_controller* controller, uint32 cad);
+uint32 hda_codec_fixed_rate(hda_codec* codec);
+void hda_codec_stream_started(hda_codec* codec, hda_stream* stream);
+void hda_codec_stream_stopped(hda_codec* codec, hda_stream* stream);
 void hda_codec_delete(hda_codec* codec);
 
 /* hda_multi_audio.c */

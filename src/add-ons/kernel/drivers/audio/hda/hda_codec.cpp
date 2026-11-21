@@ -53,6 +53,10 @@
 #define SIGMATEL_VENDORID			0x8384
 
 
+static void hda_codec_attach_hooks(hda_codec* codec, uint32 audioGroupNodeID);
+static void hda_codec_detach_hooks(hda_codec* codec);
+
+
 #ifdef TRACE_CODEC
 static const char* kPortConnector[] = {
 	"Jack", "None", "Fixed", "Dual"
@@ -1416,6 +1420,8 @@ hda_codec_new_audio_group(hda_codec* codec, uint32 audioGroupNodeID)
 	}
 	audioGroup->multi->group = audioGroup;
 
+	hda_codec_attach_hooks(codec, audioGroupNodeID);
+
 	// Parse all widgets in Audio Function Group
 	status_t status = hda_codec_parse_audio_group(audioGroup);
 	if (status != B_OK)
@@ -1616,8 +1622,132 @@ hda_audio_group_get_widgets(hda_audio_group* audioGroup, hda_stream* stream)
 	if (count == 0)
 		return B_ENTRY_NOT_FOUND;
 
+	// Some codecs run at one rate only, such as the Cirrus Logic CS8409 of
+	// Apple's Macs at 44.1 kHz: its links to the speaker amplifiers and the
+	// headphone codec are set up for that.
+	uint32 fixedRate = hda_codec_fixed_rate(audioGroup->codec);
+	uint32 fixedRateMask = fixedRate == 44100 ? B_SR_44100
+		: fixedRate == 48000 ? B_SR_48000 : fixedRate == 96000 ? B_SR_96000 : 0;
+	if ((stream->sample_rate & fixedRateMask) != 0)
+		stream->sample_rate = fixedRateMask;
+
 	stream->num_io_widgets = count;
 	return B_OK;
+}
+
+
+//	#pragma mark - vendor setup modules
+
+
+static status_t
+hda_codec_hook_send(void* cookie, const uint32* commands, uint32* responses,
+	uint32 count)
+{
+	hda_codec* codec = (hda_codec*)cookie;
+	corb_t verbs[16];
+	while (count > 0) {
+		uint32 chunk = min_c(count, 16);
+		for (uint32 i = 0; i < chunk; i++)
+			verbs[i] = ((corb_t)codec->addr << 28) | (commands[i] & 0x0fffffff);
+		status_t status = hda_send_verbs(codec, verbs, responses, chunk);
+		if (status != B_OK)
+			return status;
+		commands += chunk;
+		if (responses != NULL)
+			responses += chunk;
+		count -= chunk;
+	}
+	return B_OK;
+}
+
+
+/*!	Offers the codec to the modules that know codecs needing more setup than
+	the HDA specification describes. The one that takes it sets the codec up
+	now, before its widgets are configured here.
+*/
+static void
+hda_codec_attach_hooks(hda_codec* codec, uint32 audioGroupNodeID)
+{
+	if (codec->hooks != NULL)
+		return;
+
+	codec->hook_ops.cookie = codec;
+	codec->hook_ops.vendor_id = ((uint32)codec->vendor_id << 16)
+		| codec->product_id;
+	codec->hook_ops.subsystem_id = codec->subsystem_id;
+	codec->hook_ops.afg = audioGroupNodeID;
+	codec->hook_ops.send = hda_codec_hook_send;
+
+	void* list = open_module_list(HDA_CODEC_HOOKS_PREFIX);
+	if (list == NULL)
+		return;
+
+	char name[B_PATH_NAME_LENGTH];
+	size_t nameLength = sizeof(name);
+	while (read_next_module_name(list, name, &nameLength) == B_OK) {
+		nameLength = sizeof(name);
+		hda_codec_hooks_module_info* hooks;
+		if (get_module(name, (module_info**)&hooks) != B_OK)
+			continue;
+		if (hooks->attach(&codec->hook_ops, &codec->hooks_cookie) == B_OK) {
+			dprintf("hda: codec %04x:%04x set up by %s\n", codec->vendor_id,
+				codec->product_id, name);
+			codec->hooks = hooks;
+			break;
+		}
+		put_module(name);
+	}
+	close_module_list(list);
+}
+
+
+static void
+hda_codec_detach_hooks(hda_codec* codec)
+{
+	if (codec->hooks == NULL)
+		return;
+	codec->hooks->detach(codec->hooks_cookie);
+	put_module(codec->hooks->info.name);
+	codec->hooks = NULL;
+}
+
+
+uint32
+hda_codec_fixed_rate(hda_codec* codec)
+{
+	if (codec->hooks == NULL || codec->hooks->fixed_rate == NULL)
+		return 0;
+	return codec->hooks->fixed_rate(codec->hooks_cookie);
+}
+
+
+void
+hda_codec_stream_started(hda_codec* codec, hda_stream* stream)
+{
+	if (codec->hooks == NULL)
+		return;
+	if (stream->type == STREAM_PLAYBACK) {
+		if (codec->hooks->playback_start != NULL) {
+			codec->hooks->playback_start(codec->hooks_cookie, stream->id,
+				stream->format, stream->num_channels);
+		}
+	} else if (codec->hooks->record_start != NULL) {
+		codec->hooks->record_start(codec->hooks_cookie, stream->id,
+			stream->format, stream->num_channels);
+	}
+}
+
+
+void
+hda_codec_stream_stopped(hda_codec* codec, hda_stream* stream)
+{
+	if (codec->hooks == NULL)
+		return;
+	if (stream->type == STREAM_PLAYBACK) {
+		if (codec->hooks->playback_stop != NULL)
+			codec->hooks->playback_stop(codec->hooks_cookie);
+	} else if (codec->hooks->record_stop != NULL)
+		codec->hooks->record_stop(codec->hooks_cookie);
 }
 
 
@@ -1638,6 +1768,7 @@ hda_codec_delete(hda_codec* codec)
 		codec->audio_groups[i] = NULL;
 	}
 
+	hda_codec_detach_hooks(codec);
 	free(codec);
 }
 

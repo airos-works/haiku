@@ -1162,10 +1162,13 @@ buffer_exchange(hda_audio_group* audioGroup, multi_buffer_info* data)
 		return B_ERROR;
 
 	if (!audioGroup->playback_stream->running) {
+		hda_codec_stream_started(audioGroup->codec,
+			audioGroup->playback_stream);
 		hda_stream_start(audioGroup->codec->controller,
 			audioGroup->playback_stream);
 	}
 	if (audioGroup->record_stream && !audioGroup->record_stream->running) {
+		hda_codec_stream_started(audioGroup->codec, audioGroup->record_stream);
 		hda_stream_start(audioGroup->codec->controller,
 			audioGroup->record_stream);
 	}
@@ -1257,12 +1260,22 @@ buffer_force_stop(hda_audio_group* audioGroup)
 	atomic_add(&audioGroup->force_stop_count, 1);
 
 	if (audioGroup->playback_stream != NULL) {
+		bool wasRunning = audioGroup->playback_stream->running;
 		hda_stream_stop(audioGroup->codec->controller,
 			audioGroup->playback_stream);
+		if (wasRunning) {
+			hda_codec_stream_stopped(audioGroup->codec,
+				audioGroup->playback_stream);
+		}
 	}
 	if (audioGroup->record_stream != NULL) {
+		bool wasRunning = audioGroup->record_stream->running;
 		hda_stream_stop(audioGroup->codec->controller,
 			audioGroup->record_stream);
+		if (wasRunning) {
+			hda_codec_stream_stopped(audioGroup->codec,
+				audioGroup->record_stream);
+		}
 	}
 
 	return B_OK;

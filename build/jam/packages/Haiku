@@ -105,6 +105,11 @@ AddFilesToPackage add-ons kernel generic :
 	smbios@x86,x86_64
 	<module>tty
 	;
+# vendor setup for HD-audio codecs the hda driver offers to them, such as the
+# Apple Macs' CS8409 (GPL-2.0, see src/add-ons/kernel/generic/hda_cs8409_apple)
+AddFilesToPackage add-ons kernel media hda_codec_hooks :
+	cs8409_apple@x86,x86_64
+	;
 AddFilesToPackage add-ons kernel partitioning_systems :
 	amiga_rdb@m68k
 	apple@ppc

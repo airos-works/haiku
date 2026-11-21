@@ -12,6 +12,7 @@
 
 #include <algorithm>
 
+#include <util/AutoLock.h>
 #include <vm/vm.h>
 
 #include "driver.h"
@@ -395,6 +396,14 @@ hda_handle_interrupt_status(hda_controller* controller)
 						release_sem_etc(codec->unsol_response_sem, 1,
 							B_DO_NOT_RESCHEDULE);
 						handled = B_INVOKE_SCHEDULER;
+						continue;
+					}
+					if (codec->late_responses > 0) {
+						// the answer to a verb hda_send_verbs() stopped
+						// waiting for; it is not the answer to a later one
+						codec->late_responses--;
+						dprintf("hda: late response from codec %" B_PRIu32
+							" discarded: %08" B_PRIx32 "\n", cad, response);
 						continue;
 					}
 					if (codec->response_count >= MAX_CODEC_RESPONSES) {
@@ -966,6 +975,8 @@ hda_stream_setup_buffers(hda_audio_group* audioGroup, hda_stream* stream,
 		}
 	}
 
+	stream->format = format;
+
 	// Calculate size of buffer (aligned to 128 bytes)
 	stream->buffer_size = ALIGN(stream->buffer_length * stream->num_channels
 		* stream->sample_size, 128);
@@ -1128,6 +1139,12 @@ hda_send_verbs(hda_codec* codec, corb_t* verbs, uint32* responses, uint32 count)
 	hda_controller* controller = codec->controller;
 	uint32 sent = 0;
 
+	// The CORB write position and the codec's responses are shared: each
+	// codec's unsolicited response thread sends verbs too. Two senders could
+	// write CORBWP behind the read position, and the controller would then
+	// send the whole ring of old verbs to the codecs again.
+	MutexLocker locker(controller->verb_lock);
+
 	codec->response_count = 0;
 
 	while (sent < count) {
@@ -1152,10 +1169,34 @@ hda_send_verbs(hda_codec* codec, corb_t* verbs, uint32* responses, uint32 count)
 		}
 
 		controller->Write16(HDAC_CORB_WRITE_POS, controller->corb_write_pos);
+		// Codecs may take their time with some verbs, such as a reset or a
+		// power state change; Linux waits up to a second.
 		status_t status = acquire_sem_etc(codec->response_sem, queued,
-			B_RELATIVE_TIMEOUT, 50000ULL);
-		if (status != B_OK)
+			B_RELATIVE_TIMEOUT, 500000ULL);
+		if (status != B_OK) {
+			// Responses that still come would be taken for the answers to
+			// the next verbs, and every read after would get the answer to
+			// the verb before it: discard them when they arrive, and the
+			// semaphore counts of those that did arrive.
+			cpu_status state = disable_interrupts();
+			acquire_spinlock(&controller->interrupt_lock);
+			uint32 arrived = codec->response_count;
+			codec->late_responses += sent - min_c(arrived, sent);
+			release_spinlock(&controller->interrupt_lock);
+			restore_interrupts(state);
+
+			// late responses no longer release the semaphore
+			int32 semCount = 0;
+			if (get_sem_count(codec->response_sem, &semCount) == B_OK
+				&& semCount > 0) {
+				acquire_sem_etc(codec->response_sem, semCount,
+					B_RELATIVE_TIMEOUT, 0);
+			}
+			dprintf("hda: codec %u did not answer %" B_PRIu32 " of %" B_PRIu32
+				" verbs (first %08" B_PRIx32 ") in time: %s\n", codec->addr,
+				sent - min_c(arrived, sent), sent, verbs[0], strerror(status));
 			return status;
+		}
 	}
 
 	if (responses != NULL) {
@@ -1196,6 +1237,8 @@ hda_hw_init(hda_controller* controller)
 	status_t status;
 	const pci_info& pciInfo = controller->pci_info;
 	uint32 quirks = get_controller_quirks(pciInfo);
+
+	mutex_init(&controller->verb_lock, "hda verbs");
 
 	// enable power
 	gPci->set_powerstate(pciInfo.bus, pciInfo.device, pciInfo.function,
@@ -1554,4 +1597,6 @@ hda_hw_uninit(hda_controller* controller)
 			hda_codec_delete(controller->codecs[index]);
 	}
 	controller->active_codec = NULL;
+
+	mutex_destroy(&controller->verb_lock);
 }
