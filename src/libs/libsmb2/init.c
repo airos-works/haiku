@@ -82,6 +82,17 @@
  * here to tell the server when a context is destroyed, but this works
  */
 static struct smb2_context *active_contexts;
+#ifdef __HAIKU__
+/* Haiku: contexts are made and destroyed on several threads at once (smbfs'
+   connection pool and its directory watcher); the list needs a lock. */
+#include <pthread.h>
+static pthread_mutex_t active_contexts_lock = PTHREAD_MUTEX_INITIALIZER;
+#define ACTIVE_CONTEXTS_LOCK()   pthread_mutex_lock(&active_contexts_lock)
+#define ACTIVE_CONTEXTS_UNLOCK() pthread_mutex_unlock(&active_contexts_lock)
+#else
+#define ACTIVE_CONTEXTS_LOCK()
+#define ACTIVE_CONTEXTS_UNLOCK()
+#endif
 
 static int
 smb2_parse_args(struct smb2_context *smb2, const char *args)
@@ -302,7 +313,9 @@ struct smb2_context *smb2_init_context(void)
 
         smb2->session_key = NULL;
 
+        ACTIVE_CONTEXTS_LOCK();
         SMB2_LIST_ADD(&active_contexts, smb2);
+        ACTIVE_CONTEXTS_UNLOCK();
 
         return smb2;
 }
@@ -389,7 +402,9 @@ void smb2_destroy_context(struct smb2_context *smb2)
             free_c_data(smb2, smb2->connect_data);  /* sets smb2->connect_data to NULL */
         }
 
+        ACTIVE_CONTEXTS_LOCK();
         SMB2_LIST_REMOVE(&active_contexts, smb2);
+        ACTIVE_CONTEXTS_UNLOCK();
         free(smb2);
 }
 

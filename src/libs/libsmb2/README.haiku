@@ -19,6 +19,9 @@ Changes to upstream's files:
   allowing others to delete or rename them meanwhile, as POSIX has it.
 - libsmb2.c, smb2_rename_async(): renaming replaces a file of the new name,
   as rename() does.
+- init.c: the list of active contexts is locked when a context is added or
+  removed; smbfs makes and destroys contexts on several threads at once, and
+  the list broke (smbfs crashed in smb2_destroy_context at unmount).
 
 The library returns -errno and takes a negative value for a failure, so it
 is built with B_USE_POSITIVE_POSIX_ERRORS. Code that uses it has to be built
