@@ -401,6 +401,10 @@ void		os_vmobj_rel(os_vmobj_t *);
 int		os_vmobj_map(os_vmmap_t *, vaddr_t *, vsize_t, os_vmobj_t *,
 		    voff_t, bool, bool, bool, int, int);
 void		os_vmobj_unmap(os_vmmap_t *map, vaddr_t, vaddr_t);
+#if defined(__HAIKU__)
+os_vmobj_t *	os_vmobj_existing(os_vmmap_t *, vaddr_t, vsize_t);
+void		os_vmobj_unmap_all(os_vmmap_t *, os_vmobj_t *);
+#endif
 
 void *		os_pagemem_zalloc(size_t);
 void		os_pagemem_free(void *, size_t);

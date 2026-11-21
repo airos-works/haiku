@@ -679,6 +679,18 @@ nvmm_hmapping_unmap(struct nvmm_machine *mach, uintptr_t hva, size_t size)
 			continue;
 		}
 
+#if defined(__HAIKU__)
+		if (hmapping->existing) {
+			/*
+			 * The memory stays the caller's; the guest must not
+			 * keep it past this (the caller may unlock or free it).
+			 */
+			os_vmobj_unmap_all(os_vmspace_get_vmmap(mach->vm),
+			    hmapping->vmobj);
+			nvmm_hmapping_free(hmapping);
+			return 0;
+		}
+#endif
 		os_vmobj_unmap(os_curproc_map, hmapping->hva,
 		    hmapping->hva + hmapping->size);
 
@@ -713,6 +725,7 @@ nvmm_hva_map(struct nvmm_owner *owner, struct nvmm_ioc_hva_map *args)
 
 	hmapping->hva = args->hva;
 	hmapping->size = args->size;
+	hmapping->existing = false;
 	hmapping->vmobj = os_vmobj_create(hmapping->size);
 	uva = hmapping->hva;
 
@@ -728,6 +741,55 @@ out:
 	nvmm_machine_put(mach);
 	return error;
 }
+
+#if defined(__HAIKU__)
+/*
+ * air/OS: makes memory the caller already has mappable into the guest
+ * (GPA_MAP), where HVA_MAP replaces the range with new anonymous memory:
+ * memory shared with another process, such as what a GPU renderer exposes to
+ * the guest. The range must lie in one fully locked, writable area with
+ * ordinary pages (no device memory); the guest then maps the same pages.
+ */
+static int
+nvmm_hva_map_existing(struct nvmm_owner *owner, struct nvmm_ioc_hva_map *args)
+{
+	struct nvmm_machine *mach;
+	struct nvmm_hmapping *hmapping;
+	int error;
+
+	if (args->flags != 0)
+		return EINVAL;
+
+	error = nvmm_machine_get(owner, args->machid, &mach, true);
+	if (error)
+		return error;
+
+	error = nvmm_hmapping_validate(mach, args->hva, args->size);
+	if (error)
+		goto out;
+
+	hmapping = nvmm_hmapping_alloc(mach);
+	if (hmapping == NULL) {
+		error = ENOBUFS;
+		goto out;
+	}
+
+	hmapping->vmobj = os_vmobj_existing(os_curproc_map, args->hva,
+	    args->size);
+	if (hmapping->vmobj == NULL) {
+		hmapping->present = false;
+		error = EINVAL;
+		goto out;
+	}
+	hmapping->hva = args->hva;
+	hmapping->size = args->size;
+	hmapping->existing = true;
+
+out:
+	nvmm_machine_put(mach);
+	return error;
+}
+#endif
 
 static int
 nvmm_hva_unmap(struct nvmm_owner *owner, struct nvmm_ioc_hva_unmap *args)
@@ -1001,6 +1063,10 @@ nvmm_ioctl(struct nvmm_owner *owner, unsigned long cmd, void *data)
 		return nvmm_hva_map(owner, data);
 	case NVMM_IOC_HVA_UNMAP:
 		return nvmm_hva_unmap(owner, data);
+#if defined(__HAIKU__)
+	case NVMM_IOC_HVA_MAP_EXISTING:
+		return nvmm_hva_map_existing(owner, data);
+#endif
 	case NVMM_IOC_CTL:
 		return nvmm_ctl(owner, data);
 	default:

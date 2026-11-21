@@ -77,6 +77,8 @@ struct nvmm_hmapping {
 	uintptr_t hva;
 	size_t size;
 	os_vmobj_t *vmobj;
+	/* the caller's own memory (HVA_MAP_EXISTING): not ours to unmap */
+	bool existing;
 };
 
 struct nvmm_machine {

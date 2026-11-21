@@ -119,6 +119,9 @@ int nvmm_gpa_map(struct nvmm_machine *, uintptr_t, gpaddr_t, size_t, int);
 int nvmm_gpa_unmap(struct nvmm_machine *, uintptr_t, gpaddr_t, size_t);
 int nvmm_hva_map(struct nvmm_machine *, uintptr_t, size_t);
 int nvmm_hva_unmap(struct nvmm_machine *, uintptr_t, size_t);
+#ifdef __HAIKU__
+int nvmm_hva_map_existing(struct nvmm_machine *, uintptr_t, size_t);
+#endif
 
 int nvmm_gva_to_gpa(struct nvmm_machine *, struct nvmm_vcpu *, gvaddr_t, gpaddr_t *,
     nvmm_prot_t *);

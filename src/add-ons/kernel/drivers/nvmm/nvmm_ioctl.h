@@ -156,6 +156,9 @@ struct nvmm_ioc_ctl {
 #define NVMM_IOC_GPA_UNMAP		_IOW ('N', 12, struct nvmm_ioc_gpa_unmap)
 #define NVMM_IOC_HVA_MAP		_IOW ('N', 13, struct nvmm_ioc_hva_map)
 #define NVMM_IOC_HVA_UNMAP		_IOW ('N', 14, struct nvmm_ioc_hva_unmap)
+/* air/OS: like HVA_MAP, but the range keeps the memory it has (part of a
+   fully locked, writable area of the caller's); flags must be 0 */
+#define NVMM_IOC_HVA_MAP_EXISTING	_IOW ('N', 15, struct nvmm_ioc_hva_map)
 #define NVMM_IOC_CTL			_IOW ('N', 20, struct nvmm_ioc_ctl)
 
 #endif /* _NVMM_IOCTL_H_ */
