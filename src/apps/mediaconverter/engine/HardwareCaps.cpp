@@ -642,8 +642,8 @@ HardwareInventory::_AddTableDevice(uint16 vendor, uint16 deviceID)
 			device.vendor = kVendorIntel;
 			device.backend = kBackendVAAPI;
 			device.name.SetToFormat("Intel graphics [%04x]", deviceID);
-			device.status = "air/OS has no VA-API driver for Intel graphics "
-				"yet.";
+			device.status = "Needs the i915_drm driver (Gen 9 and later) and "
+				"its VA-API user land.";
 			break;
 
 		default:
