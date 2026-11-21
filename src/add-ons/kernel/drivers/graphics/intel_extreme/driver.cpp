@@ -16,10 +16,15 @@
 #include <string.h>
 
 #include <AGP.h>
+#include <driver_settings.h>
 #include <KernelExport.h>
 #include <OS.h>
 #include <PCI.h>
 #include <SupportDefs.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+#include <syscalls.h>
 
 
 #define TRACE_DRIVER
@@ -232,6 +237,99 @@ agp_gart_module_info* gGART;
 mutex gLock;
 
 
+/*!	Whether air/OS's i915_drm (Linux's i915, the linux-drm fork) drives this
+	GPU, which then is not ours: two drivers on one GPU stop the machine. It
+	takes Gen 9's big cores (Skylake, Kaby Lake, Coffee Lake, Comet Lake),
+	and every Gen 9 and later GPU with "haiku_probe all" in its settings,
+	unless "haiku_gpus" leaves this one out, while it is installed and has
+	not given up after starts that did not finish (its start marker: a count
+	of 2 or more from an earlier boot). The same rule as is_i915_gpu() in
+	its haiku/i915/driver.cpp.
+*/
+static bool
+i915_drm_drives(const pci_info& info, uint32 type)
+{
+	static const char* const kBinaries[] = {
+		"/boot/system/add-ons/kernel/drivers/bin/i915_drm",
+		"/boot/system/non-packaged/add-ons/kernel/drivers/bin/i915_drm",
+		"/boot/home/config/non-packaged/add-ons/kernel/drivers/bin/i915_drm",
+	};
+	static const char* kMarker
+		= "/boot/home/config/settings/kernel/drivers/i915_drm.starting";
+
+	bool probeAll = false;
+	char onlyGpus[128] = "";
+	void* handle = load_driver_settings("i915_drm");
+	if (handle != NULL) {
+		const char* probe = get_driver_parameter(handle, "haiku_probe", NULL,
+			NULL);
+		probeAll = probe != NULL && strcmp(probe, "all") == 0;
+		const char* gpus = get_driver_parameter(handle, "haiku_gpus", NULL,
+			NULL);
+		if (gpus != NULL)
+			strlcpy(onlyGpus, gpus, sizeof(onlyGpus));
+		unload_driver_settings(handle);
+	}
+
+	switch (type & INTEL_GROUP_MASK) {
+		case INTEL_GROUP_SKY:
+		case INTEL_GROUP_KBY:
+		case INTEL_GROUP_CFL:
+		case INTEL_GROUP_CML:
+			break;
+		case INTEL_GROUP_JSL:
+		case INTEL_GROUP_TGL:
+		case INTEL_GROUP_ALD:
+			if (probeAll)
+				break;
+			return false;
+		default:
+			return false;
+	}
+	if (onlyGpus[0] != '\0') {
+		char location[16];
+		snprintf(location, sizeof(location), "%02x:%02x.%x", info.bus,
+			info.device, info.function);
+		if (strstr(onlyGpus, location) == NULL)
+			return false;
+	}
+
+	bool installed = false;
+	struct stat st;
+	for (size_t i = 0; i < B_COUNT_OF(kBinaries) && !installed; i++)
+		installed = stat(kBinaries[i], &st) == 0;
+	if (!installed)
+		return false;
+
+	// a marker of an earlier boot with 2 or more unfinished starts: it
+	// stays off this boot
+	if (stat(kMarker, &st) == 0) {
+		time_t bootTime = real_time_clock() - system_time() / 1000000;
+		if (st.st_mtime + 5 < bootTime) {
+			int count = 1;
+			int fd = _kern_open(-1, kMarker, O_RDONLY, 0);
+			if (fd >= 0) {
+				char buffer[256];
+				ssize_t length = _kern_read(fd, 0, buffer, sizeof(buffer) - 1);
+				_kern_close(fd);
+				if (length > 0) {
+					buffer[length] = '\0';
+					const char* number = strstr(buffer, "unfinished starts: ");
+					if (number != NULL)
+						count = atoi(number + strlen("unfinished starts: "));
+				}
+			}
+			if (count >= 2) {
+				ERROR("%s: i915_drm gave up (%s), the GPU is ours\n",
+					__func__, kMarker);
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+
 static status_t
 get_next_intel_extreme(int32* _cookie, pci_info &info, uint32 &type)
 {
@@ -250,6 +348,11 @@ get_next_intel_extreme(int32* _cookie, pci_info &info, uint32 &type)
 		for (uint32 i = 0; i < sizeof(kSupportedDevices)
 				/ sizeof(kSupportedDevices[0]); i++) {
 			if (info.device_id == kSupportedDevices[i].device_id) {
+				if (i915_drm_drives(info, kSupportedDevices[i].type)) {
+					ERROR("%s: Intel gfx deviceID 0x%04x is i915_drm's\n",
+						__func__, info.device_id);
+					break;
+				}
 				type = i;
 				*_cookie = index + 1;
 				ERROR("%s: Intel gfx deviceID: 0x%04x\n", __func__, info.device_id);
