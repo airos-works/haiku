@@ -12,19 +12,32 @@ SubDirCcFlags [ FDefines _KERNEL=1 _XOPEN_SOURCE ]
 UseHeaders [ FDirName $(SUBDIR) ] : true ;
 
 SEARCH_SOURCE += [ FDirName $(SUBDIR) dev ic ] ;
+SEARCH_SOURCE += [ FDirName $(SUBDIR) dev pci ] ;
 SEARCH_SOURCE += [ FDirName $(SUBDIR) dev sdmmc ] ;
 
-# Broadcom/Cypress FullMAC Wi-Fi on SDIO (the Raspberry Pi 4's and 5's
-# CYW43455): OpenBSD's bwfm on an SDIO function of the MMC bus, or on the
-# Pi 4's port with a small SDIO host of its own.
+# Broadcom/Cypress FullMAC Wi-Fi: OpenBSD's bwfm. On PCIe (BCM4350, 4356,
+# 43602, 4371, 4378, 4387: msgbuf protocol), and on arm64 also on SDIO (the
+# Raspberry Pi 4's and 5's CYW43455): on an SDIO function of the MMC bus, or
+# on the Pi 4's port with a small SDIO host of its own.
+local sdioSources ;
+local sdioLibraries ;
+if $(TARGET_ARCH) = arm64 {
+	sdioSources = if_bwfm_sdio.c ;
+	sdioLibraries = broadcomfmac_sdio_host.a ;
+	SubDirCcFlags [ FDefines BWFM_SDIO ] ;
+}
+
 KernelAddon broadcomfmac :
 	bwfm.c
-	if_bwfm_sdio.c
+	if_bwfm_pci.c
+	$(sdioSources)
 	glue.c
 	:
-	broadcomfmac_sdio_host.a
+	$(sdioLibraries)
 	openbsd_wlan.a
 	libfreebsd_network.a
 	;
 
-SubInclude HAIKU_TOP src add-ons kernel drivers network wlan broadcomfmac host ;
+if $(TARGET_ARCH) = arm64 {
+	SubInclude HAIKU_TOP src add-ons kernel drivers network wlan broadcomfmac host ;
+}

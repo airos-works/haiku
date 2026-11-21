@@ -16,6 +16,60 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#ifdef __HAIKU__
+/* Haiku: OpenBSD's driver on the FreeBSD/OpenBSD compatibility layers. */
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <sys/kernel.h>
+#include <sys/malloc.h>
+#include <sys/mbuf.h>
+#include <sys/queue.h>
+#include <sys/socket.h>
+#include <sys/sockio.h>
+#include <sys/endian.h>
+#include <sys/task.h>
+#include <sys/device.h>
+#include <sys/bus.h>
+#include <sys/rman.h>
+#include <machine/bus.h>
+
+#include <net/if.h>
+#include <net/if_dl.h>
+#include <net/if_media.h>
+#include <net/if_types.h>
+#include <net/ifq.h>
+
+#include <netinet/in.h>
+#include <netinet/if_ether.h>
+
+#include <net80211/ieee80211_var.h>
+#include <net80211/ieee80211_priv.h>
+#undef DPRINTF
+
+#include <dev/pci/pcireg.h>
+#include <dev/pci/pcivar.h>
+
+#define PCI_VENDOR_BROADCOM		0x14e4
+#define PCI_PRODUCT_BROADCOM_BCM4350	0x43a3
+#define PCI_PRODUCT_BROADCOM_BCM4356	0x43ec
+#define PCI_PRODUCT_BROADCOM_BCM43602	0x43ba
+#define PCI_PRODUCT_BROADCOM_BCM4371	0x440d
+#define PCI_PRODUCT_BROADCOM_BCM4378	0x4425
+#define PCI_PRODUCT_BROADCOM_BCM4387	0x4433
+
+/* the PCI configuration calls of the compatibility layer take the device */
+#define SC_DEV_FOR_PCI	(sc->sc_sc.sc_dev)
+
+#define paddr_t bus_addr_t
+#define delay(us) DELAY(us)
+#define mallocarray(nmemb, size, type, flags) \
+	malloc((size) * (nmemb), (type), (flags))
+#define ifq_restart(ifq) do {					\
+	ifq_clr_oactive(ifq);					\
+	if (!IFQ_IS_EMPTY(ifq))					\
+		(*ifp->if_start)(ifp);				\
+} while (0)
+#else
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/malloc.h>
@@ -41,6 +95,8 @@
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
 #include <dev/pci/pcidevs.h>
+
+#endif
 
 #include <dev/ic/bwfmvar.h>
 #include <dev/ic/bwfmreg.h>
@@ -70,7 +126,11 @@ static int bwfm_debug = 2;
 #define DPRINTFN(n, x)	do { ; } while (0)
 #endif
 
+#ifdef __HAIKU__
+#define DEVNAME(sc)	gDriverName
+#else
 #define DEVNAME(sc)	((sc)->sc_sc.sc_dev.dv_xname)
+#endif
 
 enum ring_status {
 	RING_CLOSED,
@@ -115,9 +175,11 @@ struct bwfm_pci_pkts {
 
 struct bwfm_pci_softc {
 	struct bwfm_softc	 sc_sc;
+#ifndef __HAIKU__
 	pci_chipset_tag_t	 sc_pc;
 	pcitag_t		 sc_tag;
 	pcireg_t		 sc_id;
+#endif
 	void 			*sc_ih;
 
 	int			 sc_initialized;
@@ -184,6 +246,15 @@ struct bwfm_pci_softc {
 	uint8_t			 sc_mbdata_done;
 	uint8_t			 sc_pcireg64;
 	uint8_t			 sc_mb_via_ctl;
+#ifdef __HAIKU__
+	int			 sc_msi;
+	struct resource		*sc_irq;
+	int			 sc_irq_rid;
+	struct resource		*sc_reg_res;
+	int			 sc_reg_rid;
+	struct resource		*sc_tcm_res;
+	int			 sc_tcm_rid;
+#endif
 };
 
 struct bwfm_pci_dmamem {
@@ -198,10 +269,17 @@ struct bwfm_pci_dmamem {
 #define BWFM_PCI_DMA_DVA(_bdm)	((uint64_t)(_bdm)->bdm_map->dm_segs[0].ds_addr)
 #define BWFM_PCI_DMA_KVA(_bdm)	((void *)(_bdm)->bdm_kva)
 
+#ifdef __HAIKU__
+void		 bwfm_stop(struct ifnet *);
+static int	 bwfm_pci_probe(device_t);
+static int	 bwfm_pci_attach(device_t);
+static int	 bwfm_pci_haiku_detach(device_t);
+#else
 int		 bwfm_pci_match(struct device *, void *, void *);
 void		 bwfm_pci_attach(struct device *, struct device *, void *);
 int		 bwfm_pci_detach(struct device *, int);
 int		 bwfm_pci_activate(struct device *, int);
+#endif
 void		 bwfm_pci_cleanup(struct bwfm_pci_softc *);
 
 #if defined(__HAVE_FDT)
@@ -329,6 +407,7 @@ struct bwfm_proto_ops bwfm_pci_msgbuf_ops = {
 	.proto_rxctl = NULL,
 };
 
+#ifndef __HAIKU__
 const struct cfattach bwfm_pci_ca = {
 	sizeof(struct bwfm_pci_softc),
 	bwfm_pci_match,
@@ -336,6 +415,7 @@ const struct cfattach bwfm_pci_ca = {
 	bwfm_pci_detach,
 	bwfm_pci_activate,
 };
+#endif
 
 static const struct pci_matchid bwfm_pci_devices[] = {
 	{ PCI_VENDOR_BROADCOM, PCI_PRODUCT_BROADCOM_BCM4350 },
@@ -346,6 +426,168 @@ static const struct pci_matchid bwfm_pci_devices[] = {
 	{ PCI_VENDOR_BROADCOM, PCI_PRODUCT_BROADCOM_BCM4387 },
 };
 
+#ifdef __HAIKU__
+static int
+bwfm_pci_probe(device_t dev)
+{
+	int i;
+
+	for (i = 0; i < nitems(bwfm_pci_devices); i++) {
+		if (pci_get_vendor(dev) == bwfm_pci_devices[i].pm_vid &&
+		    pci_get_device(dev) == bwfm_pci_devices[i].pm_pid)
+			return BUS_PROBE_DEFAULT;
+	}
+	return ENXIO;
+}
+
+static void
+bwfm_pci_haiku_release(struct bwfm_pci_softc *sc)
+{
+	device_t dev = sc->sc_sc.sc_dev;
+
+	if (sc->sc_ih != NULL)
+		bus_teardown_intr(dev, sc->sc_irq, sc->sc_ih);
+	sc->sc_ih = NULL;
+	if (sc->sc_irq != NULL)
+		bus_release_resource(dev, SYS_RES_IRQ, sc->sc_irq_rid,
+		    sc->sc_irq);
+	sc->sc_irq = NULL;
+	if (sc->sc_msi)
+		pci_release_msi(dev);
+	sc->sc_msi = 0;
+	if (sc->sc_reg_res != NULL)
+		bus_release_resource(dev, SYS_RES_MEMORY, sc->sc_reg_rid,
+		    sc->sc_reg_res);
+	sc->sc_reg_res = NULL;
+	if (sc->sc_tcm_res != NULL)
+		bus_release_resource(dev, SYS_RES_MEMORY, sc->sc_tcm_rid,
+		    sc->sc_tcm_res);
+	sc->sc_tcm_res = NULL;
+	if (sc->sc_dmat != NULL)
+		bus_dma_tag_destroy(sc->sc_dmat);
+	sc->sc_dmat = NULL;
+}
+
+/*
+ * The interrupt, once the chip is halted and reset: enabling an MSI also
+ * turns bus mastering on (the PCI bus manager's _CommandForMSI()).
+ */
+static int
+bwfm_pci_haiku_setup_intr(struct bwfm_pci_softc *sc)
+{
+	device_t dev = sc->sc_sc.sc_dev;
+	int count;
+
+	if (sc->sc_ih != NULL)
+		return 0;
+
+	count = 1;
+	sc->sc_irq_rid = 0;
+	if (pci_alloc_msi(dev, &count) == 0) {
+		sc->sc_msi = 1;
+		sc->sc_irq_rid = 1;
+	} else {
+		/*
+		 * Only an MSI: a handler on the shared line (IRQ 16 on the
+		 * iMac18,1) lets that line through, which may then stay raised
+		 * by a device without a driver.
+		 */
+		printf("%s: no MSI\n", DEVNAME(sc));
+		return ENXIO;
+	}
+	sc->sc_irq = bus_alloc_resource_any(dev, SYS_RES_IRQ, &sc->sc_irq_rid,
+	    RF_ACTIVE);
+	if (sc->sc_irq == NULL) {
+		printf("%s: can't map interrupt\n", DEVNAME(sc));
+		return ENXIO;
+	}
+	/* in the compatibility layer's interrupt thread, under Giant */
+	if (bus_setup_intr(dev, sc->sc_irq, INTR_TYPE_NET, NULL,
+	    (driver_intr_t *)bwfm_pci_intr, sc, &sc->sc_ih) != 0) {
+		sc->sc_ih = NULL;
+		bus_release_resource(dev, SYS_RES_IRQ, sc->sc_irq_rid,
+		    sc->sc_irq);
+		sc->sc_irq = NULL;
+		printf("%s: can't establish interrupt\n", DEVNAME(sc));
+		return ENXIO;
+	}
+	return 0;
+}
+
+static int
+bwfm_pci_attach(device_t dev)
+{
+	struct bwfm_pci_softc *sc = device_get_softc(dev);
+
+	sc->sc_sc.sc_dev = dev;
+
+	/*
+	 * No DMA until the chip has been halted and reset (preinit): Apple's
+	 * EFI leaves it with bus mastering on and its own firmware's state,
+	 * which must not write to memory that is the system's now.
+	 */
+	pci_write_config(dev, PCI_COMMAND_STATUS_REG,
+	    pci_read_config(dev, PCI_COMMAND_STATUS_REG, 2)
+	    & ~PCI_COMMAND_MASTER_ENABLE, 2);
+
+	/*
+	 * The chip gets 32 bit host addresses (as from Linux and OpenBSD);
+	 * the compatibility layer bounces buffers above 4 GB.
+	 */
+	if (bus_dma_tag_create(NULL, 1, 0, BUS_SPACE_MAXADDR_32BIT,
+	    BUS_SPACE_MAXADDR, NULL, NULL, BUS_SPACE_MAXSIZE_32BIT,
+	    BUS_SPACE_UNRESTRICTED, BUS_SPACE_MAXSIZE_32BIT, 0, NULL, NULL,
+	    &sc->sc_dmat) != 0) {
+		printf("%s: can't create DMA tag\n", DEVNAME(sc));
+		return ENXIO;
+	}
+
+	/* BAR0: the backplane window and the PCIe core; BAR2: the chip's RAM */
+	sc->sc_reg_rid = PCI_MAPREG_START + 0x00;
+	sc->sc_reg_res = bus_alloc_resource_any(dev, SYS_RES_MEMORY,
+	    &sc->sc_reg_rid, RF_ACTIVE);
+	sc->sc_tcm_rid = PCI_MAPREG_START + 0x08;
+	sc->sc_tcm_res = bus_alloc_resource_any(dev, SYS_RES_MEMORY,
+	    &sc->sc_tcm_rid, RF_ACTIVE);
+	if (sc->sc_reg_res == NULL || sc->sc_tcm_res == NULL) {
+		printf("%s: can't map BARs\n", DEVNAME(sc));
+		goto fail;
+	}
+	sc->sc_reg_iot = rman_get_bustag(sc->sc_reg_res);
+	sc->sc_reg_ioh = rman_get_bushandle(sc->sc_reg_res);
+	sc->sc_reg_ios = rman_get_size(sc->sc_reg_res);
+	sc->sc_tcm_iot = rman_get_bustag(sc->sc_tcm_res);
+	sc->sc_tcm_ioh = rman_get_bushandle(sc->sc_tcm_res);
+	sc->sc_tcm_ios = rman_get_size(sc->sc_tcm_res);
+	/* the PCIe core's registers are a fixed window of BAR0 */
+	sc->sc_pcie_iot = sc->sc_reg_iot;
+	sc->sc_pcie_ioh = sc->sc_reg_ioh + 0x2000;
+
+	/* the mailbox interrupt stays masked until the firmware is up */
+	bus_space_write_4(sc->sc_pcie_iot, sc->sc_pcie_ioh,
+	    BWFM_PCI_PCIE2REG_MAILBOXMASK, 0);
+
+	printf("%s: BCM%x, BAR0 %#" B_PRIxADDR ", BAR2 %#" B_PRIxADDR
+	    " (%" B_PRIuSIZE " KB)\n", DEVNAME(sc), pci_get_device(dev),
+	    (addr_t)rman_get_start(sc->sc_reg_res),
+	    (addr_t)rman_get_start(sc->sc_tcm_res),
+	    (size_t)sc->sc_tcm_ios / 1024);
+
+	sc->sc_sc.sc_bus_ops = &bwfm_pci_bus_ops;
+	sc->sc_sc.sc_proto_ops = &bwfm_pci_msgbuf_ops;
+	bwfm_attach(&sc->sc_sc);
+	/*
+	 * The firmware files are there by now. If the chip does not come up,
+	 * the interface stays all the same; bringing it up tries again.
+	 */
+	bwfm_attachhook(&sc->sc_sc);
+	return 0;
+
+fail:
+	bwfm_pci_haiku_release(sc);
+	return ENXIO;
+}
+#else
 int
 bwfm_pci_match(struct device *parent, void *match, void *aux)
 {
@@ -428,6 +670,8 @@ bar1:
 	bus_space_unmap(sc->sc_tcm_iot, sc->sc_tcm_ioh, sc->sc_tcm_ios);
 }
 
+#endif
+
 int
 bwfm_pci_preinit(struct bwfm_softc *bwfm)
 {
@@ -457,6 +701,12 @@ bwfm_pci_preinit(struct bwfm_softc *bwfm)
 	}
 #endif
 
+#ifdef __HAIKU__
+	/* the chip is halted and reset: it may write to memory now */
+	pci_enable_busmaster(sc->sc_sc.sc_dev);
+	if (bwfm_pci_haiku_setup_intr(sc) != 0)
+		return 1;
+#endif
 	bwfm_pci_select_core(sc, BWFM_AGENT_CORE_PCIE2);
 	bus_space_write_4(sc->sc_pcie_iot, sc->sc_pcie_ioh,
 	    BWFM_PCI_PCIE2REG_CONFIGADDR, 0x4e0);
@@ -519,6 +769,30 @@ bwfm_pci_preinit(struct bwfm_softc *bwfm)
 			bwfm->sc_chip.ch_ramsize = letoh32(ramsize[1]);
 	}
 
+#ifdef __HAIKU__
+	/* everything below goes through BAR2: it must cover the chip's RAM */
+	if (bwfm->sc_chip.ch_rambase + bwfm->sc_chip.ch_ramsize >
+	    sc->sc_tcm_ios || size > bwfm->sc_chip.ch_ramsize) {
+		printf("%s: RAM 0x%x + 0x%x or firmware (%zu bytes) does not "
+		    "fit BAR2 (%#" B_PRIxADDR ")\n", DEVNAME(sc),
+		    bwfm->sc_chip.ch_rambase, bwfm->sc_chip.ch_ramsize, size,
+		    (addr_t)sc->sc_tcm_ios);
+		free(ucode, M_DEVBUF, size);
+		free(nvram, M_DEVBUF, nvsize);
+		return 1;
+	}
+	if (size < 4 || *(uint32_t *)ucode == 0) {
+		/* a file a crash left without its data reads as zeros */
+		printf("%s: the firmware file is empty\n", DEVNAME(sc));
+		free(ucode, M_DEVBUF, size);
+		free(nvram, M_DEVBUF, nvsize);
+		return 1;
+	}
+	printf("%s: chip %s rev %d, RAM 0x%x at 0x%x, firmware %zu bytes, "
+	    "NVRAM %zu bytes\n", DEVNAME(sc), bwfm->sc_chip.ch_name,
+	    bwfm->sc_chip.ch_chiprev, bwfm->sc_chip.ch_ramsize,
+	    bwfm->sc_chip.ch_rambase, size, nvlen);
+#endif
 	if (bwfm_pci_load_microcode(sc, ucode, size, nvram, nvlen) != 0) {
 		printf("%s: could not load microcode\n",
 		    DEVNAME(sc));
@@ -538,6 +812,10 @@ bwfm_pci_preinit(struct bwfm_softc *bwfm)
 		    DEVNAME(sc), sc->sc_shared_version);
 		return 1;
 	}
+#ifdef __HAIKU__
+	printf("%s: firmware up, shared area 0x%x, flags 0x%x\n", DEVNAME(sc),
+	    sc->sc_shared_address, sc->sc_shared_flags);
+#endif
 
 	if (sc->sc_shared_version >= 6) {
 		uint32_t host_cap;
@@ -825,9 +1103,19 @@ bwfm_pci_load_microcode(struct bwfm_pci_softc *sc, const u_char *ucode, size_t s
 		    BWFM_PCI_ARMCR4REG_BANKPDA, 0);
 	}
 
+#ifdef __HAIKU__
+	/* in 32 bit words, as Linux does: 600 KB in a few milliseconds */
+	for (i = 0; i + 4 <= size; i += 4)
+		bus_space_write_4(sc->sc_tcm_iot, sc->sc_tcm_ioh,
+		    bwfm->sc_chip.ch_rambase + i, le32dec(ucode + i));
+	for (; i < size; i++)
+		bus_space_write_1(sc->sc_tcm_iot, sc->sc_tcm_ioh,
+		    bwfm->sc_chip.ch_rambase + i, ucode[i]);
+#else
 	for (i = 0; i < size; i++)
 		bus_space_write_1(sc->sc_tcm_iot, sc->sc_tcm_ioh,
 		    bwfm->sc_chip.ch_rambase + i, ucode[i]);
+#endif
 
 	/* Firmware replaces this with a pointer once up. */
 	bus_space_write_4(sc->sc_tcm_iot, sc->sc_tcm_ioh,
@@ -874,6 +1162,16 @@ bwfm_pci_load_microcode(struct bwfm_pci_softc *sc, const u_char *ucode, size_t s
 			break;
 	}
 	if (shared == written) {
+#ifdef __HAIKU__
+		struct bwfm_core *arm = bwfm_chip_get_core(bwfm,
+		    BWFM_AGENT_CORE_ARM_CR4);
+		if (arm != NULL)
+			printf("%s: ARM core reset_ctl 0x%x ioctl 0x%x\n",
+			    DEVNAME(sc), bwfm->sc_buscore_ops->bc_read(bwfm,
+			    arm->co_wrapbase + BWFM_AGENT_RESET_CTL),
+			    bwfm->sc_buscore_ops->bc_read(bwfm,
+			    arm->co_wrapbase + BWFM_AGENT_IOCTL));
+#endif
 		printf("%s: firmware did not come up\n", DEVNAME(sc));
 		return 1;
 	}
@@ -888,6 +1186,67 @@ bwfm_pci_load_microcode(struct bwfm_pci_softc *sc, const u_char *ucode, size_t s
 	return 0;
 }
 
+#ifdef __HAIKU__
+/*
+ * Haiku unloads the driver when the system shuts down or its file is
+ * replaced: nothing of it may run after that, and the chip must not write
+ * to host memory any more, so it is reset.
+ */
+static int
+bwfm_pci_haiku_detach(device_t dev)
+{
+	struct bwfm_pci_softc *sc = device_get_softc(dev);
+	struct ifnet *ifp = &sc->sc_sc.sc_ic.ic_if;
+
+	if (sc->sc_sc.sc_initialized && (ifp->if_flags & IFF_RUNNING) != 0) {
+		/* the waits in there give Giant up, as everywhere in the stack */
+		mtx_lock(&Giant);
+		bwfm_stop(ifp);
+		mtx_unlock(&Giant);
+	}
+
+	bwfm_pci_intr_disable(sc);
+	/* returns once the handler thread has finished */
+	if (sc->sc_ih != NULL)
+		bus_teardown_intr(dev, sc->sc_irq, sc->sc_ih);
+	sc->sc_ih = NULL;
+	/*
+	 * A completion the interrupt handed to the task (a flowring deleted
+	 * late, after bwfm_stop() stopped waiting for it) frees what the
+	 * cleanup below frees too: let it run first.
+	 */
+	taskqueue_drain(taskqueue_fast, &sc->sc_sc.sc_task);
+
+	mtx_lock(&Giant);
+	if (bwfm_chip_get_core(&sc->sc_sc, BWFM_AGENT_CORE_PCIE2) != NULL)
+		bwfm_pci_buscore_reset(&sc->sc_sc);
+	pci_write_config(dev, PCI_COMMAND_STATUS_REG,
+	    pci_read_config(dev, PCI_COMMAND_STATUS_REG, 2)
+	    & ~PCI_COMMAND_MASTER_ENABLE, 2);
+	if (sc->sc_initialized)
+		bwfm_pci_cleanup(sc);
+	mtx_unlock(&Giant);
+
+	bwfm_pci_haiku_release(sc);
+	return 0;
+}
+
+static device_method_t bwfm_pci_methods[] = {
+	DEVMETHOD(device_probe,		bwfm_pci_probe),
+	DEVMETHOD(device_attach,	bwfm_pci_attach),
+	DEVMETHOD(device_detach,	bwfm_pci_haiku_detach),
+
+	DEVMETHOD_END
+};
+
+static driver_t bwfm_pci_driver = {
+	"bwfm",
+	bwfm_pci_methods,
+	sizeof(struct bwfm_pci_softc)
+};
+
+DRIVER_MODULE(bwfm, pci, bwfm_pci_driver, NULL, NULL);
+#else
 int
 bwfm_pci_detach(struct device *self, int flags)
 {
@@ -898,6 +1257,7 @@ bwfm_pci_detach(struct device *self, int flags)
 
 	return 0;
 }
+#endif
 
 void
 bwfm_pci_cleanup(struct bwfm_pci_softc *sc)
@@ -905,6 +1265,12 @@ bwfm_pci_cleanup(struct bwfm_pci_softc *sc)
 	int i;
 
 	for (i = 0; i < BWFM_NUM_RX_PKTIDS; i++) {
+#ifdef __HAIKU__
+		/* a loaded map may not be destroyed here */
+		if (sc->sc_rx_pkts.pkts[i].bb_m)
+			bus_dmamap_unload(sc->sc_dmat,
+			    sc->sc_rx_pkts.pkts[i].bb_map);
+#endif
 		bus_dmamap_destroy(sc->sc_dmat, sc->sc_rx_pkts.pkts[i].bb_map);
 		if (sc->sc_rx_pkts.pkts[i].bb_m)
 			m_freem(sc->sc_rx_pkts.pkts[i].bb_m);
@@ -913,6 +1279,12 @@ bwfm_pci_cleanup(struct bwfm_pci_softc *sc)
 	    sizeof(struct bwfm_pci_buf));
 
 	for (i = 0; i < BWFM_NUM_TX_PKTIDS; i++) {
+#ifdef __HAIKU__
+		/* a loaded map may not be destroyed here */
+		if (sc->sc_tx_pkts.pkts[i].bb_m)
+			bus_dmamap_unload(sc->sc_dmat,
+			    sc->sc_tx_pkts.pkts[i].bb_map);
+#endif
 		bus_dmamap_destroy(sc->sc_dmat, sc->sc_tx_pkts.pkts[i].bb_map);
 		if (sc->sc_tx_pkts.pkts[i].bb_m)
 			m_freem(sc->sc_tx_pkts.pkts[i].bb_m);
@@ -921,6 +1293,12 @@ bwfm_pci_cleanup(struct bwfm_pci_softc *sc)
 	    sizeof(struct bwfm_pci_buf));
 
 	for (i = 0; i < BWFM_NUM_IOCTL_PKTIDS; i++) {
+#ifdef __HAIKU__
+		/* a loaded map may not be destroyed here */
+		if (sc->sc_ioctl_pkts.pkts[i].bb_m)
+			bus_dmamap_unload(sc->sc_dmat,
+			    sc->sc_ioctl_pkts.pkts[i].bb_map);
+#endif
 		bus_dmamap_destroy(sc->sc_dmat, sc->sc_ioctl_pkts.pkts[i].bb_map);
 		if (sc->sc_ioctl_pkts.pkts[i].bb_m)
 			m_freem(sc->sc_ioctl_pkts.pkts[i].bb_m);
@@ -950,6 +1328,7 @@ bwfm_pci_cleanup(struct bwfm_pci_softc *sc)
 	sc->sc_initialized = 0;
 }
 
+#ifndef __HAIKU__
 int
 bwfm_pci_activate(struct device *self, int act)
 {
@@ -998,6 +1377,7 @@ bwfm_pci_activate(struct device *self, int act)
 
 	return 0;
 }
+#endif
 
 #if defined(__HAVE_FDT)
 int
@@ -1217,6 +1597,10 @@ bdmfree:
 void
 bwfm_pci_dmamem_free(struct bwfm_pci_softc *sc, struct bwfm_pci_dmamem *bdm)
 {
+#ifdef __HAIKU__
+	/* the compatibility layer does not destroy a loaded map */
+	bus_dmamap_unload(sc->sc_dmat, bdm->bdm_map);
+#endif
 	bus_dmamem_unmap(sc->sc_dmat, bdm->bdm_kva, bdm->bdm_size);
 	bus_dmamem_free(sc->sc_dmat, &bdm->bdm_seg, 1);
 	bus_dmamap_destroy(sc->sc_dmat, bdm->bdm_map);
@@ -1257,8 +1641,13 @@ bwfm_pci_pktid_new(struct bwfm_pci_softc *sc, struct bwfm_pci_pkts *pkts,
 		if (pkts->pkts[idx].bb_m == NULL) {
 			if (bus_dmamap_load_mbuf(sc->sc_dmat,
 			    pkts->pkts[idx].bb_map, m, BUS_DMA_NOWAIT) != 0) {
+#ifdef __HAIKU__
+				/* the compatibility layer has bounced it already */
+				return EFBIG;
+#else
 				if (m_defrag(m, M_DONTWAIT))
 					return EFBIG;
+#endif
 				if (bus_dmamap_load_mbuf(sc->sc_dmat,
 				    pkts->pkts[idx].bb_map, m, BUS_DMA_NOWAIT) != 0)
 					return EFBIG;
@@ -1709,7 +2098,11 @@ bwfm_pci_msg_rx(struct bwfm_pci_softc *sc, void *buf, struct mbuf_list *ml)
 			m = ring->m;
 			ring->m = NULL;
 			if (bwfm_pci_txdata(&sc->sc_sc, m))
+#ifdef __HAIKU__
+				m_freem(m);
+#else
 				m_freem(ring->m);
+#endif
 		}
 		ifq_restart(&ifp->if_snd);
 		break;
@@ -2191,8 +2584,43 @@ bwfm_pci_txcheck(struct bwfm_softc *bwfm)
 	return 0;
 }
 
+#ifdef __HAIKU__
+static int bwfm_pci_txdata_one(struct bwfm_softc *, struct mbuf *);
+
+/*
+ * The descriptor takes one buffer of m_len bytes, so a chain goes as a copy
+ * (the compatibility layer has no OpenBSD m_defrag(), which works in place).
+ * The caller frees the packet it handed in when this fails.
+ */
 int
 bwfm_pci_txdata(struct bwfm_softc *bwfm, struct mbuf *m)
+{
+	struct mbuf *m0;
+	int error;
+
+	if (m->m_next == NULL)
+		return bwfm_pci_txdata_one(bwfm, m);
+
+	m0 = MCLGETL(NULL, M_DONTWAIT, m->m_pkthdr.len);
+	if (m0 == NULL)
+		return ENOBUFS;
+	m_copydata(m, 0, m->m_pkthdr.len, mtod(m0, caddr_t));
+	m0->m_len = m0->m_pkthdr.len = m->m_pkthdr.len;
+	error = bwfm_pci_txdata_one(bwfm, m0);
+	if (error != 0) {
+		m_freem(m0);
+		return error;
+	}
+	m_freem(m);
+	return 0;
+}
+
+static int
+bwfm_pci_txdata_one(struct bwfm_softc *bwfm, struct mbuf *m)
+#else
+int
+bwfm_pci_txdata(struct bwfm_softc *bwfm, struct mbuf *m)
+#endif
 {
 	struct bwfm_pci_softc *sc = (void *)bwfm;
 	struct bwfm_pci_msgring *ring;
@@ -2373,8 +2801,12 @@ bwfm_pci_intr(void *v)
 		bwfm_pci_ring_rx(sc, &sc->sc_rx_complete, &ml);
 		bwfm_pci_ring_rx(sc, &sc->sc_tx_complete, &ml);
 
+#ifdef __HAIKU__
+		if_input(ifp, &ml);
+#else
 		if (ifiq_input(&ifp->if_rcv, &ml))
 			if_rxr_livelocked(&sc->sc_rxbuf_ring);
+#endif
 	}
 
 #ifdef BWFM_DEBUG

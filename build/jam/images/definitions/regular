@@ -384,12 +384,13 @@ SYSTEM_ADD_ONS_DRIVERS_NET += [ FFilterByBuildFeatures
 	x86_64 @{
 		mt7922wifi
 	}@ # x86_64
-	# Broadcom/Cypress FullMAC on SDIO: the Raspberry Pi 4's CYW43455. It
-	# only attaches on that board; its firmware comes with the board's image
-	# (tools/rpi4/UserBuildConfig).
-	arm64 @{
+	# Broadcom/Cypress FullMAC: on PCIe (the BCM43602 of Apple's 2015-2017
+	# Macs; firmware: the air/OS images' broadcom_wifi_firmwares) and, on
+	# arm64, on SDIO (the Raspberry Pi 4's and 5's CYW43455, whose firmware
+	# comes with the board's image: tools/rpi4/UserBuildConfig).
+	x86_64,arm64 @{
 		broadcomfmac
-	}@ # arm64
+	}@ # x86_64,arm64
 	# Legacy PCI and CardBus cards
 	x86,x86_64,riscv64 @{
 		aironetwifi
