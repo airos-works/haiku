@@ -129,6 +129,12 @@ start_wlan(device_t device)
 	ifp->if_flags |= IFF_NEEDSGIANT;
 
 	if_initname(ifp, device_get_name(device), i);
+	// if_initname() looks the root device up by unit number, which fails
+	// for PCI drivers: their init_hardware() probe used up a unit for a root
+	// of its own. Without the right root, unloading the driver detaches
+	// nothing, and its interrupt handler stays installed after its code is
+	// gone.
+	ifp->root_device = device->root;
 
 	sWatchdogStopped[i] = false;
 	timeout_set(&sWatchdogs[i], wlan_watchdog, (void*)(addr_t)i);
