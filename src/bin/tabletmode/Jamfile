@@ -1,0 +1,7 @@
+SubDir HAIKU_TOP src bin tabletmode ;
+
+UsePrivateHeaders drivers ;
+
+Application tabletmode :
+	tabletmode.cpp
+;

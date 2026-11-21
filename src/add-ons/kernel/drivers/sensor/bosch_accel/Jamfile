@@ -1,0 +1,14 @@
+SubDir HAIKU_TOP src add-ons kernel drivers sensor bosch_accel ;
+
+SubDirC++Flags -fno-rtti ;
+
+UsePrivateHeaders drivers i2c ;
+UsePrivateKernelHeaders ;
+
+SubDirHdrs [ FDirName $(HAIKU_TOP) src add-ons kernel bus_managers acpi acpica include ] ;
+SubDirHdrs [ FDirName $(HAIKU_TOP) src add-ons kernel bus_managers acpi acpica include platform ] ;
+
+KernelAddon bosch_accel :
+	bosch_accel.cpp
+	HingeTracker.cpp
+	;

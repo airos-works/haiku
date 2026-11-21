@@ -109,6 +109,7 @@ SYSTEM_BIN = [ FFilterByBuildFeatures
 	su
 	sysinfo
 	system_time
+	tabletmode
 	tcptester
 	telnet
 	telnetd
@@ -390,6 +391,7 @@ SYSTEM_ADD_ONS_DRIVERS_POWER = [ FFilterByBuildFeatures
 
 SYSTEM_ADD_ONS_DRIVERS_SENSOR = [ FFilterByBuildFeatures
 	acpi_als@x86,x86_64
+	bosch_accel@x86,x86_64
 ] ;
 
 

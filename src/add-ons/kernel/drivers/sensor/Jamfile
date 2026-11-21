@@ -2,3 +2,4 @@ SubDir HAIKU_TOP src add-ons kernel drivers sensor ;
 
 SubInclude HAIKU_TOP src add-ons kernel drivers sensor acpi_als ;
 
+SubInclude HAIKU_TOP src add-ons kernel drivers sensor bosch_accel ;

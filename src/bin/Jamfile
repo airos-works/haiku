@@ -288,6 +288,7 @@ SubInclude HAIKU_TOP src bin query ;
 SubInclude HAIKU_TOP src bin rc ;
 SubInclude HAIKU_TOP src bin screen_blanker ;
 SubInclude HAIKU_TOP src bin screenmode ;
+SubInclude HAIKU_TOP src bin tabletmode ;
 SubInclude HAIKU_TOP src bin writembr ;
 
 # debugging tools
