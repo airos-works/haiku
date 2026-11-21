@@ -846,14 +846,20 @@ print_kernel_debugger_message()
 }
 
 
-static void
+/*!	Runs the commands the debugger's message names after "@!", if any.
+	\return What the last of them returned: \c B_KDEBUG_QUIT when that was
+		"continue" (the debugger is to be left again).
+*/
+static int
 execute_panic_commands()
 {
 	if (sCurrentKernelDebuggerMessage == NULL
 		|| strstr(sCurrentKernelDebuggerMessage,
 				kKDLMessageCommandSeparator) == NULL) {
-		return;
+		return 0;
 	}
+
+	int result = 0;
 
 	// Indeed there are commands to execute.
 	const size_t kCommandBufferSize = 512;
@@ -870,7 +876,7 @@ execute_panic_commands()
 			if (commands != NULL) {
 				commands += strlen(kKDLMessageCommandSeparator);
 				kprintf("initial commands: %s\n", commands);
-				evaluate_debug_command(commands);
+				result = evaluate_debug_command(commands);
 			}
 		}
 
@@ -878,6 +884,8 @@ execute_panic_commands()
 
 		debug_free(commandBuffer);
 	}
+
+	return result;
 }
 
 
@@ -949,6 +957,8 @@ kernel_debugger_loop(const char* messagePrefix, const char* message,
 		}
 	}
 
+	bool leave = false;
+
 	if (!has_debugger_command("help") || message != NULL) {
 		// No commands yet or we came here via a panic(). Always print a stack
 		// trace in these cases.
@@ -968,7 +978,11 @@ kernel_debugger_loop(const char* messagePrefix, const char* message,
 		bool pagingEnabled = blue_screen_paging_enabled();
 		blue_screen_set_paging(false);
 
-		execute_panic_commands();
+		// Commands that end with "continue" leave the debugger again: a
+		// machine nobody can type at goes on running, and what the commands
+		// printed is in the syslog (a user's entry, see
+		// _user_kernel_debugger()).
+		leave = execute_panic_commands() == B_KDEBUG_QUIT;
 
 		blue_screen_set_paging(pagingEnabled);
 	}
@@ -982,7 +996,7 @@ kernel_debugger_loop(const char* messagePrefix, const char* message,
 		// Index of the previous command line, if the command returned
 		// B_KDEBUG_CONT, i.e. asked to be repeatable, -1 otherwise.
 
-	for (;;) {
+	while (!leave) {
 		CommandLineEditingHelper editingHelper;
 		kprintf(kKDLPrompt);
 		char* line = sLineBuffer[sCurrentLine];
@@ -2665,7 +2679,8 @@ _user_kernel_debugger(const char* userMessage)
 		// carry them: "what happened@!threads 123; bt 456; reboot". With
 		// "reboot" last, a machine nobody can type at (a hung desktop whose
 		// keyboard the debugger does not drive) records its state in the
-		// syslog buffer, which the next start keeps as previous_syslog.
+		// syslog buffer, which the next start keeps as previous_syslog. With
+		// "continue" last it goes on running, and the syslog has the output.
 		// The message is the format execute_panic_commands() looks for the
 		// commands in, so it must not have any of its own.
 		for (char* c = message + length; *c != '\0'; c++) {
