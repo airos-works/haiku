@@ -218,7 +218,17 @@ nvmm_machine_create(struct nvmm_owner *owner,
 	mach->owner = owner;
 
 	/* Zero out the host mappings. */
+#if defined(__HAIKU__)
+	mach->hmap = os_mem_alloc(NVMM_MAX_HMAPPINGS * sizeof(*mach->hmap));
+	if (mach->hmap == NULL) {
+		nvmm_machine_free(mach);
+		nvmm_machine_put(mach);
+		return ENOMEM;
+	}
+	memset(mach->hmap, 0, NVMM_MAX_HMAPPINGS * sizeof(*mach->hmap));
+#else
 	memset(&mach->hmap, 0, sizeof(mach->hmap));
+#endif
 
 	/* Create the machine vmspace. */
 	mach->gpa_begin = 0;
@@ -269,6 +279,10 @@ nvmm_do_machine_destroy(struct nvmm_machine *mach)
 			continue;
 		os_vmobj_rel(mach->hmap[i].vmobj);
 	}
+#if defined(__HAIKU__)
+	os_mem_free(mach->hmap, NVMM_MAX_HMAPPINGS * sizeof(*mach->hmap));
+	mach->hmap = NULL;
+#endif
 
 	nvmm_machine_free(mach);
 }
@@ -755,6 +769,7 @@ nvmm_hva_map_existing(struct nvmm_owner *owner, struct nvmm_ioc_hva_map *args)
 {
 	struct nvmm_machine *mach;
 	struct nvmm_hmapping *hmapping;
+	size_t i;
 	int error;
 
 	if (args->flags != 0)
@@ -767,6 +782,19 @@ nvmm_hva_map_existing(struct nvmm_owner *owner, struct nvmm_ioc_hva_map *args)
 	error = nvmm_hmapping_validate(mach, args->hva, args->size);
 	if (error)
 		goto out;
+
+	/*
+	 * nvmm_hmapping_validate() lets a range inside a mapping pass; this
+	 * memory would then be registered twice and unmapped once.
+	 */
+	for (i = 0; i < NVMM_MAX_HMAPPINGS; i++) {
+		hmapping = &mach->hmap[i];
+		if (hmapping->present && args->hva < hmapping->hva + hmapping->size
+		    && args->hva + args->size > hmapping->hva) {
+			error = EEXIST;
+			goto out;
+		}
+	}
 
 	hmapping = nvmm_hmapping_alloc(mach);
 	if (hmapping == NULL) {

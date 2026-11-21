@@ -27,6 +27,7 @@
 #define GPA_SHARED	0x8000
 #define AREA_PAGES	4
 #define MAP_PAGES	2
+#define MANY		200
 	/* the area's pages 1 and 2 are the guest's 0x8000 and 0x9000 */
 
 static const uint8_t kCode[] = {
@@ -250,6 +251,34 @@ main(void)
 	reason = run(&mach, &vcpu);
 	check(ret == 0 && reason == NVMM_VCPU_EXIT_RDMSR && page1[1] == 0x4445
 	    && page2[1] == 0x5556, "mapped again, the guest has it again");
+
+	/* many small pieces (a renderer's allocations): more than the 32 host
+	   mappings NVMM has elsewhere */
+	{
+		uint8_t *many = NULL;
+		int i, mapped = 0, unmapped = 0;
+		area_id manyArea = create_area("nvmm many", (void **)&many,
+		    B_ANY_ADDRESS, MANY * PAGE_SIZE, B_FULL_LOCK,
+		    B_READ_AREA | B_WRITE_AREA);
+		if (manyArea < 0)
+			errx(1, "create_area: %s", strerror(manyArea));
+		for (i = 0; i < MANY; i++) {
+			if (nvmm_hva_map_existing(&mach,
+			    (uintptr_t)many + i * PAGE_SIZE, PAGE_SIZE) == 0)
+				mapped++;
+		}
+		check(mapped == MANY, "200 separate pieces can be registered");
+		ret = nvmm_hva_map_existing(&mach, (uintptr_t)many + PAGE_SIZE,
+		    PAGE_SIZE);
+		check(ret == -1, "but none of them twice");
+		for (i = 0; i < MANY; i++) {
+			if (nvmm_hva_unmap(&mach, (uintptr_t)many + i * PAGE_SIZE,
+			    PAGE_SIZE) == 0)
+				unmapped++;
+		}
+		check(unmapped == MANY, "and released");
+		delete_area(manyArea);
+	}
 
 	delete_area(area);
 	check(((uint64_t *)(other + PAGE_SIZE))[1] == 0x4445,

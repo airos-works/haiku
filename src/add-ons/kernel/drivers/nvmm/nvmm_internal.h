@@ -37,7 +37,13 @@
 
 #define NVMM_MAX_MACHINES	128
 #define NVMM_MAX_VCPUS		128
+#if defined(__HAIKU__)
+/* air/OS: also every piece of memory shared with the guest
+   (NVMM_IOC_HVA_MAP_EXISTING: a GPU renderer's blobs); allocated per machine */
+#define NVMM_MAX_HMAPPINGS	1024
+#else
 #define NVMM_MAX_HMAPPINGS	32
+#endif
 
 #if defined(__NetBSD__)
 #define NVMM_MAX_RAM		(128ULL * (1 << 30))
@@ -97,7 +103,11 @@ struct nvmm_machine {
 	gpaddr_t gpa_end;
 
 	/* Host Mappings */
+#if defined(__HAIKU__)
+	struct nvmm_hmapping *hmap;	/* NVMM_MAX_HMAPPINGS of them */
+#else
 	struct nvmm_hmapping hmap[NVMM_MAX_HMAPPINGS];
+#endif
 
 	/* CPU */
 	volatile unsigned int ncpus;
