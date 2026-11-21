@@ -271,11 +271,24 @@ i915_drm_drives(const pci_info& info, uint32 type)
 		unload_driver_settings(handle);
 	}
 
+	// Gen 9's low power parts (Broxton/Apollo Lake, Gemini Lake), which
+	// this driver lists under Kaby Lake, are i915_drm's only with
+	// "haiku_probe all", as Gen 11 and later are
+	static const uint16 kGen9LowPower[] = {
+		0x0a84, 0x1a84, 0x1a85, 0x5a84, 0x5a85,	// Broxton, Apollo Lake
+		0x3184, 0x3185,							// Gemini Lake
+	};
+	bool lowPower = false;
+	for (size_t i = 0; i < B_COUNT_OF(kGen9LowPower); i++)
+		lowPower |= kGen9LowPower[i] == info.device_id;
+
 	switch (type & INTEL_GROUP_MASK) {
 		case INTEL_GROUP_SKY:
 		case INTEL_GROUP_KBY:
 		case INTEL_GROUP_CFL:
 		case INTEL_GROUP_CML:
+			if (lowPower && !probeAll)
+				return false;
 			break;
 		case INTEL_GROUP_JSL:
 		case INTEL_GROUP_TGL:
