@@ -733,6 +733,18 @@ LocalDeviceImpl::HandleEvent(struct hci_event_header* event)
 	BMessage* request = NULL;
 	int32 eventIndexLocation;
 
+	if (event->ecode != HCI_EVENT_NUM_COMP_PKTS
+		&& event->ecode != HCI_EVENT_LE_META
+		&& event->ecode != HCI_EVENT_INQUIRY_RESULT
+		&& event->ecode != HCI_EVENT_INQUIRY_RESULT_WITH_RSSI
+		&& event->ecode != HCI_EVENT_EXTENDED_INQUIRY_RESULT) {
+		const uint8* data = (const uint8*)(event + 1);
+		CLASSIC_LOG(LE_LOG_DEBUG, "HCI event %#x, %u bytes: %02x %02x %02x %02x",
+			event->ecode, event->elen, event->elen > 0 ? data[0] : 0,
+			event->elen > 1 ? data[1] : 0, event->elen > 2 ? data[2] : 0,
+			event->elen > 3 ? data[3] : 0);
+	}
+
 	// HCI command flow control: both events report how many commands the
 	// controller accepts now.
 	const uint8* payload = (const uint8*)(event + 1);
@@ -2060,6 +2072,8 @@ void
 LocalDeviceImpl::PinCodeRequest(struct hci_ev_pin_code_req* event,
 	BMessage* request)
 {
+	CLASSIC_LOG(LE_LOG_INFO, "pairing with %s: PIN code requested",
+		bdaddrUtils::ToString(event->bdaddr).String());
 	TRACE_BT("LocalDeviceImpl: Opening PincodeWindow...");
 	PincodeWindow* iPincode = new PincodeWindow(event->bdaddr, GetID());
 	iPincode->Show();
@@ -2233,6 +2247,8 @@ LocalDeviceImpl::IOCapabilityRequest(struct hci_ev_io_capability_request* event,
 	void* command;
 
 	TRACE_BT("LocalDeviceImpl: IO Capability Request from %s...\n",
+		bdaddrUtils::ToString(event->bdaddr).String());
+	CLASSIC_LOG(LE_LOG_INFO, "pairing with %s: IO capabilities requested",
 		bdaddrUtils::ToString(event->bdaddr).String());
 
 	// TODO: this should be temporary, need to change this to HCI_IO_CAP_DISPLAY_YES_NO
