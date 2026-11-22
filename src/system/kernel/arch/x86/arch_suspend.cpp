@@ -633,6 +633,29 @@ x86_suspend_restore_cpu(x86_suspend_context* context)
 }
 
 
+/*!	Sets SCI_EN in the PM1 control registers, if the firmware left it clear
+	on the way back from S3.
+*/
+static void
+enable_sci_after_resume(acpi_module_info* acpi)
+{
+	void* table;
+	if (acpi->get_table("FACP", 0, &table) != B_OK)
+		return;
+
+	// PM1a_CNT_BLK and PM1b_CNT_BLK, 32 bit I/O port addresses
+	const uint32 blocks[2] = { *(uint32*)((uint8*)table + 64),
+		*(uint32*)((uint8*)table + 68) };
+	for (int i = 0; i < 2; i++) {
+		if (blocks[i] == 0 || blocks[i] > 0xffff)
+			continue;
+		uint16 value = in16(blocks[i]);
+		if ((value & 1) == 0)
+			out16(value | 1, blocks[i]);
+	}
+}
+
+
 static void
 prepare_wakeup_trampoline(uint64 cr3, x86_suspend_context* context)
 {
@@ -870,10 +893,21 @@ x86_suspend_enter_s3(const x86_suspend_s3_args* args)
 		// still has transfers in flight (the network card in particular)
 		// does not come back reliably.
 		snooze(500000);
+		// what may wake the system: the lid and the buttons (Linux arms
+		// them before _PTS, too)
+		if (acpi->enable_wake_devices != NULL)
+			acpi->enable_wake_devices(ACPI_POWER_STATE_SLEEP_S3, true);
 		status = acpi->prepare_sleep_state(ACPI_POWER_STATE_SLEEP_S3,
 			(void (*)(void))(addr_t)kWakeupCodePage, 0);
 		if (status != B_OK)
 			INFO("preparing the sleep state failed: %s\n", strerror(status));
+	}
+
+	bool rtcWake = false;
+	if (status == B_OK && args->wake_after_s != 0) {
+		rtcWake = x86_suspend_arm_rtc_wake(acpi, args->wake_after_s);
+		INFO("RTC wake in %" B_PRIu32 " s %s\n", args->wake_after_s,
+			rtcWake ? "armed" : "not possible");
 	}
 
 	if (status == B_OK)
@@ -961,6 +995,11 @@ x86_suspend_enter_s3(const x86_suspend_s3_args* args)
 
 	if (resumed) {
 		checkpoint(4);
+		// Firmware may come back in legacy mode (SCI_EN clear), where the
+		// embedded controller belongs to SMM: the first EC command of _WAK
+		// then hangs the machine (Lenovo Yoga 11e). Linux sets SCI_EN here
+		// too, "for bug compatibility" (acpi_suspend_enter()).
+		enable_sci_after_resume(acpi);
 		acpi->leave_sleep_state(ACPI_POWER_STATE_SLEEP_S3, true);
 		checkpoint(5);
 	}
@@ -977,6 +1016,11 @@ x86_suspend_enter_s3(const x86_suspend_s3_args* args)
 		snooze(1000000);
 		checkpoint(9);
 	}
+
+	if (rtcWake)
+		x86_suspend_disarm_rtc_wake();
+	if (acpi->enable_wake_devices != NULL)
+		acpi->enable_wake_devices(ACPI_POWER_STATE_SLEEP_S3, false);
 
 	thread_unpin_from_current_cpu(thread_get_current_thread());
 	for (int32 cpu = 1; cpu < cpuCount; cpu++) {
@@ -1039,6 +1083,30 @@ x86_suspend_enter_s3(const x86_suspend_s3_args* args)
 }
 
 
+/*!	S3 when the firmware has it and does not prefer suspend to idle. */
+static uint32
+deep_sleep_state()
+{
+	acpi_module_info* acpi;
+	if (get_module(B_ACPI_MODULE_NAME, (module_info**)&acpi) != B_OK)
+		return 0;
+
+	uint32 state = 0;
+	acpi_handle handle;
+	void* fadt;
+	if (acpi->get_handle(NULL, "\\_S3_", &handle) == B_OK
+		&& acpi->get_table("FACP", 0, &fadt) == B_OK
+		&& *(uint32*)((uint8*)fadt + 4) >= 116) {
+			// (the table length, then the flags at 112)
+		uint32 fadtFlags = *(uint32*)((uint8*)fadt + 112);
+		if ((fadtFlags & (1u << 21)) == 0)
+			state = 3;
+	}
+	put_module(B_ACPI_MODULE_NAME);
+	return state;
+}
+
+
 static status_t
 suspend_syscall(const char* subsystem, uint32 function, void* buffer,
 	size_t bufferSize)
@@ -1055,6 +1123,14 @@ suspend_syscall(const char* subsystem, uint32 function, void* buffer,
 				return B_BAD_ADDRESS;
 			}
 			return x86_suspend_restart_cpu(cpu);
+		}
+
+		case X86_SUSPEND_DEEP_SLEEP_STATE:
+		{
+			uint32 state = deep_sleep_state();
+			if (bufferSize != sizeof(state) || !IS_USER_ADDRESS(buffer))
+				return B_BAD_VALUE;
+			return user_memcpy(buffer, &state, sizeof(state));
 		}
 
 		case X86_SUSPEND_GET_TRACE:
@@ -1091,7 +1167,9 @@ suspend_syscall(const char* subsystem, uint32 function, void* buffer,
 		case X86_SUSPEND_ENTER_S3:
 		{
 			x86_suspend_s3_args args = {};
-			if ((bufferSize != sizeof(args.flags) && bufferSize != sizeof(args))
+			if ((bufferSize != sizeof(args.flags)
+					&& bufferSize != offsetof(x86_suspend_s3_args, wake_after_s)
+					&& bufferSize != sizeof(args))
 				|| !IS_USER_ADDRESS(buffer)
 				|| user_memcpy(&args, buffer, bufferSize) != B_OK) {
 				return B_BAD_ADDRESS;

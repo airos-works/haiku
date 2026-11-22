@@ -55,6 +55,13 @@ enum {
 
 status_t device_manager_suspend(int32 state, uint32 flags);
 status_t device_manager_resume(uint32 flags);
+uint32 device_manager_resume_count(void);
+	// how many times the system has resumed from a suspend; a driver whose
+	// device was reset by the resume can tell its consequences from real
+	// changes (a card reader's "medium may have changed")
+uint32 device_manager_resumes_finished(void);
+	// how many of those resumes are through: every device and power hook
+	// is back (a driver that needs its bus waits for this one)
 
 void device_manager_wakeup_event(const char* source);
 int32 device_manager_wakeup_events(void);

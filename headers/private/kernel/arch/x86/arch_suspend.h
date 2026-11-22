@@ -24,6 +24,10 @@ enum {
 	X86_SUSPEND_ENTER_S2IDLE	= 4,
 		// struct x86_suspend_s2idle_args: sleeps in S0 until the SCI (lid,
 		// power button) or the timeout, and reports how it went
+	X86_SUSPEND_DEEP_SLEEP_STATE	= 5,
+		// uint32: the state a deep sleep should use, as Linux chooses its
+		// default: 3 (suspend to RAM) where the firmware has S3 and does
+		// not ask for suspend to idle (FADT LOW_POWER_S0_IDLE), else 0
 };
 
 struct x86_suspend_s2idle_args {
@@ -59,6 +63,9 @@ enum {
 struct x86_suspend_s3_args {
 	uint32	flags;
 	uint32	power_off_checkpoint;
+	uint32	wake_after_s;
+		// wake up through the RTC alarm after so many seconds (0 never;
+		// callers built before it pass the first two fields only)
 };
 
 // flags for X86_SUSPEND_ENTER_S3
@@ -110,6 +117,8 @@ void x86_suspend_start_progress(void);
 void x86_suspend_note_round(uint32 round);
 void x86_suspend_note_phase(uint32 phase);
 void x86_suspend_hold_progress_text(void);
+bool x86_suspend_arm_rtc_wake(struct acpi_module_info* acpi, uint32 seconds);
+void x86_suspend_disarm_rtc_wake(void);
 
 #ifdef __cplusplus
 }
