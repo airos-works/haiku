@@ -59,6 +59,7 @@ PowerPolicy::PowerPolicy(BServer* server)
 	fLidAction(kLidSleep),
 	fSleepCheck(0),
 	fDeepSleepMinutes(30),
+	fDeepSleepState(-1),
 	fClamshell(true),
 	fInClamshell(false),
 	fSawExternal(false),
@@ -86,7 +87,9 @@ PowerPolicy::SettingsPath()
 /*!	The settings file has lines like "power_saving_on_battery true",
 	"battery_brightness 70", "lid_closed sleep" (or "display_off",
 	"nothing"), "lid_closed_external_display awake" (or "same": the lid
-	action applies with external displays, too), "deep_sleep_minutes 30"
+	action applies with external displays, too), "deep_sleep_minutes 30",
+	"deep_sleep auto" (or "s3", suspend to RAM, or "s2idle", suspend to
+	idle; auto is S3 where the firmware does not ask for suspend to idle)
 	and "sleep_check_seconds 0". A changed file applies to the current power
 	source at once.
 */
@@ -132,6 +135,16 @@ PowerPolicy::LoadSettings()
 			NULL);
 		if (value != NULL)
 			fDeepSleepMinutes = atoi(value);
+
+		value = get_driver_parameter(handle, "deep_sleep", NULL, NULL);
+		if (value != NULL) {
+			if (strcmp(value, "s3") == 0)
+				fDeepSleepState = 3;
+			else if (strcmp(value, "s2idle") == 0)
+				fDeepSleepState = 0;
+			else
+				fDeepSleepState = -1;
+		}
 		unload_driver_settings(handle);
 	}
 
@@ -459,6 +472,24 @@ PowerPolicy::sleep_result
 PowerPolicy::_Sleep(bool deep, bigtime_t timeout)
 {
 #if defined(__i386__) || defined(__x86_64__)
+	if (deep && _DeepSleepState() == 3) {
+		// Suspend to RAM: only the lid, the power button (and the RTC)
+		// wake the machine; there is no timeout.
+		x86_suspend_s3_args s3 = {};
+		bigtime_t before = real_time_clock_usecs();
+		status_t status = _kern_generic_syscall(X86_SUSPEND_SYSCALLS,
+			X86_SUSPEND_ENTER_S3, &s3, sizeof(s3));
+		if (status == B_OK) {
+			BAutolock _(fLock);
+			fWokeUp = system_time();
+			printf("power_daemon: woke up from suspend to RAM after %"
+				B_PRId64 " s\n", (real_time_clock_usecs() - before) / 1000000);
+			return kWokeUp;
+		}
+		printf("power_daemon: cannot suspend to RAM (%s), suspending to "
+			"idle\n", strerror(status));
+	}
+
 	x86_suspend_s2idle_args args = {};
 	// The devices with suspend hooks (USB, NVMe) and the legacy drivers'
 	// power hooks (Wi-Fi) go to sleep, too; those for a deep sleep only (the
@@ -496,6 +527,28 @@ PowerPolicy::_Sleep(bool deep, bigtime_t timeout)
 #else
 	return kSleepFailed;
 #endif
+}
+
+
+/*!	The state of a deep sleep: 3 (suspend to RAM) or 0 (suspend to idle),
+	as the settings or, by default, the firmware say.
+*/
+int32
+PowerPolicy::_DeepSleepState()
+{
+	{
+		BAutolock _(fLock);
+		if (fDeepSleepState >= 0)
+			return fDeepSleepState;
+	}
+#if defined(__i386__) || defined(__x86_64__)
+	uint32 state = 0;
+	if (_kern_generic_syscall(X86_SUSPEND_SYSCALLS,
+			X86_SUSPEND_DEEP_SLEEP_STATE, &state, sizeof(state)) == B_OK) {
+		return (int32)state;
+	}
+#endif
+	return 0;
 }
 
 

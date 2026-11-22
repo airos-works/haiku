@@ -66,6 +66,7 @@ private:
 			void				_LidClosed(lid_action action,
 									bool clamshell);
 			sleep_result		_Sleep(bool deep, bigtime_t timeout);
+			int32				_DeepSleepState();
 			bool				_WaitForLidOpen(bigtime_t timeout);
 			void				_TakeDownWiredInterfaces(
 									InterfaceList& _interfaces);
@@ -90,6 +91,9 @@ private:
 				// whether its lid was opened, 0 never (the default: the kernel
 				// looks at the lid whenever the firmware interrupts the sleep)
 			int32				fDeepSleepMinutes;
+			int32				fDeepSleepState;
+				// "deep_sleep": -1 the firmware's choice (auto), 0 suspend
+				// to idle, 3 suspend to RAM
 				// with the lid closed this long, the machine sleeps deeper:
 				// the devices that take longer to come back (wireless, the
 				// GPU) sleep, too; 0 never
