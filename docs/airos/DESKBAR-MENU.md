@@ -14,7 +14,7 @@ Preferences. Developer came on 2026-10-29, Media on 2026-10-19, after the
 | Applications | airCal, airShot, airTime, Amp, Burrow, DeskCalc, HaikuDepot, Icon-O-Matic, Installer, Kiri, Mail, MediaConverter, MidiPlayer, Pe, People, SoftwareUpdater, SoundRecorder, StyledEdit, Summit, Terminal |
 | Office | Clipper, WordCraft, GridCraft, DeckCraft, PdfCraft |
 | Media | PhotoCraft, LightCraft |
-| Developer | Code - OSS, Docker Desktop, GitHub Desktop, pgAdmin 4 |
+| Developer | Code - OSS, Docker Desktop, FigCraft, GitHub Desktop, pgAdmin 4 |
 | Utilities | CharacterMap, CodyCam, Debugger, Devices, DiskProbe, DiskUsage, DriveSetup, Expander, Magnify, PoorMan, SerialConnect, Vision |
 | Demos | Chart, Clock, Cortex, FontDemo, GLTeapot, Lookout, Mandelbrot, OverlayImage, Pairs, PatchBay, Playground, Pulse, Sudoku |
 | Desktop applets | AutoRaise, BluetoothStatus, LaunchBox, NetworkStatus, PowerStatus, ProcessController, WiFiStatus, Workspaces |
@@ -28,6 +28,8 @@ autocompletion classes. ActivityMonitor and MediaPlayer are still installed,
 without a menu entry (airTime is the media player).
 
 ## Where each entry comes from
+
+- FigCraft comes from the Developer package set in airos-ci. Every image includes the editor at `apps/FigCraft`, its Developer menu link and `bin/figcraft-cli` for MCP and build-time design review.
 
 The menu is the merge of the `data/deskbar/menu` directories listed in
 `data/deskbar/menu_entries`; packagefs merges the packages' own entries in

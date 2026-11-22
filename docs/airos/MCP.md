@@ -103,6 +103,14 @@ previously had the experimental package installed. Its independent listener
 is not controlled by this preferences panel. The Pi lab image no longer adds
 that package.
 
+## Designing apps with FigCraft
+
+Open **Developer → FigCraft** and choose **air/OS application** for an editable kit of native UI elements. To connect an agent, start `/boot/system/apps/FigCraft --control 4979 --automation-read-root PROJECT --automation-write-root PROJECT` with an existing absolute project folder. This also connects an editor already open from the Deskbar.
+
+An MCP client can launch `figcraft-cli mcp --attach 4979` directly. Through the system MCP, use `run_command` with that argument vector and newline-delimited FigCraft MCP requests in `stdin`. FigCraft's `run_command` tool executes `airOS.listElements` for the Be classes and headers and `file.newFromTemplate` with `{"template":"air-os"}` to start a design. Use `component.list` and `instance.create` to place controls on a screen.
+
+Save the design in the project folder and call `request_design_review`. The operator reviews the pages in the native editor. Poll `design_review_status` with the returned `sha256`, then run `figcraft-cli review-check --attach 4979 PROJECT/design.figcraft` before implementation. Continue on exit code zero. Edits require a fresh review. [FigCraft air/OS guide](https://github.com/airos-works/figcraft/blob/airos/docs/haiku.md)
+
 ## Build and validation
 
 The minimum image definition includes both `mcp_server` and `MCP`, plus the Media
