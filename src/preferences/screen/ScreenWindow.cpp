@@ -17,10 +17,12 @@
 
 #include "ScreenWindow.h"
 
+#include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <strings.h>
+#include <unistd.h>
 
 #include <algorithm>
 
@@ -33,6 +35,7 @@
 #include <Directory.h>
 #include <File.h>
 #include <FindDirectory.h>
+#include <GroupView.h>
 #include <InterfaceDefs.h>
 #include <LayoutBuilder.h>
 #include <MenuBar.h>
@@ -53,6 +56,8 @@
 #include <Window.h>
 
 #include <InterfacePrivate.h>
+#include <TabletModeSettings.h>
+#include <accelerometer.h>
 
 #include "AlertWindow.h"
 #include "Constants.h"
@@ -313,6 +318,57 @@ ScreenWindow::ScreenWindow(ScreenSettings* settings)
 		"use it."));
 	fDarkModeBox->SetValue(fOriginalDarkMode ? B_CONTROL_ON : B_CONTROL_OFF);
 
+	// A 2-in-1 laptop: what happens when it is folded into a tablet. Only
+	// where the accelerometers that tell are there.
+	fUprightBox = NULL;
+	fTabletViewMenu = NULL;
+	fTabletViewField = NULL;
+	int hinge = open(HINGE_DEVICE_PATH, O_RDONLY);
+	if (hinge >= 0) {
+		close(hinge);
+		TabletModeSettings tablet;
+		tablet.Load();
+
+		fUprightBox = new BCheckBox("upright",
+			B_TRANSLATE("Keep the screen upright in tent and tablet modes"),
+			new BMessage(kMsgUprightRotation));
+		fUprightBox->SetToolTip(B_TRANSLATE("Folded into a tent, or held as "
+			"a tablet with the hinge at the top, the screen is turned the "
+			"right way up."));
+		fUprightBox->SetValue(tablet.uprightRotation
+			? B_CONTROL_ON : B_CONTROL_OFF);
+
+		fTabletViewMenu = new BPopUpMenu("tablet view", true, true);
+		BMessage* message = new BMessage(kMsgTabletView);
+		message->AddInt32("view", BPrivate::TABLET_VIEW_DESKTOP);
+		BMenuItem* desktop = new BMenuItem(B_TRANSLATE("Desktop"), message);
+		fTabletViewMenu->AddItem(desktop);
+		message = new BMessage(kMsgTabletView);
+		message->AddInt32("view", BPrivate::TABLET_VIEW_MOBILE);
+		BMenuItem* mobile = new BMenuItem(
+			B_TRANSLATE("air/OS Mobile (experimental)"), message);
+		fTabletViewMenu->AddItem(mobile);
+		(tablet.view == BPrivate::TABLET_VIEW_MOBILE ? mobile : desktop)
+			->SetMarked(true);
+		fTabletViewField = new BMenuField("tablet view",
+			B_TRANSLATE("In tablet mode:"), fTabletViewMenu);
+		fTabletViewField->SetToolTip(B_TRANSLATE("What the screen shows "
+			"while the keyboard is folded away: the desktop as it is, or "
+			"air/OS Mobile, a touch screen home screen with full-screen "
+			"apps and an on-screen keyboard."));
+	}
+	BGroupView* tabletGroup = new BGroupView(B_VERTICAL, B_USE_SMALL_SPACING);
+	if (fUprightBox != NULL) {
+		BLayoutBuilder::Group<>(tabletGroup)
+			.Add(fUprightBox)
+			.AddGroup(B_HORIZONTAL, 0)
+				.Add(fTabletViewField->CreateLabelLayoutItem())
+				.Add(fTabletViewField->CreateMenuBarLayoutItem())
+				.AddGlue()
+				.End();
+	} else
+		tabletGroup->Hide();
+
 	// The details of the selected display, on the right
 
 	BView* detailsView = _BuildDetailsPanel();
@@ -341,6 +397,7 @@ ScreenWindow::ScreenWindow(ScreenSettings* settings)
 				.Add(fMirrorBox)
 				.Add(fZoomBox)
 				.Add(fDarkModeBox)
+				.Add(tabletGroup)
 				.End()
 			.Add(new BSeparatorView(B_VERTICAL))
 			.AddGroup(B_VERTICAL, 0, 0.0f)
@@ -2112,6 +2169,25 @@ ScreenWindow::MessageReceived(BMessage* message)
 			set_ui_dark_mode(fDarkModeBox->Value() == B_CONTROL_ON);
 			_CheckApplyEnabled();
 			break;
+
+		case kMsgUprightRotation:
+		case kMsgTabletView:
+		{
+			// take effect at once: tablet_server follows the file
+			TabletModeSettings tablet;
+			tablet.Load();
+			if (message->what == kMsgUprightRotation)
+				tablet.uprightRotation = fUprightBox->Value() == B_CONTROL_ON;
+			else {
+				tablet.view = (BPrivate::tablet_view)message->GetInt32("view",
+					BPrivate::TABLET_VIEW_DESKTOP);
+			}
+			if (tablet.Save() == B_OK) {
+				BMessenger(TABLET_SERVER_SIGNATURE).SendMessage(
+					BPrivate::kMsgTabletSettingsChanged);
+			}
+			break;
+		}
 
 		case B_COLORS_UPDATED:
 			// the appearance may have been switched elsewhere

@@ -1,0 +1,9 @@
+SubDir HAIKU_TOP src servers tablet ;
+
+UsePrivateHeaders app drivers interface shared ;
+
+Application tablet_server :
+	TabletServer.cpp
+	: be [ TargetLibstdc++ ]
+	: tablet_server.rdef
+;

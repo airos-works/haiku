@@ -45,6 +45,16 @@ target desktop {
 		no_safemode
 	}
 
+	# air/OS: follows the hinge of a 2-in-1 laptop: turns the screen the
+	# right way up and starts air/OS Mobile when it is folded into a tablet,
+	# as the Screen preferences say (docs/airos/TABLET-MODE.md). It quits at
+	# once on other machines.
+	job tablet-mode {
+		launch /system/servers/tablet_server
+		on initial_volumes_mounted
+		no_safemode
+	}
+
 	job user-bootscript {
 		launch /bin/sh ~/config/settings/boot/UserBootscript
 	}
