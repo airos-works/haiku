@@ -343,11 +343,18 @@ TabletProtocolHandler::_ReadReport(void *buffer, uint32 *cookie)
 	fLastButtons = buttons;
 
 	if (switches != 0) {
-		if (fLastSwitches == 0) {
+		// The tip touching down is a click too (a finger's tap on a touch
+		// screen, which has no buttons): counted, so that a double tap
+		// opens what a double click does.
+		if (fLastSwitches == 0 && buttons == 0) {
 			if (fLastClickTime + fClickSpeed > timestamp)
 				fClickCount++;
 			else
 				fClickCount = 1;
+		}
+		if (buttons == 0) {
+			fLastClickTime = timestamp;
+			clicks = fClickCount;
 		}
 	}
 

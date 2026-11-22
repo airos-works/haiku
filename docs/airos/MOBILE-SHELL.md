@@ -12,9 +12,14 @@ when they are a tablet ([TABLET-MODE.md](TABLET-MODE.md)).
 
 ## Started by
 
-The tablet daemon starts `MobileShell` when the machine becomes a tablet and
-the Screen preferences say that tablet mode switches to the mobile view, and
-asks it to quit when the machine is a laptop again.
+`tablet_server` ([TABLET-MODE.md](TABLET-MODE.md)) starts `MobileShell`
+when a 2-in-1 laptop is folded into a stand, a tent or a tablet and the
+Screen preferences say **In tablet mode: air/OS Mobile (experimental)**, and
+asks it to quit when the machine is a laptop again. A shell that quits while
+it is wanted is started again (three times per folding); after any exit,
+`MobileShell --restore` puts back what a shell that died had changed. Where
+there is no hinge sensor the setting is not shown and nothing starts the
+shell.
 
 By hand, for testing on any machine:
 

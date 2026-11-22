@@ -319,13 +319,18 @@ MouseFilter::Filter(BMessage* message, EventTarget** _target, int32* _viewToken,
 				if (originalClickCount <= 0)
 					originalClickCount = 1;
 
+				// A finger on a touch screen taps a little apart each time;
+				// a mouse stays where it was.
+				float slop = message->GetBool("be:display_digitizer", false)
+					? 12 * 12 : 16;
+
 				int32 clickCount = originalClickCount;
 				if (clickCount > 1) {
 					if (modifiers != fLastClickModifiers
 						|| buttons != fLastClickButtons
 						|| !fLastClickTarget.IsValid()
 						|| fLastClickTarget.WindowToken() != windowToken
-						|| square_distance(where, fLastClickPoint) >= 16
+						|| square_distance(where, fLastClickPoint) >= slop
 						|| clickCount - fResetClickCount < 1) {
 						clickCount = 1;
 					} else
