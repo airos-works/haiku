@@ -559,6 +559,19 @@ L2capEndpoint::Accept(net_socket** _acceptedSocket)
 		status = gSocketModule->dequeue_connected(socket, _acceptedSocket);
 	} while (status != B_OK);
 
+	// The peer's address was taken from the HCI connection when its
+	// Connection Request came. A device that opens its channels right after
+	// connecting (an Apple keyboard reconnecting) can send it before the
+	// controller's Connection Complete event was handled: the connection
+	// was then made from that ACL data, without an address, and the server
+	// turned the channel away as coming from no one. By now the event is in.
+	L2capEndpoint* accepted = (L2capEndpoint*)(*_acceptedSocket)->first_protocol;
+	sockaddr_l2cap* peer = (sockaddr_l2cap*)&(*_acceptedSocket)->peer;
+	static const bdaddr_t kNullAddress = {{0, 0, 0, 0, 0, 0}};
+	if (accepted != NULL && accepted->fConnection != NULL
+		&& memcmp(&peer->l2cap_bdaddr, &kNullAddress, sizeof(bdaddr_t)) == 0)
+		peer->l2cap_bdaddr = accepted->fConnection->destination;
+
 	return status;
 }
 
