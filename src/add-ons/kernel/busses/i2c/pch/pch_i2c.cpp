@@ -554,9 +554,25 @@ err:
 }
 
 
+static const uint32 kPrivateContextBase = 0x200;
+
+
 static status_t
 suspend_bus(void* bus_cookie, int32 state)
 {
+	pch_i2c_sim_info* bus = (pch_i2c_sim_info*)bus_cookie;
+	MutexLocker locker(bus->lock);
+	if (bus->version < PCH_SKYLAKE
+		|| read32(bus->registers + PCH_IC_COMP_VERSION) == 0xffffffff) {
+		return B_OK;
+	}
+
+	// like Linux' intel_lpss_suspend()
+	for (uint32 i = 0; i < B_COUNT_OF(bus->privateContext); i++) {
+		bus->privateContext[i]
+			= read32(bus->registers + kPrivateContextBase + i * 4);
+	}
+	bus->privateContextSaved = true;
 	return B_OK;
 }
 
@@ -569,6 +585,25 @@ resume_bus(void* bus_cookie)
 	// (a controller the firmware left off reads all ones: nothing to do)
 	if (read32(bus->registers + PCH_IC_COMP_VERSION) == 0xffffffff)
 		return B_OK;
+
+	if (bus->version >= PCH_SKYLAKE
+		&& (read32(bus->registers + PCH_SUP_RESETS)
+			& (PCH_SUP_RESETS_FUNC | PCH_SUP_RESETS_IDMA))
+				!= (PCH_SUP_RESETS_FUNC | PCH_SUP_RESETS_IDMA)) {
+		// After a suspend to RAM the LPSS block is held in reset, with its
+		// clock dividers gone: out of reset, and its private registers as
+		// they were (Linux' intel_lpss_resume()).
+		TRACE_ALWAYS("held in reset after the suspend, restoring it\n");
+		write32(bus->registers + PCH_SUP_RESETS,
+			PCH_SUP_RESETS_FUNC | PCH_SUP_RESETS_IDMA);
+		if (bus->privateContextSaved) {
+			for (uint32 i = 0; i < B_COUNT_OF(bus->privateContext); i++) {
+				write32(bus->registers + kPrivateContextBase + i * 4,
+					bus->privateContext[i]);
+			}
+		}
+	}
+
 	if (read32(bus->registers + PCH_IC_CON) != bus->masterConfig) {
 		TRACE_ALWAYS("lost its configuration, programming it again\n");
 		program_controller(bus);

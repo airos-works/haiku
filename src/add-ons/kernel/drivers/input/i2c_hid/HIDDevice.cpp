@@ -18,6 +18,7 @@
 #include "ProtocolHandler.h"
 
 #include <usb/USB_hid.h>
+#include <kdevice_manager.h>
 #include <util/AutoLock.h>
 
 #include <stdlib.h>
@@ -73,6 +74,7 @@ HIDDevice::HIDDevice(uint16 descriptorAddress, i2c_device_interface* i2c,
 		fI2CCookie(i2cCookie),
 		fInterrupt(interrupt),
 		fPollPinState(interrupt != NULL && !interrupt->CanInterrupt()),
+		fResumeCount(device_manager_resumes_finished()),
 		fQueues(NULL),
 		fQueueCount(0),
 		fMaxReportSize(0),
@@ -406,6 +408,22 @@ HIDDevice::_Reader()
 	uint32 emptyReads = 0;
 
 	while (!fStopReader && !fRemoved) {
+		// (once the I2C controller is back, too)
+		uint32 resumeCount = device_manager_resumes_finished();
+		if (resumeCount != fResumeCount) {
+			// After a suspend to RAM the device was without power and its
+			// interrupt pin lost its configuration (Linux' i2c_hid_resume()
+			// resets the device too).
+			fResumeCount = resumeCount;
+			TRACE_ALWAYS("%04x:%04x: the system resumed, setting the device "
+				"up again\n", fDescriptor.wVendorID, fDescriptor.wProductID);
+			if (fInterrupt != NULL)
+				fInterrupt->Configure();
+			_Reset();
+			missedInterrupts = 0;
+			errors = 0;
+		}
+
 		if (fOpenCount == 0) {
 			ConditionVariableEntry entry;
 			fOpenCondition.Add(&entry);

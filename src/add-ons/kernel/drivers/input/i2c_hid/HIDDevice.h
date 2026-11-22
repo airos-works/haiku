@@ -99,6 +99,8 @@ private:
 
 			GpioInterrupt*		fInterrupt;
 			bool				fPollPinState;
+			uint32				fResumeCount;
+				// device_manager_resumes_finished() the device was set up for
 			mutex				fLock;
 			ConditionVariable	fOpenCondition;
 			ReportQueue*		fQueues;

@@ -9,6 +9,7 @@
  */
 
 
+#include "ps2_common.h"
 #include "ps2_service.h"
 
 #include "packet_buffer.h"
