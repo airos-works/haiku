@@ -110,6 +110,7 @@ private:
 			bool				fRotationUnsupported;
 			bool				fShellWanted;
 			bool				fShellQuitAsked;
+			team_id				fShellTeam;		// the shell started here
 			int32				fShellRestarts;
 };
 
@@ -129,6 +130,7 @@ TabletServer::TabletServer(const char* hingeFile, const char* accelerometerFile)
 	fRotationUnsupported(false),
 	fShellWanted(false),
 	fShellQuitAsked(false),
+	fShellTeam(-1),
 	fShellRestarts(0)
 {
 }
@@ -228,23 +230,29 @@ TabletServer::MessageReceived(BMessage* message)
 			if (message->FindString("be:signature", &signature) != B_OK
 				|| strcasecmp(signature, MOBILE_SHELL_SIGNATURE) != 0)
 				break;
-			if (message->what == B_SOME_APP_LAUNCHED)
+			team_id team = message->GetInt32("be:team", -1);
+			// only the shell started here, not a "MobileShell --restore" run
+			// (nor one started by hand)
+			if (message->what == B_SOME_APP_LAUNCHED || team != fShellTeam)
 				break;
+			fShellTeam = -1;
 			bool asked = fShellQuitAsked;
 			fShellQuitAsked = false;
-			// It restores the desktop when it is asked to quit; when it
-			// died, what it saved does it.
-			_RestoreDesktop();
-			if (!asked && fShellWanted) {
-				if (fShellRestarts++ < kMaxShellRestarts) {
-					syslog(LOG_WARNING, "tablet_server: MobileShell quit, "
-						"starting it again\n");
-					_StartShell();
-				} else {
-					syslog(LOG_ERR, "tablet_server: MobileShell keeps "
-						"quitting, the desktop stays\n");
-				}
+			if (!asked && fShellWanted
+				&& fShellRestarts++ < kMaxShellRestarts) {
+				// it died: a new one carries on from what it saved
+				syslog(LOG_WARNING, "tablet_server: MobileShell quit, "
+					"starting it again\n");
+				_StartShell();
+				break;
 			}
+			if (!asked && fShellWanted) {
+				syslog(LOG_ERR, "tablet_server: MobileShell keeps quitting, "
+					"the desktop stays\n");
+			}
+			// Asked to quit, it put the desktop back itself; if it died,
+			// what it saved does it.
+			_RestoreDesktop();
 			break;
 		}
 
@@ -485,7 +493,11 @@ TabletServer::_SetRotation(int32 degrees)
 void
 TabletServer::_StartShell()
 {
-	status_t status = be_roster->Launch(MOBILE_SHELL_SIGNATURE);
+	team_id team = -1;
+	status_t status = be_roster->Launch(MOBILE_SHELL_SIGNATURE,
+		(BMessage*)NULL, &team);
+	if (status == B_OK || status == B_ALREADY_RUNNING)
+		fShellTeam = team;
 	if (status != B_OK && status != B_ALREADY_RUNNING) {
 		syslog(LOG_ERR, "tablet_server: could not start MobileShell: %s\n",
 			strerror(status));
@@ -510,12 +522,11 @@ TabletServer::_RestoreDesktop()
 	if (access(MOBILE_SHELL_PATH, X_OK) != 0)
 		return;
 	const char* args[] = { MOBILE_SHELL_PATH, "--restore", NULL };
+	// not waited for: it has the windows to go through, and does nothing
+	// when a shell runs
 	thread_id thread = load_image(2, args, (const char**)environ);
-	if (thread < 0)
-		return;
-	resume_thread(thread);
-	status_t result;
-	wait_for_thread(thread, &result);
+	if (thread >= 0)
+		resume_thread(thread);
 }
 
 
