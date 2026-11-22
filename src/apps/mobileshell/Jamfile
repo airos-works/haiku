@@ -1,0 +1,24 @@
+SubDir HAIKU_TOP src apps mobileshell ;
+
+UsePrivateHeaders app interface shared ;
+UsePrivateSystemHeaders ;
+
+Application MobileShell :
+	ActionDrawer.cpp
+	AppList.cpp
+	EmojiPanel.cpp
+	Glyphs.cpp
+	HomeScreen.cpp
+	Keyboard.cpp
+	Overlay.cpp
+	Panels.cpp
+	SavedState.cpp
+	ShellApp.cpp
+	SwipeDecoder.cpp
+	SystemStatus.cpp
+	TaskSwitcher.cpp
+	Theme.cpp
+	WindowTracker.cpp
+	: be bnetapi network translation [ TargetLibstdc++ ] [ TargetLibsupc++ ]
+	: MobileShell.rdef
+;

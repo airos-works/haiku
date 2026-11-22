@@ -1,0 +1,8 @@
+SubDir HAIKU_TOP src add-ons input_server devices mobile_keyboard ;
+
+UsePrivateHeaders input ;
+SubDirHdrs $(HAIKU_TOP) src apps mobileshell ;
+
+Addon <input>mobile_keyboard :
+	MobileKeyboardDevice.cpp
+	: be input_server [ TargetLibsupc++ ] ;
