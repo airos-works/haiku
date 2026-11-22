@@ -4,7 +4,7 @@ AddSubDirSupportedPlatforms libbe_test ;
 
 UsePrivateHeaders [ FDirName graphics common ] ;
 UsePrivateHeaders [ FDirName graphics radeon ] ;
-UsePrivateHeaders interface preferences ;
+UsePrivateHeaders drivers interface preferences shared ;
 
 Application Screen :
 	AlertWindow.cpp

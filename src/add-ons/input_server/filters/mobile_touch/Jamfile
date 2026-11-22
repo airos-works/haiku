@@ -1,0 +1,8 @@
+SubDir HAIKU_TOP src add-ons input_server filters mobile_touch ;
+
+UsePrivateHeaders input ;
+SubDirHdrs $(HAIKU_TOP) src apps mobileshell ;
+
+Addon mobile_touch :
+	MobileTouchFilter.cpp
+	: be input_server [ TargetLibsupc++ ] ;

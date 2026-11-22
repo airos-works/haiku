@@ -59,6 +59,8 @@ public:
 	virtual	status_t			SetDisplayLayout(
 									const display_output_config* configs,
 									uint32 count, bool switchMode = true);
+	virtual	status_t			SetDisplayOutputRotation(uint32 id,
+									uint32 degrees);
 
 	virtual sem_id				RetraceSemaphore();
 	virtual	sem_id				OutputRetraceSemaphore(uint32 id);
@@ -211,6 +213,7 @@ private:
 			get_display_outputs	fAccGetDisplayOutputs;
 			get_display_output_modes fAccGetDisplayOutputModes;
 			set_display_layout	fAccSetDisplayLayout;
+			set_display_output_rotation fAccSetDisplayOutputRotation;
 			set_display_change_port fAccSetDisplayChangePort;
 			get_display_output_retrace_semaphore
 								fAccGetDisplayOutputRetraceSemaphore;

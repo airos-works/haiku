@@ -166,6 +166,22 @@ init_card(Card& card, int fd)
 				card.crtcCursorPlane[c] = plane.id;
 		}
 	}
+	// Where the display engine can turn a plane's picture, each plane has
+	// a "rotation" property of its own with the angles it can do.
+	for (uint32 c = 0; c < card.resources.crtcCount; c++) {
+		uint32 planes[2] = { card.crtcPrimaryPlane[c], card.crtcCursorPlane[c] };
+		uint32 properties[2] = {};
+		for (uint32 p = 0; p < 2; p++) {
+			if (planes[p] == 0)
+				continue;
+			uint32 property = Kms::PropertyId(fd, planes[p],
+				DRM_MODE_OBJECT_PLANE, "rotation");
+			if (Kms::PropertyHasEnum(fd, property, "rotate-180"))
+				properties[p] = property;
+		}
+		card.primaryRotation[c] = properties[0];
+		card.cursorRotation[c] = properties[1];
+	}
 
 	uint32 connector = first_object(card.resources.connectors,
 		card.resources.connectorCount);
@@ -594,6 +610,10 @@ amdgpu_get_display_output_scan_line(uint32 id, int32* _line, int32* _lines,
 	if (!output->enabled || output->crtcIndex < 0
 		|| gInfo->dpmsMode != B_DPMS_ON || output->timing.clock == 0
 		|| output->timing.htotal == 0 || output->timing.vdisplay == 0)
+		return B_NOT_ALLOWED;
+	// Shown upside down, the scan goes up the region from its bottom row,
+	// which no single row describes.
+	if (output_is_rotated(*output))
 		return B_NOT_ALLOWED;
 
 	bigtime_t scanStart;

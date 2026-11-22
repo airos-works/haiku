@@ -26,7 +26,7 @@
 
 
 TabletProtocolHandler::TabletProtocolHandler(HIDReport &report,
-	HIDReportItem &xAxis, HIDReportItem &yAxis)
+	HIDReportItem &xAxis, HIDReportItem &yAxis, bool displayDigitizer)
 	:
 	ProtocolHandler(report.Device(), "input/tablet/" DEVICE_PATH_SUFFIX "/",
 		0),
@@ -45,7 +45,8 @@ TabletProtocolHandler::TabletProtocolHandler(HIDReport &report,
 	fLastSwitches(0),
 	fClickCount(0),
 	fLastClickTime(0),
-	fClickSpeed(250000)
+	fClickSpeed(250000),
+	fDisplayDigitizer(displayDigitizer)
 {
 	uint32 buttonCount = 0;
 	uint32 switchCount = 0;
@@ -101,6 +102,11 @@ TabletProtocolHandler::AddHandlers(HIDDevice &device, HIDCollection &collection,
 	ProtocolHandler *&handlerList)
 {
 	bool supported = false;
+	// A touch screen and a pen are digitizers built into a display (the
+	// "Pen" of the usage tables is one "integrated with a display"); what
+	// they report are places on that display. A "Digitizer" is a tablet on
+	// the desk.
+	bool displayDigitizer = false;
 	switch (collection.UsagePage()) {
 		case B_HID_USAGE_PAGE_GENERIC_DESKTOP:
 		{
@@ -120,10 +126,12 @@ TabletProtocolHandler::AddHandlers(HIDDevice &device, HIDCollection &collection,
 		case B_HID_USAGE_PAGE_DIGITIZER:
 		{
 			switch (collection.UsageID()) {
-				case B_HID_UID_DIG_DIGITIZER:
 				case B_HID_UID_DIG_PEN:
-				case B_HID_UID_DIG_LIGHT_PEN:
 				case B_HID_UID_DIG_TOUCH_SCREEN:
+					displayDigitizer = true;
+					// fall through
+				case B_HID_UID_DIG_DIGITIZER:
+				case B_HID_UID_DIG_LIGHT_PEN:
 				case B_HID_UID_DIG_TOUCH_PAD:
 				case B_HID_UID_DIG_WHITE_BOARD:
 					TRACE("found tablet/digitizer\n");
@@ -165,7 +173,7 @@ TabletProtocolHandler::AddHandlers(HIDDevice &device, HIDCollection &collection,
 			continue;
 
 		ProtocolHandler *newHandler = new(std::nothrow) TabletProtocolHandler(
-			*inputReport, *xAxis, *yAxis);
+			*inputReport, *xAxis, *yAxis, displayDigitizer);
 		if (newHandler == NULL) {
 			TRACE("failed to allocated tablet protocol handler\n");
 			continue;
@@ -220,6 +228,9 @@ TabletProtocolHandler::Control(uint32 *cookie, uint32 op, void *buffer,
 			// we are always on demand, so 0 queued events
 			return 0;
 		}
+
+		case MS_IS_DISPLAY_DIGITIZER:
+			return fDisplayDigitizer ? B_OK : B_ENTRY_NOT_FOUND;
 
 		case MS_SET_CLICKSPEED:
 				if (!IS_USER_ADDRESS(buffer)
@@ -332,11 +343,18 @@ TabletProtocolHandler::_ReadReport(void *buffer, uint32 *cookie)
 	fLastButtons = buttons;
 
 	if (switches != 0) {
-		if (fLastSwitches == 0) {
+		// The tip touching down is a click too (a finger's tap on a touch
+		// screen, which has no buttons): counted, so that a double tap
+		// opens what a double click does.
+		if (fLastSwitches == 0 && buttons == 0) {
 			if (fLastClickTime + fClickSpeed > timestamp)
 				fClickCount++;
 			else
 				fClickCount = 1;
+		}
+		if (buttons == 0) {
+			fLastClickTime = timestamp;
+			clicks = fClickCount;
 		}
 	}
 

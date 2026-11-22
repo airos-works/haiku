@@ -89,6 +89,9 @@ private:
 			TabletInputDevice&	fTarget;
 			BString				fPath;
 			int					fDevice;
+			bool				fDisplayDigitizer;
+									// a touch screen or its pen: positions
+									// are places on that display
 
 			input_device_ref	fDeviceRef;
 			mouse_settings		fSettings;
@@ -114,6 +117,7 @@ TabletDevice::TabletDevice(TabletInputDevice& target, const char* driverPath)
 	fTarget(target),
 	fPath(driverPath),
 	fDevice(-1),
+	fDisplayDigitizer(false),
 	fThread(-1),
 	fActive(false),
 	fUpdateSettings(false)
@@ -256,6 +260,7 @@ TabletDevice::_ControlThread()
 	}
 
 	_UpdateSettings();
+	fDisplayDigitizer = ioctl(fDevice, MS_IS_DISPLAY_DIGITIZER, NULL, 0) == 0;
 
 	static const bigtime_t kTransferDelay = 1000000 / 125;
 		// 125 transfers per second should be more than enough
@@ -301,6 +306,27 @@ TabletDevice::_ControlThread()
 			uint32 buttons = lastButtons ^ movements.buttons;
 			if (buttons != 0) {
 				bool pressedButton = (buttons & movements.buttons) > 0;
+
+				// A pen hovers to where it then presses; a finger on a touch
+				// screen is just there. app_server takes the position of a
+				// press from the last move, so the move goes first: else
+				// the press lands where the last finger was lifted.
+				if (pressedButton && (movements.xpos != lastXPosition
+						|| movements.ypos != lastYPosition)) {
+					BMessage* moved = _BuildMouseMessage(B_MOUSE_MOVED,
+						movements.timestamp, lastButtons, movements.xpos,
+						movements.ypos);
+					if (moved != NULL) {
+						moved->AddFloat("be:tablet_x", movements.xpos);
+						moved->AddFloat("be:tablet_y", movements.ypos);
+						moved->AddFloat("be:tablet_pressure", 0);
+						moved->AddInt32("be:tablet_eraser", eraser);
+						fTarget.EnqueueMessage(moved);
+						lastXPosition = movements.xpos;
+						lastYPosition = movements.ypos;
+					}
+				}
+
 				BMessage* message = _BuildMouseMessage(
 					pressedButton ? B_MOUSE_DOWN : B_MOUSE_UP,
 					movements.timestamp, movements.buttons, movements.xpos,
@@ -408,6 +434,9 @@ TabletDevice::_BuildMouseMessage(uint32 what, uint64 when, uint32 buttons,
 		delete message;
 		return NULL;
 	}
+	// input_server maps these to the display the digitizer is part of
+	if (fDisplayDigitizer)
+		message->AddBool("be:display_digitizer", true);
 
 	return message;
 }

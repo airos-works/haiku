@@ -24,7 +24,9 @@ virtual	bool					IsValid() { return true; }
 virtual	void					SendQuit() {}
 
 virtual	void					UpdateScreenBounds(BRect bounds,
-										const BRegion* displays = NULL);
+										const BRegion* displays = NULL,
+										BRect touchScreen = BRect(),
+										int32 touchRotation = 0);
 virtual	bool					GetNextEvent(BMessage** _event);
 virtual	status_t				InsertEvent(BMessage* event);
 virtual	BMessage*				PeekLatestMouseMoved();

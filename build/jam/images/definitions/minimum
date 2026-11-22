@@ -260,6 +260,7 @@ SYSTEM_SERVERS = [ FFilterByBuildFeatures
 	power_daemon
 	registrar
 	syslog_daemon
+	tablet_server
 ] ;
 
 SYSTEM_NETWORK_DEVICES =

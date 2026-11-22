@@ -223,6 +223,45 @@ PropertyId(int fd, uint32 object, uint32 objectType, const char* name)
 }
 
 
+bool
+PropertyHasEnum(int fd, uint32 property, const char* name)
+{
+	if (property == 0)
+		return false;
+	drm_mode_get_property counts = {};
+	counts.prop_id = property;
+	if (Ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &counts) != B_OK
+		|| counts.count_enum_blobs == 0)
+		return false;
+	uint32 count = counts.count_enum_blobs;
+	drm_mode_property_enum* enums = (drm_mode_property_enum*)calloc(count,
+		sizeof(drm_mode_property_enum));
+	// (the values are asked for as well: the kernel copies them when there
+	// is room for the count it reports)
+	uint64* values = (uint64*)calloc(counts.count_values + 1, sizeof(uint64));
+	bool found = false;
+	if (enums != NULL && values != NULL) {
+		drm_mode_get_property get = {};
+		get.prop_id = property;
+		get.count_enum_blobs = count;
+		get.enum_blob_ptr = (uintptr_t)enums;
+		get.count_values = counts.count_values;
+		get.values_ptr = (uintptr_t)values;
+		if (Ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &get) == B_OK) {
+			for (uint32 i = 0; i < min_c(get.count_enum_blobs, count); i++) {
+				if (strncmp(enums[i].name, name, DRM_PROP_NAME_LEN) == 0) {
+					found = true;
+					break;
+				}
+			}
+		}
+	}
+	free(enums);
+	free(values);
+	return found;
+}
+
+
 static uint64
 PropertyValue(int fd, uint32 object, uint32 objectType, uint32 property)
 {

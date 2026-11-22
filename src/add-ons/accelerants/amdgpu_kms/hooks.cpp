@@ -70,6 +70,8 @@ get_accelerant_hook(uint32 feature, void* data)
 			return (void*)amdgpu_get_display_output_retrace_semaphore;
 		case B_GET_DISPLAY_OUTPUT_SCAN_LINE:
 			return (void*)amdgpu_get_display_output_scan_line;
+		case B_SET_DISPLAY_OUTPUT_ROTATION:
+			return (void*)amdgpu_set_display_output_rotation;
 		case B_WAIT_FOR_DISPLAY_RESTORE:
 			return (void*)amdgpu_wait_for_display_restore;
 

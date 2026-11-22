@@ -219,6 +219,8 @@ InputServer::_InitKeyboardMouseStates()
 	fFrame = fScreen.Frame();
 	if (fFrame == BRect(0, 0, 0, 0))
 		fFrame = BRect(0, 0, 799, 599);
+	fTouchScreen = BRect();
+	fTouchRotation = 0;
 	fMousePos = BPoint((int32)((fFrame.right + 1) / 2),
 		(int32)((fFrame.bottom + 1) / 2));
 
@@ -540,6 +542,14 @@ InputServer::MessageReceived(BMessage* message)
 			BRect frame;
 			if (message->FindRect("screen_bounds", &frame) != B_OK)
 				frame = fScreen.Frame();
+
+			// where the built-in panel a touch screen is part of is, and
+			// whether its picture is turned (a 2-in-1 standing as a tent)
+			BRect touchScreen;
+			if (message->FindRect("touch_screen", &touchScreen) != B_OK)
+				touchScreen = BRect();
+			fTouchScreen = touchScreen;
+			fTouchRotation = message->GetInt32("touch_rotation", 0);
 
 			BRegion displays;
 			BRect displayFrame;
@@ -1780,8 +1790,20 @@ InputServer::_SanitizeEvents(EventList& events)
 					// convert them to absolute screen position
 					// (the message is supposed to contain the original
 					// absolute coordinates as "be:tablet_x/y").
-					where.x = absX * fFrame.Width();
-					where.y = absY * fFrame.Height();
+					BRect area = fFrame;
+					if (event->GetBool("be:display_digitizer", false)) {
+						// A touch screen is on the built-in panel, not on
+						// the desktop around every monitor; a panel shown
+						// upside down has it upside down as well.
+						if (fTouchScreen.IsValid())
+							area = fTouchScreen;
+						if (fTouchRotation == 180) {
+							absX = 1 - absX;
+							absY = 1 - absY;
+						}
+					}
+					where.x = area.left + absX * area.Width();
+					where.y = area.top + absY * area.Height();
 
 					event->RemoveName("x");
 					event->RemoveName("y");

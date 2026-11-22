@@ -87,15 +87,18 @@ InputManager::PutStream(EventStream* stream)
 
 
 void
-InputManager::UpdateScreenBounds(BRect bounds, const BRegion* displays)
+InputManager::UpdateScreenBounds(BRect bounds, const BRegion* displays,
+	BRect touchScreen, int32 touchRotation)
 {
 	BAutolock _(this);
 
 	for (int32 i = fUsedStreams.CountItems(); i-- > 0;) {
-		fUsedStreams.ItemAt(i)->UpdateScreenBounds(bounds, displays);
+		fUsedStreams.ItemAt(i)->UpdateScreenBounds(bounds, displays,
+			touchScreen, touchRotation);
 	}
 
 	for (int32 i = fFreeStreams.CountItems(); i-- > 0;) {
-		fFreeStreams.ItemAt(i)->UpdateScreenBounds(bounds, displays);
+		fFreeStreams.ItemAt(i)->UpdateScreenBounds(bounds, displays,
+			touchScreen, touchRotation);
 	}
 }

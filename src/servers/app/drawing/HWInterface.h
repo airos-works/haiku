@@ -127,6 +127,10 @@ public:
 									// the array is malloc()ed
 	virtual	status_t			GetDisplayOutputModes(uint32 id,
 									display_mode** _modes, uint32* _count);
+	virtual	status_t			SetDisplayOutputRotation(uint32 id,
+									uint32 degrees);
+									// shows that output's region turned by
+									// 0 or 180 degrees
 	virtual	status_t			SetDisplayLayout(
 									const display_output_config* configs,
 									uint32 count, bool switchMode = true);

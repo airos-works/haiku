@@ -80,6 +80,8 @@ status_t GetPlanes(int fd, Plane* planes, uint32& count);
 
 // the ID of the property \a name of an object, 0 if it has none
 uint32 PropertyId(int fd, uint32 object, uint32 objectType, const char* name);
+// whether an enumeration or bit mask property has the value called \a name
+bool PropertyHasEnum(int fd, uint32 property, const char* name);
 
 status_t CreateBlob(int fd, const void* data, uint32 length, uint32& id);
 void DestroyBlob(int fd, uint32 id);

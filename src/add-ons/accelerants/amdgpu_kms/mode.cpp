@@ -534,6 +534,18 @@ add_card_layout(Kms::AtomicRequest& request, uint32 cardIndex,
 		request.Add(plane, card.planeCrtcY, y);
 		request.Add(plane, card.planeCrtcW, w);
 		request.Add(plane, card.planeCrtcH, h);
+		// upside down or not, as last asked for this output
+		// (B_SET_DISPLAY_OUTPUT_ROTATION); the CRTC may be another one now
+		uint64 rotation = output_is_rotated(output) ? DRM_MODE_ROTATE_180
+			: DRM_MODE_ROTATE_0;
+		if (card.primaryRotation[output.crtcIndex] != 0) {
+			request.Add(plane, card.primaryRotation[output.crtcIndex],
+				rotation);
+		}
+		if (card.cursorRotation[output.crtcIndex] != 0) {
+			request.Add(card.crtcCursorPlane[output.crtcIndex],
+				card.cursorRotation[output.crtcIndex], rotation);
+		}
 	}
 	// The cursors go, and come back when the monitors are on (update_
 	// cursor()): a cursor left on a CRTC without its primary plane, or over

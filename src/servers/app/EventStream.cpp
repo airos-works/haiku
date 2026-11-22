@@ -113,7 +113,8 @@ InputServerStream::SendQuit()
 
 
 void
-InputServerStream::UpdateScreenBounds(BRect bounds, const BRegion* displays)
+InputServerStream::UpdateScreenBounds(BRect bounds, const BRegion* displays,
+	BRect touchScreen, int32 touchRotation)
 {
 	BMessage update(IS_SCREEN_BOUNDS_UPDATED);
 	update.AddRect("screen_bounds", bounds);
@@ -123,6 +124,11 @@ InputServerStream::UpdateScreenBounds(BRect bounds, const BRegion* displays)
 		for (int32 i = 0; i < displays->CountRects(); i++)
 			update.AddRect("display_frames", displays->RectAt(i));
 	}
+	// A touch screen is part of the built-in panel: its touches are places
+	// on that panel, which may show its picture upside down.
+	if (touchScreen.IsValid())
+		update.AddRect("touch_screen", touchScreen);
+	update.AddInt32("touch_rotation", touchRotation);
 
 	fInputServer.SendMessage(&update);
 }

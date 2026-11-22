@@ -29,7 +29,8 @@ class TabletProtocolHandler : public ProtocolHandler {
 public:
 								TabletProtocolHandler(HIDReport &report,
 									HIDReportItem &xAxis,
-									HIDReportItem &yAxis);
+									HIDReportItem &yAxis,
+									bool displayDigitizer);
 
 	static	void				AddHandlers(HIDDevice &device,
 									HIDCollection &collection,
@@ -62,6 +63,7 @@ private:
 			uint32				fClickCount;
 			bigtime_t			fLastClickTime;
 			bigtime_t			fClickSpeed;
+			bool				fDisplayDigitizer;
 };
 
 #endif // USB_TABLET_PROTOCOL_HANDLER_H

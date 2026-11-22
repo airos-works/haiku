@@ -319,13 +319,18 @@ MouseFilter::Filter(BMessage* message, EventTarget** _target, int32* _viewToken,
 				if (originalClickCount <= 0)
 					originalClickCount = 1;
 
+				// A finger on a touch screen taps a little apart each time;
+				// a mouse stays where it was.
+				float slop = message->GetBool("be:display_digitizer", false)
+					? 12 * 12 : 16;
+
 				int32 clickCount = originalClickCount;
 				if (clickCount > 1) {
 					if (modifiers != fLastClickModifiers
 						|| buttons != fLastClickButtons
 						|| !fLastClickTarget.IsValid()
 						|| fLastClickTarget.WindowToken() != windowToken
-						|| square_distance(where, fLastClickPoint) >= 16
+						|| square_distance(where, fLastClickPoint) >= slop
 						|| clickCount - fResetClickCount < 1) {
 						clickCount = 1;
 					} else
@@ -669,8 +674,7 @@ Desktop::Init()
 	fEventDispatcher.SetHWInterface(fVirtualScreen.HWInterface());
 	{
 		AutoReadLocker screenLocker(fScreenLock);
-		BRegion displays = fDisplays.Region();
-		gInputManager->UpdateScreenBounds(fVirtualScreen.Frame(), &displays);
+		_UpdateInputBounds(fVirtualScreen.Frame());
 	}
 
 	fEventDispatcher.SetMouseFilter(new MouseFilter(this));
@@ -4027,8 +4031,7 @@ Desktop::_ScreenChanged(Screen* screen)
 	{
 		AutoWriteLocker screenLocker(fScreenLock);
 		_UpdateDisplays();
-		BRegion displays = fDisplays.Region();
-		gInputManager->UpdateScreenBounds(screen->Frame(), &displays);
+		_UpdateInputBounds(screen->Frame());
 	}
 
 	// windows that would be left where no monitor is come along
@@ -4154,6 +4157,30 @@ Desktop::_UpdateDisplays()
 	fDisplays.SetSingle(screen->Frame(), interface->HasDisplayLayout()
 			? 100 : interface->RenderScale(), hasInfo ? &info : NULL,
 			&mode.timing);
+}
+
+
+/*!	Tells input_server where the monitors are, and where the built-in panel
+	is that a touch screen is part of (an enabled one, not the lid's while
+	it is closed), with the angle its picture is turned by.
+*/
+void
+Desktop::_UpdateInputBounds(BRect frame)
+{
+	BRegion displays = fDisplays.Region();
+	BRect touchScreen;
+	int32 rotation = 0;
+	for (int32 i = 0; i < fDisplays.CountDisplays(); i++) {
+		const DisplayInfo* display = fDisplays.DisplayAt(i);
+		if (display->IsInternal() && display->IsEnabled()
+			&& !display->lidClosed) {
+			touchScreen = display->frame;
+			rotation = display->Rotation();
+			break;
+		}
+	}
+	gInputManager->UpdateScreenBounds(frame, &displays, touchScreen,
+		rotation);
 }
 
 
@@ -4536,6 +4563,12 @@ Desktop::SetDisplayLayout(const BMessage& request)
 		SetLidClosed(lidClosed);
 		return B_OK;
 	}
+	int32 rotation;
+	if (request.FindInt32("rotation", &rotation) == B_OK) {
+		// the built-in panel's, unless an "id" says which display
+		return SetDisplayRotation((uint32)request.GetInt32("id", -1),
+			rotation);
+	}
 
 	AutoWriteLocker _(fWindowLock);
 
@@ -4631,6 +4664,61 @@ Desktop::SetLidClosed(bool closed)
 			: "");
 	if (changed)
 		ScreenChanged(screen);
+}
+
+
+/*!	Shows a display's picture turned by 0 or 180 degrees: a 2-in-1 laptop
+	stood up as a tent has its panel upside down. The display engine turns
+	the picture as it scans it out, so nothing is drawn again and no window
+	moves; a touch screen on the panel is turned along with it (input_server
+	is told). \a id ~0 is the built-in panel. Not remembered: the tablet mode
+	service sets it as the laptop is folded.
+*/
+status_t
+Desktop::SetDisplayRotation(uint32 id, int32 degrees)
+{
+	if (degrees != 0 && degrees != 180)
+		return B_BAD_VALUE;
+
+	// in the order SetDisplayLayout() takes them: no drawing meanwhile
+	AutoWriteLocker windowLocker(fWindowLock);
+	AutoWriteLocker screenLocker(fScreenLock);
+	Screen* screen = fVirtualScreen.ScreenAt(0);
+	if (screen == NULL || screen->HWInterface() == NULL)
+		return B_NO_INIT;
+	::HWInterface* interface = screen->HWInterface();
+
+	const DisplayInfo* display = NULL;
+	if (id == ~(uint32)0) {
+		for (int32 i = 0; i < fDisplays.CountDisplays(); i++) {
+			const DisplayInfo* candidate = fDisplays.DisplayAt(i);
+			if (candidate->IsInternal() && candidate->IsConnected()) {
+				display = candidate;
+				break;
+			}
+		}
+	} else
+		display = fDisplays.DisplayByID(id);
+	if (display == NULL)
+		return degrees == 0 ? B_OK : B_ENTRY_NOT_FOUND;
+	if (display->Rotation() == degrees)
+		return B_OK;
+	if (degrees != 0 && !display->CanRotate())
+		return B_UNSUPPORTED;
+
+	uint32 displayID = display->id;
+	status_t status = interface->SetDisplayOutputRotation(displayID, degrees);
+	if (status == B_OK) {
+		// the flags say how it is shown now
+		if (!interface->HasDisplayLayout()
+			|| fDisplays.ReadOutputs(interface) != B_OK)
+			_UpdateDisplays();
+		_UpdateInputBounds(fVirtualScreen.Frame());
+	}
+	syslog(status == B_OK ? LOG_INFO : LOG_WARNING,
+		"app_server: display %" B_PRIu32 " turned to %" B_PRId32
+		" degrees: %s\n", displayID, degrees, strerror(status));
+	return status;
 }
 
 

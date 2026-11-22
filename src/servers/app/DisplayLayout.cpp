@@ -827,6 +827,8 @@ DisplayLayout::Archive(BMessage& into, HWInterface* interface) const
 		entry.AddBool("enabled", display.IsEnabled());
 		entry.AddBool("internal", display.IsInternal());
 		entry.AddBool("lid closed", display.lidClosed);
+		entry.AddBool("can rotate", display.CanRotate());
+		entry.AddInt32("rotation", display.Rotation());
 		entry.AddBool("primary", display.primary);
 		entry.AddInt32("mirror", display.IsMirror()
 			? (int32)display.mirrorOf : -1);

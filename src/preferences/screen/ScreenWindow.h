@@ -126,6 +126,11 @@ private:
 			BCheckBox*			fDarkModeBox;
 			bool				fOriginalDarkMode;
 
+			// a 2-in-1 laptop folded into a tablet; NULL on other machines
+			BCheckBox*			fUprightBox;
+			BPopUpMenu*			fTabletViewMenu;
+			BMenuField*			fTabletViewField;
+
 			BStringView*		fTitleView;
 			BStringView*		fSubtitleView;
 
