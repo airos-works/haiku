@@ -192,19 +192,30 @@ haiku_thread_unpin()
 extern "C" void
 os_preempt_disable()
 {
+	// With interrupts off: the thread must not be preempted, and moved to
+	// another CPU, between looking up its CPU and counting on it. The count
+	// would go to a CPU the thread has left, which then never reschedules
+	// again (scheduler_reschedule() returns at once while it is not zero,
+	// for a thread that wants to block too), and the matching
+	// os_preempt_enable() would take one off the count of yet another CPU.
+	// Once a CPU of its own is counted, the thread stays on it.
+	cpu_status state = disable_interrupts();
 	thread_get_current_thread()->cpu->reschedule_disabled++;
-	memory_full_barrier();
+	restore_interrupts(state);
 }
 
 
 extern "C" void
 os_preempt_enable()
 {
-	ASSERT(os_preempt_disabled());
+	cpu_status state = disable_interrupts();
+	cpu_ent* cpu = thread_get_current_thread()->cpu;
+	ASSERT(cpu->reschedule_disabled > 0);
+	bool reschedule = --cpu->reschedule_disabled == 0
+		&& cpu->invoke_scheduler;
+	restore_interrupts(state);
 
-	Thread* thread = thread_get_current_thread();
-	thread->cpu->reschedule_disabled--;
-	if (thread->cpu->invoke_scheduler)
+	if (reschedule)
 		scheduler_reschedule_if_necessary();
 }
 
