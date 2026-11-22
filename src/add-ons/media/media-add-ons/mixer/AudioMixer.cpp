@@ -454,6 +454,19 @@ AudioMixer::_AutoStop()
 	if (roster->GetNodeFor(outputID, &output) != B_OK)
 		return;
 
+	// A sound card's node is the audio input as well. While something
+	// records from it (one of its outputs is connected) it keeps running:
+	// stopped, it delivers no more buffers, and a recording would end with
+	// whatever sound happened to finish playing (#151). It is stopped when
+	// the next sound ends after the recording has.
+	media_output recording;
+	int32 recordings = 0;
+	if (roster->GetConnectedOutputsFor(output, &recording, 1, &recordings)
+			== B_OK && recordings > 0) {
+		roster->ReleaseNode(output);
+		return;
+	}
+
 	roster->StopNode(output, 0, true);
 
 	roster->ReleaseNode(output);
