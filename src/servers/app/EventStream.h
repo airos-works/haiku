@@ -29,7 +29,8 @@ class EventStream {
 		virtual bool SupportsCursorThread() const;
 
 		virtual void UpdateScreenBounds(BRect bounds,
-			const BRegion* displays = NULL) = 0;
+			const BRegion* displays = NULL, BRect touchScreen = BRect(),
+			int32 touchRotation = 0) = 0;
 
 		virtual bool GetNextEvent(BMessage** _event) = 0;
 		virtual status_t GetNextCursorPosition(BPoint& where,
@@ -56,7 +57,8 @@ class InputServerStream : public EventStream {
 		virtual bool SupportsCursorThread() const { return fCursorSemaphore >= B_OK; }
 
 		virtual void UpdateScreenBounds(BRect bounds,
-			const BRegion* displays = NULL);
+			const BRegion* displays = NULL, BRect touchScreen = BRect(),
+			int32 touchRotation = 0);
 
 		virtual bool GetNextEvent(BMessage** _event);
 		virtual status_t GetNextCursorPosition(BPoint& where,

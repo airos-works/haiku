@@ -89,6 +89,9 @@ private:
 			TabletInputDevice&	fTarget;
 			BString				fPath;
 			int					fDevice;
+			bool				fDisplayDigitizer;
+									// a touch screen or its pen: positions
+									// are places on that display
 
 			input_device_ref	fDeviceRef;
 			mouse_settings		fSettings;
@@ -114,6 +117,7 @@ TabletDevice::TabletDevice(TabletInputDevice& target, const char* driverPath)
 	fTarget(target),
 	fPath(driverPath),
 	fDevice(-1),
+	fDisplayDigitizer(false),
 	fThread(-1),
 	fActive(false),
 	fUpdateSettings(false)
@@ -256,6 +260,7 @@ TabletDevice::_ControlThread()
 	}
 
 	_UpdateSettings();
+	fDisplayDigitizer = ioctl(fDevice, MS_IS_DISPLAY_DIGITIZER, NULL, 0) == 0;
 
 	static const bigtime_t kTransferDelay = 1000000 / 125;
 		// 125 transfers per second should be more than enough
@@ -408,6 +413,9 @@ TabletDevice::_BuildMouseMessage(uint32 what, uint64 when, uint32 buttons,
 		delete message;
 		return NULL;
 	}
+	// input_server maps these to the display the digitizer is part of
+	if (fDisplayDigitizer)
+		message->AddBool("be:display_digitizer", true);
 
 	return message;
 }

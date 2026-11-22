@@ -62,5 +62,8 @@
 // Change screen resolution
 #define IS_SCREEN_BOUNDS_UPDATED		'_FMM'
 	// R5 compatible definition
+	// also "touch_screen" (BRect): where the built-in panel a touch screen
+	// is part of is on the desktop (none: no such panel), and
+	// "touch_rotation" (int32): the degrees its picture is turned by
 
 #endif	/* INPUT_SERVER_TYPES_H */

@@ -187,6 +187,7 @@ AccelerantHWInterface::AccelerantHWInterface()
 	fAccGetDisplayOutputs(NULL),
 	fAccGetDisplayOutputModes(NULL),
 	fAccSetDisplayLayout(NULL),
+	fAccSetDisplayOutputRotation(NULL),
 	fAccSetDisplayChangePort(NULL),
 	fAccGetDisplayOutputRetraceSemaphore(NULL),
 	fAccGetDisplayOutputScanLine(NULL),
@@ -501,6 +502,9 @@ AccelerantHWInterface::_SetupDefaultHooks()
 	fAccGetDisplayOutputScanLine
 		= (get_display_output_scan_line)fAccelerantHook(
 			B_GET_DISPLAY_OUTPUT_SCAN_LINE, NULL);
+	fAccSetDisplayOutputRotation
+		= (set_display_output_rotation)fAccelerantHook(
+			B_SET_DISPLAY_OUTPUT_ROTATION, NULL);
 	// copies to the screen by the device
 	fAccCreateFrameBufferSource = (create_frame_buffer_source)fAccelerantHook(
 		B_CREATE_FRAME_BUFFER_SOURCE, NULL);
@@ -538,6 +542,7 @@ AccelerantHWInterface::_SetupDefaultHooks()
 		fAccSetDisplayChangePort = NULL;
 		fAccGetDisplayOutputRetraceSemaphore = NULL;
 		fAccGetDisplayOutputScanLine = NULL;
+		fAccSetDisplayOutputRotation = NULL;
 	}
 
 	// Monitors coming and going: the accelerant writes to this port, and the
@@ -1558,6 +1563,26 @@ AccelerantHWInterface::SetDisplayLayout(const display_output_config* configs,
 		HWInterface::SetRenderScale(oldRenderScale);
 	}
 	// the cursor on the new layout, at its density
+	_UpdateHardwareCursor(true);
+	return status;
+}
+
+
+/*!	The display engine turns the output's picture as it scans it out; what
+	is drawn stays as it is. The cursor is set again: where the engine
+	cannot turn the cursor with the picture, it is drawn into the frame
+	buffer instead.
+*/
+status_t
+AccelerantHWInterface::SetDisplayOutputRotation(uint32 id, uint32 degrees)
+{
+	if (fAccSetDisplayOutputRotation == NULL)
+		return degrees == 0 ? B_OK : B_UNSUPPORTED;
+	status_t status;
+	{
+		AutoWriteLocker _(this);
+		status = fAccSetDisplayOutputRotation(id, degrees);
+	}
 	_UpdateHardwareCursor(true);
 	return status;
 }

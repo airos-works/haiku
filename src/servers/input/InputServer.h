@@ -240,6 +240,9 @@ class InputServer : public BApplication {
 		BRect			fFrame;
 		BRegion			fDisplays;		// the parts of fFrame that are shown
 		BRect			fLastDisplay;	// the display the mouse was last on
+		BRect			fTouchScreen;	// the built-in panel a touch screen
+										// is part of; invalid: the screen
+		int32			fTouchRotation;	// how far its picture is turned
 
 		void			_ConstrainToDisplays(BPoint& where);
 

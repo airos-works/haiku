@@ -89,6 +89,7 @@ enum {
 	B_SET_DISPLAY_CHANGE_PORT,			/* optional */
 	B_GET_DISPLAY_OUTPUT_RETRACE_SEMAPHORE,	/* optional */
 	B_GET_DISPLAY_OUTPUT_SCAN_LINE,		/* optional */
+	B_SET_DISPLAY_OUTPUT_ROTATION,		/* optional */
 
 	/* copies to the frame buffer made by the device: a source is memory the
 	   device reads, which the caller draws into and then has copied to the
@@ -228,6 +229,10 @@ enum {
 											/* scale fits that region to the */
 											/* monitor; what is left over is */
 											/* black. */
+	B_DISPLAY_OUTPUT_CAN_ROTATE	= 1 << 5,	/* the hardware can show this */
+											/* output's region upside down */
+											/* (B_SET_DISPLAY_OUTPUT_ROTATION) */
+	B_DISPLAY_OUTPUT_ROTATED_180 = 1 << 6,	/* and does so now */
 };
 
 typedef struct {
@@ -442,6 +447,15 @@ typedef status_t (*get_display_output_scan_line)(uint32 id, int32* _line,
 	   frame buffer region: negative in the vertical blank (minus the rows
 	   until the scan starts), _lines the region's height; when the scan
 	   of the frame began (system_time()) and how long a frame takes. */
+
+typedef status_t (*set_display_output_rotation)(uint32 id, uint32 degrees);
+	/* Turns what the monitor on that output shows: 0 is the frame buffer
+	   region as it is, 180 upside down (a 2-in-1 laptop standing as a tent).
+	   The region, the frame buffer and the mode stay as they are; only the
+	   picture on the monitor turns, the hardware cursor with it. Positions
+	   passed to the accelerant remain frame buffer positions. The rotation
+	   stays until it is set again, whatever layouts and modes are set in
+	   between. B_UNSUPPORTED for angles the hardware cannot do. */
 
 typedef status_t (*set_cursor_shape)(uint16 width, uint16 height,
 	uint16 hotX, uint16 hotY, const uint8* andMask, const uint8* xorMask);

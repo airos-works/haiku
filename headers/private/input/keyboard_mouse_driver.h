@@ -61,6 +61,10 @@ enum {
 
 	MS_IS_TOUCHPAD,
 	MS_READ_TOUCHPAD,
+	MS_IS_DISPLAY_DIGITIZER,
+		// a tablet device answers B_OK when it is part of a display (a touch
+		// screen, or the pen of one): its positions are places on that
+		// display, not on the whole desktop
 
 	IIC_WRITE = B_DEVICE_OP_CODES_END + 200, 
 	RESTART_SYSTEM,

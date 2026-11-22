@@ -70,6 +70,11 @@ struct DisplayInfo {
 						{ return mirrorOf != kNotMirrored; }
 	bool			IsInternal() const
 						{ return (flags & B_DISPLAY_OUTPUT_INTERNAL) != 0; }
+	bool			CanRotate() const
+						{ return (flags & B_DISPLAY_OUTPUT_CAN_ROTATE) != 0; }
+	int32			Rotation() const
+						{ return (flags & B_DISPLAY_OUTPUT_ROTATED_180) != 0
+							? 180 : 0; }
 	float			RefreshRate() const;
 	float			NativeRefreshRate() const;
 	float			DPI() const;

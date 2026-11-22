@@ -50,6 +50,10 @@ amdgpu_get_display_outputs(display_output* outputs, uint32* _count)
 			output.flags |= B_DISPLAY_OUTPUT_MIRROR;
 		if (source.internal)
 			output.flags |= B_DISPLAY_OUTPUT_INTERNAL;
+		if (output_can_rotate(source))
+			output.flags |= B_DISPLAY_OUTPUT_CAN_ROTATE;
+		if (output_is_rotated(source))
+			output.flags |= B_DISPLAY_OUTPUT_ROTATED_180;
 		output.x = source.x;
 		output.y = source.y;
 		output.width = source.width;
@@ -252,6 +256,113 @@ amdgpu_set_display_layout(const display_output_config* configs, uint32 count,
 	}
 	free(layout);
 	return status;
+}
+
+
+bool
+output_is_rotated(const Output& output)
+{
+	for (uint32 i = 0; i < gInfo->rotatedCount; i++) {
+		if (gInfo->rotatedOutputs[i] == output.id)
+			return true;
+	}
+	return false;
+}
+
+
+/*!	Whether the output's picture can be shown upside down: by the primary
+	plane of the CRTC that drives it, or of every CRTC that could. (The
+	cursor does not need it: where its plane cannot turn, app_server draws
+	the cursor into the frame buffer, see try_cursor().)
+*/
+bool
+output_can_rotate(const Output& output)
+{
+	const Card& card = card_of(output);
+	if (output.enabled && output.crtcIndex >= 0)
+		return card.primaryRotation[output.crtcIndex] != 0;
+	bool any = false;
+	for (uint32 c = 0; c < card.resources.crtcCount; c++) {
+		if ((output.possibleCrtcs & (1 << c)) == 0
+			|| card.crtcPrimaryPlane[c] == 0)
+			continue;
+		if (card.primaryRotation[c] == 0)
+			return false;
+		any = true;
+	}
+	return any;
+}
+
+
+/*!	Shows an output's region as it is (0) or upside down (180): for a 2-in-1
+	laptop standing as a tent, whose panel is the other way up then. The
+	display engine turns the picture as it scans the frame buffer out, so
+	nothing that draws into the frame buffer has to know; the cursor's plane
+	is turned with it. The angle is kept by output ID and goes into every
+	layout set later (add_card_layout()).
+*/
+extern "C" status_t
+amdgpu_set_display_output_rotation(uint32 id, uint32 degrees)
+{
+	if (gInfo->isClone)
+		return B_NOT_ALLOWED;
+	if (degrees != 0 && degrees != 180)
+		return B_UNSUPPORTED;
+	Output* output = NULL;
+	for (uint32 i = 0; i < gInfo->outputCount; i++) {
+		if (gInfo->outputs[i].id == id)
+			output = &gInfo->outputs[i];
+	}
+	if (output == NULL)
+		return B_ENTRY_NOT_FOUND;
+	bool rotate = degrees == 180;
+	if (rotate && !output_can_rotate(*output))
+		return B_UNSUPPORTED;
+	if (rotate == output_is_rotated(*output))
+		return B_OK;
+
+	if (output->enabled && output->crtcIndex >= 0 && gInfo->modeSet) {
+		const Card& card = card_of(*output);
+		uint32 c = output->crtcIndex;
+		uint64 value = rotate ? DRM_MODE_ROTATE_180 : DRM_MODE_ROTATE_0;
+		Kms::AtomicRequest request;
+		request.Add(card.crtcPrimaryPlane[c], card.primaryRotation[c], value);
+		if (card.cursorRotation[c] != 0) {
+			request.Add(card.crtcCursorPlane[c], card.cursorRotation[c],
+				value);
+		}
+		status_t status = request.Commit(card.fd, 0);
+		if (status != B_OK) {
+			// (a display engine that has to set its mode again for it)
+			status = request.Commit(card.fd, DRM_MODE_ATOMIC_ALLOW_MODESET);
+		}
+		if (status != B_OK) {
+			debug_printf("amdgpu_kms: %s: cannot turn the picture to %"
+				B_PRIu32 " degrees: %s\n", output->name, degrees,
+				strerror(status));
+			return status;
+		}
+	}
+
+	if (rotate) {
+		if (gInfo->rotatedCount < kMaxOutputs)
+			gInfo->rotatedOutputs[gInfo->rotatedCount++] = id;
+	} else {
+		for (uint32 i = 0; i < gInfo->rotatedCount; i++) {
+			if (gInfo->rotatedOutputs[i] == id) {
+				gInfo->rotatedOutputs[i]
+					= gInfo->rotatedOutputs[--gInfo->rotatedCount];
+				break;
+			}
+		}
+	}
+	debug_printf("amdgpu_kms: %s: shown %s\n", output->name,
+		rotate ? "upside down" : "upright");
+	// The cursor's place on the panel changed with it; app_server sets the
+	// cursor again after this (one whose plane cannot turn is drawn by it).
+	gInfo->cursorSet = false;
+	update_cursor();
+	return B_OK;
 }
 
 

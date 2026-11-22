@@ -57,6 +57,10 @@ struct Card {
 	uint32				planeCount;
 	uint32				crtcPrimaryPlane[Kms::kMaxObjects];
 	uint32				crtcCursorPlane[Kms::kMaxObjects];
+	// the planes' "rotation" properties (one per plane), 0 where a plane
+	// cannot show its picture upside down
+	uint32				primaryRotation[Kms::kMaxObjects];
+	uint32				cursorRotation[Kms::kMaxObjects];
 
 	// properties (the same ID on every object of a type)
 	uint32				connectorCrtcId;
@@ -170,6 +174,11 @@ struct accelerant_info {
 	bool				cursorSet;
 	bool				cursorRefused;	// by a monitor: app_server draws it
 
+	// the outputs shown upside down (B_SET_DISPLAY_OUTPUT_ROTATION), by ID:
+	// connectors are probed again when monitors come and go
+	uint32				rotatedOutputs[kMaxOutputs];
+	uint32				rotatedCount;
+
 	port_id				changePort;
 	uint32				changeCode;
 	thread_id			hotplugThread;
@@ -245,6 +254,8 @@ void timing_to_mode(const display_timing& timing, drm_mode_modeinfo& mode);
 int32 find_output_mode(const Output& output, const display_timing& timing);
 Output* primary_output(void);
 void update_cursor(void);
+bool output_is_rotated(const Output& output);
+bool output_can_rotate(const Output& output);
 
 // copies to the screen by an Intel GPU's blitter (i915_copy.cpp)
 status_t i915_create_frame_buffer_source(uint16 width, uint16 height,
@@ -305,6 +316,7 @@ status_t amdgpu_get_display_output_modes(uint32 id, display_mode* modes,
 status_t amdgpu_set_display_layout(const display_output_config* configs,
 	uint32 count, display_mode* mode);
 status_t amdgpu_set_display_change_port(port_id port, uint32 code);
+status_t amdgpu_set_display_output_rotation(uint32 id, uint32 degrees);
 status_t amdgpu_wait_for_display_restore(bigtime_t timeout);
 void restore_cursor_image(void);
 

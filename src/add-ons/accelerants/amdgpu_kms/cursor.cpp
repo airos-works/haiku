@@ -31,6 +31,12 @@ try_cursor(void)
 		if (!output.enabled || output.crtcIndex < 0)
 			continue;
 		Card& card = card_of(output);
+		// a monitor shown upside down needs its cursor turned as well
+		if (output_is_rotated(output)
+			&& card.cursorRotation[output.crtcIndex] == 0) {
+			status = B_UNSUPPORTED;
+			break;
+		}
 		status = Kms::SetCursor(card.fd,
 			card.resources.crtcs[output.crtcIndex], card.cursor.handle,
 			kCursorSize, kCursorSize, gInfo->cursorHotX, gInfo->cursorHotY);
@@ -162,6 +168,12 @@ update_cursor(void)
 			continue;
 		Card& card = card_of(output);
 		uint32 crtc = card.resources.crtcs[output.crtcIndex];
+		if (output_is_rotated(output)
+			&& card.cursorRotation[output.crtcIndex] == 0) {
+			// it cannot turn with the picture: app_server draws it
+			Kms::SetCursor(card.fd, crtc, 0, 0, 0, 0, 0);
+			continue;
+		}
 		if (!show || card.cursor.handle == 0) {
 			if (!gInfo->cursorSet)
 				Kms::SetCursor(card.fd, crtc, 0, 0, 0, 0, 0);
@@ -177,8 +189,16 @@ update_cursor(void)
 			x = x * (int32)output.timing.hdisplay / (int32)output.width;
 			y = y * (int32)output.timing.vdisplay / (int32)output.height;
 		}
-		Kms::MoveCursor(card.fd, crtc, x - gInfo->cursorHotX,
-			y - gInfo->cursorHotY);
+		x -= gInfo->cursorHotX;
+		y -= gInfo->cursorHotY;
+		if (output_is_rotated(output)) {
+			// The plane's picture is turned around its own middle: the
+			// cursor's hot spot is as far from its bottom right corner now,
+			// and the panel's pixels count from the other corner.
+			x = (int32)output.timing.hdisplay - x - (int32)kCursorSize;
+			y = (int32)output.timing.vdisplay - y - (int32)kCursorSize;
+		}
+		Kms::MoveCursor(card.fd, crtc, x, y);
 	}
 	gInfo->cursorSet = true;
 }

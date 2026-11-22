@@ -21,7 +21,8 @@ class InputManager : public BLocker {
 		InputManager();
 		virtual ~InputManager();
 
-		void UpdateScreenBounds(BRect bounds, const BRegion* displays = NULL);
+		void UpdateScreenBounds(BRect bounds, const BRegion* displays = NULL,
+			BRect touchScreen = BRect(), int32 touchRotation = 0);
 
 		bool AddStream(EventStream* stream);
 		void RemoveStream(EventStream* stream);

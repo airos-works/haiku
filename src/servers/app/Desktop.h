@@ -136,6 +136,8 @@ public:
 			status_t			GetDisplayLayout(BMessage& layout);
 			status_t			SetDisplayLayout(const BMessage& request);
 			void				SetLidClosed(bool closed);
+			status_t			SetDisplayRotation(uint32 id,
+									int32 degrees);
 			BRect				DisplayFrameFor(BRect frame, bool forZoom);
 			const DisplayLayout& Displays() const { return fDisplays; }
 									// the screen lock must be held
@@ -344,6 +346,8 @@ private:
 			status_t			_SetDisplayLayout(::HWInterface* interface,
 									DisplayLayout& layout, bool switchMode);
 			void				_UpdateDisplays();
+			void				_UpdateInputBounds(BRect frame);
+									// the screen lock must be held
 			void				_StoreDisplayLayout();
 			void				_RememberScreenMode(Screen* screen);
 			void				_KeepWindowsOnDisplays(

@@ -464,6 +464,13 @@ HWInterface::SetDisplayLayout(const display_output_config* configs,
 }
 
 
+status_t
+HWInterface::SetDisplayOutputRotation(uint32 id, uint32 degrees)
+{
+	return degrees == 0 ? B_OK : B_UNSUPPORTED;
+}
+
+
 // #pragma mark -
 
 
