@@ -35,6 +35,7 @@ All rights reserved.
 
 #include "FilePanelPriv.h"
 
+#include <algorithm>
 #include <string.h>
 
 #include <Alert.h>
@@ -51,6 +52,7 @@ All rights reserved.
 #include <MenuField.h>
 #include <MenuItem.h>
 #include <MessageFilter.h>
+#include <MobileKit.h>
 #include <NodeInfo.h>
 #include <NodeMonitor.h>
 #include <Path.h>
@@ -89,6 +91,8 @@ All rights reserved.
 #undef B_TRANSLATION_CONTEXT
 #define B_TRANSLATION_CONTEXT "FilePanelPriv"
 
+
+static const uint32 kChooseLocation = 'fpCL';
 
 const char* kDefaultFilePanelTemplate = "FilePanelSettings";
 
@@ -177,6 +181,10 @@ TFilePanel::TFilePanel(file_panel_mode mode, BMessenger* target, const BEntry* s
 	bool hideWhenDone)
 	:
 	BContainerWindow(0, openFlags, look, feel, windowFlags, workspace, false, false),
+	fMobile(false),
+	fUpButton(NULL),
+	fLocationButton(NULL),
+	fNewFolderButton(NULL),
 	fDirMenu(NULL),
 	fDirMenuField(NULL),
 	fTextControl(NULL),
@@ -292,6 +300,7 @@ TFilePanel::TFilePanel(file_panel_mode mode, BMessenger* target, const BEntry* s
 
 TFilePanel::~TFilePanel()
 {
+	DismissLocationSheet();
 	BMessenger tracker(kTrackerSignature);
 	BHandler::StopWatching(tracker, kDesktopFilePanelRootChanged);
 
@@ -561,6 +570,9 @@ TFilePanel::SwitchDirectory(const entry_ref* ref)
 	_inherited::SwitchDirectory(&setToRef);
 		// calls AddPosesCompleted() for the rest
 
+	if (fMobile)
+		fNewFolderButton->SetEnabled(!PoseView()->TargetVolumeIsReadOnly());
+
 	// update the menu field
 	for (int32 index = fDirMenu->CountItems() - 1; index >= 0; index--)
 		delete fDirMenu->RemoveItem(index);
@@ -573,6 +585,8 @@ TFilePanel::SwitchDirectory(const entry_ref* ref)
 
 	// set dir menu to the new directory
 	item->SetEntry(&entry);
+	if (fMobile)
+		LayoutMobile(Bounds().Width(), Bounds().Height());
 }
 
 
@@ -736,6 +750,18 @@ TFilePanel::Init(const BMessage*)
 
 	fBackView->AddChild(fDirMenuField);
 
+	fUpButton = new BButton("up", B_TRANSLATE("Up"), new BMessage(kOpenParentDir));
+	fLocationButton = new BButton("location", "", new BMessage(kChooseLocation));
+	fLocationButton->SetToolTip(B_TRANSLATE("Choose a location"));
+	fNewFolderButton = new BButton("new folder", B_TRANSLATE("New folder"),
+		new BMessage(kNewFolder));
+	fBackView->AddChild(fUpButton);
+	fBackView->AddChild(fLocationButton);
+	fBackView->AddChild(fNewFolderButton);
+	fUpButton->Hide();
+	fLocationButton->Hide();
+	fNewFolderButton->Hide();
+
 	// add buttons
 	fButtonText = fIsSavePanel ? B_TRANSLATE("Save") : B_TRANSLATE("Open");
 	BButton* default_button = new BButton(BRect(), "default button",
@@ -800,6 +826,7 @@ TFilePanel::Init(const BMessage*)
 	else
 		fBackView->AddChild(fPoseContainer);
 
+	fNewFolderButton->SetTarget(PoseView());
 	fShortcuts = new TShortcuts(this);
 
 	AddShortcut('W', B_COMMAND_KEY, new BMessage(kCancelButton));
@@ -942,6 +969,8 @@ TFilePanel::RestoreState()
 void
 TFilePanel::SaveState(bool)
 {
+	if (fMobile)
+		return;
 	BNode defaultingNode;
 	if (DefaultStateSourceNode(kDefaultFilePanelTemplate, &defaultingNode,
 		true, false)) {
@@ -1196,6 +1225,8 @@ TFilePanel::SetButtonLabel(file_panel_button selector, const char* text)
 			break;
 		}
 	}
+	if (fMobile)
+		LayoutMobile(Bounds().Width(), Bounds().Height());
 }
 
 
@@ -1220,6 +1251,32 @@ TFilePanel::MessageReceived(BMessage* message)
 	entry_ref ref;
 
 	switch (message->what) {
+		case kChooseLocation:
+		{
+			if (!fMobile || fLocationSheet.IsValid())
+				break;
+			BMobileKit::ActionSheet* sheet = new BMobileKit::ActionSheet(this,
+				B_TRANSLATE("Choose a location"));
+			for (int32 i = fDirMenu->CountItems() - 1; i >= 0; i--) {
+				BMenuItem* item = fDirMenu->ItemAt(i);
+				if (item->Message() != NULL)
+					sheet->AddAction(item->Label(), *item->Message());
+			}
+			fLocationSheet = BMessenger(sheet);
+			sheet->Open();
+			break;
+		}
+		case BMobileKit::B_MOBILE_WINDOW_QUERY:
+		{
+			BMessage reply(B_REPLY);
+			reply.AddBool("file panel", true);
+			message->SendReply(&reply);
+			break;
+		}
+		case BMobileKit::B_MOBILE_VIEW_CHANGED:
+			SetMobile(message->GetBool("mobile", false));
+			break;
+
 		case B_REFS_RECEIVED:
 		{
 			// item was double clicked in file panel (PoseView) or from the favorites menu
@@ -1473,6 +1530,8 @@ TFilePanel::OpenParent()
 	parentEntry.GetRef(&setToRef);
 	const entry_ref* parent = &setToRef;
 	SwitchDirectory(parent);
+	if (fMobile)
+		return;	// The action button should choose the folder we just entered.
 
 	// Make sure the child gets selected in the new view once it shows up.
 	fTaskLoop->RunLater(
@@ -1705,6 +1764,153 @@ TFilePanel::HandleOpenButton()
 
 
 void
+TFilePanel::Show()
+{
+	AutoLock<BWindow> lock(this);
+	if (!lock)
+		return;
+
+	if (IsHidden()) {
+		BMobileKit::PrepareWindow(this, [this](bool mobile) {
+			SetMobile(mobile);
+		}, true);
+	}
+	_inherited::Show();
+}
+
+
+void
+TFilePanel::Hide()
+{
+	AutoLock<BWindow> lock(this);
+	if (!lock)
+		return;
+	DismissLocationSheet();
+	_inherited::Hide();
+}
+
+
+void
+TFilePanel::DismissLocationSheet()
+{
+	if (fLocationSheet.IsValid())
+		fLocationSheet.SendMessage(B_QUIT_REQUESTED);
+}
+
+
+static void
+place_view(BView* view, BRect frame)
+{
+	view->MoveTo(frame.LeftTop());
+	view->ResizeTo(frame.Size());
+}
+
+
+void
+TFilePanel::SetMobile(bool mobile)
+{
+	if (fMobile == mobile)
+		return;
+
+	BView* controls[] = { fPoseContainer, fTextControl,
+		FindView("cancel button"), FindView("default button") };
+	fMobile = mobile;
+	if (mobile) {
+		fDesktopSize = Bounds().Size();
+		GetSizeLimits(&fDesktopMin.width, &fDesktopMax.width, &fDesktopMin.height,
+			&fDesktopMax.height);
+		float touch = BMobileKit::TargetSize();
+		float padding = 6 * be_control_look->ComposeSpacing(B_USE_SMALL_SPACING);
+		SetSizeLimits(3 * touch + padding, fDesktopMax.width,
+			(fIsSavePanel ? 3 : 2) * touch + padding, fDesktopMax.height);
+		for (size_t i = 0; i < B_COUNT_OF(controls); i++) {
+			if (controls[i] != NULL)
+				fDesktopControls[i] = controls[i]->Frame();
+		}
+		fMenuBar->Hide();
+		fCountContainer->Hide();
+		fDirMenuField->Hide();
+		fUpButton->Show();
+		fLocationButton->Show();
+		fNewFolderButton->Show();
+		fNewFolderButton->SetEnabled(!PoseView()->TargetVolumeIsReadOnly());
+		LayoutMobile(Bounds().Width(), Bounds().Height());
+	} else {
+		DismissLocationSheet();
+		SetSizeLimits(fDesktopMin.width, fDesktopMax.width,
+			fDesktopMin.height, fDesktopMax.height);
+		ResizeTo(fDesktopSize.width, fDesktopSize.height);
+		fDirMenuField->Show();
+		fUpButton->Hide();
+		fLocationButton->Hide();
+		fNewFolderButton->Hide();
+		fCountContainer->Show();
+		fMenuBar->Show();
+		for (size_t i = 0; i < B_COUNT_OF(controls); i++) {
+			if (controls[i] != NULL)
+				place_view(controls[i], fDesktopControls[i]);
+		}
+	}
+	PoseView()->SetMobile(mobile);
+}
+
+
+void
+TFilePanel::LayoutMobile(float width, float height)
+{
+	const float gap = be_control_look->ComposeSpacing(B_USE_SMALL_SPACING);
+	const float touch = BMobileKit::TargetSize();
+	BRect area(gap, gap, width - gap, height - gap);
+	float up = std::min(area.Width() / 3, std::max(touch, fUpButton->PreferredSize().width));
+	float create = std::min(area.Width() / 3,
+		std::max(touch, fNewFolderButton->PreferredSize().width));
+	place_view(fUpButton, BRect(area.left, area.top, area.left + up, area.top + touch));
+	place_view(fNewFolderButton, BRect(area.right - create, area.top, area.right,
+		area.top + touch));
+	BRect location(fUpButton->Frame().right + gap, area.top,
+		fNewFolderButton->Frame().left - gap, area.top + touch);
+	place_view(fLocationButton, location);
+	BPath path(TargetModel()->EntryRef());
+	BString label(path.InitCheck() == B_OK ? path.Path() : TargetModel()->Name());
+	be_plain_font->TruncateString(&label, B_TRUNCATE_BEGINNING, location.Width() - 2 * gap);
+	fLocationButton->SetLabel(label);
+
+	BView* cancel = FindView("cancel button");
+	BView* accept = FindView("default button");
+	float actionWidth = std::max(2 * touch,
+		std::max(cancel->PreferredSize().width, accept->PreferredSize().width));
+	float actionsTop = area.bottom - touch;
+	float gridBottom = actionsTop - gap;
+	// Wide panels have a single action row. On narrow screens the name
+	// gets its own row and both actions share the available width.
+	bool wide = area.Width() >= 2 * actionWidth + 5 * touch;
+	if (!wide)
+		actionWidth = floorf((area.Width() - gap) / 2);
+	float cancelLeft = area.right - 2 * actionWidth - gap;
+	place_view(cancel, BRect(cancelLeft, actionsTop, cancelLeft + actionWidth, area.bottom));
+	place_view(accept, BRect(area.right - actionWidth, actionsTop, area.right, area.bottom));
+	if (fTextControl != NULL) {
+		if (wide) {
+			place_view(fTextControl, BRect(area.left, actionsTop, cancelLeft - gap, area.bottom));
+		} else {
+			place_view(fTextControl, BRect(area.left, gridBottom - touch, area.right, gridBottom));
+			gridBottom -= touch + gap;
+		}
+	}
+	place_view(fPoseContainer, BRect(area.left, area.top + touch + gap, area.right, gridBottom));
+}
+
+
+void
+TFilePanel::FrameResized(float width, float height)
+{
+	_inherited::FrameResized(width, height);
+	if (fMobile)
+		LayoutMobile(width, height);
+}
+
+
+void
 TFilePanel::WindowActivated(bool active)
 {
 	// force focus to update properly
@@ -1719,8 +1925,92 @@ TFilePanel::WindowActivated(bool active)
 BFilePanelPoseView::BFilePanelPoseView(Model* model)
 	:
 	BPoseView(model, kListMode),
+	fMobile(false),
+	fFolderTap(false),
 	fIsDesktop(model != NULL && model->IsDesktop())
 {
+}
+
+
+void
+BFilePanelPoseView::SetMobile(bool mobile)
+{
+	fMobile = mobile;
+	fFolderTap = false;
+	if (mobile) {
+		fViewState->SetIconSize(48);
+		fViewState->SetGroupBy(0);
+	}
+	fViewState->SetKeepArranged(mobile);
+	SetViewMode(mobile ? kIconMode : kListMode);
+}
+
+
+void
+BFilePanelPoseView::SetViewMode(uint32)
+{
+	_inherited::SetViewMode(fMobile ? kIconMode : kListMode);
+}
+
+
+void
+BFilePanelPoseView::MouseDown(BPoint where)
+{
+	fFolderTap = false;
+	if (fMobile && Window()->CurrentMessage()->GetInt32("buttons", 0) == B_PRIMARY_MOUSE_BUTTON
+		&& (modifiers() & (B_SHIFT_KEY | B_COMMAND_KEY | B_CONTROL_KEY | B_OPTION_KEY)) == 0) {
+		BPose* pose = FindPose(where);
+		if (pose != NULL && GetLinkFlavor(pose->TargetModel()) == B_DIRECTORY_NODE) {
+			fTappedFolder = *pose->TargetModel()->EntryRef();
+			fTapStart = where;
+			fFolderTap = true;
+			MakeFocus();
+			SetMouseEventMask(B_POINTER_EVENTS);
+			return;
+		}
+	}
+	_inherited::MouseDown(where);
+}
+
+
+void
+BFilePanelPoseView::MouseMoved(BPoint where, uint32 transit, const BMessage* drag)
+{
+	if (fFolderTap) {
+		float slop = be_control_look->ComposeSpacing(B_USE_SMALL_SPACING);
+		if (fabsf(where.x - fTapStart.x) > slop || fabsf(where.y - fTapStart.y) > slop)
+			fTappedFolder = entry_ref();
+		return;
+	}
+	_inherited::MouseMoved(where, transit, drag);
+}
+
+
+void
+BFilePanelPoseView::MouseLongDown(const BMessage* message)
+{
+	if (fFolderTap) {
+		fTappedFolder = entry_ref();
+		return;
+	}
+	_inherited::MouseLongDown(message);
+}
+
+
+void
+BFilePanelPoseView::MouseUp(BPoint where)
+{
+	if (fFolderTap) {
+		fFolderTap = false;
+		BPose* pose = FindPose(where);
+		if (pose != NULL && *pose->TargetModel()->EntryRef() == fTappedFolder) {
+			BMessage open(kSwitchDirectory);
+			open.AddRef("refs", &fTappedFolder);
+			Window()->PostMessage(&open);
+		}
+		return;
+	}
+	_inherited::MouseUp(where);
 }
 
 
@@ -1762,7 +2052,19 @@ void
 BFilePanelPoseView::RestoreState(AttributeStreamNode* node)
 {
 	_inherited::RestoreState(node);
-	fViewState->SetViewMode(kListMode);
+	ApplyPanelViewState();
+}
+
+
+void
+BFilePanelPoseView::ApplyPanelViewState()
+{
+	fViewState->SetViewMode(fMobile ? kIconMode : kListMode);
+	if (fMobile) {
+		fViewState->SetIconSize(48);
+		fViewState->SetKeepArranged(true);
+		fViewState->SetGroupBy(0);
+	}
 }
 
 
@@ -1770,6 +2072,7 @@ void
 BFilePanelPoseView::RestoreState(const BMessage &message)
 {
 	_inherited::RestoreState(message);
+	ApplyPanelViewState();
 }
 
 

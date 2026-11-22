@@ -61,7 +61,7 @@ public:
 			// Polls app_server. Returns true when the list changed.
 			bool				Update();
 			bool				PrepareWindow(BMessenger target, BRect frame,
-									int32 look);
+									int32 look, bool filePanel);
 
 			void				SetWorkArea(BRect area);
 			BRect				WorkArea() const { return fWorkArea; }
@@ -86,7 +86,7 @@ private:
 			TrackedWindow*		_Find(int32 token);
 			void				_Prune();
 			bool				_IsBackground(team_id team);
-			bool				_IsMobileFloating(const client_window_info& info);
+			bool				_IsMobileDialogOrPlayer(const client_window_info& info);
 			std::map<int32, team_id> fAuxiliary;
 			void				_HideWindowsOf(const char* signature,
 									bool desktopOnly);

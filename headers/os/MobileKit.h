@@ -34,14 +34,17 @@ const uint32 B_MOBILE_VIEW_CHANGED = 'mVch'; // "mobile" (bool)
 
 // In a primary window constructor, after building the desktop layout and
 // before Show(). The shell records that frame before the first mobile draw.
+// The system file panel supplies its own tablet UI regardless of its host.
 template<class ChangeView>
 inline void
-PrepareWindow(BWindow* window, ChangeView change)
+PrepareWindow(BWindow* window, ChangeView change, bool filePanel = false)
 {
 	BMessenger shell("application/x-vnd.airOS-MobileShell");
 	if (!shell.IsValid())
 		return;
 	BMessage request('mVpr'), reply;
+	if (filePanel)
+		request.AddBool("file panel", true);
 	request.AddMessenger("window", BMessenger(window));
 	request.AddRect("frame", window->Frame());
 	request.AddInt32("look", window->Look());
@@ -208,12 +211,14 @@ public:
 	ActionSheet(BWindow* owner, const char* title)
 		:
 		BWindow(owner->Frame(), title, B_MODAL_WINDOW_LOOK,
-			B_MODAL_SUBSET_WINDOW_FEEL, B_NOT_ZOOMABLE | B_NOT_RESIZABLE
+			owner->Feel() == B_MODAL_APP_WINDOW_FEEL ? B_MODAL_APP_WINDOW_FEEL
+				: B_MODAL_SUBSET_WINDOW_FEEL, B_NOT_ZOOMABLE | B_NOT_RESIZABLE
 				| B_ASYNCHRONOUS_CONTROLS | B_CLOSE_ON_ESCAPE),
 		fOwner(owner),
 		fArea(owner->Frame())
 	{
-		AddToSubset(owner);
+		if (Feel() == B_MODAL_SUBSET_WINDOW_FEEL)
+			AddToSubset(owner);
 		fChoices = new Choices;
 		fChoices->SetInvocationMessage(new BMessage('mVok'));
 		BLayoutBuilder::Group<>(this, B_VERTICAL)

@@ -283,7 +283,8 @@ ShellApp::MessageReceived(BMessage* message)
 			if (message->FindMessenger("window", &target) == B_OK
 				&& target.Team() == message->ReturnAddress().Team()
 				&& fTracker.PrepareWindow(target, message->GetRect("frame", BRect()),
-					message->GetInt32("look", B_TITLED_WINDOW_LOOK))) {
+					message->GetInt32("look", B_TITLED_WINDOW_LOOK),
+					message->GetBool("file panel", false))) {
 				reply.AddRect("area", fTracker.WorkArea());
 			}
 			message->SendReply(&reply);

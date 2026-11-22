@@ -42,6 +42,7 @@ All rights reserved.
 #include "TaskLoop.h"
 
 
+class BButton;
 class BTextControl;
 class BFilePanel;
 class BRefFilter;
@@ -69,6 +70,10 @@ public:
 
 	BFilePanelPoseView* PoseView() const;
 
+	virtual void Show();
+	virtual void Hide();
+	virtual void FrameResized(float width, float height);
+	bool IsMobile() const { return fMobile; }
 	virtual bool QuitRequested();
 	virtual void MenusBeginning();
 	virtual void MenusEnded();
@@ -153,6 +158,19 @@ private:
 	bool SelectChildInParent(const entry_ref* parent, const node_ref* child);
 	void OpenSelectionCommon(BMessage*);
 
+	void DismissLocationSheet();
+	void SetMobile(bool mobile);
+	void LayoutMobile(float width, float height);
+
+	bool fMobile;
+	BSize fDesktopSize;
+	BSize fDesktopMin;
+	BSize fDesktopMax;
+	BRect fDesktopControls[4];
+	BButton* fUpButton;
+	BButton* fLocationButton;
+	BMessenger fLocationSheet;
+	BButton* fNewFolderButton;
 	bool fIsSavePanel;
 	uint32 fNodeFlavors;
 	BView* fBackView;
@@ -177,6 +195,12 @@ class BFilePanelPoseView : public BPoseView {
 public:
 	BFilePanelPoseView(Model*);
 
+	void SetMobile(bool mobile);
+	virtual void SetViewMode(uint32 mode);
+	virtual void MouseDown(BPoint where);
+	virtual void MouseUp(BPoint where);
+	virtual void MouseMoved(BPoint where, uint32 transit, const BMessage* drag);
+	virtual void MouseLongDown(const BMessage* message);
 	virtual bool IsFilePanel() const;
 	virtual bool IsDesktop() const { return fIsDesktop; };
 	void SetIsDesktop(bool on) { fIsDesktop = on; };
@@ -199,6 +223,11 @@ protected:
 	void AdaptToDesktopIntegrationChange(BMessage*);
 
 private:
+	void ApplyPanelViewState();
+	bool fMobile;
+	bool fFolderTap;
+	BPoint fTapStart;
+	entry_ref fTappedFolder;
 	bool fIsDesktop;
 		// This flags makes the distinction between the Desktop as
 		// the root of the world and "/boot/home/Desktop" to which

@@ -107,12 +107,12 @@ BFilePanel::Show()
 
 	// Position like an alert, unless the parent is NULL and a position was
 	// already restored from saved settings.
-	BWindow* parent = dynamic_cast<BWindow*>(
-		BLooper::LooperForThread(find_thread(NULL)));
-	if (parent != NULL)
-		fWindow->MoveTo(fWindow->AlertPosition(parent->Frame()));
-	else {
-		if (!static_cast<TFilePanel*>(fWindow)->DefaultStateRestored())
+	TFilePanel* panel = static_cast<TFilePanel*>(fWindow);
+	if (!panel->IsMobile()) {
+		BWindow* parent = dynamic_cast<BWindow*>(BLooper::LooperForThread(find_thread(NULL)));
+		if (parent != NULL)
+			fWindow->MoveTo(fWindow->AlertPosition(parent->Frame()));
+		else if (!panel->DefaultStateRestored())
 			fWindow->MoveTo(fWindow->AlertPosition(BScreen(fWindow).Frame()));
 	}
 

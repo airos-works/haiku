@@ -453,6 +453,11 @@ BPose::PointInPose(const BPoseView* poseView, BPoint where) const
 	ASSERT(poseView != NULL);
 	ASSERT(poseView->ViewMode() != kListMode);
 
+	// In a touch file panel the whole icon and caption form one target,
+	// including transparent pixels and the gap above the caption.
+	if (poseView->IsFilePanel())
+		return CalcRect(poseView).Contains(where);
+
 	BPoint location = Location(poseView);
 	BRect rect = _IconRect(poseView, location);
 

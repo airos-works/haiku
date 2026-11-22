@@ -3333,7 +3333,6 @@ BPoseView::SetViewMode(uint32 newMode)
 			return;
 	}
 
-	ASSERT(!IsFilePanel());
 
 	uint32 lastIconMode = fViewState->LastIconMode();
 	if (newMode != kListMode) {
@@ -3370,12 +3369,12 @@ BPoseView::SetViewMode(uint32 newMode)
 		if (IsTypeAheadFiltering())
 			ClearTypeAheadFiltering();
 
-		if (window != NULL)
+		if (window != NULL && !IsFilePanel())
 			window->HideAttributesMenu();
 
 		fTitleView->Hide();
 	} else if (newMode == kListMode) {
-		if (window != NULL)
+		if (window != NULL && !IsFilePanel())
 			window->ShowAttributesMenu();
 
 		fTitleView->Show();

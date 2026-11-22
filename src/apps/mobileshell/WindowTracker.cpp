@@ -50,12 +50,12 @@ WindowTracker::WindowTracker(team_id self)
 
 
 bool
-WindowTracker::PrepareWindow(BMessenger target, BRect frame, int32 look)
+WindowTracker::PrepareWindow(BMessenger target, BRect frame, int32 look, bool filePanel)
 {
 	app_info app;
 	if (!frame.IsValid() || !fWorkArea.IsValid()
 		|| be_roster->GetRunningAppInfo(target.Team(), &app) != B_OK
-		|| !BMobileKit::SupportsMobileView(app.ref))
+		|| (!filePanel && !BMobileKit::SupportsMobileView(app.ref)))
 		return false;
 
 	int32 count = 0;
@@ -108,8 +108,10 @@ WindowTracker::Update()
 			&& !fState.IsHidden(info->server_token)
 			&& !_IsBackground(info->team)
 			&& (info->feel == B_NORMAL_WINDOW_FEEL
-				|| (info->feel == B_FLOATING_ALL_WINDOW_FEEL
-					&& _IsMobileFloating(*info)));
+				|| ((info->feel == B_FLOATING_ALL_WINDOW_FEEL
+					|| info->feel == B_MODAL_APP_WINDOW_FEEL
+					|| info->feel == B_MODAL_SUBSET_WINDOW_FEEL)
+					&& _IsMobileDialogOrPlayer(*info)));
 		if (!wanted) {
 			free(info);
 			continue;
@@ -132,7 +134,8 @@ WindowTracker::Update()
 				free(info);
 				continue;
 			}
-			window.mobile = BMobileKit::SupportsMobileView(app.ref);
+			window.mobile = info->feel != B_NORMAL_WINDOW_FEEL
+				|| BMobileKit::SupportsMobileView(app.ref) || _IsMobileDialogOrPlayer(*info);
 			window.fits = 0;
 			window.capped = false;
 			window.capWidth = window.capHeight = INFINITY;
@@ -395,22 +398,28 @@ WindowTracker::_Prune()
 
 
 bool
-WindowTracker::_IsMobileFloating(const client_window_info& info)
+WindowTracker::_IsMobileDialogOrPlayer(const client_window_info& info)
 {
+	// A prepared window has already opted in. This also avoids asking a
+	// modal panel on every poll while its owner is waiting for a reply.
+	SavedWindow* saved = fState.FindWindow(info.server_token, info.team);
+	if (saved != NULL)
+		return saved->managed;
 	auto known = fAuxiliary.find(info.server_token);
 	if (known != fAuxiliary.end() && known->second == info.team)
 		return false;
-	app_info app;
-	if (be_roster->GetRunningAppInfo(info.team, &app) != B_OK)
+
+	BMessenger window;
+	BMessenger::Private(window).SetTo(info.team, info.client_port, info.client_token);
+	BMessage query(BMobileKit::B_MOBILE_WINDOW_QUERY), reply;
+	if (window.SendMessage(&query, &reply, kSendTimeout, kSendTimeout) != B_OK)
 		return false;
-	if (BMobileKit::SupportsMobileView(app.ref)) {
-		BMessenger window;
-		BMessenger::Private(window).SetTo(info.team, info.client_port, info.client_token);
-		BMessage query(BMobileKit::B_MOBILE_WINDOW_QUERY), reply;
-		if (window.SendMessage(&query, &reply, kSendTimeout, kSendTimeout) != B_OK)
-			return false;
-		if (reply.GetBool("primary", false))
-			return true;
+	if (reply.GetBool("file panel", false))
+		return true;
+	if (info.feel == B_FLOATING_ALL_WINDOW_FEEL && reply.GetBool("primary", false)) {
+		app_info app;
+		return be_roster->GetRunningAppInfo(info.team, &app) == B_OK
+			&& BMobileKit::SupportsMobileView(app.ref);
 	}
 	if (fAuxiliary.size() > 512)
 		fAuxiliary.clear();

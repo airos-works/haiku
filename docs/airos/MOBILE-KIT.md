@@ -64,6 +64,8 @@ A primary window with `B_FLOATING_ALL_WINDOW_FEEL`, such as a full-screen movie 
 
 A newly allocated control or page belongs to its parent once added. An action control owns the BMessage pointer supplied to it. A sheet copies each action message. `TargetSize()` gives custom controls the same minimum tap size as the kit's controls. Text, focus, keyboard shortcuts and control messages follow Interface Kit conventions.
 
+The system Open, Save and folder-selection panels adapt automatically. Use the ordinary `BFilePanel` API with the same file filters, node flavors and result messages as on the desktop. In the tablet grid, tap a folder to enter it or use Up to go to its parent. For a directory-only panel, Open chooses the current folder when nothing is selected.
+
 ## Try both presentations
 
 Open a document on the desktop, note its frame, then start MobileShell or fold a convertible configured for air/OS Mobile. Select the running window from the switcher. Go home, launch a second supporting application and open the on-screen keyboard in a text field. Quit MobileShell or unfold the convertible. Both apps should show their desktop controls with their document or playback state intact. A desktop-only application should be absent from the launcher and have a labeled, closeable card in the task switcher.
