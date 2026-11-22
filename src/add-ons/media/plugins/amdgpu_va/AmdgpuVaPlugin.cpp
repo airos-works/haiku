@@ -19,7 +19,16 @@
 	and later AV1; on older GPUs (the WX 5100's UVD 6) Setup() or the first
 	picture fails and the caller decodes in software. libavcodec is linked in
 	statically, so that it does not clash with the system's (without VA-API)
-	that the applications load themselves. */
+	that the applications load themselves.
+
+	A caller can ask for pictures half as wide and high as the stream's
+	(NV12, I420 or P010 with half the stream's size in line_width and
+	line_count, as airTime does when a film is shown at half its size or
+	less): the GPU's video processor then scales each picture before it is
+	read, which on a small GPU without a shared cache (Gemini Lake) is what
+	takes the time. A 4K HDR10 picture took 33 ms to read and copy on a
+	Yoga 11e. If the video processor fails, the pictures are halved here
+	(2x2 means). AMDGPU_VA_HALF=0 never halves. */
 
 
 #include <DecoderPlugin.h>
@@ -41,6 +50,7 @@ extern "C" {
 #include <libavutil/pixdesc.h>
 }
 #include <va/va.h>
+#include <va/va_vpp.h>
 
 #if defined(__x86_64__)
 #include <emmintrin.h>
@@ -144,6 +154,11 @@ private:
 			status_t			_Receive();
 			bool				_PrepareImage(uint32 fourcc, int width,
 									int height);
+			bool				_Scale(VASurfaceID source, bool p010,
+									const AVFrame* frame);
+			void				_StopScaling();
+			void				_HalvePlanes(const uint8* data, bool p010,
+									uint8* output);
 			bool				_CopyPlanes(const uint8* data, bool p010,
 									uint8* output);
 			void				_NarrowPlanes(const uint8* data,
@@ -153,8 +168,16 @@ private:
 			VaCodec				fCodec;
 			status_t			fStatus;
 			media_format		fInput;
-			int					fWidth;
+			int					fStreamWidth;
+			int					fStreamHeight;
+			int					fWidth;		// of the pictures given out
 			int					fHeight;
+			bool				fHalf;
+			bool				fScaleFailed;
+			VAConfigID			fScaleConfig;
+			VAContextID			fScaleContext;
+			VASurfaceID			fScaleSurface;
+			uint32				fScaleFourcc;
 			color_space			fSpace;
 			HevcOutput::Format	fFormat;
 			size_t				fRowBytes;
@@ -176,8 +199,16 @@ VaDecoder::VaDecoder(VaCodec codec)
 	:
 	fCodec(codec),
 	fStatus(B_NO_INIT),
+	fStreamWidth(0),
+	fStreamHeight(0),
 	fWidth(0),
 	fHeight(0),
+	fHalf(false),
+	fScaleFailed(false),
+	fScaleConfig(VA_INVALID_ID),
+	fScaleContext(VA_INVALID_ID),
+	fScaleSurface(VA_INVALID_SURFACE),
+	fScaleFourcc(0),
 	fSpace(B_RGB32),
 	fFormat(HevcOutput::RGB32),
 	fRowBytes(0),
@@ -207,6 +238,7 @@ VaDecoder::_Close()
 	if (fHaveImage)
 		vaDestroyImage(fDisplay, fImage.image_id);
 	fHaveImage = false;
+	_StopScaling();
 	fDisplay = NULL;
 	av_buffer_unref(&fDevice);
 	av_packet_free(&fPacket);
@@ -316,8 +348,9 @@ VaDecoder::Setup(media_format* input, const void* info, size_t size)
 		return _Fail(B_ERROR, "cannot open the decoder");
 
 	fInput = *input;
-	fWidth = display.line_width;
-	fHeight = display.line_count;
+	fStreamWidth = fWidth = display.line_width;
+	fStreamHeight = fHeight = display.line_count;
+	fHalf = fScaleFailed = false;
 	fRowBytes = 0;
 	fEnded = fDrained = false;
 	fStatus = B_OK;
@@ -353,6 +386,19 @@ VaDecoder::NegotiateOutputFormat(media_format* output)
 		bytesPerPixel = 4;
 	} else
 		return B_NOT_SUPPORTED;
+	// half the stream's size, if that is what is asked for
+	static const bool sNoHalf = getenv("AMDGPU_VA_HALF") != NULL
+		&& strcmp(getenv("AMDGPU_VA_HALF"), "0") == 0;
+	const media_video_display_info& asked = output->u.raw_video.display;
+	int halfWidth = fStreamWidth / 2, halfHeight = fStreamHeight / 2;
+	fHalf = !sNoHalf && (format == HevcOutput::NV12
+			|| format == HevcOutput::I420 || format == HevcOutput::P010)
+		&& halfWidth > 0 && halfHeight > 0
+		&& (halfWidth & 1) == 0 && (halfHeight & 1) == 0
+		&& asked.line_width == (uint32)halfWidth
+		&& asked.line_count == (uint32)halfHeight;
+	fWidth = fHalf ? halfWidth : fStreamWidth;
+	fHeight = fHalf ? halfHeight : fStreamHeight;
 	fSpace = space;
 	fFormat = format;
 	fRowBytes = fWidth * bytesPerPixel;
@@ -556,6 +602,167 @@ VaDecoder::_PrepareImage(uint32 fourcc, int width, int height)
 }
 
 
+void
+VaDecoder::_StopScaling()
+{
+	if (fScaleContext != VA_INVALID_ID)
+		vaDestroyContext(fDisplay, fScaleContext);
+	if (fScaleSurface != VA_INVALID_SURFACE)
+		vaDestroySurfaces(fDisplay, &fScaleSurface, 1);
+	if (fScaleConfig != VA_INVALID_ID)
+		vaDestroyConfig(fDisplay, fScaleConfig);
+	fScaleContext = VA_INVALID_ID;
+	fScaleSurface = VA_INVALID_SURFACE;
+	fScaleConfig = VA_INVALID_ID;
+	fScaleFourcc = 0;
+}
+
+
+static VAProcColorStandardType
+color_standard(const AVFrame* frame, int height)
+{
+	switch (frame->colorspace) {
+		case AVCOL_SPC_BT2020_NCL:
+		case AVCOL_SPC_BT2020_CL:
+			return VAProcColorStandardBT2020;
+		case AVCOL_SPC_BT709:
+			return VAProcColorStandardBT709;
+		case AVCOL_SPC_BT470BG:
+		case AVCOL_SPC_SMPTE170M:
+			return VAProcColorStandardBT601;
+		default:
+			return height >= 720 ? VAProcColorStandardBT709
+				: VAProcColorStandardBT601;
+	}
+}
+
+
+/*!	Has the GPU's video processor scale the decoded picture to the half size
+	given out, into fScaleSurface. The same colour standard and range in and
+	out: only the size changes. */
+bool
+VaDecoder::_Scale(VASurfaceID source, bool p010, const AVFrame* frame)
+{
+	uint32 fourcc = p010 ? VA_FOURCC_P010 : VA_FOURCC_NV12;
+	if (fScaleSurface == VA_INVALID_SURFACE || fScaleFourcc != fourcc) {
+		_StopScaling();
+		if (vaCreateConfig(fDisplay, VAProfileNone, VAEntrypointVideoProc,
+				NULL, 0, &fScaleConfig) != VA_STATUS_SUCCESS) {
+			fScaleConfig = VA_INVALID_ID;
+			return false;
+		}
+		VASurfaceAttrib attribute = {};
+		attribute.type = VASurfaceAttribPixelFormat;
+		attribute.flags = VA_SURFACE_ATTRIB_SETTABLE;
+		attribute.value.type = VAGenericValueTypeInteger;
+		attribute.value.value.i = fourcc;
+		if (vaCreateSurfaces(fDisplay, p010 ? VA_RT_FORMAT_YUV420_10
+					: VA_RT_FORMAT_YUV420, fWidth, fHeight, &fScaleSurface, 1,
+				&attribute, 1) != VA_STATUS_SUCCESS) {
+			fScaleSurface = VA_INVALID_SURFACE;
+			return false;
+		}
+		if (vaCreateContext(fDisplay, fScaleConfig, fWidth, fHeight,
+				VA_PROGRESSIVE, &fScaleSurface, 1, &fScaleContext)
+					!= VA_STATUS_SUCCESS) {
+			fScaleContext = VA_INVALID_ID;
+			return false;
+		}
+		fScaleFourcc = fourcc;
+	}
+
+	VARectangle in = { 0, 0, (uint16)fStreamWidth, (uint16)fStreamHeight };
+	VARectangle out = { 0, 0, (uint16)fWidth, (uint16)fHeight };
+	VAProcPipelineParameterBuffer parameters = {};
+	parameters.surface = source;
+	parameters.surface_region = &in;
+	parameters.output_region = &out;
+	parameters.output_background_color = 0xff000000;
+	parameters.filter_flags = VA_FRAME_PICTURE | VA_FILTER_SCALING_DEFAULT;
+	parameters.surface_color_standard = parameters.output_color_standard
+		= color_standard(frame, fStreamHeight);
+	uint8 range = frame->color_range == AVCOL_RANGE_JPEG
+		? VA_SOURCE_RANGE_FULL : VA_SOURCE_RANGE_REDUCED;
+	parameters.input_color_properties.color_range = range;
+	parameters.output_color_properties.color_range = range;
+
+	VABufferID buffer;
+	if (vaCreateBuffer(fDisplay, fScaleContext,
+			VAProcPipelineParameterBufferType, sizeof(parameters), 1,
+			&parameters, &buffer) != VA_STATUS_SUCCESS)
+		return false;
+	bool done = vaBeginPicture(fDisplay, fScaleContext, fScaleSurface)
+			== VA_STATUS_SUCCESS
+		&& vaRenderPicture(fDisplay, fScaleContext, &buffer, 1)
+			== VA_STATUS_SUCCESS
+		&& vaEndPicture(fDisplay, fScaleContext) == VA_STATUS_SUCCESS
+		&& vaSyncSurface(fDisplay, fScaleSurface) == VA_STATUS_SUCCESS;
+	vaDestroyBuffer(fDisplay, buffer);
+	return done;
+}
+
+
+/*!	The picture in the VA image, at the stream's size, halved into the
+	caller's buffer: each sample the mean of four, as 16 bits (eight-bit
+	samples shifted up), then written in the format given out. Only when the
+	video processor cannot scale. */
+void
+VaDecoder::_HalvePlanes(const uint8* data, bool p010, uint8* output)
+{
+	const bool wideOut = fFormat == HevcOutput::P010;
+	const uint32 sampleBytes = wideOut ? 2 : 1;
+	auto load = [p010](const uint8* row, int i) -> uint32 {
+		return p010 ? ((const uint16*)row)[i] : (uint32)row[i] << 8;
+	};
+	auto store = [wideOut](uint8* row, int i, uint32 sum) {
+		uint32 mean = (sum + 2) >> 2;
+		if (wideOut)
+			((uint16*)row)[i] = mean & 0xffc0;
+		else {
+			uint32 narrow = ((mean >> 6) + 2) >> 2;
+			row[i] = narrow > 255 ? 255 : narrow;
+		}
+	};
+
+	const uint8* luma = data + fImage.offsets[0];
+	for (int y = 0; y < fHeight; y++) {
+		const uint8* a = luma + (size_t)(2 * y) * fImage.pitches[0];
+		const uint8* b = a + fImage.pitches[0];
+		uint8* row = output + (size_t)y * fWidth * sampleBytes;
+		for (int x = 0; x < fWidth; x++) {
+			store(row, x, load(a, 2 * x) + load(a, 2 * x + 1)
+				+ load(b, 2 * x) + load(b, 2 * x + 1));
+		}
+	}
+
+	// the chroma rows of the source: fStreamWidth / 2 pairs (U V)
+	const uint8* chroma = data + fImage.offsets[1];
+	uint8* planes = output + (size_t)fWidth * fHeight * sampleBytes;
+	int pairs = fWidth / 2;
+	for (int y = 0; y < fHeight / 2; y++) {
+		const uint8* a = chroma + (size_t)(2 * y) * fImage.pitches[1];
+		const uint8* b = a + fImage.pitches[1];
+		for (int x = 0; x < pairs; x++) {
+			uint32 u = load(a, 4 * x) + load(a, 4 * x + 2) + load(b, 4 * x)
+				+ load(b, 4 * x + 2);
+			uint32 v = load(a, 4 * x + 1) + load(a, 4 * x + 3)
+				+ load(b, 4 * x + 1) + load(b, 4 * x + 3);
+			if (fFormat == HevcOutput::I420) {
+				uint8* uPlane = planes + (size_t)y * pairs;
+				uint8* vPlane = planes + (size_t)pairs * (fHeight / 2)
+					+ (size_t)y * pairs;
+				store(uPlane, x, u);
+				store(vPlane, x, v);
+			} else {
+				uint8* row = planes + (size_t)y * fWidth * sampleBytes;
+				store(row, 2 * x, u);
+				store(row, 2 * x + 1, v);
+			}
+		}
+	}
+}
+
+
 /*!	Reads the VA surface into the stream's image, then converts it into the
 	caller's buffer. */
 bool
@@ -570,19 +777,43 @@ VaDecoder::_Convert(const AVFrame* frame, uint8* output)
 	bool p010 = softwareFormat == AV_PIX_FMT_P010;
 	if (!p010 && softwareFormat != AV_PIX_FMT_NV12)
 		return false;
-	if (frame->width < fWidth || frame->height < fHeight)
+	if (frame->width < fStreamWidth || frame->height < fStreamHeight)
 		return false;
 	VASurfaceID surface = (VASurfaceID)(uintptr_t)frame->data[3];
-	if (vaSyncSurface(fDisplay, surface) != VA_STATUS_SUCCESS
-		|| !_PrepareImage(p010 ? VA_FOURCC_P010 : VA_FOURCC_NV12,
-			frame->width, frame->height)
-		|| vaGetImage(fDisplay, surface, 0, 0, frame->width, frame->height,
+	if (vaSyncSurface(fDisplay, surface) != VA_STATUS_SUCCESS)
+		return false;
+	// what is read: the decoded picture, or the GPU's half of it
+	int imageWidth = frame->width, imageHeight = frame->height;
+	bool halved = false;
+	if (fHalf && !fScaleFailed) {
+		if (_Scale(surface, p010, frame)) {
+			surface = fScaleSurface;
+			imageWidth = fWidth;
+			imageHeight = fHeight;
+			halved = true;
+		} else {
+			fprintf(stderr, "amduvd (VA-API): the video processor does not "
+				"scale %s pictures, halving them on the processor\n",
+				p010 ? "P010" : "NV12");
+			_StopScaling();
+			fScaleFailed = true;
+		}
+	}
+	if (!_PrepareImage(p010 ? VA_FOURCC_P010 : VA_FOURCC_NV12,
+			imageWidth, imageHeight)
+		|| vaGetImage(fDisplay, surface, 0, 0, imageWidth, imageHeight,
 			fImage.image_id) != VA_STATUS_SUCCESS)
 		return false;
 	void* data;
 	if (vaMapBuffer(fDisplay, fImage.buf, &data) != VA_STATUS_SUCCESS)
 		return false;
 	bigtime_t transferred = sTiming ? system_time() : 0;
+
+	if (fHalf && !halved) {
+		_HalvePlanes((const uint8*)data, p010, output);
+		vaUnmapBuffer(fDisplay, fImage.buf);
+		return true;
+	}
 
 	if (_CopyPlanes((const uint8*)data, p010, output)) {
 		vaUnmapBuffer(fDisplay, fImage.buf);
@@ -593,10 +824,10 @@ VaDecoder::_Convert(const AVFrame* frame, uint8* output)
 			sTransfer += transferred - start;
 			sCopy += end - transferred;
 			if (++sCount == 120) {
-				fprintf(stderr, "amduvd (VA-API): %dx%d %s, per picture: "
+				fprintf(stderr, "amduvd (VA-API): %dx%d %s%s, per picture: "
 					"transfer %.2f ms, copy %.2f ms\n", fWidth, fHeight,
-					p010 ? "P010" : "NV12", sTransfer / 120000.0,
-					sCopy / 120000.0);
+					p010 ? "P010" : "NV12", halved ? " (scaled by the GPU)"
+						: "", sTransfer / 120000.0, sCopy / 120000.0);
 				sTransfer = sCopy = 0;
 				sCount = 0;
 			}
@@ -607,8 +838,8 @@ VaDecoder::_Convert(const AVFrame* frame, uint8* output)
 	// the layout the conversions take: luma rows, then the
 	// interleaved chroma rows, one pitch
 	uint32 sampleBytes = p010 ? 2 : 1;
-	uint32 pitch = frame->width * sampleBytes;
-	uint32 height = frame->height;
+	uint32 pitch = imageWidth * sampleBytes;
+	uint32 height = imageHeight;
 	try {
 		fPixels.pixels.resize((size_t)pitch * height * 3 / 2);
 	} catch (const std::bad_alloc&) {
@@ -635,7 +866,7 @@ VaDecoder::_Convert(const AVFrame* frame, uint8* output)
 	fPixels.fullRange = frame->color_range == AVCOL_RANGE_JPEG;
 	// both use the matrix coefficients of ITU-T H.273
 	fPixels.matrix = frame->colorspace != AVCOL_SPC_UNSPECIFIED
-		? frame->colorspace : (fHeight >= 720 ? AVCOL_SPC_BT709
+		? frame->colorspace : (fStreamHeight >= 720 ? AVCOL_SPC_BT709
 			: AVCOL_SPC_SMPTE170M);
 	fPixels.p010 = p010;
 	fPixels.bitDepth = p010 ? 10 : 8;
