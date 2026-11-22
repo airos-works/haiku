@@ -61,6 +61,7 @@ extern "C" {
 
 // prototypes from common.c
 status_t		ps2_init(void);
+void		ps2_add_power_hook(void);
 void			ps2_uninit(void);
 
 uint8			ps2_read_ctrl(void);

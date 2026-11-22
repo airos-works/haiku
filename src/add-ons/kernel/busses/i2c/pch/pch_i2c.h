@@ -113,6 +113,11 @@ typedef struct {
 
 	uint32 masterConfig;
 
+	// the LPSS private registers (0x200-0x220: clock dividers, resets,
+	// ...), saved at a suspend: a suspend to RAM loses them
+	uint32 privateContext[9];
+	bool privateContextSaved;
+
 	// transfer
 	int32	busy;
 	ConditionVariable wait_read, wait_write, wait_busy;

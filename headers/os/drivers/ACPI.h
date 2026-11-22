@@ -301,6 +301,11 @@ struct acpi_module_info {
 	/* Leaving a sleep state: called with interrupts disabled and
 	   \a prepare set first, then again with interrupts enabled. */
 	status_t	(*leave_sleep_state)(uint8 state, bool prepare);
+
+	/* Arms (or disarms) the lid and the power and sleep buttons that can
+	   wake the system from \a state (their _PRW): their wake GPEs, and
+	   _DSW/_PSW. Returns how many were armed. */
+	int32		(*enable_wake_devices)(uint8 state, bool enable);
 };
 
 

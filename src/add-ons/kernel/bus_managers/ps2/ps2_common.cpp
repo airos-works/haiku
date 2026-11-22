@@ -13,6 +13,9 @@
 
 #include <string.h>
 
+#include <ACPI.h>
+#include <kdevice_manager.h>
+
 #include "ps2_common.h"
 #include "ps2_service.h"
 #include "ps2_dev.h"
@@ -393,6 +396,74 @@ ps2_interrupt(void* cookie)
 //	#pragma mark - driver interface
 
 
+/*!	A suspend to RAM powers the controller and the devices off: the firmware
+	sets the controller up again for itself (without our interrupts), and a
+	touchpad wakes up in its default mode. The controller is set up as at
+	the start, and the pointing devices are published again, as after a hot
+	plug, which sets them up from the start, too.
+*/
+static int32 sSuspendState = -1;
+static bool sPowerHookAdded;
+static thread_id sPowerHookThread = -1;
+
+
+static status_t
+ps2_power_hook(void* /*cookie*/, bool resume, int32 state)
+{
+	if (!resume) {
+		sSuspendState = state;
+		return B_OK;
+	}
+	if (sSuspendState != ACPI_POWER_STATE_SLEEP_S3)
+		return B_OK;
+	sSuspendState = -1;
+
+	INFO("ps2: setting the controller and the devices up again after a "
+		"suspend to RAM\n");
+	ps2_flush();
+	ps2_setup_command_byte(false);
+	if (gActiveMultiplexingEnabled) {
+		bool enabled;
+		ps2_setup_active_multiplexing(&enabled);
+	}
+	ps2_setup_command_byte(true);
+	ps2_flush();
+
+	for (int i = 0; i < PS2_DEVICE_COUNT; i++) {
+		ps2_dev* dev = &ps2_device[i];
+		if (i == PS2_DEVICE_KEYB || !dev->active)
+			continue;
+		ps2_service_notify_device_republish(dev);
+	}
+	return B_OK;
+}
+
+
+/*!	The power hook is added by a thread of its own, not while the module
+	starts: the device manager's lock is held then by the thread that loads
+	the driver, which waits for the start to finish (both hung the boot).
+*/
+static status_t
+add_power_hook_thread(void* /*data*/)
+{
+	if (device_manager_add_power_hook_etc(&ps2_power_hook, NULL, "ps2",
+			DEVICE_MANAGER_POWER_HOOK_DEEP_SLEEP) == B_OK) {
+		sPowerHookAdded = true;
+	}
+	return B_OK;
+}
+
+
+void
+ps2_add_power_hook(void)
+{
+	sPowerHookThread = spawn_kernel_thread(&add_power_hook_thread,
+		"ps2 power hook", B_NORMAL_PRIORITY, NULL);
+	if (sPowerHookThread >= 0)
+		resume_thread(sPowerHookThread);
+}
+
+
 status_t
 ps2_init(void)
 {
@@ -475,6 +546,7 @@ ps2_init(void)
 	}
 
 	gSetupComplete = true;
+	ps2_add_power_hook();
 
 	TRACE("ps2: init done!\n");
 	return B_OK;
@@ -499,6 +571,12 @@ void
 ps2_uninit(void)
 {
 	TRACE("ps2: uninit\n");
+	if (sPowerHookThread >= 0) {
+		status_t result;
+		wait_for_thread(sPowerHookThread, &result);
+	}
+	if (sPowerHookAdded)
+		device_manager_remove_power_hook(&ps2_power_hook, NULL);
 	remove_io_interrupt_handler(INT_PS2_MOUSE,    &ps2_interrupt, NULL);
 	remove_io_interrupt_handler(INT_PS2_KEYBOARD, &ps2_interrupt, NULL);
 	ps2_service_exit();

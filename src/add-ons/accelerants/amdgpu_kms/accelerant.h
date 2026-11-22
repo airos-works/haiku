@@ -162,6 +162,7 @@ struct accelerant_info {
 	uint32*				cursorImage;	// what is in the cards' cursor
 										// buffers: video memory can be lost
 	uint32				vramLost;		// AMDGPU_INFO_VRAM_LOST_COUNTER
+	uint32				displayLost;	// DRM_HAIKU_IOCTL_DEVICE_INFO's
 	uint16				cursorHotX;
 	uint16				cursorHotY;
 	uint16				cursorX;

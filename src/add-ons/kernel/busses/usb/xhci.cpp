@@ -383,6 +383,8 @@ XHCI::XHCI(pci_info *info, 	pci_device_module_info* pci, pci_device* device, Sta
 		fCmdRingPhysical(0),
 		fPortsDisconnected(false),
 		fIdleSuspended(false),
+		fS3Suspended(false),
+		fResettingDevices(false),
 		fIdleKeptRunning(false),
 		fIdleHalted(false),
 		fIdleD3Allowed(false),
@@ -406,6 +408,7 @@ XHCI::XHCI(pci_info *info, 	pci_device_module_info* pci, pci_device* device, Sta
 		fSuppressedTransferErrors(0),
 		fLastTransferErrorCode(COMP_INVALID)
 {
+	memset(fPortLost, 0, sizeof(fPortLost));
 	B_INITIALIZE_SPINLOCK(&fSpinlock);
 	mutex_init(&fFinishedLock, "XHCI finished transfers");
 	mutex_init(&fEventLock, "XHCI event handler");
@@ -1054,11 +1057,18 @@ XHCI::Suspend(int32 state)
 		return _SuspendToIdle();
 	}
 
-	TRACE_ALWAYS("suspending\n");
+	// The controller loses its state while the system sleeps. The devices
+	// stay attached anyway: they are reset and set up again on resume
+	// (Linux' reset-resume), so that a disk with mounted volumes (the boot
+	// disk of a machine started from USB) comes back as the same device.
+	// Their endpoints are stopped with the transfers left queued.
+	int32 stopped = 0;
+	_StopEndpoints(stopped);
+	TRACE_ALWAYS("suspending, %" B_PRId32 " endpoints stopped\n", stopped);
 
-	fPortsDisconnected = true;
-	fStack->Explore();
-
+	for (uint8 i = 0; i < fPortCount; i++)
+		fPortLost[i] = false;
+	fS3Suspended = true;
 	return ControllerHalt();
 }
 
@@ -1075,9 +1085,14 @@ XHCI::Resume()
 
 	TRACE_ALWAYS("resuming\n");
 
+	// (the hub must not see the devices' ports change meanwhile)
+	fResettingDevices = fS3Suspended;
+
 	ControllerHalt();
-	if (ControllerReset() != B_OK)
+	if (ControllerReset() != B_OK) {
+		fResettingDevices = false;
 		return B_ERROR;
+	}
 
 	WriteOpReg(XHCI_CONFIG, fSlotCount);
 	WriteOpReg(XHCI_STS, ReadOpReg(XHCI_STS));
@@ -1116,8 +1131,306 @@ XHCI::Resume()
 	if (WaitOpBits(XHCI_STS, STS_HCH, 0) != B_OK)
 		TRACE_ERROR("HCH start up timeout after resume\n");
 
+	if (fS3Suspended) {
+		fS3Suspended = false;
+		_ResetResumeDevices();
+	}
+	fResettingDevices = false;
+
 	// let the hub explore connected devices again
 	fPortsDisconnected = false;
+	return B_OK;
+}
+
+
+void
+XHCI::_StopEndpoints(int32& stopped)
+{
+	for (int32 slot = 1; slot < XHCI_MAX_DEVICES; slot++) {
+		xhci_device* device = &fDevices[slot];
+		if (device->slot == 0)
+			continue;
+
+		for (int32 i = 0; i < XHCI_MAX_ENDPOINTS - 1; i++) {
+			xhci_endpoint* endpoint = &device->endpoints[i];
+			if (endpoint->trbs == NULL
+				|| _GetEndpointState(endpoint) != ENDPOINT_STATE_RUNNING) {
+				continue;
+			}
+			if (StopEndpoint(true, endpoint) == B_OK)
+				stopped++;
+		}
+	}
+}
+
+
+/*!	After S3 the controller was reset: every device that was attached to a
+	root port gets its old slot back and is reset, addressed and configured
+	again, its queued transfers continuing. Hubs and the devices behind
+	them, and devices that do not come back the same, are enumerated anew:
+	their ports report a connection change to the root hub.
+*/
+void
+XHCI::_ResetResumeDevices()
+{
+	bool used[XHCI_MAX_DEVICES] = {};
+	uint8 rootPort[XHCI_MAX_DEVICES] = {};
+	for (int32 slot = 1; slot < XHCI_MAX_DEVICES; slot++) {
+		xhci_device* device = &fDevices[slot];
+		if (device->slot == 0 || device->input_ctx == NULL)
+			continue;
+		used[slot] = true;
+		uint32 dwslot0 = _ReadContext(&device->input_ctx->slot.dwslot0);
+		uint32 port = SLOT_1_RH_PORT_GET(
+			_ReadContext(&device->input_ctx->slot.dwslot1));
+		rootPort[slot] = port;
+		// below a hub, or a hub: enumerated again
+		if (SLOT_0_ROUTE_GET(dwslot0) != 0 || (dwslot0 & SLOT_0_HUB_BIT) != 0
+			|| device->usb_device == NULL) {
+			rootPort[slot] = 0;
+			if (port >= 1 && port <= fPortCount)
+				fPortLost[port - 1] = true;
+		}
+	}
+
+	// The slots come back in order: the controller hands out the lowest
+	// free one. Those of no device are given back afterwards; those of a
+	// device that fails stay enabled until it is freed.
+	uint8 fillers[XHCI_MAX_DEVICES];
+	int32 fillerCount = 0;
+	int32 resumed = 0, lost = 0;
+	for (int32 slot = 1; slot < XHCI_MAX_DEVICES; slot++) {
+		if (!used[slot])
+			continue;
+
+		uint8 got = 0;
+		while (true) {
+			got = XHCI_MAX_SLOTS;
+			if (EnableSlot(&got) != B_OK || got == 0 || got > slot)
+				break;
+			if (got == slot)
+				break;
+			if (!used[got])
+				fillers[fillerCount++] = got;
+			// (a used slot below this one was set up or failed already)
+		}
+		if (got != slot) {
+			TRACE_ERROR("slot %" B_PRId32 " not given back (%u)\n", slot, got);
+			if (got != 0 && got <= fSlotCount && !used[got])
+				fillers[fillerCount++] = got;
+			for (int32 other = slot; other < XHCI_MAX_DEVICES; other++) {
+				if (used[other] && fDevices[other].input_ctx != NULL) {
+					uint32 port = SLOT_1_RH_PORT_GET(_ReadContext(
+						&fDevices[other].input_ctx->slot.dwslot1));
+					if (port >= 1 && port <= fPortCount)
+						fPortLost[port - 1] = true;
+				}
+			}
+			break;
+		}
+
+		xhci_device* device = &fDevices[slot];
+		uint8 port = rootPort[slot];
+		status_t status = port >= 1 && port <= fPortCount
+			? _ResetResumeDevice(device, port - 1) : B_DEV_NOT_READY;
+		if (status == B_OK) {
+			resumed++;
+		} else {
+			lost++;
+			uint32 rhPort = SLOT_1_RH_PORT_GET(
+				_ReadContext(&device->input_ctx->slot.dwslot1));
+			if (rhPort >= 1 && rhPort <= fPortCount)
+				fPortLost[rhPort - 1] = true;
+			TRACE_ALWAYS("slot %" B_PRId32 " (root port %" B_PRIu32 "): %s, "
+				"enumerating again\n", slot, rhPort, strerror(status));
+		}
+	}
+
+	for (int32 i = 0; i < fillerCount; i++)
+		DisableSlot(fillers[i]);
+
+	TRACE_ALWAYS("after S3: %" B_PRId32 " devices set up again, %" B_PRId32
+		" enumerated anew\n", resumed, lost);
+}
+
+
+
+
+status_t
+XHCI::_ResetResumeDevice(xhci_device* device, uint8 port)
+{
+	Device* usbDevice = device->usb_device;
+
+	// A device that was powered off in the sleep takes a moment to connect
+	// again (Linux waits for the ports to settle, too).
+	uint32 portStatus = ReadOpReg(XHCI_PORTSC(port));
+	for (int32 i = 0; i < 40 && (portStatus & PS_CCS) == 0; i++) {
+		snooze(50000);
+		portStatus = ReadOpReg(XHCI_PORTSC(port));
+	}
+	if ((portStatus & PS_CCS) == 0)
+		return B_DEV_NOT_READY;
+
+	// Reset the port: a USB 2 port is enabled by it; a SuperSpeed one trains
+	// by itself, or needs a warm reset.
+	bool superSpeed = fPortSpeeds[port] >= USB_SPEED_SUPERSPEED;
+	if (!superSpeed || (portStatus & PS_PED) == 0) {
+		WriteOpReg(XHCI_PORTSC(port), (portStatus & ~PS_CLEAR)
+			| (superSpeed ? PS_WPR : PS_PR));
+		for (int32 i = 0; i < 50; i++) {
+			snooze(5000);
+			portStatus = ReadOpReg(XHCI_PORTSC(port));
+			if ((portStatus & PS_PR) == 0 && (portStatus & PS_PED) != 0)
+				break;
+		}
+		snooze(USB_DELAY_PORT_RESET_RECOVERY);
+		portStatus = ReadOpReg(XHCI_PORTSC(port));
+	}
+	WriteOpReg(XHCI_PORTSC(port), (portStatus & ~PS_CLEAR) | PS_CSC | PS_PEC
+		| PS_WRC | PS_PRC | PS_PLC | PS_CEC);
+	if ((portStatus & PS_PED) == 0 || (portStatus & PS_CCS) == 0)
+		return B_DEV_NOT_READY;
+
+	// The rings start over; the transfers that were queued follow later.
+	DoublyLinkedList<xhci_td> queued[XHCI_MAX_ENDPOINTS - 1];
+	uint32 endpointFlags = 0;
+	for (int32 i = 0; i < XHCI_MAX_ENDPOINTS - 1; i++) {
+		xhci_endpoint* endpoint = &device->endpoints[i];
+		if (endpoint->trbs == NULL)
+			continue;
+		MutexLocker locker(endpoint->lock);
+		queued[i].TakeFrom(&endpoint->td_list);
+		memset(endpoint->trbs, 0, sizeof(xhci_trb) * XHCI_ENDPOINT_RING_SIZE);
+		endpoint->used = 0;
+		endpoint->next = 0;
+		endpoint->recovering = false;
+		if (i > 0)
+			endpointFlags |= 1 << (i + 1);
+	}
+
+	fDcba->baseAddress[device->slot] = device->device_ctx_addr;
+	memset(device->device_ctx, 0,
+		sizeof(*device->device_ctx) << fContextSizeShift);
+
+	// The input context as at the device's first addressing: the slot and
+	// EP0 only, one context entry; the endpoints come with Configure
+	// Endpoint below.
+	_WriteContext(&device->input_ctx->input.dropFlags, 0);
+	_WriteContext(&device->input_ctx->input.addFlags, 3);
+	uint32 dwslot0 = _ReadContext(&device->input_ctx->slot.dwslot0);
+	_WriteContext(&device->input_ctx->slot.dwslot0,
+		(dwslot0 & ~SLOT_0_NUM_ENTRIES(0x1f)) | SLOT_0_NUM_ENTRIES(1));
+	_WriteContext(&device->input_ctx->slot.dwslot3, 0);
+	xhci_trb trb;
+	trb.address = device->input_ctx_addr;
+	trb.status = 0;
+	trb.flags = TRB_3_TYPE(TRB_TYPE_ADDRESS_DEVICE) | TRB_3_SLOT(device->slot);
+	status_t status = DoCommand(&trb);
+	if (status != B_OK) {
+		// The completion code, then try it in two steps (BSR first), as Linux
+		// does for devices that want it.
+		uint8 code = TRB_2_COMP_CODE_GET(trb.status);
+		TRACE_ERROR("slot %u: address device after S3: %s (%u)\n",
+			device->slot, xhci_error_string(code), code);
+		memset(device->device_ctx, 0,
+			sizeof(*device->device_ctx) << fContextSizeShift);
+		_WriteContext(&device->input_ctx->input.dropFlags, 0);
+		_WriteContext(&device->input_ctx->input.addFlags, 3);
+		status = SetAddress(device->input_ctx_addr, true, device->slot);
+		if (status == B_OK) {
+			snooze(10000);
+			_WriteContext(&device->input_ctx->input.addFlags, 3);
+			trb.address = device->input_ctx_addr;
+			trb.status = 0;
+			trb.flags = TRB_3_TYPE(TRB_TYPE_ADDRESS_DEVICE)
+				| TRB_3_SLOT(device->slot);
+			status = DoCommand(&trb);
+		}
+		if (status != B_OK) {
+			return status;
+		}
+	}
+	device->address = SLOT_3_DEVICE_ADDRESS_GET(_ReadContext(
+		&device->device_ctx->slot.dwslot3));
+	snooze(USB_DELAY_SET_ADDRESS);
+
+	if (endpointFlags != 0) {
+		dwslot0 = _ReadContext(&device->input_ctx->slot.dwslot0);
+		_WriteContext(&device->input_ctx->slot.dwslot0,
+			(dwslot0 & ~SLOT_0_NUM_ENTRIES(0x1f))
+				| SLOT_0_NUM_ENTRIES(XHCI_MAX_ENDPOINTS - 1));
+		_WriteContext(&device->input_ctx->input.dropFlags, 0);
+		_WriteContext(&device->input_ctx->input.addFlags, endpointFlags | 1);
+		status = ConfigureEndpoint(device->input_ctx_addr, false,
+			device->slot);
+		if (status != B_OK)
+			return status;
+	}
+
+
+	// The same device?
+	usb_device_descriptor descriptor;
+	size_t actualLength = 0;
+	status = usbDevice->DefaultPipe()->SendRequest(
+		USB_REQTYPE_DEVICE_IN | USB_REQTYPE_STANDARD,
+		USB_REQUEST_GET_DESCRIPTOR, USB_DESCRIPTOR_DEVICE << 8, 0,
+		sizeof(descriptor), &descriptor, sizeof(descriptor), &actualLength);
+	const usb_device_descriptor* known = usbDevice->DeviceDescriptor();
+	if (status != B_OK || actualLength != sizeof(descriptor)
+		|| descriptor.vendor_id != known->vendor_id
+		|| descriptor.product_id != known->product_id) {
+		return status != B_OK ? status : B_DEV_NOT_READY;
+	}
+
+	const usb_configuration_info* configuration = usbDevice->Configuration();
+	if (configuration != NULL) {
+		status = usbDevice->DefaultPipe()->SendRequest(
+			USB_REQTYPE_DEVICE_OUT | USB_REQTYPE_STANDARD,
+			USB_REQUEST_SET_CONFIGURATION,
+			configuration->descr->configuration_value, 0, 0, NULL, 0, NULL);
+		if (status != B_OK)
+			return status;
+
+		for (size_t i = 0; i < configuration->interface_count; i++) {
+			const usb_interface_info* active
+				= configuration->interface[i].active;
+			if (active == NULL || active->descr->alternate_setting == 0)
+				continue;
+			usbDevice->DefaultPipe()->SendRequest(
+				USB_REQTYPE_INTERFACE_OUT | USB_REQTYPE_STANDARD,
+				USB_REQUEST_SET_INTERFACE, active->descr->alternate_setting,
+				active->descr->interface_number, 0, NULL, 0, NULL);
+		}
+	}
+
+
+	// the transfers that were queued go on
+	int32 requeued = 0;
+	for (int32 i = 0; i < XHCI_MAX_ENDPOINTS - 1; i++) {
+		while (xhci_td* td = queued[i].RemoveHead()) {
+			if (td->transfer == NULL) {
+				// cancelled meanwhile
+				FreeDescriptor(td);
+				continue;
+			}
+			if (_LinkDescriptorForPipe(td, &device->endpoints[i]) == B_OK) {
+				requeued++;
+				continue;
+			}
+			// could not be queued again: finished with an error
+			Transfer* transfer = td->transfer;
+			td->transfer = NULL;
+			FreeDescriptor(td);
+			if (transfer != NULL) {
+				transfer->Finished(B_DEV_NOT_READY, 0);
+				delete transfer;
+			}
+		}
+	}
+
+	TRACE_ALWAYS("slot %u (root port %u): set up again after S3, address %u, "
+		"%" B_PRId32 " transfers queued again\n", device->slot, port + 1,
+		device->address, requeued);
 	return B_OK;
 }
 
@@ -2916,6 +3229,7 @@ XHCI::AllocateDevice(Hub* parent, int8 hubAddress, uint8 hubPort, usb_speed spee
 	// otherwise happen when this Pipe object is destroyed.
 	pipe.SetControllerCookie(NULL);
 
+	device->usb_device = deviceObject;
 	deviceObject->RegisterNode();
 
 	TRACE("AllocateDevice() port %d slot %d\n", hubPort, slot);
@@ -3515,6 +3829,11 @@ XHCI::GetPortStatus(uint8 index, usb_port_status* status)
 		status->change = PORT_STATUS_CONNECTION;
 		return B_OK;
 	}
+	if (fResettingDevices) {
+		// the devices are set up again after S3: nothing the hub should
+		// act on yet (no change, and so no new device)
+		return B_OK;
+	}
 
 	if (_IsDisabledSuperSpeedPort(index))
 		return B_OK;
@@ -3554,7 +3873,7 @@ XHCI::GetPortStatus(uint8 index, usb_port_status* status)
 		status->status |= portStatus & PS_PLS_MASK;
 
 	// build the change
-	if (portStatus & PS_CSC)
+	if ((portStatus & PS_CSC) != 0 || fPortLost[index])
 		status->change |= PORT_STATUS_CONNECTION;
 	if (portStatus & PS_PEC)
 		status->change |= PORT_STATUS_ENABLE;
@@ -3680,6 +3999,7 @@ XHCI::ClearPortFeature(uint8 index, uint16 feature)
 			WriteOpReg(portRegister, portStatus & ~PS_PP);
 			break;
 		case C_PORT_CONNECTION:
+			fPortLost[index] = false;
 			WriteOpReg(portRegister, portStatus | PS_CSC);
 			break;
 		case C_PORT_ENABLE:

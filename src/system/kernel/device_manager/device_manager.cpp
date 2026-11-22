@@ -2865,10 +2865,29 @@ device_manager_suspend(int32 state, uint32 flags)
 /*!	Calls the resume hook of all initialized drivers, parents first, and then
 	the registered power hooks.
 */
+static int32 sResumeCount;
+static int32 sResumesFinished;
+
+
+uint32
+device_manager_resume_count(void)
+{
+	return (uint32)atomic_get(&sResumeCount);
+}
+
+
+uint32
+device_manager_resumes_finished(void)
+{
+	return (uint32)atomic_get(&sResumesFinished);
+}
+
+
 status_t
 device_manager_resume(uint32 flags)
 {
 	RecursiveLocker _(sLock);
+	atomic_add(&sResumeCount, 1);
 	if ((flags & DEVICE_MANAGER_SKIP_DEVICE_TREE) == 0)
 		resume_nodes();
 	sLightSleep = false;
@@ -2887,5 +2906,6 @@ device_manager_resume(uint32 flags)
 			strerror(status));
 	}
 
+	atomic_add(&sResumesFinished, 1);
 	return B_OK;
 }

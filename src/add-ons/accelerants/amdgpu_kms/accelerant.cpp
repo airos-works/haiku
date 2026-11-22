@@ -329,6 +329,8 @@ amdgpu_init_accelerant(int device)
 	}
 	if (gInfo->isAmdgpu)
 		Kms::VramLostCounter(device, gInfo->vramLost);
+	else
+		Kms::DisplayLostCounter(device, gInfo->displayLost);
 
 	SharedInfo* shared;
 	gInfo->sharedArea = create_area("amdgpu_kms shared info", (void**)&shared,
