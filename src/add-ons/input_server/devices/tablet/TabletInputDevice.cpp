@@ -306,6 +306,27 @@ TabletDevice::_ControlThread()
 			uint32 buttons = lastButtons ^ movements.buttons;
 			if (buttons != 0) {
 				bool pressedButton = (buttons & movements.buttons) > 0;
+
+				// A pen hovers to where it then presses; a finger on a touch
+				// screen is just there. app_server takes the position of a
+				// press from the last move, so the move goes first: else
+				// the press lands where the last finger was lifted.
+				if (pressedButton && (movements.xpos != lastXPosition
+						|| movements.ypos != lastYPosition)) {
+					BMessage* moved = _BuildMouseMessage(B_MOUSE_MOVED,
+						movements.timestamp, lastButtons, movements.xpos,
+						movements.ypos);
+					if (moved != NULL) {
+						moved->AddFloat("be:tablet_x", movements.xpos);
+						moved->AddFloat("be:tablet_y", movements.ypos);
+						moved->AddFloat("be:tablet_pressure", 0);
+						moved->AddInt32("be:tablet_eraser", eraser);
+						fTarget.EnqueueMessage(moved);
+						lastXPosition = movements.xpos;
+						lastYPosition = movements.ypos;
+					}
+				}
+
 				BMessage* message = _BuildMouseMessage(
 					pressedButton ? B_MOUSE_DOWN : B_MOUSE_UP,
 					movements.timestamp, movements.buttons, movements.xpos,

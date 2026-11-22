@@ -45,6 +45,7 @@ SYSTEM_APPS += [ FFilterByBuildFeatures
 	MediaConverter@ffmpeg
 	MediaPlayer
 	MidiPlayer@fluidlite
+	MobileShell
 	People
 	PoorMan
 	PowerStatus
@@ -57,7 +58,8 @@ SYSTEM_APPS += [ FFilterByBuildFeatures
 ] ;
 
 # air/OS: ActivityMonitor and MediaPlayer stay in the image without a menu
-# entry (airTime is the media player)
+# entry (airTime is the media player), and so does MobileShell: the tablet
+# mode starts it (docs/airos/MOBILE-SHELL.md)
 DESKBAR_APPLICATIONS += [ FFilterByBuildFeatures
 	HaikuDepot
 	Icon-O-Matic

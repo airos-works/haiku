@@ -521,6 +521,7 @@ AddSymlinkToPackage add-ons Tracker
 AddFilesToPackage add-ons input_server devices :
 	<input>bluetooth_le_mouse
 	<input>keyboard
+	<input>mobile_keyboard
 	<input>mouse
 	<input>tablet
 	<input>virtio
@@ -528,6 +529,7 @@ AddFilesToPackage add-ons input_server devices :
 	;
 AddFilesToPackage add-ons input_server filters :
 	accessibility_keys
+	mobile_touch
 	padblocker
 	screen_saver
 	shortcut_catcher

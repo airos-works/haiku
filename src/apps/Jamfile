@@ -34,6 +34,7 @@ HaikuSubInclude mandelbrot ;
 HaikuSubInclude mediaconverter ;
 HaikuSubInclude mediaplayer ;
 HaikuSubInclude midiplayer ;
+HaikuSubInclude mobileshell ;
 HaikuSubInclude musiccollection ;
 HaikuSubInclude networkstatus ;
 HaikuSubInclude overlayimage ;
