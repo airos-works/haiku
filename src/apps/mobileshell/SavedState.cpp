@@ -6,6 +6,8 @@
 
 #include "SavedState.h"
 
+#include <MobileKit.h>
+
 #include <Deskbar.h>
 #include <File.h>
 #include <FindDirectory.h>
@@ -86,6 +88,7 @@ SavedState::Load()
 		saved.team = window.GetInt32("team", -1);
 		saved.look = window.GetInt32("look", -1);
 		saved.frame = window.GetRect("frame", BRect());
+		saved.managed = window.GetBool("managed", true);
 		saved.wasMinimized = window.GetBool("minimized", false);
 		if (saved.token >= 0 && saved.frame.IsValid())
 			windows.push_back(saved);
@@ -114,6 +117,7 @@ SavedState::Save() const
 		window.AddInt32("look", saved.look);
 		window.AddRect("frame", saved.frame);
 		window.AddBool("minimized", saved.wasMinimized);
+		window.AddBool("managed", saved.managed);
 		state.AddMessage("window", &window);
 	}
 	for (const HiddenWindow& window : hidden) {
@@ -199,20 +203,28 @@ SavedState::Restore()
 			continue;
 		}
 
-		BMessage look(B_SET_PROPERTY);
-		look.AddSpecifier("Look");
-		look.AddInt32("data", saved->look >= 0 ? saved->look
-			: (int32)B_TITLED_WINDOW_LOOK);
-		messenger.SendMessage(&look, (BHandler*)NULL, kSendTimeout);
+		if (saved->managed) {
+			BMessage mode(BMobileKit::B_MOBILE_VIEW_CHANGED);
+			mode.AddBool("mobile", false);
+			messenger.SendMessage(&mode, (BHandler*)NULL, kSendTimeout);
 
-		BMessage frame(B_SET_PROPERTY);
-		frame.AddSpecifier("Frame");
-		frame.AddRect("data", saved->frame);
-		messenger.SendMessage(&frame, (BHandler*)NULL, kSendTimeout);
+			BMessage look(B_SET_PROPERTY);
+			look.AddSpecifier("Look");
+			look.AddInt32("data", saved->look >= 0 ? saved->look
+				: (int32)B_TITLED_WINDOW_LOOK);
+			messenger.SendMessage(&look, (BHandler*)NULL, kSendTimeout);
+
+			BMessage frame(B_SET_PROPERTY);
+			frame.AddSpecifier("Frame");
+			frame.AddRect("data", saved->frame);
+			messenger.SendMessage(&frame, (BHandler*)NULL, kSendTimeout);
+		}
 
 		// Going home minimized it; its owner had it open.
 		if (minimized && !saved->wasMinimized)
 			do_window_action(token, B_BRING_TO_FRONT, BRect(), false);
+		else if (!minimized && saved->wasMinimized)
+			do_window_action(token, B_MINIMIZE_WINDOW, BRect(), false);
 	}
 
 	team_id deskbarTeam = be_roster->TeamFor("application/x-vnd.Be-TSKB");

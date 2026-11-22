@@ -9,6 +9,8 @@
 
 #include "Protocol.h"
 
+#include <MobileKit.h>
+
 #include <InterfaceDefs.h>
 #include <Message.h>
 #include <Roster.h>
@@ -48,6 +50,38 @@ WindowTracker::WindowTracker(team_id self)
 
 
 bool
+WindowTracker::PrepareWindow(BMessenger target, BRect frame, int32 look)
+{
+	app_info app;
+	if (!frame.IsValid() || !fWorkArea.IsValid()
+		|| be_roster->GetRunningAppInfo(target.Team(), &app) != B_OK
+		|| !BMobileKit::SupportsMobileView(app.ref))
+		return false;
+
+	int32 count = 0;
+	int32* tokens = get_token_list(target.Team(), &count);
+	bool found = false;
+	for (int32 i = 0; tokens != NULL && i < count && !found; i++) {
+		client_window_info* info = get_window_info(tokens[i]);
+		if (info == NULL)
+			continue;
+		BMessenger messenger;
+		BMessenger::Private(messenger).SetTo(info->team, info->client_port,
+			info->client_token);
+		found = target == messenger;
+		if (found && fState.FindWindow(tokens[i], info->team) == NULL) {
+			SavedWindow saved = {tokens[i], info->team, look, frame, info->is_mini, true};
+			fState.windows.push_back(saved);
+			fState.Save();
+		}
+		free(info);
+	}
+	free(tokens);
+	return found;
+}
+
+
+bool
 WindowTracker::Update()
 {
 	int32* tokens = NULL;
@@ -70,10 +104,12 @@ WindowTracker::Update()
 		// Same test as the Deskbar's window menu, less our own windows and
 		// those of programs that run in the background (the Deskbar's own).
 		bool wanted = info->team != fSelf
-			&& info->feel == B_NORMAL_WINDOW_FEEL
 			&& info->show_hide_level <= 0
 			&& !fState.IsHidden(info->server_token)
-			&& !_IsBackground(info->team);
+			&& !_IsBackground(info->team)
+			&& (info->feel == B_NORMAL_WINDOW_FEEL
+				|| (info->feel == B_FLOATING_ALL_WINDOW_FEEL
+					&& _IsMobileFloating(*info)));
 		if (!wanted) {
 			free(info);
 			continue;
@@ -91,6 +127,12 @@ WindowTracker::Update()
 		} else {
 			window.token = info->server_token;
 			window.team = info->team;
+			app_info app;
+			if (be_roster->GetRunningAppInfo(window.team, &app) != B_OK) {
+				free(info);
+				continue;
+			}
+			window.mobile = BMobileKit::SupportsMobileView(app.ref);
 			window.fits = 0;
 			window.capped = false;
 			window.capWidth = window.capHeight = INFINITY;
@@ -122,8 +164,17 @@ WindowTracker::Update()
 		}
 
 		if (!window.adopted) {
-			if (_Adopt(window))
-				_Fit(window, true);
+			if (_Adopt(window)) {
+				if (window.mobile) {
+					BMessage mode(BMobileKit::B_MOBILE_VIEW_CHANGED);
+					mode.AddBool("mobile", true);
+					window.adopted = window.messenger.SendMessage(&mode,
+						(BHandler*)NULL, kSendTimeout) == B_OK;
+					if (window.adopted)
+						_Fit(window, true);
+				} else if (!window.minimized)
+					do_window_action(window.token, B_MINIMIZE_WINDOW, BRect(), false);
+			}
 		} else if (!window.minimized && window.frame != _TargetFrame(window))
 			_Fit(window, false);
 
@@ -156,6 +207,8 @@ WindowTracker::SetWorkArea(BRect area)
 		if (!window.adopted)
 			continue;
 		window.fits = 0;
+		window.capped = false;
+		window.capWidth = window.capHeight = INFINITY;
 		_Fit(window, true);
 	}
 }
@@ -175,7 +228,9 @@ WindowTracker::Front() const
 void
 WindowTracker::Activate(int32 token)
 {
-	do_window_action(token, B_BRING_TO_FRONT, BRect(), false);
+	TrackedWindow* window = _Find(token);
+	if (window != NULL && window->mobile)
+		do_window_action(token, B_BRING_TO_FRONT, BRect(), false);
 }
 
 
@@ -234,9 +289,9 @@ WindowTracker::_Adopt(TrackedWindow& window)
 	get.AddSpecifier("Look");
 	BMessage reply;
 	int32 look = -1;
-	if (window.messenger.SendMessage(&get, &reply, kLookTimeout, kLookTimeout)
+	if (window.mobile && (window.messenger.SendMessage(&get, &reply, kLookTimeout, kLookTimeout)
 			!= B_OK
-		|| reply.FindInt32("result", &look) != B_OK) {
+		|| reply.FindInt32("result", &look) != B_OK)) {
 		if (++window.lookTries < kMaxLookTries)
 			return false;
 		look = -1;
@@ -248,6 +303,7 @@ WindowTracker::_Adopt(TrackedWindow& window)
 	saved.look = look;
 	saved.frame = window.frame;
 	saved.wasMinimized = window.minimized;
+	saved.managed = window.mobile;
 	fState.windows.push_back(saved);
 	fState.Save();
 
@@ -259,7 +315,7 @@ WindowTracker::_Adopt(TrackedWindow& window)
 void
 WindowTracker::_Fit(TrackedWindow& window, bool force)
 {
-	if (!fWorkArea.IsValid() || (!force && window.fits >= kMaxFits))
+	if (!window.mobile || !fWorkArea.IsValid() || (!force && window.fits >= kMaxFits))
 		return;
 
 	window.fits++;
@@ -335,6 +391,31 @@ WindowTracker::_Prune()
 	}
 	if (pruned)
 		fState.Save();
+}
+
+
+bool
+WindowTracker::_IsMobileFloating(const client_window_info& info)
+{
+	auto known = fAuxiliary.find(info.server_token);
+	if (known != fAuxiliary.end() && known->second == info.team)
+		return false;
+	app_info app;
+	if (be_roster->GetRunningAppInfo(info.team, &app) != B_OK)
+		return false;
+	if (BMobileKit::SupportsMobileView(app.ref)) {
+		BMessenger window;
+		BMessenger::Private(window).SetTo(info.team, info.client_port, info.client_token);
+		BMessage query(BMobileKit::B_MOBILE_WINDOW_QUERY), reply;
+		if (window.SendMessage(&query, &reply, kSendTimeout, kSendTimeout) != B_OK)
+			return false;
+		if (reply.GetBool("primary", false))
+			return true;
+	}
+	if (fAuxiliary.size() > 512)
+		fAuxiliary.clear();
+	fAuxiliary[info.server_token] = info.team;
+	return false;
 }
 
 

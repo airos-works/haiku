@@ -43,6 +43,7 @@ private:
 	struct Card {
 		int32		token;
 		BString		title;
+		bool		mobile;
 		BBitmap*	icon;
 		BRect		frame;
 		BRect		previewFrame;
@@ -57,6 +58,9 @@ private:
 			// kept between openings, by window token
 			std::map<int32, BBitmap*> fPreviews;
 
+			int32				fPage;
+			int32				fPageSize;
+			BPoint			fDown;
 			int32				fPressed;
 			bool				fPressedClose;
 };

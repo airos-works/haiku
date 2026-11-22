@@ -11,6 +11,7 @@
 
 #include <Application.h>
 #include <Roster.h>
+#include <MobileKit.h>
 #include <Window.h>
 
 #include <algorithm>
@@ -106,9 +107,17 @@ ActionDrawerView::MouseUp(BPoint where)
 
 	switch (pressed) {
 		case kTileNetwork:
-			be_roster->Launch("application/x-vnd.Haiku-Network");
-			Close();
+		{
+			entry_ref ref;
+			if (be_roster->FindApp("application/x-vnd.Haiku-Network", &ref) == B_OK
+				&& BMobileKit::SupportsMobileView(ref)) {
+				BMessage launch(kMsgLaunch);
+				launch.AddRef("ref", &ref);
+				be_app->PostMessage(&launch);
+				Close();
+			}
 			break;
+		}
 		case kTileKeyboard:
 			be_app->PostMessage(kMsgToggleKeyboard);
 			Render();

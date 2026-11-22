@@ -28,6 +28,8 @@
 #include "Theme.h"
 #include "WindowTracker.h"
 
+#include <MobileKit.h>
+
 #include <Application.h>
 #include <MessageRunner.h>
 #include <Roster.h>
@@ -274,6 +276,19 @@ ShellApp::MessageReceived(BMessage* message)
 	}
 
 	switch (message->what) {
+		case 'mVpr':
+		{
+			BMessenger target;
+			BMessage reply(B_REPLY);
+			if (message->FindMessenger("window", &target) == B_OK
+				&& target.Team() == message->ReturnAddress().Team()
+				&& fTracker.PrepareWindow(target, message->GetRect("frame", BRect()),
+					message->GetInt32("look", B_TITLED_WINDOW_LOOK))) {
+				reply.AddRect("area", fTracker.WorkArea());
+			}
+			message->SendReply(&reply);
+			break;
+		}
 		case kMsgPulse:
 			fStatusBar->PostMessage(kMsgPulse, fStatusView);
 			fHome->PostMessage(kMsgPulse, fHome->View());
@@ -640,6 +655,9 @@ ShellApp::_HelloKeyboard()
 void
 ShellApp::_Launch(const entry_ref& ref)
 {
+	if (!BMobileKit::SupportsMobileView(ref))
+		return;
+
 	// Single-launch applications that already run: bring their newest
 	// window forward.
 	team_id team;

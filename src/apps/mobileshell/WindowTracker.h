@@ -10,12 +10,12 @@
 
 	app_server has no pluggable window manager, so the shell polls the
 	window list (the private calls the Deskbar uses) and, through each
-	window's scripting suite, makes every application window borderless and
+	window's scripting suite, makes mobile application windows borderless and
 	sizes it to the work area between the status bar and the navigation panel
 	(and the keyboard, when it is up). Windows that can't take that size,
 	fixed-size ones or ones whose application caps their size, keep theirs
-	and are centred, with a line around them. The task switcher and the navigation buttons work from
-	this list.
+	and are centred, with a line around them. Desktop-only windows stay in
+	the switcher with a close action.
 
 	What a window was like before is kept (SavedState) and put back by
 	RestoreDesktop(), as are the Deskbar's windows and Tracker's desktop,
@@ -45,11 +45,14 @@ struct TrackedWindow {
 	bool		capped;		// resizable, but its app won't let it fill the area
 	float		capWidth;	// ... beyond this size (INFINITY: that way it does)
 	float		capHeight;
+	bool		mobile;		// executable declares a Mobile Kit view
 	bool		adopted;	// what it was like is saved, and it's ours to size
 	int32		lookTries;	// how often it didn't say what it looks like
 	bool		seen;
 };
 
+
+struct client_window_info;
 
 class WindowTracker {
 public:
@@ -57,6 +60,8 @@ public:
 
 			// Polls app_server. Returns true when the list changed.
 			bool				Update();
+			bool				PrepareWindow(BMessenger target, BRect frame,
+									int32 look);
 
 			void				SetWorkArea(BRect area);
 			BRect				WorkArea() const { return fWorkArea; }
@@ -81,6 +86,8 @@ private:
 			TrackedWindow*		_Find(int32 token);
 			void				_Prune();
 			bool				_IsBackground(team_id team);
+			bool				_IsMobileFloating(const client_window_info& info);
+			std::map<int32, team_id> fAuxiliary;
 			void				_HideWindowsOf(const char* signature,
 									bool desktopOnly);
 

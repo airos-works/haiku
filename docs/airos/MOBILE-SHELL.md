@@ -38,10 +38,10 @@ does not list itself among the running applications.
 |---|---|---|
 | Status bar | `Panels.cpp` | Clock, network and battery. Tap it or pull it down for the action drawer. |
 | Navigation panel | `Panels.cpp` | Task switcher, home and close buttons; the keyboard's button on the right. Swiping up from it opens the task switcher. |
-| Home screen | `HomeScreen.cpp` | Clock, favourite applications and a dock over the desktop's own picture. Swipe up (or tap the chevron) for the drawer with every application and preferences panel; flick to scroll it, pull down to close it. |
+| Home screen | `HomeScreen.cpp` | Clock, favourite applications and a dock over the desktop's own picture. Swipe up (or tap the chevron) for the drawer with the applications and preferences panels declaring Mobile Kit support; flick to scroll it, pull down to close it. |
 | Action drawer | `ActionDrawer.cpp` | Date and time, and quick settings: Network, Keyboard, Screenshot, Settings (the preferences panels). |
-| Task switcher | `TaskSwitcher.cpp` | A card for every open window, with a picture of it: tap to switch, ✕ to close. |
-| Windows | `WindowTracker.cpp` | Every application window loses its border and fills the screen between the panels (above the keyboard while it is up). Windows that cannot be that size keep theirs, centred, with a line around them. |
+| Task switcher | `TaskSwitcher.cpp` | A card for every open window, with a picture of it: tap to switch, ✕ to close. Desktop-only windows have a labeled card and can be closed. Swipe horizontally for more cards. |
+| Windows | `WindowTracker.cpp` | Each supported application window loses its border and fills the screen between the panels (above the keyboard while it is up). Windows that cannot be that size keep theirs, centred, with a line around them. |
 | Edit menu | `EditMenu.cpp` | Cut, Copy, Paste, Select all and … over a selection a long press made (see below). The buttons type the shortcuts (Alt-X, -C, -V, -A) through the keyboard add-on, so they work in any application; … clicks the secondary button where the finger was held, for the application's own menu. A finger coming down elsewhere puts it away. |
 | Keyboard | `Keyboard.cpp`, `EmojiPanel.cpp`, `SwipeDecoder.cpp` | Comes up when a text field gets the focus and goes when it loses it. The globe key opens a menu of layouts: English; Terminal, with a row of Esc, Tab, Ctrl, Alt, Home, End and arrows; Corners, with symbols in the corners of the letter keys, typed by flicking a key towards one. Emoji in place of the letters. Swiping across the letters types a word. |
 
@@ -61,8 +61,10 @@ When it starts it
 
 - hides the Deskbar's windows and Tracker's desktop window, and shows its own
   home screen in the desktop's place;
-- takes every normal window of every application that is not a background
-  program: borderless, and sized to the work area.
+- switches supporting applications to their touch layouts and fits their windows to the work area;
+- minimizes desktop-only applications and keeps their cards in the switcher.
+
+The capability declaration, window callback and touch controls are described in [Mobile Kit](MOBILE-KIT.md).
 
 Before it changes a window it notes what the window looked like (its look, its
 frame, whether it was minimized). The notes are kept in memory and in
@@ -161,8 +163,7 @@ where the previous touch had ended.
   draws them ([COLOR-EMOJI.md](COLOR-EMOJI.md)).
 - No dictation: the microphone key is waiting for the Neural Kit's speech
   recognition ([NEURAL-KIT.md](NEURAL-KIT.md)).
-- The favourites and the dock are fixed lists of what is installed, and the
-  task switcher shows the first six windows (four on a tall screen).
+- The favourites and dock use a fixed order for installed mobile applications.
 - No list of notifications in the action drawer.
 - Only applications from the applications and preferences directories are
   listed (`AppList.cpp` is where another kind of application would be added).

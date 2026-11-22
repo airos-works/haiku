@@ -72,16 +72,16 @@ TaskSwitcherView::Open(const std::vector<TrackedWindow>& windows)
 		height = available - kGap;
 	int32 rows = std::max((int32)1, (int32)(available / (height + kGap)));
 
-	// No scrolling yet: windows past the grid are left out.
+	fPage = 0;
+	fPageSize = rows * columns;
 	bool front = true;
 	for (const TrackedWindow& window : windows) {
-		int32 index = fCards.size();
-		if (index >= rows * columns)
-			break;
+		int32 index = fCards.size() % fPageSize;
 
 		Card card;
 		card.token = window.token;
 		card.title = window.title;
+		card.mobile = window.mobile;
 		card.icon = NULL;
 		app_info info;
 		if (be_roster->GetRunningAppInfo(window.team, &info) == B_OK) {
@@ -110,7 +110,7 @@ TaskSwitcherView::Open(const std::vector<TrackedWindow>& windows)
 			area.left + floorf((area.Width() + 1 - previewWidth) / 2),
 			area.top + floorf((area.Height() + 1 - previewHeight) / 2));
 
-		if (!window.minimized) {
+		if (!window.minimized && (int32)fCards.size() < fPageSize) {
 			_TakePreview(window, card, front);
 			front = false;
 		}
@@ -197,7 +197,9 @@ void
 TaskSwitcherView::MouseDown(BPoint where)
 {
 	fPressed = -1;
-	for (size_t i = 0; i < fCards.size(); i++) {
+	fDown = where;
+	for (int32 i = fPage * fPageSize; i < (int32)fCards.size()
+		&& i < (fPage + 1) * fPageSize; i++) {
 		if (fCards[i].frame.Contains(where)) {
 			fPressed = i;
 			fPressedClose = _CloseFrame(fCards[i]).Contains(where);
@@ -213,28 +215,34 @@ TaskSwitcherView::MouseUp(BPoint where)
 {
 	int32 pressed = fPressed;
 	fPressed = -1;
+	int32 lastPage = fCards.empty() ? 0 : (fCards.size() - 1) / fPageSize;
+	float dx = where.x - fDown.x;
+	if (lastPage > 0 && (fabsf(dx) > S(48)
+		|| (where.y < kTop && fDown.y < kTop && where.x > Bounds().right - kGap - S(180)))) {
+		int step = fabsf(dx) > S(48) ? (dx < 0 ? 1 : -1)
+			: (where.x > Bounds().right - kGap - S(60) ? 1 : -1);
+		fPage = std::clamp(fPage + step, 0, lastPage);
+		Render();
+		return;
+	}
 	if (pressed < 0 || pressed >= (int32)fCards.size()
 		|| !fCards[pressed].frame.Contains(where)) {
 		Close();
 		return;
 	}
 
-	if (fPressedClose) {
+	if (fPressedClose && _CloseFrame(fCards[pressed]).Contains(where)) {
 		BMessage message(kMsgCloseWindow);
 		message.AddInt32("token", fCards[pressed].token);
 		be_app->PostMessage(&message);
-		delete fCards[pressed].icon;
-		fCards.erase(fCards.begin() + pressed);
-		if (fCards.empty())
-			Close();
-		else
-			Render();
-	} else {
+		Close();
+	} else if (!fPressedClose && fCards[pressed].mobile) {
 		BMessage message(kMsgActivateWindow);
 		message.AddInt32("token", fCards[pressed].token);
 		be_app->PostMessage(&message);
 		Close();
-	}
+	} else
+		Render();
 }
 
 
@@ -264,7 +272,15 @@ TaskSwitcherView::RenderContent(BView* view)
 		return;
 	}
 
-	for (size_t i = 0; i < fCards.size(); i++) {
+	if ((int32)fCards.size() > fPageSize) {
+		BString page;
+		page << "‹     " << fPage + 1 << " / "
+			<< (int32)((fCards.size() + fPageSize - 1) / fPageSize) << "     ›";
+		view->DrawString(page.String(), BPoint(bounds.right - kGap
+			- font.StringWidth(page.String()), kTop - S(28) + offset));
+	}
+	for (int32 i = fPage * fPageSize; i < (int32)fCards.size()
+		&& i < (fPage + 1) * fPageSize; i++) {
 		const Card& card = fCards[i];
 		BRect frame = card.frame.OffsetByCopy(0, offset);
 		view->SetHighColor((int32)i == fPressed && !fPressedClose
@@ -285,6 +301,19 @@ TaskSwitcherView::RenderContent(BView* view)
 			view->DrawBitmap(card.icon, icon);
 		}
 
+		if (!card.mobile) {
+			BFont badge(be_bold_font);
+			badge.SetSize(F(15));
+			view->SetFont(&badge);
+			const char* label = "Desktop only";
+			BRect strip(frame.left + S(8), frame.bottom - kTitleHeight - S(32),
+				frame.right - S(8), frame.bottom - kTitleHeight);
+			view->SetHighColor(Theme::kPanel);
+			view->FillRoundRect(strip, S(6), S(6));
+			view->SetHighColor(Theme::kWarning);
+			view->DrawString(label, BPoint(strip.left
+				+ (strip.Width() - badge.StringWidth(label)) / 2, strip.bottom - S(9)));
+		}
 		BFont title(be_plain_font);
 		title.SetSize(F(17));
 		BString text = card.title;

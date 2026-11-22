@@ -9,6 +9,8 @@
 
 #include "Theme.h"
 
+#include <MobileKit.h>
+
 #include <AppFileInfo.h>
 #include <Bitmap.h>
 #include <Directory.h>
@@ -149,8 +151,12 @@ AppList::_ScanDirectory(const char* path, bool preference)
 		if (is_hidden(signature) || FindBySignature(signature) != NULL)
 			continue;
 
+		entry_ref ref;
+		if (entry.GetRef(&ref) != B_OK || !BMobileKit::SupportsMobileView(ref))
+			continue;
+
 		AppEntry* app = new AppEntry;
-		entry.GetRef(&app->ref);
+		app->ref = ref;
 		app->signature = signature;
 		app->preference = preference;
 

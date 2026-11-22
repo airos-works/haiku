@@ -28,6 +28,7 @@ struct SavedWindow {
 	int32		look;			// -1: could not be asked
 	BRect		frame;
 	bool		wasMinimized;
+	bool		managed;		// the shell changed the look or frame
 };
 
 
