@@ -83,7 +83,7 @@ private:
 			void				_UpdateHoldArea();
 			void				_SendHoldArea(const mobile_hold_area& area);
 			void				_HelloKeyboard();
-			void				_Launch(const entry_ref& ref);
+			void				_Launch(entry_ref ref);
 			void				_HideOverlays();
 			bool				_OverlayShown();
 			void				_DismissEditMenu();
@@ -653,16 +653,21 @@ ShellApp::_HelloKeyboard()
 
 
 void
-ShellApp::_Launch(const entry_ref& ref)
+ShellApp::_Launch(entry_ref ref)
 {
 	if (!BMobileKit::SupportsMobileView(ref))
 		return;
 
-	// Single-launch applications that already run: bring their newest
-	// window forward.
-	team_id team;
-	if (be_roster->Launch(&ref, (BMessage*)NULL, &team) != B_ALREADY_RUNNING)
-		return;
+	// Prefer the running window even for multiple-launch applications,
+	// which may hand a second launch back to the original team.
+	team_id team = be_roster->TeamFor(&ref);
+	if (team < 0) {
+		if (be_roster->Launch(&ref) != B_ALREADY_RUNNING)
+			return;
+		team = be_roster->TeamFor(&ref);
+		if (team < 0)
+			return;
+	}
 	fTracker.Update();
 	for (const TrackedWindow& window : fTracker.Windows()) {
 		if (window.team == team) {
