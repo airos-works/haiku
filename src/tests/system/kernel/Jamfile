@@ -3,6 +3,8 @@ SubDir HAIKU_TOP src tests system kernel ;
 UsePrivateKernelHeaders ;
 UsePrivateHeaders shared ;
 
+SimpleTest thread_affinity_other : thread_affinity_other.cpp ;
+
 SimpleTest advisory_locking_test : advisory_locking_test.cpp ;
 
 SimpleTest fibo_load_image : fibo_load_image.cpp ;

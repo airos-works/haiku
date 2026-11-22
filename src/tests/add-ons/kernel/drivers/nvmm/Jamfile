@@ -23,3 +23,8 @@ SimpleTest libnvmm_hva_existing :
 	h_hva_existing.c
 	: libnvmm.so libbsd.so
 ;
+
+SimpleTest libnvmm_preempt_race :
+	h_preempt_race.c
+	: libnvmm.so libbsd.so
+;
