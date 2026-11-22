@@ -10,7 +10,10 @@
 #include <NetworkAddress.h>
 #include <ObjectList.h>
 #include <String.h>
+#include <OS.h>
 #include <SupportDefs.h>
+
+#include <set>
 
 
 class BServer;
@@ -28,6 +31,13 @@ public:
 
 			void				SetOnAC(bool onAC);
 			void				SetLidOpen(bool open);
+
+			void				SetPerformanceRequest(team_id team,
+									bool wanted);
+			void				TeamQuit(team_id team);
+				// while a team asks for it (a film playing), the scheduler
+				// stays in low latency mode even where the power source's
+				// profile says power saving
 
 			bool				JustWokeUp();
 				// a power button press right after sleeping woke the machine
@@ -110,6 +120,8 @@ private:
 			float				fACBrightness;
 				// what it was on AC, restored when plugged in again
 			bigtime_t			fWokeUp;
+
+			std::set<team_id>	fPerformanceTeams;
 };
 
 

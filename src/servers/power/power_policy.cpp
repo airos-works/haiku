@@ -403,9 +403,52 @@ PowerPolicy::JustWokeUp()
 
 
 void
+PowerPolicy::SetPerformanceRequest(team_id team, bool wanted)
+{
+	BAutolock _(fLock);
+	team_info info;
+	if (wanted && get_team_info(team, &info) != B_OK)
+		return;
+	size_t before = fPerformanceTeams.size();
+	// teams that died without the roster telling (it only knows
+	// applications)
+	for (std::set<team_id>::iterator it = fPerformanceTeams.begin();
+			it != fPerformanceTeams.end();) {
+		if (*it != team && get_team_info(*it, &info) != B_OK)
+			it = fPerformanceTeams.erase(it);
+		else
+			++it;
+	}
+	if (wanted)
+		fPerformanceTeams.insert(team);
+	else
+		fPerformanceTeams.erase(team);
+	if (fPerformanceTeams.size() == before)
+		return;
+	printf("power_daemon: team %" B_PRId32 " %s full performance (%zu asking)\n",
+		team, wanted ? "asks for" : "no longer needs", fPerformanceTeams.size());
+	if (fKnowSource)
+		_ApplyProfile();
+}
+
+
+void
+PowerPolicy::TeamQuit(team_id team)
+{
+	SetPerformanceRequest(team, false);
+}
+
+
+/*!	Power saving packs the threads onto fewer, slower cores: on a Gemini Lake
+	laptop a 4K film then played at 13 pictures a second instead of 24. A
+	team that asks for full performance (airTime while a film plays, see
+	power_daemon.cpp) keeps low latency mode until it stops asking or quits.
+*/
+void
 PowerPolicy::_ApplyProfile()
 {
-	bool powerSaving = fOnAC ? fPowerSavingOnAC : fPowerSavingOnBattery;
+	bool powerSaving = (fOnAC ? fPowerSavingOnAC : fPowerSavingOnBattery)
+		&& fPerformanceTeams.empty();
 	int32 mode = powerSaving
 		? SCHEDULER_MODE_POWER_SAVING : SCHEDULER_MODE_LOW_LATENCY;
 	if (get_scheduler_mode() != mode)

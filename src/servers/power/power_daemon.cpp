@@ -13,11 +13,19 @@
 #include "power_policy.h"
 #include "thermal_trip_monitor.h"
 
+#include <Roster.h>
 #include <Server.h>
 
 #include <PathMonitor.h>
 
 #include <map>
+
+
+/*!	A request for full performance while the sender's team needs it: bool
+	"performance" true or false; the team is the message's sender. The
+	daemon forgets it when the team quits. airTime asks while a film plays.
+*/
+static const uint32 kMsgPerformanceRequest = 'pwPR';
 
 
 class PowerManagementDaemon : public BServer {
@@ -81,6 +89,9 @@ PowerManagementDaemon::PowerManagementDaemon()
 	else
 		delete thermalMonitor;
 
+	// to forget the performance requests of teams that quit
+	be_roster->StartWatching(BMessenger(this), B_REQUEST_QUIT);
+
 	// the Power preferences change the settings file
 	const char* settingsPath = PowerPolicy::SettingsPath();
 	if (settingsPath != NULL) {
@@ -115,6 +126,20 @@ PowerManagementDaemon::MessageReceived(BMessage* message)
 {
 	if (message->what == B_PATH_MONITOR) {
 		fPolicy.LoadSettings();
+		return;
+	}
+	if (message->what == kMsgPerformanceRequest) {
+		team_id team = message->ReturnAddress().Team();
+		if (team >= 0) {
+			fPolicy.SetPerformanceRequest(team,
+				message->GetBool("performance", true));
+		}
+		return;
+	}
+	if (message->what == B_SOME_APP_QUIT) {
+		int32 team;
+		if (message->FindInt32("be:team", &team) == B_OK)
+			fPolicy.TeamQuit(team);
 		return;
 	}
 
