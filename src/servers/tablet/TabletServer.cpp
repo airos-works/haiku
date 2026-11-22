@@ -295,7 +295,10 @@ TabletServer::_Watch()
 				seen = 1;
 			} else
 				seen++;
-			up = seen >= 2 ? candidate : 0;
+			// Twice in a row; a mode that just changed takes the first
+			// reading (the hinge has been still for most of a second),
+			// so that what it does is not undone a moment later.
+			up = seen >= 2 || mode != lastMode ? candidate : 0;
 		} else
 			candidate = seen = 0;
 

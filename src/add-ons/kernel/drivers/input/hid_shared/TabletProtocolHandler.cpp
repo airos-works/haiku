@@ -97,6 +97,30 @@ TabletProtocolHandler::TabletProtocolHandler(HIDReport &report,
 }
 
 
+/*!	Whether the device has a touch screen or the pen of a display among its
+	application collections.
+*/
+static bool
+has_display_digitizer(HIDDevice &device)
+{
+	HIDCollection *root = device.Parser().RootCollection();
+	if (root == NULL)
+		return false;
+	uint32 count = root->CountChildrenFlat(COLLECTION_APPLICATION);
+	for (uint32 i = 0; i < count; i++) {
+		HIDCollection *collection = root->ChildAtFlat(COLLECTION_APPLICATION,
+			i);
+		if (collection != NULL
+			&& collection->UsagePage() == B_HID_USAGE_PAGE_DIGITIZER
+			&& (collection->UsageID() == B_HID_UID_DIG_TOUCH_SCREEN
+				|| collection->UsageID() == B_HID_UID_DIG_PEN)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+
 void
 TabletProtocolHandler::AddHandlers(HIDDevice &device, HIDCollection &collection,
 	ProtocolHandler *&handlerList)
@@ -117,6 +141,10 @@ TabletProtocolHandler::AddHandlers(HIDDevice &device, HIDCollection &collection,
 					// absolute. This is determined below by scanning the
 					// report items for absolute X and Y axis.
 					supported = true;
+					// A touch screen's own absolute "mouse" (what Windows'
+					// touch screens report in until they are switched to
+					// their multi-touch mode) is on the display too.
+					displayDigitizer = has_display_digitizer(device);
 					break;
 			}
 
