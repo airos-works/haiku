@@ -67,6 +67,55 @@ while the machine is not being shaken: a tablet held upright like a book says
 nothing about its hinge. The mode stays what it was until it can be measured
 again.
 
+## What the desktop does
+
+`tablet_server` (started at login, `src/servers/tablet`; it quits at once on
+a machine without `/dev/sensor/hinge/0`) follows the hinge and does what the
+Screen preferences say. Both settings only show there on a machine with the
+hinge sensor.
+
+- **Keep the screen upright in tent and tablet modes** (on by default).
+  Folded into a tent, the panel is upside down; a tablet is upside down
+  when it is held with the hinge at the top. In the stand, tent and tablet
+  modes the accelerometer behind the screen says which way up the screen
+  is, a few times a second (the screen's top must point at least 55% of the
+  way up or down, and further than to the side, twice in a row). While it
+  cannot tell, because the machine lies flat, a tent or a tablet is turned
+  and a stand is not. As a laptop the picture is always the right way.
+- **In tablet mode: Desktop** (the default) leaves the desktop as it is;
+  **air/OS Mobile (experimental)** starts `MobileShell`, the touch shell
+  ([MOBILE-SHELL.md](MOBILE-SHELL.md)), in its place while the machine is a
+  stand, a tent or a tablet, and quits it when it is a laptop again, which
+  puts the desktop and the windows back as they were.
+
+The settings are kept in `~/config/settings/tablet_mode`:
+
+```
+upright_rotation true
+tablet_view desktop     # or mobile
+```
+
+### How the picture is turned
+
+The display engine turns it as it scans the frame buffer out: nothing is
+drawn again, no window moves, and screenshots stay the right way round. The
+accelerant hook `B_SET_DISPLAY_OUTPUT_ROTATION` (0 or 180 degrees; outputs
+that can do it say so with `B_DISPLAY_OUTPUT_CAN_ROTATE`) sets the
+`rotation` property of the primary plane, and of the cursor's plane where
+it has one; `amdgpu_kms` has it, for `i915_drm` (the Yoga's Gemini Lake),
+`amdgpu_drm` and `nouveau_drm`. Where the cursor's plane cannot be turned
+(amdgpu's), app_server draws the cursor into the frame buffer instead.
+Programs turn a display with a display layout request
+(`BPrivate::set_display_layout()`) holding `"rotation"` (int32) and, for
+another display than the built-in panel, its `"id"`; the layout
+(`get_display_layout()`) reports `"can rotate"` and `"rotation"` per display.
+
+The touch screen turns with the panel. A HID digitizer that is part of a
+display (a touch screen, or the pen of one: the usages Touch Screen and
+Pen) says so (`MS_IS_DISPLAY_DIGITIZER`), and input_server places its
+touches on the built-in panel, the way up the panel is turned, instead of on
+the whole desktop around every monitor.
+
 ## For programs
 
 `headers/private/drivers/accelerometer.h` has the details.
@@ -91,14 +140,27 @@ report that mode whatever the hinge does, firmware included; `tabletmode --set
 auto` goes back to measuring. `tabletmode -a` also prints what the two
 accelerometers measure.
 
+What follows the mode can be tried on any machine: `tablet_server --hinge
+<file> [--display-accelerometer <file>]` reads the mode from a text file
+(`tablet 357`, as the device reads) and which way up the screen is from
+another (`x y z` in mg), instead of the devices. Quit the running one first
+(`hey application/x-vnd.airOS-tablet_server quit`).
+
 The arithmetic has a host test with made-up poses (folding back and forth
 with noisy sensors, a vertical hinge, shaking, the closed-or-folded-back
 question): `src/add-ons/kernel/drivers/sensor/bosch_accel/test/run.sh`.
 
 ## What it does not do (yet)
 
-- Nothing in the desktop reacts to the mode yet: no on-screen keyboard
-  appears, and the screen does not rotate with the tablet.
+- Only the two ways up of the panel: no portrait (90 and 270 degrees),
+  which would need the desktop laid out anew rather than the picture
+  turned. The on-screen keyboard comes with air/OS Mobile, not with the
+  desktop.
+- A touch screen is taken to be on the built-in panel; a touch monitor on
+  a laptop that has a built-in panel is mapped onto the panel.
+- The vertical blank flush cannot follow the scan of a panel shown upside
+  down (it runs from the bottom row up): it copies at the blank without
+  knowing where the scan is.
 - The system does not ignore the built-in keyboard and touchpad itself in the
   tablet modes; it leaves that to the embedded controller, which was told.
 - The sensors are not calibrated (the firmware keeps offsets for Windows'

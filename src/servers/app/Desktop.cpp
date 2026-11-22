@@ -4675,6 +4675,8 @@ Desktop::SetDisplayRotation(uint32 id, int32 degrees)
 	if (degrees != 0 && degrees != 180)
 		return B_BAD_VALUE;
 
+	// in the order SetDisplayLayout() takes them: no drawing meanwhile
+	AutoWriteLocker windowLocker(fWindowLock);
 	AutoWriteLocker screenLocker(fScreenLock);
 	Screen* screen = fVirtualScreen.ScreenAt(0);
 	if (screen == NULL || screen->HWInterface() == NULL)
