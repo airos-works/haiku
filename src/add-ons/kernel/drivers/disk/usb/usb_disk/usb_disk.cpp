@@ -20,6 +20,7 @@
 #include <string.h>
 
 #include <kernel.h>
+#include <kdevice_manager.h>
 #include <fs/devfs.h>
 #include <syscall_restart.h>
 #include <util/AutoLock.h>
@@ -571,10 +572,23 @@ usb_disk_operation(device_lun* lun, uint8* operation, size_t operationLength,
 	if (lun->device->is_ufi) {
 		return usb_disk_operation_interrupt(lun, operation,
 			data, dataLength, directionIn, _action);
-	} else {
-		return usb_disk_operation_bulk(lun, operation, operationLength,
+	}
+
+	size_t length = dataLength != NULL ? *dataLength : 0;
+	status_t result = usb_disk_operation_bulk(lun, operation, operationLength,
+		data, dataLength, directionIn, _action);
+	if (lun->resume_attention) {
+		// the device was reset by a system resume and only reported that:
+		// the same command again
+		lun->resume_attention = false;
+		if (dataLength != NULL)
+			*dataLength = length;
+		if (_action != NULL)
+			*_action = err_act_ok;
+		result = usb_disk_operation_bulk(lun, operation, operationLength,
 			data, dataLength, directionIn, _action);
 	}
+	return result;
 }
 
 
@@ -629,6 +643,37 @@ usb_disk_send_diagnostic(device_lun* lun)
 		TRACE("Send Diagnostic failed: %s\n", strerror(result));
 
 	return result;
+}
+
+
+/*!	Whether the medium still has the capacity the LUN knows. */
+static bool
+usb_disk_same_capacity(device_lun* lun)
+{
+	scsi_read_capacity_10_parameter parameter;
+	size_t dataLength = sizeof(parameter);
+	uint8 commandBlock[12];
+	memset(commandBlock, 0, sizeof(commandBlock));
+	commandBlock[0] = SCSI_READ_CAPACITY_10;
+	commandBlock[1] = lun->logical_unit_number << 5;
+
+	status_t result = B_ERROR;
+	for (int32 i = 0; i < 3 && result != B_OK; i++) {
+		dataLength = sizeof(parameter);
+		result = usb_disk_operation(lun, commandBlock, 10, &parameter,
+			&dataLength, true);
+	}
+	if (result != B_OK || dataLength != sizeof(parameter))
+		return false;
+
+	uint32 blockSize = B_BENDIAN_TO_HOST_INT32(parameter.logical_block_length);
+	uint32 lastBlock
+		= B_BENDIAN_TO_HOST_INT32(parameter.last_logical_block_address);
+	if (blockSize != lun->block_size)
+		return false;
+	if (lastBlock == 0xffffffff)
+		return lun->block_count > 0xffffffffULL;
+	return (uint64)lastBlock + 1 == lun->block_count;
 }
 
 
@@ -687,6 +732,24 @@ usb_disk_request_sense(device_lun* lun, err_act* _action)
 		lun->card_slot = true;
 		TRACE_ALWAYS("lun %" B_PRIu8 " reports no medium, it is a card slot\n",
 			lun->logical_unit_number);
+	}
+
+	if (status == B_DEV_MEDIA_CHANGED && lun->media_present
+		&& lun->block_count > 0
+		&& lun->resume_count != device_manager_resume_count()) {
+		// A system resume reset the device (a reset-resume after S3), and
+		// a card reader then says its medium may have changed. Like Linux'
+		// USB persist: the same capacity is taken for the same medium, so
+		// that the volume on it (the boot volume) stays mounted.
+		lun->resume_count = device_manager_resume_count();
+		if (usb_disk_same_capacity(lun)) {
+			TRACE_ALWAYS("lun %" B_PRIu8 ": the medium is the same after the "
+				"system resumed\n", lun->logical_unit_number);
+			lun->resume_attention = true;
+			if (_action != NULL)
+				*_action = err_act_retry;
+			return B_DEV_NOT_READY;
+		}
 	}
 
 	if (status == B_DEV_MEDIA_CHANGED) {
@@ -1211,6 +1274,8 @@ usb_disk_attach(device_node* node, usb_device newDevice, void** cookie)
 		lun->should_sync = false;
 		lun->media_present = true;
 		lun->media_changed = true;
+		lun->resume_count = device_manager_resume_count();
+		lun->resume_attention = false;
 		lun->card_slot = false;
 		lun->ejected = false;
 		lun->io_scheduler = NULL;

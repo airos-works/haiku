@@ -593,4 +593,37 @@ VramLostCounter(int fd, uint32& counter)
 }
 
 
+// DRM_HAIKU_IOCTL_DEVICE_INFO (the Linux driver ports' drm_haiku.h)
+struct drm_haiku_device_info {
+	uint32	minor;
+	uint32	node_type;
+	uint16	domain;
+	uint8	bus;
+	uint8	dev;
+	uint8	func;
+	uint8	revision_id;
+	uint16	vendor_id;
+	uint16	device_id;
+	uint16	subvendor_id;
+	uint16	subdevice_id;
+	uint32	class_code;
+	uint32	file_id[2];
+	uint32	display_lost;
+	uint32	reserved;
+};
+static const unsigned long kDrmHaikuIoctlDeviceInfo
+	= DRM_IOR(0xf2, struct drm_haiku_device_info);
+
+
+status_t
+DisplayLostCounter(int fd, uint32& counter)
+{
+	drm_haiku_device_info info = {};
+	status_t status = Ioctl(fd, kDrmHaikuIoctlDeviceInfo, &info);
+	if (status == B_OK)
+		counter = info.display_lost;
+	return status;
+}
+
+
 }	// namespace Kms

@@ -862,6 +862,106 @@ leave_sleep_state(uint8 state, bool prepare)
 }
 
 
+struct wake_walk_context {
+	uint8	state;
+	bool	enable;
+	int32	count;
+};
+
+
+static ACPI_STATUS
+enable_wake_device(ACPI_HANDLE handle, UINT32 /*level*/, void* _context,
+	void** /*returnValue*/)
+{
+	wake_walk_context* context = (wake_walk_context*)_context;
+
+	ACPI_DEVICE_INFO* info;
+	if (AcpiGetObjectInfo(handle, &info) != AE_OK)
+		return AE_OK;
+	bool wanted = false;
+	if ((info->Valid & ACPI_VALID_HID) != 0) {
+		const char* hid = info->HardwareId.String;
+		// the lid, the power button, the sleep button: what Linux lets
+		// wake the system by default
+		wanted = strcmp(hid, "PNP0C0D") == 0 || strcmp(hid, "PNP0C0C") == 0
+			|| strcmp(hid, "PNP0C0E") == 0;
+	}
+	AcpiOsFree(info);
+	if (!wanted)
+		return AE_OK;
+
+	ACPI_BUFFER buffer = { ACPI_ALLOCATE_BUFFER, NULL };
+	if (AcpiEvaluateObjectTyped(handle, (char*)"_PRW", NULL, &buffer,
+			ACPI_TYPE_PACKAGE) != AE_OK) {
+		return AE_OK;
+	}
+	ACPI_OBJECT* prw = (ACPI_OBJECT*)buffer.Pointer;
+	ACPI_HANDLE gpeDevice = NULL;
+	UINT32 gpeNumber = 0;
+	UINT64 deepest = 0;
+	bool valid = prw->Package.Count >= 2
+		&& prw->Package.Elements[1].Type == ACPI_TYPE_INTEGER;
+	if (valid) {
+		deepest = prw->Package.Elements[1].Integer.Value;
+		ACPI_OBJECT* gpe = &prw->Package.Elements[0];
+		if (gpe->Type == ACPI_TYPE_INTEGER) {
+			gpeNumber = gpe->Integer.Value;
+		} else if (gpe->Type == ACPI_TYPE_PACKAGE && gpe->Package.Count == 2
+			&& gpe->Package.Elements[0].Type == ACPI_TYPE_LOCAL_REFERENCE
+			&& gpe->Package.Elements[1].Type == ACPI_TYPE_INTEGER) {
+			gpeDevice = gpe->Package.Elements[0].Reference.Handle;
+			gpeNumber = gpe->Package.Elements[1].Integer.Value;
+		} else
+			valid = false;
+	}
+	AcpiOsFree(buffer.Pointer);
+	if (!valid || deepest < context->state)
+		return AE_OK;
+
+	if (context->enable) {
+		if (AcpiSetupGpeForWake(handle, gpeDevice, gpeNumber) != AE_OK)
+			return AE_OK;
+	}
+	AcpiSetGpeWakeMask(gpeDevice, gpeNumber,
+		context->enable ? ACPI_GPE_ENABLE : ACPI_GPE_DISABLE);
+
+	// _DSW(enable, target state, sleep state) or, older, _PSW(enable)
+	ACPI_OBJECT arguments[3];
+	arguments[0].Type = ACPI_TYPE_INTEGER;
+	arguments[0].Integer.Value = context->enable ? 1 : 0;
+	arguments[1].Type = ACPI_TYPE_INTEGER;
+	arguments[1].Integer.Value = context->state;
+	arguments[2].Type = ACPI_TYPE_INTEGER;
+	arguments[2].Integer.Value = 3;
+		// D3: the device's state while sleeping
+	ACPI_OBJECT_LIST list = { 3, arguments };
+	if (AcpiEvaluateObject(handle, (char*)"_DSW", &list, NULL) == AE_NOT_FOUND) {
+		list.Count = 1;
+		AcpiEvaluateObject(handle, (char*)"_PSW", &list, NULL);
+	}
+
+	char path[128];
+	ACPI_BUFFER pathBuffer = { sizeof(path), path };
+	if (AcpiGetName(handle, ACPI_FULL_PATHNAME, &pathBuffer) != AE_OK)
+		strlcpy(path, "?", sizeof(path));
+	dprintf("acpi: %s wakes from S%u: %s (GPE %#" B_PRIx32 ")\n", path,
+		context->state, context->enable ? "armed" : "disarmed",
+		(uint32)gpeNumber);
+	context->count++;
+	return AE_OK;
+}
+
+
+int32
+enable_wake_devices(uint8 state, bool enable)
+{
+	wake_walk_context context = { state, enable, 0 };
+	AcpiWalkNamespace(ACPI_TYPE_DEVICE, ACPI_ROOT_OBJECT, ACPI_UINT32_MAX,
+		&enable_wake_device, NULL, &context, NULL);
+	return context.count;
+}
+
+
 status_t
 reboot(void)
 {
@@ -957,5 +1057,6 @@ struct acpi_module_info gACPIModule = {
 	get_table,
 	read_bit_register,
 	write_bit_register,
-	leave_sleep_state
+	leave_sleep_state,
+	enable_wake_devices
 };

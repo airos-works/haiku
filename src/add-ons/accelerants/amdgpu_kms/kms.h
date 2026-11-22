@@ -136,6 +136,8 @@ status_t MoveCursor(int fd, uint32 crtc, int32 x, int32 y);
 // how often a GPU reset has lost the contents of video memory
 // (AMDGPU_INFO_VRAM_LOST_COUNTER)
 status_t VramLostCounter(int fd, uint32& counter);
+status_t DisplayLostCounter(int fd, uint32& counter);
+	// how often the display lost what it showed (i915_drm: suspends to RAM)
 
 
 }	// namespace Kms

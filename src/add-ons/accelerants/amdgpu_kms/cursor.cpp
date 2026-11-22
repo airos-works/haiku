@@ -147,6 +147,15 @@ amdgpu_wait_for_display_restore(bigtime_t timeout)
 			restore_cursor_image();
 			return B_OK;
 		}
+		if (!gInfo->isAmdgpu
+			&& Kms::DisplayLostCounter(gInfo->device, lost) == B_OK
+			&& lost != gInfo->displayLost) {
+			gInfo->displayLost = lost;
+			debug_printf("amdgpu_kms: the display lost its contents (suspend "
+				"to RAM); the screen is drawn again\n");
+			restore_cursor_image();
+			return B_OK;
+		}
 		snooze(100000);
 	} while (system_time() < end);
 	return B_TIMED_OUT;

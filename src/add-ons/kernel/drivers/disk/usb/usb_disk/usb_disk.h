@@ -80,6 +80,11 @@ struct device_lun_s {
 	// device information through read capacity/inquiry
 	bool			media_present;
 	bool			media_changed;
+	uint32			resume_count;
+		// device_manager_resume_count() when the medium was last known
+	bool			resume_attention;
+		// the command failed with the unit attention a system resume
+		// caused, and the medium is the same: it is sent again
 	uint64			block_count;
 	uint32			block_size;
 	uint32			physical_block_size;

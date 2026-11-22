@@ -37,6 +37,8 @@ public:
 			bool				CanInterrupt() const { return fCanInterrupt; }
 			status_t			Wait(bigtime_t timeout);
 			void				Mask();
+			void				Configure();
+				// again, after a suspend to RAM
 
 			uint32				Pin() const { return fPin; }
 			const char*			ControllerName() const;

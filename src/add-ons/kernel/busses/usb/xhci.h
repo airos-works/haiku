@@ -138,6 +138,9 @@ struct xhci_device {
 		// its driver wants its root port kept out of U3 in a suspend to idle
 	bool keep_running;
 		// its driver wants the whole bus left running in a suspend to idle
+
+	Device* usb_device;
+		// the stack's object, to set the device up again after S3
 };
 
 
@@ -191,6 +194,10 @@ private:
 			status_t			ControllerHalt();
 
 			// Suspend to idle
+			void				_StopEndpoints(int32& stopped);
+			void				_ResetResumeDevices();
+			status_t			_ResetResumeDevice(xhci_device* device,
+									uint8 port);
 			status_t			_SuspendToIdle();
 			status_t			_ResumeFromIdle();
 			status_t			_PowerDown();
@@ -350,6 +357,9 @@ private:
 			phys_addr_t			fCmdRingPhysical;
 			bool				fPortsDisconnected;
 			bool				fIdleSuspended;
+			bool				fS3Suspended;
+			bool				fResettingDevices;
+			bool				fPortLost[XHCI_MAX_PORTS];
 			bool				fIdleKeptRunning;
 				// transfers are refused and doorbells held back
 			bool				fIdleHalted;

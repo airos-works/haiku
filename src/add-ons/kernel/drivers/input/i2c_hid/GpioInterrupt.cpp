@@ -1093,6 +1093,13 @@ GpioInterrupt::Mask()
 }
 
 
+void
+GpioInterrupt::Configure()
+{
+	fController->Configure(this);
+}
+
+
 const char*
 GpioInterrupt::ControllerName() const
 {

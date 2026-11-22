@@ -682,6 +682,32 @@ rtc_disarm_alarm()
 }
 
 
+/*!	Arms the RTC alarm to wake the machine from S3 after \a seconds. */
+bool
+x86_suspend_arm_rtc_wake(acpi_module_info* acpi, uint32 seconds)
+{
+	sACPI = acpi;
+	atomic_set(&sAlarmFired, 0);
+	if (sACPI->install_fixed_event_handler(ACPI_EVENT_RTC, &rtc_alarm_event,
+			NULL) != B_OK) {
+		return false;
+	}
+	if (!rtc_arm_alarm(seconds)) {
+		sACPI->remove_fixed_event_handler(ACPI_EVENT_RTC, &rtc_alarm_event);
+		return false;
+	}
+	return true;
+}
+
+
+void
+x86_suspend_disarm_rtc_wake()
+{
+	rtc_disarm_alarm();
+	sACPI->remove_fixed_event_handler(ACPI_EVENT_RTC, &rtc_alarm_event);
+}
+
+
 static const uint32 kLidPollSeconds = 30;
 
 
