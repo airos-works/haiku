@@ -566,10 +566,12 @@ BTextView::MouseDown(BPoint where)
 
 	int32 modifiers = 0;
 	uint32 buttons = 0;
+	int32 clicks = 1;
 	BMessage* currentMessage = Window()->CurrentMessage();
 	if (currentMessage != NULL) {
 		currentMessage->FindInt32("modifiers", &modifiers);
 		currentMessage->FindInt32("buttons", (int32*)&buttons);
+		currentMessage->FindInt32("clicks", &clicks);
 	}
 
 	if (buttons == B_SECONDARY_MOUSE_BUTTON) {
@@ -592,6 +594,15 @@ BTextView::MouseDown(BPoint where)
 	bool multipleClick
 		= clickTime - fClickTime < clickSpeed
 			&& fLastClickOffset == fTrackingMouse->clickOffset;
+
+	if (!multipleClick && clicks >= 2 && !fTrackingMouse->shiftDown) {
+		// The press comes counted: a touch screen's long press is a double
+		// click on its own, without a first click to count from.
+		fLastClickOffset = fCaretOffset = fTrackingMouse->clickOffset;
+		Select(fTrackingMouse->clickOffset, fTrackingMouse->clickOffset);
+		fClickCount = std::min(clicks, (int32)3) - 1;
+		multipleClick = true;
+	}
 
 	fWhere = where;
 

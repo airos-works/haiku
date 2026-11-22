@@ -324,8 +324,12 @@ MouseFilter::Filter(BMessage* message, EventTarget** _target, int32* _viewToken,
 				float slop = message->GetBool("be:display_digitizer", false)
 					? 12 * 12 : 16;
 
+				// A touch screen's long press is a double click on its own
+				// (a first click would follow a link), and says so.
+				bool counted = message->GetBool("be:clicks_counted", false);
+
 				int32 clickCount = originalClickCount;
-				if (clickCount > 1) {
+				if (clickCount > 1 && !counted) {
 					if (modifiers != fLastClickModifiers
 						|| buttons != fLastClickButtons
 						|| !fLastClickTarget.IsValid()
@@ -343,8 +347,10 @@ MouseFilter::Filter(BMessage* message, EventTarget** _target, int32* _viewToken,
 					clickTarget);
 
 				// If the click target changed, always reset the click count.
-				if (clickCount != 1 && clickTarget != fLastClickTarget)
+				if (clickCount != 1 && clickTarget != fLastClickTarget
+					&& !counted) {
 					clickCount = 1;
+				}
 
 				// update our click count management attributes
 				fResetClickCount = originalClickCount - clickCount;

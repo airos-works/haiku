@@ -5497,6 +5497,21 @@ BView::MessageReceived(BMessage* message)
 				if (vertical != NULL)
 					message->FindFloat("be:wheel_delta_y", &deltaY);
 
+				// A finger on a touch screen says how far it moved: the
+				// view follows it to the pixel.
+				float pixelsX;
+				float pixelsY;
+				if (message->FindFloat("be:wheel_pixel_delta_x", &pixelsX)
+						== B_OK
+					&& message->FindFloat("be:wheel_pixel_delta_y", &pixelsY)
+						== B_OK) {
+					if (horizontal != NULL && pixelsX != 0.0f)
+						horizontal->SetValue(horizontal->Value() + pixelsX);
+					if (vertical != NULL && pixelsY != 0.0f)
+						vertical->SetValue(vertical->Value() + pixelsY);
+					break;
+				}
+
 				if (deltaX == 0.0f && deltaY == 0.0f)
 					break;
 

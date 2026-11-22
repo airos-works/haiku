@@ -33,7 +33,11 @@ enum input_pointing_device_subtype {
 };
 
 
-// "be:wheel_phase" of a B_MOUSE_WHEEL_CHANGED message from a touchpad
+// "be:wheel_phase" of a B_MOUSE_WHEEL_CHANGED message from a touchpad, or
+// from a finger on a touch screen in tablet mode. Such messages also have
+// "be:wheel_precise_delta_x/y", the scrolling in fractions of a step; a touch
+// screen's have "be:wheel_pixel_delta_x/y" too, the distance in pixels that
+// BView and BScrollBar then scroll by instead of the steps.
 enum input_wheel_phase {
 	B_WHEEL_PHASE_NONE		= 0,
 	B_WHEEL_PHASE_BEGAN		= 1,

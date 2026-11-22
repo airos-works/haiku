@@ -1,6 +1,7 @@
 SubDir HAIKU_TOP src servers tablet ;
 
 UsePrivateHeaders app drivers interface shared ;
+SubDirHdrs $(HAIKU_TOP) src apps mobileshell ;
 
 Application tablet_server :
 	TabletServer.cpp

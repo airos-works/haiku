@@ -6,6 +6,7 @@ UsePrivateSystemHeaders ;
 Application MobileShell :
 	ActionDrawer.cpp
 	AppList.cpp
+	EditMenu.cpp
 	EmojiPanel.cpp
 	Glyphs.cpp
 	HomeScreen.cpp

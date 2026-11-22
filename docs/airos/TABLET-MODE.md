@@ -82,7 +82,11 @@ hinge sensor.
   way up or down, and further than to the side, twice in a row). While it
   cannot tell, because the machine lies flat, a tent or a tablet is turned
   and a stand is not. As a laptop the picture is always the right way.
-- **In tablet mode: Desktop** (the default) leaves the desktop as it is;
+- **In tablet mode: Desktop** (the default) leaves the desktop as it is, but
+  for the touch screen: while the machine is folded, a finger that moves
+  scrolls what is under it and a long press is the secondary click, as in
+  the mobile shell (tablet_server hands the `mobile_touch` input_server
+  filter the whole screen; see [MOBILE-SHELL.md](MOBILE-SHELL.md));
   **air/OS Mobile (experimental)** starts `MobileShell`, the touch shell
   ([MOBILE-SHELL.md](MOBILE-SHELL.md)), in its place while the machine is a
   stand, a tent or a tablet, and quits it when it is a laptop again, which

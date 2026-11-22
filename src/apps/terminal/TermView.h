@@ -492,6 +492,8 @@ private:
 
 			// scrolling: rows scrolled back into the history
 			int32				fScrollRows;
+			// what a finger on a touch screen scrolled short of a row
+			float				fWheelPixels;
 			uint64				fLinesScrolled;
 			int32				fHistorySize;
 			int32				fScrBufSize;

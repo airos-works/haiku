@@ -555,6 +555,18 @@ BScrollBar::MessageReceived(BMessage* message)
 			// scrollbars, which a scrollbar itself does not have
 			float deltaX = 0.0f;
 			float deltaY = 0.0f;
+			// a finger on a touch screen: pixels, the bar's own way first
+			if (message->FindFloat("be:wheel_pixel_delta_x", &deltaX) == B_OK
+				&& message->FindFloat("be:wheel_pixel_delta_y", &deltaY)
+					== B_OK) {
+				float pixels = Orientation() == B_HORIZONTAL
+					? (deltaX != 0.0f ? deltaX : deltaY)
+					: (deltaY != 0.0f ? deltaY : deltaX);
+				if (pixels != 0.0f)
+					SetValue(Value() + pixels);
+				break;
+			}
+
 			message->FindFloat("be:wheel_delta_x", &deltaX);
 			message->FindFloat("be:wheel_delta_y", &deltaY);
 

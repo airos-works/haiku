@@ -19,6 +19,7 @@
 
 #include "ActionDrawer.h"
 #include "AppList.h"
+#include "EditMenu.h"
 #include "HomeScreen.h"
 #include "Keyboard.h"
 #include "Panels.h"
@@ -49,6 +50,9 @@ static const int32 kHousekeepingPolls = 10;
 // Terminal's view takes text without saying so (it isn't
 // B_INPUT_METHOD_AWARE), so it is known by its signature.
 static const char* kTerminalSignature = "application/x-vnd.Haiku-Terminal";
+// Tracker's windows are of icons, not text: a long press there is the
+// secondary click, as on its desktop.
+static const char* kTrackerSignature = "application/x-vnd.Be-TRAK";
 
 static volatile sig_atomic_t sQuitSignal = 0;
 
@@ -80,6 +84,7 @@ private:
 			void				_Launch(const entry_ref& ref);
 			void				_HideOverlays();
 			bool				_OverlayShown();
+			void				_DismissEditMenu();
 
 			AppList				fApps;
 			WindowTracker		fTracker;
@@ -97,12 +102,14 @@ private:
 			ActionDrawerView*	fDrawer;
 			OverlayWindow*		fTasksWindow;
 			TaskSwitcherView*	fTasks;
+			EditMenuWindow*		fEditMenu;
 
 			BMessageRunner*		fPulse;
 			BMessageRunner*		fTrackRunner;
 			int32				fPolls;
 			bool				fKeyboardShown;
 			mobile_hold_area	fHoldArea;	// as the touch filter has it
+			int32				fFrontToken;	// the window in front
 };
 
 
@@ -122,10 +129,12 @@ ShellApp::ShellApp()
 	fDrawer(NULL),
 	fTasksWindow(NULL),
 	fTasks(NULL),
+	fEditMenu(NULL),
 	fPulse(NULL),
 	fTrackRunner(NULL),
 	fPolls(0),
-	fKeyboardShown(false)
+	fKeyboardShown(false),
+	fFrontToken(-1)
 {
 	memset(&fHoldArea, 0, sizeof(fHoldArea));
 }
@@ -190,6 +199,8 @@ ShellApp::ReadyToRun()
 	fTasks = new TaskSwitcherView(fTasksWindow->Bounds());
 	fTasksWindow->AddChild(fTasks);
 
+	fEditMenu = new EditMenuWindow();
+
 	_LayoutWindows();
 
 	fStatusBar->Show();
@@ -201,6 +212,8 @@ ShellApp::ReadyToRun()
 	fDrawerWindow->Show();
 	fTasksWindow->Hide();
 	fTasksWindow->Show();
+	fEditMenu->Hide();
+	fEditMenu->Show();
 
 	fTracker.HideDesktop();
 	_UpdateWorkArea();
@@ -237,8 +250,8 @@ ShellApp::QuitRequested()
 
 		// The shell's windows go first, so that the desktop comes back
 		// from under them in one piece.
-		BWindow* windows[] = { fDrawerWindow, fTasksWindow, fKeyboard,
-			fStatusBar, fNavBar };
+		BWindow* windows[] = { fEditMenu, fDrawerWindow, fTasksWindow,
+			fKeyboard, fStatusBar, fNavBar };
 		for (BWindow* window : windows) {
 			if (window != NULL && window->Lock()) {
 				if (!window->IsHidden())
@@ -276,6 +289,15 @@ ShellApp::MessageReceived(BMessage* message)
 				_HelloKeyboard();
 			}
 			fTracker.Update();
+			{
+				// another window in front: the selection was the last one's
+				const TrackedWindow* front = fTracker.Front();
+				int32 token = front != NULL ? front->token : -1;
+				if (token != fFrontToken) {
+					fFrontToken = token;
+					_DismissEditMenu();
+				}
+			}
 			// No application on the screen, no keyboard: the windows that
 			// going home minimizes pass the focus along as they go, and the
 			// last word on it may have been a text field's.
@@ -291,8 +313,40 @@ ShellApp::MessageReceived(BMessage* message)
 			break;
 
 		case kMsgOverlayChanged:
+			_DismissEditMenu();
 			_UpdateHoldArea();
 			break;
+
+		case kMsgTouchBegan:
+		{
+			// From the touch filter: a finger came down on an application.
+			// Anywhere but on the edit menu, the menu goes.
+			BPoint where;
+			if (message->FindPoint("where", &where) != B_OK)
+				break;
+			if (fEditMenu->Lock()) {
+				bool on = !fEditMenu->IsHidden()
+					&& fEditMenu->Frame().Contains(where);
+				fEditMenu->Unlock();
+				if (!on)
+					_DismissEditMenu();
+			}
+			break;
+		}
+
+		case kMsgTouchSelected:
+		{
+			// A long press selected something: offer what to do with it.
+			BPoint where;
+			BPoint from;
+			if (message->FindPoint("where", &where) != B_OK
+				|| message->FindPoint("from", &from) != B_OK
+				|| _OverlayShown()) {
+				break;
+			}
+			fEditMenu->ShowAt(from, where, fTracker.WorkArea());
+			break;
+		}
 
 		case kMsgLaunch:
 		{
@@ -303,6 +357,7 @@ ShellApp::MessageReceived(BMessage* message)
 		}
 
 		case kMsgGoHome:
+			_DismissEditMenu();
 			_HideOverlays();
 			_SetKeyboard(false);
 			fTracker.MinimizeAll();
@@ -349,6 +404,7 @@ ShellApp::MessageReceived(BMessage* message)
 
 		case kMsgCloseActive:
 		{
+			_DismissEditMenu();
 			_HideOverlays();
 			fTracker.Update();
 			if (const TrackedWindow* front = fTracker.Front())
@@ -514,21 +570,29 @@ ShellApp::_UpdateWorkArea()
 }
 
 
-/*!	Tells the touch filter where a finger held still means a secondary
-	click: on the applications' windows, while one is up and nothing of the
-	shell's covers them.
+/*!	Tells the touch filter where fingers scroll and select: on the
+	applications' windows, while one is up and nothing of the shell's covers
+	them. A long press selects text, but in Tracker, whose windows are of
+	icons: there it is the secondary click.
 */
 void
 ShellApp::_UpdateHoldArea()
 {
 	mobile_hold_area area = {};
-	if (fTracker.Front() != NULL && !_OverlayShown()) {
+	const TrackedWindow* front = fTracker.Front();
+	if (front != NULL && !_OverlayShown()) {
 		BRect work = fTracker.WorkArea();
 		area.enabled = 1;
 		area.left = work.left;
 		area.top = work.top;
 		area.right = work.right;
 		area.bottom = work.bottom;
+		area.flags = kTouchScroll;
+		app_info info;
+		if (be_roster->GetRunningAppInfo(front->team, &info) != B_OK
+			|| strcmp(info.signature, kTrackerSignature) != 0) {
+			area.flags |= kTouchSelect;
+		}
 	}
 	if (memcmp(&area, &fHoldArea, sizeof(area)) != 0)
 		_SendHoldArea(area);
@@ -605,6 +669,14 @@ ShellApp::_HideOverlays()
 			fTasks->Close();
 		fTasksWindow->Unlock();
 	}
+}
+
+
+void
+ShellApp::_DismissEditMenu()
+{
+	if (fEditMenu != NULL)
+		fEditMenu->Dismiss();
 }
 
 

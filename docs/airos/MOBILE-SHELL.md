@@ -42,6 +42,7 @@ does not list itself among the running applications.
 | Action drawer | `ActionDrawer.cpp` | Date and time, and quick settings: Network, Keyboard, Screenshot, Settings (the preferences panels). |
 | Task switcher | `TaskSwitcher.cpp` | A card for every open window, with a picture of it: tap to switch, ✕ to close. |
 | Windows | `WindowTracker.cpp` | Every application window loses its border and fills the screen between the panels (above the keyboard while it is up). Windows that cannot be that size keep theirs, centred, with a line around them. |
+| Edit menu | `EditMenu.cpp` | Cut, Copy, Paste, Select all and … over a selection a long press made (see below). The buttons type the shortcuts (Alt-X, -C, -V, -A) through the keyboard add-on, so they work in any application; … clicks the secondary button where the finger was held, for the application's own menu. A finger coming down elsewhere puts it away. |
 | Keyboard | `Keyboard.cpp`, `EmojiPanel.cpp`, `SwipeDecoder.cpp` | Comes up when a text field gets the focus and goes when it loses it. The globe key opens a menu of layouts: English; Terminal, with a row of Esc, Tab, Ctrl, Alt, Home, End and arrows; Corners, with symbols in the corners of the letter keys, typed by flicking a key towards one. Emoji in place of the letters. Swiping across the letters types a word. |
 
 Sizes follow the system's font size, so the shell scales with the rest of
@@ -90,12 +91,29 @@ Both are in every image and do nothing until a running shell asks
   that said hello to it, and only the mobile shell may say hello. It also
   tells that shell when a text field gets or loses the focus, which
   input_server learns from the windows but tells no one else.
-- **`mobile_touch`** (`src/add-ons/input_server/filters/mobile_touch`) turns a
-  finger held still for half a second into a click of the secondary button
-  (context menus), inside the rectangle the shell gives it: the applications'
-  windows, not the shell's own panels and keyboard. It only looks at events of
-  touch screens and pens, only while the shell that asked is still running, and
-  passes everything else through untouched.
+- **`mobile_touch`** (`src/add-ons/input_server/filters/mobile_touch`) makes
+  a finger on the applications' windows work as on a phone, inside the
+  rectangle the shell gives it: the applications' windows, not the shell's
+  own panels and keyboard. It only looks at events of touch screens and pens,
+  only while the shell that asked is still running, and passes everything
+  else through untouched.
+  - A tap is a click (the release goes a moment after the press, for
+    menus that poll the buttons).
+  - A finger that moves scrolls what is under it instead of dragging or
+    selecting, following the finger to the pixel, and a flick glides on,
+    slowing down. A finger on a gliding page stops it without clicking. The
+    scrolling goes out as wheel events carrying the distance three ways: in
+    pixels (`be:wheel_pixel_delta_x/y`, which BView, BScrollBar and Terminal
+    follow exactly), in fractions of a step of 100 pixels with the
+    gesture's phase (`be:wheel_precise_delta_x/y`, `be:wheel_phase`, as from
+    a touchpad: Summit scrolls by those) and in whole steps for everything
+    else. A move mostly one way scrolls only that way.
+  - A finger held still for half a second selects the word under it: one
+    press, counted as a double click (`be:clicks_counted`, which app_server
+    keeps and BTextView takes), held down, so dragging on selects more,
+    word by word. When it lifts, the shell shows the edit menu over the
+    selection. Over Tracker's windows, whose contents are icons, a long
+    press is the secondary click (context menus) instead.
 
 One fix this needed is in the system rather than in the shell: the tablet
 device add-on now sends the pointer's move before a press that lands
@@ -105,8 +123,10 @@ where the previous touch had ended.
 
 ## Limits
 
-- Experimental. The first machine is the Lenovo Yoga 11e; so far it has been
-  tried in a virtual machine with a mouse standing in for the finger.
+- Experimental. The first machine is the Lenovo Yoga 11e, where folding,
+  taps and the keyboard have been tried with fingers; finger scrolling, the
+  long press and the edit menu so far in a virtual machine, with QEMU's
+  absolute pointer standing in for the finger.
 - Windows are opaque on this desktop, which costs the shell what a compositor
   would give it: the drawer and the task switcher dim a still picture of the
   screen rather than the live applications, the task switcher's cards are
@@ -120,6 +140,17 @@ where the previous touch had ended.
   Tracker window): taps on a touch screen are not counted as clicks by the
   HID driver, and app_server wants the second click within 4 pixels of the
   first.
+- Dragging scrolls everywhere on an application's window, so a finger
+  cannot drag a slider, a scroll bar's knob or a file: hold it still first,
+  and the drag that follows is a mouse's (it selects, in text).
+- A long press on a link in Summit selects the link's word, and when the
+  finger lifts where it was held the link is followed: WebKit clicks on any
+  release of the primary button over what was pressed. Lift after dragging
+  off it, or long-press beside it. (The phone way, a menu for the link,
+  needs Summit to know about touch.)
+- A long press on an item of a list (BListView and the like) is a double
+  click: it opens the item.
+- Selections have no handles to drag afterwards; long-press and drag again.
 - The keyboard follows text fields of native applications. Terminal does not
   announce its text view and is known by name; web pages in a browser do not
   announce theirs at all: use the keyboard button.

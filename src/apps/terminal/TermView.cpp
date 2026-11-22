@@ -651,6 +651,7 @@ TermView::_InitObject(const ShellParameters& shellParameters)
 	fCursorForeColor = fTextBackColor;
 	fCursorBackColor = fTextForeColor;
 	fScrollRows = 0;
+	fWheelPixels = 0;
 	fLinesScrolled = 0;
 	fHistorySize = 0;
 	fAutoScrollSpeed = 0;
@@ -5132,6 +5133,17 @@ TermView::MessageReceived(BMessage *message)
 					toWrite << stepString;
 
 				_WritePTY(toWrite.String(), toWrite.Length());
+			} else if (message->HasFloat("be:wheel_pixel_delta_y")) {
+				// A finger on a touch screen: the history follows it,
+				// row by row, keeping what falls short of a row for the
+				// next move (the scroll bar would snap it away).
+				fWheelPixels
+					+= message->GetFloat("be:wheel_pixel_delta_y", 0);
+				int32 rows = (int32)(fWheelPixels / fFontHeight);
+				if (rows != 0) {
+					fWheelPixels -= rows * fFontHeight;
+					_ScrollToRows(fScrollRows - rows);
+				}
 			} else {
 				// let the BView's implementation handle the standard
 				// scrolling

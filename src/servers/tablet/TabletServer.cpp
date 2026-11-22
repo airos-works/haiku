@@ -18,6 +18,10 @@
 	- starts air/OS Mobile (MobileShell, the touch shell) in place of the
 	  desktop while the keyboard is out of reach, and quits it when the
 	  machine is a laptop again, which puts the desktop back as it was.
+	- with the desktop kept instead, has the touch screen scroll it as the
+	  shell has it scroll its applications: while folded, it gives the
+	  mobile_touch input_server filter the whole screen (a long press there
+	  is the secondary click).
 
 	On a machine without a hinge sensor it quits at once.
 */
@@ -39,11 +43,14 @@
 #include <Message.h>
 #include <Messenger.h>
 #include <Roster.h>
+#include <Screen.h>
 #include <String.h>
 
 #include <accelerometer.h>
 #include <InterfacePrivate.h>
 #include <TabletModeSettings.h>
+
+#include "Protocol.h"
 
 
 static const uint32 kMsgState = 'TMst';
@@ -95,6 +102,7 @@ private:
 			void				_QuitShell();
 			void				_RestoreDesktop();
 			bool				_ShellRunning() const;
+			void				_SetDesktopTouch(bool on);
 
 			BString				fHingeFile;		// for tests: text files
 			BString				fAccelerometerFile;	// instead of devices
@@ -112,6 +120,7 @@ private:
 			bool				fShellQuitAsked;
 			team_id				fShellTeam;		// the shell started here
 			int32				fShellRestarts;
+			bool				fDesktopTouch;	// told the touch filter
 };
 
 
@@ -131,7 +140,8 @@ TabletServer::TabletServer(const char* hingeFile, const char* accelerometerFile)
 	fShellWanted(false),
 	fShellQuitAsked(false),
 	fShellTeam(-1),
-	fShellRestarts(0)
+	fShellRestarts(0),
+	fDesktopTouch(false)
 {
 }
 
@@ -189,6 +199,7 @@ TabletServer::QuitRequested()
 		fWatchThread = -1;
 	}
 	be_roster->StopWatching(be_app_messenger);
+	_SetDesktopTouch(false);
 	return true;
 }
 
@@ -444,10 +455,40 @@ TabletServer::_Update()
 	if (wanted && !fShellWanted)
 		fShellRestarts = 0;
 	fShellWanted = wanted;
+	// the shell looks after the touch screen itself
+	_SetDesktopTouch(folded && !wanted);
 	if (wanted && !_ShellRunning())
 		_StartShell();
 	else if (!wanted && _ShellRunning())
 		_QuitShell();
+}
+
+
+/*!	Has the touch screen scroll the desktop ( on), or not any more. */
+void
+TabletServer::_SetDesktopTouch(bool on)
+{
+	if (on == fDesktopTouch)
+		return;
+
+	port_id port = find_port(MOBILE_TOUCH_PORT);
+	if (port < 0)
+		return;
+
+	mobile_hold_area area = {};
+	if (on) {
+		BRect frame = BScreen().Frame();
+		area.enabled = 1;
+		area.left = frame.left;
+		area.top = frame.top;
+		area.right = frame.right;
+		area.bottom = frame.bottom;
+		area.flags = kTouchScroll;
+	}
+	if (write_port_etc(port, kMobileHoldArea, &area, sizeof(area),
+			B_RELATIVE_TIMEOUT, 100000) == B_OK) {
+		fDesktopTouch = on;
+	}
 }
 
 
