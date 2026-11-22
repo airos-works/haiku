@@ -43,6 +43,8 @@ struct ServerRemoteDevice
 		// the current link was asked for here
 	uint8				auth_retries;
 		// of the current link, after collisions
+	bool				key_used = false;
+		// the stored link key authenticated the current link
 
 	uint16				handle;
 	RemoteDevice::ConnectionState			conn_state;

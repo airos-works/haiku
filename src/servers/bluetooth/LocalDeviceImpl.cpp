@@ -1718,8 +1718,13 @@ LocalDeviceImpl::ConnectionRequest(struct hci_ev_conn_request* event,
 		if (!known)
 			AddRemoteDevice(serverRd);
 
-		// Keep ourselves as slave
-		command = buildAcceptConnectionRequest(event->bdaddr, 0x01 , &size);
+		// Become the master (0x00), as Linux and macOS do for HID devices.
+		// A keyboard that reconnects on its own pages us and would stay the
+		// master: its link then shares the radio with our page and LE scans
+		// as a slave's, and an Apple A1016's reports came every 500 ms
+		// (repeats and lost keys). A device that refuses the switch keeps
+		// the roles as they are; the connection goes on.
+		command = buildAcceptConnectionRequest(event->bdaddr, 0x00, &size);
 
 		BMessage* newrequest = new BMessage;
 		newrequest->AddInt16("eventExpected", HCI_EVENT_CMD_STATUS);
@@ -2060,6 +2065,7 @@ LocalDeviceImpl::DisconnectionComplete(hci_ev_disconnection_complete_reply* even
 		rd->handle = 0xffff;
 		rd->outgoing = false;
 		rd->encryption_enabled = 0;
+		rd->key_used = false;
 		((BluetoothServer*)be_app)->GetHIDHost()->LinkDown(rd->bdaddr);
 	}
 
@@ -2084,6 +2090,10 @@ void
 LocalDeviceImpl::RoleChange(hci_ev_role_change* event, BMessage* request)
 {
 	// TODO: we shall update the RemoteDevice
+	CLASSIC_LOG(event->status == BT_OK ? LE_LOG_INFO : LE_LOG_ERROR,
+		"role on the link to %s: %s (status %#x)",
+		bdaddrUtils::ToString(event->bdaddr).String(),
+		event->role == 0 ? "master" : "slave", event->status);
 	TRACE_BT("LocalDeviceImpl: %s: Address %s role=%d status=%d\n", __FUNCTION__,
 		bdaddrUtils::ToString(event->bdaddr).String(), event->role, event->status);
 }
@@ -2138,6 +2148,8 @@ LocalDeviceImpl::LinkKeyRequested(struct hci_ev_link_key_req* keyRequested,
 	CLASSIC_LOG(LE_LOG_INFO, "link key for %s requested: %s",
 		bdaddrUtils::ToString(keyRequested->bdaddr).String(),
 		haveKey ? "stored" : "none, pairing");
+	if (haveKey)
+		rd->key_used = true;
 	if (!haveKey) {
 		BluetoothCommand<typed_command(hci_cp_link_key_neg_reply)>
 			linkKeyNegativeReply(OGF_LINK_CONTROL, OCF_LINK_KEY_NEG_REPLY);
@@ -2357,6 +2369,21 @@ LocalDeviceImpl::SecureLink(const bdaddr_t& address, int32 attempt)
 	if (rd == NULL || rd->conn_state != RemoteDevice::CONNECTED
 		|| rd->encryption_enabled != 0)
 		return;
+	if (attempt == 0 && rd->key_used) {
+		// The device authenticated the link with our stored key while it
+		// connected (it asked for the key): only encryption is missing.
+		// Asking to authenticate again is what Linux does not do, and some
+		// keyboards (Apple's A1016) never answer it: the request times
+		// out and the link is dropped. If encryption fails, the next check
+		// authenticates.
+		CLASSIC_LOG(LE_LOG_INFO, "link %#x to %s is authenticated but not "
+			"encrypted: turning encryption on", rd->handle,
+			bdaddrUtils::ToString(address).String());
+		SetConnEncryption(rd->handle, true);
+		((BluetoothServer*)be_app)->CheckLinkSecurityLater(GetID(), address,
+			attempt + 1);
+		return;
+	}
 	CLASSIC_LOG(LE_LOG_INFO, "link %#x to %s is not encrypted yet: "
 		"authenticating (attempt %" B_PRId32 ")", rd->handle,
 		bdaddrUtils::ToString(address).String(), attempt + 1);
