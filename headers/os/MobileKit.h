@@ -345,6 +345,15 @@ struct Skin {
 
 namespace Detail {
 
+// "be:wheel_phase" (input_wheel_phase in Input.h, which older SDKs lack).
+enum {
+	kWheelPhaseNone = 0,
+	kWheelPhaseBegan = 1,
+	kWheelPhaseChanged = 2,
+	kWheelPhaseEnded = 3
+};
+
+
 inline rgb_color
 MakeColor(uint8 red, uint8 green, uint8 blue, uint8 alpha = 255)
 {
@@ -1569,14 +1578,7 @@ public:
 		int32 part = fPressed;
 		fPressed = -1;
 		if (part == B_DISPLAY_SEEK) {
-			float fraction = _Fraction(where);
-			fScrub = -1;
-			fPosition = (bigtime_t)(fraction * fDuration);
-			Invalidate();
-			BMessage extra;
-			extra.AddFloat("fraction", fraction);
-			extra.AddInt64("position", fPosition);
-			_Send(B_DISPLAY_SEEK, &extra);
+			_Seek(_Fraction(where));
 			return;
 		}
 		BRect area = part == B_DISPLAY_ARTWORK ? fArt
@@ -1585,7 +1587,57 @@ public:
 			_Send((Part)part, NULL);
 	}
 
+	// A finger dragged along the scrubber. On a touch screen in tablet mode
+	// a drag arrives as scrolling, in pixels ("be:wheel_pixel_delta_x"), and
+	// never as a press: the playhead follows the finger from where it was,
+	// and the seek goes when the finger lifts.
+	virtual void MessageReceived(BMessage* message)
+	{
+		float pixelsX, pixelsY;
+		if (message->what != B_MOUSE_WHEEL_CHANGED
+			|| message->FindFloat("be:wheel_pixel_delta_x", &pixelsX) != B_OK
+			|| message->FindFloat("be:wheel_pixel_delta_y", &pixelsY) != B_OK) {
+			BView::MessageReceived(message);
+			return;
+		}
+		int32 phase = message->GetInt32("be:wheel_phase",
+			Detail::kWheelPhaseNone);
+		if (fScrub < 0) {
+			// only a drag that starts on the scrubber
+			BPoint where;
+			uint32 buttons;
+			GetMouse(&where, &buttons, false);
+			_Layout();
+			if (phase == Detail::kWheelPhaseEnded || fDuration <= 0
+				|| fTitle.IsEmpty()
+				|| !fTrack.InsetByCopy(-4, -6).Contains(where)) {
+				return;
+			}
+			fScrub = fmaxf(0.0f, fminf(1.0f, (float)fPosition / fDuration));
+		}
+		if (fTrack.Width() > 0) {
+			fScrub = fmaxf(0.0f, fminf(1.0f,
+				fScrub - pixelsX / fTrack.Width()));
+		}
+		Invalidate();
+		if (phase == Detail::kWheelPhaseEnded
+			|| phase == Detail::kWheelPhaseNone) {
+			_Seek(fScrub);
+		}
+	}
+
 private:
+	void _Seek(float fraction)
+	{
+		fScrub = -1;
+		fPosition = (bigtime_t)(fraction * fDuration);
+		Invalidate();
+		BMessage extra;
+		extra.AddFloat("fraction", fraction);
+		extra.AddInt64("position", fPosition);
+		_Send(B_DISPLAY_SEEK, &extra);
+	}
+
 	void _Layout()
 	{
 		BRect bounds = Bounds();
@@ -1725,7 +1777,8 @@ public:
 			| B_FULL_UPDATE_ON_RESIZE),
 		fModification(NULL),
 		fSpeakers(speakers),
-		fTracking(false)
+		fTracking(false),
+		fDragValue(0)
 	{
 		SetViewColor(B_TRANSPARENT_COLOR);
 	}
@@ -1832,6 +1885,48 @@ public:
 		Invoke();
 	}
 
+	// A finger dragged along the slider. On a touch screen in tablet mode a
+	// drag arrives as scrolling, in pixels ("be:wheel_pixel_delta_x"), and
+	// never as a press: the knob follows the finger from where it was, the
+	// modification message goes as it moves and the control's message when
+	// the finger lifts. A mouse wheel moves the knob a step a notch.
+	virtual void MessageReceived(BMessage* message)
+	{
+		if (message->what != B_MOUSE_WHEEL_CHANGED || !IsEnabled()) {
+			BControl::MessageReceived(message);
+			return;
+		}
+		float pixelsX, pixelsY;
+		if (message->FindFloat("be:wheel_pixel_delta_x", &pixelsX) == B_OK
+			&& message->FindFloat("be:wheel_pixel_delta_y", &pixelsY) == B_OK) {
+			int32 phase = message->GetInt32("be:wheel_phase",
+				Detail::kWheelPhaseNone);
+			if (!fTracking) {
+				fTracking = true;
+				fDragValue = Value();
+			}
+			BRect track = _Track();
+			if (track.Width() > 0)
+				fDragValue -= pixelsX / track.Width() * 1000;
+			fDragValue = fmaxf(0.0f, fminf(1000.0f, fDragValue));
+			_SetTracked((int32)roundf(fDragValue));
+			if (phase == Detail::kWheelPhaseEnded
+				|| phase == Detail::kWheelPhaseNone) {
+				fTracking = false;
+				Invoke();
+			}
+			return;
+		}
+		float delta = message->GetFloat("be:wheel_delta_y", 0);
+		if (delta == 0)
+			delta = message->GetFloat("be:wheel_delta_x", 0);
+		if (delta != 0) {
+			SetValue(std::max((int32)0, std::min((int32)1000,
+				Value() - (int32)roundf(delta * 50))));
+			Invoke();
+		}
+	}
+
 	virtual void KeyDown(const char* bytes, int32 numBytes)
 	{
 		if (numBytes == 1 && (bytes[0] == B_LEFT_ARROW
@@ -1859,7 +1954,11 @@ private:
 		BRect track = _Track();
 		float fraction = track.Width() > 0
 			? (where.x - track.left) / track.Width() : 0;
-		int32 value = (int32)roundf(fmaxf(0.0f, fminf(1.0f, fraction)) * 1000);
+		_SetTracked((int32)roundf(fmaxf(0.0f, fminf(1.0f, fraction)) * 1000));
+	}
+
+	void _SetTracked(int32 value)
+	{
 		if (value == Value())
 			return;
 		SetValue(value);
@@ -1873,6 +1972,7 @@ private:
 	BMessage* fModification;
 	bool fSpeakers;
 	bool fTracking;
+	float fDragValue;
 };
 
 
