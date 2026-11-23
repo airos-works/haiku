@@ -1515,22 +1515,10 @@ public:
 			none);
 		DrawCentered(this, remaining.String(), fRemaining,
 			skin.displaySecondary, none);
-		// the groove, the part played and the playhead
-		BRect groove(fTrack.left, floorf((fTrack.top + fTrack.bottom) / 2) - 2,
-			fTrack.right, floorf((fTrack.top + fTrack.bottom) / 2) + 2);
-		FillGradient(this, groove, skin.trackTop, skin.trackBottom, 2);
-		float fraction = fmaxf(0.0f, fminf(1.0f, (float)shown / fDuration));
-		float x = roundf(groove.left + fraction * groove.Width());
-		if (x > groove.left + 1) {
-			BRect played(groove.left, groove.top, x, groove.bottom);
-			SetHighColor(skin.trackFill);
-			FillRoundRect(played, 2, 2);
-		}
-		BRect head(x - 1, fTrack.top + 1, x + 1, fTrack.bottom - 1);
-		SetHighColor(MixColors(skin.playhead, skin.displayBorder, 0.4f));
-		FillRect(head.InsetByCopy(-1, 0));
-		SetHighColor(skin.playhead);
-		FillRect(head);
+		PushState();
+		DrawScrubber(fTrack, fmaxf(0.0f, fminf(1.0f,
+			(float)shown / fDuration)));
+		PopState();
 		if (fControls) {
 			rgb_color off = skin.displaySecondary;
 			off.alpha = 150;
@@ -1624,6 +1612,29 @@ public:
 			|| phase == Detail::kWheelPhaseNone) {
 			_Seek(fScrub);
 		}
+	}
+
+protected:
+	// Draws the scrubber in track, played to fraction (0 to 1): a groove with
+	// the part played filled and a playhead. A subclass can give it its own
+	// look; the drawing state is restored after the call.
+	virtual void DrawScrubber(BRect track, float fraction)
+	{
+		const Skin& skin = CurrentSkin();
+		BRect groove(track.left, floorf((track.top + track.bottom) / 2) - 2,
+			track.right, floorf((track.top + track.bottom) / 2) + 2);
+		FillGradient(this, groove, skin.trackTop, skin.trackBottom, 2);
+		float x = roundf(groove.left + fraction * groove.Width());
+		if (x > groove.left + 1) {
+			BRect played(groove.left, groove.top, x, groove.bottom);
+			SetHighColor(skin.trackFill);
+			FillRoundRect(played, 2, 2);
+		}
+		BRect head(x - 1, track.top + 1, x + 1, track.bottom - 1);
+		SetHighColor(MixColors(skin.playhead, skin.displayBorder, 0.4f));
+		FillRect(head.InsetByCopy(-1, 0));
+		SetHighColor(skin.playhead);
+		FillRect(head);
 	}
 
 private:
