@@ -231,14 +231,23 @@ Hub::ResetPort(uint8 index)
 	// that stays disabled is not addressed: a VL805 (Raspberry Pi 4) that ran
 	// an Address Device for a device behind a disabled port fails every later
 	// one for a low or full speed device with a Context State error, until
-	// the next boot. Root hubs are left out: an EHCI port stays disabled after
-	// the reset of a full speed device on purpose, as that one goes to a
-	// companion controller.
+	// the next boot. The root hubs of the older controllers are left out: an
+	// EHCI port stays disabled after the reset of a full speed device on
+	// purpose, as that one goes to a companion controller. An xHCI root port
+	// has no such excuse. One that is still disabled after its reset has a
+	// device that did not come up: typically a high speed one whose
+	// handshake the port does not see through (cable, connector), which the
+	// controller reports as gone at the end of the reset and as back at full
+	// speed a moment later. Addressing it then only fails ("unable to set
+	// address"), every time.
 	static const int32 kResetTries = 5;
+	const bool rootHub = GetBusManager()->GetRootHub() == this;
+	const bool checked = !rootHub
+		|| strcmp(GetBusManager()->TypeName(), "xhci") == 0;
 	status_t result = B_ERROR;
 	for (int32 try_ = 0; try_ < kResetTries; try_++) {
 		result = _ResetPortOnce(index);
-		if (result != B_OK || GetBusManager()->GetRootHub() == this)
+		if (result != B_OK || !checked)
 			return result;
 
 		result = UpdatePortStatus(index);
@@ -260,8 +269,15 @@ Hub::ResetPort(uint8 index)
 		snooze(USB_DELAY_PORT_RESET_LONG);
 	}
 
-	TRACE_ERROR("port %d stays disabled after %" B_PRId32 " resets\n", index,
-		kResetTries);
+	if (rootHub) {
+		// what Linux says "Cannot enable. Maybe the USB cable is bad?" about
+		TRACE_ALWAYS("port %d: the device does not come up after a reset "
+			"(%" B_PRId32 " tries); the cable or the port may not carry its "
+			"speed\n", index, kResetTries);
+	} else {
+		TRACE_ERROR("port %d stays disabled after %" B_PRId32 " resets\n",
+			index, kResetTries);
+	}
 	return B_DEV_NOT_READY;
 }
 
