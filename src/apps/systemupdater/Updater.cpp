@@ -702,6 +702,7 @@ Updater::PlanUpdate(const Release& release, const SystemState& state,
 	_plan.activate.MakeEmpty();
 	_plan.deactivate.MakeEmpty();
 	_plan.kept.MakeEmpty();
+	_plan.unchanged.MakeEmpty();
 	_plan.downloadBytes = 0;
 	_plan.copyBytes = 0;
 
@@ -844,6 +845,25 @@ Updater::PlanUpdate(const Release& release, const SystemState& state,
 			}
 			// the same file name with other contents: replace it
 			_plan.deactivate.Add(package->file);
+		} else if (!package->equivalent.IsEmpty()) {
+			// An installed build of another version that holds the same
+			// files (CI stamps its build into some versions: airos_payload,
+			// the hrev of smbfs) stays; the feed lists it only where the
+			// release's requirements allow its version.
+			bool same = false;
+			for (int32 j = 0; j < latest->packages.CountStrings(); j++) {
+				const BString& file = latest->packages.StringAt(j);
+				BString sha;
+				if (PackageNameOf(file) == package->name
+					&& _InstalledSha256(file, sha) == B_OK
+					&& package->equivalent.HasString(sha)) {
+					_plan.unchanged.Add(file);
+					same = true;
+					break;
+				}
+			}
+			if (same)
+				continue;
 		}
 
 		PlannedPackage* planned = new PlannedPackage;
@@ -861,7 +881,7 @@ Updater::PlanUpdate(const Release& release, const SystemState& state,
 	// installed packages the release replaces or dropped
 	for (int32 i = 0; i < latest->packages.CountStrings(); i++) {
 		const BString& file = latest->packages.StringAt(i);
-		if (releaseFiles.HasString(file))
+		if (releaseFiles.HasString(file) || _plan.unchanged.HasString(file))
 			continue;
 		BString name = PackageNameOf(file);
 		if (userNewer.HasString(name))
@@ -885,6 +905,7 @@ Updater::PlanGoBack(const InstalledVersion& version, const SystemState& state,
 	_plan.activate.MakeEmpty();
 	_plan.deactivate.MakeEmpty();
 	_plan.kept.MakeEmpty();
+	_plan.unchanged.MakeEmpty();
 	_plan.downloadBytes = 0;
 	_plan.copyBytes = 0;
 
@@ -1246,7 +1267,8 @@ Updater::Apply(UpdatePlan& plan, BString& _error)
 	_Status("Installing…");
 	_Progress(-1);
 	Log("committing: %" B_PRId32 " packages to activate, %" B_PRId32
-		" to deactivate (%s)", count, plan.deactivate.CountStrings(),
+		" to deactivate, %" B_PRId32 " kept as the same files (%s)", count,
+		plan.deactivate.CountStrings(), plan.unchanged.CountStrings(),
 		releaseId.String());
 	BCommitTransactionResult result;
 	error = client.CommitTransaction(transaction, result);

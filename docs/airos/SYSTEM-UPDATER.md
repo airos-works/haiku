@@ -97,14 +97,37 @@ changed since the release before it in the feed (Haiku commits, package
 versions, application commits). System Updater checks each download's size
 and SHA-256 and reads its package info before using it.
 
-CI builds some packages again for every image although their sources did not
-change (the Office and Media apps after each Haiku commit, Vision's Deskbar
-repack): same file name, same contents, other file times, another SHA-256.
-`release-feed.py` compares each such package with the release before it,
-entry by entry and attribute by attribute without the times, and lists the
-earlier SHA-256s as `equivalent`; System Updater keeps an installed copy whose
-SHA-256 is among them. Between two CI builds of 26 October this cut an
-update from 24 packages (468 MiB) to 13 (249 MiB).
+CI builds many packages again for every image although nothing in them
+changed: the Office and Media apps after each Haiku commit (other file
+times), `airos_payload` (its version is the build's: 112 MiB of unchanged GPU
+stacks and firmware), the packages versioned by Haiku's hrev (`smbfs`,
+`userland_fs`, `haiku_datatranslators`, `makefile_engine`) and the DRM
+drivers (their requires name the Haiku they were built against).
+`release-feed.py` compares each package with the one of the same name in the
+release before it, entry by entry and attribute by attribute, leaving out
+file times, the attributes of symlinks (the Linux build's attribute store is
+keyed by inode and sometimes hands a new symlink a deleted file's
+`BEOS:TYPE`), the `.PackageInfo` text and the version, provides and requires.
+A build of the same files counts as `equivalent` when the release still works
+with it: its requires are the new build's or weaker (a lower minimum
+version), its provides have the same names, and no versioned requirement of
+the release's other packages rules out its version (`haiku_devel` requires
+`haiku == <its version>`, so it never stays behind `haiku`). The entry lists
+the earlier SHA-256s as `equivalent` (up to 64, about a week of CI builds)
+and describes those of another file name in `equivalent_files` (file,
+version, provides); System Updater keeps an installed copy of the package
+whose SHA-256 is among them, whatever its file name, and `--plan` lists such
+copies as "Kept, the same files as the release's". The release notes leave
+out packages whose new version holds the same files.
+
+Between two CI builds of 26 October this cut an update from 24 packages
+(468 MiB) to 13 (249 MiB). Since 23 November (versions and requires judged
+too, `airos_payload`'s summary without the build time, app builds with
+`SOURCE_DATE_EPOCH` set to their commit time, no Haiku version in the DRM
+drivers' READMEs), an update for one Haiku commit downloads what that commit
+changed: about 47 MiB (`haiku`, `haiku_devel`, `haiku_loader` and the
+release package) plus any application that changed, where it was about
+200 MiB, and a build that changed no package downloads only `airos_release`.
 
 ### On GitHub
 
@@ -119,8 +142,10 @@ step) mirrors the feed to airos-works/haiku's Releases, all prereleases:
 A package is uploaded once, to the release that brought it; later
 `update.json` files point at that asset. An `equivalent` rebuild is not
 uploaded at all: the mirrored `update.json` lists the copy already on GitHub
-(its SHA-256 and size, the rebuild's SHA-256 among the `equivalent` ones, so
-a machine installed from the image keeps its copy). After the first release
+(its SHA-256 and size, and its file name and version where those differ, the
+rebuild's SHA-256 among the `equivalent` ones, so a machine installed from
+the image keeps its copy). A release then names, say, the `airos_payload` of
+an older build, which holds the same files. After the first release
 of a target, a mirror uploads 75–250 MiB. `index.json` is replaced last, once
 everything it names is there; releases it no longer names are deleted once
 no kept release uses their packages. GitHub sends each download from its CDN

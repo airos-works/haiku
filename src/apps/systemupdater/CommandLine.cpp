@@ -205,6 +205,12 @@ print_plan(const UpdatePlan& plan)
 	printf("To remove (%" B_PRId32 "):\n", plan.deactivate.CountStrings());
 	for (int32 i = 0; i < plan.deactivate.CountStrings(); i++)
 		printf("  - %s\n", plan.deactivate.StringAt(i).String());
+	if (!plan.unchanged.IsEmpty()) {
+		printf("Kept, the same files as the release's (%" B_PRId32 "):\n",
+			plan.unchanged.CountStrings());
+		for (int32 i = 0; i < plan.unchanged.CountStrings(); i++)
+			printf("    %s\n", plan.unchanged.StringAt(i).String());
+	}
 	if (!plan.kept.IsEmpty()) {
 		printf("Kept, installed by the user (%" B_PRId32 "):\n",
 			plan.kept.CountStrings());

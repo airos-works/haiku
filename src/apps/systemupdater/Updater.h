@@ -49,6 +49,10 @@ struct UpdatePlan {
 	BStringList	deactivate;
 	BStringList	kept;
 		// packages of the user's own that stay
+	BStringList	unchanged;
+		// installed packages the release has another build of that holds
+		// the same files (another version or other file times only: an
+		// "equivalent" of the feed), which stay instead of being downloaded
 	off_t		downloadBytes;
 	off_t		copyBytes;
 	BStringList	bootSources;
