@@ -66,6 +66,24 @@ A newly allocated control or page belongs to its parent once added. An action co
 
 The system Open, Save and folder-selection panels adapt automatically. Use the ordinary `BFilePanel` API with the same file filters, node flavors and result messages as on the desktop. In the tablet grid, tap a folder to enter it or use Up to go to its parent. For a directory-only panel, Open chooses the current folder when nothing is selected.
 
+## Skeuomorphic materials
+
+`B_MOBILE_KIT_VERSION` 2 adds an optional look modelled on objects, after the iPad's iOS 5 media apps: brushed metal bars, an inset LCD, glossy segmented buttons, a pill search field, wooden rails and a paper page. Everything is drawn by the kit (vector glyphs, gradients, a generated wood grain), so it needs no images, fonts or resources and scales with the system font. The materials follow the panel colour: aluminium and cherry on a light panel, graphite and walnut on a dark one. Amp's tablet view is the reference application.
+
+| Element | API and behavior |
+| --- | --- |
+| Bars | `MetalBar(name, B_MOBILE_TOP_BAR or B_MOBILE_BOTTOM_BAR)` is a `Bar` in brushed metal with the dark edge towards the content. The controls below paint the bar's metal behind themselves (`FillBarBehind`), so a bar and its controls read as one plate. Use nested `BLayoutBuilder` groups, not plain group views, to arrange controls inside it. |
+| Tabs and transport | `SegmentedControl(name, message, momentary)` joins segments with labels or glyphs. As a selector, `Value()` is the selected index and a tap invokes the message with `"index"`; `Select(index)` changes the selection without invoking. A momentary control keeps no selection and sends each segment's own message (`AddSegment(NULL, B_GLYPH_NEXT, new BMessage(...))`). `SetSegmentGlyph` swaps Play for Pause. |
+| Buttons | `MetalButton(name, label, message, shape, glyph)` with `B_ROUNDED_BUTTON`, `B_PILL_BUTTON` or `B_BACK_BUTTON` (pointed on the left, labelled with the page it returns to). |
+| Media display | `NowPlayingDisplay` shows the cover, title between artist and album, elapsed and remaining time, a scrubber with a playhead, and repeat and shuffle. Feed it `SetArtwork` (copied), `SetText`, `SetProgress(position, duration)` in microseconds, `SetRepeat(0, 1 or 2)` and `SetShuffle`. `SetMessage(part, message)` reports a finished scrub (`"fraction"`, `"position"`), and taps on the cover, repeat and shuffle. `SetIdleText` names the app while nothing plays. |
+| Level | `MetalSlider` is a volume slider from 0 to 1000 with speaker glyphs. Its modification message follows the knob, its message is sent on release, and `IsTracking()` tells a player not to move it under the finger. |
+| Search | `SearchField(name, placeholder, message)` sends the message with `"text"` as the text changes and again on Enter. `SetText` does not send it. The inner BTextView brings up the shell keyboard. |
+| Frame and page | `WoodFrame(name, content)` holds one view between wooden rails; `SetRails(false)` makes it a plain container, so the desktop layout can keep it. Call `ColorsChanged()` on `B_COLORS_UPDATED`. `DrawPage(view, view->Bounds(), update)` paints the paper behind a grid, lit from above, and `CurrentSkin().pageText` and `pageSecondary` colour the captions on it. |
+| Covers | `DrawReflection(view, bitmap, rect, depth, floor)` mirrors a picture onto the floor below it, fading out, for a cover on a dark stage (`CurrentSkin().stage`). |
+| Glyphs and colours | `DrawGlyph(view, glyph, rect, color)` draws transport, repeat, shuffle, back, search, clear, speaker and note symbols. `CurrentSkin()` returns the material colours for custom views, and `ControlHeight()` the visible height of a bar control inside its `TargetSize()` touch area. |
+
+The kit is header-only. An application that is built with SDKs older than the air/OS release it targets can carry a copy of `MobileKit.h` and include it by path; `B_MOBILE_KIT_VERSION` tells which version a copy provides.
+
 ## Try both presentations
 
 Open a document on the desktop, note its frame, then start MobileShell or fold a convertible configured for air/OS Mobile. Select the running window from the switcher. Go home, launch a second supporting application and open the on-screen keyboard in a text field. Quit MobileShell or unfold the convertible. Both apps should show their desktop controls with their document or playback state intact. A desktop-only application should be absent from the launcher and have a labeled, closeable card in the task switcher.
