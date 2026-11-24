@@ -131,12 +131,15 @@ Nhi::Nhi(pci_device_module_info* pci, pci_device* device, const pci_info& info)
 	fNextSeq(0),
 	fRingThread(-1),
 	fRunning(false),
-	fControlRunning(false)
+	fControlRunning(false),
+	fSuspended(false),
+	fRestore(false)
 {
 	memset(&fStats, 0, sizeof(fStats));
 	B_INITIALIZE_SPINLOCK(&fTxLock);
 	B_INITIALIZE_SPINLOCK(&fCurrentLock);
 	mutex_init(&fRequestLock, "usb4 control requests");
+	mutex_init(&fRingLock, "usb4 control rings");
 	fTxSpace.Init(this, "usb4 tx space");
 	init_crc32c();
 }
@@ -145,12 +148,16 @@ Nhi::Nhi(pci_device_module_info* pci, pci_device* device, const pci_info& info)
 Nhi::~Nhi()
 {
 	Uninit();
+	mutex_destroy(&fRingLock);
 	mutex_destroy(&fRequestLock);
 }
 
 
+/*!	What the PCI function needs before its registers can be used; again
+	after it was reset or without power.
+*/
 status_t
-Nhi::Init()
+Nhi::_PowerUp()
 {
 	uint16 command = fPCI->read_pci_config(fDevice, PCI_command, 2);
 	command &= ~(PCI_command_io | PCI_command_int_disable);
@@ -176,6 +183,17 @@ Nhi::Init()
 		uint32 maxLTR = fPCI->read_pci_config(fDevice, VS_CAP_16, 4) & 0xffff;
 		fPCI->write_pci_config(fDevice, VS_CAP_15, 4, maxLTR << 16 | maxLTR);
 	}
+
+	return B_OK;
+}
+
+
+status_t
+Nhi::Init()
+{
+	status_t powerStatus = _PowerUp();
+	if (powerStatus != B_OK)
+		return powerStatus;
 
 	phys_addr_t physicalAddress = fPCIInfo.u.h0.base_registers[0];
 	if ((fPCIInfo.u.h0.base_register_flags[0] & PCI_address_type)
@@ -258,6 +276,72 @@ Nhi::Init()
 	resume_thread(fRingThread);
 
 	return B_OK;
+}
+
+
+/*!	Sets a host interface that was reset (in a sleep of the system) up
+	again as Init() left it: the reset took the interrupt setup in its
+	registers and in its PCI configuration (the message signalled interrupt)
+	with it. The rings are StartControl()'s.
+*/
+void
+Nhi::_Restore()
+{
+	if (_PowerUp() != B_OK)
+		return;
+
+	_RemoveInterrupts();
+	_DisableAllInterrupts();
+	for (uint32 i = 0; i < NHI_MSIX_VECTORS; i++)
+		WriteReg(NHI_INT_THROTTLING_RATE + i * 4, (128 * 1000 + 255) / 256);
+
+	// until the first one arrives, the rings are polled quickly
+	atomic_set(&fInterruptCount, 0);
+	if (_SetupInterrupts() != B_OK)
+		TRACE_ALWAYS("no interrupts, polling the control rings\n");
+}
+
+
+/*!	The system is about to sleep. While it does, the platform's sleep code
+	may use ring 0 itself (to put the host router to sleep) and take the
+	host interface through D3, which resets it: the ring thread keeps off
+	the rings until Resume(). The caller keeps the connection manager from
+	sending requests.
+*/
+void
+Nhi::Suspend()
+{
+	fSuspended = true;
+	// the ring thread is not in the rings any more once this was free
+	MutexLocker _(fRingLock);
+}
+
+
+bool
+Nhi::Resume()
+{
+	bool lost = false;
+	if (fControlRunning && fRegisters != NULL) {
+		// A reset leaves the rings disabled and without their addresses
+		// (and so does the platform code when it has used ring 0).
+		uint32 txOptions = ReadReg(NHI_TX_OPTIONS_BASE);
+		uint32 rxOptions = ReadReg(NHI_RX_OPTIONS_BASE);
+		lost = txOptions == 0xffffffff
+			|| (txOptions & RING_FLAG_ENABLE) == 0
+			|| (rxOptions & RING_FLAG_ENABLE) == 0
+			|| ReadReg(NHI_TX_RING_BASE) != (uint32)fTxRingPhysical
+			|| ReadReg(NHI_RX_RING_BASE) != (uint32)fRxRingPhysical;
+	}
+
+	// Lost, or not in use and nothing to tell by: set up again whenever the
+	// control channel is started next.
+	if (lost || !fControlRunning)
+		fRestore = true;
+
+	fSuspended = false;
+	if (fRingSem >= 0)
+		release_sem(fRingSem);
+	return lost;
 }
 
 
@@ -481,7 +565,8 @@ Nhi::_RingLoop()
 		if (get_sem_count(fRingSem, &count) == B_OK && count > 0)
 			acquire_sem_etc(fRingSem, count, B_RELATIVE_TIMEOUT, 0);
 
-		if (!fControlRunning)
+		MutexLocker locker(fRingLock);
+		if (!fControlRunning || fSuspended)
 			continue;
 
 		_ProcessTx();
@@ -498,6 +583,11 @@ Nhi::StartControl()
 {
 	if (fControlRunning)
 		return B_OK;
+
+	if (fRestore) {
+		fRestore = false;
+		_Restore();
+	}
 
 	// TX ring 0
 	uint32 tx = NHI_TX_RING_BASE;

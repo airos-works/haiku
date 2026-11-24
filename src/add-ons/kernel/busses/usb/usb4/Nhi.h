@@ -73,6 +73,12 @@ public:
 			status_t			StartControl();
 			void				StopControl();
 
+			// the system sleeps
+			void				Suspend();
+			bool				Resume();
+				// true: the control channel was running and the hardware
+				// no longer has it (the host interface was reset)
+
 			ControlResult		Read(uint64 route, uint8 adapter,
 									usb4_config_space space, uint16 offset,
 									uint32* buffer, size_t dwords,
@@ -126,6 +132,8 @@ private:
 			void				_HandleFrame(uint32* data, size_t bytes,
 									uint8 pdf);
 
+			status_t			_PowerUp();
+			void				_Restore();
 			status_t			_SetupInterrupts();
 			void				_RemoveInterrupts();
 			void				_EnableRingInterrupt(uint32 bit, bool enable);
@@ -186,6 +194,14 @@ private:
 			thread_id			fRingThread;
 			volatile bool		fRunning;
 			volatile bool		fControlRunning;
+
+			mutex				fRingLock;
+				// held by the ring thread while it works on the rings
+			volatile bool		fSuspended;
+				// the ring thread keeps off them
+			bool				fRestore;
+				// the host interface may have been reset since Init(): set
+				// it up again before the control channel starts
 };
 
 

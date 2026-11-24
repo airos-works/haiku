@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include <drivers/pci_hotplug.h>
+#include <kdevice_manager.h>
 
 #include "Domain.h"
 #include "Nhi.h"
@@ -51,6 +52,8 @@ struct usb4_device {
 	int32					index;
 	uint32					denied;
 		// tunnel kinds turned off with "deny"
+	bool					suspended;
+		// the domain was suspended for the sleep the system is in
 };
 
 
@@ -413,6 +416,45 @@ usb4_uninit_driver(void* cookie)
 }
 
 
+/*!	The connection manager keeps off the host interface while the system
+	sleeps: on AMD the sleep code puts the host router to sleep through
+	ring 0 and takes the interface through D3 in a deep sleep (see
+	usb4_power_off() in arch_s2idle.cpp), and a suspend to RAM takes its
+	power. A light sleep does neither.
+*/
+static status_t
+usb4_suspend(void* cookie, int32 state)
+{
+	usb4_device* device = (usb4_device*)cookie;
+	device->suspended = false;
+	if (device->domain == NULL || !device->domain->IsRunning())
+		return B_OK;
+	if (state == ACPI_POWER_STATE_ON && device_manager_light_sleep())
+		return B_OK;
+
+	device->suspended = device->domain->Suspend();
+	return B_OK;
+}
+
+
+/*!	When the host interface was reset in the sleep, the domain starts over
+	(Domain::Resume()); otherwise it just goes on.
+*/
+static status_t
+usb4_resume(void* cookie)
+{
+	usb4_device* device = (usb4_device*)cookie;
+	if (device->suspended && device->domain != NULL) {
+		device->suspended = false;
+		device->domain->Resume();
+	} else if (device->domain == NULL || !device->domain->IsRunning()) {
+		// not in use: the next start sets the host interface up again
+		device->nhi->Resume();
+	}
+	return B_OK;
+}
+
+
 static status_t
 usb4_register_child_devices(void* cookie)
 {
@@ -586,6 +628,8 @@ static driver_module_info sUSB4Driver = {
 	usb4_register_child_devices,
 	NULL,	// rescan
 	NULL,	// removed
+	usb4_suspend,
+	usb4_resume
 };
 
 

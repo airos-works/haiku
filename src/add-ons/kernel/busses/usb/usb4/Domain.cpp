@@ -38,6 +38,8 @@ Domain::Domain(Nhi* nhi, int32 index, uint32 control)
 	fThread(-1),
 	fRunning(false),
 	fStarted(false),
+	fSuspended(false),
+	fRestart(false),
 	fStartStatus(B_OK),
 	fActivity("idle"),
 	fActivityRoute(0),
@@ -103,6 +105,56 @@ Domain::Stop()
 }
 
 
+/*!	The system is about to sleep. The platform's sleep code may take the
+	host interface away while it does (ring 0 for the host router's sleep,
+	then D3, which resets the interface), so the connection manager is kept
+	from touching it until Resume(): its lock stays held for the sleep by
+	the suspending thread, which also resumes.
+	Returns false when the connection manager is busy for too long; then
+	nothing is held and Resume() must not be called.
+*/
+bool
+Domain::Suspend()
+{
+	if (fSuspended)
+		return true;
+
+	// (it holds the lock while it enumerates or sets up tunnels)
+	if (mutex_lock_with_timeout(&fLock, B_RELATIVE_TIMEOUT, 10 * 1000000LL)
+			!= B_OK) {
+		TRACE_ERROR("domain %" B_PRId32 ": busy (%s), not suspended\n", fIndex,
+			fActivity);
+		return false;
+	}
+
+	fSuspended = true;
+	fNhi->Suspend();
+	return true;
+}
+
+
+/*!	The system is awake again. If the host interface kept its state, the
+	connection manager just goes on. If it was reset, nothing of the routers
+	and tunnels is left in the hardware: the connection manager thread
+	starts over, as at boot.
+*/
+void
+Domain::Resume()
+{
+	if (!fSuspended)
+		return;
+	fSuspended = false;
+
+	bool restart = fNhi->Resume();
+	if (restart)
+		fRestart = true;
+	mutex_unlock(&fLock);
+
+	if (restart && fEventSem >= 0)
+		release_sem(fEventSem);
+}
+
+
 void
 Domain::_SetActivity(const char* activity, uint64 route)
 {
@@ -143,6 +195,12 @@ Domain::_Loop()
 		if (!fRunning)
 			break;
 
+		if (fRestart) {
+			MutexLocker locker(fLock);
+			if (fRestart)
+				_Restart();
+		}
+
 		while (true) {
 			InterruptsSpinLocker eventLocker(fEventLock);
 			DomainEvent* event = fEvents.RemoveHead();
@@ -150,20 +208,28 @@ Domain::_Loop()
 			if (event == NULL)
 				break;
 
-			if (fStarted) {
+			if (fStarted || fRestart) {
 				MutexLocker locker(fLock);
-				_SetActivity("event", event->route);
-				_HandleEvent(event);
-				_SetActivity("idle");
+				if (fRestart) {
+					// (this event is about the routers from before the
+					// sleep, like the ones _Restart() drops)
+					_Restart();
+				} else if (fStarted) {
+					_SetActivity("event", event->route);
+					_HandleEvent(event);
+					_SetActivity("idle");
+				}
 			}
 			free(event);
 		}
 
 		if (fStarted && fPendingDPCount > 0) {
 			MutexLocker locker(fLock);
-			_SetActivity("checking DisplayPort");
-			_CheckPendingDP();
-			_SetActivity("idle");
+			if (!fRestart) {
+				_SetActivity("checking DisplayPort");
+				_CheckPendingDP();
+				_SetActivity("idle");
+			}
 		}
 	}
 
@@ -263,6 +329,49 @@ Domain::_StopDomain()
 	fPendingDPCount = 0;
 
 	fNhi->StopControl();
+}
+
+
+/*!	Starts over after the host interface was reset while the system slept
+	(fLock is held). The routers went to sleep or lost their power with it,
+	so the paths of the tunnels are gone and what was behind them has left
+	its USB and PCI busses already: forget everything and enumerate anew,
+	which brings up what is still plugged in as at boot.
+*/
+void
+Domain::_Restart()
+{
+	fRestart = false;
+	TRACE_ALWAYS("domain %" B_PRId32 ": the host interface was reset while "
+		"the system slept, starting again\n", fIndex);
+	_SetActivity("restarting");
+
+	bool hadPCIe = _FindTunnel(TUNNEL_PCIE, NULL, NULL) != NULL;
+
+	// With the control channel stopped the requests of the teardown fail at
+	// once, instead of each one timing out on rings that are gone.
+	fNhi->StopControl();
+	if (fStarted)
+		_StopDomain();
+	fStarted = false;
+
+	// what is queued is about the routers from before
+	InterruptsSpinLocker eventLocker(fEventLock);
+	while (DomainEvent* event = fEvents.RemoveHead())
+		free(event);
+	eventLocker.Unlock();
+
+	// let the PCI bus manager see the devices behind the old tunnel gone
+	if (hadPCIe && fPCIeListener != NULL)
+		fPCIeListener->PCIeTunnelChanged(this, false);
+
+	fStartStatus = _StartDomain();
+	fStarted = fStartStatus == B_OK;
+	if (!fStarted) {
+		TRACE_ERROR("domain %" B_PRId32 ": starting again failed: %s\n",
+			fIndex, strerror(fStartStatus));
+	}
+	_SetActivity("idle");
 }
 
 

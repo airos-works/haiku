@@ -60,6 +60,10 @@ public:
 			void				Stop();
 			bool				IsRunning() const { return fRunning; }
 
+			// the system sleeps
+			bool				Suspend();
+			void				Resume();
+
 			int32				Index() const { return fIndex; }
 			Nhi*				HostInterface() const { return fNhi; }
 			Router*				HostRouter() const { return fHost; }
@@ -112,6 +116,7 @@ private:
 			void				_Loop();
 			status_t			_StartDomain();
 			void				_StopDomain();
+			void				_Restart();
 			void				_HandleEvent(DomainEvent* event);
 			void				_SetActivity(const char* activity,
 									uint64 route = 0);
@@ -184,6 +189,10 @@ private:
 			thread_id			fThread;
 			volatile bool		fRunning;
 			volatile bool		fStarted;
+			bool				fSuspended;
+				// fLock is held for the sleep by the thread that suspended
+			volatile bool		fRestart;
+				// the host interface was reset in the sleep
 			status_t			fStartStatus;
 			const char* volatile fActivity;
 				// what the connection manager thread does right now
