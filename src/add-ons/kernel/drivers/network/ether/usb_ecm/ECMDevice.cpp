@@ -605,7 +605,23 @@ ECMDevice::_SetupDevice()
 
 	fControlInterfaceIndex = controlIndex;
 	fNotifyEndpoint = interface->endpoint[0].handle;
-	fNotifyBufferLength = interface->endpoint[0].descr->max_packet_size;
+
+	// The buffer has to hold what the transfer asks for: a packet of the
+	// endpoint, which need not fit the 64 bytes allocated before the
+	// endpoint was known.
+	uint32 notifyLength = max_c(16,
+		interface->endpoint[0].descr->max_packet_size & 0x7ff);
+	if (notifyLength > fNotifyBufferLength || fNotifyBuffer == NULL) {
+		uint8 *notifyBuffer = (uint8 *)realloc(fNotifyBuffer, notifyLength);
+		if (notifyBuffer == NULL) {
+			TRACE_ALWAYS("out of memory for notify buffer allocation\n");
+			return B_NO_MEMORY;
+		}
+
+		fNotifyBuffer = notifyBuffer;
+	}
+
+	fNotifyBufferLength = notifyLength;
 
 	if (dataIndex >= config->interface_count) {
 		TRACE_ALWAYS("data interface index invalid\n");

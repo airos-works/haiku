@@ -54,6 +54,34 @@ descriptor_too_short(const usb_audiocontrol_header_descriptor* header,
 #define REQ_INDEX(_ID) (0xffff & (_ID))
 
 
+/*!	The controls of a B_MULTI_LIST_MIX_CONTROLS call, as an array that cannot
+	be written past. How many controls there are is up to the device (the
+	units, channels and controls of its descriptors) and how many fit up to
+	the caller: one more than fit goes to a spare entry.
+*/
+class MixControlList {
+public:
+	MixControlList(multi_mix_control_info* info)
+		:
+		fControls(info->controls),
+		fCount(info->control_count)
+	{
+	}
+
+	multi_mix_control& operator[](int32 index)
+	{
+		if (index >= 0 && index < fCount)
+			return fControls[index];
+		return fSpare;
+	}
+
+private:
+	multi_mix_control*	fControls;
+	int32				fCount;
+	multi_mix_control	fSpare;
+};
+
+
 struct _Designation {
 	uint32 ch;
 	uint32 bus;
@@ -109,16 +137,16 @@ _AudioControl::~_AudioControl()
 
 
 AudioChannelCluster*
-_AudioControl::OutCluster()
+_AudioControl::OutCluster(uint32 depth)
 {
-	if (SourceID() == 0 || fInterface == NULL)
+	if (SourceID() == 0 || fInterface == NULL || depth >= kMaxUnitDepth)
 		return NULL;
 
 	_AudioControl* control = fInterface->Find(SourceID());
 	if (control == NULL)
 		return NULL;
 
-	return control->OutCluster();
+	return control->OutCluster(depth + 1);
 }
 
 
@@ -546,9 +574,9 @@ SelectorUnit::~SelectorUnit()
 
 
 AudioChannelCluster*
-SelectorUnit::OutCluster()
+SelectorUnit::OutCluster(uint32 depth)
 {
-	if (fInterface == NULL)
+	if (fInterface == NULL || depth >= kMaxUnitDepth)
 		return NULL;
 
 	for (int i = 0; i < fInputPins.Count(); i++) {
@@ -557,8 +585,9 @@ SelectorUnit::OutCluster()
 			continue;
 		// selector has the same channels number in the
 		// out cluster as anyone of his inputs
-		if (control->OutCluster() != NULL)
-			return control->OutCluster();
+		AudioChannelCluster* cluster = control->OutCluster(depth + 1);
+		if (cluster != NULL)
+			return cluster;
 	}
 
 	return NULL;
@@ -1142,14 +1171,25 @@ AudioControlInterface::Init(size_t interface, usb_interface_info* Interface)
 _AudioControl*
 AudioControlInterface::Find(uint8 id)
 {
-	return fAudioControls.Get(id);
+	// (the map's Get() returns its first entry for a key it does not have,
+	// and whatever is in its memory when it is empty: the ids come from the
+	// device's descriptors and from the callers of the mixer ioctls)
+	AudioControlsIterator it = fAudioControls.Find(id);
+	if (it == fAudioControls.End())
+		return NULL;
+
+	return it->Value();
 }
 
 
 _AudioControl*
 AudioControlInterface::FindOutputTerminal(uint8 id)
 {
-	return fOutputTerminals.Get(id);
+	AudioControlsIterator it = fOutputTerminals.Find(id);
+	if (it == fOutputTerminals.End())
+		return NULL;
+
+	return it->Value();
 }
 
 
@@ -1326,9 +1366,9 @@ AudioControlInterface::GetBusChannelsDescription(
 
 void
 AudioControlInterface::_HarvestRecordFeatureUnits(_AudioControl* rootControl,
-		AudioControlsMap& Map)
+		AudioControlsMap& Map, uint32 depth)
 {
-	if (rootControl == 0) {
+	if (rootControl == 0 || depth >= kMaxUnitDepth) {
 		TRACE(ERR, "Not processing due NULL root control.\n");
 		return;
 	}
@@ -1338,7 +1378,8 @@ AudioControlInterface::_HarvestRecordFeatureUnits(_AudioControl* rootControl,
 			{
 				SelectorUnit* unit = static_cast<SelectorUnit*>(rootControl);
 				for (int i = 0; i < unit->fInputPins.Count(); i++)
-					_HarvestRecordFeatureUnits(Find(unit->fInputPins[i]), Map);
+					_HarvestRecordFeatureUnits(Find(unit->fInputPins[i]), Map,
+						depth + 1);
 				Map.Put(rootControl->ID(), rootControl);
 			}
 			break;
@@ -1352,9 +1393,9 @@ AudioControlInterface::_HarvestRecordFeatureUnits(_AudioControl* rootControl,
 
 void
 AudioControlInterface::_HarvestOutputFeatureUnits(_AudioControl* rootControl,
-		AudioControlsMap& Map)
+		AudioControlsMap& Map, uint32 depth)
 {
-	if (rootControl == 0) {
+	if (rootControl == 0 || depth >= kMaxUnitDepth) {
 		TRACE(ERR, "Not processing due NULL root control.\n");
 		return;
 	}
@@ -1364,7 +1405,8 @@ AudioControlInterface::_HarvestOutputFeatureUnits(_AudioControl* rootControl,
 			{
 				MixerUnit* unit = static_cast<MixerUnit*>(rootControl);
 				for (int i = 0; i < unit->fInputPins.Count(); i++)
-					_HarvestOutputFeatureUnits(Find(unit->fInputPins[i]), Map);
+					_HarvestOutputFeatureUnits(Find(unit->fInputPins[i]), Map,
+						depth + 1);
 				Map.Put(rootControl->ID(), rootControl);
 			}
 			break;
@@ -1499,7 +1541,7 @@ AudioControlInterface::_ListFeatureUnitOption(uint32 controlType,
 			return 0;
 	}
 
-	multi_mix_control* Controls = Info->controls;
+	MixControlList Controls(Info);
 
 	if (unit->HasControl(channel, controlType)) {
 		uint32 masterIndex = CTL_ID(id, channel, unit->ID(), fInterface);
@@ -1586,7 +1628,7 @@ AudioControlInterface::_ListFeatureUnitControl(int32& index, int32 parentIndex,
 		{ "Top Back Right",		1, B_CHANNEL_TOP_BACK_RIGHT }
 	};
 
-	multi_mix_control* Controls = Info->controls;
+	MixControlList Controls(Info);
 
 	uint32 channelsConfig = cluster->ChannelsConfig();
 	int32 groupIndex = 0;
@@ -1674,7 +1716,7 @@ AudioControlInterface::_ListSelectorUnitControl(int32& index, int32 parentGroup,
 		return;
 	}
 
-	multi_mix_control* Controls = Info->controls;
+	MixControlList Controls(Info);
 
 	int32 recordMUX = CTL_ID(0, 0, selector->ID(), fInterface);
 	Controls[index].id	= recordMUX;
@@ -1773,12 +1815,12 @@ void
 AudioControlInterface::_ListMixerUnitControls(int32& index,
 		multi_mix_control_info* Info, Vector<multi_mix_control>& controls)
 {
-	multi_mix_control* Controls = Info->controls;
+	MixControlList Controls(Info);
 	uint32 groupParent = 0;
 	uint32 gainParent = 0;
 	for (Vector<multi_mix_control>::Iterator I = controls.Begin();
 			I != controls.End() && index < Info->control_count; I++) {
-		memcpy(Controls + index, &*I, sizeof(multi_mix_control));
+		Controls[index] = *I;
 		switch (I->flags) {
 			case B_MULTI_MIX_GROUP:
 				Controls[index].id = index;
@@ -1971,7 +2013,7 @@ void
 AudioControlInterface::_ListMixControlsPage(int32& index,
 		multi_mix_control_info* Info, AudioControlsMap& Map, const char* Name)
 {
-	multi_mix_control* Controls = Info->controls;
+	MixControlList Controls(Info);
 	int32 groupIndex = index | 0x10000;
 	Controls[index].id	= groupIndex;
 	Controls[index].flags = B_MULTI_MIX_GROUP;
@@ -2046,6 +2088,7 @@ AudioControlInterface::ListMixControls(multi_mix_control_info* Info)
 			OutputControlsMap.Put(control->ID(), control);
 	}
 
+	const int32 capacity = Info->control_count;
 	int32 index = 0;
 	if (InputControlsMap.Count() > 0)
 		_ListMixControlsPage(index, Info, InputControlsMap, "Input");
@@ -2061,7 +2104,8 @@ AudioControlInterface::ListMixControls(multi_mix_control_info* Info)
 			I != MixerControlsMap.End(); I++)
 		_ListMixControlsForMixerUnit(index, Info, I->Value());
 
-	Info->control_count = index;
+	// (what did not fit was not written, see MixControlList)
+	Info->control_count = min_c(index, capacity);
 
 	return B_OK;
 }

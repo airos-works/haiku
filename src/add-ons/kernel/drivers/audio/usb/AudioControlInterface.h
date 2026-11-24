@@ -21,6 +21,10 @@ class _AudioControl;
 typedef	VectorMap<uint32, _AudioControl*> AudioControlsMap;
 typedef	VectorMap<uint32, _AudioControl*>::Iterator AudioControlsIterator;
 
+// How far the units of a device are followed from one to its source: no
+// topology is that deep, and one that names its units in a ring has no end.
+const uint32 kMaxUnitDepth = 32;
+
 
 class AudioChannelCluster {
 public:
@@ -50,7 +54,7 @@ public:
 	virtual					~_AudioChannelCluster() {}
 
 	virtual	AudioChannelCluster*
-							OutCluster() { return this; }
+							OutCluster(uint32 depth = 0) { return this; }
 };
 
 
@@ -67,8 +71,12 @@ public:
 
 	virtual	const char*		Name() { return ""; }
 
+							// depth: how many units have passed the
+							// question on to their source already. A
+							// device can name a unit as its own source, or
+							// units in a ring.
 	virtual AudioChannelCluster*
-							OutCluster();
+							OutCluster(uint32 depth = 0);
 
 protected:
 			status_t		fStatus;
@@ -148,7 +156,7 @@ public:
 	virtual					~SelectorUnit();
 
 	virtual	AudioChannelCluster*
-							OutCluster();
+							OutCluster(uint32 depth = 0);
 	virtual	const char*		Name() { return "Selector"; }
 
 // protected:
@@ -332,9 +340,9 @@ protected:
 								channel_kind kind, uint32 connectors = 0);
 
 			void			_HarvestRecordFeatureUnits(_AudioControl* rootControl,
-								AudioControlsMap& Map);
+								AudioControlsMap& Map, uint32 depth = 0);
 			void			_HarvestOutputFeatureUnits(_AudioControl* rootControl,
-								AudioControlsMap& Map);
+								AudioControlsMap& Map, uint32 depth = 0);
 			void			_ListMixControlsPage(int32& index,
 								multi_mix_control_info* Info,
 								AudioControlsMap& Map, const char* Name);
