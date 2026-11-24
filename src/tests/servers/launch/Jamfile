@@ -30,4 +30,10 @@ UnitTestLib liblaunch_daemontest.so :
 # BMessenger(signature) and the jobs the launch_daemon did not launch
 SimpleTest launch_data_test : launch_data_test.cpp : be [ TargetLibsupc++ ] ;
 
+# the environment of a sourced script, read in pieces
+SimpleTest launch_export_parse_test
+	: export_parse_test.cpp Utility.cpp
+	: be [ TargetLibsupc++ ]
+;
+
 SubInclude HAIKU_TOP src tests servers launch tools ;

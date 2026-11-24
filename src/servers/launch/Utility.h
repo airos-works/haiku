@@ -7,6 +7,7 @@
 
 
 #include <String.h>
+#include <StringList.h>
 
 
 namespace Utility {
@@ -17,6 +18,10 @@ namespace Utility {
 	status_t EjectMedia(const char* path);
 
 	BString TranslatePath(const char* path);
+
+	void ParseExportOutput(BStringList& environment, BString& rest,
+		const char* data, size_t length);
+	void ParseExportVariable(BStringList& environment, const BString& line);
 }
 
 

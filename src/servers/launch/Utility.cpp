@@ -115,4 +115,57 @@ TranslatePath(const char* originalPath)
 }
 
 
+/*!	Takes the next piece of the output of the shell's "export -p", and adds
+	the variables of its complete lines to \a environment.
+
+	A read from a pipe ends anywhere, not at the end of a line: what follows
+	the last line break is kept in \a rest and put in front of the next piece.
+	At the end of the output, pass what \a rest still holds to
+	ParseExportVariable().
+*/
+void
+ParseExportOutput(BStringList& environment, BString& rest, const char* data,
+	size_t length)
+{
+	const char* end = data + length;
+	while (data < end) {
+		const char* separator = (const char*)memchr(data, '\n', end - data);
+		if (separator == NULL) {
+			rest.Append(data, end - data);
+			return;
+		}
+
+		rest.Append(data, separator - data);
+		ParseExportVariable(environment, rest);
+		rest.Truncate(0);
+
+		data = separator + 1;
+	}
+}
+
+
+/*!	Adds the variable of a line like \c export NAME="value" to
+	\a environment; other lines are ignored.
+*/
+void
+ParseExportVariable(BStringList& environment, const BString& line)
+{
+	if (!line.StartsWith("export "))
+		return;
+
+	int separator = line.FindFirst("=\"");
+	if (separator < 0)
+		return;
+
+	BString variable;
+	line.CopyInto(variable, 7, separator - 7);
+
+	BString value;
+	line.CopyInto(value, separator + 2, line.Length() - separator - 3);
+
+	variable << "=" << value;
+	environment.Add(variable);
+}
+
+
 }	// namespace Utility

@@ -12,6 +12,7 @@
 #include <spawn.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <AutoDeleter.h>
@@ -19,6 +20,7 @@
 
 #include "Conditions.h"
 #include "Events.h"
+#include "Utility.h"
 
 
 BaseJob::BaseJob(const char* name)
@@ -211,6 +213,8 @@ BaseJob::_GetSourceFileEnvironment(const char* script, BStringList& environment)
 	int status = posix_spawn_file_actions_init(&fileActions);
 	if (status != 0) {
 		// TODO: log error
+		close(pipes[0]);
+		close(pipes[1]);
 		return;
 	}
 	CObjectDeleter<posix_spawn_file_actions_t, int, posix_spawn_file_actions_destroy>
@@ -235,7 +239,9 @@ BaseJob::_GetSourceFileEnvironment(const char* script, BStringList& environment)
 
 	if (status != 0) {
 		// TODO: log error
-		debug_printf("could not fork: %s\n", strerror(errno));
+		debug_printf("could not fork: %s\n", strerror(status));
+		close(pipes[0]);
+		close(pipes[1]);
 		return;
 	}
 
@@ -243,50 +249,33 @@ BaseJob::_GetSourceFileEnvironment(const char* script, BStringList& environment)
 
 	close(pipes[1]);
 
-	BString line;
+	// A read ends anywhere in the output, also in the middle of a variable:
+	// only complete lines are parsed, the rest waits for the next read.
+	BString rest;
 	char buffer[4096];
 	while (true) {
-		ssize_t bytesRead = read(pipes[0], buffer, sizeof(buffer) - 1);
+		ssize_t bytesRead = read(pipes[0], buffer, sizeof(buffer));
+		if (bytesRead < 0 && errno == EINTR)
+			continue;
 		if (bytesRead <= 0)
 			break;
 
-		// Make sure the buffer is null terminated
-		buffer[bytesRead] = 0;
-
-		const char* chunk = buffer;
-		while (true) {
-			const char* separator = strchrnul(chunk, '\n');
-			line.Append(chunk, separator - chunk);
-
-			_ParseExportVariable(environment, line);
-			line.Truncate(0);
-
-			if (*separator == '\0')
-				break;
-			chunk = separator + 1;
-		}
+		Utility::ParseExportOutput(environment, rest, buffer, bytesRead);
 	}
+	// a last line without a line break
+	Utility::ParseExportVariable(environment, rest);
 
 	close(pipes[0]);
-}
 
-
-void
-BaseJob::_ParseExportVariable(BStringList& environment, const BString& line)
-{
-	if (!line.StartsWith("export "))
-		return;
-
-	int separator = line.FindFirst("=\"");
-	if (separator < 0)
-		return;
-
-	BString variable;
-	line.CopyInto(variable, 7, separator - 7);
-
-	BString value;
-	line.CopyInto(value, separator + 2, line.Length() - separator - 3);
-
-	variable << "=" << value;
-	environment.Add(variable);
+	// The shell has closed its output: it is gone or about to be. Collect it,
+	// or each sourced script leaves a dead child behind for as long as the
+	// launch_daemon runs. Not forever, though: a script may have replaced the
+	// shell by something that stays, and this can be the daemon's main thread.
+	for (int32 tries = 0; tries < 1000; tries++) {
+		int childStatus;
+		pid_t result = waitpid(child, &childStatus, WNOHANG);
+		if (result > 0 || (result < 0 && errno != EINTR))
+			break;
+		snooze(1000);
+	}
 }

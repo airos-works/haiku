@@ -48,8 +48,6 @@ public:
 private:
 			void				_GetSourceFileEnvironment(const char* script,
 									BStringList& environment);
-			void				_ParseExportVariable(BStringList& environment,
-									const BString& line);
 
 protected:
 			::Condition*		fCondition;
