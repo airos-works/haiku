@@ -1,0 +1,10 @@
+SubDir HAIKU_TOP src tests servers app fallback_fonts ;
+
+UsePrivateHeaders app ;
+
+# what glyphs taken from fallback fonts cost, and a fingerprint of the
+# results that a change of the fallback code must keep (#199)
+SimpleTest fallback_fonts_test :
+	FallbackFontsTest.cpp
+	: be [ TargetLibsupc++ ]
+;

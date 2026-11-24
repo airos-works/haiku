@@ -258,6 +258,7 @@ SubInclude HAIKU_TOP src tests servers app draw_string_offsets ;
 SubInclude HAIKU_TOP src tests servers app drawing_debugger ;
 SubInclude HAIKU_TOP src tests servers app drawing_modes ;
 SubInclude HAIKU_TOP src tests servers app event_mask ;
+SubInclude HAIKU_TOP src tests servers app fallback_fonts ;
 SubInclude HAIKU_TOP src tests servers app find_view ;
 SubInclude HAIKU_TOP src tests servers app following ;
 SubInclude HAIKU_TOP src tests servers app font_spacing ;

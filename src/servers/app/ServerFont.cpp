@@ -706,13 +706,13 @@ ServerFont::GetHasGlyphs(const char* string, int32 numBytes, int32 numChars, boo
 
 	FontCacheEntry* entry = NULL;
 	FontCacheReference cacheReference;
-	BObjectList<FontCacheReference, true> fallbacks(21);
 
 	entry = GlyphLayoutEngine::FontCacheEntryFor(*this, false);
 	if (entry == NULL)
 		return B_ERROR;
 
 	cacheReference.SetTo(entry);
+	FallbackFonts fallbacks(*this, false);
 
 	uint32 charCode;
 	int32 charIndex = 0;
@@ -720,12 +720,9 @@ ServerFont::GetHasGlyphs(const char* string, int32 numBytes, int32 numChars, boo
 	while (charIndex < numChars && (charCode = UTF8ToCharCode(&string)) != 0) {
 		hasArray[charIndex] = entry->CanCreateGlyph(charCode);
 
-		if (hasArray[charIndex] == false && useFallbacks) {
-			if (fallbacks.IsEmpty())
-				GlyphLayoutEngine::PopulateFallbacks(fallbacks, *this, false);
-
-			if (GlyphLayoutEngine::GetFallbackReference(fallbacks, charCode) != NULL)
-				hasArray[charIndex] = true;
+		if (hasArray[charIndex] == false && useFallbacks
+			&& fallbacks.ReferenceFor(charCode) != NULL) {
+			hasArray[charIndex] = true;
 		}
 
 		charIndex++;

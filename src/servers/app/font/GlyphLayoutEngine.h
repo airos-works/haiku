@@ -192,6 +192,50 @@ static const GlyphCache sZeroWidthGlyph(0, 0, glyph_data_invalid,
 	agg::rect_i(0, 0, -1, -1), 0, 0, 0, 0, 0, 0);
 
 
+/*!	The fonts that a glyph the string's font lacks is taken from, in the
+	order they are tried (see _Populate()). The first one whose font cache
+	entry can create the glyph supplies it (for an emoji: the first one with
+	color glyphs).
+
+	Nothing is opened before it is needed. The list is made at the first
+	missing glyph, with the font manager locked only for that, and holds the
+	candidates' styles, not cache entries. A candidate's entry is asked for
+	only when the candidate's own face (the one the font manager keeps open)
+	has the character or color glyphs: the entry's engine opens the same file
+	and face with the same (Unicode) character map, so it would say the same,
+	and the candidates before it are skipped without an entry of their own
+	at this size. The result is the one of asking every candidate's entry in
+	order, as before; a character no font has opens none.
+*/
+class FallbackFonts {
+public:
+								FallbackFonts(const ServerFont& font,
+									bool forceVector);
+								~FallbackFonts();
+
+			FontCacheReference*	ReferenceFor(uint32 charCode);
+			FontCacheReference*	ColorReference();
+
+private:
+			bool				_Populate();
+			FontCacheReference*	_ReferenceAt(int32 index);
+	static	bool				_FaceHasCharacter(FontStyle* style,
+									uint32 charCode);
+	static	bool				_FaceHasColorGlyphs(FontStyle* style);
+
+	static	const int32			kMaxCount = 30;
+									// families times style levels
+
+			const ServerFont&	fFont;
+			bool				fForceVector;
+			bool				fPopulated;
+			int32				fCount;
+			ServerFont*			fFonts[kMaxCount];
+			FontCacheReference*	fReferences[kMaxCount];
+			bool				fOpened[kMaxCount];
+};
+
+
 class GlyphLayoutEngine {
 public:
 	static	bool				IsWhiteSpace(uint32 glyphCode);
@@ -209,18 +253,10 @@ public:
 									const BPoint* offsets = NULL,
 									FontCacheReference* cacheReference = NULL);
 
-	static	void				PopulateFallbacks(
-									BObjectList<FontCacheReference, true>& fallbacks,
-									const ServerFont& font, bool forceVector);
-
-	static FontCacheReference*	GetFallbackReference(
-									BObjectList<FontCacheReference, true>& fallbacks,
-									uint32 charCode);
-
 private:
 	static	const GlyphCache*	_CreateGlyph(
 									FontCacheReference& cacheReference,
-									BObjectList<FontCacheReference, true>& fallbacks,
+									FallbackFonts& fallbacks,
 									const ServerFont& font, bool needsVector,
 									uint32 glyphCode);
 
@@ -232,7 +268,7 @@ private:
 									int32 count);
 	static	const GlyphCache*	_CreateEmojiGlyph(
 									FontCacheReference& cacheReference,
-									BObjectList<FontCacheReference, true>& fallbacks,
+									FallbackFonts& fallbacks,
 									const ServerFont& font, bool needsVector,
 									const uint32* codes, int32 count,
 									int32& usedCodes);
@@ -283,7 +319,7 @@ GlyphLayoutEngine::LayoutGlyphs(GlyphConsumer& consumer,
 	FontCacheEntry* entry = NULL;
 	FontCacheReference* pCacheReference;
 	FontCacheReference cacheReference;
-	BObjectList<FontCacheReference, true> fallbacksList(21);
+	FallbackFonts fallbacks(font, consumer.NeedsVector());
 
 	if (_cacheReference != NULL) {
 		pCacheReference = _cacheReference;
@@ -368,7 +404,7 @@ GlyphLayoutEngine::LayoutGlyphs(GlyphConsumer& consumer,
 				}
 
 				int32 usedCodes = 0;
-				glyph = _CreateEmojiGlyph(*pCacheReference, fallbacksList,
+				glyph = _CreateEmojiGlyph(*pCacheReference, fallbacks,
 					font, consumer.NeedsVector(), codes, count, usedCodes);
 				if (pCacheReference->Entry() == NULL)
 					return false;
@@ -392,7 +428,7 @@ GlyphLayoutEngine::LayoutGlyphs(GlyphConsumer& consumer,
 		if (glyph == NULL)
 			glyph = entry->CachedGlyph(charCode);
 		if (glyph == NULL) {
-			glyph = _CreateGlyph(*pCacheReference, fallbacksList, font,
+			glyph = _CreateGlyph(*pCacheReference, fallbacks, font,
 				consumer.NeedsVector(), charCode);
 
 			// Something may have gone wrong while reacquiring the entry lock
@@ -460,7 +496,7 @@ GlyphLayoutEngine::LayoutGlyphs(GlyphConsumer& consumer,
 
 inline const GlyphCache*
 GlyphLayoutEngine::_CreateGlyph(FontCacheReference& cacheReference,
-	BObjectList<FontCacheReference, true>& fallbacks,
+	FallbackFonts& fallbacks,
 	const ServerFont& font, bool forceVector, uint32 charCode)
 {
 	FontCacheEntry* entry = cacheReference.Entry();
@@ -472,10 +508,7 @@ GlyphLayoutEngine::_CreateGlyph(FontCacheReference& cacheReference,
 		return NULL;
 	}
 
-	if (fallbacks.IsEmpty())
-		PopulateFallbacks(fallbacks, font, forceVector);
-
-	FontCacheReference* fallbackReference = GetFallbackReference(fallbacks, charCode);
+	FontCacheReference* fallbackReference = fallbacks.ReferenceFor(charCode);
 	if (fallbackReference != NULL) {
 		if (cacheReference.SetFallback(fallbackReference))
 			return entry->CreateGlyph(charCode, fallbackReference->Entry());
@@ -549,7 +582,7 @@ GlyphLayoutEngine::_WantsEmojiPresentation(const uint32* codes, int32 count)
 */
 inline const GlyphCache*
 GlyphLayoutEngine::_CreateEmojiGlyph(FontCacheReference& cacheReference,
-	BObjectList<FontCacheReference, true>& fallbacks,
+	FallbackFonts& fallbacks,
 	const ServerFont& font, bool forceVector, const uint32* codes,
 	int32 count, int32& usedCodes)
 {
@@ -569,17 +602,7 @@ GlyphLayoutEngine::_CreateEmojiGlyph(FontCacheReference& cacheReference,
 	// The color font: this one, or the first fallback that is one
 	FontCacheReference* colorReference = NULL;
 	if (!entry->HasColorGlyphs()) {
-		if (fallbacks.IsEmpty())
-			PopulateFallbacks(fallbacks, font, forceVector);
-
-		for (int32 i = 0; i < fallbacks.CountItems(); i++) {
-			FontCacheEntry* fallbackEntry = fallbacks.ItemAt(i)->Entry();
-			if (fallbackEntry != NULL && fallbackEntry->HasColorGlyphs()) {
-				colorReference = fallbacks.ItemAt(i);
-				break;
-			}
-		}
-
+		colorReference = fallbacks.ColorReference();
 		if (colorReference == NULL) {
 			// remember that there is none
 			if (cacheReference.WriteLock())
@@ -612,12 +635,80 @@ GlyphLayoutEngine::_CreateEmojiGlyph(FontCacheReference& cacheReference,
 }
 
 
-inline void
-GlyphLayoutEngine::PopulateFallbacks(
-	BObjectList<FontCacheReference, true>& fallbacksList,
-	const ServerFont& font, bool forceVector)
+//	#pragma mark - FallbackFonts
+
+
+inline
+FallbackFonts::FallbackFonts(const ServerFont& font, bool forceVector)
+	:
+	fFont(font),
+	fForceVector(forceVector),
+	fPopulated(false),
+	fCount(0)
 {
-	ASSERT(fallbacksList.IsEmpty());
+}
+
+
+inline
+FallbackFonts::~FallbackFonts()
+{
+	for (int32 i = 0; i < fCount; i++) {
+		delete fReferences[i];
+		delete fFonts[i];
+	}
+}
+
+
+/*!	The first candidate whose cache entry can create a glyph for \a charCode,
+	or NULL when none can.
+*/
+inline FontCacheReference*
+FallbackFonts::ReferenceFor(uint32 charCode)
+{
+	if (!_Populate())
+		return NULL;
+
+	for (int32 i = 0; i < fCount; i++) {
+		if (!_FaceHasCharacter(fFonts[i]->GetStyle(), charCode))
+			continue;
+
+		FontCacheReference* reference = _ReferenceAt(i);
+		if (reference != NULL && reference->Entry() != NULL
+			&& reference->Entry()->CanCreateGlyph(charCode)) {
+			return reference;
+		}
+	}
+	return NULL;
+}
+
+
+//!	The first candidate with color glyphs, or NULL.
+inline FontCacheReference*
+FallbackFonts::ColorReference()
+{
+	if (!_Populate())
+		return NULL;
+
+	for (int32 i = 0; i < fCount; i++) {
+		if (!_FaceHasColorGlyphs(fFonts[i]->GetStyle()))
+			continue;
+
+		FontCacheReference* reference = _ReferenceAt(i);
+		if (reference != NULL && reference->Entry() != NULL
+			&& reference->Entry()->HasColorGlyphs()) {
+			return reference;
+		}
+	}
+	return NULL;
+}
+
+
+inline bool
+FallbackFonts::_Populate()
+{
+	if (fPopulated)
+		return fCount > 0;
+	fPopulated = true;
 
 	// TODO: We always get the fallback glyphs from the Noto family, but of
 	// course the fallback font should a) contain the missing glyphs at all
@@ -637,7 +728,7 @@ GlyphLayoutEngine::PopulateFallbacks(
 	};
 
 	if (!gFontManager->Lock())
-		return;
+		return false;
 
 	static const int nFallbacks = B_COUNT_OF(fallbacks);
 	static const int acceptAnyStyle = 2;
@@ -645,14 +736,13 @@ GlyphLayoutEngine::PopulateFallbacks(
 	for (int degradeLevel = 0; degradeLevel <= acceptAnyStyle; degradeLevel++) {
 		const char* fontStyle;
 		if (degradeLevel == 0)
-			fontStyle = font.Style();
+			fontStyle = fFont.Style();
 		else if (degradeLevel == 1)
 			fontStyle = "Regular";
 		else
 			fontStyle = NULL;
 
-		for (int i = 0; i < nFallbacks; i++) {
-
+		for (int i = 0; i < nFallbacks && fCount < kMaxCount; i++) {
 			FontStyle* fallbackStyle;
 			if (degradeLevel != acceptAnyStyle) {
 				fallbackStyle = gFontManager->GetStyle(fallbacks[i], fontStyle);
@@ -664,37 +754,79 @@ GlyphLayoutEngine::PopulateFallbacks(
 			if (fallbackStyle == NULL)
 				continue;
 
-			ServerFont fallbackFont(*fallbackStyle, font.Size());
-
-			FontCacheEntry* entry = FontCacheEntryFor(fallbackFont, forceVector);
-			if (entry == NULL)
+			// A style that is already a candidate (the same at another
+			// level) has the same entry: it cannot be the first to have a
+			// glyph the earlier one lacks.
+			bool known = false;
+			for (int32 j = 0; j < fCount && !known; j++)
+				known = fFonts[j]->GetStyle() == fallbackStyle;
+			if (known)
 				continue;
 
-			FontCacheReference* cacheReference = new(std::nothrow) FontCacheReference();
-			if (cacheReference != NULL) {
-				cacheReference->SetTo(entry);
-				fallbacksList.AddItem(cacheReference);
-			} else
-				FontCache::Default()->Recycle(entry);
+			ServerFont* font = new(std::nothrow) ServerFont(*fallbackStyle,
+				fFont.Size());
+			if (font == NULL)
+				continue;
+
+			fFonts[fCount] = font;
+			fReferences[fCount] = NULL;
+			fOpened[fCount] = false;
+			fCount++;
 		}
 	}
 
 	gFontManager->Unlock();
+	return fCount > 0;
 }
 
 
+//!	The cache entry of candidate \a index (made at the first call), or NULL.
 inline FontCacheReference*
-GlyphLayoutEngine::GetFallbackReference(
-	BObjectList<FontCacheReference, true>& fallbacks, uint32 charCode)
+FallbackFonts::_ReferenceAt(int32 index)
 {
-	int32 count = fallbacks.CountItems();
-	for (int32 index = 0; index < count; index++) {
-		FontCacheReference* fallbackReference = fallbacks.ItemAt(index);
-		FontCacheEntry* fallbackEntry = fallbackReference->Entry();
-		if (fallbackEntry != NULL && fallbackEntry->CanCreateGlyph(charCode))
-			return fallbackReference;
+	if (!fOpened[index]) {
+		fOpened[index] = true;
+		FontCacheEntry* entry = GlyphLayoutEngine::FontCacheEntryFor(
+			*fFonts[index], fForceVector);
+		if (entry != NULL) {
+			FontCacheReference* reference
+				= new(std::nothrow) FontCacheReference();
+			if (reference != NULL) {
+				reference->SetTo(entry);
+				fReferences[index] = reference;
+			} else
+				FontCache::Default()->Recycle(entry);
+		}
 	}
-	return NULL;
+	return fReferences[index];
+}
+
+
+/*!	Whether the face of \a style has a glyph for \a charCode. True when it
+	cannot be told: the entry decides then.
+*/
+/*static*/ inline bool
+FallbackFonts::_FaceHasCharacter(FontStyle* style, uint32 charCode)
+{
+	if (style == NULL || !style->Lock())
+		return true;
+	FT_Face face = style->FreeTypeFace();
+	bool has = face == NULL || face->charmap == NULL
+		|| FT_Get_Char_Index(face, charCode) != 0;
+	style->Unlock();
+	return has;
+}
+
+
+/*static*/ inline bool
+FallbackFonts::_FaceHasColorGlyphs(FontStyle* style)
+{
+	if (style == NULL || !style->Lock())
+		return true;
+	FT_Face face = style->FreeTypeFace();
+	bool has = face == NULL || FT_HAS_COLOR(face);
+	style->Unlock();
+	return has;
 }
 
 
