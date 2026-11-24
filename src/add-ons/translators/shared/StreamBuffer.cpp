@@ -134,8 +134,11 @@ StreamBuffer::Read(void *_pinto, size_t nbytes)
 	
 	while (nbytes > 0) {
 		result = _ReadStream();
-		if (result <= 0)
-			return result;
+		if (result <= 0) {
+			// the end of the stream, or an error: what was read before
+			// counts
+			return totalRead > 0 ? (ssize_t)totalRead : result;
+		}
 		if (result > 0) {
 			size_t left = min(nbytes, fLen - fPos);
 			memcpy(pinto, fBuffer + fPos, left);
@@ -197,11 +200,16 @@ StreamBuffer::Seek(off_t position, uint32 seekMode)
 {
 	// just seek in the current buffer if the new position is in it
 	if (seekMode == SEEK_CUR) {
-		if (fToRead
-			&& (fPos + position < fLen)
-			&& (fPos + position >= 0)) {
-			fPos += position;
-			return Position();
+		if (fToRead) {
+			if (position >= -(off_t)fPos
+				&& position < (off_t)(fLen - fPos)) {
+				fPos += position;
+				return Position();
+			}
+
+			// the stream is ahead of this position by what is left in the
+			// buffer
+			position -= (off_t)(fLen - fPos);
 		} else if (!fToRead
 			&& (fLen + position < fBufferSize)
 			&& (fLen + position >= 0)) {

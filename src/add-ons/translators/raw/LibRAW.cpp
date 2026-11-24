@@ -10,6 +10,7 @@
 #include <TranslationErrors.h>
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,7 +71,8 @@ LibRaw_haiku_datastream::LibRaw_haiku_datastream(BPositionIO* stream)
 	iseof = 0;
 	buffer = new StreamBuffer(stream, 2048);
 	fStream = stream;
-	fStream->GetSize(&fSize);
+	if (fStream->GetSize(&fSize) != B_OK || fSize < 0)
+		fSize = 0;
 }
 
 LibRaw_haiku_datastream::~LibRaw_haiku_datastream()
@@ -84,12 +86,14 @@ LibRaw_haiku_datastream::read(void *ptr, size_t sz, size_t nmemb)
 {
 	CALLED();
 	TRACE("read %ld %ld\n", sz, nmemb);
-	size_t to_read = sz * nmemb;
+	if (sz == 0 || nmemb == 0 || nmemb > (size_t)INT_MAX / sz)
+		return 0;
 
-	to_read = buffer->Read(ptr, to_read);
-	if (to_read < B_OK)
-		RETURN("ERROR2", to_read);
-	return int((to_read + sz - 1) / (sz > 0 ? sz : 1));
+	// like fread(): the number of items read, none after an error
+	ssize_t bytesRead = buffer->Read(ptr, sz * nmemb);
+	if (bytesRead < 0)
+		RETURN("ERROR2", 0);
+	return int((bytesRead + sz - 1) / sz);
 }
 
 
@@ -98,7 +102,37 @@ LibRaw_haiku_datastream::seek(INT64 o, int whence)
 {
 	CALLED();
 	TRACE("seek %lld %d\n", o, whence);
-	return buffer->Seek(o, whence) < 0;
+
+	// The offsets come from the file, which may be damaged or no RAW file at
+	// all: keep the position within the stream, as LibRaw's own data streams
+	// do.
+	off_t current = buffer->Position();
+	off_t target;
+	switch (whence) {
+		case SEEK_SET:
+			target = o;
+			break;
+		case SEEK_CUR:
+			if (o > 0 && current > fSize - o)
+				target = fSize;
+			else
+				target = current + o;
+			break;
+		case SEEK_END:
+			target = o > 0 ? fSize : fSize + o;
+			break;
+		default:
+			return -1;
+	}
+
+	if (target < 0)
+		target = 0;
+	else if (target > fSize)
+		target = fSize;
+
+	iseof = 0;
+	// relative, so that a seek within the buffered data stays cheap
+	return buffer->Seek(target - current, SEEK_CUR) < 0 ? -1 : 0;
 }
 
 
@@ -129,7 +163,7 @@ LibRaw_haiku_datastream::get_char()
 	ssize_t error;
 	iseof = 0;
 	error = buffer->Read((void*)&value, sizeof(unsigned char));
-	if (error >= 0)
+	if (error == 1)
 		return value;
 	iseof = EOF;
 	return EOF;

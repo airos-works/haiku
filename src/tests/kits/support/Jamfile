@@ -9,6 +9,7 @@ UnitTestLib libsupporttest.so
 
 		BlockCacheExerciseTest.cpp
 		BlockCacheConcurrencyTest.cpp
+		BufferIOTest.cpp
 		ByteOrderTest.cpp
 
 		DateTimeTest.cpp
