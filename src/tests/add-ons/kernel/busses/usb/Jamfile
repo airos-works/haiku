@@ -4,3 +4,11 @@ SimpleTest uhci_decode : uhci_decode.cpp ;
 
 SimpleTest usb_hub_child_test : usb_hub_child_test.cpp
 	: libdevice.so be [ TargetLibstdc++ ] ;
+
+# usb_fake_device_test: the stack against the misbehaving devices of
+# usbredir_fake_device.py (a host program for a QEMU guest, see both files).
+UseHeaders [ FDirName $(HAIKU_TOP) src add-ons kernel drivers bus usb ] : true ;
+
+UsePrivateHeaders input ;
+
+SimpleTest usb_fake_device_test : usb_fake_device_test.cpp ;
