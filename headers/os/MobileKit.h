@@ -2824,7 +2824,9 @@ private:
 enum RowAccessory {
 	B_ROW_NO_ACCESSORY,
 	B_ROW_CHEVRON,		// the row opens a page with more
-	B_ROW_CHECK			// the row is the chosen one
+	B_ROW_CHECK,		// the row is the chosen one
+	B_ROW_SWITCH		// an ON/OFF switch (SetSwitch); a tap on the row
+						// sends its message, the owner flips the setting
 };
 
 
@@ -2892,6 +2894,13 @@ public:
 	void SetAccessory(RowAccessory accessory) { fAccessory = accessory; }
 	RowAccessory Accessory() const { return fAccessory; }
 
+	// The state a B_ROW_SWITCH shows.
+	void SetSwitch(bool on) { fSwitch = on; }
+	bool Switch() const { return fSwitch; }
+
+	// A row whose action removes something: its title is red and centred.
+	void SetDestructive(bool destructive) { fDestructive = destructive; }
+
 	// A section header: a strip with small capitals, not a tappable row.
 	void SetHeader(bool header) { fHeader = header; }
 	bool IsHeader() const { return fHeader; }
@@ -2920,6 +2929,8 @@ private:
 	rgb_color fTint;
 	RowAccessory fAccessory;
 	bool fHeader;
+	bool fSwitch = false;
+	bool fDestructive = false;
 };
 
 
@@ -3236,6 +3247,44 @@ TableRow::DrawItem(BView* owner, BRect frame, bool /*complete*/)
 		DrawCentered(owner, "Delete", button, make_color(255, 255, 255),
 			make_color(0, 0, 0, 110));
 		right = button.left - size * 0.5f;
+	} else if (fAccessory == B_ROW_SWITCH) {
+		// the switch of iOS 5: a blue ON or a grey OFF with a round knob
+		float height = ceilf(size * 2.2f);
+		float width = ceilf(height * 2.4f);
+		BRect track(right - width, floorf((frame.top + frame.bottom - height)
+			/ 2), right, floorf((frame.top + frame.bottom - height) / 2)
+				+ height);
+		float radius = height / 2;
+		owner->SetDrawingMode(B_OP_ALPHA);
+		owner->SetHighColor(make_color(0, 0, 0, 70));
+		owner->FillRoundRect(track.OffsetByCopy(0, 1), radius, radius);
+		owner->SetHighColor(make_color(120, 122, 128));
+		owner->FillRoundRect(track, radius, radius);
+		BRect inside = track.InsetByCopy(1, 1);
+		if (fSwitch) {
+			FillGradient(owner, inside, make_color(40, 104, 214),
+				make_color(92, 156, 246), radius - 1);
+		} else {
+			FillGradient(owner, inside, make_color(214, 215, 218),
+				make_color(250, 250, 251), radius - 1);
+		}
+		BFont bold(be_bold_font);
+		bold.SetSize(ceilf(size * 0.95f));
+		owner->SetFont(&bold);
+		BRect knob(0, 0, height - 1, height - 1);
+		knob.OffsetTo(fSwitch ? track.right - height + 1 : track.left,
+			track.top);
+		BRect label = fSwitch ? BRect(track.left, track.top, knob.left,
+			track.bottom) : BRect(knob.right, track.top, track.right,
+				track.bottom);
+		DrawCentered(owner, fSwitch ? "ON" : "OFF", label,
+			fSwitch ? make_color(255, 255, 255) : make_color(110, 112, 118),
+			fSwitch ? make_color(0, 0, 0, 80) : make_color(255, 255, 255, 160));
+		owner->SetHighColor(make_color(110, 112, 118));
+		owner->FillEllipse(knob);
+		FillGradient(owner, knob.InsetByCopy(1, 1), make_color(255, 255, 255),
+			make_color(206, 207, 212), radius - 1);
+		right = track.left - size * 0.6f;
 	} else if (fAccessory == B_ROW_CHEVRON || fAccessory == B_ROW_CHECK) {
 		float glyph = ceilf(size * (fAccessory == B_ROW_CHEVRON ? 1.1f : 1.4f));
 		BRect accessory(right - glyph, floorf((frame.top + frame.bottom
@@ -3258,6 +3307,19 @@ TableRow::DrawItem(BView* owner, BRect frame, bool /*complete*/)
 	float width = fmaxf(0.0f, right - left);
 	BString shownTitle(fTitle), shownDetail(fDetail);
 	title.TruncateString(&shownTitle, B_TRUNCATE_END, width);
+	if (fDestructive) {
+		owner->SetDrawingMode(B_OP_ALPHA);
+		owner->SetFont(&title);
+		owner->SetHighColor(selected ? text : make_color(204, 34, 30));
+		font_height height;
+		title.GetHeight(&height);
+		float textWidth = title.StringWidth(shownTitle.String());
+		owner->DrawString(shownTitle.String(), BPoint(floorf((frame.left
+			+ frame.right - textWidth) / 2), floorf((frame.top + frame.bottom
+				+ height.ascent - height.descent) / 2)));
+		owner->PopState();
+		return;
+	}
 	detail.TruncateString(&shownDetail, B_TRUNCATE_MIDDLE, width);
 	float block = titleHeight.ascent + titleHeight.descent;
 	if (!fDetail.IsEmpty())
