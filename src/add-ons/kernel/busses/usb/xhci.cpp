@@ -3116,6 +3116,8 @@ XHCI::AllocateDevice(Hub* parent, int8 hubAddress, uint8 hubPort, usb_speed spee
 	endpoint0->next = 0;
 	endpoint0->cancel_count = 0;
 	endpoint0->recovering = false;
+	endpoint0->halt_errors = 0;
+	device->recovery_timed_out = false;
 	endpoint0->trbs = device->trbs;
 	endpoint0->trb_addr = device->trb_addr;
 
@@ -3375,6 +3377,7 @@ XHCI::_InsertEndpointForPipe(Pipe* pipe)
 		endpoint->next = 0;
 		endpoint->cancel_count = 0;
 		endpoint->recovering = false;
+		endpoint->halt_errors = 0;
 
 		endpoint->trbs = device->trbs + id * XHCI_ENDPOINT_RING_STRIDE;
 		endpoint->trb_addr = device->trb_addr
@@ -3609,6 +3612,52 @@ XHCI::_UnlinkDescriptorForPipe(xhci_td* descriptor, xhci_endpoint* endpoint)
 }
 
 
+/*!	Whether an endpoint that halted on an error other than a stall is to be
+	reset. Not when its device has left its root port: nothing would run on
+	it anyway, and the errors of an unplug come in bursts. Not after
+	XHCI_MAX_HALT_RECOVERIES failed transfers in a row either: a device that
+	went away behind a hub, or one that is broken, fails every transfer, and
+	a driver that queues the next one at once would go round with this
+	thread. Such an endpoint stays halted, as all of them did before, until
+	its transfers are cancelled. And not when a command for the device has
+	timed out before, so that a controller that does not answer for a device
+	that is gone costs one timeout.
+	Called from the finisher thread only.
+*/
+bool
+XHCI::_MayRecoverHaltedEndpoint(xhci_endpoint* endpoint)
+{
+	if (endpoint->trbs == NULL
+		|| _GetEndpointState(endpoint) != ENDPOINT_STATE_HALTED) {
+		return false;
+	}
+
+	xhci_device* device = endpoint->device;
+	if (device->recovery_timed_out)
+		return false;
+
+	const uint32 port = SLOT_1_RH_PORT_GET(
+		_ReadContext(&device->device_ctx->slot.dwslot1));
+	if (port >= 1 && port <= fPortCount
+		&& (ReadOpReg(XHCI_PORTSC(port - 1)) & PS_CCS) == 0) {
+		return false;
+	}
+
+	if (endpoint->halt_errors >= XHCI_MAX_HALT_RECOVERIES) {
+		if (endpoint->halt_errors == XHCI_MAX_HALT_RECOVERIES) {
+			endpoint->halt_errors++;
+			TRACE_ALWAYS("endpoint %" B_PRIu8 " of slot %" B_PRIu8 " failed %d"
+				" transfers in a row, leaving it halted\n", endpoint->id,
+				device->slot, XHCI_MAX_HALT_RECOVERIES + 1);
+		}
+		return false;
+	}
+
+	endpoint->halt_errors++;
+	return true;
+}
+
+
 /*!	Resets an endpoint that halted on \a td, and moves its ring on past that
 	descriptor. A halted endpoint runs nothing until it is reset (XHCI 1.2
 	§ 4.8.3); left halted, the next transfer would wait for its timeout and
@@ -3658,6 +3707,8 @@ XHCI::_RecoverHaltedEndpoint(xhci_endpoint* endpoint, xhci_td* td)
 		TRACE_ERROR("recovering halted endpoint %" B_PRIu8 " of slot %" B_PRIu8
 			" failed: %s\n", endpoint->id, endpoint->device->slot,
 			strerror(status));
+		if (status == B_TIMED_OUT)
+			endpoint->device->recovery_timed_out = true;
 	}
 	endpoint->recovering = false;
 	const bool ring = !endpoint->td_list.IsEmpty() && endpoint->cancel_count == 0;
@@ -4821,17 +4872,28 @@ XHCI::FinishTransfers()
 			// the default pipe), but nothing else would reset the endpoint
 			// in the controller, so the next transfer would never run
 			// (XHCI 1.2 § 4.8.3). Both sides restart at sequence number 0,
-			// as with a cancellation. Only a stall: transaction errors also
-			// halt, but an unplug raises them in bursts, and each command to
-			// a slot that is gone costs a timeout on this thread. Those are
-			// left to the next transfer's timeout and cancellation.
+			// as with a cancellation.
+			// The other errors that halt (a transaction error after the
+			// controller's retries, babble, a split transaction error) are
+			// no different: the drivers of keyboards, mice and network
+			// adapters queue their next transfer without a timeout, and
+			// after one glitch on the bus the device was silent until it
+			// was plugged in again. An unplug raises such errors too,
+			// though, on every endpoint and until the port change is
+			// seen, so these are reset only while that is worth it (see
+			// _MayRecoverHaltedEndpoint()).
 			xhci_endpoint* endpoint
 				= (xhci_endpoint*)transfer->TransferPipe()->ControllerCookie();
-			if (endpoint != NULL && completionCode != COMP_SUCCESS
-				&& completionCode != COMP_SHORT_PACKET
-				&& (endpoint->id == 0 || (completionCode == COMP_STALL
-					&& transfer->IsochronousData() == NULL))) {
-				_RecoverHaltedEndpoint(endpoint, td);
+			if (endpoint != NULL) {
+				if (completionCode == COMP_SUCCESS
+					|| completionCode == COMP_SHORT_PACKET) {
+					endpoint->halt_errors = 0;
+				} else if (endpoint->id == 0
+					|| (transfer->IsochronousData() == NULL
+						&& (completionCode == COMP_STALL
+							|| _MayRecoverHaltedEndpoint(endpoint)))) {
+					_RecoverHaltedEndpoint(endpoint, td);
+				}
 			}
 
 			FreeDescriptor(td);

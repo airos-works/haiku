@@ -49,6 +49,10 @@ struct xhci_platform_info {
  * (one for the link TRB, and one for the Event Data TRB). */
 #define XHCI_ENDPOINT_RING_SIZE	(XHCI_MAX_TRANSFERS * 2)
 
+// How many transfers in a row may halt an endpoint with an error (other than
+// a stall) and have it reset at once, see _MayRecoverHaltedEndpoint().
+#define XHCI_MAX_HALT_RECOVERIES	3
+
 /* Some controllers (the VIA VL805) read up to four TRBs past the one they
  * execute, and may later take what they read for the contents of another
  * ring that has come to use that memory. Unused TRBs follow every endpoint
@@ -100,6 +104,8 @@ struct xhci_endpoint {
 	bool			recovering;
 		// A halted endpoint is being reset: descriptors linked meanwhile are
 		// rung once it has been.
+	uint8			halt_errors;
+		// transfers in a row that halted it with an error other than a stall
 
 	xhci_trb*		trbs; // [XHCI_ENDPOINT_RING_SIZE]
 	phys_addr_t 	trb_addr;
@@ -138,6 +144,8 @@ struct xhci_device {
 		// its driver wants its root port kept out of U3 in a suspend to idle
 	bool keep_running;
 		// its driver wants the whole bus left running in a suspend to idle
+	bool recovery_timed_out;
+		// a command to reset one of its halted endpoints got no answer
 
 	Device* usb_device;
 		// the stack's object, to set the device up again after S3
@@ -251,6 +259,8 @@ private:
 									xhci_endpoint *endpoint);
 			status_t			_UnlinkDescriptorForPipe(xhci_td *descriptor,
 									xhci_endpoint *endpoint);
+			bool				_MayRecoverHaltedEndpoint(
+									xhci_endpoint* endpoint);
 			void				_RecoverHaltedEndpoint(
 									xhci_endpoint* endpoint, xhci_td* td);
 
