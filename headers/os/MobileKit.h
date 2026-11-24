@@ -4167,9 +4167,12 @@ private:
 			DrawGlyph(this, B_GLYPH_GLOBE, iconRect, skin.controlText);
 		font_height height;
 		font.GetHeight(&height);
+		// The tabs behind sit in darker metal: their titles are darker still
+		// on aluminium (and stay light on graphite) so they read as well as
+		// the lit tab's.
 		rgb_color text = skin.controlText;
-		if (!lit)
-			text = MixColors(text, skin.barBottom, 0.25f);
+		if (!lit && !IsDarkSkin())
+			text = MixColors(text, make_color(0, 0, 0), 0.5f);
 		DrawEngraved(this, title.String(), BPoint(iconRect.right + 1
 			+ size * 0.4f, floorf((tab.top + tab.bottom + height.ascent
 				- height.descent) / 2)), text, skin.controlEmboss);
