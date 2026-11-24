@@ -139,8 +139,9 @@ choose_core(const ThreadData* threadData)
 		if (core == NULL) {
 			coreLocker.Unlock();
 
+			// (NULL when no core has all of its CPUs idle)
 			core = choose_idle_core();
-			if (useMask && !core->CPUMask().Matches(mask))
+			if (core != NULL && useMask && !core->CPUMask().Matches(mask))
 				core = NULL;
 
 			if (core == NULL) {

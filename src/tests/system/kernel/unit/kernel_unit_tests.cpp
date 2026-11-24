@@ -99,7 +99,7 @@ parse_command_line(char* buffer, char**& _argv, int& _argc)
 			if (*start == '\\') {
 				// escaped char
 				start++;
-				if (start == '\0')
+				if (*start == '\0')
 					break;
 			}
 

@@ -6,6 +6,10 @@
 
 #include "TestContext.h"
 
+#include <stdlib.h>
+
+#include <new>
+
 #include <util/AutoLock.h>
 
 #include "Test.h"
@@ -261,7 +265,11 @@ TestContext::TestDone(bool success)
 void
 TestContext::ErrorArgs(const char* format, va_list args)
 {
-	int size = vsnprintf(NULL, 0, format, args) + 1;
+	// (the arguments are read twice)
+	va_list sizeArgs;
+	va_copy(sizeArgs, args);
+	int size = vsnprintf(NULL, 0, format, sizeArgs) + 1;
+	va_end(sizeArgs);
 	char* buffer = (char*)malloc(size);
 	if (buffer == NULL)
 		return;

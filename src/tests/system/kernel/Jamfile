@@ -59,6 +59,15 @@ SimpleTest signal_frame_forge_test : signal_frame_forge_test.cpp ;
 # reset by every system call on processors with AVX-512)
 SimpleTest fpu_control_syscall_test : fpu_control_syscall_test.cpp ;
 
+# a thread bound to a CPU waking up in power-saving mode with no core idle: a
+# NULL dereference in the scheduler; read_port() against delete_port(): a
+# reader asleep on the deleted port (airos-works/haiku#168; the lock tests of
+# that issue are in unit/lock). The scheduler test changes the scheduler mode
+# for its run.
+SimpleTest scheduler_pinned_power_saving_test
+	: scheduler_pinned_power_saving_test.cpp ;
+SimpleTest port_delete_race_test : port_delete_race_test.cpp ;
+
 SimpleTest hello_avx : hello_avx.c ;
 local avxSource = [ FGristFiles hello_avx.c ] ;
 local avxObject = $(avxSource:S=$(SUFOBJ)) ;

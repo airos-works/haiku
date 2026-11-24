@@ -638,6 +638,13 @@ get_locked_port(port_id id) GCC_2_NRV(portRef)
 	if (portRef != NULL && portRef->state == Port::kActive) {
 		if (mutex_lock(&portRef->lock) != B_OK)
 			portRef.Unset();
+		else if (portRef->state != Port::kActive) {
+			// Deleted since we looked, and uninit_port() may have notified
+			// the port's waiters already: who waits for it from here on is
+			// never woken.
+			mutex_unlock(&portRef->lock);
+			portRef.Unset();
+		}
 	} else
 		portRef.Unset();
 
@@ -678,7 +685,10 @@ put_port_message(port_message* message)
 }
 
 
-/*! Port must be locked. */
+/*! Port must be locked. It is unlocked while waiting for space; when the
+	port is gone after that, the function returns \c B_BAD_PORT_ID with the
+	port unlocked. In all other cases the port is locked on return.
+*/
 static status_t
 get_port_message(int32 code, size_t bufferSize, uint32 flags, bigtime_t timeout,
 	port_message** _message, Port& port)
@@ -722,6 +732,8 @@ get_port_message(int32 code, size_t bufferSize, uint32 flags, bigtime_t timeout,
 
 			if (newPortRef.Get() != &port || is_port_closed(&port)) {
 				// the port is no longer usable
+				if (newPortRef != NULL)
+					mutex_unlock(&newPortRef->lock);
 				return B_BAD_PORT_ID;
 			}
 
@@ -1627,7 +1639,9 @@ writev_port_etc(port_id id, int32 msgCode, const iovec* msgVecs,
 		&message, *portRef);
 	if (status != B_OK) {
 		if (status == B_BAD_PORT_ID) {
-			// the port had to be unlocked and is now no longer there
+			// the port had to be unlocked and is now no longer there:
+			// there is nothing of ours to unlock
+			locker.Detach();
 			T(Write(id, 0, 0, 0, 0, B_BAD_PORT_ID));
 			return B_BAD_PORT_ID;
 		}

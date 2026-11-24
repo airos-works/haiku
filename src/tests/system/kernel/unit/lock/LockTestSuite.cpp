@@ -6,6 +6,7 @@
 
 #include "LockTestSuite.h"
 
+#include "MutexTests.h"
 #include "RWLockTests.h"
 
 
@@ -15,6 +16,7 @@ create_lock_test_suite()
 	TestSuite* suite = new(std::nothrow) TestSuite("lock");
 
 	ADD_TEST(suite, create_rw_lock_test_suite());
+	ADD_TEST(suite, create_mutex_test_suite());
 
 	return suite;
 }

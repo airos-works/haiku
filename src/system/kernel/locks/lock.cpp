@@ -40,6 +40,7 @@ struct rw_lock_waiter {
 	rw_lock_waiter*	next;		// next in queue
 	rw_lock_waiter*	last;		// last in queue (valid for the first in queue)
 	bool			writer;
+	bool			destroyed;	// set by rw_lock_destroy() before it wakes us
 };
 
 #define MUTEX_FLAG_RELEASED		0x2
@@ -324,6 +325,7 @@ rw_lock_wait(rw_lock* lock, bool writer, InterruptsSpinLocker& locker)
 	waiter.thread = thread_get_current_thread();
 	waiter.next = NULL;
 	waiter.writer = writer;
+	waiter.destroyed = false;
 
 	if (lock->waiters != NULL)
 		lock->waiters->last->next = &waiter;
@@ -338,10 +340,16 @@ rw_lock_wait(rw_lock* lock, bool writer, InterruptsSpinLocker& locker)
 
 	status_t result = thread_block();
 
+	// Woken by rw_lock_destroy(): there is no lock to get anymore, and its
+	// memory may be gone by the time we run. Leave without looking at it
+	// (the caller's locker stays unlocked).
+	if (waiter.destroyed)
+		return B_ERROR;
+
 	locker.Lock();
 	while (waiter.thread != NULL) {
-		// Woken, but not by rw_lock_unblock() (which dequeues us and clears
-		// waiter.thread) nor by rw_lock_destroy(): we are still queued and do
+		// Woken, but not by rw_lock_unblock() nor by rw_lock_destroy() (both
+		// dequeue us and clear waiter.thread): we are still queued and do
 		// not have the lock. Going on would make an uncounted reader (an
 		// "rw_lock_read_unlock(): lock not read-locked" panic later, hitting
 		// whoever unlocks next) and leave this stack frame in the queue
@@ -356,7 +364,15 @@ rw_lock_wait(rw_lock* lock, bool writer, InterruptsSpinLocker& locker)
 			lock);
 		locker.Unlock();
 		result = thread_block();
+		if (waiter.destroyed)
+			return B_ERROR;
 		locker.Lock();
+	}
+
+	if (waiter.destroyed) {
+		// destroyed while we were awake for another reason
+		locker.Unlock();
+		return B_ERROR;
 	}
 	return result;
 }
@@ -474,8 +490,15 @@ rw_lock_destroy(rw_lock* lock)
 		// dequeue
 		lock->waiters = waiter->next;
 
-		// unblock thread
-		thread_unblock(waiter->thread, B_ERROR);
+		// Unblock the thread. It is out of the queue for good: without the
+		// cleared thread field rw_lock_wait() took this for a wakeup that
+		// was not meant for it and blocked again, with nobody left to wake
+		// it (#168). The waiter is on its stack: not to be touched once it
+		// runs.
+		Thread* thread = waiter->thread;
+		waiter->destroyed = true;
+		waiter->thread = NULL;
+		thread_unblock(thread, B_ERROR);
 	}
 
 	lock->name = NULL;
@@ -651,6 +674,7 @@ _rw_lock_read_lock_with_timeout(rw_lock* lock, uint32 timeoutFlags,
 	waiter.thread = thread_get_current_thread();
 	waiter.next = NULL;
 	waiter.writer = false;
+	waiter.destroyed = false;
 
 	if (lock->waiters != NULL)
 		lock->waiters->last->next = &waiter;
@@ -664,6 +688,11 @@ _rw_lock_read_lock_with_timeout(rw_lock* lock, uint32 timeoutFlags,
 	locker.Unlock();
 
 	status_t error = thread_block_with_timeout(timeoutFlags, timeout);
+
+	// woken by rw_lock_destroy(): see rw_lock_wait()
+	if (waiter.destroyed)
+		return B_ERROR;
+
 	if (error == B_OK || waiter.thread == NULL) {
 		// We were unblocked successfully -- potentially our unblocker overtook
 		// us after we already failed. In either case, we've got the lock, now.
@@ -674,6 +703,20 @@ _rw_lock_read_lock_with_timeout(rw_lock* lock, uint32 timeoutFlags,
 	}
 
 	locker.Lock();
+
+	// The same, when it happened before we got the spinlock: we are not in
+	// the queue anymore.
+	if (waiter.destroyed) {
+		locker.Unlock();
+		return B_ERROR;
+	}
+	if (waiter.thread == NULL) {
+#if KDEBUG_RW_LOCK_DEBUG
+		_rw_lock_set_read_locked(lock);
+#endif
+		return B_OK;
+	}
+
 	// We failed to get the lock -- dequeue from waiter list.
 	rw_lock_waiter* previous = NULL;
 	rw_lock_waiter* other = lock->waiters;
@@ -1469,9 +1512,60 @@ mutex_wait(mutex* lock, InterruptsSpinLocker* locker, uint32 timeoutFlags,
 			}
 		}
 
-		// we need to fix the lock count
-		atomic_add(&lock->count, 1);
-		return error;
+		// We give up, and are out of the queue: our count goes back. Not
+		// while it is the only one (-1), though: then the holder has added
+		// its own in mutex_unlock() (which does not take the spinlock) and,
+		// having seen ours, is on its way to _mutex_unlock(). It would find
+		// nobody waiting and mark the mutex released for a thread that never
+		// comes: with the count back at 0 the next thread takes the mutex the
+		// fast way, and the one after that takes the released mark, so two
+		// hold it (#168). So that unlock gets its waiter: we have the mutex
+		// handed over, and give it up as any holder does. Looking at the
+		// count and giving ours back is one atomic step, as the holder's
+		// add can come in between.
+		while (true) {
+			int32 count = atomic_get(&lock->count);
+			if (count != -1) {
+				if (atomic_test_and_set(&lock->count, count + 1, count)
+						== count) {
+					return error;
+				}
+				continue;
+			}
+
+			if ((lock->flags & MUTEX_FLAG_RELEASED) != 0) {
+				// the unlock has come by meanwhile
+				lock->flags &= ~MUTEX_FLAG_RELEASED;
+				mutex_set_holder(lock);
+				locker->Unlock();
+				mutex_unlock(lock);
+				return error;
+			}
+
+			waiter.next = lock->waiters;
+			waiter.last = lock->waiters != NULL
+				? lock->waiters->last : &waiter;
+			waiter.acquired = false;
+			waiter.hand_off = true;
+			lock->waiters = &waiter;
+
+			thread_prepare_to_block(waiter.thread, 0, THREAD_BLOCK_TYPE_MUTEX,
+				lock);
+			locker->Unlock();
+			thread_block();
+
+			if (waiter.thread == NULL)
+				return B_ERROR;
+
+			locker->Lock();
+			mutex_settle_waiter(lock, &waiter);
+			if (!mutex_dequeue_waiter(lock, &waiter) && waiter.acquired) {
+				mutex_set_holder(lock);
+				locker->Unlock();
+				mutex_unlock(lock);
+				return error;
+			}
+		}
 	}
 }
 

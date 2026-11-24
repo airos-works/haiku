@@ -102,6 +102,69 @@ public:
 	}
 
 
+	/*!	Waiters of a lock that is destroyed must come back with an error
+		(airos-works/haiku#168: they blocked again, for good). The lock is a
+		separate one: the waiters that do not come back stay with it.
+	*/
+	bool TestDestroyWithWaiters(TestContext& context)
+	{
+		rw_lock* lock = new(std::nothrow) rw_lock;
+		TEST_ASSERT(lock != NULL);
+		rw_lock_init(lock, "test r/w lock to destroy");
+		TEST_ASSERT(rw_lock_write_lock(lock) == B_OK);
+
+		fDestroyLock = lock;
+		fDestroyResults[0] = fDestroyResults[1] = 1;
+
+		thread_id threads[2];
+		for (int i = 0; i < 2; i++) {
+			threads[i] = SpawnThread(this, &RWLockTest::DestroyWaiterThread,
+				"rw lock destroy test", B_NORMAL_PRIORITY, (void*)(addr_t)i);
+			TEST_ASSERT(threads[i] >= 0);
+			resume_thread(threads[i]);
+		}
+
+		// let them block
+		snooze(200000);
+
+		rw_lock_destroy(lock);
+
+		bool returned = true;
+		for (int i = 0; i < 2; i++) {
+			status_t status = wait_for_thread_etc(threads[i],
+				B_RELATIVE_TIMEOUT, 3000000, NULL);
+			if (status == B_BAD_THREAD_ID) {
+				// gone already: a kernel thread leaves no entry to wait for
+				status = B_OK;
+			}
+			if (status != B_OK) {
+				context.Error("the %s of the destroyed lock did not return "
+					"(%s)\n", i == 0 ? "reader" : "writer", strerror(status));
+				returned = false;
+			}
+		}
+		if (!returned) {
+			// they sit on the lock: it cannot be freed
+			return false;
+		}
+		delete lock;
+
+		TEST_ASSERT_PRINT(fDestroyResults[0] == B_ERROR,
+			"reader: %#" B_PRIx32, fDestroyResults[0]);
+		TEST_ASSERT_PRINT(fDestroyResults[1] == B_ERROR,
+			"writer: %#" B_PRIx32, fDestroyResults[1]);
+		return true;
+	}
+
+	void DestroyWaiterThread(TestContext& context, void* _index)
+	{
+		int index = (addr_t)_index;
+		fDestroyResults[index] = index == 0
+			? rw_lock_read_lock(fDestroyLock)
+			: rw_lock_write_lock(fDestroyLock);
+	}
+
+
 	// thread function wrappers
 
 	void TestConcurrentWriteReadThread(TestContext& context, void* _index)
@@ -293,6 +356,8 @@ private:
 	volatile bool		fTestGo;
 	volatile uint64		fLockCount;
 	volatile bool		fTestOK;
+			rw_lock*	fDestroyLock;
+	volatile status_t	fDestroyResults[2];
 };
 
 
@@ -308,6 +373,7 @@ create_rw_lock_test_suite()
 	ADD_STANDARD_TEST(suite, RWLockTest, TestConcurrentWriteRead);
 	ADD_STANDARD_TEST(suite, RWLockTest, TestConcurrentWriteNestedRead);
 	ADD_STANDARD_TEST(suite, RWLockTest, TestConcurrentDegrade);
+	ADD_STANDARD_TEST(suite, RWLockTest, TestDestroyWithWaiters);
 
 	return suite;
 }

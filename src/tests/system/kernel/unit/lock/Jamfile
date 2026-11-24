@@ -7,5 +7,6 @@ SubDirHdrs [ FDirName $(SUBDIR) $(DOTDOT) ] ;
 
 KernelMergeObject kernel_unit_tests_lock.o :
 	LockTestSuite.cpp
+	MutexTests.cpp
 	RWLockTests.cpp
 ;
