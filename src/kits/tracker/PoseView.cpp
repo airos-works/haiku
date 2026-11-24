@@ -3366,6 +3366,8 @@ BPoseView::SetViewMode(uint32 newMode)
 
 	uint32 lastIconMode = fViewState->LastIconMode();
 	if (newMode != kListMode) {
+		// only list views show folder sizes
+		CancelFolderSizes(BMessenger(this));
 		fViewState->SetLastIconMode(newMode);
 		if (newMode == kIconMode)
 			fViewState->SetLastIconSize(fViewState->IconSize());
@@ -4072,7 +4074,10 @@ BPoseView::SetShowFolderSizes(bool show)
 	}
 	Invalidate();
 
-	RequestFolderSizes(30000000);
+	if (ShowsFolderSizes())
+		RequestFolderSizes(30000000);
+	else
+		CancelFolderSizes(BMessenger(this));
 }
 
 

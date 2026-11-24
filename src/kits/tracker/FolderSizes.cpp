@@ -67,6 +67,9 @@ static std::multiset<NodeKey>* sQueuedNodes;
 	// the folders in sQueue, to find a request that is there quickly
 static sem_id sQueueSem = -1;
 static thread_id sThread = -1;
+static BMessenger sWalkTarget;
+	// whom the walk that is running is for
+static volatile bool sCancelWalk;
 
 
 static void
@@ -106,6 +109,10 @@ WalkFolder(const entry_ref& ref, dev_t device, const BMessenger& target)
 			if (++entries > kMaxEntriesPerFolder)
 				break;
 
+			if (sCancelWalk) {
+				// folder sizes were turned off in the window
+				return -1;
+			}
 			if ((entries % kEntriesBetweenChecks) == 0 && !target.IsValid()) {
 				// the window was closed: nobody waits for the size
 				return -1;
@@ -156,6 +163,10 @@ CalculatorThread(void*)
 				}
 				wait = std::min(wait, it->notBefore - now);
 			}
+			// set with the request taken, so that a cancel cannot fall
+			// between the two
+			sWalkTarget = found ? request.target : BMessenger();
+			sCancelWalk = false;
 		}
 
 		if (!found) {
@@ -289,6 +300,27 @@ RequestFolderSize(const entry_ref& ref, const node_ref& node,
 			resume_thread(sThread);
 	}
 	release_sem(sQueueSem);
+}
+
+
+void
+CancelFolderSizes(const BMessenger& target)
+{
+	BAutolock locker(sLock);
+	InitOnce();
+
+	for (std::deque<Request>::iterator it = sQueue->begin();
+			it != sQueue->end();) {
+		if (it->target != target) {
+			it++;
+			continue;
+		}
+		sQueuedNodes->erase(sQueuedNodes->find(NodeKey(it->node)));
+		it = sQueue->erase(it);
+	}
+
+	if (sWalkTarget == target)
+		sCancelWalk = true;
 }
 
 
