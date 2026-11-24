@@ -12,10 +12,12 @@
 // would have replaced.
 //
 //	tracker_fsops_test <folder on one volume> <folder on another volume>
-//		[-fat <folder on a FAT volume>] [-only <name>]
+//		[<folder on a small volume>] [-fat <folder on a FAT volume>]
+//		[-only <name>]
 //
-// The folders are emptied. The FAT volume is for copies that fail (it takes
-// no links and not every name).
+// The folders are emptied. The small volume (some tens of MiB) is for the
+// free space check, the FAT volume for copies that fail (it takes no links
+// and not every name).
 //
 // The window for name clashes and the alerts are answered by the test. Every
 // wait has a deadline. Exits 0 when everything is as it must be.
@@ -50,6 +52,12 @@
 #include "Commands.h"
 #include "FSUndoRedo.h"
 #include "FSUtils.h"
+#include "StatusWindow.h"
+
+
+namespace BPrivate {
+extern BStatusWindow* gStatusWindow;
+}
 
 
 enum Answer {
@@ -62,7 +70,7 @@ enum Answer {
 
 static const bigtime_t kDeadline = 60 * 1000000LL;
 
-static BString sA, sB, sFat;
+static BString sA, sB, sSmall, sFat;
 static const char* sOnly = NULL;
 static int sFailures = 0;
 static int sChecks = 0;
@@ -259,7 +267,7 @@ WaitForEngine(Answer answer = kAnswerDefault, int32 alertButton = 1)
 	while (system_time() < end) {
 		for (int32 i = 0; i < be_app->CountWindows(); i++) {
 			BWindow* window = be_app->WindowAt(i);
-			if (window == NULL)
+			if (window == NULL || window == gStatusWindow)
 				continue;
 			if (window->LockWithTimeout(1000000) != B_OK)
 				continue;
@@ -1037,6 +1045,157 @@ TrashSameName()
 }
 
 
+static BStatusView*
+StatusViewOfACopy()
+{
+	// the status view of a copy or move thread, if there is one
+	if (gStatusWindow == NULL || !gStatusWindow->Lock())
+		return NULL;
+	BStatusView* found = NULL;
+	BView* background = gStatusWindow->ChildAt(0);
+	for (int32 i = 0; background != NULL && i < background->CountChildren()
+			&& found == NULL; i++) {
+		found = dynamic_cast<BStatusView*>(background->ChildAt(i));
+	}
+	gStatusWindow->Unlock();
+	return found;
+}
+
+
+static void
+StatusAndStop()
+{
+	// #156: a copy into a folder has to show in the status window, and stop
+	// when told
+	BString big = P(a, "big16.bin");
+	MakeDir(a);
+	MakeDir(b);
+	{
+		BFile file(big.String(), B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);
+		char* buffer = (char*)malloc(1024 * 1024);
+		memset(buffer, 0x5a, 1024 * 1024);
+		for (int32 i = 0; i < 600; i++)
+			file.Write(buffer, 1024 * 1024);
+		free(buffer);
+	}
+	sync();
+
+	std::vector<BString> sources;
+	sources.push_back(big);
+	FSMoveToFolder(RefList(sources), new BEntry(b.String()), kCopySelectionTo,
+		NULL);
+
+	bool shown = false;
+	bool visible = false;
+	bigtime_t end = system_time() + 20 * 1000000LL;
+	while (system_time() < end && EngineThreadsRunning()) {
+		BStatusView* view = StatusViewOfACopy();
+		if (view != NULL) {
+			shown = true;
+			// the window comes up after a delay
+			if (gStatusWindow->Lock()) {
+				visible = !gStatusWindow->IsHidden();
+				if (visible)
+					view->SetWasCanceled();
+				gStatusWindow->Unlock();
+			}
+			if (visible)
+				break;
+		}
+		snooze(20000);
+	}
+
+	sChecks++;
+	if (shown && visible)
+		printf("    ok: the copy has a status item, the window is shown\n");
+	else if (shown)
+		Fail("the copy has a status item, but the window never showed");
+	else
+		Fail("the copy has no status item: no progress, no Stop");
+
+	bigtime_t stopAsked = system_time();
+	WaitForEngine();
+	if (shown && visible) {
+		printf("    the copy thread ended %.1f s after Stop\n",
+			(system_time() - stopAsked) / 1e6);
+		Expect("the stopped copy left nothing behind", b, "");
+	}
+	RemoveTree(P(b, "big16.bin").String());
+	BEntry(big.String()).Remove();
+}
+
+
+static void
+FreeSpaceCheck()
+{
+	// #156: a copy that cannot fit is refused before it starts
+	if (sSmall.Length() == 0) {
+		printf("    (no small volume given: not run)\n");
+		return;
+	}
+
+	BString dest = P(sSmall, "t17");
+	RemoveTree(dest.String());
+	MakeDir(dest);
+	BVolume volume(dev_for_path(dest.String()));
+	off_t freeBytes = volume.FreeBytes();
+	if (freeBytes > 512 * 1024 * 1024LL) {
+		Fail("the third volume is not small");
+		return;
+	}
+
+	// three files of 40 % of the free space each
+	char* buffer = (char*)malloc(64 * 1024);
+	memset(buffer, 0x3c, 64 * 1024);
+	std::vector<BString> sources;
+	for (int32 n = 0; n < 3; n++) {
+		BString name;
+		name << "part" << n << ".bin";
+		BString path = P(a, name.String());
+		MakeDir(a);
+		BFile file(path.String(), B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);
+		for (off_t written = 0; written < freeBytes * 2 / 5;
+				written += 64 * 1024) {
+			file.Write(buffer, 64 * 1024);
+		}
+		sources.push_back(path);
+	}
+	free(buffer);
+
+	Operate(kCopySelectionTo, sources, dest, kAnswerDefault, 0);
+	sChecks++;
+	bool asked = false;
+	for (size_t i = 0; i < sAlerts.size(); i++) {
+		if (sAlerts[i].find("not enough free space") != std::string::npos)
+			asked = true;
+	}
+	if (!asked)
+		Fail("no \"not enough free space\" alert");
+	Expect("nothing was copied", dest, "");
+
+	// Two of them fit. Copied again with a new file, they are skipped (the
+	// ones there are not older) and must not count: there is room for what
+	// is new.
+	sources.pop_back();
+	Operate(kCopySelectionTo, sources, dest, kAnswerDefault, 0);
+	MakeFile(P(a, "new.txt"), "A-new");
+	sources.push_back(P(a, "new.txt"));
+	Operate(kCopySelectionTo, sources, dest, kAnswerDefault, 0);
+	sChecks++;
+	if (!sAlerts.empty())
+		Fail("the second copy, of what is new, was refused");
+	BEntry newFile(P(dest, "new.txt").String());
+	BEntry part0(P(dest, "part0.bin").String());
+	BEntry part1(P(dest, "part1.bin").String());
+	if (newFile.Exists() && part0.Exists() && part1.Exists())
+		printf("    ok: copied again, the new file arrived\n");
+	else
+		Fail("after the second copy not all three files are there");
+
+	RemoveTree(dest.String());
+}
+
+
 struct Scenario {
 	const char*	name;
 	void		(*function)();
@@ -1081,6 +1240,8 @@ static const Scenario kScenarios[] = {
 	{ "move-across-volumes-many", MoveAcrossVolumesMany },
 	{ "move-across-volumes-failed-copy", MoveAcrossVolumesFailedCopy },
 	{ "trash-same-name", TrashSameName },
+	{ "status-and-stop", StatusAndStop },
+	{ "free-space-check", FreeSpaceCheck },
 	{ NULL, NULL }
 };
 
@@ -1142,13 +1303,15 @@ main(int argc, char** argv)
 	}
 	if (folders.size() < 2) {
 		fprintf(stderr, "usage: %s <folder on one volume> <folder on another "
-			"volume> [-fat <folder on a FAT volume>] [-only <name>]\n",
-			argv[0]);
+			"volume> [<folder on a small volume>] [-fat <folder on a FAT "
+			"volume>] [-only <name>]\n", argv[0]);
 		return 2;
 	}
 
 	sA = folders[0];
 	sB = folders[1];
+	if (folders.size() > 2)
+		sSmall = folders[2];
 	create_directory(sA.String(), 0755);
 	create_directory(sB.String(), 0755);
 	if (dev_for_path(sA.String()) == dev_for_path(sB.String())) {
@@ -1158,6 +1321,8 @@ main(int argc, char** argv)
 	}
 
 	BApplication app("application/x-vnd.airos-tracker-fsops-test");
+	gStatusWindow = new BStatusWindow();
+		// as Tracker has one: where copies show their progress
 
 	thread_id thread = spawn_thread(TestThread, "test", B_NORMAL_PRIORITY,
 		NULL);

@@ -203,6 +203,30 @@ CopyConflicts::DecisionFor(const BDirectory& dir, const char* name) const
 }
 
 
+void
+CopyConflicts::GetSizes(int32* skippedItems, off_t* skippedSize,
+	off_t* replacedSize) const
+{
+	*skippedItems = 0;
+	*skippedSize = 0;
+	*replacedSize = 0;
+
+	for (int32 index = 0; index < fConflicts.CountItems(); index++) {
+		CopyConflict* conflict = fConflicts.ItemAt(index);
+		if (conflict->sourceIsFolder || conflict->existingIsFolder) {
+			// a folder's size is not known here
+			continue;
+		}
+
+		if (conflict->decision == kConflictSkip) {
+			(*skippedItems)++;
+			*skippedSize += conflict->sourceSize;
+		} else if (conflict->decision == kConflictReplace)
+			*replacedSize += conflict->existingSize;
+	}
+}
+
+
 //	#pragma mark - the window
 
 

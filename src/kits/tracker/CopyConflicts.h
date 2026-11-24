@@ -74,6 +74,12 @@ public:
 
 			bool				Truncated() const { return fTruncated; }
 
+			// How many of the listed files are skipped, with their size,
+			// and the size of the files that are replaced
+			void				GetSizes(int32* skippedItems,
+									off_t* skippedSize,
+									off_t* replacedSize) const;
+
 private:
 			void				_FindIn(const BDirectory& sourceDir,
 									const BDirectory& destDir,

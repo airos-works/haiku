@@ -45,6 +45,8 @@ respective holders. All rights reserved.
 // low level FS calls.
 
 
+#include <algorithm>
+
 #include <ctype.h>
 #include <errno.h>
 #include <strings.h>
@@ -1000,15 +1002,16 @@ InitCopy(CopyLoopControl* loopControl, uint32 moveMode,
 					return B_ERROR;
 			}
 			// folders that meet folders merge; the files in them were
-			// decided above (or, past the listed ones, replaced)
+			// decided above (or, past the listed ones, replaced). On to
+			// the status display and the free space check.
 			*preflightResult = kReplaceAll;
-			return B_OK;
-		}
-
-		*preflightResult = PreFlightNameCheck(srcList, destDir, collisionCount, moveMode);
-		if (*preflightResult == kCanceled) {
-			// user canceled
-			return B_ERROR;
+		} else {
+			*preflightResult = PreFlightNameCheck(srcList, destDir,
+				collisionCount, moveMode);
+			if (*preflightResult == kCanceled) {
+				// user canceled
+				return B_ERROR;
+			}
 		}
 	}
 
@@ -1028,8 +1031,23 @@ InitCopy(CopyLoopControl* loopControl, uint32 moveMode,
 					return B_ERROR;
 				}
 
+				// What was skipped in the window for name clashes is not
+				// copied, and a file that is replaced makes room first: a
+				// folder copied a second time, to bring over what is new in
+				// it, needs little space.
+				off_t replacedSize = 0;
+				if (conflicts != NULL) {
+					int32 skippedItems = 0;
+					off_t skippedSize = 0;
+					conflicts->GetSizes(&skippedItems, &skippedSize,
+						&replacedSize);
+					totalItems = std::max(totalItems - skippedItems, (int32)0);
+					totalSize = std::max(totalSize - skippedSize, (off_t)0);
+				}
+
 				// check for free space before starting copy
-				if ((totalSize + (4* kKBSize)) >= dstVol->FreeBytes()) {
+				if ((totalSize - replacedSize + (4* kKBSize))
+						>= dstVol->FreeBytes()) {
 					BAlert* alert = new BAlert("", B_TRANSLATE_NOCOLLECT(kNoFreeSpace),
 						B_TRANSLATE("Cancel"), 0, 0, B_WIDTH_AS_USUAL, B_WARNING_ALERT);
 					alert->SetFlags(alert->Flags() | B_CLOSE_ON_ESCAPE);
