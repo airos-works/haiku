@@ -33,6 +33,11 @@ SimpleTest tcp_reset_send_test : tcp_reset_send_test.cpp
 SimpleTest test4 : test4.c
 	: $(TARGET_NETWORK_LIBS) ;
 
+# an address added to an interface that is up had no routes
+# (airos-works/haiku#183)
+SimpleTest alias_route_test : alias_route_test.cpp
+	: $(TARGET_NETWORK_LIBS) libbnetapi.so be [ TargetLibsupc++ ] ;
+
 SubInclude HAIKU_TOP src tests system network icmp ;
 SubInclude HAIKU_TOP src tests system network ipv6 ;
 SubInclude HAIKU_TOP src tests system network multicast ;

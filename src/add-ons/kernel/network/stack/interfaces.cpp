@@ -1354,6 +1354,12 @@ add_interface_address(Interface* interface, net_domain_private* domain,
 			address->local);
 		if (status != B_OK)
 			interface->RemoveAddress(address);
+		else if ((interface->flags & IFF_UP) != 0) {
+			// An interface that is up has the routes of its addresses (see
+			// Interface::_SetUp()). Without them, what this address sends
+			// to another address of this host leaves through the device.
+			address->AddDefaultRoutes(SIOCSIFADDR);
+		}
 	}
 	if (status == B_OK)
 		notify_interface_changed(interface);
