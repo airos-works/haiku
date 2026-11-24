@@ -15,8 +15,20 @@ cc1849cb2c5c327af4f7eccf993b8616855ad7c5, MIT License, see `LICENSE.X547`):
 a doorbell this does not ring, and get no engine) with the Fermi 2D class
 (`FERMI_TWOD_A`) on it. Work is a list of methods in a push buffer; every
 submission ends with a semaphore release, which is what waiting compares
-against. A submission that has not finished after 2 s marks the engine lost:
-every operation does nothing from then on and callers fall back to the CPU.
+against. A submission that has not finished after 2 s (or an error the
+channel's notifier reports) marks the engine lost: every operation does
+nothing and callers fall back to the CPU, until `NvEngine2D::Recover()` sets
+the channel up again. That keeps the address space and every buffer in it
+(the frame buffer's import, app_server's sources and shadows) and makes the
+channel's own objects anew: error notifier, GPFIFO, push buffer, semaphore,
+channel, USERD mapping, the 2D object and its initial state. The hooks that
+need the engine try it when they find it lost, at most every 5 s; a mode set
+and a resume try it at once. Sequence numbers go on: work done before the
+loss counts as done, work that went with the old channel as not done. The
+syslog says "giving up on the engine" at the loss and "2D engine ready (set
+up again after a loss, N so far)" after it. app_server, whose copies failed
+meanwhile, tries the device again 10 s later (then 20, 40 ... up to 5 min
+while it keeps failing) and at every mode set.
 
 What uses it:
 
@@ -75,6 +87,10 @@ Engine quirks found on the GTX 1070 (GP104):
 
 Settings (`~/config/settings/nvidia_rm_accelerant`): `acceleration 2d off`
 turns the engine off (no hooks; app_server copies with the CPU).
+`acceleration 2d_test_loss <seconds>` is a test of the recovery: the engine
+loses itself that many seconds after it started, and again that long after
+every recovery, as if a submission had stalled (read when the accelerant
+starts; off unless the line is there).
 `force_edid HDMI-0 <file>` forces a connector on with the EDID in the file, no
 monitor needed on a TMDS connector: a test rig. In app_server,
 `~/config/settings/app_server/no_device_copy` switches the flush back to CPU
@@ -82,6 +98,10 @@ copies while it exists (read every half second).
 
 Tests, none of which need a monitor: `nv2dtest [w h [timings]]` checks every
 operation of the engine against the CPU on surfaces of its own and times it;
+`nv2dtest w h recover [rounds]` loses the engine on purpose, sets it up again
+and checks every operation again on the same surfaces; `nv2drecoverytest`
+checks the recovery against a resman and GPU in memory (`FakeRm.cpp`), on any
+x86_64 machine, no card needed;
 `nvclone2dtest <accelerant>` checks every hook through a clone (it publishes a
 surface of its own as the screen while app_server is not on the card);
 `--attach` does the same on app_server's real screen and puts the pixels back;

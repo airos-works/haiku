@@ -25,7 +25,8 @@
 // USERD, which is reached by mapping the channel, and there is no doorbell,
 // so work is kicked by writing GPPut. Everything here throws when the card
 // says no; once a submission has not completed in time the engine counts as
-// lost and every call does nothing, so that callers fall back to the CPU.
+// lost and every call does nothing, so that callers fall back to the CPU,
+// until Recover() has set the channel up again.
 class NvEngine2D {
 public:
 	// A surface the engine draws into or reads from, at its GPU address.
@@ -75,8 +76,25 @@ public:
 	NvEngine2D &operator=(const NvEngine2D &other) = delete;
 
 	bool IsLost() const {return fLost;}
-	// What the constructor was doing when it threw.
+	// What the constructor (or the last Recover()) was doing when it failed.
 	const char *FailedStep() const;
+
+	// Sets a lost engine up again: a channel stalled once (a suspend while a
+	// copy was in flight, say) would otherwise leave every copy to the CPU
+	// until the accelerant is loaded again. The address space and every
+	// buffer in it stay - the frame buffer's import, app_server's sources and
+	// shadows - so nobody's surfaces change; what belonged to the old channel
+	// is freed and made anew (error notifier, GPFIFO, push buffer, semaphore,
+	// channel, USERD, the 2D object) and gets the initial state again.
+	// Returns whether the engine works again. Expects the lock held; waits
+	// for callers of Wait() without it to see the loss and leave first.
+	bool Recover();
+	uint32 Recoveries() const {return fRecoveries;}
+
+	// For tests of the recovery without a GPU that stalls: the first Wait()
+	// from \a when on gives up as one for a stalled submission does, with
+	// the same message. 0 disarms it.
+	void LoseAt(bigtime_t when) {fLoseAt = when;}
 
 	// Memory of our own. mapped leaves the CPU without a view of it.
 	Buffer Allocate(NvU64 size, bool systemMemory, bool mapped = true);
@@ -123,6 +141,8 @@ public:
 
 private:
 	void Init();
+	void InitChannel();
+	void FreeChannel();
 	void Method(uint32 method, uint32 value);
 	void Methods(uint32 method, const uint32 *values, uint32 count);
 	void Reserve(uint32 words);
@@ -159,6 +179,14 @@ private:
 	uint32 fOperation = ~0u;
 	std::atomic<bool> fLost = false;
 	const char *fStep = nullptr;
+	// callers in Wait(), which may run without the lock: Recover() frees
+	// what they read only once they have left
+	std::atomic<int32> fWaiters = 0;
+	std::atomic<bigtime_t> fLoseAt = 0;
+	uint32 fRecoveries = 0;
+	// submitted to a channel that was lost before doing them
+	uint32 fAbandonedFirst = 1;
+	uint32 fAbandonedLast = 0;
 
 	Surface fTarget;
 };

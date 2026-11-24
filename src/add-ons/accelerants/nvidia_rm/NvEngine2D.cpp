@@ -248,12 +248,25 @@ void NvEngine2D::Init()
 	vaParams.flags = NV_VASPACE_ALLOCATION_FLAGS_RETRY_PTE_ALLOC_IN_SYS;
 	fVaSpace = fRmDev.Device().Alloc(FERMI_VASPACE_A, &vaParams);
 
+	InitChannel();
+}
+
+
+// Everything that belongs to the channel, in the address space that stays:
+// what Recover() makes anew.
+void NvEngine2D::InitChannel()
+{
 	fStep = "the channel's buffers";
 	fNotifier = Allocate(B_PAGE_SIZE, true);
 	fGpFifo = Allocate(kGpFifoEntries * 8, true);
 	fPushBuffer = Allocate(kPushBufferSize, true);
 	fSemaphore = Allocate(B_PAGE_SIZE, true);
 	fPush = (uint32*)fPushBuffer.Address();
+	// The numbers go on from the last one handed out, which the new
+	// semaphore starts at: a sync token of before a recovery does not wait
+	// for work of after it (Wait() says whether its work was done, see
+	// Recover()).
+	*(volatile uint32*)fSemaphore.Address() = fSequence;
 
 	fStep = "the error notifier";
 	NV_CONTEXT_DMA_ALLOCATION_PARAMS notifierParams {};
@@ -298,8 +311,13 @@ void NvEngine2D::Init()
 	fChannel.Control(NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, &schedule, sizeof(schedule));
 
 	fStep = "the first submission";
-	// The state everything below assumes, as nouveau sets it up.
+	// The state everything below assumes, as nouveau sets it up; a new
+	// channel's push buffer and GPFIFO start at their beginnings.
 	std::lock_guard<std::recursive_mutex> lock(fLock);
+	fPushStart = fPushAt = 0;
+	fGpPut = 0;
+	fOperation = ~0u;
+	fLost = false;
 	Method(kTwoDSetObject, FERMI_TWOD_A);
 	Method(kTwoDSetNumProcessingClusters, 0);
 	SetOperation(kOperationSrcCopy);
@@ -320,19 +338,73 @@ void NvEngine2D::Init()
 }
 
 
+// The channel and its buffers, the objects that use memory before the
+// memory. Resman saying no to a free leaves that handle to the client's end;
+// the rest goes anyway.
+void NvEngine2D::FreeChannel()
+{
+	auto free = [](NvRmObject &object, const char *what) {
+		try {
+			object = NvRmObject();
+		} catch (const std::system_error &ex) {
+			debug_printf("[!] nvidia_rm 2D: freeing %s: %s\n", what, ex.what());
+			object.Detach();
+		}
+	};
+	fUserd = nullptr;
+	fPush = nullptr;
+	free(fTwoD, "the 2D object");
+	fUserdMapping = NvRmMemoryMapping();
+	free(fChannel, "the channel");
+	free(fErrorContext, "the error notifier");
+	fSemaphore.Release();
+	fPushBuffer.Release();
+	fGpFifo.Release();
+	fNotifier.Release();
+}
+
+
+bool NvEngine2D::Recover()
+{
+	std::lock_guard<std::recursive_mutex> lock(fLock);
+	if (!fLost)
+		return true;
+
+	// Nobody may read the semaphore or the notifier any more: those in
+	// Wait() see the loss at their next look (within 200 us), new ones
+	// leave at once while it lasts.
+	while (fWaiters.load() > 0)
+		snooze(100);
+
+	// What the old channel had not done when it stopped is gone with it:
+	// waiting for it says so, rather than that it was done.
+	if (fSemaphore.IsSet()) {
+		fAbandonedFirst = *(volatile uint32*)fSemaphore.Address() + 1;
+		fAbandonedLast = fSequence;
+	}
+	FreeChannel();
+	try {
+		InitChannel();
+	} catch (const std::system_error &ex) {
+		debug_printf("[!] nvidia_rm 2D: setting the engine up again: %s "
+			"failed: %s\n", fStep, ex.what());
+		fLost = true;
+		while (fWaiters.load() > 0)
+			snooze(100);
+		FreeChannel();
+		return false;
+	}
+	fRecoveries++;
+	return true;
+}
+
+
 NvEngine2D::~NvEngine2D()
 {
 	if (!fLost)
 		WaitIdle();
 	fTarget = Surface();
-	fTwoD = NvRmObject();
-	fUserdMapping = NvRmMemoryMapping();
-	fChannel = NvRmObject();
-	fErrorContext = NvRmObject();
-	fSemaphore.Release();
-	fPushBuffer.Release();
-	fGpFifo.Release();
-	fNotifier.Release();
+	FreeChannel();
 	fVaSpace = NvRmObject();
 }
 
@@ -437,8 +509,26 @@ bool NvEngine2D::CheckLost()
 
 bool NvEngine2D::Wait(uint32 sequence, bigtime_t timeout, bool spin)
 {
+	// counted before fLost is looked at: Recover() sets it, then waits for
+	// the count to drop
+	struct Counted {
+		std::atomic<int32> &count;
+		Counted(std::atomic<int32> &c): count(c) {count++;}
+		~Counted() {count--;}
+	} counted(fWaiters);
 	if (fLost)
 		return false;
+	if ((int32)(sequence - fAbandonedFirst) >= 0
+		&& (int32)(fAbandonedLast - sequence) >= 0)
+		return false;
+	bigtime_t loseAt = fLoseAt.load();
+	if (loseAt != 0 && system_time() >= loseAt
+		&& fLoseAt.compare_exchange_strong(loseAt, 0)) {
+		debug_printf("[!] nvidia_rm 2D: submission %" B_PRIu32 " lost by the "
+			"test setting, giving up on the engine\n", sequence);
+		fLost = true;
+		return false;
+	}
 	// The engine is quick: most waits are over before a snooze would be.
 	bigtime_t start = system_time();
 	while (!IsDone(sequence)) {

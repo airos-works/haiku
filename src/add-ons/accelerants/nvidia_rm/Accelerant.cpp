@@ -206,6 +206,10 @@ private:
 	};
 	std::vector<Source> fSources;
 	const Source *FindSource(uint32 id) const;
+	// When setting a lost engine up again was last tried, and how often the
+	// test setting makes it lose itself (0: never).
+	bigtime_t fEngineRecoveredAt = 0;
+	bigtime_t fEngineTestLoss = 0;
 	status_t CreateSource(uint16 width, uint16 height, color_space space,
 		bool systemMemory, frame_buffer_source *source);
 	uint32 fNextSourceID = 1;
@@ -262,6 +266,8 @@ private:
 	NvAccelerant(int devFd, const nv_haiku_scanout_info &scanout);
 
 	void StartEngine();
+	bool EngineWorks(bool now = false);
+	void RecoverEngineNow();
 	void RetargetEngine(NvHandle memory, uint64 size, uint32 width,
 		uint32 height, uint32 bytesPerRow, color_space colorSpace);
 	void UpdateEngineTarget();
@@ -330,7 +336,8 @@ public:
 
 	static NvAccelerant *Instance() {return sInstance;}
 	bool IsClone() const {return fIsClone;}
-	bool HasEngine() const {return fEngine && !fEngine->IsLost();}
+	// A lost engine counts: its hooks fail until it is set up again.
+	bool HasEngine() const {return fEngine != nullptr;}
 
 	uint32 EngineCount();
 	status_t AcquireEngine(uint32 capabilities, uint32 maxWait, sync_token *st,
@@ -453,6 +460,18 @@ static bool AccelerationDisabled()
 	char value[128];
 	return ReadSetting("acceleration", "2d", value, sizeof(value))
 		&& strcmp(value, "off") == 0;
+}
+
+// "acceleration 2d_test_loss <seconds>" is a test of the recovery: the engine
+// counts as lost that many seconds after it started, and again that long
+// after every time it was set up again, as if a submission had stalled.
+static bigtime_t EngineTestLoss()
+{
+	char value[128];
+	if (!ReadSetting("acceleration", "2d_test_loss", value, sizeof(value)))
+		return 0;
+	int seconds = atoi(value);
+	return seconds > 0 ? (bigtime_t)seconds * 1000000 : 0;
 }
 
 // NVKMS names a connector with a monitor on it after the monitor, "DELL
@@ -622,6 +641,9 @@ void NvAccelerant::ResumeThread()
 			debug_printf("[!] nvidia_rm: restoring after resume failed: %s\n",
 				ex.what());
 		}
+		// A copy waited for across the suspend may have run out of time
+		// meanwhile (the channels were stopped).
+		RecoverEngineNow();
 	}
 }
 
@@ -1050,7 +1072,45 @@ void NvAccelerant::StartEngine()
 	} catch (const std::system_error &ex) {
 		debug_printf("[!] nvidia_rm: no 2D acceleration: %s\n", ex.what());
 		fEngine.reset();
+		return;
 	}
+	fEngineTestLoss = EngineTestLoss();
+	if (fEngineTestLoss > 0) {
+		debug_printf("nvidia_rm: the 2D engine loses itself every %" B_PRId64
+			" s (test setting)\n", fEngineTestLoss / 1000000);
+		fEngine->LoseAt(system_time() + fEngineTestLoss);
+	}
+}
+
+// Whether the engine can be used. A lost one is set up again first, but not
+// more often than every few seconds, since a GPU that does not answer
+// keeps the caller waiting for a second each time; now: whenever it is lost
+// (after a resume, on a mode set). Called with the engine's lock held.
+bool NvAccelerant::EngineWorks(bool now)
+{
+	if (!fEngine->IsLost())
+		return true;
+	const bigtime_t kRecoveryInterval = 5000000;
+	bigtime_t time = system_time();
+	if (!now && fEngineRecoveredAt != 0
+		&& time - fEngineRecoveredAt < kRecoveryInterval)
+		return false;
+	fEngineRecoveredAt = time;
+	if (!fEngine->Recover())
+		return false;
+	debug_printf("nvidia_rm: 2D engine ready (set up again after a loss, %"
+		B_PRIu32 " so far)\n", fEngine->Recoveries());
+	if (fEngineTestLoss > 0)
+		fEngine->LoseAt(system_time() + fEngineTestLoss);
+	return true;
+}
+
+void NvAccelerant::RecoverEngineNow()
+{
+	if (!fEngine)
+		return;
+	std::lock_guard<std::recursive_mutex> lock(fEngine->Lock());
+	EngineWorks(true);
 }
 
 // Points the engine at the frame buffer, whenever that is a new one. The old
@@ -1096,6 +1156,9 @@ void NvAccelerant::UpdateEngineTarget()
 		(uint64)fFramebuffer.BytesPerRow() * fFramebuffer.Height(),
 		fFramebuffer.Width(), fFramebuffer.Height(), fFramebuffer.BytesPerRow(),
 		fFramebuffer.ColorSpace());
+	// a mode set is a fresh start for app_server's copies (it tries the
+	// device again after one), so for a lost engine too
+	RecoverEngineNow();
 }
 
 // A clone follows app_server's frame buffer, which is a new one after every
@@ -1147,7 +1210,7 @@ status_t NvAccelerant::AcquireEngine(uint32 capabilities, uint32 maxWait,
 	fEngine->Lock().lock();
 	if (fIsClone)
 		UpdateCloneTarget();
-	if (fEngine->IsLost() || !fEngine->Target().IsSet()) {
+	if (!EngineWorks() || !fEngine->Target().IsSet()) {
 		fEngine->Lock().unlock();
 		return B_ERROR;
 	}
@@ -1219,11 +1282,13 @@ status_t NvAccelerant::CreateFrameBufferShadow(uint16 width, uint16 height,
 status_t NvAccelerant::CreateSource(uint16 width, uint16 height,
 	color_space space, bool systemMemory, frame_buffer_source *source)
 {
-	if (!fEngine || fEngine->IsLost())
+	if (!fEngine)
 		return B_UNSUPPORTED;
 	if (space != B_RGB32 && space != B_RGBA32)
 		return B_BAD_VALUE;
 	std::lock_guard<std::recursive_mutex> lock(fEngine->Lock());
+	if (!EngineWorks())
+		return B_UNSUPPORTED;
 	uint32 bytesPerRow = ((uint32)width * 4 + 255) & ~255u;
 	Source entry;
 	entry.id = fNextSourceID++;
@@ -1264,7 +1329,7 @@ status_t NvAccelerant::CopyToFrameBuffer(uint32 id, const fill_rect_params *list
 	if (!fEngine)
 		return B_UNSUPPORTED;
 	std::lock_guard<std::recursive_mutex> lock(fEngine->Lock());
-	if (fEngine->IsLost() || !fEngine->Target().IsSet())
+	if (!EngineWorks() || !fEngine->Target().IsSet())
 		return B_ERROR;
 	const Source *source = FindSource(id);
 	if (source == nullptr)
@@ -1290,7 +1355,7 @@ status_t NvAccelerant::CopyFrameBufferSource(uint32 from, uint32 to,
 	if (!fEngine)
 		return B_UNSUPPORTED;
 	std::unique_lock<std::recursive_mutex> lock(fEngine->Lock());
-	if (fEngine->IsLost())
+	if (!EngineWorks())
 		return B_ERROR;
 	const Source *source = FindSource(from);
 	const Source *target = FindSource(to);

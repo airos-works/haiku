@@ -9,8 +9,11 @@
  * It needs no display and does not touch the screen: the surfaces are its
  * own.
  *
- * usage: nv2dtest [width height [timings]]
+ * usage: nv2dtest [width height [timings | recover [rounds]]]
  *   timings skips the checks (reading video memory back is slow).
+ *   recover loses the engine on purpose (NvEngine2D::LoseAt()) after the
+ *   checks, sets it up again (Recover()) and runs the checks again on the
+ *   same surfaces, rounds times (default 3); no timings then.
  */
 #include <algorithm>
 
@@ -122,10 +125,13 @@ static void CpuBlit(Picture &picture, const blit_params &blit)
 int main(int argc, char **argv)
 {
 	bool timingsOnly = false;
+	int recoverRounds = 0;
 	if (argc >= 3) {
 		sWidth = atoi(argv[1]);
 		sHeight = atoi(argv[2]);
 		timingsOnly = argc >= 4 && strcmp(argv[3], "timings") == 0;
+		if (argc >= 4 && strcmp(argv[3], "recover") == 0)
+			recoverRounds = argc >= 5 ? atoi(argv[4]) : 3;
 	}
 
 	// Resman brings the card up when its node is opened and takes it down
@@ -180,9 +186,7 @@ int main(int argc, char **argv)
 		NvEngine2D::Buffer system2 = engine.Allocate((NvU64)bytesPerRow * sHeight, true);
 		NvEngine2D::Surface shadow = surface;
 		shadow.gpuAddress = system2.GpuAddress();
-		if (timingsOnly)
-			goto timings;
-	{
+		auto checks = [&]() {
 		// fills, edges included, one rectangle partly off the surface
 		reset();
 		fill_rect_params fills[] = {{0, 0, 0, 0}, {10, 20, 300, 40},
@@ -344,9 +348,62 @@ int main(int argc, char **argv)
 			for (int32 x = mixed.left; x <= mixed.right; x++)
 				expected.At(x, y) = y == 300 && x < 300 ? 0xcafef00d : source.At(x, y);
 		check("engine and CPU writes to one shadow, copied to the screen");
-	}
+		};
+		if (!timingsOnly)
+			checks();
 
-timings:
+		// lost and set up again: the surfaces made before stay usable
+		for (int round = 1; round <= recoverRounds; round++) {
+			printf("\nrecovery %d:\n", round);
+			uint32 before = engine.Submit();
+			reset();
+			fill_rect_params block = {0, 0, 63, 63};
+			engine.FillRectangles(0x00abcdef, &block, 1);
+			uint32 pending = engine.Submit();
+			engine.LoseAt(1);
+			if (engine.Wait(pending) || !engine.IsLost()) {
+				printf("FAIL the test setting did not lose the engine\n");
+				sFailures++;
+			} else
+				printf("ok   lost on purpose\n");
+			fill_rect_params nothing = {0, 0, 9, 9};
+			engine.FillRectangles(0, &nothing, 1);
+			if (engine.Submit() != pending) {
+				printf("FAIL a lost engine took work\n");
+				sFailures++;
+			}
+			bigtime_t begin = system_time();
+			if (!engine.Recover() || engine.IsLost()) {
+				printf("FAIL setting the engine up again: %s\n",
+					engine.FailedStep() != nullptr ? engine.FailedStep() : "?");
+				sFailures++;
+				break;
+			}
+			printf("ok   set up again in %" B_PRId64 " us (%" B_PRIu32
+				" so far)\n", system_time() - begin, engine.Recoveries());
+			// done before the loss: done; the fill handed to the old channel
+			// is done if it got that far, else gone with it - either way,
+			// waiting for it does not wait for work of the new channel
+			if (!engine.Wait(before)) {
+				printf("FAIL work done before the loss counts as not done\n");
+				sFailures++;
+			}
+			printf("     the fill of before the loss: %s\n",
+				engine.Wait(pending) ? "done" : "abandoned");
+			if (engine.IsLost()) {
+				printf("FAIL waiting for old work lost the engine again\n");
+				sFailures++;
+			}
+			checks();
+		}
+		if (recoverRounds > 0) {
+			if (engine.IsLost()) {
+				printf("FAIL the engine was lost\n");
+				sFailures++;
+			}
+			printf("\n%d failures\n", sFailures);
+			return sFailures == 0 ? 0 : 1;
+		}
 
 		// timings
 		printf("\ntimings, %" B_PRIu32 "x%" B_PRIu32 ":\n", sWidth, sHeight);

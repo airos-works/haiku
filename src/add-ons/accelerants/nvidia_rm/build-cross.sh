@@ -182,6 +182,25 @@ $TOOLS-g++ -nostdlib -o "$OUT/bin/nv2dtest" \
 	-Wl,--no-undefined -Wl,-rpath-link,"$BUILD"
 echo "built nv2dtest into $OUT/bin"
 
+# Test: NvEngine2D's recovery from a loss against a resman and GPU in memory,
+# no card needed (see Engine2DRecoveryTest.cpp).
+TOOLDIR=$OBJDIR/nv2drecoverytest
+mkdir -p "$TOOLDIR"
+for f in Engine2DRecoveryTest FakeRm NvEngine2D sdk/ErrorUtils; do
+	$TOOLS-g++ -std=c++20 "${FLAGS[@]}" -c "$SRC/$f.cpp" -o "$TOOLDIR/$(basename $f).o"
+done
+$TOOLS-gcc "${FLAGS[@]}" -c "$OGKM/src/common/shared/nvstatus/nvstatus.c" \
+	-o "$TOOLDIR/nvstatus.o"
+$TOOLS-g++ -nostdlib -o "$OUT/bin/nv2drecoverytest" \
+	"$OBJ/system/glue/arch/x86_64/crti.o" "$GCCLIB/crtbegin.o" \
+	"$OBJ/system/glue/start_dyn.o" "$OBJ/system/glue/init_term_dyn.o" \
+	"$TOOLDIR"/*.o \
+	"$OBJ/system/libroot/libroot.so" "$GCC_SYSLIBS_RUNTIME/lib/libstdc++.so" \
+	"$GCC_SYSLIBS_RUNTIME/lib/libgcc_s.so" "$GCCLIB/libgcc.a" \
+	"$GCCLIB/crtend.o" "$OBJ/system/glue/arch/x86_64/crtn.o" \
+	-Wl,--no-undefined -Wl,-rpath-link,"$BUILD"
+echo "built nv2drecoverytest into $OUT/bin"
+
 # Diagnostic tool: the accelerant's 2D hooks through a clone, as a
 # BWindowScreen program uses them (see CloneTwoDTest.cpp).
 TOOLDIR=$OBJDIR/nvclone2dtest
