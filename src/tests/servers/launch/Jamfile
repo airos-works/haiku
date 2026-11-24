@@ -27,4 +27,7 @@ UnitTestLib liblaunch_daemontest.so :
 	: be network bnetapi shared [ TargetLibstdc++ ] [ TargetLibsupc++ ]
 ;
 
+# BMessenger(signature) and the jobs the launch_daemon did not launch
+SimpleTest launch_data_test : launch_data_test.cpp : be [ TargetLibsupc++ ] ;
+
 SubInclude HAIKU_TOP src tests servers launch tools ;

@@ -465,6 +465,17 @@ Job::HandleGetLaunchData(BMessage* message)
 	if (!IsEnabled())
 		return B_NOT_ALLOWED;
 
+	// A service is launched on demand, by this very request if need be, and
+	// the reply waits for that. A plain job is not: unless it is in the job
+	// queue right now, the daemon may never launch it (its condition is not
+	// met, its target does not run, it has run and ended), while its
+	// application may well have been started by someone else. Keeping the
+	// request would keep the caller waiting forever, and that is every
+	// BMessenger(signature) of the job's name. There is no launch data: the
+	// caller asks the registrar then.
+	if (!IsService() && !IsLaunching())
+		return B_NAME_NOT_FOUND;
+
 	return fPendingLaunchDataReplies.AddItem(message) ? B_OK : B_NO_MEMORY;
 }
 
