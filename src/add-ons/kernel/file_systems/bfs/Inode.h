@@ -47,6 +47,7 @@ public:
 			void				SetID(ino_t ID);
 
 			rw_lock&			Lock() { return fLock; }
+			rw_lock&			GapLock() { return fGapLock; }
 			ReadLocker			ReadLock() { return ReadLocker(fLock); }
 			void				WriteLockInTransaction(Transaction& transaction);
 
@@ -283,7 +284,9 @@ private:
 			rw_lock				fGapLock;
 				// WriteAt(): held exclusively by a write that grows the file
 				// (across the growth, zeroing the gap and its own data),
-				// shared by all others; always taken before fLock
+				// shared by all others; bfs_write_stat(): held exclusively
+				// across a change of the size and zeroing the new blocks;
+				// always taken before the transaction and fLock
 			Volume*				fVolume;
 			ino_t				fID;
 			BPlusTree*			fTree;

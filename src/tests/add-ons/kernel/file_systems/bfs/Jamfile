@@ -8,6 +8,10 @@ SimpleTest bfs_concurrent_grow_test :
 	bfs_concurrent_grow_test.c
 ;
 
+SimpleTest bfs_grow_zero_test :
+	bfs_grow_zero_test.c
+;
+
 SimpleTest bfs_attribute_iterator_test :
 	bfs_attribute_iterator_test.cpp
 	: be ;

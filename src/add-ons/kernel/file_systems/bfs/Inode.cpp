@@ -1767,6 +1767,8 @@ Inode::WriteAt(Transaction& transaction, off_t pos, const uint8* buffer,
 
 	size_t length = *_length;
 	bool changeSize = (uint64)pos + (uint64)length > (uint64)Size();
+	bool ownTransaction = !transaction.IsStarted();
+		// a transaction started in here is one that only grows this file
 
 	// set/check boundaries for pos/length
 	if (pos < 0)
@@ -1836,8 +1838,19 @@ Inode::WriteAt(Transaction& transaction, off_t pos, const uint8* buffer,
 		writeLocker.Unlock();
 
 	if (status == B_OK) {
-		if (oldSize < pos && gapLockedExclusively)
-			status = FillGapWithZeros(oldSize, pos);
+		if (oldSize < pos && gapLockedExclusively) {
+			// Zeroing the gap is as much writing as the gap is long. With
+			// the transaction open, nothing else could create, delete or
+			// extend a file on the volume meanwhile, so it ends here if it
+			// is ours: all it had to do, the new size, is done. (The caller
+			// of bfs_write_stat() has the same problem and the same answer.)
+			if (ownTransaction && transaction.IsStarted()) {
+				WriteLockInTransaction(transaction);
+				status = transaction.Done();
+			}
+			if (status == B_OK)
+				status = FillGapWithZeros(oldSize, pos);
+		}
 
 		// If we don't want to write anything, we can now return (we may
 		// just have changed the file size using the position parameter)

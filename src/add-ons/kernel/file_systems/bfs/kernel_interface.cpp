@@ -903,99 +903,126 @@ bfs_write_stat(fs_volume* _volume, fs_vnode* _node, const struct stat* stat,
 	bfs_inode& node = inode->Node();
 	bool updateChangeTime = false, updateModificationTime = false;
 
-	Transaction transaction(volume, inode->BlockNumber());
-	inode->WriteLockInTransaction(transaction);
+	// A file that grows gets its new blocks filled with zeros (BFS has no
+	// sparse files, and the blocks hold what was there before). That is
+	// writing the whole gap through the file cache, which for gigabytes takes
+	// as long as the disk takes: it must not happen inside the transaction,
+	// or nothing else can create, delete, rename or extend a file on this
+	// volume until it is done. So the transaction only changes the size, and
+	// the zeros follow when it has ended. fGapLock is held across both: a
+	// write that finds the new size waits until its range has been zeroed,
+	// instead of being overwritten by the zeros (as in Inode::WriteAt(), with
+	// the same order: fGapLock, transaction, inode lock).
+	WriteLocker gapLocker(inode->GapLock(), false, (mask & B_STAT_SIZE) != 0);
+	off_t gapStart = 0;
+	off_t gapEnd = 0;
+	status_t status;
 
-	if (check_write_stat_permissions(node.GroupID(), node.UserID(), node.Mode(),
-			mask, stat) != B_OK)
-		RETURN_ERROR(B_NOT_ALLOWED);
+	{
+		Transaction transaction(volume, inode->BlockNumber());
+		inode->WriteLockInTransaction(transaction);
 
-	if ((mask & B_STAT_SIZE) != 0) {
-		// Since B_STAT_SIZE is the only thing that can fail directly, we
-		// do it first, so that the inode state will still be consistent
-		// with the on-disk version
-		if (inode->IsDirectory())
-			return B_IS_A_DIRECTORY;
-		if (!inode->IsFile())
-			return B_BAD_VALUE;
+		if (check_write_stat_permissions(node.GroupID(), node.UserID(),
+				node.Mode(), mask, stat) != B_OK)
+			RETURN_ERROR(B_NOT_ALLOWED);
 
-		off_t oldSize = inode->Size();
+		if ((mask & B_STAT_SIZE) != 0) {
+			// Since B_STAT_SIZE is the only thing that can fail directly, we
+			// do it first, so that the inode state will still be consistent
+			// with the on-disk version
+			if (inode->IsDirectory())
+				return B_IS_A_DIRECTORY;
+			if (!inode->IsFile())
+				return B_BAD_VALUE;
 
-		status_t status = inode->SetFileSize(transaction, stat->st_size);
-		if (status != B_OK)
-			return status;
+			off_t oldSize = inode->Size();
 
-		// fill the new blocks (if any) with zeros
-		if ((mask & B_STAT_SIZE_INSECURE) == 0) {
-			// We must not keep the inode locked during a write operation,
-			// or else we might deadlock.
-			rw_lock_write_unlock(&inode->Lock());
-			inode->FillGapWithZeros(oldSize, inode->Size());
-			rw_lock_write_lock(&inode->Lock());
+			status = inode->SetFileSize(transaction, stat->st_size);
+			if (status != B_OK)
+				return status;
+
+			// the new blocks (if any) are filled with zeros below
+			if ((mask & B_STAT_SIZE_INSECURE) == 0 && inode->Size() > oldSize) {
+				gapStart = oldSize;
+				gapEnd = inode->Size();
+			}
+
+			if (!inode->IsDeleted()) {
+				Index index(volume);
+				index.UpdateSize(transaction, inode);
+
+				updateChangeTime = updateModificationTime = true;
+			}
 		}
 
-		if (!inode->IsDeleted()) {
-			Index index(volume);
-			index.UpdateSize(transaction, inode);
-
-			updateChangeTime = updateModificationTime = true;
+		if ((mask & B_STAT_UID) != 0) {
+			node.uid = HOST_ENDIAN_TO_BFS_INT32(stat->st_uid);
+			updateChangeTime = true;
 		}
-	}
 
-	if ((mask & B_STAT_UID) != 0) {
-		node.uid = HOST_ENDIAN_TO_BFS_INT32(stat->st_uid);
-		updateChangeTime = true;
-	}
-
-	if ((mask & B_STAT_GID) != 0) {
-		node.gid = HOST_ENDIAN_TO_BFS_INT32(stat->st_gid);
-		updateChangeTime = true;
-	}
-
-	if ((mask & B_STAT_MODE) != 0) {
-		PRINT(("original mode = %u, stat->st_mode = %u\n",
-			(unsigned int)node.Mode(), (unsigned int)stat->st_mode));
-		node.mode = HOST_ENDIAN_TO_BFS_INT32((node.Mode() & ~S_IUMSK)
-			| (stat->st_mode & S_IUMSK));
-		updateChangeTime = true;
-	}
-
-	if ((mask & B_STAT_CREATION_TIME) != 0) {
-		node.create_time
-			= HOST_ENDIAN_TO_BFS_INT64(bfs_inode::ToInode(stat->st_crtim));
-	}
-
-	if ((mask & B_STAT_MODIFICATION_TIME) != 0 || updateModificationTime) {
-		int64 newTime;
-		if ((mask & B_STAT_MODIFICATION_TIME) == 0)
-			newTime = bfs_inode::ToInode(real_time_clock_usecs());
-		else
-			newTime = bfs_inode::ToInode(stat->st_mtim);
-
-		if (!inode->InLastModifiedIndex()) {
-			// directory modification times are not part of the index
-			node.last_modified_time
-				= HOST_ENDIAN_TO_BFS_INT64(newTime);
-		} else if (!inode->IsDeleted()) {
-			// Index::UpdateLastModified() will set the new time in the inode
-			Index index(volume);
-			index.UpdateLastModified(transaction, inode, newTime);
+		if ((mask & B_STAT_GID) != 0) {
+			node.gid = HOST_ENDIAN_TO_BFS_INT32(stat->st_gid);
+			updateChangeTime = true;
 		}
+
+		if ((mask & B_STAT_MODE) != 0) {
+			PRINT(("original mode = %u, stat->st_mode = %u\n",
+				(unsigned int)node.Mode(), (unsigned int)stat->st_mode));
+			node.mode = HOST_ENDIAN_TO_BFS_INT32((node.Mode() & ~S_IUMSK)
+				| (stat->st_mode & S_IUMSK));
+			updateChangeTime = true;
+		}
+
+		if ((mask & B_STAT_CREATION_TIME) != 0) {
+			node.create_time
+				= HOST_ENDIAN_TO_BFS_INT64(bfs_inode::ToInode(stat->st_crtim));
+		}
+
+		if ((mask & B_STAT_MODIFICATION_TIME) != 0 || updateModificationTime) {
+			int64 newTime;
+			if ((mask & B_STAT_MODIFICATION_TIME) == 0)
+				newTime = bfs_inode::ToInode(real_time_clock_usecs());
+			else
+				newTime = bfs_inode::ToInode(stat->st_mtim);
+
+			if (!inode->InLastModifiedIndex()) {
+				// directory modification times are not part of the index
+				node.last_modified_time
+					= HOST_ENDIAN_TO_BFS_INT64(newTime);
+			} else if (!inode->IsDeleted()) {
+				// Index::UpdateLastModified() will set the new time in the
+				// inode
+				Index index(volume);
+				index.UpdateLastModified(transaction, inode, newTime);
+			}
+		}
+
+		if ((mask & B_STAT_CHANGE_TIME) != 0 || updateChangeTime) {
+			int64 newTime;
+			if ((mask & B_STAT_CHANGE_TIME) == 0)
+				newTime = bfs_inode::ToInode(real_time_clock_usecs());
+			else
+				newTime = bfs_inode::ToInode(stat->st_ctim);
+
+			node.status_change_time = HOST_ENDIAN_TO_BFS_INT64(newTime);
+		}
+
+		status = inode->WriteBack(transaction);
+		if (status == B_OK)
+			status = transaction.Done();
 	}
 
-	if ((mask & B_STAT_CHANGE_TIME) != 0 || updateChangeTime) {
-		int64 newTime;
-		if ((mask & B_STAT_CHANGE_TIME) == 0)
-			newTime = bfs_inode::ToInode(real_time_clock_usecs());
-		else
-			newTime = bfs_inode::ToInode(stat->st_ctim);
-
-		node.status_change_time = HOST_ENDIAN_TO_BFS_INT64(newTime);
+	// The transaction has ended and with it the hold on the inode's lock,
+	// which a write operation must not keep anyway. The size has changed even
+	// if the transaction failed afterwards, so the blocks are zeroed either
+	// way.
+	if (gapEnd > gapStart) {
+		status_t fillStatus = inode->FillGapWithZeros(gapStart, gapEnd);
+		if (status == B_OK)
+			status = fillStatus;
 	}
+	gapLocker.Unlock();
 
-	status_t status = inode->WriteBack(transaction);
-	if (status == B_OK)
-		status = transaction.Done();
 	if (status == B_OK)
 		notify_stat_changed(volume->ID(), inode->ParentID(), inode->ID(), mask);
 
