@@ -96,7 +96,8 @@ Model::Model()
 	fNode(NULL),
 	fStatus(B_NO_INIT),
 	fHasLocalizedName(false),
-	fLocalizedNameIsCached(false)
+	fLocalizedNameIsCached(false),
+	fNoNodeIconWhenSmall(false)
 {
 }
 
@@ -112,7 +113,8 @@ Model::Model(const Model& other)
 	fNode(NULL),
 	fLocalizedName(other.fLocalizedName),
 	fHasLocalizedName(other.fHasLocalizedName),
-	fLocalizedNameIsCached(other.fLocalizedNameIsCached)
+	fLocalizedNameIsCached(other.fLocalizedNameIsCached),
+	fNoNodeIconWhenSmall(other.fNoNodeIconWhenSmall)
 {
 	fStatBuf.st_dev = other.NodeRef()->device;
 	fStatBuf.st_ino = other.NodeRef()->node;
@@ -139,7 +141,8 @@ Model::Model(const node_ref* dirNode, const node_ref* node, const char* name,
 	fWritable(false),
 	fNode(NULL),
 	fHasLocalizedName(false),
-	fLocalizedNameIsCached(false)
+	fLocalizedNameIsCached(false),
+	fNoNodeIconWhenSmall(false)
 {
 	SetTo(dirNode, node, name, open, writable);
 }
@@ -151,7 +154,8 @@ Model::Model(const BEntry* entry, bool open, bool writable)
 	fWritable(false),
 	fNode(NULL),
 	fHasLocalizedName(false),
-	fLocalizedNameIsCached(false)
+	fLocalizedNameIsCached(false),
+	fNoNodeIconWhenSmall(false)
 {
 	SetTo(entry, open, writable);
 }
@@ -165,7 +169,8 @@ Model::Model(const entry_ref* ref, bool traverse, bool open, bool writable)
 	fWritable(false),
 	fNode(NULL),
 	fHasLocalizedName(false),
-	fLocalizedNameIsCached(false)
+	fLocalizedNameIsCached(false),
+	fNoNodeIconWhenSmall(false)
 {
 	BEntry entry(ref, traverse);
 	fStatus = entry.InitCheck();
@@ -223,6 +228,7 @@ Model::SetTo(const BEntry* entry, bool open, bool writable)
 	fNode = NULL;
 	DeletePreferredAppVolumeNameLinkTo();
 	fIconFrom = kUnknownSource;
+	fNoNodeIconWhenSmall = false;
 	fBaseType = kUnknownNode;
 	fMimeType = "";
 
@@ -249,6 +255,7 @@ Model::SetTo(const entry_ref* newRef, bool traverse, bool open, bool writable)
 	fNode = NULL;
 	DeletePreferredAppVolumeNameLinkTo();
 	fIconFrom = kUnknownSource;
+	fNoNodeIconWhenSmall = false;
 	fBaseType = kUnknownNode;
 	fMimeType = "";
 
@@ -282,6 +289,7 @@ Model::SetTo(const node_ref* dirNode, const node_ref* nodeRef,
 	fNode = NULL;
 	DeletePreferredAppVolumeNameLinkTo();
 	fIconFrom = kUnknownSource;
+	fNoNodeIconWhenSmall = false;
 	fBaseType = kUnknownNode;
 	fMimeType = "";
 
@@ -781,6 +789,9 @@ void
 Model::ResetIconFrom()
 {
 	BModelOpener opener(this);
+
+	// its icon attributes changed
+	fNoNodeIconWhenSmall = false;
 
 	if (InitCheck() != B_OK)
 		return;

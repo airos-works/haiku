@@ -589,8 +589,7 @@ GetThumbnailFromAttr(Model* model, BBitmap* icon, BSize size, BView* view,
 	if (node == NULL)
 		return B_BAD_VALUE;
 
-	// a page or a frame says nothing at mini icon size: the type's icon does
-	if (!IsImageType(model->MimeType()) && size.IntegerWidth() + 1 < 32)
+	if (!ThumbnailAtSize(model->MimeType(), size))
 		return B_NOT_SUPPORTED;
 
 
@@ -665,6 +664,13 @@ ThumbnailFailed(const Model* model)
 	bool ownIcon = true;
 	return ThumbnailFailedBefore(*model->NodeRef(),
 		model->StatBuf()->st_mtime, &ownIcon) && !ownIcon;
+}
+
+
+bool
+ThumbnailAtSize(const char* type, BSize size)
+{
+	return IsImageType(type) || size.IntegerWidth() + 1 >= 32;
 }
 
 

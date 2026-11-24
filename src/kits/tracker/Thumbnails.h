@@ -36,6 +36,11 @@ bool ShouldGenerateThumbnail(const char* type);
 // it again.
 bool ThumbnailFailed(const Model* model);
 
+// Whether a file of that type gets a thumbnail drawn at that size: pictures
+// do at any size, documents and videos only from 32 pixels up (a page or a
+// frame says nothing at mini icon size, the type's icon does).
+bool ThumbnailAtSize(const char* type, BSize size);
+
 
 } // namespace BPrivate
 

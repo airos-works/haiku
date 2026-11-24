@@ -151,6 +151,14 @@ public:
 		// called from the attribute changed calls to force a lookup of
 		// a new icon
 
+	bool NoNodeIconWhenSmall() const { return fNoNodeIconWhenSmall; }
+	void SetNoNodeIconWhenSmall(bool noIcon)
+		{ fNoNodeIconWhenSmall = noIcon; }
+		// a file whose icon is from its node only for its thumbnail, which
+		// it does not get below 32 pixels (a document): the IconCache
+		// found it has no icon of its own and need not open it again at
+		// every draw in a list view; forgotten when its icon changes
+
 	// symlink handling calls, mainly used by the IconCache
 	const Model* ResolveIfLink() const;
 	Model* ResolveIfLink();
@@ -271,6 +279,7 @@ private:
 	BString fLocalizedName;
 	bool fHasLocalizedName;
 	bool fLocalizedNameIsCached;
+	bool fNoNodeIconWhenSmall;
 };
 
 

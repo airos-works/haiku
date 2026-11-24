@@ -1005,14 +1005,21 @@ IconCache::Preload(AutoLock<SimpleIconCache>* nodeCacheLocker,
 					resultingOpenCache = nodeCacheLocker;
 					resultingOpenCache->Lock();
 
-					if (!ThumbnailFailed(model)) {
+					// Not worth opening the file at every redraw when it has
+					// no icon of its own and no thumbnail: one that failed,
+					// or a document below 32 pixels (a list view), which
+					// gets none at that size
+					if (!ThumbnailFailed(model)
+						&& !(model->NoNodeIconWhenSmall()
+							&& !ThumbnailAtSize(model->MimeType(), size))) {
 						entry = GetNodeIcon(&modelOpener, nodeCacheLocker,
 							&resultingOpenCache, model, source, mode,
 							size, &lazyBitmap, entry, permanent, view, where);
+						if (entry == NULL
+							&& !ThumbnailAtSize(model->MimeType(), size)) {
+							model->SetNoNodeIconWhenSmall(true);
+						}
 					}
-						// else no thumbnail and no icon of its own: not
-						// worth opening the file at every redraw to find
-						// that out again
 					if (entry == NULL) {
 						// no thumbnail (yet, or at this size): the type's
 						// icon rather than the generic one; that needs
