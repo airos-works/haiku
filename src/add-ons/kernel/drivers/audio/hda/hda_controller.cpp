@@ -347,6 +347,68 @@ stream_handle_interrupt(hda_controller* controller, hda_stream* stream,
 }
 
 
+/*!	Takes the responses the controller has stored since the last call out
+	of the response ring and hands them to their codecs.
+	Interrupts must be disabled and the controller's interrupt_lock held.
+	Returns whether a thread waits for one of them.
+*/
+static bool
+hda_read_responses(hda_controller* controller)
+{
+	bool wakeUp = false;
+	uint16 writePos = (controller->Read16(HDAC_RIRB_WRITE_POS) + 1)
+		% controller->rirb_length;
+
+	for (; controller->rirb_read_pos != writePos;
+			controller->rirb_read_pos = next_rirb(controller)) {
+		uint32 response = current_rirb(controller).response;
+		uint32 responseFlags = current_rirb(controller).flags;
+		uint32 cad = responseFlags & RESPONSE_FLAGS_CODEC_MASK;
+		hda_codec* codec = controller->codecs[cad];
+
+		if (codec == NULL) {
+			dprintf("hda: Response for unknown codec %" B_PRIu32
+				": %08" B_PRIx32 "/%08" B_PRIx32 "\n", cad,
+				response, responseFlags);
+			continue;
+		}
+
+		if ((responseFlags & RESPONSE_FLAGS_UNSOLICITED) != 0) {
+			dprintf("hda: Unsolicited response: %08" B_PRIx32
+				"/%08" B_PRIx32 "\n", response, responseFlags);
+			codec->unsol_responses[codec->unsol_response_write++] =
+				response;
+			codec->unsol_response_write %= MAX_CODEC_UNSOL_RESPONSES;
+			release_sem_etc(codec->unsol_response_sem, 1,
+				B_DO_NOT_RESCHEDULE);
+			wakeUp = true;
+			continue;
+		}
+		if (codec->late_responses > 0) {
+			// the answer to a verb hda_send_verbs() stopped
+			// waiting for; it is not the answer to a later one
+			codec->late_responses--;
+			dprintf("hda: late response from codec %" B_PRIu32
+				" discarded: %08" B_PRIx32 "\n", cad, response);
+			continue;
+		}
+		if (codec->response_count >= MAX_CODEC_RESPONSES) {
+			dprintf("hda: too many responses received for codec %"
+				B_PRIu32 ": %08" B_PRIx32 "/%08" B_PRIx32 "!\n",
+				cad, response, responseFlags);
+			continue;
+		}
+
+		// Store response in codec
+		codec->responses[codec->response_count++] = response;
+		release_sem_etc(codec->response_sem, 1, B_DO_NOT_RESCHEDULE);
+		wakeUp = true;
+	}
+
+	return wakeUp;
+}
+
+
 /*!	Handles whatever the controller's interrupt status reports right now.
 	Interrupts must be disabled and the controller's interrupt_lock held.
 */
@@ -369,55 +431,9 @@ hda_handle_interrupt_status(hda_controller* controller)
 		if (rirbStatus) {
 			controller->Write8(HDAC_RIRB_STATUS, rirbStatus);
 
-			if ((rirbStatus & RIRB_STATUS_RESPONSE) != 0) {
-				uint16 writePos = (controller->Read16(HDAC_RIRB_WRITE_POS) + 1)
-					% controller->rirb_length;
-
-				for (; controller->rirb_read_pos != writePos;
-						controller->rirb_read_pos = next_rirb(controller)) {
-					uint32 response = current_rirb(controller).response;
-					uint32 responseFlags = current_rirb(controller).flags;
-					uint32 cad = responseFlags & RESPONSE_FLAGS_CODEC_MASK;
-					hda_codec* codec = controller->codecs[cad];
-
-					if (codec == NULL) {
-						dprintf("hda: Response for unknown codec %" B_PRIu32
-							": %08" B_PRIx32 "/%08" B_PRIx32 "\n", cad,
-							response, responseFlags);
-						continue;
-					}
-
-					if ((responseFlags & RESPONSE_FLAGS_UNSOLICITED) != 0) {
-						dprintf("hda: Unsolicited response: %08" B_PRIx32
-							"/%08" B_PRIx32 "\n", response, responseFlags);
-						codec->unsol_responses[codec->unsol_response_write++] =
-							response;
-						codec->unsol_response_write %= MAX_CODEC_UNSOL_RESPONSES;
-						release_sem_etc(codec->unsol_response_sem, 1,
-							B_DO_NOT_RESCHEDULE);
-						handled = B_INVOKE_SCHEDULER;
-						continue;
-					}
-					if (codec->late_responses > 0) {
-						// the answer to a verb hda_send_verbs() stopped
-						// waiting for; it is not the answer to a later one
-						codec->late_responses--;
-						dprintf("hda: late response from codec %" B_PRIu32
-							" discarded: %08" B_PRIx32 "\n", cad, response);
-						continue;
-					}
-					if (codec->response_count >= MAX_CODEC_RESPONSES) {
-						dprintf("hda: too many responses received for codec %"
-							B_PRIu32 ": %08" B_PRIx32 "/%08" B_PRIx32 "!\n",
-							cad, response, responseFlags);
-						continue;
-					}
-
-					// Store response in codec
-					codec->responses[codec->response_count++] = response;
-					release_sem_etc(codec->response_sem, 1, B_DO_NOT_RESCHEDULE);
-					handled = B_INVOKE_SCHEDULER;
-				}
+			if ((rirbStatus & RIRB_STATUS_RESPONSE) != 0
+				&& hda_read_responses(controller)) {
+				handled = B_INVOKE_SCHEDULER;
 			}
 
 			if ((rirbStatus & RIRB_STATUS_OVERRUN) != 0)
@@ -1130,6 +1146,47 @@ hda_stream_setup_buffers(hda_audio_group* audioGroup, hda_stream* stream,
 }
 
 
+/*!	Forgets the answers that were due for verbs that timed out
+	(late_responses), once they cannot come any more. The controller's
+	verb_lock must be held.
+
+	The interrupt handler discards as many of the codec's next responses as
+	are booked late. That is right while such an answer can still arrive.
+	But a codec that did not answer at all (one that is waking up, an HDMI
+	codec in a mode change) will not answer later either: the booked answer
+	then took the answer to the next verb with it, that verb timed out and
+	was booked in turn, and so did every verb after it, half a second each,
+	until the driver was loaded again (#178).
+
+	A codec answers in the frame after the one its command went out in
+	(a frame is 20.8 microseconds). So once the controller has sent all the
+	commands there are, and a few frames have passed, what the response ring
+	holds is all that is ever going to come of them.
+*/
+static void
+hda_expire_late_responses(hda_controller* controller, hda_codec* codec)
+{
+	// Commands the controller has not sent yet (it is stopped, or stalled)
+	// may still be answered: those stay booked.
+	if (controller->Read16(HDAC_CORB_READ_POS) != controller->corb_write_pos)
+		return;
+
+	snooze(100);
+
+	cpu_status state = disable_interrupts();
+	acquire_spinlock(&controller->interrupt_lock);
+
+	// Whatever this codec has answered by now, it answered late: nothing
+	// else is outstanding while the caller holds the verb lock.
+	codec->late_responses = UINT32_MAX;
+	hda_read_responses(controller);
+	codec->late_responses = 0;
+
+	release_spinlock(&controller->interrupt_lock);
+	restore_interrupts(state);
+}
+
+
 //	#pragma mark - public controller functions
 
 
@@ -1144,6 +1201,9 @@ hda_send_verbs(hda_codec* codec, corb_t* verbs, uint32* responses, uint32 count)
 	// write CORBWP behind the read position, and the controller would then
 	// send the whole ring of old verbs to the codecs again.
 	MutexLocker locker(controller->verb_lock);
+
+	if (codec->late_responses > 0)
+		hda_expire_late_responses(controller, codec);
 
 	codec->response_count = 0;
 
