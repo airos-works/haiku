@@ -66,6 +66,7 @@ SimpleTest thread_local_test : thread_local_test.cpp : [ TargetLibstdc++ ] ;
 # XSI tests
 SimpleTest xsi_msg_queue_test1 : xsi_msg_queue_test1.cpp ;
 SimpleTest xsi_sem_test1 : xsi_sem_test1.cpp ;
+SimpleTest xsi_sem_number_test : xsi_sem_number_test.cpp ;
 
 # wide character tests
 SimpleTest fwide_test : fwide_test.c ;
