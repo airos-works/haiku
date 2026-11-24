@@ -54,6 +54,7 @@
 #include "DesktopSettingsPrivate.h"
 #include "DrawingEngine.h"
 #include "GlobalFontManager.h"
+#include "GlobalSubpixelSettings.h"
 #include "HWInterface.h"
 #include "InputManager.h"
 #include "Screen.h"
@@ -540,6 +541,8 @@ Desktop::Init()
 		return fSharedReadOnlyArea;
 
 	fSettings.SetTo(new DesktopSettingsPrivate(fServerReadOnlyMemory));
+		// (reads the font settings)
+	set_shared_font_generation(&fServerReadOnlyMemory->font_generation);
 
 	for (int32 i = 0; i < kMaxWorkspaces; i++) {
 		_Windows(i).SetIndex(i);

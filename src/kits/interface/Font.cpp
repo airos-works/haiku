@@ -12,14 +12,21 @@
 
 
 #include <AppServerLink.h>
+#include <ApplicationPrivate.h>
+#include <EmojiTables.h>
 #include <FontPrivate.h>
 #include <ObjectList.h>
 #include <ServerProtocol.h>
+#include <ServerReadOnlyMemory.h>
+#include <StackOrHeapArray.h>
 #include <truncate_string.h>
 #include <utf8_functions.h>
 
+#include <Application.h>
 #include <Autolock.h>
 #include <Font.h>
+#include <ServerProtocolStructs.h>
+	// (needs Font.h)
 #include <Locker.h>
 #include <Message.h>
 #include <PortLink.h>
@@ -1032,21 +1039,329 @@ BFont::StringWidth(const char* string, int32 length) const
 }
 
 
-void
-BFont::GetStringWidths(const char* stringArray[], const int32 lengthArray[],
-	int32 numStrings, float widthArray[]) const
+//	#pragma mark - string widths
+
+
+/*	The width of a string is app_server's to say: it has the fonts. Asking it
+	is a synchronous round trip on the application's one link to it, for
+	every label that is laid out or drawn. What it answered is remembered
+	here, per process, in two ways:
+
+	- The advance of single characters, per font (family and style ID, size,
+	  spacing mode: what a width request carries). app_server adds up the
+	  advances of a string's characters in doubles and returns the sum as a
+	  float (GlyphLayoutEngine::LayoutGlyphs() with a StringWidthConsumer);
+	  width_cache_sum() adds the same doubles in the same order, so the
+	  result is the same number, not merely a close one. Only characters that
+	  were not seen before are asked for (AS_GET_GLYPH_ADVANCES), all those of
+	  a call in one request. A missing glyph that a fallback font supplies
+	  has that font's advance, like in the server.
+	- That only holds when a character's advance does not depend on its
+	  neighbours. It does with kerning (B_STRING_SPACING) and where an emoji
+	  sequence may begin (emoji_cluster_may_start_at(), the same test the
+	  server's layout makes). Such strings are asked for whole, as before,
+	  and the answer is remembered by the string.
+
+	Both are dropped when server_read_only_memory::font_generation changes:
+	app_server changes it when fonts are installed or removed (also an
+	application's own, whose IDs can be used again), and when the hinting or
+	anti-aliasing settings or the render scale change. Both are bounded:
+	kWidthCacheFonts fonts with at most kWidthCacheCharLimit characters
+	besides ASCII each (about 160 KiB when all are in use), and
+	kWidthCacheStringSlots strings of at most kWidthCacheMaxStringLength
+	bytes. Longer strings are not remembered at all.
+*/
+
+namespace {
+
+const int32 kWidthCacheFonts = 12;
+const uint32 kWidthCacheCharSlots = 1024;
+	// a power of two
+const uint32 kWidthCacheCharLimit = 768;
+	// then the font's table starts over
+const uint32 kWidthCacheStringSlots = 256;
+const int32 kWidthCacheMaxStringLength = 256;
+
+struct width_cache_font {
+	uint32	familyAndStyle;
+	float	size;
+	uint8	spacing;
+	uint64	lastUsed;
+	uint32	charCount;
+	bool	asciiKnown[128];
+	double	ascii[128];
+	uint32	codes[kWidthCacheCharSlots];
+		// 0: free
+	double	advances[kWidthCacheCharSlots];
+};
+
+struct width_cache_string {
+	char*	string;
+		// NULL: free
+	uint32	hash;
+	int32	length;
+	uint32	familyAndStyle;
+	float	size;
+	uint8	spacing;
+	float	width;
+};
+
+enum {
+	kWidthKnown,
+	kWidthNeedsAdvances,
+	kWidthNeedsServer
+};
+
+pthread_mutex_t sWidthCacheLock = PTHREAD_MUTEX_INITIALIZER;
+int32 sWidthCacheGeneration = 0;
+uint64 sWidthCacheClock = 0;
+width_cache_font* sWidthCacheFonts[kWidthCacheFonts];
+width_cache_string sWidthCacheStrings[kWidthCacheStringSlots];
+
+
+//!	app_server's font generation; 0 when nothing may be remembered.
+int32
+width_cache_generation()
 {
-	if (stringArray == NULL || lengthArray == NULL || numStrings < 1
-		|| widthArray == NULL) {
+	if (be_app == NULL)
+		return 0;
+	server_read_only_memory* shared
+		= BApplication::Private::ServerReadOnlyMemory();
+	if (shared == NULL)
+		return 0;
+	return atomic_get(&shared->font_generation);
+}
+
+
+/*!	With the lock held: whether the cache is the one of \a generation
+	(emptied, if it was an older one's). False when the generation moved on
+	meanwhile: what was asked under \a generation is not to be put in.
+*/
+bool
+width_cache_validate(int32 generation)
+{
+	if (generation == 0 || width_cache_generation() != generation)
+		return false;
+	if (sWidthCacheGeneration == generation)
+		return true;
+
+	for (int32 i = 0; i < kWidthCacheFonts; i++) {
+		free(sWidthCacheFonts[i]);
+		sWidthCacheFonts[i] = NULL;
+	}
+	for (uint32 i = 0; i < kWidthCacheStringSlots; i++) {
+		free(sWidthCacheStrings[i].string);
+		sWidthCacheStrings[i].string = NULL;
+	}
+	sWidthCacheGeneration = generation;
+	return true;
+}
+
+
+void
+width_cache_reset_font(width_cache_font* font)
+{
+	font->charCount = 0;
+	memset(font->asciiKnown, 0, sizeof(font->asciiKnown));
+	memset(font->codes, 0, sizeof(font->codes));
+}
+
+
+width_cache_font*
+width_cache_font_for(uint32 familyAndStyle, float size, uint8 spacing,
+	bool create)
+{
+	int32 slot = -1;
+	for (int32 i = 0; i < kWidthCacheFonts; i++) {
+		width_cache_font* font = sWidthCacheFonts[i];
+		if (font == NULL) {
+			if (slot < 0 || sWidthCacheFonts[slot] != NULL)
+				slot = i;
+			continue;
+		}
+		if (font->familyAndStyle == familyAndStyle && font->size == size
+			&& font->spacing == spacing) {
+			font->lastUsed = ++sWidthCacheClock;
+			return font;
+		}
+		if (slot < 0 || (sWidthCacheFonts[slot] != NULL
+				&& font->lastUsed < sWidthCacheFonts[slot]->lastUsed)) {
+			slot = i;
+		}
+	}
+	if (!create)
+		return NULL;
+
+	// a free slot, or the one of the font that was used least recently
+	width_cache_font* font = sWidthCacheFonts[slot];
+	if (font == NULL) {
+		font = (width_cache_font*)malloc(sizeof(width_cache_font));
+		if (font == NULL)
+			return NULL;
+		sWidthCacheFonts[slot] = font;
+	}
+	font->familyAndStyle = familyAndStyle;
+	font->size = size;
+	font->spacing = spacing;
+	font->lastUsed = ++sWidthCacheClock;
+	width_cache_reset_font(font);
+	return font;
+}
+
+
+inline uint32
+width_cache_char_slot(uint32 code)
+{
+	return (code * 2654435761u) >> 22;
+		// 10 bits: kWidthCacheCharSlots
+}
+
+
+inline bool
+width_cache_lookup(const width_cache_font* font, uint32 code, double& advance)
+{
+	if (code < 128) {
+		advance = font->ascii[code];
+		return font->asciiKnown[code];
+	}
+	uint32 slot = width_cache_char_slot(code);
+	while (font->codes[slot] != 0) {
+		if (font->codes[slot] == code) {
+			advance = font->advances[slot];
+			return true;
+		}
+		slot = (slot + 1) & (kWidthCacheCharSlots - 1);
+	}
+	return false;
+}
+
+
+void
+width_cache_insert(width_cache_font* font, uint32 code, double advance)
+{
+	if (code < 128) {
+		font->ascii[code] = advance;
+		font->asciiKnown[code] = true;
 		return;
 	}
+	if (font->charCount >= kWidthCacheCharLimit) {
+		// full: start over (ASCII stays)
+		font->charCount = 0;
+		memset(font->codes, 0, sizeof(font->codes));
+	}
+	uint32 slot = width_cache_char_slot(code);
+	while (font->codes[slot] != 0) {
+		if (font->codes[slot] == code) {
+			font->advances[slot] = advance;
+			return;
+		}
+		slot = (slot + 1) & (kWidthCacheCharSlots - 1);
+	}
+	font->codes[slot] = code;
+	font->advances[slot] = advance;
+	font->charCount++;
+}
 
+
+uint32
+width_cache_string_hash(const char* string, int32 length,
+	uint32 familyAndStyle, float size, uint8 spacing)
+{
+	uint32 hash = 2166136261u ^ familyAndStyle;
+	hash = (hash * 16777619u) ^ spacing;
+	uint32 sizeBits;
+	memcpy(&sizeBits, &size, sizeof(sizeBits));
+	hash = (hash * 16777619u) ^ sizeBits;
+	for (int32 i = 0; i < length; i++)
+		hash = (hash * 16777619u) ^ (uint8)string[i];
+	return hash;
+}
+
+
+/*!	The characters of one call whose advances are not known yet: their codes,
+	and the bytes of each in a slot of kGlyphAdvanceSlotSize, the way
+	AS_GET_GLYPH_ADVANCES takes them.
+*/
+struct missing_characters {
+	int32	count;
+	uint32	codes[kMaxGlyphAdvanceCount];
+	char	bytes[kMaxGlyphAdvanceCount * kGlyphAdvanceSlotSize];
+};
+
+
+/*!	The width of the null terminated \a text of \a length bytes from the
+	advances of its characters, if they are all known: the same loop as
+	GlyphLayoutEngine::LayoutGlyphs() runs for a StringWidthConsumer, with
+	the same doubles. Characters that are not known are added to \a missing
+	(kWidthNeedsAdvances). kWidthNeedsServer: the server has to lay out the
+	string as a whole.
+*/
+int
+width_cache_sum(const width_cache_font* font, const char* text, int32 length,
+	float& width, missing_characters* missing)
+{
+	const char* position = text;
+	double x = 0.0;
+	double advance = 0.0;
+	bool complete = true;
+
+	while (true) {
+		const char* start = position;
+		uint32 code = UTF8ToCharCode(&position);
+		if (code == 0)
+			break;
+		if (emoji_cluster_may_start_at(code, position,
+				position - text < length)) {
+			return kWidthNeedsServer;
+		}
+
+		x += advance;
+		if (font == NULL || !width_cache_lookup(font, code, advance)) {
+			advance = 0.0;
+			complete = false;
+			if (missing == NULL)
+				return kWidthNeedsServer;
+
+			int32 bytes = position - start;
+			if (bytes >= kGlyphAdvanceSlotSize)
+				return kWidthNeedsServer;
+			int32 index = 0;
+			while (index < missing->count && missing->codes[index] != code)
+				index++;
+			if (index == missing->count) {
+				if (index == kMaxGlyphAdvanceCount)
+					return kWidthNeedsServer;
+				missing->codes[index] = code;
+				char* slot = missing->bytes + index * kGlyphAdvanceSlotSize;
+				memset(slot, 0, kGlyphAdvanceSlotSize);
+				memcpy(slot, start, bytes);
+				missing->count++;
+			}
+		}
+
+		if (position - text + 1 > length)
+			break;
+	}
+	x += advance;
+
+	if (!complete)
+		return kWidthNeedsAdvances;
+	width = (float)x;
+	return kWidthKnown;
+}
+
+
+status_t
+get_string_widths_from_server(uint16 familyID, uint16 styleID, float size,
+	uint8 spacing, const char* stringArray[], const int32 lengthArray[],
+	int32 numStrings, float widthArray[])
+{
 	BPrivate::AppServerLink link;
 	link.StartMessage(AS_GET_STRING_WIDTHS);
-	link.Attach<uint16>(fFamilyID);
-	link.Attach<uint16>(fStyleID);
-	link.Attach<float>(fSize);
-	link.Attach<uint8>(fSpacing);
+	link.Attach<uint16>(familyID);
+	link.Attach<uint16>(styleID);
+	link.Attach<float>(size);
+	link.Attach<uint8>(spacing);
 	link.Attach<int32>(numStrings);
 
 	// TODO: all strings into a single array???
@@ -1056,10 +1371,212 @@ BFont::GetStringWidths(const char* stringArray[], const int32 lengthArray[],
 		link.AttachString(stringArray[i], lengthArray[i]);
 
 	status_t status;
-	if (link.FlushWithReply(status) != B_OK || status != B_OK)
+	if (link.FlushWithReply(status) != B_OK)
+		return B_ERROR;
+	if (status != B_OK)
+		return status;
+
+	return link.Read(widthArray, sizeof(float) * numStrings);
+}
+
+
+status_t
+get_glyph_advances_from_server(uint16 familyID, uint16 styleID, float size,
+	uint8 spacing, const missing_characters& missing, double* advances)
+{
+	BPrivate::AppServerLink link;
+	link.StartMessage(AS_GET_GLYPH_ADVANCES);
+	link.Attach<uint16>(familyID);
+	link.Attach<uint16>(styleID);
+	link.Attach<float>(size);
+	link.Attach<uint8>(spacing);
+	link.Attach<int32>(missing.count);
+	link.Attach(missing.bytes, missing.count * kGlyphAdvanceSlotSize);
+
+	status_t status;
+	if (link.FlushWithReply(status) != B_OK)
+		return B_ERROR;
+	if (status != B_OK)
+		return status;
+
+	return link.Read(advances, missing.count * sizeof(double));
+}
+
+}	// unnamed namespace
+
+
+void
+BFont::GetStringWidths(const char* stringArray[], const int32 lengthArray[],
+	int32 numStrings, float widthArray[]) const
+{
+	if (stringArray == NULL || lengthArray == NULL || numStrings < 1
+		|| widthArray == NULL) {
+		return;
+	}
+
+	// (see the comment above for what is remembered and why it is exact)
+	const int32 generation = width_cache_generation();
+	BStackOrHeapArray<uint8, 64> states(numStrings);
+	if (generation == 0 || !(fSize > 0) || !states.IsValid()) {
+		get_string_widths_from_server(fFamilyID, fStyleID, fSize, fSpacing,
+			stringArray, lengthArray, numStrings, widthArray);
+		return;
+	}
+
+	const uint32 familyAndStyle = ((uint32)fFamilyID << 16) | fStyleID;
+	const bool summable = fSpacing != B_STRING_SPACING;
+	missing_characters missing;
+	missing.count = 0;
+	int32 needAdvances = 0;
+	int32 needServer = 0;
+	char text[kWidthCacheMaxStringLength + 1];
+
+	pthread_mutex_lock(&sWidthCacheLock);
+	bool valid = width_cache_validate(generation);
+	const width_cache_font* font = valid
+		? width_cache_font_for(familyAndStyle, fSize, fSpacing, false) : NULL;
+
+	for (int32 i = 0; i < numStrings; i++) {
+		// what the server would be sent: no more than the string has
+		const char* string = stringArray[i];
+		int32 length = lengthArray[i];
+		states[i] = kWidthNeedsServer;
+		if (string != NULL && length >= 0) {
+			length = strnlen(string, length);
+			if (length == 0) {
+				widthArray[i] = 0.0f;
+				states[i] = kWidthKnown;
+			} else if (valid && length <= kWidthCacheMaxStringLength) {
+				memcpy(text, string, length);
+				text[length] = '\0';
+				if (summable) {
+					states[i] = width_cache_sum(font, text, length,
+						widthArray[i], &missing);
+				}
+				if (states[i] == kWidthNeedsServer) {
+					// one that was asked for whole before?
+					uint32 hash = width_cache_string_hash(text, length,
+						familyAndStyle, fSize, fSpacing);
+					const width_cache_string& entry = sWidthCacheStrings[
+						hash % kWidthCacheStringSlots];
+					if (entry.string != NULL && entry.hash == hash
+						&& entry.length == length
+						&& entry.familyAndStyle == familyAndStyle
+						&& entry.size == fSize && entry.spacing == fSpacing
+						&& memcmp(entry.string, text, length) == 0) {
+						widthArray[i] = entry.width;
+						states[i] = kWidthKnown;
+					}
+				}
+			}
+		}
+		if (states[i] == kWidthNeedsAdvances)
+			needAdvances++;
+		else if (states[i] == kWidthNeedsServer)
+			needServer++;
+	}
+	pthread_mutex_unlock(&sWidthCacheLock);
+
+	if (needAdvances > 0) {
+		// the characters that were not seen before, in one request
+		double advances[kMaxGlyphAdvanceCount];
+		bool received = get_glyph_advances_from_server(fFamilyID, fStyleID,
+			fSize, fSpacing, missing, advances) == B_OK;
+
+		pthread_mutex_lock(&sWidthCacheLock);
+		width_cache_font* font = NULL;
+		if (received && width_cache_validate(generation)) {
+			font = width_cache_font_for(familyAndStyle, fSize, fSpacing,
+				true);
+		}
+		if (font != NULL) {
+			for (int32 i = 0; i < missing.count; i++)
+				width_cache_insert(font, missing.codes[i], advances[i]);
+		}
+		for (int32 i = 0; i < numStrings; i++) {
+			if (states[i] != kWidthNeedsAdvances)
+				continue;
+			// (a string with more new characters than fit one request,
+			// or one whose characters did not stay: asked for whole)
+			int32 length = strnlen(stringArray[i], lengthArray[i]);
+			memcpy(text, stringArray[i], length);
+			text[length] = '\0';
+			states[i] = kWidthNeedsServer;
+			if (font != NULL) {
+				states[i] = width_cache_sum(font, text, length, widthArray[i],
+					NULL);
+			}
+			if (states[i] != kWidthKnown) {
+				states[i] = kWidthNeedsServer;
+				needServer++;
+			}
+		}
+		pthread_mutex_unlock(&sWidthCacheLock);
+	}
+
+	if (needServer == 0)
 		return;
 
-	link.Read(widthArray, sizeof(float) * numStrings);
+	if (needServer == numStrings) {
+		if (get_string_widths_from_server(fFamilyID, fStyleID, fSize,
+				fSpacing, stringArray, lengthArray, numStrings, widthArray)
+				!= B_OK) {
+			return;
+		}
+	} else {
+		// only those that are left
+		BStackOrHeapArray<const char*, 64> strings(needServer);
+		BStackOrHeapArray<int32, 64> lengths(needServer);
+		BStackOrHeapArray<float, 64> widths(needServer);
+		if (!strings.IsValid() || !lengths.IsValid() || !widths.IsValid())
+			return;
+		int32 count = 0;
+		for (int32 i = 0; i < numStrings; i++) {
+			if (states[i] == kWidthNeedsServer) {
+				strings[count] = stringArray[i];
+				lengths[count++] = lengthArray[i];
+			}
+		}
+		if (get_string_widths_from_server(fFamilyID, fStyleID, fSize,
+				fSpacing, strings, lengths, count, widths) != B_OK) {
+			return;
+		}
+		count = 0;
+		for (int32 i = 0; i < numStrings; i++) {
+			if (states[i] == kWidthNeedsServer)
+				widthArray[i] = widths[count++];
+		}
+	}
+
+	// remember the short ones by the string
+	pthread_mutex_lock(&sWidthCacheLock);
+	if (width_cache_validate(generation)) {
+		for (int32 i = 0; i < numStrings; i++) {
+			if (states[i] != kWidthNeedsServer || stringArray[i] == NULL
+				|| lengthArray[i] < 0) {
+				continue;
+			}
+			int32 length = strnlen(stringArray[i], lengthArray[i]);
+			if (length == 0 || length > kWidthCacheMaxStringLength)
+				continue;
+			uint32 hash = width_cache_string_hash(stringArray[i], length,
+				familyAndStyle, fSize, fSpacing);
+			width_cache_string& entry = sWidthCacheStrings[
+				hash % kWidthCacheStringSlots];
+			char* copy = (char*)realloc(entry.string, length);
+			if (copy == NULL)
+				continue;
+			memcpy(copy, stringArray[i], length);
+			entry.string = copy;
+			entry.hash = hash;
+			entry.length = length;
+			entry.familyAndStyle = familyAndStyle;
+			entry.size = fSize;
+			entry.spacing = fSpacing;
+			entry.width = widthArray[i];
+		}
+	}
+	pthread_mutex_unlock(&sWidthCacheLock);
 }
 
 

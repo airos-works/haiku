@@ -17,6 +17,7 @@
 #include "GlyphLayoutEngine.h"
 #include "GlobalFontManager.h"
 #include "truncate_string.h"
+#include <ServerProtocolStructs.h>
 #include "utf8_functions.h"
 
 #include FT_FREETYPE_H
@@ -1083,6 +1084,64 @@ class StringWidthConsumer {
 
 	float width;
 };
+
+
+class GlyphAdvanceConsumer {
+ public:
+	GlyphAdvanceConsumer()
+		:
+		advance(0.0)
+	{
+	}
+
+	bool NeedsVector() { return false; }
+	void Start() {}
+	void Finish(double x, double y) {}
+	void ConsumeEmptyGlyph(int32 index, uint32 charCode, double x, double y)
+	{
+		advance = 0.0;
+	}
+	bool ConsumeGlyph(int32 index, uint32 charCode, const GlyphCache* glyph,
+		FontCacheEntry* entry, double x, double y, double advanceX,
+			double advanceY)
+	{
+		advance = advanceX;
+		// the first glyph is all that is asked for
+		return false;
+	}
+
+	double advance;
+};
+
+
+/*!	The advance of each of \a count characters, by which the pen moves in
+	StringWidth() after it: exactly the numbers that are added up there, so
+	that a sum of them in the same order is the same width. (That holds for
+	a string without kerning, B_STRING_SPACING, and without characters that
+	can begin an emoji sequence: there the advance depends on what follows.)
+	\a characters has \a count slots of kGlyphAdvanceSlotSize bytes, each
+	the UTF-8 bytes of one character and a terminating null.
+*/
+status_t
+ServerFont::GetGlyphAdvances(const char* characters, int32 count,
+	double* advances) const
+{
+	if (characters == NULL || count <= 0 || advances == NULL)
+		return B_BAD_DATA;
+
+	for (int32 i = 0; i < count; i++) {
+		const char* character = characters + i * kGlyphAdvanceSlotSize;
+		GlyphAdvanceConsumer consumer;
+		if (!GlyphLayoutEngine::LayoutGlyphs(consumer, *this, character,
+				strnlen(character, kGlyphAdvanceSlotSize), INT32_MAX, NULL,
+				fSpacing)) {
+			return B_ERROR;
+		}
+		advances[i] = consumer.advance;
+	}
+
+	return B_OK;
+}
 
 
 float

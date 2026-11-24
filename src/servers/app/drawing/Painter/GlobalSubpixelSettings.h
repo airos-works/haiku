@@ -39,6 +39,15 @@ subpixel_antialiasing_active()
 	return gSubpixelAntialiasing && gRenderScale == 1.0f;
 }
 
+// The widths of strings are remembered by the applications (BFont, in the
+// Interface Kit), for as long as server_read_only_memory::font_generation
+// stays what it was. font_metrics_changed() is to be called after anything
+// changed that a width depends on besides the font, its size and its
+// spacing mode: the fonts that are installed (the font itself, or one a
+// missing glyph falls back to), hinting, anti-aliasing, the render scale.
+void font_metrics_changed();
+void set_shared_font_generation(int32* shared);
+
 // The weight with which the average of the subpixels is applied to counter
 // color fringes (0 = full sharpness ... 255 = grayscale anti-aliasing)
 extern uint8 gSubpixelAverageWeight;

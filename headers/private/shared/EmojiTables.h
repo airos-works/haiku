@@ -103,6 +103,26 @@ emoji_can_start_cluster(uint32 c)
 }
 
 
+/*!	Whether text layout looks for an emoji cluster at the character \a c:
+	the glyph and the advance of such a character depend on what follows it.
+	\a next is the byte after the character, \a hasNext whether the string
+	has one. app_server's glyph layout decides with this, and so does the
+	Interface Kit when it adds up the width of a string from the advances of
+	its characters (BFont::StringWidth()): the two have to agree.
+*/
+static inline bool
+emoji_cluster_may_start_at(uint32 c, const char* next, bool hasNext)
+{
+	if (c < '#' || !emoji_can_start_cluster(c))
+		return false;
+	if (emoji_is_keycap_base(c)) {
+		// a digit only begins a keycap: U+FE0F or U+20E3 follows
+		return hasNext && ((uint8)*next == 0xef || (uint8)*next == 0xe2);
+	}
+	return true;
+}
+
+
 /*!	Returns how many of \a codes form the emoji cluster that \a codes[0]
 	begins: a flag (two regional indicators), a keycap, or an emoji with
 	variation selectors, skin tones, tags and further emoji joined by zero

@@ -161,6 +161,9 @@ class ServerFont {
 									BRect rectArray[], font_metric_mode mode,
 									const escapement_delta deltaArray[]);
 
+			status_t			GetGlyphAdvances(const char* characters,
+									int32 count, double* advances) const;
+
 			float				StringWidth(const char *string,
 									int32 numBytes,
 									const escapement_delta* delta = NULL) const;

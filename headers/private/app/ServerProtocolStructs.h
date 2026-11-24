@@ -93,6 +93,13 @@ struct ViewDrawBitmapInfo {
 };
 
 
+// AS_GET_GLYPH_ADVANCES: each character is sent as its UTF-8 bytes in a slot
+// of this size, null terminated
+static const int32 kGlyphAdvanceSlotSize = 8;
+static const int32 kMaxGlyphAdvanceCount = 256;
+	// characters in one request
+
+
 struct ViewDrawStringInfo {
 	int32						stringLength;
 	BPoint						location;

@@ -896,6 +896,7 @@ void
 DesktopSettingsPrivate::SetSubpixelAntialiasing(bool subpix)
 {
 	gSubpixelAntialiasing = subpix;
+	font_metrics_changed();
 	Save(kAppearanceSettings);
 }
 
@@ -911,6 +912,7 @@ void
 DesktopSettingsPrivate::SetHinting(uint8 hinting)
 {
 	gDefaultHintingMode = hinting;
+	font_metrics_changed();
 	Save(kFontSettings);
 }
 
@@ -926,6 +928,7 @@ void
 DesktopSettingsPrivate::SetSubpixelAverageWeight(uint8 averageWeight)
 {
 	gSubpixelAverageWeight = averageWeight;
+	font_metrics_changed();
 	Save(kAppearanceSettings);
 }
 

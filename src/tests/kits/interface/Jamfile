@@ -114,6 +114,13 @@ SimpleTest ScrollViewTest :
 	: be [ TargetLibsupc++ ]
 	;
 
+# BFont::StringWidth() widths remembered in the kit are app_server's (#191)
+UsePrivateHeaders app ;
+SimpleTest string_width_cache_test :
+	StringWidthCacheTest.cpp
+	: be [ TargetLibsupc++ ]
+	;
+
 SimpleTest StatusBarTest :
 	StatusBarTest.cpp
 	: be [ TargetLibsupc++ ]

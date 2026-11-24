@@ -370,6 +370,8 @@ HWInterface::SetRenderScale(uint16 percent)
 		return B_OK;
 	fRenderScale = percent;
 	gRenderScale = percent / 100.0f;
+	font_metrics_changed();
+		// text is measured without hinting above 100%
 
 	// the cursor bitmap is kept at the buffer's density
 	if (fFloatingOverlaysLock.Lock()) {

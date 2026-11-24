@@ -402,6 +402,10 @@ enum {
 	// content is waiting (Window::StartCapture())
 	AS_CAPTURE_WINDOW_CONTENT,
 
+	// The advances of single characters, as AS_GET_STRING_WIDTHS adds them
+	// up: BFont::StringWidth() sums them in the application
+	AS_GET_GLYPH_ADVANCES,
+
 	AS_LAST_CODE
 };
 

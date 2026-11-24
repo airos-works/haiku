@@ -18,6 +18,7 @@
 #include <Debug.h>
 
 #include "FontFamily.h"
+#include "GlobalSubpixelSettings.h"
 
 
 //#define TRACE_FONT_MANAGER
@@ -346,6 +347,8 @@ FontManager::_AddFont(FT_Face face, node_ref nodeRef, const char* path,
 	style->ReleaseReference();
 
 	fRevision++;
+	font_metrics_changed();
+		// a glyph that was missing may fall back to this font now
 	return B_OK;
 }
 
@@ -366,6 +369,8 @@ FontManager::_RemoveFont(uint16 familyID, uint16 styleID)
 	}
 
 	fRevision++;
+	font_metrics_changed();
+		// the IDs can be another font's later
 	return style;
 }
 

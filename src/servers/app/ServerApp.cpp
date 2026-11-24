@@ -43,6 +43,7 @@
 #include <PrivateScreen.h>
 #include <RosterPrivate.h>
 #include <ServerProtocol.h>
+#include <ServerProtocolStructs.h>
 #include <WindowPrivate.h>
 
 #include "AppFontManager.h"
@@ -2486,6 +2487,68 @@ ServerApp::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 			} else
 				fLink.StartMessage(status);
 
+			fLink.Flush();
+			break;
+		}
+
+		case AS_GET_GLYPH_ADVANCES:
+		{
+			FTRACE(("ServerApp %s: AS_GET_GLYPH_ADVANCES\n", Signature()));
+
+			// Attached Data:
+			// 1) uint16 - family ID
+			// 2) uint16 - style ID
+			// 3) float - point size
+			// 4) uint8 - spacing
+			// 5) int32 - number of characters
+			// 6) char[kGlyphAdvanceSlotSize] - the UTF-8 bytes of each
+
+			// Returns:
+			// 1) double - advance (number of characters times)
+
+			uint16 familyID, styleID;
+			float size = 0;
+			uint8 spacing = 0;
+			int32 count = 0;
+
+			link.Read<uint16>(&familyID);
+			link.Read<uint16>(&styleID);
+			link.Read<float>(&size);
+			link.Read<uint8>(&spacing);
+			status_t status = link.Read<int32>(&count);
+			if (status == B_OK && (count <= 0 || count > kMaxGlyphAdvanceCount
+					|| !(size > 0))) {
+				status = B_BAD_VALUE;
+			}
+
+			char characters[kMaxGlyphAdvanceCount * kGlyphAdvanceSlotSize];
+			double advances[kMaxGlyphAdvanceCount];
+			if (status == B_OK) {
+				status = link.Read(characters,
+					count * kGlyphAdvanceSlotSize);
+			}
+
+			if (status == B_OK) {
+				for (int32 i = 0; i < count; i++) {
+					characters[i * kGlyphAdvanceSlotSize
+						+ kGlyphAdvanceSlotSize - 1] = '\0';
+				}
+
+				// the same font as AS_GET_STRING_WIDTHS measures with
+				ServerFont font;
+				status = font.SetFamilyAndStyle(familyID, styleID,
+					fAppFontManager);
+				if (status == B_OK) {
+					font.SetSize(size);
+					font.SetSpacing(spacing);
+					status = font.GetGlyphAdvances(characters, count,
+						advances);
+				}
+			}
+
+			fLink.StartMessage(status);
+			if (status == B_OK)
+				fLink.Attach(advances, count * sizeof(double));
 			fLink.Flush();
 			break;
 		}

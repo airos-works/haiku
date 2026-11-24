@@ -346,12 +346,10 @@ GlyphLayoutEngine::LayoutGlyphs(GlyphConsumer& consumer,
 		uint32 clusterCodes[EmojiSequence::kMaxCodes];
 		const char* clusterEnds[EmojiSequence::kMaxCodes];
 		int32 clusterCount = 0;
-		bool emojiStart = charCode >= '#' && emoji_can_start_cluster(charCode);
-		if (emojiStart && emoji_is_keycap_base(charCode)) {
-			// a digit only begins a keycap: U+FE0F or U+20E3 follows
-			emojiStart = utf8String - start < length
-				&& ((uint8)*utf8String == 0xef || (uint8)*utf8String == 0xe2);
-		}
+		// (BFont::StringWidth() relies on a character's advance not depending
+		// on its neighbours unless this says so, or kerning is applied)
+		bool emojiStart = emoji_cluster_may_start_at(charCode, utf8String,
+			utf8String - start < length);
 		if (emojiStart) {
 			clusterCount = _GatherEmojiCluster(charCode, utf8String, start,
 				length, maxChars, clusterCodes, clusterEnds);

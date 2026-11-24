@@ -27,6 +27,13 @@ struct server_read_only_memory {
 		// frame buffer pixels per logical pixel, see BScreen::DeviceScale()
 	bool		dark_mode;
 		// the dark palette is in use, see ui_dark_mode()
+	int32		font_generation;
+		// Changes whenever the width of a string in some font, size and
+		// spacing may have: fonts were installed or removed, the hinting
+		// or anti-aliasing settings or the render scale changed. What the
+		// Interface Kit remembers of widths (BFont::StringWidth()) is good
+		// for as long as this stays the same. 0: not maintained (an older
+		// app_server), nothing is to be remembered.
 };
 
 
