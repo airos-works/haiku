@@ -115,10 +115,12 @@ sdhci_allocate_dma(area_id* area, void** buffer, phys_addr_t* address,
 sdhci_dma_mode
 sdhci_read_dma_mode()
 {
-	sdhci_dma_mode mode = { true, false };
+	// Both are off until they have run on the boards' own hosts: the ROCK 5
+	// boots from its eMMC through this driver (airos-works/haiku#181).
+	sdhci_dma_mode mode = { false, false };
 	void* handle = load_driver_settings("sdhci");
 	if (handle != NULL) {
-		mode.gather = get_driver_boolean_parameter(handle, "gather_io", true,
+		mode.gather = get_driver_boolean_parameter(handle, "gather_io", false,
 			true);
 		mode.adma2 = get_driver_boolean_parameter(handle, "adma2", false,
 			true);

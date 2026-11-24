@@ -158,7 +158,7 @@ void sdhci_clean_dma_alias(phys_addr_t address, size_t size);
 // How the slots hand their operations' memory to the controller (the "sdhci"
 // driver settings, read by sdhci_read_dma_mode()):
 //	- arm64 copies through its private buffer, and gathers all pieces of an
-//	  operation into it for one command ("gather_io", on by default);
+//	  operation into it for one command with "gather_io" (off by default);
 //	- x86 programs SDMA with one piece of memory per command, or, with
 //	  "adma2" (off by default), one command per operation through an ADMA2
 //	  descriptor table, where the controller has ADMA2.
