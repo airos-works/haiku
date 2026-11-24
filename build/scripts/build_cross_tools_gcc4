@@ -241,6 +241,11 @@ copy_headers "$haikuSourceDir/headers/os" "$tmpIncludeDir/os"
 copy_headers "$haikuSourceDir/headers/posix" "$tmpIncludeDir/posix"
 
 # configure gcc
+# Everything it links gets a GNU hash table next to the SysV one: the runtime
+# loader rejects a symbol an image lacks by the table's Bloom filter instead of
+# walking a SysV hash chain (#200). The SysV table stays: the runtime loader
+# and the kernel need it. ld itself keeps its default, so the kernel, the boot
+# loaders and runtime_loader, which are linked with ld directly, are unchanged.
 cd "$gccObjDir"
 CFLAGS="$ccFlags" CXXFLAGS="$cxxFlags" "$gccSourceDir/configure" \
 	--prefix="$installDir" $buildHostSpec --target=$haikuMachine \
@@ -252,6 +257,7 @@ CFLAGS="$ccFlags" CXXFLAGS="$cxxFlags" "$gccSourceDir/configure" \
 	--disable-maintainer-mode \
 	--disable-libgomp \
 	--disable-libatomic \
+	--with-linker-hash-style=both \
 	$gccConfigureArgs \
 	|| exit 1
 
