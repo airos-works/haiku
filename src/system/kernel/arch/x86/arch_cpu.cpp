@@ -1589,6 +1589,20 @@ arch_cpu_init_percpu(kernel_args* args, int cpu)
 	if (x86_check_feature(IA32_FEATURE_MCE, FEATURE_COMMON))
 		x86_write_cr4(x86_read_cr4() | IA32_CR4_MCE);
 
+#ifdef __x86_64__
+	// Global pages: the kernel's mappings are marked global, and the kernel
+	// counts on an invlpg dropping a kernel translation whatever address
+	// space the CPU is in. That takes CR4.PGE, which the BIOS loader and the
+	// trampolines that start the other CPUs set, but the EFI loader enters
+	// the kernel with the firmware's CR4 on the boot CPU, and firmware (OVMF
+	// for one) leaves PGE clear. There the global flag was ignored: every
+	// address space switch dropped the kernel's translations as well, and
+	// with PCIDs the boot CPU kept kernel translations under the PCIDs it
+	// wasn't running through an unmap (#140).
+	if (x86_check_feature(IA32_FEATURE_PGE, FEATURE_COMMON))
+		x86_write_cr4(x86_read_cr4() | IA32_CR4_GLOBAL_PAGES);
+#endif
+
 	cpu_ent* cpuEnt = get_cpu_struct();
 	if (cpu == 0) {
 		bool supportsPAT = x86_check_feature(IA32_FEATURE_PAT, FEATURE_COMMON);
@@ -1692,8 +1706,11 @@ bool gX86PCIDEnabled = false;
 static void
 enable_pcid(void* dummy, int cpu)
 {
-	// CR3 must name PCID 0 when PCIDE is set: it does, nothing used them yet
-	x86_write_cr4(x86_read_cr4() | IA32_CR4_PCIDE);
+	// CR3 must name PCID 0 when PCIDE is set: it does, nothing used them yet.
+	// Global pages are a must with PCIDs (see arch_cpu_init_percpu()): a
+	// kernel translation that isn't global lives on under every PCID the CPU
+	// is not running when the kernel unmaps the page.
+	x86_write_cr4(x86_read_cr4() | IA32_CR4_GLOBAL_PAGES | IA32_CR4_PCIDE);
 	memset(gCPU[cpu].arch.pcid_slots, 0, sizeof(gCPU[cpu].arch.pcid_slots));
 	gCPU[cpu].arch.pcid_next = 0;
 }
@@ -1762,19 +1779,18 @@ arch_cpu_init_post_vm(kernel_args* args)
 	}
 
 	// Process context identifiers: switching between teams keeps their TLB
-	// entries (#104). Off unless asked for ("enable_pcid"): with them, a
-	// process could still write through a stale translation into a page that
-	// had been freed and reused, which corrupted kernel heap memory (two
-	// write_overlay files' buffers ended up sharing data, and the overlay
-	// panicked with a general protection fault). The race is not found yet.
-	if (x86_check_feature(IA32_FEATURE_EXT_PCID, FEATURE_EXT)) {
-		if (get_safemode_boolean("enable_pcid", false)
-			&& !get_safemode_boolean("disable_pcid", false)) {
+	// entries (#104). They need global pages: without CR4.PGE a kernel
+	// translation belongs to the PCID it was made under, and the invlpg of
+	// a kernel unmap reaches only the PCID the CPU is running (#140).
+	// ("enable_pcid" was needed while they were off by default.)
+	if (x86_check_feature(IA32_FEATURE_EXT_PCID, FEATURE_EXT)
+		&& x86_check_feature(IA32_FEATURE_PGE, FEATURE_COMMON)) {
+		if (!get_safemode_boolean("disable_pcid", false)) {
 			dprintf("enable PCID\n");
 			call_all_cpus_sync(&enable_pcid, NULL);
 			gX86PCIDEnabled = true;
 		} else
-			dprintf("PCID not enabled (safe mode option \"enable_pcid\")\n");
+			dprintf("PCID disabled per safemode setting\n");
 	}
 
 	// if available enable XSAVE (XSAVE and extended states)

@@ -27,9 +27,12 @@ x86_write_msr(uint32_t msr, uint64_t value)
 	asm volatile("wrmsr" : : "a" ((uint32_t)value) , "d" ((uint32_t)(value >> 32)), "c" (msr));
 }
 
+// (volatile: without it the compiler takes two reads of a register for the
+// same value, also across a write to it, and e.g. two "set a bit in CR4"
+// statements in one function end up with the first bit cleared again)
 #define x86_read_cr0() ({ \
 	size_t _v; \
-	__asm__("mov    %%cr0,%0" : "=r" (_v)); \
+	__asm__ volatile("mov    %%cr0,%0" : "=r" (_v)); \
 	_v; \
 })
 
@@ -38,13 +41,13 @@ x86_write_msr(uint32_t msr, uint64_t value)
 
 #define x86_read_cr2() ({ \
 	size_t _v; \
-	__asm__("mov    %%cr2,%0" : "=r" (_v)); \
+	__asm__ volatile("mov    %%cr2,%0" : "=r" (_v)); \
 	_v; \
 })
 
 #define x86_read_cr3() ({ \
 	size_t _v; \
-	__asm__("mov    %%cr3,%0" : "=r" (_v)); \
+	__asm__ volatile("mov    %%cr3,%0" : "=r" (_v)); \
 	_v; \
 })
 
@@ -56,7 +59,7 @@ x86_write_cr3(size_t value)
 
 #define x86_read_cr4() ({ \
 	size_t _v; \
-	__asm__("mov    %%cr4,%0" : "=r" (_v)); \
+	__asm__ volatile("mov    %%cr4,%0" : "=r" (_v)); \
 	_v; \
 })
 
@@ -65,7 +68,7 @@ x86_write_cr3(size_t value)
 
 #define x86_read_dr3() ({ \
 	size_t _v; \
-	__asm__("mov    %%dr3,%0" : "=r" (_v)); \
+	__asm__ volatile("mov    %%dr3,%0" : "=r" (_v)); \
 	_v; \
 })
 
