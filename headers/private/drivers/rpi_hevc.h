@@ -24,8 +24,12 @@
 	program clones, and it goes away with the file descriptor.
 
 	The driver knows nothing of HEVC. It checks that the buffers named are
-	the caller's own, keeps the CPU cache out of the way, and waits for the
-	interrupts. Phase one of a picture may run while phase two of the one
+	the caller's own and that phase two's buffers hold what the picture's
+	geometry makes the block write and read, keeps the CPU cache out of the
+	way, and waits for the interrupts. After a phase that did not end in
+	time, nothing of the caller's is freed any more (RPI_HEVC_FREE fails
+	with B_BUSY), not even at the end: the block may still write there.
+	Phase one of a picture may run while phase two of the one
 	before does. */
 
 #define RPI_HEVC_DEVICE_PATH	"/dev/misc/rpi_hevc"

@@ -1,0 +1,13 @@
+SubDir HAIKU_TOP src tests add-ons kernel drivers rpi_hevc ;
+
+# rpi_hevc_geometry_test: the rpi_hevc driver's check of a phase two
+# request's geometry against its buffers (also builds on any host, see the
+# file).
+
+UsePrivateHeaders drivers ;
+SubDirHdrs [ FDirName $(HAIKU_TOP) src add-ons kernel drivers misc ] ;
+
+SimpleTest rpi_hevc_geometry_test :
+	rpi_hevc_geometry_test.cpp
+	: [ TargetLibsupc++ ]
+;

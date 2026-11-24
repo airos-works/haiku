@@ -40,6 +40,8 @@
 #include <rpi_firmware.h>
 #include <rpi_hevc.h>
 
+#include "rpi_hevc_geometry.h"
+
 
 //#define TRACE_HEVC
 #ifdef TRACE_HEVC
@@ -110,6 +112,9 @@ struct hevc_client {
 	hevc_buffer	buffers[RPI_HEVC_MAX_BUFFERS];
 	int32		busy;
 		// phases under way: buffers stay until they are through
+	int32		lost;
+		// of those, phases that did not end in time: the block may still
+		// write to the buffers, which therefore stay for good
 };
 
 
@@ -350,7 +355,10 @@ phase1(hevc_client* client, rpi_hevc_phase1& request)
 	locker.Unlock();
 
 	clientLocker.Lock();
-	client->busy--;
+	if (status != B_OK)
+		client->lost++;
+	else
+		client->busy--;
 	return status == B_TIMED_OUT ? B_OK : status;
 }
 
@@ -362,8 +370,16 @@ phase2(hevc_client* client, const rpi_hevc_phase2& request)
 	hevc_buffer* pu = buffer_for(client, request.pu);
 	hevc_buffer* coeff = buffer_for(client, request.coeff);
 	hevc_buffer* frame = buffer_for(client, request.frame);
-	if (pu == NULL || coeff == NULL || frame == NULL
-		|| request.chroma_offset >= frame->size) {
+	if (pu == NULL || coeff == NULL || frame == NULL)
+		return B_BAD_VALUE;
+
+	// The block writes the picture, and the motion vectors, wherever the
+	// geometry takes it: a picture larger than its buffer went on into the
+	// physical pages after it (#202).
+	hevc_phase2_needs needs;
+	if (get_phase2_needs(request, needs) != B_OK
+		|| pu->size < needs.pu || coeff->size < needs.coeff
+		|| frame->size < needs.picture) {
 		return B_BAD_VALUE;
 	}
 
@@ -374,22 +390,20 @@ phase2(hevc_client* client, const rpi_hevc_phase2& request)
 		if (request.references[i] == RPI_HEVC_NO_BUFFER)
 			continue;
 		references[i] = buffer_for(client, request.references[i]);
-		if (references[i] == NULL
-			|| request.chroma_offset >= references[i]->size) {
+		if (references[i] == NULL || references[i]->size < needs.picture)
 			return B_BAD_VALUE;
-		}
 	}
 
 	hevc_buffer* mv = NULL;
 	hevc_buffer* collocated = NULL;
 	if (request.mv != RPI_HEVC_NO_BUFFER) {
 		mv = buffer_for(client, request.mv);
-		if (mv == NULL)
+		if (mv == NULL || mv->size < needs.mv)
 			return B_BAD_VALUE;
 	}
 	if (request.collocated != RPI_HEVC_NO_BUFFER) {
 		collocated = buffer_for(client, request.collocated);
-		if (collocated == NULL)
+		if (collocated == NULL || collocated->size < needs.mv)
 			return B_BAD_VALUE;
 	}
 	client->busy++;
@@ -442,7 +456,10 @@ phase2(hevc_client* client, const rpi_hevc_phase2& request)
 	flush_cache(frame->address, frame->size);
 
 	clientLocker.Lock();
-	client->busy--;
+	if (status != B_OK)
+		client->lost++;
+	else
+		client->busy--;
 	return status;
 }
 
@@ -618,6 +635,7 @@ hevc_open(const char* name, uint32 flags, void** _cookie)
 		return B_NO_MEMORY;
 	mutex_init(&client->lock, "rpi_hevc client");
 	client->busy = 0;
+	client->lost = 0;
 	for (uint32 i = 0; i < RPI_HEVC_MAX_BUFFERS; i++) {
 		client->buffers[i].area = -1;
 		client->buffers[i].address = NULL;
@@ -655,7 +673,7 @@ hevc_free(void* cookie)
 	// A phase that is under way writes to the buffers until it ends.
 	while (true) {
 		MutexLocker locker(client->lock);
-		if (client->busy == 0)
+		if (client->busy == client->lost)
 			break;
 		locker.Unlock();
 		snooze(10000);
@@ -666,8 +684,21 @@ hevc_free(void* cookie)
 	mutex_lock(&sPhase2Lock);
 	mutex_unlock(&sPhase2Lock);
 
-	for (uint32 i = 0; i < RPI_HEVC_MAX_BUFFERS; i++)
-		free_buffer(client->buffers[i]);
+	if (client->lost == 0) {
+		for (uint32 i = 0; i < RPI_HEVC_MAX_BUFFERS; i++)
+			free_buffer(client->buffers[i]);
+	} else {
+		// Nothing stops a phase that did not end, and nothing tells when it
+		// does: its buffers are not given back, lest the block go on
+		// writing into memory that has another use by then (#202).
+		size_t size = 0;
+		for (uint32 i = 0; i < RPI_HEVC_MAX_BUFFERS; i++) {
+			if (client->buffers[i].area >= 0)
+				size += client->buffers[i].size;
+		}
+		ERROR("%" B_PRId32 " phases did not end: keeping %" B_PRIuSIZE
+			" KiB of buffers\n", client->lost, size / 1024);
+	}
 	mutex_destroy(&client->lock);
 	delete client;
 
