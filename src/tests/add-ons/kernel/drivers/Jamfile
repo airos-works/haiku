@@ -3,6 +3,7 @@ SubDir HAIKU_TOP src tests add-ons kernel drivers ;
 SubInclude HAIKU_TOP src tests add-ons kernel drivers audio ;
 SubInclude HAIKU_TOP src tests add-ons kernel drivers edu ;
 SubInclude HAIKU_TOP src tests add-ons kernel drivers gamepad ;
+SubInclude HAIKU_TOP src tests add-ons kernel drivers graphics ;
 SubInclude HAIKU_TOP src tests add-ons kernel drivers hpet ;
 SubInclude HAIKU_TOP src tests add-ons kernel drivers npu ;
 SubInclude HAIKU_TOP src tests add-ons kernel drivers nvmm ;

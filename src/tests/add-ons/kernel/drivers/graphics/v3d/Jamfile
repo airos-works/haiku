@@ -1,0 +1,12 @@
+SubDir HAIKU_TOP src tests add-ons kernel drivers graphics v3d ;
+
+# v3d_out_syncs_test: the v3d driver's reading of a submit request's chain of
+# extensions (also builds on any host, see the file).
+
+UsePrivateHeaders graphics ;
+SubDirHdrs [ FDirName $(HAIKU_TOP) src add-ons kernel drivers graphics v3d ] ;
+
+SimpleTest v3d_out_syncs_test :
+	v3d_out_syncs_test.cpp
+	: [ TargetLibsupc++ ] [ TargetLibstdc++ ]
+;

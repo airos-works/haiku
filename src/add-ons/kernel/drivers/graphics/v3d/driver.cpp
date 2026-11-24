@@ -206,6 +206,7 @@ struct v3d_file {
 	uint32			bufferCount;
 	uint64*			syncs;		// sequence number + 1; 0: free
 	uint32			syncCount;
+	uint64			lastJob;	// the last one submitted through this file
 };
 
 // A sync object is signalled once the job whose number it holds is done.
@@ -213,7 +214,18 @@ struct v3d_file {
 // be signalled by hand holds this instead:
 #define SYNC_UNSIGNALED		UINT64_MAX
 #define SYNC_SIGNALED		1
-#define MAX_OUT_SYNCS		16
+
+
+static inline status_t
+v3d_copy_from_user(void* to, uint64 address, size_t size)
+{
+	if (!IS_USER_ADDRESS(address))
+		return B_BAD_ADDRESS;
+	return user_memcpy(to, (void*)(addr_t)address, size);
+}
+
+#include "v3d_out_syncs.h"
+	// read_out_syncs(), MAX_OUT_SYNCS
 
 
 static device_manager_info* sDeviceManager;
@@ -1444,13 +1456,16 @@ executor_thread(void* data)
 
 
 /*!	Waits until job \a seqno is done. \a timeout is relative, in
-	nanoseconds; negative waits for good.
+	nanoseconds; negative waits for good. A signal ends the wait, unless
+	\a interruptible is \c false.
 */
 static status_t
-wait_for_job(v3d_info* info, uint64 seqno, int64 timeout)
+wait_for_job(v3d_info* info, uint64 seqno, int64 timeout,
+	bool interruptible = true)
 {
 	bigtime_t deadline = timeout < 0
 		? B_INFINITE_TIMEOUT : system_time() + timeout / 1000;
+	uint32 flags = interruptible ? B_CAN_INTERRUPT : 0;
 
 	while (true) {
 		ConditionVariableEntry entry;
@@ -1465,8 +1480,8 @@ wait_for_job(v3d_info* info, uint64 seqno, int64 timeout)
 			return B_WOULD_BLOCK;
 
 		status_t status = timeout < 0
-			? entry.Wait(B_CAN_INTERRUPT)
-			: entry.Wait(B_ABSOLUTE_TIMEOUT | B_CAN_INTERRUPT, deadline);
+			? entry.Wait(flags)
+			: entry.Wait(B_ABSOLUTE_TIMEOUT | flags, deadline);
 		if (status == B_TIMED_OUT || status == B_INTERRUPTED)
 			return status;
 	}
@@ -1515,6 +1530,7 @@ submit_job(v3d_file* file, v3d_job* job, const uint32* handles, uint32 count,
 	}
 
 	job->seqno = ++info->submitted;
+	file->lastJob = job->seqno;
 	for (uint32 i = 0; i < job->boCount; i++) {
 		v3d_bo* bo = job->bos[i];
 		if (bo->cacheable) {
@@ -1535,58 +1551,6 @@ submit_job(v3d_file* file, v3d_job* job, const uint32* handles, uint32 count,
 	locker.Unlock();
 
 	release_sem(info->jobSemaphore);
-	return B_OK;
-}
-
-
-/*!	The sync objects a job signals: the single out_sync of the request, or
-	the list of the multi-sync extension (Vulkan). The extension's in_syncs
-	need no handling: jobs run in the order they were submitted.
-*/
-static status_t
-read_out_syncs(uint32 flags, uint64 extensions, uint32 outSync,
-	uint32* outSyncs, uint32& _count)
-{
-	_count = 0;
-	if ((flags & DRM_V3D_SUBMIT_EXTENSION) == 0) {
-		if (outSync != 0)
-			outSyncs[_count++] = outSync;
-		return B_OK;
-	}
-
-	uint64 address = extensions;
-	for (int32 i = 0; address != 0 && i < 8; i++) {
-		drm_v3d_extension header;
-		if (!IS_USER_ADDRESS(address)
-			|| user_memcpy(&header, (void*)(addr_t)address, sizeof(header))
-				!= B_OK) {
-			return B_BAD_ADDRESS;
-		}
-
-		if (header.id == DRM_V3D_EXT_ID_MULTI_SYNC) {
-			drm_v3d_multi_sync sync;
-			if (user_memcpy(&sync, (void*)(addr_t)address, sizeof(sync))
-					!= B_OK) {
-				return B_BAD_ADDRESS;
-			}
-			if (sync.out_sync_count > MAX_OUT_SYNCS)
-				return B_BAD_VALUE;
-			for (uint32 k = 0; k < sync.out_sync_count; k++) {
-				drm_v3d_sem semaphore;
-				uint64 entry = sync.out_syncs + k * sizeof(drm_v3d_sem);
-				if (!IS_USER_ADDRESS(entry)
-					|| user_memcpy(&semaphore, (void*)(addr_t)entry,
-						sizeof(semaphore)) != B_OK) {
-					return B_BAD_ADDRESS;
-				}
-				outSyncs[_count++] = semaphore.handle;
-			}
-		} else {
-			// CPU jobs and their kin
-			return B_NOT_SUPPORTED;
-		}
-		address = header.next;
-	}
 	return B_OK;
 }
 
@@ -1840,7 +1804,19 @@ v3d_free(void* cookie)
 	v3d_file* file = (v3d_file*)cookie;
 	v3d_info* info = file->device;
 
-	// Buffers that queued jobs still use live on until those are done.
+	// Buffers that queued jobs still use live on until those are done, and
+	// an imported one keeps its team's pages wired for as long. When the
+	// team dies (a GL program killed in the middle of a frame), its files
+	// are closed and then its address space is deleted, wired or not: the
+	// executor's unlock_memory_etc() came too late then and found no area,
+	// and the pages kept their wired counts (a panic when their cache goes,
+	// #193). So the file's jobs are waited for here: the last reference to
+	// each of its imports goes while the address space is still there. Not
+	// to be interrupted, the thread of a killed team has a signal pending;
+	// a job ends by itself (wait_for_event() has a deadline).
+	if (file->lastJob != 0)
+		wait_for_job(info, file->lastJob, -1, false);
+
 	MutexLocker locker(info->lock);
 	for (uint32 i = 0; i < file->bufferCount; i++) {
 		if (file->buffers[i] != NULL)
