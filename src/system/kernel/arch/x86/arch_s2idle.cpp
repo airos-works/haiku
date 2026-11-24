@@ -2005,6 +2005,12 @@ x86_suspend_enter_s2idle(x86_suspend_s2idle_args* args)
 			cpu_set_enabled(cpu, true);
 	}
 
+	// In the SoC's deepest state the cores are without power, too, and what
+	// the firmware puts back is its business: have the frequency module
+	// write its registers again, as after a suspend to RAM. (They are the
+	// values it wrote before; the module's mode did not change above.)
+	cpu_set_scheduler_mode((scheduler_mode)oldMode);
+
 	args->wake_reason = atomic_get(&sWakeReason);
 	args->slept_us = slept;
 	args->idle_rounds = rounds;

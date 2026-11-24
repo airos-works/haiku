@@ -1028,6 +1028,16 @@ x86_suspend_enter_s3(const x86_suspend_s3_args* args)
 			cpu_set_enabled(cpu, true);
 	}
 
+	if (resumed) {
+		// The processors were without power: what the frequency module
+		// wrote into them when it started (hardware P-states enabled, the
+		// performance request of every CPU) is back at the firmware's
+		// defaults, and nothing above restores it. The module writes these
+		// registers on all CPUs when it is told the scheduler mode, so tell
+		// it the current one again.
+		cpu_set_scheduler_mode((scheduler_mode)_user_get_scheduler_mode());
+	}
+
 	if (resumed)
 		checkpoint(10);
 

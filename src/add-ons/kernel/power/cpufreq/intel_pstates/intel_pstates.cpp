@@ -65,8 +65,16 @@ static void
 pstates_set_scheduler_mode(scheduler_mode mode)
 {
 	sAvoidBoost = mode == SCHEDULER_MODE_POWER_SAVING;
-	if (sHWPActive)
+	if (sHWPActive) {
 		call_all_cpus(set_normal_pstate, NULL);
+	} else if (sCPUEntries != NULL) {
+		// The mode is also set again after a sleep in which the processors
+		// lost their registers: forget what was last written, so that the
+		// next request writes the P-state whatever it is.
+		int32 cpuCount = smp_get_num_cpus();
+		for (int32 i = 0; i < cpuCount; i++)
+			sCPUEntries[i].fCurrentPState = sMinPState - 1;
+	}
 }
 
 
