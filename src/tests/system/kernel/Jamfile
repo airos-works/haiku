@@ -20,6 +20,10 @@ SourceSysHdrs kqueue_unsupported_fd_test.cpp
 SimpleTest kqueue_unsupported_fd_test : kqueue_unsupported_fd_test.cpp
 	: libbsd.so ;
 
+# msync() of a mapping 4 GiB into a file wrote other pages
+# (airos-works/haiku#183); needs 4.4 GiB on the volume and minutes
+SimpleTest msync_large_offset_test : msync_large_offset_test.cpp ;
+
 SimpleTest durable_write : durable_write.cpp ;
 
 SimpleTest illegal_instruction_test : illegal_instruction_test.cpp ;
