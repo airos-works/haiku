@@ -877,6 +877,11 @@ doscheckpath(struct denode *source, struct denode *target, daddr_t *wait_scn)
 			break;
 		}
 		scn = dep->de_StartCluster;
+		/* Haiku: see readep() */
+		if (scn < CLUST_FIRST || scn > pmp->pm_maxcluster) {
+			error = EIO;
+			break;
+		}
 		error = bread(pmp->pm_devvp, cntobn(pmp, scn),
 		    pmp->pm_bpcluster, NOCRED, &bp);
 		if (error != 0)
@@ -944,6 +949,16 @@ readep(struct msdosfsmount *pmp, u_long dirclust, u_long diroffset,
 	if (dirclust == MSDOSFSROOT
 	    && de_blk(pmp, diroffset + blsize) > pmp->pm_rootdirsize)
 		blsize = de_bn2off(pmp, pmp->pm_rootdirsize) & pmp->pm_crbomask;
+	/*
+	 * Haiku: the cluster of a directory comes from the disk (its entry's
+	 * start cluster); one outside the volume would be read from past its
+	 * end.
+	 */
+	if (dirclust != MSDOSFSROOT
+	    && (dirclust < CLUST_FIRST || dirclust > pmp->pm_maxcluster)) {
+		*bpp = NULL;
+		return (EIO);
+	}
 	bn = detobn(pmp, dirclust, diroffset);
 	if ((error = bread(pmp->pm_devvp, bn, blsize, NOCRED, bpp)) != 0) {
 		brelse(*bpp);

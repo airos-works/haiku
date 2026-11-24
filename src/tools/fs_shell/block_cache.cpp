@@ -697,8 +697,10 @@ static void
 put_cached_block(block_cache* cache, fssh_off_t blockNumber)
 {
 	if (blockNumber < 0 || blockNumber >= cache->max_blocks) {
-		fssh_panic("put_cached_block: invalid block number %" FSSH_B_PRIdOFF
-			" (max %" FSSH_B_PRIdOFF ")", blockNumber, cache->max_blocks - 1);
+		fssh_dprintf("put_cached_block: invalid block number %" FSSH_B_PRIdOFF
+			" (max %" FSSH_B_PRIdOFF "), damaged volume?\n", blockNumber,
+			cache->max_blocks - 1);
+		return;
 	}
 
 	cached_block* block = (cached_block*)hash_lookup(cache->hash, &blockNumber);
@@ -720,9 +722,12 @@ static fssh_status_t
 get_cached_block(block_cache* cache, fssh_off_t blockNumber, bool* _allocated,
 	bool readBlock, cached_block** _block)
 {
+	// (not a panic: block numbers come from the disk, as in the kernel's
+	// block cache)
 	if (blockNumber < 0 || blockNumber >= cache->max_blocks) {
-		fssh_panic("get_cached_block: invalid block number %" FSSH_B_PRIdOFF
-			" (max %" FSSH_B_PRIdOFF ")", blockNumber, cache->max_blocks - 1);
+		fssh_dprintf("get_cached_block: invalid block number %" FSSH_B_PRIdOFF
+			" (max %" FSSH_B_PRIdOFF "), damaged volume?\n", blockNumber,
+			cache->max_blocks - 1);
 		return FSSH_B_BAD_VALUE;
 	}
 
@@ -780,8 +785,9 @@ get_writable_cached_block(block_cache* cache, fssh_off_t blockNumber,
 		blockNumber, transactionID));
 
 	if (blockNumber < 0 || blockNumber >= cache->max_blocks) {
-		fssh_panic("get_writable_cached_block: invalid block number %"
-			FSSH_B_PRIdOFF " (max %" FSSH_B_PRIdOFF ")", blockNumber,
+		fssh_dprintf("get_writable_cached_block: invalid block number %"
+			FSSH_B_PRIdOFF " (max %" FSSH_B_PRIdOFF "), damaged volume?\n",
+			blockNumber,
 			cache->max_blocks - 1);
 		return FSSH_B_BAD_VALUE;
 	}
@@ -1570,8 +1576,9 @@ fssh_block_cache_sync_etc(void* _cache, fssh_off_t blockNumber,
 	// transaction or no transaction only
 
 	if (blockNumber < 0 || blockNumber >= cache->max_blocks) {
-		fssh_panic("block_cache_sync_etc: invalid block number %" FSSH_B_PRIdOFF
-			" (max %" FSSH_B_PRIdOFF ")", blockNumber, cache->max_blocks - 1);
+		fssh_dprintf("block_cache_sync_etc: invalid block number %"
+			FSSH_B_PRIdOFF " (max %" FSSH_B_PRIdOFF "), damaged volume?\n",
+			blockNumber, cache->max_blocks - 1);
 		return FSSH_B_BAD_VALUE;
 	}
 

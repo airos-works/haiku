@@ -199,6 +199,17 @@ pcbmap(struct denode *dep, u_long findcn, daddr_t *bnp, u_long *cnp, int *sp)
 		 */
 		if ((cn | ~pmp->pm_fatmask) >= CLUST_RSRVD)
 			goto hiteof;
+		/*
+		 * Haiku: a cluster number from the disk (a directory entry, a FAT
+		 * entry, the boot sector) that is not a cluster of this volume: its
+		 * FAT entry and its data would be read from past the end of the
+		 * FAT, or of the volume.
+		 */
+		if (cn < CLUST_FIRST || cn > pmp->pm_maxcluster) {
+			if (bp)
+				brelse(bp);
+			return (EIO);
+		}
 		byteoffset = FATOFS(pmp, cn);
 		fatblock(pmp, byteoffset, &bn, &bsize, &bo);
 		if (bn != bp_bn) {
@@ -237,6 +248,9 @@ pcbmap(struct denode *dep, u_long findcn, daddr_t *bnp, u_long *cnp, int *sp)
 	if (!MSDOSFSEOF(pmp, cn)) {
 		if (bp)
 			brelse(bp);
+		/* Haiku: see above */
+		if (cn < CLUST_FIRST || cn > pmp->pm_maxcluster)
+			return (EIO);
 		if (bnp)
 			*bnp = cntobn(pmp, cn);
 		if (cnp)

@@ -236,9 +236,13 @@ InitVolDesc(iso9660_volume *volume, char *buffer)
 	volume->optMPathTblLoc[MSB_DATA] = *(uint16*)buffer;
 	buffer += sizeof(volume->optMPathTblLoc[MSB_DATA]);
 
-	// Fill in directory record.
+	// Fill in directory record. In a volume descriptor it has a fixed size:
+	// what follows is the descriptor's next field, not this record's.
 	volume->joliet_level = 0;
-	InitNode(volume, &volume->rootDirRec, buffer, NULL);
+	status_t status = InitNode(volume, &volume->rootDirRec, buffer,
+		ISO_ROOT_DIR_REC_SIZE, NULL);
+	if (status != B_OK)
+		return status;
 
 	volume->rootDirRec.id = ISO_ROOTNODE_ID;
 	buffer += ISO_ROOT_DIR_REC_SIZE;
@@ -300,6 +304,14 @@ InitVolDesc(iso9660_volume *volume, char *buffer)
 }
 
 
+static status_t init_node(iso9660_volume* volume, iso9660_inode* node,
+	char* buffer, size_t bufferSize, size_t* _bytesRead, bool relocated);
+
+
+/*!	Parses the system use entries (Rock Ridge) between \a buffer and \a end.
+	Every length in there comes from the disk: an entry is only looked at when
+	it lies within the record and is as long as its fields need.
+*/
 static status_t
 parse_rock_ridge(iso9660_volume* volume, iso9660_inode* node, char* buffer,
 	char* end, bool relocated)
@@ -312,17 +324,16 @@ parse_rock_ridge(iso9660_volume* volume, iso9660_inode* node, char* buffer,
 	uint16 slNameSize = 0;
 	uint8 length = 0;
 	bool done = false;
+	status_t status = B_OK;
 
 	TRACE(("RR: Start of extensions at %p\n", buffer));
 
 	while (!done) {
 		buffer += length;
-		if (buffer + 2 >= end)
+		if (end - buffer < 4)
 			break;
 		length = *(uint8*)(buffer + 2);
-		if (buffer + length > end)
-			break;
-		if (length == 0)
+		if (length < 4 || length > end - buffer)
 			break;
 
 		switch (((int)buffer[0] << 8) + buffer[1]) {
@@ -331,6 +342,10 @@ parse_rock_ridge(iso9660_volume* volume, iso9660_inode* node, char* buffer,
 			{
 				uint8 bytePos = 3;
 				TRACE(("RR: found PX, length %u\n", length));
+				if (length < 36) {
+					// version byte and four fields of 8 bytes
+					break;
+				}
 				node->attr.pxVer = *(uint8*)(buffer + bytePos++);
 
 				// st_mode
@@ -374,14 +389,18 @@ parse_rock_ridge(iso9660_volume* volume, iso9660_inode* node, char* buffer,
 			// Symbolic link info
 			case 'SL':
 			{
-				uint8 bytePos = 3;
-				uint8 addPos = 0;
+				// The positions are wider than the entry's 8 bit length, so
+				// that a component at its end cannot wrap them around.
+				uint32 bytePos = 3;
+				uint32 addPos = 0;
 				bool slDone = false;
 				bool useSeparator = true;
 
 				TRACE(("RR: found SL, length %u\n", length));
 				TRACE(("Buffer is at %p\n", buffer));
 				TRACE(("Current length is %u\n", slNameSize));
+				if (length < 5)
+					break;
 				//kernel_debugger("");
 				node->attr.slVer = *(uint8*)(buffer + bytePos++);
 #if TRACE_ISO9660
@@ -391,9 +410,14 @@ parse_rock_ridge(iso9660_volume* volume, iso9660_inode* node, char* buffer,
 				// skip symlink flags
 				++bytePos;
 #endif
-				while (!slDone && bytePos < length) {
+				while (!slDone && bytePos + 2 <= length) {
 					uint8 compFlag = *(uint8*)(buffer + bytePos++);
 					uint8 compLen = *(uint8*)(buffer + bytePos++);
+
+					if (compLen > length - bytePos) {
+						// the component claims more than the entry holds
+						break;
+					}
 
 					if (slName == NULL)
 						useSeparator = false;
@@ -415,6 +439,8 @@ parse_rock_ridge(iso9660_volume* volume, iso9660_inode* node, char* buffer,
 								slNameSize + 1);
 							if (newSlName == NULL) {
 								free(slName);
+								free(altName);
+								node->attr.slName = NULL;
 								return B_NO_MEMORY;
 							}
 							slName = newSlName;
@@ -439,6 +465,8 @@ parse_rock_ridge(iso9660_volume* volume, iso9660_inode* node, char* buffer,
 								slNameSize + 1);
 							if (newSlName == NULL) {
 								free(slName);
+								free(altName);
+								node->attr.slName = NULL;
 								return B_NO_MEMORY;
 							}
 							slName = newSlName;
@@ -453,6 +481,8 @@ parse_rock_ridge(iso9660_volume* volume, iso9660_inode* node, char* buffer,
 								slNameSize + 1);
 							if (newSlName == NULL) {
 								free(slName);
+								free(altName);
+								node->attr.slName = NULL;
 								return B_NO_MEMORY;
 							}
 							slName = newSlName;
@@ -468,6 +498,8 @@ parse_rock_ridge(iso9660_volume* volume, iso9660_inode* node, char* buffer,
 								slNameSize + 1);
 							if (newSlName == NULL) {
 								free(slName);
+								free(altName);
+								node->attr.slName = NULL;
 								return B_NO_MEMORY;
 							}
 							slName = newSlName;
@@ -500,6 +532,11 @@ parse_rock_ridge(iso9660_volume* volume, iso9660_inode* node, char* buffer,
 				uint8 flags = 0;
 				uint16 oldEnd = altNameSize;
 
+				if (length < 5) {
+					// no room for the version and the flags, let alone a name
+					break;
+				}
+
 				altNameSize += length - 5;
 				char* newAltName = (char*)realloc(altName, altNameSize + 1);
 				if (newAltName == NULL) {
@@ -529,6 +566,12 @@ parse_rock_ridge(iso9660_volume* volume, iso9660_inode* node, char* buffer,
 						free(node->name);
 					node->name = altName;
 					node->name_length = altNameSize;
+
+					// The node owns the name now. Another name entry in this
+					// record starts a name of its own instead of growing (and
+					// then freeing) the one that was just handed over.
+					altName = NULL;
+					altNameSize = 0;
 				}
 				break;
 			}
@@ -537,19 +580,41 @@ parse_rock_ridge(iso9660_volume* volume, iso9660_inode* node, char* buffer,
 			case 'CL':
 			{
 				TRACE(("RR: found CL, length %u\n", length));
+				if (length < 12)
+					break;
+				if (relocated || volume->fBlockCache == NULL) {
+					// The "." entry of a relocated directory does not point
+					// on to another one (a directory pointing at itself would
+					// use up the stack), and the volume descriptor's copy of
+					// the root record is parsed before there is a block cache.
+					dprintf("iso9660: ignoring a nested directory "
+						"relocation\n");
+					break;
+				}
+
 				// Reinitialize the node with the information at the
 				// "." entry of the pointed to directory data
 				node->startLBN[LSB_DATA] = *(uint32*)(buffer+4);
 				node->startLBN[MSB_DATA] = *(uint32*)(buffer+8);
 
-				char* buffer = (char*)block_cache_get(volume->fBlockCache,
-					node->startLBN[FS_DATA_FORMAT]);
-				if (buffer == NULL)
+				off_t block = node->startLBN[FS_DATA_FORMAT];
+				char* blockData = (char*)block_cache_get(volume->fBlockCache,
+					block);
+				if (blockData == NULL) {
+					// not a block of this volume, or it cannot be read
+					status = B_UNSUPPORTED;
+					done = true;
 					break;
+				}
 
-				InitNode(volume, node, buffer, NULL, true);
-				block_cache_put(volume->fBlockCache,
-					node->startLBN[FS_DATA_FORMAT]);
+				status = init_node(volume, node, blockData,
+					volume->logicalBlkSize[FS_DATA_FORMAT], NULL, true);
+				block_cache_put(volume->fBlockCache, block);
+				if (status != B_OK) {
+					// an entry we cannot make sense of is skipped
+					status = B_UNSUPPORTED;
+					done = true;
+				}
 				break;
 			}
 
@@ -560,8 +625,10 @@ parse_rock_ridge(iso9660_volume* volume, iso9660_inode* node, char* buffer,
 			case 'RE':
 				// Relocated directory, we should skip.
 				TRACE(("RR: found RE, length %u\n", length));
-				if (!relocated)
-					return B_UNSUPPORTED;
+				if (!relocated) {
+					status = B_UNSUPPORTED;
+					done = true;
+				}
 				break;
 
 			case 'TF':
@@ -575,7 +642,9 @@ parse_rock_ridge(iso9660_volume* volume, iso9660_inode* node, char* buffer,
 			case 'SF':
 				TRACE(("RR: found SF, sparse files not supported!\n"));
 				// TODO: support sparse files
-				return B_UNSUPPORTED;
+				status = B_UNSUPPORTED;
+				done = true;
+				break;
 
 			default:
 				if (buffer[0] == '\0') {
@@ -587,7 +656,10 @@ parse_rock_ridge(iso9660_volume* volume, iso9660_inode* node, char* buffer,
 		}
 	}
 
-	return B_OK;
+	// a name that was to be continued and was not
+	free(altName);
+
+	return status;
 }
 
 //	#pragma mark - ISO-9660 specific exported functions
@@ -673,10 +745,23 @@ ISOMount(const char *path, uint32 flags, iso9660_volume **_newVolume,
 
 				TRACE(("ISOMount: Is an ISO9660 volume, initting rec\n"));
 
-				InitVolDesc(volume, buffer);
+				if (InitVolDesc(volume, buffer) != B_OK) {
+					dprintf("iso9660: invalid root directory record\n");
+					break;
+				}
 				strncpy(volume->devicePath,path,127);
 				volume->id = ISO_ROOTNODE_ID;
 				TRACE(("ISO9660: volume->blockSize = %d\n", volume->logicalBlkSize[FS_DATA_FORMAT]));
+
+				// Everything is counted in logical blocks; the standard
+				// allows powers of two from 512 bytes on.
+				uint32 blockSize = volume->logicalBlkSize[FS_DATA_FORMAT];
+				if (blockSize < 512 || (blockSize & (blockSize - 1)) != 0) {
+					dprintf("iso9660: invalid logical block size %" B_PRIu32
+						"\n", blockSize);
+					free(volume->rootDirRec.name);
+					break;
+				}
 
 #if TRACE_ISO9660
 				int multiplier = deviceBlockSize / volume->logicalBlkSize[FS_DATA_FORMAT];
@@ -694,6 +779,10 @@ ISOMount(const char *path, uint32 flags, iso9660_volume **_newVolume,
 				TRACE(("ISO9660: cache init: dev %d, max blocks %lld\n", volume->fd, maxBlocks));
 				volume->fBlockCache = block_cache_create(volume->fd, maxBlocks,
 					volume->logicalBlkSize[FS_DATA_FORMAT], true);
+				if (volume->fBlockCache == NULL) {
+					free(volume->rootDirRec.name);
+					break;
+				}
 				isISO = true;
 			} else if (*buffer == 0x02 && isISO && allowJoliet) {
 				// ISO_VD_SUPPLEMENTARY
@@ -712,8 +801,21 @@ ISOMount(const char *path, uint32 flags, iso9660_volume **_newVolume,
 					// Because Joliet-stuff starts at other sector,
 					// update root directory record.
 					if (volume->joliet_level > 0) {
-						InitNode(volume, &volume->rootDirRec, &buffer[156],
-							NULL);
+						// A root record that is no good leaves the volume
+						// with the primary descriptor's names.
+						iso9660_inode root;
+						if (InitNode(volume, &root, &buffer[156],
+								ISO_ROOT_DIR_REC_SIZE, NULL) == B_OK) {
+							root.id = volume->rootDirRec.id;
+							root.parID = volume->rootDirRec.parID;
+							root.volume = volume->rootDirRec.volume;
+							free(volume->rootDirRec.name);
+							volume->rootDirRec = root;
+						} else {
+							dprintf("iso9660: invalid Joliet root directory "
+								"record, ignoring Joliet\n");
+							volume->joliet_level = 0;
+						}
 					}
 				}
 			} else if (*(unsigned char *)buffer == 0xff) {
@@ -785,11 +887,14 @@ ISOReadDirEnt(iso9660_volume *volume, dircookie *cookie, struct dirent *dirent,
 			iso9660_inode node;
 			size_t bytesRead = 0;
 			result = InitNode(volume, &node, blockData + cookie->pos,
+				volume->logicalBlkSize[FS_DATA_FORMAT] - cookie->pos,
 				&bytesRead);
 
 			// if we hit an entry that we don't support, we just skip it
-			if (result != B_OK && result != B_UNSUPPORTED)
+			if (result != B_OK && result != B_UNSUPPORTED) {
+				block_cache_put(volume->fBlockCache, cacheBlock);
 				break;
+			}
 
 			if (result == B_OK && (node.flags & ISO_IS_ASSOCIATED_FILE) == 0) {
 				size_t nameBufferSize = bufferSize - offsetof(struct dirent, d_name);
@@ -818,7 +923,7 @@ ISOReadDirEnt(iso9660_volume *volume, dircookie *cookie, struct dirent *dirent,
 
 			cookie->pos += bytesRead;
 
-			if (cookie->pos == volume->logicalBlkSize[FS_DATA_FORMAT]) {
+			if (cookie->pos >= volume->logicalBlkSize[FS_DATA_FORMAT]) {
 				cookie->pos = 0;
 				cookie->block++;
 			}
@@ -841,30 +946,67 @@ ISOReadDirEnt(iso9660_volume *volume, dircookie *cookie, struct dirent *dirent,
 }
 
 
+/*!	Fills in \a node from the directory record at \a buffer, of which
+	\a bufferSize bytes can be read (the rest of the directory's block).
+	\a _bytesRead is set to the record's length, or to 0 when the record is
+	not one: there is no telling where the next one would start then.
+*/
 status_t
 InitNode(iso9660_volume* volume, iso9660_inode* node, char* buffer,
-	size_t* _bytesRead, bool relocated)
+	size_t bufferSize, size_t* _bytesRead)
 {
+	return init_node(volume, node, buffer, bufferSize, _bytesRead, false);
+}
+
+
+static status_t
+init_node(iso9660_volume* volume, iso9660_inode* node, char* buffer,
+	size_t bufferSize, size_t* _bytesRead, bool relocated)
+{
+	// the fixed part of a directory record, up to and including the length
+	// of the name
+	const size_t kRecordHeaderSize = 33;
+
+	if (_bytesRead != NULL)
+		*_bytesRead = 0;
+	if (bufferSize == 0)
+		return B_ENTRY_NOT_FOUND;
+
+	char* recordStart = buffer;
 	uint8 recordLength = *(uint8*)buffer++;
 	size_t nameLength;
 
 	TRACE(("InitNode - ENTER, bufstart is %p, record length is %d bytes\n",
 		buffer, recordLength));
 
-	if (_bytesRead != NULL)
-		*_bytesRead = recordLength;
 	if (recordLength == 0)
 		return B_ENTRY_NOT_FOUND;
 
-	char* end = buffer + recordLength;
+	// The length comes from the disk. A record that says it is shorter than
+	// its own header, or that goes on past the end of its block, would have
+	// us read (and, for the names, copy) whatever follows in memory.
+	if (recordLength <= kRecordHeaderSize || recordLength > bufferSize
+		|| kRecordHeaderSize + *(uint8*)(recordStart + 32) > recordLength) {
+		dprintf("iso9660: invalid directory record (length %u, name length "
+			"%u, %" B_PRIuSIZE " bytes left in the block)\n", recordLength,
+			bufferSize > 32 ? *(uint8*)(recordStart + 32) : 0, bufferSize);
+		return B_BAD_DATA;
+	}
+
+	if (_bytesRead != NULL)
+		*_bytesRead = recordLength;
+
+	char* end = recordStart + recordLength;
 
 	if (!relocated) {
 		node->cache = NULL;
 		node->name = NULL;
 		node->attr.slName = NULL;
 		memset(node->attr.stat, 0, sizeof(node->attr.stat));
-	} else
+	} else {
 		free(node->attr.slName);
+		node->attr.slName = NULL;
+	}
 
 	node->extAttrRecLen = *(uint8*)buffer++;
 	TRACE(("InitNode - ext attr length is %d\n", (int)node->extAttrRecLen));

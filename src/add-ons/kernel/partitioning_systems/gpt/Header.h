@@ -38,7 +38,8 @@ public:
 									{ return fHeader.EntryCount(); }
 			gpt_partition_entry& EntryAt(int32 index) const
 									{ return *(gpt_partition_entry*)(fEntries
-										+ fHeader.EntrySize() * index); }
+										+ (size_t)fHeader.EntrySize()
+											* index); }
 
 #ifndef _BOOT_MODE
 			status_t			WriteEntry(int fd, uint32 entryIndex);
@@ -62,7 +63,7 @@ private:
 			bool				_ValidateEntriesCRC() const;
 			void				_SetBackupHeaderFromPrimary(uint64 lastBlock);
 			size_t				_EntryArraySize() const
-									{ return fHeader.EntrySize()
+									{ return (size_t)fHeader.EntrySize()
 										* fHeader.EntryCount(); }
 
 			const char*			_PrintGUID(const guid_t& id);

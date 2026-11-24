@@ -817,6 +817,34 @@ static void mark_block_busy_reading(block_cache* cache, cached_block* block);
 static void mark_block_unbusy_reading(block_cache* cache, cached_block* block);
 
 
+/*!	A block number outside the device. File systems take block numbers from
+	the disk, so this is what a damaged or crafted volume looks like, not a
+	bug of the kernel: the caller gets an error and the log gets a line (a
+	few per second at most, a directory of such blocks must not drown it).
+*/
+static void
+report_invalid_block(block_cache* cache, const char* function, off_t blockNumber)
+{
+	static bigtime_t sWindowStart = 0;
+	static int32 sReports = 0;
+	const int32 kReportsPerSecond = 5;
+
+	bigtime_t now = system_time();
+	if (now - sWindowStart >= 1000000) {
+		int32 dropped = atomic_get_and_set(&sReports, 0) - kReportsPerSecond;
+		sWindowStart = now;
+		if (dropped > 0)
+			dprintf("block cache: %" B_PRId32 " more invalid block numbers\n", dropped);
+	}
+	if (atomic_add(&sReports, 1) >= kReportsPerSecond)
+		return;
+
+	dprintf("block cache: %s: invalid block number %" B_PRIdOFF " (max %" B_PRIdOFF
+		") on fd %d, damaged volume?\n", function, blockNumber, cache->max_blocks - 1,
+		cache->fd);
+}
+
+
 //	#pragma mark - notifications/listener
 
 
@@ -1493,8 +1521,7 @@ BlockPrefetcher::Allocate()
 	for (size_t i = 0; i < fNumRequested; ++i) {
 		off_t blockNumIter = fBlockNumber + i;
 		if (blockNumIter < 0 || blockNumIter >= fCache->max_blocks) {
-			panic("BlockPrefetcher::Allocate: invalid block number %" B_PRIdOFF " (max %"
-				B_PRIdOFF ")", blockNumIter, fCache->max_blocks - 1);
+			report_invalid_block(fCache, "BlockPrefetcher::Allocate", blockNumIter);
 			return B_BAD_VALUE;
 		}
 		cached_block* block = fCache->hash.Lookup(blockNumIter);
@@ -2137,8 +2164,9 @@ static void
 put_cached_block(block_cache* cache, off_t blockNumber, WriteLocker* writeLocker = NULL)
 {
 	if (blockNumber < 0 || blockNumber >= cache->max_blocks) {
-		panic("put_cached_block: invalid block number %" B_PRIdOFF " (max %" B_PRIdOFF ")",
-			blockNumber, cache->max_blocks - 1);
+		// can only be the other half of a get that was refused
+		report_invalid_block(cache, "put_cached_block", blockNumber);
+		return;
 	}
 
 	cached_block* block = cache->hash.Lookup(blockNumber);
@@ -2168,8 +2196,7 @@ get_cached_block(block_cache* cache, off_t blockNumber, bool* _allocated,
 	ASSERT_LOCKED_MUTEX(&cache->lock);
 
 	if (blockNumber < 0 || blockNumber >= cache->max_blocks) {
-		panic("get_cached_block: invalid block number %" B_PRIdOFF " (max %" B_PRIdOFF ")",
-			blockNumber, cache->max_blocks - 1);
+		report_invalid_block(cache, "get_cached_block", blockNumber);
 		return B_BAD_VALUE;
 	}
 
@@ -2251,8 +2278,7 @@ get_writable_cached_block(block_cache* cache, off_t blockNumber,
 		blockNumber, transactionID);
 
 	if (blockNumber < 0 || blockNumber >= cache->max_blocks) {
-		panic("get_writable_cached_block: invalid block number %" B_PRIdOFF " (max %" B_PRIdOFF ")",
-			blockNumber, cache->max_blocks - 1);
+		report_invalid_block(cache, "get_writable_cached_block", blockNumber);
 		return B_BAD_VALUE;
 	}
 
@@ -3782,9 +3808,7 @@ block_cache_sync_etc(void* _cache, off_t blockNumber, size_t numBlocks)
 	// transaction or no transaction only
 
 	if (blockNumber < 0 || blockNumber >= cache->max_blocks) {
-		panic("block_cache_sync_etc: invalid block number %" B_PRIdOFF
-			" (max %" B_PRIdOFF ")",
-			blockNumber, cache->max_blocks - 1);
+		report_invalid_block(cache, "block_cache_sync_etc", blockNumber);
 		return B_BAD_VALUE;
 	}
 

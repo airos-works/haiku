@@ -709,7 +709,10 @@ get_nth_fat_entry(msdosfsmount* fatVolume, uint32 cluster, uint32 n)
 			REPORT_ERROR(B_FROM_POSIX_ERROR(status));
 			break;
 		}
-		ASSERT(IS_DATA_CLUSTER(resultCluster));
+		// The entry comes from the disk: the end of the chain, or on a damaged volume any
+		// number at all. The callers tell a data cluster from the rest.
+		if (!IS_DATA_CLUSTER(resultCluster))
+			break;
 	}
 
 	return static_cast<uint32>(resultCluster);

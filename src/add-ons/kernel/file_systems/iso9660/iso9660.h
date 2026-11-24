@@ -225,7 +225,7 @@ status_t ISOMount(const char *path, uint32 flags, iso9660_volume** _newVolume,
 status_t ISOReadDirEnt(iso9660_volume* ns, dircookie* cookie,
 	struct dirent* buffer, size_t bufferSize);
 status_t InitNode(iso9660_volume* volume, iso9660_inode* rec, char* buf,
-	size_t* bytesRead, bool relocated = false);
+	size_t bufferSize, size_t* bytesRead);
 status_t ConvertRecDate(ISORecDate* inDate, time_t* outDate);
 
 #endif	/* ISO_9660_H */

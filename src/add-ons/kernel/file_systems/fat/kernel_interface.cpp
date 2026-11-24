@@ -1129,7 +1129,10 @@ dosfs_get_file_map(fs_volume* volume, fs_vnode* vnode, off_t position, size_t le
 		// Break when iter reaches the first sector of a non-contiguous cluster.
 		while (length > 0) {
 			status = iter_csi(&iter, 1);
-			ASSERT(status == B_OK);
+			if (status != B_OK) {
+				// the cluster chain ends before the size in the directory entry does
+				RETURN_ERROR(B_IO_ERROR);
+			}
 			status = validate_cs(iter.fatVolume, iter.cluster, iter.sector);
 			if (status != B_OK)
 				RETURN_ERROR(status);
@@ -1656,6 +1659,11 @@ dosfs_rename(fs_volume* volume, fs_vnode* fromDir, const char* fromName, fs_vnod
 		u_long clustNumber = fromFatNode->de_StartCluster;
 		ASSERT(clustNumber != MSDOSFSROOT);
 			// this should never happen
+		if (!IS_DATA_CLUSTER(clustNumber)) {
+			// the start cluster comes from the disk
+			msdosfs_integrity_error(fatVolume);
+			RETURN_ERROR(B_IO_ERROR);
+		}
 		daddr_t blockNumber = cntobn(fatVolume, clustNumber);
 		status = B_FROM_POSIX_ERROR(
 			bread(fatVolume->pm_devvp, blockNumber, fatVolume->pm_bpcluster, NOCRED, &dotDotBuf));
@@ -3396,6 +3404,15 @@ fat_volume_init(vnode* devvp, mount* bsdVolume, const uint64_t fatFlags, const c
 		INFORM("number of clusters (%ld) exceeds FAT capacity (%" B_PRIu32 ") "
 			"(some clusters are inaccessible)\n", fatVolume->pm_maxcluster + 1, fatCapacity);
 		fatVolume->pm_maxcluster = fatCapacity - 1;
+	}
+
+	// The root directory of a FAT32 volume is a cluster chain like any other, and where it
+	// starts comes from the boot sector.
+	if (FAT32(fatVolume) == true && (fatVolume->pm_rootdirblk < CLUST_FIRST
+			|| fatVolume->pm_rootdirblk > fatVolume->pm_maxcluster)) {
+		INFORM("root directory cluster (%lu) is outside the volume (clusters 2 to %lu)\n",
+			fatVolume->pm_rootdirblk, fatVolume->pm_maxcluster);
+		return B_BAD_VALUE;
 	}
 
 	if (FAT12(fatVolume) != 0)

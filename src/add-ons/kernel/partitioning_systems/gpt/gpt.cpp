@@ -79,6 +79,9 @@ efi_gpt_identify_partition(int fd, partition_data* partition, void** _cookie)
 {
 	EFI::Header* header = new (std::nothrow) EFI::Header(fd,
 		(partition->size - 1) / partition->block_size, partition->block_size);
+	if (header == NULL)
+		return -1;
+
 	status_t status = header->InitCheck();
 	if (status != B_OK) {
 		delete header;
@@ -120,8 +123,10 @@ efi_gpt_scan_partition(int fd, partition_data* partition, void* _cookie)
 		if (entry.partition_type == kEmptyGUID)
 			continue;
 
-		if (entry.EndBlock() * partition->block_size
-				> (uint64)partition->size) {
+		// (compared in blocks: the product with the block size can wrap)
+		if (entry.StartBlock() > entry.EndBlock()
+			|| entry.EndBlock()
+				> (uint64)partition->size / partition->block_size) {
 			TRACE(("efi_gpt: child partition exceeds existing space (ends at "
 				"block %" B_PRIu64 ")\n", entry.EndBlock()));
 			continue;

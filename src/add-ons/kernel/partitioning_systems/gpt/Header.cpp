@@ -47,6 +47,12 @@
 namespace EFI {
 
 
+// The specification's entries are 128 bytes (and may be 128 * 2^n), its usual
+// table has 128 of them. These bounds leave room and keep the array at 16 MiB.
+static const uint32 kMaxEntrySize = 4096;
+static const uint32 kMaxEntryCount = 4096;
+
+
 Header::Header(int fd, uint64 lastBlock, uint32 blockSize)
 	:
 	fBlockSize(blockSize),
@@ -334,9 +340,24 @@ Header::_Read(int fd, off_t offset, void* data, size_t size) const
 bool
 Header::_IsHeaderValid(gpt_table_header& header, uint64 block)
 {
-	return !memcmp(header.header, EFI_PARTITION_HEADER, sizeof(header.header))
-		&& _ValidateHeaderCRC(header)
-		&& header.AbsoluteBlock() == block;
+	if (memcmp(header.header, EFI_PARTITION_HEADER, sizeof(header.header)) != 0
+		|| !_ValidateHeaderCRC(header)
+		|| header.AbsoluteBlock() != block)
+		return false;
+
+	// The entry array is allocated, read and indexed with these two; a
+	// checksum that matches says nothing about what they are. An entry
+	// smaller than the structure, or a product that does not fit 32 bits,
+	// has EntryAt() point outside the array.
+	if (header.EntrySize() < sizeof(gpt_partition_entry)
+		|| header.EntrySize() > kMaxEntrySize
+		|| header.EntryCount() > kMaxEntryCount) {
+		dprintf("gpt: invalid entry array: %" B_PRIu32 " entries of %"
+			B_PRIu32 " bytes\n", header.EntryCount(), header.EntrySize());
+		return false;
+	}
+
+	return true;
 }
 
 

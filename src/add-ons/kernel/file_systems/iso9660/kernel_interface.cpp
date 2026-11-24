@@ -297,7 +297,9 @@ fs_walk(fs_volume* _volume, fs_vnode* _base, const char* file, ino_t* _vnodeID)
 			&& totalRead + blockBytesRead < dataLength
 			&& blockData[0] != 0
 			&& !done) {
-			initResult = InitNode(volume, &node, blockData, &bytesRead);
+			initResult = InitNode(volume, &node, blockData,
+				volume->logicalBlkSize[FS_DATA_FORMAT] - blockBytesRead,
+				&bytesRead);
 			TRACE(("fs_walk - InitNode returned %s, filename %s, %u bytes "
 				"read\n", strerror(initResult), node.name, (unsigned)bytesRead));
 
@@ -361,7 +363,7 @@ fs_read_vnode(fs_volume* _volume, ino_t vnodeID, fs_vnode* _node,
 	TRACE(("fs_read_vnode - block = %u, pos = %u, raw = %Lu node %p\n",
 		(unsigned)block, (unsigned) pos, vnodeID, newNode));
 
-	if (pos > volume->logicalBlkSize[FS_DATA_FORMAT]) {
+	if (pos >= volume->logicalBlkSize[FS_DATA_FORMAT]) {
 		free(newNode);
 		return B_BAD_VALUE;
 	}
@@ -372,7 +374,8 @@ fs_read_vnode(fs_volume* _volume, ino_t vnodeID, fs_vnode* _node,
 		return B_IO_ERROR;
 	}
 
-	status_t result = InitNode(volume, newNode, data + pos, NULL);
+	status_t result = InitNode(volume, newNode, data + pos,
+		volume->logicalBlkSize[FS_DATA_FORMAT] - pos, NULL);
 	block_cache_put(volume->fBlockCache, block);
 
 	if (result < B_OK) {
@@ -562,6 +565,11 @@ fs_read_link(fs_volume* _volume, fs_vnode* _node, char* buffer,
 
 	if (!S_ISLNK(node->attr.stat[FS_DATA_FORMAT].st_mode))
 		return B_BAD_VALUE;
+
+	// the mode comes from one entry of the record and the target from
+	// another, which need not be there
+	if (node->attr.slName == NULL)
+		return B_BAD_DATA;
 
 	size_t length = strlen(node->attr.slName);
 

@@ -58,6 +58,26 @@ disk_super_block::IsValid() const
 			1L << AllocationGroupShift()))
 		return false;
 
+	// The log is read (replayed) at mount, from where its run says, and its
+	// length divides the positions in it: a run outside the volume or without
+	// blocks is not something to find out about in the block cache.
+	off_t logBlock = ((off_t)log_blocks.AllocationGroup()
+		<< AllocationGroupShift()) + log_blocks.Start();
+	if (log_blocks.AllocationGroup() < 0
+		|| log_blocks.AllocationGroup() >= AllocationGroups()
+		|| log_blocks.Length() == 0
+		|| logBlock + log_blocks.Length() > NumBlocks()
+		|| LogStart() < 0 || LogStart() >= log_blocks.Length()
+		|| LogEnd() < 0 || LogEnd() >= log_blocks.Length())
+		return false;
+
+	// so is the root directory's inode
+	if (root_dir.AllocationGroup() < 0
+		|| root_dir.AllocationGroup() >= AllocationGroups()
+		|| ((off_t)root_dir.AllocationGroup() << AllocationGroupShift())
+			+ root_dir.Start() >= NumBlocks())
+		return false;
+
 	return true;
 }
 
@@ -434,12 +454,15 @@ Volume::ResizeBlockCache(off_t numBlocks)
 status_t
 Volume::ValidateBlockRun(block_run run)
 {
+	// The last allocation group is usually not a whole one, so the run is
+	// compared with the volume's size as well.
 	if (run.AllocationGroup() < 0
-		|| run.AllocationGroup() > (int32)AllocationGroups()
+		|| run.AllocationGroup() >= (int32)AllocationGroups()
 		|| run.Start() > (1UL << AllocationGroupShift())
 		|| run.length == 0
 		|| uint32(run.Length() + run.Start())
-				> (1UL << AllocationGroupShift())) {
+				> (1UL << AllocationGroupShift())
+		|| ToBlock(run) + run.Length() > NumBlocks()) {
 		Panic();
 		FATAL(("*** invalid run(%d,%d,%d)\n", (int)run.AllocationGroup(),
 			run.Start(), run.Length()));
