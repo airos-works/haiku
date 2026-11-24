@@ -190,8 +190,10 @@ public:
 	// list views that show how big folders are
 	bool ShowsFolderSizes() const;
 	void SetShowFolderSizes(bool show);
-	void RequestFolderSizes(bigtime_t maxAge);
-		// sizes known for longer than maxAge are worked out again
+	void RequestFolderSizes(bigtime_t maxAge, bool refresh = false);
+		// sizes known for longer than maxAge are worked out again; with
+		// refresh, only sizes that are different are sent (the window has
+		// the others)
 
 	// icon views that keep their items in sort order
 	bool KeepArranged() const;

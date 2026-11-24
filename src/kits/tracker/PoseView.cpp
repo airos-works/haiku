@@ -1197,9 +1197,11 @@ BPoseView::WindowActivated(bool active)
 		MakeFocus();
 
 	// changes deep inside a folder are not reported to it: coming back to
-	// the window is when its sizes are checked again
+	// the window is when its sizes are checked again (only sizes that
+	// changed are sent: with thousands of folders, sending them all took
+	// the window a tenth of a second at every activation)
 	if (active)
-		RequestFolderSizes(10000000);
+		RequestFolderSizes(10000000, true);
 }
 
 
@@ -4083,7 +4085,7 @@ BPoseView::SetShowFolderSizes(bool show)
 
 
 void
-BPoseView::RequestFolderSizes(bigtime_t maxAge)
+BPoseView::RequestFolderSizes(bigtime_t maxAge, bool refresh)
 {
 	if (!ShowsFolderSizes())
 		return;
@@ -4105,8 +4107,13 @@ BPoseView::RequestFolderSizes(bigtime_t maxAge)
 		if (!found->second)
 			continue;
 
-		RequestFolderSize(*model->EntryRef(), *model->NodeRef(), target,
-			maxAge);
+		if (refresh) {
+			RefreshFolderSize(*model->EntryRef(), *model->NodeRef(), target,
+				maxAge);
+		} else {
+			RequestFolderSize(*model->EntryRef(), *model->NodeRef(), target,
+				maxAge);
+		}
 	}
 }
 

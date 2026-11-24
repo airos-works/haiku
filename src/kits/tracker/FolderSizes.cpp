@@ -53,6 +53,10 @@ struct Request {
 	BMessenger	target;
 	bigtime_t	maxAge;
 	bigtime_t	notBefore;
+	bool		refresh;
+		// the target has the size already: only a different one is sent
+	off_t		known;
+		// the size cached when a refresh was asked for, -1 if none
 };
 
 
@@ -193,7 +197,8 @@ CalculatorThread(void*)
 						<= request.maxAge)) {
 				off_t size = cached->second.size;
 				locker.Unlock();
-				SendSize(request, size);
+				if (!request.refresh || size != request.known)
+					SendSize(request, size);
 				continue;
 			}
 		}
@@ -214,7 +219,8 @@ CalculatorThread(void*)
 			(*sCache)[NodeKey(request.node)] = cached;
 		}
 
-		SendSize(request, size);
+		if (!request.refresh || size != request.known)
+			SendSize(request, size);
 	}
 
 	return B_OK;
@@ -249,9 +255,10 @@ GetFolderSize(const node_ref& node, off_t* size)
 }
 
 
-void
-RequestFolderSize(const entry_ref& ref, const node_ref& node,
-	const BMessenger& target, bigtime_t maxAge, bigtime_t delay)
+static void
+AskForFolderSize(const entry_ref& ref, const node_ref& node,
+	const BMessenger& target, bigtime_t maxAge, bigtime_t delay,
+	bool sendCached)
 {
 	BAutolock locker(sLock);
 	InitOnce();
@@ -261,14 +268,19 @@ RequestFolderSize(const entry_ref& ref, const node_ref& node,
 	request.node = node;
 	request.target = target;
 	request.maxAge = maxAge;
+	request.refresh = !sendCached;
+	request.known = -1;
 
 	std::map<NodeKey, CachedSize>::iterator found = sCache->find(NodeKey(node));
-	if (found != sCache->end()
-		&& (maxAge < 0 || system_time() - found->second.when <= maxAge)) {
-		off_t size = found->second.size;
-		locker.Unlock();
-		SendSize(request, size);
-		return;
+	if (found != sCache->end()) {
+		if (maxAge < 0 || system_time() - found->second.when <= maxAge) {
+			off_t size = found->second.size;
+			locker.Unlock();
+			if (sendCached)
+				SendSize(request, size);
+			return;
+		}
+		request.known = found->second.size;
 	}
 
 	// One pending request per folder and requester: a folder that changes
@@ -283,6 +295,8 @@ RequestFolderSize(const entry_ref& ref, const node_ref& node,
 			continue;
 		if (maxAge >= 0 && (it->maxAge < 0 || maxAge < it->maxAge))
 			it->maxAge = maxAge;
+		if (!request.refresh)
+			it->refresh = false;
 		merged = true;
 		break;
 	}
@@ -300,6 +314,22 @@ RequestFolderSize(const entry_ref& ref, const node_ref& node,
 			resume_thread(sThread);
 	}
 	release_sem(sQueueSem);
+}
+
+
+void
+RequestFolderSize(const entry_ref& ref, const node_ref& node,
+	const BMessenger& target, bigtime_t maxAge, bigtime_t delay)
+{
+	AskForFolderSize(ref, node, target, maxAge, delay, true);
+}
+
+
+void
+RefreshFolderSize(const entry_ref& ref, const node_ref& node,
+	const BMessenger& target, bigtime_t maxAge)
+{
+	AskForFolderSize(ref, node, target, maxAge, 0, false);
 }
 
 

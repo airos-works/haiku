@@ -33,6 +33,13 @@ void RequestFolderSize(const entry_ref& ref, const node_ref& node,
 	const BMessenger& target, bigtime_t maxAge = 30000000,
 	bigtime_t delay = 0);
 
+// The same for a target that has the size already and checks whether it is
+// still right (a window when it is activated): it is sent only when it is
+// different. Sending every size again cost the window a message per folder
+// at each activation.
+void RefreshFolderSize(const entry_ref& ref, const node_ref& node,
+	const BMessenger& target, bigtime_t maxAge);
+
 // Drops the requests of target that wait, and stops a walk for it that is
 // running: its window no longer shows folder sizes.
 void CancelFolderSizes(const BMessenger& target);
