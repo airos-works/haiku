@@ -315,6 +315,7 @@ private:
 			void				_Deactivate();
 
 			// geometry
+			void				_EndResize();
 			float				_DeviceScale() const;
 			void				_UpdateMetrics();
 			int32				_FirstRow() const;
@@ -351,7 +352,6 @@ private:
 			void				_SendMouseEvent(int32 type, int32 button,
 									BPoint where, int32 modifiers);
 			bool				_ReportsMouse() const;
-			void				_UpdateSIGWINCH();
 
 			// scrolling
 			void				_ScrollTo(float y, bool scrollGfx);
@@ -428,7 +428,6 @@ private:
 			std::vector<Event*>	fEvents;		// guarded by the terminal
 			bool				fEventsPosted;
 
-			BMessageRunner*		fWinchRunner;
 			BMessageRunner*		fCursorBlinkRunner;
 			BMessageRunner*		fAutoScrollRunner;
 			BMessageRunner*		fResizeRunner;
@@ -464,7 +463,7 @@ private:
 			bool				fFrameNeeded;
 
 			// frame resized flag.
-			bool				fFrameResized;
+			bigtime_t			fLastResizeTime;
 			int32				fResizeViewDisableCount;
 
 			// cursor blinking

@@ -30,6 +30,7 @@ resize 640 440
 printf '\033[?25l\033[2J\033[Hfirst row\r\nsecond row\r\nthird row' > "$tty"
 sleep .2
 snapshot before
+initialSize=$(stty -F "$tty" size)
 
 # Hold rendering across each resize. The scripting snapshot must still show
 # the last complete frame until the terminal program releases the update.
@@ -37,7 +38,12 @@ check_resize() {
 	printf '\033[?2026h' > "$tty"
 	sleep .05
 	resize "$1" "$2"
-	sleep .05
+	# Let the grid and pty settle while the program is still holding output.
+	sleep .2
+	if [ "$(stty -F "$tty" size)" = "$initialSize" ]; then
+		echo "The pty did not receive the resized grid" >&2
+		exit 1
+	fi
 	rm -f "$dir/held.png"
 	snapshot held
 	cmp "$dir/before.png" "$dir/held.png"

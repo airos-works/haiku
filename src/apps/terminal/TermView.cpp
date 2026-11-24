@@ -135,7 +135,7 @@ static property_info sPropList[] = {
 };
 
 
-static const uint32 kUpdateSigWinch = 'Rwin';
+static const uint32 kFinishResize = 'Rfin';
 static const uint32 kBlinkCursor = 'BlCr';
 static const uint32 kFrameNeeded = 'TFnd';
 static const uint32 kRenderFrame = 'TRnd';
@@ -148,6 +148,7 @@ static const uint32 kSearchUpdate = 'TSup';
 // at most this many frames a second
 static const bigtime_t kFrameInterval = 1000000 / 120;
 static const bigtime_t kSynchronizedRetry = 20000;
+static const bigtime_t kResizeSettleTime = 75000;
 
 // choosing between the GPU and the software renderer: large frames timed
 // in a series, after some that are not
@@ -605,7 +606,6 @@ TermView::_InitObject(const ShellParameters& shellParameters)
 	fFramePending = false;
 	fConverterState = 0;
 	fEventsPosted = false;
-	fWinchRunner = NULL;
 	fCursorBlinkRunner = NULL;
 	fAutoScrollRunner = NULL;
 	fResizeRunner = NULL;
@@ -630,7 +630,7 @@ TermView::_InitObject(const ShellParameters& shellParameters)
 	fBitmap = NULL;
 	fLastFrameTime = 0;
 	fFrameNeeded = false;
-	fFrameResized = false;
+	fLastResizeTime = 0;
 	fResizeViewDisableCount = 0;
 	static int32 sNextRemoteControlID = 1;
 	fRemoteControlID = atomic_add(&sNextRemoteControlID, 1);
@@ -1425,8 +1425,11 @@ TermView::SetTermSize(int rows, int columns, bool notifyShell)
 	if (fScrollBar != NULL)
 		fScrollBar->SetSteps(fFontHeight, fFontHeight * fRows);
 
-	if (notifyShell)
-		fFrameResized = true;
+	if (notifyShell && fShell != NULL) {
+		const RenderMetrics& metrics = fGlyphs.Metrics();
+		fShell->UpdateWindowSize(fRows, fColumns, fColumns * metrics.cellWidth,
+			fRows * metrics.cellHeight);
+	}
 
 	_InvalidateAll();
 
@@ -2823,6 +2826,12 @@ TermView::_RenderFrame()
 	int32 height = std::max((int32)1,
 		(int32)ceilf((bounds.Height() + 1) * fScale));
 
+	if (fResizeRunner != NULL && fBitmap != NULL) {
+		// Output can keep painting at the current grid size during a drag.
+		width = fBitmap->Bounds().IntegerWidth() + 1;
+		height = fBitmap->Bounds().IntegerHeight() + 1;
+	}
+
 	bigtime_t frameStart = system_time();
 	for (int32 attempt = 0; attempt < 2; attempt++) {
 		fTerminal->Lock();
@@ -3360,19 +3369,6 @@ TermView::_WriteLoop()
 }
 
 
-//!	Handler for SIGWINCH
-void
-TermView::_UpdateSIGWINCH()
-{
-	if (fFrameResized) {
-		const RenderMetrics& metrics = fGlyphs.Metrics();
-		fShell->UpdateWindowSize(fRows, fColumns,
-			fColumns * metrics.cellWidth, fRows * metrics.cellHeight);
-		fFrameResized = false;
-	}
-}
-
-
 // #pragma mark - keyboard
 
 
@@ -3714,17 +3710,11 @@ TermView::AttachedToWindow()
 		_UpdateScrollBarRange();
 	}
 
-	BMessenger thisMessenger(this);
-
 	fTerminal->Lock();
 	fWindowMessenger = BMessenger(Window());
 	fTerminal->Unlock();
 
-	BMessage message(kUpdateSigWinch);
-	fWinchRunner = new (std::nothrow) BMessageRunner(thisMessenger,
-		&message, 500000);
-
-	be_clipboard->StartWatching(thisMessenger);
+	be_clipboard->StartWatching(BMessenger(this));
 
 	_LoadRenderer();
 	_SetPointerShape(fPointerShape.String());
@@ -3753,14 +3743,10 @@ TermView::DetachedFromWindow()
 
 	 _NextState(fDefaultState);
 
-	delete fWinchRunner;
-	fWinchRunner = NULL;
-
 	delete fCursorBlinkRunner;
 	fCursorBlinkRunner = NULL;
 
-	delete fResizeRunner;
-	fResizeRunner = NULL;
+	_EndResize();
 
 	delete fFrameRunner;
 	fFrameRunner = NULL;
@@ -3813,16 +3799,28 @@ TermView::MakeFocus(bool focusState)
 void
 TermView::FrameResized(float width, float height)
 {
-	int32 columns = (int32)((width + 1) / fFontWidth);
-	int32 rows = (int32)((height + 1) / fFontHeight);
+	// B_VIEW_RESIZED is queued. A newer layout may already have run.
+	int rows, columns;
+	GetTermSizeFromRect(Bounds(), &rows, &columns);
 
-	if (columns == fColumns && rows == fRows) {
-		_InvalidateAll();
+	if (fResizeRunner == NULL && columns == fColumns && rows == fRows) {
+		_ScheduleFrame();
 		return;
 	}
 
+	fLastResizeTime = system_time();
 	bool hasResizeView = fResizeRunner != NULL;
 	if (!hasResizeView) {
+		BMessage message(kFinishResize);
+		fResizeRunner = new(std::nothrow) BMessageRunner(BMessenger(this),
+			&message, 25000);
+		if (fResizeRunner == NULL || fResizeRunner->InitCheck() != B_OK) {
+			_EndResize();
+			SetTermSize(Bounds(), true);
+			_ScheduleFrame();
+			return;
+		}
+
 		// show the current size in a view
 		fResizeView = new BStringView(BRect(100, 100, 300, 140), "size", "");
 		fResizeView->SetAlignment(B_ALIGN_CENTER);
@@ -3830,10 +3828,6 @@ TermView::FrameResized(float width, float height)
 		fResizeView->SetViewColor(fTextBackColor);
 		fResizeView->SetLowColor(fTextBackColor);
 		fResizeView->SetHighColor(fTextForeColor);
-
-		BMessage message(MSG_REMOVE_RESIZE_VIEW_IF_NEEDED);
-		fResizeRunner = new(std::nothrow) BMessageRunner(BMessenger(this),
-			&message, 25000LL);
 	}
 
 	BString text;
@@ -3848,8 +3842,20 @@ TermView::FrameResized(float width, float height)
 
 	if (fResizeViewDisableCount > 0)
 		fResizeViewDisableCount--;
+}
 
-	SetTermSize(rows, columns, true);
+
+void
+TermView::_EndResize()
+{
+	delete fResizeRunner;
+	fResizeRunner = NULL;
+	if (fResizeView != NULL) {
+		if (fResizeView->Parent() != NULL)
+			RemoveChild(fResizeView);
+		delete fResizeView;
+		fResizeView = NULL;
+	}
 }
 
 
@@ -5156,9 +5162,6 @@ TermView::MessageReceived(BMessage *message)
 		case kBlinkCursor:
 			_BlinkCursor();
 			break;
-		case kUpdateSigWinch:
-			_UpdateSIGWINCH();
-			break;
 		case kSecondaryMouseDropAction:
 			_DoSecondaryMouseDropAction(message);
 			break;
@@ -5308,21 +5311,22 @@ TermView::MessageReceived(BMessage *message)
 			SwitchCursorBlinking();
 			break;
 		}
-		case MSG_REMOVE_RESIZE_VIEW_IF_NEEDED:
+		case kFinishResize:
 		{
+			if (fResizeRunner == NULL
+				|| system_time() - fLastResizeTime < kResizeSettleTime) {
+					break;
+			}
 			BPoint point;
 			uint32 buttons;
 			GetMouse(&point, &buttons, false);
 			if (buttons != 0)
 				break;
 
-			if (fResizeView != NULL) {
-				fResizeView->RemoveSelf();
-				delete fResizeView;
-				fResizeView = NULL;
-			}
-			delete fResizeRunner;
-			fResizeRunner = NULL;
+			// Reflow scrollback and notify the pty together at the final size.
+			_EndResize();
+			SetTermSize(Bounds(), true);
+			_ScheduleFrame();
 			break;
 		}
 
