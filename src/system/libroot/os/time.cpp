@@ -41,6 +41,14 @@ __get_system_time_offset()
 }
 
 
+/*!	A number that changes whenever the system's time zone is set. */
+int32
+__get_time_zone_generation()
+{
+	return atomic_get(&sRealTimeData->timezone_generation);
+}
+
+
 //	#pragma mark - public API
 
 

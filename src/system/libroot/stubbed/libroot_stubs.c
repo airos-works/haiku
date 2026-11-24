@@ -702,6 +702,7 @@ void __get_scheduler_mode() {}
 void __get_secondary_architectures() {}
 void __get_system_info() {}
 void __get_system_time_offset() {}
+void __get_time_zone_generation() {}
 void __getc_unlocked() {}
 void __getdelim() {}
 void __getenv_reentrant() {}

@@ -295,6 +295,12 @@ _user_set_timezone(int32 timezoneOffset, const char *name, size_t nameLength)
 
 	sTimezoneOffset = offset;
 
+	// tell the teams' libroot to ask for the time zone again
+	atomic_add(&sRealTimeData->timezone_generation, 1);
+#ifdef _COMPAT_MODE
+	atomic_add(&sRealTimeDataCompat->timezone_generation, 1);
+#endif
+
 	TRACE(("new system_time_offset %lld\n",
 		arch_rtc_get_system_time_offset(sRealTimeData)));
 

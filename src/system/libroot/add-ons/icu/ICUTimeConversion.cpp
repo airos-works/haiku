@@ -7,8 +7,11 @@
 #include "ICUTimeConversion.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <string.h>
 #include <strings.h>
+
+#include <locks.h>
 
 #include <unicode/gregocal.h>
 
@@ -20,18 +23,53 @@ namespace BPrivate {
 namespace Libroot {
 
 
+// Guards the time zone and the calendar of every ICUTimeConversion: TZSet()
+// replaced the zone while other threads made calendars of it.
+static mutex sLock = MUTEX_INITIALIZER("ICU time conversion");
+static pthread_once_t sForkHookOnce = PTHREAD_ONCE_INIT;
+
+
+static void
+reinit_lock_after_fork()
+{
+	mutex_init(&sLock, "ICU time conversion");
+}
+
+
+static void
+register_fork_hook()
+{
+	pthread_atfork(NULL, NULL, &reinit_lock_after_fork);
+}
+
+
+struct Locker {
+	Locker()	{ mutex_lock(&sLock); }
+	~Locker()	{ mutex_unlock(&sLock); }
+};
+
+
 ICUTimeConversion::ICUTimeConversion(const ICUTimeData& timeData)
 	:
 	fTimeData(timeData),
 	fDataBridge(NULL),
-	fTimeZone(NULL)
+	fTimeZone(NULL),
+	fCalendar(NULL),
+	fTZSetDone(false),
+	fLastTZWasSet(false),
+	fLastTZSetStatus(B_NO_INIT)
 {
 	fTimeZoneID[0] = '\0';
+	fLastTimeZoneID[0] = '\0';
+	fLastTZ[0] = '\0';
+
+	pthread_once(&sForkHookOnce, &register_fork_hook);
 }
 
 
 ICUTimeConversion::~ICUTimeConversion()
 {
+	delete fCalendar;
 	delete fTimeZone;
 }
 
@@ -45,6 +83,32 @@ ICUTimeConversion::Initialize(TimeConversionDataBridge* dataBridge)
 
 status_t
 ICUTimeConversion::TZSet(const char* timeZoneID, const char* tz)
+{
+	Locker locker;
+
+	// Called before every conversion: nothing to do when it gets what it got
+	// the last time. (_TZSet() would also notice, except for a TZ variable
+	// ICU does not know, which made a new zone every time.)
+	if (fTZSetDone && (tz != NULL) == fLastTZWasSet
+		&& strcmp(fLastTimeZoneID, timeZoneID) == 0
+		&& (tz == NULL || strcmp(fLastTZ, tz) == 0)) {
+		return fLastTZSetStatus;
+	}
+
+	status_t status = _TZSet(timeZoneID, tz);
+
+	fTZSetDone = strlcpy(fLastTimeZoneID, timeZoneID,
+			sizeof(fLastTimeZoneID)) < sizeof(fLastTimeZoneID)
+		&& (tz == NULL || strlcpy(fLastTZ, tz, sizeof(fLastTZ))
+			< sizeof(fLastTZ));
+	fLastTZWasSet = tz != NULL;
+	fLastTZSetStatus = status;
+	return status;
+}
+
+
+status_t
+ICUTimeConversion::_TZSet(const char* timeZoneID, const char* tz)
 {
 	bool offsetHasBeenSet = false;
 	bool timeZoneIdMatches = false;
@@ -108,6 +172,8 @@ done:
 	if (fTimeZone != NULL && timeZoneIdMatches)
 		return B_OK;
 
+	delete fCalendar;
+	fCalendar = NULL;
 	delete fTimeZone;
 	fTimeZone = TimeZone::createTimeZone(fTimeZoneID);
 	if (fTimeZone == NULL)
@@ -169,21 +235,30 @@ error:
 status_t
 ICUTimeConversion::Localtime(const time_t* inTime, struct tm* tmOut)
 {
-	if (fTimeZone == NULL)
-		return B_NO_INIT;
+	Locker locker;
+
+	GregorianCalendar* calendar;
+	status_t status = _LocalCalendar(calendar);
+	if (status != B_OK)
+		return status;
 
 	tmOut->tm_zone = fTimeZoneID;
-	return _FillTmValues(fTimeZone, inTime, tmOut);
+	return _FillTmValues(*calendar, inTime, tmOut);
 }
 
 
 status_t
 ICUTimeConversion::Gmtime(const time_t* inTime, struct tm* tmOut)
 {
-	const TimeZone* icuTimeZone = TimeZone::getGMT();
-		// no delete - doesn't belong to us
+	// (libroot does the arithmetic itself: this is only asked for times
+	// before the Gregorian calendar, or far in the future)
+	UErrorCode icuStatus = U_ZERO_ERROR;
+	GregorianCalendar calendar(*TimeZone::getGMT(), fTimeData.ICULocale(),
+		icuStatus);
+	if (!U_SUCCESS(icuStatus))
+		return B_ERROR;
 
-	status_t status = _FillTmValues(icuTimeZone, inTime, tmOut);
+	status_t status = _FillTmValues(calendar, inTime, tmOut);
 	if (status == B_OK) {
 		// tm_zone must be "GMT" for gmtime, not the current timezone
 		// (even if that happens to be equivalent to GMT).
@@ -196,27 +271,65 @@ ICUTimeConversion::Gmtime(const time_t* inTime, struct tm* tmOut)
 status_t
 ICUTimeConversion::Mktime(struct tm* inOutTm, time_t& timeOut)
 {
-	return _Mktime(fTimeZone, inOutTm, timeOut);
+	Locker locker;
+
+	GregorianCalendar* calendar;
+	status_t status = _LocalCalendar(calendar);
+	if (status != B_OK)
+		return status;
+
+	return _Mktime(*calendar, inOutTm, timeOut);
 }
 
 
 status_t
 ICUTimeConversion::Timegm(struct tm* inOutTm, time_t& timeOut)
 {
-	const TimeZone* icuTimeZone = TimeZone::getGMT();
-	return _Mktime(icuTimeZone, inOutTm, timeOut);
+	UErrorCode icuStatus = U_ZERO_ERROR;
+	GregorianCalendar calendar(*TimeZone::getGMT(), fTimeData.ICULocale(),
+		icuStatus);
+	if (!U_SUCCESS(icuStatus))
+		return B_ERROR;
+
+	return _Mktime(calendar, inOutTm, timeOut);
+}
+
+
+/*!	Returns the calendar of the current time zone, made when it is first
+	needed. The lock must be held.
+*/
+status_t
+ICUTimeConversion::_LocalCalendar(GregorianCalendar*& _calendar)
+{
+	if (fTimeZone == NULL)
+		return B_NO_INIT;
+
+	if (fCalendar == NULL) {
+		// (the locale only sets the week's first day, which none of the
+		// fields asked for depends on)
+		UErrorCode icuStatus = U_ZERO_ERROR;
+		fCalendar = new GregorianCalendar(*fTimeZone,
+			fTimeData.ICULocale(), icuStatus);
+		if (fCalendar == NULL)
+			return B_NO_MEMORY;
+		if (!U_SUCCESS(icuStatus)) {
+			delete fCalendar;
+			fCalendar = NULL;
+			return B_ERROR;
+		}
+		fCalendar->setLenient(TRUE);
+	}
+
+	_calendar = fCalendar;
+	return B_OK;
 }
 
 
 status_t
-ICUTimeConversion::_FillTmValues(const TimeZone* icuTimeZone,
-	const time_t* inTime, struct tm* tmOut)
+ICUTimeConversion::_FillTmValues(Calendar& calendar, const time_t* inTime,
+	struct tm* tmOut)
 {
 	UErrorCode icuStatus = U_ZERO_ERROR;
-	GregorianCalendar calendar(*icuTimeZone, fTimeData.ICULocale(), icuStatus);
-	if (!U_SUCCESS(icuStatus))
-		return B_ERROR;
-
 	calendar.setTime(1000 * (UDate)*inTime, icuStatus);
 	if (!U_SUCCESS(icuStatus))
 		return B_ERROR;
@@ -259,18 +372,14 @@ ICUTimeConversion::_FillTmValues(const TimeZone* icuTimeZone,
 
 
 status_t
-ICUTimeConversion::_Mktime(const TimeZone* icuTimeZone,
-	struct tm* inOutTm, time_t& timeOut)
+ICUTimeConversion::_Mktime(Calendar& calendar, struct tm* inOutTm,
+	time_t& timeOut)
 {
-	if (icuTimeZone == NULL)
-		return B_NO_INIT;
-
 	UErrorCode icuStatus = U_ZERO_ERROR;
-	GregorianCalendar calendar(*icuTimeZone, fTimeData.ICULocale(),
-		icuStatus);
-	if (!U_SUCCESS(icuStatus))
-		return B_ERROR;
-
+	calendar.clear();
+		// The milliseconds stay 0. A new calendar had those of the current
+		// time, which made the result of a time before 1970 one second too
+		// late (999 times in 1000), as the division below cuts towards 0.
 	calendar.setLenient(TRUE);
 	calendar.set(inOutTm->tm_year + 1900, inOutTm->tm_mon, inOutTm->tm_mday,
 		inOutTm->tm_hour, inOutTm->tm_min, inOutTm->tm_sec);
@@ -280,7 +389,7 @@ ICUTimeConversion::_Mktime(const TimeZone* icuTimeZone,
 		return B_ERROR;
 	timeOut = (time_t)((int64_t)timeInMillis / 1000);
 
-	return _FillTmValues(icuTimeZone, &timeOut, inOutTm);
+	return _FillTmValues(calendar, &timeOut, inOutTm);
 }
 
 

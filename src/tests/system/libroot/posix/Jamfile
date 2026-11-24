@@ -17,6 +17,7 @@ TARGET_WARNING_C++FLAGS_$(TARGET_PACKAGING_ARCH)
 SimpleTest abort_test : abort_test.cpp ;
 SimpleTest SyslogTest : SyslogTest.cpp ;
 SimpleTest syslog_long_message_test : syslog_long_message_test.cpp ;
+SimpleTest time_conversion_test : time_conversion_test.cpp ;
 SimpleTest brk_test : brk_test.c ;
 SimpleTest calloc_test : calloc_test.c ;
 SimpleTest <test>chmod : chmod.cpp ;

@@ -14,6 +14,9 @@
 
 struct real_time_data {
 	struct arch_real_time_data	arch_data;
+	int32						timezone_generation;
+		// changes with every _kern_set_timezone(): libroot asks for the
+		// time zone again only then
 };
 
 
