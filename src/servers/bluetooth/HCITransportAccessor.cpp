@@ -81,7 +81,9 @@ HCITransportAccessor::IssueCommand(raw_command rc, size_t size)
 {
 	if (Id() < 0 || fDescriptor < 0)
 		return B_ERROR;
-	if (rc == NULL || size < 3)
+	// header and at most 255 bytes of parameters: the drivers refuse
+	// anything else
+	if (rc == NULL || size < 3 || size > 3 + 255)
 		return B_BAD_VALUE;
 
 	BAutolock lock(fQueueLock);

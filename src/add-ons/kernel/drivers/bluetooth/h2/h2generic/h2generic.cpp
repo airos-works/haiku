@@ -19,6 +19,7 @@
 
 #include <btModules.h>
 
+#include <bluetooth/HCI/btHCI_command.h>
 #include "bluetooth/HCI/btHCI_transport.h"
 #include "h2cfg.h"
 #include "h2debug.h"
@@ -814,25 +815,39 @@ device_control(void* cookie, uint32 msg, void* params, size_t size)
 
 	switch (msg) {
 		case ISSUE_BT_COMMAND: {
-			if (size == 0) {
+			// An HCI command is its header and at most 255 bytes of
+			// parameters. The size is the caller's: unchecked, it was the
+			// size of a copy on the kernel stack.
+			uint8 command[HCI_COMMAND_HDR_SIZE + 255];
+			if (size < HCI_COMMAND_HDR_SIZE || size > sizeof(command)) {
 				TRACE("%s: Invalid size control\n", __func__);
 				err = B_BAD_VALUE;
 				break;
 			}
 
-			void* _params = alloca(size);
-			if (user_memcpy(_params, params, size) != B_OK)
-				return B_BAD_ADDRESS;
+			// Every error leaves through the end of the switch: the device's
+			// lock is held.
+			if (user_memcpy(command, params, size) != B_OK) {
+				err = B_BAD_ADDRESS;
+				break;
+			}
 
 			// TODO: Reuse from some TXcompleted queue
 			// snbuf = snb_create(size);
 			snbuf = snb_fetch(&bdev->snetBufferRecycleTrash, size);
-			snb_put(snbuf, _params, size);
+			if (snbuf == NULL) {
+				err = B_NO_MEMORY;
+				break;
+			}
+			snb_put(snbuf, command, size);
 
 			err = submit_tx_command(bdev, snbuf);
-			if (err != B_OK)
+			if (err != B_OK) {
+				// it was not queued, so its completion will not give the
+				// buffer back
+				snb_park(&bdev->snetBufferRecycleTrash, snbuf);
 				ERROR("%s: Queing failed at submit_tx_command()\n", __func__);
-			else
+			} else
 				TRACE("%s: command launched\n", __func__);
 			break;
 		}

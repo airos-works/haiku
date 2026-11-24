@@ -35,10 +35,18 @@ snb_create(uint16 size)
 #ifdef SNB_BUFFER_ATTACHED
 	// Allocating these 2 buffers together might prevent memory fragmentation
 	snet_buffer* snb = (snet_buffer*) malloc(sizeof(snet_buffer) + size);
+	if (snb == NULL)
+		return NULL;
 	snb->buffer = ((uint8*)snb) + sizeof(snet_buffer);
 #else
 	snet_buffer* snb = malloc(sizeof (snet_buffer));
+	if (snb == NULL)
+		return NULL;
 	snb->buffer = malloc(size);
+	if (snb->buffer == NULL) {
+		free(snb);
+		return NULL;
+	}
 #endif
 
 	snb->pullingSize = snb->puttingSize = 0;
