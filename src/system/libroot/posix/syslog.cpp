@@ -168,16 +168,22 @@ send_syslog_message(syslog_context *context, int priority, const char *text,
 	message.priority = priority;
 	strcpy(message.ident, context->ident);
 
+	// vsnprintf() returns the length the text would have had, so a text that
+	// does not fit has to be cut here: the newline below and write_port()
+	// used that length as it was, and wrote, respectively sent, what lies
+	// behind the buffer (the caller's stack). One byte is kept for the
+	// newline that ends every message, cut or not.
+	const int kMaxLength = sizeof(buffer) - sizeof(syslog_message) - 1;
 	va_list copy;
 	va_copy(copy, args);
-	int length = vsnprintf(message.message, sizeof(buffer)
-		- sizeof(syslog_message), text, copy);
+	int length = vsnprintf(message.message, kMaxLength + 1, text, copy);
 	va_end(copy);
-	if (message.message + length - buffer < (int32)sizeof(buffer)) {
-		if (length == 0 || message.message[length - 1] != '\n')
-			message.message[length++] = '\n';
-	} else
-		buffer[length - 1] = '\n';
+	if (length < 0)
+		length = 0;
+	else if (length > kMaxLength)
+		length = kMaxLength;
+	if (length == 0 || message.message[length - 1] != '\n')
+		message.message[length++] = '\n';
 
 	status_t status;
 	for (int attempt = 0; attempt < 2; attempt++) {

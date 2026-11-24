@@ -1,6 +1,11 @@
 SubDir HAIKU_TOP src tests system libroot posix ;
 
 UsePrivateHeaders libroot system ;
+
+# for syslog_long_message_test (the syslog daemon's port and message)
+UsePrivateHeaders app [ FDirName syslog_daemon ] ;
+SourceHdrs syslog_long_message_test.cpp
+	: [ FDirName $(HAIKU_TOP) headers private kernel util ] ;
 SubDirSysHdrs $(HAIKU_TOP) headers compatibility bsd ;
 SubDirSysHdrs $(HAIKU_TOP) headers compatibility gnu ;
 
@@ -11,6 +16,7 @@ TARGET_WARNING_C++FLAGS_$(TARGET_PACKAGING_ARCH)
 # POSIX/libc tests
 SimpleTest abort_test : abort_test.cpp ;
 SimpleTest SyslogTest : SyslogTest.cpp ;
+SimpleTest syslog_long_message_test : syslog_long_message_test.cpp ;
 SimpleTest brk_test : brk_test.c ;
 SimpleTest calloc_test : calloc_test.c ;
 SimpleTest <test>chmod : chmod.cpp ;
