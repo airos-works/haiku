@@ -17,6 +17,21 @@ SimpleTest RosterShell
 
 SimpleTest message_deliverer_test : message_deliverer_test.cpp : be ;
 
+# A user application that is slow to quit (saving, busy, hung, modal), and
+# the request that quits the user applications as a shutdown does.
+
+UsePrivateHeaders app ;
+
+SimpleTest slow_quit_app
+	: slow_quit_app.cpp
+	: be [ TargetLibsupc++ ]
+;
+
+SimpleTest quit_user_apps
+	: quit_user_apps.cpp
+	: be [ TargetLibsupc++ ]
+;
+
 
 # libbe_test related stuff
 

@@ -64,6 +64,14 @@ using namespace BPrivate;
 // MessageDeliverer).
 static const bigtime_t kAppQuitTimeout = 3000000; // 3 s
 
+// The further time span a user application gets that has not quit within
+// kAppQuitTimeout and does not show a modal panel: it may still be saving its
+// data (to a slow disk, a network share), or its looper has not come to the
+// quit message yet. It is shown in the shutdown window, where the user can
+// kill it or cancel the shutdown. A hung application must not hold the
+// shutdown forever, so after this time it is killed as before.
+static const bigtime_t kBusyAppQuitTimeout = 60000000; // 60 s
+
 // The time span a background application has after the quit message has been
 // delivered (more precisely: has been handed over to the MessageDeliverer).
 static const bigtime_t kBackgroundAppQuitTimeout = 3000000; // 3 s
@@ -1885,6 +1893,7 @@ ShutdownProcess::_QuitBlockingApp(AppInfoList& list, team_id team,
 {
 	bool debugged = false;
 	bool modal = false;
+	bool busy = false;
 	{
 		BAutolock _(fWorkerLock);
 		if (fDebuggedTeams.Contains(team))
@@ -1894,6 +1903,14 @@ ShutdownProcess::_QuitBlockingApp(AppInfoList& list, team_id team,
 		// This asks app_server. Without the shutdown window, app_server is
 		// gone or does not answer, and nobody could close a modal panel.
 		modal = BPrivate::is_app_showing_modal_window(team);
+
+		// A user application without a panel is not necessarily hung: it may
+		// be saving in QuitRequested(), or be busy with something else and
+		// not have seen the request yet. Killing it now would lose that data,
+		// so it gets more time while the shutdown window offers to kill it.
+		// (Without the window nobody could do that, and the applications
+		// usually wait for app_server: those are killed right away.)
+		busy = !modal && cancelAllowed;
 	}
 
 	if (modal) {
@@ -1905,9 +1922,24 @@ ShutdownProcess::_QuitBlockingApp(AppInfoList& list, team_id team,
 		_SetShutdownWindowCurrentApp(team);
 		_SetShutdownWindowKillButtonEnabled(true);
 		_SetShutdownWindowWaitAnimationEnabled(true);
+	} else if (busy) {
+		BString buffer = B_TRANSLATE("The application \"%appName%\" has not "
+			"quit yet. It might still be saving its data.");
+		buffer.ReplaceFirst("%appName%", appName);
+		_SetShutdownWindowText(buffer.String());
+		_SetShutdownWindowCurrentApp(team);
+		_SetShutdownWindowKillButtonEnabled(true);
+		_SetShutdownWindowWaitAnimationEnabled(true);
+
+		syslog(LOG_NOTICE, "registrar: \"%s\" (team %" B_PRId32 ") has not "
+			"quit after %" B_PRIdBIGTIME " s, waiting up to %" B_PRIdBIGTIME
+			" s more\n", appName, team, kAppQuitTimeout / 1000000,
+			kBusyAppQuitTimeout / 1000000);
+
+		_ScheduleTimeoutEvent(kBusyAppQuitTimeout, team);
 	}
 
-	if (modal || debugged) {
+	if (modal || debugged || busy) {
 		// wait for something to happen
 		bool appGone = false;
 		while (true) {
@@ -1926,12 +1958,32 @@ ShutdownProcess::_QuitBlockingApp(AppInfoList& list, team_id team,
 			if (event == KILL_APP_EVENT && eventTeam == team)
 				break;
 
+			if (event == TIMEOUT_EVENT && eventTeam == team && busy) {
+				// The time is up. If the application has opened a panel in
+				// the meantime ("Save changes?"), it waits for the user, as
+				// one that showed the panel from the start.
+				if (BPrivate::is_app_showing_modal_window(team)) {
+					busy = false;
+					modal = true;
+					BString buffer = B_TRANSLATE("The application "
+						"\"%appName%\" might be blocked on a modal panel.");
+					buffer.ReplaceFirst("%appName%", appName);
+					_SetShutdownWindowText(buffer.String());
+					continue;
+				}
+				break;
+			}
+
 			if (event == ABORT_EVENT) {
 				if (cancelAllowed || debugged) {
 					PRINT("ShutdownProcess::_QuitBlockingApp(): shutdown "
 						"cancelled by team %" B_PRId32 " (-1 => user)\n",
 						eventTeam);
 
+					if (busy) {
+						BAutolock _(fWorkerLock);
+						fEventQueue->RemoveEvent(fTimeoutEvent);
+					}
 					if (!debugged)
 						_DisplayAbortingApp(eventTeam);
 					throw_error(B_SHUTDOWN_CANCELLED);
@@ -1945,6 +1997,11 @@ ShutdownProcess::_QuitBlockingApp(AppInfoList& list, team_id team,
 			}
 		}
 
+		if (busy) {
+			BAutolock _(fWorkerLock);
+			fEventQueue->RemoveEvent(fTimeoutEvent);
+		}
+
 		_SetShutdownWindowKillButtonEnabled(false);
 		_SetShutdownWindowWaitAnimationEnabled(false);
 
@@ -1954,6 +2011,8 @@ ShutdownProcess::_QuitBlockingApp(AppInfoList& list, team_id team,
 
 	// kill the app
 	PRINT("  killing team %" B_PRId32 "\n", team);
+	syslog(LOG_WARNING, "registrar: killing \"%s\" (team %" B_PRId32 "), it "
+		"did not quit\n", appName, team);
 
 	kill_team(team);
 
