@@ -225,6 +225,12 @@ IOSchedulerSimple::Init(const char* name)
 	fMinOwnerBandwidth = fBlockSize * 1024;
 	fMaxOwnerBandwidth = fBlockSize * 4096;
 
+	// What an operation takes of its owner's quantum at least: a command has
+	// a fixed cost on every device, so an owner of many small operations (the
+	// page writer with a fragmented file, a page per extent) would otherwise
+	// keep a slow device for a hundred commands and more per turn.
+	fMinOperationBandwidth = fMinOwnerBandwidth / 8;
+
 	// start threads
 	char buffer[B_OS_NAME_LENGTH];
 	strlcpy(buffer, name, sizeof(buffer));
@@ -481,7 +487,7 @@ IOSchedulerSimple::_PrepareRequestOperations(IORequest* request,
 				continue;
 			}
 
-			off_t bandwidth = operation->Length();
+			off_t bandwidth = _OperationBandwidth(operation);
 			quantum -= bandwidth;
 			usedBandwidth += bandwidth;
 
@@ -511,7 +517,7 @@ IOSchedulerSimple::_PrepareRequestOperations(IORequest* request,
 			return true;
 		}
 
-		off_t bandwidth = operation->Length();
+		off_t bandwidth = _OperationBandwidth(operation);
 		quantum -= bandwidth;
 		usedBandwidth += bandwidth;
 
@@ -520,6 +526,16 @@ IOSchedulerSimple::_PrepareRequestOperations(IORequest* request,
 	}
 
 	return true;
+}
+
+
+/*!	What \a operation takes of its owner's quantum and of the iteration: its
+	length, but no less than what a command costs by itself.
+*/
+off_t
+IOSchedulerSimple::_OperationBandwidth(IOOperation* operation) const
+{
+	return max_c((off_t)operation->Length(), fMinOperationBandwidth);
 }
 
 
@@ -720,6 +736,10 @@ IOSchedulerSimple::_Scheduler()
 
 	RequestOwner* owner = NULL;
 	off_t quantum = 0;
+	RequestOwner* turnOwner = NULL;
+		// The owner the last iteration stopped at with part of its quantum
+		// left; it sits right behind the marker. Only ever compared: the
+		// owner may be gone by the time the lock is held again.
 
 	while (!fTerminating) {
 //dprintf("IOSchedulerSimple::_Scheduler(): next iteration: request owner: %p, quantum: %lld\n", owner, quantum);
@@ -732,8 +752,26 @@ IOSchedulerSimple::_Scheduler()
 		off_t iterationBandwidth = fIterationBandwidth;
 
 		if (owner == NULL) {
-			owner = fActiveRequestOwners.GetPrevious(&marker);
-			quantum = 0;
+			// Go on where the last iteration stopped: with the owner behind
+			// the marker and what is left of its quantum, if it is still
+			// that owner. Giving it a new quantum with every iteration, as
+			// this did before, means that the turn never passes on while the
+			// owner has something queued whenever an iteration starts. With a
+			// device that takes one operation per iteration (usb_disk has a
+			// single DMA buffer) that is all a busy owner needs: the page
+			// writer, with two runs in flight, kept the disk for as long as
+			// pages were being modified, and the block cache's writer and the
+			// journal (and with them every fsync() and every change of a
+			// directory) waited for it to pause (airos-works/haiku#152).
+			RequestOwner* next = fActiveRequestOwners.GetNext(&marker);
+			if (turnOwner != NULL && next == turnOwner
+				&& quantum >= (off_t)fBlockSize) {
+				owner = next;
+			} else {
+				owner = fActiveRequestOwners.GetPrevious(&marker);
+				quantum = 0;
+			}
+			turnOwner = NULL;
 			fActiveRequestOwners.Remove(&marker);
 		}
 
@@ -744,10 +782,18 @@ IOSchedulerSimple::_Scheduler()
 			}
 		}
 
+		// An iteration takes operations from the active owners in turn, a
+		// quantum each, until its bandwidth is used up, the operations or DMA
+		// buffers run out, or no owner has anything left to add.
+		const int32 activeOwnerCount = fActiveRequestOwners.Count();
+		int32 ownersWithoutWork = 0;
+			// the owners in a row that had nothing (more) to add
+
 		while (resourcesAvailable && iterationBandwidth >= (off_t)fBlockSize) {
 //dprintf("IOSchedulerSimple::_Scheduler(): request owner: %p (thread %ld)\n",
 //owner, owner->thread);
 			// Prepare operations for the owner.
+			const int32 previousOperationCount = operationCount;
 
 			// There might still be unfinished ones.
 			while (IOOperation* operation = owner->operations.RemoveHead()) {
@@ -760,7 +806,7 @@ IOSchedulerSimple::_Scheduler()
 
 				operations.Add(operation);
 				operationCount++;
-				off_t bandwidth = operation->Length();
+				off_t bandwidth = _OperationBandwidth(operation);
 				quantum -= bandwidth;
 				iterationBandwidth -= bandwidth;
 
@@ -777,9 +823,9 @@ IOSchedulerSimple::_Scheduler()
 					&& iterationBandwidth >= (off_t)fBlockSize) {
 				IORequest* request = owner->requests.Head();
 				if (request == NULL) {
-					resourcesAvailable = false;
-if (operationCount == 0)
-panic("no more requests for owner %p (thread %" B_PRId32 ")", owner, owner->thread);
+					// All this owner has for now: on to the next one. (This
+					// ended the iteration, and the next one started with
+					// the same owner again.)
 					break;
 				}
 
@@ -796,15 +842,38 @@ panic("no more requests for owner %p (thread %" B_PRId32 ")", owner, owner->thre
 				}
 			}
 
+			if (!resourcesAvailable) {
+				// This owner goes on in the next iteration.
+				break;
+			}
+
+			if (operationCount != previousOperationCount) {
+				ownersWithoutWork = 0;
+			} else if (++ownersWithoutWork >= activeOwnerCount) {
+				// once around the owners, and nobody had anything to add
+				if (operationCount == 0) {
+					panic("IOSchedulerSimple: no requests for any of the %"
+						B_PRId32 " active owners (owner %p, thread %" B_PRId32
+						")", activeOwnerCount, owner, owner->thread);
+				}
+				break;
+			}
+
 			// Get the next owner.
-			if (resourcesAvailable)
-				_NextActiveRequestOwner(owner, quantum);
+			if (!_NextActiveRequestOwner(owner, quantum))
+				break;
 		}
 
 		// Since we're going to drop the lock, we have to use the marker to
-		// keep track of where we are in the ActiveRequestOwners list.
+		// keep track of where we are in the ActiveRequestOwners list: in
+		// front of the owner whose turn it still is, or behind the one whose
+		// quantum is used up.
 		if (owner != NULL) {
-			fActiveRequestOwners.InsertBefore(owner, &marker);
+			if (quantum >= (off_t)fBlockSize) {
+				fActiveRequestOwners.InsertBefore(owner, &marker);
+				turnOwner = owner;
+			} else
+				fActiveRequestOwners.InsertAfter(owner, &marker);
 			owner = NULL;
 		}
 

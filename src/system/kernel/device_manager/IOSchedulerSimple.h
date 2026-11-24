@@ -67,6 +67,8 @@ private:
 									IOOperationList& operations,
 									int32& operationsPrepared, off_t quantum,
 									off_t& usedBandwidth);
+			off_t				_OperationBandwidth(IOOperation* operation)
+									const;
 			bool				_CheckAndBlockWrites(IOOperationList& operations, IOOperation* operation);
 			void				_RemoveWriteBlocksForOperation(IOOperation* operation);
 			void				_SortOperations(IOOperationList& operations,
@@ -101,6 +103,7 @@ private:
 			off_t				fIterationBandwidth;
 			off_t				fMinOwnerBandwidth;
 			off_t				fMaxOwnerBandwidth;
+			off_t				fMinOperationBandwidth;
 	volatile bool				fTerminating;
 };
 
