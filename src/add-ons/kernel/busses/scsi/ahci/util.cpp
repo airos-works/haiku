@@ -9,7 +9,9 @@
 #include <OS.h>
 #include <vm/vm.h>
 #include <string.h>
+#include <driver_settings.h>
 #if defined(__aarch64__)
+#include <arch/arm64/arch_kernel.h>
 #include <arch/arm64/cache_line_size.h>
 #endif
 
@@ -154,4 +156,89 @@ swap_words(void *data, size_t size)
 		*word = (*word << 8) | (*word >> 8);
 		word++;
 	}
+}
+
+
+#if defined(__aarch64__)
+static int32 sDirectDMA = -1;
+	// not yet read
+#endif
+
+
+bool
+ahci_direct_dma(void)
+{
+#if defined(__aarch64__)
+	if (atomic_get(&sDirectDMA) < 0) {
+		// Off by default until it has run on a board that is not coherent
+		// (the ROCK 5): a wrong cache maintenance corrupts data.
+		void *settings = load_driver_settings("ahci");
+		bool direct = settings != NULL && get_driver_boolean_parameter(
+			settings, "direct_dma", false, true);
+		if (settings != NULL)
+			unload_driver_settings(settings);
+		// The SCSI manager's DMA buffers align to at most a block: a CPU
+		// that does not give its granule (or a larger one) keeps bouncing.
+		uint64 ctr;
+		asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+		uint32 granule = (ctr >> 24) & 0xf;
+		if (direct && (granule == 0 || (4u << granule) > 512)) {
+			TRACE("direct DMA not used: cache writeback granule %" B_PRIu32
+				"\n", granule);
+			direct = false;
+		}
+		atomic_set(&sDirectDMA, direct ? 1 : 0);
+		if (direct) {
+			TRACE("ARM64 direct DMA: the request's pages, aligned to %"
+				B_PRIu32 " bytes, with cache maintenance\n",
+				ahci_dma_alignment());
+		}
+	}
+	return atomic_get(&sDirectDMA) != 0;
+#else
+	return false;
+#endif
+}
+
+
+uint32
+ahci_dma_alignment(void)
+{
+#if defined(__aarch64__)
+	if (ahci_direct_dma()) {
+		// the cache writeback granule (CTR_EL0.CWG, given and at most a
+		// block: ahci_direct_dma())
+		uint64 ctr;
+		asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+		return 4 << ((ctr >> 24) & 0xf);
+	}
+#endif
+	return 2;
+}
+
+
+/*!	Cleans and invalidates the data cache lines of the first \a dataSize
+	bytes of the S/G table's memory, through the linear map: before a
+	transfer, so that the controller reads what the CPU wrote and no dirty
+	line is written back over what it writes; after it wrote them, so that
+	no line the CPU loaded during the transfer hides it.
+*/
+void
+ahci_dma_sync(const physical_entry *sgTable, int sgCount, size_t dataSize)
+{
+#if defined(__aarch64__)
+	uint64 ctr;
+	asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+	const size_t lineSize = arm64_data_cache_line_size(ctr);
+	for (int i = 0; i < sgCount && dataSize > 0; i++) {
+		size_t size = min_c(sgTable[i].size, dataSize);
+		addr_t start = (KERNEL_PMAP_BASE + sgTable[i].address)
+			& ~(addr_t)(lineSize - 1);
+		addr_t end = KERNEL_PMAP_BASE + sgTable[i].address + size;
+		for (addr_t p = start; p < end; p += lineSize)
+			asm volatile("dc civac, %0" :: "r"(p) : "memory");
+		dataSize -= size;
+	}
+	memory_full_barrier();
+#endif
 }

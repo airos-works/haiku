@@ -17,7 +17,8 @@ class sata_request;
 
 #if defined(__aarch64__)
 // One command is active per port. Bound its private DMA payload and let the
-// SCSI manager split larger disk requests before they reach the controller.
+// SCSI manager split larger disk requests before they reach the controller
+// (unless direct DMA hands the controller the request's own memory: util.h).
 static const size_t kAHCIMaxDMATransfer = 128 * 1024;
 #endif
 class AHCIPort {
@@ -74,6 +75,9 @@ private:
 //	uint8 *		SetCommandFis(volatile command_list_entry *cmd, volatile fis *fis, const void *data, size_t dataSize);
 	status_t	FillPrdTable(volatile prd *prdTable, int *prdCount, int prdMax, const void *data, size_t dataSize);
 	status_t	FillPrdTable(volatile prd *prdTable, int *prdCount, int prdMax, const physical_entry *sgTable, int sgCount, size_t dataSize);
+#if defined(__aarch64__)
+	bool		IsDirectDMA(const physical_entry *sgTable, int sgCount, size_t dataSize);
+#endif
 
 private:
 	AHCIController*			fController;
@@ -86,6 +90,9 @@ private:
 	phys_addr_t				fDMAAddress;
 #endif
 	bool					fDMAFailed;
+	uint32					fDirectTransfers;
+	uint32					fCopiedTransfers;
+		// with direct DMA: reported at powers of two
 	spinlock						fSpinlock;
 	volatile uint32					fCommandsActive;
 	sem_id							fRequestSem;

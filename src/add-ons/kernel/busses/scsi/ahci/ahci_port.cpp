@@ -72,6 +72,8 @@ AHCIPort::AHCIPort(AHCIController* controller, int index)
 	fDMAAddress(0),
 #endif
 	fDMAFailed(false),
+	fDirectTransfers(0),
+	fCopiedTransfers(0),
 	fCommandsActive(0),
 	fRequestSem(-1),
 	fResponseSem(-1),
@@ -1284,6 +1286,33 @@ AHCIPort::ScsiUnmap(scsi_ccb* request, scsi_unmap_parameter_list* unmapBlocks)
 }
 
 
+#if defined(__aarch64__)
+/*!	Whether the controller can be given this memory itself (ARM64 direct
+	DMA): every piece starts and ends on the cache writeback granule, and is
+	addressable.
+*/
+bool
+AHCIPort::IsDirectDMA(const physical_entry* sgTable, int sgCount,
+	size_t dataSize)
+{
+	if (!ahci_direct_dma() || sgTable == NULL || sgCount <= 0
+		|| (dataSize & 1) != 0)
+		return false;
+	const phys_addr_t mask = ahci_dma_alignment() - 1;
+	for (int i = 0; i < sgCount && dataSize > 0; i++) {
+		size_t size = min_c(sgTable[i].size, dataSize);
+		phys_addr_t address = sgTable[i].address;
+		if (size == 0 || ((address | (address + size)) & mask) != 0
+			|| ((fController->fRegs->cap & CAP_S64A) == 0
+				&& address + size - 1 > UINT32_MAX))
+			return false;
+		dataSize -= size;
+	}
+	return dataSize == 0;
+}
+#endif
+
+
 void
 AHCIPort::ExecuteSataRequest(sata_request* request, bool isWrite)
 {
@@ -1303,7 +1332,31 @@ AHCIPort::ExecuteSataRequest(sata_request* request, bool isWrite)
 	int prdEntrys = 0;
 	size_t dataSize = request->Size();
 #if defined(__aarch64__)
-	if (dataSize > kAHCIMaxDMATransfer)
+	// Direct DMA: the request's own memory, which the SCSI manager made
+	// cache line aligned (ahci_dma_alignment()), with cache maintenance
+	// around the transfer. Anything else is copied through the port's
+	// buffer, as without it.
+	const bool direct = dataSize != 0 && request->CCB() != NULL
+		&& IsDirectDMA(request->CCB()->sg_list, request->CCB()->sg_count,
+			dataSize);
+	if (ahci_direct_dma() && dataSize != 0) {
+		// how often each way is taken (the first time, then at every
+		// power of two), for a hardware test to see it is used
+		uint32 count = ++(direct ? fDirectTransfers : fCopiedTransfers);
+		if ((count & (count - 1)) == 0) {
+			dprintf("ahci: port %d: %" B_PRIu32 " transfers %s (this one %" B_PRIuSIZE
+				" bytes)\n", fIndex, count,
+				direct ? "direct" : "copied", dataSize);
+		}
+	}
+	if (direct) {
+		status = FillPrdTable(fPRDTable, &prdEntrys, PRD_TABLE_ENTRY_COUNT,
+			request->CCB()->sg_list, request->CCB()->sg_count, dataSize);
+		if (status == B_OK) {
+			ahci_dma_sync(request->CCB()->sg_list, request->CCB()->sg_count,
+				dataSize);
+		}
+	} else if (dataSize > kAHCIMaxDMATransfer)
 		status = B_BAD_VALUE;
 	else if (dataSize != 0) {
 		status = request->CopyData(fDMABuffer, dataSize, false, !isWrite);
@@ -1423,7 +1476,13 @@ AHCIPort::ExecuteSataRequest(sata_request* request, bool isWrite)
 	}
 
 #if defined(__aarch64__)
-	if (status == B_OK && !isWrite
+	if (direct) {
+		// what the CPU may have loaded of it during the transfer
+		if (!isWrite) {
+			ahci_dma_sync(request->CCB()->sg_list, request->CCB()->sg_count,
+				dataSize);
+		}
+	} else if (status == B_OK && !isWrite
 		&& (tfd & (ATA_STATUS_ERROR | ATA_STATUS_DEVICE_FAULT)) == 0) {
 		status = request->CopyData(fDMABuffer, bytesTransfered, true);
 	}
@@ -1654,8 +1713,10 @@ AHCIPort::ScsiGetRestrictions(bool* isATAPI, bool* noAutoSense,
 	*noAutoSense = fIsATAPI; // emulated auto sense for ATA, but not ATAPI
 	*maxBlocks = fUse48BitCommands ? 65536 : 256;
 #if defined(__aarch64__)
-	*maxBlocks = min_c(*maxBlocks,
-		kAHCIMaxDMATransfer / (fSectorSize != 0 ? fSectorSize : 512));
+	if (!ahci_direct_dma()) {
+		*maxBlocks = min_c(*maxBlocks,
+			kAHCIMaxDMATransfer / (fSectorSize != 0 ? fSectorSize : 512));
+	}
 #endif
 	TRACE("AHCIPort::ScsiGetRestrictions port %d: isATAPI %d, noAutoSense %d, "
 		"maxBlocks %" B_PRIu32 "\n", fIndex, *isATAPI, *noAutoSense,

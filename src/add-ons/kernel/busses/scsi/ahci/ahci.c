@@ -353,8 +353,9 @@ ahci_register_device(device_node *parent)
 			{ .string = AHCI_BRIDGE_PRETTY_NAME }},
 
 		// DMA properties
-		// data must be word-aligned;
-		{ B_DMA_ALIGNMENT, B_UINT32_TYPE, { .ui32 = 1 }},
+		// data must be word-aligned (cache line aligned for ARM64 direct
+		// DMA: the SCSI manager bounces what is not);
+		{ B_DMA_ALIGNMENT, B_UINT32_TYPE, { .ui32 = ahci_dma_alignment() - 1 }},
 		// one S/G block must not cross 64K boundary
 		{ B_DMA_BOUNDARY, B_UINT32_TYPE, { .ui32 = 0xffff }},
 		// max size of S/G block is 16 bits with zero being 64K
