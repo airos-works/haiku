@@ -237,9 +237,13 @@ l2cap_receive_data(net_buffer* buffer)
 		return EMSGSIZE;
 	}
 
+	// The buffer is ours from here on: the ACL layer forgets it whatever
+	// comes back. Every path below passes it on or frees it.
 	NetBufferHeaderReader<l2cap_basic_header> bufferHeader(buffer);
-	if (bufferHeader.Status() != B_OK)
+	if (bufferHeader.Status() != B_OK) {
+		gBufferModule->free(buffer);
 		return ENOBUFS;
+	}
 
 	uint16 length = le16toh(bufferHeader->length);
 	uint16 dcid = le16toh(bufferHeader->dcid);
@@ -251,6 +255,7 @@ l2cap_receive_data(net_buffer* buffer)
 	if (length != buffer->size) {
 		ERROR("l2cap: payload length mismatch, packetlen=%d, bufferlen=%" B_PRIu32 "\n",
 			length, buffer->size);
+		gBufferModule->free(buffer);
 		return EMSGSIZE;
 	}
 
@@ -261,10 +266,14 @@ l2cap_receive_data(net_buffer* buffer)
 			// We need to find the connection this packet is associated with.
 			struct HciConnection* connection = connection_for(buffer);
 			if (connection == NULL) {
-				panic("no connection for received L2CAP command");
+				// (the link went away while its last frames were on their
+				// way up)
+				ERROR("l2cap: signaling command without a connection\n");
+				gBufferModule->free(buffer);
 				return ENOTCONN;
 			}
 
+			// frees the buffer in any case
 			status = l2cap_handle_signaling_command(connection, buffer);
 			break;
 		}
@@ -272,15 +281,23 @@ l2cap_receive_data(net_buffer* buffer)
 		case L2CAP_CONNECTIONLESS_CID:
 		{
 			NetBufferHeaderReader<l2cap_connectionless_header> connlessHeader(buffer);
+			if (connlessHeader.Status() != B_OK) {
+				gBufferModule->free(buffer);
+				return EMSGSIZE;
+			}
 			const uint16 psm = le16toh(connlessHeader->psm);
 			L2capEndpoint* endpoint = gL2capEndpointManager.GetForPSM(psm);
-			if (endpoint == NULL)
+			if (endpoint == NULL) {
+				gBufferModule->free(buffer);
 				return ECONNRESET;
+			}
 
 			connlessHeader.Remove();
 			buffer->interface_address = NULL;
 
 			status = endpoint->ReceiveData(buffer);
+			if (status != B_OK)
+				gBufferModule->free(buffer);
 			gSocketModule->release_socket(endpoint->socket);
 			break;
 		}
@@ -346,12 +363,32 @@ l2cap_receive_data(net_buffer* buffer)
 
 		default:
 		{
+			// The channel numbers are handed out for the whole machine, but
+			// a channel belongs to the link it was opened on: what another
+			// device sends with its number is not this channel's data.
+			HciConnection* connection = connection_for(buffer);
 			L2capEndpoint* endpoint = gL2capEndpointManager.GetForChannel(dcid);
-			if (endpoint == NULL)
+			if (endpoint == NULL) {
+				gBufferModule->free(buffer);
 				return ECONNRESET;
+			}
+			if (connection == NULL || !endpoint->IsOnConnection(connection)) {
+				static bigtime_t sComplainedAt = 0;
+				bigtime_t now = system_time();
+				if (now - sComplainedAt > 5000000) {
+					sComplainedAt = now;
+					dprintf("l2cap: data for channel %#x from a link (handle "
+						"%#x) that is not the channel's, dropped\n", dcid,
+						connection != NULL ? connection->handle : 0);
+				}
+				gSocketModule->release_socket(endpoint->socket);
+				gBufferModule->free(buffer);
+				return ECONNRESET;
+			}
 
-			buffer->interface_address = NULL;
 			status = endpoint->ReceiveData(buffer);
+			if (status != B_OK)
+				gBufferModule->free(buffer);
 			gSocketModule->release_socket(endpoint->socket);
 			break;
 		}

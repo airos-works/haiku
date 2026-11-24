@@ -37,6 +37,22 @@ struct l2cap_config_options {
 // #pragma mark - incoming signals
 
 
+/*!	The endpoint of a channel a request names, if the request came in on the
+	channel's own link: to any other device the channel does not exist (the
+	numbers are handed out for the whole machine).
+*/
+static L2capEndpoint*
+channel_on_connection(HciConnection* connection, uint16 cid)
+{
+	L2capEndpoint* endpoint = gL2capEndpointManager.GetForChannel(cid);
+	if (endpoint != NULL && !endpoint->IsOnConnection(connection)) {
+		gSocketModule->release_socket(endpoint->socket);
+		return NULL;
+	}
+	return endpoint;
+}
+
+
 static status_t
 l2cap_handle_connection_req(HciConnection* conn, uint8 ident, net_buffer* buffer)
 {
@@ -156,7 +172,7 @@ l2cap_handle_configuration_req(HciConnection* conn, uint8 ident, net_buffer* buf
 		return ENOBUFS;
 
 	const uint16 dcid = le16toh(command->dcid);
-	L2capEndpoint* endpoint = gL2capEndpointManager.GetForChannel(dcid);
+	L2capEndpoint* endpoint = channel_on_connection(conn, dcid);
 	if (endpoint == NULL) {
 		ERROR("l2cap: unexpected configuration req: channel does not exist (cid=%d)\n", dcid);
 		send_l2cap_command_reject(conn, ident,
@@ -232,7 +248,7 @@ l2cap_handle_disconnection_req(HciConnection* conn, uint8 ident, net_buffer* buf
 		return ENOBUFS;
 
 	const uint16 dcid = le16toh(command->dcid);
-	L2capEndpoint* endpoint = gL2capEndpointManager.GetForChannel(dcid);
+	L2capEndpoint* endpoint = channel_on_connection(conn, dcid);
 	if (endpoint == NULL) {
 		ERROR("l2cap: unexpected disconnection req: channel does not exist (cid=%d)\n", dcid);
 		send_l2cap_command_reject(conn, ident,
@@ -500,8 +516,11 @@ l2cap_handle_signaling_command(HciConnection* connection, net_buffer* buffer)
 
 	while (buffer->size != 0) {
 		NetBufferHeaderReader<l2cap_command_header> commandHeader(buffer);
-		if (commandHeader.Status() != B_OK)
+		if (commandHeader.Status() != B_OK) {
+			// (the buffer is ours on every path)
+			gBufferModule->free(buffer);
 			return ENOBUFS;
+		}
 
 		const uint8 code = commandHeader->code;
 		const uint8 ident = commandHeader->ident;
@@ -524,6 +543,7 @@ l2cap_handle_signaling_command(HciConnection* connection, net_buffer* buffer)
 				if (endpoint != NULL)
 					gSocketModule->release_socket(endpoint->socket);
 			}
+			gBufferModule->free(buffer);
 			return EMSGSIZE;
 		}
 

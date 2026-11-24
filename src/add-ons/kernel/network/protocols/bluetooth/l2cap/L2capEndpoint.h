@@ -39,6 +39,8 @@ public:
 			status_t	Accept(net_socket** _acceptedSocket);
 
 			uint16		ChannelID() const { return fChannelID; }
+			bool		IsOnConnection(const HciConnection* connection) const
+							{ return fConnection == connection; }
 			uint16		DestinationChannelID() const { return fDestinationChannelID; }
 
 			ssize_t		ReadData(size_t numBytes, uint32 flags, net_buffer** _buffer);

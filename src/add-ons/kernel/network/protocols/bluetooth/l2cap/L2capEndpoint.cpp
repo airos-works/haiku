@@ -643,7 +643,8 @@ status_t
 L2capEndpoint::ReceiveData(net_buffer* buffer)
 {
 	CALLED();
-	// FIXME: Check address specified in net_buffer!
+	// (The caller checked that the buffer came in on our connection, and
+	// frees it when it does not fit the queue any more.)
 	status_t status = gStackModule->fifo_enqueue_buffer(&fReceiveQueue, buffer);
 
 	if (status == B_OK)
