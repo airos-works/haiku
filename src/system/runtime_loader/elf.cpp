@@ -32,10 +32,10 @@
 #include "elf_versioning.h"
 #include "errors.h"
 #include "images.h"
+#include "lazy_binding.h"
 
 
 // TODO: implement better locking strategy
-// TODO: implement lazy binding
 
 // a handle returned by load_library() (dlopen())
 #define RLD_GLOBAL_SCOPE	((void*)-2l)
@@ -596,7 +596,12 @@ load_program(char const *path, void **_entry)
 	// This results in the desired symbol resolution for dlopen()ed libraries.
 	set_image_flags_recursively(gProgramImage, RTLD_GLOBAL);
 
+	// Decide whether the jump slots of these images are bound lazily, on
+	// their first call (LD_BIND_LAZY, LD_BIND_NOW).
+	lazy_binding_init(gProgramImage, sPreloadedAddonCount > 0);
+
 	status = relocate_dependencies(gProgramImage);
+	lazy_binding_done();
 	if (status < B_OK)
 		goto err;
 	if (gTraceLoaderTiming)
@@ -611,9 +616,9 @@ load_program(char const *path, void **_entry)
 	if (gTraceLoaderTiming) {
 		printf("loader timing: %.256s load=%" B_PRIdBIGTIME
 			" relocate=%" B_PRIdBIGTIME " remap=%" B_PRIdBIGTIME
-			" init=%" B_PRIdBIGTIME " us\n", path, loaded - start,
-			relocated - loaded, remapped - relocated,
-			_kern_system_time() - remapped);
+			" init=%" B_PRIdBIGTIME " us lazy=%" B_PRIu32 "\n", path,
+			loaded - start, relocated - loaded, remapped - relocated,
+			_kern_system_time() - remapped, lazy_binding_deferred_count());
 	}
 
 	// Since the images are initialized now, we no longer should use our

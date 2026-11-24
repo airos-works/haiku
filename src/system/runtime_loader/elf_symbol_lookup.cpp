@@ -17,6 +17,7 @@
 #include "add_ons.h"
 #include "errors.h"
 #include "images.h"
+#include "lazy_binding.h"
 #include "runtime_loader_private.h"
 
 
@@ -556,18 +557,16 @@ find_undefined_symbol_add_on(image_t* rootImage, image_t* image,
 }
 
 
-int
-resolve_symbol(image_t* rootImage, image_t* image, elf_sym* sym,
-	SymbolLookupCache* cache, addr_t* symAddress, image_t** symbolImage)
+/*!	Resolves the undefined (or local) symbol \a sym of \a image. With \a lazy
+	the symbol is looked up in the program's lazy binding scope instead of
+	through \a rootImage's lookup function, and a failure is not added to the
+	error message for the launching application: the program runs already.
+*/
+static int
+resolve_symbol(image_t* rootImage, image_t* image, elf_sym* sym, bool lazy,
+	addr_t* symAddress, image_t** symbolImage)
 {
 	uint32 index = sym - image->syms;
-
-	// check the cache first
-	if (cache->IsSymbolValueCached(index)) {
-		*symAddress = cache->SymbolValueAt(index, symbolImage);
-		return B_OK;
-	}
-
 	elf_sym* sharedSym;
 	image_t* sharedImage;
 	const char* symName = SYMNAME(image, sym);
@@ -591,8 +590,14 @@ resolve_symbol(image_t* rootImage, image_t* image, elf_sym* sym,
 		}
 
 		// search the symbol
-		sharedSym = rootImage->find_undefined_symbol(rootImage, image,
-			SymbolLookupInfo(symName, type, versionInfo, 0, sym), &sharedImage);
+		SymbolLookupInfo lookupInfo(symName, type, versionInfo, 0, sym);
+		if (lazy) {
+			sharedSym = find_undefined_symbol_lazy(rootImage, image, lookupInfo,
+				&sharedImage);
+		} else {
+			sharedSym = rootImage->find_undefined_symbol(rootImage, image,
+				lookupInfo, &sharedImage);
+		}
 	}
 
 	enum {
@@ -661,16 +666,50 @@ resolve_symbol(image_t* rootImage, image_t* image, elf_sym* sym,
 				break;
 		}
 
-		if (report_errors())
+		if (!lazy && report_errors())
 			gErrorMessage.AddString("missing symbol", symName);
 
 		return B_MISSING_SYMBOL;
 	}
 
-	cache->SetSymbolValueAt(index, (addr_t)location, sharedImage);
-
 	if (symbolImage)
 		*symbolImage = sharedImage;
 	*symAddress = (addr_t)location;
 	return B_OK;
+}
+
+
+int
+resolve_symbol(image_t* rootImage, image_t* image, elf_sym* sym,
+	SymbolLookupCache* cache, addr_t* symAddress, image_t** symbolImage)
+{
+	uint32 index = sym - image->syms;
+
+	// check the cache first
+	if (cache->IsSymbolValueCached(index)) {
+		*symAddress = cache->SymbolValueAt(index, symbolImage);
+		return B_OK;
+	}
+
+	image_t* sharedImage = NULL;
+	int status = resolve_symbol(rootImage, image, sym, false, symAddress,
+		&sharedImage);
+	if (status != B_OK)
+		return status;
+
+	cache->SetSymbolValueAt(index, *symAddress, sharedImage);
+	if (symbolImage)
+		*symbolImage = sharedImage;
+	return B_OK;
+}
+
+
+/*!	Resolves the jump slot symbol \a sym of \a image when it is first called
+	(lazy binding). Does not lock: see lazy_binding.h.
+*/
+int
+resolve_symbol_lazily(image_t* rootImage, image_t* image, elf_sym* sym,
+	addr_t* symAddress)
+{
+	return resolve_symbol(rootImage, image, sym, true, symAddress, NULL);
 }

@@ -89,6 +89,8 @@ status_t get_next_image_dependency(image_id id, uint32* cookie,
 	const char** _name);
 int resolve_symbol(image_t* rootImage, image_t* image, elf_sym* sym,
 	SymbolLookupCache* cache, addr_t* sym_addr, image_t** symbolImage = NULL);
+int resolve_symbol_lazily(image_t* rootImage, image_t* image, elf_sym* sym,
+	addr_t* sym_addr);
 
 
 status_t elf_verify_header(void* header, size_t length);

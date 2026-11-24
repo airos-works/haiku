@@ -112,6 +112,7 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 			export.cpp
 			heap.cpp
 			images.cpp
+			lazy_binding.cpp
 			runtime_loader.cpp
 			utility.cpp
 		;

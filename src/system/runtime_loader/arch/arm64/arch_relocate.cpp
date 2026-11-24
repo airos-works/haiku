@@ -8,6 +8,7 @@
 #include <stdlib.h>
 
 #include "arch_elf.h"
+#include "lazy_binding.h"
 #include "runtime_loader_private.h"
 
 #include <runtime_loader.h>
@@ -81,6 +82,44 @@ relocate_rela(image_t* rootImage, image_t* image, Elf64_Rela* rel,
 }
 
 
+void
+arch_lazy_binding_init()
+{
+}
+
+
+/*!	Prepares the PLT of \a image for lazy binding: the jump slots keep
+	pointing to PLT0, which pushes the slot's address and jumps to GOT[2].
+	arch_lazy_binding_entry() derives the relocation from the slot's position,
+	so every PLT relocation must be a jump slot, the n-th one for GOT[3 + n].
+	Returns an error and changes nothing if the PLT does not look like that.
+*/
+static status_t
+setup_lazy_plt(image_t* image, addr_t* got)
+{
+	Elf64_Rela* relocations = (Elf64_Rela*)image->pltrel;
+	size_t count = image->pltrel_len / sizeof(Elf64_Rela);
+	addr_t delta = image->regions[0].delta;
+
+	for (size_t i = 0; i < count; i++) {
+		if (ELF64_R_TYPE(relocations[i].r_info) != R_AARCH64_JUMP_SLOT
+			|| delta + relocations[i].r_offset != (addr_t)&got[3 + i]) {
+			return B_BAD_DATA;
+		}
+		if (!lazy_binding_slot_target_valid(image, got[3 + i] + delta))
+			return B_BAD_DATA;
+	}
+
+	for (size_t i = 0; i < count; i++)
+		got[3 + i] += delta;
+
+	got[1] = (addr_t)image;
+	got[2] = (addr_t)&arch_lazy_binding_entry;
+	lazy_binding_note_deferred(count);
+	return B_OK;
+}
+
+
 status_t
 arch_relocate_image(image_t *rootImage, image_t *image,
 	SymbolLookupCache* cache)
@@ -97,8 +136,13 @@ arch_relocate_image(image_t *rootImage, image_t *image,
 			return status;
 	}
 
-	// PLT relocations (they are RELA on arm64).
+	// PLT relocations (they are RELA on arm64), bound on their first call
+	// if the program binds lazily.
 	if (image->pltrel) {
+		addr_t* got = lazy_binding_plt_got(rootImage, image);
+		if (got != NULL && setup_lazy_plt(image, got) == B_OK)
+			return B_OK;
+
 		status = relocate_rela(rootImage, image, (Elf64_Rela*)image->pltrel,
 			image->pltrel_len, cache);
 		if (status != B_OK)
