@@ -336,7 +336,7 @@ DetailsPane::_Rebuild(BPoseView* poseView)
 		fContent->AddView(titleView);
 
 		off_t total = 0;
-		std::set<BString> kinds;
+		std::set<BString> types;
 		PoseList* selection = poseView->SelectionList();
 		for (int32 i = 0; i < selection->CountItems(); i++) {
 			Model* model = selection->ItemAt(i)->TargetModel();
@@ -347,7 +347,15 @@ DetailsPane::_Rebuild(BPoseView* poseView)
 				if (GetFolderSize(*model->NodeRef(), &size))
 					total += size;
 			}
-			BMimeType type(model->MimeType());
+			types.insert(model->MimeType());
+		}
+
+		// a description is read from the MIME database: once per type, not
+		// once per item (Select All in a folder of 20,000 photos)
+		std::set<BString> kinds;
+		for (std::set<BString>::iterator it = types.begin();
+				it != types.end(); it++) {
+			BMimeType type(it->String());
 			char description[B_MIME_TYPE_LENGTH];
 			if (type.GetShortDescription(description) == B_OK)
 				kinds.insert(description);
