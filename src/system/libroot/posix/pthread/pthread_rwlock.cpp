@@ -29,6 +29,7 @@ struct Waiter : DoublyLinkedListLinkImpl<Waiter> {
 		:
 		userThread(get_user_thread()),
 		thread(find_thread(NULL)),
+		owner(__pthread_lock_owner_id(thread)),
 		writer(writer),
 		queued(false)
 	{
@@ -36,6 +37,9 @@ struct Waiter : DoublyLinkedListLinkImpl<Waiter> {
 
 	user_thread*	userThread;
 	thread_id		thread;
+	thread_id		owner;
+		// what LocalRWLock::owner becomes; differs from the thread's ID in
+		// the thread of a fork()ed team, see __pthread_lock_owner_id()
 	status_t		status;
 	bool			writer;
 	bool			queued;
@@ -170,7 +174,7 @@ struct LocalRWLock {
 
 		if (reader_count == 0 && writer_count == 0) {
 			writer_count++;
-			owner = find_thread(NULL);
+			owner = __pthread_lock_owner_id(find_thread(NULL));
 			return B_OK;
 		}
 
@@ -181,7 +185,10 @@ struct LocalRWLock {
 	{
 		Locker locker(this);
 
-		if (find_thread(NULL) == owner) {
+		// (a write lock held across fork() is the child's thread's as well,
+		// and was released as if it were a read lock: the lock stayed
+		// write-locked for good)
+		if (__pthread_lock_owner_id(find_thread(NULL)) == owner) {
 			writer_count--;
 			owner = -1;
 		} else
@@ -198,8 +205,10 @@ private:
 		if (timeout == 0)
 			return B_TIMED_OUT;
 
-		if (writer_count == 1 && owner == find_thread(NULL))
+		if (writer_count == 1
+			&& owner == __pthread_lock_owner_id(find_thread(NULL))) {
 			return EDEADLK;
+		}
 
 		Waiter waiter(writer);
 		waiters.Add(&waiter);
@@ -245,7 +254,7 @@ private:
 				waiter->status = B_OK;
 				waiter->queued = false;
 				waiters.Remove(waiter);
-				owner = waiter->thread;
+				owner = waiter->owner;
 
 				if (waiter->userThread->wait_status > 0)
 					_kern_unblock_thread(waiter->thread, B_OK);
@@ -382,7 +391,8 @@ pthread_rwlock_clockrdlock(pthread_rwlock_t* lock, clockid_t clock_id,
 
 	if (error != B_OK && invalidTime)
 		return EINVAL;
-	return (error == B_TIMED_OUT) ? EBUSY : error;
+	// (B_TIMED_OUT is ETIMEDOUT; EBUSY is what the "try" functions return)
+	return error;
 }
 
 
@@ -448,7 +458,8 @@ pthread_rwlock_clockwrlock(pthread_rwlock_t* lock, clockid_t clock_id,
 
 	if (error != B_OK && invalidTime)
 		return EINVAL;
-	return (error == B_TIMED_OUT) ? EBUSY : error;
+	// (B_TIMED_OUT is ETIMEDOUT; EBUSY is what the "try" functions return)
+	return error;
 }
 
 

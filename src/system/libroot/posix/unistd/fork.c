@@ -137,6 +137,7 @@ pid_t
 fork(void)
 {
 	thread_id thread;
+	thread_id lockOwnerID;
 	status_t status;
 
 	defer_signals();
@@ -147,6 +148,10 @@ fork(void)
 		return status;
 	}
 
+	// The child's thread owns the pthread locks this thread holds, and those
+	// name this ID as their owner.
+	lockOwnerID = __pthread_lock_owner_id(find_thread(NULL));
+
 	// call preparation hooks
 	call_fork_hooks(sPrepareHooks);
 	__heap_before_fork();
@@ -156,11 +161,14 @@ fork(void)
 		// we are the child
 		__main_thread_id = find_thread(NULL);
 		pthread_self()->id = __main_thread_id;
+		__gForkedThreadOwnerID = lockOwnerID;
+		__gForkedThread = __main_thread_id;
 
 		mutex_init(&sForkLock, FORK_LOCK_NAME);
 		__gRuntimeLoader->reinit_after_fork();
 		__heap_after_fork_child();
 		__reinit_pwd_backend_after_fork();
+		__libio_reinit_locks_after_fork(lockOwnerID);
 
 		call_fork_hooks(sChildHooks);
 	} else {

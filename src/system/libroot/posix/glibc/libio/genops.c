@@ -1331,6 +1331,40 @@ _IO_list_resetlock (void)
 libc_hidden_def (_IO_list_resetlock)
 
 
+/* Called by fork() in the child, with THREAD the ID by which its thread owns
+   locks (see __pthread_lock_owner_id()).
+   A stream lock that another thread of the parent held at the time of the
+   fork stays locked in the child, where that thread does not exist: the
+   child hung at its first use of the stream. Such locks are initialized
+   again; what the forking thread itself holds (flockfile()) is the child's.
+   The parent does not take the list lock for the fork (fork() would wait
+   for a thread that holds it while blocked on a stream): the list is valid
+   at any instant, since linking and unlinking a stream each change a single
+   pointer.  */
+void __libio_reinit_locks_after_fork (int thread);
+
+void
+__libio_reinit_locks_after_fork (int thread)
+{
+#ifdef _IO_MTSAFE_IO
+  struct _IO_FILE *fp;
+
+  if (list_all_lock.mutex.owner != thread)
+    _IO_lock_init (list_all_lock);
+
+  for (fp = (struct _IO_FILE *) INTUSE(_IO_list_all); fp != NULL;
+       fp = fp->_chain)
+    {
+      _IO_lock_t *lock = fp->_lock;
+      if ((fp->_flags & _IO_USER_LOCK) != 0 || lock == NULL)
+	continue;
+      if (lock->mutex.owner != thread)
+	_IO_lock_init (*lock);
+    }
+#endif
+}
+
+
 #ifdef TODO
 #if defined(linux)
 #define IO_CLEANUP ;

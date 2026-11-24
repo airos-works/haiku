@@ -61,7 +61,10 @@ static status_t
 cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex, uint32 flags,
 	bigtime_t timeout)
 {
-	if (mutex->owner != find_thread(NULL)) {
+	thread_id thisThread = find_thread(NULL);
+	if ((mutex->flags & MUTEX_FLAG_SHARED) == 0)
+		thisThread = __pthread_lock_owner_id(thisThread);
+	if (mutex->owner != thisThread) {
 		// calling thread isn't mutex owner
 		return EPERM;
 	}

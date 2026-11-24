@@ -27,6 +27,22 @@ static const pthread_mutexattr pthread_mutexattr_default = {
 	false
 };
 
+thread_id __gForkedThread = -1;
+thread_id __gForkedThreadOwnerID = -1;
+
+
+/*!	The ID the calling thread owns \a mutex by, see
+	__pthread_lock_owner_id().
+*/
+static inline thread_id
+owner_id(const pthread_mutex_t* mutex)
+{
+	thread_id thisThread = find_thread(NULL);
+	if ((mutex->flags & MUTEX_FLAG_SHARED) != 0)
+		return thisThread;
+	return __pthread_lock_owner_id(thisThread);
+}
+
 
 int
 pthread_mutex_init(pthread_mutex_t* mutex, const pthread_mutexattr_t* _attr)
@@ -53,7 +69,7 @@ pthread_mutex_destroy(pthread_mutex_t* mutex)
 status_t
 __pthread_mutex_lock(pthread_mutex_t* mutex, uint32 flags, bigtime_t timeout)
 {
-	thread_id thisThread = find_thread(NULL);
+	thread_id thisThread = owner_id(mutex);
 
 	if (mutex->owner == thisThread) {
 		// recursive locking handling
@@ -155,7 +171,7 @@ pthread_mutex_timedlock(pthread_mutex_t* mutex, const struct timespec* abstime)
 int
 pthread_mutex_unlock(pthread_mutex_t* mutex)
 {
-	if (mutex->owner != find_thread(NULL))
+	if (mutex->owner != owner_id(mutex))
 		return EPERM;
 
 	if (MUTEX_TYPE(mutex) == PTHREAD_MUTEX_RECURSIVE

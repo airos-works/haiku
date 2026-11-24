@@ -85,6 +85,31 @@ typedef struct _pthread_thread {
 extern "C" {
 #endif
 
+// The thread that fork() made in this team, and the ID its original had in
+// the parent team (-1: this team was not forked).
+extern thread_id __gForkedThread;
+extern thread_id __gForkedThreadOwnerID;
+
+
+/*!	The ID by which the calling thread (\a thisThread) owns locks that live
+	in this team's own memory.
+	That is its thread ID, except for the thread of a fork()ed team: the
+	locks its original held at the time of the fork were copied with the
+	original's ID as their owner and belong to it now, so it goes on using
+	that ID. With the new ID it could neither unlock them (EPERM) nor ever
+	lock them again.
+	Not for locks in memory shared between teams: those still belong to the
+	parent's thread.
+*/
+static inline thread_id
+__pthread_lock_owner_id(thread_id thisThread)
+{
+	if (thisThread == __gForkedThread)
+		return __gForkedThreadOwnerID;
+	return thisThread;
+}
+
+
 void __pthread_key_call_destructors(pthread_thread *thread);
 void __pthread_destroy_thread(void);
 pthread_thread *__allocate_pthread(void* (*entry)(void*), void *data);

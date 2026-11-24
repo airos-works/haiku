@@ -29,6 +29,8 @@ int __ctype_toupper;
 int __gABIVersion;
 int __gAPIVersion;
 int __gCPUCount;
+int __gForkedThread;
+int __gForkedThreadOwnerID;
 int __gCommPageAddress;
 int __gRuntimeLoader;
 int __gUmask;
@@ -739,6 +741,7 @@ void __lgammal_r() {}
 void __libc_dlclose() {}
 void __libc_dlopen() {}
 void __libc_dlsym() {}
+void __libio_reinit_locks_after_fork() {}
 void __libio_translit() {}
 void __load_image_at_path() {}
 void __longjmp_return() {}
