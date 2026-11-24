@@ -51,6 +51,12 @@ SimpleTest profiler_detach_test : profiler_detach_test.cpp ;
 # tools/airos/ci/guest-tests too
 SimpleTest fragmented_write_test : fragmented_write_test.cpp ;
 
+# cold reads of fragmented files from several threads: a thread that waited
+# for a block of a file's extent list reported other transfers of the same
+# file and waited for the lock it held (airos-works/haiku#166). Mounts a
+# scratch volume itself, so not in tools/airos/ci/guest-tests.
+SimpleTest fragmented_read_test : fragmented_read_test.cpp ;
+
 # modified pages of a file that is being removed, against a write that waits
 # for the modified page quota: the page writer went round its queue at full
 # speed and the write never returned (airos-works/haiku#146). Needs a slow

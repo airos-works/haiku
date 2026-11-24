@@ -189,10 +189,15 @@ struct qpair_info {
 	int32					sync_waiters;
 	bool					polling;
 	thread_id				thread;
+	bool					reporting;
+		// the completion thread is reporting transfers (only it looks)
 	// transfers whose last command completed, to be reported once the
 	// queue is unlocked
 	spinlock				done_lock;
 	nvme_async_io*			done;
+	nvme_async_io*			released;
+		// transfers completed by another thread, whose locks it released:
+		// for the completion thread to report
 };
 
 
@@ -551,8 +556,10 @@ nvme_disk_init_device(void* _info, void** _cookie)
 		qpinfo.sync_waiters = 0;
 		qpinfo.polling = info->polling;
 		qpinfo.thread = -1;
+		qpinfo.reporting = false;
 		B_INITIALIZE_SPINLOCK(&qpinfo.done_lock);
 		qpinfo.done = NULL;
+		qpinfo.released = NULL;
 		// published once set up (a full barrier): the interrupt handler may
 		// look at it at once
 		atomic_add((int32*)&info->qpair_count, 1);
@@ -764,24 +771,41 @@ command_submitted(qpair_info* qpinfo)
 
 
 /*!	The last command of a transfer completed (or the transfer could not be
-	submitted further): its locks are released, and it is reported, on
-	whatever thread saw it, without any queue locked. The report may start
-	more I/O.
+	submitted further): it gives up the locks it held for its commands.
 */
 static void
-async_io_done(nvme_async_io* io)
+release_transfer_locks(nvme_async_io* io)
 {
 	nvme_disk_driver_info* info = io->info;
 	if (io->write_locked)
 		rw_lock_read_unlock(&info->rounded_write_lock);
 	rw_lock_read_unlock(&info->suspend_lock);
+}
 
+
+/*!	Reports a transfer whose locks have been released to whoever asked for
+	it, without any queue locked. The report may start more I/O, and it may
+	wait for I/O (a file system that reads a block to map the next part of a
+	request).
+*/
+static void
+report_transfer(nvme_async_io* io)
+{
 	const generic_size_t transferred = io->failed == INT64_MAX
 		? io->length : io->failed - io->start;
 	io->request->SetTransferredBytes(io->status != B_OK, transferred);
 	// notification may delete the request
 	io->request->SetStatusAndNotify(io->status);
 	free(io);
+}
+
+
+//! A transfer that ended while it was being submitted, on the submitter.
+static void
+async_io_done(nvme_async_io* io)
+{
+	release_transfer_locks(io);
+	report_transfer(io);
 }
 
 
@@ -847,6 +871,8 @@ defer_requests(nvme_disk_driver_info* info, IORequestList& requests)
 	collected, as they are for a thread that is sending one itself (its
 	nvme_disk_io_request() sends them when it is done), and given to the
 	thread for deferred requests.
+
+	The transfers have given up their locks already, see poll_qpair().
 */
 static void
 report_transfers(nvme_disk_driver_info* info, nvme_async_io* done)
@@ -870,7 +896,7 @@ report_transfers(nvme_disk_driver_info* info, nvme_async_io* done)
 
 	while (done != NULL) {
 		nvme_async_io* next = done->next;
-		async_io_done(done);
+		report_transfer(done);
 		done = next;
 	}
 
@@ -883,20 +909,46 @@ report_transfers(nvme_disk_driver_info* info, nvme_async_io* done)
 }
 
 
+/*!	Whether the calling thread is a queue's completion thread. */
+static bool
+is_completion_thread(nvme_disk_driver_info* info)
+{
+	const thread_id thread = thread_get_current_thread_id();
+	for (uint32 i = 0; i < info->qpair_count; i++) {
+		if (info->qpairs[i].thread == thread)
+			return true;
+	}
+	return false;
+}
+
+
 /*!	Completes what the controller finished on this queue. Any thread may do
 	this; the queue's completion thread does it on every interrupt.
+
+	Finished asynchronous transfers give up their locks at once, whoever
+	completes them, but they are reported by the completion thread only, and
+	not while it is reporting already. A report runs the callbacks of someone
+	else's request, which may need a lock that the thread completing the
+	queue holds: a file system that reads a block while it maps a file (a
+	synchronous command, whose waiter completes the queue) holds that file's
+	map lock, and the report of another transfer of the same file maps the
+	file's next part (airos-works/haiku#166). The completion thread itself
+	gets there when a report of its own reads such a block.
+	The locks go first, as a report may read synchronously, which read-locks
+	suspend_lock again: a suspend that waits to write-lock it would wait for
+	the transfers that are not reported yet, and the report for the suspend.
 */
 static uint32
 poll_qpair(qpair_info* qpinfo)
 {
 	nvme_disk_driver_info* info = qpinfo->info;
+	uint32 completions = 0;
 	atomic_add(&info->pollers, 1);
-	if (atomic_get(&info->queues_down) != 0) {
-		atomic_add(&info->pollers, -1);
-		return 0;
-	}
-	uint32 completions = nvme_qpair_poll(qpinfo->qpair, 0);
+	if (atomic_get(&info->queues_down) == 0)
+		completions = nvme_qpair_poll(qpinfo->qpair, 0);
 	atomic_add(&info->pollers, -1);
+		// (What was completed before the queues went down is still
+		// reported.)
 
 	nvme_async_io* done;
 	{
@@ -904,7 +956,47 @@ poll_qpair(qpair_info* qpinfo)
 		done = qpinfo->done;
 		qpinfo->done = NULL;
 	}
-	report_transfers(info, done);
+	for (nvme_async_io* io = done; io != NULL; io = io->next)
+		release_transfer_locks(io);
+
+	// (without its thread, at start-up or should it be gone: whoever is here)
+	const thread_id thread = qpinfo->thread;
+	if (thread > 0 && (thread != thread_get_current_thread_id()
+			|| qpinfo->reporting)) {
+		if (done != NULL) {
+			nvme_async_io* last = done;
+			while (last->next != NULL)
+				last = last->next;
+
+			InterruptsSpinLocker locker(qpinfo->done_lock);
+			last->next = qpinfo->released;
+			qpinfo->released = done;
+			locker.Unlock();
+
+			// as its interrupt would
+			atomic_set(&qpinfo->interrupted, 1);
+			qpinfo->interrupt.NotifyOne();
+		}
+		return completions;
+	}
+
+	{
+		InterruptsSpinLocker locker(qpinfo->done_lock);
+		if (qpinfo->released != NULL) {
+			nvme_async_io* last = qpinfo->released;
+			while (last->next != NULL)
+				last = last->next;
+			last->next = done;
+			done = qpinfo->released;
+			qpinfo->released = NULL;
+		}
+	}
+
+	if (done != NULL) {
+		qpinfo->reporting = thread > 0;
+		report_transfers(info, done);
+		qpinfo->reporting = false;
+	}
 	return completions;
 }
 
@@ -1197,7 +1289,7 @@ prepare_sync_command(nvme_io_request* request)
 
 
 /*!	Submits a command, waiting for a free request when the queue has none
-	(never on a completion thread: they do not submit).
+	(on a completion thread only for a synchronous command of a report).
 */
 static int
 submit_command(nvme_disk_driver_info* info, qpair_info* qpinfo,
@@ -1238,7 +1330,8 @@ submit_command(nvme_disk_driver_info* info, qpair_info* qpinfo,
 /*!	Waits for a synchronous command: the queue's interrupt wakes this
 	thread, which completes the queue itself, as does whoever else completes
 	it. (Then a completion thread that is busy reporting is no matter, and
-	neither is one that is the waiter.)
+	neither is one that is the waiter.) Asynchronous transfers that it finds
+	finished are left to the completion thread, see poll_qpair().
 */
 static void
 await_command(nvme_disk_driver_info* info, qpair_info* qpinfo,
@@ -1745,9 +1838,14 @@ do_io(nvme_disk_handle* handle, io_request* request, bool waited)
 	// file system request continues: that stays asynchronous, for the thread
 	// must not wait for its own queue. Waiting for I/O there is up to the
 	// read and write hooks, whose waiters complete the queue themselves.)
+	// What a report on a completion thread waits for must be synchronous
+	// whatever its size: an asynchronous transfer is reported by that very
+	// thread, which would wait for it instead.
 	const bool oneCommand = !tooLarge && rounded_len <= maxIOBytes
 		&& nvme_request.iovec_count <= NVME_MAX_SGL_DESCRIPTORS / 2;
-	if (!(waited && oneCommand)
+	const bool synchronous = waited
+		&& (oneCommand || is_completion_thread(handle->info));
+	if (!synchronous
 		&& do_async_io(handle->info, request, nvme_request, rounded_pos)
 			== B_OK) {
 		return B_OK;
