@@ -82,6 +82,23 @@ The system Open, Save and folder-selection panels adapt automatically. Use the o
 | Covers | `DrawReflection(view, bitmap, rect, depth, floor)` mirrors a picture onto the floor below it, fading out, for a cover on a dark stage (`CurrentSkin().stage`). |
 | Glyphs and colours | `DrawGlyph(view, glyph, rect, color)` draws transport, repeat, shuffle, back, search, clear, speaker and note symbols. `CurrentSkin()` returns the material colours for custom views, and `ControlHeight()` the visible height of a bar control inside its `TargetSize()` touch area. |
 
+## Browser and list controls (version 3)
+
+`B_MOBILE_KIT_VERSION` 3 adds what a browser, a mail client or a reader needs on top of the materials, after Safari on the early iPhone and iPad: toolbar glyph buttons with a count, a row of tabs, a grid of page cards, touch tables with an editing mode, a share sheet and a confirmation toast. Summit's mobile view is the reference application (its `docs/mobile.md`).
+
+| Element | API and behavior |
+| --- | --- |
+| Window skin | `SetWindowSkin(window, B_GRAPHITE_SKIN)` (or `B_ALUMINIUM_SKIN`, `B_PANEL_SKIN`) gives one window's kit views another material set, for example a private browsing window. Call it with the window locked or before it is shown; the change applies on the window's thread before its next update. `IsDarkSkin()` tells a custom view which set it is drawing with. |
+| Glyphs | Browser and list symbols: `B_GLYPH_ARROW_BACK` and `B_GLYPH_ARROW_FORWARD`, `RELOAD`, `STOP`, `ADD`, `PAGES` (open tabs), `BOOK` (bookmarks), `ACTION` (share), `CLOCK` (history), `FOLDER`, `STAR`, `GLASSES` (reading list), `PRIVATE`, `CHEVRON`, `CHECK`, `GLOBE` (a page without an icon), `MORE`, `LOCK` and `DOWNLOAD`. `PagesGlyphFace(rect)` is the front page of `B_GLYPH_PAGES`, where a count fits. |
+| Toolbar buttons | `MetalButton` with `B_PLAIN_BUTTON` is a glyph cut into the bar with no plate, which glows while pressed. `SetGlyphText("3")` writes a short count inside the glyph (the tab count on `B_GLYPH_PAGES`); `SetHighlighted(true)` keeps the glow and tints the glyph for a mode that is on. |
+| Progress | `MetalBar::SetProgress(fraction)` draws a blue loading line along the bar's edge towards the content; below 0 (or 1) hides it. |
+| Titles | `TitleView(name, title)` is a page title engraved into a bar, between its buttons. |
+| Tables | `TableView` (a `BListView` for `Scroll()`) holds `TableRow`s: a bitmap (copied) or glyph picture, a bold title, an optional detail line and a `B_ROW_CHEVRON` or `B_ROW_CHECK` accessory. A tap highlights the row blue and sends its message with `"index"` to the table's target (or the window). `SetHeader(true)` makes a section heading. `SetEditing(true)` gives each row with a delete message a red minus; tapping it shows a red **Delete** button that sends that message. `SetEmptyText` is shown while the table is empty. |
+| Card grid | `CardGrid(name, open, close)` lays out cards of open pages: a strip with an icon, a title and ✕ over a picture of the page (both bitmaps copied), two columns on a phone and more on wider screens. A tap opens a card, ✕ closes it, and a finger swiping a card sideways (touch scrolling) slides it off to close it. Messages carry `"id"` and `"index"`. `SetSelected(id)` rings the page on show, `SetAspect(height / width)` matches the pictures, `SetEmptyText(text, glyph)` explains an empty grid (first line as the heading). Without a scroll bar the grid scrolls itself. |
+| Tab row | `TabBar(name, select, close)` is the iPad's row of tabs under a bar: the tab on show is lit with ✕, the others sit back; tabs share the width down to a touch-sized minimum, then the row scrolls sideways. `AddTab(id, title, icon)`, then `SetSelected(id)`. |
+| Share sheet | `ActionSheet` now rises from the bottom of its window as a dark slab: `AddActivity(label, glyph, message)` puts large glyph buttons in rows at the top, `AddAction(label, message, B_ACTION_DESTRUCTIVE)` a red button in the column, and Cancel is set apart below. A tap above the sheet or Escape dismisses it; a long sheet scrolls. Existing `AddAction(label, message)` callers are unchanged. |
+| Toast | `ShowToast(window, "Bookmark saved", B_GLYPH_CHECK)` shows a dark square with a glyph and a line in the middle of the window for a moment, without taking the focus. |
+
 The kit is header-only. An application that is built with SDKs older than the air/OS release it targets can carry a copy of `MobileKit.h` and include it by path; `B_MOBILE_KIT_VERSION` tells which version a copy provides.
 
 ## Try both presentations

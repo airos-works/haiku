@@ -29,6 +29,9 @@
 #include <TextControl.h>
 #include <TextView.h>
 
+#include <MessageFilter.h>
+#include <MessageRunner.h>
+#include <ScrollBar.h>
 #include <math.h>
 #include <string.h>
 
@@ -38,7 +41,10 @@
 
 // 1: presentation switching and native touch controls.
 // 2: the skeuomorphic materials and controls (MetalBar, SegmentedControl, ...).
-#define B_MOBILE_KIT_VERSION 2
+// 3: per-window skins, browser and list glyphs, plain bar buttons with a count,
+//    bar progress, TableView, CardGrid, TabBar, TitleView, Toast and a
+//    share-sheet look for ActionSheet (activities, destructive actions).
+#define B_MOBILE_KIT_VERSION 3
 
 
 namespace BMobileKit {
@@ -221,100 +227,6 @@ Scroll(const char* name, BView* content)
 	return new BScrollView(name, content, 0, false, true, B_NO_BORDER);
 }
 
-// A transient, scrollable list of commands. Each row carries its original
-// BMessage (including IDs or refs). Escape and Cancel dismiss the sheet.
-class ActionSheet : public BWindow {
-public:
-	ActionSheet(BWindow* owner, const char* title)
-		:
-		BWindow(owner->Frame(), title, B_MODAL_WINDOW_LOOK,
-			owner->Feel() == B_MODAL_APP_WINDOW_FEEL ? B_MODAL_APP_WINDOW_FEEL
-				: B_MODAL_SUBSET_WINDOW_FEEL, B_NOT_ZOOMABLE | B_NOT_RESIZABLE
-				| B_ASYNCHRONOUS_CONTROLS | B_CLOSE_ON_ESCAPE),
-		fOwner(owner),
-		fArea(owner->Frame())
-	{
-		if (Feel() == B_MODAL_SUBSET_WINDOW_FEEL)
-			AddToSubset(owner);
-		fChoices = new Choices;
-		fChoices->SetInvocationMessage(new BMessage('mVok'));
-		BLayoutBuilder::Group<>(this, B_VERTICAL)
-			.SetInsets(B_USE_HALF_ITEM_SPACING)
-			.Add(Scroll("choices-scroll", fChoices))
-			.Add(Action("cancel", "Cancel", new BMessage(B_QUIT_REQUESTED)));
-		fChoices->SetTarget(this);
-	}
-
-	virtual ~ActionSheet()
-	{
-		while (BListItem* item = fChoices->RemoveItem((int32)0))
-			delete item;
-	}
-
-	void AddAction(const char* label, const BMessage& action)
-	{
-		Choice* item = new Choice(label, action);
-		if (!fChoices->AddItem(item))
-			delete item;
-	}
-
-	void Open()
-	{
-		float width = fminf(fArea.Width() - 16, TargetSize() * 12);
-		float height = fminf(fArea.Height() * 0.8f,
-			TargetSize() * (2 + fChoices->CountItems()));
-		ResizeTo(width, height);
-		MoveTo(fArea.left + floorf((fArea.Width() - width) / 2),
-			fArea.bottom - height - 8);
-		Show();
-	}
-
-	virtual void MessageReceived(BMessage* message)
-	{
-		if (message->what != 'mVok') {
-			BWindow::MessageReceived(message);
-			return;
-		}
-		Choice* item = (Choice*)fChoices->ItemAt(message->GetInt32("index", -1));
-		if (item != NULL) {
-			fOwner.SendMessage(&item->action);
-			PostMessage(B_QUIT_REQUESTED);
-		}
-	}
-
-private:
-	struct Choice : public ListItem {
-		Choice(const char* label, const BMessage& value)
-			: ListItem(label), action(value) {}
-		BMessage action;
-	};
-
-	class Choices : public BListView {
-	public:
-		Choices() : BListView("choices"), fDown(-1) {}
-		virtual void MouseDown(BPoint point)
-		{
-			BMessage* event = Window()->CurrentMessage();
-			fDown = event->GetInt32("buttons", 0) == B_PRIMARY_MOUSE_BUTTON
-				&& event->GetInt32("clicks", 1) == 1 ? IndexOf(point) : -1;
-			BListView::MouseDown(point);
-		}
-		virtual void MouseUp(BPoint point)
-		{
-			BListView::MouseUp(point);
-			if (fDown >= 0 && IndexOf(point) == fDown && CurrentSelection() == fDown)
-				Invoke();
-			fDown = -1;
-		}
-	private:
-		int32 fDown;
-	};
-
-	BMessenger fOwner;
-	BRect fArea;
-	Choices* fChoices;
-};
-
 
 // #pragma mark - Skeuomorphic materials (version 2)
 
@@ -472,12 +384,95 @@ IsDarkPanel()
 
 // The material set that goes with the current panel colour. Views that draw
 // with it repaint on B_COLORS_UPDATED to follow an Appearance change.
+// The material set a window draws with: the panel's (the default), or always
+// aluminium or graphite (a private browsing window, for example).
+enum SkinStyle {
+	B_PANEL_SKIN,
+	B_ALUMINIUM_SKIN,
+	B_GRAPHITE_SKIN
+};
+
+
+namespace Detail {
+
+// Each window draws on its own thread, so the choice is kept per thread.
+inline SkinStyle&
+ThreadSkin()
+{
+	static thread_local SkinStyle style = B_PANEL_SKIN;
+	return style;
+}
+
+
+inline void
+InvalidateTree(BView* view)
+{
+	for (; view != NULL; view = view->NextSibling()) {
+		view->Invalidate();
+		InvalidateTree(view->ChildAt(0));
+	}
+}
+
+
+class SkinFilter : public BMessageFilter {
+public:
+	SkinFilter() : BMessageFilter('mVsk') {}
+
+	virtual filter_result Filter(BMessage* message, BHandler** target)
+	{
+		ThreadSkin() = (SkinStyle)message->GetInt32("style", B_PANEL_SKIN);
+		if (BWindow* window = dynamic_cast<BWindow*>(Looper()))
+			InvalidateTree(window->ChildAt(0));
+		return B_SKIP_MESSAGE;
+	}
+};
+
+} // namespace Detail
+
+
+// Gives the window's kit views another material set. Call it with the window
+// locked (or before it is shown); the change applies on the window's thread,
+// before its next update.
+inline void
+SetWindowSkin(BWindow* window, SkinStyle style)
+{
+	bool installed = false;
+	BList* filters = window->CommonFilterList();
+	for (int32 i = 0; filters != NULL && i < filters->CountItems(); i++) {
+		if (dynamic_cast<Detail::SkinFilter*>(
+				(BMessageFilter*)filters->ItemAt(i)) != NULL)
+			installed = true;
+	}
+	if (!installed)
+		window->AddCommonFilter(new Detail::SkinFilter);
+	BMessage message('mVsk');
+	message.AddInt32("style", style);
+	window->PostMessage(&message);
+}
+
+
 inline const Skin&
 CurrentSkin()
 {
 	static const Skin aluminium = Detail::AluminiumSkin();
 	static const Skin graphite = Detail::GraphiteSkin();
-	return IsDarkPanel() ? graphite : aluminium;
+	switch (Detail::ThreadSkin()) {
+		case B_ALUMINIUM_SKIN:
+			return aluminium;
+		case B_GRAPHITE_SKIN:
+			return graphite;
+		default:
+			return IsDarkPanel() ? graphite : aluminium;
+	}
+}
+
+
+// Whether the kit's views in this window draw graphite.
+inline bool
+IsDarkSkin()
+{
+	return Detail::ThreadSkin() == B_GRAPHITE_SKIN
+		|| (Detail::ThreadSkin() == B_PANEL_SKIN && IsDarkPanel());
 }
 
 
@@ -570,8 +565,41 @@ enum Glyph {
 	B_GLYPH_CLEAR,
 	B_GLYPH_SPEAKER,
 	B_GLYPH_SPEAKER_LOUD,
-	B_GLYPH_NOTE
+	B_GLYPH_NOTE,
+	// version 3
+	B_GLYPH_ARROW_BACK,		// filled arrows for a browser's Back and Forward
+	B_GLYPH_ARROW_FORWARD,
+	B_GLYPH_RELOAD,
+	B_GLYPH_STOP,
+	B_GLYPH_ADD,
+	B_GLYPH_PAGES,			// two pages, one over the other (open pages, tabs)
+	B_GLYPH_BOOK,			// an open book (bookmarks)
+	B_GLYPH_ACTION,			// an arrow out of a tray (share and actions)
+	B_GLYPH_CLOCK,			// history
+	B_GLYPH_FOLDER,
+	B_GLYPH_STAR,
+	B_GLYPH_GLASSES,		// reading list
+	B_GLYPH_PRIVATE,		// a hat over glasses (private browsing)
+	B_GLYPH_CHEVRON,		// a row's disclosure indicator
+	B_GLYPH_CHECK,
+	B_GLYPH_GLOBE,
+	B_GLYPH_MORE,			// three dots
+	B_GLYPH_LOCK,
+	B_GLYPH_DOWNLOAD
 };
+
+
+// The front page of B_GLYPH_PAGES in a glyph drawn in rect, where a count
+// of pages can be written.
+inline BRect
+PagesGlyphFace(BRect rect)
+{
+	float size = fminf(rect.Width(), rect.Height());
+	float h = size / 2;
+	BPoint c((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+	return BRect(c.x - h * 0.86f, c.y - h * 0.46f, c.x + h * 0.46f,
+		c.y + h * 0.86f);
+}
 
 
 inline void
@@ -729,6 +757,204 @@ DrawGlyph(BView* view, Glyph glyph, BRect rect, rgb_color color)
 			view->StrokeShape(&flag);
 			break;
 		}
+		case B_GLYPH_ARROW_BACK:
+		case B_GLYPH_ARROW_FORWARD:
+		{
+			float d = glyph == B_GLYPH_ARROW_FORWARD ? 1 : -1;
+			view->FillTriangle(BPoint(c.x + d * h * 0.62f, c.y),
+				BPoint(c.x - d * h * 0.42f, c.y - h * 0.7f),
+				BPoint(c.x - d * h * 0.42f, c.y + h * 0.7f));
+			break;
+		}
+		case B_GLYPH_RELOAD:
+		{
+			float radius = h * 0.62f;
+			view->SetPenSize(fmaxf(1.0f, roundf(size * 0.12f)));
+			view->StrokeArc(c, radius, radius, 70, 290);
+			// the arrowhead at the end of the arc, pointing on round
+			float angle = 70 * M_PI / 180;
+			BPoint tip(c.x + radius * cosf(angle), c.y - radius * sinf(angle));
+			float arrow = h * 0.36f;
+			view->FillTriangle(BPoint(tip.x - arrow * 0.9f, tip.y - arrow),
+				BPoint(tip.x - arrow * 0.9f, tip.y + arrow),
+				BPoint(tip.x + arrow * 0.8f, tip.y));
+			break;
+		}
+		case B_GLYPH_STOP:
+			view->SetPenSize(fmaxf(1.0f, roundf(size * 0.13f)));
+			view->StrokeLine(BPoint(c.x - h * 0.55f, c.y - h * 0.55f),
+				BPoint(c.x + h * 0.55f, c.y + h * 0.55f));
+			view->StrokeLine(BPoint(c.x + h * 0.55f, c.y - h * 0.55f),
+				BPoint(c.x - h * 0.55f, c.y + h * 0.55f));
+			break;
+		case B_GLYPH_ADD:
+			view->SetPenSize(fmaxf(1.0f, roundf(size * 0.14f)));
+			view->StrokeLine(BPoint(c.x, c.y - h * 0.68f),
+				BPoint(c.x, c.y + h * 0.68f));
+			view->StrokeLine(BPoint(c.x - h * 0.68f, c.y),
+				BPoint(c.x + h * 0.68f, c.y));
+			break;
+		case B_GLYPH_PAGES:
+		{
+			view->SetPenSize(fmaxf(1.0f, roundf(size * 0.09f)));
+			float radius = h * 0.14f;
+			BRect back(c.x - h * 0.5f, c.y - h * 0.82f, c.x + h * 0.82f,
+				c.y + h * 0.5f);
+			BRect front = PagesGlyphFace(rect);
+			// the page behind shows only above and to the right of the front
+			view->StrokeLine(BPoint(back.left, front.top - pen * 0.5f),
+				BPoint(back.left, back.top + radius));
+			view->StrokeLine(BPoint(back.left + radius, back.top),
+				BPoint(back.right - radius, back.top));
+			view->StrokeArc(BPoint(back.left + radius, back.top + radius),
+				radius, radius, 90, 90);
+			view->StrokeArc(BPoint(back.right - radius, back.top + radius),
+				radius, radius, 0, 90);
+			view->StrokeLine(BPoint(back.right, back.top + radius),
+				BPoint(back.right, back.bottom));
+			view->StrokeLine(BPoint(back.right, back.bottom),
+				BPoint(front.right + pen * 0.5f, back.bottom));
+			view->StrokeRoundRect(front, radius, radius);
+			break;
+		}
+		case B_GLYPH_BOOK:
+		{
+			BPoint left[4] = { BPoint(c.x - h * 0.08f, c.y - h * 0.5f),
+				BPoint(c.x - h * 0.86f, c.y - h * 0.68f),
+				BPoint(c.x - h * 0.86f, c.y + h * 0.56f),
+				BPoint(c.x - h * 0.08f, c.y + h * 0.74f) };
+			BPoint right[4] = { BPoint(c.x + h * 0.08f, c.y - h * 0.5f),
+				BPoint(c.x + h * 0.86f, c.y - h * 0.68f),
+				BPoint(c.x + h * 0.86f, c.y + h * 0.56f),
+				BPoint(c.x + h * 0.08f, c.y + h * 0.74f) };
+			view->FillPolygon(left, 4);
+			view->FillPolygon(right, 4);
+			break;
+		}
+		case B_GLYPH_ACTION:
+		{
+			view->SetPenSize(fmaxf(1.0f, roundf(size * 0.1f)));
+			float top = c.y - h * 0.18f, bottom = c.y + h * 0.82f;
+			float left = c.x - h * 0.62f, right = c.x + h * 0.62f;
+			view->StrokeLine(BPoint(left + h * 0.32f, top), BPoint(left, top));
+			view->StrokeLine(BPoint(left, top), BPoint(left, bottom));
+			view->StrokeLine(BPoint(left, bottom), BPoint(right, bottom));
+			view->StrokeLine(BPoint(right, bottom), BPoint(right, top));
+			view->StrokeLine(BPoint(right, top), BPoint(right - h * 0.32f, top));
+			view->StrokeLine(BPoint(c.x, c.y + h * 0.34f),
+				BPoint(c.x, c.y - h * 0.6f));
+			view->FillTriangle(BPoint(c.x, c.y - h * 0.92f),
+				BPoint(c.x - h * 0.34f, c.y - h * 0.5f),
+				BPoint(c.x + h * 0.34f, c.y - h * 0.5f));
+			break;
+		}
+		case B_GLYPH_CLOCK:
+			view->SetPenSize(fmaxf(1.0f, roundf(size * 0.09f)));
+			view->StrokeEllipse(c, h * 0.78f, h * 0.78f);
+			view->StrokeLine(c, BPoint(c.x, c.y - h * 0.5f));
+			view->StrokeLine(c, BPoint(c.x + h * 0.36f, c.y + h * 0.2f));
+			break;
+		case B_GLYPH_FOLDER:
+		{
+			BPoint outline[6] = { BPoint(c.x - h * 0.86f, c.y - h * 0.58f),
+				BPoint(c.x - h * 0.3f, c.y - h * 0.58f),
+				BPoint(c.x - h * 0.16f, c.y - h * 0.4f),
+				BPoint(c.x + h * 0.86f, c.y - h * 0.4f),
+				BPoint(c.x + h * 0.86f, c.y + h * 0.66f),
+				BPoint(c.x - h * 0.86f, c.y + h * 0.66f) };
+			view->FillPolygon(outline, 6);
+			break;
+		}
+		case B_GLYPH_STAR:
+		{
+			BPoint points[10];
+			for (int i = 0; i < 10; i++) {
+				float radius = (i % 2) == 0 ? h * 0.92f : h * 0.38f;
+				float angle = (-90 + i * 36) * M_PI / 180;
+				points[i] = BPoint(c.x + radius * cosf(angle),
+					c.y + h * 0.08f + radius * sinf(angle));
+			}
+			view->FillPolygon(points, 10);
+			break;
+		}
+		case B_GLYPH_GLASSES:
+		case B_GLYPH_PRIVATE:
+		{
+			bool hat = glyph == B_GLYPH_PRIVATE;
+			float y = hat ? c.y + h * 0.42f : c.y + h * 0.1f;
+			float radius = h * 0.3f;
+			view->SetPenSize(fmaxf(1.0f, roundf(size * 0.08f)));
+			view->StrokeEllipse(BPoint(c.x - h * 0.46f, y), radius, radius);
+			view->StrokeEllipse(BPoint(c.x + h * 0.46f, y), radius, radius);
+			view->StrokeArc(BPoint(c.x, y), h * 0.16f, h * 0.12f, 20, 140);
+			if (hat) {
+				BPoint crown[4] = { BPoint(c.x - h * 0.5f, c.y - h * 0.08f),
+					BPoint(c.x - h * 0.36f, c.y - h * 0.8f),
+					BPoint(c.x + h * 0.36f, c.y - h * 0.8f),
+					BPoint(c.x + h * 0.5f, c.y - h * 0.08f) };
+				view->FillPolygon(crown, 4);
+				view->FillRect(BRect(c.x - h * 0.92f, c.y - h * 0.16f,
+					c.x + h * 0.92f, c.y - h * 0.02f));
+			} else {
+				view->StrokeLine(BPoint(c.x - h * 0.76f, y),
+					BPoint(c.x - h * 0.94f, y - h * 0.3f));
+				view->StrokeLine(BPoint(c.x + h * 0.76f, y),
+					BPoint(c.x + h * 0.94f, y - h * 0.3f));
+			}
+			break;
+		}
+		case B_GLYPH_CHEVRON:
+			view->SetPenSize(fmaxf(1.0f, roundf(size * 0.14f)));
+			view->StrokeLine(BPoint(c.x - h * 0.24f, c.y - h * 0.56f),
+				BPoint(c.x + h * 0.3f, c.y));
+			view->StrokeLine(BPoint(c.x + h * 0.3f, c.y),
+				BPoint(c.x - h * 0.24f, c.y + h * 0.56f));
+			break;
+		case B_GLYPH_CHECK:
+			view->SetPenSize(fmaxf(1.0f, roundf(size * 0.15f)));
+			view->StrokeLine(BPoint(c.x - h * 0.66f, c.y + h * 0.02f),
+				BPoint(c.x - h * 0.2f, c.y + h * 0.5f));
+			view->StrokeLine(BPoint(c.x - h * 0.2f, c.y + h * 0.5f),
+				BPoint(c.x + h * 0.7f, c.y - h * 0.56f));
+			break;
+		case B_GLYPH_GLOBE:
+			view->SetPenSize(fmaxf(1.0f, roundf(size * 0.07f)));
+			view->StrokeEllipse(c, h * 0.8f, h * 0.8f);
+			view->StrokeEllipse(c, h * 0.34f, h * 0.8f);
+			view->StrokeLine(BPoint(c.x - h * 0.8f, c.y),
+				BPoint(c.x + h * 0.8f, c.y));
+			view->StrokeLine(BPoint(c.x, c.y - h * 0.8f),
+				BPoint(c.x, c.y + h * 0.8f));
+			break;
+		case B_GLYPH_MORE:
+			for (int i = -1; i <= 1; i++) {
+				view->FillEllipse(BPoint(c.x + i * h * 0.62f, c.y), h * 0.17f,
+					h * 0.17f);
+			}
+			break;
+		case B_GLYPH_LOCK:
+		{
+			view->FillRoundRect(BRect(c.x - h * 0.6f, c.y - h * 0.1f,
+				c.x + h * 0.6f, c.y + h * 0.78f), h * 0.12f, h * 0.12f);
+			view->SetPenSize(fmaxf(1.0f, roundf(size * 0.11f)));
+			view->StrokeArc(BPoint(c.x, c.y - h * 0.36f), h * 0.38f,
+				h * 0.4f, 0, 180);
+			view->StrokeLine(BPoint(c.x - h * 0.38f, c.y - h * 0.36f),
+				BPoint(c.x - h * 0.38f, c.y - h * 0.1f));
+			view->StrokeLine(BPoint(c.x + h * 0.38f, c.y - h * 0.36f),
+				BPoint(c.x + h * 0.38f, c.y - h * 0.1f));
+			break;
+		}
+		case B_GLYPH_DOWNLOAD:
+			view->SetPenSize(fmaxf(1.0f, roundf(size * 0.12f)));
+			view->StrokeLine(BPoint(c.x, c.y - h * 0.8f),
+				BPoint(c.x, c.y + h * 0.2f));
+			view->FillTriangle(BPoint(c.x, c.y + h * 0.5f),
+				BPoint(c.x - h * 0.4f, c.y + h * 0.05f),
+				BPoint(c.x + h * 0.4f, c.y + h * 0.05f));
+			view->StrokeLine(BPoint(c.x - h * 0.7f, c.y + h * 0.8f),
+				BPoint(c.x + h * 0.7f, c.y + h * 0.8f));
+			break;
 		case B_GLYPH_NONE:
 			break;
 	}
@@ -751,15 +977,42 @@ public:
 	explicit MetalBar(const char* name, BarPosition position = B_MOBILE_TOP_BAR)
 		:
 		Bar(name),
-		fPosition(position)
+		fPosition(position),
+		fProgress(-1)
 	{
-		SetFlags(Flags() | B_WILL_DRAW | B_FULL_UPDATE_ON_RESIZE);
+		SetFlags(Flags() | B_WILL_DRAW | B_FULL_UPDATE_ON_RESIZE
+			| B_DRAW_ON_CHILDREN);
 		SetViewColor(B_TRANSPARENT_COLOR);
 		float inset = ceilf(be_plain_font->Size() * 0.5f);
 		GroupLayout()->SetInsets(inset, 1, inset, 1);
 	}
 
 	BarPosition Position() const { return fPosition; }
+
+	// A loading progress line along the edge towards the content: 0 to 1,
+	// or below 0 to hide it.
+	void SetProgress(float progress)
+	{
+		if (progress >= 1)
+			progress = -1;
+		if (progress == fProgress)
+			return;
+		fProgress = progress;
+		BRect bounds = Bounds();
+		float thickness = ProgressThickness();
+		Invalidate(fPosition == B_MOBILE_TOP_BAR
+			? BRect(bounds.left, bounds.bottom - thickness, bounds.right,
+				bounds.bottom)
+			: BRect(bounds.left, bounds.top, bounds.right,
+				bounds.top + thickness));
+	}
+
+	float Progress() const { return fProgress; }
+
+	static float ProgressThickness()
+	{
+		return fmaxf(2.0f, ceilf(be_plain_font->Size() / 4));
+	}
 
 	virtual void Draw(BRect update)
 	{
@@ -781,10 +1034,34 @@ public:
 				BPoint(bounds.right, bounds.top + 1));
 		}
 		PopState();
+		_DrawProgress();
+	}
+
+	virtual void DrawAfterChildren(BRect update)
+	{
+		_DrawProgress();
 	}
 
 private:
+	void _DrawProgress()
+	{
+		if (fProgress < 0)
+			return;
+		const Skin& skin = CurrentSkin();
+		BRect bounds = Bounds();
+		float thickness = ProgressThickness();
+		BRect line = fPosition == B_MOBILE_TOP_BAR
+			? BRect(bounds.left, bounds.bottom - thickness + 1, bounds.right,
+				bounds.bottom)
+			: BRect(bounds.left, bounds.top, bounds.right,
+				bounds.top + thickness - 1);
+		line.right = line.left + floorf(line.Width()
+			* fmaxf(0.04f, fProgress));
+		FillGradient(this, line, skin.fillTop, skin.fillBottom);
+	}
+
 	BarPosition fPosition;
+	float fProgress;
 };
 
 
@@ -1163,7 +1440,8 @@ private:
 enum ButtonShape {
 	B_ROUNDED_BUTTON,	// a plain bar button
 	B_PILL_BUTTON,		// fully round ends
-	B_BACK_BUTTON		// pointed on the left, for drill-down navigation
+	B_BACK_BUTTON,		// pointed on the left, for drill-down navigation
+	B_PLAIN_BUTTON		// no plate: a glyph cut into the bar (toolbars)
 };
 
 
@@ -1183,6 +1461,27 @@ public:
 	}
 
 	void SetGlyph(Glyph glyph) { fGlyph = glyph; InvalidateLayout(); Invalidate(); }
+	Glyph GetGlyph() const { return fGlyph; }
+
+	// Short text written inside the glyph, such as the count of open pages
+	// on B_GLYPH_PAGES.
+	void SetGlyphText(const char* text)
+	{
+		if (fGlyphText == text)
+			return;
+		fGlyphText = text;
+		Invalidate();
+	}
+
+	// A highlighted button (a plain one glows, others look pressed in), for
+	// a mode that is on.
+	void SetHighlighted(bool highlighted)
+	{
+		if (fHighlighted == highlighted)
+			return;
+		fHighlighted = highlighted;
+		Invalidate();
+	}
 
 	virtual void SetLabel(const char* label)
 	{
@@ -1201,6 +1500,8 @@ public:
 			width += ControlHeight() * 0.6f;
 		if (fShape == B_BACK_BUTTON)
 			width += ControlHeight() * 0.3f;
+		if (fShape == B_PLAIN_BUTTON && (Label() == NULL || Label()[0] == '\0'))
+			width = TargetSize() * 1.1f;
 		return BLayoutUtils::ComposeSize(ExplicitMinSize(),
 			BSize(ceilf(fmaxf(width, TargetSize())), TargetSize()));
 	}
@@ -1220,11 +1521,26 @@ public:
 		const Skin& skin = CurrentSkin();
 		FillBarBehind(this, update);
 		BRect plate = VisibleRect(Bounds());
-		bool down = fPressed && fInside;
+		bool down = (fPressed && fInside) || fHighlighted;
 		rgb_color top = down ? skin.pressedTop : skin.controlTop;
 		rgb_color bottom = down ? skin.pressedBottom : skin.controlBottom;
 		BRect content = plate;
-		if (fShape == B_BACK_BUTTON) {
+		if (fShape == B_PLAIN_BUTTON) {
+			if (down) {
+				// the glow of a pressed toolbar button
+				PushState();
+				SetDrawingMode(B_OP_ALPHA);
+				SetBlendingMode(B_CONSTANT_ALPHA, B_ALPHA_OVERLAY);
+				BPoint middle((plate.left + plate.right) / 2,
+					(plate.top + plate.bottom) / 2);
+				float radius = plate.Height() * 0.62f;
+				for (int i = 4; i >= 1; i--) {
+					SetHighColor(255, 255, 255, IsDarkSkin() ? 22 : 40);
+					FillEllipse(middle, radius * i / 4, radius * i / 4);
+				}
+				PopState();
+			}
+		} else if (fShape == B_BACK_BUTTON) {
 			float point = floorf(plate.Height() * 0.3f);
 			PushState();
 			SetDrawingMode(B_OP_ALPHA);
@@ -1260,7 +1576,8 @@ public:
 		BFont font(be_bold_font);
 		font.SetSize(be_plain_font->Size());
 		SetFont(&font);
-		float glyph = floorf(plate.Height() * 0.5f);
+		float glyph = floorf(plate.Height()
+			* (fShape == B_PLAIN_BUTTON ? 0.66f : 0.5f));
 		bool hasLabel = Label() != NULL && Label()[0] != '\0';
 		if (fGlyph != B_GLYPH_NONE) {
 			float labelWidth = hasLabel ? font.StringWidth(Label())
@@ -1269,8 +1586,20 @@ public:
 				- glyph - labelWidth) / 2);
 			BRect box(left, floorf((plate.top + plate.bottom - glyph) / 2),
 				left + glyph, floorf((plate.top + plate.bottom + glyph) / 2));
+			rgb_color glyphColor = text;
+			if (fShape == B_PLAIN_BUTTON && fHighlighted)
+				glyphColor = skin.displayActive;
 			DrawGlyph(this, fGlyph, box.OffsetByCopy(0, 1), skin.controlEmboss);
-			DrawGlyph(this, fGlyph, box, text);
+			DrawGlyph(this, fGlyph, box, glyphColor);
+			if (!fGlyphText.IsEmpty()) {
+				BRect face = fGlyph == B_GLYPH_PAGES ? PagesGlyphFace(box) : box;
+				BFont small(be_bold_font);
+				small.SetSize(fmaxf(7.0f, face.Height() * 0.62f));
+				SetFont(&small);
+				DrawCentered(this, fGlyphText.String(), face.OffsetByCopy(0, 0.5f),
+					glyphColor, skin.controlEmboss);
+				SetFont(&font);
+			}
 			content.left = box.right + glyph * 0.4f;
 			if (hasLabel) {
 				content.right = content.left + labelWidth;
@@ -1351,6 +1680,8 @@ private:
 	Glyph fGlyph;
 	bool fPressed;
 	bool fInside;
+	bool fHighlighted = false;
+	BString fGlyphText;
 };
 
 
@@ -2435,6 +2766,1887 @@ DrawReflection(BView* view, const BBitmap* bitmap, BRect rect, float depth,
 		B_FILTER_BITMAP_BILINEAR);
 	view->PopState();
 }
+
+// #pragma mark - TitleView (version 3)
+
+// The title of a page in a MetalBar, engraved into the metal and centred.
+// It takes the space between the bar's buttons; the text is truncated.
+class TitleView : public BView {
+public:
+	explicit TitleView(const char* name, const char* title = NULL)
+		:
+		BView(name, B_WILL_DRAW | B_FULL_UPDATE_ON_RESIZE),
+		fTitle(title)
+	{
+		SetViewColor(B_TRANSPARENT_COLOR);
+	}
+
+	void SetTitle(const char* title)
+	{
+		if (fTitle == title)
+			return;
+		fTitle = title;
+		Invalidate();
+	}
+
+	const char* Title() const { return fTitle.String(); }
+
+	virtual BSize MinSize()
+	{
+		return BLayoutUtils::ComposeSize(ExplicitMinSize(),
+			BSize(TargetSize(), TargetSize()));
+	}
+
+	virtual BSize MaxSize()
+	{
+		return BLayoutUtils::ComposeSize(ExplicitMaxSize(),
+			BSize(B_SIZE_UNLIMITED, TargetSize()));
+	}
+
+	virtual void Draw(BRect update)
+	{
+		const Skin& skin = CurrentSkin();
+		FillBarBehind(this, update);
+		BFont font(be_bold_font);
+		font.SetSize(ceilf(be_plain_font->Size() * 1.25f));
+		SetFont(&font);
+		DrawCentered(this, fTitle.String(), Bounds().InsetByCopy(4, 0),
+			skin.controlText, skin.controlEmboss);
+	}
+
+private:
+	BString fTitle;
+};
+
+
+// #pragma mark - TableView (version 3)
+
+enum RowAccessory {
+	B_ROW_NO_ACCESSORY,
+	B_ROW_CHEVRON,		// the row opens a page with more
+	B_ROW_CHECK			// the row is the chosen one
+};
+
+
+// A row of a TableView: a picture (a bitmap, which is copied, or a glyph),
+// a title, an optional detail line under it and an accessory on the right.
+// A tap sends the row's message with "index" to the table's target.
+class TableRow : public BListItem {
+public:
+	TableRow(const char* title, const char* detail = NULL,
+		BMessage* message = NULL)
+		:
+		fTitle(title),
+		fDetail(detail),
+		fMessage(message),
+		fDeleteMessage(NULL),
+		fIcon(NULL),
+		fGlyph(B_GLYPH_NONE),
+		fAccessory(B_ROW_NO_ACCESSORY),
+		fHeader(false)
+	{
+		fTint = MakeTint();
+	}
+
+	virtual ~TableRow()
+	{
+		delete fMessage;
+		delete fDeleteMessage;
+		delete fIcon;
+	}
+
+	static rgb_color MakeTint()
+	{
+		rgb_color tint = { 108, 112, 120, 255 };
+		return tint;
+	}
+
+	const char* Title() const { return fTitle.String(); }
+	const char* Detail() const { return fDetail.String(); }
+	void SetTitle(const char* title) { fTitle = title; }
+	void SetDetail(const char* detail) { fDetail = detail; }
+	BMessage* Message() const { return fMessage; }
+	void SetMessage(BMessage* message) { delete fMessage; fMessage = message; }
+
+	// The message sent when the row is deleted in editing mode; rows
+	// without one cannot be deleted.
+	void SetDeleteMessage(BMessage* message)
+	{
+		delete fDeleteMessage;
+		fDeleteMessage = message;
+	}
+	BMessage* DeleteMessage() const { return fDeleteMessage; }
+
+	void SetIcon(const BBitmap* icon)
+	{
+		delete fIcon;
+		fIcon = icon != NULL ? new BBitmap(icon) : NULL;
+	}
+
+	void SetGlyph(Glyph glyph, rgb_color tint = MakeTint())
+	{
+		fGlyph = glyph;
+		fTint = tint;
+	}
+
+	void SetAccessory(RowAccessory accessory) { fAccessory = accessory; }
+	RowAccessory Accessory() const { return fAccessory; }
+
+	// A section header: a strip with small capitals, not a tappable row.
+	void SetHeader(bool header) { fHeader = header; }
+	bool IsHeader() const { return fHeader; }
+
+	virtual void Update(BView* owner, const BFont* font)
+	{
+		BListItem::Update(owner, font);
+		float size = be_plain_font->Size();
+		if (fHeader)
+			SetHeight(ceilf(size * 2.0f));
+		else if (fDetail.IsEmpty())
+			SetHeight(fmaxf(TargetSize(), ceilf(size * 3.6f)));
+		else
+			SetHeight(fmaxf(TargetSize(), ceilf(size * 4.4f)));
+	}
+
+	virtual void DrawItem(BView* owner, BRect frame, bool complete = false);
+
+private:
+	BString fTitle;
+	BString fDetail;
+	BMessage* fMessage;
+	BMessage* fDeleteMessage;
+	BBitmap* fIcon;
+	Glyph fGlyph;
+	rgb_color fTint;
+	RowAccessory fAccessory;
+	bool fHeader;
+};
+
+
+// A touch list after the tables of early iPhones: tall rows with pictures,
+// a blue highlight under the finger, disclosure chevrons and an editing mode
+// in which a red button before a row offers to delete it. Put it in Scroll()
+// for flick scrolling. Rows are TableRows; the table owns them.
+class TableView : public BListView {
+public:
+	explicit TableView(const char* name)
+		:
+		BListView(name, B_SINGLE_SELECTION_LIST, B_WILL_DRAW | B_NAVIGABLE
+			| B_FULL_UPDATE_ON_RESIZE | B_FRAME_EVENTS),
+		fEditing(false),
+		fConfirm(-1),
+		fDown(-1)
+	{
+	}
+
+	virtual ~TableView()
+	{
+		RemoveRows();
+	}
+
+	// Rows send their messages to the table's target (BInvoker::SetTarget),
+	// or else to the window.
+
+	void RemoveRows()
+	{
+		while (BListItem* item = RemoveItem((int32)0))
+			delete item;
+		fConfirm = fDown = -1;
+	}
+
+	TableRow* RowAt(int32 index) const
+	{
+		return dynamic_cast<TableRow*>(ItemAt(index));
+	}
+
+	// Editing: each row with a delete message gets a red button before it.
+	void SetEditing(bool editing)
+	{
+		if (fEditing == editing)
+			return;
+		fEditing = editing;
+		fConfirm = -1;
+		Invalidate();
+	}
+	bool IsEditing() const { return fEditing; }
+
+	// Text shown in the middle while the table has no rows.
+	void SetEmptyText(const char* text) { fEmpty = text; Invalidate(); }
+
+	int32 ConfirmingRow() const { return fConfirm; }
+
+	BRect DeleteButtonRect(BRect frame) const
+	{
+		BFont font(be_bold_font);
+		float width = font.StringWidth("Delete") + be_plain_font->Size() * 2;
+		float height = fminf(frame.Height() - 10, ControlHeight());
+		float top = floorf((frame.top + frame.bottom - height) / 2);
+		return BRect(frame.right - width - 8, top, frame.right - 8,
+			top + height);
+	}
+
+	BRect MinusRect(BRect frame) const
+	{
+		float size = ceilf(be_plain_font->Size() * 1.6f);
+		float top = floorf((frame.top + frame.bottom - size) / 2);
+		float left = frame.left + ceilf(be_plain_font->Size() * 0.8f);
+		return BRect(left, top, left + size, top + size);
+	}
+
+	virtual void Draw(BRect update)
+	{
+		BListView::Draw(update);
+		if (CountItems() == 0 && !fEmpty.IsEmpty()) {
+			SetHighColor(ui_color(B_LIST_BACKGROUND_COLOR));
+			FillRect(update);
+			rgb_color text = ui_color(B_LIST_ITEM_TEXT_COLOR);
+			text.alpha = 140;
+			BFont font(be_bold_font);
+			font.SetSize(ceilf(be_plain_font->Size() * 1.2f));
+			SetFont(&font);
+			BRect area = Bounds();
+			area.bottom = area.top + TargetSize() * 3;
+			PushState();
+			SetDrawingMode(B_OP_ALPHA);
+			SetHighColor(text);
+			BString shown(fEmpty);
+			font.TruncateString(&shown, B_TRUNCATE_END, area.Width() - 16);
+			DrawString(shown.String(), BPoint(floorf((area.left + area.right
+				- font.StringWidth(shown.String())) / 2), area.bottom));
+			PopState();
+		}
+	}
+
+	virtual void MouseDown(BPoint where)
+	{
+		MakeFocus(true);
+		BMessage* event = Window()->CurrentMessage();
+		if (event != NULL && (event->GetInt32("buttons", B_PRIMARY_MOUSE_BUTTON)
+				& B_PRIMARY_MOUSE_BUTTON) == 0) {
+			BListView::MouseDown(where);
+			return;
+		}
+		int32 index = IndexOf(where);
+		TableRow* row = RowAt(index);
+		fDown = -1;
+		if (row == NULL || row->IsHeader()) {
+			if (fConfirm >= 0)
+				_SetConfirm(-1);
+			return;
+		}
+		BRect frame = ItemFrame(index);
+		if (fEditing && row->DeleteMessage() != NULL) {
+			if (fConfirm == index
+				&& DeleteButtonRect(frame).InsetByCopy(-4, -4).Contains(where)) {
+				fDown = index;
+				fDownOnDelete = true;
+				return;
+			}
+			if (MinusRect(frame).InsetByCopy(-8, -8).Contains(where)) {
+				_SetConfirm(fConfirm == index ? -1 : index);
+				return;
+			}
+		}
+		if (fConfirm >= 0) {
+			_SetConfirm(-1);
+			return;
+		}
+		fDown = index;
+		fDownOnDelete = false;
+		Select(index);
+		SetMouseEventMask(B_POINTER_EVENTS, B_NO_POINTER_HISTORY);
+	}
+
+	virtual void MouseMoved(BPoint where, uint32 transit, const BMessage* drag)
+	{
+		if (fDown >= 0 && !fDownOnDelete && IndexOf(where) != fDown) {
+			DeselectAll();
+			fDown = -1;
+		}
+		BListView::MouseMoved(where, transit, drag);
+	}
+
+	virtual void MouseUp(BPoint where)
+	{
+		int32 index = fDown;
+		fDown = -1;
+		if (index < 0 || IndexOf(where) != index)
+			return;
+		TableRow* row = RowAt(index);
+		if (row == NULL)
+			return;
+		if (fDownOnDelete) {
+			fConfirm = -1;
+			_Send(row->DeleteMessage(), index);
+			return;
+		}
+		_Send(row->Message(), index);
+		// The highlight stays a moment, then goes, as on the phone.
+		DeselectAll();
+	}
+
+	virtual bool InitiateDrag(BPoint, int32, bool) { return false; }
+
+	virtual status_t Invoke(BMessage* message = NULL)
+	{
+		int32 index = CurrentSelection();
+		TableRow* row = RowAt(index);
+		if (message == NULL && row != NULL && row->Message() != NULL) {
+			_Send(row->Message(), index);
+			return B_OK;
+		}
+		return BListView::Invoke(message);
+	}
+
+	virtual void KeyDown(const char* bytes, int32 numBytes)
+	{
+		if (numBytes == 1 && bytes[0] == B_DELETE && fEditing) {
+			TableRow* row = RowAt(CurrentSelection());
+			if (row != NULL && row->DeleteMessage() != NULL) {
+				_Send(row->DeleteMessage(), CurrentSelection());
+				return;
+			}
+		}
+		BListView::KeyDown(bytes, numBytes);
+	}
+
+private:
+	void _SetConfirm(int32 index)
+	{
+		if (fConfirm >= 0)
+			InvalidateItem(fConfirm);
+		fConfirm = index;
+		if (fConfirm >= 0)
+			InvalidateItem(fConfirm);
+	}
+
+	void _Send(const BMessage* source, int32 index)
+	{
+		if (source == NULL)
+			return;
+		BMessage message(*source);
+		message.AddInt32("index", index);
+		message.AddPointer("source", this);
+		BMessenger target = Messenger().IsValid() ? Messenger()
+			: BMessenger(Window());
+		target.SendMessage(&message);
+	}
+
+	bool fEditing;
+	int32 fConfirm;
+	int32 fDown;
+	bool fDownOnDelete = false;
+	BString fEmpty;
+};
+
+
+inline void
+TableRow::DrawItem(BView* owner, BRect frame, bool /*complete*/)
+{
+	const Skin& skin = CurrentSkin();
+	TableView* table = dynamic_cast<TableView*>(owner);
+	float size = be_plain_font->Size();
+	rgb_color background = ui_color(B_LIST_BACKGROUND_COLOR);
+	rgb_color text = ui_color(B_LIST_ITEM_TEXT_COLOR);
+	owner->PushState();
+	if (fHeader) {
+		// a strip of brushed metal with the section's name
+		FillGradient(owner, frame, MixColors(skin.barTop, background, 0.3f),
+			MixColors(skin.barBottom, background, 0.45f));
+		owner->SetHighColor(MixColors(skin.barEdge, background, 0.6f));
+		owner->StrokeLine(frame.LeftBottom(), frame.RightBottom());
+		BFont font(be_bold_font);
+		owner->SetFont(&font);
+		font_height height;
+		font.GetHeight(&height);
+		DrawEngraved(owner, fTitle.String(), BPoint(frame.left + size,
+			floorf((frame.top + frame.bottom + height.ascent
+				- height.descent) / 2)), skin.controlText, skin.controlEmboss);
+		owner->PopState();
+		return;
+	}
+	bool selected = IsSelected();
+	if (selected) {
+		FillGradient(owner, frame, skin.fillTop, skin.fillBottom);
+		text = make_color(255, 255, 255);
+	} else {
+		owner->SetHighColor(background);
+		owner->FillRect(frame);
+	}
+	// the separator under the row
+	owner->SetHighColor(MixColors(background, text, 0.16f));
+	owner->StrokeLine(BPoint(frame.left, frame.bottom),
+		BPoint(frame.right, frame.bottom));
+	float left = frame.left + size;
+	bool editing = table != NULL && table->IsEditing() && fDeleteMessage != NULL;
+	int32 index = table != NULL ? table->IndexOf(this) : -1;
+	bool confirming = editing && table->ConfirmingRow() == index;
+	if (editing) {
+		BRect minus = table->MinusRect(frame);
+		owner->SetDrawingMode(B_OP_ALPHA);
+		owner->SetHighColor(make_color(150, 20, 20));
+		owner->FillEllipse(minus);
+		FillGradient(owner, minus.InsetByCopy(1, 1), make_color(240, 92, 86),
+			make_color(204, 30, 26), minus.Width() / 2);
+		owner->SetHighColor(255, 255, 255);
+		owner->SetPenSize(fmaxf(2.0f, roundf(minus.Height() / 7)));
+		if (confirming) {
+			// the minus turns upright while the Delete button shows
+			owner->StrokeLine(BPoint((minus.left + minus.right) / 2,
+				minus.top + minus.Height() * 0.26f),
+				BPoint((minus.left + minus.right) / 2,
+					minus.bottom - minus.Height() * 0.26f));
+		} else {
+			owner->StrokeLine(BPoint(minus.left + minus.Width() * 0.26f,
+				(minus.top + minus.bottom) / 2),
+				BPoint(minus.right - minus.Width() * 0.26f,
+					(minus.top + minus.bottom) / 2));
+		}
+		owner->SetPenSize(1);
+		left = minus.right + size * 0.8f;
+	}
+	float picture = ceilf(fminf(frame.Height() - size, size * 2.2f));
+	BRect box(left, floorf((frame.top + frame.bottom - picture) / 2),
+		left + picture, floorf((frame.top + frame.bottom + picture) / 2));
+	if (fIcon != NULL) {
+		owner->SetDrawingMode(B_OP_ALPHA);
+		owner->SetBlendingMode(B_PIXEL_ALPHA, B_ALPHA_OVERLAY);
+		BRect source = fIcon->Bounds();
+		float scale = fminf(box.Width() / (source.Width() + 1),
+			box.Height() / (source.Height() + 1));
+		float width = (source.Width() + 1) * scale;
+		float height = (source.Height() + 1) * scale;
+		BRect target(0, 0, width - 1, height - 1);
+		target.OffsetTo(floorf((box.left + box.right - width) / 2),
+			floorf((box.top + box.bottom - height) / 2));
+		owner->DrawBitmap(fIcon, source, target, B_FILTER_BITMAP_BILINEAR);
+		left = box.right + size * 0.8f;
+	} else if (fGlyph != B_GLYPH_NONE) {
+		DrawGlyph(owner, fGlyph, box.InsetByCopy(picture * 0.12f,
+			picture * 0.12f), selected ? text : fTint);
+		left = box.right + size * 0.8f;
+	}
+	float right = frame.right - size;
+	if (confirming) {
+		BRect button = table->DeleteButtonRect(frame);
+		DrawPlate(owner, button, ceilf(button.Height() / 6),
+			make_color(236, 84, 78), make_color(190, 24, 20));
+		BFont bold(be_bold_font);
+		owner->SetFont(&bold);
+		DrawCentered(owner, "Delete", button, make_color(255, 255, 255),
+			make_color(0, 0, 0, 110));
+		right = button.left - size * 0.5f;
+	} else if (fAccessory == B_ROW_CHEVRON || fAccessory == B_ROW_CHECK) {
+		float glyph = ceilf(size * (fAccessory == B_ROW_CHEVRON ? 1.1f : 1.4f));
+		BRect accessory(right - glyph, floorf((frame.top + frame.bottom
+			- glyph) / 2), right, floorf((frame.top + frame.bottom
+				+ glyph) / 2));
+		rgb_color color = fAccessory == B_ROW_CHECK ? skin.displayActive
+			: MixColors(background, text, 0.45f);
+		if (selected)
+			color = text;
+		DrawGlyph(owner, fAccessory == B_ROW_CHEVRON ? B_GLYPH_CHEVRON
+			: B_GLYPH_CHECK, accessory, color);
+		right = accessory.left - size * 0.6f;
+	}
+	BFont title(be_bold_font);
+	title.SetSize(ceilf(size * 1.15f));
+	BFont detail(be_plain_font);
+	font_height titleHeight, detailHeight;
+	title.GetHeight(&titleHeight);
+	detail.GetHeight(&detailHeight);
+	float width = fmaxf(0.0f, right - left);
+	BString shownTitle(fTitle), shownDetail(fDetail);
+	title.TruncateString(&shownTitle, B_TRUNCATE_END, width);
+	detail.TruncateString(&shownDetail, B_TRUNCATE_MIDDLE, width);
+	float block = titleHeight.ascent + titleHeight.descent;
+	if (!fDetail.IsEmpty())
+		block += detailHeight.ascent + detailHeight.descent + size * 0.2f;
+	float baseline = floorf((frame.top + frame.bottom - block) / 2
+		+ titleHeight.ascent);
+	owner->SetDrawingMode(B_OP_ALPHA);
+	owner->SetLowColor(selected ? skin.fillTop : background);
+	owner->SetFont(&title);
+	owner->SetHighColor(text);
+	owner->DrawString(shownTitle.String(), BPoint(left, baseline));
+	if (!fDetail.IsEmpty()) {
+		owner->SetFont(&detail);
+		owner->SetHighColor(selected ? text : MixColors(background, text, 0.6f));
+		owner->DrawString(shownDetail.String(), BPoint(left, baseline
+			+ titleHeight.descent + size * 0.2f + detailHeight.ascent));
+	}
+	owner->PopState();
+}
+
+
+// #pragma mark - CardGrid (version 3)
+
+// A grid of cards, each a picture of a page under a strip with its icon, its
+// title and a close button, as a browser shows its open tabs. Tap a card to
+// open it; tap ✕ or swipe the card sideways off the grid to close it. The
+// grid scrolls vertically in Scroll(); give it the aspect of the pictures.
+// The open and close messages go with "id" (int64) and "index".
+class CardGrid : public BView {
+public:
+	CardGrid(const char* name, BMessage* open, BMessage* close)
+		:
+		BView(name, B_WILL_DRAW | B_FRAME_EVENTS | B_FULL_UPDATE_ON_RESIZE
+			| B_NAVIGABLE),
+		fOpen(open),
+		fClose(close),
+		fSelected(0),
+		fAspect(1.4f),
+		fColumns(2),
+		fDown(-1),
+		fDownOnClose(false),
+		fSwiping(-1),
+		fSwipe(0)
+	{
+		SetViewColor(B_TRANSPARENT_COLOR);
+	}
+
+	virtual ~CardGrid()
+	{
+		RemoveCards();
+		delete fOpen;
+		delete fClose;
+	}
+
+	void SetTarget(const BMessenger& target) { fTarget = target; }
+
+	// The pictures are copied; either may be NULL.
+	int32 AddCard(int64 id, const char* title, const BBitmap* picture,
+		const BBitmap* icon)
+	{
+		Card card;
+		card.id = id;
+		card.title = title;
+		card.picture = picture != NULL ? new BBitmap(picture) : NULL;
+		card.icon = icon != NULL ? new BBitmap(icon) : NULL;
+		fCards.push_back(card);
+		_Relayout();
+		return (int32)fCards.size() - 1;
+	}
+
+	void RemoveCards()
+	{
+		for (size_t i = 0; i < fCards.size(); i++) {
+			delete fCards[i].picture;
+			delete fCards[i].icon;
+		}
+		fCards.clear();
+		fDown = fSwiping = -1;
+		fSwipe = 0;
+		_Relayout();
+	}
+
+	int32 CountCards() const { return (int32)fCards.size(); }
+
+	// The card drawn with a ring around it (the page on show).
+	void SetSelected(int64 id) { fSelected = id; Invalidate(); }
+
+	// Height of a picture over its width.
+	void SetAspect(float aspect)
+	{
+		if (aspect > 0.2f && aspect < 5 && aspect != fAspect) {
+			fAspect = aspect;
+			_Relayout();
+		}
+	}
+
+	// What the grid says while it has no cards: a glyph over a heading and
+	// lines of explanation (separated by newlines).
+	void SetEmptyText(const char* text, Glyph glyph = B_GLYPH_NONE)
+	{
+		fEmpty = text;
+		fEmptyGlyph = glyph;
+		Invalidate();
+	}
+
+	void ScrollToSelected()
+	{
+		for (size_t i = 0; i < fCards.size(); i++) {
+			if (fCards[i].id != fSelected)
+				continue;
+			BRect card = CardRect(i);
+			BRect bounds = Bounds();
+			if (card.top < bounds.top || card.bottom > bounds.bottom) {
+				float top = fmaxf(0.0f, card.top - _Gap());
+				ScrollTo(0, fminf(top, fmaxf(0.0f, _ContentHeight()
+					- bounds.Height())));
+			}
+			return;
+		}
+	}
+
+	BRect CardRect(int32 index) const
+	{
+		float gap = _Gap();
+		float width = Bounds().Width() + 1;
+		float cardWidth = floorf((width - gap * (fColumns + 1)) / fColumns);
+		float cardHeight = _CardHeight(cardWidth);
+		int32 row = index / fColumns, column = index % fColumns;
+		BRect rect(0, 0, cardWidth - 1, cardHeight - 1);
+		rect.OffsetTo(gap + column * (cardWidth + gap),
+			gap + row * (cardHeight + gap));
+		if (index == fSwiping)
+			rect.OffsetBy(fSwipe, 0);
+		return rect;
+	}
+
+	virtual void FrameResized(float /*width*/, float /*height*/)
+	{
+		_Relayout();
+	}
+
+	virtual void AttachedToWindow()
+	{
+		BView::AttachedToWindow();
+		_Relayout();
+	}
+
+	virtual void Draw(BRect update)
+	{
+		const Skin& skin = CurrentSkin();
+		BRect bounds = Bounds();
+		// a cloth-coloured table under the cards
+		BRect table = bounds;
+		FillGradient(this, table, MixColors(skin.barBottom, skin.stage, 0.25f),
+			MixColors(skin.barBottom, skin.stage, 0.5f));
+		PushState();
+		SetDrawingMode(B_OP_ALPHA);
+		SetHighColor(255, 255, 255, 10);
+		for (float y = floorf(update.top / 3) * 3; y <= update.bottom; y += 3)
+			StrokeLine(BPoint(update.left, y), BPoint(update.right, y));
+		PopState();
+		if (fCards.empty() && !fEmpty.IsEmpty())
+			_DrawEmpty(bounds);
+		for (size_t i = 0; i < fCards.size(); i++) {
+			BRect card = CardRect(i);
+			if (card.InsetByCopy(-8, -8).Intersects(update))
+				_DrawCard(i, card);
+		}
+	}
+
+	virtual void MouseDown(BPoint where)
+	{
+		MakeFocus(true);
+		fDown = _CardAt(where);
+		fDownOnClose = fDown >= 0
+			&& _CloseRect(CardRect(fDown)).InsetByCopy(-6, -6).Contains(where);
+		if (fDown >= 0) {
+			SetMouseEventMask(B_POINTER_EVENTS, B_NO_POINTER_HISTORY);
+			Invalidate(CardRect(fDown).InsetByCopy(-8, -8));
+		}
+	}
+
+	virtual void MouseMoved(BPoint where, uint32 transit, const BMessage* drag)
+	{
+		if (fDown >= 0 && _CardAt(where) != fDown) {
+			Invalidate(CardRect(fDown).InsetByCopy(-8, -8));
+			fDown = -1;
+		}
+	}
+
+	virtual void MouseUp(BPoint where)
+	{
+		int32 index = fDown;
+		fDown = -1;
+		if (index < 0)
+			return;
+		Invalidate(CardRect(index).InsetByCopy(-8, -8));
+		if (_CardAt(where) != index)
+			return;
+		bool onClose = _CloseRect(CardRect(index)).InsetByCopy(-6, -6)
+			.Contains(where);
+		_Send(onClose && fDownOnClose ? fClose : fOpen, index);
+	}
+
+	// A finger moved sideways along a card (touch scrolling) slides it; let
+	// go past a third of its width to close it.
+	virtual void MessageReceived(BMessage* message)
+	{
+		float pixelsX, pixelsY;
+		if (message->what == B_MOUSE_WHEEL_CHANGED
+			&& message->FindFloat("be:wheel_pixel_delta_x", &pixelsX) == B_OK
+			&& message->FindFloat("be:wheel_pixel_delta_y", &pixelsY) == B_OK) {
+			int32 phase = message->GetInt32("be:wheel_phase",
+				Detail::kWheelPhaseNone);
+			if (fSwiping < 0 && fabsf(pixelsX) > fabsf(pixelsY)
+				&& phase != Detail::kWheelPhaseEnded) {
+				BPoint where;
+				uint32 buttons;
+				GetMouse(&where, &buttons, false);
+				fSwiping = _CardAt(where);
+				fSwipe = 0;
+			}
+			if (fSwiping < 0) {
+				_ScrollBy(pixelsY);
+				return;
+			}
+			if (fSwiping >= 0) {
+				BRect before = CardRect(fSwiping);
+				fSwipe -= pixelsX;
+				BRect after = CardRect(fSwiping);
+				Invalidate((before | after).InsetByCopy(-10, -10));
+				if (phase == Detail::kWheelPhaseEnded
+					|| phase == Detail::kWheelPhaseNone) {
+					int32 index = fSwiping;
+					bool close = fabsf(fSwipe) > before.Width() / 3;
+					fSwiping = -1;
+					fSwipe = 0;
+					Invalidate();
+					if (close)
+						_Send(fClose, index);
+				}
+				return;
+			}
+		}
+		if (message->what == B_MOUSE_WHEEL_CHANGED
+			&& ScrollBar(B_VERTICAL) == NULL) {
+			_ScrollBy(message->GetFloat("be:wheel_delta_y", 0) * TargetSize());
+			return;
+		}
+		BView::MessageReceived(message);
+	}
+
+	virtual void KeyDown(const char* bytes, int32 numBytes)
+	{
+		int32 index = -1;
+		for (size_t i = 0; i < fCards.size(); i++) {
+			if (fCards[i].id == fSelected)
+				index = i;
+		}
+		int32 next = index;
+		if (numBytes == 1) {
+			switch (bytes[0]) {
+				case B_LEFT_ARROW: next = index - 1; break;
+				case B_RIGHT_ARROW: next = index + 1; break;
+				case B_UP_ARROW: next = index - fColumns; break;
+				case B_DOWN_ARROW: next = index + fColumns; break;
+				case B_ENTER: case B_SPACE:
+					if (index >= 0)
+						_Send(fOpen, index);
+					return;
+				case B_DELETE: case B_BACKSPACE:
+					if (index >= 0)
+						_Send(fClose, index);
+					return;
+				default:
+					BView::KeyDown(bytes, numBytes);
+					return;
+			}
+		}
+		if (next >= 0 && next < (int32)fCards.size() && next != index) {
+			SetSelected(fCards[next].id);
+			ScrollToSelected();
+		}
+	}
+
+private:
+	struct Card {
+		int64 id;
+		BString title;
+		BBitmap* picture;
+		BBitmap* icon;
+	};
+
+	float _Gap() const { return ceilf(be_plain_font->Size() * 1.2f); }
+
+	// Without a scroll bar (in tablet mode a finger scrolls in pixels) the
+	// grid scrolls itself.
+	void _ScrollBy(float delta)
+	{
+		if (ScrollBar(B_VERTICAL) != NULL) {
+			ScrollBar(B_VERTICAL)->SetValue(ScrollBar(B_VERTICAL)->Value()
+				+ delta);
+			return;
+		}
+		float limit = fmaxf(0.0f, _ContentHeight() - Bounds().Height() - 1);
+		float top = fmaxf(0.0f, fminf(limit, Bounds().top + delta));
+		if (top != Bounds().top)
+			ScrollTo(0, top);
+	}
+	float _Strip() const { return ceilf(TargetSize() * 0.72f); }
+
+	float _CardHeight(float width) const
+	{
+		// the pictures show the top of the page, cropped shorter than it
+		return _Strip() + floorf(width * fminf(fAspect, 1.5f));
+	}
+
+	float _ContentHeight() const
+	{
+		if (fCards.empty())
+			return 0;
+		BRect last = CardRect(fCards.size() - 1);
+		return last.bottom + _Gap();
+	}
+
+	void _Relayout()
+	{
+		// two columns on a phone, three on a tablet, up to six on a wide
+		// screen
+		float width = Bounds().Width() + 1;
+		float column = TargetSize() * 5.2f;
+		fColumns = std::max((int32)2, std::min((int32)6,
+			(int32)roundf(width / column)));
+		if (width < TargetSize() * 5)
+			fColumns = 1;
+		BScrollBar* bar = ScrollBar(B_VERTICAL);
+		if (bar != NULL) {
+			float height = Bounds().Height() + 1;
+			float range = fmaxf(0.0f, _ContentHeight() - height);
+			bar->SetRange(0, range);
+			bar->SetProportion(range > 0 ? height / (range + height) : 1);
+			bar->SetSteps(TargetSize(), height - TargetSize());
+		} else if (Window() != NULL) {
+			float limit = fmaxf(0.0f, _ContentHeight() - Bounds().Height() - 1);
+			if (Bounds().top > limit)
+				ScrollTo(0, limit);
+		}
+		Invalidate();
+	}
+
+	int32 _CardAt(BPoint where) const
+	{
+		for (size_t i = 0; i < fCards.size(); i++) {
+			if (CardRect(i).Contains(where))
+				return i;
+		}
+		return -1;
+	}
+
+	BRect _CloseRect(BRect card) const
+	{
+		float strip = _Strip();
+		return BRect(card.right - strip, card.top, card.right,
+			card.top + strip - 1);
+	}
+
+	void _DrawEmpty(BRect bounds)
+	{
+		const Skin& skin = CurrentSkin();
+		float size = be_plain_font->Size();
+		float y = bounds.top + TargetSize() * 2;
+		if (fEmptyGlyph != B_GLYPH_NONE) {
+			float glyph = ceilf(TargetSize() * 2.2f);
+			BRect box(0, 0, glyph, glyph);
+			box.OffsetTo(floorf((bounds.left + bounds.right - glyph) / 2), y);
+			DrawGlyph(this, fEmptyGlyph, box.OffsetByCopy(0, 1),
+				skin.selectedEmboss);
+			DrawGlyph(this, fEmptyGlyph, box, skin.selectedText);
+			y = box.bottom + size;
+		}
+		BString text(fEmpty);
+		int32 line = 0;
+		while (true) {
+			int32 end = text.FindFirst('\n');
+			BString part;
+			text.CopyInto(part, 0, end < 0 ? text.Length() : end);
+			BFont font(line == 0 ? be_bold_font : be_plain_font);
+			font.SetSize(ceilf(size * (line == 0 ? 1.4f : 1.05f)));
+			SetFont(&font);
+			font_height height;
+			font.GetHeight(&height);
+			float lineHeight = ceilf(height.ascent + height.descent
+				+ height.leading) + (line == 0 ? size * 0.6f : 2);
+			// wrap long lines at spaces
+			BString rest(part);
+			float width = bounds.Width() - size * 4;
+			while (!rest.IsEmpty()) {
+				int32 cut = rest.Length();
+				while (cut > 0 && font.StringWidth(rest.String(), cut) > width) {
+					int32 space = rest.FindLast(' ', cut - 1);
+					if (space <= 0) break;
+					cut = space;
+				}
+				BString piece;
+				rest.CopyInto(piece, 0, cut);
+				DrawCentered(this, piece.String(), BRect(bounds.left, y,
+					bounds.right, y + lineHeight), line == 0
+						? skin.selectedText : MixColors(skin.selectedText,
+							skin.barBottom, 0.25f), skin.selectedEmboss);
+				y += lineHeight;
+				rest.Remove(0, cut);
+				while (rest.ByteAt(0) == ' ')
+					rest.Remove(0, 1);
+			}
+			line++;
+			if (end < 0)
+				break;
+			text.Remove(0, end + 1);
+		}
+	}
+
+	void _DrawCard(int32 index, BRect card)
+	{
+		const Skin& skin = CurrentSkin();
+		const Card& item = fCards[index];
+		float radius = ceilf(be_plain_font->Size() * 0.5f);
+		bool fading = index == fSwiping;
+		float fade = fading ? fmaxf(0.25f, 1 - fabsf(fSwipe)
+			/ fmaxf(1.0f, card.Width())) : 1;
+		PushState();
+		SetDrawingMode(B_OP_ALPHA);
+		SetBlendingMode(B_CONSTANT_ALPHA, B_ALPHA_OVERLAY);
+		// a soft shadow under the card
+		for (int i = 3; i >= 1; i--) {
+			SetHighColor(0, 0, 0, (uint8)(28 * fade));
+			FillRoundRect(card.OffsetByCopy(0, i).InsetByCopy(-i, -i * 0.5f),
+				radius + i, radius + i);
+		}
+		bool selected = item.id == fSelected;
+		if (selected) {
+			rgb_color ring = skin.displayActive;
+			ring.alpha = (uint8)(255 * fade);
+			SetHighColor(ring);
+			float width = ceilf(be_plain_font->Size() / 4);
+			FillRoundRect(card.InsetByCopy(-width - 1, -width - 1),
+				radius + width, radius + width);
+		}
+		rgb_color paper = skin.pageTop;
+		paper.alpha = (uint8)(255 * fade);
+		SetHighColor(paper);
+		FillRoundRect(card, radius, radius);
+		// the strip with the icon, the title and ✕
+		float strip = _Strip();
+		BRect header(card.left, card.top, card.right, card.top + strip - 1);
+		BRegion headerClip(header);
+		PushState();
+		ConstrainClippingRegion(&headerClip);
+		rgb_color top = skin.controlTop, bottom = skin.controlBottom;
+		if (index == fDown && !fDownOnClose) {
+			top = skin.pressedTop;
+			bottom = skin.pressedBottom;
+		}
+		top.alpha = bottom.alpha = (uint8)(255 * fade);
+		FillGradient(this, card, top, bottom, radius);
+		PopState();
+		SetHighColor(skin.controlBorder);
+		StrokeLine(BPoint(header.left, header.bottom),
+			BPoint(header.right, header.bottom));
+		float iconSize = floorf(strip * 0.5f);
+		BRect icon(0, 0, iconSize - 1, iconSize - 1);
+		icon.OffsetTo(header.left + floorf(strip * 0.25f),
+			floorf((header.top + header.bottom - iconSize) / 2));
+		if (item.icon != NULL) {
+			SetBlendingMode(B_PIXEL_ALPHA, B_ALPHA_OVERLAY);
+			DrawBitmap(item.icon, item.icon->Bounds(), icon,
+				B_FILTER_BITMAP_BILINEAR);
+			SetBlendingMode(B_CONSTANT_ALPHA, B_ALPHA_OVERLAY);
+		} else {
+			DrawGlyph(this, B_GLYPH_GLOBE, icon, skin.controlText);
+		}
+		BRect close = _CloseRect(card);
+		float cross = floorf(strip * 0.34f);
+		BRect crossRect(0, 0, cross, cross);
+		crossRect.OffsetTo(floorf((close.left + close.right - cross) / 2),
+			floorf((close.top + close.bottom - cross) / 2));
+		DrawGlyph(this, B_GLYPH_STOP, crossRect,
+			index == fDown && fDownOnClose ? skin.displayActive
+				: skin.controlText);
+		BFont font(be_bold_font);
+		font.SetSize(be_plain_font->Size());
+		SetFont(&font);
+		BRect title(icon.right + floorf(strip * 0.2f), header.top,
+			close.left, header.bottom);
+		BString shown(item.title);
+		font.TruncateString(&shown, B_TRUNCATE_END, title.Width());
+		font_height height;
+		font.GetHeight(&height);
+		SetHighColor(skin.controlText);
+		DrawString(shown.String(), BPoint(title.left,
+			floorf((title.top + title.bottom + height.ascent
+				- height.descent) / 2)));
+		// the picture of the page, its top filling the card's width
+		BRect picture(card.left, header.bottom + 1, card.right, card.bottom);
+		if (item.picture != NULL) {
+			BRect source = item.picture->Bounds();
+			float scale = (picture.Width() + 1) / (source.Width() + 1);
+			float visible = (picture.Height() + 1) / scale;
+			if (visible < source.Height() + 1)
+				source.bottom = source.top + floorf(visible) - 1;
+			else
+				picture.bottom = picture.top + floorf((source.Height() + 1)
+					* scale) - 1;
+			BRegion clip(picture);
+			// round the bottom corners off
+			PushState();
+			ConstrainClippingRegion(&clip);
+			SetDrawingMode(B_OP_COPY);
+			DrawBitmap(item.picture, source, picture, B_FILTER_BITMAP_BILINEAR);
+			PopState();
+		} else {
+			float glyph = floorf(fminf(picture.Width(), picture.Height()) / 3);
+			BRect box(0, 0, glyph, glyph);
+			box.OffsetTo(floorf((picture.left + picture.right - glyph) / 2),
+				floorf((picture.top + picture.bottom - glyph) / 2));
+			DrawGlyph(this, B_GLYPH_GLOBE, box, skin.pageSecondary);
+		}
+		SetHighColor(MixColors(skin.controlBorder, paper, 0.3f));
+		StrokeRoundRect(card, radius, radius);
+		PopState();
+	}
+
+	void _Send(const BMessage* source, int32 index)
+	{
+		if (source == NULL || index < 0 || index >= (int32)fCards.size())
+			return;
+		BMessage message(*source);
+		message.AddInt64("id", fCards[index].id);
+		message.AddInt32("index", index);
+		BMessenger target = fTarget.IsValid() ? fTarget : BMessenger(Window());
+		target.SendMessage(&message);
+	}
+
+	BMessage* fOpen;
+	BMessage* fClose;
+	BMessenger fTarget;
+	Glyph fEmptyGlyph = B_GLYPH_NONE;
+	std::vector<Card> fCards;
+	int64 fSelected;
+	float fAspect;
+	int32 fColumns;
+	int32 fDown;
+	bool fDownOnClose;
+	int32 fSwiping;
+	float fSwipe;
+	BString fEmpty;
+};
+
+
+// #pragma mark - TabBar (version 3)
+
+// A row of tabs under a MetalBar, as the iPad's Safari had: the tab on show
+// is lit and joins the page, the others sit back in the metal. A tab has an
+// icon (copied) and a title; the tab on show has ✕. Tabs share the width down
+// to a touch-sized minimum, then the row scrolls sideways. The messages go
+// with "id" (int64): select when a tab is tapped, close for its ✕.
+class TabBar : public BView {
+public:
+	TabBar(const char* name, BMessage* select, BMessage* close)
+		:
+		BView(name, B_WILL_DRAW | B_FULL_UPDATE_ON_RESIZE | B_FRAME_EVENTS),
+		fSelect(select),
+		fClose(close),
+		fSelected(0),
+		fScroll(0),
+		fDown(-1),
+		fDownOnClose(false)
+	{
+		SetViewColor(B_TRANSPARENT_COLOR);
+	}
+
+	virtual ~TabBar()
+	{
+		RemoveTabs();
+		delete fSelect;
+		delete fClose;
+	}
+
+	void SetTarget(const BMessenger& target) { fTarget = target; }
+
+	void RemoveTabs()
+	{
+		for (size_t i = 0; i < fTabs.size(); i++)
+			delete fTabs[i].icon;
+		fTabs.clear();
+		fDown = -1;
+	}
+
+	void AddTab(int64 id, const char* title, const BBitmap* icon)
+	{
+		Tab tab;
+		tab.id = id;
+		tab.title = title;
+		tab.icon = icon != NULL ? new BBitmap(icon) : NULL;
+		fTabs.push_back(tab);
+	}
+
+	// Call after adding the tabs: shows the selected one.
+	void SetSelected(int64 id)
+	{
+		fSelected = id;
+		_Reveal();
+		Invalidate();
+	}
+
+	virtual BSize MinSize()
+	{
+		return BLayoutUtils::ComposeSize(ExplicitMinSize(),
+			BSize(TargetSize() * 2, _Height()));
+	}
+
+	virtual BSize MaxSize()
+	{
+		return BLayoutUtils::ComposeSize(ExplicitMaxSize(),
+			BSize(B_SIZE_UNLIMITED, _Height()));
+	}
+
+	virtual BSize PreferredSize()
+	{
+		return BLayoutUtils::ComposeSize(ExplicitPreferredSize(), MinSize());
+	}
+
+	virtual void FrameResized(float, float)
+	{
+		_Reveal();
+		Invalidate();
+	}
+
+	virtual void Draw(BRect update)
+	{
+		const Skin& skin = CurrentSkin();
+		BRect bounds = Bounds();
+		// the slot the tabs sit in: darker metal with a shadow at the top
+		rgb_color slotTop = MixColors(skin.barBottom, skin.barEdge, 0.35f);
+		rgb_color slotBottom = MixColors(skin.barBottom, skin.barEdge, 0.2f);
+		FillGradient(this, bounds, slotTop, slotBottom);
+		PushState();
+		SetDrawingMode(B_OP_ALPHA);
+		SetHighColor(0, 0, 0, 60);
+		StrokeLine(bounds.LeftTop(), bounds.RightTop());
+		PopState();
+		int32 selected = -1;
+		for (size_t i = 0; i < fTabs.size(); i++) {
+			if (fTabs[i].id == fSelected) {
+				selected = i;
+				continue;
+			}
+			BRect tab = TabRect(i);
+			if (tab.Intersects(update))
+				_DrawTab(i, tab, false);
+		}
+		// the edge the content starts at, under every tab but the lit one
+		SetHighColor(skin.barEdge);
+		StrokeLine(bounds.LeftBottom(), bounds.RightBottom());
+		if (selected >= 0)
+			_DrawTab(selected, TabRect(selected), true);
+	}
+
+	BRect TabRect(int32 index) const
+	{
+		float width = _TabWidth();
+		BRect bounds = Bounds();
+		float left = bounds.left + index * width - fScroll;
+		return BRect(left, bounds.top + 3, left + width - 1, bounds.bottom);
+	}
+
+	virtual void MouseDown(BPoint where)
+	{
+		fDown = _TabAt(where);
+		fDownOnClose = fDown >= 0 && fTabs[fDown].id == fSelected
+			&& _CloseRect(TabRect(fDown)).InsetByCopy(-6, -6).Contains(where);
+		if (fDown >= 0)
+			SetMouseEventMask(B_POINTER_EVENTS, B_NO_POINTER_HISTORY);
+	}
+
+	virtual void MouseUp(BPoint where)
+	{
+		int32 index = fDown;
+		fDown = -1;
+		if (index < 0 || _TabAt(where) != index)
+			return;
+		bool onClose = fDownOnClose && _CloseRect(TabRect(index))
+			.InsetByCopy(-6, -6).Contains(where);
+		_Send(onClose ? fClose : fSelect, index);
+	}
+
+	virtual void MessageReceived(BMessage* message)
+	{
+		if (message->what == B_MOUSE_WHEEL_CHANGED) {
+			float pixels;
+			float delta = 0;
+			if (message->FindFloat("be:wheel_pixel_delta_x", &pixels) == B_OK)
+				delta = pixels;
+			if (delta == 0 && message->FindFloat("be:wheel_pixel_delta_y",
+					&pixels) == B_OK)
+				delta = pixels;
+			if (delta == 0) {
+				delta = (message->GetFloat("be:wheel_delta_x", 0)
+					+ message->GetFloat("be:wheel_delta_y", 0)) * _TabWidth()
+					/ 2;
+			}
+			_ScrollTo(fScroll + delta);
+			return;
+		}
+		BView::MessageReceived(message);
+	}
+
+private:
+	struct Tab {
+		int64 id;
+		BString title;
+		BBitmap* icon;
+	};
+
+	static float _Height()
+	{
+		return ceilf(TargetSize() * 0.82f);
+	}
+
+	float _TabWidth() const
+	{
+		float width = Bounds().Width() + 1;
+		if (fTabs.empty())
+			return width;
+		float each = floorf(width / fTabs.size());
+		return fmaxf(TargetSize() * 3.4f, fminf(each, TargetSize() * 6.5f));
+	}
+
+	int32 _TabAt(BPoint where) const
+	{
+		for (size_t i = 0; i < fTabs.size(); i++) {
+			if (TabRect(i).Contains(where))
+				return i;
+		}
+		return -1;
+	}
+
+	BRect _CloseRect(BRect tab) const
+	{
+		float size = tab.Height();
+		return BRect(tab.left + 2, tab.top, tab.left + 2 + size, tab.bottom);
+	}
+
+	void _ScrollTo(float scroll)
+	{
+		float limit = fmaxf(0.0f, fTabs.size() * _TabWidth()
+			- Bounds().Width() - 1);
+		scroll = fmaxf(0.0f, fminf(limit, scroll));
+		if (scroll != fScroll) {
+			fScroll = scroll;
+			Invalidate();
+		}
+	}
+
+	void _Reveal()
+	{
+		for (size_t i = 0; i < fTabs.size(); i++) {
+			if (fTabs[i].id != fSelected)
+				continue;
+			float width = _TabWidth();
+			float left = i * width;
+			if (left < fScroll)
+				_ScrollTo(left);
+			else if (left + width > fScroll + Bounds().Width() + 1)
+				_ScrollTo(left + width - Bounds().Width() - 1);
+			else
+				_ScrollTo(fScroll);
+			return;
+		}
+		_ScrollTo(fScroll);
+	}
+
+	void _DrawTab(int32 index, BRect tab, bool lit)
+	{
+		const Skin& skin = CurrentSkin();
+		const Tab& item = fTabs[index];
+		float slope = floorf(tab.Height() * 0.3f);
+		BPoint outline[4] = {
+			BPoint(tab.left, tab.bottom),
+			BPoint(tab.left + slope, tab.top),
+			BPoint(tab.right - slope, tab.top),
+			BPoint(tab.right, tab.bottom) };
+		PushState();
+		SetDrawingMode(B_OP_ALPHA);
+		SetBlendingMode(B_CONSTANT_ALPHA, B_ALPHA_OVERLAY);
+		BGradientLinear gradient(tab.LeftTop(), tab.LeftBottom());
+		if (lit) {
+			gradient.AddColor(skin.barTop, 0);
+			gradient.AddColor(MixColors(skin.barTop, skin.barBottom, 0.45f), 255);
+		} else {
+			gradient.AddColor(MixColors(skin.barBottom, skin.barEdge, 0.12f), 0);
+			gradient.AddColor(MixColors(skin.barBottom, skin.barEdge, 0.28f), 255);
+		}
+		FillPolygon(outline, 4, gradient);
+		SetHighColor(lit ? skin.barHighlight : MixColors(skin.barTop,
+			skin.barBottom, 0.6f));
+		StrokeLine(outline[1] + BPoint(1, 1), outline[2] + BPoint(-1, 1));
+		SetHighColor(skin.barEdge);
+		StrokeLine(outline[0], outline[1]);
+		StrokeLine(outline[1], outline[2]);
+		StrokeLine(outline[2], outline[3]);
+		PopState();
+		float size = be_plain_font->Size();
+		BRect content(tab.left + slope, tab.top, tab.right - slope, tab.bottom);
+		if (lit) {
+			BRect close = _CloseRect(tab).OffsetByCopy(slope * 0.6f, 0);
+			float cross = floorf(close.Height() * 0.32f);
+			BRect box(0, 0, cross, cross);
+			box.OffsetTo(floorf((close.left + close.right - cross) / 2),
+				floorf((close.top + close.bottom - cross) / 2));
+			DrawGlyph(this, B_GLYPH_STOP, box, skin.controlText);
+		}
+		BFont font(lit ? be_bold_font : be_plain_font);
+		font.SetSize(size);
+		SetFont(&font);
+		float icon = floorf(tab.Height() * 0.46f);
+		BString title(item.title);
+		float textWidth = fminf(font.StringWidth(title.String()),
+			content.Width() - icon * 2.6f);
+		font.TruncateString(&title, B_TRUNCATE_END, textWidth);
+		textWidth = font.StringWidth(title.String());
+		float total = icon + size * 0.4f + textWidth;
+		float left = floorf((content.left + content.right - total) / 2);
+		if (lit)
+			left = fmaxf(left, content.left + icon * 1.4f);
+		BRect iconRect(left, floorf((tab.top + tab.bottom - icon) / 2),
+			left + icon - 1, floorf((tab.top + tab.bottom - icon) / 2) + icon - 1);
+		if (item.icon != NULL) {
+			PushState();
+			SetDrawingMode(B_OP_ALPHA);
+			SetBlendingMode(B_PIXEL_ALPHA, B_ALPHA_OVERLAY);
+			DrawBitmap(item.icon, item.icon->Bounds(), iconRect,
+				B_FILTER_BITMAP_BILINEAR);
+			PopState();
+		} else
+			DrawGlyph(this, B_GLYPH_GLOBE, iconRect, skin.controlText);
+		font_height height;
+		font.GetHeight(&height);
+		rgb_color text = skin.controlText;
+		if (!lit)
+			text = MixColors(text, skin.barBottom, 0.25f);
+		DrawEngraved(this, title.String(), BPoint(iconRect.right + 1
+			+ size * 0.4f, floorf((tab.top + tab.bottom + height.ascent
+				- height.descent) / 2)), text, skin.controlEmboss);
+	}
+
+	void _Send(const BMessage* source, int32 index)
+	{
+		if (source == NULL || index < 0 || index >= (int32)fTabs.size())
+			return;
+		BMessage message(*source);
+		message.AddInt64("id", fTabs[index].id);
+		BMessenger target = fTarget.IsValid() ? fTarget : BMessenger(Window());
+		target.SendMessage(&message);
+	}
+
+	BMessage* fSelect;
+	BMessage* fClose;
+	BMessenger fTarget;
+	std::vector<Tab> fTabs;
+	int64 fSelected;
+	float fScroll;
+	int32 fDown;
+	bool fDownOnClose;
+};
+
+
+// #pragma mark - ActionSheet
+
+enum ActionStyle {
+	B_ACTION_DEFAULT,
+	B_ACTION_DESTRUCTIVE	// red, for an action that removes something
+};
+
+
+// A transient sheet of commands that rises from the bottom of its window,
+// after the share sheets of early iPhones: an optional row of activities
+// (large glyph buttons with a caption), then a column of glossy buttons, then
+// Cancel. Each choice carries its original BMessage (including IDs or refs),
+// sent to the owner. Escape, Cancel or a tap above the sheet dismisses it.
+// A long sheet scrolls.
+class ActionSheet : public BWindow {
+public:
+	ActionSheet(BWindow* owner, const char* title)
+		:
+		BWindow(owner->Frame(), title, B_NO_BORDER_WINDOW_LOOK,
+			owner->Feel() == B_MODAL_APP_WINDOW_FEEL ? B_MODAL_APP_WINDOW_FEEL
+				: B_MODAL_SUBSET_WINDOW_FEEL, B_NOT_ZOOMABLE | B_NOT_RESIZABLE
+				| B_NOT_MOVABLE | B_ASYNCHRONOUS_CONTROLS | B_CLOSE_ON_ESCAPE),
+		fOwner(owner),
+		fArea(owner->Frame())
+	{
+		if (Feel() == B_MODAL_SUBSET_WINDOW_FEEL)
+			AddToSubset(owner);
+		fSheet = new Sheet(this, title);
+		AddChild(fSheet);
+	}
+
+	// A button in the column.
+	void AddAction(const char* label, const BMessage& action,
+		ActionStyle style = B_ACTION_DEFAULT)
+	{
+		fSheet->Add(label, action, B_GLYPH_NONE, style, false);
+	}
+
+	// A button with a glyph in the row of activities above the column.
+	void AddActivity(const char* label, Glyph glyph, const BMessage& action)
+	{
+		fSheet->Add(label, action, glyph, B_ACTION_DEFAULT, true);
+	}
+
+	void Open()
+	{
+		float width = fArea.Width() + 1;
+		fSheet->ResizeTo(width - 1, 10);
+		float content = fSheet->ContentHeight(width);
+		float height = fminf(fArea.Height() * 0.85f, content);
+		ResizeTo(width - 1, height - 1);
+		fSheet->ResizeTo(width - 1, height - 1);
+		MoveTo(fArea.left, fArea.bottom - height + 1);
+		fSheet->MakeFocus(true);
+		Show();
+	}
+
+	virtual void MessageReceived(BMessage* message)
+	{
+		if (message->what != 'mVok') {
+			BWindow::MessageReceived(message);
+			return;
+		}
+		const BMessage* action = fSheet->ActionAt(message->GetInt32("index", -1));
+		if (action != NULL) {
+			fOwner.SendMessage(const_cast<BMessage*>(action));
+			PostMessage(B_QUIT_REQUESTED);
+		}
+	}
+
+	virtual void WindowActivated(bool active)
+	{
+		// A tap outside the sheet (on its window) puts it away.
+		if (!active && IsHidden() == false && fShown)
+			PostMessage(B_QUIT_REQUESTED);
+		if (active)
+			fShown = true;
+		BWindow::WindowActivated(active);
+	}
+
+private:
+	struct Choice {
+		BString label;
+		BMessage action;
+		Glyph glyph;
+		ActionStyle style;
+		bool activity;
+	};
+
+	class Sheet : public BView {
+	public:
+		Sheet(ActionSheet* owner, const char* title)
+			:
+			BView(BRect(0, 0, 10, 10), "action-sheet", B_FOLLOW_ALL,
+				B_WILL_DRAW | B_FULL_UPDATE_ON_RESIZE | B_NAVIGABLE),
+			fTitle(title),
+			fPressed(-1),
+			fFocus(-1),
+			fScroll(0)
+		{
+			SetViewColor(B_TRANSPARENT_COLOR);
+			(void)owner;
+		}
+
+		void Add(const char* label, const BMessage& action, Glyph glyph,
+			ActionStyle style, bool activity)
+		{
+			Choice choice;
+			choice.label = label;
+			choice.action = action;
+			choice.glyph = glyph;
+			choice.style = style;
+			choice.activity = activity;
+			fChoices.push_back(choice);
+		}
+
+		const BMessage* ActionAt(int32 index) const
+		{
+			if (index < 0 || index >= (int32)fChoices.size())
+				return NULL;
+			return &fChoices[index].action;
+		}
+
+		float ContentHeight(float width)
+		{
+			_Layout(width);
+			return fContent;
+		}
+
+		virtual void FrameResized(float width, float height)
+		{
+			_Layout(width + 1);
+			fScroll = fmaxf(0.0f, fminf(fScroll, fContent - height - 1));
+		}
+
+		virtual void Draw(BRect update)
+		{
+			BRect bounds = Bounds();
+			float size = be_plain_font->Size();
+			// a slab of dark glass
+			FillGradient(this, bounds, Detail::MakeColor(64, 68, 78),
+				Detail::MakeColor(22, 24, 30));
+			SetHighColor(Detail::MakeColor(120, 126, 140));
+			StrokeLine(bounds.LeftTop(), bounds.RightTop());
+			SetHighColor(Detail::MakeColor(0, 0, 0));
+			StrokeLine(BPoint(bounds.left, bounds.top + 1),
+				BPoint(bounds.right, bounds.top + 1));
+			PushState();
+			SetOrigin(0, -fScroll);
+			if (!fTitle.IsEmpty()) {
+				BFont font(be_plain_font);
+				SetFont(&font);
+				DrawCentered(this, fTitle.String(), fTitleRect,
+					Detail::MakeColor(210, 214, 222), Detail::MakeColor(0, 0, 0, 160));
+			}
+			for (size_t i = 0; i <= fChoices.size(); i++)
+				_DrawChoice(i);
+			PopState();
+			(void)update;
+			(void)size;
+		}
+
+		virtual void MouseDown(BPoint where)
+		{
+			MakeFocus(true);
+			fPressed = _ChoiceAt(where);
+			if (fPressed < 0 && where.y + fScroll < fTop)
+				Window()->PostMessage(B_QUIT_REQUESTED);
+			SetMouseEventMask(B_POINTER_EVENTS, B_NO_POINTER_HISTORY);
+			Invalidate();
+		}
+
+		virtual void MouseMoved(BPoint where, uint32, const BMessage*)
+		{
+			if (fPressed >= 0 && _ChoiceAt(where) != fPressed) {
+				fPressed = -1;
+				Invalidate();
+			}
+		}
+
+		virtual void MouseUp(BPoint where)
+		{
+			int32 pressed = fPressed;
+			fPressed = -1;
+			Invalidate();
+			if (pressed >= 0 && _ChoiceAt(where) == pressed)
+				_Choose(pressed);
+		}
+
+		virtual void MessageReceived(BMessage* message)
+		{
+			if (message->what == B_MOUSE_WHEEL_CHANGED) {
+				float pixels;
+				float delta = message->FindFloat("be:wheel_pixel_delta_y",
+					&pixels) == B_OK ? pixels
+					: message->GetFloat("be:wheel_delta_y", 0) * TargetSize();
+				_ScrollTo(fScroll + delta);
+				return;
+			}
+			BView::MessageReceived(message);
+		}
+
+		virtual void KeyDown(const char* bytes, int32 numBytes)
+		{
+			int32 count = (int32)fChoices.size() + 1;
+			if (numBytes == 1) {
+				switch (bytes[0]) {
+					case B_DOWN_ARROW: case B_RIGHT_ARROW: case B_TAB:
+						fFocus = (fFocus + 1) % count;
+						_Reveal(fFocus);
+						Invalidate();
+						return;
+					case B_UP_ARROW: case B_LEFT_ARROW:
+						fFocus = (fFocus + count - 1) % count;
+						_Reveal(fFocus);
+						Invalidate();
+						return;
+					case B_ENTER: case B_SPACE:
+						if (fFocus >= 0)
+							_Choose(fFocus);
+						return;
+				}
+			}
+			BView::KeyDown(bytes, numBytes);
+		}
+
+	private:
+		void _Layout(float width)
+		{
+			float size = be_plain_font->Size();
+			float margin = ceilf(size * 1.4f);
+			float y = ceilf(size * 0.8f);
+			fTitleRect = BRect();
+			if (!fTitle.IsEmpty()) {
+				fTitleRect = BRect(margin, y, width - margin, y + ceilf(size * 2));
+				y = fTitleRect.bottom + ceilf(size * 0.5f);
+			}
+			fTop = 0;
+			fRects.assign(fChoices.size() + 1, BRect());
+			// activities: square buttons in rows
+			float tile = ceilf(TargetSize() * 1.35f);
+			float caption = ceilf(size * 2.6f);
+			int32 perRow = std::max((int32)1, (int32)((width - margin * 2)
+				/ (tile + size * 1.6f)));
+			perRow = std::min(perRow, (int32)6);
+			float gap = perRow > 1 ? floorf((width - margin * 2 - tile * perRow)
+				/ (perRow - 1)) : 0;
+			int32 column = 0;
+			bool any = false;
+			for (size_t i = 0; i < fChoices.size(); i++) {
+				if (!fChoices[i].activity)
+					continue;
+				any = true;
+				float left = margin + column * (tile + gap);
+				fRects[i] = BRect(left, y, left + tile - 1, y + tile - 1);
+				if (++column == perRow) {
+					column = 0;
+					y += tile + caption;
+				}
+			}
+			if (column > 0)
+				y += tile + caption;
+			if (any)
+				y += ceilf(size * 0.4f);
+			float button = ceilf(ControlHeight() * 1.2f);
+			float spacing = ceilf(size * 0.7f);
+			for (size_t i = 0; i < fChoices.size(); i++) {
+				if (fChoices[i].activity)
+					continue;
+				fRects[i] = BRect(margin, y, width - margin - 1, y + button - 1);
+				y += button + spacing;
+			}
+			y += spacing;
+			// Cancel, set apart
+			fRects[fChoices.size()] = BRect(margin, y, width - margin - 1,
+				y + button - 1);
+			y += button + ceilf(size * 1.6f);
+			fContent = y;
+		}
+
+		int32 _ChoiceAt(BPoint where) const
+		{
+			where.y += fScroll;
+			for (size_t i = 0; i < fRects.size(); i++) {
+				if (fRects[i].Contains(where))
+					return i;
+			}
+			return -1;
+		}
+
+		void _Choose(int32 index)
+		{
+			if (index == (int32)fChoices.size()) {
+				Window()->PostMessage(B_QUIT_REQUESTED);
+				return;
+			}
+			BMessage choose('mVok');
+			choose.AddInt32("index", index);
+			Window()->PostMessage(&choose);
+		}
+
+		void _ScrollTo(float scroll)
+		{
+			float limit = fmaxf(0.0f, fContent - Bounds().Height() - 1);
+			scroll = fmaxf(0.0f, fminf(scroll, limit));
+			if (scroll != fScroll) {
+				fScroll = scroll;
+				Invalidate();
+			}
+		}
+
+		void _Reveal(int32 index)
+		{
+			if (index < 0 || index >= (int32)fRects.size())
+				return;
+			BRect rect = fRects[index];
+			float height = Bounds().Height();
+			if (rect.top < fScroll)
+				_ScrollTo(rect.top - 8);
+			else if (rect.bottom > fScroll + height)
+				_ScrollTo(rect.bottom - height + 8);
+		}
+
+		void _DrawChoice(size_t index)
+		{
+			bool cancel = index == fChoices.size();
+			BRect rect = fRects[index];
+			bool pressed = (int32)index == fPressed;
+			bool focused = (int32)index == fFocus && IsFocus();
+			float size = be_plain_font->Size();
+			rgb_color top, bottom, text, emboss;
+			const Choice* choice = cancel ? NULL : &fChoices[index];
+			if (pressed) {
+				top = Detail::MakeColor(92, 150, 240);
+				bottom = Detail::MakeColor(30, 92, 210);
+				text = Detail::MakeColor(255, 255, 255);
+				emboss = Detail::MakeColor(0, 0, 0, 120);
+			} else if (cancel) {
+				top = Detail::MakeColor(86, 90, 100);
+				bottom = Detail::MakeColor(34, 36, 42);
+				text = Detail::MakeColor(255, 255, 255);
+				emboss = Detail::MakeColor(0, 0, 0, 160);
+			} else if (choice->style == B_ACTION_DESTRUCTIVE) {
+				top = Detail::MakeColor(236, 96, 90);
+				bottom = Detail::MakeColor(186, 22, 20);
+				text = Detail::MakeColor(255, 255, 255);
+				emboss = Detail::MakeColor(0, 0, 0, 120);
+			} else {
+				top = Detail::MakeColor(255, 255, 255);
+				bottom = Detail::MakeColor(206, 208, 214);
+				text = Detail::MakeColor(30, 32, 36);
+				emboss = Detail::MakeColor(255, 255, 255, 200);
+			}
+			float radius = ceilf(size * 0.7f);
+			PushState();
+			SetDrawingMode(B_OP_ALPHA);
+			SetBlendingMode(B_CONSTANT_ALPHA, B_ALPHA_OVERLAY);
+			SetHighColor(0, 0, 0, 200);
+			FillRoundRect(rect.InsetByCopy(-1, -1), radius + 1, radius + 1);
+			PopState();
+			FillGradient(this, rect, top, bottom, radius);
+			// the gloss over the upper half
+			PushState();
+			SetDrawingMode(B_OP_ALPHA);
+			SetBlendingMode(B_CONSTANT_ALPHA, B_ALPHA_OVERLAY);
+			BRect gloss = rect.InsetByCopy(1, 1);
+			gloss.bottom = floorf((rect.top + rect.bottom) / 2);
+			SetHighColor(255, 255, 255, cancel || pressed ? 30 : 70);
+			FillRoundRect(gloss, radius - 1, radius - 1);
+			if (focused) {
+				SetHighColor(ui_color(B_KEYBOARD_NAVIGATION_COLOR));
+				SetPenSize(2);
+				StrokeRoundRect(rect.InsetByCopy(-2, -2), radius + 2, radius + 2);
+			}
+			PopState();
+			BFont font(be_bold_font);
+			font.SetSize(ceilf(size * 1.15f));
+			if (choice != NULL && choice->activity) {
+				float glyph = floorf(rect.Height() * 0.5f);
+				BRect box(0, 0, glyph, glyph);
+				box.OffsetTo(floorf((rect.left + rect.right - glyph) / 2),
+					floorf((rect.top + rect.bottom - glyph) / 2));
+				DrawGlyph(this, choice->glyph, box.OffsetByCopy(0, 1), emboss);
+				DrawGlyph(this, choice->glyph, box, text);
+				BFont small(be_plain_font);
+				small.SetSize(ceilf(size * 0.92f));
+				SetFont(&small);
+				BRect label(rect.left - size, rect.bottom + 2, rect.right + size,
+					rect.bottom + ceilf(size * 2.2f));
+				DrawCentered(this, choice->label.String(), label,
+					Detail::MakeColor(236, 238, 242), Detail::MakeColor(0, 0, 0, 170));
+				return;
+			}
+			SetFont(&font);
+			DrawCentered(this, cancel ? "Cancel" : choice->label.String(),
+				rect.InsetByCopy(size, 0), text, emboss);
+		}
+
+		BString fTitle;
+		std::vector<Choice> fChoices;
+		std::vector<BRect> fRects;
+		BRect fTitleRect;
+		float fTop;
+		float fContent = 0;
+		int32 fPressed;
+		int32 fFocus;
+		float fScroll;
+	};
+
+	BMessenger fOwner;
+	BRect fArea;
+	Sheet* fSheet;
+	bool fShown = false;
+};
+
+
+// #pragma mark - Toast (version 3)
+
+// A dark rounded square in the middle of a window with a glyph and a line of
+// text that goes by itself after a moment, to confirm that something was
+// done ("Bookmark saved"). It takes no input and no focus.
+class Toast : public BWindow {
+public:
+	Toast(BWindow* owner, const char* text, Glyph glyph = B_GLYPH_CHECK,
+		bigtime_t duration = 1400000)
+		:
+		BWindow(BRect(0, 0, 10, 10), "toast", B_NO_BORDER_WINDOW_LOOK,
+			B_FLOATING_SUBSET_WINDOW_FEEL, B_AVOID_FOCUS | B_NOT_MOVABLE
+				| B_NOT_RESIZABLE | B_NOT_ZOOMABLE | B_NOT_MINIMIZABLE
+				| B_NOT_CLOSABLE),
+		fDuration(duration)
+	{
+		AddToSubset(owner);
+		float size = be_plain_font->Size();
+		BFont font(be_bold_font);
+		font.SetSize(ceilf(size * 1.1f));
+		float width = fmaxf(size * 10, fminf(owner->Frame().Width() * 0.8f,
+			font.StringWidth(text) + size * 3));
+		float height = ceilf(size * (glyph != B_GLYPH_NONE ? 9 : 4));
+		ResizeTo(width, height);
+		BRect area = owner->Frame();
+		MoveTo(floorf(area.left + (area.Width() - width) / 2),
+			floorf(area.top + (area.Height() - height) / 2));
+		AddChild(new Face(Bounds(), text, glyph));
+	}
+
+	// Shows it; the window deletes itself.
+	void Go()
+	{
+		Show();
+		BMessage quit(B_QUIT_REQUESTED);
+		BMessageRunner::StartSending(BMessenger(this), &quit, fDuration, 1);
+	}
+
+private:
+	class Face : public BView {
+	public:
+		Face(BRect frame, const char* text, Glyph glyph)
+			:
+			BView(frame, "toast", B_FOLLOW_ALL, B_WILL_DRAW),
+			fText(text),
+			fGlyph(glyph)
+		{
+			SetViewColor(B_TRANSPARENT_COLOR);
+		}
+
+		virtual void Draw(BRect update)
+		{
+			BRect bounds = Bounds();
+			float size = be_plain_font->Size();
+			FillGradient(this, bounds, MakeColor(58, 60, 64),
+				MakeColor(24, 25, 27));
+			SetHighColor(MakeColor(8, 8, 10));
+			StrokeRect(bounds);
+			rgb_color white = MakeColor(255, 255, 255);
+			BRect text = bounds;
+			if (fGlyph != B_GLYPH_NONE) {
+				float glyph = ceilf(size * 3.6f);
+				BRect box(0, 0, glyph, glyph);
+				box.OffsetTo(floorf((bounds.left + bounds.right - glyph) / 2),
+					bounds.top + ceilf(size * 1.4f));
+				DrawGlyph(this, fGlyph, box, white);
+				text.top = box.bottom;
+			}
+			BFont font(be_bold_font);
+			font.SetSize(ceilf(size * 1.1f));
+			SetFont(&font);
+			DrawCentered(this, fText.String(), text.InsetByCopy(size, 0), white,
+				MakeColor(0, 0, 0, 160));
+			(void)update;
+		}
+
+	private:
+		static rgb_color MakeColor(uint8 r, uint8 g, uint8 b, uint8 a = 255)
+		{
+			return Detail::MakeColor(r, g, b, a);
+		}
+
+		BString fText;
+		Glyph fGlyph;
+	};
+
+	bigtime_t fDuration;
+};
+
+
+inline void
+ShowToast(BWindow* owner, const char* text, Glyph glyph = B_GLYPH_CHECK)
+{
+	if (owner != NULL && text != NULL && text[0] != '\0')
+		(new Toast(owner, text, glyph))->Go();
+}
+
 
 } // namespace BMobileKit
 
