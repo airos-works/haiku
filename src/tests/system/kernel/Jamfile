@@ -13,6 +13,13 @@ SimpleTest fibo_exec : fibo_exec.cpp ;
 
 SimpleTest fifo_poll_test : fifo_poll_test.cpp ;
 
+# kevent() adding a directory freed an event that was queued
+# (airos-works/haiku#183)
+SourceSysHdrs kqueue_unsupported_fd_test.cpp
+	: [ FDirName $(HAIKU_TOP) headers compatibility bsd ] ;
+SimpleTest kqueue_unsupported_fd_test : kqueue_unsupported_fd_test.cpp
+	: libbsd.so ;
+
 SimpleTest durable_write : durable_write.cpp ;
 
 SimpleTest illegal_instruction_test : illegal_instruction_test.cpp ;
