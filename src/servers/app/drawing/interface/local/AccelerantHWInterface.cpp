@@ -199,7 +199,6 @@ AccelerantHWInterface::AccelerantHWInterface()
 	fAccCreateFrameBufferShadow(NULL),
 	fAccCopyFrameBufferSource(NULL),
 	fAccFrameBufferIsPartial(NULL),
-	fDeviceCopyFailed(false),
 
 	fModeCount(0),
 	fModeList(NULL),
@@ -849,6 +848,11 @@ AccelerantHWInterface::_SetMode(const display_mode& mode, bool force)
 
 	fDisplayMode = newMode;
 	fInitialModeSwitch = false;
+
+	// A mode set is a fresh start for the device's copies too, if they had
+	// failed (the accelerant sets a lost engine up again on one): before
+	// the back buffer is made, so that it is the device's again.
+	_TakeUpDeviceCopies();
 
 	// update frontbuffer
 	fFrontBuffer->SetDisplayMode(fDisplayMode);
@@ -1916,7 +1920,7 @@ AccelerantHWInterface::MoveCursorTo(float x, float y)
 RenderingBuffer*
 AccelerantHWInterface::_CreateDeviceBackBuffer(uint32 width, uint32 height)
 {
-	if (fAccCopyFrameBufferSource == NULL || fDeviceCopyFailed
+	if (fAccCopyFrameBufferSource == NULL || _DeviceCopiesLost()
 		|| !fFrontBuffer.IsSet() || width > 65535 || height > 65535
 		|| fFrontBuffer->Width() != width || fFrontBuffer->Height() != height)
 		return NULL;
@@ -1946,7 +1950,7 @@ AccelerantHWInterface::_CreateFlushShadow(uint32 width, uint32 height)
 	DeviceSourceBuffer* back
 		= dynamic_cast<DeviceSourceBuffer*>(fBackBuffer.Get());
 	if (back != NULL && fAccCreateFrameBufferShadow != NULL
-		&& !fDeviceCopyFailed && back->Width() == width
+		&& !_DeviceCopiesLost() && back->Width() == width
 		&& back->Height() == height) {
 		frame_buffer_source shadow = {};
 		if (fAccCreateFrameBufferShadow(width, height, B_RGBA32, &shadow)
@@ -1966,7 +1970,7 @@ AccelerantHWInterface::_CreateFlushShadow(uint32 width, uint32 height)
 		}
 	}
 
-	if (fAccCreateFrameBufferSource != NULL && !fDeviceCopyFailed
+	if (fAccCreateFrameBufferSource != NULL && !_DeviceCopiesLost()
 		&& width <= 65535 && height <= 65535) {
 		frame_buffer_source source = {};
 		if (fAccCreateFrameBufferSource(width, height, B_RGBA32, &source)
@@ -1988,7 +1992,7 @@ AccelerantHWInterface::_CreateFlushShadow(uint32 width, uint32 height)
 bool
 AccelerantHWInterface::_DeviceCopiesShadows() const
 {
-	return fAccCopyToFrameBuffer != NULL && !fDeviceCopyFailed;
+	return fAccCopyToFrameBuffer != NULL && !_DeviceCopiesLost();
 }
 
 
@@ -1996,7 +2000,7 @@ bool
 AccelerantHWInterface::_CopyShadowByDevice(RenderingBuffer* shadow,
 	const BRegion& region)
 {
-	if (fAccCopyToFrameBuffer == NULL || fDeviceCopyFailed)
+	if (fAccCopyToFrameBuffer == NULL || _DeviceCopiesLost())
 		return false;
 	DeviceSourceBuffer* source = dynamic_cast<DeviceSourceBuffer*>(shadow);
 	if (source == NULL)
@@ -2015,13 +2019,14 @@ AccelerantHWInterface::_CopyShadowByDevice(RenderingBuffer* shadow,
 			rects[chunk].bottom = r.bottom;
 		}
 		if (fAccCopyToFrameBuffer(source->ID(), rects, chunk) != B_OK) {
-			// the device is gone for good: the CPU copies from now on, from
-			// shadows in memory in the system still (they are ordinary
-			// memory to the CPU), else from the back buffer
+			// the device is lost: the CPU copies until it is tried again,
+			// from shadows in memory in the system still (they are
+			// ordinary memory to the CPU), else from the back buffer
 			_DeviceCopyFailed("copy to the screen");
 			return false;
 		}
 	}
+	_DeviceCopyWorked();
 	return true;
 }
 
@@ -2035,7 +2040,7 @@ bool
 AccelerantHWInterface::_CopyBackToShadowByDevice(RenderingBuffer* shadow,
 	const IntRect& area)
 {
-	if (fAccCopyFrameBufferSource == NULL || fDeviceCopyFailed)
+	if (fAccCopyFrameBufferSource == NULL || _DeviceCopiesLost())
 		return false;
 	DeviceSourceBuffer* to = dynamic_cast<DeviceSourceBuffer*>(shadow);
 	DeviceSourceBuffer* from
@@ -2063,21 +2068,8 @@ AccelerantHWInterface::_CopyBackToShadowByDevice(RenderingBuffer* shadow,
 			return false;
 		}
 	}
+	_DeviceCopyWorked();
 	return true;
-}
-
-
-/*!	The device's copies failed (it is lost, as the accelerant counts it):
-	from now on the CPU copies, and the flush copies from the back buffer
-	where its shadows are in the device. */
-void
-AccelerantHWInterface::_DeviceCopyFailed(const char* what)
-{
-	if (!fDeviceCopyFailed) {
-		syslog(LOG_ERR, "app_server: the graphics device failed to %s, the "
-			"CPU copies from now on\n", what);
-	}
-	fDeviceCopyFailed = true;
 }
 
 

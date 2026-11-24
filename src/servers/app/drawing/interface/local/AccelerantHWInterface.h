@@ -130,7 +130,6 @@ private:
 			status_t			_SetupDefaultHooks();
 			RenderingBuffer*	_CreateDeviceBackBuffer(uint32 width,
 									uint32 height);
-			void				_DeviceCopyFailed(const char* what);
 			void				_UpdateHooksAfterModeChange();
 			status_t			_UpdateModeList();
 			status_t			_UpdateFrameBufferConfig();
@@ -229,7 +228,6 @@ private:
 			create_frame_buffer_shadow fAccCreateFrameBufferShadow;
 			copy_frame_buffer_source fAccCopyFrameBufferSource;
 			frame_buffer_is_partial fAccFrameBufferIsPartial;
-			bool				fDeviceCopyFailed;
 
 			frame_buffer_config	fFrameBufferConfig;
 			int					fModeCount;

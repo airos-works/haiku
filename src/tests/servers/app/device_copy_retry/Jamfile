@@ -1,0 +1,20 @@
+SubDir HAIKU_TOP src tests servers app device_copy_retry ;
+
+UseLibraryHeaders agg ;
+UsePrivateHeaders app graphics interface shared ;
+UsePrivateHeaders [ FDirName graphics common ] ;
+UseHeaders [ FDirName $(HAIKU_TOP) src servers app ] ;
+UseHeaders [ FDirName $(HAIKU_TOP) src servers app drawing ] ;
+UseHeaders [ FDirName $(HAIKU_TOP) src servers app drawing Painter ] ;
+
+SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src servers app ] ;
+
+# app_server's vertical blank flush with a fake graphics device whose copies
+# fail and work again (haiku#201): HWInterface as app_server has it, the
+# device and the screen in memory
+SimpleTest device_copy_retry_test :
+	DeviceCopyRetryTest.cpp
+	IntRect.cpp
+	MultiLocker.cpp
+	: libasdrawing.a be [ TargetLibstdc++ ] [ TargetLibsupc++ ]
+;

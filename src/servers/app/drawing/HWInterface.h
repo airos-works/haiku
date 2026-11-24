@@ -255,11 +255,25 @@ protected:
 									{ return false; }
 	// A shadow the CPU cannot reach (Bits() is NULL) is in the device's own
 	// memory: the device copies what was drawn into it as well. When it
-	// cannot, the flush copies from the back buffer from then on.
+	// cannot, the flush copies from the back buffer until the device is
+	// taken up again (_TakeUpDeviceCopies()).
 	virtual	bool				_CopyBackToShadowByDevice(
 									RenderingBuffer* shadow,
 									const IntRect& area)
 									{ return false; }
+
+	// When the device's copies fail (its driver lost the engine, say), the
+	// CPU copies; the device is tried again a while later (10 s, twice as
+	// long after every try that failed, up to 5 min) and at every mode set
+	// (_TakeUpDeviceCopies()). A try while the device still fails costs
+	// one call that fails.
+			bool				_DeviceCopiesLost() const
+									{ return fDeviceCopyLost; }
+			void				_DeviceCopyFailed(const char* what);
+			void				_DeviceCopyWorked();
+			bool				_TakeUpDeviceCopies();
+			void				_SetDeviceCopyRetryDelay(bigtime_t delay);
+			bool				_RefreshDeviceShadows();
 
 private:
 			struct FlushWorker;
@@ -437,6 +451,14 @@ private:
 			volatile bool		fDeviceCopyOff;
 									// the no_device_copy file: the CPU
 									// copies from the device's shadows
+			volatile bool		fDeviceCopyLost;
+									// its copies failed: the CPU copies,
+									// the device's shadows go stale
+			volatile bool		fDeviceCopyRetried;
+									// taken up again, not proven yet
+			bigtime_t			fDeviceCopyLostAt;
+			bigtime_t			fDeviceCopyFirstDelay;
+			bigtime_t			fDeviceCopyRetryDelay;
 };
 
 #endif // HW_INTERFACE_H

@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
 #include <unistd.h>
 
 #include <vesa/vesa_info.h>
@@ -33,6 +34,12 @@
 
 
 using std::nothrow;
+
+
+// how long after the device's copies failed it is tried again, at first and
+// at most
+static const bigtime_t kDeviceCopyRetryDelay = 10000000;
+static const bigtime_t kDeviceCopyMaxRetryDelay = 300000000;
 
 
 HWInterfaceListener::HWInterfaceListener()
@@ -82,7 +89,12 @@ HWInterface::HWInterface()
 	fFlushWanted(false),
 	fShadowCurrent(0),
 	fShadowReaders(0),
-	fDeviceCopyOff(false)
+	fDeviceCopyOff(false),
+	fDeviceCopyLost(false),
+	fDeviceCopyRetried(false),
+	fDeviceCopyLostAt(0),
+	fDeviceCopyFirstDelay(kDeviceCopyRetryDelay),
+	fDeviceCopyRetryDelay(kDeviceCopyRetryDelay)
 {
 	for (int32 i = 0; i < 32; i++)
 		fShadowWrites[i].used = false;
@@ -676,7 +688,7 @@ HWInterface::CopyBackToFront(const BRect& frame)
 		if (shadow != NULL && slot >= 0 && shadow->Bits() == NULL) {
 			// a shadow in the device's memory: the device copies, the CPU
 			// is free (or, when it cannot, the flush copies from the back
-			// buffer from now on)
+			// buffer until the device is taken up again)
 			_CopyBackToShadowByDevice(shadow, area);
 		} else if (shadow != NULL && slot >= 0) {
 			uint32 srcBPR = backBuffer->BytesPerRow();
@@ -1159,8 +1171,96 @@ HWInterface::_FlushKnobThread()
 			}
 			fDeviceCopyOff = cpu;
 		}
-		snooze(500000);
+		// the device's copies, once failed, are tried again now and then
+		if (fDeviceCopyLost
+			&& system_time() - fDeviceCopyLostAt >= fDeviceCopyRetryDelay
+			&& LockExclusiveAccess()) {
+			_TakeUpDeviceCopies();
+			UnlockExclusiveAccess();
+		}
+		snooze(fDeviceCopyFirstDelay < 500000 ? fDeviceCopyFirstDelay / 2
+			: 500000);
 	}
+}
+
+
+/*!	The device's copies failed (the device is lost, as its driver counts
+	it): the CPU copies until they are taken up again. */
+void
+HWInterface::_DeviceCopyFailed(const char* what)
+{
+	if (!fDeviceCopyLost && !fDeviceCopyRetried) {
+		syslog(LOG_ERR, "app_server: the graphics device failed to %s, the "
+			"CPU copies until it works again\n", what);
+	}
+	if (fDeviceCopyRetried) {
+		// a try that did not work: the next one after a longer while
+		fDeviceCopyRetried = false;
+		fDeviceCopyRetryDelay = min_c(fDeviceCopyRetryDelay * 2,
+			kDeviceCopyMaxRetryDelay);
+	}
+	fDeviceCopyLostAt = system_time();
+	fDeviceCopyLost = true;
+}
+
+
+/*!	A copy by the device that worked: the first after they were taken up
+	again says so. */
+void
+HWInterface::_DeviceCopyWorked()
+{
+	if (!fDeviceCopyRetried)
+		return;
+	fDeviceCopyRetried = false;
+	fDeviceCopyRetryDelay = fDeviceCopyFirstDelay;
+	syslog(LOG_NOTICE, "app_server: the graphics device copies to the "
+		"screen again\n");
+}
+
+
+/*!	The device copies again, if it can: its shadows are brought up to date
+	first, since the flush copied from the back buffer meanwhile and they
+	missed what was drawn. Returns false when that failed (the CPU goes on
+	copying). Write locked: nothing draws, nothing is copied meanwhile.
+*/
+bool
+HWInterface::_TakeUpDeviceCopies()
+{
+	if (!fDeviceCopyLost)
+		return true;
+	fDeviceCopyLost = false;
+	fDeviceCopyRetried = true;
+	return _RefreshDeviceShadows();
+}
+
+
+/*!	For tests: how long after a failure the device is tried again (the
+	first time; doubled after every try that fails). */
+void
+HWInterface::_SetDeviceCopyRetryDelay(bigtime_t delay)
+{
+	fDeviceCopyFirstDelay = fDeviceCopyRetryDelay = delay;
+}
+
+
+/*!	Every shadow in the device's memory gets the whole back buffer, copied
+	by the device. Write locked. */
+bool
+HWInterface::_RefreshDeviceShadows()
+{
+	RenderingBuffer* backBuffer = BackBuffer();
+	if (backBuffer == NULL)
+		return true;
+	for (int32 i = 0; i < 2; i++) {
+		RenderingBuffer* shadow = fFlushShadow[i].Get();
+		if (shadow == NULL || shadow->Bits() != NULL
+			|| shadow->Width() != backBuffer->Width()
+			|| shadow->Height() != backBuffer->Height())
+			continue;
+		if (!_CopyBackToShadowByDevice(shadow, IntRect(backBuffer->Bounds())))
+			return false;
+	}
+	return true;
 }
 
 
