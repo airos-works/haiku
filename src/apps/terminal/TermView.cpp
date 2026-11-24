@@ -27,6 +27,7 @@
 #include <termios.h>
 
 #include <algorithm>
+#include <memory>
 #include <new>
 
 #include <Alert.h>
@@ -1410,9 +1411,6 @@ TermView::SetTermSize(int rows, int columns, bool notifyShell)
 	if (columns > 0)
 		fColumns = columns;
 
-	// To keep things simple, get rid of the selection first.
-	_Deselect();
-
 	fTerminal->Lock();
 	fTerminal->Resize(fColumns, fRows);
 	std::string output;
@@ -1422,6 +1420,7 @@ TermView::SetTermSize(int rows, int columns, bool notifyShell)
 	fTerminal->Unlock();
 	_Send(output);
 
+	_Deselect();
 	_UpdateScrollBarRange();
 	if (fScrollBar != NULL)
 		fScrollBar->SetSteps(fFontHeight, fFontHeight * fRows);
@@ -1697,37 +1696,7 @@ TermView::_UpdateMetrics()
 	fTerminal->SetPixelScale(fScale);
 	fTerminal->Unlock();
 
-	fBuilder.Invalidate();
-	_ResizeBitmap();
-}
-
-
-void
-TermView::_ResizeBitmap()
-{
-	if (Window() == NULL)
-		return;
-
-	BRect bounds = Bounds();
-	int32 width = std::max((int32)1,
-		(int32)ceilf((bounds.Width() + 1) * fScale));
-	int32 height = std::max((int32)1,
-		(int32)ceilf((bounds.Height() + 1) * fScale));
-
-	if (fBitmap != NULL && fBitmap->Bounds().IntegerWidth() + 1 == width
-		&& fBitmap->Bounds().IntegerHeight() + 1 == height) {
-		return;
-	}
-
-	delete fBitmap;
-	fBitmap = new(std::nothrow) BBitmap(BRect(0, 0, width - 1, height - 1),
-		B_RGB32);
-	if (fBitmap != NULL && fBitmap->InitCheck() != B_OK) {
-		delete fBitmap;
-		fBitmap = NULL;
-	}
-	fBuilder.Invalidate();
-	_ScheduleFrame();
+	_InvalidateAll();
 }
 
 
@@ -2842,11 +2811,17 @@ TermView::_RenderFrame()
 	delete fFrameRunner;
 	fFrameRunner = NULL;
 
-	if (Window() == NULL || fBitmap == NULL || fRenderer == NULL)
+	if (Window() == NULL || fRenderer == NULL)
 		return;
 
 	if (!fEvents.empty())
 		_HandleEvents();
+
+	BRect bounds = Bounds();
+	int32 width = std::max((int32)1,
+		(int32)ceilf((bounds.Width() + 1) * fScale));
+	int32 height = std::max((int32)1,
+		(int32)ceilf((bounds.Height() + 1) * fScale));
 
 	bigtime_t frameStart = system_time();
 	for (int32 attempt = 0; attempt < 2; attempt++) {
@@ -2947,9 +2922,7 @@ TermView::_RenderFrame()
 		}
 
 		uint32 epoch = fGlyphs.Epoch();
-		BRect bitmapBounds = fBitmap->Bounds();
-		fBuilder.Build(fTerminal, state, bitmapBounds.IntegerWidth() + 1,
-			bitmapBounds.IntegerHeight() + 1, fFrame);
+		fBuilder.Build(fTerminal, state, width, height, fFrame);
 
 		TerminalGraphics* graphics = fTerminal->Graphics();
 		bool animating = graphics != NULL && graphics->HasAnimations();
@@ -2988,9 +2961,26 @@ TermView::_RenderFrame()
 	}
 
 	bigtime_t renderStart = system_time();
+	// During a resize Draw() can run while a frame is still pending. Keep
+	// the last complete bitmap until we can present one at the new size.
+	BRect bitmapBounds(0, 0, width - 1, height - 1);
+	std::unique_ptr<BBitmap> replacement;
+	BBitmap* target = fBitmap;
+	if (target == NULL || target->Bounds() != bitmapBounds) {
+		replacement.reset(new(std::nothrow) BBitmap(bitmapBounds, B_RGB32));
+		if (replacement == NULL || replacement->InitCheck() != B_OK)
+			return;
+		target = replacement.get();
+		fFrame.allDirty = true;
+	}
+
 	int32 firstRow;
 	int32 lastRow;
-	bool rendered = _Render(firstRow, lastRow);
+	bool rendered = _Render(*target, firstRow, lastRow);
+	if (rendered && replacement != NULL) {
+		delete fBitmap;
+		fBitmap = replacement.release();
+	}
 
 	static bool sStatistics = getenv("TERMINAL_STATS") != NULL;
 	if (sStatistics && rendered) {
@@ -3037,11 +3027,11 @@ TermView::_RenderFrame()
 	a few frames to speed up.
 */
 bool
-TermView::_Render(int32& _firstRow, int32& _lastRow)
+TermView::_Render(BBitmap& target, int32& _firstRow, int32& _lastRow)
 {
 	const GlyphAtlasInfo& atlas = fGlyphs.Atlas();
-	uint8* bits = (uint8*)fBitmap->Bits();
-	int32 bytesPerRow = fBitmap->BytesPerRow();
+	uint8* bits = (uint8*)target.Bits();
+	int32 bytesPerRow = target.BytesPerRow();
 
 	if (fGPURenderer == NULL || fGPURenderer->IsBroken()) {
 		// no GPU, or it is gone: the processor draws from now on
@@ -3073,7 +3063,7 @@ TermView::_Render(int32& _firstRow, int32& _lastRow)
 	if (!fRenderer->Render(fFrame, atlas, bits, bytesPerRow, _firstRow,
 			_lastRow)) {
 		if (gpu && fGPURenderer->IsBroken())
-			return _Render(_firstRow, _lastRow);
+			return _Render(target, _firstRow, _lastRow);
 		return false;
 	}
 	bigtime_t now = system_time();
@@ -3122,6 +3112,14 @@ TermView::Draw(BRect updateRect)
 		BRect source = fBitmap->Bounds();
 		BRect destination(0, 0, (source.Width() + 1) / fScale - 1,
 			(source.Height() + 1) / fScale - 1);
+		if (!destination.Contains(updateRect)) {
+			// Fill the newly exposed edges while the larger frame is pending.
+			BRegion exposed(updateRect);
+			exposed.Exclude(BRect(0, 0, floorf(destination.right),
+				floorf(destination.bottom)));
+			SetHighColor(color_from_value(fFrame.defaultBackground));
+			FillRegion(&exposed);
+		}
 		DrawBitmap(fBitmap, source, destination,
 			fScale != 1 ? B_DEVICE_PIXEL_BITMAP : 0);
 	} else {
@@ -3815,8 +3813,6 @@ TermView::MakeFocus(bool focusState)
 void
 TermView::FrameResized(float width, float height)
 {
-	_ResizeBitmap();
-
 	int32 columns = (int32)((width + 1) / fFontWidth);
 	int32 rows = (int32)((height + 1) / fFontHeight);
 

@@ -317,7 +317,6 @@ private:
 			// geometry
 			float				_DeviceScale() const;
 			void				_UpdateMetrics();
-			void				_ResizeBitmap();
 			int32				_FirstRow() const;
 			TermPoint			_ConvertToTerminal(const BPoint& point) const;
 			BPoint				_ConvertFromTerminal(const TermPoint& pos)
@@ -328,7 +327,8 @@ private:
 			// drawing
 			void				_ScheduleFrame();
 			void				_RenderFrame();
-			bool				_Render(int32& _firstRow, int32& _lastRow);
+			bool				_Render(BBitmap& target, int32& _firstRow,
+									int32& _lastRow);
 			void				_InvalidateAll();
 			void				_LoadRenderer();
 			void				_PostEvent(Event* event);
