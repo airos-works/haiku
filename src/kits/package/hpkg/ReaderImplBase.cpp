@@ -1300,7 +1300,7 @@ ReaderImplBase::ReadAttributeValue(uint8 type, uint8 encoding,
 				if (error != B_OK)
 					return error;
 
-				if (index > fCurrentSection->stringsCount) {
+				if (index >= fCurrentSection->stringsCount) {
 					fErrorOutput->PrintError("Error: Invalid %s section: "
 						"string reference (%lld) out of bounds (%lld)\n",
 						fCurrentSection->name, index,
