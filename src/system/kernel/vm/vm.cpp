@@ -2598,17 +2598,9 @@ map_device_area_like(VMArea* sourceArea, VMArea* area, uint32 protection)
 {
 	uint32 memoryType = sourceArea->MemoryType();
 
-	VMTranslationMap* map = sourceArea->address_space->TranslationMap();
-	map->Lock();
-
-	phys_addr_t physicalAddress;
-	uint32 oldProtection;
-	map->Query(sourceArea->Base(), &physicalAddress, &oldProtection);
-
-	map->Unlock();
-
+	VMTranslationMap* sourceMap = sourceArea->address_space->TranslationMap();
 	VMAddressSpace* addressSpace = area->address_space;
-	map = addressSpace->TranslationMap();
+	VMTranslationMap* map = addressSpace->TranslationMap();
 	size_t reservePages = map->MaxPagesNeededToMap(area->Base(),
 		area->Base() + (area->Size() - 1));
 
@@ -2616,18 +2608,52 @@ map_device_area_like(VMArea* sourceArea, VMArea* area, uint32 protection)
 	vm_page_reserve_pages(&reservation, reservePages,
 		addressSpace == VMAddressSpace::Kernel()
 			? VM_PRIORITY_SYSTEM : VM_PRIORITY_USER);
-	map->Lock();
 
-	for (addr_t offset = 0; offset < area->Size(); offset += B_PAGE_SIZE) {
-		map->Map(area->Base() + offset, physicalAddress + offset,
-			protection, area->MemoryType(), &reservation);
+	// The source need not be one physical range
+	// (vm_map_physical_memory_vecs()): ask its map for every page, a batch
+	// at a time, so that the two maps are never locked together.
+	static const size_t kBatchPages = 32;
+	static const phys_addr_t kNotMapped = ~(phys_addr_t)0;
+	phys_addr_t physicalAddresses[kBatchPages];
+	phys_addr_t firstPhysicalAddress = kNotMapped;
+
+	for (addr_t offset = 0; offset < area->Size();) {
+		const size_t count = std::min(kBatchPages,
+			(size_t)((area->Size() - offset) / B_PAGE_SIZE));
+
+		sourceMap->Lock();
+		for (size_t i = 0; i < count; i++) {
+			uint32 flags;
+			if (sourceMap->Query(sourceArea->Base() + offset + i * B_PAGE_SIZE,
+					&physicalAddresses[i], &flags) != B_OK
+				|| (flags & PAGE_PRESENT) == 0) {
+				physicalAddresses[i] = kNotMapped;
+			} else if (firstPhysicalAddress == kNotMapped)
+				firstPhysicalAddress = physicalAddresses[i];
+		}
+		sourceMap->Unlock();
+
+		map->Lock();
+		for (size_t i = 0; i < count; i++) {
+			if (physicalAddresses[i] == kNotMapped)
+				continue;
+
+			// a copy has the source's protection, page by page
+			const addr_t address = area->Base() + offset + i * B_PAGE_SIZE;
+			map->Map(address, physicalAddresses[i],
+				area->page_protections != NULL
+					? get_area_page_protection(area, address) : protection,
+				area->MemoryType(), &reservation);
+		}
+		map->Unlock();
+
+		offset += count * B_PAGE_SIZE;
 	}
 
-	map->Unlock();
 	vm_page_unreserve_pages(&reservation);
 
-	if (memoryType != 0) {
-		status_t status = arch_vm_set_memory_type(area, physicalAddress,
+	if (memoryType != 0 && firstPhysicalAddress != kNotMapped) {
+		status_t status = arch_vm_set_memory_type(area, firstPhysicalAddress,
 			memoryType, NULL);
 
 		// Resetting the same memory type on the same physical memory
@@ -3161,7 +3187,12 @@ vm_copy_area(team_id team, const char* name, void** _address,
 
 		cacheLocker.SetTo(cache, true);	// already locked
 
-		sharedArea = (source->protection & B_SHARED_AREA) != 0;
+		// Device memory is never copied: there are no pages to copy, and a
+		// copy-on-write cache over it would put RAM where the program wrote
+		// to the device. The child gets the mapping itself, whether the area
+		// is a clone (B_SHARED_AREA) or what a driver mapped for the team.
+		sharedArea = (source->protection & B_SHARED_AREA) != 0
+			|| cache->type == CACHE_TYPE_DEVICE;
 
 		page_num_t oldWiredPages = wiredPages;
 		wiredPages = 0;
@@ -3258,7 +3289,8 @@ vm_copy_area(team_id team, const char* name, void** _address,
 		// hasn't acquired a ref. So we have to do that now.
 		cache->AcquireRefLocked();
 
-		if (source->cache_type == CACHE_TYPE_DEVICE) {
+		if (source->cache_type == CACHE_TYPE_DEVICE
+			|| cache->type == CACHE_TYPE_DEVICE) {
 			// A device memory mapping (a frame buffer a direct window maps,
 			// say) has no pages a fault could map: map it all now, as
 			// vm_clone_area() does, or the child crashes when it touches it.
@@ -4743,6 +4775,28 @@ vm_soft_fault(VMAddressSpace* addressSpace, addr_t originalAddress,
 			status = context.topCache->Fault(addressSpace, context.cacheOffset);
 			if (status != B_BAD_HANDLER)
 				break;
+		}
+
+		if (context.topCache->type == CACHE_TYPE_DEVICE && wirePage == NULL) {
+			// Device memory is mapped when its area is made and has no pages
+			// a fault could map. A fault on a page of it that is mapped (one
+			// taken on a stale TLB entry while mprotect() gave the access)
+			// must not put a page of RAM in the device's place: set the
+			// mapping's protection and be done.
+			context.map->Lock();
+			phys_addr_t physicalAddress;
+			uint32 flags;
+			const bool mapped = context.map->Query(address, &physicalAddress,
+					&flags) == B_OK
+				&& (flags & PAGE_PRESENT) != 0;
+			if (mapped)
+				context.map->ProtectPage(area, address, protection);
+			context.map->Unlock();
+
+			if (mapped) {
+				status = B_OK;
+				break;
+			}
 		}
 
 		if ((area->protection & B_LARGE_PAGES_AREA) != 0 && wirePage == NULL
@@ -6886,6 +6940,14 @@ _user_set_memory_protection(void* _address, size_t size, uint32 protection)
 			status_t error = map->Query(pageAddress, &physicalAddress, &flags);
 			if (error != B_OK || (flags & PAGE_PRESENT) == 0)
 				continue;
+
+			if (topCache->type == CACHE_TYPE_DEVICE) {
+				// Device memory: what is mapped is the device's, not a page
+				// of some cache (most of it has no vm_page at all, and where
+				// it has one, that page is not the cache's).
+				map->ProtectPage(area, pageAddress, protection);
+				continue;
+			}
 
 			vm_page* page = vm_lookup_page(physicalAddress / B_PAGE_SIZE);
 			if (page == NULL) {
