@@ -253,6 +253,9 @@ struct eqos_info {
 
 	mutex			rxLock;
 	mutex			txLock;
+	spinlock		interruptLock;
+		// for DMA_CH0_INTERRUPT_ENABLE: the interrupt handler, the reader and
+		// the sender all change it
 	sem_id			rxSemaphore;
 	sem_id			txSemaphore;
 	uint32			rxIndex;	// next descriptor the controller completes
@@ -301,6 +304,21 @@ static inline void
 clear32(eqos_info* info, uint32 reg, uint32 bits)
 {
 	write32(info, reg, read32(info, reg) & ~bits);
+}
+
+
+/*!	Read-modify-write of DMA_CH0_INTERRUPT_ENABLE, under the lock the
+	interrupt handler takes for it too: set32() and clear32() from the
+	reader and the sender raced with each other and with the handler, and
+	an enable could be lost. A receive interrupt lost that way left the
+	reader asleep for good (airos-works/haiku#192).
+*/
+static void
+update_interrupt_enable(eqos_info* info, uint32 set, uint32 clear)
+{
+	InterruptsSpinLocker locker(info->interruptLock);
+	write32(info, DMA_CH0_INTERRUPT_ENABLE,
+		(read32(info, DMA_CH0_INTERRUPT_ENABLE) & ~clear) | set);
 }
 
 
@@ -602,6 +620,8 @@ eqos_interrupt(void* data)
 {
 	eqos_info* info = (eqos_info*)data;
 
+	SpinLocker locker(info->interruptLock);
+		// (interrupts are off in the handler)
 	uint32 status = read32(info, DMA_CH0_STATUS);
 	uint32 enabled = read32(info, DMA_CH0_INTERRUPT_ENABLE);
 	if ((status & enabled & (DMA_INT_RI | DMA_INT_TI | DMA_INT_FBE)) == 0) {
@@ -619,6 +639,7 @@ eqos_interrupt(void* data)
 	// interrupts are only needed when a writer runs out of descriptors.
 	uint32 handled = status & enabled & (DMA_INT_RI | DMA_INT_TI);
 	write32(info, DMA_CH0_INTERRUPT_ENABLE, enabled & ~handled);
+	locker.Unlock();
 	if ((handled & DMA_INT_RI) != 0)
 		release_sem_etc(info->rxSemaphore, 1, B_DO_NOT_RESCHEDULE);
 	if ((handled & DMA_INT_TI) != 0)
@@ -658,7 +679,7 @@ give_rx_descriptor(eqos_info* info, uint32 index)
 static void
 eqos_stop(eqos_info* info)
 {
-	write32(info, DMA_CH0_INTERRUPT_ENABLE, 0);
+	update_interrupt_enable(info, 0, 0xffffffff);
 
 	clear32(info, DMA_CH0_TX_CONTROL, TX_CONTROL_ST);
 	for (int i = 0; i < 10000; i++) {
@@ -781,8 +802,8 @@ eqos_start(eqos_info* info)
 		(uint32)rx_descriptor_address(info, DESCRIPTOR_COUNT - 1));
 
 	write32(info, DMA_CH0_STATUS, 0xffffffff);
-	write32(info, DMA_CH0_INTERRUPT_ENABLE, DMA_INT_NI | DMA_INT_AI
-		| DMA_INT_FBE | DMA_INT_RI);
+	update_interrupt_enable(info, DMA_INT_NI | DMA_INT_AI | DMA_INT_FBE
+		| DMA_INT_RI, 0xffffffff);
 
 	set32(info, DMA_CH0_TX_CONTROL, TX_CONTROL_ST);
 	set32(info, DMA_CH0_RX_CONTROL, RX_CONTROL_SR);
@@ -846,16 +867,18 @@ eqos_receive(eqos_info* info, net_buffer** _buffer)
 		// Arm, then recheck: a frame can arrive after the empty-ring test
 		// while the interrupt is still off. Never sleep with it pending.
 		write32(info, DMA_CH0_STATUS, DMA_INT_RI);
-		set32(info, DMA_CH0_INTERRUPT_ENABLE, DMA_INT_RI);
+		update_interrupt_enable(info, DMA_INT_RI, 0);
 		if ((info->rxRing[info->rxIndex].des3 & DES3_OWN) == 0) {
-			clear32(info, DMA_CH0_INTERRUPT_ENABLE, DMA_INT_RI);
+			update_interrupt_enable(info, 0, DMA_INT_RI);
 			continue;
 		}
 		locker.Unlock();
 
+		// (the timeout only in case the interrupt is lost after all: the
+		// ring is looked at again)
 		status_t result = acquire_sem_etc(info->rxSemaphore, 1,
-			B_CAN_INTERRUPT, 0);
-		if (result != B_OK)
+			B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT, 1000000);
+		if (result != B_OK && result != B_TIMED_OUT)
 			return result;
 	}
 }
@@ -891,10 +914,11 @@ eqos_send(eqos_info* info, net_buffer* buffer)
 			return B_WOULD_BLOCK;
 
 		write32(info, DMA_CH0_STATUS, DMA_INT_TI);
-		set32(info, DMA_CH0_INTERRUPT_ENABLE, DMA_INT_TI);
+		update_interrupt_enable(info, DMA_INT_TI, 0);
 		clean_tx(info);
 		if ((info->txIndex + DESCRIPTOR_COUNT - info->txCleaned)
 				% DESCRIPTOR_COUNT < DESCRIPTOR_COUNT - 1) {
+			update_interrupt_enable(info, 0, DMA_INT_TI);
 			continue;
 		}
 		locker.Unlock();
@@ -922,7 +946,11 @@ eqos_send(eqos_info* info, net_buffer* buffer)
 	eqos_descriptor& descriptor = info->txRing[index];
 	descriptor.des0 = (uint32)address;
 	descriptor.des1 = (uint32)(address >> 32);
-	descriptor.des2 = length;
+	descriptor.des2 = DES2_IOC | length;
+		// Interrupt on completion: the sender that waits for room is woken
+		// by it. Without it, the transmit interrupt it enables never came,
+		// and every full ring cost the 100 ms timeout (airos-works/haiku#192).
+		// While nobody waits, the interrupt is off.
 	memory_write_barrier();
 	descriptor.des3 = DES3_OWN | DES3_FD | DES3_LD | length;
 
@@ -1022,6 +1050,7 @@ eqos_init_device(void* _info, void** _cookie)
 
 	mutex_init(&info->rxLock, "dwc_eqos rx");
 	mutex_init(&info->txLock, "dwc_eqos tx");
+	B_INITIALIZE_SPINLOCK(&info->interruptLock);
 	info->rxSemaphore = -1;
 	info->txSemaphore = -1;
 	info->linkChangeSemaphore = -1;

@@ -358,6 +358,9 @@ struct tc956x_device {
 
 	mutex			rxLock;
 	mutex			txLock;
+	spinlock		interruptLock;
+		// for DMA_CH0_INT_EN: the interrupt handler, the reader and
+		// the sender all change it
 	mutex			mdioLock;
 	sem_id			rxSemaphore;
 	sem_id			txSemaphore;
@@ -428,6 +431,21 @@ static inline void
 clear32(tc956x_device* device, uint32 reg, uint32 bits)
 {
 	write32(device, reg, read32(device, reg) & ~bits);
+}
+
+
+/*!	Read-modify-write of DMA_CH0_INT_EN, under the lock the
+	interrupt handler takes for it too: set32() and clear32() from the
+	reader and the sender raced with each other and with the handler, and
+	an enable could be lost. A receive interrupt lost that way left the
+	reader asleep for good (airos-works/haiku#192).
+*/
+static void
+update_interrupt_enable(tc956x_device* device, uint32 set, uint32 clear)
+{
+	InterruptsSpinLocker locker(device->interruptLock);
+	write32(device, DMA_CH0_INT_EN,
+		(read32(device, DMA_CH0_INT_EN) & ~clear) | set);
 }
 
 
@@ -1048,6 +1066,8 @@ tc956x_interrupt(void* data)
 	device->interrupts++;
 
 	uint32 sources = mmio_read(device->msigen, MSI_INT_STS);
+	SpinLocker locker(device->interruptLock);
+		// (interrupts are off in the handler)
 	uint32 status = read32(device, DMA_CH0_STATUS);
 	uint32 enabled = read32(device, DMA_CH0_INT_EN);
 
@@ -1064,6 +1084,7 @@ tc956x_interrupt(void* data)
 		// interrupts are only needed when a writer runs out of descriptors.
 		uint32 handled = status & enabled & (DMA_INT_RI | DMA_INT_TI);
 		write32(device, DMA_CH0_INT_EN, enabled & ~handled);
+		locker.Unlock();
 		if ((handled & DMA_INT_RI) != 0)
 			release_sem_etc(device->rxSemaphore, 1, B_DO_NOT_RESCHEDULE);
 		if ((handled & DMA_INT_TI) != 0)
@@ -1111,7 +1132,7 @@ static void
 tc956x_stop(tc956x_device* device)
 {
 	mmio_write(device->msigen, MSI_OUT_EN, 0);
-	write32(device, DMA_CH0_INT_EN, 0);
+	update_interrupt_enable(device, 0, 0xffffffff);
 
 	clear32(device, DMA_CH0_TX_CONTROL, TX_CONTROL_ST);
 	snooze(1000);
@@ -1228,8 +1249,8 @@ tc956x_start(tc956x_device* device)
 			DESCRIPTOR_COUNT - 1)));
 
 	write32(device, DMA_CH0_STATUS, 0xffffffff);
-	write32(device, DMA_CH0_INT_EN, DMA_INT_NI | DMA_INT_AI | DMA_INT_FBE
-		| DMA_INT_RI);
+	update_interrupt_enable(device, DMA_INT_NI | DMA_INT_AI | DMA_INT_FBE
+		| DMA_INT_RI, 0xffffffff);
 
 	set32(device, DMA_CH0_TX_CONTROL, TX_CONTROL_ST);
 	set32(device, DMA_CH0_RX_CONTROL, RX_CONTROL_SR);
@@ -1301,16 +1322,18 @@ tc956x_receive(tc956x_device* device, net_buffer** _buffer)
 		// Arm, then recheck: a frame can arrive after the empty-ring test
 		// while the interrupt is still off. Never sleep with it pending.
 		write32(device, DMA_CH0_STATUS, DMA_INT_RI);
-		set32(device, DMA_CH0_INT_EN, DMA_INT_RI);
+		update_interrupt_enable(device, DMA_INT_RI, 0);
 		if ((device->rxRing[device->rxIndex].des3 & DES3_OWN) == 0) {
-			clear32(device, DMA_CH0_INT_EN, DMA_INT_RI);
+			update_interrupt_enable(device, 0, DMA_INT_RI);
 			continue;
 		}
 		locker.Unlock();
 
+		// (the timeout only in case the interrupt is lost after all: the
+		// ring is looked at again)
 		status_t result = acquire_sem_etc(device->rxSemaphore, 1,
-			B_CAN_INTERRUPT, 0);
-		if (result != B_OK)
+			B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT, 1000000);
+		if (result != B_OK && result != B_TIMED_OUT)
 			return result;
 	}
 }
@@ -1346,10 +1369,11 @@ tc956x_send(tc956x_device* device, net_buffer* buffer)
 			return B_WOULD_BLOCK;
 
 		write32(device, DMA_CH0_STATUS, DMA_INT_TI);
-		set32(device, DMA_CH0_INT_EN, DMA_INT_TI);
+		update_interrupt_enable(device, DMA_INT_TI, 0);
 		clean_tx(device);
 		if ((device->txIndex + DESCRIPTOR_COUNT - device->txCleaned)
 				% DESCRIPTOR_COUNT < DESCRIPTOR_COUNT - 1) {
+			update_interrupt_enable(device, 0, DMA_INT_TI);
 			continue;
 		}
 		locker.Unlock();
@@ -1376,7 +1400,11 @@ tc956x_send(tc956x_device* device, net_buffer* buffer)
 	tc956x_descriptor& descriptor = device->txRing[index];
 	descriptor.des0 = (uint32)address;
 	descriptor.des1 = (uint32)(address >> 32);
-	descriptor.des2 = length;
+	descriptor.des2 = DES2_IOC | length;
+		// Interrupt on completion: the sender that waits for room is woken
+		// by it. Without it, the transmit interrupt it enables never came,
+		// and every full ring cost the 100 ms timeout (airos-works/haiku#192).
+		// While nobody waits, the interrupt is off.
 	memory_write_barrier();
 	descriptor.des3 = DES3_OWN | DES3_FD | DES3_LD | length;
 
@@ -1966,6 +1994,7 @@ device_init(tc956x_device* device)
 
 	mutex_init(&device->rxLock, "tc956x rx");
 	mutex_init(&device->txLock, "tc956x tx");
+	B_INITIALIZE_SPINLOCK(&device->interruptLock);
 	mutex_init(&device->mdioLock, "tc956x mdio");
 	device->rxSemaphore = -1;
 	device->txSemaphore = -1;
