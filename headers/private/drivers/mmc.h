@@ -213,6 +213,13 @@ typedef struct mmc_device_interface {
 		// Execute a command that involves a data transfer.
 	void (*set_bus_width)(device_node* controller, void* cookie, int width);
 		// Set the data bus width to 1, 4 or 8 bit mode.
+	status_t (*erase)(device_node* controller, void* cookie, uint16_t rca,
+		uint32_t firstAddress, uint32_t lastAddress, uint32_t mode);
+		// The SD erase sequence (CMD32, CMD33, CMD38) for the blocks from
+		// firstAddress to lastAddress, both included, as one step: no other
+		// command of this bus gets in between, which would reset the
+		// sequence, and it fails when the card reports an error for any
+		// of them.
 } mmc_device_interface;
 
 

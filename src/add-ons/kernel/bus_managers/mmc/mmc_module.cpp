@@ -108,6 +108,20 @@ mmc_bus_do_io(device_node* node, void* cookie, uint16_t rca, uint8_t command,
 }
 
 
+static status_t
+mmc_bus_erase(device_node* node, void* cookie, uint16_t rca,
+	uint32_t firstAddress, uint32_t lastAddress, uint32_t mode)
+{
+	MMCBus* bus = (MMCBus*)cookie;
+
+	bus->AcquireBus();
+	status_t result = bus->Erase(rca, firstAddress, lastAddress, mode);
+	bus->ReleaseBus();
+
+	return result;
+}
+
+
 static void
 mmc_bus_set_width(device_node* node, void* cookie, int width)
 {
@@ -170,7 +184,8 @@ mmc_device_interface mmc_bus_controller_module = {
 	},
 	mmc_bus_execute_command,
 	mmc_bus_do_io,
-	mmc_bus_set_width
+	mmc_bus_set_width,
+	mmc_bus_erase
 };
 
 

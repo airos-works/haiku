@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include "mmc_disk.h"
+#include "sd_erase_range.h"
 #include "mmc_icon.h"
 #include "mmc.h"
 
@@ -580,34 +581,25 @@ mmc_block_trim(mmc_disk_driver_info* info, fs_trim_data* trimData)
 		ASSERT(offset % kBlockSize == 0);
 		ASSERT(length % kBlockSize == 0);
 
-		if ((info->flags & kIoCommandOffsetAsSectors) != 0) {
-			offset /= kBlockSize;
-			length /= kBlockSize;
-		}
-
-		// Parameter of execute_command is uint32_t
-		if (offset > UINT32_MAX
-			|| length > UINT32_MAX - offset) {
+		// The end of an erase is its last block, not the block after it
+		// (which, for a file system's trim, is a block in use).
+		uint32_t first;
+		uint32_t last;
+		if (!sd_erase_range(offset, length, kBlockSize,
+				(info->flags & kIoCommandOffsetAsSectors) != 0, &first,
+				&last)) {
 			result = B_BAD_VALUE;
 			break;
 		}
 
-		uint32_t response;
-		result = info->mmc->execute_command(info->parent, info->parentCookie,
-			info->rca, SD_ERASE_WR_BLK_START, offset, &response);
-		if (result != B_OK)
-			break;
-		result = info->mmc->execute_command(info->parent, info->parentCookie,
-			info->rca, SD_ERASE_WR_BLK_END, offset + length, &response);
-		if (result != B_OK)
-			break;
-		result = info->mmc->execute_command(info->parent, info->parentCookie,
-			info->rca, SD_ERASE, kEraseModeDiscard, &response);
+		// One step for the bus: a read or write between the three commands
+		// would reset the sequence. A range the card refuses is not counted.
+		result = info->mmc->erase(info->parent, info->parentCookie, info->rca,
+			first, last, kEraseModeDiscard);
 		if (result != B_OK)
 			break;
 
-		trimmedSize += (info->flags & kIoCommandOffsetAsSectors) != 0
-			? length * kBlockSize : length;
+		trimmedSize += length;
 	}
 
 	trimData->trimmed_size = trimmedSize;

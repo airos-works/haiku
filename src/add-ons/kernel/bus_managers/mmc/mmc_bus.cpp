@@ -154,6 +154,66 @@ MMCBus::ExecuteCommand(uint16_t rca, uint8_t command, uint32_t argument,
 }
 
 
+/*!	The SD erase sequence for the blocks from \a firstAddress to
+	\a lastAddress, both included. The caller holds the bus for all of it:
+	any command but these (and SEND_STATUS) between the first and the last
+	makes the card drop the sequence.
+*/
+status_t
+MMCBus::Erase(uint16_t rca, uint32_t firstAddress, uint32_t lastAddress,
+	uint32_t mode)
+{
+	static const struct {
+		uint8_t		command;
+		const char*	name;
+	} kSequence[] = {
+		{ SD_ERASE_WR_BLK_START, "ERASE_WR_BLK_START" },
+		{ SD_ERASE_WR_BLK_END, "ERASE_WR_BLK_END" },
+		{ SD_ERASE, "ERASE" }
+	};
+	const uint32_t arguments[] = { firstAddress, lastAddress, mode };
+
+	uint32_t response = 0;
+	for (size_t i = 0; i < B_COUNT_OF(kSequence); i++) {
+		status_t status = ExecuteCommand(rca, kSequence[i].command,
+			arguments[i], &response);
+		// The answer is the card's status: an address out of range, a
+		// sequence error and a write protected card are told there, not by
+		// the host.
+		if (status == B_OK && (response & kMmcR1ErrorMask) != 0)
+			status = B_IO_ERROR;
+		if (status != B_OK) {
+			ERROR("erase of %" B_PRIu32 " to %" B_PRIu32 ": %s failed: %s, "
+				"card status %#" B_PRIx32 "\n", firstAddress, lastAddress,
+				kSequence[i].name, strerror(status), response);
+			return status;
+		}
+	}
+
+	// The card is busy while it erases, and tells what went wrong with it
+	// (a protected block that was skipped) in its status afterwards. The
+	// next command waits until it is ready for data again.
+	const bigtime_t deadline = system_time() + 30 * 1000000LL;
+	while (true) {
+		status_t status = fController->execute_command(fCookie, SEND_STATUS,
+			(uint32_t)rca << 16, &response);
+		if (status == B_OK && (response & kMmcR1ErrorMask) != 0)
+			status = B_IO_ERROR;
+		if (status != B_OK) {
+			ERROR("erase of %" B_PRIu32 " to %" B_PRIu32 " failed: %s, card "
+				"status %#" B_PRIx32 "\n", firstAddress, lastAddress,
+				strerror(status), response);
+			return status;
+		}
+		if ((response & 0x1f00) == 0x900)
+			return B_OK; // READY_FOR_DATA and TRAN state.
+		if (system_time() >= deadline)
+			return B_TIMED_OUT;
+		snooze(1000);
+	}
+}
+
+
 status_t
 MMCBus::DoIO(uint16_t rca, uint8_t command, IOOperation* operation,
 	bool offsetAsSectors)

@@ -148,6 +148,8 @@ public:
 				status_t		DoIO(uint16_t rca, uint8_t command,
 									IOOperation* operation,
 									bool offsetAsSectors);
+				status_t		Erase(uint16_t rca, uint32_t firstAddress,
+									uint32_t lastAddress, uint32_t mode);
 
 				status_t		SetClock(int frequency);
 				status_t		ReadExtendedCsd(uint16_t rca, uint8_t data[512]);

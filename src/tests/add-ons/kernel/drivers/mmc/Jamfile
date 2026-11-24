@@ -1,0 +1,7 @@
+SubDir HAIKU_TOP src tests add-ons kernel drivers mmc ;
+
+# sd_erase_range_test.cpp is a test for the build host, see run_host.sh.
+
+SimpleTest sd_trim_test :
+	sd_trim_test.cpp
+;
