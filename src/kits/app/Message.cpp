@@ -78,6 +78,10 @@ extern "C" {
 }
 
 
+//!	The area a large message's fields and data are sent in (_FlattenToArea())
+static const char* const kMessageAreaName = "BMessage data";
+
+
 BBlockCache* BMessage::sMsgCache = NULL;
 port_id BMessage::sReplyPorts[sNumReplyPorts];
 int32 BMessage::sReplyPortInUse[sNumReplyPorts];
@@ -113,6 +117,24 @@ print_type3(const char* format, uint8* pointer)
 	Type item;
 	memcpy(&item, pointer, sizeof(Type));
 	printf(format, item, item, item);
+}
+
+
+/*!	Unflattens a message that is the value of a field: from no more than
+	the \a size bytes the field has for it, and with nothing of it in an area
+	(a message in a field is never flattened that way).
+*/
+static status_t
+unflatten_field(BMessage* message, const void* data, ssize_t size)
+{
+	if (size >= (ssize_t)sizeof(uint32)
+		&& *(const uint32*)data == MESSAGE_FORMAT_HAIKU) {
+		BMemoryIO stream(data, size);
+		return message->Unflatten(&stream);
+	}
+
+	// the formats of other systems carry their own size
+	return message->Unflatten((const char*)data);
 }
 
 
@@ -326,8 +348,9 @@ BMessage::HasSameData(const BMessage& other, bool ignoreFieldOrder,
 		bool needsMemCompare = true;
 		if (deep && field->type == B_MESSAGE_TYPE) {
 			BMessage message, otherMessage;
-			if (message.Unflatten((const char*)data) == B_OK
-				&& otherMessage.Unflatten((const char*)otherData) == B_OK) {
+			if (unflatten_field(&message, data, field->data_size) == B_OK
+				&& unflatten_field(&otherMessage, otherData,
+					otherField->data_size) == B_OK) {
 				if (!message.HasSameData(ignoreFieldOrder, deep))
 					return false;
 				needsMemCompare = false;
@@ -739,7 +762,8 @@ BMessage::_PrintToStream(const char* indent) const
 					snprintf(buffer, sizeof(buffer), "%s        ", indent);
 
 					BMessage message;
-					status_t result = message.Unflatten((const char*)pointer);
+					status_t result = unflatten_field(&message, pointer,
+						size);
 					if (result != B_OK) {
 						printf("failed unflatten: %s\n", strerror(result));
 						break;
@@ -1159,7 +1183,7 @@ BMessage::_FlattenToArea(message_header** _header) const
 	size_t fieldsSize = header->field_count * sizeof(field_header);
 	size_t size = fieldsSize + header->data_size;
 	size = (size + B_PAGE_SIZE) & ~(B_PAGE_SIZE - 1);
-	area_id area = create_area("BMessage data", (void**)&address,
+	area_id area = create_area(kMessageAreaName, (void**)&address,
 		B_ANY_ADDRESS, size, B_NO_LOCK, B_READ_AREA | B_WRITE_AREA);
 
 	if (area < 0) {
@@ -1186,16 +1210,29 @@ BMessage::_Reference()
 	fHeader->flags &= ~MESSAGE_FLAG_PASS_BY_AREA;
 
 	/* if there is no data at all we don't need the area */
-	if (fHeader->field_count == 0 && fHeader->data_size == 0)
+	if (fHeader->field_count == 0 && fHeader->data_size == 0) {
+		// (and none was sent: the id is not one to delete with the message)
+		fHeader->message_area = -1;
 		return B_OK;
+	}
 
 	area_info areaInfo;
 	status_t result = get_area_info(fHeader->message_area, &areaInfo);
 	if (result != B_OK)
 		return result;
 
-	if (areaInfo.team != BPrivate::current_team())
+	// The id is a number in a header that another program wrote. Only an
+	// area that _FlattenToArea() made and the sender transferred to this
+	// team is taken (it is made read-only here and deleted with the
+	// message, which must not happen to any other area of this team), and
+	// it has to hold the fields and the data the header counts.
+	uint64 size = (uint64)fHeader->field_count * sizeof(field_header)
+		+ fHeader->data_size;
+	if (areaInfo.team != BPrivate::current_team()
+		|| areaInfo.size < size
+		|| strcmp(areaInfo.name, kMessageAreaName) != 0) {
 		return B_BAD_VALUE;
+	}
 
 	set_area_protection(fHeader->message_area, B_READ_AREA);
 
@@ -1269,22 +1306,75 @@ BMessage::_ValidateMessage()
 	if (fHeader == NULL)
 		return B_NO_INIT;
 
-	if (fHeader->field_count == 0)
+	// The header and the fields can be another program's, or come from a
+	// file or an attribute. What the accessors index with, divide by or
+	// follow without looking again is checked here, once: the hash table and
+	// its chains, the place of every field in the data, and the sizes of
+	// the items of fields of variable size.
+	bool valid = fHeader->hash_table_size == MESSAGE_BODY_HASH_TABLE_SIZE;
+
+	if (valid && fHeader->field_count == 0)
 		return B_OK;
 
-	if (fFields == NULL)
+	if (valid && fFields == NULL)
 		return B_NO_INIT;
 
-	for (uint32 i = 0; i < fHeader->field_count; i++) {
+	const uint32 fieldCount = fHeader->field_count;
+	const uint64 dataSize = fHeader->data_size;
+
+	for (uint32 i = 0; valid && i < fieldCount; i++) {
 		field_header* field = &fFields[i];
-		if ((field->next_field >= 0
-				&& (uint32)field->next_field > fHeader->field_count)
-			|| (field->offset + field->name_length + field->data_size
-				> fHeader->data_size)) {
-			// the message is corrupt
-			MakeEmpty();
-			return B_BAD_VALUE;
+		if (field->next_field < -1
+			|| (field->next_field >= 0
+				&& (uint32)field->next_field >= fieldCount)
+			|| (uint64)field->offset + field->name_length + field->data_size
+				> dataSize
+			|| field->name_length == 0 || field->count == 0
+			|| fData == NULL
+			|| fData[field->offset + field->name_length - 1] != '\0') {
+			valid = false;
+			break;
 		}
+
+		if ((field->flags & FIELD_FLAG_FIXED_SIZE) == 0) {
+			// each item is its size and then its data
+			const uint8* items = fData + field->offset + field->name_length;
+			uint64 position = 0;
+			for (uint32 item = 0; item < field->count; item++) {
+				if (position + sizeof(uint32) > field->data_size) {
+					valid = false;
+					break;
+				}
+				uint32 itemSize;
+				memcpy(&itemSize, items + position, sizeof(uint32));
+				position += sizeof(uint32) + itemSize;
+			}
+			if (position > field->data_size)
+				valid = false;
+		}
+	}
+
+	// every chain ends: together they hold each field once at most
+	uint32 chained = 0;
+	for (uint32 i = 0; valid && i < MESSAGE_BODY_HASH_TABLE_SIZE; i++) {
+		int32 next = fHeader->hash_table[i];
+		if (next < -1 || (next >= 0 && (uint32)next >= fieldCount)) {
+			valid = false;
+			break;
+		}
+		while (next >= 0) {
+			if (++chained > fieldCount) {
+				valid = false;
+				break;
+			}
+			next = fFields[next].next_field;
+		}
+	}
+
+	if (!valid) {
+		// the message is corrupt
+		MakeEmpty();
+		return B_BAD_VALUE;
 	}
 
 	return B_OK;
@@ -1302,13 +1392,26 @@ BMessage::Unflatten(const char* flatBuffer)
 	if (format != MESSAGE_FORMAT_HAIKU)
 		return BPrivate::MessageAdapter::Unflatten(format, this, flatBuffer);
 
+	// This is how a message read from a port is unflattened: it may have its
+	// fields and data in an area (see _SendMessage()).
 	BMemoryIO io(flatBuffer, SSIZE_MAX);
-	return Unflatten(&io);
+	return _Unflatten(&io, true);
 }
 
 
 status_t
 BMessage::Unflatten(BDataIO* stream)
+{
+	DEBUG_FUNCTION_ENTER;
+	// What comes out of a stream (a file, an attribute, a buffer of a known
+	// size) has all of the message in it: a header in it that names an area
+	// is damaged, or wants an area of this team deleted.
+	return _Unflatten(stream, false);
+}
+
+
+status_t
+BMessage::_Unflatten(BDataIO* stream, bool mayReferenceArea)
 {
 	DEBUG_FUNCTION_ENTER;
 	if (stream == NULL)
@@ -1341,8 +1444,9 @@ BMessage::Unflatten(BDataIO* stream)
 
 	if ((fHeader->flags & MESSAGE_FLAG_PASS_BY_AREA) != 0
 		&& fHeader->message_area >= 0) {
-		status_t result = _Reference();
+		status_t result = mayReferenceArea ? _Reference() : B_BAD_VALUE;
 		if (result != B_OK) {
+			// (this forgets the area: it is not this message's to delete)
 			_InitHeader();
 			return result;
 		}
@@ -1358,8 +1462,13 @@ BMessage::Unflatten(BDataIO* stream)
 			}
 
 			result = stream->Read(fFields, fieldsSize);
-			if (result != fieldsSize)
+			if (result != fieldsSize) {
+				// not a header with fields that were never read
+				free(fFields);
+				fFields = NULL;
+				_InitHeader();
 				return result < 0 ? result : B_BAD_VALUE;
+			}
 		}
 
 		if (fHeader->data_size > 0) {
@@ -3060,7 +3169,7 @@ BMessage::FindMessage(const char* name, int32 index, BMessage* message) const
 		(const void**)&data, &size);
 
 	if (error == B_OK)
-		error = message->Unflatten((const char*)data);
+		error = unflatten_field(message, data, size);
 	else
 		*message = BMessage();
 

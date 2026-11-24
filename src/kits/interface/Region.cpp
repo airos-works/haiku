@@ -496,13 +496,20 @@ BRegion::_SetSize(int32 newSize)
 	if (newSize == fDataSize)
 		return true;
 
+	if (newSize > INT32_MAX - kDataBlockSize) {
+		// the rounding below would wrap, and report success with the old
+		// size (the count can be one read from a link)
+		return false;
+	}
+
 	// align newSize to multiple of kDataBlockSize
 	newSize = ((newSize + kDataBlockSize - 1) / kDataBlockSize) * kDataBlockSize;
 
 	if (newSize > 0) {
 		if (fData == &fBounds) {
 			fData = (clipping_rect*)malloc(newSize * sizeof(clipping_rect));
-			fData[0] = fBounds;
+			if (fData != NULL)
+				fData[0] = fBounds;
 		} else if (fData) {
 			clipping_rect* resizedData = (clipping_rect*)realloc(fData,
 				newSize * sizeof(clipping_rect));

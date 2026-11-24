@@ -62,6 +62,15 @@ public:
 		opSize = other.opSize;
 		ptCount = other.ptCount;
 		ptSize = other.ptSize;
+		if (opList == NULL || ptList == NULL) {
+			// no memory: an empty shape
+			delete[] opList;
+			delete[] ptList;
+			opList = NULL;
+			ptList = NULL;
+			opCount = opSize = ptCount = ptSize = 0;
+			return;
+		}
 		memcpy((void*)opList, other.opList, opSize);
 		memcpy((void*)ptList, other.ptList, ptSize);
 	}

@@ -169,6 +169,11 @@ SimpleTest DanoMessageTest :
 	dano_message.cpp
 	: be ;
 
+# BMessage::Unflatten() of damaged flattened messages (#177)
+SimpleTest message_unflatten_test :
+	MessageUnflattenTest.cpp
+	: be [ TargetLibstdc++ ] ;
+
 SEARCH on [ FGristFiles
 		dano_message.cpp
 	] = [ FDirName $(HAIKU_TOP) src kits app ] ;

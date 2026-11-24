@@ -560,6 +560,7 @@ private:
 			bool				fCaptureSessionPending;
 			bool				fCaptureSession;
 			BReference<UtilityBitmap> fCaptureBitmap;
+			BRegion				fCaptureContentRegion;
 			ObjectDeleter<BitmapHWInterface> fCaptureHWInterface;
 			ObjectDeleter<DrawingEngine> fCaptureEngine;
 };

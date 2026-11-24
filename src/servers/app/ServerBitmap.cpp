@@ -84,8 +84,8 @@ ServerBitmap::ServerBitmap(BRect rect, color_space space, uint32 flags,
 	// Same is done in FBBitmap subclass, so if you
 	// modify here make sure to do the same under
 	// FBBitmap::SetSize(...)
-	fWidth(rect.IntegerWidth() + 1),
-	fHeight(rect.IntegerHeight() + 1),
+	fWidth(0),
+	fHeight(0),
 	fBytesPerRow(0),
 	fSpace(space),
 	fFlags(flags),
@@ -94,9 +94,32 @@ ServerBitmap::ServerBitmap(BRect rect, color_space space, uint32 flags,
 	// fToken is initialized (if used) by the BitmapManager
 {
 	mutex_init(&fIconLock, "bitmap icon");
-	int32 minBytesPerRow = get_bytes_per_row(space, fWidth);
 
-	fBytesPerRow = max_c(bytesPerRow, minBytesPerRow);
+	// The bounds and the row length can be an application's (AS_CREATE_BITMAP,
+	// AS_RECONNECT_BITMAP, cursors, the pixels in a picture). A size that
+	// is not a bitmap's (not finite, empty, or with a length that does not
+	// fit 31 bits, which is what the kits and the drawing code compute
+	// with) leaves the bitmap empty: BitsLength() is 0 then and no buffer
+	// is allocated or accepted for it.
+	const float kMaxDimension = 1 << 27;
+		// 8 bytes per pixel still give a row length below 2 GiB
+	if (!rect.IsValid() || !(rect.Width() < kMaxDimension)
+		|| !(rect.Height() < kMaxDimension)) {
+		return;
+	}
+
+	int32 width = rect.IntegerWidth() + 1;
+	int32 height = rect.IntegerHeight() + 1;
+	int32 minBytesPerRow = get_bytes_per_row(space, width);
+	if (minBytesPerRow <= 0)
+		return;
+	bytesPerRow = max_c(bytesPerRow, minBytesPerRow);
+	if ((int64)bytesPerRow * height > INT32_MAX)
+		return;
+
+	fWidth = width;
+	fHeight = height;
+	fBytesPerRow = bytesPerRow;
 }
 
 

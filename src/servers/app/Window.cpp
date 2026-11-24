@@ -2125,7 +2125,17 @@ Window::_DrawableContentRegion()
 	if (fCaptureSession) {
 		if (!fContentRegionValid)
 			_UpdateContentRegion();
-		return fContentRegion;
+		// Only what is inside the capture bitmap: the bitmap starts at the
+		// screen's origin, the window may reach above or left of it, and it
+		// may have been moved or resized since the bitmap was made. The
+		// drawing code trusts its clipping to be inside the buffer.
+		fCaptureContentRegion = fContentRegion;
+		if (fCaptureBitmap.IsSet()) {
+			BRegion bitmapBounds(fCaptureBitmap->Bounds());
+			fCaptureContentRegion.IntersectWith(&bitmapBounds);
+		} else
+			fCaptureContentRegion.MakeEmpty();
+		return fCaptureContentRegion;
 	}
 	return VisibleContentRegion();
 }
@@ -2169,8 +2179,20 @@ Window::StartCapture()
 	// a bitmap as large as the screens, so that the drawing engine draws in
 	// screen coordinates as it does on the screen
 	BRect screen = fDesktop->VirtualScreen().Frame().OffsetToCopy(0, 0);
-	screen.right = std::max(screen.right, fFrame.right);
-	screen.bottom = std::max(screen.bottom, fFrame.bottom);
+	// It grows for a window that reaches beyond the right or bottom edge,
+	// but by no more than the size of the screens: a window parked far away
+	// must not make this a bitmap of hundreds of megabytes. What is outside
+	// of the bitmap (also above and left of the screens) is not captured.
+	screen.right = std::max(screen.right,
+		std::min(fFrame.right, 2 * screen.right + 1));
+	screen.bottom = std::max(screen.bottom,
+		std::min(fFrame.bottom, 2 * screen.bottom + 1));
+	if (!screen.IsValid() || !screen.Intersects(fFrame)) {
+		fCaptureRequest->result = B_BAD_VALUE;
+		release_sem(fCaptureRequest->done);
+		fCaptureRequest.Unset();
+		return;
+	}
 	if (!fCaptureBitmap.IsSet() || fCaptureBitmap->Bounds() != screen) {
 		_FreeCaptureEngine();
 		UtilityBitmap* bitmap = new(std::nothrow) UtilityBitmap(screen,
@@ -2219,11 +2241,18 @@ Window::_FinishCapture(const BRegion& drawn)
 				target->Width());
 			int32 height = std::min((int32)area.IntegerHeight() + 1,
 				target->Height());
-			if (area.IsValid() && width > 0 && height > 0) {
-				int32 destX = (int32)(area.left - fFrame.left);
-				int32 destY = (int32)(area.top - fFrame.top);
+			int32 destX = 0;
+			int32 destY = 0;
+			if (area.IsValid()) {
+				// the target may be no larger than the part of the window
+				// that is above or left of the capture bitmap: nothing to
+				// copy then
+				destX = (int32)(area.left - fFrame.left);
+				destY = (int32)(area.top - fFrame.top);
 				width = std::min(width, target->Width() - destX);
 				height = std::min(height, target->Height() - destY);
+			}
+			if (area.IsValid() && width > 0 && height > 0) {
 				const uint8* source = fCaptureBitmap->Bits()
 					+ (int32)area.top * fCaptureBitmap->BytesPerRow()
 					+ (int32)area.left * 4;

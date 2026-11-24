@@ -87,6 +87,26 @@ using std::nothrow;
 static const uint32 kMsgUpdateShowAllDraggers = '_adg';
 static const uint32 kMsgAppQuit = 'appQ';
 
+//!	The most strings one font request of a client may carry.
+static const int32 kMaxStringCount = 1024 * 1024;
+
+
+/*!	Reads the \a numBytes of a string that the font code takes by a count of
+	characters, into a buffer of numBytes + 1, and terminates it: the count
+	is the client's and can be larger than what its bytes hold, and the code
+	that goes through the characters only stops at the count or at a null.
+*/
+static bool
+read_font_string(BPrivate::LinkReceiver& link, char* buffer, size_t numBytes)
+{
+	if (numBytes == 0 || numBytes > INT32_MAX
+		|| link.Read(buffer, numBytes) != B_OK) {
+		return false;
+	}
+	buffer[numBytes] = '\0';
+	return true;
+}
+
 
 ServerApp::ServerApp(Desktop* desktop, port_id clientReplyPort,
 		port_id clientLooperPort, team_id clientTeam,
@@ -2181,6 +2201,12 @@ ServerApp::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 				size = 0.0f;
 			}
 
+			if (numStrings < 0 || numStrings > kMaxStringCount) {
+				fLink.StartMessage(B_BAD_VALUE);
+				fLink.Flush();
+				break;
+			}
+
 			BStackOrHeapArray<float, 64> widthArray(numStrings);
 			BStackOrHeapArray<int32, 64> lengthArray(numStrings);
 			BStackOrHeapArray<char*, 64> stringArray(numStrings);
@@ -2193,8 +2219,14 @@ ServerApp::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 
 			for (int32 i = 0; i < numStrings; i++) {
 				// This version of ReadString allocates the strings, we free
-				// them below
-				link.ReadString(&stringArray[i], (size_t *)&lengthArray[i]);
+				// them below. It leaves both untouched when the message
+				// has no (more) string, and writes the length as a size_t:
+				// straight into the int32 array, that was four bytes past
+				// its end for the last string (a crash for 64 of them).
+				size_t length = 0;
+				stringArray[i] = NULL;
+				link.ReadString(&stringArray[i], &length);
+				lengthArray[i] = (int32)length;
 			}
 
 			ServerFont font;
@@ -2490,11 +2522,12 @@ ServerApp::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 			link.Read<float>(&falseBoldWidth);
 			link.Read<uint32>(&flags);
 
-			int32 numChars, numBytes;
+			int32 numChars = 0, numBytes = 0;
 			link.Read<int32>(&numChars);
 			link.Read<int32>(&numBytes);
 
-			BStackOrHeapArray<char, 256> charArray(numBytes);
+			// one more for a terminating null: see read_font_string()
+			BStackOrHeapArray<char, 256> charArray((size_t)numBytes + 1);
 			BStackOrHeapArray<BShape*, 64> shapes(numChars);
 			if (!charArray.IsValid() || !shapes.IsValid()) {
 				fLink.StartMessage(B_NO_MEMORY);
@@ -2502,7 +2535,11 @@ ServerApp::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 				break;
 			}
 
-			link.Read(charArray, numBytes);
+			if (!read_font_string(link, charArray, numBytes)) {
+				fLink.StartMessage(B_BAD_VALUE);
+				fLink.Flush();
+				break;
+			}
 
 			ServerFont font;
 			status_t status = font.SetFamilyAndStyle(familyID, styleID,
@@ -2548,11 +2585,12 @@ ServerApp::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 			link.Read<uint16>(&familyID);
 			link.Read<uint16>(&styleID);
 
-			int32 numChars, numBytes;
+			int32 numChars = 0, numBytes = 0;
 			link.Read<int32>(&numChars);
 			link.Read<int32>(&numBytes);
 
-			BStackOrHeapArray<char, 256> charArray(numBytes);
+			// one more for a terminating null: see read_font_string()
+			BStackOrHeapArray<char, 256> charArray((size_t)numBytes + 1);
 			BStackOrHeapArray<bool, 256> hasArray(numChars);
 			if (!charArray.IsValid() || !hasArray.IsValid()) {
 				fLink.StartMessage(B_NO_MEMORY);
@@ -2560,7 +2598,11 @@ ServerApp::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 				break;
 			}
 
-			link.Read(charArray, numBytes);
+			if (!read_font_string(link, charArray, numBytes)) {
+				fLink.StartMessage(B_BAD_VALUE);
+				fLink.Flush();
+				break;
+			}
 
 			bool useFallbacks;
 			link.Read<bool>(&useFallbacks);
@@ -2599,13 +2641,14 @@ ServerApp::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 			link.Read<uint16>(&familyID);
 			link.Read<uint16>(&styleID);
 
-			int32 numChars;
+			int32 numChars = 0;
 			link.Read<int32>(&numChars);
 
-			uint32 numBytes;
+			uint32 numBytes = 0;
 			link.Read<uint32>(&numBytes);
 
-			BStackOrHeapArray<char, 256> charArray(numBytes);
+			// one more for a terminating null: see read_font_string()
+			BStackOrHeapArray<char, 256> charArray((size_t)numBytes + 1);
 			BStackOrHeapArray<edge_info, 64> edgeArray(numChars);
 			if (!charArray.IsValid() || !edgeArray.IsValid()) {
 				fLink.StartMessage(B_NO_MEMORY);
@@ -2613,7 +2656,11 @@ ServerApp::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 				break;
 			}
 
-			link.Read(charArray, numBytes);
+			if (!read_font_string(link, charArray, numBytes)) {
+				fLink.StartMessage(B_BAD_VALUE);
+				fLink.Flush();
+				break;
+			}
 
 			ServerFont font;
 			status_t status = font.SetFamilyAndStyle(familyID, styleID,
@@ -2673,13 +2720,14 @@ ServerApp::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 			bool wantsOffsets;
 			link.Read<bool>(&wantsOffsets);
 
-			int32 numChars;
+			int32 numChars = 0;
 			link.Read<int32>(&numChars);
 
-			uint32 numBytes;
+			uint32 numBytes = 0;
 			link.Read<uint32>(&numBytes);
 
-			BStackOrHeapArray<char, 256> charArray(numBytes);
+			// one more for a terminating null: see read_font_string()
+			BStackOrHeapArray<char, 256> charArray((size_t)numBytes + 1);
 			BStackOrHeapArray<BPoint, 64> escapements(numChars);
 			BPoint* offsets = NULL;
 			if (wantsOffsets)
@@ -2693,7 +2741,12 @@ ServerApp::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 				break;
 			}
 
-			link.Read(charArray, numBytes);
+			if (!read_font_string(link, charArray, numBytes)) {
+				delete[] offsets;
+				fLink.StartMessage(B_BAD_VALUE);
+				fLink.Flush();
+				break;
+			}
 
 			ServerFont font;
 			status_t status = font.SetFamilyAndStyle(familyID, styleID,
@@ -2764,13 +2817,14 @@ ServerApp::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 			link.Read<float>(&delta.nonspace);
 			link.Read<float>(&delta.space);
 
-			int32 numChars;
+			int32 numChars = 0;
 			link.Read<int32>(&numChars);
 
-			uint32 numBytes;
+			uint32 numBytes = 0;
 			link.Read<uint32>(&numBytes);
 
-			BStackOrHeapArray<char, 256> charArray(numBytes);
+			// one more for a terminating null: see read_font_string()
+			BStackOrHeapArray<char, 256> charArray((size_t)numBytes + 1);
 			BStackOrHeapArray<float, 64> escapements(numChars);
 			if (!charArray.IsValid() || !escapements.IsValid()) {
 				fLink.StartMessage(B_NO_MEMORY);
@@ -2778,7 +2832,11 @@ ServerApp::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 				break;
 			}
 
-			link.Read(charArray, numBytes);
+			if (!read_font_string(link, charArray, numBytes)) {
+				fLink.StartMessage(B_BAD_VALUE);
+				fLink.Flush();
+				break;
+			}
 
 			// figure out escapements
 
@@ -2853,13 +2911,14 @@ ServerApp::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 			escapement_delta delta;
 			link.Read<escapement_delta>(&delta);
 
-			int32 numChars;
+			int32 numChars = 0;
 			link.Read<int32>(&numChars);
 
-			uint32 numBytes;
+			uint32 numBytes = 0;
 			link.Read<uint32>(&numBytes);
 
-			BStackOrHeapArray<char, 256> charArray(numBytes);
+			// one more for a terminating null: see read_font_string()
+			BStackOrHeapArray<char, 256> charArray((size_t)numBytes + 1);
 			BStackOrHeapArray<BRect, 64> rectArray(numChars);
 			if (!charArray.IsValid() || !rectArray.IsValid()) {
 				fLink.StartMessage(B_NO_MEMORY);
@@ -2867,7 +2926,11 @@ ServerApp::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 				break;
 			}
 
-			link.Read(charArray, numBytes);
+			if (!read_font_string(link, charArray, numBytes)) {
+				fLink.StartMessage(B_BAD_VALUE);
+				fLink.Flush();
+				break;
+			}
 
 			// figure out escapements
 
@@ -2942,6 +3005,12 @@ ServerApp::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 			int32 numStrings;
 			link.Read<int32>(&numStrings);
 
+			if (numStrings <= 0 || numStrings > kMaxStringCount) {
+				fLink.StartMessage(B_BAD_VALUE);
+				fLink.Flush();
+				break;
+			}
+
 			BStackOrHeapArray<escapement_delta, 64> deltaArray(numStrings);
 			BStackOrHeapArray<char*, 64> stringArray(numStrings);
 			BStackOrHeapArray<size_t, 64> lengthArray(numStrings);
@@ -2953,13 +3022,30 @@ ServerApp::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 				break;
 			}
 
+			status_t readStatus = B_OK;
 			for (int32 i = 0; i < numStrings; i++) {
 				// This version of ReadString allocates the strings, we free
-				// them below
+				// them below; it leaves both untouched when the message has
+				// no (more) string
+				stringArray[i] = NULL;
+				lengthArray[i] = 0;
 				link.ReadString(&stringArray[i], &lengthArray[i]);
+				if (stringArray[i] == NULL)
+					readStatus = B_BAD_VALUE;
 			}
-			for (int32 i = 0; i < numStrings; i++)
-				link.Read<escapement_delta>(&deltaArray[i]);
+			for (int32 i = 0; i < numStrings; i++) {
+				deltaArray[i].nonspace = 0;
+				deltaArray[i].space = 0;
+				if (link.Read<escapement_delta>(&deltaArray[i]) != B_OK)
+					readStatus = B_BAD_VALUE;
+			}
+			if (readStatus != B_OK) {
+				for (int32 i = 0; i < numStrings; i++)
+					free(stringArray[i]);
+				fLink.StartMessage(B_BAD_VALUE);
+				fLink.Flush();
+				break;
+			}
 
 			ServerFont font;
 			status_t status = font.SetFamilyAndStyle(familyID, styleID,
@@ -3248,8 +3334,11 @@ ServerApp::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 					status = B_NO_MEMORY;
 				else {
 					status = link.Read(buffer, size);
-					if (status == B_OK)
-						status = request.Unflatten(buffer);
+					if (status == B_OK) {
+						// no more than what arrived
+						BMemoryIO stream(buffer, size);
+						status = request.Unflatten(&stream);
+					}
 					delete[] buffer;
 				}
 			} else if (status == B_OK)

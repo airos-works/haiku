@@ -2179,17 +2179,27 @@ Painter::_IterateShapeData(const int32& opCount, const uint32* opList,
 	// it would be nice to use BShape data directly (write
 	// an AGG "VertexSource" adaptor)
 	fPath.remove_all();
+	// The lists are a client's: each op says how many points it takes, which
+	// has to agree with the number of points that came with it. A shape that
+	// asks for more is drawn as far as its points go.
+	int32 pointsLeft = ptCount;
 	for (int32 i = 0; i < opCount; i++) {
 		uint32 op = opList[i] & 0xFF000000;
 		if ((op & OP_MOVETO) != 0) {
+			if (pointsLeft < 1)
+				break;
 			fPath.move_to(
 				points->x * viewScale + viewToScreenOffset.x,
 				points->y * viewScale + viewToScreenOffset.y);
 			points++;
+			pointsLeft--;
 		}
 
 		if ((op & OP_LINETO) != 0) {
 			int32 count = opList[i] & 0x00FFFFFF;
+			if (count > pointsLeft)
+				break;
+			pointsLeft -= count;
 			while (count--) {
 				fPath.line_to(
 					points->x * viewScale + viewToScreenOffset.x,
@@ -2200,7 +2210,12 @@ Painter::_IterateShapeData(const int32& opCount, const uint32* opList,
 
 		if ((op & OP_BEZIERTO) != 0) {
 			int32 count = opList[i] & 0x00FFFFFF;
-			while (count) {
+			if (count > pointsLeft)
+				break;
+			// three points per curve; a count that is not a multiple of
+			// three has points left over, which are skipped
+			pointsLeft -= count;
+			for (; count >= 3; count -= 3) {
 				fPath.curve4(
 					points[0].x * viewScale + viewToScreenOffset.x,
 					points[0].y * viewScale + viewToScreenOffset.y,
@@ -2209,15 +2224,18 @@ Painter::_IterateShapeData(const int32& opCount, const uint32* opList,
 					points[2].x * viewScale + viewToScreenOffset.x,
 					points[2].y * viewScale + viewToScreenOffset.y);
 				points += 3;
-				count -= 3;
 			}
+			points += count;
 		}
 
 		if ((op & OP_LARGE_ARC_TO_CW) != 0 || (op & OP_LARGE_ARC_TO_CCW) != 0
 			|| (op & OP_SMALL_ARC_TO_CW) != 0
 			|| (op & OP_SMALL_ARC_TO_CCW) != 0) {
 			int32 count = opList[i] & 0x00FFFFFF;
-			while (count > 0) {
+			if (count > pointsLeft)
+				break;
+			pointsLeft -= count;
+			for (; count >= 3; count -= 3) {
 				fPath.arc_to(
 					points[0].x * viewScale,
 					points[0].y * viewScale,
@@ -2227,8 +2245,8 @@ Painter::_IterateShapeData(const int32& opCount, const uint32* opList,
 					points[2].x * viewScale + viewToScreenOffset.x,
 					points[2].y * viewScale + viewToScreenOffset.y);
 				points += 3;
-				count -= 3;
 			}
+			points += count;
 		}
 
 		if ((op & OP_CLOSE) != 0)

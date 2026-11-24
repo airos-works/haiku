@@ -410,12 +410,26 @@ ClonedAreaMemory::~ClonedAreaMemory()
 }
 
 
+/*!	Maps the client's \a area; \a length bytes from \a offset on have to be
+	inside of it.
+*/
 void*
-ClonedAreaMemory::Clone(area_id area, size_t offset)
+ClonedAreaMemory::Clone(area_id area, size_t offset, size_t length)
 {
 	BAutolock locker(sLocker);
 	if (sClonedAreaMemoryAllocator.AddArea(area, fClonedArea, fBase, 0, false) != B_OK)
 		return NULL;
+
+	// The offset and the size are the client's word: memory after the area
+	// is not the bitmap's.
+	area_info info;
+	if (get_area_info(fClonedArea, &info) != B_OK || offset > info.size
+		|| length > info.size - offset) {
+		sClonedAreaMemoryAllocator.RemoveArea(area);
+		fClonedArea = -1;
+		fBase = NULL;
+		return NULL;
+	}
 
 	fArea = area;
 	fOffset = offset;

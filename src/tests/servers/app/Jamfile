@@ -242,6 +242,7 @@ HaikuInstall install-test-apps : $(HAIKU_APP_TEST_DIR) : run.sh
 SubInclude HAIKU_TOP src tests servers app archived_view ;
 SubInclude HAIKU_TOP src tests servers app async_drawing ;
 SubInclude HAIKU_TOP src tests servers app avoid_focus ;
+SubInclude HAIKU_TOP src tests servers app bad_requests ;
 SubInclude HAIKU_TOP src tests servers app benchmark ;
 SubInclude HAIKU_TOP src tests servers app bitmap_bounds ;
 SubInclude HAIKU_TOP src tests servers app bitmap_drawing ;

@@ -643,7 +643,11 @@ CanvasCallbacks::DrawPixels(const BRect& src, const BRect& _dest, uint32 width,
 	if (!bitmap.IsValid())
 		return;
 
-	memcpy(bitmap.Bits(), data, std::min(height * bytesPerRow, length));
+	// The sizes are a picture's, that is a client's: the bitmap can have a
+	// longer row than the picture says (the minimum for its width), and the
+	// product can overflow.
+	memcpy(bitmap.Bits(), data, std::min((size_t)bitmap.BitsLength(),
+		std::min((size_t)height * bytesPerRow, length)));
 
 	BRect dest = _dest;
 	fCanvas->PenToScreenTransform().Apply(&dest);

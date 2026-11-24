@@ -41,31 +41,45 @@ BShapeIterator::Iterate(BShape* shape)
 {
 	shape_data* data = (shape_data*)shape->fPrivateData;
 	BPoint* points = data->ptList;
+	// The ops say how many points they take. The lists can come from
+	// elsewhere (a picture, a link): no op gets more points than are left.
+	int32 pointsLeft = data->ptCount;
 
 	for (int32 i = 0; i < data->opCount; i++) {
 		int32 op = data->opList[i] & 0xFF000000;
 
 		if ((op & OP_MOVETO) != 0) {
+			if (pointsLeft < 1)
+				return B_BAD_DATA;
 			IterateMoveTo(points);
 			points++;
+			pointsLeft--;
 		}
 
 		if ((op & OP_LINETO) != 0) {
 			int32 count = data->opList[i] & 0x00FFFFFF;
+			if (count > pointsLeft)
+				return B_BAD_DATA;
 			IterateLineTo(count, points);
 			points += count;
+			pointsLeft -= count;
 		}
 
 		if ((op & OP_BEZIERTO) != 0) {
 			int32 count = data->opList[i] & 0x00FFFFFF;
+			if (count > pointsLeft)
+				return B_BAD_DATA;
 			IterateBezierTo(count / 3, points);
 			points += count;
+			pointsLeft -= count;
 		}
 
 		if ((op & OP_LARGE_ARC_TO_CW) != 0 || (op & OP_LARGE_ARC_TO_CCW) != 0
 			|| (op & OP_SMALL_ARC_TO_CW) != 0
 			|| (op & OP_SMALL_ARC_TO_CCW) != 0) {
 			int32 count = data->opList[i] & 0x00FFFFFF;
+			if (count > pointsLeft)
+				return B_BAD_DATA;
 			for (int32 i = 0; i < count / 3; i++) {
 				IterateArcTo(points[0].x, points[0].y, points[1].x,
 					op & (OP_LARGE_ARC_TO_CW | OP_LARGE_ARC_TO_CCW),
@@ -73,6 +87,8 @@ BShapeIterator::Iterate(BShape* shape)
 					points[2]);
 				points += 3;
 			}
+			points += count % 3;
+			pointsLeft -= count;
 		}
 
 		if ((op & OP_CLOSE) != 0)

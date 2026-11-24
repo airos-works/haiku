@@ -107,7 +107,9 @@ BitmapManager::CreateBitmap(ClientMemoryAllocator* allocator,
 
 	ServerBitmap* bitmap = new(std::nothrow) ServerBitmap(bounds, space, flags,
 		bytesPerRow);
-	if (bitmap == NULL) {
+	if (bitmap == NULL || bitmap->BitsLength() == 0) {
+		// no memory, or a size that is not a bitmap's (see the constructor)
+		delete bitmap;
 		if (overlayToken != NULL)
 			hwInterface.ReleaseOverlayChannel(overlayToken);
 
@@ -197,14 +199,16 @@ BitmapManager::CloneFromClient(area_id clientArea, size_t areaOffset,
 		return NULL;
 	BReference<ServerBitmap> bitmap(new(std::nothrow) ServerBitmap(bounds, space, flags,
 		bytesPerRow), true);
-	if (bitmap == NULL)
+	if (bitmap == NULL || bitmap->BitsLength() == 0)
 		return NULL;
 
 	ClonedAreaMemory* memory = new(std::nothrow) ClonedAreaMemory;
 	if (memory == NULL) {
 		return NULL;
 	}
-	int8* buffer = (int8*)memory->Clone(clientArea, areaOffset);
+	// the whole bitmap has to be inside the client's area
+	int8* buffer = (int8*)memory->Clone(clientArea, areaOffset,
+		bitmap->BitsLength());
 	if (buffer == NULL) {
 		delete memory;
 		return NULL;

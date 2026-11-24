@@ -543,6 +543,8 @@ private:
 			status_t			_Dereference();
 
 			status_t			_ValidateMessage();
+			status_t			_Unflatten(BDataIO* stream,
+									bool mayReferenceArea);
 
 			void				_UpdateOffsets(uint32 offset, int32 change);
 			status_t			_ResizeData(uint32 offset, int32 change);

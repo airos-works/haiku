@@ -134,8 +134,9 @@ public:
 uint32
 ServerBitmap::BitsLength() const
 {
-	int64 length = fBytesPerRow * fHeight;
-	return (length > 0 && length <= UINT32_MAX) ? (uint32)length : 0;
+	// in 64 bits: both factors can be a client's
+	int64 length = (int64)fBytesPerRow * fHeight;
+	return (length > 0 && length <= INT32_MAX) ? (uint32)length : 0;
 }
 
 

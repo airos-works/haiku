@@ -1,0 +1,12 @@
+SubDir HAIKU_TOP src tests servers app bad_requests ;
+
+UsePrivateHeaders app interface shared ;
+UseHeaders [ FDirName $(HAIKU_TOP) src kits app ] ;
+	# link_message.h
+
+# requests whose sizes do not describe what they carry, and captures of a
+# window that is partly off screen: app_server has to survive them (#177)
+SimpleTest as_bad_requests_test :
+	BadRequests.cpp
+	: be [ TargetLibstdc++ ] [ TargetLibsupc++ ]
+;

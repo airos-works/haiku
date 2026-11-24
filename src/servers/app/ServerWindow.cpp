@@ -132,6 +132,30 @@ static profile sRedrawProcessingTime;
 #endif
 
 
+// Limits for what a client's message says it carries. Whatever is smaller
+// still has to arrive in full (LinkReceiver::Read() fails otherwise); these
+// keep the sizes computed from the counts inside 32 bits and the buffers
+// reasonable.
+static const int32 kMaxFlattenedMessageSize = 16 * 1024 * 1024;
+static const int32 kMaxStringLength = 16 * 1024 * 1024;
+static const int32 kMaxShapeCount = 16 * 1024 * 1024;
+
+
+static inline bool
+valid_shape_counts(int32 opCount, int32 pointCount)
+{
+	return opCount > 0 && opCount <= kMaxShapeCount
+		&& pointCount > 0 && pointCount <= kMaxShapeCount;
+}
+
+
+static inline bool
+valid_point_count(int32 pointCount)
+{
+	return pointCount > 0 && pointCount <= kMaxShapeCount;
+}
+
+
 //	#pragma mark -
 
 
@@ -988,12 +1012,16 @@ ServerWindow::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 			DTRACE(("ServerWindow %s: Message AS_SET_DECORATOR_SETTINGS\n",
 				Title()));
 
+			// The size is the client's: not a buffer on the stack, and the
+			// message is read from no more than what arrived.
 			int32 size;
-			if (fWindow.IsSet() && link.Read<int32>(&size) == B_OK) {
-				char buffer[size];
-				if (link.Read(buffer, size) == B_OK) {
+			if (fWindow.IsSet() && link.Read<int32>(&size) == B_OK
+				&& size > 0 && size <= kMaxFlattenedMessageSize) {
+				ArrayDeleter<char> buffer(new(std::nothrow) char[size]);
+				if (buffer.IsSet() && link.Read(buffer.Get(), size) == B_OK) {
 					BMessage settings;
-					if (settings.Unflatten(buffer) == B_OK)
+					BMemoryIO stream(buffer.Get(), size);
+					if (settings.Unflatten(&stream) == B_OK)
 						fDesktop->SetWindowDecoratorSettings(
 							fWindow.Get(), settings);
 				}
@@ -2292,8 +2320,14 @@ fDesktop->LockSingleWindow();
 			link.Read<bool>(&inverse);
 
 			shape_data shape;
+			shape.opCount = 0;
+			shape.ptCount = 0;
 			link.Read<int32>(&shape.opCount);
 			link.Read<int32>(&shape.ptCount);
+			if (!valid_shape_counts(shape.opCount, shape.ptCount)) {
+				// (the sizes below are 32 bits wide)
+				break;
+			}
 			shape.opSize = shape.opCount * sizeof(uint32);
 			shape.ptSize = shape.ptCount * sizeof(BPoint);
 			shape.opList = new(nothrow) uint32[shape.opCount];
@@ -2396,8 +2430,9 @@ fDesktop->LockSingleWindow();
 			if (bufferSize > 0) {
 				char* buffer = new (nothrow) char[bufferSize];
 				BMessage dragMessage;
+				BMemoryIO stream(buffer, buffer != NULL ? bufferSize : 0);
 				if (link.Read(buffer, bufferSize) == B_OK
-					&& dragMessage.Unflatten(buffer) == B_OK) {
+					&& dragMessage.Unflatten(&stream) == B_OK) {
 						BReference<ServerBitmap> bitmap(
 							fServerApp->GetBitmap(bitmapToken), true);
 						// TODO: possible deadlock
@@ -2430,8 +2465,9 @@ fDesktop->LockSingleWindow();
 			if (bufferSize > 0) {
 				char* buffer = new (nothrow) char[bufferSize];
 				BMessage dragMessage;
+				BMemoryIO stream(buffer, buffer != NULL ? bufferSize : 0);
 				if (link.Read(buffer, bufferSize) == B_OK
-					&& dragMessage.Unflatten(buffer) == B_OK) {
+					&& dragMessage.Unflatten(&stream) == B_OK) {
 						// TODO: possible deadlock
 fDesktop->UnlockSingleWindow();
 						fDesktop->EventDispatcher().SetDragMessage(dragMessage,
@@ -2610,6 +2646,15 @@ ServerWindow::_DispatchViewDrawingMessage(int32 code,
 	// that's why you need to use the clipping only for as long
 	// as you have it locked
 	drawingEngine->ConstrainClippingRegion(&fCurrentDrawingRegion);
+
+	// Unlocked on every way out: the drawing code reports a failed
+	// allocation with an exception, which _DispatchMessage() catches. A lock
+	// left behind then made the next window's drawing engine wait for it,
+	// and the desktop with it.
+	struct ParallelAccessUnlocker {
+		DrawingEngine* engine;
+		~ParallelAccessUnlocker() { engine->UnlockParallelAccess(); }
+	} parallelAccessUnlocker = { drawingEngine };
 
 	switch (code) {
 		case AS_STROKE_LINE:
@@ -3007,12 +3052,14 @@ ServerWindow::_DispatchViewDrawingMessage(int32 code,
 
 			BRect polyFrame;
 			bool isClosed = true;
-			int32 pointCount;
+			int32 pointCount = 0;
 
 			link.Read<BRect>(&polyFrame);
 			if (code == AS_STROKE_POLYGON)
 				link.Read<bool>(&isClosed);
 			link.Read<int32>(&pointCount);
+			if (!valid_point_count(pointCount))
+				break;
 
 			const SimpleTransform transform =
 				fCurrentView->PenToScreenTransform();
@@ -3036,11 +3083,13 @@ ServerWindow::_DispatchViewDrawingMessage(int32 code,
 
 			BRect polyFrame;
 			bool isClosed = true;
-			int32 pointCount;
+			int32 pointCount = 0;
 			link.Read<BRect>(&polyFrame);
 			if (code == AS_STROKE_POLYGON_GRADIENT)
 				link.Read<bool>(&isClosed);
 			link.Read<int32>(&pointCount);
+			if (!valid_point_count(pointCount))
+				break;
 
 			const SimpleTransform transform =
 				fCurrentView->PenToScreenTransform();
@@ -3068,12 +3117,14 @@ ServerWindow::_DispatchViewDrawingMessage(int32 code,
 				Title()));
 
 			BRect shapeFrame;
-			int32 opCount;
-			int32 ptCount;
+			int32 opCount = 0;
+			int32 ptCount = 0;
 
 			link.Read<BRect>(&shapeFrame);
 			link.Read<int32>(&opCount);
 			link.Read<int32>(&ptCount);
+			if (!valid_shape_counts(opCount, ptCount))
+				break;
 
 			uint32* opList = new(nothrow) uint32[opCount];
 			BPoint* ptList = new(nothrow) BPoint[ptCount];
@@ -3107,12 +3158,14 @@ ServerWindow::_DispatchViewDrawingMessage(int32 code,
 				Title()));
 
 			BRect shapeFrame;
-			int32 opCount;
-			int32 ptCount;
+			int32 opCount = 0;
+			int32 ptCount = 0;
 
 			link.Read<BRect>(&shapeFrame);
 			link.Read<int32>(&opCount);
 			link.Read<int32>(&ptCount);
+			if (!valid_shape_counts(opCount, ptCount))
+				break;
 
 			uint32* opList = new(nothrow) uint32[opCount];
 			BPoint* ptList = new(nothrow) BPoint[ptCount];
@@ -3251,7 +3304,8 @@ ServerWindow::_DispatchViewDrawingMessage(int32 code,
 		{
 			ViewDrawStringInfo info;
 			if (link.Read<ViewDrawStringInfo>(&info) != B_OK
-				|| info.stringLength <= 0) {
+				|| info.stringLength <= 0
+				|| info.stringLength > kMaxStringLength) {
 				break;
 			}
 
@@ -3289,8 +3343,10 @@ ServerWindow::_DispatchViewDrawingMessage(int32 code,
 		case AS_DRAW_STRING_WITH_OFFSETS:
 		{
 			int32 stringLength;
-			if (link.Read<int32>(&stringLength) != B_OK || stringLength <= 0)
+			if (link.Read<int32>(&stringLength) != B_OK || stringLength <= 0
+				|| stringLength > kMaxStringLength) {
 				break;
+			}
 
 			int32 glyphCount;
 			if (link.Read<int32>(&glyphCount) != B_OK || glyphCount <= 0)
@@ -3378,8 +3434,6 @@ ServerWindow::_DispatchViewDrawingMessage(int32 code,
 			}
 			break;
 	}
-
-	drawingEngine->UnlockParallelAccess();
 }
 
 
@@ -3666,13 +3720,15 @@ ServerWindow::_DispatchPictureMessage(int32 code, BPrivate::LinkReceiver& link)
 		{
 			BRect polyFrame;
 			bool isClosed = true;
-			int32 pointCount;
+			int32 pointCount = 0;
 			const bool fill = (code == AS_FILL_POLYGON);
 
 			link.Read<BRect>(&polyFrame);
 			if (code == AS_STROKE_POLYGON)
 				link.Read<bool>(&isClosed);
 			link.Read<int32>(&pointCount);
+			if (!valid_point_count(pointCount))
+				break;
 
 			BPoint* pointList = new(nothrow) BPoint[pointCount];
 			if (link.Read(pointList, pointCount * sizeof(BPoint)) >= B_OK) {
@@ -3805,13 +3861,15 @@ ServerWindow::_DispatchPictureMessage(int32 code, BPrivate::LinkReceiver& link)
 		{
 			BRect polyFrame;
 			bool isClosed = true;
-			int32 pointCount;
+			int32 pointCount = 0;
 			const bool fill = (code == AS_FILL_POLYGON_GRADIENT);
 
 			link.Read<BRect>(&polyFrame);
 			if (code == AS_STROKE_POLYGON_GRADIENT)
 				link.Read<bool>(&isClosed);
 			link.Read<int32>(&pointCount);
+			if (!valid_point_count(pointCount))
+				break;
 
 			ArrayDeleter<BPoint> pointList(new(nothrow) BPoint[pointCount]);
 			if (link.Read(pointList.Get(), pointCount * sizeof(BPoint)) != B_OK)
@@ -3831,12 +3889,14 @@ ServerWindow::_DispatchPictureMessage(int32 code, BPrivate::LinkReceiver& link)
 		case AS_FILL_SHAPE_GRADIENT:
 		{
 			BRect shapeFrame;
-			int32 opCount;
-			int32 ptCount;
+			int32 opCount = 0;
+			int32 ptCount = 0;
 
 			link.Read<BRect>(&shapeFrame);
 			link.Read<int32>(&opCount);
 			link.Read<int32>(&ptCount);
+			if (!valid_shape_counts(opCount, ptCount))
+				break;
 
 			ArrayDeleter<uint32> opList(new(std::nothrow) uint32[opCount]);
 			ArrayDeleter<BPoint> ptList(new(std::nothrow) BPoint[ptCount]);
@@ -4004,8 +4064,11 @@ ServerWindow::_DispatchPictureMessage(int32 code, BPrivate::LinkReceiver& link)
 		case AS_DRAW_STRING_WITH_DELTA:
 		{
 			ViewDrawStringInfo info;
-			if (link.Read<ViewDrawStringInfo>(&info) != B_OK)
+			if (link.Read<ViewDrawStringInfo>(&info) != B_OK
+				|| info.stringLength <= 0
+				|| info.stringLength > kMaxStringLength) {
 				break;
+			}
 
 			char* string = (char*)malloc(info.stringLength + 1);
 			if (string == NULL)
@@ -4046,8 +4109,10 @@ ServerWindow::_DispatchPictureMessage(int32 code, BPrivate::LinkReceiver& link)
 		case AS_DRAW_STRING_WITH_OFFSETS:
 		{
 			int32 stringLength;
-			if (link.Read<int32>(&stringLength) != B_OK || stringLength <= 0)
+			if (link.Read<int32>(&stringLength) != B_OK || stringLength <= 0
+				|| stringLength > kMaxStringLength) {
 				break;
+			}
 
 			int32 glyphCount;
 			if (link.Read<int32>(&glyphCount) != B_OK || glyphCount <= 0)
@@ -4101,12 +4166,14 @@ ServerWindow::_DispatchPictureMessage(int32 code, BPrivate::LinkReceiver& link)
 		case AS_FILL_SHAPE:
 		{
 			BRect shapeFrame;
-			int32 opCount;
-			int32 ptCount;
+			int32 opCount = 0;
+			int32 ptCount = 0;
 
 			link.Read<BRect>(&shapeFrame);
 			link.Read<int32>(&opCount);
 			link.Read<int32>(&ptCount);
+			if (!valid_shape_counts(opCount, ptCount))
+				break;
 
 			BStackOrHeapArray<uint32, 512> opList(opCount);
 			BStackOrHeapArray<BPoint, 512> ptList(ptCount);
@@ -4225,8 +4292,14 @@ ServerWindow::_DispatchPictureMessage(int32 code, BPrivate::LinkReceiver& link)
 			link.Read<bool>(&inverse);
 
 			shape_data shape;
+			shape.opCount = 0;
+			shape.ptCount = 0;
 			link.Read<int32>(&shape.opCount);
 			link.Read<int32>(&shape.ptCount);
+			if (!valid_shape_counts(shape.opCount, shape.ptCount)) {
+				// (the sizes below are 32 bits wide)
+				break;
+			}
 			shape.opSize = shape.opCount * sizeof(uint32);
 			shape.ptSize = shape.ptCount * sizeof(BPoint);
 			shape.opList = new(nothrow) uint32[shape.opCount];

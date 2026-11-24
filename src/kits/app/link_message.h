@@ -18,6 +18,9 @@ static const size_t kInitialBufferSize = 2048;
 static const size_t kMaxBufferSize = 65536;
 	// anything beyond that should be sent with a different mechanism
 
+static const char* const kLinkSenderAreaName = "LinkSenderArea";
+	// the area such data is sent in; the receiver takes no other
+
 struct message_header {
 	int32	size;
 	uint32	code;

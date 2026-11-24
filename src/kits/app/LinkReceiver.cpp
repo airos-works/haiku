@@ -19,6 +19,7 @@
 #include <string.h>
 #include <new>
 
+#include <AppMisc.h>
 #include <ServerProtocol.h>
 #include <String.h>
 #include <Region.h>
@@ -298,17 +299,23 @@ LinkReceiver::Read(void *data, ssize_t passedSize)
 		area_id sourceArea;
 		memcpy((void*)&sourceArea, fRecvBuffer + fRecvPosition, size);
 
+		// The sender made the area for this data and transferred it to this
+		// team (LinkSender::Attach()). The id is only a number in a message,
+		// though: an area of another team has its address in another
+		// address space, a smaller one does not hold what is asked for, and
+		// any other area of this team is not the sender's to have deleted.
 		area_info areaInfo;
-		if (get_area_info(sourceArea, &areaInfo) < B_OK)
+		if (sourceArea < 0 || get_area_info(sourceArea, &areaInfo) < B_OK
+			|| areaInfo.team != BPrivate::current_team()
+			|| areaInfo.address == NULL
+			|| areaInfo.size < (size_t)passedSize
+			|| strcmp(areaInfo.name, kLinkSenderAreaName) != 0) {
 			fReadError = B_BAD_VALUE;
+		}
 
 		if (fReadError >= B_OK) {
-			void* areaAddress = areaInfo.address;
-
-			if (areaAddress && sourceArea >= B_OK) {
-				memcpy(data, areaAddress, passedSize);
-				delete_area(sourceArea);
-			}
+			memcpy(data, areaInfo.address, passedSize);
+			delete_area(sourceArea);
 		}
 	} else {
 		memcpy(data, fRecvBuffer + fRecvPosition, size);
@@ -448,19 +455,29 @@ err:
 status_t
 LinkReceiver::ReadRegion(BRegion* region)
 {
-	status_t status = Read(&region->fCount, sizeof(int32));
+	// The region stays empty unless all of it arrived: a count without its
+	// rectangles (the count is the sender's word) must not be left in it,
+	// some callers use the region whatever is returned here.
+	int32 count = 0;
+	clipping_rect bounds;
+	status_t status = Read(&count, sizeof(int32));
 	if (status >= B_OK)
-		status = Read(&region->fBounds, sizeof(clipping_rect));
-	if (status >= B_OK) {
-		if (!region->_SetSize(region->fCount)) {
+		status = Read(&bounds, sizeof(clipping_rect));
+	if (status >= B_OK && count < 0)
+		status = B_BAD_VALUE;
+	if (status >= B_OK && count > 0) {
+		if (!region->_SetSize(count))
 			status = B_NO_MEMORY;
-		} else if (region->fCount > 0) {
-			status = Read(region->fData,
-				region->fCount * sizeof(clipping_rect));
-		}
-		if (status < B_OK)
-			region->MakeEmpty();
+		else
+			status = Read(region->fData, count * sizeof(clipping_rect));
 	}
+	if (status < B_OK) {
+		region->MakeEmpty();
+		return status;
+	}
+
+	region->fCount = count;
+	region->fBounds = bounds;
 	return status;
 }
 

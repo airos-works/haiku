@@ -189,7 +189,7 @@ LinkSender::Attach(const void *passedData, size_t passedSize)
 		}
 		void* address = NULL;
 		off_t alignedSize = (passedSize + B_PAGE_SIZE) & ~(B_PAGE_SIZE - 1);
-		senderArea = create_area("LinkSenderArea", &address, B_ANY_ADDRESS,
+		senderArea = create_area(kLinkSenderAreaName, &address, B_ANY_ADDRESS,
 			alignedSize, B_NO_LOCK, B_READ_AREA | B_WRITE_AREA);
 
 		if (senderArea < B_OK)
