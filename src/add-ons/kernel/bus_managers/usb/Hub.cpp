@@ -10,6 +10,7 @@
 
 #include "usb_private.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 
 #include <algorithm>
@@ -276,10 +277,24 @@ Hub::ResetPort(uint8 index)
 	}
 
 	if (rootHub) {
-		// what Linux says "Cannot enable. Maybe the USB cable is bad?" about
-		TRACE_ALWAYS("port %d: the device does not come up after a reset "
-			"(%" B_PRId32 " tries); the cable or the port may not carry its "
-			"speed\n", index, kResetTries);
+		// What Linux says "Cannot enable. Maybe the USB cable is bad?" about.
+		// The state the port is left in tells what failed: a high speed
+		// device whose handshake did not go through is back at full speed.
+		const uint16 status = fPortStatus[index].status;
+		const char* speed = "full";
+		if ((status & PORT_STATUS_POWER) == 0) {
+			// a SuperSpeed port has PORT_STATUS_SS_POWER instead, in the
+			// place of PORT_STATUS_LOW_SPEED
+			speed = "SuperSpeed";
+		} else if ((status & PORT_STATUS_HIGH_SPEED) != 0)
+			speed = "high";
+		else if ((status & PORT_STATUS_LOW_SPEED) != 0)
+			speed = "low";
+		_TraceEnumeration(index, "port %d: the device does not come up after "
+			"a reset (%" B_PRId32 " tries; status %#06x, change %#06x: "
+			"connected at %s speed, not enabled); the cable or the port may "
+			"not carry its speed\n", index, kResetTries, status,
+			fPortStatus[index].change, speed);
 	} else {
 		TRACE_ERROR("port %d stays disabled after %" B_PRId32 " resets\n",
 			index, kResetTries);
@@ -404,7 +419,8 @@ Hub::Explore(change_item **changeList)
 				// does not answer may drop off and come back by itself.
 			} else if (fPortStatus[i].status & PORT_STATUS_CONNECTION) {
 				// new device attached!
-				TRACE_ALWAYS("port %" B_PRId32 ": new device connected\n", i);
+				_TraceEnumeration(i, "port %" B_PRId32 ": new device "
+					"connected\n", i);
 
 				bool setupFailed = false;
 				int32 retry = 2;
@@ -420,8 +436,11 @@ Hub::Explore(change_item **changeList)
 					// reset the port, this will also enable it
 					result = ResetPort(i);
 					if (result < B_OK) {
-						TRACE_ERROR("resetting port %" B_PRId32 " failed\n",
-							i);
+						// a port that stays disabled was reported already
+						if (result != B_DEV_NOT_READY) {
+							TRACE_ERROR("resetting port %" B_PRId32
+								" failed\n", i);
+						}
 						break;
 					}
 
@@ -496,8 +515,14 @@ Hub::Explore(change_item **changeList)
 
 				if (fChildren[i] == NULL)
 					_EnumerationFailed(i);
-				else
+				else {
+					if (fEnumerationFailures[i] > kMaxEnumerationRetryShift) {
+						TRACE_ALWAYS("port %" B_PRId32 ": the device "
+							"enumerated after %" B_PRIu8 " failed tries\n", i,
+							fEnumerationFailures[i]);
+					}
 					fEnumerationFailures[i] = 0;
+				}
 
 				// An internal device that does not even take an address (an
 				// Intel Bluetooth radio after a warm reboot) may have a reset
@@ -762,8 +787,40 @@ Hub::_EnumerationFailed(uint8 index)
 		fEnumerationFailures[index]++;
 
 	fNextEnumeration[index] = system_time() + delay;
-	TRACE_ALWAYS("port %" B_PRIu8 ": the device failed to enumerate, trying "
-		"again in %" B_PRIdBIGTIME " s\n", index, delay / 1000000);
+	if (fEnumerationFailures[index] <= kMaxEnumerationRetryShift) {
+		TRACE_ALWAYS("port %" B_PRIu8 ": the device failed to enumerate, "
+			"trying again in %" B_PRIdBIGTIME " s\n", index,
+			delay / 1000000);
+	} else if (fEnumerationFailures[index] == kMaxEnumerationRetryShift + 1) {
+		TRACE_ALWAYS("port %" B_PRIu8 ": the device failed to enumerate, "
+			"trying again every %" B_PRIdBIGTIME " s without logging it\n",
+			index, delay / 1000000);
+	} else {
+		TRACE("port %" B_PRIu8 ": the device failed to enumerate again\n",
+			index);
+	}
+}
+
+
+/*!	Logs a step of a device's enumeration, unless the device has been
+	failing for a while: it is tried again every minute for as long as it
+	stays plugged in, and logging every try filled the system log (a NanoKVM
+	on a port whose link it cannot hold: four lines a minute for days, 70% of
+	a rotated log, #204). The tries until the pause reaches its longest are
+	logged, then one line says that the logging stops.
+*/
+void
+Hub::_TraceEnumeration(uint8 index, const char* format, ...)
+{
+	if (fEnumerationFailures[index] > kMaxEnumerationRetryShift)
+		return;
+
+	char buffer[256];
+	va_list args;
+	va_start(args, format);
+	vsnprintf(buffer, sizeof(buffer), format, args);
+	va_end(args);
+	TRACE_ALWAYS("%s", buffer);
 }
 
 

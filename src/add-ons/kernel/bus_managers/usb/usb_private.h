@@ -701,6 +701,10 @@ virtual	status_t						BuildDeviceName(char *string,
 private:
 		status_t						_DebouncePort(uint8 index);
 		void							_EnumerationFailed(uint8 index);
+		void							_TraceEnumeration(uint8 index,
+											const char* format, ...)
+											__attribute__((format(printf, 3,
+												4)));
 
 		InterruptPipe *					fInterruptPipe;
 		uint8							fPortCount;
