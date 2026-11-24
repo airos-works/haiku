@@ -1,9 +1,9 @@
 /* See nvenc_hevc.h, and nvenc_h264.c for where the values come from.
  *
- * On a GTX 1070 (class C2B7) the engine encodes I pictures, IDR or not, and
- * refuses every P picture before writing anything (README.md says what was
- * tried). MediaConverter's test encodes P pictures, so it finds that out and
- * encodes H.265 on the CPU. */
+ * I and P pictures. What P pictures need on a GTX 1070 (class C2B7) was
+ * found by comparing NVIDIA's own driver with this add-on (README.md, "H.265
+ * P pictures"): the picture control's codec 5, slice type 0 for a P slice,
+ * and an inter transform depth of 3. */
 
 #include "nvenc_hevc.h"
 
@@ -29,6 +29,11 @@ _Static_assert(sizeof(nvenc_h265_quant_control_s) == 16, "quant control");
 #define CTB_SIZE		32
 #define MIN_CB_SIZE		8
 #define LOG2_MAX_POC_LSB	8
+/* The engine writes inter transform trees that a decoder reads right only
+ * with a depth of 3, NVIDIA's value; with 0 to 2 every P picture after its
+ * first few blocks decodes to garbage, although the engine's own
+ * reconstruction is right. */
+#define MAX_TRANSFORM_DEPTH_INTER	3
 #define MIN_QP			10
 #define MAX_QP			51
 
@@ -198,7 +203,7 @@ write_parameter_sets(NvencHevc *encoder)
 	nvencPutUe(&bits, 2);			/* to 32x32 */
 	nvencPutUe(&bits, 0);			/* log2_min_luma_transform_block_size_minus2 */
 	nvencPutUe(&bits, 3);			/* to 32x32 */
-	nvencPutUe(&bits, 1);			/* max_transform_hierarchy_depth_inter */
+	nvencPutUe(&bits, MAX_TRANSFORM_DEPTH_INTER);	/* max_transform_hierarchy_depth_inter */
 	nvencPutUe(&bits, 1);			/* max_transform_hierarchy_depth_intra */
 	nvencPut(&bits, 0, 1);			/* scaling_list_enabled */
 	nvencPut(&bits, 0, 1);			/* amp_enabled */
@@ -446,7 +451,7 @@ fill_pic_setup(NvencHevc *encoder, bool idr, int qp)
 	sps->max_cu_size = 2;			/* 32x32 */
 	sps->min_tu_size = 0;			/* 4x4 */
 	sps->max_tu_size = 3;			/* 32x32 */
-	sps->max_transform_depth_inter = 1;
+	sps->max_transform_depth_inter = MAX_TRANSFORM_DEPTH_INTER;
 	sps->max_transform_depth_intra = 1;
 	sps->num_short_term_ref_pic_sets = 1;
 	sps->bit_depth_minus_8 = encoder->bitDepth - 8;
@@ -480,9 +485,12 @@ fill_pic_setup(NvencHevc *encoder, bool idr, int qp)
 	pic->bitstream_buf_size = (uint32_t)encoder->bitstream.size;
 	pic->pic_type = idr ? 3 : 0;
 	pic->ref_pic_flag = 1;
-	/* as for H.264: one dynamic slice, and not the decoder's codec number */
+	/* As for H.264, one dynamic slice. The codec is 5, as NVIDIA's driver
+	 * sets it: with 0, which H.264 uses, the engine's units hang on any P
+	 * picture (error 47 when the watchdog resets it), although I pictures
+	 * encode. */
 	pic->slice_mode = 0;
-	pic->codec = 0;
+	pic->codec = 5;
 	pic->ceil_log2_pic_size_in_ctbs = ceil_log2(encoder->widthInCtbs * encoder->heightInCtbs);
 	pic->short_term_ref_pic_set_sps_flag = 1;
 	pic->short_term_ref_pic_set_idx = 0;
@@ -496,7 +504,10 @@ fill_pic_setup(NvencHevc *encoder, bool idr, int qp)
 		= (nvenc_h265_slice_control_s *)(base + SLICE_CONTROL_OFFSET);
 	slice->num_ctus = encoder->widthInCtbs * encoder->heightInCtbs;
 	slice->qp_avr = qp;
-	slice->slice_type = idr ? 2 : 1;
+	/* 0 for a P slice, as NVIDIA's driver sends; 1, which the header's
+	 * comment says is P, fails the picture with microcode error 9
+	 * (E_ME_PROGRAMMING). */
+	slice->slice_type = idr ? 2 : 0;
 	slice->collocated_from_l0_flag = 1;
 	slice->qp_slice_min = qp;
 	slice->qp_slice_max = qp;

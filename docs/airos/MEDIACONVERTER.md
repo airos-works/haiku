@@ -20,7 +20,7 @@ only M4A, MP3, FLAC, Ogg, Opus and WAV.
 | --- | --- | --- |
 | H.264 | AMD VCE/VCN (VA-API), NVIDIA NVENC (Maxwell and later), Allwinner A733 (Cubie A7S) | x264 |
 | H.264 10-bit | – | x264 |
-| H.265 | AMD Polaris and later (VA-API), NVIDIA NVENC (second Maxwell and later; the add-on does not manage P pictures yet, so the self-test sends it to the CPU), Allwinner A733 (Cubie A7S) | x265 |
+| H.265 | AMD Polaris and later (VA-API), NVIDIA NVENC (second Maxwell and later), Allwinner A733 (Cubie A7S) | x265 |
 | H.265 10-bit | AMD VCN 2 and later, NVIDIA Pascal and later (as H.265) | x265 |
 | H.265 12-bit | – | x265 |
 | AV1, AV1 10-bit | AMD VCN 4 (RDNA 3, Phoenix and later), NVIDIA Ada Lovelace and later | SVT-AV1 |
@@ -290,8 +290,8 @@ with I, P and B pictures: a 12 second 1080p clip converts at 103 pictures/s
 (3.4 times real time) and comes back at 44.7 dB. The two fastest speed
 settings leave the B pictures out, which is a quarter faster and costs 0.2
 to 0.4 dB at the same bit rate; nothing else changes NVENC's speed. H.265
-Main and Main 10 encode I pictures, but the engine refuses P pictures, so
-H.265 goes to the CPU for now.
+Main and Main 10 work with I and P pictures since 2026-11-25, when a capture
+of NVIDIA's own driver showed the three settings P pictures need.
 
 The add-on can know several ways of handing the engine a picture
 (`variants`; it has the one arrangement found on the card, with B pictures
@@ -401,9 +401,10 @@ MEDIACONVERTER_FAKE_NVIDIA=1b81 ...         pretend there is a GTX 1070 (with th
 
 ## Known limits
 
-- NVENC: H.264 is verified on a GTX 1070 (Pascal) only (see Measured);
-  other generations run the same code and rely on the self-test. H.265 P pictures are refused
-  by the engine, so H.265 is encoded on the CPU on NVIDIA cards (see above).
+- NVENC: H.264 and H.265 are verified on a GTX 1070 (Pascal) only (see
+  Measured); other generations run the same code and rely on the self-test.
+  H.265 is encoded with I and P pictures only (Pascal has no H.265 B
+  pictures).
   H.264 has one B picture between reference pictures and one reference
   picture each way; x264 at its medium setting still gets more out of a bit.
 - AV1 on Ada and Blackwell is encoded on the CPU: NVENC's AV1 needs the

@@ -109,7 +109,7 @@ size_t nvencBlockLinearOffset(int x, int y, int pitch, bool linesInFours);
 
 /* SET_CONTROL_PARAMS */
 #define NVENC_CONTROL_CODEC_H264		3
-#define NVENC_CONTROL_CODEC_H265		7	/* the decoder's numbers */
+#define NVENC_CONTROL_CODEC_H265		4	/* NVIDIA's driver on Pascal */
 #define NVENC_CONTROL_FORCE_OUT_PIC		(1u << 8)
 #define NVENC_CONTROL_FORCE_OUT_COL		(1u << 9)
 #define NVENC_CONTROL_DEBUG_MODE		(1u << 16)
