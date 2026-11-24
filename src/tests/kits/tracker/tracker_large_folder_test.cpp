@@ -8,9 +8,12 @@
 // thumbnails must not hold a file descriptor per pending item (Tracker has
 // 512, the test sets the same limit), and a folder that is reported changed
 // over and over is not walked again for every report. A walk stops when its
-// window turns folder sizes off; thumbnails of icons that were scrolled out
-// of view are not made; a file whose thumbnail failed is not opened and
-// tried again at every redraw.
+// window turns folder sizes off; a window that checks its sizes again (when
+// it is activated) gets only those that changed; thumbnails of icons that
+// were scrolled out of view are not made; a file whose thumbnail failed is
+// not opened and tried again at every redraw; a new picture on the node of
+// a deleted one gets its own thumbnail; documents in a list view are not
+// opened at every redraw.
 //
 //	tracker_large_folder_test <folder> [-only <name>]
 //
@@ -55,6 +58,7 @@
 #include "Model.h"
 #include "Thumbnails.h"
 
+#include <set>
 #include <vector>
 
 
@@ -503,6 +507,111 @@ FolderSizeCancel()
 }
 
 
+static int32
+WaitForSizes(bigtime_t start, off_t* size)
+{
+	// the sizes sent for requests made at start: done when the walking
+	// thread was idle for a second, or a size came and nothing for 1 s
+	WaitForIdleThread("folder sizes", 1000000, start + 60000000LL);
+	snooze(300000);
+	int32 replies = 0;
+	bigtime_t last = 0;
+	sReceiver->Get(&replies, size, &last);
+	return replies;
+}
+
+
+static void
+FolderSizeRefresh()
+{
+	// A window asks for the sizes of all its folders again when it is
+	// activated (BPoseView::WindowActivated()). It has them already: a
+	// size that is recent, or that came out the same when the folder was
+	// walked again, must not be sent again (with thousands of folders,
+	// thousands of messages for the window at every activation); one that
+	// changed must be. A libtracker.so without RefreshFolderSize() sends
+	// them with RequestFolderSize(), as its activations did.
+	typedef void (*RefreshFunction)(const entry_ref&, const node_ref&,
+		const BMessenger&, bigtime_t);
+	RefreshFunction refresh = (RefreshFunction)dlsym(RTLD_DEFAULT,
+		"_ZN8BPrivate17RefreshFolderSizeERK9entry_refRK8node_refRK10"
+		"BMessengerl");
+	printf("    RefreshFolderSize() %s\n", refresh != NULL
+		? "is there" : "is not in this libtracker.so: RequestFolderSize() "
+			"instead");
+
+	BString root(sFolder);
+	root << "/refresh";
+	RemoveTree(root.String());
+	BString deep(root);
+	deep << "/a/b";
+	create_directory(deep.String(), 0755);
+	for (int32 i = 0; i < 10; i++) {
+		BString file(deep);
+		file << "/file" << i;
+		MakeFile(file, 100);
+	}
+	BEntry entry(root.String());
+	entry_ref ref;
+	node_ref node;
+	entry.GetRef(&ref);
+	entry.GetNodeRef(&node);
+	BMessenger target(sReceiver);
+
+	ForgetFolderSize(node);
+	sReceiver->Reset();
+	bigtime_t start = system_time();
+	RequestFolderSize(ref, node, target, 0);
+	off_t size;
+	int32 replies = WaitForSizes(start, &size);
+	printf("    asked for: %" B_PRId32 " sizes sent, %" B_PRIdOFF " bytes\n",
+		replies, size);
+	Check(replies == 1 && size == 1000, "the size was sent when asked for");
+
+	// at once: the size is recent
+	sReceiver->Reset();
+	start = system_time();
+	if (refresh != NULL)
+		refresh(ref, node, target, 10000000);
+	else
+		RequestFolderSize(ref, node, target, 10000000);
+	int32 recentReplies = WaitForSizes(start, &size);
+
+	// walked again (anything older than 0 s): the same size
+	sReceiver->Reset();
+	start = system_time();
+	if (refresh != NULL)
+		refresh(ref, node, target, 0);
+	else
+		RequestFolderSize(ref, node, target, 0);
+	int32 sameReplies = WaitForSizes(start, &size);
+
+	// a file added deep inside: a different size
+	BString file(deep);
+	file << "/added";
+	MakeFile(file, 500);
+	sReceiver->Reset();
+	start = system_time();
+	if (refresh != NULL)
+		refresh(ref, node, target, 0);
+	else
+		RequestFolderSize(ref, node, target, 0);
+	off_t changedSize = -1;
+	int32 changedReplies = WaitForSizes(start, &changedSize);
+
+	printf("    checked again: %" B_PRId32 " sent while recent, %" B_PRId32
+		" after a walk that found the same size, %" B_PRId32 " after one "
+		"that found %" B_PRIdOFF " bytes\n", recentReplies, sameReplies,
+		changedReplies, changedSize);
+	Check(recentReplies == 0 && sameReplies == 0,
+		"a size the window has was not sent again");
+	Check(changedReplies == 1 && changedSize == 1500,
+		"a size that changed was sent");
+
+	RemoveTree(root.String());
+}
+
+
 // A window with a view of 400 by 400 pixels, the size of a folder window's
 // pose view, to draw icons into as Tracker does.
 class IconWindow : public BWindow {
@@ -721,6 +830,215 @@ FailedThumbnailRedraws()
 }
 
 
+static bool
+PicturePNG(BMallocIO& png)
+{
+	// 2,000 by 2,000 pixels of one colour: a few KiB on disk, and some tens
+	// of milliseconds to read
+	BBitmap picture(BRect(0, 0, 1999, 1999), B_RGB32);
+	memset(picture.Bits(), 0x80, picture.BitsLength());
+	BBitmapStream pictureStream(&picture);
+	BBitmap* detached;
+	status_t status = BTranslatorRoster::Default()->Translate(&pictureStream,
+		NULL, NULL, &png, B_PNG_FORMAT);
+	pictureStream.DetachBitmap(&detached);
+	if (status != B_OK)
+		Fail("no PNG translator");
+	return status == B_OK;
+}
+
+
+static void
+ThumbnailsOfReusedNodes()
+{
+	// Thumbnails are made of 100 pictures whose models are gone by then (a
+	// window that was closed), and the pictures are deleted. New pictures
+	// made after that get some of the same node numbers. They must get
+	// thumbnails of their own: the jobs used to put each picture into the
+	// icon cache by node, after the model that would have removed it was
+	// gone, and a new file with that node was drawn with it and never got
+	// a thumbnail.
+	BMallocIO png;
+	if (!PicturePNG(png))
+		return;
+
+	const int32 kCount = 100;
+	BString gone(sFolder);
+	gone << "/gone";
+	RemoveTree(gone.String());
+	create_directory(gone.String(), 0755);
+	std::set<ino_t> oldNodes;
+	BBitmap icon(BRect(0, 0, 63, 63), B_RGBA32);
+	for (int32 i = 0; i < kCount; i++) {
+		BString path(gone);
+		path << "/picture" << i << ".png";
+		BFile file(path.String(), B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);
+		file.Write(png.Buffer(), png.BufferLength());
+		BNodeInfo(&file).SetType("image/png");
+		file.Unset();
+		entry_ref ref;
+		get_ref_for_path(path.String(), &ref);
+		Model model(&ref, false, true);
+		oldNodes.insert(model.NodeRef()->node);
+		GetThumbnailFromAttr(&model, &icon, BSize(63, 63));
+	}
+	WaitForIdleThread("thumbnail worker", 2000000,
+		system_time() + 120000000LL);
+	RemoveTree(gone.String());
+
+	BString root(sFolder);
+	root << "/fresh";
+	RemoveTree(root.String());
+	create_directory(root.String(), 0755);
+	std::vector<entry_ref> refs;
+	std::vector<Model*> models;
+	int32 reused = 0;
+	for (int32 i = 0; i < kCount; i++) {
+		BString path(root);
+		path << "/picture" << i << ".png";
+		BFile file(path.String(), B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);
+		file.Write(png.Buffer(), png.BufferLength());
+		BNodeInfo(&file).SetType("image/png");
+		file.Unset();
+		entry_ref ref;
+		get_ref_for_path(path.String(), &ref);
+		refs.push_back(ref);
+		Model* model = new Model(&ref, false, false);
+		models.push_back(model);
+		if (oldNodes.find(model->NodeRef()->node) != oldNodes.end())
+			reused++;
+	}
+
+	// all of them in view
+	IconWindow* window = new IconWindow;
+	window->Show();
+	BView* view = window->View();
+	window->Lock();
+	for (int32 i = 0; i < kCount; i++) {
+		IconCache::sIconCache->Draw(models[i], view, BPoint(0, 0),
+			kNormalIcon, BSize(63, 63));
+	}
+	view->Sync();
+	window->Unlock();
+	WaitForIdleThread("thumbnail worker", 3000000,
+		system_time() + 300000000LL);
+
+	int32 missing = 0;
+	int32 missingReused = 0;
+	for (int32 i = 0; i < kCount; i++) {
+		BNode node(&refs[i]);
+		attr_info info;
+		if (node.GetAttrInfo(kAttrThumbnail, &info) == B_OK)
+			continue;
+		missing++;
+		if (oldNodes.find(models[i]->NodeRef()->node) != oldNodes.end())
+			missingReused++;
+	}
+	printf("    %" B_PRId32 " new pictures, %" B_PRId32 " of them on a node "
+		"of a deleted one; without a thumbnail: %" B_PRId32 " (%" B_PRId32
+		" of them on such a node)\n", kCount, reused, missing,
+		missingReused);
+	if (reused == 0)
+		printf("    no node was used again: this run shows nothing\n");
+	Check(missing == 0, "every new picture got its thumbnail");
+
+	window->Lock();
+	window->Quit();
+	for (size_t i = 0; i < models.size(); i++)
+		delete models[i];
+	RemoveTree(root.String());
+}
+
+
+static bigtime_t
+KernelTime()
+{
+	thread_info info;
+	get_thread_info(find_thread(NULL), &info);
+	return info.kernel_time;
+}
+
+
+static void
+TimeListRedraws(BView* view, const std::vector<Model*>& models,
+	bigtime_t* _drawTime, bigtime_t* _kernelTime)
+{
+	// draws the icons at 16 pixels, as a list view does, eleven times: the
+	// first finds out where they come from, the other ten are timed
+	*_drawTime = 0;
+	*_kernelTime = 0;
+	for (int32 pass = 0; pass < 11; pass++) {
+		view->LockLooper();
+		bigtime_t start = system_time();
+		bigtime_t kernelStart = KernelTime();
+		for (size_t i = 0; i < models.size(); i++) {
+			IconCache::sIconCache->Draw(models[i], view,
+				BPoint(0, (i % 25) * 16), kNormalIcon, BSize(15, 15));
+		}
+		view->Sync();
+		if (pass > 0) {
+			*_drawTime += system_time() - start;
+			*_kernelTime += KernelTime() - kernelStart;
+		}
+		view->UnlockLooper();
+	}
+	*_drawTime /= 10;
+	*_kernelTime /= 10;
+}
+
+
+static void
+ListViewDocumentRedraws()
+{
+	// 500 documents of a type that gets thumbnails in an icon view, drawn
+	// at 16 pixels as a list view draws them, where documents get none: once
+	// it is known that they have no icon of their own either, drawing them
+	// again must not open each file to find that out again. They must cost
+	// no more than 500 files of a type that never gets thumbnails.
+	BString root(sFolder);
+	root << "/documents";
+	RemoveTree(root.String());
+	create_directory(root.String(), 0755);
+	const int32 kCount = 500;
+	std::vector<Model*> documents;
+	std::vector<Model*> others;
+	for (int32 i = 0; i < kCount * 2; i++) {
+		BString path(root);
+		path << (i < kCount ? "/document" : "/other") << i;
+		MakeFile(path, 4096, i < kCount
+			? "application/pdf" : "application/x-vnd.haiku-package");
+		entry_ref ref;
+		get_ref_for_path(path.String(), &ref);
+		(i < kCount ? documents : others).push_back(
+			new Model(&ref, false, false));
+	}
+
+	IconWindow* window = new IconWindow;
+	window->Show();
+	BView* view = window->View();
+
+	bigtime_t documentDraw, documentKernel, otherDraw, otherKernel;
+	TimeListRedraws(view, documents, &documentDraw, &documentKernel);
+	TimeListRedraws(view, others, &otherDraw, &otherKernel);
+
+	printf("    a redraw of %" B_PRId32 " documents at 16 pixels: %.2f ms, "
+		"%.2f ms of it in the kernel; of %" B_PRId32 " files of a type "
+		"without thumbnails: %.2f ms, %.2f ms in the kernel\n", kCount,
+		documentDraw / 1e3, documentKernel / 1e3, kCount, otherDraw / 1e3,
+		otherKernel / 1e3);
+	Check(documentKernel < otherKernel * 3 / 2 + 1000, "the documents were "
+		"not opened again (no more time in the kernel than the others, "
+		"give or take 1 ms)");
+
+	window->Lock();
+	window->Quit();
+	for (int32 i = 0; i < kCount; i++) {
+		delete documents[i];
+		delete others[i];
+	}
+	RemoveTree(root.String());
+}
+
 struct Scenario {
 	const char*	name;
 	void		(*function)();
@@ -731,12 +1049,12 @@ static const Scenario kScenarios[] = {
 	{ "folder-size-many-subfolders", FolderSizeManySubfolders },
 	{ "folder-size-burst", FolderSizeBurst },
 	{ "folder-size-cancel", FolderSizeCancel },
-	// before thumbnail-jobs: after it, 1 to 3 of the 600 pictures got no
-	// thumbnail at all, with the libtracker.so of before and after these
-	// changes alike (not explained yet); on their own, every one does
+	{ "folder-size-refresh", FolderSizeRefresh },
+	{ "thumbnail-jobs", ThumbnailJobs },
 	{ "thumbnails-out-of-view", ThumbnailsOutOfView },
 	{ "failed-thumbnail-redraws", FailedThumbnailRedraws },
-	{ "thumbnail-jobs", ThumbnailJobs },
+	{ "thumbnails-of-reused-nodes", ThumbnailsOfReusedNodes },
+	{ "list-view-document-redraws", ListViewDocumentRedraws },
 	{ NULL, NULL }
 };
 

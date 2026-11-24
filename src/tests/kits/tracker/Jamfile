@@ -10,8 +10,10 @@ SimpleTest tracker_fsops_test : tracker_fsops_test.cpp
 	: be tracker shared [ TargetLibstdc++ ] ;
 
 # Folder sizes and thumbnails with folders of thousands of entries (#179):
-# file descriptors held, walks per burst of changes, a walk cancelled,
-# thumbnails of icons scrolled out of view, redraws after failed thumbnails.
+# file descriptors held, walks per burst of changes, a walk cancelled, sizes
+# checked again, thumbnails of icons scrolled out of view, redraws after
+# failed thumbnails, thumbnails of pictures on reused nodes, documents
+# redrawn in a list view.
 # Needs app_server (it draws into a window); keeps <folder>/bigtree, a tree
 # of 300,000 files that takes minutes to make, between runs.
 #	tracker_large_folder_test /Data/t
