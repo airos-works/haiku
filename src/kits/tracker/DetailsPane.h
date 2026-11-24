@@ -48,6 +48,9 @@ private:
 			BObjectList<entry_ref, true> fShown;
 			entry_ref			fFolder;
 			Model*				fModel;
+			const BPoseView*	fPoseView;
+			uint32				fSelectionChangeCount;
+				// of fPoseView when the selection was last looked at
 };
 
 

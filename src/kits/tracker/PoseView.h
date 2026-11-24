@@ -344,6 +344,10 @@ public:
 
 	// selection
 	PoseList* SelectionList() const;
+	uint32 SelectionChangeCount() const;
+		// changes when items are selected or deselected, or a selected
+		// item is renamed: the details pane looks at the selection after
+		// every message to the window, and only needs to when this changed
 	void SelectAll();
 	void InvertSelection();
 	int32 SelectMatchingEntries(const BMessage*);
@@ -801,6 +805,7 @@ private:
 	PoseList* fFilteredPoseList;
 	PoseList* fVSPoseList;
 	PoseList* fSelectionList;
+	uint32 fSelectedRenames;
 	HashSet<node_ref_key> fInsertedNodes;
 	BStringList fMimeTypesInSelectionCache;
 		// used for mime string based icon highliting during a drag
@@ -1013,6 +1018,13 @@ inline PoseList*
 BPoseView::SelectionList() const
 {
 	return fSelectionList;
+}
+
+
+inline uint32
+BPoseView::SelectionChangeCount() const
+{
+	return fSelectionList->ChangeCount() + fSelectedRenames;
 }
 
 

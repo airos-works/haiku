@@ -59,14 +59,16 @@ public:
 	PoseList(int32 itemsPerBlock = 20, bool owning = false)
 		:
 		_inherited(itemsPerBlock),
-		fOwning(owning)
+		fOwning(owning),
+		fChangeCount(0)
 	{
 	}
 
 	PoseList(const PoseList& list)
 		:
 		_inherited(list),
-		fOwning(list.fOwning)
+		fOwning(list.fOwning),
+		fChangeCount(0)
 	{
 	}
 
@@ -88,14 +90,22 @@ public:
 	BPose* LastItem() const { return _inherited::LastItem(); }
 	BPose* ItemAt(int32 i) const { return _inherited::ItemAt(i); }
 
-	bool AddItem(BPose* p) { return _inherited::AddItem(p); }
-	bool AddItem(BPose* p, int32 i) { return _inherited::AddItem(p, i); }
-	bool AddList(PoseList* list) { return _inherited::AddList(list); }
+	bool AddItem(BPose* p) { fChangeCount++; return _inherited::AddItem(p); }
+	bool AddItem(BPose* p, int32 i)
+		{ fChangeCount++; return _inherited::AddItem(p, i); }
+	bool AddList(PoseList* list)
+		{ fChangeCount++; return _inherited::AddList(list); }
 
 	bool RemoveItem(BPose* p, bool deleteIfOwning = true);
-	BPose* RemoveItemAt(int32 i) { return _inherited::RemoveItemAt(i); }
+	BPose* RemoveItemAt(int32 i)
+		{ fChangeCount++; return _inherited::RemoveItemAt(i); }
 
 	void MakeEmpty(bool deleteIfOwning = true);
+
+	// Goes up with every change of what the list holds: whoever shows
+	// something about its items (the details pane, the selection) can tell
+	// at once whether anything changed without comparing every item.
+	uint32 ChangeCount() const { return fChangeCount; }
 
 public:
 	template<class Item, class Param1>
@@ -123,6 +133,7 @@ public:
 
 private:
 	bool fOwning;
+	uint32 fChangeCount;
 };
 
 
@@ -130,6 +141,8 @@ inline bool
 PoseList::RemoveItem(BPose* p, bool deleteIfOwning)
 {
 	bool removed = _inherited::RemoveItem(p);
+	if (removed)
+		fChangeCount++;
 	if (removed && fOwning && deleteIfOwning)
 		delete p;
 	return removed;
@@ -144,6 +157,8 @@ PoseList::MakeEmpty(bool deleteIfOwning)
 		for (int32 index = 0; index < count; index++)
 			delete ItemAt(index);
 	}
+	if (CountItems() > 0)
+		fChangeCount++;
 	_inherited::MakeEmpty();
 }
 

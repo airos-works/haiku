@@ -233,6 +233,7 @@ BPoseView::BPoseView(Model* model, uint32 viewMode)
 	fFilteredPoseList(new PoseList()),
 	fVSPoseList(new PoseList()),
 	fSelectionList(new PoseList()),
+	fSelectedRenames(0),
 	fMimeTypesInSelectionCache(20),
 	fZombieList(new BObjectList<Model, true>(10)),
 	fColumnList(new BObjectList<BColumn, true>(4)),
@@ -6783,6 +6784,8 @@ BPoseView::EntryMoved(const BMessage* message)
 			Model* poseModel = pose->TargetModel();
 			ASSERT(poseModel != NULL);
 			poseModel->UpdateEntryRef(&dirNode, name);
+			if (pose->IsSelected())
+				fSelectedRenames++;
 
 			BPoint loc(0, index * fListElemHeight);
 			// if we get a rename then we need to assume that we might

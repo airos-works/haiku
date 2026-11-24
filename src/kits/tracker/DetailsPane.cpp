@@ -97,7 +97,9 @@ DetailsPane::DetailsPane()
 	:
 	BView("details", B_WILL_DRAW),
 	fShown(10),
-	fModel(NULL)
+	fModel(NULL),
+	fPoseView(NULL),
+	fSelectionChangeCount(0)
 {
 	SetViewUIColor(B_PANEL_BACKGROUND_COLOR);
 	// the content says how narrow it can be; this is how wide it starts
@@ -288,11 +290,23 @@ DetailsPane::_AddAttributes(Model* model)
 void
 DetailsPane::Update(BPoseView* poseView, bool force)
 {
-	// only when what is shown changed
+	// only when what is shown changed. This runs after every message to
+	// the window: comparing a selection of 20,000 items took 0.6 ms each
+	// time, so the items are only compared when the pose view says its
+	// selection changed (selecting the same items again leaves the pane as
+	// it is).
+	bool sameFolder = poseView->TargetModel() != NULL
+		&& *poseView->TargetModel()->EntryRef() == fFolder;
+	if (!force && sameFolder && poseView == fPoseView
+		&& poseView->SelectionChangeCount() == fSelectionChangeCount) {
+		return;
+	}
+	fPoseView = poseView;
+	fSelectionChangeCount = poseView->SelectionChangeCount();
+
 	PoseList* selection = poseView->SelectionList();
 	bool same = !force && selection->CountItems() == fShown.CountItems()
-		&& poseView->TargetModel() != NULL
-		&& *poseView->TargetModel()->EntryRef() == fFolder;
+		&& sameFolder;
 	for (int32 i = 0; same && i < selection->CountItems(); i++) {
 		if (*selection->ItemAt(i)->TargetModel()->EntryRef()
 				!= *fShown.ItemAt(i)) {
