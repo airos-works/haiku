@@ -1,0 +1,9 @@
+SubDir HAIKU_TOP src tests add-ons kernel drivers ioctl ;
+
+# ioctl_pointer_test: device ioctls with wrong pointers and lengths in what
+# the caller passes (/dev/acpi/call, the disks' icon, the thermal drivers, raw
+# SCSI commands on ATAPI). For a virtual machine: see the source.
+
+SimpleTest ioctl_pointer_test :
+	ioctl_pointer_test.cpp
+;

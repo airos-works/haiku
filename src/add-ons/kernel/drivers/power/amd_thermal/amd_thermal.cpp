@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include <cpu.h>
+#include <kernel.h>
 
 #include "amd_thermal.h"
 
@@ -55,9 +56,6 @@ typedef struct amd_thermal_device_info {
 } amd_thermal_device_info;
 
 
-status_t amd_thermal_control(void* _cookie, uint32 op, void* arg, size_t len);
-
-
 static uint32
 ksmn_read_reg(amd_thermal_device_info* device, uint32 address)
 {
@@ -75,6 +73,24 @@ ksmn_ccd_init(amd_thermal_device_info* device, int ccpCount)
 			continue;
 		device->ccdValid |= (1 << i);
 	}
+}
+
+
+static void
+amd_thermal_get_type(amd_thermal_device_info* device, amd_thermal_type* att)
+{
+	// Read basic temperature thresholds.
+	uint32 data = ksmn_read_reg(device, AMD_SMU_17H_THM);
+	uint16 raw = GET_CURTMP(data);
+	int32 offset = 0;
+	if ((data & CURTMP_17H_RANGE_SELECTION) != 0)
+		offset -= CURTMP_17H_RANGE_ADJUST;
+	offset -= device->tctlOffset;
+	offset *= 100000;
+	// convert to microCelsius then offset
+	uint32 value = raw * 125000 + offset;
+	// convert to tenth of Celsius
+	att->current_temp = value / 100000;
 }
 
 
@@ -100,7 +116,7 @@ amd_thermal_read(void* _cookie, off_t position, void* buf, size_t* num_bytes)
 	if (position == 0) {
 		char buffer[128];
 		TRACE("amd_thermal: read()\n");
-		amd_thermal_control(device, drvOpGetThermalType, &therm_info, 0);
+		amd_thermal_get_type(device, &therm_info);
 
 		int32 copied = snprintf(buffer, sizeof(buffer),
 			"  Current Temperature: %" B_PRIu32 ".%" B_PRIu32 " C\n",
@@ -125,31 +141,25 @@ amd_thermal_write(void* cookie, off_t position, const void* buffer, size_t* num_
 }
 
 
-status_t
+static status_t
 amd_thermal_control(void* _cookie, uint32 op, void* arg, size_t len)
 {
 	amd_thermal_device_info* device = (amd_thermal_device_info*)_cookie;
 	status_t err = B_ERROR;
 
-	amd_thermal_type* att = NULL;
-
 	switch (op) {
 		case drvOpGetThermalType:
 		{
-			att = (amd_thermal_type*)arg;
+			// "arg" is the caller's pointer: fill a structure of our own
+			// and copy it out
+			amd_thermal_type type;
+			amd_thermal_get_type(device, &type);
 
-			// Read basic temperature thresholds.
-			uint32 data = ksmn_read_reg(device, AMD_SMU_17H_THM);
-			uint16 raw = GET_CURTMP(data);
-			int32 offset = 0;
-			if ((data & CURTMP_17H_RANGE_SELECTION) != 0)
-				offset -= CURTMP_17H_RANGE_ADJUST;
-			offset -= device->tctlOffset;
-			offset *= 100000;
-			// convert to microCelsius then offset
-			uint32 value = raw * 125000 + offset;
-			// convert to tenth of Celsius
-			att->current_temp = value / 100000;
+			if (!IS_USER_ADDRESS(arg)
+				|| user_memcpy(arg, &type, sizeof(type)) != B_OK) {
+				return B_BAD_ADDRESS;
+			}
+
 			err = B_OK;
 			break;
 		}

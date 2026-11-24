@@ -194,7 +194,15 @@ ATAPIDevice::ExecuteIO(ATARequest *request)
 		return B_BAD_INDEX;
 	}
 
-	// ATAPI command packets are 12 bytes long;
+	// ATAPI command packets are 12 bytes long: a longer command (a 16 byte
+	// one of a raw device command) cannot be sent to the device
+	if (ccb->cdb_length > sizeof(fPacket)) {
+		TRACE_ERROR("command 0x%02x of %u bytes does not fit an ATAPI "
+			"packet\n", ccb->cdb[0], ccb->cdb_length);
+		request->SetStatus(SCSI_REQ_INVALID);
+		return B_BAD_VALUE;
+	}
+
 	// if the command is shorter, remaining bytes must be padded with zeros
 	memset(fPacket, 0, sizeof(fPacket));
 	memcpy(fPacket, ccb->cdb, ccb->cdb_length);

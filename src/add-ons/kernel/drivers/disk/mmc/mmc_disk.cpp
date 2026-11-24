@@ -23,6 +23,7 @@
 #include <drivers/KernelExport.h>
 #include <drivers/Drivers.h>
 #include <kernel/OS.h>
+#include <kernel.h>
 #include <util/fs_trim_support.h>
 
 #include <AutoDeleter.h>
@@ -696,7 +697,9 @@ mmc_block_ioctl(void* cookie, uint32 op, void* buffer, size_t length)
 				return B_BAD_ADDRESS;
 
 			if (iconData.icon_size >= (int32)sizeof(kDriveIcon)) {
-				if (user_memcpy(iconData.icon_data, kDriveIcon,
+				// the pointer in the structure is the caller's as well
+				if (!IS_USER_ADDRESS(iconData.icon_data)
+					|| user_memcpy(iconData.icon_data, kDriveIcon,
 						sizeof(kDriveIcon)) != B_OK)
 					return B_BAD_ADDRESS;
 			}

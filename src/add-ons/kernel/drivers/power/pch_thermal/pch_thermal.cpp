@@ -13,6 +13,7 @@
 #include <PCI.h>
 #include <bus/PCI.h>
 #include <util/AreaKeeper.h>
+#include <kernel.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,7 +72,18 @@ typedef struct pch_thermal_device_info {
 } pch_thermal_device_info;
 
 
-status_t pch_thermal_control(void* _cookie, uint32 op, void* arg, size_t len);
+static void
+pch_thermal_get_type(pch_thermal_device_info* device, pch_thermal_type* att)
+{
+	// Read basic temperature thresholds.
+	att->critical_temp = device->criticalTemp;
+	att->hot_temp = device->hotTemp;
+
+	uint16 temp = read16(device->registers + PCH_THERMAL_TEMP);
+	temp = (temp >> PCH_THERMAL_TEMP_TSR_SHIFT)
+		& PCH_THERMAL_TEMP_TSR_MASK;
+	att->current_temp = (uint32)temp * 10 / 2 - 500;
+}
 
 
 static status_t
@@ -99,7 +111,7 @@ pch_thermal_read(void* _cookie, off_t position, void *buf, size_t* num_bytes)
 		size_t totalCopied = 0;
 		char *str = (char *)buffer;
 		TRACE("pch_thermal: read()\n");
-		pch_thermal_control(device, drvOpGetThermalType, &therm_info, 0);
+		pch_thermal_get_type(device, &therm_info);
 
 		int32 copied = snprintf(str, maxLength, "  Critical Temperature: %" B_PRIu32 ".%"
 			B_PRIu32 " C\n", (therm_info.critical_temp / 10),
@@ -142,26 +154,23 @@ pch_thermal_write(void* cookie, off_t position, const void* buffer,
 }
 
 
-status_t
+static status_t
 pch_thermal_control(void* _cookie, uint32 op, void* arg, size_t len)
 {
 	pch_thermal_device_info* device = (pch_thermal_device_info*)_cookie;
 	status_t err = B_ERROR;
 
-	pch_thermal_type *att = NULL;
-
 	switch (op) {
 		case drvOpGetThermalType: {
-			att = (pch_thermal_type *)arg;
+			// "arg" is the caller's pointer: fill a structure of our own
+			// and copy it out
+			pch_thermal_type type;
+			pch_thermal_get_type(device, &type);
 
-			// Read basic temperature thresholds.
-			att->critical_temp = device->criticalTemp;
-			att->hot_temp = device->hotTemp;
-
-			uint16 temp = read16(device->registers + PCH_THERMAL_TEMP);
-			temp = (temp >> PCH_THERMAL_TEMP_TSR_SHIFT)
-				& PCH_THERMAL_TEMP_TSR_MASK;
-			att->current_temp = (uint32)temp * 10 / 2 - 500;
+			if (!IS_USER_ADDRESS(arg)
+				|| user_memcpy(arg, &type, sizeof(type)) != B_OK) {
+				return B_BAD_ADDRESS;
+			}
 
 			err = B_OK;
 			break;

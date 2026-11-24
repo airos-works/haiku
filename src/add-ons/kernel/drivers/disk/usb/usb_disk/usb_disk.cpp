@@ -1869,9 +1869,11 @@ usb_disk_ioctl(void* cookie, uint32 op, void* buffer, size_t length)
 			if (user_memcpy(&iconData, buffer, sizeof(device_icon)) != B_OK)
 				return B_BAD_ADDRESS;
 
+			// the pointer in the structure is the caller's as well
 			if (iconData.icon_size >= icon->icon_size
-				&& user_memcpy(iconData.icon_data, icon->icon_data, (size_t)icon->icon_size)
-					!= B_OK) {
+				&& (!IS_USER_ADDRESS(iconData.icon_data)
+					|| user_memcpy(iconData.icon_data, icon->icon_data,
+						(size_t)icon->icon_size) != B_OK)) {
 				return B_BAD_ADDRESS;
 			}
 

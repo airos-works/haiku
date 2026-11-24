@@ -23,6 +23,7 @@
 
 #include <fs/devfs.h>
 #include <io_requests.h>
+#include <kernel.h>
 #include <vm/vm_page.h>
 
 #include "IOCache.h"
@@ -805,7 +806,9 @@ cd_ioctl(void* cookie, uint32 op, void* buffer, size_t length)
 				return B_BAD_ADDRESS;
 
 			if (iconData.icon_size >= (int32)sizeof(kCDIcon)) {
-				if (user_memcpy(iconData.icon_data, kCDIcon,
+				// the pointer in the structure is the caller's as well
+				if (!IS_USER_ADDRESS(iconData.icon_data)
+					|| user_memcpy(iconData.icon_data, kCDIcon,
 						sizeof(kCDIcon)) != B_OK)
 					return B_BAD_ADDRESS;
 			}

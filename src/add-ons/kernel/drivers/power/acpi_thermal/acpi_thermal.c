@@ -17,6 +17,7 @@
 #include <stdlib.h>
 
 #include <ACPI.h>
+#include <kernel.h>
 
 #include <util/convertutf.h>
 
@@ -42,7 +43,8 @@ typedef struct acpi_ns_device_info {
 } acpi_thermal_device_info;
 
 
-status_t acpi_thermal_control(void* _cookie, uint32 op, void* arg, size_t len);
+static void acpi_thermal_get_type(acpi_thermal_device_info* device,
+	acpi_thermal_type* att);
 
 static void guess_kelvin_offset(acpi_thermal_device_info* device);
 
@@ -59,7 +61,7 @@ guess_kelvin_offset(acpi_thermal_device_info* device)
 {
 	acpi_thermal_type therm_info;
 
-	acpi_thermal_control(device, drvOpGetThermalType, &therm_info, 0);
+	acpi_thermal_get_type(device, &therm_info);
 
 	device->kelvin_offset = 2732;
 	if (therm_info.critical_temp > 2732 && (therm_info.critical_temp % 5) == 1)
@@ -96,7 +98,7 @@ acpi_thermal_read(void* _cookie, off_t position, void* buf, size_t* num_bytes)
 
 		uint kelvinOffset = device->kelvin_offset;
 
-		acpi_thermal_control(device, drvOpGetThermalType, &therm_info, 0);
+		acpi_thermal_get_type(device, &therm_info);
 
 		snprintf(str, max_len, "  Critical Temperature: %" B_PRIu32 ".%" B_PRIu32 " °C\n",
 				((therm_info.critical_temp - kelvinOffset) / 10),
@@ -155,7 +157,48 @@ acpi_thermal_write(void* cookie, off_t position, const void* buffer, size_t* num
 }
 
 
-status_t
+static void
+acpi_thermal_get_type(acpi_thermal_device_info* device, acpi_thermal_type* att)
+{
+	status_t err;
+	acpi_object_type object;
+
+	acpi_data buffer;
+	buffer.pointer = &object;
+	buffer.length = sizeof(object);
+
+	// Read basic temperature thresholds.
+	err = device->acpi->evaluate_method (device->acpi_cookie, "_CRT",
+		NULL, &buffer);
+
+	att->critical_temp =
+		(err == B_OK && object.object_type == ACPI_TYPE_INTEGER)
+		? object.integer.integer : 0;
+
+	err = device->acpi->evaluate_method (device->acpi_cookie, "_TMP",
+		NULL, &buffer);
+
+	att->current_temp =
+		(err == B_OK && object.object_type == ACPI_TYPE_INTEGER)
+		? object.integer.integer : 0;
+
+	err = device->acpi->evaluate_method(device->acpi_cookie, "_HOT",
+		NULL, &buffer);
+
+	att->hot_temp =
+		(err == B_OK && object.object_type == ACPI_TYPE_INTEGER)
+		? object.integer.integer : 0;
+
+	// Read Passive Cooling devices
+	att->passive_package = NULL;
+	//err = device->acpi->get_object(device->acpi_cookie, "_PSL", &(att->passive_package));
+
+	att->active_count = 0;
+	att->active_devices = NULL;
+}
+
+
+static status_t
 acpi_thermal_control(void* _cookie, uint32 op, void* arg, size_t len)
 {
 	acpi_thermal_device_info* device = (acpi_thermal_device_info*)_cookie;
@@ -199,43 +242,15 @@ acpi_thermal_control(void* _cookie, uint32 op, void* arg, size_t len)
 			break;
 		}
 		case drvOpGetThermalType: {
-			acpi_object_type object;
-			acpi_thermal_type* att = NULL;
+			// "arg" is the caller's pointer: fill a structure of our own
+			// and copy it out
+			acpi_thermal_type type;
+			acpi_thermal_get_type(device, &type);
 
-			acpi_data buffer;
-			buffer.pointer = &object;
-			buffer.length = sizeof(object);
-
-			att = (acpi_thermal_type*)arg;
-
-			// Read basic temperature thresholds.
-			err = device->acpi->evaluate_method (device->acpi_cookie, "_CRT",
-				NULL, &buffer);
-
-			att->critical_temp =
-				(err == B_OK && object.object_type == ACPI_TYPE_INTEGER)
-				? object.integer.integer : 0;
-
-			err = device->acpi->evaluate_method (device->acpi_cookie, "_TMP",
-				NULL, &buffer);
-
-			att->current_temp =
-				(err == B_OK && object.object_type == ACPI_TYPE_INTEGER)
-				? object.integer.integer : 0;
-
-			err = device->acpi->evaluate_method(device->acpi_cookie, "_HOT",
-				NULL, &buffer);
-
-			att->hot_temp =
-				(err == B_OK && object.object_type == ACPI_TYPE_INTEGER)
-				? object.integer.integer : 0;
-
-			// Read Passive Cooling devices
-			att->passive_package = NULL;
-			//err = device->acpi->get_object(device->acpi_cookie, "_PSL", &(att->passive_package));
-
-			att->active_count = 0;
-			att->active_devices = NULL;
+			if (!IS_USER_ADDRESS(arg)
+				|| user_memcpy(arg, &type, sizeof(type)) != B_OK) {
+				return B_BAD_ADDRESS;
+			}
 
 			err = B_OK;
 			break;

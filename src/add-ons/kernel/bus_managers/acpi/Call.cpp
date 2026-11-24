@@ -13,6 +13,8 @@
 #include <KernelExport.h>
 #include <OS.h>
 
+#include <kernel.h>
+
 #include "ACPIPrivate.h"
 
 
@@ -36,6 +38,12 @@ struct acpi_call_desc
 	acpi_data	result;
 	acpi_size	reslen;
 };
+
+
+// A control method takes at most seven arguments (ACPI_METHOD_NUM_ARGS).
+static const uint32 kMaxArguments = 7;
+// The largest string or buffer argument that is copied into the kernel.
+static const size_t kMaxArgumentSize = 64 * 1024;
 
 
 //	#pragma mark - device module API
@@ -117,6 +125,94 @@ acpi_call_fixup_pointers(acpi_object_type *p, void *target)
 }
 
 
+/*!	Frees what acpi_call_copy_arguments() allocated for the first \a count
+	arguments.
+*/
+static void
+acpi_call_free_arguments(acpi_object_type* args, uint32 count)
+{
+	for (uint32 i = 0; i < count; i++) {
+		if (args[i].object_type == ACPI_TYPE_STRING)
+			free(args[i].string.string);
+		else if (args[i].object_type == ACPI_TYPE_BUFFER)
+			free(args[i].buffer.buffer);
+	}
+}
+
+
+/*!	Copies the caller's argument objects, and the strings and buffers they
+	point to, into kernel memory: ACPICA reads all of them directly, which
+	it must not do with memory of the calling team (a wrong pointer would be
+	an unhandled fault, and with SMAP even a right one is).
+	On success the caller owns the copies (acpi_call_free_arguments()).
+*/
+static status_t
+acpi_call_copy_arguments(const acpi_objects& userArgs, acpi_object_type* args)
+{
+	if (userArgs.count == 0)
+		return B_OK;
+	if (userArgs.count > kMaxArguments)
+		return B_BAD_VALUE;
+	if (!IS_USER_ADDRESS(userArgs.pointer)
+		|| user_memcpy(args, userArgs.pointer,
+			userArgs.count * sizeof(acpi_object_type)) != B_OK) {
+		return B_BAD_ADDRESS;
+	}
+
+	status_t status = B_OK;
+	uint32 i = 0;
+	for (; i < userArgs.count; i++) {
+		void* userData;
+		size_t size;
+		if (args[i].object_type == ACPI_TYPE_INTEGER) {
+			continue;
+		} else if (args[i].object_type == ACPI_TYPE_STRING) {
+			userData = args[i].string.string;
+			size = args[i].string.len;
+		} else if (args[i].object_type == ACPI_TYPE_BUFFER) {
+			userData = args[i].buffer.buffer;
+			size = args[i].buffer.length;
+		} else {
+			// Packages would have to be copied object by object, and
+			// references carry a kernel pointer: neither can be passed.
+			status = B_BAD_VALUE;
+			break;
+		}
+
+		if (size > kMaxArgumentSize) {
+			status = B_BAD_VALUE;
+			break;
+		}
+		if (!IS_USER_ADDRESS(userData)) {
+			status = B_BAD_ADDRESS;
+			break;
+		}
+
+		// one more byte, so that a string is terminated in any case
+		char* data = (char*)malloc(size + 1);
+		if (data == NULL) {
+			status = B_NO_MEMORY;
+			break;
+		}
+		if (user_memcpy(data, userData, size) != B_OK) {
+			free(data);
+			status = B_BAD_ADDRESS;
+			break;
+		}
+		data[size] = '\0';
+
+		if (args[i].object_type == ACPI_TYPE_STRING)
+			args[i].string.string = data;
+		else
+			args[i].buffer.buffer = data;
+	}
+
+	if (status != B_OK)
+		acpi_call_free_arguments(args, i);
+	return status;
+}
+
+
 static status_t
 acpi_call_control(void *_device, uint32 op, void *buffer, size_t length)
 {
@@ -126,31 +222,59 @@ acpi_call_control(void *_device, uint32 op, void *buffer, size_t length)
 	if (op == 'ACCA') {
 		struct acpi_call_desc params;
 		char path[1024];
-		if (user_memcpy(&params, buffer, sizeof(params)) != B_OK
-			|| user_memcpy(path, params.path, sizeof(path)) != B_OK) {
+		if (!IS_USER_ADDRESS(buffer)
+			|| user_memcpy(&params, buffer, sizeof(params)) != B_OK
+			|| !IS_USER_ADDRESS(params.path)) {
 			return B_BAD_ADDRESS;
 		}
+
+		// The path is a string: copying a fixed number of bytes fails for
+		// one that ends near the end of a mapping, and does not terminate.
+		ssize_t pathLength = user_strlcpy(path, params.path, sizeof(path));
+		if (pathLength < 0)
+			return B_BAD_ADDRESS;
+		if ((size_t)pathLength >= sizeof(path))
+			return B_NAME_TOO_LONG;
+
+		// Check where the result goes before the method runs.
+		if (params.result.pointer != NULL
+			&& !IS_USER_ADDRESS(params.result.pointer)) {
+			return B_BAD_ADDRESS;
+		}
+
+		acpi_object_type argObjects[kMaxArguments];
+		status_t status = acpi_call_copy_arguments(params.args, argObjects);
+		if (status != B_OK)
+			return status;
+
+		acpi_objects args;
+		args.count = params.args.count;
+		args.pointer = argObjects;
+
 		acpi_data result;
 		result.length = ACPI_ALLOCATE_BUFFER;
 		result.pointer = NULL;
 
-		acpi_status retval = device->acpi->evaluate_method(NULL, path, &params.args, &result);
-		if (retval == 0) {
-			if (result.pointer != NULL) {
-				if (params.result.pointer != NULL) {
-					params.result.length = min_c(params.result.length, result.length);
-					if (result.length >= sizeof(acpi_object_type))
-						acpi_call_fixup_pointers((acpi_object_type*)(result.pointer), params.result.pointer);
+		acpi_status retval = device->acpi->evaluate_method(NULL, path, &args,
+			&result);
+		acpi_call_free_arguments(argObjects, args.count);
 
-					if (user_memcpy(params.result.pointer, result.pointer, params.result.length) != B_OK
-						|| user_memcpy(buffer, &params, sizeof(params)) != B_OK) {
-						return B_BAD_ADDRESS;
-					}
-				}
-				free(result.pointer);
+		if (retval == 0 && result.pointer != NULL
+			&& params.result.pointer != NULL) {
+			params.result.length = min_c(params.result.length, result.length);
+			if (result.length >= sizeof(acpi_object_type)) {
+				acpi_call_fixup_pointers((acpi_object_type*)(result.pointer),
+					params.result.pointer);
+			}
+
+			if (user_memcpy(params.result.pointer, result.pointer,
+					params.result.length) != B_OK
+				|| user_memcpy(buffer, &params, sizeof(params)) != B_OK) {
+				status = B_BAD_ADDRESS;
 			}
 		}
-		return B_OK;
+		free(result.pointer);
+		return status;
 	}
 
 	return B_ERROR;

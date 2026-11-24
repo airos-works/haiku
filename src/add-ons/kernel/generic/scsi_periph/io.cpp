@@ -136,6 +136,11 @@ raw_command(scsi_periph_device_info *device, raw_device_command *cmd)
 
 	SHOW_FLOW0(0, "");
 
+	// The length is the caller's: the busses copy that many bytes of the
+	// command block, which has no more than SCSI_MAX_CDB_SIZE.
+	if (cmd->command_length > SCSI_MAX_CDB_SIZE)
+		return B_BAD_VALUE;
+
 	request = device->scsi->alloc_ccb(device->scsi_device);
 	if (request == NULL)
 		return B_NO_MEMORY;
