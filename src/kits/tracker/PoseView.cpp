@@ -281,6 +281,7 @@ BPoseView::BPoseView(Model* model, uint32 viewMode)
 	fSelectionRectEnabled(true),
 	fAlwaysAutoPlace(false),
 	fArrangePending(false),
+	fArrangeWhenAdded(false),
 	fModeBeforeSearch(0),
 	fAllowPoseEditing(true),
 	fSelectionChangedHook(false),
@@ -1331,6 +1332,21 @@ BPoseView::IsValidAddPosesThread(thread_id currentThread) const
 }
 
 
+bool
+BPoseView::IsAddingPoses() const
+{
+	// whether a thread is still reading the folder for this view
+	std::set<thread_id>::const_iterator it;
+	for (it = fAddPosesThreads.begin(); it != fAddPosesThreads.end(); it++) {
+		if (fFinishedAddPosesThreads.find(*it)
+				== fFinishedAddPosesThreads.end()) {
+			return true;
+		}
+	}
+	return false;
+}
+
+
 void
 BPoseView::AddPoses(Model* model)
 {
@@ -1613,6 +1629,7 @@ BPoseView::AddPosesTask(void* castToParams)
 		}
 
 		BMessage finishedSending(kAddPosesCompleted);
+		finishedSending.AddInt32("thread", threadID);
 		lock.Target().SendMessage(&finishedSending);
 
 	} catch (failToLock) {
@@ -1634,6 +1651,7 @@ BPoseView::AddPosesTask(void* castToParams)
 	if (lock.Lock()) {
 		view->ReturnDirentIterator(container);
 		view->fAddPosesThreads.erase(threadID);
+		view->fFinishedAddPosesThreads.erase(threadID);
 	} else
 		delete container;
 
@@ -1764,6 +1782,11 @@ BPoseView::AddPosesCompleted()
 	// were "auto" placed to see if they overlap with other icons
 	if (ViewMode() != kListMode)
 		CheckAutoPlacedPoses();
+
+	if (fArrangeWhenAdded && !IsAddingPoses()) {
+		fArrangeWhenAdded = false;
+		ScheduleArrange();
+	}
 
 	RequestFolderSizes(30000000);
 
@@ -2326,6 +2349,13 @@ BPoseView::MessageReceived(BMessage* message)
 		}
 
 		case kAddPosesCompleted:
+			// the thread adds no more poses, though it takes itself off
+			// fAddPosesThreads only later
+			if (fAddPosesThreads.find((thread_id)message->GetInt32("thread",
+					-1)) != fAddPosesThreads.end()) {
+				fFinishedAddPosesThreads.insert(
+					(thread_id)message->GetInt32("thread", -1));
+			}
 			AddPosesCompleted();
 			break;
 
@@ -4098,6 +4128,15 @@ BPoseView::ScheduleArrange()
 	// arrange once after a burst of changes
 	if (fArrangePending || Window() == NULL)
 		return;
+
+	if (IsAddingPoses()) {
+		// The folder is still being read, in chunks of at most 50 entries:
+		// sorting and laying out all icons after each of them costs time
+		// that grows with the square of the folder's size. Once, when all
+		// are there (AddPosesCompleted()).
+		fArrangeWhenAdded = true;
+		return;
+	}
 
 	fArrangePending = true;
 	BMessage message(kArrangePoses);
@@ -6895,9 +6934,11 @@ BPoseView::AttributeChanged(const BMessage* message)
 		if (pose != NULL && pose->TargetModel()->IsDirectory()
 			&& !pose->TargetModel()->IsSymLink()
 			&& CanCalculateFolderSizes(itemNode.device)) {
+			// files copied into it change it many times a second: the
+			// walk waits a moment for more changes, and is asked for once
 			ForgetFolderSize(itemNode);
 			RequestFolderSize(*pose->TargetModel()->EntryRef(), itemNode,
-				BMessenger(this), 0);
+				BMessenger(this), 0, 1000000);
 		}
 	}
 
@@ -9629,6 +9670,7 @@ BPoseView::SwitchDir(const entry_ref* newDirRef, AttributeStreamNode* node)
 	// the new add_poses thread will then set fAddPosesThread to its ID and it
 	// will be allowed to add icons
 	fAddPosesThreads.clear();
+	fFinishedAddPosesThreads.clear();
 	fInsertedNodes.Clear();
 
 	delete fModel;

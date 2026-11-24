@@ -8,3 +8,9 @@ SubDirHdrs $(HAIKU_TOP) src kits tracker ;
 #	tracker_fsops_test /Data/t /OtherVolume/t
 SimpleTest tracker_fsops_test : tracker_fsops_test.cpp
 	: be tracker shared [ TargetLibstdc++ ] ;
+
+# Folder sizes and thumbnails with folders of thousands of entries (#179):
+# file descriptors held, walks per burst of changes.
+#	tracker_large_folder_test /Data/t
+SimpleTest tracker_large_folder_test : tracker_large_folder_test.cpp
+	: be tracker translation shared [ TargetLibstdc++ ] ;

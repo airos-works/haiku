@@ -712,6 +712,7 @@ protected:
 	virtual void AddPosesCompleted();
 	virtual void CreateTrashPose();
 	bool IsValidAddPosesThread(thread_id) const;
+	bool IsAddingPoses() const;
 
 	// typeahead filtering
 	void EnsurePoseUnselected(BPose* pose);
@@ -783,6 +784,9 @@ protected:
 	BLooper* fSelectionHandler;
 
 	std::set<thread_id> fAddPosesThreads;
+	std::set<thread_id> fFinishedAddPosesThreads;
+		// those of fAddPosesThreads whose kAddPosesCompleted came: they add
+		// no more poses, but are still running
 	PoseList* fPoseList;
 
 	PendingNodeMonitorCache pendingNodeMonitorCache;
@@ -892,6 +896,8 @@ private:
 	bool fSelectionRectEnabled : 1;
 	bool fAlwaysAutoPlace : 1;
 	bool fArrangePending : 1;
+	bool fArrangeWhenAdded : 1;
+		// an arrange was asked for while the folder was being read
 	uint32 fModeBeforeSearch;
 
 	struct GroupHeader {

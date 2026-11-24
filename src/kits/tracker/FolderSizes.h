@@ -26,8 +26,12 @@ bool GetFolderSize(const node_ref& node, off_t* size);
 
 // Asks for the size of the folder at ref; target gets kFolderSizeReady.
 // A cached size younger than maxAge (or any, with maxAge < 0) is sent at once.
+// Otherwise the folder is walked, not before delay has passed (to let a burst
+// of changes settle); a request for a folder that is still waiting for its
+// walk is merged into the one already there.
 void RequestFolderSize(const entry_ref& ref, const node_ref& node,
-	const BMessenger& target, bigtime_t maxAge = 30000000);
+	const BMessenger& target, bigtime_t maxAge = 30000000,
+	bigtime_t delay = 0);
 
 // Drops what is known about a folder, after it changed.
 void ForgetFolderSize(const node_ref& node);

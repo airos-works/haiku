@@ -9,6 +9,7 @@
 #include "Thumbnails.h"
 
 #include <list>
+#include <map>
 #include <set>
 #include <fs_attr.h>
 
@@ -126,33 +127,25 @@ ScaleBitmap(BBitmap* source, BBitmap& dest, BSize size, color_space colorSpace)
 
 class GenerateThumbnailJob : public BSupportKit::BJob {
 public:
-	GenerateThumbnailJob(Model* model, const BFile& file,
-			BSize requestedSize, color_space colorSpace)
+	GenerateThumbnailJob(Model* model, BSize requestedSize,
+			color_space colorSpace)
 		: BJob("GenerateThumbnail"),
 		  fMimeType(model->MimeType()),
 		  fRef(*model->EntryRef()),
+		  fNodeRef(*model->NodeRef()),
 		  fRequestedSize(requestedSize),
 		  fColorSpace(colorSpace)
 	{
-		fFile = new(std::nothrow) BFile(file);
-		fFile->GetNodeRef((node_ref*)&fNodeRef);
-
+		// The file is opened when the job runs, not here: jobs wait in the
+		// queue, a folder full of documents queues hundreds of them, and
+		// each would hold one of Tracker's 512 file descriptors.
 		BAutolock lock(sActiveJobsLock);
 		sActiveJobs.push_back(this);
 	}
 	virtual ~GenerateThumbnailJob()
 	{
-		delete fFile;
-
 		BAutolock lock(sActiveJobsLock);
 		sActiveJobs.remove(this);
-	}
-
-	status_t InitCheck()
-	{
-		if (fFile == NULL)
-			return B_NO_MEMORY;
-		return BJob::InitCheck();
 	}
 
 	virtual status_t Execute();
@@ -163,9 +156,6 @@ public:
 	const node_ref fNodeRef;
 	const BSize fRequestedSize;
 	const color_space fColorSpace;
-
-private:
-	BFile* fFile;
 };
 
 
@@ -174,17 +164,26 @@ private:
 static std::set<BString> sNoThumbnailTypes;
 static BLocker sNoThumbnailTypesLock("no thumbnail types");
 
-// Files whose thumbnail could not be made: until they change, their type's
-// icon is shown instead of asking again at every redraw.
-static std::set<std::pair<dev_t, ino_t> > sFailedNodes;
+// Files whose thumbnail could not be made, with their modification time
+// then: until they change, their type's icon is shown instead of asking
+// again at every redraw.
+static std::map<std::pair<dev_t, ino_t>, time_t> sFailedNodes;
 
 
 static bool
-ThumbnailFailedBefore(const node_ref& node)
+ThumbnailFailedBefore(const node_ref& node, time_t modified)
 {
 	BAutolock locker(sNoThumbnailTypesLock);
-	return sFailedNodes.find(std::make_pair(node.device, node.node))
-		!= sFailedNodes.end();
+	std::map<std::pair<dev_t, ino_t>, time_t>::iterator found
+		= sFailedNodes.find(std::make_pair(node.device, node.node));
+	if (found == sFailedNodes.end())
+		return false;
+	if (found->second != modified) {
+		// changed since: worth another try
+		sFailedNodes.erase(found);
+		return false;
+	}
+	return true;
 }
 
 
@@ -239,12 +238,23 @@ ThumbnailFromQuickLook(const entry_ref& ref, const char* mimeType, int32 size)
 status_t
 GenerateThumbnailJob::Execute()
 {
+	BFile file(&fRef, B_READ_ONLY);
+	node_ref node;
+	status_t status = file.InitCheck();
+	if (status == B_OK)
+		status = file.GetNodeRef(&node);
+	if (status != B_OK)
+		return status;
+	if (node != fNodeRef) {
+		// moved away, or replaced by another file of the name
+		return B_ENTRY_NOT_FOUND;
+	}
+
 	BBitmap* image = NULL;
-	status_t status;
 	bool isImage = IsImageType(fMimeType);
 	if (isImage) {
 		BBitmapStream imageStream;
-		status = BTranslatorRoster::Default()->Translate(fFile, NULL, NULL,
+		status = BTranslatorRoster::Default()->Translate(&file, NULL, NULL,
 			&imageStream, B_TRANSLATOR_BITMAP, 0, fMimeType);
 		if (status != B_OK)
 			return status;
@@ -256,9 +266,11 @@ GenerateThumbnailJob::Execute()
 		image = ThumbnailFromQuickLook(fRef, fMimeType, B_XXL_ICON);
 		if (image == NULL) {
 			{
+				time_t modified = 0;
+				file.GetModificationTime(&modified);
 				BAutolock locker(sNoThumbnailTypesLock);
-				sFailedNodes.insert(std::make_pair(fNodeRef.device,
-					fNodeRef.node));
+				sFailedNodes[std::make_pair(fNodeRef.device, fNodeRef.node)]
+					= modified;
 			}
 			// draw the type's icon instead
 			BMessage message(kUpdateThumbnail);
@@ -296,12 +308,12 @@ GenerateThumbnailJob::Execute()
 	if (isImage) {
 		// the picture's size, for a column; not for a page or a frame
 		const int32 width = image->Bounds().IntegerWidth() + 1;
-		const size_t written = fFile->WriteAttr("Media:Width", B_INT32_TYPE,
+		const size_t written = file.WriteAttr("Media:Width", B_INT32_TYPE,
 			0, &width, sizeof(int32));
 		canWrite = written == sizeof(int32);
 		if (canWrite) {
 			const int32 height = image->Bounds().IntegerHeight() + 1;
-			fFile->WriteAttr("Media:Height", B_INT32_TYPE, 0, &height,
+			file.WriteAttr("Media:Height", B_INT32_TYPE, 0, &height,
 				sizeof(int32));
 		}
 	}
@@ -318,13 +330,13 @@ GenerateThumbnailJob::Execute()
 					NULL, NULL, &stream, B_WEBP_FORMAT) == B_OK
 				&& thumbStream.DetachBitmap(&thumbPointer) == B_OK) {
 			// write WebP image data into an attribute
-			status = fFile->WriteAttr(kAttrThumbnail, B_RAW_TYPE, 0,
+			status = file.WriteAttr(kAttrThumbnail, B_RAW_TYPE, 0,
 				stream.Buffer(), stream.BufferLength());
 			thumbnailWritten = (status == B_OK);
 
 			// write thumbnail creation time into an attribute
 			int64_t created = real_time_clock();
-			fFile->WriteAttr(kAttrThumbnailCreationTime, B_TIME_TYPE,
+			file.WriteAttr(kAttrThumbnailCreationTime, B_TIME_TYPE,
 				0, &created, sizeof(int64_t));
 		}
 	}
@@ -386,7 +398,7 @@ GenerateThumbnail(Model* model, color_space colorSpace, BSize size)
 		return status;
 
 	GenerateThumbnailJob* job = new(std::nothrow) GenerateThumbnailJob(model,
-		*file, size, colorSpace);
+		size, colorSpace);
 	ObjectDeleter<GenerateThumbnailJob> jobDeleter(job);
 	if (job == NULL)
 		return B_NO_MEMORY;
@@ -499,7 +511,8 @@ GetThumbnailFromAttr(Model* model, BBitmap* icon, BSize size)
 		// slow there
 		if (!IsImageType(model->MimeType())
 			&& (!CanCalculateFolderSizes(model->NodeRef()->device)
-				|| ThumbnailFailedBefore(*model->NodeRef()))) {
+				|| ThumbnailFailedBefore(*model->NodeRef(),
+					model->StatBuf()->st_mtime))) {
 			return B_NOT_SUPPORTED;
 		}
 		return GenerateThumbnail(model, icon->ColorSpace(), size);

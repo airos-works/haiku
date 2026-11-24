@@ -16,8 +16,10 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <deque>
 #include <map>
+#include <set>
 #include <vector>
 
 
@@ -50,15 +52,19 @@ struct Request {
 	node_ref	node;
 	BMessenger	target;
 	bigtime_t	maxAge;
+	bigtime_t	notBefore;
 };
 
 
 static const int32 kMaxEntriesPerFolder = 2000000;
 static const size_t kMaxCachedFolders = 20000;
+static const int32 kEntriesBetweenChecks = 1000;
 
 static BLocker sLock("folder sizes");
 static std::map<NodeKey, CachedSize>* sCache;
 static std::deque<Request>* sQueue;
+static std::multiset<NodeKey>* sQueuedNodes;
+	// the folders in sQueue, to find a request that is there quickly
 static sem_id sQueueSem = -1;
 static thread_id sThread = -1;
 
@@ -75,29 +81,35 @@ SendSize(const Request& request, off_t size)
 
 
 static off_t
-WalkFolder(const entry_ref& ref, dev_t device)
+WalkFolder(const entry_ref& ref, dev_t device, const BMessenger& target)
 {
 	// iterative, so deep trees cannot exhaust the stack; links are not
-	// followed and other volumes mounted below are skipped
+	// followed and other volumes mounted below are skipped. The folders
+	// still to be read are kept as entry_refs, not as open BDirectorys: a
+	// folder with hundreds of subfolders would hold a file descriptor for
+	// each of them (Tracker has 512 for everything) and leave out the ones
+	// that could not be opened. Returns -1 when the requester went away.
 	off_t total = 0;
 	int32 entries = 0;
 
-	std::vector<BDirectory*> stack;
-	BDirectory* root = new BDirectory(&ref);
-	if (root->InitCheck() != B_OK) {
-		delete root;
-		return 0;
-	}
-	stack.push_back(root);
+	std::vector<entry_ref> stack;
+	stack.push_back(ref);
 
 	while (!stack.empty()) {
-		BDirectory* dir = stack.back();
+		BDirectory dir(&stack.back());
 		stack.pop_back();
+		if (dir.InitCheck() != B_OK)
+			continue;
 
 		BEntry entry;
-		while (dir->GetNextEntry(&entry, false) == B_OK) {
+		while (dir.GetNextEntry(&entry, false) == B_OK) {
 			if (++entries > kMaxEntriesPerFolder)
 				break;
+
+			if ((entries % kEntriesBetweenChecks) == 0 && !target.IsValid()) {
+				// the window was closed: nobody waits for the size
+				return -1;
+			}
 
 			struct stat st;
 			if (entry.GetStat(&st) != B_OK || st.st_dev != device)
@@ -106,21 +118,15 @@ WalkFolder(const entry_ref& ref, dev_t device)
 			if (S_ISREG(st.st_mode))
 				total += st.st_size;
 			else if (S_ISDIR(st.st_mode)) {
-				BDirectory* subDir = new BDirectory(&entry);
-				if (subDir->InitCheck() == B_OK)
-					stack.push_back(subDir);
-				else
-					delete subDir;
+				entry_ref subRef;
+				if (entry.GetRef(&subRef) == B_OK)
+					stack.push_back(subRef);
 			}
 		}
-		delete dir;
 
 		if (entries > kMaxEntriesPerFolder)
 			break;
 	}
-
-	for (size_t i = 0; i < stack.size(); i++)
-		delete stack[i];
 
 	return total;
 }
@@ -130,31 +136,51 @@ static status_t
 CalculatorThread(void*)
 {
 	while (true) {
-		if (acquire_sem_etc(sQueueSem, 1, B_RELATIVE_TIMEOUT, 60000000)
-				!= B_OK) {
-			// idle for a minute: let the thread go, a request starts a new one
+		Request request;
+		bigtime_t wait = 60000000;
+		bool found = false;
+		{
 			BAutolock locker(sLock);
-			if (sQueue->empty()) {
-				sThread = -1;
-				return B_OK;
+			// the first request that is due; one that waits for a folder's
+			// changes to settle lets the others go first
+			bigtime_t now = system_time();
+			for (std::deque<Request>::iterator it = sQueue->begin();
+					it != sQueue->end(); it++) {
+				if (it->notBefore <= now) {
+					request = *it;
+					sQueue->erase(it);
+					sQueuedNodes->erase(
+						sQueuedNodes->find(NodeKey(request.node)));
+					found = true;
+					break;
+				}
+				wait = std::min(wait, it->notBefore - now);
+			}
+		}
+
+		if (!found) {
+			if (acquire_sem_etc(sQueueSem, 1, B_RELATIVE_TIMEOUT, wait)
+					!= B_OK) {
+				// idle for a minute: let the thread go, a request starts a
+				// new one
+				BAutolock locker(sLock);
+				if (sQueue->empty()) {
+					sThread = -1;
+					return B_OK;
+				}
 			}
 			continue;
 		}
 
-		Request request;
 		{
 			BAutolock locker(sLock);
-			if (sQueue->empty())
-				continue;
-			request = sQueue->front();
-			sQueue->pop_front();
-
 			// asked for again meanwhile, or by another window
-			std::map<NodeKey, CachedSize>::iterator found
+			std::map<NodeKey, CachedSize>::iterator cached
 				= sCache->find(NodeKey(request.node));
-			if (found != sCache->end() && (request.maxAge < 0
-					|| system_time() - found->second.when <= request.maxAge)) {
-				off_t size = found->second.size;
+			if (cached != sCache->end() && (request.maxAge < 0
+					|| system_time() - cached->second.when
+						<= request.maxAge)) {
+				off_t size = cached->second.size;
 				locker.Unlock();
 				SendSize(request, size);
 				continue;
@@ -164,7 +190,10 @@ CalculatorThread(void*)
 		if (!request.target.IsValid())
 			continue;
 
-		off_t size = WalkFolder(request.ref, request.node.device);
+		off_t size = WalkFolder(request.ref, request.node.device,
+			request.target);
+		if (size < 0)
+			continue;
 
 		{
 			BAutolock locker(sLock);
@@ -189,6 +218,7 @@ InitOnce()
 
 	sCache = new std::map<NodeKey, CachedSize>;
 	sQueue = new std::deque<Request>;
+	sQueuedNodes = new std::multiset<NodeKey>;
 	sQueueSem = create_sem(0, "folder size requests");
 }
 
@@ -210,7 +240,7 @@ GetFolderSize(const node_ref& node, off_t* size)
 
 void
 RequestFolderSize(const entry_ref& ref, const node_ref& node,
-	const BMessenger& target, bigtime_t maxAge)
+	const BMessenger& target, bigtime_t maxAge, bigtime_t delay)
 {
 	BAutolock locker(sLock);
 	InitOnce();
@@ -230,7 +260,27 @@ RequestFolderSize(const entry_ref& ref, const node_ref& node,
 		return;
 	}
 
+	// One pending request per folder and requester: a folder that changes
+	// all the time (files being copied into it) is not walked again for each
+	// change that was reported while it waited. The request that is there
+	// keeps its time, so the size still comes while the changes go on.
+	bool merged = false;
+	for (std::deque<Request>::iterator it = sQueue->begin();
+			sQueuedNodes->count(NodeKey(node)) > 0 && it != sQueue->end();
+			it++) {
+		if (it->node != node || it->target != target)
+			continue;
+		if (maxAge >= 0 && (it->maxAge < 0 || maxAge < it->maxAge))
+			it->maxAge = maxAge;
+		merged = true;
+		break;
+	}
+	if (merged)
+		return;
+
+	request.notBefore = system_time() + delay;
 	sQueue->push_back(request);
+	sQueuedNodes->insert(NodeKey(node));
 
 	if (sThread < 0) {
 		sThread = spawn_thread(CalculatorThread, "folder sizes",
