@@ -23,18 +23,26 @@
 	contiguous memory, which this driver hands out: a buffer is an area the
 	program clones, and it goes away with the file descriptor.
 
-	The driver knows nothing of HEVC. It checks that the buffers named are
+	The driver knows little of HEVC. It checks that the buffers named are
 	the caller's own and that phase two's buffers hold what the picture's
-	geometry makes the block write and read, keeps the CPU cache out of the
-	way, and waits for the interrupts. After a phase that did not end in
-	time, nothing of the caller's is freed any more (RPI_HEVC_FREE fails
-	with B_BUSY), not even at the end: the block may still write there.
-	Phase one of a picture may run while phase two of the one
+	geometry makes the block write and read. Phase one's command list is
+	copied out of the caller's buffer before the block reads it, and only
+	runs if every write in it is one the block may be given: registers of
+	the slice decoding, the bit reader inside the bytes of the bitstream
+	buffer in use, and no more rows of coding tree blocks than the PU and
+	coefficient buffers hold at their strides (B_BAD_VALUE otherwise). It
+	keeps the CPU cache out of the way, and waits for the interrupts.
+	After a phase that did not end in time, nothing of the caller's is
+	freed any more (RPI_HEVC_FREE fails with B_BUSY), not even at the end:
+	the block may still write there. (With "timeout_recovery true" in the
+	driver's settings, the block's activity line decides instead; see the
+	driver.) Phase one of a picture may run while phase two of the one
 	before does. */
 
 #define RPI_HEVC_DEVICE_PATH	"/dev/misc/rpi_hevc"
 
 #define RPI_HEVC_MAX_BUFFERS	96
+#define RPI_HEVC_MAX_COMMANDS	(1 << 20)	// in phase one's list
 #define RPI_HEVC_NO_BUFFER		0xffffffffu
 
 enum {
@@ -52,7 +60,8 @@ struct rpi_hevc_allocate {
 							// physical address on both SoCs)
 };
 
-// one write to a register of phase one
+// one write to a register of phase one (see rpi_hevc_commands.h of the
+// driver for the registers it may name)
 struct rpi_hevc_command {
 	uint32	address;
 	uint32	data;

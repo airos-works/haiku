@@ -19,12 +19,31 @@
 	- it sits behind one of the BCM2712's IOMMUs ("iommus"), which it
 	  shares with the camera's ISP back end. Linux turns that IOMMU on;
 	  nothing here does, and the block is only used with it off (all
-	  addresses pass unchanged). */
+	  addresses pass unchanged).
+
+	Phase one runs a list of register writes the program makes (#202). The
+	driver copies it into a buffer of its own (sCommands) and checks the
+	copy (rpi_hevc_commands.h) before the block reads it: the program keeps
+	its own buffer mapped and could change the list under the block, and
+	the list names physical addresses and the rows the block writes.
+
+	Neither Linux driver stops or resets the block: they wait for its
+	interrupts without a time limit. Its device tree node names no reset
+	line or power domain, and the SoCs' reset controller (bcm2835-power)
+	resets V3D, H264 and ISP only. So after a phase did not end in time,
+	nothing here can stop the block, and its buffers are kept. With
+	"timeout_recovery true" in the driver settings, the block's activity
+	lines (ACTIVE1/2_STATUS of its interrupt control; the interrupts are
+	their falling edges) tell when such a phase has ended after all: its
+	buffers are released then, and until then no phase of that kind is
+	started again. That is off by default until a Pi has shown that the
+	lines drop when a phase ends. */
 
 
 #include <ByteOrder.h>
 #include <Drivers.h>
 #include <KernelExport.h>
+#include <driver_settings.h>
 
 #include <new>
 #include <stdlib.h>
@@ -40,6 +59,7 @@
 #include <rpi_firmware.h>
 #include <rpi_hevc.h>
 
+#include "rpi_hevc_commands.h"
 #include "rpi_hevc_geometry.h"
 
 
@@ -87,8 +107,10 @@
 // the block's interrupt control
 #define INT_ACTIVE1				(1 << 0)
 #define INT_ACTIVE1_ENABLE		(1 << 2)
+#define INT_ACTIVE1_STATUS		(1 << 3)	// the phase is running
 #define INT_ACTIVE2				(1 << 4)
 #define INT_ACTIVE2_ENABLE		(1 << 6)
+#define INT_ACTIVE2_STATUS		(1 << 7)
 #define INT_H264				(1 << 25)
 #define INT_VP9					(1u << 29)
 #define INT_ALL			(INT_ACTIVE1 | INT_ACTIVE2 | INT_H264 | INT_VP9)
@@ -114,7 +136,21 @@ struct hevc_client {
 		// phases under way: buffers stay until they are through
 	int32		lost;
 		// of those, phases that did not end in time: the block may still
-		// write to the buffers, which therefore stay for good
+		// write to the buffers, which therefore stay for good (or, with
+		// timeout recovery, until the block is seen idle after lostEpoch)
+	uint32		lostEpoch;
+};
+
+// what the block may still use after its phase did not end
+struct hevc_kept_area {
+	area_id			area;
+	size_t			size;
+	hevc_kept_area*	next;
+};
+
+enum {
+	PHASE1_HUNG = 1 << 0,
+	PHASE2_HUNG = 1 << 1
 };
 
 
@@ -141,6 +177,21 @@ static mutex sOpenLock = MUTEX_INITIALIZER("rpi_hevc open");
 static sem_id sPhase1Sem = -1;
 static sem_id sPhase2Sem = -1;
 static int32 sOpenCount;
+
+// phase one's command list as the block reads it (sPhase1Lock)
+static area_id sCommandArea = -1;
+static rpi_hevc_command* sCommands;
+static phys_addr_t sCommandsPhysical;
+static size_t sCommandsSize;
+
+// after a phase that did not end in time (sStateLock)
+static bool sTimeoutRecovery;
+static mutex sStateLock = MUTEX_INITIALIZER("rpi_hevc state");
+static uint32 sHung;
+	// PHASE1_HUNG, PHASE2_HUNG: running past its time, as far as known
+static uint32 sEpoch;
+	// counts the times the block was seen idle again after a hang
+static hevc_kept_area* sKeptAreas;
 
 
 static inline uint32
@@ -243,6 +294,127 @@ free_buffer(hevc_buffer& buffer)
 }
 
 
+//	#pragma mark - after a phase that did not end
+
+
+/*!	With sStateLock held, and the block's clock on: whether the phases that
+	ran past their time have ended since, by the block's activity lines.
+	Once neither is running any more, what was kept for them is freed.
+*/
+static void
+check_hung_locked()
+{
+	if (sHung == 0)
+		return;
+
+	uint32 control = *sInterruptControl;
+	uint32 hung = sHung;
+	if ((control & INT_ACTIVE1_STATUS) == 0)
+		hung &= ~PHASE1_HUNG;
+	if ((control & INT_ACTIVE2_STATUS) == 0)
+		hung &= ~PHASE2_HUNG;
+	if (hung == sHung)
+		return;
+
+	sHung = hung;
+	if (hung != 0)
+		return;
+
+	// Every phase that ran past its time has ended now.
+	sEpoch++;
+	size_t size = 0;
+	while (sKeptAreas != NULL) {
+		hevc_kept_area* kept = sKeptAreas;
+		sKeptAreas = kept->next;
+		size += kept->size;
+		delete_area(kept->area);
+		free(kept);
+	}
+	dprintf("rpi_hevc: the block is idle again, %" B_PRIuSIZE " KiB of "
+		"buffers freed\n", size / 1024);
+}
+
+
+/*!	The phase of \a which did not end in time, and the block still says it
+	is running it (or nothing tells): from now on, nothing it may use is
+	freed until it is seen idle. Returns the epoch of the loss.
+*/
+static uint32
+phase_lost(uint32 which)
+{
+	MutexLocker locker(sStateLock);
+	if (sTimeoutRecovery)
+		sHung |= which;
+	return sEpoch;
+}
+
+
+/*!	After the phase of \a which did not end in time: whether it is over
+	all the same. Only the block's activity line can tell; without timeout
+	recovery it is not asked.
+*/
+static bool
+phase_ended_late(uint32 which)
+{
+	if (!sTimeoutRecovery)
+		return false;
+	uint32 control = *sInterruptControl;
+	return (control & (which == PHASE1_HUNG
+		? INT_ACTIVE1_STATUS : INT_ACTIVE2_STATUS)) == 0;
+}
+
+
+/*!	Before a phase of \a which starts, with its lock held: whether the
+	block is still at one that did not end.
+*/
+static bool
+phase_hung(uint32 which)
+{
+	MutexLocker locker(sStateLock);
+	check_hung_locked();
+	return (sHung & which) != 0;
+}
+
+
+/*!	With the client's lock held: its phases that did not end are over if
+	the block was seen idle after the last of them.
+*/
+static void
+settle_lost(hevc_client* client)
+{
+	if (client->lost == 0 || !sTimeoutRecovery)
+		return;
+
+	MutexLocker locker(sStateLock);
+	check_hung_locked();
+	if (sEpoch != client->lostEpoch) {
+		client->busy -= client->lost;
+		client->lost = 0;
+	}
+}
+
+
+/*!	Keeps \a area until the block is idle (with timeout recovery), or for
+	good.
+*/
+static void
+keep_area(area_id area, size_t size)
+{
+	if (!sTimeoutRecovery)
+		return;
+
+	hevc_kept_area* kept = (hevc_kept_area*)malloc(sizeof(hevc_kept_area));
+	if (kept == NULL)
+		return;
+	kept->area = area;
+	kept->size = size;
+
+	MutexLocker locker(sStateLock);
+	kept->next = sKeptAreas;
+	sKeptAreas = kept;
+}
+
+
 static status_t
 allocate_buffer(hevc_client* client, rpi_hevc_allocate& request)
 {
@@ -293,6 +465,82 @@ allocate_buffer(hevc_client* client, rpi_hevc_allocate& request)
 //	#pragma mark - the phases
 
 
+/*!	With sPhase1Lock held: copies the command list out of \a commands into
+	sCommands, where nobody else can change it, and checks the copy.
+*/
+static status_t
+copy_commands(const hevc_buffer* commands, const hevc_buffer* bitstream,
+	const hevc_buffer* pu, const hevc_buffer* coeff,
+	const rpi_hevc_phase1& request)
+{
+	size_t size = request.command_count * sizeof(rpi_hevc_command);
+	if (sCommandArea < 0 || sCommandsSize < size) {
+		if (sCommandArea >= 0)
+			delete_area(sCommandArea);
+		sCommandArea = -1;
+
+		size_t areaSize = 64 * 1024;
+		while (areaSize < size)
+			areaSize *= 2;
+		void* address;
+		area_id area = create_area("rpi_hevc commands", &address,
+			B_ANY_KERNEL_ADDRESS, areaSize, B_CONTIGUOUS,
+			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
+		if (area < 0)
+			return area;
+		physical_entry entry;
+		status_t status = get_memory_map(address, areaSize, &entry, 1);
+		if (status != B_OK) {
+			delete_area(area);
+			return status;
+		}
+		sCommandArea = area;
+		sCommands = (rpi_hevc_command*)address;
+		sCommandsPhysical = entry.address;
+		sCommandsSize = areaSize;
+	}
+
+	memcpy(sCommands, commands->address, size);
+
+	hevc_phase1_check check;
+	hevc_phase1_needs needs;
+	if (check_phase1_commands(sCommands, request.command_count,
+			bitstream->physical, request.bitstream_size, check) != B_OK) {
+		ERROR("phase 1: command %" B_PRIu32 " of %" B_PRIu32 " (%#" B_PRIx32
+			" = %#" B_PRIx32 ") refused: %s\n", check.entry,
+			request.command_count, sCommands[check.entry].address,
+			sCommands[check.entry].data, check.reason);
+		return B_BAD_VALUE;
+	}
+	if (get_phase1_needs(request, check.rows, needs) != B_OK
+		|| pu->size < needs.pu || coeff->size < needs.coeff) {
+		ERROR("phase 1: %" B_PRIu32 " rows do not fit the buffers\n",
+			check.rows);
+		return B_BAD_VALUE;
+	}
+
+	flush_cache(sCommands, size);
+	return B_OK;
+}
+
+
+/*!	With sPhase1Lock held, after a phase one that did not end: the block
+	may still read the list, which therefore stays where it is.
+*/
+static void
+retire_commands()
+{
+	if (sCommandArea >= 0) {
+		ERROR("keeping the command list (%" B_PRIuSIZE " KiB)\n",
+			sCommandsSize / 1024);
+		keep_area(sCommandArea, sCommandsSize);
+	}
+	sCommandArea = -1;
+	sCommands = NULL;
+	sCommandsSize = 0;
+}
+
+
 static status_t
 phase1(hevc_client* client, rpi_hevc_phase1& request)
 {
@@ -303,6 +551,7 @@ phase1(hevc_client* client, rpi_hevc_phase1& request)
 	hevc_buffer* coeff = buffer_for(client, request.coeff);
 	if (commands == NULL || bitstream == NULL || pu == NULL || coeff == NULL
 		|| request.command_count == 0
+		|| request.command_count > RPI_HEVC_MAX_COMMANDS
 		|| (uint64)request.command_count * sizeof(rpi_hevc_command)
 			> commands->size
 		|| request.bitstream_size > bitstream->size) {
@@ -313,8 +562,18 @@ phase1(hevc_client* client, rpi_hevc_phase1& request)
 
 	MutexLocker locker(sPhase1Lock);
 
-	flush_cache(commands->address,
-		request.command_count * sizeof(rpi_hevc_command));
+	status_t status = B_OK;
+	if (phase_hung(PHASE1_HUNG))
+		status = B_BUSY;
+	else
+		status = copy_commands(commands, bitstream, pu, coeff, request);
+	if (status != B_OK) {
+		locker.Unlock();
+		clientLocker.Lock();
+		client->busy--;
+		return status;
+	}
+
 	flush_cache(bitstream->address, request.bitstream_size);
 
 	// an interrupt nobody waited for
@@ -328,11 +587,22 @@ phase1(hevc_client* client, rpi_hevc_phase1& request)
 	write_reg(REG_COMMAND_COUNT, request.command_count);
 	barrier();
 	// this one starts the phase
-	write_reg(REG_COMMAND_BASE, block_address(commands));
+	write_reg(REG_COMMAND_BASE, (uint32)(sCommandsPhysical >> 6));
 	barrier();
 
-	status_t status = acquire_sem_etc(sPhase1Sem, 1, B_RELATIVE_TIMEOUT,
+	status = acquire_sem_etc(sPhase1Sem, 1, B_RELATIVE_TIMEOUT,
 		PHASE_TIMEOUT);
+	bool lost = false;
+	uint32 epoch = 0;
+	if (status != B_OK) {
+		if (phase_ended_late(PHASE1_HUNG))
+			ERROR("phase 1 ended without its interrupt\n");
+		else {
+			lost = true;
+			epoch = phase_lost(PHASE1_HUNG);
+			retire_commands();
+		}
+	}
 
 	uint32 done = read_reg(REG_COMMAND_STATUS);
 	uint32 count = read_reg(REG_COMMAND_COUNT);
@@ -355,9 +625,10 @@ phase1(hevc_client* client, rpi_hevc_phase1& request)
 	locker.Unlock();
 
 	clientLocker.Lock();
-	if (status != B_OK)
+	if (lost) {
 		client->lost++;
-	else
+		client->lostEpoch = epoch;
+	} else
 		client->busy--;
 	return status == B_TIMED_OUT ? B_OK : status;
 }
@@ -411,6 +682,13 @@ phase2(hevc_client* client, const rpi_hevc_phase2& request)
 
 	MutexLocker locker(sPhase2Lock);
 
+	if (phase_hung(PHASE2_HUNG)) {
+		locker.Unlock();
+		clientLocker.Lock();
+		client->busy--;
+		return B_BUSY;
+	}
+
 	while (acquire_sem_etc(sPhase2Sem, 1, B_RELATIVE_TIMEOUT, 0) == B_OK) {
 	}
 
@@ -448,17 +726,27 @@ phase2(hevc_client* client, const rpi_hevc_phase2& request)
 
 	status_t status = acquire_sem_etc(sPhase2Sem, 1, B_RELATIVE_TIMEOUT,
 		PHASE_TIMEOUT);
-	if (status != B_OK)
+	bool lost = false;
+	uint32 epoch = 0;
+	if (status != B_OK) {
 		ERROR("phase 2 did not end: %s\n", strerror(status));
+		if (phase_ended_late(PHASE2_HUNG))
+			ERROR("phase 2 ended without its interrupt\n");
+		else {
+			lost = true;
+			epoch = phase_lost(PHASE2_HUNG);
+		}
+	}
 	locker.Unlock();
 
 	// what the cache has of the picture is the picture before
 	flush_cache(frame->address, frame->size);
 
 	clientLocker.Lock();
-	if (status != B_OK)
+	if (lost) {
 		client->lost++;
-	else
+		client->lostEpoch = epoch;
+	} else
 		client->busy--;
 	return status;
 }
@@ -636,6 +924,7 @@ hevc_open(const char* name, uint32 flags, void** _cookie)
 	mutex_init(&client->lock, "rpi_hevc client");
 	client->busy = 0;
 	client->lost = 0;
+	client->lostEpoch = 0;
 	for (uint32 i = 0; i < RPI_HEVC_MAX_BUFFERS; i++) {
 		client->buffers[i].area = -1;
 		client->buffers[i].address = NULL;
@@ -684,17 +973,24 @@ hevc_free(void* cookie)
 	mutex_lock(&sPhase2Lock);
 	mutex_unlock(&sPhase2Lock);
 
+	mutex_lock(&client->lock);
+	settle_lost(client);
+	mutex_unlock(&client->lock);
+
 	if (client->lost == 0) {
 		for (uint32 i = 0; i < RPI_HEVC_MAX_BUFFERS; i++)
 			free_buffer(client->buffers[i]);
 	} else {
-		// Nothing stops a phase that did not end, and nothing tells when it
-		// does: its buffers are not given back, lest the block go on
-		// writing into memory that has another use by then (#202).
+		// Nothing stops a phase that did not end: its buffers are not given
+		// back, lest the block go on writing into memory that has another
+		// use by then (#202). With timeout recovery they go once the block
+		// is seen idle.
 		size_t size = 0;
 		for (uint32 i = 0; i < RPI_HEVC_MAX_BUFFERS; i++) {
-			if (client->buffers[i].area >= 0)
+			if (client->buffers[i].area >= 0) {
 				size += client->buffers[i].size;
+				keep_area(client->buffers[i].area, client->buffers[i].size);
+			}
 		}
 		ERROR("%" B_PRId32 " phases did not end: keeping %" B_PRIuSIZE
 			" KiB of buffers\n", client->lost, size / 1024);
@@ -743,6 +1039,7 @@ hevc_control(void* cookie, uint32 op, void* buffer, size_t length)
 			MutexLocker locker(client->lock);
 			if (buffer_for(client, index) == NULL)
 				return B_BAD_VALUE;
+			settle_lost(client);
 			if (client->busy != 0)
 				return B_BUSY;
 			free_buffer(client->buffers[index]);
@@ -830,6 +1127,13 @@ init_driver()
 	if (status != B_OK)
 		return B_OK;
 
+	void* settings = load_driver_settings("rpi_hevc");
+	if (settings != NULL) {
+		sTimeoutRecovery = get_driver_boolean_parameter(settings,
+			"timeout_recovery", false, true);
+		unload_driver_settings(settings);
+	}
+
 	sPhase1Sem = create_sem(0, "rpi_hevc phase 1");
 	sPhase2Sem = create_sem(0, "rpi_hevc phase 2");
 
@@ -900,6 +1204,20 @@ uninit_driver()
 	if (sIommuArea >= 0)
 		delete_area(sIommuArea);
 	sIommuArea = -1;
+	// Nobody has the device open: the block does not read the list now,
+	// unless a phase did not end (then it was retired).
+	if (sCommandArea >= 0)
+		delete_area(sCommandArea);
+	sCommandArea = -1;
+	sCommands = NULL;
+	sCommandsSize = 0;
+	// what a phase that did not end may still use stays
+	while (sKeptAreas != NULL) {
+		hevc_kept_area* kept = sKeptAreas;
+		sKeptAreas = kept->next;
+		free(kept);
+	}
+
 	if (sPhase1Sem >= 0)
 		delete_sem(sPhase1Sem);
 	if (sPhase2Sem >= 0)

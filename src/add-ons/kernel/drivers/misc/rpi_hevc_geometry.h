@@ -6,7 +6,7 @@
 #define RPI_HEVC_GEOMETRY_H
 
 
-/*	What phase two of the HEVC block reads and writes for a request, in
+/*	What the HEVC block reads and writes for a request of either phase, in
 	bytes from the start of each buffer: the block is told where the
 	buffers start, but not where they end. The layout is the one the Linux
 	drivers (rpivid, hevc_dec) and the rpi_hevc media add-on use:
@@ -24,6 +24,12 @@
 	<rpi_hevc.h>. */
 
 
+struct hevc_phase1_needs {
+	uint64	pu;
+	uint64	coeff;
+};
+
+
 struct hevc_phase2_needs {
 	uint64	picture;	// of the frame, and of each reference
 	uint64	pu;
@@ -36,6 +42,26 @@ static inline uint64
 hevc_round_up(uint64 value, uint64 unit)
 {
 	return (value + unit - 1) / unit * unit;
+}
+
+
+/*!	What the PU and coefficient buffers of phase one's \a request must
+	hold when its command list names \a rows rows of coding tree blocks:
+	the block writes a row's data from the row's start to at most its
+	stride (and reports a full buffer, RPI_HEVC_PHASE1_PU_FULL or
+	_COEFF_FULL, when a row needs more). A stride of nothing would put all
+	rows in one place.
+*/
+static status_t
+get_phase1_needs(const rpi_hevc_phase1& request, uint32 rows,
+	hevc_phase1_needs& needs)
+{
+	if (request.pu_stride == 0 || request.coeff_stride == 0)
+		return B_BAD_VALUE;
+
+	needs.pu = (uint64)rows * hevc_round_up(request.pu_stride, 64);
+	needs.coeff = (uint64)rows * hevc_round_up(request.coeff_stride, 64);
+	return B_OK;
 }
 
 

@@ -11,3 +11,16 @@ SimpleTest rpi_hevc_geometry_test :
 	rpi_hevc_geometry_test.cpp
 	: [ TargetLibsupc++ ]
 ;
+
+# rpi_hevc_commands_test: the driver's check of phase one's command list,
+# with the lists the rpi_hevc media add-on makes for the streams named on
+# the command line, and bad ones (also builds on any host, see the file).
+SubDirHdrs [ FDirName $(HAIKU_TOP) src add-ons media plugins rpi_hevc ] ;
+SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src add-ons media plugins rpi_hevc ] ;
+
+SimpleTest rpi_hevc_commands_test :
+	rpi_hevc_commands_test.cpp
+	HevcParser.cpp
+	SandConvert.cpp
+	: be [ TargetLibsupc++ ] [ TargetLibstdc++ ]
+;
