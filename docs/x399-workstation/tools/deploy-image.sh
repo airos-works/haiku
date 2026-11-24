@@ -23,7 +23,7 @@ import socket, sys
 import time
 for attempt in range(60):
     try:
-        s = socket.create_connection(("192.168.1.22", int(sys.argv[2])))
+        s = socket.create_connection(("192.168.1.9", int(sys.argv[2])))
         break
     except ConnectionRefusedError:
         time.sleep(1)

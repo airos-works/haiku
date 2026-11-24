@@ -16,7 +16,7 @@ import time
 import urllib.parse
 import urllib.request
 
-BASE = os.environ.get("NANOKVM_URL", "http://192.168.1.22").rstrip("/")
+BASE = os.environ.get("NANOKVM_URL", "http://192.168.1.9").rstrip("/")
 SESSION = Path(os.environ.get("NANOKVM_SESSION", "/mnt/HaikuWork/x399/state/nanokvm-session.json"))
 
 

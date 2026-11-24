@@ -11,7 +11,7 @@
 set -uo pipefail
 X399=/mnt/HaikuWork/x399
 K="/mnt/HaikuWork/nanokvm/.venv/bin/python $X399/tools/kvm.py"
-export NANOKVM_URL=${NANOKVM_URL:-http://192.168.1.22}
+export NANOKVM_URL=${NANOKVM_URL:-http://192.168.1.9}
 export NANOKVM_SESSION=${NANOKVM_SESSION:-$X399/state/nanokvm-session.json}
 [ -n "${NANOKVM_PASSWORD:-}" ] || export NANOKVM_PASSWORD=$(cat $X399/state/nanokvm-password)
 
