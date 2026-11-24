@@ -138,7 +138,13 @@ TLSBlockTemplates::Unregister(unsigned dso)
 		return;
 
 	RecursiveLocker _(sTemplateLock);
-	atomic_add(&fGeneration, 1);
+	// The freed slot belongs to the new generation: a thread that has a
+	// block for it destroys that block the next time it catches up with the
+	// generation. Left at its old generation, the block survived a thread's
+	// TLS access made while the slot was free, and the image that got the
+	// slot next was handed the unloaded image's thread-local memory, with
+	// its contents and its size.
+	fTemplates[dso].SetGeneration(atomic_add(&fGeneration, 1) + 1);
 	fFreeDSOs.push_back(dso);
 }
 

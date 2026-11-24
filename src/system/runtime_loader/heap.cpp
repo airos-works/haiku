@@ -137,6 +137,15 @@ realloc(void* oldBuffer, size_t newSize)
 	RecursiveLocker _(sLock);
 
 	void* newBuffer = sAllocator.Reallocate(oldBuffer, newSize);
+	if (newBuffer == NULL && newSize != 0) {
+		// Enlarge the heap as malloc() does: a full heap otherwise failed
+		// every realloc() until some malloc() happened to grow it (a
+		// thread's first access to thread-local storage then got NULL).
+		if (grow_heap(newSize) != B_OK)
+			return NULL;
+
+		newBuffer = sAllocator.Reallocate(oldBuffer, newSize);
+	}
 	if (oldBuffer == newBuffer) {
 		TRACE(("realloc(%p, %lu) old buffer is large enough\n",
 			oldBuffer, newSize));

@@ -70,6 +70,15 @@ main(int argc, char** argv)
 		// in each new worker. The main thread keeps its existing vector.
 		if (dlclose(b) != 0)
 			return 2;
+		// In every other round the main thread uses thread-local storage
+		// while B's slot is free: it catches up with the generation of the
+		// unload, and must lose its block for that slot all the same (it
+		// kept it, and the reopened B got the old B's memory and contents).
+		if ((round & 1) != 0) {
+			void* address;
+			checks++;
+			failures += readA(&address) != 987654;
+		}
 		b = open_module(argv[2]);
 		sStore = (store_function)dlsym(b, "store_value");
 		sRead = (read_function)dlsym(b, "read_value");
