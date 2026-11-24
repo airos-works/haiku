@@ -40,7 +40,9 @@ H.264 works: I, P and B pictures, High profile, any size from 33x32 to
 source included) and comes back at 44.7 dB. H.265 Main and Main 10 work too,
 I and P pictures, from 65x64 to 8192x4320 (Main 10 at 8192x4320 does not get
 its buffers on an 8 GB card in use as a desktop); the same clip converts at
-95 pictures/s and comes back at 43.5 dB (quality 50).
+98 pictures/s and comes back at 43.8 dB (quality 50), and at the same bit
+rate H.265 is about as good as H.264 with its B pictures (4000 kbit/s: 47.4
+against 47.6 dB; 1000 kbit/s: 41.5 against 40.6 dB).
 
 What the header does not say, found on the card:
 
@@ -59,6 +61,9 @@ What the header does not say, found on the card:
 - An H.265 slice control's `slice_type` counts 0 for a P slice, as NVIDIA's
   driver sends it, although the header's comment says 0 is B and 1 is P. With
   1 the engine fails the picture with microcode error 9 (E_ME_PROGRAMMING).
+- Sample adaptive offset works as NVIDIA's driver sets it (`sao_luma_mode`
+  and `sao_chroma_mode` 31, the slice's SAO flags on) and gives 0.3 to 0.5 dB
+  at the same bit rate.
 - H.265 P pictures need `max_transform_hierarchy_depth_inter` 3 (NVIDIA's
   value) in the SPS and in `sps_data`. With 0, 1 or 2 the engine encodes,
   and its reconstructed picture is right, but the inter transform trees it
@@ -187,10 +192,11 @@ one address with the chroma offset in the surface configuration; it sends
 no colocated data (temporal motion vector prediction is off), but
 `SET_IO_RC_PROCESS` and `SET_IN_RCDATA` with `GPTIMER_ON`; it turns on AMP,
 transform skip, the CU QP delta and CABAC initialisation choice, with a
-minimum CU of 16x16; its history buffer is 192 bytes a macroblock for the
-whole picture and a row more. Its motion search, mode decision and
-quantiser controls differ in many fields from the add-on's and make no
-difference to whether a P picture works.
+minimum CU of 16x16 (on a synthetic picture they made 0.1 dB at most); its
+history buffer is 192 bytes a macroblock for the whole picture and a row
+more. Its motion search, mode decision and quantiser controls differ in
+many fields from the add-on's and make no difference to whether a P picture
+works.
 
 `NVENC_DEBUG=1` makes the add-on print the error notifier and the status
 words of each picture, `NVENC_RC_DEBUG=1` each picture's kind, QP, size and

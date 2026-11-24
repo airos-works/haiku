@@ -354,6 +354,16 @@ each output decoded with libavcodec and compared with `mediaconvert
 | Six conversions at once | all complete, 38.5 to 40.7 dB |
 | The window, preset Fast 1080p | encoded on the GPU, 44.65 dB |
 
+H.265 on the same card (2026-11-25, I and P pictures, the same 12 s clip):
+
+| Test | Result |
+| --- | --- |
+| Quality 0 / 50 / 100 (QP 36 / 26 / 16) | 38.0 / 43.8 / 49.3 dB, 98 pictures/s at quality 50 |
+| Average 1000 / 4000 / 12000 kbit/s | 41.5 / 47.4 / 51.0 dB (H.264: 40.6 / 47.6 / 51.6) |
+| Main 10, quality 50; 4000 kbit/s | 42.5 dB, 70 pictures/s; 46.1 dB |
+| Heights 1080 to 90 (scaled) | all decode and match, 39.5 to 45.0 dB |
+| Blu-ray (m2ts) and DVD (VOB) sources | 48.3 and 46.7 dB |
+
 On the Framework 13 (Radeon 760M, Phoenix, VCN 4), the same clip at 720p,
 each output decoded and compared:
 

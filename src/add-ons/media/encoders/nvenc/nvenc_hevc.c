@@ -207,7 +207,7 @@ write_parameter_sets(NvencHevc *encoder)
 	nvencPutUe(&bits, 1);			/* max_transform_hierarchy_depth_intra */
 	nvencPut(&bits, 0, 1);			/* scaling_list_enabled */
 	nvencPut(&bits, 0, 1);			/* amp_enabled */
-	nvencPut(&bits, 0, 1);			/* sample_adaptive_offset_enabled */
+	nvencPut(&bits, 1, 1);			/* sample_adaptive_offset_enabled */
 	nvencPut(&bits, 0, 1);			/* pcm_enabled */
 	nvencPutUe(&bits, 1);			/* num_short_term_ref_pic_sets */
 	/* st_ref_pic_set(0): the previous picture */
@@ -454,6 +454,7 @@ fill_pic_setup(NvencHevc *encoder, bool idr, int qp)
 	sps->max_transform_depth_inter = MAX_TRANSFORM_DEPTH_INTER;
 	sps->max_transform_depth_intra = 1;
 	sps->num_short_term_ref_pic_sets = 1;
+	sps->sample_adaptive_offset_enabled_flag = 1;
 	sps->bit_depth_minus_8 = encoder->bitDepth - 8;
 
 	nvenc_h265_rc_s *rc = &setup->rate_control;
@@ -476,6 +477,11 @@ fill_pic_setup(NvencHevc *encoder, bool idr, int qp)
 		pic->short_term_rps.used_by_curr_pic_s0_flag = 1;
 	}
 	pic->pic_output_flag = 1;
+	/* Sample adaptive offset, as NVIDIA's driver has it: every mode the
+	 * engine knows, for luma and chroma. It gives 0.3 to 0.5 dB at the
+	 * same bit rate. */
+	pic->sao_luma_mode = 31;
+	pic->sao_chroma_mode = 31;
 	pic->pic_order_cnt_lsb = encoder->poc % (1 << LOG2_MAX_POC_LSB);
 	pic->slice_control_offset = SLICE_CONTROL_OFFSET;
 	pic->me_control_offset = ME_CONTROL_OFFSET;
@@ -509,6 +515,8 @@ fill_pic_setup(NvencHevc *encoder, bool idr, int qp)
 	 * (E_ME_PROGRAMMING). */
 	slice->slice_type = idr ? 2 : 0;
 	slice->collocated_from_l0_flag = 1;
+	slice->slice_sao_luma_flag = 1;
+	slice->slice_sao_chroma_flag = 1;
 	slice->qp_slice_min = qp;
 	slice->qp_slice_max = qp;
 
