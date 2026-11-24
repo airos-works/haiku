@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <new>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -77,6 +78,7 @@ SdhciBus::SdhciBus(struct registers* registers, uint32_t irq, bool poll,
 	fAdmaArea(-1),
 	fAdmaTable(NULL),
 	fAdmaAddress(0),
+	fAdmaFromMemory(false),
 	fDMAQuarantined(false),
 	fReportedHighCpuRead(false),
 	fReportedHighCpuWrite(false),
@@ -192,6 +194,22 @@ SdhciBus::SdhciBus(struct registers* registers, uint32_t irq, bool poll,
 		}
 		if (fStatus != B_OK)
 			return;
+	}
+#else
+	// With ADMA2, an operation's pieces of memory (up to 256 of them) go to
+	// the card in one command, instead of a command for each piece: 4 KiB
+	// pages, mostly. Off by default until a pass on a real reader (#181).
+	if (sdhci_read_dma_mode().adma2
+		&& fRegisters->host_controller_version.specVersion >= 1
+		&& fRegisters->capabilities.AdvancedDMA()) {
+		void* table;
+		if (sdhci_allocate_dma(&fAdmaArea, &table, &fAdmaAddress, B_PAGE_SIZE)
+				== B_OK) {
+			fAdmaTable = (uint32*)table;
+			fAdmaFromMemory = true;
+			TRACE_ALWAYS("ADMA2 descriptor table at %#" B_PRIxPHYSADDR "\n",
+				fAdmaAddress);
+		}
 	}
 #endif
 
@@ -622,6 +640,15 @@ SdhciBus::DoIO(uint8_t command, IOOperation* operation, bool offsetAsSectors)
 	if (vecs == NULL || count == 0)
 		return B_BAD_VALUE;
 
+	// How the operation's memory reaches the controller (see sdhci.h):
+	// copied through the private buffer (arm64), where all pieces are
+	// gathered for a command as long as the buffer; described piece by piece
+	// in an ADMA2 table, for one command (x86, "adma2"); or one piece per
+	// SDMA command. Commands are what is slow: each one costs a wait for an
+	// interrupt and the card's set-up, more than moving 4 KiB does.
+	const bool bounce = fDMABuffer != NULL;
+	const bool table = !bounce && fAdmaFromMemory;
+
 	// Validate the complete request before any command can change the card.
 	generic_size_t remaining = length;
 	uint64 cpuAddress = UINT64_MAX;
@@ -632,12 +659,17 @@ SdhciBus::DoIO(uint8_t command, IOOperation* operation, bool offsetAsSectors)
 		uint64 address = vecs[i].base;
 		if (address < fPlatform.cpu_address_floor
 			|| size % blockSize != 0 || (address & (blockSize - 1)) != 0
-			|| size > kSdhciDmaSize || size > UINT64_MAX - address)
+			|| size > UINT64_MAX - address)
 			return B_BAD_VALUE;
-		if (fDMABuffer == NULL && (address >= UINT64_C(0x100000000)
-			|| size > UINT64_C(0x100000000) - address
-			|| (address & 0x7ffff) + size > 0x80000))
-			return B_BAD_VALUE;
+		if (!bounce) {
+			// the controller addresses the piece itself, with 32 bits, and
+			// SDMA within a 512 KiB boundary
+			if (address >= UINT64_C(0x100000000)
+				|| size > UINT64_C(0x100000000) - address)
+				return B_BAD_VALUE;
+			if (!table && (address & 0x7ffff) + size > 0x80000)
+				return B_BAD_VALUE;
+		}
 		cpuAddress = std::min(cpuAddress, address);
 		remaining -= size;
 	}
@@ -646,23 +678,43 @@ SdhciBus::DoIO(uint8_t command, IOOperation* operation, bool offsetAsSectors)
 		|| (length - blockSize) / unit > UINT32_MAX - offset / unit)
 		return B_BAD_VALUE;
 
-	for (size_t i = 0; i < count && length != 0; i++) {
-		generic_size_t size = std::min(length, vecs[i].length);
-		if (size == 0)
-			continue;
-		if (fDMABuffer != NULL) {
+	size_t index = 0;
+	generic_size_t vecOffset = 0;
+	while (length != 0) {
+		while (index < count && vecOffset == vecs[index].length) {
+			index++;
+			vecOffset = 0;
+		}
+		if (index == count)
+			return B_BAD_VALUE;
+		// for the log: where the command's memory starts
+		const uint64 pieceAddress = vecs[index].base + vecOffset;
+
+		// this command's bytes
+		generic_size_t size;
+		if (bounce)
+			size = std::min(length, (generic_size_t)kSdhciDmaSize);
+		else if (table)
+			size = _FillAdmaTable(vecs, count, index, vecOffset, length);
+		else
+			size = std::min(length, vecs[index].length - vecOffset);
+		if (size == 0 || size % blockSize != 0 || size / blockSize > 0xffff)
+			return B_BAD_VALUE;
+
+		if (bounce) {
 			if (operation->IsWrite()) {
-				status_t status = vm_memcpy_from_physical(fDMABuffer, vecs[i].base,
-					size, false);
+				status_t status = _CopyVecs(true, vecs, count, index,
+					vecOffset, size);
 				if (status != B_OK)
 					return status;
-			} else
-				memset(fDMABuffer, 0, size);
+			}
+			// (a read needs no clearing: the card writes all of it, and a
+			// failed transfer is not copied out)
 			memory_full_barrier();
 			if (fPlatform.dma_coherent)
 				sdhci_clean_dma_alias(fDMAAddress, size);
 		}
-		if (fAdmaTable != NULL && fDMABuffer != NULL) {
+		if (fAdmaTable != NULL && bounce) {
 			// 32-bit ADMA2: attribute (valid, end, transfer), a length of up
 			// to 64 KiB (0: 64 KiB), the address
 			uint32 descriptor = 0;
@@ -679,10 +731,20 @@ SdhciBus::DoIO(uint8_t command, IOOperation* operation, bool offsetAsSectors)
 				sdhci_clean_dma_alias(fAdmaAddress, 8 * descriptor);
 			fRegisters->host_control.SetDMAMode(HostControl::kAdma32);
 			fRegisters->adma_system_address = fAdmaAddress;
+		} else if (table) {
+			// (the table is in ordinary memory: x86 DMA snoops the caches)
+			memory_full_barrier();
+			fRegisters->host_control.SetDMAMode(HostControl::kAdma32);
+			// as two 32-bit writes: not every controller (nor QEMU's)
+			// takes a 64-bit one
+			volatile uint32* admaAddress = (volatile uint32*)
+				((volatile uint8*)fRegisters
+					+ offsetof(struct registers, adma_system_address));
+			admaAddress[0] = (uint32)fAdmaAddress;
+			admaAddress[1] = 0;
 		} else {
 			fRegisters->host_control.SetDMAMode(HostControl::kSdma);
-			fRegisters->system_address = fDMABuffer != NULL
-				? fDMAAddress : vecs[i].base;
+			fRegisters->system_address = bounce ? fDMAAddress : pieceAddress;
 		}
 		fRegisters->block_size.ConfigureTransfer(blockSize, BlockSize::kDmaBoundary512K);
 		fRegisters->block_count = size / blockSize;
@@ -702,7 +764,7 @@ SdhciBus::DoIO(uint8_t command, IOOperation* operation, bool offsetAsSectors)
 				command, (uint64)offset, (uint64)size, strerror(status),
 				(uint32)atomic_get(&fCommandResult), (uint32)fRegisters->interrupt_status,
 				(uint32)fRegisters->interrupt_signal_enable, fRegisters->present_state.Bits(),
-				(uint64)vecs[i].base, (uint64)fDMAAddress);
+				pieceAddress, (uint64)(table ? fAdmaAddress : fDMAAddress));
 			RecoverError();
 			return status;
 		}
@@ -711,10 +773,22 @@ SdhciBus::DoIO(uint8_t command, IOOperation* operation, bool offsetAsSectors)
 			RecoverError();
 			return B_IO_ERROR;
 		}
-		if (fDMABuffer != NULL && !operation->IsWrite()) {
-			status = vm_memcpy_to_physical(vecs[i].base, fDMABuffer, size, false);
+		if (bounce && !operation->IsWrite()) {
+			status = _CopyVecs(false, vecs, count, index, vecOffset, size);
 			if (status != B_OK)
 				return status;
+		} else if (!bounce) {
+			// past the memory the command took
+			for (generic_size_t done = size; done != 0;) {
+				generic_size_t piece = std::min(done,
+					vecs[index].length - vecOffset);
+				vecOffset += piece;
+				done -= piece;
+				if (vecOffset == vecs[index].length && done != 0) {
+					index++;
+					vecOffset = 0;
+				}
+			}
 		}
 		length -= size;
 		offset += size;
@@ -730,6 +804,84 @@ SdhciBus::DoIO(uint8_t command, IOOperation* operation, bool offsetAsSectors)
 		}
 	}
 	return B_OK;
+}
+
+
+/*!	Copies the next \a size bytes of the operation's memory to the private
+	buffer or back, and moves \a index and \a vecOffset past them.
+*/
+status_t
+SdhciBus::_CopyVecs(bool toBuffer, const generic_io_vec* vecs, size_t count,
+	size_t& index, generic_size_t& vecOffset, generic_size_t size)
+{
+	uint8* buffer = (uint8*)fDMABuffer;
+	while (size != 0) {
+		if (index >= count)
+			return B_BAD_VALUE;
+		if (vecOffset == vecs[index].length) {
+			index++;
+			vecOffset = 0;
+			continue;
+		}
+		generic_size_t piece = std::min(size, vecs[index].length - vecOffset);
+		status_t status = toBuffer
+			? vm_memcpy_from_physical(buffer, vecs[index].base + vecOffset,
+				piece, false)
+			: vm_memcpy_to_physical(vecs[index].base + vecOffset, buffer,
+				piece, false);
+		if (status != B_OK)
+			return status;
+		buffer += piece;
+		vecOffset += piece;
+		size -= piece;
+	}
+	return B_OK;
+}
+
+
+/*!	Describes the operation's memory from \a index and \a vecOffset on in
+	the ADMA2 table, as much of \a length as fits, and returns how many bytes
+	that is (whole blocks): the next command's.
+*/
+generic_size_t
+SdhciBus::_FillAdmaTable(const generic_io_vec* vecs, size_t count,
+	size_t index, generic_size_t vecOffset, generic_size_t length)
+{
+	const generic_size_t kMaxCommand = 0xffff * 512;
+		// the block count register's limit
+	uint32 descriptor = 0;
+	generic_size_t described = 0;
+	while (index < count && described < length
+		&& descriptor < kSdhciAdmaTableEntries) {
+		if (vecOffset == vecs[index].length) {
+			index++;
+			vecOffset = 0;
+			continue;
+		}
+		generic_size_t piece = std::min(
+			std::min(length, kMaxCommand) - described,
+			std::min(vecs[index].length - vecOffset,
+				(generic_size_t)kSdhciAdmaMaxLength));
+		if (piece == 0)
+			break;
+		// valid, transfer data; the length, the 32-bit address
+		fAdmaTable[2 * descriptor] = 0x21 | (uint32)piece << 16;
+		fAdmaTable[2 * descriptor + 1] = (uint32)(vecs[index].base + vecOffset);
+		descriptor++;
+		vecOffset += piece;
+		described += piece;
+	}
+	// A command takes whole blocks: should the table be full in the middle
+	// of one, leave that block's pieces to the next command.
+	while (described % 512 != 0 && descriptor > 0) {
+		descriptor--;
+		described -= fAdmaTable[2 * descriptor] >> 16;
+	}
+	if (descriptor == 0)
+		return 0;
+	fAdmaTable[2 * (descriptor - 1)] |= 0x02;
+		// the end
+	return described;
 }
 
 

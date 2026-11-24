@@ -51,6 +51,12 @@ SimpleTest profiler_detach_test : profiler_detach_test.cpp ;
 # tools/airos/ci/guest-tests too
 SimpleTest fragmented_write_test : fragmented_write_test.cpp ;
 
+# a disk driver's DMA paths (airos-works/haiku#181): a pattern written to a
+# raw device with requests of all sizes, alignments and scattered vectors,
+# read back and compared byte by byte; optionally throughput. Overwrites the
+# device: run it by hand on a scratch disk.
+SimpleTest raw_disk_dma_test : raw_disk_dma_test.cpp ;
+
 # cold reads of fragmented files from several threads: a thread that waited
 # for a block of a file's extent list reported other transfers of the same
 # file and waited for the lock it held (airos-works/haiku#166). Mounts a

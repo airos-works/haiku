@@ -256,6 +256,8 @@ static status_t
 register_children(void* cookie)
 {
 	FdtMmc* info = (FdtMmc*)cookie;
+	// (all pieces of an operation are gathered into the private buffer)
+	const sdhci_dma_limits limits = sdhci_get_dma_limits(sdhci_read_dma_mode());
 	device_attr attrs[] = {
 		{B_DEVICE_PRETTY_NAME, B_STRING_TYPE, {.string = "RK3588 eMMC legacy SDR"}},
 		{B_DEVICE_BUS, B_STRING_TYPE, {.string = "mmc"}},
@@ -267,8 +269,10 @@ register_children(void* cookie)
 		{B_DMA_LOW_ADDRESS, B_UINT64_TYPE, {.ui64 = info->cpuAddressFloor}},
 		{B_DMA_ALIGNMENT, B_UINT32_TYPE, {.ui32 = 511}},
 		{B_DMA_BOUNDARY, B_UINT32_TYPE, {.ui32 = (1 << 19) - 1}},
-		{B_DMA_MAX_SEGMENT_COUNT, B_UINT32_TYPE, {.ui32 = 1}},
-		{B_DMA_MAX_SEGMENT_BLOCKS, B_UINT32_TYPE, {.ui32 = (1 << 10) - 1}},
+		{B_DMA_MAX_SEGMENT_COUNT, B_UINT32_TYPE, {.ui32 = limits.segmentCount}},
+		{B_DMA_MAX_SEGMENT_BLOCKS, B_UINT32_TYPE, {.ui32 = limits.segmentBlocks}},
+		{B_DMA_MAX_TRANSFER_BLOCKS, B_UINT32_TYPE,
+			{.ui32 = limits.transferBlocks}},
 		{}
 	};
 	return gDeviceManager->register_node(info->node, SDHCI_FDT_BUS, attrs, NULL, NULL);

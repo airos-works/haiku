@@ -185,6 +185,7 @@ register_child_devices_acpi(void* cookie)
 	}
 
 	char prettyName[25];
+	const sdhci_dma_limits limits = sdhci_get_dma_limits(sdhci_read_dma_mode());
 
 	sprintf(prettyName, (slotQuirks & SDHCI_SLOT_NON_REMOVABLE) != 0
 		? "SDHC bus (SDIO)" : "SDHC bus");
@@ -201,15 +202,15 @@ register_child_devices_acpi(void* cookie)
 			{ .ui8 = (uint8)((slotQuirks & SDHCI_SLOT_NON_REMOVABLE) != 0) }},
 		{ SDHCI_SLOT_QUIRKS_ATTRIBUTE, B_UINT32_TYPE, { .ui32 = slotQuirks }},
 
-		// DMA properties
-		// The high alignment is to force access only to complete sectors
-		// These constraints could be removed by using ADMA which allows
-		// use of the full 64bit address space and can do scatter-gather.
+		// DMA properties: whole sectors, below 4 GiB, and as many pieces per
+		// operation as the DMA mode takes (sdhci_get_dma_limits())
 		{ B_DMA_ALIGNMENT, B_UINT32_TYPE, { .ui32 = 511 }},
 		{ B_DMA_HIGH_ADDRESS, B_UINT64_TYPE, { .ui64 = 0x100000000LL }},
 		{ B_DMA_BOUNDARY, B_UINT32_TYPE, { .ui32 = (1 << 19) - 1 }},
-		{ B_DMA_MAX_SEGMENT_COUNT, B_UINT32_TYPE, { .ui32 = 1 }},
-		{ B_DMA_MAX_SEGMENT_BLOCKS, B_UINT32_TYPE, { .ui32 = (1 << 10) - 1 }},
+		{ B_DMA_MAX_SEGMENT_COUNT, B_UINT32_TYPE, { .ui32 = limits.segmentCount }},
+		{ B_DMA_MAX_SEGMENT_BLOCKS, B_UINT32_TYPE, { .ui32 = limits.segmentBlocks }},
+		{ B_DMA_MAX_TRANSFER_BLOCKS, B_UINT32_TYPE,
+			{ .ui32 = limits.transferBlocks }},
 
 		// private data to identify device
 		{ NULL }

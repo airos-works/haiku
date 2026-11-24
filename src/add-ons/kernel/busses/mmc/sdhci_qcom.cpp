@@ -504,6 +504,8 @@ static status_t
 register_children_qcom(void* cookie)
 {
 	QcomMmc* info = (QcomMmc*)cookie;
+	// (all pieces of an operation are gathered into the private buffer)
+	const sdhci_dma_limits limits = sdhci_get_dma_limits(sdhci_read_dma_mode());
 	device_attr attrs[] = {
 		{B_DEVICE_PRETTY_NAME, B_STRING_TYPE, {.string = "Qualcomm SD card"}},
 		{B_DEVICE_BUS, B_STRING_TYPE, {.string = "mmc"}},
@@ -513,8 +515,10 @@ register_children_qcom(void* cookie)
 		{kMmcMaxBusWidthAttribute, B_UINT8_TYPE, {.ui8 = 4}},
 		{B_DMA_ALIGNMENT, B_UINT32_TYPE, {.ui32 = 511}},
 		{B_DMA_BOUNDARY, B_UINT32_TYPE, {.ui32 = (1 << 19) - 1}},
-		{B_DMA_MAX_SEGMENT_COUNT, B_UINT32_TYPE, {.ui32 = 1}},
-		{B_DMA_MAX_SEGMENT_BLOCKS, B_UINT32_TYPE, {.ui32 = (1 << 10) - 1}},
+		{B_DMA_MAX_SEGMENT_COUNT, B_UINT32_TYPE, {.ui32 = limits.segmentCount}},
+		{B_DMA_MAX_SEGMENT_BLOCKS, B_UINT32_TYPE, {.ui32 = limits.segmentBlocks}},
+		{B_DMA_MAX_TRANSFER_BLOCKS, B_UINT32_TYPE,
+			{.ui32 = limits.transferBlocks}},
 		{}
 	};
 	return gDeviceManager->register_node(info->node, SDHCI_QCOM_BUS, attrs,

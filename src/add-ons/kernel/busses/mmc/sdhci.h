@@ -15,6 +15,7 @@
 #include <device_manager.h>
 
 #include <KernelExport.h>
+#include <util/iovec_support.h>
 
 #include "mmc.h"
 
@@ -98,6 +99,14 @@ class SdhciBus {
 			status_t			_ReadDataBlock(uint8_t command,
 									uint32_t argument, uint8_t* data,
 									uint32_t length);
+			status_t			_CopyVecs(bool toBuffer,
+									const generic_io_vec* vecs, size_t count,
+									size_t& index, generic_size_t& vecOffset,
+									generic_size_t size);
+			generic_size_t		_FillAdmaTable(const generic_io_vec* vecs,
+									size_t count, size_t index,
+									generic_size_t vecOffset,
+									generic_size_t length);
 	static	status_t			_WorkerThread(void*);
 
 	private:
@@ -122,6 +131,9 @@ class SdhciBus {
 			area_id				fAdmaArea;		// its ADMA2 descriptors
 			uint32*				fAdmaTable;
 			phys_addr_t			fAdmaAddress;
+			bool				fAdmaFromMemory;
+				// x86: the ADMA2 table describes the operation's own memory
+				// (the "adma2" setting), not a bounce buffer
 			bool				fDMAQuarantined;
 			bool				fReportedHighCpuRead;
 			bool				fReportedHighCpuWrite;
@@ -142,6 +154,35 @@ const size_t kSdhciDmaSize = 512 * 1024;
 status_t sdhci_allocate_dma(area_id* area, void** buffer, phys_addr_t* address,
 	size_t size = 0);
 void sdhci_clean_dma_alias(phys_addr_t address, size_t size);
+
+// How the slots hand their operations' memory to the controller (the "sdhci"
+// driver settings, read by sdhci_read_dma_mode()):
+//	- arm64 copies through its private buffer, and gathers all pieces of an
+//	  operation into it for one command ("gather_io", on by default);
+//	- x86 programs SDMA with one piece of memory per command, or, with
+//	  "adma2" (off by default), one command per operation through an ADMA2
+//	  descriptor table, where the controller has ADMA2.
+struct sdhci_dma_mode {
+	bool	gather;
+	bool	adma2;
+};
+sdhci_dma_mode sdhci_read_dma_mode();
+
+// The DMA restrictions a slot's bus node publishes for that mode
+struct sdhci_dma_limits {
+	uint32	segmentCount;
+	uint32	segmentBlocks;
+	uint32	transferBlocks;
+};
+sdhci_dma_limits sdhci_get_dma_limits(const sdhci_dma_mode& mode);
+
+// ADMA2 from memory: at most this much per descriptor (it does not use the
+// 64 KiB length 0, which some controllers do not take), and at most this
+// many descriptors in the table's page.
+const uint32 kSdhciAdmaMaxLength = 32 * 1024;
+const uint32 kSdhciAdmaTableEntries = 4096 / 8;
+const uint32 kSdhciAdmaMaxSegments = 256;
+const uint32 kSdhciAdmaMaxTransfer = 1024 * 1024;
 
 
 class SdhciDevice {
