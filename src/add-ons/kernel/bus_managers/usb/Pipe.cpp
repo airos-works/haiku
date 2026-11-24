@@ -311,6 +311,13 @@ IsochronousPipe::QueueIsochronous(void *data, size_t dataLength,
 		|| (packetCount > 0 && packetDesc == NULL))
 		return B_BAD_VALUE;
 
+	// The counts are the caller's (a program's, through usb_raw), and the
+	// host controllers divide the data by the packets: no packets is a
+	// division by zero in EHCI, and fewer bytes than packets gives packets
+	// of no bytes, which it never finishes cutting the data into.
+	if (packetCount == 0 || dataLength < packetCount)
+		return B_BAD_VALUE;
+
 	usb_isochronous_data *isochronousData
 		= new(std::nothrow) usb_isochronous_data;
 

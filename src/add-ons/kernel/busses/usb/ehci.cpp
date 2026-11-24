@@ -1272,6 +1272,15 @@ EHCI::SubmitIsochronous(Transfer *transfer)
 	bool directionIn = (pipe->Direction() == Pipe::In);
 	usb_isochronous_data *isochronousData = transfer->IsochronousData();
 	size_t packetSize = transfer->DataLength();
+
+	// The stack refuses these (IsochronousPipe::QueueIsochronous()); here
+	// they would be a division by zero, and packets of no bytes, which the
+	// loop below never finishes with.
+	if (isochronousData->packet_count == 0
+		|| packetSize < isochronousData->packet_count) {
+		return B_BAD_VALUE;
+	}
+
 #ifdef TRACE_USB
 	size_t restSize = packetSize % isochronousData->packet_count;
 #endif
@@ -1345,10 +1354,33 @@ EHCI::SubmitIsochronous(Transfer *transfer)
 
 	uint16 itdIndex = 0;
 	size_t dataLength = transfer->DataLength();
+
+	// The descriptors, 8 packets each, before any of them is linked: one
+	// that cannot be allocated then leaves nothing to take back. They fit
+	// the array: the packets are less than twice the packet count (the rest
+	// of the division makes more of them).
+	const size_t itdCount = ((dataLength + packetSize - 1) / packetSize + 7) / 8;
+	if (itdCount > isochronousData->packet_count) {
+		delete[] isoRequest;
+		return B_BAD_VALUE;
+	}
+
+	for (size_t i = 0; i < itdCount; i++) {
+		isoRequest[i] = CreateItdDescriptor();
+		if (isoRequest[i] == NULL) {
+			while (i-- > 0)
+				FreeDescriptor(isoRequest[i]);
+			delete[] isoRequest;
+			return B_NO_MEMORY;
+		}
+	}
+
 	void* bufferLog;
 	phys_addr_t bufferPhy;
 	if (AllocateChunk(&bufferLog, &bufferPhy, dataLength) != B_OK) {
 		TRACE_ERROR("unable to allocate itd buffer\n");
+		for (size_t i = 0; i < itdCount; i++)
+			FreeDescriptor(isoRequest[i]);
 		delete[] isoRequest;
 		return B_NO_MEMORY;
 	}
@@ -1357,9 +1389,8 @@ EHCI::SubmitIsochronous(Transfer *transfer)
 
 	phys_addr_t currentPhy = bufferPhy;
 	uint32 frameCount = 0;
-	while (dataLength > 0) {
-		ehci_itd* itd = CreateItdDescriptor();
-		isoRequest[itdIndex++] = itd;
+	while (dataLength > 0 && itdIndex < itdCount) {
+		ehci_itd* itd = isoRequest[itdIndex++];
 		uint16 pg = 0;
 		itd->buffer_phy[pg] = currentPhy & 0xfffff000;
 		uint32 offset = currentPhy & 0xfff;

@@ -141,16 +141,32 @@ Device::Device(Object* parent, int8 hubAddress, uint8 hubPort,
 		usb_configuration_descriptor* configuration
 			= (usb_configuration_descriptor*)configData;
 		fConfigurations[i].descr = configuration;
-		fConfigurations[i].interface_count = configuration->number_interfaces;
-		fConfigurations[i].interface = (usb_interface_list*)malloc(
-			configuration->number_interfaces * sizeof(usb_interface_list));
-		if (fConfigurations[i].interface == NULL) {
-			TRACE_ERROR("out of memory when creating interfaces\n");
-			return;
+
+		// The descriptor is handed on with the length it states (usb_raw
+		// copies that many bytes to its callers), and the device has sent
+		// its header a second time: it says what was received, whatever
+		// the device made of it this time.
+		if (configuration->total_length != actualLength) {
+			TRACE_ERROR("configuration %" B_PRId32 " changed its total length"
+				" from %" B_PRIuSIZE " to %" B_PRIu16 ", correcting!\n", i,
+				actualLength, configuration->total_length);
+			configuration->total_length = actualLength;
 		}
 
-		memset(fConfigurations[i].interface, 0,
-			configuration->number_interfaces * sizeof(usb_interface_list));
+		// A configuration without interfaces has no list (and an interface
+		// descriptor that follows nowhere to go, see below).
+		fConfigurations[i].interface_count = configuration->number_interfaces;
+		if (configuration->number_interfaces > 0) {
+			fConfigurations[i].interface = (usb_interface_list*)malloc(
+				configuration->number_interfaces * sizeof(usb_interface_list));
+			if (fConfigurations[i].interface == NULL) {
+				TRACE_ERROR("out of memory when creating interfaces\n");
+				return;
+			}
+
+			memset(fConfigurations[i].interface, 0,
+				configuration->number_interfaces * sizeof(usb_interface_list));
+		}
 
 		usb_interface_info* currentInterface = NULL;
 		uint32 descriptorStart = sizeof(usb_configuration_descriptor);
@@ -200,6 +216,17 @@ Device::Device(Object* parent, int8 hubAddress, uint8 hubPort,
 						interfaceDescriptor->interface_protocol);
 					TRACE("\tinterface:..........%d\n",
 						interfaceDescriptor->interface);
+
+					if (fConfigurations[i].interface_count == 0) {
+						// There is no last interface to count it as (the
+						// correction below made it number 255 of none), and
+						// its endpoints belong to no interface either.
+						TRACE_ERROR("interface descriptor in configuration %"
+							B_PRId32 ", which has no interfaces, ignoring!\n",
+							i);
+						currentInterface = NULL;
+						break;
+					}
 
 					if (interfaceDescriptor->interface_number
 							>= fConfigurations[i].interface_count) {
@@ -723,12 +750,48 @@ Device::ClearEndpoints(int32 interfaceIndex)
 status_t
 Device::SetAltInterface(const usb_interface_info* interface)
 {
+	if (interface == NULL || interface->descr == NULL
+		|| fCurrentConfiguration == NULL) {
+		return B_BAD_VALUE;
+	}
+
 	uint8 interfaceNumber = interface->descr->interface_number;
+	if (interfaceNumber >= fCurrentConfiguration->interface_count)
+		return B_BAD_VALUE;
+
+	// Find the alternate in the list of the interface. It is in the order of
+	// the descriptors, which the device numbers as it likes: settings 0 and
+	// 2 are entries 0 and 1, and bAlternateSetting is no index into it.
+	usb_interface_list* interfaceList
+		= &fCurrentConfiguration->interface[interfaceNumber];
+	usb_interface_info* alternate = NULL;
+	for (size_t i = 0; i < interfaceList->alt_count; i++) {
+		if (&interfaceList->alt[i] == interface) {
+			alternate = &interfaceList->alt[i];
+			break;
+		}
+	}
+
+	if (alternate == NULL) {
+		// not one of this list (of another configuration, or a copy): the
+		// setting of that number, then
+		for (size_t i = 0; i < interfaceList->alt_count; i++) {
+			if (interfaceList->alt[i].descr->alternate_setting
+					== interface->descr->alternate_setting) {
+				alternate = &interfaceList->alt[i];
+				break;
+			}
+		}
+	}
+
+	if (alternate == NULL)
+		return B_BAD_VALUE;
+
 	// Tell the device to set the alternate settings
 	status_t result = fDefaultPipe->SendRequest(
 		USB_REQTYPE_INTERFACE_OUT | USB_REQTYPE_STANDARD,
 		USB_REQUEST_SET_INTERFACE,
-		interface->descr->alternate_setting, interfaceNumber, 0, NULL, 0, NULL);
+		alternate->descr->alternate_setting, interfaceNumber, 0, NULL, 0, NULL);
 	if (result < B_OK)
 		return result;
 
@@ -736,10 +799,7 @@ Device::SetAltInterface(const usb_interface_info* interface)
 	ClearEndpoints(interfaceNumber);
 
 	// Update the active pointer of the interface list
-	usb_interface_list* interfaceList
-		= &fCurrentConfiguration->interface[interfaceNumber];
-	interfaceList->active
-		= &interfaceList->alt[interface->descr->alternate_setting];
+	interfaceList->active = alternate;
 
 	// Initialize the new endpoints
 	InitEndpoints(interfaceNumber);

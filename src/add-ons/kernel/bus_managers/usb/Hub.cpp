@@ -135,8 +135,14 @@ Hub::Hub(Object *parent, int8 hubAddress, uint8 hubPort,
 		TRACE("\tpower_control_mask:..0x%02x\n", hubDescriptor.power_control_mask);
 		TRACE("\tdevice_removeable:...0x%02x\n", hubDescriptor.device_removeable);
 	}
-	usb_interface_list *list = Configuration()->interface;
-	Object *object = GetStack()->GetObject(list->active->endpoint[0].handle);
+	// (a device that calls itself a hub need not have the interface and the
+	// endpoint of one)
+	const usb_configuration_info *configuration = Configuration();
+	const usb_interface_info *interface = configuration != NULL
+			&& configuration->interface_count > 0
+		? configuration->interface[0].active : NULL;
+	Object *object = interface != NULL && interface->endpoint_count > 0
+		? GetStack()->GetObject(interface->endpoint[0].handle) : NULL;
 	if (object != NULL && (object->Type() & USB_OBJECT_INTERRUPT_PIPE) != 0) {
 		fInterruptPipe = (InterruptPipe *)object;
 		fInterruptPipe->QueueInterrupt(fInterruptStatus,
