@@ -20,6 +20,7 @@
 #include <syslog.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <map>
 
 #include "Mcp.h"
@@ -78,6 +79,25 @@ struct ConnectionArgs {
 };
 
 
+// The limits of a request (airos-works/haiku#198). The body is read only
+// for a request that has the token: before that, the sender is anybody who
+// can reach the port, and gets a header of 64 KiB within the header timeout.
+const size_t kMaxHeaderSize = 64 * 1024;
+const size_t kMaxBodySize = 64 * 1024 * 1024;
+
+// A body must arrive within the body timeout plus what its size takes at
+// this rate: enough for 64 MiB over a bad link, but a sender cannot keep a
+// connection (and what the server has buffered for it) for as long as it
+// likes by sending a byte every now and then.
+const size_t kMinBodyRate = 32 * 1024;	// bytes per second
+
+// After an answer to a request whose body was not read, the rest of what the
+// client sends is discarded for a moment, so that it gets the answer rather
+// than a reset connection.
+const bigtime_t kLingerTimeout = 2 * 1000000LL;
+const size_t kLingerSize = 1024 * 1024;
+
+
 struct HttpRequest {
 	std::string method;
 	std::string path;
@@ -85,15 +105,64 @@ struct HttpRequest {
 	std::map<std::string, std::string> headers;	// lower-case names
 	std::string body;
 	bool keepAlive;
+	bool hasBody;
+	bool chunked;
+	size_t contentLength;
 };
 
 
+// Reads what has arrived, waiting for it until the deadline at most.
+ssize_t
+ReadSome(int fd, char* chunk, size_t size, bigtime_t deadline)
+{
+	while (true) {
+		bigtime_t now = system_time();
+		if (now >= deadline) {
+			errno = ETIMEDOUT;
+			return -1;
+		}
+		pollfd descriptor = { fd, POLLIN, 0 };
+		int ready = poll(&descriptor, 1,
+			(int)std::min((deadline - now + 999) / 1000, (bigtime_t)60000));
+		if (ready < 0 && errno != EINTR)
+			return -1;
+		if (ready > 0)
+			return recv(fd, chunk, size, 0);
+	}
+}
+
+
+// The time a body may take: see kMinBodyRate. No single wait for more of it
+// is longer than the idle timeout.
+struct BodyClock {
+	bigtime_t end;
+	bigtime_t idleTimeout;
+
+	BodyClock(const HttpOptions& options)
+		:
+		end(system_time() + options.bodyTimeout),
+		idleTimeout(options.idleTimeout)
+	{
+	}
+
+	bigtime_t Deadline(size_t size) const
+	{
+		bigtime_t deadline = end + (bigtime_t)size * 1000000LL / kMinBodyRate;
+		return std::min(deadline, system_time() + idleTimeout);
+	}
+};
+
+
+// Reads until the buffer holds "needed" bytes; "size" is the size of the body
+// as far as it is known, for the deadline.
 bool
-ReadExact(int fd, std::string& buffer, size_t needed)
+ReadExact(int fd, std::string& buffer, size_t needed, const BodyClock& clock,
+	size_t size)
 {
 	char chunk[65536];
 	while (buffer.size() < needed) {
-		ssize_t got = read(fd, chunk, sizeof(chunk));
+		ssize_t got = ReadSome(fd, chunk, sizeof(chunk),
+			clock.Deadline(std::max(size, buffer.size())));
 		if (got <= 0)
 			return false;
 		buffer.append(chunk, got);
@@ -102,19 +171,32 @@ ReadExact(int fd, std::string& buffer, size_t needed)
 }
 
 
-// Reads one request; false when the connection ended or the request is bad.
+// Reads the request line and the headers of one request; false when the
+// connection ended, the request is bad or it did not come in time. The body,
+// if there is one, has not been read then: see ReadBody().
 bool
-ReadRequest(int fd, std::string& buffer, HttpRequest& request)
+ReadHeader(int fd, std::string& buffer, HttpRequest& request,
+	const HttpOptions& options)
 {
+	// Waiting for a request may take the idle timeout; once its first byte is
+	// here, all of the header has to follow within the header timeout,
+	// however slowly its sender lets the bytes trickle.
+	bool started = !buffer.empty();
+	bigtime_t deadline = system_time()
+		+ (started ? options.headerTimeout : options.idleTimeout);
 	size_t headerEnd;
 	while ((headerEnd = buffer.find("\r\n\r\n")) == std::string::npos) {
-		if (buffer.size() > 64 * 1024)
+		if (buffer.size() > kMaxHeaderSize)
 			return false;
 		char chunk[16384];
-		ssize_t got = read(fd, chunk, sizeof(chunk));
+		ssize_t got = ReadSome(fd, chunk, sizeof(chunk), deadline);
 		if (got <= 0)
 			return false;
 		buffer.append(chunk, got);
+		if (!started) {
+			started = true;
+			deadline = system_time() + options.headerTimeout;
+		}
 	}
 	std::string head = buffer.substr(0, headerEnd);
 	buffer.erase(0, headerEnd + 4);
@@ -155,48 +237,89 @@ ReadRequest(int fd, std::string& buffer, HttpRequest& request)
 			request.keepAlive = true;
 	}
 
-	size_t contentLength = 0;
+	request.contentLength = 0;
 	it = request.headers.find("content-length");
 	if (it != request.headers.end())
-		contentLength = strtoul(it->second.c_str(), NULL, 10);
-	if (contentLength > 64 * 1024 * 1024)
+		request.contentLength = strtoul(it->second.c_str(), NULL, 10);
+	request.chunked = request.headers.count("transfer-encoding") != 0;
+	request.hasBody = request.chunked || request.contentLength > 0;
+	request.body.clear();
+	return true;
+}
+
+
+// Reads the body of a request whose header ReadHeader() returned; false when
+// the connection ended, the body is too large or it did not come in time.
+bool
+ReadBody(int fd, std::string& buffer, HttpRequest& request,
+	const HttpOptions& options)
+{
+	size_t contentLength = request.contentLength;
+	if (contentLength > kMaxBodySize)
 		return false;
-	if (request.headers.count("transfer-encoding") != 0) {
+	BodyClock clock(options);
+	if (request.chunked) {
 		// Chunked bodies: decode.
 		request.body.clear();
 		while (true) {
+			size_t received = request.body.size();
 			size_t lineEnd;
 			while ((lineEnd = buffer.find("\r\n")) == std::string::npos) {
 				if (buffer.size() > 65536)
 					return false;
-				if (!ReadExact(fd, buffer, buffer.size() + 1))
+				if (!ReadExact(fd, buffer, buffer.size() + 1, clock, received))
 					return false;
 			}
 			size_t chunkSize = strtoul(buffer.substr(0, lineEnd).c_str(), NULL, 16);
 			buffer.erase(0, lineEnd + 2);
-			if (chunkSize > 64 * 1024 * 1024 - request.body.size())
+			if (chunkSize > kMaxBodySize - request.body.size())
 				return false;
 			if (chunkSize == 0) {
 				// trailer
 				while ((lineEnd = buffer.find("\r\n")) == std::string::npos) {
-					if (!ReadExact(fd, buffer, buffer.size() + 1))
+					if (buffer.size() > 65536)
 						return false;
+					if (!ReadExact(fd, buffer, buffer.size() + 1, clock,
+							received)) {
+						return false;
+					}
 				}
 				buffer.erase(0, lineEnd + 2);
 				break;
 			}
-			if (!ReadExact(fd, buffer, chunkSize + 2))
+			if (!ReadExact(fd, buffer, chunkSize + 2, clock,
+					received + chunkSize)) {
 				return false;
+			}
 			request.body.append(buffer, 0, chunkSize);
 			buffer.erase(0, chunkSize + 2);
 		}
 		return true;
 	}
-	if (!ReadExact(fd, buffer, contentLength))
+	if (!ReadExact(fd, buffer, contentLength, clock, contentLength))
 		return false;
 	request.body = buffer.substr(0, contentLength);
 	buffer.erase(0, contentLength);
 	return true;
+}
+
+
+// Ends a connection whose client may still be sending (a body nobody reads):
+// closing with unread data resets the connection, and the client could lose
+// the answer it was just sent.
+void
+LingerBeforeClose(int fd)
+{
+	shutdown(fd, SHUT_WR);
+	bigtime_t deadline = system_time() + kLingerTimeout;
+	size_t discarded = 0;
+	char chunk[16384];
+	while (discarded < kLingerSize) {
+		ssize_t got = ReadSome(fd, chunk, sizeof(chunk), deadline);
+		if (got <= 0)
+			break;
+		discarded += got;
+	}
 }
 
 
@@ -236,6 +359,18 @@ SendResponse(int fd, int status, const char* statusText,
 }
 
 
+// Whether the client gave the token, in a time that does not tell how much of
+// it was right.
+bool
+SameToken(const std::string& given, const std::string& token)
+{
+	unsigned char difference = given.size() != token.size() ? 1 : 0;
+	for (size_t i = 0; i < token.size(); i++)
+		difference |= token[i] ^ (i < given.size() ? given[i] : 0);
+	return difference == 0;
+}
+
+
 bool
 Authorized(const HttpRequest& request, const HttpOptions& options)
 {
@@ -246,11 +381,11 @@ Authorized(const HttpRequest& request, const HttpOptions& options)
 	if (it != request.headers.end()) {
 		std::string value = it->second;
 		if (strncasecmp(value.c_str(), "Bearer ", 7) == 0
-				&& TrimString(value.substr(7)) == options.token)
+				&& SameToken(TrimString(value.substr(7)), options.token))
 			return true;
 	}
 	it = request.headers.find("x-airos-token");
-	if (it != request.headers.end() && it->second == options.token)
+	if (it != request.headers.end() && SameToken(it->second, options.token))
 		return true;
 	return false;
 }
@@ -269,12 +404,32 @@ ConnectionThread(void* data)
 	delete args;
 
 	std::string buffer;
+	bool authenticated = false;
+	bool linger = false;
 	while (true) {
 		HttpRequest request;
-		if (!ReadRequest(fd, buffer, request) || !transport->IsCurrent(generation))
+		if (!ReadHeader(fd, buffer, request, options))
 			break;
 
+		// Only who has the token gets its body read (up to 64 MiB, kept in
+		// memory). Anybody else gets the answer to the header alone, and the
+		// connection ends, as what follows is the body nobody read.
+		bool authorized = Authorized(request, options);
 		bool keepAlive = request.keepAlive;
+		if (authorized) {
+			if (!authenticated) {
+				authenticated = true;
+				transport->ConnectionAuthenticated(fd);
+			}
+			if (!ReadBody(fd, buffer, request, options))
+				break;
+		} else if (request.hasBody) {
+			keepAlive = false;
+			linger = true;
+		}
+		if (!transport->IsCurrent(generation))
+			break;
+
 		// Native MCP clients do not send Origin. Reject browser origins, including
 		// "null", instead of exposing system control to arbitrary web pages.
 		if (request.headers.count("origin") != 0) {
@@ -297,7 +452,7 @@ ConnectionThread(void* data)
 			if (!SendResponse(fd, 404, "Not Found", "text/plain",
 					"airos_mcp: POST JSON-RPC to /mcp\n", keepAlive))
 				break;
-		} else if (!Authorized(request, options)) {
+		} else if (!authorized) {
 			syslog(LOG_WARNING, "airos_mcp: unauthorized request from %s",
 				peer.c_str());
 			if (!SendResponse(fd, 401, "Unauthorized", "application/json",
@@ -330,6 +485,8 @@ ConnectionThread(void* data)
 		if (!keepAlive)
 			break;
 	}
+	if (linger)
+		LingerBeforeClose(fd);
 	transport->ConnectionClosed(fd);
 	return 0;
 }
@@ -347,14 +504,14 @@ HttpTransport::HttpTransport(McpServer& server)
 HttpTransport::~HttpTransport()
 {
 	Stop();
-	std::map<int, thread_id> connections;
+	std::map<int, Connection> connections;
 	{
 		BAutolock lock(&fLock);
 		connections = fConnections;
 	}
 	for (const auto& connection : connections) {
 		status_t result;
-		wait_for_thread(connection.second, &result);
+		wait_for_thread(connection.second.thread, &result);
 	}
 }
 
@@ -372,6 +529,72 @@ HttpTransport::IsCurrent(uint64 generation)
 {
 	BAutolock lock(&fLock);
 	return !fStopping && generation == fGeneration;
+}
+
+
+void
+HttpTransport::ConnectionAuthenticated(int socket)
+{
+	BAutolock lock(&fLock);
+	std::map<int, Connection>::iterator found = fConnections.find(socket);
+	if (found != fConnections.end())
+		found->second.authenticated = true;
+}
+
+
+/*!	Makes room for a new connection from \a address; the lock is held.
+	Returns whether it may be taken.
+
+	A peer that has not shown the token must not be able to keep those who
+	have it out (airos-works/haiku#198). So a connection that has not
+	authenticated gives way to a new one: the oldest of its address, when that
+	address has as many of them as one address may have, or the oldest of all,
+	when all connections are taken. Whoever fills the table with idle
+	connections only loses them again, and a client with the token gets in
+	even from the same address.
+	Connections that have shown the token are never given up; when they take
+	all there is, the new one is refused as before.
+*/
+bool
+HttpTransport::_MakeRoom(uint32 address)
+{
+	size_t count = 0;
+	size_t unauthenticatedOfPeer = 0;
+	std::map<int, Connection>::iterator oldest = fConnections.end();
+	std::map<int, Connection>::iterator oldestOfPeer = fConnections.end();
+	for (std::map<int, Connection>::iterator it = fConnections.begin();
+			it != fConnections.end(); ++it) {
+		Connection& connection = it->second;
+		if (connection.evicted)
+			continue;
+		count++;
+		if (connection.authenticated)
+			continue;
+		if (oldest == fConnections.end()
+			|| connection.accepted < oldest->second.accepted) {
+			oldest = it;
+		}
+		if (connection.address != address)
+			continue;
+		unauthenticatedOfPeer++;
+		if (oldestOfPeer == fConnections.end()
+			|| connection.accepted < oldestOfPeer->second.accepted) {
+			oldestOfPeer = it;
+		}
+	}
+
+	if (unauthenticatedOfPeer >= fOptions.maxUnauthenticatedPerPeer
+		&& oldestOfPeer != fConnections.end()) {
+		oldest = oldestOfPeer;
+	} else if (count < fOptions.maxConnections)
+		return true;
+	else if (oldest == fConnections.end())
+		return false;
+
+	// Its thread ends when it sees the socket shut down, and removes it.
+	oldest->second.evicted = true;
+	shutdown(oldest->first, SHUT_RDWR);
+	return true;
 }
 
 
@@ -472,7 +695,7 @@ HttpTransport::_AcceptThread(void* data)
 		int fd = accept(self->fListener, (sockaddr*)&peer, &peerLength);
 		if (fd < 0)
 			continue;
-		if (self->fConnections.size() >= 32) {
+		if (!self->_MakeRoom(peer.sin_addr.s_addr)) {
 			close(fd);
 			continue;
 		}
@@ -497,7 +720,9 @@ HttpTransport::_AcceptThread(void* data)
 			delete args;
 			continue;
 		}
-		self->fConnections[fd] = thread;
+		Connection connection = { thread, peer.sin_addr.s_addr, system_time(),
+			false, false };
+		self->fConnections[fd] = connection;
 		resume_thread(thread);
 	}
 }

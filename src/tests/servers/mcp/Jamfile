@@ -4,3 +4,10 @@ SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src servers mcp ] ;
 UseHeaders [ FDirName $(HAIKU_TOP) src servers mcp ] ;
 
 SimpleTest MCPJsonTest : JsonTests.cpp Json.cpp : [ TargetLibstdc++ ] ;
+
+# the HTTP transport against clients without the token (limits, deadlines)
+SubDirC++Flags -std=c++17 ;
+SimpleTest MCPTransportTest
+	: TransportTest.cpp Transport.cpp Mcp.cpp Json.cpp Util.cpp
+	: be network [ TargetLibstdc++ ]
+;
