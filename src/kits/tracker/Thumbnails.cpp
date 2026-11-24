@@ -11,6 +11,7 @@
 #include <list>
 #include <map>
 #include <set>
+#include <vector>
 #include <fs_attr.h>
 
 #include <Application.h>
@@ -21,6 +22,7 @@
 #include <Node.h>
 #include <NodeInfo.h>
 #include <Roster.h>
+#include <Window.h>
 #include <TranslatorFormats.h>
 #include <TranslatorRoster.h>
 #include <TranslationUtils.h>
@@ -125,6 +127,13 @@ ScaleBitmap(BBitmap* source, BBitmap& dest, BSize size, color_space colorSpace)
 }
 
 
+// Where an icon that waits for its thumbnail is drawn.
+struct ThumbnailPlace {
+	BMessenger	view;
+	BRect		frame;
+};
+
+
 class GenerateThumbnailJob : public BSupportKit::BJob {
 public:
 	GenerateThumbnailJob(Model* model, BSize requestedSize,
@@ -134,7 +143,9 @@ public:
 		  fRef(*model->EntryRef()),
 		  fNodeRef(*model->NodeRef()),
 		  fRequestedSize(requestedSize),
-		  fColorSpace(colorSpace)
+		  fColorSpace(colorSpace),
+		  fPlacesChanged(0),
+		  fDropped(false)
 	{
 		// The file is opened when the job runs, not here: jobs wait in the
 		// queue, a folder full of documents queues hundreds of them, and
@@ -150,12 +161,27 @@ public:
 
 	virtual status_t Execute();
 
+			// with sActiveJobsLock held
+			void AddPlace(BView* view, BPoint where);
+			bool IsDropped() const { return fDropped; }
+private:
+			bool IsWanted();
+
 public:
 	const BString fMimeType;
 	const entry_ref fRef;
 	const node_ref fNodeRef;
 	const BSize fRequestedSize;
 	const color_space fColorSpace;
+
+private:
+	// guarded by sActiveJobsLock
+	std::vector<ThumbnailPlace> fPlaces;
+		// empty when it was only asked for without a place (to preload an
+		// icon, a hit test)
+	uint32 fPlacesChanged;
+	bool fDropped;
+		// found not to be wanted; a new request makes a new job
 };
 
 
@@ -167,23 +193,114 @@ static BLocker sNoThumbnailTypesLock("no thumbnail types");
 // Files whose thumbnail could not be made, with their modification time
 // then: until they change, their type's icon is shown instead of asking
 // again at every redraw.
-static std::map<std::pair<dev_t, ino_t>, time_t> sFailedNodes;
+struct FailedThumbnail {
+	time_t	modified;
+	bool	ownIcon;
+		// the file has an icon of its own, drawn instead
+};
+static std::map<std::pair<dev_t, ino_t>, FailedThumbnail> sFailedNodes;
 
 
 static bool
-ThumbnailFailedBefore(const node_ref& node, time_t modified)
+ThumbnailFailedBefore(const node_ref& node, time_t modified,
+	bool* _ownIcon = NULL)
 {
 	BAutolock locker(sNoThumbnailTypesLock);
-	std::map<std::pair<dev_t, ino_t>, time_t>::iterator found
+	std::map<std::pair<dev_t, ino_t>, FailedThumbnail>::iterator found
 		= sFailedNodes.find(std::make_pair(node.device, node.node));
 	if (found == sFailedNodes.end())
 		return false;
-	if (found->second != modified) {
+	if (found->second.modified != modified) {
 		// changed since: worth another try
 		sFailedNodes.erase(found);
 		return false;
 	}
+	if (_ownIcon != NULL)
+		*_ownIcon = found->second.ownIcon;
 	return true;
+}
+
+
+static void
+RememberFailure(BNode& node, const node_ref& nodeRef)
+{
+	FailedThumbnail failed;
+	failed.modified = 0;
+	node.GetModificationTime(&failed.modified);
+	attr_info info;
+	failed.ownIcon = node.GetAttrInfo(kAttrIcon, &info) == B_OK
+		|| node.GetAttrInfo(kAttrMiniIcon, &info) == B_OK
+		|| node.GetAttrInfo(kAttrLargeIcon, &info) == B_OK;
+
+	BAutolock locker(sNoThumbnailTypesLock);
+	sFailedNodes[std::make_pair(nodeRef.device, nodeRef.node)] = failed;
+}
+
+
+void
+GenerateThumbnailJob::AddPlace(BView* view, BPoint where)
+{
+	if (view == NULL)
+		return;
+
+	fPlacesChanged++;
+	ThumbnailPlace place;
+	place.view = BMessenger(view);
+	place.frame = BRect(where, where + BPoint(fRequestedSize.width,
+		fRequestedSize.height));
+	for (size_t i = 0; i < fPlaces.size(); i++) {
+		if (fPlaces[i].view == place.view) {
+			// drawn there again, maybe somewhere else
+			fPlaces[i].frame = place.frame;
+			return;
+		}
+	}
+	fPlaces.push_back(place);
+}
+
+
+bool
+GenerateThumbnailJob::IsWanted()
+{
+	// A folder paged through quickly queues a job for every icon that was
+	// on screen for a moment; only those still in view are worth the time
+	// (a document waits for the quick_look server, a picture is read
+	// whole). One that is dropped is asked for again when it is drawn.
+	std::vector<ThumbnailPlace> places;
+	uint32 placesChanged;
+	{
+		BAutolock locker(sActiveJobsLock);
+		if (fPlaces.empty())
+			return true;
+		places = fPlaces;
+		placesChanged = fPlacesChanged;
+	}
+
+	for (size_t i = 0; i < places.size(); i++) {
+		status_t status = places[i].view.LockTargetWithTimeout(50000);
+		if (status == B_TIMED_OUT || status == B_WOULD_BLOCK) {
+			// the window is busy: do not hold the job up to find out
+			return true;
+		}
+		if (status != B_OK)
+			continue;
+
+		BLooper* looper = NULL;
+		BView* view = dynamic_cast<BView*>(places[i].view.Target(&looper));
+		bool visible = view != NULL && view->Window() != NULL
+			&& view->Bounds().Intersects(places[i].frame);
+		looper->Unlock();
+		if (visible)
+			return true;
+	}
+
+	BAutolock locker(sActiveJobsLock);
+	if (fPlacesChanged != placesChanged) {
+		// drawn again meanwhile
+		return true;
+	}
+	fDropped = true;
+	return false;
 }
 
 
@@ -238,6 +355,9 @@ ThumbnailFromQuickLook(const entry_ref& ref, const char* mimeType, int32 size)
 status_t
 GenerateThumbnailJob::Execute()
 {
+	if (!IsWanted())
+		return B_CANCELED;
+
 	BFile file(&fRef, B_READ_ONLY);
 	node_ref node;
 	status_t status = file.InitCheck();
@@ -256,8 +376,12 @@ GenerateThumbnailJob::Execute()
 		BBitmapStream imageStream;
 		status = BTranslatorRoster::Default()->Translate(&file, NULL, NULL,
 			&imageStream, B_TRANSLATOR_BITMAP, 0, fMimeType);
-		if (status != B_OK)
+		if (status != B_OK) {
+			// not a picture after all, or a damaged one: do not read it
+			// again for every redraw
+			RememberFailure(file, fNodeRef);
 			return status;
+		}
 
 		status = imageStream.DetachBitmap(&image);
 		if (status != B_OK)
@@ -265,13 +389,7 @@ GenerateThumbnailJob::Execute()
 	} else {
 		image = ThumbnailFromQuickLook(fRef, fMimeType, B_XXL_ICON);
 		if (image == NULL) {
-			{
-				time_t modified = 0;
-				file.GetModificationTime(&modified);
-				BAutolock locker(sNoThumbnailTypesLock);
-				sFailedNodes[std::make_pair(fNodeRef.device, fNodeRef.node)]
-					= modified;
-			}
+			RememberFailure(file, fNodeRef);
 			// draw the type's icon instead
 			BMessage message(kUpdateThumbnail);
 			if (message.AddNodeRef("noderef", &fNodeRef) == B_OK)
@@ -377,14 +495,17 @@ thumbnail_worker(void* castToJobQueue)
 
 
 static status_t
-GenerateThumbnail(Model* model, color_space colorSpace, BSize size)
+GenerateThumbnail(Model* model, color_space colorSpace, BSize size,
+	BView* view, BPoint where)
 {
 	// First check we do not have a job queued already.
 	BAutolock jobsLock(sActiveJobsLock);
 	for (std::list<GenerateThumbnailJob*>::iterator it = sActiveJobs.begin();
 			it != sActiveJobs.end(); it++) {
-		if ((*it)->fNodeRef == *model->NodeRef())
+		if ((*it)->fNodeRef == *model->NodeRef() && !(*it)->IsDropped()) {
+			(*it)->AddPlace(view, where);
 			return B_BUSY;
+		}
 	}
 	jobsLock.Unlock();
 
@@ -404,6 +525,10 @@ GenerateThumbnail(Model* model, color_space colorSpace, BSize size)
 		return B_NO_MEMORY;
 	if (job->InitCheck() != B_OK)
 		return job->InitCheck();
+	{
+		BAutolock locker(sActiveJobsLock);
+		job->AddPlace(view, where);
+	}
 
 	JobQueue** jobQueue;
 	if (st.st_size >= (128 * kKBSize)) {
@@ -440,6 +565,14 @@ GenerateThumbnail(Model* model, color_space colorSpace, BSize size)
 
 status_t
 GetThumbnailFromAttr(Model* model, BBitmap* icon, BSize size)
+{
+	return GetThumbnailFromAttr(model, icon, size, NULL, B_ORIGIN);
+}
+
+
+status_t
+GetThumbnailFromAttr(Model* model, BBitmap* icon, BSize size, BView* view,
+	BPoint where)
 {
 	if (model == NULL || icon == NULL)
 		return B_BAD_VALUE;
@@ -509,16 +642,29 @@ GetThumbnailFromAttr(Model* model, BBitmap* icon, BSize size)
 	if (ShouldGenerateThumbnail(model->MimeType())) {
 		// not over the network: reading a whole video to draw an icon is
 		// slow there
-		if (!IsImageType(model->MimeType())
-			&& (!CanCalculateFolderSizes(model->NodeRef()->device)
-				|| ThumbnailFailedBefore(*model->NodeRef(),
-					model->StatBuf()->st_mtime))) {
+		if ((!IsImageType(model->MimeType())
+				&& !CanCalculateFolderSizes(model->NodeRef()->device))
+			|| ThumbnailFailedBefore(*model->NodeRef(),
+				model->StatBuf()->st_mtime)) {
 			return B_NOT_SUPPORTED;
 		}
-		return GenerateThumbnail(model, icon->ColorSpace(), size);
+		return GenerateThumbnail(model, icon->ColorSpace(), size, view,
+			where);
 	}
 
 	return B_NOT_SUPPORTED;
+}
+
+
+bool
+ThumbnailFailed(const Model* model)
+{
+	if (!ShouldGenerateThumbnail(model->MimeType()))
+		return false;
+
+	bool ownIcon = true;
+	return ThumbnailFailedBefore(*model->NodeRef(),
+		model->StatBuf()->st_mtime, &ownIcon) && !ownIcon;
 }
 
 

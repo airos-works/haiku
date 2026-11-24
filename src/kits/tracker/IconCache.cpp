@@ -803,7 +803,8 @@ IconCache::GetNodeIcon(ModelNodeLazyOpener* modelOpener,
 	AutoLock<SimpleIconCache>** resultingOpenCache,
 	Model* model, IconSource& source,
 	IconDrawMode mode, BSize size,
-	LazyBitmapAllocator* lazyBitmap, IconCacheEntry* entry, bool permanent)
+	LazyBitmapAllocator* lazyBitmap, IconCacheEntry* entry, bool permanent,
+	BView* view, BPoint where)
 {
 	*resultingOpenCache = nodeCacheLocker;
 	(*resultingOpenCache)->Lock();
@@ -825,7 +826,8 @@ IconCache::GetNodeIcon(ModelNodeLazyOpener* modelOpener,
 			&& (file = dynamic_cast<BFile*>(model->Node())) != NULL) {
 			result = GetAppIconFromAttr(file, lazyBitmap->Get(), icon_size_for(size));
 		} else {
-			result = GetThumbnailFromAttr(model, lazyBitmap->Get(), size);
+			result = GetThumbnailFromAttr(model, lazyBitmap->Get(), size,
+				view, where);
 			if (result != B_OK && result != B_BUSY) {
 				result = GetFileIconFromAttr(model->Node(), lazyBitmap->Get(),
 					icon_size_for(size));
@@ -927,7 +929,7 @@ IconCache::Preload(AutoLock<SimpleIconCache>* nodeCacheLocker,
 	AutoLock<SimpleIconCache>* sharedCacheLocker,
 	AutoLock<SimpleIconCache>** resultingCache,
 	Model* model, IconDrawMode mode, BSize size,
-	bool permanent)
+	bool permanent, BView* view, BPoint where)
 {
 	IconCacheEntry* entry = NULL;
 
@@ -971,7 +973,8 @@ IconCache::Preload(AutoLock<SimpleIconCache>* nodeCacheLocker,
 					// look for node icons first
 					entry = GetNodeIcon(&modelOpener, nodeCacheLocker,
 						&resultingOpenCache, model, source,
-						mode, size, &lazyBitmap, entry, permanent);
+						mode, size, &lazyBitmap, entry, permanent, view,
+						where);
 				}
 
 				if (entry == NULL) {
@@ -1002,15 +1005,20 @@ IconCache::Preload(AutoLock<SimpleIconCache>* nodeCacheLocker,
 					resultingOpenCache = nodeCacheLocker;
 					resultingOpenCache->Lock();
 
-					entry = GetNodeIcon(&modelOpener, nodeCacheLocker,
-						&resultingOpenCache, model, source, mode,
-						size, &lazyBitmap, entry, permanent);
+					if (!ThumbnailFailed(model)) {
+						entry = GetNodeIcon(&modelOpener, nodeCacheLocker,
+							&resultingOpenCache, model, source, mode,
+							size, &lazyBitmap, entry, permanent, view, where);
+					}
+						// else no thumbnail and no icon of its own: not
+						// worth opening the file at every redraw to find
+						// that out again
 					if (entry == NULL) {
 						// no thumbnail (yet, or at this size): the type's
-						// icon rather than the generic one
+						// icon rather than the generic one; that needs
+						// only what the model knows, not the node
 						if (resultingOpenCache != NULL)
 							resultingOpenCache->Unlock();
-						modelOpener.OpenNode();
 						resultingOpenCache = sharedCacheLocker;
 						resultingOpenCache->Lock();
 						IconSource typeSource = kUnknownSource;
@@ -1149,7 +1157,7 @@ IconCache::Draw(Model* model, BView* view, BPoint where, IconDrawMode mode,
 
 	AutoLock<SimpleIconCache>* resultingCacheLocker;
 	IconCacheEntry* entry = Preload(&nodeCacheLocker, &sharedCacheLocker,
-		&resultingCacheLocker, model, mode, size, false);
+		&resultingCacheLocker, model, mode, size, false, view, where);
 		// Preload finds/creates the appropriate entry, locking down the
 		// cache it is in and returns the whole state back to here
 
@@ -1178,7 +1186,7 @@ IconCache::SyncDraw(Model* model, BView* view, BPoint where,
 
 	AutoLock<SimpleIconCache>* resultingCacheLocker;
 	IconCacheEntry* entry = Preload(&nodeCacheLocker, &sharedCacheLocker,
-		&resultingCacheLocker, model, mode, size, false);
+		&resultingCacheLocker, model, mode, size, false, view, where);
 
 	if (entry == NULL)
 		return;

@@ -421,7 +421,8 @@ private:
 	IconCacheEntry* Preload(AutoLock<SimpleIconCache>* nodeCache,
 		AutoLock<SimpleIconCache>* sharedCache,
 		AutoLock<SimpleIconCache>** resultingLockedCache,
-		Model*, IconDrawMode mode, BSize size, bool permanent);
+		Model*, IconDrawMode mode, BSize size, bool permanent,
+		BView* view = NULL, BPoint where = B_ORIGIN);
 		// preload uses lazy locking, returning the cache we decided
 		// to use to get the icon
 		// <resultingLockedCache> may be null if we don't care
@@ -461,7 +462,8 @@ private:
 		AutoLock<SimpleIconCache>** resultingLockedCache,
 		Model*, IconSource&, IconDrawMode mode,
 		BSize size, LazyBitmapAllocator*, IconCacheEntry*,
-		bool permanent);
+		bool permanent, BView* view = NULL, BPoint where = B_ORIGIN);
+			// view and where: where the icon is drawn, if it is
 	IconCacheEntry* GetGenericIcon(AutoLock<SimpleIconCache>* sharedCache,
 		AutoLock<SimpleIconCache>** resultingLockedCache,
 		Model*, IconSource&, IconDrawMode mode,
