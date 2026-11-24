@@ -19,6 +19,7 @@ floods. Every test prints `PASS <name>` or `FAIL <name>: why`.
 | `seqnowrap` | the same loss without the wrap; failed for initial sequence numbers above 2^31 |
 | `winupdate` | window updates are not duplicate ACKs |
 | `persist` | the persist timer keeps probing a closed window |
+| `zerowindow` | a closed window with everything acknowledged: probes one below SND.UNA (which a peer answers), backing off, no retransmit timeout; a lost window update is repaired by the next probe and the data follows at the full congestion window (#173) |
 | `ooo`, `synflood`, `fragflood`, `udpburst`, `udpempty`, `ipv6ext`, `rfc5961`, `predictable`, `mss12`, `mss1460`, `icmp`, `timewait`, `ioctl`, `priv` | the #126-#130 fixes |
 | `sink N` / `[sndbuf B] send ADDR S` | throughput between two guests |
 | `[rounds R] sink N` / `[linger S] sendn ADDR MB COUNT` | COUNT uploads of MB each, timed until the receiver closes (or, with `linger`, until a lingering `close()` returns); the sink takes R connections (default 3) |

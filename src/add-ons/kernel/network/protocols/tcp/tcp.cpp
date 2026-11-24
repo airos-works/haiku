@@ -587,29 +587,24 @@ tcp_setsockopt(net_protocol* _protocol, int level, int option,
 {
 	TCPEndpoint* protocol = (TCPEndpoint*)_protocol;
 
-	if (level == SOL_SOCKET) {
-		if (option == SO_SNDBUF || option == SO_RCVBUF) {
-			if (length != sizeof(int))
-				return B_BAD_VALUE;
-
-			status_t status;
-			const int* value = (const int*)_value;
-
-			if (option == SO_SNDBUF)
-				status = protocol->SetSendBufferSize(*value);
-			else
-				status = protocol->SetReceiveBufferSize(*value);
-
-			if (status < B_OK)
-				return status;
-		}
-	} else if (level == IPPROTO_TCP)
+	if (level == IPPROTO_TCP)
 		return protocol->SetOption(option, _value, length);
 
 	status_t status = protocol->next->module->setsockopt(protocol->next, level,
 		option, _value, length);
-	if (status == B_OK && level == SOL_SOCKET && option == SO_KEEPALIVE)
-		protocol->KeepAliveChanged();
+	if (status == B_OK && level == SOL_SOCKET) {
+		// The queues get the size the socket took, not the one asked for:
+		// the socket layer limits it (and an int below 0 used to become a
+		// queue of 16 EiB here).
+		if (option == SO_SNDBUF) {
+			status = protocol->SetSendBufferSize(
+				protocol->socket->send.buffer_size);
+		} else if (option == SO_RCVBUF) {
+			status = protocol->SetReceiveBufferSize(
+				protocol->socket->receive.buffer_size);
+		} else if (option == SO_KEEPALIVE)
+			protocol->KeepAliveChanged();
+	}
 
 	return status;
 }

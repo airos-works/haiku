@@ -1772,6 +1772,143 @@ test_persist(void)
 		fail(name, "only %d window probe(s) in 8.5 s", probes);
 }
 
+static uint64_t
+retransmit_timeouts(void)
+{
+	/* tcp_retransmit_timeouts is the 24th counter of net_protocol_stats */
+	uint64_t stats[64];
+	memset(stats, 0, sizeof(stats));
+	if (_kern_generic_syscall("network/stats", 1, stats, sizeof(stats)) != B_OK)
+		return 0;
+	return stats[23];
+}
+
+/*
+ * #173: a closed window is not a loss. The peer acknowledges everything
+ * with a window of 0 and then behaves like any TCP: no answer to an empty
+ * segment at the sequence it expects, an ACK for a segment outside its
+ * window. Later it opens the window, and the window update is lost: only
+ * the answer to a probe tells the guest.
+ */
+static void
+test_zero_window(void)
+{
+	const char* name = "zerowindow";
+	struct peer p;
+	int fd = handshake(name, &p, 1460, 1);
+	if (fd < 0)
+		return;
+	char data[6000];
+	memset(data, 'z', sizeof(data));
+	struct seg sg;
+
+	/* 1,000 bytes with the window open, acknowledged with a closed one */
+	send(fd, data, 1000, 0);
+	uint32_t base = p.guest_next;
+	bigtime_t end = now_ms() + 1000;
+	while (now_ms() < end && p.guest_next - base < 1000) {
+		if (!read_seg(&sg, 100) || sg.proto != IPPROTO_TCP
+			|| sg.sport != p.guest_port)
+			continue;
+		if (sg.has_ts)
+			p.ts_recent = sg.tsval;
+		if (sg.len > 0 && sg.seq == p.guest_next)
+			p.guest_next += sg.len;
+	}
+	sPeerWindow = 0;
+	send_tcp(&p, F_ACK, p.seq, p.guest_next, 0, NULL, 0);
+	usleep(50000);
+	uint64_t timeouts = retransmit_timeouts();
+
+	/* more data, which the window holds back: count the probes */
+	send(fd, data, sizeof(data), 0);
+	const bigtime_t start = now_ms();
+	int probes = 0, below = 0, dataSegments = 0;
+	bigtime_t times[32];
+	end = start + 7500;
+	while (now_ms() < end) {
+		if (!read_seg(&sg, 100) || sg.proto != IPPROTO_TCP
+			|| sg.sport != p.guest_port)
+			continue;
+		if (sg.has_ts)
+			p.ts_recent = sg.tsval;
+		if (sg.len > 0) {
+			dataSegments++;
+			continue;
+		}
+		if (probes < 32)
+			times[probes] = now_ms() - start;
+		probes++;
+		if ((int32_t)(sg.seq - p.guest_next) < 0) {
+			/* outside the window: answer, the window is still closed */
+			below++;
+			send_tcp(&p, F_ACK, p.seq, p.guest_next, 0, NULL, 0);
+		}
+	}
+	timeouts = retransmit_timeouts() - timeouts;
+	char spacing[256] = "";
+	for (int i = 0; i < probes && i < 32; i++) {
+		snprintf(spacing + strlen(spacing), sizeof(spacing) - strlen(spacing),
+			"%s%.1f", i > 0 ? ", " : "", times[i] / 1000.0);
+	}
+	printf("  %d probe(s) in 7.5 s (at %s s), %d below the window, "
+		"%d data segment(s), %llu retransmit timeout(s)\n", probes, spacing,
+		below, dataSegments, (unsigned long long)timeouts);
+
+	/* the window opens, the update is lost: the next probe's answer has it */
+	sPeerWindow = 65535;
+	bigtime_t answered = -1;
+	uint32_t received = 0;
+	int segments = 0;
+	end = now_ms() + 10000;
+	while (now_ms() < end) {
+		if (answered >= 0 && now_ms() > answered + 100)
+			break;
+		if (!read_seg(&sg, 20) || sg.proto != IPPROTO_TCP
+			|| sg.sport != p.guest_port)
+			continue;
+		if (sg.has_ts)
+			p.ts_recent = sg.tsval;
+		if (sg.len > 0) {
+			/* not acknowledged: what the congestion window lets out */
+			segments++;
+			if ((int32_t)(sg.seq + sg.len - p.guest_next) > (int32_t)received)
+				received = sg.seq + sg.len - p.guest_next;
+		} else if ((int32_t)(sg.seq - p.guest_next) < 0 && answered < 0) {
+			send_tcp(&p, F_ACK, p.seq, p.guest_next, 0, NULL, 0);
+			answered = now_ms();
+		}
+	}
+	printf("  after the window opened: %u bytes in %d segment(s) within "
+		"100 ms of the probe's answer\n", received, segments);
+
+	send_tcp(&p, F_RST | F_ACK, p.seq, p.guest_next + received, 0, NULL, 0);
+	close(fd);
+
+	/* The counter is the whole stack's: one timeout may be another
+	   connection's (the ssh session the test runs in, on a busy host);
+	   the bug counts three in this time. */
+	if (timeouts >= 2) {
+		fail(name, "%llu retransmit timeouts with nothing in flight",
+			(unsigned long long)timeouts);
+	} else if (dataSegments != 0)
+		fail(name, "%d data segment(s) into a closed window", dataSegments);
+	else if (probes < 2 || below != probes)
+		fail(name, "%d of %d probes were outside the window (an empty "
+			"segment inside it draws no answer)", below, probes);
+	else if (probes > 4)
+		fail(name, "%d probes in 7.5 s: no back off", probes);
+	else if (answered < 0)
+		fail(name, "no probe in 10 s after the window opened");
+	else if (received < sizeof(data)) {
+		fail(name, "only %u of %u bytes followed the window update: the "
+			"congestion window was cut", received, (unsigned)sizeof(data));
+	} else {
+		pass(name, "%d probes, backing off, no timeout; a lost window "
+			"update is repaired by the next probe, at full window", probes);
+	}
+}
+
 /* ---- throughput between two guests ---- */
 
 static int sSinkRounds = 3;
@@ -2674,6 +2811,8 @@ main(int argc, char** argv)
 			test_window_update();
 		else if (!strcmp(t, "persist"))
 			test_persist();
+		else if (!strcmp(t, "zerowindow"))
+			test_zero_window();
 		else if (!strcmp(t, "ooo"))
 			test_out_of_order();
 		else if (!strcmp(t, "synflood"))

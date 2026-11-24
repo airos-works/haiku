@@ -1611,7 +1611,8 @@ TCPEndpoint::_KeepAlive()
 
 /*!	Sends a keepalive probe: an empty segment one below SND.UNA, which is
 	outside the peer's window, so that it must answer with an ACK (RFC 1122
-	4.2.3.6, RFC 9293 3.10.7.4).
+	4.2.3.6, RFC 9293 3.10.7.4). The persist timer probes a closed window
+	with it too, as Linux does: the answer carries the peer's window.
 */
 status_t
 TCPEndpoint::_SendKeepAlive()
@@ -2320,6 +2321,28 @@ TCPEndpoint::_UpdateSendBuffer()
 }
 
 
+/*!	A connection takes over the buffer sizes its listener was given with
+	SO_SNDBUF and SO_RCVBUF, and keeps them. The socket layer reported them
+	for the connection already, and the window shift of the SYN-ACK was
+	computed from them, while the queues started at their default size and
+	sized themselves (airos-works/haiku#173). The listener is also the only
+	place to ask for a large window: the SYN-ACK fixes the shift before
+	accept() returns the socket.
+*/
+void
+TCPEndpoint::_InheritBufferSizes(TCPEndpoint* parent)
+{
+	if ((parent->fFlags & FLAG_AUTO_SEND_BUFFER_SIZE) == 0) {
+		fSendQueue.SetMaxBytes(socket->send.buffer_size);
+		fFlags &= ~FLAG_AUTO_SEND_BUFFER_SIZE;
+	}
+	if ((parent->fFlags & FLAG_AUTO_RECEIVE_BUFFER_SIZE) == 0) {
+		fReceiveQueue.SetMaxBytes(socket->receive.buffer_size);
+		fFlags &= ~FLAG_AUTO_RECEIVE_BUFFER_SIZE;
+	}
+}
+
+
 void
 TCPEndpoint::_UpdateReceiveBuffer()
 {
@@ -2365,11 +2388,14 @@ TCPEndpoint::_UpdateReceiveBuffer()
 	if (newWindowSize > (fReceiveQueue.Size() * 2))
 		newWindowSize = fReceiveQueue.Size() * 2;
 
-	// Round to the window shift and max segment size.
-	uint32 newWindowShifted = newWindowSize >> fReceiveWindowShift;
-	const uint32 maxSegmentShifted = fReceiveMaxSegmentSize >> fReceiveWindowShift;
-	newWindowShifted = (newWindowShifted / maxSegmentShifted) * maxSegmentShifted;
-	newWindowSize = newWindowShifted << fReceiveWindowShift;
+	// Round down to whole segments, then to what the window shift can
+	// express. In bytes: the segment size used to be shifted first, and one
+	// below 1 << shift (a small MTU, or the large shift a large SO_RCVBUF
+	// gives) became 0, a kernel divide error (airos-works/haiku#173).
+	if (fReceiveMaxSegmentSize > 0)
+		newWindowSize -= newWindowSize % fReceiveMaxSegmentSize;
+	newWindowSize = (newWindowSize >> fReceiveWindowShift)
+		<< fReceiveWindowShift;
 
 	if (newWindowSize > maxWindowSize)
 		newWindowSize = maxWindowSize;
@@ -2542,6 +2568,7 @@ TCPEndpoint::_Spawn(TCPEndpoint* parent, tcp_segment_header& segment,
 		T(Error(this, "binding failed", __LINE__));
 		goto abort;
 	}
+	_InheritBufferSizes(parent);
 	if (_PrepareSendPath(buffer->source) != B_OK) {
 		T(Error(this, "prepare send failed", __LINE__));
 		goto abort;
@@ -2613,6 +2640,7 @@ TCPEndpoint::_SpawnFromCookie(TCPEndpoint* parent, tcp_segment_header& segment,
 
 	if (fManager->BindChild(this, buffer->destination) != B_OK)
 		goto abort;
+	_InheritBufferSizes(parent);
 	if (_PrepareSendPath(buffer->source) != B_OK)
 		goto abort;
 
@@ -3881,6 +3909,7 @@ TCPEndpoint::_SendQueued(bool force)
 
 		sendWindow -= buffer->size;
 
+		const tcp_sequence previousSendNext = fSendNext;
 		status = _PrepareAndSend(segment, buffer, retransmit);
 		if (status != B_OK) {
 			// Sending failed locally (no route, interface down, no buffers).
@@ -3894,7 +3923,11 @@ TCPEndpoint::_SendQueued(bool force)
 			return status;
 		}
 
-		if (shouldStartRetransmitTimer) {
+		if (shouldStartRetransmitTimer && fSendNext != previousSendNext) {
+			// Only for what takes sequence space: there is nothing to
+			// send again of an empty segment, and when the timer ran out
+			// for one, with nothing in flight, that counted as a loss
+			// all the same (airos-works/haiku#173).
 			TRACE("starting initial retransmit timer of: %" B_PRIdBIGTIME,
 				fRetransmitTimeout);
 			gStackModule->set_timer(&fRetransmitTimer, fRetransmitTimeout);
@@ -4748,7 +4781,21 @@ TCPEndpoint::_PersistTimer(net_timer* timer, void* _endpoint)
 	if (endpoint->State() == CLOSED)
 		return;
 
-	endpoint->_SendQueued(true);
+	if (endpoint->fSendWindow == 0) {
+		// The peer closed its window: nothing can be sent, so ask for the
+		// window. The probe used to be the empty segment _SendQueued() is
+		// left with, at SND.NXT, which is what the peer expects and so
+		// draws no answer: a lost window update was never repaired. With
+		// everything acknowledged that segment also started the retransmit
+		// timer, and its expiry was taken for a loss, each time: the
+		// timeout doubled, the congestion window fell to one segment, and
+		// the back off below never ran (airos-works/haiku#173).
+		if (endpoint->fSendQueue.Available(endpoint->fSendNext) > 0)
+			endpoint->_SendKeepAlive();
+	} else {
+		// what was held back for a full segment's worth goes out now
+		endpoint->_SendQueued(true);
+	}
 
 	// Keep probing, backing off, while the window stays closed and data
 	// waits: a lost window update used to stall the connection after the

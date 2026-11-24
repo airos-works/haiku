@@ -1,5 +1,9 @@
 SubDir HAIKU_TOP src tests system network ;
 
+SubDirSysHdrs $(HAIKU_TOP) headers compatibility bsd ;
+	# getifaddrs()
+UsePrivateHeaders net ;
+
 SimpleTest firefox_crash : firefox_crash.cpp : $(TARGET_NETWORK_LIBS) ;
 
 SimpleTest udp_client : udp_client.c : $(TARGET_NETWORK_LIBS) ;
@@ -28,6 +32,12 @@ SimpleTest tcp_connection_test : tcp_connection_test.cpp
 	: $(TARGET_NETWORK_LIBS) ;
 
 SimpleTest tcp_reset_send_test : tcp_reset_send_test.cpp
+	: $(TARGET_NETWORK_LIBS) ;
+
+SimpleTest tcp_listen_rcvbuf_test : tcp_listen_rcvbuf_test.cpp
+	: $(TARGET_NETWORK_LIBS) ;
+
+SimpleTest tcp_zero_window_test : tcp_zero_window_test.cpp
 	: $(TARGET_NETWORK_LIBS) ;
 
 SimpleTest test4 : test4.c

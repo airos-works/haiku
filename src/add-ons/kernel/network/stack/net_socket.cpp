@@ -46,6 +46,17 @@
 #endif
 
 
+/*!	The largest SO_SNDBUF or SO_RCVBUF: a larger request is cut down to it
+	(and SO_SNDBUF/SO_RCVBUF report what the socket got), as Linux does at
+	its wmem_max/rmem_max. As much as TCP's window grows to by itself with
+	the default window shift. Without a limit, a socket could ask for
+	gigabytes: socket_send() gathers up to the send buffer size before the
+	protocol sees the data, and the queues are kernel memory
+	(airos-works/haiku#173).
+*/
+static const uint32 kMaxSocketBufferSize = 16 * 1024 * 1024;
+
+
 struct net_socket_private;
 typedef DoublyLinkedList<net_socket_private> SocketList;
 
@@ -1559,14 +1570,16 @@ socket_set_option(net_socket* socket, int level, int option, const void* value,
 			if (length != sizeof(uint32))
 				return B_BAD_VALUE;
 
-			socket->send.buffer_size = *(const uint32*)value;
+			socket->send.buffer_size = min_c(*(const uint32*)value,
+				kMaxSocketBufferSize);
 			return B_OK;
 
 		case SO_RCVBUF:
 			if (length != sizeof(uint32))
 				return B_BAD_VALUE;
 
-			socket->receive.buffer_size = *(const uint32*)value;
+			socket->receive.buffer_size = min_c(*(const uint32*)value,
+				kMaxSocketBufferSize);
 			return B_OK;
 
 		case SO_SNDLOWAT:

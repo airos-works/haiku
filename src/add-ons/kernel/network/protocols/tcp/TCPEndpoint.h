@@ -119,6 +119,7 @@ private:
 			int32		_ChallengeAcknowledge();
 			void		_UpdateTimestamps(tcp_segment_header& segment,
 							size_t segmentLength);
+			void		_InheritBufferSizes(TCPEndpoint* parent);
 			void		_UpdateReceiveBuffer();
 			void		_UpdateSendBuffer();
 			void		_MarkEstablished();
