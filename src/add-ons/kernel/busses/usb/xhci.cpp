@@ -2329,7 +2329,8 @@ XHCI::CheckDebugTransfer(Transfer* transfer)
 
 		if (status == B_OK && directionIn && !_DirectPhysical(transfer)) {
 			ReadDescriptor(td, transfer->Vector(), transfer->VectorCount(),
-				transfer->IsPhysical(), transfer->IsochronousData());
+				transfer->IsPhysical(), transfer->IsochronousData(),
+				transfer->FragmentLength());
 		}
 
 		FreeDescriptor(td);
@@ -2817,11 +2818,18 @@ XHCI::FreeDescriptor(xhci_td* descriptor)
 	each buffer to the largest packet put the start of the next packet into
 	a shorter one, and the data of a stream of 44 and 45 sample packets
 	went out of step.)
+	Out of the buffers only what was received is copied: the first
+	\a received bytes, or of each isochronous packet its actual length (the
+	rest of a packet's place in the vectors is left as it is). A receive
+	buffer is as large as the most that may come, 64 KiB for a network
+	adapter, and what comes is usually far less; and where the buffers are
+	not cached (arm64, B_UNCACHED_MEMORY) reading them is slow.
 */
 static size_t
 copy_descriptor_data(xhci_td* descriptor, generic_io_vec* vector,
 	size_t vectorCount, bool physical,
-	const usb_isochronous_data* isochronous, bool toBuffers)
+	const usb_isochronous_data* isochronous, bool toBuffers,
+	size_t received = SIZE_MAX)
 {
 	size_t bufferCount = descriptor->buffer_count;
 	if (isochronous != NULL)
@@ -2835,6 +2843,16 @@ copy_descriptor_data(xhci_td* descriptor, generic_io_vec* vector,
 			(size_t)isochronous->packet_descriptors[index].request_length);
 	};
 
+	// how much of buffer index holds data
+	auto bufferFilled = [&](size_t index) -> size_t {
+		if (toBuffers)
+			return SIZE_MAX;
+		if (isochronous == NULL)
+			return received > index * descriptor->buffer_size
+				? received - index * descriptor->buffer_size : 0;
+		return isochronous->packet_descriptors[index].actual_length;
+	};
+
 	size_t copied = 0;
 	size_t bufIdx = 0, bufUsed = 0;
 	for (size_t vecIdx = 0; vecIdx < vectorCount; vecIdx++) {
@@ -2842,7 +2860,17 @@ copy_descriptor_data(xhci_td* descriptor, generic_io_vec* vector,
 
 		while (length > 0 && bufIdx < bufferCount) {
 			size_t bufSize = bufferSize(bufIdx);
-			size_t toCopy = min_c(length, bufSize - bufUsed);
+			size_t filled = bufferFilled(bufIdx);
+			if (isochronous == NULL && filled == 0) {
+				// nothing was received from here on
+				return copied;
+			}
+
+			// The place in the vectors moves on by the buffer's size, what
+			// is copied may be less.
+			size_t toSkip = min_c(length, bufSize - bufUsed);
+			size_t toCopy = filled > bufUsed
+				? min_c(toSkip, filled - bufUsed) : 0;
 			if (toCopy > 0) {
 				generic_addr_t buffer
 					= (generic_addr_t)descriptor->buffers[bufIdx] + bufUsed;
@@ -2855,8 +2883,8 @@ copy_descriptor_data(xhci_td* descriptor, generic_io_vec* vector,
 			}
 
 			copied += toCopy;
-			bufUsed += toCopy;
-			length -= toCopy;
+			bufUsed += toSkip;
+			length -= toSkip;
 			if (bufUsed == bufSize) {
 				bufIdx++;
 				bufUsed = 0;
@@ -2882,10 +2910,10 @@ XHCI::WriteDescriptor(xhci_td *descriptor, generic_io_vec *vector, size_t vector
 
 size_t
 XHCI::ReadDescriptor(xhci_td *descriptor, generic_io_vec *vector, size_t vectorCount, bool physical,
-	const usb_isochronous_data* isochronous)
+	const usb_isochronous_data* isochronous, size_t received)
 {
 	size_t read = copy_descriptor_data(descriptor, vector, vectorCount,
-		physical, isochronous, false);
+		physical, isochronous, false, received);
 
 	TRACE("read descriptor (%" B_PRIuSIZE " bytes)\n", read);
 	return read;
@@ -4778,7 +4806,8 @@ XHCI::FinishTransfers()
 				if (status == B_OK) {
 					ReadDescriptor(td, transfer->Vector(),
 						transfer->VectorCount(), transfer->IsPhysical(),
-						transfer->IsochronousData());
+						transfer->IsochronousData(),
+						min_c(actualLength, transfer->FragmentLength()));
 				} else {
 					callbackStatus = status;
 				}

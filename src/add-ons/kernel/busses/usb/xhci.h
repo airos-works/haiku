@@ -244,7 +244,8 @@ private:
 									const usb_isochronous_data* isochronous = NULL);
 			size_t				ReadDescriptor(xhci_td *descriptor,
 									generic_io_vec *vector, size_t vectorCount, bool physical,
-									const usb_isochronous_data* isochronous = NULL);
+									const usb_isochronous_data* isochronous,
+									size_t received);
 
 			status_t			_LinkDescriptorForPipe(xhci_td *descriptor,
 									xhci_endpoint *endpoint);
