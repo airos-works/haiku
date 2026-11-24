@@ -834,12 +834,12 @@ report_invalid_block(block_cache* cache, const char* function, off_t blockNumber
 		int32 dropped = atomic_get_and_set(&sReports, 0) - kReportsPerSecond;
 		sWindowStart = now;
 		if (dropped > 0)
-			dprintf("block cache: %" B_PRId32 " more invalid block numbers\n", dropped);
+			TRACE_ALWAYS("block cache: %" B_PRId32 " more invalid block numbers\n", dropped);
 	}
 	if (atomic_add(&sReports, 1) >= kReportsPerSecond)
 		return;
 
-	dprintf("block cache: %s: invalid block number %" B_PRIdOFF " (max %" B_PRIdOFF
+	TRACE_ALWAYS("block cache: %s: invalid block number %" B_PRIdOFF " (max %" B_PRIdOFF
 		") on fd %d, damaged volume?\n", function, blockNumber, cache->max_blocks - 1,
 		cache->fd);
 }
