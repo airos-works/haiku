@@ -46,6 +46,11 @@ public:
 	virtual	status_t			Control(uint32 *cookie, uint32 op, void *buffer,
 									size_t length);
 
+	// The device was reset (or was without power) while handlers have it
+	// open: whatever a handler set up in it when it was opened is gone and
+	// has to be set up again. Called by the transport, from its own thread.
+	virtual	void				DeviceWasReset();
+
 			int32				RingBufferReadable();
 			status_t			RingBufferRead(void *buffer, size_t length);
 			status_t			RingBufferWrite(const void *buffer,

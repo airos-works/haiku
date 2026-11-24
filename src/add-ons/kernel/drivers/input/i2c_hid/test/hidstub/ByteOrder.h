@@ -1,0 +1,5 @@
+#ifndef _TEST_HID_BYTE_ORDER_H
+#define _TEST_HID_BYTE_ORDER_H
+#define B_HOST_IS_LENDIAN 1
+#define B_HOST_IS_BENDIAN 0
+#endif

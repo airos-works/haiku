@@ -167,6 +167,13 @@ ProtocolHandler::Control(uint32 *cookie, uint32 op, void *buffer, size_t length)
 }
 
 
+void
+ProtocolHandler::DeviceWasReset()
+{
+	// most handlers keep nothing in the device
+}
+
+
 int32
 ProtocolHandler::RingBufferReadable()
 {

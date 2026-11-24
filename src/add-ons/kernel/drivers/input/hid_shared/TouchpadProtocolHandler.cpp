@@ -20,6 +20,7 @@
 #include <usb/USB_hid.h>
 
 #include <kernel.h>
+#include <util/AutoLock.h>
 
 
 // Device configuration values (Windows Precision Touchpad).
@@ -38,6 +39,7 @@ TouchpadProtocolHandler::TouchpadProtocolHandler(HIDReport& report,
 		0),
 	fReport(report),
 	fCollection(collection),
+	fOpenCount(0),
 	fContactSlots(0),
 	fContactCount(NULL),
 	fButtonCount(0),
@@ -49,6 +51,7 @@ TouchpadProtocolHandler::TouchpadProtocolHandler(HIDReport& report,
 	fFrameExpected(0),
 	fFrameButtons(0)
 {
+	mutex_init(&fConfigureLock, "hid touchpad configuration");
 	memset(fContacts, 0, sizeof(fContacts));
 	memset(fButtons, 0, sizeof(fButtons));
 
@@ -127,6 +130,12 @@ TouchpadProtocolHandler::TouchpadProtocolHandler(HIDReport& report,
 }
 
 
+TouchpadProtocolHandler::~TouchpadProtocolHandler()
+{
+	mutex_destroy(&fConfigureLock);
+}
+
+
 /*!	Returns whether it added a handler for the collection, which then needs
 	no other (as an absolute tablet, say).
 */
@@ -185,17 +194,57 @@ TouchpadProtocolHandler::Open(uint32 flags, uint32* cookie)
 	if (status != B_OK)
 		return status;
 
-	// Report contacts rather than act as a mouse, with the surface and the
-	// buttons both reporting.
-	status = _SetFeature(B_HID_UID_DIG_DEVICE_MODE, kInputModeTouchpad);
+	atomic_add(&fOpenCount, 1);
+	status = _Configure();
 	if (status != B_OK) {
 		TRACE_ALWAYS("touchpad: cannot switch to reporting contacts: %s\n",
 			strerror(status));
 	}
-	_SetFeature(B_HID_UID_DIG_SURFACE_SWITCH, 1);
 
 	fFrameExpected = 0;
 	return B_OK;
+}
+
+
+status_t
+TouchpadProtocolHandler::Close(uint32* cookie)
+{
+	atomic_add(&fOpenCount, -1);
+	return ProtocolHandler::Close(cookie);
+}
+
+
+/*!	A reset puts the touchpad back into its default mode, in which it acts
+	as a mouse: while somebody has it open, switch it to reporting contacts
+	again (whoever has it open stays, as over a sleep, and would otherwise
+	wait for contact reports that no longer come).
+*/
+void
+TouchpadProtocolHandler::DeviceWasReset()
+{
+	if (atomic_get(&fOpenCount) <= 0)
+		return;
+
+	status_t status = _Configure();
+	if (status != B_OK) {
+		TRACE_ALWAYS("touchpad: cannot switch back to reporting contacts: "
+			"%s\n", strerror(status));
+	}
+}
+
+
+/*!	Report contacts rather than act as a mouse, with the surface and the
+	buttons both reporting.
+*/
+status_t
+TouchpadProtocolHandler::_Configure()
+{
+	// (a feature report is filled in and sent in several steps)
+	MutexLocker locker(fConfigureLock);
+	status_t status = _SetFeature(B_HID_UID_DIG_DEVICE_MODE,
+		kInputModeTouchpad);
+	_SetFeature(B_HID_UID_DIG_SURFACE_SWITCH, 1);
+	return status;
 }
 
 

@@ -35,6 +35,8 @@ public:
 			int32				OpenCount() const { return fOpenCount; }
 
 			void				Removed();
+			void				Suspending(bool losesPower);
+				// the system is about to sleep
 			bool				IsRemoved() const { return fRemoved; }
 
 			status_t			MaybeScheduleTransfer(HIDReport *report);
@@ -101,6 +103,9 @@ private:
 			bool				fPollPinState;
 			uint32				fResumeCount;
 				// device_manager_resumes_finished() the device was set up for
+			bool				fKeptPower;
+				// the sleep the system is in (or just left) left the device
+				// its power (suspend to idle)
 			mutex				fLock;
 			ConditionVariable	fOpenCondition;
 			ReportQueue*		fQueues;

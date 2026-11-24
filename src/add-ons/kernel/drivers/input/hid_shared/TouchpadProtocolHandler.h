@@ -7,6 +7,7 @@
 
 
 #include <keyboard_mouse_driver.h>
+#include <lock.h>
 
 #include "ProtocolHandler.h"
 
@@ -26,12 +27,15 @@ class TouchpadProtocolHandler : public ProtocolHandler {
 public:
 								TouchpadProtocolHandler(HIDReport& report,
 									HIDCollection& collection);
+	virtual						~TouchpadProtocolHandler();
 
 	static	bool				AddHandlers(HIDDevice& device,
 									HIDCollection& collection,
 									ProtocolHandler*& handlerList);
 
 	virtual	status_t			Open(uint32 flags, uint32* cookie);
+	virtual	status_t			Close(uint32* cookie);
+	virtual	void				DeviceWasReset();
 	virtual	status_t			Control(uint32* cookie, uint32 op,
 									void* buffer, size_t length);
 
@@ -51,12 +55,16 @@ private:
 				uint32			y;
 			};
 
+			status_t			_Configure();
 			status_t			_SetFeature(uint16 usageID, uint32 value);
 			status_t			_ReadReport(touchpad_movement* movement,
 									bigtime_t timeout, uint32* cookie);
 
 			HIDReport&			fReport;
 			HIDCollection&		fCollection;
+			int32				fOpenCount;
+			mutex				fConfigureLock;
+				// an open and the transport's thread may both configure
 
 			Contact				fContacts[kMaxContacts];
 			uint32				fContactSlots;

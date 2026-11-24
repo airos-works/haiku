@@ -75,6 +75,7 @@ HIDDevice::HIDDevice(uint16 descriptorAddress, i2c_device_interface* i2c,
 		fInterrupt(interrupt),
 		fPollPinState(interrupt != NULL && !interrupt->CanInterrupt()),
 		fResumeCount(device_manager_resumes_finished()),
+		fKeptPower(false),
 		fQueues(NULL),
 		fQueueCount(0),
 		fMaxReportSize(0),
@@ -328,6 +329,13 @@ HIDDevice::Removed()
 }
 
 
+void
+HIDDevice::Suspending(bool losesPower)
+{
+	fKeptPower = !losesPower;
+}
+
+
 status_t
 HIDDevice::MaybeScheduleTransfer(HIDReport *report)
 {
@@ -413,13 +421,30 @@ HIDDevice::_Reader()
 		if (resumeCount != fResumeCount) {
 			// After a suspend to RAM the device was without power and its
 			// interrupt pin lost its configuration (Linux' i2c_hid_resume()
-			// resets the device too).
+			// resets the device too). A sleep in S0 leaves the device its
+			// power and what it was set up to do: no reset then, which
+			// would only throw that away. (Not told which sleep it was, as
+			// with the device tree left out of the suspend: reset.)
 			fResumeCount = resumeCount;
+			bool keptPower = fKeptPower;
+			fKeptPower = false;
 			TRACE_ALWAYS("%04x:%04x: the system resumed, setting the device "
-				"up again\n", fDescriptor.wVendorID, fDescriptor.wProductID);
+				"up again%s\n", fDescriptor.wVendorID, fDescriptor.wProductID,
+				keptPower ? " (it kept its power: no reset)" : "");
 			if (fInterrupt != NULL)
 				fInterrupt->Configure();
-			_Reset();
+			if (!keptPower)
+				_Reset();
+
+			// The reset put the device into its default mode (a precision
+			// touchpad's is to act as a mouse), and what has it open stays
+			// open across the sleep: the handlers set it up again, as Linux
+			// does after every resume (hid-multitouch's mt_resume()).
+			for (ProtocolHandler* handler = fProtocolHandlerList;
+					handler != NULL; handler = handler->NextHandler()) {
+				handler->DeviceWasReset();
+			}
+
 			missedInterrupts = 0;
 			errors = 0;
 		}

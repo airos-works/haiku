@@ -504,6 +504,20 @@ i2c_hid_register_child_devices(void *cookie)
 }
 
 
+/*!	Tells the device what kind of sleep it goes into: only a suspend to RAM
+	takes its power, and with it what it was set up to do. (The device is
+	set up again by its reader thread, once the whole resume is through.)
+*/
+static status_t
+i2c_hid_suspend(void *driverCookie, int32 state)
+{
+	hid_driver_cookie *device = (hid_driver_cookie*)driverCookie;
+	if (device != NULL && device->hidDevice != NULL)
+		device->hidDevice->Suspending(state != ACPI_POWER_STATE_ON);
+	return B_OK;
+}
+
+
 static status_t
 std_ops(int32 op, ...)
 {
@@ -547,7 +561,7 @@ driver_module_info i2c_hid_driver_module = {
 	.register_child_devices = i2c_hid_register_child_devices,
 	.rescan_child_devices = NULL,
 	.device_removed = NULL,
-	.suspend = NULL,
+	.suspend = i2c_hid_suspend,
 	.resume = NULL,
 };
 
