@@ -29,6 +29,9 @@ static pci_module_info* sPCIModule = NULL;
 
 #if defined(NVME_HAIKU_NONCOHERENT_DMA)
 static int32 sForceHighDMA = 0;
+static int32 sDirectDMA = 0;
+static size_t sDirectAlignment = 2048;
+static uint64 sDMALimit = ~(uint64)0;
 #endif
 
 
@@ -44,11 +47,35 @@ nvme_mem_init()
 	void* settings = load_driver_settings("nvme_disk");
 	bool forceHighDMA = settings != NULL && get_driver_boolean_parameter(
 		settings, "force_high_dma", false, false);
-	if (settings != NULL)
+	// Off by default until it has run on the ROCK 5 (not coherent) and the
+	// Dragon (coherent): a wrong cache maintenance corrupts data (#181).
+	bool directDMA = settings != NULL && get_driver_boolean_parameter(
+		settings, "direct_dma", false, true);
+	uint64 limit = 0;
+	if (settings != NULL) {
+		const char* value = get_driver_parameter(settings, "dma_limit", NULL,
+			NULL);
+		if (value != NULL)
+			limit = strtoull(value, NULL, 0);
 		unload_driver_settings(settings);
+	}
 	atomic_set(&sForceHighDMA, forceHighDMA ? 1 : 0);
 	if (forceHighDMA)
 		nvme_notice("ARM64 lab DMA floor: 0x100000000 (4 GiB)\n");
+
+	// The cache writeback granule (CTR_EL0.CWG; when it is not given, the
+	// architecture's largest, 2 KiB)
+	uint64 ctr;
+	asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+	uint32 granule = (ctr >> 24) & 0xf;
+	sDirectAlignment = granule != 0 ? 4 << granule : 2048;
+	sDMALimit = limit != 0 ? limit : ~(uint64)0;
+	atomic_set(&sDirectDMA, directDMA ? 1 : 0);
+	if (directDMA) {
+		nvme_notice("ARM64 direct DMA: the caller's pages, aligned to %zu "
+			"bytes, with cache maintenance; DMA limit %#" B_PRIx64 "\n",
+			sDirectAlignment, sDMALimit);
+	}
 #endif
 	return 0;
 }
@@ -76,6 +103,8 @@ nvme_mem_alloc_node(size_t size, size_t align, unsigned int node_id,
 #if defined(NVME_HAIKU_NONCOHERENT_DMA)
 	if (atomic_get(&sForceHighDMA) != 0)
 		physicalRestrictions.low_address = UINT64_C(0x100000000);
+	if (sDMALimit != ~(uint64)0)
+		physicalRestrictions.high_address = sDMALimit;
 #endif
 
 	void* address;
@@ -164,6 +193,124 @@ nvme_dma_clean_alias(uint64_t physical, size_t size)
 
 
 #if defined(NVME_HAIKU_NONCOHERENT_DMA)
+int
+nvme_dma_direct(void)
+{
+	return atomic_get(&sDirectDMA);
+}
+
+
+size_t
+nvme_dma_alignment(void)
+{
+	return nvme_dma_direct() ? sDirectAlignment : 4;
+}
+
+
+uint64_t
+nvme_dma_limit(void)
+{
+	return sDMALimit;
+}
+
+
+/*!	Calls \a function for each physically contiguous piece of the request's
+	payload. Returns the first error \a function or the payload returned.
+*/
+template<typename Function>
+static int
+for_each_payload_range(const nvme_request* request, Function function)
+{
+	if (request->payload_size == 0)
+		return B_OK;
+
+	if (request->payload.type == NVME_PAYLOAD_TYPE_CONTIG) {
+		addr_t address = (addr_t)request->payload.u.contig;
+		if (address == 0 || address > UINTPTR_MAX - request->payload_offset)
+			return B_BAD_ADDRESS;
+		address += request->payload_offset;
+		size_t done = 0;
+		while (done < request->payload_size) {
+			physical_entry entry;
+			uint32 count = 1;
+			status_t status = get_memory_map_etc(B_SYSTEM_TEAM,
+				(void*)(address + done), request->payload_size - done,
+				&entry, &count);
+			if (status != B_OK && status != B_BUFFER_OVERFLOW)
+				return status;
+			if (count != 1 || entry.size == 0)
+				return B_BAD_ADDRESS;
+			size_t length = min_c(entry.size, request->payload_size - done);
+			status = function(entry.address, length);
+			if (status != B_OK)
+				return status;
+			done += length;
+		}
+		return B_OK;
+	}
+
+	if (request->payload.type != NVME_PAYLOAD_TYPE_SGL
+		|| request->payload.u.sgl.reset_sgl_fn == NULL
+		|| request->payload.u.sgl.next_sge_fn == NULL)
+		return B_BAD_VALUE;
+
+	request->payload.u.sgl.reset_sgl_fn(request->payload.u.sgl.cb_arg,
+		request->payload_offset);
+	size_t done = 0;
+	while (done < request->payload_size) {
+		uint64 physicalAddress;
+		uint32 length;
+		if (request->payload.u.sgl.next_sge_fn(request->payload.u.sgl.cb_arg,
+				&physicalAddress, &length) != 0 || length == 0)
+			return B_BAD_VALUE;
+		length = min_c(length, request->payload_size - done);
+		if (physicalAddress > UINT64_MAX - (length - 1))
+			return B_BAD_ADDRESS;
+		status_t status = function(physicalAddress, length);
+		if (status != B_OK)
+			return status;
+		done += length;
+	}
+	return B_OK;
+}
+
+
+int
+nvme_dma_map_payload(const nvme_request* request)
+{
+	const bool toHost = (nvme_opc_get_data_transfer(request->cmd.opc)
+		& NVME_DATA_CONTROLLER_TO_HOST) != 0;
+	const uint64 mask = sDirectAlignment - 1;
+	return for_each_payload_range(request,
+		[toHost, mask](uint64 address, size_t length) -> status_t {
+			// A line the controller writes must hold nothing else: the CPU
+			// could write the rest of it during the transfer, and the line's
+			// write-back would then overwrite what the controller wrote.
+			if (toHost && ((address | (address + length)) & mask) != 0)
+				return B_BAD_ADDRESS;
+			if (address + length - 1 >= sDMALimit)
+				return B_BAD_ADDRESS;
+			// What the CPU wrote goes to memory, for the controller to read;
+			// lines of a buffer the controller writes are not written back
+			// over it later.
+			nvme_dma_clean_alias(address, length);
+			return B_OK;
+		});
+}
+
+
+void
+nvme_dma_unmap_payload(const nvme_request* request)
+{
+	// (the lines are clean: invalidating them is all this does)
+	for_each_payload_range(request,
+		[](uint64 address, size_t length) -> status_t {
+			nvme_dma_clean_alias(address, length);
+			return B_OK;
+		});
+}
+
+
 int
 nvme_dma_copy_payload(const nvme_request* request, void* buffer,
 	enum nvme_dma_copy operation)

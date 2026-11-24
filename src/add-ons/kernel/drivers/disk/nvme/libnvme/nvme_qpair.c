@@ -407,7 +407,11 @@ static void nvme_qpair_complete_tracker(struct nvme_qpair *qpair,
 
 #if defined(NVME_HAIKU_NONCOHERENT_DMA)
 	struct nvme_cpl completion = *cpl;
-	if (!error && req->payload_size != 0
+	if (nvme_dma_direct()) {
+		if (req->payload_size != 0
+		    && (nvme_opc_get_data_transfer(req->cmd.opc) & NVME_DATA_CONTROLLER_TO_HOST))
+			nvme_dma_unmap_payload(req);
+	} else if (!error && req->payload_size != 0
 	    && (nvme_opc_get_data_transfer(req->cmd.opc) & NVME_DATA_CONTROLLER_TO_HOST)) {
 		if (nvme_dma_copy_payload(req, qpair->dma_buffers[tr->cid],
 				NVME_DMA_TO_HOST) != 0) {
@@ -541,6 +545,60 @@ static inline void _nvme_qpair_req_bad_phys(struct nvme_qpair *qpair,
 					   NVME_SC_INVALID_FIELD,
 					   1, true);
 }
+
+#if defined(NVME_HAIKU_NONCOHERENT_DMA)
+static int _nvme_qpair_build_contig_request(struct nvme_qpair *qpair,
+					    struct nvme_request *req,
+					    struct nvme_tracker *tr);
+static int _nvme_qpair_build_prps_sgl_request(struct nvme_qpair *qpair,
+					      struct nvme_request *req,
+					      struct nvme_tracker *tr);
+
+/*
+ * Direct DMA (the "direct_dma" setting): the controller gets the payload's
+ * own pages, as on x86, with the CPU caches cleaned and invalidated around
+ * the transfer (nvme_dma_map_payload(), nvme_dma_unmap_payload()).
+ */
+static int nvme_qpair_build_direct_request(struct nvme_qpair *qpair,
+		struct nvme_request *req, struct nvme_tracker *tr)
+{
+	int ret;
+
+	if (nvme_dma_map_payload(req) != 0) {
+		nvme_crit("qpair %u: payload of %u bytes is not cache line "
+			"aligned or not addressable for direct DMA\n", qpair->id,
+			req->payload_size);
+		nvme_qpair_manual_complete_tracker(qpair, tr, NVME_SCT_GENERIC,
+			NVME_SC_DATA_TRANSFER_ERROR, 1, true);
+		return -EINVAL;
+	}
+
+	/*
+	 * PRP lists, also where the controller takes SGLs: every controller
+	 * takes them, so the path that QEMU's controller exercises is the one
+	 * the boards' SSDs get.
+	 */
+	if (req->payload.type == NVME_PAYLOAD_TYPE_CONTIG)
+		ret = _nvme_qpair_build_contig_request(qpair, req, tr);
+	else
+		ret = _nvme_qpair_build_prps_sgl_request(qpair, req, tr);
+	if (ret != 0)
+		return ret;
+
+	/*
+	 * The PRP list is in the trackers' noncached memory: clean the
+	 * linear map's lines of it, as for the commands.
+	 */
+	if (req->cmd.dptr.prp.prp2 == tr->prp_sgl_bus_addr) {
+		size_t entries = req->payload_size / PAGE_SIZE + 2;
+		if (entries > NVME_MAX_PRP_LIST_ENTRIES)
+			entries = NVME_MAX_PRP_LIST_ENTRIES;
+		nvme_dma_clean_alias(tr->prp_sgl_bus_addr,
+			entries * sizeof(uint64_t));
+	}
+	return 0;
+}
+#endif
 
 /*
  * Build PRP list describing physically contiguous payload buffer.
@@ -918,7 +976,7 @@ int nvme_qpair_construct(struct nvme_ctrlr *ctrlr, struct nvme_qpair *qpair,
 #if defined(NVME_HAIKU_NONCOHERENT_DMA)
 	// Keep bounded DMA storage ready before submissions can hold this lock.
 	// Admin trackers also carry long-lived asynchronous event requests.
-	if (qpair->id != 0)
+	if (qpair->id != 0 && !nvme_dma_direct())
 		trackers = nvme_min(trackers, NVME_DMA_IO_TRACKERS);
 #endif
 	qpair->entries = entries;
@@ -1023,6 +1081,12 @@ int nvme_qpair_construct(struct nvme_ctrlr *ctrlr, struct nvme_qpair *qpair,
 	}
 
 #if defined(NVME_HAIKU_NONCOHERENT_DMA)
+	if (nvme_dma_direct()) {
+		nvme_log(NVME_LOG_INFO,
+			"libnvme: ARM64 direct DMA: qpair %u, %u trackers\n",
+			qpair->id, trackers);
+		goto buffers_done;
+	}
 	qpair->dma_buffers = calloc(trackers, sizeof(void *));
 	qpair->dma_bus_addresses = calloc(trackers, sizeof(phys_addr_t));
 	if (!qpair->dma_buffers || !qpair->dma_bus_addresses)
@@ -1037,6 +1101,7 @@ int nvme_qpair_construct(struct nvme_ctrlr *ctrlr, struct nvme_qpair *qpair,
 		"libnvme: ARM64 noncoherent DMA: qpair %u, %u buffers of %u bytes, first %#llx\n",
 		qpair->id, trackers, NVME_DMA_MAX_TRANSFER,
 		(unsigned long long)qpair->dma_bus_addresses[0]);
+buffers_done:
 #endif
 
 	nvme_qpair_reset(qpair);
@@ -1167,6 +1232,8 @@ int nvme_qpair_submit_request(struct nvme_qpair *qpair,
 		/* Null payload - leave PRP fields zeroed */
 		ret = 0;
 #if defined(NVME_HAIKU_NONCOHERENT_DMA)
+	} else if (nvme_dma_direct()) {
+		ret = nvme_qpair_build_direct_request(qpair, req, tr);
 	} else {
 		ret = nvme_qpair_build_dma_request(qpair, req, tr);
 #else

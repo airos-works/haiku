@@ -593,6 +593,11 @@ nvme_disk_init_device(void* _info, void** _cookie)
 		// of the block size.
 	restrictions.max_segment_count = (NVME_MAX_SGL_DESCRIPTORS / 2);
 	restrictions.max_transfer_size = cstat->max_xfer_size;
+#if defined(NVME_HAIKU_NONCOHERENT_DMA)
+	// bounce buffers the controller can address (direct DMA)
+	if (nvme_dma_limit() != ~(uint64)0)
+		restrictions.high_address = nvme_dma_limit();
+#endif
 	info->max_io_blocks = cstat->max_xfer_size / nsstat.sector_size;
 
 	err = info->dma_resource.Init(restrictions, B_PAGE_SIZE, buffers, buffers);
@@ -1758,6 +1763,23 @@ do_io(nvme_disk_handle* handle, io_request* request, bool waited)
 	const size_t block_size = handle->info->block_size;
 	bool bounceAll = (nvme_request.iovecs == NULL);
 	const char* reason = "too many physical vectors";
+#if defined(NVME_HAIKU_NONCOHERENT_DMA)
+	// ARM64 direct DMA: the ends of the memory must be cache line aligned,
+	// and memory the controller cannot address is bounced (#181).
+	const phys_addr_t alignMask = nvme_dma_alignment() - 1;
+	const uint64 dmaLimit = nvme_dma_limit();
+#else
+	const phys_addr_t alignMask = 0x3;
+	const uint64 dmaLimit = ~(uint64)0;
+#endif
+	for (int32 i = 0; !bounceAll && dmaLimit != ~(uint64)0
+			&& i < nvme_request.iovec_count; i++) {
+		if (nvme_request.iovecs[i].address + nvme_request.iovecs[i].size
+				> dmaLimit) {
+			bounceAll = true;
+			reason = "memory above the DMA limit";
+		}
+	}
 	// A single physically contiguous vector can be much larger than the
 	// controller's maximum transfer (a run of cache pages often is). The
 	// asynchronous path cuts it into pieces; the synchronous one, taken
@@ -1790,22 +1812,26 @@ do_io(nvme_disk_handle* handle, io_request* request, bool waited)
 		// respectively, though the start address must always be 32-bit-aligned.
 		physical_entry* entry = &nvme_request.iovecs[0];
 		if (!bounceAll && (((entry->address + entry->size) % B_PAGE_SIZE) != 0
-				|| (entry->address & 0x3) != 0 || (entry->size % block_size) != 0)) {
+				|| (entry->address & alignMask) != 0 || (entry->size % block_size) != 0)) {
 			bounceAll = true;
 			reason = "unaligned first vector";
 		}
 
 		entry = &nvme_request.iovecs[nvme_request.iovec_count - 1];
 		if (!bounceAll && ((entry->address % B_PAGE_SIZE) != 0
-				|| (entry->size % block_size) != 0)) {
+				|| (entry->size % block_size) != 0
+				|| ((entry->address + entry->size) & alignMask) != 0)) {
 			bounceAll = true;
 			reason = "unaligned last vector";
 		}
 	} else {
 		// There is only one vec. Check that it is a multiple of the block size,
-		// and that its address is 32-bit-aligned.
+		// and that its address is 32-bit-aligned (and its ends cache line
+		// aligned, with ARM64 direct DMA).
 		physical_entry* entry = &nvme_request.iovecs[0];
-		if (!bounceAll && ((entry->address & 0x3) != 0 || (entry->size % block_size) != 0)) {
+		if (!bounceAll && ((entry->address & alignMask) != 0
+				|| ((entry->address + entry->size) & alignMask) != 0
+				|| (entry->size % block_size) != 0)) {
 			bounceAll = true;
 			reason = "unaligned buffer";
 		}

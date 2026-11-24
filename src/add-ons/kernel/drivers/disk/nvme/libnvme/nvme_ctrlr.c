@@ -1212,7 +1212,8 @@ nvme_ctrlr_attach(struct pci_device *pci_dev,
 	/* Set default transfer size */
 	ctrlr->max_xfer_size = NVME_MAX_XFER_SIZE;
 #if defined(NVME_HAIKU_NONCOHERENT_DMA)
-	ctrlr->max_xfer_size = nvme_min(ctrlr->max_xfer_size, NVME_DMA_MAX_TRANSFER);
+	if (!nvme_dma_direct())
+		ctrlr->max_xfer_size = nvme_min(ctrlr->max_xfer_size, NVME_DMA_MAX_TRANSFER);
 #endif
 
 	/* Create the admin queue pair */
