@@ -23,5 +23,7 @@ SimpleTest transfer_area_test : transfer_area_test.cpp ;
 SimpleTest set_area_protection_test1 : set_area_protection_test1.cpp ;
 SimpleTest mprotect_shared_test : mprotect_shared_test.cpp ;
 
+SimpleTest read_error_fault_test : read_error_fault_test.cpp ;
+
 UsePrivateHeaders drivers ;
 SimpleTest device_area_fork_test : device_area_fork_test.cpp ;

@@ -4145,7 +4145,8 @@ fault_read_pages(PageFaultContext& context, VMCache* cache)
 	vm_page_reservation aroundReservation;
 	aroundReservation.count = 0;
 
-	if (cache->type == CACHE_TYPE_VNODE && fault_around_allowed()) {
+	if (cache->type == CACHE_TYPE_VNODE && !cache->read_around_failed
+		&& fault_around_allowed()) {
 		uint32 windowPages = kFaultAroundPages;
 		if (faultOffset == cache->read_around_next
 			&& cache->read_around_pages >= kFaultAroundPages) {
@@ -4245,13 +4246,29 @@ fault_read_pages(PageFaultContext& context, VMCache* cache)
 		}
 	}
 
+	// The fault needs its own page only. When the pages could not all be
+	// read (a bad block under a neighbour, a request a network share does not
+	// serve), read that page alone before giving up: without the read-around
+	// the fault would have succeeded.
+	const uint32 faultIndex = (faultOffset - start) / B_PAGE_SIZE;
+	const status_t aroundStatus = status;
+	if (status < B_OK && pageCount > 1) {
+		generic_io_vec vec;
+		vec.base = (phys_addr_t)pages[faultIndex]->physical_page_number
+			* B_PAGE_SIZE;
+		vec.length = B_PAGE_SIZE;
+		generic_size_t bytesRead = B_PAGE_SIZE;
+		status = cache->Read(faultOffset, &vec, 1, B_PHYSICAL_IO_REQUEST,
+			&bytesRead);
+	}
+
 	cache->Lock();
 
 	for (uint32 i = 0; i < pageCount; i++) {
 		vm_page* page = pages[i];
 		DEBUG_PAGE_ACCESS_START(page);
 
-		if (status < B_OK) {
+		if ((i == faultIndex ? status : aroundStatus) < B_OK) {
 			// on error remove and free the pages
 			cache->NotifyPageEvents(page, PAGE_EVENT_NOT_BUSY);
 			cache->RemovePage(page);
@@ -4263,7 +4280,16 @@ fault_read_pages(PageFaultContext& context, VMCache* cache)
 		}
 	}
 
-	if (status < B_OK) {
+	if (aroundStatus < B_OK && pageCount > 1) {
+		// Every further fault in this window would first wait for the same
+		// request to fail again (a drive takes seconds over a bad block):
+		// this cache reads single pages from now on.
+		cache->read_around_failed = true;
+		dprintf("reading %" B_PRIu32 " pages at %" B_PRIdOFF " from cache %p "
+			"returned: %s; the faulting page alone (at %" B_PRIdOFF "): %s\n",
+			pageCount, start, cache, strerror(aroundStatus), faultOffset,
+			strerror(status < B_OK ? status : B_OK));
+	} else if (status < B_OK) {
 		dprintf("reading page from cache %p returned: %s!\n",
 			cache, strerror(status));
 	}
