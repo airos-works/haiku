@@ -39,6 +39,8 @@
 
 #include <MediaDebug.h>
 #include <MediaMisc.h>
+#include <MessengerPrivate.h>
+#include <system_info.h>
 
 #include "BufferManager.h"
 #include "media_server.h"
@@ -84,6 +86,12 @@ AppManager::RegisterTeam(team_id team, const BMessenger& messenger)
 		return B_NO_MEMORY;
 	}
 
+	// The registrar tells of applications that are gone (B_SOME_APP_QUIT),
+	// but a program needs no BApplication to play or record sound, and such
+	// a team's nodes and connections stayed for good when it died: have the
+	// kernel tell the server of this team's end (B_SYSTEM_OBJECT_UPDATE).
+	_WatchTeam(team, true);
+
 	return B_OK;
 }
 
@@ -96,6 +104,9 @@ AppManager::UnregisterTeam(team_id team)
 	Lock();
 	bool isRemoved = fMap.erase(team) != 0;
 	Unlock();
+
+	if (isRemoved)
+		_WatchTeam(team, false);
 
 	_CleanupTeam(team);
 
@@ -158,6 +169,24 @@ AppManager::NotifyRosters()
 	AppMap::iterator iterator = fMap.begin();
 	for (; iterator != fMap.end(); iterator++)
 		iterator->second.SendMessage(MEDIA_SERVER_ALIVE);
+}
+
+
+void
+AppManager::_WatchTeam(team_id team, bool watch)
+{
+	BMessenger target(be_app);
+	BMessenger::Private messengerPrivate(target);
+	port_id port = messengerPrivate.Port();
+	int32 token = messengerPrivate.Token();
+
+	if (watch) {
+		__start_watching_system(team, B_WATCH_SYSTEM_TEAM_DELETION, port,
+			token);
+	} else {
+		__stop_watching_system(team, B_WATCH_SYSTEM_TEAM_DELETION, port,
+			token);
+	}
 }
 
 

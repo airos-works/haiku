@@ -32,6 +32,7 @@ public:
 
 private:
 			void				_CleanupTeam(team_id team);
+			void				_WatchTeam(team_id team, bool watch);
 
 private:
 			typedef std::map<team_id, BMessenger> AppMap;

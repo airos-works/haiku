@@ -41,6 +41,16 @@ struct registered_node {
 	OutputList				output_list;
 };
 
+// A connection whose other end was a node of a team that is gone.
+struct broken_connection {
+	media_node				peer;	// the node that is still there
+	bool					peer_is_consumer;
+	media_source			source;
+	media_destination		destination;
+};
+
+typedef std::vector<broken_connection> BrokenConnectionList;
+
 struct dormant_add_on_flavor_info {
 	media_addon_id			add_on_id;
 	int32					flavor_id;
@@ -157,6 +167,7 @@ private:
 			status_t			_AcquireNodeReference(media_node_id id,
 									team_id team);
 			void				_NotifyTimeSource(registered_node& node);
+			void				_DisconnectPeers(team_id team);
 
 private:
 			typedef std::map<media_addon_id, registered_node> NodeMap;

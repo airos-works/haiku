@@ -16,6 +16,11 @@ SimpleTest mixer_monitor_test :
 	mixer_monitor_test.cpp
 	: media be ;
 
+# what a killed player or recorder leaves behind (#164)
+SimpleTest media_dead_team_test :
+	media_dead_team_test.cpp
+	: media be ;
+
 SimpleTest VideoDecoder :
 	VideoDecoder.cpp
 	: media be ;

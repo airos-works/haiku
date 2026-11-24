@@ -46,6 +46,7 @@ char __dont_remove_copyright_from_binary[] = "Copyright (c) 2002, 2003 "
 #include <Server.h>
 
 #include <syscalls.h>
+#include <system_info.h>
 
 #include "AppManager.h"
 #include "BufferManager.h"
@@ -972,6 +973,19 @@ ServerApp::MessageReceived(BMessage* msg)
 			_NotifyDefaultChanged(VIDEO_OUTPUT);
 			_NotifyDefaultChanged(VIDEO_INPUT);
 			break;
+
+		case B_SYSTEM_OBJECT_UPDATE:
+		{
+			// A team the AppManager watches is gone. For an application the
+			// registrar says so as well (below); whichever comes first
+			// cleans up.
+			team_id team = msg->GetInt32("team", -1);
+			if (msg->GetInt32("opcode", 0) == B_TEAM_DELETED && team >= 0
+				&& gAppManager->HasTeam(team)) {
+				gAppManager->UnregisterTeam(team);
+			}
+			break;
+		}
 
 		case B_SOME_APP_QUIT:
 		{

@@ -2200,15 +2200,16 @@ MultiAudioNode::_FillNextBuffer(multi_buffer_info& info, node_output& output)
 	if (output.fBufferGroup == NULL)
 		return NULL;
 
+	// Without waiting: this is the thread that also plays, with the buffer
+	// lock held. A consumer that holds all the buffers (a recording program
+	// that hangs, or waits behind its crash alert) made every cycle wait a
+	// whole buffer period here, so the next buffer exchange came a period
+	// late and whatever played at that time crackled (#164). The consumer
+	// loses this period of the recording instead.
 	BBuffer* buffer = output.fBufferGroup->RequestBuffer(
-		output.fOutput.format.u.raw_audio.buffer_size, BufferDuration());
-	if (buffer == NULL) {
-		// If we fail to get a buffer (for example, if the request times out),
-		// we skip this buffer and go on to the next, to avoid locking up the
-		// control thread.
-		fprintf(stderr, "Buffer is null");
+		output.fOutput.format.u.raw_audio.buffer_size, 0);
+	if (buffer == NULL)
 		return NULL;
-	}
 
 	if (fDevice == NULL)
 		fprintf(stderr, "fDevice NULL\n");

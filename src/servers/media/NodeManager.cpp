@@ -36,13 +36,17 @@
 #include <Entry.h>
 #include <MediaAddOn.h>
 #include <MediaDefs.h>
+#include <MediaRoster.h>
 #include <Message.h>
 #include <Messenger.h>
 #include <OS.h>
 #include <Path.h>
 
+#include <set>
+
 #include <MediaDebug.h>
 #include <MediaMisc.h>
+#include <MediaRosterEx.h>
 #include <Notifications.h>
 
 #include "AppManager.h"
@@ -1135,6 +1139,60 @@ NodeManager::SetNodeTimeSource(media_node_id node,
 }
 
 
+/*!	Tells the nodes at the other end of a gone team's connections that
+	these are no more, as BMediaRoster::Disconnect() would have, and publishes
+	their inputs and outputs anew.
+	This waits for the nodes' answers, and they may ask the server in turn
+	(the system mixer stops the sound card when its last input goes): it has
+	a thread of its own, away from the server's control thread and looper.
+*/
+static status_t
+disconnect_peers(void* data)
+{
+	BrokenConnectionList* connections = (BrokenConnectionList*)data;
+	BPrivate::media::BMediaRosterEx* roster
+		= MediaRosterEx(BMediaRoster::Roster());
+
+	for (size_t i = 0; i < connections->size(); i++) {
+		const broken_connection& connection = (*connections)[i];
+
+		if (connection.peer_is_consumer) {
+			consumer_disconnected_request request;
+			consumer_disconnected_reply reply;
+			request.source = connection.source;
+			request.destination = connection.destination;
+			QueryPort(connection.peer.port, CONSUMER_DISCONNECTED, &request,
+				sizeof(request), &reply, sizeof(reply));
+
+			List<media_input> inputs;
+			if (roster != NULL
+				&& roster->GetAllInputs(connection.peer, &inputs) == B_OK) {
+				roster->PublishInputs(connection.peer, &inputs);
+			}
+		} else {
+			producer_disconnect_request request;
+			producer_disconnect_reply reply;
+			request.source = connection.source;
+			request.destination = connection.destination;
+			QueryPort(connection.peer.port, PRODUCER_DISCONNECT, &request,
+				sizeof(request), &reply, sizeof(reply));
+
+			List<media_output> outputs;
+			if (roster != NULL
+				&& roster->GetAllOutputs(connection.peer, &outputs) == B_OK) {
+				roster->PublishOutputs(connection.peer, &outputs);
+			}
+		}
+
+		BPrivate::media::notifications::ConnectionBroken(connection.source,
+			connection.destination);
+	}
+
+	delete connections;
+	return B_OK;
+}
+
+
 void
 NodeManager::CleanupTeam(team_id team)
 {
@@ -1143,6 +1201,14 @@ NodeManager::CleanupTeam(team_id team)
 	fDefaultManager->CleanupTeam(team);
 
 	PRINT(1, "NodeManager::CleanupTeam: team %" B_PRId32 "\n", team);
+
+	// The team's nodes may be connected to nodes of other teams (a player
+	// to the system mixer, a recorder to the sound card). Those must hear
+	// that the connection is gone, and nobody else tells them: the mixer
+	// would keep the input (and the sound card running) for good, and the
+	// sound card's output would stay taken, so that nothing could record
+	// from it until the media services were started again (#164).
+	_DisconnectPeers(team);
 
 	// Cleanup node references
 
@@ -1165,9 +1231,11 @@ NodeManager::CleanupTeam(team_id team)
 				", team %" B_PRId32 "\n", node.node_id, team);
 			// Ensure the slave node is removed from it's timesource
 			_NotifyTimeSource(node);
-			fDefaultManager->NodeUnregistered(node.node_id);
+			media_node_id id = node.node_id;
+				// "node" is gone with its entry
+			fDefaultManager->NodeUnregistered(id);
 			fNodeMap.erase(remove);
-			BPrivate::media::notifications::NodesDeleted(&node.node_id, 1);
+			BPrivate::media::notifications::NodesDeleted(&id, 1);
 			continue;
 		}
 
@@ -1185,8 +1253,9 @@ NodeManager::CleanupTeam(team_id team)
 
 				// Ensure the slave node is removed from it's timesource
 				_NotifyTimeSource(node);
+				media_node_id id = node.node_id;
 				fNodeMap.erase(remove);
-				BPrivate::media::notifications::NodesDeleted(&node.node_id, 1);
+				BPrivate::media::notifications::NodesDeleted(&id, 1);
 			} else
 				node.team_ref_count.erase(teamRef);
 		}
@@ -1387,6 +1456,84 @@ NodeManager::_AcquireNodeReference(media_node_id id, team_id team)
 		"%" B_PRId32 ", ref %" B_PRId32 ", team ref %" B_PRId32 "\n", id, team,
 		node.ref_count, node.team_ref_count.find(team)->second);
 	return B_OK;
+}
+
+
+/*!	Collects the connections between the nodes of the given team, which is
+	gone or going, and the nodes of other teams, and has the latter told.
+	What the roster of the team that connected two nodes published of them
+	(PublishInputs(), PublishOutputs()) is what the server knows of
+	connections. The manager must be locked, and still have the team's nodes.
+*/
+void
+NodeManager::_DisconnectPeers(team_id team)
+{
+	BrokenConnectionList* connections = NULL;
+	try {
+		std::set<port_id> gonePorts;
+		for (NodeMap::iterator iterator = fNodeMap.begin();
+				iterator != fNodeMap.end(); iterator++) {
+			if (iterator->second.containing_team == team)
+				gonePorts.insert(iterator->second.port);
+		}
+		if (gonePorts.empty())
+			return;
+
+		connections = new BrokenConnectionList;
+
+		for (NodeMap::iterator iterator = fNodeMap.begin();
+				iterator != fNodeMap.end(); iterator++) {
+			const registered_node& node = iterator->second;
+			if (node.containing_team == team)
+				continue;
+
+			broken_connection connection;
+			connection.peer.node = node.node_id;
+			connection.peer.port = node.port;
+			connection.peer.kind = node.kinds;
+
+			connection.peer_is_consumer = true;
+			for (size_t i = 0; i < node.input_list.size(); i++) {
+				const media_input& input = node.input_list[i];
+				if (gonePorts.find(input.source.port) == gonePorts.end())
+					continue;
+				connection.source = input.source;
+				connection.destination = input.destination;
+				connections->push_back(connection);
+			}
+
+			connection.peer_is_consumer = false;
+			for (size_t i = 0; i < node.output_list.size(); i++) {
+				const media_output& output = node.output_list[i];
+				if (gonePorts.find(output.destination.port)
+						== gonePorts.end()) {
+					continue;
+				}
+				connection.source = output.source;
+				connection.destination = output.destination;
+				connections->push_back(connection);
+			}
+		}
+	} catch (std::bad_alloc& exception) {
+		delete connections;
+		return;
+	}
+
+	if (connections->empty()) {
+		delete connections;
+		return;
+	}
+
+	PRINT(1, "NodeManager::_DisconnectPeers: team %" B_PRId32 " leaves %"
+		B_PRIuSIZE " connections\n", team, connections->size());
+
+	thread_id thread = spawn_thread(disconnect_peers, "disconnect peers",
+		B_NORMAL_PRIORITY, connections);
+	if (thread < 0) {
+		delete connections;
+		return;
+	}
+	resume_thread(thread);
 }
 
 
