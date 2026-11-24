@@ -12,14 +12,18 @@
 
 #include "IconUtils.h"
 
+#include <algorithm>
 #include <new>
 #include <fs_attr.h>
+#include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <Bitmap.h>
 #ifndef HAIKU_BUILD_ICON_UTILS
 #include <BitmapPrivate.h>
+#include <ZlibCompressionAlgorithm.h>
 #endif
 #include <FindDirectory.h>
 #include <Node.h>
@@ -302,6 +306,388 @@ scale4x(const uint8* srcBits, uint8* dstBits, int32 srcWidth, int32 srcHeight,
 }
 
 
+#ifndef HAIKU_BUILD_ICON_UTILS
+//	#pragma mark - PNG icons
+
+
+/*	A vector icon attribute or resource may hold a PNG instead: an icon that
+	only exists as a picture (an Android app's, for example). Like a vector
+	icon it is drawn from its source at every size, and the app_server draws it
+	again at the drawing density. Non-interlaced PNGs of every color type and
+	bit depth are read; other systems fall back to the B_CMAP8 icons.
+*/
+
+
+static const uint8 kPNGSignature[8]
+	= {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+static const uint32 kMaxPNGIconSize = 1024;
+
+
+static inline uint32
+png_uint32(const uint8* p)
+{
+	return ((uint32)p[0] << 24) | ((uint32)p[1] << 16) | ((uint32)p[2] << 8)
+		| p[3];
+}
+
+
+static inline uint8
+png_paeth(uint8 a, uint8 b, uint8 c)
+{
+	int p = a + b - c;
+	int pa = abs(p - a);
+	int pb = abs(p - b);
+	int pc = abs(p - c);
+	if (pa <= pb && pa <= pc)
+		return a;
+	return pb <= pc ? b : c;
+}
+
+
+/*!	Sample \a channel of pixel \a x of an unfiltered row, at its own depth. */
+static inline uint32
+png_sample(const uint8* row, uint32 x, uint32 channel, uint32 channels,
+	uint32 depth)
+{
+	if (depth == 16) {
+		const uint8* p = row + (x * channels + channel) * 2;
+		return ((uint32)p[0] << 8) | p[1];
+	}
+	if (depth == 8)
+		return row[x * channels + channel];
+	uint32 bit = x * depth;
+	uint32 shift = 8 - depth - (bit & 7);
+	return (row[bit >> 3] >> shift) & ((1 << depth) - 1);
+}
+
+
+static inline uint8
+png_to_8(uint32 value, uint32 depth)
+{
+	if (depth == 16)
+		return value >> 8;
+	if (depth == 8)
+		return value;
+	return value * 255 / ((1 << depth) - 1);
+}
+
+
+/*!	Decodes a PNG into straight alpha R, G, B, A bytes per pixel. */
+static status_t
+decode_png(const uint8* buffer, size_t size, uint8** _pixels, uint32* _width,
+	uint32* _height)
+{
+	if (size < 8 || memcmp(buffer, kPNGSignature, 8) != 0)
+		return B_BAD_TYPE;
+
+	uint32 width = 0;
+	uint32 height = 0;
+	uint32 depth = 0;
+	uint32 colorType = 0;
+	uint8 palette[256][4];
+	uint32 paletteCount = 0;
+	for (int i = 0; i < 256; i++) {
+		palette[i][0] = palette[i][1] = palette[i][2] = 0;
+		palette[i][3] = 255;
+	}
+	uint32 key[3] = {0, 0, 0};
+	bool hasKey = false;
+	bool haveHeader = false;
+	BMallocIO compressed;
+
+	size_t pos = 8;
+	while (size - pos >= 12) {
+		uint32 length = png_uint32(buffer + pos);
+		const uint8* type = buffer + pos + 4;
+		const uint8* data = buffer + pos + 8;
+		if (length > size - pos - 12)
+			return B_BAD_DATA;
+		if (memcmp(type, "IHDR", 4) == 0) {
+			if (length != 13)
+				return B_BAD_DATA;
+			width = png_uint32(data);
+			height = png_uint32(data + 4);
+			depth = data[8];
+			colorType = data[9];
+			if (data[10] != 0 || data[11] != 0 || data[12] != 0) {
+				// other compression or filter methods, or interlaced
+				return B_NOT_SUPPORTED;
+			}
+			haveHeader = true;
+		} else if (!haveHeader) {
+			return B_BAD_DATA;
+		} else if (memcmp(type, "PLTE", 4) == 0) {
+			if (length % 3 != 0 || length > 256 * 3)
+				return B_BAD_DATA;
+			paletteCount = length / 3;
+			for (uint32 i = 0; i < paletteCount; i++) {
+				palette[i][0] = data[i * 3];
+				palette[i][1] = data[i * 3 + 1];
+				palette[i][2] = data[i * 3 + 2];
+			}
+		} else if (memcmp(type, "tRNS", 4) == 0) {
+			if (colorType == 3) {
+				for (uint32 i = 0; i < length && i < 256; i++)
+					palette[i][3] = data[i];
+			} else if (colorType == 0 && length >= 2) {
+				key[0] = (data[0] << 8) | data[1];
+				hasKey = true;
+			} else if (colorType == 2 && length >= 6) {
+				for (int i = 0; i < 3; i++)
+					key[i] = (data[i * 2] << 8) | data[i * 2 + 1];
+				hasKey = true;
+			}
+		} else if (memcmp(type, "IDAT", 4) == 0) {
+			if (compressed.Write(data, length) != (ssize_t)length)
+				return B_NO_MEMORY;
+		} else if (memcmp(type, "IEND", 4) == 0)
+			break;
+		pos += 12 + length;
+	}
+
+	if (!haveHeader || width == 0 || height == 0 || width > kMaxPNGIconSize
+		|| height > kMaxPNGIconSize || compressed.BufferLength() == 0) {
+		return B_BAD_DATA;
+	}
+
+	uint32 channels;
+	bool depthValid;
+	switch (colorType) {
+		case 0:
+			channels = 1;
+			depthValid = depth == 1 || depth == 2 || depth == 4 || depth == 8
+				|| depth == 16;
+			break;
+		case 2:
+			channels = 3;
+			depthValid = depth == 8 || depth == 16;
+			break;
+		case 3:
+			channels = 1;
+			depthValid = (depth == 1 || depth == 2 || depth == 4 || depth == 8)
+				&& paletteCount > 0;
+			break;
+		case 4:
+			channels = 2;
+			depthValid = depth == 8 || depth == 16;
+			break;
+		case 6:
+			channels = 4;
+			depthValid = depth == 8 || depth == 16;
+			break;
+		default:
+			return B_NOT_SUPPORTED;
+	}
+	if (!depthValid)
+		return B_NOT_SUPPORTED;
+
+	uint32 bitsPerPixel = channels * depth;
+	uint32 rowBytes = (width * bitsPerPixel + 7) / 8;
+	uint32 filterBytes = std::max(1U, bitsPerPixel / 8);
+	size_t rawSize = (size_t)height * (rowBytes + 1);
+	uint8* raw = new(std::nothrow) uint8[rawSize];
+	if (raw == NULL)
+		return B_NO_MEMORY;
+	ArrayDeleter<uint8> rawDeleter(raw);
+
+	BZlibCompressionAlgorithm zlib;
+	iovec input = {(void*)compressed.Buffer(), compressed.BufferLength()};
+	iovec output = {raw, rawSize};
+	status_t status = zlib.DecompressBuffer(input, output);
+	if (status != B_OK)
+		return status;
+	if (output.iov_len != rawSize)
+		return B_BAD_DATA;
+
+	// undo the row filters, in place
+	for (uint32 y = 0; y < height; y++) {
+		uint8* row = raw + y * (rowBytes + 1) + 1;
+		const uint8* previous = y > 0 ? row - (rowBytes + 1) : NULL;
+		uint8 filter = row[-1];
+		for (uint32 i = 0; i < rowBytes; i++) {
+			uint8 a = i >= filterBytes ? row[i - filterBytes] : 0;
+			uint8 b = previous != NULL ? previous[i] : 0;
+			uint8 c = previous != NULL && i >= filterBytes
+				? previous[i - filterBytes] : 0;
+			switch (filter) {
+				case 0:
+					break;
+				case 1:
+					row[i] += a;
+					break;
+				case 2:
+					row[i] += b;
+					break;
+				case 3:
+					row[i] += (a + b) / 2;
+					break;
+				case 4:
+					row[i] += png_paeth(a, b, c);
+					break;
+				default:
+					return B_BAD_DATA;
+			}
+		}
+	}
+
+	uint8* pixels = new(std::nothrow) uint8[(size_t)width * height * 4];
+	if (pixels == NULL)
+		return B_NO_MEMORY;
+	for (uint32 y = 0; y < height; y++) {
+		const uint8* row = raw + y * (rowBytes + 1) + 1;
+		uint8* d = pixels + (size_t)y * width * 4;
+		for (uint32 x = 0; x < width; x++, d += 4) {
+			switch (colorType) {
+				case 0:
+				{
+					uint32 v = png_sample(row, x, 0, 1, depth);
+					d[0] = d[1] = d[2] = png_to_8(v, depth);
+					d[3] = hasKey && v == key[0] ? 0 : 255;
+					break;
+				}
+				case 2:
+				{
+					uint32 v[3];
+					for (int c = 0; c < 3; c++) {
+						v[c] = png_sample(row, x, c, 3, depth);
+						d[c] = png_to_8(v[c], depth);
+					}
+					d[3] = hasKey && v[0] == key[0] && v[1] == key[1]
+						&& v[2] == key[2] ? 0 : 255;
+					break;
+				}
+				case 3:
+					memcpy(d, palette[png_sample(row, x, 0, 1, depth)], 4);
+					break;
+				case 4:
+					d[0] = d[1] = d[2]
+						= png_to_8(png_sample(row, x, 0, 2, depth), depth);
+					d[3] = png_to_8(png_sample(row, x, 1, 2, depth), depth);
+					break;
+				case 6:
+					for (int c = 0; c < 4; c++)
+						d[c] = png_to_8(png_sample(row, x, c, 4, depth), depth);
+					break;
+			}
+		}
+	}
+
+	*_pixels = pixels;
+	*_width = width;
+	*_height = height;
+	return B_OK;
+}
+
+
+/*!	Draws a PNG into a B_RGBA32 or B_RGB32 bitmap of any size, centered and
+	with its aspect ratio kept: averaged over the area of each pixel when
+	shrinking, bilinear when enlarging, both premultiplied. */
+static status_t
+render_png_icon(const uint8* buffer, size_t size, BBitmap* icon)
+{
+	uint8* pixels = NULL;
+	uint32 width = 0;
+	uint32 height = 0;
+	status_t status = decode_png(buffer, size, &pixels, &width, &height);
+	if (status != B_OK)
+		return status;
+	ArrayDeleter<uint8> pixelsDeleter(pixels);
+
+	// premultiply, in floats
+	float* source = new(std::nothrow) float[(size_t)width * height * 4];
+	if (source == NULL)
+		return B_NO_MEMORY;
+	ArrayDeleter<float> sourceDeleter(source);
+	for (size_t i = 0; i < (size_t)width * height; i++) {
+		float alpha = pixels[i * 4 + 3] / 255.0f;
+		for (int c = 0; c < 3; c++)
+			source[i * 4 + c] = pixels[i * 4 + c] * alpha;
+		source[i * 4 + 3] = pixels[i * 4 + 3];
+	}
+
+	int32 iconWidth = icon->Bounds().IntegerWidth() + 1;
+	int32 iconHeight = icon->Bounds().IntegerHeight() + 1;
+	float scale = std::min((float)iconWidth / width,
+		(float)iconHeight / height);
+	float left = (iconWidth - width * scale) / 2;
+	float top = (iconHeight - height * scale) / 2;
+	uint8* bits = (uint8*)icon->Bits();
+	int32 bpr = icon->BytesPerRow();
+
+	for (int32 y = 0; y < iconHeight; y++) {
+		uint8* d = bits + y * bpr;
+		for (int32 x = 0; x < iconWidth; x++, d += 4) {
+			float sum[4] = {0, 0, 0, 0};
+			if (scale < 1) {
+				// the source area under this pixel
+				float x0 = (x - left) / scale;
+				float x1 = (x + 1 - left) / scale;
+				float y0 = (y - top) / scale;
+				float y1 = (y + 1 - top) / scale;
+				float area = (x1 - x0) * (y1 - y0);
+				int32 sy0 = std::max(0, (int32)floorf(y0));
+				int32 sy1 = std::min((int32)height, (int32)ceilf(y1));
+				int32 sx0 = std::max(0, (int32)floorf(x0));
+				int32 sx1 = std::min((int32)width, (int32)ceilf(x1));
+				for (int32 sy = sy0; sy < sy1; sy++) {
+					float wy = std::min(y1, sy + 1.0f) - std::max(y0, (float)sy);
+					if (wy <= 0)
+						continue;
+					const float* s = source + ((size_t)sy * width + sx0) * 4;
+					for (int32 sx = sx0; sx < sx1; sx++, s += 4) {
+						float w = wy * (std::min(x1, sx + 1.0f)
+							- std::max(x0, (float)sx));
+						if (w <= 0)
+							continue;
+						for (int c = 0; c < 4; c++)
+							sum[c] += s[c] * w;
+					}
+				}
+				for (int c = 0; c < 4; c++)
+					sum[c] /= area;
+			} else {
+				// the source pixel centers around this one's
+				float sx = (x + 0.5f - left) / scale - 0.5f;
+				float sy = (y + 0.5f - top) / scale - 0.5f;
+				if (sx > -1 && sy > -1 && sx < width && sy < height) {
+					sx = std::max(0.0f, std::min(sx, width - 1.0f));
+					sy = std::max(0.0f, std::min(sy, height - 1.0f));
+					int32 ix = std::min((int32)sx, (int32)width - 2);
+					int32 iy = std::min((int32)sy, (int32)height - 2);
+					ix = std::max(ix, 0);
+					iy = std::max(iy, 0);
+					float fx = width > 1 ? sx - ix : 0;
+					float fy = height > 1 ? sy - iy : 0;
+					int32 nx = width > 1 ? 1 : 0;
+					int32 ny = height > 1 ? width : 0;
+					const float* s = source + ((size_t)iy * width + ix) * 4;
+					for (int c = 0; c < 4; c++) {
+						float upper = s[c] + (s[nx * 4 + c] - s[c]) * fx;
+						float lower = s[ny * 4 + c]
+							+ (s[(ny + nx) * 4 + c] - s[ny * 4 + c]) * fx;
+						sum[c] = upper + (lower - upper) * fy;
+					}
+				}
+			}
+
+			float alpha = std::min(255.0f, std::max(0.0f, sum[3]));
+			if (alpha < 0.5f) {
+				d[0] = d[1] = d[2] = d[3] = 0;
+				continue;
+			}
+			// B_RGBA32 is B, G, R, A in memory
+			for (int c = 0; c < 3; c++) {
+				float value = sum[2 - c] * 255 / alpha;
+				d[c] = (uint8)std::min(255.0f, std::max(0.0f, value + 0.5f));
+			}
+			d[3] = (uint8)(alpha + 0.5f);
+		}
+	}
+	return B_OK;
+}
+#endif	// !HAIKU_BUILD_ICON_UTILS
+
+
 //	#pragma mark - GetIcon()
 
 
@@ -465,26 +851,36 @@ BIconUtils::GetVectorIcon(const uint8* buffer, size_t size, BBitmap* icon)
 			return B_NO_MEMORY;
 	}
 
-	Icon vector;
-	result = vector.InitCheck();
-	if (result != B_OK)
-		return result;
-
-	FlatIconImporter importer;
-	result = importer.Import(&vector, const_cast<uint8*>(buffer), size);
-	if (result != B_OK) {
-		// try the message based format used by Icon-O-Matic
-		MessageImporter messageImporter;
-		BMemoryIO memoryIO(const_cast<uint8*>(buffer), size);
-		result = messageImporter.Import(&vector, &memoryIO);
+#ifndef HAIKU_BUILD_ICON_UTILS
+	if (size >= sizeof(kPNGSignature)
+		&& memcmp(buffer, kPNGSignature, sizeof(kPNGSignature)) == 0) {
+		result = render_png_icon(buffer, size, temp);
 		if (result != B_OK)
 			return result;
-	}
+	} else
+#endif
+	{
+		Icon vector;
+		result = vector.InitCheck();
+		if (result != B_OK)
+			return result;
 
-	IconRenderer renderer(temp);
-	renderer.SetIcon(&vector);
-	renderer.SetScale((temp->Bounds().Width() + 1.0) / 64.0);
-	renderer.Render();
+		FlatIconImporter importer;
+		result = importer.Import(&vector, const_cast<uint8*>(buffer), size);
+		if (result != B_OK) {
+			// try the message based format used by Icon-O-Matic
+			MessageImporter messageImporter;
+			BMemoryIO memoryIO(const_cast<uint8*>(buffer), size);
+			result = messageImporter.Import(&vector, &memoryIO);
+			if (result != B_OK)
+				return result;
+		}
+
+		IconRenderer renderer(temp);
+		renderer.SetIcon(&vector);
+		renderer.SetScale((temp->Bounds().Width() + 1.0) / 64.0);
+		renderer.Render();
+	}
 
 	if (temp != icon) {
 		uint8* src = (uint8*)temp->Bits();
