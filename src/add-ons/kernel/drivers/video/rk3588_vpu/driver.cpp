@@ -6,6 +6,7 @@
 #include <bus/FDT.h>
 #include <KernelExport.h>
 #include <AutoDeleterOS.h>
+#include <condition_variable.h>
 #include <driver_settings.h>
 #include <lock.h>
 #include <smp.h>
@@ -19,6 +20,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "VpuCompletion.h"
 #include "VpuInterface.h"
 #include "VpuPower.h"
 
@@ -132,6 +134,219 @@ struct DmaBuffer {
 };
 
 static DmaBuffer* FindTeamBuffer(team_id owner, uint32_t handle);
+
+
+// #pragma mark - per-domain job locks and completion interrupts (#182)
+
+
+/*!	Both are off unless the driver settings switch them on
+	("parallel_blocks true", "completion_interrupts true"); off, every job
+	runs start to finish under sHardwareLock and polls its status word, as
+	it always did.
+
+	parallel_blocks: a job holds the lock of its power domain and lets go
+	of sHardwareLock while the block works. RKVDEC0 and AV1 are children of
+	VDPU, whose own block is VPU121 (VDPU2), and a failed decode job powers
+	all three down (PowerDownDecoder()), so they share sDecodeLock. VENC0
+	hangs off VCODEC, which the firmware leaves on and this driver never
+	switches; its PMU bits (VpuPower.h), CRU gate 47 and IOMMU are its own,
+	and no decoder check reads them: sEncodeLock. Whatever can free a
+	buffer or power a block down under a running job (buffer allocation and
+	release, Free(), the diagnostic power cycles, UninitDriver()) takes
+	both job locks first. Lock order: sDecodeLock, sEncodeLock,
+	sHardwareLock. */
+static bool sParallelBlocks = false;
+static bool sCompletionInterrupts = false;
+static mutex sDecodeLock = MUTEX_INITIALIZER("RK3588 VPU decode jobs");
+static mutex sEncodeLock = MUTEX_INITIALIZER("RK3588 VPU encode jobs");
+
+
+static mutex*
+JobLock(bool encode)
+{
+	if (!sParallelBlocks)
+		return NULL;
+	return encode ? &sEncodeLock : &sDecodeLock;
+}
+
+
+struct BlockCompletion {
+	spinlock lock;
+	ConditionVariable condition;
+	CompletionState state;
+	const CompletionSpec* spec;
+	volatile uint32_t* words;	// the job registers the status word is in
+};
+
+static BlockCompletion sCompletions[kCompletionBlocks];
+
+
+struct CompletionRegisters {
+	volatile uint32_t* words;
+
+	uint32_t Read(uint32_t index)
+	{
+		memory_read_barrier();
+		return words[index];
+	}
+
+	void Write(uint32_t index, uint32_t value)
+	{
+		words[index] = value;
+		memory_write_barrier();
+	}
+};
+
+
+static int32
+CompletionInterrupt(void* cookie)
+{
+	BlockCompletion& block = *(BlockCompletion*)cookie;
+	InterruptsSpinLocker locker(block.lock);
+	CompletionRegisters registers = {block.words};
+	CompletionAction action = HandleCompletionInterrupt(block.state,
+		*block.spec, registers);
+	locker.Unlock();
+	if (action != kCompletionHandled)
+		return B_UNHANDLED_INTERRUPT;
+	block.condition.NotifyAll();
+	return B_HANDLED_INTERRUPT;
+}
+
+
+struct CompletionPlatform {
+	BlockCompletion& block;
+
+	int64_t Now() { return system_time(); }
+
+	uint32_t Read(uint32_t index)
+	{
+		memory_read_barrier();
+		return block.words[index];
+	}
+
+	void Snapshot(uint32_t& sequence, uint32_t& status)
+	{
+		InterruptsSpinLocker locker(block.lock);
+		sequence = block.state.sequence;
+		status = block.state.status;
+	}
+
+	bool Sleep(uint32_t seen, int64_t micros)
+	{
+		ConditionVariableEntry entry;
+		block.condition.Add(&entry);
+		{
+			InterruptsSpinLocker locker(block.lock);
+			if (block.state.sequence != seen)
+				return true;
+		}
+		return entry.Wait(B_RELATIVE_TIMEOUT, micros) == B_OK;
+	}
+};
+
+
+static void
+InitCompletions()
+{
+	for (uint32_t i = 0; i < kCompletionBlocks; i++) {
+		BlockCompletion& block = sCompletions[i];
+		B_INITIALIZE_SPINLOCK(&block.lock);
+		block.condition.Init(&block, "RK3588 VPU completion");
+		block.state = CompletionState();
+		block.spec = &kCompletionSpecs[i];
+		block.words = NULL;
+	}
+}
+
+
+/*!	With the block's job lock held and its registers mapped (\a words: the
+	job registers its status word is counted in). Installs the handler the
+	first time. Returns the block to arm, or NULL: poll. */
+static BlockCompletion*
+PrepareCompletion(CompletionBlock which, void* words)
+{
+	if (!sCompletionInterrupts || words == NULL)
+		return NULL;
+	BlockCompletion& block = sCompletions[which];
+	if (block.words == NULL) {
+		block.words = (volatile uint32_t*)words;
+		status_t status = install_io_interrupt_handler(block.spec->vector,
+			CompletionInterrupt, &block, 0);
+		{
+			InterruptsSpinLocker locker(block.lock);
+			if (status == B_OK)
+				block.state.installed = true;
+			else
+				block.state.broken = true;
+		}
+		dprintf("rk3588_vpu: %s completion interrupt %" B_PRIu32 ": %s\n",
+			block.spec->name, block.spec->vector, strerror(status));
+	}
+	return block.state.installed ? &block : NULL;
+}
+
+
+static bool
+ArmBlock(BlockCompletion* block)
+{
+	if (block == NULL)
+		return false;
+	InterruptsSpinLocker locker(block->lock);
+	return ArmCompletion(block->state);
+}
+
+
+static void
+DisarmBlock(BlockCompletion* block)
+{
+	InterruptsSpinLocker locker(block->lock);
+	DisarmCompletion(block->state);
+}
+
+
+static uint32_t
+WaitBlock(BlockCompletion* block, int64_t timeout)
+{
+	CompletionPlatform platform = {*block};
+	return WaitCompletion(platform, block->state, *block->spec, timeout);
+}
+
+
+static void
+LogCompletion(CompletionBlock which)
+{
+	const BlockCompletion& block = sCompletions[which];
+	const CompletionState& state = block.state;
+	if (!sCompletionInterrupts || block.words == NULL)
+		return;
+	dprintf("rk3588_vpu: %s completion interrupts%s: %" B_PRIu64 " jobs, %"
+		B_PRIu64 " interrupts, %" B_PRIu64 " sleeps woken, %" B_PRIu64
+		" timed out, %" B_PRIu64 " missed, %" B_PRIu64 " stray; trusted %"
+		B_PRIu64 " times, %s now\n", block.spec->name,
+		state.broken ? " (broken: polling)" : "", state.jobs,
+		state.interrupts, state.notified, state.timedOut, state.missed,
+		state.strays, state.trusts, state.trusted ? "trusted" : "polling");
+}
+
+
+static void
+RemoveCompletions()
+{
+	for (uint32_t i = 0; i < kCompletionBlocks; i++) {
+		BlockCompletion& block = sCompletions[i];
+		if (!block.state.installed)
+			continue;
+		{
+			InterruptsSpinLocker locker(block.lock);
+			block.state.armed = false;
+		}
+		remove_io_interrupt_handler(block.spec->vector, CompletionInterrupt,
+			&block);
+		block.state.installed = false;
+		block.words = NULL;
+	}
+}
 
 
 // #pragma mark - RKVENC (VEPU580) jobs
@@ -1563,7 +1778,8 @@ public:
 		return B_OK;
 	}
 
-	status_t RunRkvdec0Job(const MppPendingJob& job, void* mapped = NULL)
+	status_t RunRkvdec0Job(const MppPendingJob& job, void* mapped = NULL,
+		BlockCompletion* completion = NULL)
 	{
 		if (!job.valid || job.readBytes == 0 || job.readBytes > 128)
 			return B_BAD_VALUE;
@@ -1591,12 +1807,15 @@ public:
 		if (registers[0] != kRkvdec0HardwareId || iommu[0] != 0
 			|| (iommu[1] & 1) != 0 || (iommu[1] & 0x18) != 0x18)
 			return B_NOT_ALLOWED;
+		bool armed = ArmBlock(completion);
 		for (uint32_t index = 8; index < 288; index++) {
 			if (index == 10 || (job.written[index / 32]
 					& (1u << (index % 32))) == 0)
 				continue;
 			uint32_t value = job.registers[index];
-			if (index == 11)
+			if (index == 11 && armed)
+				value &= ~(1u << 4); // The IRQ wakes the waiter (#182).
+			else if (index == 11)
 				value |= 1u << 4; // Poll completion without asserting an IRQ.
 			registers[index] = value;
 		}
@@ -1605,20 +1824,29 @@ public:
 		memory_write_barrier();
 		const uint32_t terminal = (1u << 2) | (1u << 4)
 			| (1u << 5) | (1u << 9);
+		static_assert(terminal == kRkvdecTerminal, "VpuCompletion.h");
 		uint32_t status = 0;
 		bigtime_t deadline = system_time() + 500000;
-		do {
-			memory_read_barrier();
-			status = registers[224];
-			if ((status & terminal) != 0)
-				break;
-			snooze(50);
-		} while (system_time() < deadline);
+		if (armed)
+			status = WaitBlock(completion, 500000);
+		else {
+			do {
+				memory_read_barrier();
+				status = registers[224];
+				if ((status & terminal) != 0)
+					break;
+				snooze(50);
+			} while (system_time() < deadline);
+		}
 		uint32_t readback[32] = {};
 		for (uint32_t index = 0; index < job.readBytes / 4; index++)
 			readback[index] = registers[224 + index];
+		if (armed)
+			readback[0] = status;	// the handler may have cleared the word
 		registers[224] = 0;
 		memory_write_barrier();
+		if (armed)
+			DisarmBlock(completion);
 		status_t result = user_memcpy((void*)(addr_t)job.readAddress,
 			readback, job.readBytes);
 		if (result != B_OK)
@@ -1626,7 +1854,8 @@ public:
 		return (status & terminal) != 0 ? B_OK : B_TIMED_OUT;
 	}
 
-	status_t RunAv1Job(const MppPendingJob& job, void* mapped = NULL)
+	status_t RunAv1Job(const MppPendingJob& job, void* mapped = NULL,
+		BlockCompletion* completion = NULL)
 	{
 		if (!job.valid || job.readBytes != sizeof(job.registers))
 			return B_BAD_VALUE;
@@ -1662,27 +1891,41 @@ public:
 			registers[index] = job.registers[index];
 		}
 		memory_write_barrier();
-		registers[1] = job.registers[1] | (1u << 4);
+		bool armed = ArmBlock(completion);
+		// Bit 4 keeps the IRQ from asserting (G1's DEC_IRQ_DIS).
+		if (armed)
+			registers[1] = job.registers[1] & ~(1u << 4);
+		else
+			registers[1] = job.registers[1] | (1u << 4);
 		memory_write_barrier();
 		const uint32_t terminal = (1u << 11) | (1u << 12) | (1u << 13)
 			| (1u << 14) | (1u << 16) | (1u << 18) | (1u << 21)
 			| (1u << 23);
+		static_assert(terminal == kAv1Terminal, "VpuCompletion.h");
 		uint32_t status = 0;
 		bigtime_t deadline = system_time() + 500000;
-		do {
-			memory_read_barrier();
-			status = registers[1];
-			if ((status & terminal) != 0)
-				break;
-			snooze(50);
-		} while (system_time() < deadline);
+		if (armed)
+			status = WaitBlock(completion, 500000);
+		else {
+			do {
+				memory_read_barrier();
+				status = registers[1];
+				if ((status & terminal) != 0)
+					break;
+				snooze(50);
+			} while (system_time() < deadline);
+		}
 		if ((status & (1u << 12)) == 0)
 			dprintf("rk3588_vpu: AV1 terminal status=%#" B_PRIx32 "\n", status);
 		uint32_t readback[512];
 		for (uint32_t index = 0; index < 512; index++)
 			readback[index] = registers[index];
+		if (armed)
+			readback[1] = status;	// the handler may have cleared the word
 		registers[1] = 0;
 		memory_write_barrier();
+		if (armed)
+			DisarmBlock(completion);
 		status_t result = user_memcpy((void*)(addr_t)job.readAddress,
 			readback, sizeof(readback));
 		if (result != B_OK)
@@ -1764,7 +2007,7 @@ public:
 		with one core and one job at a time, a reference is complete before
 		the next picture starts. */
 	status_t RunRkvencJob(const EncoderJob& job, void* mapped,
-		uint32_t& interruptStatus)
+		uint32_t& interruptStatus, BlockCompletion* completion = NULL)
 	{
 		interruptStatus = 0;
 		if (!job.valid || mapped == NULL)
@@ -1797,27 +2040,38 @@ public:
 		uint32_t watchdog = registers[kEncoderWatchdog] & 0xff000000;
 		registers[kEncoderWatchdog] = watchdog | 0x60000;
 		memory_write_barrier();
+		// MPP's control words (0-23) carry the interrupt enables.
+		bool armed = ArmBlock(completion);
 		registers[kEncoderStartRegister] = job.registers[kEncoderStartRegister];
 		memory_write_barrier();
 
+		static_assert((kEncoderDone | kEncoderErrors) == kRkvencTerminal,
+			"VpuCompletion.h");
 		uint32_t status = 0;
 		bigtime_t deadline = system_time() + 1000000;
-		do {
-			memory_read_barrier();
-			status = registers[kEncoderInterruptStatus];
-			if ((status & (kEncoderDone | kEncoderErrors)) != 0)
-				break;
-			snooze(50);
-		} while (system_time() < deadline);
+		if (armed)
+			status = WaitBlock(completion, 1000000);
+		else {
+			do {
+				memory_read_barrier();
+				status = registers[kEncoderInterruptStatus];
+				if ((status & (kEncoderDone | kEncoderErrors)) != 0)
+					break;
+				snooze(50);
+			} while (system_time() < deadline);
+		}
 		interruptStatus = status;
 		registers[kEncoderInterruptClear] = status;
 		memory_write_barrier();
+		status_t result = B_OK;
 		if ((status & kEncoderErrors) != 0 || (status & kEncoderDone) == 0) {
 			ResetRkvenc(registers);
-			return (status & kEncoderDone) == 0 && (status & kEncoderErrors) == 0
-				? B_TIMED_OUT : B_IO_ERROR;
+			result = (status & kEncoderDone) == 0
+				&& (status & kEncoderErrors) == 0 ? B_TIMED_OUT : B_IO_ERROR;
 		}
-		return B_OK;
+		if (armed)
+			DisarmBlock(completion);
+		return result;
 	}
 
 	/*!	One VDPU2 picture, as BSP mpp_vdpu2.c vdpu_run()/vdpu_irq()/
@@ -1826,7 +2080,8 @@ public:
 		interrupt status back for word 55 and the stream length consumed,
 		shifted by ten, for word 64. A picture the decoder finished with
 		error bits still completes (MPP judges it); the block is reset. */
-	status_t RunVdpu2Job(const MppPendingJob& job, void* mapped)
+	status_t RunVdpu2Job(const MppPendingJob& job, void* mapped,
+		BlockCompletion* completion = NULL)
 	{
 		if (!job.valid || mapped == NULL || job.readBytes == 0
 			|| job.readBytes > kVdpu2Registers * 4)
@@ -1844,24 +2099,33 @@ public:
 		memory_read_barrier();
 		if (iommu[0] != 0 || (iommu[1] & 1) != 0)
 			return B_NOT_ALLOWED;
+		bool armed = ArmBlock(completion);
 		for (uint32_t index = 0; index < kVdpu2Registers; index++) {
 			if (index == kVdpu2Enable
 				|| (job.written[index / 32] & (1u << (index % 32))) == 0)
 				continue;
-			registers[index] = job.registers[index];
+			uint32_t value = job.registers[index];
+			if (index == kVdpu2Interrupt && armed)
+				value &= ~(1u << 1);	// DEC_IRQ_DIS: the IRQ wakes the waiter
+			registers[index] = value;
 		}
 		memory_write_barrier();
 		registers[kVdpu2Enable] = job.registers[kVdpu2Enable] | 1;
 		memory_write_barrier();
+		static_assert(kVdpu2InterruptRaw == kVdpu2Done, "VpuCompletion.h");
 		uint32_t status = 0;
 		bigtime_t deadline = system_time() + 500000;
-		do {
-			memory_read_barrier();
-			status = registers[kVdpu2Interrupt];
-			if ((status & kVdpu2InterruptRaw) != 0)
-				break;
-			snooze(50);
-		} while (system_time() < deadline);
+		if (armed)
+			status = WaitBlock(completion, 500000);
+		else {
+			do {
+				memory_read_barrier();
+				status = registers[kVdpu2Interrupt];
+				if ((status & kVdpu2InterruptRaw) != 0)
+					break;
+				snooze(50);
+			} while (system_time() < deadline);
+		}
 		uint32_t readback[kVdpu2Registers];
 		for (uint32_t index = 0; index < job.readBytes / 4; index++)
 			readback[index] = registers[index];
@@ -1884,6 +2148,8 @@ public:
 				&& system_time() < resetDeadline) {
 			}
 		}
+		if (armed)
+			DisarmBlock(completion);
 		status_t result = user_memcpy((void*)(addr_t)job.readAddress,
 			readback, job.readBytes);
 		if (result != B_OK)
@@ -1953,6 +2219,9 @@ PowerDownDecoder(Controller* controller)
 		controller->slowestJob, controller->vdpuSession.restoreResult,
 		controller->rkvdec0Session.restoreResult,
 		controller->av1Session.restoreResult);
+	LogCompletion(kCompletionRkvdec0);
+	LogCompletion(kCompletionAv1);
+	LogCompletion(kCompletionVdpu2);
 	controller->jobs = 0;
 	controller->jobTime = 0;
 	controller->decodeTime = 0;
@@ -2086,6 +2355,7 @@ PowerDownEncoder(Controller* controller)
 		controller->encodeJobs, controller->encodeJobs > 0
 			? controller->encodeTime / controller->encodeJobs : 0,
 		controller->slowestEncode, controller->venc0Session.restoreResult);
+	LogCompletion(kCompletionRkvenc0);
 	controller->encodeJobs = 0;
 	controller->encodeTime = 0;
 	controller->slowestEncode = 0;
@@ -2145,9 +2415,11 @@ EnsureEncoderPowered(Controller* controller)
 }
 
 
-// With sHardwareLock held: one validated RKVENC job, start to finish.
+// With sHardwareLock held: one validated RKVENC job, start to finish. With
+// parallel_blocks, the caller holds sEncodeLock as well, and \a locker's
+// sHardwareLock is let go while the block encodes.
 static status_t
-RunEncoderJob(OpenHandle* opened)
+RunEncoderJob(OpenHandle* opened, MutexLocker& locker)
 {
 	Controller* controller = opened->controller;
 	EncoderJob& job = *opened->encoderJob;
@@ -2160,6 +2432,10 @@ RunEncoderJob(OpenHandle* opened)
 		opened->encodes = true;
 		controller->encodeClients++;
 	}
+	BlockCompletion* completion = PrepareCompletion(kCompletionRkvenc0,
+		controller->rkvenc0Registers);
+	if (sParallelBlocks)
+		locker.Unlock();
 	bigtime_t started = system_time();
 	for (uint32_t i = 0; i < job.bufferCount; i++) {
 		if (job.shared[i])
@@ -2167,7 +2443,7 @@ RunEncoderJob(OpenHandle* opened)
 	}
 	uint32_t interruptStatus = 0;
 	status = controller->hardware->RunRkvencJob(job,
-		controller->rkvenc0Registers, interruptStatus);
+		controller->rkvenc0Registers, interruptStatus, completion);
 	for (uint32_t i = 0; i < job.bufferCount; i++) {
 		if (job.shared[i])
 			SyncBufferForDevice(job.buffers[i]);
@@ -2177,6 +2453,8 @@ RunEncoderJob(OpenHandle* opened)
 			controller->rkvenc0Registers, interruptStatus);
 	}
 	bigtime_t spent = system_time() - started;
+	if (sParallelBlocks)
+		locker.Lock();
 	job.valid = false;
 	controller->encodeJobs++;
 	controller->encodeTime += spent;
@@ -2262,6 +2540,11 @@ InitDriver(device_node* node, void** cookie)
 		controller->encodeEnabled = strcmp(profile,
 			"rock5-itx-edk2-v1.1-rkvenc0-h264-h265") == 0
 			|| (profile[0] == '\0' && controller->decodeEnabled);
+		// #182, both off by default; see the job locks above.
+		sParallelBlocks = get_driver_boolean_parameter(settings,
+			"parallel_blocks", false, false);
+		sCompletionInterrupts = get_driver_boolean_parameter(settings,
+			"completion_interrupts", false, false);
 		if (controller->decodeEnabled || controller->av1DecodeEnabled
 			|| controller->encodeEnabled) {
 			const char* pool = get_driver_parameter(settings, "dma_pool_mb",
@@ -2279,16 +2562,19 @@ InitDriver(device_node* node, void** cookie)
 		return B_NOT_SUPPORTED;
 	}
 	controller->node = node;
+	InitCompletions();
 	CreateDmaPool(controller, poolMegabytes);
 	dprintf("rk3588_vpu: validated VDPU and IOMMU resources;"
 		" VDPU power cycle %s, RKVDEC0 power cycle %s, AV1 power cycle %s,"
-		" RKVDEC decode %s, AV1 decode %s, RKVENC encode %s\n",
+		" RKVDEC decode %s, AV1 decode %s, RKVENC encode %s;"
+		" parallel blocks %s, completion interrupts %s\n",
 		controller->cycleEnabled ? "enabled" : "disabled",
 		controller->rkvdec0CycleEnabled ? "enabled" : "disabled",
 		controller->av1CycleEnabled ? "enabled" : "disabled",
 		controller->decodeEnabled ? "enabled" : "disabled",
 		controller->av1DecodeEnabled ? "enabled" : "disabled",
-		controller->encodeEnabled ? "enabled" : "disabled");
+		controller->encodeEnabled ? "enabled" : "disabled",
+		sParallelBlocks ? "on" : "off", sCompletionInterrupts ? "on" : "off");
 	*cookie = controller;
 	return B_OK;
 }
@@ -2298,7 +2584,12 @@ UninitDriver(void* cookie)
 {
 	Controller* controller = (Controller*)cookie;
 	{
+		MutexLocker decodeJobs(JobLock(false));
+		MutexLocker encodeJobs(JobLock(true));
 		MutexLocker locker(sHardwareLock);
+		// The handlers go before the blocks power down and their registers
+		// are unmapped.
+		RemoveCompletions();
 		PowerDownDecoder(controller);
 		PowerDownEncoder(controller);
 		delete controller->hardware;
@@ -2361,6 +2652,8 @@ static status_t
 Free(void* cookie)
 {
 	OpenHandle* opened = (OpenHandle*)cookie;
+	MutexLocker decodeJobs(JobLock(false));
+	MutexLocker encodeJobs(JobLock(true));
 	MutexLocker locker(sHardwareLock);
 	for (OpenHandle** slot = &sOpenHandles; *slot != NULL;
 		slot = &(*slot)->next) {
@@ -2425,6 +2718,7 @@ Control(void* cookie, uint32 op, void* buffer, size_t length)
 			&& opened->mppClientType == kMppClientRkvenc) {
 			if (!controller->encodeEnabled || opened->encoderJob == NULL)
 				return B_NOT_ALLOWED;
+			MutexLocker jobLocker(JobLock(true));
 			MutexLocker locker(sHardwareLock);
 			status = ValidateEncoderJob(opened, (const MppServiceRequest*)buffer);
 			if (status != B_OK) {
@@ -2435,12 +2729,13 @@ Control(void* cookie, uint32 op, void* buffer, size_t length)
 				}
 				return status;
 			}
-			return RunEncoderJob(opened);
+			return RunEncoderJob(opened, locker);
 		}
 		if (request.command >= 0x200 && request.command <= 0x203
 			&& opened->mppClientType == kMppClientVdpu2) {
 			if (!controller->vdpu2DecodeEnabled || !controller->cycleEnabled)
 				return B_NOT_ALLOWED;
+			MutexLocker jobLocker(JobLock(false));
 			MutexLocker locker(sHardwareLock);
 			status = ValidateVdpu2Job(opened, (const MppServiceRequest*)buffer);
 			if (status != B_OK) {
@@ -2460,12 +2755,18 @@ Control(void* cookie, uint32 op, void* buffer, size_t length)
 				opened->decodes = true;
 				controller->decodeClients++;
 			}
+			BlockCompletion* completion = PrepareCompletion(kCompletionVdpu2,
+				(uint8_t*)controller->vdpu2Registers + 0x400);
+			if (sParallelBlocks)
+				locker.Unlock();
 			bigtime_t started = system_time();
 			SyncJobBuffers(opened->mppJob);
 			status = controller->hardware->RunVdpu2Job(opened->mppJob,
-				controller->vdpu2Registers);
+				controller->vdpu2Registers, completion);
 			SyncJobBuffers(opened->mppJob);
 			bigtime_t spent = system_time() - started;
+			if (sParallelBlocks)
+				locker.Lock();
 			opened->mppJob.valid = false;
 			controller->jobs++;
 			controller->jobTime += spent;
@@ -2484,6 +2785,7 @@ Control(void* cookie, uint32 op, void* buffer, size_t length)
 			if (opened->mppClientType != kMppClientRkvdec
 				&& opened->mppClientType != kMppClientAv1)
 				return B_NOT_ALLOWED;
+			MutexLocker jobLocker(JobLock(false));
 			MutexLocker locker(sHardwareLock);
 			status = ValidateMppJob(opened,
 				(const MppServiceRequest*)buffer);
@@ -2507,17 +2809,26 @@ Control(void* cookie, uint32 op, void* buffer, size_t length)
 				opened->decodes = true;
 				controller->decodeClients++;
 			}
+			BlockCompletion* completion = rkvdec
+				? PrepareCompletion(kCompletionRkvdec0,
+					(uint8_t*)controller->rkvdec0Registers + 0x100)
+				: PrepareCompletion(kCompletionAv1, controller->av1Registers);
+			if (sParallelBlocks)
+				locker.Unlock();
 			bigtime_t started = system_time();
 			SyncJobBuffers(opened->mppJob);
 			bigtime_t decodeStarted = system_time();
 			status = rkvdec
 				? controller->hardware->RunRkvdec0Job(opened->mppJob,
-					controller->rkvdec0Registers)
+					controller->rkvdec0Registers, completion)
 				: controller->hardware->RunAv1Job(opened->mppJob,
-					controller->av1Registers);
-			controller->decodeTime += system_time() - decodeStarted;
+					controller->av1Registers, completion);
+			bigtime_t decodeTime = system_time() - decodeStarted;
 			SyncJobBuffers(opened->mppJob);
 			bigtime_t spent = system_time() - started;
+			if (sParallelBlocks)
+				locker.Lock();
+			controller->decodeTime += decodeTime;
 			opened->mppJob.valid = false;
 			controller->jobs++;
 			controller->jobTime += spent;
@@ -2611,6 +2922,11 @@ Control(void* cookie, uint32 op, void* buffer, size_t length)
 	if (op == kAllocBuffer || op == kFreeBuffer || op == kValidateBuffer) {
 		if (!opened->write || opened->owner != team_get_current_team_id())
 			return B_NOT_ALLOWED;
+		// No job may use a buffer that goes (a failed allocation frees its
+		// new one too).
+		bool changes = op != kValidateBuffer;
+		MutexLocker decodeJobs(changes ? JobLock(false) : NULL);
+		MutexLocker encodeJobs(changes ? JobLock(true) : NULL);
 		MutexLocker locker(sHardwareLock);
 		if (op == kValidateBuffer) {
 			if (length != sizeof(BufferValidation))
@@ -2720,6 +3036,8 @@ Control(void* cookie, uint32 op, void* buffer, size_t length)
 		if ((op == kCycleAv1WithVdpu || op == kProbeAv1Registers)
 			&& (!controller->cycleEnabled || !controller->av1CycleEnabled))
 			return B_NOT_ALLOWED;
+		MutexLocker decodeJobs(JobLock(false));
+		MutexLocker encodeJobs(JobLock(true));
 		MutexLocker locker(sHardwareLock);
 		PowerHardware hardware;
 		status_t status = hardware.Init(controller->resources);
