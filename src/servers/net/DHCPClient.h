@@ -82,6 +82,11 @@ private:
 			bigtime_t			fRenewalTime;
 			bigtime_t			fRebindingTime;
 			bigtime_t			fLeaseTime;
+				// when the lease must be renewed, rebound, ends (system_time())
+			bigtime_t			fRenewalDuration;
+			bigtime_t			fRebindingDuration;
+			bigtime_t			fLeaseDuration;
+				// the same as the last reply gave them, from fRequestTime on
 			bool				fKeepLease;
 			status_t			fStatus;
 };

@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -140,7 +141,7 @@ struct dhcp_message {
 	bool HasOptions() const;
 	bool NextOption(dhcp_option_cookie& cookie, message_option& option,
 		const uint8*& data, size_t& size) const;
-	const uint8* FindOption(message_option which) const;
+	const uint8* FindOption(message_option which, size_t* _size = NULL) const;
 	const uint8* LastOption() const;
 	message_type Type() const;
 
@@ -181,7 +182,7 @@ const uint32 kMsgLeaseTime = 'lstm';
 static const uint8 kRequestParameters[] = {
 	OPTION_SUBNET_MASK, OPTION_ROUTER_ADDRESS,
 	OPTION_DOMAIN_NAME_SERVER, OPTION_BROADCAST_ADDRESS,
-	OPTION_DOMAIN_NAME
+	OPTION_DOMAIN_NAME, OPTION_RENEWAL_TIME, OPTION_REBINDING_TIME
 };
 
 
@@ -281,14 +282,25 @@ dhcp_message::NextOption(dhcp_option_cookie& cookie,
 			continue;
 		}
 
+		// An option that does not fit into what is left of its field ends
+		// the parsing: a damaged or truncated reply made bytesLeft wrap
+		// around, and the parsing went on past the message, up the stack
+		// (airos-works/haiku#174).
+		if (bytesLeft < 2 || (uint32)cookie.next[1] + 2 > bytesLeft) {
+			cookie.next = NULL;
+			return false;
+		}
+
 		size = cookie.next[1];
 		data = &cookie.next[2];
 		cookie.next += 2 + size;
 		bytesLeft -= 2 + size;
 
 		if (option == OPTION_OVERLOAD) {
-			cookie.file_has_options = data[0] & 1;
-			cookie.server_name_has_options = data[0] & 2;
+			if (size >= 1) {
+				cookie.file_has_options = data[0] & 1;
+				cookie.server_name_has_options = data[0] & 2;
+			}
 			continue;
 		}
 
@@ -298,7 +310,7 @@ dhcp_message::NextOption(dhcp_option_cookie& cookie,
 
 
 const uint8*
-dhcp_message::FindOption(message_option which) const
+dhcp_message::FindOption(message_option which, size_t* _size) const
 {
 	dhcp_option_cookie cookie;
 	message_option option;
@@ -306,8 +318,11 @@ dhcp_message::FindOption(message_option which) const
 	size_t size;
 	while (NextOption(cookie, option, data, size)) {
 		// iterate through all options
-		if (option == which)
+		if (option == which) {
+			if (_size != NULL)
+				*_size = size;
 			return data;
+		}
 	}
 
 	return NULL;
@@ -332,8 +347,9 @@ dhcp_message::LastOption() const
 message_type
 dhcp_message::Type() const
 {
-	const uint8* data = FindOption(OPTION_MESSAGE_TYPE);
-	if (data)
+	size_t size;
+	const uint8* data = FindOption(OPTION_MESSAGE_TYPE, &size);
+	if (data != NULL && size >= 1)
 		return (message_type)data[0];
 
 	return DHCP_NONE;
@@ -492,6 +508,9 @@ DHCPClient::DHCPClient(BMessenger target, const char* device)
 	fRenewalTime(0),
 	fRebindingTime(0),
 	fLeaseTime(0),
+	fRenewalDuration(0),
+	fRebindingDuration(0),
+	fLeaseDuration(0),
 	fKeepLease(false)
 {
 	fTransactionID = (uint32)system_time() ^ rand();
@@ -626,7 +645,15 @@ DHCPClient::_Negotiate()
 		return errno;
 	}
 
-	bigtime_t previousLeaseTime = fLeaseTime;
+	// Only this negotiation's reply counts. The times used to be kept as
+	// the absolute times of the previous lease when the server sent no T1
+	// and T2 (options 58 and 59), and the time of the request was added to
+	// them once more: every renewal came twice as late as the one before,
+	// long after the lease had ended (airos-works/haiku#174).
+	bigtime_t previousLeaseDuration = fLeaseDuration;
+	fLeaseDuration = 0;
+	fRenewalDuration = 0;
+	fRebindingDuration = 0;
 
 	status_t status = B_OK;
 	while (state != BOUND && fNegotiateThread != -1) {
@@ -637,18 +664,27 @@ DHCPClient::_Negotiate()
 
 	close(socket);
 
-	if (fLeaseTime == 0)
-		fLeaseTime = previousLeaseTime;
-	if (fLeaseTime == 0)
-		fLeaseTime = 60;
+	if (fLeaseDuration == 0)
+		fLeaseDuration = previousLeaseDuration;
+	if (fLeaseDuration == 0)
+		fLeaseDuration = AS_USECS(60);
 
-	if (fRenewalTime == 0)
-		fRenewalTime = fLeaseTime / 2;
-	if (fRebindingTime == 0)
-		fRebindingTime = fLeaseTime * 7 / 8;
-	fLeaseTime += fRequestTime;
-	fRenewalTime += fRequestTime;
-	fRebindingTime += fRequestTime;
+	// T1 and T2 default to 1/2 and 7/8 of the lease (RFC 2131 4.4.5)
+	if (fRenewalDuration == 0 || fRenewalDuration > fLeaseDuration)
+		fRenewalDuration = fLeaseDuration / 2;
+	if (fRebindingDuration == 0 || fRebindingDuration > fLeaseDuration)
+		fRebindingDuration = fLeaseDuration * 7 / 8;
+	if (fRebindingDuration < fRenewalDuration)
+		fRebindingDuration = fRenewalDuration;
+
+	fLeaseTime = fRequestTime + fLeaseDuration;
+	fRenewalTime = fRequestTime + fRenewalDuration;
+	fRebindingTime = fRequestTime + fRebindingDuration;
+	syslog(LOG_DEBUG, "%s: renewal in %" B_PRIdBIGTIME " s, rebinding in %"
+		B_PRIdBIGTIME " s, lease ends in %" B_PRIdBIGTIME " s\n", Device(),
+		(fRenewalTime - system_time()) / 1000000,
+		(fRebindingTime - system_time()) / 1000000,
+		(fLeaseTime - system_time()) / 1000000);
 	_RestartLease(fRenewalTime);
 
 	fStatus = status;
@@ -706,6 +742,13 @@ DHCPClient::CheckConfiguration()
 	BNetworkInterface interface(Device());
 	if (!interface.Exists() || (interface.Flags() & IFF_UP) == 0)
 		return;
+
+	if ((interface.Flags() & IFF_AUTO_CONFIGURED) == 0) {
+		// Someone configured the interface by hand (ifconfig clears the
+		// flag on purpose): putting the lease back undid that within
+		// seconds (airos-works/haiku#174).
+		return;
+	}
 
 	bool hasAddress = false;
 	int32 count = interface.CountAddresses();
@@ -875,6 +918,23 @@ DHCPClient::_StateTransition(int socket, dhcp_state& state)
 			return errno;
 
 		skipRequest = true;
+		if ((size_t)bytesReceived < offsetof(dhcp_message, options)) {
+			syslog(LOG_DEBUG, "%s: Ignoring %zd bytes from %s: too short\n",
+				Device(), bytesReceived,
+				_AddressToString(from.sin_addr.s_addr).String());
+			continue;
+		}
+
+		// What was not received reads as padding, which ends the options:
+		// they were read on into what an earlier reply, or the stack, had
+		// left in the buffer (airos-works/haiku#174).
+		static_assert(sizeof(buffer) >= sizeof(dhcp_message),
+			"the buffer holds a whole message");
+		if ((size_t)bytesReceived < sizeof(dhcp_message)) {
+			memset(buffer + bytesReceived, OPTION_PAD,
+				sizeof(dhcp_message) - bytesReceived);
+		}
+
 		dhcp_message* message = (dhcp_message*)buffer;
 		if (message->transaction_id != htonl(fTransactionID)
 			|| !message->HasOptions()
@@ -905,8 +965,12 @@ DHCPClient::_RestartLease(bigtime_t leaseTime)
 	if (leaseTime == 0)
 		return;
 
+	delete fRunner;
+		// (it sent its one message already)
+
 	BMessage lease(kMsgLeaseTime);
-	fRunner = new BMessageRunner(this, &lease, leaseTime - system_time(), 1);
+	fRunner = new BMessageRunner(this, &lease,
+		max_c(leaseTime - system_time(), (bigtime_t)AS_USECS(1)), 1);
 }
 
 
@@ -920,6 +984,26 @@ DHCPClient::_ParseOptions(dhcp_message& message, BMessage& address,
 	size_t size;
 	while (message.NextOption(cookie, option, data, size)) {
 		// iterate through all options
+		switch (option) {
+			case OPTION_ROUTER_ADDRESS:
+			case OPTION_SUBNET_MASK:
+			case OPTION_BROADCAST_ADDRESS:
+			case OPTION_SERVER_ADDRESS:
+			case OPTION_ADDRESS_LEASE_TIME:
+			case OPTION_RENEWAL_TIME:
+			case OPTION_REBINDING_TIME:
+				// an address or a time: four bytes (a list of routers
+				// starts with the first one)
+				if (size < 4) {
+					syslog(LOG_DEBUG, "  option %" B_PRIu32 " too short (%"
+						B_PRIuSIZE " bytes)\n", (uint32)option, size);
+					continue;
+				}
+				break;
+			default:
+				break;
+		}
+
 		switch (option) {
 			case OPTION_ROUTER_ADDRESS:
 				syslog(LOG_DEBUG, "  gateway: %s\n",
@@ -964,17 +1048,17 @@ DHCPClient::_ParseOptions(dhcp_message& message, BMessage& address,
 			case OPTION_ADDRESS_LEASE_TIME:
 				syslog(LOG_DEBUG, "  lease time: %lu seconds\n",
 					ntohl(*(uint32*)data));
-				fLeaseTime = ntohl(*(uint32*)data) * 1000000LL;
+				fLeaseDuration = ntohl(*(uint32*)data) * 1000000LL;
 				break;
 			case OPTION_RENEWAL_TIME:
 				syslog(LOG_DEBUG, "  renewal time: %lu seconds\n",
 					ntohl(*(uint32*)data));
-				fRenewalTime = ntohl(*(uint32*)data) * 1000000LL;
+				fRenewalDuration = ntohl(*(uint32*)data) * 1000000LL;
 				break;
 			case OPTION_REBINDING_TIME:
 				syslog(LOG_DEBUG, "  rebinding time: %lu seconds\n",
 					ntohl(*(uint32*)data));
-				fRebindingTime = ntohl(*(uint32*)data) * 1000000LL;
+				fRebindingDuration = ntohl(*(uint32*)data) * 1000000LL;
 				break;
 
 			case OPTION_HOST_NAME:
@@ -984,9 +1068,11 @@ DHCPClient::_ParseOptions(dhcp_message& message, BMessage& address,
 
 			case OPTION_DOMAIN_NAME:
 			{
+				// not NUL terminated: strlcpy() read on past the option
 				char domain[256];
-				strlcpy(domain, (const char*)data,
-					min_c(size + 1, sizeof(domain)));
+				size_t length = min_c(size, sizeof(domain) - 1);
+				memcpy(domain, data, length);
+				domain[length] = '\0';
 
 				syslog(LOG_DEBUG, "  domain name: \"%s\"\n", domain);
 
@@ -1172,8 +1258,18 @@ DHCPClient::MessageReceived(BMessage* message)
 {
 	switch (message->what) {
 		case kMsgLeaseTime:
+		{
+			BNetworkInterface interface(Device());
+			if ((interface.Flags() & IFF_AUTO_CONFIGURED) == 0) {
+				// configured by hand since: the renewal would put the
+				// lease back (see CheckConfiguration())
+				syslog(LOG_INFO, "%s: not renewing the lease, the interface "
+					"was configured by hand\n", Device());
+				break;
+			}
 			Start();
 			break;
+		}
 
 		default:
 			BHandler::MessageReceived(message);
